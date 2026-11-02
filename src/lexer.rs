@@ -388,6 +388,15 @@ impl Lexer {
                     self.stack.pop();
                     Tok::RBracket
                 }
+                // `++`, `*=`, `/=`, `.5` (FEEDBACK45.md, Q-520): before the arms that take `+`, `*`, `/`, `.`.
+                '+' if n == Some('+') => return Err(QuilloError::new("there is no `++`: `n += 1`", line)),
+                '*' if n == Some('=') => return Err(QuilloError::new("there is no `*=`: `n = n * 2`", line)),
+                '/' if n == Some('=') => return Err(QuilloError::new("there is no `/=`: `n = n / 2`", line)),
+                '.' if n.map_or(false, |d| d.is_ascii_digit()) && !matches!(self.last, Some(Tok::Ident(_) | Tok::RParen | Tok::RBracket | Tok::RBrace | Tok::Int(_) | Tok::Float(_) | Tok::Dec(_) | Tok::Str(_) | Tok::Dot | Tok::DotDot)) => {
+                    // After what a field may follow (`}.0`, `"ab".0`), or a range or spread's dots
+                    // (`[...1]`), it is not a number (found by the suite).
+                    return Err(QuilloError::new("a number starts with a digit: `0.5`, not `.5`", line));
+                }
                 ',' => Tok::Comma,
                 ':' => Tok::Colon,
                 ';' => Tok::Semi,
@@ -406,6 +415,14 @@ impl Lexer {
                 '*' => Tok::Star,
                 '/' => Tok::Slash,
                 '%' => Tok::Percent,
+                // `===`, `!==`, `++`, `*=`: JavaScript's, which Quillo has not (FEEDBACK45.md,
+                // Q-520; branch feedback40-43).
+                '=' if n == Some('=') && self.peek_char_at(1) == Some('=') => {
+                    return Err(QuilloError::new("there is no `===`: `==` compares values, lists and maps by what they hold", line));
+                }
+                '!' if n == Some('=') && self.peek_char_at(1) == Some('=') => {
+                    return Err(QuilloError::new("there is no `!==`: `!=` compares values, lists and maps by what they hold", line));
+                }
                 '=' if n == Some('=') => two(self, Tok::EqEq),
                 '=' if n == Some('>') => two(self, Tok::FatArrow),
                 '=' => Tok::Assign,
@@ -434,6 +451,22 @@ impl Lexer {
                     };
                     return Err(QuilloError::new(format!("unexpected character U+{:04X}{}, which cannot be seen: delete it", other as u32, what), line));
                 }
+                // What a word processor or another language put there (FEEDBACK45.md, Q-520;
+                // branch feedback40-43).
+                '&' => return Err(QuilloError::new("unexpected character `&`: `&&` is and; for bits, `bit.and(a, b)`", line)),
+                '\u{201C}' | '\u{201D}' | '\u{2018}' | '\u{2019}' | '\u{00AB}' | '\u{00BB}' => {
+                    return Err(QuilloError::new(format!("unexpected character `{}`, a curly quote: write `\"`", c), line));
+                }
+                '\u{2013}' | '\u{2014}' | '\u{2212}' => {
+                    return Err(QuilloError::new(format!("unexpected character `{}`, a dash or a minus sign: write `-`", c), line));
+                }
+                '\u{FF08}' | '\u{FF09}' | '\u{FF0C}' | '\u{FF1A}' | '\u{FF1B}' | '\u{FF1D}' => {
+                    let ascii = char::from_u32(c as u32 - 0xFEE0).unwrap_or('?');
+                    return Err(QuilloError::new(format!("unexpected character `{}`, a full-width one: write `{}`", c, ascii), line));
+                }
+                '\\' if matches!(n, Some('\n') | None) || self.text().get(self.pos..).map_or(false, |r| r.iter().take_while(|c| **c != '\n').all(|c| c.is_whitespace())) => {
+                    return Err(QuilloError::new("unexpected character `\\`: a line goes on by itself after an operator, so end it with `+` (or `,`, `(`), not `\\`", line));
+                }
                 other => return Err(QuilloError::new(format!("unexpected character `{}`", other), line)),
             }
         };
@@ -447,6 +480,10 @@ impl Lexer {
         // `0xFF`, `0xFFFF_0000`: masks and flags, for the `bit` module. As with
         // any int, one past 64 bits is an error, not a wrap (FEEDBACK19.md,
         // Q-153; branch feedback19-fixes).
+        // `0b101`, `0o17`: no binary or octal (FEEDBACK45.md, Q-520).
+        if self.peek_char() == Some('0') && matches!(self.peek_char_at(1), Some('b' | 'B' | 'o' | 'O')) && self.peek_char_at(2).map_or(false, |c| c.is_ascii_digit()) {
+            return Err(QuilloError::new("there are no binary or octal numbers: write it in hex, `0x5`, or as it is, `5`", line));
+        }
         if self.peek_char() == Some('0') && matches!(self.peek_char_at(1), Some('x' | 'X')) {
             self.bump();
             self.bump();

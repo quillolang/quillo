@@ -231,7 +231,8 @@ fn the_same_file_used_twice_gives_one_name() {
         ("lib/a.qwe", "fn helper() = \"a\"\n"),
         ("lib/b.qwe", "private fn helper() = \"b\"\nfn b() = helper()\n"),
     ]);
-    clean(&m);
+    // The second `use` is warned of (FEEDBACK45.md, Q-523), and changes nothing.
+    assert_eq!(diags(&m), ["main.qwe:2 warning: lib/a.qwe is taken a second time in this file: once is enough"]);
     assert_eq!(runs(&m), "ab");
 }
 
@@ -304,7 +305,7 @@ fn a_prop_cannot_have_a_name_that_is_renamed() {
 #[test]
 fn what_a_use_cannot_take_stops_the_program() {
     let cases: &[(&str, &str, &str)] = &[
-        ("import lib/a.qwe use nope\nfn out() = 1\n", "fn one() = 1\n", "lib/a.qwe has no public name `nope`"),
+        ("import lib/a.qwe use nope\nfn out() = 1\n", "fn one() = 1\n", "lib/a.qwe has no public name `nope` (did you mean `one`?)"),
         ("import lib/a.qwe use hidden\nfn out() = 1\n", "private fn hidden() = 1\n", "`hidden` is private to lib/a.qwe: make it `public` there, or take something public"),
         ("import lib/a.qwe use one\nfn one() = 2\nfn out() = 1\n", "fn one() = 1\n", "`one` is defined in this file, and taken from lib/a.qwe: take it `as` another name"),
     ];

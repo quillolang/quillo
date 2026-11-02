@@ -195,7 +195,12 @@ pub fn may_be_newer_syntax(msg: &str) -> bool {
     if msg.starts_with("unexpected character U+") {
         return false;
     }
-    if msg.starts_with("unexpected character") || msg.starts_with("unexpected keyword") || msg.starts_with("unknown escape") || msg.starts_with("bad escape") {
+    // One that says what to write instead (`@`, a curly quote, `===`) names a rule, not newer
+    // syntax (FEEDBACK45.md, Q-008, Q-520; branch feedback40-43).
+    if msg.starts_with("unexpected character") {
+        return !msg.contains(": ");
+    }
+    if msg.starts_with("unexpected keyword") || msg.starts_with("unknown escape") || msg.starts_with("bad escape") {
         return true;
     }
     if !msg.starts_with("expected ") || msg.contains("which is a keyword") {

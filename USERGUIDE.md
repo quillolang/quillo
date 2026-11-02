@@ -5191,7 +5191,14 @@ turns it around. A later release removes it.
   `.qwe` file (`use lib/auth`). An `import` finds whichever of `.qwer` and `.qwe` is
   there. `import lib/auth.qwe use *` says the same as `use lib/auth.qwe`: every public
   name.
-- A file `use`d twice, or by several files, runs once.
+- A file `use`d twice, or by several files, runs once. Within one file, a second `use`
+  of a file, or a name taken twice from it, is a warning: one is enough.
+- A name taken `as` another is called that in the file: after `import lib/m.qwe use
+  price as cost`, writing `price` is a warning ("this file takes `price` as `cost`"),
+  and still works, as a name not taken does. Take both to have both: `use price as cost,
+  price`.
+- A `use` list may go on over lines, each line after a `,`. A `,` at the end of the
+  list is an error: the next line is the next statement, not a name to take.
 - **A file's text.** A file is UTF-8; one that is not is refused with the line and column
   of the first bad byte. A byte-order mark at the start is skipped, and so is a first line
   starting `#!`, in the main file and in a `use`d one, so a script with

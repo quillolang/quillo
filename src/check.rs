@@ -558,6 +558,46 @@ fn binop_t(op: BinOp, a: T, b: T) -> Option<T> {
 
 /// `(name, params, returns)`. A parameter is a type, `T=` when it may be left
 /// out, and `T...` for any number. `error(str)` is an error value.
+/// The Latin letter a Cyrillic or Greek one looks like, or the letter itself.
+fn latin_lookalike(c: char) -> char {
+    match c {
+        'а' => 'a', 'е' => 'e', 'о' => 'o', 'р' => 'p', 'с' => 'c', 'у' => 'y', 'х' => 'x', 'і' => 'i', 'ј' => 'j', 'ѕ' => 's', 'ԁ' => 'd', 'һ' => 'h',
+        'А' => 'A', 'В' => 'B', 'Е' => 'E', 'К' => 'K', 'М' => 'M', 'Н' => 'H', 'О' => 'O', 'Р' => 'P', 'С' => 'C', 'Т' => 'T', 'Х' => 'X', 'І' => 'I', 'Ѕ' => 'S',
+        'ο' => 'o', 'ν' => 'v', 'ρ' => 'p', 'ι' => 'i', 'κ' => 'k', 'α' => 'a',
+        'Α' => 'A', 'Β' => 'B', 'Ε' => 'E', 'Ζ' => 'Z', 'Η' => 'H', 'Ι' => 'I', 'Κ' => 'K', 'Μ' => 'M', 'Ν' => 'N', 'Ο' => 'O', 'Ρ' => 'P', 'Τ' => 'T', 'Υ' => 'Y', 'Χ' => 'X',
+        _ => c,
+    }
+}
+
+/// Whether every `name` in `src`, but on its `import` and `use` lines, is called: `name(`,
+/// not after a `.`. A conservative reading of the text: a string or comment with the word
+/// in it keeps the name unmarked.
+fn only_called(src: &str, name: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    for line in src.lines() {
+        let t = line.trim_start();
+        if t.starts_with("import ") || t.starts_with("use ") {
+            continue;
+        }
+        let mut from = 0;
+        while let Some(at) = line[from..].find(name).map(|i| i + from) {
+            let end = at + name.len();
+            from = end;
+            let before = line[..at].chars().next_back();
+            if before.is_some_and(word) || line[end..].chars().next().is_some_and(word) {
+                continue;
+            }
+            if before == Some('.') || !line[end..].trim_start().starts_with('(') {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The mark on a name a file took only `as` another (Checker::renames_for).
+const OLD: char = '\u{1}';
+
 const BUILTINS: &[(&str, &str, &str)] = &[
     ("print", "any...", "null"),
     ("error", "any", "any"),
@@ -569,7 +609,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("stdin", "", "str | error(str)"),
     ("read_line", "", "str | null | error(str)"),
     ("exit", "int=", "null"),
-    ("str", "any=", "str"),
+    // `str()` gave null, which no program means (FEEDBACK45.md, Q-525).
+    ("str", "any", "str"),
     ("int", "any", "int | error(str)"),
     ("float", "any", "float | error(str)"),
     ("dec", "any", "dec | error(str)"),
@@ -978,6 +1019,8 @@ impl Sig {
     fn builtin(name: &str, params: &str, ret: &str) -> Sig {
         let mut ps = Vec::new();
         let mut variadic = false;
+        // The parameters' names, as the docs give them (FEEDBACK45.md, Q-525; branch feedback40-43).
+        let names: Vec<&str> = crate::builtin_docs::DOCS.iter().find(|(n, _, _)| *n == name).map_or(Vec::new(), |(_, p, _)| p.split(',').map(str::trim).collect());
         for (i, p) in params.split(',').map(str::trim).filter(|p| !p.is_empty()).enumerate() {
             let (p, optional) = match p.strip_suffix('=') {
                 Some(x) => (x, true),
@@ -991,7 +1034,8 @@ impl Sig {
                 None => p,
             };
             let t = parse_t(p);
-            ps.push(PSig { name: format!("arg{}", i + 1), ty: t.bits, full: t, optional: optional || variadic, annotated: true });
+            let pname = names.get(i).filter(|n| !n.is_empty()).map_or_else(|| format!("arg{}", i + 1), |n| n.trim_end_matches("...").to_string());
+            ps.push(PSig { name: pname, ty: t.bits, full: t, optional: optional || variadic, annotated: true });
         }
         let effects = Some(builtin_effect(name));
         Sig {
@@ -1345,6 +1389,7 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
     let main: Arc<str> = Arc::from(file);
     let mut parser = Parser::new(src);
     let parsed = parser.parse_program();
+    let parse_failed = parsed.is_err();
     c.plain_dollars.extend(parser.plain_dollars().into_iter().map(|(text, n)| (file.to_string(), text, n)));
     match parsed.map(Arc::new).and_then(|stmts| c.link(stmts, src, file, base_dir)) {
         Ok(stmts) => {
@@ -1373,6 +1418,7 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
                 }
             }
             c.run(order);
+            c.unused_said();
             c.state_details();
             c.as_written();
         }
@@ -1380,7 +1426,13 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
             if crate::error::may_be_newer_syntax(&e.msg) {
                 c.out.syntax_errors.push((main.to_string(), e.line));
             }
-            c.diag_at(main, e.line, Severity::Error, e.msg)
+            // The syntax errors after the first, each from the next statement on, so one run
+            // says them all (FEEDBACK45.md, Q-522; branch feedback40-43).
+            let more = if parse_failed { crate::parser::more_errors(src, e.line) } else { Vec::new() };
+            c.diag_at(main.clone(), e.line, Severity::Error, e.msg);
+            for m in more {
+                c.diag_at(main.clone(), m.line, Severity::Error, m.msg);
+            }
         }
     }
     c.finish()
@@ -1428,6 +1480,30 @@ struct Var {
     ready: bool,
 }
 
+/// An unknown name in a function: where, the error said if nothing defines it, and how many
+/// functions and scopes deep it was.
+struct Early {
+    name: String,
+    file: Arc<str>,
+    line: u32,
+    msg: String,
+    fns: usize,
+    /// The scopes around it, by number: a `let` in one of them defines it.
+    chain: Vec<u64>,
+    /// Read in a function inside the one with the `let`: a closure, which may well run after
+    /// the `let` (found in review).
+    nested: bool,
+}
+
+/// A `let` of a block that has ended.
+struct Gone {
+    name: String,
+    file: Arc<str>,
+    line: u32,
+    kind: &'static str,
+    fns: usize,
+}
+
 struct FnCtx {
     name: String,
     ret: Option<T>,
@@ -1453,6 +1529,8 @@ struct Item {
 }
 
 struct Checker {
+    /// Names an import line could not take, said there and not again where used (Q-523).
+    failed_imports: HashSet<(PathBuf, String)>,
     /// Top-level functions and `let` lambdas, by name (Q-514).
     bodies: HashMap<String, Arc<FnDef>>,
     /// The route's path parameters with no type, while its body is checked (Q-513).
@@ -1480,6 +1558,9 @@ struct Checker {
     /// Checking top-level code as it runs (not a function or route body).
     sequential: bool,
     assigned: HashSet<String>,
+    /// A `let` only `+=` and `-=` change (by its file, line and name): its first value's type,
+    /// which a wrong `-=` is held to (FEEDBACK45.md, Q-525; branch feedback40-43).
+    first_t: HashMap<(Arc<str>, u32, String), T>,
     /// Of those, the ones assigned where nothing local has that name.
     assigned_globals: HashSet<String>,
     ret_cache: HashMap<usize, T>,
@@ -1498,6 +1579,19 @@ struct Checker {
     everywhere: HashSet<String>,
     /// Names already reported as not taken, by the file using them.
     told: HashSet<(Arc<str>, String)>,
+    /// Unknown names inside a function, said when it ends unless a `let` further down it
+    /// defines them, which makes them names used before they are defined (FEEDBACK45.md, Q-524).
+    early: Vec<Early>,
+    /// Each scope's number, and the last given (Checker::push).
+    scope_ids: Vec<u64>,
+    scope_serial: u64,
+    /// The `let`s of blocks that have ended, for a read after the block (Q-524).
+    gone: Vec<Gone>,
+    /// What the next block is the body of: `if`, `for` or `while`.
+    block_kind: Option<&'static str>,
+    /// Unused variables, said at the end: a read after its block, or before its `let`,
+    /// is a use (Q-524).
+    unused: Vec<(Arc<str>, u32, String)>,
     /// Browser libraries' names: the file and line of their `use`.
     scripts: HashMap<String, (Arc<str>, u32)>,
     /// Each `state` (by its file, line and name): the types it takes (its
@@ -1604,6 +1698,7 @@ impl Checker {
             quiet: 0,
             sequential: true,
             assigned: HashSet::new(),
+            first_t: HashMap::new(),
             assigned_globals: HashSet::new(),
             ret_cache: HashMap::new(),
             in_progress: HashSet::new(),
@@ -1614,6 +1709,12 @@ impl Checker {
             keys: HashMap::new(),
             everywhere: HashSet::new(),
             told: HashSet::new(),
+            early: Vec::new(),
+            scope_ids: Vec::new(),
+            scope_serial: 0,
+            gone: Vec::new(),
+            block_kind: None,
+            unused: Vec::new(),
             scripts: HashMap::new(),
             state_types: HashMap::new(),
             live_ok: false,
@@ -1626,6 +1727,7 @@ impl Checker {
             text_params: Vec::new(),
             text_params_depth: 0,
             bodies: HashMap::new(),
+            failed_imports: HashSet::new(),
             confined: false,
             root: PathBuf::new(),
             uses: 0,
@@ -1661,8 +1763,9 @@ impl Checker {
         if self.quiet > 0 {
             return;
         }
-        // A private name as it was written (src/privacy.rs; branch public-private).
-        let msg = crate::privacy::demangle(&msg.into());
+        // A private name as it was written (src/privacy.rs; branch public-private), and an
+        // old name without its mark.
+        let msg = crate::privacy::demangle(&msg.into()).replace(OLD, "");
         if !self.reported.insert((file.clone(), line, msg.clone())) {
             return;
         }
@@ -1712,13 +1815,40 @@ impl Checker {
             parsed
         });
         self.plain_dollars.extend(dollars);
+        // Said at the import line, by the path the program wrote, and once: the name it could
+        // not take is not said again where it is used (FEEDBACK45.md, Q-523).
+        let main_key = Path::new(file).canonicalize().ok();
         for p in std::mem::take(&mut self.links.problems) {
-            self.diag_at(Arc::from(p.file.display().to_string()), p.line, Severity::Error, p.message);
+            let shown = if p.file.canonicalize().ok() == main_key { file.to_string() } else { p.file.display().to_string() };
+            if let Some(n) = &p.name {
+                self.failed_imports.insert((p.file.clone(), n.clone()));
+            }
+            self.diag_at(Arc::from(shown), p.line, Severity::Error, p.message);
         }
-        match self.links.renames(&crate::modules::key(Path::new(file))) {
-            Some(names) => reparsed(src, names).map(Arc::new),
+        for p in std::mem::take(&mut self.links.repeats) {
+            let shown = if p.file.canonicalize().ok() == main_key { file.to_string() } else { p.file.display().to_string() };
+            self.diag_at(Arc::from(shown), p.line, Severity::Warning, p.message);
+        }
+        match self.renames_for(&crate::modules::key(Path::new(file)), src) {
+            Some(names) => reparsed(src, &names).map(Arc::new),
             None => Ok(stmts),
         }
+    }
+
+    /// How the checker renames a file's names: as linking does, and each name the file took
+    /// only `as` another marked with OLD, so its uses can be told from the new name's
+    /// (FEEDBACK45.md, Q-523). A builtin's name stays the builtin's.
+    /// Only a name the file calls and never binds is marked: a parameter, prop, `let` or key
+    /// of that name is the file's own, and a local of the other file's name is what the alias
+    /// finds as the program runs, which the checker must see (found in review).
+    fn renames_for(&self, key: &Path, src: &str) -> Option<HashMap<String, String>> {
+        let mut names = self.links.renames(key).cloned().unwrap_or_default();
+        for n in self.links.old_names.get(key).into_iter().flat_map(|o| o.keys()) {
+            if !BUILTINS.iter().any(|(b, _, _)| b == n) && only_called(src, n) {
+                names.insert(n.clone(), format!("{}{}", n, OLD));
+            }
+        }
+        (!names.is_empty()).then_some(names)
     }
 
     /// Lists statements in the order the top level runs them, following `use`.
@@ -1889,8 +2019,8 @@ impl Checker {
                     continue;
                 }
                 match text {
-                    Ok(src) => match match (self.links.renames(&key), self.links.parsed.get(&key)) {
-                        (Some(names), _) => reparsed(&src, names).map(Arc::new),
+                    Ok(src) => match match (self.renames_for(&key, &src), self.links.parsed.get(&key)) {
+                        (Some(names), _) => reparsed(&src, &names).map(Arc::new),
                         (None, Some(parsed)) => Ok(parsed.clone()),
                         (None, None) => Parser::new(&src).parse_program().map(Arc::new),
                     } {
@@ -1909,7 +2039,22 @@ impl Checker {
                             self.diag_at(fname, e.line, Severity::Error, e.msg)
                         }
                     },
-                    Err(e) => self.diag_at(file.clone(), *line, Severity::Error, format!("cannot read {}: {}", full.display(), e)),
+                    Err(e) => {
+                        // Its names are not said again as unknown, and a file near it is offered
+                        // (FEEDBACK45.md, Q-523; branch feedback40-43).
+                        for (_, alias) in names.iter().flatten() {
+                            let k = self.key_of(&file);
+                            self.failed_imports.insert((k, alias.clone()));
+                        }
+                        let near = full.parent().and_then(|d| std::fs::read_dir(d).ok()).and_then(|entries| {
+                            let names: Vec<String> = entries.flatten().map(|en| en.file_name().to_string_lossy().to_string()).filter(|n| n.ends_with(".qwe")).collect();
+                            let want = full.file_name()?.to_string_lossy().to_string();
+                            closest(&want, names.iter().map(|n| n.as_str()))
+                        });
+                        let shown = path.trim_start_matches("./");
+                        let hint = near.map_or(String::new(), |n| format!(" (did you mean {}?)", Path::new(shown).with_file_name(n).display()));
+                        self.diag_at(file.clone(), *line, Severity::Error, format!("cannot read {}: {}{}", shown, e, hint));
+                    }
                 }
                 continue;
             }
@@ -2119,6 +2264,7 @@ impl Checker {
                     }
                     for (n, t, sig) in binds {
                         let reassigned = self.assigned.contains(&n);
+                        self.note_first_t(&it.file, *line, &n, t);
                         if let Some(g) = self.globals.get_mut(&n) {
                             g.ready = true;
                             if g.file == it.file && g.line == *line {
@@ -2157,6 +2303,12 @@ impl Checker {
 
     fn push(&mut self) {
         self.scopes.push(HashMap::new());
+        // Each scope's own number, so a `let` can be told to enclose a read (Checker::read_before).
+        // Scopes cleared in a body leave 0s, which match nothing.
+        let n = self.scopes.len() - 1;
+        self.scope_ids.resize(n, 0);
+        self.scope_serial += 1;
+        self.scope_ids.push(self.scope_serial);
     }
 
     fn pop(&mut self) {
@@ -2167,7 +2319,9 @@ impl Checker {
         while self.url_vars.last().map_or(false, |(d, _, _)| *d > depth) {
             self.url_vars.pop();
         }
-        if let Some(scope) = self.scopes.pop() {
+        let popped = self.scopes.pop();
+        self.scope_ids.truncate(self.scopes.len());
+        if let Some(scope) = popped {
             for (name, v) in scope {
                 if self.quiet == 0 {
                     let detail = var_detail(&name, &v);
@@ -2176,10 +2330,79 @@ impl Checker {
                     self.out.locals.push(Local { name: name.clone(), file, line, end, detail, statement });
                 }
                 if v.kind == Kind::Let && !v.used && !name.starts_with('_') && self.quiet == 0 {
-                    self.diag_at(v.file.clone(), v.line, Severity::Warning, format!("unused variable `{}` (name it `_{}` if that is intended)", name, name));
+                    self.unused.push((v.file.clone(), v.line, name));
                 }
             }
         }
+    }
+
+    /// `print(tmp)`, then `let tmp = 1`, in one function: said as the top level says it, and
+    /// `tmp` is not unused (FEEDBACK45.md, Q-524; branch feedback40-43). The `let` is at the
+    /// read's level or around it.
+    fn read_before(&mut self, name: &str) -> bool {
+        if self.quiet > 0 || self.early.is_empty() {
+            return false;
+        }
+        let (fns, file) = (self.fns.len(), self.file.clone());
+        let Some(scope) = self.scope_ids.get(self.scopes.len().wrapping_sub(1)).copied().filter(|i| *i != 0 && self.scope_ids.len() == self.scopes.len()) else {
+            return false;
+        };
+        let (found, rest): (Vec<Early>, Vec<Early>) =
+            std::mem::take(&mut self.early).into_iter().partition(|e| e.name == name && e.file == file && e.fns == fns && e.chain.contains(&scope));
+        self.early = rest;
+        // A closure's read is fine if it runs after the `let`, as it most often does.
+        for e in found.iter().filter(|e| !e.nested) {
+            self.diag_at(e.file.clone(), e.line, Severity::Error, format!("`{}` is used before it is defined (line {})", name, self.line));
+        }
+        !found.is_empty()
+    }
+
+    /// A `let` only `+=` and `-=` change keeps its first value's type for them (Q-525).
+    fn note_first_t(&mut self, file: &Arc<str>, line: u32, name: &str, t: T) {
+        if self.assigned.contains(name) && !self.assigned.contains(&format!("={}", name)) && !t.vague() && t.bits & NIL == 0 {
+            self.first_t.insert((file.clone(), line, name.to_string()), t);
+        }
+    }
+
+    /// After a function's body: its unknown names that no `let` defined are said, or, in a
+    /// function inside another, wait for the outer one's `let`s; its ended blocks are forgotten.
+    fn fn_ended(&mut self) {
+        let n = self.fns.len();
+        for mut e in std::mem::take(&mut self.early) {
+            if e.fns <= n {
+                self.early.push(e);
+            } else if n == 0 {
+                self.diag_at(e.file.clone(), e.line, Severity::Error, e.msg);
+            } else {
+                e.fns = n;
+                e.nested = true;
+                self.early.push(e);
+            }
+        }
+        self.gone.retain(|g| g.fns <= n);
+    }
+
+    /// The unused variables, once every read has been seen.
+    fn unused_said(&mut self) {
+        for e in std::mem::take(&mut self.early) {
+            self.diag_at(e.file.clone(), e.line, Severity::Error, e.msg);
+        }
+        for (file, line, name) in std::mem::take(&mut self.unused) {
+            self.diag_at(file, line, Severity::Warning, format!("unused variable `{}` (name it `_{}` if that is intended)", name, name));
+        }
+    }
+
+    /// `if c { let x = 1 }`, then `x`: where `x` was, and how to have it after the block (Q-524).
+    fn gone_name(&mut self, name: &str) -> Option<String> {
+        let (fns, file, line) = (self.fns.len(), self.file.clone(), self.line);
+        let g = self.gone.iter().rev().find(|g| g.name == name && g.file == file && g.fns == fns && g.line <= line)?;
+        let msg = format!(
+            "`{}` is declared inside the `{}` (line {}), and is not seen after it: declare it before the `{}` (`let {} = ...`), and assign it inside",
+            name, g.kind, g.line, g.kind, name
+        );
+        let key = (g.file.clone(), g.line, g.name.clone());
+        self.unused.retain(|u| *u != key);
+        Some(msg)
     }
 
     /// A second local `fn` or `state` of one name in one body: the second replaced the first
@@ -2196,10 +2419,11 @@ impl Checker {
         let url = std::mem::replace(&mut self.next_url, false);
         self.url_vars.push((self.scopes.len(), name.to_string(), url));
         let v = Var { t, sig, file: self.file.clone(), line: self.line, kind, used: false, ready: true };
+        let read_before = kind == Kind::Let && self.read_before(name);
         match self.scopes.last_mut() {
             Some(s) => {
                 // `let x` twice in one scope reuses the variable.
-                let used = s.get(name).map_or(false, |old| old.used);
+                let used = read_before || s.get(name).map_or(false, |old| old.used);
                 s.insert(name.to_string(), Var { used, ..v });
             }
             None => {
@@ -2212,6 +2436,7 @@ impl Checker {
         if self.quiet > 0 {
             return;
         }
+        let name = name.strip_suffix(OLD).unwrap_or(name);
         self.taken(name, v);
         let def = if &*v.file == "<builtin>" { None } else { Some((v.file.to_string(), v.line)) };
         let detail = var_detail(name, v);
@@ -2319,8 +2544,26 @@ impl Checker {
                 return Some(v);
             }
         }
-        let v = self.globals.get(name).cloned()?;
+        let v = match self.globals.get(name) {
+            Some(v) => v.clone(),
+            None => self.old_name(name)?,
+        };
         self.record(name, &v);
+        Some(v)
+    }
+
+    /// `price` where this file took it `as p`: still the other file's, so the program runs,
+    /// but not a name this file took (FEEDBACK45.md, Q-523).
+    fn old_name(&mut self, name: &str) -> Option<Var> {
+        let base = name.strip_suffix(OLD)?;
+        let v = self.globals.get(base).cloned()?;
+        let key = self.key_of(&self.file.clone());
+        let alias = self.links.old_names.get(&key).and_then(|o| o.get(base)).cloned();
+        if let Some(alias) = alias {
+            if self.told.insert((self.file.clone(), name.to_string())) {
+                self.warn(format!("this file takes `{}` as `{}`: write `{}`, or take `{}` too", base, alias, alias, base));
+            }
+        }
         Some(v)
     }
 
@@ -2333,7 +2576,7 @@ impl Checker {
                 v.used = true;
                 Some(v.clone())
             }
-            None => self.globals.get(name).cloned(),
+            None => self.globals.get(name).cloned().or_else(|| self.old_name(name)),
         }
     }
 
@@ -2341,7 +2584,14 @@ impl Checker {
         match self.lookup(name) {
             Some(v) => {
                 if v.kind == Kind::Global && !v.ready && self.sequential && self.fns.is_empty() {
-                    self.error(format!("`{}` is used before it is defined (line {})", name, v.line));
+                    // Another file's line says which file (FEEDBACK45.md, Q-523).
+                    let at = if v.file == self.file {
+                        format!("line {}", v.line)
+                    } else {
+                        let key = self.key_of(&v.file);
+                        format!("{}:{}", self.links.written(&key), v.line)
+                    };
+                    self.error(format!("`{}` is used before it is defined ({})", name, at));
                 }
                 if v.kind == Kind::Global && &*v.file != "<builtin>" {
                     self.browser_global(name, &v);
@@ -2354,7 +2604,7 @@ impl Checker {
             None => {
                 if name == "request" {
                     self.error("`request` only exists in routes and `server fn`s; pass what you need as an argument");
-                } else if !self.unparsed_names.contains(name) {
+                } else if !self.unparsed_names.contains(name) && !self.failed_import(name) {
                     let removed = crate::error::removed_note(name);
                     // Another file's `private` name (branch public-private).
                     let cwd = std::env::current_dir().ok();
@@ -2379,14 +2629,54 @@ impl Checker {
                         // feedback26-fixes).
                         if self.letting.iter().any(|l| l == name) {
                             self.error(format!("`{}` does not exist until its `let` ends: a function that calls itself is a `fn`", name));
+                        } else if let Some(msg) = self.gone_name(name) {
+                            self.error(msg);
                         } else {
-                            self.error(format!("unknown name `{}`{}", name, if removed.is_empty() { self.suggest(name) } else { removed }));
+                            let hint = if !removed.is_empty() { removed } else { self.lookalike(name).unwrap_or_else(|| self.suggest(name)) };
+                            let msg = format!("unknown name `{}`{}", name, hint);
+                            if self.fns.is_empty() || self.quiet > 0 {
+                                self.error(msg);
+                            } else {
+                                let (file, line, fns) = (self.file.clone(), self.line, self.fns.len());
+                                let chain = self.scope_ids.iter().copied().take(self.scopes.len()).filter(|i| *i != 0).collect();
+                                self.early.push(Early { name: name.to_string(), file, line, msg, fns, chain, nested: false });
+                            }
                         }
                     }
                 }
                 (T::ANY, None)
             }
         }
+    }
+
+    /// A name this file's import line could not take, said there (Q-523): by file, as
+    /// another file's own unknown name of that spelling is still said (found in review).
+    fn failed_import(&mut self, name: &str) -> bool {
+        if self.failed_imports.is_empty() {
+            return false;
+        }
+        let k = self.key_of(&self.file.clone());
+        self.failed_imports.contains(&(k, name.to_string()))
+    }
+
+    /// `a` where the program has `а`, a Cyrillic letter: the same to the eye, another name
+    /// (FEEDBACK45.md, Q-524). Says which letter, by its code point.
+    fn lookalike(&self, name: &str) -> Option<String> {
+        let key: String = name.chars().map(latin_lookalike).collect();
+        let mut cands: Vec<(&str, u32)> = self.scopes.iter().flat_map(|s| s.iter().map(|(k, v)| (k.as_str(), v.line))).collect();
+        cands.extend(self.globals.iter().filter(|(_, v)| &*v.file != "<builtin>").map(|(k, v)| (k.as_str(), v.line)));
+        cands.sort_unstable();
+        let (other, line) = cands.into_iter().find(|(c, _)| *c != name && c.chars().map(latin_lookalike).collect::<String>() == key)?;
+        let odd = |w: &str| w.chars().find(|c| latin_lookalike(*c) != *c);
+        let (c, whose) = match odd(name) {
+            Some(c) => (c, "this one".to_string()),
+            None => (odd(other)?, format!("the `{}` on line {}", other, line)),
+        };
+        let script = if ('\u{370}'..='\u{3ff}').contains(&c) { "Greek" } else { "Cyrillic" };
+        Some(format!(
+            " (`{}` is defined on line {} with other letters that look the same: {} has U+{:04X}, a {} letter, not `{}`)",
+            other, line, whose, c as u32, script, latin_lookalike(c)
+        ))
     }
 
     fn suggest(&self, name: &str) -> String {
@@ -2476,6 +2766,7 @@ impl Checker {
         self.check_return_expr(&d.body, t);
         self.pop();
         self.fns.pop();
+        self.fn_ended();
     }
 
     fn params(&mut self, d: &FnDef) {
@@ -2644,6 +2935,7 @@ impl Checker {
         self.text_params.clear();
         self.pop();
         self.fns.pop();
+        self.fn_ended();
     }
 
     fn stmt(&mut self, s: &Stmt, last: bool) -> T {
@@ -2708,7 +3000,13 @@ impl Checker {
                 let url = matches!(p, Pattern::Bind(_)) && self.url_fixed(e);
                 for (n, t, sig) in binds {
                     let kind = if matches!(p, Pattern::Bind(_)) { Kind::Let } else { Kind::Bound };
-                    let t = if self.assigned.contains(&n) { T::ANY } else { t };
+                    let t = if self.assigned.contains(&n) {
+                        let (file, line) = (self.file.clone(), self.line);
+                        self.note_first_t(&file, line, &n, t);
+                        T::ANY
+                    } else {
+                        t
+                    };
                     self.next_sql = sql;
                     self.next_url = url;
                     self.define(&n, t, sig, kind);
@@ -2798,11 +3096,14 @@ impl Checker {
                         }
                         if !matches!(op, AssignOp::Set) {
                             let bop = if matches!(op, AssignOp::Add) { BinOp::Add } else { BinOp::Sub };
-                            if binop_t(bop, v.t, rhs).is_none() {
+                            // Reassigned, it is any: by `+=` and `-=` alone, it is still its
+                            // first value's kind (Q-525).
+                            let left = self.first_t.get(&(v.file.clone(), v.line, name.to_string())).copied().filter(|_| v.t.vague()).unwrap_or(v.t);
+                            if binop_t(bop, left, rhs).is_none() {
                                 self.error(format!(
                                     "cannot {} {} and {}",
                                     if matches!(op, AssignOp::Add) { "add" } else { "subtract" },
-                                    bits_text(v.t.bits),
+                                    bits_text(left.bits),
                                     bits_text(rhs.bits)
                                 ));
                             }
@@ -3020,6 +3321,7 @@ impl Checker {
         self.pop();
         self.sequential = saved_seq;
         let t = t.union(self.fns.pop().map_or(T::NEVER, |f| f.exits));
+        self.fn_ended();
         let t = match &d.ret {
             Some(r) => ty_t(r).union(t.without(!ERR)),
             None => t,
@@ -3044,6 +3346,7 @@ impl Checker {
         }
         self.in_progress.insert(key);
         let saved_scopes = std::mem::take(&mut self.scopes);
+        let saved_ids = std::mem::take(&mut self.scope_ids);
         let saved_fns = std::mem::take(&mut self.fns);
         let saved_line = self.line;
         let saved_seq = self.sequential;
@@ -3071,6 +3374,7 @@ impl Checker {
         self.quiet -= 1;
         self.fns = saved_fns;
         self.scopes = saved_scopes;
+        self.scope_ids = saved_ids;
         self.line = saved_line;
         self.sequential = saved_seq;
         self.in_progress.remove(&key);
@@ -3632,9 +3936,13 @@ impl Checker {
                 let (mut yes, mut no) = (Vec::new(), Vec::new());
                 self.facts(c, true, &mut yes);
                 self.facts(c, false, &mut no);
+                self.block_kind = matches!(&**a, Expr::Block(_)).then_some("if");
                 let x = self.under(yes, |s| s.expr(a));
                 let y = match b {
-                    Some(b) => self.under(no, |s| s.expr(b)),
+                    Some(b) => {
+                        self.block_kind = matches!(&**b, Expr::Block(_)).then_some("if");
+                        self.under(no, |s| s.expr(b))
+                    }
                     None => T::of(NIL),
                 };
                 x.union(y)
@@ -3716,6 +4024,7 @@ impl Checker {
                 for (n, bt, sig) in binds {
                     self.define(&n, bt, sig, Kind::Bound);
                 }
+                self.block_kind = matches!(&**body, Expr::Block(_)).then_some("for");
                 self.expr(body);
                 self.pop();
                 T::of(LIST)
@@ -3753,6 +4062,7 @@ impl Checker {
                 self.js_truthiness(ct, c, Truth::Cond);
                 let mut yes = Vec::new();
                 self.facts(c, true, &mut yes);
+                self.block_kind = matches!(&**body, Expr::Block(_)).then_some("while");
                 self.under(yes, |s| s.expr(body));
                 // It leaves only by a `return`: nothing comes after it (FEEDBACK25.md,
                 // Q-322; branch feedback26-fixes).
@@ -3762,6 +4072,7 @@ impl Checker {
                 T::of(NIL)
             }
             Expr::Block(stmts) => {
+                let kind = self.block_kind.take();
                 self.push();
                 let mut t = T::of(NIL);
                 let mut never = false;
@@ -3787,6 +4098,14 @@ impl Checker {
                     }
                     if i + 1 == stmts.len() {
                         t = st;
+                    }
+                }
+                if let (Some(kind), 0) = (kind, self.quiet) {
+                    let lets: Vec<(String, u32)> = self.scopes.last().map_or(Vec::new(), |s| {
+                        s.iter().filter(|(_, v)| v.kind == Kind::Let).map(|(n, v)| (n.clone(), v.line)).collect()
+                    });
+                    for (name, line) in lets {
+                        self.gone.push(Gone { name, file: self.file.clone(), line, kind, fns: self.fns.len() });
                     }
                 }
                 self.pop();
@@ -4965,14 +5284,32 @@ impl Checker {
             self.error(format!("`{}` is a component; write <{} ... /> instead of calling it", name, sig.name));
         }
         let n = sig.params.len();
-        if args.len() > n && !sig.variadic {
-            self.error(format!("`{}` takes {} argument{}, got {}{}", name, n, if n == 1 { "" } else { "s" }, args.len(), hides(&sig, name)));
+        // A builtin's call as its docs write it: `reduce(xs, start, f)` (Q-525).
+        let shape = || format!("{}({})", name, sig.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "));
+        let too_many = args.len() > n && !sig.variadic;
+        if too_many {
+            // `max(1, 2)`: one list, said once, not also as argument 1's type.
+            if sig.builtin && n == 1 && sig.params[0].ty & !NIL == LIST && args.first().is_some_and(|a| a.bits != 0 && a.bits & LIST == 0) {
+                self.error(format!("`{}` takes one list: put the items in it, `{}([...])`", name, name));
+                return sig.ret.unwrap_or(T::ANY);
+            }
+            let shown = if sig.builtin { format!(": {}", shape()) } else { String::new() };
+            self.error(format!("`{}` takes {} argument{}, got {}{}{}", name, n, if n == 1 { "" } else { "s" }, args.len(), shown, hides(&sig, name)));
         }
         for (i, p) in sig.params.iter().enumerate() {
             let what = || if sig.builtin { format!("argument {}", i + 1) } else { format!("argument `{}`", p.name) };
             match args.get(i) {
                 None if !p.optional => {
-                    self.error(format!("missing argument `{}` in call to `{}`{}", p.name, name, hides(&sig, name)));
+                    let given_fn = i > 0 && args.get(i - 1).is_some_and(|a| a.bits == FN) && sig.params[i - 1].ty != FN;
+                    if sig.builtin && given_fn && p.ty == FN {
+                        // `reduce(xs, (a, x) => a + x)`: the start value left out.
+                        self.error(format!("`{}` takes `{}` before the function: {}", name, sig.params[i - 1].name, shape()));
+                    } else if sig.builtin {
+                        let kind = if p.ty == FN { ", a function," } else { "" };
+                        self.error(format!("missing argument `{}`{} in call to `{}`: {}", p.name, kind, name, shape()));
+                    } else {
+                        self.error(format!("missing argument `{}` in call to `{}`{}", p.name, name, hides(&sig, name)));
+                    }
                     break;
                 }
                 Some(a) if p.annotated && a.bits != 0 && a.bits & p.ty == 0 && matches!(name, "__merge" | "__concat") => {
@@ -6027,8 +6364,12 @@ pub(crate) fn global_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
 fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
     for s in stmts {
         match s {
-            Stmt::Assign(n, _, e, _) => {
+            Stmt::Assign(n, op, e, _) => {
                 out.insert(n.to_string());
+                // `=` too, apart: `+=` and `-=` alone keep a kind (Checker::note_first_t).
+                if matches!(op, AssignOp::Set) {
+                    out.insert(format!("={}", n));
+                }
                 assigned_in(e, out)
             }
             Stmt::Let(_, e, _) | Stmt::Expr(e) | Stmt::State(_, e, _) => assigned_in(e, out),
@@ -6176,8 +6517,11 @@ fn assigned_in(e: &Expr, out: &mut HashSet<String>) {
     walk_expr(e, &mut |x| {
         if let Expr::Block(stmts) = x {
             for s in stmts {
-                if let Stmt::Assign(n, ..) = s {
+                if let Stmt::Assign(n, op, ..) = s {
                     out.insert(n.to_string());
+                    if matches!(op, AssignOp::Set) {
+                        out.insert(format!("={}", n));
+                    }
                 }
             }
         }

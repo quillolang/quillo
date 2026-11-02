@@ -141,8 +141,10 @@ fn a_service_inside_a_function_is_refused() {
 
 #[test]
 fn compound_assignment_needs_values_that_add() {
-    says("fn f() {\n let x = 1\n x -= \"a\"\n x\n}", &["3 cannot subtract any and str"]);
-    says("fn f() {\n let x = [1]\n x += 1\n x\n}", &[]);
+    says("fn f() {\n let x = 1\n x -= \"a\"\n x\n}", &["3 cannot subtract int and str"]);
+    // `[1] + 1` fails as it runs: by `+=` too (FEEDBACK45.md, Q-525).
+    says("fn f() {\n let x = [1]\n x += 1\n x\n}", &["3 cannot add list and int"]);
+    says("fn f() {\n let x = [1]\n x += [2]\n x\n}", &[]);
 }
 
 #[test]
@@ -356,7 +358,7 @@ fn a_spread_needs_what_it_spreads() {
 fn live_needs_a_server_fn_by_name_in_a_state() {
     says("fn g() = 1\ncomponent C() {\n  state a = live(g)\n  <p>{a}</p>\n}", &["3 `live` needs a server fn: `g` is not one"]);
     says("component C() {\n  state b = live(() => 1)\n  <p>{b}</p>\n}", &["2 `live` needs a server fn by name: state items = live(load_items, ...)"]);
-    says("component C() {\n  state c = live()\n  <p>{c}</p>\n}", &["2 missing argument `arg1` in call to `live`"]);
+    says("component C() {\n  state c = live()\n  <p>{c}</p>\n}", &["2 missing argument `load` in call to `live`: live(load, args)"]);
     says("server fn s() = 1\ncomponent C() {\n  let x = live(s)\n  <p>{x}</p>\n}", &["3 in <C>, `live(...)` sets state: state items = live(load_items, ...)"]);
     clean("server fn s() = 1\nfn f() = live(s)");
 }
@@ -635,14 +637,14 @@ fn a_call_of_later_on_something_else_is_a_plain_call() {
 
 #[test]
 fn http_without_its_url_is_only_that_mistake() {
-    says("fn f() = http.get()", &["1 missing argument `arg1` in call to `http.get`"]);
+    says("fn f() = http.get()", &["1 missing argument `url` in call to `http.get`: http.get(url, headers, options)"]);
     clean("fn f(u) = u | http.get({})");
 }
 
 #[test]
 fn js_without_a_name_says_what_is_missing() {
-    says("print(js())", &["1 missing argument `arg1` in call to `js`"]);
-    says("print(js_new())", &["1 missing argument `arg1` in call to `js_new`"]);
+    says("print(js())", &["1 missing argument `name` in call to `js`: js(name, args)"]);
+    says("print(js_new())", &["1 missing argument `name` in call to `js_new`: js_new(name, args)"]);
 }
 
 #[test]
@@ -663,7 +665,7 @@ fn a_helper_called_through_a_call_counts_for_nothing() {
 
 #[test]
 fn only_the_lambda_in_its_place_is_typed() {
-    says("fn f() = sort_by([1], (x) => x.name, (y) => y.name)", &["1 int has no field `name`", "1 `sort_by` takes 2 arguments, got 3"]);
+    says("fn f() = sort_by([1], (x) => x.name, (y) => y.name)", &["1 int has no field `name`", "1 `sort_by` takes 2 arguments, got 3: sort_by(xs, f)"]);
     says("fn f() = sort_by([1], (x) => x.name)", &["1 int has no field `name`"]);
 }
 

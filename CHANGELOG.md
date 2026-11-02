@@ -218,6 +218,29 @@
 - **Types written another language's way** say how Quillo writes them: `int: a` swapped,
   `a int`, `int a`, `int[]`, `list[int]`, `a?: int`, `?int`, `): int`, `let x: int`, `state
   n: int`, and in an arrow's parameters the type's own error (Q-519).
+- **Other languages' words say what Quillo writes**: `===`, `!==`, `++`, `*=`, `&`, `.5`,
+  `0b101`, curly quotes, dashes and full-width characters, `const`, `var`, `fun`, `elif`,
+  `switch`, `case`, `typeof`, `if x = 1`, `x ? 1` with no `:`, `type user =`, `import x
+  from` and `import { x } from`, each with the Quillo way; a slip of a keyword (`retrun`)
+  says which (Q-520).
+- **Several syntax errors in one run**: after the first, `check` goes on from the next
+  statement and says up to nine more (Q-522).
+- **Import mistakes are said once, at the import line**, by the path the program wrote:
+  a name the file does not have, with "did you mean", a private one, a missing file with
+  the file nearest its name, and none of the "unknown name" errors they caused.
+  `import lib/m.qwe price` shows `import lib/m.qwe use price`; `use *, price` says `*` is
+  alone; "used before it is defined" names another file's line. New warnings: a name used
+  by its old name after `as`, and a `use` repeated. What changes: a `use` list that ends
+  with `,` at a line's end is an error, where it took the next line's first word (Q-523).
+- **Names out of their scope**: in a function, a name read before its `let` is "used
+  before it is defined (line 3)", as at the top level; a block's `let` read after the
+  block says which block, and how to have it after; neither is called unused. A name
+  with a lookalike letter (Cyrillic `а` for `a`) says which, by its code point (Q-524).
+- **Builtins' arguments by their names**: `missing argument `f`, a function, in call to
+  `map`: map(xs, f)`, not `arg2`; `reduce(xs, f)` says the start value comes first;
+  `max(1, 2)` is one error, "takes one list"; `f(a: 1)` shows `f({ a: ... })`; `n -= "a"`
+  after `let n = 1` says int, not any, and `xs += 2` on a list is an error, as `[1] + 2`
+  is. What changes: `str()` with nothing to make text of is an error; it gave null (Q-525).
 
 ### Developer tools and the browser (FEEDBACK42.md)
 

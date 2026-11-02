@@ -212,7 +212,7 @@ fn mistakes_say_what_to_write() {
         ("import lib/a.qwe use a as".to_string(), "the name to call it after `as`".to_string()),
         ("import lib/a.qwe use * as".to_string(), "the name to call it after `as`".to_string()),
         ("import lib/a.qwe use a, a".to_string(), "`a` is taken twice in this `use`".to_string()),
-        ("import lib/a.qwe".to_string(), "`import` takes names from a file, and says which: import lib/a.qwe use ...".to_string()),
+        ("import lib/a.qwe".to_string(), "`import` takes names from a file, and says which after `use`: import lib/a.qwe use ...".to_string()),
         (format!("client \"{}\"", url), format!("client \"{}\" use ...", url)),
         ("preload module a.js".to_string(), "preload module a.js use ...".to_string()),
     ] {

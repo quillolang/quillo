@@ -517,6 +517,10 @@ impl Parser {
         if self.eat(&Tok::Star)? {
             // Not an operator: the line may end here.
             self.lx.last = Some(Tok::RParen);
+            // `use *, price` (FEEDBACK45.md, Q-523).
+            if self.at(&Tok::Comma)? {
+                return Err(QuilloError::new("`*` takes every public name: write `use *` alone, or name each one", line));
+            }
             return if self.eat_kw("as")? { Ok(Some(vec![("*".to_string(), self.expect_ident(as_name)?)])) } else { Ok(None) };
         }
         let mut list: Vec<(String, String)> = Vec::new();
@@ -527,10 +531,23 @@ impl Parser {
                 return Err(QuilloError::new(format!("`{}` is taken twice in this `use`", alias), line));
             }
             list.push((name, alias));
+            let comma_line = self.line()?;
             if !self.eat(&Tok::Comma)? {
                 return Ok(Some(list));
             }
+            // `use price,` at a line's end, then `print(...)`: the list went on into the next
+            // statement (FEEDBACK45.md, Q-523). A name on the next line goes on it; a call or an
+            // assignment there does not.
             self.eat(&Tok::Newline)?;
+            if self.line()? > comma_line {
+                let saved = self.save();
+                let next_is_name = matches!(self.next()?.tok, Tok::Ident(_))
+                    && (matches!(self.peek()?, Tok::Comma | Tok::Newline | Tok::Semi | Tok::Eof) || self.at_kw("as")?);
+                self.restore(saved);
+                if !next_is_name {
+                    return Err(QuilloError::new("this `use` list ends with `,`: drop it, or name what else to take on the next line", line));
+                }
+            }
         }
     }
 
@@ -651,6 +668,47 @@ impl Parser {
                 }
                 if let Some(h) = self.word_before().and_then(|w| word_habit(&w)) {
                     return self.err_at(h);
+                }
+                // `x ? 1` alone, read as `x?` and then `1` (FEEDBACK45.md, Q-520).
+                if matches!(other, Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Ident(_)) {
+                    let text = self.lx.text();
+                    let upto = self.lx.pos.min(text.len());
+                    let start = text[..upto].iter().rposition(|c| *c == '\n').map_or(0, |i| i + 1);
+                    let line: String = text[start..upto].iter().collect();
+                    if let Some(q) = line.rfind(" ? ") {
+                        if !line[q..].contains(':') && !line.contains("??") {
+                            return self.err_at("`?` needs `:` and a value for when it does not hold: `x ? 1 : 0`, or `x && 1`");
+                        }
+                    }
+                }
+                // `use lib/m.qwe use price`: names are taken with `import` (Q-520).
+                if matches!(&other, Tok::Ident(w) if w == "use") {
+                    let text = self.lx.text();
+                    let upto = self.lx.pos.min(text.len());
+                    let start = text[..upto].iter().rposition(|c| *c == '\n').map_or(0, |i| i + 1);
+                    let line: String = text[start..upto].iter().collect();
+                    if let Some(path) = line.trim_start().strip_prefix("use ") {
+                        let path = path.trim().trim_end_matches("use").trim();
+                        return self.err_at(format!("to take names from a file, `import {} use ...`; `use {}` alone takes all its public names", path, path));
+                    }
+                }
+                // `... } elif ...`: the word is what was found.
+                if let Some(h) = match &other {
+                    Tok::Ident(w) => word_habit(w),
+                    _ => None,
+                } {
+                    return self.err_at(h);
+                }
+                // `retrun x`, `lett x = 1`, `mtach x {}`: a keyword misspelt (FEEDBACK45.md,
+                // Q-520; branch feedback40-43).
+                // A word written more than once is a name of the program's (`f 2` with an `fn f`),
+                // not a slip (found in review).
+                if let Some(w) = self.word_before().filter(|w| !KEYWORDS.contains(&w.as_str()) && self.word_count(w) <= 1) {
+                    const STATEMENT: &[&str] = &["let", "fn", "view", "route", "routes", "use", "import", "return", "if", "else", "match", "for", "while", "component", "type", "state", "reply"];
+                    let most = if w.chars().count() <= 4 { 1 } else { 2 };
+                    if let Some(k) = STATEMENT.iter().copied().filter(|k| *k != w && crate::check::edit_distance(&w, k) <= most).min_by_key(|k| (crate::check::edit_distance(&w, k), *k)) {
+                        return self.err_at(format!("`{}` is no keyword: did you mean `{}`?", w, k));
+                    }
                 }
                 match other {
                     Tok::Comma => self.err_at("expected end of statement, found `,`: there is one `let` to a line"),
@@ -826,7 +884,24 @@ impl Parser {
                             return Err(QuilloError::new(format!("`{}` is a keyword, so it cannot be a name here: pick another name", n), line));
                         }
                         let capital = n.chars().next().map_or(false, |c| c.is_ascii_uppercase());
+                        let lower_name = n.clone();
                         self.next()?;
+                        // `type user = { ... }`: a type's name starts with a capital (Q-520).
+                        if !capital && self.at(&Tok::Assign)? {
+                            // By characters, not bytes: `type ūser`, `type Éclair` and `type _x` too
+                            // (found in review).
+                            let mut chars = lower_name.chars();
+                            let first = chars.next().unwrap_or('_');
+                            let up: String = first.to_uppercase().collect();
+                            let msg = if first.is_ascii_lowercase() {
+                                format!("a type's name starts with a capital letter: `type {}{} = ...`", up, chars.as_str())
+                            } else if first.is_alphabetic() {
+                                format!("a type's name starts with a capital letter from A to Z, as `User`: `{}` does not", lower_name)
+                            } else {
+                                format!("a type's name starts with a capital letter, as `User`: `{}` does not", lower_name)
+                            };
+                            return Err(QuilloError::new(msg, line));
+                        }
                         if capital && self.at(&Tok::Assign)? {
                             if !crate::ast::is_type_name(&n) {
                                 return Err(QuilloError::new(format!("a type is named like `User` or `OrderLine`, with small letters: `{}` reads as a constant", n), line));
@@ -1073,10 +1148,27 @@ impl Parser {
                     if self.at_import() {
                         return self.import_stmt(w, line);
                     }
-                    // `client /total` is a division, so a path that starts with `/` needs its `use`.
+                    // `import { price } from "lib/m.qwe"`, `import price from ...`: JavaScript's
+                    // and Python's order (FEEDBACK45.md, Q-520, Q-523; branch feedback40-43).
                     let rest = self.rest_of_line();
+                    if w == "import" && (rest.trim_start().starts_with('{') || rest.contains(" from ")) {
+                        let file = rest.rsplit(" from ").next().unwrap_or("").trim().trim_matches(|c| c == '"' || c == '\'' || c == ';');
+                        let names: String = rest.split(" from ").next().unwrap_or("").trim().trim_matches(|c| c == '{' || c == '}').trim().to_string();
+                        return Err(QuilloError::new(format!("the file comes first, then the names: `import {} use {}`", if file.is_empty() { "lib/m.qwe" } else { file }, if names.is_empty() { "price" } else { &names }), line));
+                    }
+                    // `client /total` is a division, so a path that starts with `/` needs its `use`.
                     if !rest.trim_start().starts_with('/') && import_line(&format!("{} {}", w, rest)) {
-                        return Err(QuilloError::new(format!("`{}` takes names from a file, and says which: {} {} use ...", w, w, rest.trim()), line));
+                        // `import lib/m.qwe price`: its `use` left out (Q-523).
+                        // `preload module a.js`: the word `module` goes with the path.
+                        let rest = rest.trim();
+                        let (module, rest) = match rest.strip_prefix("module ") {
+                            Some(r) => ("module ", r.trim_start()),
+                            None => ("", rest),
+                        };
+                        let mut words = rest.splitn(2, char::is_whitespace);
+                        let file = format!("{}{}", module, words.next().unwrap_or(""));
+                        let names = words.next().map(str::trim).filter(|n| !n.is_empty()).unwrap_or("...");
+                        return Err(QuilloError::new(format!("`{}` takes names from a file, and says which after `use`: {} {} use {}", w, w, file, names), line));
                     }
                 }
                 "return" => {
@@ -1978,6 +2070,10 @@ impl Parser {
         if self.at(&Tok::Question)? {
             self.next()?;
             let a = self.parse_expr()?;
+            // `x ? 1` alone (FEEDBACK45.md, Q-520).
+            if !self.at(&Tok::Colon)? {
+                return self.err_at("`?` needs `:` and a value for when it does not hold: `x ? 1 : 0`, or `x && 1`");
+            }
             self.expect(&Tok::Colon, "`:` in `cond ? a : b`")?;
             let b = self.parse_expr()?;
             return Ok(Expr::If(Box::new(cond), Box::new(a), Some(Box::new(b))));
@@ -2187,11 +2283,20 @@ impl Parser {
                             return p.err_at("a function's parameters are plain names, not patterns: `(p) => p[0] + p[1]`");
                         }
                         if p.at(&Tok::Colon)? {
-                            return p.err_at("there are no named arguments: pass a map, as `f({ c: 9 })`");
+                            // With the names written (FEEDBACK45.md, Q-525).
+                            let f = match &e { Expr::Ident(n, _) => n.to_string(), _ => "f".to_string() };
+                            let arg = match args.last() { Some(Expr::Ident(n, _)) => n.to_string(), _ => "c".to_string() };
+                            return p.err_at(format!("there are no named arguments: give the value alone, `{}(...)`, or pass a map with the names, `{}({{ {}: ... }})`", f, f, arg));
                         }
                         let next = p.peek()?.clone();
                         if let Some(h) = habit(&next) {
                             return p.err_at(h);
+                        }
+                        // `print(typeof x)`: the word before what was found (Q-520).
+                        if let (Some(Expr::Ident(w, _)), false) = (args.last(), matches!(next, Tok::RParen)) {
+                            if let Some(h) = word_habit(w) {
+                                return p.err_at(h);
+                            }
                         }
                         p.expect(&Tok::RParen, "`)` after arguments")?;
                         Ok(args)
@@ -2361,6 +2466,16 @@ impl Parser {
 
     /// After `{` in expression position: a map if it is empty or starts with
     /// The word just before the next token, for what an error can say of it.
+    /// How many times `w` is written in the file as a whole word.
+    fn word_count(&self, w: &str) -> usize {
+        let text = self.lx.text();
+        let want: Vec<char> = w.chars().collect();
+        let word = |c: char| c.is_alphanumeric() || c == '_';
+        (0..text.len().saturating_sub(want.len() - 1))
+            .filter(|&i| text[i..i + want.len()] == want[..] && (i == 0 || !word(text[i - 1])) && text.get(i + want.len()).map_or(true, |c| !word(*c)))
+            .count()
+    }
+
     fn word_before(&self) -> Option<String> {
         let text = self.lx.text();
         let upto = self.lx.pos.min(text.len());
@@ -2517,6 +2632,10 @@ impl Parser {
         if self.at_kw("then")? {
             return self.err_at("`if c then a else b` is now written `c ? a : b`");
         }
+        // `if x = 1 {`: an assignment meant as a comparison (FEEDBACK45.md, Q-520).
+        if self.at(&Tok::Assign)? {
+            return self.err_at("`=` gives a value; to compare, `==`: `if x == 1 { ... }`");
+        }
         if !self.at(&Tok::LBrace)? {
             return self.err_at("expected `{` after the `if` condition (or write `cond ? a : b`)");
         }
@@ -2552,6 +2671,18 @@ impl Parser {
             } else {
                 None
             };
+            // `1: "a"`, `1 -> "a"`, `case 1 =>`, `n where n > 0 =>`: other languages' arms
+            // (FEEDBACK45.md, Q-520; branch feedback40-43).
+            match self.peek()? {
+                Tok::Colon | Tok::Arrow => return self.err_at("a `match` arm is a pattern, `=>` and its value: `1 => \"one\"`"),
+                Tok::Ident(w) if w == "where" || w == "when" => return self.err_at("a guard is written with `if`: `n if n > 0 => ...`"),
+                _ => {}
+            }
+            if let (Pattern::Bind(w), Tok::Int(_) | Tok::Str(_) | Tok::Ident(_)) = (&pat, self.peek()?.clone()) {
+                if &**w == "case" {
+                    return self.err_at("there is no `case`: a `match` arm is `1 => \"one\"`");
+                }
+            }
             self.expect(&Tok::FatArrow, "`=>` after the match pattern")?;
             let body = self.parse_arrow_body()?;
             arms.push(Arm { pat, guard, body, line: arm_line });
@@ -3280,6 +3411,55 @@ fn arrow(params: Vec<Param>, ret: Option<Ty>, (body, nesting): (Expr, u32), line
     }))
 }
 
+/// The syntax errors of `src` after the one on line `after`: each from the next line that
+/// starts a top-level statement on, as a parser that stops at its first error cannot (at most
+/// nine more; FEEDBACK45.md, Q-522; branch feedback40-43).
+pub fn more_errors(src: &str, after: u32) -> Vec<QuilloError> {
+    const STARTS: &[&str] = &[
+        "let ", "fn ", "view ", "component ", "route ", "routes ", "type ", "use ", "import ", "server fn ", "service ", "mount ",
+        "client ", "preload ", "preconnect ", "print(", "database ", "site ", "style ", "test ",
+    ];
+    let lines: Vec<&str> = src.split('\n').collect();
+    // A line inside a `...` template or a string is its text, not a statement (found in
+    // review): which lines start inside one, read as the lexer would, `//` comments aside.
+    let mut inside = Vec::with_capacity(lines.len());
+    let (mut tick, mut quote) = (false, false);
+    for line in &lines {
+        inside.push(tick || quote);
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' if tick || quote => {
+                    chars.next();
+                }
+                '`' if !quote => tick = !tick,
+                '"' if !tick => quote = !quote,
+                '/' if !tick && !quote && chars.peek() == Some(&'/') => break,
+                _ => {}
+            }
+        }
+    }
+    let mut out: Vec<QuilloError> = Vec::new();
+    let mut last = after;
+    // The error's own line may start the next statement (`let a = (1` is said at the `let` of
+    // the line after): look from there, and a line further each time nothing new is found.
+    let mut from = (after as usize).saturating_sub(1);
+    while out.len() < 9 {
+        let Some(i) = (from..lines.len()).find(|&i| !inside[i] && STARTS.iter().any(|s| lines[i].starts_with(s))) else { break };
+        let rest = lines[i..].join("\n");
+        match Parser::with_line(&rest, (i + 1) as u32).parse_program() {
+            Ok(_) => break,
+            Err(e) if e.line <= last => from = i + 1,
+            Err(e) => {
+                last = e.line;
+                from = i + 1;
+                out.push(e);
+            }
+        }
+    }
+    out
+}
+
 /// What to write instead of an old Wisp-era spelling.
 /// What to write for what Python and JavaScript write, where a token gives it away
 /// (FEEDBACK29.md, Q-359; branch feedback29-fixes).
@@ -3298,7 +3478,13 @@ fn word_habit(w: &str) -> Option<&'static str> {
         "class" => "there are no classes: `type` for a record, and functions",
         "yield" => "there are no generators: return a list",
         "throw" | "raise" => "there is no `throw`: `return err(...)`",
-        "def" | "function" | "func" => "a function is `fn name(x) = ...`",
+        "def" | "function" | "func" | "fun" => "a function is `fn name(x) = ...`",
+        // Other languages' words (FEEDBACK45.md, Q-520; branch feedback40-43).
+        "const" | "var" | "val" => "there is no `const` or `var`: `let x = 1`, which can be given again with `x = 2`",
+        "elif" | "elsif" => "after `if`, `else if`",
+        "switch" => "there is no `switch`: `match x { 1 => \"one\", _ => \"other\" }`",
+        "typeof" => "`type_of(x)` gives a value's type",
+        "from" => "names are taken from a file with `import lib/m.qwe use price`",
         _ => return None,
     })
 }

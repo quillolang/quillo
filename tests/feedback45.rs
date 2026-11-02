@@ -345,3 +345,203 @@ fn types_written_another_way_say_how_they_are_written() {
     // Written the right way, or names that are types' too: nothing said.
     assert!(diags("fn f(a: int?, b: list<int> = [], list, str) = a\nlet g = (a: int, b) => a + b\nlet h = (x): int => x\nlet yes = true\nlet t = (yes ? 2 : 3)\ntype Int = { n: int }\nfn k(a: Int) = a\n").is_empty());
 }
+
+// Q-520, Q-008: other languages' words and characters say what Quillo writes, with no note
+// that the code may be for a newer Quillo.
+#[test]
+fn other_languages_words_say_what_quillo_writes() {
+    for (src, want) in [
+        ("const x = 1\n", "there is no `const` or `var`: `let x = 1`"),
+        ("var x = 1\n", "there is no `const` or `var`"),
+        ("fun add(a) = a\n", "a function is `fn name(x) = ...`"),
+        ("retrun 1\n", "`retrun` is no keyword: did you mean `return`?"),
+        ("lett x = 1\n", "`lett` is no keyword: did you mean `let`?"),
+        ("if true { 1 } elif false { 2 }\n", "after `if`, `else if`"),
+        ("switch x { 1 => 2 }\n", "there is no `switch`"),
+        ("let x = 1 === 1\n", "there is no `===`"),
+        ("let a = 1\na++\n", "there is no `++`: `n += 1`"),
+        ("let n = 1\nn *= 2\n", "there is no `*=`: `n = n * 2`"),
+        ("print(.5)\n", "a number starts with a digit: `0.5`, not `.5`"),
+        ("print(0b101)\n", "there are no binary or octal numbers"),
+        ("print(1 & 2)\n", "`&&` is and; for bits, `bit.and(a, b)`"),
+        ("print(typeof 1)\n", "`type_of(x)` gives a value's type"),
+        ("let x = 1\nif x = 1 { print(1) }\n", "`=` gives a value; to compare, `==`"),
+        ("let x = true\nlet y = x ? 1\n", "`?` needs `:` and a value for when it does not hold"),
+        ("type user = { name: str }\n", "a type's name starts with a capital letter: `type User = ...`"),
+        ("let x = match 1 { case 1 => 2 }\n", "there is no `case`"),
+        ("let x = match 1 { 1: 2 }\n", "a `match` arm is a pattern, `=>` and its value"),
+        ("let x = match 1 { 1 -> 2 }\n", "a `match` arm is a pattern, `=>` and its value"),
+        ("let x = match 1 { n where n > 0 => n }\n", "a guard is written with `if`"),
+        ("import { price } from \"lib/m.qwe\"\n", "the file comes first, then the names: `import lib/m.qwe use price`"),
+        ("import price from \"lib/m.qwe\"\n", "`import lib/m.qwe use price`"),
+        ("from lib/m.qwe import price\n", "`import lib/m.qwe use price`"),
+        ("print(“hello”)\n", "a curly quote: write `\"`"),
+        ("print(5 – 2)\n", "a dash or a minus sign: write `-`"),
+        ("print（1）\n", "a full-width one: write `(`"),
+        ("let x = 1 \\\n+ 2\n", "a line goes on by itself after an operator"),
+    ] {
+        let r = check_source(src, "t.qwe", Path::new("."));
+        let d: Vec<String> = r.diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(d.iter().any(|w| w.contains(want)), "{} {:?}", src, d);
+        // A message that says what to write names a rule: no "newer Quillo" note.
+        assert!(r.syntax_errors.iter().all(|(e, _)| !quillo::error::may_be_newer_syntax(e)), "{} {:?}", src, r.syntax_errors);
+    }
+    // What is right stays right: ranges, indexes, `&&`, ternaries, `?` passing an error on, `use`.
+    assert!(diags("let r = 1..5\nlet xs = [1, 2]\nprint(xs[0] + 1.5, true && false, true ? 1 : 2)\nfn f(x) = x?\nlet type = 1\nprint(4/2)\n").is_empty());
+}
+
+// Q-522: the syntax errors after the first, each from the next statement on; the first first.
+#[test]
+fn several_syntax_errors_are_said_in_one_run() {
+    let lines = |src: &str| check_source(src, "t.qwe", Path::new(".")).diagnostics.iter().map(|d| d.line).collect::<Vec<_>>();
+    assert_eq!(lines("let a = (1\nlet b = 2 +\nlet c = [1 2]\nfn f( = 1\nlet ok = 1\n"), [2, 3, 4]);
+    assert_eq!(lines("fn f() {\n  let x = (1\n  print(x)\n}\nfn g() = [1 2]\nfn h() = 3\n"), [3, 5]);
+    // One error, at the end: said once.
+    assert_eq!(lines("let a = 1\nlet b = (\n"), [3]);
+    // At most ten.
+    let many: String = (0..30).map(|_| "let x = (1\n").collect();
+    assert_eq!(lines(&many).len(), 10);
+}
+
+// Q-523: an import line's mistake said there, once, by the path written; the right fix for a
+// missing `use`; a `use` list does not run on into the next line; another file's line named.
+#[test]
+fn import_mistakes_are_said_at_the_import_line() {
+    let dir = std::env::temp_dir().join(format!("quillo-f45-imports-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    std::fs::write(dir.join("lib/m.qwe"), "fn price(x) = x * 2\nprivate fn secret() = 1\nfn cost(x) = x\n").unwrap();
+    let d = |src: &str| diags_in(src, &dir);
+    assert_eq!(d("import lib/m.qwe use pricee\nprint(pricee(1))\n"), ["1 lib/m.qwe has no public name `pricee` (did you mean `price`?)"]);
+    assert_eq!(d("import lib/m.qwe use secret\nprint(secret())\n"), ["1 `secret` is private to lib/m.qwe: make it `public` there, or take something public"]);
+    let missing = d("import lib/mm.qwe use price\nprint(price(1))\n");
+    assert_eq!(missing.len(), 1, "{:?}", missing);
+    assert!(missing[0].starts_with("1 cannot read lib/mm.qwe") && missing[0].ends_with("(did you mean lib/m.qwe?)"), "{:?}", missing);
+    assert_eq!(d("import lib/m.qwe price\n"), ["1 `import` takes names from a file, and says which after `use`: import lib/m.qwe use price"]);
+    assert_eq!(d("import lib/m.qwe use *, price\n"), ["1 `*` takes every public name: write `use *` alone, or name each one"]);
+    assert_eq!(d("import lib/m.qwe use price,\nprint(price(1))\n"), ["1 this `use` list ends with `,`: drop it, or name what else to take on the next line"]);
+    assert_eq!(d("import lib/m.qwe use price,\nlet x = 1\n"), ["1 this `use` list ends with `,`: drop it, or name what else to take on the next line"]);
+    assert_eq!(d("print(price(1))\nuse lib/m.qwe\n"), ["1 `price` is used before it is defined (lib/m.qwe:1)"]);
+    // The old name after `as`, and a `use` twice: warnings, and the program runs.
+    assert_eq!(d("import lib/m.qwe use price as p\nprint(price(1))\nprint(price(2))\n"), ["2 warning: this file takes `price` as `p`: write `p`, or take `price` too"]);
+    assert_eq!(d("import lib/m.qwe use price\nimport lib/m.qwe use price\nprint(price(1))\n"), ["2 warning: `price` is taken a second time from lib/m.qwe: drop this one"]);
+    assert_eq!(d("use lib/m.qwe\nuse lib/m.qwe\nprint(price(1))\n"), ["2 warning: lib/m.qwe is taken a second time in this file: once is enough"]);
+    // What is right stays right: a list over lines, `use *`, both names, a local or parameter of
+    // the old name, and a builtin's name taken as another.
+    for ok in [
+        "import lib/m.qwe use price,\n    cost\nprint(price(cost(1)))\n",
+        "import lib/m.qwe use price,\n    cost as c\nprint(price(c(1)))\n",
+        "import lib/m.qwe use *\nprint(price(1))\n",
+        "import lib/m.qwe use price as p, price\nprint(price(p(1)))\n",
+        "import lib/m.qwe use price as p\nfn f(price) = price + 1\nlet price = 3\nprint(f(p(price)))\nprint([1].map((price) => price))\n",
+        "import lib/m.qwe use price, cost as p\nprint(price(p(1)))\n",
+    ] {
+        assert!(d(ok).is_empty(), "{} {:?}", ok, d(ok));
+    }
+    std::fs::write(dir.join("lib/n.qwe"), "fn len(x) = 0\n").unwrap();
+    // (Defining `len` is warned of in lib/n.qwe; `len` here is still not an old name.)
+    let builtin = d("import lib/n.qwe use len as size\nprint(len([1]), size(1))\n");
+    assert!(builtin.iter().all(|w| !w.contains("takes `len` as")), "{:?}", builtin);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Q-524: a name read before its `let` in a function, or after the block that declared it, says
+// so and is not called unused; a lookalike letter is named by its code point.
+#[test]
+fn names_out_of_their_scope_say_where_they_are() {
+    assert_eq!(diags("fn f() {\n    print(tmp)\n    let tmp = 1\n}\nf()\n"), ["2 `tmp` is used before it is defined (line 3)"]);
+    // From a lambda in the function, before the `let`: it runs after it, so fine, and `soon`
+    // is not unused (found in review).
+    assert!(diags("fn f() {\n    let g = () => soon\n    let soon = 1\n    print(g())\n}\nf()\n").is_empty());
+    assert_eq!(
+        diags("if true {\n    let x = 1\n} else {\n    let z = 2\n}\nprint(x, z)\n"),
+        [
+            "6 `x` is declared inside the `if` (line 2), and is not seen after it: declare it before the `if` (`let x = ...`), and assign it inside",
+            "6 `z` is declared inside the `if` (line 4), and is not seen after it: declare it before the `if` (`let z = ...`), and assign it inside",
+        ]
+    );
+    assert_eq!(
+        diags("fn f() {\n    for i in [1] {\n        let y = i\n    }\n    return y\n}\nprint(f())\n"),
+        ["5 `y` is declared inside the `for` (line 3), and is not seen after it: declare it before the `for` (`let y = ...`), and assign it inside"]
+    );
+    assert_eq!(
+        diags("fn f() {\n    let n = 0\n    while n < 3 {\n        let m = n\n        n += 1\n    }\n    print(m)\n}\nf()\n"),
+        ["7 `m` is declared inside the `while` (line 4), and is not seen after it: declare it before the `while` (`let m = ...`), and assign it inside"]
+    );
+    assert_eq!(
+        diags("let а = 1\nprint(a)\n"),
+        ["2 unknown name `a` (`а` is defined on line 1 with other letters that look the same: the `а` on line 1 has U+0430, a Cyrillic letter, not `a`)"]
+    );
+    assert_eq!(
+        diags("let a = 1\nprint(а)\n"),
+        ["2 unknown name `а` (`a` is defined on line 1 with other letters that look the same: this one has U+0430, a Cyrillic letter, not `a`)"]
+    );
+    assert_eq!(
+        diags("let Οk = 1\nprint(Ok)\n"),
+        ["2 unknown name `Ok` (`Οk` is defined on line 1 with other letters that look the same: the `Οk` on line 1 has U+039F, a Greek letter, not `O`)"]
+    );
+    // Still as they were: a name nothing defines, one in another function, a `let` in a block
+    // after the read, a block's own unused `let`, and one read where it is seen.
+    assert_eq!(diags("fn f() {\n    print(nope)\n}\nf()\n"), ["2 unknown name `nope` (did you mean `now`?)"]);
+    assert_eq!(diags("fn f() {\n    let q = 1\n    print(q)\n}\nfn g() = q\nprint(f(), g())\n"), ["5 unknown name `q`"]);
+    let d = diags("fn f() {\n    print(tmp)\n    if true {\n        let tmp = 1\n    }\n}\nf()\n");
+    assert!(d[0].starts_with("2 unknown name `tmp`") && d[1] == "4 warning: unused variable `tmp` (name it `_tmp` if that is intended)", "{:?}", d);
+    assert_eq!(diags("fn f() {\n  let u = 1\n}\nf()\n"), ["2 warning: unused variable `u` (name it `_u` if that is intended)"]);
+    assert!(diags("fn f() {\n    let x = 0\n    if true {\n        let y = 1\n        print(y)\n    }\n    return x\n}\nprint(f())\nlet ü = 1\nprint(ü)\n").is_empty());
+    // A lambda reading a `let` above it, called after: as before, fine.
+    assert!(diags("fn f() {\n    let n = 2\n    let g = () => n\n    print(g())\n}\nf()\n").is_empty());
+}
+
+// Q-525: builtins' parameters by their docs' names, the call shown, one error for `max(1, 2)`,
+// the start value of `reduce`, named arguments, `+=` and `-=` held to the first value's type.
+#[test]
+fn builtin_calls_say_what_they_take() {
+    for (src, want) in [
+        ("print(map([1, 2]))\n", "1 missing argument `f`, a function, in call to `map`: map(xs, f)"),
+        ("let xs = [1]\nprint(reduce(xs, (a, x) => a + x))\n", "2 `reduce` takes `start` before the function: reduce(xs, start, f)"),
+        ("print(replace(\"aa\", \"a\"))\n", "1 missing argument `to` in call to `replace`: replace(s, from, to)"),
+        ("print(max(1, 2))\n", "1 `max` takes one list: put the items in it, `max([...])`"),
+        ("print(sum(1, 2, 3))\n", "1 `sum` takes one list: put the items in it, `sum([...])`"),
+        ("print(str())\n", "1 missing argument `x` in call to `str`: str(x)"),
+        ("print(upper(\"a\", \"b\"))\n", "1 `upper` takes 1 argument, got 2: upper(s)"),
+        ("fn f(a) = a\nprint(f(a: 1))\n", "2 there are no named arguments: give the value alone, `f(...)`, or pass a map with the names, `f({ a: ... })`"),
+        ("let n = 1\nn -= \"a\"\n", "2 cannot subtract int and str"),
+        ("let xs = [1]\nxs += 2\n", "2 cannot add list and int"),
+    ] {
+        assert_eq!(diags(src), [want], "{}", src);
+    }
+    // A program's own function keeps its parameters' names, and no shape.
+    assert_eq!(diags("fn f(a, b) = a\nprint(f(1))\n"), ["2 missing argument `b` in call to `f`"]);
+    // What `+=` and `-=` may do stays allowed: a float added to an int, text to text, a list to
+    // a list, and any once `=` gives the variable another value.
+    assert!(diags("let n = 1\nn += 0.5\nlet s = \"\"\ns += \"a\"\nlet xs = []\nxs += [1]\nlet m = 1\nm = \"x\"\nm += \"y\"\nprint(n, s, xs, m, str(1), max([1, 2]), reduce([1], 0, (a, x) => a + x))\n").is_empty());
+}
+
+// The review of slice C: what its first version said wrongly.
+#[test]
+fn the_reviews_cases_for_imports_and_scopes() {
+    let dir = std::env::temp_dir().join(format!("quillo-f45-review-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    std::fs::write(dir.join("lib/m.qwe"), "fn price(x) = x * 2\n").unwrap();
+    std::fs::write(dir.join("lib/sub.qwe"), "fn helper() = pricee\n").unwrap();
+    let d = |src: &str| diags_in(src, &dir);
+    // A prop, a view's parameter or a local of the old name is the file's own.
+    assert!(d("import lib/m.qwe use price as p\ncomponent Card(price: int) {\n    <div>{price}</div>\n}\nview Home() = <div><Card price={p(3)}/></div>\n").is_empty());
+    // A local of the other file's name is what the alias finds: still said.
+    assert_eq!(d("import lib/m.qwe use price as p\nroute GET /item/:price {\n    let n = int(price) ?? 0\n    p(n)\n}\n"), ["4 cannot call `price`: it is str, not a function"]);
+    // A name another file's import could not take is still said in this one.
+    let sub = d("import lib/m.qwe use pricee\nimport lib/sub.qwe use helper\nprint(helper())\n");
+    assert!(sub.iter().any(|w| w.contains("unknown name `pricee`")), "{:?}", sub);
+    let _ = std::fs::remove_dir_all(&dir);
+    // A `let` in a sibling block does not define what the other read; a closure may read a
+    // `let` below it.
+    assert_eq!(diags("fn a() {\n    if true { print(x) }\n    if false {\n        let x = 1\n        print(x)\n    }\n}\na()\n"), ["2 unknown name `x`"]);
+    assert!(diags("fn c() {\n    let g = () => z\n    let z = 1\n    return g()\n}\nprint(c())\n").is_empty());
+    // A name of the program's is not a slipped keyword; `len` takes more than lists.
+    assert_eq!(diags("fn f(x) = x\nf 2\n"), ["2 expected end of statement, found `2`"]);
+    assert_eq!(diags("print(len(\"a\", \"b\"))\n"), ["1 `len` takes 1 argument, got 2: len(x)"]);
+    assert_eq!(diags("type Éclair = { a: int }\n"), ["1 a type's name starts with a capital letter from A to Z, as `User`: `Éclair` does not"]);
+    assert_eq!(diags("type _x = { a: int }\n"), ["1 a type's name starts with a capital letter, as `User`: `_x` does not"]);
+    // A template's line that starts like a statement is its text.
+    let lines: Vec<u32> = check_source("let a = 1 +\nlet doc = md`\nExample:\nlet x = 1\n`\nlet b = [1, 2\nprint(doc)\nfn ok() = `the end`\n", "t.qwe", Path::new(".")).diagnostics.iter().map(|d| d.line).collect();
+    assert_eq!(lines, [2, 7]);
+}

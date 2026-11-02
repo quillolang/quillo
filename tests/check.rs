@@ -710,7 +710,8 @@ fn use_takes_names_from_plugins() {
     };
     // Every way to write it.
     let ok = check("use lib/greet.qwe\nuse lib\\greet\nimport \"lib/greet.qwe\" use *\nimport lib/kv.qwer use cache_get as kv_get, cache_set\nimport lib/mem use cache_get as mem_get\nprint(hello(\"a\"), kv_get(\"k\"), cache_set(\"k\", \"v\"), mem_get(\"k\"))\n");
-    assert!(ok.is_empty(), "{:#?}", ok);
+    // The same file each way: each line after the first says it takes it again (Q-523).
+    assert!(ok.iter().all(|w| w.ends_with("lib/greet.qwe is taken a second time in this file: once is enough")) && ok.len() == 2, "{:#?}", ok);
     // A name taken under another is not there under its own.
     let renamed = check("use cache_get as kv_get from lib/kv\nprint(cache_get(\"k\"))\n");
     assert!(renamed.iter().any(|m| m.contains("unknown name `cache_get`")), "{:#?}", renamed);

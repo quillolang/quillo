@@ -160,7 +160,7 @@ fn filled_is_there_for_scripts_too() {
 #[test]
 fn filled_is_known_to_the_checker_and_the_browser() {
     clean("component C(name: str) = <p>{filled(name) ?? \"anonymous\"}</p>\nroute GET / = <C name=\"\"/>");
-    one("filled()", "missing argument `arg1` in call to `filled`");
+    one("filled()", "missing argument `x` in call to `filled`: filled(x)");
 }
 
 // ---- `break` and `continue` (Q-152) ------------------------------------------------------------
@@ -313,7 +313,7 @@ fn what_is_not_an_int_is_refused_at_each_argument() {
 fn the_checker_knows_the_module() {
     clean("print(bit.and(1, 2), bit.or(1, 2), bit.xor(1, 2), bit.not(1), bit.shl(1, 2), bit.shr(1, 2))");
     one("bit.nope(1)", "`bit` has no function `nope`");
-    one("bit.and(1)", "missing argument `arg2` in call to `bit.and`");
+    one("bit.and(1)", "missing argument `b` in call to `bit.and`: bit.and(a, b)");
     one("bit.and(\"a\", 1)", "argument 1 of `bit.and` must be int, got str");
     clean("component C(n: int) = <p>{bit.and(n, 0xFF)} {bit.shl(1, n)}</p>\nroute GET / = <C n={3}/>");
 }

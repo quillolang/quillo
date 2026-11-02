@@ -30,6 +30,9 @@ pub struct Problem {
     pub file: PathBuf,
     pub line: u32,
     pub message: String,
+    /// The name the import line takes that this is about, so its uses are not said again as
+    /// unknown (FEEDBACK45.md, Q-523).
+    pub name: Option<String>,
 }
 
 #[derive(Default)]
@@ -51,6 +54,11 @@ pub struct Links {
     /// How the program writes the path of each file it `use`s.
     written: HashMap<PathBuf, String>,
     pub problems: Vec<Problem>,
+    /// What a `use` takes again: said as a warning, the program runs (FEEDBACK45.md, Q-523).
+    pub repeats: Vec<Problem>,
+    /// By file, the names it takes only `as` another name, with that name: the one the other
+    /// file calls it, written here, is not one it took (Q-523).
+    pub old_names: HashMap<PathBuf, HashMap<String, String>>,
     /// Each file as it was parsed, before any renaming.
     pub parsed: HashMap<PathBuf, Arc<Vec<Stmt>>>,
 }
@@ -190,6 +198,7 @@ pub fn link(main: &Path, stmts: Arc<Vec<Stmt>>, base: &Path, read: &mut dyn FnMu
         let mut imports = Imports::default();
         let mut whole: BTreeMap<&str, Vec<(String, usize)>> = BTreeMap::new();
         let mut named: HashMap<String, String> = HashMap::new();
+        let mut renamed: Vec<(String, String)> = Vec::new();
         for s in stmts.iter() {
             let Stmt::Use(path, names, line, _) = s else { continue };
             if crate::ast::is_script(path) {
@@ -199,10 +208,14 @@ pub fn link(main: &Path, stmts: Arc<Vec<Stmt>>, base: &Path, read: &mut dyn FnMu
             let path = resolve_from(base, file, path);
             let k = key(&base.join(&path));
             let target = files.iter().position(|(f, _)| *f == k);
-            let mut problem = |message: String| links.problems.push(Problem { file: file.clone(), line: *line, message });
+            let mut problem = |message: String, name: Option<String>| links.problems.push(Problem { file: file.clone(), line: *line, message, name });
+            let mut repeat = |message: String| links.repeats.push(Problem { file: file.clone(), line: *line, message, name: None });
             match (names, target) {
                 (None, Some(t)) => {
-                    imports.files.insert(k);
+                    if !imports.files.insert(k) {
+                        repeat(format!("{} is taken a second time in this file: once is enough", path));
+                        continue;
+                    }
                     for (n, _) in tops[t].iter().filter(|(n, _)| !own.contains(n.as_str())) {
                         whole.entry(n).or_default().push((final_of(t, n), t));
                     }
@@ -214,21 +227,33 @@ pub fn link(main: &Path, stmts: Arc<Vec<Stmt>>, base: &Path, read: &mut dyn FnMu
                     for (n, alias) in list {
                         if !tops[t].iter().any(|(m, _)| m == n) {
                             let private = defined_privately(&files[t].1, n);
-                            problem(if private {
-                                format!("`{}` is private to {}: make it `public` there, or take something public", n, path)
-                            } else {
-                                format!("{} has no public name `{}`", path, n)
-                            });
+                            let public: Vec<&str> = tops[t].iter().map(|(m, _)| m.as_str()).collect();
+                            let near = public.iter().copied().filter(|m| crate::check::edit_distance(n, m) <= 2).min_by_key(|m| (crate::check::edit_distance(n, m), *m));
+                            problem(
+                                if private {
+                                    format!("`{}` is private to {}: make it `public` there, or take something public", n, path)
+                                } else {
+                                    format!("{} has no public name `{}`{}", path, n, near.map_or(String::new(), |m| format!(" (did you mean `{}`?)", m)))
+                                },
+                                Some(alias.clone()),
+                            );
                             continue;
                         }
                         if own.contains(alias.as_str()) {
-                            problem(format!("`{}` is defined in this file, and taken from {}: take it `as` another name", alias, path));
+                            problem(format!("`{}` is defined in this file, and taken from {}: take it `as` another name", alias, path), None);
                             continue;
                         }
                         let f = final_of(t, n);
                         if named.get(alias).is_some_and(|other| *other != f) {
-                            problem(format!("`{}` is taken twice, the second time from {}: take one `as` another name", alias, path));
+                            problem(format!("`{}` is taken twice, the second time from {}: take one `as` another name", alias, path), None);
                             continue;
+                        }
+                        if named.get(alias).is_some() {
+                            repeat(format!("`{}` is taken a second time from {}: drop this one", alias, path));
+                            continue;
+                        }
+                        if n != alias {
+                            renamed.push((n.clone(), alias.clone()));
                         }
                         named.insert(alias.clone(), f.clone());
                         imports.names.insert(f.clone());
@@ -240,6 +265,14 @@ pub fn link(main: &Path, stmts: Arc<Vec<Stmt>>, base: &Path, read: &mut dyn FnMu
                 // A plugin's names, or a file that is reported where it is used.
                 (Some(list), None) => imports.names.extend(list.iter().map(|(_, alias)| alias.clone())),
             }
+        }
+        // `use price as p`, then `price(1)`: still the other file's, though not taken by that name.
+        let old: HashMap<String, String> = renamed
+            .into_iter()
+            .filter(|(n, _)| n.starts_with(|c: char| c.is_lowercase()) && !own.contains(n.as_str()) && !named.contains_key(n) && !whole.contains_key(n.as_str()))
+            .collect();
+        if !old.is_empty() {
+            links.old_names.insert(file.clone(), old);
         }
         for (n, from) in whole {
             if named.contains_key(n) {
