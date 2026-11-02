@@ -314,14 +314,22 @@ for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; 
 
 ### Test coverage
 
-**98.44% of lines** of the Rust source run under the tests (44,408 lines, 693 not run),
-measured on 2026-11-02 on branch `feedback27-35-fixes` (23146e4 and its changes) with
-`cargo llvm-cov` on macOS: the Lines column of the report's total, from 2,191 tests,
-Chrome, PostgreSQL and MariaDB included. Every line the FEEDBACK27 to 35 fixes added or
-changed is run. The browser runtime (`src/client/runtime.js`) is JavaScript and not in
-this number; its changes are run by the browser tests in [`tests/browser/`](tests/browser).
-What is not run is mostly `unreachable!` arms, failures of the operating system, and
-other systems' branches.
+**Rust: 97.91% of lines** run under the tests (47,074 lines, 985 not run).
+**Browser runtime (`src/client/runtime.js`): 99.78% of lines** (4,529 lines, 10 not run).
+Both were measured together on 2026-11-02 on branch `runtime-coverage` (c8b50ae, with main's
+FEEDBACK36 to 39 merged in) on macOS, from 2,227 tests with Chrome, PostgreSQL and MariaDB
+included. The Rust figure is the Lines column of `cargo llvm-cov`'s total. The runtime's is
+V8's own coverage from headless Chrome and every Node a test starts, mapped back to
+runtime.js's lines. What Rust does not run is mostly the new in-process app bridge
+(`src/embed.rs`, 82.83%), loops compiled to machine code (`src/jitloop.rs`, 89.91%),
+`unreachable!` arms, operating system failures and other systems' branches. The
+runtime's 10 lines are defensive guards and a few branches no test reaches yet.
+
+runtime.js must stay at **99.50% or above** on every change, and every line a change
+touches must run in some test: `sh scripts/runtime-coverage.sh` runs the tests and checks
+both, and CI runs it on each push. `sh scripts/coverage.sh` measures Rust and runtime.js in
+one run and writes `target/coverage/coverage.json`, which
+[quillolang.org/coverage/](https://quillolang.org/coverage/) shows with every run before it.
 
 ## Acknowledgements
 
