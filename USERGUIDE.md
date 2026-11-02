@@ -768,6 +768,30 @@ for everything the function calls, including the lambdas it passes to `map`: the
 effects allowed are narrowed on the way in, and nothing called can widen them.
 Functions without `with` may do anything.
 
+Routes and route groups take `with` too, written before the body, after the patterns. It
+holds for everything the route runs: its body, what it calls, and the middleware of its
+groups. A group's `with` is what its routes may use at most; a route in it may narrow it,
+and one that asks for more is an error:
+
+```quillo
+route GET /report/:day with db = db.query("select * from orders where day = ?", day)
+route POST /notes ? { text: str } with db {
+    db.exec("insert into notes (text) values (?)", text)
+    redirect("/notes")
+}
+
+routes /admin | signed_in with db, time {
+    route GET /users = list_users()                  // db and time, as the group allows
+    route GET /status with time = str(now())         // narrower: no database here
+}
+```
+
+A read-only page declared `with db` cannot post to another site by mistake, and a check
+in its middleware is held to the same: `` `http.post` needs the http effect, but `route
+GET /report/:day` is declared `with db` ``. A route without `with` may do anything, as
+a function without it may. A job is a function given to `schedule`, so it takes `with`
+as a function does (see [Scheduled jobs](#scheduled-jobs)).
+
 - **A connection's calls** need `db` as `db`'s do: `analytics.query(...)` in a `with
   http` function is an error. On a parameter with no type, `c.query(...)` (or `.one`,
   `.exec`, `.transaction`) is a warning, since `c` may be a connection: `` `c.query` reads
@@ -1030,6 +1054,20 @@ route GET / = <html><body><Counter start={5}/></body></html>
   would move it out of the table: its root element carries the island (`data-qi`), so a
   row component is a row. `raw(...)` in a component is likewise in a
   `<quillo-raw style="display: contents">`, which a child selector does not see through.
+
+  ```quillo
+  component Row(name: str, qty: int) {
+      <tr><td>{name}</td><td>{qty}</td></tr>
+  }
+
+  view Stock() = <table><tbody>
+      <Row name="lamp" qty={2}/>
+      <Row name="desk" qty={1}/>
+  </tbody></table>
+  ```
+
+  Each row is `<tr data-qi="" data-c="Row" ...>` in the page, with no island around it,
+  so `tbody > tr` finds both.
 - `state count = start` declares state, set once (`~count = start` is the short form).
   After that it is just `count`, and assigning to it (`count += 1`) updates what reads
   it, and nothing else. A component's code runs once. A `let` that reads state or props
@@ -1037,6 +1075,16 @@ route GET / = <html><body><Counter start={5}/></body></html>
   that reads them (`if running { every(...) }`). Each place in the markup that shows a
   value follows only that value: changing one row's text changes that text. Assigning
   the value a state already has does nothing.
+
+  ```quillo
+  component Total(price: int) {
+      ~qty = 1                                  // the same as `state qty = 1`
+      let total = price * qty                   // worked out again when qty changes
+      <p>{qty} x {price} = {total} <button @click={() => { qty += 1 }}>+</button></p>
+  }
+  ```
+
+  `<Total price={3}/>` shows `1 x 3 = 3`, and `2 x 3 = 6` after a click.
 - `for` in markup keeps a row for each item: by its `key={...}`, else by its place. The
   key is the row's element's, written after `=>` or as the value of a block
   (`for p in xs { let n = p.name; <li key={n}>{n}</li> }`, whose statements the key may use).
@@ -1047,6 +1095,19 @@ route GET / = <html><body><Counter start={5}/></body></html>
   their DOM (and focus). `if`, `? :`, `match` and `cond && <markup>` in markup make a
   branch again only when another one is chosen: an input in one keeps its focus and
   what was typed while the page updates. Nested components keep their own state.
+
+  ```quillo
+  component Todos() {
+      state items = [{ id: 1, text: "milk" }, { id: 2, text: "bread" }]
+      <div>
+          <ul>{for it in items => <li key={it.id}><input/> {it.text}</li>}</ul>
+          <button @click={() => { items = reverse(items) }}>Reverse</button>
+      </div>
+  }
+  ```
+
+  Type in the first row's input and press Reverse: "bread" comes first, and what you
+  typed moves with "milk", as its row was moved, not written again.
 - `@event={fn}` handles DOM events (`@click`, `@input`, `@scroll`, `@submit`, ...), on
   HTML elements only (on a view or component tag it is an error). `onclick={fn}` is the same
   handler, written as HTML and JSX write it; on a view or component, `on_change={...}` or
@@ -1069,6 +1130,19 @@ route GET / = <html><body><Counter start={5}/></body></html>
     arrow key moving the cursor, a pasted image going into a textarea). It must come
     before anything the handler waits for (a `server fn`), since by then the browser
     has gone on.
+
+  ```quillo
+  component Search() {
+      state sent = ""
+      <form @submit={(e) => { sent = e.form.q }}>
+          <input name="q" @keydown={(e) => { if e.key == "Escape" { e.value = "" } }}/>
+          <button>Go</button>
+          <p>{sent}</p>
+      </form>
+  }
+  ```
+
+  Submitting shows what was typed and the page stays; Escape empties the input.
 
   Setting a field sets the element's, when the event has no field of that name:
   `e.value = ""` empties the input (a file picker too, so that picking the same file
@@ -1136,6 +1210,16 @@ route GET / = <html><body><Counter start={5}/></body></html>
   `muted`) that is one way is held to `x`: after each handler it is set back to the state,
   so typing the state does not take is undone. A bare `<input>` keeps what is typed, read
   through `e.value` or `e.form`.
+
+  ```quillo
+  component Pin() {
+      state pin = ""
+      <input value={pin} @input={(e) => { if len(e.value) <= 4 { pin = e.value } }}/>
+  }
+  ```
+
+  The handler takes four characters; a fifth is typed, not taken, and undone, so the
+  input still shows `1234`.
 - `style={...}` takes text or a map of properties: `style={{ color: tone, font_size:
   "2rem", marginTop: "3px", "--gap": "4px" }}`, where `_` and camelCase are written as
   `-` (`font-size`, `margin-top`), a custom property is kept as it is, and a `null` or
@@ -1144,14 +1228,48 @@ route GET / = <html><body><Counter start={5}/></body></html>
   changes: a `transform` or a class a handler set by hand stays, so a drag does not jump
   home. `<details open={x}>` and `<dialog open={x}>` follow `x` when `x` changes, and
   leave what a person opened or closed alone otherwise (FEEDBACK28.md, Q-337, Q-338).
+
+  ```quillo
+  component Badge(tone: str, big: bool) {
+      <p style={{ color: tone, font_size: "2rem", margin_top: big ? "1rem" : null, "--gap": "4px" }}>New</p>
+  }
+  ```
+
+  `<Badge tone="teal" big={false}/>` writes `style="color: teal; font-size: 2rem; --gap:
+  4px"`: `margin-top` is left out.
 - `==` on two of the page's objects (elements, events) asks whether they are the same one
   (Q-334).
+
+  ```quillo
+  component Modal() {
+      state open = true
+      state backdrop = null
+      <div class="backdrop" @mount={(el) => { backdrop = el }}
+           @click={(e) => { if e.target == backdrop { open = false } }}>
+          {open && <div class="box">Click outside to close</div>}
+      </div>
+  }
+  ```
+
+  A click on the box reaches the backdrop's handler too, with the box as `e.target`, so
+  only a click on the backdrop itself closes it. (`e.currentTarget` is the document, as
+  clicks are handled there.)
 - Assigning state updates the page a moment later (once the handler's synchronous code
   is done, or at its first wait), all changes at once. A state is changed when it gets a
   different value: assigning the same list again does nothing, and assigning an equal
   but new list updates what reads it. Code that sets what it reads goes round in a loop,
   and is stopped after 1,000 rounds with a message in the console. See
   [Reactivity](#reactivity) for the whole model.
+
+  ```quillo
+  component Pair() {
+      state a = 0
+      state b = 0
+      <p @click={() => { a += 1; b = a * 10 }}>{a} and {b}</p>
+  }
+  ```
+
+  A click shows `1 and 10` at once; the page never shows `1 and 0` in between.
 - `every(ms, f)` in a component's code calls `f` every `ms` milliseconds, in the browser,
   for as long as the code that called it stands: `if running { every(100, step) }`
   runs a game while `running` is true, starts again with the new speed when that changes,
@@ -1160,6 +1278,18 @@ route GET / = <html><body><Counter start={5}/></body></html>
   from one of its event handlers or its `@mount`, where it runs until the component
   leaves the page (started after a handler's first wait, it belongs to no one, and is an
   error). A tab in the background is slowed by the browser to once a second at most.
+
+  ```quillo
+  component Stopwatch() {
+      state running = false
+      state tenths = 0
+      if running { every(100, () => { tenths += 1 }) }
+      <p>{tenths / 10} s <button @click={() => { running = !running }}>{running ? "Stop" : "Start"}</button></p>
+  }
+  ```
+
+  Start counts in tenths of a second; Stop ends the `every`, as the `if` that called it no
+  longer stands.
 - `run_after(ms, f)` calls `f` once, `ms` milliseconds on, unless its component has gone
   first: from a handler, `@mount` or the component's code alike. There is no
   `setTimeout`; a debounce or a throttle is an `every` under a state flag that the tick
@@ -1168,6 +1298,31 @@ route GET / = <html><body><Counter start={5}/></body></html>
   `listen(url, f)` follows a stream the same way (see [Streaming](#streaming)), and opens
   it again when the connection drops (after a second, doubling up to 30 s), not when the
   stream ends.
+
+  ```quillo
+  component Save() {
+      state saved = false
+      <p>
+          <button @click={() => { saved = true; run_after(2000, () => { saved = false }) }}>Save</button>
+          {saved && <span>Saved</span>}
+      </p>
+  }
+
+  component Names() {
+      state names = ["Ana"]
+      <div>
+          {for n in names => <input class="name" value={n}/>}
+          <button @click={() => {
+              names = names + [""]
+              page_updated()                    // the new input is in the page now
+              js("document.querySelector", ".name:last-of-type").focus()
+          }}>Add</button>
+      </div>
+  }
+  ```
+
+  "Saved" shows for two seconds. Add puts a new input in the page and focuses it, which it
+  could not do before `page_updated()`, as the input was not there yet.
 - Component code, and the functions, views and constants it uses, is compiled to
   JavaScript. Code that cannot run in a browser is an error when the program loads
   (under [`--watch`](#options-of-quillo-run), the option for working on a program, `quillo run main.qwe --watch`: in the log right after the load, and in the browser's console of
@@ -1178,6 +1333,20 @@ route GET / = <html><body><Counter start={5}/></body></html>
   [What the browser can reach](#what-the-browser-can-reach)). Any name is fine in
   component code, JavaScript's own words included (`new`, `class`, `this`, `window`): the
   compiler renames them.
+
+  ```quillo
+  component Orders() {
+      state rows = db.query("select * from orders")
+      <p>{len(rows)} orders</p>
+  }
+  ```
+
+  ```
+  main.qwe:2: error: `db.query` is not available in the browser, where <Orders> also runs; use a `server fn`
+  ```
+
+  Ask the server for them instead: `server fn orders() with db = db.query("select * from
+  orders")`, then `state rows = orders()`.
 - What the browser has of the standard library: text, lists, maps, numbers, errors,
   `raw`, `escape`, `url_encode`, `now`, `random`, `random_int`, `uuid`, `format_number`,
   `markdown` (made by the server), `highlight`, `t` and `locale`, `json`, `re`, `math`,
@@ -1187,11 +1356,33 @@ route GET / = <html><body><Counter start={5}/></body></html>
   program loads: `env` (but `PUBLIC_`), `sleep`, files, `redirect`, `respond`,
   sessions and cookies, `crypto`, `image`, `db`, `publish` and `watch`, tenants,
   uploads, `schedule`, `stream`, `events`, `http.stream`, `join_on`, services.
+
+  ```quillo
+  component Receipt(total: float, at: str) {
+      <p>{format_number(total)} on {at}, ref {uuid()}</p>
+  }
+  ```
+
+  `<Receipt total={1234.5} at="2026-11-03"/>` shows `1,234.5 on 2026-11-03, ref` and a
+  uuid, on the server and in the browser alike. `env("PUBLIC_SHOP")` may join them;
+  `env("DB_URL")` may not.
 - There is nothing built in for `document`, `window`, `localStorage`, the clipboard,
   focus or scrolling: reach them through the page, `js("localStorage.getItem", k)`,
   `js("navigator.clipboard.writeText", s)`, `js("window.innerWidth")` (no arguments
   reads a value), and `el.focus()` on an element (see [JavaScript
   libraries](#javascript-libraries)).
+
+  ```quillo
+  component Theme() {
+      state dark = false
+      <button @click={() => {
+          dark = !dark
+          js("localStorage.setItem", "theme", dark ? "dark" : "light")
+      }}>{dark ? "Dark" : "Light"}</button>
+  }
+  ```
+
+  `js("document.querySelector", "#name").focus()` focuses an input the same way.
 - Each page loads two scripts, minified, whose addresses change with their content, so
   the browser keeps them for good:
   - `/_quillo/r/<hash>.js`, the runtime: the parts of it the program's components
@@ -1207,6 +1398,12 @@ route GET / = <html><body><Counter start={5}/></body></html>
   by route and no lazy component: an `App` whose `match` shows thirty pages carries the
   thirty in its bundle. Under `--watch` a page loads one unminified bundle instead,
   which loads a file per component and function (see [Debugging](#in-the-browser)).
+
+  ```sh
+  curl -s localhost:8080/ | grep -o '/_quillo/[rb]/[^"]*'
+  # /_quillo/r/f68b2dc51ad5ad52.js
+  # /_quillo/b/0767fa4dd4c7b224.js
+  ```
 - And only when it is needed: the server's HTML shows at once, and the bundle comes
   when someone reaches for a component (points at, touches or focuses it, or presses a
   key in it). What they typed before it came is kept, and each click, double click,
@@ -1222,14 +1419,35 @@ route GET / = <html><body><Counter start={5}/></body></html>
   `<body>` itself, an app) loads as soon as the page is idle. `/_quillo/quillo.js` has
   every component, for pages that load it themselves. Text responses are gzipped for
   browsers that accept it.
+
+  Of the components above, `Total` and `Todos` wait for a person to reach them;
+  `Stopwatch` (an `every` in its code) and `Modal` (an `@mount`) load as soon as the page
+  is idle.
 - A component is an element `<quillo-island data-c="Name" data-p="{props}"
   data-s="{state}">`, with `data-l` and `data-v` for live state and `data-e` when it runs
   by itself. Values cross as JSON, with these marked so they come back as they were: a
   decimal (`{"$dec": "12.50"}`), an int past 2^53 (`{"$int": "..."}`, a BigInt in the
   browser), an error value (`{"$quillo_err": ...}`). NaN and infinities become `null`;
   dates are their text, as everywhere.
+
+  `<Counter start={5}/>` from the top of this section is sent as:
+
+  ```html
+  <quillo-island style="display:contents" data-c="Counter" data-p="{&quot;start&quot;:5}"
+      data-s="{&quot;count&quot;:5}"><div>...</div></quillo-island>
+  ```
 - A `state` that still holds its very prop (`state items = initial`) is written in the
   page as a reference to the prop, not as a second copy of it.
+
+  ```quillo
+  component List(initial: list<str>) {
+      state items = initial
+      <ul>{for i in items => <li>{i}</li>}</ul>
+  }
+  ```
+
+  `<List initial={["a", "b"]}/>` carries `data-p="{"initial":["a","b"]}"` and
+  `data-s="{"items":{"$quillo_prop":"initial"}}"`: the list once.
 - Components are resumed, not made again: the browser runs a component's code once,
   from the state the server sent, and takes the server's elements as its own (checking that
   they are the same) instead of replacing them, so images do not reload, a scrolled
@@ -1239,9 +1457,34 @@ route GET / = <html><body><Counter start={5}/></body></html>
   `state` initializers do not run again in the browser: the server's values win. There
   is no virtual DOM: each state is a signal, tied to the text, attributes and classes
   that show it, and a list's rows are moved by key.
+
+  ```quillo
+  component Roll() {
+      state seed = random_int(1, 1000000)       // drawn once, on the server
+      <p>{seed}</p>
+  }
+  ```
+
+  The browser shows the number the server drew, and keeps it: it does not draw again.
 - A JavaScript error in a handler, `@mount`, a statement or an initializer is written
   to the console (`quillo: ...`), and pushed onto `window.__quilloErrors` if the page
   made that list; the component goes on. There is no error overlay on the page.
+
+  ```quillo
+  component Broken() {
+      state n = 0
+      <button @click={() => { js("JSON.parse", "{"); n += 1 }}>{n}</button>
+  }
+
+  route GET / = <html>
+      <head><script>window.__quilloErrors = []</script></head>
+      <body><Broken/></body>
+  </html>
+  ```
+
+  Each click stops at the bad JSON (so `n` stays 0), writes the error to the console, and
+  adds it to `window.__quilloErrors`, where a test can read it; the button goes on
+  answering.
 - `ask(message, { title, ok, cancel, tone })` asks in a dialog on the page and waits for
   the answer (`true` or `false`) — a handler goes on after it, and its buttons, unless
   `ok` and `cancel` are given, are in the page's locale (see
@@ -1252,6 +1495,21 @@ route GET / = <html><body><Counter start={5}/></body></html>
   backdrop and Cancel answer `false`; `tone: "danger"` starts on Cancel; a note goes
   after 4 seconds unless `seconds` says otherwise). On the server both are an error:
   they speak to someone in the browser.
+
+  ```quillo
+  component Remove(id: int) {
+      state gone = false
+      <button @click={() => {
+          if ask("Delete this order?", { title: "Delete", ok: "Delete", tone: "danger" }) {
+              gone = true
+              notify("Deleted", { tone: "success" })
+          }
+      }}>{gone ? "Deleted" : "Delete"}</button>
+  }
+  ```
+
+  The dialog starts on Cancel, as its tone is `danger`; Delete answers `true`, and the
+  note goes after 4 seconds.
 - The classes and attributes Quillo sets itself, for a sheet to style. No `.qwe` file
   writes them, so a tool that drops CSS it finds no use for (PurgeCSS and the like) must
   be told to keep them:
@@ -1265,6 +1523,13 @@ route GET / = <html><body><Counter start={5}/></body></html>
   | `highlight(code, lang)` | `hl-k` keywords, `hl-s` strings, `hl-c` comments, `hl-n` numbers and constants, `hl-f` functions called, `hl-t` types and tags, `hl-a` attributes, properties and keys |
   | `<quillo-media>` | `data-state`: `connecting`, `waiting`, `playing`, `ended`, `unsupported`; one that sends: `starting`, `sending`, `refused`, `ended`, `unsupported` |
   | a component's `style` | `data-q-<id>` on the elements it writes |
+
+  ```css
+  .q-backdrop { background: rgb(0 0 0 / 40%); }
+  .q-dialog { border-radius: 8px; padding: 1.5rem; }
+  .q-dialog.q-danger .q-ok { background: crimson; color: white; }
+  .q-toast.q-success { border-left: 4px solid seagreen; }
+  ```
 - In the browser, numbers are JavaScript numbers, so a whole float such as `2.0` prints
   as `2`, and `json.stringify(json.parse("1.0"))` gives `1`. While the server renders a
   component it writes numbers the same way, so the page it sends is the one the browser
@@ -1273,11 +1538,30 @@ route GET / = <html><body><Counter start={5}/></body></html>
   those from `json.parse` where the browser says what the text was (Chrome, Edge,
   Firefox and Safari since 2025). Elsewhere the server writes `2.0`. `math.*` may differ
   in the last digits, as each side has its own library.
+
+  ```quillo
+  component Price() {
+      let whole = 2.0
+      <p>{whole} {7 / 2}</p>
+  }
+  ```
+
+  Both sides show `2 3.5`.
 - A map keeps its keys in order on the server. In the browser, keys that look like whole
   numbers come first, in number order, as in any JavaScript object, so `keys`, `values`
   and `for [k, v] in m` over `group_by(xs, (x) => x.id)` can differ, and a page showing
   such a map is made again. Sort the keys, or keep a list. With `--watch`, a component the browser had to make again says which,
   and what differed, in the console.
+
+  ```quillo
+  component Keys() {
+      let m = { b: 1, "10": 2, a: 3 }
+      <p>{join(keys(m), " ")} / {join(sort(keys(m)), " ")}</p>
+  }
+  ```
+
+  The server writes `b 10 a / 10 a b`, the browser `10 b a / 10 a b`: the first half
+  differs, the sorted half does not.
 
 ### Composition
 
@@ -2300,8 +2584,8 @@ demos show each of these running beside its code.
 ## Routes
 
 ```quillo
-route METHOD /path/:param/:typed(int)/*rest [? { query pattern }] [{ request pattern }] = expr
-route METHOD /path { ... block ... }
+route METHOD /path/:param/:typed(int)/*rest [? { query pattern }] [{ request pattern }] [with effects] = expr
+route METHOD /path [with effects] { ... block ... }
 ```
 
 - **Methods:** `GET POST PUT PATCH DELETE OPTIONS ANY`. `ANY` takes every method. A
@@ -2312,17 +2596,56 @@ route METHOD /path { ... block ... }
   HEAD, OPTIONS, POST`), and so is `OPTIONS *`: a health check that sends it (HAProxy's
   `option httpchk`) finds the server up. Nothing answers CORS preflights by itself, and
   no `access-control-*` header is written for you.
+
+  ```quillo
+  route GET /items = "the list"
+  route POST /items = "added"
+  route ANY /echo = request.method
+  ```
+
+  ```sh
+  curl -X DELETE -i localhost:8080/items    # 405, allow: GET, HEAD, OPTIONS, POST
+  curl -I localhost:8080/items              # 200, content-length: 8, no body
+  curl -X OPTIONS -i localhost:8080/items   # 204, allow: GET, HEAD, OPTIONS, POST
+  curl -X PATCH localhost:8080/echo         # PATCH
+  ```
 - **Path params** become variables. `:id(int)` only matches what parses as an int (also
   `float`, `dec`, `num`, `str`, and `date`: `/day/:d(date)` takes `2026-11-20`, not
   `2026-02-30`). `*rest` (or `*name`) takes the rest of the path; `*`
   alone names it `rest`. The path is split at `/`, empty pieces dropped, so `/users`,
   `/users/` and `//users` are one path; each piece is percent-decoded after the split, so
   a `%2F` stays inside its piece. `request.path` is the path as it came, undecoded.
+
+  ```quillo
+  route GET /users/:id(int) = `user ${id + 1}`     // id is an int: arithmetic works
+  route GET /day/:d(date) = `the ${d}`
+  route GET /files/*rest = rest
+  ```
+
+  ```sh
+  curl localhost:8080/users/41              # user 42
+  curl localhost:8080/users/abc             # 404: not an int, so no route matches
+  curl localhost:8080/day/2026-02-30        # 404: not a date
+  curl localhost:8080/files/docs/a.txt      # docs/a.txt
+  ```
 - **Query pattern:** `? { q: str, page: int = 1 }`. Query values are text, so `int`, `float` and `bool` patterns convert them.
   A name sent more than once keeps its last value in `request.query` and `request.form`;
   a list in the pattern takes them all, as a group of checkboxes sends: `? { tag: [str] }`
   gives `["a", "b"]` for `?tag=a&tag=b`, one value a list of one, and none an empty list.
   So does `{ form: { tag: [str] } }`, for a urlencoded form.
+
+  ```quillo
+  route GET /search ? { q: str, page: int = 1 } = `${q}, page ${page}`
+  route GET /filter ? { tag: [str] } = join(tag, ", ")
+  ```
+
+  ```sh
+  curl "localhost:8080/search?q=lamp"            # lamp, page 1
+  curl "localhost:8080/search?q=lamp&page=2"     # lamp, page 2
+  curl "localhost:8080/search?q=lamp&page=x"     # 400: page is not an int
+  curl "localhost:8080/search"                   # 400: q is missing
+  curl "localhost:8080/filter?tag=a&tag=b"       # a, b
+  ```
 - **Request pattern:** matched against the `request` map. Its fields, and all of them:
   `method`, `path`, `query`, `query_string` (the query as it came), `params`, `headers`,
   `cookies`, `body`, `json`, `form`, `files`, `ip`, `id`. The host is `request.headers.host`; the tenant and the locale
@@ -2330,6 +2653,21 @@ route METHOD /path { ... block ... }
   int. Form fields, headers and cookies are converted like query values. `{ json: User }`
   takes the body as a [record](#records). A pattern on the host is a pattern on the
   headers: `{ headers: { host: "api.example.com" } }`.
+
+  ```quillo
+  route POST /api/items { json: { name: str, qty: int } } = `${qty} x ${name}`
+  route GET /beta { headers: { "x-beta": "yes" } } = "the new page"
+  route GET /beta = "the old page"                 // the same path, for everyone else
+  ```
+
+  ```sh
+  curl -H "content-type: application/json" -d '{"name":"lamp","qty":2}' localhost:8080/api/items
+  # 2 x lamp
+  curl -H "content-type: application/json" -d '{"name":"lamp","qty":"2"}' localhost:8080/api/items
+  # 400: "2" is text, not an int
+  curl -H "x-beta: yes" localhost:8080/beta      # the new page
+  curl localhost:8080/beta                       # the old page
+  ```
 - **What the request holds.** `headers` has its names in lower case, and a header sent
   twice keeps the last; only the last `Cookie` header is read, its values
   percent-decoded. `query` and `form` keep the last of a key given twice (`a=1&a=2` is
@@ -2340,9 +2678,23 @@ route METHOD /path { ... block ... }
   body cannot be read as it was (there is no bytes value in the language), and for a
   multipart body it is empty. `id` is the request's id (see [Services](#services)). A
   JSON body that starts with a byte-order mark is read.
+
+  ```quillo
+  route POST /show = json.stringify({ method: request.method, path: request.path,
+      query: request.query, form: request.form, agent: request.headers["user-agent"] })
+  ```
+
+  ```sh
+  curl -A demo/1 -d "name=Ana&name=Bo" "localhost:8080/show?a=1"
+  # {"method":"POST","path":"/show","query":{"a":"1"},"form":{"name":"Bo"},"agent":"demo/1"}
+  ```
+
+  `name` was sent twice and keeps the last; a list in a pattern (`{ form: { name: [str] }
+  }`) takes both.
 - **What the server refuses before a route.** Two `Host` headers, an HTTP/1.1 request
   without one, or one that is not a host and a port, get 400; a method not written in
-  capitals, or one HTTP does not define (`FROB`), gets 501. A request target in absolute
+  capitals, or one HTTP does not define (`FROB`), gets 501, unless a `route ANY` takes the
+  path, as `ANY` takes every method. A request target in absolute
   form (`GET http://host/path`) takes its host from the target. A `HEAD` answer carries
   the `Content-Length` the `GET` would. A body sent with `Content-Encoding: gzip` reaches
   the route decoded, [`--max-body`](#options-of-quillo-run) (`quillo run main.qwe --max-body 50MB`; 10MB unless
@@ -2351,11 +2703,45 @@ route METHOD /path { ... block ... }
   than `100-continue` gets 417. An HTTP/1.0 request gets no `100 Continue` (a 1.0 client
   would take it for the answer) and no chunks: a streamed answer goes with no length and
   ends with the connection, and an `Upgrade` is ignored.
+
+  ```sh
+  curl -X FROB localhost:8080/items         # 501 unknown method
+  curl -X get localhost:8080/items          # 501 unknown method (methods are written in capitals)
+  printf 'GET /items HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n' | nc localhost 8080
+  # 400 Bad Request: two Host headers (curl would send only one)
+  ```
 - **Reserved:** paths under `/_quillo/` belong to Quillo and never reach a route (what is
-  there is listed under [What a route cannot do](#what-a-route-cannot-do)).
+  there is listed under [What a route cannot do](#what-a-route-cannot-do)). A route
+  written there is never called: `route GET /_quillo/stats = ...` answers 404, so put
+  your own under another path (`/stats`, `/admin/stats`).
 - **Order:** routes are tried in the order they are declared, and the first whose method, path and patterns all match handles the request. A later route can be the fallback.
   Routes are declared at the top level of a file: `quillo check` refuses one inside a
   function or a block.
+
+  ```quillo
+  route GET /people/me = "you"                     // before :id, or "me" would not match
+  route GET /people/:id(int) = `person ${id}`
+  route ANY /*rest = respond(404, `Nothing at /${rest}`)   // last: everything else
+  ```
+
+  ```sh
+  curl localhost:8080/people/me             # you
+  curl localhost:8080/people/7              # person 7
+  curl localhost:8080/nowhere               # 404: Nothing at /nowhere
+  ```
+
+  Put the specific before the general. With the catch-all last, no path answers 405 or
+  400 any more: every request reaches it.
+- **What it may do:** `with`, before the body, holds the route to what it says, as for a
+  function (see [Effects](#effects)):
+
+  ```quillo
+  route GET /report/:day with db = db.query("select * from orders where day = ?", day)
+  ```
+
+  A call in it (or in a group's middleware) that needs another effect is refused by
+  `quillo check` and when it runs. What the answer runs after the body is held too: the
+  function given to `stream(f)` or `events(f)`, and a component's `defer(...)` parts.
 
 If no route matches, the response is 404 for an unknown path, 405 for a known
 path with the wrong method (with `Allow`, the methods it takes), and 400 when a route
@@ -2415,7 +2801,16 @@ routes /api { headers: { host: "api.example.com" } } {    // Laravel's domain()
 routes / | signed_in {                              // no prefix: middleware only
     route GET /settings = <Settings/>
 }
+
+routes /reports | signed_in with db {               // what its routes may do, at most
+    route GET /daily = daily()
+}
 ```
+
+- **`with`**, after the middleware, is what every route in the group, and its middleware,
+  may do. A route in it may narrow it (`route GET /status with time = ...`), a group
+  inside it too, and asking for an effect it does not allow is an error (see
+  [Effects](#effects)).
 
 - **The path** goes before each route's own, parameters and types included
   (`:team(int)`), which the routes' bodies and patterns can use; a group's `/` alone
@@ -6069,7 +6464,17 @@ schedule("0 3 * * *", nightly_report)           // cron: 03:00 UTC
 schedule("@daily", () => db.exec("delete from tokens where expires < ?", now()))
 ```
 
-A job is a function of the program, and what it does is seen where it writes. Here the
+A job is a function of the program, so it takes `with` as any function does, and what it
+may do is held to that each time it runs:
+
+```quillo
+fn nightly_report() with db, time {
+    db.exec("insert into reports (day, total) select date(?), sum(total) from orders", now())
+}
+schedule("0 3 * * *", nightly_report)
+```
+
+What it does is seen where it writes. Here the
 nightly report the routes add to, and the page that shows its rows:
 
 ```quillo

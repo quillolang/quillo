@@ -62,7 +62,8 @@ pub(crate) fn split(body: Vec<u8>, jobs: Vec<Deferred>) -> Page {
 /// Each waiting component rendered again: its part, or nothing when rendering it
 /// failed (the error is logged and the placeholder stays).
 pub(crate) fn resolve(it: &mut crate::interp::Interp, d: &Deferred) -> String {
-    match it.render_deferred(d) {
+    // Under the route's `with`, as the rest of the page was (branch feedback40-43).
+    match it.under_route(|it| it.render_deferred(d)) {
         Ok(html) => part(d.id, &html),
         Err(crate::interp::Ctrl::Error(e)) => {
             eprintln!("quillo: error while rendering the deferred part of <{}>: {}", d.tag, e);

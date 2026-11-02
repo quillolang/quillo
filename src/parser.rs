@@ -784,7 +784,7 @@ impl Parser {
                         if !top {
                             return Err(QuilloError::new("a `routes` group is written at the top level of a file, as `route` is", line));
                         }
-                        let mut routes = self.parse_group(line, &[], &[], &[])?.into_iter();
+                        let mut routes = self.parse_group(line, &[], &[], &[], &None)?.into_iter();
                         let Some(first) = routes.next() else {
                             return Err(QuilloError::new("this `routes` group has no routes in it", line));
                         };
@@ -868,6 +868,8 @@ impl Parser {
                                     line,
                                     file: self.file.clone(),
                                     uses_request: false,
+                                    effects: None,
+                                    limit: None,
                                 })));
                             }
                         }
@@ -1107,27 +1109,7 @@ impl Parser {
         self.expect(&Tok::RParen, "`)`")?;
         let ret = if self.eat(&Tok::Arrow)? { Some(self.parse_type()?) } else { None };
         let err = if self.eat(&Tok::Bang)? { Some(self.parse_type()?) } else { None };
-        let effects = if self.eat_kw("with")? {
-            let mut effs = Vec::new();
-            loop {
-                let t = self.next()?;
-                match t.tok {
-                    Tok::Ident(e) if EFFECTS.contains(&e.as_str()) => effs.push(e),
-                    other => {
-                        return Err(QuilloError::new(
-                            format!("expected an effect after `with` ({}), found {}", EFFECTS.join(", "), other.describe()),
-                            t.line,
-                        ))
-                    }
-                }
-                if !self.eat(&Tok::Comma)? {
-                    break;
-                }
-            }
-            Some(effs)
-        } else {
-            None
-        };
+        let effects = self.parse_with()?;
         if std::mem::take(&mut self.callers_ok) && self.eat_kw("for")? {
             if !self.eat(&Tok::LBracket)? {
                 return self.err_at("after `for`, the services it takes calls from: for [\"shop\", \"orders\"]");
@@ -1482,6 +1464,30 @@ impl Parser {
         s
     }
 
+    /// `with db, http`, if it is there: the effects a function, a route or a group may use.
+    fn parse_with(&mut self) -> PResult<Option<Vec<String>>> {
+        if !self.eat_kw("with")? {
+            return Ok(None);
+        }
+        let mut effs = Vec::new();
+        loop {
+            let t = self.next()?;
+            match t.tok {
+                Tok::Ident(e) if EFFECTS.contains(&e.as_str()) => effs.push(e),
+                other => {
+                    return Err(QuilloError::new(
+                        format!("expected an effect after `with` ({}), found {}", EFFECTS.join(", "), other.describe()),
+                        t.line,
+                    ))
+                }
+            }
+            if !self.eat(&Tok::Comma)? {
+                break;
+            }
+        }
+        Ok(Some(effs))
+    }
+
     fn parse_route(&mut self, line: u32) -> PResult<RouteDef> {
         let method = self.expect_ident("an HTTP method")?;
         if !METHODS.contains(&method.as_str()) {
@@ -1565,7 +1571,7 @@ impl Parser {
             let saved = self.save();
             let res = self.parse_pattern();
             let is_pat = match &res {
-                Ok(_) => matches!(self.peek(), Ok(Tok::LBrace) | Ok(Tok::Assign)),
+                Ok(_) => matches!(self.peek(), Ok(Tok::LBrace) | Ok(Tok::Assign)) || matches!(self.peek(), Ok(Tok::Ident(k)) if k == "with"),
                 Err(_) => false,
             };
             if is_pat {
@@ -1575,6 +1581,8 @@ impl Parser {
             }
         }
 
+        // `with db`: what the route may do, as for a function (branch feedback40-43).
+        let effects = self.parse_with()?;
         let body = if self.eat(&Tok::Assign)? {
             self.parse_expr()?
         } else if self.at(&Tok::LBrace)? {
@@ -1585,12 +1593,12 @@ impl Parser {
         let uses_request = body_pat.is_some()
             || names_request(&body)
             || query.as_ref().map_or(false, pattern_names_request);
-        Ok(RouteDef { method, path, query, body_pat, guards: Vec::new(), body, line, file: self.file.clone(), uses_request })
+        Ok(RouteDef { method, path, query, body_pat, guards: Vec::new(), body, line, file: self.file.clone(), uses_request, effects, limit: None }.limited())
     }
 
     /// Whether what follows `routes` is a group's path: `/` and a path
-    /// (`/admin`, `/:team`), or `/` alone before `|` or `{` (a group at the
-    /// root). `routes / 2` is a division (branch route-groups).
+    /// (`/admin`, `/:team`), or `/` alone before `|`, `{` or `with` (a group at
+    /// the root). `routes / 2` is a division (branch route-groups).
     fn group_ahead(&self) -> bool {
         if self.lx.peek_char() != Some('/') {
             return false;
@@ -1602,7 +1610,10 @@ impl Parser {
                 while matches!(self.lx.peek_char_at(n), Some(' ' | '\t')) {
                     n += 1;
                 }
-                matches!(self.lx.peek_char_at(n), Some('|' | '{'))
+                // `routes / with db { ... }`: `with` and a space (branch feedback40-43).
+                let with = "with".chars().enumerate().all(|(i, c)| self.lx.peek_char_at(n + i) == Some(c))
+                    && matches!(self.lx.peek_char_at(n + 4), Some(' ' | '\t'));
+                with || matches!(self.lx.peek_char_at(n), Some('|' | '{'))
             }
         }
     }
@@ -1613,7 +1624,7 @@ impl Parser {
     /// body (`__answer(m(request))`: a `reply` in it, or a response it gives,
     /// answers instead), and the pattern matched with its own (branch
     /// route-groups).
-    fn parse_group(&mut self, line: u32, prefix: &[Seg], before: &[(Expr, u32)], guards: &[Pattern]) -> PResult<Vec<RouteDef>> {
+    fn parse_group(&mut self, line: u32, prefix: &[Seg], before: &[(Expr, u32)], guards: &[Pattern], outer: &Option<Vec<String>>) -> PResult<Vec<RouteDef>> {
         let mut path = prefix.to_vec();
         path.extend(self.parse_path("after `routes`")?);
         let mut before = before.to_vec();
@@ -1622,6 +1633,19 @@ impl Parser {
             let at = self.line()?;
             before.push((self.parse_or()?, at));
         }
+        // `routes /admin | signed_in with db { ... }`: what every route in it, and its
+        // middleware, may do; a group inside narrows it further (branch feedback40-43).
+        let with_line = self.line()?;
+        let effects = match (outer, self.parse_with()?) {
+            (None, mine) => mine,
+            (Some(o), None) => Some(o.clone()),
+            (Some(o), Some(mine)) => {
+                if let Some(e) = mine.iter().find(|e| !o.contains(e)) {
+                    return Err(QuilloError::new(format!("this group asks for `{}`, which the group around it does not allow (`with {}`)", e, o.join(", ")), with_line));
+                }
+                Some(mine)
+            }
+        };
         let mut guards = guards.to_vec();
         if self.at(&Tok::LBrace)? {
             let saved = self.save();
@@ -1662,11 +1686,21 @@ impl Parser {
                         r.body = Expr::Block(stmts);
                     }
                     r.uses_request = r.uses_request || !before.is_empty() || !r.guards.is_empty();
-                    out.push(r);
+                    if let Some(g) = &effects {
+                        match &r.effects {
+                            Some(own) => {
+                                if let Some(e) = own.iter().find(|e| !g.contains(e)) {
+                                    return Err(QuilloError::new(format!("this route asks for `{}`, which its group does not allow (`with {}`)", e, g.join(", ")), at));
+                                }
+                            }
+                            None => r.effects = Some(g.clone()),
+                        }
+                    }
+                    out.push(r.limited());
                 }
                 Tok::Ident(k) if k == "routes" => {
                     self.next()?;
-                    out.extend(self.parse_group(at, &path, &before, &guards)?);
+                    out.extend(self.parse_group(at, &path, &before, &guards, &effects)?);
                 }
                 other => return self.err_at(format!("a `routes` group holds `route` and `routes`, found {}", other.describe())),
             }

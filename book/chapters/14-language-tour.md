@@ -440,6 +440,30 @@ for everything the function calls, including the lambdas it passes to `map`: the
 effects allowed are narrowed on the way in, and nothing called can widen them.
 Functions without `with` may do anything.
 
+Routes and route groups take `with` too, written before the body, after the patterns. It
+holds for everything the route runs: its body, what it calls, and the middleware of its
+groups. A group's `with` is what its routes may use at most; a route in it may narrow it,
+and one that asks for more is an error:
+
+```quillo
+route GET /report/:day with db = db.query("select * from orders where day = ?", day)
+route POST /notes ? { text: str } with db {
+    db.exec("insert into notes (text) values (?)", text)
+    redirect("/notes")
+}
+
+routes /admin | signed_in with db, time {
+    route GET /users = list_users()                  // db and time, as the group allows
+    route GET /status with time = str(now())         // narrower: no database here
+}
+```
+
+A read-only page declared `with db` cannot post to another site by mistake, and a check
+in its middleware is held to the same: `` `http.post` needs the http effect, but `route
+GET /report/:day` is declared `with db` ``. A route without `with` may do anything, as
+a function without it may. A job is a function given to `schedule`, so it takes `with`
+as a function does (see [Scheduled jobs](#scheduled-jobs)).
+
 - **A connection's calls** need `db` as `db`'s do: `analytics.query(...)` in a `with
   http` function is an error. On a parameter with no type, `c.query(...)` (or `.one`,
   `.exec`, `.transaction`) is a warning, since `c` may be a connection: `` `c.query` reads

@@ -182,7 +182,17 @@ schedule("0 3 * * *", nightly_report)           // cron: 03:00 UTC
 schedule("@daily", () => db.exec("delete from tokens where expires < ?", now()))
 ```
 
-A job is a function of the program, and what it does is seen where it writes. Here the
+A job is a function of the program, so it takes `with` as any function does, and what it
+may do is held to that each time it runs:
+
+```quillo
+fn nightly_report() with db, time {
+    db.exec("insert into reports (day, total) select date(?), sum(total) from orders", now())
+}
+schedule("0 3 * * *", nightly_report)
+```
+
+What it does is seen where it writes. Here the
 nightly report the routes add to, and the page that shows its rows:
 
 ```quillo

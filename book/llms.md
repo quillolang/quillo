@@ -279,7 +279,9 @@ db.transaction(() => {
 - Always pass values as `?` or `:name` placeholders; never build SQL with `+` or `${}`.
 - A row is a map: `select a.id, b.id` leaves one `id`, so name columns apart with `as`.
 - `with db` on a function says it uses the database; a function with `with` may do only
-  what it declares (`db`, `http`, `fs`, `env`, `time`, `random`, `net`).
+  what it declares (`db`, `http`, `fs`, `env`, `time`, `random`, `net`). Routes and
+  route groups take it too, before the body: `route GET /report with db = ...`,
+  `routes /admin | signed_in with db { ... }`.
 
 ## Before you finish
 

@@ -79,6 +79,18 @@
   `onclick="..."` stays HTML's own, text made from values stays refused, and on a view or
   component `on_change={...}` stays a parameter.
 
+### Routes take `with`
+
+- **`route GET /report/:day with db = ...`** and **`routes /admin | signed_in with db {
+  ... }`**: what the route's body, what it calls and its groups' middleware may do, held
+  in `quillo check` and as it runs, as a `with` function is. A group's `with` is what its
+  routes may use at most; a route or a group inside may narrow it, and asking for more is
+  an error. A route without `with` may do anything, as before. A stream's function
+  (`stream(f)`, `events(f)`) and a component's `defer(...)` parts run under the route's
+  `with` too, though they run after its body; a group at the root takes it
+  (`routes / with db { ... }`). When a policy takes away an effect the `with` names, the
+  error says it was the policy.
+
 ### The command line
 
 - **`--max-body` takes a size as the policy writes one**: `--max-body 50MB`, `512KB`,

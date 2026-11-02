@@ -307,7 +307,8 @@ pub(crate) fn run(it: &mut Interp, mut p: Pending, sink: &mut dyn Sink, chunked:
     let sink: *mut (dyn Sink + '_) = sink;
     let sink: *mut dyn Sink = unsafe { std::mem::transmute(sink) };
     let saved = it.stream_out.replace(Out { sink: SinkPtr(sink), events: p.events, chunked, gone: false });
-    let r = it.call(&p.f, vec![Value::Builtin("send", send)], 0);
+    // Under the route's `with`, as its body was (branch feedback40-43).
+    let r = it.under_route(|it| it.call(&p.f, vec![Value::Builtin("send", send)], 0));
     let out = std::mem::replace(&mut it.stream_out, saved).expect("set above");
     match r {
         _ if out.gone => Ended::Gone,

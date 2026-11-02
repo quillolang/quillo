@@ -1904,7 +1904,7 @@ fn keyword_doc(w: &str) -> Option<String> {
         "server" => "`server fn name(params) = ...`\n\nA function the browser can call. Component code awaits it automatically.",
         "view" => "`view Name(params, children) = <html/>`\n\nA function returning HTML, used as `<Name .../>`.",
         "reply" => "`reply status [body]`\n\nEnds the current request immediately with that response, from anywhere.",
-        "with" => "`fn f() with db, http = ...`\n\nDeclares the effects a function may use: db, http, fs, env, time, random.",
+        "with" => "`fn f() with db, http = ...`, `route GET /x with db = ...`, `routes /admin with db { ... }`\n\nDeclares the effects a function, a route or a group's routes may use: db, http, net, fs, env, time, random. Nothing called inside may do more.",
         "match" => "`match value { pattern [if guard] => result ... }`",
         "use" => "`use lib/auth.qwe` (or `use lib/auth`, or `use \"lib/auth.qwe\"`) runs another file once: its public names are this file's to use.\n\nTo take some of its names, the file comes first: `import redis.qwer use cache_get as redis_get, cache_set`.",
         "import" => "`import lib/auth.qwe use login, logout as bye` takes names from a file, each under the name after `as`; `use *` takes them all. The file comes first, so the editor can offer its names. Works for `.qwe` and `.qwer` files.",

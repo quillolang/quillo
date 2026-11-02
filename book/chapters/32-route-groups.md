@@ -107,6 +107,24 @@ routes /api | api_key {
 }
 ```
 
+## What its routes may do
+
+A group takes `with`, after its middleware, as a function does: what every route in it,
+and its middleware, may use at most. A route in it may narrow it; one that asks for an
+effect the group does not allow is an error, and so is an inner group that does:
+
+```quillo
+routes /reports | signed_in with db, time {
+    route GET /daily = daily_totals()                    // db and time
+    route GET /now with time = str(now())                // time only
+}
+```
+
+`quillo check` says it before the program runs, and the program refuses it as it runs:
+`` `http.post` needs the http effect, but `route GET /reports/daily` is declared `with db,
+time` ``. A route outside any group takes `with` the same way: `route GET /day/:d with db
+= ...` (see [Effects](#effects)).
+
 ## Rules
 
 - A group holds only `route`s and `routes` groups, at the top level of a file. Its

@@ -2473,8 +2473,9 @@ impl Checker {
             name: format!("{} {}", r.method, route_path(r)),
             ret: None,
             err: None,
-            allowed: crate::policy::ceiling(),
-            restrictor: None,
+            // `route ... with db` (branch feedback40-43).
+            allowed: r.effects.as_ref().map_or(ALL_EFFECTS, |e| effect_mask(e)) & crate::policy::ceiling(),
+            restrictor: r.effects.as_ref().map(|e| (format!("route {}", r.shown()), e.clone())),
             component: None,
             nested: false,
             state_init: false,
@@ -3033,7 +3034,9 @@ impl Checker {
     fn effect_error(&mut self, what: &str, missing: u8, restrictor: Option<&(String, Vec<String>)>) {
         let names = effect_names(missing);
         let need = format!("the {} effect{}", names.join(", "), if names.len() == 1 { "" } else { "s" });
-        match restrictor {
+        // An effect the `with` names but the policy took away is the policy's to explain
+        // (branch feedback40-43).
+        match restrictor.filter(|(_, decl)| effect_mask(decl) & missing == 0) {
             Some((f, decl)) => self.error(format!("`{}` needs {}, but `{}` is declared `with {}`", what, need, f, decl.join(", "))),
             None if crate::policy::ceiling() != ALL_EFFECTS => self.error(format!("`{}` needs {}, which {} does not allow", what, need, crate::policy::get().effects_source())),
             None => self.error(format!("`{}` needs {}, which is not allowed here", what, need)),

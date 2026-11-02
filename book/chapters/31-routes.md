@@ -1,8 +1,8 @@
 # Routes
 
 ```quillo
-route METHOD /path/:param/:typed(int)/*rest [? { query pattern }] [{ request pattern }] = expr
-route METHOD /path { ... block ... }
+route METHOD /path/:param/:typed(int)/*rest [? { query pattern }] [{ request pattern }] [with effects] = expr
+route METHOD /path [with effects] { ... block ... }
 ```
 
 - **Methods:** `GET POST PUT PATCH DELETE OPTIONS ANY`. `ANY` takes every method. A
@@ -13,17 +13,56 @@ route METHOD /path { ... block ... }
   HEAD, OPTIONS, POST`), and so is `OPTIONS *`: a health check that sends it (HAProxy's
   `option httpchk`) finds the server up. Nothing answers CORS preflights by itself, and
   no `access-control-*` header is written for you.
+
+  ```quillo
+  route GET /items = "the list"
+  route POST /items = "added"
+  route ANY /echo = request.method
+  ```
+
+  ```sh
+  curl -X DELETE -i localhost:8080/items    # 405, allow: GET, HEAD, OPTIONS, POST
+  curl -I localhost:8080/items              # 200, content-length: 8, no body
+  curl -X OPTIONS -i localhost:8080/items   # 204, allow: GET, HEAD, OPTIONS, POST
+  curl -X PATCH localhost:8080/echo         # PATCH
+  ```
 - **Path params** become variables. `:id(int)` only matches what parses as an int (also
   `float`, `dec`, `num`, `str`, and `date`: `/day/:d(date)` takes `2026-11-20`, not
   `2026-02-30`). `*rest` (or `*name`) takes the rest of the path; `*`
   alone names it `rest`. The path is split at `/`, empty pieces dropped, so `/users`,
   `/users/` and `//users` are one path; each piece is percent-decoded after the split, so
   a `%2F` stays inside its piece. `request.path` is the path as it came, undecoded.
+
+  ```quillo
+  route GET /users/:id(int) = `user ${id + 1}`     // id is an int: arithmetic works
+  route GET /day/:d(date) = `the ${d}`
+  route GET /files/*rest = rest
+  ```
+
+  ```sh
+  curl localhost:8080/users/41              # user 42
+  curl localhost:8080/users/abc             # 404: not an int, so no route matches
+  curl localhost:8080/day/2026-02-30        # 404: not a date
+  curl localhost:8080/files/docs/a.txt      # docs/a.txt
+  ```
 - **Query pattern:** `? { q: str, page: int = 1 }`. Query values are text, so `int`, `float` and `bool` patterns convert them.
   A name sent more than once keeps its last value in `request.query` and `request.form`;
   a list in the pattern takes them all, as a group of checkboxes sends: `? { tag: [str] }`
   gives `["a", "b"]` for `?tag=a&tag=b`, one value a list of one, and none an empty list.
   So does `{ form: { tag: [str] } }`, for a urlencoded form.
+
+  ```quillo
+  route GET /search ? { q: str, page: int = 1 } = `${q}, page ${page}`
+  route GET /filter ? { tag: [str] } = join(tag, ", ")
+  ```
+
+  ```sh
+  curl "localhost:8080/search?q=lamp"            # lamp, page 1
+  curl "localhost:8080/search?q=lamp&page=2"     # lamp, page 2
+  curl "localhost:8080/search?q=lamp&page=x"     # 400: page is not an int
+  curl "localhost:8080/search"                   # 400: q is missing
+  curl "localhost:8080/filter?tag=a&tag=b"       # a, b
+  ```
 - **Request pattern:** matched against the `request` map. Its fields, and all of them:
   `method`, `path`, `query`, `query_string` (the query as it came), `params`, `headers`,
   `cookies`, `body`, `json`, `form`, `files`, `ip`, `id`. The host is `request.headers.host`; the tenant and the locale
@@ -31,6 +70,21 @@ route METHOD /path { ... block ... }
   int. Form fields, headers and cookies are converted like query values. `{ json: User }`
   takes the body as a [record](#records). A pattern on the host is a pattern on the
   headers: `{ headers: { host: "api.example.com" } }`.
+
+  ```quillo
+  route POST /api/items { json: { name: str, qty: int } } = `${qty} x ${name}`
+  route GET /beta { headers: { "x-beta": "yes" } } = "the new page"
+  route GET /beta = "the old page"                 // the same path, for everyone else
+  ```
+
+  ```sh
+  curl -H "content-type: application/json" -d '{"name":"lamp","qty":2}' localhost:8080/api/items
+  # 2 x lamp
+  curl -H "content-type: application/json" -d '{"name":"lamp","qty":"2"}' localhost:8080/api/items
+  # 400: "2" is text, not an int
+  curl -H "x-beta: yes" localhost:8080/beta      # the new page
+  curl localhost:8080/beta                       # the old page
+  ```
 - **What the request holds.** `headers` has its names in lower case, and a header sent
   twice keeps the last; only the last `Cookie` header is read, its values
   percent-decoded. `query` and `form` keep the last of a key given twice (`a=1&a=2` is
@@ -41,9 +95,23 @@ route METHOD /path { ... block ... }
   body cannot be read as it was (there is no bytes value in the language), and for a
   multipart body it is empty. `id` is the request's id (see [Services](#services)). A
   JSON body that starts with a byte-order mark is read.
+
+  ```quillo
+  route POST /show = json.stringify({ method: request.method, path: request.path,
+      query: request.query, form: request.form, agent: request.headers["user-agent"] })
+  ```
+
+  ```sh
+  curl -A demo/1 -d "name=Ana&name=Bo" "localhost:8080/show?a=1"
+  # {"method":"POST","path":"/show","query":{"a":"1"},"form":{"name":"Bo"},"agent":"demo/1"}
+  ```
+
+  `name` was sent twice and keeps the last; a list in a pattern (`{ form: { name: [str] }
+  }`) takes both.
 - **What the server refuses before a route.** Two `Host` headers, an HTTP/1.1 request
   without one, or one that is not a host and a port, get 400; a method not written in
-  capitals, or one HTTP does not define (`FROB`), gets 501. A request target in absolute
+  capitals, or one HTTP does not define (`FROB`), gets 501, unless a `route ANY` takes the
+  path, as `ANY` takes every method. A request target in absolute
   form (`GET http://host/path`) takes its host from the target. A `HEAD` answer carries
   the `Content-Length` the `GET` would. A body sent with `Content-Encoding: gzip` reaches
   the route decoded, [`--max-body`](#options-of-quillo-run) (`quillo run main.qwe --max-body 50MB`; 10MB unless
@@ -52,11 +120,45 @@ route METHOD /path { ... block ... }
   than `100-continue` gets 417. An HTTP/1.0 request gets no `100 Continue` (a 1.0 client
   would take it for the answer) and no chunks: a streamed answer goes with no length and
   ends with the connection, and an `Upgrade` is ignored.
+
+  ```sh
+  curl -X FROB localhost:8080/items         # 501 unknown method
+  curl -X get localhost:8080/items          # 501 unknown method (methods are written in capitals)
+  printf 'GET /items HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n' | nc localhost 8080
+  # 400 Bad Request: two Host headers (curl would send only one)
+  ```
 - **Reserved:** paths under `/_quillo/` belong to Quillo and never reach a route (what is
-  there is listed under [What a route cannot do](#what-a-route-cannot-do)).
+  there is listed under [What a route cannot do](#what-a-route-cannot-do)). A route
+  written there is never called: `route GET /_quillo/stats = ...` answers 404, so put
+  your own under another path (`/stats`, `/admin/stats`).
 - **Order:** routes are tried in the order they are declared, and the first whose method, path and patterns all match handles the request. A later route can be the fallback.
   Routes are declared at the top level of a file: `quillo check` refuses one inside a
   function or a block.
+
+  ```quillo
+  route GET /people/me = "you"                     // before :id, or "me" would not match
+  route GET /people/:id(int) = `person ${id}`
+  route ANY /*rest = respond(404, `Nothing at /${rest}`)   // last: everything else
+  ```
+
+  ```sh
+  curl localhost:8080/people/me             # you
+  curl localhost:8080/people/7              # person 7
+  curl localhost:8080/nowhere               # 404: Nothing at /nowhere
+  ```
+
+  Put the specific before the general. With the catch-all last, no path answers 405 or
+  400 any more: every request reaches it.
+- **What it may do:** `with`, before the body, holds the route to what it says, as for a
+  function (see [Effects](#effects)):
+
+  ```quillo
+  route GET /report/:day with db = db.query("select * from orders where day = ?", day)
+  ```
+
+  A call in it (or in a group's middleware) that needs another effect is refused by
+  `quillo check` and when it runs. What the answer runs after the body is held too: the
+  function given to `stream(f)` or `events(f)`, and a component's `defer(...)` parts.
 
 If no route matches, the response is 404 for an unknown path, 405 for a known
 path with the wrong method (with `Allow`, the methods it takes), and 400 when a route
@@ -116,7 +218,16 @@ routes /api { headers: { host: "api.example.com" } } {    // Laravel's domain()
 routes / | signed_in {                              // no prefix: middleware only
     route GET /settings = <Settings/>
 }
+
+routes /reports | signed_in with db {               // what its routes may do, at most
+    route GET /daily = daily()
+}
 ```
+
+- **`with`**, after the middleware, is what every route in the group, and its middleware,
+  may do. A route in it may narrow it (`route GET /status with time = ...`), a group
+  inside it too, and asking for an effect it does not allow is an error (see
+  [Effects](#effects)).
 
 - **The path** goes before each route's own, parameters and types included
   (`:team(int)`), which the routes' bodies and patterns can use; a group's `/` alone

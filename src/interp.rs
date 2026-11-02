@@ -129,6 +129,9 @@ pub struct Interp {
     /// the program had (see `script_mask`).
     pub(crate) script: Option<(Env, u8)>,
     pub(crate) restrictor: Option<Arc<FnDef>>,
+    /// The running request's route's `with`, for what its answer runs after the body: a
+    /// stream's function, deferred parts (branch feedback40-43).
+    pub(crate) route_limit: Option<Arc<FnDef>>,
     /// Names of `server fn`s, callable from the browser.
     pub server_fns: Arc<Vec<String>>,
     /// What the program set about its site (see `site::Site`).
@@ -1164,6 +1167,7 @@ impl Interp {
             allowed: crate::policy::ceiling(),
             script: None,
             restrictor: None,
+            route_limit: None,
             server_fns: Arc::new(Vec::new()),
             site: Arc::new(crate::site::Site::default()),
             tenant: None,
@@ -1264,6 +1268,7 @@ impl Interp {
             allowed: crate::policy::ceiling(),
             script: None,
             restrictor: None,
+            route_limit: None,
             server_fns: self.server_fns.clone(),
             site: self.site.clone(),
             tenant: None,
@@ -3435,10 +3440,25 @@ impl Interp {
     }
 
     /// "`http.get` needs the http effect, but `load` is declared `with db`".
+    /// `f` under the route's `with`, as its body ran: narrowed, never widened (branch
+    /// feedback40-43).
+    pub(crate) fn under_route<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let Some(def) = self.route_limit.clone() else { return f(self) };
+        let mask = effect_mask(def.effects.as_deref().unwrap_or_default()) & self.allowed;
+        let allowed = std::mem::replace(&mut self.allowed, mask);
+        let who = std::mem::replace(&mut self.restrictor, Some(def));
+        let r = f(self);
+        self.allowed = allowed;
+        self.restrictor = who;
+        r
+    }
+
     fn effect_denied(&self, what: &str, missing: u8) -> String {
         let names = effect_names(missing);
         let need = format!("the {} effect{}", names.join(", "), if names.len() == 1 { "" } else { "s" });
-        match &self.restrictor {
+        // An effect the `with` names but the policy took away (a route's, narrowed by the
+        // policy rather than refused) is the policy's to explain (branch feedback40-43).
+        match self.restrictor.as_ref().filter(|f| effect_mask(f.effects.as_deref().unwrap_or_default()) & missing == 0) {
             Some(f) => format!(
                 "`{}` needs {}, but `{}` is declared `with {}`",
                 what,

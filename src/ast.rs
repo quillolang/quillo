@@ -256,6 +256,53 @@ pub struct RouteDef {
     /// against it. Otherwise the request map is made only if something asks
     /// for it (`url()`, a server fn).
     pub uses_request: bool,
+    /// `route GET /report/:day with db { ... }`: what its body, and the middleware of its
+    /// groups, may do; the group's `with` narrowed by its own (branch feedback40-43).
+    pub effects: Option<Vec<String>>,
+    /// The same as a function the runtime holds while the route runs, for its messages
+    /// (`route GET /report/:day` is declared `with db`); made by `limited`.
+    pub limit: Option<Arc<FnDef>>,
+}
+
+impl RouteDef {
+    /// `GET /report/:day`, as written.
+    pub fn shown(&self) -> String {
+        let mut s = String::new();
+        for seg in &self.path {
+            s.push('/');
+            match seg {
+                Seg::Lit(l) => s.push_str(l),
+                Seg::Param(n, Some(t)) => s.push_str(&format!(":{}({})", n, t)),
+                Seg::Param(n, None) => s.push_str(&format!(":{}", n)),
+                Seg::Rest(n) => s.push_str(&format!("*{}", n)),
+            }
+        }
+        if s.is_empty() {
+            s.push('/');
+        }
+        format!("{} {}", self.method, s)
+    }
+
+    /// Sets `limit` from `effects` and the route's path.
+    pub fn limited(mut self) -> Self {
+        self.limit = self.effects.as_ref().map(|e| {
+            Arc::new(FnDef {
+                name: format!("route {}", self.shown()),
+                params: Vec::new(),
+                ret: None,
+                err: None,
+                effects: Some(e.clone()),
+                server: false,
+                component: false,
+                body: Expr::Lit(Lit::Nil),
+                line: self.line,
+                nesting: 1,
+                file: self.file.clone(),
+                hot: Default::default(),
+            })
+        });
+        self
+    }
 }
 
 #[derive(Debug, Clone)]

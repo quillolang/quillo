@@ -323,6 +323,7 @@ impl Interp {
         self.tenant_named = false;
         self.no_such_tenant = false;
         self.upload_body = None;
+        self.route_limit = None;
         self.set_cookies.clear();
         self.session = None;
         self.visitor_read = false;
@@ -636,7 +637,11 @@ impl Interp {
 
             self.current_request = r.uses_request.then_some(reqv);
             let file = std::mem::replace(&mut self.cur_file, r.file.clone());
-            let ran = if crate::debug::on() { self.debug_route(&r, &scope) } else { self.eval(&r.body, &scope) };
+            // `route ... with db`: its body runs as a `with` function's, narrowed, never widened
+            // (branch feedback40-43).
+            // Kept for the request: a stream's function and deferred parts run after the body.
+            self.route_limit = r.limit.clone();
+            let ran = self.under_route(|it| if crate::debug::on() { it.debug_route(&r, &scope) } else { it.eval(&r.body, &scope) });
             self.cur_file = file;
             let resp = finish(crate::interp::in_file(ran, &r.file));
             // The page's components will need the locale (see `handle`).
