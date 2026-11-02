@@ -1,0 +1,15 @@
+:root { --accent: #0b6e4f; --muted: #667; --line: #dde; font: 16px/1.45 system-ui, "Noto Sans Arabic", sans-serif }
+body { margin: 0; background: #f6f7f9; color: #1d2330 }
+.top { display: flex; gap: 1rem; align-items: center; padding: .6rem 1rem; background: #fff; border-block-end: 1px solid var(--line) }
+.top nav { display: flex; gap: .8rem; margin-inline-end: auto }
+.brand { font-weight: 700; color: var(--accent); text-decoration: none }
+.langs a { margin-inline-start: .4rem; color: var(--muted) }
+.langs a.on { color: var(--accent); font-weight: 600 }
+main { max-width: 52rem; margin: 1.5rem auto; padding: 0 1rem }
+.card { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 1rem 1.25rem }
+label { display: block; margin: .5rem 0 }
+.problem { color: #a40000 }
+.msg { color: var(--accent) }
+.appts li.cancelled { opacity: .6 }
+table { border-collapse: collapse; width: 100% }
+td, th { text-align: start; padding: .3rem .5rem; border-block-end: 1px solid var(--line) }

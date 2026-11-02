@@ -1,0 +1,150 @@
+// Quillo Clinic: one booking desk for five branches in five time zones
+// (Manila, New York's all-night urgent care, Sydney, London, Tokyo). Patients
+// book a doctor's free time in the branch's own time and see it in theirs,
+// read their invoices in the branch's currency with its tax, and keep their
+// lab results; the front desk uploads results for patients and exports the
+// invoices as CSV. English, Spanish and Arabic (right to left). A reminder is
+// written a day ahead, in the patient's language.
+//
+//   quillo run app/clinic/main.qwe --watch        then open http://127.0.0.1:8080
+//   quillo check app/clinic/main.qwe
+//
+// CLINIC_DB picks the database file (clinic.db). Sign in as desk@clinic.test,
+// or ana@example.com, with the password "clinic-pass".
+//
+//   lib/zones.qwe      slots and times in each branch's zone (server and browser)
+//   lib/auth.qwe       accounts, sessions, the visitor's zone
+//   lib/booking.qwe    free times, booking, cancelling
+//   lib/billing.qwe    invoices, tax, CSV
+//   lib/files.qwe      lab results
+//   lib/reminders.qwe  the jobs
+//   ui/*.qwe           the pages
+
+db.open(env("CLINIC_DB", "clinic.db")) | unwrap
+db.migrate("migrations")
+translations("locales", { default: "en" })
+
+import lib/auth.qwe use me, sign_in, sign_up, sign_out, signed_in, staff, my_zone, Signup
+import lib/booking.qwe use branches, upcoming
+import lib/billing.qwe use invoice, invoices_csv
+import lib/files.qwe use as_list, keep_result, results_of, result_file
+import lib/reminders.qwe use send_reminders, morning_lists
+import ui/page.qwe use Frame, LoginPage
+import ui/book.qwe use Booking
+import ui/mine.qwe use Mine, Results
+import ui/desk.qwe use Desk, InvoicePage
+
+private fn seed() with db, random {
+    if db.one("select count(*) as n from branches").n > 0 { return null }
+    let b = [
+        ["MNL", "Manila", "Asia/Manila", "en-PH", "PHP", "12", "08:00", "17:00"],
+        ["NYC", "New York Urgent Care", "America/New_York", "en-US", "USD", "8.875", "00:00", "23:59"],
+        ["SYD", "Sydney", "Australia/Sydney", "en-AU", "AUD", "10", "08:00", "18:00"],
+        ["LON", "London", "Europe/London", "en-GB", "GBP", "20", "09:00", "17:30"],
+        ["TYO", "Tokyo", "Asia/Tokyo", "ja-JP", "JPY", "10", "09:00", "18:00"],
+    ]
+    for r in b {
+        db.exec("insert into branches (code, name, zone, locale, currency, tax_rate, opens, closes) values (?, ?, ?, ?, ?, ?, ?, ?)", r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7])?
+    }
+    let pw = crypto.hash_password("clinic-pass")
+    let docs = [
+        ["Dr. Maria Santos", 1, "Family medicine", "1500", 30, "1,2,3,4,5,6"],
+        ["Dr. Jose Rizal Cruz", 1, "Ophthalmology", "2500", 60, "1,3,5"],
+        ["Dr. Ellen Park", 2, "Urgent care", "185.50", 30, "1,2,3,4,5,6,7"],
+        ["Dr. Sam O'Neill", 3, "General practice", "89.95", 15, "1,2,3,4,5"],
+        ["Dr. Priya Shah", 4, "Dermatology", "120", 20, "1,2,3,4"],
+        ["Dr. 佐藤 健", 5, "内科", "5500", 30, "1,2,3,4,5"],
+    ]
+    for [i, d] in enumerate(docs) {
+        let u = db.exec("insert into users (email, name, password_hash, role) values (?, ?, ?, 'doctor')", `doctor${i + 1}@clinic.test`, d[0], pw)?
+        db.exec("insert into doctors (user_id, branch_id, specialty, fee, slot_minutes, days) values (?, ?, ?, ?, ?, ?)", u.last_id, d[1], d[2], d[3], d[4], d[5])?
+    }
+    db.exec("insert into users (email, name, password_hash, role, branch_id) values ('desk@clinic.test', 'Front Desk', ?, 'desk', 1)", pw)?
+    db.exec("insert into users (email, name, password_hash, locale) values ('ana@example.com', 'Ana Reyes', ?, 'es')", pw)?
+    db.exec("insert into users (email, name, password_hash, locale) values ('omar@example.com', 'عمر الفاروق', ?, 'ar')", pw)?
+}
+seed() | unwrap
+
+// ?lang= for a link, then the account's own setting; else the cookie and the
+// browser's languages, as Quillo does by itself.
+locale_from((r) => r.query.lang ?? me().locale)
+
+schedule("5m", send_reminders)
+schedule("@hourly", morning_lists)
+
+// `local_path` reads the address as a browser does, so `/\evil.example` is no way out
+// (FEEDBACK31.md, Q-390; branch feedback27-35-fixes).
+private fn safe_next(n) -> str = local_path(n) ?? "/book"
+
+route GET / = redirect("/book")
+route GET /public/*path = file("public/" + path)
+
+route GET /login ? { next: str = "/book" } = <LoginPage next={safe_next(next)} problem={null}/>
+route POST /login { form: { email: str, password: str } } {
+    let r = sign_in(email, password)
+    if is_err(r) { reply 401 <LoginPage next={safe_next(request.form.next)} problem={r.error}/> }
+    redirect(safe_next(request.form.next))
+}
+route POST /signup { form: Signup as f } {
+    let r = sign_up(f)
+    if is_err(r) { reply 422 <LoginPage next="/book" problem={r.error}/> }
+    redirect("/book")
+}
+route POST /logout { sign_out(); redirect("/login") }
+
+// The language: a cookie for everyone, and the account's setting.
+route GET /lang/:code {
+    let loc = code == "en" || code == "es" || code == "ar" ? code : "en"
+    set_cookie("locale", loc, { max_age: "1y" })
+    let u = me()
+    if u != null { db.exec("update users set locale = ? where id = ?", loc, u.id)? }
+    redirect(safe_next(request.headers.referer != null ? url_path(request.headers.referer) : "/book"))
+}
+private fn url_path(u: str) -> str = re.replace(u, "^https?://[^/]+", "")
+
+route GET /book {
+    let bs = branches()
+    let u = me()
+    <Frame title={t("nav.book")}><Booking branches={bs} my_zone={my_zone(bs[0].zone)} signed_in={u != null}/></Frame>
+}
+
+routes / | signed_in {
+    route GET /mine {
+        let u = me()
+        let zone = my_zone("UTC")
+        <Frame title={t("mine.title")}><Mine rows={upcoming(u.id)} my_zone={zone} today={date.today(zone)}/></Frame>
+    }
+    route GET /results = <Frame title={t("results.title")}><Results rows={results_of(me().id)}/></Frame>
+    route GET /results/:id(int)/*name {
+        let r = result_file(id) ?? reply 404 "Not found"
+        file(r.stored_as)
+    }
+    route GET /invoices/:id(int) {
+        let i = invoice(id) ?? reply 404 "Not found"
+        let u = me()
+        if i.patient_id != u.id && u.role == "patient" { reply 404 "Not found" }
+        <Frame title={t("invoice.title", { n: id })}><InvoicePage i={i}/></Frame>
+    }
+}
+
+routes /desk | signed_in | staff {
+    route GET / {
+        let done = request.query.done
+        let bs = branches()
+        let rows = db.query(sql`
+            select a.starts_at, u.name as patient, du.name as doctor, b.name as branch, b.zone
+            from appointments a join users u on u.id = a.patient_id join doctors d on d.id = a.doctor_id
+            join users du on du.id = d.user_id join branches b on b.id = d.branch_id
+            where a.status = 'booked' and a.starts_at >= ? order by a.starts_at limit 200`, date.now())
+        let patients = db.query("select id, name, email from users where role = 'patient' order by name")
+        <Frame title={t("nav.desk")}><Desk branches={bs} today_rows={rows} patients={patients} done={done}/></Frame>
+    }
+    route POST /results { form: { patient: int, note: str = "" } } {
+        let files = as_list(request.files.files)
+        let saved = for f in files => keep_result(patient, me().id, f, note)
+        let bad = saved | filter(is_err)
+        if len(bad) > 0 { reply 422 join(bad | map((e) => e.error), "; ") }
+        redirect(`/desk?done=${url_encode(t("results.count", { count: len(saved) }))}`)
+    }
+    route GET /invoices/:b(int)/invoices.csv = invoices_csv(b)
+}

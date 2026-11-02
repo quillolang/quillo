@@ -1,0 +1,44 @@
+// Reminders, a day ahead, in the patient's language; and each branch's list
+// for the morning, at 07:00 in the branch's own zone.
+
+import lib/zones.qwe use local_time, local_day
+
+private fn lang_of(p: map) -> str = p.locale ?? split(p.branch_locale, "-")[0]
+
+public fn send_reminders() with db, time {
+    let now_ms = now()
+    let from = date.from_ms(now_ms + 23 * 3_600_000, "UTC")
+    let to = date.from_ms(now_ms + 24 * 3_600_000 + 300_000, "UTC")
+    let due = db.query(sql`
+        select a.id, a.starts_at, u.locale, u.zone as my_zone, du.name as doctor, b.name as branch, b.zone, b.locale as branch_locale
+        from appointments a join users u on u.id = a.patient_id
+        join doctors d on d.id = a.doctor_id join users du on du.id = d.user_id join branches b on b.id = d.branch_id
+        where a.status = 'booked' and a.starts_at >= ? and a.starts_at < ?
+          and not exists (select 1 from outbox o where o.appointment_id = a.id and o.kind = 'remind')`, from, to)
+    for a in due {
+        let loc = lang_of(a)
+        let body = with_locale(loc, () => t("remind.body", {
+            doctor: a.doctor, branch: a.branch,
+            when: `${local_day(a.starts_at, a.zone, loc)} ${local_time(a.starts_at, a.zone)}`,
+            local: local_time(a.starts_at, a.my_zone ?? a.zone),
+        }))
+        db.exec("insert into outbox (appointment_id, kind, locale, body, created_at) values (?, 'remind', ?, ?, ?) on conflict do nothing",
+            a.id, loc, body, date.now())
+    }
+    len(due)
+}
+
+// schedule's cron is in UTC, and a branch's 07:00 moves against UTC twice a
+// year: run every hour, and act where it is seven o'clock now.
+public fn morning_lists() with db, time {
+    for b in db.query("select * from branches") {
+        let here = date.to_zone(date.now(), b.zone)
+        if date.parts(here).hour == 7 {
+            let today = date.date_in(date.now(), b.zone)
+            let n = db.one(sql`select count(*) as n from appointments a join doctors d on d.id = a.doctor_id
+                where d.branch_id = ? and a.status = 'booked' and a.starts_at >= ? and a.starts_at < ?`,
+                b.id, date.to_zone(date.at(today, "00:00", b.zone), "UTC"), date.to_zone(date.at(date.add_days(today, 1), "00:00", b.zone), "UTC")).n
+            print(`morning list for ${b.code}: ${n}`)
+        }
+    }
+}

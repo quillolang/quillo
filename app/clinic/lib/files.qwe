@@ -1,0 +1,47 @@
+// Lab results: PDFs and images, kept under uploads/ by a name of our own and
+// served only to their patient and to staff.
+
+import lib/auth.qwe use me
+
+private let MAX = 5_000_000
+
+// A file field may hold one file (a map) or several (a list).
+public fn as_list(f) -> list = f == null ? [] : type_of(f) == "list" ? f : [f]
+
+// What kind of file it is, by its bytes, not by what the browser said.
+private fn kind(f: map) -> str? {
+    let ext = lower(last(split(f.filename, ".")) ?? "")
+    if ext == "pdf" {
+        let head = slice(read_upload(f) ?? "", 0, 5)
+        return head == "%PDF-" ? "pdf" : null
+    }
+    let saved = save_upload(f, `uploads/tmp/${uuid()}`) ?? return null
+    let info = image.info(saved) ?? null
+    delete_file(saved)
+    info != null && (info.format == "png" || info.format == "jpeg" || info.format == "webp") ? info.format : null
+}
+
+public fn keep_result(patient_id: int, by: int, f: map, note: str) with db, fs, random, time {
+    if f.size > MAX { return err(t("results.too_big")) }
+    let k = kind(f) ?? return err(t("results.kind"))
+    let ext = k == "jpeg" ? "jpg" : k
+    let stored = save_upload(f, `uploads/${patient_id}/${uuid()}.${ext}`)?
+    let r = db.exec("insert into lab_results (patient_id, uploaded_by, filename, stored_as, type, size, note, created_at) values (?, ?, ?, ?, ?, ?, ?, ?)",
+        patient_id, by, f.filename, stored, k, f.size, slice(note, 0, 300), date.now())?
+    { id: r.last_id, filename: f.filename, note }
+}
+
+public fn results_of(patient_id: int) with db =
+    db.query("select id, filename, type, size, note, created_at from lab_results where patient_id = ? order by created_at desc, id desc", patient_id)
+
+// The patient's own upload, from the page.
+server fn add_result(file: map, note: str) with db, fs, random, time {
+    let u = me() ?? return err("Sign in first")
+    keep_result(u.id, u.id, file, note)
+}
+
+public fn result_file(id: int) with db {
+    let u = me() ?? return null
+    let r = db.one("select * from lab_results where id = ?", id) ?? return null
+    u.id == r.patient_id || u.role == "desk" || u.role == "doctor" ? r : null
+}

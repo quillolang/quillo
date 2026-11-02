@@ -1,0 +1,24 @@
+{
+  "app": { "name": "Clínica Quillo", "tagline": "Cuatro sedes, una recepción" },
+  "nav": { "book": "Reservar", "mine": "Mis citas", "results": "Resultados", "desk": "Recepción", "login": "Entrar", "logout": "Salir", "lang": "Idioma" },
+  "auth": { "email": "Correo", "password": "Contraseña", "name": "Nombre completo", "signup": "Crear cuenta", "wrong": "Correo o contraseña incorrectos", "taken": "Ese correo ya está registrado" },
+  "book": {
+    "branch": "Sede", "doctor": "Médico", "day": "Día", "pick": "Elige una hora",
+    "local": "Las horas son de {branch} ({zone}).", "yours": "Tu hora: {time}",
+    "none": "No hay horas libres ese día.", "reason": "Motivo de la visita", "confirm": "Reservar {time}",
+    "done": "Reservado: {doctor}, {when}", "taken": "Alguien acaba de tomar esa hora. Elige otra.",
+    "past": "Esa hora ya pasó.", "closed": "La sede está cerrada ese día.",
+    "slots": { "one": "{count} hora libre", "many": "{count} de horas libres", "other": "{count} horas libres" }
+  },
+  "mine": {
+    "title": "Mis citas", "empty": "No tienes citas.", "cancel": "Cancelar", "cancelled": "Cancelada",
+    "count": { "one": "{count} cita próxima", "other": "{count} citas próximas" },
+    "in_days": { "zero": "hoy", "one": "mañana", "other": "en {count} días" }
+  },
+  "results": {
+    "title": "Resultados", "upload": "Subir resultados", "for": "Paciente", "note": "Nota", "empty": "Aún no hay resultados.",
+    "count": { "one": "{count} archivo", "other": "{count} archivos" }, "too_big": "Archivos de hasta 5 MB", "kind": "Solo PDF o imagen"
+  },
+  "invoice": { "title": "Factura {n}", "line": "Concepto", "qty": "Cant.", "unit": "Precio", "amount": "Importe", "subtotal": "Subtotal", "tax": "Impuesto ({rate} %)", "total": "Total", "export": "Exportar CSV" },
+  "remind": { "body": "Recordatorio: {doctor} en {branch}, {when} (tu hora {local})." }
+}

@@ -1,0 +1,42 @@
+// The front desk: today's list at each branch, uploading a patient's results
+// by a plain form, and the invoices as CSV.
+
+import lib/zones.qwe use local_time
+
+public view Desk(branches: list, today_rows: list, patients: list, done: str?) = <section.card #desk>
+    <h1>{t("nav.desk")}</h1>
+    {done != null && <p.msg #done>{done}</p>}
+    <table>
+        <thead><tr><th>{t("book.branch")}</th><th>{t("book.doctor")}</th><th>Patient</th><th>Time</th></tr></thead>
+        <tbody>
+            {for a in today_rows => <tr><td>{a.branch}</td><td>{a.doctor}</td><td>{a.patient}</td><td>{local_time(a.starts_at, a.zone)}</td></tr>}
+        </tbody>
+    </table>
+    <h2>{t("results.upload")}</h2>
+    <form #upload method="post" action="/desk/results" enctype="multipart/form-data">
+        <label>{t("results.for")} <select name="patient">{for p in patients => <option value={p.id}>{p.name} · {p.email}</option>}</select></label>
+        <label>{t("results.note")} <input name="note"/></label>
+        <input type="file" name="files" multiple accept="application/pdf,image/*"/>
+        <button>{t("results.upload")}</button>
+    </form>
+    <h2>{t("invoice.export")}</h2>
+    <ul>{for b in branches => <li><a href={`/desk/invoices/${b.id}/invoices.csv`}>{b.name}</a></li>}</ul>
+</section>
+
+public view InvoicePage(i: map) {
+    let loc = i.locale
+    let m = (amount) => money.format({ amount, currency: i.currency }, loc)
+    <section.card #invoice>
+        <h1>{t("invoice.title", { n: i.id })}</h1>
+        <p>{i.patient} · {i.branch} · {date.format(date.to_zone(i.starts_at, i.zone), { locale: loc, style: "long" })}</p>
+        <table>
+            <thead><tr><th>{t("invoice.line")}</th><th>{t("invoice.qty")}</th><th>{t("invoice.unit")}</th><th>{t("invoice.amount")}</th></tr></thead>
+            <tbody>{for l in i.lines => <tr><td>{l.label}</td><td>{l.qty}</td><td>{m(l.unit)}</td><td>{m(l.amount)}</td></tr>}</tbody>
+            <tfoot>
+                <tr><td colspan="3">{t("invoice.subtotal")}</td><td>{m(i.subtotal)}</td></tr>
+                <tr><td colspan="3">{t("invoice.tax", { rate: format_number(i.tax_rate, loc, 3) })}</td><td>{m(i.tax)}</td></tr>
+                <tr><td colspan="3"><b>{t("invoice.total")}</b></td><td #total><b>{m(i.total)}</b></td></tr>
+            </tfoot>
+        </table>
+    </section>
+}

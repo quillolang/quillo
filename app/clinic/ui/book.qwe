@@ -1,0 +1,78 @@
+// <Booking>: pick a branch, a doctor and a day, see the free times in the
+// branch's zone and your own, and book one.
+
+import lib/zones.qwe use both_times, local_day
+import lib/booking.qwe use doctors_at, free_slots, book
+
+server fn doctors_for(branch_id: int) -> list with db = doctors_at(branch_id)
+
+component Booking(branches: list, my_zone: str, signed_in: bool) {
+    style css`
+      .slots { display: flex; flex-wrap: wrap; gap: .4rem; padding: 0; list-style: none }
+      .slots button[aria-pressed="true"] { outline: 2px solid var(--accent) }
+      .hint { color: var(--muted); font-size: .9em }
+    `
+    state branch_id = branches[0].id
+    state doctors = doctors_for(branches[0].id)
+    state doctor_id = doctors[0].id ?? null
+    state day = date.today(branches[0].zone)
+    state slots = doctor_id == null ? [] : free_slots(doctor_id, day)
+    state picked = null
+    state reason = ""
+    state msg = null
+    state busy = false
+    let branch = branches | find((b) => b.id == branch_id)
+    let loc = locale()
+
+    fn load_slots() {
+        picked = null
+        slots = doctor_id == null ? [] : (free_slots(doctor_id, day) ?? [])
+    }
+
+    <section.card #booking>
+        <h1>{t("nav.book")}</h1>
+        <label>{t("book.branch")}
+            <select #branch @change={(e) => {
+                branch_id = int(e.value)
+                let b = branches | find((x) => x.id == branch_id)
+                day = date.today(b.zone)
+                doctors = doctors_for(branch_id) ?? []
+                doctor_id = doctors[0].id ?? null
+                load_slots()
+            }}>
+                {for b in branches => <option value={b.id} selected={b.id == branch_id}>{b.name}</option>}
+            </select>
+        </label>
+        <label>{t("book.doctor")}
+            <select #doctor @change={(e) => { doctor_id = int(e.value); load_slots() }}>
+                {for d in doctors => <option value={d.id} selected={d.id == doctor_id}>{d.name} · {d.specialty}</option>}
+            </select>
+        </label>
+        <label>{t("book.day")}
+            <input #day type="date" bind:value={day} @change={() => load_slots()}/>
+        </label>
+        <p.hint>{t("book.local", { branch: branch.name, zone: branch.zone })} {local_day(date.at(day, "12:00", branch.zone), branch.zone, loc)}</p>
+        <p #count>{t("book.slots", { count: len(slots) })}</p>
+        {len(slots) == 0
+            ? <p.hint>{t("book.none")}</p>
+            : <ul.slots>
+                {for s in slots => <li key={s}><button type="button" data-at={s} aria-pressed={picked == s ? "true" : "false"}
+                    @click={() => { picked = s; msg = null }}>{both_times(s, branch.zone, my_zone)}</button></li>}
+              </ul>}
+        {picked != null && signed_in && <form #confirm @submit={(e) => {
+            e.preventDefault()
+            busy = true
+            let r = book(doctor_id, picked, reason)
+            busy = false
+            if is_err(r) { msg = r.error; load_slots() } else {
+                msg = t("book.done", { doctor: r.doctor, when: both_times(r.at, branch.zone, my_zone) })
+                load_slots()
+            }
+        }}>
+            <label>{t("book.reason")} <input #reason bind:value={reason} maxlength="500"/></label>
+            <button disabled={busy}>{t("book.confirm", { time: both_times(picked, branch.zone, my_zone) })}</button>
+        </form>}
+        {picked != null && !signed_in && <p><a href="/login?next=/book">{t("nav.login")}</a></p>}
+        {msg != null && <p.msg #msg role="status">{msg}</p>}
+    </section>
+}

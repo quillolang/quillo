@@ -1,0 +1,62 @@
+// The frame of every page: the language's direction, the menu, the sign-in
+// form, and the script that tells the server the visitor's time zone.
+
+import lib/auth.qwe use me
+
+private let LANGS = [["en", "English"], ["es", "Español"], ["ar", "العربية"]]
+
+public fn rtl(loc: str) -> bool = loc == "ar" || starts_with(loc, "ar-") || loc == "he"
+
+private let TZ_SCRIPT = "try{var z=Intl.DateTimeFormat().resolvedOptions().timeZone;if(z&&document.cookie.indexOf('tz='+z)<0)document.cookie='tz='+z+'; path=/; max-age=31536000; samesite=lax'}catch(e){}"
+
+public view Frame(title: str, children) {
+    let u = me()
+    let loc = locale()
+    <html lang={loc} dir={rtl(loc) ? "rtl" : "ltr"}>
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>{title} · {t("app.name")}</title>
+            <link rel="stylesheet" href="/public/clinic.css"/>
+            <script>{raw(TZ_SCRIPT)}</script>
+        </head>
+        <body>
+            <header.top>
+                <a.brand href="/">{t("app.name")}</a>
+                <nav>
+                    <a href="/book">{t("nav.book")}</a>
+                    {u != null && <a href="/mine">{t("nav.mine")}</a>}
+                    {u != null && <a href="/results">{t("nav.results")}</a>}
+                    {u != null && u.role != "patient" && <a href="/desk">{t("nav.desk")}</a>}
+                </nav>
+                <span.langs aria-label={t("nav.lang")}>
+                    {for [code, name] in LANGS => <a href={`/lang/${code}`} class={code == loc && "on"} lang={code}>{name}</a>}
+                </span>
+                {u == null
+                    ? <a href="/login">{t("nav.login")}</a>
+                    : <form method="post" action="/logout"><span.who>{u.name}</span> <button>{t("nav.logout")}</button></form>}
+            </header>
+            <main>{children}</main>
+        </body>
+    </html>
+}
+
+public view LoginPage(next: str, problem: str?) = <Frame title={t("nav.login")}>
+    <section.card>
+        <h1>{t("nav.login")}</h1>
+        {problem != null && <p.problem>{problem}</p>}
+        <form method="post" action="/login">
+            <input type="hidden" name="next" value={next}/>
+            <label>{t("auth.email")} <input name="email" type="email" required/></label>
+            <label>{t("auth.password")} <input name="password" type="password" required/></label>
+            <button>{t("nav.login")}</button>
+        </form>
+        <h2>{t("auth.signup")}</h2>
+        <form method="post" action="/signup">
+            <label>{t("auth.name")} <input name="name" required/></label>
+            <label>{t("auth.email")} <input name="email" type="email" required/></label>
+            <label>{t("auth.password")} <input name="password" type="password" minlength="8" required/></label>
+            <button>{t("auth.signup")}</button>
+        </form>
+    </section>
+</Frame>

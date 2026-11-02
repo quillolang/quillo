@@ -1,0 +1,68 @@
+// Booking: what a doctor has free on a day, taking a time, cancelling.
+
+import lib/zones.qwe use day_slots
+import lib/auth.qwe use me
+import lib/billing.qwe use issue_invoice
+
+public fn branches() with db = db.query("select * from branches order by id")
+
+public fn doctors_at(branch_id: int) with db = db.query(sql`
+    select d.id, u.name, d.specialty, d.fee, d.slot_minutes, d.days, d.branch_id
+    from doctors d join users u on u.id = d.user_id
+    where d.branch_id = ? order by u.name`, branch_id)
+
+private fn doctor(id: int) with db = db.one(sql`
+    select d.*, u.name, b.zone, b.opens, b.closes, b.currency, b.tax_rate, b.locale, b.name as branch
+    from doctors d join users u on u.id = d.user_id join branches b on b.id = d.branch_id
+    where d.id = ?`, id)
+
+private fn taken(doctor_id: int, day_slots: list) with db {
+    if len(day_slots) == 0 { return [] }
+    db.query("select starts_at from appointments where doctor_id = ? and status = 'booked' and starts_at >= ? and starts_at <= ?",
+        doctor_id, first(day_slots), last(day_slots)) | map((r) => r.starts_at)
+}
+
+// The instants still free, in UTC: the page shows them in the branch's time and
+// the patient's.
+server fn free_slots(doctor_id: int, day: date) -> list with db, time {
+    let d = doctor(doctor_id) ?? return []
+    let all = day_slots(day, { zone: d.zone, opens: d.opens, closes: d.closes }, d)
+    let busy = taken(doctor_id, all)
+    let now_utc = date.now()
+    all | filter((t) => t > now_utc && !(busy | any((b) => b == t)))
+}
+
+server fn book(doctor_id: int, at: str, reason: str) with db, time {
+    let u = me() ?? return err("Sign in first")
+    let d = doctor(doctor_id) ?? return err("No such doctor")
+    if !date.valid(at, "date-time") { return err("bad time") }
+    let at_utc = date.to_zone(at, "UTC")
+    let day = date.date_in(at_utc, d.zone)
+    let offered = day_slots(day, { zone: d.zone, opens: d.opens, closes: d.closes }, d)
+    if !(offered | any((t) => t == at_utc)) { return err(t("book.closed")) }
+    if at_utc <= date.now() { return err(t("book.past")) }
+    let ends = date.from_ms(date.ms(at_utc) + d.slot_minutes * 60_000, "UTC")
+    db.transaction(() => {
+        let r = db.exec("insert into appointments (doctor_id, patient_id, starts_at, ends_at, reason, created_at) values (?, ?, ?, ?, ?, ?)",
+            doctor_id, u.id, at_utc, ends, slice(trim(reason), 0, 500), date.now())
+        if db.error_kind(r) == "unique" { return err(t("book.taken")) }
+        r?
+        issue_invoice(r.last_id)?
+        { id: r.last_id, at: at_utc, doctor: d.name, zone: d.zone }
+    })
+}
+
+server fn cancel(id: int) with db {
+    let u = me() ?? return err("Sign in first")
+    let r = db.exec("update appointments set status = 'cancelled' where id = ? and patient_id = ? and status = 'booked'", id, u.id)?
+    r.changes == 1 ? true : err("Not yours, or not booked")
+}
+
+public fn upcoming(user_id: int) with db, time = db.query(sql`
+    select a.id, a.starts_at, a.status, a.reason, u.name as doctor, b.name as branch, b.zone, b.code,
+           i.id as invoice_id, i.total, i.currency
+    from appointments a
+    join doctors d on d.id = a.doctor_id join users u on u.id = d.user_id join branches b on b.id = d.branch_id
+    left join invoices i on i.appointment_id = a.id
+    where a.patient_id = ? and a.starts_at >= ?
+    order by a.starts_at`, user_id, date.now())
