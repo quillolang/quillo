@@ -1,0 +1,120 @@
+// Field Notes: a website of Markdown pages. Each page is a file in pages/, and NAV says
+// which pages there are, in the order of the sidebar. A page's title is its first `# `
+// heading; edit a file and, under --watch, the open page reloads.
+//
+//   quillo run app/mdsite --watch      then open http://localhost:8080
+//
+// /sitemap.xml lists the pages, and /<page>.md gives a page's Markdown as it is written.
+
+let SITE = "Field Notes"
+
+let NAV = [
+    { path: "/", file: "index.md", group: "" },
+    { path: "/getting-started", file: "getting-started.md", group: "" },
+    { path: "/guide/writing", file: "guide/writing.md", group: "Guide" },
+    { path: "/guide/pages", file: "guide/pages.md", group: "Guide" },
+    { path: "/guide/code", file: "guide/code.md", group: "Guide" },
+    { path: "/about", file: "about.md", group: "" },
+]
+
+/// A page's title: its first `# ` heading, or its path.
+fn title_of(text: str, path: str) -> str {
+    let line = find(split(text, "\n"), (l) => starts_with(l, "# "))
+    line == null ? path : trim(slice(line, 2))
+}
+
+/// The page at `path`, its place in NAV and its text, or null.
+fn page_at(path: str) {
+    let at = index_of(for p in NAV => p.path, path)
+    if at == null { return null }
+    let p = NAV[at]
+    let text = read_file("pages/" + p.file)
+    if is_err(text) { return null }
+    { ...p, at, text, title: title_of(text, p.path) }
+}
+
+view Layout(title: str, current: str, children) {
+    // Global: the pages' own elements come from markdown(), which carries no view's mark.
+    style global css`
+        :root { --ink: #1d2433; --muted: #5b6475; --line: #e3e6ec; --accent: #2f5bd8; --wash: #f6f7fa; }
+        body { margin: 0; font: 17px/1.6 -apple-system, "Segoe UI", system-ui, sans-serif; color: var(--ink); }
+        .shell { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
+        aside { background: var(--wash); border-right: 1px solid var(--line); padding: 28px 22px; }
+        aside .brand { font-weight: 700; font-size: 19px; color: var(--ink); text-decoration: none; }
+        aside h4 { margin: 22px 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+        aside a.page { display: block; padding: 5px 10px; margin: 2px -10px; border-radius: 6px; color: var(--ink); text-decoration: none; }
+        aside a.page:hover { background: #eceff5; }
+        aside a.page.on { background: #e3eaff; color: var(--accent); font-weight: 600; }
+        main { max-width: 760px; padding: 40px 56px 80px; }
+        main h1 { font-size: 34px; line-height: 1.2; margin-top: 0; }
+        main a { color: var(--accent); }
+        main pre { background: #0f1420; color: #e6e9f0; padding: 16px 18px; border-radius: 8px; overflow-x: auto; font-size: 14px; }
+        main code { font-size: 0.92em; }
+        .hl-k { color: #c792ea; } .hl-s { color: #c3e88d; } .hl-n { color: #f78c6c; } .hl-c { color: #697098; font-style: italic; }
+        .hl-f { color: #82aaff; } .hl-t { color: #ffcb6b; } .hl-a { color: #89ddff; }
+        main table { border-collapse: collapse; }
+        main td, main th { border: 1px solid var(--line); padding: 6px 10px; }
+        main blockquote { margin: 0; padding: 4px 16px; border-left: 4px solid var(--line); color: var(--muted); }
+        .pager { display: flex; justify-content: space-between; margin-top: 56px; padding-top: 18px; border-top: 1px solid var(--line); }
+        .pager a { text-decoration: none; }
+        .source { font-size: 13px; color: var(--muted); margin-top: 18px; }
+        @media (max-width: 720px) { .shell { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid var(--line); } main { padding: 28px 20px 60px; } }
+    `
+    <html lang="en">
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>{title == SITE ? SITE : `${title} · ${SITE}`}</title>
+        </head>
+        <body>
+            <div.shell>
+                <aside>
+                    <a.brand href="/">{SITE}</a>
+                    {for [i, p] in enumerate(NAV) => <div key={p.path}>
+                        {p.group != "" && (i == 0 || NAV[i - 1].group != p.group) ? <h4>{p.group}</h4> : null}
+                        <a class={p.path == current ? "page on" : "page"} href={p.path}>{title_of(read_file("pages/" + p.file) ?? "", p.path)}</a>
+                    </div>}
+                </aside>
+                <main>{children}</main>
+            </div>
+        </body>
+    </html>
+}
+
+/// A page, with links to the one before and after it.
+fn show(path: str) {
+    let p = page_at(path)
+    if p == null {
+        reply 404 <Layout title="Not found" current="">
+            <h1>Not found</h1>
+            <p>There is no page at <code>{path}</code>. <a href="/">Back to the start</a>.</p>
+        </Layout>
+    }
+    let before = p.at > 0 ? NAV[p.at - 1] : null
+    let after = p.at < len(NAV) - 1 ? NAV[p.at + 1] : null
+    let name = (q) => title_of(read_file("pages/" + q.file) ?? "", q.path)
+    <Layout title={p.title} current={p.path}>
+        {markdown(p.text, { html: true })}
+        <nav.pager>
+            {before != null ? <a href={before.path}>← {name(before)}</a> : <span/>}
+            {after != null ? <a href={after.path}>{name(after)} →</a> : <span/>}
+        </nav>
+        <p.source><a href={p.path == "/" ? "/index.md" : p.path + ".md"}>This page's Markdown</a></p>
+    </Layout>
+}
+
+route GET /sitemap.xml = <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    {for p in NAV => <url key={p.path}><loc>{`http://localhost:8080${p.path}`}</loc></url>}
+</urlset>
+
+route GET /assets/*path = files("public", path, { not_found: null })
+
+// A page's Markdown, as it is written.
+route GET /*path {
+    if ends_with(path, ".md") {
+        let page = page_at(path == "index.md" ? "/" : "/" + slice(path, 0, -3))
+        if page == null { reply 404 "no such page\n" }
+        return respond(200, page.text, { "content-type": "text/markdown; charset=utf-8" })
+    }
+    show("/" + path)
+}

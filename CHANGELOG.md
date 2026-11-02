@@ -96,6 +96,13 @@
 - **`--max-body` takes a size as the policy writes one**: `--max-body 50MB`, `512KB`,
   `2GB` (1024-based), in any case, or plain bytes as before.
 
+### Editors
+
+- **A new `import` line offers its file's names at once**: on `import lib/order.qwe use `,
+  `quillo lsp` lists the file's public functions before a letter is typed, from the file
+  itself (as the editor has it) when the program does not take it yet. They came only once
+  a name was begun.
+
 ### Shared servers: a socket, FastCGI and a policy (FEEDBACK41.md)
 
 - **`--listen unix:PATH`** listens on a Unix socket instead of a TCP port, made with mode

@@ -222,7 +222,14 @@ through wry, not yet run.
 
 Editor support: [quillolang/editors](https://github.com/quillolang/editors) has a VS Code extension (highlighting,
 diagnostics as you type, quick fixes, hover, go to definition, completion, outline, snippets,
-end tags added as you type a start tag's `>` or `</`, and a debugger: see [Debugging](#debugging)).
+end tags added as you type a start tag's `>` or `</`, and a debugger: see [Debugging](#debugging)),
+which Cursor, Windsurf and VSCodium take as its `.vsix` (or from Open VSX, once a release is
+published there). The same repository has a plugin for the JetBrains IDEs and Android Studio,
+an extension for Zed, and support for Neovim, Helix, Emacs, Sublime Text and Vim, with Eclipse
+and Visual Studio set up by hand. All but Visual Studio run `quillo lsp`, and all but Visual
+Studio, Sublime Text and Vim `quillo dap`. Zed, Neovim, Helix and Emacs highlight
+with tree-sitter-quillo, a tree-sitter grammar in the same repository; documentation sites can
+use its Shiki, highlight.js and Prism definitions.
 An element left open is reported at its start tag (`` `<li>` is never closed: add `</li>` before
 `</ul>` on line 5 ``), with a quick fix that adds the end tag there. A class in markup
 (`<span.chip>`, `class="chip"`) goes to its rules with Go to Definition, in `css(...)`, a
