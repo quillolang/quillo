@@ -16,11 +16,38 @@ functions of that name:
 // shop.qwe
 service billing = "billing.qwe"
 
+route GET / =
+    <form method="post" action="/buy">
+        <input name="name" placeholder="Your name"/>
+        <button>Buy for $12.00</button>
+    </form>
+
 route POST /buy {
     let inv = billing.invoice(request.form.name, 1200)?    // billing's `server fn invoice`
     <p>Invoice #{inv.id}</p>
 }
 ```
+
+The other side is a program with the `server fn`, in a file beside it:
+
+```quillo
+// billing.qwe
+let invoices = []
+
+server fn invoice(name: str, cents: int) -> map ! str {
+    if trim(name) == "" { return err("An invoice is for someone") }
+    let inv = { id: len(invoices) + 1, name, cents }
+    invoices = invoices + [inv]
+    inv
+}
+```
+
+`quillo run shop.qwe` serves the form; sending it with a name gives `Invoice #1`, then
+`#2`, the same with `quillo run shop.qwe --split`, where billing runs as a process of its
+own. A blank name
+is billing's error value, which `?` makes the answer: a 500 with `{"error":"An invoice
+is for someone"}`. To answer with a status of your own, use `??` (see [What crosses the
+wire](#what-crosses-the-wire)).
 
 The app is made of its services. With a path, a service's routes are served under it too,
 and it is named after its file:
@@ -36,22 +63,28 @@ Services may use one another.
 
 ## One process or many
 
+How the app runs is said when it is started, with options of `quillo run` after the
+program's file: `quillo run app.qwe --split`, `quillo run billing.qwe --port 8081
+--as-service`. Every word starting with `--` on this page is one of them; [the
+options](#running-quillo) lists them all.
+
 - **In one process**, the default, a service is loaded once and shared by every program
   in the process that names it: one copy of its variables and of its database. A call
   goes straight to it, with nothing on the network.
 - **Split**, a service runs on a server of its own, and its calls go there as signed
-  HTTP requests. Run alone, a service is an ordinary program; `--base` is the path it is
-  served under, which its links and redirects carry.
+  HTTP requests. Run alone, a service is an ordinary program; `--base`
+  (`quillo run billing.qwe --base /billing`) is the path it is served under, which its links and redirects carry.
 - **`--split`** runs each service the app declares (and those they declare) as a
   process of its own, each on its own port, its log lines marked with its name, all
   signed with one secret. They stop with the app. `--describe`, `--no-build` and the
-  `--policy` files, given to the app, are given to each of them too. It is the quickest
+  `--policy` files, given to the app (`quillo run app.qwe --split --no-build --policy
+  prod.toml`), are given to each of them too. It is the quickest
   way to see an app as it would run split, on one machine.
 - **Checked once.** Before `--split` starts any service, the app checks the whole tree,
   its own files and every service's, and says each warning once. An error in a service
   stops it there, before anything waits. A service that ends as it starts is said at
   once: `service billing stopped at start (exit status: 1; see its lines above)`.
-- **`--split --watch`** watches the services' files too: a function added to
+- **`quillo run app.qwe --split --watch`** watches the services' files too: a function added to
   `billing.qwe` reloads billing's process and the app, and the app calls it at once.
 
 ```sh
@@ -164,15 +197,15 @@ the service stays up. Only an answer of 200 is remembered.
 
 A copy that [joins](#microservices-copies-that-join) the app does so at `POST <app>/_quillo/join`,
 with `{ "service": "billing", "port": 8081, "leave": false }` as the body (and `"url"`,
-from `--join-as`), signed as a service call is, for the function `_join`, with a nonce
+from the copy's `--join-as`; see [Copies that join](#microservices-copies-that-join)), signed as a service call is, for the function `_join`, with a nonce
 in `x-quillo-call`, which is taken once: with the service's own key (`kid` its name)
 when the app has a key for that service in `accept_calls`, else under
 `QUILLO_SERVICE_SECRET`. The answer is 200 with `{ "service", "at" }`, the address the
 copy is recorded at; otherwise 400 for a body without a port, an address that is not
 known, or a `url` that does not lead to where the copy joined from, 401 for a bad or old
 signature, a key of another service's, a join under the shared secret where the app
-wants the service's key, or no nonce, 403 when the app takes no copies (`--no-join`,
-`--allow-join`) or has neither `QUILLO_SERVICE_SECRET` nor keys in `accept_calls`, 404 when the app declares no such
+wants the service's key, or no nonce, 403 when the app takes no copies (started with `--no-join`,
+or an `--allow-join` that does not name the service) or has neither `QUILLO_SERVICE_SECRET` nor keys in `accept_calls`, 404 when the app declares no such
 service, 405 for a method other than POST, and 409 for a nonce sent before. Only copies call it, so a proxy in
 front of the app need not pass it from outside.
 
@@ -229,7 +262,7 @@ What holds across the links:
   ledger stops waiting too, and a call with no time left is not made. What a service is
   already doing runs to its end.
 - **One id all the way down.** The request's `x-request-id` (or the one made for it)
-  goes with every call. With `--log json` the caller logs each call as a line of its
+  goes with every call. With `quillo run app.qwe --log json` the caller logs each call as a line of its
   own, beside the request's:
 
 ```json
@@ -344,7 +377,7 @@ service ledger: 409 `total` here is `total() -> int`; the caller's copy of this 
 So a caller's `.qwe` copy of a service is its client stub: keep the `server fn`
 signatures in it in step with the service, and `quillo check` plus the contract check
 catch the rest. As the app loads, it reads only the copy's `server fn` headers, so a
-mistake in one of its routes or bodies does not stop an app run with `--no-check`.
+mistake in one of its routes or bodies does not stop an app run with `quillo run app.qwe --no-check`.
 
 The app may also go without the copy. With no file and an address (`--service-url` or
 `QUILLO_SERVICE_<NAME>`), it asks the running service for its functions as it starts.
@@ -438,14 +471,16 @@ copies of those services only.
 Each copy has a circuit of its own. With several app servers, a copy joins each.
 
 Join the app's own address, not its public one: through a proxy the app sees the
-proxy's address, unless it runs with `--trust-proxy` naming it. A copy behind NAT is
+proxy's address, unless it runs with `--trust-proxy` naming it (`quillo run app.qwe --trust-proxy
+10.0.0.1`). A copy behind NAT is
 recorded at an address the app cannot reach, so such a copy belongs behind a balancer
 instead.
 
 ### Discovery by registration
 
 Services are found by registering, in two ways: a copy joins the app (`--join`, above),
-and any server joins limer's pool (`--register`, with `LIMER_ADMIN_SECRET`). A caller
+and any server joins limer's pool (`quillo run app.qwe --register URL`, with
+`LIMER_ADMIN_SECRET`). A caller
 does not look a service up by name, so a service the app does not run itself needs
 `--service-url` or `QUILLO_SERVICE_<NAME>`. `QUILLO_SERVICE_SECRET` and the keys are
 set on every machine by hand.
@@ -532,7 +567,7 @@ not: a 401, 404 or 409 from a deploy gone wrong, or a 500, is tried again for ab
 and a service that does not answer at all is waited for however long it takes. A 400,
 arguments the service refuses, cannot work and is given up on at once. A call given up on
 stays in `_quillo_later` with `tries` -1 and why in `error`, is counted in
-`quillo_later_total` with `--metrics`, and goes again with `update _quillo_later set at =
+`quillo_later_total` with `quillo run app.qwe --metrics`, and goes again with `update _quillo_later set at =
 0, tries = 0 where tries < 0`.
 
 **Asking after one.** [`later.status(id)`](https://quillolang.org/docs/reference/later.status/) says whether the
@@ -567,8 +602,8 @@ a working one. Five rules carry it:
   chain of calls commits step by step. Give each step a reference the caller makes up,
   and keep what was done, so a request sent again goes on from where it stopped instead
   of doing a step twice. To undo the steps before one that fails, see [Sagas](#microservices-sagas).
-- **Variables are each copy's.** Copies of a service (`--scale`, `--join`, several
-  addresses) share its database, not its global variables.
+- **Variables are each copy's.** Copies of a service (`quillo run app.qwe --split --scale
+  billing=3`, `--join`, several addresses) share its database, not its global variables.
 - **A service's own publishing.** A topic a service publishes while answering a call
   reaches the caller's pages; one it publishes on its own (a job, a call made later
   being delivered) reaches only the service's pages when it runs apart.

@@ -99,7 +99,6 @@ add("32-route-groups.md", "route-groups", replace_once(shift(site_guide("route-g
 add("33-headers-cookies-sessions.md", "headers-cookies-sessions", replace_once(shift(site_guide("headers-cookies-sessions"), -1),
     "This page shows each of them", "This chapter shows each of them"), ("guide", "headers-cookies-sessions"))
 hc = chapters[-1]
-hc["lines"] = replace_once(hc["lines"], "](#requiring-a-session)", "](#sessions)")   # a bold paragraph on the site, not a heading
 add("34-realtime.md", "realtime", shift(site_guide("realtime"), -1), ("guide", "realtime"))
 pf = shift(site_guide("prefetching"), -1)
 pf = replace_once(pf, "> **Try it here.** This site is a Quillo program, and its pages prefetch.",

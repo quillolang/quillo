@@ -216,21 +216,26 @@ fn duration(s: &str) -> Option<Duration> {
 fn bytes(v: &V) -> Option<usize> {
     match v {
         V::Int(n) if *n >= 0 => Some(*n as usize),
-        V::Str(s) => {
-            let s = s.trim().to_ascii_uppercase();
-            let (n, mul) = if let Some(n) = s.strip_suffix("GB") {
-                (n, 1usize << 30)
-            } else if let Some(n) = s.strip_suffix("MB") {
-                (n, 1 << 20)
-            } else if let Some(n) = s.strip_suffix("KB") {
-                (n, 1 << 10)
-            } else {
-                (s.strip_suffix('B').unwrap_or(&s), 1)
-            };
-            n.trim().parse::<usize>().ok().map(|n| n * mul)
-        }
+        V::Str(s) => size(s),
         _ => None,
     }
+}
+
+/// A size as people write one: `10MB`, `512KB`, `2GB`, `100B` or plain bytes, in any case
+/// (KB, MB and GB are 1024, 1024² and 1024³ bytes). `--max-body` takes the same (branch
+/// feedback40-43).
+pub fn size(s: &str) -> Option<usize> {
+    let s = s.trim().to_ascii_uppercase();
+    let (n, mul) = if let Some(n) = s.strip_suffix("GB") {
+        (n, 1usize << 30)
+    } else if let Some(n) = s.strip_suffix("MB") {
+        (n, 1 << 20)
+    } else if let Some(n) = s.strip_suffix("KB") {
+        (n, 1 << 10)
+    } else {
+        (s.strip_suffix('B').unwrap_or(&s), 1)
+    };
+    n.trim().parse::<usize>().ok().and_then(|n| n.checked_mul(mul))
 }
 
 impl Policy {
@@ -460,6 +465,15 @@ mod tests {
         assert_eq!(duration("2m"), Some(Duration::from_secs(120)));
         assert_eq!(duration("5"), Some(Duration::from_secs(5)));
         assert_eq!(duration("5h"), None);
+        assert_eq!(size("50MB"), Some(50 << 20));
+        assert_eq!(size("50mb"), Some(50 << 20));
+        assert_eq!(size(" 2 GB "), Some(2 << 30));
+        assert_eq!(size("512KB"), Some(512 << 10));
+        assert_eq!(size("100B"), Some(100));
+        assert_eq!(size("52428800"), Some(52428800));
+        assert_eq!(size("1.5GB"), None);
+        assert_eq!(size("lots"), None);
+        assert_eq!(size(&format!("{}GB", usize::MAX)), None, "too large is no size, not a wrapped one");
     }
 
     #[test]

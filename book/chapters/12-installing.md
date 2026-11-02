@@ -134,7 +134,8 @@ cargo install --git https://github.com/quillolang/quillo quillo
 ```
 
 Then run the sample app in the clone, `quillo run app/main.qwe --watch`, and open
-http://localhost:8080.
+http://localhost:8080. `--watch` is an option of `quillo run`: it reloads the program
+and refreshes its pages when a file changes. [The options](#running-quillo) lists the others.
 
 ## What Cargo downloads
 
@@ -186,7 +187,8 @@ the output of the servers the tests start.
 
 Releases are built for Linux and macOS, on x86-64 and ARM, and for Windows (see
 [Download](#download)). On Windows, `quillo dap` (the debugger) is not there yet, and
-`--with` needs a `sh` on the `PATH`.
+`quillo run`'s `--with` option (`quillo run main.qwe --with "npx tailwindcss ..."`,
+a command run beside the program) needs a `sh` on the `PATH`.
 
 ## Running a program
 

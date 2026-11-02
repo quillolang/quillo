@@ -46,9 +46,10 @@ curl 127.0.0.1:8080/readings                                      # [{"id":"boil
 - **Packets wait their turn**, up to 10,000 (`{ queue: 50000 }` for more). A full queue
   drops its oldest packet, as UDP itself would.
 - **The port is taken when the program starts**, so one already in use is an error at
-  once, not when the first packet comes. It stays open across `--reload` and `--watch`,
-  and the new version's handler gets the packets. With `--instances`, the instances
-  share the socket.
+  once, not when the first packet comes. It stays open when the program reloads
+  (started with `quillo run main.qwe --watch` or `--reload`, options of `quillo run`; see
+  [the options](#running-quillo)), and the new version's handler gets the packets. With
+  `quillo run main.qwe --instances 4`, the instances share the socket.
 
 ## Packets out
 
@@ -93,6 +94,23 @@ component Chat() {
     </form>
 }
 ```
+
+The page that holds it, and the form that gives a visitor the name `join` asks for (a
+page without one is turned away):
+
+```quillo
+route GET / =
+    <html><body>
+        {session().name == null
+            ? <form method="post" action="/name"><input name="name" placeholder="Your name"/><button>Join</button></form>
+            : <Chat/>}
+    </body></html>
+
+route POST /name { form: { name: str } } { set_session({ name }); redirect("/") }
+```
+
+Open it in two browsers (or one and a private window), each with a name: a line sent in
+one shows in both, after its sender's name.
 
 - **In a component**, `channel.open(name, f)` opens the channel for as long as the code
   that called it stands: `f` gets each message the server sends on it, and `.send(value)`
@@ -301,23 +319,23 @@ In the Network panel, the connection is the request to `/_quillo/wt`; if its typ
 
 On your own machine, open `http://127.0.0.1:8080` rather than `localhost`. `quillo run`
 listens on 127.0.0.1, and browsers try `localhost` over IPv6 first for UDP. They find
-nothing there and use a WebSocket instead. `--host ::1` serves `localhost` over IPv6, if
+nothing there and use a WebSocket instead. `quillo run main.qwe --host ::1` serves `localhost` over IPv6, if
 you would rather keep the name.
 
 ## In production
 
 - **Open the UDP port.** WebTransport uses the HTTP port's number over UDP (443 for 443),
-  or the one `--wt-port` gives. Firewalls and cloud security groups often open only TCP.
+  or the one `quillo run main.qwe --wt-port 4433` gives. Firewalls and cloud security groups often open only TCP.
 - **A certificate.** The server makes one of its own, which browsers accept by its hash,
   and a new one before each ends (browsers take such certificates for two weeks at
-  most). `--tls-cert` and `--tls-key` give it a real one.
+  most). `quillo run main.qwe --tls-cert cert.pem --tls-key key.pem` gives it a real one.
 - **Behind a proxy or a CDN** that passes HTTP only, open the UDP port to the server
   itself, or pages use the WebSocket through the proxy.
-- **One server's pages.** Broadcasts reach the pages connected to this server. With
-  `--metrics`, `quillo_channel_pages` counts them, `quillo_channel_dropped_total` the
+- **One server's pages.** Broadcasts reach the pages connected to this server. Started with
+  `quillo run main.qwe --metrics`, `quillo_channel_pages` counts them, `quillo_channel_dropped_total` the
   messages dropped because a page's queue was full, and `quillo_udp_received_total` and
   `quillo_udp_dropped_total` the packets.
-- `--no-wt` turns WebTransport off, and every page uses the WebSocket.
+- `quillo run main.qwe --no-wt` turns WebTransport off, and every page uses the WebSocket.
 
 ## Limits, and what it does not do
 

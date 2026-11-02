@@ -27,7 +27,8 @@ seconds write `sleep(200)` ``); `c.query(...)` on an untyped parameter in a `wit
 function without `db`; a service whose file is not here. Warnings never make
 it fail.
 
-`quillo check --policy FILE` checks the program as it would run under that policy (and
+[`quillo check --policy FILE`](#other-commands) (`quillo check main.qwe --policy host.toml`)
+checks the program as it would run under that policy (and
 the host's and the program's own, which it always reads): it names the files first
 (`quillo: policy host.toml + quillo.policy (effects: db, http, time; no builds; no
 private addresses)`), then what each would refuse, as errors: a builtin needing an
@@ -44,7 +45,8 @@ database through a helper between them (`quillo run` refuses that before it serv
 `quillo check` writes its findings to stderr as `file:line: error: ...` and `file:line:
 warning: ...`; with errors it ends `quillo: N errors` and exits 1; else it writes
 `main.qwe: ok (12 routes, 40 functions, 9 components, in 18 files)` to stdout (with the
-warnings counted) and exits 0. `--strict-null` (below) is its one option.
+warnings counted) and exits 0. Its two options, given after the program as `quillo run`'s are,
+are [`--strict-null`](#other-commands) (below) and `--policy FILE` (above).
 
 After a syntax error that a newer Quillo might accept (an unknown character or escape,
 an unexpected keyword, an unknown word), `quillo check`, `quillo run` and the language

@@ -98,8 +98,8 @@ routes /api | api.key {
 ```
 
 For a page rather than an API, the check redirects instead: a `reply` with a status and
-a `redirect` goes to the login page from inside the helper (see [Requiring a
-session](#sessions)).
+a `redirect` goes to the login page from inside the helper (see
+[Sessions](#sessions)).
 
 ## Setting response headers
 
@@ -187,7 +187,7 @@ The options, and what a cookie is without them:
 | option | default | takes |
 |---|---|---|
 | `max_age` | none: the cookie lasts until the browser closes | seconds, or a duration: `"30d"` with `s`, `m`, `h`, `d`, `w`, `y` |
-| `path` | `/` (under `--base` or in a mounted program, that prefix) | a path starting with `/` |
+| `path` | `/` (or the prefix the program is served under: `quillo run main.qwe --base /shop`, or a mounted program's path) | a path starting with `/` |
 | `domain` | the host only | a host name, letters, digits, `.` and `-` |
 | `http_only` | `true`: the page's scripts cannot read it | `false` to let them |
 | `secure` | `true`: sent over HTTPS only | `false` |
@@ -203,8 +203,9 @@ The options, and what a cookie is without them:
 - `cookie(name)` works in any function the request runs, so a helper that reads the
   visitor's time zone from a cookie need not be handed `request`. Outside a request (a
   job, a script) it is null.
-- `Secure` is left out with `--watch`, in desktop apps and with `--plain-http`, where
-  the site is served over plain HTTP. In production a browser drops a `Secure` cookie
+- `Secure` is left out in desktop apps, and when the program is started with `quillo run
+  main.qwe --watch` or `quillo run main.qwe --plain-http` (options of `quillo run`; see
+  [the options](#running-quillo)), where the site is served over plain HTTP. In production a browser drops a `Secure` cookie
   that comes over plain HTTP from anywhere but `localhost`, so a site reached as
   `http://10.0.0.5:8080` cannot keep anyone signed in; the server says so once when it
   happens. Serve the site over HTTPS (a proxy in front, sending
@@ -397,6 +398,9 @@ let api = {
     key: (req) => req.headers.authorization == `Bearer ${env("API_TOKEN")}` ? req : reply 401 { error: "unauthorized" },
 }
 
+// Only a path on this site: "//evil.example" starts with "/" too, and is another site.
+fn local(next: str) = starts_with(next, "/") && !starts_with(next, "//") && !contains(next, "\\") ? next : "/"
+
 fn me() = session().user == null ? null : db.one("select id, name from users where id = ?", session().user)
 fn me_or_login(back: str) = me() ?? reply 303 redirect(`/login?next=${url_encode(back)}`)
 
@@ -413,6 +417,11 @@ route GET / {
     touch()
     <Page theme={cookie("theme") ?? "light"}>
         {me() != null ? <p>Hello, {me().name}. <a href="/account">Account</a></p> : <a href="/login">Sign in</a>}
+        <form method="post" action="/theme">
+            <select name="theme"><option>light</option><option>dark</option></select>
+            <button>Change theme</button>
+        </form>
+        {me() != null && <form method="post" action="/logout"><button>Sign out</button></form>}
     </Page>
 }
 
@@ -430,7 +439,7 @@ route POST /login { form: { email: str, password: str, next: str = "/" } } {
     let hash = user.password_hash ?? crypto.hash_password("not anyone's")
     if user == null || !crypto.verify_password(password, hash) { reply 401 "Wrong email or password" }
     set_session({ user: user.id, at: now() })
-    redirect(starts_with(next, "/") ? next : "/")
+    redirect(local(next))
 }
 
 route GET /account = <Page theme={cookie("theme") ?? "light"}><p>Account of {me_or_login("/account").name}</p></Page>
@@ -442,7 +451,37 @@ route POST /logout { end_session(); redirect("/") }
 route GET /api/me = request | api.key | (r) => respond(200, { ip: r.ip, user: session().user }, { "cache-control": "no-store" })
 ```
 
-The `next` a login form carries is checked to start with `/` before it is followed, so a
-link from elsewhere cannot send a visitor to another site after signing in. The
-`migrations/` folder holds the `users` table; see [Database](#database) for how
+The `next` a login form carries is checked by `local` before it is followed, so a link
+from elsewhere cannot send a visitor to another site after signing in: starting with
+`/` is not enough, since a browser takes `//evil.example` (and `/\evil.example`) as
+another host, and `redirect` sends what it is given. Signing out and the theme are
+forms too, posting to their routes: a link cannot log anyone out, since a `GET` would
+let any page do it. The `migrations/` folder holds the `users` table,
+`migrations/001_users.sql`:
+
+```sql
+create table users (id integer primary key, name text, email text unique, password_hash text);
+```
+
+A user to sign in as, made with a script beside it (`quillo run seed.qwe`), and the
+routes followed with `curl` (`--plain-http`, so the session cookie is not `Secure`):
+
+```quillo
+db.open("app.db")
+db.migrate("migrations")
+db.exec("insert into users (name, email, password_hash) values (?, ?, ?)", "Ann", "ann@example.com", crypto.hash_password("pw"))
+```
+
+```sh
+quillo run main.qwe --port 8080 --plain-http
+curl -c jar -b jar localhost:8080/login -H "Origin: http://localhost:8080" -d "email=ann@example.com&password=no"
+# 401 Wrong email or password
+curl -c jar -b jar localhost:8080/login -H "Origin: http://localhost:8080" -d "email=ann@example.com&password=pw&next=/account"
+# 303 to /account, with the session cookie
+curl -c jar -b jar localhost:8080/account                # Account of Ann
+curl -c jar -b jar -X POST localhost:8080/logout -H "Origin: http://localhost:8080"
+curl -c jar -b jar -i localhost:8080/account             # 303 to /login?next=%2Faccount
+```
+
+See [Database](#database) for how
 migrations run.

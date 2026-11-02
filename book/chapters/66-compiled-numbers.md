@@ -42,4 +42,4 @@ round, written about 5, where the interpreter takes 45 (FEEDBACK29.md).
 - A list it writes is taken out of its variable while it runs, and put back after; one
   only read is held. What else holds the list keeps what it had.
 - Not in a server for a global the loop assigns (what follows it must be told), not under
-  the debugger, with `--max-compute`, in a script with a budget, or in a cached view.
+  the debugger, with [`--max-compute`](#options-of-quillo-run), in a script with a budget, or in a cached view.

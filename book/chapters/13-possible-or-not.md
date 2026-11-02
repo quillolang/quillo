@@ -33,7 +33,7 @@ does not do it today; the way around it follows.
 | use `setTimeout`, debounce or throttle? | No `setTimeout`: `run_after(ms, f)` for once, and `every(ms, f)` under a state flag for a debounce. See [Components](#components) |
 | use `localStorage`, the clipboard, `window`? | Through the page: `js("localStorage.getItem", k)`. Nothing is built in for them |
 | use event modifiers like `@click.prevent`? | No: `e.preventDefault()` in the handler |
-| scope CSS to a component, or use Tailwind? | Yes: `style` in a component is scoped, a file's `style` styles its components, `--with` and `style_with` run Tailwind and PostCSS, and `style_with(f)` and `build` run an engine of the program's own, fed by `classes()`. See [HTML literals](#html-literals) |
+| scope CSS to a component, or use Tailwind? | Yes: `style` in a component is scoped, a file's `style` styles its components, [`--with`](#options-of-quillo-run) and `style_with` run Tailwind and PostCSS, and `style_with(f)` and `build` run an engine of the program's own, fed by `classes()`. See [HTML literals](#html-literals) |
 | paste plain HTML into a page? | Mostly: comments, quotes of either kind, unquoted values and the doctype are taken; unclosed `<p>` and `<li>`, `<style>` and `<script>` braces need changing. See [From HTML](#from-html) |
 | translate the interface? | Yes, with plural rules, on both sides. See [Translations](#translations) |
 | run the app in a desktop window? | Yes, with a build that has the `app` feature (the release downloads do not). See [Desktop apps](#desktop-apps) |
@@ -52,9 +52,9 @@ does not do it today; the way around it follows.
 | stream a response? | Yes: `stream`, `events`. See [Streaming](#streaming) |
 | limit how often a client calls? | Not built in: count in a table of your own. See [What a route cannot do](#what-a-route-cannot-do) |
 | put a time limit on a route? | No: only sockets time out |
-| see the visitor's address behind a proxy? | Name it with `--trust-proxy`, and `request.ip` is the visitor's. Otherwise read `x-forwarded-for` from `request.headers` yourself; Quillo never trusts it |
+| see the visitor's address behind a proxy? | Name it with [`--trust-proxy`](#options-of-quillo-run), and `request.ip` is the visitor's. Otherwise read `x-forwarded-for` from `request.headers` yourself; Quillo never trusts it |
 | run several programs on one port? | Yes, in one process: `mount` or `service /prefix`. See [Mounting programs](#mounting-programs) |
-| listen on a Unix socket, or run behind FastCGI? | Yes: `--listen unix:PATH`, and `quillo fcgi` for `mod_fcgid` or nginx's `fastcgi_pass`. See [Quillo on a shared server](#quillo-on-a-shared-server-cpanel) |
+| listen on a Unix socket, or run behind FastCGI? | Yes: [`--listen unix:PATH`](#options-of-quillo-run), and `quillo fcgi` for `mod_fcgid` or nginx's `fastcgi_pass`. See [Quillo on a shared server](#quillo-on-a-shared-server-cpanel) |
 | run on shared hosting (cPanel)? | Where the account has `mod_fcgid`, with `quillo fcgi` and plugins built beforehand; not through Passenger. See [Quillo on a shared server](#quillo-on-a-shared-server-cpanel) |
 | serve a site as static files? | Yes, when its components call nothing on the server: fetch every page and the bundles it loads, and upload them |
 | make requests run once when retried? | Yes: `idempotent`. See [Idempotent requests](#idempotent-requests) |
@@ -69,7 +69,7 @@ does not do it today; the way around it follows.
 | use UDP, WebTransport datagrams, live video? | Yes: `udp.*`, channels, `media.*`. See [UDP](#udp), [Media](#media) |
 | connect pages to each other (WebRTC)? | No: everything goes through the server, which relays video as an SFU, with no TURN |
 | record a stream? | No: have the encoder write a copy |
-| relay channels and streams across servers? | No: live data is shared through limer (`--register`); channels and media are each server's |
+| relay channels and streams across servers? | No: live data is shared through limer ([`--register`](#options-of-quillo-run)); channels and media are each server's |
 
 ## Data
 
@@ -91,17 +91,17 @@ does not do it today; the way around it follows.
 
 | Can I... | |
 |---|---|
-| split an app into services without changing its code? | Yes: `service`, in one process or `--split`. See [Services](#services) |
+| split an app into services without changing its code? | Yes: `service`, in one process or [`--split`](#options-of-quillo-run). See [Services](#services) |
 | write a service in another language? | Yes, if it answers Quillo's signed calls; the caller keeps a `.qwe` file of its signatures, or the service answers `_contracts`. See [Services](#services) |
 | deploy an app without its services' code? | Yes: with an address and no file, the app asks the running service for its functions. See [Services](#services) |
 | authenticate services with keys of their own, OAuth 2.0 tokens, JWTs or mutual TLS? | Yes: `auth` where a service is declared, `accept_calls` in it, `for [...]` on a `server fn`. See [Authentication between services](#authentication-between-services) |
 | call an API that speaks only HTTP/2, as Apple's push service (APNs) or gRPC? | No: `http.*` speaks HTTP/1.1 only. Use another program for those calls, or an API that takes HTTP/1.1 (Firebase Cloud Messaging's v1 API does) |
 | call out through a company's proxy, trust an internal CA, or present a client certificate? | Yes: `HTTPS_PROXY` and `NO_PROXY` are read, and `http.*` takes `ca`, `cert` and `key`. See [HTTP client](#http-client) |
-| use every core? | Yes: `--instances N`, each with its own variables. See [Concurrency](#concurrency-and-reloading) |
+| use every core? | Yes: [`--instances N`](#options-of-quillo-run), each with its own variables. See [Concurrency](#concurrency-and-reloading) |
 | run several servers? | Yes, behind limer, sharing a database; live data follows. See [Several servers](#several-servers) |
-| describe my API for a gateway? | Yes: `quillo docs`, `--describe`. See [The program's API (OpenAPI)](#the-programs-api-openapi) |
-| add a copy of a service while it runs? | Yes: `--join`, or behind limer with `--register`. See [Copies that join](#copies-that-join) |
-| deploy without dropping a request? | With `--reload` for the program's files; a new binary is a stop and a start, so run two servers for no gap |
+| describe my API for a gateway? | Yes: `quillo docs`, [`--describe`](#options-of-quillo-run). See [The program's API (OpenAPI)](#the-programs-api-openapi) |
+| add a copy of a service while it runs? | Yes: [`--join`](#options-of-quillo-run), or behind limer with [`--register`](#options-of-quillo-run). See [Copies that join](#copies-that-join) |
+| deploy without dropping a request? | With [`--reload`](#options-of-quillo-run) for the program's files; a new binary is a stop and a start, so run two servers for no gap |
 | keep state in memory across restarts? | No: globals start afresh; keep it in the database |
 
 ## Extending and tooling
@@ -114,7 +114,7 @@ does not do it today; the way around it follows.
 | debug with breakpoints? | Yes, in VS Code or any DAP client, on macOS and Linux, server and browser alike. See [Debugging](#debugging) |
 | get editor support? | Yes: `quillo lsp`, and the VS Code extension |
 | run untrusted users' code? | Yes, sandboxed: `run_script`. Never as `.qwer`. See [Scripts from users](#scripts-from-users) |
-| get structured logs and metrics? | JSON request lines (`--log json`) and Prometheus metrics (`--metrics`); errors are text lines. See [Logs and metrics](#logs-and-metrics) |
+| get structured logs and metrics? | JSON request lines ([`--log json`](#options-of-quillo-run)) and Prometheus metrics ([`--metrics`](#options-of-quillo-run)); errors are text lines. See [Logs and metrics](#logs-and-metrics) |
 | configure with a file? | Only `.env`, and a policy that takes away; everything else is an option. See the options in [Running quillo](#running-quillo) |
 | limit what a program may do from outside it? | Yes, with a policy: plugins, effects, hosts, variables, limits. See [The policy](#the-policy) |
 | sandbox a program with the system's help (seccomp, Landlock)? | Not yet: a policy holds Quillo code, not a plugin's Rust |

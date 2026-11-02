@@ -211,9 +211,21 @@ server fn add_todo(text: str) = db.exec("insert into todos (text) values (?)", t
 
 component Todos() {
     state todos = live(load_todos)      // every open page sees new todos
-    <ul>{for t in todos => <li key={t.id}>{t.text}</li>}</ul>
+    state draft = ""
+    <div>
+        <ul>{for t in todos => <li key={t.id}>{t.text}</li>}</ul>
+        <form @submit={() => { add_todo(draft); draft = "" }}>
+            <input value={draft} placeholder="Add a todo"/>
+        </form>
+    </div>
 }
+
+route GET / = <html><body><Todos/></body></html>
 ```
+
+The form calls `add_todo` and does not touch `todos` itself: the insert announces the
+table, and `live` runs `load_todos` again, on this page and on every other page showing
+the list.
 
 The tables a loader reads are found in its SQL (`from`, `join`), and every `insert`,
 `update` and `delete` through `db` announces the tables it writes. This works the same on

@@ -168,7 +168,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   stream ends.
 - Component code, and the functions, views and constants it uses, is compiled to
   JavaScript. Code that cannot run in a browser is an error when the program loads
-  (under `--watch`, in the log right after the load, and in the browser's console of
+  (under [`--watch`](#options-of-quillo-run), the option for working on a program, `quillo run main.qwe --watch`: in the log right after the load, and in the browser's console of
   a page that needs the component; and in `quillo check`, for what the component calls
   directly): `request`, `db`, `env`
   (but for variables named `PUBLIC_...`), files, `reply`, or a global the server changes
@@ -200,7 +200,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
     share it, whichever of them each showed.
 
   A page with no components loads no script. The server keeps the bundles of the last
-  256 sets of components pages were made of (`quillo_bundles` under `--metrics`); a
+  256 sets of components pages were made of (`quillo_bundles` under [`--metrics`](#options-of-quillo-run)); a
   page that names one no longer kept is sent the whole program's. There is no splitting
   by route and no lazy component: an `App` whose `match` shows thirty pages carries the
   thirty in its bundle. Under `--watch` a page loads one unminified bundle instead,
@@ -601,6 +601,39 @@ component App() {
 route GET /*rest = <html><body><App/></body></html>       // every path renders on the server
 ```
 
+And the pages it shows, with the `server fn`s that give them their data:
+
+```quillo
+let products = [{ id: 1, name: "Kettle", price: 30 }, { id: 2, name: "Teapot", price: 25 }]
+
+server fn list_products() = products | map((p) => { id: p.id, name: p.name })
+server fn load_product(id: int) = products | find((p) => p.id == id)
+
+view Home() = <h1>Welcome</h1>
+view NotFound(path: str) = <h1>No page at {path}</h1>
+
+component ProductList() {
+    state items = list_products()
+    {items == null
+        ? <p>Loading…</p>
+        : <ul>{for p in items => <li key={p.id}><a href={`/products/${p.id}`}>{p.name}</a></li>}</ul>}
+}
+
+component ProductPage(id: int, on_add) {
+    state product = load_product(id)
+    {product == null
+        ? <p>Loading…</p>
+        : <div>
+              <h1>{product.name}</h1>
+              <button @click={() => on_add(product)}>Add to cart, {product.price}</button>
+          </div>}
+}
+```
+
+Opened at `/products/2`, the server sends the Teapot's page whole. Clicking Products, then
+Kettle, changes the address and the page without loading one, each page showing
+`Loading…` until its call answers; Add to cart makes the cart 1, and Back keeps it.
+
 Pages load their data with `server fn`s in `state` initializers: on the server while
 rendering, in the browser when you navigate to them, where the state is `null` until
 the answer comes (show something for `null`). Give a page component a `key` from
@@ -617,15 +650,32 @@ runs again, and what shows the state follows it, whenever something it read chan
 anyone, not only when this page acts.
 
 ```quillo
-server fn load_notes() = db.query("select * from notes order by id")
+db.open("notes.db")
+db.exec("create table if not exists notes (id integer primary key, text text not null)")
+
+server fn load_notes() = db.query("select id, text from notes order by id")
 
 server fn add_note(text: str) = db.exec("insert into notes (text) values (?)", text)
 
-component Notes(initial: list) {
+component Notes() {
     state notes = live(load_notes)  // every open page sees new notes
-    ...
+    state draft = ""
+    <div>
+        <ul>{for n in notes => <li key={n.id}>{n.text}</li>}</ul>
+        <form @submit={() => { add_note(draft); draft = "" }}>
+            <input value={draft} placeholder="A note"/>
+            <button>Add</button>
+        </form>
+    </div>
 }
+
+route GET / = <html><body><Notes/></body></html>
 ```
+
+The form calls `add_note`, and nothing sets `notes` by hand: the insert writes `notes`, so
+every page whose loader read it runs `load_notes` again, this one included, and the list
+grows on each. A note added from anywhere else (another tab, another visitor, a
+`POST /_quillo/rpc/add_note`, a route) shows the same way.
 
 - `live` takes a `server fn` by its name (not a lambda, not a variable holding one),
   and in a component only as a `state` initializer: `state notes = live(load_notes)`.
@@ -690,7 +740,24 @@ component Notes(initial: list) {
       db.exec("insert into posts (thread, text) values (?, ?)", thread, text)
       publish(`thread:${thread}`)
   }
+
+  component Thread(id: int) {
+      state posts = live(load_posts, id)
+      state draft = ""
+      <section>
+          {for p in posts => <p key={p.id}>{p.text}</p>}
+          <form @submit={() => { reply_to(id, draft); draft = "" }}>
+              <textarea value={draft}></textarea>
+              <button>Reply</button>
+          </form>
+      </section>
+  }
+
+  route GET /threads/:id(int) = <html><body><Thread id={id}/></body></html>
   ```
+
+  A reply on `/threads/7` shows on every page open on thread 7; pages on thread 8 do not
+  run their loader for it.
 - A loader runs again as a call from the page, with the page's cookies, so `session()`
   inside it is the viewer's session. So what should happen when new data arrives for a
   viewer (marking posts or messages read) is done in the loader: a component's code
@@ -716,17 +783,18 @@ component Notes(initial: list) {
   server cannot be reached, the page waits longer each time, up to half a minute. A tab
   in the background keeps its connection and runs its loaders as a visible one does. A
   page on another site cannot open it (403).
-- A server keeps at most 4096 such connections open (live data, `--watch` reloads,
+- A server keeps at most 4096 such connections open (live data, [`--watch`](#options-of-quillo-run) reloads,
   channels over a WebSocket), and at most 256 for one client: an IPv4 address, or an
   IPv6 /64 network. Channels over WebTransport are not counted. Past that, a page is
   answered `503`, keeps what it shows, says so once in the console, and asks again when
   told. The server says so once in its log, and `quillo_live_refused_total` counts them.
 - **Behind a proxy, name it.** Every visitor is then the proxy's address, so without
-  this only 256 pages get updates. `--trust-proxy 127.0.0.1` (addresses or networks,
-  comma-separated) believes `X-Forwarded-For` on connections from those: the client is
+  this only 256 pages get updates. Start the program with [`--trust-proxy`](#options-of-quillo-run), naming the
+  proxy, `quillo run main.qwe --trust-proxy 127.0.0.1` (addresses or networks,
+  comma-separated): it believes `X-Forwarded-For` on connections from those: the client is
   the nearest address in it that is not one of them, for this limit, for `request.ip` and
   everywhere else. From any other address the header is ignored, as a client can write
-  it. When one address really is many visitors, as an office is, `--live-per-client 1000`
+  it. When one address really is many visitors, as an office is, [`--live-per-client 1000`](#options-of-quillo-run)
   raises the limit.
 - Only changes made through Quillo are seen: a row changed by another program
   (`psql`, a script) does not wake pages.
@@ -788,9 +856,9 @@ quillo run shop.qwe --port 8081 --register http://10.0.0.1:2019   # on each serv
 - Each server registers (and keeps registering, every 5 seconds; limer drops
   one that stops for 15) and sends the topics it changes to limer's
   `/broadcast`, which passes them to every member (`POST /_quillo/announce`, at
-  most 64 KiB). The pool's name is the file's (`shop`), or `--service`. `--register`
-  needs a `--port` written out, and cannot be combined with `--instances` (nor can
-  `--watch`): run one instance per server, or several servers.
+  most 64 KiB). The pool's name is the file's (`shop`), or [`--service`](#options-of-quillo-run). [`--register`](#options-of-quillo-run)
+  needs a [`--port`](#options-of-quillo-run) written out, and cannot be combined with [`--instances`](#options-of-quillo-run) (nor can
+  [`--watch`](#options-of-quillo-run)): run one instance per server, or several servers.
 - limer's admin secret is required: `--register` does not start without
   `LIMER_ADMIN_SECRET`. Each announcement is signed (HMAC-SHA256, with a key made
   from the secret) together with the time and a random nonce; one that is not
@@ -828,12 +896,20 @@ component Notes(initial: list) {
     state problem = null
     <form @submit={() => {
         let r = add_note(draft)                    // a request to the server
-        if is_err(r) { problem = r.error } else { notes = r }
+        if is_err(r) { problem = r.error } else { notes = r; draft = ""; problem = null }
     }}>
+        <ul>{for n in notes => <li key={n.id}>{n.text}</li>}</ul>
         <input value={draft}/>
+        <button>Add</button>
+        {problem && <p class="problem">{problem}</p>}
     </form>
 }
+
+route GET / = <html><body><Notes initial={db.query("select * from notes")}/></body></html>
 ```
+
+The route gives the component the notes there are; pressing Add with the box empty shows
+`empty note` under it, and with text the list shows the new note and the box empties.
 
 In component code the call is awaited automatically. A call that fails (the
 connection drops, the server errors) returns an error value, like `http.*` on the
@@ -948,6 +1024,26 @@ Components and server code share a file, but not what they can touch:
   is written into the bundle as it was when the program loaded. That suits the keys
   services hand out for pages to use (a map's token, a search-only key, an error
   reporter's address); a secret keeps its own name, and stays on the server.
+
+  ```sh
+  # .env, beside main.qwe
+  PUBLIC_MAP_TOKEN=pk.test123
+  STRIPE_KEY=sk_live_xyz
+  ```
+
+  ```quillo
+  component Map() {
+      state token = env("PUBLIC_MAP_TOKEN")              // written into the bundle
+      <div class="map" data-token={token}>Map, token {token}</div>
+  }
+
+  server fn charge() = env("STRIPE_KEY") != null         // a secret stays on the server
+  ```
+
+  The page and its bundle hold `pk.test123`, and nothing of `sk_live_xyz`. Reading
+  `env("STRIPE_KEY")` in the component instead stops the program as it loads (and `quillo
+  check`): `` `env` is not available in the browser, where <Map> also runs; use a `server
+  fn` (or name the variable PUBLIC_..., which says the browser may see it) ``.
 - `http.get`, `http.post` and the rest work in a component's event handlers, `@mount`
   and the functions they call: the request goes from the page, with the browser's rules
   rather than the server's. The other site must allow this one (CORS: it answers with

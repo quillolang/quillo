@@ -19,12 +19,13 @@ shop/
     kit.qwe           views every page uses: the frame, buttons, cards
     cart.qwe          components
   migrations/         001_orders.sql, ...
+  data/               the database: make the folder, db.open does not
   public/             files served as they are
 ```
 
 ```quillo
 // main.qwe
-db.open("data/shop.db")
+db.open("data/shop.db") | unwrap      // stops here if data/ is missing
 db.migrate("migrations")
 
 use "lib/money.qwe"
@@ -59,6 +60,18 @@ component Cart() {
     </section>
 }
 ```
+
+And the table the queries read, `migrations/001_orders.sql`, with two rows to see:
+
+```sql
+create table orders (id integer primary key, item text not null, cents integer not null);
+insert into orders (item, cents) values ('Mug', 1250), ('Tea', 499);
+```
+
+`quillo run shop/main.qwe` then serves `/` with `Mug: €12.50`, `Tea: €4.99` and `Total
+€17.49`. Without `| unwrap`, a missing `data/` folder would be one line in the log (`db:
+unable to open database file`) and the program would go on with SQLite in memory,
+losing its orders at each restart.
 
 - **`use` and `import` run a file once, and give this file its names.** `ui/cart.qwe`
   calls `price` and `load_orders` because it took them, and `main.qwe` sees `Frame` and `Cart` because
@@ -261,7 +274,8 @@ cross between files.
 diagnostics as you type, hover, Go to Definition across `use`d files, completion (your
 names, builtins with their signatures, the members of `db.`, `http.`, `channel.` and the
 other modules, effects after `with`), an outline, snippets, and a debugger (F5, with
-breakpoints, stepping and the variables). *Run this file* starts it with `--watch`. It
+breakpoints, stepping and the variables). *Run this file* starts it as `quillo run file.qwe --watch`, which reloads it
+when a file changes (an option of `quillo run`; see [the options](#running-quillo)). It
 finds `quillo` in the `quillo.path` setting, then in the workspace's `target/release` or
 `target/debug`, then on your `PATH`. Errors on code that runs fine usually mean an old
 `quillo` was found: `quillo --version` names its commit.

@@ -54,10 +54,19 @@ route GET /logout {
 ```
 
 Pointing at a link to either does nothing: `/count` counts only when it is followed, and
-pointing at "Log out" logs no one out. The same holds for prefetches the browser makes on
-its own (`Sec-Purpose: prefetch`, from `<link rel="prefetch">` or speculation rules a page
-writes itself). A page prerendered runs none of its components, `server fn`s or live updates
-until someone opens it.
+pointing at "Log out" logs no one out. A prefetch can be made by hand, as the browsers
+other than Chrome and Edge make it:
+
+```sh
+curl -i -H "x-quillo-prefetch: 1" localhost:8080/count
+# 503, cache-control: no-store, and no row inserted; the log says GET /count -> 503 prefetch
+curl localhost:8080/count
+# counted: followed, the route runs
+```
+
+The same holds for prefetches the browser makes on its own (`Sec-Purpose: prefetch`, from
+`<link rel="prefetch">` or speculation rules a page writes itself). A page prerendered
+runs none of its components, `server fn`s or live updates until someone opens it.
 
 ## Keeping up with changes
 
@@ -81,7 +90,8 @@ go ahead of a visitor.
   route says.
 - A page whose live loader writes (marking messages read, say) is not prefetched either:
   it is made when the link is followed.
-- `quillo run --no-prefetch` turns it off for the whole program: pages no longer carry
+- `quillo run main.qwe --no-prefetch`, an option given when starting the program (see
+  [the options](#running-quillo)), turns it off for the whole program: pages no longer carry
   it, and prefetch requests are answered as ordinary ones.
 
 ## When you see no requests
@@ -102,10 +112,11 @@ go ahead of a visitor.
 
 ## Seeing what it does
 
-The request log marks a prefetch: `GET /docs -> 200 (0.4ms) prefetch`, and `"prefetch": true`
-under `--log json`, so what counts the log does not count pages nobody saw. With `--metrics`,
-`quillo_prefetches_total` counts those `answered`, `refused`, and `used` by a click, which a
-page reports when it was landed on from a prefetch (in Chrome and Edge).
+The request log marks a prefetch: `GET /docs -> 200 (0.4ms) prefetch`, and `"prefetch":
+true` when started with `quillo run main.qwe --log json`, so what counts the log does not
+count pages nobody saw. With `--metrics` (`quillo run main.qwe --metrics`),
+`quillo_prefetches_total` counts those `answered`, `refused`, and `used` by a click, which
+a page reports when it was landed on from a prefetch (in Chrome and Edge).
 
 ## Behind a CDN or on a static host
 

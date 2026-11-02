@@ -22,6 +22,10 @@ Quillo needs no Node, no package install and no build step on the server.
 quillo run main.qwe --port 8080 --log json
 ```
 
+The words after the program's file are options of `quillo run`, given when the program
+is started. The table has the ones that matter in production; [the
+options](#running-quillo) lists every one, `--watch` and `--split` included.
+
 | Option | In production |
 |---|---|
 | `--port N` | the port, 0 to 65535 (default `$PORT`, then 8080); 0 takes any free port |
@@ -32,7 +36,7 @@ quillo run main.qwe --port 8080 --log json
 | `--instances N` | the program N times over, a core each (see [several cores](#several-cores-several-servers)) |
 | `--log json` | a JSON line per request, for log collectors |
 | `--reload` | reload when the program's files change, without dropping requests (see [new versions](#new-versions)) |
-| `--max-body N` | the largest request body, in bytes (default 10 MiB): raise it for big uploads. A body may take as long as it keeps coming; one that sends nothing for 30 s is answered `408`, with a line in the log. A gzipped body (`Content-Encoding: gzip`) is decoded, and the limit counts what it decodes to |
+| `--max-body 50MB` | the largest request body (default 10 MiB): raise it for big uploads. A body may take as long as it keeps coming; one that sends nothing for 30 s is answered `408`, with a line in the log. A gzipped body (`Content-Encoding: gzip`) is decoded, and the limit counts what it decodes to |
 | `--base /shop` | when the program is served under a path rather than at the root: its links, redirects, scripts and cookies carry the prefix, and the proxy strips it from requests (Quillo routes the path it is given) |
 | `--metrics` | answer `/_quillo/metrics` (keep it private: see below) |
 
@@ -47,7 +51,8 @@ route GET /about {
 }
 ```
 
-Never `--watch` in production: it shows errors on pages, refreshes them, and leaves
+Never `--watch` in production (`quillo run main.qwe --watch` is for your own machine,
+reloading the program as it is edited): it shows errors on pages, refreshes them, and leaves
 `Secure` off cookies, since it expects plain HTTP on your own machine.
 
 ## Environment
@@ -61,13 +66,13 @@ Never `--watch` in production: it shows errors on pages, refreshes them, and lea
 | `QUILLO_SYSTEM_DB` | where Quillo keeps its own tables when each tenant has a database |
 | `QUILLO_SERVICE_SECRET` | signs calls between [services](#microservices) split across servers: the same on all of them; `new,old` (or `QUILLO_SERVICE_SECRET_PREVIOUS`) while it is rotated: the first signs, any is taken |
 | `QUILLO_SERVICE_KEY` | a service's own key, which a copy joins the app with and which proves it is that service (see [authentication between services](#microservices-authentication-between-services)) |
-| `QUILLO_SERVICE_<NAME>` | where service NAME runs, as `--service-url` says |
-| `LIMER_ADMIN_SECRET` | for `--register`, joining limer's pool |
+| `QUILLO_SERVICE_<NAME>` | where service NAME runs, as `quillo run main.qwe --service-url NAME=URL` says |
+| `LIMER_ADMIN_SECRET` | for `quillo run main.qwe --register URL`, joining limer's pool |
 | `PUBLIC_...` | variables components may read, written into the pages' scripts |
 
 Keep them out of the program's files: in the service manager's environment file, or the
-container platform's secrets. `quillo run` also reads a `.env` beside the program (or
-`--env-file`), handy on your own machine; a variable the environment has wins over it,
+container platform's secrets. `quillo run` also reads a `.env` beside the program (or the file
+`quillo run main.qwe --env-file prod.env` names), handy on your own machine; a variable the environment has wins over it,
 so a `.env` left on a server cannot override production's. The one other
 configuration is a policy, which only takes away: `/etc/quillo/policy.toml`,
 `--policy FILE` and `quillo.policy` beside the program (see [the
@@ -161,10 +166,11 @@ site_headers("/embed", { "x-frame-options": null })
   `content-length`, `transfer-encoding`, `connection`, `set-cookie` and `content-type`
   are refused.
 - **WebTransport** (channels over HTTP/3) goes over UDP, which these proxies do not pass.
-  Open the UDP port, the HTTP port's number unless `--wt-port` says another, to the
+  Open the UDP port, the HTTP port's number unless `quillo run main.qwe --wt-port 4433`
+  says another, to the
   server itself: Quillo presents a certificate of its own, which pages take by its hash,
-  or yours with `--tls-cert` and `--tls-key`. Otherwise pages use a WebSocket, which
-  works through the proxy; `--no-wt` turns WebTransport off.
+  or yours with `--tls-cert cert.pem --tls-key key.pem`. Otherwise pages use a WebSocket, which
+  works through the proxy; `quillo run main.qwe --no-wt` turns WebTransport off.
 
 ## Keeping it running
 
@@ -253,8 +259,8 @@ about 170 MB, most of it Debian; `quillo` needs only the C library from it.
   balancer. With [limer](https://limer.sh), `--register` joins its pool, so a change made
   through one server wakes live pages on all of them (see
   [Live data](#several-servers)). Use the same `QUILLO_SECRET` on all.
-- **Scheduled jobs** run once per due time across servers on one database; `--no-jobs`
-  turns them off on a server.
+- **Scheduled jobs** run once per due time across servers on one database; `quillo run
+  main.qwe --no-jobs` turns them off on a server.
 
 ## Health, logs and metrics
 
@@ -279,7 +285,7 @@ about 170 MB, most of it Debian; `quillo` needs only the C library from it.
 - `--metrics` answers `GET /_quillo/metrics` in Prometheus's text format. Anyone who can
   reach it can read it, so keep it from the public at the proxy: in nginx,
   `location /_quillo/metrics { deny all; }`; in Caddy, `respond /_quillo/metrics 403`.
-- `--describe` answers `GET /_quillo/describe` with the program's API. It is public too:
+- `quillo run main.qwe --describe` answers `GET /_quillo/describe` with the program's API. It is public too:
   it lists every route, those no page links to as well, each `server fn`'s signature,
   the file and line of every route, and the version. Keep it private as
   `/_quillo/metrics` is, with the same rules at the proxy, or leave it off in
@@ -316,5 +322,5 @@ writes them to a folder that is uploaded as it is.
 - a service manager that restarts it, and waits 15 seconds when stopping it
 - `/_quillo/health` for the load balancer, `/_quillo/ready` for readiness;
   `/_quillo/metrics` and `/_quillo/describe` kept private, or off
-- `--max-compute 2s`, so one request that computes for ever cannot hold an instance, and
+- `quillo run main.qwe --max-compute 2s`, so one request that computes for ever cannot hold an instance, and
   limits of your own where you need them: Quillo has no rate limiting

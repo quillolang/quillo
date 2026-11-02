@@ -79,6 +79,11 @@
   `onclick="..."` stays HTML's own, text made from values stays refused, and on a view or
   component `on_change={...}` stays a parameter.
 
+### The command line
+
+- **`--max-body` takes a size as the policy writes one**: `--max-body 50MB`, `512KB`,
+  `2GB` (1024-based), in any case, or plain bytes as before.
+
 ### Shared servers: a socket, FastCGI and a policy (FEEDBACK41.md)
 
 - **`--listen unix:PATH`** listens on a Unix socket instead of a TCP port, made with mode

@@ -135,6 +135,11 @@ curl localhost:8080/transfers -b cookies.txt -H "Idempotency-Key: $(uuidgen)" \
 # the same again: 201, the same body, and Idempotent-Replayed: true
 ```
 
+`cookies.txt` holds the session of a signed-in user, from a sign-in like the one in
+[Headers, cookies and sessions](#headers-cookies-sessions) (`curl -c cookies.txt`
+on its `POST /login`); without it the answer is `401 Sign in first`. Asking for more
+than the balance gives `422 {"error":"Not enough money","balance":{"amount":"87.50","currency":"USD"}}`.
+
 - `idempotent` runs the function in a transaction and writes the answer in it, so the
   transfer, its `history` row and its answer are kept together, or none of them is. If
   the server stops part way, the database rolls the transaction back, and a minute later
@@ -163,7 +168,7 @@ fn withdraw(account: int, cents: int) with db =
     db.transaction({ isolation: "serializable", retries: 5 }, () => {
         let balance = db.one("select balance_minor from accounts where id = ?", account).balance_minor
         if balance < cents { return err("not enough money") }
-        db.exec("update accounts set balance_minor = balance_minor - ? where id = ?", cents, account)?
+        db.exec("update accounts set balance_minor = balance_minor - ? where id = ?", cents, account)
     })
 ```
 
@@ -215,6 +220,19 @@ route POST /hooks/stripe {
 `request.body` is the body as it was sent, which the signature is of. A signature older
 than five minutes is refused, so an event recorded and sent again later does nothing,
 and any of the `v1` signatures may match (Stripe sends two while a secret is changed).
+
+To try it without Stripe, sign an event as Stripe would, with the same secret in
+`STRIPE_WEBHOOK_SECRET`:
+
+```sh
+body='{"id":"evt_1","type":"payment_intent.succeeded","data":{"object":{"amount":2500,"currency":"usd","metadata":{"account":"2"}}}}'
+t=$(date +%s)
+sig=$(printf '%s.%s' "$t" "$body" | openssl dgst -sha256 -hmac "$STRIPE_WEBHOOK_SECRET" -hex | awk '{print $NF}')
+curl localhost:8080/hooks/stripe -H "Stripe-Signature: t=$t,v1=$sig" --json "$body"
+# {"received":true}, and account 2 has 25.00 more; sent again, the same answer and nothing added
+curl localhost:8080/hooks/stripe -H "Stripe-Signature: t=$t,v1=00" --json "$body"
+# 400 Bad signature
+```
 
 ## The statement
 

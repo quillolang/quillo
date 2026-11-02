@@ -12,8 +12,8 @@ of your own, see [Hosting](#hosting).
 |---|---|---|
 | **127.0.0.1** | shared with every account on the machine: any of them can connect to a port there, past the web server | listen on a Unix socket in a folder of your own, or answer FastCGI: never a TCP port |
 | **Processes** | nothing keeps one of yours running; processes started by hand or by cron are often killed | let the web server start the program: `mod_fcgid` starts it, keeps it up while requests come, and stops it when idle |
-| **Rust** | not installed | build the `.qwer` files elsewhere, upload them built, and run with `--no-build` |
-| **Limits** | CloudLinux's LVE: processes (`NPROC`, which counts threads, for the whole account) and requests at once (`EP`; over it, visitors get a 508 page from the host) | `--workers 8` or so |
+| **Rust** | not installed | build the `.qwer` files elsewhere, upload them built, and start it with `quillo fcgi main.qwe --no-build` (an option, as for `quillo run`: see [the options](#running-quillo)) |
+| **Limits** | CloudLinux's LVE: processes (`NPROC`, which counts threads, for the whole account) and requests at once (`EP`; over it, visitors get a 508 page from the host) | `quillo fcgi main.qwe --workers 8` or so |
 | **System** | AlmaLinux, CloudLinux or CentOS 7 and 8, with old glibc | the Linux releases from the next tag on, linked against glibc 2.17 |
 
 ## The binary
@@ -56,7 +56,8 @@ RewriteRule ^ app.fcgi [QSA,L]
 ```
 
 - **Each request is the visitor's**: its path, headers and body. `request.ip` is Apache's
-  `REMOTE_ADDR`, with no `--trust-proxy` needed. The server does the rest as it does
+  `REMOTE_ADDR`, with no `--trust-proxy` needed (the option of
+  `quillo run` that believes a proxy's `X-Forwarded-For`). The server does the rest as it does
   for any visitor: routes, sessions, limits and the log. The log goes to Apache's error
   log.
 - **Jobs and the program's own calls** reach it through a socket only it can open, in a
@@ -67,7 +68,7 @@ RewriteRule ^ app.fcgi [QSA,L]
 - **A `stream` or `events` answer arrives whole** unless the host sets `mod_fcgid`'s output
   buffer to 0 (`FcgidOutputBufferSize 0`).
 - **Several processes.** `mod_fcgid` may start more than one, and each has its own global
-  variables, as with `--instances`. Keep what must be shared in the database.
+  variables, as with `quillo run main.qwe --instances 4`. Keep what must be shared in the database.
   `quillo fcgi` refuses `--split`, `--instances`, `--register` and `--join`.
 - A request Apache abandons while its answer streams ends when the connection closes.
 
@@ -106,7 +107,8 @@ ProxyPassReverse "/" "http://localhost/"
 configuration, not in `.htaccess`.
 
 - **Its mode is 0600** when it is made: only the account's own processes can open it.
-  Give `--socket-mode 660` when the web server reaches it through its group.
+  Give `--socket-mode 660` when the web server reaches it through its group:
+  `quillo run main.qwe --listen unix:app.sock --socket-mode 660 --trust-proxy 127.0.0.1`.
 - **It goes when the server stops.** A socket left by a server that did not stop cleanly
   is taken over. One another server still answers on is refused: `a server is listening
   there`.
@@ -187,8 +189,8 @@ there are.
 
 ## The rest of the account
 
-- **Settings.** Use the `.env` beside the program, or `--env-file` for one outside the
-  public folder. Keep secrets out of `app.fcgi`.
+- **Settings.** Use the `.env` beside the program, or `--env-file` for one elsewhere
+  (`quillo fcgi main.qwe --env-file /home/u/app.env` in `app.fcgi`). Keep secrets out of `app.fcgi`.
 - **Jobs.** A FastCGI process stopped when idle runs no `schedule` or `every`. Run them
   from cPanel's Cron Jobs page instead, as a script:
   `cd /home/u/app && /home/u/bin/quillo run jobs.qwe`.

@@ -39,6 +39,11 @@ async function addNote(text) {
 The same in Quillo:
 
 ```quillo
+db.open("app.db")
+db.exec("create table if not exists notes (id integer primary key, text text not null)")
+
+server fn load_notes() -> list with db = db.query("select * from notes order by id")
+
 server fn add_note(text: str) -> list ! str with db {
     if trim(text) == "" { return err("A note needs some text") }
     db.exec("insert into notes (text) values (?)", text)
@@ -58,9 +63,15 @@ component Notes() {
         <p>{problem}</p>
     </form>
 }
+
+route GET / = <html><body><Notes/></body></html>
 ```
 
-No route, no URL, no JSON, no `async`, no `await`, no `try`. `add_note` is checked
+That is the whole program. The page arrives with the notes already in its list; Enter in
+the field adds one and the list shows it, and a blank note shows `A note needs some text`
+under the field, with nothing written.
+
+No API route, no URL, no JSON, no `async`, no `await`, no `try`. `add_note` is checked
 like any function: its name, the number and types of its arguments, and the result,
 which `quillo check` knows may be an error.
 

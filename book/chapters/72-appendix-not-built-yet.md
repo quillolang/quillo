@@ -6,7 +6,7 @@
 - a file's names under a prefix (`use lib/auth as auth`, then `auth.login()`), where `.`
   in markup is already a class
 - splitting a page's bundle by route, and components loaded lazily
-- a caller finding a service by name through limer's pool, and `--join` for copies behind NAT
+- a caller finding a service by name through limer's pool, and [`--join`](#options-of-quillo-run) for copies behind NAT
 - `{{ ... }}` blocks of JavaScript in a component (a design only)
 - in the browser, a map's keys that look like integers keep their order of insertion:
   there `keys({ "10": 1, "2": 2 })` is `["2", "10"]`, as JavaScript orders them

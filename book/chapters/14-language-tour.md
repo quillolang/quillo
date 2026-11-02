@@ -391,7 +391,8 @@ failed type check, recursion more than 10,000 calls deep) are runtime errors. In
 route they become a 500 response, and the server logs them.
 
 A runtime error says where it happened and how it got there, in the terminal, the log and,
-under `--watch`, on the page. A visitor sees only `internal error`:
+under [`--watch`](#options-of-quillo-run) (the option you start a program with while working on it,
+`quillo run main.qwe --watch`), on the page. A visitor sees only `internal error`:
 
 ```
 quillo: price.qwe:2: division by zero
@@ -399,7 +400,7 @@ quillo: price.qwe:2: division by zero
   in split_bill, called at main.qwe:7
 ```
 
-A deep recursion keeps its first and last five calls. Under `--log json` the calls are a
+A deep recursion keeps its first and last five calls. Under [`--log json`](#options-of-quillo-run) the calls are a
 `calls` field beside `error`. The chain is built as the error leaves each call, so calls
 that succeed pay nothing, and a function in machine code gives the same chain, as what
 fails there runs again in the interpreter. An error value is not a failure yet and has no chain, but
@@ -586,7 +587,7 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   "npx tailwindcss -i src/app.css -o public/app.css --watch"`, the sheet served with
   `file()`. Tailwind finds classes written out in strings and attributes (`class="px-3"`,
   `ok ? "text-green-700" : "text-red-700"`); a class made from parts (`` `bg-${color}` ``)
-  is found by neither it nor Quillo. Under `--watch`, each time it writes the sheet the
+  is found by neither it nor Quillo. Under [`--watch`](#options-of-quillo-run), each time it writes the sheet the
   open pages take it as they are. Tailwind's scanner reads the shorthand too
   (`<div.flex.p-4.md:flex-row>`), but a fraction right before `/>` is read with the
   slash (`<i.w-1/3/>`): put a space before `/>`. `classes()` gives the classes the

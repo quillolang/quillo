@@ -560,3 +560,17 @@ fn a_reload_gets_its_turn_on_a_busy_server() {
     busy.off();
     assert!(reloaded, "{}", srv.log().lines().filter(|l| !l.starts_with("GET")).collect::<Vec<_>>().join("\n"));
 }
+
+/// `--max-body 1KB`: a size as the policy writes one, 1,024 bytes (branch feedback40-43).
+#[test]
+fn max_body_takes_a_size_with_its_unit() {
+    let srv = start("max-body-units", APP, &["--max-body", "1KB"]);
+    let post = |n: usize| {
+        let body = "x".repeat(n);
+        raw(srv.port, format!("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", n, body).as_bytes())
+    };
+    let small = post(1024);
+    assert!(small.starts_with("HTTP/1.1 200"), "{}", &small[..small.len().min(80)]);
+    let big = post(1025);
+    assert!(big.starts_with("HTTP/1.1 413"), "{}", &big[..big.len().min(80)]);
+}

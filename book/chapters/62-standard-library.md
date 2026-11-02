@@ -78,7 +78,8 @@
   points) and `app` (`{ id, name, version, build }`). What a system does not tell is `null`. It is read
   once: the screen and locale are as they were when the program started. It runs on the server, as
   `env` does: in a component, call it from a `server fn`. `server` is where the server listens,
-  `{ host, port, url, base }`: the port it got with `--port 0`, and a `url` reachable from this
+  `{ host, port, url, base }`: the port it got when started with [`--port 0`](#options-of-quillo-run)
+  (`quillo run main.qwe --port 0`), and a `url` reachable from this
   machine (`0.0.0.0` is written `127.0.0.1`), so a program that reads its own pages need not be
   told its address again. It is null in a script and while the program loads.
 
@@ -133,8 +134,8 @@ What is not in the standard library, and what to do instead:
   built in.
 - **`url_decode`.** Not there: query strings, forms and cookies arrive decoded.
 - **A seed for `random`.** None: runs are not repeatable.
-- **Other processes.** A program cannot run a command: `env`, files, and `--with` beside
-  it. A script reads its arguments with `args()` and its input with `stdin()` and
+- **Other processes.** A program cannot run a command: `env`, files, and a command started
+  beside it with the option [`--with`](#options-of-quillo-run) (`quillo run main.qwe --with "npx tailwindcss ..."`). A script reads its arguments with `args()` and its input with `stdin()` and
   `read_line()` (see [Scripts as tools](#scripts-as-tools)).
 - **Hashing a value.** `crypto.sha256(json.stringify(v))`. Values never change, so
   nothing needs copying.
@@ -187,7 +188,7 @@ Safety built in:
 - `respond` and `redirect` refuse header values with line breaks, which would let text
   from a request add headers of its own.
 - A failing request answers `internal error`; the message, with file and line, goes to
-  the terminal (and to the page too with `--watch`).
+  the terminal (and to the page too with [`--watch`](#options-of-quillo-run)).
 - A `json:` pattern matches only a body sent as JSON (or with no content type), not a
   `text/plain` one, which a page on another site could send.
 - A page on another site cannot post a form here: a `POST`, `PUT`, `PATCH` or `DELETE`
@@ -197,6 +198,22 @@ Safety built in:
   call the site (webhooks, scripts) send no `Origin`, so both work as before. For a
   path that must take such posts, such as a payment provider's return or a single
   sign-on callback, say so at the top of the program: `allow_cross_site("/sso")`.
+
+  ```quillo
+  allow_cross_site("/payment")        // the provider's page posts back here
+
+  route POST /payment/return { form: { order: str, status: str } } {
+      // anyone can post this: check with the provider before believing it
+      redirect(`/orders/${order}`)
+  }
+
+  route POST /notes { form: { text: str } } = "saved"
+  ```
+
+  A form on `https://pay.example` posting to `/payment/return` reaches the route; the same
+  page posting to `/notes` gets 403 and the text `this site does not take form posts from
+  other sites`.
+
   Nor can such a page open the WebSocket on which pages hear of live changes
   (`/_quillo/live`), which the browser would otherwise let it do.
 - Globals read with `env`, `read_file`, the database or a service are never written
@@ -252,7 +269,8 @@ level off: `flatten(flatten(xs))` for two.
 
 `read_file`, `write_file`, `delete_file`, `file`, `files`, `save_upload` and
 `check_program` take a path from the program's folder, and stay in it. A path with `..`
-or starting with `/` is refused, unless `--allow-path` names the folder it leads to. A
+or starting with `/` is refused, unless the program is started with [`--allow-path`](#options-of-quillo-run)
+naming the folder it leads to (`quillo run main.qwe --allow-path /srv/shared/uploads`). A
 path is judged where it really leads, with its links followed:
 
 - A link inside the folder that leads inside it works as any path: `alias -> real`.
@@ -750,6 +768,36 @@ with a cookie, set from `Intl.DateTimeFormat().resolvedOptions().timeZone` throu
 `js`, which a helper reads with `cookie("tz")`; the first page a browser asks for is made
 before the cookie exists.
 
+```quillo
+fn zone() = cookie("tz") ?? "UTC"     // in any function the request runs
+
+server fn set_zone(zone: str) =
+    date.valid_zone(zone) ? set_cookie("tz", zone, { max_age: "1y" }) : null
+
+component SendZone(known) {            // once in the layout: sends the zone when it differs
+    <span hidden @mount={() => {
+        let z = js("Intl.DateTimeFormat", []).resolvedOptions().timeZone
+        if z != known { set_zone(z) }
+    }}></span>
+}
+
+route GET / = <html><body>
+    <SendZone known={cookie("tz")}/>
+    <p>Today, where you are: {date.today(zone())} ({zone()})</p>
+    <form method="post" action="/meet">
+        <input type="datetime-local" name="at"/>
+        <button>Book</button>
+    </form>
+</body></html>
+
+route POST /meet { form: { at: str } } = `Booked for ${date.at(at, zone())}`
+```
+
+In Manila the first page says `(UTC)`; from the next one on, `Today, where you are:
+2026-11-02 (Asia/Manila)`, and 09:30 booked in the form is `Booked for
+2026-11-20T09:30:00+08:00`. `set_zone` checks the zone, since anyone can call it with any
+text.
+
 ## Database {#standard-library-database}
 
 `db` talks to SQLite (built in), PostgreSQL or MySQL/MariaDB, with the same functions.
@@ -916,8 +964,8 @@ compute those in Quillo. Values: a column declared `bool` or `boolean` gives `tr
 [Decimals](#decimals)); booleans are stored as 0 and 1, lists and maps as JSON text;
 dates are what text you store. There is one connection per database per process, and its
 queries run under the interpreter's lock, on the loop's thread: a SQLite query holds up
-the other requests of its instance while it runs. Several processes (`--instances`,
-`--split`, another program) may share a file: readers do not wait, writers take turns.
+the other requests of its instance while it runs. Several processes (a program started
+with [`--instances`](#options-of-quillo-run) or [`--split`](#options-of-quillo-run), `quillo run main.qwe --instances 4`; another program) may share a file: readers do not wait, writers take turns.
 There is no SQLCipher (no encryption at rest), and a file is opened by path, not as a
 `file:` URI (so no read-only mode). Back it up with `db.exec("vacuum into
 'backup.db'")` or `sqlite3 app.db ".backup ..."`, not by copying the file while it runs.
@@ -1208,6 +1256,12 @@ tenant_from("example.com")          // acme.example.com is tenant "acme"
 db.open("data/{tenant}.db")         // a SQLite file per tenant
 db.migrate()                        // run for each tenant's database when it is made
 
+route GET /signup =                 // at www.example.com, which needs no database
+    <form method="post" action="/signup">
+        <input name="name" pattern="[a-z0-9][a-z0-9_-]*" placeholder="acme" required/>.example.com
+        <button>Make my site</button>
+    </form>
+
 route POST /signup { form: { name: str } } {
     let made = new_tenant(name, () => db.exec("insert into settings (plan) values ('free')"))   // makes acme.db
     if is_err(made) { reply 409 "That name is taken" }
@@ -1215,6 +1269,10 @@ route POST /signup { form: { name: str } } {
 }
 route GET / = <h1>Welcome, {tenant()}</h1>
 ```
+
+Sent `acme`, the form makes `data/acme.db` (with `migrations/`'s tables) and goes to
+`https://acme.example.com/`, which says `Welcome, acme`. Sent `acme` again, it shows
+`That name is taken`, with status 409.
 
 - `tenant_from("example.com")` takes the part of the host before the domain;
   `tenant_from((request) => ...)` takes what the function gives for the request (a

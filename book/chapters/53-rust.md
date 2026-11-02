@@ -107,7 +107,7 @@ How it runs:
   cargo then.
 - **`.quillo/plugins.lock`**, beside `.quillo/native/`, holds each library's file name
   and SHA-256, a line each, written by every build: `quillo build`, a `use` that built,
-  `--watch`. Deploy it with `.quillo/native/`. A library is loaded only when it is the one
+  [`--watch`](#options-of-quillo-run). Deploy it with `.quillo/native/`. A library is loaded only when it is the one
   built: one whose hash differs, or that has no line, is built again where cargo may run
   (`quillo: libhi-687dd0b24f29e5cf.dylib is not the library that was built (its SHA-256
   differs from .quillo/plugins.lock's): building it again`), and refused where it may
@@ -117,11 +117,11 @@ How it runs:
   a library already there is not built again, so remove `.quillo/native/` and run
   `quillo build` to get one. Whoever can write both the library and the lock can still
   run code in the server.
-- **`--no-build`** never runs cargo, so no crate's build script runs on the server: a
+- **[`--no-build`](#options-of-quillo-run)** never runs cargo, so no crate's build script runs on the server: a
   library is loaded only as the lock names it, and a file not built is an error
   (`./hi.qwer is not built, and --no-build says not to build it here: build it with
   quillo build and bring .quillo along`). Under it, a folder with no lock loads nothing.
-  `--split` passes it to its services, and a policy's `[plugins] build = false` is the
+  [`--split`](#options-of-quillo-run) passes it to its services, and a policy's `[plugins] build = false` is the
   same (see [The policy](#the-policy)).
 - **A policy's `[plugins] allow`** names the plugins a program may `use`: `"csv"` any
   version, `"csv@1"` or `"csv@1.4.2"` by the file's `//! version:` line (`1` takes
@@ -129,7 +129,7 @@ How it runs:
   `` the plugin `pdf` 2.0.1 is not in the plugins /etc/quillo/policy.toml allows: csv@1, qr ``.
   It names plugins by their file's name and header; it does not prove their code.
 - A call runs off the event loop, without the lock Quillo code holds, on the threads
-  that also wait for databases (`--workers`): a slow function holds up no one, and
+  that also wait for databases ([`--workers`](#options-of-quillo-run)): a slow function holds up no one, and
   calls from several requests run on several cores at once; many long calls at once
   can keep database waits waiting. Inside a SQLite transaction a call holds the lock,
   and every request waits. Nothing times a call out or cancels it. The values cross as
@@ -140,7 +140,8 @@ How it runs:
   refused before the function runs. A stop (`SIGTERM`) while a request is in a call is
   logged as a stop, `quillo: stopped with GET /slow?ms=14000 still running`, not as a bug
   in Quillo.
-- With `--watch` and `--reload`, a Rust file that changes is built again and the
+- When the program is started with [`--watch`](#options-of-quillo-run) or [`--reload`](#options-of-quillo-run)
+  (`quillo run main.qwe --watch`), a Rust file that changes is built again and the
   program reloaded with it. A build that fails prints the compiler's errors, and the
   program goes on as it was. Requests in progress finish with the version they started
   with: libraries stay loaded, the old ones for the life of the process, with their
@@ -155,7 +156,7 @@ See [rust.qwe](https://github.com/quillolang/examples/blob/main/rust.qwe) and [r
 
 [quillolang.org/plugins](https://quillolang.org/plugins/) has `.qwer` files ready to use,
 each with a version, an example, and a test run before it is published. `quillo install`
-puts them beside the program:
+puts them beside the program (its [options](#other-commands) are below):
 
 ```
 quillo install csv qr jwt          # csv.qwer, qr.qwer and jwt.qwer, into this folder
@@ -164,13 +165,13 @@ quillo install --update            # the plugins here that the catalog has newer
 quillo install --list pdf          # what the catalog has, matching "pdf"
 ```
 
-- It reads the catalog (`https://quillolang.org/plugins/index.json`; `--registry` or
+- It reads the catalog (`https://quillolang.org/plugins/index.json`; [`--registry`](#other-commands) or
   `QUILLO_REGISTRY` for another), downloads each file, and writes it only when its
   SHA-256 and the `//! version:` line of its header match the catalog's. A plugin
   that fails leaves the others going, and the exit status is 1.
 - A file already there is left alone when it is the same, replaced when the catalog's
   version is newer, and kept when it is newer or the same version changed by hand:
-  `--force` replaces it. `--dir DIR` installs elsewhere. `name@1.2.0` asks for that
+  [`--force`](#other-commands) replaces it. [`--dir DIR`](#other-commands) installs elsewhere. `name@1.2.0` asks for that
   version, and fails when the catalog has another (it keeps only the newest).
 - Then `use csv.qwer`, or only what you need, `import csv use csv_parse, csv_write`: the
   first run builds it with cargo, as any `.qwer` file.

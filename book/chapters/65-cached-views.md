@@ -18,4 +18,5 @@ up to date the moment something it shows changes.
 - Views inside views pass on what they read, so a cached page follows the global its
   innermost view uses. Only views declared at the top level are cached, and at most 32
   renders of each are kept (the 32 most recent sets of arguments).
-- `quillo run --no-view-cache` turns it off (to measure, or to rule it out).
+- Starting the program with [`--no-view-cache`](#options-of-quillo-run), `quillo run main.qwe --no-view-cache`,
+  turns it off (to measure, or to rule it out).

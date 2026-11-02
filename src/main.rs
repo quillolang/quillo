@@ -775,10 +775,11 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
             },
             ("--register", Some(v)) => o.register = Some(v.clone()),
             ("--service", Some(v)) => o.service = Some(v.clone()),
-            ("--max-body", Some(v)) => match v.parse::<usize>() {
-                Ok(n) if n > 0 => o.max_body = n,
+            // `--max-body 50MB`, as the policy writes a size, or plain bytes.
+            ("--max-body", Some(v)) => match quillo::policy::size(v) {
+                Some(n) if n > 0 => o.max_body = n,
                 _ => {
-                    eprintln!("quillo: --max-body needs a positive number of bytes");
+                    eprintln!("quillo: --max-body is a size such as 50MB, 512KB or 2GB (or a number of bytes), got {:?}", v);
                     return Err(2);
                 }
             },

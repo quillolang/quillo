@@ -10,7 +10,8 @@ as if it simply waited; there is no `async` or `await`. Updating shared state su
 `todos = todos | push(t)` is safe without locks, since only one handler runs at a time.
 
 A request that only computes never leaves the loop's thread, so plain pages and JSON
-cost a few microseconds each. To use more cores, `--instances N` runs the program N times
+cost a few microseconds each. To use more cores, start the program with
+[`--instances N`](#options-of-quillo-run), `quillo run main.qwe --instances 4`, which runs the program N times
 over in one process, each with an event loop of its own; the first takes the connections
 and hands them out in turn. Like N processes, each instance has its own variables, while
 the database is shared, and changes to it (and `publish`) reach live pages on every
@@ -26,7 +27,8 @@ cores. So put long computing in Rust (see [Rust](#rust)), or run more instances:
 several, connections are taken on a thread of their own and go to an instance that is not
 computing, so one stuck instance holds up only the connections already on it.
 
-An instance computing for 5 s is logged, with its request. `--max-compute 2s` ends a request
+An instance computing for 5 s is logged, with its request. Started with
+[`--max-compute 2s`](#options-of-quillo-run) (`quillo run main.qwe --max-compute 2s`), the server ends a request
 that computes that long without letting go: a 500, between two statements, so nothing is
 left half done, and a line in the log. Time spent waiting does not count. Compiled code has
 nowhere to stop, so under `--max-compute` functions are not compiled. `quillo check` warns on
@@ -34,7 +36,7 @@ a `while` that cannot end.
 
 How long a wait may last:
 
-- `--workers N` (64 by default) requests can wait at once, each on a pool thread; more
+- [`--workers N`](#options-of-quillo-run) (64 by default) requests can wait at once, each on a pool thread; more
   wait for a thread, while requests that only compute go on being answered. PostgreSQL
   queries take no thread. A thread the system will not start (an account's process
   limit, which on Linux counts threads) is said once in the log, `quillo: cannot start a
@@ -61,7 +63,7 @@ stack; each request's coroutine reserves as much, and grows as it needs), up to
 reach 260 threads), one thread for PostgreSQL's pipelined connections (half the
 instances, at least two, with `--instances`), a pool of one less than the cores (at most
 31) for long lists, up to four for images, one for scheduled jobs, one for calls made
-later, one for `--watch`, and one for each channel and `--with` command. Memory is not
+later, one for [`--watch`](#options-of-quillo-run), and one for each channel and [`--with`](#options-of-quillo-run) command. Memory is not
 limited by anything configurable: the allocator is mimalloc on the loops and the waiting
 threads, the system's elsewhere.
 
@@ -70,8 +72,8 @@ little, and two file descriptors, a socket and a connection. Quillo takes all th
 descriptors the system allows when it starts, and says so in the log if that is too few
 for 4096 pages; `ulimit -n`, or `LimitNOFILE=` under systemd, raises what is allowed.
 
-With `--watch`, a change to the program or a `use`d file reloads it (starting its
-state afresh) and refreshes open pages. `--reload` reloads it the same way without
+With [`--watch`](#options-of-quillo-run) (`quillo run main.qwe --watch`), a change to the program or a `use`d file reloads it (starting its
+state afresh) and refreshes open pages. [`--reload`](#options-of-quillo-run) reloads it the same way without
 `--watch`'s development aids (errors on pages, refreshing them), for production
 programs that change their own files, such as a plugin editor. Both watch the main file
 and every file the program loaded (`use`d, mounted, a service's; under `--watch`, files
@@ -109,7 +111,7 @@ What a reload keeps, and what it starts afresh:
   memory of calls a service answered, the live cache and channels start empty.
 - There is no handing a port from one process to the next: a new `quillo` binary means
   a stop (requests in progress finish, up to 10 s) and a start, during which the port
-  answers nothing. For no gap, run two servers behind limer (`--register`; `/_quillo/health`
+  answers nothing. For no gap, run two servers behind limer ([`--register`](#options-of-quillo-run); `/_quillo/health`
   says 503 as soon as one starts stopping) and restart them one at a time. Two programs
   cannot share a port: `mount` or `service /prefix` them in one.
 
@@ -117,7 +119,8 @@ What a reload keeps, and what it starts afresh:
 
 The first Ctrl-C or `SIGTERM` stops the server gracefully: it takes no new connections,
 closes idle ones, answers the requests in progress (for up to 10 seconds) and exits with
-status 0. A server that joined a pool with `--register` leaves it first, so limer stops
+status 0. A server that joined a pool with [`--register`](#options-of-quillo-run) (see [Several
+servers](#several-servers)) leaves it first, so limer stops
 sending it requests. A second Ctrl-C stops it at once. It stops the same when its stderr
 goes into a pipe that has closed (a `tee` or a log shipper that ended): Quillo's own
 messages are then dropped, and never keep it from stopping.
@@ -140,8 +143,8 @@ maximum and average of the last 100, with how many ran and failed in all:
   "statements": [ { "sql": "select * from orders where customer = ?", "count": 100, "min_ms": 1.9, "max_ms": 48.7, "avg_ms": 12.3, "total": 840, "errors": 0 }, ... ] }
 ```
 
-- **Off until switched on**, so a server pays nothing for it: on under `--watch`, with
-  `--query-stats` or `QUILLO_QUERY_STATS=1`, or while it runs with `POST
+- **Off until switched on**, so a server pays nothing for it: on under [`--watch`](#options-of-quillo-run), when
+  the server is started with [`--query-stats`](#options-of-quillo-run) or `QUILLO_QUERY_STATS=1`, or while it runs with `POST
   /_quillo/health/queries?on=1` (`?on=0` switches it off; either way what was counted is
   forgotten). Off, the address answers `{ "enabled": false }`.
 - **`statements`**, each statement's figures, slowest on average first (at most 100 of
@@ -153,8 +156,22 @@ maximum and average of the last 100, with how many ran and failed in all:
   as errors; Quillo's own tables (`_quillo_jobs` and the like) are not. The last 500
   statements are kept; past that, the one used longest ago makes room.
 
+On a server already running, with the token in its environment:
+
+```sh
+export QUILLO_HEALTH_TOKEN=0123456789abcdef-token        # 16 characters at least
+quillo run main.qwe                                      # or with --query-stats, on from the start
+curl -X POST 'localhost:8080/_quillo/health/queries?on=1' -H "Authorization: Bearer $QUILLO_HEALTH_TOKEN"
+curl localhost:8080/_quillo/health/queries -H "Authorization: Bearer $QUILLO_HEALTH_TOKEN"   # with statements
+curl localhost:8080/_quillo/health/queries                                                    # the totals only
+```
+
+Without the switch, the address says how to turn it on: `"how": "off: run with
+--query-stats or QUILLO_QUERY_STATS=1, or POST /_quillo/health/queries?on=1 with the health
+token"`.
+
 A second Ctrl-C, or a second `SIGTERM`, exits at once with status 130. Stopping also
-stops the commands run with `--with`, and a stream's `send` fails once the server is
+stops the commands run with [`--with`](#options-of-quillo-run), and a stream's `send` fails once the server is
 stopping, so a long stream ends.
 
 ## Scheduled jobs
@@ -164,6 +181,30 @@ schedule("5m", clean_sessions)                  // every 5 minutes, on the clock
 schedule("0 3 * * *", nightly_report)           // cron: 03:00 UTC
 schedule("@daily", () => db.exec("delete from tokens where expires < ?", now()))
 ```
+
+A job is a function of the program, and what it does is seen where it writes. Here the
+nightly report the routes add to, and the page that shows its rows:
+
+```quillo
+db.open("app.db")
+db.exec("create table if not exists orders (id integer primary key, total int, at bigint)")
+db.exec("create table if not exists reports (day text primary key, orders int, total int)")
+
+fn nightly_report() {
+    let day = str(date.today())
+    let r = db.one("select count(*) as n, coalesce(sum(total), 0) as total from orders where at > ?", now() - 86_400_000)
+    db.exec("insert into reports (day, orders, total) values (?, ?, ?) on conflict (day) do update set orders = excluded.orders, total = excluded.total", day, r.n, r.total)
+}
+
+schedule("0 3 * * *", nightly_report)
+
+route POST /orders { form: { total: int } } = db.exec("insert into orders (total, at) values (?, ?)", total, now())
+route GET /reports = <ul>{for r in db.query("select * from reports order by day desc") => <li>{r.day}: {r.orders} orders, {r.total}</li>}</ul>
+```
+
+Each run is a line in the log, `POST /_quillo/job/nightly_report?at=1793631366 -> 200
+(3.5ms)`, and `/reports` shows `2026-11-02: 1 orders, 40` after it. To try a job without
+waiting for 03:00, give it `"10s"` while you work on it.
 
 - The first argument is a duration (seconds, or `"30s"`, `"5m"`, `"1h"`, `"1d"`,
   `"2w"`, `"1y"`), counted from 1970 in UTC, so that every server agrees and `"5m"` runs
@@ -180,25 +221,45 @@ schedule("@daily", () => db.exec("delete from tokens where expires < ?", now()))
   `job-<line>`, or to run one function twice): letters, digits, `_`, `-` and `.`, at
   most 64, and no two alike. Nobody outside the server can start one.
 - A job that runs for ever (a loop with `sleep` in it) is told to end when the server
-  stops, and when `--watch` loads the program again: its `sleep` ends the job, so a
+  stops, and when [`--watch`](#options-of-quillo-run) (`quillo run main.qwe --watch`) loads the program again: its `sleep` ends the job, so a
   new version never runs beside the old one (a tick's too; a request's `sleep` is waited
   out, since requests in progress are answered). A job still running when it is due again
   is said once in the log, not each time.
 - A service's jobs run with the app's when the service shares its process
   (`POST /_quillo/job/game~end_round` in the log), and in the service's own process
-  under `--split`.
+  when the app is started with [`--split`](#options-of-quillo-run) (`quillo run app.qwe --split`).
 - Several servers on one database (PostgreSQL, or SQLite shared by processes on one
   machine) run each job once per due time: the first to record it in `_quillo_jobs`
   runs it. Without a database, or with one per tenant, each server runs its jobs;
-  `--no-jobs` turns them off on a server. For a database per tenant, loop over your
+  starting a server with [`--no-jobs`](#options-of-quillo-run) (`quillo run main.qwe --no-jobs`) turns them
+  off there. For a database per tenant, loop over your
   tenants inside the job with `with_tenant(name, () => ...)`.
 
 ## Ticks: `every` on the server
 
 ```quillo
+let ball = { x: 0, dx: 4 }
+
+fn step() {
+    let dx = ball.x + ball.dx > 300 || ball.x + ball.dx < 0 ? -ball.dx : ball.dx
+    ball = { x: ball.x + dx, dx }
+}
+fn snapshot() = { x: ball.x }
+
 fn tick() { step(); channel.broadcast("room", snapshot()) }
 every(50, tick)                                 // 20 times a second, on the clock
+
+component Court() {                             // the other side: each page in "room"
+    state x = 0
+    channel.open("room", (s) => { x = s.x })
+    <svg width="320" height="40"><circle cx={x + 10} cy="20" r="8"/></svg>
+}
+
+route GET / = <html><body><Court/></body></html>
 ```
+
+Every page open on `/` shows the same ball, moved by the server 20 times a second; a page
+opened later picks it up where it is.
 
 - `every(ms, f)` at the top of a program runs `f` on the server every `ms`
   milliseconds, counted from 1970 so that each tick falls on a multiple of `ms`: the
@@ -207,7 +268,7 @@ every(50, tick)                                 // 20 times a second, on the clo
 - A tick is named after its function (`{ name: "..." }` for a lambda, else
   `every-<line>`), and no two alike. It runs like a job, one at a time: a tick still
   running when the next is due skips that one, so a slow step slows the loop and never
-  doubles it. Ticks are not logged or counted in `--metrics`, are not recorded in
+  doubles it. Ticks are not logged or counted in [`--metrics`](#options-of-quillo-run) (`quillo run main.qwe --metrics`), are not recorded in
   `_quillo_jobs` (each server runs its own), and stop with the server and on a reload.
 - Under a second is what `every` is for; for minutes and hours, `schedule`.
 
@@ -252,7 +313,8 @@ What follows `--` is its arguments, `args()`; `stdin()` is all that is piped in,
 `read_line()` the next line, `null` at the end; `exit(n)` ends it with status `n`. A script
 that ends by itself ends with 0, and one that fails (a stop, or an error a `?` at the top
 passes on) with 1, saying what it was. Files are the program's folder's, as for a server;
-`--allow-path DIR` names another folder that `read_file` and `write_file` may use, by its
+[`--allow-path DIR`](#options-of-quillo-run), given when the script is started
+(`quillo run tool.qwe --allow-path ../data -- x`), names another folder that `read_file` and `write_file` may use, by its
 own path or through `..`, where a link leads being what counts (FEEDBACK29.md, Q-357);
 without it, a link out of the folder is refused too (see [Paths and
 links](#paths-and-links)). It is named, never assumed: the same program may serve strangers later, and in a program that
@@ -335,7 +397,7 @@ When the program stops, all of it stops: no other request runs Quillo code until
 (waits already under way, for a database or the network, finish meanwhile). Pausing a server
 that is waiting for requests stops the next one to run.
 
-While debugging, views are not cached (`--no-view-cache`), so a breakpoint in one stops each
+While debugging, views are not cached (as with the option [`--no-view-cache`](#options-of-quillo-run)), so a breakpoint in one stops each
 time it renders, and functions are not compiled to machine code. `.qwer` functions run as they
 are, without stops. It runs on macOS and Linux; not yet on Windows.
 
@@ -347,7 +409,7 @@ Chrome (or Edge) once the server listens, with its JavaScript debugger, in the s
 a breakpoint on a line of a `.qwe` file stops on the server and in the browser, wherever that
 line runs. `"url"` names the page to open (by default, the address the server listens on).
 
-This works because in development (`--watch`, or under the debugger) a page's bundle is a
+This works because in development ([`--watch`](#options-of-quillo-run), or under the debugger) a page's bundle is a
 small loader for files of their own: the runtime (`quillo.js`, as it is written), and each
 component, view and function at `/_quillo/src/<hash>/<file>.qwe/<Name>.js`, with a source map
 from its lines to the `.qwe` file's. The browser's developer tools show them by those names,
@@ -371,7 +433,7 @@ the argument `dap`, messages on stdin and stdout. A `launch` request takes:
 | `noDebug` | run without stopping at breakpoints |
 
 `attach` is not supported yet: the debugger starts the program itself (with
-`--no-view-cache`, unless `noDebug`). `browser` and `url` are the VS Code extension's;
+[`--no-view-cache`](#options-of-quillo-run), unless `noDebug`). `browser` and `url` are the VS Code extension's;
 elsewhere, open the page in a browser yourself. What the adapter offers: breakpoints
 with conditions and hit counts, logpoints, stepping, evaluation for hovers, the
 `errors` exception filter (on by default), and terminate.
@@ -379,10 +441,17 @@ with conditions and hit counts, logpoints, stepping, evaluation for hovers, the
 ## Logs and metrics
 
 Each request is logged on stderr as `GET /path?query -> 200 (0.4ms)`: the path with its
-query string. With `--log json` the line is a JSON object instead, for log collectors:
+query string. Started with [`--log json`](#options-of-quillo-run), `quillo run main.qwe --log json`, the line is a
+JSON object instead, for log collectors:
 `time` (RFC 3339, UTC, with milliseconds), `method`, `path` (with the query string),
 `status`, `ms`, `ip` (the TCP peer), `tenant` when the request had one, and `rid` (the
-request's id, also sent back as `x-request-id`). `--log off` turns the request log off;
+request's id, also sent back as `x-request-id`):
+
+```
+{"time":"2026-11-02T14:59:16.713Z","method":"GET","path":"/orders/1","status":200,"ms":0.07,"ip":"127.0.0.1","rid":"e60956f5b6f86d27"}
+```
+
+`--log off` turns the request log off;
 errors are still printed. Lines are buffered and written each turn of the event loop,
 or at 32 KiB. Not logged: `/_quillo/health`, `/_quillo/metrics`, Chrome's
 `/.well-known/appspecific/com.chrome.devtools.json`, UDP packets, channel messages. The
@@ -395,7 +464,15 @@ written escaped too, and under `--log json` it is an object of its own, `{"time"
 "status", "error", "line"}`. Quillo's own notices (`listening on`, warnings, `stopping`)
 are text lines on stderr in both modes.
 
-With `--metrics`, `GET /_quillo/metrics` answers in Prometheus's text format:
+Started with [`--metrics`](#options-of-quillo-run), `GET /_quillo/metrics` answers in Prometheus's text format:
+
+```sh
+quillo run main.qwe --metrics --log json
+curl -s localhost:8080/_quillo/metrics | grep quillo_requests_total
+# quillo_requests_total{status="2xx"} 2
+```
+
+What it reports:
 
 | Metric | |
 |---|---|
@@ -424,7 +501,7 @@ starts, by `quillo run`, `quillo fcgi` and `quillo check`:
 
 1. `/etc/quillo/policy.toml`, the host's, whenever it is there (one that is there and
    cannot be read stops the program);
-2. each `--policy FILE`, in order;
+2. each [`--policy FILE`](#options-of-quillo-run), in order;
 3. `quillo.policy` beside the program's main file.
 
 Each file only narrows what the ones before it allow: a list is a condition every file
@@ -462,13 +539,13 @@ hosts = ["api.stripe.com", "*.mapbox.com"]
 
 | Section | |
 |---|---|
-| `[plugins] build` | `false`: never build a Rust file, as `--no-build` (see [Rust](#rust)) |
+| `[plugins] build` | `false`: never build a Rust file, as [`--no-build`](#options-of-quillo-run) (see [Rust](#rust)) |
 | `[plugins] allow` | the plugins a program may `use`, by file name: `"qr"` at any version, `"csv@1"` or `"csv@1.4.2"` by the file's `//! version:` line. A plugin not listed is refused, by `quillo check` too, before anything is built. It names plugins; it does not prove their code |
 | `[effects] allow` | the effects anything in the program may use, as a `with` on its top level, routes, jobs and functions alike; a Rust file with no `//! effects:` line is refused anywhere under it |
 | `[http] hosts` | the hosts `http.*` may reach: `api.stripe.com`, `*.mapbox.com` (its subdomains, not itself), `*`. Each redirect is judged before it is followed |
 | `[http] private` | `false`: `http.*` reaches nothing on this machine or its networks (loopback, private, link-local and the cloud's metadata at `169.254.169.254`, carrier-grade NAT, IPv6's unique-local), as the name resolves when it connects |
 | `[env] names` | the variables `env()` may read; any other reads as not set, so `env("HOME") ?? "none"` gives `"none"` |
-| `[limits] workers`, `max_compute`, `max_body` | the most `--workers`, `--max-compute` and `--max-body` may be: a smaller value given on the command line stays (`"10s"`, `"500ms"`, `"2m"`; `"10MB"`, `"512KB"` or bytes) |
+| `[limits] workers`, `max_compute`, `max_body` | the most [`--workers`](#options-of-quillo-run), [`--max-compute`](#options-of-quillo-run) and [`--max-body`](#options-of-quillo-run) may be: a smaller value given on the command line stays (`"10s"`, `"500ms"`, `"2m"`; `"10MB"`, `"512KB"` or bytes) |
 
 Under the two files above, with `APP_NAME=Shop`:
 
@@ -489,7 +566,7 @@ main.qwe:6: error: `udp.listen` needs the net effect, which host.toml does not a
 
 - `quillo check` and `quillo run` always read the host's file and `quillo.policy`;
   `--policy` adds one, and `check` names the files only when one is given.
-- `--split` passes the `--policy` files and `quillo.policy` to its services; a service
+- [`--split`](#options-of-quillo-run) passes the `--policy` files and `quillo.policy` to its services; a service
   reads the host's file itself.
 - What a policy holds to is Quillo code and what it loads. A plugin is Rust in the
   server's process, which a policy cannot watch: it can only choose which plugins load.
@@ -545,7 +622,7 @@ itself, its `.env` and its database stay outside it, in `/home/u/app`, where Apa
 not serve them.
 
 - Each request is the request the visitor made: its path (`REQUEST_URI`), headers and
-  body, and `request.ip` is Apache's `REMOTE_ADDR`, with no `--trust-proxy`. The server
+  body, and `request.ip` is Apache's `REMOTE_ADDR`, with no [`--trust-proxy`](#options-of-quillo-run). The server
   does the rest as for any visitor: routes, sessions, limits, the log (on Apache's error
   log).
 - Its jobs and its own calls reach it through a socket only it can open, in a private
@@ -556,13 +633,13 @@ not serve them.
   arrives whole unless the host sets `mod_fcgid`'s output buffer to 0
   (`FcgidOutputBufferSize 0`).
 - `mod_fcgid` may start several processes, each with its own global variables, as
-  `--instances` would; keep what must be shared in the database. `quillo fcgi` refuses
-  `--split`, `--instances`, `--register` and `--join`.
+  [`--instances`](#options-of-quillo-run) would; keep what must be shared in the database. `quillo fcgi` refuses
+  [`--split`](#options-of-quillo-run), `--instances`, [`--register`](#options-of-quillo-run) and [`--join`](#options-of-quillo-run).
 - A request Apache abandons while its answer streams (FastCGI's `ABORT`) ends when the
   connection closes.
 - Run from a terminal, it says what it needs: `file descriptor 0 is not a socket:
   quillo fcgi is started by a FastCGI process manager (mod_fcgid), or given --listen
-  unix:PATH or --port`. With `--listen unix:f.sock` (or `--port 9000`, on 127.0.0.1) it
+  unix:PATH or --port`. With [`--listen unix:f.sock`](#options-of-quillo-run) (or [`--port 9000`](#options-of-quillo-run), on 127.0.0.1) it
   makes its own socket instead, for nginx's `fastcgi_pass unix:/srv/app/f.sock` with
   `include fastcgi_params` on a server of one's own.
 
@@ -577,7 +654,7 @@ ProxyPassReverse "/" "http://localhost/"
 
 (Apache 2.4.47 or later for `upgrade=websocket`; `ProxyPass` is the host's
 configuration, not `.htaccess`'s). The socket is made with mode 0600, for the account's
-own processes: give `--socket-mode 660` when the web server reaches it through its
+own processes: give [`--socket-mode 660`](#options-of-quillo-run) when the web server reaches it through its
 group. A socket left by a server that did not stop cleanly is taken over; one another
 server answers on is not (`a server is listening there`). Every visitor through the
 socket is 127.0.0.1 to the program, which the server says at start until
@@ -588,7 +665,7 @@ socket is 127.0.0.1 to the program, which the server says at start until
 elsewhere with `quillo build main.qwe`, on Linux on the same processor, and on a system
 no newer than the server's (a plugin linked against a newer glibc does not load on an
 older one: build in a CentOS 7 or AlmaLinux 8 container). Upload `.quillo/` with the
-program: `.quillo/native/` and `.quillo/plugins.lock`. Run with `--no-build`, so that
+program: `.quillo/native/` and `.quillo/plugins.lock`. Run with [`--no-build`](#options-of-quillo-run), so that
 nothing is ever built on the server, and a library that is not the one built is refused
 rather than built again.
 
@@ -597,7 +674,7 @@ rather than built again.
 policy](#the-policy)). `quillo check --policy policy.toml main.qwe`, run before
 uploading, says what would be refused.
 
-**Threads and `ulimit -u`.** A Quillo server may use `--workers` + 9 threads (73 with the
+**Threads and `ulimit -u`.** A Quillo server may use [`--workers`](#options-of-quillo-run) + 9 threads (73 with the
 default 64), and on Linux the account's process limit counts them, beside PHP, cron and
 SSH. Give `--workers 8` or so (a host's policy can cap it with `[limits] workers`). At
 start a server says when `ulimit -u` is below what it may use, and a thread the system
@@ -605,7 +682,7 @@ refuses is said once (see [Concurrency and reloading](#concurrency-and-reloading
 
 **The rest of the account.**
 
-- **Settings:** the `.env` beside the program, or `--env-file` for one outside the
+- **Settings:** the `.env` beside the program, or [`--env-file`](#options-of-quillo-run) for one outside the
   public folder. A FastCGI program gets the web server's environment, so keep secrets
   there and not in `app.fcgi`.
 - **Jobs:** a FastCGI process stopped when idle runs no `schedule` or `every`. Run them
