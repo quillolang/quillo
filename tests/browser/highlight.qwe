@@ -14,8 +14,13 @@ let SAMPLES = [
     ["nope", "<b> & 'x'"],
 ]
 
-component Client() =
-    <div id="client">{for s in SAMPLES => <pre class="sample">{highlight(s[1], s[0])}</pre>}</div>
+// Empty from the server: the samples are coloured once the component runs in the
+// browser, so what highlight.js compares is the runtime's work and not the server's
+// markup taken up as it was.
+component Client() {
+    state shown = false
+    <div id="client" @mount={(el) => { shown = true }}>{for s in (shown ? SAMPLES : []) => <pre class="sample">{highlight(s[1], s[0])}</pre>}</div>
+}
 
 route GET / = <html><body>
     <div id="server">{for s in SAMPLES => <pre class="sample">{highlight(s[1], s[0])}</pre>}</div>
