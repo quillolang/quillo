@@ -8,11 +8,28 @@ the website's folder, which serves them at /llms.txt and /llms-full.txt.
 Run it whenever llms.md, a builtin or a chapter changes, as assemble.py is run. It
 writes nothing unless every example in llms.md passes `quillo check` ($QUILLO, else
 target/release/quillo).
+
+`python3 llms.py v0.6.0` writes a release's own, from that tag, into the website's
+v0.6.0/ folder, served at /v0.6.0/llms.txt and /v0.6.0/llms-full.txt (two routes in the
+site's main.qwe for each release): an assistant on a
+release reads what that release has (FEEDBACK46.md, Q-533). A tag with book/llms.md is
+written as above, its examples already checked when it was made; an older one, which has
+none (0.6.0), is its USERGUIDE.md and the builtins its check.rs knows, with their types.
 """
 import re, os, glob, sys, shutil, subprocess, tempfile
 
 APP = os.path.expanduser("~/dev/quillo-app1")
 SITE = os.path.expanduser("~/dev/quillo-website")
+RELEASE = sys.argv[1] if len(sys.argv) > 1 else None
+OUT, LINK = SITE, "https://quillolang.org"
+if RELEASE:
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", RELEASE):
+        sys.exit(f"llms.py: `{RELEASE}` is not a release tag (v0.6.0)")
+    TAG_DIR = tempfile.mkdtemp(prefix="llms-tag-")
+    archive = subprocess.run(["git", "-C", APP, "archive", RELEASE], capture_output=True, check=True).stdout
+    subprocess.run(["tar", "-x", "-C", TAG_DIR], input=archive, check=True)
+    APP, OUT, LINK = TAG_DIR, f"{SITE}/{RELEASE}", f"https://quillolang.org/{RELEASE}"
+    os.makedirs(OUT, exist_ok=True)
 
 def builtins():
     """The builtins, grouped as builtin_docs.rs groups them."""
@@ -101,18 +118,42 @@ def check_examples(guide):
     finally:
         shutil.rmtree(tmp)
 
+def typed_builtins():
+    """A tag without builtin_docs.rs: the names, parameter types and result in check.rs's table."""
+    src = open(f"{APP}/src/check.rs").read()
+    body = src[src.index("const BUILTINS"):]
+    body = body[: body.index("\n];")]
+    out = [f"- `{n}({p})` gives {r or 'nothing'}" for n, p, r in re.findall(r'^\s*\("([a-z_.0-9]+)", "([^"]*)", "([^"]*)"\)', body, re.M) if not n.startswith("__")]
+    return len(out), out
+
+if RELEASE and not os.path.exists(f"{APP}/book/llms.md"):
+    version = RELEASE[1:]
+    count, lines = typed_builtins()
+    short = f"# Quillo {version}\n\nThe user guide of Quillo {version}, as its release has it, for AI coding assistants. " \
+        + "The guide at https://quillolang.org/llms.txt describes main, the next release, which has more: " \
+        + f"write for {version} from this one.\n\n## Builtins\n\nAll {count} of them, with the types they take and give.\n" \
+        + "\n".join(lines) + "\n\n# The user guide\n\n" + open(f"{APP}/USERGUIDE.md").read().rstrip("\n") + "\n"
+    for name in ("llms.txt", "llms-full.txt"):
+        open(f"{OUT}/{name}", "w").write(short)
+        print(f"{OUT}/{name}: {len(short.split())} words")
+    shutil.rmtree(APP)
+    sys.exit(0)
+
 guide = open(f"{APP}/book/llms.md").read().rstrip("\n")
-check_examples(guide)
+if not RELEASE:
+    check_examples(guide)
 count, lines = builtins()
 short = guide + f"\n\n## Builtins\n\nAll {count} of them. A name with a dot is a module's (`db.query`).\n" \
     + "\n".join(lines) + "\n\n## More\n\n" \
-    + "- [The whole manual in one file](https://quillolang.org/llms-full.txt)\n" \
+    + f"- [The whole manual in one file]({LINK}/llms-full.txt)\n" \
     + "- [Documentation](https://quillolang.org/docs/)\n" \
     + "- [Plugins](https://quillolang.org/plugins/)\n" \
     + "- [A program to start from](https://github.com/quillolang/starter)\n"
 full = short + "\n\n# The manual\n\n" + "\n\n".join(chapters()) + "\n"
 
 for name, text in (("llms.txt", short), ("llms-full.txt", full)):
-    open(f"{SITE}/{name}", "w").write(text)
-    print(f"{SITE}/{name}: {len(text.split())} words")
+    open(f"{OUT}/{name}", "w").write(text)
+    print(f"{OUT}/{name}: {len(text.split())} words")
 print(f"{count} builtins")
+if RELEASE:
+    shutil.rmtree(APP)

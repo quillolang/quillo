@@ -673,23 +673,19 @@ fn glue(qwer: &Path, exports: &[Export]) -> String {
         let _ = writeln!(s, "            {} => {{", i);
         let mut call_args = Vec::new();
         for (j, (pname, ty)) in e.params.iter().enumerate() {
-            // A reference is made from a value of its own.
-            let (owned, by_ref) = match ty.strip_prefix('&') {
-                Some(t) => {
-                    let t = t.trim();
-                    let owned = if t == "str" {
-                        "String".to_string()
-                    } else if let Some(inner) = t.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
-                        format!("Vec<{}>", inner)
-                    } else {
-                        t.to_string()
-                    };
-                    (owned, true)
-                }
-                None => (ty.clone(), false),
+            // Each argument's type is the function's, which Rust infers from the call: this file
+            // is outside the user's module, where its `use` lines (`use serde_json::Value`) do
+            // not reach (FEEDBACK46.md, Q-530; branch feedback40-43). A reference is made from a
+            // value of its own; only `&str` and `&[T]` need theirs named, and neither needs a
+            // name of the file's.
+            let (owned, call) = match ty.strip_prefix('&').map(str::trim) {
+                Some("str") => (": String", format!("&a{}", j)),
+                Some(t) if t.starts_with('[') && t.ends_with(']') => (": Vec<_>", format!("a{}.as_slice()", j)),
+                Some(_) => ("", format!("&a{}", j)),
+                None => ("", format!("a{}", j)),
             };
-            let _ = writeln!(s, "                let a{}: {} = __quillo::arg(&mut a, {}, {:?}, {:?})?;", j, owned, j, e.name, pname);
-            call_args.push(if by_ref { format!("&a{}", j) } else { format!("a{}", j) });
+            let _ = writeln!(s, "                let a{}{} = __quillo::arg(&mut a, {}, {:?}, {:?})?;", j, owned, j, e.name, pname);
+            call_args.push(call);
         }
         let _ = writeln!(s, "                __quillo::Back::back(user::{}({}))", e.name, call_args.join(", "));
         s.push_str("            }\n");

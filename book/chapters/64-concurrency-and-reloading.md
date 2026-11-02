@@ -320,7 +320,7 @@ quillo> db.query("select * from notes")
 
 A program with no routes is a script: `quillo run tool.qwe` runs it from the top and ends.
 What follows `--` is its arguments, `args()`; `stdin()` is all that is piped in, and
-`read_line()` the next line, `null` at the end; `exit(n)` ends it with status `n`. A script
+`read_line()` the next line, `null` at the end; `exit(n)` ends it with status `n` *(since 0.7)*. A script
 that ends by itself ends with 0, and one that fails (a stop, or an error a `?` at the top
 passes on) with 1, saying what it was. Files are the program's folder's, as for a server;
 [`--allow-path DIR`](#options-of-quillo-run), given when the script is started
@@ -432,7 +432,7 @@ or a widget's `function run()` and Quillo's leave each other alone (FEEDBACK42.m
 
 ### For developer tools
 
-A browser extension or a test can follow what the runtime does, without the debugger. It
+*(since 0.7)* A browser extension or a test can follow what the runtime does, without the debugger. It
 asks by setting `data-quillo-devtools="1"` on `<html>` before the runtime starts (a content
 script at `document_start`, or the page itself); a page that does not ask does nothing
 more. The runtime then says what happens as `quillo:devtools` events on `document`, each
@@ -553,7 +553,7 @@ It is off by default, since anyone who can reach the server could read it.
 ## The policy
 
 `with` limits what a function may do, from inside the program. A policy limits what the
-whole program may do, from outside it: the host's, for every program on a server, and
+whole program may do, from outside it *(since 0.7)*: the host's, for every program on a server, and
 the site owner's, for one deploy. Policies are small TOML files, read as the program
 starts, by `quillo run`, `quillo fcgi` and `quillo check`:
 
@@ -638,7 +638,7 @@ main.qwe:6: error: `udp.listen` needs the net effect, which host.toml does not a
 
 ## Quillo on a shared server (cPanel)
 
-A shared hosting account (cPanel, often on CloudLinux, with Apache or LiteSpeed in
+*(since 0.7)* A shared hosting account (cPanel, often on CloudLinux, with Apache or LiteSpeed in
 front) gives a folder, a web server the host runs, and no root. It differs from a server
 of one's own in three ways that matter to Quillo:
 

@@ -242,6 +242,20 @@
   after `let n = 1` says int, not any, and `xs += 2` on a list is an error, as `[1] + 2`
   is. What changes: `str()` with nothing to make text of is an error; it gave null (Q-525).
 
+### An app on the starter (FEEDBACK46.md)
+
+- **A `.qwer` function's signature may name what the file's `use` lines bring in**:
+  `use serde_json::Value;` then `pub fn role(auth: Value)`, or a `HashMap<String, i64>`
+  after `use std::collections::HashMap;`. The glue copied each type's text into a file
+  where those lines did not reach, and the build failed with an error in `lib.rs`, a file
+  the program never wrote (Q-530).
+- **A style map is properties on every element on the server**: on one with `class=`, a
+  spread, or a `<textarea>`, `style={{ color: "red" }}` was written as JSON (Q-531).
+- **`quillo check` warns of an input whose value nothing takes**: `value={v}` where `v` is a
+  view's parameter or a component's prop, `value={form.name}`, and a checkbox's `checked`,
+  with no handler, `bind:`, `name=`, `readonly` or `disabled` on it. The input showed the
+  typed text while the program kept what it had (Q-532).
+
 ### Developer tools and the browser (FEEDBACK42.md)
 
 - **`quillo check` warns of `sleep(0.2)`**: `sleep` takes milliseconds, and a number written

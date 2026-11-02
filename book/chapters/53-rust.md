@@ -1,6 +1,6 @@
 # Rust
 
-A `.qwer` or `.rs` file is Rust, and a program `use`s it as it uses a `.qwe` file: its
+A `.qwer` or `.rs` *(since 0.7)* file is Rust, and a program `use`s it as it uses a `.qwe` file: its
 top-level `pub fn`s are the program's functions. The two extensions are the same to
 Quillo: `.rs` is the one editors, `rustfmt` and clippy know, and `.qwer` is the catalog's
 and `quillo install`'s. A `.rs` file is the program's only when a `use` or `import` names
@@ -49,7 +49,10 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   `use`. A `pub fn` that is generic (a written lifetime counts: `fn f<'a>`), `async`,
   takes `&mut`, or has a type that cannot cross, as a fixed-size array cannot, is not
   exported, and `quillo check` says why. Another crate's type named `Value` passes the
-  check and fails the build.
+  check and fails the build. A signature may name what the file's own `use` lines bring
+  in: after `use serde_json::Value;` and `use std::collections::HashMap;`, `pub fn
+  role(auth: Value)` and `pub fn total(m: HashMap<String, i64>)` build as written in
+  full do.
 - The `//! [dependencies]` lines are the file's crates, as in `Cargo.toml`: any crate
   from crates.io or git. They come first, after other `//!` lines if any; the first line
   that is not `//!` ends them. Only that table is read (no `[features]` table, no
@@ -105,7 +108,7 @@ How it runs:
   the same processor and system (there is no cross-compiling: build on Linux for
   Linux), by the same Quillo glue. A Quillo whose glue changed builds again, and needs
   cargo then.
-- **`.quillo/plugins.lock`**, beside `.quillo/native/`, holds each library's file name
+- **`.quillo/plugins.lock`** *(since 0.7)*, beside `.quillo/native/`, holds each library's file name
   and SHA-256, a line each, written by every build: `quillo build`, a `use` that built,
   [`--watch`](#options-of-quillo-run). Deploy it with `.quillo/native/`. A library is loaded only when it is the one
   built: one whose hash differs, or that has no line, is built again where cargo may run

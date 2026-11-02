@@ -19,6 +19,9 @@ cargo build --release
 cargo test
 ```
 
+Features marked *(since 0.7)* are in main and the next release, not in 0.6.0. On 0.6.0,
+read the guide at https://github.com/quillolang/quillo/blob/v0.6.0/USERGUIDE.md instead.
+
 ### Options of `quillo run`
 
 `quillo run` checks the program, executes its top level and, if it declared routes or
@@ -44,27 +47,27 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | Option | What it does, and when to give it |
 |---|---|
 | `--port N`, `--host H` | where to listen (default `$PORT` or 8080, on 127.0.0.1). Give `--port` when 8080 is taken or a host names the port; `--port 0` takes any free one (`platform().server.port` says which). Give `--host 0.0.0.0` to be reached from other machines without a proxy in front; `--host localhost` is 127.0.0.1 |
-| `--listen unix:PATH` | listen on a Unix socket instead of a TCP port, when a web server on the same machine passes requests on (on a shared server, so the neighbours cannot reach the port): made with mode 0600, removed when the server stops, and at most 100 bytes long (a short path relative to the folder `quillo` runs in). A `$PORT` that holds an absolute path (`/home/u/app.sock`, or `unix:/home/u/app.sock`) is taken the same way. Not with `--split`, `--instances`, `--register` or `--join` (see [Quillo on a shared server](#quillo-on-a-shared-server-cpanel)) |
-| `--socket-mode 660` | with `--listen`: the socket's permissions, in octal, when the web server reaches it through the owner's group; the owner must keep read and write (`600`, the default) |
+| `--listen unix:PATH` *(since 0.7)* | listen on a Unix socket instead of a TCP port, when a web server on the same machine passes requests on (on a shared server, so the neighbours cannot reach the port): made with mode 0600, removed when the server stops, and at most 100 bytes long (a short path relative to the folder `quillo` runs in). A `$PORT` that holds an absolute path (`/home/u/app.sock`, or `unix:/home/u/app.sock`) is taken the same way. Not with `--split`, `--instances`, `--register` or `--join` (see [Quillo on a shared server](#quillo-on-a-shared-server-cpanel)) |
+| `--socket-mode 660` *(since 0.7)* | with `--listen`: the socket's permissions, in octal, when the web server reaches it through the owner's group; the owner must keep read and write (`600`, the default) |
 | `--watch`, `-w` | while you work on the program: reload when it or a `use`d file changes (a symbolic link pointed elsewhere, to a file or a folder, counts, within a second), show errors on the page, and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's). Not in production |
 | `--reload` | in production, for a program whose files change while it runs (a deploy that copies new files, a plugin editor): reload when files change, with no errors shown on pages and no page refreshes |
 | `--env-file F` | when the settings are not in the `.env` beside the program: a file kept outside the site's folder, or one file per place (`--env-file prod.env`); a path from the folder `quillo` runs in, which must exist |
-| `--policy FILE` | before a deploy, or on a server you share: narrow what the program may do, after `/etc/quillo/policy.toml` and before the `quillo.policy` beside it; may be given more than once (see [The policy](#the-policy)) |
-| `--no-build` | on a server with no Rust, or one that must never run cargo: load only libraries `quillo build` made, as `.quillo/plugins.lock` names them (see [Rust](#rust)) |
+| `--policy FILE` *(since 0.7)* | before a deploy, or on a server you share: narrow what the program may do, after `/etc/quillo/policy.toml` and before the `quillo.policy` beside it; may be given more than once (see [The policy](#the-policy)) |
+| `--no-build` *(since 0.7)* | on a server with no Rust, or one that must never run cargo: load only libraries `quillo build` made, as `.quillo/plugins.lock` names them (see [Rust](#rust)) |
 | `--no-check` | when the program is known to check (a deploy that ran `quillo check` already) and starting must be quick: skip the static checks |
 | `--max-body N` | when visitors send larger files or bodies than 10MB: the largest request body to accept, a size such as `50MB` (`KB`, `MB` and `GB`, in any case, are 1024-based) or bytes; default 10MB; a larger body gets 413 (see [Uploads](#uploads)) |
-| `--max-compute 2s` | when a request that computes for long must not hold up the others: end one that computes this long without letting go, as a 500 (see [Concurrency](#concurrency-and-reloading)) |
+| `--max-compute 2s` *(since 0.7)* | when a request that computes for long must not hold up the others: end one that computes this long without letting go, as a 500 (see [Concurrency](#concurrency-and-reloading)) |
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64). Give fewer where an account limits its threads (shared hosting), more for many slow calls at once |
 | `--instances N` | to use N cores on one machine: run the program N times over, one event loop each, each with its own variables (see [Concurrency](#concurrency-and-reloading)); not with `--watch`, `--register` or `--split`; more than the machine's cores is warned of |
-| `--trust-proxy 10.0.0.0/8` | when a proxy (limer, nginx, Apache) is in front: believe `X-Forwarded-For` from these addresses, so `request.ip` and the limits per client are the visitor's (see [Live data](#live-data)) |
-| `--live-per-client N` | when one address is many visitors (an office behind one address): the pages one client may have waiting for live data (default 256) |
+| `--trust-proxy 10.0.0.0/8` *(since 0.7)* | when a proxy (limer, nginx, Apache) is in front: believe `X-Forwarded-For` from these addresses, so `request.ip` and the limits per client are the visitor's (see [Live data](#live-data)) |
+| `--live-per-client N` *(since 0.7)* | when one address is many visitors (an office behind one address): the pages one client may have waiting for live data (default 256) |
 | `--plain-http` | when the site is served over plain HTTP on purpose, on a network you trust (a factory's kiosks at `http://10.0.0.5:8080`): cookies are not `Secure`, which browsers would drop there (see [Cookies and sessions](#cookies-and-sessions)) |
-| `--allow-path DIR` | when a script used as a tool must read or write files outside its folder, or a deploy links a folder from elsewhere (`uploads -> /srv/shared/uploads`): `read_file` and `write_file` may use `DIR` too; any part of the program may then, routes too (see [Paths and links](#paths-and-links)) |
-| `-- a b` | for a script: after the program, what follows is the program's, and `args()` gives `["a", "b"]`; before it, `--` ends the options (`quillo run -- a.qwe x`). A stray word elsewhere is told it goes after `--` (see [Scripts as tools](#scripts-as-tools)) |
+| `--allow-path DIR` *(since 0.7)* | when a script used as a tool must read or write files outside its folder, or a deploy links a folder from elsewhere (`uploads -> /srv/shared/uploads`): `read_file` and `write_file` may use `DIR` too; any part of the program may then, routes too (see [Paths and links](#paths-and-links)) |
+| `-- a b` *(since 0.7)* | for a script: after the program, what follows is the program's, and `args()` gives `["a", "b"]`; before it, `--` ends the options (`quillo run -- a.qwe x`). A stray word elsewhere is told it goes after `--` (see [Scripts as tools](#scripts-as-tools)) |
 | `--with CMD` | when a tool must run beside the program while you work (Tailwind's watcher): run a command (through `sh -c`, in its folder), its lines marked with its name, stopped with it however it ends, a Ctrl-C or `SIGTERM` while it loads, a panic and a `SIGKILL` too (more than once for several): `--with "npx tailwindcss -i src/app.css -o public/app.css --watch"` |
 | `--log F` | the request log on stderr: `text` (the default), `json` (one object per line) for a log collector, or `off` when another layer logs requests (see [Logs and metrics](#logs-and-metrics)) |
 | `--metrics` | when Prometheus (or another scraper) should read the server: answer `GET /_quillo/metrics` (see [Logs and metrics](#logs-and-metrics)) |
-| `--query-stats` | to find slow queries on a running server: time database queries for `GET /_quillo/health/queries`, the last 100, overall and per statement (on under `--watch`; see [Stopping and health](#stopping-and-health)) |
+| `--query-stats` *(since 0.7)* | to find slow queries on a running server: time database queries for `GET /_quillo/health/queries`, the last 100, overall and per statement (on under `--watch`; see [Stopping and health](#stopping-and-health)) |
 | `--describe` | when a gateway imports the program's API: answer `GET /_quillo/describe` with it, as `quillo docs` writes it (see [The program's API](#the-programs-api-openapi)) |
 | `--no-view-cache` | to measure, or to rule the cache out while looking for a bug: render views every time (see [Cached views](#cached-views)) |
 | `--no-jobs` | on all but one of several servers that do not share a database, or on a copy that must not run them: run none of the program's scheduled jobs here (see [Scheduled jobs](#scheduled-jobs)) |
@@ -76,8 +79,8 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | `--as-service` | to run a service on a machine of its own: serve the program as a service, its `server fn`s answering other services' signed calls, not pages (see [Services](#services)) |
 | `--service-name NAME` | with `--as-service`, when the file is not named as callers call the service: the name it answers to; calls signed for another service are refused |
 | `--join URL` | with `--as-service` and a `--port`, to add a copy of a service while the app runs: join the app at URL, signed with `QUILLO_SERVICE_KEY` when it is set (see [Copies that join](#copies-that-join)) |
-| `--join-as URL` | with `--join`, when the app must call the copy at another address than the one it connects from (`https://billing-3.internal:8443`); it must lead to where the copy joined from |
-| `--no-join`, `--allow-join A,B` | on the app, to take no copies that join, or only copies of these services |
+| `--join-as URL` *(since 0.7)* | with `--join`, when the app must call the copy at another address than the one it connects from (`https://billing-3.internal:8443`); it must lead to where the copy joined from |
+| `--no-join`, `--allow-join A,B` *(since 0.7)* | on the app, to take no copies that join, or only copies of these services |
 | `--register URL`, `--service S` | to run several servers behind limer: join its pool at its admin address (the pool named `S`, else the file's name), and share live updates with its other servers; needs `LIMER_ADMIN_SECRET` (see [Several servers](#several-servers)) |
 | `--wt-port N` | when the UDP port of the HTTP port's number is taken or not open: the UDP port pages connect to over WebTransport (see [Channels](#channels)) |
 | `--tls-cert F`, `--tls-key F` | when WebTransport should present a real certificate, instead of one of its own; the files must exist |
@@ -85,7 +88,7 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 
 ### Other commands
 
-`quillo new <folder>` writes a program to start from. By default it is the to-do app, the
+`quillo new <folder>` *(since 0.7)* writes a program to start from. By default it is the to-do app, the
 eight files of `app/`: a database with a migration, a component, files served.
 `--minimal` writes three: `main.qwe`, `lib/greet.qwe` and `ui/page.qwe`, a page, a
 component and a function both sides use. Both get a `.gitignore` (`*.db`, `*.db-wal`,
@@ -107,11 +110,11 @@ one and for a folder, runs `quillo new` and opens the folder.
 
 The other commands: `quillo check` (below, and [Checking](#checking)), `quillo docs`
 (the API as OpenAPI 3, to stdout; see [Services](#services)), `quillo build` (the Rust
-files; see [Rust](#rust)), `quillo fix` (the `import` lines a program's files need, and 0.6's lines turned around; see
-[Files of a program](#files-of-a-program)), `quillo serve <folder>` (a folder of files as
+files; see [Rust](#rust)), `quillo fix` *(since 0.7)* (the `import` lines a program's files need, and 0.6's lines turned around; see
+[Files of a program](#files-of-a-program)), `quillo serve <folder>` *(since 0.7)* (a folder of files as
 they are, as a static host serves it; see [Static files](#static-files)), `quillo classes
-<file.qwe>` (the classes the program's markup writes, one a line; see [HTML
-literals](#html-literals)), `quillo fcgi <file.qwe>` (the program behind FastCGI, for
+<file.qwe>` *(since 0.7)* (the classes the program's markup writes, one a line; see [HTML
+literals](#html-literals)), `quillo fcgi <file.qwe>` *(since 0.7)* (the program behind FastCGI, for
 `mod_fcgid` or nginx's `fastcgi_pass`; see [Quillo on a shared
 server](#quillo-on-a-shared-server-cpanel)), `quillo repl`, `quillo lsp`, `quillo dap`,
 `quillo version` (or `--version`, `-V`), which names the commit: from a source archive
@@ -139,7 +142,7 @@ Their options, given after the command as `quillo run`'s are:
 | Command and option | What it does, and when to give it |
 |---|---|
 | `quillo check --strict-null` | to find where a value may be null and null does not work (see [Checking](#checking)); `check` only, not `run` |
-| `quillo check --policy FILE` | before a deploy to a server with a policy: check the program as it would run under it (see [The policy](#the-policy)) |
+| `quillo check --policy FILE` *(since 0.7)* | before a deploy to a server with a policy: check the program as it would run under it (see [The policy](#the-policy)) |
 | `quillo new --minimal`, `--binary` | three files instead of the to-do app; a copy of this `quillo` in the new folder, for a machine that has none |
 | `quillo app --open PATH` | the page the window opens on (`/` by default); `app` takes `run`'s options but `--host`, `--register` and `--service` (see [Desktop apps](#desktop-apps)) |
 | `quillo serve <folder>` | `run`'s options, such as `--port` (see [Static files](#static-files)) |
@@ -171,14 +174,14 @@ Everything Quillo reads from the environment:
 |---|---|
 | `PORT` | the port, when [`--port`](#options-of-quillo-run) is not given; an absolute path is a Unix socket to listen on, as [`--listen unix:`](#options-of-quillo-run) |
 | `QUILLO_SECRET` | signs sessions (see [Cookies and sessions](#cookies-and-sessions)); without it, a key made at start |
-| `QUILLO_QUERY_STATS` | `1`: query stats on from the start, as [`--query-stats`](#options-of-quillo-run) |
-| `QUILLO_HEALTH_TOKEN` | lets a request with `Authorization: Bearer <it>` see each statement's query stats and switch them on or off; 16 characters at least |
+| `QUILLO_QUERY_STATS` *(since 0.7)* | `1`: query stats on from the start, as [`--query-stats`](#options-of-quillo-run) |
+| `QUILLO_HEALTH_TOKEN` *(since 0.7)* | lets a request with `Authorization: Bearer <it>` see each statement's query stats and switch them on or off; 16 characters at least |
 | `QUILLO_DB` | the database when the program does not call `db.open`; without it, SQLite in memory, gone at restart |
 | `QUILLO_SYSTEM_DB` | where Quillo's own tables go with a database per tenant (see [Quillo's own tables](#quillos-own-tables)) |
 | `QUILLO_SERVICE_SECRET`, `QUILLO_SERVICE_<NAME>` | signs calls between services (several, comma-separated: the first signs, any is taken); where service NAME runs (see [Services](#services)) |
-| `QUILLO_SERVICE_SECRET_PREVIOUS` | a secret still taken while `QUILLO_SERVICE_SECRET` is changed (see [Authentication between services](#authentication-between-services)) |
-| `QUILLO_SERVICE_KEY` | a service's own key: a copy joins with it, and it proves the copy is that service (see [Copies that join](#copies-that-join)) |
-| `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` | the proxy `http.*` calls go through, and the hosts that do not (see [HTTP client](#http-client)) |
+| `QUILLO_SERVICE_SECRET_PREVIOUS` *(since 0.7)* | a secret still taken while `QUILLO_SERVICE_SECRET` is changed (see [Authentication between services](#authentication-between-services)) |
+| `QUILLO_SERVICE_KEY` *(since 0.7)* | a service's own key: a copy joins with it, and it proves the copy is that service (see [Copies that join](#copies-that-join)) |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` *(since 0.7)* | the proxy `http.*` calls go through, and the hosts that do not (see [HTTP client](#http-client)) |
 | `LIMER_ADMIN_SECRET` | for [`--register`](#options-of-quillo-run) (see [Several servers](#several-servers)) |
 | `QUILLO_NATIVE_CACHE`, `CARGO` | where `.qwer` files are built, and with what (see [Rust](#rust)) |
 | `PUBLIC_...` | any such variable may be read in a component (see [What the browser can reach](#what-the-browser-can-reach)) |
@@ -271,7 +274,7 @@ split apart), and [index.qwe](https://github.com/quillolang/examples/blob/main/i
 
 ### Phone apps (preview)
 
-A program runs inside an iOS or Android app: the runtime is linked into it and runs the
+*(since 0.7)* A program runs inside an iOS or Android app: the runtime is linked into it and runs the
 program in the app's process, with no HTTP server, as `quillo app` does on a desktop, so it
 works offline and keeps its SQLite database in the app's container. `mobile/ios/build.sh app
 --run` builds the app around a program folder for the iOS simulator and opens it there, and
@@ -379,7 +382,7 @@ Operators are as in JavaScript, with these meanings:
 | `null`, `false` and error values | everything else, `0` and `""` included |
 
 Because `""` is truthy, `name || "anonymous"` keeps an empty name: write
-`filled(name) ?? "anonymous"` to replace a blank or a missing name, or
+`filled(name) ?? "anonymous"` *(since 0.7)* to replace a blank or a missing name, or
 `name ?? "anonymous"` to replace only null (`quillo check` points these out).
 
 Ints are 64-bit: `+`, `-`, `*` and unary `-` past their range are a runtime error
@@ -780,7 +783,7 @@ for everything the function calls, including the lambdas it passes to `map`: the
 effects allowed are narrowed on the way in, and nothing called can widen them.
 Functions without `with` may do anything.
 
-Routes and route groups take `with` too, written before the body, after the patterns. It
+Routes and route groups take `with` too *(since 0.7)*, written before the body, after the patterns. It
 holds for everything the route runs: its body, what it calls, and the middleware of its
 groups. A group's `with` is what its routes may use at most; a route in it may narrow it,
 and one that asks for more is an error:
@@ -809,7 +812,7 @@ as a function does (see [Scheduled jobs](#scheduled-jobs)).
   `.exec`, `.transaction`) is a warning, since `c` may be a connection: `` `c.query` reads
   like a database call, which needs the db effect ``.
 - **A Rust function** (a `.qwer` or `.rs` file) has the effects its file declares in
-  its header, `//! effects: db, http` (or `//! effects: none`). A file without that line
+  its header, `//! effects: db, http` *(since 0.7)* (or `//! effects: none`). A file without that line
   may do anything, so its functions run outside any `with` as before, and are refused
   inside one, at run time and by `quillo check`: `` `hi` is Rust whose file does not say
   what it does, so it may do anything and is refused in `greet` ``. An editor's hover
@@ -865,7 +868,7 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   out. A name may hold `-`, `_`, `:`, `@` and `.` (`data-id`, `bind:value`, `@click`),
   the `{name}` shorthand takes a bare name, and an attribute written twice is an error.
 - An event attribute given an expression, `onclick={() => ...}` or `onClick={save}`, is a
-  handler, the same as `@click={...}` (both on one element is an error). Given text,
+  handler *(since 0.7)*, the same as `@click={...}` (both on one element is an error). Given text,
   `onclick="..."`, it is HTML's own and runs in the browser as written, so it takes only
   `"text"` written in the program: the browser decodes the value and runs it, and escaping
   cannot keep data out of code. Text made from values, ``onmouseover={`go('${u}')`}``, is
@@ -954,7 +957,7 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   is found by neither it nor Quillo. Under [`--watch`](#options-of-quillo-run), each time it writes the sheet the
   open pages take it as they are. Tailwind's scanner reads the shorthand too
   (`<div.flex.p-4.md:flex-row>`), but a fraction right before `/>` is read with the
-  slash (`<i.w-1/3/>`): put a space before `/>`. `classes()` gives the classes the
+  slash (`<i.w-1/3/>`): put a space before `/>`. `classes()` *(since 0.7)* gives the classes the
   program's markup writes, sorted, for a CSS engine called from the program, and `quillo
   classes app.qwe` prints them one a line, for a tool beside it (Tailwind's `@source
   inline(...)`, or a safelist file). Both read the source: the `.class` shorthand,
@@ -1162,7 +1165,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   again fires `change`). `@submit` does not reload the page. HTML5 drag and drop
   (`e.dataTransfer`), pointer capture (`e.target.setPointerCapture(e.pointerId)`) and
   SVG markup work as they do in the browser.
-- What a person changes in the page is two-way by itself: `<input value={name}/>`, where
+- What a person changes in the page is two-way by itself *(since 0.7)*: `<input value={name}/>`, where
   `name` is the component's state and nothing on the input sets it, keeps the input and
   `name` in step, typing included. The same for each thing a person can change:
 
@@ -1210,6 +1213,13 @@ route GET / = <html><body><Counter start={5}/></body></html>
   - it is a radio (unticking one fires no event, so each cannot follow a state of its
     own: give the group one state and `checked={size == "s"}`), or a `<select multiple>`.
 
+  `quillo check` warns of an input whose value is a parameter (a view's, or a component's
+  prop) or a state's field (`value={form.name}`) when nothing on it takes what is typed: no
+  handler, no `bind:`, no `name=` for a form sent to a route, not `readonly` or `disabled`.
+  The input would show the typed text while the program kept what it had: "typing here
+  changes nothing: `v` is `Field`'s parameter, which `value=` only shows". Pass the state's
+  own input down, give the field a state of its own, or take what changes with `@input`.
+
   `value` on a checkbox, radio, file or button input is not what a person changes, and
   stays an attribute.
 - `bind:x={y}` says the same in so many words, for any attribute in the table, and also
@@ -1233,7 +1243,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
 
   The handler takes four characters; a fifth is typed, not taken, and undone, so the
   input still shows `1234`.
-- `style={...}` takes text or a map of properties: `style={{ color: tone, font_size:
+- `style={...}` takes text or a map of properties *(since 0.7)*: `style={{ color: tone, font_size:
   "2rem", marginTop: "3px", "--gap": "4px" }}`, where `_` and camelCase are written as
   `-` (`font-size`, `margin-top`), a custom property is kept as it is, and a `null` or
   `false` value is left out; the same on the server and in the browser.
@@ -1303,10 +1313,10 @@ route GET / = <html><body><Counter start={5}/></body></html>
 
   Start counts in tenths of a second; Stop ends the `every`, as the `if` that called it no
   longer stands.
-- `run_after(ms, f)` calls `f` once, `ms` milliseconds on, unless its component has gone
+- `run_after(ms, f)` *(since 0.7)* calls `f` once, `ms` milliseconds on, unless its component has gone
   first: from a handler, `@mount` or the component's code alike. There is no
   `setTimeout`; a debounce or a throttle is an `every` under a state flag that the tick
-  turns off. `page_updated()` in a handler waits until the page shows what the handler
+  turns off. `page_updated()` *(since 0.7)* in a handler waits until the page shows what the handler
   has set so far, to read or focus what that made appear (FEEDBACK28.md, Q-349).
   `listen(url, f)` follows a stream the same way (see [Streaming](#streaming)), and opens
   it again when the connection drops (after a second, doubling up to 30 s), not when the
@@ -1585,7 +1595,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
 
 Views and components nest like HTML: a capitalized tag renders another view or
 component, its attributes are the props, and what is between the tags arrives as the
-`children` parameter, or `null` for a tag with nothing between (`<Card title="x"/>`),
+`children` parameter, or `null` for a tag with nothing between *(since 0.7)* (`<Card title="x"/>`),
 on the server as in the browser, so `children == null` tells the two apart (FEEDBACK28.md,
 Q-345), and `quillo check` warns on `str(children)`, which is `"null"` then. A component is used by its tag: called as a function (`let make = Dead`, then
 `make()`, or given to `map`) it would show and never answer, so it is an error, and `quillo
@@ -1666,7 +1676,7 @@ component Dashboard() {
 ### JavaScript libraries
 
 A component can hand an element to a library (a chart, a map, an editor) and call into
-it. Name the library on a line that starts with `client`, then call it as JavaScript does:
+it. Name the library on a line that starts with `client` *(since 0.7)*, then call it as JavaScript does:
 
 ```quillo
 client "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" use Chart
@@ -1720,7 +1730,7 @@ route GET / = <html><body><Sales points={load_points()}/></body></html>
   name or password in it: browsers do not load those, and the page would show it.
 - A page loads a library late: when the browser is idle, or at the first touch of a
   component that only answers clicks. To get ready for it sooner, start the line with
-  `preload` or `preconnect` in place of `client`:
+  `preload` or `preconnect` in place of `client` *(since 0.7)*:
 
   ```quillo
   preload "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" use Chart
@@ -1855,10 +1865,10 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   while the server renders, so a component that shows it in its markup is made again in
   the browser; `quillo check` warns of it: write `state w = js(...)`, which runs again
   in the browser (below).
-- `js_has("navigator.vibrate")` says whether the page has a feature without calling it,
+- `js_has("navigator.vibrate")` *(since 0.7)* says whether the page has a feature without calling it,
   as `js(...)` would; `false` on the server (Q-341). A field's `selectionStart` counts
   UTF-16 units, as JavaScript does, and `slice`, `len` and `s[i]` count characters:
-  `cursor_index(text, el.selectionStart)` turns the one into the other (Q-344).
+  `cursor_index(text, el.selectionStart)` *(since 0.7)* turns the one into the other (Q-344).
 - A `state` initializer that reads the page (`state wide = js("window.innerWidth") > 800`)
   gives null while the server renders the component, and runs again in the browser
   once the component is on the page, which sets the state from what it gives. An
@@ -2851,7 +2861,7 @@ routes /reports | signed_in with db {               // what its routes may do, a
   routes: `quillo docs` lists them by their whole path.
 - **Back where they were.** The login page sends the visitor on to `next` once signed in.
   `next` came in the address, so anyone can write a link whose `next` is another site:
-  `local_path(next)` gives `next` when it is an address on this site as a browser reads it
+  `local_path(next)` *(since 0.7)* gives `next` when it is an address on this site as a browser reads it
   (tabs and line breaks dropped, `\` read as `/`), else null. `//evil.example`,
   `/\evil.example`, `https://...` and `javascript:...` are null. It works on both sides.
 
@@ -3178,8 +3188,8 @@ fn touch() {
 | `respond(status, body, headers)` | exactly that |
 | `redirect(url, status = 303)` | a redirect |
 | `file(path, { cache })` | a file under the program's folder (see [Static files](#static-files)) |
-| `files(folder, path, options)` | a folder of files, as a static host serves it (see [Static files](#static-files)) |
-| `markdown_page(text, { title, lang, html })` | Markdown as a whole page: a doctype, a `<head>` with the title (the option's, else the first `#` heading), and the HTML |
+| `files(folder, path, options)` *(since 0.7)* | a folder of files, as a static host serves it (see [Static files](#static-files)) |
+| `markdown_page(text, { title, lang, html })` *(since 0.7)* | Markdown as a whole page: a doctype, a `<head>` with the title (the option's, else the first `#` heading), and the HTML |
 | `stream(f, { type, status, headers })` | sent as `f` makes it (see [Streaming](#streaming)) |
 | `events(f, { status, headers })` | Server-Sent Events, as `f` sends them |
 | a runtime error | 500 `text/plain`, `internal error` |
@@ -3216,7 +3226,7 @@ fn touch() {
   (it called `session()` or `cookie()`, or set a cookie) carries `cache-control:
   private` and `vary: cookie`, unless the route set its own `cache-control`, so a shared
   cache never gives one visitor's page to another.
-- `site_headers(map)` at the top level adds headers to every answer that does not set
+- `site_headers(map)` *(since 0.7)* at the top level adds headers to every answer that does not set
   them itself, and `site_headers("/admin", map)` to those under a path; a longer path's
   rule wins over a shorter one's. A `null` value takes away one Quillo sends. Names are
   checked, and values are one line; `content-length`, `transfer-encoding`, `connection`,
@@ -4401,7 +4411,7 @@ When a service runs elsewhere, its calls are made to hold up:
     refuses, cannot work and is given up on at once. A call given up on stays in
     `_quillo_later` with `tries` -1 and why in `error`, is counted by `--metrics`, and goes
     again with `update _quillo_later set at = 0, tries = 0 where tries < 0`.
-  - **Asking after one.** `later.status(id)` gives `{ state: "waiting", tries, error }`,
+  - **Asking after one.** `later.status(id)` *(since 0.7)* gives `{ state: "waiting", tries, error }`,
     `{ state: "done", result }`, `{ state: "failed", error }`, or `null` if nothing is
     known of it: a call done over a day ago, kept in memory and done, or made in a
     transaction not committed yet. `result` is what the function gave, an error value
@@ -4420,7 +4430,7 @@ See [services](https://github.com/quillolang/examples/tree/main/services): a sho
 A call signed with `QUILLO_SERVICE_SECRET` proves one thing: the caller holds the secret.
 Every service holding it can sign as any other, call any function of any service, and name
 any tenant, so the most exposed service in a system holds the key to all the others. A
-caller can prove more than that, and a service can say whom it takes calls from.
+caller can prove more than that, and a service can say whom it takes calls from *(since 0.7)*.
 
 The caller says how it proves who it is, where it declares the service:
 
@@ -4620,7 +4630,7 @@ it on in production.
 
 #### Calling another Quillo site
 
-`site shop = "https://shop.example.com"` names a deployed Quillo site, and `shop.notes(a,
+*(since 0.7)* `site shop = "https://shop.example.com"` names a deployed Quillo site, and `shop.notes(a,
 b)` calls its `server fn notes` as the site's own pages do: `POST
 <url>/_quillo/rpc/notes` with the arguments as a JSON array. It gives the answer's value,
 the site's error as an error value, or an error value when the site cannot be reached.
@@ -4811,7 +4821,7 @@ stays the simpler choice when the next move depends on the answer.
 - **Strings:** `upper lower trim split join contains starts_with ends_with replace slice repeat index_of normalize`
   (`upper` and `lower` know all of Unicode: `"straße"` is `"STRASSE"`; `replace`
   replaces every occurrence of plain text, not a pattern; regular expressions are `re`,
-  below). `normalize(s, form)` gives one Unicode form of the text, `"NFC"` unless
+  below). `normalize(s, form)` *(since 0.7)* gives one Unicode form of the text, `"NFC"` unless
   `"NFD"`, `"NFKC"` or `"NFKD"` is given, on both sides: an `é` typed as one character and
   one typed as `e` and an accent are two texts until normalized. Compare emails and user
   names normalized, and user names in `"NFKC"`, which also makes `ﬁ` `fi` and a
@@ -4822,7 +4832,7 @@ stays the simpler choice when the next move depends on the answer.
   match and `$`, or a function given the match) and `re.split`. A match is
   `{ text, start, end, groups, named }`, positions counting characters as `slice` does.
   Flags come last: `"i"` (any case), `"m"` (`^` and `$` at each line) and `"s"` (`.`
-  matches line breaks too). `re.valid(p, flags)` asks whether a pattern can be run, for
+  matches line breaks too). `re.valid(p, flags)` *(since 0.7)* asks whether a pattern can be run, for
   one from data. They give the same answers on the server and in the browser, but for
   groups in a loop (`(?:(a)|b)*` on `ab`, where the server keeps the group's last match and
   the browser clears `(a)` on each round: the two engines cannot be made the same, and
@@ -4876,7 +4886,7 @@ stays the simpler choice when the next move depends on the answer.
   `tenant`, `tenant_from`, `with_tenant`, `platform` (below), and in components `url`, `navigate`, `every`,
   `ask`, `notify`, `js`, `js_new`, `live`, `waiting`, `publish`, `watch`, `unwatched`: each is
   described where it is used.
-- **Where the program runs:** `platform()` gives a map: `os` (`"ios"`, `"android"`,
+- **Where the program runs:** `platform()` *(since 0.7)* gives a map: `os` (`"ios"`, `"android"`,
   `"macos"`, `"linux"`, `"windows"`), `os_name` and `os_version` (`"iOS"`, `"27.0"`), `kernel`,
   `device` (`"phone"`, `"tablet"`, `"desktop"` in `quillo app`, `"server"`), `model` (the
   hardware's identifier: `"iPhone19,2"`, `"Mac17,2"`), `arch`, `cpus`, `simulator`, `runtime`
@@ -5114,7 +5124,7 @@ caught: Quillo does not use Linux's `openat2`.
 ### Files of a program
 
 `use lib/forum.qwe` brings another file into the program, and its names into this file.
-`import` takes some of them. A file sees its own names, the builtins, and what it takes:
+`import` *(since 0.7)* takes some of them. A file sees its own names, the builtins, and what it takes:
 
 ```quillo
 // ui/thread.qwe
@@ -5147,7 +5157,7 @@ turns it around. A later release removes it.
 - A `use` is for the file that writes it, and is not passed on: when `lib/a.qwe` `use`s
   `lib/b.qwe`, a file that `use`s `lib/a.qwe` sees `a`'s names and not `b`'s. The order
   of `use` lines does not matter, and files may `use` each other.
-- **For now a name the file did not take still works, with a warning**: "`price` comes
+- **For now a name the file did not take still works, with a warning** *(since 0.7)*: "`price` comes
   from lib/money.qwe, which this file does not take: add `import lib/money.qwe use
   price`". `quillo fix main.qwe` writes those lines, in every file of the program
   (run it once for each program, a service's or a mounted one's too). A later release
@@ -5413,7 +5423,7 @@ math.comb(52, 5)  math.log(8, 2)  math.fsum(xs)  math.isclose(a, b)  math.pi
   gamma lgamma`, and `pi e tau inf nan`. What Python raises is an error here too: a math
   domain error (`math.sqrt(-1)`, `math.log(0)`), a range error (`math.exp(1000)`), an int
   past 64 bits (`math.factorial(21)`).
-- **`bit`:** `and(a, b) or(a, b) xor(a, b) not(a) shl(a, n) shr(a, n)`, on the 64 bits of
+- **`bit`:** *(since 0.7)* `and(a, b) or(a, b) xor(a, b) not(a) shl(a, n) shr(a, n)`, on the 64 bits of
   an int, with the same answers in the browser (where JavaScript's own `&` and `<<` keep
   32). `shl` drops what goes past the top, unlike `*`, which refuses; `shr` keeps the
   sign, and `bit.and` masks it off: `bit.and(bit.shr(x, 8), 0xFF)`. A shift outside 0 to
@@ -5516,11 +5526,11 @@ date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or a
 - **Milliseconds:** `date.ms(t)` is a date-time (or a date, at its midnight in UTC) as
   milliseconds since 1970, what `now()` gives, and `date.from_ms(ms, tz)` a time kept that
   way as a date-time (to the second): `date.from_ms(now(), "Europe/Lisbon")`.
-- **Comparing:** `date.compare(a, b)` is -1, 0 or 1 by the instants, fractions of a
+- **Comparing:** `date.compare(a, b)` *(since 0.7)* is -1, 0 or 1 by the instants, fractions of a
   second included, a date counting as its midnight in UTC: the safe way to order or
   compare date-times written differently, `sort_by(xs, (x) => date.ms(x.at))` the way
   to sort them.
-- **Time zones:** `date.valid_zone(z)` asks whether a zone exists, for one a person typed;
+- **Time zones:** `date.valid_zone(z)` *(since 0.7)* asks whether a zone exists, for one a person typed;
   a zone it does not know stops the call, so `date.to_zone(t, z) ?? t` guards it too.
   `date.to_zone(t, tz)` is the same instant at the zone's offset then
   (daylight saving included), a fraction of a second that is all zeros dropped (`.000Z`
@@ -5648,7 +5658,7 @@ runs in, and `quillo run` says which file it opened when it starts
 SQLite file's path. SQL Server, Oracle and the rest are reached through Rust (see
 [Other stores](#other-stores)).
 
-**Many rows at once: `db.exec_many(sql, rows)`.** It runs the statement for each row, a
+**Many rows at once: `db.exec_many(sql, rows)`.** *(since 0.7)* It runs the statement for each row, a
 list of its `?` values, and gives `{ changes }`, the rows changed in all. It is all or
 none: it runs in a transaction of its own, or as a savepoint of the one it is in, so a row
 that fails (a duplicate key) leaves the table as it was, and gives the error. An empty
@@ -5954,7 +5964,7 @@ db.transaction(() => {
   page reading through one connection hears a write made through another. (Another
   user or other options on a server URL is another pool, with the same topics.)
 - **Names for this database.** `analytics.sql_name(col)` quotes a name as that database
-  reads it, `` `col` `` on MySQL, `"col"` elsewhere; `db.sql_name(col)` does the same for
+  reads it, `` `col` `` on MySQL, `"col"` elsewhere; `db.sql_name(col)` *(since 0.7)* does the same for
   the program's database. Plain `sql_name` quotes for the program's database only, so a
   program with MySQL beside SQLite or PostgreSQL uses the connection's: MySQL reads
   `"title"` as text, and `select "title" from items` gives the word `title` in every row.
@@ -6133,7 +6143,7 @@ Sent `acme`, the form makes `data/acme.db` (with `migrations/`'s tables) and goe
 - `db.tenants()` lists the SQLite files, the PostgreSQL schemas or the MySQL databases
   there are; for `postgres://host/app_{tenant}`, and for a function, it is an error:
   keep the list yourself.
-- `new_tenant(name, f)` is for signing up: it makes the tenant's database, migrates it and
+- `new_tenant(name, f)` *(since 0.7)* is for signing up: it makes the tenant's database, migrates it and
   runs `f` for it, or gives an error when that tenant exists, so a second signup for one
   name cannot land in a customer's data. It is one step on the database, so of two signups
   at once one makes it. Names such as `www` and `admin` are the program's to refuse.
@@ -6663,7 +6673,7 @@ quillo> db.query("select * from notes")
 
 A program with no routes is a script: `quillo run tool.qwe` runs it from the top and ends.
 What follows `--` is its arguments, `args()`; `stdin()` is all that is piped in, and
-`read_line()` the next line, `null` at the end; `exit(n)` ends it with status `n`. A script
+`read_line()` the next line, `null` at the end; `exit(n)` ends it with status `n` *(since 0.7)*. A script
 that ends by itself ends with 0, and one that fails (a stop, or an error a `?` at the top
 passes on) with 1, saying what it was. Files are the program's folder's, as for a server;
 [`--allow-path DIR`](#options-of-quillo-run), given when the script is started
@@ -6775,7 +6785,7 @@ or a widget's `function run()` and Quillo's leave each other alone (FEEDBACK42.m
 
 #### For developer tools
 
-A browser extension or a test can follow what the runtime does, without the debugger. It
+*(since 0.7)* A browser extension or a test can follow what the runtime does, without the debugger. It
 asks by setting `data-quillo-devtools="1"` on `<html>` before the runtime starts (a content
 script at `document_start`, or the page itself); a page that does not ask does nothing
 more. The runtime then says what happens as `quillo:devtools` events on `document`, each
@@ -6896,7 +6906,7 @@ It is off by default, since anyone who can reach the server could read it.
 ### The policy
 
 `with` limits what a function may do, from inside the program. A policy limits what the
-whole program may do, from outside it: the host's, for every program on a server, and
+whole program may do, from outside it *(since 0.7)*: the host's, for every program on a server, and
 the site owner's, for one deploy. Policies are small TOML files, read as the program
 starts, by `quillo run`, `quillo fcgi` and `quillo check`:
 
@@ -6981,7 +6991,7 @@ main.qwe:6: error: `udp.listen` needs the net effect, which host.toml does not a
 
 ### Quillo on a shared server (cPanel)
 
-A shared hosting account (cPanel, often on CloudLinux, with Apache or LiteSpeed in
+*(since 0.7)* A shared hosting account (cPanel, often on CloudLinux, with Apache or LiteSpeed in
 front) gives a folder, a web server the host runs, and no root. It differs from a server
 of one's own in three ways that matter to Quillo:
 
@@ -7167,7 +7177,7 @@ round, written about 5, where the interpreter takes 45 (FEEDBACK29.md).
 
 ## Rust
 
-A `.qwer` or `.rs` file is Rust, and a program `use`s it as it uses a `.qwe` file: its
+A `.qwer` or `.rs` *(since 0.7)* file is Rust, and a program `use`s it as it uses a `.qwe` file: its
 top-level `pub fn`s are the program's functions. The two extensions are the same to
 Quillo: `.rs` is the one editors, `rustfmt` and clippy know, and `.qwer` is the catalog's
 and `quillo install`'s. A `.rs` file is the program's only when a `use` or `import` names
@@ -7216,7 +7226,10 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   `use`. A `pub fn` that is generic (a written lifetime counts: `fn f<'a>`), `async`,
   takes `&mut`, or has a type that cannot cross, as a fixed-size array cannot, is not
   exported, and `quillo check` says why. Another crate's type named `Value` passes the
-  check and fails the build.
+  check and fails the build. A signature may name what the file's own `use` lines bring
+  in: after `use serde_json::Value;` and `use std::collections::HashMap;`, `pub fn
+  role(auth: Value)` and `pub fn total(m: HashMap<String, i64>)` build as written in
+  full do.
 - The `//! [dependencies]` lines are the file's crates, as in `Cargo.toml`: any crate
   from crates.io or git. They come first, after other `//!` lines if any; the first line
   that is not `//!` ends them. Only that table is read (no `[features]` table, no
@@ -7272,7 +7285,7 @@ How it runs:
   the same processor and system (there is no cross-compiling: build on Linux for
   Linux), by the same Quillo glue. A Quillo whose glue changed builds again, and needs
   cargo then.
-- **`.quillo/plugins.lock`**, beside `.quillo/native/`, holds each library's file name
+- **`.quillo/plugins.lock`** *(since 0.7)*, beside `.quillo/native/`, holds each library's file name
   and SHA-256, a line each, written by every build: `quillo build`, a `use` that built,
   [`--watch`](#options-of-quillo-run). Deploy it with `.quillo/native/`. A library is loaded only when it is the one
   built: one whose hash differs, or that has no line, is built again where cargo may run

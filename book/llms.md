@@ -5,6 +5,10 @@
 > built-in SQLite. There is no package file, no build step and no JavaScript to write.
 > `quillo run` serves the program; `quillo check` checks it without running it.
 
+Features marked *(since 0.7)* are in main and the next release, not in 0.6.0. On 0.6.0,
+read https://github.com/quillolang/quillo/blob/v0.6.0/USERGUIDE.md and
+https://quillolang.org/v0.6.0/llms.txt instead.
+
 This file is for AI coding assistants. Quillo is new, so what you know from other
 languages will lead you wrong in a few places, listed below. Rules for working on a
 Quillo program:
@@ -13,7 +17,7 @@ Quillo program:
   main.qwe`). It finds syntax errors, wrong types, misspelled fields, missing `import`s,
   JavaScript habits that mean something else here, and markup the browser would break.
   Fix what it says before you go on.
-- `quillo fix` writes the `import` lines a program's files need.
+- `quillo fix` *(since 0.7)* writes the `import` lines a program's files need.
 - `quillo run --watch` serves at http://127.0.0.1:8080 and reloads on each save.
 - Do not invent builtins. The list is at the end of this file and in
   https://quillolang.org/docs/standard-library/. When unsure, `quillo repl` answers
@@ -29,9 +33,9 @@ Quillo program:
 | `lib/*.qwe`, `ui/*.qwe` | its parts, by convention: helpers and server fns; views and components |
 | `migrations/NNN_name.sql` | the database's tables, run once each, in order, by `db.migrate("migrations")` |
 | `public/` | files served as they are (with a route: `route GET /assets/*path = file("public/" + path)`) |
-| `*.qwer`, `*.rs` | Rust a program `use`s (`quillo install <name>` fetches a `.qwer` plugin from quillolang.org/plugins) |
+| `*.qwer`, `*.rs` *(since 0.7)* | Rust a program `use`s (`quillo install <name>` fetches a `.qwer` plugin from quillolang.org/plugins) |
 
-`quillo new my-app` makes a program to start from (`--minimal` for a page and a
+`quillo new my-app` *(since 0.7)* makes a program to start from (`--minimal` for a page and a
 component).
 
 ## The language in one screen
@@ -67,7 +71,7 @@ let kind = match user {
 - `==` compares deeply and converts nothing: `1 == "1"` is false, `[1, 2] == [1, 2]` is
   true.
 - Only `null`, `false` and error values are falsy. **`0` and `""` are truthy**, so
-  `name || "anonymous"` keeps an empty name: write `filled(name) ?? "anonymous"`, and
+  `name || "anonymous"` keeps an empty name: write `filled(name) ?? "anonymous"` *(since 0.7)*, and
   `count != 0 && <Badge/>`, not `count && <Badge/>`.
 - `/` is exact: `7 / 2` is `3.5`, `6 / 2` is `3`; `floor(7 / 2)` divides whole numbers.
   Ints are 64-bit and overflow is an error, never a wrap.
@@ -88,12 +92,12 @@ let kind = match user {
 | `break`, `continue` | `return` to leave; `filter` first to skip items |
 | `1 < x < 3` | `1 < x && x < 3` |
 | `x?.y` | `x.y` (a field of null is null) |
-| `===`, `**`, `++`, `*=`, `/=`, bitwise `& \| ^ << >>` | `==`, `pow(a, b)`, `x += 1`, `x = x * 2`, `bit.*` (`\|` is the pipe) |
+| `===`, `**`, `++`, `*=`, `/=`, bitwise `& \| ^ << >>` | `==`, `pow(a, b)`, `x += 1`, `x = x * 2`, `bit.*` *(since 0.7)* (`\|` is the pipe) |
 | `and`, `or`, `not`, `if c then a else b` | `&&`, `\|\|`, `!`, `c ? a : b` or `if c { a } else { b }` |
 | `/regex/` literals | strings to `re.*`: `re.find_all(s, "@(\\w+)")` |
 | `yield`, generators | return a list |
 | `<>...</>` fragments | one element around the others |
-| `className` | `class` (`onclick={...}` and `@click={...}` are both a handler) |
+| `className` | `class` (`onclick={...}` *(since 0.7)* and `@click={...}` are both a handler) |
 | `m.name = v` | `m = { ...m, name: v }` (inside a component it sets an element's property) |
 
 Builtins are free functions that take the list, map or string first:
@@ -166,7 +170,7 @@ import lib/notes.qwe use load_notes, add_note
 
 - Paths count from the main file's folder, in every file: `use "lib/x.qwe"` in
   `ui/a.qwe`, never `"../lib/x.qwe"`.
-- A file that calls a name from another file takes it: `import path use name`, or the
+- A file that calls a name from another file takes it: `import path use name` *(since 0.7)*, or the
   whole file with `use "path"`. `quillo fix` writes these lines for you.
 - Start each file with a comment saying what it holds.
 
@@ -223,7 +227,7 @@ route GET / = <html><body><Card title="Hi"><Counter start={5}/></Card></body></h
 - A `view` is made on the server only. A `component` is made on the server and resumes in
   the browser; nothing else on the page needs JavaScript.
 - Events are `@click`, `@submit`, `@input`, `@change` (or `onclick` and the rest): a
-  lambda. What a person changes is two-way by itself when it shows a state:
+  lambda. What a person changes is two-way by itself when it shows a state *(since 0.7)*:
   `<input value={draft}/>`, `checked={done}`, `<details open={more}>`, a player's
   `volume={v}`. A handler of the input's own, or `readonly`, keeps it one way.
 - `style css`...`` at the start of a component's body is CSS for its elements only.
@@ -280,7 +284,7 @@ db.transaction(() => {
 - A row is a map: `select a.id, b.id` leaves one `id`, so name columns apart with `as`.
 - `with db` on a function says it uses the database; a function with `with` may do only
   what it declares (`db`, `http`, `fs`, `env`, `time`, `random`, `net`). Routes and
-  route groups take it too, before the body: `route GET /report with db = ...`,
+  route groups take it too *(since 0.7)*, before the body: `route GET /report with db = ...`,
   `routes /admin | signed_in with db { ... }`.
 
 ## Before you finish

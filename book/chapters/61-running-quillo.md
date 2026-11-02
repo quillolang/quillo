@@ -14,6 +14,9 @@ cargo build --release
 cargo test
 ```
 
+Features marked *(since 0.7)* are in main and the next release, not in 0.6.0. On 0.6.0,
+read the guide at https://github.com/quillolang/quillo/blob/v0.6.0/USERGUIDE.md instead.
+
 ## Options of `quillo run`
 
 `quillo run` checks the program, executes its top level and, if it declared routes or
@@ -39,27 +42,27 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | Option | What it does, and when to give it |
 |---|---|
 | `--port N`, `--host H` | where to listen (default `$PORT` or 8080, on 127.0.0.1). Give `--port` when 8080 is taken or a host names the port; `--port 0` takes any free one (`platform().server.port` says which). Give `--host 0.0.0.0` to be reached from other machines without a proxy in front; `--host localhost` is 127.0.0.1 |
-| `--listen unix:PATH` | listen on a Unix socket instead of a TCP port, when a web server on the same machine passes requests on (on a shared server, so the neighbours cannot reach the port): made with mode 0600, removed when the server stops, and at most 100 bytes long (a short path relative to the folder `quillo` runs in). A `$PORT` that holds an absolute path (`/home/u/app.sock`, or `unix:/home/u/app.sock`) is taken the same way. Not with `--split`, `--instances`, `--register` or `--join` (see [Quillo on a shared server](#quillo-on-a-shared-server-cpanel)) |
-| `--socket-mode 660` | with `--listen`: the socket's permissions, in octal, when the web server reaches it through the owner's group; the owner must keep read and write (`600`, the default) |
+| `--listen unix:PATH` *(since 0.7)* | listen on a Unix socket instead of a TCP port, when a web server on the same machine passes requests on (on a shared server, so the neighbours cannot reach the port): made with mode 0600, removed when the server stops, and at most 100 bytes long (a short path relative to the folder `quillo` runs in). A `$PORT` that holds an absolute path (`/home/u/app.sock`, or `unix:/home/u/app.sock`) is taken the same way. Not with `--split`, `--instances`, `--register` or `--join` (see [Quillo on a shared server](#quillo-on-a-shared-server-cpanel)) |
+| `--socket-mode 660` *(since 0.7)* | with `--listen`: the socket's permissions, in octal, when the web server reaches it through the owner's group; the owner must keep read and write (`600`, the default) |
 | `--watch`, `-w` | while you work on the program: reload when it or a `use`d file changes (a symbolic link pointed elsewhere, to a file or a folder, counts, within a second), show errors on the page, and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's). Not in production |
 | `--reload` | in production, for a program whose files change while it runs (a deploy that copies new files, a plugin editor): reload when files change, with no errors shown on pages and no page refreshes |
 | `--env-file F` | when the settings are not in the `.env` beside the program: a file kept outside the site's folder, or one file per place (`--env-file prod.env`); a path from the folder `quillo` runs in, which must exist |
-| `--policy FILE` | before a deploy, or on a server you share: narrow what the program may do, after `/etc/quillo/policy.toml` and before the `quillo.policy` beside it; may be given more than once (see [The policy](#the-policy)) |
-| `--no-build` | on a server with no Rust, or one that must never run cargo: load only libraries `quillo build` made, as `.quillo/plugins.lock` names them (see [Rust](#rust)) |
+| `--policy FILE` *(since 0.7)* | before a deploy, or on a server you share: narrow what the program may do, after `/etc/quillo/policy.toml` and before the `quillo.policy` beside it; may be given more than once (see [The policy](#the-policy)) |
+| `--no-build` *(since 0.7)* | on a server with no Rust, or one that must never run cargo: load only libraries `quillo build` made, as `.quillo/plugins.lock` names them (see [Rust](#rust)) |
 | `--no-check` | when the program is known to check (a deploy that ran `quillo check` already) and starting must be quick: skip the static checks |
 | `--max-body N` | when visitors send larger files or bodies than 10MB: the largest request body to accept, a size such as `50MB` (`KB`, `MB` and `GB`, in any case, are 1024-based) or bytes; default 10MB; a larger body gets 413 (see [Uploads](#uploads)) |
-| `--max-compute 2s` | when a request that computes for long must not hold up the others: end one that computes this long without letting go, as a 500 (see [Concurrency](#concurrency-and-reloading)) |
+| `--max-compute 2s` *(since 0.7)* | when a request that computes for long must not hold up the others: end one that computes this long without letting go, as a 500 (see [Concurrency](#concurrency-and-reloading)) |
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64). Give fewer where an account limits its threads (shared hosting), more for many slow calls at once |
 | `--instances N` | to use N cores on one machine: run the program N times over, one event loop each, each with its own variables (see [Concurrency](#concurrency-and-reloading)); not with `--watch`, `--register` or `--split`; more than the machine's cores is warned of |
-| `--trust-proxy 10.0.0.0/8` | when a proxy (limer, nginx, Apache) is in front: believe `X-Forwarded-For` from these addresses, so `request.ip` and the limits per client are the visitor's (see [Live data](#live-data)) |
-| `--live-per-client N` | when one address is many visitors (an office behind one address): the pages one client may have waiting for live data (default 256) |
+| `--trust-proxy 10.0.0.0/8` *(since 0.7)* | when a proxy (limer, nginx, Apache) is in front: believe `X-Forwarded-For` from these addresses, so `request.ip` and the limits per client are the visitor's (see [Live data](#live-data)) |
+| `--live-per-client N` *(since 0.7)* | when one address is many visitors (an office behind one address): the pages one client may have waiting for live data (default 256) |
 | `--plain-http` | when the site is served over plain HTTP on purpose, on a network you trust (a factory's kiosks at `http://10.0.0.5:8080`): cookies are not `Secure`, which browsers would drop there (see [Cookies and sessions](#cookies-and-sessions)) |
-| `--allow-path DIR` | when a script used as a tool must read or write files outside its folder, or a deploy links a folder from elsewhere (`uploads -> /srv/shared/uploads`): `read_file` and `write_file` may use `DIR` too; any part of the program may then, routes too (see [Paths and links](#paths-and-links)) |
-| `-- a b` | for a script: after the program, what follows is the program's, and `args()` gives `["a", "b"]`; before it, `--` ends the options (`quillo run -- a.qwe x`). A stray word elsewhere is told it goes after `--` (see [Scripts as tools](#scripts-as-tools)) |
+| `--allow-path DIR` *(since 0.7)* | when a script used as a tool must read or write files outside its folder, or a deploy links a folder from elsewhere (`uploads -> /srv/shared/uploads`): `read_file` and `write_file` may use `DIR` too; any part of the program may then, routes too (see [Paths and links](#paths-and-links)) |
+| `-- a b` *(since 0.7)* | for a script: after the program, what follows is the program's, and `args()` gives `["a", "b"]`; before it, `--` ends the options (`quillo run -- a.qwe x`). A stray word elsewhere is told it goes after `--` (see [Scripts as tools](#scripts-as-tools)) |
 | `--with CMD` | when a tool must run beside the program while you work (Tailwind's watcher): run a command (through `sh -c`, in its folder), its lines marked with its name, stopped with it however it ends, a Ctrl-C or `SIGTERM` while it loads, a panic and a `SIGKILL` too (more than once for several): `--with "npx tailwindcss -i src/app.css -o public/app.css --watch"` |
 | `--log F` | the request log on stderr: `text` (the default), `json` (one object per line) for a log collector, or `off` when another layer logs requests (see [Logs and metrics](#logs-and-metrics)) |
 | `--metrics` | when Prometheus (or another scraper) should read the server: answer `GET /_quillo/metrics` (see [Logs and metrics](#logs-and-metrics)) |
-| `--query-stats` | to find slow queries on a running server: time database queries for `GET /_quillo/health/queries`, the last 100, overall and per statement (on under `--watch`; see [Stopping and health](#stopping-and-health)) |
+| `--query-stats` *(since 0.7)* | to find slow queries on a running server: time database queries for `GET /_quillo/health/queries`, the last 100, overall and per statement (on under `--watch`; see [Stopping and health](#stopping-and-health)) |
 | `--describe` | when a gateway imports the program's API: answer `GET /_quillo/describe` with it, as `quillo docs` writes it (see [The program's API](#the-programs-api-openapi)) |
 | `--no-view-cache` | to measure, or to rule the cache out while looking for a bug: render views every time (see [Cached views](#cached-views)) |
 | `--no-jobs` | on all but one of several servers that do not share a database, or on a copy that must not run them: run none of the program's scheduled jobs here (see [Scheduled jobs](#scheduled-jobs)) |
@@ -71,8 +74,8 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | `--as-service` | to run a service on a machine of its own: serve the program as a service, its `server fn`s answering other services' signed calls, not pages (see [Services](#services)) |
 | `--service-name NAME` | with `--as-service`, when the file is not named as callers call the service: the name it answers to; calls signed for another service are refused |
 | `--join URL` | with `--as-service` and a `--port`, to add a copy of a service while the app runs: join the app at URL, signed with `QUILLO_SERVICE_KEY` when it is set (see [Copies that join](#copies-that-join)) |
-| `--join-as URL` | with `--join`, when the app must call the copy at another address than the one it connects from (`https://billing-3.internal:8443`); it must lead to where the copy joined from |
-| `--no-join`, `--allow-join A,B` | on the app, to take no copies that join, or only copies of these services |
+| `--join-as URL` *(since 0.7)* | with `--join`, when the app must call the copy at another address than the one it connects from (`https://billing-3.internal:8443`); it must lead to where the copy joined from |
+| `--no-join`, `--allow-join A,B` *(since 0.7)* | on the app, to take no copies that join, or only copies of these services |
 | `--register URL`, `--service S` | to run several servers behind limer: join its pool at its admin address (the pool named `S`, else the file's name), and share live updates with its other servers; needs `LIMER_ADMIN_SECRET` (see [Several servers](#several-servers)) |
 | `--wt-port N` | when the UDP port of the HTTP port's number is taken or not open: the UDP port pages connect to over WebTransport (see [Channels](#channels)) |
 | `--tls-cert F`, `--tls-key F` | when WebTransport should present a real certificate, instead of one of its own; the files must exist |
@@ -80,7 +83,7 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 
 ## Other commands
 
-`quillo new <folder>` writes a program to start from. By default it is the to-do app, the
+`quillo new <folder>` *(since 0.7)* writes a program to start from. By default it is the to-do app, the
 eight files of `app/`: a database with a migration, a component, files served.
 `--minimal` writes three: `main.qwe`, `lib/greet.qwe` and `ui/page.qwe`, a page, a
 component and a function both sides use. Both get a `.gitignore` (`*.db`, `*.db-wal`,
@@ -102,11 +105,11 @@ one and for a folder, runs `quillo new` and opens the folder.
 
 The other commands: `quillo check` (below, and [Checking](#checking)), `quillo docs`
 (the API as OpenAPI 3, to stdout; see [Services](#services)), `quillo build` (the Rust
-files; see [Rust](#rust)), `quillo fix` (the `import` lines a program's files need, and 0.6's lines turned around; see
-[Files of a program](#files-of-a-program)), `quillo serve <folder>` (a folder of files as
+files; see [Rust](#rust)), `quillo fix` *(since 0.7)* (the `import` lines a program's files need, and 0.6's lines turned around; see
+[Files of a program](#files-of-a-program)), `quillo serve <folder>` *(since 0.7)* (a folder of files as
 they are, as a static host serves it; see [Static files](#static-files)), `quillo classes
-<file.qwe>` (the classes the program's markup writes, one a line; see [HTML
-literals](#html-literals)), `quillo fcgi <file.qwe>` (the program behind FastCGI, for
+<file.qwe>` *(since 0.7)* (the classes the program's markup writes, one a line; see [HTML
+literals](#html-literals)), `quillo fcgi <file.qwe>` *(since 0.7)* (the program behind FastCGI, for
 `mod_fcgid` or nginx's `fastcgi_pass`; see [Quillo on a shared
 server](#quillo-on-a-shared-server-cpanel)), `quillo repl`, `quillo lsp`, `quillo dap`,
 `quillo version` (or `--version`, `-V`), which names the commit: from a source archive
@@ -134,7 +137,7 @@ Their options, given after the command as `quillo run`'s are:
 | Command and option | What it does, and when to give it |
 |---|---|
 | `quillo check --strict-null` | to find where a value may be null and null does not work (see [Checking](#checking)); `check` only, not `run` |
-| `quillo check --policy FILE` | before a deploy to a server with a policy: check the program as it would run under it (see [The policy](#the-policy)) |
+| `quillo check --policy FILE` *(since 0.7)* | before a deploy to a server with a policy: check the program as it would run under it (see [The policy](#the-policy)) |
 | `quillo new --minimal`, `--binary` | three files instead of the to-do app; a copy of this `quillo` in the new folder, for a machine that has none |
 | `quillo app --open PATH` | the page the window opens on (`/` by default); `app` takes `run`'s options but `--host`, `--register` and `--service` (see [Desktop apps](#desktop-apps)) |
 | `quillo serve <folder>` | `run`'s options, such as `--port` (see [Static files](#static-files)) |
@@ -166,14 +169,14 @@ Everything Quillo reads from the environment:
 |---|---|
 | `PORT` | the port, when [`--port`](#options-of-quillo-run) is not given; an absolute path is a Unix socket to listen on, as [`--listen unix:`](#options-of-quillo-run) |
 | `QUILLO_SECRET` | signs sessions (see [Cookies and sessions](#cookies-and-sessions)); without it, a key made at start |
-| `QUILLO_QUERY_STATS` | `1`: query stats on from the start, as [`--query-stats`](#options-of-quillo-run) |
-| `QUILLO_HEALTH_TOKEN` | lets a request with `Authorization: Bearer <it>` see each statement's query stats and switch them on or off; 16 characters at least |
+| `QUILLO_QUERY_STATS` *(since 0.7)* | `1`: query stats on from the start, as [`--query-stats`](#options-of-quillo-run) |
+| `QUILLO_HEALTH_TOKEN` *(since 0.7)* | lets a request with `Authorization: Bearer <it>` see each statement's query stats and switch them on or off; 16 characters at least |
 | `QUILLO_DB` | the database when the program does not call `db.open`; without it, SQLite in memory, gone at restart |
 | `QUILLO_SYSTEM_DB` | where Quillo's own tables go with a database per tenant (see [Quillo's own tables](#standard-library-quillos-own-tables)) |
 | `QUILLO_SERVICE_SECRET`, `QUILLO_SERVICE_<NAME>` | signs calls between services (several, comma-separated: the first signs, any is taken); where service NAME runs (see [Services](#services)) |
-| `QUILLO_SERVICE_SECRET_PREVIOUS` | a secret still taken while `QUILLO_SERVICE_SECRET` is changed (see [Authentication between services](#authentication-between-services)) |
-| `QUILLO_SERVICE_KEY` | a service's own key: a copy joins with it, and it proves the copy is that service (see [Copies that join](#copies-that-join)) |
-| `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` | the proxy `http.*` calls go through, and the hosts that do not (see [HTTP client](#http-client)) |
+| `QUILLO_SERVICE_SECRET_PREVIOUS` *(since 0.7)* | a secret still taken while `QUILLO_SERVICE_SECRET` is changed (see [Authentication between services](#authentication-between-services)) |
+| `QUILLO_SERVICE_KEY` *(since 0.7)* | a service's own key: a copy joins with it, and it proves the copy is that service (see [Copies that join](#copies-that-join)) |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` *(since 0.7)* | the proxy `http.*` calls go through, and the hosts that do not (see [HTTP client](#http-client)) |
 | `LIMER_ADMIN_SECRET` | for [`--register`](#options-of-quillo-run) (see [Several servers](#several-servers)) |
 | `QUILLO_NATIVE_CACHE`, `CARGO` | where `.qwer` files are built, and with what (see [Rust](#rust)) |
 | `PUBLIC_...` | any such variable may be read in a component (see [What the browser can reach](#what-the-browser-can-reach)) |

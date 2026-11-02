@@ -1582,6 +1582,8 @@ struct Checker {
     /// Unknown names inside a function, said when it ends unless a `let` further down it
     /// defines them, which makes them names used before they are defined (FEEDBACK45.md, Q-524).
     early: Vec<Early>,
+    /// Elements around this one with `@input` or `@change` (Checker::shown_only).
+    input_above: usize,
     /// Each scope's number, and the last given (Checker::push).
     scope_ids: Vec<u64>,
     scope_serial: u64,
@@ -1710,6 +1712,7 @@ impl Checker {
             everywhere: HashSet::new(),
             told: HashSet::new(),
             early: Vec::new(),
+            input_above: 0,
             scope_ids: Vec::new(),
             scope_serial: 0,
             gone: Vec::new(),
@@ -5531,6 +5534,77 @@ impl Checker {
         }
     }
 
+    /// `<input value={v}/>` where `v` is a parameter, or `value={f.name}` a state's field:
+    /// one way, so the input shows what is typed and the program keeps what it had, with
+    /// nothing said (FEEDBACK46.md, Q-532; branch feedback40-43). Not when something takes the
+    /// value (a handler, `bind:`, `name=` for a form sent to a route), nor when nothing can be
+    /// typed (`readonly`, `disabled`), nor when what the element is is decided as it runs. A
+    /// `<details open={p}>` opens by itself: `p` is where it starts.
+    fn shown_only(&mut self, el: &HtmlEl) {
+        // Any handler on the element may take the value (`@blur` saving it, `@mount` wiring
+        // its own listeners), and an `input` or `change` reaches one on an element around it
+        // (found in review).
+        if self.input_above > 0 || el.attrs.iter().any(|(a, v)| a.starts_with('@') || a == "name" || matches!(v, AttrVal::Spread(_))) || el.tag.contains('-') {
+            return;
+        }
+        let set = |n: &str| el.attrs.iter().any(|(a, v)| a == n && !matches!(v, AttrVal::Expr(Expr::Lit(Lit::Bool(false)))));
+        if set("disabled") {
+            return;
+        }
+        let kind = match el.attrs.iter().find(|(a, _)| a == "type") {
+            None => None,
+            Some((_, AttrVal::Expr(Expr::Lit(Lit::Str(t))))) => Some(t.to_ascii_lowercase()),
+            Some(_) => return,
+        };
+        // Only the parameters of the view or component itself: a lambda's or a local fn's are
+        // that function's (found in review).
+        if self.fns.len() != 1 {
+            return;
+        }
+        let Some(owner) = self.fns.first().map(|f| f.name.clone()).filter(|n| n.starts_with(|c: char| c.is_uppercase())) else { return };
+        let multiple = el.attrs.iter().any(|(a, _)| a == "multiple");
+        for (n, v) in &el.attrs {
+            let AttrVal::Expr(x) = v else { continue };
+            // `readonly` holds a text field; a box or a list is still changed (the browser
+            // ignores it there): `disabled` is what holds those.
+            let (verb, holds) = match (el.tag.as_str(), n.as_str()) {
+                ("input", "value") if !matches!(kind.as_deref(), Some("checkbox" | "radio" | "file" | "button" | "submit" | "reset" | "image" | "hidden" | "range" | "color")) => ("typing here", "readonly"),
+                ("input", "value") if matches!(kind.as_deref(), Some("range" | "color")) => ("choosing here", "disabled"),
+                ("textarea", "value") => ("typing here", "readonly"),
+                ("select", "value") if !multiple => ("choosing here", "disabled"),
+                ("input", "checked") if kind.as_deref() == Some("checkbox") => ("ticking this", "disabled"),
+                _ => continue,
+            };
+            if el.attrs.iter().any(|(a, _)| *a == format!("bind:{}", n)) || (holds == "readonly" && set("readonly")) {
+                continue;
+            }
+            // `v ?? ""` shows `v` too.
+            let mut x = x;
+            while let Expr::Coalesce(l, _) = x {
+                x = l;
+            }
+            // The name it starts from: `v`, `user.name`, `form.a.b`.
+            let (mut root, mut path) = (x, Vec::new());
+            while let Expr::Field(o, f, _) = root {
+                path.push(f.clone());
+                root = o;
+            }
+            let Expr::Ident(name, _) = root else { continue };
+            let Some(kind_of) = self.scopes.iter().rev().find_map(|s| s.get(name.as_str())).map(|v| v.kind) else { continue };
+            path.reverse();
+            let shown = std::iter::once(name.to_string()).chain(path.iter().cloned()).collect::<Vec<_>>().join(".");
+            let what = match (kind_of, path.is_empty()) {
+                (Kind::Param, true) => format!("`{}` is `{}`'s parameter, which `{}=` only shows:", shown, owner, n),
+                (Kind::Param, false) => format!("`{}` is a field of `{}`'s parameter `{}`, which `{}=` only shows:", shown, owner, name, n),
+                (Kind::State, false) => format!("`{}` is a field of the state `{}`, which `{}=` only shows; give it a state of its own, or", shown, name, n),
+                _ => continue,
+            };
+            let event = if n == "checked" { "@change" } else { "@input" };
+            self.line = el.line;
+            self.warn(format!("{} changes nothing: {} take what changes with `{}={{(e) => ...}}`, or add `{}`", verb, what, event, holds));
+        }
+    }
+
     fn html(&mut self, el: &HtmlEl) {
         for line in &el.dollars {
             self.line = *line;
@@ -5570,6 +5644,9 @@ impl Checker {
                 self.line = el.line;
                 self.warn(format!("<{}> is no HTML element, and is written to the page as it is: the view is <{}>", el.tag, cap));
             }
+        }
+        if !is_view {
+            self.shown_only(el);
         }
         let mut given: Vec<(String, T)> = Vec::new();
         let mut spread = false;
@@ -5626,6 +5703,11 @@ impl Checker {
             }
             given.push((name.clone(), t));
         }
+        // `<form @input={...}>`: what is typed inside reaches it (Checker::shown_only).
+        let bubbles = el.attrs.iter().any(|(a, _)| a == "@input" || a == "@change");
+        if bubbles {
+            self.input_above += 1;
+        }
         for c in &el.children {
             match c {
                 HtmlChild::El(e) => crate::stack::maybe_grow(256 << 10, 4 << 20, || self.html(e)),
@@ -5672,6 +5754,9 @@ impl Checker {
                     self.expr(x);
                 }
             }
+        }
+        if bubbles {
+            self.input_above -= 1;
         }
         if !is_view {
             return;

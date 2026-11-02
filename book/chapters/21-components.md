@@ -123,7 +123,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   again fires `change`). `@submit` does not reload the page. HTML5 drag and drop
   (`e.dataTransfer`), pointer capture (`e.target.setPointerCapture(e.pointerId)`) and
   SVG markup work as they do in the browser.
-- What a person changes in the page is two-way by itself: `<input value={name}/>`, where
+- What a person changes in the page is two-way by itself *(since 0.7)*: `<input value={name}/>`, where
   `name` is the component's state and nothing on the input sets it, keeps the input and
   `name` in step, typing included. The same for each thing a person can change:
 
@@ -171,6 +171,13 @@ route GET / = <html><body><Counter start={5}/></body></html>
   - it is a radio (unticking one fires no event, so each cannot follow a state of its
     own: give the group one state and `checked={size == "s"}`), or a `<select multiple>`.
 
+  `quillo check` warns of an input whose value is a parameter (a view's, or a component's
+  prop) or a state's field (`value={form.name}`) when nothing on it takes what is typed: no
+  handler, no `bind:`, no `name=` for a form sent to a route, not `readonly` or `disabled`.
+  The input would show the typed text while the program kept what it had: "typing here
+  changes nothing: `v` is `Field`'s parameter, which `value=` only shows". Pass the state's
+  own input down, give the field a state of its own, or take what changes with `@input`.
+
   `value` on a checkbox, radio, file or button input is not what a person changes, and
   stays an attribute.
 - `bind:x={y}` says the same in so many words, for any attribute in the table, and also
@@ -194,7 +201,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
 
   The handler takes four characters; a fifth is typed, not taken, and undone, so the
   input still shows `1234`.
-- `style={...}` takes text or a map of properties: `style={{ color: tone, font_size:
+- `style={...}` takes text or a map of properties *(since 0.7)*: `style={{ color: tone, font_size:
   "2rem", marginTop: "3px", "--gap": "4px" }}`, where `_` and camelCase are written as
   `-` (`font-size`, `margin-top`), a custom property is kept as it is, and a `null` or
   `false` value is left out; the same on the server and in the browser.
@@ -264,10 +271,10 @@ route GET / = <html><body><Counter start={5}/></body></html>
 
   Start counts in tenths of a second; Stop ends the `every`, as the `if` that called it no
   longer stands.
-- `run_after(ms, f)` calls `f` once, `ms` milliseconds on, unless its component has gone
+- `run_after(ms, f)` *(since 0.7)* calls `f` once, `ms` milliseconds on, unless its component has gone
   first: from a handler, `@mount` or the component's code alike. There is no
   `setTimeout`; a debounce or a throttle is an `every` under a state flag that the tick
-  turns off. `page_updated()` in a handler waits until the page shows what the handler
+  turns off. `page_updated()` *(since 0.7)* in a handler waits until the page shows what the handler
   has set so far, to read or focus what that made appear (FEEDBACK28.md, Q-349).
   `listen(url, f)` follows a stream the same way (see [Streaming](#streaming)), and opens
   it again when the connection drops (after a second, doubling up to 30 s), not when the
@@ -546,7 +553,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
 
 Views and components nest like HTML: a capitalized tag renders another view or
 component, its attributes are the props, and what is between the tags arrives as the
-`children` parameter, or `null` for a tag with nothing between (`<Card title="x"/>`),
+`children` parameter, or `null` for a tag with nothing between *(since 0.7)* (`<Card title="x"/>`),
 on the server as in the browser, so `children == null` tells the two apart (FEEDBACK28.md,
 Q-345), and `quillo check` warns on `str(children)`, which is `"null"` then. A component is used by its tag: called as a function (`let make = Dead`, then
 `make()`, or given to `map`) it would show and never answer, so it is an error, and `quillo
@@ -627,7 +634,7 @@ component Dashboard() {
 ## JavaScript libraries
 
 A component can hand an element to a library (a chart, a map, an editor) and call into
-it. Name the library on a line that starts with `client`, then call it as JavaScript does:
+it. Name the library on a line that starts with `client` *(since 0.7)*, then call it as JavaScript does:
 
 ```quillo
 client "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" use Chart
@@ -681,7 +688,7 @@ route GET / = <html><body><Sales points={load_points()}/></body></html>
   name or password in it: browsers do not load those, and the page would show it.
 - A page loads a library late: when the browser is idle, or at the first touch of a
   component that only answers clicks. To get ready for it sooner, start the line with
-  `preload` or `preconnect` in place of `client`:
+  `preload` or `preconnect` in place of `client` *(since 0.7)*:
 
   ```quillo
   preload "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" use Chart
@@ -816,10 +823,10 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   while the server renders, so a component that shows it in its markup is made again in
   the browser; `quillo check` warns of it: write `state w = js(...)`, which runs again
   in the browser (below).
-- `js_has("navigator.vibrate")` says whether the page has a feature without calling it,
+- `js_has("navigator.vibrate")` *(since 0.7)* says whether the page has a feature without calling it,
   as `js(...)` would; `false` on the server (Q-341). A field's `selectionStart` counts
   UTF-16 units, as JavaScript does, and `slice`, `len` and `s[i]` count characters:
-  `cursor_index(text, el.selectionStart)` turns the one into the other (Q-344).
+  `cursor_index(text, el.selectionStart)` *(since 0.7)* turns the one into the other (Q-344).
 - A `state` initializer that reads the page (`state wide = js("window.innerWidth") > 800`)
   gives null while the server renders the component, and runs again in the browser
   once the component is on the page, which sets the state from what it gives. An

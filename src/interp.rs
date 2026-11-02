@@ -701,6 +701,16 @@ fn render_value(v: &Value, out: &mut String) {
 /// A value placed in a `<script>` (see `render_tag_into`).
 /// A map of CSS properties as a `style` attribute's text: `fontSize` and `font_size` are
 /// `font-size`, a custom property (`--gap`) stays, and a null or false value is left out.
+/// `style={{ color: c, font_size: "2rem" }}`, React's way: a property for each key, `_` and
+/// camelCase written as `-` (FEEDBACK35.md, Q-429; branch feedback27-35-fixes), on every path
+/// that writes attributes (Q-531).
+fn style_value(name: &str, v: Value) -> Value {
+    match &v {
+        Value::Map(m) if name.eq_ignore_ascii_case("style") => Value::str(style_text(m)),
+        _ => v,
+    }
+}
+
 pub fn style_text(m: &Map) -> String {
     let mut out = String::new();
     for (k, v) in m.iter() {
@@ -4180,6 +4190,9 @@ impl Interp {
             if !attr_name_ok(name) {
                 continue;
             }
+            // Here too: an element with `class=`, a spread or a textarea (FEEDBACK46.md, Q-531;
+            // branch feedback40-43).
+            let v = style_value(name, v);
             let v = match (&v, name) {
                 _ if url_attr(name) && shows_script_url(&v) => Value::str(BLOCKED_URL),
                 _ if anim_value_attr(&el.tag, name) && shows_script_url_in_list(&v) => Value::str(BLOCKED_URL),
@@ -4330,12 +4343,7 @@ impl Interp {
     /// URLs that would run script are blocked; site paths get the mount's
     /// prefix.
     fn write_attr(&self, tag: &str, name: &str, v: Value, out: &mut String) {
-        // `style={{ color: c, font_size: "2rem" }}`, React's way: a property for each key, `_` and
-        // camelCase written as `-` (FEEDBACK35.md, Q-429; branch feedback27-35-fixes).
-        let v = match (&v, name) {
-            (Value::Map(m), "style") => Value::str(style_text(m)),
-            _ => v,
-        };
+        let v = style_value(name, v);
         let v = match (&v, name) {
             _ if url_attr(name) && shows_script_url(&v) => Value::str(BLOCKED_URL),
             _ if anim_value_attr(tag, name) && shows_script_url_in_list(&v) => Value::str(BLOCKED_URL),

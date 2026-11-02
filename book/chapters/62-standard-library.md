@@ -4,7 +4,7 @@
 - **Strings:** `upper lower trim split join contains starts_with ends_with replace slice repeat index_of normalize`
   (`upper` and `lower` know all of Unicode: `"straße"` is `"STRASSE"`; `replace`
   replaces every occurrence of plain text, not a pattern; regular expressions are `re`,
-  below). `normalize(s, form)` gives one Unicode form of the text, `"NFC"` unless
+  below). `normalize(s, form)` *(since 0.7)* gives one Unicode form of the text, `"NFC"` unless
   `"NFD"`, `"NFKC"` or `"NFKD"` is given, on both sides: an `é` typed as one character and
   one typed as `e` and an accent are two texts until normalized. Compare emails and user
   names normalized, and user names in `"NFKC"`, which also makes `ﬁ` `fi` and a
@@ -15,7 +15,7 @@
   match and `$`, or a function given the match) and `re.split`. A match is
   `{ text, start, end, groups, named }`, positions counting characters as `slice` does.
   Flags come last: `"i"` (any case), `"m"` (`^` and `$` at each line) and `"s"` (`.`
-  matches line breaks too). `re.valid(p, flags)` asks whether a pattern can be run, for
+  matches line breaks too). `re.valid(p, flags)` *(since 0.7)* asks whether a pattern can be run, for
   one from data. They give the same answers on the server and in the browser, but for
   groups in a loop (`(?:(a)|b)*` on `ab`, where the server keeps the group's last match and
   the browser clears `(a)` on each round: the two engines cannot be made the same, and
@@ -69,7 +69,7 @@
   `tenant`, `tenant_from`, `with_tenant`, `platform` (below), and in components `url`, `navigate`, `every`,
   `ask`, `notify`, `js`, `js_new`, `live`, `waiting`, `publish`, `watch`, `unwatched`: each is
   described where it is used.
-- **Where the program runs:** `platform()` gives a map: `os` (`"ios"`, `"android"`,
+- **Where the program runs:** `platform()` *(since 0.7)* gives a map: `os` (`"ios"`, `"android"`,
   `"macos"`, `"linux"`, `"windows"`), `os_name` and `os_version` (`"iOS"`, `"27.0"`), `kernel`,
   `device` (`"phone"`, `"tablet"`, `"desktop"` in `quillo app`, `"server"`), `model` (the
   hardware's identifier: `"iPhone19,2"`, `"Mac17,2"`), `arch`, `cpus`, `simulator`, `runtime`
@@ -307,7 +307,7 @@ caught: Quillo does not use Linux's `openat2`.
 ## Files of a program
 
 `use lib/forum.qwe` brings another file into the program, and its names into this file.
-`import` takes some of them. A file sees its own names, the builtins, and what it takes:
+`import` *(since 0.7)* takes some of them. A file sees its own names, the builtins, and what it takes:
 
 ```quillo
 // ui/thread.qwe
@@ -340,7 +340,7 @@ turns it around. A later release removes it.
 - A `use` is for the file that writes it, and is not passed on: when `lib/a.qwe` `use`s
   `lib/b.qwe`, a file that `use`s `lib/a.qwe` sees `a`'s names and not `b`'s. The order
   of `use` lines does not matter, and files may `use` each other.
-- **For now a name the file did not take still works, with a warning**: "`price` comes
+- **For now a name the file did not take still works, with a warning** *(since 0.7)*: "`price` comes
   from lib/money.qwe, which this file does not take: add `import lib/money.qwe use
   price`". `quillo fix main.qwe` writes those lines, in every file of the program
   (run it once for each program, a service's or a mounted one's too). A later release
@@ -606,7 +606,7 @@ math.comb(52, 5)  math.log(8, 2)  math.fsum(xs)  math.isclose(a, b)  math.pi
   gamma lgamma`, and `pi e tau inf nan`. What Python raises is an error here too: a math
   domain error (`math.sqrt(-1)`, `math.log(0)`), a range error (`math.exp(1000)`), an int
   past 64 bits (`math.factorial(21)`).
-- **`bit`:** `and(a, b) or(a, b) xor(a, b) not(a) shl(a, n) shr(a, n)`, on the 64 bits of
+- **`bit`:** *(since 0.7)* `and(a, b) or(a, b) xor(a, b) not(a) shl(a, n) shr(a, n)`, on the 64 bits of
   an int, with the same answers in the browser (where JavaScript's own `&` and `<<` keep
   32). `shl` drops what goes past the top, unlike `*`, which refuses; `shr` keeps the
   sign, and `bit.and` masks it off: `bit.and(bit.shr(x, 8), 0xFF)`. A shift outside 0 to
@@ -709,11 +709,11 @@ date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or a
 - **Milliseconds:** `date.ms(t)` is a date-time (or a date, at its midnight in UTC) as
   milliseconds since 1970, what `now()` gives, and `date.from_ms(ms, tz)` a time kept that
   way as a date-time (to the second): `date.from_ms(now(), "Europe/Lisbon")`.
-- **Comparing:** `date.compare(a, b)` is -1, 0 or 1 by the instants, fractions of a
+- **Comparing:** `date.compare(a, b)` *(since 0.7)* is -1, 0 or 1 by the instants, fractions of a
   second included, a date counting as its midnight in UTC: the safe way to order or
   compare date-times written differently, `sort_by(xs, (x) => date.ms(x.at))` the way
   to sort them.
-- **Time zones:** `date.valid_zone(z)` asks whether a zone exists, for one a person typed;
+- **Time zones:** `date.valid_zone(z)` *(since 0.7)* asks whether a zone exists, for one a person typed;
   a zone it does not know stops the call, so `date.to_zone(t, z) ?? t` guards it too.
   `date.to_zone(t, tz)` is the same instant at the zone's offset then
   (daylight saving included), a fraction of a second that is all zeros dropped (`.000Z`
@@ -841,7 +841,7 @@ runs in, and `quillo run` says which file it opened when it starts
 SQLite file's path. SQL Server, Oracle and the rest are reached through Rust (see
 [Other stores](#other-stores)).
 
-**Many rows at once: `db.exec_many(sql, rows)`.** It runs the statement for each row, a
+**Many rows at once: `db.exec_many(sql, rows)`.** *(since 0.7)* It runs the statement for each row, a
 list of its `?` values, and gives `{ changes }`, the rows changed in all. It is all or
 none: it runs in a transaction of its own, or as a savepoint of the one it is in, so a row
 that fails (a duplicate key) leaves the table as it was, and gives the error. An empty
@@ -1147,7 +1147,7 @@ db.transaction(() => {
   page reading through one connection hears a write made through another. (Another
   user or other options on a server URL is another pool, with the same topics.)
 - **Names for this database.** `analytics.sql_name(col)` quotes a name as that database
-  reads it, `` `col` `` on MySQL, `"col"` elsewhere; `db.sql_name(col)` does the same for
+  reads it, `` `col` `` on MySQL, `"col"` elsewhere; `db.sql_name(col)` *(since 0.7)* does the same for
   the program's database. Plain `sql_name` quotes for the program's database only, so a
   program with MySQL beside SQLite or PostgreSQL uses the connection's: MySQL reads
   `"title"` as text, and `select "title" from items` gives the word `title` in every row.
@@ -1326,7 +1326,7 @@ Sent `acme`, the form makes `data/acme.db` (with `migrations/`'s tables) and goe
 - `db.tenants()` lists the SQLite files, the PostgreSQL schemas or the MySQL databases
   there are; for `postgres://host/app_{tenant}`, and for a function, it is an error:
   keep the list yourself.
-- `new_tenant(name, f)` is for signing up: it makes the tenant's database, migrates it and
+- `new_tenant(name, f)` *(since 0.7)* is for signing up: it makes the tenant's database, migrates it and
   runs `f` for it, or gives an error when that tenant exists, so a second signup for one
   name cannot land in a customer's data. It is one step on the database, so of two signups
   at once one makes it. Names such as `www` and `admin` are the program's to refuse.

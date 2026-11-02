@@ -250,7 +250,7 @@ routes /reports | signed_in with db {               // what its routes may do, a
   routes: `quillo docs` lists them by their whole path.
 - **Back where they were.** The login page sends the visitor on to `next` once signed in.
   `next` came in the address, so anyone can write a link whose `next` is another site:
-  `local_path(next)` gives `next` when it is an address on this site as a browser reads it
+  `local_path(next)` *(since 0.7)* gives `next` when it is an address on this site as a browser reads it
   (tabs and line breaks dropped, `\` read as `/`), else null. `//evil.example`,
   `/\evil.example`, `https://...` and `javascript:...` are null. It works on both sides.
 
@@ -577,8 +577,8 @@ fn touch() {
 | `respond(status, body, headers)` | exactly that |
 | `redirect(url, status = 303)` | a redirect |
 | `file(path, { cache })` | a file under the program's folder (see [Static files](#static-files)) |
-| `files(folder, path, options)` | a folder of files, as a static host serves it (see [Static files](#static-files)) |
-| `markdown_page(text, { title, lang, html })` | Markdown as a whole page: a doctype, a `<head>` with the title (the option's, else the first `#` heading), and the HTML |
+| `files(folder, path, options)` *(since 0.7)* | a folder of files, as a static host serves it (see [Static files](#static-files)) |
+| `markdown_page(text, { title, lang, html })` *(since 0.7)* | Markdown as a whole page: a doctype, a `<head>` with the title (the option's, else the first `#` heading), and the HTML |
 | `stream(f, { type, status, headers })` | sent as `f` makes it (see [Streaming](#streaming)) |
 | `events(f, { status, headers })` | Server-Sent Events, as `f` sends them |
 | a runtime error | 500 `text/plain`, `internal error` |
@@ -615,7 +615,7 @@ fn touch() {
   (it called `session()` or `cookie()`, or set a cookie) carries `cache-control:
   private` and `vary: cookie`, unless the route set its own `cache-control`, so a shared
   cache never gives one visitor's page to another.
-- `site_headers(map)` at the top level adds headers to every answer that does not set
+- `site_headers(map)` *(since 0.7)* at the top level adds headers to every answer that does not set
   them itself, and `site_headers("/admin", map)` to those under a path; a longer path's
   rule wins over a shorter one's. A `null` value takes away one Quillo sends. Names are
   checked, and values are one line; `content-length`, `transfer-encoding`, `connection`,
@@ -1800,7 +1800,7 @@ When a service runs elsewhere, its calls are made to hold up:
     refuses, cannot work and is given up on at once. A call given up on stays in
     `_quillo_later` with `tries` -1 and why in `error`, is counted by `--metrics`, and goes
     again with `update _quillo_later set at = 0, tries = 0 where tries < 0`.
-  - **Asking after one.** `later.status(id)` gives `{ state: "waiting", tries, error }`,
+  - **Asking after one.** `later.status(id)` *(since 0.7)* gives `{ state: "waiting", tries, error }`,
     `{ state: "done", result }`, `{ state: "failed", error }`, or `null` if nothing is
     known of it: a call done over a day ago, kept in memory and done, or made in a
     transaction not committed yet. `result` is what the function gave, an error value
@@ -1819,7 +1819,7 @@ See [services](https://github.com/quillolang/examples/tree/main/services): a sho
 A call signed with `QUILLO_SERVICE_SECRET` proves one thing: the caller holds the secret.
 Every service holding it can sign as any other, call any function of any service, and name
 any tenant, so the most exposed service in a system holds the key to all the others. A
-caller can prove more than that, and a service can say whom it takes calls from.
+caller can prove more than that, and a service can say whom it takes calls from *(since 0.7)*.
 
 The caller says how it proves who it is, where it declares the service:
 
@@ -2019,7 +2019,7 @@ it on in production.
 
 ### Calling another Quillo site
 
-`site shop = "https://shop.example.com"` names a deployed Quillo site, and `shop.notes(a,
+*(since 0.7)* `site shop = "https://shop.example.com"` names a deployed Quillo site, and `shop.notes(a,
 b)` calls its `server fn notes` as the site's own pages do: `POST
 <url>/_quillo/rpc/notes` with the arguments as a JSON array. It gives the answer's value,
 the site's error as an error value, or an error value when the site cannot be reached.

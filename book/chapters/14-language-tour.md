@@ -44,7 +44,7 @@ Operators are as in JavaScript, with these meanings:
 | `null`, `false` and error values | everything else, `0` and `""` included |
 
 Because `""` is truthy, `name || "anonymous"` keeps an empty name: write
-`filled(name) ?? "anonymous"` to replace a blank or a missing name, or
+`filled(name) ?? "anonymous"` *(since 0.7)* to replace a blank or a missing name, or
 `name ?? "anonymous"` to replace only null (`quillo check` points these out).
 
 Ints are 64-bit: `+`, `-`, `*` and unary `-` past their range are a runtime error
@@ -445,7 +445,7 @@ for everything the function calls, including the lambdas it passes to `map`: the
 effects allowed are narrowed on the way in, and nothing called can widen them.
 Functions without `with` may do anything.
 
-Routes and route groups take `with` too, written before the body, after the patterns. It
+Routes and route groups take `with` too *(since 0.7)*, written before the body, after the patterns. It
 holds for everything the route runs: its body, what it calls, and the middleware of its
 groups. A group's `with` is what its routes may use at most; a route in it may narrow it,
 and one that asks for more is an error:
@@ -474,7 +474,7 @@ as a function does (see [Scheduled jobs](#scheduled-jobs)).
   `.exec`, `.transaction`) is a warning, since `c` may be a connection: `` `c.query` reads
   like a database call, which needs the db effect ``.
 - **A Rust function** (a `.qwer` or `.rs` file) has the effects its file declares in
-  its header, `//! effects: db, http` (or `//! effects: none`). A file without that line
+  its header, `//! effects: db, http` *(since 0.7)* (or `//! effects: none`). A file without that line
   may do anything, so its functions run outside any `with` as before, and are refused
   inside one, at run time and by `quillo check`: `` `hi` is Rust whose file does not say
   what it does, so it may do anything and is refused in `greet` ``. An editor's hover
@@ -530,7 +530,7 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   out. A name may hold `-`, `_`, `:`, `@` and `.` (`data-id`, `bind:value`, `@click`),
   the `{name}` shorthand takes a bare name, and an attribute written twice is an error.
 - An event attribute given an expression, `onclick={() => ...}` or `onClick={save}`, is a
-  handler, the same as `@click={...}` (both on one element is an error). Given text,
+  handler *(since 0.7)*, the same as `@click={...}` (both on one element is an error). Given text,
   `onclick="..."`, it is HTML's own and runs in the browser as written, so it takes only
   `"text"` written in the program: the browser decodes the value and runs it, and escaping
   cannot keep data out of code. Text made from values, ``onmouseover={`go('${u}')`}``, is
@@ -619,7 +619,7 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   is found by neither it nor Quillo. Under [`--watch`](#options-of-quillo-run), each time it writes the sheet the
   open pages take it as they are. Tailwind's scanner reads the shorthand too
   (`<div.flex.p-4.md:flex-row>`), but a fraction right before `/>` is read with the
-  slash (`<i.w-1/3/>`): put a space before `/>`. `classes()` gives the classes the
+  slash (`<i.w-1/3/>`): put a space before `/>`. `classes()` *(since 0.7)* gives the classes the
   program's markup writes, sorted, for a CSS engine called from the program, and `quillo
   classes app.qwe` prints them one a line, for a tool beside it (Tailwind's `@source
   inline(...)`, or a safelist file). Both read the source: the `.class` shorthand,
