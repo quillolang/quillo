@@ -16,7 +16,7 @@ component Cart(items: list) {
     if total > 1000 { every(5000, () => { notify("Big order!") }) }   // starts and stops with it
     <div>
         <ul>{for l in lines => <li key={l.id}>{l.name} × {l.qty}</li>}</ul>
-        <input bind:value={coupon} placeholder="Coupon"/>
+        <input value={coupon} placeholder="Coupon"/>
         <p class={off > 0 && "saved"}>Total {total - off}</p>
         <button @click={() => { lines = lines | filter((l) => l.qty > 0) }}>Tidy</button>
     </div>
@@ -179,6 +179,7 @@ The server has two of its own, which follow the same idea of following what was 
 | `useMemo` | `$derived` | `computed` | `let y = ...` reading state |
 | `useEffect` (and its cleanup) | `$effect` | `watchEffect` | a statement reading state; what it starts stops with it |
 | `useRef` | `bind:this` | template ref | `@mount={(el) => { box = el }}` |
+| `value` with `onChange` | `bind:value` | `v-model` | `value={x}`: two-way by itself when `x` is state |
 | `useContext` | `setContext` | `provide` | none: props |
 | `key` | `{#each ... (key)}` | `:key` | `key={...}` |
 | `React.memo`, `useCallback` | | | not needed: nothing renders again |

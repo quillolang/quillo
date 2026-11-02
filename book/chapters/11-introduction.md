@@ -18,7 +18,7 @@ component Notes(initial: list) {
     state notes = initial
     state draft = ""
     <form @submit={() => { notes = add_note(draft); draft = "" }}>
-        <input bind:value={draft}/>
+        <input value={draft}/>
         <ul>{for n in notes => <li key={n.id}>{n.text}</li>}</ul>
     </form>
 }

@@ -1027,7 +1027,8 @@ pub fn build(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
     let abs = qwer.canonicalize().unwrap_or_else(|_| qwer.to_path_buf());
     let lib = lib_path(qwer, &src);
     // Built, and the library that was built: loaded (Q-477).
-    let as_built = |lib: &Path| -> Result<bool, String> {
+    // Asked twice, before the build lock and under it: said once, the second time.
+    let as_built = |lib: &Path, say: bool| -> Result<bool, String> {
         if !lib.is_file() {
             return Ok(false);
         }
@@ -1042,16 +1043,18 @@ pub fn build(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
             None => Ok(true),
             Some(why) if no_build() => Err(format!("will not load the library of {}: {}; build it with `quillo build`, which writes the lock, and bring .quillo along", qwer.display(), why)),
             Some(why) => {
-                eprintln!("quillo: {}: building it again", why);
+                if say {
+                    eprintln!("quillo: {}: building it again", why);
+                }
                 Ok(false)
             }
         }
     };
-    if as_built(&lib)? {
+    if as_built(&lib, false)? {
         return Ok((lib, parsed));
     }
     let _one = BUILDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if as_built(&lib)? {
+    if as_built(&lib, true)? {
         return Ok((lib, parsed));
     }
     if no_build() {

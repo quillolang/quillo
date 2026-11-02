@@ -375,7 +375,7 @@ fn a_live_loader_through_a_later_call_follows_only_the_service() {
 #[test]
 fn markup_attributes_are_checked() {
     says("view Card() = <p></p>\nprint(<Card @click={() => 1}/>)", &["2 <Card> is a view; `@click` handlers go on HTML elements"]);
-    says("component C() {\n state a = \"\"\n <input bind:focus={a}/>\n}", &["3 `bind:focus` is not supported (use bind:value or bind:checked)"]);
+    says("component C() {\n state a = \"\"\n <input bind:focus={a}/>\n}", &["3 `bind:focus` is not something a person changes in <input> (see bind in the guide: value, checked, indeterminate, open, muted, volume, currentTime, playbackRate)"]);
     says("component C() {\n <input bind:value=\"x\"/>\n}", &["2 `bind:value` needs a variable: bind:value={name}"]);
     says("let g = 1\ncomponent C() {\n <input bind:value={g}/>\n}", &["3 `bind:value` needs component state or a local variable, like ~g"]);
     says("fn f(Foo: int) = <Foo/>", &["1 <Foo> is not a view: it is int"]);

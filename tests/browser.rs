@@ -310,6 +310,33 @@ fn a_binding_and_a_handler_on_one_input_both_run() {
     assert_eq!(r, want);
 }
 
+/// `x={state}` on what a person changes (a text, a box, a choice, <details> and <dialog>, a
+/// player's sound, place and speed) with nothing else setting it is two-way, both ways; a
+/// handler of its own, `readonly` or a value that is not a state keeps it one way;
+/// `onclick={...}` is `@click` (branch feedback40-43).
+#[test]
+fn an_input_held_to_a_state_and_nothing_else_is_two_way() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("implied.qwe"), free_port(), Some(&dir.join("implied.js")));
+    let want = serde_json::json!({
+        // qty, a number input: 3 typed is the number 3 (4 shown), not the text "3" ("31").
+        "person": "Ana|on|whole|s|ABC|kept|2|open|closed|quiet|0.25|2|0.5|4",
+        // The transform's own handler wins. `readonly`: a person cannot type there; a script
+        // setting it changes the element only, and the state stays "kept" (the text above). An
+        // input showing a `let` keeps what is typed, as before (nothing holds it, nothing reads it).
+        "inputs": ["Ana", "ABC", "changed", "typed", false, "3"],
+        "program": "Ana|on|whole|s|ABC|kept|2|open|closed|quiet|0.5|1.5|0.5|4",
+        "player": [0.5, 1.5, true],
+        "wild": [1, 0.0625],
+        "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
 /// A page loads its components' code when it is needed: not before someone
 /// reaches for one (what they typed and clicked meanwhile is kept), and at
 /// once for one that runs by itself. It resumes on the server's HTML: the

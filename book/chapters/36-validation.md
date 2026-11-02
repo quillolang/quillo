@@ -84,12 +84,12 @@ component SignupForm() {
             if is_err(r) { from_server = r.error } else { done = r }
         }
     }}>
-        <label>Name <input name="name" bind:value={name}/></label>
+        <label>Name <input name="name" value={name}/></label>
         <p.hint>{hint("name")}</p>
-        <label>Email <input name="email" bind:value={email}/></label>
+        <label>Email <input name="email" value={email}/></label>
         <p.hint>{hint("email")}</p>
-        <label>Plan <select name="plan" bind:value={plan}><option>free</option><option>pro</option></select></label>
-        <label>Seats <input name="seats" type="number" bind:value={seats}/></label>
+        <label>Plan <select name="plan" value={plan}><option>free</option><option>pro</option></select></label>
+        <label>Seats <input name="seats" type="number" value={seats}/></label>
         <p.hint>{hint("seats")}</p>
         <p.hint>{hint("")}</p>
         <button>Sign up</button>
@@ -108,11 +108,12 @@ route GET / = <html><body><SignupForm/></body></html>
   (the address is taken) is kept with the draft it was about: `sent == draft` compares
   them by value, so typing a new address clears it, and typing the old one back shows it
   again.
-- **Inputs bind to plain variables.** `bind:value` needs a variable of the component, not
-  a field of a map, which is why each input has its own `state`. Do not put an `@input`
-  handler on an input that has `bind:value`: it currently takes the binding's place, and
-  the variable stops following the input (`quillo check` does not say so). Work out
-  what depends on the input with `let`, as `draft` is here.
+- **Inputs follow their state.** `value={name}` keeps an input and `name` in step, typing
+  included, when `name` is a state of the component and nothing else on the input sets
+  it. It needs a state, not a field of a map, which is why each input has its own
+  `state`. An `@input` of the input's own makes it one way (a transform, say); for a
+  handler that runs after the state is set, write `bind:value={name} @input={...}`. Work
+  out what depends on the input with `let`, as `draft` is here.
 - **There is no debounce.** Rules run on every keystroke, in the browser, which is cheap.
   A check only the server can make (is the address taken?) waits for the submit, as
   here, or for a pause in the typing: count the keystrokes in a state, and in

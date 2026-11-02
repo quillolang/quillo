@@ -743,9 +743,7 @@ fn handlers_and_frame_pages_take_only_text_written_in_the_program() {
     let load = |src: &str| Interp::new(env!("CARGO_MANIFEST_DIR")).load_source(src, "t.qwe").err().map(|e| e.to_string()).unwrap_or_default();
     for (src, needle) in [
         ("route GET /a ? { u: str } = <div onmouseover={`go('${u}')`}>\"x\"</div>", "@mouseover"),
-        ("route GET /a ? { u: str } = <div ONCLICK={u}>\"x\"</div>", "@click"),
         ("route GET /a ? { u: str } = <div bind:onclick={u}>\"x\"</div>", "@click"),
-        ("route GET /a ? { onclick: str } = <div {onclick}>\"x\"</div>", "@click"),
         ("route GET /a ? { u: str } = <iframe srcdoc={u}></iframe>", "sandbox"),
         ("route GET /a ? { u: str } = <iframe sandbox=\"allow-scripts allow-same-origin\" srcdoc={u}></iframe>", "sandbox"),
     ] {
@@ -753,6 +751,17 @@ fn handlers_and_frame_pages_take_only_text_written_in_the_program() {
         assert!(e.contains("takes only text written here") && e.contains(needle), "{}: {}", src, e);
         let a = quillo::check::check_source(src, "t.qwe", std::path::Path::new("."));
         assert!(a.diagnostics.iter().any(|d| d.message.contains("takes only text written here")), "{}", src);
+    }
+    // `onclick={x}` on an element is `@click={x}`, a handler: given text, the check refuses it,
+    // and the page has no handler made of it (branch feedback40-43).
+    for src in ["route GET /a ? { u: str } = <div ONCLICK={u}>\"x\"</div>", "route GET /a ? { onclick: str } = <div {onclick}>\"x\"</div>"] {
+        let a = quillo::check::check_source(src, "t.qwe", std::path::Path::new("."));
+        assert!(a.diagnostics.iter().any(|d| d.message.contains("`@click` needs a function, got str")), "{}", src);
+        let mut it = Interp::new(env!("CARGO_MANIFEST_DIR"));
+        it.load_source(src, "t.qwe").unwrap();
+        let q = if src.contains("{onclick}") { "onclick" } else { "u" };
+        let html = send(&mut it, "GET", &format!("/a?{}=alert(1)", q), &[], "").text();
+        assert!(!html.to_ascii_lowercase().contains("onclick") && !html.contains("alert"), "{}", html);
     }
     // Text written in the program, a frame kept away from the site, and a
     // component's parameters are fine.

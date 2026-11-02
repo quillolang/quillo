@@ -267,6 +267,27 @@ pub enum AttrVal {
     Spread(Expr),
 }
 
+/// What a person can change of an element in the page, by its attribute: the event that says
+/// it changed, and the property that holds it. `bind:x={state}` keeps the two in step, and so
+/// does `x={state}` when nothing else on the element sets it (branch feedback40-43).
+pub fn bind_event(tag: &str, attr: &str) -> Option<(&'static str, &'static str)> {
+    Some(match (tag, attr) {
+        ("input" | "textarea" | "select", "value") => ("input", "value"),
+        ("input", "checked") => ("change", "checked"),
+        ("input", "indeterminate") => ("change", "indeterminate"),
+        ("details", "open") => ("toggle", "open"),
+        ("dialog", "open") => ("close", "open"),
+        ("video" | "audio", "muted") => ("volumechange", "muted"),
+        ("video" | "audio", "volume") => ("volumechange", "volume"),
+        ("video" | "audio", "currentTime") => ("timeupdate", "currentTime"),
+        ("video" | "audio", "playbackRate") => ("ratechange", "playbackRate"),
+        // On another element (a custom one), `bind:value` and `bind:checked` as on an input.
+        (_, "value") if tag.contains('-') => ("input", "value"),
+        (_, "checked") if tag.contains('-') => ("change", "checked"),
+        _ => return None,
+    })
+}
+
 /// Attributes whose value the browser runs as code (`onclick`) or shows as
 /// a page of the site (`srcdoc`). Escaping does not help there: the browser
 /// decodes the value first.

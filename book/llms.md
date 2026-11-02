@@ -93,7 +93,7 @@ let kind = match user {
 | `/regex/` literals | strings to `re.*`: `re.find_all(s, "@(\\w+)")` |
 | `yield`, generators | return a list |
 | `<>...</>` fragments | one element around the others |
-| `className`, `onClick`, `onclick={...}` | `class`, `@click={...}` |
+| `className` | `class` (`onclick={...}` and `@click={...}` are both a handler) |
 | `m.name = v` | `m = { ...m, name: v }` (inside a component it sets an element's property) |
 
 Builtins are free functions that take the list, map or string first:
@@ -222,8 +222,10 @@ route GET / = <html><body><Card title="Hi"><Counter start={5}/></Card></body></h
   key={t.id}>{t.text}</li>}` renders a list.
 - A `view` is made on the server only. A `component` is made on the server and resumes in
   the browser; nothing else on the page needs JavaScript.
-- Events are `@click`, `@submit`, `@input`, `@change`: a lambda. Inputs bind with
-  `bind:value={draft}` (and `bind:checked`).
+- Events are `@click`, `@submit`, `@input`, `@change` (or `onclick` and the rest): a
+  lambda. What a person changes is two-way by itself when it shows a state:
+  `<input value={draft}/>`, `checked={done}`, `<details open={more}>`, a player's
+  `volume={v}`. A handler of the input's own, or `readonly`, keeps it one way.
 - `style css`...`` at the start of a component's body is CSS for its elements only.
 - A `server fn` is a function the browser calls over HTTP. In a component it is awaited
   for you and returns an error value if it fails:
@@ -245,7 +247,7 @@ component Tasks() {
         let r = add_task(draft)
         if is_err(r) { problem = r.error } else { draft = "" }
     }}>
-        <input bind:value={draft} aria-label="New task"/>
+        <input value={draft} aria-label="New task"/>
         {problem && <p>{problem}</p>}
         <ul>{for t in items ?? [] => <li key={t.id}>{t.text}</li>}</ul>
     </form>

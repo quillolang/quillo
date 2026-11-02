@@ -89,7 +89,7 @@ component Chat() {
         draft = ""
     }}>
         <ul>{for l in lines => <li><b>{l.from}</b> {l.text}</li>}</ul>
-        <input bind:value={draft}/>
+        <input value={draft}/>
     </form>
 }
 ```

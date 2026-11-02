@@ -4,6 +4,15 @@
 
 ### What to change in your code
 
+- **An input with `value={state}` and nothing else setting it is two-way now**: typing
+  changes the state. Before, typing was undone at once. To show a state without letting
+  it change, add `readonly`. The same holds for a checkbox's `checked`, `open`, and a player's `muted`,
+  `volume`, `currentTime` and `playbackRate`.
+- **`bind:value` on a number or range input gives a number** (`null` when empty), where it
+  gave text: drop an `int(...)` around it.
+- **`onclick={...}` on an element is a handler**, where it was an error: nothing to change,
+  but `onclick={text}` is now refused by `quillo check` as a handler that is not a function.
+
 - **`children` given none is `null`,** on both sides: test `children != null`. `quillo
   check` warns on `str(children)`.
 - **`js_new("Promise", ...)` stays a Promise.** To wait for it and catch its failure, wrap
@@ -51,6 +60,24 @@
   declared `with http` is now an error. Add `db` to its `with`.
 - **`udp.listen` (and `media.rtp`) need the `net` effect**, and `save_upload` and `files`
   the `fs` effect: add them to the `with` of the functions that call them.
+
+### What a person changes is two-way, and `onclick={...}` is a handler
+
+- **`value={x}` is two-way when `x` is the component's state** and nothing else on the
+  input sets it: typing changes `x`, as `bind:value={x}` did. The same for every attribute
+  a person changes in the page: `checked` and `indeterminate` on a checkbox, `value` on a
+  `<textarea>` and `<select>`, `open` on `<details>` and `<dialog>`, and `muted`, `volume`,
+  `currentTime` and `playbackRate` on `<video>` and `<audio>`. It stays one way with a
+  handler of its own on an event saying it changed (`@input` or `@change` for a value),
+  with `readonly`, on a radio or a `<select multiple>`, with a `type={...}` or a spread, or
+  when the value is not a state. A number or range input gives a number back, with
+  `bind:value` too (it gave text); a player's volume and speed are kept in range.
+- **`bind:` takes each of those**, where it took `value` and `checked` only; two bindings
+  on one event (`muted` and `volume`) are one listener. The runtime sets `indeterminate`,
+  `volume`, `currentTime` and `playbackRate` as the properties they are.
+- **`onclick={() => ...}` on an element is `@click={...}`**, in any case (`onClick`).
+  `onclick="..."` stays HTML's own, text made from values stays refused, and on a view or
+  component `on_change={...}` stays a parameter.
 
 ### Shared servers: a socket, FastCGI and a policy (FEEDBACK41.md)
 

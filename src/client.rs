@@ -2027,6 +2027,18 @@ impl<'a> Compiler<'a> {
         self.ctx().scopes.last_mut().unwrap().insert(name.to_string(), local);
     }
 
+    /// Whether `name` here is a component's state, asked without reading it.
+    fn is_state(&self, name: &str) -> bool {
+        for ctx in self.ctxs.iter().rev() {
+            for scope in ctx.scopes.iter().rev() {
+                if let Some(l) = scope.get(name) {
+                    return matches!(l, Local::State(_));
+                }
+            }
+        }
+        false
+    }
+
     fn resolve(&mut self, name: &str) -> Result<Resolved, QuilloError> {
         let mut found = None;
         'outer: for (ci, ctx) in self.ctxs.iter().enumerate().rev() {
@@ -4035,7 +4047,63 @@ impl<'a> Compiler<'a> {
         // the attributes when they listen to the same event.
         let mut ons: Vec<(String, String)> = Vec::new();
         let mut binds: Vec<(&str, String)> = Vec::new();
-        for (name, v) in &el.attrs {
+        // `<input value={name}/>`, where `name` is the component's state and nothing on the input
+        // sets it, can only mean what `bind:value` says: typing changes `name`. Held to it one way,
+        // typing was undone at once, and nothing said why. A handler of its own (a transform), a
+        // binding, or `readonly` keeps it one way (branch feedback40-43).
+        // The same for each thing a person changes: a box ticked, a <details> opened, a player's
+        // volume (see `bind_event`).
+        let has = |n: &str| el.attrs.iter().any(|(a, _)| a == n);
+        // `readonly` written, or `readonly={...}` that is not `false`.
+        let readonly = el.attrs.iter().any(|(a, v)| a == "readonly" && !matches!(v, AttrVal::Expr(Expr::Lit(Lit::Bool(false)))));
+        let type_attr = el.attrs.iter().find(|(a, _)| a == "type");
+        let kind = type_attr.and_then(|(_, v)| match v {
+            AttrVal::Expr(Expr::Lit(Lit::Str(t))) => Some(t.to_ascii_lowercase()),
+            _ => None,
+        });
+        let kind = kind.as_deref();
+        // A `type={...}` decided as it runs, and a spread (which may carry a handler or a
+        // `readonly`), cannot be judged here: one way.
+        let knowable = (type_attr.is_none() || kind.is_some()) && !has("...");
+        let typed = el.tag != "input" || !matches!(kind, Some("checkbox" | "radio" | "file" | "button" | "submit" | "reset" | "image" | "hidden"));
+        let implied: Vec<usize> = el
+            .attrs
+            .iter()
+            .enumerate()
+            .filter(|(_, (n, v))| {
+                if !knowable || crate::ast::bind_event(&el.tag, n).is_none() || el.tag.contains('-') {
+                    return false;
+                }
+                // Radios: unticking one fires nothing, so each cannot follow a state of its own;
+                // several choices of a <select multiple> are not one value.
+                let fits = match n.as_str() {
+                    "value" => typed && !has("multiple"),
+                    "checked" | "indeterminate" => kind == Some("checkbox"),
+                    _ => true,
+                };
+                // A handler on any event that says it changed sets it itself (a check before it
+                // takes the value, a conversion): one way.
+                let own: &[&str] = match n.as_str() {
+                    "value" => &["@input", "@change"],
+                    "checked" | "indeterminate" => &["@change", "@input", "@click"],
+                    "open" => &["@toggle", "@close"],
+                    "muted" | "volume" => &["@volumechange"],
+                    "currentTime" => &["@timeupdate", "@seeked"],
+                    _ => &["@ratechange"],
+                };
+                let one_way = own.iter().any(|h| has(h)) || has(&format!("bind:{}", n)) || (readonly && matches!(n.as_str(), "value" | "checked" | "indeterminate"));
+                fits && !one_way && matches!(v, AttrVal::Expr(Expr::Ident(x, _)) if self.is_state(x))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for (at, (name, v)) in el.attrs.iter().enumerate() {
+            let bound;
+            let name = if implied.contains(&at) {
+                bound = format!("bind:{}", name);
+                &bound
+            } else {
+                name
+            };
             if matches!(v, AttrVal::Spread(_)) || name == "key" || name == "class" {
                 continue;
             }
@@ -4066,10 +4134,15 @@ impl<'a> Compiler<'a> {
                 let AttrVal::Expr(Expr::Ident(var, _)) = v else {
                     return self.err(format!("`bind:{}` needs a variable: bind:{}={{name}}", prop, prop));
                 };
-                let (event, read) = match prop {
-                    "value" => ("input", "e.target.value"),
-                    "checked" => ("change", "e.target.checked"),
-                    other => return self.err(format!("`bind:{}` is not supported (use bind:value or bind:checked)", other)),
+                let Some((event, field)) = crate::ast::bind_event(&el.tag, prop) else {
+                    return self.err(format!("`bind:{}` is not something a person changes in <{}> (see bind in the guide: value, checked, indeterminate, open, muted, volume, currentTime, playbackRate)", prop, el.tag));
+                };
+                // A number input's value as a number (null when empty), not its text: `qty + 1`
+                // after typing 3 is 4, not "31".
+                let read = if field == "value" && el.tag == "input" && matches!(kind, Some("number" | "range")) {
+                    "(e.target.value === \"\" ? null : e.target.valueAsNumber)".to_string()
+                } else {
+                    format!("e.target.{}", field)
                 };
                 let saved = self.reactive;
                 let (get, set) = match self.resolve(var)? {
@@ -4108,18 +4181,24 @@ impl<'a> Compiler<'a> {
         // the state, then the handler runs and reads it. Before, the second
         // took the first one's place (FEEDBACK14.md, Q-094; branch
         // feedback14-fixes).
+        // Bindings on one event (`muted` and `volume`) are one handler too.
+        let sets_of = |ev: &str, binds: &mut Vec<(&str, String)>| -> Vec<String> {
+            let mut sets = Vec::new();
+            binds.retain(|(b, s)| if *b == ev { sets.push(s.clone()); false } else { true });
+            sets
+        };
         for (ev, f) in ons {
-            let f = match binds.iter().position(|(b, _)| *b == ev) {
-                Some(i) => {
-                    let (_, set) = binds.remove(i);
-                    format!("(e) => {{ {}; const $h = {}; if (typeof $h === \"function\") return $h.length > 0 ? $h(e) : $h(); }}", set, f)
-                }
-                None => f,
+            let sets = sets_of(&ev, &mut binds);
+            let f = if sets.is_empty() {
+                f
+            } else {
+                format!("(e) => {{ {}; const $h = {}; if (typeof $h === \"function\") return $h.length > 0 ? $h(e) : $h(); }}", sets.join("; "), f)
             };
             hole(&mut holes, vals, 2, &ev, f);
         }
-        for (ev, set) in binds {
-            hole(&mut holes, vals, 2, ev, format!("(e) => {{ {}; }}", set));
+        while let Some((ev, _)) = binds.first().cloned() {
+            let sets = sets_of(ev, &mut binds);
+            hole(&mut holes, vals, 2, ev, format!("(e) => {{ {}; }}", sets.join("; ")));
         }
         if !spread_js.is_empty() {
             let v = format!("W.spread([{}], [{}])", spread_js.join(", "), written.join(", "));

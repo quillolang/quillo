@@ -54,7 +54,7 @@ component Notes() {
         if is_err(r) { problem = r.error } else { notes = r; draft = ""; problem = null }
     }}>
         <ul>{for n in notes => <li key={n.id}>{n.text}</li>}</ul>
-        <input bind:value={draft}/>
+        <input value={draft}/>
         <p>{problem}</p>
     </form>
 }

@@ -439,7 +439,8 @@ The built-in functions are free functions taking the list, map or string first (
 | `x.toFixed(2)` | `round(x, 2)` gives a number |
 | `s.match(/re/g)`, `s.replace(/re/g, ...)` | `re.find_all(s, "re")`, `re.replace(s, "re", ...)`; `re.test`, `re.find`, `re.split` |
 | `encodeURIComponent(s)` | `url_encode(s)`, which also encodes `!'()*`; `url_encode(map)` gives a query string |
-- Text in HTML follows JSX, but `class` (not `className`) and `@click` (not `onClick`).
+- Text in HTML follows JSX, but `class` (not `className`), and a handler is `@click={...}`
+  or `onclick={...}`, which on an element mean the same.
 
 ### Variables, functions, views
 
@@ -793,10 +794,14 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   out double-quoted. `true` renders a bare attribute; `false`/`null` leaves it
   out. A name may hold `-`, `_`, `:`, `@` and `.` (`data-id`, `bind:value`, `@click`),
   the `{name}` shorthand takes a bare name, and an attribute written twice is an error.
-- Event handler attributes (`onclick`, any `on...`) and `srcdoc` take only `"text"`
-  written in the program: the browser decodes their value and runs it, so escaping
-  cannot keep data out of the code. `onmouseover={...}` is an error when the program
-  loads (and in `quillo check`); handle events with `@mouseover={...}`. An `<iframe>`
+- An event attribute given an expression, `onclick={() => ...}` or `onClick={save}`, is a
+  handler, the same as `@click={...}` (both on one element is an error). Given text,
+  `onclick="..."`, it is HTML's own and runs in the browser as written, so it takes only
+  `"text"` written in the program: the browser decodes the value and runs it, and escaping
+  cannot keep data out of code. Text made from values, ``onmouseover={`go('${u}')`}``, is
+  an error when the program loads (and in `quillo check`), and a handler given text
+  (`onclick={u}` with `u` a str) is an error in `quillo check` and does nothing in the page.
+  `srcdoc` takes only text too. An `<iframe>`
   with a written `sandbox` attribute that does not say `allow-same-origin` may take
   `srcdoc={...}`: its page cannot reach the site. A view's or component's attributes
   are its parameters, so `on_change={...}` there is fine.
@@ -1009,7 +1014,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
   branch again only when another one is chosen: an input in one keeps its focus and
   what was typed while the page updates. Nested components keep their own state.
 - `@event={fn}` handles DOM events (`@click`, `@input`, `@scroll`, `@submit`, ...), on
-  HTML elements only (on a view or component tag it is an error). There are no
+  HTML elements only (on a view or component tag it is an error). `onclick={fn}` is the same
+  handler, written as HTML and JSX write it; on a view or component, `on_change={...}` or
+  `onChange={...}` is a parameter like any other. There are no
   modifiers: `@click.prevent` is taken as an event named `click.prevent`, which never
   fires; call `e.preventDefault()`. Event names are not checked, so a misspelt one
   (`@clik`) is silent. Clicks are handled once, at the document, innermost first, so
@@ -1034,14 +1041,67 @@ route GET / = <html><body><Counter start={5}/></body></html>
   again fires `change`). `@submit` does not reload the page. HTML5 drag and drop
   (`e.dataTransfer`), pointer capture (`e.target.setPointerCapture(e.pointerId)`) and
   SVG markup work as they do in the browser.
-- `bind:value={x}` and `bind:checked={x}` keep an input and a variable in step; there is
-  no other `bind:`. `x` is the component's state or a local, not a global or a map's
-  field (give each input its own state, and make the map with a `let`). `bind:value`
-  listens to `input` and `bind:checked` to `change`; an `@input` (or `@change`) on the
-  same input runs after the binding, with the state already set: `<input
-  bind:value={amount} @input={refresh}/>`. An input with `value={x}` (or `checked`, `selected`, and a `<video>`'s or `<audio>`'s `muted`) is held to `x`: after
-  each handler it is set back to the state, so typing the state does not take is
-  undone. A bare `<input>` keeps what is typed, read through `e.value` or `e.form`.
+- What a person changes in the page is two-way by itself: `<input value={name}/>`, where
+  `name` is the component's state and nothing on the input sets it, keeps the input and
+  `name` in step, typing included. The same for each thing a person can change:
+
+  | Element | Attribute | Changed by the person on |
+  |---|---|---|
+  | `<input>` (text, number, date, range, color, ...), `<textarea>`, `<select>` | `value` | `input` |
+  | `<input type="checkbox">` | `checked`, `indeterminate` | `change` |
+  | `<details>` | `open` | `toggle` |
+  | `<dialog>` | `open` | `close` |
+  | `<video>`, `<audio>` | `muted`, `volume` | `volumechange` |
+  | `<video>`, `<audio>` | `currentTime` | `timeupdate` |
+  | `<video>`, `<audio>` | `playbackRate` | `ratechange` |
+
+  ```quillo
+  component Settings() {
+      state name = ""
+      state notify = true
+      state more = false
+      state loud = 0.8
+      <form>
+          <input value={name}/>
+          <input type="checkbox" checked={notify}/>
+          <details open={more}><summary>More</summary>...</details>
+          <audio src="/bell.mp3" volume={loud}></audio>
+          <p>{name}, {notify ? "notified" : "quiet"}, volume {loud}</p>
+      </form>
+  }
+  ```
+
+  A number or range input gives a number back (`null` when empty), so `qty + 1` after
+  typing 3 is 4. A player's `volume` is kept between 0 and 1 and its `playbackRate`
+  between 1/16 and 16, whatever the state says, and a place the player has just reported
+  is not sought back to while it plays.
+
+  It stays one way, the attribute held to the value, when:
+  - the element has a handler of its own on an event that says it changed (`@input` or
+    `@change` for a value, `@change` or `@click` for a box, `@toggle` or `@close` for
+    `open`, the player's own events): a transform, `value={code} @input={(e) => { code =
+    upper(e.target.value) }}`, or a check before the value is taken;
+  - it is `readonly` (but not `readonly={false}`);
+  - the value is not a state (a `let`, a prop, an expression): an input showing a `let`
+    keeps what is typed and sets nothing;
+  - what the element is cannot be known when the program is compiled: a `type={...}`
+    decided as it runs, or a `{...spread}` (which may hold a handler);
+  - it is a radio (unticking one fires no event, so each cannot follow a state of its
+    own: give the group one state and `checked={size == "s"}`), or a `<select multiple>`.
+
+  `value` on a checkbox, radio, file or button input is not what a person changes, and
+  stays an attribute.
+- `bind:x={y}` says the same in so many words, for any attribute in the table, and also
+  binds a local variable, and works with a handler of its own: `bind:value` with `@input`
+  is one listener, the binding first, so the handler reads the state already set:
+  `<input bind:value={amount} @input={refresh}/>`. `y` is the component's state or a
+  local, not a global or a map's field (give each input its own state, and make the map
+  with a `let`). On a custom element (`<my-field>`), `bind:value` and `bind:checked` listen
+  to `input` and `change`. Any other `bind:` is an error that names those there are.
+- An input with `value={x}` (or `checked`, `selected`, and a `<video>`'s or `<audio>`'s
+  `muted`) that is one way is held to `x`: after each handler it is set back to the state,
+  so typing the state does not take is undone. A bare `<input>` keeps what is typed, read
+  through `e.value` or `e.form`.
 - `style={...}` takes text or a map of properties: `style={{ color: tone, font_size:
   "2rem", marginTop: "3px", "--gap": "4px" }}`, where `_` and camelCase are written as
   `-` (`font-size`, `margin-top`), a custom property is kept as it is, and a `null` or
@@ -1738,7 +1798,7 @@ component Notes(initial: list) {
         let r = add_note(draft)                    // a request to the server
         if is_err(r) { problem = r.error } else { notes = r }
     }}>
-        <input bind:value={draft}/>
+        <input value={draft}/>
     </form>
 }
 ```
@@ -1931,7 +1991,7 @@ component Cart(items: list) {
     if total > 1000 { every(5000, () => { notify("Big order!") }) }   // starts and stops with it
     <div>
         <ul>{for l in lines => <li key={l.id}>{l.name} × {l.qty}</li>}</ul>
-        <input bind:value={coupon} placeholder="Coupon"/>
+        <input value={coupon} placeholder="Coupon"/>
         <p class={off > 0 && "saved"}>Total {total - off}</p>
         <button @click={() => { lines = lines | filter((l) => l.qty > 0) }}>Tidy</button>
     </div>
@@ -2094,6 +2154,7 @@ The server has two of its own, which follow the same idea of following what was 
 | `useMemo` | `$derived` | `computed` | `let y = ...` reading state |
 | `useEffect` (and its cleanup) | `$effect` | `watchEffect` | a statement reading state; what it starts stops with it |
 | `useRef` | `bind:this` | template ref | `@mount={(el) => { box = el }}` |
+| `value` with `onChange` | `bind:value` | `v-model` | `value={x}`: two-way by itself when `x` is state |
 | `useContext` | `setContext` | `provide` | none: props |
 | `key` | `{#each ... (key)}` | `:key` | `key={...}` |
 | `React.memo`, `useCallback` | | | not needed: nothing renders again |

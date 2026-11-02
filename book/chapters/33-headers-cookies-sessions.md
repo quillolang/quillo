@@ -316,8 +316,8 @@ component LoginForm() {
         let r = sign_in(email, password)
         if is_err(r) { problem = r.error } else { navigate("/") }
     }}>
-        <input name="email" bind:value={email}/>
-        <input name="password" type="password" bind:value={password}/>
+        <input name="email" value={email}/>
+        <input name="password" type="password" value={password}/>
         <p.hint>{problem}</p>
         <button>Sign in</button>
     </form>

@@ -4699,11 +4699,12 @@ impl Checker {
                 if is_view {
                     self.error(format!("<{}> is a view; `@{}` handlers go on HTML elements", el.tag, ev));
                 } else if t.bits != 0 && t.bits & FN == 0 {
-                    self.error(format!("`@{}` needs a function, got {}", ev, bits_text(t.bits)));
+                    // `onclick={text}` is read as this too: say what a handler is.
+                    self.error(format!("`@{}` needs a function, got {}: a handler is a function, `@{}={{() => ...}}` (or `on{}`); text is never run as code", ev, bits_text(t.bits), ev, ev));
                 }
             } else if let Some(prop) = name.strip_prefix("bind:") {
-                if !matches!(prop, "value" | "checked") {
-                    self.error(format!("`bind:{}` is not supported (use bind:value or bind:checked)", prop));
+                if crate::ast::bind_event(&el.tag, prop).is_none() {
+                    self.error(format!("`bind:{}` is not something a person changes in <{}> (see bind in the guide: value, checked, indeterminate, open, muted, volume, currentTime, playbackRate)", prop, el.tag));
                 }
                 match v {
                     AttrVal::Expr(Expr::Ident(n, _)) => {

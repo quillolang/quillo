@@ -90,7 +90,7 @@ fn what_a_handler_cannot_assign() {
 #[test]
 fn what_binding_and_live_need() {
     assert_eq!(refused("component C() {\n  <input bind:value=\"x\"/>\n}"), "case.qwe:2: <C> (compiled for the browser): `bind:value` needs a variable: bind:value={name}");
-    assert_eq!(refused("component C() {\n  state a = 1\n  <input bind:nope={a}/>\n}"), "case.qwe:3: <C> (compiled for the browser): `bind:nope` is not supported (use bind:value or bind:checked)");
+    assert_eq!(refused("component C() {\n  state a = 1\n  <input bind:nope={a}/>\n}"), "case.qwe:3: <C> (compiled for the browser): `bind:nope` is not something a person changes in <input> (see bind in the guide: value, checked, indeterminate, open, muted, volume, currentTime, playbackRate)");
     assert_eq!(refused("let g = 1\ncomponent C() {\n  <input bind:value={g}/>\n}"), "case.qwe:3: <C> (compiled for the browser): `bind:value` needs component state, like `state g`");
     assert_eq!(refused("component C(p) {\n  <input bind:value={p}/>\n}"), "case.qwe:2: <C> (compiled for the browser): `bind:value` needs component state, like `state p`");
     assert_eq!(refused("component C() {\n  state x = live(print)\n  <p>{x}</p>\n}"), "case.qwe:2: <C> (compiled for the browser): `live` needs a server fn: `print` is not one");

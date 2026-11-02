@@ -1,0 +1,47 @@
+// `x={state}` on what a person changes in the page, where nothing else on the element sets
+// it, is two-way, as `bind:x` is: a text, a box ticked or half ticked, a choice, a <details>
+// or <dialog> opened, a player's sound, place and speed. One with a handler of its own on that
+// event, `readonly`, or a value that is not a state stays one way. `onclick={...}` on an
+// element is `@click={...}` (branch feedback40-43).
+
+component Implied(clip: str) {
+    state name = ""
+    state agree = false
+    state half = true
+    state size = "m"
+    state code = ""
+    state locked = "kept"
+    state n = 0
+    state shown = false
+    state asking = true
+    state quiet = false
+    state loud = 1.0
+    state speed = 1.0
+    state at = 0.0
+    state qty = 1
+    let fixed_text = "fixed"
+    <div>
+        <input #name value={name}/>
+        <input #agree type="checkbox" checked={agree}/>
+        <input #half type="checkbox" indeterminate={half}/>
+        <select #size value={size}><option value="s">S</option><option value="m">M</option></select>
+        <input #code value={code} @input={(e) => { code = upper(e.target.value) }}/>
+        <input #locked value={locked} readonly/>
+        <input #fixed value={fixed_text}/>
+        <input #qty type="number" value={qty}/>
+        <button #inc onclick={() => { n += 1 }}>+</button>
+        <details #more open={shown}><summary>more</summary>more</details>
+        <dialog #ask open={asking}>asked</dialog>
+        <audio #player src={clip} muted={quiet} volume={loud} playbackRate={speed} currentTime={at}></audio>
+        <button #set @click={() => { loud = 0.5
+            speed = 1.5 }}>set</button>
+        <button #wild @click={() => { loud = 3.0
+            speed = -1.0 }}>wild</button>
+        <p #out>{name}|{agree ? "on" : "off"}|{half ? "half" : "whole"}|{size}|{code}|{locked}|{n}|{shown ? "open" : "shut"}|{asking ? "asking" : "closed"}|{quiet ? "quiet" : "sound"}|{loud}|{speed}|{at}|{qty + 1}</p>
+    </div>
+}
+
+route GET / = <html><body><Implied clip="/clip.wav"/></body></html>
+
+// A second of silence (tests/browser/clip.wav), for the player to have a place to go to.
+route GET /clip.wav = file("clip.wav")

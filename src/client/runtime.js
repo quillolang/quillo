@@ -5350,6 +5350,21 @@ function setProp(el, k, v, old) {
     if (k !== "value") { if (nv) el.setAttribute(k, ""); else el.removeAttribute(k); }
     return;
   }
+  // What only a property says: a box half ticked, a player's volume, place and speed. The
+  // server's HTML cannot say them, so they are set when the page is taken up too, unless the
+  // person has changed them already; a value out of range is brought into it, and one that is
+  // no number is left out, as the browser would throw (branch feedback40-43).
+  if (k === "indeterminate") { el.indeterminate = truthy(v); return; }
+  if (k === "volume" || k === "currentTime" || k === "playbackRate") {
+    let n = Number(v);
+    if (isNil(v) || !Number.isFinite(n) || (claiming && el[k] !== (k === "currentTime" ? 0 : 1))) return;
+    n = k === "volume" ? Math.min(1, Math.max(0, n)) : k === "playbackRate" ? Math.min(16, Math.max(0.0625, n)) : Math.max(0, n);
+    // A place the player has just reported, set back a moment later, would seek while it plays:
+    // within a tenth of a second is where it is.
+    if (k === "currentTime" ? Math.abs(el.currentTime - n) < 0.1 : el[k] === n) return;
+    try { el[k] = n; } catch (_) { /* a player that cannot take it now keeps what it has */ }
+    return;
+  }
   // What a person opened or closed stays until the value itself changes.
   if (k === "open" && old !== undefined && truthy(old) === truthy(v)) return;
   if ((k === "style" || k === "class") && typeof v === "string" && (typeof old === "string" || isNil(old) || old === false) && old !== undefined) {

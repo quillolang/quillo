@@ -2692,17 +2692,35 @@ impl Parser {
                 Some(c) => return self.html_err(format!("unexpected `{}` in <{}> tag", c, tag)),
             }
         };
+        // `onclick={...}` on an element is `@click={...}`: a handler the program gives, not text the
+        // browser runs. `onclick="..."` stays HTML's own, and text built from values stays refused
+        // below; on a component, `on_change={...}` is a parameter (branch feedback40-43).
+        let mut renamed = Vec::new();
+        if tag.starts_with(|c: char| c.is_ascii_lowercase()) {
+            for (n, v) in attrs.iter_mut() {
+                let lower = n.to_ascii_lowercase();
+                let handler = matches!(v, AttrVal::Expr(e) if !matches!(e, Expr::Lit(_) | Expr::Template(_)));
+                if handler && lower.len() > 2 && lower.starts_with("on") && lower[2..].bytes().all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'_') {
+                    renamed.push(format!("@{}", &lower[2..]));
+                    *n = format!("@{}", &lower[2..]);
+                }
+            }
+        }
         // One of the two would be lost: in a list, `key` and a view's own
         // `key` was such a pair.
         if let Some((_, (name, _))) = attrs.iter().enumerate().find(|(i, (n, _))| n != "..." && attrs[..*i].iter().any(|(m, _)| m == n)) {
-            return self.html_err(format!("attribute `{}` is written twice in <{}>", name, tag));
+            let hint = if renamed.contains(name) { format!(" (`on{}={{...}}` is `{}`)", &name[1..], name) } else { String::new() };
+            return self.html_err(format!("attribute `{}` is written twice in <{}>{}", name, tag, hint));
         }
         // The browser decodes these attributes before it runs them, so no
         // escaping keeps a value from data from running as code.
         if let Some((name, _)) = attrs.iter().find(|(n, v)| code_from_data(&tag, &attrs, n, v)) {
             let lower = name.to_ascii_lowercase();
             let msg = match lower.strip_prefix("bind:").unwrap_or(&lower).strip_prefix("on") {
-                Some(ev) => format!("`{}` in <{}> takes only text written here, as it runs as code: handle the event with `@{}={{...}}`", name, tag, ev),
+                Some(ev) if !ev.is_empty() && ev.bytes().all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'_') => {
+                    format!("`{}` in <{}> takes only text written here, as it runs as code: handle the event with `@{}={{...}}`", name, tag, ev)
+                }
+                Some(_) => format!("`{}` in <{}> takes only text written here, as the browser runs it as code", name, tag),
                 None => format!("`{}` in <{}> takes only text written here, unless the element also has a `sandbox` attribute without allow-same-origin", name, tag),
             };
             return Err(QuilloError::new(msg, line));

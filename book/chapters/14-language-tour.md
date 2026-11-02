@@ -144,7 +144,8 @@ The built-in functions are free functions taking the list, map or string first (
 | `x.toFixed(2)` | `round(x, 2)` gives a number |
 | `s.match(/re/g)`, `s.replace(/re/g, ...)` | `re.find_all(s, "re")`, `re.replace(s, "re", ...)`; `re.test`, `re.find`, `re.split` |
 | `encodeURIComponent(s)` | `url_encode(s)`, which also encodes `!'()*`; `url_encode(map)` gives a query string |
-- Text in HTML follows JSX, but `class` (not `className`) and `@click` (not `onClick`).
+- Text in HTML follows JSX, but `class` (not `className`), and a handler is `@click={...}`
+  or `onclick={...}`, which on an element mean the same.
 
 ## Variables, functions, views
 
@@ -498,10 +499,14 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   out double-quoted. `true` renders a bare attribute; `false`/`null` leaves it
   out. A name may hold `-`, `_`, `:`, `@` and `.` (`data-id`, `bind:value`, `@click`),
   the `{name}` shorthand takes a bare name, and an attribute written twice is an error.
-- Event handler attributes (`onclick`, any `on...`) and `srcdoc` take only `"text"`
-  written in the program: the browser decodes their value and runs it, so escaping
-  cannot keep data out of the code. `onmouseover={...}` is an error when the program
-  loads (and in `quillo check`); handle events with `@mouseover={...}`. An `<iframe>`
+- An event attribute given an expression, `onclick={() => ...}` or `onClick={save}`, is a
+  handler, the same as `@click={...}` (both on one element is an error). Given text,
+  `onclick="..."`, it is HTML's own and runs in the browser as written, so it takes only
+  `"text"` written in the program: the browser decodes the value and runs it, and escaping
+  cannot keep data out of code. Text made from values, ``onmouseover={`go('${u}')`}``, is
+  an error when the program loads (and in `quillo check`), and a handler given text
+  (`onclick={u}` with `u` a str) is an error in `quillo check` and does nothing in the page.
+  `srcdoc` takes only text too. An `<iframe>`
   with a written `sandbox` attribute that does not say `allow-same-origin` may take
   `srcdoc={...}`: its page cannot reach the site. A view's or component's attributes
   are its parameters, so `on_change={...}` there is fine.
