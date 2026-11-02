@@ -1374,6 +1374,91 @@ fn an_error_in_a_page_names_its_place_in_development_only() {
     assert_eq!(r["said"], serde_json::json!(["quillo: division by zero"]));
 }
 
+/// What a developer tool hears, as `quillo:devtools` events, once the page asks with
+/// `<html data-quillo-devtools="1">`, and what it may ask; nothing at all on a page that does
+/// not ask (FEEDBACK42.md, Part C; branch feedback40-43). Also: a component inside another
+/// whose text a script changed is made again, not left empty with "quillo: text".
+#[test]
+fn a_developer_tool_hears_what_happens() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let (app, script) = (dir.join("devtools.qwe"), dir.join("devtools.js"));
+    for dev in [true, false] {
+        let r = run_page_args(&chrome, &app, free_port(), "/", Some(&script), if dev { &["--watch"] } else { &[] });
+        assert!(r["exception"].is_null(), "{}", r);
+        let heard = r["heard"].as_array().unwrap();
+        let of = |t: &str| heard.iter().filter(|m| m["type"] == t).collect::<Vec<_>>();
+        let first = |t: &str, f: &dyn Fn(&serde_json::Value) -> bool| of(t).into_iter().find(|m| f(m)).cloned().unwrap_or_else(|| panic!("no {} in {}", t, r));
+        assert_eq!(heard[0], serde_json::json!({ "type": "hello", "protocol": 1, "version": env!("CARGO_PKG_VERSION"), "dev": dev, "base": "" }));
+        let panel = first("component", &|m| m["name"] == "Panel");
+        assert_eq!(panel["parent"], serde_json::Value::Null);
+        assert_eq!(panel["state"], serde_json::json!({ "count": 0, "show": false, "price": 12.5, "items": [], "got": [], "answer": "" }));
+        let id = panel["id"].clone();
+        assert_eq!(first("component", &|m| m["props"]["label"] == "kept")["parent"], id);
+        // Made in the browser, then gone.
+        let made = first("component", &|m| m["props"]["label"] == "made");
+        assert_eq!(made["parent"], id);
+        assert!(of("gone").iter().any(|m| m["id"] == made["id"]), "{}", r);
+        assert!(of("state").iter().any(|m| m["id"] == id && m["name"] == "count" && m["value"] == 1), "{}", r);
+        // Made again: what differed, under --watch.
+        let remade = first("remade", &|m| m["name"] == "Said");
+        assert_eq!(remade.get("makes").is_some(), dev, "{}", remade);
+        assert_eq!(r["said"], "as written");
+        assert_eq!(first("live", &|_| true)["loads"], serde_json::json!([{ "id": id, "name": "Panel" }]));
+        let call = |n: &str| first("call", &|m| m["name"] == n);
+        assert_eq!((call("add_note")["ok"].clone(), call("add_note")["value"].clone(), call("add_note")["live"].clone()), (true.into(), 1.into(), false.into()));
+        assert_eq!(call("notes")["live"], true);
+        assert_eq!((call("refuse")["ok"].clone(), call("refuse")["failed"].clone(), call("refuse")["value"].clone()), (false.into(), false.into(), serde_json::json!({ "$quillo_err": "no" })));
+        assert!(of("channel").iter().any(|m| m["dir"] == "out" && m["value"]["text"] == "hello"), "{}", r);
+        assert!(of("channel").iter().any(|m| m["dir"] == "in" && m["value"]["text"] == "hello"), "{}", r);
+        assert!(of("channel").iter().any(|m| m["channel"] == "vip" && m["joined"] == false), "{}", r);
+        let error = first("error", &|m| m["message"].as_str().unwrap().contains("JSON"));
+        assert_eq!(error["place"].as_str().map_or(false, |p| p.contains("devtools.qwe:45: ")), dev, "{}", error);
+        assert_eq!(r["errors"].as_array().unwrap().len(), 1, "{}", r);
+        // The asks: list, where (and its mark moving), set under --watch only, and what is wrong.
+        let answers = r["answers"].as_array().unwrap();
+        let ok = |n: i64| answers.iter().find(|a| a["id"] == n).map(|a| a["ok"].clone()).unwrap_or_else(|| panic!("no answer {} in {}", n, r));
+        assert_eq!((ok(1), ok(2), ok(3), ok(4), ok(5), ok(6)), (true.into(), true.into(), false.into(), dev.into(), false.into(), false.into()));
+        assert_eq!((r["marked"].clone(), r["unmarked"].clone()), (true.into(), true.into()));
+        assert_eq!(r["shown"], if dev { "41" } else { "2" });
+        assert!(answers.iter().any(|a| a["id"].is_null() && a["ok"] == true), "{}", r);
+    }
+    // A page that does not ask hears nothing, and is not answered.
+    let r = run_page_args(&chrome, &app, free_port(), "/plain", Some(&script), &[]);
+    assert_eq!((r["heard"].clone(), r["answers"].clone()), (serde_json::json!([]), serde_json::json!([])), "{}", r);
+}
+
+/// Under `--watch` the runtime keeps to a scope of its own, as in production: the page's own
+/// `function report()` stays the page's, a script loaded later with a `function run()` stops
+/// no component, and `window` gets the names production gives it (FEEDBACK42.md, Q-481; branch
+/// feedback40-43).
+#[test]
+fn in_development_the_runtime_and_the_page_keep_their_own_names() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let (app, script) = (dir.join("scoped/main.qwe"), dir.join("scoped.js"));
+    let dev = run_page_args(&chrome, &app, free_port(), "/", Some(&script), &["--watch"]);
+    let prod = run_page_args(&chrome, &app, free_port(), "/", Some(&script), &[]);
+    for r in [&dev, &prod] {
+        assert_eq!(r["report"], "the page's own report", "{}", r);
+        assert_eq!(r["second"], "tally 2", "{}", r);
+        assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
+    }
+    // The same names on `window` but the one production hands its bundles the runtime by.
+    let names = |r: &serde_json::Value| {
+        let mut v: Vec<String> = r["globals"].as_array().unwrap().iter().filter_map(|n| n.as_str()).filter(|n| *n != "__quillo_rt").map(String::from).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(names(&dev), names(&prod));
+}
+
 #[test]
 fn in_development_components_come_in_files_of_their_own_mapped_to_their_lines() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {
@@ -1415,7 +1500,7 @@ fn in_development_components_come_in_files_of_their_own_mapped_to_their_lines() 
     let r: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let scripts: Vec<String> = r["scripts"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect();
     let files: Vec<&str> = scripts.iter().filter_map(|s| s.strip_prefix("/_quillo/src/")).map(|s| s.split_once('/').unwrap().1).collect();
-    assert_eq!(files, vec!["quillo.js", "program.js", "ui/counter.qwe/label.js", "ui/counter.qwe/Counter.js", "boot.js"]);
+    assert_eq!(files, vec!["quillo.js", "ui/counter.qwe/label.js", "ui/counter.qwe/Counter.js", "boot.js"]);
     assert!(r["breakpointIn"].as_str().unwrap().ends_with("/ui/counter.qwe/Counter.js"), "{}", r);
     assert_eq!(r["stoppedAt"], 7, "{}", r);
     assert!(r["stops"].as_array().unwrap().iter().all(|l| l == 7), "{}", r);

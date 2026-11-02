@@ -1,0 +1,55 @@
+// What a developer tool hears and may ask (FEEDBACK42.md, Part C): the page asks for it with
+// <html data-quillo-devtools="1">, and /plain does not. Driven by devtools.js
+// (tests/browser.rs, a_developer_tool_hears_what_happens).
+
+db.open(":memory:")
+db.exec("create table notes (text text)")
+
+server fn add_note(text: str) with db {
+    db.exec("insert into notes (text) values (?)", text)
+    len(db.query("select * from notes"))
+}
+server fn refuse() -> int ! str = err("no")
+server fn notes() with db = db.query("select text from notes")
+
+channel.on("room", (msg, peer) => { channel.broadcast("room", msg) })
+channel.on("vip", (m) => null, { join: (peer) => false })
+
+component Inner(label: str) {
+    state n = 1
+    <span class="inner">{label} <button class="bump" @click={() => { n += 1 }}>{n}</button></span>
+}
+
+// Its text a script changes before the page is taken up: made again.
+component Said(text: str) {
+    <span class="said">{text}</span>
+}
+
+component Panel() {
+    state count = 0
+    state show = false
+    state price = 12.5
+    state items = live(notes)
+    state got = []
+    state answer = ""
+    let room = channel.open("room", (m) => { got = got + [m.text] })
+    let _vip = channel.open("vip", (m) => null)
+    <div id="panel">
+        <button id="up" @click={() => { count += 1; show = !show }}>{count}</button>
+        <Inner label="kept"/>
+        {show && <Inner label="made"/>}
+        <Said text="as written"/>
+        <button id="add" @click={() => { answer = str(add_note("hi")) }}>add</button>
+        <button id="refuse" @click={() => { answer = str(refuse()) }}>refuse</button>
+        <button id="send" @click={() => room.send({ text: "hello" })}>send</button>
+        <button id="boom" @click={() => { let _x = js("JSON.parse", "{"); count += 1 }}>boom</button>
+        <p id="n">{len(items)} {answer} {len(got)} {price}</p>
+    </div>
+}
+
+let CHANGE = "<script>document.addEventListener('DOMContentLoaded', () => { document.querySelector('.said').textContent = 'changed' })</script>"
+// Listening from the start, as a tool's content script at document_start does.
+let HEAR = "<script>window.__heard = []; document.addEventListener('quillo:devtools', (e) => window.__heard.push(JSON.parse(e.detail)))</script>"
+
+route GET / = <html data-quillo-devtools="1"><head>{raw(HEAR)}{raw(CHANGE)}</head><body><Panel/></body></html>
+route GET /plain = <html><head>{raw(HEAR)}</head><body><Panel/></body></html>

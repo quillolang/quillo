@@ -101,16 +101,21 @@ fn each_function_has_a_file_mapped_to_its_lines() {
     let it = program(&d, "main.qwe", &src);
     let (at, files) = listed(&client::bundle(&it).unwrap());
     assert!(at.starts_with("/_quillo/src/"), "{}", at);
-    assert_eq!(files, ["quillo.js", "program.js", "main.qwe/helper.js", "main.qwe/Counter.js", "boot.js"]);
+    // The program's blocks and `DEV` are in the runtime's own function (FEEDBACK42.md, Q-481).
+    assert_eq!(files, ["quillo.js", "main.qwe/helper.js", "main.qwe/Counter.js", "boot.js"]);
     let hash = hash_of(&at);
     let (runtime, none) = file(&hash, "quillo.js");
     assert!(runtime.contains("function boot"), "the runtime as it is written");
     assert!(none.is_none());
-    let (program_js, _) = file(&hash, "program.js");
-    assert!(program_js.contains("DEV = true;"));
+    assert!(runtime.starts_with("(function () { ") && runtime.contains("DEV = true;"), "in a function of its own");
+    assert!(runtime.contains("Object.defineProperty(window, Symbol.for(\"quillo.dev\")"), "handed over by a symbol, not a name");
     let (helper, map) = file(&hash, "main.qwe/helper.js");
     let map = map.expect("a source map");
-    assert!(helper.starts_with("\"use strict\";\n"));
+    // In a function that takes the runtime's names, opened on the first line, so the map's
+    // lines are the file's (Q-481).
+    assert!(helper.starts_with("(function ($rt) { \"use strict\"; const { "), "{}", helper);
+    assert_eq!(helper.lines().next().unwrap().matches('\n').count(), 0);
+    assert!(helper.contains("})(window[Symbol.for(\"quillo.dev\")]);\n//# sourceMappingURL="), "{}", helper);
     assert!(!helper.contains('\u{1}'), "a line mark was left in");
     assert_eq!(map["version"], 3);
     assert_eq!(map["sources"][0].as_str().unwrap(), format!("file://{}", d.join("main.qwe").display()));
@@ -150,6 +155,31 @@ fn constants_and_views_go_in_files_between_the_functions() {
     assert!(!joined[plain].contains('\u{1}'));
 }
 
+/// A piece with no source map is closed at its end, even when a value of the program holds
+/// the words a map's line starts with; it was closed inside the string (branch feedback40-43).
+#[test]
+fn a_value_that_names_a_source_map_stays_whole() {
+    let _one = alone();
+    let d = temp_dir("client-dev-map-words").canonicalize().unwrap();
+    let src = "let note = \"see //# sourceMappingURL=x.map\"\ncomponent C() = <p>{note}</p>\n";
+    let it = program(&d, "main.qwe", src);
+    let (at, files) = listed(&client::bundle(&it).unwrap());
+    let hash = hash_of(&at);
+    let close = "})(window[Symbol.for(\"quillo.dev\")]);\n";
+    for f in &files[1..] {
+        let text = client::dev_file(&hash, f).unwrap();
+        assert!(text.starts_with("(function ($rt) { \"use strict\"; const { "), "{}: {}", f, text);
+        // Closed once: before its map's line, else at its end.
+        assert_eq!(text.matches(close).count(), 1, "{}: {}", f, text);
+        match text.rfind("\n//# sourceMappingURL=data:") {
+            Some(i) => assert!(text[..i + 1].ends_with(close), "{}: {}", f, text),
+            None => assert!(text.ends_with(close), "{}: {}", f, text),
+        }
+    }
+    let joined: String = files.iter().map(|f| client::dev_file(&hash, f).unwrap()).collect();
+    assert!(joined.contains("\"see //# sourceMappingURL=x.map\""), "{}", joined);
+}
+
 #[test]
 fn a_view_with_no_file_of_its_own_gets_one() {
     let _one = alone();
@@ -171,7 +201,8 @@ fn a_mounted_programs_base_is_in_the_addresses() {
     it.base = "/shop".to_string();
     let (at, files) = listed(&client::bundle(&it).unwrap());
     assert!(at.starts_with("/shop/_quillo/src/"), "{}", at);
-    let (text, _) = file(&hash_of(&at), &files[1]);
+    assert_eq!(files[0], "quillo.js");
+    let (text, _) = file(&hash_of(&at), &files[0]);
     assert!(text.contains("BASE = \"/shop\";"), "{}", text);
 }
 

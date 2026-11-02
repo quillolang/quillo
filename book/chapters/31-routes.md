@@ -1189,7 +1189,10 @@ How messages travel:
   together, give it a real one. A WebTransport connection is kept alive every 5 s and
   dropped after 20 s of silence. Behind a proxy that passes HTTP only, open the UDP
   port to the server itself, or pages use the WebSocket. [`--no-wt`](#options-of-quillo-run) turns WebTransport
-  off, as does a build without the `realtime` feature.
+  off, as does a build without the `realtime` feature. The browser's Network panel shows
+  a WebTransport session open but none of its messages, so to watch a channel's messages
+  there, run with `--no-wt`: each one is then a WebSocket frame (`["m","room",{...}]`)
+  (FEEDBACK42.md, Q-485).
 - Broadcasts reach the pages connected to this server (its [`--instances`](#options-of-quillo-run) share them;
   servers behind limer do not relay them, see [Several servers](#several-servers)).
   With [`--metrics`](#options-of-quillo-run), `quillo_channel_pages` counts them and `quillo_channel_dropped_total`

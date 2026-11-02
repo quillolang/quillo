@@ -3463,6 +3463,7 @@ B.channel = {
 // connection is down) kept, up to a point.
 function chanSend(name, v, o) {
   const text = jsonText(["m", name, v]);
+  if (TOOLS) toolsSay("channel", { dir: "out", channel: name, value: toolsWire(v) });
   const reliable = isMap(o) && truthy(o.reliable);
   if (Chan.conn && Chan.joined.has(name)) {
     Chan.conn.put(text, reliable);
@@ -3667,6 +3668,7 @@ function chanGot(text) {
   let m;
   try { m = JSON.parse(text); } catch (e) { return; }
   const [k, name, v] = m, subs = Chan.subs.get(name);
+  if (TOOLS) toolsSay("channel", k === "j" ? { dir: "in", channel: name, joined: !!v } : { dir: "in", channel: name, value: v });
   if (!subs) return;
   if (k === "j") {
     if (!v) {
@@ -4073,6 +4075,13 @@ function idemKey() {
 // (`h`, the hash of `base`, its last value from the server) and the answer
 // may be a patch to that (FEEDBACK2.md, Q-028; branch feedback6-fixes).
 async function rpcRaw(name, args, live, idem) {
+  if (!TOOLS) return rpcSend(name, args, live, idem);
+  const t0 = performance.now(), r = await rpcSend(name, args, live, idem);
+  toolsSay("call", { name, args: args.map(toolsWire), ms: Math.round(performance.now() - t0), ok: !r.failed && !(r.value instanceof Err), failed: !!r.failed, value: toolsWire(r.value), live: !!live, idempotent: !!idem });
+  return r;
+}
+
+async function rpcSend(name, args, live, idem) {
   let r;
   // It may change what was kept for a link (see `Ahead`).
   if (!live) aheadDrop();
@@ -4268,6 +4277,7 @@ function liveChanged(j) {
   Live.server = j.server || "";
   const changed = new Set(j.changed || []);
   if (!changed.size) return;
+  if (TOOLS) toolsSay("live", { seq: j.seq, topics: [...changed], loads: [...Live.subs].filter((s) => s.topics.some((t) => changed.has(t))).map((s) => ({ id: TOOLS.ids.get(s.inst) || null, name: s.inst.def.$name })) });
   for (const s of [...Live.subs]) {
     if (!s.topics.some((t) => changed.has(t))) continue;
     if (s.seen >= j.seq && s.seenOn === Live.server) continue;
@@ -4361,6 +4371,7 @@ function disposeKids(s) {
 function dispose(s) {
   if (s.dead) return;
   s.dead = true;
+  if (TOOLS && s instanceof Inst) toolsGone(s);
   const up = s.up;
   if (up && up.owned) {
     const i = up.owned.indexOf(s), last = up.owned.pop();
@@ -4516,7 +4527,10 @@ function runCalc(c) {
     Owner = o;
     if (c.src && c.at < c.src.length) unlinkFrom(c, c.at);
     c.state = c.effect ? CLEAN : DIRTY;
-    if (c.effect) {
+    // Taking up the page's HTML found it not what the code makes (a text a script changed):
+    // for the component to be made again (see `island`, `resume`), not an error to report,
+    // after which it stayed empty (branch feedback40-43).
+    if (c.effect && !(e instanceof Mismatch)) {
       report(e);
       // A place whose value failed is emptied: the last good value beside a field that no
       // longer says it reads as the page's answer (FEEDBACK30.md, Q-370; branch
@@ -5797,6 +5811,8 @@ class Inst extends Scope {
     this.s0 = state || {};
     this.liveInfo = liveInfo || null;
     this.el = null;
+    // Its id from the start, for the components inside it to name it as theirs.
+    if (TOOLS) TOOLS.ids.set(this, TOOLS.next++);
   }
 
   // `state name = init`: what the server rendered with, or init's value.
@@ -5808,12 +5824,17 @@ class Inst extends Scope {
   sig(name, init, page) {
     const had = this.sigs || (this.sigs = {});
     if (had[name]) return had[name];
+    const s = this.made(name, init, page);
+    return (had[name] = TOOLS ? toolsSig(this, name, s) : s);
+  }
+
+  made(name, init, page) {
     if (hasOwn(this.s0, name)) {
       // `{"$quillo_prop": "initial"}`: the prop's own value, written once (FEEDBACK30.md, Q-371;
       // branch feedback27-35-fixes).
       let v = this.s0[name];
       if (v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length === 1 && typeof v.$quillo_prop === "string") v = this.props[v.$quillo_prop];
-      const s = (had[name] = new Sig(v));
+      const s = new Sig(v);
       if (page) Promise.resolve().then(init).then((x) => s.set(x), report);
       return s;
     }
@@ -5821,9 +5842,9 @@ class Inst extends Scope {
     if (v instanceof Promise) {
       const s = new Sig(null);
       v.then((x) => s.set(x), report);
-      return (had[name] = s);
+      return s;
     }
-    return (had[name] = new Sig(v));
+    return new Sig(v);
   }
 }
 
@@ -5861,6 +5882,7 @@ function asOwnRoot(w, inst) {
 function remade(name) {
   if (typeof window !== "undefined") window.__quilloRemade = (window.__quilloRemade || 0) + 1;
   if (DEV && wanted) console.warn(`quillo: <${name}> was made again, not taken up from the server's HTML: where it wrote ${onPage(wanted[0])}, the browser makes ${wanted[1]}`); // dev
+  if (TOOLS) toolsSay("remade", Object.assign({ name }, toolsWanted()));
 }
 
 // A component in its <quillo-island>: made, or taking up the page's.
@@ -5877,6 +5899,7 @@ function island(def, props, h, c) {
   inst.el = el;
   if (!c.claim) {
     run(inst, el, false);
+    if (TOOLS) toolsMade(inst);
     return asOwnRoot(el, inst);
   }
   // One inside another that cannot be taken up is made again by itself, and
@@ -5894,6 +5917,7 @@ function island(def, props, h, c) {
     inst.el = el;
     run(inst, el, false);
   }
+  if (TOOLS) toolsMade(inst);
   return el;
 }
 
@@ -5990,6 +6014,7 @@ function report(e) {
   if (DEV && e instanceof Error) said.splice(1, 1, placed(e), e); // dev
   console.error(...said);
   if (typeof window !== "undefined" && window.__quilloErrors) window.__quilloErrors.push(String(e && e.message || e));
+  if (TOOLS) toolsSay("error", { message: String(e && e.message || e), place: DEV && e instanceof Error ? toolsPlace(e) : null, id: toolsOwner() });
 }
 
 // ---- resuming: the server's HTML, taken up as it is ----------------------
@@ -6006,6 +6031,111 @@ function outerIsland(node) {
   let i = node && node.nodeType === 1 && node.closest ? node.closest(ISLANDS) : null;
   for (let up = i && i.parentElement && i.parentElement.closest(ISLANDS); up; up = up.parentElement && up.parentElement.closest(ISLANDS)) i = up;
   return i;
+}
+
+// ---- what a developer tool hears (FEEDBACK42.md, Part C; branch feedback40-43) ----
+//
+// Off until a tool asks, by `<html data-quillo-devtools="1">` before the runtime starts
+// (an extension's content script at document_start). Then the runtime says what happens
+// as `quillo:devtools` events on `document`, each `detail` a JSON string (so it reaches an
+// extension's isolated world), values as the wire writes them (`$dec`, `$int`,
+// `$quillo_err`); a tool asks with `quillo:devtools-ask` (`{ id, op, ... }`) and is
+// answered `{ type: "answer", id, ok }`. No name goes on `window`. With no tool, each hook
+// is one test of `TOOLS`, or is not put in place at all (a state's `set`).
+let TOOLS = null;
+let VERSION = ""; // Quillo's version: src/client.rs sets it after the runtime, as BASE
+
+function toolsStart() {
+  if (document.documentElement.getAttribute("data-quillo-devtools") !== "1") return;
+  TOOLS = { ids: new WeakMap(), all: new Map(), next: 1, marked: null };
+  document.addEventListener("quillo:devtools-ask", toolsAsk);
+  toolsSay("hello", { protocol: 1, version: VERSION, dev: DEV, base: BASE });
+}
+
+function toolsSay(type, o) {
+  document.dispatchEvent(new CustomEvent("quillo:devtools", { detail: JSON.stringify(Object.assign({ type }, o)) }));
+}
+
+// A value as the wire writes it; what cannot be written (a page's object) as its text.
+function toolsWire(v) {
+  if (v instanceof Err) return { $quillo_err: toolsWire(v.error) };
+  try { return toJSON(v, true); } catch (_) { return String(v); }
+}
+
+// The component the code running now belongs to, by its id.
+function toolsOwner() {
+  for (let s = Owner; s; s = s.up) if (s instanceof Inst) return TOOLS.ids.get(s) || null;
+  return null;
+}
+
+// Where an error is in the program, in development (the `.qwe` line); and what a component
+// made again was given and wanted (see `remade`).
+let toolsPlace = () => null;
+let toolsWanted = () => ({});
+toolsPlace = (e) => placed(e); // dev
+toolsWanted = () => (wanted ? { wrote: onPage(wanted[0]), makes: wanted[1] } : {}); // dev
+
+// A component as a tool sees it: its name, the one it is in, its props and its states.
+function toolsOf(inst) {
+  let parent = null;
+  for (let s = inst.up; s; s = s.up) if (s instanceof Inst) { parent = TOOLS.ids.get(s) || null; break; }
+  return untrack(() => {
+    const props = {}, state = {};
+    for (const k of Object.keys(inst.props || {})) { try { props[k] = toolsWire(inst.props[k]); } catch (e) { props[k] = { $quillo_err: String(e && e.message || e) }; } }
+    for (const k of Object.keys(inst.sigs || {})) state[k] = toolsWire(inst.sigs[k]._v);
+    return { id: TOOLS.ids.get(inst), name: inst.def.$name, parent, props, state };
+  });
+}
+
+// Said once it is in place, its states made; one made again in its stead was never said.
+function toolsMade(inst) {
+  TOOLS.all.set(TOOLS.ids.get(inst), inst);
+  toolsSay("component", toolsOf(inst));
+}
+
+function toolsGone(inst) {
+  const id = TOOLS.ids.get(inst);
+  if (TOOLS.all.delete(id)) toolsSay("gone", { id });
+}
+
+// A state that says when it is set; only the states of a page a tool looks at.
+function toolsSig(inst, name, s) {
+  s.set = function (v) {
+    const was = this._v;
+    Sig.prototype.set.call(this, v);
+    if (v !== was && TOOLS.all.get(TOOLS.ids.get(inst)) === inst) toolsSay("state", { id: TOOLS.ids.get(inst), name, value: toolsWire(v) });
+    return null;
+  };
+  return s;
+}
+
+// `list`: every component now; `where`: marks one's element for the tool to find (the mark
+// moves with the next `where`); `set`: sets a state, under --watch only.
+function toolsAsk(e) {
+  let q;
+  try { q = JSON.parse(e.detail); } catch (_) { return; }
+  if (!q || typeof q !== "object") return;
+  const answer = (ok, more) => toolsSay("answer", Object.assign({ id: q.id === undefined ? null : q.id, ok }, more));
+  const inst = TOOLS.all.get(q.target);
+  if (q.op === "list") {
+    for (const i of TOOLS.all.values()) toolsSay("component", toolsOf(i));
+    return answer(true);
+  }
+  if (q.op === "where") {
+    if (TOOLS.marked) TOOLS.marked.removeAttribute("data-quillo-devtools-id");
+    TOOLS.marked = inst && inst.el;
+    if (!TOOLS.marked) return answer(false, { error: "no such component" });
+    TOOLS.marked.setAttribute("data-quillo-devtools-id", String(q.target));
+    return answer(true);
+  }
+  if (q.op === "set") {
+    if (!DEV) return answer(false, { error: "states are set from a tool under --watch only" });
+    const sig = inst && inst.sigs && hasOwn(inst.sigs, q.name) ? inst.sigs[q.name] : null;
+    if (!sig) return answer(false, { error: "no such state" });
+    sig.set(untagDeep(q.value));
+    return answer(true);
+  }
+  answer(false, { error: "unknown op: " + q.op });
 }
 
 // An island taken up: its component (and those inside it) resumed from
@@ -6060,6 +6190,7 @@ function resume(el) {
     if (r !== el) { el.replaceWith(r); el = r; }
   }
   hydrating = null;
+  if (TOOLS) toolsMade(inst);
   // What was typed before it was taken up: the component hears it now.
   for (const f of el.querySelectorAll("input, textarea, select")) {
     if (!asParsed(f)) {
@@ -6095,6 +6226,7 @@ function wake(e) {
 }
 
 function boot() {
+  toolsStart();
   // A deferred island swapped in after the runtime came: taken up if it runs by itself.
   window.__quillo_resume = (el) => { if (el && !el.__q) resume(el); };
   // Someone reaching for an island takes it up (before their event is

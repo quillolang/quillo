@@ -1,0 +1,17 @@
+// FEEDBACK42.md Q-481: under --watch the runtime keeps to its own scope, as in production,
+// so the page's own `report()` and a later script's `run()` and Quillo's leave each other
+// alone. Driven by scoped.js.
+
+route GET /assets/*path = file("public/" + path)
+
+component Tally() {
+    state n = 0
+    <button.tally @click={() => { n = n + 1 }}>tally {n}</button>
+}
+
+route GET / =
+    <html><head><title>clash</title><script src="/assets/own.js"></script></head><body>
+        <Tally/>
+        <div.later><Tally/></div>
+        <button.widget onclick="const s = document.createElement('script'); s.src = '/assets/widget.js'; document.head.append(s); this.textContent = 'widget loaded'">load widget</button>
+    </body></html>

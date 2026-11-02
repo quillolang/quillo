@@ -399,7 +399,12 @@ route GET / = <html><body><Counter start={5}/></body></html>
   is idle.
 - A component is an element `<quillo-island data-c="Name" data-p="{props}"
   data-s="{state}">`, with `data-l` and `data-v` for live state and `data-e` when it runs
-  by itself. Values cross as JSON, with these marked so they come back as they were: a
+  by itself. `data-s` is the state the server rendered it with, and is not written again
+  as the state changes: after a click that makes `count` 6, it still says 5, so a test
+  or a tool reads the page, not `data-s`. A component inside another is written with
+  `data-p="{}"`, as the one around it passes its props when it runs; one made in the
+  browser (`{open && <Detail/>}` after a click) carries `data-c` alone (FEEDBACK42.md,
+  Q-487). Values cross as JSON, with these marked so they come back as they were: a
   decimal (`{"$dec": "12.50"}`), an int past 2^53 (`{"$int": "..."}`, a BigInt in the
   browser), an error value (`{"$quillo_err": ...}`). NaN and infinities become `null`;
   dates are their text, as everywhere.

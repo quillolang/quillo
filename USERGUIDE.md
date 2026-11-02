@@ -1432,7 +1432,12 @@ route GET / = <html><body><Counter start={5}/></body></html>
   is idle.
 - A component is an element `<quillo-island data-c="Name" data-p="{props}"
   data-s="{state}">`, with `data-l` and `data-v` for live state and `data-e` when it runs
-  by itself. Values cross as JSON, with these marked so they come back as they were: a
+  by itself. `data-s` is the state the server rendered it with, and is not written again
+  as the state changes: after a click that makes `count` 6, it still says 5, so a test
+  or a tool reads the page, not `data-s`. A component inside another is written with
+  `data-p="{}"`, as the one around it passes its props when it runs; one made in the
+  browser (`{open && <Detail/>}` after a click) carries `data-c` alone (FEEDBACK42.md,
+  Q-487). Values cross as JSON, with these marked so they come back as they were: a
   decimal (`{"$dec": "12.50"}`), an int past 2^53 (`{"$int": "..."}`, a BigInt in the
   browser), an error value (`{"$quillo_err": ...}`). NaN and infinities become `null`;
   dates are their text, as everywhere.
@@ -3779,7 +3784,10 @@ How messages travel:
   together, give it a real one. A WebTransport connection is kept alive every 5 s and
   dropped after 20 s of silence. Behind a proxy that passes HTTP only, open the UDP
   port to the server itself, or pages use the WebSocket. [`--no-wt`](#options-of-quillo-run) turns WebTransport
-  off, as does a build without the `realtime` feature.
+  off, as does a build without the `realtime` feature. The browser's Network panel shows
+  a WebTransport session open but none of its messages, so to watch a channel's messages
+  there, run with `--no-wt`: each one is then a WebSocket frame (`["m","room",{...}]`)
+  (FEEDBACK42.md, Q-485).
 - Broadcasts reach the pages connected to this server (its [`--instances`](#options-of-quillo-run) share them;
   servers behind limer do not relay them, see [Several servers](#several-servers)).
   With [`--metrics`](#options-of-quillo-run), `quillo_channel_pages` counts them and `quillo_channel_dropped_total`
@@ -6715,7 +6723,50 @@ from its lines to the `.qwe` file's. The browser's developer tools show them by 
 with the `.qwe` source beside them, and a variable a statement declares carries its own name
 (`count`, which the compiled code calls `$count_1`); a component's state is a signal, its
 value in `.v`. Values are JavaScript's: the debug console takes JavaScript, not Quillo. In
-production a page's bundle is one minified file, as before.
+production a page's bundle is one minified file, as before. In both, the runtime keeps its
+names to itself: none of its functions is the page's, so a page's own `function report()`
+or a widget's `function run()` and Quillo's leave each other alone (FEEDBACK42.md, Q-481).
+
+#### For developer tools
+
+A browser extension or a test can follow what the runtime does, without the debugger. It
+asks by setting `data-quillo-devtools="1"` on `<html>` before the runtime starts (a content
+script at `document_start`, or the page itself); a page that does not ask does nothing
+more. The runtime then says what happens as `quillo:devtools` events on `document`, each
+`detail` a JSON string, with values written as the wire writes them (`{"$dec": "12.50"}`,
+`{"$int": "..."}`, `{"$quillo_err": ...}`):
+
+```js
+document.documentElement.dataset.quilloDevtools = "1";
+document.addEventListener("quillo:devtools", (e) => console.log(JSON.parse(e.detail)));
+// {"type":"component","id":1,"name":"Panel","parent":null,"props":{},"state":{"count":0}}
+// {"type":"state","id":1,"name":"count","value":1}
+```
+
+| `type` | When | Carries |
+|---|---|---|
+| `hello` | the runtime starts | `protocol` (1), `version`, `dev` (under `--watch`), `base` |
+| `component` | one is taken up or made in the page | `id`, `name`, `parent` (the id of the one it is in), `props`, `state` |
+| `state` | a state is set to another value | `id`, `name`, `value` |
+| `gone` | a component leaves the page | `id` |
+| `error` | an error is reported | `message`, `place` (the `.qwe` file and line, under `--watch`), `id` when known |
+| `remade` | a component is made again, not taken up | `name`; under `--watch`, `wrote` (what the page had) and `makes` |
+| `call` | a server fn answers | `name`, `args`, `ms`, `ok`, `failed` (it did not reach the server), `value`, `live`, `idempotent` |
+| `live` | a live change comes | `seq`, `topics`, `loads` (the components whose live states load again) |
+| `channel` | a message goes or comes, over WebTransport or a WebSocket | `dir` (`in`, `out`), `channel`, `value`; or `joined` (true, false) |
+
+A tool asks with a `quillo:devtools-ask` event, its `detail` a JSON string
+`{ "id": ..., "op": ... }`, and is answered `{"type": "answer", "id": ..., "ok": ...}`, with
+`error` when not:
+
+| `op` | |
+|---|---|
+| `list` | each component now, as a `component` message |
+| `where`, `target` | marks the component's element with `data-quillo-devtools-id` (the mark moves with the next `where`) |
+| `set`, `target`, `name`, `value` | sets a state; under `--watch` only |
+
+Reading is open in production, as the page can be read with the browser's debugger anyway;
+setting is not (FEEDBACK42.md, Part C).
 
 #### Other editors
 

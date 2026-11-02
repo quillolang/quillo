@@ -176,10 +176,23 @@
 - **PostgreSQL errors carry their SQLSTATE** (` [23505]`), and `db.error_kind` reads it
   first, so it works whatever language the server speaks (Q-493).
 
-### Checking (FEEDBACK42.md)
+### Developer tools and the browser (FEEDBACK42.md)
 
 - **`quillo check` warns of `sleep(0.2)`**: `sleep` takes milliseconds, and a number written
   between 0 and 1 is a fraction of one (Q-482).
+- **Under `--watch` the runtime keeps its names to itself**, as in production: they were
+  the page's globals, so a page's own `function report()` was replaced by Quillo's, and a
+  script loaded later with a `function run()` stopped every component not yet taken up,
+  under `--watch` only (Q-481).
+- **An interface for developer tools**: a page with `<html data-quillo-devtools="1">` says
+  what happens as `quillo:devtools` events (components, states, errors, components made
+  again, server fn calls, live changes, channel messages over either transport), and
+  answers `list`, `where` and, under `--watch`, `set`. A page that does not ask does
+  nothing more, measured on a keyed list of 1,000 rows (Part C; Q-483, Q-484, Q-485).
+- **A component inside another whose text a script changed is made again**: it was left
+  empty, with a bare `quillo: text` in the console.
+- The guide says what `data-s` and `data-p` hold (Q-487), and to run with `--no-wt` to see
+  a channel's messages in the Network panel (Q-485).
 
 ### HTTP the server speaks (FEEDBACK36.md)
 

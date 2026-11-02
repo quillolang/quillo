@@ -27,6 +27,12 @@ use std::sync::Arc;
 
 const RUNTIME: &str = include_str!("client/runtime.js");
 
+/// The line that gives the runtime Quillo's version, after it as `BASE` is (`VERSION`, which
+/// a developer tool's `hello` says; FEEDBACK42.md, Part C; branch feedback40-43).
+fn version_line() -> String {
+    format!("VERSION = {};\n", js_str(env!("CARGO_PKG_VERSION")))
+}
+
 /// Development (`--watch`, the debugger): a page's bundle is a loader for
 /// the runtime and each component, view and function in a file of its own,
 /// named after the `.qwe` file it is in, with a source map to its lines.
@@ -284,6 +290,9 @@ fn program_text(it: &Interp, c: &Compiler, boots: bool, with_base: bool) -> Stri
     if with_base && !it.base.is_empty() {
         let _ = writeln!(program, "BASE = {};", js_str(&it.base));
     }
+    if with_base && boots {
+        program.push_str(&version_line());
+    }
     for b in &c.blocks {
         program.push_str(b);
         program.push('\n');
@@ -401,6 +410,9 @@ fn runtime_from(it: &Interp, c: &Compiler, boots: bool) -> RuntimeFile {
     runtime_into(rt, &keep, &mut js);
     if !it.base.is_empty() {
         let _ = writeln!(js, "BASE = {};", js_str(&it.base));
+    }
+    if rt.by_name.get("VERSION").is_some_and(|&i| keep[i]) {
+        js.push_str(&version_line());
     }
     let _ = writeln!(js, "window.__quillo_rt = {{ {} }};", exported.join(", "));
     js.push_str("})();\n");
@@ -542,8 +554,9 @@ const MARK: char = '\u{1}';
 
 /// Development bundles (see `DEV`): the runtime as it is written, the
 /// program's pieces in files of their own, and a loader that adds them to
-/// the page in order. They are plain scripts, not modules or closures, so
-/// the names the runtime declares are seen by every file after it.
+/// the page in order. The runtime is in a function of its own, as in
+/// production, and hands each piece the names it uses (see `in_scope`), so
+/// none of them is the page's (FEEDBACK42.md, Q-481).
 mod dev {
     use super::*;
     use std::sync::Mutex;
@@ -568,7 +581,7 @@ mod dev {
         let mut pieces: Vec<Piece> = Vec::new();
         // Room in a stack for the calls an error came through (FEEDBACK21.md, Q-173; branch
         // feedback20-fixes).
-        let mut prelude = String::from("DEV = true;\nError.stackTraceLimit = 64;\n");
+        let mut prelude = format!("DEV = true;\nError.stackTraceLimit = 64;\n{}", version_line());
         if !it.base.is_empty() {
             let _ = writeln!(prelude, "BASE = {};", js_str(&it.base));
         }
@@ -576,7 +589,6 @@ mod dev {
             prelude.push_str(b);
             prelude.push('\n');
         }
-        pieces.push(Piece { path: "program.js".into(), code: prelude, source: None });
         let base = std::fs::canonicalize(&*it.base_dir).unwrap_or_else(|_| it.base_dir.to_path_buf());
         // Each function the program wrote, in a file of its own (in the order
         // they were compiled, which is the order they need); what else the
@@ -603,8 +615,8 @@ mod dev {
                         p.code.push('\n');
                     }
                     _ => {
-                        let n = pieces.len();
-                        pieces.push(Piece { path: format!("program-{}.js", n), code: format!("{}\n", d), source: None });
+                        let path = loose_path(pieces.len());
+                        pieces.push(Piece { path, code: format!("{}\n", d), source: None });
                     }
                 },
             }
@@ -618,8 +630,8 @@ mod dev {
                     pieces[i].code.push('\n');
                 }
                 None => {
-                    let n = pieces.len();
-                    pieces.push(Piece { path: format!("program-{}.js", n), code: format!("{}\n", v), source: None });
+                    let path = loose_path(pieces.len());
+                    pieces.push(Piece { path, code: format!("{}\n", v), source: None });
                 }
             }
         }
@@ -636,9 +648,22 @@ mod dev {
         }
         pieces.push(Piece { path: "boot.js".into(), code: boot, source: None });
 
+        // The runtime and the program's blocks in one function, as in production, whose
+        // names reach the program's files through one handover rather than as the page's
+        // globals: a page's own `function report()` or a later script's `function run()`
+        // and Quillo's no longer replace each other (FEEDBACK42.md, Q-481; branch
+        // feedback40-43). The opener shares the runtime's first line, so its lines keep
+        // their numbers.
+        let shared = shared_names(c);
+        let mut runtime = String::from("(function () { ");
+        runtime.push_str(RUNTIME);
+        runtime.push_str(&prelude);
+        let _ = writeln!(runtime, "Object.defineProperty(window, Symbol.for({}), {{ value: {{ {} }}, configurable: true }});", js_str(HANDOVER), shared.join(", "));
+        runtime.push_str("})();\n");
+        let shared: HashSet<String> = shared.into_iter().collect();
         let mut files: HashMap<String, String> = HashMap::new();
         let mut order = vec!["quillo.js".to_string()];
-        files.insert("quillo.js".into(), RUNTIME.to_string());
+        files.insert("quillo.js".into(), runtime);
         let mut sources: HashMap<Arc<str>, Option<String>> = HashMap::new();
         // A file's text goes into the map of the first piece made from it only;
         // the other pieces name the file and carry no copy. With it in every
@@ -651,6 +676,7 @@ mod dev {
             if p.code.trim().is_empty() {
                 continue;
             }
+            let mapped = p.source.is_some();
             let text = match &p.source {
                 Some(src) => {
                     let content = sources.entry(src.clone()).or_insert_with(|| std::fs::read_to_string(&**src).ok());
@@ -659,6 +685,7 @@ mod dev {
                 }
                 None => format!("\"use strict\";\n{}", unmarked(&p.code)),
             };
+            let text = in_scope(&text, mapped, &shared);
             order.push(p.path.clone());
             files.insert(p.path, text);
         }
@@ -705,6 +732,64 @@ mod dev {
     /// Q-047; branch stays-fixes).
     fn unmarked(code: &str) -> String {
         code.split(MARK).enumerate().filter(|(i, _)| i % 2 == 0).map(|(_, part)| part).collect()
+    }
+
+    /// The path of a file of what the program defines outside a `.qwe` file's functions
+    /// (`let`s, a view's `<Name/>` form): `program.js` first, as when the blocks were in it.
+    fn loose_path(n: usize) -> String {
+        if n == 0 { "program.js".to_string() } else { format!("program-{}.js", n) }
+    }
+
+    /// The key under which a development runtime hands the program's files its names.
+    const HANDOVER: &str = "quillo.dev";
+
+    /// What a development runtime hands the program's files: its own top-level names (those
+    /// on its `// dev` lines too, which declare one name each) and the program's blocks
+    /// (`const $b0 = W.block(...)`).
+    fn shared_names(c: &Compiler) -> Vec<String> {
+        let decl = |line: &str| -> Option<String> {
+            let rest = ["async function ", "function ", "class ", "const ", "let "].iter().find_map(|p| line.strip_prefix(p))?;
+            let n: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
+            (!n.is_empty()).then_some(n)
+        };
+        let mut names: Vec<String> = runtime_units().by_name.keys().filter(|n| !n.contains('.')).cloned().collect();
+        names.extend(RUNTIME.lines().filter(|l| l.trim_end().ends_with("// dev")).filter_map(decl));
+        names.extend(c.blocks.iter().filter_map(|b| decl(b)));
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// A program's file in a function of its own that takes what it uses from the runtime's
+    /// handover, as a production bundle does (see `RuntimeFile::wrap`). The opener takes the
+    /// place of the file's first line (`"use strict";`, which the source map gives nothing),
+    /// so the map and the places in it stay as they are.
+    /// `mapped`: the piece ends with its source map's line, which stays the last. Only such a
+    /// piece is split there: one with none may hold the words in a value of the program.
+    fn in_scope(text: &str, mapped: bool, shared: &HashSet<String>) -> String {
+        let body = text.strip_prefix("\"use strict\";\n").unwrap_or(text);
+        let (code, map) = match body.rfind("\n//# sourceMappingURL=").filter(|_| mapped) {
+            Some(i) => body.split_at(i + 1),
+            None => (body, ""),
+        };
+        let declared: HashSet<String> = code
+            .lines()
+            .filter_map(|l| ["const ", "let ", "function ", "class ", "async function "].iter().find_map(|p| l.strip_prefix(p)))
+            .map(|r| r.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect())
+            .collect();
+        let mut used: Vec<String> = names_in(code).into_iter().filter(|n| shared.contains(n) && !declared.contains(n)).collect();
+        used.sort();
+        used.dedup();
+        // Copies, which pass nothing on: compiled code sets the runtime's state through its
+        // objects (`G`, `W`, `PLACES`), never by assigning one of its names. (`assigns` reads
+        // text, so it cannot tell: a sample in a string, `"export A=1"`, would look like one.)
+        format!(
+            "(function ($rt) {{ \"use strict\"; const {{ {} }} = $rt;\n{}}})(window[Symbol.for({})]);\n{}",
+            used.join(", "),
+            code,
+            js_str(HANDOVER),
+            map
+        )
     }
 
     /// The global `G["name"] = ...` defines, if it is one.
