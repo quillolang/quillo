@@ -77,10 +77,14 @@ pub fn resolve_from(base: &Path, from: &Path, path: &str) -> String {
     let dir = real(from.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")));
     let target = lexical(&dir.join(path));
     let base = real(base);
-    let rel = match target.strip_prefix(&base) {
-        Ok(r) => r.to_string_lossy().replace('\\', "/"),
-        Err(_) => target.to_string_lossy().into_owned(),
-    };
+    // Outside the program's folder it is said as a way from it, `../secret.qwe`, never as the
+    // machine's own path.
+    let common = target.components().zip(base.components()).take_while(|(a, b)| a == b).count();
+    let ups = base.components().count() - common;
+    let rel = std::iter::repeat_n("..".to_string(), ups)
+        .chain(target.components().skip(common).map(|c| c.as_os_str().to_string_lossy().into_owned()))
+        .collect::<Vec<_>>()
+        .join("/");
     resolve(&base, &rel)
 }
 

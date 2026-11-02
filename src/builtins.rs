@@ -1202,7 +1202,7 @@ fn save_upload(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Err(e) => return Ok(Value::err(Value::str(format!("save_upload: {}", e)))),
     };
     let full = it.base_dir.join(rel);
-    if let Some(why) = own_file(it, &full) {
+    if let Some(why) = own_file(it, &full, true) {
         return Ok(Value::err(Value::str(format!("save_upload: will not write {}: {}; save uploads under a folder of their own, such as uploads/", dest, why))));
     }
     let written = it.unlocked(move || {
@@ -1454,13 +1454,24 @@ fn allowed_path(it: &Interp, p: &str) -> Option<std::path::PathBuf> {
 /// with its journal, or a migration (FEEDBACK30.md, Q-361; branch feedback27-35-fixes). An
 /// upload saved under the visitor's name at the folder's root could otherwise replace
 /// `main.qwe` and run as the program.
-pub(crate) fn own_file(it: &Interp, full: &Path) -> Option<&'static str> {
+pub(crate) fn own_file(it: &Interp, full: &Path, upload: bool) -> Option<&'static str> {
+    // A file not there yet is where the nearest folder above it that is there really is, so a
+    // folder made later is judged the same as one made before.
     let real = |p: &Path| -> std::path::PathBuf {
-        // A file not there yet is where its folder really is.
-        p.canonicalize().unwrap_or_else(|_| match (p.parent().and_then(|d| d.canonicalize().ok()), p.file_name()) {
-            (Some(d), Some(n)) => d.join(n),
-            _ => p.to_path_buf(),
-        })
+        let mut rest = Vec::new();
+        let mut at = p;
+        loop {
+            if let Ok(r) = at.canonicalize() {
+                return rest.iter().rev().fold(r, |r: std::path::PathBuf, n| r.join(n));
+            }
+            match (at.parent(), at.file_name()) {
+                (Some(up), Some(n)) => {
+                    rest.push(n.to_os_string());
+                    at = up;
+                }
+                _ => return p.to_path_buf(),
+            }
+        }
     };
     let target = real(full);
     let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1479,7 +1490,8 @@ pub(crate) fn own_file(it: &Interp, full: &Path) -> Option<&'static str> {
             return Some("it is the database the program has open");
         }
     }
-    if target.starts_with(real(&it.base_dir).join("migrations")) {
+    // A program may write its own migrations; a visitor's upload may not.
+    if upload && target.starts_with(real(&it.base_dir).join("migrations")) {
         return Some("it is in the program's migrations");
     }
     None
@@ -1530,7 +1542,7 @@ fn write_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let Some(full) = local_path(it, &p) else {
         return Ok(Value::err(Value::str(format!("write_file: path must stay inside the program's folder: {}", p))));
     };
-    if let Some(why) = own_file(it, &full) {
+    if let Some(why) = own_file(it, &full, false) {
         return Ok(Value::err(Value::str(format!("write_file: will not write {}: {}", p, why))));
     }
     if let Some(dir) = full.parent() {
@@ -1590,7 +1602,7 @@ fn delete_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let Some(full) = local_path(it, &p).filter(|f| f.as_path() != &*it.base_dir) else {
         return Ok(Value::err(Value::str(format!("delete_file: path must be inside the program's folder: {}", p))));
     };
-    if let Some(why) = own_file(it, &full) {
+    if let Some(why) = own_file(it, &full, false) {
         return Ok(Value::err(Value::str(format!("delete_file: will not delete {}: {}", p, why))));
     }
     let r = if full.is_dir() { std::fs::remove_dir_all(&full) } else { std::fs::remove_file(&full) };
