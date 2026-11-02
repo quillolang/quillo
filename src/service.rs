@@ -43,6 +43,17 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+
+/// Addresses of a host and port, none when it cannot be looked up.
+trait SocketAddrsSafe {
+    fn to_socket_addrs_safe(&self) -> Vec<std::net::SocketAddr>;
+}
+
+impl SocketAddrsSafe for (&str, u16) {
+    fn to_socket_addrs_safe(&self) -> Vec<std::net::SocketAddr> {
+        std::net::ToSocketAddrs::to_socket_addrs(self).map(|a| a.collect()).unwrap_or_default()
+    }
+}
 use std::time::{Duration, Instant};
 
 type R = Result<Value, Ctrl>;
@@ -50,9 +61,30 @@ type R = Result<Value, Ctrl>;
 /// How old a signed call may be (seconds), either way: clocks differ a little.
 const WINDOW: u64 = 300;
 
-/// The secret services sign their calls with, if set.
+/// The secret services sign their calls with, if set: the first of those given, while any
+/// of them is taken (FEEDBACK38.md, Q-461; branch feedback36-39).
 fn secret() -> Option<String> {
-    std::env::var("QUILLO_SERVICE_SECRET").ok().filter(|s| !s.is_empty())
+    crate::svcauth::secrets().into_iter().next()
+}
+
+/// The shared secret `sig` was made with by `make`, if one was.
+fn shared_signed(sig: &str, make: impl Fn(&str) -> String) -> Option<String> {
+    crate::svcauth::secrets().into_iter().find(|k| crate::crypto::same(make(k).as_bytes(), sig.as_bytes()))
+}
+
+/// Which services may join, as `--no-join` and `--allow-join` say (none set: any declared).
+static JOIN_POLICY: OnceLock<Option<Vec<String>>> = OnceLock::new();
+
+/// `--no-join` (an empty list) or `--allow-join billing,risk` (FEEDBACK38.md, Q-459).
+pub fn set_join_policy(allowed: Option<Vec<String>>) {
+    let _ = JOIN_POLICY.set(allowed);
+}
+
+/// `--join-as https://billing-3.internal:8443`: the address a copy is called at.
+static JOIN_AS: OnceLock<String> = OnceLock::new();
+
+pub fn join_as(url: &str) {
+    let _ = JOIN_AS.set(url.trim_end_matches('/').to_string());
 }
 
 /// The service this process serves as (`--service-name`, or the program's
@@ -129,13 +161,13 @@ pub fn join_here(it: &Interp, req: &HttpRequest) -> HttpResponse {
     if req.method != "POST" {
         return refused(405, "joining is a POST");
     }
-    let Some(secret) = secret() else {
+    let keyed = it.accept.as_ref().is_some_and(|a| !a.keys.is_empty());
+    if secret().is_none() && !keyed {
         return refused(403, "joining needs QUILLO_SERVICE_SECRET, on both sides");
-    };
+    }
     let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
-    let sig = header("x-quillo-service").unwrap_or("");
-    let t = sig.split(',').find_map(|p| p.strip_prefix("t=")).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-    let given = sig.split(',').find_map(|p| p.strip_prefix("sig=")).unwrap_or("");
+    let sig = crate::svcauth::signed(header("x-quillo-service").unwrap_or(""));
+    let (t, given) = (sig.t, sig.sig);
     let Some(nonce) = header("x-quillo-call").filter(|c| !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric())) else {
         return refused(401, "a join carries its nonce (x-quillo-call)");
     };
@@ -144,9 +176,24 @@ pub fn join_here(it: &Interp, req: &HttpRequest) -> HttpResponse {
     };
     let service = body["service"].as_str().unwrap_or("").to_string();
     let port = body["port"].as_u64().filter(|p| (1..=65535).contains(p));
-    let expected = signature(&secret, t, "_join", &service, "", nonce, &req.body);
-    if now_secs().abs_diff(t) > WINDOW || !crate::crypto::same(expected.as_bytes(), given.as_bytes()) {
-        return refused(401, "not signed with this server's QUILLO_SERVICE_SECRET (or too old)");
+    // Who may join: a copy of `billing` proves it with billing's own key, where the app knows
+    // one, and not with the secret every service has (FEEDBACK38.md, Q-459; branch feedback36-39).
+    if let Some(Some(allowed)) = JOIN_POLICY.get() {
+        if !allowed.iter().any(|a| *a == service) {
+            return refused(403, &if allowed.is_empty() { "this app takes no copies (--no-join)".to_string() } else { format!("this app takes copies of {} only (--allow-join)", allowed.join(", ")) });
+        }
+    }
+    let theirs = it.accept.as_ref().and_then(|a| a.keys.get(&service)).cloned();
+    let ok = match (&theirs, sig.kid) {
+        (_, kid) if !kid.is_empty() && kid != service => return refused(401, &format!("a copy joins with its own service's key: this one is `{}`, not `{}`", kid, service)),
+        (Some(keys), kid) if !kid.is_empty() => keys.iter().any(|k| crate::crypto::same(crate::svcauth::sign3(k, t, "_join", &service, "", nonce, kid, "", "", "", &req.body).as_bytes(), given.as_bytes())),
+        (Some(_), _) => return refused(401, &format!("this app takes copies of `{}` signed with its key (QUILLO_SERVICE_KEY on the copy)", service)),
+        (None, kid) if !kid.is_empty() => return refused(401, &format!("this app has no key for `{}` (accept_calls {{ keys }})", service)),
+        (None, _) => shared_signed(given, |k| signature(k, t, "_join", &service, "", nonce, &req.body)).is_some(),
+    };
+    if now_secs().abs_diff(t) > WINDOW || !ok {
+        let whose = if sig.kid.is_empty() { "this server's QUILLO_SERVICE_SECRET".to_string() } else { format!("`{}`'s key", service) };
+        return refused(401, &format!("not signed with {} (or too old)", whose));
     }
     {
         let mut seen = seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -161,9 +208,25 @@ pub fn join_here(it: &Interp, req: &HttpRequest) -> HttpResponse {
     }
     let ip = req.remote.parse::<std::net::SocketAddr>().map(|a| a.ip()).or_else(|_| req.remote.parse::<std::net::IpAddr>());
     let Ok(ip) = ip else { return refused(400, "the copy's address is not known") };
-    let url = match ip {
-        std::net::IpAddr::V6(v6) => format!("http://[{}]:{}", v6, port),
-        v4 => format!("http://{}:{}", v4, port),
+    // The address it gives (`--join-as https://...`), when it names where it joined from: then a
+    // copy elsewhere is called over HTTPS, not always `http://` (Q-459).
+    let url = match body["url"].as_str() {
+        Some(u) => match url::Url::parse(u) {
+            Ok(p) if matches!(p.scheme(), "http" | "https") && p.host_str().is_some() => {
+                let host = p.host_str().unwrap_or("").trim_start_matches('[').trim_end_matches(']').to_string();
+                let port = p.port_or_known_default().unwrap_or(80);
+                let here = (host.as_str(), port).to_socket_addrs_safe().iter().any(|a| a.ip() == ip || (a.ip().is_loopback() && ip.is_loopback()));
+                if !here {
+                    return refused(400, &format!("the copy says it is at {}, which is not where it joined from ({})", u, ip));
+                }
+                u.trim_end_matches('/').to_string()
+            }
+            _ => return refused(400, "the copy's url is an http(s) address"),
+        },
+        None => match ip {
+            std::net::IpAddr::V6(v6) => format!("http://[{}]:{}", v6, port),
+            v4 => format!("http://{}:{}", v4, port),
+        },
     };
     let mut j = joined().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let copies = j.entry(service.clone()).or_default();
@@ -225,16 +288,26 @@ impl Joining {
     }
 
     fn post(&self, leave: bool) -> Result<(), String> {
-        let secret = secret().ok_or("QUILLO_SERVICE_SECRET is not set")?;
-        let body = serde_json::json!({ "service": self.service, "port": self.port, "leave": leave }).to_string();
+        let mut body = serde_json::json!({ "service": self.service, "port": self.port, "leave": leave });
+        if let Some(u) = JOIN_AS.get() {
+            body["url"] = serde_json::json!(u);
+        }
+        let body = body.to_string();
         let t = now_secs();
         let nonce = new_id(16);
-        let sig = signature(&secret, t, "_join", &self.service, "", &nonce, body.as_bytes());
+        // With this service's own key when it has one, which proves it is this service.
+        let header = match crate::svcauth::own_key() {
+            Some(k) => format!("v=3,kid={},t={},sig={}", self.service, t, crate::svcauth::sign3(&k, t, "_join", &self.service, "", &nonce, &self.service, "", "", "", body.as_bytes())),
+            None => {
+                let secret = secret().ok_or("QUILLO_SERVICE_SECRET (or QUILLO_SERVICE_KEY) is not set")?;
+                format!("t={},sig={}", t, signature(&secret, t, "_join", &self.service, "", &nonce, body.as_bytes()))
+            }
+        };
         let r = agent()
             .post(&format!("{}/_quillo/join", self.app))
             .timeout(Duration::from_secs(3))
             .set("content-type", "application/json")
-            .set("x-quillo-service", &format!("t={},sig={}", t, sig))
+            .set("x-quillo-service", &header)
             .set("x-quillo-call", &nonce)
             .send_string(&body);
         match r {
@@ -336,8 +409,10 @@ fn set_opts(name: &str, given: &Value, line: u32) -> Result<(), Ctrl> {
                 Value::Int(n) if *n >= 1 => o.failures = *n as u32,
                 _ => return bad("how many failures in a row leave an address alone, 1 or more"),
             },
+            // How the call proves who makes it (src/svcauth.rs), read where it is declared.
+            "auth" | "forward" => {}
             other => {
-                return fail(line, format!("service {}: no option `{}` (timeout, retries, failures, cooldown)", name, other));
+                return fail(line, format!("service {}: no option `{}` (timeout, retries, failures, cooldown, auth, forward)", name, other));
             }
         }
     }
@@ -749,17 +824,17 @@ pub fn signed_post(base: &str, path: &str, to: &str, f: &str, body: &[u8]) -> Re
 /// secret; and, when `named`, for this process's `--service-name` (what the
 /// app sends a service), else for the app ("", what a service sends it).
 pub fn signed_for(req: &HttpRequest, f: &str, named: bool) -> Result<(), HttpResponse> {
-    let Some(secret) = secret() else {
+    if secret().is_none() {
         return Err(refused(403, "channels between processes need QUILLO_SERVICE_SECRET, on both sides"));
-    };
+    }
     let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
     let sig = header("x-quillo-service").unwrap_or("");
     let t = sig.split(',').find_map(|p| p.strip_prefix("t=")).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
     let given = sig.split(',').find_map(|p| p.strip_prefix("sig=")).unwrap_or("");
     let to = header("x-quillo-to").unwrap_or("");
     let c = header("x-quillo-call").unwrap_or("");
-    let expected = signature(&secret, t, to, f, "", c, &req.body);
-    if req.method != "POST" || now_secs().abs_diff(t) > WINDOW || !crate::crypto::same(expected.as_bytes(), given.as_bytes()) {
+    let ok = shared_signed(given, |k| signature(k, t, to, f, "", c, &req.body)).is_some();
+    if req.method != "POST" || now_secs().abs_diff(t) > WINDOW || !ok {
         return Err(refused(401, "not signed with this server's QUILLO_SERVICE_SECRET (or too old)"));
     }
     if (named && SERVED_AS.get().is_some_and(|me| *me != to)) || (!named && !to.is_empty()) {
@@ -776,11 +851,27 @@ pub fn app_url() -> Option<&'static str> {
 
 /// How one try went.
 enum Try {
-    Answer(u16, String),
+    /// The status, the body, and the answer's signature, if it has one.
+    Answer(u16, String, Option<String>),
     /// No connection: the call was not sent.
     NotSent(String),
     /// Sent, but no answer (in time): it may have run.
     NoAnswer(String),
+}
+
+/// The name a call says it comes from: the key's name, this process's service name, or `app`.
+fn caller_name(a: &crate::svcauth::Auth) -> String {
+    a.key.as_ref().map(|(me, _)| me.clone()).or_else(|| served_as().map(str::to_string)).unwrap_or_else(|| "app".into())
+}
+
+/// The visitor's headers a call passes on (`forward`), from the request it is made in.
+fn forwarded(it: &mut Interp, names: &[String]) -> Vec<(String, String)> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let Some(Value::Map(r)) = it.request_value() else { return Vec::new() };
+    let Some(Value::Map(h)) = r.get("headers") else { return Vec::new() };
+    names.iter().filter_map(|n| h.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| (format!("x-quillo-forward-{}", n), v.display()))).collect()
 }
 
 /// A call to where the service runs: tried at its addresses in turn (one
@@ -788,17 +879,46 @@ enum Try {
 /// options say. A try that got no connection, or a busy or missing server
 /// (502, 503, 504), is made again elsewhere; one sent but not answered in
 /// time, again at the same address, with the same call id, which that
-/// server remembers, so the function runs once.
+/// server remembers, so the function runs once. It proves who makes it as
+/// the declaration's `auth` says (src/svcauth.rs).
 #[allow(clippy::too_many_arguments)]
 fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: String) -> Outcome {
-    let Some(secret) = secret() else {
-        return Outcome::Missed(format!("service {}: runs at {}, but QUILLO_SERVICE_SECRET is not set to sign the call", name, urls.join(",")));
+    let a = crate::svcauth::auth_of(name);
+    let shared = secret();
+    // What signs the call: its own key, else the shared secret (FEEDBACK38.md, Q-458; branch
+    // feedback36-39). A token or a certificate alone proves it too.
+    // A call that proves itself with a token is not also signed with the shared secret, which the
+    // callee would take first, and the token would never be looked at.
+    let token = a.bearer.is_some() || a.oauth.is_some();
+    let (sign_key, kid) = match (&a.key, &shared) {
+        (Some((me, k)), _) => (Some(k.clone()), me.clone()),
+        (None, Some(s)) if !token => (Some(s.clone()), String::new()),
+        _ => (None, String::new()),
     };
+    if sign_key.is_none() && a.bearer.is_none() && a.oauth.is_none() && a.mtls.is_none() {
+        return Outcome::Missed(format!("service {}: runs at {}, but QUILLO_SERVICE_SECRET is not set to sign the call", name, urls.join(",")));
+    }
+    let bearer = match &a.bearer {
+        Some(f @ (Value::Func(_) | Value::Builtin(..))) => match it.call(f, Vec::new(), 0) {
+            Ok(Value::Str(t)) if !t.is_empty() => Some(t.to_string()),
+            Ok(Value::Err(e, ..)) => return Outcome::Missed(format!("service {}: its `bearer` gave no token: {}", name, e.display())),
+            Ok(other) => return Outcome::Missed(format!("service {}: its `bearer` gives a token as text, not {}", name, short(&other))),
+            Err(Ctrl::Error(e)) => return Outcome::Missed(format!("service {}: its `bearer` failed: {}", name, e.msg)),
+            Err(_) => return Outcome::Missed(format!("service {}: its `bearer` gave no token", name)),
+        },
+        Some(Value::Str(t)) => Some(t.to_string()),
+        _ => None,
+    };
+    let agent = match crate::svcauth::agent_for(a.mtls.as_ref()) {
+        Ok(ag) => ag,
+        Err(e) => return Outcome::Missed(format!("service {}: its `mtls`: {}", name, e)),
+    };
+    let passed = forwarded(it, &a.forward);
     let o = opts(name);
     let body = serde_json::Value::Array(args.iter().map(to_wire).collect()).to_string().into_bytes();
     let tenant = tenant.map(|t| t.to_string()).unwrap_or_default();
     let rid = rid.map(|r| r.to_string()).unwrap_or_default();
-    let caller = if it.base.is_empty() { "/".to_string() } else { it.base.clone() };
+    let caller = caller_name(&a);
     let mut tried: Vec<String> = Vec::new();
     let mut same: Option<String> = None;
     let mut why = String::new();
@@ -825,43 +945,75 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
             _ => (o.timeout, false),
         };
         let t = now_secs();
-        let sig = signature(&secret, t, name, f, &tenant, &call, &body);
+        let deadline = timeout.as_millis().to_string();
+        let mine = contracts().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(name.to_string(), f.to_string())).cloned().unwrap_or_default();
+        let covered = format!("{}\n{}", mine, crate::svcauth::forwarded_text(passed.iter().map(|(k, v)| (k.as_str(), v.as_str()))));
+        let sig = sign_key.as_ref().map(|k| format!("v=3,kid={},t={},sig={}", kid, t, crate::svcauth::sign3(k, t, name, f, &tenant, &call, &kid, &caller, &deadline, &covered, &body)));
         let endpoint = format!("{}/_quillo/service/{}", url, f);
         let (b, tn, r, c, cl, to) = (body.clone(), tenant.clone(), rid.clone(), call.clone(), caller.clone(), name.to_string());
-        let mine = contracts().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(name.to_string(), f.to_string())).cloned().unwrap_or_default();
+        let (ag, oauth, bearer, passed) = (agent.clone(), a.oauth.clone(), bearer.clone(), passed.clone());
         let got = it.unlocked(move || -> Try {
-            let mut rq = agent()
-                .post(&endpoint)
-                .timeout(timeout)
-                .set("content-type", "application/json")
-                .set("x-quillo-service", &format!("t={},sig={}", t, sig))
-                .set("x-quillo-to", &to)
-                .set("x-quillo-call", &c)
-                .set("x-quillo-caller", &cl)
-                .set("x-quillo-deadline", &timeout.as_millis().to_string());
-            if !mine.is_empty() {
-                rq = rq.set("x-quillo-contract", &mine);
-            }
-            if !tn.is_empty() {
-                rq = rq.set("x-quillo-tenant", &tn);
-            }
-            if !r.is_empty() {
-                rq = rq.set("x-request-id", &r);
-            }
-            let resp = match rq.send_bytes(&b) {
-                Ok(r) | Err(ureq::Error::Status(_, r)) => r,
-                Err(ureq::Error::Transport(e)) if matches!(e.kind(), ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns) => return Try::NotSent(e.to_string()),
-                Err(e) => return Try::NoAnswer(e.to_string()),
+            let send = |token: Option<&str>| -> Try {
+                let mut rq = ag
+                    .post(&endpoint)
+                    .timeout(timeout)
+                    .set("content-type", "application/json")
+                    .set("x-quillo-to", &to)
+                    .set("x-quillo-call", &c)
+                    .set("x-quillo-caller", &cl)
+                    .set("x-quillo-deadline", &deadline);
+                if let Some(s) = &sig {
+                    rq = rq.set("x-quillo-service", s);
+                }
+                if let Some(tk) = token {
+                    rq = rq.set("authorization", &format!("Bearer {}", tk));
+                }
+                for (k, v) in &passed {
+                    rq = rq.set(k, v);
+                }
+                if !mine.is_empty() {
+                    rq = rq.set("x-quillo-contract", &mine);
+                }
+                if !tn.is_empty() {
+                    rq = rq.set("x-quillo-tenant", &tn);
+                }
+                if !r.is_empty() {
+                    rq = rq.set("x-request-id", &r);
+                }
+                let resp = match rq.send_bytes(&b) {
+                    Ok(r) | Err(ureq::Error::Status(_, r)) => r,
+                    Err(ureq::Error::Transport(e)) if matches!(e.kind(), ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns) => return Try::NotSent(e.to_string()),
+                    Err(e) => return Try::NoAnswer(e.to_string()),
+                };
+                let status = resp.status();
+                let signed = resp.header("x-quillo-answer").map(str::to_string);
+                let mut text = String::new();
+                match resp.into_reader().take(64 << 20).read_to_string(&mut text) {
+                    Ok(_) => Try::Answer(status, text, signed),
+                    Err(e) => Try::NoAnswer(e.to_string()),
+                }
             };
-            let status = resp.status();
-            let mut text = String::new();
-            match resp.into_reader().take(64 << 20).read_to_string(&mut text) {
-                Ok(_) => Try::Answer(status, text),
-                Err(e) => Try::NoAnswer(e.to_string()),
+            match &oauth {
+                // A token fetched by OAuth, kept until it nearly expires; one refused is
+                // fetched again, once.
+                Some(o) => {
+                    let token = match crate::svcauth::oauth_token(o, false) {
+                        Ok(t) => t,
+                        Err(e) => return Try::NotSent(e),
+                    };
+                    match send(Some(&token)) {
+                        Try::Answer(401, ..) => match crate::svcauth::oauth_token(o, true) {
+                            Ok(t) => send(Some(&t)),
+                            Err(e) => Try::NotSent(e),
+                        },
+                        other => other,
+                    }
+                }
+                None => send(bearer.as_deref()),
             }
         });
         match got {
-            Try::Answer(status @ (502..=504), text) => {
+            Try::Answer(status @ (502..=504), text, _) => {
                 went_wrong(&url, &o);
                 why = format!("service {}: {} at {} ({})", name, status, url, reason(&text));
                 // A call still running there (503) is asked of it again.
@@ -870,9 +1022,18 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
                     same = None;
                 }
             }
-            Try::Answer(status, text) => {
+            Try::Answer(status, text, signed) => {
                 went_well(&url);
                 log_call(name, f, &url, status, start, attempt + 1, &rid);
+                // The answer is the service's: signed back with the key the call was signed
+                // with. A call with a key of its own takes no answer without it (Q-459).
+                if let Some(k) = &sign_key {
+                    let want = crate::svcauth::sign_answer(k, &call, status, text.as_bytes());
+                    let good = signed.as_deref().map(|s| s.strip_prefix("sig=").unwrap_or(s)).map(|s| crate::crypto::same(s.as_bytes(), want.as_bytes()));
+                    if good == Some(false) || (good.is_none() && !kid.is_empty() && status == 200) {
+                        return Outcome::Refused(502, format!("service {}: the answer from {} is not signed by the service", name, url));
+                    }
+                }
                 let answer = serde_json::from_str::<serde_json::Value>(&text).ok().filter(|_| status == 200);
                 // What the call published there is announced here too, for
                 // pages of this program watching it (FEEDBACK4.md, Q-038;
@@ -950,43 +1111,122 @@ fn refused(status: u16, msg: &str) -> HttpResponse {
 }
 
 /// `POST /_quillo/service/<fn>`: another service calling one of this
-/// program's server fns. Only a call signed with the shared secret, made
-/// in the last few minutes, for this service, is answered, and only once
-/// (its call id is remembered for longer than a signature lasts); it runs
-/// in the tenant it names.
+/// program's server fns. Only a call that proves who makes it is answered:
+/// signed in the last few minutes with the shared secret or the caller's own
+/// key, for this service, or with a token or a certificate `accept_calls`
+/// takes (src/svcauth.rs); and only once (its call id is remembered for
+/// longer than a signature lasts); it runs in the tenant it names.
 pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     if req.method != "POST" {
         return refused(405, "a service call is a POST");
     }
-    let Some(secret) = secret() else {
+    let accept = it.accept.clone();
+    if secret().is_none() && accept.is_none() {
         return refused(403, "service calls need QUILLO_SERVICE_SECRET, on both sides");
-    };
+    }
     let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
-    let sig = header("x-quillo-service").unwrap_or("");
-    let t = sig.split(',').find_map(|p| p.strip_prefix("t=")).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-    let given = sig.split(',').find_map(|p| p.strip_prefix("sig=")).unwrap_or("");
+    let s = crate::svcauth::signed(header("x-quillo-service").unwrap_or(""));
     let tenant = header("x-quillo-tenant").unwrap_or("");
     let to = header("x-quillo-to").unwrap_or("");
     let Some(c) = header("x-quillo-call").filter(|c| !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric())) else {
         return refused(401, "a service call carries its call id (x-quillo-call)");
     };
-    let expected = signature(&secret, t, to, f, tenant, c, &req.body);
-    if now_secs().abs_diff(t) > WINDOW || !crate::crypto::same(expected.as_bytes(), given.as_bytes()) {
-        return refused(401, "not signed with this server's QUILLO_SERVICE_SECRET (or too old)");
+    let (said_caller, deadline, contract) = (header("x-quillo-caller").unwrap_or(""), header("x-quillo-deadline").unwrap_or(""), header("x-quillo-contract").unwrap_or(""));
+    // Who called, and the key its answer is signed with (FEEDBACK38.md, Q-458 to Q-462; branch
+    // feedback36-39).
+    let mut caller: Option<Value> = None;
+    let mut answer_key: Option<String> = None;
+    let mut why = if secret().is_some() {
+        "not signed with this server's QUILLO_SERVICE_SECRET (or too old)".to_string()
+    } else {
+        "this call proves no caller: a key, a token or a certificate accept_calls takes".to_string()
+    };
+    if !s.sig.is_empty() {
+        let fresh = now_secs().abs_diff(s.t) <= WINDOW;
+        let covered = format!("{}\n{}", contract, crate::svcauth::forwarded_text(req.headers.iter().map(|(k, v)| (k.as_str(), v.as_str()))));
+        let v3 = |k: &str| crate::svcauth::sign3(k, s.t, to, f, tenant, c, s.kid, said_caller, deadline, &covered, &req.body);
+        if !s.kid.is_empty() {
+            match accept.as_ref().and_then(|a| a.keys.get(s.kid)) {
+                Some(keys) => match keys.iter().find(|k| crate::crypto::same(v3(k).as_bytes(), s.sig.as_bytes())) {
+                    Some(k) if fresh => {
+                        answer_key = Some(k.clone());
+                        caller = Some(crate::svcauth::caller_value(s.kid, "key", Vec::new()));
+                    }
+                    _ => why = format!("not signed with the key of `{}` (or too old)", s.kid),
+                },
+                None => why = format!("no key here for caller `{}` (accept_calls {{ keys }})", s.kid),
+            }
+        } else if accept.as_ref().map_or(true, |a| a.shared) {
+            let k = if s.v >= 3 { shared_signed(s.sig, v3) } else { shared_signed(s.sig, |k| signature(k, s.t, to, f, tenant, c, &req.body)) };
+            if let (Some(k), true) = (k, fresh) {
+                answer_key = Some(k);
+                // Version 2 did not sign the caller's name: it is not known then.
+                caller = Some(crate::svcauth::caller_value(if s.v >= 3 { said_caller } else { "" }, "quillo", Vec::new()));
+            }
+        } else {
+            why = "this service takes no calls signed with the shared secret (accept_calls { shared: false })".into();
+        }
     }
+    if caller.is_none() {
+        let bearer = header("authorization").and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer "))).map(str::to_string);
+        match (accept.as_ref().and_then(|a| a.jwt.clone()), bearer) {
+            (Some(rules), Some(token)) => match it.unlocked(move || crate::svcauth::verify_jwt(&token, &rules)) {
+                Ok(claims) => caller = Some(crate::svcauth::jwt_caller(&claims)),
+                Err(e) => why = format!("the bearer token: {}", e),
+            },
+            (None, Some(_)) if s.sig.is_empty() => why = "a bearer token, and nothing here checks one (accept_calls { jwt })".into(),
+            _ => {}
+        }
+    }
+    if caller.is_none() {
+        // The certificate a proxy checked, from a proxy `--trust-proxy` names only.
+        if let Some(h) = accept.as_ref().and_then(|a| a.client_cert.clone()) {
+            let from_proxy = header(crate::httpd::PROXIED).is_some();
+            match header(&h) {
+                Some(v) if from_proxy => match crate::svcauth::cert_identity(v) {
+                    Some((name, extra)) => caller = Some(crate::svcauth::caller_value(&name, "mtls", extra)),
+                    None => why = format!("`{}` names no certificate's subject", h),
+                },
+                Some(_) => why = format!("`{}` is believed only from a proxy --trust-proxy names", h),
+                None => {}
+            }
+        }
+    }
+    let Some(mut caller) = caller else { return refused(401, &why) };
     if let Some(me) = SERVED_AS.get().filter(|me| *me != to) {
         return refused(401, &format!("this call is for service `{}`; this is `{}` (see --service-name)", to, me));
     }
     if !tenant.is_empty() && !crate::site::tenant_name_ok(tenant) {
         return refused(400, "not a tenant's name");
     }
+    // Anything else, in Quillo: what `check` gives is the caller from then on.
+    if let Some(check) = accept.as_ref().and_then(|a| a.check.clone()) {
+        match it.call(&check, vec![caller.clone()], 0) {
+            Ok(Value::Map(m)) => caller = Value::Map(m),
+            Ok(Value::Bool(false)) => return refused(403, "refused by accept_calls's check"),
+            Ok(Value::Err(e, ..)) => return refused(403, &e.display()),
+            Ok(_) | Err(Ctrl::Return(_)) => {}
+            Err(Ctrl::Reply(r)) => return crate::server::render_response(&r),
+            Err(Ctrl::Error(e)) => {
+                eprintln!("quillo: error in accept_calls's check: {:#}", e);
+                return refused(500, "internal error in accept_calls's check");
+            }
+        }
+    }
+    let signed_back = |r: HttpResponse| -> HttpResponse {
+        let Some(k) = &answer_key else { return r };
+        let mut r = r;
+        r.headers.retain(|(h, _)| h != "x-quillo-answer");
+        r.headers.push(("x-quillo-answer".into(), format!("sig={}", crate::svcauth::sign_answer(k, c, r.status, &r.body))));
+        r
+    };
     // A call sent again (it got no answer in time, is a call made later
     // delivered twice, or was replayed by someone who saw it): answered as
     // it was, not run again.
     {
         let mut seen = seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match seen.get(c) {
-            Some((_, Some(r))) => return r.clone(),
+            Some((_, Some(r))) => return signed_back(r.clone()),
             Some((_, None)) => return refused(503, "this call is still running"),
             None => {
                 if seen.len() >= SEEN_MAX {
@@ -1007,7 +1247,7 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
         Some(crate::db::Claim::Done(status, body)) => {
             let r = HttpResponse { status, headers: vec![("content-type".into(), "application/json".into())], body: body.into_bytes() };
             seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(c.to_string(), (Instant::now(), Some(r.clone())));
-            return r;
+            return signed_back(r);
         }
         Some(crate::db::Claim::Running) => {
             seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(c);
@@ -1015,7 +1255,7 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
         }
         Some(crate::db::Claim::Mine) | None => {}
     }
-    let r = run_call(it, f, tenant, req);
+    let r = run_call(it, f, tenant, req, caller);
     if shared.is_some() {
         crate::db::call_done(it, c, r.status, &String::from_utf8_lossy(&r.body));
     }
@@ -1028,7 +1268,8 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     } else {
         seen.insert(c.to_string(), (Instant::now(), Some(r.clone())));
     }
-    r
+    drop(seen);
+    signed_back(r)
 }
 
 /// Calls answered lately, by call id: when, and the answer (none while it runs).
@@ -1043,10 +1284,22 @@ fn seen() -> &'static Mutex<HashMap<String, (Instant, Option<HttpResponse>)>> {
 const SEEN_FOR: Duration = Duration::from_secs(2 * WINDOW + 60);
 const SEEN_MAX: usize = 100_000;
 
-fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpResponse {
+fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, caller: Value) -> HttpResponse {
     let Some(Value::Func(c)) = lookup(&it.globals, f).filter(|_| it.server_fns.iter().any(|n| n == f)) else {
         return refused(404, &format!("no server fn `{}`", f));
     };
+    // `for ["shop"]`: only those callers, before its arguments are read (FEEDBACK38.md, Q-458;
+    // branch feedback36-39).
+    let who = match &caller {
+        Value::Map(m) => m.get("name").map(|n| n.display()).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if let Some(allowed) = it.fn_callers.get(f) {
+        if !allowed.iter().any(|a| *a == who) {
+            let who = if who.is_empty() { "a caller whose name is not known".to_string() } else { format!("`{}`", who) };
+            return refused(403, &format!("`{}` takes calls from {} only; this is {}", f, allowed.join(", "), who));
+        }
+    }
     // The caller's copy of this service, deployed apart, may say otherwise.
     let theirs = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-quillo-contract")).map(|(_, v)| v.as_str());
     let ours = crate::describe::contract(&c.def);
@@ -1066,7 +1319,27 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpRe
     // Called by another service: `request` is the request it came from, as
     // far as it goes with the call (its id), and the call's own id.
     let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
-    it.current_request = Some(step_request(it.request_id.as_deref(), header("x-quillo-call").unwrap_or("")));
+    let mut step = match step_request(it.request_id.as_deref(), header("x-quillo-call").unwrap_or("")) {
+        Value::Map(m) => (*m).clone(),
+        _ => Map::new(),
+    };
+    // Who called, and what the visitor's own headers it passed on say: `request.user` when
+    // the visitor's token is one `accept_calls`'s jwt takes (Q-460).
+    step.insert("caller".into(), caller);
+    let mut passed = Map::new();
+    for (k, v) in &req.headers {
+        if let Some(n) = k.to_ascii_lowercase().strip_prefix("x-quillo-forward-") {
+            passed.insert(n.into(), Value::str(v.as_str()));
+        }
+    }
+    let token = passed.get("authorization").map(|v| v.display()).and_then(|v| v.strip_prefix("Bearer ").map(str::to_string));
+    if let (Some(rules), Some(token)) = (it.accept.as_ref().and_then(|a| a.jwt.clone()), token) {
+        if let Ok(claims) = it.unlocked(move || crate::svcauth::verify_jwt(&token, &rules)) {
+            step.insert("user".into(), Value::from_json(&claims));
+        }
+    }
+    step.insert("forwarded".into(), Value::map(passed));
+    it.current_request = Some(Value::map(step));
     // The topics this call publishes go back with the answer, so the
     // caller's pages that watch them follow, as they do in one process
     // (FEEDBACK4.md, Q-038; branch bank-fixes).
@@ -1158,6 +1431,9 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
     }
     if let Some(o) = options {
         set_opts(name, o, line)?;
+        if let Value::Map(m) = o {
+            crate::svcauth::set_auth(name, m.get("auth"), m.get("forward"), &it.base_dir).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
+        }
     }
     let full = it.base_dir.join(file);
     let defs = offered(&full).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
@@ -1488,18 +1764,7 @@ pub fn start_deliveries(addr: std::net::SocketAddr) {
         if !more {
             std::thread::sleep(Duration::from_secs(1));
         }
-        let asked = (|| -> std::io::Result<bool> {
-            use std::io::Write;
-            let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
-            write!(
-                s,
-                "POST /_quillo/later HTTP/1.1\r\nHost: localhost\r\nX-Quillo-Job: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                crate::jobs::token()
-            )?;
-            let mut out = Vec::new();
-            s.read_to_end(&mut out)?;
-            Ok(out.ends_with(b"more\n"))
-        })();
+        let asked = crate::jobs::post_self(addr, "/_quillo/later", b"").map(|(_, out)| out.ends_with(b"more\n"));
         more = matches!(asked, Ok(true));
     });
 }

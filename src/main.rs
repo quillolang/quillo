@@ -1,3 +1,18 @@
+/// Quillo's own messages go to stderr, and one that cannot be written is dropped: std's
+/// `eprintln!` panics then, and a server whose stderr went into a pipe that closed (a `| head`,
+/// a log shipper that stopped) could no longer be stopped by a signal, its handler ended by
+/// the panic (FEEDBACK37.md, Q-452; branch feedback36-39).
+macro_rules! eprintln {
+    () => {{
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(b"\n");
+    }};
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use quillo::ast::Stmt;
@@ -39,6 +54,11 @@ usage:
   quillo dap                        debugger for editors (the Debug Adapter
                                     Protocol, on stdio): breakpoints, stepping,
                                     variables
+  quillo classes <file.qwe>         the classes the program's markup writes, one a
+                                    line, for a CSS tool (Tailwind's safelist)
+  quillo serve <folder> [options]   serve a folder of files as they are, as a
+                                    static host does: index.html, clean URLs,
+                                    404.html (the options of `run`)
   quillo <file.qwe>                 same as `quillo run`
 
 The program is the first argument that is not an option, wherever the options
@@ -80,7 +100,12 @@ options for `run`:
                  stopped with it (`--with \"npx tailwindcss -i src/app.css -o
                  public/app.css --watch\"`); may be given more than once
   --join URL     with --as-service: join the app at URL as one more copy of
-                 this service, while it runs; leaves when stopped
+                 this service, while it runs; leaves when stopped; signed with
+                 $QUILLO_SERVICE_KEY when set, which proves it is this service
+  --join-as URL  with --join: the address the app calls this copy at, such as
+                 https://billing-3.internal:8443 (it must lead to where the
+                 copy joined from)
+  --no-join      take no copies that join; --allow-join billing,risk: only those
   --as-service   serve the program as a service: its server fns answer only
                  other services' signed calls, not pages (--split sets it)
   --service-name NAME
@@ -167,13 +192,13 @@ fn main() {
 const VALUE_OPTIONS: &[&str] = &[
     "--host", "--port", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
     "--max-body", "--max-compute", "--allow-path", "--trust-proxy", "--live-per-client", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
-    "--scale", "--join", "--with",
+    "--scale", "--join", "--with", "--allow-join", "--join-as",
 ];
 
 /// Options of `run`, `app` and `check` that take no value.
 const FLAG_OPTIONS: &[&str] = &[
     "--watch", "--reload", "--no-check", "--split", "--as-service", "--no-wt", "--no-prefetch", "--no-view-cache",
-    "--no-jobs", "--plain-http", "--metrics", "--query-stats", "--strict-null", "--describe",
+    "--no-jobs", "--plain-http", "--metrics", "--query-stats", "--strict-null", "--describe", "--no-join",
 ];
 
 /// What an unknown option was probably meant to be: the nearest known one
@@ -259,15 +284,67 @@ fn program_and_flags(args: &[String]) -> Result<(String, Vec<String>), String> {
     if Path::new(&named).is_dir() {
         let main = Path::new(&named).join("main.qwe");
         if !main.is_file() {
+            // A folder of pages: said how to serve it (FEEDBACK36.md, Q-450; branch feedback36-39).
+            let pages = Path::new(&named).join("index.html").is_file();
+            let serve = if pages { format!("; to serve its files as they are, `quillo serve {}`", named) } else { String::new() };
             return Err(if named == "." {
-                "no program: name a .qwe file, or add a main.qwe here".to_string()
+                format!("no program: name a .qwe file, or add a main.qwe here{}", serve)
             } else {
-                format!("no program: {} has no main.qwe; name a .qwe file", named)
+                format!("no program: {} has no main.qwe; name a .qwe file{}", named, serve)
             });
         }
         return Ok((if named == "." { "main.qwe".to_string() } else { main.to_string_lossy().into_owned() }, flags));
     }
+    // A file of another kind is said to be one, with how to serve it, rather than read as Quillo
+    // and refused at its first character (FEEDBACK36.md, Q-450; branch feedback36-39).
+    let ext = Path::new(&named).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let folder = Path::new(&named).parent().map(|p| p.to_string_lossy().into_owned()).filter(|p| !p.is_empty()).unwrap_or_else(|| ".".into());
+    match ext.as_str() {
+        "html" | "htm" => return Err(format!("{} is HTML, not a Quillo program: serve its folder as it is with `quillo serve {}`, or from a program with `route GET /*path = files(\"{}\", path)`", named, folder, folder)),
+        "md" | "markdown" => return Err(format!("{} is Markdown, not a Quillo program: show it as a page with `route GET / = markdown_page(read_file(\"{}\"))`, or serve its folder with `quillo serve {}`", named, named, folder)),
+        "rs" | "qwer" => return Err(format!("{} is Rust, not a Quillo program: a program uses it with `use \"{}\"`, and calls its `pub fn`s", named, Path::new(&named).file_name().map_or(named.clone(), |n| n.to_string_lossy().into_owned()))),
+        "css" | "js" | "mjs" | "json" | "txt" | "xml" | "csv" | "svg" => return Err(format!("{} is not a Quillo program (a .qwe file): serve it with `file(\"{}\")` in a route, or its folder with `quillo serve {}`", named, named, folder)),
+        _ => {}
+    }
     Ok((named, flags))
+}
+
+/// `quillo serve DIR`: the folder's files as they are, by a program of one route that is no file
+/// in it (FEEDBACK36.md, Q-450; branch feedback36-39).
+fn serve(args: &[String]) -> i32 {
+    let mut dir = None;
+    let mut flags = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "-h" || a == "--help" {
+            println!("{}", USAGE);
+            return 0;
+        }
+        if a.starts_with('-') {
+            flags.push(a.clone());
+            if VALUE_OPTIONS.contains(&a.as_str()) {
+                if let Some(v) = args.get(i + 1) {
+                    flags.push(v.clone());
+                    i += 1;
+                }
+            }
+        } else if dir.is_none() {
+            dir = Some(a.clone());
+        } else {
+            eprintln!("quillo: unknown argument `{}`: `serve` takes one folder", a);
+            return 2;
+        }
+        i += 1;
+    }
+    let dir = dir.unwrap_or_else(|| ".".into());
+    if !Path::new(&dir).is_dir() {
+        eprintln!("quillo: {} is not a folder: `quillo serve` serves a folder's files", dir);
+        return 2;
+    }
+    let program = Path::new(&dir).join(".quillo-serve.qwe");
+    quillo::error::set_virtual(program.clone(), "route GET /*path = files(\".\", path)\n".into());
+    run(&program.to_string_lossy(), &flags)
 }
 
 /// `program_and_flags`, or the line that says why there is none (exit 2).
@@ -362,6 +439,25 @@ fn real_main(args: Vec<String>) -> i32 {
         Some("install") => quillo::install::main(&args[2..]),
         // A program to start from (FEEDBACK34.md, Q-422; branch feedback27-35-fixes).
         Some("new") => quillo::new::main(&args[2..]),
+        Some("serve") => serve(&args[2..]),
+        // The classes the program writes, one a line, for a CSS tool beside it (FEEDBACK37.md,
+        // Q-456; branch feedback36-39).
+        Some("classes") => with_one_program(&args, &[], |f, _| {
+            let mut files = Vec::new();
+            match quillo::native::walk_program(Path::new(f), &mut |_, stmts| files.push(stmts.to_vec())) {
+                Ok(_) => {
+                    let refs: Vec<&[Stmt]> = files.iter().map(|s| s.as_slice()).collect();
+                    for c in quillo::styles::written_classes(&refs) {
+                        println!("{}", c);
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("quillo: {}", e);
+                    1
+                }
+            }
+        }),
         // `-i`: the prompts and the greeting, from a pipe too, as Python's `-i` (FEEDBACK31.md,
         // Q-388; branch feedback27-35-fixes).
         Some("repl") => repl(args[2..].iter().any(|a| a == "-i")),
@@ -629,6 +725,26 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                     return Err(2);
                 }
             },
+            // Which copies may join, and where a copy is called (FEEDBACK38.md, Q-459; branch
+            // feedback36-39).
+            ("--no-join", _) => {
+                quillo::service::set_join_policy(Some(Vec::new()));
+                i += 1;
+                continue;
+            }
+            ("--allow-join", Some(v)) => {
+                let names: Vec<String> = v.split(',').map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).collect();
+                if names.is_empty() {
+                    eprintln!("quillo: --allow-join names the services whose copies may join: --allow-join billing,risk");
+                    return Err(2);
+                }
+                quillo::service::set_join_policy(Some(names));
+            }
+            ("--join-as", Some(v)) if v.starts_with("http://") || v.starts_with("https://") => quillo::service::join_as(v),
+            ("--join-as", Some(_)) => {
+                eprintln!("quillo: --join-as is the address this copy is called at: --join-as https://billing-3.internal:8443");
+                return Err(2);
+            }
             ("--trust-proxy", Some(v)) => {
                 if !quillo::httpd::trust_proxies(v) {
                     eprintln!("quillo: --trust-proxy needs addresses or networks, as 127.0.0.1 or 10.0.0.0/8,192.168.0.0/16");
@@ -949,6 +1065,8 @@ fn install_stop() {
             with::stop_all();
             std::process::exit(130);
         }
+        // A message that cannot be written no longer panics (the `eprintln!` above), so the
+        // handler goes on to stop the server (FEEDBACK37.md, Q-452; branch feedback36-39).
         eprintln!("quillo: stopping once the requests in progress are answered (again to stop now)");
         if let Some(m) = &stop.member {
             m.leave();
@@ -985,6 +1103,11 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
     install_stop();
     if let Err(code) = before_the_program(file, &o) {
         return code;
+    }
+    // The Rust files not built yet, in one cargo call before the program runs, rather than one
+    // `use` after another (FEEDBACK37.md, Q-454; branch feedback36-39).
+    if let Ok(files) = quillo::native::rust_files(Path::new(file)) {
+        quillo::native::prebuild(&files);
     }
     let host = o.host.clone().unwrap_or_else(|| "127.0.0.1".into());
     let port = o.port.clone().unwrap_or_else(|| std::env::var("PORT").unwrap_or_else(|_| "8080".into()));

@@ -71,12 +71,116 @@ struct Opts {
     cache: u32,
     /// Milliseconds the whole call may take (0: the agent's own limits).
     timeout_ms: u32,
+    /// The certificates a call trusts and presents (`ca`, `cert`, `key`), by their number in
+    /// `TLS` (0: the usual public CAs, and none presented).
+    tls: u32,
 }
 
-const DEFAULT_OPTS: Opts = Opts { redirects: 5, public_only: false, cache: 0, timeout_ms: 0 };
+const DEFAULT_OPTS: Opts = Opts { redirects: 5, public_only: false, cache: 0, timeout_ms: 0, tls: 0 };
 
 /// The options there are; `http.stream`'s map also has its request's.
-const OPTION_NAMES: &[&str] = &["redirects", "public_only", "cache", "timeout"];
+const OPTION_NAMES: &[&str] = &["redirects", "public_only", "cache", "timeout", "ca", "cert", "key"];
+/// What `ca`, `cert` and `key` named, each set once, so that `Opts` stays a plain value: a CA
+/// file (or "system") to trust instead of the bundled ones, and a certificate and its key to
+/// present, as some banks' and governments' APIs ask (FEEDBACK36.md, Q-442; branch feedback36-39).
+static TLS: Mutex<Vec<(Option<String>, Option<String>, Option<String>)>> = Mutex::new(Vec::new());
+
+fn tls_number(ca: Option<String>, cert: Option<String>, key: Option<String>) -> u32 {
+    if ca.is_none() && cert.is_none() && key.is_none() {
+        return 0;
+    }
+    let mut t = TLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = (ca, cert, key);
+    match t.iter().position(|e| *e == entry) {
+        Some(i) => i as u32 + 1,
+        None => {
+            t.push(entry);
+            t.len() as u32
+        }
+    }
+}
+
+/// A client's TLS settings: the CAs in `ca` (a PEM file, or "system" for the machine's), or the
+/// usual public ones; and `cert` with its `key` presented to the server.
+pub(crate) fn client_tls(ca: Option<&str>, cert: Option<&str>, key: Option<&str>) -> Result<std::sync::Arc<rustls::ClientConfig>, String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+    let mut roots = rustls::RootCertStore::empty();
+    match ca {
+        None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+        Some("system") => {
+            let found = rustls_native_certs::load_native_certs();
+            roots.add_parsable_certificates(found.certs);
+            if roots.is_empty() {
+                return Err("ca \"system\": no CA certificates found on this system".into());
+            }
+        }
+        Some(path) => {
+            let certs = CertificateDer::pem_file_iter(path).and_then(|c| c.collect::<Result<Vec<_>, _>>()).map_err(|e| format!("ca {}: {}", path, e))?;
+            if certs.is_empty() {
+                return Err(format!("ca {}: no certificate in it (a PEM file is wanted)", path));
+            }
+            for c in certs {
+                roots.add(c).map_err(|e| format!("ca {}: {}", path, e))?;
+            }
+        }
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_root_certificates(roots);
+    let config = match (cert, key) {
+        (None, None) => builder.with_no_client_auth(),
+        (Some(cert), Some(key)) => {
+            let chain = CertificateDer::pem_file_iter(cert).and_then(|c| c.collect::<Result<Vec<_>, _>>()).map_err(|e| format!("cert {}: {}", cert, e))?;
+            if chain.is_empty() {
+                return Err(format!("cert {}: no certificate in it (a PEM file is wanted)", cert));
+            }
+            let key = PrivateKeyDer::from_pem_file(key).map_err(|e| format!("key {}: {}", key, e))?;
+            builder.with_client_auth_cert(chain, key).map_err(|e| format!("cert and key: {}", e))?
+        }
+        _ => return Err("cert and key go together: a certificate, and its key".into()),
+    };
+    Ok(std::sync::Arc::new(config))
+}
+
+/// The proxy for `url` from `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` (either case), unless
+/// `NO_PROXY` names its host (a name, `.domain` or `domain` for it and below, an address, `*`);
+/// the machine itself never goes through one, as Go's default has it (FEEDBACK36.md, Q-442;
+/// branch feedback36-39).
+fn proxy_for(url: &str) -> Option<String> {
+    let var = |names: &[&str]| names.iter().find_map(|n| std::env::var(n).ok().filter(|v| !v.trim().is_empty()));
+    let https = url.starts_with("https://");
+    let proxy = if https { var(&["HTTPS_PROXY", "https_proxy"]) } else { var(&["HTTP_PROXY", "http_proxy"]) }.or_else(|| var(&["ALL_PROXY", "all_proxy"]))?;
+    let host = host_of(url).to_ascii_lowercase();
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare == "localhost" || bare.ends_with(".localhost") || bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
+        return None;
+    }
+    let no = var(&["NO_PROXY", "no_proxy"]).unwrap_or_default();
+    for entry in no.split(',').map(|e| e.trim().to_ascii_lowercase()).filter(|e| !e.is_empty()) {
+        if entry == "*" {
+            return None;
+        }
+        let name = entry.trim_start_matches('.');
+        let name = name.rsplit_once(':').filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())).map_or(name, |(h, _)| h);
+        if bare == name || bare.ends_with(&format!(".{}", name)) {
+            return None;
+        }
+    }
+    Some(proxy)
+}
+
+/// The host of an http(s) URL, without its port or user.
+fn host_of(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    match authority.strip_prefix('[') {
+        Some(v6) => &authority[..v6.find(']').map_or(authority.len(), |i| i + 2)],
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    }
+}
 const STREAM_NAMES: &[&str] = &["method", "body", "headers"];
 
 /// The longest `timeout`, in seconds.
@@ -85,7 +189,7 @@ const MAX_TIMEOUT_SECS: f64 = 300.0;
 /// The longest `cache`: a day.
 const MAX_CACHE_SECS: i64 = 86_400;
 
-fn opts_of(v: Option<&Value>, fname: &str, line: u32) -> Result<Opts, Ctrl> {
+fn opts_of(v: Option<&Value>, fname: &str, line: u32, base: &std::path::Path) -> Result<Opts, Ctrl> {
     let m = match v {
         None | Some(Value::Nil) => return Ok(DEFAULT_OPTS),
         Some(Value::Map(m)) => m,
@@ -122,7 +226,20 @@ fn opts_of(v: Option<&Value>, fname: &str, line: u32) -> Result<Opts, Ctrl> {
         let known = if stream { [STREAM_NAMES, OPTION_NAMES].concat() } else { OPTION_NAMES.to_vec() };
         return fail(line, format!("`{}`: unknown option `{}` (the options are {})", fname, k, known.join(", ")));
     }
-    Ok(Opts { redirects, public_only, cache, timeout_ms })
+    // Files are named from the program's folder, as `read_file` names them.
+    let file = |name: &str| -> Result<Option<String>, Ctrl> {
+        match m.get(name) {
+            None | Some(Value::Nil) => Ok(None),
+            Some(Value::Str(s)) if name == "ca" && &**s == "system" => Ok(Some("system".into())),
+            Some(Value::Str(s)) if !s.is_empty() => Ok(Some(base.join(&**s).to_string_lossy().into_owned())),
+            Some(other) => fail(line, format!("`{}`: `{}` is the path of a PEM file{}, got {}", fname, name, if name == "ca" { " or \"system\"" } else { "" }, other.repr())),
+        }
+    };
+    let (ca, cert, key) = (file("ca")?, file("cert")?, file("key")?);
+    if cert.is_some() != key.is_some() {
+        return fail(line, format!("`{}`: `cert` and `key` go together: a certificate, and its key", fname));
+    }
+    Ok(Opts { redirects, public_only, cache, timeout_ms, tls: tls_number(ca, cert, key) })
 }
 
 /// The server's own network is not where a component's calls go (see the
@@ -200,34 +317,60 @@ fn resolve_public(netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
     Ok(public)
 }
 
-/// The agent for calls with these options (`stream`: for `http.stream`,
-/// which has no limit on the whole answer, only on a silence in it).
-fn agent(o: Opts, stream: bool) -> ureq::Agent {
-    static AGENTS: OnceLock<Mutex<HashMap<(u32, bool, bool), ureq::Agent>>> = OnceLock::new();
+/// The agent for calls with these options to `url` (`stream`: for `http.stream`, which has no
+/// limit on the whole answer, only on a silence in it).
+fn agent(o: Opts, stream: bool, url: &str) -> Result<ureq::Agent, String> {
+    type Key = (u32, bool, bool, u32, Option<String>);
+    static AGENTS: OnceLock<Mutex<HashMap<Key, ureq::Agent>>> = OnceLock::new();
+    let proxy = proxy_for(url);
     let mut agents = AGENTS.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    agents
-        .entry((o.redirects, o.public_only, stream))
-        .or_insert_with(|| {
-            let b = ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(10))
-                .redirects(o.redirects)
-                .user_agent(concat!("quillo/", env!("CARGO_PKG_VERSION")));
-            let b = if stream { b.timeout_read(Duration::from_secs(300)) } else { b.timeout(Duration::from_secs(60)) };
-            let b = if o.public_only { b.resolver(resolve_public) } else { b };
-            b.build()
-        })
-        .clone()
+    let key = (o.redirects, o.public_only, stream, o.tls, proxy.clone());
+    if let Some(a) = agents.get(&key) {
+        return Ok(a.clone());
+    }
+    let b = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .redirects(o.redirects)
+        // `Authorization` goes on to the same host, as `fetch` keeps it for the same origin: an
+        // API that adds a `/` by a redirect answered 401 (FEEDBACK36.md, Q-437; branch
+        // feedback36-39).
+        .redirect_auth_headers(ureq::RedirectAuthHeaders::SameHost)
+        .user_agent(concat!("quillo/", env!("CARGO_PKG_VERSION")));
+    let b = if stream { b.timeout_read(Duration::from_secs(300)) } else { b.timeout(Duration::from_secs(60)) };
+    // Through a proxy, the proxy looks the name up: `public_only` checks it before the call.
+    let b = if o.public_only && proxy.is_none() { b.resolver(resolve_public) } else { b };
+    let b = match &proxy {
+        Some(p) => b.proxy(ureq::Proxy::new(p).map_err(|e| format!("the proxy in the environment, {}: {}", p, e))?),
+        None => b,
+    };
+    let b = if o.tls > 0 {
+        let entry = TLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[o.tls as usize - 1].clone();
+        b.tls_config(client_tls(entry.0.as_deref(), entry.1.as_deref(), entry.2.as_deref())?)
+    } else {
+        b
+    };
+    let a = b.build();
+    agents.insert(key, a.clone());
+    Ok(a)
 }
 
 #[derive(Clone)]
 struct Reply {
     status: u16,
     headers: Vec<(String, String)>,
+    /// Every `Set-Cookie`, which cannot be joined into one header as others are.
+    cookies: Vec<String>,
     body: String,
 }
 
-fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Option<(&str, Vec<u8>)>) -> Result<Reply, String> {
-    let mut req = agent(o, false).request(method, url);
+/// One call: its answer, the head read, the body not yet.
+fn call(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, String)], body: Option<&(String, Vec<u8>)>) -> Result<ureq::Response, String> {
+    if o.public_only && proxy_for(url).is_some() {
+        let host = host_of(url).trim_start_matches('[').trim_end_matches(']');
+        let port = if url.starts_with("https://") { 443 } else { 80 };
+        resolve_public(&format!("{}:{}", host, port)).map_err(|e| timed_out(o, url, format!("{}: {}", url, e)))?;
+    }
+    let mut req = agent(o, stream, url)?.request(method, url);
     if o.timeout_ms > 0 {
         req = req.timeout(Duration::from_millis(o.timeout_ms as u64));
     }
@@ -239,23 +382,226 @@ fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Op
             if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
                 req = req.set("content-type", ctype);
             }
-            req.send_bytes(&bytes)
+            req.send_bytes(bytes)
         }
         None => req.call(),
     };
-    let resp = match res {
-        Ok(r) | Err(ureq::Error::Status(_, r)) => r,
-        Err(e) => return Err(timed_out(o, url, e.to_string())),
-    };
-    let status = resp.status();
-    let headers = resp
-        .headers_names()
-        .into_iter()
-        .filter_map(|n| resp.header(&n).map(|v| (n.to_ascii_lowercase(), v.to_string())))
-        .collect();
+    match res {
+        Ok(r) | Err(ureq::Error::Status(_, r)) => Ok(r),
+        Err(e) => Err(timed_out(o, url, e.to_string())),
+    }
+}
+
+/// `call`, and the redirects the client does not follow: a `307` or `308` after a write is
+/// followed with the same method and body, as RFC 9110 §15.4.8 and `fetch` do, where the
+/// redirect was the answer (FEEDBACK36.md, Q-437; branch feedback36-39). To another origin,
+/// `Authorization` and `Cookie` are not sent on.
+fn follow(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, String)], body: Option<(String, Vec<u8>)>) -> Result<(String, ureq::Response), String> {
+    let mut url = url.to_string();
+    let mut headers = headers.to_vec();
+    let mut hops = 0;
+    loop {
+        let resp = call(o, stream, method, &url, &headers, body.as_ref())?;
+        let again = matches!(resp.status(), 307 | 308) && !matches!(method, "GET" | "HEAD") && o.redirects > 0;
+        let next = if again { resp.header("location").and_then(|l| join_url(&url, l)) } else { None };
+        let Some(next) = next else { return Ok((url, resp)) };
+        hops += 1;
+        if hops > o.redirects {
+            return Err(format!("{}: more than {} redirects", url, o.redirects));
+        }
+        if origin_of(&next) != origin_of(&url) {
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization") && !k.eq_ignore_ascii_case("cookie"));
+        }
+        url = next;
+    }
+}
+
+/// A `Location` read against the URL it came from; only http(s).
+fn join_url(base: &str, location: &str) -> Option<String> {
+    let u = url::Url::parse(base).ok()?.join(location).ok()?;
+    matches!(u.scheme(), "http" | "https").then(|| u.to_string())
+}
+
+/// `scheme://host:port`, the port written out.
+fn origin_of(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(u) => format!("{}://{}:{}", u.scheme(), u.host_str().unwrap_or(""), u.port_or_known_default().unwrap_or(0)),
+        Err(_) => url.to_string(),
+    }
+}
+
+fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Option<(String, Vec<u8>)>) -> Result<Reply, String> {
+    let (url, resp) = follow(o, false, method, url, headers, body)?;
+    let (status, headers, cookies, reader) = head_of(o, &url, method, resp)?;
     let mut bytes = Vec::new();
-    resp.into_reader().take(MAX_BODY).read_to_end(&mut bytes).map_err(|e| timed_out(o, url, e.to_string()))?;
-    Ok(Reply { status, headers, body: String::from_utf8_lossy(&bytes).into_owned() })
+    reader.take(MAX_BODY).read_to_end(&mut bytes).map_err(|e| timed_out(o, &url, e.to_string()))?;
+    Ok(Reply { status, headers, cookies, body: String::from_utf8_lossy(&bytes).into_owned() })
+}
+
+/// An answer's status, headers, `Set-Cookie`s and body.
+type Head = (u16, Vec<(String, String)>, Vec<String>, Body);
+
+/// The answer's status, headers (a repeated one joined with `, `, as RFC 9110 §5.3 allows; the
+/// `Set-Cookie`s, which cannot be, with a line break), its `Set-Cookie`s, and its body decoded
+/// (FEEDBACK36.md, Q-435 and Q-438; branch feedback36-39). Interim answers are passed over to
+/// the final one: a `103 Early Hints` was taken for the answer, and the call waited out its
+/// time limit for its body (Q-436).
+fn head_of(o: Opts, url: &str, method: &str, resp: ureq::Response) -> Result<Head, String> {
+    let status = resp.status();
+    if (100..200).contains(&status) && status != 101 {
+        // ureq reads an interim answer as one whose body lasts until the connection closes:
+        // that body is the rest of what the server sent, the final answer among it.
+        return after_interim(o, url, method, resp.into_reader());
+    }
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut cookies = Vec::new();
+    for n in resp.headers_names() {
+        let values = resp.all(&n);
+        let n = n.to_ascii_lowercase();
+        if headers.iter().any(|(k, _)| *k == n) {
+            continue;
+        }
+        if n == "set-cookie" {
+            cookies.extend(values.iter().map(|v| v.to_string()));
+        }
+        headers.push((n.clone(), values.join(if n == "set-cookie" { "\n" } else { ", " })));
+    }
+    let coding = headers.iter().find(|(k, _)| k == "content-encoding").map(|(_, v)| v.trim().to_ascii_lowercase());
+    let reader = decoded(coding.as_deref(), resp.into_reader())?;
+    if coding.is_some() {
+        headers.retain(|(k, _)| k != "content-encoding" && k != "content-length");
+    }
+    Ok((status, headers, cookies, reader))
+}
+
+/// A body in the coding its `Content-Encoding` names, decoded: ureq decodes gzip and brotli,
+/// and leaves `deflate`; another coding is an error that names it, where the program got the
+/// encoded bytes as text (FEEDBACK36.md, Q-438; branch feedback36-39).
+fn decoded(coding: Option<&str>, reader: Body) -> Result<Body, String> {
+    Ok(match coding {
+        None | Some("" | "identity") => reader,
+        Some("gzip" | "x-gzip") => Box::new(flate2::read::MultiGzDecoder::new(reader)),
+        Some("br") => Box::new(brotli_decompressor::Decompressor::new(reader, 8 << 10)),
+        Some("deflate") => {
+            // `deflate` is zlib's format, though some servers send the raw one: the first two
+            // bytes tell them apart.
+            let mut r = std::io::BufReader::new(reader);
+            let head = std::io::BufRead::fill_buf(&mut r).map_err(|e| e.to_string())?;
+            let zlib = head.len() >= 2 && head[0] & 0x0f == 8 && (u16::from(head[0]) << 8 | u16::from(head[1])) % 31 == 0;
+            if zlib {
+                Box::new(flate2::read::ZlibDecoder::new(r))
+            } else {
+                Box::new(flate2::read::DeflateDecoder::new(r))
+            }
+        }
+        Some(other) => return Err(format!("the answer is in a coding Quillo cannot read: content-encoding {}", other)),
+    })
+}
+
+/// The final answer after interim ones, read from what followed them.
+fn after_interim(o: Opts, url: &str, method: &str, mut rest: Body) -> Result<Head, String> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let mut hs = [httparse::EMPTY_HEADER; 100];
+        let mut r = httparse::Response::new(&mut hs);
+        match r.parse(&buf) {
+            Ok(httparse::Status::Complete(n)) => {
+                let status = r.code.unwrap_or(0);
+                if (100..200).contains(&status) && status != 101 {
+                    buf.drain(..n);
+                    continue;
+                }
+                let mut headers: Vec<(String, String)> = Vec::new();
+                let mut cookies = Vec::new();
+                for h in r.headers.iter() {
+                    let (k, v) = (h.name.to_ascii_lowercase(), String::from_utf8_lossy(h.value).trim().to_string());
+                    if k == "set-cookie" {
+                        cookies.push(v.clone());
+                    }
+                    match headers.iter_mut().find(|(n, _)| *n == k) {
+                        Some((_, old)) => {
+                            old.push_str(if k == "set-cookie" { "\n" } else { ", " });
+                            old.push_str(&v);
+                        }
+                        None => headers.push((k, v)),
+                    }
+                }
+                let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+                let after: Body = Box::new(std::io::Cursor::new(buf[n..].to_vec()).chain(rest));
+                let framed: Body = if method == "HEAD" || matches!(status, 204 | 304) {
+                    Box::new(std::io::empty())
+                } else if header("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked")) {
+                    Box::new(Dechunk { inner: after, left: 0, done: false })
+                } else if let Some(len) = header("content-length").and_then(|l| l.parse::<u64>().ok()) {
+                    Box::new(after.take(len))
+                } else {
+                    after
+                };
+                let coding = header("content-encoding").map(|c| c.trim().to_ascii_lowercase());
+                let reader = decoded(coding.as_deref(), framed)?;
+                headers.retain(|(k, _)| k != "content-encoding" && k != "transfer-encoding" && (coding.is_none() || k != "content-length"));
+                return Ok((status, headers, cookies, reader));
+            }
+            Ok(httparse::Status::Partial) if buf.len() < 100 << 10 => {
+                let n = rest.read(&mut chunk).map_err(|e| timed_out(o, url, e.to_string()))?;
+                if n == 0 {
+                    return Err(format!("{}: the connection closed after an interim (1xx) answer, with no final one", url));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            _ => return Err(format!("{}: a bad answer after an interim (1xx) one", url)),
+        }
+    }
+}
+
+/// A chunked body, decoded as it arrives.
+struct Dechunk {
+    inner: Body,
+    /// Bytes left in this chunk.
+    left: u64,
+    done: bool,
+}
+
+impl Dechunk {
+    fn line(&mut self) -> std::io::Result<String> {
+        let mut l = Vec::new();
+        let mut b = [0u8; 1];
+        while self.inner.read(&mut b)? == 1 && b[0] != b'\n' {
+            l.push(b[0]);
+            if l.len() > 4096 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "a chunk's size line is too long"));
+            }
+        }
+        Ok(String::from_utf8_lossy(&l).trim().to_string())
+    }
+}
+
+impl Read for Dechunk {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.done || out.is_empty() {
+            return Ok(0);
+        }
+        if self.left == 0 {
+            let size = self.line()?;
+            let size = size.split(';').next().unwrap_or("").trim();
+            self.left = u64::from_str_radix(size, 16).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "a bad chunk size"))?;
+            if self.left == 0 {
+                self.done = true;
+                return Ok(0);
+            }
+        }
+        let want = out.len().min(self.left as usize);
+        let n = self.inner.read(&mut out[..want])?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        self.left -= n as u64;
+        if self.left == 0 {
+            self.line()?;
+        }
+        Ok(n)
+    }
 }
 
 /// A call cut short by its `timeout` says so, in those words.
@@ -346,7 +692,7 @@ fn keep(key: String, secs: u32, reply: &Reply) {
 
 fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Value, headers: &Value, opts: Option<&Value>, line: u32) -> R {
     not_in_component(it, fname, line)?;
-    let o = opts_of(opts, fname, line)?;
+    let o = opts_of(opts, fname, line, &it.base_dir.clone())?;
     if o.cache > 0 && method != "GET" {
         return fail(line, format!("`{}`: `cache` keeps the answers of GET requests, not {}", fname, method));
     }
@@ -361,11 +707,11 @@ fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Va
         Value::Nil => Vec::new(),
         other => return fail(line, format!("`{}` expects headers as a map, got {}", fname, other.type_name())),
     };
-    let payload: Option<(&str, Vec<u8>)> = match body {
+    let payload: Option<(String, Vec<u8>)> = match body {
         Value::Nil => None,
-        Value::Str(s) => Some(("text/plain; charset=utf-8", s.as_bytes().to_vec())),
-        Value::Html(h) => Some(("text/html; charset=utf-8", h.as_bytes().to_vec())),
-        other => Some(("application/json", other.json_text().into_bytes())),
+        Value::Str(s) => Some(("text/plain; charset=utf-8".into(), s.as_bytes().to_vec())),
+        Value::Html(h) => Some(("text/html; charset=utf-8".into(), h.as_bytes().to_vec())),
+        other => Some(("application/json".into(), other.json_text().into_bytes())),
     };
     let key = (o.cache > 0).then(|| cache_key(o, method, url, &hdrs));
     let reply = match key.as_deref().and_then(cached) {
@@ -390,6 +736,8 @@ fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Va
     m.insert("status".into(), Value::Int(reply.status as i64));
     m.insert("ok".into(), Value::Bool((200..300).contains(&reply.status)));
     m.insert("headers".into(), Value::map(reply.headers.into_iter().map(|(k, v)| (k.into(), Value::str(v))).collect()));
+    // Each `Set-Cookie` as it came (FEEDBACK36.md, Q-435; branch feedback36-39).
+    m.insert("cookies".into(), Value::list(reply.cookies.into_iter().map(Value::str).collect()));
     m.insert("body".into(), Value::str(reply.body));
     m.insert("json".into(), json);
     Ok(Value::map(m))
@@ -433,29 +781,9 @@ fn request(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 type Body = Box<dyn Read + Send + Sync>;
 
-fn open(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Option<(&str, Vec<u8>)>) -> Result<(u16, Vec<(String, String)>, Body), String> {
-    let mut req = agent(o, true).request(method, url);
-    if o.timeout_ms > 0 {
-        req = req.timeout(Duration::from_millis(o.timeout_ms as u64));
-    }
-    for (k, v) in headers {
-        req = req.set(k, v);
-    }
-    let res = match body {
-        Some((ctype, bytes)) => {
-            if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
-                req = req.set("content-type", ctype);
-            }
-            req.send_bytes(&bytes)
-        }
-        None => req.call(),
-    };
-    let resp = match res {
-        Ok(r) | Err(ureq::Error::Status(_, r)) => r,
-        Err(e) => return Err(timed_out(o, url, e.to_string())),
-    };
-    let headers = resp.headers_names().into_iter().filter_map(|n| resp.header(&n).map(|v| (n.to_ascii_lowercase(), v.to_string()))).collect();
-    Ok((resp.status(), headers, resp.into_reader()))
+fn open(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Option<(String, Vec<u8>)>) -> Result<Head, String> {
+    let (url, resp) = follow(o, true, method, url, headers, body)?;
+    head_of(o, &url, method, resp)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -480,6 +808,8 @@ const MAX_PIECE: usize = 16 << 20;
 struct Pending {
     buf: Vec<u8>,
     scanned: usize,
+    /// The last event id the stream gave.
+    id: Option<String>,
 }
 
 /// Where the first event in `b` ends at a blank line (`\n\n`, `\r\n\r\n`
@@ -548,16 +878,26 @@ fn pieces(p: &mut Pending, kind: Kind, end: bool) -> Result<Vec<Vec<Value>>, Str
                 };
                 let block = String::from_utf8_lossy(&buf[start..stop]).replace("\r\n", "\n");
                 let (mut data, mut name): (Vec<&str>, Option<&str>) = (Vec::new(), None);
+                let mut retry = None;
                 for l in block.lines() {
                     let (field, value) = l.split_once(':').map_or((l, ""), |(f, v)| (f, v.strip_prefix(' ').unwrap_or(v)));
                     match field {
                         "data" => data.push(value),
                         "event" => name = Some(value),
+                        // The last id is kept for the events after it, as a browser's
+                        // `EventSource` keeps it (FEEDBACK36.md, Q-444; branch feedback36-39).
+                        "id" if !value.contains('\0') => p.id = Some(value.to_string()).filter(|v| !v.is_empty()),
+                        "retry" => retry = value.parse::<i64>().ok(),
                         _ => {}
                     }
                 }
                 if !data.is_empty() {
-                    out.push(vec![parsed(&data.join("\n")), name.map_or(Value::Nil, Value::str)]);
+                    out.push(vec![
+                        parsed(&data.join("\n")),
+                        name.map_or(Value::Nil, Value::str),
+                        p.id.as_deref().map_or(Value::Nil, Value::str),
+                        retry.map_or(Value::Nil, Value::Int),
+                    ]);
                 }
                 start = next;
                 from = next;
@@ -595,7 +935,7 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Ok(Value::err(Value::str(format!("http: not an http(s) URL: {}", url))));
     }
-    let o = opts_of(Some(&Value::Map(opts.clone())), "http.stream", line)?;
+    let o = opts_of(Some(&Value::Map(opts.clone())), "http.stream", line, &it.base_dir.clone())?;
     if o.cache > 0 {
         return fail(line, "`http.stream`: `cache` keeps whole answers, of `http.get`");
     }
@@ -609,13 +949,13 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Some(Value::Map(m)) => m.iter().map(|(k, v)| (k.to_string(), v.display())).collect(),
         _ => Vec::new(),
     };
-    let payload: Option<(&str, Vec<u8>)> = match &body {
+    let payload: Option<(String, Vec<u8>)> = match &body {
         Value::Nil => None,
-        Value::Str(s) => Some(("text/plain; charset=utf-8", s.as_bytes().to_vec())),
-        other => Some(("application/json", other.json_text().into_bytes())),
+        Value::Str(s) => Some(("text/plain; charset=utf-8".into(), s.as_bytes().to_vec())),
+        other => Some(("application/json".into(), other.json_text().into_bytes())),
     };
     let u = url.to_string();
-    let (status, headers, mut reader) = match it.unlocked(move || open(o, &method, &u, &hdrs, payload)) {
+    let (status, headers, cookies, mut reader) = match it.unlocked(move || open(o, &method, &u, &hdrs, payload)) {
         Ok(r) => r,
         Err(e) => return Ok(Value::err(Value::str(format!("http: {}", e)))),
     };
@@ -624,6 +964,7 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     m.insert("status".into(), Value::Int(status as i64));
     m.insert("ok".into(), Value::Bool(ok));
     m.insert("headers".into(), Value::map(headers.iter().map(|(k, v)| (k.into(), Value::str(v))).collect()));
+    m.insert("cookies".into(), Value::list(cookies.into_iter().map(Value::str).collect()));
     if !ok {
         let bytes = it.unlocked(move || {
             let mut b = Vec::new();
@@ -699,7 +1040,7 @@ mod tests {
     #[test]
     fn stream_pieces_however_they_arrive() {
         let events = b"data: 1\n\nevent: tick\ndata: {\"a\": 2}\r\n\r\n: comment\ndata: x\ndata: y\n\r\ndata: last";
-        let want = vec!["1 null", "{ a: 2 } \"tick\"", "\"x\\ny\" null", "\"last\" null"];
+        let want = vec!["1 null null null", "{ a: 2 } \"tick\" null null", "\"x\\ny\" null null null", "\"last\" null null null"];
         let lines = b"{\"n\": 1}\n\n2\r\nthree\n4";
         for step in [1, 2, 3, 7, 1000] {
             assert_eq!(feed(Kind::Events, events, step).unwrap(), want, "{}", step);

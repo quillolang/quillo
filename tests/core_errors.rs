@@ -95,7 +95,8 @@ fn a_definition_in_the_wrong_place() {
         ("private server fn f() = 1", 1, "a `server fn` cannot be private: it is an address on the server that anyone can call; keep the work in a private `fn` it calls"),
         ("private type Foo = int", 1, "`private type` is not there yet: a type's name is the program's"),
         ("private x", 1, "expected end of statement, found `x`"),
-        ("style \"a\"", 1, "`style` belongs in the body of a component or a view"),
+        // At a file's top level, a file's style (FEEDBACK37.md, Q-457).
+        ("style \"a\"", 1, "a file's `style` styles the components declared in it, and this file has none"),
         ("view P() {\n  <div/>\n  style \"a\"\n}", 3, "`style` comes before the markup of `P`"),
         ("view P() {\n  fn q() { style \"a\" }\n  <div/>\n}", 2, "`style` belongs in the body of a component or a view"),
         ("view P(a) {\n  style a\n  <div/>\n}", 2, "a style is the same for every `P`, so it cannot read its parameter `a`; set a class or `style=` on an element instead"),
@@ -198,7 +199,9 @@ fn maps_and_patterns_say_what_they_found() {
 fn markup_says_where_it_went_wrong() {
     refused(&[
         ("<div / >", 1, "expected `>` after `/` in <div>"),
-        ("<div a=1/>", 1, "attribute `a` needs a \"string\" or {expression} value"),
+        // An unquoted value is taken, as HTML takes it (FEEDBACK36.md, Q-449); a value that
+        // starts with what no value starts with is not.
+        ("<div a=>x</div>", 1, "attribute `a` needs a \"string\" or {expression} value"),
         ("<div", 1, "unexpected end of input: unclosed <div>"),
         ("<div\n  a=\"b\"\n", 3, "unexpected end of input: unclosed <div>"),
         ("<div !>", 1, "unexpected `!` in <div> tag"),

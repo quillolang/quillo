@@ -37,6 +37,20 @@ pub const MARK: &str = "x-quillo-stream";
 pub trait Sink {
     /// Writes and sends `data`; false when the client is gone.
     fn write(&mut self, data: &[u8]) -> bool;
+
+    /// Whether the client reads chunks: an HTTP/1.0 one does not (FEEDBACK36.md, Q-434;
+    /// branch feedback36-39).
+    fn chunked(&self) -> bool {
+        true
+    }
+
+    /// Sends the answer's head: as HTTP, for a connection; an app's reply takes it as it is
+    /// (src/embed.rs).
+    fn start(&mut self, resp: &crate::server::HttpResponse, chunked: bool) -> bool {
+        let mut head = Vec::new();
+        crate::httpd::write_stream_head(&mut head, resp, chunked);
+        self.write(&head)
+    }
 }
 
 /// The stream a function is sending on.
@@ -164,13 +178,34 @@ fn encode(v: &Value, event: Option<&Value>, events: bool) -> Vec<u8> {
         };
     }
     let mut out = Vec::new();
-    if matches!(v, Value::Nil) && event.is_none() {
+    // `send(v, { event, id, retry })`: the event's name, an id the browser sends back as
+    // `Last-Event-ID` when it connects again, and how long it waits first (FEEDBACK36.md,
+    // Q-444; branch feedback36-39). A name alone is `send(v, "name")`, as before.
+    let (event, id, retry) = match event {
+        Some(Value::Map(m)) => (m.get("event"), m.get("id"), m.get("retry")),
+        other => (other, None, None),
+    };
+    fn given(v: Option<&Value>) -> Option<&Value> {
+        v.filter(|v| !matches!(v, Value::Nil))
+    }
+    let one_line = |v: &Value| -> String { v.display().chars().filter(|c| !matches!(c, '\n' | '\r' | '\0')).collect() };
+    if matches!(v, Value::Nil) && given(event).is_none() && given(id).is_none() && given(retry).is_none() {
         out.extend_from_slice(b":\n\n");
         return out;
     }
-    if let Some(e) = event.filter(|e| !matches!(e, Value::Nil)) {
+    if let Some(r) = given(retry) {
+        out.extend_from_slice(format!("retry: {}\n", one_line(r)).as_bytes());
+    }
+    if let Some(i) = given(id) {
+        out.extend_from_slice(format!("id: {}\n", one_line(i)).as_bytes());
+    }
+    if matches!(v, Value::Nil) && given(event).is_none() {
+        out.push(b'\n');
+        return out;
+    }
+    if let Some(e) = given(event) {
         // One line: a name with a line break in it would end the field.
-        let name: String = e.display().chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        let name = one_line(e);
         out.extend_from_slice(b"event: ");
         out.extend_from_slice(name.as_bytes());
         out.push(b'\n');
@@ -182,11 +217,20 @@ fn encode(v: &Value, event: Option<&Value>, events: bool) -> Vec<u8> {
     out
 }
 
-/// `send(value, event = null)`, given to a stream's function.
+/// `send(value, event = null)`, given to a stream's function; for events, `send(value, { event,
+/// id, retry })` too.
 fn send(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let Some(out) = it.stream_out.as_mut() else {
         return fail(line, "`send` works while a `stream` or `events` answer is being sent");
     };
+    if let Some(Value::Map(m)) = args.get(1) {
+        if let Some(k) = m.keys().find(|k| !["event", "id", "retry"].contains(&&***k)) {
+            return fail(line, format!("`send`: unknown option `{}` (an event takes event, id and retry)", k));
+        }
+        if let Some(r) = m.get("retry").filter(|r| !matches!(r, Value::Nil | Value::Int(0..))) {
+            return fail(line, format!("`send`: retry is milliseconds, a whole number, got {}", r.repr()));
+        }
+    }
     if out.gone {
         return fail(line, GONE);
     }

@@ -21,6 +21,7 @@ import android.webkit.PermissionRequest
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import org.json.JSONObject
@@ -29,9 +30,12 @@ import java.util.Locale
 import java.util.TimeZone
 
 /**
- * A Quillo program as an Android app: one WebView on what the runtime serves on
- * 127.0.0.1, with `window.quilloNative` on the program's own pages for what a
- * WebView cannot reach (see Bridge.kt), as the iOS app has.
+ * A Quillo program as an Android app: the runtime runs it in this process with no socket,
+ * and one WebView gets its pages from it at [ORIGIN], which the WebView's requests are
+ * answered for here (FEEDBACK39.md, Q-465 to Q-470; branch feedback36-39). Android's
+ * interceptor carries no body, so every request with one goes through the bridge, as do
+ * connections for live data and channels. `window.quilloNative` is on the program's own
+ * pages for what a WebView cannot reach (see Bridge.kt), as the iOS app has.
  */
 class MainActivity : Activity() {
     private lateinit var web: WebView
@@ -94,6 +98,13 @@ class MainActivity : Activity() {
             for (i in 2..9) x.getString("eval$i")?.let { pendingEvals.add(script(it)) }
         }
         web.webViewClient = object : WebViewClient() {
+            // The program's pages, scripts, images and data, answered by the program here.
+            override fun shouldInterceptRequest(view: WebView, req: WebResourceRequest): WebResourceResponse? {
+                val url = req.url.toString()
+                if (!own(url)) return null
+                return answer(req.method, url, JSONObject(req.requestHeaders as Map<*, *>).toString())
+            }
+
             // The program's own pages stay here; a link to another site opens in the browser.
             override fun shouldOverrideUrlLoading(view: WebView, req: WebResourceRequest): Boolean {
                 val url = req.url.toString()
@@ -177,7 +188,7 @@ class MainActivity : Activity() {
             web.loadData("<meta name=viewport content='width=device-width'><body style='font:16px sans-serif;padding:24px'><h2>The program did not start</h2><pre style='white-space:pre-wrap'>${said.removePrefix("error: ")}</pre>", "text/html", "utf-8")
             return
         }
-        origin = Uri.parse(said).let { "${it.scheme}://${it.host}:${it.port}" }
+        origin = ORIGIN
         bridge.attach(if (site.isEmpty()) setOf(origin) else setOf(origin, site))
         // Back goes back in the program's pages first. From Android 13 the system asks
         // for a callback (predictive back, the only way from Android 16); before, the
@@ -191,6 +202,30 @@ class MainActivity : Activity() {
     }
 
     private fun own(url: String) = origin.isNotEmpty() && (url == origin || url == "$origin/" || url.startsWith("$origin/"))
+
+    /** The program's answer to a request, as the WebView takes it. A redirect is a page that
+     *  goes on, since an intercepted answer cannot be one. */
+    private fun answer(method: String, url: String, headers: String): WebResourceResponse {
+        val raw = Quillo.request(method, url, headers, null)
+        val b = java.nio.ByteBuffer.wrap(raw)
+        val status = b.int
+        val hlen = b.int
+        val hs = JSONObject(String(raw, 8, hlen, Charsets.UTF_8))
+        val body = raw.copyOfRange(8 + hlen, raw.size)
+        val fields = HashMap<String, String>()
+        for (k in hs.keys()) fields[k] = hs.optString(k)
+        val type = fields.entries.firstOrNull { it.key.equals("content-type", true) }?.value ?: "application/octet-stream"
+        val mime = type.substringBefore(';').trim()
+        val charset = Regex("charset=([^;]+)", RegexOption.IGNORE_CASE).find(type)?.groupValues?.get(1)?.trim()
+        val location = fields.entries.firstOrNull { it.key.equals("location", true) }?.value
+        if (status in 300..399 && location != null) {
+            val to = JSONObject.quote(location)
+            val page = "<!doctype html><meta http-equiv=refresh content=\"0;url=${location.replace("\"", "&quot;")}\"><script>location.replace($to)</script>"
+            return WebResourceResponse("text/html", "utf-8", 200, "OK", HashMap(), java.io.ByteArrayInputStream(page.toByteArray()))
+        }
+        val reason = if (status in 200..299) "OK" else "Answer"
+        return WebResourceResponse(mime, charset, status, reason, fields, java.io.ByteArrayInputStream(body))
+    }
 
     /** Asks for [perms] the person has not granted yet; [done] gets whether all were. */
     fun ask(perms: Array<String>, done: (Boolean) -> Unit) {
@@ -230,7 +265,15 @@ class MainActivity : Activity() {
     @Deprecated("The system back button goes back in the program's pages first.")
     override fun onBackPressed() { if (web.canGoBack()) web.goBack() else @Suppress("DEPRECATION") super.onBackPressed() }
 
-    companion object { const val FILE_REQUEST = 7; const val CAPTURE_REQUEST = 8 }
+    override fun onStop() { Quillo.suspend(); super.onStop() }
+
+    companion object {
+        const val FILE_REQUEST = 7
+        const val CAPTURE_REQUEST = 8
+        /** The program's origin, the same at every launch, so the page's storage stays with it
+         *  (Q-466). A `.localhost` name never leads to the network. */
+        const val ORIGIN = "https://quillo.localhost"
+    }
 }
 
 /** The program, started once per process. */
@@ -246,8 +289,9 @@ object Program {
         val data = File(activity.filesDir, "quillo").apply { mkdirs() }
         val started = System.currentTimeMillis()
         // `main` in app.toml (FEEDBACK20.md, Q-169; branch feedback20-fixes).
-        val result = Quillo.start(bundle.path, data.path, activity.getString(R.string.quillo_main), device(activity))
-        Log.i("quillo", "${if (result.startsWith("error: ")) "did not start: $result" else "started"} in ${System.currentTimeMillis() - started} ms: data in ${data.path}")
+        val failed = Quillo.open(bundle.path, data.path, activity.getString(R.string.quillo_main), device(activity))
+        val result = if (failed.isEmpty()) MainActivity.ORIGIN + "/" else "error: $failed"
+        Log.i("quillo", "${if (failed.isNotEmpty()) "did not start: $failed" else "started"} in ${System.currentTimeMillis() - started} ms: data in ${data.path}")
         said = result
         return result
     }

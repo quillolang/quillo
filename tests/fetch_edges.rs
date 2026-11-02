@@ -86,8 +86,8 @@ fn options_are_checked() {
     assert!(opt("{ timeout: \"soon\" }").contains("`timeout` is seconds, more than 0 and up to 300, got soon"));
     assert!(opt("{ timeout: 0 }").contains("`timeout` is seconds, more than 0 and up to 300, got 0"));
     assert!(opt("{ timeout: 301.5 }").contains("got 301.5"));
-    assert!(opt("{ retries: 1 }").contains("unknown option `retries` (the options are redirects, public_only, cache, timeout)"));
-    assert!(fails(&format!("http.stream({}, (x) => x, {{ retries: 1 }})", u)).contains("(the options are method, body, headers, redirects, public_only, cache, timeout)"));
+    assert!(opt("{ retries: 1 }").contains("unknown option `retries` (the options are redirects, public_only, cache, timeout, ca, cert, key)"));
+    assert!(fails(&format!("http.stream({}, (x) => x, {{ retries: 1 }})", u)).contains("(the options are method, body, headers, redirects, public_only, cache, timeout, ca, cert, key)"));
     assert!(fails(&format!("http.post({}, null, {{}}, {{ cache: 5 }})", u)).contains("`cache` keeps the answers of GET requests, not POST"));
     assert!(fails("http.get(5)").contains("`http.get` expects a URL string, got int"));
     assert!(fails(&format!("http.get({}, 5)", u)).contains("expects headers as a map, got int"));

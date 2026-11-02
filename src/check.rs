@@ -597,8 +597,13 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("now", "", "int"),
     ("sleep", "num", "null"),
     ("file", "str, map | null=", "response"),
+    ("files", "str, str | null=, map | null=", "response"),
     ("redirect", "str, int=", "response"),
     ("__site", "str, any", "any"),
+    ("__built", "str, fn", "response"),
+    ("classes", "", "list"),
+    ("accept_calls", "map", "null"),
+    ("__callers", "str, list", "null"),
     ("local_path", "any", "str | null"),
     ("respond", "int, any=, map | null=", "response"),
     ("read_file", "str", "str | error(str)"),
@@ -626,6 +631,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("index_of", "list | str, any", "int | null"),
     ("repeat", "str, int", "str"),
     ("markdown", "str, map | null=", "html"),
+    ("markdown_page", "str, map | null=", "html"),
     ("highlight", "str, str | null=", "html"),
     ("run_script", "str, map | null=", "any"),
     ("sql_name", "str | list", "str"),
@@ -659,7 +665,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("css", "str", "str"),
     ("__style", "str, bool | null=, str=", "null"),
     ("ready", "str, fn", "null"),
-    ("style_with", "str", "null"),
+    ("style_with", "str | fn", "null"),
     ("sql", "str", "str"),
     ("navigate", "str", "null"),
     ("waiting", "any", "bool"),
@@ -896,7 +902,7 @@ const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "unwatched", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
       "delete_cookie", "session", "cookie", "set_session", "end_session", "translations", "locale_from", "with_locale",
-      "schedule", "stream", "events", "image.info", "image.convert", "later.status", "args", "stdin", "read_line", "exit", "allow_cross_site", "site_headers", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform"];
+      "schedule", "stream", "events", "image.info", "image.convert", "later.status", "args", "stdin", "read_line", "exit", "allow_cross_site", "site_headers", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform", "markdown_page", "files", "classes", "accept_calls"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;
@@ -1735,13 +1741,13 @@ impl Checker {
                 let Some(full) = self.file_at(base, path, &file, *line) else { continue };
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
                 // A `.qwer` file's names are taken by each `use` that names some (branch imports).
-                if !seen.insert(key.clone()) && (names.is_none() || !path.ends_with(".qwer")) {
+                if !seen.insert(key.clone()) && (names.is_none() || !crate::native::is_rust(&path)) {
                     continue;
                 }
                 let fname: Arc<str> = Arc::from(full.display().to_string());
                 let text = self.overrides.get(&full).cloned().map_or_else(|| crate::error::read_source(&full), Ok);
                 // Rust: its functions' signatures, read without building it.
-                if path.ends_with(".qwer") {
+                if crate::native::is_rust(&path) {
                     match text {
                         Ok(src) => {
                             let parsed = crate::native::parse(&src);
@@ -2268,6 +2274,16 @@ impl Checker {
     }
 
     fn suggest(&self, name: &str) -> String {
+        // `<DIV CLASS="a">`, pasted from older HTML, whose tags are any case: a capital starts a
+        // view's name here (FEEDBACK36.md, Q-449; branch feedback36-39).
+        const HTML_TAGS: &[&str] = &["a", "abbr", "article", "aside", "b", "body", "br", "button", "caption", "center", "code", "dd", "div", "dl", "dt", "em",
+            "font", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hr", "html", "i", "iframe", "img", "input", "label", "li", "link",
+            "main", "meta", "nav", "ol", "option", "p", "pre", "script", "section", "select", "small", "span", "strong", "style", "table", "tbody", "td",
+            "textarea", "th", "thead", "title", "tr", "u", "ul"];
+        let lower = name.to_ascii_lowercase();
+        if name.len() > 1 && name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) && HTML_TAGS.contains(&lower.as_str()) {
+            return format!(" (HTML tags are written in lowercase here, <{}>: a capital letter starts a view's name)", lower);
+        }
         let mut best: Option<(usize, String)> = None;
         let mut consider = |cand: &str| {
             let d = edit_distance(name, cand);
@@ -2678,14 +2694,35 @@ impl Checker {
                 }
                 // The options the loader takes, known here too (FEEDBACK9.md,
                 // Q-072; branch feedback9-fixes).
-                const OPTIONS: [&str; 4] = ["timeout", "retries", "failures", "cooldown"];
+                const OPTIONS: [&str; 6] = ["timeout", "retries", "failures", "cooldown", "auth", "forward"];
                 match opts {
                     Some(Expr::Map(fields)) => {
                         for (k, v) in fields {
                             if !OPTIONS.contains(&k.as_str()) {
                                 let near = OPTIONS.iter().map(|o| (edit_distance(k, o), *o)).filter(|(d, _)| *d <= 2).min();
-                                let hint = near.map_or_else(|| " (timeout, retries, failures, cooldown)".to_string(), |(_, o)| format!(" (did you mean `{}`?)", o));
+                                let hint = near.map_or_else(|| " (timeout, retries, failures, cooldown, auth, forward)".to_string(), |(_, o)| format!(" (did you mean `{}`?)", o));
                                 self.error(format!("service {}: no option `{}`{}", name, k, hint));
+                            }
+                            // A key or a client secret written in the source is in every copy of it,
+                            // and in its history (FEEDBACK38.md, Q-458; branch feedback36-39).
+                            if k == "auth" {
+                                let mut literal = None;
+                                if let Expr::Map(a) = v {
+                                    for (ak, av) in a {
+                                        let inner: Vec<(&str, &Expr)> = match av {
+                                            Expr::Map(m) if ak == "oauth" => m.iter().map(|(k, e)| (k.as_str(), e)).collect(),
+                                            e => vec![(ak.as_str(), e)],
+                                        };
+                                        for (ik, ie) in inner {
+                                            if ["key", "client_secret"].contains(&ik) && matches!(ie, Expr::Lit(Lit::Str(_)) | Expr::Template(_)) {
+                                                literal = Some(ik.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(what) = literal {
+                                    self.warn(format!("service {}: its `{}` is written in the source, where every copy of the program has it: read it with env(\"...\")", name, what));
+                                }
                             }
                             self.expr(v);
                             self.line = *line;
@@ -3173,6 +3210,7 @@ impl Checker {
             Expr::Call(callee, args, line) => {
                 self.line = *line;
                 self.upload_named_by_visitor(callee, args);
+                self.interim_status(callee, args);
                 if let Expr::Field(o, f, _) = callee.as_ref() {
                     if let Expr::Ident(s, _) = o.as_ref() {
                         if self.sites.contains(s.as_str()) && !self.is_local(s) {
@@ -3371,8 +3409,8 @@ impl Checker {
                     self.error(format!("`reply` only works on the server, but <{}> also runs in the browser", c));
                 }
                 if let Expr::Lit(Lit::Int(n)) = &**status {
-                    if !(100..=599).contains(n) {
-                        self.error(format!("reply status must be an HTTP status code (100-599), got {}", n));
+                    if !(200..=599).contains(n) {
+                        self.error(format!("reply status must be an HTTP status code (200-599), got {}", n));
                     }
                 } else if st.bits != 0 && st.bits & INT == 0 {
                     self.error(format!("reply status must be an int, got {}", bits_text(st.bits)));
@@ -3461,6 +3499,19 @@ impl Checker {
     /// `save_upload(f, f.filename)`, or a path ending in the visitor's name with no folder of the
     /// program's before it: a visitor can then name the file `main.qwe` or `.env`, which are
     /// refused, or any other at the folder's root (FEEDBACK30.md, Q-361; branch feedback27-35-fixes).
+    /// `respond(103, ...)`: a 1xx is an interim answer, after which the client waits for the
+    /// real one, which never comes (FEEDBACK36.md, Q-433; branch feedback36-39).
+    fn interim_status(&mut self, callee: &Expr, args: &[Expr]) {
+        if !matches!(callee, Expr::Ident(n, _) if n == "respond") || self.is_local("respond") {
+            return;
+        }
+        if let Some(Expr::Lit(Lit::Int(n))) = args.first() {
+            if (100..200).contains(n) {
+                self.error(format!("`respond` status must be 200-599, got {}: a 1xx is an interim answer, and the client would wait for the real one", n));
+            }
+        }
+    }
+
     fn upload_named_by_visitor(&mut self, callee: &Expr, args: &[Expr]) {
         if !matches!(callee, Expr::Ident(n, _) if n == "save_upload") || self.is_local("save_upload") {
             return;
@@ -4028,8 +4079,8 @@ impl Checker {
         };
         if let (false, Some(Expr::Map(fields))) = (piped, opts_at.and_then(|i| args.get(i))) {
             for (k, _) in fields {
-                if !["redirects", "public_only", "cache", "timeout"].contains(&k.as_str()) {
-                    self.error(format!("`http.{}`: unknown option `{}` (the options are redirects, public_only, cache, timeout)", f, k));
+                if !["redirects", "public_only", "cache", "timeout", "ca", "cert", "key"].contains(&k.as_str()) {
+                    self.error(format!("`http.{}`: unknown option `{}` (the options are redirects, public_only, cache, timeout, ca, cert, key)", f, k));
                 }
             }
         }
@@ -4593,6 +4644,12 @@ impl Checker {
                         Expr::Map(_) => {
                             self.line = el.line;
                             self.warn("a map written as an element's child is shown as its text: one pair of braces shows a value, `{x}`");
+                        }
+                        // `<pre>f() { return 1 }</pre>`, pasted HTML: the `return` ends the route,
+                        // and its value is the whole answer (FEEDBACK36.md, Q-448; branch feedback36-39).
+                        Expr::Block(stmts) if stmts.iter().any(|s| matches!(s, Stmt::Return(..))) => {
+                            self.line = el.line;
+                            self.warn(format!("`{{ return ... }}` in <{}> leaves the function, and its value is the answer, not the page: for the characters, write {{\"{{\"}} and {{\"}}\"}}, or put the text in a string", el.tag));
                         }
                         Expr::Block(_) => {
                             self.line = el.line;

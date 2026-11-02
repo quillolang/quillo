@@ -219,7 +219,7 @@ fn spread_attributes() {
 #[test]
 fn routes() {
     one("route GET /a/:id/:id = id", "path parameter `id` appears twice");
-    one("route GET /x = reply 999", "reply status must be an HTTP status code (100-599), got 999");
+    one("route GET /x = reply 999", "reply status must be an HTTP status code (200-599), got 999");
     one("route GET /x/:id(int) = id + \"\" + nope", "unknown name `nope`");
     clean("route GET /users/:id(int) ? { page: int = 1 } { json: { name: str } } = { id, page, name, path: request.path }");
     clean("route GET /files/*path = path");

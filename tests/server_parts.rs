@@ -25,7 +25,8 @@ fn pair() -> (TcpStream, TcpStream) {
 }
 
 fn upgrade(key: Option<&str>) -> HttpRequest {
-    let mut headers = vec![("Upgrade".to_string(), "WebSocket".to_string())];
+    // As a browser asks: version 13, and `Connection: Upgrade` (FEEDBACK36.md, Q-445).
+    let mut headers = vec![("Upgrade".to_string(), "WebSocket".to_string()), ("Connection".to_string(), "keep-alive, Upgrade".to_string()), ("Sec-WebSocket-Version".to_string(), "13".to_string())];
     if let Some(k) = key {
         headers.push(("Sec-WebSocket-Key".to_string(), format!(" {} ", k)));
     }

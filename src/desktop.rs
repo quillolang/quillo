@@ -1,11 +1,11 @@
 //! `quillo app`: the program in a native window.
 //!
-//! The program is served as by `quillo run`, but on 127.0.0.1 at a port the
-//! system picks, and only to the window (see `server::launch_gate`). The
-//! window is the platform's own web view: WebKit on macOS and Linux,
+//! The program runs in this process with no socket (src/embed.rs): the window
+//! asks for its pages through the `quillo` scheme, at an origin that stays the
+//! same from one launch to the next, and nothing else can reach the program.
+//! The window is the platform's own web view: WebKit on macOS and Linux,
 //! WebView2 on Windows. Closing it ends the program.
 
-use std::net::SocketAddr;
 use std::path::Path;
 use tao::dpi::LogicalSize;
 #[cfg(target_os = "macos")]
@@ -21,6 +21,8 @@ enum UserEvent {
     /// The page asked for a new window onto one of its own pages: it opens
     /// in this one instead, since only this window may reach the program.
     Open(String),
+    /// What the program sends the page through the bridge (src/embed.rs).
+    Eval(String),
 }
 
 pub fn main(file: &str, flags: &[String]) -> i32 {
@@ -69,22 +71,17 @@ fn window(file: &str, flags: &[String]) -> i32 {
         });
     }
     quillo::platform::set_runtime("app");
-    let token = match quillo::server::launch_token() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("quillo: {}", e);
-            return 1;
-        }
-    };
     let path = Path::new(file).to_path_buf();
     let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Quillo".into());
     let watch = o.watch;
-    let addr = match start_program(&path, o, token.clone()) {
-        Ok(a) => a,
+    let program = match start_program(&path, o) {
+        Ok(p) => p,
         Err(code) => return code,
     };
-    let origin = format!("http://{}", addr);
-    match open_window(&name, &origin, &open, &token, watch) {
+    if watch {
+        program.watch();
+    }
+    match open_window(&name, program, &open, watch) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("quillo: cannot open the window: {}", e);
@@ -93,20 +90,32 @@ fn window(file: &str, flags: &[String]) -> i32 {
     }
 }
 
-/// Loads and serves the program on a thread of its own; returns once it
-/// listens, with its address.
-fn start_program(path: &Path, o: crate::RunOptions, token: String) -> Result<SocketAddr, i32> {
-    let (tx, rx) = std::sync::mpsc::channel::<Result<SocketAddr, i32>>();
-    let path = path.to_path_buf();
-    let addr = format!("127.0.0.1:{}", o.port.as_deref().unwrap_or("0"));
+/// The window's origin, the same at every launch, so the page's `localStorage` and IndexedDB stay
+/// with it (FEEDBACK39.md, Q-466; branch feedback36-39): wry serves the scheme as
+/// `https://quillo.localhost` on Windows.
+#[cfg(target_os = "windows")]
+const ORIGIN: &str = "https://quillo.localhost";
+#[cfg(not(target_os = "windows"))]
+const ORIGIN: &str = "quillo://app";
+
+/// Loads the program on a thread of its own, to run in this process with no socket: the window
+/// asks for its pages through the `quillo` scheme (src/embed.rs; FEEDBACK39.md, Q-465 and Q-469).
+fn start_program(path: &Path, o: crate::RunOptions) -> Result<quillo::embed::Program, i32> {
+    let dir = path.parent().unwrap_or(Path::new(".")).join(".quillo");
+    if let Err(e) = quillo::embed::keep_secret(&dir) {
+        eprintln!("quillo: {}", e);
+        return Err(1);
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Result<quillo::server::App, i32>>();
+    let path_buf = path.to_path_buf();
     let spawned = std::thread::Builder::new()
         .name("quillo-app".into())
         .stack_size(quillo::server::WORKER_STACK)
         .spawn(move || {
-            let mut app = match crate::load(&path, &o) {
+            let app = match crate::load(&path_buf, &o) {
                 Ok(Some(app)) => app,
                 Ok(None) => {
-                    eprintln!("quillo: {} declares no routes, so there is nothing to show in a window", path.display());
+                    eprintln!("quillo: {} declares no routes, so there is nothing to show in a window", path_buf.display());
                     let _ = tx.send(Err(1));
                     return;
                 }
@@ -115,25 +124,21 @@ fn start_program(path: &Path, o: crate::RunOptions, token: String) -> Result<Soc
                     return;
                 }
             };
-            app.launch_token = Some(token);
-            let ready = tx.clone();
-            if let Err(e) = quillo::server::serve_with(app, &addr, o.workers, move |a| {
-                let _ = ready.send(Ok(a));
-            }) {
-                eprintln!("quillo: {}", e);
-                let _ = tx.send(Err(1));
-            }
+            app.shared().gil.release();
+            let _ = tx.send(Ok(app));
         });
     if let Err(e) = spawned {
         eprintln!("quillo: cannot start the program's thread: {}", e);
         return Err(1);
     }
     // Disconnected: the thread ended without saying why (it panicked).
-    rx.recv().unwrap_or(Err(1))
+    let app = rx.recv().unwrap_or(Err(1))?;
+    let jar = path.parent().unwrap_or(Path::new(".")).join(".quillo").join("app-cookies.json");
+    Ok(quillo::embed::Program::of(app, Some(jar)))
 }
 
 /// Runs the window until it is closed; does not return when it opens.
-fn open_window(name: &str, origin: &str, start: &str, token: &str, devtools: bool) -> Result<(), String> {
+fn open_window(name: &str, program: quillo::embed::Program, start: &str, devtools: bool) -> Result<(), String> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let window = WindowBuilder::new()
         .with_title(name)
@@ -143,22 +148,47 @@ fn open_window(name: &str, origin: &str, start: &str, token: &str, devtools: boo
 
     let titles = event_loop.create_proxy();
     let opens = event_loop.create_proxy();
-    let (own, own_too) = (origin.to_string(), origin.to_string());
+    let evals = std::sync::Mutex::new(event_loop.create_proxy());
+    let to_page: std::sync::Arc<dyn Fn(String) + Send + Sync> = std::sync::Arc::new(move |json: String| {
+        let _ = evals.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send_event(UserEvent::Eval(quillo::embed::deliver_js(&json)));
+    });
+    let (pages, bridged) = (program.clone(), program.clone());
     let builder = WebViewBuilder::new()
-        .with_url(format!("{}{}{}_quillo_launch={}", origin, start, if start.contains('?') { '&' } else { '?' }, token))
+        .with_url(format!("{}{}", ORIGIN, start))
         .with_devtools(devtools)
+        // WebKitGTK carries no body through a scheme unless built so: on Linux they go through
+        // the bridge, as on Android.
+        .with_initialization_script(quillo::embed::shell_js("window.ipc.postMessage", if cfg!(target_os = "linux") { "bridge" } else { "bytes" }))
+        // Each request of the page, answered by the program in this process.
+        .with_asynchronous_custom_protocol("quillo".into(), move |_, request, responder| {
+            let (parts, body) = request.into_parts();
+            let headers = parts.headers.iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())).collect();
+            let req = quillo::embed::request_of(parts.method.as_str(), &parts.uri.to_string(), headers, body);
+            let p = pages.clone();
+            std::thread::spawn(move || {
+                let r = p.request_whole(req);
+                let mut b = wry::http::Response::builder().status(r.status);
+                for (k, v) in r.headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("set-cookie")) {
+                    b = b.header(k.as_str(), v.as_str());
+                }
+                let resp = b.body(r.body).unwrap_or_else(|_| wry::http::Response::builder().status(500).body(Vec::new()).expect("a plain answer"));
+                responder.respond(resp);
+            });
+        })
+        // What a scheme cannot carry: connections, for live data and channels.
+        .with_ipc_handler(move |req| quillo::embed::bridge_message(&bridged, req.body(), to_page.clone()))
         .with_document_title_changed_handler(move |t| {
             let _ = titles.send_event(UserEvent::Title(t));
         })
         .with_navigation_handler(move |url| {
-            if is_own(&url, &own) || url == "about:blank" {
+            if is_own(&url, ORIGIN) || url == "about:blank" {
                 return true;
             }
             open_outside(&url);
             false
         })
         .with_new_window_req_handler(move |url, _| {
-            if is_own(&url, &own_too) {
+            if is_own(&url, ORIGIN) {
                 let _ = opens.send_event(UserEvent::Open(url));
             } else {
                 open_outside(&url);
@@ -166,6 +196,11 @@ fn open_window(name: &str, origin: &str, start: &str, token: &str, devtools: boo
             NewWindowResponse::Deny
         });
 
+    #[cfg(target_os = "windows")]
+    let builder = {
+        use wry::WebViewBuilderExtWindows;
+        builder.with_https_scheme(true)
+    };
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     let webview = builder.build(&window).map_err(|e| e.to_string())?;
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -188,7 +223,13 @@ fn open_window(name: &str, origin: &str, start: &str, token: &str, devtools: boo
             Event::UserEvent(UserEvent::Open(url)) => {
                 let _ = webview.load_url(&url);
             }
-            Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => *control_flow = ControlFlow::Exit,
+            Event::UserEvent(UserEvent::Eval(js)) => {
+                let _ = webview.evaluate_script(&js);
+            }
+            Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
+                program.stop();
+                *control_flow = ControlFlow::Exit
+            }
             // `run` does not return: the last thing before it ends.
             Event::LoopDestroyed => crate::with::stop_all(),
             _ => {}

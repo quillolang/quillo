@@ -26,7 +26,23 @@ impl Socket {
     /// Completes the handshake on the request's connection; `None` if the
     /// request is not a valid one.
     pub fn accept(req: &HttpRequest, mut stream: std::net::TcpStream) -> Option<Socket> {
-        let key = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-key"))?.1.trim().to_string();
+        // A GET, asking for an upgrade, in version 13, as RFC 6455 §4.2.1 asks; told so with a
+        // 426 or a 400 otherwise (an HTTP/1.0 request's `Upgrade` is dropped as it is read)
+        // (FEEDBACK36.md, Q-445; branch feedback36-39).
+        let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim());
+        let upgrading = header("connection").is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")));
+        let refusal = if req.method != "GET" || !upgrading || header("sec-websocket-key").is_none() {
+            Some("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+        } else if header("sec-websocket-version") != Some("13") {
+            Some("HTTP/1.1 426 Upgrade Required\r\nsec-websocket-version: 13\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+        } else {
+            None
+        };
+        if let Some(r) = refusal {
+            let _ = stream.write_all(r.as_bytes());
+            return None;
+        }
+        let key = header("sec-websocket-key")?.to_string();
         let accept = base64(&sha1(format!("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key).as_bytes()));
         let handshake = format!(
             "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {}\r\n\r\n",

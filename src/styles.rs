@@ -27,6 +27,9 @@ const KEPT: usize = 256;
 pub struct Styles {
     /// The scoped CSS of each component and view with a style, by its id.
     by_id: BTreeMap<String, String>,
+    /// Those that are files' styles: before the components' own in a sheet, so that a
+    /// component's rule wins over its file's of the same weight.
+    files: std::collections::HashSet<String>,
     sheets: HashMap<String, Sheet>,
     tick: u64,
 }
@@ -44,12 +47,19 @@ impl Styles {
         // (or, for `style global`, kept as written), by component: its id,
         // and the style's place among the component's.
         let mut written: BTreeMap<String, (String, String, u32)> = BTreeMap::new();
+        let mut files = std::collections::HashSet::new();
         let mut parts: Vec<(String, String, bool)> = Vec::new();
         let env = it.globals.clone();
         for (_, v) in scope_vars(&it.globals) {
             let Value::Func(f) = v else { continue };
             let Expr::Block(stmts) = &f.def.body else { continue };
-            let id = style_id(f.def.file.as_deref(), &f.def.name);
+            // A file's own style: by the file, whichever of its `style`s this is (FEEDBACK37.md,
+            // Q-457; branch feedback36-39).
+            let of_file = f.def.name.starts_with(crate::parser::FILE_STYLE);
+            let id = if of_file { style_id(f.def.file.as_deref(), crate::parser::FILE_STYLE) } else { style_id(f.def.file.as_deref(), &f.def.name) };
+            if of_file {
+                files.insert(id.clone());
+            }
             for (k, (e, global)) in stmts.iter().filter_map(style_parts).enumerate() {
                 let css = match it.eval(e, &env) {
                     Ok(Value::Str(s)) => s.to_string(),
@@ -62,7 +72,7 @@ impl Styles {
                     Err(Ctrl::Error(e)) => return Err(*e),
                     Err(_) => return Err(QuilloError::new(format!("`style` in `{}` must be CSS text", f.def.name), f.def.line)),
                 };
-                let key = format!("{}-{}", id, k);
+                let key = if of_file { format!("{}-{}", id, f.def.name) } else { format!("{}-{:04}", id, k) };
                 written.insert(key.clone(), (f.def.name.clone(), css, f.def.line));
                 parts.push((key, id.clone(), global));
             }
@@ -70,6 +80,27 @@ impl Styles {
         if let Some(cmd) = it.style_with.clone() {
             made_with(&cmd, &it.base_dir, &mut written)?;
         }
+        // A function, Quillo's or a `.qwer` file's: a CSS engine in Rust in the program, with no
+        // Node (FEEDBACK37.md, Q-455; branch feedback36-39).
+        if let Some(f) = it.style_with_fn.clone() {
+            let name = match &f {
+                Value::Func(c) => c.def.name.clone(),
+                Value::Builtin(n, _) => n.to_string(),
+                _ => "a function".into(),
+            };
+            let mut run = |input: &str| -> Result<String, String> {
+                match it.call(&f, vec![Value::str(input)], 0) {
+                    Ok(Value::Str(s)) => Ok(s.to_string()),
+                    Ok(Value::Err(e, ..)) => Err(e.display()),
+                    Ok(other) => Err(format!("it gave {}, not CSS text", other.type_name())),
+                    Err(Ctrl::Error(e)) => Err(e.msg.clone()),
+                    Err(_) => Err("it did not give CSS text".into()),
+                }
+            };
+            split_made(&mut run, &format!("`{}`", name), &mut written)?;
+        }
+        // In the order they are written: a file's styles one after another, as a component's.
+        parts.sort_by(|a, b| a.0.cmp(&b.0));
         let mut by_id: BTreeMap<String, String> = BTreeMap::new();
         for (key, id, global) in parts {
             let css = &written[&key].1;
@@ -77,7 +108,7 @@ impl Styles {
             out.push_str(&if global { css.clone() } else { scope(css, &id) });
             out.push('\n');
         }
-        Ok(Styles { by_id, ..Default::default() })
+        Ok(Styles { by_id, files, ..Default::default() })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -92,7 +123,7 @@ impl Styles {
     /// or none when none of them has a style.
     pub fn sheet_for(&mut self, ids: &[String]) -> Option<String> {
         let mut ids: Vec<&String> = ids.iter().filter(|i| self.by_id.contains_key(*i)).collect();
-        ids.sort();
+        ids.sort_by_key(|i| (!self.files.contains(*i), (*i).clone()));
         ids.dedup();
         if ids.is_empty() {
             return None;
@@ -121,6 +152,66 @@ impl Styles {
     pub fn all(&self) -> String {
         unique(self.by_id.values().map(|s| s.as_str()))
     }
+}
+
+/// The classes the program's markup writes, sorted: the `.name` shorthand, `class="..."`, the
+/// text in `class={...}`, and `class:name` toggles; for a CSS engine, which a scanner of the
+/// source as text served badly (FEEDBACK37.md, Q-456; branch feedback36-39). A class made from
+/// parts (`` `bg-${color}` ``) is in none of them: only whole words written out are.
+pub fn written_classes(files: &[&[crate::ast::Stmt]]) -> Vec<String> {
+    use crate::ast::{AttrVal, Expr, HtmlChild, HtmlEl, Lit, TPart};
+    fn texts(e: &Expr, out: &mut std::collections::BTreeSet<String>) {
+        crate::check::walk_expr(e, &mut |x| match x {
+            Expr::Lit(Lit::Str(s)) => out.extend(s.split_whitespace().map(str::to_string)),
+            Expr::Template(parts) => {
+                for (k, p) in parts.iter().enumerate() {
+                    let TPart::Lit(t) = p else { continue };
+                    let mut words: Vec<&str> = t.split_whitespace().collect();
+                    // A word against an expression is part of a name made from parts.
+                    if k > 0 && !t.starts_with(char::is_whitespace) {
+                        words.drain(..words.len().min(1));
+                    }
+                    if parts.get(k + 1).is_some() && !t.ends_with(char::is_whitespace) {
+                        words.pop();
+                    }
+                    out.extend(words.into_iter().map(str::to_string));
+                }
+            }
+            _ => {}
+        });
+    }
+    fn el(e: &HtmlEl, out: &mut std::collections::BTreeSet<String>) {
+        for c in &e.classes {
+            if let Expr::Lit(Lit::Str(s)) = c {
+                out.insert(s.to_string());
+            }
+        }
+        for (name, v) in &e.attrs {
+            match (name.as_str(), v) {
+                ("class" | "className", AttrVal::Expr(x)) => texts(x, out),
+                (n, _) if n.starts_with("class:") => {
+                    out.insert(n["class:".len()..].to_string());
+                }
+                _ => {}
+            }
+        }
+        for c in &e.children {
+            if let HtmlChild::El(c) = c {
+                el(c, out);
+            }
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    let mut each = |x: &Expr| {
+        if let Expr::Html(e, _) = x {
+            el(e, &mut out);
+        }
+    };
+    for stmts in files {
+        let block = Expr::Block(stmts.to_vec());
+        crate::check::walk_expr(&block, &mut each);
+    }
+    out.into_iter().filter(|c| !c.is_empty()).collect()
 }
 
 /// The program's styles passed through the command it names with
@@ -166,12 +257,18 @@ fn made_with(cmd: &str, dir: &std::path::Path, styles: &mut BTreeMap<String, (St
         MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(HashMap::new).insert(key(input), made.clone());
         Ok(made)
     };
+    split_made(&mut |input| run(input), &format!("`{}`", cmd), styles)
+}
+
+/// All the styles through `run` at once, each after its mark, and split again where the marks
+/// came back; each on its own when they did not.
+fn split_made(run: &mut dyn FnMut(&str) -> Result<String, String>, what: &str, styles: &mut BTreeMap<String, (String, String, u32)>) -> Result<(), QuilloError> {
     if styles.is_empty() {
         return Ok(());
     }
     let mark = |id: &str| format!("/*! quillo-style {} */", id);
     let all: String = styles.iter().map(|(id, (_, css, _))| format!("{}\n{}\n", mark(id), css)).collect();
-    let whole = run(&all).map_err(|e| QuilloError::new(format!("style_with `{}` failed: {}", cmd, e), 0))?;
+    let whole = run(&all).map_err(|e| QuilloError::new(format!("style_with {} failed: {}", what, e), 0))?;
     // Split where the marks are, in the order they went in.
     let ids: Vec<String> = styles.keys().cloned().collect();
     let mut at: Vec<usize> = Vec::new();
@@ -195,7 +292,7 @@ fn made_with(cmd: &str, dir: &std::path::Path, styles: &mut BTreeMap<String, (St
         return Ok(());
     }
     for (_, (name, css, line)) in styles.iter_mut() {
-        *css = run(css).map_err(|e| QuilloError::new(format!("style_with `{}` failed on `{}`'s style: {}", cmd, name, e), *line))?;
+        *css = run(css).map_err(|e| QuilloError::new(format!("style_with {} failed on `{}`'s style: {}", what, name, e), *line))?;
     }
     Ok(())
 }

@@ -59,6 +59,14 @@ pub struct Parser {
     file: Option<Arc<str>>,
     /// The component or view whose body is being parsed, for `style`.
     styling: Option<Styling>,
+    /// The id of the file's own `style`, which its components' elements carry, and how many of
+    /// its `style`s and components there are so far (FEEDBACK37.md, Q-457; branch feedback36-39).
+    file_style: Option<String>,
+    file_styles: u32,
+    components: u32,
+    /// A `server fn` is being parsed, which may name its callers; and the names it gave.
+    callers_ok: bool,
+    callers: Option<Vec<String>>,
     /// The `fn` about to be parsed is a view (`view`, or a capital name).
     view_next: bool,
     /// The elements whose children are being parsed, innermost last: what a
@@ -150,6 +158,14 @@ pub(crate) fn import_line(line: &str) -> bool {
     IMPORT_WORDS.contains(&first) && (path || second == "module" || words.any(|w| w == "use"))
 }
 
+/// The start of the name of the function a file's `style` is kept in.
+pub const FILE_STYLE: &str = "__file_style_";
+
+/// The mark of a file's style: from its path, so the same on the server and in the browser.
+fn file_style_id(file: Option<&str>) -> String {
+    crate::ast::style_id(file, FILE_STYLE)
+}
+
 /// A style in a body that writes no element of its own, only components and views, as
 /// `view V() { style global css; <Inner/> }`: nothing on the page carries its mark, which is
 /// how a page's sheet is chosen, so its `__style` names it, to be noted as it runs
@@ -176,6 +192,8 @@ fn name_unmarked_styles(body: &mut Expr, styling: Option<Styling>) {
 struct Styling {
     owner: String,
     may: bool,
+    /// A component's body, or a helper's inside one: its elements carry the file's style's mark.
+    component: bool,
     params: Vec<String>,
     scope: Option<String>,
     /// Elements written so far: a `style` comes before them.
@@ -229,7 +247,7 @@ impl Parser {
     }
 
     pub fn with_line(src: &str, line: u32) -> Self {
-        Parser { lx: Lexer::new(src, line), peeked: None, in_typedef: false, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None, styling: None, view_next: false, open: Vec::new(), unclosed_at_end: None, top: false, more: Vec::new(),
+        Parser { lx: Lexer::new(src, line), peeked: None, in_typedef: false, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None, styling: None, file_style: None, file_styles: 0, components: 0, callers_ok: false, callers: None, view_next: false, open: Vec::new(), unclosed_at_end: None, top: false, more: Vec::new(),
                  privates: Default::default(), privacy_tag: crate::privacy::tag(None, src) }
     }
 
@@ -463,7 +481,7 @@ impl Parser {
             return Err(QuilloError::new("`use` expects a file: use lib/auth.qwe", line));
         }
         self.lx.last = Some(Tok::RParen);
-        if !p.ends_with(".qwe") && !p.ends_with(".qwer") && !crate::ast::is_script(&p) {
+        if !p.ends_with(".qwe") && !crate::native::is_rust(&p) && !crate::ast::is_script(&p) {
             p.push_str(if names { ".qwer" } else { ".qwe" });
         }
         Ok(p)
@@ -593,6 +611,9 @@ impl Parser {
         loop {
             self.skip_seps()?;
             if self.at(&Tok::Eof)? {
+                if self.file_style.is_some() && self.components == 0 {
+                    return Err(QuilloError::new("a file's `style` styles the components declared in it, and this file has none", self.lx.line));
+                }
                 // `private` names: renamed in the whole file (src/privacy.rs).
                 if !self.privates.is_empty() {
                     crate::privacy::rename(&mut out, &self.privates, &self.privacy_tag)?;
@@ -687,6 +708,9 @@ impl Parser {
                     let saved = self.save();
                     self.next()?;
                     if self.line()? == line && matches!(self.peek()?, Tok::Ident(_) | Tok::Str(_)) {
+                        if top && self.styling.is_none() {
+                            return self.file_style_stmt(line);
+                        }
                         return self.style_stmt(line);
                     }
                     self.restore(saved);
@@ -719,9 +743,29 @@ impl Parser {
                     self.next()?;
                     if self.eat_kw("fn")? {
                         let name = self.expect_ident("a function name after `server fn`")?;
-                        let mut def = self.parse_fn_rest(name, line)?;
+                        self.callers_ok = true;
+                        let def = self.parse_fn_rest(name, line);
+                        self.callers_ok = false;
+                        let mut def = def?;
                         def.server = true;
+                        // `for ["shop"]`: the services it takes calls from (FEEDBACK38.md, Q-458;
+                        // branch feedback36-39), noted as the program loads.
+                        if let Some(names) = self.callers.take() {
+                            let list = Expr::List(names.into_iter().map(|n| Expr::Lit(Lit::Str(n.into()))).collect());
+                            let note = Expr::Call(Box::new(Expr::Ident("__callers".into(), line)), vec![Expr::Lit(Lit::Str(def.name.as_str().into())), list], line);
+                            self.more.push(Stmt::Expr(note));
+                        }
                         return Ok(Stmt::Fn(Arc::new(def)));
+                    }
+                    self.restore(saved);
+                }
+                // `accept_calls { keys: ... }`: how calls from other services are taken.
+                "accept_calls" if top => {
+                    let saved = self.save();
+                    self.next()?;
+                    if self.at(&Tok::LBrace)? && self.line()? == line {
+                        let m = self.parse_expr()?;
+                        return Ok(Stmt::Expr(Expr::Call(Box::new(Expr::Ident("accept_calls".into(), line)), vec![m], line)));
                     }
                     self.restore(saved);
                 }
@@ -751,6 +795,9 @@ impl Parser {
                 }
                 "component" => {
                     self.next()?;
+                    if top {
+                        self.components += 1;
+                    }
                     return Ok(Stmt::Fn(Arc::new(self.parse_component(line)?)));
                 }
                 "type" => {
@@ -789,6 +836,40 @@ impl Parser {
                             let url = self.parse_expr()?;
                             let call = Expr::Call(Box::new(Expr::Ident("__site".into(), line)), vec![Expr::Lit(Lit::Str(name.as_str().into())), url], line);
                             return Ok(Stmt::Let(Pattern::Bind(name.as_str().into()), call, line));
+                        }
+                    }
+                    self.restore(saved);
+                }
+                // `build "/app.css" = tailwind(...)`: made once the port is open, beside the requests,
+                // where top-level work held the port shut; a request for it that comes first waits for
+                // it (FEEDBACK37.md, Q-454; branch feedback36-39). Otherwise `build` is a name.
+                "build" if top => {
+                    let saved = self.save();
+                    self.next()?;
+                    if let (Tok::Str(parts), true) = (self.peek()?, self.line()? == line) {
+                        if let Some(path) = lit_string(parts) {
+                            self.next()?;
+                            if self.at(&Tok::Assign)? {
+                                self.next()?;
+                                if !path.starts_with('/') || path.contains(['?', '#', ':', '*']) || path.ends_with('/') {
+                                    return Err(QuilloError::new(format!("`build` names the path it is served at, like \"/app.css\": got {:?}", path), line));
+                                }
+                                let made = self.measured(|p| p.parse_expr())?;
+                                let f = arrow(Vec::new(), None, made, line, self.file.clone());
+                                let body = Expr::Call(Box::new(Expr::Ident("__built".into(), line)), vec![Expr::Lit(Lit::Str(path.as_str().into())), f], line);
+                                let segs = path.split('/').filter(|s| !s.is_empty()).map(|s| Seg::Lit(s.to_string())).collect();
+                                return Ok(Stmt::Route(Arc::new(RouteDef {
+                                    method: "GET".into(),
+                                    path: segs,
+                                    query: None,
+                                    body_pat: None,
+                                    guards: Vec::new(),
+                                    body,
+                                    line,
+                                    file: self.file.clone(),
+                                    uses_request: false,
+                                })));
+                            }
                         }
                     }
                     self.restore(saved);
@@ -1047,10 +1128,34 @@ impl Parser {
         } else {
             None
         };
+        if std::mem::take(&mut self.callers_ok) && self.eat_kw("for")? {
+            if !self.eat(&Tok::LBracket)? {
+                return self.err_at("after `for`, the services it takes calls from: for [\"shop\", \"orders\"]");
+            }
+            let mut names = Vec::new();
+            while !self.eat(&Tok::RBracket)? {
+                match self.next()?.tok {
+                    Tok::Str(parts) => match lit_string(parts) {
+                        Some(n) if !n.is_empty() => names.push(n),
+                        _ => return self.err_at("a caller is named in plain text: for [\"shop\"]"),
+                    },
+                    other => return self.err_at(format!("a caller is named in plain text, like \"shop\", found {}", other.describe())),
+                }
+                if !self.eat(&Tok::Comma)? {
+                    self.expect(&Tok::RBracket, "`]` after the callers")?;
+                    break;
+                }
+            }
+            if names.is_empty() {
+                return self.err_at("`for []` takes no caller: leave `for` out, or name the services that may call it");
+            }
+            self.callers = Some(names);
+        }
         let may = std::mem::take(&mut self.view_next);
         // A helper written inside a styled component or view is part of it.
         let scope = if may { None } else { self.styling.as_ref().and_then(|s| s.scope.clone()) };
-        let styling = Styling { owner: name.clone(), may, params: params.iter().map(|p| p.name.to_string()).collect(), scope, els: 0, marked: 0 };
+        let component = !may && self.styling.as_ref().is_some_and(|s| s.component);
+        let styling = Styling { owner: name.clone(), may, component, params: params.iter().map(|p| p.name.to_string()).collect(), scope, els: 0, marked: 0 };
         let outer = self.styling.replace(styling);
         let body = if self.eat(&Tok::Assign)? {
             self.measured(Self::parse_arrow_body)
@@ -1064,6 +1169,38 @@ impl Parser {
         let (mut body, nesting) = body?;
         name_unmarked_styles(&mut body, ours);
         Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line, nesting, file: self.file.clone(), hot: Default::default() })
+    }
+
+    /// `style <css>` at a file's top level: the CSS of the components the file declares, and no
+    /// one else's: their elements carry the file's mark too, and its rules need it, sent once for
+    /// the file where a CSS value given to each component's `style` was sent once for each
+    /// (FEEDBACK37.md, Q-457; branch feedback36-39). A function of its own holds it, which the
+    /// program's styles are taken from as a component's are.
+    fn file_style_stmt(&mut self, line: u32) -> PResult<Stmt> {
+        if self.components > 0 {
+            return Err(QuilloError::new("a file's `style` comes before its components, so that its rules are written where they are read", line));
+        }
+        let mut global = false;
+        if matches!(self.peek()?, Tok::Ident(w) if w == "global") {
+            let saved = self.save();
+            self.next()?;
+            if self.line()? == line && matches!(self.peek()?, Tok::Ident(_) | Tok::Str(_)) {
+                global = true;
+            } else {
+                self.restore(saved);
+            }
+        }
+        let e = self.parse_expr()?;
+        let id = file_style_id(self.file.as_deref());
+        self.file_style = Some(id.clone());
+        self.file_styles += 1;
+        let name = format!("{}{}_{:04}", FILE_STYLE, id, self.file_styles);
+        let mut args = vec![e, Expr::Lit(Lit::Bool(global)), Expr::Lit(Lit::Str(id.as_str().into()))];
+        if !global {
+            args[1] = Expr::Lit(Lit::Nil);
+        }
+        let body = Expr::Block(vec![Stmt::Expr(Expr::Call(Box::new(Expr::Ident("__style".into(), line)), args, line))]);
+        Ok(Stmt::Fn(Arc::new(FnDef { name, params: Vec::new(), ret: None, err: None, effects: None, server: false, component: false, body, line, nesting: 1, file: self.file.clone(), hot: Default::default() })))
     }
 
     /// `style <css>` in a component's or view's body: the call of `__style`,
@@ -1142,7 +1279,7 @@ impl Parser {
             }
         }
         self.expect(&Tok::RParen, "`)`")?;
-        let styling = Styling { owner: name.clone(), may: true, params: params.iter().map(|p| p.name.to_string()).collect(), scope: None, els: 0, marked: 0 };
+        let styling = Styling { owner: name.clone(), may: true, component: true, params: params.iter().map(|p| p.name.to_string()).collect(), scope: None, els: 0, marked: 0 };
         let outer = self.styling.replace(styling);
         let body = self.measured(|p| p.component_body(&name));
         let ours = std::mem::replace(&mut self.styling, outer);
@@ -1951,6 +2088,19 @@ impl Parser {
             Tok::Lt => {
                 if self.peeked.is_none() && self.lx.peek_char().map_or(false, |c| c.is_alphabetic()) {
                     self.parse_html(line)
+                } else if self.peeked.is_none() && self.doctype_len() > 0 {
+                    // `<!DOCTYPE html>` before `<html>`, as an HTML file has it: an <html> gets
+                    // one by itself, so it is passed over (FEEDBACK36.md, Q-449; branch feedback36-39).
+                    for _ in 0..self.doctype_len() {
+                        self.lx.bump();
+                    }
+                    self.lx.skip_all_ws();
+                    let html: String = (1..6).map_while(|i| self.lx.peek_char_at(i)).collect();
+                    if self.lx.peek_char() != Some('<') || !html.to_ascii_lowercase().starts_with("html") || html.chars().nth(4).is_some_and(|c| c.is_alphanumeric()) {
+                        return Err(QuilloError::new("`<!DOCTYPE html>` goes before an <html> element, which gets one by itself", line));
+                    }
+                    self.lx.bump();
+                    self.parse_html(line)
                 } else {
                     let fragment = self.peeked.is_none() && self.lx.peek_char() == Some('>');
                     Err(QuilloError::new(if fragment { "there are no `<>` fragments: wrap the elements in one, like <div>, or give a list" } else { "expected an expression, found `<`" }, line))
@@ -2373,6 +2523,28 @@ impl Parser {
         Ok(Expr::Html(Box::new(el), line))
     }
 
+    /// How many characters `!DOCTYPE html>` takes after a `<` just read (any case), or 0.
+    fn doctype_len(&self) -> usize {
+        let ahead: String = (0..15).map_while(|i| self.lx.peek_char_at(i)).collect();
+        let lower = ahead.to_ascii_lowercase();
+        if lower.starts_with("!doctype html>") {
+            "!doctype html>".len()
+        } else {
+            0
+        }
+    }
+
+    /// How many characters `<!-- ... -->` takes from its `<`, or `None` when it is not closed.
+    fn html_comment_len(&self) -> Option<usize> {
+        let mut i = 4;
+        loop {
+            match (self.lx.peek_char_at(i)?, self.lx.peek_char_at(i + 1), self.lx.peek_char_at(i + 2)) {
+                ('-', Some('-'), Some('>')) => return Some(i + 3),
+                _ => i += 1,
+            }
+        }
+    }
+
     fn html_err<T>(&self, msg: impl Into<String>) -> PResult<T> {
         Err(QuilloError::new(msg, self.lx.line))
     }
@@ -2453,6 +2625,33 @@ impl Parser {
                                 self.template(parts)?
                             }
                             Some('{') => self.parse_braced_expr()?,
+                            // HTML's other two ways: 'single quotes' and an unquoted value, taken as
+                            // the text they are, with no `{...}` in them (FEEDBACK36.md, Q-449;
+                            // branch feedback36-39).
+                            Some('\'') => {
+                                self.lx.bump();
+                                let mut v = String::new();
+                                loop {
+                                    match self.lx.bump() {
+                                        Some('\'') => break,
+                                        Some(c) => v.push(c),
+                                        None => return self.html_err(format!("attribute `{}`'s value is never closed with `'`", name)),
+                                    }
+                                }
+                                Expr::Lit(Lit::Str(v.into()))
+                            }
+                            Some(c) if !c.is_whitespace() && !"\"'=<>`{}".contains(c) => {
+                                let mut v = String::new();
+                                while let Some(c) = self.lx.peek_char() {
+                                    // `/>` ends the tag, as written after a value: `<img src=a.png/>`.
+                                    if c.is_whitespace() || "\"'=<>`{}".contains(c) || (c == '/' && self.lx.peek_char_at(1) == Some('>')) {
+                                        break;
+                                    }
+                                    v.push(c);
+                                    self.lx.bump();
+                                }
+                                Expr::Lit(Lit::Str(v.into()))
+                            }
                             _ => {
                                 return self.html_err(format!(
                                     "attribute `{}` needs a \"string\" or {{expression}} value",
@@ -2551,6 +2750,12 @@ impl Parser {
                     s.marked += 1;
                 }
             }
+            // And of a component of a file with a style (FEEDBACK37.md, Q-457).
+            if let (true, Some(f)) = (s.component, &self.file_style) {
+                if !tag.starts_with(|c: char| c.is_uppercase()) && s.scope.as_deref() != Some(f.as_str()) {
+                    attrs.push((format!("data-q-{}", f), AttrVal::Bool));
+                }
+            }
         }
         let facts = ElFacts::of(&tag, &id, &classes, &attrs, &children, VOID_TAGS.contains(&tag.as_str()));
         Ok(HtmlEl { tag, id, classes, attrs, children, line, dollars, facts })
@@ -2596,6 +2801,17 @@ impl Parser {
                     let l = self.lx.line;
                     self.lx.bump();
                     children.push(HtmlChild::El(self.nested(|p| p.parse_html_el(l))?));
+                }
+                // `<!-- a note -->`, as HTML has it: a comment, left out of the page, where it
+                // showed as text (FEEDBACK36.md, Q-448; branch feedback36-39).
+                (Some('<'), Some('!')) if tag != "script" && tag != "style" && self.lx.peek_char_at(2) == Some('-') && self.lx.peek_char_at(3) == Some('-') => {
+                    let Some(n) = self.html_comment_len() else {
+                        return self.html_err("`<!--` is never closed with `-->`");
+                    };
+                    push_text(&mut children, &mut text);
+                    for _ in 0..n {
+                        self.lx.bump();
+                    }
                 }
                 // `{/* a note */}`: a comment, as in JSX.
                 (Some('{'), _) if self.braced_comment_len() > 0 => {

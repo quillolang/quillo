@@ -268,8 +268,8 @@ fn respond_keeps_to_real_statuses() {
     let d = folder("respond");
     let mut it = program(&d, "route GET /a = respond(700, \"x\")\n");
     assert_eq!(get(&mut it, "/a").status, 500);
-    fails("respond(99, \"x\")", "`respond` status must be 100-599, got 99");
-    fails("respond(700, \"x\")", "`respond` status must be 100-599, got 700");
+    fails("respond(99, \"x\")", "`respond` status must be 200-599, got 99");
+    fails("respond(700, \"x\")", "`respond` status must be 200-599, got 700");
 }
 
 #[test]

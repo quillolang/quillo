@@ -1105,6 +1105,35 @@ fn read_iso(s: &str) -> Option<String> {
 }
 
 /// An HTTP date, `Tue, 27 Oct 2026 14:30:00 GMT` (RFC 9110's IMF-fixdate), as UTC.
+/// Seconds since 1970 of an HTTP date in any of the three forms RFC 9110 §5.6.7 says a
+/// recipient takes: `Sun, 06 Nov 1994 08:49:37 GMT`, RFC 850's `Sunday, 06-Nov-94 08:49:37
+/// GMT` and asctime's `Sun Nov  6 08:49:37 1994` (FEEDBACK36.md, Q-441; branch feedback36-39).
+pub(crate) fn http_seconds(s: &str) -> Option<i64> {
+    const MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let month = |m: &str| MON.iter().position(|x| *x == m).map(|i| i as i64 + 1);
+    let w: Vec<&str> = s.split_whitespace().collect();
+    let (y, m, d, t) = match w.as_slice() {
+        [dow, d, m, y, t, "GMT"] if dow.ends_with(',') && d.len() == 2 && y.len() == 4 => (num(y.as_bytes())?, month(m)?, num(d.as_bytes())?, *t),
+        [dow, dmy, t, "GMT"] if dow.ends_with(',') => {
+            let [d, m, y] = dmy.split('-').collect::<Vec<_>>()[..] else { return None };
+            let y = num(y.as_bytes()).filter(|_| y.len() == 2)?;
+            // Two digits: a year more than 50 years ahead is taken as the past (§5.6.7).
+            let now = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() / 31_556_952) as i64 + 1970;
+            let mut y = now - now % 100 + y;
+            if y > now + 50 {
+                y -= 100;
+            }
+            (y, month(m)?, num(d.as_bytes()).filter(|_| d.len() == 2)?, *t)
+        }
+        [_, m, d, t, y] if y.len() == 4 => (num(y.as_bytes())?, month(m)?, num(d.as_bytes())?, *t),
+        _ => return None,
+    };
+    if t.len() != 8 {
+        return None;
+    }
+    Some(ymd(y, m, d)? * 86400 + hms(t.as_bytes())?)
+}
+
 fn read_http(s: &str) -> Option<String> {
     const MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     let w: Vec<&str> = s.split_whitespace().collect();

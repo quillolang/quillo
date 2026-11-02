@@ -247,7 +247,20 @@ pub fn which_quillo() -> String {
 
 /// A program's file as text. One that is not UTF-8 is refused with the line and column of the
 /// first byte that is not (FEEDBACK31.md, Q-386; branch feedback27-35-fixes).
+/// A program that is no file: `quillo serve`'s, at the path it is given (FEEDBACK36.md, Q-450;
+/// branch feedback36-39).
+static VIRTUAL: std::sync::OnceLock<(std::path::PathBuf, String)> = std::sync::OnceLock::new();
+
+/// Sets the program read for `path` from now on.
+pub fn set_virtual(path: std::path::PathBuf, source: String) {
+    let _ = VIRTUAL.set((path, source));
+}
+
 pub fn read_source(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    if let Some((p, s)) = VIRTUAL.get().filter(|(p, _)| p == path.as_ref()) {
+        let _ = p;
+        return Ok(s.clone());
+    }
     let bytes = std::fs::read(path)?;
     String::from_utf8(bytes).map_err(|e| {
         let ok = &e.as_bytes()[..e.utf8_error().valid_up_to()];

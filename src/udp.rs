@@ -358,13 +358,18 @@ fn decode(mut b: &[u8]) -> Option<Vec<Packet>> {
 
 /// The delivery thread's own connection to the server, kept open between
 /// batches.
-pub struct Loopback(std::net::TcpStream, Vec<u8>);
+/// With no port (a program inside an app), none: each batch is answered here (FEEDBACK39.md,
+/// Q-468; branch feedback36-39).
+pub struct Loopback(Option<std::net::TcpStream>, Vec<u8>, SocketAddr);
 
 impl Loopback {
     pub fn connect(addr: SocketAddr) -> std::io::Result<Loopback> {
+        if crate::jobs::local() {
+            return Ok(Loopback(None, Vec::new(), addr));
+        }
         let s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
         s.set_nodelay(true)?;
-        Ok(Loopback(s, Vec::new()))
+        Ok(Loopback(Some(s), Vec::new(), addr))
     }
 
     fn post(self, path: &str, body: &[u8]) -> std::io::Result<(Loopback, u16)> {
@@ -375,14 +380,18 @@ impl Loopback {
     /// connection is given back for the next one.
     pub fn post_for(mut self, path: &str, body: &[u8]) -> std::io::Result<(Loopback, u16, Vec<u8>)> {
         use std::io::{Read, Write};
+        let Some(stream) = self.0.as_mut() else {
+            let (status, answer) = crate::jobs::post_self(self.2, path, body)?;
+            return Ok((self, status, answer));
+        };
         let head = format!(
             "POST {} HTTP/1.1\r\nHost: localhost\r\nX-Quillo-Job: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
             path,
             crate::jobs::token(),
             body.len()
         );
-        self.0.write_all(head.as_bytes())?;
-        self.0.write_all(body)?;
+        stream.write_all(head.as_bytes())?;
+        stream.write_all(body)?;
         let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad answer");
         let buf = &mut self.1;
         buf.clear();
@@ -391,7 +400,7 @@ impl Loopback {
             if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                 break i + 4;
             }
-            let n = self.0.read(&mut chunk)?;
+            let n = stream.read(&mut chunk)?;
             if n == 0 {
                 return Err(std::io::ErrorKind::UnexpectedEof.into());
             }
@@ -406,7 +415,7 @@ impl Loopback {
             .unwrap_or(0);
         let closing = head.lines().any(|l| l.to_ascii_lowercase().starts_with("connection:") && l.to_ascii_lowercase().contains("close"));
         while buf.len() - end < len {
-            let n = self.0.read(&mut chunk)?;
+            let n = stream.read(&mut chunk)?;
             if n == 0 {
                 return Err(std::io::ErrorKind::UnexpectedEof.into());
             }
@@ -415,7 +424,7 @@ impl Loopback {
         let answer = buf[end..end + len].to_vec();
         if closing {
             // Answered, but not to be used again: the next batch connects anew.
-            return Loopback::connect(self.0.peer_addr()?).map(|c| (c, status, answer));
+            return Loopback::connect(self.2).map(|c| (c, status, answer));
         }
         Ok((self, status, answer))
     }

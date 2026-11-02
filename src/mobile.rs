@@ -110,7 +110,7 @@ pub fn app_env(file: &Path) -> std::collections::HashMap<String, String> {
 
 /// A key for signing sessions, made once and kept in the app's container, so
 /// a visitor stays signed in when the app is opened again.
-fn keep_secret(data: &Path) -> Result<(), String> {
+pub(crate) fn keep_secret(data: &Path) -> Result<(), String> {
     if std::env::var("QUILLO_SECRET").map_or(false, |s| !s.is_empty()) {
         return Ok(());
     }
