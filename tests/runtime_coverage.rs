@@ -109,6 +109,10 @@ fn the_runtime_goes_out_as_written_and_maps_back_to_its_lines() {
     let r = rtcover(&["report", &both]);
     assert!(r.status.success() && text(&r).contains("(1 records)"), "{}", text(&r));
 
+    // A revision that is not there: said, and a failure, not a crash.
+    let r = rtcover(&["report", records.to_str().unwrap(), "--diff", "no-such-revision"]);
+    assert!(!r.status.success() && text(&r).contains("cannot compare with no-such-revision"), "{}", text(&r));
+
     // Nothing recorded: the report says the variable was not set, and fails.
     let empty = dir.join("none");
     let r = rtcover(&["report", empty.to_str().unwrap()]);

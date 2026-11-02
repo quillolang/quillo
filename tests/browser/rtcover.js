@@ -170,7 +170,15 @@ function report(argv) {
   }
   const rev = opt("--diff");
   if (rev) {
-    const changed = changedSince(rev).filter((l) => counted(LINES[l - 1]) && !ran.has(l));
+    let since;
+    try {
+      since = changedSince(rev);
+    } catch (e) {
+      // No git here (a copy made by `git archive`), or no such revision.
+      console.log(`cannot compare with ${rev}: ${String(e.message).split("\n")[0]}`);
+      return 1;
+    }
+    const changed = since.filter((l) => counted(LINES[l - 1]) && !ran.has(l));
     if (changed.length) {
       console.log(`lines changed since ${rev} that no test runs: ${runs(changed).join(", ")}`);
       status = 1;
@@ -185,7 +193,9 @@ module.exports = { mapScript, hits, record, counted, FILE };
 
 if (require.main === module) {
   const [cmd, ...rest] = process.argv.slice(2);
-  if (cmd === "report") process.exit(report(rest));
-  console.error("usage: node rtcover.js report <folder>[,<folder>...] [--min 99.5] [--lcov file] [--json file] [--diff git-rev]");
-  process.exit(2);
+  if (cmd === "report") process.exitCode = report(rest);
+  else {
+    console.error("usage: node rtcover.js report <folder>[,<folder>...] [--min 99.5] [--lcov file] [--json file] [--diff git-rev]");
+    process.exitCode = 2;
+  }
 }
