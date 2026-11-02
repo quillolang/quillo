@@ -1,0 +1,59 @@
+// Channels as components come and go: two on one channel in a page, one
+// removed (the page stays in), both removed (it leaves), one back (it joins
+// again); a listener whose function fails; a message sent before the
+// connection is open; the connection lost when the server stops, and found
+// again when it is back; a ticket refused, and WebTransport that never answers.
+// Driven by cover-channels.js, cover-channels-restart.js and
+// cover-channels-ticket.js (tests/runtime_cover_dom.rs).
+
+let log = []
+// Which server this is: another after a restart.
+let GEN = uuid()
+
+channel.on("room", (msg, peer) => {
+    log = log + [msg.text]
+    channel.broadcast("room", { text: msg.text }, { reliable: true })
+})
+channel.on("early", (msg, peer) => {
+    log = log + [msg]
+    null
+})
+
+component Listener(tag: str) {
+    state got = []
+    state zero = 0
+    // "boom" fails in a's function, after a has it.
+    let room = channel.open("room", (m) => {
+        got = got + [m.text]
+        if m.text == "boom" && tag == "a" { let _x = 1 / zero }
+    })
+    <div class={`listener ${tag}`}>
+        <button class="send" @click={() => room.send({ text: `${tag} says` }, { reliable: true })}>send</button>
+        <ul>{for t in got => <li>{t}</li>}</ul>
+    </div>
+}
+
+// Sends as soon as it is made, before the page is let in.
+component Early() {
+    let early = channel.open("early", (m) => null)
+    <button id="early" @mount={() => { early.send("early bird", { reliable: true }) }}>early</button>
+}
+
+component Room(start: bool = true) {
+    state a = start
+    state b = start
+    <div>
+        <button id="toggle-a" @click={() => { a = !a }}>a</button>
+        <button id="toggle-b" @click={() => { b = !b }}>b</button>
+        {a && <Listener tag="a"/>}
+        {b && <Listener tag="b"/>}
+    </div>
+}
+
+route GET / = <html><body><Room/><Early/></body></html>
+// No channel until one is shown.
+route GET /plain = <html><body><Room start={false}/></body></html>
+route GET /bcast/:t = str(channel.broadcast("room", { text: t }, { reliable: true }))
+route GET /peers = str(len(channel.peers("room")))
+route GET /log = log
+route GET /gen = GEN

@@ -1,0 +1,106 @@
+// Timers, @mount and streams in the browser: `run_after` and `every` whose
+// function fails, a component gone before its timer fires, an @mount that
+// fails beside one that works, and `listen` opening a stream again after
+// the server refused it, and stopping where its function fails.
+// Driven by cover-timers.js (tests/runtime_cover_dom.rs).
+
+let flaky_hits = 0
+let bad_hits = 0
+
+// Refused the first time, as a server restarting is; a stream after.
+route GET /flaky {
+    flaky_hits += 1
+    if flaky_hits == 1 {
+        return respond(503, "busy")
+    }
+    events((send) => { send({ n: flaky_hits }) })
+}
+route GET /bad = events((send) => {
+    bad_hits += 1
+    for i in range(1, 4) {
+        send(i)
+        sleep(100)
+    }
+})
+route GET /hits = { flaky: flaky_hits, bad: bad_hits }
+
+component Failing() {
+    state zero = 0
+    state ticks = 0
+    state on = false
+    state after = "none"
+    if on {
+        every(30, () => {
+            ticks += 1
+            if ticks == 2 { let _x = 1 / zero }
+            if ticks == 5 { on = false }
+        })
+    }
+    <div>
+        <button id="run-after" @click={() => {
+            run_after(10, () => { let _x = 1 / zero })
+            run_after(-5, () => { after = "ran" })
+        }}>run_after</button>
+        <button id="every" @click={() => { on = true }}>every</button>
+        <p id="ticks">{ticks}</p>
+        <p id="after">{after}</p>
+    </div>
+}
+
+// Its timers report to the page through `ping`.
+component Timed(ping: fn) {
+    run_after(250, () => { ping("after") })
+    every(40, () => { ping("tick") })
+    <p id="timed">timed</p>
+}
+
+component Host() {
+    state shown = false
+    state pings = []
+    <div>
+        <button id="show" @click={() => { shown = true }}>show</button>
+        <button id="hide" @click={() => { shown = false }}>hide</button>
+        {shown && <Timed ping={(what) => { pings = pings + [what] }}/>}
+        <p id="pings">{join(pings, ",")}</p>
+    </div>
+}
+
+component Mounts() {
+    state zero = 0
+    state mounted = "none"
+    state shown = false
+    <div>
+        <button id="mount" @click={() => { shown = true }}>mount</button>
+        {shown && <div>
+            <i id="bad-mount" @mount={() => { let _x = 1 / zero }}></i>
+            <b id="good-mount" @mount={(el) => { mounted = el.id }}></b>
+        </div>}
+        <p id="mounted">{mounted}</p>
+    </div>
+}
+
+component Streams() {
+    state flaky = "waiting"
+    state bad = []
+    state zero = 0
+    listen("/flaky", (m) => { flaky = str(m.n) })
+    listen("/bad", (n) => {
+        bad = bad + [n]
+        if n == 2 { let _x = 1 / zero }
+    })
+    <div>
+        <p id="flaky">{flaky}</p>
+        <p id="bad">{join(bad | map((n) => str(n)), ",")}</p>
+    </div>
+}
+
+// The streams start when asked, so that what they say comes after the rest.
+component Later() {
+    state on = false
+    <div>
+        <button id="streams" @click={() => { on = true }}>streams</button>
+        {on && <Streams/>}
+    </div>
+}
+
+route GET / = <html><body><Failing/><Host/><Mounts/><Later/></body></html>

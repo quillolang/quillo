@@ -11,6 +11,7 @@
 const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const rtcover = require("./rtcover");
 
 const [chrome, url, profile, timeoutArg, scriptFile] = process.argv.slice(2);
 const timeout = Number(timeoutArg || 20000);
@@ -23,6 +24,9 @@ async function main() {
     "--remote-debugging-port=0", `--user-data-dir=${profile}`,
     // For leak tests: gc() and exact performance.memory figures.
     "--js-flags=--expose-gc", "--enable-precise-memory-info",
+    // More for one test, as QUILLO_CHROME_FLAGS: a fake camera and microphone
+    // for the media tests (tests/runtime_cover_media.rs), say.
+    ...(process.env.QUILLO_CHROME_FLAGS || "").split(" ").filter(Boolean),
     "about:blank",
   ], { stdio: ["ignore", "ignore", "pipe"] });
   // Every wait below checks the deadline, but a reply Chrome never sends would
@@ -58,6 +62,30 @@ async function main() {
     // first script on, for the tests' "errors" checks.
     await send("Page.enable");
     await send("Page.addScriptToEvaluateOnNewDocument", { source: "window.__quilloErrors = [];" });
+    // Measuring runtime.js's coverage (rtcover.js): what ran is taken often,
+    // since what a page ran before it navigates goes with it.
+    const coverDir = process.env.QUILLO_RUNTIME_COVERAGE;
+    const covered = new Set();
+    const maps = new Map();
+    const takeCoverage = async () => {
+      if (!coverDir) return;
+      const r = await send("Profiler.takePreciseCoverage");
+      for (const s of (r.result && r.result.result) || []) {
+        if (!maps.has(s.scriptId)) {
+          const src = await send("Debugger.getScriptSource", { scriptId: s.scriptId });
+          const source = src.result ? src.result.scriptSource : "";
+          maps.set(s.scriptId, { source, map: rtcover.mapScript(source) });
+        }
+        const { source, map } = maps.get(s.scriptId);
+        if (map) rtcover.hits(source, s.functions, map, covered);
+      }
+    };
+    if (coverDir) {
+      await send("Debugger.enable");
+      await send("Debugger.setSkipAllPauses", { skip: true });
+      await send("Profiler.enable");
+      await send("Profiler.startPreciseCoverage", { callCount: true, detailed: true });
+    }
     await send("Page.navigate", { url });
     if (scriptFile) {
       for (;;) {
@@ -69,6 +97,7 @@ async function main() {
         const ready = `location.origin === ${JSON.stringify(origin)} && document.readyState === "complete"`;
         const r = await send("Runtime.evaluate", { expression: ready, returnByValue: true });
         if (r.result && r.result.result && r.result.result.value === true) break;
+        await takeCoverage();
         await sleep(50);
       }
       await send("Runtime.evaluate", { expression: fs.readFileSync(scriptFile, "utf8") });
@@ -82,9 +111,11 @@ async function main() {
       }
       const r = await send("Runtime.evaluate", { expression: "document.body && document.body.getAttribute('data-result')", returnByValue: true });
       const v = r.result && r.result.result && r.result.result.value;
+      await takeCoverage();
       if (v) { process.stdout.write(v); break; }
       await sleep(100);
     }
+    if (coverDir) rtcover.record(coverDir, "chrome", covered);
     ws.close();
   } finally {
     proc.kill();

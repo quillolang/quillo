@@ -398,12 +398,7 @@ fn runtime_from(it: &Interp, c: &Compiler, boots: bool) -> RuntimeFile {
         .collect();
     exported.sort();
     let mut js = String::from("(function () {\n");
-    minify_into(&rt.preamble, &mut js);
-    for (i, (_, text)) in rt.units.iter().enumerate() {
-        if keep[i] {
-            minify_into(text, &mut js);
-        }
-    }
+    runtime_into(rt, &keep, &mut js);
     if !it.base.is_empty() {
         let _ = writeln!(js, "BASE = {};", js_str(&it.base));
     }
@@ -959,16 +954,41 @@ fn assemble(open: &str, program: &str, close: &str) -> String {
     let mut out = String::with_capacity(program.len() + 16 * 1024);
     out.push_str(open);
     out.push('\n');
-    minify_into(&rt.preamble, &mut out);
-    for (i, (_, text)) in rt.units.iter().enumerate() {
-        if keep[i] {
-            minify_into(text, &mut out);
-        }
-    }
+    runtime_into(rt, &keep, &mut out);
     minify_into(program, &mut out);
     out.push_str(close);
     out.push('\n');
     out
+}
+
+/// Whether the runtime goes out as written, to measure what of runtime.js
+/// the tests run (scripts/runtime-coverage.sh sets QUILLO_RUNTIME_COVERAGE).
+fn covering() -> bool {
+    std::env::var_os("QUILLO_RUNTIME_COVERAGE").is_some_and(|v| !v.is_empty())
+}
+
+/// The runtime's preamble and the declarations `keep` says, minified. When
+/// `covering`, as written instead, each after a line `//@rt N` naming the line
+/// of runtime.js it starts on, and `//@rt end` after the last, so that the
+/// coverage Chrome and Node record maps back to runtime.js
+/// (tests/browser/rtcover.js).
+fn runtime_into(rt: &Runtime, keep: &[bool], out: &mut String) {
+    if !covering() {
+        minify_into(&rt.preamble, out);
+        for (i, (_, text)) in rt.units.iter().enumerate() {
+            if keep[i] {
+                minify_into(text, out);
+            }
+        }
+        return;
+    }
+    let _ = write!(out, "//@rt 1\n{}", rt.preamble);
+    for (i, (_, text)) in rt.units.iter().enumerate() {
+        if keep[i] {
+            let _ = write!(out, "//@rt {}\n{}", rt.starts[i], text);
+        }
+    }
+    out.push_str("//@rt end\n");
 }
 
 /// Which of the runtime's declarations `program` needs, with what they need.
@@ -992,6 +1012,8 @@ fn shake(rt: &Runtime, program: &str) -> Vec<bool> {
 struct Runtime {
     preamble: String,
     units: Vec<(String, String)>,
+    /// The line of runtime.js each unit starts on.
+    starts: Vec<usize>,
     by_name: HashMap<String, usize>,
 }
 
@@ -1000,9 +1022,10 @@ fn runtime_units() -> &'static Runtime {
     RT.get_or_init(|| {
         let mut preamble = String::new();
         let mut units: Vec<(String, String)> = Vec::new();
+        let mut starts = Vec::new();
         // Lines ending `// dev` are for development bundles only, which
         // take the runtime as it is written.
-        for line in RUNTIME.lines().filter(|l| !l.trim_end().ends_with("// dev")) {
+        for (n, line) in RUNTIME.lines().enumerate().filter(|(_, l)| !l.trim_end().ends_with("// dev")) {
             let decl = ["async function ", "function ", "class ", "const ", "let "]
                 .iter()
                 .find_map(|p| line.strip_prefix(p))
@@ -1016,7 +1039,10 @@ fn runtime_units() -> &'static Runtime {
                     })
                 });
             match decl {
-                Some(name) if !name.is_empty() && !name.ends_with('.') => units.push((name, format!("{}\n", line))),
+                Some(name) if !name.is_empty() && !name.ends_with('.') => {
+                    units.push((name, format!("{}\n", line)));
+                    starts.push(n + 1);
+                }
                 _ => match units.last_mut() {
                     Some(u) => {
                         u.1.push_str(line);
@@ -1057,7 +1083,7 @@ fn runtime_units() -> &'static Runtime {
                 }
             }
         }
-        Runtime { preamble, units, by_name }
+        Runtime { preamble, units, starts, by_name }
     })
 }
 

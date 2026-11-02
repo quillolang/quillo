@@ -1,0 +1,18 @@
+// Pages that send (tests/runtime_cover_media.rs): `<quillo-media publish>`,
+// and the pages that play what they send. The test scripts are
+// tests/browser/media-*.js.
+
+media.on("cam")
+media.on("edge:*")
+media.on("ending")
+media.on("inj")
+media.on("closed", { publish: (peer) => false })
+
+// A page sending its camera, and playing what it sends.
+route GET / = <html><body><quillo-media publish="cam"/><quillo-media stream="cam" controls/></body></html>
+
+// The element's script and a channel connection; the test script makes the rest.
+route GET /page = <html><body><quillo-media stream="inj" muted/></body></html>
+
+route POST /close = media.close("ending")
+route GET /streams = media.streams()

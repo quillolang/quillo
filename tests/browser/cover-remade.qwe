@@ -1,0 +1,34 @@
+// Components inside another, taken up from the server's HTML when it is
+// reached: one as written, one whose element a script changed (made again by
+// itself, said in development), a table cell that is its own island, and raw
+// HTML. Driven by cover-remade.js (tests/runtime_cover_dom.rs).
+
+component Inner(label: str) {
+    state n = 1
+    <span class="inner"><b>{label}</b> <button class="bump" @click={() => { n += 1 }}>{n}</button></span>
+}
+
+component Cell(v: str) {
+    state hits = 0
+    <td class="cell" @click={() => { hits += 1 }}>{v} {hits}</td>
+}
+
+// Its text a script changed: the same element, other words.
+component Said(text: str) {
+    <span class="said">{text}</span>
+}
+
+component Outer() {
+    state clicks = 0
+    <div id="outer">
+        <button id="wake" @click={() => { clicks += 1 }}>{clicks}</button>
+        <Inner label="kept"/>
+        <Inner label="changed"/>
+        <table><tbody><tr><Cell v="x"/></tr></tbody></table>
+        <p id="raw">{raw("<b>bold</b> and <i>it</i>")}</p>
+        <Said text="as written"/>
+    </div>
+}
+
+// Not in <body> itself, so taken up only when reached.
+route GET / = <html><body><main><Outer/></main></body></html>

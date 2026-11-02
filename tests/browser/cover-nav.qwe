@@ -1,0 +1,40 @@
+// navigate() with odd addresses: on a page where nothing reads url() (the
+// browser loads what it names), and on one that does (a spot already gone
+// to is gone to again; another site is loaded, not pushed onto the history).
+// Driven by cover-nav.js and cover-nav-spa.js (tests/runtime_cover_dom.rs).
+
+component Go() {
+    state to = ""
+    <div>
+        <input id="to" bind:value={to}/>
+        <button id="go" @click={() => navigate(to)}>Go</button>
+    </div>
+}
+
+// The note leaves out the hash, which the server never sees (and a text the
+// browser shows otherwise is not made again: see
+// a_changed_text_inside_a_component_makes_it_again).
+component Routed() {
+    state to = ""
+    let u = url()
+    <div>
+        <p id="note">{`${u.path}?${json.stringify(u.query)}`}</p>
+        <input id="to" bind:value={to}/>
+        <button id="go" @click={() => navigate(to)}>Go</button>
+        <div style="height:3000px"></div>
+        <h2 id="spot">Spot</h2>
+        <div style="height:3000px"></div>
+    </div>
+}
+
+route GET / = <html><body><Go/><div style="height:3000px"></div><h2 id="middle">Middle</h2><div style="height:3000px"></div></body></html>
+route GET /spa = <html><body><Routed/></body></html>
+
+// Slow, so that the page that asked is still there a moment after it asked.
+route GET /landed/:name {
+    sleep(600)
+    let seen = json.stringify({ name, path: request.path, query: request.query })
+    <html><body><script>{raw(`window.__seen = ${seen}`)}</script><script>{raw(REPORT)}</script></body></html>
+}
+
+let REPORT = "addEventListener('load', () => document.body.setAttribute('data-result', JSON.stringify({ ...window.__seen, before: JSON.parse(sessionStorage.getItem('before') || 'null'), hash: location.hash, host: location.hostname, reloaded: performance.getEntriesByType('navigation')[0].type === 'navigate', errors: window.__quilloErrors || [] })))"

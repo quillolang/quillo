@@ -1,0 +1,34 @@
+// Fields and children as the page has them when a component is taken up:
+// selects as the browser chose (or a person changed) them, an element a
+// script added inside a component, and list rows that show nothing. Not in
+// <body> itself, so taken up only when reached. Driven by cover-values.js
+// (tests/runtime_cover_values_dom.rs).
+
+component Pick() {
+    state changes = []
+    <div id="pick">
+        <button id="wake" @click={() => { changes = changes + ["wake"] }}>wake</button>
+        <select id="plain" @change={(e) => { changes = changes + ["plain " + e.value] }}><option>a</option><option>b</option></select>
+        <select id="chosen" @change={(e) => { changes = changes + ["chosen " + e.value] }}><option>a</option><option selected>b</option></select>
+        <select id="typed" @change={(e) => { changes = changes + ["typed " + e.value] }}><option>a</option><option>b</option></select>
+        <select id="many" multiple @change={(e) => { changes = changes + ["many"] }}><option>a</option><option>b</option></select>
+        <span id="changes">{join(changes, ",")}</span>
+    </div>
+}
+
+component Extra() {
+    state n = 0
+    <p id="extra"><button id="bump" @click={() => { n += 1 }}>{n}</button></p>
+}
+
+component Rows() {
+    state items = [{ id: 1, on: false }, { id: 2, on: true }, { id: 3, on: false }]
+    <div id="rows">
+        <button id="add" @click={() => { items = items + [{ id: len(items) + 1, on: true }] }}>add</button>
+        <button id="drop" @click={() => { items = slice(items, 1) }}>drop</button>
+        <button id="clear" @click={() => { items = [] }}>clear</button>
+        <ul id="list">{for it in items => it.on ? <li>{it.id}</li> : null}</ul>
+    </div>
+}
+
+route GET / = <html><body><main><Pick/><Extra/><Rows/></main></body></html>

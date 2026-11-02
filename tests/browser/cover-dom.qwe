@@ -1,0 +1,109 @@
+// The DOM side of the browser runtime: what a handler reads of its event,
+// HTML sent as a request's body, `range` with a step, the dialog's Tab key,
+// lists emptied beside other elements, rows moved where the browser has no
+// moveBefore, and the idempotency key without crypto.randomUUID.
+// Driven by cover-dom.js (tests/runtime_cover_dom.rs).
+
+db.exec("create table if not exists paid (who text)")
+
+server fn pay(who: str) = idempotent(() => {
+    sleep(200)
+    db.exec("insert into paid (who) values (?)", who)
+    who
+})
+server fn paid() = len(db.query("select who from paid"))
+
+// What a request's body arrived as.
+route POST /echo = { type: request.headers["content-type"], body: request.body }
+
+component Events() {
+    state checked = "none"
+    state sent = "none"
+    state loose = "none"
+    state fields = "none"
+    <div>
+        <input id="tick" type="checkbox" @change={(e) => { checked = json.stringify([e.checked, e.value, e.type]) }}/>
+        <form id="form" @submit={(e) => { e.preventDefault(); sent = json.stringify(e.form) }}>
+            <input name="who" value="ana"/>
+            <input name="tag" value="first"/>
+            <input name="tag" value="last"/>
+            <input id="pic" name="pic" type="file"/>
+            <button id="submit">Send</button>
+        </form>
+        <button id="loose" @click={(e) => {
+            loose = json.stringify(e.form)
+            fields = json.stringify([e.no_such_field, e.button, e.key, e.target.id])
+        }}>Loose</button>
+        <p id="checked">{checked}</p>
+        <p id="sent">{sent}</p>
+        <p id="loose-form">{loose}</p>
+        <p id="fields">{fields}</p>
+    </div>
+}
+
+component Bodies() {
+    state said = []
+    <div>
+        <button id="post-raw" @click={() => {
+            let a = http.post("/echo", raw("<b>bold</b>"))
+            let b = http.post("/echo", raw("<i>kept</i>"), { "Content-Type": "text/x-mine" })
+            let c = http.post("/echo", markdown("**md**"))
+            said = [a.json, b.json, c.json]
+        }}>Post</button>
+        <pre id="bodies">{json.stringify(said)}</pre>
+    </div>
+}
+
+component Ranges() {
+    state out = "none"
+    state zero = 0
+    <div>
+        <button id="ranges" @click={() => {
+            let up = []
+            for i in range(1, 10, 3) { up = up + [i] }
+            let down = []
+            for i in range(10, 0, -4) { down = down + [i] }
+            let none = []
+            for i in range(5, 1, 2) { none = none + [i] }
+            out = json.stringify([up, down, none])
+        }}>Ranges</button>
+        <button id="range-zero" @click={() => {
+            for i in range(0, 5, zero) { out = "looped" }
+        }}>Zero</button>
+        <p id="range-out">{out}</p>
+    </div>
+}
+
+component Asker() {
+    state answer = "none"
+    <div>
+        <button id="ask" @click={() => { answer = str(ask("Sure?", { ok: "Yes", cancel: "No" })) }}>Ask</button>
+        <p id="answer">{answer}</p>
+    </div>
+}
+
+// A list with elements of its own beside the rows.
+component Rows() {
+    state items = ["a", "b", "c"]
+    <div>
+        <ul id="rows"><li id="head">head</li>{for x in items => <li key={x} class="row">{x}</li>}<li id="tail">tail</li></ul>
+        <button id="rows-clear" @click={() => { items = [] }}>Clear</button>
+        <button id="rows-abc" @click={() => { items = ["a", "b", "c"] }}>abc</button>
+        <button id="rows-new" @click={() => { items = ["x", "y"] }}>New</button>
+        <button id="rows-reverse" @click={() => { items = items | reverse }}>Reverse</button>
+        <button id="rows-five" @click={() => { items = ["e", "d", "c", "b", "a"] }}>Five</button>
+    </div>
+}
+
+component Pay() {
+    state said = "none"
+    state n = 0
+    <div>
+        <button id="pay" @click={() => { said = pay("click") }}>Pay</button>
+        <button id="count" @click={() => { n = paid() }}>Count</button>
+        <p id="said">{said}</p>
+        <p id="n">{n}</p>
+    </div>
+}
+
+route GET / = <html><body><Events/><Bodies/><Ranges/><Asker/><Rows/><Pay/></body></html>
