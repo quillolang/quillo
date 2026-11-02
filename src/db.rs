@@ -1781,6 +1781,20 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     crate::txn::run(it, on, &opts, line, &mut |it| it.call(&f, Vec::new(), line))
 }
 
+/// What `body` gave, or the first error a statement in it dropped: a transaction is never
+/// committed past a failure no one took (FEEDBACK27.md, Q-332; branch feedback27-35-fixes).
+fn caught(it: &mut Interp, body: &mut dyn FnMut(&mut Interp) -> R) -> R {
+    let outer = it.dropped.take();
+    it.catching_drops += 1;
+    let r = body(it);
+    it.catching_drops -= 1;
+    let dropped = std::mem::replace(&mut it.dropped, outer);
+    match (r, dropped) {
+        (Ok(v), Some(e)) if !matches!(v, Value::Err(..)) => Ok(e),
+        (r, _) => r,
+    }
+}
+
 /// One try of a transaction on connection `on`: what `body` gave (or the
 /// error that ended it), and whether the database gave up on it because of
 /// another transaction (then it is worth another try; told only for the
@@ -1813,7 +1827,7 @@ pub(crate) fn attempt(
             }
             let mark = tx_begin(it);
             it.sqlite_tx += 1;
-            let r = body(it);
+            let r = caught(it, body);
             it.sqlite_tx -= 1;
             let commit = ok(&r);
             let end = match (commit, immediate) {
@@ -1863,7 +1877,7 @@ pub(crate) fn attempt(
             let started = pooled_run(it, &b, move |c| c.batch(&begin));
             let mark = tx_begin(it);
             let r = match started {
-                Ok(()) => body(it),
+                Ok(()) => caught(it, body),
                 Err(e) => Ok(db_err(e)),
             };
             let conflicted = |it: &Interp| {

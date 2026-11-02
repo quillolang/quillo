@@ -503,15 +503,25 @@ db.transaction(() => {
 })
 db.transaction(() => {
     db.exec("insert into t values (3)")
-    db.transaction(() => {
+    let _ = db.transaction(() => {
         db.exec("insert into t values (4)")
         err("inner only")
     })
     db.exec("insert into t values (5)")
 })
+db.transaction(() => {
+    db.exec("insert into t values (6)")
+    db.transaction(() => {
+        db.exec("insert into t values (7)")
+        err("dropped, so the outer one rolls back too")
+    })
+    db.exec("insert into t values (8)")
+})
 db.query("select n from t order by n") | map(r => r.n)
 "#,
     );
+    // A nested one rolls back alone when its error is taken; one no statement takes rolls back
+    // the one around it too (FEEDBACK27.md, Q-332; branch feedback27-35-fixes).
     assert_eq!(r, "[1, 3, 5]");
 }
 

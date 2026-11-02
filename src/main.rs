@@ -14,6 +14,9 @@ const USAGE: &str = "\
 Quillo — a small web language
 
 usage:
+  quillo new <folder> [--minimal]   a program to start from: the to-do app, or a
+               [--binary]           page and a component; --binary copies this
+                                    quillo into <folder>/.quillo/bin
   quillo run <file.qwe> [options]   run a program; serve it if it has routes
   quillo app <file.qwe> [options]   run a program in a native window (needs a
                                     build with `--features app`)
@@ -30,7 +33,8 @@ usage:
                                     quillolang.org/plugins into this folder,
                                     their version and hash checked; --example,
                                     --update, --list (`quillo install --help`)
-  quillo repl                       interactive prompt
+  quillo repl [-i]                  interactive prompt (from a pipe, the answers
+                                    alone; -i keeps the prompts)
   quillo lsp                        language server for editors (stdio)
   quillo dap                        debugger for editors (the Debug Adapter
                                     Protocol, on stdio): breakpoints, stepping,
@@ -64,7 +68,7 @@ options for `run`:
                  its own, on a port of its own (one process: the default)
   --service-url NAME=URL
                  where service NAME runs, when not here (also
-                 QUILLO_SERVICE_NAME); calls are signed with
+                 QUILLO_SERVICE_<NAME>, as QUILLO_SERVICE_BILLING); calls are signed with
                  QUILLO_SERVICE_SECRET, the same on every service
   --base PATH    the path the program is served under (/shop), as a mounted
                  program is: its links and redirects carry it
@@ -127,8 +131,15 @@ fn main() {
     // (FEEDBACK26.md, Q-202; branch feedback26-fixes).
     if args.get(1).is_some_and(|c| c == "run" || c.ends_with(".qwe")) {
         if let Some(at) = args.iter().position(|a| a == "--") {
-            let theirs = args.split_off(at + 1);
+            let mut theirs = args.split_off(at + 1);
             args.pop();
+            // `quillo run -- a.qwe x`: a `--` before the program ends the options, and the
+            // program is the word after it (FEEDBACK31.md, Q-381; branch feedback27-35-fixes).
+            let from = if args[1] == "run" { 2 } else { 1 };
+            let named = program_and_flags(&args[from..]).ok().is_some_and(|_| has_program(&args[from..]));
+            if !named && !theirs.is_empty() {
+                args.push(theirs.remove(0));
+            }
             let _ = quillo::builtins::PROGRAM_ARGS.set(theirs);
         }
     }
@@ -144,7 +155,11 @@ fn main() {
             real_main(args)
         })
         .expect("cannot start interpreter thread");
-    std::process::exit(child.join().unwrap_or(1));
+    // A panic is a way out too: what runs beside the program stops with it (FEEDBACK31.md,
+    // Q-382; branch feedback27-35-fixes).
+    let code = child.join().unwrap_or(1);
+    with::stop_all();
+    std::process::exit(code);
 }
 
 /// Options of `run` and `app` that take a value: the word after one is its
@@ -180,6 +195,23 @@ fn nearest<'a>(option: &str, known: impl Iterator<Item = &'a &'a str>) -> String
     near.map_or_else(String::new, |(_, o)| format!(" (did you mean `{}`?)", o))
 }
 
+/// Whether `args` name a program: a word that is no option and no option's value.
+fn has_program(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a.starts_with('-') {
+            if VALUE_OPTIONS.contains(&a.as_str()) {
+                i += 1;
+            }
+        } else {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// The program a command names and the options around it, wherever they
 /// stand: the first argument that is neither an option nor an option's
 /// value. A folder, or no program at all, is that folder's main.qwe, and
@@ -207,6 +239,11 @@ fn program_and_flags(args: &[String]) -> Result<(String, Vec<String>), String> {
             flags.push(a.clone());
             if VALUE_OPTIONS.contains(&a.as_str()) {
                 if let Some(v) = args.get(i + 1) {
+                    // `--service-name --watch`: an option is no value, and would go unseen
+                    // (FEEDBACK31.md, Q-381; branch feedback27-35-fixes).
+                    if VALUE_OPTIONS.contains(&v.as_str()) || FLAG_OPTIONS.contains(&v.as_str()) || matches!(v.as_str(), "-w" | "-h" | "--help") {
+                        return Err(format!("`{}` needs a value, and `{}` is an option", a, v));
+                    }
                     flags.push(v.clone());
                     i += 1;
                 }
@@ -323,7 +360,12 @@ fn real_main(args: Vec<String>) -> i32 {
         }),
         // Plugins from quillolang.org's catalog, into the program's folder.
         Some("install") => quillo::install::main(&args[2..]),
-        Some("repl") | None => repl(),
+        // A program to start from (FEEDBACK34.md, Q-422; branch feedback27-35-fixes).
+        Some("new") => quillo::new::main(&args[2..]),
+        // `-i`: the prompts and the greeting, from a pipe too, as Python's `-i` (FEEDBACK31.md,
+        // Q-388; branch feedback27-35-fixes).
+        Some("repl") => repl(args[2..].iter().any(|a| a == "-i")),
+        None => repl(false),
         Some("lsp") => quillo::lsp::Server::new().run(),
         Some("version" | "--version" | "-V") => {
             println!("quillo {}", quillo::version());
@@ -335,7 +377,19 @@ fn real_main(args: Vec<String>) -> i32 {
         }
         // The same reading as `run`: `--log=off` is `--log off` here too
         // (FEEDBACK16.md, Q-139; branch feedback20-fixes).
-        Some(f) if f.ends_with(".qwe") => with_program(&args[1..], run),
+        Some(f) if f.to_ascii_lowercase().ends_with(".qwe") => with_program(&args[1..], run),
+        // A misspelt command is told the nearest, and a file given without `run` how to run it
+        // (FEEDBACK31.md, Q-389; branch feedback27-35-fixes).
+        Some(c) if !c.starts_with('-') => {
+            const COMMANDS: &[&str] = &["run", "check", "docs", "build", "fix", "install", "repl", "lsp", "dap", "app", "new", "version", "help"];
+            let near = nearest(c, COMMANDS.iter());
+            if Path::new(c).is_file() {
+                eprintln!("quillo: unknown command `{}`{}; to run the file: quillo run {}", c, near, c);
+            } else {
+                eprintln!("quillo: unknown command `{}`{}; `quillo help` lists them", c, near);
+            }
+            2
+        }
         Some(_) => usage(),
     }
 }
@@ -540,8 +594,19 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 };
                 quillo::metrics::LOG.store(format, std::sync::atomic::Ordering::Relaxed);
             }
+            // `localhost` is both loopbacks to whoever calls it, and its first address is `::1` on
+            // macOS: the one the guide and the tools call, 127.0.0.1, is listened on
+            // (FEEDBACK31.md, Q-384; branch feedback27-35-fixes).
+            ("--host", Some(v)) if v.eq_ignore_ascii_case("localhost") => o.host = Some("127.0.0.1".into()),
             ("--host", Some(v)) => o.host = Some(v.clone()),
-            ("--port", Some(v)) => o.port = Some(v.clone()),
+            // A port is checked with the options, a usage mistake (FEEDBACK31.md, Q-381).
+            ("--port", Some(v)) => match v.parse::<u16>() {
+                Ok(_) => o.port = Some(v.clone()),
+                Err(_) => {
+                    eprintln!("quillo: --port is a number from 1 to 65535 (or 0 for any free one), got {:?}", v);
+                    return Err(2);
+                }
+            },
             ("--register", Some(v)) => o.register = Some(v.clone()),
             ("--service", Some(v)) => o.service = Some(v.clone()),
             ("--max-body", Some(v)) => match v.parse::<usize>() {
@@ -578,7 +643,15 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 }
             },
             ("--instances", Some(v)) => match v.parse::<usize>() {
-                Ok(n) if n > 0 => o.instances = n,
+                Ok(n) if n > 0 => {
+                    // Each is a copy of the program and a thread: past the cores they only cost
+                    // (FEEDBACK31.md, Q-381; branch feedback27-35-fixes).
+                    let cores = std::thread::available_parallelism().map_or(1, |c| c.get());
+                    if n > cores {
+                        eprintln!("quillo: --instances {} is more than the {} cores here: each is a copy of the program, and they take turns", n, cores);
+                    }
+                    o.instances = n
+                }
                 _ => {
                     eprintln!("quillo: --instances needs a positive number");
                     return Err(2);
@@ -608,6 +681,10 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 eprintln!("quillo: --open is for `quillo app`, which opens a window on that page");
                 return Err(2);
             }
+            (other, _) if !other.starts_with('-') => {
+                eprintln!("quillo: unknown argument `{}`: a program's own arguments go after `--`, as `quillo run tool.qwe -- {}`", other, other);
+                return Err(2);
+            }
             (other, _) => {
                 eprintln!("quillo: unknown option `{}`{}", other, meant(other.split('=').next().unwrap_or(other)));
                 return Err(2);
@@ -618,6 +695,14 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
     if quillo::wt::TLS_CERT.get().is_some() != quillo::wt::TLS_KEY.get().is_some() {
         eprintln!("quillo: --tls-cert and --tls-key go together");
         return Err(2);
+    }
+    // The files are there, said with the other options (FEEDBACK31.md, Q-381; branch
+    // feedback27-35-fixes).
+    for (flag, f) in [("--tls-cert", quillo::wt::TLS_CERT.get()), ("--tls-key", quillo::wt::TLS_KEY.get())] {
+        if let Some(f) = f.filter(|f| !f.is_file()) {
+            eprintln!("quillo: {} {}: there is no such file", flag, f.display());
+            return Err(2);
+        }
     }
     // Query stats: on in development, else when asked (branch query-stats).
     if o.watch || std::env::var("QUILLO_QUERY_STATS").is_ok_and(|v| v == "1" || v == "true") {
@@ -694,6 +779,8 @@ mod with {
     use std::sync::Mutex;
 
     static RUNNING: Mutex<Vec<std::process::Child>> = Mutex::new(Vec::new());
+    /// The pipe to each command's watcher, and the watcher, kept open while `quillo` runs.
+    static WATCHED: Mutex<Vec<(std::process::ChildStdin, std::process::Child)>> = Mutex::new(Vec::new());
 
     pub fn start(cmd: &str, dir: &Path) -> Result<(), String> {
         let mut c = std::process::Command::new("sh");
@@ -704,6 +791,23 @@ mod with {
             c.process_group(0);
         }
         let mut child = c.spawn().map_err(|e| e.to_string())?;
+        // Whatever way `quillo` ends, SIGKILL included, the pipe a watcher reads closes, and the
+        // watcher ends the command's group (FEEDBACK31.md, Q-382; branch feedback27-35-fixes).
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let watcher = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("read _; kill -TERM -{} 2>/dev/null", child.id()))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .process_group(0)
+                .spawn();
+            if let Some((pipe, w)) = watcher.ok().and_then(|mut w| w.stdin.take().map(|p| (p, w))) {
+                WATCHED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((pipe, w));
+            }
+        }
         let tag = cmd.split_whitespace().find(|w| !w.contains('=') && *w != "npx" && *w != "bunx").unwrap_or("with").rsplit('/').next().unwrap_or("with").to_string();
         eprintln!("quillo: started `{}` beside the program", cmd);
         for out in [child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>)].into_iter().flatten() {
@@ -731,6 +835,10 @@ mod with {
             let _ = child.wait();
         }
         running.clear();
+        for (pipe, mut w) in WATCHED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain(..) {
+            drop(pipe);
+            let _ = w.wait();
+        }
     }
 }
 
@@ -751,28 +859,11 @@ fn stop_on_signal(member: Option<quillo::cluster::Membership>) {
 }
 
 fn stop_on_signal_with(member: Option<quillo::cluster::Membership>, joining: Option<std::sync::Arc<quillo::service::Joining>>) {
-    let again = std::sync::atomic::AtomicBool::new(false);
-    let _ = ctrlc::set_handler(move || {
-        if again.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            std::process::exit(130);
-        }
-        eprintln!("quillo: stopping once the requests in progress are answered (again to stop now)");
-        if let Some(m) = &member {
-            m.leave();
-        }
-        if let Some(j) = &joining {
-            j.leave();
-        }
-        with::stop_all();
-        quillo::httpd::stop();
-        // A request computing never comes back to its loop, so the time is kept from here
-        // (FEEDBACK20.md, Q-164; branch feedback20-fixes).
-        std::thread::spawn(|| {
-            std::thread::sleep(quillo::httpd::DRAIN + std::time::Duration::from_millis(500));
-            eprintln!("quillo: stopping with requests in progress: {}", quillo::httpd::in_progress().join(", "));
-            std::process::exit(0);
-        });
-    });
+    install_stop();
+    let mut stop = STOP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    stop.serving = true;
+    stop.member = member;
+    stop.joining = joining;
 }
 
 fn run_instances(path: &Path, mut o: RunOptions, addr: &str) -> i32 {
@@ -839,6 +930,44 @@ fn before_the_program(file: &str, o: &RunOptions) -> Result<(), i32> {
     Ok(())
 }
 
+/// The way out of a stop: during the load, at once and with what runs beside the program;
+/// while serving, once the requests are answered (FEEDBACK31.md, Q-382; branch
+/// feedback27-35-fixes). Set once, before anything starts, as a handler can be set only once.
+struct Stop {
+    serving: bool,
+    member: Option<quillo::cluster::Membership>,
+    joining: Option<std::sync::Arc<quillo::service::Joining>>,
+}
+
+static STOP: std::sync::Mutex<Stop> = std::sync::Mutex::new(Stop { serving: false, member: None, joining: None });
+
+fn install_stop() {
+    let again = std::sync::atomic::AtomicBool::new(false);
+    let _ = ctrlc::set_handler(move || {
+        let stop = STOP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if again.swap(true, std::sync::atomic::Ordering::SeqCst) || !stop.serving {
+            with::stop_all();
+            std::process::exit(130);
+        }
+        eprintln!("quillo: stopping once the requests in progress are answered (again to stop now)");
+        if let Some(m) = &stop.member {
+            m.leave();
+        }
+        if let Some(j) = &stop.joining {
+            j.leave();
+        }
+        with::stop_all();
+        quillo::httpd::stop();
+        // A request computing never comes back to its loop, so the time is kept from here
+        // (FEEDBACK20.md, Q-164; branch feedback20-fixes).
+        std::thread::spawn(|| {
+            std::thread::sleep(quillo::httpd::DRAIN + std::time::Duration::from_millis(500));
+            eprintln!("quillo: stopping with requests in progress: {}", quillo::httpd::in_progress().join(", "));
+            std::process::exit(0);
+        });
+    });
+}
+
 /// Runs the program. Whichever way it ends, a program that fails to load, has
 /// nothing to serve or cannot listen included, what runs beside it stops
 /// with it (FEEDBACK16.md, Q-123; branch feedback20-fixes).
@@ -853,6 +982,7 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
         Ok(o) => o,
         Err(code) => return code,
     };
+    install_stop();
     if let Err(code) = before_the_program(file, &o) {
         return code;
     }
@@ -994,23 +1124,47 @@ fn plural_warnings(n: usize) -> String {
     }
 }
 
-fn repl() -> i32 {
+fn repl(prompts: bool) -> i32 {
     let mut interp = Interp::new(".");
     let stdin = io::stdin();
     let mut buf = String::new();
     let mut kept: Vec<Vec<Stmt>> = Vec::new();
-    println!("Quillo {} — enter expressions; Ctrl-D exits", quillo::version());
-    // The program here, which `quillo run` serves (FEEDBACK6.md, Q-059; branch feedback6-fixes).
-    if Path::new("main.qwe").is_file() {
-        println!("main.qwe is here: `quillo run` serves it");
+    // From a pipe, the output is the answers alone, as Python's REPL does, and input that ends
+    // with a statement open is an error (FEEDBACK31.md, Q-388; branch feedback27-35-fixes).
+    #[cfg(unix)]
+    let terminal = prompts || unsafe { libc::isatty(0) } == 1;
+    #[cfg(not(unix))]
+    let terminal = { let _ = prompts; true };
+    if terminal {
+        println!("Quillo {} — enter expressions; Ctrl-D exits", quillo::version());
+        // The program here, which `quillo run` serves (FEEDBACK6.md, Q-059; branch feedback6-fixes).
+        if Path::new("main.qwe").is_file() {
+            println!("main.qwe is here: `quillo run` serves it");
+        }
     }
+    let mut line_no = 0usize;
+    let mut began = 0usize;
+    let mut failed = false;
     loop {
-        print!("{}", if buf.is_empty() { "quillo> " } else { "....> " });
-        let _ = io::stdout().flush();
+        if terminal {
+            print!("{}", if buf.is_empty() { "quillo> " } else { "....> " });
+            let _ = io::stdout().flush();
+        }
         let mut line = String::new();
         if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
-            println!();
-            return 0;
+            if !buf.trim().is_empty() {
+                let what = Parser::new(&buf).parse_program().err().map_or_else(String::new, |e| format!(": {}", e.msg));
+                eprintln!("error: the input ended inside the statement that began on line {}{}", began, what);
+                return 1;
+            }
+            if terminal {
+                println!();
+            }
+            return if failed && !terminal { 1 } else { 0 };
+        }
+        line_no += 1;
+        if buf.is_empty() {
+            began = line_no;
         }
         buf.push_str(&line);
         let stmts = match Parser::new(&buf).parse_program() {
@@ -1018,6 +1172,7 @@ fn repl() -> i32 {
             Err(e) if e.msg.contains("end of input") => continue,
             Err(e) => {
                 eprintln!("error: {}", e);
+                failed = true;
                 buf.clear();
                 continue;
             }
@@ -1038,6 +1193,7 @@ fn repl() -> i32 {
                 Err(Ctrl::Reply(r)) => println!("<reply {}>", r.status),
                 Err(Ctrl::Error(e)) => {
                     eprintln!("error: {}", e);
+                    failed = true;
                     break;
                 }
             }

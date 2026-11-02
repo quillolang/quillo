@@ -135,8 +135,30 @@ pub struct Lexer {
 }
 
 impl Lexer {
+    /// A file is read as Windows, Linux and the shell write one: a byte-order mark at its start
+    /// is skipped, as Python, Node and rustc do (FEEDBACK31.md, Q-386); a first line `#!` is the
+    /// shell's, so `./tool.qwe` runs (Q-387); and a CRLF is a line break, so a string over two
+    /// lines is the same text from a file git checked out on Windows (Q-385; branch
+    /// feedback27-35-fixes). A `\r` written as `\r` stays.
     pub fn new(src: &str, line: u32) -> Self {
-        Lexer { chars: Arc::new(src.chars().collect()), pos: 0, line, stack: Vec::new(), last: None, comment_newline: None }
+        let src = if line == 1 { src.strip_prefix('\u{FEFF}').unwrap_or(src) } else { src };
+        let mut chars: Vec<char> = Vec::with_capacity(src.len());
+        let mut it = src.chars().peekable();
+        if line == 1 && src.starts_with("#!") {
+            for c in it.by_ref() {
+                if c == '\n' {
+                    chars.push('\n');
+                    break;
+                }
+            }
+        }
+        while let Some(c) = it.next() {
+            if c == '\r' && it.peek() == Some(&'\n') {
+                continue;
+            }
+            chars.push(c);
+        }
+        Lexer { chars: Arc::new(chars), pos: 0, line, stack: Vec::new(), last: None, comment_newline: None }
     }
 
     pub fn peek_char(&self) -> Option<char> {
@@ -378,6 +400,17 @@ impl Lexer {
                 '?' => Tok::Question,
                 '~' => Tok::Tilde,
                 '@' => return Err(QuilloError::new("unexpected character `@`: there are no decorators, and in markup it starts an event, as `@click`", line)),
+                // One that cannot be seen is named by its code (FEEDBACK31.md, Q-386; branch
+                // feedback27-35-fixes).
+                other if other.is_control() || other.is_whitespace() || matches!(other, '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}' | '\u{00AD}') => {
+                    let what = match other {
+                        '\u{FEFF}' => " (a byte-order mark)",
+                        '\u{00A0}' => " (a no-break space)",
+                        '\u{200B}' => " (a zero-width space)",
+                        _ => "",
+                    };
+                    return Err(QuilloError::new(format!("unexpected character U+{:04X}{}, which cannot be seen: delete it", other as u32, what), line));
+                }
                 other => return Err(QuilloError::new(format!("unexpected character `{}`", other), line)),
             }
         };

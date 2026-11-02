@@ -787,7 +787,7 @@ fn the_log_never_shows_a_launch_token() {
         let _ = child.kill();
         let out = child.wait_with_output().unwrap();
         let log = String::from_utf8_lossy(&out.stderr);
-        assert!(log.contains("/hello") && log.contains("-> 400"), "{:?}: {}", flags, log);
+        assert!(log.contains("/hello") && (log.contains("-> 400") || log.contains("\"status\":400")), "{:?}: {}", flags, log);
         assert!(!log.contains(token) && !log.contains(&token[..12]), "{:?}: {}", flags, log);
     }
 }

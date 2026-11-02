@@ -85,7 +85,7 @@ mod with_windows {
         let d = folder("help", &[("app.qwe", APP)]);
         let (code, out, _) = no_window(&d, &["app.qwe", "--help"], &[]);
         assert_eq!(code, 0);
-        assert!(out.contains("usage:\n  quillo run <file.qwe> [options]"), "{}", out);
+        assert!(out.contains("usage:\n  quillo new <folder>") && out.contains("\n  quillo run <file.qwe> [options]"), "{}", out);
     }
 
     #[test]

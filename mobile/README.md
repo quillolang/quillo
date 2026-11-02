@@ -17,7 +17,7 @@ database in the app's container, and is written exactly as it is for a server.
 ## The phone's own hardware
 
 The iOS and Android apps put `window.quilloNative` on the program's pages (their own
-origin only), for what a web view cannot reach. A component calls it with `js()` in an inline handler or
+origin and app.toml's `site` only, in the main frame), for what a web view cannot reach. A component calls it with `js()` in an inline handler or
 `@mount`, which wait for its answer; a refusal is an error value.
 
 | Call | Answer |
@@ -35,7 +35,9 @@ origin only), for what a web view cannot reach. A component calls it with `js()`
 
 A link the web view cannot open itself, `tel:`, `sms:`, `mailto:`, a maps link (`geo:` on
 Android, `maps:` on iOS) or a store's (`market:`, `itms-apps:`), goes to the app the phone
-opens it with; other schemes are dropped. The program is served on the same port at each
+opens it with; other schemes are dropped. An `<iframe>` of another site loads where it
+is, in the page, rather than sending the person to Safari or Chrome; a frame gets no
+bridge (FEEDBACK33.md, Q-409). The program is served on the same port at each
 launch while it is free (kept in the app's data folder as `port`), so its pages keep one
 origin, and `localStorage` and IndexedDB, which go by origin, keep what they had
 (FEEDBACK28.md, Q-339, Q-346).
@@ -58,7 +60,20 @@ version = "1.0.0"                   # what people see in the store
 build = 1                           # a whole number, higher for each upload to a store
 icon = "icon.png"                   # 1024 x 1024 PNG without transparency; Quillo's when left out
 main = "mobile.qwe"                 # the file the app starts from, in the program's folder; main.qwe when left out
+site = "https://app.example.com"    # a site of yours the web view keeps, with the bridge
+env.SHOP_URL = "https://shop.example.com"   # what env("SHOP_URL") gives on the phone
 ```
+
+`env.NAME = "value"` lines are what `env("NAME")` gives on the phone: the phone has no
+environment, and the app's `.env` is not read (nor bundled). Under `quillo run` the same
+code takes `NAME` from `.env`. They are public, as everything in an app is: anyone can
+unzip it (FEEDBACK33.md, Q-406).
+
+`site` is an https address with no path (`https://app.example.com`, a port allowed).
+Pages of that origin stay in the web view, and `window.quilloNative` answers them as it
+answers the program's pages. The bundled program still starts first and can link or
+redirect there. An app that only wraps a website is turned down by Apple's App Review
+(guideline 4.2), so the app should be more than the site (Q-410).
 
 `main` is for a program with a file for each platform: `web.qwe` and `desktop.qwe` for
 `quillo run` and `quillo app`, `mobile.qwe` for the phone, over the same code. The whole
@@ -69,6 +84,18 @@ A bad value stops the build with what is wrong. Without an `app.toml`, the app i
 "Quillo" (`org.quillolang.app`) with Quillo's icon. The icon becomes an asset catalog
 (iOS, compiled by `actool`) and launcher icons at every density plus an adaptive icon
 (Android).
+
+## What goes into an app
+
+Both systems copy the program's folder with one filter, `app_copy_program` in
+app-config.sh: everything but `.env` and `.env.*`, `.git/` (the program's history, old
+secrets included), `.quillo/` and any other dotfile (`.well-known/` is kept), databases
+(`*.db`, `*.db-wal`, `*.db-shm`, `*.sqlite`), `uploads/`, and a subfolder with a main.qwe
+of its own, which is a program apart. The build prints how many files went in and what
+it left out; when that includes a `.env`, it adds "a .env is the server's: put public
+values in app.toml as env.NAME" (Q-407). Android keeps folders that start with `_`:
+Gradle's `ignoreAssetsPattern` is set in app/build.gradle.kts, so a program works the
+same on both systems (Q-408).
 
 ## iOS
 
@@ -119,8 +146,8 @@ xcrun simctl launch booted org.quillolang.app --eval "$(cat mobile/ios/add-todos
 ```
 
 `build.sh` builds the runtime for `aarch64-apple-ios-sim` (`rustup target add
-aarch64-apple-ios-sim` once), copies the program's folder into the app (not its databases,
-nor subfolders that are programs of their own), links it all with `swiftc` (no Xcode
+aarch64-apple-ios-sim` once), copies the program's folder into the app (see [What goes
+into an app](#what-goes-into-an-app)), links it all with `swiftc` (no Xcode
 project) and, with `--run`, installs and opens it on a simulator. `--eval <script>` runs a
 script in the page once it has loaded, for screenshots and tests; given several times, the
 scripts run in turn, one per page loaded.
@@ -141,9 +168,11 @@ mobile/android/build.sh app --run      # a debug APK around app/, installed with
 `MainActivity` unpacks the program from the APK's assets into the app's files (assets are
 not files), gathers the device's facts (`Build`, the display, memory, locale), starts the
 runtime through JNI (`Quillo.start`, `Java_org_quillolang_app_Quillo_start` in quillo-mobile)
-and shows a WebView on the URL it gives. Links to other sites open in the browser, and the
-back button goes back in the program's pages first. 127.0.0.1 is the only place cleartext
-HTTP is allowed (res/xml/network_security_config.xml).
+and shows a WebView on the URL it gives. Links to other sites open in the browser, but for
+app.toml's `site`, whose pages stay in the web view, and frames, which load where they are;
+the back button goes back in the
+program's pages first. 127.0.0.1 is the only place the web view may use cleartext HTTP
+(res/xml/network_security_config.xml); the runtime's own sockets are not the web view's.
 
 - **The bridge** (Bridge.kt): `window.quilloNative` with the same calls as on iOS, put on
   the program's pages before their own scripts and answering only the program's origin
@@ -199,6 +228,58 @@ battery or memory; the program starts again from its database when the app is op
 | 70 s on the screen | 8 |
 | 150 s behind the home screen | 11 |
 | 70 s after coming back | 12 |
+
+## Calling a server
+
+A page's `http.*` to another site meets CORS, and the page's origin, `127.0.0.1`, is not
+one a site can safely allow. When it fails, it says so: `http: no answer from <host>: it
+may not allow this page (CORS), or be plain http, or be unreachable; a server fn can call
+it from the server` (Q-411). So the program reaches a server from a `server fn`, with the
+program's own `http.*`, not from the page.
+
+A deployed Quillo site is declared with `site` and its `server fn`s are called as the
+program's own (src/sites.rs, Q-412):
+
+```quillo
+site shop = env("SHOP_URL", "https://shop.example.com")   // env.SHOP_URL in app.toml
+
+server fn latest(n: int) = shop.notes(n)                  // the site's `server fn notes`
+
+component Notes() {
+    state notes = latest(20)
+    <ul>{for n in notes => <li key={n.id}>{n.text}</li>}</ul>
+}
+```
+
+- `shop.notes(a, b)` is `POST <url>/_quillo/rpc/notes` with a JSON array of the
+  arguments. It gives the answer's value, the site's error as an error value, or an
+  error value when the site cannot be reached (`site shop: no answer from ...`).
+  Decimals and big ints cross as they do for pages.
+- The address is any expression. `site` stays an ordinary name elsewhere: `let site =
+  ...` works.
+- In an app of one person (a phone app, `quillo app`, or with `QUILLO_SITE_COOKIES=1`)
+  the cookies the site sets are kept in `.quillo/sites/<name>.json` in the program's
+  folder, so whoever signed in stays signed in across launches. On a server they are
+  not kept, and a log line says so once: one visitor's session would be every
+  visitor's.
+- It runs on the server side only: `quillo check` refuses `shop.x()` in a component
+  (call it in a server fn).
+- `/_quillo/rpc/<fn>` is a stable wire for programs: a JSON array in, `{"ok": v}` or
+  `{"err": e}` out. A program sends no `Origin` header and needs none; a request with
+  another site's `Origin` is refused.
+- A `service` on a phone always runs inside the app. To use a server's, call the server
+  with `site`, not `service` (Q-413).
+
+Reaching a server (Q-414):
+
+- Info.plist has `NSLocalNetworkUsageDescription`: a real iPhone asks the person before
+  the app reaches a computer on the local network. The simulator shares the Mac's
+  network, so `127.0.0.1` reaches a server on the Mac there.
+- The runtime's `http.*` and `site` calls trust the certificate roots built into the
+  binary, not the phone's, so a company's CA installed on the phone is not trusted by
+  them.
+- App Transport Security does not cover the runtime's own sockets, so the program can
+  reach plain `http://`. Prefer https.
 
 ## What a phone build leaves out
 

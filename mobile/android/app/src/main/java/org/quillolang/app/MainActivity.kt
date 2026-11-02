@@ -37,6 +37,12 @@ class MainActivity : Activity() {
     private lateinit var web: WebView
     private lateinit var bridge: Bridge
     private var origin = ""
+    /** app.toml's `site`, https only (FEEDBACK33.md, Q-410; branch feedback27-35-fixes). */
+    private val site: String by lazy {
+        val s = getString(R.string.quillo_site)
+        val u = Uri.parse(s)
+        if (s.startsWith("https://") && !u.host.isNullOrEmpty()) "https://${u.host}${if (u.port > 0) ":${u.port}" else ""}" else ""
+    }
     // `--es eval "<js>"` (and eval2, eval3, ...): run in the page as each one loads, in
     // turn, for screenshots and tests. Only a launch from adb or the IDE passes them.
     private val pendingEvals = ArrayDeque<String>()
@@ -91,7 +97,11 @@ class MainActivity : Activity() {
             // The program's own pages stay here; a link to another site opens in the browser.
             override fun shouldOverrideUrlLoading(view: WebView, req: WebResourceRequest): Boolean {
                 val url = req.url.toString()
+                // A frame loads where it is (FEEDBACK33.md, Q-409; branch feedback27-35-fixes).
+                if (!req.isForMainFrame) return false
                 if (origin.isEmpty() || url.startsWith("$origin/") || url == origin) return false
+                // The developer's own site, from app.toml (FEEDBACK33.md, Q-410).
+                if (site.isNotEmpty() && (url == site || url.startsWith("$site/"))) return false
                 if (url.startsWith("about:") || url.startsWith("data:") || url.startsWith("blob:")) return false
                 // What the system handles: a link to dial or to mail does what it does in a
                 // browser (FEEDBACK28.md, Q-346; branch feedback29-fixes).
@@ -168,7 +178,7 @@ class MainActivity : Activity() {
             return
         }
         origin = Uri.parse(said).let { "${it.scheme}://${it.host}:${it.port}" }
-        bridge.attach(origin)
+        bridge.attach(if (site.isEmpty()) setOf(origin) else setOf(origin, site))
         // Back goes back in the program's pages first. From Android 13 the system asks
         // for a callback (predictive back, the only way from Android 16); before, the
         // key comes to onBackPressed.

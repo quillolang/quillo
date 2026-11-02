@@ -60,7 +60,8 @@ route GET /crlf = set_cookie("a", "1", { path: "/x\r\nSet-Cookie: evil=1" })
     let r = send(&mut it, "GET", "localhost:9000", "/b", None);
     assert_eq!(
         set_cookies(&r),
-        ["open=1; Path=/b; SameSite=Strict", "theme=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax"]
+        // A deletion is Secure only over HTTPS (FEEDBACK34.md, Q-425; branch feedback27-35-fixes).
+        ["open=1; Path=/b; SameSite=Strict", "theme=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"]
     );
     // SameSite=None needs Secure, always.
     let r = send(&mut it, "GET", "127.0.0.1:9000", "/c", None);

@@ -25,6 +25,10 @@
     <key>NSPhotoLibraryAddUsageDescription</key><string>For pictures the program saves for you.</string>
     <key>NSMotionUsageDescription</key><string>For the compass and the device's motion.</string>
     <!-- The program is served to this app on 127.0.0.1 over plain HTTP. -->
+    <!-- A real phone asks before an app reaches the local network, as a developer's machine
+         serving the program is (FEEDBACK33.md, Q-414; branch feedback27-35-fixes). -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>To reach a server on this network, such as the computer the app is being made on.</string>
     <key>NSAppTransportSecurity</key>
     <dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict>

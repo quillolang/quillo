@@ -76,11 +76,39 @@ pub fn parse_urlencoded(s: &str) -> Map {
 /// `req` as `request`, its form as `all_values` makes it, for `{ form: { tag: [str] } }`.
 fn form_lists(pat: Option<&crate::ast::Pattern>, reqv: &Value, req: &HttpRequest) -> Option<Value> {
     let Some(crate::ast::Pattern::Record(fields)) = pat else { return None };
-    let f = fields.iter().find(|f| f.path.len() == 1 && f.path[0] == "form")?;
     let Value::Map(m) = reqv else { return None };
-    let form = all_values(&f.pat, m.get("form")?, &String::from_utf8_lossy(&req.body))?;
-    let mut out = (**m).clone();
-    out.insert("form".into(), form);
+    let mut out = None;
+    if let Some(f) = fields.iter().find(|f| f.path.len() == 1 && f.path[0] == "form") {
+        if let Some(form) = m.get("form").and_then(|v| all_values(&f.pat, v, &String::from_utf8_lossy(&req.body))) {
+            out.get_or_insert_with(|| (**m).clone()).insert("form".into(), form);
+        }
+    }
+    // `{ files: { docs: [map] } }`: every file of that field as a list, one file or none
+    // included, as a field holds one file's record when one is sent (FEEDBACK30.md, Q-365;
+    // branch feedback27-35-fixes).
+    if let Some(f) = fields.iter().find(|f| f.path.len() == 1 && f.path[0] == "files") {
+        if let Some(files) = file_lists(&f.pat, m.get("files").unwrap_or(&Value::Nil)) {
+            out.get_or_insert_with(|| (**m).clone()).insert("files".into(), files);
+        }
+    }
+    out.map(Value::map)
+}
+
+fn file_lists(pat: &crate::ast::Pattern, v: &Value) -> Option<Value> {
+    let crate::ast::Pattern::Record(fields) = pat else { return None };
+    let names: Vec<&String> = fields.iter().filter(|f| f.path.len() == 1 && matches!(f.pat, crate::ast::Pattern::List(_, None))).map(|f| &f.path[0]).collect();
+    if names.is_empty() {
+        return None;
+    }
+    let mut out = if let Value::Map(m) = v { (**m).clone() } else { Map::new() };
+    for n in names {
+        let all = match out.get(n.as_str()) {
+            None | Some(Value::Nil) => Value::list(Vec::new()),
+            Some(one @ Value::Map(_)) => Value::list(vec![one.clone()]),
+            Some(other) => other.clone(),
+        };
+        out.insert(n.as_str().into(), all);
+    }
     Some(Value::map(out))
 }
 
@@ -214,7 +242,9 @@ fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map {
     // not reach routes that expect JSON.
     let looks_json = trimmed.starts_with('{') || trimmed.starts_with('[');
     let json = if is_json_type(&ctype) || (ctype.trim().is_empty() && looks_json) {
-        serde_json::from_str::<serde_json::Value>(&body).map(|j| Value::from_json(&j)).unwrap_or(Value::Nil)
+        // RFC 8259 lets a reader skip a byte-order mark (FEEDBACK31.md, Q-386; branch
+        // feedback27-35-fixes).
+        serde_json::from_str::<serde_json::Value>(body.strip_prefix('\u{FEFF}').unwrap_or(&body)).map(|j| Value::from_json(&j)).unwrap_or(Value::Nil)
     } else {
         Value::Nil
     };
@@ -295,6 +325,7 @@ impl Interp {
         self.upload_body = None;
         self.set_cookies.clear();
         self.session = None;
+        self.visitor_read = false;
         self.locale = None;
         if !req.body.is_empty() {
             let ctype = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map_or("", |(_, v)| v.as_str());
@@ -343,9 +374,11 @@ impl Interp {
                 }
             }
         }
+        let sets_cookie = !self.set_cookies.is_empty();
         for c in self.set_cookies.drain(..) {
             resp.headers.push(("set-cookie".into(), c));
         }
+        self.site_headers_into(path, sets_cookie, &mut resp);
         if !self.base.is_empty() {
             for (k, v) in resp.headers.iter_mut() {
                 if k.eq_ignore_ascii_case("location") {
@@ -413,9 +446,10 @@ impl Interp {
             let mut tags = String::new();
             // Components translate in the browser too: the page carries its
             // locale's text, read when the (deferred) bundle runs.
-            if let (Some(i18n), Some(l)) = (self.site.i18n.clone(), self.locale()) {
-                tags.push_str(&format!("<script>window.__quillo_i18n={}</script>", i18n.browser_json(&l)));
-            }
+            let i18n = match (self.site.i18n.clone(), self.locale()) {
+                (Some(i18n), Some(l)) => Some((i18n, l)),
+                _ => None,
+            };
             // Only the code of the components on the page (and what they
             // use), at an address that changes when it does.
             if !script_tag_for(&resp.body, b"/_quillo/quillo.js") {
@@ -427,6 +461,12 @@ impl Interp {
                     Some(page) => {
                         // The libraries its components use first (branch js-libraries).
                         let mut s = page.libs.clone();
+                        // Its translations, the keys its code can ask for, in a file of their
+                        // own the browser keeps (FEEDBACK30.md, Q-372; branch feedback27-35-fixes).
+                        if let Some((i18n, l)) = &i18n {
+                            let hash = crate::i18n::keep_file(i18n.browser_json(l, page.t_keys.as_deref().map(|v| v.as_slice())));
+                            s.insert(0, format!("{}/_quillo/t/{}.js", self.base, hash));
+                        }
                         if let Some((rt, _)) = self.runtime_file().filter(|_| page.split) {
                             s.push(format!("{}/_quillo/r/{}.js", self.base, rt));
                         }
@@ -439,6 +479,9 @@ impl Interp {
                         bundle_styles = self.styles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ids();
                         hints = crate::client::all_hints(self);
                         let mut s = crate::client::all_libs(self);
+                        if let Some((i18n, l)) = &i18n {
+                            s.insert(0, format!("{}/_quillo/t/{}.js", self.base, crate::i18n::keep_file(i18n.browser_json(l, None))));
+                        }
                         s.push(format!("{}/_quillo/quillo.js", self.base));
                         s
                     }
@@ -446,6 +489,9 @@ impl Interp {
                 tags.push_str(&format!("<script>{}</script>", island_loader(&srcs)));
             } else {
                 bundle_styles = self.styles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ids();
+                if let Some((i18n, l)) = &i18n {
+                    tags.push_str(&format!("<script>window.__quillo_i18n={}</script>", i18n.browser_json(l, None)));
+                }
             }
             let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
             resp.body.splice(at..at, tags.into_bytes());
@@ -582,16 +628,15 @@ impl Interp {
             let file = std::mem::replace(&mut self.cur_file, r.file.clone());
             let ran = if crate::debug::on() { self.debug_route(&r, &scope) } else { self.eval(&r.body, &scope) };
             self.cur_file = file;
-            let mut resp = finish(crate::interp::in_file(ran, &r.file));
+            let resp = finish(crate::interp::in_file(ran, &r.file));
             // The page's components will need the locale (see `handle`).
             if self.rendered_island && self.site.i18n.is_some() {
                 self.locale();
             }
             self.current_request = None;
             self.pending_request = None;
-            if req.method == "HEAD" {
-                resp.body.clear();
-            }
+            // A `HEAD` is answered with the GET's headers, its length included; the body is left
+            // out where the answer is written (FEEDBACK31.md, Q-393; branch feedback27-35-fixes).
             return resp;
         }
         if method_matched {
@@ -665,6 +710,47 @@ impl Interp {
         }
     }
 
+    /// What every answer carries that its route did not set: the program's `site_headers`, then
+    /// Quillo's own defaults. A page made from who the visitor is (it read the session or a
+    /// cookie) is `Cache-Control: private` with `Vary: Cookie`, so a shared cache does not hand
+    /// it to the next visitor, and a page is not framed by another site, `X-Frame-Options:
+    /// SAMEORIGIN` (FEEDBACK31.md, Q-391; branch feedback27-35-fixes).
+    fn site_headers_into(&self, path: &str, sets_cookie: bool, resp: &mut HttpResponse) {
+        let under = |p: &str| p == "/" || path == p || path.starts_with(&format!("{}/", p));
+        let mut want: Vec<(String, Option<String>)> = Vec::new();
+        let mut rules: Vec<&(String, Vec<(String, Option<String>)>)> = self.site.headers.iter().filter(|(p, _)| under(p)).collect();
+        rules.sort_by_key(|(p, _)| if p == "/" { 0 } else { p.len() });
+        for (_, hs) in rules {
+            for (k, v) in hs {
+                match want.iter_mut().find(|(n, _)| n == k) {
+                    Some(w) => w.1 = v.clone(),
+                    None => want.push((k.clone(), v.clone())),
+                }
+            }
+        }
+        let html = resp.header("content-type").is_some_and(|c| c.starts_with("text/html"));
+        let framed_by_policy = resp.header("content-security-policy").is_some_and(|c| c.contains("frame-ancestors"))
+            || want.iter().any(|(k, v)| k == "content-security-policy" && v.as_deref().is_some_and(|c| c.contains("frame-ancestors")));
+        if html && !framed_by_policy && !want.iter().any(|(k, _)| k == "x-frame-options") {
+            want.push(("x-frame-options".into(), Some("SAMEORIGIN".into())));
+        }
+        let personal = (self.visitor_read || sets_cookie) && resp.status < 400;
+        if personal && !want.iter().any(|(k, _)| k == "cache-control") {
+            want.push(("cache-control".into(), Some("private".into())));
+        }
+        for (k, v) in want {
+            if resp.header(&k).is_some() {
+                continue;
+            }
+            if let Some(v) = v {
+                resp.headers.push((k, v));
+            }
+        }
+        if personal && !resp.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("vary") && v.to_ascii_lowercase().contains("cookie")) {
+            resp.headers.push(("vary".into(), "Cookie".into()));
+        }
+    }
+
     fn handle_internal(&mut self, rest: &str, req: &HttpRequest, path: &str, qs: &str) -> HttpResponse {
         // A page's sheet; one no longer kept (or from before a reload) is
         // every style.
@@ -677,6 +763,19 @@ impl Interp {
                     ("cache-control".into(), if kept { "public, max-age=31536000, immutable" } else { "no-cache" }.into()),
                 ],
                 body: css.as_bytes().to_vec(),
+            };
+        }
+        // A page's translations (FEEDBACK30.md, Q-372; branch feedback27-35-fixes). One no longer
+        // kept is every key of the default locale, which does no harm.
+        if let Some(hash) = rest.strip_prefix("t/").and_then(|r| r.strip_suffix(".js")) {
+            let (js, cache) = match crate::i18n::file(hash) {
+                Some(js) => (js.to_string(), "public, max-age=31536000, immutable"),
+                None => (self.site.i18n.as_ref().map_or_else(String::new, |i| format!("window.__quillo_i18n={};", i.browser_json(&i.default.clone(), None))), "no-cache"),
+            };
+            return HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "text/javascript; charset=utf-8".into()), ("cache-control".into(), cache.into())],
+                body: js.into_bytes(),
             };
         }
         // The runtime file pages' bundles share; another than this program's
@@ -759,7 +858,9 @@ impl Interp {
         // The program's API, for a gateway or a reader, under `--describe`
         // (FEEDBACK10.md, Q-077; branch feedback10-fixes).
         if rest == "describe" && crate::describe::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-            let title = self.base_dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            // The file's name, as `quillo docs` titles it, however the program was started
+            // (FEEDBACK32.md, Q-398; branch feedback27-35-fixes).
+            let title = crate::service::served_as().map(str::to_string).filter(|t| !t.is_empty()).unwrap_or_else(|| "api".into());
             return json_response(200, crate::describe::of_interp(self, &title));
         }
         if rest == "live" {
@@ -899,15 +1000,23 @@ impl Interp {
             }
             None => (req.body.clone(), Map::new()),
         };
+        // A file anywhere in them, a list's or a map's too (FEEDBACK30.md, Q-364; branch
+        // feedback27-35-fixes).
+        fn arg_of(j: &serde_json::Value, files: &Map) -> Value {
+            match j {
+                serde_json::Value::Object(o) if o.len() == 1 && o.contains_key("$quillo_file") => match o["$quillo_file"].as_u64() {
+                    Some(i) => files.get(format!("file{}", i).as_str()).cloned().unwrap_or(Value::Nil),
+                    None => Value::Nil,
+                },
+                serde_json::Value::Array(a) => Value::list(a.iter().map(|x| arg_of(x, files)).collect()),
+                // Decimals and large ints as the page sends them ({"$dec": "12.50"}).
+                serde_json::Value::Object(o) if o.len() == 1 && o.keys().all(|k| matches!(k.as_str(), "$dec" | "$int" | "$quillo_err")) => crate::interp::from_island_json(j),
+                serde_json::Value::Object(o) => Value::map(o.iter().map(|(k, v)| (k.as_str().into(), arg_of(v, files))).collect()),
+                other => crate::interp::from_island_json(other),
+            }
+        }
         let args = match serde_json::from_slice::<serde_json::Value>(&json_args) {
-            Ok(serde_json::Value::Array(a)) => a
-                .iter()
-                .map(|j| match j.get("$quillo_file").and_then(|i| i.as_u64()) {
-                    Some(i) if j.as_object().map_or(false, |o| o.len() == 1) => files.get(format!("file{}", i).as_str()).cloned().unwrap_or(Value::Nil),
-                    // Decimals and large ints as the page sends them ({"$dec": "12.50"}).
-                    _ => crate::interp::from_island_json(j),
-                })
-                .collect::<Vec<_>>(),
+            Ok(serde_json::Value::Array(a)) => a.iter().map(|j| arg_of(j, &files)).collect::<Vec<_>>(),
             _ => return rpc_error(400, "the body must be a JSON array of arguments"),
         };
         let args = match take_args(self, &c.def, args) {
@@ -1487,7 +1596,10 @@ pub fn finish(res: Result<Value, Ctrl>) -> HttpResponse {
         Err(Ctrl::Error(e)) => {
             // A prefetch stopped before it changed something is expected.
             if !e.msg.contains(crate::interp::PREFETCH_REFUSED) {
-                crate::httpd::error_line(&format!("{:#}", e));
+                let head = format!("{}", e);
+                let full = format!("{:#}", e);
+                let calls: Vec<String> = full.get(head.len()..).unwrap_or("").lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect();
+                crate::httpd::error_line_with(&head, &calls);
             }
             // The message names files and lines of the program; it is for
             // its author (`--watch`), not for whoever sent the request.
@@ -1789,8 +1901,10 @@ impl App {
     }
 }
 
-fn mtimes(files: &[PathBuf]) -> Vec<Option<std::time::SystemTime>> {
-    files.iter().map(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok()).collect()
+/// Each file's time, and where it leads: a link pointed elsewhere is a change (FEEDBACK31.md,
+/// Q-383; branch feedback27-35-fixes).
+fn mtimes(files: &[PathBuf]) -> Vec<(Option<std::time::SystemTime>, Option<PathBuf>)> {
+    files.iter().map(|f| (std::fs::metadata(f).and_then(|m| m.modified()).ok(), f.canonicalize().ok())).collect()
 }
 
 /// Polls the program's files and reloads it when one changes. Under
@@ -2276,6 +2390,14 @@ impl Worker {
                     run_program(it, &req)
                 } {
                     Some(r) => r,
+                    // A stop cuts off a request still running past the drain, a plugin's call
+                    // say: that is no bug (FEEDBACK27.md, Q-330; branch feedback27-35-fixes).
+                    None if crate::httpd::stopping() => {
+                        eprintln!("quillo: stopped with {} {} still running", req.method, log_url(&req.url));
+                        self.local = None;
+                        self.generation = 0;
+                        plain(503, "stopping\n")
+                    }
                     None => {
                         eprintln!("quillo: internal error (a bug in Quillo) while handling {} {}", req.method, log_url(&req.url));
                         // Its state may be half-updated; start afresh.
@@ -2437,6 +2559,9 @@ pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(s
     take_descriptors();
     let listener = std::net::TcpListener::bind(addr).map_err(|e| format!("cannot listen on {}: {}", addr, e))?;
     let bound = listener.local_addr().ok();
+    if let Some(b) = bound {
+        crate::platform::set_listening(&b.ip().to_string(), b.port());
+    }
     let shown = bound.map_or_else(|| addr.to_string(), |a| a.to_string());
     let app = Arc::new(app);
     if let Loaded::Ready(it) = &*app.current().1 {
@@ -2485,6 +2610,9 @@ pub fn serve_many(apps: Vec<App>, addr: &str, workers: usize) -> Result<(), Stri
     crate::value::HIDING.store(true, std::sync::atomic::Ordering::Relaxed);
     crate::value::SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
     let listener = std::net::TcpListener::bind(addr).map_err(|e| format!("cannot listen on {}: {}", addr, e))?;
+    if let Ok(b) = listener.local_addr() {
+        crate::platform::set_listening(&b.ip().to_string(), b.port());
+    }
     let shown = listener.local_addr().map_or_else(|_| addr.to_string(), |a| a.to_string());
     let apps: Vec<Arc<App>> = apps.into_iter().map(Arc::new).collect();
     if let Some(Loaded::Ready(it)) = apps.first().map(|a| a.current().1).as_deref() {

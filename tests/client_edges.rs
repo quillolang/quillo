@@ -326,7 +326,7 @@ fn a_page_needing_more_than_the_file_carries_its_own_runtime() {
 
 #[test]
 fn the_kept_page_lists_forget_their_roots_past_a_limit() {
-    let page = |set: &str| client::PageBundle { js: format!("// {}", set), set: vec![set.to_string()], split: false, styles: vec![], libs: vec![], hints: String::new() };
+    let page = |set: &str| client::PageBundle { js: format!("// {}", set), set: vec![set.to_string()], split: false, t_keys: None, styles: vec![], libs: vec![], hints: String::new() };
     let mut b = Bundles::default();
     let first = b.keep("r0".to_string(), page("A"));
     assert_eq!(b.len(), 1);

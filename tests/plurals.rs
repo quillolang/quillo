@@ -118,8 +118,8 @@ fn the_browsers_copy_of_a_locale_not_there_is_the_default() {
     locales.insert("en".into(), en);
     locales.insert("fr".into(), fr);
     let i18n = I18n { default: "en".into(), locales };
-    assert_eq!(i18n.browser_json("xx"), "{\"locale\":\"xx\",\"t\":{\"hi\":\"Hello \\u003c/script>\"}}");
-    assert_eq!(i18n.browser_json("fr"), "{\"locale\":\"fr\",\"t\":{\"hi\":\"Salut\"}}");
+    assert_eq!(i18n.browser_json("xx", None), "{\"locale\":\"xx\",\"t\":{\"hi\":\"Hello \\u003c/script>\"}}");
+    assert_eq!(i18n.browser_json("fr", None), "{\"locale\":\"fr\",\"t\":{\"hi\":\"Salut\"}}");
     assert_eq!(i18n.best(""), None);
     assert_eq!(i18n.best("  ").as_deref(), None);
     assert_eq!(i18n.best("FR_ca").as_deref(), Some("fr"));

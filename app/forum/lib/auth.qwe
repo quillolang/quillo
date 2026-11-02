@@ -29,7 +29,9 @@ fn is_mod(u) -> bool = u != null && (u.role == "admin" || u.role == "moderator")
 fn is_admin(u) -> bool = u != null && u.role == "admin"
 
 // Only paths on this site: "/t/4" but not "//evil.example" or "https://...".
-fn safe_next(next) -> str = type_of(next) == "str" && starts_with(next, "/") && !starts_with(next, "//") ? next : "/"
+// `local_path` reads the address as a browser does, so `/\evil.example` is no way out
+// (FEEDBACK31.md, Q-390; branch feedback27-35-fixes).
+fn safe_next(next) -> str = local_path(next) ?? "/"
 
 // For routes: who is signed in, or off to the sign-in page and back here after.
 fn signed_in(back: str) = me() ?? reply 303 redirect(`/login?next=${back}`)

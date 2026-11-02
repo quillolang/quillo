@@ -45,15 +45,63 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// A `name="value"` parameter of a Content-Disposition header.
+/// A `name="value"` parameter of a Content-Disposition header. A quoted value is read to its
+/// closing quote, so a `;` inside it stays, and the three escapes HTML's multipart encoding
+/// writes, `%22` for `"`, `%0D` and `%0A`, are undone (FEEDBACK30.md, Q-373; branch
+/// feedback27-35-fixes).
 fn param(header: &str, name: &str) -> Option<String> {
-    for p in header.split(';').skip(1) {
-        let (k, v) = p.split_once('=')?;
+    let mut rest = header.split_once(';')?.1;
+    loop {
+        let (k, after) = rest.split_once('=')?;
+        let after = after.trim_start();
+        let (v, next) = match after.strip_prefix('"') {
+            Some(q) => {
+                let mut v = String::new();
+                let mut chars = q.char_indices();
+                let mut end = q.len();
+                // No backslash escapes: browsers send `\` as it is (a Windows path), and a quote
+                // as `%22`.
+                for (i, c) in chars.by_ref() {
+                    match c {
+                        '"' => {
+                            end = i + 1;
+                            break;
+                        }
+                        c => v.push(c),
+                    }
+                }
+                let next = q[end..].split_once(';').map_or("", |(_, n)| n);
+                (v, next)
+            }
+            None => match after.split_once(';') {
+                Some((v, n)) => (v.trim().to_string(), n),
+                None => (after.trim().to_string(), ""),
+            },
+        };
         if k.trim().eq_ignore_ascii_case(name) {
-            return Some(v.trim().trim_matches('"').to_string());
+            return Some(v.replace("%22", "\"").replace("%0D", "\r").replace("%0A", "\n"));
+        }
+        if next.is_empty() {
+            return None;
+        }
+        rest = next;
+    }
+}
+
+/// A Content-Disposition that makes a browser save the answer as `name`: the name in plain
+/// ASCII for old readers, and whole in RFC 5987's form (FEEDBACK30.md; branch feedback27-35-fixes).
+pub fn attachment(name: &str) -> String {
+    let base = base_name(name);
+    let plain: String = base.chars().map(|c| if c.is_ascii_graphic() && c != '"' && c != '\\' && c != '%' || c == ' ' { c } else { '_' }).collect();
+    let mut enc = String::new();
+    for b in base.bytes() {
+        if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
+            enc.push(b as char);
+        } else {
+            enc.push_str(&format!("%{:02X}", b));
         }
     }
-    None
+    format!("attachment; filename=\"{}\"; filename*=UTF-8''{}", plain, enc)
 }
 
 /// A browser's file name without any folders it sent along.

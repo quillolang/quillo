@@ -1395,3 +1395,55 @@ fn in_development_components_come_in_files_of_their_own_mapped_to_their_lines() 
     assert_eq!(r["sourcesContent"], true);
     assert_eq!(r["text"], "count: 6");
 }
+
+/// The browser's side of FEEDBACK28 (Q-415 to Q-420), FEEDBACK30 and FEEDBACK35 (Q-428 to Q-431):
+/// each fact the same on both sides, handlers that do not pause, failed places emptied, a
+/// state that holds its prop resumed, styles from a map, ask in Spanish and files in a list
+/// (branch feedback27-35-fixes).
+#[test]
+fn the_edges_of_feedback30_hold_in_the_browser() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with_path(&chrome, &dir.join("edges30.qwe"), free_port(), "/?lang=es", Some(&dir.join("edges30.js")));
+    assert_eq!(r["errors"].as_array().map(|e| e.iter().filter(|x| !x.as_str().unwrap_or("").contains("date.format")).count()), Some(0), "{}", r);
+    assert_eq!(r["server"], r["browser"], "{}", r);
+    assert_eq!(r["server"][0], "0 mensajes", "{}", r);
+    assert_eq!(r["server"][1], "1 mensaje", "{}", r);
+    assert_eq!(r["server"][2], "1 mensaje", "{}", r);
+    assert_eq!(r["server"][3], "1.5 mensajes", "{}", r);
+    assert_eq!(r["server"][4], "1000000 de mensajes", "{}", r);
+    assert_eq!(r["keys"], "2", "{}", r);
+    assert_eq!(r["sums"], serde_json::json!(["2,4,6", "2,4,6"]), "{}", r);
+    assert_eq!(r["child"], "2026-11-01", "{}", r);
+    assert_eq!(r["rec"], "err", "{}", r);
+    assert_eq!(r["due"], "", "{}", r);
+    assert_eq!((r["copy"].as_u64(), r["copy_more"].as_u64()), (Some(20), Some(21)), "{}", r);
+    assert_eq!(r["style"], serde_json::json!(["rgb(255, 0, 0)", "20px", "3px", "rgb(0, 0, 255)"]), "{}", r);
+    assert_eq!(r["scripted"], serde_json::json!([1, "it's \"quoted\""]), "{}", r);
+    // The table's word, and the program's own translation where it has one (Q-377).
+    assert_eq!(r["ask"], serde_json::json!(["Aceptar", "Volver", "no"]), "{}", r);
+    let fails: Vec<String> = r["fails"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
+    for want in [
+        "the form is \"NFC\", \"NFD\", \"NFKC\" or \"NFKD\", got \"NFX\"",
+        "expects a form (\"NFC\", \"NFD\", \"NFKC\" or \"NFKD\") as argument 2, got int",
+        "digits are `{ min, max }`, not `most`",
+        "min 3 is more than max 1",
+        "max is an int",
+        "expects an int or `{ min, max }` as argument 3",
+        "repeated is \"earlier\" or \"later\"",
+        "skipped is \"later\", \"earlier\" or \"error\"",
+        "the options are repeated and skipped, not `when`",
+        "expects options as a map as argument 4",
+    ] {
+        assert!(fails.iter().any(|f| f.contains(want)), "{}: {:?}", want, fails);
+    }
+    assert!(r["away"].as_str().unwrap().starts_with("http: no answer from 127.0.0.1:9: it may not allow this page (CORS)"), "{}", r);
+    assert_eq!(r["pic"], "IMG", "{}", r);
+    assert_eq!(r["up"], serde_json::json!(["xray.png", ["xray.png", "notes \"v2\".txt"], ["xray.png", "notes \"v2\".txt"], "xray.png", [4, 6]]), "{}", r);
+    assert_eq!(r["tick"], serde_json::json!([true, true, true, "on", true, false, "off"]), "{}", r);
+    assert_eq!(r["field"], serde_json::json!([true, true, "ab"]), "{}", r);
+    assert_eq!(r["remade"], 0, "{}", r);
+}

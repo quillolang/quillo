@@ -18,6 +18,15 @@ fn main() {
             None => hash,
         })
     });
+    // A source archive: `git archive` wrote the commit into COMMIT (.gitattributes'
+    // export-subst), where a checkout has the placeholder (FEEDBACK31.md, Q-389; branch
+    // feedback27-35-fixes).
+    let commit = commit.or_else(|| {
+        let text = std::fs::read_to_string("COMMIT").ok()?;
+        let text = text.trim();
+        (!text.is_empty() && !text.starts_with("$Format")).then(|| text.to_string())
+    });
+    println!("cargo:rerun-if-changed=COMMIT");
     println!("cargo:rustc-env=QUILLO_COMMIT={}", commit.unwrap_or_default());
     println!("cargo:rerun-if-env-changed=QUILLO_COMMIT");
     // Built again when HEAD moves: a commit, a checkout, a pull.

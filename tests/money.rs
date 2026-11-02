@@ -119,7 +119,8 @@ fn formats_as_each_locale_writes() {
         same(&format!("money.format({})", args), &serde_json::to_string(want).unwrap());
     }
     same("[format_number(1234567.891m, \"en-IN\"), format_number(-1234.5, \"de-DE\", 2), format_number(1234, \"fr-FR\"), format_number(2.5m, \"en-US\", 0)]",
-        "[\"12,34,567.891\", \"-1.234,50\", \"1\u{202f}234\", \"2\"]");
+        // A tie rounds away from zero, as Intl does (FEEDBACK30.md, Q-369; branch feedback27-35-fixes).
+        "[\"12,34,567.891\", \"-1.234,50\", \"1\u{202f}234\", \"3\"]");
 }
 
 /// Every covered locale and common currency, as the browser's own
@@ -167,7 +168,7 @@ fn formats_as_intl_does() {
         }
     }
     let js = format!(
-        "const bad = [];\nfor (const [l, a, got] of {}) {{\n  const want = new Intl.NumberFormat(l, {{ minimumFractionDigits: 2, maximumFractionDigits: 2, roundingMode: 'halfEven', signDisplay: 'negative' }}).format(a);\n  if (want !== got) bad.push([l, a, want, got]);\n}}\nconsole.log(JSON.stringify(bad.slice(0, 20)) + ' ' + bad.length);",
+        "const bad = [];\nfor (const [l, a, got] of {}) {{\n  const want = new Intl.NumberFormat(l, {{ minimumFractionDigits: 2, maximumFractionDigits: 2, roundingMode: 'halfExpand', signDisplay: 'negative' }}).format(a);\n  if (want !== got) bad.push([l, a, want, got]);\n}}\nconsole.log(JSON.stringify(bad.slice(0, 20)) + ' ' + bad.length);",
         serde_json::to_string(&nums).unwrap()
     );
     let out = node(&js);

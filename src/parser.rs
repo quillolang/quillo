@@ -770,6 +770,29 @@ impl Parser {
                     }
                     self.restore(saved);
                 }
+                // `site shop = "https://shop.example.com"`: a deployed Quillo site, whose server
+                // fns are called as `shop.notes()` (FEEDBACK33.md, Q-412; branch
+                // feedback27-35-fixes). Two names and `=` are nothing else, so `site` stays a name.
+                "site" if top => {
+                    let saved = self.save();
+                    self.next()?;
+                    let next = self.peek()?;
+                    let same_line = self.line()? == line;
+                    let name = match next {
+                        Tok::Ident(n) if same_line && !KEYWORDS.contains(&n.as_str()) => Some(n),
+                        _ => None,
+                    };
+                    if let Some(name) = name {
+                        self.next()?;
+                        if self.at(&Tok::Assign)? {
+                            self.next()?;
+                            let url = self.parse_expr()?;
+                            let call = Expr::Call(Box::new(Expr::Ident("__site".into(), line)), vec![Expr::Lit(Lit::Str(name.as_str().into())), url], line);
+                            return Ok(Stmt::Let(Pattern::Bind(name.as_str().into()), call, line));
+                        }
+                    }
+                    self.restore(saved);
+                }
                 "service" => {
                     // `service name = "file.qwe"` or `service /prefix = "file.qwe"`;
                     // otherwise `service` is a name.
@@ -2585,7 +2608,18 @@ impl Parser {
                         dollars.push(self.lx.line);
                     }
                     push_text(&mut children, &mut text);
-                    children.push(HtmlChild::Expr(and_as_if(self.parse_braced_expr()?)));
+                    // JavaScript's own braces in a <script> are read as Quillo: said so, with what to
+                    // write (FEEDBACK35.md, Q-428; branch feedback27-35-fixes).
+                    let e = match self.parse_braced_expr() {
+                        Err(e) if tag == "script" => {
+                            return Err(QuilloError::new(
+                                format!("{} (a `{{` in a <script> starts a Quillo value: write the code as a string, <script>{{raw(CODE)}}</script>, or put it in a file of its own)", e.msg),
+                                e.line,
+                            ))
+                        }
+                        r => r?,
+                    };
+                    children.push(HtmlChild::Expr(and_as_if(e)));
                 }
                 // A line of markup starting with `//` is a comment, not
                 // text for the page (`{"//"}` writes the characters).

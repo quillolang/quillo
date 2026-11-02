@@ -34,7 +34,7 @@ pub static DEV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 
 /// Builtins that also exist in the browser.
 const CLIENT_BUILTINS: &[&str] = &[
-    "print", "str", "int", "float", "dec", "len", "type_of", "upper", "lower", "trim", "filled", "split", "join", "contains",
+    "print", "str", "int", "float", "dec", "len", "type_of", "upper", "lower", "normalize", "local_path", "trim", "filled", "split", "join", "contains",
     "starts_with", "ends_with", "replace", "slice", "map", "filter", "find", "any", "all", "reduce", "sum", "min",
     "max", "sort", "sort_by", "reverse", "first", "last", "push", "range", "enumerate", "keys", "values", "get", "has",
     "set", "remove", "merge", "err", "is_err", "error", "unwrap", "run_after", "page_updated", "js_has", "cursor_index", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
@@ -325,15 +325,16 @@ pub fn bundle_for(it: &Interp, roots: &[String], rt: Option<&RuntimeFile>) -> Re
     let styles = styles_of(it, &c);
     let libs = libs_of(it, &c);
     let hints = hint_links(it, c.globals.keys().filter_map(|k| it.js_libs.get(k)));
+    let t_keys = c.t_keys.clone().map(Arc::new);
     if c.dev {
-        return Ok(PageBundle { js: dev::bundle(it, &c, boots), set, split: false, styles, libs, hints });
+        return Ok(PageBundle { js: dev::bundle(it, &c, boots), set, split: false, styles, libs, hints, t_keys });
     }
     if let Some(rt) = rt {
         if let Some(js) = rt.wrap(&program_text(it, &c, boots, false)) {
-            return Ok(PageBundle { js, set, split: true, styles, libs, hints });
+            return Ok(PageBundle { js, set, split: true, styles, libs, hints, t_keys });
         }
     }
-    Ok(PageBundle { js: assemble("(function () {", &program_text(it, &c, boots, true), "})();"), set, split: false, styles, libs, hints })
+    Ok(PageBundle { js: assemble("(function () {", &program_text(it, &c, boots, true), "})();"), set, split: false, styles, libs, hints, t_keys })
 }
 
 pub struct PageBundle {
@@ -348,6 +349,8 @@ pub struct PageBundle {
     pub libs: Vec<String>,
     /// The `<link>`s of those named `with preload` or `with preconnect`.
     pub hints: String,
+    /// The translation keys its code can ask for (see `Compiler::t_keys`).
+    pub t_keys: Option<Arc<Vec<String>>>,
 }
 
 /// A page's bundle as the page names it.
@@ -359,6 +362,7 @@ pub struct PageRef {
     pub styles: Vec<String>,
     pub libs: Vec<String>,
     pub hints: String,
+    pub t_keys: Option<Arc<Vec<String>>>,
 }
 
 /// The runtime as a file of its own, `/_quillo/r/<hash>.js`, which every
@@ -510,7 +514,7 @@ impl Bundles {
             m.used = self.tick;
             return m.page.clone();
         }
-        let page = PageRef { hash: hash_text(&b.js), split: b.split, styles: b.styles, libs: b.libs, hints: b.hints };
+        let page = PageRef { hash: hash_text(&b.js), split: b.split, styles: b.styles, libs: b.libs, hints: b.hints, t_keys: b.t_keys };
         self.by_set.insert(set, Made { page: page.clone(), js: Arc::new(b.js), used: self.tick });
         crate::metrics::BUNDLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         while self.by_set.len() > KEPT {
@@ -1285,6 +1289,10 @@ enum Resolved {
 
 struct Compiler<'a> {
     it: &'a Interp,
+    /// The translation keys the code can ask `t` for: each written out, or the start of one
+    /// made from parts (`sec.*`); `None` when one is worked out some other way. A page then
+    /// carries only those (FEEDBACK30.md, Q-372; branch feedback27-35-fixes).
+    t_keys: Option<Vec<String>>,
     /// The lambda an `@event` or `@mount` attribute is, while it compiles (by
     /// its definition, which both of `function`'s passes see).
     handler: Option<*const FnDef>,
@@ -1831,6 +1839,7 @@ impl<'a> Compiler<'a> {
             crate::check::global_assigned(stmts, &mut assigned);
         }
         Compiler {
+            t_keys: Some(Vec::new()),
             it,
             assigned,
             private: collect_private(&it.program),
@@ -2868,7 +2877,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn iife(&mut self, body: &str) -> String {
-        if self.ctx().is_async {
+        // An async function always yields to whoever waits for it, and the page updates there:
+        // a block is one only when something in it waits (FEEDBACK28.md, Q-415; branch
+        // feedback27-35-fixes).
+        if self.ctx().is_async && body.contains("await") {
             format!("(await (async () => {{\n{}}})())", body)
         } else {
             format!("(() => {{\n{}}})()", body)
@@ -3265,20 +3277,40 @@ impl<'a> Compiler<'a> {
     }
 
     /// The function value an expression names, and whether calling it waits.
-    fn callee_value(&mut self, e: &Expr) -> Result<(String, bool), QuilloError> {
+    /// The function `e` names, whether it waits, and whether that is known: a function of the
+    /// component's or of the program's is compiled here, so it is; a prop or a value is not.
+    fn callee_value(&mut self, e: &Expr) -> Result<(String, bool, bool), QuilloError> {
         if let Expr::Ident(n, line) = e {
             self.line = *line;
             return Ok(match self.resolve(n)? {
-                Resolved::Local(js, f) => (js, f.unwrap_or(false)),
-                Resolved::State(js) | Resolved::Reactive(js) => (format!("{}.v", js), false),
-                Resolved::Prop(n) => (format!("$p.{}", n), false),
-                Resolved::Global(js, a) => (js, a),
+                Resolved::Local(js, f) => (js, f.unwrap_or(false), f.is_some()),
+                Resolved::State(js) | Resolved::Reactive(js) => (format!("{}.v", js), false, false),
+                Resolved::Prop(n) => (format!("$p.{}", n), false, false),
+                Resolved::Global(js, a) => {
+                    let known = js.starts_with("G[");
+                    (js, a, known)
+                }
             });
         }
-        Ok((self.expr(e)?, false))
+        Ok((self.expr(e)?, false, false))
     }
 
     fn call(&mut self, callee: &Expr, args: &[Expr], pre: Option<String>) -> Result<String, QuilloError> {
+        if matches!(callee, Expr::Ident(n, _) if (n == "t" || n == "t_html") && lookup(&self.it.globals, n).is_some_and(|v| matches!(v, Value::Builtin(..)))) {
+            let key = match args.first() {
+                Some(Expr::Lit(Lit::Str(k))) => Some(k.to_string()),
+                Some(Expr::Template(parts)) => match parts.first() {
+                    Some(TPart::Lit(start)) if !start.is_empty() => Some(format!("{}*", start)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match (key, self.t_keys.as_mut()) {
+                (Some(k), Some(keys)) => keys.push(k),
+                (None, _) => self.t_keys = None,
+                _ => {}
+            }
+        }
         if let Some(path) = self.lib_path(callee)? {
             return self.lib_call(&path, args, pre);
         }
@@ -3298,8 +3330,19 @@ impl<'a> Compiler<'a> {
             if recv == "B.http" {
                 return self.http_call(name, argv);
             }
-            let is_async = self.is_async_name(name);
+            // A module's function (`date.valid`, `re.replace`) gives no Promise and is never the
+            // component's own: nothing waits (FEEDBACK28.md, Q-415 and Q-417; branch
+            // feedback27-35-fixes).
+            let module = recv.starts_with("B.") && !recv.starts_with("B.js_value");
+            let waits_here = self.ctx().waits_js || self.ctx().state_init;
+            // The component's own function of that name is only what a value without the method
+            // falls back to: outside code that waits it is not waited for, so a function given to
+            // the page, a Promise's executor, stays one that can throw (Q-420).
+            let is_async = !module && (waits_here || self.ctx().component.is_some()) && self.is_async_name(name);
             let call = format!("W.mcall({}, {}, {}, [{}])", recv, js_str(name), fb, argv.join(", "));
+            if module {
+                return self.finish_call(name, false, call);
+            }
             // One rule for what waits: a call of the page's that gives a Promise, as
             // `img.decode()` and `audio.play()` do, is waited for where code can wait, as
             // `js(...)` is; `.then`, `.catch` and `.finally` keep it (FEEDBACK28.md, Q-336;
@@ -3335,7 +3378,7 @@ impl<'a> Compiler<'a> {
                 return self.err(format!("`waiting` takes a component's live state by its name (`state {} = live(...)`)", var));
             }
         }
-        let (f, is_async) = self.callee_value(callee)?;
+        let (f, is_async, known) = self.callee_value(callee)?;
         // The component's own functions, the program's and url() may read
         // what changes: what calls them follows it.
         if matches!(callee, Expr::Ident(..)) && (self.last_here || f.starts_with("G[") || f == "B.url") {
@@ -3373,7 +3416,8 @@ impl<'a> Compiler<'a> {
         }
         // A function given as a prop may wait, or not: its Promise is waited for as a
         // `server fn`'s is (FEEDBACK28.md, Q-335; branch feedback29-fixes).
-        if !is_async && !self.keep_promise && self.ctx().waits_js && !f.starts_with("B.") {
+        // Not one compiled here, known to give no Promise (Q-416).
+        if !is_async && !known && !self.keep_promise && self.ctx().waits_js && !f.starts_with("B.") {
             return self.finish_wait(&name, call);
         }
         self.finish_call(&name, is_async, call)
@@ -3817,7 +3861,7 @@ impl<'a> Compiler<'a> {
     /// getters where they read what changes, and its children as markup.
     fn comp_call(&mut self, el: &HtmlEl) -> Result<String, QuilloError> {
         self.line = el.line;
-        let (f, _) = self.callee_value(&Expr::Ident(el.tag.clone().into(), el.line))?;
+        let (f, _, _) = self.callee_value(&Expr::Ident(el.tag.clone().into(), el.line))?;
         if f.starts_with("G[") && matches!(lookup(&self.it.globals, &el.tag), Some(Value::Func(c)) if !c.def.component && !c.def.server) {
             self.need_view(&el.tag)?;
         }
@@ -4066,6 +4110,8 @@ impl<'a> Compiler<'a> {
                 return self.err("a component's <script> takes only text written in the program; pass data in a `data-` attribute, or use a view");
             }
             match c {
+                // As the server writes it (FEEDBACK35.md, Q-428; branch feedback27-35-fixes).
+                HtmlChild::Expr(Expr::Lit(Lit::Str(s))) if el.tag == "script" => kids.push(js_str(&crate::interp::script_text(s))),
                 HtmlChild::Expr(Expr::Lit(Lit::Str(s))) => kids.push(js_str(s)),
                 HtmlChild::El(e) if inlineable(e) => kids.push(self.tpl_el(e, vals)?),
                 HtmlChild::El(e) => {

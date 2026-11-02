@@ -123,7 +123,8 @@ fn pay(id, n) = db.atomic([users.on(id), ledger], () => {
 Part of an app can run in the same process or as a server of its own without its code
 changing. Calls between them are retried without running twice, spread over several
 addresses, kept away from one that is failing, traced by one request id, or made later
-in the background until they get through.
+in the background until they get through. A program is described as OpenAPI for a
+gateway (`quillo docs`), and a service is given more copies while it runs (`--join`).
 
 ```quillo
 service billing = "billing.qwe" { timeout: "2s", retries: 2 }
@@ -207,7 +208,16 @@ interpreter's exact answers and errors.
 
 Each [release](https://github.com/quillolang/quillo/releases) has `quillo` built for
 Linux (x86-64 and ARM), macOS (Apple silicon and Intel) and Windows: unpack it and put
-`quillo` on your `PATH`. A `.sha256` beside each archive checks the download.
+`quillo` on your `PATH`. A `.sha256` beside each archive checks the download. The Linux
+builds need glibc 2.34 or later (Ubuntu 22.04, Debian 12, RHEL 9 or newer); on an older
+system, build from source.
+
+Start a program of your own with `quillo new`:
+
+```sh
+quillo new hello                  # the to-do app; --minimal for a page, a component and a function
+cd hello && quillo run --watch    # http://127.0.0.1:8080
+```
 
 To build it yourself: Quillo builds with a stable Rust toolchain, 1.94 or later ([rustup](https://rustup.rs)),
 and a C compiler ([what to install](https://quillolang.org/docs/install/) on macOS, Linux and
@@ -227,7 +237,8 @@ On Windows, in PowerShell, the check is `scripts\doctor.ps1`:
 powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Build
 ```
 
-Run the sample app in [`app/`](app), then check it without running it:
+In a clone, run the sample app in [`app/`](app), the program `quillo new` writes, then
+check it without running it:
 
 ```sh
 ./target/release/quillo run app/main.qwe --watch   # http://127.0.0.1:8080
@@ -300,6 +311,17 @@ requests are welcome. Before sending a change:
 cargo test
 for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; done
 ```
+
+### Test coverage
+
+**98.44% of lines** of the Rust source run under the tests (44,408 lines, 693 not run),
+measured on 2026-11-02 on branch `feedback27-35-fixes` (23146e4 and its changes) with
+`cargo llvm-cov` on macOS: the Lines column of the report's total, from 2,191 tests,
+Chrome, PostgreSQL and MariaDB included. Every line the FEEDBACK27 to 35 fixes added or
+changed is run. The browser runtime (`src/client/runtime.js`) is JavaScript and not in
+this number; its changes are run by the browser tests in [`tests/browser/`](tests/browser).
+What is not run is mostly `unreachable!` arms, failures of the operating system, and
+other systems' branches.
 
 ## Acknowledgements
 

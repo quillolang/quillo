@@ -14,7 +14,15 @@ use std::path::Path;
 
 /// The files to apply, in order: name and text.
 fn files(dir: &Path) -> Result<Vec<(String, String)>, String> {
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {}", dir.display(), e))?;
+    // A folder that is not there may be one git did not keep, as it keeps no empty folder: said,
+    // with what to do (FEEDBACK34.md, Q-423; branch feedback27-35-fixes).
+    let entries = std::fs::read_dir(dir).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "cannot read {}: there is no such folder (git keeps no empty folder: put the first migration in it, or a .gitkeep, which is not read)",
+            dir.display()
+        ),
+        _ => format!("cannot read {}: {}", dir.display(), e),
+    })?;
     let mut out = Vec::new();
     for e in entries.flatten() {
         let path = e.path();

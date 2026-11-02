@@ -38,13 +38,14 @@ import org.json.JSONObject
 class Bridge(private val activity: MainActivity, private val web: WebView) {
     private var attached = false
 
-    /** Puts the bridge on the pages of [origin] (http://127.0.0.1:port). */
-    fun attach(origin: String) {
+    /** Puts the bridge on the pages of [origins]: http://127.0.0.1:port, and app.toml's `site`
+     *  when there is one (FEEDBACK33.md, Q-410; branch feedback27-35-fixes). */
+    fun attach(origins: Set<String>) {
         if (attached) return
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER) ||
             !WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return
         attached = true
-        val only = setOf(origin)
+        val only = origins
         WebViewCompat.addWebMessageListener(web, "quilloAndroid", only) { _, msg, _, isMainFrame, reply ->
             if (isMainFrame) onMessage(msg, reply)
         }

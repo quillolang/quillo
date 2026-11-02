@@ -71,6 +71,17 @@ pub fn fail<T>(line: u32, msg: impl Into<String>) -> Result<T, Ctrl> {
     Err(Ctrl::Error(Box::new(QuilloError::new(msg, line))))
 }
 
+/// Whether a builtin's refusal is of an error value it was given.
+fn refused_an_error(msg: &str) -> bool {
+    msg.contains("got error") || msg.contains("convert error") || msg.contains("got an error")
+}
+
+/// What an error given to a builtin was: `it failed before: read_file: cannot read x.json`.
+fn earlier((inner, at): &(Arc<Value>, Place)) -> String {
+    let text = crate::value::told(|| inner.display());
+    format!("it failed before this call, {}", at.before(&text))
+}
+
 fn undefined(name: &str, line: u32) -> Ctrl {
     Ctrl::Error(Box::new(QuilloError::new(format!("unknown name `{}`{}", name, crate::error::removed_note(name)), line)))
 }
@@ -98,6 +109,8 @@ pub struct Interp {
     /// with its own (`--watch`), but not its own, so a file both `use`
     /// is still run here (FEEDBACK4.md, Q-040; branch bank-fixes).
     pub(crate) watched: Arc<HashSet<PathBuf>>,
+    /// The program's files as written, where a link is on their way (see `note_link`).
+    pub(crate) via_links: Arc<HashSet<PathBuf>>,
     pub shared: Arc<Shared>,
     /// The services this version of the program loaded (see `shared::Services`).
     pub(crate) services: Arc<crate::shared::Services>,
@@ -140,6 +153,9 @@ pub struct Interp {
     pub set_cookies: Vec<String>,
     /// The request's session, once read or set.
     pub session: Option<Value>,
+    /// The answer read who the visitor is, from a cookie: one visitor's, for caches to keep
+    /// apart (FEEDBACK31.md, Q-391; branch feedback27-35-fixes).
+    pub visitor_read: bool,
     /// The locale the code runs in, once worked out (see `i18n`).
     pub locale: Option<Arc<str>>,
     /// Every statement the program has loaded, for the browser compiler.
@@ -185,6 +201,10 @@ pub struct Interp {
     /// Open SQLite transactions. SQLite has one connection, shared by every
     /// request, so while one is open the lock is kept (see `unlocked`).
     pub sqlite_tx: usize,
+    /// Transactions running here that take an error a statement drops: the first such
+    /// error, which rolls the innermost back (FEEDBACK27.md, Q-332; branch feedback27-35-fixes).
+    pub catching_drops: usize,
+    pub dropped: Option<Value>,
     /// The Postgres connection this request's `db.transaction` holds.
     pub pg_tx: std::sync::Mutex<Vec<crate::db::TxConn>>,
     /// This program's database (SQLite or a Postgres pool), opened on first use.
@@ -220,6 +240,9 @@ pub struct Interp {
     /// Services with a prefix that run elsewhere: their routes are passed
     /// on to them (`service /shop = "shop.qwe"`, src/service.rs).
     pub remote_mounts: Vec<(String, String)>,
+    /// The files of those services, for the program's API to describe their routes
+    /// (FEEDBACK32.md, Q-397; branch feedback27-35-fixes).
+    pub remote_sources: Vec<(String, PathBuf)>,
     /// Loaded as a service (src/service.rs): its server fns are called by
     /// other services, signed, never by browsers (`/_quillo/rpc`).
     pub is_service: bool,
@@ -667,6 +690,46 @@ fn render_value(v: &Value, out: &mut String) {
 }
 
 /// A value placed in a `<script>` (see `render_tag_into`).
+/// A map of CSS properties as a `style` attribute's text: `fontSize` and `font_size` are
+/// `font-size`, a custom property (`--gap`) stays, and a null or false value is left out.
+pub fn style_text(m: &Map) -> String {
+    let mut out = String::new();
+    for (k, v) in m.iter() {
+        if matches!(v, Value::Nil | Value::Bool(false)) {
+            continue;
+        }
+        let name: String = if k.starts_with("--") {
+            k.to_string()
+        } else {
+            let mut n = String::new();
+            for c in k.chars() {
+                match c {
+                    '_' => n.push('-'),
+                    c if c.is_ascii_uppercase() => {
+                        n.push('-');
+                        n.push(c.to_ascii_lowercase());
+                    }
+                    c => n.push(c),
+                }
+            }
+            n
+        };
+        if !out.is_empty() {
+            out.push_str("; ");
+        }
+        out.push_str(&name);
+        out.push_str(": ");
+        out.push_str(&v.display());
+    }
+    out
+}
+
+/// A `<script>`'s own text as the page carries it: as written, but that `</` and `<!--` cannot
+/// end it early (FEEDBACK35.md, Q-428; branch feedback27-35-fixes).
+pub fn script_text(s: &str) -> String {
+    s.replace("</", "<\\/").replace("<!--", "<\\!--")
+}
+
 fn script_value(v: &Value, out: &mut String) {
     match v {
         Value::Nil | Value::Bool(false) => {}
@@ -860,7 +923,7 @@ pub(crate) fn same_expr(a: &Expr, b: &Expr) -> bool {
 }
 
 /// Builtins that only compute from what they are given: called twice, the same.
-const PURE: &[&str] = &["str", "int", "float", "lower", "upper", "trim", "len", "abs", "round", "floor", "ceil"];
+const PURE: &[&str] = &["str", "int", "float", "lower", "normalize", "upper", "trim", "len", "abs", "round", "floor", "ceil"];
 
 /// `quiet`, or calls of those builtins, as they are in `env`: `set(m, str(i % 10), get(m,
 /// str(i % 10), []) | push(i))` works its key out once, where it is written twice, and that
@@ -1085,6 +1148,7 @@ impl Interp {
             loaded: Arc::new(HashSet::new()),
             links: Default::default(),
             watched: Arc::new(HashSet::new()),
+            via_links: Arc::new(HashSet::new()),
             shared,
             services: Default::default(),
             depth: 0,
@@ -1104,6 +1168,7 @@ impl Interp {
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
+            visitor_read: false,
             locale: None,
             program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
@@ -1124,6 +1189,8 @@ impl Interp {
             pending_raw: Vec::new(),
             published: None,
             sqlite_tx: 0,
+            catching_drops: 0,
+            dropped: None,
             db: Arc::new(std::sync::Mutex::new(None)),
             db_conns: Arc::new(std::sync::Mutex::new(Vec::new())),
             db_on: None,
@@ -1135,6 +1202,7 @@ impl Interp {
             base: String::new(),
             mounts: Vec::new(),
             remote_mounts: Vec::new(),
+            remote_sources: Vec::new(),
             is_service: false,
             retired: Default::default(),
             own_seqs: Vec::new(),
@@ -1177,6 +1245,7 @@ impl Interp {
             loaded: self.loaded.clone(),
             links: self.links.clone(),
             watched: self.watched.clone(),
+            via_links: self.via_links.clone(),
             shared: self.shared.clone(),
             services: self.services.clone(),
             depth: 0,
@@ -1196,6 +1265,7 @@ impl Interp {
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
+            visitor_read: false,
             locale: None,
             program: self.program.clone(),
             client_js: self.client_js.clone(),
@@ -1216,6 +1286,8 @@ impl Interp {
             pending_raw: Vec::new(),
             published: None,
             sqlite_tx: 0,
+            catching_drops: 0,
+            dropped: None,
             db: self.db.clone(),
             db_conns: self.db_conns.clone(),
             db_on: None,
@@ -1227,6 +1299,7 @@ impl Interp {
             base: self.base.clone(),
             mounts: self.mounts.iter().map(|(p, m)| (p.clone(), m.fork())).collect(),
             remote_mounts: self.remote_mounts.clone(),
+            remote_sources: self.remote_sources.clone(),
             is_service: self.is_service,
             retired: self.retired.clone(),
             own_seqs: Vec::new(),
@@ -1262,7 +1335,17 @@ impl Interp {
     /// The source files this program has loaded (the main file and `use`d
     /// files), and those of the programs it mounts or calls as services.
     pub fn files(&self) -> Vec<PathBuf> {
-        self.loaded.iter().chain(self.watched.iter()).cloned().collect()
+        self.loaded.iter().chain(self.watched.iter()).chain(self.via_links.iter()).cloned().collect()
+    }
+
+    /// A file reached through a symbolic link, of its own or of a folder on its way, is watched
+    /// by that way too, so a link pointed elsewhere (`ln -sfn`, a `current` release) is seen
+    /// (FEEDBACK31.md, Q-383; branch feedback27-35-fixes).
+    fn note_link(&mut self, path: &Path) {
+        let abs = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir().map(|d| d.join(path)).unwrap_or_else(|_| path.to_path_buf()) };
+        if abs.ancestors().any(|a| a.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink())) {
+            Arc::make_mut(&mut self.via_links).insert(abs);
+        }
     }
 
     /// Announces changes to `topics`, after the current transaction commits.
@@ -1588,7 +1671,7 @@ impl Interp {
         // What each file sees, before any of them runs (src/modules.rs).
         if stmts.iter().any(|s| matches!(s, Stmt::Use(p, ..) if !crate::ast::is_script(p))) {
             let links = crate::modules::link(Path::new(file), stmts.clone(), &self.base_dir, &mut |_, full| {
-                let src = std::fs::read_to_string(full).ok()?;
+                let src = crate::error::read_source(full).ok()?;
                 parse_cached(&src, source_path(full), &full.display().to_string(), None).ok()
             });
             if let Some(p) = links.problems.first() {
@@ -1618,6 +1701,15 @@ impl Interp {
     }
 
     fn load_stmts(&mut self, stmts: &[Stmt], env: &Env, file: &str, last: &mut Value) -> Result<(), QuilloError> {
+        // Top-level code is in its file, so an error it makes or drops names it (FEEDBACK27.md,
+        // Q-332 and Q-333; branch feedback27-35-fixes).
+        let was = self.cur_file.replace(Arc::from(file));
+        let r = self.load_stmts_in(stmts, env, file, last);
+        self.cur_file = was;
+        r
+    }
+
+    fn load_stmts_in(&mut self, stmts: &[Stmt], env: &Env, file: &str, last: &mut Value) -> Result<(), QuilloError> {
         let n = stmts.len();
         for (i, s) in stmts.iter().enumerate() {
             // What gives a value no one takes: a loop in it makes no list. The last statement
@@ -1731,11 +1823,12 @@ impl Interp {
     }
 
     pub fn load_file(&mut self, path: &Path) -> Result<Value, QuilloError> {
-        let src = std::fs::read_to_string(path)
+        let src = crate::error::read_source(path)
             .map_err(|e| QuilloError::new(format!("cannot read {}: {}", path.display(), e), 0))?;
         if let Ok(p) = path.canonicalize() {
             Arc::make_mut(&mut self.loaded).insert(p);
         }
+        self.note_link(path);
         // Nothing asks a program run from its file for its value.
         let keep = std::mem::replace(&mut self.keep_last, false);
         let r = self.load_source(&src, &path.display().to_string());
@@ -1816,9 +1909,11 @@ impl Interp {
                 Ok(Value::Nil)
             }
             Stmt::Use(path, names, line, _) => {
-                let path = &crate::modules::resolve(&self.base_dir, path);
+                let from = self.cur_file.as_deref().map_or_else(|| self.base_dir.join("main.qwe"), PathBuf::from);
+                let path = &crate::modules::resolve_from(&self.base_dir, &from, path);
                 let full = self.base_dir.join(path);
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
+                self.note_link(&full);
                 // A `.qwer` file's names are defined for each `use` that takes some
                 // (its library is built and opened once); anything else runs once.
                 if !Arc::make_mut(&mut self.loaded).insert(key.clone()) && (names.is_none() || !path.ends_with(".qwer")) {
@@ -1832,7 +1927,7 @@ impl Interp {
                         other => other.map(|_| Value::Nil),
                     };
                 }
-                let src = std::fs::read_to_string(&full)
+                let src = crate::error::read_source(&full)
                     .map_err(|e| QuilloError::new(format!("cannot read {}: {}", full.display(), e), *line))?;
                 let fname = full.display().to_string();
                 let abs = source_path(&full);
@@ -1846,6 +1941,9 @@ impl Interp {
                     crate::debug::enter(self, path, abs, 1);
                 }
                 let mut r = Ok(Value::Nil);
+                // Its statements are in its file: a `use ./x.qwe` in it counts from there
+                // (FEEDBACK25.md, Q-325; branch feedback27-35-fixes).
+                let was_file = self.cur_file.replace(Arc::from(fname.as_str()));
                 for s in stmts.iter() {
                     // A used file's statements give nothing to anyone.
                     let ran = match s {
@@ -1874,6 +1972,7 @@ impl Interp {
                         }
                     }
                 }
+                self.cur_file = was_file;
                 if debugging {
                     crate::debug::leave(self);
                 }
@@ -2316,7 +2415,34 @@ impl Interp {
                 Ok(Value::Nil)
             }
             Expr::Block(stmts) => self.eval_block(stmts, env, false),
-            e => self.eval(e, env),
+            e => {
+                let v = self.eval(e, env)?;
+                if let Value::Err(..) = v {
+                    self.dropped_error(&v, crate::debug::expr_line(e));
+                }
+                Ok(v)
+            }
+        }
+    }
+
+    /// An error a statement gave and no one took: inside a transaction, it rolls that back and
+    /// is its value; anywhere else it goes to the log, with its place and the request, so a
+    /// failed write is not silent (FEEDBACK27.md, Q-332; branch feedback27-35-fixes). `let _ =`
+    /// takes a value, so it is the way to say an error is not wanted.
+    #[cold]
+    #[inline(never)]
+    fn dropped_error(&mut self, v: &Value, line: u32) {
+        if self.catching_drops > 0 {
+            if self.dropped.is_none() {
+                self.dropped = Some(v.clone());
+            }
+            return;
+        }
+        if let Value::Err(e, _, at) = v {
+            let text = crate::value::told(|| e.display());
+            let here = Place::new(self.cur_file.as_ref(), line);
+            let made = if at.to_string().is_empty() || at.to_string() == here.to_string() { String::new() } else { format!(", made at {}", at) };
+            crate::httpd::error_line(&here.before(&format!("an error no statement took{}: {} (pass it on with `?`, give a value with `??`, or take it with `let _ =`)", made, text)));
         }
     }
 
@@ -2933,8 +3059,16 @@ impl Interp {
                 }
                 _ => None,
             };
+            // `shop.notes()` on a `site`: the site's server fn of that name (FEEDBACK33.md,
+            // Q-412; branch feedback27-35-fixes).
+            let site = matches!(&recv, Value::Map(m) if m.contains_key("$site")) && method.is_none();
             match method {
                 Some(f) => f,
+                None if site => {
+                    argv.push(recv);
+                    argv.push(Value::str(name.as_str()));
+                    Value::Builtin("__site_call", crate::sites::call)
+                }
                 None => match lookup(env, name).filter(|f| matches!(f, Value::Func(_) | Value::Builtin(..))) {
                     Some(f) => {
                         argv.push(recv);
@@ -3057,11 +3191,34 @@ impl Interp {
                 if self.fuel != u64::MAX {
                     return self.script_builtin(name, *func, args, line);
                 }
-                match func(self, args, line) {
-                    // All an error value is made by: `err` and the builtins that fail
-                    // (FEEDBACK21.md, Q-174; branch feedback20-fixes).
+                // An error given to a builtin that cannot take one: what it was is said, as
+                // the builtin's own refusal names only its type (FEEDBACK27.md, Q-333; branch
+                // feedback27-35-fixes).
+                let given = args.iter().find_map(|a| if let Value::Err(e, _, at) = a { Some((e.clone(), *at)) } else { None });
+                // The usual call, given no error, takes the path it always took.
+                let Some(given) = given else {
+                    return match func(self, args, line) {
+                        // All an error value is made by: `err` and the builtins that fail
+                        // (FEEDBACK21.md, Q-174; branch feedback20-fixes).
+                        Ok(Value::Err(e, own, Place::NONE)) => Ok(Value::Err(e, own, Place::new(self.cur_file.as_ref(), line))),
+                        r => r,
+                    };
+                };
+                let given = Some(given);
+                let r = match func(self, args, line) {
                     Ok(Value::Err(e, own, Place::NONE)) => Ok(Value::Err(e, own, Place::new(self.cur_file.as_ref(), line))),
                     r => r,
+                };
+                match (given, r) {
+                    (Some(g), Err(Ctrl::Error(mut e))) if refused_an_error(&e.msg) => {
+                        e.msg = format!("{} ({})", e.msg, earlier(&g));
+                        Err(Ctrl::Error(e))
+                    }
+                    (Some(g), Ok(Value::Err(e, own, at))) if matches!(&*e, Value::Str(m) if refused_an_error(m)) => {
+                        let m = format!("{} ({})", e.display(), earlier(&g));
+                        Ok(Value::Err(Arc::new(Value::str(m)), own, at))
+                    }
+                    (_, r) => r,
                 }
             }
             Value::Func(c) => {
@@ -3894,7 +4051,10 @@ impl Interp {
             None if el.tag == "script" => {
                 for c in &el.children {
                     match c {
-                        HtmlChild::Expr(e) if !matches!(e, Expr::Lit(Lit::Str(_))) => {
+                        // Its own text is code, which the browser does not unescape: written as it
+                        // is, but for `</` and `<!--` (FEEDBACK35.md, Q-428; branch feedback27-35-fixes).
+                        HtmlChild::Expr(Expr::Lit(Lit::Str(s))) => out.push_str(&script_text(s)),
+                        HtmlChild::Expr(e) => {
                             let v = self.eval(e, env)?;
                             script_value(&v, out);
                         }
@@ -4126,6 +4286,12 @@ impl Interp {
     /// URLs that would run script are blocked; site paths get the mount's
     /// prefix.
     fn write_attr(&self, tag: &str, name: &str, v: Value, out: &mut String) {
+        // `style={{ color: c, font_size: "2rem" }}`, React's way: a property for each key, `_` and
+        // camelCase written as `-` (FEEDBACK35.md, Q-429; branch feedback27-35-fixes).
+        let v = match (&v, name) {
+            (Value::Map(m), "style") => Value::str(style_text(m)),
+            _ => v,
+        };
         let v = match (&v, name) {
             _ if url_attr(name) && shows_script_url(&v) => Value::str(BLOCKED_URL),
             _ if anim_value_attr(tag, name) && shows_script_url_in_list(&v) => Value::str(BLOCKED_URL),
@@ -4309,7 +4475,24 @@ impl Interp {
     /// A component's island: its HTML in a `<quillo-island>` carrying its props and
     /// state (or, inside a table or a select, its own root element carrying them).
     #[allow(clippy::too_many_arguments)]
-    fn island_wrap(&self, tag: &str, props: Map, state: Map, live: Map, eager: bool, extra: &str, body: &str, out: &mut String) {
+    fn island_wrap(&self, tag: &str, props: Map, mut state: Map, live: Map, eager: bool, extra: &str, body: &str, out: &mut String) {
+        // A state that still holds its very prop, as `state items = initial` does, is written as
+        // a reference to it, not as a second copy of the list (FEEDBACK30.md, Q-371; branch
+        // feedback27-35-fixes).
+        for (k, v) in state.iter_mut() {
+            let same = |p: &Value| match (p, &*v) {
+                (Value::List(a), Value::List(b)) => Arc::ptr_eq(a, b) && !a.is_empty(),
+                (Value::Map(a), Value::Map(b)) => Arc::ptr_eq(a, b) && !a.is_empty(),
+                (Value::Str(a), Value::Str(b)) => Arc::ptr_eq(a, b) && a.len() > 64,
+                _ => false,
+            };
+            if let Some((name, _)) = props.iter().find(|(_, p)| same(p)) {
+                let mut m = Map::new();
+                m.insert("$quillo_prop".into(), Value::str(&**name));
+                let _ = k;
+                *v = Value::map(m);
+            }
+        }
         let live_attrs = if live.is_empty() {
             String::new()
         } else {

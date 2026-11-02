@@ -234,9 +234,22 @@ pub fn format_amount(d: Dec, code: &str, places: u32, loc_name: &str) -> String 
 
 /// `format_number(x, locale, digits)`: a number as `locale` writes one.
 pub fn format_number(d: Dec, places: Option<u32>, loc_name: &str) -> String {
+    format_number_between(d, places.map(|p| (p, p)), loc_name)
+}
+
+/// `format_number` with at least `min` and at most `max` digits after the point. A tie is
+/// rounded away from zero, from the number's shortest decimal, as `Intl.NumberFormat` and
+/// `round` do (FEEDBACK30.md, Q-369; branch feedback27-35-fixes).
+pub fn format_number_between(d: Dec, places: Option<(u32, u32)>, loc_name: &str) -> String {
     let loc = locale_data(loc_name);
     let d = match places {
-        Some(p) => d.round(p as i32, Rounding::HalfEven).unwrap_or(d),
+        Some((min, max)) => {
+            let mut r = d.round(max as i32, Rounding::HalfUp).unwrap_or(d);
+            while r.scale() > min && r.mantissa() % 10 == 0 {
+                r = Dec::new(r.mantissa() / 10, r.scale() - 1).unwrap_or(r);
+            }
+            r
+        }
         None => d,
     };
     let sign = if d.is_negative() { loc.minus } else { "" };
@@ -555,12 +568,34 @@ pub fn format_number_fn(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         other => return fail(line, format!("`{}` expects a number as argument 1, got {}", F, tn(other))),
     };
     let loc = locale_arg(it, &args, 1, F, line)?;
+    // Digits after the point: exactly `n`, or `{ min, max }` as `Intl` takes them, so 10 and
+    // 8.875 come from one call (FEEDBACK30.md; branch feedback27-35-fixes).
     let places = match args.get(2) {
         None | Some(Value::Nil) => None,
-        Some(Value::Int(n)) => Some((*n).clamp(0, 28) as u32),
-        other => return fail(line, format!("`{}` expects an int as argument 3, got {}", F, tn(other))),
+        Some(Value::Int(n)) => Some(((*n).clamp(0, 28) as u32, (*n).clamp(0, 28) as u32)),
+        Some(Value::Map(m)) => {
+            if let Some(k) = m.keys().find(|k| !matches!(&***k, "min" | "max")) {
+                return fail(line, format!("`{}`'s digits are `{{ min, max }}`, not `{}`", F, k));
+            }
+            let get = |k: &str| match m.get(k) {
+                None | Some(Value::Nil) => Ok(None),
+                Some(Value::Int(n)) => Ok(Some((*n).clamp(0, 28) as u32)),
+                Some(other) => Err(format!("`{}`'s {} is an int, got {}", F, k, tn(Some(other)))),
+            };
+            let (min, max) = match (get("min"), get("max")) {
+                (Ok(a), Ok(b)) => (a, b),
+                (Err(e), _) | (_, Err(e)) => return fail(line, e),
+            };
+            let min = min.unwrap_or(0);
+            let max = max.unwrap_or(min.max(3));
+            if min > max {
+                return fail(line, format!("`{}`: min {} is more than max {}", F, min, max));
+            }
+            Some((min, max))
+        }
+        other => return fail(line, format!("`{}` expects an int or `{{ min, max }}` as argument 3, got {}", F, tn(other))),
     };
-    Ok(Value::str(format_number(d, places, &loc)))
+    Ok(Value::str(format_number_between(d, places, &loc)))
 }
 
 #[cfg(test)]

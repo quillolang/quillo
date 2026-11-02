@@ -25,7 +25,9 @@ fn acting_client() with http = client() ?? err("Sign in first")
 
 fn acting_staff() with db = staff() ?? err("Staff only: sign in first")
 
-fn safe_next(next) -> str = type_of(next) == "str" && starts_with(next, "/") && !starts_with(next, "//") ? next : "/"
+// `local_path` reads the address as a browser does, so `/\evil.example` is no way out
+// (FEEDBACK31.md, Q-390; branch feedback27-35-fixes).
+fn safe_next(next) -> str = local_path(next) ?? "/"
 
 fn client_sign_in(number: str, pin: str) ! str with http {
     let c = customers.sign_in(trim(number), trim(pin))?

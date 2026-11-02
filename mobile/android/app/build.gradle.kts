@@ -27,6 +27,8 @@ android {
         resValue("string", "app_name", env("QUILLO_APP_NAME", "Quillo"))
         // The file the program starts from (FEEDBACK20.md, Q-169; branch feedback20-fixes).
         resValue("string", "quillo_main", env("QUILLO_APP_MAIN", "main.qwe"))
+        // FEEDBACK33.md, Q-410; branch feedback27-35-fixes.
+        resValue("string", "quillo_site", env("QUILLO_APP_SITE", ""))
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
     signingConfigs {
@@ -53,7 +55,13 @@ android {
     }
     buildFeatures { resValues = true }
     // The program's files are served as they are: keep them uncompressed and whole.
-    androidResources { noCompress += listOf("qwe", "db") }
+    // Gradle's own pattern leaves out every dotfile and every folder starting with `_`, so a
+    // program's `_lib/` would be missing on Android alone: what goes in is app-config.sh's to say
+    // (FEEDBACK33.md, Q-408; branch feedback27-35-fixes).
+    androidResources {
+        noCompress += listOf("qwe", "db")
+        ignoreAssetsPattern = "!.svn:!.git:!.ds_store:!*.scc:!CVS:!thumbs.db:!picasa.ini:!*~"
+    }
 }
 
 kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) } }

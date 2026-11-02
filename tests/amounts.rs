@@ -147,7 +147,7 @@ fn formatting_takes_the_locale_or_the_programs() {
     fails("format_number(1, 5)", "`format_number` expects a locale (a str) as argument 2, got int 5");
     fails("format_number(\"x\")", "`format_number` expects a number as argument 1, got str \"x\"");
     fails("format_number()", "`format_number` expects a number as argument 1, got nothing");
-    fails("format_number(1, \"en-US\", \"x\")", "`format_number` expects an int as argument 3, got str \"x\"");
+    fails("format_number(1, \"en-US\", \"x\")", "`format_number` expects an int or `{ min, max }` as argument 3, got str \"x\"");
 }
 
 #[test]

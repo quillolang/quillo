@@ -545,11 +545,12 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("int", "any", "int | error(str)"),
     ("float", "any", "float | error(str)"),
     ("dec", "any", "dec | error(str)"),
-    ("format_number", "num | dec, str | null=, int=", "str"),
+    ("format_number", "num | dec, str | null=, int | map | null=", "str"),
     ("len", "str | list | map | html | null", "int"),
     ("type_of", "any", "str"),
     ("upper", "str", "str"),
     ("lower", "str", "str"),
+    ("normalize", "str, str | null=", "str"),
     ("trim", "str", "str"),
     ("filled", "any", "any"),
     ("split", "str, str=", "list"),
@@ -597,6 +598,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("sleep", "num", "null"),
     ("file", "str, map | null=", "response"),
     ("redirect", "str, int=", "response"),
+    ("__site", "str, any", "any"),
+    ("local_path", "any", "str | null"),
     ("respond", "int, any=, map | null=", "response"),
     ("read_file", "str", "str | error(str)"),
     ("write_file", "str, any", "null | error(str)"),
@@ -636,6 +639,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("t", "str, map | null=", "str"),
     ("schedule", "str | int, fn, map | null=", "null"),
     ("allow_cross_site", "str", "null"),
+    ("site_headers", "str | map, map=", "null"),
     ("tenant", "", "str | null"),
     ("tenant_from", "str | fn", "null"),
     ("with_tenant", "str, fn", "any"),
@@ -731,7 +735,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("date.end_of_month", "str", "str"),
     ("date.to_zone", "str, str | null=", "str"),
     ("date.date_in", "str, str | null=", "str"),
-    ("date.at", "str, str | null=, str | null=", "str"),
+    ("date.at", "str, str | null=, str | map | null=, map | null=", "str"),
+    ("date.compare", "str, str", "int"),
     ("date.format", "str, str | map", "str"),
     ("date.ms", "str", "int"),
     ("date.from_ms", "int, str | null=", "str"),
@@ -891,7 +896,7 @@ const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "unwatched", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
       "delete_cookie", "session", "cookie", "set_session", "end_session", "translations", "locale_from", "with_locale",
-      "schedule", "stream", "events", "image.info", "image.convert", "later.status", "args", "stdin", "read_line", "exit", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform"];
+      "schedule", "stream", "events", "image.info", "image.convert", "later.status", "args", "stdin", "read_line", "exit", "allow_cross_site", "site_headers", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;
@@ -1240,7 +1245,7 @@ pub fn check_file_with(path: &Path, overrides: HashMap<PathBuf, String>) -> Anal
 
 /// `check_file_with`, with options.
 pub fn check_file_opts(path: &Path, overrides: HashMap<PathBuf, String>, opts: Options) -> Analysis {
-    let main = overrides.get(path).cloned().map_or_else(|| std::fs::read_to_string(path), Ok);
+    let main = overrides.get(path).cloned().map_or_else(|| crate::error::read_source(path), Ok);
     match main {
         Ok(src) => {
             let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -1407,6 +1412,12 @@ struct Item {
 struct Checker {
     /// The functions being read in their own `let`.
     letting: Vec<String>,
+    /// A component's `let`s whose value comes from the page (`js(...)`), by component: shown in
+    /// markup, they make the browser remake the component (FEEDBACK35.md, Q-431; branch
+    /// feedback27-35-fixes).
+    page_lets: Vec<(String, String)>,
+    /// The names `site` declared (FEEDBACK33.md, Q-412; branch feedback27-35-fixes).
+    sites: HashSet<String>,
     /// Files' text to use instead of what is on disk.
     overrides: HashMap<PathBuf, String>,
     globals: HashMap<String, Var>,
@@ -1528,6 +1539,8 @@ impl Checker {
             );
         }
         Checker {
+            page_lets: Vec::new(),
+            sites: HashSet::new(),
             overrides: HashMap::new(),
             globals,
             scopes: Vec::new(),
@@ -1625,7 +1638,7 @@ impl Checker {
             if confined && !Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_))) {
                 return None;
             }
-            let text = overrides.get(full).cloned().map_or_else(|| std::fs::read_to_string(full), Ok).ok()?;
+            let text = overrides.get(full).cloned().map_or_else(|| crate::error::read_source(full), Ok).ok()?;
             Parser::new(&text).parse_program().ok().map(Arc::new)
         });
         for p in std::mem::take(&mut self.links.problems) {
@@ -1704,7 +1717,7 @@ impl Checker {
             // The file comes first now (FEEDBACK19.md, Q-156; branch feedback19-fixes).
             if let Stmt::Use(path, names, line, options) = s {
                 if options.old {
-                    let r = crate::modules::Respell::new(&file, *line, &crate::modules::resolve(base, path), names.as_deref(), options);
+                    let r = crate::modules::Respell::new(&file, *line, &crate::modules::resolve_from(base, Path::new(&*file), path), names.as_deref(), options);
                     self.diag_at(file.clone(), *line, Severity::Warning, format!("write this as `{} use {}` (`quillo fix` does)", r.head, r.names));
                     self.out.respell.push(r);
                 }
@@ -1718,7 +1731,7 @@ impl Checker {
                 continue;
             }
             if let Stmt::Use(path, names, line, _) = s {
-                let path = &crate::modules::resolve(base, path);
+                let path = &crate::modules::resolve_from(base, Path::new(&*file), path);
                 let Some(full) = self.file_at(base, path, &file, *line) else { continue };
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
                 // A `.qwer` file's names are taken by each `use` that names some (branch imports).
@@ -1726,7 +1739,7 @@ impl Checker {
                     continue;
                 }
                 let fname: Arc<str> = Arc::from(full.display().to_string());
-                let text = self.overrides.get(&full).cloned().map_or_else(|| std::fs::read_to_string(&full), Ok);
+                let text = self.overrides.get(&full).cloned().map_or_else(|| crate::error::read_source(&full), Ok);
                 // Rust: its functions' signatures, read without building it.
                 if path.ends_with(".qwer") {
                     match text {
@@ -1749,6 +1762,14 @@ impl Checker {
                                     None => vec![e.name.clone()],
                                 };
                                 for alias in taken {
+                                    // A plugin's function replaces a builtin as a program's would, and its
+                                    // user cannot see it: said at the `.qwer` file's line (FEEDBACK27.md,
+                                    // Q-326; branch feedback27-35-fixes).
+                                    if self.globals.get(&alias).is_some_and(|g| &*g.file == "<builtin>") {
+                                        self.diag_at(fname.clone(), e.line, Severity::Warning, format!(
+                                            "`{}` hides the builtin `{}`: the plugin's is used everywhere in the program, so rename it, or take it under another name: import {} use {} as {}_{}",
+                                            alias, alias, path, alias, short.trim_end_matches(".qwer"), alias));
+                                    }
                                     // One name from two plugins: the last `use`d wins, so say so,
                                     // and how to keep both (branch imports).
                                     if let Some((other, _)) = self.natives.iter().find(|(f, x)| *f != fname && x.name == alias) {
@@ -1963,6 +1984,11 @@ impl Checker {
                     });
                 }
                 Stmt::Let(p, e, line) => {
+                    if let (Pattern::Bind(n), Expr::Call(f, _, _)) = (p, e) {
+                        if matches!(&**f, Expr::Ident(s, _) if s == "__site") {
+                            self.sites.insert(n.to_string());
+                        }
+                    }
                     self.line = *line;
                     self.scopes.clear();
                     let t = self.expr(e);
@@ -2479,6 +2505,20 @@ impl Checker {
                 let t = self.expr(e);
                 if making {
                     self.letting.pop();
+                }
+                if let (Pattern::Bind(n), Expr::Call(f, _, _)) = (p, e) {
+                    if matches!(&**f, Expr::Ident(s, _) if s == "__site") {
+                        self.sites.insert(n.to_string());
+                    }
+                }
+                if let (Pattern::Bind(n), Some(c)) = (p, self.fns.last().and_then(|f| f.component.clone())) {
+                    let mut from_page = false;
+                    walk_expr(e, &mut |x| {
+                        from_page |= matches!(x, Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(n, _) if n == "js" || n == "js_new"));
+                    });
+                    if from_page && !matches!(e, Expr::Lambda(_)) {
+                        self.page_lets.push((c, n.to_string()));
+                    }
                 }
                 let mut binds = Vec::new();
                 self.bind_pattern(p, t, &mut binds);
@@ -3132,6 +3172,21 @@ impl Checker {
             }
             Expr::Call(callee, args, line) => {
                 self.line = *line;
+                self.upload_named_by_visitor(callee, args);
+                if let Expr::Field(o, f, _) = callee.as_ref() {
+                    if let Expr::Ident(s, _) = o.as_ref() {
+                        if self.sites.contains(s.as_str()) && !self.is_local(s) {
+                            if let Some(c) = self.in_component() {
+                                self.error(format!("`{s}.{f}()` calls the site from the server, and <{c}> also runs in the browser: call it in a `server fn`"));
+                            }
+                        }
+                    }
+                }
+                // Children given none are null since 0.6's fixes, so `str(children) != ""` is
+                // true (FEEDBACK28.md, Q-421; branch feedback27-35-fixes).
+                if matches!(callee.as_ref(), Expr::Ident(n, _) if n == "str") && matches!(args.as_slice(), [Expr::Ident(c, _)] if c == "children") && !self.is_local("str") && self.is_local("children") {
+                    self.warn("`children` is null when none are given, and `str(children)` is \"null\" then: ask `children != null`");
+                }
                 self.call(callee, args, None)
             }
             Expr::Field(obj, name, line) => {
@@ -3274,6 +3329,9 @@ impl Checker {
                         self.answer_dropped(s);
                     }
                     let st = self.stmt(s, i + 1 == stmts.len());
+                    if i + 1 < stmts.len() {
+                        self.error_dropped(s, st);
+                    }
                     if matches!(s, Stmt::Return(..)) || (st.bits == 0 && matches!(s, Stmt::Expr(_))) {
                         never = true;
                     }
@@ -3400,6 +3458,63 @@ impl Checker {
         self.warn(format!("`{}` gives a new value and changes nothing, and it is dropped here: write `x = x | {}(...)`", name, name));
     }
 
+    /// `save_upload(f, f.filename)`, or a path ending in the visitor's name with no folder of the
+    /// program's before it: a visitor can then name the file `main.qwe` or `.env`, which are
+    /// refused, or any other at the folder's root (FEEDBACK30.md, Q-361; branch feedback27-35-fixes).
+    fn upload_named_by_visitor(&mut self, callee: &Expr, args: &[Expr]) {
+        if !matches!(callee, Expr::Ident(n, _) if n == "save_upload") || self.is_local("save_upload") {
+            return;
+        }
+        let is_filename = |e: &Expr| matches!(e, Expr::Field(_, n, _) if n == "filename");
+        let bare = match args.get(1) {
+            Some(e) if is_filename(e) => true,
+            Some(Expr::Template(parts)) => match parts.as_slice() {
+                [TPart::Expr(e)] => is_filename(e),
+                [TPart::Expr(_), TPart::Lit(l), TPart::Expr(e)] if l == "/" => is_filename(e),
+                _ => false,
+            },
+            _ => false,
+        };
+        if bare {
+            self.warn("the file is saved under the name the visitor gave, where they choose it: put it in a folder of the program's, `save_upload(f, `uploads/${uuid()}.pdf`)`, and keep their name in the database");
+        }
+    }
+
+    /// A call alone on a line whose error would be lost: a `db.transaction`, whose value is
+    /// the only word that it rolled back, or a function of the program's that can give one
+    /// (FEEDBACK27.md, Q-332; branch feedback27-35-fixes). A builtin's dropped error is logged
+    /// when it happens, so `db.exec(...)` alone, the usual way to set a table up, is let be.
+    fn error_dropped(&mut self, s: &Stmt, t: T) {
+        let Stmt::Expr(Expr::Call(f, _, _)) = s else { return };
+        let name = match &**f {
+            Expr::Field(o, name, _) if matches!(&**o, Expr::Ident(db, _) if db == "db") && name == "transaction" => {
+                self.warn("the transaction's value is dropped, so a rollback is not seen: write `db.transaction(...)?`, or `let r = db.transaction(...)`");
+                return;
+            }
+            Expr::Ident(name, _) => name.as_str(),
+            _ => return,
+        };
+        if self.is_local(name) {
+            return;
+        }
+        // It can fail when its type says so, or it declares `! T`, or its body makes an error or
+        // passes one on with `?`.
+        let can_fail = |d: &FnDef| {
+            let mut found = d.err.is_some();
+            walk_expr(&d.body, &mut |e| {
+                found |= matches!(e, Expr::Try(_)) || matches!(e, Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(n, _) if n == "err"));
+            });
+            found
+        };
+        let fails = (t.bits != ANY && t.bits & ERR != 0) || self.globals.get(name).and_then(|v| v.sig.as_ref()).and_then(|s| s.def.as_ref()).is_some_and(|d| can_fail(d));
+        if !fails {
+            return;
+        }
+        if self.globals.get(name).is_some_and(|v| &*v.file != "<builtin>" && v.sig.as_ref().is_some_and(|s| !s.builtin && !s.component)) {
+            self.warn(format!("`{}` can give an error, and it is dropped here: write `{}(...)?` to pass it on, or `let _ = {}(...)` if it does not matter", name, name, name));
+        }
+    }
+
     /// `type_of(x) == "decimal"` is never true, and nothing says so (FEEDBACK28.md, Q-347;
     /// branch feedback29-fixes).
     fn type_name_compared(&mut self, a: &Expr, b: &Expr) {
@@ -3426,6 +3541,9 @@ impl Checker {
         for a in args {
             if matches!(a, Expr::Lit(Lit::Str(p)) if runs_in_runs(p)) {
                 self.warn("this pattern repeats something that repeats, as `(a+)+`: on the wrong text it can hang a browser tab, with no way to stop it. Bound the counts (`{1,8}`), or run it in a `server fn`".to_string());
+            }
+            if matches!(a, Expr::Lit(Lit::Str(p)) if capture_in_repeat(p)) {
+                self.warn("a group inside a group that repeats, as `(?:(a)|b)*`, holds its last match on the server and nothing in the browser, where each round clears it: capture the whole repetition instead, `((?:a|b)*)`".to_string());
             }
         }
     }
@@ -4464,6 +4582,39 @@ impl Checker {
             match c {
                 HtmlChild::El(e) => crate::stack::maybe_grow(256 << 10, 4 << 20, || self.html(e)),
                 HtmlChild::Expr(x) => {
+                    // `<p>{{ name }}</p>`, the habit of Vue, Handlebars and Jinja: a map in braces,
+                    // shown as its text (FEEDBACK35.md, Q-430; branch feedback27-35-fixes).
+                    match x {
+                        Expr::Map(entries) if entries.len() == 1 && matches!(&entries[0].1, Expr::Ident(n, _) if *n == entries[0].0) => {
+                            self.line = el.line;
+                            let n = &entries[0].0;
+                            self.warn(format!("`{{{{ {n} }}}}` shows the map `{{ {n}: ... }}`: to show `{n}`, write `{{{n}}}`"));
+                        }
+                        Expr::Map(_) => {
+                            self.line = el.line;
+                            self.warn("a map written as an element's child is shown as its text: one pair of braces shows a value, `{x}`");
+                        }
+                        Expr::Block(_) => {
+                            self.line = el.line;
+                            self.warn("`{{ ... }}` here is a block, and its value is shown: one pair of braces shows a value, `{x}`");
+                        }
+                        _ => {}
+                    }
+                    if let Some(c) = self.in_component() {
+                        let mut shown = Vec::new();
+                        walk_expr(x, &mut |y| {
+                            if let Expr::Ident(n, _) = y {
+                                shown.push(n.clone());
+                            }
+                        });
+                        for n in shown {
+                            if let Some(i) = self.page_lets.iter().position(|(pc, pn)| *pc == c && *pn == n) {
+                                self.page_lets.remove(i);
+                                self.line = el.line;
+                                self.warn(format!("`{n}` is a value from the page shown in markup: the server has null for it, so the browser makes <{c}> again on each load. Write `state {n} = ...`, which is set once the component is on the page"));
+                            }
+                        }
+                    }
                     self.expr(x);
                 }
             }
@@ -5486,6 +5637,42 @@ fn nesting_problem(stack: &[String], tag: &str) -> Option<String> {
 }
 
 /// Whether a pattern has a group holding a run that is itself repeated.
+/// Whether a pattern has a capturing group inside a group that repeats, as `(?:(a)|b)*`: there
+/// JavaScript clears the group at each round and the server keeps its last match, so the two
+/// sides give different groups (FEEDBACK25.md, Q-308; branch feedback27-35-fixes).
+fn capture_in_repeat(p: &str) -> bool {
+    let cs: Vec<char> = p.chars().collect();
+    // For each open group: whether it captures, and whether a capturing group is inside it.
+    let mut groups: Vec<(bool, bool)> = Vec::new();
+    let (mut i, mut class) = (0, false);
+    while i < cs.len() {
+        match cs[i] {
+            '\\' => i += 1,
+            ']' if class => class = false,
+            _ if class => {}
+            '[' => class = true,
+            '(' => {
+                let named = cs.get(i + 1) == Some(&'?') && matches!(cs.get(i + 2), Some('<' | 'P')) && !matches!(cs.get(i + 3), Some('=' | '!'));
+                let captures = cs.get(i + 1) != Some(&'?') || named;
+                groups.push((captures, false));
+            }
+            ')' => {
+                let (captures, holds) = groups.pop().unwrap_or((false, false));
+                let repeats = matches!(cs.get(i + 1), Some('+' | '*' | '{'));
+                if repeats && holds {
+                    return true;
+                }
+                if let Some(g) = groups.last_mut() {
+                    g.1 |= holds || captures;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 fn runs_in_runs(p: &str) -> bool {
     let cs: Vec<char> = p.chars().collect();
     let mut groups: Vec<bool> = Vec::new();

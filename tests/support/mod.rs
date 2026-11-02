@@ -300,7 +300,10 @@ impl Answer {
 pub fn send(port: u16, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Answer {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-    let mut head = format!("{} {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n", method, path, body.len());
+    // One Host: the test's own when it gives one, as a request may have only one (FEEDBACK31.md,
+    // Q-393; branch feedback27-35-fixes).
+    let host = if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) { "" } else { "Host: localhost\r\n" };
+    let mut head = format!("{} {} HTTP/1.1\r\n{}Connection: close\r\nContent-Length: {}\r\n", method, path, host, body.len());
     if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) && !body.is_empty() {
         head.push_str("Content-Type: application/json\r\n");
     }

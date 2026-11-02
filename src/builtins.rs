@@ -29,6 +29,7 @@ pub fn install(env: &Env) {
         ("type_of", type_of),
         ("upper", upper),
         ("lower", lower),
+        ("normalize", normalize),
         ("trim", trim),
         ("filled", filled),
         ("split", split),
@@ -79,6 +80,8 @@ pub fn install(env: &Env) {
         ("sleep", sleep),
         ("file", file),
         ("allow_cross_site", allow_cross_site),
+        ("site_headers", site_headers),
+        ("__site", crate::sites::declare),
         ("save_upload", save_upload),
         ("read_upload", read_upload),
         ("tenant", tenant),
@@ -89,6 +92,7 @@ pub fn install(env: &Env) {
         ("__service_later", crate::service::later),
         ("__record", crate::record::construct),
         ("redirect", redirect),
+        ("local_path", local_path_fn),
         ("respond", respond),
         ("read_file", read_file),
         ("write_file", write_file),
@@ -357,10 +361,28 @@ fn error_of(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
     })
 }
 
+/// Output nobody reads any longer (`| head -1`, a log shipper that stopped): a script ends there
+/// as a shell's commands do, status 141, and a server goes on, its pages answered as before
+/// (FEEDBACK31.md, Q-379; branch feedback27-35-fixes).
+static STDOUT_GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn print_line(line: &str) {
+    use std::io::Write;
+    if STDOUT_GONE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut out = std::io::stdout().lock();
+    let gone = writeln!(out, "{}", line).is_err_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe);
+    if gone && !crate::value::serving() {
+        std::process::exit(141);
+    }
+    STDOUT_GONE.fetch_or(gone, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn print(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
     // The program's own log: what it hides from visitors, it sees.
     let line = crate::value::told(|| args.iter().map(|v| v.display()).collect::<Vec<_>>().join(" "));
-    println!("{}", line);
+    print_line(&line);
     Ok(Value::Nil)
 }
 
@@ -439,6 +461,26 @@ fn upper(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 fn lower(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::str(s_arg(&args, 0, "lower", line)?.to_lowercase()))
+}
+
+/// `normalize(s, "NFC")`: one Unicode form for text that looks the same, so `café` typed and
+/// `cafe` with a combining accent are one name; `"NFKC"` also folds look-alikes such as `ﬁ`, for
+/// comparing user names (FEEDBACK31.md, Q-394; branch feedback27-35-fixes).
+fn normalize(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    use unicode_normalization::UnicodeNormalization;
+    let s = s_arg(&args, 0, "normalize", line)?;
+    let form = match args.get(1) {
+        None | Some(Value::Nil) => "NFC".into(),
+        Some(Value::Str(f)) => f.to_ascii_uppercase(),
+        Some(other) => return fail(line, format!("`normalize` expects a form (\"NFC\", \"NFD\", \"NFKC\" or \"NFKD\") as argument 2, got {}", other.type_name())),
+    };
+    Ok(Value::str(match form.as_str() {
+        "NFC" => s.nfc().collect::<String>(),
+        "NFD" => s.nfd().collect(),
+        "NFKC" => s.nfkc().collect(),
+        "NFKD" => s.nfkd().collect(),
+        _ => return fail(line, format!("`normalize`: the form is \"NFC\", \"NFD\", \"NFKC\" or \"NFKD\", got {:?}", form)),
+    }))
 }
 
 /// The value, or null for `""`: what `||` does in JavaScript, for text, as
@@ -1016,6 +1058,23 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     let full = it.base_dir.join(rel);
     let Ok(info) = crate::statics::info(&full) else { return Ok(not_found()) };
+    // Options it does not know are refused, naming those it does, as a mistyped `cache` would
+    // otherwise go unseen (FEEDBACK27.md, Q-331; branch feedback27-35-fixes). `download` names
+    // the file a browser saves, and `type` is its content type (FEEDBACK30.md, limitations).
+    let mut download = None;
+    let mut given_type = None;
+    if let Some(Value::Map(m)) = args.get(1) {
+        for (k, v) in m.iter() {
+            match (&**k, v) {
+                ("cache", _) => {}
+                ("download", Value::Str(n)) if !n.is_empty() => download = Some(n.clone()),
+                ("type", Value::Str(t)) if !t.is_empty() && !t.contains(['\r', '\n']) => given_type = Some(t.clone()),
+                ("download" | "type", Value::Nil) => {}
+                ("download" | "type", other) => return fail(line, format!("`file`'s {} is a str, got {}", k, other.repr())),
+                (k, _) => return fail(line, format!("`file` has no option `{}`: it takes `cache`, `download` and `type`", k)),
+            }
+        }
+    }
     let keep = match args.get(1) {
         None | Some(Value::Nil) => None,
         Some(Value::Map(m)) => match m.get("cache") {
@@ -1059,8 +1118,11 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if fresh {
         return answer(304, headers, Vec::new());
     }
-    headers.push(("content-type".into(), mime(&full).into()));
+    headers.push(("content-type".into(), given_type.map_or_else(|| mime(&full).to_string(), |t| t.to_string())));
     headers.push(("accept-ranges".into(), "bytes".into()));
+    if let Some(n) = download {
+        headers.push(("content-disposition".into(), crate::upload::attachment(&n)));
+    }
     // Larger files are sent from disk as they are written (see `statics`).
     let large = info.len > 1 << 20;
     if let Some(r) = asked("range", it) {
@@ -1140,6 +1202,9 @@ fn save_upload(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Err(e) => return Ok(Value::err(Value::str(format!("save_upload: {}", e)))),
     };
     let full = it.base_dir.join(rel);
+    if let Some(why) = own_file(it, &full) {
+        return Ok(Value::err(Value::str(format!("save_upload: will not write {}: {}; save uploads under a folder of their own, such as uploads/", dest, why))));
+    }
     let written = it.unlocked(move || {
         if let Some(dir) = full.parent() {
             std::fs::create_dir_all(dir)?;
@@ -1173,6 +1238,39 @@ fn allow_cross_site(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return fail(line, format!("`allow_cross_site` needs a path that starts with /, got {:?}", &*p));
     }
     Arc::make_mut(&mut it.site).cross_site_ok.push(p.to_string());
+    Ok(Value::Nil)
+}
+
+/// `site_headers({ "content-security-policy": "..." })`, or `site_headers("/admin", {...})` for
+/// the answers under a path: headers sent with every answer that does not set them itself. A
+/// null value takes away one Quillo sends by itself, `"x-frame-options": null` (FEEDBACK31.md,
+/// Q-391; branch feedback27-35-fixes).
+fn site_headers(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let (prefix, m) = match args.as_slice() {
+        [Value::Map(m)] => ("/".to_string(), m.clone()),
+        [Value::Str(p), Value::Map(m)] if p.starts_with('/') => (p.trim_end_matches('/').to_string(), m.clone()),
+        [Value::Str(p), _] if !p.starts_with('/') => return fail(line, format!("`site_headers` needs a path that starts with /, got {:?}", &**p)),
+        _ => return fail(line, "`site_headers` takes a map of headers, or a path and a map: site_headers(\"/admin\", { \"cache-control\": \"no-store\" })"),
+    };
+    let prefix = if prefix.is_empty() { "/".to_string() } else { prefix };
+    let mut hs = Vec::new();
+    for (k, v) in m.iter() {
+        let name = k.to_ascii_lowercase();
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)) {
+            return fail(line, format!("`site_headers`: {:?} is not a header's name", &**k));
+        }
+        if matches!(name.as_str(), "content-length" | "transfer-encoding" | "connection" | "set-cookie" | "content-type") {
+            return fail(line, format!("`site_headers`: `{}` is the answer's own; a route sets it", name));
+        }
+        let value = match v {
+            Value::Nil => None,
+            Value::Str(s) if !s.contains(['\r', '\n']) => Some(s.to_string()),
+            Value::Int(_) | Value::Bool(_) => Some(v.display().to_string()),
+            other => return fail(line, format!("`site_headers`: the value of `{}` is text on one line, or null, got {}", name, other.repr())),
+        };
+        hs.push((name, value));
+    }
+    Arc::make_mut(&mut it.site).headers.push((prefix, hs));
     Ok(Value::Nil)
 }
 
@@ -1351,6 +1449,68 @@ fn allowed_path(it: &Interp, p: &str) -> Option<std::path::PathBuf> {
     dirs.iter().any(|d| real.starts_with(d)).then_some(real)
 }
 
+/// Why `full` must not be written by the program, if it is one of its own files: a `.qwe` or
+/// `.qwer` it loaded, which `--reload` would run, a `.env`, the SQLite database it has open
+/// with its journal, or a migration (FEEDBACK30.md, Q-361; branch feedback27-35-fixes). An
+/// upload saved under the visitor's name at the folder's root could otherwise replace
+/// `main.qwe` and run as the program.
+pub(crate) fn own_file(it: &Interp, full: &Path) -> Option<&'static str> {
+    let real = |p: &Path| -> std::path::PathBuf {
+        // A file not there yet is where its folder really is.
+        p.canonicalize().unwrap_or_else(|_| match (p.parent().and_then(|d| d.canonicalize().ok()), p.file_name()) {
+            (Some(d), Some(n)) => d.join(n),
+            _ => p.to_path_buf(),
+        })
+    };
+    let target = real(full);
+    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // The file, or a folder that holds one (`delete_file("lib")`).
+    if it.loaded.iter().any(|f| real(f).starts_with(&target)) {
+        return Some("it is one of the program's own files");
+    }
+    if name == ".env" || name.starts_with(".env.") {
+        return Some("it is the program's settings (.env)");
+    }
+    if let Some(db) = &*crate::db::OPENED.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+        let db = real(Path::new(db));
+        let dn = db.to_string_lossy();
+        let tn = target.to_string_lossy();
+        if target == db || ["-wal", "-shm", "-journal"].iter().any(|x| *tn == format!("{}{}", dn, x)) {
+            return Some("it is the database the program has open");
+        }
+    }
+    if target.starts_with(real(&it.base_dir).join("migrations")) {
+        return Some("it is in the program's migrations");
+    }
+    None
+}
+
+/// `local_path(next)`: an address on this site, as a browser would read it, or null. Tabs and
+/// line breaks are dropped and `\` is `/`, as browsers do, and anything with a scheme or a host
+/// (`//evil.example`, `/\evil.example`, `https:...`) is null, so `redirect(local_path(next) ??
+/// "/")` cannot send a visitor to another site (FEEDBACK31.md, Q-390; branch feedback27-35-fixes).
+pub fn local_target(s: &str) -> Option<String> {
+    let s: String = s.chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).map(|c| if c == '\\' { '/' } else { c }).collect();
+    let s = s.trim_matches(|c: char| c <= ' ');
+    if !s.starts_with('/') || s.starts_with("//") || s.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    // A `:` before the path's first `/`, `?` or `#` would be a scheme; none can be here, as it
+    // starts with `/`, but `/%2F/x` decodes to `//x` in some servers: refused too.
+    let lower = s.to_ascii_lowercase();
+    if lower.starts_with("/%2f") || lower.starts_with("/%5c") {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+fn local_path_fn(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
+    Ok(match args.first() {
+        Some(Value::Str(s)) => local_target(s).map_or(Value::Nil, Value::str),
+        _ => Value::Nil,
+    })
+}
+
 /// `read_file(path)`: the file's text, or an error value.
 fn read_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let p = s_arg(&args, 0, "read_file", line)?;
@@ -1370,6 +1530,9 @@ fn write_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let Some(full) = local_path(it, &p) else {
         return Ok(Value::err(Value::str(format!("write_file: path must stay inside the program's folder: {}", p))));
     };
+    if let Some(why) = own_file(it, &full) {
+        return Ok(Value::err(Value::str(format!("write_file: will not write {}: {}", p, why))));
+    }
     if let Some(dir) = full.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -1427,6 +1590,9 @@ fn delete_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let Some(full) = local_path(it, &p).filter(|f| f.as_path() != &*it.base_dir) else {
         return Ok(Value::err(Value::str(format!("delete_file: path must be inside the program's folder: {}", p))));
     };
+    if let Some(why) = own_file(it, &full) {
+        return Ok(Value::err(Value::str(format!("delete_file: will not delete {}: {}", p, why))));
+    }
     let r = if full.is_dir() { std::fs::remove_dir_all(&full) } else { std::fs::remove_file(&full) };
     Ok(match r {
         Ok(()) => Value::Nil,

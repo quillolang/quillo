@@ -3010,6 +3010,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
+ "unicode-normalization",
  "ureq",
  "webpki-roots 0.26.11",
  "wry",

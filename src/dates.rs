@@ -55,6 +55,7 @@ const FNS: &[(&str, BuiltinFn)] = &[
     ("date.format", format),
     ("date.ms", ms),
     ("date.from_ms", from_ms),
+    ("date.compare", compare),
 ];
 
 /// The clock's functions, which a sandboxed script does without.
@@ -514,14 +515,29 @@ fn offset_at(z: &Zone, instant: i64) -> i64 {
 /// forward) it is the time that far after the gap, and in an overlap
 /// (moved back) the earlier of the two: what jiff and Temporal call
 /// "compatible". It assumes one change of offset within a day either side.
-fn local_instant(z: &Zone, local: i64) -> i64 {
+/// What a time the clocks skip becomes (`date.at`'s `skipped`).
+#[derive(Clone, Copy, PartialEq)]
+enum Skipped {
+    Later,
+    Earlier,
+    Error,
+}
+
+/// `local_instant`, with the second of two times a wall-clock time names when `later`, and
+/// a skipped time moved on, back, or refused (FEEDBACK30.md, Q-375; branch feedback27-35-fixes).
+fn local_instant_as(z: &Zone, local: i64, later: bool, skipped: Skipped) -> Result<i64, ()> {
     let (before, after) = (offset_at(z, local - 86400), offset_at(z, local + 86400));
     let fits = |o: i64| offset_at(z, local - o) == o;
     match (fits(before), fits(after)) {
-        (true, true) => local - before.max(after),
-        (true, false) => local - before,
-        (false, true) => local - after,
-        (false, false) => local - before,
+        (true, true) if later => Ok(local - before.min(after)),
+        (true, true) => Ok(local - before.max(after)),
+        (true, false) => Ok(local - before),
+        (false, true) => Ok(local - after),
+        (false, false) => match skipped {
+            Skipped::Later => Ok(local - before),
+            Skipped::Earlier => Ok(local - after),
+            Skipped::Error => Err(()),
+        },
     }
 }
 
@@ -567,12 +583,44 @@ fn now(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::str(stamp_text(t, "", offset_at(&z, t)).unwrap_or_default()))
 }
 
+/// A fraction of a second that is all zeros is no fraction: `.000Z`, as JavaScript's
+/// `toISOString()` writes every time, becomes `Z`, so two times made alike are one text
+/// (FEEDBACK30.md, Q-368; branch feedback27-35-fixes).
+fn kept_frac(frac: &str) -> &str {
+    if frac.bytes().skip(1).all(|b| b == b'0') {
+        ""
+    } else {
+        frac
+    }
+}
+
+/// `date.compare(a, b)`: -1, 0 or 1, by the instants they name, a fraction of a second
+/// included; a date is its midnight in UTC (FEEDBACK30.md, Q-368; branch feedback27-35-fixes).
+fn compare(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let key = |i: usize| -> Result<(i64, u64), Ctrl> {
+        let (z, t) = either_arg(&args, i, "date.compare", line)?;
+        Ok(match t {
+            Some(t) => {
+                let frac = t.frac.trim_start_matches('.');
+                (t.instant(), format!("{:0<9}", &frac[..frac.len().min(9)]).parse::<u64>().unwrap_or(0))
+            }
+            None => (z * 86400, 0),
+        })
+    };
+    let (a, b) = (key(0)?, key(1)?);
+    Ok(Value::Int(match a.cmp(&b) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }))
+}
+
 fn to_zone(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = "date.to_zone";
     let t = stamp_arg(&args, 0, f, line)?;
     let z = zone(&args, 1, f, line)?;
     let i = t.instant();
-    match stamp_text(i, &t.frac, offset_at(&z, i)) {
+    match stamp_text(i, kept_frac(&t.frac), offset_at(&z, i)) {
         Some(s) => Ok(Value::str(s)),
         None => out_of_range(f, line),
     }
@@ -586,9 +634,21 @@ fn date_in(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     day_value(Some((i + offset_at(&z, i)).div_euclid(86400)), f, line)
 }
 
-/// `date.at(d, "14:30", tz)`: the date-time of a local time in a zone.
+/// `date.at(d, "14:30", tz)`: the date-time of a local time in a zone. `date.at(v, tz)` takes
+/// the date and time as one text, as `<input type="datetime-local">` gives it (FEEDBACK30.md,
+/// Q-376), and options last say which of two times a repeated one is, `{ repeated: "later" }`,
+/// and what a skipped one does, `{ skipped: "earlier" }` or `"error"` (Q-375; branch
+/// feedback27-35-fixes).
 fn at(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = "date.at";
+    let one_text = match args.first() {
+        Some(Value::Str(s)) => local_date_time(s),
+        _ => None,
+    };
+    if let Some((day, sec)) = one_text {
+        let z = zone(&args, 1, f, line)?;
+        return at_local(&z, day * 86400 + sec, args.get(2), f, line, 3);
+    }
     let day = date_arg(&args, 0, f, line)?;
     let sec = match given(&args, 1) {
         None => 0,
@@ -607,8 +667,49 @@ fn at(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         other => return fail(line, format!("`{}` expects a time (HH:MM or HH:MM:SS) as argument 2, got {}", f, got(other))),
     };
     let z = zone(&args, 2, f, line)?;
-    let i = local_instant(&z, day * 86400 + sec);
-    match stamp_text(i, "", offset_at(&z, i)) {
+    at_local(&z, day * 86400 + sec, args.get(3), f, line, 4)
+}
+
+/// `"2026-10-27T14:30"` or `"2026-10-27T14:30:05"`, a date and a wall-clock time with no
+/// offset: the day and the second of it.
+fn local_date_time(s: &str) -> Option<(i64, i64)> {
+    let b = s.as_bytes();
+    if !s.is_ascii() || !matches!(b.len(), 16 | 19) || !matches!(b[10], b'T' | b' ') {
+        return None;
+    }
+    let day = parse_date(&s[..10])?;
+    let sec = if b.len() == 16 { hms(&[&b[11..16], b":00"].concat())? } else { hms(&b[11..19])? };
+    Some((day, sec))
+}
+
+fn at_local(z: &Zone, local: i64, opts: Option<&Value>, f: &str, line: u32, n: usize) -> R {
+    let (mut later, mut skipped) = (false, Skipped::Later);
+    match opts {
+        None | Some(Value::Nil) => {}
+        Some(Value::Map(m)) => {
+            for (k, v) in m.iter() {
+                match (&**k, v) {
+                    ("repeated", Value::Str(w)) if &**w == "earlier" || &**w == "later" => later = &**w == "later",
+                    ("skipped", Value::Str(w)) if matches!(&**w, "later" | "earlier" | "error") => {
+                        skipped = match &**w {
+                            "later" => Skipped::Later,
+                            "earlier" => Skipped::Earlier,
+                            _ => Skipped::Error,
+                        }
+                    }
+                    ("repeated", other) => return fail(line, format!("`{}`'s repeated is \"earlier\" or \"later\", got {}", f, got(Some(other)))),
+                    ("skipped", other) => return fail(line, format!("`{}`'s skipped is \"later\", \"earlier\" or \"error\", got {}", f, got(Some(other)))),
+                    (k, _) => return fail(line, format!("`{}`: the options are repeated and skipped, not `{}`", f, k)),
+                }
+            }
+        }
+        Some(other) => return fail(line, format!("`{}` expects options as a map as argument {}, got {}", f, n, got(Some(other)))),
+    }
+    let Ok(i) = local_instant_as(z, local, later, skipped) else {
+        let (day, sec) = (local.div_euclid(86400), local.rem_euclid(86400));
+        return Ok(Value::err(Value::str(format!("{}: {} {:02}:{:02} is skipped in that zone, as its clocks move forward", f, date_text(day), sec / 3600, sec % 3600 / 60))));
+    };
+    match stamp_text(i, "", offset_at(z, i)) {
         Some(s) => Ok(Value::str(s)),
         None => out_of_range(f, line),
     }
@@ -1003,11 +1104,28 @@ fn read_iso(s: &str) -> Option<String> {
     stamp_text(day * 86400 + sec - off, &frac, off)
 }
 
+/// An HTTP date, `Tue, 27 Oct 2026 14:30:00 GMT` (RFC 9110's IMF-fixdate), as UTC.
+fn read_http(s: &str) -> Option<String> {
+    const MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let w: Vec<&str> = s.split_whitespace().collect();
+    let [dow, d, m, y, t, "GMT"] = w.as_slice() else { return None };
+    if !dow.ends_with(',') || d.len() != 2 || y.len() != 4 || t.len() != 8 {
+        return None;
+    }
+    let m = MON.iter().position(|x| x == m)? as i64 + 1;
+    let day = ymd(num(y.as_bytes())?, m, num(d.as_bytes())?)?;
+    let sec = hms(t.as_bytes())?;
+    stamp_text(day * 86400 + sec, "", 0)
+}
+
 fn parse(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = "date.parse";
     let s = str_arg(&args, 0, f, line)?;
     let r = match given(&args, 1) {
-        None => read_iso(s.trim()).ok_or_else(|| format!("not a date or a date-time: {}", got(args.first()))),
+        // A local date-time names no instant until a zone is given: it is refused with what to
+        // write (FEEDBACK30.md, Q-376; branch feedback27-35-fixes).
+        None if local_date_time(s.trim()).is_some() => Err(format!("{} has no offset, so it is a wall-clock time and names no instant: read it in its zone with date.at(v, zone)", got(args.first()))),
+        None => read_iso(s.trim()).or_else(|| read_http(s.trim())).ok_or_else(|| format!("not a date or a date-time: {}", got(args.first()))),
         Some(Value::Str(p)) => {
             let (s, p): (Vec<char>, Vec<char>) = (s.trim().chars().collect(), p.chars().collect());
             read(&s, &p).ok_or_else(|| format!("{} is not a date in the form {}", got(args.first()), got(args.get(1))))

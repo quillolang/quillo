@@ -42,7 +42,11 @@ pub fn load_into_process(path: &Path, required: bool) -> Result<(), String> {
         Err(e) => return Err(format!("cannot read {}: {}", path.display(), e)),
     };
     let mut keys = from_file().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    for (k, v) in parse(&text) {
+    let (pairs, skipped) = parse_noting(&text);
+    for n in skipped {
+        eprintln!("quillo: {}:{}: not KEY=value, skipped", path.display(), n);
+    }
+    for (k, v) in pairs {
         if std::env::var_os(&k).is_some() && !keys.contains(&k) {
             continue;
         }
@@ -75,43 +79,97 @@ pub fn var(own: &HashMap<String, String>, name: &str) -> Option<String> {
 /// allowed, values bare (to a ` #`), in double quotes (with `\n`, `\"` and
 /// `\\`) or in single quotes (as written).
 pub fn parse(text: &str) -> Vec<(String, String)> {
+    parse_noting(text).0
+}
+
+/// `parse`, and the lines it skipped, by number. A byte-order mark is no part of the first key,
+/// and a quoted value goes on to its closing quote, over several lines, as a PEM key is kept in
+/// Node's `dotenv` and Docker Compose (FEEDBACK31.md, Q-380; branch feedback27-35-fixes).
+pub fn parse_noting(text: &str) -> (Vec<(String, String)>, Vec<usize>) {
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
+    let mut skipped = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let at = i + 1;
+        let line = lines[i].trim();
+        i += 1;
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let line = line.strip_prefix("export ").unwrap_or(line);
-        let Some((k, v)) = line.split_once('=') else { continue };
+        let Some((k, v)) = line.split_once('=') else {
+            skipped.push(at);
+            continue;
+        };
         let k = k.trim();
         if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            skipped.push(at);
             continue;
         }
-        let v = v.trim();
-        let value = if let Some(rest) = v.strip_prefix('"') {
+        let v = v.trim_start();
+        let value = if let Some(first) = v.strip_prefix('"') {
             let mut s = String::new();
-            let mut chars = rest.chars();
-            while let Some(c) = chars.next() {
-                match c {
-                    '"' => break,
-                    '\\' => match chars.next() {
-                        Some('n') => s.push('\n'),
-                        Some('t') => s.push('\t'),
-                        Some(other) => s.push(other),
-                        None => {}
-                    },
-                    c => s.push(c),
+            let mut rest = first.to_string();
+            loop {
+                let mut chars = rest.chars();
+                let mut closed = false;
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => {
+                            closed = true;
+                            break;
+                        }
+                        '\\' => match chars.next() {
+                            Some('n') => s.push('\n'),
+                            Some('t') => s.push('\t'),
+                            Some(other) => s.push(other),
+                            None => {}
+                        },
+                        c => s.push(c),
+                    }
+                }
+                if closed || i >= lines.len() {
+                    if !closed {
+                        skipped.push(at);
+                    }
+                    break;
+                }
+                s.push('\n');
+                rest = lines[i].trim_end_matches('\r').to_string();
+                i += 1;
+            }
+            s
+        } else if let Some(first) = v.strip_prefix('\'') {
+            let mut s = String::new();
+            let mut rest = first;
+            loop {
+                match rest.split_once('\'') {
+                    Some((before, _)) => {
+                        s.push_str(before);
+                        break;
+                    }
+                    None if i < lines.len() => {
+                        s.push_str(rest);
+                        s.push('\n');
+                        rest = lines[i];
+                        i += 1;
+                    }
+                    None => {
+                        s.push_str(rest);
+                        skipped.push(at);
+                        break;
+                    }
                 }
             }
             s
-        } else if let Some(rest) = v.strip_prefix('\'') {
-            rest.split('\'').next().unwrap_or("").to_string()
         } else {
             v.split(" #").next().unwrap_or("").trim_end().to_string()
         };
         out.push((k.to_string(), value));
     }
-    out
+    (out, skipped)
 }
 
 #[cfg(test)]

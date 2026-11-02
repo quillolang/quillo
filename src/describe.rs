@@ -26,7 +26,13 @@ pub static ENABLED: AtomicBool = AtomicBool::new(false);
 pub fn of_interp(it: &Interp, title: &str) -> J {
     let mut parts = Parts::default();
     collect_interp(it, "", &mut parts);
-    parts.document(title)
+    let mut doc = parts.document(title);
+    // Under `--base /shop` every address the program makes carries the prefix: a gateway that
+    // imports the document is told so (FEEDBACK32.md, Q-398; branch feedback27-35-fixes).
+    if !it.base.is_empty() {
+        doc["servers"] = json!([{ "url": it.base }]);
+    }
+    doc
 }
 
 /// The document of the program in `path`, read without running it.
@@ -77,7 +83,27 @@ fn collect_interp(it: &Interp, prefix: &str, parts: &mut Parts) {
     fns.sort_by(|a, b| a.name.cmp(&b.name));
     parts.fns.extend(fns.into_iter().map(|d| (prefix.to_string(), d)));
     for (p, sub) in &it.mounts {
-        collect_interp(sub, &format!("{}{}", prefix, p), parts);
+        // A service under a prefix serves its routes here, but its server fns are called by
+        // other services, signed, not at `/billing/_quillo/rpc`: only a mount's are described,
+        // as `quillo docs` does (FEEDBACK32.md, Q-395; branch feedback27-35-fixes).
+        if sub.is_service {
+            let mut inner = Parts::default();
+            collect_interp(sub, &format!("{}{}", prefix, p), &mut inner);
+            parts.routes.extend(inner.routes);
+        } else {
+            collect_interp(sub, &format!("{}{}", prefix, p), parts);
+        }
+    }
+    // A service under a prefix that runs as a process of its own (`--split`): its routes from
+    // its source, as `quillo docs` reads them, so the document does not depend on how the app
+    // was started (FEEDBACK32.md, Q-397; branch feedback27-35-fixes).
+    for (p, file) in &it.remote_sources {
+        let dir = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let mut inner = Parts::default();
+        let mut seen = Vec::new();
+        if collect_file(file, &dir, &format!("{}{}", prefix, p), &mut inner, &mut seen, 1).is_ok() {
+            parts.routes.extend(inner.routes);
+        }
     }
 }
 
@@ -87,14 +113,14 @@ fn collect_file(path: &Path, base: &Path, prefix: &str, parts: &mut Parts, seen:
         return Ok(());
     }
     seen.push(key);
-    let src = std::fs::read_to_string(path).map_err(|e| QuilloError::new(format!("cannot read {}: {}", path.display(), e), 0))?;
+    let src = crate::error::read_source(path).map_err(|e| QuilloError::new(format!("cannot read {}: {}", path.display(), e), 0))?;
     let file: Arc<str> = Arc::from(path.display().to_string());
     let stmts = crate::parser::Parser::new(&src).in_file(Some(file)).parse_program().map_err(|e| e.in_file(&path.display().to_string()))?;
     for s in stmts {
         match s {
             Stmt::Route(r) => parts.routes.push((prefix.to_string(), r)),
             Stmt::Fn(d) if d.server => parts.fns.push((prefix.to_string(), d)),
-            Stmt::Use(p, ..) if !crate::ast::is_script(&p) => collect_file(&base.join(crate::modules::resolve(base, &p)), base, prefix, parts, seen, depth + 1)?,
+            Stmt::Use(p, ..) if !crate::ast::is_script(&p) => collect_file(&base.join(crate::modules::resolve_from(base, path, &p)), base, prefix, parts, seen, depth + 1)?,
             // A service with a prefix: its routes are served here.
             Stmt::Service(_, Some(p), file, _, _) => {
                 let full = base.join(&file);
@@ -116,28 +142,91 @@ fn collect_file(path: &Path, base: &Path, prefix: &str, parts: &mut Parts, seen:
 
 impl Parts {
     fn document(&self, title: &str) -> J {
+        // The routes of one method on one shape of path are one operation: several bodies a
+        // `oneOf`, several queries one list, a parameter required where every route requires it,
+        // and the path's template named as the first route names it, as OpenAPI takes one
+        // template per shape (FEEDBACK32.md, Q-396; branch feedback27-35-fixes).
+        let mut groups: Vec<(String, String, Vec<&(String, Arc<RouteDef>)>)> = Vec::new();
+        for pr in &self.routes {
+            let (prefix, r) = pr;
+            let shape = openapi_path(prefix, &r.path).0.split('/').map(|s| if s.starts_with('{') { "{}" } else { s }).collect::<Vec<_>>().join("/");
+            let method = r.method.to_ascii_lowercase();
+            match groups.iter_mut().find(|(s, m, _)| *s == shape && *m == method) {
+                Some(g) => g.2.push(pr),
+                None => groups.push((shape, method, vec![pr])),
+            }
+        }
         let mut paths = Map::new();
-        for (prefix, r) in &self.routes {
-            let (path, mut params) = openapi_path(prefix, &r.path);
-            if let Some(Pattern::Record(fields)) = &r.query {
-                for f in fields {
-                    let (schema, required) = field_schema(f);
-                    params.push(json!({ "name": f.path.join("."), "in": "query", "required": required, "schema": schema }));
+        for (_, method, routes) in &groups {
+            let (prefix, first) = routes[0];
+            let (path, mut params) = openapi_path(prefix, &first.path);
+            // A path parameter typed otherwise by another route: either type.
+            for (_, r) in routes.iter().skip(1) {
+                let (_, other) = openapi_path(prefix, &r.path);
+                for (p, o) in params.iter_mut().zip(other.iter()).filter(|(p, o)| o["schema"] != p["schema"]) {
+                    let mut alts = match &p["schema"]["oneOf"] {
+                        J::Array(a) => a.clone(),
+                        _ => vec![p["schema"].clone()],
+                    };
+                    if !alts.contains(&o["schema"]) {
+                        alts.push(o["schema"].clone());
+                    }
+                    p["schema"] = json!({ "oneOf": alts });
                 }
+            }
+            let mut query: Vec<(String, J, usize, usize)> = Vec::new();
+            for (_, r) in routes.iter() {
+                if let Some(Pattern::Record(fields)) = &r.query {
+                    for f in fields {
+                        let (schema, required) = field_schema(f);
+                        let name = f.path.join(".");
+                        match query.iter_mut().find(|(n, _, _, _)| *n == name) {
+                            Some(q) => {
+                                q.2 += 1;
+                                q.3 += required as usize;
+                            }
+                            None => query.push((name, schema, 1, required as usize)),
+                        }
+                    }
+                }
+            }
+            for (name, schema, seen, required) in query {
+                params.push(json!({ "name": name, "in": "query", "required": seen == routes.len() && required == routes.len(), "schema": schema }));
             }
             let mut op = Map::new();
             op.insert("responses".into(), json!({ "200": { "description": "the route's answer" } }));
             if !params.is_empty() {
                 op.insert("parameters".into(), J::Array(params));
             }
-            if let Some(body) = request_body(r.body_pat.as_ref()) {
-                op.insert("requestBody".into(), body);
+            let bodies: Vec<J> = routes.iter().filter_map(|(_, r)| request_body(r.body_pat.as_ref())).collect();
+            match bodies.len() {
+                0 => {}
+                1 => {
+                    op.insert("requestBody".into(), bodies.into_iter().next().unwrap_or_default());
+                }
+                _ => {
+                    let mut content = Map::new();
+                    for (kind, v) in bodies.iter().filter_map(|b| b["content"].as_object()).flatten() {
+                        let entry = content.entry(kind.clone()).or_insert_with(|| json!({ "schema": { "oneOf": [] } }));
+                        if let J::Array(a) = &mut entry["schema"]["oneOf"] {
+                            a.push(v["schema"].clone());
+                        }
+                    }
+                    op.insert("requestBody".into(), json!({ "required": true, "content": content }));
+                }
             }
-            let file = r.file.as_deref().map(|f| Path::new(f).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-            op.insert("x-quillo-at".into(), json!(format!("{}:{}", file.unwrap_or_default(), r.line)));
+            let at = |r: &RouteDef| {
+                let file = r.file.as_deref().map(|f| Path::new(f).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+                format!("{}:{}", file.unwrap_or_default(), r.line)
+            };
+            if routes.len() == 1 {
+                op.insert("x-quillo-at".into(), json!(at(first)));
+            } else {
+                op.insert("x-quillo-at".into(), J::Array(routes.iter().map(|(_, r)| json!(at(r))).collect()));
+            }
             let entry = paths.entry(path).or_insert_with(|| J::Object(Map::new()));
             if let J::Object(m) = entry {
-                m.insert(r.method.to_ascii_lowercase(), J::Object(op));
+                m.insert(method.clone(), J::Object(op));
             }
         }
         let mut fns = Map::new();
@@ -183,7 +272,9 @@ fn openapi_path(prefix: &str, segs: &[Seg]) -> (String, Vec<J>) {
             }
             Seg::Rest(n) => {
                 path.push_str(&format!("{{{}}}", n));
-                params.push(json!({ "name": n, "in": "path", "required": true, "schema": { "type": "string" }, "description": "the rest of the path" }));
+                // A template matches one segment: said, for a gateway to route the rest itself
+                // (FEEDBACK32.md, Q-405; branch feedback27-35-fixes).
+                params.push(json!({ "name": n, "in": "path", "required": true, "schema": { "type": "string" }, "description": "the rest of the path, slashes included", "x-quillo-rest": true }));
             }
         }
     }

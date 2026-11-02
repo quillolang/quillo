@@ -156,7 +156,8 @@ route GET /read-number = cookie(1)
     assert!(set[0].starts_with("a=2;") && set[1].starts_with("b=3;"), "{:?}", set);
     says(get(&mut it, "/bad-name"), 500, "`set_cookie` needs a cookie name of letters");
     says(get(&mut it, "/no-name"), 500, "`set_cookie` needs a cookie name");
-    assert_eq!(get(&mut it, "/delete").header("set-cookie").unwrap(), "a=; Path=/x; Max-Age=0; HttpOnly; Secure; SameSite=Lax");
+    // A deletion is Secure only over HTTPS (FEEDBACK34.md, Q-425; branch feedback27-35-fixes).
+    assert_eq!(get(&mut it, "/delete").header("set-cookie").unwrap(), "a=; Path=/x; Max-Age=0; HttpOnly; SameSite=Lax");
     says(get(&mut it, "/delete-bad"), 500, "`delete_cookie` needs a cookie name");
     says(get(&mut it, "/delete-options"), 500, "`delete_cookie` expects options as a map");
     assert_eq!(send(&mut it, "GET", "/read", &[("Cookie", "a=caf%C3%A9; b=2")], "").text(), "café");
