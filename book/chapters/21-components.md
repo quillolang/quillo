@@ -1,0 +1,951 @@
+# Components
+
+A `component` is a view with state that also runs in the browser:
+
+```quillo
+component Counter(start: int = 0) {
+    state count = start                  // state: set once; assigning it updates what shows it
+    let double = count * 2               // recomputed on every render
+    <div>
+        <span>{count} (x2 = {double})</span>
+        <button @click={() => { count += 1 }}>+</button>
+    </div>
+}
+
+route GET / = <html><body><Counter start={5}/></body></html>
+```
+
+- The server renders it like a view, inside a `<quillo-island>` that carries its props
+  and state. The page loads its bundle automatically, and the browser resumes the
+  component from that state, on the server's own elements (see below). The island is
+  `display: contents`, so it does not change the layout, but it is still an element:
+  a child selector such as `.posts > li` does not reach the component's root element
+  (write `.posts li`, or give the component's root the class), and `:first-child` or
+  `:nth-child` count the islands, so each component in a list is a "first child" of its
+  own island. A component whose root
+  is a table's or a select's part (`tr`, `td`, `th`, `thead`, `tbody`, `tfoot`,
+  `caption`, `colgroup`, `option`, `optgroup`) has no island element, since the browser
+  would move it out of the table: its root element carries the island (`data-qi`), so a
+  row component is a row. `raw(...)` in a component is likewise in a
+  `<quillo-raw style="display: contents">`, which a child selector does not see through.
+- `state count = start` declares state, set once (`~count = start` is the short form).
+  After that it is just `count`, and assigning to it (`count += 1`) updates what reads
+  it, and nothing else. A component's code runs once. A `let` that reads state or props
+  (`let double = count * 2`) is worked out again when they change. So is a statement
+  that reads them (`if running { every(...) }`). Each place in the markup that shows a
+  value follows only that value: changing one row's text changes that text. Assigning
+  the value a state already has does nothing.
+- `for` in markup keeps a row for each item: by its `key={...}`, else by its place. The
+  key is the row's element's, written after `=>` or as the value of a block
+  (`for p in xs { let n = p.name; <li key={n}>{n}</li> }`, whose statements the key may use).
+  `key` is the list's, not passed to the view or component, so neither may take a
+  parameter named `key` (a load-time error); an attribute written twice on one element
+  is an error too.
+  A row whose item changed is updated where it shows what changed, and moved rows keep
+  their DOM (and focus). `if`, `? :`, `match` and `cond && <markup>` in markup make a
+  branch again only when another one is chosen: an input in one keeps its focus and
+  what was typed while the page updates. Nested components keep their own state.
+- `@event={fn}` handles DOM events (`@click`, `@input`, `@scroll`, `@submit`, ...), on
+  HTML elements only (on a view or component tag it is an error). There are no
+  modifiers: `@click.prevent` is taken as an event named `click.prevent`, which never
+  fires; call `e.preventDefault()`. Event names are not checked, so a misspelt one
+  (`@clik`) is silent. Clicks are handled once, at the document, innermost first, so
+  `e.stopPropagation()` stops outer handlers, and a library that stops a click before
+  it reaches the document hides it from Quillo; other events listen on their element.
+  The function may take the event `e` (it gets it only if it declares a parameter):
+  - `e.value` and `e.checked` of the input (`null` and `false` when it has none), `e.key`
+    of a key press, `e.type`;
+  - `e.form`: the fields of the form, as a map (a file field gives the file's name; a
+    name given twice, the last);
+  - `e.target`: the element itself;
+  - any other field of the browser's event (`e.clientX`, `e.deltaY`, `e.shiftKey`,
+    ...), then of the element (`e.scrollTop`, `e.scrollHeight`, `e.clientHeight`,
+    `e.dataset`, ...);
+  - its methods: `e.preventDefault()` keeps the browser from doing what it would (an
+    arrow key moving the cursor, a pasted image going into a textarea). It must come
+    before anything the handler waits for (a `server fn`), since by then the browser
+    has gone on.
+
+  Setting a field sets the element's, when the event has no field of that name:
+  `e.value = ""` empties the input (a file picker too, so that picking the same file
+  again fires `change`). `@submit` does not reload the page. HTML5 drag and drop
+  (`e.dataTransfer`), pointer capture (`e.target.setPointerCapture(e.pointerId)`) and
+  SVG markup work as they do in the browser.
+- `bind:value={x}` and `bind:checked={x}` keep an input and a variable in step; there is
+  no other `bind:`. `x` is the component's state or a local, not a global or a map's
+  field (give each input its own state, and make the map with a `let`). `bind:value`
+  listens to `input` and `bind:checked` to `change`; an `@input` (or `@change`) on the
+  same input runs after the binding, with the state already set: `<input
+  bind:value={amount} @input={refresh}/>`. An input with `value={x}` (or `checked`, `selected`, and a `<video>`'s or `<audio>`'s `muted`) is held to `x`: after
+  each handler it is set back to the state, so typing the state does not take is
+  undone. A bare `<input>` keeps what is typed, read through `e.value` or `e.form`.
+- `style={...}` takes text or a map of properties: `style={{ color: tone, font_size:
+  "2rem", marginTop: "3px", "--gap": "4px" }}`, where `_` and camelCase are written as
+  `-` (`font-size`, `margin-top`), a custom property is kept as it is, and a `null` or
+  `false` value is left out; the same on the server and in the browser.
+  `style={...}` and `class={...}` change only what they name when what they read
+  changes: a `transform` or a class a handler set by hand stays, so a drag does not jump
+  home. `<details open={x}>` and `<dialog open={x}>` follow `x` when `x` changes, and
+  leave what a person opened or closed alone otherwise (FEEDBACK28.md, Q-337, Q-338).
+- `==` on two of the page's objects (elements, events) asks whether they are the same one
+  (Q-334).
+- Assigning state updates the page a moment later (once the handler's synchronous code
+  is done, or at its first wait), all changes at once. A state is changed when it gets a
+  different value: assigning the same list again does nothing, and assigning an equal
+  but new list updates what reads it. Code that sets what it reads goes round in a loop,
+  and is stopped after 1,000 rounds with a message in the console. See
+  [Reactivity](#reactivity) for the whole model.
+- `every(ms, f)` in a component's code calls `f` every `ms` milliseconds, in the browser,
+  for as long as the code that called it stands: `if running { every(100, step) }`
+  runs a game while `running` is true, starts again with the new speed when that changes,
+  and stops when `running` is false or the component leaves the page. On the server it
+  does nothing. It is called from the component's code (or a `let` or `if` there), or
+  from one of its event handlers or its `@mount`, where it runs until the component
+  leaves the page (started after a handler's first wait, it belongs to no one, and is an
+  error). A tab in the background is slowed by the browser to once a second at most.
+- `run_after(ms, f)` calls `f` once, `ms` milliseconds on, unless its component has gone
+  first: from a handler, `@mount` or the component's code alike. There is no
+  `setTimeout`; a debounce or a throttle is an `every` under a state flag that the tick
+  turns off. `page_updated()` in a handler waits until the page shows what the handler
+  has set so far, to read or focus what that made appear (FEEDBACK28.md, Q-349).
+  `listen(url, f)` follows a stream the same way (see [Streaming](#streaming)), and opens
+  it again when the connection drops (after a second, doubling up to 30 s), not when the
+  stream ends.
+- Component code, and the functions, views and constants it uses, is compiled to
+  JavaScript. Code that cannot run in a browser is an error when the program loads
+  (under `--watch`, in the log right after the load, and in the browser's console of
+  a page that needs the component; and in `quillo check`, for what the component calls
+  directly): `request`, `db`, `env`
+  (but for variables named `PUBLIC_...`), files, `reply`, or a global the server changes
+  (pass it as a prop instead). `http.*` runs in the browser, from event handlers (see
+  [What the browser can reach](#what-the-browser-can-reach)). Any name is fine in
+  component code, JavaScript's own words included (`new`, `class`, `this`, `window`): the
+  compiler renames them.
+- What the browser has of the standard library: text, lists, maps, numbers, errors,
+  `raw`, `escape`, `url_encode`, `now`, `random`, `random_int`, `uuid`, `format_number`,
+  `markdown` (made by the server), `highlight`, `t` and `locale`, `json`, `re`, `math`,
+  `stats`, `vec`, `date`, `money`, `http.*`, and what only a page has: `url`,
+  `navigate`, `every`, `listen`, `receive`, `ask`, `notify`, `js`, `js_new`,
+  `channel.open`. `print` writes to the console. Not there, and an error when the
+  program loads: `env` (but `PUBLIC_`), `sleep`, files, `redirect`, `respond`,
+  sessions and cookies, `crypto`, `image`, `db`, `publish` and `watch`, tenants,
+  uploads, `schedule`, `stream`, `events`, `http.stream`, `join_on`, services.
+- There is nothing built in for `document`, `window`, `localStorage`, the clipboard,
+  focus or scrolling: reach them through the page, `js("localStorage.getItem", k)`,
+  `js("navigator.clipboard.writeText", s)`, `js("window.innerWidth")` (no arguments
+  reads a value), and `el.focus()` on an element (see [JavaScript
+  libraries](#javascript-libraries)).
+- Each page loads two scripts, minified, whose addresses change with their content, so
+  the browser keeps them for good:
+  - `/_quillo/r/<hash>.js`, the runtime: the parts of it the program's components
+    reach (about 35 KB, 11 KB gzipped, for a page with one counter). Every page of the program
+    loads the same one, so the browser downloads it once.
+  - `/_quillo/b/<hash>.js`, the page's own code: the components it was rendered with,
+    every component they can show, and what they use. Pages with the same components
+    share it, whichever of them each showed.
+
+  A page with no components loads no script. The server keeps the bundles of the last
+  256 sets of components pages were made of (`quillo_bundles` under `--metrics`); a
+  page that names one no longer kept is sent the whole program's. There is no splitting
+  by route and no lazy component: an `App` whose `match` shows thirty pages carries the
+  thirty in its bundle. Under `--watch` a page loads one unminified bundle instead,
+  which loads a file per component and function (see [Debugging](#in-the-browser)).
+- And only when it is needed: the server's HTML shows at once, and the bundle comes
+  when someone reaches for a component (points at, touches or focuses it, or presses a
+  key in it). What they typed before it came is kept, and each click, double click,
+  right or middle click, press and release is done again then as it was made: on the
+  same element, at the same point, with the same buttons, keys and click count (a
+  `@pointerdown` may still capture a pointer whose finger was lifted meanwhile). A
+  click waits for the code, so a checkbox ticks and a link is followed then; should the
+  code fail to load, they are done as the page alone does them. (The idea comes from
+  Flickr, Google's JSAction, Angular's preboot and event replay, Qwik and React: see
+  Acknowledgements in the [README](README.md#acknowledgements).) A
+  component that runs by itself (`every`, `live`, `listen`, `js`, `js_new`, `@mount` in
+  its code or markup, or in a component nested inside it) or that is the page (in
+  `<body>` itself, an app) loads as soon as the page is idle. `/_quillo/quillo.js` has
+  every component, for pages that load it themselves. Text responses are gzipped for
+  browsers that accept it.
+- A component is an element `<quillo-island data-c="Name" data-p="{props}"
+  data-s="{state}">`, with `data-l` and `data-v` for live state and `data-e` when it runs
+  by itself. Values cross as JSON, with these marked so they come back as they were: a
+  decimal (`{"$dec": "12.50"}`), an int past 2^53 (`{"$int": "..."}`, a BigInt in the
+  browser), an error value (`{"$quillo_err": ...}`). NaN and infinities become `null`;
+  dates are their text, as everywhere.
+- A `state` that still holds its very prop (`state items = initial`) is written in the
+  page as a reference to the prop, not as a second copy of it.
+- Components are resumed, not made again: the browser runs a component's code once,
+  from the state the server sent, and takes the server's elements as its own (checking that
+  they are the same) instead of replacing them, so images do not reload, a scrolled
+  list stays where it is and what someone typed stays typed. Each component is resumed
+  when it is first reached, the others when they are needed. An element whose tag or
+  text differs (a script changed the page) is made again, for that component only.
+  `state` initializers do not run again in the browser: the server's values win. There
+  is no virtual DOM: each state is a signal, tied to the text, attributes and classes
+  that show it, and a list's rows are moved by key.
+- A JavaScript error in a handler, `@mount`, a statement or an initializer is written
+  to the console (`quillo: ...`), and pushed onto `window.__quilloErrors` if the page
+  made that list; the component goes on. There is no error overlay on the page.
+- `ask(message, { title, ok, cancel, tone })` asks in a dialog on the page and waits for
+  the answer (`true` or `false`) — a handler goes on after it, and its buttons, unless
+  `ok` and `cancel` are given, are in the page's locale (see
+  [Translations](#translations)); `notify(message, { title,
+  tone, seconds })` shows a note that goes by itself. Both are markup with `q-` classes
+  in a host the page lays out (`<body data-notices="dialog-center toasts-top-right">`)
+  and styles: keyboard, focus and screen readers are taken care of (Escape, the
+  backdrop and Cancel answer `false`; `tone: "danger"` starts on Cancel; a note goes
+  after 4 seconds unless `seconds` says otherwise). On the server both are an error:
+  they speak to someone in the browser.
+- The classes and attributes Quillo sets itself, for a sheet to style. No `.qwe` file
+  writes them, so a tool that drops CSS it finds no use for (PurgeCSS and the like) must
+  be told to keep them:
+
+  | Set by | Classes and attributes |
+  |---|---|
+  | `ask` | `q-notices` (the host), `q-backdrop`, `q-dialog`, `q-title`, `q-message`, `q-actions`, `q-cancel`, `q-ok`; `q-open` while shown |
+  | `notify` | `q-notices`, `q-toasts`, `q-toast`, `q-title`, `q-message`, `q-close`; `q-open` while shown |
+  | `ask`, `notify` with `tone` | `q-` and the tone, on the dialog or toast: `q-danger`, `q-success` |
+  | the host's places | the page's `data-notices` on `<body>`, else `dialog-center toasts-top-right`, as classes of `q-notices` (any `dialog-...` and `toasts-...`) |
+  | `highlight(code, lang)` | `hl-k` keywords, `hl-s` strings, `hl-c` comments, `hl-n` numbers and constants, `hl-f` functions called, `hl-t` types and tags, `hl-a` attributes, properties and keys |
+  | `<quillo-media>` | `data-state`: `connecting`, `waiting`, `playing`, `ended`, `unsupported`; one that sends: `starting`, `sending`, `refused`, `ended`, `unsupported` |
+  | a component's `style` | `data-q-<id>` on the elements it writes |
+- In the browser, numbers are JavaScript numbers, so a whole float such as `2.0` prints
+  as `2`, and `json.stringify(json.parse("1.0"))` gives `1`. While the server renders a
+  component it writes numbers the same way, so the page it sends is the one the browser
+  would make and is taken up, not made again. Neither side uses an exponent. Arithmetic
+  gives the same results on both sides: ints stay exact past 2^53, to 64 bits, as do
+  those from `json.parse` where the browser says what the text was (Chrome, Edge,
+  Firefox and Safari since 2025). Elsewhere the server writes `2.0`. `math.*` may differ
+  in the last digits, as each side has its own library.
+- A map keeps its keys in order on the server. In the browser, keys that look like whole
+  numbers come first, in number order, as in any JavaScript object, so `keys`, `values`
+  and `for [k, v] in m` over `group_by(xs, (x) => x.id)` can differ, and a page showing
+  such a map is made again. Sort the keys, or keep a list. With `--watch`, a component the browser had to make again says which,
+  and what differed, in the console.
+
+## Composition
+
+Views and components nest like HTML: a capitalized tag renders another view or
+component, its attributes are the props, and what is between the tags arrives as the
+`children` parameter, or `null` for a tag with nothing between (`<Card title="x"/>`),
+on the server as in the browser, so `children == null` tells the two apart (FEEDBACK28.md,
+Q-345), and `quillo check` warns on `str(children)`, which is `"null"` then. A component is used by its tag: called as a function (`let make = Dead`, then
+`make()`, or given to `map`) it would show and never answer, so it is an error, and `quillo
+check` says so.
+
+```quillo
+view Card(title: str, children) = <section.card><h2>{title}</h2>{children}</section>
+
+component Counter(label: str, start: int = 0, on_change = null) {
+    state n = start
+    <p>{label}: {n} <button @click={() => { n += 1; on_change && on_change(n) }}>+</button></p>
+}
+
+component Panel(header, children) {          // `header` is a named slot: any HTML
+    state open = true
+    <div>
+        <div @click={() => { open = !open }}>{header}</div>
+        {open && children}
+    </div>
+}
+
+component Dashboard() {
+    state total = 0
+    <Card title="Counters">
+        <Counter label="Apples" on_change={(v) => { total = v }}/>   // child to parent
+        <Counter label="Pears" start={3}/>
+        <Panel header={<b>Details</b>}><p>Last change: {total}</p></Panel>
+    </Card>
+}
+```
+
+- **Down:** props. **Up:** pass a function (`on_change`) and call it. A call of a
+  function given as a prop is waited for, so what it gives is what the child gets: a
+  callback that only sets state (`cb={() => { x = 1 }}`) gives `null`, and so does one
+  that ends in a page's Promise (`cb={() => js("Promise.resolve")}`) once it is done. A
+  child that must know whether its caller finished has the caller give `true` when done,
+  or calls a `done` function it is given. There is no
+  context or global store: state in the outermost component, passed down, is the store.
+  Components placed separately in a page share nothing in the browser; they share
+  through the server (`live`, channels).
+- Props are passed live: a child shows its parent's new value without either running
+  again. Each component keeps its own state; give components in a list a `key={...}`
+  so each keeps its own (a new key makes it afresh). A key is text or a number: a list
+  or a map as a key never matches, and remakes its row each time.
+- A view or component takes only the parameters it declares: there is no rest
+  parameter, so `id`, `data-*` or a class meant for its root element is passed as a
+  parameter it declares (`<Button id="x">` is an error unless `Button` has `id`).
+- A component may show itself (a tree of comments), as long as it stops somewhere.
+- There are no portals and no refs: `@mount={(el) => { box = el }}` with `state box =
+  null` keeps an element, and `js("document.body.appendChild", el)` moves one.
+- What reads a prop follows it, as what reads state does: a place in the markup that
+  shows it (`{label}`, `class={...}`), a `let` (`let doubled = count * 2`), a statement
+  (`if active { every(1000, tick) }` starts and stops with it), `live(load, id)` (loads
+  again when `id` changes), and a prop passed on to a child. A handler reads its value
+  when it runs.
+- `state x = prop` reads the prop once, when the component starts: state is the
+  component's own. To follow the parent, read the prop (or a `let` of it); to start over
+  when it changes, give the component a `key` that changes with it. There is no hook
+  that says the prop changed under a state copied from it: the `key` starts afresh, and
+  loses what was typed.
+- A function called in markup with a state, `{tick(on)}`, is called again at each change.
+  When its markup comes out the same shape and nothing in it follows state itself, the
+  page's elements are kept and take the new attributes, text and handlers, so an input in
+  it keeps its focus and what was typed. A function whose markup changes shape is made
+  anew, and its input loses the focus: there, use a `view`, whose props are live.
+- A plain function used as a tag (`<Row item={x}/>` where `Row` is neither a view nor a
+  component) is called again as a whole when what it is given changes.
+- Views are plain functions: they have no state and add nothing to the browser bundle
+  unless a component uses them.
+- A component placed directly in a page gets its props from the server, so they must
+  be data (no functions, no HTML values), and they stay as the page was made: nothing
+  above it changes them. Inside another component, props can be anything (callbacks,
+  HTML, other values), and follow that component's state. A component's `state` must be
+  data wherever it is. `quillo check` does not see a prop or state that is not: the page
+  fails as it renders (`prop header of <D> is html, which cannot be sent to the
+  browser`). `children` placed from the server travels as its HTML.
+
+## JavaScript libraries
+
+A component can hand an element to a library (a chart, a map, an editor) and call into
+it. Name the library on a line that starts with `client`, then call it as JavaScript does:
+
+```quillo
+client "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" use Chart
+client /assets/leaflet.js use L
+client "https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"
+    use confetti
+
+component Sales(points: list) {
+    state chart = null
+    <canvas @mount={(el) => {
+        chart = Chart.new(el, { type: "line", data: points })    // new Chart(el, ...)
+        () => chart.destroy()                   // when the canvas leaves the page
+    }}></canvas>
+    <button @click={() => confetti({ particleCount: 120 })}>Celebrate</button>
+}
+
+component Where() {
+    <div class="map" @mount={(el) => { L.map(el).setView([14.6, 121.0], 12) }}></div>
+}
+
+route GET / = <html><body><Sales points={load_points()}/></body></html>
+```
+
+- `client <script> use Name`: `client` says this runs in the browser, and the path says
+  where it comes from: an address (a CDN) or a file of your own, ending in `.js` or
+  `.mjs`. `Name` is what the script defines on the page (`Chart`, `L`, `confetti`,
+  `dayjs`): the name the library's own documentation uses, in its case. Several from one
+  script: `client /assets/leaflet.js use L, LeafletDraw`; another name for one:
+  `client "..." use Chart as ChartJS`. Quotes are optional, as for every path; put an
+  address in them, so editors do not read its `//` as a comment.
+- A long address may leave its `use` to the next line, as `confetti` does above, so the
+  names stay at the left. `quillo fix` breaks a line this way when it would be long.
+- `client`, `preload`, `preconnect` and `module` are still names everywhere else:
+  `client / 2` is a division. It is the `use` after a file that makes the line an import.
+- Each file that calls a library says so, as for any name: another file that calls
+  `Chart` writes the same line. The page still loads the script once.
+- `Name.new(args)` makes an object of a class (`new Chart(el, config)`); `Name(args)`
+  calls a function (`confetti()`); `Name.fn(args)` calls one of its functions
+  (`L.map(el)`, `dayjs.extend(...)`); `Name.field` reads a value (`Chart.version`).
+  What they give is the library's object, whose methods and fields are used as below
+  (`chart.update()`, `map.setView(...)`).
+- The page loads the script only where a component that uses the library is on it (or
+  one it can come to show), once, in the order the program names its libraries, before
+  the components' own code. A page without such a component loads nothing more. No
+  `<script>` tag is written; one you write still works, as below.
+- A path (`/assets/leaflet.js`, `assets/leaflet.js`) is from the program's own address,
+  under its base path; serve it as any other file (`public/`, or a route with `file()`).
+  An address (`https://...`, `http://...`, `//...`, in any case) is loaded as written:
+  pin its version. Either may carry a query or a fragment (`/assets/app.js?v=2`). Any
+  other kind of address (`ftp:`, `file:`, `data:`) is refused, and so is one with a user
+  name or password in it: browsers do not load those, and the page would show it.
+- A page loads a library late: when the browser is idle, or at the first touch of a
+  component that only answers clicks. To get ready for it sooner, start the line with
+  `preload` or `preconnect` in place of `client`:
+
+  ```quillo
+  preload "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" use Chart
+  preconnect "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" use L
+  ```
+
+  `preload` has the page's `<head>` fetch the script (`<link rel="preload"
+  as="script">`), which suits a library the page uses as soon as it opens, such as a
+  chart in its `@mount`. `preconnect` only opens the connection to the script's
+  host (`<link rel="preconnect">`), which costs little and suits one a click may need;
+  it takes an address, since a path is on the page's own connection. Take one or the
+  other: a preload opens the connection itself. Each goes only in
+  pages that can load the library, as the script does. A preload is fetched whether or
+  not the library ends up used, so keep it for one or two scripts a page needs at once.
+- The names are known to `quillo check` and the editor. They are the browser's: on the
+  server, while a component renders, `Chart.version` and `Chart.new(...)` give null, as
+  `js(...)` does, so call them in `@mount` and event handlers.
+- Mistakes say what to do: `Chart(el)` for a class stops with "Chart is a class: make
+  one with Chart.new(...)"; a name in the wrong case gives an error value,
+  `js_new: chart is not defined on this page (did you mean Chart?)`; so does a script
+  that did not load.
+- Without `module`, `client` takes a library that sets a global (a "UMD" or "browser"
+  build: `.umd.js`, `.min.js`, `.browser.js`). An ES module is below; an npm package
+  needs a CDN that serves it as one.
+
+An ES module (`import`/`export`) gives names by exporting them, and `module` after the
+first word takes them. Nothing goes on `window`: what the module exports is kept in Quillo's runtime, where
+the page's scripts cannot reach or replace it, and is called as any library is:
+
+```quillo
+client module "https://esm.sh/chart.js@4.4.1" use Chart, registerables
+preload module "https://esm.sh/chart.js@4.4.1" use Chart as ChartJS
+client module "https://esm.sh/dayjs@1.11.13" use default as dayjs
+client module "https://esm.sh/three@0.170.0" use * as THREE
+client /assets/helper.mjs use helper
+
+component Scene() {
+    <canvas @mount={(el) => {
+        let scene = THREE.Scene.new()
+        scene.name = dayjs().format("YYYY")
+    }}></canvas>
+}
+```
+
+- Each name is an export, and `as` gives it another name. `default as Name` takes the
+  default export, and `* as Name` the whole module (`THREE.Scene.new()`,
+  `Name.default(...)`).
+- A file ending in `.mjs` is a module without saying so. A `.js` file or an address may be
+  either, so `module` says which.
+- With `preload`, the page has `<link rel="modulepreload">`, and with `preconnect` a
+  connection made for CORS. A module at another address needs its server to send
+  `access-control-allow-origin`, as the public CDNs do, and its own imports must be
+  addresses too: a CDN such as esm.sh or jsDelivr's `/+esm` rewrites an npm package's.
+- A page's components start once its modules are in, so a slow module holds them back,
+  and what is done on the page meanwhile is done when they start.
+- `quillo check` cannot read a module at an address, so a wrong name is known in the
+  browser: an error value where it is used, `gone: /x.js has no export \`gone\``, or
+  `/x.js did not load: ...`, and the rest of the page runs. Calling a class without `.new`
+  and the rest say what they do for any library.
+- `js("Chart")` finds the module's `Chart` too, ahead of a `Chart` on the page. Anything
+  else `js` and `js_new` find from the page's globals.
+
+Without `use`, a page's own `<script>` tags work too, and `js` and `js_new` reach what
+they define by name:
+
+```quillo
+component Sales(points: list) {
+    state chart = null
+    <canvas @mount={(el) => { chart = js_new("Chart", el, { type: "line", data: points }) }}></canvas>
+}
+
+route GET / = <html><head><script src="/assets/chart.js"></script></head>
+                    <body><Sales points={load_points()}/></body></html>
+```
+
+- `@mount={(el) => ...}` runs once the element is on the page, once in its life (on a
+  server's element too, when the component is resumed). A function it returns runs when
+  the element leaves the page, or its component does. That is the only lifecycle hook:
+  what runs when state changes is a statement that reads it.
+- A Quillo function handed to the page's JavaScript (an event listener, a callback) is
+  called with as many arguments as it declares, so `marker.on("click", () => ...)`
+  works, and `off` finds what `on` was given.
+- `js("path.to.fn", args...)` calls a function of the page's scripts, found by its dotted
+  name from the page's globals (`js("L.map", el)`, `js("analytics.track", "signup")`),
+  and gives its result; `js_new("Chart", ...)` makes an object of a class. A library's
+  name from `use` is the same call written as JavaScript reads, with the same checks.
+  The name is written in the code: one from data could reach anything on the page, so a variable is
+  an error when the program loads, as are `eval`, `Function` and the like.
+- Objects from the page (elements, a library's objects) have their properties and
+  methods as fields: `el.value`, `chart.update()`; and their fields can be set:
+  `el.value = ""`, `el.scrollTop += 100` (only theirs: a map's fields are made anew,
+  with `set` or `{ ...m, name: v }`). A plain `fn` may set them too, on a parameter of
+  no declared type that a component hands it (`fn paint(ctx) { ctx.fillStyle = "red" }`,
+  called as `paint(el.getContext("2d"))`), so drawing code is shared by components;
+  run on the server, it is an error there. `innerHTML`, `outerHTML`, `srcdoc` and `on...` are
+  not set, and nothing is set to a `javascript:` URL. What runs text as code or HTML is
+  refused: `eval`, `Function` and its kin, `setTimeout` and `setInterval`,
+  `insertAdjacentHTML`, `document.write`, `DOMParser`, `setAttribute("on...")`, script
+  elements, nodes of another document, `javascript:` URLs (in lists and maps too) given
+  to the page's functions, and what steps around these checks (`Reflect.set`,
+  `Object.assign`, `Function.prototype.call`). Markup in the component does all of that
+  safely.
+- These checks are a guard-rail against mistakes, not a security boundary. Code that
+  calls into the page can do what the page's scripts can, and a program set on it can
+  find ways through (a library function that writes HTML, a function of the page
+  reached inside data the page gave back, a `blob:` page opened in a frame). Keep data
+  out of what `js` calls, as you would in JavaScript.
+- A Promise a page's function gives (`navigator.mediaDevices.getUserMedia`, `fetch`) is
+  waited for where code can wait, as a `server fn` call is: in an event handler, in
+  `@mount`, in a `state` initializer, and in the component's `let` functions that its
+  markup does not call (`let locate = () => { ... }`, then `@click={locate}`): `let cam =
+  js("navigator.mediaDevices.getUserMedia", { video: true })` is the stream, or an
+  error value if it was refused. The same holds for a method of what the page gave
+  (`img.decode()`, `audio.play()`) and for a function given as a prop, so there is one
+  rule: a call of the page's that gives a Promise is waited for where code can wait.
+  Elsewhere (a function `map` calls, a function the markup calls, a statement that runs
+  again, a top-level `fn`), with `.then`, `.catch` or `.finally` after it, and for what
+  `js_new` makes (`js_new("Promise", ...)`, kept to be used later), it stays a Promise:
+  `js("load").then((x) => { data = x })`. `type_of` calls one `promise`. A function of the
+  program's that the page calls with `undefined`, as `.then` does for a Promise of
+  nothing, is given `null` (FEEDBACK28.md, Q-336). To wait for what `js_new` makes, and
+  catch its failure, wrap it: `js("Promise.resolve", js_new("Promise", ...))`.
+- A handler pauses only where something waits. A block in it (`match`, `if`, `for`) is
+  made to wait only when something inside it waits; a call of a module's function
+  (`date.`, `re.`, `money.`, `math.`, `stats.`, `vec.`) is never waited for; and a call of
+  a function compiled here (the component's own, or a top-level `fn`) that is known to
+  give no Promise is not waited for, so it can be given to `map`, `filter` and `reduce`.
+  A state started from a module's function is set at once, in a component made later
+  too. A component's own function named like a method of the page's objects is not
+  waited for outside waiting code, so a Promise's executor that throws rejects it.
+- A `let` set from the page (`let w = js("window.innerWidth")`, `js_new(...)`) is null
+  while the server renders, so a component that shows it in its markup is made again in
+  the browser; `quillo check` warns of it: write `state w = js(...)`, which runs again
+  in the browser (below).
+- `js_has("navigator.vibrate")` says whether the page has a feature without calling it,
+  as `js(...)` would; `false` on the server (Q-341). A field's `selectionStart` counts
+  UTF-16 units, as JavaScript does, and `slice`, `len` and `s[i]` count characters:
+  `cursor_index(text, el.selectionStart)` turns the one into the other (Q-344).
+- A `state` initializer that reads the page (`state wide = js("window.innerWidth") > 800`)
+  gives null while the server renders the component, and runs again in the browser
+  once the component is on the page, which sets the state from what it gives. An
+  image's `@load` that came before the code is sent to the image once the code runs
+  (its `e.target` is the image), and runs once.
+- A name the page does not have (a library's `<script>` left out) gives an error value,
+  `js: L.map is not defined on this page`, so a component can say so instead of stopping.
+- On the server, `@mount` does nothing and `js` gives null.
+- `js` names what it calls in the code (`js("Chart", ...)`, not `js(name, ...)`), which
+  `quillo check` says as loading the program does.
+- There are no npm packages, `import`s or TypeScript: a library is a script the page
+  loads (named with `use`, or a `<script>` tag), and component code reaches it by name. `js("fetch", url)` works, but `http.*`
+  is the way.
+
+## Single-page apps
+
+`url()` gives `{ path, query, hash }`: of the request on the server, and of the address
+bar in the browser, where what reads it follows it when it changes. A browser never
+sends the hash, so on the server it is `""`, and a component that shows something by
+the hash is made again in the browser. A query key given twice keeps the last. Once a
+component has called it, clicks on same-site links inside components change the page
+without reloading; Back and Forward work. `navigate("/path")` does the same from code;
+on a page where no component has called `url()`, it loads that page as a link would.
+(Links with a modifier key, `target`, `download` or `data-reload` work as usual.) A link
+or `navigate("#spot")` to a spot on the same page goes there as the browser does:
+scrolled into view, and CSS `:target` set. `navigate("/page#spot")` goes to the spot
+once the new page shows it, and stays at the top if it never does.
+
+```quillo
+component App() {
+    state cart = []                               // survives moving between pages
+    let path = url().path
+    <div>
+        <nav><a href="/">Home</a> <a href="/products">Products</a> Cart: {len(cart)}</nav>
+        {match split(path, "/") | filter((s) => s != "") {
+            [] => <Home/>
+            ["products"] => <ProductList/>                      // loads with state items = list_products()
+            ["products", id] => <ProductPage key={id} id={int(id)} on_add={(p) => { cart = cart + [p] }}/>
+            _ => <NotFound {path}/>
+        }}
+    </div>
+}
+
+route GET /*rest = <html><body><App/></body></html>       // every path renders on the server
+```
+
+Pages load their data with `server fn`s in `state` initializers: on the server while
+rendering, in the browser when you navigate to them, where the state is `null` until
+the answer comes (show something for `null`). Give a page component a `key` from
+its URL (`key={id}`) so a new product starts with fresh state. `navigate` scrolls to
+the top; links outside the program's mount, and under `/_quillo/`, load as usual. A
+full page load starts every state afresh: keep what must survive one on the server, or
+in `localStorage` through `js`. See
+[spa.qwe](https://github.com/quillolang/examples/blob/main/spa.qwe), which also answers 404 on the server for unknown paths.
+
+## Live data
+
+`live(load, ...args)` makes component state follow the server: `load` (a `server fn`)
+runs again, and what shows the state follows it, whenever something it read changes, for
+anyone, not only when this page acts.
+
+```quillo
+server fn load_notes() = db.query("select * from notes order by id")
+
+server fn add_note(text: str) = db.exec("insert into notes (text) values (?)", text)
+
+component Notes(initial: list) {
+    state notes = live(load_notes)  // every open page sees new notes
+    ...
+}
+```
+
+- `live` takes a `server fn` by its name (not a lambda, not a variable holding one),
+  and in a component only as a `state` initializer: `state notes = live(load_notes)`.
+  The checker refuses other forms. In a route or a view it calls the function once and
+  follows nothing: live data is a component's.
+- Its arguments are followed too: `live(load, id)` runs `load` again with the new `id`
+  when the prop or state it came from changes, and an answer still on its way for the
+  old one is dropped. They are sent as JSON, so they must be data. Until the new answer
+  comes, the state keeps the old one: `waiting(grid)` is true meanwhile (and while a
+  page the browser made waits for its first), so a grid titled December can say that it
+  still shows November: `<table class={waiting(grid) ? "stale" : ""}>`. On the server it
+  is false, since the server renders with the answer.
+- What a loader *reads* is recorded: the tables in its queries (`from notes`,
+  `join users`, in subqueries too; a schema's prefix is dropped, so `a.notes` and
+  `b.notes` are one table) and the global variables it uses (`todos`; a global holding
+  a function is not followed). What any code *writes* is announced: `insert`, `update`,
+  `delete`, `truncate`, `create`, `alter` and `drop table` through `db.*`
+  (`insert ... select` writes one table and reads another), and assignments to globals.
+  This works the same with SQLite, PostgreSQL and MySQL, and with data kept in variables.
+  Not seen: what a trigger, a stored procedure or a `copy` writes, writes to the tables
+  behind a view a loader reads (the view's name is what is recorded), and MySQL's
+  `delete t from t join u` form. Publish a topic for those.
+- Topics have names: a table is `db:notes` (`db@55c8e71313e4:notes` on a connection from
+  `db.connect`, by a label made from where the database is, the same for every spelling
+  of it: see [Several databases](#standard-library-several-databases)), a global `var:todos`, and `publish("thread:7")` what it
+  says. With tenants, every topic but a global's belongs to the tenant, so a `publish`
+  wakes only the same tenant's pages; in a mounted program they are the mount's.
+  `watch` and `publish` take several topics at once; `unwatched(f)` calls `f` with
+  nothing.
+- A loader that gives an error value makes the state that error value, sent whole; one
+  that fails with a runtime error, or `reply`s a status that is not a success, leaves
+  the page's state as it was (the console says so), and the next change tries again.
+- A page may follow at most 256 topics; past that, the rest hear nothing.
+- Inside `db.transaction`, the announcement waits for the commit, and is dropped
+  on rollback.
+- `publish("topic")` announces anything else, and `watch("topic")` inside a loader
+  subscribes to it.
+- What a loader reads includes what the functions it calls read: a `me()` that looks up
+  the `sessions` table makes every loader calling it run again when anyone signs in.
+  `unwatched(() => me())` calls it without following what it reads, though what it read
+  still makes the run the viewer's own. Keep what changes often but is not shown (view
+  counts, last-seen times) in a table of its own, so writing it wakes no page.
+- A field of a global map, read as `world.scores`, is a topic of its own
+  (`var:world.scores`): a loader that shows it runs again when that field changes, not on
+  every write to the map, even 20 times a second from a game's loop. Assigning the map
+  announces each top-level field whose value changed (what `{ ...world, tick: t }` keeps
+  is unchanged), and the map itself, for what reads it whole (`world`, `keys(world)`,
+  `world.len`, a field it lacks). Deeper fields are not followed apart: `world.scores.ana`
+  follows `scores`.
+- A write to a table wakes every loader that read the table, whatever rows it read:
+  a reply in one thread runs `load_posts` again on every open thread page. To follow
+  one thread only, read the table `unwatched` and watch a topic of its own, which the
+  code that writes publishes:
+
+  ```quillo
+  server fn load_posts(thread: int) {
+      watch(`thread:${thread}`)
+      unwatched(() => db.query("select * from posts where thread = ?", thread))
+  }
+
+  server fn reply_to(thread: int, text: str) {
+      db.exec("insert into posts (thread, text) values (?, ?)", thread, text)
+      publish(`thread:${thread}`)
+  }
+  ```
+- A loader runs again as a call from the page, with the page's cookies, so `session()`
+  inside it is the viewer's session. So what should happen when new data arrives for a
+  viewer (marking posts or messages read) is done in the loader: a component's code
+  cannot call a `server fn` when state changes, but the loader is that call. A page
+  whose loader writes is not prefetched (see [Prefetching](#routes-prefetching)); it is made
+  when the link is followed. What a loader writes does not wake that loader again on its
+  page, since its answer has it already (pages showing it elsewhere are woken), and a
+  statement that changed no row (`update messages set seen = 1 where seen = 0`, once
+  everything is seen) is not announced at all: a loader that marks what it shows as
+  read runs once for each change, not for ever.
+- The server renders the first value; the page keeps one WebSocket open
+  (`/_quillo/live`, served by its own thread), down which the server streams each
+  change to its topics (the names, with a sequence number; a ping every 20 s when
+  nothing changed), and calls the loader again, so a page gets the latest value, not
+  every change in between: changes made while a page was disconnected are caught up on
+  when it comes back. A WebSocket, because browsers
+  allow only six HTTP/1.1 connections to a host across all tabs: requests left
+  waiting would hold them, and server calls would queue behind them. Where a
+  WebSocket cannot open, the page asks the same URL as a plain request instead,
+  answered at the first change or after 25 s, and asked again at once. A connection
+  that drops is opened again after a second or so, spread out, and after a restart pages
+  ask for their data over a second, so that they do not all come at once; when the
+  server cannot be reached, the page waits longer each time, up to half a minute. A tab
+  in the background keeps its connection and runs its loaders as a visible one does. A
+  page on another site cannot open it (403).
+- A server keeps at most 4096 such connections open (live data, `--watch` reloads,
+  channels over a WebSocket), and at most 256 for one client: an IPv4 address, or an
+  IPv6 /64 network. Channels over WebTransport are not counted. Past that, a page is
+  answered `503`, keeps what it shows, says so once in the console, and asks again when
+  told. The server says so once in its log, and `quillo_live_refused_total` counts them.
+- **Behind a proxy, name it.** Every visitor is then the proxy's address, so without
+  this only 256 pages get updates. `--trust-proxy 127.0.0.1` (addresses or networks,
+  comma-separated) believes `X-Forwarded-For` on connections from those: the client is
+  the nearest address in it that is not one of them, for this limit, for `request.ip` and
+  everywhere else. From any other address the header is ignored, as a client can write
+  it. When one address really is many visitors, as an office is, `--live-per-client 1000`
+  raises the limit.
+- Only changes made through Quillo are seen: a row changed by another program
+  (`psql`, a script) does not wake pages.
+- One change wakes the pages showing it, and no others, and they all ask at once. The
+  first change goes to a page at once; what comes within a tenth of a second or so after
+  it goes as one, so a burst of writes is a few refreshes, not one each.
+  `live({ every: "2s" }, load)` asks for a gap of its own between a page's refreshes,
+  as `500`, `"500ms"`, `"2s"` or `"1m"`, written here as it is.
+- A loader's run is shared by the pages that ask, within two seconds, for the same
+  function with the same arguments (and the same `Host`) while nothing it read has
+  changed: fifty open boards run `load_board` once, and that goes for a page's first
+  load too. Calls that come while a run is under way wait for it. A run that read the
+  request (`session()`, cookies, headers, the locale) is shared only by the same viewer's
+  pages (their tabs), wherever in the run it read it; a viewer is told by address,
+  cookies, `Authorization`, `Accept-Language` and `User-Agent` together. A run that
+  wrote, set a cookie, took a file, or answered with `respond` is not shared.
+- **What a thousand pages cost** depends on whether the loader is shared. A loader for
+  everyone runs once a change however many pages show it. One that reads the viewer runs
+  once for each page, on every change to what it read, so with many pages and a busy
+  table give each viewer a topic of their own: `watch("user:7")` and an `unwatched` query,
+  published by whoever writes. What is in the table does not matter, what the loader
+  returns does: each run makes that value's JSON, so return what the page shows (`limit`,
+  or `live(load_page, page)`), not the table. A loader giving over 4 MB is said in the
+  log. `quillo_live_runs_total` tells runs made from runs shared.
+- A page is sent what changed in the value, not the whole value again: the server keeps
+  the values pages have (up to 64 MB with the patches, no value over 16 MB; past that,
+  those few pages share go first), and answers a page with a patch to its own when the
+  patch is the shorter. A patch does not go inside text, so one letter changed in a long
+  field sends the field. Lists of rows are matched by their `id` (a number or text; the first of two
+  alike counts), rows without one by place, then by content, and what is inside a row
+  is patched the same way, so a card moved or renamed on a board of 3,000 costs that
+  card. A map whose keys changed order, and a decimal, go whole. The patch applies to
+  what the server last sent, so changes the page made to the state meanwhile (a card
+  shown moved before the server says so) are replaced as before. An error value is
+  never patched.
+
+### Several servers
+
+To run an app on several Quillo servers behind [limer](https://limer.sh), let
+them join a `discover` pool with a `broadcast` path; changes made through one
+server then wake pages on all of them, with no message broker:
+
+```
+app.example.com {
+    reverse_proxy {
+        discover shop {
+            allow 10.0.0.0/8
+            broadcast /_quillo/announce
+        }
+    }
+}
+```
+
+```sh
+export LIMER_ADMIN_SECRET=...        # limer's admin secret
+quillo run shop.qwe --port 8081 --register http://10.0.0.1:2019   # on each server
+```
+
+- Each server registers (and keeps registering, every 5 seconds; limer drops
+  one that stops for 15) and sends the topics it changes to limer's
+  `/broadcast`, which passes them to every member (`POST /_quillo/announce`, at
+  most 64 KiB). The pool's name is the file's (`shop`), or `--service`. `--register`
+  needs a `--port` written out, and cannot be combined with `--instances` (nor can
+  `--watch`): run one instance per server, or several servers.
+- limer's admin secret is required: `--register` does not start without
+  `LIMER_ADMIN_SECRET`. Each announcement is signed (HMAC-SHA256, with a key made
+  from the secret) together with the time and a random nonce; one that is not
+  signed so, more than a minute old, or seen before is refused. A server takes
+  only the topics it already knows (changed there, or shown on its pages), at most
+  256 a message.
+- What is shared is the database: tables (`db:` topics) and `publish` topics
+  are announced. Data kept in variables belongs to each server and is not. Nor are
+  channels and media streams: a broadcast reaches the pages on this server, and a
+  camera's stream is watched through the server it comes to (see [Channels](#channels)).
+- Sequence numbers are per server, and each carries its server's id. A page
+  whose live connection lands on a different server (after a restart, or with
+  round-robin balancing) loads its live data again once, rather than missing a
+  change. `lb_policy sticky_cookie` keeps a browser on one server and avoids
+  even that.
+- Announcements are delivered once, without retries: a server that cannot be
+  reached when one is sent misses it, and its pages show that change only when
+  they next load the data (the next change to it, or a reload).
+- Sessions need the same `QUILLO_SECRET` on each server.
+
+## Server functions
+
+`server fn` makes a function callable from the browser:
+
+```quillo
+server fn add_note(text: str) -> list ! str with db {
+    if trim(text) == "" { return err("empty note") }
+    db.exec("insert into notes (text) values (?)", text)?
+    db.query("select * from notes")
+}
+
+component Notes(initial: list) {
+    state notes = initial
+    state draft = ""
+    state problem = null
+    <form @submit={() => {
+        let r = add_note(draft)                    // a request to the server
+        if is_err(r) { problem = r.error } else { notes = r }
+    }}>
+        <input bind:value={draft}/>
+    </form>
+}
+```
+
+In component code the call is awaited automatically. A call that fails (the
+connection drops, the server errors) returns an error value, like `http.*` on the
+server, so `let more = load_more() ?? []` carries on and can try again later. It works in event handlers and
+in `state` initializers (`state todos = load_todos()`: the server runs it while rendering,
+so the page arrives with the data). Calling one while rendering is an error.
+
+The error value's text says what happened: ``server fn `x` could not be reached:
+...`` when there was no answer, ``server fn `x` failed (403): ...`` when the server
+refused it (400 with the argument that did not fit, 403 from another site, 404 for no
+such function, 500 `internal error in x`, whose real message is on the server's
+stderr). A function that returns `err(v)` gives an error value with `v`. A `reply 401
+"Log in first"` inside it gives only the status (``failed (401)``), since its body is
+not JSON: return `err("Log in first")`, or `reply 401 { error: "Log in first" }`, for the
+page to show the words. Nothing happens by itself on a 401 or a 500 (no redirect, no
+retry, except for [idempotent](#idempotent-requests) calls); there is no loading flag
+either: set a state of your own around the call.
+
+**Slow data: `defer`.** A `state` initializer runs while the server renders, so the
+page waits for its slowest one. `defer` lets a slow one follow the page instead:
+
+```quillo
+component Product(id: int) {
+    state product = load_product(id)                  // in the first bytes
+    state reviews = defer(load_reviews(id))           // streamed when it is ready
+    <div>
+        <h1>{product.name}</h1>
+        {reviews == null ? <p>Loading reviews…</p> : <ReviewList reviews={reviews}/>}
+    </div>
+}
+```
+
+- The page is sent at once with `reviews` null: what the component shows for null is
+  there (a skeleton, "Loading…"). The rest of the answer comes when `load_reviews`
+  does: the component rendered again, its other states as they were (`load_product`
+  is not called twice) and `reviews` worked out, which a line of script swaps in. The
+  answer is one response, so search engines read the whole page, reviews included.
+- The browser takes the component up once its part has come, not before: until then
+  it is HTML (links work, nothing else does). Its part comes as soon as it is ready,
+  and before the page counts as loaded.
+- Only a component placed in the page defers. Inside another component, and in the
+  browser (a page made there after `navigate`), `defer(x)` is `x`: there a state that
+  calls the server is null until it answers anyway. Components inside a deferring one
+  render again with it, their initializers too.
+- Several deferred components follow in the order they are on the page, each as soon
+  as the ones before it are sent. A deferred part cannot set cookies or the session
+  (the answer's head is gone): do that in the route or a server fn.
+- Without a connection to stream to (a test calling `handle`), for a prefetch, or for
+  a mounted program, the parts are worked out first and the page is sent whole. A
+  runtime error in one is logged, and its placeholder stays.
+
+For data a page should not wait for at all (another site's API that may take seconds),
+render a placeholder and call the `server fn` from `@mount`.
+
+There is no `async` or `await` to write: on the server a call simply waits (and other
+requests run meanwhile); in the browser the compiler awaits it, and every function that
+calls it. Calls run one after another. To run several at once, give them to
+`parallel`, which returns their results in order:
+
+```quillo
+let [user, orders] = parallel(() => load_user(id), () => load_orders(id))
+```
+
+In the browser that is `Promise.all`. In a request on the server each function runs as a
+coroutine of its own on the event loop (outside a request, on a thread of its own), so
+their waits (database, `http.*`, `sleep`) overlap. Their computing does not: Quillo code
+runs one piece at a time, so `parallel` shortens waiting, not arithmetic. Inside a
+transaction they run one after another, since the others' SQL would not be part of it. A
+failure stops the whole call; error values are results like any other.
+
+Each call is a `POST /_quillo/rpc/<name>` with a JSON array of arguments (or, when an
+argument is a file, multipart: see [Uploads](#uploads)), checked against
+the parameter types all the way in (a `list<Role>`'s items, a record's fields; a 400
+otherwise), and records made as `User(v)` makes them (other fields left out); the answer is `{"ok": value}` or `{"err": payload}`.
+Only `server fn`s can be called, only with `content-type: application/json`, and only
+from the program's own pages: a request a browser marks as coming from another site
+(`Sec-Fetch-Site`, or an `Origin` naming another host) gets a 403. Inside one, `request`
+is the current request. `reply` in a
+server fn becomes the HTTP response, so the usual middleware works:
+
+```quillo
+server fn delete_all() = request | auth.required | (_) => { ... }
+```
+
+From hand-written JavaScript: `await quillo.server.add_note("text")`, which resolves to
+an object with `.error` rather than rejecting. `window.quillo` (`{ server, components,
+rpc }`) is there once a program with `server fn`s has had its bundle loaded, which is
+when a component is reached; a script that runs as the page loads includes `<script
+src="/_quillo/quillo.js"></script>` first. A component cannot be mounted from a script:
+components start from the server's HTML, or inside another component.
+
+A call that must not happen twice (a payment, a transfer) is wrapped in
+[`idempotent`](#idempotent-requests), in the `server fn` or a function it calls: the page
+then sends a key with each call, and sends the call again when its answer does not come
+back, and the server runs it once. Two clicks are one call: while a call runs, the same
+call with the same arguments shares its answer and sends nothing, and a call that got no
+answer keeps its key, so sending it again is safe. Any answer ends it, so the next
+payment, even of the same amount, is a new one. A call with other arguments is another
+call.
+
+### What the browser can reach
+
+Components and server code share a file, but not what they can touch:
+
+- A component cannot use `db`, `request`, `env`, files, Rust (`.qwer`) functions,
+  or a global the server changes: that is an error when the program loads, and in the
+  editor. Top-level values that come from them (`let KEY = env("STRIPE_KEY")`,
+  `let CONFIG = load_config()`) are not written into the browser's bundle either, which
+  anyone can download: a component that uses one is an error, and asks a `server fn`.
+- An environment variable named `PUBLIC_...` is for the browser: `env("PUBLIC_MAP_TOKEN")`,
+  with the name written out, works in a component and in a top-level value it uses, and
+  is written into the bundle as it was when the program loaded. That suits the keys
+  services hand out for pages to use (a map's token, a search-only key, an error
+  reporter's address); a secret keeps its own name, and stays on the server.
+- `http.get`, `http.post` and the rest work in a component's event handlers, `@mount`
+  and the functions they call: the request goes from the page, with the browser's rules
+  rather than the server's. The other site must allow this one (CORS: it answers with
+  `access-control-allow-origin`), or the call is an error value that says what it may be
+  (`http: no answer from api.example.com: it may not allow this page (CORS), or be plain
+  http, or be unreachable; a server fn can call it from the server`). To reach your own
+  server from a page that is not its own, a phone app's, call it from a `server fn` (the
+  program's `http.*`, or [`site`](#calling-another-quillo-site)); the page's cookies are
+  not sent to it (a path of the program's own, `/api/x`, goes to its own server, with
+  its cookies); and it reaches what the visitor's machine can, such as a service on
+  their own computer or network, not what the server can. Only `redirects: 0` and
+  `timeout` of the options mean something there. Nothing goes through the
+  server, which suits a site that limits each visitor, one that answers by where the
+  visitor is, a visitor's own token kept in the page, and large files:
+
+  ```quillo
+  server fn upload_url(name: str) -> str {
+      let me = session().user ?? reply 401 "Log in first"
+      presign_put(me, name)                              // your bucket's signed URL
+  }
+
+  component Upload() {
+      state done = false
+      <input type="file" @change={(e) => {
+          let f = e.target.files[0]
+          done = http.put(upload_url(f.name), f).ok      // the file, as it is, to the bucket
+      }}/>
+  }
+  ```
+
+  A file from an input is sent as it is, with its own type. While the server renders a
+  component and runs its `state` initializers, nothing goes out: an `http.*` call there
+  is an error (when the program loads where it can be seen, as the page renders where
+  it cannot), since it would come from the server's network. Ask a `server fn` for what
+  the first render needs. Answers from another site show only the headers it allows.
+- A `server fn` is the way in, and it is a public address. Anyone can send
+  `POST /_quillo/rpc/<name>` with any arguments, from a script or the browser's console,
+  signed in or not; refusing other sites' pages stops other sites, not people. So each
+  one checks, as a route does, who is asking and whether they may touch *this* record,
+  and gives its parameters types (one without a type takes any JSON):
+
+  ```quillo
+  server fn delete_note(id: int) {
+      let me = session().user ?? reply 401 "Log in first"
+      db.exec("delete from notes where id = ? and owner = ?", id, me)
+  }
+  ```
+
+- What a `server fn` returns, and the props a page gives a component, reach the browser
+  in full: `db.one("select * from users where id = ?", id)` sends `password_hash` too.
+  Select the columns the page shows.
+- A `server fn` that calls another site for the browser passes on what it is given: with
+  a URL it takes from its arguments, anyone could have it fetch any address the server
+  reaches. Write the host in the code (`` `https://api.example.com/users/${id}` ``), or
+  pass `{ public_only: true }` (see [HTTP client](#http-client)); `quillo check` warns
+  when neither is so.
