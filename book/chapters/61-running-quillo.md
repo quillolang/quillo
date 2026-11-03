@@ -214,7 +214,7 @@ says what differs). The origin is the same at every launch, so what a page keeps
 keeps no cookies for the scheme, so the program's are kept for it in
 `.quillo/app-cookies.json` beside the program, and its session key in
 `.quillo/.quillo-secret` unless `QUILLO_SECRET` is set: someone signed in stays signed in
-from one launch to the next. [`--port`](#options-of-quillo-run) has no effect. Links to other sites open in the
+from one launch to the next. [`--port`](#options-of-quillo-run) and [`--listen`](#options-of-quillo-run) are refused, as there is no socket to give them to. Links to other sites open in the
 system's browser. Only macOS has run this way; Windows and Linux take the same code
 through wry, not yet run.
 
