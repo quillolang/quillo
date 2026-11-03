@@ -4295,8 +4295,11 @@ impl<'a> Compiler<'a> {
                     Some(l) => fixed_attrs.push(format!("[{}, {}]", js_str(name), lit_js(l))),
                     None => unreachable!(),
                 },
+                // A function given to an attribute is not called as the page loads, taken for a
+                // value that follows what it reads, as a child's was (FEEDBACK48.md, Q-571; found
+                // in review).
                 AttrVal::Expr(e) if !live => {
-                    let v = self.hole_value(e, vals.len())?;
+                    let v = self.child_hole(e, vals.len())?;
                     hole(&mut holes, vals, 0, name, v);
                 }
                 AttrVal::Expr(e) => {

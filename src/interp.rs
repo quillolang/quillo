@@ -927,7 +927,7 @@ fn class_words(v: &Value, out: &mut String) {
         }
     };
     match v {
-        Value::Nil | Value::Bool(_) => {}
+        Value::Nil | Value::Bool(_) | Value::Func(_) | Value::Builtin(..) => {}
         Value::Str(s) => word(s, out),
         Value::List(items) => {
             for i in items.iter() {
@@ -4551,7 +4551,7 @@ impl Interp {
             }
             if name.eq_ignore_ascii_case("class") {
                 match &v {
-                    Value::Nil | Value::Bool(false) => {}
+                    Value::Nil | Value::Bool(false) | Value::Func(_) | Value::Builtin(..) => {}
                     Value::Str(s) => classes.push(s.to_string()),
                     // A map's keys that are true and a list's words, as clsx gives them
                     // (FEEDBACK48.md, Q-566; branch main).
@@ -4568,7 +4568,8 @@ impl Interp {
             }
             match v {
                 Value::Bool(b) => write_bool_attr(name, b, &mut rest),
-                Value::Nil => {}
+                // A function, as in `write_attr` (found in review).
+                Value::Nil | Value::Func(_) | Value::Builtin(..) => {}
                 Value::List(_) | Value::Map(_) => {
                     rest.push_str(&format!(" {}=\"{}\"", name, escape(&v.json_text())))
                 }
@@ -4707,7 +4708,9 @@ impl Interp {
             // `aria-expanded={false}` is `aria-expanded="false"`, `disabled={false}` nothing
             // (FEEDBACK48.md, Q-564; branch main).
             Value::Bool(b) => write_bool_attr(name, *b, out),
-            Value::Nil => {}
+            // A function, as a child is: nothing, where it was `<fn <fn>>` here and the browser
+            // called it as the page loaded (FEEDBACK48.md, Q-571; found in review).
+            Value::Nil | Value::Func(_) | Value::Builtin(..) => {}
             Value::List(_) | Value::Map(_) => {
                 out.push(' ');
                 out.push_str(name);

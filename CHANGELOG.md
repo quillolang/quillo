@@ -418,6 +418,11 @@
   (Q-564 to Q-567). A function as a child shows nothing, where it was `<fn <fn>>`; in the
   browser it was called, so `{inc}` ran the handler as the page rendered (Q-571). A `<pre>`
   whose text starts with a line break gets the one the browser drops back (Q-572).
+- A review of the rendering found three more, fixed: a spread's `onChange` beside
+  `bind:value` or `bind:checked` took the binding's place, so it stopped binding (now the
+  spread's handler runs after the binding's); a function given to an attribute was written
+  `<fn <fn>>` and called in the browser as the page loaded (now nothing, on both sides); a
+  spread's `CLASS` was a class to the server only.
 - The guide has a "From JSX" table beside "From HTML" (Q-578).
 
 ### Found measuring coverage

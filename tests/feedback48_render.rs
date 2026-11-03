@@ -9,7 +9,7 @@
 mod support;
 
 use quillo::Interp;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -356,4 +356,50 @@ fn the_browser_writes_markup_as_the_server_does() {
     let errors = r["errors"].as_array().unwrap();
     assert_eq!(errors.len(), 1, "{}", r);
     assert!(errors[0].as_str().unwrap().contains("`onClickCapture` listens before the element's own handlers"), "{}", r);
+}
+
+/// `page` of tests/browser in headless Chrome, its script `script`: what the script recorded.
+fn in_chrome(chrome: &Path, page: &str, script: &str) -> serde_json::Value {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let port = support::free_port();
+    let _server = support::Guard::new(
+        Command::new(env!("CARGO_BIN_EXE_quillo")).arg("run").arg(dir.join(page)).args(["--port", &port.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !support::listening(port) {
+        assert!(Instant::now() < deadline, "server did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let profile = std::env::temp_dir().join(format!("quillo-chrome-f48v-{}-{}", std::process::id(), port));
+    let out = Command::new("node").arg(dir.join("run.js")).arg(chrome).arg(format!("http://127.0.0.1:{}/", port)).arg(&profile).arg("60000").arg(dir.join(script)).output().unwrap();
+    let _ = std::fs::remove_dir_all(&profile);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+// The review's findings: a spread's `onChange` took the place of `bind:value`'s and
+// `bind:checked`'s handler, so neither bound; a function given to an attribute was written
+// `<fn <fn>>` by the server and called by the browser as the page loaded; a spread's `CLASS` was
+// the server's class and not the browser's.
+#[test]
+fn a_spread_beside_a_binding_a_function_attribute_and_a_spread_class() {
+    // The server's side.
+    let s = support::serve(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser/f48-review.qwe"), &[]);
+    let page = support::send(s.port, "GET", "/", &[], "").body;
+    assert!(page.contains(r#"<p id="t">x</p>"#), "{}", page);
+    assert!(page.contains(r#"<p class="z y" id="up">u</p>"#), "{}", page);
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let r = in_chrome(&chrome, "f48-review.qwe", "f48-review.js");
+    assert_eq!(r["exception"], serde_json::Value::Null, "{}", r);
+    assert_eq!(r["remade"], 0, "{}", r);
+    // The binding takes what is typed and ticked, and the spread's handler runs after it.
+    assert_eq!(r["after"], "hey|true|11", "{}", r);
+    // Not called, and nothing written.
+    assert_eq!(r["n"], "0", "{}", r);
+    assert_eq!(r["t"], r#"<p id="t">x</p>"#, "{}", r);
+    assert_eq!(r["up"], "z y", "{}", r);
+    assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
 }

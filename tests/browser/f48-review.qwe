@@ -1,0 +1,23 @@
+// What the review of FEEDBACK48's rendering found (branch main), driven by f48-review.js: a
+// spread's `onChange` beside `bind:value`/`bind:checked`, a function given to an attribute, and
+// a spread's `CLASS`.
+
+component P() {
+    state name = ""
+    state ok = false
+    state seen = 0
+    state n = 0
+    let field = { onChange: (e) => { seen += 1 }, placeholder: "p" }
+    let box = { onChange: (e) => { seen += 10 } }
+    let inc = () => { n += 1 }
+    <div>
+        <input id="i" bind:value={name} {...field}/>
+        <input id="cb" type="checkbox" bind:checked={ok} {...box}/>
+        <p id="out">{name}|{str(ok)}|{seen}</p>
+        <p id="up" {...{ CLASS: "z", Class: "y" }}>u</p>
+        <p id="t" title={inc} class={inc}>x</p>
+        <p id="n">{n}</p>
+    </div>
+}
+
+route GET / = <html><body><P/></body></html>

@@ -5040,11 +5040,21 @@ function spreadInto(el, get) {
   effect(() => {
     const now = typeof get === "function" ? get() : get;
     untrack(() => {
-      for (const k of Object.keys(had)) if (!hasOwn(now, k)) { if (k[0] === "@") listen(el, k.slice(1), null); else setProp(el, k, null, had[k]); }
-      for (const k of Object.keys(now)) { if (k[0] === "@") listen(el, k.slice(1), now[k]); else setProp(el, k, now[k], had[k]); }
+      for (const k of Object.keys(had)) if (!hasOwn(now, k)) { if (k[0] === "@") spreadListen(el, k.slice(1), null); else setProp(el, k, null, had[k]); }
+      for (const k of Object.keys(now)) { if (k[0] === "@") spreadListen(el, k.slice(1), now[k]); else setProp(el, k, now[k], had[k]); }
       had = now;
     });
   });
+}
+
+// A spread's handler on an event the element listens to already, as `bind:value`'s on
+// `input`, runs after that one, which it took the place of, and the binding stopped
+// (FEEDBACK48.md, Q-567; found in review). Taken away, the element's own is put back.
+function spreadListen(el, t, f) {
+  const own = el.__sb || (el.__sb = {});
+  if (!(t in own)) own[t] = (t === "click" ? el.__click : el.__w && el.__w[t]) || null;
+  const b = own[t];
+  listen(el, t, !b || !f ? f || b : (e) => { b(e); return f.length > 0 ? f(e) : f(); });
 }
 
 // W.spread(maps, written): the attributes the maps give an element, without
@@ -5094,13 +5104,14 @@ function reactEvent(tag, written, ev) {
 // values are truthy, a list's items (lists in it flattened, null and bools skipped); a map or a
 // list was its text, and after an update a scramble of words (FEEDBACK48.md, Q-566; branch main).
 function clsWords(x, out) {
-  if (isNil(x) || typeof x === "boolean" || x === "") return;
+  if (isNil(x) || typeof x === "boolean" || typeof x === "function" || x === "") return;
   if (Array.isArray(x)) { for (const y of x) clsWords(y, out); return; }
   if (isMap(x)) { for (const k of Object.keys(x)) if (k !== "" && truthy(x[k])) out.push(k); return; }
   out.push(display(x));
 }
 
-const spreadClasses = (maps) => maps.filter(isMap).flatMap((m) => Object.keys(m).filter((k) => k === "class" || k.toLowerCase() === "classname").map((k) => m[k]));
+// `CLASS` and `Class` too, as the server takes them (found in review).
+const spreadClasses = (maps) => maps.filter(isMap).flatMap((m) => Object.keys(m).filter((k) => { const l = k.toLowerCase(); return l === "class" || l === "classname"; }).map((k) => m[k]));
 
 // Several values side by side, each fixed or following what it reads.
 function frag(items) {
@@ -5420,6 +5431,8 @@ function boolText(k, v) {
 }
 
 function setProp(el, k, v, old) {
+  // A function is no value of an attribute's, as on the server (found in review).
+  if (typeof v === "function") v = null;
   if (k === "style" && isMap(v)) v = styleText(v);
   if (k === "style" && isMap(old)) old = styleText(old);
   // What the attribute is only the default of, as `value` (FEEDBACK28.md, Q-338; branch
