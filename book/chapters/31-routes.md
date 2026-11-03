@@ -28,8 +28,13 @@ route METHOD /path [with effects] { ... block ... }
   ```
 - **Path params** become variables. `:id(int)` only matches what parses as an int (also
   `float`, `dec`, `num`, `str`, and `date`: `/day/:d(date)` takes `2026-11-20`, not
-  `2026-02-30`). `*rest` (or `*name`) takes the rest of the path; `*`
-  alone names it `rest`. `/users/{id}`, as OpenAPI and Express write a parameter, is an
+  `2026-02-30`). A typed parameter takes its type written one way *(since 0.7)*: an `int`
+  is an optional `-` and digits with no leading `0` (`05`, `+5` and ` 5` are not one, so a
+  page has one address), a `float`, `num` or `dec` also takes a fraction and an exponent and
+  is finite (`NaN`, `inf` and `1e999` are not), and nothing is trimmed, a `str` included.
+  The same holds for typed fields of a query or a form. `*rest` (or `*name`) takes the rest
+  of the path, so it comes last: nothing can follow it, in the route or in its group's
+  routes *(since 0.7: what followed was ignored)*; `*` alone names it `rest`. `/users/{id}`, as OpenAPI and Express write a parameter, is an
   error that says to write `:id`. The path is split at `/`, empty pieces dropped, so `/users`,
   `/users/` and `//users` are one path; each piece is percent-decoded after the split, so
   a `%2F` stays inside its piece. `request.path` is the path as it came, undecoded.
@@ -46,7 +51,12 @@ route METHOD /path [with effects] { ... block ... }
   curl localhost:8080/day/2026-02-30        # 404: not a date
   curl localhost:8080/files/docs/a.txt      # docs/a.txt
   ```
-- **Query pattern:** `? { q: str, page: int = 1 }`. Query values are text, so `int`, `float` and `bool` patterns convert them.
+- **Query pattern:** `? { q: str, page: int = 1 }`. Query values are text, so `int`, `float` and `bool` patterns convert them. A blank value (`?page=`, as a search
+  form sends a field left empty) is one not sent when the field has a default, so `page`
+  is 1 *(since 0.7)*. `bool` takes `true`, `on`, `1` and `yes`, and `false`, `off`, `0` and
+  `no`, in any case. A list (`{ tag: [str] }`) takes every `tag`, or every `tag[]` when
+  no `tag` came, as PHP- and Rails-shaped forms name them. An unchecked checkbox sends
+  nothing, so its field needs a default: `{ form: { agree: bool = false } }`.
   A name sent more than once keeps its last value in `request.query` and `request.form`;
   a list in the pattern takes them all, as a group of checkboxes sends: `? { tag: [str] }`
   gives `["a", "b"]` for `?tag=a&tag=b`, one value a list of one, and none an empty list.
@@ -131,7 +141,9 @@ route METHOD /path [with effects] { ... block ... }
 - **Reserved:** paths under `/_quillo/` belong to Quillo and never reach a route (what is
   there is listed under [What a route cannot do](#what-a-route-cannot-do)). A route
   written there is never called: `route GET /_quillo/stats = ...` answers 404, so put
-  your own under another path (`/stats`, `/admin/stats`).
+  your own under another path (`/stats`, `/admin/stats`). `quillo check` refuses one, and
+  a `route HEAD` too (a HEAD is answered by the GET route), and warns of a route an
+  earlier one with no pattern always takes first *(since 0.7)*.
 - **Order:** routes are tried in the order they are declared, and the first whose method, path and patterns all match handles the request. A later route can be the fallback.
   Routes are declared at the top level of a file: `quillo check` refuses one inside a
   function or a block.
@@ -163,7 +175,9 @@ route METHOD /path [with effects] { ... block ... }
 
 If no route matches, the response is 404 for an unknown path, 405 for a known
 path with the wrong method (with `Allow`, the methods it takes), and 400 when a route
-matched the path and method but none of its patterns matched. Before any route is tried, a `POST`, `PUT`, `PATCH` or
+matched the path and method but none of its patterns matched. The 400 is logged with the
+route that came closest and its first miss (`` POST /form (main.qwe:6): `form.agree` is
+missing, and must be a bool ``), and under `--watch` the answer says it too *(since 0.7)*. Before any route is tried, a `POST`, `PUT`, `PATCH` or
 `DELETE` with a form, multipart or plain-text body (or none) that the browser marks as
 coming from another site is refused with 403 (see `allow_cross_site` under
 [Standard library](#standard-library)). A last `route ANY /*rest` is a 404 page of
@@ -233,17 +247,47 @@ routes /reports | signed_in with db {               // what its routes may do, a
 - **The path** goes before each route's own, parameters and types included
   (`:team(int)`), which the routes' bodies and patterns can use; a group's `/` alone
   adds nothing.
-- **Middleware** (each after a `|`, as in a pipeline) is called with `request` before the
-  route's body, outer groups' first, in the order written. A `reply` in it answers the
-  request in the route's place, as does a response it gives back (`redirect(...)`,
-  `respond(...)`); anything else it gives lets the route go on, so the middleware of a
-  pipeline (`auth.required`, which gives the request back) works as it is. What it gives
-  does not reach the route: a route that needs the user reads it again (`session()`,
-  `me()`). `quillo check` checks each call as it checks any other, at the line the
-  middleware is written on.
+- **Middleware** (each after a `|`, as in a pipeline) is called with the request before
+  the route's body, outer groups' first, in the order written. It lets the route go on by
+  giving the request back (as `auth.required` does) or null. Anything else stops it: a
+  `reply` in it, or a response it gives back (`redirect(...)`, `respond(...)`), answers in
+  the route's place; `false` answers 403, an error value answers as a route's error does,
+  and any other value (`true`, text) is a 500 that names the middleware *(since 0.7: these
+  let the route run)*. So a check is written `(r) => ok(r) ? r : reply 403 "..."`, not as a
+  predicate, and `quillo check` says so when a middleware can only be a `bool` or text.
+  What it gives does not reach the route: a route that needs the user reads it again
+  (`session()`, `me()`). It is given the request as sent, whatever the route's patterns
+  bind: a JSON field named `request` is the route's, not the middleware's *(since 0.7)*.
+- **Before the server's own answers** *(since 0.7)*. A request under a group's path that
+  no route of the group takes (another path, method or parameter type, a pattern it does
+  not match, an `OPTIONS`) goes through the group's middleware first: only those it lets
+  in learn what is there from a 404, a 400, a 405 and its `Allow`.
+- **Middleware that takes an argument** is a function that makes one, called in the
+  group's scope, where the group's own parameters are, already typed:
+
+  ```quillo
+  fn member_of(team: int) = (r) => my_teams() | contains(team) ? r : reply 403 "not your team"
+  fn role(name: str) = (r) => session().role == name ? r : reply 403 "no"
+
+  routes /teams/:team(int) | member_of(team) {
+      route GET /board = board(team)
+  }
+  routes /billing | role("admin") { route GET / = <Billing/> }
+  ```
+- **A group guards its routes, not the `server fn`s their pages call.** Each server fn is
+  its own `POST /_quillo/rpc/<name>`, which anyone can call: one a guarded page loads or
+  acts through checks the caller itself (`admins(request)`, `me()`). `quillo check` warns
+  of a server fn a guarded page calls that reads neither `request` nor `session`.
 - **A request pattern** after the middleware is matched as well as each route's own
   (both must match), and binds the same way: a request it does not match goes on to the
-  next route, as with a route's own pattern.
+  next route, as with a route's own pattern. The middleware comes first:
+  `routes /api { headers: ... } | g { ... }` is an error, as `| g` there would be a
+  pattern that takes any request.
+- **A host** in a pattern is matched as it names a host: `headers.host`, and
+  `request.host`, are lower case, without a trailing dot or the default port
+  (`API.example.com:443` is `api.example.com`) *(since 0.7)*. `request.route_path` is the
+  path as routes read it (`//admin/users` and `/%61dmin/users` are `/admin/users`), which
+  `site_headers` and `allow_cross_site` match on too.
 - A group holds only `route`s and `routes` groups, is written at the top level of a file,
   and keeps its routes in the order written, among the file's others. Outside that,
   `routes` is a name like any other (`routes / 2` divides). Routes from groups are
@@ -355,11 +399,11 @@ and the function gets the same `{ field, filename, type, size }` record a form's
 is, for `save_upload`:
 
 ```quillo
-server fn add_photo(file: map) = save_upload(file, `photos/${uuid()}.jpg`)
+server fn add_photo(file: map) -> str = save_upload(file, `photos/${uuid()}.jpg`)
 
 component Photo() {
     state saved = null
-    <input type="file" accept="image/*" @change={(e) => { saved = add_photo(e.target.files[0]) }}/>
+    <input type="file" accept="image/*" onchange={(e) => { saved = add_photo(e.target.files[0]) }}/>
 }
 ```
 
@@ -457,7 +501,7 @@ copy served as `image/jpeg`. A text file named `.jpg` is not kept, and the answe
 ## Cookies and sessions
 
 ```quillo
-route POST /login { form: { email: str, password: str } } {
+route POST /login { form: { email: str, password: str } } with db {
     // stored the same way at signup: one Unicode form, trimmed, in lower case
     let user = db.one("select * from users where email = ?", lower(normalize(trim(email))))
     if !crypto.verify_password(password, user.password_hash) { reply 401 "Wrong email or password" }
@@ -465,7 +509,7 @@ route POST /login { form: { email: str, password: str } } {
     redirect("/")
 }
 
-route GET /me {
+route GET /me with db {
     let id = session().user ?? reply 401 "Log in first"
     db.one("select name from users where id = ?", id)
 }
@@ -743,7 +787,7 @@ the component has nothing to add for it:
 component Pay() {
     state sent = null
     <div>
-        <button @click={() => { sent = transfer("ana", "bob", "12.50") }}>Send 12.50 to Bob</button>
+        <button onclick={() => { sent = transfer("ana", "bob", "12.50") }}>Send 12.50 to Bob</button>
         {is_err(sent) ? <p>Not sent: {error(sent)}</p> : sent && <p>Sent, transfer {sent.id}</p>}
     </div>
 }
@@ -801,7 +845,7 @@ curl -i localhost:8080/_quillo/rpc/transfer -H "Idempotency-Key: k-77" --json '[
           </form>
       </body></html>
 
-  route POST /order { form: { item: str, qty: int } } = idempotent(() => {
+  route POST /order { form: { item: str, qty: int } } with db = idempotent(() => {
       let o = db.one("insert into orders (item, qty) values (?, ?) returning id", item, qty)
       respond(201, <p>Order {o.id} placed: {qty} × {item}</p>)
   })
@@ -921,7 +965,7 @@ progress, a model's reply word by word. The client has the head at once, and eac
 `send` as it is made.
 
 ```quillo
-route GET /orders.csv = stream((send) => {
+route GET /orders.csv with db = stream((send) => {
     send("id,total\n")
     for o in db.query("select id, total from orders") { send(`${o.id},${o.total}\n`) }
 }, { type: "text/csv", headers: { "content-disposition": "attachment" } })
@@ -934,7 +978,7 @@ route GET /jobs/:id/progress = events((send) => {
 })
 
 // A model's answer, passed on as it arrives.
-route POST /ask = events((send) => http.stream("https://api.example.com/v1/chat", send, {
+route POST /ask with http, env = events((send) => http.stream("https://api.example.com/v1/chat", send, {
     body: { prompt: request.json.prompt, stream: true },
     headers: { authorization: `Bearer ${env("API_KEY")}` },
 }))
@@ -989,7 +1033,7 @@ route POST /ask = events((send) => http.stream("https://api.example.com/v1/chat"
 component Chat() {
     state answer = ""
     <div>
-        <button @click={() => receive("/ask", (part) => { answer = answer + part.text }, { body: { prompt: "hi" } })}>Ask</button>
+        <button onclick={() => receive("/ask", (part) => { answer = answer + part.text }, { body: { prompt: "hi" } })}>Ask</button>
         <p>{answer}</p>
     </div>
 }
@@ -1027,7 +1071,7 @@ A page that shows the last readings as they come, and a sensor's packet sent fro
 terminal (`nc` stands in for the device):
 
 ```quillo
-server fn latest() = readings | drop(len(readings) - 10)     // the last ten
+server fn latest() -> list = readings | drop(len(readings) - 10)     // the last ten
 
 component Readings() {
     state rs = live(latest)
@@ -1089,7 +1133,7 @@ channel.on("game", (msg, peer) => {
 component Board() {
     state others = {}
     let game = channel.open("game", (m) => { others = set(others, m.id, m.pos) })
-    <canvas @pointermove={(e) => game.send({ pos: [e.clientX, e.clientY] })}/>
+    <canvas onpointermove={(e) => game.send({ pos: [e.clientX, e.clientY] })}/>
 }
 ```
 
@@ -1138,7 +1182,7 @@ component Board() {
       let room = channel.open("lobby", (m) => { lines = lines + [`${m.from}: ${m.text}`] })
       <div>
           <ul>{for l in lines => <li>{l}</li>}</ul>
-          <form @submit={() => { room.send({ text: draft }); draft = "" }}>
+          <form onsubmit={() => { room.send({ text: draft }); draft = "" }}>
               <input value={draft}/>
               <button>Send</button>
           </form>
@@ -1539,7 +1583,7 @@ route GET / =
         <button>Buy, 12.00</button>
     </form>
 
-route POST /buy {
+route POST /buy with http {
     let inv = billing.invoice(request.form.name, 1200)?    // billing's `server fn invoice`
     <p>Invoice #{inv.id}</p>
 }
@@ -2027,14 +2071,14 @@ Decimals and big ints cross as they do for pages. The address is any expression:
 
 ```quillo
 // shop.qwe, deployed at https://shop.example.com
-server fn notes(n: int) = range(1, n + 1) | map((i) => { id: i, text: `note ${i}` })
+server fn notes(n: int) -> list = range(1, n + 1) | map((i) => { id: i, text: `note ${i}` })
 
 // main.qwe, elsewhere
 site shop = env("SHOP_URL", "https://shop.example.com")
 
 server fn my_notes() = shop.notes(10)
 
-route GET / = <ul>{for n in my_notes() ?? [] => <li>{n.text}</li>}</ul>
+route GET / with http = <ul>{for n in my_notes() ?? [] => <li>{n.text}</li>}</ul>
 ```
 
 `SHOP_URL=http://127.0.0.1:8081 quillo run main.qwe` with the shop on that port lists
@@ -2084,10 +2128,10 @@ fn undo(s) = match s.step {
     _ => payments.refund(s.id)
 }
 
-fn move(s, state, step, why) =
+fn move(s, state, step, why) -> map =
     db.exec("update sagas set state = ?, step = ?, tries = 0, next_at = 0, why = ? where id = ? and state = ? and step = ?", state, step, why, s.id, s.state, s.step)
 
-fn try_again(s, why) =
+fn try_again(s, why) -> map =
     db.exec("update sagas set tries = ?, next_at = ?, why = ? where id = ?", s.tries + 1, now() + min([1000 * pow(2, s.tries + 1), 60000]), why, s.id)
 
 fn advance(s) {
@@ -2162,13 +2206,13 @@ route GET /order =
         <button>Order</button>
     </form>
 
-route POST /order { form: { cents: int } } {
+route POST /order { form: { cents: int } } with db, random {
     let id = uuid()
     db.exec("insert into sagas (id, cents, state, step, tries, next_at) values (?, ?, 'running', 0, 0, 0)", id, cents)
     redirect(`/order/${id}`)
 }
 
-route GET /order/:id {
+route GET /order/:id with db {
     let s = db.one("select state, why from sagas where id = ?", id) ?? reply 404 "No such order"
     match s.state {
         "done" => <p>Your order is placed.</p>

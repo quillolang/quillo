@@ -88,10 +88,10 @@ db.open(env("DATABASE_URL") ?? "ledger.db") | unwrap
 db.migrate()
 
 fn me() = session().user ?? reply 401 "Sign in first"
-fn balance(a) = money.from_minor(a.balance_minor, a.currency)
+fn balance(a) -> map = money.from_minor(a.balance_minor, a.currency)
 
 // Who did what: a row of `history`, in the transaction of the change it records.
-fn record(action: str, details) with db =
+fn record(action: str, details) -> map with db =
     db.exec("insert into history (actor, action, details) values (?, ?, ?)",
         session().user, action, json.stringify(details))
 ```
@@ -104,7 +104,7 @@ the same `Idempotency-Key` header, and gets the first answer, without the transf
 running again, as with Stripe's API:
 
 ```quillo
-route POST /transfers { json: { from: int, to: int, amount: dec } } {
+route POST /transfers { json: { from: int, to: int, amount: dec } } with db {
     let user = me()
     idempotent({ isolation: "serializable", retries: 5 }, () => {
         let src = db.one("select * from accounts where id = ? and owner = ?", from, user)
@@ -164,7 +164,7 @@ fails, and `retries: 5` runs it again, from the start, on the balance the other 
 `db.transaction` takes the same options when there is no request to keep:
 
 ```quillo
-fn withdraw(account: int, cents: int) with db =
+fn withdraw(account: int, cents: int) -> map with db =
     db.transaction({ isolation: "serializable", retries: 5 }, () => {
         let balance = db.one("select balance_minor from accounts where id = ?", account).balance_minor
         if balance < cents { return err("not enough money") }
@@ -185,7 +185,7 @@ the time and the body. `crypto.hmac` makes it again, and `crypto.equal` compares
 constant time:
 
 ```quillo
-fn stripe_signed(body: str, header: str?, secret: str) {
+fn stripe_signed(body: str, header: str?, secret: str) -> bool {
     let fields = split(header ?? "", ",") | map((f) => split(f, "="))
     let t = int(find(fields, (f) => f[0] == "t")?[1] ?? "")
     if is_err(t) || abs(now() / 1000 - t) > 300 { return false }   // five minutes
@@ -193,7 +193,7 @@ fn stripe_signed(body: str, header: str?, secret: str) {
     any(fields, (f) => f[0] == "v1" && crypto.equal(f[1] ?? "", want))
 }
 
-route POST /hooks/stripe {
+route POST /hooks/stripe with db, env, time {
     if !stripe_signed(request.body, request.headers["stripe-signature"], env("STRIPE_WEBHOOK_SECRET")) {
         reply 400 "Bad signature"
     }
@@ -251,7 +251,7 @@ view Statement(a, rows: list, locale: str) =
             </tr>}</table>
     </section>
 
-route GET /accounts/:id(int) { query: { locale: str = "en-US" } } {
+route GET /accounts/:id(int) { query: { locale: str = "en-US" } } with db {
     let a = db.one("select * from accounts where id = ? and owner = ?", id, me()) ?? reply 404 "No such account"
     let rows = db.query("select * from transfers where from_id = ? or to_id = ? order by id desc limit 50", id, id)
     <html><body><Statement a={a} rows={rows} locale={locale}/></body></html>

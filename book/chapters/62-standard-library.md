@@ -42,7 +42,7 @@
   server makes it (a request to `/_quillo/markdown`, so the page shows the same HTML,
   highlighting included), awaited like a `server fn`: call it in an event handler or a
   `state` initializer, and keep the text in state:
-  `@input={(e) => { preview = str(markdown(e.value)) }}` and `<div>{raw(preview)}</div>`.
+  `oninput={(e) => { preview = str(markdown(e.value)) }}` and `<div>{raw(preview)}</div>`.
   `markdown_page(text, { title, lang, html })` is the same as a whole page, for a route:
   a doctype, a `<head>` with its `<title>` (the option's, else the text's first `#`
   heading), and the HTML in its `<body>`.
@@ -246,8 +246,18 @@ Safety built in:
   `` `insert into t (${sql_name(keys(row))}) values (${sql_param(keys(row))})` `` with
   `row` as the parameters, or `` `update t set (${sql_name(cols)}) = (${sql_param(cols)})` ``.
   It is a warning, not a proof: SQL built in a list made with `map` is not followed.
-- Inside `db.transaction` on SQLite, `sleep` and `http` calls hold up other requests
-  instead of letting them write into the open transaction.
+- Inside `db.transaction` on SQLite, `sleep`, `http` and queries to another database
+  (PostgreSQL, MySQL) hold up other requests instead of letting them read and write
+  inside the open transaction *(since 0.7: a query to another database let them in)*.
+- **A transaction is `db.transaction`'s, not written by hand** *(since 0.7)*. `db.exec`,
+  `db.query` and `db.one` refuse `begin`, `start transaction`, `commit`, `end`,
+  `rollback`, `savepoint` and `release` alone: a `begin` whose `commit` was never reached
+  (a `?` that left, a `reply 400`) left the shared connection in it, and every other
+  request's writes with it. `db.transaction(() => ...)` commits, rolls back when something
+  fails, and keeps other requests out. A script run whole (`db.exec(read_file("seed.sql"))`)
+  may hold its own transaction, as `sqlite3 .dump` writes them, but one it leaves open is
+  rolled back and is an error; a SQLite connection still in a transaction at the end of a
+  request is rolled back too, and logged. `quillo check` says so of the literal text.
 
 Values are immutable: `push`, `set` and `+` return new lists and maps. A map's keys are
 text: `set(m, 5, x)` keys it `"5"`, and `m[5]`, `get(m, 5)` and `has(m, 5)` read that.
@@ -414,10 +424,10 @@ turns it around. A later release removes it.
   ```quillo
   // lib/forum.qwe
   private let PAGE = 20
-  private fn page_of(posts: list, n: int) = posts | drop((n - 1) * PAGE) | take(PAGE)
+  private fn page_of(posts: list, n: int) -> list = posts | drop((n - 1) * PAGE) | take(PAGE)
   private view Post(p: map) = <article><h2>{p.title}</h2></article>
 
-  public fn latest(n: int = 1) = page_of(db.query("select * from posts order by id desc"), n)
+  public fn latest(n: int = 1) -> list = page_of(db.query("select * from posts order by id desc"), n)
   public view Feed(n: int = 1) = <div>{for p in latest(n) => <Post p={p}/>}</div>
   ```
 
@@ -776,13 +786,13 @@ with a cookie, set from `Intl.DateTimeFormat().resolvedOptions().timeZone` throu
 before the cookie exists.
 
 ```quillo
-fn zone() = cookie("tz") ?? "UTC"     // in any function the request runs
+fn zone() -> str = cookie("tz") ?? "UTC"     // in any function the request runs
 
 server fn set_zone(zone: str) =
     date.valid_zone(zone) ? set_cookie("tz", zone, { max_age: "1y" }) : null
 
 component SendZone(known) {            // once in the layout: sends the zone when it differs
-    <span hidden @mount={() => {
+    <span hidden onmount={() => {
         let z = js("Intl.DateTimeFormat", []).resolvedOptions().timeZone
         if z != known { set_zone(z) }
     }}></span>
@@ -917,7 +927,7 @@ how many times to run `f` again when the database gives up on it because of anot
 transaction:
 
 ```quillo
-fn withdraw(account: int, cents: int) with db =
+fn withdraw(account: int, cents: int) -> map with db =
     db.transaction({ isolation: "serializable", retries: 5 }, () => {
         let balance = db.one("select balance from accounts where id = ?", account).balance
         if balance < cents { return err("not enough money") }
@@ -1014,6 +1024,29 @@ There is no SQLCipher (no encryption at rest), and a file is opened by path, not
   transactions and migrations. A query releases the interpreter lock while it waits,
   so other requests keep running. A transaction keeps one connection until it ends, so
   other requests never see its changes early.
+- **The session is the transaction's** *(since 0.7)*. A pooled connection goes from one
+  request to another, so what a statement changes beyond its transaction would reach the
+  next visitor: `set` (without `local`), `set_config(..., false)`, a `create temp` table,
+  `listen`, a session's advisory lock, a cursor `with hold`, `set session authorization`.
+  In a transaction, such a statement is noted, and the connection is reset before it goes
+  back (`set session authorization default`, `reset all`, `close all`, `discard temp`,
+  advisory locks let go, `unlisten *`; Quillo's prepared statements kept), or closed if the
+  reset fails. Outside one, where the connection is shared by every request, it is refused,
+  and so is a `begin` anywhere in a script. `prepare` is refused everywhere: pass values as
+  parameters (`?`), which Quillo prepares itself. Inside a SQLite transaction a PostgreSQL
+  query takes a free connection at once or is an error, as waiting would hold every request. Row-level
+  security's setting per request is therefore written inside the transaction, as local:
+
+  ```quillo
+  db.transaction(() => {
+      db.one("select set_config('app.user_id', ?, true)", me().id)   // true: this transaction's
+      db.query("select * from orders")                                 // what its policies allow
+  })
+  ```
+
+  A policy that reads it can take `coalesce(nullif(current_setting('app.user_id', true), ''), ...)`:
+  after a `set local`, PostgreSQL reads the setting back as `""` in the connection's next
+  transaction, not null.
 - In the server, other queries share a second set of connections, pipelined (four,
   more while some wait on slow queries, up to `pool_size`): a request's queries (its
   `parallel` calls' too, outside a transaction) go to the same one, so the database
@@ -1287,7 +1320,7 @@ route GET /signup =                 // at www.example.com, which needs no databa
         <button>Make my site</button>
     </form>
 
-route POST /signup { form: { name: str } } {
+route POST /signup { form: { name: str } } with db {
     let made = new_tenant(name, () => db.exec("insert into settings (plan) values ('free')"))   // makes acme.db
     if is_err(made) { reply 409 "That name is taken" }
     redirect(`https://${name}.example.com/`)

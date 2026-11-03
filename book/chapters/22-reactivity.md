@@ -18,7 +18,7 @@ component Cart(items: list) {
         <ul>{for l in lines => <li key={l.id}>{l.name} × {l.qty}</li>}</ul>
         <input value={coupon} placeholder="Coupon"/>
         <p class={off > 0 && "saved"}>Total {total - off}</p>
-        <button @click={() => { lines = lines | filter((l) => l.qty > 0) }}>Tidy</button>
+        <button onclick={() => { lines = lines | filter((l) => l.qty > 0) }}>Tidy</button>
     </div>
 }
 ```
@@ -89,8 +89,8 @@ component Clock() {
     state ticks = 0
     if running { every(speed, () => { ticks += 1 }) }    // stops when running is false,
     <div>                                                 // starts over when speed changes
-        <button @click={() => { running = !running }}>{running ? "Stop" : "Start"}</button>
-        <button @click={() => { speed = speed / 2 }}>Faster</button>
+        <button onclick={() => { running = !running }}>{running ? "Stop" : "Start"}</button>
+        <button onclick={() => { speed = speed / 2 }}>Faster</button>
         <span>{ticks}</span>
     </div>
 }
@@ -146,7 +146,7 @@ starts clean (`<Product key={id} id={id}/>`).
 ## What is not followed
 
 - **The page's own objects.** `el.value`, `el.scrollTop`, what `js(...)` gives: read
-  them in a handler and put what matters in state (`@scroll={(e) => { top = e.scrollTop }}`).
+  them in a handler and put what matters in state (`onscroll={(e) => { top = e.scrollTop }}`).
 - **Time.** `now()` is read once; a clock is a state that `every` sets.
 - **The server.** A `state x = load()` is the answer the page was made with. To follow
   the server, `state x = live(load)` (see [Live data](#live-data)); its arguments are
@@ -178,7 +178,7 @@ The server has two of its own, which follow the same idea of following what was 
 | `useState` | `$state` | `ref` | `state x = v` |
 | `useMemo` | `$derived` | `computed` | `let y = ...` reading state |
 | `useEffect` (and its cleanup) | `$effect` | `watchEffect` | a statement reading state; what it starts stops with it |
-| `useRef` | `bind:this` | template ref | `@mount={(el) => { box = el }}` |
+| `useRef` | `bind:this` | template ref | `onmount={(el) => { box = el }}` |
 | `value` with `onChange` | `bind:value` | `v-model` | `value={x}`: two-way by itself when `x` is state |
 | `useContext` | `setContext` | `provide` | none: props |
 | `key` | `{#each ... (key)}` | `:key` | `key={...}` |

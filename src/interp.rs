@@ -472,21 +472,62 @@ fn one_char(c: char) -> Value {
     Value::str(c.to_string())
 }
 
+/// Text from a URL, a query or a form as the type a pattern names, written one way: an int is
+/// an optional `-` and digits with no leading `0`, a float or a decimal also with a fraction and
+/// an exponent and finite, and nothing is trimmed. `/n/05`, `/n/+5` and `/n/%205` were 5 (one
+/// page at many addresses), and `NaN`, `inf` and `1e999` were floats a JSON answer wrote as
+/// null (FEEDBACK47.md, Q-542; branch feedback40-43). `bool` reads any case (Q-543).
 pub fn coerce(t: &str, s: &str) -> Option<Value> {
-    let s = s.trim();
     match t {
-        "int" => s.parse::<i64>().ok().map(Value::Int),
-        "float" => s.parse::<f64>().ok().map(Value::Float),
-        "num" => s.parse::<i64>().ok().map(Value::Int).or_else(|| s.parse::<f64>().ok().map(Value::Float)),
-        "dec" => Dec::parse(s).map(Value::Dec),
+        "int" => plain_int(s).then(|| s.parse::<i64>().ok().map(Value::Int)).flatten(),
+        "float" => plain_number(s).then(|| s.parse::<f64>().ok().filter(|f| f.is_finite()).map(Value::Float)).flatten(),
+        "num" => coerce("int", s).or_else(|| coerce("float", s)),
+        "dec" => plain_number(s).then(|| Dec::parse(s).map(Value::Dec)).flatten(),
         "date" => crate::dates::parse_date(s).map(|_| Value::str(s)),
-        "bool" => match s {
+        "bool" => match s.to_ascii_lowercase().as_str() {
             "true" | "on" | "1" | "yes" => Some(Value::Bool(true)),
             "false" | "off" | "0" | "no" => Some(Value::Bool(false)),
             _ => None,
         },
         "str" | "any" => Some(Value::str(s)),
         _ => None,
+    }
+}
+
+/// `-12`, `0`, `7`: not `05`, `+5`, ` 5` or `-0`.
+fn plain_int(s: &str) -> bool {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && (digits == "0" || !digits.starts_with('0')) && s != "-0"
+}
+
+/// `-1.5`, `2e3`, `0.25`: an int as above, then a fraction and an exponent, each optional.
+fn plain_number(s: &str) -> bool {
+    let (mantissa, exp) = match s.find(['e', 'E']) {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => (s, None),
+    };
+    let (whole, frac) = match mantissa.split_once('.') {
+        Some((w, f)) => (w, Some(f)),
+        None => (mantissa, None),
+    };
+    // `-0.5` has a whole part of `-0`; `-0` alone is no number of its own.
+    let whole_ok = plain_int(whole) || (whole == "-0" && (frac.is_some() || exp.is_some()));
+    let frac_ok = frac.map_or(true, |f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()));
+    let exp_ok = exp.map_or(true, |e| {
+        let d = e.strip_prefix(['-', '+']).unwrap_or(e);
+        !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
+    });
+    whole_ok && frac_ok && exp_ok
+}
+
+/// What `int(s)` and `float(s)` take, as Python's do: around spaces, a `+`, and for a float
+/// `nan` and `inf` too.
+pub fn coerce_loose(t: &str, s: &str) -> Option<Value> {
+    let s = s.trim();
+    match t {
+        "int" => s.parse::<i64>().ok().map(Value::Int),
+        "float" => s.parse::<f64>().ok().map(Value::Float),
+        _ => coerce(t, s),
     }
 }
 
@@ -1482,7 +1523,9 @@ impl Interp {
         // Inside a SQLite transaction, another request would run its SQL in
         // this one's transaction: committed or rolled back with it, and
         // seeing what it has not committed. So the wait holds everyone up.
-        if self.sqlite_tx > 0 {
+        // The thread's hold too: a service's code runs on an interpreter of its own, here
+        // (FEEDBACK44.md, Q-579; found in review).
+        if self.sqlite_tx > 0 || crate::httpd::held() {
             return f();
         }
         // A request in the server is a coroutine: it pauses, `f` runs on
@@ -3845,6 +3888,80 @@ impl Interp {
 
     /// Returns the matched (possibly coerced) value, or `None` on no match.
     /// Bindings are appended to `binds`.
+    /// Why `v` does not match `p`, a route's query or request pattern: the first field missing
+    /// or of another kind, as the 400 under `--watch` and the log say (FEEDBACK47.md, Q-544;
+    /// branch feedback40-43). `place` is what the fields are under: `query`, or none for a
+    /// request pattern, whose fields name `form`, `json` or `headers` themselves.
+    pub fn why_no_match(&mut self, p: &Pattern, v: &Value, place: &str, mode: Mode) -> String {
+        // Neither a value sent (a token in a header, a password) nor a pattern's own literal
+        // (a webhook's secret) is said: this goes to the log, and under `--watch` to whoever
+        // sent the request. Nothing is evaluated either: a default is code of the program's
+        // (found in review).
+        let Pattern::Record(fields) = p else { return "the request does not match its pattern".to_string() };
+        for f in fields {
+            let name = if place.is_empty() { f.path.join(".") } else { format!("{}.{}", place, f.path.join(".")) };
+            let sub = match mode {
+                Mode::Request if f.path[0] == "json" => Mode::Strict,
+                Mode::Request => Mode::Lenient,
+                m => m,
+            };
+            let article = |t: &str| if t.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
+            let wanted = match &f.pat {
+                Pattern::Type(t) => format!("{} {}", article(t), t),
+                Pattern::List(items, None) if items.len() == 1 => match &items[0] {
+                    Pattern::Type(t) => format!("a list of {}", t),
+                    _ => "a list".to_string(),
+                },
+                Pattern::Lit(_) => "the value the route asks for".to_string(),
+                _ => "what its pattern takes".to_string(),
+            };
+            match get_path(v, &f.path) {
+                None | Some(Value::Nil) if f.default.is_none() => {
+                    let checkbox = name.starts_with("form.") && matches!(&f.pat, Pattern::Type(t) if t == "bool");
+                    let hint = if checkbox {
+                        format!(" (an unchecked checkbox sends nothing: give it a default, `{}: bool = false`)", f.path.last().map_or("", |s| s.as_str()))
+                    } else {
+                        String::new()
+                    };
+                    return format!("`{}` is missing, and must be {}{}", name, wanted, hint);
+                }
+                // `{ form: { agree: bool } }`: the field inside, by its whole name.
+                Some(x @ Value::Map(_)) if matches!(f.pat, Pattern::Record(_)) => {
+                    let inner = self.why_no_match(&f.pat, &x, &name, sub);
+                    if inner != "the request does not match its pattern" {
+                        return inner;
+                    }
+                }
+                Some(x) if !matches!(x, Value::Nil) && !self.pattern_fits(&f.pat, &x, sub == Mode::Lenient) => {
+                    let kind = match &x {
+                        Value::Str(_) => "text".to_string(),
+                        other => format!("{} {}", article(other.type_name()), other.type_name()),
+                    };
+                    return format!("`{}` is {}, not {}", name, kind, wanted);
+                }
+                _ => {}
+            }
+        }
+        "the request does not match its pattern".to_string()
+    }
+
+    /// Whether `x` could match `p`, by its type and shape only: what `why_no_match` reads.
+    fn pattern_fits(&self, p: &Pattern, x: &Value, lenient: bool) -> bool {
+        match p {
+            Pattern::Type(t) if self.types.contains_key(t) => true,
+            Pattern::Type(t) if t == "dec" => as_dec(x).is_some(),
+            Pattern::Type(t) => type_name_matches(t, x) || (lenient && matches!(x, Value::Str(s) if coerce(t, s).is_some())),
+            Pattern::Lit(l) => {
+                let lv = lit_value(l);
+                equal(&lv, x) || (lenient && matches!(x, Value::Str(s) if coerce(lv.type_name(), s).is_some_and(|c| equal(&c, &lv))))
+            }
+            Pattern::Alt(ps) => ps.iter().any(|q| self.pattern_fits(q, x, lenient)),
+            Pattern::As(q, _) => self.pattern_fits(q, x, lenient),
+            Pattern::List(items, None) if items.len() == 1 => matches!(x, Value::List(l) if l.iter().all(|y| self.pattern_fits(&items[0], y, lenient))),
+            _ => true,
+        }
+    }
+
     pub fn match_pat(
         &mut self,
         p: &Pattern,
@@ -3943,8 +4060,15 @@ impl Interp {
                         m => m,
                     };
                     let found = get_path(v, &f.path);
+                    // A blank field of a query or a form, as a search form sends one left empty,
+                    // is one not sent when there is a default: `?page=` was a 400 (FEEDBACK47.md,
+                    // Q-543; branch feedback40-43).
+                    // Not a `str` field: there blank text is text, a password of spaces included
+                    // (found in review).
+                    let text_field = matches!(&f.pat, Pattern::Type(t) if t == "str" || t == "any");
+                    let blank = sub_mode == Mode::Lenient && f.default.is_some() && !text_field && matches!(&found, Some(Value::Str(s)) if s.trim().is_empty());
                     let val = match (found, &f.default) {
-                        (Some(x), _) if !matches!(x, Value::Nil) => x,
+                        (Some(x), _) if !matches!(x, Value::Nil) && !blank => x,
                         (_, Some(d)) => {
                             // A default is taken as written: `limit: int = null`
                             // binds null when the field is missing.

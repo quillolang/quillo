@@ -35,15 +35,15 @@ What a type cannot say goes in functions. Each rule gives a list of problems, a 
 a message, so rules add up with `+` and an empty list means all is well:
 
 ```quillo
-fn problem(field: str, message: str) = [{ field, message }]
-fn when(cond: bool, problems: list) = cond ? problems : []
+fn problem(field: str, message: str) -> list = [{ field, message }]
+fn when(cond: bool, problems: list) -> list = cond ? problems : []
 
-fn is_email(s: str) {
+fn is_email(s: str) -> bool {
     let parts = split(s, "@")
     len(parts) == 2 && parts[0] != "" && contains(parts[1], ".") && !contains(s, " ")
 }
 
-fn check_signup(s: map) =
+fn check_signup(s: map) -> list =
     when(trim(s.name ?? "") == "", problem("name", "Your name, please"))
     + when(!is_email(s.email ?? ""), problem("email", "Not an email address"))
     + when(s.plan == "pro" && (s.seats ?? 1) < 2, problem("seats", "Pro is for teams of 2 or more"))
@@ -76,7 +76,7 @@ component SignupForm() {
     let problems = mine + (sent == draft ? from_server : [])          // the server's, while they apply
     let hint = (field) => touched ? message_for(problems, field) : null
 
-    <form.signup @submit={() => {
+    <form.signup onsubmit={() => {
         touched = true
         if len(mine) == 0 {
             let r = sign_up(draft)
@@ -197,10 +197,10 @@ Some problems are advice, not a refusal. A `level` on the problem says so, and o
 others block:
 
 ```quillo
-fn warning(field: str, message: str) = [{ field, message, level: "warning" }]
-fn errors(problems: list) = problems | filter((p) => p.level != "warning")
+fn warning(field: str, message: str) -> list = [{ field, message, level: "warning" }]
+fn errors(problems: list) -> list = problems | filter((p) => p.level != "warning")
 
-fn check_email(s: map) = when(ends_with(s.email ?? "", ".con"), warning("email", "Did you mean .com?"))
+fn check_email(s: map) -> list = when(ends_with(s.email ?? "", ".con"), warning("email", "Did you mean .com?"))
 ```
 
 Show every problem as a hint, and decide on `errors(problems)`, in the browser and on the

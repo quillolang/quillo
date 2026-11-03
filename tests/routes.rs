@@ -180,7 +180,10 @@ route GET /half = half()
     assert_eq!(with(&mut it, "/admin", &ok).text(), "admin home");
     assert_eq!(with(&mut it, "/admin/teams/3/members", &ok).text(), r#"{"team":3}"#);
     assert_eq!(with(&mut it, "/admin/teams/x/members", &ok).status, 404);
-    assert_eq!(get(&mut it, "/seen").text(), r#"["/admin/users","/admin/users","/admin/users","/admin","/admin/teams/3/members","/admin/teams/3/members"]"#);
+    // The typed parameter's miss runs the middleware too, the outer group's and the inner's,
+    // as its routes do: what is under a guarded group is said only to whom it lets in
+    // (FEEDBACK47.md, Q-539).
+    assert_eq!(get(&mut it, "/seen").text(), r#"["/admin/users","/admin/users","/admin/users","/admin","/admin/teams/3/members","/admin/teams/3/members","/admin/teams/x/members","/admin/teams/x/members"]"#);
     assert_eq!(with(&mut it, "/api/me", &[]).text(), "not the api's host");
     let api = it.handle(&HttpRequest { method: "GET".into(), url: "/api/me".into(), headers: vec![("Host".into(), "api.example.com".into())], body: vec![], remote: "127.0.0.1".into() });
     assert_eq!(api.text(), "the api");

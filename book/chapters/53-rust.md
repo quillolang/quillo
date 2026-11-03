@@ -225,7 +225,7 @@ pub fn cache_incr(key: &str) -> Result<i64, String> {
 ```quillo
 use "redis.qwer"
 
-server fn visits(page: str) {
+server fn visits(page: str) -> int {
     watch(`visits:${page}`)                  // live pages showing this follow the topic
     int(cache_get(`visits:${page}`)? ?? "0")
 }
@@ -238,7 +238,7 @@ server fn visit(page: str) {
 
 component Visits(page: str) {
     state n = live(visits, page)
-    <button @click={() => visit(page)}>{n} visits</button>
+    <button onclick={() => visit(page)}>{n} visits</button>
 }
 ```
 

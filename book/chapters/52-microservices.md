@@ -22,7 +22,7 @@ route GET / =
         <button>Buy for $12.00</button>
     </form>
 
-route POST /buy {
+route POST /buy with http {
     let inv = billing.invoice(request.form.name, 1200)?    // billing's `server fn invoice`
     <p>Invoice #{inv.id}</p>
 }
@@ -116,7 +116,7 @@ A call that cannot be made (the service is not answering, every address is faili
 an error value, like any other: `?` passes it on and `??` replaces it.
 
 ```quillo
-route POST /buy {
+route POST /buy with http {
     let inv = billing.invoice(request.form.name, 1200) ?? reply 503 "Billing is busy; try again in a moment"
     <p>Invoice #{inv.id}</p>
 }
@@ -155,7 +155,7 @@ server fn invoice(o: Order) -> map ! str {
 // shop.qwe, calling it
 type Order = { customer: str, cents: int, note: str = "" }
 
-route POST /buy { json: Order } {
+route POST /buy { json: Order } with http {
     let inv = billing.invoice(Order(request.json)) ?? reply 400 "Billing refused the order"
     { invoice: inv }
 }
@@ -219,7 +219,7 @@ functions calling each other:
 // shop.qwe
 service billing = "billing.qwe" { timeout: "2s", retries: 1 }
 
-route POST /buy { json: Order } {
+route POST /buy { json: Order } with http {
     let inv = billing.invoice(Order(request.json))?
     { invoice: inv }
 }
@@ -664,7 +664,7 @@ server fn refund(account: int, cents: int) for ["shop"] {
     { refunded: cents, by: request.caller.name }
 }
 
-server fn whoami() = { caller: request.caller, user: request.user, forwarded: request.forwarded }
+server fn whoami() -> map = { caller: request.caller, user: request.user, forwarded: request.forwarded }
 ```
 
 - `keys` gives each caller's key by its name; a list takes any of them while one is

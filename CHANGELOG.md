@@ -4,6 +4,25 @@
 
 ### What to change in your code
 
+- **A group's middleware lets the route go on only by giving the request back, or null.**
+  `false` now answers 403, an error value answers as a route's error, and `true` or text is
+  a 500 naming the middleware; all of them let the route run before. A predicate middleware
+  (`fn is_admin(r) = ...`) is written `(r) => is_admin(r) ? r : reply 403 "..."`;
+  `quillo check` says so (FEEDBACK47.md, Q-534).
+- **Typed path, query and form values take their type written one way**: `05`, `+5`,
+  ` 5`, `NaN`, `inf` and `1e999` no longer match `int` or `float`, and a `str` parameter
+  is no longer trimmed (Q-542). `int(s)` and `float(s)` read as before.
+- **`db.exec("begin")` and the like are refused**: write `db.transaction(() => ...)`. A
+  `begin` whose `commit` was never reached left the shared connection in a transaction, and
+  every other request's writes in it. A script run whole may still hold its own (FEEDBACK44.md,
+  Q-580).
+- **On PostgreSQL, `set` (without `local`), `set_config(..., false)` and `create temp` are
+  refused outside `db.transaction`**: the connection is shared by every request, so another
+  visitor read them. Inside one they are reset when it ends (Q-581).
+- **`*rest` comes last**: `/f/*rest/more`, and a route inside `routes /docs/*path`, are
+  errors (what followed was ignored); so are `route HEAD` and a route under `/_quillo/`,
+  which were never called (Q-540, Q-541).
+
 - **An input with `value={state}` and nothing else setting it is two-way now**: typing
   changes the state. Before, typing was undone at once. To show a state without letting
   it change, add `readonly`. The same holds for a checkbox's `checked`, `open`, and a player's `muted`,
@@ -255,6 +274,40 @@
   view's parameter or a component's prop, `value={form.name}`, and a checkbox's `checked`,
   with no handler, `bind:`, `name=`, `readonly` or `disabled` on it. The input showed the
   typed text while the program kept what it had (Q-532).
+
+### What one request's transaction lets another see (FEEDBACK44.md)
+
+- **Inside a SQLite transaction, a query to PostgreSQL or MySQL waits in place**: it paused
+  the request, and others ran on SQLite's one connection inside the transaction, reading its
+  rows before it committed and losing their own writes when it rolled back (Q-579).
+- **Transactions are `db.transaction`'s**: `begin`, `commit` and the rest alone are refused,
+  a script that leaves one open is rolled back, and so is a SQLite connection still in one
+  at the end of a request, which the log says (Q-580).
+- **A PostgreSQL connection's session is reset before another request gets it**, after a
+  transaction that changed it; outside a transaction such a change is refused (Q-581).
+
+### Routes and groups (FEEDBACK47.md)
+
+- **A guarded group says nothing before its middleware**: a request under its path that
+  no route of it takes goes through the middleware before the server's 400, 404, 405, 501
+  or `OPTIONS`, which told a stranger its paths, methods and parameter types (Q-539).
+- **Middleware gets the request as sent**: a JSON field, query field or path parameter
+  named `request` replaced it, so a body could carry the headers it checked (Q-535).
+- **`routes /api { headers: ... } | g { ... }` is an error**: `| g` was a second pattern
+  that took any request, so neither the pattern nor `g` refused anything (Q-536).
+- **`site_headers` and `allow_cross_site` match the path as routes read it**:
+  `//admin/users` and `/%61dmin/users` got the admin page without its headers (Q-537).
+  `request.route_path` gives that path, and `request.host` the host as it names one: lower
+  case, no trailing dot or default port, as `headers.host` is now too (Q-545).
+- **Query and form values**: a blank field with a default takes the default, `bool` reads
+  any case, and a list takes `tag[]` when no `tag` came (Q-543).
+- **A 400 says why**: the route that came closest and its first miss, in the log always and
+  under `--watch` in the answer, with a hint for an unchecked checkbox (Q-544).
+- **`quillo check`**: a server fn a guarded page calls that checks nothing itself (Q-538), a
+  route an earlier one always takes first (Q-541), and a message of its own for each
+  mistake on the route line: `{ ok: true }` meant as an answer, a pattern after `with` or
+  before `?`, a method or no `/` after `routes`, a character a path cannot hold, a
+  parameter named `if` or `1`, and a group with nothing in it (Q-546).
 
 ### Found measuring coverage
 

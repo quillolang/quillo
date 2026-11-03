@@ -542,7 +542,7 @@ type Id = int | str                         // another name for a type
 let ada = User({ name: "Ada", email: "ada@example.com" })
 // { name: "Ada", email: "ada@example.com", role: "member", tags: [] }
 
-fn greet(u: User) = `Hi ${u.name}`
+fn greet(u: User) -> str = `Hi ${u.name}`
 
 route POST /users { json: User } = save(json)    // the body, made a User; else no match
 route POST /users = respond(422, "not a user")
@@ -759,9 +759,9 @@ the `.qwe` file and line, and the calls. In production it says the message alone
 `with` declares what a function may do besides computing a value:
 
 ```quillo
-fn load_user(id: int) with db = db.one("select * from users where id = ?", id)
+fn load_user(id: int) -> map? with db = db.one("select * from users where id = ?", id)
 fn fetch_avatar(url: str) with http = http.get(url).body
-fn profile(id: int) with db, http = { user: load_user(id), avatar: fetch_avatar(...) }
+fn profile(id: int) -> map with db, http = { user: load_user(id), avatar: fetch_avatar(...) }
 ```
 
 The effects, and the builtins behind each:
@@ -947,7 +947,7 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   as a command does (``style_with `engine` failed: it gave int, not CSS text``):
 
   ```quillo
-  fn engine(css) { replace(css, "@apply m-2;", "margin: .5rem;") }
+  fn engine(css) -> str { replace(css, "@apply m-2;", "margin: .5rem;") }
   style_with(engine)
   ```
 - With Tailwind's CLI for the page's own sheet: `quillo run main.qwe --watch --with
@@ -1050,7 +1050,7 @@ component Counter(start: int = 0) {
     let double = count * 2               // recomputed on every render
     <div>
         <span>{count} (x2 = {double})</span>
-        <button @click={() => { count += 1 }}>+</button>
+        <button onclick={() => { count += 1 }}>+</button>
     </div>
 }
 
@@ -1096,7 +1096,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   component Total(price: int) {
       ~qty = 1                                  // the same as `state qty = 1`
       let total = price * qty                   // worked out again when qty changes
-      <p>{qty} x {price} = {total} <button @click={() => { qty += 1 }}>+</button></p>
+      <p>{qty} x {price} = {total} <button onclick={() => { qty += 1 }}>+</button></p>
   }
   ```
 
@@ -1117,7 +1117,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
       state items = [{ id: 1, text: "milk" }, { id: 2, text: "bread" }]
       <div>
           <ul>{for it in items => <li key={it.id}><input/> {it.text}</li>}</ul>
-          <button @click={() => { items = reverse(items) }}>Reverse</button>
+          <button onclick={() => { items = reverse(items) }}>Reverse</button>
       </div>
   }
   ```
@@ -1126,7 +1126,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   typed moves with "milk", as its row was moved, not written again.
 - `@event={fn}` handles DOM events (`@click`, `@input`, `@scroll`, `@submit`, ...), on
   HTML elements only (on a view or component tag it is an error). `onclick={fn}` is the same
-  handler, written as HTML and JSX write it; on a view or component, `on_change={...}` or
+  handler, written as HTML and JSX write it, and the form this guide's examples use
+  (`onsubmit`, `oninput`, `onmount`, ...); on a view or component, `on_change={...}` or
   `onChange={...}` is a parameter like any other. There are no
   modifiers: `@click.prevent` is taken as an event named `click.prevent`, which never
   fires; call `e.preventDefault()`. Event names are not checked, so a misspelt one
@@ -1150,8 +1151,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   ```quillo
   component Search() {
       state sent = ""
-      <form @submit={(e) => { sent = e.form.q }}>
-          <input name="q" @keydown={(e) => { if e.key == "Escape" { e.value = "" } }}/>
+      <form onsubmit={(e) => { sent = e.form.q }}>
+          <input name="q" onkeydown={(e) => { if e.key == "Escape" { e.value = "" } }}/>
           <button>Go</button>
           <p>{sent}</p>
       </form>
@@ -1237,7 +1238,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   ```quillo
   component Pin() {
       state pin = ""
-      <input value={pin} @input={(e) => { if len(e.value) <= 4 { pin = e.value } }}/>
+      <input value={pin} oninput={(e) => { if len(e.value) <= 4 { pin = e.value } }}/>
   }
   ```
 
@@ -1267,8 +1268,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   component Modal() {
       state open = true
       state backdrop = null
-      <div class="backdrop" @mount={(el) => { backdrop = el }}
-           @click={(e) => { if e.target == backdrop { open = false } }}>
+      <div class="backdrop" onmount={(el) => { backdrop = el }}
+           onclick={(e) => { if e.target == backdrop { open = false } }}>
           {open && <div class="box">Click outside to close</div>}
       </div>
   }
@@ -1288,7 +1289,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   component Pair() {
       state a = 0
       state b = 0
-      <p @click={() => { a += 1; b = a * 10 }}>{a} and {b}</p>
+      <p onclick={() => { a += 1; b = a * 10 }}>{a} and {b}</p>
   }
   ```
 
@@ -1307,7 +1308,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
       state running = false
       state tenths = 0
       if running { every(100, () => { tenths += 1 }) }
-      <p>{tenths / 10} s <button @click={() => { running = !running }}>{running ? "Stop" : "Start"}</button></p>
+      <p>{tenths / 10} s <button onclick={() => { running = !running }}>{running ? "Stop" : "Start"}</button></p>
   }
   ```
 
@@ -1326,7 +1327,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   component Save() {
       state saved = false
       <p>
-          <button @click={() => { saved = true; run_after(2000, () => { saved = false }) }}>Save</button>
+          <button onclick={() => { saved = true; run_after(2000, () => { saved = false }) }}>Save</button>
           {saved && <span>Saved</span>}
       </p>
   }
@@ -1335,7 +1336,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
       state names = ["Ana"]
       <div>
           {for n in names => <input class="name" value={n}/>}
-          <button @click={() => {
+          <button onclick={() => {
               names = names + [""]
               page_updated()                    // the new input is in the page now
               js("document.querySelector", ".name:last-of-type").focus()
@@ -1368,7 +1369,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   main.qwe:2: error: `db.query` is not available in the browser, where <Orders> also runs; use a `server fn`
   ```
 
-  Ask the server for them instead: `server fn orders() with db = db.query("select * from
+  Ask the server for them instead: `server fn orders() -> list with db = db.query("select * from
   orders")`, then `state rows = orders()`.
 - What the browser has of the standard library: text, lists, maps, numbers, errors,
   `raw`, `escape`, `url_encode`, `now`, `random`, `random_int`, `uuid`, `format_number`,
@@ -1398,7 +1399,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   ```quillo
   component Theme() {
       state dark = false
-      <button @click={() => {
+      <button onclick={() => {
           dark = !dark
           js("localStorage.setItem", "theme", dark ? "dark" : "light")
       }}>{dark ? "Dark" : "Light"}</button>
@@ -1501,7 +1502,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   ```quillo
   component Broken() {
       state n = 0
-      <button @click={() => { js("JSON.parse", "{"); n += 1 }}>{n}</button>
+      <button onclick={() => { js("JSON.parse", "{"); n += 1 }}>{n}</button>
   }
 
   route GET / = <html>
@@ -1527,7 +1528,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   ```quillo
   component Remove(id: int) {
       state gone = false
-      <button @click={() => {
+      <button onclick={() => {
           if ask("Delete this order?", { title: "Delete", ok: "Delete", tone: "danger" }) {
               gone = true
               notify("Deleted", { tone: "success" })
@@ -1606,13 +1607,13 @@ view Card(title: str, children) = <section.card><h2>{title}</h2>{children}</sect
 
 component Counter(label: str, start: int = 0, on_change = null) {
     state n = start
-    <p>{label}: {n} <button @click={() => { n += 1; on_change && on_change(n) }}>+</button></p>
+    <p>{label}: {n} <button onclick={() => { n += 1; on_change && on_change(n) }}>+</button></p>
 }
 
 component Panel(header, children) {          // `header` is a named slot: any HTML
     state open = true
     <div>
-        <div @click={() => { open = !open }}>{header}</div>
+        <div onclick={() => { open = !open }}>{header}</div>
         {open && children}
     </div>
 }
@@ -1644,7 +1645,7 @@ component Dashboard() {
   parameter, so `id`, `data-*` or a class meant for its root element is passed as a
   parameter it declares (`<Button id="x">` is an error unless `Button` has `id`).
 - A component may show itself (a tree of comments), as long as it stops somewhere.
-- There are no portals and no refs: `@mount={(el) => { box = el }}` with `state box =
+- There are no portals and no refs: `onmount={(el) => { box = el }}` with `state box =
   null` keeps an element, and `js("document.body.appendChild", el)` moves one.
 - What reads a prop follows it, as what reads state does: a place in the markup that
   shows it (`{label}`, `class={...}`), a `let` (`let doubled = count * 2`), a statement
@@ -1686,15 +1687,15 @@ client "https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser
 
 component Sales(points: list) {
     state chart = null
-    <canvas @mount={(el) => {
+    <canvas onmount={(el) => {
         chart = Chart.new(el, { type: "line", data: points })    // new Chart(el, ...)
         () => chart.destroy()                   // when the canvas leaves the page
     }}></canvas>
-    <button @click={() => confetti({ particleCount: 120 })}>Celebrate</button>
+    <button onclick={() => confetti({ particleCount: 120 })}>Celebrate</button>
 }
 
 component Where() {
-    <div class="map" @mount={(el) => { L.map(el).setView([14.6, 121.0], 12) }}></div>
+    <div class="map" onmount={(el) => { L.map(el).setView([14.6, 121.0], 12) }}></div>
 }
 
 route GET / = <html><body><Sales points={load_points()}/></body></html>
@@ -1768,7 +1769,7 @@ client module "https://esm.sh/three@0.170.0" use * as THREE
 client /assets/helper.mjs use helper
 
 component Scene() {
-    <canvas @mount={(el) => {
+    <canvas onmount={(el) => {
         let scene = THREE.Scene.new()
         scene.name = dayjs().format("YYYY")
     }}></canvas>
@@ -1799,7 +1800,7 @@ they define by name:
 ```quillo
 component Sales(points: list) {
     state chart = null
-    <canvas @mount={(el) => { chart = js_new("Chart", el, { type: "line", data: points }) }}></canvas>
+    <canvas onmount={(el) => { chart = js_new("Chart", el, { type: "line", data: points }) }}></canvas>
 }
 
 route GET / = <html><head><script src="/assets/chart.js"></script></head>
@@ -1841,7 +1842,7 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
 - A Promise a page's function gives (`navigator.mediaDevices.getUserMedia`, `fetch`) is
   waited for where code can wait, as a `server fn` call is: in an event handler, in
   `@mount`, in a `state` initializer, and in the component's `let` functions that its
-  markup does not call (`let locate = () => { ... }`, then `@click={locate}`): `let cam =
+  markup does not call (`let locate = () => { ... }`, then `onclick={locate}`): `let cam =
   js("navigator.mediaDevices.getUserMedia", { video: true })` is the stream, or an
   error value if it was refused. The same holds for a method of what the page gave
   (`img.decode()`, `audio.play()`) and for a function given as a prop, so there is one
@@ -1920,8 +1921,8 @@ And the pages it shows, with the `server fn`s that give them their data:
 ```quillo
 let products = [{ id: 1, name: "Kettle", price: 30 }, { id: 2, name: "Teapot", price: 25 }]
 
-server fn list_products() = products | map((p) => { id: p.id, name: p.name })
-server fn load_product(id: int) = products | find((p) => p.id == id)
+server fn list_products() -> list = products | map((p) => { id: p.id, name: p.name })
+server fn load_product(id: int) -> map? = products | find((p) => p.id == id)
 
 view Home() = <h1>Welcome</h1>
 view NotFound(path: str) = <h1>No page at {path}</h1>
@@ -1939,7 +1940,7 @@ component ProductPage(id: int, on_add) {
         ? <p>Loading…</p>
         : <div>
               <h1>{product.name}</h1>
-              <button @click={() => on_add(product)}>Add to cart, {product.price}</button>
+              <button onclick={() => on_add(product)}>Add to cart, {product.price}</button>
           </div>}
 }
 ```
@@ -1967,16 +1968,16 @@ anyone, not only when this page acts.
 db.open("notes.db")
 db.exec("create table if not exists notes (id integer primary key, text text not null)")
 
-server fn load_notes() = db.query("select id, text from notes order by id")
+server fn load_notes() -> list = db.query("select id, text from notes order by id")
 
-server fn add_note(text: str) = db.exec("insert into notes (text) values (?)", text)
+server fn add_note(text: str) -> map = db.exec("insert into notes (text) values (?)", text)
 
 component Notes() {
     state notes = live(load_notes)  // every open page sees new notes
     state draft = ""
     <div>
         <ul>{for n in notes => <li key={n.id}>{n.text}</li>}</ul>
-        <form @submit={() => { add_note(draft); draft = "" }}>
+        <form onsubmit={() => { add_note(draft); draft = "" }}>
             <input value={draft} placeholder="A note"/>
             <button>Add</button>
         </form>
@@ -2045,7 +2046,7 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
   code that writes publishes:
 
   ```quillo
-  server fn load_posts(thread: int) {
+  server fn load_posts(thread: int) -> list {
       watch(`thread:${thread}`)
       unwatched(() => db.query("select * from posts where thread = ?", thread))
   }
@@ -2060,7 +2061,7 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
       state draft = ""
       <section>
           {for p in posts => <p key={p.id}>{p.text}</p>}
-          <form @submit={() => { reply_to(id, draft); draft = "" }}>
+          <form onsubmit={() => { reply_to(id, draft); draft = "" }}>
               <textarea value={draft}></textarea>
               <button>Reply</button>
           </form>
@@ -2208,7 +2209,7 @@ component Notes(initial: list) {
     state notes = initial
     state draft = ""
     state problem = null
-    <form @submit={() => {
+    <form onsubmit={() => {
         let r = add_note(draft)                    // a request to the server
         if is_err(r) { problem = r.error } else { notes = r; draft = ""; problem = null }
     }}>
@@ -2219,7 +2220,7 @@ component Notes(initial: list) {
     </form>
 }
 
-route GET / = <html><body><Notes initial={db.query("select * from notes")}/></body></html>
+route GET / with db = <html><body><Notes initial={db.query("select * from notes")}/></body></html>
 ```
 
 The route gives the component the notes there are; pressing Add with the box empty shows
@@ -2351,7 +2352,7 @@ Components and server code share a file, but not what they can touch:
       <div class="map" data-token={token}>Map, token {token}</div>
   }
 
-  server fn charge() = env("STRIPE_KEY") != null         // a secret stays on the server
+  server fn charge() -> bool = env("STRIPE_KEY") != null         // a secret stays on the server
   ```
 
   The page and its bundle hold `pk.test123`, and nothing of `sk_live_xyz`. Reading
@@ -2381,7 +2382,7 @@ Components and server code share a file, but not what they can touch:
 
   component Upload() {
       state done = false
-      <input type="file" @change={(e) => {
+      <input type="file" onchange={(e) => {
           let f = e.target.files[0]
           done = http.put(upload_url(f.name), f).ok      // the file, as it is, to the bucket
       }}/>
@@ -2400,7 +2401,7 @@ Components and server code share a file, but not what they can touch:
   and gives its parameters types (one without a type takes any JSON):
 
   ```quillo
-  server fn delete_note(id: int) {
+  server fn delete_note(id: int) -> map {
       let me = session().user ?? reply 401 "Log in first"
       db.exec("delete from notes where id = ? and owner = ?", id, me)
   }
@@ -2435,7 +2436,7 @@ component Cart(items: list) {
         <ul>{for l in lines => <li key={l.id}>{l.name} × {l.qty}</li>}</ul>
         <input value={coupon} placeholder="Coupon"/>
         <p class={off > 0 && "saved"}>Total {total - off}</p>
-        <button @click={() => { lines = lines | filter((l) => l.qty > 0) }}>Tidy</button>
+        <button onclick={() => { lines = lines | filter((l) => l.qty > 0) }}>Tidy</button>
     </div>
 }
 ```
@@ -2506,8 +2507,8 @@ component Clock() {
     state ticks = 0
     if running { every(speed, () => { ticks += 1 }) }    // stops when running is false,
     <div>                                                 // starts over when speed changes
-        <button @click={() => { running = !running }}>{running ? "Stop" : "Start"}</button>
-        <button @click={() => { speed = speed / 2 }}>Faster</button>
+        <button onclick={() => { running = !running }}>{running ? "Stop" : "Start"}</button>
+        <button onclick={() => { speed = speed / 2 }}>Faster</button>
         <span>{ticks}</span>
     </div>
 }
@@ -2563,7 +2564,7 @@ starts clean (`<Product key={id} id={id}/>`).
 ### What is not followed
 
 - **The page's own objects.** `el.value`, `el.scrollTop`, what `js(...)` gives: read
-  them in a handler and put what matters in state (`@scroll={(e) => { top = e.scrollTop }}`).
+  them in a handler and put what matters in state (`onscroll={(e) => { top = e.scrollTop }}`).
 - **Time.** `now()` is read once; a clock is a state that `every` sets.
 - **The server.** A `state x = load()` is the answer the page was made with. To follow
   the server, `state x = live(load)` (see [Live data](#live-data)); its arguments are
@@ -2595,7 +2596,7 @@ The server has two of its own, which follow the same idea of following what was 
 | `useState` | `$state` | `ref` | `state x = v` |
 | `useMemo` | `$derived` | `computed` | `let y = ...` reading state |
 | `useEffect` (and its cleanup) | `$effect` | `watchEffect` | a statement reading state; what it starts stops with it |
-| `useRef` | `bind:this` | template ref | `@mount={(el) => { box = el }}` |
+| `useRef` | `bind:this` | template ref | `onmount={(el) => { box = el }}` |
 | `value` with `onChange` | `bind:value` | `v-model` | `value={x}`: two-way by itself when `x` is state |
 | `useContext` | `setContext` | `provide` | none: props |
 | `key` | `{#each ... (key)}` | `:key` | `key={...}` |
@@ -2639,8 +2640,13 @@ route METHOD /path [with effects] { ... block ... }
   ```
 - **Path params** become variables. `:id(int)` only matches what parses as an int (also
   `float`, `dec`, `num`, `str`, and `date`: `/day/:d(date)` takes `2026-11-20`, not
-  `2026-02-30`). `*rest` (or `*name`) takes the rest of the path; `*`
-  alone names it `rest`. `/users/{id}`, as OpenAPI and Express write a parameter, is an
+  `2026-02-30`). A typed parameter takes its type written one way *(since 0.7)*: an `int`
+  is an optional `-` and digits with no leading `0` (`05`, `+5` and ` 5` are not one, so a
+  page has one address), a `float`, `num` or `dec` also takes a fraction and an exponent and
+  is finite (`NaN`, `inf` and `1e999` are not), and nothing is trimmed, a `str` included.
+  The same holds for typed fields of a query or a form. `*rest` (or `*name`) takes the rest
+  of the path, so it comes last: nothing can follow it, in the route or in its group's
+  routes *(since 0.7: what followed was ignored)*; `*` alone names it `rest`. `/users/{id}`, as OpenAPI and Express write a parameter, is an
   error that says to write `:id`. The path is split at `/`, empty pieces dropped, so `/users`,
   `/users/` and `//users` are one path; each piece is percent-decoded after the split, so
   a `%2F` stays inside its piece. `request.path` is the path as it came, undecoded.
@@ -2657,7 +2663,12 @@ route METHOD /path [with effects] { ... block ... }
   curl localhost:8080/day/2026-02-30        # 404: not a date
   curl localhost:8080/files/docs/a.txt      # docs/a.txt
   ```
-- **Query pattern:** `? { q: str, page: int = 1 }`. Query values are text, so `int`, `float` and `bool` patterns convert them.
+- **Query pattern:** `? { q: str, page: int = 1 }`. Query values are text, so `int`, `float` and `bool` patterns convert them. A blank value (`?page=`, as a search
+  form sends a field left empty) is one not sent when the field has a default, so `page`
+  is 1 *(since 0.7)*. `bool` takes `true`, `on`, `1` and `yes`, and `false`, `off`, `0` and
+  `no`, in any case. A list (`{ tag: [str] }`) takes every `tag`, or every `tag[]` when
+  no `tag` came, as PHP- and Rails-shaped forms name them. An unchecked checkbox sends
+  nothing, so its field needs a default: `{ form: { agree: bool = false } }`.
   A name sent more than once keeps its last value in `request.query` and `request.form`;
   a list in the pattern takes them all, as a group of checkboxes sends: `? { tag: [str] }`
   gives `["a", "b"]` for `?tag=a&tag=b`, one value a list of one, and none an empty list.
@@ -2742,7 +2753,9 @@ route METHOD /path [with effects] { ... block ... }
 - **Reserved:** paths under `/_quillo/` belong to Quillo and never reach a route (what is
   there is listed under [What a route cannot do](#what-a-route-cannot-do)). A route
   written there is never called: `route GET /_quillo/stats = ...` answers 404, so put
-  your own under another path (`/stats`, `/admin/stats`).
+  your own under another path (`/stats`, `/admin/stats`). `quillo check` refuses one, and
+  a `route HEAD` too (a HEAD is answered by the GET route), and warns of a route an
+  earlier one with no pattern always takes first *(since 0.7)*.
 - **Order:** routes are tried in the order they are declared, and the first whose method, path and patterns all match handles the request. A later route can be the fallback.
   Routes are declared at the top level of a file: `quillo check` refuses one inside a
   function or a block.
@@ -2774,7 +2787,9 @@ route METHOD /path [with effects] { ... block ... }
 
 If no route matches, the response is 404 for an unknown path, 405 for a known
 path with the wrong method (with `Allow`, the methods it takes), and 400 when a route
-matched the path and method but none of its patterns matched. Before any route is tried, a `POST`, `PUT`, `PATCH` or
+matched the path and method but none of its patterns matched. The 400 is logged with the
+route that came closest and its first miss (`` POST /form (main.qwe:6): `form.agree` is
+missing, and must be a bool ``), and under `--watch` the answer says it too *(since 0.7)*. Before any route is tried, a `POST`, `PUT`, `PATCH` or
 `DELETE` with a form, multipart or plain-text body (or none) that the browser marks as
 coming from another site is refused with 403 (see `allow_cross_site` under
 [Standard library](#standard-library)). A last `route ANY /*rest` is a 404 page of
@@ -2844,17 +2859,47 @@ routes /reports | signed_in with db {               // what its routes may do, a
 - **The path** goes before each route's own, parameters and types included
   (`:team(int)`), which the routes' bodies and patterns can use; a group's `/` alone
   adds nothing.
-- **Middleware** (each after a `|`, as in a pipeline) is called with `request` before the
-  route's body, outer groups' first, in the order written. A `reply` in it answers the
-  request in the route's place, as does a response it gives back (`redirect(...)`,
-  `respond(...)`); anything else it gives lets the route go on, so the middleware of a
-  pipeline (`auth.required`, which gives the request back) works as it is. What it gives
-  does not reach the route: a route that needs the user reads it again (`session()`,
-  `me()`). `quillo check` checks each call as it checks any other, at the line the
-  middleware is written on.
+- **Middleware** (each after a `|`, as in a pipeline) is called with the request before
+  the route's body, outer groups' first, in the order written. It lets the route go on by
+  giving the request back (as `auth.required` does) or null. Anything else stops it: a
+  `reply` in it, or a response it gives back (`redirect(...)`, `respond(...)`), answers in
+  the route's place; `false` answers 403, an error value answers as a route's error does,
+  and any other value (`true`, text) is a 500 that names the middleware *(since 0.7: these
+  let the route run)*. So a check is written `(r) => ok(r) ? r : reply 403 "..."`, not as a
+  predicate, and `quillo check` says so when a middleware can only be a `bool` or text.
+  What it gives does not reach the route: a route that needs the user reads it again
+  (`session()`, `me()`). It is given the request as sent, whatever the route's patterns
+  bind: a JSON field named `request` is the route's, not the middleware's *(since 0.7)*.
+- **Before the server's own answers** *(since 0.7)*. A request under a group's path that
+  no route of the group takes (another path, method or parameter type, a pattern it does
+  not match, an `OPTIONS`) goes through the group's middleware first: only those it lets
+  in learn what is there from a 404, a 400, a 405 and its `Allow`.
+- **Middleware that takes an argument** is a function that makes one, called in the
+  group's scope, where the group's own parameters are, already typed:
+
+  ```quillo
+  fn member_of(team: int) = (r) => my_teams() | contains(team) ? r : reply 403 "not your team"
+  fn role(name: str) = (r) => session().role == name ? r : reply 403 "no"
+
+  routes /teams/:team(int) | member_of(team) {
+      route GET /board = board(team)
+  }
+  routes /billing | role("admin") { route GET / = <Billing/> }
+  ```
+- **A group guards its routes, not the `server fn`s their pages call.** Each server fn is
+  its own `POST /_quillo/rpc/<name>`, which anyone can call: one a guarded page loads or
+  acts through checks the caller itself (`admins(request)`, `me()`). `quillo check` warns
+  of a server fn a guarded page calls that reads neither `request` nor `session`.
 - **A request pattern** after the middleware is matched as well as each route's own
   (both must match), and binds the same way: a request it does not match goes on to the
-  next route, as with a route's own pattern.
+  next route, as with a route's own pattern. The middleware comes first:
+  `routes /api { headers: ... } | g { ... }` is an error, as `| g` there would be a
+  pattern that takes any request.
+- **A host** in a pattern is matched as it names a host: `headers.host`, and
+  `request.host`, are lower case, without a trailing dot or the default port
+  (`API.example.com:443` is `api.example.com`) *(since 0.7)*. `request.route_path` is the
+  path as routes read it (`//admin/users` and `/%61dmin/users` are `/admin/users`), which
+  `site_headers` and `allow_cross_site` match on too.
 - A group holds only `route`s and `routes` groups, is written at the top level of a file,
   and keeps its routes in the order written, among the file's others. Outside that,
   `routes` is a name like any other (`routes / 2` divides). Routes from groups are
@@ -2966,11 +3011,11 @@ and the function gets the same `{ field, filename, type, size }` record a form's
 is, for `save_upload`:
 
 ```quillo
-server fn add_photo(file: map) = save_upload(file, `photos/${uuid()}.jpg`)
+server fn add_photo(file: map) -> str = save_upload(file, `photos/${uuid()}.jpg`)
 
 component Photo() {
     state saved = null
-    <input type="file" accept="image/*" @change={(e) => { saved = add_photo(e.target.files[0]) }}/>
+    <input type="file" accept="image/*" onchange={(e) => { saved = add_photo(e.target.files[0]) }}/>
 }
 ```
 
@@ -3068,7 +3113,7 @@ copy served as `image/jpeg`. A text file named `.jpg` is not kept, and the answe
 ### Cookies and sessions
 
 ```quillo
-route POST /login { form: { email: str, password: str } } {
+route POST /login { form: { email: str, password: str } } with db {
     // stored the same way at signup: one Unicode form, trimmed, in lower case
     let user = db.one("select * from users where email = ?", lower(normalize(trim(email))))
     if !crypto.verify_password(password, user.password_hash) { reply 401 "Wrong email or password" }
@@ -3076,7 +3121,7 @@ route POST /login { form: { email: str, password: str } } {
     redirect("/")
 }
 
-route GET /me {
+route GET /me with db {
     let id = session().user ?? reply 401 "Log in first"
     db.one("select name from users where id = ?", id)
 }
@@ -3354,7 +3399,7 @@ the component has nothing to add for it:
 component Pay() {
     state sent = null
     <div>
-        <button @click={() => { sent = transfer("ana", "bob", "12.50") }}>Send 12.50 to Bob</button>
+        <button onclick={() => { sent = transfer("ana", "bob", "12.50") }}>Send 12.50 to Bob</button>
         {is_err(sent) ? <p>Not sent: {error(sent)}</p> : sent && <p>Sent, transfer {sent.id}</p>}
     </div>
 }
@@ -3412,7 +3457,7 @@ curl -i localhost:8080/_quillo/rpc/transfer -H "Idempotency-Key: k-77" --json '[
           </form>
       </body></html>
 
-  route POST /order { form: { item: str, qty: int } } = idempotent(() => {
+  route POST /order { form: { item: str, qty: int } } with db = idempotent(() => {
       let o = db.one("insert into orders (item, qty) values (?, ?) returning id", item, qty)
       respond(201, <p>Order {o.id} placed: {qty} × {item}</p>)
   })
@@ -3532,7 +3577,7 @@ progress, a model's reply word by word. The client has the head at once, and eac
 `send` as it is made.
 
 ```quillo
-route GET /orders.csv = stream((send) => {
+route GET /orders.csv with db = stream((send) => {
     send("id,total\n")
     for o in db.query("select id, total from orders") { send(`${o.id},${o.total}\n`) }
 }, { type: "text/csv", headers: { "content-disposition": "attachment" } })
@@ -3545,7 +3590,7 @@ route GET /jobs/:id/progress = events((send) => {
 })
 
 // A model's answer, passed on as it arrives.
-route POST /ask = events((send) => http.stream("https://api.example.com/v1/chat", send, {
+route POST /ask with http, env = events((send) => http.stream("https://api.example.com/v1/chat", send, {
     body: { prompt: request.json.prompt, stream: true },
     headers: { authorization: `Bearer ${env("API_KEY")}` },
 }))
@@ -3600,7 +3645,7 @@ route POST /ask = events((send) => http.stream("https://api.example.com/v1/chat"
 component Chat() {
     state answer = ""
     <div>
-        <button @click={() => receive("/ask", (part) => { answer = answer + part.text }, { body: { prompt: "hi" } })}>Ask</button>
+        <button onclick={() => receive("/ask", (part) => { answer = answer + part.text }, { body: { prompt: "hi" } })}>Ask</button>
         <p>{answer}</p>
     </div>
 }
@@ -3638,7 +3683,7 @@ A page that shows the last readings as they come, and a sensor's packet sent fro
 terminal (`nc` stands in for the device):
 
 ```quillo
-server fn latest() = readings | drop(len(readings) - 10)     // the last ten
+server fn latest() -> list = readings | drop(len(readings) - 10)     // the last ten
 
 component Readings() {
     state rs = live(latest)
@@ -3700,7 +3745,7 @@ channel.on("game", (msg, peer) => {
 component Board() {
     state others = {}
     let game = channel.open("game", (m) => { others = set(others, m.id, m.pos) })
-    <canvas @pointermove={(e) => game.send({ pos: [e.clientX, e.clientY] })}/>
+    <canvas onpointermove={(e) => game.send({ pos: [e.clientX, e.clientY] })}/>
 }
 ```
 
@@ -3749,7 +3794,7 @@ component Board() {
       let room = channel.open("lobby", (m) => { lines = lines + [`${m.from}: ${m.text}`] })
       <div>
           <ul>{for l in lines => <li>{l}</li>}</ul>
-          <form @submit={() => { room.send({ text: draft }); draft = "" }}>
+          <form onsubmit={() => { room.send({ text: draft }); draft = "" }}>
               <input value={draft}/>
               <button>Send</button>
           </form>
@@ -4150,7 +4195,7 @@ route GET / =
         <button>Buy, 12.00</button>
     </form>
 
-route POST /buy {
+route POST /buy with http {
     let inv = billing.invoice(request.form.name, 1200)?    // billing's `server fn invoice`
     <p>Invoice #{inv.id}</p>
 }
@@ -4638,14 +4683,14 @@ Decimals and big ints cross as they do for pages. The address is any expression:
 
 ```quillo
 // shop.qwe, deployed at https://shop.example.com
-server fn notes(n: int) = range(1, n + 1) | map((i) => { id: i, text: `note ${i}` })
+server fn notes(n: int) -> list = range(1, n + 1) | map((i) => { id: i, text: `note ${i}` })
 
 // main.qwe, elsewhere
 site shop = env("SHOP_URL", "https://shop.example.com")
 
 server fn my_notes() = shop.notes(10)
 
-route GET / = <ul>{for n in my_notes() ?? [] => <li>{n.text}</li>}</ul>
+route GET / with http = <ul>{for n in my_notes() ?? [] => <li>{n.text}</li>}</ul>
 ```
 
 `SHOP_URL=http://127.0.0.1:8081 quillo run main.qwe` with the shop on that port lists
@@ -4695,10 +4740,10 @@ fn undo(s) = match s.step {
     _ => payments.refund(s.id)
 }
 
-fn move(s, state, step, why) =
+fn move(s, state, step, why) -> map =
     db.exec("update sagas set state = ?, step = ?, tries = 0, next_at = 0, why = ? where id = ? and state = ? and step = ?", state, step, why, s.id, s.state, s.step)
 
-fn try_again(s, why) =
+fn try_again(s, why) -> map =
     db.exec("update sagas set tries = ?, next_at = ?, why = ? where id = ?", s.tries + 1, now() + min([1000 * pow(2, s.tries + 1), 60000]), why, s.id)
 
 fn advance(s) {
@@ -4773,13 +4818,13 @@ route GET /order =
         <button>Order</button>
     </form>
 
-route POST /order { form: { cents: int } } {
+route POST /order { form: { cents: int } } with db, random {
     let id = uuid()
     db.exec("insert into sagas (id, cents, state, step, tries, next_at) values (?, ?, 'running', 0, 0, 0)", id, cents)
     redirect(`/order/${id}`)
 }
 
-route GET /order/:id {
+route GET /order/:id with db {
     let s = db.one("select state, why from sagas where id = ?", id) ?? reply 404 "No such order"
     match s.state {
         "done" => <p>Your order is placed.</p>
@@ -4859,7 +4904,7 @@ stays the simpler choice when the next move depends on the answer.
   server makes it (a request to `/_quillo/markdown`, so the page shows the same HTML,
   highlighting included), awaited like a `server fn`: call it in an event handler or a
   `state` initializer, and keep the text in state:
-  `@input={(e) => { preview = str(markdown(e.value)) }}` and `<div>{raw(preview)}</div>`.
+  `oninput={(e) => { preview = str(markdown(e.value)) }}` and `<div>{raw(preview)}</div>`.
   `markdown_page(text, { title, lang, html })` is the same as a whole page, for a route:
   a doctype, a `<head>` with its `<title>` (the option's, else the text's first `#`
   heading), and the HTML in its `<body>`.
@@ -5063,8 +5108,18 @@ Safety built in:
   `` `insert into t (${sql_name(keys(row))}) values (${sql_param(keys(row))})` `` with
   `row` as the parameters, or `` `update t set (${sql_name(cols)}) = (${sql_param(cols)})` ``.
   It is a warning, not a proof: SQL built in a list made with `map` is not followed.
-- Inside `db.transaction` on SQLite, `sleep` and `http` calls hold up other requests
-  instead of letting them write into the open transaction.
+- Inside `db.transaction` on SQLite, `sleep`, `http` and queries to another database
+  (PostgreSQL, MySQL) hold up other requests instead of letting them read and write
+  inside the open transaction *(since 0.7: a query to another database let them in)*.
+- **A transaction is `db.transaction`'s, not written by hand** *(since 0.7)*. `db.exec`,
+  `db.query` and `db.one` refuse `begin`, `start transaction`, `commit`, `end`,
+  `rollback`, `savepoint` and `release` alone: a `begin` whose `commit` was never reached
+  (a `?` that left, a `reply 400`) left the shared connection in it, and every other
+  request's writes with it. `db.transaction(() => ...)` commits, rolls back when something
+  fails, and keeps other requests out. A script run whole (`db.exec(read_file("seed.sql"))`)
+  may hold its own transaction, as `sqlite3 .dump` writes them, but one it leaves open is
+  rolled back and is an error; a SQLite connection still in a transaction at the end of a
+  request is rolled back too, and logged. `quillo check` says so of the literal text.
 
 Values are immutable: `push`, `set` and `+` return new lists and maps. A map's keys are
 text: `set(m, 5, x)` keys it `"5"`, and `m[5]`, `get(m, 5)` and `has(m, 5)` read that.
@@ -5231,10 +5286,10 @@ turns it around. A later release removes it.
   ```quillo
   // lib/forum.qwe
   private let PAGE = 20
-  private fn page_of(posts: list, n: int) = posts | drop((n - 1) * PAGE) | take(PAGE)
+  private fn page_of(posts: list, n: int) -> list = posts | drop((n - 1) * PAGE) | take(PAGE)
   private view Post(p: map) = <article><h2>{p.title}</h2></article>
 
-  public fn latest(n: int = 1) = page_of(db.query("select * from posts order by id desc"), n)
+  public fn latest(n: int = 1) -> list = page_of(db.query("select * from posts order by id desc"), n)
   public view Feed(n: int = 1) = <div>{for p in latest(n) => <Post p={p}/>}</div>
   ```
 
@@ -5593,13 +5648,13 @@ with a cookie, set from `Intl.DateTimeFormat().resolvedOptions().timeZone` throu
 before the cookie exists.
 
 ```quillo
-fn zone() = cookie("tz") ?? "UTC"     // in any function the request runs
+fn zone() -> str = cookie("tz") ?? "UTC"     // in any function the request runs
 
 server fn set_zone(zone: str) =
     date.valid_zone(zone) ? set_cookie("tz", zone, { max_age: "1y" }) : null
 
 component SendZone(known) {            // once in the layout: sends the zone when it differs
-    <span hidden @mount={() => {
+    <span hidden onmount={() => {
         let z = js("Intl.DateTimeFormat", []).resolvedOptions().timeZone
         if z != known { set_zone(z) }
     }}></span>
@@ -5734,7 +5789,7 @@ how many times to run `f` again when the database gives up on it because of anot
 transaction:
 
 ```quillo
-fn withdraw(account: int, cents: int) with db =
+fn withdraw(account: int, cents: int) -> map with db =
     db.transaction({ isolation: "serializable", retries: 5 }, () => {
         let balance = db.one("select balance from accounts where id = ?", account).balance
         if balance < cents { return err("not enough money") }
@@ -5831,6 +5886,29 @@ There is no SQLCipher (no encryption at rest), and a file is opened by path, not
   transactions and migrations. A query releases the interpreter lock while it waits,
   so other requests keep running. A transaction keeps one connection until it ends, so
   other requests never see its changes early.
+- **The session is the transaction's** *(since 0.7)*. A pooled connection goes from one
+  request to another, so what a statement changes beyond its transaction would reach the
+  next visitor: `set` (without `local`), `set_config(..., false)`, a `create temp` table,
+  `listen`, a session's advisory lock, a cursor `with hold`, `set session authorization`.
+  In a transaction, such a statement is noted, and the connection is reset before it goes
+  back (`set session authorization default`, `reset all`, `close all`, `discard temp`,
+  advisory locks let go, `unlisten *`; Quillo's prepared statements kept), or closed if the
+  reset fails. Outside one, where the connection is shared by every request, it is refused,
+  and so is a `begin` anywhere in a script. `prepare` is refused everywhere: pass values as
+  parameters (`?`), which Quillo prepares itself. Inside a SQLite transaction a PostgreSQL
+  query takes a free connection at once or is an error, as waiting would hold every request. Row-level
+  security's setting per request is therefore written inside the transaction, as local:
+
+  ```quillo
+  db.transaction(() => {
+      db.one("select set_config('app.user_id', ?, true)", me().id)   // true: this transaction's
+      db.query("select * from orders")                                 // what its policies allow
+  })
+  ```
+
+  A policy that reads it can take `coalesce(nullif(current_setting('app.user_id', true), ''), ...)`:
+  after a `set local`, PostgreSQL reads the setting back as `""` in the connection's next
+  transaction, not null.
 - In the server, other queries share a second set of connections, pipelined (four,
   more while some wait on slow queries, up to `pool_size`): a request's queries (its
   `parallel` calls' too, outside a transaction) go to the same one, so the database
@@ -6104,7 +6182,7 @@ route GET /signup =                 // at www.example.com, which needs no databa
         <button>Make my site</button>
     </form>
 
-route POST /signup { form: { name: str } } {
+route POST /signup { form: { name: str } } with db {
     let made = new_tenant(name, () => db.exec("insert into settings (plan) values ('free')"))   // makes acme.db
     if is_err(made) { reply 409 "That name is taken" }
     redirect(`https://${name}.example.com/`)
@@ -6539,7 +6617,7 @@ A job is a function of the program, so it takes `with` as any function does, and
 may do is held to that each time it runs:
 
 ```quillo
-fn nightly_report() with db, time {
+fn nightly_report() -> map with db, time {
     db.exec("insert into reports (day, total) select date(?), sum(total) from orders", now())
 }
 schedule("0 3 * * *", nightly_report)
@@ -6553,7 +6631,7 @@ db.open("app.db")
 db.exec("create table if not exists orders (id integer primary key, total int, at bigint)")
 db.exec("create table if not exists reports (day text primary key, orders int, total int)")
 
-fn nightly_report() {
+fn nightly_report() -> map {
     let day = str(date.today())
     let r = db.one("select count(*) as n, coalesce(sum(total), 0) as total from orders where at > ?", now() - 86_400_000)
     db.exec("insert into reports (day, orders, total) values (?, ?, ?) on conflict (day) do update set orders = excluded.orders, total = excluded.total", day, r.n, r.total)
@@ -6561,8 +6639,8 @@ fn nightly_report() {
 
 schedule("0 3 * * *", nightly_report)
 
-route POST /orders { form: { total: int } } = db.exec("insert into orders (total, at) values (?, ?)", total, now())
-route GET /reports = <ul>{for r in db.query("select * from reports order by day desc") => <li>{r.day}: {r.orders} orders, {r.total}</li>}</ul>
+route POST /orders { form: { total: int } } with db, time = db.exec("insert into orders (total, at) values (?, ?)", total, now())
+route GET /reports with db = <ul>{for r in db.query("select * from reports order by day desc") => <li>{r.day}: {r.orders} orders, {r.total}</li>}</ul>
 ```
 
 Each run is a line in the log, `POST /_quillo/job/nightly_report?at=1793631366 -> 200
@@ -6607,7 +6685,7 @@ fn step() {
     let dx = ball.x + ball.dx > 300 || ball.x + ball.dx < 0 ? -ball.dx : ball.dx
     ball = { x: ball.x + dx, dx }
 }
-fn snapshot() = { x: ball.x }
+fn snapshot() -> map = { x: ball.x }
 
 fn tick() { step(); channel.broadcast("room", snapshot()) }
 every(50, tick)                                 // 20 times a second, on the clock
@@ -7402,7 +7480,7 @@ pub fn cache_incr(key: &str) -> Result<i64, String> {
 ```quillo
 use "redis.qwer"
 
-server fn visits(page: str) {
+server fn visits(page: str) -> int {
     watch(`visits:${page}`)                  // live pages showing this follow the topic
     int(cache_get(`visits:${page}`)? ?? "0")
 }
@@ -7415,7 +7493,7 @@ server fn visit(page: str) {
 
 component Visits(page: str) {
     state n = live(visits, page)
-    <button @click={() => visit(page)}>{n} visits</button>
+    <button onclick={() => visit(page)}>{n} visits</button>
 }
 ```
 

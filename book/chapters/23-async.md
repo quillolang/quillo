@@ -54,7 +54,7 @@ component Notes() {
     state notes = load_notes()          // the server runs it while rendering
     state draft = ""
     state problem = null
-    <form @submit={() => {
+    <form onsubmit={() => {
         let r = add_note(draft)          // a call to the server; the page waits for it
         if is_err(r) { problem = r.error } else { notes = r; draft = ""; problem = null }
     }}>
@@ -157,7 +157,7 @@ an event loop, and each request is a coroutine that is set aside while it waits.
 ```quillo
 fn avatar(url: str) with http = http.get(url).body
 
-route GET /profile/:id(int) = {
+route GET /profile/:id(int) with db, http = {
     user: db.one("select * from users where id = ?", id),
     avatar: avatar(`https://avatars.example.com/${id}`),
 }

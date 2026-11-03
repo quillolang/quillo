@@ -195,7 +195,7 @@ pub(crate) fn hashing<T: Send + 'static>(it: &mut Interp, work: impl FnOnce() ->
     let _left = Left;
     // Outside the server, or inside a SQLite transaction (which no other
     // request may run in meanwhile): here, in turn.
-    if !crate::httpd::in_task() || it.sqlite_tx > 0 {
+    if !crate::httpd::in_task() || it.sqlite_tx > 0 || crate::httpd::held() {
         return Ok(in_turn(work));
     }
     static TURNS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();

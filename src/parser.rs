@@ -850,11 +850,20 @@ impl Parser {
                     let saved = self.save();
                     self.next()?;
                     self.lx.skip_spaces();
+                    if self.peeked.is_none() {
+                        if let Some(msg) = self.group_slip() {
+                            return Err(QuilloError::new(msg, line));
+                        }
+                    }
                     if self.peeked.is_none() && self.group_ahead() {
                         if !top {
                             return Err(QuilloError::new("a `routes` group is written at the top level of a file, as `route` is", line));
                         }
-                        let mut routes = self.parse_group(line, &[], &[], &[], &None)?.into_iter();
+                        let routes = self.parse_group(line, &[], &[], &[], &None)?;
+                        if routes.iter().all(|r| r.method == crate::ast::GUARD_METHOD) {
+                            return Err(QuilloError::new("this `routes` group has no routes in it", line));
+                        }
+                        let mut routes = routes.into_iter();
                         let Some(first) = routes.next() else {
                             return Err(QuilloError::new("this `routes` group has no routes in it", line));
                         };
@@ -1683,6 +1692,10 @@ impl Parser {
                     if name.is_empty() {
                         return Err(QuilloError::new("expected a parameter name after `:` in the path", self.lx.line));
                     }
+                    // `/:if`, `/:1`: a name the route's body can never read (Q-546).
+                    if KEYWORDS.contains(&name.as_str()) || name.starts_with(|c: char| c.is_ascii_digit()) {
+                        return Err(QuilloError::new(format!("`:{}` is no name the route can read: a parameter is named as a variable is, `/users/:id`", name), self.lx.line));
+                    }
                     let ty = if self.lx.peek_char() == Some('(') {
                         self.lx.bump();
                         let t = self.read_word();
@@ -1701,7 +1714,16 @@ impl Parser {
                 Some('*') => {
                     self.lx.bump();
                     let name = self.read_word();
-                    path.push(Seg::Rest(if name.is_empty() { "rest".into() } else { name }));
+                    if KEYWORDS.contains(&name.as_str()) || name.starts_with(|c: char| c.is_ascii_digit()) {
+                        return Err(QuilloError::new(format!("`*{}` is no name the route can read: the rest is named as a variable is, `/files/*path`", name), self.lx.line));
+                    }
+                    let name = if name.is_empty() { "rest".to_string() } else { name };
+                    // `/f/*rest/more`: what came after the rest was never compared (FEEDBACK47.md,
+                    // Q-540; branch feedback40-43).
+                    if self.lx.peek_char() == Some('/') {
+                        return Err(QuilloError::new(format!("`*{}` takes the rest of the path, so it comes last: nothing can follow it", name), self.lx.line));
+                    }
+                    path.push(Seg::Rest(name));
                 }
                 Some(c) if is_path_char(c) => {
                     let mut s = String::new();
@@ -1715,6 +1737,14 @@ impl Parser {
                     path.push(Seg::Lit(s));
                 }
                 _ => {}
+            }
+            // `/a/:id(int)x`, `/a:b`, `/a+b`: a character the path cannot hold, where the route
+            // line went on to say it expected its body (Q-546).
+            if let Some(c) = self.lx.peek_char() {
+                if !c.is_whitespace() && !matches!(c, '/' | '{' | '=' | '?' | '|' | ')' | ',' | ';') {
+                    let hint = if c == ':' { ": a parameter is a piece of its own, `/a/:b`" } else { "" };
+                    return Err(QuilloError::new(format!("a path cannot hold `{}` here{}", c, hint), self.lx.line));
+                }
             }
         }
         self.lx.last = Some(Tok::RParen);
@@ -1792,6 +1822,15 @@ impl Parser {
     }
 
     fn parse_route_rest(&mut self, method: String, path: Vec<Seg>, line: u32) -> PResult<RouteDef> {
+        // Mistakes on the route line, each said for what it is (FEEDBACK47.md, Q-546; branch
+        // feedback40-43).
+        self.lx.skip_spaces();
+        if self.peeked.is_none() && self.lx.peek_char() == Some('/') {
+            return self.err_at("a path has no spaces: write it in one piece, `/a/b`");
+        }
+        if self.at(&Tok::Bar)? {
+            return self.err_at("a route has no middleware of its own: put it in a group, `routes /x | g { route ... }`, or call it in the body, `request | g`");
+        }
         let query = if self.eat(&Tok::Question)? {
             if !self.at(&Tok::LBrace)? {
                 return self.err_at("expected `{` with query parameters after `?`");
@@ -1810,15 +1849,54 @@ impl Parser {
                 Ok(_) => matches!(self.peek(), Ok(Tok::LBrace) | Ok(Tok::Assign)) || matches!(self.peek(), Ok(Tok::Ident(k)) if k == "with"),
                 Err(_) => false,
             };
+            if let (Ok(Pattern::Record(fields)), false) = (&res, is_pat) {
+                if self.at(&Tok::Question)? {
+                    return self.err_at("the query pattern goes before the request pattern: `route POST /x ? { q: str } { json: j } = ...`");
+                }
+                // Only when the braces are no body either: `{ "hi" }`, `{ n }` and `{ request }`
+                // are blocks (found in review).
+                let ends = matches!(self.peek(), Ok(Tok::Newline | Tok::Eof | Tok::RBrace));
+                let is_block = ends && {
+                    let after = self.save();
+                    self.restore(saved.clone());
+                    let ok = self.parse_block().is_ok();
+                    self.restore(after);
+                    ok
+                };
+                if ends && !is_block {
+                    const REQUEST: &[&str] = &["json", "form", "headers", "query", "cookies", "files", "body", "method", "path", "params", "ip", "host"];
+                    return if !fields.is_empty() && fields.iter().all(|f| REQUEST.contains(&f.path[0].as_str())) {
+                        Err(QuilloError::new("this request pattern has no body after it: `= ...` or `{ ... }`", line))
+                    } else {
+                        Err(QuilloError::new("a route's `{` starts its body, or its request pattern: to answer this map, write `= { ... }`", line))
+                    };
+                }
+            }
             if is_pat {
                 body_pat = res.ok();
             } else {
                 self.restore(saved);
             }
         }
+        if let Some(name) = body_pat.as_ref().and_then(bare_alternative) {
+            return Err(QuilloError::new(format!(
+                "`| {}` after a request pattern is another pattern, one that takes any request, so the route always runs: a route has no middleware of its own; put it in a group, `routes /x | {} {{ route ... }}`, or call it in the body",
+                name, name
+            ), line));
+        }
 
         // `with db`: what the route may do, as for a function (branch feedback40-43).
         let effects = self.parse_with()?;
+        // `route POST /x with db { json: j } = j`: the pattern was read as the body (Q-546).
+        if effects.is_some() && body_pat.is_none() && self.at(&Tok::LBrace)? {
+            let saved = self.save();
+            let pat = self.parse_pattern();
+            let pattern_then_body = pat.is_ok() && matches!(self.peek(), Ok(Tok::LBrace | Tok::Assign));
+            self.restore(saved);
+            if pattern_then_body {
+                return self.err_at("the request pattern goes before `with`: `route POST /x { json: j } with db = ...`");
+            }
+        }
         let body = if self.eat(&Tok::Assign)? {
             self.parse_expr()?
         } else if self.at(&Tok::LBrace)? {
@@ -1835,6 +1913,34 @@ impl Parser {
     /// Whether what follows `routes` is a group's path: `/` and a path
     /// (`/admin`, `/:team`), or `/` alone before `|`, `{` or `with` (a group at
     /// the root). `routes / 2` is a division (branch route-groups).
+    /// `routes GET /a { ... }` and `routes admin { ... }`: what a group is not, said as such
+    /// rather than as a misspelt `route` (FEEDBACK47.md, Q-546; branch feedback40-43).
+    fn group_slip(&self) -> Option<String> {
+        let mut n = 0;
+        let mut word = String::new();
+        while let Some(c) = self.lx.peek_char_at(n) {
+            if !(c.is_alphanumeric() || c == '_') {
+                break;
+            }
+            word.push(c);
+            n += 1;
+        }
+        if word.is_empty() {
+            return None;
+        }
+        while matches!(self.lx.peek_char_at(n), Some(' ' | '\t')) {
+            n += 1;
+        }
+        let next = self.lx.peek_char_at(n);
+        if METHODS.contains(&word.as_str()) && next == Some('/') {
+            return Some(format!("a group takes no method, each of its routes has one: `routes /... {{ route {} /... = ... }}`", word));
+        }
+        if matches!(next, Some('{' | '|')) && !KEYWORDS.contains(&word.as_str()) {
+            return Some(format!("a group's path starts with `/`: `routes /{} {{ ... }}`", word));
+        }
+        None
+    }
+
     fn group_ahead(&self) -> bool {
         if self.lx.peek_char() != Some('/') {
             return false;
@@ -1882,11 +1988,28 @@ impl Parser {
                 Some(mine)
             }
         };
+        if self.at(&Tok::Bar)? {
+            return self.err_at("a group's middleware goes before `with`: `routes /admin | signed_in with db { ... }`");
+        }
+        if self.at(&Tok::Question)? {
+            return self.err_at("a group takes no query pattern: put `? { ... }` on each route that reads it");
+        }
         let mut guards = guards.to_vec();
         if self.at(&Tok::LBrace)? {
             let saved = self.save();
             match self.parse_pattern() {
-                Ok(p) if self.at(&Tok::LBrace)? => guards.push(p),
+                Ok(p) if self.at(&Tok::LBrace)? => {
+                    // `routes /api { headers: ... } | g { ... }`: `| g` was an alternative that
+                    // takes anything, so neither the pattern nor `g` ever refused a request
+                    // (FEEDBACK47.md, Q-536; branch feedback40-43).
+                    if let Some(name) = bare_alternative(&p) {
+                        return Err(QuilloError::new(format!(
+                            "`| {}` after a request pattern is another pattern, one that takes any request: a group's middleware goes before the pattern, `routes {} | {} {{ headers: ... }} {{ ... }}`",
+                            name, shown_path(&path), name
+                        ), line));
+                    }
+                    guards.push(p)
+                }
                 _ => self.restore(saved),
             }
         }
@@ -1904,20 +2027,43 @@ impl Parser {
                 Tok::Ident(k) if k == "route" => {
                     self.next()?;
                     let mut r = self.parse_route(at)?;
+                    // `routes /docs/*path { route GET /edit ... }`: the group's rest took every
+                    // path under it, so its first route answered them all (Q-540).
+                    if let (Some(Seg::Rest(name)), false) = (path.last(), r.path.is_empty()) {
+                        return Err(QuilloError::new(format!(
+                            "`*{0}` takes the rest of the path, so it comes last: a route in this group can add nothing after it; give the group no rest, and each route its own (`route GET /edit/*{0}`)",
+                            name
+                        ), at));
+                    }
                     let mut full = path.clone();
                     full.append(&mut r.path);
                     r.path = full;
+                    // `routes /t/:team(int) | member_of(team) { route POST /move { json: { team: int } } }`:
+                    // the body's `team` took the path's place in the middleware's call, so a
+                    // request chose whose team it was checked against (found in review).
+                    let mut bound = Vec::new();
+                    for p in r.query.iter().chain(r.body_pat.iter()).chain(r.guards.iter()) {
+                        crate::check::pattern_names(p, &mut bound);
+                    }
+                    for (m, _) in &before {
+                        let mut read = Vec::new();
+                        crate::check::walk_expr(m, &mut |x| {
+                            if let Expr::Ident(n, _) = x {
+                                read.push(n.to_string());
+                            }
+                        });
+                        if let Some(n) = bound.iter().find(|n| read.contains(n)) {
+                            return Err(QuilloError::new(format!(
+                                "this route's pattern binds `{0}`, which the group's middleware reads: it would be called with the request's `{0}`, not the path's; name the field otherwise (`{{ json: {{ {0}: other }} }}`)",
+                                n
+                            ), at));
+                        }
+                    }
                     let mut gs = guards.clone();
                     gs.append(&mut r.guards);
                     r.guards = gs;
                     if !before.is_empty() {
-                        let mut stmts: Vec<Stmt> = before
-                            .iter()
-                            .map(|(m, ml)| {
-                                let called = Expr::Call(Box::new(m.clone()), vec![Expr::Ident("request".into(), *ml)], *ml);
-                                Stmt::Expr(Expr::Call(Box::new(Expr::Ident("__answer".into(), *ml)), vec![called], *ml))
-                            })
-                            .collect();
+                        let mut stmts = guard_calls(&before);
                         stmts.push(Stmt::Expr(std::mem::replace(&mut r.body, Expr::Lit(Lit::Nil))));
                         r.body = Expr::Block(stmts);
                     }
@@ -1936,13 +2082,44 @@ impl Parser {
                 }
                 Tok::Ident(k) if k == "routes" => {
                     self.next()?;
-                    out.extend(self.parse_group(at, &path, &before, &guards, &effects)?);
+                    let inner = self.parse_group(at, &path, &before, &guards, &effects)?;
+                    // As at the top level (Q-546): a group inside another with nothing in it.
+                    if inner.iter().all(|r| r.method == crate::ast::GUARD_METHOD) {
+                        return Err(QuilloError::new("this `routes` group has no routes in it", at));
+                    }
+                    out.extend(inner);
                 }
                 other => return self.err_at(format!("a `routes` group holds `route` and `routes`, found {}", other.describe())),
             }
             self.end_stmt()?;
         }
-        let _ = line;
+        // Its middleware for what no route of it answers (Q-539): after the routes of groups
+        // inside it, whose own guards are nearer.
+        if !before.is_empty() {
+            let mut guard_path = path.clone();
+            if !matches!(guard_path.last(), Some(Seg::Rest(_))) {
+                guard_path.push(Seg::Rest("__rest".into()));
+            }
+            let mut body = guard_calls(&before);
+            body.push(Stmt::Expr(Expr::Lit(Lit::Nil)));
+            out.push(
+                RouteDef {
+                    method: crate::ast::GUARD_METHOD.to_string(),
+                    path: guard_path,
+                    query: None,
+                    body_pat: None,
+                    // The group's request pattern (a host's) says which requests are under it.
+                    guards: guards.clone(),
+                    body: Expr::Block(body),
+                    line,
+                    file: self.file.clone(),
+                    uses_request: true,
+                    effects: effects.clone(),
+                    limit: None,
+                }
+                .limited(),
+            );
+        }
         Ok(out)
     }
 
@@ -3458,6 +3635,57 @@ pub fn more_errors(src: &str, after: u32) -> Vec<QuilloError> {
         }
     }
     out
+}
+
+/// The calls of a group's middleware, each answered by `__answer`, that start each of its
+/// routes' bodies and its hidden guard route's.
+fn guard_calls(before: &[(Expr, u32)]) -> Vec<Stmt> {
+    before
+        .iter()
+        .map(|(m, ml)| {
+            // With the request itself, which the route's patterns cannot bind: a
+            // JSON field named `request` was what the middleware checked
+            // (FEEDBACK47.md, Q-535; branch feedback40-43). Its name goes along,
+            // for what it gave (Q-534).
+            let called = Expr::Call(Box::new(m.clone()), vec![Expr::Ident("__request".into(), *ml)], *ml);
+            let shown = match m {
+                Expr::Ident(n, _) => n.to_string(),
+                Expr::Call(f, _, _) => match &**f {
+                    Expr::Ident(n, _) => format!("{}(...)", n),
+                    _ => "the middleware".to_string(),
+                },
+                _ => "the middleware".to_string(),
+            };
+            let name = Expr::Lit(Lit::Str(shown.into()));
+            Stmt::Expr(Expr::Call(Box::new(Expr::Ident("__answer".into(), *ml)), vec![called, name], *ml))
+        })
+        .collect()
+}
+
+/// The name in `{ ... } | g`, a request pattern's alternative that binds anything: written for
+/// middleware, it made the pattern match every request (FEEDBACK47.md, Q-536).
+fn bare_alternative(p: &Pattern) -> Option<String> {
+    match p {
+        Pattern::Alt(ps) => ps.iter().find_map(|p| match p {
+            Pattern::Bind(n) => Some(n.to_string()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+/// A route path as written: `/admin/:id`.
+fn shown_path(path: &[Seg]) -> String {
+    let s: String = path
+        .iter()
+        .map(|seg| match seg {
+            Seg::Lit(l) => format!("/{}", l),
+            Seg::Param(n, Some(t)) => format!("/:{}({})", n, t),
+            Seg::Param(n, None) => format!("/:{}", n),
+            Seg::Rest(n) => format!("/*{}", n),
+        })
+        .collect();
+    if s.is_empty() { "/".to_string() } else { s }
 }
 
 /// What to write instead of an old Wisp-era spelling.

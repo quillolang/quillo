@@ -73,7 +73,8 @@ struct Parts {
 }
 
 fn collect_interp(it: &Interp, prefix: &str, parts: &mut Parts) {
-    for r in it.routes.iter() {
+    // Not a guarded group's hidden route (FEEDBACK47.md, Q-539).
+    for r in it.routes.iter().filter(|r| r.method != crate::ast::GUARD_METHOD) {
         parts.routes.push((prefix.to_string(), r.clone()));
     }
     for (f, who) in it.fn_callers.iter() {
@@ -124,7 +125,7 @@ fn collect_file(path: &Path, base: &Path, prefix: &str, parts: &mut Parts, seen:
     let stmts = crate::parser::Parser::new(&src).in_file(Some(file)).parse_program().map_err(|e| e.in_file(&path.display().to_string()))?;
     for s in stmts {
         match s {
-            Stmt::Route(r) => parts.routes.push((prefix.to_string(), r)),
+            Stmt::Route(r) if r.method != crate::ast::GUARD_METHOD => parts.routes.push((prefix.to_string(), r)),
             Stmt::Fn(d) if d.server => parts.fns.push((prefix.to_string(), d)),
             Stmt::Expr(crate::ast::Expr::Call(f, args, _)) if matches!(&*f, crate::ast::Expr::Ident(n, _) if n == "__callers") => {
                 if let [crate::ast::Expr::Lit(crate::ast::Lit::Str(name)), crate::ast::Expr::List(l)] = args.as_slice() {

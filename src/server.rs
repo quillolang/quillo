@@ -123,9 +123,14 @@ fn all_values(pat: &crate::ast::Pattern, m: &Value, raw: &str) -> Option<Value> 
         return None;
     }
     let mut out = (**map).clone();
+    let pairs: Vec<(String, String)> =
+        raw.split('&').filter(|p| !p.is_empty()).map(|p| p.split_once('=').unwrap_or((p, ""))).map(|(k, v)| (percent_decode(k, true), percent_decode(v, true))).collect();
     for n in names {
-        let all = raw.split('&').filter(|p| !p.is_empty()).map(|p| p.split_once('=').unwrap_or((p, ""))).filter(|(k, _)| percent_decode(k, true) == **n);
-        out.insert(n.as_str().into(), Value::list(all.map(|(_, v)| Value::str(percent_decode(v, true))).collect()));
+        // `tag[]=a&tag[]=b`, as PHP- and Rails-shaped forms name a list, when there is no `tag`:
+        // it gave an empty list, and the route went on without them (FEEDBACK47.md, Q-543).
+        let bracketed = format!("{}[]", n);
+        let key = if pairs.iter().any(|(k, _)| k == n) { n.as_str() } else { bracketed.as_str() };
+        out.insert(n.as_str().into(), Value::list(pairs.iter().filter(|(k, _)| k == key).map(|(_, v)| Value::str(v)).collect()));
     }
     Some(Value::map(out))
 }
@@ -221,6 +226,29 @@ impl PendingRequest {
     }
 }
 
+/// A path as routes read it: split at `/`, empty pieces dropped, each decoded. `//admin/users`
+/// and `/%61dmin/users` are `/admin/users`, which a route under `/admin` answers, so what is
+/// said about `/admin` must hold for them too (FEEDBACK47.md, Q-537; branch feedback40-43).
+pub fn route_path(path: &str) -> String {
+    // A `%2F` stays inside its piece, as routes keep it: `/payments%2Freturn` is one piece, not
+    // `/payments/return`, which a rule of that path would then cover (found in review).
+    let pieces: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(|s| percent_decode(s, false).replace('/', "%2F")).collect();
+    format!("/{}", pieces.join("/"))
+}
+
+/// A `Host` as it names a host: lower case, without a trailing dot or the default port.
+/// `API.example.com`, `api.example.com:443` and `api.example.com.` are `api.example.com`, which
+/// a pattern on `headers.host` missed (FEEDBACK47.md, Q-545).
+pub fn host_name(host: &str) -> String {
+    let h = host.trim().to_ascii_lowercase();
+    let h = h.strip_suffix(":80").or_else(|| h.strip_suffix(":443")).unwrap_or(&h).to_string();
+    match h.rsplit_once(':') {
+        // `example.com.:8080`
+        Some((name, port)) if !name.ends_with(']') && port.bytes().all(|b| b.is_ascii_digit()) => format!("{}:{}", name.trim_end_matches('.'), port),
+        _ => h.trim_end_matches('.').to_string(),
+    }
+}
+
 fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map {
     let header = |name: &str| {
         req.headers.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()).unwrap_or("")
@@ -256,11 +284,15 @@ fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map {
 
     let mut headers = Map::with_capacity(req.headers.len());
     for (k, v) in &req.headers {
-        headers.insert(k.to_ascii_lowercase().into(), Value::str(v));
+        let k = k.to_ascii_lowercase();
+        let v = if k == "host" { host_name(v) } else { v.clone() };
+        headers.insert(k.into(), Value::str(v));
     }
-    let mut m = Map::with_capacity(10);
+    let mut m = Map::with_capacity(12);
     m.insert("method".into(), Value::str(&req.method));
     m.insert("path".into(), Value::str(path));
+    m.insert("route_path".into(), Value::str(route_path(path)));
+    m.insert("host".into(), Value::str(host_name(header("host"))));
     m.insert("query".into(), query.clone());
     // As it came: what a repeated name's others were, and what a signed URL signed.
     m.insert("query_string".into(), Value::str(req.url.split_once('?').map_or("", |(_, q)| q)));
@@ -340,6 +372,8 @@ impl Interp {
         let changed = (req.method != "GET" && req.method != "HEAD").then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         self.changed = changed.clone();
         let mut resp = self.handle_inner(req);
+        // A transaction begun by hand and left open (FEEDBACK44.md, Q-580).
+        crate::db::left_open(self, &format!("{} {}", req.method, path));
         // A prefetch's deferred parts: worked out now, as part of the prefetch, which
         // may change nothing (branch defer).
         if prefetch.is_some() && !self.deferred.is_empty() {
@@ -556,7 +590,7 @@ impl Interp {
         if !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS")
             && sends_form(req)
             && cross_site(req)
-            && !self.site.takes_cross_site(path)
+            && !self.site.takes_cross_site(&route_path(path))
         {
             return plain(403, "this site does not take form posts from other sites\n");
         }
@@ -567,14 +601,21 @@ impl Interp {
 
         let mut path_matched = false;
         let mut method_matched = false;
+        // The first route whose method and path took the request, and the pattern it missed,
+        // for what the 400 says (FEEDBACK47.md, Q-544).
+        let mut closest: Option<(Arc<crate::ast::RouteDef>, crate::ast::Pattern, Value, &'static str, Mode)> = None;
         // The methods the path takes, for `Allow` (FEEDBACK36.md, Q-440; branch feedback36-39).
         let mut allowed: Vec<&str> = Vec::new();
         let routes = self.routes.clone();
         if req.url == "*" && req.method == "OPTIONS" {
-            let mut all: Vec<&str> = routes.iter().map(|r| r.method.as_str()).filter(|m| *m != "ANY").collect();
+            let mut all: Vec<&str> = routes.iter().map(|r| r.method.as_str()).filter(|m| *m != "ANY" && *m != crate::ast::GUARD_METHOD).collect();
             return options_answer(&mut all);
         }
         for r in routes.iter() {
+            // A guarded group's own, for what no route answers (see below).
+            if r.method == crate::ast::GUARD_METHOD {
+                continue;
+            }
             let Some(params) = match_path(&r.path, &segs) else { continue };
             path_matched = true;
             if r.method != "ANY" && r.method != method {
@@ -612,15 +653,18 @@ impl Interp {
             let form_all = form_lists(r.body_pat.as_ref(), &reqv, req);
             let reqv = form_all.unwrap_or(reqv);
             // The `routes` groups' patterns too, outermost first (branch route-groups).
-            let checks = std::iter::once((r.query.as_ref(), query_v, Mode::Lenient))
-                .chain(r.guards.iter().map(|g| (Some(g), &reqv, Mode::Request)))
-                .chain(std::iter::once((r.body_pat.as_ref(), &reqv, Mode::Request)));
+            let checks = std::iter::once((r.query.as_ref(), query_v, Mode::Lenient, "query"))
+                .chain(r.guards.iter().map(|g| (Some(g), &reqv, Mode::Request, "")))
+                .chain(std::iter::once((r.body_pat.as_ref(), &reqv, Mode::Request, "")));
             let mut matched = true;
-            for (pat, val, mode) in checks {
+            for (pat, val, mode, place) in checks {
                 let Some(pat) = pat else { continue };
                 match self.match_pat(pat, val, mode, &scope, &mut binds) {
                     Ok(Some(_)) => {}
                     Ok(None) => {
+                        if closest.is_none() {
+                            closest = Some((r.clone(), pat.clone(), val.clone(), place, mode));
+                        }
                         matched = false;
                         break;
                     }
@@ -633,6 +677,12 @@ impl Interp {
             }
             for (k, v) in binds {
                 define(&scope, &k, v);
+            }
+            // The request as sent, for a group's middleware: a pattern binding `request` binds the
+            // route's own name, never this one (FEEDBACK47.md, Q-535; branch feedback40-43). After
+            // the patterns' names, so not even `? { __request: str }` replaces it (found in review).
+            if r.uses_request {
+                define(&scope, "__request", reqv.clone());
             }
 
             self.current_request = r.uses_request.then_some(reqv);
@@ -654,9 +704,35 @@ impl Interp {
             // out where the answer is written (FEEDBACK31.md, Q-393; branch feedback27-35-fixes).
             return resp;
         }
+        // Under a guarded group, its middleware first: a stranger learns nothing of what is
+        // there, its paths, methods and parameters, from the server's own answers (FEEDBACK47.md,
+        // Q-539; branch feedback40-43).
+        if let Some(refused) = self.guard_first(&routes, req, path, &segs, &query_v) {
+            return refused;
+        }
         if method_matched {
-            plain(400, "bad request: no route pattern matches this request\n")
-        } else if !KNOWN_METHODS.contains(&method) && !routes.iter().any(|r| r.method == method) {
+            // Which route came closest, and its first miss: in the log always, and under `--watch`
+            // in the answer too, as a 400 nobody can explain is a guess (Q-544).
+            let why = closest.map(|(r, pat, val, place, mode)| {
+                // The file as from where the program was started, as other messages give it.
+                let at = match r.file.as_deref() {
+                    Some(file) => {
+                        let cwd = std::env::current_dir().ok();
+                        let file = cwd.as_ref().and_then(|d| std::path::Path::new(file).strip_prefix(d).ok()).map_or(file.to_string(), |p| p.display().to_string());
+                        format!("{}:{}", file, r.line)
+                    }
+                    None => format!("line {}", r.line),
+                };
+                format!("{} ({}): {}", r.shown(), at, self.why_no_match(&pat, &val, place, mode))
+            });
+            if let Some(why) = &why {
+                crate::httpd::warning_line(&format!("400: {}", why));
+            }
+            match why.filter(|_| SHOW_ERRORS.load(std::sync::atomic::Ordering::Relaxed)) {
+                Some(why) => plain(400, &format!("bad request: no route pattern matches this request\n{}\n", why)),
+                None => plain(400, "bad request: no route pattern matches this request\n"),
+            }
+        } else if !KNOWN_METHODS.contains(&method) && !routes.iter().any(|r| r.method == method && r.method != crate::ast::GUARD_METHOD) {
             // A method nothing here knows is a 501, not a 405 (RFC 9110 §9.1).
             plain(501, "unknown method\n")
         } else if path_matched && method == "OPTIONS" {
@@ -670,6 +746,88 @@ impl Interp {
             plain(404, "not found\n")
         }
     }
+}
+
+impl Interp {
+    /// The middleware of the innermost guarded group whose path the request is under, when no
+    /// route answered it: its answer if it refuses, else none, and the server's answer stands.
+    fn guard_first(&mut self, routes: &[Arc<crate::ast::RouteDef>], req: &HttpRequest, path: &str, segs: &[String], query_v: &Value) -> Option<HttpResponse> {
+        // Every guarded group the request is under, outer and inner, overlapping or not, each
+        // in the order declared: the first that refuses answers (found in review: only the
+        // first was asked). A group's own request pattern, a host's, says whether it is under it.
+        // An inner group's guard runs its outer groups' middleware too: their own guards are
+        // not run again after it (found by the suite). Told by the middleware calls, where they
+        // are written: an inner guard's begin with its outer groups', and a group that only
+        // overlaps (`/api/v2` and `/api`) has its own (found in review).
+        let mut ran: Vec<Vec<(Option<Arc<str>>, u32)>> = Vec::new();
+        for r in routes.iter().filter(|r| r.method == crate::ast::GUARD_METHOD) {
+            let own = guard_calls(r);
+            if ran.iter().any(|inner| inner.len() > own.len() && inner[..own.len()] == own[..]) {
+                continue;
+            }
+            // Its parameters typed when they are of their type, as the middleware expects them
+            // (`member_of(team)` compares an int); as text when not, so `/t/abc/x` under
+            // `/t/:team(int)` goes through it too, or the 404 would say the type (found in review).
+            let untyped: Vec<crate::ast::Seg> = r
+                .path
+                .iter()
+                .map(|seg| match seg {
+                    crate::ast::Seg::Param(n, Some(_)) => crate::ast::Seg::Param(n.clone(), None),
+                    other => other.clone(),
+                })
+                .collect();
+            let Some(params) = match_path(&r.path, segs).or_else(|| match_path(&untyped, segs)) else { continue };
+            let scope = Scope::child(&self.globals);
+            let mut reqmap = build_request(req, path, query_v);
+            reqmap.insert("params".into(), Value::map(params.iter().map(|(k, v)| (k.into(), v.clone())).collect()));
+            if let Some(id) = &self.request_id {
+                reqmap.insert("id".into(), Value::str(&**id));
+            }
+            let reqv = Value::map(reqmap);
+            let mut binds = Vec::new();
+            let mut under = true;
+            for g in &r.guards {
+                match self.match_pat(g, &reqv, Mode::Request, &scope, &mut binds) {
+                    Ok(Some(_)) => {}
+                    _ => {
+                        under = false;
+                        break;
+                    }
+                }
+            }
+            if !under {
+                continue;
+            }
+            define(&scope, "request", reqv.clone());
+            define(&scope, "__request", reqv.clone());
+            for (k, v) in params {
+                define(&scope, &k, v);
+            }
+            self.current_request = Some(reqv);
+            let file = std::mem::replace(&mut self.cur_file, r.file.clone());
+            self.route_limit = r.limit.clone();
+            let answered = self.under_route(|it| it.eval(&r.body, &scope));
+            self.cur_file = file;
+            self.current_request = None;
+            if answered.is_err() {
+                return Some(finish(crate::interp::in_file(answered, &r.file)));
+            }
+            ran.push(own);
+        }
+        None
+    }
+}
+
+/// A guard route's middleware calls, by their file and line.
+fn guard_calls(r: &crate::ast::RouteDef) -> Vec<(Option<Arc<str>>, u32)> {
+    let crate::ast::Expr::Block(stmts) = &r.body else { return Vec::new() };
+    stmts
+        .iter()
+        .filter_map(|s| match s {
+            crate::ast::Stmt::Expr(crate::ast::Expr::Call(_, _, line)) => Some((r.file.clone(), *line)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Methods RFC 9110 and RFC 5789 define: one of them no route takes is a 405 or a 404, any
@@ -762,7 +920,12 @@ impl Interp {
     /// it to the next visitor, and a page is not framed by another site, `X-Frame-Options:
     /// SAMEORIGIN` (FEEDBACK31.md, Q-391; branch feedback27-35-fixes).
     fn site_headers_into(&self, path: &str, sets_cookie: bool, resp: &mut HttpResponse) {
-        let under = |p: &str| p == "/" || path == p || path.starts_with(&format!("{}/", p));
+        // On the path as routes read it (Q-537).
+        let path = &route_path(path);
+        let under = |p: &str| {
+            let p = route_path(p);
+            p == "/" || *path == p || path.starts_with(&format!("{}/", p))
+        };
         let mut want: Vec<(String, Option<String>)> = Vec::new();
         let mut rules: Vec<&(String, Vec<(String, Option<String>)>)> = self.site.headers.iter().filter(|(p, _)| under(p)).collect();
         rules.sort_by_key(|(p, _)| if p == "/" { 0 } else { p.len() });
@@ -1934,7 +2097,7 @@ impl App {
         let mut slot = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match res {
             Ok(_) => {
-                eprintln!("quillo: reloaded {} ({} routes)", self.main_file.display(), it.routes.len());
+                eprintln!("quillo: reloaded {} ({} routes)", self.main_file.display(), it.routes.iter().filter(|r| r.method != crate::ast::GUARD_METHOD).count());
                 // A version that is the first to use services or `db.atomic`
                 // needs what delivers and recovers in the background.
                 let addr = *self.addr.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2828,7 +2991,7 @@ fn serve_from(
     threads_allowed(workers);
     let app = Arc::new(app);
     if let Loaded::Ready(it) = &*app.current().1 {
-        let n = it.routes.len();
+        let n = it.routes.iter().filter(|r| r.method != crate::ast::GUARD_METHOD).count();
         eprintln!("quillo: {} route{} listening on {}", n, if n == 1 { "" } else { "s" }, shown);
         if let Some(db) = &*crate::db::OPENED.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             eprintln!("quillo: database {}", db);
@@ -2913,7 +3076,7 @@ pub fn serve_many(apps: Vec<App>, addr: &str, workers: usize) -> Result<(), Stri
     let shown = listener.local_addr().map_or_else(|_| addr.to_string(), |a| a.to_string());
     let apps: Vec<Arc<App>> = apps.into_iter().map(Arc::new).collect();
     if let Some(Loaded::Ready(it)) = apps.first().map(|a| a.current().1).as_deref() {
-        let n = it.routes.len();
+        let n = it.routes.iter().filter(|r| r.method != crate::ast::GUARD_METHOD).count();
         eprintln!(
             "quillo: {} route{} listening on http://{} ({} instances)",
             n,

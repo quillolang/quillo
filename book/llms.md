@@ -178,13 +178,13 @@ import lib/notes.qwe use load_notes, add_note
 
 ```quillo
 route GET /hello = "Hello"                                   // text
-route GET /api/todos = db.query("select * from todos")       // a list or map is JSON
-route GET /todos/:id(int) {
+route GET /api/todos with db = db.query("select * from todos")   // a list or map is JSON
+route GET /todos/:id(int) with db {
     let t = db.one("select * from todos where id = ?", id)
     t ?? respond(404, "no such todo")
 }
 route GET /search ? { q: str, page: int = 1 } = search(q, page)       // query pattern
-route POST /todos { form: { text: str } } {
+route POST /todos { form: { text: str } } with db {
     db.exec("insert into todos (text) values (?)", text)?
     redirect("/")
 }
@@ -213,7 +213,7 @@ component Counter(start: int = 0) {
     let double = count * 2           // recomputed when count changes
     <div>
         <span>{count} (x2 = {double})</span>
-        <button @click={() => { count += 1 }}>+</button>
+        <button onclick={() => { count += 1 }}>+</button>
     </div>
 }
 
@@ -226,8 +226,8 @@ route GET / = <html><body><Card title="Hi"><Counter start={5}/></Card></body></h
   key={t.id}>{t.text}</li>}` renders a list.
 - A `view` is made on the server only. A `component` is made on the server and resumes in
   the browser; nothing else on the page needs JavaScript.
-- Events are `@click`, `@submit`, `@input`, `@change` (or `onclick` and the rest): a
-  lambda. What a person changes is two-way by itself when it shows a state *(since 0.7)*:
+- Events are `onclick`, `onsubmit`, `oninput`, `onchange` (or `@click` and the rest),
+  given a lambda. What a person changes is two-way by itself when it shows a state *(since 0.7)*:
   `<input value={draft}/>`, `checked={done}`, `<details open={more}>`, a player's
   `volume={v}`. A handler of the input's own, or `readonly`, keeps it one way.
 - `style css`...`` at the start of a component's body is CSS for its elements only.
@@ -247,7 +247,7 @@ component Tasks() {
     state items = live(list_tasks)     // runs again when the tasks table changes, on every page
     state draft = ""
     state problem = null
-    <form @submit={() => {
+    <form onsubmit={() => {
         let r = add_task(draft)
         if is_err(r) { problem = r.error } else { draft = "" }
     }}>

@@ -85,7 +85,7 @@ component Chat() {
     state lines = []
     state draft = ""
     let chat = channel.open("chat", (m) => { lines = lines + [m] })
-    <form @submit={() => {
+    <form onsubmit={() => {
         chat.send({ text: draft }, { reliable: true })
         draft = ""
     }}>
@@ -160,7 +160,7 @@ component Cursors() {
     let room = channel.open("cursors", (m) => {
         others = m.gone ? remove(others, m.id) : set(others, m.id, m)
     })
-    <div.board @pointermove={(e) => room.send({ x: e.clientX, y: e.clientY })}>
+    <div.board onpointermove={(e) => room.send({ x: e.clientX, y: e.clientY })}>
         {for c in values(others) =>
             <i.cursor key={c.id} style={`left:${c.x}px;top:${c.y}px`}/>}
     </div>

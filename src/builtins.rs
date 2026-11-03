@@ -1,6 +1,6 @@
 //! The standard library: functions every program can call.
 
-use crate::interp::{coerce, escape, fail, Ctrl, Interp};
+use crate::interp::{escape, fail, Ctrl, Interp};
 use crate::value::*;
 use indexmap::IndexMap;
 use std::path::{Component, Path};
@@ -408,7 +408,7 @@ fn to_int(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
         Value::Bool(b) => Value::Int(b as i64),
         // The whole part (toward zero).
         Value::Dec(d) => d.trunc_i64().map_or_else(|| Value::err(Value::str(format!("{} is too large for an int", d))), Value::Int),
-        Value::Str(s) => coerce("int", &s).unwrap_or_else(|| Value::err(Value::str(format!("not an int: {:?}", &*s)))),
+        Value::Str(s) => crate::interp::coerce_loose("int", &s).unwrap_or_else(|| Value::err(Value::str(format!("not an int: {:?}", &*s)))),
         other => Value::err(Value::str(format!("cannot convert {} to int", other.type_name()))),
     })
 }
@@ -419,7 +419,7 @@ fn to_float(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
         Value::Float(f) => Value::Float(f),
         Value::Dec(d) => Value::Float(d.to_f64()),
         Value::Str(s) => {
-            coerce("float", &s).unwrap_or_else(|| Value::err(Value::str(format!("not a number: {:?}", &*s))))
+            crate::interp::coerce_loose("float", &s).unwrap_or_else(|| Value::err(Value::str(format!("not a number: {:?}", &*s))))
         }
         other => Value::err(Value::str(format!("cannot convert {} to float", other.type_name()))),
     })
@@ -2629,10 +2629,32 @@ fn navigate(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// (`redirect(...)`, `respond(...)`) answers the request in the route's place,
 /// as a `reply` in the middleware does; anything else lets the route go on
 /// (branch route-groups).
-fn answer_with(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    match args.into_iter().next() {
-        Some(Value::Response(r)) => Err(Ctrl::Reply(r)),
-        _ => Ok(Value::Nil),
+/// What a group's middleware gave (`routes /admin | signed_in { ... }`): an answer stops the
+/// request, and the request given back, or null, lets the route go on. Anything else refuses
+/// it, so a middleware fails closed: `false` is a 403, an error value the route's error, and any
+/// other value a 500 naming the middleware. It let the route run (FEEDBACK47.md, Q-534; branch
+/// feedback40-43).
+fn answer_with(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let mut args = args.into_iter();
+    let given = args.next().unwrap_or(Value::Nil);
+    let name = args.next().map(|n| n.display()).unwrap_or_else(|| "the middleware".into());
+    match given {
+        Value::Response(r) => Err(Ctrl::Reply(r)),
+        Value::Nil | Value::Map(_) => Ok(Value::Nil),
+        Value::Bool(false) => Err(Ctrl::Reply(Arc::new(Response {
+            status: 403,
+            headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
+            body: Body::Value(Value::str("forbidden\n")),
+        }))),
+        e @ Value::Err(..) => Err(Ctrl::Return(e)),
+        other => fail(
+            line,
+            format!(
+                "`{}` gave {}: middleware gives back the request to let the route go on (or null), or an answer to stop it (`reply`, `respond`, `redirect`); `false` refuses with a 403",
+                name,
+                other.type_name()
+            ),
+        ),
     }
 }
 

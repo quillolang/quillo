@@ -42,7 +42,7 @@ browser drops; a `204` would leave it where it was. The page is then made as usu
 the link is followed.
 
 ```quillo
-route GET /count {
+route GET /count with db {
     db.exec("insert into visits values (1)")     // a write: a prefetch stops here
     <html><body>counted</body></html>
 }

@@ -240,6 +240,12 @@ pub enum Seg {
     Rest(String),
 }
 
+/// The method of a guarded group's hidden route (`routes /admin | admins { ... }`): its
+/// middleware, run for a request under the group's path that no route of it answers, before
+/// the server's 400, 404, 405, 501 or `OPTIONS` say what is there (FEEDBACK47.md, Q-539; branch
+/// feedback40-43). A program cannot write this method.
+pub const GUARD_METHOD: &str = "__GUARD";
+
 #[derive(Debug)]
 pub struct RouteDef {
     pub method: String,
@@ -281,6 +287,11 @@ impl RouteDef {
         }
         if s.is_empty() {
             s.push('/');
+        }
+        // A guarded group's hidden route is its group, in what a message says of it.
+        if self.method == GUARD_METHOD {
+            let group = s.strip_suffix("/*__rest").unwrap_or(&s);
+            return format!("routes {}", if group.is_empty() { "/" } else { group });
         }
         format!("{} {}", self.method, s)
     }

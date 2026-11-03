@@ -204,7 +204,7 @@ type Id = int | str                         // another name for a type
 let ada = User({ name: "Ada", email: "ada@example.com" })
 // { name: "Ada", email: "ada@example.com", role: "member", tags: [] }
 
-fn greet(u: User) = `Hi ${u.name}`
+fn greet(u: User) -> str = `Hi ${u.name}`
 
 route POST /users { json: User } = save(json)    // the body, made a User; else no match
 route POST /users = respond(422, "not a user")
@@ -421,9 +421,9 @@ the `.qwe` file and line, and the calls. In production it says the message alone
 `with` declares what a function may do besides computing a value:
 
 ```quillo
-fn load_user(id: int) with db = db.one("select * from users where id = ?", id)
+fn load_user(id: int) -> map? with db = db.one("select * from users where id = ?", id)
 fn fetch_avatar(url: str) with http = http.get(url).body
-fn profile(id: int) with db, http = { user: load_user(id), avatar: fetch_avatar(...) }
+fn profile(id: int) -> map with db, http = { user: load_user(id), avatar: fetch_avatar(...) }
 ```
 
 The effects, and the builtins behind each:
@@ -609,7 +609,7 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   as a command does (``style_with `engine` failed: it gave int, not CSS text``):
 
   ```quillo
-  fn engine(css) { replace(css, "@apply m-2;", "margin: .5rem;") }
+  fn engine(css) -> str { replace(css, "@apply m-2;", "margin: .5rem;") }
   style_with(engine)
   ```
 - With Tailwind's CLI for the page's own sheet: `quillo run main.qwe --watch --with

@@ -294,6 +294,9 @@ fn request_t() -> T {
     map_of(vec![
         (Arc::from("method"), text),
         (Arc::from("path"), text),
+        // As routes read it, and the host as it names one (FEEDBACK47.md, Q-537 and Q-545).
+        (Arc::from("route_path"), text),
+        (Arc::from("host"), text),
         (Arc::from("query"), any_map),
         (Arc::from("query_string"), text),
         (Arc::from("params"), any_map),
@@ -558,6 +561,91 @@ fn binop_t(op: BinOp, a: T, b: T) -> Option<T> {
 
 /// `(name, params, returns)`. A parameter is a type, `T=` when it may be left
 /// out, and `T...` for any number. `error(str)` is an error value.
+/// The server fns `body` calls, or names (`live(load)`), there and in the views and
+/// components it shows, as far as they go.
+fn server_fns_reached(fns: &HashMap<String, Arc<FnDef>>, body: &Expr) -> Vec<Arc<FnDef>> {
+    let mut found: Vec<Arc<FnDef>> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut pending: Vec<Expr> = vec![body.clone()];
+    while let Some(e) = pending.pop() {
+        let mut next: Vec<Expr> = Vec::new();
+        walk_expr(&e, &mut |x| match x {
+            Expr::Ident(n, _) => {
+                if let Some(d) = fns.get(n.as_str()).filter(|d| d.server) {
+                    if seen.insert(format!("fn {}", n)) {
+                        found.push(d.clone());
+                    }
+                }
+            }
+            Expr::Html(el, _) => walk_html_els(el, &mut |h| {
+                if h.tag.starts_with(|c: char| c.is_uppercase()) && seen.insert(h.tag.to_string()) {
+                    if let Some(d) = fns.get(h.tag.as_str()) {
+                        next.push(d.body.clone());
+                    }
+                }
+            }),
+            _ => {}
+        });
+        pending.extend(next);
+    }
+    found
+}
+
+/// Whether every request route `r` takes, `e` takes first: its method (or `ANY`), a path that
+/// covers `r`'s piece by piece, and no pattern that could let a request through to `r`.
+fn route_covers(e: &RouteDef, r: &RouteDef) -> bool {
+    if e.query.is_some() || e.body_pat.is_some() || !e.guards.is_empty() || (e.method != r.method && e.method != "ANY") {
+        return false;
+    }
+    for (i, es) in e.path.iter().enumerate() {
+        if matches!(es, Seg::Rest(_)) {
+            return true;
+        }
+        let Some(rs) = r.path.get(i) else { return false };
+        let ok = match (es, rs) {
+            (_, Seg::Rest(_)) => false,
+            (Seg::Lit(a), Seg::Lit(b)) => a == b,
+            (Seg::Param(_, None), _) => true,
+            (Seg::Param(_, Some(t)), Seg::Param(_, Some(u))) => t == u,
+            (Seg::Param(_, Some(t)), Seg::Lit(l)) => crate::interp::coerce(t, l).is_some(),
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    e.path.len() == r.path.len()
+}
+
+/// The middleware of the group a route is in, by name: its body's first call is `__answer`'s.
+fn middleware_of(r: &RouteDef) -> Option<String> {
+    let Expr::Block(stmts) = &r.body else { return None };
+    match stmts.first() {
+        Some(Stmt::Expr(Expr::Call(f, args, _))) if matches!(&**f, Expr::Ident(n, _) if n == "__answer") => match args.get(1) {
+            Some(Expr::Lit(Lit::Str(s))) => Some(s.to_string()),
+            _ => Some("its middleware".to_string()),
+        },
+        _ => None,
+    }
+}
+
+/// Whether a server fn checks who calls it: it reads `request` or `session`, there or in a
+/// function of the program it calls (`me()`, `signed_in(request)`), as far as they go.
+fn guards_itself(fns: &HashMap<String, Arc<FnDef>>, body: &Expr, seen: &mut HashSet<String>) -> bool {
+    let mut found = false;
+    let mut called: Vec<String> = Vec::new();
+    walk_expr(body, &mut |x| {
+        if let Expr::Ident(n, _) = x {
+            if n == "request" || n == "session" {
+                found = true;
+            } else if fns.contains_key(n.as_str()) {
+                called.push(n.to_string());
+            }
+        }
+    });
+    found || called.into_iter().any(|n| seen.insert(n.clone()) && fns.get(&n).is_some_and(|d| guards_itself(fns, &d.body, seen)))
+}
+
 /// The Latin letter a Cyrillic or Greek one looks like, or the letter itself.
 fn latin_lookalike(c: char) -> char {
     match c {
@@ -739,7 +827,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("navigate", "str", "null"),
     ("waiting", "any", "bool"),
     // What a `routes` group's middleware gave: a response answers (branch route-groups).
-    ("__answer", "any", "null"),
+    ("__answer", "any, str=", "null"),
     ("publish", "any...", "null"),
     ("watch", "any...", "null"),
     ("unwatched", "fn", "any"),
@@ -1417,6 +1505,7 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
                     }
                 }
             }
+            c.route_reach(&order);
             c.run(order);
             c.unused_said();
             c.state_details();
@@ -2229,6 +2318,8 @@ impl Checker {
                     self.scopes.clear();
                     self.stmt(&it.stmt, false);
                 }
+                // A guarded group's hidden route is no route of the program's (Q-539).
+                Stmt::Route(r) if r.method == crate::ast::GUARD_METHOD => {}
                 Stmt::Route(r) => {
                     self.out.symbols.push(Symbol {
                         name: format!("{} {}", r.method, route_path(r)),
@@ -2296,6 +2387,9 @@ impl Checker {
             self.scopes.clear();
             match &it.stmt {
                 Stmt::Fn(d) => self.fn_body(d),
+                // A guarded group's hidden route calls the middleware each of its routes does,
+                // checked there (FEEDBACK47.md, Q-539).
+                Stmt::Route(r) if r.method == crate::ast::GUARD_METHOD => {}
                 Stmt::Route(r) => self.route(r),
                 _ => {}
             }
@@ -2326,7 +2420,8 @@ impl Checker {
         self.scope_ids.truncate(self.scopes.len());
         if let Some(scope) = popped {
             for (name, v) in scope {
-                if self.quiet == 0 {
+                // Quillo's own names (`__request`) are no editor's to offer (FEEDBACK47.md, Q-535).
+                if self.quiet == 0 && !name.starts_with("__") {
                     let detail = var_detail(&name, &v);
                     let (file, line, end) = (v.file.to_string(), v.line, self.line.max(v.line));
                     let statement = matches!(v.kind, Kind::Let | Kind::State);
@@ -2364,6 +2459,74 @@ impl Checker {
     fn note_first_t(&mut self, file: &Arc<str>, line: u32, name: &str, t: T) {
         if self.assigned.contains(name) && !self.assigned.contains(&format!("={}", name)) && !t.vague() && t.bits & NIL == 0 {
             self.first_t.insert((file.clone(), line, name.to_string()), t);
+        }
+    }
+
+    /// Routes no request reaches, and the server fns a guarded page calls that guard nothing
+    /// themselves (FEEDBACK47.md, Q-541 and Q-538; branch feedback40-43).
+    fn route_reach(&mut self, order: &[Item]) {
+        let routes: Vec<(Arc<str>, Arc<RouteDef>)> = order
+            .iter()
+            .filter_map(|it| match &it.stmt {
+                Stmt::Route(r) if r.method != crate::ast::GUARD_METHOD => Some((it.file.clone(), r.clone())),
+                _ => None,
+            })
+            .collect();
+        for (i, (file, r)) in routes.iter().enumerate() {
+            if r.method == "HEAD" {
+                self.diag_at(file.clone(), r.line, Severity::Error, "`route HEAD` is never matched: a HEAD request is answered by the GET route, with its headers and no body");
+            }
+            if matches!(r.path.first(), Some(Seg::Lit(l)) if l == "_quillo") {
+                self.diag_at(file.clone(), r.line, Severity::Error, "a route under `/_quillo/` is never called: Quillo answers those paths itself, so pick another");
+            }
+            // An earlier route with no pattern takes every request this one would: the first
+            // that matches answers. Dangerous when this one is in a guarded group and that one is
+            // not, as a page left from before the group was added.
+            if let Some((efile, e)) = routes[..i].iter().find(|(_, e)| route_covers(e, r)) {
+                let mine = middleware_of(r);
+                let theirs = middleware_of(e);
+                let unguarded = match (&mine, &theirs) {
+                    (Some(m), None) => format!(", without `{}`, this route's middleware", m),
+                    _ => String::new(),
+                };
+                // Another file's route by its file too (found in review).
+                let at = if efile == file { format!("line {}", e.line) } else { self.shown_at(efile, e.line) };
+                self.diag_at(file.clone(), r.line, Severity::Warning, format!(
+                    "this route is never reached: `{}` ({}) takes every request it would{}",
+                    e.shown(), at, unguarded
+                ));
+            }
+        }
+        // Q-538: a group guards its routes, not the server fns their pages call, each of which is
+        // its own `POST /_quillo/rpc/<name>`. The program's functions, views and components by
+        // name, as this runs before the rest of the check.
+        let fns: HashMap<String, Arc<FnDef>> = order
+            .iter()
+            .filter_map(|it| match &it.stmt {
+                Stmt::Fn(d) => Some((d.name.clone(), d.clone())),
+                _ => None,
+            })
+            .collect();
+        let files: HashMap<String, Arc<str>> = order
+            .iter()
+            .filter_map(|it| match &it.stmt {
+                Stmt::Fn(d) => Some((d.name.clone(), it.file.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut told: HashSet<String> = HashSet::new();
+        for (_, r) in &routes {
+            let Some(guard) = middleware_of(r) else { continue };
+            for d in server_fns_reached(&fns, &r.body) {
+                if guards_itself(&fns, &d.body, &mut HashSet::new()) || !told.insert(d.name.clone()) {
+                    continue;
+                }
+                let file: Arc<str> = files.get(&d.name).cloned().unwrap_or_else(|| self.file.clone());
+                self.diag_at(file, d.line, Severity::Warning, format!(
+                    "`{}` is called by `{}`'s page, which `{}` guards, but a group guards its routes, not the server fns their pages call: anyone can call it at POST /_quillo/rpc/{}; if it is not for everyone, check the request in it too, as `{}(request)`",
+                    d.name, r.shown(), guard, d.name, guard.trim_end_matches("(...)")
+                ));
+            }
         }
     }
 
@@ -2900,6 +3063,8 @@ impl Checker {
         });
         self.push();
         self.define("request", request_t(), None, Kind::Bound);
+        // What a group's middleware is given (FEEDBACK47.md, Q-535; branch feedback40-43).
+        self.define("__request", request_t(), None, Kind::Bound);
         let mut seen = HashSet::new();
         for seg in &r.path {
             match seg {
@@ -5374,6 +5539,30 @@ impl Checker {
         // A piped value is the SQL: the pipe looks at it (see `Expr::Pipe`).
         if sig.builtin {
             self.lambda_arity(name, arg_exprs);
+        }
+        // A group's middleware that can give neither the request back, nor null, nor an answer
+        // stops every request: a predicate's `true` is a 500 (FEEDBACK47.md, Q-534).
+        if sig.builtin && name == "__answer" {
+            let t = args.first().copied().unwrap_or(T::ANY);
+            if t.bits != 0 && !t.vague() && t.bits & (MAP | NIL | RESP | ERR) == 0 {
+                let who = match arg_exprs.get(1) {
+                    Some(Expr::Lit(Lit::Str(s))) => s.to_string(),
+                    _ => "this middleware".to_string(),
+                };
+                self.error(format!(
+                    "`{}` gives {}: middleware gives back the request to let the route go on, or an answer to stop it; a check is written `(r) => ok(r) ? r : reply 403 \"...\"`",
+                    who,
+                    bits_text(t.bits)
+                ));
+            }
+        }
+        // `db.exec("begin")`, refused as it runs (FEEDBACK44.md, Q-580; branch feedback40-43).
+        if sig.builtin && matches!(name, "db.query" | "db.one" | "db.exec") {
+            if let Some(Expr::Lit(Lit::Str(s))) = arg_exprs.first() {
+                if crate::db::tx_control(s) {
+                    self.error(format!("`{}(\"{}\")`: write `db.transaction(() => ...)`, which commits, rolls back when something fails, and keeps other requests out of it", name, s.trim()));
+                }
+            }
         }
         if sig.builtin && matches!(name, "db.query" | "db.one" | "db.exec" | "db.exec_many") && args.len() == arg_exprs.len() {
             if arg_exprs.first().map_or(false, |e| self.sql_built(e)) {

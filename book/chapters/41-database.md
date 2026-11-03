@@ -76,9 +76,9 @@ A query that fails (a syntax error, a constraint, the server unreachable) is an 
 value with the database's message:
 
 ```quillo
-fn add(text: str) with db = db.exec("insert into todos (text) values (?)", text)?.last_id
+fn add(text: str) -> int with db = db.exec("insert into todos (text) values (?)", text)?.last_id
 
-route POST /todos { form: { text: str } } {
+route POST /todos { form: { text: str } } with db {
     let id = add(text) ?? reply 422 "Could not add that"
     redirect(`/todos/${id}`)
 }
@@ -102,7 +102,7 @@ SQL. It is a template string like any other, so it should hold no `${...}` value
 those go in as parameters.
 
 ```quillo
-fn recent(limit: int) with db = db.query(sql`
+fn recent(limit: int) -> list with db = db.query(sql`
     select id, text
     from todos
     order by id desc
@@ -120,7 +120,7 @@ sort by, say), put it in with `sql_name`, which takes only letters, digits and `
 a list of such names:
 
 ```quillo
-fn sorted(by: "text" | "id") with db = db.query(`select id, text from todos order by ${sql_name(by)}`)
+fn sorted(by: "text" | "id") -> list with db = db.query(`select id, text from todos order by ${sql_name(by)}`)
 ```
 
 SQL built only from text as written, `sql_name` and `sql_param`, and choices between
@@ -151,7 +151,7 @@ what is wrong.
 `db.transaction(f)` runs `f` and commits what it did, all or nothing:
 
 ```quillo
-fn transfer(from: int, to: int, amount: int) with db =
+fn transfer(from: int, to: int, amount: int) -> map with db =
     db.transaction(() => {
         db.exec("update accounts set balance = balance - ? where id = ?", amount, from)?
         db.exec("update accounts set balance = balance + ? where id = ?", amount, to)?
@@ -206,15 +206,15 @@ A page can follow the database. `live(load)` in a component runs a `server fn` a
 whenever a table it read changes, through Quillo, for anyone:
 
 ```quillo
-server fn load_todos() = db.query("select id, text from todos order by id")
-server fn add_todo(text: str) = db.exec("insert into todos (text) values (?)", text)
+server fn load_todos() -> list = db.query("select id, text from todos order by id")
+server fn add_todo(text: str) -> map = db.exec("insert into todos (text) values (?)", text)
 
 component Todos() {
     state todos = live(load_todos)      // every open page sees new todos
     state draft = ""
     <div>
         <ul>{for t in todos => <li key={t.id}>{t.text}</li>}</ul>
-        <form @submit={() => { add_todo(draft); draft = "" }}>
+        <form onsubmit={() => { add_todo(draft); draft = "" }}>
             <input value={draft} placeholder="Add a todo"/>
         </form>
     </div>
@@ -239,7 +239,7 @@ read the table inside `unwatched` and watch a topic of your own, which the write
 publishes:
 
 ```quillo
-server fn load_posts(thread: int) {
+server fn load_posts(thread: int) -> list {
     watch(`thread:${thread}`)
     unwatched(() => db.query("select * from posts where thread = ?", thread))
 }
@@ -357,7 +357,7 @@ without `_id` (`user` here), else `joined`.
 several:
 
 ```quillo
-fn pay(from: int, n: int) =
+fn pay(from: int, n: int) -> int =
     db.atomic([db, ledger], () => {
         db.exec("update accounts set balance = balance - ? where id = ?", n, from)?
         ledger.exec("insert into entries (account, amount) values (?, ?)", from, -n)?
@@ -405,7 +405,7 @@ tenant_from("example.com")          // acme.example.com is tenant "acme"
 db.open("data/{tenant}.db")         // a SQLite file per tenant
 db.migrate()                        // run for each tenant's database when it is made
 
-route POST /signup { form: { name: str } } {
+route POST /signup { form: { name: str } } with db {
     let made = new_tenant(name, () => db.exec("insert into settings (plan) values ('free')"))   // makes acme.db
     if is_err(made) { reply 409 "That name is taken" }
     redirect(`https://${name}.example.com/`)

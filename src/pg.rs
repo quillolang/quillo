@@ -205,6 +205,16 @@ impl Pool {
         }
     }
 
+    /// A connection not to give back (one whose session could not be reset): closed, and
+    /// its place in the pool freed.
+    pub fn discard(&self, c: Conn) {
+        drop(c);
+        let mut g = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.1 = g.1.saturating_sub(1);
+        drop(g);
+        self.freed.notify_one();
+    }
+
     pub fn give_back(&self, c: Conn) {
         if c.aside {
             return;

@@ -145,6 +145,21 @@ pub fn error_line(text: &str) {
 /// visitor sent: its line breaks and control characters are written as `\n` and `\x1b`, so it
 /// cannot add lines of its own to the log or reach a terminal (FEEDBACK31.md, Q-378; branch
 /// feedback27-35-fixes).
+/// A line of the log for what is no error of the program's but wants a look: a request no
+/// route's pattern took, and why (FEEDBACK47.md, Q-544; branch feedback40-43).
+pub fn warning_line(text: &str) {
+    let key = own_request();
+    let what = lock(&RUNNING).as_ref().and_then(|m| m.get(&key).cloned());
+    if crate::metrics::LOG.load(SeqCst) == crate::metrics::JSON {
+        eprintln!("{}", serde_json::json!({ "time": iso_now(), "level": "warning", "request": what, "warning": text }));
+        return;
+    }
+    match what {
+        Some(what) => eprintln!("quillo: warning: {}: {}", log_safe(&what), log_safe(text)),
+        None => eprintln!("quillo: warning: {}", log_safe(text)),
+    }
+}
+
 pub fn error_line_with(text: &str, calls: &[String]) {
     let key = own_request();
     let what = lock(&RUNNING).as_ref().and_then(|m| m.get(&key).cloned());
@@ -475,7 +490,8 @@ thread_local! {
 /// result. Elsewhere gives `f` back, for the caller to run.
 pub fn wait_elsewhere<T: Send, F: FnOnce() -> T + Send>(f: F) -> Result<T, F> {
     let y = YIELDER.with(|c| c.get());
-    if y == 0 {
+    // Not while a SQLite transaction is open on this thread (FEEDBACK44.md, Q-579).
+    if y == 0 || held() {
         return Err(f);
     }
     // SAFETY: set by the coroutine itself, whose stack holds the yielder.
@@ -523,6 +539,23 @@ pub fn request_number() -> usize {
     REQUEST.with(|c| c.get())
 }
 
+thread_local! {
+    /// SQLite transactions open on this thread: while one is, nothing here lets the request
+    /// pause, as another would run on SQLite's one connection, inside it (FEEDBACK44.md,
+    /// Q-579; branch feedback40-43).
+    static HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A SQLite transaction opens (`true`) or ends here.
+pub fn hold_in_place(open: bool) {
+    HELD.with(|h| h.set(if open { h.get() + 1 } else { h.get().saturating_sub(1) }));
+}
+
+/// Whether a wait must be done in place: a SQLite transaction is open.
+pub fn held() -> bool {
+    HELD.with(|h| h.get() > 0)
+}
+
 /// In a request's coroutine: runs `fut` on the async runtime while the
 /// server answers other requests, and gives back its output (`Err` if it
 /// failed unexpectedly). `None` outside a coroutine.
@@ -530,7 +563,8 @@ pub fn await_elsewhere<T: Send + 'static>(
     fut: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>,
 ) -> Option<Result<T, String>> {
     let y = YIELDER.with(|c| c.get());
-    if y == 0 {
+    // Not while a SQLite transaction is open: the caller waits in place (Q-579).
+    if y == 0 || held() {
         return None;
     }
     // SAFETY: as in `wait_elsewhere`.

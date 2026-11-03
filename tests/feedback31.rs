@@ -439,9 +439,10 @@ fn host_must_be_one_and_head_says_the_gets_length() {
     assert!(old.starts_with("HTTP/1.1 200") && old.ends_with("none"), "{}", old);
     let abs = raw(s.port, b"GET http://site.example:8080/echo HTTP/1.1\r\nHost: other\r\nConnection: close\r\n\r\n");
     assert!(abs.ends_with("site.example:8080"), "{}", abs);
-    for good in ["a.example", "a.example:8080", "[::1]:80", "127.0.0.1"] {
+    // Read as a host is named: the default port dropped (FEEDBACK47.md, Q-545).
+    for (good, read) in [("a.example", "a.example"), ("a.example:8080", "a.example:8080"), ("[::1]:80", "[::1]"), ("127.0.0.1", "127.0.0.1")] {
         let r = raw(s.port, format!("GET /echo HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", good).as_bytes());
-        assert!(r.starts_with("HTTP/1.1 200") && r.ends_with(good), "{}: {}", good, r);
+        assert!(r.starts_with("HTTP/1.1 200") && r.ends_with(read), "{}: {}", good, r);
     }
     let head = raw(s.port, b"HEAD /ten HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
     assert!(head.to_ascii_lowercase().contains("content-length: 10\r\n"), "{}", head);

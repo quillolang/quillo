@@ -189,6 +189,16 @@ impl Backend {
         }
     }
 
+    pub(crate) fn discard(&self, c: Pinned) {
+        match (self, c) {
+            (Backend::Postgres(p), Pinned::Pg(c)) => p.discard(c),
+            #[cfg(feature = "mysql")]
+            (Backend::Mysql(p), Pinned::My(c)) => p.give_back(c),
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+    }
+
     pub(crate) fn give_back(&self, c: Pinned) {
         match (self, c) {
             (Backend::Postgres(p), Pinned::Pg(c)) => p.give_back(c),
@@ -330,6 +340,107 @@ pub struct TxConn {
     backend: Arc<Backend>,
     conn: Option<Pinned>,
     depth: usize,
+    /// A statement in it changed the session (`set`, a temporary table): the connection is
+    /// reset before it goes back (FEEDBACK44.md, Q-581; branch feedback40-43).
+    session: bool,
+}
+
+/// Whether a PostgreSQL statement changes the session, which outlives the transaction and the
+/// request on a pooled connection: another visitor's next request reads it (`set app.user_id`,
+/// row-level security's usual setting, then read by `current_setting`). `set local`,
+/// `set_config(..., true)` and `pg_advisory_xact_lock` end with the transaction (Q-581).
+fn changes_session(sql: &str) -> bool {
+    statements(sql).iter().any(|s| statement_changes_session(s))
+}
+
+fn statement_changes_session(sql: &str) -> bool {
+    let words = first_words(sql);
+    let first = words.split(' ').next().unwrap_or("");
+    let l = sql.to_ascii_lowercase();
+    // `create temp`, `create local temporary`, `create or replace temp view` (found in review).
+    let head: Vec<&str> = l.split(|c: char| !c.is_ascii_alphabetic()).filter(|w| !w.is_empty()).take(6).collect();
+    match first {
+        "set" => !matches!(words.as_str(), "set local" | "set transaction" | "set constraints"),
+        "listen" => true,
+        "create" => head.iter().any(|w| *w == "temp" || *w == "temporary"),
+        "declare" => l.contains(" with hold"),
+        "select" | "with" => {
+            l.contains(" into temp")
+                || l.contains("pg_advisory_lock")
+                || l.contains("pg_try_advisory_lock")
+                || set_config_lasts(&l)
+        }
+        _ => false,
+    }
+}
+
+/// `set_config(name, value, false)`: its own third argument, read past the first two
+/// (`coalesce(null, false)` elsewhere in the statement is not it; found in review).
+fn set_config_lasts(l: &str) -> bool {
+    let mut rest = l;
+    while let Some(at) = rest.find("set_config") {
+        rest = &rest[at + "set_config".len()..];
+        let Some(open) = rest.find('(') else { break };
+        if !rest[..open].trim().is_empty() {
+            continue;
+        }
+        let (mut depth, mut args, mut cur) = (0, Vec::new(), String::new());
+        for c in rest[open + 1..].chars() {
+            match c {
+                '(' => depth += 1,
+                ')' if depth == 0 => break,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    args.push(std::mem::take(&mut cur));
+                    continue;
+                }
+                _ => {}
+            }
+            cur.push(c);
+        }
+        args.push(cur);
+        if args.get(2).map(|a| a.trim()) == Some("false") {
+            return true;
+        }
+    }
+    false
+}
+
+/// What a session changed is set back, its prepared statements kept (Quillo's own among them):
+/// whether that worked. One that did not is closed, not given back (found in review).
+fn reset_session(c: &mut Pinned) -> bool {
+    match c {
+        Pinned::Pg(_) => c
+            .batch("set session authorization default; reset all; close all; discard temp; select pg_advisory_unlock_all(); unlisten *")
+            .is_ok(),
+        #[allow(unreachable_patterns)]
+        _ => true,
+    }
+}
+
+/// A statement that changes the session, on PostgreSQL: noted in the request's transaction,
+/// whose connection is then reset, and refused outside one, where the connection is shared by
+/// every request (Q-581).
+fn session_change(it: &Interp, b: &Arc<Backend>, sql: &str) -> Result<(), String> {
+    if !matches!(&**b, Backend::Postgres(_)) {
+        return Ok(());
+    }
+    // A statement prepared by name outlives everything, and cannot be let go without Quillo's
+    // own (found in review).
+    if statements(sql).iter().any(|s| first_words(s).starts_with("prepare")) {
+        return Err("`prepare` makes a statement for the whole session: pass the values as parameters (`?`) instead, which Quillo prepares itself".to_string());
+    }
+    if !changes_session(sql) {
+        return Ok(());
+    }
+    let mut g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match g.iter_mut().find(|t| Arc::ptr_eq(&t.backend, b)) {
+        Some(t) => {
+            t.session = true;
+            Ok(())
+        }
+        None => Err("outside `db.transaction` this connection is shared by every request, so what this changes would reach others: use `set local` (or `set_config(..., true)`) inside `db.transaction`".to_string()),
+    }
 }
 
 fn db_err(e: impl std::fmt::Display) -> Value {
@@ -475,6 +586,29 @@ pub(crate) fn backend_on(it: &mut Interp, on: Option<usize>) -> Result<Arc<Backe
 }
 
 /// The slot a call is on, if it has been opened.
+/// After a request: a SQLite connection left in a transaction outside `db.transaction` is
+/// rolled back, and the log says so. Every later request's writes went into it, and were lost
+/// when the server stopped (FEEDBACK44.md, Q-580). No other request runs while a transaction is
+/// open (Q-579), so one still open here is this request's.
+pub fn left_open(it: &Interp, what: &str) {
+    if it.sqlite_tx > 0 || crate::httpd::held() {
+        return;
+    }
+    let mut slots: Vec<DbSlot> = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned().collect();
+    slots.extend(it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().map(|(_, s)| s.clone()));
+    for slot in slots {
+        if let DbSlot::One(b) = slot {
+            if let Backend::Sqlite(m) = &*b {
+                let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !c.is_autocommit() {
+                    let _ = c.execute_batch("rollback");
+                    crate::httpd::error_line_with(&format!("{} left a transaction open on SQLite, so it was rolled back: write `db.transaction(() => ...)`", what), &[]);
+                }
+            }
+        }
+    }
+}
+
 fn slot_on(it: &Interp, on: Option<usize>) -> Option<DbSlot> {
     match on {
         None => it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
@@ -657,6 +791,11 @@ pub(crate) fn checkout_for_tx(it: &mut Interp, b: &Arc<Backend>) -> Result<Pinne
         if let Some(c) = taken {
             return Ok(Pinned::Pg(c));
         }
+        // Inside a SQLite transaction nothing else runs, the requests that would give a
+        // connection back included: waiting would hold the whole server (found in review).
+        if crate::httpd::held() {
+            return Err(held_none_free());
+        }
         if std::time::Instant::now() >= until {
             return Err(pool.none_free());
         }
@@ -691,20 +830,34 @@ pub(crate) fn pooled_run<T: Send>(
             }
             r
         }
-        None => it.unlocked(|| {
-            let mut c = pool.checkout()?;
-            let r = f(&mut c);
-            pool.give_back(c);
-            r
-        }),
+        None => {
+            let held = crate::httpd::held();
+            it.unlocked(move || {
+                let mut c = match (held, pool) {
+                    // As above: in a SQLite transaction, one free now or none.
+                    (true, Backend::Postgres(p)) => Pinned::Pg(p.try_checkout()?.ok_or_else(held_none_free)?),
+                    _ => pool.checkout()?,
+                };
+                let r = f(&mut c);
+                pool.give_back(c);
+                r
+            })
+        }
     }
+}
+
+/// Why a PostgreSQL query in a SQLite transaction found no connection.
+fn held_none_free() -> String {
+    "no PostgreSQL connection is free, and this request is inside a SQLite transaction, which holds up every other request, those that would give one back too: take the PostgreSQL work out of the SQLite transaction, or allow more with `?pool_size=N`".to_string()
 }
 
 /// In the server, outside a transaction, queries use the connections all
 /// requests share (pipelined; see `pg::Lanes`). `None`: use `pg_run`.
 fn shared_lanes(it: &Interp, b: &Arc<Backend>, pool: &pg::Pool) -> Option<Arc<pg::Lanes>> {
     let pinned = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|t| Arc::ptr_eq(&t.backend, b));
-    (!pinned && crate::httpd::in_task()).then(|| pool.lanes())
+    // Inside a SQLite transaction the lanes would pause the request, and others would run
+    // inside it: the pool waits in place instead (FEEDBACK44.md, Q-579; branch feedback40-43).
+    (!pinned && crate::httpd::in_task() && !crate::httpd::held() && it.sqlite_tx == 0).then(|| pool.lanes())
 }
 
 fn awaited<T>(r: Option<Result<Result<T, String>, String>>) -> Result<T, String> {
@@ -904,6 +1057,109 @@ fn tx_end(it: &mut Interp, mark: usize, committed: bool) {
         let raw = std::mem::take(&mut it.pending_raw);
         it.note_published(raw);
     }
+}
+
+/// The statement's first two words, past spaces and comments, as they are written ("" for
+/// none): read in place, as every `db.exec` reads them, and a string made each time put 100k
+/// inserts behind Python's.
+fn two_words(sql: &str) -> (&str, &str) {
+    let mut s = sql;
+    loop {
+        s = s.trim_start();
+        if let Some(r) = s.strip_prefix("--") {
+            s = r.split_once('\n').map_or("", |(_, r)| r);
+        } else if let Some(r) = s.strip_prefix("/*") {
+            s = r.split_once("*/").map_or("", |(_, r)| r);
+        } else {
+            break;
+        }
+    }
+    let mut w = s.split(|c: char| !c.is_ascii_alphabetic()).filter(|w| !w.is_empty());
+    (w.next().unwrap_or(""), w.next().unwrap_or(""))
+}
+
+/// The statement's first word or two, past spaces and comments, in lower case.
+fn first_words(sql: &str) -> String {
+    match two_words(sql) {
+        (a, "") => a.to_ascii_lowercase(),
+        (a, b) => format!("{} {}", a, b).to_ascii_lowercase(),
+    }
+}
+
+/// The statements of a script, split at `;` outside quotes and comments, each with text.
+fn statements(sql: &str) -> Vec<&str> {
+    let b = sql.as_bytes();
+    let (mut out, mut start, mut i) = (Vec::new(), 0, 0);
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"') => {
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += 1;
+                }
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b';' => {
+                out.push(&sql[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&sql[start.min(sql.len())..]);
+    out.into_iter().filter(|s| !two_words(s).0.is_empty()).collect()
+}
+
+/// Whether a statement begins or ends a transaction: `begin`, `commit`, `savepoint`...
+fn controls_tx(statement: &str) -> bool {
+    let (first, second) = two_words(statement);
+    ["begin", "commit", "end", "rollback", "savepoint", "release", "abort"].iter().any(|w| first.eq_ignore_ascii_case(w))
+        || (first.eq_ignore_ascii_case("start") && second.eq_ignore_ascii_case("transaction"))
+}
+
+/// A transaction begun or ended by hand: one such statement alone, or, on a server's shared
+/// connection (`server`), one anywhere in a script, as `begin; insert ...` left the lane in it
+/// (found in review). SQLite checks a script's end itself (see `exec`).
+pub fn tx_control_in(sql: &str, server: bool) -> bool {
+    let all = statements(sql);
+    if server {
+        all.iter().any(|s| controls_tx(s))
+    } else {
+        all.len() == 1 && controls_tx(all[0])
+    }
+}
+
+/// One statement that begins or ends a transaction, alone.
+pub fn tx_control(sql: &str) -> bool {
+    tx_control_in(sql, false)
+}
+
+/// A transaction begun or ended by hand, one statement alone: a `begin` whose `commit` was
+/// never reached left the shared connection in it, and every later request's writes with it
+/// (FEEDBACK44.md, Q-580; branch feedback40-43). A script of several statements may hold one
+/// of its own, and is checked for leaving it open where it runs.
+fn no_tx_control(sql: &str, f: &str, line: u32) -> Result<(), Ctrl> {
+    // A query has no use for one anywhere.
+    if tx_control_in(sql, f != "db.exec") {
+        return fail(line, format!(
+            "`{}(\"{}\")`: write `db.transaction(() => ...)`, which commits, rolls back when something fails, and keeps other requests out of it",
+            f,
+            sql.trim()
+        ));
+    }
+    Ok(())
 }
 
 fn sql_arg(args: &[Value], name: &str, line: u32) -> Result<String, Ctrl> {
@@ -1259,12 +1515,21 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let on = it.db_on.take();
     let sql = sql_arg(&args, "db.exec", line)?;
+    no_tx_control(&sql, "db.exec", line)?;
     it.wrote_req = Some(crate::httpd::request_number());
     let params = args[1..].to_vec();
     let b = match backend_on(it, on) {
         Ok(b) => b,
         Err(e) => return Ok(db_err(e)),
     };
+    // A change to the session, noted or refused (FEEDBACK44.md, Q-581).
+    if let Err(e) = session_change(it, &b, &sql) {
+        return Ok(db_err(e));
+    }
+    // On a server's shared connection, a script's `begin` anywhere (found in review).
+    if !matches!(&*b, Backend::Sqlite(_)) && tx_control_in(&sql, true) {
+        return fail(line, "`db.exec`: this SQL begins or ends a transaction, which on a shared connection would hold every later request in it: write `db.transaction(() => ...)`, which commits, rolls back when something fails, and keeps other requests out of it");
+    }
     // Timed for /_quillo/health/queries (branch query-stats).
     let started = std::time::Instant::now();
     let res = match &*b {
@@ -1272,7 +1537,15 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             (|| {
                 if params.is_empty() {
+                    let before = c.is_autocommit();
                     c.execute_batch(&sql).map_err(|e| e.to_string())?;
+                    // A script run whole (`sqlite3 .dump`'s `BEGIN TRANSACTION; ... COMMIT;`) may
+                    // hold its own transaction, but must end it: one left open took every
+                    // later request's writes into it (FEEDBACK44.md, Q-580).
+                    if before && !c.is_autocommit() {
+                        let _ = c.execute_batch("rollback");
+                        return Err("this SQL left a transaction open, so it was rolled back: write `db.transaction(() => ...)`, which commits, rolls back when something fails, and keeps other requests out of it".to_string());
+                    }
                 } else {
                     let mut stmt = c.prepare_cached(&sql).map_err(|e| e.to_string())?;
                     bind(&mut stmt, &params)?;
@@ -1900,6 +2173,7 @@ fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, l
             }
         }
     }
+    session_change(it, &b, &sql)?;
     if !only_reads(&sql) {
         it.wrote_req = Some(crate::httpd::request_number());
     }
@@ -1929,6 +2203,7 @@ fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, l
 fn query(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let on = it.db_on.take();
     let sql = sql_arg(&args, "db.query", line)?;
+    no_tx_control(&sql, "db.query", line)?;
     Ok(select(it, on, sql, args[1..].to_vec(), None).map(Value::list).unwrap_or_else(db_err))
 }
 
@@ -1936,6 +2211,7 @@ fn query(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn one(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let on = it.db_on.take();
     let sql = sql_arg(&args, "db.one", line)?;
+    no_tx_control(&sql, "db.one", line)?;
     Ok(select(it, on, sql, args[1..].to_vec(), Some(1))
         .map(|r| r.into_iter().next().unwrap_or(Value::Nil))
         .unwrap_or_else(db_err))
@@ -2004,7 +2280,9 @@ pub(crate) fn attempt(
             }
             let mark = tx_begin(it);
             it.sqlite_tx += 1;
+            crate::httpd::hold_in_place(true);
             let r = caught(it, body);
+            crate::httpd::hold_in_place(false);
             it.sqlite_tx -= 1;
             let commit = ok(&r);
             let end = match (commit, immediate) {
@@ -2042,7 +2320,7 @@ pub(crate) fn attempt(
                     Err(e) => return (Ok(db_err(e)), false),
                 };
                 c.watch_conflicts(true);
-                it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(TxConn { backend: b.clone(), conn: Some(c), depth: 0 });
+                it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(TxConn { backend: b.clone(), conn: Some(c), depth: 0, session: false });
             }
             let depth = {
                 let mut g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2085,9 +2363,13 @@ pub(crate) fn attempt(
                     None
                 }
             };
-            if let Some(TxConn { conn: Some(mut c), .. }) = done {
+            if let Some(TxConn { conn: Some(mut c), session, .. }) = done {
                 c.watch_conflicts(false);
-                pool.give_back(c);
+                if session && !reset_session(&mut c) {
+                    pool.discard(c);
+                } else {
+                    pool.give_back(c);
+                }
             }
             match ended {
                 Err(e) if commit => (Ok(db_err(e)), lost),
@@ -2373,7 +2655,7 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             _ => {
                 match checkout_for_tx(it, &p.b) {
                     Ok(c) => {
-                        it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(TxConn { backend: p.b.clone(), conn: Some(c), depth: 1 });
+                        it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(TxConn { backend: p.b.clone(), conn: Some(c), depth: 1, session: false });
                         let begin = if p.kind == Kind::Pg { "begin".to_string() } else { format!("xa start '{}'", p.gid) };
                         pooled_run(it, &p.b, move |c| c.batch(&begin))
                     }
@@ -2392,6 +2674,7 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let sqlite = parts.iter().enumerate().any(|(k, p)| p.kind == Kind::Sqlite && begun.contains(&k));
     if sqlite {
         it.sqlite_tx += 1;
+        crate::httpd::hold_in_place(true);
     }
     let mark = tx_begin(it);
     it.wrote_req = Some(crate::httpd::request_number());
@@ -2405,6 +2688,7 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         abort_parts(it, &mut parts, &begun);
     }
     if sqlite {
+        crate::httpd::hold_in_place(false);
         it.sqlite_tx -= 1;
     }
     // The connections go back.
@@ -2413,8 +2697,12 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             let mut g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             g.iter().position(|t| Arc::ptr_eq(&t.backend, &p.b)).map(|i| g.remove(i))
         };
-        if let Some(TxConn { conn: Some(c), .. }) = taken {
-            p.b.give_back(c);
+        if let Some(TxConn { conn: Some(mut c), session, .. }) = taken {
+            if session && !reset_session(&mut c) {
+                p.b.discard(c);
+            } else {
+                p.b.give_back(c);
+            }
         }
     }
     tx_end(it, mark, outcome.is_ok());
@@ -2572,7 +2860,42 @@ pub fn recover(it: &mut Interp) {
 
 #[cfg(test)]
 mod tests {
-    use super::{kind_of, values_tuple};
+    use super::{first_words, kind_of, statements, tx_control_in, two_words, values_tuple};
+
+    // The first words read in place, as every `db.exec` reads them: any case, past comments
+    // and spaces, and a transaction's control found among a script's statements.
+    #[test]
+    fn the_first_words_are_read_in_place() {
+        assert_eq!(two_words("  -- a note\n /* and */ Start   Transaction;"), ("Start", "Transaction"));
+        assert_eq!(two_words("begin"), ("begin", ""));
+        assert_eq!(two_words(""), ("", ""));
+        assert_eq!(two_words("-- only a note"), ("", ""));
+        assert_eq!(two_words("/* never closed"), ("", ""));
+        assert_eq!(two_words("insert(1)"), ("insert", ""));
+        assert_eq!(first_words("SET Local x = 1"), "set local");
+        assert_eq!(first_words("Listen"), "listen");
+        assert_eq!(first_words(" ; "), "");
+        for (sql, alone, server) in [
+            ("BEGIN", true, true),
+            ("  commit ;", true, true),
+            ("Start Transaction", true, true),
+            ("start", false, false),
+            ("starting", false, false),
+            ("beginning()", false, false),
+            ("ROLLBACK to savepoint a", true, true),
+            ("select 'begin'", false, false),
+            ("-- begin\nselect 1", false, false),
+            ("begin; insert into t values (1)", false, true),
+            ("insert into t values (1); COMMIT", false, true),
+            ("insert into t values (';begin')", false, false),
+            ("", false, false),
+            (";;", false, false),
+        ] {
+            assert_eq!(tx_control_in(sql, false), alone, "{}", sql);
+            assert_eq!(tx_control_in(sql, true), server, "{}", sql);
+        }
+        assert_eq!(statements("a; ; -- x\n; b").len(), 2);
+    }
 
     // An insert of one row's `?`s, with nothing after them, goes as many rows a statement;
     // anything else a row at a time (branch feedback40-43).

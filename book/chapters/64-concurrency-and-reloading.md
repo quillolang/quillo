@@ -186,7 +186,7 @@ A job is a function of the program, so it takes `with` as any function does, and
 may do is held to that each time it runs:
 
 ```quillo
-fn nightly_report() with db, time {
+fn nightly_report() -> map with db, time {
     db.exec("insert into reports (day, total) select date(?), sum(total) from orders", now())
 }
 schedule("0 3 * * *", nightly_report)
@@ -200,7 +200,7 @@ db.open("app.db")
 db.exec("create table if not exists orders (id integer primary key, total int, at bigint)")
 db.exec("create table if not exists reports (day text primary key, orders int, total int)")
 
-fn nightly_report() {
+fn nightly_report() -> map {
     let day = str(date.today())
     let r = db.one("select count(*) as n, coalesce(sum(total), 0) as total from orders where at > ?", now() - 86_400_000)
     db.exec("insert into reports (day, orders, total) values (?, ?, ?) on conflict (day) do update set orders = excluded.orders, total = excluded.total", day, r.n, r.total)
@@ -208,8 +208,8 @@ fn nightly_report() {
 
 schedule("0 3 * * *", nightly_report)
 
-route POST /orders { form: { total: int } } = db.exec("insert into orders (total, at) values (?, ?)", total, now())
-route GET /reports = <ul>{for r in db.query("select * from reports order by day desc") => <li>{r.day}: {r.orders} orders, {r.total}</li>}</ul>
+route POST /orders { form: { total: int } } with db, time = db.exec("insert into orders (total, at) values (?, ?)", total, now())
+route GET /reports with db = <ul>{for r in db.query("select * from reports order by day desc") => <li>{r.day}: {r.orders} orders, {r.total}</li>}</ul>
 ```
 
 Each run is a line in the log, `POST /_quillo/job/nightly_report?at=1793631366 -> 200
@@ -254,7 +254,7 @@ fn step() {
     let dx = ball.x + ball.dx > 300 || ball.x + ball.dx < 0 ? -ball.dx : ball.dx
     ball = { x: ball.x + dx, dx }
 }
-fn snapshot() = { x: ball.x }
+fn snapshot() -> map = { x: ball.x }
 
 fn tick() { step(); channel.broadcast("room", snapshot()) }
 every(50, tick)                                 // 20 times a second, on the clock

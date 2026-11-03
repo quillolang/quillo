@@ -8,7 +8,7 @@ component Counter(start: int = 0) {
     let double = count * 2               // recomputed on every render
     <div>
         <span>{count} (x2 = {double})</span>
-        <button @click={() => { count += 1 }}>+</button>
+        <button onclick={() => { count += 1 }}>+</button>
     </div>
 }
 
@@ -54,7 +54,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   component Total(price: int) {
       ~qty = 1                                  // the same as `state qty = 1`
       let total = price * qty                   // worked out again when qty changes
-      <p>{qty} x {price} = {total} <button @click={() => { qty += 1 }}>+</button></p>
+      <p>{qty} x {price} = {total} <button onclick={() => { qty += 1 }}>+</button></p>
   }
   ```
 
@@ -75,7 +75,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
       state items = [{ id: 1, text: "milk" }, { id: 2, text: "bread" }]
       <div>
           <ul>{for it in items => <li key={it.id}><input/> {it.text}</li>}</ul>
-          <button @click={() => { items = reverse(items) }}>Reverse</button>
+          <button onclick={() => { items = reverse(items) }}>Reverse</button>
       </div>
   }
   ```
@@ -84,7 +84,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   typed moves with "milk", as its row was moved, not written again.
 - `@event={fn}` handles DOM events (`@click`, `@input`, `@scroll`, `@submit`, ...), on
   HTML elements only (on a view or component tag it is an error). `onclick={fn}` is the same
-  handler, written as HTML and JSX write it; on a view or component, `on_change={...}` or
+  handler, written as HTML and JSX write it, and the form this guide's examples use
+  (`onsubmit`, `oninput`, `onmount`, ...); on a view or component, `on_change={...}` or
   `onChange={...}` is a parameter like any other. There are no
   modifiers: `@click.prevent` is taken as an event named `click.prevent`, which never
   fires; call `e.preventDefault()`. Event names are not checked, so a misspelt one
@@ -108,8 +109,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   ```quillo
   component Search() {
       state sent = ""
-      <form @submit={(e) => { sent = e.form.q }}>
-          <input name="q" @keydown={(e) => { if e.key == "Escape" { e.value = "" } }}/>
+      <form onsubmit={(e) => { sent = e.form.q }}>
+          <input name="q" onkeydown={(e) => { if e.key == "Escape" { e.value = "" } }}/>
           <button>Go</button>
           <p>{sent}</p>
       </form>
@@ -195,7 +196,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   ```quillo
   component Pin() {
       state pin = ""
-      <input value={pin} @input={(e) => { if len(e.value) <= 4 { pin = e.value } }}/>
+      <input value={pin} oninput={(e) => { if len(e.value) <= 4 { pin = e.value } }}/>
   }
   ```
 
@@ -225,8 +226,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   component Modal() {
       state open = true
       state backdrop = null
-      <div class="backdrop" @mount={(el) => { backdrop = el }}
-           @click={(e) => { if e.target == backdrop { open = false } }}>
+      <div class="backdrop" onmount={(el) => { backdrop = el }}
+           onclick={(e) => { if e.target == backdrop { open = false } }}>
           {open && <div class="box">Click outside to close</div>}
       </div>
   }
@@ -246,7 +247,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   component Pair() {
       state a = 0
       state b = 0
-      <p @click={() => { a += 1; b = a * 10 }}>{a} and {b}</p>
+      <p onclick={() => { a += 1; b = a * 10 }}>{a} and {b}</p>
   }
   ```
 
@@ -265,7 +266,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
       state running = false
       state tenths = 0
       if running { every(100, () => { tenths += 1 }) }
-      <p>{tenths / 10} s <button @click={() => { running = !running }}>{running ? "Stop" : "Start"}</button></p>
+      <p>{tenths / 10} s <button onclick={() => { running = !running }}>{running ? "Stop" : "Start"}</button></p>
   }
   ```
 
@@ -284,7 +285,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   component Save() {
       state saved = false
       <p>
-          <button @click={() => { saved = true; run_after(2000, () => { saved = false }) }}>Save</button>
+          <button onclick={() => { saved = true; run_after(2000, () => { saved = false }) }}>Save</button>
           {saved && <span>Saved</span>}
       </p>
   }
@@ -293,7 +294,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
       state names = ["Ana"]
       <div>
           {for n in names => <input class="name" value={n}/>}
-          <button @click={() => {
+          <button onclick={() => {
               names = names + [""]
               page_updated()                    // the new input is in the page now
               js("document.querySelector", ".name:last-of-type").focus()
@@ -326,7 +327,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   main.qwe:2: error: `db.query` is not available in the browser, where <Orders> also runs; use a `server fn`
   ```
 
-  Ask the server for them instead: `server fn orders() with db = db.query("select * from
+  Ask the server for them instead: `server fn orders() -> list with db = db.query("select * from
   orders")`, then `state rows = orders()`.
 - What the browser has of the standard library: text, lists, maps, numbers, errors,
   `raw`, `escape`, `url_encode`, `now`, `random`, `random_int`, `uuid`, `format_number`,
@@ -356,7 +357,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   ```quillo
   component Theme() {
       state dark = false
-      <button @click={() => {
+      <button onclick={() => {
           dark = !dark
           js("localStorage.setItem", "theme", dark ? "dark" : "light")
       }}>{dark ? "Dark" : "Light"}</button>
@@ -459,7 +460,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   ```quillo
   component Broken() {
       state n = 0
-      <button @click={() => { js("JSON.parse", "{"); n += 1 }}>{n}</button>
+      <button onclick={() => { js("JSON.parse", "{"); n += 1 }}>{n}</button>
   }
 
   route GET / = <html>
@@ -485,7 +486,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   ```quillo
   component Remove(id: int) {
       state gone = false
-      <button @click={() => {
+      <button onclick={() => {
           if ask("Delete this order?", { title: "Delete", ok: "Delete", tone: "danger" }) {
               gone = true
               notify("Deleted", { tone: "success" })
@@ -564,13 +565,13 @@ view Card(title: str, children) = <section.card><h2>{title}</h2>{children}</sect
 
 component Counter(label: str, start: int = 0, on_change = null) {
     state n = start
-    <p>{label}: {n} <button @click={() => { n += 1; on_change && on_change(n) }}>+</button></p>
+    <p>{label}: {n} <button onclick={() => { n += 1; on_change && on_change(n) }}>+</button></p>
 }
 
 component Panel(header, children) {          // `header` is a named slot: any HTML
     state open = true
     <div>
-        <div @click={() => { open = !open }}>{header}</div>
+        <div onclick={() => { open = !open }}>{header}</div>
         {open && children}
     </div>
 }
@@ -602,7 +603,7 @@ component Dashboard() {
   parameter, so `id`, `data-*` or a class meant for its root element is passed as a
   parameter it declares (`<Button id="x">` is an error unless `Button` has `id`).
 - A component may show itself (a tree of comments), as long as it stops somewhere.
-- There are no portals and no refs: `@mount={(el) => { box = el }}` with `state box =
+- There are no portals and no refs: `onmount={(el) => { box = el }}` with `state box =
   null` keeps an element, and `js("document.body.appendChild", el)` moves one.
 - What reads a prop follows it, as what reads state does: a place in the markup that
   shows it (`{label}`, `class={...}`), a `let` (`let doubled = count * 2`), a statement
@@ -644,15 +645,15 @@ client "https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser
 
 component Sales(points: list) {
     state chart = null
-    <canvas @mount={(el) => {
+    <canvas onmount={(el) => {
         chart = Chart.new(el, { type: "line", data: points })    // new Chart(el, ...)
         () => chart.destroy()                   // when the canvas leaves the page
     }}></canvas>
-    <button @click={() => confetti({ particleCount: 120 })}>Celebrate</button>
+    <button onclick={() => confetti({ particleCount: 120 })}>Celebrate</button>
 }
 
 component Where() {
-    <div class="map" @mount={(el) => { L.map(el).setView([14.6, 121.0], 12) }}></div>
+    <div class="map" onmount={(el) => { L.map(el).setView([14.6, 121.0], 12) }}></div>
 }
 
 route GET / = <html><body><Sales points={load_points()}/></body></html>
@@ -726,7 +727,7 @@ client module "https://esm.sh/three@0.170.0" use * as THREE
 client /assets/helper.mjs use helper
 
 component Scene() {
-    <canvas @mount={(el) => {
+    <canvas onmount={(el) => {
         let scene = THREE.Scene.new()
         scene.name = dayjs().format("YYYY")
     }}></canvas>
@@ -757,7 +758,7 @@ they define by name:
 ```quillo
 component Sales(points: list) {
     state chart = null
-    <canvas @mount={(el) => { chart = js_new("Chart", el, { type: "line", data: points }) }}></canvas>
+    <canvas onmount={(el) => { chart = js_new("Chart", el, { type: "line", data: points }) }}></canvas>
 }
 
 route GET / = <html><head><script src="/assets/chart.js"></script></head>
@@ -799,7 +800,7 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
 - A Promise a page's function gives (`navigator.mediaDevices.getUserMedia`, `fetch`) is
   waited for where code can wait, as a `server fn` call is: in an event handler, in
   `@mount`, in a `state` initializer, and in the component's `let` functions that its
-  markup does not call (`let locate = () => { ... }`, then `@click={locate}`): `let cam =
+  markup does not call (`let locate = () => { ... }`, then `onclick={locate}`): `let cam =
   js("navigator.mediaDevices.getUserMedia", { video: true })` is the stream, or an
   error value if it was refused. The same holds for a method of what the page gave
   (`img.decode()`, `audio.play()`) and for a function given as a prop, so there is one
@@ -878,8 +879,8 @@ And the pages it shows, with the `server fn`s that give them their data:
 ```quillo
 let products = [{ id: 1, name: "Kettle", price: 30 }, { id: 2, name: "Teapot", price: 25 }]
 
-server fn list_products() = products | map((p) => { id: p.id, name: p.name })
-server fn load_product(id: int) = products | find((p) => p.id == id)
+server fn list_products() -> list = products | map((p) => { id: p.id, name: p.name })
+server fn load_product(id: int) -> map? = products | find((p) => p.id == id)
 
 view Home() = <h1>Welcome</h1>
 view NotFound(path: str) = <h1>No page at {path}</h1>
@@ -897,7 +898,7 @@ component ProductPage(id: int, on_add) {
         ? <p>Loading…</p>
         : <div>
               <h1>{product.name}</h1>
-              <button @click={() => on_add(product)}>Add to cart, {product.price}</button>
+              <button onclick={() => on_add(product)}>Add to cart, {product.price}</button>
           </div>}
 }
 ```
@@ -925,16 +926,16 @@ anyone, not only when this page acts.
 db.open("notes.db")
 db.exec("create table if not exists notes (id integer primary key, text text not null)")
 
-server fn load_notes() = db.query("select id, text from notes order by id")
+server fn load_notes() -> list = db.query("select id, text from notes order by id")
 
-server fn add_note(text: str) = db.exec("insert into notes (text) values (?)", text)
+server fn add_note(text: str) -> map = db.exec("insert into notes (text) values (?)", text)
 
 component Notes() {
     state notes = live(load_notes)  // every open page sees new notes
     state draft = ""
     <div>
         <ul>{for n in notes => <li key={n.id}>{n.text}</li>}</ul>
-        <form @submit={() => { add_note(draft); draft = "" }}>
+        <form onsubmit={() => { add_note(draft); draft = "" }}>
             <input value={draft} placeholder="A note"/>
             <button>Add</button>
         </form>
@@ -1003,7 +1004,7 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
   code that writes publishes:
 
   ```quillo
-  server fn load_posts(thread: int) {
+  server fn load_posts(thread: int) -> list {
       watch(`thread:${thread}`)
       unwatched(() => db.query("select * from posts where thread = ?", thread))
   }
@@ -1018,7 +1019,7 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
       state draft = ""
       <section>
           {for p in posts => <p key={p.id}>{p.text}</p>}
-          <form @submit={() => { reply_to(id, draft); draft = "" }}>
+          <form onsubmit={() => { reply_to(id, draft); draft = "" }}>
               <textarea value={draft}></textarea>
               <button>Reply</button>
           </form>
@@ -1166,7 +1167,7 @@ component Notes(initial: list) {
     state notes = initial
     state draft = ""
     state problem = null
-    <form @submit={() => {
+    <form onsubmit={() => {
         let r = add_note(draft)                    // a request to the server
         if is_err(r) { problem = r.error } else { notes = r; draft = ""; problem = null }
     }}>
@@ -1177,7 +1178,7 @@ component Notes(initial: list) {
     </form>
 }
 
-route GET / = <html><body><Notes initial={db.query("select * from notes")}/></body></html>
+route GET / with db = <html><body><Notes initial={db.query("select * from notes")}/></body></html>
 ```
 
 The route gives the component the notes there are; pressing Add with the box empty shows
@@ -1309,7 +1310,7 @@ Components and server code share a file, but not what they can touch:
       <div class="map" data-token={token}>Map, token {token}</div>
   }
 
-  server fn charge() = env("STRIPE_KEY") != null         // a secret stays on the server
+  server fn charge() -> bool = env("STRIPE_KEY") != null         // a secret stays on the server
   ```
 
   The page and its bundle hold `pk.test123`, and nothing of `sk_live_xyz`. Reading
@@ -1339,7 +1340,7 @@ Components and server code share a file, but not what they can touch:
 
   component Upload() {
       state done = false
-      <input type="file" @change={(e) => {
+      <input type="file" onchange={(e) => {
           let f = e.target.files[0]
           done = http.put(upload_url(f.name), f).ok      // the file, as it is, to the bucket
       }}/>
@@ -1358,7 +1359,7 @@ Components and server code share a file, but not what they can touch:
   and gives its parameters types (one without a type takes any JSON):
 
   ```quillo
-  server fn delete_note(id: int) {
+  server fn delete_note(id: int) -> map {
       let me = session().user ?? reply 401 "Log in first"
       db.exec("delete from notes where id = ? and owner = ?", id, me)
   }

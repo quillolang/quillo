@@ -32,7 +32,7 @@ route GET /whoami {
   only way in, read it yourself:
 
 ```quillo
-fn visitor(req: map) = trim(first(split(req.headers["x-forwarded-for"] ?? req.ip, ",")))
+fn visitor(req: map) -> str = trim(first(split(req.headers["x-forwarded-for"] ?? req.ip, ",")))
 
 route GET /ip = visitor(request)
 ```
@@ -226,7 +226,7 @@ them. For "remember me", store a random token in the database and put only the t
 the cookie:
 
 ```quillo
-route POST /remember {
+route POST /remember with db, random, time {
     let id = session().user ?? reply 401 "Log in first"
     let token = crypto.token()
     db.exec("insert into remember (token, user_id, expires) values (?, ?, ?)", token, id, now() + 90 * 24 * 60 * 60 * 1000)
@@ -248,7 +248,7 @@ HMAC-SHA256. The browser holds it and sends it back; it can read it, so keep sec
 out, but it cannot change it, since the signature would no longer match.
 
 ```quillo
-route POST /login { form: { email: str, password: str } } {
+route POST /login { form: { email: str, password: str } } with db, random {
     let user = db.one("select * from users where email = ?", email)
     let hash = user.password_hash ?? crypto.hash_password("not anyone's")   // same work, user or not
     if user == null || !crypto.verify_password(password, hash) { reply 401 "Wrong email or password" }
@@ -256,7 +256,7 @@ route POST /login { form: { email: str, password: str } } {
     redirect("/")
 }
 
-route GET /me {
+route GET /me with db {
     let id = session().user ?? reply 401 "Log in first"
     db.one("select id, name from users where id = ?", id)
 }
@@ -279,19 +279,19 @@ route POST /logout { end_session(); redirect("/") }
 with a status and a `redirect` ends the request from inside it:
 
 ```quillo
-fn me() = session().user == null ? null : db.one("select id, name from users where id = ?", session().user)
+fn me() -> map? = session().user == null ? null : db.one("select id, name from users where id = ?", session().user)
 
 fn me_or_login(back: str) = me() ?? reply 303 redirect(`/login?next=${url_encode(back)}`)
 
-route GET /account = <AccountPage me={me_or_login("/account")}/>
-route GET /orders = <OrdersPage me={me_or_login("/orders")}/>
+route GET /account with db = <AccountPage me={me_or_login("/account")}/>
+route GET /orders with db = <OrdersPage me={me_or_login("/orders")}/>
 ```
 
 For a `server fn`, which a component calls from the browser, answer with an error value
 the page can show instead of a redirect:
 
 ```quillo
-server fn save_note(text: str) {
+server fn save_note(text: str) -> map {
     let id = session().user ?? return err("Sign in first")
     db.exec("insert into notes (user_id, text) values (?, ?)", id, text)
 }
@@ -301,7 +301,7 @@ server fn save_note(text: str) {
 is set on the answer to the call, and the pages the visitor opens next carry it.
 
 ```quillo
-server fn sign_in(email: str, password: str) {
+server fn sign_in(email: str, password: str) -> map {
     let user = db.one("select * from users where email = ?", email)
     let hash = user.password_hash ?? crypto.hash_password("not anyone's")
     if user == null || !crypto.verify_password(password, hash) { return err("Wrong email or password") }
@@ -313,7 +313,7 @@ component LoginForm() {
     state email = ""
     state password = ""
     state problem = null
-    <form @submit={() => {
+    <form onsubmit={() => {
         let r = sign_in(email, password)
         if is_err(r) { problem = r.error } else { navigate("/") }
     }}>
@@ -349,7 +349,7 @@ laptop, a password change), keep a session id in the session and check it agains
 database:
 
 ```quillo
-route POST /login/anywhere { form: { email: str, password: str } } {
+route POST /login/anywhere { form: { email: str, password: str } } with db, random, time {
     let user = check_password(email, password) ?? reply 401 "Wrong email or password"
     let sid = crypto.token()
     db.exec("insert into sessions (id, user_id, created) values (?, ?, ?)", sid, user.id, now())
@@ -357,13 +357,13 @@ route POST /login/anywhere { form: { email: str, password: str } } {
     redirect("/")
 }
 
-fn me_checked() {
+fn me_checked() -> map? {
     let s = session()
     if s.sid == null { return null }
     db.one("select u.id, u.name from sessions s join users u on u.id = s.user_id where s.id = ?", s.sid)
 }
 
-route POST /logout/everywhere {
+route POST /logout/everywhere with db {
     let id = session().user ?? reply 401 "Log in first"
     db.exec("delete from sessions where user_id = ?", id)
     end_session()
@@ -399,9 +399,9 @@ let api = {
 }
 
 // Only a path on this site: "//evil.example" starts with "/" too, and is another site.
-fn local(next: str) = starts_with(next, "/") && !starts_with(next, "//") && !contains(next, "\\") ? next : "/"
+fn local(next: str) -> str = starts_with(next, "/") && !starts_with(next, "//") && !contains(next, "\\") ? next : "/"
 
-fn me() = session().user == null ? null : db.one("select id, name from users where id = ?", session().user)
+fn me() -> map? = session().user == null ? null : db.one("select id, name from users where id = ?", session().user)
 fn me_or_login(back: str) = me() ?? reply 303 redirect(`/login?next=${url_encode(back)}`)
 
 fn touch() {
@@ -413,7 +413,7 @@ fn touch() {
 view Page(theme: str, children) =
     <html><body class={`theme-${theme}`}>{children}</body></html>
 
-route GET / {
+route GET / with db, time {
     touch()
     <Page theme={cookie("theme") ?? "light"}>
         {me() != null ? <p>Hello, {me().name}. <a href="/account">Account</a></p> : <a href="/login">Sign in</a>}
@@ -434,7 +434,7 @@ route GET /login ? { next: str = "/" } =
         </form>
     </Page>
 
-route POST /login { form: { email: str, password: str, next: str = "/" } } {
+route POST /login { form: { email: str, password: str, next: str = "/" } } with db, random, time {
     let user = db.one("select * from users where email = ?", email)
     let hash = user.password_hash ?? crypto.hash_password("not anyone's")
     if user == null || !crypto.verify_password(password, hash) { reply 401 "Wrong email or password" }
@@ -442,7 +442,7 @@ route POST /login { form: { email: str, password: str, next: str = "/" } } {
     redirect(local(next))
 }
 
-route GET /account = <Page theme={cookie("theme") ?? "light"}><p>Account of {me_or_login("/account").name}</p></Page>
+route GET /account with db = <Page theme={cookie("theme") ?? "light"}><p>Account of {me_or_login("/account").name}</p></Page>
 
 route POST /theme { form: { theme: str } } { set_cookie("theme", theme, { max_age: "1y" }); redirect("/") }
 
