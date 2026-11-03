@@ -40,9 +40,9 @@
   (Q-564 to Q-567).
 - **Text in a `<pre>`, `<textarea>` and `<listing>` keeps its lines and spaces**, where it
   was joined into one line, and a `//` line in it is text, not a comment (Q-572).
-- **A `db.open` that fails as the program starts stops it**, where it ran on SQLite in
-  memory and lost what it took at the next start. Open `":memory:"` for that on purpose
-  (FEEDBACK49.md, Q-602).
+- **A `db.open` that fails as the program starts stops it when nothing takes its error**
+  (alone on a line), where it ran on SQLite in memory and lost what it took at the next
+  start. `let r = db.open(...)` takes it, to go on (FEEDBACK49.md, Q-602).
 - **A service call answered 502 or 504 goes to another copy only if its function uses
   `idempotent`**; any other call gives the error, as the copy behind a proxy may have run
   it (Q-595). **An unsigned 200 from a service is refused under the shared secret** too: a

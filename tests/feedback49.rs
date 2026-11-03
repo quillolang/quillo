@@ -57,6 +57,7 @@ fn a_database_that_cannot_be_opened_stops_the_program_as_it_starts() {
             ("file.qwe", b"db.open(\"junk.db\")\nroute GET /w = \"ok\"\n"),
             ("server.qwe", b"db.open(\"postgres://quillo@127.0.0.1:1/none\")\nroute GET /w = \"ok\"\n"),
             ("in_fn.qwe", b"fn setup() { db.open(\"junk.db\") }\nsetup()\nroute GET /w = \"ok\"\n"),
+            ("taken.qwe", b"let r = db.open(\"junk.db\")\nprint(is_err(r))\nlet d = db.open(\"junk.db\") ?? \"fallback\"\nroute GET /w = str(is_err(r))\n"),
             ("later.qwe", b"db.open(\"good.db\")\ndb.exec(\"create table if not exists t (i int)\")\nroute GET /o {\n    let r = db.open(\"junk.db\")\n    `${is_err(r)} ${db.one(\"select count(*) as n from t\").n}`\n}\n"),
             ("memory.qwe", b"db.open(\":memory:\")\ndb.exec(\"create table t (i int)\")\nroute GET /w = \"ok\"\n"),
         ],
@@ -67,6 +68,9 @@ fn a_database_that_cannot_be_opened_stops_the_program_as_it_starts() {
         assert!(said.contains(why) && said.contains("the program's database cannot be opened, so the program does not start"), "{}: {}", file, said);
         assert!(!said.contains("listening"), "{}: {}", file, said);
     }
+    // Taken by the program, the error is a value, and it starts.
+    let s = support::serve(&d.join("taken.qwe"), &[]);
+    assert_eq!(support::send(s.port, "GET", "/w", &[], "").body, "true");
     // In memory on purpose, it starts; a `db.open` later that fails gives the error and leaves
     // the database as it was.
     let s = support::serve(&d.join("memory.qwe"), &[]);

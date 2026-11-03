@@ -1386,15 +1386,28 @@ fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             }
             Ok(Value::Nil)
         }
-        // As the program starts, a database that cannot be opened stops it, where it ran on
-        // one in memory, answered writes 200, and lost them at the next start (FEEDBACK49.md,
-        // Q-602; branch main). Later, opening another gives the error, as before.
-        Err(e) if crate::value::loading() => fail(
-            line,
-            format!("db.open: {}: the program's database cannot be opened, so the program does not start (open \":memory:\" for one in memory on purpose)", e),
-        ),
-        Err(e) => Ok(db_err(e)),
+        // As the program starts, one whose error nothing takes stops it: see `Interp::eval_unused`
+        // (FEEDBACK49.md, Q-602).
+        Err(e) => {
+            let v = db_err(e);
+            if crate::value::loading() {
+                if let Value::Err(inner, ..) = &v {
+                    OPEN_FAILED.with(|f| f.set(Arc::as_ptr(inner) as usize));
+                }
+            }
+            Ok(v)
+        }
     }
+}
+
+thread_local! {
+    /// The error value of the last `db.open` that failed as the program loaded (Q-602).
+    static OPEN_FAILED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether `inner` is the error a `db.open` gave as the program loaded.
+pub fn open_failed(inner: &Arc<Value>) -> bool {
+    OPEN_FAILED.with(|f| f.get() == Arc::as_ptr(inner) as usize)
 }
 
 /// `db.connect(target)`: another database, as a map of the same functions

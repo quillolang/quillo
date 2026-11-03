@@ -5831,12 +5831,14 @@ if is_err(r) { reply 400 `Not imported: ${r.error}` }
 print(`${r.changes} products`)
 ```
 
-**A `db.open` that fails as the program starts stops it** *(since 0.7)*, with the reason:
-``db.open: error connecting to server: Connection refused: the program's database cannot be
-opened, so the program does not start``. It ran on SQLite in memory before, answered
-writes, and lost them at the next start; a wrong password, a server down or a damaged file
-did it. To run on memory on purpose, open `":memory:"`. Later, a `db.open` that fails
-gives an error value and leaves the database as it was.
+**A `db.open` that fails as the program starts, its error taken by nothing, stops it**
+*(since 0.7)*, with the reason: ``db.open: error connecting to server: Connection refused:
+the program's database cannot be opened, so the program does not start``. That is
+`db.open(...)` alone on a line, or given back by a function called so. It ran on SQLite in
+memory before, answered writes, and lost them at the next start; a wrong password, a server
+down or a damaged file did it. An error the program takes (`let r = db.open(...)`, `??`,
+`| is_err`) is a value, as is one from a `db.open` later, which leaves the database as it
+was.
 
 **Opening another database while it runs.** `db.open` after the start replaces the
 program's database. Open pages showing its rows are told at once, every tenant's (the

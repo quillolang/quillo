@@ -2661,7 +2661,19 @@ impl Interp {
             Expr::Block(stmts) => self.eval_block(stmts, env, false),
             e => {
                 let v = self.eval(e, env)?;
-                if let Value::Err(..) = v {
+                if let Value::Err(err, ..) = &v {
+                    // A `db.open` that failed as the program starts, its error taken by nothing
+                    // (alone on a line, or given back by a function called so): the program
+                    // stops, where it ran on a database in memory, answered writes, and lost
+                    // them at the next start (FEEDBACK49.md, Q-602; branch main). Taken (`let r
+                    // = ...`, `| is_err`, `??`), it is a value, as before.
+                    if crate::value::loading() && crate::db::open_failed(err) {
+                        let why = crate::value::told(|| err.display());
+                        return Err(Ctrl::Error(Box::new(QuilloError::new(
+                            format!("db.open: {}: the program's database cannot be opened, so the program does not start (take the error, `let r = db.open(...)`, to go on without it)", why.trim_start_matches("db: ")),
+                            crate::debug::expr_line(e),
+                        ))));
+                    }
                     self.dropped_error(&v, crate::debug::expr_line(e));
                 }
                 Ok(v)

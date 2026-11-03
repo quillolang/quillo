@@ -583,7 +583,7 @@ money.format(price, "de-DE")                    // "19,99 $"
   many digits as the number needs within them: `format_number(10, "en-US", { max: 3 })`
   is `10`, `8.875` stays `8.875`, and `{ min: 2, max: 3 }` writes `8.8` as `8.80`.
 - An amount past what `money.of` takes (minor units that do not fit an int) is an error
-  value from `money.add`, `money.sub`, `money.mul` and `money.neg` too *(since 0.7: they
+  value from `money.add`, `money.sub` and `money.mul` too *(since 0.7: they
   made it, and only `money.to_minor` refused it)*.
 - There are no exchange rates: an amount stays in its currency, and converting is the
   program's arithmetic with a rate it chose. `quillo check` takes every `money.*`
@@ -632,9 +632,10 @@ math.comb(52, 5)  math.log(8, 2)  math.fsum(xs)  math.isclose(a, b)  math.pi
   `percentile(data, p)` (p from 0 to 100, or a list of them; numpy's linear rule),
   `describe`, `histogram(data, bins = 10)` (or the edges as a list), `zscore`,
   `normalize` (to 0..1) and `rank` (ties share their average rank, a float; others are
-  ints). Data or edges holding NaN or an infinity are an error that names it and where
-  *(since 0.7: `median([3, NaN, 1])` was 3.0, and a histogram with `inf` counted nothing)*,
-  as `sort` refuses them. Statistics of no data, or of too little, is an error, as in Python, except
+  ints). What puts data in order or counts them (the medians, `quantiles`, `percentile`,
+  `describe`, `rank`, `histogram` and its edges) refuses NaN and infinities, naming which
+  and where, as `sort` does *(since 0.7: `median([3, NaN, 1])` was 3.0, and a histogram
+  with `inf` counted nothing)*; a mean or a spread has them as Python's does. Statistics of no data, or of too little, is an error, as in Python, except
   `describe([])`, which is `{ count: 0, sum: 0 }` with the rest `null`, and `zscore` and
   `normalize` of a constant list, which give zeros. `mode` and `multimode` take any
   values, text too. Python's `median_grouped` and the rest of `NormalDist` are not
@@ -877,12 +878,14 @@ if is_err(r) { reply 400 `Not imported: ${r.error}` }
 print(`${r.changes} products`)
 ```
 
-**A `db.open` that fails as the program starts stops it** *(since 0.7)*, with the reason:
-``db.open: error connecting to server: Connection refused: the program's database cannot be
-opened, so the program does not start``. It ran on SQLite in memory before, answered
-writes, and lost them at the next start; a wrong password, a server down or a damaged file
-did it. To run on memory on purpose, open `":memory:"`. Later, a `db.open` that fails
-gives an error value and leaves the database as it was.
+**A `db.open` that fails as the program starts, its error taken by nothing, stops it**
+*(since 0.7)*, with the reason: ``db.open: error connecting to server: Connection refused:
+the program's database cannot be opened, so the program does not start``. That is
+`db.open(...)` alone on a line, or given back by a function called so. It ran on SQLite in
+memory before, answered writes, and lost them at the next start; a wrong password, a server
+down or a damaged file did it. An error the program takes (`let r = db.open(...)`, `??`,
+`| is_err`) is a value, as is one from a `db.open` later, which leaves the database as it
+was.
 
 **Opening another database while it runs.** `db.open` after the start replaces the
 program's database. Open pages showing its rows are told at once, every tenant's (the
