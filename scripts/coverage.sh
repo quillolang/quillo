@@ -32,6 +32,30 @@ rm -f "$T"/*.profraw
 QUILLO_RUNTIME_COVERAGE="$OUT/records" NODE_OPTIONS="--require $ROOT/tests/browser/rtcover-node.js" \
   cargo test --release --all-features --no-fail-fast >"$OUT/tests.log" 2>&1
 tests=$?
+# A test that failed under the run's load is run again by itself, its profile kept with the
+# others. No number is written unless each then passes: lines a failed test ran are not tested
+# (FEEDBACK49.md, Q-607).
+rerun=0
+if [ "$tests" -ne 0 ]; then
+  awk '/^     Running /{bin=$NF; gsub(/[()]/, "", bin)} /^test .* \.\.\. FAILED$/{print bin, $2}' "$OUT/tests.log" >"$OUT/failed.txt"
+  tests=0
+  while read -r bin name; do
+    case "$bin" in /*) ;; *) bin="$ROOT/$bin" ;; esac
+    if QUILLO_RUNTIME_COVERAGE="$OUT/records" NODE_OPTIONS="--require $ROOT/tests/browser/rtcover-node.js" \
+      "$bin" --exact "$name" >>"$OUT/rerun.log" 2>&1; then
+      rerun=$((rerun + 1))
+      echo "passed alone: $name"
+    else
+      tests=1
+      echo "failed again, alone: $name ($bin)"
+    fi
+  done <"$OUT/failed.txt"
+  if [ "$tests" -ne 0 ]; then
+    echo "a test fails by itself too (see $OUT/rerun.log): no number is written"
+    exit 1
+  fi
+fi
+export COVERAGE_RERUN=$rerun
 cargo llvm-cov report --release >"$OUT/rust.txt" 2>/dev/null
 cargo llvm-cov report --release --json --summary-only --output-path "$OUT/rust.json" 2>/dev/null
 cargo llvm-cov report --release --lcov --output-path "$OUT/rust.lcov" 2>/dev/null
@@ -44,5 +68,5 @@ cover=$?
 node scripts/coverage-json.mjs "$OUT" || exit 1
 tail -1 "$OUT/rust.txt"
 cat "$OUT/runtime.txt"
-[ "$tests" -eq 0 ] || echo "some tests failed (see $OUT/tests.log): fix them before reading the numbers"
+[ "$rerun" -eq 0 ] || echo "$rerun tests failed under load and passed alone (see $OUT/failed.txt)"
 [ "$tests" -eq 0 ] && [ "$cover" -eq 0 ]

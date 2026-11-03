@@ -256,6 +256,14 @@
   with no handler, `bind:`, `name=`, `readonly` or `disabled` on it. The input showed the
   typed text while the program kept what it had (Q-532).
 
+### Found measuring coverage
+
+- **`quillo app --port` and `--listen` say they mean nothing there**: the window asks the
+  program directly, with no socket, so a port was taken and ignored without a word. Both now
+  stop it with a message, as `--host` does.
+- **Under `quillo fcgi`, an answer whose head is over 1 MB is a 502** that says so. It was cut
+  at 1 MB, and the rest of the head, its `content-length` and all, went out as the body.
+
 ### Developer tools and the browser (FEEDBACK42.md)
 
 - **`quillo check` warns of `sleep(0.2)`**: `sleep` takes milliseconds, and a number written

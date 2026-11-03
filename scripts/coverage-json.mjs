@@ -20,6 +20,9 @@ const git = (...a) => execFileSync("git", ["-C", root, ...a], { encoding: "utf8"
 // llvm-cov's summary: the total, and each file of src/ (the tests' own files left out).
 const rust = JSON.parse(readFileSync(join(out, "rust.json"), "utf8")).data[0];
 const lines = (s) => ({ lines: s.lines.count, run: s.lines.covered, percent: Number(s.lines.percent.toFixed(2)) });
+// Regions too: a line counts as run when any part of it ran, so `let x = f()?;` is run though
+// `f` never failed; a region is each such part (FEEDBACK49.md, Q-607). The gate stays on lines.
+const regions = (s) => ({ count: s.regions.count, run: s.regions.covered, percent: Number(s.regions.percent.toFixed(2)) });
 const files = rust.files
   .map((f) => ({ file: relative(root, f.filename), ...lines(f.summary) }))
   .filter((f) => f.file.startsWith("src/"))
@@ -33,6 +36,13 @@ for (const m of log.matchAll(/^test result: \w+\. (\d+) passed; (\d+) failed/gm)
   passed += Number(m[1]);
   failed += Number(m[2]);
 }
+// coverage.sh runs each failed test again by itself, its profile kept with the others; a
+// number is written only when every one then passes (Q-607), and says how many it took.
+const rerun = Number(process.env.COVERAGE_RERUN || 0);
+if (rerun) {
+  passed += rerun;
+  failed -= rerun;
+}
 
 // A copy made by `git archive` has no .git: COVERAGE_COMMIT and COVERAGE_BRANCH name what it is.
 const inGit = !process.env.COVERAGE_COMMIT;
@@ -44,9 +54,9 @@ const report = {
   date: new Date().toISOString().slice(0, 10),
   version: JSON.parse(execFileSync("cargo", ["metadata", "--no-deps", "--format-version", "1"], { cwd: root, encoding: "utf8" })).packages[0].version,
   system: `${{ darwin: "macOS", linux: "Linux", win32: "Windows" }[process.platform] ?? process.platform} ${process.arch}`,
-  tests: { passed, failed },
-  rust: { ...lines(rust.totals), files },
+  tests: { passed, failed, rerun },
+  rust: { ...lines(rust.totals), regions: regions(rust.totals), files },
   runtime: JSON.parse(readFileSync(join(out, "runtime.json"), "utf8")),
 };
 writeFileSync(join(out, "coverage.json"), JSON.stringify(report, null, 1) + "\n");
-console.log(`coverage.json: Rust ${report.rust.percent}%, runtime.js ${report.runtime.percent}%, ${passed} tests passed, ${failed} failed, at ${report.commit}${dirty ? " with changes" : ""}`);
+console.log(`coverage.json: Rust ${report.rust.percent}% of lines (${report.rust.regions.percent}% of regions), runtime.js ${report.runtime.percent}%, ${passed} tests passed, ${failed} failed, at ${report.commit}${dirty ? " with changes" : ""}`);

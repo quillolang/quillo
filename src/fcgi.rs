@@ -273,7 +273,14 @@ fn answer(c: &mut dyn Conn, id: u16, params: &[(String, String)], body: &[u8], h
             break head.split_off(i + 4);
         }
         if head.len() > 1 << 20 {
-            break Vec::new();
+            // An answer whose head runs past 1 MB is not one the web server can take: sent as it
+            // was, the rest of the head went out as the body, its `content-length` and all
+            // (found measuring coverage; branch feedback40-43).
+            drop(ours);
+            stdout(c, id, b"Status: 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nthe program's answer has a head over 1 MB\n")?;
+            c.write_all(&record(STDOUT, id, &[]))?;
+            c.write_all(&end_request(id, 0, REQUEST_COMPLETE))?;
+            return c.flush();
         }
     };
     let text = String::from_utf8_lossy(head.strip_suffix(b"\r\n\r\n").unwrap_or(&head)).into_owned();

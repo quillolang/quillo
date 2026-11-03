@@ -135,15 +135,22 @@ mod with_windows {
     }
 
     #[test]
-    fn a_port_already_taken_stops_it_before_the_window() {
-        let d = folder("taken", &[("app.qwe", "print(\"loaded\")\nroute GET / = \"hi\"\n")]);
-        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = held.local_addr().unwrap().port().to_string();
-        let (code, out, err) = no_window(&d, &["app.qwe", "--port", &port, "--open", "/admin?x=1", "--workers", "2"], &[("QUILLO_SECRET", "short")]);
-        assert_eq!(code, 1, "{}", err);
-        assert_eq!(out, "loaded\n", "the program ran first");
-        assert!(err.contains("QUILLO_SECRET is 5 bytes"), "{}", err);
-        assert!(err.contains(&format!("quillo: cannot listen on 127.0.0.1:{}", port)), "{}", err);
-        drop(held);
+    fn a_port_is_refused_before_the_window() {
+        // The window asks the program directly, with no socket (FEEDBACK39.md, Q-465): a port
+        // means nothing to `app`, and is said so before anything runs.
+        let d = folder("port", &[("app.qwe", "print(\"loaded\")\nroute GET / = \"hi\"\n")]);
+        for flags in [&["app.qwe", "--port", "8123", "--open", "/admin?x=1"][..], &["app.qwe", "--listen", "unix:q.sock"][..]] {
+            let (code, out, err) = no_window(&d, flags, &[]);
+            assert_eq!(code, 2, "{}", err);
+            assert_eq!(out, "", "nothing ran");
+            assert!(err.contains("quillo: `app` has no port: its window asks the program directly, with no socket; --port and --listen are for `run`"), "{}", err);
+        }
+        // Its edges: port 0 is a port too, and an option written wrong is said as `run` says it.
+        let (code, _, err) = no_window(&d, &["app.qwe", "--port", "0"], &[]);
+        assert_eq!(code, 2, "{}", err);
+        assert!(err.contains("`app` has no port"), "{}", err);
+        let (code, _, err) = no_window(&d, &["app.qwe", "--port"], &[]);
+        assert_eq!(code, 2, "{}", err);
+        assert!(err.contains("`--port` needs a value") && !err.contains("`app` has no port"), "{}", err);
     }
 }

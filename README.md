@@ -314,18 +314,24 @@ for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; 
 
 ### Test coverage
 
-**Rust: 97.91% of lines** run under the tests (47,074 lines, 985 not run).
-**Browser runtime (`src/client/runtime.js`): 99.78% of lines** (4,529 lines, 10 not run).
-Both were measured together on 2026-11-02 on branch `runtime-coverage` (c8b50ae, with main's
-FEEDBACK36 to 39 merged in) on macOS, from 2,227 tests with Chrome, PostgreSQL and MariaDB
-included. The Rust figure is the Lines column of `cargo llvm-cov`'s total. The runtime's is
-V8's own coverage from headless Chrome and every Node a test starts, mapped back to
-runtime.js's lines. What Rust does not run is mostly the new in-process app bridge
-(`src/embed.rs`, 82.83%), loops compiled to machine code (`src/jitloop.rs`, 89.91%),
-`unreachable!` arms, operating system failures and other systems' branches. The
-runtime's 10 lines are defensive guards and a few branches no test reaches yet.
+**Rust: 98.85% of lines** run under the tests (50,288 lines, 577 not run), **97.22% of
+regions** (120,880, 3,360 not run).
+**Browser runtime (`src/client/runtime.js`): 99.85% of lines** (4,626 lines, 7 not run).
+Both were measured together on 2026-11-03 on main (0.7.0-dev, with FEEDBACK45 and 46) on
+macOS, from 2,540 tests with Chrome, PostgreSQL and MariaDB included; 2 failed under the
+run's load and passed when run again by themselves, as `scripts/coverage.sh` now does
+before it writes a number. The Rust figures are the Lines and Regions columns of `cargo
+llvm-cov`'s total. A line counts as run when any part of it ran, so `let x = f()?;` is run
+though `f` never failed; regions count each part, which is why they are lower
+(FEEDBACK49.md). The runtime's is V8's own coverage from headless Chrome and every Node a
+test starts, mapped back to runtime.js's lines. What Rust does not run is mostly operating
+system failures (a thread or a socket that cannot be made), other systems' branches
+(`src/platform.rs`, `src/desktop.rs`), `unreachable!` arms and timers; the files with the
+most are `src/httpd.rs` (53 lines) and `src/embed.rs` (40). The runtime's 7 lines are
+defensive guards.
 
-runtime.js must stay at **99.50% or above** on every change, and every line a change
+Rust must stay at **97.90% of lines or above** (the aim is 99%), and runtime.js at
+**99.50% or above** on every change, and every line a change
 touches must run in some test: `sh scripts/runtime-coverage.sh` runs the tests and checks
 both, and CI runs it on each push. `sh scripts/coverage.sh` measures Rust and runtime.js in
 one run and writes `target/coverage/coverage.json`, which

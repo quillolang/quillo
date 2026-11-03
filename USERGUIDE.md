@@ -144,7 +144,7 @@ Their options, given after the command as `quillo run`'s are:
 | `quillo check --strict-null` | to find where a value may be null and null does not work (see [Checking](#checking)); `check` only, not `run` |
 | `quillo check --policy FILE` *(since 0.7)* | before a deploy to a server with a policy: check the program as it would run under it (see [The policy](#the-policy)) |
 | `quillo new --minimal`, `--binary` | three files instead of the to-do app; a copy of this `quillo` in the new folder, for a machine that has none |
-| `quillo app --open PATH` | the page the window opens on (`/` by default); `app` takes `run`'s options but `--host`, `--register` and `--service` (see [Desktop apps](#desktop-apps)) |
+| `quillo app --open PATH` | the page the window opens on (`/` by default); `app` takes `run`'s options but `--host`, `--register`, `--service`, `--port` and `--listen`: its window asks the program directly, with no socket (see [Desktop apps](#desktop-apps)) |
 | `quillo serve <folder>` | `run`'s options, such as `--port` (see [Static files](#static-files)) |
 | `quillo fcgi <file.qwe>` | `run`'s options but `--split`, `--instances`, `--register` and `--join`; `--listen unix:PATH` or `--port` when no FastCGI manager hands it a socket (see [Quillo on a shared server](#quillo-on-a-shared-server-cpanel)) |
 | `quillo install --example`, `--update`, `--list [word]`, `--force`, `--dir DIR`, `--registry URL` | a plugin's example program too; the plugins here the catalog has newer; what the catalog has; replace a file changed by hand; install elsewhere; another catalog (see [Plugins from the catalog](#plugins-from-the-catalog)) |

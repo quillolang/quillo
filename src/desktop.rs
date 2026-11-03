@@ -58,6 +58,12 @@ fn window(file: &str, flags: &[String]) -> i32 {
         eprintln!("quillo: `app` serves its own window only; --host, --register and --service are for `run`");
         return 2;
     }
+    // The window asks the program directly, with no socket (FEEDBACK39.md, Q-465): a port was
+    // taken and ignored without a word (found measuring coverage; branch feedback40-43).
+    if o.port.is_some() || o.listen.is_some() {
+        eprintln!("quillo: `app` has no port: its window asks the program directly, with no socket; --port and --listen are for `run`");
+        return 2;
+    }
     if let Err(code) = crate::before_the_program(file, &o) {
         return code;
     }
