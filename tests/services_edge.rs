@@ -232,6 +232,9 @@ fn fake(f: impl Fn(usize, &Req, &mut TcpStream) + Send + Sync + 'static) -> Stri
             let (f, n) = (f.clone(), n.clone());
             std::thread::spawn(move || {
                 if let Some((r, _)) = read_request(&mut s) {
+                    // `answer` signs with it, as a service does (FEEDBACK49.md, Q-596).
+                    let call = r.head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("x-quillo-call:").map(|v| v.trim().to_string()));
+                    CALL.with(|c| *c.borrow_mut() = call);
                     f(n.fetch_add(1, Ordering::SeqCst), &r, &mut s);
                 }
             });
@@ -240,8 +243,15 @@ fn fake(f: impl Fn(usize, &Req, &mut TcpStream) + Send + Sync + 'static) -> Stri
     format!("http://127.0.0.1:{}", port)
 }
 
+thread_local! {
+    /// The call the fake is answering, if it was one.
+    static CALL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// An answer, signed with the secret for the call being answered, as a service signs it.
 fn answer(s: &mut TcpStream, status: u16, body: &str) {
-    let _ = write!(s, "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", status, body.len(), body);
+    let sig = CALL.with(|c| c.borrow().clone()).map_or(String::new(), |call| format!("x-quillo-answer: sig={}\r\n", quillo::svcauth::sign_answer(SECRET, &call, status, body.as_bytes())));
+    let _ = write!(s, "HTTP/1.1 {} X\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", status, sig, body.len(), body);
 }
 
 /// A URL no one answers at.
@@ -301,17 +311,18 @@ fn a_call_goes_on_past_a_busy_server_and_asks_again_of_one_still_running_it() {
     assert!(seen.iter().all(|c| *c == seen[0]), "the same call each time: {:?}", seen);
     drop(seen);
 
-    // A 502 is not at all what was asked: the next address.
-    let bad = fake(|_, _, s| answer(s, 502, "{\"error\":\"down\"}"));
+    // A 503, the call not taken: the next address.
+    let bad = fake(|_, _, s| answer(s, 503, "{\"error\":\"down\"}"));
     let good = fake(|_, _, s| answer(s, 200, "{\"ok\":\"there\"}"));
     let mut it = program("next", Some(&format!("{},{}", bad, good)), "{ retries: 2 }");
     for _ in 0..4 {
         assert_eq!(ev(&mut it, "next.add(1)"), "\"there\"");
     }
-    // Every address busy, tried as often as it says.
+    // A 502 or 504, after which the call may have run there: not sent on for a function that
+    // is not safe to run twice (FEEDBACK49.md, Q-595).
     let mut it = program("busy", Some(&fake(|_, _, s| answer(s, 504, "gateway"))), "{ retries: 1 }");
     let out = ev(&mut it, "busy.add(1)");
-    assert!(out.contains("service busy: 504 at http://127.0.0.1:") && out.contains("(gateway)"), "{}", out);
+    assert!(out.contains("service busy: 504 at http://127.0.0.1:") && out.contains("(gateway)") && out.contains("not sent to another copy"), "{}", out);
 }
 
 #[test]

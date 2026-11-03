@@ -299,3 +299,52 @@ fn addresses_on_the_public_internet_are_told_from_the_others() {
         assert!(!ip(a), "{}", a);
     }
 }
+
+// FEEDBACK49.md, Q-599: a body past 64 MiB was cut at it with no word, and cut JSON was
+// `json: null`; `http.stream`'s non-2xx body dropped its read's error.
+#[test]
+fn an_answer_longer_than_what_is_read_whole_is_an_error() {
+    const MAX: usize = 64 << 20;
+    let port = server(|r, s| {
+        let path = r.head.split(' ').nth(1).unwrap().to_string();
+        let (status, n, close_early) = match path.as_str() {
+            "/exact" => ("200 OK", MAX, false),
+            "/over" => ("200 OK", MAX + 1, false),
+            "/over-json" => ("200 OK", MAX + 10, false),
+            "/missing-over" => ("404 Not Found", MAX + 1, false),
+            "/missing-cut" => ("404 Not Found", 1000, true),
+            _ => ("200 OK", 2, false),
+        };
+        let ctype = if path == "/over-json" { "application/json" } else { "text/plain" };
+        let _ = write!(s, "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", status, ctype, n);
+        if close_early {
+            let _ = s.write_all(b"cut short");
+            return;
+        }
+        let chunk = vec![b'['; 1 << 20];
+        let mut left = n;
+        while left > 0 {
+            let k = left.min(chunk.len());
+            if s.write_all(&chunk[..k]).is_err() {
+                return;
+            }
+            left -= k;
+        }
+    });
+    let url = |p: &str| format!("\"http://127.0.0.1:{}{}\"", port, p);
+    // Exactly the limit is read whole.
+    assert_eq!(ev(&format!("let r = http.get({})\n[r.status, len(r.body)]", url("/exact"))), format!("[200, {}]", MAX));
+    // One byte more, and JSON, are errors that say what to do.
+    for p in ["/over", "/over-json"] {
+        let v = ev(&format!("http.get({})", url(p)));
+        assert!(v.contains("the answer is longer than 64 MiB, the most that is read whole: read it with http.stream"), "{}: {}", p, v);
+        assert!(v.starts_with("err("), "{}", v);
+    }
+    // A stream's answer that is not 2xx: the same limit, and a body cut short is an error.
+    let v = ev(&format!("http.stream({}, (t) => null)", url("/missing-over")));
+    assert!(v.contains("longer than 64 MiB"), "{}", v);
+    let v = ev(&format!("http.stream({}, (t) => null)", url("/missing-cut")));
+    assert!(v.starts_with("err(\"http: "), "{}", v);
+    // A small answer is as before.
+    assert_eq!(ev(&format!("http.get({}).body", url("/small"))), "\"[[\"");
+}

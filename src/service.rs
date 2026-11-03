@@ -881,6 +881,13 @@ fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<
 /// (`describe::contract`): sent with each call, so a service deployed apart
 /// from its caller says when they disagree (FEEDBACK10.md, Q-077; branch
 /// feedback10-fixes).
+/// The functions of each service that are safe to call twice, as its file says: they use
+/// `idempotent` (FEEDBACK49.md, Q-595; branch main).
+fn repeatable() -> &'static Mutex<HashSet<(String, String)>> {
+    static R: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
 fn contracts() -> &'static Mutex<HashMap<(String, String), String>> {
     static C: OnceLock<Mutex<HashMap<(String, String), String>>> = OnceLock::new();
     C.get_or_init(Default::default)
@@ -1139,6 +1146,13 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
             Try::Answer(status @ (502..=504), text, _) => {
                 went_wrong(&url, &o);
                 why = format!("service {}: {} at {} ({})", name, status, url, reason(&text));
+                // A proxy's 502 or 504 may come after the copy behind it ran the call: only a
+                // function that is safe to run twice goes to another copy, where it ran on both
+                // (FEEDBACK49.md, Q-595; branch main). A 503 was not taken.
+                if status != 503 && !repeatable().lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&(name.to_string(), f.to_string())) {
+                    log_call(name, f, &url, status, start, attempt + 1, &rid);
+                    return Outcome::Missed(format!("{}; not sent to another copy, as it may have run there (a function that is safe to run twice uses `idempotent`)", why));
+                }
                 // A call still running there (503) is asked of it again.
                 if status != 503 || same.is_none() {
                     tried.push(url);
@@ -1149,11 +1163,13 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
                 went_well(&url);
                 log_call(name, f, &url, status, start, attempt + 1, &rid);
                 // The answer is the service's: signed back with the key the call was signed
-                // with. A call with a key of its own takes no answer without it (Q-459).
+                // with. A call with a key of its own takes no answer without it (Q-459), nor one
+                // under the shared secret, where an unsigned answer from whatever was at the
+                // service's address was taken (FEEDBACK49.md, Q-596; branch main).
                 if let Some(k) = &sign_key {
                     let want = crate::svcauth::sign_answer(k, &call, status, text.as_bytes());
                     let good = signed.as_deref().map(|s| s.strip_prefix("sig=").unwrap_or(s)).map(|s| crate::crypto::same(s.as_bytes(), want.as_bytes()));
-                    if good == Some(false) || (good.is_none() && !kid.is_empty() && status == 200) {
+                    if good == Some(false) || (good.is_none() && status == 200) {
                         return Outcome::Refused(502, format!("service {}: the answer from {} is not signed by the service", name, url));
                     }
                 }
@@ -1594,6 +1610,19 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
         let mut stmts = Vec::new();
         let _ = statements(&full, full.parent().unwrap_or(Path::new(".")), &mut seen, &mut stmts);
         Arc::make_mut(&mut it.watched).extend(seen);
+        // Which of its functions may be sent to another copy after a proxy's 502 or 504 (Q-595).
+        let all: HashMap<String, Arc<crate::ast::FnDef>> = stmts.iter().filter_map(|s| match s {
+            crate::ast::Stmt::Fn(d) => Some((d.name.clone(), d.clone())),
+            _ => None,
+        }).collect();
+        let mut r = repeatable().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for d in &defs {
+            if crate::idempotency::used_by_defs(&all, d) {
+                r.insert((name.to_string(), d.name.clone()));
+            } else {
+                r.remove(&(name.to_string(), d.name.clone()));
+            }
+        }
     }
     let ns = namespace(it, name, &defs, line)?;
     if let Some(url) = url_of(&it.shared, name) {

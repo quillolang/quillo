@@ -449,11 +449,21 @@ fn origin_of(url: &str) -> String {
     }
 }
 
+/// What an answer longer than `MAX_BODY` is told.
+fn too_long(url: &str) -> String {
+    format!("{}: the answer is longer than {} MiB, the most that is read whole: read it with http.stream", url, MAX_BODY >> 20)
+}
+
 fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Option<(String, Vec<u8>)>) -> Result<Reply, String> {
     let (url, resp) = follow(o, false, method, url, headers, body)?;
     let (status, headers, cookies, reader) = head_of(o, &url, method, resp)?;
     let mut bytes = Vec::new();
-    reader.take(MAX_BODY).read_to_end(&mut bytes).map_err(|e| timed_out(o, &url, e.to_string()))?;
+    reader.take(MAX_BODY + 1).read_to_end(&mut bytes).map_err(|e| timed_out(o, &url, e.to_string()))?;
+    // A longer one is an error, where it was cut at the limit and said nothing: cut JSON was
+    // `json: null` (FEEDBACK49.md, Q-599; branch main).
+    if bytes.len() as u64 > MAX_BODY {
+        return Err(too_long(&url));
+    }
     Ok(Reply { status, headers, cookies, body: String::from_utf8_lossy(&bytes).into_owned() })
 }
 
@@ -985,11 +995,16 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     m.insert("headers".into(), Value::map(headers.iter().map(|(k, v)| (k.into(), Value::str(v))).collect()));
     m.insert("cookies".into(), Value::list(cookies.into_iter().map(Value::str).collect()));
     if !ok {
-        let bytes = it.unlocked(move || {
+        let read = it.unlocked(move || {
             let mut b = Vec::new();
-            let _ = reader.take(MAX_BODY).read_to_end(&mut b);
-            b
+            reader.take(MAX_BODY + 1).read_to_end(&mut b).map(|_| b)
         });
+        // Its error said, not dropped, and one too long refused (Q-599).
+        let bytes = match read {
+            Ok(b) if b.len() as u64 > MAX_BODY => return Ok(Value::err(Value::str(format!("http: {}", too_long(&url))))),
+            Ok(b) => b,
+            Err(e) => return Ok(Value::err(Value::str(format!("http: {}: {}", url, e)))),
+        };
         m.insert("body".into(), Value::str(String::from_utf8_lossy(&bytes)));
         return Ok(Value::map(m));
     }

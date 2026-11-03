@@ -2340,6 +2340,7 @@ impl Checker {
                     if self.literal_mismatch(p, e) {
                         self.error("this `let` never matches the value it is given, so it fails every time it runs");
                     }
+                    self.capital_let(p, e);
                     let t = self.expr(e);
                     let mut binds = Vec::new();
                     self.bind_pattern(p, t, &mut binds);
@@ -3138,6 +3139,7 @@ impl Checker {
                 if self.literal_mismatch(p, e) {
                     self.error("this `let` never matches the value it is given, so it fails every time it runs");
                 }
+                self.capital_let(p, e);
                 let making = matches!((p, e), (Pattern::Bind(_), Expr::Lambda(_)));
                 if let (true, Pattern::Bind(n)) = (making, p) {
                     self.letting.push(n.to_string());
@@ -3761,16 +3763,33 @@ impl Checker {
         }
     }
 
+    /// `let Tag = "h1"`, for React's `<Tag>`: a capital makes it a type in the pattern, and the
+    /// `let` fails when it runs (FEEDBACK48.md, Q-577; branch main).
+    fn capital_let(&mut self, p: &Pattern, e: &Expr) {
+        let Pattern::Type(n) = p else { return };
+        if !n.starts_with(|c: char| c.is_uppercase()) || record(n).is_some() {
+            return;
+        }
+        let tag = if matches!(e, Expr::Lit(Lit::Str(_))) { "; and a tag's name is written out, as there are no dynamic tags: choose between them with `match`" } else { "" };
+        let mut lower = n.clone();
+        if let Some(f) = lower.get_mut(0..1) {
+            f.make_ascii_lowercase();
+        }
+        self.error(format!("`let {} = ...` reads `{}` as a type, as a capitalised name in a pattern is one, so it fails when it runs: name the variable in lower case, `let {} = ...`{}", n, n, lower, tag));
+    }
+
     /// A lambda given to `map`, `filter`, `reduce`, `sort_by` and the like takes the
     /// arguments the builtin passes: one item, or the total and an item for `reduce`
     /// (FEEDBACK45.md, Q-515; branch feedback40-43).
-    fn lambda_arity(&mut self, name: &str, args: &[Expr]) {
+    /// `xs.map(f)` too, whose `args` start after `xs` (`skipped` 1), where only `map(xs, f)` was
+    /// checked (FEEDBACK48.md, Q-574; branch main).
+    fn lambda_arity(&mut self, name: &str, args: &[Expr], skipped: usize) {
         let (at, passes) = match name {
             "map" | "filter" | "find" | "any" | "all" | "sort_by" | "group_by" | "count" => (1, 1),
             "reduce" => (2, 2),
             _ => return,
         };
-        let Some(Expr::Lambda(d)) = args.get(at) else { return };
+        let Some(Expr::Lambda(d)) = args.get(at - skipped) else { return };
         let most = d.params.len();
         let least = d.params.iter().filter(|p| p.default.is_none()).count();
         if passes >= least && passes <= most {
@@ -3783,7 +3802,9 @@ impl Checker {
         } else {
             let what = if passes == 1 { "one item" } else { "the total so far and an item" };
             let takes = if least == most { format!("{}", most) } else { format!("{} to {}", least, most) };
-            self.error(format!("`{}` passes its function {}, but this one takes {}", name, what, takes));
+            // JavaScript's `(x, i)`: how to have the index (Q-574).
+            let index = if passes == 1 && most == 2 { ": for the index, `for [i, x] in enumerate(xs) => ...`, which gives a list too".to_string() } else { String::new() };
+            self.error(format!("`{}` passes its function {}, but this one takes {}{}", name, what, takes, index));
         }
     }
 
@@ -4378,6 +4399,36 @@ impl Checker {
             "defs", "marker", "mask", "pattern", "clipPath", "linearGradient", "radialGradient", "stop", "image", "foreignObject", "filter",
             "animate", "animateTransform", "animateMotion", "set", "desc", "metadata", "switch", "view",
         ];
+        // React's own names, which reach the page and do nothing there (FEEDBACK48.md, Q-570;
+        // branch main).
+        let react = match name {
+            "defaultValue" => Some("write `value`: a field with no state keeps what is typed".to_string()),
+            "defaultChecked" => Some("write `checked`".to_string()),
+            "dangerouslySetInnerHTML" => Some("put {raw(html)} between the element's tags".to_string()),
+            "ref" => Some("write `@mount={(el) => ...}`, which is given the element".to_string()),
+            _ => None,
+        };
+        if let Some(how) = react {
+            self.warn(format!("`{}` is React's, and does nothing in a page: {}", name, how));
+            return;
+        }
+        // And on SVG, React's camelCase for its hyphenated attributes: the page lowercases
+        // `strokeWidth` to `strokewidth`, which SVG does not know.
+        const SVG_CAMEL: &[&str] = &[
+            "strokeWidth", "strokeLinecap", "strokeLinejoin", "strokeDasharray", "strokeDashoffset", "strokeOpacity", "strokeMiterlimit",
+            "fillRule", "fillOpacity", "clipRule", "clipPath", "stopColor", "stopOpacity", "fontSize", "fontFamily", "fontWeight", "textAnchor",
+            "dominantBaseline", "floodColor", "floodOpacity", "lightingColor", "markerStart", "markerMid", "markerEnd", "vectorEffect",
+            "shapeRendering", "colorInterpolationFilters", "letterSpacing", "wordSpacing", "textDecoration", "paintOrder", "imageRendering",
+        ];
+        if (SVG.contains(&tag) || tag.starts_with("fe")) && SVG_CAMEL.contains(&name) {
+            let svg: String = name.chars().flat_map(|c| if c.is_ascii_uppercase() { vec!['-', c.to_ascii_lowercase()] } else { vec![c] }).collect();
+            self.warn(format!("`{}` is React's: SVG's attribute is `{}`", name, svg));
+            return;
+        }
+        if (SVG.contains(&tag) || tag.starts_with("fe")) && name == "xlinkHref" {
+            self.warn("`xlinkHref` is React's: SVG's attribute is `href` (or `xlink:href`)");
+            return;
+        }
         // SVG's filters (`feTurbulence`'s `seed`, `scale`), and HTML's text handlers
         // (`onload="..."`), framework attributes (`x-data`, `hx-get`): found in review.
         if (SVG.contains(&tag) || tag.starts_with("fe")) && !name.starts_with('@') {
@@ -4411,6 +4462,18 @@ impl Checker {
             Some(ev) => (ev, EVENTS, "@"),
             None => (name, ATTRS, ""),
         };
+        // `@mouseEnter`: the browser's event names are lower case, and compared as written
+        // (FEEDBACK48.md, Q-561; branch main).
+        if prefix == "@" && word != word.to_ascii_lowercase() && list.contains(&word.to_ascii_lowercase().as_str()) {
+            self.warn(format!("`@{}` never fires: the browser's event names are lower case, `@{}` (or React's `on{}`)", word, word.to_ascii_lowercase(), {
+                let mut c = word.to_string();
+                if let Some(f) = c.get_mut(0..1) {
+                    f.make_ascii_uppercase();
+                }
+                c
+            }));
+            return;
+        }
         if word.chars().count() < 4 || list.contains(&word) || list.iter().any(|a| a.eq_ignore_ascii_case(word)) {
             return;
         }
@@ -4709,6 +4772,9 @@ impl Checker {
             match found {
                 Some(v) if v.t.bits & FN != 0 => {
                     self.record(name, &v);
+                    if pre.is_none() && v.sig.as_ref().is_some_and(|s| s.builtin) {
+                        self.lambda_arity(name, args, 1);
+                    }
                     return self.apply(v.t, v.sig.clone(), all, args, name);
                 }
                 _ => {
@@ -5538,7 +5604,7 @@ impl Checker {
         }
         // A piped value is the SQL: the pipe looks at it (see `Expr::Pipe`).
         if sig.builtin {
-            self.lambda_arity(name, arg_exprs);
+            self.lambda_arity(name, arg_exprs, 0);
         }
         // A group's middleware that can give neither the request back, nor null, nor an answer
         // stops every request: a predicate's `true` is a 500 (FEEDBACK47.md, Q-534).
@@ -5799,6 +5865,20 @@ impl Checker {
             self.line = *line;
             self.warn("the `$` before this `{` is text, and shows on the page: `{name}` alone gives the value here (`${name}` is for templates); write `{\"$\"}{name}` if the `$` is meant");
         }
+        // As JSX has it, a line break between text and an element is no space (FEEDBACK48.md,
+        // Q-573; branch main).
+        for (line, a, b) in &el.joined {
+            // A view whose element is a block, `<BulletList>`, starts a line of its own anyway.
+            let block_view = [a, b].iter().filter_map(|s| s.strip_prefix('<').and_then(|s| s.strip_suffix('>'))).any(|t| {
+                t.starts_with(|c: char| c.is_uppercase())
+                    && self.ident(t).1.and_then(|s| s.def.clone()).is_some_and(|d| root_tag(&d.body).is_some_and(|r| !crate::parser::inline_tag(r)))
+            });
+            if block_view {
+                continue;
+            }
+            self.line = *line;
+            self.warn(format!("{} and {} are on lines of their own, so no space comes between them on the page: write {{\" \"}} between them, or put them on one line", a, b));
+        }
         self.line = el.line;
         if let Some(id) = &el.id {
             self.expr(id);
@@ -5940,7 +6020,13 @@ impl Checker {
                             }
                         }
                     }
-                    self.expr(x);
+                    let t = self.expr(x);
+                    // React's function as children, or `{onClick}` for `{label}`: shown as nothing
+                    // (FEEDBACK48.md, Q-571; branch main).
+                    if matches!(x, Expr::Lambda(_)) || t.bits == FN {
+                        self.line = el.line;
+                        self.warn("a function where markup goes shows nothing: call it, {render(x)}, or give it to a view as an attribute, render={(x) => ...}");
+                    }
                 }
             }
         }
@@ -5951,10 +6037,17 @@ impl Checker {
             return;
         }
         self.line = el.line;
+        // React's `<Fragment>` (FEEDBACK48.md, Q-577; branch main).
+        if el.tag == "Fragment" && !self.is_local("Fragment") && !self.globals.contains_key("Fragment") {
+            self.error(crate::parser::FRAGMENTS);
+            return;
+        }
         let (t, sig) = self.ident(&el.tag);
         let Some(sig) = sig else {
             if t.bits != 0 && t.bits & FN == 0 {
-                self.error(format!("<{}> is not a view: it is {}", el.tag, bits_text(t.bits)));
+                // `let Tag = "h1"` then `<Tag>`: React's dynamic tag (Q-577).
+                let dynamic = if t.bits & STR != 0 { ": a tag's name is written out, as there are no dynamic tags; choose between them with `match`, or write a view per tag" } else { "" };
+                self.error(format!("<{}> is not a view: it is {}{}", el.tag, bits_text(t.bits), dynamic));
             }
             return;
         };
@@ -5962,11 +6055,30 @@ impl Checker {
             self.error(format!("<{}> is a builtin function, not a view", el.tag));
             return;
         }
+        // React's `function Card(props)`: a view's parameters are its props, each by its name
+        // (FEEDBACK48.md, Q-577; branch main).
+        if let [only] = sig.params.as_slice() {
+            if only.name == "props" && given.iter().any(|(n, _)| n != "props" && n != "key" && !n.starts_with('@')) {
+                let names: Vec<&str> = given.iter().map(|(n, _)| n.as_str()).filter(|n| *n != "key" && !n.starts_with('@')).collect();
+                self.error(format!("a view's parameters are its props, each by name: write `view {}({})`, not one `props`", el.tag, names.join(", ")));
+                return;
+            }
+        }
+        // What is between its tags goes nowhere without a `children` parameter, where an
+        // attribute it lacks was already an error (FEEDBACK48.md, Q-569; branch main).
+        if !el.children.is_empty() && !spread && !sig.params.iter().any(|p| p.name == "children") {
+            self.error(format!("<{}> takes no children, so what is between its tags is lost: give it a `children` parameter, or write <{} .../>", el.tag, el.tag));
+        }
         for (n, t) in &given {
             if n == "key" || n.starts_with('@') {
                 continue;
             }
             match sig.params.iter().find(|p| &p.name == n) {
+                // `<Card.big #main>` is `class` and `id` given to it (Q-568).
+                None if n == "class" || n == "id" => self.error(format!(
+                    "<{}> has no parameter `{}`: a view's attributes are its parameters, `.name` giving `class` and `#name` giving `id`; give it {} `{}` parameter and put it on its element",
+                    el.tag, n, if n == "id" { "an" } else { "a" }, n
+                )),
                 None => self.error(format!("<{}> has no parameter `{}`", el.tag, n)),
                 Some(p) => {
                     if p.annotated && t.bits != 0 && t.bits & p.ty == 0 {
@@ -5985,6 +6097,18 @@ impl Checker {
                 self.error(format!("<{}> is a server fn, not a view (in <{}>)", el.tag, c));
             }
         }
+    }
+}
+
+/// The tag of the element a view's body gives, when it ends with one.
+fn root_tag(body: &Expr) -> Option<&str> {
+    match body {
+        Expr::Html(el, _) => Some(el.tag.as_str()),
+        Expr::Block(stmts) => match stmts.last() {
+            Some(Stmt::Expr(e)) => root_tag(e),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

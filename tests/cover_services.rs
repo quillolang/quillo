@@ -92,7 +92,10 @@ fn fake(f: impl Fn(usize, &str, &str) -> (u16, String) + Send + Sync + 'static) 
                 s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
                 let (head, body) = read_request(&mut s);
                 let (status, out) = f(n.fetch_add(1, Ordering::SeqCst), &head, &body);
-                let _ = write!(s, "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", status, out.len(), out);
+                // Signed with the secret, as a service signs its answers (FEEDBACK49.md, Q-596).
+                let call = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("x-quillo-call:").map(|v| v.trim().to_string()));
+                let sig = call.map_or(String::new(), |c| format!("x-quillo-answer: sig={}\r\n", quillo::svcauth::sign_answer(SECRET, &c, status, out.as_bytes())));
+                let _ = write!(s, "HTTP/1.1 {} X\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", status, sig, out.len(), out);
             });
         }
     });

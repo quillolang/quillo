@@ -150,6 +150,7 @@ fn stand_in() -> Stand {
                     }
                     let f = line.split(' ').nth(1).unwrap_or("").rsplit('/').next().unwrap_or("").to_string();
                     let mut length = 0;
+                    let mut call = String::new();
                     loop {
                         let mut l = String::new();
                         r.read_line(&mut l).unwrap();
@@ -158,6 +159,9 @@ fn stand_in() -> Stand {
                         }
                         if let Some(v) = l.to_ascii_lowercase().strip_prefix("content-length:") {
                             length = v.trim().parse().unwrap();
+                        }
+                        if let Some(v) = l.to_ascii_lowercase().strip_prefix("x-quillo-call:") {
+                            call = v.trim().to_string();
                         }
                     }
                     r.read_exact(&mut vec![0; length]).unwrap();
@@ -168,7 +172,9 @@ fn stand_in() -> Stand {
                         _ if h.load(Ordering::SeqCst) => (200, format!(r#"{{"ok":"{} done"}}"#, f)),
                         f => (f[1..].parse().unwrap_or(500), r#"{"error":"not now"}"#.to_string()),
                     };
-                    let head = format!("HTTP/1.1 {} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", status, body.len());
+                    // Signed, as a service signs its answers (FEEDBACK49.md, Q-596).
+                    let sig = quillo::svcauth::sign_answer(SECRET, &call, status, body.as_bytes());
+                    let head = format!("HTTP/1.1 {} X\r\ncontent-type: application/json\r\nx-quillo-answer: sig={}\r\ncontent-length: {}\r\n\r\n", status, sig, body.len());
                     let _ = r.get_mut().write_all(format!("{}{}", head, body).as_bytes());
                 }
             });

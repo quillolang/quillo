@@ -340,6 +340,36 @@ fn an_answer_is_the_services_and_a_copy_joins_with_its_own_key() {
     assert!(raw_join(some_port).body.contains("this app takes copies of risk only (--allow-join)"));
 }
 
+// FEEDBACK49.md, Q-596: under the shared secret, an unsigned answer from whatever answered at
+// the service's address was taken as the service's.
+#[test]
+fn under_the_shared_secret_an_unsigned_answer_is_refused_too() {
+    let fake = impostor();
+    let fake_url = format!("http://127.0.0.1:{}", fake);
+    let d = dir(
+        "shared-answer",
+        &[
+            ("billing.qwe", "server fn refund() = { refunded: 500 }\n"),
+            ("main.qwe", "service billing = \"billing.qwe\"\nroute GET /refund = billing.refund()\n"),
+        ],
+    );
+    let secret = ("QUILLO_SERVICE_SECRET", "0123456789abcdef0123456789abcdef");
+    let (_a, ap) = run(&d, "main.qwe", &[], &[secret, ("QUILLO_SERVICE_BILLING", fake_url.as_str())]);
+    let a = send(ap, "GET", "/refund", &[], "");
+    assert_eq!(a.status, 500, "the impostor's unsigned answer is refused: {}", a.body);
+    assert!(!a.body.contains("an impostor"), "{}", a.body);
+    // The real service, under the same secret, signs back.
+    let (_b, bp) = run(&d, "billing.qwe", &["--as-service"], &[secret]);
+    let url = format!("http://127.0.0.1:{}", bp);
+    let (_c, cp) = run(&d, "main.qwe", &[], &[secret, ("QUILLO_SERVICE_BILLING", url.as_str())]);
+    assert_eq!(send(cp, "GET", "/refund", &[], "").body, r#"{"refunded":500}"#);
+    // Under another secret the service refuses the call; its 401 is an error here, not a
+    // result, signed or not.
+    let (_d, dp) = run(&d, "main.qwe", &[], &[("QUILLO_SERVICE_SECRET", "another-secret-0123456789abcdef01"), ("QUILLO_SERVICE_BILLING", url.as_str())]);
+    let other = send(dp, "GET", "/refund", &[], "");
+    assert_eq!(other.status, 500, "{}", other.body);
+}
+
 #[test]
 fn what_auth_and_accept_calls_take() {
     let d = dir(
@@ -445,7 +475,9 @@ fn signatures_and_identities_unit_by_unit() {
     assert!(verify_jwt(&jwt(r#"{"exp":1}"#, "s"), &no_secret).unwrap_err().contains("no secret"));
     for alg in ["RS256", "ES256", "EdDSA"] {
         let tok = format!("{}.{}.AA", b64(format!(r#"{{"alg":"{}","kid":"k"}}"#, alg).as_bytes()), b64(b"{}"));
-        assert!(verify_jwt(&tok, &no_secret).unwrap_err().contains("jwks"), "{}", alg);
+        // Nothing there: said without the URL, which is the server's to know (FEEDBACK49.md,
+        // Q-597), and tried once for the three.
+        assert_eq!(verify_jwt(&tok, &no_secret).unwrap_err(), "the identity provider's keys could not be fetched", "{}", alg);
     }
 }
 
@@ -485,6 +517,139 @@ fn tokens_are_checked_against_a_jwks() {
     assert_eq!(fetched.load(std::sync::atomic::Ordering::SeqCst), 1, "fetched again at most once a minute");
     let caller = quillo::svcauth::jwt_caller(&serde_json::json!({ "azp": "x", "scp": ["a", "b"] }));
     assert_eq!(caller.display(), "{ name: \"x\", by: \"jwt\", scopes: [\"a\", \"b\"], claims: { azp: \"x\", scp: [\"a\", \"b\"] } }");
+}
+
+/// An identity provider for the tests: answers its JWKS (`keys`) as `how` says, counting fetches.
+fn idp(how: &'static str, keys: String) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}/jwks", l.local_addr().unwrap().port());
+    let (fetched, down) = (std::sync::Arc::new(AtomicUsize::new(0)), std::sync::Arc::new(AtomicBool::new(false)));
+    let (f2, d2) = (fetched.clone(), down.clone());
+    std::thread::spawn(move || {
+        for mut c in l.incoming().flatten() {
+            let (f3, d3, keys) = (f2.clone(), d2.clone(), keys.clone());
+            std::thread::spawn(move || {
+                let mut b = [0u8; 2048];
+                let _ = c.read(&mut b);
+                f3.fetch_add(1, SeqCst);
+                match how {
+                    "silent" => std::thread::sleep(Duration::from_secs(30)),
+                    "slow" => std::thread::sleep(Duration::from_millis(800)),
+                    _ => {}
+                }
+                if how == "500" || d3.load(SeqCst) {
+                    let _ = write!(c, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\nConnection: close\r\n\r\noops");
+                } else {
+                    let body = format!(r#"{{"keys":[{}]}}"#, keys);
+                    let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                }
+            });
+        }
+    });
+    (url, fetched, down)
+}
+
+// FEEDBACK49.md, Q-597: no negative cache, no stale keys, a wait of ten seconds on a provider
+// that does not answer, and the JWKS URL in the caller's error.
+#[test]
+fn a_jwks_that_fails_is_fetched_once_a_minute_and_the_old_keys_are_kept() {
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use std::sync::atomic::Ordering::SeqCst;
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let jwk = format!(r#"{{"kty":"OKP","crv":"Ed25519","kid":"ed-1","use":"sig","x":"{}"}}"#, b64(key.public_key().as_ref()));
+    let token = {
+        let m = format!("{}.{}", b64(br#"{"alg":"EdDSA","kid":"ed-1"}"#), b64(format!(r#"{{"sub":"a","exp":{}}}"#, now() + 60).as_bytes()));
+        format!("{}.{}", m, b64(key.sign(m.as_bytes()).as_ref()))
+    };
+    let rules = |url: &str| quillo::svcauth::JwtRules { jwks: Some(url.to_string()), audience: None, issuer: None, secret: None };
+
+    // A provider that fails: one fetch for five calls, and no URL in what the caller is told.
+    let (url, fetched, _) = idp("500", jwk.clone());
+    for _ in 0..5 {
+        let e = quillo::svcauth::verify_jwt(&token, &rules(&url)).unwrap_err();
+        assert_eq!(e, "the identity provider's keys could not be fetched");
+    }
+    assert_eq!(fetched.load(SeqCst), 1);
+    // A minute on, it is tried again.
+    quillo::svcauth::age_jwks(&url, Duration::from_secs(61));
+    assert!(quillo::svcauth::verify_jwt(&token, &rules(&url)).is_err());
+    assert_eq!(fetched.load(SeqCst), 2);
+
+    // One that never answers: three seconds for the first call, none for the next.
+    let (url, fetched, _) = idp("silent", jwk.clone());
+    let t = Instant::now();
+    assert!(quillo::svcauth::verify_jwt(&token, &rules(&url)).is_err());
+    assert!(t.elapsed() < Duration::from_secs(6), "{:?}", t.elapsed());
+    let t = Instant::now();
+    for _ in 0..4 {
+        assert!(quillo::svcauth::verify_jwt(&token, &rules(&url)).is_err());
+    }
+    assert!(t.elapsed() < Duration::from_millis(500), "{:?}", t.elapsed());
+    assert_eq!(fetched.load(SeqCst), 1);
+
+    // Five callers at once, on a slow one: one fetch, and all take its keys.
+    let (url, fetched, down) = idp("slow", jwk.clone());
+    let all: Vec<_> = (0..5).map(|_| {
+        let (token, url) = (token.clone(), url.clone());
+        std::thread::spawn(move || quillo::svcauth::verify_jwt(&token, &rules(&url)).map(|c| c["sub"].clone()))
+    }).collect();
+    for h in all {
+        assert_eq!(h.join().unwrap().unwrap(), "a");
+    }
+    assert_eq!(fetched.load(SeqCst), 1);
+    // Old keys, and the provider down: they are used, and it is asked once a minute.
+    down.store(true, SeqCst);
+    quillo::svcauth::age_jwks(&url, Duration::from_secs(601));
+    assert_eq!(quillo::svcauth::verify_jwt(&token, &rules(&url)).unwrap()["sub"], "a");
+    assert_eq!(quillo::svcauth::verify_jwt(&token, &rules(&url)).unwrap()["sub"], "a");
+    assert_eq!(fetched.load(SeqCst), 2);
+    // Back up, a minute later: fetched again.
+    down.store(false, SeqCst);
+    quillo::svcauth::age_jwks(&url, Duration::from_secs(61));
+    assert_eq!(quillo::svcauth::verify_jwt(&token, &rules(&url)).unwrap()["sub"], "a");
+    assert_eq!(fetched.load(SeqCst), 3);
+    // A key it does not have, after a fetch that worked, is told without the URL.
+    let other = {
+        let m = format!("{}.{}", b64(br#"{"alg":"EdDSA","kid":"ed-9"}"#), b64(format!(r#"{{"sub":"a","exp":{}}}"#, now() + 60).as_bytes()));
+        format!("{}.{}", m, b64(key.sign(m.as_bytes()).as_ref()))
+    };
+    let e = quillo::svcauth::verify_jwt(&other, &rules(&url)).unwrap_err();
+    assert_eq!(e, "no key `ed-9` in the identity provider's keys");
+}
+
+// The signatures the provider's keys check, wrong and right (Q-597's "never run in a test").
+#[test]
+fn rs256_and_es256_tokens_with_a_wrong_signature_are_refused() {
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+    let rng = ring::rand::SystemRandom::new();
+    let ec = |rng: &ring::rand::SystemRandom| {
+        let p = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, rng).unwrap();
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, p.as_ref(), rng).unwrap()
+    };
+    let (mine, theirs) = (ec(&rng), ec(&rng));
+    let point = mine.public_key().as_ref();
+    let ec_jwk = format!(r#"{{"kty":"EC","crv":"P-256","kid":"ec-1","x":"{}","y":"{}"}}"#, b64(&point[1..33]), b64(&point[33..65]));
+    // An RSA key of 2048 bits: any odd modulus does for a signature that cannot be right.
+    let mut n = vec![0xc3u8; 256];
+    n[255] |= 1;
+    let rsa_jwk = format!(r#"{{"kty":"RSA","kid":"rsa-1","n":"{}","e":"AQAB"}}"#, b64(&n));
+    let (url, _, _) = idp("ok", format!("{},{}", ec_jwk, rsa_jwk));
+    let rules = quillo::svcauth::JwtRules { jwks: Some(url), audience: None, issuer: None, secret: None };
+    let claims = b64(format!(r#"{{"sub":"a","exp":{}}}"#, now() + 60).as_bytes());
+    let es = |by: &EcdsaKeyPair| {
+        let m = format!("{}.{}", b64(br#"{"alg":"ES256","kid":"ec-1"}"#), claims);
+        format!("{}.{}", m, b64(by.sign(&rng, m.as_bytes()).unwrap().as_ref()))
+    };
+    assert_eq!(quillo::svcauth::verify_jwt(&es(&mine), &rules).unwrap()["sub"], "a");
+    assert_eq!(quillo::svcauth::verify_jwt(&es(&theirs), &rules).unwrap_err(), "the token's signature is wrong");
+    let rs = format!("{}.{}.{}", b64(br#"{"alg":"RS256","kid":"rsa-1"}"#), claims, b64(&[7u8; 256]));
+    assert_eq!(quillo::svcauth::verify_jwt(&rs, &rules).unwrap_err(), "the token's signature is wrong");
+    // A key of the wrong kind for the token is no key.
+    let wrong = format!("{}.{}.{}", b64(br#"{"alg":"RS256","kid":"ec-1"}"#), claims, b64(&[7u8; 256]));
+    assert_eq!(quillo::svcauth::verify_jwt(&wrong, &rules).unwrap_err(), "no key `ec-1` in the identity provider's keys");
 }
 
 #[allow(dead_code)]

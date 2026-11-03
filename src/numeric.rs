@@ -1322,6 +1322,24 @@ fn data(args: &[Value], f: &str, least: usize, line: u32) -> Result<(Vec<f64>, b
     Ok((x, ints))
 }
 
+/// `data`, for what puts the data in order or counts them: NaN and infinity have no place
+/// there, where a mean has them as Python's does (FEEDBACK49.md, Q-605).
+fn ordered(args: &[Value], f: &str, least: usize, line: u32) -> Result<(Vec<f64>, bool), Ctrl> {
+    let d = data(args, f, least, line)?;
+    finite(&d.0, f, "data", line)?;
+    Ok(d)
+}
+
+/// NaN and infinity refused by name, as `sort` refuses them, where data are put in order or
+/// counted: `stats.median([3, NaN, 1])` was 3.0, and a histogram with `inf` had NaN edges and
+/// counted nothing (FEEDBACK49.md, Q-605; branch main).
+fn finite(x: &[f64], f: &str, what: &str, line: u32) -> Result<(), Ctrl> {
+    match x.iter().position(|v| !v.is_finite()) {
+        None => Ok(()),
+        Some(i) => fail(line, format!("`{}`: the {} hold {} at index {}: NaN and infinity cannot be counted or put in order", f, what, if x[i].is_nan() { "NaN" } else if x[i] > 0.0 { "inf" } else { "-inf" }, i)),
+    }
+}
+
 fn s_mean(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (x, _) = data(&args, "stats.mean", 1, line)?;
     Ok(Value::Float(mean_of(&x)))
@@ -1367,7 +1385,7 @@ fn s_harmonic_mean(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 fn s_median(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let (x, ints) = data(&args, "stats.median", 1, line)?;
+    let (x, ints) = ordered(&args, "stats.median", 1, line)?;
     let n = x.len();
     if n % 2 == 1 {
         return Ok(back(values_at(&x, &[n / 2])[0], ints));
@@ -1377,13 +1395,13 @@ fn s_median(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 fn s_median_low(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let (x, ints) = data(&args, "stats.median_low", 1, line)?;
+    let (x, ints) = ordered(&args, "stats.median_low", 1, line)?;
     let n = x.len();
     Ok(back(values_at(&x, &[if n % 2 == 1 { n / 2 } else { n / 2 - 1 }])[0], ints))
 }
 
 fn s_median_high(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let (x, ints) = data(&args, "stats.median_high", 1, line)?;
+    let (x, ints) = ordered(&args, "stats.median_high", 1, line)?;
     let n = x.len();
     Ok(back(values_at(&x, &[n / 2])[0], ints))
 }
@@ -1523,7 +1541,7 @@ pub const MOST_QUANTILES: i64 = 10_000;
 /// points, as Python computes them.
 fn s_quantiles(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = "stats.quantiles";
-    let (x, _) = data(&args, f, 1, line)?;
+    let (x, _) = ordered(&args, f, 1, line)?;
     let n = int_or(&args, 1, f, line, 4)?;
     if !(1..=MOST_QUANTILES).contains(&n) {
         return fail(line, format!("`{}`: n must be from 1 to {}, got {}", f, MOST_QUANTILES, n));
@@ -1574,7 +1592,7 @@ fn percentiles(x: &[f64], ps: &[f64]) -> Vec<f64> {
 /// `stats.percentile(data, p)`, p from 0 to 100, or a list of them.
 fn s_percentile(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = "stats.percentile";
-    let (x, _) = data(&args, f, 1, line)?;
+    let (x, _) = ordered(&args, f, 1, line)?;
     let check = |p: f64| if (0.0..=100.0).contains(&p) { Ok(p) } else { fail(line, format!("`{}`: percentiles are from 0 to 100, got {}", f, p)) };
     if let Some(Value::List(_)) = args.get(1) {
         let ps = xs(&args, 1, f, line)?;
@@ -1694,6 +1712,7 @@ fn s_linear_regression(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// describe (std of a sample, quartiles by numpy's rule). Nulls for no data.
 fn s_describe(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (x, ints) = nums(&args, 0, "stats.describe", line)?;
+    finite(&x, "stats.describe", "data", line)?;
     let n = x.len();
     let mut m = Map::new();
     m.insert("count".into(), Value::Int(n as i64));
@@ -1724,8 +1743,10 @@ fn s_describe(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn s_histogram(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = "stats.histogram";
     let x = xs(&args, 0, f, line)?;
+    finite(&x, f, "data", line)?;
     let edges = if let Some(Value::List(_)) = args.get(1) {
         let e = xs(&args, 1, f, line)?;
+        finite(&e, f, "edges", line)?;
         if e.len() < 2 || e.windows(2).any(|w| w[1] < w[0]) {
             return fail(line, format!("`{}`: edges must be at least two, increasing", f));
         }
@@ -1741,6 +1762,10 @@ fn s_histogram(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         if lo == hi {
             (lo, hi) = (lo - 0.5, hi + 0.5);
+        }
+        // ±1e308 make a width past what a float holds (Q-605).
+        if !(hi - lo).is_finite() {
+            return fail(line, format!("`{}`: the data spread over more than a float can hold, {} to {}: give the edges", f, lo, hi));
         }
         linspace(lo, hi, bins as usize + 1, true)
     };
@@ -1804,6 +1829,7 @@ fn s_normalize(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 fn s_rank(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (x, _) = nums(&args, 0, "stats.rank", line)?;
+    finite(&x, "stats.rank", "data", line)?;
     Ok(Value::list(ranks(&x).into_iter().map(whole).collect()))
 }
 

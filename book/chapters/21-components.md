@@ -205,7 +205,18 @@ route GET / = <html><body><Counter start={5}/></body></html>
 - `style={...}` takes text or a map of properties *(since 0.7)*: `style={{ color: tone, font_size:
   "2rem", marginTop: "3px", "--gap": "4px" }}`, where `_` and camelCase are written as
   `-` (`font-size`, `margin-top`), a custom property is kept as it is, and a `null` or
-  `false` value is left out; the same on the server and in the browser.
+  `false` value is left out; the same on the server and in the browser. A number is in
+  pixels, as React has it, except `0` and React's unitless properties (`opacity`,
+  `z-index`, `line-height`, `flex`, `font-weight`, `order`...) and custom properties:
+  `{ fontSize: 12, opacity: 0.5, "--gap": 4 }` is `font-size: 12px; opacity: 0.5; --gap: 4`
+  *(since 0.7: `12` was written bare, and the browser dropped it)*. `ms` starts a prefix as
+  `Webkit` and `Moz` do: `msFlex` is `-ms-flex`.
+- `class={...}` takes text, a map (the keys whose values are true) or a list (its texts,
+  lists inside it flattened, `null`, `false`, `true` and `""` skipped, a map in it giving
+  its true keys), as `clsx` does: `class={{ active: on, off: !on }}`, `class={["card", big
+  && "big"]}` *(since 0.7: they were written as Quillo text)*. Quillo's truthiness counts,
+  so `{ d: 0 }` gives `d`. Nothing left gives no `class` at all. After an update the
+  element has exactly the new classes.
   `style={...}` and `class={...}` change only what they name when what they read
   changes: a `transform` or a class a handler set by hand stays, so a drag does not jump
   home. `<details open={x}>` and `<dialog open={x}>` follow `x` when `x` changes, and

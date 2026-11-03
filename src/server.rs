@@ -1951,6 +1951,12 @@ pub(crate) fn render_response(r: &Response) -> HttpResponse {
             Value::Html(h) => (Some(markup_type(h)), h.as_bytes().to_vec()),
             Value::Str(s) => (Some("text/plain; charset=utf-8"), s.as_bytes().to_vec()),
             other => {
+                // An answer too large or too deep to write is the program's error, not the
+                // server's end (Q-606, Q-592).
+                if let Err(why) = other.json_fits(crate::builtins::JSON_MOST, crate::builtins::JSON_DEEPEST) {
+                    crate::httpd::error_line_with(&format!("the answer's value cannot be written as JSON: {}", why), &[]);
+                    return HttpResponse { status: 500, headers: vec![("content-type".into(), "application/json".into())], body: br#"{"error":"internal error"}"#.to_vec() };
+                }
                 let mut out = Vec::new();
                 hidden(other).as_ref().unwrap_or(other).json_into(&mut out);
                 (Some("application/json"), out)

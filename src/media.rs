@@ -323,7 +323,12 @@ pub struct H264 {
     pps: Option<Vec<u8>>,
     /// After a loss: only a keyframe will do.
     want_key: bool,
+    /// The bytes of the frame being put together (Q-604).
+    held: usize,
 }
+
+/// Larger than any frame a camera sends: a 4K keyframe is a few MB.
+const MAX_FRAME: usize = 16 << 20;
 
 /// An access unit: Annex B bytes, and whether it is a keyframe.
 pub struct Unit {
@@ -350,6 +355,14 @@ impl H264 {
         let b = &p.payload;
         if b.is_empty() {
             return;
+        }
+        // A frame that never ends (no marker, the same time) is let go past a size no frame
+        // has, where it grew for as long as packets came (FEEDBACK49.md, Q-604; branch main).
+        self.held += b.len();
+        if self.held > MAX_FRAME {
+            self.nals.clear();
+            self.lost();
+            self.held = b.len();
         }
         match b[0] & 0x1f {
             1..=23 => self.nals.push(b.to_vec()),
@@ -395,6 +408,7 @@ impl H264 {
     }
 
     fn flush(&mut self, out: &mut Vec<Unit>) {
+        self.held = 0;
         let nals = std::mem::take(&mut self.nals);
         let broken = std::mem::take(&mut self.broken) || self.fu.take().is_some();
         let Some(ts) = self.ts.take() else { return };
@@ -736,6 +750,37 @@ mod tests {
 
     const SPS: &[u8] = &[0x67, 0x42, 0xc0, 0x1e, 0xaa];
     const PPS: &[u8] = &[0x68, 0xce, 0x3c, 0x80];
+
+    // FEEDBACK49.md, Q-604: packets that never set the marker, at one time, grew a frame for
+    // as long as they came.
+    #[test]
+    fn a_frame_that_never_ends_is_let_go_past_its_size() {
+        let mut h = H264::new();
+        let mut out = Vec::new();
+        let piece = vec![0x41u8; 60_000];
+        for seq in 0..400u16 {
+            h.push(&parse(&rtp_packet(seq, 9, false, &piece)).unwrap(), &mut out);
+            assert!(h.held <= MAX_FRAME, "{} bytes held", h.held);
+            assert!(h.nals.iter().map(Vec::len).sum::<usize>() <= MAX_FRAME);
+        }
+        assert!(out.is_empty());
+        // FU-A pieces of one NAL unit with no end, the same.
+        let mut h = H264::new();
+        let mut first = vec![0x7c, 0x85];
+        first.extend_from_slice(&piece);
+        h.push(&parse(&rtp_packet(0, 9, false, &first)).unwrap(), &mut out);
+        let mut more = vec![0x7c, 0x05];
+        more.extend_from_slice(&piece);
+        for seq in 1..400u16 {
+            h.push(&parse(&rtp_packet(seq, 9, false, &more)).unwrap(), &mut out);
+            assert!(h.fu.as_ref().map_or(0, Vec::len) <= MAX_FRAME + 60_002);
+        }
+        // A frame after it, whole, is taken: a keyframe with its SPS and PPS.
+        let key = stap(&[SPS, PPS, &[0x65, 1, 2, 3]]);
+        h.push(&parse(&rtp_packet(500, 10, true, &key)).unwrap(), &mut out);
+        assert_eq!(out.len(), 1, "the whole frame after it");
+        assert_eq!(h.held, 0);
+    }
 
     fn stap(nals: &[&[u8]]) -> Vec<u8> {
         let mut b = vec![24];

@@ -410,18 +410,28 @@ fn minor_of(d: Dec, units: u32) -> Option<i64> {
     i64::try_from(d.mantissa()).ok().filter(|_| d.scale() == units)
 }
 
+/// Money past what `money.of` takes, as `money.of` says it: an error value, where `money.add`,
+/// `money.sub` and `money.mul` made amounts that only `money.to_minor` refused, with "integer overflow"
+/// (FEEDBACK49.md, Q-605; branch main).
+fn in_range(m: Money) -> Value {
+    match minor_of(m.amount, m.units) {
+        Some(_) => m.value(),
+        None => Value::err(Value::str(format!("{} {} is too large an amount", m.amount, m.code))),
+    }
+}
+
 fn add(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (a, b) = (money(&args, 0, "money.add", line)?, money(&args, 1, "money.add", line)?);
     same_currency(&a, &b, "add", line)?;
     let sum = a.amount.add(b.amount).map_err(dec_err(line))?;
-    Ok(Money { amount: to_units(sum, a.units, Rounding::HalfEven, line)?, ..a }.value())
+    Ok(in_range(Money { amount: to_units(sum, a.units, Rounding::HalfEven, line)?, ..a }))
 }
 
 fn sub(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (a, b) = (money(&args, 0, "money.sub", line)?, money(&args, 1, "money.sub", line)?);
     same_currency(&a, &b, "subtract", line)?;
     let diff = a.amount.sub(b.amount).map_err(dec_err(line))?;
-    Ok(Money { amount: to_units(diff, a.units, Rounding::HalfEven, line)?, ..a }.value())
+    Ok(in_range(Money { amount: to_units(diff, a.units, Rounding::HalfEven, line)?, ..a }))
 }
 
 /// `money.mul(m, factor, mode)`: times a decimal or an int, rounded to the
@@ -436,7 +446,7 @@ fn mul(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     };
     let mode = mode(&args, 2, "money.mul", line)?;
     let product = m.amount.mul(factor).map_err(dec_err(line))?;
-    Ok(Money { amount: to_units(product, m.units, mode, line)?, ..m }.value())
+    Ok(in_range(Money { amount: to_units(product, m.units, mode, line)?, ..m }))
 }
 
 fn neg(_: &mut Interp, args: Vec<Value>, line: u32) -> R {

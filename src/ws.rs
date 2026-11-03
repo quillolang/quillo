@@ -20,7 +20,8 @@ pub fn is_upgrade(req: &HttpRequest) -> bool {
 
 /// A WebSocket the server writes to. Each `send` reports whether the page
 /// is still there.
-pub struct Socket(std::net::TcpStream);
+/// The connection, and how long one frame may take to write (none: as long as it takes).
+pub struct Socket(std::net::TcpStream, Option<std::time::Duration>);
 
 impl Socket {
     /// Completes the handshake on the request's connection; `None` if the
@@ -49,7 +50,7 @@ impl Socket {
             accept
         );
         stream.write_all(handshake.as_bytes()).ok()?;
-        Some(Socket(stream))
+        Some(Socket(stream, None))
     }
 
     pub fn send(&mut self, text: &str) -> bool {
@@ -66,6 +67,13 @@ impl Socket {
 
     /// The same connection, to read from on another thread while this one
     /// writes.
+    /// How long one frame may take to write to a page that does not read, after which it
+    /// fails and the connection ends: for the whole frame, as a page that takes a few bytes
+    /// now and then would hold each write's own timeout off (FEEDBACK49.md, Q-594; branch main).
+    pub fn write_timeout(&mut self, d: std::time::Duration) {
+        self.1 = Some(d);
+    }
+
     pub fn reader(&self, max: usize) -> std::io::Result<Reader<std::net::TcpStream>> {
         Ok(Reader::new(self.0.try_clone()?, max))
     }
@@ -120,7 +128,24 @@ impl Socket {
             }
         }
         f.extend_from_slice(payload);
-        self.0.write_all(&f).and_then(|_| self.0.flush()).is_ok()
+        let Some(wait) = self.1 else {
+            return self.0.write_all(&f).and_then(|_| self.0.flush()).is_ok();
+        };
+        let until = std::time::Instant::now() + wait;
+        let mut rest = &f[..];
+        while !rest.is_empty() {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() || self.0.set_write_timeout(Some(left)).is_err() {
+                return false;
+            }
+            match self.0.write(rest) {
+                Ok(0) => return false,
+                Ok(n) => rest = &rest[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return false,
+            }
+        }
+        true
     }
 }
 
@@ -192,8 +217,15 @@ impl<R: Read> Reader<R> {
                 }
                 n => n as u64,
             };
-            let so_far = self.partial.as_ref().map_or(0, |(_, d)| d.len()) as u64;
-            if len + so_far > self.max as u64 {
+            // A control frame is short and whole (RFC 6455 5.5); a message's parts are counted
+            // without wrapping, where a length of u64::MAX after a first part wrapped to 0 and
+            // passed, and the allocation panicked the channel's thread (FEEDBACK49.md, Q-593;
+            // branch main).
+            if opcode & 0x8 != 0 && (len > 125 || !fin) {
+                return Err(bad("a control frame longer than 125 bytes, or in parts"));
+            }
+            let so_far = if opcode == 0x0 { self.partial.as_ref().map_or(0, |(_, d)| d.len()) as u64 } else { 0 };
+            if len.checked_add(so_far).map_or(true, |n| n > self.max as u64) {
                 return Err(bad("message too large"));
             }
             let mut mask = [0u8; 4];

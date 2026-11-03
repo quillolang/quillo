@@ -235,7 +235,7 @@ fn navigate_in_a_single_page_app_goes_to_the_spot_again() {
 /// 'pushState' on 'History' ...". Expected: the other site loaded, as on a
 /// page where nothing reads url(), and as a link to it is followed.
 #[test]
-#[ignore = "bug: navigate() to another origin in a single-page app throws from pushState (runtime.js:5202)"]
+#[ignore = "bug: navigate() to another origin in a single-page app throws from pushState (runtime.js, `navigate`)"]
 fn navigate_to_another_site_from_a_single_page_app_loads_it() {
     let Some(chrome) = browser() else { return };
     let r = run_page(&chrome, "cover-nav.qwe", "/spa", "cover-nav-away.js", &[]);
@@ -290,7 +290,8 @@ fn components_inside_another_are_taken_up_or_made_again_by_themselves() {
 /// a #hash, which the guide says is made again in the browser. Expected:
 /// "as written", made again once, no errors; actual: "", 0, ["text"].
 #[test]
-#[ignore = "bug: a Mismatch in a dynamic text part is reported and emptied, not made again (runtime.js:4492)"]
+// It was ignored as a bug that is fixed: run, so it stays fixed (FEEDBACK49.md, Q-609; branch
+// main).
 fn a_changed_text_inside_a_component_makes_it_again() {
     let Some(chrome) = browser() else { return };
     let r = run_page(&chrome, "cover-remade.qwe", "/", "cover-remade-text.js", &[]);

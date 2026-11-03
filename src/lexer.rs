@@ -608,6 +608,18 @@ impl Lexer {
     /// Lexes a "..." or '...' string, starting at the opening quote. Its
     /// text is taken as it is; `${}` interpolation needs a `template`.
     pub fn lex_string(&mut self) -> Result<Vec<StrPart>, QuilloError> {
+        self.lex_quoted(false).map(|buf| vec![StrPart::Lit(buf)])
+    }
+
+    /// Lexes an attribute's "...", starting at the opening quote: plain text up to the next
+    /// `"`, as in HTML and JSX, so `title="C:\new"` and `pattern="\d{3}"` keep their
+    /// backslashes, where they were Quillo's escapes (FEEDBACK48.md, Q-563; branch main).
+    /// A `\"`, an escape before, would now end the string: refused, with what to write.
+    pub fn lex_attr_string(&mut self) -> Result<String, QuilloError> {
+        self.lex_quoted(true)
+    }
+
+    fn lex_quoted(&mut self, plain: bool) -> Result<String, QuilloError> {
         let start = self.line;
         let unterminated = || QuilloError::new("unexpected end of input: unterminated string", start);
         let quote = self.bump().unwrap_or('"');
@@ -616,8 +628,14 @@ impl Lexer {
         loop {
             let c = self.bump().ok_or_else(unterminated)?;
             match c {
+                '\\' if plain && self.peek_char() == Some(quote) => {
+                    return Err(QuilloError::new(
+                        "`\\\"` in an attribute: its text is plain, as in HTML, so a backslash is a backslash and this `\"` ends it; write `&quot;` for a quote (or the value as {\"...\"})",
+                        self.line,
+                    ));
+                }
                 c if c == quote => break,
-                '\\' => buf.push(self.escape(&unterminated)?),
+                '\\' if !plain => buf.push(self.escape(&unterminated)?),
                 '$' if self.peek_char() == Some('{') => {
                     let mut name = String::new();
                     let mut n = 1;
@@ -639,7 +657,7 @@ impl Lexer {
                 set.insert((buf.clone(), name));
             }
         }
-        Ok(vec![StrPart::Lit(buf)])
+        Ok(buf)
     }
 
     /// Lexes a `template ${with} interpolation`, starting at the backtick.

@@ -109,5 +109,7 @@ fn the_rarer_component_forms_work_in_a_page() {
 fn true_as_a_child_is_the_same_text_in_the_browser() {
     let Some(chrome) = chrome().filter(|_| node_ready()) else { return };
     let r = run_page(&chrome, "forms.qwe", "/", "forms.js");
-    assert_eq!(r["flag"], "true");
+    // Nothing, as on the server, as in React (FEEDBACK48.md, Q-564; branch main), where Q-118
+    // had both show "true".
+    assert_eq!(r["flag"], "");
 }

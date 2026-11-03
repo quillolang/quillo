@@ -696,7 +696,8 @@ fn a_unix_socket_is_on_this_machine() {
     let port = pg.url.rsplit(':').next().unwrap().split('/').next().unwrap();
     let dir = data_dir("socket").display().to_string().replace('/', "%2F");
     let mut it = program("socket", &format!("postgres://quillo@{}:{}/postgres", dir, port), "");
-    assert_eq!(v(&mut it, "1"), "1");
+    // The database itself, over the socket: before, `1` passed while the open had failed.
+    assert_eq!(v(&mut it, "1 + 1"), "2");
 }
 
 #[test]
@@ -756,4 +757,30 @@ fn an_older_tls_is_checked_too() {
     restart(&pg, "tls12");
     let mut it = program("tls12", &format!("{}?sslmode=require", pg.url), "");
     assert_eq!(eval(&mut it, "db.one(\"select version from pg_stat_ssl where pid = pg_backend_pid()\").version"), "\"TLSv1.2\"");
+}
+
+// FEEDBACK49.md, Q-601: after a restart, the first transaction on each idle pooled connection
+// failed with "internal error", as the connection the server had ended was handed out unchecked.
+#[test]
+fn a_transaction_on_connections_the_server_ended_while_idle_begins_on_new_ones() {
+    let Some(pg) = server("ended-idle") else { return };
+    let url = format!("{}?pool_size=3", pg.url);
+    let mut it = quillo::Interp::new(".");
+    let run = |it: &mut quillo::Interp, src: &str| it.load_source(src, "t.qwe").map(|v| v.display()).unwrap_or_else(|e| format!("error: {}", e));
+    assert_eq!(run(&mut it, &format!("db.open(\"{}\")\ndb.exec(\"create table if not exists kept (n int)\")\n\"ok\"", url)), "ok");
+    // Three connections in the pool, each used once and idle.
+    assert_eq!(run(&mut it, "parallel([() => db.transaction(() => db.one(\"select 1 as x from pg_sleep(0.2)\").x), () => db.transaction(() => db.one(\"select 1 as x from pg_sleep(0.2)\").x), () => db.transaction(() => db.one(\"select 1 as x from pg_sleep(0.2)\").x)])"), "[1, 1, 1]");
+    // The server ends them, as a restart or a failover does.
+    psql(&pg, &pg.url, &["select pg_terminate_backend(pid) from pg_stat_activity where datname = current_database() and pid <> pg_backend_pid()"]);
+    std::thread::sleep(Duration::from_millis(200));
+    for i in 0..4 {
+        let r = run(&mut it, &format!("db.transaction(() => {{\n    db.exec(\"insert into kept values (?)\", {})\n    \"in\"\n}})", i));
+        assert_eq!(r, "in", "transaction {}", i);
+    }
+    assert_eq!(run(&mut it, "db.one(\"select count(*) as n from kept\").n"), "4");
+    // And a query outside one, on a connection ended since: told as a connection's error.
+    psql(&pg, &pg.url, &["select pg_terminate_backend(pid) from pg_stat_activity where datname = current_database() and pid <> pg_backend_pid()"]);
+    std::thread::sleep(Duration::from_millis(200));
+    let kinds = run(&mut it, "let r = db.transaction(() => db.one(\"select 1 as one\").one)\nis_err(r) ? db.error_kind(r) : r");
+    assert!(kinds == "1" || kinds == "connection", "{}", kinds);
 }

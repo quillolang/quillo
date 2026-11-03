@@ -398,6 +398,10 @@ pub struct HtmlEl {
     /// `${name}` is written, for `quillo check` to ask about: once parsed, `$` is
     /// text like `{"$"}`, which means it (FEEDBACK20.md, Q-170; branch feedback20-fixes).
     pub dollars: Vec<u32>,
+    /// Text and an inline element on lines of their own, which JSX's rule joins with no space
+    /// ("Hello,<b>Ann</b>"): the line, and the two as `quillo check` names them (FEEDBACK48.md,
+    /// Q-573; branch main).
+    pub joined: Vec<(u32, String, String)>,
     /// What rendering needs to know of it, worked out when it is parsed.
     pub facts: ElFacts,
 }

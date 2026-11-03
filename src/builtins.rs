@@ -1665,9 +1665,17 @@ fn json_parse(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     })
 }
 
+/// The most JSON `json.stringify` and an answer make, and how deep (FEEDBACK49.md, Q-606 and
+/// Q-592; branch main).
+pub const JSON_MOST: usize = 256 << 20;
+pub const JSON_DEEPEST: usize = 10_000;
+
 fn json_stringify(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
     // As `str` is (FEEDBACK26.md, Q-197; branch feedback26-fixes).
     let v = arg(&args, 0);
+    if let Err(why) = v.json_fits(JSON_MOST, JSON_DEEPEST) {
+        return Ok(Value::err(Value::str(format!("json.stringify: {}", why))));
+    }
     let j = if crate::value::hiding() { crate::server::hidden(&v).unwrap_or(v).to_json() } else { v.to_json() };
     let pretty = arg(&args, 1).truthy();
     let s = if pretty { serde_json::to_string_pretty(&j) } else { serde_json::to_string(&j) };

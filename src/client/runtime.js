@@ -4684,8 +4684,9 @@ function claimText(c, t) {
 
 // The nodes for value `v` (text, markup, a list of them), into `out`.
 function put(v, c, out) {
-  // `true` is text, as the server writes it (FEEDBACK16.md, Q-118; branch feedback20-fixes).
-  if (isNil(v) || v === false) return;
+  // `true` shows nothing, as `false` and null do, as in React, and as the server writes it; a
+  // function too (FEEDBACK48.md, Q-564 and Q-571; branch main).
+  if (isNil(v) || typeof v === "boolean" || typeof v === "function") return;
   if (Array.isArray(v)) { for (const x of v) put(x, c, out); return; }
   if (v instanceof Html) { v.make(c, out); return; }
   const t = display(v);
@@ -5050,24 +5051,56 @@ function spreadInto(el, get) {
 // those it has written out, the key and the class (added to its own).
 // Names are compared as the browser does (`ACTION` is `action`), so a key
 // cannot stand in for a written attribute.
-function spreadAttrs(maps, written) {
+// A key follows the rules of the same one written out: `onClick: f` is a handler, `@click`, as
+// the parser makes it (`onChange` on an <input> is `@input`), where it was dropped;
+// `className` is `class` and `htmlFor` is `for`, as React's (FEEDBACK48.md, Q-567; branch main).
+function spreadAttrs(maps, written, tag) {
   const o = {};
   const seen = new Set(written.map(attrKey));
   for (const m of maps) {
     if (isNil(m)) continue;
     if (!isMap(m)) fail(`\`{...}\` needs a map, got ${typeName(m)}`);
-    for (const k of Object.keys(m)) {
-      const n = attrKey(k);
-      if (n === "key" || n === "class" || seen.has(n)) continue;
+    for (let k of Object.keys(m)) {
+      const v = m[k];
+      const lower = k.toLowerCase();
+      let n = attrKey(k);
+      if (typeof v === "function" && /^on[a-z_-]+$/.test(lower)) n = k = "@" + reactEvent(tag, k, lower.slice(2));
+      else if (n === "htmlfor") n = k = "for";
+      if (n === "key" || n === "class" || n === "classname" || seen.has(n)) continue;
       if (k[0] !== "@" && !spreadAttrOk(k)) continue;
       seen.add(n);
-      o[k] = m[k];
+      o[k] = v;
     }
   }
   return o;
 }
 
-const spreadClasses = (maps) => maps.filter((m) => isMap(m) && hasOwn(m, "class")).map((m) => m.class);
+// The DOM event React's handler `written` (`onDoubleClick`, as `doubleclick`) listens for, as
+// the parser's `react_event` has it; a `…Capture` is refused, as written out.
+function reactEvent(tag, written, ev) {
+  if (ev === "change" && (tag === "input" || tag === "textarea")) return "input";
+  if (ev === "doubleclick") return "dblclick";
+  if (ev === "focus") return "focusin";
+  if (ev === "blur") return "focusout";
+  if (ev.length > 7 && ev.endsWith("capture") && ev !== "gotpointercapture" && ev !== "lostpointercapture") {
+    const base = written.slice(2, written.length - 7);
+    fail(`\`${written}\` listens before the element's own handlers, as React's \`…Capture\` does, which Quillo has no form for: write \`on${base[0].toUpperCase()}${base.slice(1)}\` (or \`@${reactEvent(tag, "on" + base, base.toLowerCase())}\`), which hears it as it bubbles up`);
+  }
+  return ev;
+}
+
+// `className` in a spread is its `class` (FEEDBACK48.md, Q-567; branch main).
+// `class={...}`'s words, as clsx gives them and the server writes them: a map's keys whose
+// values are truthy, a list's items (lists in it flattened, null and bools skipped); a map or a
+// list was its text, and after an update a scramble of words (FEEDBACK48.md, Q-566; branch main).
+function clsWords(x, out) {
+  if (isNil(x) || typeof x === "boolean" || x === "") return;
+  if (Array.isArray(x)) { for (const y of x) clsWords(y, out); return; }
+  if (isMap(x)) { for (const k of Object.keys(x)) if (k !== "" && truthy(x[k])) out.push(k); return; }
+  out.push(display(x));
+}
+
+const spreadClasses = (maps) => maps.filter(isMap).flatMap((m) => Object.keys(m).filter((k) => k === "class" || k.toLowerCase() === "classname").map((k) => m[k]));
 
 // Several values side by side, each fixed or following what it reads.
 function frag(items) {
@@ -5361,9 +5394,30 @@ function classTokens(el, was, now) {
 }
 
 // `style={{ color: c }}`: a property for each key, as on the server (FEEDBACK35.md, Q-429;
-// branch feedback27-35-fixes).
+// branch feedback27-35-fixes). A number is in pixels but 0, on a custom property and on
+// React's unitless properties, and `msFlex` is `-ms-flex`, as on the server (FEEDBACK48.md,
+// Q-565; branch main).
+const UNITLESS = new Set(("animation-iteration-count aspect-ratio border-image-outset border-image-slice border-image-width " +
+  "box-flex box-flex-group box-ordinal-group column-count columns fill-opacity flex flex-grow flex-negative flex-order " +
+  "flex-positive flex-shrink flood-opacity font-weight grid-area grid-column grid-column-end grid-column-span " +
+  "grid-column-start grid-row grid-row-end grid-row-span grid-row-start line-clamp line-height opacity order orphans " +
+  "scale stop-opacity stroke-dasharray stroke-dashoffset stroke-miterlimit stroke-opacity stroke-width tab-size widows " +
+  "z-index zoom").split(" "));
+const styleName = (k) => (k.startsWith("--") ? k : k.replace(/_/g, "-").replace(/[A-Z]/g, (c) => "-" + c.toLowerCase()).replace(/^ms-/, "-ms-"));
+const styleNonzero = (v) => (typeof v === "number" ? v !== 0 && Number.isFinite(v) : typeof v === "bigint" ? v !== 0n : v instanceof Dec && v.m !== 0n);
+const stylePx = (n, v) => styleNonzero(v) && !n.startsWith("--") && !UNITLESS.has(n.replace(/^-(webkit|moz|ms|o)-/, "")) ? "px" : "";
 const styleText = (m) => Object.keys(m).filter((k) => !isNil(m[k]) && m[k] !== false)
-  .map((k) => (k.startsWith("--") ? k : k.replace(/_/g, "-").replace(/[A-Z]/g, (c) => "-" + c.toLowerCase())) + ": " + display(m[k])).join("; ");
+  .map((k) => { const n = styleName(k); return n + ": " + display(m[k]) + stylePx(n, m[k]); }).join("; ");
+
+// The text a bool is for an attribute whose values are words, as on the server (see its
+// `bool_attr_text`): "true"/"false" for aria-*, data-*, draggable, spellcheck and
+// contenteditable, "yes"/"no" for translate; null for HTML's boolean attributes
+// (FEEDBACK48.md, Q-564; branch main).
+function boolText(k, v) {
+  const n = k.toLowerCase();
+  if (n === "translate") return v ? "yes" : "no";
+  return (n.length > 5 && (n.startsWith("aria-") || n.startsWith("data-"))) || n === "draggable" || n === "spellcheck" || n === "contenteditable" ? String(v) : null;
+}
 
 function setProp(el, k, v, old) {
   if (k === "style" && isMap(v)) v = styleText(v);
@@ -5399,6 +5453,7 @@ function setProp(el, k, v, old) {
     (k === "style" ? styleApply : classTokens)(el, typeof old === "string" ? old : "", v);
     return;
   }
+  if (typeof v === "boolean") { const t = boolText(k, v); if (t !== null) v = t; }
   if (isNil(v) || v === false) { el.removeAttribute(k); return; }
   // Only text written in the program goes there (set with the template),
   // and a page for a sandboxed frame that is kept away from the site.
@@ -6358,8 +6413,9 @@ W.Html = Html;
 W.display = display;
 W.repr = repr;
 W.short = short;
-W.cls = (xs) => xs.filter((x) => !isNil(x) && x !== false).map(display).join(" ");
-W.cls1 = (x) => (isNil(x) || x === false ? "" : display(x));
+W.cls = (xs) => { const out = []; clsWords(xs, out); return out.join(" "); };
+W.cls1 = (x) => (typeof x === "string" ? x : W.cls([x]));
+W.nofn = (v) => (typeof v === "function" ? null : v);
 W.component = (name, params, render) => {
   render.$name = name;
   render.$p = params;

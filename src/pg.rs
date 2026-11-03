@@ -49,7 +49,7 @@ pub struct Pool {
     config: postgres::Config,
     /// The same, for the connections requests share (`Lanes`).
     async_config: tokio_postgres::Config,
-    tls: tokio_postgres_rustls::MakeRustlsConnect,
+    tls: Connector,
     idle: Mutex<(Vec<Conn>, usize)>,
     freed: Condvar,
     max: usize,
@@ -305,6 +305,51 @@ fn take_options(url: &str) -> Result<Options, String> {
 
 // ---- TLS -----------------------------------------------------------------
 
+/// rustls's connector, which also takes a name it cannot check (a Unix socket's, given as
+/// "") and fails only if TLS is then tried: tokio-postgres asks for a connector for every
+/// host, TLS or not, and rustls refused the socket's empty name, so no socket could be opened
+/// (found by FEEDBACK49.md, Q-602, which made the failed `db.open` stop the program; branch
+/// main).
+#[derive(Clone)]
+pub struct Connector(tokio_postgres_rustls::MakeRustlsConnect);
+
+impl<S> tokio_postgres::tls::MakeTlsConnect<S> for Connector
+where
+    tokio_postgres_rustls::MakeRustlsConnect: tokio_postgres::tls::MakeTlsConnect<S>,
+    <<tokio_postgres_rustls::MakeRustlsConnect as tokio_postgres::tls::MakeTlsConnect<S>>::TlsConnect as tokio_postgres::tls::TlsConnect<S>>::Future: Send + 'static,
+{
+    type Stream = <tokio_postgres_rustls::MakeRustlsConnect as tokio_postgres::tls::MakeTlsConnect<S>>::Stream;
+    type TlsConnect = Named<<tokio_postgres_rustls::MakeRustlsConnect as tokio_postgres::tls::MakeTlsConnect<S>>::TlsConnect>;
+    type Error = std::convert::Infallible;
+
+    fn make_tls_connect(&mut self, domain: &str) -> Result<Self::TlsConnect, Self::Error> {
+        Ok(Named(self.0.make_tls_connect(domain).ok()))
+    }
+}
+
+/// A connector for a host, or none for a name TLS cannot check.
+pub struct Named<T>(Option<T>);
+
+impl<S, T> tokio_postgres::tls::TlsConnect<S> for Named<T>
+where
+    T: tokio_postgres::tls::TlsConnect<S>,
+    T::Future: Send + 'static,
+{
+    type Stream = T::Stream;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<T::Stream, Self::Error>> + Send>>;
+
+    fn connect(self, stream: S) -> Self::Future {
+        match self.0 {
+            Some(t) => {
+                let f = t.connect(stream);
+                Box::pin(async move { f.await.map_err(Into::into) })
+            }
+            None => Box::pin(async { Err("TLS cannot check this host's name (a Unix socket has none): connect without TLS, sslmode=disable".into()) }),
+        }
+    }
+}
+
 /// libpq's `sslmode`, less `allow` (plain first, which leaves the
 /// password to whoever answers).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -357,8 +402,16 @@ impl Tls {
             #[allow(unreachable_patterns)]
             _ => false,
         }) || config.get_hostaddrs().iter().any(|a| !a.is_loopback());
+        // Over a Unix socket, as libpq has it, no TLS: it was tried, with the socket's path for
+        // the server's name, and failed (found by FEEDBACK49.md, Q-602, which made a failed
+        // `db.open` stop the program; branch main).
+        #[cfg(unix)]
+        let socket = !config.get_hosts().is_empty() && config.get_hosts().iter().all(|h| matches!(h, Host::Unix(_)));
+        #[cfg(not(unix))]
+        let socket = false;
         match self.mode {
             Some(m) => m,
+            None if socket => SslMode::Disable,
             None if remote || self.root.as_deref() == Some("system") => SslMode::VerifyFull,
             None => SslMode::Prefer,
         }
@@ -376,7 +429,7 @@ impl Tls {
     }
 
     /// Sets the driver's mode in `config`, and makes the TLS connector.
-    fn settle(&self, config: &mut tokio_postgres::Config) -> Result<tokio_postgres_rustls::MakeRustlsConnect, String> {
+    fn settle(&self, config: &mut tokio_postgres::Config) -> Result<Connector, String> {
         use tokio_postgres::config::SslMode as Driver;
         let mode = self.mode_for(config);
         config.ssl_mode(match mode {
@@ -384,7 +437,7 @@ impl Tls {
             SslMode::Prefer => Driver::Prefer,
             _ => Driver::Require,
         });
-        self.client_config(mode).map(tokio_postgres_rustls::MakeRustlsConnect::new)
+        self.client_config(mode).map(|c| Connector(tokio_postgres_rustls::MakeRustlsConnect::new(c)))
     }
 
     fn client_config(&self, mode: SslMode) -> Result<rustls::ClientConfig, String> {
@@ -679,7 +732,7 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
 /// (`Pool::checkout`).
 pub struct Lanes {
     config: tokio_postgres::Config,
-    tls: tokio_postgres_rustls::MakeRustlsConnect,
+    tls: Connector,
     slots: Vec<Mutex<Option<Arc<Lane>>>>,
 }
 
@@ -1509,6 +1562,12 @@ mod tests {
         assert_eq!(mode("postgres://u:p@db.internal/app?sslmode=require"), SslMode::Require);
         for local in ["postgres://u@localhost/app", "postgres://u@127.0.0.1:5432/app", "postgres://u@[::1]/app"] {
             assert_eq!(mode(local), SslMode::Prefer, "{}", local);
+        }
+        // A Unix socket has no TLS, as in libpq, unless the URL says so.
+        #[cfg(unix)]
+        {
+            assert_eq!(mode("postgres://u@%2Ftmp%2Fpg:5432/app"), SslMode::Disable);
+            assert_eq!(mode("postgres://u@%2Ftmp%2Fpg:5432/app?sslmode=require"), SslMode::Require);
         }
         // The operating system's CAs: only to check the server's name too.
         assert_eq!(mode("postgres://u@localhost/app?sslrootcert=system"), SslMode::VerifyFull);

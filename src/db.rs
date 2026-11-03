@@ -478,8 +478,15 @@ fn kind_of(msg: &str) -> Option<&'static str> {
             "23502" => return Some("not_null"),
             "23514" => return Some("check"),
             "40001" | "40p01" | "55p03" => return Some("conflict"),
+            // The server ended the connection (a restart, a failover, an administrator), or
+            // it could not be made (FEEDBACK49.md, Q-601; branch main).
+            "57p01" | "57p02" | "57p03" => return Some("connection"),
+            c if c.starts_with("08") => return Some("connection"),
             _ => {}
         }
+    }
+    if has(&["terminating connection", "server closed the connection", "connection closed", "connection reset", "broken pipe", "connection refused"]) {
+        return Some("connection");
     }
     // MariaDB's own words, for a failed check (4025) and for a row changed since the
     // snapshot (1020), which a transaction retries on (FEEDBACK16.md, Q-122; branch
@@ -1379,6 +1386,13 @@ fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             }
             Ok(Value::Nil)
         }
+        // As the program starts, a database that cannot be opened stops it, where it ran on
+        // one in memory, answered writes 200, and lost them at the next start (FEEDBACK49.md,
+        // Q-602; branch main). Later, opening another gives the error, as before.
+        Err(e) if crate::value::loading() => fail(
+            line,
+            format!("db.open: {}: the program's database cannot be opened, so the program does not start (open \":memory:\" for one in memory on purpose)", e),
+        ),
         Err(e) => Ok(db_err(e)),
     }
 }
@@ -1536,6 +1550,7 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Backend::Sqlite(m) => {
             let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             (|| {
+                tx_gone(&b, &c)?;
                 if params.is_empty() {
                     let before = c.is_autocommit();
                     c.execute_batch(&sql).map_err(|e| e.to_string())?;
@@ -2178,7 +2193,10 @@ fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, l
         it.wrote_req = Some(crate::httpd::request_number());
     }
     let res = match &*b {
-        Backend::Sqlite(m) => rows(&m.lock().unwrap_or_else(std::sync::PoisonError::into_inner), &sql, &params, limit),
+        Backend::Sqlite(m) => {
+            let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            tx_gone(&b, &c).and_then(|_| rows(&c, &sql, &params, limit))
+        }
         Backend::Postgres(pool) => match shared_lanes(it, &b, pool) {
             Some(lanes) => awaited(crate::httpd::await_elsewhere(Box::pin(lanes.query(crate::httpd::request_number(), sql.clone(), params, limit)))),
             None => {
@@ -2252,6 +2270,27 @@ fn caught(it: &mut Interp, body: &mut dyn FnMut(&mut Interp) -> R) -> R {
 /// error that ended it), and whether the database gave up on it because of
 /// another transaction (then it is worth another try; told only for the
 /// outermost transaction, the one that can be tried again).
+/// What a statement in a transaction SQLite ended is told.
+const TX_GONE: &str = "the database ended this transaction after an error, and rolled back all it held, so nothing more runs in it";
+
+thread_local! {
+    /// The SQLite databases with a transaction of `db.transaction`'s open on this thread (no
+    /// other request runs on it meanwhile: see `Interp::unlocked`).
+    static IN_TX: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A statement inside a transaction SQLite has ended by itself: refused, where it was
+/// committed on its own (FEEDBACK49.md, Q-591; branch main). Only on the database whose
+/// transaction it is: another's statements, the system database's among them, run as ever
+/// (found in review).
+fn tx_gone(b: &Arc<Backend>, c: &Connection) -> Result<(), String> {
+    let mine = Arc::as_ptr(b) as usize;
+    if c.is_autocommit() && IN_TX.with(|t| t.borrow().contains(&mine)) {
+        return Err(TX_GONE.to_string());
+    }
+    Ok(())
+}
+
 pub(crate) fn attempt(
     it: &mut Interp,
     on: Option<usize>,
@@ -2280,10 +2319,29 @@ pub(crate) fn attempt(
             }
             let mark = tx_begin(it);
             it.sqlite_tx += 1;
+            let mine = Arc::as_ptr(&b) as usize;
+            IN_TX.with(|t| t.borrow_mut().push(mine));
             crate::httpd::hold_in_place(true);
             let r = caught(it, body);
             crate::httpd::hold_in_place(false);
+            IN_TX.with(|t| {
+                let mut t = t.borrow_mut();
+                if let Some(i) = t.iter().rposition(|p| *p == mine) {
+                    t.remove(i);
+                }
+            });
             it.sqlite_tx -= 1;
+            // SQLite ended it itself (a full disk, an I/O error) and rolled back all it held:
+            // the release would fail, and what ran after the error was committed by itself
+            // (FEEDBACK49.md, Q-591; branch main). Nothing more ran in it (`tx_gone`).
+            if m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_autocommit() {
+                tx_end(it, mark, false);
+                let why = match &r {
+                    Ok(Value::Err(e, ..)) => format!(": {}", e.display().trim_start_matches("db: ")),
+                    _ => String::new(),
+                };
+                return (Ok(db_err(format!("{}{}", TX_GONE, why))), false);
+            }
             let commit = ok(&r);
             let end = match (commit, immediate) {
                 (true, true) => "commit",
@@ -2329,7 +2387,33 @@ pub(crate) fn attempt(
                 tx.depth
             };
             let begin = if depth == 1 { crate::txn::begin_sql(b.is_mysql(), opts.isolation) } else { format!("savepoint quillo_tx_{}", depth) };
-            let started = pooled_run(it, &b, move |c| c.batch(&begin));
+            let mut started = { let begin = begin.clone(); pooled_run(it, &b, move |c| c.batch(&begin)) };
+            // A pooled connection the server ended while it sat idle (a restart, a failover)
+            // fails its first statement: nothing has run, so another is taken and the
+            // transaction begun on it, where the program was given "internal error"
+            // (FEEDBACK49.md, Q-601; branch main).
+            let mut tries = 0;
+            while depth == 1 && tries < 3 && started.as_ref().err().is_some_and(|e| kind_of(e) == Some("connection")) {
+                tries += 1;
+                let dead = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().find(|t| Arc::ptr_eq(&t.backend, &b)).and_then(|t| t.conn.take());
+                if let Some(d) = dead {
+                    b.discard(d);
+                }
+                match checkout_for_tx(it, &b) {
+                    Ok(mut c) => {
+                        c.watch_conflicts(true);
+                        if let Some(t) = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().find(|t| Arc::ptr_eq(&t.backend, &b)) {
+                            t.conn = Some(c);
+                        }
+                    }
+                    Err(e) => {
+                        started = Err(e);
+                        break;
+                    }
+                }
+                let begin = begin.clone();
+                started = pooled_run(it, &b, move |c| c.batch(&begin));
+            }
             let mark = tx_begin(it);
             let r = match started {
                 Ok(()) => caught(it, body),
@@ -2864,6 +2948,25 @@ mod tests {
 
     // The first words read in place, as every `db.exec` reads them: any case, past comments
     // and spaces, and a transaction's control found among a script's statements.
+    // FEEDBACK49.md, Q-601: a connection the server ended is a kind of its own.
+    #[test]
+    fn a_connection_the_server_ended_is_told_as_one() {
+        for m in [
+            "db: terminating connection due to administrator command [57P01]",
+            "db: the database system is shutting down [57P03]",
+            "db: connection failure [08006]",
+            "db: connection closed",
+            "db: Broken pipe (os error 32)",
+            "db: error connecting to server: Connection refused (os error 61)",
+            "db: server closed the connection unexpectedly",
+        ] {
+            assert_eq!(kind_of(m), Some("connection"), "{}", m);
+        }
+        for m in ["db: syntax error at or near \"x\" [42601]", "db: relation \"t\" does not exist [42P01]", "db: duplicate key value violates unique constraint [23505]"] {
+            assert_ne!(kind_of(m), Some("connection"), "{}", m);
+        }
+    }
+
     #[test]
     fn the_first_words_are_read_in_place() {
         assert_eq!(two_words("  -- a note\n /* and */ Start   Transaction;"), ("Start", "Transaction"));

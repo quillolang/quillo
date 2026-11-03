@@ -389,6 +389,50 @@ impl Value {
         }
     }
 
+    /// Whether this value's JSON fits in `max` bytes and `depth` levels, counted without making
+    /// it, each shared part as often as it appears: `[xs, xs]` twenty-four times over made a
+    /// 100 MB text from 3.5 GB of memory, and a list nested 100,000 deep overflowed the stack
+    /// and stopped the server (FEEDBACK49.md, Q-606 and Q-592; branch main). Ints are counted
+    /// as written; floats and decimals at their longest.
+    pub fn json_fits(&self, max: usize, depth: usize) -> Result<(), String> {
+        let mut todo: Vec<(&Value, usize)> = vec![(self, 0)];
+        let mut bytes = 0usize;
+        while let Some((v, d)) = todo.pop() {
+            if d > depth {
+                return Err(format!("it is nested more than {} deep", depth));
+            }
+            bytes += match v {
+                Value::Nil => 4,
+                Value::Bool(_) => 5,
+                Value::Int(n) => n.unsigned_abs().checked_ilog10().map_or(1, |l| l as usize + 1) + (*n < 0) as usize,
+                Value::Float(_) => 24,
+                Value::Dec(_) => 42,
+                Value::Str(s) | Value::Html(s) => s.len() + 2,
+                Value::List(l) => {
+                    todo.extend(l.iter().map(|x| (x, d + 1)));
+                    2 + l.len()
+                }
+                Value::Map(m) => {
+                    for (k, x) in m.iter() {
+                        bytes += k.len() + 3;
+                        todo.push((x, d + 1));
+                    }
+                    2 + m.len()
+                }
+                Value::Err(e, ..) => {
+                    todo.push((e, d + 1));
+                    11
+                }
+                Value::Response(_) => 16,
+                Value::Func(_) | Value::Builtin(..) => 24,
+            };
+            if bytes > max {
+                return Err(format!("its JSON would be more than {} MiB", max >> 20));
+            }
+        }
+        Ok(())
+    }
+
     /// The JSON text of `to_json`, written straight into `out`.
     pub fn json_into(&self, out: &mut Vec<u8>) {
         match self {

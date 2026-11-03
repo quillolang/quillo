@@ -277,7 +277,7 @@ fn a_source_goes_instead_of_a_camera_the_page_may_not_have() {
 /// incompatible with codec parameters"), a new encoder is made for the next,
 /// and no sound goes.
 #[test]
-#[ignore = "bug: runtime.js mediaPublisher sends no picture above 1280x720 (line 3777) and no sound of more than 2 channels (line 3820)"]
+#[ignore = "bug: runtime.js mediaPublisher sends no picture above 1280x720 (the `getUserMedia` constraints it asks for) and no sound of more than 2 channels (its audio encoder's)"]
 fn a_large_source_and_one_of_four_channels_are_sent() {
     let Some(chrome) = browser() else { return };
     let r = run(&chrome, "/page?large", "media-source.js", NO_PERMISSION, &[]);

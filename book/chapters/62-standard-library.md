@@ -117,7 +117,7 @@ What each does at its edges, where the answer is not what another language would
 | `write_file(path, v)` | `v` as text, folders made, the file replaced; `null` or an error value |
 | `escape(s)` | `& < > " '` as entities |
 | `json.parse(s)` | an error value for bad JSON; an int past 64 bits becomes a float; a key given twice keeps the last value |
-| `json.stringify(v, pretty)` | indented by two spaces when `pretty` is true; a decimal as a string, NaN and infinities as `null`, an error value as `{"error": ...}` |
+| `json.stringify(v, pretty)` | indented by two spaces when `pretty` is true; a decimal as a string, NaN and infinities as `null`, an error value as `{"error": ...}`; JSON past 256 MiB, or nested more than 10,000 deep, is an error value, counted before it is made, as lists that hold one part twice can double at each step *(since 0.7)*; a route's answer the same, a 500 with the reason in the log |
 
 What is not in the standard library, and what to do instead:
 
@@ -582,6 +582,9 @@ money.format(price, "de-DE")                    // "19,99 $"
   `1.01`. `digits` may be `{ min, max }` (`max` is `max(min, 3)` when left out), for as
   many digits as the number needs within them: `format_number(10, "en-US", { max: 3 })`
   is `10`, `8.875` stays `8.875`, and `{ min: 2, max: 3 }` writes `8.8` as `8.80`.
+- An amount past what `money.of` takes (minor units that do not fit an int) is an error
+  value from `money.add`, `money.sub`, `money.mul` and `money.neg` too *(since 0.7: they
+  made it, and only `money.to_minor` refused it)*.
 - There are no exchange rates: an amount stays in its currency, and converting is the
   program's arithmetic with a rate it chose. `quillo check` takes every `money.*`
   result as money, so `is_err(r) ? r.error : ...` after `money.mul` is refused by it,
@@ -629,7 +632,9 @@ math.comb(52, 5)  math.log(8, 2)  math.fsum(xs)  math.isclose(a, b)  math.pi
   `percentile(data, p)` (p from 0 to 100, or a list of them; numpy's linear rule),
   `describe`, `histogram(data, bins = 10)` (or the edges as a list), `zscore`,
   `normalize` (to 0..1) and `rank` (ties share their average rank, a float; others are
-  ints). Statistics of no data, or of too little, is an error, as in Python, except
+  ints). Data or edges holding NaN or an infinity are an error that names it and where
+  *(since 0.7: `median([3, NaN, 1])` was 3.0, and a histogram with `inf` counted nothing)*,
+  as `sort` refuses them. Statistics of no data, or of too little, is an error, as in Python, except
   `describe([])`, which is `{ count: 0, sum: 0 }` with the rest `null`, and `zscore` and
   `normalize` of a constant list, which give zeros. `mode` and `multimode` take any
   values, text too. Python's `median_grouped` and the rest of `NormalDist` are not
@@ -841,6 +846,10 @@ SQLite in memory. A transaction rolls back if its function fails, returns an err
 value or replies early, and also when a statement in it gives an error that nothing
 takes: `db.exec(...)` alone on a line that fails rolls the whole transaction back, and
 the transaction gives that error as its value, so half the work is never committed.
+A transaction SQLite ends by itself (a full disk, an I/O error), rolling back all it held,
+is over: each statement after it in the function is an error, and the transaction gives
+``the database ended this transaction after an error, and rolled back all it held``
+*(since 0.7: what ran after it was committed statement by statement)*.
 An inner transaction whose error is dropped rolls the outer one back too; `let _ =
 db.transaction(...)` for the inner one says its failure is not wanted, and the outer one
 goes on. `quillo check` warns when a `db.transaction(...)` call's value is dropped
@@ -868,10 +877,12 @@ if is_err(r) { reply 400 `Not imported: ${r.error}` }
 print(`${r.changes} products`)
 ```
 
-**A failed `db.open` does not stop the program.** It gives an error value and leaves
-the database as it was, so the next `db` call opens `$QUILLO_DB` or SQLite in memory: a
-wrong password runs the app on an empty database that is gone at restart. Write
-`db.open(env("DATABASE_URL")) | unwrap`, which stops the program with the reason.
+**A `db.open` that fails as the program starts stops it** *(since 0.7)*, with the reason:
+``db.open: error connecting to server: Connection refused: the program's database cannot be
+opened, so the program does not start``. It ran on SQLite in memory before, answered
+writes, and lost them at the next start; a wrong password, a server down or a damaged file
+did it. To run on memory on purpose, open `":memory:"`. Later, a `db.open` that fails
+gives an error value and leaves the database as it was.
 
 **Opening another database while it runs.** `db.open` after the start replaces the
 program's database. Open pages showing its rows are told at once, every tenant's (the
@@ -908,7 +919,11 @@ comes back as text (bytes that are not UTF-8 replaced), and PostgreSQL's `bytea`
 is, the same for SQLite, PostgreSQL and MySQL, whose words for it differ: `"unique"` (a key
 or unique column has the value already), `"foreign_key"`, `"not_null"`, `"check"`,
 `"conflict"` (another transaction: the database busy, a deadlock, a serialization
-failure), or null for any other failure and for anything else. It needs no effect.
+failure), `"connection"` (the server ended the connection, or it could not be made:
+`57P01` and class `08`) *(since 0.7)*, or null for any other failure and for anything else.
+A transaction whose first statement finds that the server ended its pooled connection
+while it sat idle, as after a restart or a failover, is begun again on another one: nothing
+had run. It needs no effect.
 Every database failure is an error value whose text starts `db: `, with the database's
 own message (PostgreSQL's `detail` in brackets, then its SQLSTATE in square brackets:
 `db: duplicate key value violates unique constraint "seats_pkey" (Key (k)=(1) already
@@ -1403,7 +1418,9 @@ options)`. The answer is `{ status, ok, headers, body, json, cookies }`: `ok` fo
 header names in lower case, a header sent more than once joined with `, ` (two `Link`s are
 one `</x>; rel=a, </y>; rel=b`), `set-cookie`'s lines joined by a line break, as they
 cannot be by a comma, and also given one by one in `cookies`, a list; `body` as text
-(bytes that are not UTF-8 replaced; cut at 64 MiB), `json` the body parsed, or `null`.
+(bytes that are not UTF-8 replaced), `json` the body parsed, or `null`. A body longer than
+64 MiB is an error value that says to read it with `http.stream` *(since 0.7: it was cut
+there, and cut JSON was `null`)*.
 Interim answers (`100 Continue`, `103 Early Hints`) are passed over to the final one. A
 body in `gzip`, `deflate` or `br` is decoded; another coding is an error value that names
 it (`the answer is in a coding Quillo cannot read: content-encoding zstd`). Requests say `User-Agent: quillo/<version>` unless

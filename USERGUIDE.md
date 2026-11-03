@@ -846,7 +846,15 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
 ```
 
 - Text follows JSX's rules: each line is trimmed, blank lines are dropped and the rest
-  are joined with a space. Entities such as `&amp;` and `&mdash;` work; write `{"{"}`
+  are joined with a space. So text and an element on lines of their own touch, as in JSX
+  (`Hello,` then `<b>{name}</b>` on the next line is "Hello,Ann"), and `quillo check` says
+  so for an inline element or a view *(since 0.7)*: write `{" "}` at the end of the line.
+  In a `<pre>`, a `<textarea>` and a `<listing>`, text keeps its lines and spaces as HTML
+  has them, and a `//` line in it is text *(since 0.7)*; only the line break right after the
+  start tag is dropped, and spaces alone across lines, between its tags, as code laid out
+  to read has them. Every named entity HTML has (`&amp;`, `&mdash;`, `&rarr;`, `&times;`,
+  `&rsquo;`) and numeric ones (`&#8594;`, `&#x2192;`) work, in text and in attribute values
+  *(since 0.7: ten names, and none in attributes)*; a name HTML has not stays as written. Write `{"{"}`
   for a brace. A `$` is text too, so `${name}` shows a `$` before the value, and
   `quillo check` asks: write `{name}`, or `{"$"}{name}` for a price. Braces in text are
   code, so a `return` in them leaves the function: `<pre>f() { return 1 }</pre>` answers
@@ -854,21 +862,43 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   function, and its value is the answer, not the page ``).
 - `.class` and `#id` shorthand, with `{}` interpolation in the name. A class may hold
   `:` before a letter or digit and `/` before a digit, as Tailwind's do:
-  `<em.hover:underline>`, `<div.md:flex.w-1/2>`.
+  `<em.hover:underline>`, `<div.md:flex.w-1/2>`. On a view or component's tag they are its
+  `class` and `id` parameters *(since 0.7: they were dropped)*, so `<Card.big #main/>` needs
+  a `Card(class, id)`, and one without is told so. There are no member tags:
+  `<Card.Header/>` is an error that says to import `Header` by its own name.
 - `{name}` is short for `name={name}`, and `{...map}` spreads a map's keys as attributes
-  (or as a view's props): `<a {...link}>`, `<Card {...node.props}/>`. Attributes written
+  (or as a view's props): `<a {...link}>`, `<Card {...node.props}/>`. On an element they
+  follow the rules of the same keys written out *(since 0.7)*: a key `onClick` whose value
+  is a function is a handler, as `onClick={f}` is (`"@click"` too), `className` is `class`
+  and `htmlFor` is `for`, and booleans and style numbers are written as below. Attributes written
   out win over spread ones, whatever the case of the key (`ACTION` is `action`); classes
   from both are kept. On a view or component, spread
   keys that are not parameters are ignored, so data with extra fields can be passed
   straight through; a misspelled attribute written out is still an error.
 - Attributes: `"text"` (plain, as in JSX) or `{expr}`, for example
-  ``href={`/todos/${id}`}``. HTML's other two ways are taken too, as text with no `{...}`
+  ``href={`/todos/${id}`}``. `"text"` is plain as HTML's is: a backslash is a backslash
+  (`title="C:\new"`, `pattern="\d{3}"`) and entities are decoded (`href="?a=1&amp;b=2"`)
+  *(since 0.7: `\n` and `\t` were escapes)*. So a `\"` would end it: it is an error that
+  says to write `&quot;`, or the value as a Quillo string, `title={"say \"hi\""}`.
+  HTML's other two ways are taken too, as text with no `{...}`
   in them: `'single quotes'` and an unquoted value, `<p class='a b' id=top>`, which go
-  out double-quoted. `true` renders a bare attribute; `false`/`null` leaves it
-  out. A name may hold `-`, `_`, `:`, `@` and `.` (`data-id`, `bind:value`, `@click`),
+  out double-quoted. On HTML's boolean attributes (`disabled`, `hidden`, `checked`...)
+  `true` renders a bare attribute and `false`/`null` leaves it out. On `aria-*`, `data-*`,
+  `draggable`, `spellcheck` and `contenteditable`, whose value is the text, `true` and
+  `false` are written `"true"` and `"false"`, and `translate` gets `"yes"`/`"no"`, as React
+  writes them *(since 0.7: `aria-hidden={true}` was bare, which hides nothing, and
+  `aria-expanded={false}` was left out)*; written bare, `<div aria-hidden>`, it is `"true"`.
+  `null` leaves any attribute out. A name may hold `-`, `_`, `:`, `@` and `.` (`data-id`, `bind:value`, `@click`),
   the `{name}` shorthand takes a bare name, and an attribute written twice is an error.
 - An event attribute given an expression, `onclick={() => ...}` or `onClick={save}`, is a
-  handler *(since 0.7)*, the same as `@click={...}` (both on one element is an error). Given text,
+  handler *(since 0.7)*, the same as `@click={...}` (both on one element is an error).
+  Where React's name means another DOM event, it is that one: `onChange` on an `<input>`
+  or a `<textarea>` is `@input`, each keystroke (the DOM's `change` waits until the field
+  loses focus; `@change` is still that); `onDoubleClick` is `@dblclick`; `onFocus` and
+  `onBlur` are `@focusin` and `@focusout`, which a wrapper around fields hears.
+  `onClickCapture` and React's other `…Capture` names are an error, as there is no capture
+  phase here. The DOM's names are lower case and compared as written, so `quillo check`
+  warns of `@mouseEnter`, which never fires. Given text,
   `onclick="..."`, it is HTML's own and runs in the browser as written, so it takes only
   `"text"` written in the program: the browser decodes the value and runs it, and escaping
   cannot keep data out of code. Text made from values, ``onmouseover={`go('${u}')`}``, is
@@ -878,12 +908,20 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   with a written `sandbox` attribute that does not say `allow-same-origin` may take
   `srcdoc={...}`: its page cannot reach the site. A view's or component's attributes
   are its parameters, so `on_change={...}` there is fine.
-- `null`/`false` children render nothing; list children render each item, so `{for ... => <li/>}` works.
+- `null`, `false` and `true` children render nothing, as in React *(since 0.7: `true` showed
+  "true")*, so `{admin && " (admin)"}` is the way to show something for a flag; list children
+  render each item, so `{for ... => <li/>}` works. A function where markup goes renders
+  nothing too, on the server and in the browser.
+  `{...xs}` among children is an error that says to write `{xs}`. A function where markup
+  goes is a mistake, `{onClick}` for `{label}`, or React's function as children: `quillo
+  check` warns (call it, `{render(x)}`, or give it to a view as an attribute).
   A map as a child is shown as Quillo writes it, which is seldom meant: `quillo check`
   warns on `<p>{{ name }}</p>` (`` shows the map `{ name: ... }`: to show `name`, write
   `{name}` ``), and on any map or `{{ ... }}` block as an element's child. A map as an
   attribute (`Prop={{ k: v }}`) is as before.
 - Void tags (`<br>`, `<img ...>`, `<input ...>`) need no closing tag. Any tag can self-close with `/>`.
+  An end tag right after one, `<img src="a.png"></img>`, as JSX and XHTML write it, is
+  passed over *(since 0.7)*; one anywhere else is an error whose fix removes it.
 - `<html>` gets `<!doctype html>`. A `<!DOCTYPE html>` written before `<html>`, as an HTML
   file has it, is passed over; before another element it is an error (`` `<!DOCTYPE html>`
   goes before an <html> element, which gets one by itself ``).
@@ -1000,10 +1038,14 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   as text outside a `<script>` element (`raw("<script>" + ... )`) is not looked at.
 - `raw(s)` marks trusted HTML.
 - A capitalized tag calls a view: attributes fill parameters by name, and the element's body is passed as `children`.
+  A view with no `children` parameter given a body is an error *(since 0.7: the body was
+  dropped)*, as an attribute it has no parameter for is; spaces alone are no body.
   An HTML tag written in capitals (`<DIV>`) is taken for a view, and the error says to
   write it in lowercase, `<div>`.
-- Comments: in markup, a line starting with `//` is a comment, and so are `{/* ... */}`,
-  as in JSX, and `<!-- ... -->`, as in HTML; none of them reaches the page. A `<!--` with
+- Comments: in markup, a line starting with `//` is a comment, and so are `{/* ... */}`
+  and `{// ...` with its `}` on a later line, as in JSX, and `<!-- ... -->`, as in HTML;
+  none of them reaches the page. Between a tag's attributes, a `//` line and `{/* ... */}`
+  are comments too. A `<!--` with
   no `-->` is an error. In code, `//` to the end of the line and `/* ... */` anywhere; a
   `/*` never closed is an error at its line, not the rest of the file left out. `//` after
   other text on a line is text (`https://...`), and `{"//"}` writes the characters.
@@ -1035,6 +1077,31 @@ What to change:
 | `<DIV CLASS="a">` | lowercase, `<div class="a">`: a capital starts a view's name |
 | `{` and `}` in text, as a code sample in a `<pre>` has them | `{"{"}` and `{"}"}`, or the sample in a string, `<pre>{SAMPLE}</pre>` |
 | a `$` before a `{` in text | `{"$"}` |
+| text and an inline element on lines of their own, `Hello,` then `<b>Ann</b>` | `{" "}` at the end of the line, as HTML's space between them is none here (`quillo check` says where) |
+
+#### From JSX
+
+Markup is written like JSX, and React's habits mostly work: `className` is told,
+`onClick={f}` is a handler, `{cond && <p/>}`, `xs.map(x => <li/>)`, `style={{ fontSize: 12 }}`,
+`{/* comments */}`, `<img></img>`. What to change, where `quillo check` or the error says it too:
+
+| JSX as written | In Quillo |
+|---|---|
+| `className="a"`, `htmlFor="n"` | `class="a"`, `for="n"` |
+| `<>...</>`, `<Fragment>`, `<React.Fragment>` | one element around them, like `<div>`, or a list |
+| `function Card(props)`, `props.title`; `function Card({ title })` | `view Card(title)`: a view's props are its parameters, by name |
+| `<Card.Header/>`, a member tag | `<Header/>`, imported by its own name |
+| `const Tag = "h1"; <Tag/>`, a dynamic tag | a `match` choosing between written tags, or a view per tag |
+| `{children}` without declaring it | a `children` parameter: a body given to a view without one is an error |
+| `xs.map((x, i) => ...)` | `for [i, x] in enumerate(xs) => ...`, as `map` passes one item |
+| `{...xs}` among children | `{xs}`: a list shows each item |
+| `ref={el}` | `@mount={(el) => ...}`, given the element |
+| `dangerouslySetInnerHTML={{ __html: s }}` | `{raw(s)}` between the tags |
+| `defaultValue`, `defaultChecked` | `value`, `checked`: a field with no state keeps what is typed |
+| `onClickCapture` | `onClick` (or `@click`): there is no capture phase |
+| SVG's `strokeWidth`, `fillRule` | SVG's own `stroke-width`, `fill-rule` |
+| `{cond && " (admin)"}` with `0` or `""` | `0` and `""` are truthy in Quillo: compare, `{n > 0 && ...}` |
+| `<input value={x} onChange={(e) => setX(e.target.value)}/>` | works as is; or `value={x}` alone, which follows typing by itself |
 
 To send an HTML file unchanged, serve it with `file()` or `files()`, or a whole folder with
 `quillo serve` (see [Static files](#static-files)); `raw(read_file("page.html"))` puts it
@@ -1247,7 +1314,18 @@ route GET / = <html><body><Counter start={5}/></body></html>
 - `style={...}` takes text or a map of properties *(since 0.7)*: `style={{ color: tone, font_size:
   "2rem", marginTop: "3px", "--gap": "4px" }}`, where `_` and camelCase are written as
   `-` (`font-size`, `margin-top`), a custom property is kept as it is, and a `null` or
-  `false` value is left out; the same on the server and in the browser.
+  `false` value is left out; the same on the server and in the browser. A number is in
+  pixels, as React has it, except `0` and React's unitless properties (`opacity`,
+  `z-index`, `line-height`, `flex`, `font-weight`, `order`...) and custom properties:
+  `{ fontSize: 12, opacity: 0.5, "--gap": 4 }` is `font-size: 12px; opacity: 0.5; --gap: 4`
+  *(since 0.7: `12` was written bare, and the browser dropped it)*. `ms` starts a prefix as
+  `Webkit` and `Moz` do: `msFlex` is `-ms-flex`.
+- `class={...}` takes text, a map (the keys whose values are true) or a list (its texts,
+  lists inside it flattened, `null`, `false`, `true` and `""` skipped, a map in it giving
+  its true keys), as `clsx` does: `class={{ active: on, off: !on }}`, `class={["card", big
+  && "big"]}` *(since 0.7: they were written as Quillo text)*. Quillo's truthiness counts,
+  so `{ d: 0 }` gives `d`. Nothing left gives no `class` at all. After an update the
+  element has exactly the new classes.
   `style={...}` and `class={...}` change only what they name when what they read
   changes: a `transform` or a class a handler set by hand stays, so a drag does not jump
   home. `<details open={x}>` and `<dialog open={x}>` follow `x` when `x` changes, and
@@ -3712,7 +3790,10 @@ Each packet adds a line, `hall: 21.5 °C`, to every page open on `/`, without a 
   Packets reach it in the order they came, one at a time. An error in it is logged and
   the next packet goes on.
 - Packets wait in a queue while the handler is busy (10,000 unless `queue` says
-  otherwise). A full queue drops its oldest packet, as UDP would; on a server started with
+  otherwise, and 64 MiB at most). A full queue drops its oldest packet, as UDP would,
+  except that a sender holding more than half of it while others wait has its new packet
+  dropped, so one sender cannot push out the rest *(since 0.7)*. A batch the server could
+  not take for five seconds is dropped with a line in the log; on a server started with
   [`--metrics`](#options-of-quillo-run) (`quillo run main.qwe --metrics`),
   `quillo_udp_received_total` and `quillo_udp_dropped_total` count them. Nothing slows
   a sender down, so where packets come in bursts faster than the handler takes them,
@@ -4353,9 +4434,13 @@ When a service runs elsewhere, its calls are made to hold up:
   copy of this service says `assess(n: int) -> int` ``.
 - **Described** as OpenAPI, for a gateway: see [The program's API
   (OpenAPI)](#the-programs-api-openapi).
-- **Tried again.** A call that got no connection, or a server answering 502, 503 or 504,
-  is tried at the next address, a little later each time (100 ms, doubling, with some
-  jitter). A call sent but not answered in time is tried again at the same address, with
+- **Tried again.** A call that got no connection, or a server answering 503, is tried at
+  the next address, a little later each time (100 ms, doubling, with some jitter). A 502
+  or 504, which a proxy gives after the copy behind it may have run the call, sends it to
+  the next address only when the function is safe to run twice, as one that uses
+  [`idempotent`](#idempotent-requests) (in it, or in a function it calls, as the caller's
+  copy of the service's file says) is; any other call gives the error *(since 0.7: every
+  call was tried again, and ran on both copies)*. A call sent but not answered in time is tried again at the same address, with
   the same call id: the service remembers the calls it answered (for eleven minutes, up
   to 100,000 of them in memory, and in `_quillo_calls` when it has a database) and gives
   the same answer, so while the service stays up the function runs once however often
@@ -4416,7 +4501,10 @@ When a service runs elsewhere, its calls are made to hold up:
   the caller's name then not known. The answer is `{"ok": value}` or `{"err": payload}`
   (with `"published": [...]`, the topics to announce), signed with the call's key in
   `x-quillo-answer: sig=<hex>`, HMAC-SHA256 of `quillo-answer-3`, the call id and the
-  status, each on a line, then the body. It is 401 for a call that proves no caller (a
+  status, each on a line, then the body. A 200 without it is refused, under the shared
+  secret as with a key of the caller's own *(since 0.7: under the secret it was taken)*:
+  what answered at the service's address may not be the service. Under `bearer`, OAuth and
+  mTLS nothing signs the answer, which is the service's as far as TLS says it is. It is 401 for a call that proves no caller (a
   bad or old signature, another service's, a key or token not taken), 403 for a caller
   `for` or `check` refuses, 404 for no such function, 409 for a contract that differs,
   503 while the call still runs. A server in another language that answers so,
@@ -4534,7 +4622,10 @@ server fn refund(account: int, cents: int) for ["shop"] {
 - `jwt: { issuer, audience, jwks, secret }`: a bearer token, an OAuth 2.0 access token,
   checked against the identity provider's keys at `jwks` (a URL, kept for ten minutes,
   fetched again at most once a minute for a key it does not have: RS256, ES256, EdDSA)
-  or against `secret` (HS256). `audience` is required, so a token meant for another
+  or against `secret` (HS256). One fetch at a time, for three seconds at most; one that
+  fails is not tried again for a minute, the keys fetched before are used meanwhile, and
+  the URL and what went wrong go to the log, while the caller is told only `the identity
+  provider's keys could not be fetched` *(since 0.7)*. `audience` is required, so a token meant for another
   service is not taken here; `exp` is required too, and `nbf`, `iss` and `aud` are
   checked, with a minute's leeway. A token that fails is a 401 that says why (`the
   bearer token: the token is not for billing (aud)`, `... has expired`, `... has no exp:
@@ -4979,7 +5070,7 @@ What each does at its edges, where the answer is not what another language would
 | `write_file(path, v)` | `v` as text, folders made, the file replaced; `null` or an error value |
 | `escape(s)` | `& < > " '` as entities |
 | `json.parse(s)` | an error value for bad JSON; an int past 64 bits becomes a float; a key given twice keeps the last value |
-| `json.stringify(v, pretty)` | indented by two spaces when `pretty` is true; a decimal as a string, NaN and infinities as `null`, an error value as `{"error": ...}` |
+| `json.stringify(v, pretty)` | indented by two spaces when `pretty` is true; a decimal as a string, NaN and infinities as `null`, an error value as `{"error": ...}`; JSON past 256 MiB, or nested more than 10,000 deep, is an error value, counted before it is made, as lists that hold one part twice can double at each step *(since 0.7)*; a route's answer the same, a 500 with the reason in the log |
 
 What is not in the standard library, and what to do instead:
 
@@ -5444,6 +5535,9 @@ money.format(price, "de-DE")                    // "19,99 $"
   `1.01`. `digits` may be `{ min, max }` (`max` is `max(min, 3)` when left out), for as
   many digits as the number needs within them: `format_number(10, "en-US", { max: 3 })`
   is `10`, `8.875` stays `8.875`, and `{ min: 2, max: 3 }` writes `8.8` as `8.80`.
+- An amount past what `money.of` takes (minor units that do not fit an int) is an error
+  value from `money.add`, `money.sub` and `money.mul` too *(since 0.7: they
+  made it, and only `money.to_minor` refused it)*.
 - There are no exchange rates: an amount stays in its currency, and converting is the
   program's arithmetic with a rate it chose. `quillo check` takes every `money.*`
   result as money, so `is_err(r) ? r.error : ...` after `money.mul` is refused by it,
@@ -5491,7 +5585,10 @@ math.comb(52, 5)  math.log(8, 2)  math.fsum(xs)  math.isclose(a, b)  math.pi
   `percentile(data, p)` (p from 0 to 100, or a list of them; numpy's linear rule),
   `describe`, `histogram(data, bins = 10)` (or the edges as a list), `zscore`,
   `normalize` (to 0..1) and `rank` (ties share their average rank, a float; others are
-  ints). Statistics of no data, or of too little, is an error, as in Python, except
+  ints). What puts data in order or counts them (the medians, `quantiles`, `percentile`,
+  `describe`, `rank`, `histogram` and its edges) refuses NaN and infinities, naming which
+  and where, as `sort` does *(since 0.7: `median([3, NaN, 1])` was 3.0, and a histogram
+  with `inf` counted nothing)*; a mean or a spread has them as Python's does. Statistics of no data, or of too little, is an error, as in Python, except
   `describe([])`, which is `{ count: 0, sum: 0 }` with the rest `null`, and `zscore` and
   `normalize` of a constant list, which give zeros. `mode` and `multimode` take any
   values, text too. Python's `median_grouped` and the rest of `NormalDist` are not
@@ -5703,6 +5800,10 @@ SQLite in memory. A transaction rolls back if its function fails, returns an err
 value or replies early, and also when a statement in it gives an error that nothing
 takes: `db.exec(...)` alone on a line that fails rolls the whole transaction back, and
 the transaction gives that error as its value, so half the work is never committed.
+A transaction SQLite ends by itself (a full disk, an I/O error), rolling back all it held,
+is over: each statement after it in the function is an error, and the transaction gives
+``the database ended this transaction after an error, and rolled back all it held``
+*(since 0.7: what ran after it was committed statement by statement)*.
 An inner transaction whose error is dropped rolls the outer one back too; `let _ =
 db.transaction(...)` for the inner one says its failure is not wanted, and the outer one
 goes on. `quillo check` warns when a `db.transaction(...)` call's value is dropped
@@ -5730,10 +5831,12 @@ if is_err(r) { reply 400 `Not imported: ${r.error}` }
 print(`${r.changes} products`)
 ```
 
-**A failed `db.open` does not stop the program.** It gives an error value and leaves
-the database as it was, so the next `db` call opens `$QUILLO_DB` or SQLite in memory: a
-wrong password runs the app on an empty database that is gone at restart. Write
-`db.open(env("DATABASE_URL")) | unwrap`, which stops the program with the reason.
+**A `db.open` that fails as the program starts stops it** *(since 0.7)*, with the reason:
+``db.open: error connecting to server: Connection refused: the program's database cannot be
+opened, so the program does not start``. It ran on SQLite in memory before, answered
+writes, and lost them at the next start; a wrong password, a server down or a damaged file
+did it. To run on memory on purpose, open `":memory:"`. Later, a `db.open` that fails
+gives an error value and leaves the database as it was.
 
 **Opening another database while it runs.** `db.open` after the start replaces the
 program's database. Open pages showing its rows are told at once, every tenant's (the
@@ -5770,7 +5873,11 @@ comes back as text (bytes that are not UTF-8 replaced), and PostgreSQL's `bytea`
 is, the same for SQLite, PostgreSQL and MySQL, whose words for it differ: `"unique"` (a key
 or unique column has the value already), `"foreign_key"`, `"not_null"`, `"check"`,
 `"conflict"` (another transaction: the database busy, a deadlock, a serialization
-failure), or null for any other failure and for anything else. It needs no effect.
+failure), `"connection"` (the server ended the connection, or it could not be made:
+`57P01` and class `08`) *(since 0.7)*, or null for any other failure and for anything else.
+A transaction whose first statement finds that the server ended its pooled connection
+while it sat idle, as after a restart or a failover, is begun again on another one: nothing
+had run. It needs no effect.
 Every database failure is an error value whose text starts `db: `, with the database's
 own message (PostgreSQL's `detail` in brackets, then its SQLSTATE in square brackets:
 `db: duplicate key value violates unique constraint "seats_pkey" (Key (k)=(1) already
@@ -6265,7 +6372,9 @@ options)`. The answer is `{ status, ok, headers, body, json, cookies }`: `ok` fo
 header names in lower case, a header sent more than once joined with `, ` (two `Link`s are
 one `</x>; rel=a, </y>; rel=b`), `set-cookie`'s lines joined by a line break, as they
 cannot be by a comma, and also given one by one in `cookies`, a list; `body` as text
-(bytes that are not UTF-8 replaced; cut at 64 MiB), `json` the body parsed, or `null`.
+(bytes that are not UTF-8 replaced), `json` the body parsed, or `null`. A body longer than
+64 MiB is an error value that says to read it with `http.stream` *(since 0.7: it was cut
+there, and cut JSON was `null`)*.
 Interim answers (`100 Continue`, `103 Early Hints`) are passed over to the final one. A
 body in `gzip`, `deflate` or `br` is decoded; another coding is an error value that names
 it (`the answer is in a coding Quillo cannot read: content-encoding zstd`). Requests say `User-Agent: quillo/<version>` unless

@@ -724,10 +724,18 @@ fn spread_attr_allowed(name: &str) -> bool {
         && (!name.contains(':') || key == "xlink:href")
 }
 
+/// Whether `lower`, an attribute's name in lower case, is React's handler form, `onclick`
+/// (see `react_event` in the parser).
+fn is_react_handler(lower: &str) -> bool {
+    lower.len() > 2 && lower.starts_with("on") && lower[2..].bytes().all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'_')
+}
+
 fn render_value(v: &Value, out: &mut String) {
     match v {
         Value::Html(h) => out.push_str(h),
-        Value::Nil | Value::Bool(false) => {}
+        // `true` shows nothing, as `false` and null do, as in React; a function too, where it
+        // showed `<fn <fn>>` (FEEDBACK48.md, Q-564 and Q-571; branch main).
+        Value::Nil | Value::Bool(_) | Value::Func(_) | Value::Builtin(..) => {}
         Value::List(items) => {
             for i in items.iter() {
                 render_value(i, out);
@@ -758,30 +766,189 @@ pub fn style_text(m: &Map) -> String {
         if matches!(v, Value::Nil | Value::Bool(false)) {
             continue;
         }
-        let name: String = if k.starts_with("--") {
-            k.to_string()
-        } else {
-            let mut n = String::new();
-            for c in k.chars() {
-                match c {
-                    '_' => n.push('-'),
-                    c if c.is_ascii_uppercase() => {
-                        n.push('-');
-                        n.push(c.to_ascii_lowercase());
-                    }
-                    c => n.push(c),
-                }
-            }
-            n
-        };
         if !out.is_empty() {
             out.push_str("; ");
         }
-        out.push_str(&name);
+        let start = out.len();
+        if k.starts_with("--") {
+            out.push_str(k);
+        } else {
+            for c in k.chars() {
+                match c {
+                    '_' => out.push('-'),
+                    c if c.is_ascii_uppercase() => {
+                        out.push('-');
+                        out.push(c.to_ascii_lowercase());
+                    }
+                    c => out.push(c),
+                }
+            }
+            // `msFlex` is `-ms-flex`, as `WebkitFlex` is `-webkit-flex`, React's way
+            // (FEEDBACK48.md, Q-565; branch main).
+            if out[start..].starts_with("ms-") {
+                out.insert(start, '-');
+            }
+        }
+        let end = out.len();
         out.push_str(": ");
-        out.push_str(&v.display());
+        // A number is in pixels, as React has it (`fontSize: 12` is `12px`, where the browser
+        // dropped `font-size: 12`), but 0, a custom property and React's unitless properties
+        // (`opacity`, `zIndex`, `lineHeight`, ...) (FEEDBACK48.md, Q-565; branch main).
+        let nonzero = match v {
+            Value::Int(n) => {
+                push_int(&mut out, *n);
+                *n != 0
+            }
+            Value::Float(f) => {
+                out.push_str(&v.display());
+                *f != 0.0 && f.is_finite()
+            }
+            Value::Dec(d) => {
+                out.push_str(&v.display());
+                !d.is_zero()
+            }
+            other => {
+                out.push_str(&other.display());
+                false
+            }
+        };
+        if nonzero && takes_px(&out[start..end]) {
+            out.push_str("px");
+        }
     }
     out
+}
+
+/// React's unitless CSS properties (`isUnitlessNumber`), as the attribute names them
+/// (FEEDBACK48.md, Q-565; branch main).
+const UNITLESS: &[&str] = &[
+    "animation-iteration-count",
+    "aspect-ratio",
+    "border-image-outset",
+    "border-image-slice",
+    "border-image-width",
+    "box-flex",
+    "box-flex-group",
+    "box-ordinal-group",
+    "column-count",
+    "columns",
+    "fill-opacity",
+    "flex",
+    "flex-grow",
+    "flex-negative",
+    "flex-order",
+    "flex-positive",
+    "flex-shrink",
+    "flood-opacity",
+    "font-weight",
+    "grid-area",
+    "grid-column",
+    "grid-column-end",
+    "grid-column-span",
+    "grid-column-start",
+    "grid-row",
+    "grid-row-end",
+    "grid-row-span",
+    "grid-row-start",
+    "line-clamp",
+    "line-height",
+    "opacity",
+    "order",
+    "orphans",
+    "scale",
+    "stop-opacity",
+    "stroke-dasharray",
+    "stroke-dashoffset",
+    "stroke-miterlimit",
+    "stroke-opacity",
+    "stroke-width",
+    "tab-size",
+    "widows",
+    "z-index",
+    "zoom",
+];
+
+/// Whether a number for CSS property `name` (`font-size`) is in pixels: not for a custom
+/// property or a unitless one, with or without a vendor prefix (`-webkit-flex`).
+fn takes_px(name: &str) -> bool {
+    if name.starts_with("--") {
+        return false;
+    }
+    let base = ["-webkit-", "-moz-", "-ms-", "-o-"].iter().find_map(|p| name.strip_prefix(p)).unwrap_or(name);
+    !UNITLESS.contains(&base)
+}
+
+/// The text a bool is for an attribute whose values are words: "true" and "false" for ARIA's,
+/// `data-` ones and the enumerated `draggable`, `spellcheck` and `contenteditable`, "yes" and
+/// "no" for `translate`, as React writes them. None for the rest, HTML's boolean attributes
+/// (`disabled`), which are there (bare) or not (FEEDBACK48.md, Q-564; branch main).
+pub fn bool_attr_text(name: &str, b: bool) -> Option<&'static str> {
+    let n = name.as_bytes();
+    let has = |p: &str| n.len() > p.len() && n[..p.len()].eq_ignore_ascii_case(p.as_bytes());
+    if has("aria-") || has("data-") || ["draggable", "spellcheck", "contenteditable"].iter().any(|w| name.eq_ignore_ascii_case(w)) {
+        Some(if b { "true" } else { "false" })
+    } else if name.eq_ignore_ascii_case("translate") {
+        Some(if b { "yes" } else { "no" })
+    } else {
+        None
+    }
+}
+
+/// ` name="true"` for a bool attribute whose values are words (see `bool_attr_text`), else
+/// ` name` for true and nothing for false.
+fn write_bool_attr(name: &str, b: bool, out: &mut String) {
+    match bool_attr_text(name, b) {
+        Some(t) => {
+            out.push(' ');
+            out.push_str(name);
+            out.push_str("=\"");
+            out.push_str(t);
+            out.push('"');
+        }
+        None if b => {
+            out.push(' ');
+            out.push_str(name);
+        }
+        None => {}
+    }
+}
+
+/// The classes `class={...}` gives, as clsx has them: a map's keys whose values are truthy, a
+/// list's items (lists in it flattened, null, false and true skipped, a map in it as above),
+/// joined with spaces; text as it is. A map or list was written as its Quillo text
+/// (FEEDBACK48.md, Q-566; branch main).
+fn class_words(v: &Value, out: &mut String) {
+    let word = |w: &str, out: &mut String| {
+        if !w.is_empty() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(w);
+        }
+    };
+    match v {
+        Value::Nil | Value::Bool(_) => {}
+        Value::Str(s) => word(s, out),
+        Value::List(items) => {
+            for i in items.iter() {
+                class_words(i, out);
+            }
+        }
+        Value::Map(m) => {
+            for (k, x) in m.iter() {
+                if x.truthy() {
+                    word(k, out);
+                }
+            }
+        }
+        other => word(&other.display(), out),
+    }
+}
+
+/// Whether the browser drops a newline right after the start tag of `tag`: <pre>, <textarea>
+/// and <listing>, whose text keeps its layout (FEEDBACK48.md, Q-572; branch main).
+fn drops_first_newline(tag: &str) -> bool {
+    matches!(tag, "pre" | "textarea" | "listing")
 }
 
 /// A `<script>`'s own text as the page carries it: as written, but that `</` and `<!--` cannot
@@ -4152,8 +4319,10 @@ impl Interp {
             let _ = f.html_once.set(Arc::from(&out[start..]));
             return Ok(());
         }
-        // Tags that never change: their HTML is in pieces, made once.
-        if f.tags_fixed {
+        // Tags that never change: their HTML is in pieces, made once. Not a <pre>, whose text,
+        // known only as it is written, may need a newline before it (FEEDBACK48.md, Q-572;
+        // branch main).
+        if f.tags_fixed && !drops_first_newline(&el.tag) {
             if f.pieces.get().is_none() {
                 let mut pieces = Vec::new();
                 let mut html = String::new();
@@ -4187,7 +4356,7 @@ impl Interp {
         }
         for c in &el.children {
             match c {
-                HtmlChild::El(e) if e.facts.tags_fixed => self.pieces_into(e, env, pieces, html)?,
+                HtmlChild::El(e) if e.facts.tags_fixed && !drops_first_newline(&e.tag) => self.pieces_into(e, env, pieces, html)?,
                 HtmlChild::Expr(e @ Expr::Lit(Lit::Str(_))) => self.render_expr_into(e, env, html)?,
                 _ => {
                     if !html.is_empty() {
@@ -4221,7 +4390,14 @@ impl Interp {
             return Ok(());
         }
         match text_value {
-            Some(t) => out.push_str(&escape(&t)),
+            Some(t) => {
+                // The browser drops a first newline here: one more keeps the text's own
+                // (FEEDBACK48.md, Q-572; branch main).
+                if t.starts_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(&escape(&t))
+            }
             // A script is code to the browser, where HTML escaping means
             // nothing: a value goes in as JSON (a JS value, `<` escaped), and
             // HTML (`raw(...)`) as it is, but without `</` or `<!--`, so
@@ -4257,8 +4433,15 @@ impl Interp {
                 }
             }
             None => {
+                let start = out.len();
                 for c in &el.children {
                     self.render_child(c, env, out)?;
+                }
+                // A <pre>, <textarea> or <listing> whose text starts with a newline: the browser
+                // drops the first one after the start tag, so one more is written, and the text
+                // the page shows is the one written (FEEDBACK48.md, Q-572; branch main).
+                if out.as_bytes().get(start) == Some(&b'\n') && drops_first_newline(&el.tag) {
+                    out.insert(start, '\n');
                 }
             }
         }
@@ -4288,7 +4471,29 @@ impl Interp {
         // the value as code or as a page.
         // Names are compared as the browser does (`ACTION` is `action`), so
         // a spread key cannot stand in for a written attribute.
-        let spread: Vec<(String, Value)> = spread.into_iter().filter(|(n, _)| spread_attr_allowed(n)).collect();
+        // A spread's keys follow the rules of the same ones written out: `className` is `class`
+        // and `htmlFor` is `for`, as React's, and `onClick: f` a handler, which only the browser
+        // has (its `…Capture` refused, as written out), where they were written as they were or
+        // dropped (FEEDBACK48.md, Q-567; branch main).
+        let mut kept = Vec::with_capacity(spread.len());
+        for (n, v) in spread {
+            let lower = n.to_ascii_lowercase();
+            if matches!(v, Value::Func(_) | Value::Builtin(..)) && is_react_handler(&lower) {
+                if let Err(m) = crate::parser::react_event(&el.tag, &n, &lower[2..]) {
+                    return fail(el.line, m);
+                }
+                continue;
+            }
+            let n = match lower.as_str() {
+                "classname" => "class".to_string(),
+                "htmlfor" => "for".to_string(),
+                _ => n,
+            };
+            if spread_attr_allowed(&n) {
+                kept.push((n, v));
+            }
+        }
+        let spread = kept;
         let mut written: HashSet<String> = explicit.iter().map(|(n, _)| attr_key(n)).collect();
         // Written classes first, then the spread's.
         let (spread_class, spread): (Vec<_>, Vec<_>) = spread.into_iter().partition(|(n, _)| attr_key(n) == "class");
@@ -4330,17 +4535,25 @@ impl Interp {
                 continue;
             }
             if name.eq_ignore_ascii_case("class") {
-                if !matches!(v, Value::Nil | Value::Bool(false)) {
-                    classes.push(v.display());
+                match &v {
+                    Value::Nil | Value::Bool(false) => {}
+                    Value::Str(s) => classes.push(s.to_string()),
+                    // A map's keys that are true and a list's words, as clsx gives them
+                    // (FEEDBACK48.md, Q-566; branch main).
+                    Value::List(_) | Value::Map(_) | Value::Bool(true) => {
+                        let mut words = String::new();
+                        class_words(&v, &mut words);
+                        if !words.is_empty() {
+                            classes.push(words);
+                        }
+                    }
+                    other => classes.push(other.display()),
                 }
                 continue;
             }
             match v {
-                Value::Bool(true) => {
-                    rest.push(' ');
-                    rest.push_str(name);
-                }
-                Value::Bool(false) | Value::Nil => {}
+                Value::Bool(b) => write_bool_attr(name, b, &mut rest),
+                Value::Nil => {}
                 Value::List(_) | Value::Map(_) => {
                     rest.push_str(&format!(" {}=\"{}\"", name, escape(&v.json_text())))
                 }
@@ -4388,10 +4601,9 @@ impl Interp {
                 continue;
             }
             match val {
-                AttrVal::Bool => {
-                    out.push(' ');
-                    out.push_str(name);
-                }
+                // `<div aria-hidden>` is `aria-hidden="true"`, as `aria-hidden={true}` is
+                // (FEEDBACK48.md, Q-564; branch main).
+                AttrVal::Bool => write_bool_attr(name, true, out),
                 // A template outside URL attributes goes straight in, part by part.
                 AttrVal::Expr(Expr::Template(parts)) if !url_attr(name) && !anim_value_attr(&el.tag, name) => {
                     out.push(' ');
@@ -4477,11 +4689,10 @@ impl Interp {
             _ => v,
         };
         match &v {
-            Value::Bool(true) => {
-                out.push(' ');
-                out.push_str(name);
-            }
-            Value::Bool(false) | Value::Nil => {}
+            // `aria-expanded={false}` is `aria-expanded="false"`, `disabled={false}` nothing
+            // (FEEDBACK48.md, Q-564; branch main).
+            Value::Bool(b) => write_bool_attr(name, *b, out),
+            Value::Nil => {}
             Value::List(_) | Value::Map(_) => {
                 out.push(' ');
                 out.push_str(name);

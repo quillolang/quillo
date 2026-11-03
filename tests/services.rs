@@ -701,3 +701,82 @@ fn the_schedulers_own_calls_are_not_logged() {
     assert!(log.contains("GET /free -> 200"), "{}", log);
     assert!(!log.contains("/_quillo/later"), "{}", log);
 }
+
+/// A proxy in front of `to` that passes each request on, takes the answer, and then answers
+/// 504, as a proxy whose wait ran out does after the copy behind it ran the call.
+fn late_proxy(to: u16) -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut c in l.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut req = Vec::new();
+                let mut b = [0u8; 1];
+                while !req.ends_with(b"\r\n\r\n") {
+                    if c.read_exact(&mut b).is_err() {
+                        return;
+                    }
+                    req.push(b[0]);
+                }
+                let head = String::from_utf8_lossy(&req).to_lowercase();
+                let n: usize = head.lines().find_map(|l| l.strip_prefix("content-length:")).map_or(0, |v| v.trim().parse().unwrap_or(0));
+                let mut body = vec![0u8; n];
+                let _ = c.read_exact(&mut body);
+                let head = String::from_utf8_lossy(&req).replace("Connection: keep-alive", "Connection: close");
+                if let Ok(mut up) = TcpStream::connect(("127.0.0.1", to)) {
+                    let _ = up.write_all(head.as_bytes());
+                    let _ = up.write_all(&body);
+                    let _ = up.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut answer = [0u8; 4096];
+                    let _ = up.read(&mut answer);
+                }
+                let _ = c.write_all(b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            });
+        }
+    });
+    port
+}
+
+// FEEDBACK49.md, Q-595: a proxy's 504 after the copy behind it ran the call sent the call to the
+// next copy, and it ran on both.
+#[test]
+fn a_proxys_504_sends_a_call_to_another_copy_only_if_it_is_safe_to_run_twice() {
+    let d = dir("late-504");
+    std::fs::write(
+        d.join("latebill.qwe"),
+        "let runs = 0\nserver fn refund() -> int {\n    runs += 1\n    500\n}\nserver fn pay() -> int = idempotent(() => {\n    runs += 1\n    7\n})\nroute GET /runs = str(runs)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("front.qwe"),
+        "service latebill = \"latebill.qwe\" { retries: 2, timeout: \"3s\" }\nroute GET /refund = str(latebill.refund())\nroute GET /pay = str(latebill.pay())\n",
+    )
+    .unwrap();
+    let secret = "a-test-secret-for-services";
+    let (p1, p2) = (free_port(), free_port());
+    let _c1 = start(&d.join("latebill.qwe"), p1, &["--as-service"], &[("QUILLO_SERVICE_SECRET", secret)]);
+    let _c2 = start(&d.join("latebill.qwe"), p2, &["--as-service"], &[("QUILLO_SERVICE_SECRET", secret)]);
+    let proxy = late_proxy(p1);
+    std::env::set_var("QUILLO_SERVICE_SECRET", secret);
+    let mut it = Interp::new(&d);
+    it.shared.service_urls.lock().unwrap().insert("latebill".into(), format!("http://127.0.0.1:{},http://127.0.0.1:{}", proxy, p2));
+    it.load_file(&d.join("front.qwe")).unwrap();
+    let runs = || -> u32 { http(p1, "GET", "/runs", &[], "").1.parse::<u32>().unwrap() + http(p2, "GET", "/runs", &[], "").1.parse::<u32>().unwrap() };
+    // A function that is not: each call runs once, and one the proxy answered is an error.
+    let (mut ok, mut refused) = (0, 0);
+    for _ in 0..6 {
+        let t = text(&get(&mut it, "/refund"));
+        if t == "500" {
+            ok += 1;
+        } else {
+            assert!(t.contains("504 at") && t.contains("not sent to another copy, as it may have run there"), "{}", t);
+            refused += 1;
+        }
+    }
+    assert!(refused > 0 && ok > 0, "{} ok, {} refused", ok, refused);
+    assert_eq!(runs(), 6, "each call ran once");
+    // One that uses `idempotent` goes on to the next copy, and answers.
+    for _ in 0..4 {
+        assert_eq!(text(&get(&mut it, "/pay")), "7");
+    }
+}

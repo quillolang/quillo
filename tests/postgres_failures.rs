@@ -56,9 +56,12 @@ fn certificates_the_system_can_not_read_say_why_there_are_none() {
     let d = support::temp_dir("pgfail-no-cert-file");
     std::fs::write(d.join("app.qwe"), "print(db.open(\"postgres://u@127.0.0.1:1/x?sslrootcert=system\"))\n").unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_quillo")).args(["run", "app.qwe"]).current_dir(&d).env("SSL_CERT_FILE", "/no/such/certs.pem").env("SSL_CERT_DIR", "/no/such/certs").stdin(Stdio::null()).output().unwrap();
-    let said = String::from_utf8_lossy(&out.stdout);
+    // As the program starts, the program stops with the reason (FEEDBACK49.md, Q-602).
+    let said = String::from_utf8_lossy(&out.stderr);
     says(said.to_string(), "sslrootcert=system: no CA certificates found on this system (");
     says(said.to_string(), "/no/such/certs.pem");
+    says(said.to_string(), "the program's database cannot be opened, so the program does not start");
+    assert!(!out.status.success());
 }
 
 #[test]

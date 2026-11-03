@@ -540,12 +540,13 @@ pub fn verify_jwt(token: &str, rules: &JwtRules) -> Result<serde_json::Value, St
 
 /// The key `kid` of the JWKS at `url`, fetched and kept for ten minutes, and fetched again (at
 /// most once a minute) for a key it does not have, as a provider's keys rotate.
+///
+/// A fetch that failed is not tried again for a minute, and the keys it had are kept and used
+/// meanwhile; one fetch at a time, for three seconds at most; and the URL and what went wrong
+/// are told in the log, not to the caller, whose token may be anyone's. Each junk token made a
+/// fetch, a provider that did not answer held each call ten seconds, and one that was down
+/// refused every caller once the keys were ten minutes old (FEEDBACK49.md, Q-597; branch main).
 fn jwk(url: &str, kid: &str, alg: &str) -> Result<serde_json::Value, String> {
-    struct Kept {
-        keys: Vec<serde_json::Value>,
-        at: Instant,
-    }
-    static JWKS: OnceLock<Mutex<HashMap<String, Kept>>> = OnceLock::new();
     let find = |keys: &[serde_json::Value]| {
         let kty = match alg {
             "RS256" => "RSA",
@@ -554,25 +555,81 @@ fn jwk(url: &str, kid: &str, alg: &str) -> Result<serde_json::Value, String> {
         };
         keys.iter().find(|k| k["kty"] == kty && (kid.is_empty() || k["kid"] == kid) && k["use"].as_str().map_or(true, |u| u == "sig")).cloned()
     };
-    let cache = JWKS.get_or_init(Default::default);
-    {
-        let c = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(k) = c.get(url) {
-            let fresh = k.at.elapsed() < Duration::from_secs(600);
-            if let Some(key) = find(&k.keys).filter(|_| fresh) {
-                return Ok(key);
-            }
-            if k.at.elapsed() < Duration::from_secs(60) {
-                return Err(format!("no key `{}` in {}", kid, url));
-            }
+    let missing = || format!("no key `{}` in the identity provider's keys", kid);
+    let cache = jwks_cache();
+    // What is kept answers, unless it is old, or has no such key and was fetched over a
+    // minute ago.
+    let kept = |c: &HashMap<String, KeptKeys>| -> Option<Result<serde_json::Value, String>> {
+        let k = c.get(url)?;
+        let fresh = k.at.is_some_and(|at| at.elapsed() < JWKS_FRESH);
+        let tried = k.tried.elapsed() < JWKS_RETRY;
+        match find(&k.keys) {
+            Some(key) if fresh || tried => Some(Ok(key)),
+            None if tried => Some(Err(if k.at.is_some() { missing() } else { "the identity provider's keys could not be fetched".to_string() })),
+            _ => None,
+        }
+    };
+    if let Some(r) = kept(&cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner)) {
+        return r;
+    }
+    // One fetch at a time: the others wait for it, and take what it got.
+    let one = {
+        static FETCHING: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+        FETCHING.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(url.to_string()).or_default().clone()
+    };
+    let _turn = one.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(r) = kept(&cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner)) {
+        return r;
+    }
+    let fetched = agent()
+        .get(url)
+        .timeout(Duration::from_secs(3))
+        .call()
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.into_string().map_err(|e| e.to_string()))
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).map_err(|_| "not JSON".to_string()))
+        .and_then(|j| j["keys"].as_array().cloned().ok_or_else(|| "no `keys`".to_string()));
+    let mut c = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = c.entry(url.to_string()).or_insert_with(|| KeptKeys { keys: Vec::new(), at: None, tried: Instant::now() });
+    entry.tried = Instant::now();
+    match fetched {
+        Ok(keys) => {
+            entry.keys = keys;
+            entry.at = Some(Instant::now());
+            find(&entry.keys).ok_or_else(missing)
+        }
+        Err(e) => {
+            let kept = !entry.keys.is_empty();
+            eprintln!("quillo: warning: the jwks at {} could not be fetched ({}){}", url, e, if kept { "; the keys fetched before are used until it can be" } else { "" });
+            find(&entry.keys).ok_or_else(|| if kept { missing() } else { "the identity provider's keys could not be fetched".to_string() })
         }
     }
-    let text = agent().get(url).timeout(Duration::from_secs(10)).call().map_err(|e| format!("the jwks at {}: {}", url, e))?.into_string().map_err(|e| e.to_string())?;
-    let j: serde_json::Value = serde_json::from_str(&text).map_err(|_| format!("the jwks at {} is not JSON", url))?;
-    let keys = j["keys"].as_array().cloned().unwrap_or_default();
-    let found = find(&keys);
-    cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(url.to_string(), Kept { keys, at: Instant::now() });
-    found.ok_or_else(|| format!("no key `{}` in {}", kid, url))
+}
+
+/// How long a JWKS is taken as it is, and how soon one is fetched again after a try.
+const JWKS_FRESH: Duration = Duration::from_secs(600);
+const JWKS_RETRY: Duration = Duration::from_secs(60);
+
+struct KeptKeys {
+    keys: Vec<serde_json::Value>,
+    /// When they were fetched; none if no fetch has worked yet.
+    at: Option<Instant>,
+    /// When a fetch was last tried, whether it worked or not.
+    tried: Instant,
+}
+
+fn jwks_cache() -> &'static Mutex<HashMap<String, KeptKeys>> {
+    static JWKS: OnceLock<Mutex<HashMap<String, KeptKeys>>> = OnceLock::new();
+    JWKS.get_or_init(Default::default)
+}
+
+/// For tests: the JWKS at `url` as if fetched, and tried, `by` earlier.
+#[doc(hidden)]
+pub fn age_jwks(url: &str, by: Duration) {
+    if let Some(k) = jwks_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(url) {
+        k.at = k.at.and_then(|at| at.checked_sub(by));
+        k.tried = k.tried.checked_sub(by).unwrap_or(k.tried);
+    }
 }
 
 /// `request.caller` of a token's claims.

@@ -578,6 +578,19 @@ fn reaches(globals: &Env, def: &crate::ast::FnDef, seen: &mut std::collections::
     })
 }
 
+/// `used_by` over a file's own definitions, as a caller reads its copy of a service's file:
+/// whether calling `def` twice is safe (FEEDBACK49.md, Q-595; branch main).
+pub fn used_by_defs(defs: &std::collections::HashMap<String, std::sync::Arc<crate::ast::FnDef>>, def: &crate::ast::FnDef) -> bool {
+    fn go(defs: &std::collections::HashMap<String, std::sync::Arc<crate::ast::FnDef>>, def: &crate::ast::FnDef, seen: &mut std::collections::HashSet<String>) -> bool {
+        let body = format!("{:?}", def.body);
+        if body.contains("\"idempotent\"") {
+            return true;
+        }
+        body.split("Ident(\"").skip(1).filter_map(|rest| rest.split_once('"')).any(|(name, _)| seen.insert(name.to_string()) && defs.get(name).is_some_and(|d| go(defs, d, seen)))
+    }
+    go(defs, def, &mut std::collections::HashSet::new())
+}
+
 /// Whether an answer holds such a key: the page cannot be kept for anyone,
 /// the same visitor later included, or two payments would be one.
 pub fn holds_form_key(body: &[u8]) -> bool {

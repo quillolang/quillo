@@ -833,6 +833,7 @@ fn run_loop(
         slots: Vec::new(),
         free: Vec::new(),
         ready: VecDeque::new(),
+        ended: std::collections::HashSet::new(),
         tasks: Vec::new(),
         free_tasks: Vec::new(),
         workers: Vec::new(),
@@ -861,6 +862,10 @@ struct Loop {
     free: Vec<usize>,
     /// Connections with something to do, oldest first.
     ready: VecDeque<usize>,
+    /// Connections whose client has said it sends no more (its FIN, in the event): read to the
+    /// end, as with the data that came with it nothing else will say so (FEEDBACK49.md, Q-600;
+    /// branch main).
+    ended: std::collections::HashSet<usize>,
     tasks: Vec<Option<Running>>,
     free_tasks: Vec<usize>,
     /// Handles on the program for requests to run with, kept for reuse.
@@ -944,7 +949,12 @@ impl Loop {
                 match ev.token() {
                     LISTENER => accept = true,
                     WAKER => {}
-                    Token(i) => self.ready.push_back(i),
+                    Token(i) => {
+                        if ev.is_read_closed() {
+                            self.ended.insert(i);
+                        }
+                        self.ready.push_back(i)
+                    }
                 }
             }
             if accept {
@@ -1089,6 +1099,7 @@ impl Loop {
 
     fn close(&mut self, i: usize, mut c: Box<Conn>) {
         let _ = self.poll.registry().deregister(&mut c.stream);
+        self.ended.remove(&i);
         self.slots[i] = Slot::Free;
         self.free.push(i);
         crate::metrics::CONNECTIONS.fetch_sub(1, SeqCst);
@@ -1159,6 +1170,7 @@ impl Loop {
             return self.start(i, c, items);
         }
         let mut ended = false;
+        let told_end = self.ended.remove(&i);
         let chunk = &mut self.chunk;
         let cap = input_cap(self.app.max_body);
         c.full = false;
@@ -1178,8 +1190,9 @@ impl Loop {
                     c.input.extend_from_slice(&chunk[..n]);
                     // Less than asked for: that was all there was. (What
                     // arrives later raises a new event, so there is no need
-                    // for another read just to be told so.)
-                    if n < chunk.len() {
+                    // for another read just to be told so, unless the client
+                    // has said it sends no more, which raises none: Q-600.)
+                    if n < chunk.len() && !told_end {
                         break;
                     }
                 }

@@ -737,3 +737,135 @@ fn a_server_taking_rtp_stops_when_asked() {
     let status = eventually(10, "it did not stop", || r.child.try_wait().unwrap());
     assert!(status.success(), "{}: {}", status, r.log());
 }
+
+// ---- what a page may not send, and a page that does not read (FEEDBACK49.md) ----------
+
+impl Ws {
+    /// A frame as written, with a length of its own (not the data's) and FIN as given.
+    fn raw(&mut self, first: u8, len: u64, data: &[u8]) {
+        let mut f = vec![first];
+        if len < 126 {
+            f.push(0x80 | len as u8);
+        } else if len <= 0xffff {
+            f.push(0x80 | 126);
+            f.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            f.push(0x80 | 127);
+            f.extend_from_slice(&len.to_be_bytes());
+        }
+        let mask = [1, 2, 3, 4];
+        f.extend_from_slice(&mask);
+        f.extend(data.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        self.0.write_all(&f).unwrap();
+    }
+
+    /// Whether the server ends the connection: a close frame, or the end of the stream.
+    fn ended(&mut self) -> bool {
+        self.0.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut h = [0u8; 2];
+        loop {
+            match self.0.read_exact(&mut h) {
+                Err(e) => return !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
+                Ok(()) if h[0] & 0x0f == 8 => return true,
+                Ok(()) => {
+                    let mut n = (h[1] & 0x7f) as usize;
+                    if n == 126 {
+                        let mut l = [0u8; 2];
+                        let _ = self.0.read_exact(&mut l);
+                        n = u16::from_be_bytes(l) as usize;
+                    }
+                    let mut data = vec![0u8; n];
+                    let _ = self.0.read_exact(&mut data);
+                }
+            }
+        }
+    }
+}
+
+// Q-593: a continuation's length of u64::MAX after a first part wrapped the size check, and
+// the allocation panicked the reading thread: the page stayed counted, and was ignored.
+#[test]
+fn a_frame_whose_length_wraps_or_a_long_control_frame_ends_the_connection() {
+    let d = dir("ws-wrap");
+    std::fs::write(d.join("main.qwe"), CHANNELS).unwrap();
+    let r = run(&d.join("main.qwe"), &["--no-wt"], &[]);
+    let joined = |r: &Run| {
+        let mut w = Ws::open(r);
+        w.text(r#"["j","chat"]"#);
+        eventually(10, "the page did not join", || (r.get("/peers") == "1").then_some(()));
+        w
+    };
+    // A first part, then a last part whose length wraps.
+    let mut w = joined(&r);
+    w.raw(0x01, 1, b"x");
+    w.raw(0x80, u64::MAX, b"");
+    assert!(w.ended(), "the connection was kept");
+    eventually(10, "the page is still counted", || (r.get("/peers") == "0").then_some(()));
+    // And one just past what the server takes, counted with the first part.
+    let mut w = joined(&r);
+    w.raw(0x01, 10, b"0123456789");
+    w.raw(0x80, u64::MAX - 9, b"");
+    assert!(w.ended());
+    eventually(10, "the page is still counted", || (r.get("/peers") == "0").then_some(()));
+    // A ping of 126 bytes, and a ping in parts (RFC 6455 5.5).
+    let mut w = joined(&r);
+    w.raw(0x89, 126, &[b'p'; 126]);
+    assert!(w.ended());
+    let mut w = joined(&r);
+    w.raw(0x09, 1, b"p");
+    assert!(w.ended());
+    eventually(10, "the page is still counted", || (r.get("/peers") == "0").then_some(()));
+    // A message in parts is taken whole, and a ping of 125 bytes between them is answered.
+    let mut w = joined(&r);
+    w.raw(0x01, 14, br#"["m","chat","h"#);
+    w.raw(0x89, 125, &[b'p'; 125]);
+    // Past the join's answer.
+    while w.read() != Frame::Pong {}
+    w.raw(0x80, 6, br#"ello"]"#);
+    eventually(10, "the message in parts was not heard", || r.get("/heard").contains("hello").then_some(()));
+    assert_eq!(r.get("/peers"), "1");
+}
+
+/// The threads of a process, as the system counts them.
+fn threads(pid: u32) -> usize {
+    if let Ok(s) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
+        return s.lines().find_map(|l| l.strip_prefix("Threads:")).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+    }
+    let out = Command::new("ps").args(["-M", "-p", &pid.to_string()]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).lines().count().saturating_sub(1)
+}
+
+// Q-594: once a page's queue was full, each reliable message started a thread that waited on
+// a writer stuck on a page that does not read: thousands of threads, never ending.
+#[test]
+fn a_page_that_does_not_read_costs_no_thread_per_message_and_is_let_go() {
+    let d = dir("ws-stuck");
+    std::fs::write(d.join("main.qwe"), CHANNELS.replace("route GET /peers", FLOOD)).unwrap();
+    let r = run(&d.join("main.qwe"), &["--no-wt"], &[]);
+    let mut w = Ws::open(&r);
+    w.text(r#"["j","chat"]"#);
+    eventually(10, "the page did not join", || (r.get("/peers") == "1").then_some(()));
+    // The socket full, then more reliable messages than the page's queue holds, three times.
+    r.get("/flood");
+    let before = threads(r.child.id());
+    for _ in 0..3 {
+        r.get("/many");
+    }
+    let after = threads(r.child.id());
+    assert!(after < before + 20, "threads went from {} to {}", before, after);
+    // Its writer gives up on a write the page never takes, and the page is let go.
+    eventually(60, "the page that does not read was not let go", || (r.get("/peers") == "0").then_some(()));
+    // A page that reads is not touched by it.
+    let mut ok = Ws::open(&r);
+    ok.text(r#"["j","chat"]"#);
+    eventually(10, "a new page did not join", || (r.get("/peers") == "1").then_some(()));
+    assert_eq!(r.get("/say/3"), "1");
+    let mut got = Vec::new();
+    while !got.iter().any(|t: &String| t.contains("line 2")) {
+        if let Frame::Text(t) = ok.read() {
+            got.push(t);
+        }
+    }
+    assert_eq!(got.iter().filter(|t| t.contains("line")).count(), 3, "{:?}", got);
+    drop(w);
+}

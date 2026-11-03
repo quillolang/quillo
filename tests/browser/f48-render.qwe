@@ -1,0 +1,65 @@
+// How markup is written, in the browser after an update as on the server (FEEDBACK48.md, Q-564
+// to Q-567, Q-571 and Q-572; branch main): bools as children and in word attributes, numbers
+// in a style map, class maps and lists, a spread's React keys, a function as a child, and a
+// <pre> whose text starts with a newline. Driven by f48-render.js.
+
+component K(children) {
+    <span id="kk">{children}</span>
+}
+
+component K2(render) {
+    <p id="h">k{render}k</p>
+}
+
+component Cap() {
+    state show = false
+    let cap = { onClickCapture: () => 1 }
+    <div>
+        <button id="cap" @click={() => { show = true }}>cap</button>
+        {show ? <b id="cb" {...cap}>x</b> : null}
+    </div>
+}
+
+component R() {
+    state on = true
+    state n = 0
+    state size = 12
+    state typed = ""
+    state log = ""
+    let inc = () => { n += 1 }
+    let props = { onClick: () => { n += 1 }, title: "t", className: on ? "big" : "small", htmlFor: "i", "aria-pressed": on, style: { fontSize: size }, gone: null, "data-n": n }
+    let hp = on ? { onClick: () => { n += 100 } } : {}
+    let names = ["a", on && "b", [on ? "c" : null, ["d"]], { e: !on }, "", null]
+    <div>
+        <button id="go" @click={() => { on = !on; size = 20 }}>go</button>
+        <p id="m" class={{ active: on, off: !on }}>m</p>
+        <p id="l" class={names}>l</p>
+        <p id="e" class={{}}>e</p>
+        <p id="z" class={{ a: false, b: null }}>z</p>
+        <p id="mixed" class={on ? "one two" : ["two", "three"]}>mixed</p>
+        <div id="s" style={{ fontSize: size, opacity: 0.5, zIndex: n, "--gap": size, msFlex: 1, margin: 0, top: -size, left: 1.5, lineHeight: 1.2, flexGrow: 2 }}>s</div>
+        <div id="a" aria-hidden={on} aria-expanded={!on} data-on={on} draggable={on} spellcheck={!on} contenteditable={on} translate={on} hidden={!on} aria-label={on ? "x" : null}>a</div>
+        <div id="af" aria-hidden aria-expanded={false} data-x={true} disabled={false}>af</div>
+        <label id="b" {...props}>{n}</label>
+        <button id="hp" {...hp}>hp</button>
+        <button id="w2" @click={() => { n += 1000 }} {...{ onClick: () => { n += 5 } }}>w2</button>
+        <div id="c" {...{ onDoubleClick: () => { log = log + "dbl;" } }}>c</div>
+        <input id="i" {...{ onChange: (e) => { typed = e.value } }}/>
+        <div id="w" {...{ onFocus: () => { log = log + "focus;" }, onBlur: () => { log = log + "blur;" } }}><input id="wi"/></div>
+        <p id="typed">{typed}</p>
+        <p id="log">{log}</p>
+        <p id="k">a{true}b{false}c{null}d{inc}e{(x) => <i>{x}</i>}f{on}g</p>
+        <K>x{inc}y</K>
+        <K2 render={inc}/>
+        <pre id="pre">{"\nline"}</pre>
+        <pre id="pre2">{on ? "\nyes" : "\nno"}</pre>
+        <textarea id="ta" value={on ? "\nfirst" : "\nsecond"}></textarea>
+        <p id="sc" class="own" {...{ className: on ? "y" : "z" }}>sc</p>
+        <ul id="rows">{for x in [1, 2] => <li key={x}>{x}{inc}{true}</li>}</ul>
+        {on ? null : <i id="late" aria-hidden aria-expanded={false} data-x={true} disabled={false} style={{ width: 10, zIndex: 2 }} class={{ q: true, r: false }}>late</i>}
+        {on ? null : <pre id="latepre">{"\nz"}</pre>}
+        <Cap/>
+    </div>
+}
+
+route GET / = <html><body><R/></body></html>

@@ -34,6 +34,9 @@ const MAX_PACKET: usize = 65_507;
 /// Most packets, and bytes, handed to the program at once.
 const BATCH_PACKETS: usize = 4096;
 const BATCH_BYTES: usize = 1 << 20;
+/// Most bytes a port's queue holds, whatever `queue` says of packets: 60 KB packets filled
+/// 655 MB of one (FEEDBACK49.md, Q-604; branch main).
+const QUEUE_BYTES: usize = 64 << 20;
 /// How long a socket the running program no longer listens on is kept, in
 /// case a program being loaded (which binds before it runs) wants it.
 const GRACE: Duration = Duration::from_secs(3);
@@ -64,9 +67,72 @@ struct Packet {
 
 /// A bound socket, and the packets it has received that the program has
 /// not had yet.
+/// What a port has received and the program has not had yet: the packets, their bytes, and
+/// the bytes from each sender.
+#[derive(Default)]
+struct Queue {
+    packets: VecDeque<Packet>,
+    bytes: usize,
+    from: HashMap<std::net::IpAddr, usize>,
+}
+
+impl Queue {
+    fn push(&mut self, p: Packet) {
+        self.bytes += p.data.len();
+        *self.from.entry(p.from.ip()).or_default() += p.data.len();
+        self.packets.push_back(p);
+    }
+
+    fn taken(&mut self, p: &Packet) {
+        self.bytes -= p.data.len();
+        if let Some(n) = self.from.get_mut(&p.from.ip()) {
+            *n -= p.data.len();
+            if *n == 0 {
+                self.from.remove(&p.from.ip());
+            }
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<Packet> {
+        let p = self.packets.pop_front()?;
+        self.taken(&p);
+        Some(p)
+    }
+
+    /// A packet in, within `cap` packets and `bytes`: how many were dropped for it. A sender
+    /// holding more than half of a full queue that others wait in has its new packet dropped,
+    /// where dropping the oldest let one sender push out the rest (FEEDBACK49.md, Q-604;
+    /// branch main). Alone, its oldest go, as before.
+    fn admit(&mut self, p: Packet, cap: usize, bytes: usize) -> u64 {
+        let n = p.data.len();
+        let full = |q: &Queue| q.packets.len() >= cap || q.bytes + n > bytes;
+        let mut dropped = 0;
+        if full(self) {
+            let mine = self.from.get(&p.from.ip()).copied().unwrap_or(0);
+            if mine * 2 > self.bytes && self.from.len() > 1 {
+                return 1;
+            }
+            while full(self) && self.pop_front().is_some() {
+                dropped += 1;
+            }
+        }
+        self.push(p);
+        dropped
+    }
+
+    /// The first `n` packets, out of the queue.
+    fn take(&mut self, n: usize) -> Vec<Packet> {
+        let out: Vec<Packet> = self.packets.drain(..n).collect();
+        for p in &out {
+            self.taken(p);
+        }
+        out
+    }
+}
+
 struct Bound {
     socket: UdpSocket,
-    queue: Mutex<VecDeque<Packet>>,
+    queue: Mutex<Queue>,
     arrived: Condvar,
     cap: usize,
     closed: AtomicBool,
@@ -138,7 +204,7 @@ fn bind(host: &str, port: u16, cap: usize) -> std::io::Result<()> {
     roomy(&socket);
     let b = Arc::new(Bound {
         socket,
-        queue: Mutex::new(VecDeque::new()),
+        queue: Mutex::new(Queue::default()),
         arrived: Condvar::new(),
         cap,
         closed: AtomicBool::new(false),
@@ -194,13 +260,8 @@ fn receive(b: Arc<Bound>) {
             }
         };
         RECEIVED.fetch_add(1, Relaxed);
-        let mut q = lock(&b.queue);
-        if q.len() >= b.cap {
-            q.pop_front();
-            DROPPED.fetch_add(1, Relaxed);
-        }
-        q.push_back(Packet { data: buf[..n].to_vec(), from, at: now_ms() });
-        drop(q);
+        let dropped = lock(&b.queue).admit(Packet { data: buf[..n].to_vec(), from, at: now_ms() }, b.cap, QUEUE_BYTES);
+        DROPPED.fetch_add(dropped, Relaxed);
         b.arrived.notify_one();
     }
 }
@@ -254,21 +315,26 @@ fn deliver_loop(addr: SocketAddr, port: u16, b: Arc<Bound>) {
     loop {
         let batch: Vec<Packet> = {
             let mut q = lock(&b.queue);
-            while q.is_empty() {
+            while q.packets.is_empty() {
                 if b.closed.load(Relaxed) {
                     return;
                 }
                 q = b.arrived.wait_timeout(q, Duration::from_millis(250)).unwrap_or_else(std::sync::PoisonError::into_inner).0;
             }
             let (mut n, mut bytes) = (0, 0);
-            while n < q.len() && n < BATCH_PACKETS && (n == 0 || bytes + q[n].data.len() <= BATCH_BYTES) {
-                bytes += q[n].data.len();
+            while n < q.packets.len() && n < BATCH_PACKETS && (n == 0 || bytes + q.packets[n].data.len() <= BATCH_BYTES) {
+                bytes += q.packets[n].data.len();
                 n += 1;
             }
-            q.drain(..n).collect()
+            q.take(n)
         };
         let body = encode(&batch);
         let path = format!("/_quillo/udp/{}", port);
+        // A batch the server never took is said, and counted, where it went with no word (Q-604).
+        let lost = |why: &str| {
+            DROPPED.fetch_add(batch.len() as u64, Relaxed);
+            eprintln!("quillo: UDP port {}: {} packet(s) dropped: {}", port, batch.len(), why);
+        };
         // A server that is not answering yet (or any more) is tried again.
         let mut tries = 0;
         loop {
@@ -279,6 +345,9 @@ fn deliver_loop(addr: SocketAddr, port: u16, b: Arc<Bound>) {
                     Err(_) => {
                         tries += 1;
                         if tries > 50 || b.closed.load(Relaxed) || crate::httpd::stopping() {
+                            if tries > 50 {
+                                lost("the server could not be reached for 5 s");
+                            }
                             break;
                         }
                         std::thread::sleep(Duration::from_millis(100));
@@ -299,6 +368,9 @@ fn deliver_loop(addr: SocketAddr, port: u16, b: Arc<Bound>) {
                 Err(_) => {
                     tries += 1;
                     if tries > 50 || crate::httpd::stopping() {
+                        if tries > 50 {
+                            lost("the server closed the connection each time");
+                        }
                         break;
                     }
                 }
@@ -590,6 +662,43 @@ fn reply(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // FEEDBACK49.md, Q-604: a queue counted packets, not bytes, and a full one let one sender
+    // push out the others.
+    #[test]
+    fn a_queue_is_held_to_its_bytes_and_one_sender_cannot_push_out_the_rest() {
+        let p = |from: &str, n: usize| Packet { data: vec![1; n], from: from.parse().unwrap(), at: 0 };
+        let mut q = Queue::default();
+        // Bytes: ten packets of 100 in 500 bytes keep the last five.
+        let dropped: u64 = (0..10).map(|_| q.admit(p("10.0.0.1:1", 100), 1000, 500)).sum();
+        assert_eq!((dropped, q.packets.len(), q.bytes), (5, 5, 500));
+        // One sender alone: its oldest go, as before.
+        assert_eq!(q.admit(p("10.0.0.1:1", 100), 1000, 500), 1);
+        // Another arrives: room is made for it from the first one's oldest.
+        assert_eq!(q.admit(p("10.0.0.2:9", 100), 1000, 500), 1);
+        assert_eq!(q.from.len(), 2);
+        // The first, holding more than half, now has its new packets dropped, and the
+        // second's stay.
+        for _ in 0..20 {
+            assert_eq!(q.admit(p("10.0.0.1:2", 100), 1000, 500), 1);
+        }
+        assert_eq!(q.from[&"10.0.0.2".parse::<std::net::IpAddr>().unwrap()], 100);
+        // The second still gets in, and the packet limit counts as the byte limit does.
+        assert_eq!(q.admit(p("10.0.0.2:9", 100), 1000, 500), 1);
+        assert_eq!(q.from[&"10.0.0.2".parse::<std::net::IpAddr>().unwrap()], 200);
+        let mut few = Queue::default();
+        let dropped: u64 = (0..5).map(|_| few.admit(p("10.0.0.1:1", 1), 3, 1 << 20)).sum();
+        assert_eq!((dropped, few.packets.len()), (2, 3));
+        // Taken out, the counts follow, and a sender with none left is forgotten.
+        let all = q.packets.len();
+        assert_eq!(q.take(all).len(), all);
+        assert_eq!((q.bytes, q.from.len()), (0, 0));
+        // An empty packet is let in, and a packet larger than the whole limit empties the queue
+        // for it.
+        assert_eq!(q.admit(p("10.0.0.3:1", 0), 1000, 500), 0);
+        assert_eq!(q.admit(p("10.0.0.3:1", 600), 1000, 500), 1);
+        assert_eq!(q.packets.len(), 1);
+    }
 
     #[test]
     fn batches_round_trip() {

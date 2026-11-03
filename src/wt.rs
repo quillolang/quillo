@@ -57,6 +57,9 @@ pub static TLS_KEY: OnceLock<std::path::PathBuf> = OnceLock::new();
 /// dropped, and a page that cannot take a reliable message is let go (it
 /// connects again).
 const PEER_QUEUE: usize = 4096;
+
+/// How long a write to a page may wait on a page that does not read (FEEDBACK49.md, Q-594).
+const WRITE_WAIT: Duration = Duration::from_secs(30);
 /// Messages from pages waiting for a channel's handler.
 const INBOX: usize = 10_000;
 /// The largest message, as JSON.
@@ -120,6 +123,10 @@ pub struct Peer {
     /// their own); over a WebSocket, with the rest.
     media_tx: Option<tokio::sync::mpsc::Sender<Arc<crate::media::Frame>>>,
     rooms: Mutex<HashSet<String>>,
+    /// It missed a message it was promised, and is being let go: one thread puts its close
+    /// after what is queued, where one was started for each message that did not fit, and each
+    /// waited on a writer stuck on a page that does not read (FEEDBACK49.md, Q-594; branch main).
+    cut: AtomicBool,
 }
 
 /// A page, as a stream's viewer.
@@ -153,9 +160,11 @@ impl Peer {
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) if frame => false,
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 DROPPED.fetch_add(1, Relaxed);
-                if reliable {
+                if reliable && !self.cut.swap(true, Relaxed) {
                     // It would miss a message it was promised: it is let go,
-                    // and joins again as new.
+                    // and joins again as new, once it has what was queued. The
+                    // thread ends with the writer, which a page that does not
+                    // read ends too (`WRITE_WAIT`).
                     let tx = self.tx.clone();
                     std::thread::spawn(move || {
                         let _ = tx.blocking_send(Out::Close);
@@ -199,7 +208,7 @@ pub fn connect(t: Ticket, media_tx: Option<tokio::sync::mpsc::Sender<Arc<crate::
             break id;
         }
     };
-    let p = Arc::new(Peer { id, session: t.session, tenant: t.tenant, tx, media_tx, rooms: Mutex::new(HashSet::new()) });
+    let p = Arc::new(Peer { id, session: t.session, tenant: t.tenant, tx, media_tx, rooms: Mutex::new(HashSet::new()), cut: AtomicBool::new(false) });
     lock(&hub().peers).insert(id, p.clone());
     (p, rx)
 }
@@ -1093,7 +1102,8 @@ mod quic {
                             let mut framed = Vec::with_capacity(json.len() + 4);
                             framed.extend_from_slice(&(json.len() as u32).to_be_bytes());
                             framed.extend_from_slice(json.as_bytes());
-                            if out.write_all(&framed).await.is_err() {
+                            // A page that does not read is let go, not waited on (Q-594).
+                            if !matches!(tokio::time::timeout(WRITE_WAIT, out.write_all(&framed)).await, Ok(Ok(_))) {
                                 break;
                             }
                         }
@@ -1138,6 +1148,7 @@ mod quic {
 /// it: what the page sends is read on a second thread.
 pub fn over_websocket(mut socket: crate::ws::Socket, ticket: Ticket) {
     let (peer, mut rx) = connect(ticket, None);
+    socket.write_timeout(WRITE_WAIT);
     let Ok(mut reader) = socket.reader(MAX_MESSAGE + 64) else {
         disconnect(&peer);
         return;
@@ -1145,6 +1156,15 @@ pub fn over_websocket(mut socket: crate::ws::Socket, ticket: Ticket) {
     let reading = {
         let peer = peer.clone();
         std::thread::Builder::new().name("quillo-ch-ws".into()).stack_size(256 << 10).spawn(move || {
+            // However the reading ends, a panic too, the page is let go, where one left it
+            // counted and ignored (FEEDBACK49.md, Q-593; branch main).
+            struct Ends(Arc<Peer>);
+            impl Drop for Ends {
+                fn drop(&mut self) {
+                    self.0.put(Out::Close);
+                }
+            }
+            let _ends = Ends(peer.clone());
             loop {
                 match reader.next() {
                     Ok(crate::ws::Message::Text(t)) => from_page(&peer, &t),
@@ -1157,7 +1177,6 @@ pub fn over_websocket(mut socket: crate::ws::Socket, ticket: Ticket) {
                     Ok(_) => {}
                 }
             }
-            peer.put(Out::Close);
         })
     };
     if reading.is_err() {

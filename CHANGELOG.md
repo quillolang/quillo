@@ -22,6 +22,36 @@
 - **`*rest` comes last**: `/f/*rest/more`, and a route inside `routes /docs/*path`, are
   errors (what followed was ignored); so are `route HEAD` and a route under `/_quillo/`,
   which were never called (Q-540, Q-541).
+- **An attribute's `"text"` is plain, as in HTML**: `\n`, `\t` and `\\` in it are the
+  characters as written, and `\"` is an error. Write `&quot;` for a quote, or the value as
+  a Quillo string, `title={"say \"hi\""}` (FEEDBACK48.md, Q-563).
+- **`onChange={...}` on an `<input>` or `<textarea>` runs on each keystroke**, as React's
+  does, where it waited until the field lost focus; `onFocus` and `onBlur` are `focusin`
+  and `focusout`, so a wrapper hears its fields. `@change` and `@focus` are as before (Q-560,
+  Q-561).
+- **`.class` and `#id` on a view's tag are its `class` and `id`**, which were dropped: a
+  view without those parameters is told so. A body given to a view with no `children`
+  parameter is an error, where it was dropped (Q-568, Q-569).
+- **`{true}` as a child shows nothing**, as `{false}` and `{null}` do, as in React; it
+  showed "true". **`aria-*`, `data-*`, `draggable`, `spellcheck` and `contenteditable`
+  write `true`/`false` as text**, where `true` was a bare name and `false` left them out.
+  **A number in a `style` map is in pixels** but for unitless properties. **`class` takes
+  a map or a list**, and a spread's `onClick` and `className` work as written-out ones
+  (Q-564 to Q-567).
+- **Text in a `<pre>`, `<textarea>` and `<listing>` keeps its lines and spaces**, where it
+  was joined into one line, and a `//` line in it is text, not a comment (Q-572).
+- **A `db.open` that fails as the program starts stops it**, where it ran on SQLite in
+  memory and lost what it took at the next start. Open `":memory:"` for that on purpose
+  (FEEDBACK49.md, Q-602).
+- **A service call answered 502 or 504 goes to another copy only if its function uses
+  `idempotent`**; any other call gives the error, as the copy behind a proxy may have run
+  it (Q-595). **An unsigned 200 from a service is refused under the shared secret** too: a
+  service in another language signs its answers, as the guide's protocol says (Q-596).
+- **`http.get` and the rest give an error value for an answer past 64 MiB**, where they cut
+  it there (Q-599). **The medians, `quantiles`, `percentile`, `describe`, `rank` and
+  `histogram` refuse NaN and infinities**, and `money.add`, `sub` and `mul` give an error
+  value past `money.of`'s range (Q-605). **`json.stringify` gives
+  an error value past 256 MiB or 10,000 levels**, and an answer that would, a 500 (Q-606).
 
 - **An input with `value={state}` and nothing else setting it is two-way now**: typing
   changes the state. Before, typing was undone at once. To show a state without letting
@@ -308,6 +338,59 @@
   mistake on the route line: `{ ok: true }` meant as an answer, a pattern after `with` or
   before `?`, a method or no `/` after `routes`, a character a path cannot hold, a
   parameter named `if` or `1`, and a group with nothing in it (Q-546).
+
+### The failure side (FEEDBACK49.md)
+
+- A page could stop a channel's thread with one WebSocket frame whose length wrapped the
+  size check, and stay counted and ignored; control frames longer than 125 bytes, or in
+  parts, are refused too (Q-593). A page that stops reading no longer costs a thread for
+  each reliable message, and is let go when a frame to it takes more than 30 s (Q-594).
+- JWKS: a failed fetch is not tried again for a minute, the old keys are used meanwhile,
+  one fetch at a time for 3 s at most, and the URL goes to the log, not to the caller
+  (Q-597). UDP: 64 MiB a port, a share for each sender, a lost batch logged; H.264: 16 MiB
+  a frame (Q-604).
+- A transaction SQLite ends by itself (a full disk) makes each later statement an error,
+  where they committed one by one, and `idempotent` stored a success (Q-591). A PostgreSQL
+  transaction whose idle connection the server ended is begun on another, and
+  `db.error_kind` says `"connection"` (Q-601).
+- A request followed at once by the client's end is answered and the connection closed,
+  where it stayed open (Q-600).
+- Still open: a derived value that throws in the browser (Q-590), a server fn's answer
+  that is not one (Q-598), dropping a value nested hundreds of thousands deep (Q-592, but
+  for JSON), SQLite's lock wait holding others (Q-603), the compute budget inside long
+  builtins (Q-606), and the fuzz targets (Q-608). An ignored test of a bug since fixed runs again (Q-609).
+
+### Markup as JSX and HTML write it (FEEDBACK48.md)
+
+- Every named entity HTML has (`&rarr;`, `&times;`, `&rsquo;`), in text and in each kind of
+  attribute value, where ten were known and attributes had none: `href="?a=1&amp;b=2"`
+  sent `amp;b` (Q-562). An attribute's `"text"` is plain, so `pattern="\d{3}"` loads (Q-563).
+- React's event names that are other DOM events: `onChange` on a field is `@input`,
+  `onDoubleClick` is `@dblclick`, `onFocus`/`onBlur` are `@focusin`/`@focusout`; `…Capture`
+  is an error; `quillo check` warns of `@mouseEnter`, as event names are compared as written
+  (Q-560, Q-561).
+- `<pre>`, `<textarea>` and `<listing>` keep their text as written (Q-572). `{/* ... */}`
+  between attributes and `{// ...}` are comments (Q-575). `<img></img>` is taken, and a
+  stray `</img>` gets a fix that removes it, where the fix closed the element around it
+  (Q-576).
+- `.class` and `#id` on a view are its `class` and `id`; `<Card.Header/>` and
+  `<React.Fragment>` say what to write (Q-568, Q-577). A body for a view with no `children`
+  is an error (Q-569).
+- `quillo check` warns of React's own attributes (`defaultValue`, `defaultChecked`, `ref`,
+  `dangerouslySetInnerHTML`, SVG's `strokeWidth` and the like) (Q-570), a function where
+  markup goes (Q-571), text and an inline element on lines of their own, which touch on the
+  page (Q-573; the site and the kit had 26), and `xs.map((x, i) => ...)`, as `map(xs, f)`
+  was checked (Q-574). `view Card(props)`, `view Card({ title })`, `let Tag = "h1"`,
+  `<Fragment>`, `{...xs}` among children and `for (x, i) in xs` each say how Quillo writes
+  them (Q-577).
+- Values in markup as React writes them, on the server and in the browser after an update:
+  `{true}` shows nothing, ARIA's and `data-*`'s booleans are `"true"`/`"false"`, a style
+  number is in pixels but for React's unitless properties (and `msFlex` is `-ms-flex`),
+  `class` takes a map or a list as `clsx` does, and a spread follows the written-out rules
+  (Q-564 to Q-567). A function as a child shows nothing, where it was `<fn <fn>>`; in the
+  browser it was called, so `{inc}` ran the handler as the page rendered (Q-571). A `<pre>`
+  whose text starts with a line break gets the one the browser drops back (Q-572).
+- The guide has a "From JSX" table beside "From HTML" (Q-578).
 
 ### Found measuring coverage
 

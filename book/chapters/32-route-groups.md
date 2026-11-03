@@ -31,7 +31,7 @@ line, and a value that does not fit lets matching go on to the next route, so
 ## Middleware
 
 A check is a function that takes the request and either gives it back or ends the
-request. In a group it goes after the prefix, one `|` per check, and runs before each
+request. In a group it goes after the prefix, one `|` per check, and runs before the
 route's body:
 
 ```quillo
@@ -51,13 +51,24 @@ What a middleware gives back decides what happens:
   sends the visitor to the login page, `reply 401 { error: "..." }` answers JSON.
 - **A response value**, from `respond(...)` or `redirect(...)` returned rather than
   replied, answers the request too.
-- **Anything else** lets the route run. Giving the request back is the convention, so
-  the same function works as a pipeline stage inside a route (`request | signed_in |
-  ...`) and as a group's middleware.
+- **The request, or null,** lets the route run. Giving the request back is the
+  convention, so the same function works as a pipeline stage inside a route (`request |
+  signed_in | ...`) and as a group's middleware.
+- **Anything else** stops it *(since 0.7: these let the route run)*: `false` answers
+  403, an error value answers as a route's error does, and any other value (`true`,
+  text) is a 500 that names the middleware. So a check is written `(r) => ok(r) ? r :
+  reply 403 "..."`, not as a predicate, and `quillo check` says so when a middleware can
+  only be a `bool` or text.
 - What it gives does not reach the route: a route that needs the user reads it again
   (`session()`, `me()`), which is cheap.
 
 Order: outer groups' middleware first, then the inner's, each in the order written.
+It is given the request as sent, whatever the route's patterns bind.
+
+It runs before the server's own answers too *(since 0.7)*: a request under the group's
+path that no route of it takes (another path, method or parameter type, a pattern it does
+not match, an `OPTIONS`) goes through the group's middleware first, so only those it lets
+in learn what is there from a 404, a 400, a 405 and its `Allow`.
 `quillo check` checks each call at the line the middleware is written on, as it checks
 any other call.
 

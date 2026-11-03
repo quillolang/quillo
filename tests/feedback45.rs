@@ -272,7 +272,7 @@ fn a_lambdas_arguments_are_counted() {
     assert_eq!(d, [
         "2 missing argument `b` in call to `f`",
         "3 `f` takes 2 arguments, got 3",
-        "4 `map` passes its function one item, but this one takes 2",
+        "4 `map` passes its function one item, but this one takes 2: for the index, `for [i, x] in enumerate(xs) => ...`, which gives a list too",
         "5 `reduce` passes the total so far and an item: `reduce(xs, 0, (total, x) => total + x)`",
         "6 `filter` passes its function one item, but this one takes 0",
         "7 `sort_by` passes one item, not two to compare: give what to sort by, `sort_by(xs, (x) => x.n)`",

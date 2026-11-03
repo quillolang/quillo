@@ -1,0 +1,21 @@
+// React's event names on elements (FEEDBACK48.md, Q-560 and Q-561; branch main): `onChange`
+// on a field is each keystroke, `onDoubleClick` is the DOM's `dblclick`, and `onFocus` and
+// `onBlur` on a wrapper hear its fields. Driven by f48-events.js.
+
+component C() {
+    state name = ""
+    state note = ""
+    state log = []
+    <div>
+        <input id="a" value={name} onChange={(e) => { name = e.target.value }}/>
+        <p id="pa">{name}</p>
+        <textarea id="t" onChange={(e) => { note = e.target.value }}></textarea>
+        <p id="pt">{note}</p>
+        <div id="me" onDoubleClick={() => { log = push(log, "dbl") }}>twice</div>
+        <div id="w" onFocus={() => { log = push(log, "focus") }} onBlur={() => { log = push(log, "blur") }}><input id="i"/></div>
+        <select id="s" onChange={(e) => { log = push(log, `pick ${e.target.value}`) }}><option>x</option><option>y</option></select>
+        <p id="log">{join(log, ",")}</p>
+    </div>
+}
+
+route GET / = <html><body><C/></body></html>

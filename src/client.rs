@@ -3795,7 +3795,21 @@ impl<'a> Compiler<'a> {
                 self.pop_scope();
                 Ok(format!("(() => {{\n{}}})()", r?))
             }
-            _ => self.dyn_value(e),
+            // A function shows nothing (see `child_hole`; FEEDBACK48.md, Q-571; branch main).
+            Expr::Lambda(_) => {
+                self.reactive_expr(e)?;
+                Ok("null".into())
+            }
+            _ => {
+                let (v, r) = self.reactive_expr(e)?;
+                Ok(if r {
+                    format!("() => ({})", v)
+                } else if may_be_fn(e) {
+                    format!("W.nofn({})", v)
+                } else {
+                    v
+                })
+            }
         }
     }
 
@@ -3969,7 +3983,33 @@ impl<'a> Compiler<'a> {
     /// A hole's value in the template being compiled (see `dyn_value`),
     /// noting in `row_mask` whether it reads nothing but its row.
     fn hole_value(&mut self, e: &Expr, at: usize) -> Result<String, QuilloError> {
-        let Some(row) = self.cur_row.clone() else { return self.dyn_value(e) };
+        let (v, reactive) = self.hole_parts(e, at)?;
+        Ok(if reactive { format!("() => ({})", v) } else { v })
+    }
+
+    /// What `e` shows as a child (see `hole_value`). A function shows nothing, as on the server:
+    /// as it was, the runtime took it for a value that follows what it reads and called it, a
+    /// handler at once and `(x) => <p>{x}</p>` without its `x` (FEEDBACK48.md, Q-571; branch
+    /// main).
+    fn child_hole(&mut self, e: &Expr, at: usize) -> Result<String, QuilloError> {
+        if matches!(e, Expr::Lambda(_)) {
+            // Compiled all the same, so that what in it cannot run in the browser is said.
+            self.reactive_expr(e)?;
+            return Ok("null".into());
+        }
+        let (v, reactive) = self.hole_parts(e, at)?;
+        Ok(if reactive {
+            format!("() => ({})", v)
+        } else if may_be_fn(e) {
+            format!("W.nofn({})", v)
+        } else {
+            v
+        })
+    }
+
+    /// `e`'s code, and whether it reads what changes, for a hole (see `hole_value`).
+    fn hole_parts(&mut self, e: &Expr, at: usize) -> Result<(String, bool), QuilloError> {
+        let Some(row) = self.cur_row.clone() else { return self.reactive_expr(e) };
         let saved = self.read_log.replace(Vec::new());
         let r = self.reactive_expr(e);
         let log = std::mem::replace(&mut self.read_log, saved).unwrap_or_default();
@@ -3977,13 +4017,10 @@ impl<'a> Compiler<'a> {
             outer.extend(log.iter().cloned());
         }
         let (v, reactive) = r?;
-        if !reactive {
-            return Ok(v);
-        }
-        if !log.is_empty() && log.iter().all(|s| *s == row) && at < 31 {
+        if reactive && !log.is_empty() && log.iter().all(|s| *s == row) && at < 31 {
             self.row_mask |= 1 << at;
         }
-        Ok(format!("() => ({})", v))
+        Ok((v, reactive))
     }
 
     /// `<Name .../>`: a component, a view or a function, with its props as
@@ -4252,7 +4289,9 @@ impl<'a> Compiler<'a> {
             match v {
                 AttrVal::Bool if !live => fixed_attrs.push(format!("[{}, true]", js_str(name))),
                 AttrVal::Expr(e) if !live && fixed(e).is_some() => match fixed(e) {
-                    Some(Lit::Nil | Lit::Bool(false)) => {}
+                    // `aria-expanded={false}` is there, as "false" (FEEDBACK48.md, Q-564; branch main).
+                    Some(Lit::Nil) => {}
+                    Some(Lit::Bool(false)) if crate::interp::bool_attr_text(name, false).is_none() => {}
                     Some(l) => fixed_attrs.push(format!("[{}, {}]", js_str(name), lit_js(l))),
                     None => unreachable!(),
                 },
@@ -4292,7 +4331,9 @@ impl<'a> Compiler<'a> {
             hole(&mut holes, vals, 2, ev, format!("(e) => {{ {}; }}", sets.join("; ")));
         }
         if !spread_js.is_empty() {
-            let v = format!("W.spread([{}], [{}])", spread_js.join(", "), written.join(", "));
+            // The tag, for the names of React's handlers in it: `onChange` on an <input> is
+            // `input` (FEEDBACK48.md, Q-567; branch main).
+            let v = format!("W.spread([{}], [{}], {})", spread_js.join(", "), written.join(", "), js_str(&el.tag));
             hole(&mut holes, vals, 3, "", if spread_r { format!("() => {}", v) } else { v });
         }
         // Children: fixed text and elements are in the template; anything
@@ -4316,7 +4357,7 @@ impl<'a> Compiler<'a> {
                     vals.push(v);
                 }
                 HtmlChild::Expr(e) => {
-                    let v = if has_markup(e) { self.markup(e)? } else { self.hole_value(e, vals.len())? };
+                    let v = if has_markup(e) { self.markup(e)? } else { self.child_hole(e, vals.len())? };
                     kids.push(vals.len().to_string());
                     vals.push(v);
                 }
@@ -4331,6 +4372,25 @@ impl<'a> Compiler<'a> {
 /// component) without a `key`, which makes it start afresh when it changes.
 fn inlineable(el: &HtmlEl) -> bool {
     !el.tag.starts_with(|c: char| c.is_uppercase()) && el.attrs.iter().all(|(name, _)| name != "key")
+}
+
+/// Whether `e`, shown as a child, may be a function, which shows nothing (see `child_hole`):
+/// what names or gives a value, not what makes one of its own kind.
+fn may_be_fn(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Ident(..)
+            | Expr::Field(..)
+            | Expr::Index(..)
+            | Expr::Call(..)
+            | Expr::Pipe(..)
+            | Expr::Coalesce(..)
+            | Expr::Try(..)
+            | Expr::If(..)
+            | Expr::Match(..)
+            | Expr::Block(..)
+            | Expr::Binary(BinOp::And | BinOp::Or, ..)
+    )
 }
 
 /// A value fixed when the program is written: text, a number or a bool.

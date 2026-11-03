@@ -1224,6 +1224,9 @@ impl Parser {
             if self.at(&Tok::DotDot)? {
                 return self.err_at("a function takes no `...rest`: take a list");
             }
+            if self.at(&Tok::LBrace)? {
+                return self.destructured_params(&name);
+            }
             let pname = self.expect_ident("a parameter name")?;
             let ty = self.param_type(&pname)?;
             let default = if self.eat(&Tok::Assign)? { Some(self.parse_expr()?) } else { None };
@@ -1381,6 +1384,9 @@ impl Parser {
         while !self.at(&Tok::RParen)? {
             if self.at(&Tok::DotDot)? {
                 return self.err_at("a function takes no `...rest`: take a list");
+            }
+            if self.at(&Tok::LBrace)? {
+                return self.destructured_params(&name);
             }
             let pname = self.expect_ident("a parameter name")?;
             let ty = if self.eat(&Tok::Colon)? { Some(self.parse_type()?) } else { None };
@@ -2592,7 +2598,7 @@ impl Parser {
                     self.parse_html(line)
                 } else {
                     let fragment = self.peeked.is_none() && self.lx.peek_char() == Some('>');
-                    Err(QuilloError::new(if fragment { "there are no `<>` fragments: wrap the elements in one, like <div>, or give a list" } else { "expected an expression, found `<`" }, line))
+                    Err(QuilloError::new(if fragment { FRAGMENTS } else { "expected an expression, found `<`" }, line))
                 }
             }
             Tok::Ident(k) => match k.as_str() {
@@ -2900,7 +2906,26 @@ impl Parser {
         })
     }
 
+    /// React's `function Card({ title, body })`: a view's props are its parameters, each by name
+    /// (FEEDBACK48.md, Q-577; branch main).
+    fn destructured_params<T>(&mut self, name: &str) -> PResult<T> {
+        let names = match self.parse_binding() {
+            Ok(Pattern::Record(fs)) => fs.iter().filter_map(|f| f.path.first().cloned()).collect::<Vec<_>>().join(", "),
+            _ => String::new(),
+        };
+        let names = if names.is_empty() { "title, body".to_string() } else { names };
+        if name.starts_with(|c: char| c.is_uppercase()) {
+            self.err_at(format!("a view's parameters are its props, each by name: write `view {}({})`, without the braces", name, names))
+        } else {
+            self.err_at(format!("a parameter is a name, not a `{{ ... }}` pattern: write `{}({})`, or take the map and read its fields", name, names))
+        }
+    }
+
     fn parse_for(&mut self, line: u32) -> PResult<Expr> {
+        // JavaScript's `(x, i)`, for the index (FEEDBACK48.md, Q-574; branch main).
+        if self.at(&Tok::LParen)? {
+            return self.err_at("`for (x, i)`: a pattern takes no parentheses; for each item with its index, write `for [i, x] in enumerate(xs)`");
+        }
         let pat = self.parse_binding()?;
         if !self.eat_kw("in")? {
             return self.err_at("expected `in` after the `for` pattern");
@@ -3134,7 +3159,19 @@ impl Parser {
                 }
                 Some('>') => {
                     self.lx.bump();
-                    break VOID_TAGS.contains(&tag.as_str());
+                    let void = VOID_TAGS.contains(&tag.as_str());
+                    // `<img></img>`, `<br></br>`, as JSX and XHTML write them: the end tag right
+                    // after is passed over, where it was taken for the end of the element around
+                    // it (FEEDBACK48.md, Q-576; branch main).
+                    if void {
+                        let end: Vec<char> = format!("</{}>", tag).chars().collect();
+                        if end.iter().enumerate().all(|(i, c)| self.lx.peek_char_at(i).is_some_and(|d| d.eq_ignore_ascii_case(c))) {
+                            for _ in 0..end.len() {
+                                self.lx.bump();
+                            }
+                        }
+                    }
+                    break void;
                 }
                 Some('.') => {
                     self.lx.bump();
@@ -3159,10 +3196,9 @@ impl Parser {
                         self.lx.bump();
                         self.lx.skip_inline_ws();
                         let v = match self.lx.peek_char() {
-                            Some('"') => {
-                                let parts = self.lx.lex_string()?;
-                                self.template(parts)?
-                            }
+                            // Plain text with HTML's entities, as in JSX: `&amp;` in a link is `&`
+                            // (FEEDBACK48.md, Q-562 and Q-563; branch main).
+                            Some('"') => Expr::Lit(Lit::Str(decode_entities(&self.lx.lex_attr_string()?).into())),
                             Some('{') => self.parse_braced_expr()?,
                             // HTML's other two ways: 'single quotes' and an unquoted value, taken as
                             // the text they are, with no `{...}` in them (FEEDBACK36.md, Q-449;
@@ -3177,7 +3213,7 @@ impl Parser {
                                         None => return self.html_err(format!("attribute `{}`'s value is never closed with `'`", name)),
                                     }
                                 }
-                                Expr::Lit(Lit::Str(v.into()))
+                                Expr::Lit(Lit::Str(decode_entities(&v).into()))
                             }
                             Some(c) if !c.is_whitespace() && !"\"'=<>`{}".contains(c) => {
                                 let mut v = String::new();
@@ -3189,7 +3225,7 @@ impl Parser {
                                     v.push(c);
                                     self.lx.bump();
                                 }
-                                Expr::Lit(Lit::Str(v.into()))
+                                Expr::Lit(Lit::Str(decode_entities(&v).into()))
                             }
                             _ => {
                                 return self.html_err(format!(
@@ -3201,6 +3237,12 @@ impl Parser {
                         attrs.push((name, AttrVal::Expr(v)));
                     } else {
                         attrs.push((name, AttrVal::Bool));
+                    }
+                }
+                // `{/* a note */}` between attributes, as in JSX (FEEDBACK48.md, Q-575; branch main).
+                Some('{') if self.braced_comment_len() > 0 => {
+                    for _ in 0..self.braced_comment_len() {
+                        self.lx.bump();
                     }
                 }
                 // `{...map}` spreads a map; `{name}` is short for name={name}.
@@ -3234,21 +3276,65 @@ impl Parser {
         // `onclick={...}` on an element is `@click={...}`: a handler the program gives, not text the
         // browser runs. `onclick="..."` stays HTML's own, and text built from values stays refused
         // below; on a component, `on_change={...}` is a parameter (branch feedback40-43).
-        let mut renamed = Vec::new();
+        // `.name` and `#name` on a view's tag are its `class` and `id`, as written out, where
+        // they were dropped; a capital after the dot is JSX's member tag, which Quillo has not
+        // (FEEDBACK48.md, Q-568 and Q-577; branch main).
+        if tag.starts_with(|c: char| c.is_uppercase()) {
+            let member = classes.iter().find_map(|c| match c {
+                Expr::Lit(Lit::Str(n)) if n.starts_with(|c: char| c.is_uppercase()) => Some(n.to_string()),
+                _ => None,
+            });
+            match member {
+                Some(m) if tag == "React" && m == "Fragment" => return Err(QuilloError::new(FRAGMENTS, line)),
+                Some(m) => {
+                    return Err(QuilloError::new(
+                        format!("there are no member tags: `<{tag}.{m}>` is <{tag}> with the class `{m}`; import the view by its own name and write <{m}>"),
+                        line,
+                    ))
+                }
+                None => {}
+            }
+            let mut parts = Vec::new();
+            for (i, c) in std::mem::take(&mut classes).into_iter().enumerate() {
+                if i > 0 {
+                    parts.push(TPart::Lit(" ".to_string()));
+                }
+                match c {
+                    Expr::Lit(Lit::Str(n)) => parts.push(TPart::Lit(n.to_string())),
+                    Expr::Template(ps) => parts.extend(ps),
+                    e => parts.push(TPart::Expr(e)),
+                }
+            }
+            if !parts.is_empty() {
+                let v = match parts.as_slice() {
+                    [TPart::Lit(n)] => Expr::Lit(Lit::Str(n.clone().into())),
+                    _ => Expr::Template(parts),
+                };
+                attrs.insert(0, ("class".to_string(), AttrVal::Expr(v)));
+            }
+            if let Some(i) = id.take() {
+                attrs.insert(0, ("id".to_string(), AttrVal::Expr(i)));
+            }
+        }
+        let mut renamed: Vec<(String, String)> = Vec::new();
         if tag.starts_with(|c: char| c.is_ascii_lowercase()) {
             for (n, v) in attrs.iter_mut() {
                 let lower = n.to_ascii_lowercase();
                 let handler = matches!(v, AttrVal::Expr(e) if !matches!(e, Expr::Lit(_) | Expr::Template(_)));
                 if handler && lower.len() > 2 && lower.starts_with("on") && lower[2..].bytes().all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'_') {
-                    renamed.push(format!("@{}", &lower[2..]));
-                    *n = format!("@{}", &lower[2..]);
+                    let ev = react_event(&tag, n, &lower[2..]).map_err(|m| QuilloError::new(m, line))?;
+                    renamed.push((format!("@{}", ev), n.clone()));
+                    *n = format!("@{}", ev);
                 }
             }
         }
         // One of the two would be lost: in a list, `key` and a view's own
         // `key` was such a pair.
         if let Some((_, (name, _))) = attrs.iter().enumerate().find(|(i, (n, _))| n != "..." && attrs[..*i].iter().any(|(m, _)| m == n)) {
-            let hint = if renamed.contains(name) { format!(" (`on{}={{...}}` is `{}`)", &name[1..], name) } else { String::new() };
+            let hint = match renamed.iter().find(|(r, _)| r == name) {
+                Some((r, from)) => format!(" (`{}={{...}}` is `{}`)", from, r),
+                None => String::new(),
+            };
             return self.html_err(format!("attribute `{}` is written twice in <{}>{}", name, tag, hint));
         }
         // The browser decodes these attributes before it runs them, so no
@@ -3266,6 +3352,7 @@ impl Parser {
         }
         let mut children = Vec::new();
         let mut dollars = Vec::new();
+        let mut joined = Vec::new();
         if !self_closing {
             let text = self.lx.text();
             let opened = OpenTag {
@@ -3276,7 +3363,7 @@ impl Parser {
                 indent: text[start - col_at(text, start) as usize..].iter().take_while(|c| **c == ' ' || **c == '\t').collect(),
             };
             self.open.push(opened);
-            let r = self.parse_html_children(&tag, line, &mut dollars);
+            let r = self.parse_html_children(&tag, line, &mut dollars, &mut joined);
             self.open.pop();
             children = r?;
         }
@@ -3315,7 +3402,7 @@ impl Parser {
             }
         }
         let facts = ElFacts::of(&tag, &id, &classes, &attrs, &children, VOID_TAGS.contains(&tag.as_str()));
-        Ok(HtmlEl { tag, id, classes, attrs, children, line, dollars, facts })
+        Ok(HtmlEl { tag, id, classes, attrs, children, line, dollars, joined, facts })
     }
 
     /// What is between an element's tags, up to its end tag. A missing end
@@ -3323,17 +3410,47 @@ impl Parser {
     /// as the fix (branch editor-end-tags): before an end tag that closes
     /// an element around it, before the `}` that ends the code around it,
     /// or before the declaration that the file goes on with.
-    fn parse_html_children(&mut self, tag: &str, line: u32, dollars: &mut Vec<u32>) -> PResult<Vec<HtmlChild>> {
+    fn parse_html_children(&mut self, tag: &str, line: u32, dollars: &mut Vec<u32>, joined: &mut Vec<(u32, String, String)>) -> PResult<Vec<HtmlChild>> {
         let mut children = Vec::new();
         let mut text = String::new();
+        // In a <pre>, a <textarea> or a <listing>, text keeps its lines and spaces, as HTML has
+        // it, and `//` starts no comment (FEEDBACK48.md, Q-572; branch main).
+        let pre = self.open.iter().any(|o| KEEPS_SPACES.contains(&o.tag.as_str()));
+        let own_pre = KEEPS_SPACES.contains(&tag);
+        // The inline element just before the text being read, and the line it ended on (Q-573).
+        let mut after_inline: Option<(String, u32)> = None;
         loop {
+            // Text, then a line break, then this inline element; or this one's text after one.
+            if text.is_empty() && matches!(self.lx.peek_char(), Some('<' | '{')) {
+                after_inline = None;
+            }
+            if !pre {
+                if let Some((el, at)) = after_inline.as_ref().filter(|_| !text.is_empty()) {
+                    let next_is_text = !matches!(self.lx.peek_char(), Some('<' | '{') | None);
+                    if !next_is_text {
+                        if let Some(word) = text_after_break(&text) {
+                            joined.push((*at, format!("<{}>", el), format!("\"{}\"", word)));
+                        }
+                        after_inline = None;
+                    }
+                }
+            }
             match (self.lx.peek_char(), self.lx.peek_char_at(1)) {
                 (Some('<'), Some('/')) => {
-                    push_text(&mut children, &mut text);
+                    push_text_in(&mut children, &mut text, pre, own_pre);
                     let (at, at_line) = (self.lx.pos, self.lx.line);
                     self.lx.bump();
                     self.lx.bump();
                     let close = self.read_html_name();
+                    // An end tag for an element that has none, away from it: removed by the fix,
+                    // where the fix made it this element's end (Q-576).
+                    if close != tag && VOID_TAGS.contains(&close.as_str()) {
+                        let col = col_at(self.lx.text(), at);
+                        self.lx.skip_inline_ws();
+                        let len = if self.lx.peek_char() == Some('>') { self.lx.pos + 1 - at } else { self.lx.pos - at };
+                        return Err(QuilloError::new(format!("`<{}>` has no end tag: remove `</{}>`", close, close), at_line)
+                            .with_fix(Fix { title: format!("Remove </{}>", close), line: at_line, col, len: len as u32, text: String::new() }));
+                    }
                     if close != tag {
                         let around = self.open.iter().rev().skip(1).any(|o| o.tag == close);
                         if around {
@@ -3354,10 +3471,18 @@ impl Parser {
                     return Ok(children);
                 }
                 (Some('<'), Some(c)) if c.is_alphabetic() => {
-                    push_text(&mut children, &mut text);
+                    let next: String = (1..).map_while(|i| self.lx.peek_char_at(i).filter(|c| c.is_alphanumeric())).collect();
+                    if !pre && inline_tag(&next) {
+                        if let Some(word) = text_before_break(&text) {
+                            joined.push((self.lx.line, format!("\"{}\"", word), format!("<{}>", next)));
+                        }
+                    }
+                    push_text_in(&mut children, &mut text, pre, own_pre);
                     let l = self.lx.line;
                     self.lx.bump();
                     children.push(HtmlChild::El(self.nested(|p| p.parse_html_el(l))?));
+                    after_inline = inline_tag(&next).then(|| (next, self.lx.line));
+                    continue;
                 }
                 // `<!-- a note -->`, as HTML has it: a comment, left out of the page, where it
                 // showed as text (FEEDBACK36.md, Q-448; branch feedback36-39).
@@ -3365,7 +3490,7 @@ impl Parser {
                     let Some(n) = self.html_comment_len() else {
                         return self.html_err("`<!--` is never closed with `-->`");
                     };
-                    push_text(&mut children, &mut text);
+                    push_text_in(&mut children, &mut text, pre, own_pre);
                     for _ in 0..n {
                         self.lx.bump();
                     }
@@ -3376,11 +3501,15 @@ impl Parser {
                         self.lx.bump();
                     }
                 }
+                // `{...xs}`, JSX's spread of children: a list shows each item already (Q-577).
+                (Some('{'), _) if self.lx.peek_char_at(1) == Some('.') && self.lx.peek_char_at(2) == Some('.') && self.lx.peek_char_at(3) == Some('.') => {
+                    return self.html_err("`{...xs}` among children: a list shows each of its items where it stands, so write `{xs}`");
+                }
                 (Some('{'), _) => {
                     if text.ends_with('$') {
                         dollars.push(self.lx.line);
                     }
-                    push_text(&mut children, &mut text);
+                    push_text_in(&mut children, &mut text, pre, own_pre);
                     // JavaScript's own braces in a <script> are read as Quillo: said so, with what to
                     // write (FEEDBACK35.md, Q-428; branch feedback27-35-fixes).
                     let e = match self.parse_braced_expr() {
@@ -3396,7 +3525,7 @@ impl Parser {
                 }
                 // A line of markup starting with `//` is a comment, not
                 // text for the page (`{"//"}` writes the characters).
-                (Some('/'), Some('/')) if text.contains('\n') && text.rsplit('\n').next().map_or(false, |l| l.trim().is_empty()) => {
+                (Some('/'), Some('/')) if !pre && text.contains('\n') && text.rsplit('\n').next().map_or(false, |l| l.trim().is_empty()) => {
                     while !matches!(self.lx.peek_char(), Some('\n') | None) {
                         self.lx.bump();
                     }
@@ -3476,29 +3605,38 @@ impl Parser {
 
     /// How many characters `{/* ... */}` takes, starting at its `{`, or 0
     /// when what is ahead is not one (only spaces may stand around the
-    /// comment; the comment may hold `}`).
+    /// comment; the comment may hold `}`). JSX's `{// a note` and a `}` on a line after it
+    /// is one too, and so are several (FEEDBACK48.md, Q-575; branch main).
     fn braced_comment_len(&self) -> usize {
         let at = |i: usize| self.lx.peek_char_at(i);
         let mut i = 1;
-        while matches!(at(i), Some(' ' | '\t' | '\r' | '\n')) {
-            i += 1;
-        }
-        if !(at(i) == Some('/') && at(i + 1) == Some('*')) {
-            return 0;
-        }
-        i += 2;
+        let mut comments = 0;
         loop {
-            match (at(i), at(i + 1)) {
-                (Some('*'), Some('/')) => break,
-                (Some(_), _) => i += 1,
-                (None, _) => return 0,
+            while matches!(at(i), Some(' ' | '\t' | '\r' | '\n')) {
+                i += 1;
             }
+            match (at(i), at(i + 1)) {
+                (Some('/'), Some('*')) => {
+                    i += 2;
+                    loop {
+                        match (at(i), at(i + 1)) {
+                            (Some('*'), Some('/')) => break,
+                            (Some(_), _) => i += 1,
+                            (None, _) => return 0,
+                        }
+                    }
+                    i += 2;
+                }
+                (Some('/'), Some('/')) => {
+                    while !matches!(at(i), Some('\n') | None) {
+                        i += 1;
+                    }
+                }
+                (Some('}'), _) if comments > 0 => return i + 1,
+                _ => return 0,
+            }
+            comments += 1;
         }
-        i += 2;
-        while matches!(at(i), Some(' ' | '\t' | '\r' | '\n')) {
-            i += 1;
-        }
-        if at(i) == Some('}') { i + 1 } else { 0 }
     }
 
     fn read_interp_name(&mut self) -> PResult<Expr> {
@@ -3729,6 +3867,32 @@ fn old_syntax_hint(t: &Tok) -> Option<&'static str> {
     }
 }
 
+/// The DOM event a React handler's name (`onDoubleClick`, as `doubleclick`) listens for, where
+/// the two differ: React's `onChange` on a field is every keystroke, the DOM's `input`, where
+/// `change` waited for the field to lose focus; its `onFocus` and `onBlur` reach a wrapper, as
+/// the DOM's `focusin` and `focusout` do (FEEDBACK48.md, Q-560 and Q-561; branch main).
+pub(crate) fn react_event(tag: &str, written: &str, ev: &str) -> Result<String, String> {
+    Ok(match ev {
+        "change" if tag == "input" || tag == "textarea" => "input",
+        "doubleclick" => "dblclick",
+        "focus" => "focusin",
+        "blur" => "focusout",
+        "gotpointercapture" | "lostpointercapture" => ev,
+        _ if ev.len() > "capture".len() && ev.ends_with("capture") => {
+            let base = &ev[..ev.len() - "capture".len()];
+            return Err(format!(
+                "`{}` listens before the element's own handlers, as React's `…Capture` does, which Quillo has no form for: write `on{}{}` (or `@{}`), which hears it as it bubbles up",
+                written,
+                &written[2..3].to_ascii_uppercase(),
+                &written[3..written.len() - "capture".len()],
+                react_event(tag, written, base).unwrap_or_else(|_| base.to_string())
+            ));
+        }
+        _ => ev,
+    }
+    .to_string())
+}
+
 /// Text inside an element, with JSX's whitespace rules: lines are trimmed
 /// (except where they touch an element or `{}` on the same line), blank
 /// lines dropped, and the rest joined with single spaces. HTML entities
@@ -3762,31 +3926,24 @@ fn decode_entities(s: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let end = rest.find(';').filter(|&e| e <= 10);
+        // Every name HTML has, as JSX decodes them, where ten were known and `&rarr;` showed as
+        // written (FEEDBACK48.md, Q-562; branch main). The longest is 31 letters.
+        let end = rest[1..].find(|c: char| !c.is_ascii_alphanumeric() && c != '#').map(|e| e + 1).filter(|&e| rest[e..].starts_with(';') && e <= 33);
         let decoded = end.and_then(|e| {
             let name = &rest[1..e];
-            let c = match name {
-                "amp" => Some('&'),
-                "lt" => Some('<'),
-                "gt" => Some('>'),
-                "quot" => Some('"'),
-                "apos" | "#39" => Some('\''),
-                "nbsp" => Some('\u{a0}'),
-                "copy" => Some('©'),
-                "mdash" => Some('—'),
-                "ndash" => Some('–'),
-                "hellip" => Some('…'),
-                _ => name
-                    .strip_prefix("#x")
-                    .and_then(|h| u32::from_str_radix(h, 16).ok())
-                    .or_else(|| name.strip_prefix('#').and_then(|d| d.parse().ok()))
-                    .and_then(char::from_u32),
+            let c = match name.strip_prefix('#') {
+                Some(n) => n
+                    .strip_prefix(['x', 'X'])
+                    .map_or_else(|| n.parse().ok(), |h| u32::from_str_radix(h, 16).ok())
+                    .and_then(char::from_u32)
+                    .map(String::from),
+                None => crate::entities::named(name).map(String::from),
             };
             c.map(|c| (c, e))
         });
         match decoded {
             Some((c, e)) => {
-                out.push(c);
+                out.push_str(&c);
                 rest = &rest[e + 1..];
             }
             None => {
@@ -3841,6 +3998,58 @@ fn is_markup(e: &Expr) -> bool {
         Expr::Binary(BinOp::And, _, b, _) => is_markup(b),
         Expr::If(_, t, f) => is_markup(t) || f.as_deref().map_or(false, is_markup),
         _ => false,
+    }
+}
+
+/// Elements shown in the line of text, where a missing space shows; a view too.
+pub(crate) fn inline_tag(tag: &str) -> bool {
+    tag.starts_with(|c: char| c.is_uppercase())
+        || matches!(tag, "a" | "b" | "i" | "em" | "strong" | "span" | "code" | "small" | "mark" | "s" | "u" | "sub" | "sup" | "abbr" | "kbd" | "cite" | "q" | "time" | "var" | "samp" | "dfn")
+}
+
+/// The last word of text that ends with a line break, when a space would be wanted after it.
+fn text_before_break(text: &str) -> Option<&str> {
+    let body = text.trim_end();
+    let tail = &text[body.len()..];
+    if body.trim().is_empty() || !tail.contains('\n') || body.ends_with(['(', '[', '{', '"', '\'', '\u{201c}', '\u{2018}', '/', '-']) {
+        return None;
+    }
+    body.split_whitespace().last()
+}
+
+/// The first word of text that starts after a line break, when a space would be wanted before it.
+fn text_after_break(text: &str) -> Option<&str> {
+    let body = text.trim_start();
+    let head = &text[..text.len() - body.len()];
+    if body.trim().is_empty() || !head.contains('\n') || body.starts_with(['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'', '\u{201d}', '\u{2019}', '/', '-']) {
+        return None;
+    }
+    body.split_whitespace().next()
+}
+
+/// What `<>`, `<Fragment>` and `<React.Fragment>` are told.
+pub const FRAGMENTS: &str = "there are no `<>` fragments: wrap the elements in one, like <div>, or give a list";
+
+/// The elements whose text keeps its layout.
+const KEEPS_SPACES: &[&str] = &["pre", "textarea", "listing"];
+
+/// Text inside a <pre> (`pre`) as written, entities decoded: only spaces across lines, as
+/// between its tags in code laid out to read, are left out, as JSX leaves them, and the line
+/// break right after `<pre>` (its first text, `first`) as HTML does.
+fn push_text_in(children: &mut Vec<HtmlChild>, text: &mut String, pre: bool, first: bool) {
+    if !pre {
+        return push_text(children, text);
+    }
+    if text.is_empty() {
+        return;
+    }
+    let raw = std::mem::take(text);
+    if raw.trim().is_empty() && raw.contains('\n') {
+        return;
+    }
+    let raw = if first && children.is_empty() { raw.strip_prefix("\r\n").or_else(|| raw.strip_prefix('\n')).unwrap_or(&raw) } else { &raw };
+    if !raw.is_empty() {
+        children.push(HtmlChild::Expr(Expr::Lit(Lit::Str(decode_entities(raw).into()))));
     }
 }
 
@@ -3903,5 +4112,5 @@ fn form_key_field(line: u32) -> HtmlEl {
     let key = Expr::Call(Box::new(Expr::Ident("uuid".into(), line)), Vec::new(), line);
     let attrs = vec![("type".to_string(), text("hidden")), ("name".to_string(), text(crate::idempotency::FORM_FIELD)), ("value".to_string(), AttrVal::Expr(key))];
     let facts = ElFacts::of("input", &None, &[], &attrs, &[], true);
-    HtmlEl { tag: "input".into(), id: None, classes: Vec::new(), attrs, children: Vec::new(), line, dollars: Vec::new(), facts }
+    HtmlEl { tag: "input".into(), id: None, classes: Vec::new(), attrs, children: Vec::new(), line, dollars: Vec::new(), joined: Vec::new(), facts }
 }

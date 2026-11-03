@@ -508,7 +508,15 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
 ```
 
 - Text follows JSX's rules: each line is trimmed, blank lines are dropped and the rest
-  are joined with a space. Entities such as `&amp;` and `&mdash;` work; write `{"{"}`
+  are joined with a space. So text and an element on lines of their own touch, as in JSX
+  (`Hello,` then `<b>{name}</b>` on the next line is "Hello,Ann"), and `quillo check` says
+  so for an inline element or a view *(since 0.7)*: write `{" "}` at the end of the line.
+  In a `<pre>`, a `<textarea>` and a `<listing>`, text keeps its lines and spaces as HTML
+  has them, and a `//` line in it is text *(since 0.7)*; only the line break right after the
+  start tag is dropped, and spaces alone across lines, between its tags, as code laid out
+  to read has them. Every named entity HTML has (`&amp;`, `&mdash;`, `&rarr;`, `&times;`,
+  `&rsquo;`) and numeric ones (`&#8594;`, `&#x2192;`) work, in text and in attribute values
+  *(since 0.7: ten names, and none in attributes)*; a name HTML has not stays as written. Write `{"{"}`
   for a brace. A `$` is text too, so `${name}` shows a `$` before the value, and
   `quillo check` asks: write `{name}`, or `{"$"}{name}` for a price. Braces in text are
   code, so a `return` in them leaves the function: `<pre>f() { return 1 }</pre>` answers
@@ -516,21 +524,43 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   function, and its value is the answer, not the page ``).
 - `.class` and `#id` shorthand, with `{}` interpolation in the name. A class may hold
   `:` before a letter or digit and `/` before a digit, as Tailwind's do:
-  `<em.hover:underline>`, `<div.md:flex.w-1/2>`.
+  `<em.hover:underline>`, `<div.md:flex.w-1/2>`. On a view or component's tag they are its
+  `class` and `id` parameters *(since 0.7: they were dropped)*, so `<Card.big #main/>` needs
+  a `Card(class, id)`, and one without is told so. There are no member tags:
+  `<Card.Header/>` is an error that says to import `Header` by its own name.
 - `{name}` is short for `name={name}`, and `{...map}` spreads a map's keys as attributes
-  (or as a view's props): `<a {...link}>`, `<Card {...node.props}/>`. Attributes written
+  (or as a view's props): `<a {...link}>`, `<Card {...node.props}/>`. On an element they
+  follow the rules of the same keys written out *(since 0.7)*: a key `onClick` whose value
+  is a function is a handler, as `onClick={f}` is (`"@click"` too), `className` is `class`
+  and `htmlFor` is `for`, and booleans and style numbers are written as below. Attributes written
   out win over spread ones, whatever the case of the key (`ACTION` is `action`); classes
   from both are kept. On a view or component, spread
   keys that are not parameters are ignored, so data with extra fields can be passed
   straight through; a misspelled attribute written out is still an error.
 - Attributes: `"text"` (plain, as in JSX) or `{expr}`, for example
-  ``href={`/todos/${id}`}``. HTML's other two ways are taken too, as text with no `{...}`
+  ``href={`/todos/${id}`}``. `"text"` is plain as HTML's is: a backslash is a backslash
+  (`title="C:\new"`, `pattern="\d{3}"`) and entities are decoded (`href="?a=1&amp;b=2"`)
+  *(since 0.7: `\n` and `\t` were escapes)*. So a `\"` would end it: it is an error that
+  says to write `&quot;`, or the value as a Quillo string, `title={"say \"hi\""}`.
+  HTML's other two ways are taken too, as text with no `{...}`
   in them: `'single quotes'` and an unquoted value, `<p class='a b' id=top>`, which go
-  out double-quoted. `true` renders a bare attribute; `false`/`null` leaves it
-  out. A name may hold `-`, `_`, `:`, `@` and `.` (`data-id`, `bind:value`, `@click`),
+  out double-quoted. On HTML's boolean attributes (`disabled`, `hidden`, `checked`...)
+  `true` renders a bare attribute and `false`/`null` leaves it out. On `aria-*`, `data-*`,
+  `draggable`, `spellcheck` and `contenteditable`, whose value is the text, `true` and
+  `false` are written `"true"` and `"false"`, and `translate` gets `"yes"`/`"no"`, as React
+  writes them *(since 0.7: `aria-hidden={true}` was bare, which hides nothing, and
+  `aria-expanded={false}` was left out)*; written bare, `<div aria-hidden>`, it is `"true"`.
+  `null` leaves any attribute out. A name may hold `-`, `_`, `:`, `@` and `.` (`data-id`, `bind:value`, `@click`),
   the `{name}` shorthand takes a bare name, and an attribute written twice is an error.
 - An event attribute given an expression, `onclick={() => ...}` or `onClick={save}`, is a
-  handler *(since 0.7)*, the same as `@click={...}` (both on one element is an error). Given text,
+  handler *(since 0.7)*, the same as `@click={...}` (both on one element is an error).
+  Where React's name means another DOM event, it is that one: `onChange` on an `<input>`
+  or a `<textarea>` is `@input`, each keystroke (the DOM's `change` waits until the field
+  loses focus; `@change` is still that); `onDoubleClick` is `@dblclick`; `onFocus` and
+  `onBlur` are `@focusin` and `@focusout`, which a wrapper around fields hears.
+  `onClickCapture` and React's other `…Capture` names are an error, as there is no capture
+  phase here. The DOM's names are lower case and compared as written, so `quillo check`
+  warns of `@mouseEnter`, which never fires. Given text,
   `onclick="..."`, it is HTML's own and runs in the browser as written, so it takes only
   `"text"` written in the program: the browser decodes the value and runs it, and escaping
   cannot keep data out of code. Text made from values, ``onmouseover={`go('${u}')`}``, is
@@ -540,12 +570,20 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   with a written `sandbox` attribute that does not say `allow-same-origin` may take
   `srcdoc={...}`: its page cannot reach the site. A view's or component's attributes
   are its parameters, so `on_change={...}` there is fine.
-- `null`/`false` children render nothing; list children render each item, so `{for ... => <li/>}` works.
+- `null`, `false` and `true` children render nothing, as in React *(since 0.7: `true` showed
+  "true")*, so `{admin && " (admin)"}` is the way to show something for a flag; list children
+  render each item, so `{for ... => <li/>}` works. A function where markup goes renders
+  nothing too, on the server and in the browser.
+  `{...xs}` among children is an error that says to write `{xs}`. A function where markup
+  goes is a mistake, `{onClick}` for `{label}`, or React's function as children: `quillo
+  check` warns (call it, `{render(x)}`, or give it to a view as an attribute).
   A map as a child is shown as Quillo writes it, which is seldom meant: `quillo check`
   warns on `<p>{{ name }}</p>` (`` shows the map `{ name: ... }`: to show `name`, write
   `{name}` ``), and on any map or `{{ ... }}` block as an element's child. A map as an
   attribute (`Prop={{ k: v }}`) is as before.
 - Void tags (`<br>`, `<img ...>`, `<input ...>`) need no closing tag. Any tag can self-close with `/>`.
+  An end tag right after one, `<img src="a.png"></img>`, as JSX and XHTML write it, is
+  passed over *(since 0.7)*; one anywhere else is an error whose fix removes it.
 - `<html>` gets `<!doctype html>`. A `<!DOCTYPE html>` written before `<html>`, as an HTML
   file has it, is passed over; before another element it is an error (`` `<!DOCTYPE html>`
   goes before an <html> element, which gets one by itself ``).
@@ -662,10 +700,14 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   as text outside a `<script>` element (`raw("<script>" + ... )`) is not looked at.
 - `raw(s)` marks trusted HTML.
 - A capitalized tag calls a view: attributes fill parameters by name, and the element's body is passed as `children`.
+  A view with no `children` parameter given a body is an error *(since 0.7: the body was
+  dropped)*, as an attribute it has no parameter for is; spaces alone are no body.
   An HTML tag written in capitals (`<DIV>`) is taken for a view, and the error says to
   write it in lowercase, `<div>`.
-- Comments: in markup, a line starting with `//` is a comment, and so are `{/* ... */}`,
-  as in JSX, and `<!-- ... -->`, as in HTML; none of them reaches the page. A `<!--` with
+- Comments: in markup, a line starting with `//` is a comment, and so are `{/* ... */}`
+  and `{// ...` with its `}` on a later line, as in JSX, and `<!-- ... -->`, as in HTML;
+  none of them reaches the page. Between a tag's attributes, a `//` line and `{/* ... */}`
+  are comments too. A `<!--` with
   no `-->` is an error. In code, `//` to the end of the line and `/* ... */` anywhere; a
   `/*` never closed is an error at its line, not the rest of the file left out. `//` after
   other text on a line is text (`https://...`), and `{"//"}` writes the characters.
@@ -697,6 +739,31 @@ What to change:
 | `<DIV CLASS="a">` | lowercase, `<div class="a">`: a capital starts a view's name |
 | `{` and `}` in text, as a code sample in a `<pre>` has them | `{"{"}` and `{"}"}`, or the sample in a string, `<pre>{SAMPLE}</pre>` |
 | a `$` before a `{` in text | `{"$"}` |
+| text and an inline element on lines of their own, `Hello,` then `<b>Ann</b>` | `{" "}` at the end of the line, as HTML's space between them is none here (`quillo check` says where) |
+
+### From JSX
+
+Markup is written like JSX, and React's habits mostly work: `className` is told,
+`onClick={f}` is a handler, `{cond && <p/>}`, `xs.map(x => <li/>)`, `style={{ fontSize: 12 }}`,
+`{/* comments */}`, `<img></img>`. What to change, where `quillo check` or the error says it too:
+
+| JSX as written | In Quillo |
+|---|---|
+| `className="a"`, `htmlFor="n"` | `class="a"`, `for="n"` |
+| `<>...</>`, `<Fragment>`, `<React.Fragment>` | one element around them, like `<div>`, or a list |
+| `function Card(props)`, `props.title`; `function Card({ title })` | `view Card(title)`: a view's props are its parameters, by name |
+| `<Card.Header/>`, a member tag | `<Header/>`, imported by its own name |
+| `const Tag = "h1"; <Tag/>`, a dynamic tag | a `match` choosing between written tags, or a view per tag |
+| `{children}` without declaring it | a `children` parameter: a body given to a view without one is an error |
+| `xs.map((x, i) => ...)` | `for [i, x] in enumerate(xs) => ...`, as `map` passes one item |
+| `{...xs}` among children | `{xs}`: a list shows each item |
+| `ref={el}` | `@mount={(el) => ...}`, given the element |
+| `dangerouslySetInnerHTML={{ __html: s }}` | `{raw(s)}` between the tags |
+| `defaultValue`, `defaultChecked` | `value`, `checked`: a field with no state keeps what is typed |
+| `onClickCapture` | `onClick` (or `@click`): there is no capture phase |
+| SVG's `strokeWidth`, `fillRule` | SVG's own `stroke-width`, `fill-rule` |
+| `{cond && " (admin)"}` with `0` or `""` | `0` and `""` are truthy in Quillo: compare, `{n > 0 && ...}` |
+| `<input value={x} onChange={(e) => setX(e.target.value)}/>` | works as is; or `value={x}` alone, which follows typing by itself |
 
 To send an HTML file unchanged, serve it with `file()` or `files()`, or a whole folder with
 `quillo serve` (see [Static files](#static-files)); `raw(read_file("page.html"))` puts it

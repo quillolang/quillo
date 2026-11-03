@@ -30,6 +30,7 @@ pub mod decimal;
 pub mod defer;
 pub mod describe;
 pub mod dotenv;
+pub mod entities;
 pub mod debug;
 pub mod error;
 pub mod fetch;

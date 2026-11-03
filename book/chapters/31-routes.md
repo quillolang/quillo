@@ -1100,7 +1100,10 @@ Each packet adds a line, `hall: 21.5 °C`, to every page open on `/`, without a 
   Packets reach it in the order they came, one at a time. An error in it is logged and
   the next packet goes on.
 - Packets wait in a queue while the handler is busy (10,000 unless `queue` says
-  otherwise). A full queue drops its oldest packet, as UDP would; on a server started with
+  otherwise, and 64 MiB at most). A full queue drops its oldest packet, as UDP would,
+  except that a sender holding more than half of it while others wait has its new packet
+  dropped, so one sender cannot push out the rest *(since 0.7)*. A batch the server could
+  not take for five seconds is dropped with a line in the log; on a server started with
   [`--metrics`](#options-of-quillo-run) (`quillo run main.qwe --metrics`),
   `quillo_udp_received_total` and `quillo_udp_dropped_total` count them. Nothing slows
   a sender down, so where packets come in bursts faster than the handler takes them,
@@ -1741,9 +1744,13 @@ When a service runs elsewhere, its calls are made to hold up:
   copy of this service says `assess(n: int) -> int` ``.
 - **Described** as OpenAPI, for a gateway: see [The program's API
   (OpenAPI)](#the-programs-api-openapi).
-- **Tried again.** A call that got no connection, or a server answering 502, 503 or 504,
-  is tried at the next address, a little later each time (100 ms, doubling, with some
-  jitter). A call sent but not answered in time is tried again at the same address, with
+- **Tried again.** A call that got no connection, or a server answering 503, is tried at
+  the next address, a little later each time (100 ms, doubling, with some jitter). A 502
+  or 504, which a proxy gives after the copy behind it may have run the call, sends it to
+  the next address only when the function is safe to run twice, as one that uses
+  [`idempotent`](#idempotent-requests) (in it, or in a function it calls, as the caller's
+  copy of the service's file says) is; any other call gives the error *(since 0.7: every
+  call was tried again, and ran on both copies)*. A call sent but not answered in time is tried again at the same address, with
   the same call id: the service remembers the calls it answered (for eleven minutes, up
   to 100,000 of them in memory, and in `_quillo_calls` when it has a database) and gives
   the same answer, so while the service stays up the function runs once however often
@@ -1804,7 +1811,10 @@ When a service runs elsewhere, its calls are made to hold up:
   the caller's name then not known. The answer is `{"ok": value}` or `{"err": payload}`
   (with `"published": [...]`, the topics to announce), signed with the call's key in
   `x-quillo-answer: sig=<hex>`, HMAC-SHA256 of `quillo-answer-3`, the call id and the
-  status, each on a line, then the body. It is 401 for a call that proves no caller (a
+  status, each on a line, then the body. A 200 without it is refused, under the shared
+  secret as with a key of the caller's own *(since 0.7: under the secret it was taken)*:
+  what answered at the service's address may not be the service. Under `bearer`, OAuth and
+  mTLS nothing signs the answer, which is the service's as far as TLS says it is. It is 401 for a call that proves no caller (a
   bad or old signature, another service's, a key or token not taken), 403 for a caller
   `for` or `check` refuses, 404 for no such function, 409 for a contract that differs,
   503 while the call still runs. A server in another language that answers so,
@@ -1922,7 +1932,10 @@ server fn refund(account: int, cents: int) for ["shop"] {
 - `jwt: { issuer, audience, jwks, secret }`: a bearer token, an OAuth 2.0 access token,
   checked against the identity provider's keys at `jwks` (a URL, kept for ten minutes,
   fetched again at most once a minute for a key it does not have: RS256, ES256, EdDSA)
-  or against `secret` (HS256). `audience` is required, so a token meant for another
+  or against `secret` (HS256). One fetch at a time, for three seconds at most; one that
+  fails is not tried again for a minute, the keys fetched before are used meanwhile, and
+  the URL and what went wrong go to the log, while the caller is told only `the identity
+  provider's keys could not be fetched` *(since 0.7)*. `audience` is required, so a token meant for another
   service is not taken here; `exp` is required too, and `nbf`, `iss` and `aud` are
   checked, with a minute's leeway. A token that fails is a 401 that says why (`the
   bearer token: the token is not for billing (aud)`, `... has expired`, `... has no exp:
