@@ -374,6 +374,15 @@
   `db.error_kind` says `"connection"` (Q-601).
 - A request followed at once by the client's end is answered and the connection closed,
   where it stayed open (Q-600).
+- A review of these fixes found seven more, fixed: a page that neither reads nor closes is
+  let go with its thread and socket, and the live updates' socket has the same deadline;
+  `json.stringify` and a JSON answer are held to their limits as they are written, with no
+  tree made first (3.9 GB and 2.8 s were 298 MB and 0.19 s); a transaction after a
+  PostgreSQL restart gets past every ended connection in a pool of eight; an error made later
+  in the memory of a `db.open` error taken is not taken for it; a 504 from a copy that joined
+  is not run here as well; `money.neg` of the least amount is an error value; a client's end
+  after a full read buffer is not lost; only the name `idempotent` makes a function safe to
+  run twice.
 - Still open: a derived value that throws in the browser (Q-590), a server fn's answer
   that is not one (Q-598), dropping a value nested hundreds of thousands deep (Q-592, but
   for JSON), SQLite's lock wait holding others (Q-603), the compute budget inside long

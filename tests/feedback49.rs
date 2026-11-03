@@ -57,7 +57,7 @@ fn a_database_that_cannot_be_opened_stops_the_program_as_it_starts() {
             ("file.qwe", b"db.open(\"junk.db\")\nroute GET /w = \"ok\"\n"),
             ("server.qwe", b"db.open(\"postgres://quillo@127.0.0.1:1/none\")\nroute GET /w = \"ok\"\n"),
             ("in_fn.qwe", b"fn setup() { db.open(\"junk.db\") }\nsetup()\nroute GET /w = \"ok\"\n"),
-            ("taken.qwe", b"let r = db.open(\"junk.db\")\nprint(is_err(r))\nlet d = db.open(\"junk.db\") ?? \"fallback\"\nroute GET /w = str(is_err(r))\n"),
+            ("taken.qwe", b"let r = db.open(\"junk.db\")\nprint(is_err(r))\nlet d = db.open(\"junk.db\") ?? \"fallback\"\nlet gone = db.open(\"/no/such/dir/x.db\") | is_err\n// Errors made later, perhaps in the same memory, are not that one (found in review).\nfor i in 0..3000 { err(\"x\") }\nroute GET /w = str(is_err(r))\n"),
             ("later.qwe", b"db.open(\"good.db\")\ndb.exec(\"create table if not exists t (i int)\")\nroute GET /o {\n    let r = db.open(\"junk.db\")\n    `${is_err(r)} ${db.one(\"select count(*) as n from t\").n}`\n}\n"),
             ("memory.qwe", b"db.open(\":memory:\")\ndb.exec(\"create table t (i int)\")\nroute GET /w = \"ok\"\n"),
         ],
@@ -231,6 +231,10 @@ fn stats_refuse_nan_and_infinity_and_money_stays_in_range() {
     // At the edge, an amount still fits, and the arithmetic is as before.
     assert_eq!(fails("money.to_minor(money.add(money.of(\"92233720368547758.06\", \"USD\"), money.of(\"0.01\", \"USD\")))"), "9223372036854775807");
     assert_eq!(fails("money.neg(money.of(5, \"EUR\"))"), "{ amount: -5.00m, currency: \"EUR\" }");
+    // The least amount that fits, negated, does not (found in review).
+    let out = fails("money.neg(money.from_minor(-9223372036854775807 - 1, \"USD\"))");
+    assert!(out.starts_with("err(") && out.contains("is too large an amount"), "{}", out);
+    assert_eq!(fails("money.to_minor(money.neg(money.from_minor(-9223372036854775807, \"USD\")))"), "9223372036854775807");
     assert_eq!(fails("money.mul(money.of(2, \"JPY\"), 3)"), "{ amount: 6m, currency: \"JPY\" }");
 }
 
@@ -242,7 +246,7 @@ fn json_too_large_or_too_deep_is_an_error_and_the_server_goes_on() {
         "json-big",
         &[(
             "main.qwe",
-            b"fn shared(n) {\n    let xs = [1]\n    for i in range(0, n) { xs = [xs, xs] }\n    xs\n}\nfn deep(n) {\n    let x = []\n    for i in range(0, n) { x = [x] }\n    x\n}\nfn told(r) = is_err(r) ? `ERR ${r.error}` : r\nroute GET /shared/:n(int) = told(json.stringify(shared(n)))\nroute GET /deep/:n(int) = told(json.stringify(deep(n)))\nroute GET /answer/shared = shared(26)\nroute GET /answer/deep = deep(20000)\nroute GET /ping = \"pong\"\n",
+            b"fn shared(n) {\n    let xs = [1]\n    for i in range(0, n) { xs = [xs, xs] }\n    xs\n}\nfn deep(n) {\n    let x = []\n    for i in range(0, n) { x = [x] }\n    x\n}\nfn told(r) = is_err(r) ? `ERR ${r.error}` : r\nroute GET /shared/:n(int) = told(json.stringify(shared(n)))\nroute GET /deep/:n(int) = told(json.stringify(deep(n)))\nroute GET /len/:n(int) = str(len(json.stringify(shared(n))))\nroute GET /answer/shared = shared(26)\nroute GET /answer/deep = deep(20000)\nroute GET /ping = \"pong\"\n",
         )],
     );
     let s = support::serve(&d.join("main.qwe"), &[]);
@@ -256,6 +260,11 @@ fn json_too_large_or_too_deep_is_an_error_and_the_server_goes_on() {
     assert_eq!(support::send(s.port, "GET", "/answer/shared", &[], "").status, 500);
     assert_eq!(support::send(s.port, "GET", "/answer/deep", &[], "").status, 500);
     assert_eq!(support::send(s.port, "GET", "/ping", &[], "").body, "pong");
+    // Shared parts under the limit are written, fast, with no tree made first: 24 rounds took
+    // 3.5 GB and 3 s (found in review).
+    let t = std::time::Instant::now();
+    assert_eq!(support::send(s.port, "GET", "/len/24", &[], "").body, "100663293");
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
     // Under the limits, as before.
     assert_eq!(support::send(s.port, "GET", "/shared/3", &[], "").body, "[[[[1],[1]],[[1],[1]]],[[[1],[1]],[[1],[1]]]]");
     assert!(support::send(s.port, "GET", "/deep/9999", &[], "").body.starts_with("[[[["));

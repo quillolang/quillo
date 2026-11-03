@@ -72,6 +72,7 @@ impl Socket {
     /// now and then would hold each write's own timeout off (FEEDBACK49.md, Q-594; branch main).
     pub fn write_timeout(&mut self, d: std::time::Duration) {
         self.1 = Some(d);
+        let _ = self.0.set_write_timeout(Some(d));
     }
 
     pub fn reader(&self, max: usize) -> std::io::Result<Reader<std::net::TcpStream>> {
@@ -114,6 +115,18 @@ impl Socket {
         self.frame(0x8, &[]);
     }
 
+    /// The end of a channel's connection: a close frame when the last write went through (not
+    /// in the middle of one that did not), then the socket shut both ways, which wakes its
+    /// reader too. Only dropping it left the reader's copy open, and a page that neither read
+    /// nor closed kept a thread and a socket for good (FEEDBACK49.md, Q-594; found in review).
+    pub fn end(mut self, clean: bool) {
+        if clean {
+            self.write_timeout(std::time::Duration::from_secs(2));
+            self.frame(0x8, &[]);
+        }
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+
     fn frame(&mut self, opcode: u8, payload: &[u8]) -> bool {
         let mut f = vec![0x80 | opcode];
         match payload.len() {
@@ -131,21 +144,34 @@ impl Socket {
         let Some(wait) = self.1 else {
             return self.0.write_all(&f).and_then(|_| self.0.flush()).is_ok();
         };
+        // The socket's own timeout is `wait` already: set again only after a part was written,
+        // to what is left, and put back after, so a frame written whole costs no system call
+        // more (found in review).
         let until = std::time::Instant::now() + wait;
         let mut rest = &f[..];
-        while !rest.is_empty() {
-            let left = until.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() || self.0.set_write_timeout(Some(left)).is_err() {
-                return false;
+        let mut shortened = false;
+        let ok = loop {
+            if rest.is_empty() {
+                break true;
+            }
+            if shortened || rest.len() < f.len() {
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() || self.0.set_write_timeout(Some(left)).is_err() {
+                    break false;
+                }
+                shortened = true;
             }
             match self.0.write(rest) {
-                Ok(0) => return false,
+                Ok(0) => break false,
                 Ok(n) => rest = &rest[n..],
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => return false,
+                Err(_) => break false,
             }
+        };
+        if shortened {
+            let _ = self.0.set_write_timeout(Some(wait));
         }
-        true
+        ok
     }
 }
 

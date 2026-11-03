@@ -764,12 +764,15 @@ fn an_older_tls_is_checked_too() {
 #[test]
 fn a_transaction_on_connections_the_server_ended_while_idle_begins_on_new_ones() {
     let Some(pg) = server("ended-idle") else { return };
-    let url = format!("{}?pool_size=3", pg.url);
+    // The default pool, eight, every one used and then ended: with three tries, the first
+    // two transactions failed (found in review).
+    let url = pg.url.clone();
     let mut it = quillo::Interp::new(".");
     let run = |it: &mut quillo::Interp, src: &str| it.load_source(src, "t.qwe").map(|v| v.display()).unwrap_or_else(|e| format!("error: {}", e));
     assert_eq!(run(&mut it, &format!("db.open(\"{}\")\ndb.exec(\"create table if not exists kept (n int)\")\n\"ok\"", url)), "ok");
-    // Three connections in the pool, each used once and idle.
-    assert_eq!(run(&mut it, "parallel([() => db.transaction(() => db.one(\"select 1 as x from pg_sleep(0.2)\").x), () => db.transaction(() => db.one(\"select 1 as x from pg_sleep(0.2)\").x), () => db.transaction(() => db.one(\"select 1 as x from pg_sleep(0.2)\").x)])"), "[1, 1, 1]");
+    // Eight connections in the pool, each used once and idle.
+    assert_eq!(run(&mut it, "parallel(for i in range(0, 8) => () => db.transaction(() => db.one(\"select 1 as x from pg_sleep(0.3)\").x))"), "[1, 1, 1, 1, 1, 1, 1, 1]");
+    assert_eq!(psql_value(&pg, &pg.url, "select count(*) from pg_stat_activity where datname = current_database() and pid <> pg_backend_pid()"), "8");
     // The server ends them, as a restart or a failover does.
     psql(&pg, &pg.url, &["select pg_terminate_backend(pid) from pg_stat_activity where datname = current_database() and pid <> pg_backend_pid()"]);
     std::thread::sleep(Duration::from_millis(200));

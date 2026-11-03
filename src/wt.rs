@@ -1191,6 +1191,7 @@ pub fn over_websocket(mut socket: crate::ws::Socket, ticket: Ticket) {
             return;
         }
     });
+    let mut clean = true;
     while let Some(o) = rx.blocking_recv() {
         let alive = match o {
             Out::Text { json, .. } => socket.send(&json),
@@ -1200,11 +1201,12 @@ pub fn over_websocket(mut socket: crate::ws::Socket, ticket: Ticket) {
             Out::Close => break,
         };
         if !alive {
+            clean = false;
             break;
         }
     }
     disconnect(&peer);
-    socket.close();
+    socket.end(clean);
 }
 
 /// A frame a page sends to a stream (`<quillo-media publish>`): taken only

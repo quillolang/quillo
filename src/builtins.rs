@@ -1673,13 +1673,77 @@ pub const JSON_DEEPEST: usize = 10_000;
 fn json_stringify(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
     // As `str` is (FEEDBACK26.md, Q-197; branch feedback26-fixes).
     let v = arg(&args, 0);
-    if let Err(why) = v.json_fits(JSON_MOST, JSON_DEEPEST) {
+    let v = if crate::value::hiding() { crate::server::hidden(&v).unwrap_or(v) } else { v };
+    // Written as it is held to its limits, with no tree of serde's made first (FEEDBACK49.md,
+    // Q-606; found in review).
+    let mut out = Vec::new();
+    if let Err(why) = v.json_into_within(&mut out, JSON_MOST, JSON_DEEPEST) {
         return Ok(Value::err(Value::str(format!("json.stringify: {}", why))));
     }
-    let j = if crate::value::hiding() { crate::server::hidden(&v).unwrap_or(v).to_json() } else { v.to_json() };
-    let pretty = arg(&args, 1).truthy();
-    let s = if pretty { serde_json::to_string_pretty(&j) } else { serde_json::to_string(&j) };
-    Ok(Value::str(s.unwrap_or_default()))
+    // SAFETY: only JSON text, which is UTF-8, was written.
+    let text = unsafe { String::from_utf8_unchecked(out) };
+    Ok(Value::str(if arg(&args, 1).truthy() { indented(&text) } else { text }))
+}
+
+/// Compact JSON text indented by two spaces, as serde_json's pretty writer has it: `[]` and
+/// `{}` stay as they are, and a string's own brackets and commas are text.
+fn indented(json: &str) -> String {
+    let b = json.as_bytes();
+    let mut out = String::with_capacity(json.len() * 2);
+    let mut level = 0usize;
+    let newline = |out: &mut String, level: usize| {
+        out.push('\n');
+        for _ in 0..level {
+            out.push_str("  ");
+        }
+    };
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b'"' => {
+                let start = i;
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                out.push_str(&json[start..=i.min(b.len() - 1)]);
+            }
+            b'[' | b'{' if b.get(i + 1) == Some(&if c == b'[' { b']' } else { b'}' }) => {
+                out.push(c as char);
+                out.push(b[i + 1] as char);
+                i += 1;
+            }
+            b'[' | b'{' => {
+                out.push(c as char);
+                level += 1;
+                newline(&mut out, level);
+            }
+            b']' | b'}' => {
+                level = level.saturating_sub(1);
+                newline(&mut out, level);
+                out.push(c as char);
+            }
+            b',' => {
+                out.push(',');
+                newline(&mut out, level);
+            }
+            b':' => out.push_str(": "),
+            _ => {
+                // The rest of a number, `true`, `false` or `null`.
+                let start = i;
+                while i + 1 < b.len() && !matches!(b[i + 1], b',' | b']' | b'}' | b':') {
+                    i += 1;
+                }
+                out.push_str(&json[start..=i]);
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 // ---- files -------------------------------------------------------------

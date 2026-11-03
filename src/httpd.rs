@@ -1201,6 +1201,11 @@ impl Loop {
                 Err(_) => return self.close(i, c),
             }
         }
+        // Stopped at the cap with the client's end not yet read: kept for the next read, as no
+        // event will say it again (Q-600; found in review).
+        if told_end && c.full && !ended {
+            self.ended.insert(i);
+        }
         // A bug in parsing costs this connection, not the server.
         let (max_body, now) = (self.app.max_body, self.now);
         let items = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| take_requests(&mut c, max_body, now))) {

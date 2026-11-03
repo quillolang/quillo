@@ -1392,7 +1392,7 @@ fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             let v = db_err(e);
             if crate::value::loading() {
                 if let Value::Err(inner, ..) = &v {
-                    OPEN_FAILED.with(|f| f.set(Arc::as_ptr(inner) as usize));
+                    OPEN_FAILED.with(|f| *f.borrow_mut() = Arc::downgrade(inner));
                 }
             }
             Ok(v)
@@ -1401,13 +1401,15 @@ fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 thread_local! {
-    /// The error value of the last `db.open` that failed as the program loaded (Q-602).
-    static OPEN_FAILED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The error value of the last `db.open` that failed as the program loaded (Q-602), held
+    /// weakly: its address is not given to another value while this is held, where an error
+    /// made later in the same place was taken for it (found in review).
+    static OPEN_FAILED: std::cell::RefCell<std::sync::Weak<Value>> = std::cell::RefCell::new(std::sync::Weak::new());
 }
 
 /// Whether `inner` is the error a `db.open` gave as the program loaded.
 pub fn open_failed(inner: &Arc<Value>) -> bool {
-    OPEN_FAILED.with(|f| f.get() == Arc::as_ptr(inner) as usize)
+    OPEN_FAILED.with(|f| f.borrow().upgrade().is_some_and(|e| Arc::ptr_eq(&e, inner)))
 }
 
 /// `db.connect(target)`: another database, as a map of the same functions
@@ -2279,10 +2281,6 @@ fn caught(it: &mut Interp, body: &mut dyn FnMut(&mut Interp) -> R) -> R {
     }
 }
 
-/// One try of a transaction on connection `on`: what `body` gave (or the
-/// error that ended it), and whether the database gave up on it because of
-/// another transaction (then it is worth another try; told only for the
-/// outermost transaction, the one that can be tried again).
 /// What a statement in a transaction SQLite ended is told.
 const TX_GONE: &str = "the database ended this transaction after an error, and rolled back all it held, so nothing more runs in it";
 
@@ -2304,6 +2302,10 @@ fn tx_gone(b: &Arc<Backend>, c: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// One try of a transaction on connection `on`: what `body` gave (or the
+/// error that ended it), and whether the database gave up on it because of
+/// another transaction (then it is worth another try; told only for the
+/// outermost transaction, the one that can be tried again).
 pub(crate) fn attempt(
     it: &mut Interp,
     on: Option<usize>,
@@ -2405,8 +2407,15 @@ pub(crate) fn attempt(
             // fails its first statement: nothing has run, so another is taken and the
             // transaction begun on it, where the program was given "internal error"
             // (FEEDBACK49.md, Q-601; branch main).
+            // As many as the pool holds, each perhaps ended, and two more: three gave up while
+            // dead idle ones were left, and with eight the first two transactions failed (found
+            // in review).
+            let most = match &*b {
+                Backend::Postgres(p) => p.size() + 2,
+                _ => 3,
+            };
             let mut tries = 0;
-            while depth == 1 && tries < 3 && started.as_ref().err().is_some_and(|e| kind_of(e) == Some("connection")) {
+            while depth == 1 && tries < most && started.as_ref().err().is_some_and(|e| kind_of(e) == Some("connection")) {
                 tries += 1;
                 let dead = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().find(|t| Arc::ptr_eq(&t.backend, &b)).and_then(|t| t.conn.take());
                 if let Some(d) = dead {

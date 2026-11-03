@@ -877,10 +877,6 @@ fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<
     }
 }
 
-/// Each service's functions as this program's copy of it declares them
-/// (`describe::contract`): sent with each call, so a service deployed apart
-/// from its caller says when they disagree (FEEDBACK10.md, Q-077; branch
-/// feedback10-fixes).
 /// The functions of each service that are safe to call twice, as its file says: they use
 /// `idempotent` (FEEDBACK49.md, Q-595; branch main).
 fn repeatable() -> &'static Mutex<HashSet<(String, String)>> {
@@ -888,6 +884,10 @@ fn repeatable() -> &'static Mutex<HashSet<(String, String)>> {
     R.get_or_init(Default::default)
 }
 
+/// Each service's functions as this program's copy of it declares them
+/// (`describe::contract`): sent with each call, so a service deployed apart
+/// from its caller says when they disagree (FEEDBACK10.md, Q-077; branch
+/// feedback10-fixes).
 fn contracts() -> &'static Mutex<HashMap<(String, String), String>> {
     static C: OnceLock<Mutex<HashMap<(String, String), String>>> = OnceLock::new();
     C.get_or_init(Default::default)
@@ -1151,7 +1151,10 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
                 // (FEEDBACK49.md, Q-595; branch main). A 503 was not taken.
                 if status != 503 && !repeatable().lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&(name.to_string(), f.to_string())) {
                     log_call(name, f, &url, status, start, attempt + 1, &rid);
-                    return Outcome::Missed(format!("{}; not sent to another copy, as it may have run there (a function that is safe to run twice uses `idempotent`)", why));
+                    // Refused, not missed: a call missed is run here when the service's only
+                    // copies are ones that joined, and this one may have run there (found in
+                    // review).
+                    return Outcome::Refused(status, format!("{}; not sent to another copy, as it may have run there (a function that is safe to run twice uses `idempotent`)", why));
                 }
                 // A call still running there (503) is asked of it again.
                 if status != 503 || same.is_none() {

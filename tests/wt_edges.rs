@@ -853,8 +853,25 @@ fn a_page_that_does_not_read_costs_no_thread_per_message_and_is_let_go() {
     }
     let after = threads(r.child.id());
     assert!(after < before + 20, "threads went from {} to {}", before, after);
-    // Its writer gives up on a write the page never takes, and the page is let go.
+    // Its writer gives up on a write the page never takes, and the page is let go, its threads
+    // and its socket with it, where its reader stayed blocked on a socket never shut (found in
+    // review).
     eventually(60, "the page that does not read was not let go", || (r.get("/peers") == "0").then_some(()));
+    eventually(20, "the page's threads did not end", || (threads(r.child.id()) <= before).then_some(()));
+    let mut gone = [0u8; 64];
+    w.0.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut end = false;
+    for _ in 0..100_000 {
+        match w.0.read(&mut gone) {
+            Ok(0) => {
+                end = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(end, "the server did not close the connection");
     // A page that reads is not touched by it.
     let mut ok = Ws::open(&r);
     ok.text(r#"["j","chat"]"#);

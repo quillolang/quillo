@@ -389,48 +389,61 @@ impl Value {
         }
     }
 
-    /// Whether this value's JSON fits in `max` bytes and `depth` levels, counted without making
-    /// it, each shared part as often as it appears: `[xs, xs]` twenty-four times over made a
-    /// 100 MB text from 3.5 GB of memory, and a list nested 100,000 deep overflowed the stack
-    /// and stopped the server (FEEDBACK49.md, Q-606 and Q-592; branch main). Ints are counted
-    /// as written; floats and decimals at their longest.
-    pub fn json_fits(&self, max: usize, depth: usize) -> Result<(), String> {
-        let mut todo: Vec<(&Value, usize)> = vec![(self, 0)];
-        let mut bytes = 0usize;
-        while let Some((v, d)) = todo.pop() {
-            if d > depth {
-                return Err(format!("it is nested more than {} deep", depth));
-            }
-            bytes += match v {
-                Value::Nil => 4,
-                Value::Bool(_) => 5,
-                Value::Int(n) => n.unsigned_abs().checked_ilog10().map_or(1, |l| l as usize + 1) + (*n < 0) as usize,
-                Value::Float(_) => 24,
-                Value::Dec(_) => 42,
-                Value::Str(s) | Value::Html(s) => s.len() + 2,
+    /// `json_into`, held to `max` bytes and `depth` levels as it writes: `[xs, xs]` twenty-four
+    /// times over made a 100 MB text from 3.5 GB of memory, and a list nested 100,000 deep
+    /// overflowed the stack and stopped the server (FEEDBACK49.md, Q-606 and Q-592; branch
+    /// main). Checked while written, the text itself counted, escapes and all, and no tree
+    /// made first: a walk before it cost every JSON answer a third more (found in review).
+    pub fn json_into_within(&self, out: &mut Vec<u8>, max: usize, depth: usize) -> Result<(), String> {
+        // Scalars are written where they stand, and the size is looked at once a container
+        // ends: what makes JSON grow past its limit is containers, shared or nested.
+        fn go(v: &Value, out: &mut Vec<u8>, max: usize, left: usize, depth: usize) -> Result<(), String> {
+            let inner = |x: &Value, out: &mut Vec<u8>| -> Result<(), String> {
+                match x {
+                    Value::List(_) | Value::Map(_) | Value::Err(..) => go(x, out, max, left - 1, depth),
+                    scalar => {
+                        scalar.json_into(out);
+                        Ok(())
+                    }
+                }
+            };
+            match v {
+                Value::List(_) | Value::Map(_) | Value::Err(..) if left == 0 => return Err(format!("it is nested more than {} deep", depth)),
                 Value::List(l) => {
-                    todo.extend(l.iter().map(|x| (x, d + 1)));
-                    2 + l.len()
+                    out.push(b'[');
+                    for (i, x) in l.iter().enumerate() {
+                        if i > 0 {
+                            out.push(b',');
+                        }
+                        inner(x, out)?;
+                    }
+                    out.push(b']');
                 }
                 Value::Map(m) => {
-                    for (k, x) in m.iter() {
-                        bytes += k.len() + 3;
-                        todo.push((x, d + 1));
+                    out.push(b'{');
+                    for (i, (k, x)) in m.iter().enumerate() {
+                        if i > 0 {
+                            out.push(b',');
+                        }
+                        json_str_into(k, out);
+                        out.push(b':');
+                        inner(x, out)?;
                     }
-                    2 + m.len()
+                    out.push(b'}');
                 }
-                Value::Err(e, ..) => {
-                    todo.push((e, d + 1));
-                    11
+                Value::Err(e, _, _) => {
+                    out.extend_from_slice(b"{\"error\":");
+                    inner(e, out)?;
+                    out.push(b'}');
                 }
-                Value::Response(_) => 16,
-                Value::Func(_) | Value::Builtin(..) => 24,
-            };
-            if bytes > max {
+                scalar => scalar.json_into(out),
+            }
+            if out.len() > max {
                 return Err(format!("its JSON would be more than {} MiB", max >> 20));
             }
+            Ok(())
         }
-        Ok(())
+        go(self, out, max, depth + 1, depth)
     }
 
     /// The JSON text of `to_json`, written straight into `out`.

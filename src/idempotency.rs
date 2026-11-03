@@ -557,7 +557,8 @@ fn cleanup(it: &mut Interp, tenant: Option<&str>) {
     let _ = sql(it, false, "delete from _quillo_idempotency where expires_at < ?", vec![Value::Int(now)]);
 }
 
-/// Whether a server fn uses `idempotent`, or a function it calls does
+/// Whether a server fn uses `idempotent` (the name, not a text or a key that says it: found in
+/// review of FEEDBACK49.md, Q-595), or a function it calls does
 /// (FEEDBACK24.md, Q-196; branch feedback24-fixes): then the page sends a key
 /// with each call, and sends it again with the call if the answer does not come
 /// (see `rpcOnce` in the browser runtime).
@@ -567,7 +568,7 @@ pub fn used_by(globals: &Env, def: &crate::ast::FnDef) -> bool {
 
 fn reaches(globals: &Env, def: &crate::ast::FnDef, seen: &mut std::collections::HashSet<String>) -> bool {
     let body = format!("{:?}", def.body);
-    if body.contains("\"idempotent\"") {
+    if body.contains("Ident(\"idempotent\"") {
         return true;
     }
     body.split("Ident(\"").skip(1).filter_map(|rest| rest.split_once('"')).any(|(name, _)| {
@@ -583,7 +584,7 @@ fn reaches(globals: &Env, def: &crate::ast::FnDef, seen: &mut std::collections::
 pub fn used_by_defs(defs: &std::collections::HashMap<String, std::sync::Arc<crate::ast::FnDef>>, def: &crate::ast::FnDef) -> bool {
     fn go(defs: &std::collections::HashMap<String, std::sync::Arc<crate::ast::FnDef>>, def: &crate::ast::FnDef, seen: &mut std::collections::HashSet<String>) -> bool {
         let body = format!("{:?}", def.body);
-        if body.contains("\"idempotent\"") {
+        if body.contains("Ident(\"idempotent\"") {
             return true;
         }
         body.split("Ident(\"").skip(1).filter_map(|rest| rest.split_once('"')).any(|(name, _)| seen.insert(name.to_string()) && defs.get(name).is_some_and(|d| go(defs, d, seen)))

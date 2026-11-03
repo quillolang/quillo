@@ -138,7 +138,13 @@ impl Pool {
     /// An idle connection or a new one, or None when all `max` are taken.
     pub fn try_checkout(&self) -> Result<Option<Conn>, String> {
         let mut g = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(c) = g.0.pop() {
+        // One the server ended while it sat idle, as the client knows by now, is let go here,
+        // not handed out to fail (FEEDBACK49.md, Q-601; found in review).
+        while let Some(c) = g.0.pop() {
+            if c.client.is_closed() {
+                g.1 = g.1.saturating_sub(1);
+                continue;
+            }
             return Ok(Some(c));
         }
         if g.1 >= self.max {
@@ -207,6 +213,11 @@ impl Pool {
 
     /// A connection not to give back (one whose session could not be reset): closed, and
     /// its place in the pool freed.
+    /// How many connections it holds at most.
+    pub fn size(&self) -> usize {
+        self.max
+    }
+
     pub fn discard(&self, c: Conn) {
         drop(c);
         let mut g = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

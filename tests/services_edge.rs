@@ -548,6 +548,16 @@ fn calls_go_to_a_copy_that_joined_and_here_again_when_it_does_not_answer() {
         assert_eq!(ev(&mut it, "gonecopy.add(1)"), "2");
     }
 
+    // A copy that joined, behind a proxy that answers 504 after it may have run the call: the
+    // error, not the call run here as well (FEEDBACK49.md, Q-595; found in review). The app's
+    // own add(1) would give 2.
+    let late = fake(|_, _, s| answer(s, 504, "{\"error\":\"gateway\"}"));
+    let port: u16 = late.rsplit(':').next().unwrap().parse().unwrap();
+    let mut it = program("latecopy", None, "{ retries: 0 }");
+    join_copy(&mut it, "latecopy", port, &format!("latecopy{}", std::process::id()));
+    let out = ev(&mut it, "latecopy.add(1)");
+    assert!(out.contains("504 at") && out.contains("not sent to another copy"), "{}", out);
+
     // A copy joins one that runs elsewhere: taken with the addresses it was given.
     let hits = Arc::new(AtomicUsize::new(0));
     let h = hits.clone();

@@ -451,7 +451,11 @@ fn mul(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 fn neg(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let m = money(&args, 0, "money.neg", line)?;
-    Ok(Money { amount: m.amount.neg(), ..m }.value())
+    // `-(-9223372036854775808)` cents is one past what fits: an error value, as from
+    // `money.add`, when the amount given fitted (found in review).
+    let fitted = minor_of(m.amount, m.units).is_some();
+    let out = Money { amount: m.amount.neg(), ..m };
+    Ok(if fitted { in_range(out) } else { out.value() })
 }
 
 /// `money.compare(a, b)`: -1, 0 or 1, for amounts of one currency.

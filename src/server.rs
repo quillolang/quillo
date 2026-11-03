@@ -1630,6 +1630,9 @@ fn serve_live(shared: Arc<Shared>, req: HttpRequest) -> Answer {
         let following = shared.follow(topics);
         if crate::ws::is_upgrade(&req) {
             let Some(mut socket) = crate::ws::Socket::accept(&req, stream) else { return };
+            // A page that does not read is let go, not waited on for good (FEEDBACK49.md,
+            // Q-594; found in review).
+            socket.write_timeout(Duration::from_secs(30));
             let mut server = server;
             let mut quiet = Duration::ZERO;
             let mut next = Instant::now();
@@ -1957,13 +1960,12 @@ pub(crate) fn render_response(r: &Response) -> HttpResponse {
             Value::Str(s) => (Some("text/plain; charset=utf-8"), s.as_bytes().to_vec()),
             other => {
                 // An answer too large or too deep to write is the program's error, not the
-                // server's end (Q-606, Q-592).
-                if let Err(why) = other.json_fits(crate::builtins::JSON_MOST, crate::builtins::JSON_DEEPEST) {
+                // server's end, said as it is written (Q-606, Q-592).
+                let mut out = Vec::new();
+                if let Err(why) = hidden(other).as_ref().unwrap_or(other).json_into_within(&mut out, crate::builtins::JSON_MOST, crate::builtins::JSON_DEEPEST) {
                     crate::httpd::error_line_with(&format!("the answer's value cannot be written as JSON: {}", why), &[]);
                     return HttpResponse { status: 500, headers: vec![("content-type".into(), "application/json".into())], body: br#"{"error":"internal error"}"#.to_vec() };
                 }
-                let mut out = Vec::new();
-                hidden(other).as_ref().unwrap_or(other).json_into(&mut out);
                 (Some("application/json"), out)
             }
         },
@@ -2419,6 +2421,9 @@ fn serve_events(app: Arc<App>, req: HttpRequest) -> Answer {
     waiter("quillo-events", &req.remote.clone(), move |stream| {
         if crate::ws::is_upgrade(&req) {
             let Some(mut socket) = crate::ws::Socket::accept(&req, stream) else { return };
+            // A page that does not read is let go, not waited on for good (FEEDBACK49.md,
+            // Q-594; found in review).
+            socket.write_timeout(Duration::from_secs(30));
             let seen = seen.unwrap_or(0);
             let mut css_seen = css_seen;
             loop {
