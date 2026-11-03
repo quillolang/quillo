@@ -959,7 +959,10 @@ pub fn script_text(s: &str) -> String {
 
 fn script_value(v: &Value, out: &mut String) {
     match v {
-        Value::Nil | Value::Bool(false) => {}
+        // As JSON, where they were left out as children are, and `const a = {null};` was
+        // `const a = ;` (FEEDBACK53.md, Q-682; branch main).
+        Value::Nil => out.push_str("null"),
+        Value::Bool(false) => out.push_str("false"),
         Value::Html(h) => out.push_str(&h.replace("</", "<\\/").replace("<!--", "<\\!--")),
         other => out.push_str(&script_json(&crate::server::hidden(other).as_ref().unwrap_or(other).to_json())),
     }

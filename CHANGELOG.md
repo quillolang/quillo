@@ -40,6 +40,10 @@
   (Q-564 to Q-567).
 - **Text in a `<pre>`, `<textarea>` and `<listing>` keeps its lines and spaces**, where it
   was joined into one line, and a `//` line in it is text, not a comment (Q-572).
+- **`image.convert` writes the format its target's name says** when no `format` is given,
+  where it wrote JPEG; a target named `.gif` or with no extension is an error value
+  (FEEDBACK53.md, Q-684). **In a `<script>`, `{null}`, `{false}` and `{"text"}` are JSON**
+  (Q-682).
 - **A `db.open` that fails as the program starts stops it when nothing takes its error**
   (alone on a line), where it ran on SQLite in memory and lost what it took at the next
   start. `let r = db.open(...)` takes it, to go on (FEEDBACK49.md, Q-602).
@@ -338,6 +342,21 @@
   mistake on the route line: `{ ok: true }` meant as an answer, a pattern after `with` or
   before `?`, a method or no `/` after `routes`, a character a path cannot hold, a
   parameter named `if` or `1`, and a group with nothing in it (Q-546).
+
+### A long-read site on Quillo (FEEDBACK53.md)
+
+- A route's path takes `@`, `+`, `!`, `$` and `&` in a piece, and a parameter after `@` or
+  `~`: `route GET /@:name` takes `/@ann`, as profiles' addresses are written; `quillo check`
+  and `quillo docs` know it (`/@{name}`) (Q-683).
+- `<script>{x}</script>` writes `null`, `false` and a string written in the braces as
+  JSON, where they wrote nothing or the text bare and the page's script did not parse
+  (Q-682).
+- `image.convert` writes the format its target's name says unless `format` is given, where
+  it wrote JPEG to `out.png`; a name that says none is an error value (Q-684).
+- `\s`, `\d`, `\w` and the other escapes of a regular expression in a string say to write
+  `\\s`, without the note about a newer Quillo (Q-008). SQL written in `` sql`...` `` and
+  then added to (`BASE + "where id = ?"`) is no longer taken for SQL built from values
+  (Q-029).
 
 ### The failure side (FEEDBACK49.md)
 

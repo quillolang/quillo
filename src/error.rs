@@ -200,6 +200,10 @@ pub fn may_be_newer_syntax(msg: &str) -> bool {
     if msg.starts_with("unexpected character") {
         return !msg.contains(": ");
     }
+    // A regular expression's escape is told what to write (FEEDBACK53.md, Q-008).
+    if msg.contains("a regular expression's") {
+        return false;
+    }
     if msg.starts_with("unexpected keyword") || msg.starts_with("unknown escape") || msg.starts_with("bad escape") {
         return true;
     }

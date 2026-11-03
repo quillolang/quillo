@@ -281,8 +281,8 @@ fn openapi_path(prefix: &str, segs: &[Seg]) -> (String, Vec<J>) {
         path.push('/');
         match s {
             Seg::Lit(l) => path.push_str(l),
-            Seg::Param(n, t) => {
-                path.push_str(&format!("{{{}}}", n));
+            Seg::Param(n, t, p) => {
+                path.push_str(&format!("{}{{{}}}", p, n));
                 let schema = t.as_deref().map_or(json!({ "type": "string" }), |t| name_schema(t));
                 params.push(json!({ "name": n, "in": "path", "required": true, "schema": schema }));
             }

@@ -236,7 +236,9 @@ pub struct RecField {
 #[derive(Debug, Clone)]
 pub enum Seg {
     Lit(String),
-    Param(String, Option<String>),
+    /// `:name`, `:name(int)`; the last is what the piece starts with before the parameter,
+    /// `@` in `/@:name`, a profile's address (FEEDBACK53.md, Q-683; branch main), or "".
+    Param(String, Option<String>, String),
     Rest(String),
 }
 
@@ -280,8 +282,8 @@ impl RouteDef {
             s.push('/');
             match seg {
                 Seg::Lit(l) => s.push_str(l),
-                Seg::Param(n, Some(t)) => s.push_str(&format!(":{}({})", n, t)),
-                Seg::Param(n, None) => s.push_str(&format!(":{}", n)),
+                Seg::Param(n, Some(t), p) => s.push_str(&format!("{}:{}({})", p, n, t)),
+                Seg::Param(n, None, p) => s.push_str(&format!("{}:{}", p, n)),
                 Seg::Rest(n) => s.push_str(&format!("*{}", n)),
             }
         }

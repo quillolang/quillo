@@ -605,9 +605,12 @@ fn route_covers(e: &RouteDef, r: &RouteDef) -> bool {
         let ok = match (es, rs) {
             (_, Seg::Rest(_)) => false,
             (Seg::Lit(a), Seg::Lit(b)) => a == b,
-            (Seg::Param(_, None), _) => true,
-            (Seg::Param(_, Some(t)), Seg::Param(_, Some(u))) => t == u,
-            (Seg::Param(_, Some(t)), Seg::Lit(l)) => crate::interp::coerce(t, l).is_some(),
+            // A parameter after a prefix (`/@:name`) takes a piece that starts with it and
+            // goes on (FEEDBACK53.md, Q-683).
+            (Seg::Param(_, None, p), Seg::Lit(l)) => l.strip_prefix(p.as_str()).is_some_and(|v| p.is_empty() || !v.is_empty()),
+            (Seg::Param(_, None, p), Seg::Param(_, _, q)) => q.starts_with(p.as_str()),
+            (Seg::Param(_, Some(t), p), Seg::Param(_, Some(u), q)) => t == u && q.starts_with(p.as_str()),
+            (Seg::Param(_, Some(t), p), Seg::Lit(l)) => l.strip_prefix(p.as_str()).is_some_and(|v| (p.is_empty() || !v.is_empty()) && crate::interp::coerce(t, v).is_some()),
             _ => false,
         };
         if !ok {
@@ -3069,7 +3072,7 @@ impl Checker {
         let mut seen = HashSet::new();
         for seg in &r.path {
             match seg {
-                Seg::Param(n, ty) => {
+                Seg::Param(n, ty, _) => {
                     if !seen.insert(n.clone()) {
                         self.error(format!("path parameter `{}` appears twice", n));
                     }
@@ -3097,7 +3100,7 @@ impl Checker {
         // `:id + 1` gives "51": an untyped parameter is text (FEEDBACK45.md, Q-513).
         self.text_params_depth = self.scopes.len();
         self.text_params = r.path.iter().filter_map(|seg| match seg {
-            Seg::Param(n, None) => Some(n.clone()),
+            Seg::Param(n, None, _) => Some(n.clone()),
             _ => None,
         }).collect();
         self.expr(&r.body);
@@ -5401,6 +5404,9 @@ impl Checker {
             Expr::Call(f, args, _) => {
                 self.sql_safe_call(f)
                     || (is_join(f) && matches!(args.as_slice(), [Expr::List(items), rest @ ..] if items.iter().chain(rest).all(|x| self.sql_safe(x))))
+                    // `` sql`select ...` ``, the tag editors highlight, is the text written in it:
+                    // `BASE + "where id = ?"` warned for good (FEEDBACK53.md, Q-029; branch main).
+                    || (matches!(&**f, Expr::Ident(n, _) if n == "sql" && !self.is_local(n)) && args.iter().all(|a| self.sql_safe(a)))
             }
             Expr::Template(parts) => parts.iter().all(|p| matches!(p, TPart::Lit(_)) || matches!(p, TPart::Expr(e) if self.sql_safe(e))),
             Expr::Binary(BinOp::Add, a, b, _) => self.sql_safe(a) && self.sql_safe(b),
@@ -6199,8 +6205,8 @@ fn route_path(r: &RouteDef) -> String {
         s.push('/');
         match seg {
             Seg::Lit(l) => s.push_str(l),
-            Seg::Param(n, Some(t)) => s.push_str(&format!(":{}({})", n, t)),
-            Seg::Param(n, None) => s.push_str(&format!(":{}", n)),
+            Seg::Param(n, Some(t), p) => s.push_str(&format!("{}:{}({})", p, n, t)),
+            Seg::Param(n, None, p) => s.push_str(&format!("{}:{}", p, n)),
             Seg::Rest(n) => s.push_str(&format!("*{}", n)),
         }
     }

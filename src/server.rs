@@ -148,8 +148,13 @@ fn match_path(def: &[Seg], segs: &[String]) -> Option<Vec<(String, Value)>> {
                     return None;
                 }
             }
-            Seg::Param(name, ty) => {
-                let s = segs.get(i)?;
+            Seg::Param(name, ty, prefix) => {
+                // `/@:name`: the piece starts with the prefix, and the rest is the value, which
+                // `/@` alone has none of (FEEDBACK53.md, Q-683; branch main).
+                let s = segs.get(i)?.strip_prefix(prefix.as_str())?;
+                if s.is_empty() && !prefix.is_empty() {
+                    return None;
+                }
                 let v = match ty {
                     Some(t) => coerce(t, s)?,
                     None => Value::str(s),
@@ -772,7 +777,7 @@ impl Interp {
                 .path
                 .iter()
                 .map(|seg| match seg {
-                    crate::ast::Seg::Param(n, Some(_)) => crate::ast::Seg::Param(n.clone(), None),
+                    crate::ast::Seg::Param(n, Some(_), p) => crate::ast::Seg::Param(n.clone(), None, p.clone()),
                     other => other.clone(),
                 })
                 .collect();

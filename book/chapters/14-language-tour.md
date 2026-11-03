@@ -687,7 +687,10 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   writing every class its text holds, so its one error is not followed by a warning for
   each of them.
 - `<script>{x}</script>` writes `x` as JSON, a JavaScript value (`<` written `\u003c`,
-  so it cannot end the script): `<script>const user = {user};</script>`. HTML in it
+  so it cannot end the script): `<script>const user = {user};</script>`. `null` and
+  `false` are `null` and `false` there, and a string written in the braces, `{"hello"}`,
+  is `"hello"` *(since 0.7: they wrote nothing, or the text bare, and the script did not
+  parse)*. HTML in it
   (`raw(code)`) goes in as it is, except that `</` becomes `<\/` and `<!--` becomes
   `<\!--`, which mean the same inside JavaScript strings and cannot end the element
   early, so `raw(json.stringify(x))` there is safe too. The script's own text, and a

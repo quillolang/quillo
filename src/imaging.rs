@@ -115,7 +115,17 @@ fn int_of(m: &Map, k: &str) -> Option<i64> {
     }
 }
 
-fn job_of(opts: Option<&Value>, line: u32) -> Result<Job, Ctrl> {
+/// The format a target's name says: `.jpg`/`.jpeg`, `.png`, `.webp`, any case.
+fn format_of_name(dest: &std::path::Path) -> Option<ImageFormat> {
+    match dest.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
+        "png" => Some(ImageFormat::Png),
+        "webp" => Some(ImageFormat::WebP),
+        _ => None,
+    }
+}
+
+fn job_of(opts: Option<&Value>, dest: &std::path::Path, line: u32) -> Result<Job, Ctrl> {
     let empty = Map::new();
     let o = match opts {
         None | Some(Value::Nil) => &empty,
@@ -135,8 +145,11 @@ fn job_of(opts: Option<&Value>, line: u32) -> Result<Job, Ctrl> {
         Some(w) if (1..=MOST_SIDE as i64).contains(&w) => Some(w as u32),
         Some(w) => return fail(line, format!("`image.convert`: width {} is not from 1 to {}", w, MOST_SIDE)),
     };
+    // Unless said, the target's name says it, where it was JPEG whatever the name, and
+    // `out.png` held a JPEG without its transparency (FEEDBACK53.md, Q-684; branch main).
     let format = match o.get("format") {
-        None | Some(Value::Nil) => ImageFormat::Jpeg,
+        // `convert` gave an error value for a name that says none.
+        None | Some(Value::Nil) => format_of_name(dest).unwrap_or(ImageFormat::Jpeg),
         Some(Value::Str(f)) => match &**f {
             "jpeg" | "jpg" => ImageFormat::Jpeg,
             "png" => ImageFormat::Png,
@@ -235,7 +248,15 @@ fn in_turn<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
 fn convert(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let src = path_arg(it, &args, 0, "image.convert", line)?;
     let dest = path_arg(it, &args, 1, "image.convert", line)?;
-    let job = job_of(args.get(2), line)?;
+    let job = job_of(args.get(2), std::path::Path::new(&dest), line)?;
+    let said = matches!(args.get(2), Some(Value::Map(m)) if !matches!(m.get("format"), None | Some(Value::Nil)));
+    // A folder is said as the write's own failure.
+    if !said && !std::path::Path::new(&dest).is_dir() && format_of_name(std::path::Path::new(&dest)).is_none() {
+        return Ok(err_value(format!(
+            "{}: its name says no format to write: end it in .jpg, .png or .webp, or give format: \"jpeg\", \"png\" or \"webp\"",
+            args.get(1).map(|v| v.display()).unwrap_or_default()
+        )));
+    }
     Ok(match it.unlocked(move || in_turn(|| make(&src, &dest, job))) {
         Ok((w, h)) => {
             let mut m = Map::new();

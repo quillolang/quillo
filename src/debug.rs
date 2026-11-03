@@ -236,7 +236,8 @@ pub fn route_name(r: &RouteDef) -> String {
         s.push('/');
         match seg {
             Seg::Lit(l) => s.push_str(l),
-            Seg::Param(n, _) => {
+            Seg::Param(n, _, p) => {
+                s.push_str(p);
                 s.push(':');
                 s.push_str(n);
             }

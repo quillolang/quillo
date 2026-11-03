@@ -1025,7 +1025,10 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   writing every class its text holds, so its one error is not followed by a warning for
   each of them.
 - `<script>{x}</script>` writes `x` as JSON, a JavaScript value (`<` written `\u003c`,
-  so it cannot end the script): `<script>const user = {user};</script>`. HTML in it
+  so it cannot end the script): `<script>const user = {user};</script>`. `null` and
+  `false` are `null` and `false` there, and a string written in the braces, `{"hello"}`,
+  is `"hello"` *(since 0.7: they wrote nothing, or the text bare, and the script did not
+  parse)*. HTML in it
   (`raw(code)`) goes in as it is, except that `</` becomes `<\/` and `<!--` becomes
   `<\!--`, which mean the same inside JavaScript strings and cannot end the element
   early, so `raw(json.stringify(x))` there is safe too. The script's own text, and a
@@ -2728,6 +2731,14 @@ route METHOD /path [with effects] { ... block ... }
   error that says to write `:id`. The path is split at `/`, empty pieces dropped, so `/users`,
   `/users/` and `//users` are one path; each piece is percent-decoded after the split, so
   a `%2F` stays inside its piece. `request.path` is the path as it came, undecoded.
+- **What a piece may hold:** letters and digits (any script: `/café`), `- . _ ~ %` and the
+  other characters a URL's path takes as they are, `@ + ! $ &` *(since 0.7: `@` and `+`
+  were refused)*: `/u/@me`, `/c++`. `= , ; ' ( ) *` are not, as the route line gives them
+  meanings of its own, and `:` starts a parameter. A parameter may follow `@` or `~` in
+  its piece, as profiles' addresses are written *(since 0.7)*: `route GET /@:name` takes
+  `/@ann` with `name` `"ann"` (and `/%40ann`, the same piece encoded); `/@` alone has no
+  name, so a later route takes it. A route before it that takes the same requests is said
+  by `quillo check`, as for any other route.
 
   ```quillo
   route GET /users/:id(int) = `user ${id + 1}`     // id is an int: arithmetic works
@@ -3147,6 +3158,11 @@ image.convert("photos/a.jpg", "cache/a-800.jpg", {
     format: "jpeg", quality: 82,                // jpeg, png or webp (lossless)
 })
 ```
+
+`format` is what the target's name says unless given: `.jpg` or `.jpeg`, `.png`, `.webp`,
+in any case *(since 0.7: it was JPEG whatever the name, and `out.png` held a JPEG without
+its transparency)*. A name that says none of them (`.gif`, no extension), with no
+`format`, is an error value, and nothing is written. A `format` given wins over the name.
 
 JPEG, PNG, WebP and GIF are read. `image.info` reads only the header, so it is a cheap
 check that an upload is an image at all. Decoding is limited to 12,000 pixels a side

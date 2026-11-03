@@ -454,7 +454,8 @@ fn mistakes_on_the_route_line_say_what_they_are() {
         ("fn g(r) = r\nroute GET /x | g = 1\n", "a route has no middleware of its own"),
         ("route GET /a/:id(int)x = 1\n", "a path cannot hold `x` here"),
         ("route GET /a:b = 1\n", "a path cannot hold `:` here: a parameter is a piece of its own, `/a/:b`"),
-        ("route GET /a+b = 1\n", "a path cannot hold `+` here"),
+        // `+`, `@` and the others a URL's path takes are taken since FEEDBACK53.md, Q-683.
+        ("route GET /a'b = 1\n", "a path cannot hold `'` here"),
         ("route GET /a /b = 1\n", "a path has no spaces"),
         ("route GET /:if = 1\n", "`:if` is no name the route can read"),
         ("route GET /:1 = 1\n", "`:1` is no name the route can read"),

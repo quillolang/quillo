@@ -575,6 +575,15 @@ impl Lexer {
             '0' => '\0',
             '"' | '\'' | '`' | '\\' | '{' | '}' | '$' => e,
             'u' => return self.unicode_escape(unterminated),
+            // A regular expression's (`\s`, `\d`, `\w`, `\.`), as written for JavaScript: what to
+            // write, where the note said newer Quillo might know it (FEEDBACK53.md, Q-008; branch
+            // main).
+            other if "sdwbSDWB.()[]+*?^|/-".contains(other) => {
+                return Err(QuilloError::new(
+                    format!("unknown escape `\\{0}` in string: a regular expression's `\\{0}` is written `\\\\{0}` in a Quillo string", other),
+                    self.line,
+                ))
+            }
             other => return Err(QuilloError::new(format!("unknown escape `\\{}` in string", other), self.line)),
         })
     }

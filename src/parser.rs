@@ -230,8 +230,12 @@ fn lit_string(parts: Vec<StrPart>) -> Option<String> {
     Some(s)
 }
 
+/// What a fixed piece of a route's path may hold: letters, digits, `-._~%`, and the others a
+/// URL's path takes as they are, `@+!$&` (`/a@b`, `/c++`), where `@` was refused
+/// (FEEDBACK53.md, Q-683; branch main). `=`, `,`, `;`, `'`, `(`, `)` and `*` stay out, as the
+/// route line gives them meanings of its own.
 fn is_path_char(c: char) -> bool {
-    c.is_alphanumeric() || "-._~%".contains(c)
+    c.is_alphanumeric() || "-._~%@+!$&".contains(c)
 }
 
 /// What a path written without quotes may have: past its first character, what an
@@ -1691,6 +1695,21 @@ impl Parser {
                 let written = ty.as_ref().map_or(name.clone(), |t| format!("{}:{}", name, t));
                 return Err(QuilloError::new(format!("path parameters are written `:{0}{1}`, as in `/users/:{0}{1}`, not `{{{2}}}`", name, typed, written), self.lx.line));
             }
+            // `/@:name`, `/~:name`: a parameter after a prefix of `@` or `~`, as profiles'
+            // addresses are written (FEEDBACK53.md, Q-683; branch main).
+            let mut prefix = String::new();
+            let mut k = 0;
+            while let Some(c @ ('@' | '~')) = self.lx.peek_char_at(k) {
+                prefix.push(c);
+                k += 1;
+            }
+            if !prefix.is_empty() && self.lx.peek_char_at(k) == Some(':') {
+                for _ in 0..k {
+                    self.lx.bump();
+                }
+            } else {
+                prefix.clear();
+            }
             match self.lx.peek_char() {
                 Some(':') => {
                     self.lx.bump();
@@ -1715,7 +1734,7 @@ impl Parser {
                     } else {
                         None
                     };
-                    path.push(Seg::Param(name, ty));
+                    path.push(Seg::Param(name, ty, prefix));
                 }
                 Some('*') => {
                     self.lx.bump();
@@ -3521,6 +3540,13 @@ impl Parser {
                         }
                         r => r?,
                     };
+                    // `{"hello"}` in a <script> is a value, written as JSON (`"hello"`), not the
+                    // script's own text, which a string written so was taken for
+                    // (FEEDBACK53.md, Q-682; branch main).
+                    let e = match e {
+                        e @ Expr::Lit(Lit::Str(_)) if tag == "script" => Expr::Template(vec![TPart::Expr(e)]),
+                        e => e,
+                    };
                     children.push(HtmlChild::Expr(and_as_if(e)));
                 }
                 // A line of markup starting with `//` is a comment, not
@@ -3818,8 +3844,8 @@ fn shown_path(path: &[Seg]) -> String {
         .iter()
         .map(|seg| match seg {
             Seg::Lit(l) => format!("/{}", l),
-            Seg::Param(n, Some(t)) => format!("/:{}({})", n, t),
-            Seg::Param(n, None) => format!("/:{}", n),
+            Seg::Param(n, Some(t), p) => format!("/{}:{}({})", p, n, t),
+            Seg::Param(n, None, p) => format!("/{}:{}", p, n),
             Seg::Rest(n) => format!("/*{}", n),
         })
         .collect();

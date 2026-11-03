@@ -132,7 +132,7 @@ impl Renamer<'_> {
                 let r = Arc::get_mut(r).expect("a route just parsed has one owner");
                 for seg in r.path.iter_mut() {
                     match seg {
-                        Seg::Param(n, _) | Seg::Rest(n) => self.name(n),
+                        Seg::Param(n, _, _) | Seg::Rest(n) => self.name(n),
                         Seg::Lit(_) => {}
                     }
                 }

@@ -117,8 +117,9 @@ fn urls_of_other_kinds_of_value_are_shown_or_blocked() {
 
 #[test]
 fn a_script_takes_values_as_data() {
-    assert_eq!(page("", "<script>let a = {null};</script>").replace(' ', ""), "<script>leta=;</script>");
-    assert_eq!(page("", "<script>let a = {false};</script>").replace(' ', ""), "<script>leta=;</script>");
+    // JSON, where they wrote nothing (FEEDBACK53.md, Q-682).
+    assert_eq!(page("", "<script>let a = {null};</script>").replace(' ', ""), "<script>leta=null;</script>");
+    assert_eq!(page("", "<script>let a = {false};</script>").replace(' ', ""), "<script>leta=false;</script>");
     assert_eq!(page("", "<script>let a = {[1, \"x\"]};</script>").replace(' ', ""), "<script>leta=[1,\"x\"];</script>");
 }
 
