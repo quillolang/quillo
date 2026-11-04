@@ -1747,11 +1747,41 @@ function roundDec(x, d, mode) {
 B.round = meta((x, d, mode) => {
   if (x instanceof Dec) return roundDec(x, d, mode);
   if (!isNil(mode)) fail("`round` takes a rounding mode for a dec only: convert with dec(x)");
-  N(x, "round"); if (d === undefined) return roundHalf(x); const p = 10 ** Math.min(Math.max(I(d, "round", 2), 0), 15); return roundHalf(x * p) / p; }, "round", null);
+  N(x, "round"); if (d === undefined) return roundHalf(x);
+  const k = Math.min(Math.max(I(d, "round", 2), 0), 15);
+  // From the float's shortest decimal, a tie away from zero, as on the server (FEEDBACK50.md,
+  // Q-626; branch feedback50-fixes).
+  const p = 10 ** k, y = x * p;
+  if (!(Math.abs(y) >= 1e9 || Math.abs(Math.abs(y - Math.trunc(y)) - 0.5) < 1e-6)) return roundHalf(y) / p + 0;
+  const dd = decFromFloat(x);
+  if (dd !== null) return Number(decText(decRound(dd, k, "half_up")));
+  return Number.isFinite(y) ? roundHalf(y) / p : x; }, "round", null);
 B.floor = meta((x) => x instanceof Dec ? decRound(x, 0, "floor") : Math.floor(N(x, "floor")), "floor", null);
 B.ceil = meta((x) => x instanceof Dec ? decRound(x, 0, "ceiling") : Math.ceil(N(x, "ceil")), "ceil", null);
 B.sqrt = meta((x) => Math.sqrt(N(x, "sqrt")), "sqrt", null);
 B.pow = meta((x, y) => {
+  // A decimal to an int's power, by squaring as src/decimal.rs's powi (FEEDBACK50.md, Q-632;
+  // branch feedback50-fixes).
+  if (x instanceof Dec) {
+    if (!isInt(y) && typeof y !== "bigint") fail(`\`pow\` takes a dec to an int's power, got ${typeName(y)} as the power: for a fraction of a power, float(x) and math.pow`);
+    const one = new Dec(1n, 0), n = BigInt(y), e = n < 0n ? -n : n;
+    const powU = (b) => {
+      let base = b, acc = one, k = e;
+      while (k > 0n) {
+        if (k & 1n) acc = decMul(acc, base);
+        k >>= 1n;
+        if (k > 0n) base = decMul(base, base);
+      }
+      return acc;
+    };
+    if (n >= 0n) return powU(x);
+    // Below one, one over it first; above one, a power past what fits is 0 at 28 decimals,
+    // as src/decimal.rs's powi (found in review).
+    if (decCmp(new Dec(babs(x.m), x.s), one) < 0) return powU(decDiv(one, x));
+    let p;
+    try { p = powU(x); } catch (err) { if (err instanceof QuilloError && err.message === "decimal overflow") return new Dec(0n, DEC_SCALE); throw err; }
+    return decDiv(one, p);
+  }
   // As `*` does, exactly (FEEDBACK29.md, Q-351; branch feedback29-fixes).
   if ((isInt(x) || typeof x === "bigint") && isInt(y) && y >= 0) {
     if (y > 64 && (x > 1 || x < -1)) fail("integer overflow");
@@ -2166,56 +2196,133 @@ const MONEY_CURRENCIES = "AED2 AFN2 ALL2 AMD2 AOA2 ARS2 AUD2 AWG2 AZN2 BAM2 BBD2
   "XPF0 YER2 ZAR2 ZMW2 ZWG2";
 // Withdrawn since 2007: amounts kept in them still read (FEEDBACK50.md, Q-630; branch
 // feedback50-fixes).
+// The decimals CLDR writes where they are not the ISO 4217 minor units: what money.format
+// shows (FEEDBACK50.md, Q-627; branch feedback50-fixes).
+const MONEY_DISPLAY = "AFN0 ALL0 IQD0 IRR0 KPW0 LAK0 LBP0 MGA0 MMK0 RSD0 SOS0 SYP0 YER0 MRO0 SLL0 STD0 TMM0 ZMK0 ZWD0";
 const MONEY_WITHDRAWN = "ANG2 BGN2 BYR0 CYP2 EEK2 GHC2 HRK2 LTL2 LVL2 MRO2 MTL2 SDD2 SIT2 SKK2 SLL2 STD2 TMM2 VEB2 VEF2 ZMK2 ZWD2 ZWL2 ZWN2 ZWR2";
-const MONEY_SYMBOLS = "USD=US$,EUR=\u20ac,GBP=\u00a3,JPY=JP\u00a5,CNY=CN\u00a5,INR=\u20b9,CAD=CA$,AUD=AU$,NZD=NZ$,BRL=R$,MXN=MX$,KRW=\u20a9,TWD=NT$,HKD=HK$,VND=\u20ab,ILS=\u20aa";
-const MONEY_LOCALES = "en-US\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,AUD=A$,PHP=\u20b1\n" +
-  "en-GB\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,PHP=\u20b1\n" +
-  "en-CA\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tCAD=$,AUD=A$,PHP=\u20b1\n" +
-  "en-AU\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=USD,EUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=$,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
-  "en-NZ\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,NZD=$,PHP=\u20b1\n" +
-  "en-IE\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,PHP=\u20b1\n" +
-  "en-IN\t.\t,\t\t\t-\t1\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,AUD=A$,PHP=\u20b1\n" +
-  "en-SG\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,SGD=$,PHP=\u20b1\n" +
-  "en-ZA\t,\t\u00a0\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,PHP=\u20b1,ZAR=R\n" +
-  "de-DE\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$,JPY=\u00a5,THB=\u0e3f\n" +
-  "de-AT\t,\t.\t\t\u00a0\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,THB=\u0e3f\n" +
-  "de-CH\t.\t\u2019\t\t\t-\t0\t\u00a4\u00a0#\t\u00a4-#\t\u00a4\u00a0#\t\u00a4-#\tUSD=$,EUR=EUR,JPY=\u00a5,THB=\u0e3f\n" +
-  "fr-FR\t,\t\u202f\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$US,GBP=\u00a3GB,JPY=JPY,CNY=CNY,CAD=$CA,AUD=$AU,NZD=$NZ,MXN=$MX,ARS=$AR,TWD=TWD,HKD=HKD,SGD=$SG\n" +
-  "fr-BE\t,\t\u202f\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$US,GBP=\u00a3GB,JPY=JPY,CNY=CNY,CAD=$CA,AUD=$AU,NZD=$NZ,MXN=$MX,ARS=$AR,TWD=TWD,HKD=HKD,SGD=$SG\n" +
-  "fr-CA\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$\u00a0US,JPY=\u00a5,INR=INR,CAD=$,AUD=$\u00a0AU,NZD=$\u00a0NZ,MXN=MXN,KRW=KRW,TWD=TWD,HKD=$\u00a0HK,SGD=$\u00a0SG,VND=VND,ILS=ILS\n" +
-  "fr-CH\t.\t\u202f\t,\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$US,GBP=\u00a3GB,JPY=JPY,CNY=CNY,CAD=$CA,AUD=$AU,NZD=$NZ,MXN=$MX,ARS=$AR,TWD=TWD,HKD=HKD,SGD=$SG\n" +
-  "it-IT\t,\t.\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,JPY=JPY,INR=INR,AUD=A$,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,THB=\u0e3f,VND=VND,PHP=\u20b1\n" +
-  "it-CH\t.\t\u2019\t\t\t-\t2\t\u00a4\u00a0#\t\u00a4-#\t\u00a4\u00a0#\t\u00a4-#\tUSD=USD,JPY=JPY,INR=INR,AUD=A$,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,THB=\u0e3f,VND=VND,PHP=\u20b1\n" +
-  "es-ES\t,\t.\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tGBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,THB=\u0e3f,ILS=ILS\n" +
-  "es-MX\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=USD,EUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=$,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
-  "es-AR\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tEUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,ARS=$,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
-  "pt-BR\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tTHB=\u0e3f\n" +
-  "pt-PT\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tTHB=\u0e3f\n" +
-  "nl-NL\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t\u00a4\u00a0-#\t\u00a4\u00a0#\t\u00a4\u00a0-#\tCAD=C$,THB=\u0e3f\n" +
-  "nl-BE\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t\u00a4\u00a0-#\t\u00a4\u00a0#\t\u00a4\u00a0-#\tCAD=C$,THB=\u0e3f\n" +
-  "sv-SE\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tGBP=GBP,JPY=JPY,CNY=CNY,INR=INR,AUD=AUD,NZD=NZD,SEK=kr,NOK=Nkr,DKK=Dkr,BRL=BR$,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,EGP=EG\u00a3\n" +
-  "nb-NO\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,NOK=kr,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
-  "da-DK\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tDKK=kr.,THB=\u0e3f\n" +
-  "fi-FI\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$,JPY=\u00a5,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
-  "pl-PL\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,PLN=z\u0142,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
-  "cs-CZ\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tINR=INR,CZK=K\u010d,VND=VND,ILS=ILS\n" +
-  "hu-HU\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,EUR=EUR,GBP=GBP,JPY=\u00a5,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,HUF=Ft,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
-  "ro-RO\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,EUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
-  "el-GR\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$,AUD=A$,THB=\u0e3f\n" +
-  "tr-TR\t,\t.\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,TRY=\u20ba,THB=\u0e3f\n" +
-  "ru-RU\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$,JPY=\u00a5,AUD=A$,RUB=\u20bd,UAH=\u20b4,THB=\u0e3f\n" +
-  "uk-UA\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,EUR=EUR,GBP=GBP,JPY=\u00a5,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,UAH=\u20b4,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
-  "ja-JP\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\uffe5,CNY=\u5143,AUD=A$\n" +
-  "zh-CN\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tCNY=\u00a5\n" +
-  "zh-TW\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5,KRW=\uffe6,TWD=$\n" +
-  "zh-HK\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5\n" +
-  "ko-KR\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\n" +
-  "hi-IN\t.\t,\t\t\t-\t1\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,AUD=A$,THB=\u0e3f\n" +
-  "id-ID\t,\t.\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tINR=Rs,THB=\u0e3f,IDR=Rp\n" +
-  "th-TH\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5,THB=\u0e3f\n" +
-  "vi-VN\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tJPY=\u00a5,THB=\u0e3f\n" +
-  "ms-MY\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=USD,CAD=CAD,AUD=A$,MXN=MXN,MYR=RM\n" +
-  "fil-PH\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,AUD=A$,THB=\u0e3f,PHP=\u20b1";
+const MONEY_SYMBOLS = "AUD=A$,BRL=R$,CAD=CA$,CNY=CN\u00a5,EUR=\u20ac,GBP=\u00a3,HKD=HK$,ILS=\u20aa,INR=\u20b9,JPY=JP\u00a5,KRW=\u20a9,MXN=MX$,NZD=NZ$,TWD=NT$,USD=US$,VND=\u20ab,XAF=FCFA,XCD=EC$,XCG=Cg.,XOF=F\u202fCFA,XPF=CFPF";
+const MONEY_LOCALES = "en-US\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5,PHP=\u20b1,USD=$\n" +
+  "en-GB\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tPHP=\u20b1\n" +
+  "en-CA\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tCAD=$,PHP=\u20b1\n" +
+  "en-AU\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=$,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,SCR=Rs,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF,XPF=CFP\n" +
+  "en-NZ\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tNZD=$,PHP=\u20b1\n" +
+  "en-IE\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tPHP=\u20b1\n" +
+  "en-IN\t.\t,\t\t\t-\t5\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tPHP=\u20b1,USD=$\n" +
+  "en-SG\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tPHP=\u20b1,SGD=$\n" +
+  "en-ZA\t,\t\u00a0\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tPHP=\u20b1,ZAR=R\n" +
+  "de-DE\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AU$,JPY=\u00a5,THB=\u0e3f,USD=$\n" +
+  "de-AT\t,\t.\t\t\u00a0\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AU$,JPY=\u00a5,THB=\u0e3f,USD=$\n" +
+  "de-CH\t.\t\u2019\t\t\t-\t0\t\u00a4\u00a0#\t\u00a4-#\t\u00a4\u00a0#\t\u00a4-#\tAUD=AU$,EUR=EUR,JPY=\u00a5,THB=\u0e3f,USD=$\n" +
+  "fr-FR\t,\t\u202f\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tARS=$AR,AUD=$AU,BMD=$BM,BND=$BN,BZD=$BZ,CAD=$CA,CLP=$CL,CNY=CNY,COP=$CO,FJD=$FJ,FKP=\u00a3FK,GBP=\u00a3GB,GIP=\u00a3GI,HKD=HKD,JPY=JPY,LBP=\u00a3LB,MXN=$MX,NAD=$NA,NZD=$NZ,SBD=$SB,SGD=$SG,SRD=$SR,TTD=$TT,TWD=TWD,USD=$US,UYU=$UY,WST=$WS,XCD=XCD,XPF=FCFP,CYP=\u00a3CY\n" +
+  "fr-BE\t,\t\u202f\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tARS=$AR,AUD=$AU,BMD=$BM,BND=$BN,BZD=$BZ,CAD=$CA,CLP=$CL,CNY=CNY,COP=$CO,FJD=$FJ,FKP=\u00a3FK,GBP=\u00a3GB,GIP=\u00a3GI,HKD=HKD,JPY=JPY,LBP=\u00a3LB,MXN=$MX,NAD=$NA,NZD=$NZ,SBD=$SB,SGD=$SG,SRD=$SR,TTD=$TT,TWD=TWD,USD=$US,UYU=$UY,WST=$WS,XCD=XCD,XPF=FCFP,CYP=\u00a3CY\n" +
+  "fr-CA\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=$\u00a0AU,CAD=$,HKD=$\u00a0HK,ILS=ILS,INR=INR,JPY=\u00a5,KRW=KRW,MXN=MXN,NZD=$\u00a0NZ,SGD=$\u00a0SG,TWD=TWD,USD=$\u00a0US,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF,XPF=XPF,CYP=\u00a3CY\n" +
+  "fr-CH\t.\t\u202f\t,\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tARS=$AR,AUD=$AU,BMD=$BM,BND=$BN,BZD=$BZ,CAD=$CA,CLP=$CL,CNY=CNY,COP=$CO,FJD=$FJ,FKP=\u00a3FK,GBP=\u00a3GB,GIP=\u00a3GI,HKD=HKD,JPY=JPY,LBP=\u00a3LB,MXN=$MX,NAD=$NA,NZD=$NZ,SBD=$SB,SGD=$SG,SRD=$SR,TTD=$TT,TWD=TWD,USD=$US,UYU=$UY,WST=$WS,XCD=XCD,XPF=FCFP,CYP=\u00a3CY\n" +
+  "it-IT\t,\t.\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tBRL=BRL,HKD=HKD,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,PHP=\u20b1,THB=\u0e3f,TWD=TWD,USD=USD,VND=VND\n" +
+  "it-CH\t.\t\u2019\t\t\t-\t2\t\u00a4\u00a0#\t\u00a4-#\t\u00a4\u00a0#\t\u00a4-#\tBRL=BRL,HKD=HKD,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,PHP=\u20b1,THB=\u0e3f,TWD=TWD,USD=USD,VND=VND\n" +
+  "es-ES\t,\t.\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,THB=\u0e3f,TWD=TWD,XAF=XAF,XCD=XCD,XOF=XOF\n" +
+  "es-MX\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MRU=UM,MXN=$,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF,MRO=MRU\n" +
+  "es-AR\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tARS=$,AUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n" +
+  "pt-BR\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AU$,THB=\u0e3f\n" +
+  "pt-PT\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AU$,THB=\u0e3f\n" +
+  "nl-NL\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t\u00a4\u00a0-#\t\u00a4\u00a0#\t\u00a4\u00a0-#\tAUD=AU$,CAD=C$,FJD=FJ$,SBD=SI$,THB=\u0e3f,XPF=XPF\n" +
+  "nl-BE\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t\u00a4\u00a0-#\t\u00a4\u00a0#\t\u00a4\u00a0-#\tAUD=AU$,CAD=C$,FJD=FJ$,SBD=SI$,THB=\u0e3f,XPF=XPF\n" +
+  "sv-SE\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,BBD=Bds$,BMD=BM$,BRL=BR$,BSD=BS$,BZD=BZ$,CNY=CNY,DKK=Dkr,DOP=RD$,EGP=EG\u00a3,GBP=GBP,HKD=HKD,INR=INR,ISK=Ikr,JMD=JM$,JPY=JPY,KRW=KRW,NOK=Nkr,NZD=NZD,SEK=kr,TWD=TWD,VND=VND,EEK=Ekr\n" +
+  "nb-NO\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NOK=kr,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XPF=XPF\n" +
+  "da-DK\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AU$,DKK=kr.,THB=\u0e3f\n" +
+  "fi-FI\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,HKD=HKD,ILS=ILS,INR=INR,JPY=\u00a5,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=$,VND=VND,XCD=XCD,XPF=XPF\n" +
+  "pl-PL\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,CAD=CAD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,PLN=z\u0142,TWD=TWD,USD=USD,VND=VND\n" +
+  "cs-CZ\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AU$,CZK=K\u010d,ILS=ILS,INR=INR,VND=VND\n" +
+  "hu-HU\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,HUF=Ft,ILS=ILS,INR=INR,JPY=\u00a5,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XCD=XCD\n" +
+  "ro-RO\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XCD=XCD\n" +
+  "el-GR\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tTHB=\u0e3f,USD=$\n" +
+  "tr-TR\t,\t.\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AU$,JPY=\u00a5,THB=\u0e3f,TRY=\u20ba,USD=$\n" +
+  "ru-RU\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tJPY=\u00a5,RUB=\u20bd,THB=\u0e3f,TMT=\u0422\u041c\u0422,UAH=\u20b4,USD=$\n" +
+  "uk-UA\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=\u00a5,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,UAH=\u20b4,USD=USD,VND=VND,XCD=XCD\n" +
+  "ja-JP\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tCNY=\u5143,JPY=\uffe5,USD=$\n" +
+  "zh-CN\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AU$,CNY=\u00a5\n" +
+  "zh-TW\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AU$,JPY=\u00a5,KRW=\uffe6,TWD=$\n" +
+  "zh-HK\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AU$,JPY=\u00a5\n" +
+  "ko-KR\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AU$\n" +
+  "hi-IN\t.\t,\t\t\t-\t5\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tTHB=\u0e3f,USD=$\n" +
+  "id-ID\t,\t.\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AU$,IDR=Rp,INR=Rs,THB=\u0e3f\n" +
+  "th-TH\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AU$,JPY=\u00a5,THB=\u0e3f\n" +
+  "vi-VN\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AU$,JPY=\u00a5,THB=\u0e3f\n" +
+  "ms-MY\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tCAD=CAD,MXN=MXN,MYR=RM,USD=USD\n" +
+  "fil-PH\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5,PHP=\u20b1,THB=\u0e3f,USD=$\n" +
+  "es-419\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n" +
+  "es-CO\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,COP=$,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n" +
+  "es-CL\t,\t.\t\t\t-\t0\t\u00a4#\t\u00a4-#\t\u00a4\u00a0#\t\u00a4-#\tAUD=AUD,BRL=BRL,CAD=CAD,CLP=$,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n" +
+  "es-PE\t.\t,\t\t\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,PEN=S/,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n" +
+  "es-US\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=\u00a5,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=$,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n" +
+  "es-UY\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,UYU=$,UYW=UP,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n" +
+  "es-VE\t,\t.\t\t\t-\t0\t\u00a4#\t\u00a4-#\t\u00a4\u00a0#\t\u00a4-#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VES=Bs.S,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF,VEF=Bs.\n" +
+  "es-EC\t,\t.\t\t\t-\t0\t\u00a4#\t\u00a4-#\t\u00a4\u00a0#\t\u00a4-#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=$,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n" +
+  "es-GT\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,GTQ=Q,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n" +
+  "es-CR\t,\t\u00a0\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,CRC=\u20a1,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n" +
+  "es-DO\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,DOP=RD$,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n" +
+  "es-BO\t,\t.\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AUD,BOB=Bs,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n" +
+  "es-PY\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t\u00a4\u00a0-#\t\u00a4\u00a0#\t\u00a4\u00a0-#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,PYG=Gs.,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n" +
+  "es-PA\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,PAB=B/.,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n" +
+  "es-PR\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=$,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n" +
+  "pt-AO\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAOA=Kz,AUD=AU$,THB=\u0e3f\n" +
+  "pt-MZ\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AU$,MZN=MTn,THB=\u0e3f\n" +
+  "en-NG\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tNGN=\u20a6,PHP=\u20b1\n" +
+  "en-KE\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tKES=Ksh,PHP=\u20b1\n" +
+  "en-PK\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tPHP=\u20b1,PKR=Rs\n" +
+  "en-PH\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5,PHP=\u20b1,USD=$\n" +
+  "en-MY\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tMYR=RM,PHP=\u20b1\n" +
+  "en-AE\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5,PHP=\u20b1,USD=$\n" +
+  "en-HK\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tPHP=\u20b1\n" +
+  "en-GH\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tGHS=GH\u20b5,PHP=\u20b1\n" +
+  "en-IL\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tPHP=\u20b1\n" +
+  "en-001\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tPHP=\u20b1\n" +
+  "fr-MA\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tARS=$AR,AUD=$AU,BMD=$BM,BND=$BN,BZD=$BZ,CAD=$CA,CLP=$CL,CNY=CNY,COP=$CO,FJD=$FJ,FKP=\u00a3FK,GBP=\u00a3GB,GIP=\u00a3GI,HKD=HKD,JPY=JPY,LBP=\u00a3LB,MXN=$MX,NAD=$NA,NZD=$NZ,SBD=$SB,SGD=$SG,SRD=$SR,TTD=$TT,TWD=TWD,USD=$US,UYU=$UY,WST=$WS,XCD=XCD,XPF=FCFP,CYP=\u00a3CY\n" +
+  "fr-SN\t,\t\u202f\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tARS=$AR,AUD=$AU,BMD=$BM,BND=$BN,BZD=$BZ,CAD=$CA,CLP=$CL,CNY=CNY,COP=$CO,FJD=$FJ,FKP=\u00a3FK,GBP=\u00a3GB,GIP=\u00a3GI,HKD=HKD,JPY=JPY,LBP=\u00a3LB,MXN=$MX,NAD=$NA,NZD=$NZ,SBD=$SB,SGD=$SG,SRD=$SR,TTD=$TT,TWD=TWD,USD=$US,UYU=$UY,WST=$WS,XCD=XCD,XPF=FCFP,CYP=\u00a3CY\n" +
+  "fr-CI\t,\t\u202f\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tARS=$AR,AUD=$AU,BMD=$BM,BND=$BN,BZD=$BZ,CAD=$CA,CLP=$CL,CNY=CNY,COP=$CO,FJD=$FJ,FKP=\u00a3FK,GBP=\u00a3GB,GIP=\u00a3GI,HKD=HKD,JPY=JPY,LBP=\u00a3LB,MXN=$MX,NAD=$NA,NZD=$NZ,SBD=$SB,SGD=$SG,SRD=$SR,TTD=$TT,TWD=TWD,USD=$US,UYU=$UY,WST=$WS,XCD=XCD,XPF=FCFP,CYP=\u00a3CY\n" +
+  "fr-LU\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tARS=$AR,AUD=$AU,BMD=$BM,BND=$BN,BZD=$BZ,CAD=$CA,CLP=$CL,CNY=CNY,COP=$CO,FJD=$FJ,FKP=\u00a3FK,GBP=\u00a3GB,GIP=\u00a3GI,HKD=HKD,JPY=JPY,LBP=\u00a3LB,MXN=$MX,NAD=$NA,NZD=$NZ,SBD=$SB,SGD=$SG,SRD=$SR,TTD=$TT,TWD=TWD,USD=$US,UYU=$UY,WST=$WS,XCD=XCD,XPF=FCFP,CYP=\u00a3CY\n" +
+  "de-LU\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AU$,JPY=\u00a5,THB=\u0e3f,USD=$\n" +
+  "de-LI\t.\t\u2019\t\t\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AU$,EUR=EUR,JPY=\u00a5,THB=\u0e3f,USD=$\n" +
+  "hr-HR\t,\t.\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XCD=XCD,XPF=XPF,HRK=kn\n" +
+  "sl-SI\t,\t.\t\t\t\u2212\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,BRL=BRL,CAD=CAD,GBP=GBP,JPY=\u00a5,MXN=MXN,NZD=NZD,TWD=TWD,USD=$,XCD=XCD\n" +
+  "sk-SK\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=NIS,INR=INR,JPY=JPY,KRW=KRW,NZD=NZD,TWD=TWD,USD=USD,VND=VND\n" +
+  "bg-BG\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=\u0449.\u0434.,VND=VND,XCD=XCD,BGN=\u043b\u0432.\n" +
+  "lt-LT\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF,XPF=XPF\n" +
+  "lv-LV\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AU$,JPY=\u00a5,THB=\u0e3f,USD=$,LVL=Ls\n" +
+  "et-EE\t,\t\u00a0\t\t\t\u2212\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AU$,JPY=\u00a5,THB=\u0e3f,USD=$,EEK=kr\n" +
+  "is-IS\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,BRL=BRL,CAD=CAD,EUR=EUR,GBP=GBP,INR=INR,ISK=kr.,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND\n" +
+  "mk-MK\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MKD=\u0434\u0435\u043d.,NZD=NZD,TWD=TWD,VND=VND\n" +
+  "sr-Latn-RS\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,BAM=KM,JPY=\u00a5,KRW=KRW,NZD=NZD,VND=VND\n" +
+  "bs-Latn-BA\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,BAM=KM,BRL=BRL,CAD=CAD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=ILS,JPY=\u00a5,MXN=MXN,NZD=NZD,RSD=din.,THB=\u0e3f,USD=USD,XCD=XCD,XPF=XPF,HRK=kn\n" +
+  "sq-AL\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tALL=Lek\u00eb,BRL=BRL,THB=\u0e3f\n" +
+  "ka-GE\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,CNY=CNY,GEL=\u20be,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,NZD=NZD,VND=VND\n" +
+  "hy-AM\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAMD=\u058f,THB=\u0e3f,USD=$\n" +
+  "az-Latn-AZ\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAZN=\u20bc,THB=\u0e3f\n" +
+  "kk-KZ\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tKZT=\u20b8,LSL=\u041b\u0421\u041b,RUB=\u20bd,THB=\u0e3f,USD=$\n" +
+  "uz-Latn-UZ\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUZS=so\u02bbm\n" +
+  "sw-TZ\t.\t,\t\t\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tKES=Ksh,THB=\u0e3f,TZS=TSh\n" +
+  "sw-KE\t.\t,\t\t\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tKES=Ksh,THB=\u0e3f,TZS=TSh,USD=$\n" +
+  "zh-SG\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AU$,SGD=$\n" +
+  "zh-MO\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AU$,JPY=\u00a5,MOP=MOP$\n" +
+  "ta-IN\t.\t,\t\t\t-\t5\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5,THB=\u0e3f,USD=$\n" +
+  "te-IN\t.\t,\t\t\t-\t5\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tTHB=\u0e3f,USD=$\n" +
+  "gu-IN\t.\t,\t\t\t-\t5\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tTHB=\u0e3f\n" +
+  "kn-IN\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tTHB=\u0e3f,USD=$\n" +
+  "ml-IN\t.\t,\t\t\t-\t4\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5,THB=\u0e3f,USD=$\n" +
+  "pa-IN\t.\t,\t\t\t-\t5\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tTHB=\u0e3f\n" +
+  "km-KH\t.\t,\t\t\t-\t0\t#\u00a4\t-#\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tKHR=\u17db,LSL=\u17a1\u17bc\u1791\u17b8,THB=\u0e3f,USD=$\n" +
+  "lo-LA\t,\t.\t\t\t-\t0\t\u00a4#\t\u00a4-#\t\u00a4\u00a0#\t\u00a4-#\tLAK=\u20ad,THB=\u0e3f\n" +
+  "si-LK\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tLKR=\u0dbb\u0dd4.,THB=\u0e3f,XOF=\u0dc3\u0dd2\u0dc6\u0dca\u0d91\n" +
+  "am-ET\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=AU$,ETB=\u1265\u122d,THB=\u0e3f\n" +
+  "zu-ZA\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tTHB=\u0e3f,USD=$,ZAR=R\n" +
+  "af-ZA\t,\t\u00a0\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tCAD=CAD,MXN=MXN,THB=\u0e3f,USD=USD,ZAR=R\n" +
+  "ca-ES\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AU$,BRL=BRL,CAD=CAD,CNY=CNY,JPY=\u00a5,MXN=MXN,THB=\u0e3f,USD=USD,XCD=XCD\n" +
+  "eu-ES\t,\t.\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tTHB=\u0e3f\n" +
+  "gl-ES\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tMXN=$MX,THB=\u0e3f,USD=$,XCD=XCD\n" +
+  "ga-IE\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5,PHP=\u20b1,THB=\u0e3f,USD=$\n" +
+  "cy-GB\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tKRW=KRW,THB=\u0e3f\n" +
+  "mt-MT\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\n" +
+  "lb-LU\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AU$,JPY=\u00a5,THB=\u0e3f,USD=$\n" +
+  "nn-NO\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NOK=kr,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XPF=XPF";
 let moneyT = null;
 function moneyTables() {
   if (moneyT) return moneyT;
@@ -2224,18 +2331,61 @@ function moneyTables() {
   for (const c of (MONEY_CURRENCIES + " " + MONEY_WITHDRAWN).split(" ")) units[c.slice(0, 3)] = +c.slice(3);
   const locales = MONEY_LOCALES.split("\n").map((l) => {
     const f = l.split("\t");
-    return { name: f[0], decimal: f[1], group: f[2], number: [f[3] || f[1], f[4] || f[2]], minus: f[5], indian: (+f[6] & 1) !== 0, min2: (+f[6] & 2) !== 0, pats: f.slice(7, 11), symbols: pairs(f[11] || "") };
+    return { name: f[0], decimal: f[1], group: f[2], number: [f[3] || f[1], f[4] || f[2]], minus: f[5], indian: (+f[6] & 1) !== 0, numberIndian: (+f[6] & 4) !== 0, min2: (+f[6] & 2) !== 0, pats: f.slice(7, 11), symbols: pairs(f[11] || "") };
   });
   return (moneyT = { units, locales, symbols: pairs(MONEY_SYMBOLS) });
 }
 const unitsOf = (code) => { const u = moneyTables().units[code]; return u === undefined ? null : u; };
-function localeData(name) {
+const displayDigits = (code, units) => {
+  const t = moneyTables();
+  if (!t.display) { t.display = Object.create(null); for (const c of MONEY_DISPLAY.split(" ")) t.display[c.slice(0, 3)] = +c.slice(3); }
+  return t.display[code] ?? units;
+};
+// A locale's data as src/money.rs's locale_found finds it: by name; Chinese by script; by
+// language and region without the script; Latin America's Spanish as es-419 and Portugal's
+// regions as pt-PT, as CLDR's parents; else the first of the language; else en-US; extensions
+// not read. [data, matched] (FEEDBACK50.md, Q-627; branch feedback50-fixes).
+const ES_419 = ["419", "AR", "BO", "BZ", "CL", "CO", "CR", "CU", "DO", "EC", "GT", "HN", "MX", "NI", "PA", "PE", "PR", "PY", "SV", "US", "UY", "VE"];
+const PT_PT = ["AO", "CH", "CV", "GQ", "GW", "LU", "MO", "MZ", "PT", "ST", "TL"];
+const asciiLower = (s) => s.replace(/[A-Z]/g, (x) => x.toLowerCase());
+function localeFound(name) {
   const all = moneyTables().locales;
-  name = String(name).replace(/_/g, "-").toLowerCase();
-  const lang = name.split("-")[0];
-  return all.find((l) => l.name.toLowerCase() === name) || all.find((l) => l.name.split("-")[0].toLowerCase() === lang) || all[0];
+  name = String(name).replace(/_/g, "-");
+  const find = (n) => all.find((l) => asciiLower(l.name) === asciiLower(n));
+  const exact = find(name);
+  if (exact) return [exact, true];
+  const subs = name.split("-"), lang = asciiLower(subs[0]);
+  const rest = [];
+  for (const x of subs.slice(1)) { if (/^[A-Za-z0-9]$/.test(x)) break; rest.push(x); }
+  const script = rest.length > 0 && /^[A-Za-z]{4}$/.test(rest[0]) ? asciiLower(rest[0]) : null;
+  const r = rest[script === null ? 0 : 1];
+  const region = r !== undefined && /^([A-Za-z]{2}|[0-9]{3})$/.test(r) ? r.replace(/[a-z]/g, (x) => x.toUpperCase()) : null;
+  let picked = null;
+  if (lang === "zh" && script === "hant") picked = region === "HK" || region === "MO" ? `zh-${region}` : "zh-TW";
+  else if (lang === "zh" && script === "hans") picked = region === "SG" ? "zh-SG" : "zh-CN";
+  else if (region !== null && find(`${lang}-${region}`)) picked = `${lang}-${region}`;
+  else if (lang === "es" && ES_419.includes(region)) picked = "es-419";
+  else if (lang === "pt" && PT_PT.includes(region)) picked = "pt-PT";
+  if (picked !== null && find(picked)) return [find(picked), true];
+  const first = all.find((l) => asciiLower(l.name.split("-")[0]) === lang);
+  if (!first) return [all[0], false];
+  // A language alone (or with its own script) names its first locale.
+  const rowScript = first.name.split("-")[1];
+  const sameScript = script === null || (rowScript && rowScript.length === 4 ? asciiLower(rowScript) === script : script === "latn");
+  return [first, region === null && sameScript];
 }
-function moneyDigits(loc, [decimal, group], d) {
+const localeSaid = new Set();
+function localeData(name) {
+  const [loc, found] = localeFound(name);
+  if (!found && localeSaid.size < 64 && !localeSaid.has(String(name))) {
+    localeSaid.add(String(name));
+    console.warn(`quillo: warning: no money and number data for locale ${JSON.stringify(String(name))}: written as ${loc.name}`);
+  }
+  return loc;
+}
+// A currency sign (Unicode's Sc), as src/money.rs's is_currency_sign.
+const CURRENCY_SIGN = /^[$\u00a2-\u00a5\u058f\u060b\u07fe\u07ff\u09f2\u09f3\u09fb\u0af1\u0bf9\u0e3f\u17db\u20a0-\u20c0\ua838\ufdfc\ufe69\uff04\uffe0\uffe1\uffe5\uffe6\u{11fdd}-\u{11fe0}\u{1e2ff}\u{1ecb0}]$/u;
+function moneyDigits(loc, [decimal, group], d, indian = loc.indian) {
   const t = decText(new Dec(babs(d.m), d.s));
   const dot = t.indexOf(".");
   const whole = dot < 0 ? t : t.slice(0, dot), frac = dot < 0 ? "" : t.slice(dot + 1);
@@ -2243,7 +2393,7 @@ function moneyDigits(loc, [decimal, group], d) {
   let out = "";
   for (let i = 0; i < n; i++) {
     const left = n - i;
-    if (i > 0 && grouped && (loc.indian ? left === 3 || (left > 3 && (left - 3) % 2 === 0) : left % 3 === 0)) out += group;
+    if (i > 0 && grouped && (indian ? left === 3 || (left > 3 && (left - 3) % 2 === 0) : left % 3 === 0)) out += group;
     out += whole[i];
   }
   return frac ? out + decimal + frac : out;
@@ -2254,10 +2404,10 @@ function formatAmount(d, code, places, locName) {
   const sym = loc.symbols[code] ?? moneyTables().symbols[code] ?? code;
   const before = loc.pats[0].indexOf("¤") < loc.pats[0].indexOf("#");
   const side = before ? Array.from(sym).pop() : Array.from(sym)[0];
-  const letters = side !== undefined && /\p{L}/u.test(side);
+  const letters = side !== undefined && !CURRENCY_SIGN.test(side);
   const pat = loc.pats[(letters ? 2 : 0) + (d.m < 0n ? 1 : 0)];
   const num = moneyDigits(loc, [loc.decimal, loc.group], d);
-  return pat.replace("-", loc.minus).replace("¤", sym).replace("#", num);
+  return pat.replace("-", () => loc.minus).replace("¤", () => sym).replace("#", () => num);
 }
 const moneyShort = (v) => (v === undefined ? "nothing" : `${typeName(v)} ${short(v)}`);
 // Trimmed as Rust's trim() trims (its White_Space, not JavaScript's \s), and a code
@@ -2325,13 +2475,58 @@ function moneyOp(x, y, sub) {
   if (a.code !== b.code) return new Err(`cannot ${sub ? "subtract" : "add"} ${a.code} and ${b.code}: convert one currency to the other first`);
   return moneyIn(decAdd(a.amount, sub ? new Dec(-b.amount.m, b.amount.s) : b.amount), a.code);
 }
-function moneyMode(m, f) {
+function moneyMode(m, f, i = f === "money.round" ? 2 : 3) {
   if (isNil(m)) return "half_even";
-  if (typeof m !== "string") fail(`\`${f}\` expects a rounding mode (a str) as argument ${f === "money.round" ? 2 : 3}, got ${moneyShort(m)}`);
+  if (typeof m !== "string") fail(`\`${f}\` expects a rounding mode (a str) as argument ${i}, got ${moneyShort(m)}`);
   if (!["half_even", "half_up", "half_down", "up", "down", "ceiling", "floor"].includes(m)) fail(`\`${f}\`: unknown rounding ${JSON.stringify(m)} (one of ${ROUNDINGS})`);
   return m;
 }
 const moneyOf = (amount, code) => ({ amount, currency: code });
+// The rest of money.of and money.parse, as src/money.rs's of_amount.
+function moneyOfAmount(d, c, mode, f, i) {
+  let r;
+  if (isNil(mode)) {
+    r = decRound(d, c.units, "down");
+    if (decCmp(r, d) !== 0) return new Err(`${decText(d)} has more decimals than ${c.code} has (${c.units}); give a rounding mode to round it`);
+  } else r = decRound(d, c.units, moneyMode(mode, f, i));
+  if (r.s !== c.units || r.m < I64_MIN || r.m > I64_MAX) return new Err(`${decText(r)} ${c.code} is too large an amount`);
+  return moneyOf(r, c.code);
+}
+// Text as `loc` writes an amount of `code`, as src/money.rs's read_amount.
+const SPACEY = /^[ \u00a0\u202f]$/, MARKS = /^[ \u00a0\u202f\u200e\u200f\u061c]+|[ \u00a0\u202f\u200e\u200f\u061c]+$/g;
+function moneyRead(text, code, loc) {
+  let t = rsTrim(text).replace(MARKS, "");
+  if (t === "" || Array.from(t).length > 400) return null;
+  const sym = (l) => l.symbols[code] ?? moneyTables().symbols[code] ?? code;
+  const names = [...new Set([...moneyTables().locales.map(sym), code])]
+    .sort((a, b) => Array.from(b).length - Array.from(a).length || (a < b ? -1 : a > b ? 1 : 0));
+  const sign = () => {
+    const m = [loc.minus, "-", "\u2212"].find((x) => t.startsWith(x));
+    if (m === undefined) return false;
+    t = t.slice(m.length).replace(MARKS, "");
+    return true;
+  };
+  let neg = sign();
+  const n = names.find((x) => t.startsWith(x) || t.endsWith(x));
+  if (n !== undefined) t = (t.startsWith(n) ? t.slice(n.length) : t.slice(0, t.length - n.length)).replace(MARKS, "");
+  if (!neg) neg = sign();
+  const spaced = Array.from(loc.group).every((ch) => SPACEY.test(ch));
+  const isGroup = (ch) => (spaced ? SPACEY.test(ch) : loc.group.includes(ch) || (loc.group === "\u2019" && ch === "'"));
+  const at = t.indexOf(loc.decimal);
+  const whole = at < 0 ? t : t.slice(0, at), frac = at < 0 ? null : t.slice(at + loc.decimal.length);
+  if (frac !== null && !/^[0-9]+$/.test(frac)) return null;
+  const groups = [];
+  let cur = "";
+  for (const ch of whole) { if (isGroup(ch)) { groups.push(cur); cur = ""; } else cur += ch; }
+  groups.push(cur);
+  if (groups.some((g) => !/^[0-9]+$/.test(g))) return null;
+  if (groups.length > 1) {
+    const last = groups[groups.length - 1], rest = groups.slice(0, -1);
+    const western = groups[0].length <= 3 && groups.slice(1).every((g) => g.length === 3);
+    if (!(western || (loc.indian && last.length === 3 && rest[0].length <= 2 && rest.slice(1).every((g) => g.length === 2)))) return null;
+  }
+  return decParse((neg ? "-" : "") + groups.join("") + (frac === null ? "" : "." + frac), false);
+}
 function moneySame(a, b, verb) {
   if (a.code !== b.code) fail(`cannot ${verb} ${a.code} and ${b.code}: convert one currency to the other first`);
 }
@@ -2353,13 +2548,16 @@ B.money = {
     else if (typeof amount === "string") { d = /[eE]/.test(amount) ? null : decParse(rsTrim(amount), false); if (d === null) return new Err(`not an amount: ${repr(amount)}`); }
     else if (typeof amount === "number") fail("`money.of` takes a dec, an int or text, not a float: convert it with dec(x)");
     else fail(`\`money.of\` expects an amount (a dec, int or str) as argument 1, got ${moneyShort(amount)}`);
-    let r;
-    if (isNil(mode)) {
-      r = decRound(d, c.units, "down");
-      if (decCmp(r, d) !== 0) return new Err(`${decText(d)} has more decimals than ${c.code} has (${c.units}); give a rounding mode to round it`);
-    } else r = decRound(d, c.units, moneyMode(mode, "money.of"));
-    if (r.s !== c.units || r.m < I64_MIN || r.m > I64_MAX) return new Err(`${decText(r)} ${c.code} is too large an amount`);
-    return moneyOf(r, c.code);
+    return moneyOfAmount(d, c, mode, "money.of", 3);
+  },
+  // An amount as the locale writes one, as src/money.rs's parse (FEEDBACK50.md, Q-624; branch
+  // feedback50-fixes).
+  parse: (text, currency, locale, mode) => {
+    if (typeof text !== "string") fail(`\`money.parse\` expects text as argument 1, got ${moneyShort(text)}`);
+    const c = moneyCurrency(currency, "money.parse", 2);
+    if (c instanceof Err) return c;
+    const d = moneyRead(text, c.code, localeData(moneyLocale(locale, "money.parse", 3)));
+    return d === null ? new Err(`not an amount: ${repr(text)}`) : moneyOfAmount(d, c, mode, "money.parse", 4);
   },
   from_minor: (n, currency) => {
     const c = moneyCurrency(currency, "money.from_minor", 2);
@@ -2410,16 +2608,17 @@ B.money = {
     for (const k of order.slice(0, left)) shares[k] += 1n;
     return shares.map((x) => moneyOf(new Dec(neg ? -x : x, a.units), a.code));
   },
-  format: (x, locale) => { const a = moneyArg(x, "money.format", 1); return formatAmount(a.amount, a.code, a.units, moneyLocale(locale, "money.format", 2)); },
+  format: (x, locale) => { const a = moneyArg(x, "money.format", 1); const shown = displayDigits(a.code, a.units); return formatAmount(decRound(a.amount, shown, "half_up"), a.code, shown, moneyLocale(locale, "money.format", 2)); },
 };
 // format_number(x, locale, digits): a number as the locale writes one.
-B.format_number = meta((x, locale, digits) => {
+B.format_number = meta((x, locale, digits, mode) => {
   let d;
   if (x instanceof Dec) d = x;
   else if (isInt(x) || typeof x === "bigint") d = new Dec(BigInt(x), 0);
   else if (typeof x === "number") { d = decFromFloat(x); if (d === null) return display(x); }
   else fail(`\`format_number\` expects a number as argument 1, got ${moneyShort(x)}`);
   const loc = localeData(moneyLocale(locale, "format_number", 2));
+  const rounding = isNil(mode) ? "half_up" : moneyMode(mode, "format_number", 4);
   // Ties away from zero, as Intl writes them; `{ min, max }` digits too (FEEDBACK30.md, Q-369;
   // branch feedback27-35-fixes).
   if (!isNil(digits)) {
@@ -2433,10 +2632,11 @@ B.format_number = meta((x, locale, digits) => {
       if (min > max) fail(`\`format_number\`: min ${min} is more than max ${max}`);
     } else if (isInt(digits)) min = max = clamp(digits);
     else fail(`\`format_number\` expects an int or \`{ min, max }\` as argument 3, got ${moneyShort(digits)}`);
-    d = decRound(d, max, "half_up");
+    // A tie away from zero unless `mode` says (FEEDBACK50.md, Q-626; branch feedback50-fixes).
+    d = decRound(d, max, rounding);
     while (d.s > min && d.m % 10n === 0n) d = new Dec(d.m / 10n, d.s - 1);
   }
-  return (d.m < 0n ? loc.minus : "") + moneyDigits(loc, loc.number, d);
+  return (d.m < 0n ? loc.minus : "") + moneyDigits(loc, loc.number, d, loc.numberIndian);
 }, "format_number", null);
 
 // ---- math, stats, vec (src/numeric.rs, the same answers) ------------------

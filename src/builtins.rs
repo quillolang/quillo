@@ -2122,7 +2122,25 @@ fn round(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let x = num_arg(&args, 0, "round", line)?;
     if args.len() > 1 {
         let d = i_arg(&args, 1, "round", line)?.clamp(0, 15) as i32;
+        // From the float's shortest decimal, a tie away from zero, as `format_number` rounds:
+        // `round(1.005, 2)` was 1.0, as 1.005 * 100 is 100.49999... in binary, while
+        // `format_number` wrote 1.01 (FEEDBACK50.md, Q-626; branch feedback50-fixes). Away from
+        // a tie the binary product rounds the same, and an int over a power of ten is the
+        // nearest float to the decimal: that is the quick way, and gives no -0. Below 1e9 the
+        // product is within 4e-7 of the decimal's, inside the window (found in review).
         let p = 10f64.powi(d);
+        let y = x * p;
+        let near_tie = y.abs() >= 1.0e9 || ((y - y.trunc()).abs() - 0.5).abs() < 1e-6;
+        if !near_tie {
+            return Ok(Value::Float(y.round() / p + 0.0));
+        }
+        if let Some(r) = crate::decimal::Dec::from_f64(x).and_then(|v| v.round(d, crate::decimal::Rounding::HalfUp).ok()) {
+            return Ok(Value::Float(r.to_f64()));
+        }
+        // Past what a decimal holds: as before, but `x` itself where `x * p` is past a float.
+        if !y.is_finite() {
+            return Ok(Value::Float(x));
+        }
         return Ok(Value::Float((x * p).round() / p));
     }
     Ok(to_int_or_float(x.round()))
@@ -2148,6 +2166,13 @@ fn sqrt(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 /// `pow(x, y)`: an int when both are ints and y >= 0 (and it fits), else a float.
 fn pow(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    // A decimal to an int's power, exactly (FEEDBACK50.md, Q-632; branch feedback50-fixes).
+    if let Value::Dec(x) = arg(&args, 0) {
+        return match arg(&args, 1) {
+            Value::Int(n) => x.powi(n).map(Value::Dec).or_else(|e| fail(line, e.message())),
+            other => fail(line, format!("`pow` takes a dec to an int's power, got {} as the power: for a fraction of a power, float(x) and math.pow", other.type_name())),
+        };
+    }
     if let (Value::Int(x), Value::Int(y)) = (arg(&args, 0), arg(&args, 1)) {
         // As `*` does: a float this size prints digits that were made up
         // (FEEDBACK29.md, Q-351; branch feedback29-fixes). `math.pow` is the float.

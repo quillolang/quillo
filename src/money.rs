@@ -41,67 +41,154 @@ pub const CURRENCIES: &str = "AED2 AFN2 ALL2 AMD2 AOA2 ARS2 AUD2 AWG2 AZN2 BAM2 
     XPF0 YER2 ZAR2 ZMW2 ZWG2";
 
 /// Currency symbols most locales use, where they use one (others write the
-/// code); `LOCALES` has each locale's own.
-pub const SYMBOLS: &str = "USD=US$,EUR=\u{20ac},GBP=\u{a3},JPY=JP\u{a5},CNY=CN\u{a5},INR=\u{20b9},CAD=CA$,AUD=AU$,NZD=NZ$,BRL=R$,MXN=MX$,KRW=\u{20a9},TWD=NT$,HKD=HK$,VND=\u{20ab},ILS=\u{20aa}";
+/// code); `LOCALES` has each locale's own. With `LOCALES`, written from ICU 77's
+/// CLDR data for every currency: XOF, XAF, XPF, XCD and XCG had none, and the
+/// French locales none for $CL and a dozen others (FEEDBACK50.md, Q-627; branch
+/// feedback50-fixes).
+pub const SYMBOLS: &str = "AUD=A$,BRL=R$,CAD=CA$,CNY=CN\u{a5},EUR=\u{20ac},GBP=\u{a3},HKD=HK$,ILS=\u{20aa},INR=\u{20b9},JPY=JP\u{a5},KRW=\u{20a9},MXN=MX$,NZD=NZ$,TWD=NT$,USD=US$,VND=\u{20ab},XAF=FCFA,XCD=EC$,XCG=Cg.,XOF=F\u{202f}CFA,XPF=CFPF";
 
 /// Each locale, from CLDR (as ICU 77 has it): decimal and group marks in
 /// amounts of money, and in other numbers when they differ (de-AT groups
 /// money with "." and numbers with a space), minus sign, flags (1: Indian grouping, 3 then 2s; 2: no group in a
-/// four-digit number), the patterns for an amount and a negative one with
+/// four-digit number; 4: Indian grouping in other numbers), the patterns for an amount and a negative one with
 /// a symbol (`¤` the symbol, `#` the number) and with a code or a symbol
-/// that is letters at the number's side, and the symbols that differ from
-/// `SYMBOLS`.
-pub const LOCALES: &str = "en-US\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tUSD=$,JPY=\u{a5},AUD=A$,PHP=\u{20b1}\n\
-en-GB\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=A$,PHP=\u{20b1}\n\
-en-CA\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tCAD=$,AUD=A$,PHP=\u{20b1}\n\
-en-AU\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tUSD=USD,EUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=$,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n\
-en-NZ\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=A$,NZD=$,PHP=\u{20b1}\n\
-en-IE\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=A$,PHP=\u{20b1}\n\
-en-IN\t.\t,\t\t\t-\t1\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tUSD=$,AUD=A$,PHP=\u{20b1}\n\
-en-SG\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=A$,SGD=$,PHP=\u{20b1}\n\
-en-ZA\t,\t\u{a0}\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=A$,PHP=\u{20b1},ZAR=R\n\
-de-DE\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tUSD=$,JPY=\u{a5},THB=\u{e3f}\n\
-de-AT\t,\t.\t\t\u{a0}\t-\t0\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tUSD=$,JPY=\u{a5},THB=\u{e3f}\n\
-de-CH\t.\t\u{2019}\t\t\t-\t0\t\u{a4}\u{a0}#\t\u{a4}-#\t\u{a4}\u{a0}#\t\u{a4}-#\tUSD=$,EUR=EUR,JPY=\u{a5},THB=\u{e3f}\n\
-fr-FR\t,\t\u{202f}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tUSD=$US,GBP=\u{a3}GB,JPY=JPY,CNY=CNY,CAD=$CA,AUD=$AU,NZD=$NZ,MXN=$MX,ARS=$AR,TWD=TWD,HKD=HKD,SGD=$SG\n\
-fr-BE\t,\t\u{202f}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tUSD=$US,GBP=\u{a3}GB,JPY=JPY,CNY=CNY,CAD=$CA,AUD=$AU,NZD=$NZ,MXN=$MX,ARS=$AR,TWD=TWD,HKD=HKD,SGD=$SG\n\
-fr-CA\t,\t\u{a0}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tUSD=$\u{a0}US,JPY=\u{a5},INR=INR,CAD=$,AUD=$\u{a0}AU,NZD=$\u{a0}NZ,MXN=MXN,KRW=KRW,TWD=TWD,HKD=$\u{a0}HK,SGD=$\u{a0}SG,VND=VND,ILS=ILS\n\
-fr-CH\t.\t\u{202f}\t,\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tUSD=$US,GBP=\u{a3}GB,JPY=JPY,CNY=CNY,CAD=$CA,AUD=$AU,NZD=$NZ,MXN=$MX,ARS=$AR,TWD=TWD,HKD=HKD,SGD=$SG\n\
-it-IT\t,\t.\t\t\t-\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tUSD=USD,JPY=JPY,INR=INR,AUD=A$,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,THB=\u{e3f},VND=VND,PHP=\u{20b1}\n\
-it-CH\t.\t\u{2019}\t\t\t-\t2\t\u{a4}\u{a0}#\t\u{a4}-#\t\u{a4}\u{a0}#\t\u{a4}-#\tUSD=USD,JPY=JPY,INR=INR,AUD=A$,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,THB=\u{e3f},VND=VND,PHP=\u{20b1}\n\
-es-ES\t,\t.\t\t\t-\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tGBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,THB=\u{e3f},ILS=ILS\n\
-es-MX\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tUSD=USD,EUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=$,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n\
-es-AR\t,\t.\t\t\t-\t0\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tEUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,ARS=$,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n\
-pt-BR\t,\t.\t\t\t-\t0\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tTHB=\u{e3f}\n\
-pt-PT\t,\t\u{a0}\t\t\t-\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tTHB=\u{e3f}\n\
-nl-NL\t,\t.\t\t\t-\t0\t\u{a4}\u{a0}#\t\u{a4}\u{a0}-#\t\u{a4}\u{a0}#\t\u{a4}\u{a0}-#\tCAD=C$,THB=\u{e3f}\n\
-nl-BE\t,\t.\t\t\t-\t0\t\u{a4}\u{a0}#\t\u{a4}\u{a0}-#\t\u{a4}\u{a0}#\t\u{a4}\u{a0}-#\tCAD=C$,THB=\u{e3f}\n\
-sv-SE\t,\t\u{a0}\t\t\t\u{2212}\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tGBP=GBP,JPY=JPY,CNY=CNY,INR=INR,AUD=AUD,NZD=NZD,SEK=kr,NOK=Nkr,DKK=Dkr,BRL=BR$,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,EGP=EG\u{a3}\n\
-nb-NO\t,\t\u{a0}\t\t\t\u{2212}\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tUSD=USD,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,NOK=kr,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n\
-da-DK\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tDKK=kr.,THB=\u{e3f}\n\
-fi-FI\t,\t\u{a0}\t\t\t\u{2212}\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tUSD=$,JPY=\u{a5},CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n\
-pl-PL\t,\t\u{a0}\t\t\t-\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tUSD=USD,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,PLN=z\u{142},MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n\
-cs-CZ\t,\t\u{a0}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tINR=INR,CZK=K\u{10d},VND=VND,ILS=ILS\n\
-hu-HU\t,\t\u{a0}\t\t\t-\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tUSD=USD,EUR=EUR,GBP=GBP,JPY=\u{a5},CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,HUF=Ft,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n\
-ro-RO\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tUSD=USD,EUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n\
-el-GR\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tUSD=$,AUD=A$,THB=\u{e3f}\n\
-tr-TR\t,\t.\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tUSD=$,JPY=\u{a5},TRY=\u{20ba},THB=\u{e3f}\n\
-ru-RU\t,\t\u{a0}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tUSD=$,JPY=\u{a5},AUD=A$,RUB=\u{20bd},UAH=\u{20b4},THB=\u{e3f}\n\
-uk-UA\t,\t\u{a0}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tUSD=USD,EUR=EUR,GBP=GBP,JPY=\u{a5},CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,UAH=\u{20b4},BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n\
-ja-JP\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tUSD=$,JPY=\u{ffe5},CNY=\u{5143},AUD=A$\n\
-zh-CN\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tCNY=\u{a5}\n\
-zh-TW\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tJPY=\u{a5},KRW=\u{ffe6},TWD=$\n\
-zh-HK\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tJPY=\u{a5}\n\
-ko-KR\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\t\n\
-hi-IN\t.\t,\t\t\t-\t1\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tUSD=$,AUD=A$,THB=\u{e3f}\n\
-id-ID\t,\t.\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tINR=Rs,THB=\u{e3f},IDR=Rp\n\
-th-TH\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tJPY=\u{a5},THB=\u{e3f}\n\
-vi-VN\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tJPY=\u{a5},THB=\u{e3f}\n\
-ms-MY\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tUSD=USD,CAD=CAD,AUD=A$,MXN=MXN,MYR=RM\n\
-fil-PH\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tUSD=$,JPY=\u{a5},AUD=A$,THB=\u{e3f},PHP=\u{20b1}";
+/// whose side at the number is not a currency sign, and the symbols that differ from
+/// `SYMBOLS`. 122 locales, written from Intl.NumberFormat's formatToParts under ICU 77 by
+/// scripts/money-tables.mjs: the locales whose digits are not 0-9, and those
+/// whose money the four patterns cannot write (right-to-left marks around symbols, en-150's
+/// pattern for each currency), are left out and written as another, with a warning
+/// (FEEDBACK50.md, Q-627; branch feedback50-fixes).
+pub const LOCALES: &str = "en-US\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tJPY=\u{a5},PHP=\u{20b1},USD=$\n\
+en-GB\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tPHP=\u{20b1}\n\
+en-CA\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tCAD=$,PHP=\u{20b1}\n\
+en-AU\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=$,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,SCR=Rs,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF,XPF=CFP\n\
+en-NZ\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tNZD=$,PHP=\u{20b1}\n\
+en-IE\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tPHP=\u{20b1}\n\
+en-IN\t.\t,\t\t\t-\t5\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tPHP=\u{20b1},USD=$\n\
+en-SG\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tPHP=\u{20b1},SGD=$\n\
+en-ZA\t,\t\u{a0}\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tPHP=\u{20b1},ZAR=R\n\
+de-DE\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AU$,JPY=\u{a5},THB=\u{e3f},USD=$\n\
+de-AT\t,\t.\t\t\u{a0}\t-\t0\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AU$,JPY=\u{a5},THB=\u{e3f},USD=$\n\
+de-CH\t.\t\u{2019}\t\t\t-\t0\t\u{a4}\u{a0}#\t\u{a4}-#\t\u{a4}\u{a0}#\t\u{a4}-#\tAUD=AU$,EUR=EUR,JPY=\u{a5},THB=\u{e3f},USD=$\n\
+fr-FR\t,\t\u{202f}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tARS=$AR,AUD=$AU,BMD=$BM,BND=$BN,BZD=$BZ,CAD=$CA,CLP=$CL,CNY=CNY,COP=$CO,FJD=$FJ,FKP=\u{a3}FK,GBP=\u{a3}GB,GIP=\u{a3}GI,HKD=HKD,JPY=JPY,LBP=\u{a3}LB,MXN=$MX,NAD=$NA,NZD=$NZ,SBD=$SB,SGD=$SG,SRD=$SR,TTD=$TT,TWD=TWD,USD=$US,UYU=$UY,WST=$WS,XCD=XCD,XPF=FCFP,CYP=\u{a3}CY\n\
+fr-BE\t,\t\u{202f}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tARS=$AR,AUD=$AU,BMD=$BM,BND=$BN,BZD=$BZ,CAD=$CA,CLP=$CL,CNY=CNY,COP=$CO,FJD=$FJ,FKP=\u{a3}FK,GBP=\u{a3}GB,GIP=\u{a3}GI,HKD=HKD,JPY=JPY,LBP=\u{a3}LB,MXN=$MX,NAD=$NA,NZD=$NZ,SBD=$SB,SGD=$SG,SRD=$SR,TTD=$TT,TWD=TWD,USD=$US,UYU=$UY,WST=$WS,XCD=XCD,XPF=FCFP,CYP=\u{a3}CY\n\
+fr-CA\t,\t\u{a0}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=$\u{a0}AU,CAD=$,HKD=$\u{a0}HK,ILS=ILS,INR=INR,JPY=\u{a5},KRW=KRW,MXN=MXN,NZD=$\u{a0}NZ,SGD=$\u{a0}SG,TWD=TWD,USD=$\u{a0}US,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF,XPF=XPF,CYP=\u{a3}CY\n\
+fr-CH\t.\t\u{202f}\t,\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tARS=$AR,AUD=$AU,BMD=$BM,BND=$BN,BZD=$BZ,CAD=$CA,CLP=$CL,CNY=CNY,COP=$CO,FJD=$FJ,FKP=\u{a3}FK,GBP=\u{a3}GB,GIP=\u{a3}GI,HKD=HKD,JPY=JPY,LBP=\u{a3}LB,MXN=$MX,NAD=$NA,NZD=$NZ,SBD=$SB,SGD=$SG,SRD=$SR,TTD=$TT,TWD=TWD,USD=$US,UYU=$UY,WST=$WS,XCD=XCD,XPF=FCFP,CYP=\u{a3}CY\n\
+it-IT\t,\t.\t\t\t-\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tBRL=BRL,HKD=HKD,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,PHP=\u{20b1},THB=\u{e3f},TWD=TWD,USD=USD,VND=VND\n\
+it-CH\t.\t\u{2019}\t\t\t-\t2\t\u{a4}\u{a0}#\t\u{a4}-#\t\u{a4}\u{a0}#\t\u{a4}-#\tBRL=BRL,HKD=HKD,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,PHP=\u{20b1},THB=\u{e3f},TWD=TWD,USD=USD,VND=VND\n\
+es-ES\t,\t.\t\t\t-\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,THB=\u{e3f},TWD=TWD,XAF=XAF,XCD=XCD,XOF=XOF\n\
+es-MX\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MRU=UM,MXN=$,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF,MRO=MRU\n\
+es-AR\t,\t.\t\t\t-\t0\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tARS=$,AUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n\
+pt-BR\t,\t.\t\t\t-\t0\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AU$,THB=\u{e3f}\n\
+pt-PT\t,\t\u{a0}\t\t\t-\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AU$,THB=\u{e3f}\n\
+nl-NL\t,\t.\t\t\t-\t0\t\u{a4}\u{a0}#\t\u{a4}\u{a0}-#\t\u{a4}\u{a0}#\t\u{a4}\u{a0}-#\tAUD=AU$,CAD=C$,FJD=FJ$,SBD=SI$,THB=\u{e3f},XPF=XPF\n\
+nl-BE\t,\t.\t\t\t-\t0\t\u{a4}\u{a0}#\t\u{a4}\u{a0}-#\t\u{a4}\u{a0}#\t\u{a4}\u{a0}-#\tAUD=AU$,CAD=C$,FJD=FJ$,SBD=SI$,THB=\u{e3f},XPF=XPF\n\
+sv-SE\t,\t\u{a0}\t\t\t\u{2212}\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,BBD=Bds$,BMD=BM$,BRL=BR$,BSD=BS$,BZD=BZ$,CNY=CNY,DKK=Dkr,DOP=RD$,EGP=EG\u{a3},GBP=GBP,HKD=HKD,INR=INR,ISK=Ikr,JMD=JM$,JPY=JPY,KRW=KRW,NOK=Nkr,NZD=NZD,SEK=kr,TWD=TWD,VND=VND,EEK=Ekr\n\
+nb-NO\t,\t\u{a0}\t\t\t\u{2212}\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NOK=kr,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XPF=XPF\n\
+da-DK\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AU$,DKK=kr.,THB=\u{e3f}\n\
+fi-FI\t,\t\u{a0}\t\t\t\u{2212}\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,HKD=HKD,ILS=ILS,INR=INR,JPY=\u{a5},KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=$,VND=VND,XCD=XCD,XPF=XPF\n\
+pl-PL\t,\t\u{a0}\t\t\t-\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,CAD=CAD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,PLN=z\u{142},TWD=TWD,USD=USD,VND=VND\n\
+cs-CZ\t,\t\u{a0}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AU$,CZK=K\u{10d},ILS=ILS,INR=INR,VND=VND\n\
+hu-HU\t,\t\u{a0}\t\t\t-\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,HUF=Ft,ILS=ILS,INR=INR,JPY=\u{a5},KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XCD=XCD\n\
+ro-RO\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XCD=XCD\n\
+el-GR\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tTHB=\u{e3f},USD=$\n\
+tr-TR\t,\t.\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AU$,JPY=\u{a5},THB=\u{e3f},TRY=\u{20ba},USD=$\n\
+ru-RU\t,\t\u{a0}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tJPY=\u{a5},RUB=\u{20bd},THB=\u{e3f},TMT=\u{422}\u{41c}\u{422},UAH=\u{20b4},USD=$\n\
+uk-UA\t,\t\u{a0}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=\u{a5},KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,UAH=\u{20b4},USD=USD,VND=VND,XCD=XCD\n\
+ja-JP\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tCNY=\u{5143},JPY=\u{ffe5},USD=$\n\
+zh-CN\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AU$,CNY=\u{a5}\n\
+zh-TW\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AU$,JPY=\u{a5},KRW=\u{ffe6},TWD=$\n\
+zh-HK\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AU$,JPY=\u{a5}\n\
+ko-KR\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AU$\n\
+hi-IN\t.\t,\t\t\t-\t5\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tTHB=\u{e3f},USD=$\n\
+id-ID\t,\t.\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AU$,IDR=Rp,INR=Rs,THB=\u{e3f}\n\
+th-TH\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AU$,JPY=\u{a5},THB=\u{e3f}\n\
+vi-VN\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AU$,JPY=\u{a5},THB=\u{e3f}\n\
+ms-MY\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tCAD=CAD,MXN=MXN,MYR=RM,USD=USD\n\
+fil-PH\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tJPY=\u{a5},PHP=\u{20b1},THB=\u{e3f},USD=$\n\
+es-419\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n\
+es-CO\t,\t.\t\t\t-\t0\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,COP=$,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n\
+es-CL\t,\t.\t\t\t-\t0\t\u{a4}#\t\u{a4}-#\t\u{a4}\u{a0}#\t\u{a4}-#\tAUD=AUD,BRL=BRL,CAD=CAD,CLP=$,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n\
+es-PE\t.\t,\t\t\t-\t0\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,PEN=S/,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n\
+es-US\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=\u{a5},KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=$,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n\
+es-UY\t,\t.\t\t\t-\t0\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,UYU=$,UYW=UP,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n\
+es-VE\t,\t.\t\t\t-\t0\t\u{a4}#\t\u{a4}-#\t\u{a4}\u{a0}#\t\u{a4}-#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VES=Bs.S,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF,VEF=Bs.\n\
+es-EC\t,\t.\t\t\t-\t0\t\u{a4}#\t\u{a4}-#\t\u{a4}\u{a0}#\t\u{a4}-#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=$,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n\
+es-GT\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,GTQ=Q,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n\
+es-CR\t,\t\u{a0}\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,CRC=\u{20a1},EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n\
+es-DO\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,DOP=RD$,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n\
+es-BO\t,\t.\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AUD,BOB=Bs,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n\
+es-PY\t,\t.\t\t\t-\t0\t\u{a4}\u{a0}#\t\u{a4}\u{a0}-#\t\u{a4}\u{a0}#\t\u{a4}\u{a0}-#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,PYG=Gs.,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n\
+es-PA\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,PAB=B/.,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n\
+es-PR\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,EUR=EUR,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=$,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF\n\
+pt-AO\t,\t\u{a0}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAOA=Kz,AUD=AU$,THB=\u{e3f}\n\
+pt-MZ\t,\t\u{a0}\t\t\t-\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AU$,MZN=MTn,THB=\u{e3f}\n\
+en-NG\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tNGN=\u{20a6},PHP=\u{20b1}\n\
+en-KE\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tKES=Ksh,PHP=\u{20b1}\n\
+en-PK\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tPHP=\u{20b1},PKR=Rs\n\
+en-PH\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tJPY=\u{a5},PHP=\u{20b1},USD=$\n\
+en-MY\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tMYR=RM,PHP=\u{20b1}\n\
+en-AE\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tJPY=\u{a5},PHP=\u{20b1},USD=$\n\
+en-HK\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tPHP=\u{20b1}\n\
+en-GH\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tGHS=GH\u{20b5},PHP=\u{20b1}\n\
+en-IL\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tPHP=\u{20b1}\n\
+en-001\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tPHP=\u{20b1}\n\
+fr-MA\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tARS=$AR,AUD=$AU,BMD=$BM,BND=$BN,BZD=$BZ,CAD=$CA,CLP=$CL,CNY=CNY,COP=$CO,FJD=$FJ,FKP=\u{a3}FK,GBP=\u{a3}GB,GIP=\u{a3}GI,HKD=HKD,JPY=JPY,LBP=\u{a3}LB,MXN=$MX,NAD=$NA,NZD=$NZ,SBD=$SB,SGD=$SG,SRD=$SR,TTD=$TT,TWD=TWD,USD=$US,UYU=$UY,WST=$WS,XCD=XCD,XPF=FCFP,CYP=\u{a3}CY\n\
+fr-SN\t,\t\u{202f}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tARS=$AR,AUD=$AU,BMD=$BM,BND=$BN,BZD=$BZ,CAD=$CA,CLP=$CL,CNY=CNY,COP=$CO,FJD=$FJ,FKP=\u{a3}FK,GBP=\u{a3}GB,GIP=\u{a3}GI,HKD=HKD,JPY=JPY,LBP=\u{a3}LB,MXN=$MX,NAD=$NA,NZD=$NZ,SBD=$SB,SGD=$SG,SRD=$SR,TTD=$TT,TWD=TWD,USD=$US,UYU=$UY,WST=$WS,XCD=XCD,XPF=FCFP,CYP=\u{a3}CY\n\
+fr-CI\t,\t\u{202f}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tARS=$AR,AUD=$AU,BMD=$BM,BND=$BN,BZD=$BZ,CAD=$CA,CLP=$CL,CNY=CNY,COP=$CO,FJD=$FJ,FKP=\u{a3}FK,GBP=\u{a3}GB,GIP=\u{a3}GI,HKD=HKD,JPY=JPY,LBP=\u{a3}LB,MXN=$MX,NAD=$NA,NZD=$NZ,SBD=$SB,SGD=$SG,SRD=$SR,TTD=$TT,TWD=TWD,USD=$US,UYU=$UY,WST=$WS,XCD=XCD,XPF=FCFP,CYP=\u{a3}CY\n\
+fr-LU\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tARS=$AR,AUD=$AU,BMD=$BM,BND=$BN,BZD=$BZ,CAD=$CA,CLP=$CL,CNY=CNY,COP=$CO,FJD=$FJ,FKP=\u{a3}FK,GBP=\u{a3}GB,GIP=\u{a3}GI,HKD=HKD,JPY=JPY,LBP=\u{a3}LB,MXN=$MX,NAD=$NA,NZD=$NZ,SBD=$SB,SGD=$SG,SRD=$SR,TTD=$TT,TWD=TWD,USD=$US,UYU=$UY,WST=$WS,XCD=XCD,XPF=FCFP,CYP=\u{a3}CY\n\
+de-LU\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AU$,JPY=\u{a5},THB=\u{e3f},USD=$\n\
+de-LI\t.\t\u{2019}\t\t\t-\t0\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AU$,EUR=EUR,JPY=\u{a5},THB=\u{e3f},USD=$\n\
+hr-HR\t,\t.\t\t\t\u{2212}\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XCD=XCD,XPF=XPF,HRK=kn\n\
+sl-SI\t,\t.\t\t\t\u{2212}\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,BRL=BRL,CAD=CAD,GBP=GBP,JPY=\u{a5},MXN=MXN,NZD=NZD,TWD=TWD,USD=$,XCD=XCD\n\
+sk-SK\t,\t\u{a0}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=NIS,INR=INR,JPY=JPY,KRW=KRW,NZD=NZD,TWD=TWD,USD=USD,VND=VND\n\
+bg-BG\t,\t\u{a0}\t\t\t-\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=\u{449}.\u{434}.,VND=VND,XCD=XCD,BGN=\u{43b}\u{432}.\n\
+lt-LT\t,\t\u{a0}\t\t\t\u{2212}\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XOF=XOF,XPF=XPF\n\
+lv-LV\t,\t\u{a0}\t\t\t-\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AU$,JPY=\u{a5},THB=\u{e3f},USD=$,LVL=Ls\n\
+et-EE\t,\t\u{a0}\t\t\t\u{2212}\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AU$,JPY=\u{a5},THB=\u{e3f},USD=$,EEK=kr\n\
+is-IS\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,BRL=BRL,CAD=CAD,EUR=EUR,GBP=GBP,INR=INR,ISK=kr.,KRW=KRW,MXN=MXN,NZD=NZD,TWD=TWD,USD=USD,VND=VND\n\
+mk-MK\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MKD=\u{434}\u{435}\u{43d}.,NZD=NZD,TWD=TWD,VND=VND\n\
+sr-Latn-RS\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,BAM=KM,JPY=\u{a5},KRW=KRW,NZD=NZD,VND=VND\n\
+bs-Latn-BA\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,BAM=KM,BRL=BRL,CAD=CAD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=ILS,JPY=\u{a5},MXN=MXN,NZD=NZD,RSD=din.,THB=\u{e3f},USD=USD,XCD=XCD,XPF=XPF,HRK=kn\n\
+sq-AL\t,\t\u{a0}\t\t\t-\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tALL=Lek\u{eb},BRL=BRL,THB=\u{e3f}\n\
+ka-GE\t,\t\u{a0}\t\t\t-\t2\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,CNY=CNY,GEL=\u{20be},HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,NZD=NZD,VND=VND\n\
+hy-AM\t,\t\u{a0}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAMD=\u{58f},THB=\u{e3f},USD=$\n\
+az-Latn-AZ\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAZN=\u{20bc},THB=\u{e3f}\n\
+kk-KZ\t,\t\u{a0}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tKZT=\u{20b8},LSL=\u{41b}\u{421}\u{41b},RUB=\u{20bd},THB=\u{e3f},USD=$\n\
+uz-Latn-UZ\t,\t\u{a0}\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tUZS=so\u{2bb}m\n\
+sw-TZ\t.\t,\t\t\t-\t0\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tKES=Ksh,THB=\u{e3f},TZS=TSh\n\
+sw-KE\t.\t,\t\t\t-\t0\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tKES=Ksh,THB=\u{e3f},TZS=TSh,USD=$\n\
+zh-SG\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AU$,SGD=$\n\
+zh-MO\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AU$,JPY=\u{a5},MOP=MOP$\n\
+ta-IN\t.\t,\t\t\t-\t5\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tJPY=\u{a5},THB=\u{e3f},USD=$\n\
+te-IN\t.\t,\t\t\t-\t5\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tTHB=\u{e3f},USD=$\n\
+gu-IN\t.\t,\t\t\t-\t5\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tTHB=\u{e3f}\n\
+kn-IN\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tTHB=\u{e3f},USD=$\n\
+ml-IN\t.\t,\t\t\t-\t4\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tJPY=\u{a5},THB=\u{e3f},USD=$\n\
+pa-IN\t.\t,\t\t\t-\t5\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tTHB=\u{e3f}\n\
+km-KH\t.\t,\t\t\t-\t0\t#\u{a4}\t-#\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tKHR=\u{17db},LSL=\u{17a1}\u{17bc}\u{1791}\u{17b8},THB=\u{e3f},USD=$\n\
+lo-LA\t,\t.\t\t\t-\t0\t\u{a4}#\t\u{a4}-#\t\u{a4}\u{a0}#\t\u{a4}-#\tLAK=\u{20ad},THB=\u{e3f}\n\
+si-LK\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tLKR=\u{dbb}\u{dd4}.,THB=\u{e3f},XOF=\u{dc3}\u{dd2}\u{dc6}\u{dca}\u{d91}\n\
+am-ET\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tAUD=AU$,ETB=\u{1265}\u{122d},THB=\u{e3f}\n\
+zu-ZA\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tTHB=\u{e3f},USD=$,ZAR=R\n\
+af-ZA\t,\t\u{a0}\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tCAD=CAD,MXN=MXN,THB=\u{e3f},USD=USD,ZAR=R\n\
+ca-ES\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AU$,BRL=BRL,CAD=CAD,CNY=CNY,JPY=\u{a5},MXN=MXN,THB=\u{e3f},USD=USD,XCD=XCD\n\
+eu-ES\t,\t.\t\t\t\u{2212}\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tTHB=\u{e3f}\n\
+gl-ES\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tMXN=$MX,THB=\u{e3f},USD=$,XCD=XCD\n\
+ga-IE\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tJPY=\u{a5},PHP=\u{20b1},THB=\u{e3f},USD=$\n\
+cy-GB\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\tKRW=KRW,THB=\u{e3f}\n\
+mt-MT\t.\t,\t\t\t-\t0\t\u{a4}#\t-\u{a4}#\t\u{a4}\u{a0}#\t-\u{a4}\u{a0}#\t\n\
+lb-LU\t,\t.\t\t\t-\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AU$,JPY=\u{a5},THB=\u{e3f},USD=$\n\
+nn-NO\t,\t\u{a0}\t\t\t\u{2212}\t0\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\t#\u{a0}\u{a4}\t-#\u{a0}\u{a4}\tAUD=AUD,BRL=BRL,CAD=CAD,CNY=CNY,GBP=GBP,HKD=HKD,ILS=ILS,INR=INR,JPY=JPY,KRW=KRW,MXN=MXN,NOK=kr,NZD=NZD,TWD=TWD,USD=USD,VND=VND,XAF=XAF,XCD=XCD,XPF=XPF";
+
+/// The decimals CLDR writes for a currency where they are not its ISO 4217 minor units
+/// (`Intl.NumberFormat` writes IRR 1,234, not IRR 1,234.00): what `money.format` shows. An
+/// amount keeps its minor units (FEEDBACK50.md, Q-627; branch feedback50-fixes).
+pub const DISPLAY: &str = "AFN0 ALL0 IQD0 IRR0 KPW0 LAK0 LBP0 MGA0 MMK0 RSD0 SOS0 SYP0 YER0 MRO0 SLL0 STD0 TMM0 ZMK0 ZWD0";
 
 pub const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("money.of", of),
+    ("money.parse", parse),
     ("money.from_minor", from_minor),
     ("money.to_minor", to_minor),
     ("money.add", add),
@@ -148,6 +235,8 @@ struct Locale {
     number: (&'static str, &'static str),
     minus: &'static str,
     indian: bool,
+    /// Indian grouping in other numbers (ml-IN groups numbers so, not money).
+    number_indian: bool,
     min2: bool,
     /// With a symbol: amount, negative; with letters next to the number: the same.
     pats: [&'static str; 4],
@@ -174,6 +263,7 @@ fn locales() -> &'static [Locale] {
                     number: (or(f[3], f[1]), or(f[4], f[2])),
                     minus: f[5],
                     indian: flags & 1 != 0,
+                    number_indian: flags & 4 != 0,
                     min2: flags & 2 != 0,
                     pats: [f[7], f[8], f[9], f[10]],
                     symbols: symbol_pairs(f.get(11).copied().unwrap_or("")),
@@ -183,16 +273,89 @@ fn locales() -> &'static [Locale] {
     })
 }
 
-/// A locale's data: by its name (`en-US`, `en_us`), else the first of its
-/// language (`de-LU`, `de`: de-DE), else en-US.
-fn locale_data(name: &str) -> &'static Locale {
+/// The decimals `money.format` writes for a currency: CLDR's, else its minor units.
+fn display_digits(code: &str, units: u32) -> u32 {
+    static T: OnceLock<HashMap<&'static str, u32>> = OnceLock::new();
+    T.get_or_init(|| DISPLAY.split_whitespace().map(|c| (&c[..3], c[3..].parse().unwrap())).collect()).get(code).copied().unwrap_or(units)
+}
+
+/// Regions whose Spanish CLDR writes as Latin America's (es-419), and whose Portuguese as
+/// Portugal's: its parent locales.
+const ES_419: &[&str] = &["419", "AR", "BO", "BZ", "CL", "CO", "CR", "CU", "DO", "EC", "GT", "HN", "MX", "NI", "PA", "PE", "PR", "PY", "SV", "US", "UY", "VE"];
+const PT_PT: &[&str] = &["AO", "CH", "CV", "GQ", "GW", "LU", "MO", "MZ", "PT", "ST", "TL"];
+
+/// A locale's data: by its name (`en-US`, `en_us`, `sr-Latn-RS`); for Chinese by its script
+/// (`zh-Hant` as zh-TW, `zh-Hans-SG` as zh-SG); else by its language and region, the script
+/// left out; for Spanish of Latin America es-419, for Portuguese of Africa and Asia pt-PT, as
+/// CLDR's parent locales are; else the first of its language (`de`: de-DE); else en-US.
+/// Extensions (`-u-ca-gregory`, `-x-...`) are not read. es-CO was Spain's, zh-Hant-TW
+/// mainland China's (FEEDBACK50.md, Q-627; branch feedback50-fixes). The second value: whether
+/// the name was matched or taken for what it says, not only written as something else.
+fn locale_found(name: &str) -> (&'static Locale, bool) {
     let all = locales();
     let name = name.replace('_', "-");
-    let lang = name.split('-').next().unwrap_or("");
-    all.iter()
-        .find(|l| l.name.eq_ignore_ascii_case(&name))
-        .or_else(|| all.iter().find(|l| l.name.split('-').next().map_or(false, |x| x.eq_ignore_ascii_case(lang))))
-        .unwrap_or(&all[0])
+    let find = |n: &str| all.iter().find(|l| l.name.eq_ignore_ascii_case(n));
+    if let Some(l) = find(&name) {
+        return (l, true);
+    }
+    let subs: Vec<&str> = name.split('-').collect();
+    let lang = subs[0].to_ascii_lowercase();
+    // Up to an extension's one-letter key (`-u-`, `-x-`).
+    let rest: Vec<&str> = subs[1..].iter().copied().take_while(|s| !(s.len() == 1 && s.bytes().all(|b| b.is_ascii_alphanumeric()))).collect();
+    let alpha = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_alphabetic());
+    let script = rest.first().filter(|s| alpha(s, 4)).map(|s| s.to_ascii_lowercase());
+    let region = rest
+        .get(script.is_some() as usize)
+        .filter(|s| alpha(s, 2) || (s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit())))
+        .map(|s| s.to_ascii_uppercase());
+    let (script, region) = (script.as_deref(), region.as_deref());
+    let picked = match (lang.as_str(), script, region) {
+        ("zh", Some("hant"), Some(r @ ("HK" | "MO"))) => Some(format!("zh-{}", r)),
+        ("zh", Some("hant"), _) => Some("zh-TW".to_string()),
+        ("zh", Some("hans"), Some("SG")) => Some("zh-SG".to_string()),
+        ("zh", Some("hans"), _) => Some("zh-CN".to_string()),
+        (_, _, Some(r)) if find(&format!("{}-{}", lang, r)).is_some() => Some(format!("{}-{}", lang, r)),
+        ("es", _, Some(r)) if ES_419.contains(&r) => Some("es-419".to_string()),
+        ("pt", _, Some(r)) if PT_PT.contains(&r) => Some("pt-PT".to_string()),
+        _ => None,
+    };
+    if let Some(l) = picked.and_then(|n| find(&n)) {
+        return (l, true);
+    }
+    match all.iter().find(|l| l.name.split('-').next().map_or(false, |x| x.eq_ignore_ascii_case(&lang))) {
+        // A language alone (or with its own script: `sr-Latn`, `en-Latn`) names its first
+        // locale; with a region not here, it is written as another country's.
+        Some(l) => {
+            let row_script = l.name.split('-').nth(1).filter(|s| s.len() == 4);
+            let same_script = script.map_or(true, |s| row_script.map_or(s == "latn", |r| r.eq_ignore_ascii_case(s)));
+            (l, region.is_none() && same_script)
+        }
+        None => (&all[0], false),
+    }
+}
+
+/// A locale's data (`locale_found`), said in the log once for each name written as another
+/// (at most 64 names).
+fn locale_data(name: &str) -> &'static Locale {
+    let (loc, found) = locale_found(name);
+    if !found {
+        static SAID: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+        let mut said = SAID.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if said.len() < 64 && !said.contains(name) {
+            said.insert(name.to_string());
+            eprintln!("quillo: warning: no money and number data for locale {:?}: written as {}", name, loc.name);
+        }
+    }
+    loc
+}
+
+/// A currency sign (Unicode's Sc): a symbol whose edge is one meets the number; one whose edge
+/// is anything else (a letter, `.` as in `Cg.`, a mark) is set apart with a no-break space, as
+/// ICU does (FEEDBACK50.md, Q-627; branch feedback50-fixes).
+fn is_currency_sign(c: char) -> bool {
+    matches!(c, '$' | '\u{a2}'..='\u{a5}' | '\u{58f}' | '\u{60b}' | '\u{7fe}' | '\u{7ff}' | '\u{9f2}' | '\u{9f3}' | '\u{9fb}' | '\u{af1}' | '\u{bf9}'
+        | '\u{e3f}' | '\u{17db}' | '\u{20a0}'..='\u{20c0}' | '\u{a838}' | '\u{fdfc}' | '\u{fe69}' | '\u{ff04}' | '\u{ffe0}' | '\u{ffe1}' | '\u{ffe5}' | '\u{ffe6}'
+        | '\u{11fdd}'..='\u{11fe0}' | '\u{1e2ff}' | '\u{1ecb0}')
 }
 
 fn symbol(loc: &Locale, code: &str) -> String {
@@ -204,7 +367,7 @@ fn symbol(loc: &Locale, code: &str) -> String {
 }
 
 /// The digits of a decimal's magnitude, grouped, with these marks.
-fn digits(loc: &Locale, (decimal, group): (&str, &str), d: Dec) -> String {
+fn digits(loc: &Locale, (decimal, group): (&str, &str), indian: bool, d: Dec) -> String {
     let text = d.abs().to_string();
     let (whole, frac) = text.split_once('.').map_or((text.as_str(), ""), |(w, f)| (w, f));
     let mut out = String::new();
@@ -213,7 +376,7 @@ fn digits(loc: &Locale, (decimal, group): (&str, &str), d: Dec) -> String {
     for (i, c) in whole.chars().enumerate() {
         let left = n - i;
         if i > 0 && grouped {
-            let cut = if loc.indian { left == 3 || (left > 3 && (left - 3) % 2 == 0) } else { left % 3 == 0 };
+            let cut = if indian { left == 3 || (left > 3 && (left - 3) % 2 == 0) } else { left % 3 == 0 };
             if cut {
                 out.push_str(group);
             }
@@ -236,24 +399,25 @@ pub fn format_amount(d: Dec, code: &str, places: u32, loc_name: &str) -> String 
     // Before the number, the symbol's last character meets it; after, its first.
     let before = loc.pats[0].find('\u{a4}') < loc.pats[0].find('#');
     let side = if before { sym.chars().last() } else { sym.chars().next() };
-    let letters = side.map_or(false, |c| c.is_alphabetic());
+    let letters = side.map_or(false, |c| !is_currency_sign(c));
     let pat = loc.pats[if letters { 2 } else { 0 } + neg as usize];
-    pat.replace('-', loc.minus).replace('\u{a4}', &sym).replace('#', &digits(loc, (loc.decimal, loc.group), d))
+    pat.replace('-', loc.minus).replace('\u{a4}', &sym).replace('#', &digits(loc, (loc.decimal, loc.group), loc.indian, d))
 }
 
 /// `format_number(x, locale, digits)`: a number as `locale` writes one.
 pub fn format_number(d: Dec, places: Option<u32>, loc_name: &str) -> String {
-    format_number_between(d, places.map(|p| (p, p)), loc_name)
+    format_number_between(d, places.map(|p| (p, p)), Rounding::HalfUp, loc_name)
 }
 
 /// `format_number` with at least `min` and at most `max` digits after the point. A tie is
 /// rounded away from zero, from the number's shortest decimal, as `Intl.NumberFormat` and
-/// `round` do (FEEDBACK30.md, Q-369; branch feedback27-35-fixes).
-pub fn format_number_between(d: Dec, places: Option<(u32, u32)>, loc_name: &str) -> String {
+/// `round` do (FEEDBACK30.md, Q-369; branch feedback27-35-fixes), unless `mode` says otherwise:
+/// half to even writes what `money` works out (FEEDBACK50.md, Q-626; branch feedback50-fixes).
+pub fn format_number_between(d: Dec, places: Option<(u32, u32)>, mode: Rounding, loc_name: &str) -> String {
     let loc = locale_data(loc_name);
     let d = match places {
         Some((min, max)) => {
-            let mut r = d.round(max as i32, Rounding::HalfUp).unwrap_or(d);
+            let mut r = d.round(max as i32, mode).unwrap_or(d);
             while r.scale() > min && r.mantissa() % 10 == 0 {
                 r = Dec::new(r.mantissa() / 10, r.scale() - 1).unwrap_or(r);
             }
@@ -262,7 +426,7 @@ pub fn format_number_between(d: Dec, places: Option<(u32, u32)>, loc_name: &str)
         None => d,
     };
     let sign = if d.is_negative() { loc.minus } else { "" };
-    format!("{}{}", sign, digits(loc, loc.number, d))
+    format!("{}{}", sign, digits(loc, loc.number, loc.number_indian, d))
 }
 
 // ---- values --------------------------------------------------------------
@@ -395,7 +559,13 @@ fn of(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Some(Value::Float(_)) => return fail(line, "`money.of` takes a dec, an int or text, not a float: convert it with dec(x)"),
         other => return fail(line, format!("`money.of` expects an amount (a dec, int or str) as argument 1, got {}", tn(other))),
     };
-    let rounded = match args.get(2) {
+    of_amount(amount, code, units, &args, 2, "money.of", line)
+}
+
+/// The rest of `money.of` and `money.parse`: the amount to the currency's units (rounded as
+/// argument `m` says, else exact, or an error value), and minor units that fit an int.
+fn of_amount(amount: Dec, code: String, units: u32, args: &[Value], m: usize, f: &str, line: u32) -> R {
+    let rounded = match args.get(m) {
         None | Some(Value::Nil) => {
             let exact = to_units(amount, units, Rounding::Down, line)?;
             if exact != amount {
@@ -406,7 +576,7 @@ fn of(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
             }
             exact
         }
-        _ => to_units(amount, units, mode(&args, 2, "money.of", line)?, line)?,
+        _ => to_units(amount, units, mode(args, m, f, line)?, line)?,
     };
     // Money whose minor units do not fit an int is an error value here,
     // where a form's amount is checked, not a runtime error later in
@@ -415,6 +585,89 @@ fn of(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return Ok(Value::err(Value::str(format!("{} {} is too large an amount", rounded, code))));
     }
     Ok(Money { amount: rounded, code, units }.value())
+}
+
+/// `money.parse(text, currency, locale, mode)`: an amount as `locale` writes one, for a form:
+/// its decimal and group marks (whole groups only), a minus, and the currency's symbol or
+/// code before or after. `money.of` reads text as a program writes it, so a German visitor's
+/// "1.000", a thousand, was one euro (FEEDBACK50.md, Q-624; branch feedback50-fixes).
+fn parse(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    const F: &str = "money.parse";
+    let text = match args.first() {
+        Some(Value::Str(s)) => s.clone(),
+        other => return fail(line, format!("`{}` expects text as argument 1, got {}", F, tn(other))),
+    };
+    let (code, units) = match currency(&args, 1, F, line)? {
+        Ok(c) => c,
+        Err(e) => return Ok(e),
+    };
+    let loc = locale_data(&locale_arg(it, &args, 2, F, line)?);
+    match read_amount(&text, &code, loc) {
+        Some(amount) => of_amount(amount, code, units, &args, 3, F, line),
+        None => Ok(Value::err(Value::str(format!("not an amount: {}", Value::Str(text).repr())))),
+    }
+}
+
+/// Spaces a locale writes between groups, or that people type for them.
+fn spacey(c: char) -> bool {
+    matches!(c, ' ' | '\u{a0}' | '\u{202f}')
+}
+
+/// Text as `loc` writes an amount of `code`, as a decimal (`money.parse`).
+fn read_amount(text: &str, code: &str, loc: &Locale) -> Option<Dec> {
+    let marks = |c: char| spacey(c) || matches!(c, '\u{200e}' | '\u{200f}' | '\u{61c}');
+    let mut t = text.trim().trim_matches(marks).to_string();
+    if t.is_empty() || t.chars().count() > 400 {
+        return None;
+    }
+    // The currency, at either end: its code, or a symbol any locale writes for it (`¥` and
+    // `￥`, `$` and `US$`), the longest first.
+    let mut names: Vec<String> = locales().iter().map(|l| symbol(l, code)).chain([code.to_string()]).collect();
+    names.sort_by_key(|n| (std::cmp::Reverse(n.chars().count()), n.clone()));
+    names.dedup();
+    // A minus before the currency (`-$5`) or after it (`$-5`, `€ -5`).
+    let sign = |t: &mut String| -> bool {
+        match [loc.minus, "-", "\u{2212}"].iter().find_map(|m| t.strip_prefix(m)) {
+            Some(rest) => {
+                *t = rest.trim_matches(marks).to_string();
+                true
+            }
+            None => false,
+        }
+    };
+    let mut neg = sign(&mut t);
+    if let Some(n) = names.iter().find(|n| t.starts_with(n.as_str()) || t.ends_with(n.as_str())) {
+        t = t.strip_prefix(n.as_str()).or_else(|| t.strip_suffix(n.as_str())).unwrap_or(&t).trim_matches(marks).to_string();
+    }
+    if !neg {
+        neg = sign(&mut t);
+    }
+    // The whole part's groups and the fraction, by the locale's marks.
+    let group_spaced = loc.group.chars().all(spacey);
+    let group = |c: char| if group_spaced { spacey(c) } else { loc.group.contains(c) || (loc.group == "\u{2019}" && c == '\'') };
+    let (whole, frac) = match t.split_once(loc.decimal) {
+        Some((w, f)) => (w, Some(f)),
+        None => (t.as_str(), None),
+    };
+    if frac.is_some_and(|f| f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let groups: Vec<&str> = whole.split(group).collect();
+    if groups.iter().any(|g| g.is_empty() || !g.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    if groups.len() > 1 {
+        // The first group of 1 to 3 digits, the others of 3; in Indian grouping also the last
+        // of 3 and those before it of 2.
+        let (last, rest) = groups.split_last().unwrap();
+        let western = groups[0].len() <= 3 && groups[1..].iter().all(|g| g.len() == 3);
+        let ok = western || (loc.indian && last.len() == 3 && rest[0].len() <= 2 && rest[1..].iter().all(|g| g.len() == 2));
+        if !ok {
+            return None;
+        }
+    }
+    let digits = format!("{}{}{}", if neg { "-" } else { "" }, groups.concat(), frac.map_or(String::new(), |f| format!(".{}", f)));
+    Dec::parse(&digits)
 }
 
 /// `money.from_minor(1250, "USD")`: 12.50 dollars, from cents.
@@ -667,7 +920,11 @@ fn locale_arg(it: &mut Interp, args: &[Value], i: usize, f: &str, line: u32) -> 
 fn format(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let m = money(&args, 0, "money.format", line)?;
     let loc = locale_arg(it, &args, 1, "money.format", line)?;
-    Ok(Value::str(format_amount(m.amount, &m.code, m.units, &loc)))
+    // Fewer decimals shown than the amount has (IRR's none): rounded as Intl rounds, a tie away
+    // from zero (found in review of FEEDBACK50's fixes).
+    let shown = display_digits(&m.code, m.units);
+    let amount = m.amount.round(shown as i32, Rounding::HalfUp).unwrap_or(m.amount);
+    Ok(Value::str(format_amount(amount, &m.code, shown, &loc)))
 }
 
 /// `format_number(x, locale, digits)`: "1,234.5" (en-US), "1.234,5"
@@ -711,7 +968,12 @@ pub fn format_number_fn(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         other => return fail(line, format!("`{}` expects an int or `{{ min, max }}` as argument 3, got {}", F, tn(other))),
     };
-    Ok(Value::str(format_number_between(d, places, &loc)))
+    // How a tie rounds: away from zero unless told (FEEDBACK50.md, Q-626; branch feedback50-fixes).
+    let rounding = match args.get(3) {
+        None | Some(Value::Nil) => Rounding::HalfUp,
+        Some(_) => mode(&args, 3, F, line)?,
+    };
+    Ok(Value::str(format_number_between(d, places, rounding, &loc)))
 }
 
 #[cfg(test)]
@@ -723,8 +985,53 @@ mod tests {
         assert_eq!(CURRENCIES.split_whitespace().count(), 165);
         assert_eq!((units_of("JPY"), units_of("USD"), units_of("BHD"), units_of("CLF"), units_of("XAU")), (Some(0), Some(2), Some(3), Some(4), None));
         assert!(locales().iter().all(|l| l.pats.iter().all(|p| p.contains('#') && p.contains('\u{a4}'))));
-        assert_eq!(locale_data("de_lu").name, "de-DE");
-        assert_eq!(locale_data("xx").name, "en-US");
+        let named = |n: &str| (locale_found(n).0.name, locale_found(n).1);
+        assert_eq!(named("de_lu"), ("de-LU", true));
+        assert_eq!(named("DE-at"), ("de-AT", true));
+        assert_eq!(named("de"), ("de-DE", true));
+        assert_eq!(named("de-XX"), ("de-DE", false));
+        assert_eq!(named("sr-Latn-RS"), ("sr-Latn-RS", true));
+        assert_eq!(named("az-Cyrl-AZ"), ("az-Latn-AZ", false));
+        assert_eq!(named("zh-Hant-TW"), ("zh-TW", true));
+        assert_eq!(named("zh-Hant"), ("zh-TW", true));
+        assert_eq!(named("zh-Hant-HK"), ("zh-HK", true));
+        assert_eq!(named("zh-Hant-MO"), ("zh-MO", true));
+        assert_eq!(named("zh-Hans-SG"), ("zh-SG", true));
+        assert_eq!(named("zh-Hans"), ("zh-CN", true));
+        assert_eq!(named("es-CO"), ("es-CO", true));
+        assert_eq!(named("es-HN"), ("es-419", true));
+        assert_eq!(named("es"), ("es-ES", true));
+        assert_eq!(named("pt-CV"), ("pt-PT", true));
+        assert_eq!(named("pt"), ("pt-BR", true));
+        assert_eq!(named("es-419"), ("es-419", true));
+        assert_eq!(named("zh-Hant-CN"), ("zh-TW", true));
+        assert_eq!(named("zh-Hant-SG"), ("zh-TW", true));
+        assert_eq!(named("zh-Hans-TW"), ("zh-CN", true));
+        assert_eq!(named("zh-TW"), ("zh-TW", true));
+        assert_eq!(named("en-u-ca-gregory"), ("en-US", true));
+        assert_eq!(named("fr-u-ca-gregory"), ("fr-FR", true));
+        assert_eq!(named("es-x-ca"), ("es-ES", true));
+        assert_eq!(named("de-CH-u-nu-latn"), ("de-CH", true));
+        assert_eq!(named("es-GQ"), ("es-ES", false));
+        assert_eq!(named("es-150"), ("es-ES", false));
+        assert_eq!(named("pt-US"), ("pt-BR", false));
+        assert_eq!(named("pt-GW"), ("pt-PT", true));
+        assert_eq!(named("pt-AO"), ("pt-AO", true));
+        assert_eq!(named("sr-Latn"), ("sr-Latn-RS", true));
+        assert_eq!(named("sr-Cyrl"), ("sr-Latn-RS", false));
+        assert_eq!(named("en-Latn"), ("en-US", true));
+        assert_eq!(named("es-\u{e9}"), ("es-ES", true));
+        assert_eq!(named("es-\u{e9}\u{e9}"), ("es-ES", true));
+        assert_eq!(named("\u{212a}k-KZ"), ("en-US", false));
+        assert_eq!(named("en--US"), ("en-US", true));
+        assert_eq!(named("xx"), ("en-US", false));
+        assert_eq!(named(""), ("en-US", false));
+        assert_eq!(locale_data("xx-YY").name, "en-US");
+        assert_eq!(locale_data("xx-YY").name, "en-US");
+        assert_eq!(display_digits("IRR", 2), 0);
+        assert_eq!(display_digits("USD", 2), 2);
+        assert!(['$', '\u{a2}', '\u{20ac}', '\u{20b9}', '\u{ffe5}', '\u{17db}'].iter().all(|c| is_currency_sign(*c)));
+        assert!(['.', 'F', '/', '\u{17b8}', ' '].iter().all(|c| !is_currency_sign(*c)));
     }
 
     #[test]
@@ -759,6 +1066,7 @@ mod tests {
         };
         assert_eq!(constant("MONEY_CURRENCIES"), CURRENCIES);
         assert_eq!(constant("MONEY_WITHDRAWN"), WITHDRAWN);
+        assert_eq!(constant("MONEY_DISPLAY"), DISPLAY);
         assert_eq!(constant("MONEY_SYMBOLS"), SYMBOLS);
         assert_eq!(constant("MONEY_LOCALES"), LOCALES);
     }

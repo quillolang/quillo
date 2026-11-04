@@ -5072,14 +5072,14 @@ What each does at its edges, where the answer is not what another language would
 | `contains(x, y)` | in a string, `y` as text; in a list, an equal item; in a map, a key |
 | `remove(list, x)` | every item equal to `x` gone; `remove(map, k)` the key |
 | `set(xs, i, v)` | `i` past the end is an error |
-| `round(x)` | a float rounds half away from zero (`round(-2.5)` is `-3`) to an int; `round(x, 2)` a float with at most 15 places; a decimal takes a mode (see [Decimals](#decimals)) |
+| `round(x)` | a float rounds half away from zero (`round(-2.5)` is `-3`) to an int; `round(x, 2)` a float with at most 15 places, from its shortest decimal (`round(1.005, 2)` is `1.01`, as `format_number` writes it); a decimal takes a mode (see [Decimals](#decimals)) |
 | `int(x)` | a float or decimal cut toward zero (an error value when too large for an int); `true` is 1; text of digits only (`int("1.0")`, `int("1e3")` are error values) |
 | `str(x)` | a whole float as `2.0`, never in exponent form (`1e16` is `10000000000000000`); a list or map as Quillo writes it (`{ a: 1, b: "x" }`); `null` as `null` |
 | `type_of(x)` | one of `null bool int float dec str list map fn html response error` (`promise` for a JavaScript Promise in the browser) |
 | `len(x)` | a string's characters, a list's items, a map's keys; an `html` value's bytes |
 | `min([])`, `max([])`, `first([])` | `null`; `sum([])` is `0`, and a sum of decimals stays exact |
 | `sqrt(-1)` | `NaN`, while `math.sqrt(-1)` is an error, as in Python |
-| `pow(2, 10)` | an int, exact, or an overflow as `*` gives (`pow(2, 63)`); a float on either side, or a negative power, gives a float |
+| `pow(2, 10)` | an int, exact, or an overflow as `*` gives (`pow(2, 63)`); a float on either side, or a negative power, gives a float; a decimal to an int's power, a decimal (see [Decimals](#decimals)) |
 | `print(a, b)` | the values as text, a space between, on stdout (the console in a page) |
 | `now()` | milliseconds since 1970, an int |
 | `sleep(ms)` | no maximum; other requests run meanwhile; in a scheduled job or a tick, ends it (status 503) when the server stops or the program is loaded again, so a loop that runs for ever stops; a request waits it out (it is answered at a stop, up to 10 s, and finishes on its version at a reload) |
@@ -5459,6 +5459,11 @@ dec("12.50")  dec(42)  dec(0.1)        // 12.50m, 42m, 0.1m
   zero, as taught at school), `half_down`, `up` (away from zero), `down` (toward zero),
   `ceiling` and `floor`. `floor`, `ceil` and `abs` give decimals; `sum`, `min`, `max`
   and `sort` take lists of them, and a sum stays exact.
+- `pow(d, n)` raises a decimal to an int's power, by squaring: exact while the answer
+  fits, else each product rounded as `*` rounds, and a negative power is one over the
+  positive one *(since 0.7)*. Interest and loan payments need no floats:
+  `pow(1m + 0.05m / 12, 360)` is `4.4677443140061322124280701433m`, right to 25 digits. A
+  power that is not an int is an error: `float(x)` and `math.pow` for that.
 - `math`, `stats` and `vec` work on floats: a decimal there is an error that says to
   use `float(x)`.
 - `json.stringify`, and a route answering a map, write a decimal as a string
@@ -5476,8 +5481,22 @@ dec("12.50")  dec(42)  dec(0.1)        // 12.50m, 42m, 0.1m
   as on the server. The browser cannot tell `2.0` from `2`, so there a whole float
   added to a decimal counts as an int.
 - `quillo check` knows them: `12.5m + 1` is a `dec`, `12.5m + 0.5` an error, and `round`,
-  `abs`, `floor`, `ceil`, `sum`, `min` and `max` keep the type they are given. `num` is
-  still `int | float`.
+  `abs`, `floor`, `ceil`, `pow`, `sum`, `min` and `max` keep the type they are given. `num`
+  is still `int | float`.
+
+**Rounding.** Each place that rounds says how. A tie, the 5 of `0.125` to two places:
+
+| Where | A tie | `0.125` | `1.005` |
+|---|---|---|---|
+| `money.*`, and `round(d, n)` of a decimal | to even, unless a mode says otherwise | 0.12 | 1.00 |
+| `format_number(x, locale, n)` | away from zero, from the shortest decimal, as `Intl.NumberFormat`; or `mode` | 0.13 | 1.01 |
+| `round(x, n)` of a float | away from zero, from the float's shortest decimal *(since 0.7: `1.005` was `1.0`)* | 0.13 | 1.01 |
+| `money.format`, where a currency shows fewer decimals than it has (IRR) | away from zero, as `Intl.NumberFormat` | | |
+| PostgreSQL `numeric(p, s)` and MySQL `decimal` when a value has more decimals | away from zero | 0.13 | 1.01 |
+
+So write a line of an invoice as money works it out: `format_number(x, locale, 2,
+"half_even")`, or `money.format` of the line's money, never `format_number` of the
+amount with its default, which may show a cent more than the total adds up.
 - [Compiled numbers](#compiled-numbers) leave decimals to the interpreter.
 
 **In databases.** PostgreSQL's `numeric` and MySQL's `decimal` come back as decimals with
@@ -5494,8 +5513,22 @@ NUMERIC affinity: SQLite turns "0.10" into the real 0.1 (and rounds past 15 digi
 the scale is lost and large amounts are not exact. For exact amounts, declare the
 column `decimal_text` (TEXT affinity: SQLite keeps the digits as written, and Quillo
 still reads them as decimals), or keep whole minor units (`amount_cents integer`; see
-`money.to_minor`). SQL's own sums and ordering do not work on text: add up and sort in
-Quillo, or keep minor units.
+`money.to_minor`). SQL's own sums and ordering do not work on text: `max` of a
+`decimal_text` column is the largest text (`"9.99"` before `"100.00"`), as text; add up
+and sort in Quillo, or keep minor units. The first time SQLite is given a `create table`
+or `alter table` with a `money`, `decimal`, `dec(p, s)` or `numeric(p, s)` column, the log
+says which column, once *(since 0.7)*.
+
+PostgreSQL's own `money` type keeps a count of the smallest unit of its `lc_monetary`'s
+currency. Quillo reads it with that currency's decimals, asked of the connection the first
+time a result has one: `500` written reads back as `500m` under a yen `lc_monetary`, and
+`500.00m` under a dollar one *(since 0.7: it was always read as cents, so ￥500 came back
+as `5.00m`)*. It carries no currency: `numeric(p, s)` and a currency column say more.
+
+A list given as a query's parameters, `db.exec("insert ... values (?)", [x])` as Python's
+`sqlite3` takes them, is one parameter, stored as the list's JSON text. Parameters are
+separate arguments: `db.exec(sql, a, b)`. `quillo check` says so when the SQL is written
+out and has a `?` *(since 0.7)*.
 
 ### Money
 
@@ -5507,10 +5540,12 @@ it each time it is given one. On the server and in the browser alike:
 ```quillo
 let price = money.of(19.99m, "USD")             // { amount: 19.99m, currency: "USD" }
 money.of(form.amount, "EUR") ?? reply 400       // text from a form; an error value if bad
+money.parse("1.234,50 €", "EUR", "de-DE")       // 1234.50, as a German visitor writes it
 money.of("12.345", "USD")                       // err: more decimals than USD has
 money.of("12.345", "USD", "half_up")            // 12.35
 money.from_minor(1250, "USD")                   // 12.50, from cents
 money.to_minor(price)                           // 1999
+price + tax  price - discount                   // amounts of one currency, added
 money.add(a, b)  money.sub(a, b)  money.neg(a)  money.compare(a, b)   // -1, 0, 1
 money.mul(price, 3)  money.mul(price, 0.075m, "half_up")              // rounded to cents
 money.allocate(money.of(100, "USD"), [1, 1, 1])  // 33.34, 33.33, 33.33
@@ -5519,53 +5554,86 @@ money.format(price, "de-DE")                    // "19,99 $"
 
 - `money.of(amount, currency, mode)` takes a decimal, an int or numeric text (a float
   is a runtime error, as is a currency that is not text: `dec(x)` it first). Text is an
-  amount as people write one: digits, a sign and a point, not `"1e3"`. An amount
-  with more decimals than the currency has, bad text, an amount whose minor units do
-  not fit an int (so that `money.to_minor` always can) and an unknown currency give
-  error values, as `int("x")` does; with a
-  rounding mode (those of `round`), the amount is rounded instead. Codes are ISO 4217's
-  active ones (`money.minor_units("JPY")` is 0); codes without minor units, such as XAU,
-  are not money.
-- `add`, `sub` and `compare` take two amounts of one currency: two currencies are an
-  error, never a sum. `mul(m, factor, mode = "half_even")` multiplies by a decimal or an
-  int and rounds to the currency; `round(m, mode)` rounds an amount made by hand.
-  `zero(currency)`, `is_zero(m)`.
+  amount as a program writes one: digits, a sign and a point, not `"1e3"` and not
+  `"1,234.50"`. An amount with more decimals than the currency has, bad text, an amount
+  whose minor units do not fit an int (so that `money.to_minor` always can) and an
+  unknown currency give error values, as `int("x")` does; with a rounding mode (those of
+  `round`), the amount is rounded instead. Codes are ISO 4217's
+  (`money.minor_units("JPY")` is 0), and withdrawn ones still read, so last year's
+  invoice in leva is money: BGN, HRK, ANG, SLL, ZWL and the others withdrawn since 2007
+  *(since 0.7)*. Codes without minor units, such as XAU, and crypto currencies are not
+  money.
+- `money.parse(text, currency, locale, mode)` reads an amount as the locale writes one,
+  for a form *(since 0.7)*: its decimal mark and group mark, Indian grouping in en-IN, a
+  minus, and the currency's symbol or code before or after it, as `money.format` writes
+  them. Groups must be whole (`"1.00"` is not an amount in de-DE), and a mark of the
+  other kind is refused (`"1,5"` is not an amount in en-US). `money.of` reads text as a
+  program writes it, so a German visitor's `"1.000"`, one thousand, was one euro there.
+  Without a locale, the program's (`locale()`), else en-US. What is wrong is an error
+  value, as from `money.of`.
+- `a + b` and `a - b` on two money values add and subtract the amounts, as `money.add` and
+  `money.sub` do, with `+=` and `-=` too; two currencies give an error value *(since 0.7:
+  `+` merged the two maps, so a cart's total was its last line)*. Only maps of exactly
+  `amount` and `currency` are money here: other maps still merge. `money.add`, `sub` and
+  `compare` take two amounts of one currency, and two currencies are a runtime error.
+  `mul(m, factor, mode = "half_even")` multiplies by a decimal or an int and rounds to the
+  currency; `round(m, mode)` rounds an amount made by hand. `zero(currency)`,
+  `is_zero(m)`.
+- Every `money` function reads a map it is given as `money.of` reads an amount: the code
+  trimmed and in any case, text without an exponent, no more decimals than the currency
+  has, minor units that fit an int. `money.round(m, mode)` alone takes more decimals, and
+  makes money of them. Anything else is a runtime error that says why *(since 0.7: some
+  functions rounded $1.005 and others took it as it was, so `compare` said it was more
+  than $1.00 while `format` wrote $1.00)*.
+- An amount past what `money.of` takes (minor units that do not fit an int) is an error
+  value from `+`, `-`, `money.add`, `money.sub`, `money.mul`, `money.neg` and
+  `money.round` *(since 0.7: they made it, and only `money.to_minor` refused it)*. A bad
+  argument (a float, a map that is not money, two currencies to `money.add`) is a runtime
+  error, a mistake in the program. `quillo check` types their results as money or an
+  error.
 - `money.allocate(m, ratios)` splits an amount by ratios (ints or decimals; a number n
   for n equal parts) without losing or making a minor unit: each share gets its part,
-  rounded down, and the units left over go one each to the first shares (Martin
-  Fowler's allocation). The shares always add up to the amount.
-- `money.format(m, locale)` writes it as CLDR has it for the locale, the same as
-  `Intl.NumberFormat` in a browser: `$1,234.50` (en-US), `1.234,50 €` (de-DE),
+  rounded down, and the units left over go one each to the shares closest to their next
+  unit, the largest remainders, a tie to the first *(since 0.7: to the first shares, so a
+  1:99 split of $0.10 gave the 1% share $0.01)*. The shares always add up to the amount,
+  and a ratio of 0 gets nothing.
+- `money.format(m, locale)` writes it as CLDR has it for the locale, as
+  `Intl.NumberFormat` writes it in a browser: `$1,234.50` (en-US), `1.234,50 €` (de-DE),
   `1 234,50 €` (fr-FR, a narrow no-break space between thousands), `￥1,235` (ja-JP),
-  `₹12,34,567.00` (en-IN). Without a locale it uses the program's (`locale()`, with
-  [Translations](#translations)), else en-US. Covered: en-US, en-GB, en-CA, en-AU,
-  en-NZ, en-IE, en-IN, en-SG, en-ZA, de-DE, de-AT, de-CH, fr-FR, fr-BE, fr-CA, fr-CH,
-  it-IT, it-CH, es-ES, es-MX, es-AR, pt-BR, pt-PT, nl-NL, nl-BE, sv-SE, nb-NO, da-DK,
-  fi-FI, pl-PL, cs-CZ, hu-HU, ro-RO, el-GR, tr-TR, ru-RU, uk-UA, ja-JP, zh-CN, zh-TW,
-  zh-HK, ko-KR, hi-IN, id-ID, th-TH, vi-VN, ms-MY and fil-PH. Another locale is written
-  as the first of its language (`de-LU` as de-DE, `fr` as fr-FR), else as en-US. The
-  common currencies have their symbols (`$`, `€`, `£`, `¥`, `₹`, `CA$`, ...); others
-  are written with their code (`XOF 1,235`).
-- `format_number(x, locale, digits)` writes any number the same way: `format_number(
+  `₹12,34,567.00` (en-IN), `F CFA 1,234` (XOF in en-US), `IRR 1,235` (CLDR shows no
+  decimals of the rial; the amount keeps them). Without a locale it uses the program's
+  (`locale()`, with [Translations](#translations)), else en-US. 122 locales are covered,
+  written from ICU 77's data by `scripts/money-tables.mjs`, and every currency's symbol in
+  each *(since 0.7: 48 locales and 16 symbols)*. A name is matched without regard to case,
+  with `_` for `-` and its extensions (`-u-...`) left out; Chinese by its script
+  (`zh-Hant` as zh-TW); Spanish of Latin America as es-419 and Portuguese of Africa and
+  Asia as pt-PT, as CLDR's parent locales are; a language alone as its first locale (`fr`
+  as fr-FR, `es` as es-ES). Any other is written as the first of its language, else as
+  en-US, and the log says so once (the browser's console too). Not covered: languages
+  whose digits are not 0-9 (Arabic in Egypt, Persian, Bengali, Burmese, Nepali, Marathi),
+  right-to-left ones (Hebrew, Arabic in the Emirates and Morocco), Urdu and en-150.
+- `format_number(x, locale, digits, mode)` writes any number the same way: `format_number(
   1234567.5, "en-IN", 2)` is `"12,34,567.50"`. `digits` is kept within 0 to 28; a float
   too large for a decimal (past about 7.9e28), NaN or an infinity is written plainly,
   without grouping. It rounds a tie away from zero, from the number's shortest decimal, as
   `Intl.NumberFormat` does, on both sides: `2.5` to 0 digits is `3`, and `1.005` to 2 is
-  `1.01`. `digits` may be `{ min, max }` (`max` is `max(min, 3)` when left out), for as
-  many digits as the number needs within them: `format_number(10, "en-US", { max: 3 })`
-  is `10`, `8.875` stays `8.875`, and `{ min: 2, max: 3 }` writes `8.8` as `8.80`.
-- An amount past what `money.of` takes (minor units that do not fit an int) is an error
-  value from `money.add`, `money.sub` and `money.mul` too *(since 0.7: they
-  made it, and only `money.to_minor` refused it)*.
+  `1.01`; `mode` rounds as `round` does instead (`"half_even"`, as money) *(since 0.7)*.
+  `digits` may be `{ min, max }` (`max` is `max(min, 3)` when left out), for as many digits
+  as the number needs within them: `format_number(10, "en-US", { max: 3 })` is `10`,
+  `8.875` stays `8.875`, and `{ min: 2, max: 3 }` writes `8.8` as `8.80`.
 - There are no exchange rates: an amount stays in its currency, and converting is the
-  program's arithmetic with a rate it chose. `quillo check` takes every `money.*`
-  result as money, so `is_err(r) ? r.error : ...` after `money.mul` is refused by it,
-  though `money.mul` does give an error value for a bad argument: test with
-  `type_of(r) == "error"` there.
+  program's arithmetic with a rate it chose.
 
-To hold the program to the shape, name it: `type Money = { amount: dec, currency: str }`
-makes `Money(request.json)` check what a client sends, and `quillo check` knows what the
-`money` functions give.
+To hold what a client sends to money's rules, name the type `money`: in a pattern, `route
+POST /pay { json: { price: money } }`, a record's field, `type Line = { item: str, price:
+money }`, or an annotation, `fn total(m: money)`. In a pattern or a field it takes a map
+of an `amount` (a decimal, an int, numeric text or a JSON number) and a `currency`, holds
+it to `money.of`'s rules with no rounding mode, and gives the money; a request that fails
+gets a 400, and the log (or the page, under `--watch`) says which rule, without the value
+sent: "`json.price` has more decimals than JPY has (0)". In an annotation it takes money
+as the `money` functions take it. A record written out, `type Money = { amount: dec,
+currency: str }`, checks only the shape *(since 0.7: that was the way, and $10.004 went
+through to be cut to $10.00, `"1e3"` was 1,000, and BTC a 500)*.
 
 ### Numbers and data
 

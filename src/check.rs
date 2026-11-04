@@ -524,7 +524,8 @@ fn binop_t(op: BinOp, a: T, b: T) -> Option<T> {
         // Money adds and subtracts, in `a - b`, `t -= x` and state alike; a map whose shape is
         // not known may be money (FEEDBACK50.md, Q-620; branch feedback50-fixes).
         BinOp::Add | BinOp::Sub if is_money(a) && is_money(b) => return Some(money_t().union(T::error(STR))),
-        BinOp::Sub if maybe_money(a) && maybe_money(b) => return Some(T::of(MAP | ERR)),
+        // One side known to be a map: `any - any` stays a number's.
+        BinOp::Sub if maybe_money(a) && maybe_money(b) && !(a.is_any() && b.is_any()) => return Some(T::of(MAP | ERR)),
         _ => {}
     }
     let mut out = 0u16;
@@ -730,7 +731,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("int", "any", "int | error(str)"),
     ("float", "any", "float | error(str)"),
     ("dec", "any", "dec | error(str)"),
-    ("format_number", "num | dec, str | null=, int | map | null=", "str"),
+    ("format_number", "num | dec, str | null=, int | map | null=, str | null=", "str"),
     ("len", "str | list | map | html | null", "int"),
     ("type_of", "any", "str"),
     ("upper", "str", "str"),
@@ -804,7 +805,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("floor", "num | dec", "num | dec"),
     ("ceil", "num | dec", "num | dec"),
     ("sqrt", "num", "float"),
-    ("pow", "num, num", "num"),
+    ("pow", "num | dec, num", "num | dec"),
     ("unique", "list | null", "list"),
     ("flatten", "list | null", "list"),
     ("zip", "list | null, list | null", "list"),
@@ -939,17 +940,18 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("media.streams", "", "list"),
     // src/money.rs
     ("money.of", "dec | int | str, str, str=", "map | error(str)"),
+    ("money.parse", "str, str, str | null=, str=", "map | error(str)"),
     ("money.from_minor", "int, str", "map | error(str)"),
     ("money.to_minor", "map", "int"),
-    ("money.add", "map, map", "map"),
-    ("money.sub", "map, map", "map"),
-    ("money.mul", "map, dec | int, str=", "map"),
-    ("money.neg", "map", "map"),
+    ("money.add", "map, map", "map | error(str)"),
+    ("money.sub", "map, map", "map | error(str)"),
+    ("money.mul", "map, dec | int, str=", "map | error(str)"),
+    ("money.neg", "map", "map | error(str)"),
     ("money.compare", "map, map", "int"),
     ("money.zero", "str", "map | error(str)"),
     ("money.is_zero", "map", "bool"),
     ("money.allocate", "map, list | int", "list"),
-    ("money.round", "map, str=", "map"),
+    ("money.round", "map, str=", "map | error(str)"),
     ("money.minor_units", "str", "int | error(str)"),
     ("money.format", "map, str | null=", "str"),
     // src/numeric.rs
@@ -4768,6 +4770,9 @@ impl Checker {
                     if what != format!("db.{}", name) && self.sql_built(sql) {
                         self.warn_sql(&what);
                     }
+                    if what != format!("db.{}", name) {
+                        self.sql_params(&what, args);
+                    }
                 }
             }
             let recv = self.expr(obj);
@@ -4954,12 +4959,14 @@ impl Checker {
                 Some(T::of(if expr_at(0).is_some_and(never_empty) { e.bits } else { e.bits | NIL }))
             }
             // Money is `{ amount: dec, currency: str }`.
-            "money.add" | "money.sub" | "money.mul" | "money.neg" | "money.round" => Some(money_t()),
-            "money.of" | "money.from_minor" | "money.zero" => Some(money_t().union(T::error(STR))),
+            // An amount too large is an error value (FEEDBACK49.md, Q-605), so these may give
+            // one (FEEDBACK50.md, Q-633; branch feedback50-fixes).
+            "money.add" | "money.sub" | "money.mul" | "money.neg" | "money.round" => Some(money_t().union(T::error(STR))),
+            "money.of" | "money.parse" | "money.from_minor" | "money.zero" => Some(money_t().union(T::error(STR))),
             "money.allocate" => Some(list_of(money_t())),
             // A decimal gives a decimal; ints and floats as before.
-            "abs" | "floor" | "ceil" | "round" if a0.bits == DEC => Some(T::of(DEC)),
-            "abs" | "floor" | "ceil" | "round" if a0.bits & DEC == 0 && a0.bits != 0 => Some(T::of(NUM)),
+            "abs" | "floor" | "ceil" | "round" | "pow" if a0.bits == DEC => Some(T::of(DEC)),
+            "abs" | "floor" | "ceil" | "round" | "pow" if a0.bits & DEC == 0 && a0.bits != 0 => Some(T::of(NUM)),
             "merge" => Some(merge_maps(a0, *args.get(1)?)),
             "set" if args.len() == 3 => {
                 let fs = a0.fields().filter(|_| a0.bits & NIL == 0)?;
@@ -5204,6 +5211,12 @@ impl Checker {
         } else if !BROWSER_MODULES.contains(&m) && full != "channel.open" {
             self.browser_forbidden(&format!("`{}`", full));
         }
+        if m == "db" && !piped {
+            self.sql_params(&full, args);
+        }
+        if m == "money" && !piped {
+            self.money_literals(f, args);
+        }
         // A pattern written out is checked now, not when it runs.
         if m == "re" {
             let lit = |i: usize| match args.get(i) {
@@ -5225,7 +5238,64 @@ impl Checker {
         self.quiet > 0
     }
 
+    /// A rounding mode or a currency code written out in a `money` call that can only fail:
+    /// `"half-up"` was a runtime error, `"XYZ"` an error value (FEEDBACK50.md, Q-633; branch
+    /// feedback50-fixes).
+    fn money_literals(&mut self, f: &str, args: &[Expr]) {
+        let (code_at, mode_at) = match f {
+            "of" => (Some(1), Some(2)),
+            "parse" => (Some(1), Some(3)),
+            "from_minor" => (Some(1), None),
+            "zero" | "minor_units" => (Some(0), None),
+            "mul" => (None, Some(2)),
+            "round" => (None, Some(1)),
+            _ => (None, None),
+        };
+        let lit = |i: Option<usize>| match i.and_then(|i| args.get(i)) {
+            Some(Expr::Lit(Lit::Str(s))) => Some(s.to_string()),
+            _ => None,
+        };
+        if let Some(code) = lit(code_at) {
+            if crate::money::units_of(&code.trim().to_ascii_uppercase()).is_none() {
+                self.error(format!("`money.{}`: {:?} is not an ISO 4217 currency code", f, code));
+            }
+        }
+        if let Some(mode) = lit(mode_at) {
+            if crate::decimal::Rounding::parse(&mode).is_none() {
+                self.error(format!("`money.{}`: unknown rounding {:?} (one of {})", f, mode, crate::decimal::Rounding::NAMES));
+            }
+        }
+    }
+
     // ---- SQL built from values ----------------------------------------
+
+    /// `db.exec(sql, [a, b])`, Python's way: the parameters are separate arguments, and the
+    /// list is one, stored as its JSON text (`["9.99"]`) where the SQL has one `?`
+    /// (FEEDBACK50.md, Q-629; branch feedback50-fixes).
+    fn sql_params(&mut self, what: &str, args: &[Expr]) {
+        if !matches!(what.rsplit('.').next(), Some("exec" | "query" | "one")) {
+            return;
+        }
+        let sql = match args.first() {
+            Some(Expr::Lit(Lit::Str(s))) => s.to_string(),
+            Some(Expr::Template(parts)) if parts.iter().all(|p| matches!(p, TPart::Lit(_))) => {
+                parts.iter().map(|p| if let TPart::Lit(t) = p { t.to_string() } else { String::new() }).collect()
+            }
+            _ => return,
+        };
+        let [_, Expr::List(_)] = args else { return };
+        // Outside quoted text and names and comments (found in review).
+        static NOISE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let noise = NOISE.get_or_init(|| regex::Regex::new(r#"(?s)--[^\n]*|/\*.*?\*/|'(?:[^']|'')*'|"(?:[^"]|"")*""#).unwrap());
+        let marks = noise.replace_all(&sql, " ").matches('?').count();
+        if marks == 0 {
+            return;
+        }
+        let what_happens = if marks == 1 { "stored as its JSON text".to_string() } else { format!("and the SQL's {} other `?` {} nothing", marks - 1, if marks == 2 { "gets" } else { "get" }) };
+        self.warn(format!(
+            "`{what}` takes its parameters one by one, as in `{what}(sql, a, b)`: this list is one parameter, {what_happens}. Pass the values after the SQL, or json.stringify(list) to store a list"
+        ));
+    }
 
     fn warn_sql(&mut self, name: &str) {
         self.warn(format!(
@@ -5794,6 +5864,15 @@ impl Checker {
             if !matches!(name, "len" | "keys" | "values") {
                 self.error(format!("this map has no field `{}`{}", name, field_hint(name, &fs)));
                 return T::of(NIL);
+            }
+        }
+        // A field of a map whose shape is known, where the value may also be an error: the
+        // field's type (an error has no fields, so reading one stops there anyway).
+        // `money.of(...).amount + 0.5` passed as anything (FEEDBACK50.md, Q-633; branch
+        // feedback50-fixes).
+        if t.bits & MAP != 0 && t.bits & !(MAP | ERR | NIL) == 0 {
+            if let Some((_, ft)) = shape_of(t.shape).and_then(|fs| fs.iter().find(|(k, _)| &**k == name).cloned()) {
+                return ft.union(T::of(t.bits & NIL));
             }
         }
         if t.bits & (MAP | NIL) != 0 || t.is_any() {

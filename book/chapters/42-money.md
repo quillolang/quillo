@@ -42,17 +42,28 @@ money.of(19.99m, "USD")                          // { amount: 19.99m, currency: 
 money.of("12.345", "USD")                        // an error value: USD has two decimals
 money.of("12.345", "USD", "half_up")             // 12.35
 money.mul(money.of(19.99m, "USD"), 0.075m, "half_up")   // 1.50, rounded to cents
+money.of(10, "USD") + money.of(2.50m, "USD")     // 12.50: two amounts of one currency
 money.allocate(money.of(100, "USD"), [1, 1, 1])  // 33.34, 33.33 and 33.33
+money.parse("1.234,50 €", "EUR", "de-DE")        // 1234.50, as a German visitor writes it
 money.format(money.of("1234.5", "EUR"), "de-DE") // "1.234,50 €"
 money.to_minor(money.of(19.99m, "USD"))          // 1999
 money.from_minor(1250, "USD")                    // 12.50
 ```
 
-Adding two currencies is an error, never a sum. `allocate` splits an amount without
-losing or making a cent: the shares always add up to it. `format` writes an amount as
-CLDR has it for nearly fifty locales, the same as `Intl.NumberFormat` in a browser. All
-of it works in components too, with the same answers. See
-[Money](#standard-library-money).
+`+` and `-` add and subtract two amounts of one currency, as `money.add` and `money.sub`
+do; two currencies are an error value, never a sum. Every `money` function holds an
+amount to the currency's decimals: `money.round(m, mode)` makes money of one with more.
+`allocate` splits an amount without losing or making a cent: the shares always add up to
+it, and the cents left go to the shares closest to their next one. `format` writes an
+amount as CLDR has it for 122 locales, as `Intl.NumberFormat` writes it in a browser, and
+`parse` reads one back as the locale writes it: `money.of("1.000", "EUR")` is one euro,
+while a German visitor meant a thousand. All of it works in components too, with the same
+answers. See [Money](#standard-library-money).
+
+Money a client sends is checked by its type: `{ json: { price: money } }` in a route's
+pattern, or `price: money` in a record, takes `{ "amount": "19.99", "currency": "USD" }`
+held to `money.of`'s rules, and answers 400 to `"19.999"`, to `"1e3"` and to a currency
+that is not one.
 
 ## Keeping it in the database
 
@@ -260,4 +271,14 @@ route GET /accounts/:id(int) { query: { locale: str = "en-US" } } with db {
 
 With `?locale=de-DE`, a balance shows as "112,50 $". `format_number(1234567.5, "en-IN",
 2)` writes any number the same way: "12,34,567.50". For interest, a decimal rate keeps
-it exact: `money.mul(money.of(10000, "USD"), 0.045m * dec(181) / 360)` is 226.25.
+it exact: `money.mul(money.of(10000, "USD"), 0.045m * dec(181) / 360)` is 226.25. A loan's
+monthly payment needs a power, which a decimal takes too:
+
+```quillo
+fn payment(principal: dec, yearly: dec, months: int) -> dec {
+    let r = yearly / 12
+    let f = pow(1m + r, months)
+    principal * r * f / (f - 1)
+}
+money.of(payment(200000m, 0.05m, 360), "USD", "half_up")   // 1073.64 a month
+```

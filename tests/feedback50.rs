@@ -431,3 +431,240 @@ fn codes_and_amounts_are_trimmed_and_upper_cased_alike() {
     same("money.of(1, \"u\\u{17f}d\")", "err(\"unknown currency \\\"u\u{17f}d\\\"\")");
     same("{ amount: \"\\u{3000}5\", currency: \"\\tusd\\n\" } + money.of(1, \"USD\")", "{ amount: 6.00m, currency: \"USD\" }");
 }
+
+// Q-627: money.format was not "the same as Intl.NumberFormat": XOF had no symbol anywhere, the
+// French locales none for $CL, 13 currencies showed decimals Intl does not, and a locale not in
+// the table was another country's (es-CO as Spain's, zh-Hant-TW as mainland China's).
+#[test]
+fn money_formats_as_cldr_writes_it() {
+    let f = |amount: &str, code: &str, loc: &str| format!("money.format(money.of({amount:?}, {code:?}), {loc:?})");
+    for (call, want) in [
+        (f("1234", "XOF", "en-US"), "F\u{202f}CFA\u{a0}1,234"),
+        (f("1234", "XOF", "fr-FR"), "1\u{202f}234\u{a0}F\u{202f}CFA"),
+        (f("1234", "XAF", "fr-FR"), "1\u{202f}234\u{a0}FCFA"),
+        (f("1234", "XCD", "en-US"), "EC$1,234.00"),
+        (f("1234", "XCG", "en-US"), "Cg.\u{a0}1,234.00"),
+        (f("1234", "CLP", "fr-FR"), "1\u{202f}234\u{a0}$CL"),
+        (f("1234.50", "IRR", "en-US"), "IRR\u{a0}1,235"),
+        (f("1234.49", "IRR", "en-US"), "IRR\u{a0}1,234"),
+        (f("-2.50", "IRR", "en-US"), "-IRR\u{a0}3"),
+        (f("-0.40", "IRR", "en-US"), "IRR\u{a0}0"),
+        (f("1234.567", "IQD", "en-US"), "IQD\u{a0}1,235"),
+        (f("1234.5", "USD", "es-CO"), "US$\u{a0}1.234,50"),
+        (f("1234.5", "USD", "es-HN"), "USD\u{a0}1,234.50"),
+        (f("1234.5", "TWD", "zh-Hant-TW"), "$1,234.50"),
+        (f("1234.5", "TWD", "zh-Hant"), "$1,234.50"),
+        (f("1234.5", "TWD", "zh-Hant-CN"), "$1,234.50"),
+        (f("1234.5", "CNY", "zh-Hans"), "¥1,234.50"),
+        (f("1234.5", "CNY", "zh-Hans-TW"), "¥1,234.50"),
+        (f("1234.5", "EUR", "pt-GW"), "1234,50\u{a0}€"),
+        (f("1234.5", "EUR", "pt-US"), "€\u{a0}1.234,50"),
+        (f("1234.5", "EUR", "es-GQ"), "1234,50\u{a0}€"),
+        (f("1234.5", "CAD", "en-u-ca-gregory"), "CA$1,234.50"),
+        (f("1234.5", "USD", "sw"), "US$\u{a0}1,234.50"),
+        (f("1234.5", "EUR", "sr-Latn-RS"), "1.234,50\u{a0}€"),
+        (f("-1234.5", "INR", "en-IN"), "-₹1,234.50"),
+        (f("1234567", "INR", "hi-IN"), "₹12,34,567.00"),
+    ] {
+        same(&call, &format!("{:?}", want).replace("\\u{a0}", "\u{a0}").replace("\\u{202f}", "\u{202f}"));
+    }
+    // Numbers: Indian grouping where only numbers have it.
+    same("[format_number(1234567, \"ml-IN\", 2), money.format(money.of(1234567, \"INR\"), \"ml-IN\")]", "[\"12,34,567.00\", \"₹1,234,567.00\"]");
+    // An amount keeps its minor units; only what is shown is rounded, a tie away from zero, as
+    // Intl rounds it (Intl writes -0.40 rials as "-IRR 0"; Quillo writes no -0).
+    same("money.to_minor(money.of(\"1234.50\", \"IRR\"))", "123450");
+    // Every name a fallback rule takes, in the browser too.
+    same("[\"es-HN\", \"zh-Hans-SG\", \"zh-Hant-MO\", \"pt-CV\", \"sr-Latn\", \"en-Latn\", \"es-\\u{e9}\", \"en--US\", \"de-CH-u-nu-latn\"] | map((l) => format_number(-1234.5, l, 1))",
+        "[\"-1,234.5\", \"-1,234.5\", \"-1,234.5\", \"-1234,5\", \"-1.234,5\", \"-1,234.5\", \"-1234,5\", \"-1,234.5\", \"-1’234.5\"]");
+}
+
+#[test]
+fn a_locale_written_as_another_is_said_once_in_the_log() {
+    let d = dir(
+        "locale-log",
+        "print(money.format(money.of(1, \"USD\") ?? null, \"xx-YY\"))\nprint(money.format(money.of(2, \"USD\") ?? null, \"xx-YY\"))\nprint(format_number(3, \"de-XX\"))\nprint(money.format(money.of(4, \"EUR\") ?? null, \"fr\"))\n",
+    );
+    let out = run_script(&d);
+    assert_eq!(out.matches("no money and number data for locale \"xx-YY\": written as en-US").count(), 1, "{}", out);
+    assert_eq!(out.matches("no money and number data for locale \"de-XX\": written as de-DE").count(), 1, "{}", out);
+    // A language alone names its first locale, and is not said.
+    assert!(!out.contains("\"fr\""), "{}", out);
+    assert!(out.contains("$1.00") && out.contains("$2.00") && out.contains("4,00\u{a0}€"), "{}", out);
+}
+
+// Q-628: `money` and `decimal(12, 2)` columns in SQLite lose cents past 15 digits and the
+// scale; only the guide said so.
+#[test]
+fn sqlite_says_once_which_columns_lose_digits() {
+    let d = dir(
+        "sqlite-lossy",
+        "db.exec(\"create table t (id integer primary key, price money, p2 DECIMAL(12, 2), p3 decimal_text, n numeric, d dec(5,1), \\\"q\\\" numeric ( 10, 2), dx decimal, \\\"unit price\\\" money, c money_cents)\")\ndb.exec(\"create table if not exists t (price money)\")\ndb.exec(\"alter table t add column fee decimal\")\ndb.exec(\"alter table t add tax money\")\ndb.exec(\"CREATE\\n  TEMP TABLE u (price money) -- , note decimal\\n; create table v (a text default ', x money', /* , y money */ b int)\")\ndb.exec(\"insert into t (price, p3) values (?, ?)\", 12345678901234567.89m, 12345678901234567.89m)\nprint(db.query(\"select price, p3 from t\"))\n",
+    );
+    std::fs::create_dir_all(d.join("migrations")).unwrap();
+    std::fs::write(d.join("migrations/001_ledger.sql"), "create table ledger (id integer primary key, total decimal(12, 2));\n").unwrap();
+    std::fs::write(d.join("main.qwe"), format!("db.migrate()\n{}", std::fs::read_to_string(d.join("main.qwe")).unwrap())).unwrap();
+    let out = run_script(&d);
+    for col in ["t.price", "t.p2", "t.d", "t.q", "t.dx", "t.unit price", "t.c", "t.fee", "t.tax", "u.price", "ledger.total"] {
+        assert_eq!(out.matches(&format!("SQLite keeps `{}` (", col)).count(), 1, "{}: {}", col, out);
+    }
+    for col in ["t.p3", "t.n", "t.id", "u.note", "v.x", "v.y", "v.a", "v.b"] {
+        assert!(!out.contains(&format!("`{}` (", col)), "{}: {}", col, out);
+    }
+    assert!(out.contains("price: 12345678901234568m, p3: 12345678901234567.89m"), "{}", out);
+}
+
+// Q-629: Python's sqlite3 takes the parameters as a list; Quillo stored the list as JSON text.
+#[test]
+fn a_list_given_as_the_parameters_is_warned_about() {
+    let out = check(
+        "db.exec(\"insert into t (p) values (?)\", [9.99m])\ndb.query(\"select * from t where a = ? and b = ?\", [1, 2])\ndb.query(\"select * from t where a = ? and b = ? and c = ?\", [1, 2, 3])\nlet c = db.connect(\"o.db\")\nc.exec(`insert into t (p) values (?)`, [1])\n",
+    );
+    assert!(out.contains("main.qwe:1: warning: `db.exec` takes its parameters one by one, as in `db.exec(sql, a, b)`: this list is one parameter, stored as its JSON text. Pass the values after the SQL, or json.stringify(list) to store a list"), "{}", out);
+    assert!(out.contains("main.qwe:2: warning: `db.query` takes its parameters one by one") && out.contains("the SQL's 1 other `?` gets nothing"), "{}", out);
+    assert!(out.contains("main.qwe:3:") && out.contains("the SQL's 2 other `?` get nothing"), "{}", out);
+    assert!(out.contains("main.qwe:5: warning: `c.exec` takes its parameters one by one"), "{}", out);
+    // Not for: values given one by one, a list stored on purpose, a `?` in quotes, no `?`,
+    // SQL that is not written out, exec_many's list of rows, and a list after other values.
+    let quiet = check(
+        "db.exec(\"insert into t (p) values (?)\", 9.99m)\ndb.exec(\"insert into t (p) values (?)\", json.stringify([1]))\ndb.query(\"select * from t where a = '?'\", [1])\ndb.exec(\"delete from t\", [1])\nlet sql = \"insert into t (p) values (?)\"\ndb.exec(sql, [1])\ndb.exec_many(\"insert into t (p) values (?)\", [[1], [2]])\ndb.exec(\"insert into t (a, b) values (?, ?)\", 1, [2])\n[1] | db.exec(\"insert into t (p) values (?)\")\n",
+    );
+    assert!(!quiet.contains("one by one"), "{}", quiet);
+}
+
+// Q-632: `(1 + r)^n` for interest and loan payments went through floats: pow refused a dec.
+#[test]
+fn a_decimal_to_an_int_s_power_stays_a_decimal() {
+    same("[pow(1.1m, 2), pow(2m, -2), pow(0m, 0), pow(-1.5m, 3), pow(10m, 28), pow(1.05m, 1), pow(7m, 0), pow(-2m, -3)]",
+        "[1.21m, 0.25m, 1m, -3.375m, 10000000000000000000000000000m, 1.05m, 1m, -0.125m]");
+    // A 30-year loan of $200,000 at 5% a year: the factor to the 25th digit, the payment exact.
+    same("let r = 0.05m / 12\nlet f = pow(1m + r, 360)\n[f, round(200000m * r * f / (f - 1), 2)]", "[4.4677443140061322124280701433m, 1073.64m]");
+    same("pow(0.5m, 200)", "0.0000000000000000000000000000m");
+    same("pow(1m, 9223372036854775807)", "1m");
+    same("pow(10m, 29)", "ERROR: decimal overflow");
+    same("pow(10m, 64)", "ERROR: decimal overflow");
+    // A negative power: below one, from one over it; above one, 0 past what fits.
+    same("[pow(0.5m, -90), pow(-0.5m, -3), pow(2m, -100), pow(1.05m, -2000), pow(10m, -29)]",
+        "[1237940039285380274899124224m, -8m, 0.0000000000000000000000000000m, 0.0000000000000000000000000000m, 0.0000000000000000000000000000m]");
+    same("pow(0.5m, -100)", "ERROR: decimal overflow");
+    same("pow(0m, -1)", "ERROR: division by zero");
+    same("pow(1.5m, 0.5)", "ERROR: `pow` takes a dec to an int's power, got float as the power: for a fraction of a power, float(x) and math.pow");
+    same("pow(1.5m, 2m)", "ERROR: `pow` takes a dec to an int's power, got dec as the power: for a fraction of a power, float(x) and math.pow");
+    // The checker keeps the type it is given.
+    let out = check("fn want_int(n: int) = n\nwant_int(pow(1.05m, 12))\n");
+    assert!(out.contains("must be int, got dec"), "{}", out);
+    let ok = check("print(pow(2, 10) + 1, pow(1.05m, 12) + 1m, round(pow(1.05m, 12), 2))\n");
+    assert!(ok.contains(": ok"), "{}", ok);
+}
+
+// Q-626: round(1.005, 2) was 1.0 while format_number wrote 1.01, and format_number could not
+// round as money does.
+#[test]
+fn round_and_format_number_round_alike_and_format_number_takes_a_mode() {
+    same("[round(1.005, 2), round(-1.005, 2), round(2.675, 2), round(0.125, 2), round(1.115, 2), round(123.456, 1), round(-1.25, 1), round(0.1 + 0.2, 15), round(1.23456789, 15)]",
+        "[1.01, -1.01, 2.68, 0.13, 1.12, 123.5, -1.3, 0.3, 1.23456789]");
+    // Whole results (a page writes 0.0 as 0, as it cannot tell them apart): away from a tie the
+    // quick way, with no -0; past 2^53; past what a decimal holds; not a number.
+    let (_, s) = server("[round(0.0049999, 2), round(-0.001, 2), round(-0.4, 0), round(2.5, 0), round(12345678901234567.0, 2) == 12345678901234567.0, round(1e300, 2) == 1e300, round(1.0 / 0, 2)]");
+    assert_eq!(s, "[0.0, 0.0, 0.0, 3.0, true, true, inf]");
+    same("[round(1e300, 2) == 1e300, round(1e306, 15) == 1e306, round(663152832.685, 2) == 663152832.69, round(133743.506045, 5) == 133743.50605]", "[true, true, true, true]");
+    same("[format_number(0.125m, \"en-US\", 2), format_number(0.125m, \"en-US\", 2, \"half_even\"), format_number(0.135m, \"en-US\", 2, \"half_even\"), format_number(2.5, \"en-US\", 0, \"floor\"), format_number(-2.5, \"de-DE\", 0, \"ceiling\")]",
+        "[\"0.13\", \"0.12\", \"0.14\", \"2\", \"-2\"]");
+    // An invoice line shows what money works out.
+    same("let line = money.mul(money.of(2.50m, \"USD\"), 0.05m)\n[money.format(line, \"en-US\"), format_number(2.50m * 0.05m, \"en-US\", 2, \"half_even\")]", "[\"$0.12\", \"0.12\"]");
+    same("format_number(1, \"en-US\", 2, \"bad\")", "ERROR: `format_number`: unknown rounding \"bad\" (one of half_even, half_up, half_down, up, down, ceiling or floor)");
+    same("format_number(1, \"en-US\", 2, 5)", "ERROR: `format_number` expects a rounding mode (a str) as argument 4, got int 5");
+    same("format_number(1, \"en-US\", null, \"half_even\")", "\"1\"");
+}
+
+// Q-624: money.of reads text as a program writes it, so a German visitor's "1.000", a
+// thousand, was one euro; nothing read money.format's own output back.
+#[test]
+fn money_parse_reads_an_amount_as_the_locale_writes_it() {
+    let p = |text: &str, code: &str, loc: &str| format!("money.parse({text:?}, {code:?}, {loc:?})");
+    let m = |amount: &str, code: &str| format!("{{ amount: {amount}m, currency: \"{code}\" }}");
+    for (text, code, loc, want) in [
+        ("1.234,50 €", "EUR", "de-DE", m("1234.50", "EUR")),
+        ("1.000", "EUR", "de-DE", m("1000.00", "EUR")),
+        ("1,5", "EUR", "de-DE", m("1.50", "EUR")),
+        ("1234,5", "USD", "de-DE", m("1234.50", "USD")),
+        ("-1.234,50 €", "EUR", "de-DE", m("-1234.50", "EUR")),
+        ("$1,234.50", "USD", "en-US", m("1234.50", "USD")),
+        ("-$1,234.50", "USD", "en-US", m("-1234.50", "USD")),
+        ("$-5", "USD", "en-US", m("-5.00", "USD")),
+        ("  USD 5 ", "USD", "en-US", m("5.00", "USD")),
+        ("US$5", "USD", "en-US", m("5.00", "USD")),
+        ("1,234", "USD", "en-US", m("1234.00", "USD")),
+        ("1.000", "USD", "en-US", m("1.00", "USD")),
+        ("₹12,34,567.00", "INR", "en-IN", m("1234567.00", "INR")),
+        ("1,00,000", "INR", "en-IN", m("100000.00", "INR")),
+        ("1,000,000", "INR", "en-IN", m("1000000.00", "INR")),
+        ("1\u{202f}234,50\u{a0}€", "EUR", "fr-FR", m("1234.50", "EUR")),
+        ("1 234,50", "EUR", "fr-FR", m("1234.50", "EUR")),
+        ("5 $", "USD", "fr-FR", m("5.00", "USD")),
+        ("CHF 1'234.50", "CHF", "de-CH", m("1234.50", "CHF")),
+        ("CHF-1’234.50", "CHF", "de-CH", m("-1234.50", "CHF")),
+        ("¥1,235", "JPY", "ja-JP", m("1235", "JPY")),
+        ("\u{2212}5\u{a0}kr", "SEK", "sv-SE", m("-5.00", "SEK")),
+        ("\u{200f}1,234.50\u{a0}EGP", "EGP", "en-US", m("1234.50", "EGP")),
+        ("0,001", "BHD", "de-DE", m("0.001", "BHD")),
+    ] {
+        same(&p(text, code, loc), &want);
+    }
+    for (text, code, loc) in [
+        ("1.00", "EUR", "de-DE"), ("1234.5", "USD", "de-DE"), ("1,5", "USD", "en-US"), ("1,2345", "USD", "en-US"), ("12,34,567", "USD", "en-US"),
+        ("", "USD", "en-US"), ("abc", "USD", "en-US"), ("$", "USD", "en-US"), ("1,", "USD", "en-US"), (",5", "USD", "en-US"), ("1,,000", "USD", "en-US"),
+        ("1e3", "USD", "en-US"), ("--5", "USD", "en-US"), ("5 £", "USD", "en-US"), ("1,23,4567", "INR", "en-IN"), ("١٢", "USD", "en-US"),
+    ] {
+        same(&p(text, code, loc), &format!("err(\"not an amount: {}\")", format!("{:?}", text).replace('"', "\\\"")));
+    }
+    same(&p("12.345", "USD", "en-US"), "err(\"12.345 has more decimals than USD has (2); give a rounding mode to round it\")");
+    same("money.parse(\"12.345\", \"USD\", \"en-US\", \"half_up\")", &m("12.35", "USD"));
+    same("money.parse(\"1\", \"XYZ\", \"en-US\")", "err(\"unknown currency \\\"XYZ\\\"\")");
+    same("money.parse(\"92.233.720.368.547.758,08\", \"EUR\", \"de-DE\")", "err(\"92233720368547758.08 EUR is too large an amount\")");
+    same("money.parse(5, \"USD\")", "ERROR: `money.parse` expects text as argument 1, got int 5");
+    same("money.parse(\"1\", \"USD\", \"en-US\", 3)", "ERROR: `money.parse` expects a rounding mode (a str) as argument 4, got int 3");
+    // What money.format writes, money.parse reads, in every locale.
+    same(
+        "let m = money.of(\"-1234567.89\", \"EUR\")\n[\"en-US\", \"de-DE\", \"fr-FR\", \"de-CH\", \"en-IN\", \"sv-SE\", \"nl-NL\", \"es-CO\", \"pt-BR\", \"ja-JP\"] | map((l) => money.parse(money.format(m, l), \"EUR\", l) == m)",
+        "[true, true, true, true, true, true, true, true, true, true]",
+    );
+    // Without a locale, the program's, else en-US; the checker takes it as money or an error.
+    same("money.parse(\"1,234.50\", \"USD\")", &m("1234.50", "USD"));
+    let out = check("fn want_int(n: int) = n\nwant_int(money.parse(\"5\", \"USD\"))\n");
+    assert!(out.contains("got map | error"), "{}", out);
+}
+
+// Q-633: the guide said money.mul gives error values for bad arguments (they are runtime
+// errors; too large an amount is the error value), and `check` let literals through that can
+// only fail, and typed `money.of(...).amount` as anything.
+#[test]
+fn the_checker_knows_money_s_literals_fields_and_error_values() {
+    let out = check(
+        "let a = money.of(1, \"USD\", \"half-up\")\nlet b = money.of(1, \"XYZ\")\nlet c = money.parse(\"1\", \"usd\", \"en-US\", \"bankers\")\nlet d = money.zero(\"BTC\")\nlet e = money.round(money.of(1, \"USD\") ?? null, \"HALF_EVEN\")\nprint(money.of(1, \"USD\").amount + 0.5)\n",
+    );
+    for line in [
+        "main.qwe:1: error: `money.of`: unknown rounding \"half-up\"",
+        "main.qwe:2: error: `money.of`: \"XYZ\" is not an ISO 4217 currency code",
+        "main.qwe:3: error: `money.parse`: unknown rounding \"bankers\"",
+        "main.qwe:4: error: `money.zero`: \"BTC\" is not an ISO 4217 currency code",
+        "main.qwe:5: error: `money.round`: unknown rounding \"HALF_EVEN\"",
+        "main.qwe:6: error: cannot add dec and float",
+    ] {
+        assert!(out.contains(line), "{}\n{}", line, out);
+    }
+    // What is right passes: codes in any case and with spaces, a withdrawn code, every mode,
+    // modes and codes held in variables, and testing what money.mul gives.
+    let ok = check(
+        "let mode = \"half_up\"\nlet m = money.of(1, \" usd \", mode) ?? reply 400\nlet r = money.mul(m, 3, \"floor\")\nprint(is_err(r) ? r.error : money.format(r), money.of(1, \"bgn\", \"ceiling\"), money.minor_units(\"HRK\"))\nprint(money.from_minor(1, \"JPY\"), money.round(m, \"half_down\"), money.parse(\"1\", \"EUR\", null, \"up\"))\n",
+    );
+    assert!(ok.contains(": ok"), "{}", ok);
+}
+
+#[test]
+fn placeholders_in_comments_and_quoted_names_are_not_counted() {
+    let quiet = check("db.query(\"select * from t -- why?\\n\", [1])\ndb.query(\"select \\\"col?\\\" from t /* ? */\", [1])\n");
+    assert!(!quiet.contains("one by one"), "{}", quiet);
+    let said = check("db.query(\"select * from t where a = ? -- the id\", [1])\n");
+    assert!(said.contains("one by one"), "{}", said);
+    assert!(check("print(format_number(1, \"en-US\", 2, null))\n").contains(": ok"));
+}

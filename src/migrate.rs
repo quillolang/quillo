@@ -64,6 +64,8 @@ pub fn run(db: &Backend, dir: &Path) -> Result<Vec<String>, String> {
                     }
                     continue;
                 }
+                // A migration is where tables are made (FEEDBACK50.md, Q-628; found in review).
+                crate::db::warn_lossy_columns(text);
                 let done = c.execute_batch(text).and_then(|_| {
                     c.execute(
                         "insert into _quillo_migrations (name, sha256, applied_at) values (?1, ?2, datetime('now'))",

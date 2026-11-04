@@ -1539,6 +1539,56 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
 }
 
+/// The columns a `create table` or `alter table` gives SQLite as `money`, `decimal` or
+/// `numeric(p, s)`: read back as decimals, but kept with NUMERIC affinity, as a float past
+/// 15 digits and without the scale. Only the guide said so; the log says it once for each
+/// column (FEEDBACK50.md, Q-628; branch feedback50-fixes). As (table, column, type), with
+/// comments and quoted text left out.
+pub(crate) fn lossy_columns(sql: &str) -> Vec<(String, String, String)> {
+    use std::sync::OnceLock;
+    const NAME: &str = r#"("[^"]+"|`[^`]+`|\[[^\]]+\]|[\w.]+)"#;
+    static GATE: OnceLock<regex::Regex> = OnceLock::new();
+    static COL: OnceLock<regex::Regex> = OnceLock::new();
+    static NOISE: OnceLock<regex::Regex> = OnceLock::new();
+    let gate = GATE.get_or_init(|| {
+        regex::Regex::new(&format!(r"(?is)\b(?:create\s+(?:temp(?:orary)?\s+)?table(?:\s+if\s+not\s+exists)?|alter\s+table)\s+{}", NAME)).unwrap()
+    });
+    if !gate.is_match(sql) {
+        return Vec::new();
+    }
+    let col = COL.get_or_init(|| {
+        regex::Regex::new(&format!(r"(?is)(?:\(|,|\badd\s+(?:column\s+)?)\s*{}\s+(money\w*|decimal\b|numeric\s*\(|dec\s*\(|dec\b)", NAME)).unwrap()
+    });
+    let noise = NOISE.get_or_init(|| regex::Regex::new(r"(?s)--[^\n]*|/\*.*?\*/|'(?:[^']|'')*'").unwrap());
+    let unquote = |n: &str| n.trim_matches(|c| matches!(c, '"' | '`' | '[' | ']')).to_string();
+    let clean = noise.replace_all(sql, " ");
+    let mut out = Vec::new();
+    for stmt in clean.split(';') {
+        let Some(head) = gate.captures(stmt) else { continue };
+        let body = &stmt[head.get(0).unwrap().end()..];
+        for c in col.captures_iter(body) {
+            let ty: String = c[2].split_whitespace().collect::<String>().trim_end_matches('(').to_ascii_lowercase();
+            out.push((unquote(&head[1]), unquote(&c[1]), ty));
+        }
+    }
+    out
+}
+
+/// `lossy_columns`, said once each in the log (64 at most).
+pub(crate) fn warn_lossy_columns(sql: &str) {
+    static SAID: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    for (table, col, ty) in lossy_columns(sql) {
+        let key = format!("{}.{}", table, col);
+        let mut said = SAID.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if said.len() < 64 && said.insert(key.clone()) {
+            eprintln!(
+                "quillo: warning: SQLite keeps `{}` ({}) as a number of 15 digits: 12345678901234567.89 comes back as 12345678901234568, and 0.10 as 0.1. Declare it `decimal_text`, or keep minor units in an `integer` column (money.to_minor)",
+                key, ty
+            );
+        }
+    }
+}
+
 /// `db.exec(sql, ...params)`: `{ changes, last_id }`. Without parameters the
 /// text may hold several statements (a schema, for example).
 fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
@@ -1563,6 +1613,10 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let started = std::time::Instant::now();
     let res = match &*b {
         Backend::Sqlite(m) => {
+            // SQLite takes no parameters in a `create table`.
+            if params.is_empty() {
+                warn_lossy_columns(&sql);
+            }
             let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             (|| {
                 tx_gone(&b, &c)?;

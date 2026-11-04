@@ -521,6 +521,44 @@ impl Dec {
         fit(neg, Wide::mul(self.mag(), o.mag()), scale, false, Rounding::HalfEven)
     }
 
+    /// `self` to the power `n`, by squaring: exact while the answer fits, else each product
+    /// rounded as `mul` rounds; a negative power is one over the positive one. For interest
+    /// and loan payments, `(1 + r)^n`, which went through floats (FEEDBACK50.md, Q-632; branch
+    /// feedback50-fixes).
+    pub fn powi(self, n: i64) -> Result<Dec, DecError> {
+        let one = Dec::from_i64(1);
+        let e = n.unsigned_abs();
+        if n >= 0 {
+            return self.pow_u(e);
+        }
+        // Below one, one over it first: its power keeps its digits where `x^n` at 28
+        // decimals would keep few, `0.5^-90` 1% off. Above one, a power past what fits is
+        // under 1e-28, so one over it is 0 at 28 decimals (found in review).
+        if self.abs().cmp(one) == Ordering::Less {
+            return one.div(self)?.pow_u(e);
+        }
+        match self.pow_u(e) {
+            Ok(p) => one.div(p),
+            Err(DecError::Overflow) => Ok(Dec::from_parts(false, 0, MAX_SCALE)),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// `self` to a power, by squaring.
+    fn pow_u(self, mut e: u64) -> Result<Dec, DecError> {
+        let (mut base, mut acc) = (self, Dec::from_i64(1));
+        while e > 0 {
+            if e & 1 == 1 {
+                acc = acc.mul(base)?;
+            }
+            e >>= 1;
+            if e > 0 {
+                base = base.mul(base)?;
+            }
+        }
+        Ok(acc)
+    }
+
     pub fn div(self, o: Dec) -> Result<Dec, DecError> {
         if o.is_zero() {
             return Err(DecError::DivByZero);

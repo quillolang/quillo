@@ -162,7 +162,9 @@ fn contains_slice_reverse_index_of_and_pow_take_what_they_take() {
     same_error("index_of({ a: 1 }, \"a\")", "`index_of` expects a list or str, got map");
     // A float or a negative power is a float's power.
     same_is("", "[pow(2.0, 0.5), pow(2, -1), pow(4, -2), pow(0.5, 3), pow(-8, 1.0 / 3), pow(2.5, 2)]", "[1.4142135623730951, 0.5, 0.0625, 0.125, NaN, 6.25]");
-    same_error("pow(dec(\"1.5\"), 2)", "`pow` expects a number as argument 1, got dec (this works on floats: convert a dec with float(x))");
+    // A decimal to an int's power is a decimal (FEEDBACK50.md, Q-632; branch feedback50-fixes).
+    same_is("", "pow(dec(\"1.5\"), 2)", "2.25m");
+    same_error("pow(2, dec(\"1.5\"))", "`pow` expects a number as argument 2, got dec (this works on floats: convert a dec with float(x))");
     same_error("pow(\"a\", 2)", "`pow` expects a number as argument 1, got str");
     same_error("pow(2, \"a\")", "`pow` expects a number as argument 2, got str");
     same_error("pow(2.5, null)", "`pow` expects a number as argument 2, got null");

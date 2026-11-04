@@ -114,6 +114,50 @@
 - **`udp.listen` (and `media.rtp`) need the `net` effect**, and `save_upload` and `files`
   the `fs` effect: add them to the `with` of the functions that call them.
 
+- **`a + b` on two money values adds them**, and `a - b` subtracts: `+` merged the two
+  maps, so `total + line` was the line. Only maps of exactly `amount` and `currency`; two
+  currencies give an error value (FEEDBACK50.md, Q-620).
+- **Every `money` function holds a money map to `money.of`'s rules**: more decimals than
+  the currency has, `"1e3"` as text, and minor units past an int are runtime errors, where
+  some functions rounded and others did not. `money.round(m, mode)` makes money of an
+  amount with more decimals (Q-622, Q-623).
+- **`money.allocate` gives the units left to the largest remainders**, not the first
+  shares: $0.10 split 1:99 is 0.00 and 0.10, not 0.01 and 0.09 (Q-631).
+- **`round(x, n)` of a float rounds its shortest decimal**: `round(1.005, 2)` is `1.01`, as
+  `format_number` writes it, where it was `1.0` (Q-626).
+- **`money.format` writes what `Intl.NumberFormat` writes**: XOF, XAF, XPF, XCD and XCG have
+  symbols, IRR and 12 other currencies show no decimals, the French locales have `$CL` and
+  the like, and es-CO, zh-Hant-TW and 70-odd other locales are their own, not another
+  country's (Q-627).
+- **A PostgreSQL `money` column reads with its `lc_monetary`'s decimals**: under a yen
+  `lc_monetary`, ￥500 is `500m`, where it was `5.00m` (Q-625).
+- **`money` is a type**: in a pattern, `{ price: money }` checks money where it bound a
+  variable named `money` (Q-621).
+
+### Money (FEEDBACK50.md)
+
+- **A `money` type** for patterns, record fields and annotations: `route POST /pay { json: {
+  price: money } }` takes `{ amount, currency }` held to `money.of`'s rules and gives the
+  money; a request that fails is a 400 whose log line says which rule. `type Money = {
+  amount: dec, currency: str }` checked the shape only (Q-621).
+- **`money.parse(text, currency, locale)`** reads an amount as the locale writes it,
+  `"1.234,50 €"` in de-DE; `money.of` reads text as a program writes it, so a German
+  `"1.000"` was €1.00 (Q-624).
+- **`pow(d, n)`** raises a decimal to an int's power, for interest and loan payments, which
+  went through floats (Q-632).
+- **`format_number(x, locale, digits, mode)`** rounds as `mode` says, `"half_even"` as money
+  does (Q-626).
+- **Withdrawn currencies** (BGN, HRK and 22 others since 2007) still read, so old invoices
+  are money (Q-630).
+- **122 locales** for `money.format` and `format_number`, every currency's symbol in each,
+  written from ICU 77 by `scripts/money-tables.mjs`; a locale written as another is said in
+  the log once (Q-627).
+- **Warnings**: SQLite's log says once which `money`, `decimal` or `numeric(p, s)` column
+  keeps 15 digits (Q-628), and `quillo check` says when a list is given as a query's
+  parameters, stored as its JSON text (Q-629).
+- **In the browser too**: money's range check of FEEDBACK49's Q-605, and text trimmed and
+  quoted as the server does.
+
 ### What a person changes is two-way, and `onclick={...}` is a handler
 
 - **`value={x}` is two-way when `x` is the component's state** and nothing else on the
