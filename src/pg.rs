@@ -43,6 +43,8 @@ pub struct Conn {
     /// Opened past the pool's size by `checkout_nested`: closed when given
     /// back, not kept.
     aside: bool,
+    /// The decimals of a `money` value here, once a result has had one (`money_digits`).
+    money: Option<u32>,
 }
 
 pub struct Pool {
@@ -132,7 +134,7 @@ impl Pool {
 
     fn connect(&self) -> Result<Conn, String> {
         let client = self.config.connect(self.tls.clone()).map_err(|e| describe(&e))?;
-        Ok(Conn { client, stmts: HashMap::new(), conflict: None, aside: false })
+        Ok(Conn { client, stmts: HashMap::new(), conflict: None, aside: false, money: None })
     }
 
     /// An idle connection or a new one, or None when all `max` are taken.
@@ -634,7 +636,12 @@ impl Conn {
         let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
         let rows = self.client.query(&stmt, &refs);
         let rows = rows.map_err(|e| self.failed(&e))?;
-        values(&rows, limit)
+        let digits = match (has_money(&rows), self.money) {
+            (false, _) => 2,
+            (true, Some(d)) => d,
+            (true, None) => *self.money.insert(money_digits(self.client.query_one(MONEY_DIGITS, &[]))?),
+        };
+        values(&rows, limit, digits)
     }
 
     /// `{ changes, last_id }`; Postgres has no last insert id, so use
@@ -688,8 +695,30 @@ impl Conn {
     }
 }
 
-/// Rows as maps of column name to value.
-fn values(rows: &[postgres::Row], limit: Option<usize>) -> Result<Vec<Value>, String> {
+/// How many decimals PostgreSQL's `money` has on a connection: those of its `lc_monetary`'s
+/// currency (2 for dollars, 0 for yen, 3 for dinars). The binary value is a count of that
+/// unit, which was read as cents whatever the currency: ￥1,234 came back as 12.34
+/// (FEEDBACK50.md, Q-625; branch feedback50-fixes).
+const MONEY_DIGITS: &str = "select scale(1::money::numeric)";
+
+fn money_digits<E: std::fmt::Display>(row: Result<postgres::Row, E>) -> Result<u32, String> {
+    let scale: i32 = row.map_err(|e| e.to_string())?.try_get(0).map_err(|e| e.to_string())?;
+    Ok(scale.clamp(0, 28) as u32)
+}
+
+/// Whether a result has a `money` column.
+fn has_money(rows: &[postgres::Row]) -> bool {
+    rows.first().map_or(false, |r| r.columns().iter().any(|c| *c.type_() == Type::MONEY))
+}
+
+thread_local! {
+    /// The `money` decimals of the connection whose rows are being read (`values`).
+    static MONEY: std::cell::Cell<u32> = const { std::cell::Cell::new(2) };
+}
+
+/// Rows as maps of column name to value; a `money` value with `digits` decimals.
+fn values(rows: &[postgres::Row], limit: Option<usize>, digits: u32) -> Result<Vec<Value>, String> {
+    MONEY.with(|m| m.set(digits));
     let mut out = Vec::with_capacity(rows.len().min(limit.unwrap_or(usize::MAX)));
     for row in rows.iter().take(limit.unwrap_or(usize::MAX)) {
         let mut m = Map::with_capacity(row.len());
@@ -759,6 +788,8 @@ struct Lane {
     waiting: AtomicUsize,
     /// When it last answered, or was given work while it had none (`clock`).
     moved: AtomicU64,
+    /// The decimals of a `money` value here, once a result has had one (`money_digits`).
+    money: OnceLock<u32>,
 }
 
 /// Milliseconds since the first call.
@@ -824,7 +855,7 @@ impl Lanes {
         tokio::spawn(async move {
             let _ = conn.await;
         });
-        let l = Arc::new(Lane { client, stmts: Mutex::new(HashMap::new()), waiting: AtomicUsize::new(0), moved: AtomicU64::new(0) });
+        let l = Arc::new(Lane { client, stmts: Mutex::new(HashMap::new()), waiting: AtomicUsize::new(0), moved: AtomicU64::new(0), money: OnceLock::new() });
         *self.slots[pick].lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(l.clone());
         Ok(l)
     }
@@ -863,7 +894,15 @@ impl Lanes {
         let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
         let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
         let rows = lane.client.query(&stmt, &refs).await.map_err(|e| describe(&e))?;
-        values(&rows, limit)
+        let digits = match (has_money(&rows), lane.money.get()) {
+            (false, _) => 2,
+            (true, Some(d)) => *d,
+            (true, None) => {
+                let d = money_digits(lane.client.query_one(MONEY_DIGITS, &[]).await)?;
+                *lane.money.get_or_init(|| d)
+            }
+        };
+        values(&rows, limit, digits)
     }
 
     pub async fn exec(self: Arc<Self>, n: usize, sql: String, params: Vec<Value>) -> Result<Value, String> {
@@ -1454,8 +1493,8 @@ fn date_text(days: i64) -> String {
 /// already, and what is left is shown as `bytea` is, as bytes passed off as text say nothing
 /// (FEEDBACK16.md, Q-117; branch feedback20-fixes).
 fn other_type(ty: &Type, raw: &[u8]) -> Value {
-    if let ("money", Ok(cents)) = (ty.name(), <[u8; 8]>::try_from(raw)) {
-        if let Some(d) = crate::decimal::Dec::new(i64::from_be_bytes(cents) as i128, 2) {
+    if let ("money", Ok(units)) = (ty.name(), <[u8; 8]>::try_from(raw)) {
+        if let Some(d) = crate::decimal::Dec::new(i64::from_be_bytes(units) as i128, MONEY.with(|m| m.get())) {
             return Value::Dec(d);
         }
     }

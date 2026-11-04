@@ -414,6 +414,13 @@ fn name_schema(n: &str) -> J {
         "dec" => json!({ "type": "string", "format": "decimal" }),
         "str" => json!({ "type": "string" }),
         "date" => json!({ "type": "string", "format": "date" }),
+        // Money: an amount as a decimal's text, and an ISO 4217 code (FEEDBACK50.md, Q-621;
+        // branch feedback50-fixes).
+        "money" => json!({
+            "type": "object",
+            "required": ["amount", "currency"],
+            "properties": { "amount": { "type": "string", "format": "decimal" }, "currency": { "type": "string", "pattern": "^[A-Za-z]{3}$" } }
+        }),
         "bool" => json!({ "type": "boolean" }),
         "list" => json!({ "type": "array" }),
         "map" => json!({ "type": "object" }),

@@ -16,7 +16,7 @@ const KEYWORDS: &[&str] = &[
     "let", "fn", "view", "component", "server", "route", "use", "mount", "return", "if", "else", "match", "for", "while", "in",
     "true", "false", "null", "reply", "as", "with", "state", "type", "service", "private", "public",
 ];
-const TYPES: &[&str] = &["int", "float", "dec", "num", "str", "bool", "list", "map", "html", "fn", "any", "response", "null"];
+const TYPES: &[&str] = &["int", "float", "dec", "num", "str", "money", "bool", "list", "map", "html", "fn", "any", "response", "null"];
 const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "ANY"];
 /// HTML's elements, offered after `<` with the program's views and components.
 const HTML_TAGS: &[&str] = &[

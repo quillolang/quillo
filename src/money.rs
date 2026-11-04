@@ -27,9 +27,9 @@ use std::sync::OnceLock;
 
 type R = Result<Value, Ctrl>;
 
-/// The active ISO 4217 currencies and their minor units (as of 2026; ANG,
-/// BGN, HRK, SLL and ZWL are withdrawn, and codes without minor units, such
-/// as XAU and XDR, are not money here). runtime.js has the same table.
+/// The active ISO 4217 currencies and their minor units, as of 2026. Codes
+/// without minor units, such as XAU and XDR, are not money here; withdrawn
+/// ones (ANG, BGN, HRK, ...) are in `WITHDRAWN`. runtime.js has the same table.
 pub const CURRENCIES: &str = "AED2 AFN2 ALL2 AMD2 AOA2 ARS2 AUD2 AWG2 AZN2 BAM2 BBD2 BDT2 BHD3 BIF0 BMD2 BND2 BOB2 BOV2 BRL2 BSD2 \
     BTN2 BWP2 BYN2 BZD2 CAD2 CDF2 CHE2 CHF2 CHW2 CLF4 CLP0 CNY2 COP2 COU2 CRC2 CUC2 CUP2 CVE2 CZK2 DJF0 \
     DKK2 DOP2 DZD2 EGP2 ERN2 ETB2 EUR2 FJD2 FKP2 GBP2 GEL2 GHS2 GIP2 GMD2 GNF0 GTQ2 GYD2 HKD2 HNL2 HTG2 \
@@ -125,10 +125,19 @@ pub fn install(m: &mut Map) {
 
 // ---- tables --------------------------------------------------------------
 
-/// A currency's minor units, by its code (upper case).
+/// Currencies withdrawn since 2007, with their minor units: amounts kept in them still
+/// read, so last year's invoice in leva is not an error in every `money` function
+/// (FEEDBACK50.md, Q-630; branch feedback50-fixes). runtime.js has the same table.
+pub const WITHDRAWN: &str = "ANG2 BGN2 BYR0 CYP2 EEK2 GHC2 HRK2 LTL2 LVL2 MRO2 MTL2 SDD2 SIT2 SKK2 SLL2 STD2 TMM2 VEB2 VEF2 ZMK2 ZWD2 ZWL2 ZWN2 ZWR2";
+
+/// A currency's minor units, by its code (upper case): an active one, or a withdrawn one.
 pub fn units_of(code: &str) -> Option<u32> {
     static T: OnceLock<HashMap<&'static str, u32>> = OnceLock::new();
-    T.get_or_init(|| CURRENCIES.split_whitespace().map(|c| (&c[..3], c[3..].parse().unwrap())).collect()).get(code).copied()
+    T.get_or_init(|| {
+        CURRENCIES.split_whitespace().chain(WITHDRAWN.split_whitespace()).map(|c| (&c[..3], c[3..].parse().unwrap())).collect()
+    })
+    .get(code)
+    .copied()
 }
 
 struct Locale {
@@ -285,28 +294,55 @@ fn currency(args: &[Value], i: usize, f: &str, line: u32) -> Result<Result<(Stri
     match args.get(i) {
         Some(Value::Str(s)) => {
             let code = s.trim().to_ascii_uppercase();
-            Ok(units_of(&code).map(|u| (code, u)).ok_or_else(|| Value::err(Value::str(format!("unknown currency {:?}", &**s)))))
+            Ok(units_of(&code).map(|u| (code, u)).ok_or_else(|| Value::err(Value::str(format!("unknown currency {}", Value::Str(s.clone()).repr())))))
         }
         other => fail(line, format!("`{}` expects a currency code (a str) as argument {}, got {}", f, i + 1, tn(other))),
     }
 }
 
-/// Argument `i` as money: a map with a known `currency` and an `amount`
-/// (a decimal, an int, or numeric text, as JSON brings it).
+/// Argument `i` as money: a map with a known `currency` and an `amount` (a decimal, an int,
+/// or numeric text, as JSON brings it), held to what `money.of` holds an amount to: the code
+/// trimmed, no exponent in text, no more decimals than the currency has, and minor units that
+/// fit an int. Every function sees one amount: `compare` and `is_zero` took $1.005 as it was
+/// while `add` and `format` rounded it to $1.00, and `"1e3"` in a map was 1,000
+/// (FEEDBACK50.md, Q-622 and Q-623; branch feedback50-fixes).
 fn money(args: &[Value], i: usize, f: &str, line: u32) -> Result<Money, Ctrl> {
-    let bad = |why: &str| fail(line, format!("`{}` expects money ({{ amount, currency }}) as argument {}, got {}{}", f, i + 1, tn(args.get(i)), why));
-    let Some(Value::Map(m)) = args.get(i) else { return bad("") };
+    read(args.get(i), i, f, line, true)
+}
+
+/// `money`, with `exact` false for `money.round`, which takes an amount made by hand with
+/// more decimals than its currency has.
+fn read(v: Option<&Value>, i: usize, f: &str, line: u32, exact: bool) -> Result<Money, Ctrl> {
+    let bad = |why: String| fail(line, format!("`{}` expects money ({{ amount, currency }}) as argument {}, got {}{}", f, i + 1, tn(v), why));
+    let Some(Value::Map(m)) = v else { return bad(String::new()) };
     let code = match m.get("currency") {
-        Some(Value::Str(s)) => s.to_ascii_uppercase(),
-        _ => return bad(": no currency"),
+        Some(Value::Str(s)) => s.trim().to_ascii_uppercase(),
+        _ => return bad(": no currency".into()),
     };
-    let Some(units) = units_of(&code) else { return bad(": unknown currency") };
+    let Some(units) = units_of(&code) else { return bad(": unknown currency".into()) };
     let amount = match m.get("amount") {
-        Some(v @ (Value::Dec(_) | Value::Int(_) | Value::Str(_))) => crate::interp::as_dec(v),
-        _ => None,
+        Some(Value::Dec(d)) => *d,
+        Some(Value::Int(n)) => Dec::from_i64(*n),
+        Some(Value::Str(s)) => match Dec::parse(s.trim()).filter(|_| !s.contains(['e', 'E'])) {
+            Some(d) => d,
+            None => return bad(format!(": its amount {} is not an amount", Value::Str(s.clone()).repr())),
+        },
+        Some(Value::Float(_)) => return bad(": its amount is a float: make it with money.of(dec(x), currency)".into()),
+        _ => return bad(": its amount must be a dec".into()),
     };
-    let Some(amount) = amount else { return bad(": its amount must be a dec") };
-    Ok(Money { amount, code, units })
+    if !exact {
+        return Ok(Money { amount, code, units });
+    }
+    // An amount with no room for the currency's decimals stays as it is, and is too large, as
+    // one whose minor units do not fit an int is.
+    let fitted = amount.round(units as i32, Rounding::Down).unwrap_or(amount);
+    if fitted != amount {
+        return fail(line, format!("`{}`: {} has more decimals than {} has ({}): round it first with money.round(m, mode)", f, amount, code, units));
+    }
+    if minor_of(fitted, units).is_none() {
+        return fail(line, format!("`{}`: {} {} is too large an amount", f, amount, code));
+    }
+    Ok(Money { amount: fitted, code, units })
 }
 
 /// A rounding mode given as argument `i` (half_even when left out).
@@ -354,7 +390,7 @@ fn of(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         // (FEEDBACK14.md, Q-096; branch feedback14-fixes).
         Some(Value::Str(s)) => match Dec::parse(s.trim()).filter(|_| !s.contains(['e', 'E'])) {
             Some(d) => d,
-            None => return Ok(Value::err(Value::str(format!("not an amount: {:?}", &**s)))),
+            None => return Ok(Value::err(Value::str(format!("not an amount: {}", Value::Str(s.clone()).repr())))),
         },
         Some(Value::Float(_)) => return fail(line, "`money.of` takes a dec, an int or text, not a float: convert it with dec(x)"),
         other => return fail(line, format!("`money.of` expects an amount (a dec, int or str) as argument 1, got {}", tn(other))),
@@ -397,12 +433,9 @@ fn from_minor(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 /// `money.to_minor(m)`: the amount in minor units (cents), an int.
 fn to_minor(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    // `money` has the amount at the currency's units, and its minor units fit an int.
     let m = money(&args, 0, "money.to_minor", line)?;
-    let d = to_units(m.amount, m.units, Rounding::HalfEven, line)?;
-    match minor_of(d, m.units) {
-        Some(n) => Ok(Value::Int(n)),
-        None => fail(line, "integer overflow"),
-    }
+    Ok(Value::Int(m.amount.mantissa() as i64))
 }
 
 /// An amount with `units` decimals as an int of minor units, if it fits.
@@ -420,18 +453,85 @@ fn in_range(m: Money) -> Value {
     }
 }
 
+/// What the `money` type makes of data, in a pattern or a record's field: a map of an
+/// `amount` (a decimal, an int, numeric text, or a JSON number through its shortest text) and
+/// a `currency`, held to `money.of`'s rules with no rounding mode, and made money; else what is
+/// wrong, without the value sent (it may go to the log). `type Money = { amount: dec, currency: str }` checked the shape only, so $10.004 was
+/// taken and dropped to $10.00, "1e3" was 1,000, and BTC was a 500 at the first `money` call
+/// (FEEDBACK50.md, Q-621; branch feedback50-fixes).
+pub fn from_data(v: &Value) -> Result<Value, String> {
+    let Value::Map(m) = v else { return Err("must be money, { amount, currency }".into()) };
+    let code = match m.get("currency") {
+        Some(Value::Str(s)) => s.trim().to_ascii_uppercase(),
+        Some(_) => return Err("has a currency that is not text".into()),
+        None => return Err("has no currency".into()),
+    };
+    let Some(units) = units_of(&code) else { return Err("has a currency that is not an ISO 4217 code".into()) };
+    let amount = match m.get("amount") {
+        Some(Value::Dec(d)) => Some(*d),
+        Some(Value::Int(n)) => Some(Dec::from_i64(*n)),
+        Some(Value::Float(f)) => Dec::from_f64(*f),
+        Some(Value::Str(s)) => Dec::parse(s.trim()).filter(|_| !s.contains(['e', 'E'])),
+        Some(_) => None,
+        None => return Err("has no amount".into()),
+    };
+    let Some(amount) = amount else { return Err("has an amount that is not a number".into()) };
+    let fitted = amount.round(units as i32, Rounding::Down).unwrap_or(amount);
+    if fitted != amount {
+        return Err(format!("has more decimals than {} has ({})", code, units));
+    }
+    if minor_of(fitted, units).is_none() {
+        return Err(format!("is too large an amount of {}", code));
+    }
+    Ok(Money { amount: fitted, code, units }.value())
+}
+
+/// Whether a value is money as every `money` function takes it: what an annotation's `money`
+/// holds a value to.
+pub fn is_money(v: &Value) -> bool {
+    read(Some(v), 0, "", 0, true).is_ok()
+}
+
+/// Whether a value has money's shape: a map of exactly `amount` and `currency`.
+fn shaped(v: &Value) -> bool {
+    matches!(v, Value::Map(m) if m.len() == 2 && m.contains_key("amount") && m.contains_key("currency"))
+}
+
+/// `a + b` and `a - b` when both have money's shape: the amounts added, as `money.add` does,
+/// and two currencies an error value. `+` merged the maps, so a cart's total was its last
+/// line, and dollars plus euros were the euros (FEEDBACK50.md, Q-620; branch feedback50-fixes).
+/// None for other values, which `+` merges and `-` refuses as before.
+pub fn op(a: &Value, b: &Value, sub: bool, line: u32) -> Option<R> {
+    if !(shaped(a) && shaped(b)) {
+        return None;
+    }
+    let (sym, verb) = if sub { ("-", "subtract") } else { ("+", "add") };
+    let both = read(Some(a), 0, sym, line, true).and_then(|x| Ok((x, read(Some(b), 1, sym, line, true)?)));
+    Some(both.map(|(x, y)| {
+        if x.code != y.code {
+            return Value::err(Value::str(format!("cannot {} {} and {}: convert one currency to the other first", verb, x.code, y.code)));
+        }
+        sum(x, y, sub)
+    }))
+}
+
+/// `a + b` or `a - b` of two amounts of one currency, as `money` reads them: at the currency's
+/// units, with minor units that fit an int, so the answer is exact and fits a decimal.
+fn sum(a: Money, b: Money, sub: bool) -> Value {
+    let r = if sub { a.amount.sub(b.amount) } else { a.amount.add(b.amount) };
+    in_range(Money { amount: r.expect("two ints' worth of minor units fit a decimal"), ..a })
+}
+
 fn add(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (a, b) = (money(&args, 0, "money.add", line)?, money(&args, 1, "money.add", line)?);
     same_currency(&a, &b, "add", line)?;
-    let sum = a.amount.add(b.amount).map_err(dec_err(line))?;
-    Ok(in_range(Money { amount: to_units(sum, a.units, Rounding::HalfEven, line)?, ..a }))
+    Ok(sum(a, b, false))
 }
 
 fn sub(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (a, b) = (money(&args, 0, "money.sub", line)?, money(&args, 1, "money.sub", line)?);
     same_currency(&a, &b, "subtract", line)?;
-    let diff = a.amount.sub(b.amount).map_err(dec_err(line))?;
-    Ok(in_range(Money { amount: to_units(diff, a.units, Rounding::HalfEven, line)?, ..a }))
+    Ok(sum(a, b, true))
 }
 
 /// `money.mul(m, factor, mode)`: times a decimal or an int, rounded to the
@@ -452,10 +552,8 @@ fn mul(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn neg(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let m = money(&args, 0, "money.neg", line)?;
     // `-(-9223372036854775808)` cents is one past what fits: an error value, as from
-    // `money.add`, when the amount given fitted (found in review).
-    let fitted = minor_of(m.amount, m.units).is_some();
-    let out = Money { amount: m.amount.neg(), ..m };
-    Ok(if fitted { in_range(out) } else { out.value() })
+    // `money.add` (found in review).
+    Ok(in_range(Money { amount: m.amount.neg(), ..m }))
 }
 
 /// `money.compare(a, b)`: -1, 0 or 1, for amounts of one currency.
@@ -479,9 +577,9 @@ fn is_zero(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 /// `money.round(m, mode)`: the amount rounded to the currency's decimals.
 fn round(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let m = money(&args, 0, "money.round", line)?;
+    let m = read(args.first(), 0, "money.round", line, false)?;
     let mode = mode(&args, 1, "money.round", line)?;
-    Ok(Money { amount: to_units(m.amount, m.units, mode, line)?, ..m }.value())
+    Ok(in_range(Money { amount: to_units(m.amount, m.units, mode, line)?, ..m }))
 }
 
 fn minor_units(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
@@ -494,8 +592,9 @@ fn minor_units(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// `money.allocate(m, ratios)`: the amount split by ratios (ints or
 /// decimals; a number n for n equal parts) without losing or making a
 /// minor unit. Each share gets its ratio's part, rounded down; the units
-/// left over go one each to the first shares with a ratio (Fowler's
-/// allocation), so the shares add up to the amount.
+/// left over go one each to the shares closest to their next unit (the
+/// largest remainders, Hamilton's method; a tie to the first), so the
+/// shares add up to the amount and none gets more than a unit past its part.
 fn allocate(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     const F: &str = "money.allocate";
     let m = money(&args, 0, F, line)?;
@@ -522,24 +621,27 @@ fn allocate(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let Some(total_ratio) = total_ratio.filter(|t| *t > 0) else {
         return fail(line, format!("`{}`: the ratios must add up to more than 0", F));
     };
-    let minor = to_units(m.amount, m.units, Rounding::HalfEven, line)?.mantissa();
+    let minor = m.amount.mantissa();
     let (neg, units) = (minor < 0, minor.unsigned_abs() as i128);
     let mut shares = Vec::with_capacity(whole.len());
+    let mut rests = Vec::with_capacity(whole.len());
     for r in &whole {
         match units.checked_mul(*r) {
-            Some(p) => shares.push(p / total_ratio),
+            Some(p) => {
+                shares.push(p / total_ratio);
+                rests.push(p % total_ratio);
+            }
             None => return fail(line, format!("`{}`: the ratios are too large", F)),
         }
     }
-    let mut left = units - shares.iter().sum::<i128>();
-    for (s, r) in shares.iter_mut().zip(&whole) {
-        if left == 0 {
-            break;
-        }
-        if *r > 0 {
-            *s += 1;
-            left -= 1;
-        }
+    // The units left go to the largest remainders, not to the first shares: of $0.10 split
+    // 1:99, the 1% share got $0.01, a tenth (FEEDBACK50.md, Q-631; branch feedback50-fixes).
+    // A share with no ratio has no remainder, and fewer units are left than shares with one.
+    let left = (units - shares.iter().sum::<i128>()) as usize;
+    let mut order: Vec<usize> = (0..shares.len()).collect();
+    order.sort_by(|a, b| rests[*b].cmp(&rests[*a]).then(a.cmp(b)));
+    for k in order.into_iter().take(left) {
+        shares[k] += 1;
     }
     let out = shares
         .into_iter()
@@ -656,6 +758,7 @@ mod tests {
             unescape(&parts.concat())
         };
         assert_eq!(constant("MONEY_CURRENCIES"), CURRENCIES);
+        assert_eq!(constant("MONEY_WITHDRAWN"), WITHDRAWN);
         assert_eq!(constant("MONEY_SYMBOLS"), SYMBOLS);
         assert_eq!(constant("MONEY_LOCALES"), LOCALES);
     }

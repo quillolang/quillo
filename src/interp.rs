@@ -402,6 +402,8 @@ pub fn type_name_matches(t: &str, v: &Value) -> bool {
         "str" => matches!(v, Value::Str(_)),
         // Text that is a date, not a date-time (FEEDBACK13.md, Q-093; branch open-fixes).
         "date" => matches!(v, Value::Str(s) if crate::dates::parse_date(s).is_some()),
+        // Money every `money` function takes (FEEDBACK50.md, Q-621; branch feedback50-fixes).
+        "money" => crate::money::is_money(v),
         "bool" => matches!(v, Value::Bool(_)),
         "list" => matches!(v, Value::List(_)),
         "map" => matches!(v, Value::Map(_)),
@@ -1260,6 +1262,12 @@ fn int_op(op: BinOp, x: i64, y: i64) -> Option<Value> {
 pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
     use Value::*;
     let overflow = || Ctrl::Error(Box::new(QuilloError::new("integer overflow", line)));
+    // Two money values add up, and subtract (FEEDBACK50.md, Q-620; branch feedback50-fixes).
+    if matches!((op, &a, &b), (BinOp::Add | BinOp::Sub, Map(_), Map(_))) {
+        if let Some(r) = crate::money::op(&a, &b, op == BinOp::Sub, line) {
+            return r;
+        }
+    }
     match op {
         BinOp::Add => match (a, b) {
             (Int(x), Int(y)) => x.checked_add(y).map(Int).ok_or_else(overflow),
@@ -4114,6 +4122,13 @@ impl Interp {
                         return inner;
                     }
                 }
+                // Money says which of `money.of`'s rules it fails (FEEDBACK50.md, Q-621; branch
+                // feedback50-fixes).
+                Some(x) if matches!(&f.pat, Pattern::Type(t) if t == "money") && !matches!(x, Value::Nil) => {
+                    if let Err(why) = crate::money::from_data(&x) {
+                        return format!("`{}` {}", name, why);
+                    }
+                }
                 Some(x) if !matches!(x, Value::Nil) && !self.pattern_fits(&f.pat, &x, sub == Mode::Lenient) => {
                     let kind = match &x {
                         Value::Str(_) => "text".to_string(),
@@ -4132,6 +4147,7 @@ impl Interp {
         match p {
             Pattern::Type(t) if self.types.contains_key(t) => true,
             Pattern::Type(t) if t == "dec" => as_dec(x).is_some(),
+            Pattern::Type(t) if t == "money" => crate::money::from_data(x).is_ok(),
             Pattern::Type(t) => type_name_matches(t, x) || (lenient && matches!(x, Value::Str(s) if coerce(t, s).is_some())),
             Pattern::Lit(l) => {
                 let lv = lit_value(l);
@@ -4177,6 +4193,9 @@ impl Interp {
             // A decimal from an int, numeric text or a JSON number, in
             // any pattern: what it is given is converted.
             Pattern::Type(t) if t == "dec" => as_dec(v).map(Value::Dec),
+            // Money from data, held to `money.of`'s rules (FEEDBACK50.md, Q-621; branch
+            // feedback50-fixes).
+            Pattern::Type(t) if t == "money" => crate::money::from_data(v).ok(),
             Pattern::Type(t) => {
                 if type_name_matches(t, v) {
                     Some(v.clone())

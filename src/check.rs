@@ -399,6 +399,9 @@ fn ty_t(t: &Ty) -> T {
     if let (Some(fs), true) = (&t.fields, out.bits & MAP != 0) {
         out.shape = shape_id(fs.iter().map(|(k, ft)| (Arc::from(k.as_str()), ty_t(ft))).collect());
     }
+    if t.names.iter().any(|n| n == "money") && t.fields.is_none() {
+        out.shape = money_t().shape;
+    }
     // One of the program's own types: its fields (or what it stands for).
     let own: Vec<Arc<TypeDef>> = t.names.iter().filter_map(|n| record(n)).collect();
     if let ([td], true) = (own.as_slice(), t.fields.is_none()) {
@@ -461,6 +464,9 @@ fn name_bits(n: &str) -> u16 {
         "num" => NUM,
         // A date is text (FEEDBACK13.md, Q-093; branch open-fixes).
         "date" => STR,
+        // Money is a map, `{ amount: dec, currency: str }` (FEEDBACK50.md, Q-621; branch
+        // feedback50-fixes).
+        "money" => MAP,
         "nil" | "null" => NIL,
         other => BASE.iter().find(|(_, x)| *x == other).map_or(ANY, |(b, _)| *b),
     }
@@ -469,6 +475,19 @@ fn name_bits(n: &str) -> u16 {
 /// A money value's type (src/money.rs).
 fn money_t() -> T {
     map_of(vec![(Arc::from("amount"), T::of(DEC)), (Arc::from("currency"), T::of(STR))])
+}
+
+/// Whether a type is money's shape, `{ amount, currency }` (or an error besides): what `+`
+/// and `-` take as amounts (FEEDBACK50.md, Q-620; branch feedback50-fixes).
+fn is_money(t: T) -> bool {
+    t.bits & MAP != 0
+        && t.bits & !(MAP | ERR) == 0
+        && shape_of(t.shape).map_or(false, |s| s.len() == 2 && s.iter().all(|(k, _)| matches!(&**k, "amount" | "currency")))
+}
+
+/// Whether a value may be money: of any type, or a map whose shape is money's or not known.
+fn maybe_money(t: T) -> bool {
+    t.is_any() || (t.bits & MAP != 0 && t.bits & !(MAP | ERR | NIL) == 0 && (t.shape == 0 || is_money(t.without(NIL))))
 }
 
 /// After an error about a decimal and a float: what to do about it.
@@ -502,6 +521,10 @@ fn binop_t(op: BinOp, a: T, b: T) -> Option<T> {
         BinOp::Eq | BinOp::Ne => return Some(T::of(BOOL)),
         // `a && b` and `a || b` give one of their operands.
         BinOp::And | BinOp::Or => return Some(a.union(b)),
+        // Money adds and subtracts, in `a - b`, `t -= x` and state alike; a map whose shape is
+        // not known may be money (FEEDBACK50.md, Q-620; branch feedback50-fixes).
+        BinOp::Add | BinOp::Sub if is_money(a) && is_money(b) => return Some(money_t().union(T::error(STR))),
+        BinOp::Sub if maybe_money(a) && maybe_money(b) => return Some(T::of(MAP | ERR)),
         _ => {}
     }
     let mut out = 0u16;
@@ -3953,6 +3976,11 @@ impl Checker {
                 }
                 if matches!(op, BinOp::Div | BinOp::Mod) && matches!(**b, Expr::Lit(Lit::Int(0))) {
                     self.error("division by zero");
+                }
+                // Two money values add and subtract their amounts, not merge as maps do
+                // (FEEDBACK50.md, Q-620; branch feedback50-fixes).
+                if matches!(op, BinOp::Add | BinOp::Sub) && is_money(x) && is_money(y) {
+                    return money_t().union(T::error(STR));
                 }
                 match binop_t(*op, x, y) {
                     Some(t) => {

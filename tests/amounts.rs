@@ -105,22 +105,25 @@ fn from_minor_and_zero_say_what_is_wrong() {
 
 #[test]
 fn money_made_by_hand_is_checked_when_it_is_used() {
-    fails("money.add({ amount: 1.5, currency: \"USD\" }, money.of(1, \"USD\"))", ": its amount must be a dec");
+    fails("money.add({ amount: 1.5, currency: \"USD\" }, money.of(1, \"USD\"))", ": its amount is a float: make it with money.of(dec(x), currency)");
     fails("money.add({ currency: \"USD\" }, money.of(1, \"USD\"))", ": its amount must be a dec");
     fails("money.add({ amount: 1m }, money.of(1, \"USD\"))", ": no currency");
     fails("money.add({ amount: 1m, currency: \"ZZZ\" }, money.of(1, \"USD\"))", ": unknown currency");
     fails("money.add(5, money.of(1, \"USD\"))", "`money.add` expects money ({ amount, currency }) as argument 1, got int 5");
-    fails("money.to_minor({ amount: 79228162514264337593543950335m, currency: \"USD\" })", "integer overflow");
-    fails("money.to_minor({ amount: 79228162514264337593543950m, currency: \"USD\" })", "integer overflow");
+    // Too large for the currency's decimals, or for its minor units in an int: said when the
+    // map is read (FEEDBACK50.md, Q-623; branch feedback50-fixes).
+    fails("money.to_minor({ amount: 79228162514264337593543950335m, currency: \"USD\" })", "`money.to_minor`: 79228162514264337593543950335 USD is too large an amount");
+    fails("money.to_minor({ amount: 79228162514264337593543950m, currency: \"USD\" })", "`money.to_minor`: 79228162514264337593543950 USD is too large an amount");
     assert_eq!(ev("money.to_minor({ amount: \"12.5\", currency: \"usd\" })"), "1250");
     assert_eq!(ev("money.to_minor({ amount: 12, currency: \"USD\" })"), "1200");
 }
 
 #[test]
 fn adding_past_what_a_decimal_holds_is_an_error() {
+    // Past an int's minor units already, so refused as it is read.
     let big = "{ amount: 79228162514264337593543950335m, currency: \"JPY\" }";
-    fails(&format!("money.add({big}, {big})"), "decimal overflow");
-    fails(&format!("money.sub({big}, money.neg({big}))"), "decimal overflow");
+    fails(&format!("money.add({big}, {big})"), "`money.add`: 79228162514264337593543950335 JPY is too large an amount");
+    fails(&format!("money.sub({big}, {big})"), "`money.sub`: 79228162514264337593543950335 JPY is too large an amount");
 }
 
 #[test]

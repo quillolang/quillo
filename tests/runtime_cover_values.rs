@@ -254,11 +254,12 @@ fn money_says_what_it_was_given_that_is_not_an_amount() {
             &format!("`money.allocate`: ratio 1 must be an int or a dec, 0 or more, got {}", got),
         );
     }
-    // A ratio of 0 takes nothing; decimals as ratios split by their size.
+    // A ratio of 0 takes nothing; decimals as ratios split by their size, the cent left to
+    // the largest remainder, 0.666... (FEEDBACK50.md, Q-631; branch feedback50-fixes).
     same_is(
         "",
         &format!("{}money.allocate(m, [0, dec(\"0.5\"), 1])", usd),
-        "[{ amount: 0.00m, currency: \"USD\" }, { amount: 0.34m, currency: \"USD\" }, { amount: 0.66m, currency: \"USD\" }]",
+        "[{ amount: 0.00m, currency: \"USD\" }, { amount: 0.33m, currency: \"USD\" }, { amount: 0.67m, currency: \"USD\" }]",
     );
     same_error("format_number(\"12\")", "`format_number` expects a number as argument 1, got str \"12\"");
     same_error("format_number(null)", "`format_number` expects a number as argument 1, got null null");

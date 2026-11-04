@@ -22,7 +22,8 @@ fn key_not_a_param(def: &FnDef) -> PResult<()> {
 }
 
 // `date`: text that is a calendar date, YYYY-MM-DD (FEEDBACK13.md, Q-093; branch open-fixes).
-pub const TYPE_NAMES: &[&str] = &["int", "float", "dec", "num", "str", "date", "bool", "list", "map", "html", "fn", "any", "response"];
+// `money` (FEEDBACK50.md, Q-621; branch feedback50-fixes).
+pub const TYPE_NAMES: &[&str] = &["int", "float", "dec", "num", "str", "date", "money", "bool", "list", "map", "html", "fn", "any", "response"];
 pub const VOID_TAGS: &[&str] =
     &["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"];
 const KEYWORDS: &[&str] = &[

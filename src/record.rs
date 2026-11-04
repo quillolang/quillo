@@ -224,6 +224,9 @@ fn make_name(it: &mut Interp, n: &str, ty: &Ty, v: &Value, lenient: bool, depth:
         ("float", Value::Int(i)) if !ty.names.iter().any(|n| n == "int") => Ok(Ok(Value::Float(*i as f64))),
         // A decimal field takes an int, numeric text or a JSON number.
         ("dec", _) => Ok(crate::interp::as_dec(v).map(Value::Dec).ok_or_else(Why::default)),
+        // Money, held to `money.of`'s rules, with what is wrong (FEEDBACK50.md, Q-621; branch
+        // feedback50-fixes).
+        ("money", _) => Ok(crate::money::from_data(v).map_err(|what| Why { path: String::new(), what })),
         (t, Value::Str(s)) if lenient && !type_name_matches(t, v) => match crate::interp::coerce(t, s) {
             Some(x) => Ok(Ok(x)),
             None => Ok(Err(Why::default())),

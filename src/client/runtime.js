@@ -460,6 +460,8 @@ function typeIs(t, v) {
     case "str": return typeof v === "string";
     // Text that is a date (FEEDBACK13.md, Q-093; branch open-fixes).
     case "date": return isDay(v);
+    // Money every money function takes (FEEDBACK50.md, Q-621; branch feedback50-fixes).
+    case "money": return moneyIs(v);
     case "bool": return typeof v === "boolean";
     case "list": return Array.isArray(v);
     case "map": return isMap(v) || isEvent(v);
@@ -574,6 +576,8 @@ function ownMakeName(n, t, v, depth) {
   }
   // A decimal field takes an int, numeric text or a JSON number.
   if (n === "dec") { const d = asDec(v); return d === null ? { ok: false, w: OWN_PLAIN } : { ok: true, v: d }; }
+  // Money, held to money.of's rules, with what is wrong (FEEDBACK50.md, Q-621).
+  if (n === "money") { const r = moneyFromData(v); return r.why ? { ok: false, w: { path: "", what: r.why } } : { ok: true, v: r.v }; }
   const w = ownFits({ n: [n], o: false, e: t.e, f: t.f, t: t.t }, v, true, depth);
   return w ? { ok: false, w } : { ok: true, v };
 }
@@ -688,7 +692,7 @@ function add(a, b) {
   if (typeof a === "bigint" || typeof b === "bigint") return bigArith(a, b, "+", "add");
   if (a instanceof Html && b instanceof Html) return frag([a, b]);
   if (Array.isArray(a) && Array.isArray(b)) return a.concat(b);
-  if (isMap(a) && isMap(b)) return { ...a, ...b };
+  if (isMap(a) && isMap(b)) return moneyOp(a, b, false) ?? { ...a, ...b };
   fail(`cannot add ${typeName(a)} and ${typeName(b)}`);
 }
 
@@ -700,7 +704,7 @@ function arith(a, b, op, verb) {
   if (isInt(a) && isInt(b) && b === 0) fail("division by zero");
   return op === "/" ? a / b : a % b;
 }
-const sub = (a, b) => (typeof a === "number" && typeof b === "number" ? big(a - b, a, b, "-", "subtract") : arith(a, b, "-", "subtract"));
+const sub = (a, b) => (typeof a === "number" && typeof b === "number" ? big(a - b, a, b, "-", "subtract") : (isMap(a) && isMap(b) && moneyOp(a, b, true)) || arith(a, b, "-", "subtract"));
 const mul = (a, b) => (typeof a === "number" && typeof b === "number" ? big(a * b, a, b, "*", "multiply") : arith(a, b, "*", "multiply"));
 const div = (a, b) => (typeof a === "number" && typeof b === "number" && b !== 0 ? a / b : arith(a, b, "/", "divide"));
 const mod = (a, b) => (typeof a === "number" && typeof b === "number" && b !== 0 ? a % b : arith(a, b, "%", "take the remainder of"));
@@ -927,6 +931,8 @@ function matchInto(p, v, b) {
       madeLast = undefined;
       // A decimal from an int, numeric text or a JSON number.
       if (p.t === "dec") { const d = asDec(v); if (d === null) return false; madeLast = d; return true; }
+      // Money from data (FEEDBACK50.md, Q-621; branch feedback50-fixes).
+      if (p.t === "money") { const r = moneyFromData(v); if (r.why) return false; madeLast = r.v; return true; }
       // A record: the value made as `User(v)` makes it.
       const r = ownTypes && ownTypes.make(p.t, v);
       if (r) {
@@ -2158,6 +2164,9 @@ const MONEY_CURRENCIES = "AED2 AFN2 ALL2 AMD2 AOA2 ARS2 AUD2 AWG2 AZN2 BAM2 BBD2
   "SBD2 SCR2 SDG2 SEK2 SGD2 SHP2 SLE2 SOS2 SRD2 SSP2 STN2 SVC2 SYP2 SZL2 THB2 TJS2 TMT2 TND3 TOP2 TRY2 " +
   "TTD2 TWD2 TZS2 UAH2 UGX0 USD2 USN2 UYI0 UYU2 UYW4 UZS2 VED2 VES2 VND0 VUV0 WST2 XAF0 XCD2 XCG2 XOF0 " +
   "XPF0 YER2 ZAR2 ZMW2 ZWG2";
+// Withdrawn since 2007: amounts kept in them still read (FEEDBACK50.md, Q-630; branch
+// feedback50-fixes).
+const MONEY_WITHDRAWN = "ANG2 BGN2 BYR0 CYP2 EEK2 GHC2 HRK2 LTL2 LVL2 MRO2 MTL2 SDD2 SIT2 SKK2 SLL2 STD2 TMM2 VEB2 VEF2 ZMK2 ZWD2 ZWL2 ZWN2 ZWR2";
 const MONEY_SYMBOLS = "USD=US$,EUR=\u20ac,GBP=\u00a3,JPY=JP\u00a5,CNY=CN\u00a5,INR=\u20b9,CAD=CA$,AUD=AU$,NZD=NZ$,BRL=R$,MXN=MX$,KRW=\u20a9,TWD=NT$,HKD=HK$,VND=\u20ab,ILS=\u20aa";
 const MONEY_LOCALES = "en-US\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,AUD=A$,PHP=\u20b1\n" +
   "en-GB\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,PHP=\u20b1\n" +
@@ -2212,7 +2221,7 @@ function moneyTables() {
   if (moneyT) return moneyT;
   const pairs = (s) => { const o = Object.create(null); for (const p of s.split(",")) { const i = p.indexOf("="); if (i > 0) o[p.slice(0, i)] = p.slice(i + 1); } return o; };
   const units = Object.create(null);
-  for (const c of MONEY_CURRENCIES.split(" ")) units[c.slice(0, 3)] = +c.slice(3);
+  for (const c of (MONEY_CURRENCIES + " " + MONEY_WITHDRAWN).split(" ")) units[c.slice(0, 3)] = +c.slice(3);
   const locales = MONEY_LOCALES.split("\n").map((l) => {
     const f = l.split("\t");
     return { name: f[0], decimal: f[1], group: f[2], number: [f[3] || f[1], f[4] || f[2]], minus: f[5], indian: (+f[6] & 1) !== 0, min2: (+f[6] & 2) !== 0, pats: f.slice(7, 11), symbols: pairs(f[11] || "") };
@@ -2251,22 +2260,70 @@ function formatAmount(d, code, places, locName) {
   return pat.replace("-", loc.minus).replace("¤", sym).replace("#", num);
 }
 const moneyShort = (v) => (v === undefined ? "nothing" : `${typeName(v)} ${short(v)}`);
+// Trimmed as Rust's trim() trims (its White_Space, not JavaScript's \s), and a code
+// upper-cased in ASCII only, as on the server (found in review of FEEDBACK50's fixes).
+const rsTrim = (s) => s.replace(/^[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g, "");
+const moneyCode = (c) => rsTrim(c).replace(/[a-z]/g, (x) => x.toUpperCase());
 function moneyCurrency(c, f, i) {
   if (typeof c !== "string") fail(`\`${f}\` expects a currency code (a str) as argument ${i}, got ${moneyShort(c)}`);
-  const code = c.trim().toUpperCase(), u = unitsOf(code);
-  return u === null ? new Err(`unknown currency ${JSON.stringify(c)}`) : { code, units: u };
+  const code = moneyCode(c), u = unitsOf(code);
+  return u === null ? new Err(`unknown currency ${repr(c)}`) : { code, units: u };
 }
-function moneyArg(v, f, i) {
+// Money held to what money.of holds an amount to, as on the server: the code trimmed, no
+// exponent in text, no more decimals than the currency has, minor units that fit an int;
+// `exact` false for money.round (FEEDBACK50.md, Q-622 and Q-623; branch feedback50-fixes).
+function moneyArg(v, f, i, exact = true) {
   const bad = (why) => fail(`\`${f}\` expects money ({ amount, currency }) as argument ${i}, got ${moneyShort(v)}${why}`);
   if (!isMap(v)) bad("");
   const c = hasOwn(v, "currency") ? v.currency : null;
   if (typeof c !== "string") bad(": no currency");
-  const code = c.toUpperCase(), units = unitsOf(code);
+  const code = moneyCode(c), units = unitsOf(code);
   if (units === null) bad(": unknown currency");
   const a = hasOwn(v, "amount") ? v.amount : null;
-  const amount = a instanceof Dec || isInt(a) || typeof a === "bigint" || typeof a === "string" ? asDec(a) : null;
-  if (amount === null) bad(": its amount must be a dec");
-  return { amount, code, units };
+  let amount;
+  if (a instanceof Dec) amount = a;
+  else if (isInt(a) || typeof a === "bigint") amount = new Dec(BigInt(a), 0);
+  else if (typeof a === "string") { amount = /[eE]/.test(a) ? null : decParse(rsTrim(a), false); if (amount === null) bad(`: its amount ${repr(a)} is not an amount`); }
+  else if (typeof a === "number") bad(": its amount is a float: make it with money.of(dec(x), currency)");
+  else bad(": its amount must be a dec");
+  if (!exact) return { amount, code, units };
+  const fitted = decRound(amount, units, "down");
+  if (decCmp(fitted, amount) !== 0) fail(`\`${f}\`: ${decText(amount)} has more decimals than ${code} has (${units}): round it first with money.round(m, mode)`);
+  if (fitted.s !== units || fitted.m < I64_MIN || fitted.m > I64_MAX) fail(`\`${f}\`: ${decText(amount)} ${code} is too large an amount`);
+  return { amount: fitted, code, units };
+}
+const moneyIs = (v) => { try { moneyArg(v, "", 0); return true; } catch (e) { if (e instanceof QuilloError) return false; throw e; } };
+// What the money type makes of data, as src/money.rs's from_data: a map of an amount (a
+// decimal, an int, numeric text, or a JSON number) and a currency, held to money.of's rules
+// with no rounding mode; else why, without the value sent (FEEDBACK50.md, Q-621; branch
+// feedback50-fixes).
+function moneyFromData(v) {
+  if (!isMap(v)) return { why: "must be money, { amount, currency }" };
+  if (!hasOwn(v, "currency") || v.currency === undefined) return { why: "has no currency" };
+  if (typeof v.currency !== "string") return { why: "has a currency that is not text" };
+  const code = moneyCode(v.currency), units = unitsOf(code);
+  if (units === null) return { why: "has a currency that is not an ISO 4217 code" };
+  if (!hasOwn(v, "amount") || v.amount === undefined) return { why: "has no amount" };
+  const a = v.amount;
+  const amount = a instanceof Dec ? a : isInt(a) || typeof a === "bigint" ? new Dec(BigInt(a), 0) : typeof a === "number" ? decFromFloat(a)
+    : typeof a === "string" && !/[eE]/.test(a) ? decParse(rsTrim(a), false) : null;
+  if (amount === null) return { why: "has an amount that is not a number" };
+  const fitted = decRound(amount, units, "down");
+  if (decCmp(fitted, amount) !== 0) return { why: `has more decimals than ${code} has (${units})` };
+  if (fitted.s !== units || fitted.m < I64_MIN || fitted.m > I64_MAX) return { why: `is too large an amount of ${code}` };
+  return { v: moneyOf(fitted, code) };
+}
+// Money past what money.of takes: an error value, as on the server (FEEDBACK49.md, Q-605;
+// the browser's half, branch feedback50-fixes).
+const moneyIn = (d, code) => (d.m < I64_MIN || d.m > I64_MAX ? new Err(`${decText(d)} ${code} is too large an amount`) : moneyOf(d, code));
+// a + b and a - b when both have money's shape: the amounts, and two currencies an error
+// value (FEEDBACK50.md, Q-620; branch feedback50-fixes). null for other maps.
+const moneyShaped = (v) => isMap(v) && hasOwn(v, "amount") && hasOwn(v, "currency") && Object.keys(v).length === 2;
+function moneyOp(x, y, sub) {
+  if (!moneyShaped(x) || !moneyShaped(y)) return null;
+  const sym = sub ? "-" : "+", a = moneyArg(x, sym, 1), b = moneyArg(y, sym, 2);
+  if (a.code !== b.code) return new Err(`cannot ${sub ? "subtract" : "add"} ${a.code} and ${b.code}: convert one currency to the other first`);
+  return moneyIn(decAdd(a.amount, sub ? new Dec(-b.amount.m, b.amount.s) : b.amount), a.code);
 }
 function moneyMode(m, f) {
   if (isNil(m)) return "half_even";
@@ -2293,7 +2350,7 @@ B.money = {
     else if (isInt(amount) || typeof amount === "bigint") d = new Dec(BigInt(amount), 0);
     // Text as people write an amount, and money whose cents fit an int, as
     // on the server (FEEDBACK14.md, Q-096; branch feedback14-fixes).
-    else if (typeof amount === "string") { d = /[eE]/.test(amount) ? null : decParse(amount.trim(), false); if (d === null) return new Err(`not an amount: ${JSON.stringify(amount)}`); }
+    else if (typeof amount === "string") { d = /[eE]/.test(amount) ? null : decParse(rsTrim(amount), false); if (d === null) return new Err(`not an amount: ${repr(amount)}`); }
     else if (typeof amount === "number") fail("`money.of` takes a dec, an int or text, not a float: convert it with dec(x)");
     else fail(`\`money.of\` expects an amount (a dec, int or str) as argument 1, got ${moneyShort(amount)}`);
     let r;
@@ -2310,12 +2367,9 @@ B.money = {
     if (!isInt(n) && typeof n !== "bigint") fail(`\`money.from_minor\` expects an int as argument 1, got ${moneyShort(n)}`);
     return moneyOf(new Dec(BigInt(n), c.units), c.code);
   },
-  to_minor: (m) => {
-    const a = moneyArg(m, "money.to_minor", 1), d = decRound(a.amount, a.units, "half_even");
-    return d.s === a.units ? bigChecked(d.m) : fail("integer overflow");
-  },
-  add: (x, y) => { const a = moneyArg(x, "money.add", 1), b = moneyArg(y, "money.add", 2); moneySame(a, b, "add"); return moneyOf(decRound(decAdd(a.amount, b.amount), a.units, "half_even"), a.code); },
-  sub: (x, y) => { const a = moneyArg(x, "money.sub", 1), b = moneyArg(y, "money.sub", 2); moneySame(a, b, "subtract"); return moneyOf(decRound(decAdd(a.amount, new Dec(-b.amount.m, b.amount.s)), a.units, "half_even"), a.code); },
+  to_minor: (m) => bigChecked(moneyArg(m, "money.to_minor", 1).amount.m),
+  add: (x, y) => { const a = moneyArg(x, "money.add", 1), b = moneyArg(y, "money.add", 2); moneySame(a, b, "add"); return moneyIn(decAdd(a.amount, b.amount), a.code); },
+  sub: (x, y) => { const a = moneyArg(x, "money.sub", 1), b = moneyArg(y, "money.sub", 2); moneySame(a, b, "subtract"); return moneyIn(decAdd(a.amount, new Dec(-b.amount.m, b.amount.s)), a.code); },
   mul: (x, factor, mode) => {
     const a = moneyArg(x, "money.mul", 1);
     let f;
@@ -2323,17 +2377,17 @@ B.money = {
     else if (isInt(factor) || typeof factor === "bigint") f = new Dec(BigInt(factor), 0);
     else if (typeof factor === "number") fail("`money.mul` takes a dec or an int, not a float: convert it with dec(x)");
     else fail(`\`money.mul\` expects a dec or an int as argument 2, got ${moneyShort(factor)}`);
-    return moneyOf(decRound(decMul(a.amount, f), a.units, moneyMode(mode, "money.mul")), a.code);
+    return moneyIn(decRound(decMul(a.amount, f), a.units, moneyMode(mode, "money.mul")), a.code);
   },
-  neg: (x) => { const a = moneyArg(x, "money.neg", 1); return moneyOf(new Dec(-a.amount.m, a.amount.s), a.code); },
+  neg: (x) => { const a = moneyArg(x, "money.neg", 1); return moneyIn(new Dec(-a.amount.m, a.amount.s), a.code); },
   compare: (x, y) => { const a = moneyArg(x, "money.compare", 1), b = moneyArg(y, "money.compare", 2); moneySame(a, b, "compare"); return decCmp(a.amount, b.amount); },
   zero: (currency) => { const c = moneyCurrency(currency, "money.zero", 1); return c instanceof Err ? c : moneyOf(new Dec(0n, c.units), c.code); },
   is_zero: (x) => moneyArg(x, "money.is_zero", 1).amount.m === 0n,
-  round: (x, mode) => { const a = moneyArg(x, "money.round", 1); return moneyOf(decRound(a.amount, a.units, moneyMode(mode, "money.round")), a.code); },
+  round: (x, mode) => { const a = moneyArg(x, "money.round", 1, false); return moneyIn(decRound(a.amount, a.units, moneyMode(mode, "money.round")), a.code); },
   minor_units: (currency) => { const c = moneyCurrency(currency, "money.minor_units", 1); return c instanceof Err ? c : c.units; },
   // Split by ratios without losing or making a minor unit: each share its
-  // part rounded down, the units left one each to the first shares with a
-  // ratio (Fowler's allocation).
+  // part rounded down, the units left one each to the largest remainders, a
+  // tie to the first (FEEDBACK50.md, Q-631; branch feedback50-fixes).
   allocate: (x, ratios) => {
     const F = "money.allocate", a = moneyArg(x, F, 1);
     let rs;
@@ -2349,10 +2403,11 @@ B.money = {
     const whole = rs.map((r) => r.m * p10(s - r.s));
     const total = whole.reduce((t, r) => t + r, 0n);
     if (total <= 0n) fail(`\`${F}\`: the ratios must add up to more than 0`);
-    const minor = decRound(a.amount, a.units, "half_even").m, neg = minor < 0n, units = babs(minor);
-    const shares = whole.map((r) => (units * r) / total);
-    let left = units - shares.reduce((t, x) => t + x, 0n);
-    for (let i = 0; i < shares.length && left > 0n; i++) if (whole[i] > 0n) { shares[i] += 1n; left -= 1n; }
+    const minor = a.amount.m, neg = minor < 0n, units = babs(minor);
+    const shares = whole.map((r) => (units * r) / total), rests = whole.map((r) => (units * r) % total);
+    const left = Number(units - shares.reduce((t, x) => t + x, 0n));
+    const order = shares.map((_, k) => k).sort((p, q) => (rests[q] > rests[p] ? 1 : rests[q] < rests[p] ? -1 : p - q));
+    for (const k of order.slice(0, left)) shares[k] += 1n;
     return shares.map((x) => moneyOf(new Dec(neg ? -x : x, a.units), a.code));
   },
   format: (x, locale) => { const a = moneyArg(x, "money.format", 1); return formatAmount(a.amount, a.code, a.units, moneyLocale(locale, "money.format", 2)); },
