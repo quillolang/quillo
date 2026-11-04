@@ -14,7 +14,7 @@ cargo build --release
 cargo test
 ```
 
-Features marked *(since 0.7)* are in main and the next release, not in 0.6.0. On 0.6.0,
+This guide is for Quillo 0.7.0. Features marked *(since 0.7)* are new in it. On 0.6.0,
 read the guide at https://github.com/quillolang/quillo/blob/v0.6.0/USERGUIDE.md instead.
 
 ## Options of `quillo run`

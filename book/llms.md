@@ -5,7 +5,7 @@
 > built-in SQLite. There is no package file, no build step and no JavaScript to write.
 > `quillo run` serves the program; `quillo check` checks it without running it.
 
-Features marked *(since 0.7)* are in main and the next release, not in 0.6.0. On 0.6.0,
+This is for Quillo 0.7.0. Features marked *(since 0.7)* are new in it. On 0.6.0,
 read https://github.com/quillolang/quillo/blob/v0.6.0/USERGUIDE.md and
 https://quillolang.org/v0.6.0/llms.txt instead.
 

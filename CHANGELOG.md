@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 (2026-11-05)
+
+Strict modules, the security review's fixes, money, shared hosting, services the app does not
+hold, the failure side, markup as JSX writes it, and the rest below. Not in it, moved to 0.8:
+FEEDBACK43's database driver interface (Q-494 to Q-497, a design study) and the apps planned
+for 0.7 (the live dashboard and the others, see the 0.7 plan).
 
 ### What to change in your code
 

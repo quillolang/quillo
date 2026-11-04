@@ -19,7 +19,7 @@ cargo build --release
 cargo test
 ```
 
-Features marked *(since 0.7)* are in main and the next release, not in 0.6.0. On 0.6.0,
+This guide is for Quillo 0.7.0. Features marked *(since 0.7)* are new in it. On 0.6.0,
 read the guide at https://github.com/quillolang/quillo/blob/v0.6.0/USERGUIDE.md instead.
 
 ### Options of `quillo run`
@@ -7450,7 +7450,7 @@ of one's own in three ways that matter to Quillo:
   limits: processes (`NPROC`, which counts threads, for the whole account), and requests
   at once (`EP`; over it, visitors get a 508 page from the host, not from Quillo).
 
-**The binary.** The Linux releases from the next tag on are linked against glibc 2.17,
+**The binary.** The Linux releases from 0.7.0 on are linked against glibc 2.17,
 so they start on CentOS 7, CloudLinux 7 and 8, AlmaLinux 8 and newer (0.6.0's need glibc
 2.35). They are glibc builds, not static ones, as a plugin is a library they load.
 

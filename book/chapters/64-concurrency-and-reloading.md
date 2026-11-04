@@ -652,7 +652,7 @@ of one's own in three ways that matter to Quillo:
   limits: processes (`NPROC`, which counts threads, for the whole account), and requests
   at once (`EP`; over it, visitors get a 508 page from the host, not from Quillo).
 
-**The binary.** The Linux releases from the next tag on are linked against glibc 2.17,
+**The binary.** The Linux releases from 0.7.0 on are linked against glibc 2.17,
 so they start on CentOS 7, CloudLinux 7 and 8, AlmaLinux 8 and newer (0.6.0's need glibc
 2.35). They are glibc builds, not static ones, as a plugin is a library they load.
 
