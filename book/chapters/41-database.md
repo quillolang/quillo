@@ -62,7 +62,7 @@ optional parts. Rows are maps from column
 names to values, so `todo.text` reads a column, and a list of rows goes straight into
 `for` in a page or out as JSON.
 
-Three things that surprise people:
+Four things that surprise people:
 
 - **A row is a map**, so two columns with one name (`select a.id, b.id`) leave only the
   last: name them apart with `as`.
@@ -71,6 +71,9 @@ Three things that surprise people:
   that gives rows (`insert ... returning id`) goes to `db.one`, not `db.exec`.
 - **`db.query` gives every row at once**, in memory: page through large tables with
   `limit` and the last row's key.
+- **Values are separate arguments**, `db.exec(sql, a, b)`, not a list as Python's
+  `sqlite3` takes them: `db.exec("insert ... values (?)", [x])` stores the list as its
+  JSON text. `quillo check` says so when the SQL is written out.
 
 A query that fails (a syntax error, a constraint, the server unreachable) is an error
 value with the database's message:
@@ -455,7 +458,8 @@ wait, writers take turns, for up to 5 seconds before a write fails as a conflict
   quotes, comments and `$$` strings.
 - Values convert both ways: numbers, text, booleans, `json` and `jsonb` as maps and
   lists, arrays as lists, `numeric` as [decimals](#money) with their scale (an int
-  when it has none); `uuid`, `date`, `timestamptz` (ISO 8601, in UTC), `timestamp` (as
+  when it has none), `money` as a decimal with its `lc_monetary` currency's decimals (no
+  currency comes with it: `numeric(p, s)` and a currency column say more); `uuid`, `date`, `timestamptz` (ISO 8601, in UTC), `timestamp` (as
   stored, no zone) and `interval` (PostgreSQL's own text) as text. Other parameters are
   sent as text for PostgreSQL to convert; columns of types it does not decode (`inet`,
   ranges, composites) are cast to text in the query: `ip::text`.

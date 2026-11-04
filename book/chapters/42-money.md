@@ -68,7 +68,8 @@ that is not one.
 ## Keeping it in the database
 
 SQLite has no decimal type, so the ledger keeps whole cents in integers, which SQL can
-add up exactly. PostgreSQL's `numeric` and MySQL's `decimal` come back as decimals
+add up exactly. (A `money` or `decimal(12, 2)` column there keeps 15 digits, and the log
+says so when the table is made.) PostgreSQL's `numeric` and MySQL's `decimal` come back as decimals
 instead, with their scale.
 
 ```sql
