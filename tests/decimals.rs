@@ -1,6 +1,8 @@
 //! Decimals (src/decimal.rs): exact numbers, `12.50m`. What they give on
 //! the server, in the checker, in the database and, compiled, in the browser.
 
+mod support;
+
 use quillo::eval_str;
 use std::process::Command;
 
@@ -40,7 +42,7 @@ fn server(body: &str) -> (quillo::Interp, String) {
 fn both(body: &str) -> (String, String) {
     let (it, server) = server(body);
     let js = quillo::client::test_script(&it, "__t").unwrap_or_else(|e| panic!("{}\n{}", e, body));
-    let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
+    let out = support::node(&js).expect("node");
     assert!(out.status.success(), "node failed: {}\n{}", String::from_utf8_lossy(&out.stderr), js);
     (server, String::from_utf8_lossy(&out.stdout).trim().to_string())
 }

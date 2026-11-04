@@ -5,6 +5,8 @@
 //! What only the page has (its objects, `fetch`, `crypto`) is checked against
 //! the answer the browser must give.
 
+mod support;
+
 use std::process::Command;
 use quillo::Interp;
 
@@ -29,7 +31,7 @@ fn server_of(it: &mut Interp) -> String {
 /// What Node prints running `__t` compiled, with `prelude` run first.
 fn browser_of(it: &Interp, prelude: &str) -> String {
     let js = format!("{}\n{}", prelude, quillo::client::test_script(it, "__t").unwrap_or_else(|e| panic!("{}", e)));
-    let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
+    let out = support::node(&js).expect("node");
     assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }

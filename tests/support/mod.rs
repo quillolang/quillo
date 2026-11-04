@@ -349,3 +349,15 @@ let g = db.transaction(() => db.exec_many("  INSERT INTO many VALUES (?,?)  ", [
 "#;
 
 pub const EXEC_MANY_WANT: &str = r#"[2500, 0, 2, true, "db: row 2 has 1 value, the first has 2", true, 1, 2501, "ç"]"#;
+
+/// `node` running `js`, from a file: Linux takes at most 128 KiB in one argument, and a script
+/// with the runtime unminified (`QUILLO_RUNTIME_COVERAGE`, as CI runs) is more (found by CI).
+#[allow(dead_code)]
+pub fn node(js: &str) -> std::io::Result<std::process::Output> {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let file = std::env::temp_dir().join(format!("quillo-node-{}-{}.cjs", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+    std::fs::write(&file, js)?;
+    let out = std::process::Command::new("node").arg(&file).output();
+    let _ = std::fs::remove_file(&file);
+    out
+}

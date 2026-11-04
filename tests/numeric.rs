@@ -2,6 +2,8 @@
 //! (computed with python3's math and statistics modules), and the same
 //! answers in the browser.
 
+mod support;
+
 use quillo::Interp;
 use std::process::Command;
 
@@ -276,7 +278,7 @@ fn both(body: &str) -> (String, String) {
         Err(_) => "returned".into(),
     };
     let js = quillo::client::test_script(&it, "__t").unwrap_or_else(|e| panic!("{}\n{}", e, src));
-    let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
+    let out = support::node(&js).expect("node");
     assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
     let browser = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (whole_floats(&server), browser)

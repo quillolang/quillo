@@ -23,7 +23,7 @@ fn both(defs: &str, body: &str) -> (String, String) {
         Err(quillo::interp::Ctrl::Reply(_)) => "REPLY".into(),
     };
     let js = client::test_script(&it, "__t").unwrap_or_else(|e| panic!("{}\n{}", e, src));
-    let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
+    let out = support::node(&js).expect("node");
     assert!(out.status.success(), "node failed: {}\n{}", String::from_utf8_lossy(&out.stderr), src);
     (server, String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -218,7 +218,7 @@ fn a_method_that_cannot_run_in_the_browser_is_no_function_there() {
     if !node_available() {
         return;
     }
-    let out = Command::new("node").arg("-e").arg(&js).output().unwrap();
+    let out = support::node(&js).unwrap();
     let said = String::from_utf8_lossy(&out.stdout);
     assert_eq!(said.trim(), "ERROR: str has no method `bad`");
 }

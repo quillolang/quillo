@@ -351,9 +351,18 @@ fn a_process_limit_too_low_for_the_threads_is_said_at_start() {
         });
     }
     let child = cmd.spawn().unwrap();
-    let _guard = support::Guard::new(child);
+    let mut guard = support::Guard::new(child);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while !support::listening(port) {
+        // An account that already has 30 processes and threads (a CI runner's) cannot start
+        // even the first: said so, with the limit, and not a panic (found by CI).
+        if let Ok(Some(status)) = guard.0.try_wait() {
+            let said = std::fs::read_to_string(d.join("nproc.log")).unwrap();
+            assert_eq!(status.code(), Some(1), "{}", said);
+            assert!(said.contains("quillo: cannot start: no thread can be made (") && said.contains("; the process limit (ulimit -u) is 30, which counts every thread of this account's processes: raise it"), "{}", said);
+            assert!(!said.contains("panicked"), "{}", said);
+            return;
+        }
         assert!(std::time::Instant::now() < deadline, "{}", std::fs::read_to_string(d.join("nproc.log")).unwrap());
         std::thread::sleep(std::time::Duration::from_millis(20));
     }

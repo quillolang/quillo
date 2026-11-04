@@ -233,7 +233,9 @@ fn run_script(d: &std::path::Path) -> String {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // A deadline, not how long it takes: a debug build against a PostgreSQL started for the test
+    // took more than 30 s on CI.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     while child.try_wait().unwrap().is_none() {
         if std::time::Instant::now() > deadline {
             let _ = child.kill();

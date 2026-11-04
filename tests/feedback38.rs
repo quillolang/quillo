@@ -209,9 +209,22 @@ fn token_endpoint() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     let given = n.clone();
     std::thread::spawn(move || {
         for mut c in l.incoming().flatten() {
+            // The whole request: its form may come after its head (found by CI).
+            let mut got = Vec::new();
             let mut b = [0u8; 4096];
-            let got = c.read(&mut b).unwrap_or(0);
-            let req = String::from_utf8_lossy(&b[..got]).into_owned();
+            loop {
+                let n = c.read(&mut b).unwrap_or(0);
+                got.extend_from_slice(&b[..n]);
+                let text = String::from_utf8_lossy(&got).into_owned();
+                let done = text.find("\r\n\r\n").is_some_and(|end| {
+                    let len = text.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                    got.len() >= end + 4 + len
+                });
+                if done || n == 0 {
+                    break;
+                }
+            }
+            let req = String::from_utf8_lossy(&got).into_owned();
             let k = given.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let ok = req.contains("grant_type=client_credentials") && (req.contains("client_secret=s3cret") || req.contains("authorization: Basic"));
             let exp = if k == 0 { now() - 600 } else { now() + 600 };

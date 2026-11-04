@@ -1,6 +1,8 @@
 //! The browser compiler: compiled code must compute what the server computes.
 //! Each case runs on the interpreter and, compiled to JS, in Node.
 
+mod support;
+
 use std::process::Command;
 use quillo::Interp;
 
@@ -26,7 +28,7 @@ fn both_with(prelude: &str, defs: &str, body: &str) -> (String, String) {
     };
     let js = quillo::client::test_script(&it, "__t").unwrap_or_else(|e| panic!("{}\n{}", e, src));
     let js = format!("{}\n{}", prelude, js);
-    let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
+    let out = support::node(&js).expect("node");
     let browser = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(out.status.success(), "node failed: {}\n{}", String::from_utf8_lossy(&out.stderr), js);
     (server, browser)

@@ -516,7 +516,7 @@ fn both(defs: &str, body: &str) -> Option<(String, String)> {
         Err(quillo::interp::Ctrl::Reply(_)) => "REPLY".into(),
     };
     let js = quillo::client::test_script(&it, "__t").unwrap_or_else(|e| panic!("{}\n{}", e, src));
-    let o = Command::new("node").arg("-e").arg(&js).output().expect("node");
+    let o = support::node(&js).expect("node");
     Some((server, String::from_utf8_lossy(&o.stdout).trim().to_string() + &String::from_utf8_lossy(&o.stderr)))
 }
 

@@ -3038,6 +3038,20 @@ fn threads_allowed(workers: usize) {
     }
 }
 
+/// `; the process limit (ulimit -u) is N ...` where the system sets one, for a message about a
+/// thread that could not be made.
+pub fn process_limit_note() -> String {
+    #[cfg(unix)]
+    {
+        let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: `r` is a live rlimit for the call to write.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut r) } == 0 && r.rlim_cur != libc::RLIM_INFINITY {
+            return format!("; the process limit (ulimit -u) is {}, which counts every thread of this account's processes: raise it", r.rlim_cur);
+        }
+    }
+    String::new()
+}
+
 #[cfg(not(unix))]
 fn take_descriptors() {}
 

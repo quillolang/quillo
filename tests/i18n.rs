@@ -1,6 +1,8 @@
 //! Translations: choosing the locale, `t`, plurals, cached views, and the
 //! same text in components in the browser.
 
+mod support;
+
 use quillo::server::{HttpRequest, HttpResponse};
 use quillo::Interp;
 use std::process::Command;
@@ -158,7 +160,7 @@ fn __t() = [0, 1, 2, 5, 11, 21, 22, 1.5] | map((n) => t("files", { count: n })) 
     let server = it.call(&quillo::value::lookup(&it.globals, "__t").unwrap(), vec![], 0).ok().unwrap().repr();
     let words = it.site.i18n.as_ref().unwrap().browser_json("ru", None);
     let js = format!("globalThis.window = {{ [Symbol.for(\"quillo\")]: {{ i18n: {} }} }};\n{}", words, quillo::client::test_script(&it, "__t").unwrap());
-    let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
+    let out = support::node(&js).expect("node");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(server, String::from_utf8_lossy(&out.stdout).trim());
     assert!(server.contains("\"21 файл\"") && server.contains("\"22 файла\"") && server.contains("\"5 файлов\""), "{}", server);
@@ -194,6 +196,6 @@ fn __t() = raw(t("welcome", { name: "<i>x</i>" }))
     }
     let words = it.site.i18n.as_ref().unwrap().browser_json("en", None);
     let js = format!("globalThis.window = {{ [Symbol.for(\"quillo\")]: {{ i18n: {} }} }};\n{}", words, script);
-    let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
+    let out = support::node(&js).expect("node");
     assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "<html>", "{}", String::from_utf8_lossy(&out.stderr));
 }

@@ -1469,12 +1469,17 @@ pub fn target_label(base: &Path, t: &str) -> String {
         return t.to_string();
     }
     let full = if Path::new(t).is_absolute() { Path::new(t).to_path_buf() } else { base.join(t) };
-    // A file not made yet: its folder's real path, and its name.
-    let real = std::fs::canonicalize(&full).ok().or_else(|| {
-        let dir = std::fs::canonicalize(full.parent()?).ok()?;
-        Some(dir.join(full.file_name()?))
-    });
-    let real = real.unwrap_or(full);
+    // A file not made yet: the real path of the nearest folder above it that is there, and the
+    // rest as written. Its folder's alone gave an absolute label where /tmp is a link (macOS)
+    // and a relative one where it is not (found by CI on Linux).
+    let real = full
+        .ancestors()
+        .find_map(|at| {
+            let r = std::fs::canonicalize(at).ok()?;
+            let rest = full.strip_prefix(at).ok()?;
+            Some(if rest.as_os_str().is_empty() { r } else { r.join(rest) })
+        })
+        .unwrap_or_else(|| full.clone());
     let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
     match real.strip_prefix(&base) {
         Ok(inside) => inside.display().to_string(),

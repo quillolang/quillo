@@ -186,12 +186,16 @@ fn main() {
         std::process::exit(app(&args));
     }
     // Run on a thread with a roomy stack (see WORKER_STACK).
-    let child = std::thread::Builder::new()
-        .stack_size(quillo::server::WORKER_STACK)
-        .spawn(move || {
-            real_main(args)
-        })
-        .expect("cannot start interpreter thread");
+    let child = match std::thread::Builder::new().stack_size(quillo::server::WORKER_STACK).spawn(move || real_main(args)) {
+        Ok(child) => child,
+        // Said, rather than a panic: an account at its process limit, which counts every thread
+        // of its processes, cannot start one more (found by CI, where the account had more than
+        // the limit a test set; FEEDBACK41.md, Q-480).
+        Err(e) => {
+            eprintln!("quillo: cannot start: no thread can be made ({}){}", e, quillo::server::process_limit_note());
+            std::process::exit(1);
+        }
+    };
     // A panic is a way out too: what runs beside the program stops with it (FEEDBACK31.md,
     // Q-382; branch feedback27-35-fixes).
     let code = child.join().unwrap_or(1);

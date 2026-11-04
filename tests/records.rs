@@ -2,6 +2,8 @@
 //! annotations and patterns, held to by `quillo check`, and the same in the
 //! browser.
 
+mod support;
+
 use quillo::server::{HttpRequest, HttpResponse};
 use quillo::Interp;
 use std::path::Path;
@@ -176,7 +178,7 @@ fn both(body: &str) -> (String, String) {
         Err(_) => "returned".into(),
     };
     let js = quillo::client::test_script(&it, "__t").unwrap_or_else(|e| panic!("{}", e));
-    let out = Command::new("node").arg("-e").arg(&js).output().unwrap();
+    let out = support::node(&js).unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     (server, String::from_utf8_lossy(&out.stdout).trim().to_string())
 }

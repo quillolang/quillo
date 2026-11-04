@@ -37,7 +37,7 @@ fn both(body: &str) -> (String, String) {
         Err(_) => panic!("{}", src),
     };
     let js = client::test_script(&it, "__t").unwrap_or_else(|e| panic!("{}\n{}", e, src));
-    let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
+    let out = support::node(&js).expect("node");
     let shown = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     (server, shown.trim().to_string())
 }

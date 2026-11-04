@@ -276,9 +276,11 @@ fn a_targets_label_leaves_out_how_it_is_spelled() {
     for t in ["data/app.db", "./data/app.db", "data/../data/app.db", &d.join("data/app.db").display().to_string()] {
         assert_eq!(target_label(&d, t), "data/app.db", "{}", t);
     }
-    // Not made yet: its folder's real path.
+    // Not made yet: the real path of the nearest folder there, so inside the program's folder,
+    // a folder not made yet too (where /tmp is a link, as on macOS, and where it is not).
     assert_eq!(target_label(&d, "./data/new.db"), "data/new.db");
-    assert_eq!(target_label(&d, "nofolder/x.db"), d.join("nofolder/x.db").display().to_string());
+    assert_eq!(target_label(&d, "nofolder/x.db"), "nofolder/x.db");
+    assert_eq!(target_label(&d, &d.join("a/b/x.db").display().to_string()), "a/b/x.db");
     // Outside the folder: the whole real path.
     let outside = support::temp_dir("f43-label-outside");
     let o = target_label(&d, &outside.join("x.db").display().to_string());

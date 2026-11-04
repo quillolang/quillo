@@ -253,7 +253,9 @@ fn json_too_large_or_too_deep_is_an_error_and_the_server_goes_on() {
     let t = std::time::Instant::now();
     let a = support::send(s.port, "GET", "/shared/26", &[], "");
     assert!(a.body.contains("json.stringify: its JSON would be more than 256 MiB"), "{}", a.body);
-    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+    // A debug build (CI's `cargo test`) is several times slower.
+    let most = if cfg!(debug_assertions) { 60 } else { 10 };
+    assert!(t.elapsed() < Duration::from_secs(most), "{:?}", t.elapsed());
     let a = support::send(s.port, "GET", "/deep/20000", &[], "");
     assert!(a.body.contains("json.stringify: it is nested more than 10000 deep"), "{}", a.body);
     // A route's own value, written as its answer: a 500, and the server goes on.

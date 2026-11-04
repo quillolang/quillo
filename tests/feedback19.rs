@@ -3,6 +3,8 @@
 //! `filled` (Q-151), `break` and `continue` (Q-152), and bits and hex
 //! (Q-153), with the bits checked against the browser's own answers.
 
+mod support;
+
 use quillo::check::{check_source, Severity};
 use std::path::Path;
 use std::process::Command;
@@ -50,7 +52,7 @@ fn same(body: &str, want: &str) {
     assert_eq!(on_server, want, "server: {}", body);
     if node_available() {
         let js = quillo::client::test_script(&it, "__t").unwrap_or_else(|e| panic!("{}\n{}", e, body));
-        let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
+        let out = support::node(&js).expect("node");
         assert!(out.status.success(), "node failed: {}\n{}", String::from_utf8_lossy(&out.stderr), js);
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), want, "browser: {}", body);
     }

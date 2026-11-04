@@ -184,15 +184,19 @@ fn a_served_file_that_cannot_be_opened_any_more_is_watched_by_looking() {
     assert_eq!(support::send(port, "GET", "/a.txt", &[], "").body, "a");
     std::fs::set_permissions(d.join("a.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
     assert_eq!(support::send(port, "GET", "/b.txt", &[], "").body, "b");
-    let said = "looking for changed files every 50 ms (the system cannot tell of them:";
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !srv.log().contains(said) {
-        assert!(Instant::now() < deadline, "{}", srv.log());
-        std::thread::sleep(Duration::from_millis(20));
+    // macOS watches each file, and one it cannot open turns it to looking; Linux watches their
+    // folders, which a file's mode does not stop, so there it goes on being told (found by CI).
+    if cfg!(target_os = "macos") {
+        let said = "looking for changed files every 50 ms (the system cannot tell of them:";
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !srv.log().contains(said) {
+            assert!(Instant::now() < deadline, "{}", srv.log());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let log = srv.log();
+        let line = log.lines().find(|l| l.contains(said)).unwrap();
+        assert!(line.contains("a.txt: Permission denied"), "{}", line);
     }
-    let log = srv.log();
-    let line = log.lines().find(|l| l.contains(said)).unwrap();
-    assert!(line.contains("a.txt: Permission denied"), "{}", line);
     std::fs::set_permissions(d.join("a.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
     std::fs::write(d.join("app.qwe"), "route GET / = \"two\"\n").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
