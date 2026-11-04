@@ -690,12 +690,13 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   so it cannot end the script): `<script>const user = {user};</script>`. `null` and
   `false` are `null` and `false` there, and a string written in the braces, `{"hello"}`,
   is `"hello"` *(since 0.7: they wrote nothing, or the text bare, and the script did not
-  parse)*. HTML in it
+  parse)*. What puts something in or not, `{dev && raw(x)}` or an `if` with no `else`,
+  writes nothing when it gives `false` or `null`. HTML in it
   (`raw(code)`) goes in as it is, except that `</` becomes `<\/` and `<!--` becomes
   `<\!--`, which mean the same inside JavaScript strings and cannot end the element
-  early, so `raw(json.stringify(x))` there is safe too. The script's own text, and a
-  string written in it (`<script>{"if (a < b) go('x')"}</script>`), go in the same way:
-  as written, quotes included, with only `</` and `<!--` escaped. A `{` in a script's text
+  early, so `raw(json.stringify(x))` there is safe too. The script's own text goes in the
+  same way: as written, quotes included, with only `</` and `<!--` escaped; code kept in
+  a string goes in as code with `raw`, `<script>{raw("if (a < b) go('x')")}</script>`. A `{` in a script's text
   starts a Quillo value, so JavaScript with braces is a parse error that says what to
   do: ``a `{` in a <script> starts a Quillo value: write the code as a string,
   <script>{raw(CODE)}</script>, or put it in a file of its own``. A component's `<script>` (made

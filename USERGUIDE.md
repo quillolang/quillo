@@ -1028,12 +1028,13 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   so it cannot end the script): `<script>const user = {user};</script>`. `null` and
   `false` are `null` and `false` there, and a string written in the braces, `{"hello"}`,
   is `"hello"` *(since 0.7: they wrote nothing, or the text bare, and the script did not
-  parse)*. HTML in it
+  parse)*. What puts something in or not, `{dev && raw(x)}` or an `if` with no `else`,
+  writes nothing when it gives `false` or `null`. HTML in it
   (`raw(code)`) goes in as it is, except that `</` becomes `<\/` and `<!--` becomes
   `<\!--`, which mean the same inside JavaScript strings and cannot end the element
-  early, so `raw(json.stringify(x))` there is safe too. The script's own text, and a
-  string written in it (`<script>{"if (a < b) go('x')"}</script>`), go in the same way:
-  as written, quotes included, with only `</` and `<!--` escaped. A `{` in a script's text
+  early, so `raw(json.stringify(x))` there is safe too. The script's own text goes in the
+  same way: as written, quotes included, with only `</` and `<!--` escaped; code kept in
+  a string goes in as code with `raw`, `<script>{raw("if (a < b) go('x')")}</script>`. A `{` in a script's text
   starts a Quillo value, so JavaScript with braces is a parse error that says what to
   do: ``a `{` in a <script> starts a Quillo value: write the code as a string,
   <script>{raw(CODE)}</script>, or put it in a file of its own``. A component's `<script>` (made
@@ -2731,9 +2732,11 @@ route METHOD /path [with effects] { ... block ... }
   error that says to write `:id`. The path is split at `/`, empty pieces dropped, so `/users`,
   `/users/` and `//users` are one path; each piece is percent-decoded after the split, so
   a `%2F` stays inside its piece. `request.path` is the path as it came, undecoded.
-- **What a piece may hold:** letters and digits (any script: `/café`), `- . _ ~ %` and the
+- **What a piece may hold:** letters and digits (any script: `/café`), `- . _ ~` and the
   other characters a URL's path takes as they are, `@ + ! $ &` *(since 0.7: `@` and `+`
-  were refused)*: `/u/@me`, `/c++`. `= , ; ' ( ) *` are not, as the route line gives them
+  were refused)*: `/u/@me`, `/c++`. A `%` escape is read as the request's is, so
+  `/a%20b` takes `/a%20b` *(since 0.7: it never matched)*. `/users/${id}` and `/@{name}`,
+  a template's or OpenAPI's way, are an error that says to write `:id`. `= , ; ' ( ) *` are not, as the route line gives them
   meanings of its own, and `:` starts a parameter. A parameter may follow `@` or `~` in
   its piece, as profiles' addresses are written *(since 0.7)*: `route GET /@:name` takes
   `/@ann` with `name` `"ann"` (and `/%40ann`, the same piece encoded); `/@` alone has no

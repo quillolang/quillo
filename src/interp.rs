@@ -4425,7 +4425,13 @@ impl Interp {
                         HtmlChild::Expr(Expr::Lit(Lit::Str(s))) => out.push_str(&script_text(s)),
                         HtmlChild::Expr(e) => {
                             let v = self.eval(e, env)?;
-                            script_value(&v, out);
+                            // `{dev && raw(x)}`, `{if dev { raw(x) }}`: what puts something in or
+                            // not, which nothing then, where `false` or `null` was left in the
+                            // script (FEEDBACK53.md, Q-682; found in review).
+                            let maybe = matches!(e, Expr::Binary(BinOp::And, ..) | Expr::If(_, _, None));
+                            if !(maybe && matches!(v, Value::Nil | Value::Bool(false))) {
+                                script_value(&v, out);
+                            }
                         }
                         c => self.render_child(c, env, out)?,
                     }

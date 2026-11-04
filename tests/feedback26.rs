@@ -238,14 +238,10 @@ fn set_on_a_list_reading_itself_costs_its_length() {
 fn a_guard_does_not_hold_up_what_must_end() {
     let src = "route GET /slow {\n    let n = 0\n    let r = (() => {\n        while true {\n            n = n + 1\n        }\n    })() ?? \"caught\"\n    r\n}\n";
     let d = dir("guard", &[("main.qwe", src)]);
-    let port = support::free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_quillo")).arg("run").arg(d.join("main.qwe")).args(["--port", &port.to_string(), "--max-compute", "200ms", "--no-check"]).env("QUILLO_SECRET", "a secret for this test, long enough to use").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    support::stop_with_tests(&child);
-    let _server = support::Guard::new(child);
-    while !support::listening(port) {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert_eq!(send(port, "GET", "/slow", &[], "").status, 500);
+    // Started by `serve_with`, which gives up on a server that stopped or never listened, where
+    // this waited for good on one that lost its port to another test.
+    let s = support::serve_with(&d.join("main.qwe"), &["--max-compute", "200ms", "--no-check"]);
+    assert_eq!(send(s.port, "GET", "/slow", &[], "").status, 500);
 }
 
 // ---- the rest of FEEDBACK26.md --------------------------------------------------------------

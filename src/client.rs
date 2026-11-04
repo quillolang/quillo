@@ -4347,6 +4347,11 @@ impl<'a> Compiler<'a> {
             // would be code. (A view's, made on the server, takes values as
             // JSON.)
             if el.tag == "script" && !matches!(c, HtmlChild::Expr(Expr::Lit(Lit::Str(_)))) {
+                // `{"console.log(1)"}`: a string in braces is a value, JSON in a script, since
+                // FEEDBACK53.md's Q-682 (found in review).
+                if matches!(c, HtmlChild::Expr(Expr::Template(p)) if matches!(p.as_slice(), [TPart::Expr(Expr::Lit(Lit::Str(_)))])) {
+                    return self.err("a string in braces in a <script> is a value, written as JSON: write the code without the braces and quotes, as the script's own text");
+                }
                 return self.err("a component's <script> takes only text written in the program; pass data in a `data-` attribute, or use a view");
             }
             match c {

@@ -38,9 +38,11 @@ route METHOD /path [with effects] { ... block ... }
   error that says to write `:id`. The path is split at `/`, empty pieces dropped, so `/users`,
   `/users/` and `//users` are one path; each piece is percent-decoded after the split, so
   a `%2F` stays inside its piece. `request.path` is the path as it came, undecoded.
-- **What a piece may hold:** letters and digits (any script: `/café`), `- . _ ~ %` and the
+- **What a piece may hold:** letters and digits (any script: `/café`), `- . _ ~` and the
   other characters a URL's path takes as they are, `@ + ! $ &` *(since 0.7: `@` and `+`
-  were refused)*: `/u/@me`, `/c++`. `= , ; ' ( ) *` are not, as the route line gives them
+  were refused)*: `/u/@me`, `/c++`. A `%` escape is read as the request's is, so
+  `/a%20b` takes `/a%20b` *(since 0.7: it never matched)*. `/users/${id}` and `/@{name}`,
+  a template's or OpenAPI's way, are an error that says to write `:id`. `= , ; ' ( ) *` are not, as the route line gives them
   meanings of its own, and `:` starts a parameter. A parameter may follow `@` or `~` in
   its piece, as profiles' addresses are written *(since 0.7)*: `route GET /@:name` takes
   `/@ann` with `name` `"ann"` (and `/%40ann`, the same piece encoded); `/@` alone has no

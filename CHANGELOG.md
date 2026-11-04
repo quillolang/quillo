@@ -358,6 +358,15 @@
   then added to (`BASE + "where id = ?"`) is no longer taken for SQL built from values
   (Q-029).
 
+- A review of these fixes found more, fixed: `/users/${id}` and `/@{name}` are an error that
+  says to write `:id`, where `$` was taken as text and `{id}` as a request pattern; `routes
+  /@:name { ... }` parses at the top level; a `%` escape in a fixed piece is read as the
+  request's is (`/a%20b` never matched); `/~:id(int)` is not said to be hidden by
+  `/:id(int)`; OpenAPI has one path for one shape, whatever the method; `{dev && raw(x)}` and
+  an `if` with no `else` in a script write nothing for `false` and `null`; a component's
+  `<script>{"..."}</script>` is told why it is refused, by `quillo check` too; a program's own
+  `sql` is not the tag; two formats of one image made at once do not share a file.
+
 ### The failure side (FEEDBACK49.md)
 
 - A page could stop a channel's thread with one WebSocket frame whose length wrapped the

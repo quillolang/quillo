@@ -578,7 +578,9 @@ impl Lexer {
             // A regular expression's (`\s`, `\d`, `\w`, `\.`), as written for JavaScript: what to
             // write, where the note said newer Quillo might know it (FEEDBACK53.md, Q-008; branch
             // main).
-            other if "sdwbSDWB.()[]+*?^|/-".contains(other) => {
+            // Not `\/` or `\-`, which are not always a regular expression's, and `<\/script>`
+            // in a string is JavaScript's habit, not one (found in review).
+            other if "sdwbSDWB.()[]+*?^|".contains(other) => {
                 return Err(QuilloError::new(
                     format!("unknown escape `\\{0}` in string: a regular expression's `\\{0}` is written `\\\\{0}` in a Quillo string", other),
                     self.line,

@@ -1759,7 +1759,19 @@ impl Parser {
                         s.push(c);
                         self.lx.bump();
                     }
-                    path.push(Seg::Lit(s));
+                    // `/users/${id}`, `/@{name}`: a template's or OpenAPI's parameter after what
+                    // a piece may now hold, taken for the text `$` and a request pattern
+                    // (FEEDBACK53.md, Q-683; found in review).
+                    if self.lx.peek_char() == Some('{') {
+                        let name: String = (1..).map_while(|i| self.lx.peek_char_at(i).filter(|c| c.is_alphanumeric() || *c == '_')).collect();
+                        let name = if name.is_empty() { "name".to_string() } else { name };
+                        let before = s.trim_end_matches('$');
+                        let (wrote, want) = (format!("{}{{{}}}", s, name), format!("{}:{}", before, name));
+                        return Err(QuilloError::new(format!("path parameters are written `:{}`, as in `/{}`, not `{}`", name, want, wrote), self.lx.line));
+                    }
+                    // Decoded, as a request's pieces are before they are compared: `/a%20b` took
+                    // only `/a%2520b` (found in review).
+                    path.push(Seg::Lit(if s.contains('%') { crate::server::percent_decode(&s, false) } else { s }));
                 }
                 _ => {}
             }
@@ -1971,7 +1983,9 @@ impl Parser {
             return false;
         }
         match self.lx.peek_char_at(1) {
-            Some(c) if c.is_alphanumeric() || matches!(c, ':' | '_' | '-' | '.' | '*') => true,
+            // What a piece may start with (`/@:name`, `/~me`), as the path reader takes it
+            // (FEEDBACK53.md, Q-683; found in review).
+            Some(c) if is_path_char(c) || matches!(c, ':' | '*') => true,
             _ => {
                 let mut n = 1;
                 while matches!(self.lx.peek_char_at(n), Some(' ' | '\t')) {

@@ -162,7 +162,17 @@ impl Parts {
         let mut groups: Vec<(String, String, Vec<&(String, Arc<RouteDef>)>)> = Vec::new();
         for pr in &self.routes {
             let (prefix, r) = pr;
-            let shape = openapi_path(prefix, &r.path).0.split('/').map(|s| if s.starts_with('{') { "{}" } else { s }).collect::<Vec<_>>().join("/");
+            // A parameter after a prefix (`/@{name}`) is one shape whatever it is named too
+            // (FEEDBACK53.md, Q-683; found in review).
+            let shape = openapi_path(prefix, &r.path)
+                .0
+                .split('/')
+                .map(|s| match s.find('{') {
+                    Some(i) => format!("{}{{}}", &s[..i]),
+                    None => s.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("/");
             let method = r.method.to_ascii_lowercase();
             match groups.iter_mut().find(|(s, m, _)| *s == shape && *m == method) {
                 Some(g) => g.2.push(pr),
@@ -170,9 +180,25 @@ impl Parts {
             }
         }
         let mut paths = Map::new();
-        for (_, method, routes) in &groups {
+        // One template for a shape, whatever the method: `GET /u/:a` and `POST /u/:b` were the
+        // two paths `/u/{a}` and `/u/{b}`, which OpenAPI does not allow; the later takes the
+        // first's names, in order (found in review of FEEDBACK53.md, Q-683).
+        let mut named: std::collections::HashMap<String, (String, Vec<J>)> = std::collections::HashMap::new();
+        for (shape, method, routes) in &groups {
             let (prefix, first) = routes[0];
             let (path, mut params) = openapi_path(prefix, &first.path);
+            let path = match named.get(shape) {
+                Some((p, names)) => {
+                    for (param, name) in params.iter_mut().zip(names) {
+                        param["name"] = name.clone();
+                    }
+                    p.clone()
+                }
+                None => {
+                    named.insert(shape.clone(), (path.clone(), params.iter().map(|p| p["name"].clone()).collect()));
+                    path
+                }
+            };
             // A path parameter typed otherwise by another route: either type.
             for (_, r) in routes.iter().skip(1) {
                 let (_, other) = openapi_path(prefix, &r.path);

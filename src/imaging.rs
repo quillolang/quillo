@@ -176,11 +176,17 @@ fn make(src: &Path, dest: &Path, job: Job) -> Result<(u32, u32), String> {
             img = img.resize_exact(w, h, image::imageops::FilterType::Lanczos3);
         }
     }
+    // A folder is no file to write, said before anything is written beside it.
+    if dest.is_dir() {
+        return Err(format!("{}: Is a directory", dest.display()));
+    }
     if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     // Written beside, then renamed: a request never sees half a file.
-    let tmp = dest.with_extension(format!("tmp{}", std::process::id()));
+    // The whole name in it: `a.png` and `a.webp` made at once shared `a.tmp<pid>` (found in
+    // review of FEEDBACK53.md, Q-684).
+    let tmp = dest.with_file_name(format!("{}.tmp{}", dest.file_name().map_or(std::borrow::Cow::Borrowed("image"), |n| n.to_string_lossy()), std::process::id()));
     let out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
     let mut w = std::io::BufWriter::new(out);
     let encoded = match job.format {

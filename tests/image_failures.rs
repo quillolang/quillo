@@ -96,7 +96,8 @@ fn a_finished_image_that_has_nowhere_to_go_leaves_nothing_behind() {
 /// The place `image.convert` writes to before the rename, as a pipe whose
 /// reader goes away at once: each write past what a pipe holds then fails.
 fn stops_taking_bytes(dest: &Path) -> std::thread::JoinHandle<()> {
-    let tmp = dest.with_extension(format!("tmp{}", std::process::id()));
+    // The whole name, then `.tmp<pid>` (FEEDBACK53.md's review).
+    let tmp = dest.with_file_name(format!("{}.tmp{}", dest.file_name().unwrap().to_string_lossy(), std::process::id()));
     let c = CString::new(tmp.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
     std::thread::spawn(move || drop(std::fs::File::open(tmp).unwrap()))

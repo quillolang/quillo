@@ -177,3 +177,79 @@ fn sql_written_in_a_tag_is_sql_the_program_wrote() {
     // The program's own function named `sql` is not the tag.
     assert_eq!(diags("fn g(x) {\n    let sql = (s) => s + x\n    db.query(sql(\"select \") + \"1\")\n}\n").iter().filter(|d| d.contains(w)).count(), 1);
 }
+
+// What the review of these fixes found.
+#[test]
+fn the_reviews_cases_for_paths() {
+    // A template's or OpenAPI's parameter after what a piece may hold: said, not taken for the
+    // text `$` and a request pattern.
+    let e = run("route GET /users/${id} = 1");
+    assert!(e.contains("path parameters are written `:id`, as in `/:id`, not `${id}`"), "{}", e);
+    let e = run("route GET /p/@{name} = 1");
+    assert!(e.contains("path parameters are written `:name`, as in `/@:name`, not `@{name}`"), "{}", e);
+    // A request pattern after a space is one, as ever.
+    assert_eq!(diags("route POST /x { json: { a: int } } = a\n"), Vec::<String>::new());
+    // A typed parameter's prefix is part of what is checked: no false "never reached".
+    assert!(diags("route GET /:id(int) = id\nroute GET /~:id(int) = id\n").is_empty(), "{:?}", diags("route GET /:id(int) = id\nroute GET /~:id(int) = id\n"));
+    assert!(diags("route GET /:s(str) = s\nroute GET /~:t(str) = t\n").iter().any(|d| d.contains("never reached")));
+    // Groups at the top level whose path starts with what a piece may now hold, and a `%`
+    // escape in a fixed piece read as the request's is.
+    let d = dir("groups");
+    std::fs::write(
+        d.join("main.qwe"),
+        "routes /@:name {\n    route GET /posts = `posts of ${name}`\n}\nroutes /~me {\n    route GET /a = \"tilde\"\n}\nroute GET /a%20b = \"space\"\nroute GET /x%40y = \"at\"\n",
+    )
+    .unwrap();
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let get = |p: &str| support::send(s.port, "GET", p, &[], "").body;
+    assert_eq!(get("/@ann/posts"), "posts of ann");
+    assert_eq!(get("/~me/a"), "tilde");
+    assert_eq!(get("/a%20b"), "space");
+    assert_eq!(get("/x@y"), "at");
+    assert_eq!(get("/x%40y"), "at");
+    // One OpenAPI path for one shape, whatever its parameter is named.
+    std::fs::write(d.join("api.qwe"), "route GET /@:name ? { tab: str } = name\nroute POST /@:user = user\n").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_quillo")).args(["docs", "api.qwe"]).current_dir(&d).output().unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let paths: Vec<&String> = j["paths"].as_object().unwrap().keys().collect();
+    assert_eq!(paths, ["/@{name}"], "{}", j);
+}
+
+#[test]
+fn the_reviews_cases_for_scripts_escapes_and_sql() {
+    // What puts something in or not writes nothing when it does not.
+    let src = "let dev = false\nlet ld = { a: 1 }\nstr(<script type=\"application/ld+json\">{raw(json.stringify(ld))}{dev && raw(\",{}\")}{if dev { raw(\"x\") }}</script>)";
+    assert_eq!(run(src), "<script type=\"application/ld+json\">{\"a\":1}</script>");
+    assert_eq!(run("let on = true\nstr(<script>go({on && 1}, {if on { 2 }}, {false}, {null});</script>)"), "<script>go(1, 2, false, null);</script>");
+    // A component's script with a string in braces is told why, by `check` too.
+    let c = "component C() = <div><script>{\"console.log(1)\"}</script></div>\nroute GET / = <html><body><C/></body></html>\n";
+    assert!(diags(c).iter().any(|d| d.contains("a string in braces in a <script> is a value, written as JSON")), "{:?}", diags(c));
+    // `\/` is JavaScript's habit in `<\/script>`, not a regular expression's: no such advice.
+    let e = run("let s = \"<\\/script>\"");
+    assert!(e.contains("unknown escape `\\/` in string") && !e.contains("regular expression"), "{}", e);
+    // A program's own `sql`, at the top level, is not the tag.
+    let w = "`db.query` with SQL built from values";
+    let own = "let sql = (s) => s + (env(\"X\") ?? \"\")\nfn f() = db.query(sql(\"select 1\") + \" limit 1\")\n";
+    assert!(diags(own).iter().any(|d| d.contains(w)), "{:?}", diags(own));
+}
+
+#[test]
+fn two_formats_of_one_image_made_at_once_do_not_share_a_file() {
+    let d = dir("two");
+    image::RgbImage::new(8, 8).save(d.join("a.png")).unwrap();
+    let all: Vec<_> = ["out.png", "out.webp", "out.jpg"]
+        .iter()
+        .map(|name| {
+            let (d, name) = (d.clone(), name.to_string());
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    let r = run_in(&d, &format!("image.convert(\"a.png\", \"{}\", {{ width: 4 }})\nimage.info(\"{}\").format", name, name));
+                    assert_eq!(r, if name.ends_with("png") { "png" } else if name.ends_with("webp") { "webp" } else { "jpeg" }, "{}", name);
+                }
+            })
+        })
+        .collect();
+    for t in all {
+        t.join().unwrap();
+    }
+}

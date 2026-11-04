@@ -609,7 +609,9 @@ fn route_covers(e: &RouteDef, r: &RouteDef) -> bool {
             // goes on (FEEDBACK53.md, Q-683).
             (Seg::Param(_, None, p), Seg::Lit(l)) => l.strip_prefix(p.as_str()).is_some_and(|v| p.is_empty() || !v.is_empty()),
             (Seg::Param(_, None, p), Seg::Param(_, _, q)) => q.starts_with(p.as_str()),
-            (Seg::Param(_, Some(t), p), Seg::Param(_, Some(u), q)) => t == u && q.starts_with(p.as_str()),
+            // Typed, the prefix is part of the text checked: `/:id(int)` does not take `/~5`
+            // (found in review).
+            (Seg::Param(_, Some(t), p), Seg::Param(_, Some(u), q)) => t == u && (q == p || (t == "str" && q.starts_with(p.as_str()))),
             (Seg::Param(_, Some(t), p), Seg::Lit(l)) => l.strip_prefix(p.as_str()).is_some_and(|v| (p.is_empty() || !v.is_empty()) && crate::interp::coerce(t, v).is_some()),
             _ => false,
         };
@@ -5406,7 +5408,8 @@ impl Checker {
                     || (is_join(f) && matches!(args.as_slice(), [Expr::List(items), rest @ ..] if items.iter().chain(rest).all(|x| self.sql_safe(x))))
                     // `` sql`select ...` ``, the tag editors highlight, is the text written in it:
                     // `BASE + "where id = ?"` warned for good (FEEDBACK53.md, Q-029; branch main).
-                    || (matches!(&**f, Expr::Ident(n, _) if n == "sql" && !self.is_local(n)) && args.iter().all(|a| self.sql_safe(a)))
+                    || (matches!(&**f, Expr::Ident(n, _) if n == "sql" && !self.is_local(n) && self.globals.get("sql").is_some_and(|g| &*g.file == "<builtin>"))
+                        && args.iter().all(|a| self.sql_safe(a)))
             }
             Expr::Template(parts) => parts.iter().all(|p| matches!(p, TPart::Lit(_)) || matches!(p, TPart::Expr(e) if self.sql_safe(e))),
             Expr::Binary(BinOp::Add, a, b, _) => self.sql_safe(a) && self.sql_safe(b),
@@ -6025,6 +6028,12 @@ impl Checker {
                                 self.warn(format!("`{n}` is a value from the page shown in markup: the server has null for it, so the browser makes <{c}> again on each load. Write `state {n} = ...`, which is set once the component is on the page"));
                             }
                         }
+                    }
+                    // What `quillo run` refuses in a component's script, refused here too (found in
+                    // review of FEEDBACK53.md, Q-682).
+                    if el.tag == "script" && self.in_component().is_some() && matches!(x, Expr::Template(p) if matches!(p.as_slice(), [TPart::Expr(Expr::Lit(Lit::Str(_)))])) {
+                        self.line = el.line;
+                        self.error("a string in braces in a <script> is a value, written as JSON: write the code without the braces and quotes, as the script's own text");
                     }
                     let t = self.expr(x);
                     // React's function as children, or `{onClick}` for `{label}`: shown as nothing
