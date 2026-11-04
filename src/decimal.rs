@@ -537,10 +537,10 @@ impl Dec {
         if self.abs().cmp(one) == Ordering::Less {
             return one.div(self)?.pow_u(e);
         }
+        // Squaring only overflows.
         match self.pow_u(e) {
             Ok(p) => one.div(p),
-            Err(DecError::Overflow) => Ok(Dec::from_parts(false, 0, MAX_SCALE)),
-            Err(other) => Err(other),
+            Err(_) => Ok(Dec::from_parts(false, 0, MAX_SCALE)),
         }
     }
 

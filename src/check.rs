@@ -5276,11 +5276,9 @@ impl Checker {
         if !matches!(what.rsplit('.').next(), Some("exec" | "query" | "one")) {
             return;
         }
+        // Written out: a template without `${}` is read as text too.
         let sql = match args.first() {
             Some(Expr::Lit(Lit::Str(s))) => s.to_string(),
-            Some(Expr::Template(parts)) if parts.iter().all(|p| matches!(p, TPart::Lit(_))) => {
-                parts.iter().map(|p| if let TPart::Lit(t) = p { t.to_string() } else { String::new() }).collect()
-            }
             _ => return,
         };
         let [_, Expr::List(_)] = args else { return };

@@ -280,6 +280,9 @@ fn postgres_money_reads_with_its_currency_s_decimals() {
     let s = support::serve(&d.join("main.qwe"), &[]);
     let body = support::send(s.port, "GET", "/m", &[], "").body;
     assert!(body.contains("\"m\":\"500\""), "{}", body);
+    // Again, on a connection that has asked already.
+    let again = support::send(s.port, "GET", "/m", &[], "").body;
+    assert_eq!(again, body);
     assert!(body.contains("\"m\":\"-1234\""), "{}", body);
 }
 
@@ -336,6 +339,8 @@ fn the_money_type_holds_data_to_money_of_s_rules() {
     same_with(defs, "[kind(json.parse(`{\"amount\": \"2\", \"currency\": \"eur\"}`)), kind(json.parse(`{\"amount\": \"2.001\", \"currency\": \"eur\"}`)), kind(5)]",
         "[\"money €2.00\", \"other\", \"other\"]");
     same_with(defs, "cents(money.of(\"12.5\", \"USD\") ?? null)", "1250");
+    // A decimal amount from the program, in a record.
+    same_with("type Line = { item: str, price: money }", "Line({ item: \"a\", price: { amount: 2.5m, currency: \"usd\" } })", "{ item: \"a\", price: { amount: 2.50m, currency: \"USD\" } }");
     same_with(defs, "cents(json.parse(`{\"amount\": \"1.005\", \"currency\": \"USD\"}`))",
         "ERROR: argument `m` of `cents` must be money, got map { amount: \"1.005\", currency: \"USD\" }");
     same_with(defs, "cents(json.parse(`{\"amount\": 1.5, \"currency\": \"USD\"}`))",
@@ -377,6 +382,12 @@ fn a_money_pattern_says_which_rule_it_fails_under_watch() {
     assert!(!r.body.contains("1.5"), "{}", r.body);
     let r = support::send(s.port, "POST", "/pay", &[("content-type", "application/json")], r#"{"price": "5"}"#);
     assert!(r.body.contains("`json.price` must be money, { amount, currency }"), "{}", r.body);
+    // Money that is right, and another field that is not: that field is said.
+    let d = dir("why2", "route POST /pay { json: { price: money, qty: int } } = money.to_minor(price) * qty\n");
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+    let r = support::send(s.port, "POST", "/pay", &[("content-type", "application/json")], r#"{"price": {"amount": "1.50", "currency": "USD"}, "qty": "x"}"#);
+    assert_eq!(r.status, 400);
+    assert!(r.body.contains("`json.qty`"), "{}", r.body);
 }
 
 #[test]
@@ -613,7 +624,7 @@ fn money_parse_reads_an_amount_as_the_locale_writes_it() {
     for (text, code, loc) in [
         ("1.00", "EUR", "de-DE"), ("1234.5", "USD", "de-DE"), ("1,5", "USD", "en-US"), ("1,2345", "USD", "en-US"), ("12,34,567", "USD", "en-US"),
         ("", "USD", "en-US"), ("abc", "USD", "en-US"), ("$", "USD", "en-US"), ("1,", "USD", "en-US"), (",5", "USD", "en-US"), ("1,,000", "USD", "en-US"),
-        ("1e3", "USD", "en-US"), ("--5", "USD", "en-US"), ("5 £", "USD", "en-US"), ("1,23,4567", "INR", "en-IN"), ("١٢", "USD", "en-US"),
+        ("1e3", "USD", "en-US"), ("--5", "USD", "en-US"), ("1.", "USD", "en-US"), ("5.x", "USD", "en-US"), ("5 £", "USD", "en-US"), ("1,23,4567", "INR", "en-IN"), ("١٢", "USD", "en-US"),
     ] {
         same(&p(text, code, loc), &format!("err(\"not an amount: {}\")", format!("{:?}", text).replace('"', "\\\"")));
     }

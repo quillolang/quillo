@@ -1032,6 +1032,7 @@ mod tests {
         assert_eq!(display_digits("USD", 2), 2);
         assert!(['$', '\u{a2}', '\u{20ac}', '\u{20b9}', '\u{ffe5}', '\u{17db}'].iter().all(|c| is_currency_sign(*c)));
         assert!(['.', 'F', '/', '\u{17b8}', ' '].iter().all(|c| !is_currency_sign(*c)));
+        assert!(['\u{11fdd}', '\u{11fe0}', '\u{1e2ff}', '\u{1ecb0}'].iter().all(|c| is_currency_sign(*c)));
     }
 
     #[test]
