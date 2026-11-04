@@ -74,7 +74,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("int", "x", "A number cut toward zero, `true` as 1, or text of digits; `\"1.0\"` and a number too large for an int are error values."),
     ("float", "x", "A number or numeric text as a float; anything else is an error value."),
     ("dec", "x", "A decimal from text, an int, or a float through its shortest text; else an error value."),
-    ("format_number", "x, locale, digits, mode", "`x` as `locale` writes numbers (else the program's, or en-US), rounded to `digits` if given: a tie away from zero, or as `mode` says (`\"half_even\"`, as `money` rounds)."),
+    ("format_number", "x, locale, digits, mode", "`x` as `locale` writes numbers, to `digits` if given: a tie away from zero, or as `mode` says (`\"half_even\"` as money)."),
     ("len", "x", "A string's characters, a list's items, a map's keys, an `html` value's bytes; null is 0."),
     ("type_of", "x", "The name of `x`'s type: `int`, `str`, `list`, `map`, `null`, `error` and the like."),
     // Errors
@@ -87,7 +87,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("floor", "x", "`x` rounded down: an int from a float, a decimal from a decimal."),
     ("ceil", "x", "`x` rounded up: an int from a float, a decimal from a decimal."),
     ("sqrt", "x", "The square root, a float; `NaN` for a negative `x`, where `math.sqrt` is an error."),
-    ("pow", "x, y", "`x` to the power `y`: an int while both are ints, `y` is not negative and it fits; a decimal to an int's power, a decimal; else a float."),
+    ("pow", "x, y", "`x` to the power `y`: an int for ints (`y` >= 0, if it fits), a decimal for a decimal to an int's power, else a float."),
     // Randomness
     ("random", "", "A float from 0 up to but not including 1; fast but predictable, so not for secrets."),
     ("random_int", "lo, hi", "An int from `lo` to `hi`, both included; fast but predictable, so not for secrets."),
@@ -262,7 +262,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("money.allocate", "m, ratios", "`m` split by a list of ratios, or into `ratios` equal parts, the shares adding up exactly."),
     ("money.round", "m, mode", "An amount rounded to the currency's decimals, half to even unless `mode` says."),
     ("money.minor_units", "currency", "How many decimals the currency has (JPY 0, USD 2); an unknown one is an error value."),
-    ("money.parse", "text, currency, locale, mode", "An amount as `locale` writes it, for a form: `money.parse(\"1.234,50 €\", \"EUR\", \"de-DE\")` is 1234.50 euros; bad text is an error value."),
+    ("money.parse", "text, currency, locale, mode", "An amount as `locale` writes it, for a form: `\"1.234,50 €\"` in de-DE is 1234.50 euros; bad text is an error value."),
     ("money.format", "m, locale", "The amount as `locale` writes it: `$1,234.50`; else the program's locale, or en-US."),
     // math
     ("math.sqrt", "x", "The square root; a negative `x` is an error, where `sqrt` gives `NaN`."),
