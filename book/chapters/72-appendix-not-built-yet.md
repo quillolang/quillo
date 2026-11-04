@@ -11,7 +11,7 @@
 - in the browser, a map's keys that look like integers keep their order of insertion:
   there `keys({ "10": 1, "2": 2 })` is `["2", "10"]`, as JavaScript orders them
 - Linux builds linked with musl, or static: not planned, since a static binary cannot
-  load plugins. The releases from the next tag on are linked against glibc 2.17 instead
+  load plugins. The releases from 0.7.0 on are linked against glibc 2.17 instead
 - a catalog whose entries are signed, its plugins prebuilt for Linux, and `//! effects:`
   on each of them; a policy that allows catalog plugins only (`local = false`)
 - `quillo run --sandbox` (seccomp and Landlock on Linux), and plugins built to

@@ -14,11 +14,11 @@ of your own, see [Hosting](#hosting).
 | **Processes** | nothing keeps one of yours running; processes started by hand or by cron are often killed | let the web server start the program: `mod_fcgid` starts it, keeps it up while requests come, and stops it when idle |
 | **Rust** | not installed | build the `.qwer` files elsewhere, upload them built, and start it with `quillo fcgi main.qwe --no-build` (an option, as for `quillo run`: see [the options](#running-quillo)) |
 | **Limits** | CloudLinux's LVE: processes (`NPROC`, which counts threads, for the whole account) and requests at once (`EP`; over it, visitors get a 508 page from the host) | `quillo fcgi main.qwe --workers 8` or so |
-| **System** | AlmaLinux, CloudLinux or CentOS 7 and 8, with old glibc | the Linux releases from the next tag on, linked against glibc 2.17 |
+| **System** | AlmaLinux, CloudLinux or CentOS 7 and 8, with old glibc | the Linux releases from 0.7.0 on, linked against glibc 2.17 |
 
 ## The binary
 
-The Linux releases from the next tag on are linked against glibc 2.17. They start on
+The Linux releases from 0.7.0 on are linked against glibc 2.17. They start on
 CentOS 7, CloudLinux 7 and 8, AlmaLinux 8 and every newer system. Releases up to 0.6.0
 need glibc 2.35. They are glibc builds, not static ones, because a plugin is a library
 the binary loads, and a static binary cannot load one.
