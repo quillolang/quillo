@@ -80,7 +80,11 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   under another name: `import x.qwer use len as x_len` (FEEDBACK27.md, Q-326).
 - `quillo check` reads the functions' types from the Rust, without building anything:
   calls are checked, and editors show them on hover. The language server also runs
-  `cargo check` on each save of a `.qwer` file, and shows Rust's errors in the editor.
+  `cargo check` on each save of a `.qwer` file, and shows Rust's errors in the editor, in
+  a folder the editor says it trusts: `cargo check` runs the dependencies' build scripts
+  and macros, so a cloned repository's `.qwer` could run code as it was opened *(since
+  0.7)*. The VS Code extension says so from its Workspace Trust; another editor gives the
+  server `initializationOptions: { "trusted": true }` for folders of your own.
   They run on the server only (in services and mounted programs too); components call
   them through a `server fn`.
 - A Rust function cannot call back into Quillo: no `db`, `publish` or `env()` (it reads
