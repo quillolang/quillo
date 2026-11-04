@@ -146,9 +146,13 @@ fn route_groups_take_prefix_middleware_and_pattern() {
     let mut it = app(
         r#"
 let seen = []
-fn note(r) { seen = seen | push(r.path) }
+// Middleware gives the request back to go on; null answers 404 (FEEDBACK51.md, Q-651).
+fn note(r) {
+    seen = seen | push(r.path)
+    r
+}
 fn signed(r) = r.headers.authorization == "Bearer ok" ? r : reply 401 "sign in first"
-fn admins(r) = r.headers["x-role"] == "admin" ? null : redirect("/login")
+fn admins(r) = r.headers["x-role"] == "admin" ? r : redirect("/login")
 route GET / = "home"
 routes /admin | note | signed | admins {
     route GET / = "admin home"

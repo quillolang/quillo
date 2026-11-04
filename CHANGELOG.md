@@ -18,9 +18,9 @@ From the security review (FEEDBACK51.md, Q-640 to Q-676):
   (Q-642, Q-643). Pages make at most 1,024 streams, 256 a tenant, and watch 32 each; a
   stream keeps 32 MiB of video, all of them 256 MiB.
 - **A middleware that gives a map other than the request is a 500** naming it: `{ error:
-  "bad api key" }` let the route run. The request, a copy of it (`merge(r, ...)`) and null
-  go on, as before; `quillo check` warns about an `if` with no `else` after a `return r`,
-  which lets everyone else in (Q-651).
+  "bad api key" }` let the route run. **One that gives null says its routes do not match**:
+  `if root { return r }` let everyone else in; now the next route is tried, and with none it
+  is a 404. `quillo check` refuses a middleware that can only give null (Q-651).
 - **An `accept_calls` `check` accepts only with `true` or a caller map**; null (an `if` with
   no `else`) refused nobody (Q-652). **A visitor's token is not a service caller's**: a JWT
   whose `sub` is a user, not the client, is refused (Q-665). **A remembered service answer
@@ -65,9 +65,12 @@ From the security review (FEEDBACK51.md, Q-640 to Q-676):
 - **`quillo lsp` compiles a `.qwer` only when it is saved, in a folder the editor says it
   trusts** (`initializationOptions.trusted`; the VS Code extension sends it) (Q-653).
 
-- **A group's middleware lets the route go on only by giving the request back, or null.**
-  `false` now answers 403, an error value answers as a route's error, and `true` or text is
-  a 500 naming the middleware; all of them let the route run before. A predicate middleware
+- **A group's middleware lets the route go on only by giving the request back** (or a copy
+  of it, `merge(r, ...)`). Null says the group's routes do not match, as a pattern that
+  misses: the next route is tried, and with none it is a 404. `false` now answers 403, an
+  error value answers as a route's error, and `true`, text or another map is a 500 naming the
+  middleware; all of them let the route run before. A middleware that only logs ends with
+  `r` (FEEDBACK51.md, Q-651). A predicate middleware
   (`fn is_admin(r) = ...`) is written `(r) => is_admin(r) ? r : reply 403 "..."`;
   `quillo check` says so (FEEDBACK47.md, Q-534).
 - **Typed path, query and form values take their type written one way**: `05`, `+5`,

@@ -611,6 +611,8 @@ impl Interp {
         // The first route whose method and path took the request, and the pattern it missed,
         // for what the 400 says (FEEDBACK47.md, Q-544).
         let mut closest: Option<(Arc<crate::ast::RouteDef>, crate::ast::Pattern, Value, &'static str, Mode)> = None;
+        // The groups whose middleware gave null (see `no_match_of`).
+        let mut excluded: Vec<Vec<(Option<Arc<str>>, u32)>> = Vec::new();
         // The methods the path takes, for `Allow` (FEEDBACK36.md, Q-440; branch feedback36-39).
         let mut allowed: Vec<&str> = Vec::new();
         let routes = self.routes.clone();
@@ -700,6 +702,14 @@ impl Interp {
             self.route_limit = r.limit.clone();
             let ran = self.under_route(|it| if crate::debug::on() { it.debug_route(&r, &scope) } else { it.eval(&r.body, &scope) });
             self.cur_file = file;
+            // A middleware gave null: its group's routes do not match, and the next route is
+            // tried (FEEDBACK51.md, Q-651).
+            if let Some(group) = no_match_of(&r, &ran) {
+                excluded.push(group);
+                self.current_request = None;
+                self.pending_request = None;
+                continue;
+            }
             let resp = finish(crate::interp::in_file(ran, &r.file));
             // The page's components will need the locale (see `handle`).
             if self.rendered_island && self.site.i18n.is_some() {
@@ -714,8 +724,33 @@ impl Interp {
         // Under a guarded group, its middleware first: a stranger learns nothing of what is
         // there, its paths, methods and parameters, from the server's own answers (FEEDBACK47.md,
         // Q-539; branch feedback40-43).
-        if let Some(refused) = self.guard_first(&routes, req, path, &segs, &query_v) {
+        if let Some(refused) = self.guard_first(&routes, req, path, &segs, &query_v, &mut excluded) {
             return refused;
+        }
+        // The groups whose middleware said their routes do not match: the server answers as if
+        // they were not there, a 404 where no other route has the path, and no `Allow` naming
+        // theirs (FEEDBACK51.md, Q-651).
+        if !excluded.is_empty() {
+            let out = |r: &crate::ast::RouteDef| {
+                let calls = middleware_calls(r);
+                excluded.iter().any(|g| calls.starts_with(g))
+            };
+            (path_matched, method_matched) = (false, false);
+            allowed.clear();
+            for r in routes.iter().filter(|r| r.method != crate::ast::GUARD_METHOD && !out(r)) {
+                if match_path(&r.path, &segs).is_none() {
+                    continue;
+                }
+                path_matched = true;
+                if r.method != "ANY" && r.method != method {
+                    allowed.push(r.method.as_str());
+                } else {
+                    method_matched = true;
+                }
+            }
+            if closest.as_ref().is_some_and(|c| out(&c.0)) {
+                closest = None;
+            }
         }
         if method_matched {
             // Which route came closest, and its first miss: in the log always, and under `--watch`
@@ -758,7 +793,15 @@ impl Interp {
 impl Interp {
     /// The middleware of the innermost guarded group whose path the request is under, when no
     /// route answered it: its answer if it refuses, else none, and the server's answer stands.
-    fn guard_first(&mut self, routes: &[Arc<crate::ast::RouteDef>], req: &HttpRequest, path: &str, segs: &[String], query_v: &Value) -> Option<HttpResponse> {
+    fn guard_first(
+        &mut self,
+        routes: &[Arc<crate::ast::RouteDef>],
+        req: &HttpRequest,
+        path: &str,
+        segs: &[String],
+        query_v: &Value,
+        excluded: &mut Vec<Vec<(Option<Arc<str>>, u32)>>,
+    ) -> Option<HttpResponse> {
         // Every guarded group the request is under, outer and inner, overlapping or not, each
         // in the order declared: the first that refuses answers (found in review: only the
         // first was asked). A group's own request pattern, a host's, says whether it is under it.
@@ -770,6 +813,11 @@ impl Interp {
         for r in routes.iter().filter(|r| r.method == crate::ast::GUARD_METHOD) {
             let own = guard_calls(r);
             if ran.iter().any(|inner| inner.len() > own.len() && inner[..own.len()] == own[..]) {
+                continue;
+            }
+            // A group a middleware already said the request is not for, or one inside it: not
+            // asked again (Q-651).
+            if excluded.iter().any(|g| own.starts_with(g)) {
                 continue;
             }
             // Its parameters typed when they are of their type, as the middleware expects them
@@ -816,6 +864,10 @@ impl Interp {
             let answered = self.under_route(|it| it.eval(&r.body, &scope));
             self.cur_file = file;
             self.current_request = None;
+            if let Some(group) = no_match_of(r, &answered) {
+                excluded.push(group);
+                continue;
+            }
             if answered.is_err() {
                 return Some(finish(crate::interp::in_file(answered, &r.file)));
             }
@@ -823,6 +875,39 @@ impl Interp {
         }
         None
     }
+}
+
+/// What `__answer` gives for a middleware's null: no answer, but that the routes of the group
+/// whose middleware is at `line` do not match (see `Interp::handle_inner`; FEEDBACK51.md, Q-651).
+pub(crate) fn no_match(line: u32) -> crate::value::Response {
+    crate::value::Response { status: 0, headers: vec![(NO_MATCH.into(), line.to_string())], body: crate::value::Body::Value(Value::Nil) }
+}
+
+const NO_MATCH: &str = "x-quillo-no-match";
+
+/// The group a middleware's null came from, as the calls of its middleware down to that one:
+/// none if `ran` is no such null.
+fn no_match_of(r: &crate::ast::RouteDef, ran: &Result<Value, Ctrl>) -> Option<Vec<(Option<Arc<str>>, u32)>> {
+    let Err(Ctrl::Reply(resp)) = ran else { return None };
+    if resp.status != 0 {
+        return None;
+    }
+    let line: u32 = resp.headers.iter().find(|(k, _)| k == NO_MATCH).and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
+    let calls = middleware_calls(r);
+    let upto = calls.iter().position(|c| c.1 == line).map_or(calls.len(), |i| i + 1);
+    Some(calls[..upto].to_vec())
+}
+
+/// A route's middleware calls, those of its groups that start its body, by their file and line.
+fn middleware_calls(r: &crate::ast::RouteDef) -> Vec<(Option<Arc<str>>, u32)> {
+    let crate::ast::Expr::Block(stmts) = &r.body else { return Vec::new() };
+    stmts
+        .iter()
+        .map_while(|s| match s {
+            crate::ast::Stmt::Expr(crate::ast::Expr::Call(f, _, line)) if matches!(&**f, crate::ast::Expr::Ident(n, _) if &**n == "__answer") => Some((r.file.clone(), *line)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A guard route's middleware calls, by their file and line.

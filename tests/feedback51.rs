@@ -414,9 +414,10 @@ fn a_page_follows_no_other_tenants_topics() {
 }
 
 // Q-651: middleware let the route go on for any map: `{ error: "bad api key" }`, the way a
-// refusal is written as JSON, gave the secret. The request, a copy of it, and null go on, as
-// decided for Q-534; `quillo check` warns about an `if` that ends with no value after a
-// `return r`, which lets everyone else in.
+// refusal is written as JSON, gave the secret; and for null, so a guard that ends with no
+// value (`if root { return r }`) let in everyone it was written to keep out. The request, or a
+// copy of it, goes on; null says the group's routes do not match, and the next route is tried
+// (decided 2026-11-04).
 #[test]
 fn middleware_lets_the_route_go_on_only_with_the_request() {
     let src = r#"fn api_key(r) = r.headers["x-api-key"] == "k3y" ? r : { error: "bad api key" }
@@ -429,40 +430,52 @@ fn logs(r) {
     print(r.path)
 }
 fn copied(r) = { ...r, seen: true }
-fn not_banned(r) {
-    if r.headers["x-user"] == "eve" {
-        return false
-    }
-}
 fn fine(r) = r.headers["x"] == "1" ? r : false
 routes /api | api_key { route GET /secret = { data: "SECRET-API" } }
-routes /admin | admins { route GET /x = "admin" }
+routes /admin | admins {
+    route GET /x = "admin"
+    route GET /only = "admin only"
+    routes /deep | fine { route GET /y = "deep" }
+}
+route GET /admin/x = "the public page"
 routes /log | logs { route GET /x = "log" }
 routes /copy | copied { route GET /x = "copy" }
 routes /ok | fine { route GET /x = "ok" }
-routes /lambda | (r) => { if r.headers["x"] == "1" { return r } } { route GET /x = "lambda" }
-routes /open | not_banned { route GET /x = "open" }
 "#;
     let diags: Vec<String> = quillo::check::check_source(src, "t.qwe", Path::new(".")).diagnostics.iter().map(|d| format!("{} {}", d.line, d.message)).collect();
-    let warned = |line: &str, who: &str| diags.iter().any(|d| d.starts_with(line) && d.contains(&format!("`{}` can end with no value, and null lets the request go on", who)));
-    assert!(warned("18 ", "admins"), "{:?}", diags);
-    assert!(warned("22 ", "the middleware") || warned("22 ", "this middleware"), "{:?}", diags);
-    // Logging that gives nothing back, as before, and the others: nothing said.
-    assert_eq!(diags.iter().filter(|d| d.contains("can end with no value")).count(), 2, "{:?}", diags);
-    let d = dir("middleware", src);
+    // A middleware that can only give null leaves its routes never matching: refused.
+    assert!(diags.iter().any(|d| d.starts_with("19 ") && d.contains("`logs` gives null")), "{:?}", diags);
+    assert_eq!(diags.len(), 1, "{:?}", diags);
+    let d = dir("middleware", &src.replace("routes /log | logs { route GET /x = \"log\" }\n", ""));
     let s = support::serve(&d.join("main.qwe"), &[]);
-    let get = |p: &str, h: &[(&str, &str)]| support::send(s.port, "GET", p, h, "");
+    let send = |m: &str, p: &str, h: &[(&str, &str)]| support::send(s.port, m, p, h, "");
+    let get = |p: &str, h: &[(&str, &str)]| send("GET", p, h);
     let r = get("/api/secret", &[]);
     assert_eq!(r.status, 500, "{}", r.body);
     assert!(!r.body.contains("SECRET"), "{}", r.body);
     assert_eq!(get("/api/secret", &[("x-api-key", "k3y")]).body, r#"{"data":"SECRET-API"}"#);
-    assert_eq!(get("/admin/x", &[("x-user", "root")]).body, "admin");
-    assert_eq!(get("/log/x", &[]).body, "log");
+    // Root: the group's routes. Anyone else: the next route of the path, or none.
+    let root = [("x-user", "root")];
+    assert_eq!(get("/admin/x", &root).body, "admin");
+    assert_eq!(get("/admin/x", &[]).body, "the public page");
+    assert_eq!(get("/admin/only", &root).body, "admin only");
+    let r = get("/admin/only", &[]);
+    assert_eq!((r.status, r.body.as_str()), (404, "not found\n"));
+    assert_eq!(send("HEAD", "/admin/only", &[]).status, 404);
+    // Nothing is said of the group: no 405 and its `Allow` for another method, nor what is
+    // inside it, an inner group's routes included.
+    let r = send("POST", "/admin/only", &[]);
+    assert_eq!(r.status, 404, "{:?}", r.headers);
+    assert_eq!(send("POST", "/admin/only", &root).status, 405);
+    assert_eq!(get("/admin/deep/y", &[("x", "1")]).status, 404);
+    assert_eq!(get("/admin/deep/y", &[("x", "1"), ("x-user", "root")]).body, "deep");
+    assert_eq!(get("/admin/deep/y", &root).status, 403);
+    assert_eq!(get("/admin/nothing", &[]).status, 404);
+    assert_eq!(get("/admin/nothing", &root).status, 404);
+    // A copy of the request goes on; `false` is a 403.
     assert_eq!(get("/copy/x", &[]).body, "copy");
     assert_eq!(get("/ok/x", &[("x", "1")]).body, "ok");
     assert_eq!(get("/ok/x", &[]).status, 403);
-    assert_eq!(get("/open/x", &[]).body, "open");
-    assert_eq!(get("/open/x", &[("x-user", "eve")]).status, 403);
 }
 
 /// `quillo run` with these arguments and this environment, once it listens.

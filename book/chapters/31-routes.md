@@ -259,11 +259,17 @@ routes /reports | signed_in with db {               // what its routes may do, a
   adds nothing.
 - **Middleware** (each after a `|`, as in a pipeline) is called with the request before
   the route's body, outer groups' first, in the order written. It lets the route go on by
-  giving the request back (as `auth.required` does) or null. Anything else stops it: a
-  `reply` in it, or a response it gives back (`redirect(...)`, `respond(...)`), answers in
-  the route's place; `false` answers 403, an error value answers as a route's error does,
-  and any other value (`true`, text) is a 500 that names the middleware *(since 0.7: these
-  let the route run)*. So a check is written `(r) => ok(r) ? r : reply 403 "..."`, not as a
+  giving the request back (as `auth.required` does), or a copy of it (`merge(r, ...)`).
+  **Null says the group's routes do not match**, as a request pattern that misses: the
+  next route is tried, and with none the server answers as if they were not there (a 404,
+  where no other route has the path). So a guard that ends with no value (`if root {
+  return r }`) keeps out everyone else and tells them nothing, and a later route of the
+  same path can answer them. Anything else stops it: a `reply` in it, or a response it
+  gives back (`redirect(...)`, `respond(...)`), answers in the route's place; `false`
+  answers 403; an error value answers as a route's error does; and any other value
+  (`true`, text, another map such as `{ error: "no" }`) is a 500 that names the middleware
+  *(since 0.7: these let the route run, null and maps too)*. A middleware that only logs
+  ends with `r`. So a check is written `(r) => ok(r) ? r : reply 403 "..."`, not as a
   predicate, and `quillo check` says so when a middleware can only be a `bool` or text.
   What it gives does not reach the route: a route that needs the user reads it again
   (`session()`, `me()`). It is given the request as sent, whatever the route's patterns

@@ -2759,17 +2759,20 @@ fn answer_with(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let given = args.next().unwrap_or(Value::Nil);
     let name = args.next().map(|n| n.display()).unwrap_or_else(|| "the middleware".into());
     // The request it was given, or a copy of it (`merge(r, ...)`, whose headers are the
-    // request's own), lets the route go on, and null, as decided for Q-534. Any map did: a
-    // refusal written as JSON, `{ error: "bad api key" }`, let everyone in (FEEDBACK51.md,
-    // Q-651; branch feedback51-fixes).
+    // request's own), lets the route go on. Any map did: a refusal written as JSON, `{ error:
+    // "bad api key" }`, let everyone in; and so did null, so a guard that ends with no value
+    // (an `if` that gives the request back, and nothing else) let in everyone it was written to
+    // keep out. Null now says the group's routes do not match, as a pattern that misses: the
+    // next route is tried, and with none the server answers as if they were not there
+    // (FEEDBACK51.md, Q-651; decided 2026-11-04; branch feedback51-fixes).
     let itself = match (&given, &it.current_request) {
         (Value::Map(m), Some(Value::Map(r))) => Arc::ptr_eq(m, r) || matches!((m.get("headers"), r.get("headers")), (Some(Value::Map(a)), Some(Value::Map(b))) if Arc::ptr_eq(a, b)),
         _ => false,
     };
     match given {
         Value::Response(r) => Err(Ctrl::Reply(r)),
-        Value::Nil => Ok(Value::Nil),
         _ if itself => Ok(Value::Nil),
+        Value::Nil => Err(Ctrl::Reply(Arc::new(crate::server::no_match(line)))),
         Value::Map(_) => fail(
             line,
             format!("`{}` gave a map that is not the request it was given: middleware gives back the request to let the route go on, or an answer to stop it (`reply 403 {{ error: ... }}`)", name),
@@ -2783,7 +2786,7 @@ fn answer_with(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         other => fail(
             line,
             format!(
-                "`{}` gave {}: middleware gives back the request to let the route go on (or null), or an answer to stop it (`reply`, `respond`, `redirect`); `false` refuses with a 403",
+                "`{}` gave {}: middleware gives back the request to let the route go on, or an answer to stop it (`reply`, `respond`, `redirect`); `false` refuses with a 403, and null says the route does not match",
                 name,
                 other.type_name()
             ),

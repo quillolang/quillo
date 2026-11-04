@@ -74,12 +74,13 @@ routes /always | always { route GET /x = "secret" }
 "#,
     );
     let admin = [("x-role", "admin")];
-    for (group, status) in [("text", 500), ("err", 500), ("false", 403), ("null", 200), ("reply", 401), ("respond", 418), ("true", 500), ("changed", 200)] {
+    // Null: the group's routes do not match, and no other route has the path (FEEDBACK51.md,
+    // Q-651, which changed it from going on).
+    for (group, status) in [("text", 500), ("err", 500), ("false", 403), ("null", 404), ("reply", 401), ("respond", 418), ("true", 500), ("changed", 200)] {
         let r = get(&mut it, &format!("/{}/x", group), &[]);
         assert_eq!(r.status, status, "{}: {}", group, r.text());
-        // Null and the request given back let the route go on, as the user decided; nothing
-        // else does.
-        if !matches!(group, "null" | "changed") {
+        // The request given back, or a copy of it, lets the route go on; nothing else does.
+        if group != "changed" {
             assert_ne!(r.text(), "secret", "{} let a stranger in", group);
         }
         // An admin goes on, whatever the group.
@@ -97,7 +98,7 @@ routes /always | always { route GET /x = "secret" }
 fn check_refuses_middleware_that_can_only_be_a_predicate_or_text() {
     assert_eq!(
         diags("fn admin(r) = r.headers[\"x-role\"] == \"admin\"\nroutes /a | admin { route GET /x = 1 }\n"),
-        ["2 `admin` gives bool: middleware gives back the request to let the route go on, or an answer to stop it; a check is written `(r) => ok(r) ? r : reply 403 \"...\"`"]
+        ["2 `admin` gives bool: middleware gives back the request to let the route go on (null: the route does not match), or an answer to stop it; a check is written `(r) => ok(r) ? r : reply 403 \"...\"`"]
     );
     assert_eq!(diags("fn note(r) = \"seen\"\nroutes /a | note { route GET /x = 1 }\n").len(), 1);
     // A factory's middleware, by its name and its call.
@@ -564,7 +565,10 @@ fn an_overlapping_group_asks_as_a_nested_one_does_not_twice() {
     let mut it = app(
         r#"
 let seen = []
-fn note(r) { seen = seen | push(r.path) }
+fn note(r) {
+    seen = seen | push(r.path)
+    r
+}
 fn auth(r) = r.headers.ok == "1" ? r : reply 403 "no"
 routes /api/v2 | note { route GET /x = "v2" }
 routes /api | auth { route GET /y = "y" }

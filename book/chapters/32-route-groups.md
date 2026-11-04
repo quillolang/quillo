@@ -51,12 +51,25 @@ What a middleware gives back decides what happens:
   sends the visitor to the login page, `reply 401 { error: "..." }` answers JSON.
 - **A response value**, from `respond(...)` or `redirect(...)` returned rather than
   replied, answers the request too.
-- **The request, a copy of it (`merge(r, ...)`), or null,** lets the route run. Giving
-  the request back is the convention, so the same function works as a pipeline stage
-  inside a route (`request | signed_in | ...`) and as a group's middleware. Null goes on
-  too, so `quillo check` warns about a middleware that gives the request back in one
-  place and can end with no value in another (an `if` with no `else` after a `return
-  r`): whoever reaches that end is let in.
+- **The request, or a copy of it (`merge(r, ...)`),** lets the route run. Giving the
+  request back is the convention, so the same function works as a pipeline stage inside a
+  route (`request | signed_in | ...`) and as a group's middleware. A middleware that only
+  logs ends with `r`.
+- **Null says the group's routes do not match** *(since 0.7: null let the route run)*, as
+  a request pattern that misses: the next route is tried, and with none the server
+  answers as if they were not there, a 404 where no other route has the path. So a guard
+  that ends with no value keeps out everyone it does not give the request back for:
+
+  ```quillo noexec
+  fn admins(r) {
+      if session().user == "root" { return r }
+  }
+  routes /admin | admins { route GET /users = db.query("select email from users") }
+  route GET /admin/users = "Admins only."     // what everyone else gets
+  ```
+
+  `quillo check` refuses a middleware that can only give null: its routes would never
+  match.
 - **Anything else** stops it *(since 0.7: these let the route run)*: `false` answers
   403, an error value answers as a route's error does, and any other value (`true`,
   text, a map other than the request, `{ error: "bad api key" }`) is a 500 that names

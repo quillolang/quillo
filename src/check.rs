@@ -2516,8 +2516,9 @@ impl Checker {
             }
             // An earlier route with no pattern takes every request this one would: the first
             // that matches answers. Dangerous when this one is in a guarded group and that one is
-            // not, as a page left from before the group was added.
-            if let Some((efile, e)) = routes[..i].iter().find(|(_, e)| route_covers(e, r)) {
+            // not, as a page left from before the group was added. Not one with middleware, whose
+            // null says it does not match, and the next route is tried (FEEDBACK51.md, Q-651).
+            if let Some((efile, e)) = routes[..i].iter().find(|(_, e)| route_covers(e, r) && middleware_of(e).is_none()) {
                 let mine = middleware_of(r);
                 let theirs = middleware_of(e);
                 let unguarded = match (&mine, &theirs) {
@@ -5750,36 +5751,17 @@ impl Checker {
         // stops every request: a predicate's `true` is a 500 (FEEDBACK47.md, Q-534).
         if sig.builtin && name == "__answer" {
             let t = args.first().copied().unwrap_or(T::ANY);
-            if t.bits != 0 && !t.vague() && t.bits & (MAP | NIL | RESP | ERR) == 0 {
+            // Null too, which says the group's routes do not match (FEEDBACK51.md, Q-651): a
+            // middleware that only logs, and gives nothing back, leaves them never matching.
+            if t.bits != 0 && !t.vague() && t.bits & (MAP | RESP | ERR) == 0 {
                 let who = match arg_exprs.get(1) {
                     Some(Expr::Lit(Lit::Str(s))) => s.to_string(),
                     _ => "this middleware".to_string(),
                 };
                 self.error(format!(
-                    "`{}` gives {}: middleware gives back the request to let the route go on, or an answer to stop it; a check is written `(r) => ok(r) ? r : reply 403 \"...\"`",
+                    "`{}` gives {}: middleware gives back the request to let the route go on (null: the route does not match), or an answer to stop it; a check is written `(r) => ok(r) ? r : reply 403 \"...\"`",
                     who,
                     bits_text(t.bits)
-                ));
-            }
-            // Null goes on (Q-534), so a middleware that gives the request back in one place and
-            // can end with no value in another, an `if` with no `else` last, lets in whoever
-            // reaches that end (FEEDBACK51.md, Q-651; branch feedback51-fixes).
-            let falls_through = match arg_exprs.first() {
-                Some(Expr::Call(f, _, _)) => match &**f {
-                    Expr::Ident(n, _) if !self.is_local(n) => self.bodies.get(&**n).is_some_and(|d| ends_without_value(&d.body) && d.params.first().is_some_and(|p| returns_name(&d.body, &p.name))),
-                    Expr::Lambda(d) => ends_without_value(&d.body) && d.params.first().is_some_and(|p| returns_name(&d.body, &p.name)),
-                    _ => false,
-                },
-                _ => false,
-            };
-            if falls_through {
-                let who = match arg_exprs.get(1) {
-                    Some(Expr::Lit(Lit::Str(s))) => s.to_string(),
-                    _ => "this middleware".to_string(),
-                };
-                self.warn(format!(
-                    "`{}` can end with no value, and null lets the request go on: end it with `false` or a `reply` where it should not",
-                    who
                 ));
             }
         }
@@ -6367,41 +6349,6 @@ fn exits(e: &Expr) -> bool {
 
 fn is_view(d: &FnDef) -> bool {
     d.name.chars().next().map_or(false, |c| c.is_uppercase())
-}
-
-/// Whether `return name` is somewhere in a function's body, outside the functions in it: a
-/// middleware that gives the request back there, and may end with nothing elsewhere. One that
-/// gives `false` there and nothing at its end lets the rest in on purpose (found in review).
-fn returns_name(body: &Expr, name: &str) -> bool {
-    match body {
-        Expr::Block(stmts) => stmts.iter().any(|s| match s {
-            Stmt::Return(Some(Expr::Ident(n, _)), _) => &**n == name,
-            Stmt::Expr(e) => returns_name(e, name),
-            _ => false,
-        }),
-        Expr::If(_, then, other) => returns_name(then, name) || other.as_deref().is_some_and(|o| returns_name(o, name)),
-        Expr::For(_, _, b, _) | Expr::While(_, b, _) => returns_name(b, name),
-        _ => false,
-    }
-}
-
-/// Whether a function's body can end with no value: an `if` with no `else` last, a loop or a
-/// `let` last, nothing at all (Q-651).
-fn ends_without_value(body: &Expr) -> bool {
-    match body {
-        Expr::Block(stmts) => match stmts.last() {
-            None => true,
-            Some(Stmt::Expr(e)) => ends_without_value(e),
-            Some(Stmt::Return(e, _)) => e.is_none(),
-            Some(Stmt::Let(..) | Stmt::Assign(..) | Stmt::SetField(..)) => true,
-            Some(_) => false,
-        },
-        // When the test fails it ends there, whatever the branch does.
-        Expr::If(_, _, None) => true,
-        Expr::If(_, then, Some(other)) => ends_without_value(then) || ends_without_value(other),
-        Expr::For(..) | Expr::While(..) => true,
-        _ => false,
-    }
 }
 
 fn route_path(r: &RouteDef) -> String {
