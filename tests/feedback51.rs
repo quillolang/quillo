@@ -842,9 +842,10 @@ route GET /maps = `${{ a: 1 } == { b: 1 }} ${{ a: [1] } == { a: [1] }} ${{ a: 1 
     // And the server still answers.
     assert_eq!(get("/eq/2").body, "true false");
     // As JSON, past 10,000 levels a value is null, there too. On a stack of a request's size,
-    // 16 MiB: a test's own is 2.
+    // 16 MiB: a test's own is 2. A debug build's frames are larger, and its `to_json` of 10,001
+    // levels needs more (found by CI's runtime.js coverage run, a debug build; Q-661's open part).
     std::thread::Builder::new()
-        .stack_size(16 << 20)
+        .stack_size(if cfg!(debug_assertions) { 64 << 20 } else { 16 << 20 })
         .spawn(|| {
             let mut v = quillo::Value::Int(7);
             for _ in 0..10_050 {
