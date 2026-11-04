@@ -314,21 +314,21 @@ for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; 
 
 ### Test coverage
 
-**Rust: 98.85% of lines** run under the tests (50,288 lines, 577 not run), **97.22% of
-regions** (120,880, 3,360 not run).
-**Browser runtime (`src/client/runtime.js`): 99.85% of lines** (4,626 lines, 7 not run).
-Both were measured together on 2026-11-03 on main (0.7.0-dev, with FEEDBACK45 and 46) on
-macOS, from 2,540 tests with Chrome, PostgreSQL and MariaDB included; 2 failed under the
-run's load and passed when run again by themselves, as `scripts/coverage.sh` now does
-before it writes a number. The Rust figures are the Lines and Regions columns of `cargo
-llvm-cov`'s total. A line counts as run when any part of it ran, so `let x = f()?;` is run
-though `f` never failed; regions count each part, which is why they are lower
-(FEEDBACK49.md). The runtime's is V8's own coverage from headless Chrome and every Node a
-test starts, mapped back to runtime.js's lines. What Rust does not run is mostly operating
-system failures (a thread or a socket that cannot be made), other systems' branches
-(`src/platform.rs`, `src/desktop.rs`), `unreachable!` arms and timers; the files with the
-most are `src/httpd.rs` (53 lines) and `src/embed.rs` (40). The runtime's 7 lines are
-defensive guards.
+**Rust: 98.67% of lines** run under the tests (52,590 lines, 700 not run), **97.12% of
+regions** (126,220, 3,636 not run).
+**Browser runtime (`src/client/runtime.js`): 99.86% of lines** (4,871 lines, 7 not run).
+Both were measured together on 2026-11-04 on the FEEDBACK50 work (0.7.0-dev, c99b8cf, now
+main) on macOS, from 2,650 tests with Chrome, PostgreSQL and MariaDB included; 3 failed
+under the run's load and passed when run again by themselves, as `scripts/coverage.sh`
+does before it writes a number. Every line FEEDBACK50 added runs in a test. The Rust
+figures are the Lines and Regions columns of `cargo llvm-cov`'s total. A line counts as
+run when any part of it ran, so `let x = f()?;` is run though `f` never failed; regions
+count each part, which is why they are lower (FEEDBACK49.md). The runtime's is V8's own
+coverage from headless Chrome and every Node a test starts, mapped back to runtime.js's
+lines. What Rust does not run is mostly operating system failures (a thread or a socket
+that cannot be made), other systems' branches (`src/platform.rs`, `src/desktop.rs`),
+`unreachable!` arms and timers; the files with the most are `src/builtins.rs` (65 lines),
+`src/httpd.rs` (56) and `src/embed.rs` (40). The runtime's 7 lines are defensive guards.
 
 Rust must stay at **97.90% of lines or above** (the aim is 99%), and runtime.js at
 **99.50% or above** on every change, and every line a change
