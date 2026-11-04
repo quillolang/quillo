@@ -36,7 +36,9 @@ options](#running-quillo) lists every one, `--watch` and `--split` included.
 | `--instances N` | the program N times over, a core each (see [several cores](#several-cores-several-servers)) |
 | `--log json` | a JSON line per request, for log collectors |
 | `--reload` | reload when the program's files change, without dropping requests (see [new versions](#new-versions)) |
-| `--max-body 50MB` | the largest request body (default 10 MiB): raise it for big uploads. A body may take as long as it keeps coming; one that sends nothing for 30 s is answered `408`, with a line in the log. A gzipped body (`Content-Encoding: gzip`) is decoded, and the limit counts what it decodes to |
+| `--max-body 50MB` | the largest request body (default 10 MiB): raise it for big uploads. Past its first 30 s a body must keep coming at 1 KiB/s *(since 0.7)*, and one that sends nothing for 30 s is answered `408`, with a line in the log. A gzipped body (`Content-Encoding: gzip`) is decoded, and the limit counts what it decodes to |
+| `--max-connections N` | connections open at once (default: what the file descriptors allow, less 4,608); past it one more is closed as it comes *(since 0.7)* |
+| `--connections-per-client N` | connections one client (an address, or an IPv6 /64) may hold open (default 512); this machine and `--trust-proxy`'s proxies are not held to it *(since 0.7)* |
 | `--base /shop` | when the program is served under a path rather than at the root: its links, redirects, scripts and cookies carry the prefix, and the proxy strips it from requests (Quillo routes the path it is given) |
 | `--metrics` | answer `/_quillo/metrics` (keep it private: see below) |
 
@@ -53,7 +55,11 @@ route GET /about {
 
 Never `--watch` in production (`quillo run main.qwe --watch` is for your own machine,
 reloading the program as it is edited): it shows errors on pages, refreshes them, and leaves
-`Secure` off cookies, since it expects plain HTTP on your own machine.
+`Secure` off cookies, since it expects plain HTTP on your own machine. Under `--watch` the
+server answers only `localhost`, addresses and the names `--allowed-hosts` gives
+(`myapp.test`, `.dev.test` for its subdomains too), and `421` to any other name *(since
+0.7)*: a page elsewhere whose name was made to point at your machine (DNS rebinding)
+cannot call it.
 
 ## Environment
 

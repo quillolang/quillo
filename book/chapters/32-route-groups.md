@@ -60,9 +60,8 @@ What a middleware gives back decides what happens:
 - **Anything else** stops it *(since 0.7: these let the route run)*: `false` answers
   403, an error value answers as a route's error does, and any other value (`true`,
   text, a map other than the request, `{ error: "bad api key" }`) is a 500 that names
-  the middleware. So a check is written `(r) => ok(r) ? r :
-  reply 403 "..."`, not as a predicate, and `quillo check` says so when a middleware can
-  only be a `bool` or text.
+  the middleware. So a check is written `(r) => ok(r) ? r : reply 403 "..."`, not as a
+  predicate, and `quillo check` says so when a middleware can only be a `bool` or text.
 - What it gives does not reach the route: a route that needs the user reads it again
   (`session()`, `me()`), which is cheap.
 

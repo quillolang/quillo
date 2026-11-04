@@ -298,9 +298,9 @@ vim.api.nvim_create_autocmd("FileType", {
 ```
 
 A `.qwer` file gets the Rust compiler's errors only when it is saved, in a folder the
-editor says it trusts *(since 0.7)*, as compiling it runs its crates' build scripts: the
-VS Code extension says so for a trusted workspace, and Neovim with `init_options = {
-trusted = true }` in `vim.lsp.start`.
+editor says it trusts *(since 0.7)*, as compiling it runs its crates' build scripts. The
+VS Code extension says so for a trusted workspace; in Neovim, add
+`init_options = { trusted = true }` to `vim.lsp.start` for folders you trust.
 
 The extension's README has Helix's settings, and `quillo dap` for debuggers in other
 editors.

@@ -303,7 +303,9 @@ db.open(env("DATABASE_URL"), { replicas: [env("REPLICA_1"), env("REPLICA_2")] })
   what it wrote.
 - A replica that fails is left out for ten seconds, and its reads go to the primary
   meanwhile. Every replica must be reachable when the program opens the database:
-  otherwise `db.open` gives an error value, which `unwrap` turns into a stop.
+  otherwise `db.open` gives an error value, which `unwrap` turns into a stop. The error
+  names the replica without its user and password *(since 0.7: the URL went to the log
+  whole)*.
 - Another request may still read from a replica that has not caught up with a write made
   just before. Reads that cannot wait for that belong in a transaction.
 - `db.connect(url, { replicas: [...] })` takes them too. Replicas are for one database
@@ -434,8 +436,10 @@ route POST /signup { form: { name: str } } with db {
 - `db.tenant_exists(name)` says whether a tenant has a database, without making one.
   `db.tenants()` lists the tenants whose databases exist, for a SQLite, PostgreSQL schema
   or MySQL template; where a function says where tenants are, keep the list yourself.
-- Live updates stay within a tenant. Global variables are shared by every tenant, so
-  keep a tenant's data in its database.
+- Live updates stay within a tenant: a page follows only its own tenant's topics and
+  those of no tenant *(since 0.7)*. Channels and media streams are each tenant's own too
+  (see [Real time](#realtime)), unless `tenants: "shared"`. Global variables are
+  shared by every tenant, so keep a tenant's data in its database.
 
 [Many tenants](#many-tenants) has the rest: tenant names, schema
 prefixes, and how many databases stay open at once.

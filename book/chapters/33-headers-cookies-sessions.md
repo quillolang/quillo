@@ -173,7 +173,11 @@ route GET /app = respond(200, <Page><Home/></Page>, { "content-security-policy":
 
 `set_cookie(name, value, options)` adds a `Set-Cookie` to the answer, whatever the route
 returns, from anywhere in the request. `cookie(name)` reads one the browser sent, or
-null; `request.cookies` is all of them.
+null; `request.cookies` is all of them. A page that reads either, or the `cookie` or
+`authorization` header, is the visitor's: it goes out with `Cache-Control: private` and
+`Vary: Cookie`, as one made with `session()` does, so a cache in front keeps it for no
+one else *(since 0.7: one that read `request.cookies` or the headers was not)*. A route
+that sets `cache-control` itself keeps its own.
 
 ```quillo
 route POST /theme { form: { theme: str } } {
@@ -458,8 +462,8 @@ route GET /api/me = request | api.key | (r) => respond(200, { ip: r.ip, user: se
 The `next` a login form carries is checked by `local` before it is followed, so a link
 from elsewhere cannot send a visitor to another site after signing in: starting with
 `/` is not enough, since a browser takes `//evil.example` (and `/\evil.example`) as
-another host, and `redirect` sends what it is given, but for a `javascript:` URL, which it
-refuses *(since 0.7)*. Signing out and the theme are
+another host, and `redirect` sends what it is given, but for a `javascript:` URL, which
+it refuses *(since 0.7)*. Signing out and the theme are
 forms too, posting to their routes: a link cannot log anyone out, since a `GET` would
 let any page do it. The `migrations/` folder holds the `users` table,
 `migrations/001_users.sql`:
