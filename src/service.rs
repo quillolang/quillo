@@ -1376,10 +1376,8 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     // it was, not run again. The same call: by the same caller, to the same function, for the
     // same tenant, with the same arguments. By its id alone, another caller that had the id was
     // given the first one's answer (FEEDBACK51.md, Q-664; branch feedback51-fixes).
-    let who = match &caller {
-        Value::Map(m) => m.get("name").map(|n| n.display()).unwrap_or_default(),
-        _ => String::new(),
-    };
+    let Value::Map(caller_map) = &caller else { unreachable!("a caller is a map: `caller_value`'s, or `check`'s") };
+    let who = caller_map.get("name").map(|n| n.display()).unwrap_or_default();
     let key = call_key(c, &who, f, tenant, &req.body);
     let c = key.as_str();
     {

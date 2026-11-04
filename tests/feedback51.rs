@@ -436,15 +436,19 @@ routes /admin | admins {
     route GET /x = "admin"
     route GET /only = "admin only"
     routes /deep | fine { route GET /y = "deep" }
+    route GET /form ? { q: int } = "admin form"
+    route GET /both = "admin both"
 }
 route GET /admin/x = "the public page"
+route POST /admin/both = "posted"
+route GET /admin/both ? { page: int } = "page"
 routes /log | logs { route GET /x = "log" }
 routes /copy | copied { route GET /x = "copy" }
 routes /ok | fine { route GET /x = "ok" }
 "#;
     let diags: Vec<String> = quillo::check::check_source(src, "t.qwe", Path::new(".")).diagnostics.iter().map(|d| format!("{} {}", d.line, d.message)).collect();
     // A middleware that can only give null leaves its routes never matching: refused.
-    assert!(diags.iter().any(|d| d.starts_with("19 ") && d.contains("`logs` gives null")), "{:?}", diags);
+    assert!(diags.iter().any(|d| d.starts_with("23 ") && d.contains("`logs` gives null")), "{:?}", diags);
     assert_eq!(diags.len(), 1, "{:?}", diags);
     let d = dir("middleware", &src.replace("routes /log | logs { route GET /x = \"log\" }\n", ""));
     let s = support::serve(&d.join("main.qwe"), &[]);
@@ -472,6 +476,17 @@ routes /ok | fine { route GET /x = "ok" }
     assert_eq!(get("/admin/deep/y", &root).status, 403);
     assert_eq!(get("/admin/nothing", &[]).status, 404);
     assert_eq!(get("/admin/nothing", &root).status, 404);
+    // What is outside the group still counts: another method of the path, another route whose
+    // pattern misses; a miss of the group's own pattern says nothing of it.
+    let r = get("/admin/both", &[]);
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert_eq!(get("/admin/both?page=2", &[]).body, "page");
+    assert_eq!(get("/admin/both", &root).body, "admin both");
+    let r = send("PUT", "/admin/both", &[]);
+    assert_eq!((r.status, r.headers.iter().find(|(k, _)| k == "allow").map(|(_, v)| v.as_str())), (405, Some("GET, HEAD, OPTIONS, POST")));
+    assert_eq!(get("/admin/form?q=x", &[]).status, 404);
+    assert_eq!(get("/admin/form?q=x", &root).status, 400);
+    assert_eq!(get("/admin/form?q=2", &root).body, "admin form");
     // A copy of the request goes on; `false` is a 403.
     assert_eq!(get("/copy/x", &[]).body, "copy");
     assert_eq!(get("/ok/x", &[("x", "1")]).body, "ok");
@@ -805,6 +820,7 @@ route GET /sort/:n = {
     let a = deep(int(n))
     `${len(sort([a, a]))}`
 }
+route GET /maps = `${{ a: 1 } == { b: 1 }} ${{ a: [1] } == { a: [1] }} ${{ a: 1 } == { a: 1, b: 2 }}`
 "#,
     );
     let s = support::serve(&d.join("main.qwe"), &[]);
@@ -819,8 +835,36 @@ route GET /sort/:n = {
     // Past 10,000 levels two lists are not ordered: an error, not a crash.
     assert_eq!(get("/sort/100").body, "2");
     assert_eq!(get("/sort/20000").status, 500);
+    assert_eq!(get("/maps").body, "false true false");
     // And the server still answers.
     assert_eq!(get("/eq/2").body, "true false");
+    // As JSON, past 10,000 levels a value is null, there too. On a stack of a request's size,
+    // 16 MiB: a test's own is 2.
+    std::thread::Builder::new()
+        .stack_size(16 << 20)
+        .spawn(|| {
+            let mut v = quillo::Value::Int(7);
+            for _ in 0..10_050 {
+                v = quillo::Value::list(vec![v]);
+            }
+            let text = v.json_text();
+            assert!(text.ends_with(&format!("null{}", "]".repeat(10_001))), "{}", &text[text.len() - 40..]);
+            let json = v.to_json();
+            let mut j = &json;
+            let mut depth = 0;
+            while let serde_json::Value::Array(a) = j {
+                j = &a[0];
+                depth += 1;
+            }
+            assert_eq!((depth, j), (10_001, &serde_json::Value::Null));
+            let e = quillo::Value::err(v);
+            // The error is a level too.
+            let t = e.json_text();
+            assert!(t.starts_with("{\"error\":[[") && t.ends_with(&format!("null{}}}", "]".repeat(10_000))), "{}", &t[t.len() - 40..]);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 // Q-675: a new SQLite database was readable by every user of the machine.
@@ -929,10 +973,12 @@ print(image.convert("tiny.png", "main.qwe", { format: "png" }))
 print(image.convert("tiny.png", "out/small.png").width)
 print(image.convert("big.png", "out/big.png", { width: 6000 }))
 print(image.convert("big.png", "out/thumb.png", { width: 400 }).width)
+print(image.convert("huge.png", "out/huge.png"))
 "#,
     );
     image::GrayImage::new(4, 4).save(d.join("tiny.png")).unwrap();
     image::GrayImage::new(7000, 5600).save(d.join("big.png")).unwrap();
+    image::GrayImage::new(7000, 6000).save(d.join("huge.png")).unwrap();
     std::fs::write(d.join(".env"), "SECRET=x\n").unwrap();
     let out = run_script(&d);
     let lines: Vec<&str> = out.lines().collect();
@@ -943,6 +989,7 @@ print(image.convert("big.png", "out/thumb.png", { width: 400 }).width)
     assert_eq!(lines[2], "4");
     assert!(lines[3].contains("converting the 7000×5600 image so would take about") && lines[3].contains("more than the 640 converted at once"), "{}", out);
     assert_eq!(lines[4], "400");
+    assert!(lines[5].contains("the image is 7000×6000, more than the 40 megapixels converted"), "{}", out);
 }
 
 // Q-663: under --watch, a page elsewhere whose name was made to point here reached the server
@@ -1043,4 +1090,45 @@ route GET / = <html><head><title>t</title></head><body><Css/></body></html>
     assert_eq!(r["sheet"], r"#cv { color: blue\7d  p\7b color:red\3b background:url(//evil) }", "{}", r);
     assert_eq!(r["color"], "rgb(255, 0, 0)", "{}", r);
     assert_eq!((r["keys"].as_str(), &r["polluted"]), (Some("__proto__,a"), &serde_json::Value::Null), "{}", r);
+}
+
+// Q-672's and Q-663's options: said wrong, the server does not start, and says why.
+#[test]
+fn the_new_options_take_what_they_say() {
+    let d = dir("options", "route GET / = \"home\"\n");
+    for (args, said) in [
+        (["--max-connections", "0"], "--max-connections needs a positive number"),
+        (["--max-connections", "x"], "--max-connections needs a positive number"),
+        (["--connections-per-client", "-1"], "--connections-per-client needs a positive number"),
+        (["--allowed-hosts", " , "], "--allowed-hosts needs host names"),
+    ] {
+        let o = Command::new(env!("CARGO_BIN_EXE_quillo")).arg("run").arg(d.join("main.qwe")).args(args).output().unwrap();
+        assert_eq!(o.status.code(), Some(2), "{:?}", args);
+        assert!(String::from_utf8_lossy(&o.stderr).contains(said), "{:?}: {}", args, String::from_utf8_lossy(&o.stderr));
+    }
+    let (_g, port) = run_with(&d, "main.qwe", &["--max-connections", "100", "--connections-per-client", "5"], &[]);
+    assert_eq!(support::send(port, "GET", "/", &[], "").body, "home");
+}
+
+// Q-655: a probe of `/_quillo/ready` while another waits on a service that does not answer is
+// told what was known, at once, rather than wait too.
+#[test]
+fn a_ready_probe_does_not_wait_on_another() {
+    let held = TcpListener::bind("127.0.0.1:0").unwrap();
+    let silent = held.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        for c in held.incoming() {
+            kept.push(c);
+        }
+    });
+    let d = dir("ready-busy", "service billing = \"billing.qwe\"\nroute GET / = \"hi\"\n");
+    std::fs::write(d.join("billing.qwe"), "server fn f() = 1\n").unwrap();
+    let (_g, port) = run_with(&d, "main.qwe", &["--service-url", &format!("billing=http://127.0.0.1:{}", silent)], &[]);
+    let first = std::thread::spawn(move || support::send(port, "GET", "/_quillo/ready", &[], "").status);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let start = std::time::Instant::now();
+    assert_eq!(support::send(port, "GET", "/_quillo/ready", &[], "").status, 503);
+    assert!(start.elapsed() < std::time::Duration::from_millis(1000), "{:?}", start.elapsed());
+    assert_eq!(first.join().unwrap(), 503);
 }

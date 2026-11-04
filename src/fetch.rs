@@ -1066,6 +1066,15 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 mod tests {
     use super::*;
 
+    // As the client reads a URL (found in review of FEEDBACK51.md, Q-650).
+    #[test]
+    fn a_host_is_the_clients() {
+        assert_eq!(host_of("http://169.254.169.254\\latest\\x@example.com/"), "169.254.169.254");
+        assert_eq!(host_of("http://[::1]:8080/a"), "[::1]");
+        assert_eq!(host_of("https://Example.COM./"), "example.com.");
+        assert_eq!(host_of("not a url"), "");
+    }
+
     fn feed(kind: Kind, input: &[u8], step: usize) -> Result<Vec<String>, String> {
         let mut p = Pending::default();
         let mut got = Vec::new();

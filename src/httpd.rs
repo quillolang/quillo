@@ -2422,6 +2422,35 @@ pub(crate) fn flush_log() {
 
 #[cfg(test)]
 mod tests {
+    // Q-672: a client holds so many connections, all clients so many, this machine and the
+    // proxies --trust-proxy names no limit of the first.
+    #[test]
+    fn connections_have_places() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let at = |a: &str| a.parse::<std::net::SocketAddr>().unwrap();
+        let before = super::CONNECTIONS_PER_CLIENT.swap(2, SeqCst);
+        let (a, b) = (super::place_for(&at("203.0.113.7:1000")), super::place_for(&at("203.0.113.7:1001")));
+        assert!(a.is_some() && b.is_some());
+        assert!(super::place_for(&at("203.0.113.7:1002")).is_none());
+        // One of an IPv6 /64 is the same client as another of it.
+        let v6 = [super::place_for(&at("[2001:db8:1:2::1]:1")), super::place_for(&at("[2001:db8:1:2::9]:1"))];
+        assert!(v6.iter().all(Option::is_some) && super::place_for(&at("[2001:db8:1:2::5]:1")).is_none());
+        // A place given back is another's.
+        drop(a);
+        assert!(super::place_for(&at("203.0.113.7:1003")).is_some());
+        for _ in 0..5 {
+            assert!(super::place_for(&at("127.0.0.1:1")).is_some());
+        }
+        super::CONNECTIONS_PER_CLIENT.store(before, SeqCst);
+        // All of them: past --max-connections, none.
+        let most = super::MAX_CONNECTIONS.swap(1, SeqCst);
+        crate::metrics::CONNECTIONS.fetch_add(1, SeqCst);
+        assert!(super::place_for(&at("127.0.0.1:2")).is_none());
+        crate::metrics::CONNECTIONS.fetch_sub(1, SeqCst);
+        super::MAX_CONNECTIONS.store(most, SeqCst);
+        drop((b, v6));
+    }
+
     #[test]
     fn dates() {
         assert_eq!(super::http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");

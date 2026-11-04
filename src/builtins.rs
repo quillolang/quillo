@@ -1439,7 +1439,8 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// `lib.QWE` is `lib.qwe`, and on Windows so are `lib.qwe.`, `lib.qwe ` and `lib.qwe::$DATA`
 /// (FEEDBACK51.md, Q-656; branch feedback51-fixes).
 pub(crate) fn hidden_path(rel: &str) -> bool {
-    if cfg!(windows) && rel.contains(['\\', ':']) {
+    #[cfg(windows)]
+    if rel.contains(['\\', ':']) {
         return true;
     }
     // Folded as the file system folds it: `ſ` is `s` and `K` (U+212A) `k` on macOS, so `plug.rſ`

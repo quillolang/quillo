@@ -112,12 +112,8 @@ fn remote_ready(url: &str) -> bool {
         ASKING.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(url.to_string()).or_default().clone()
     };
     // One asking already: what was known, rather than wait for it (found in review).
-    let _turn = match one.try_lock() {
-        Ok(t) => t,
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            return seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(url).is_some_and(|(_, ok)| *ok);
-        }
+    let Ok(_turn) = one.try_lock() else {
+        return seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(url).is_some_and(|(_, ok)| *ok);
     };
     if let Some(ok) = kept() {
         return ok;

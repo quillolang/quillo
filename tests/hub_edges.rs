@@ -63,6 +63,7 @@ media.on("radio", { watch: (p) => true })
 channel.on("who", (m) => channel.broadcast("who", channel.peers("who")))
 channel.on("dm", (m) => channel.send("dm", m.to, "a word"))
 media.on("cam2", { publish: (p) => true, watch: (p) => true })
+media.on("town", { publish: (p) => true, watch: (p) => true, tenants: "shared" })
 
 route GET /heard = heard
 "#;
@@ -838,6 +839,23 @@ fn a_tenants_viewer_joins_no_stream_a_page_made_and_a_job_ends_all() {
     assert!(matches!(next(&mut apex_rx), Out::Media(f) if f.kind == media::END));
     assert_eq!(text(&mut acme_rx), "[\"j\",\"media:cam2\",false]");
     for p in [&apex, &aw, &acme] {
+        wt::disconnect(p);
+    }
+}
+
+// `tenants: "shared"`: one stream of the name for every tenant (FEEDBACK51.md, Q-642).
+#[test]
+fn a_shared_stream_is_every_tenants() {
+    hub();
+    let (w, mut w_rx) = wt::connect(ticket_in(Some("acme")), None);
+    wt::from_page(&w, "[\"v\",\"town\"]");
+    let (s, _s_rx) = joined_in(Some("evil"), "media:town");
+    wt::frame_from_page(&s, wire("town", media::VIDEO, true, b"evil's"));
+    match next(&mut w_rx) {
+        Out::Media(f) => assert!(f.wire.ends_with(b"evil's")),
+        _ => panic!("no frame"),
+    }
+    for p in [&w, &s] {
         wt::disconnect(p);
     }
 }

@@ -764,15 +764,7 @@ pub fn answer(it: &mut Interp, name: &str, body: &[u8]) -> crate::server::HttpRe
             continue;
         };
         let it: &mut Interp = match sub {
-            Some(path) => match mounted(&mut *it, path) {
-                Some(s) => s,
-                None => {
-                    if matches!(kind, "j" | "w") {
-                        verdicts.push(false);
-                    }
-                    continue;
-                }
-            },
+            Some(path) => mounted(&mut *it, path),
             None => &mut *it,
         };
         let session = serde_json::from_str::<serde_json::Value>(e["s"].as_str().unwrap_or("{}")).map(|j| Value::from_json(&j)).unwrap_or(Value::Nil);
@@ -864,12 +856,13 @@ fn find(it: &Interp, name: &str) -> Option<(Arc<Handler>, Option<Vec<usize>>)> {
     None
 }
 
-fn mounted<'a>(it: &'a mut Interp, path: &[usize]) -> Option<&'a mut Interp> {
+/// The program mounted at `path`, as `find` gave it, from this program's own mounts.
+fn mounted<'a>(it: &'a mut Interp, path: &[usize]) -> &'a mut Interp {
     let mut at = it;
     for &i in path {
-        at = &mut at.mounts.get_mut(i)?.1;
+        at = &mut at.mounts[i].1;
     }
-    Some(at)
+    at
 }
 
 // ---- builtins ----------------------------------------------------------------
@@ -1452,4 +1445,21 @@ pub fn leave_all(key: &str) {
 /// Pages connected now, for `--metrics`.
 pub fn connected() -> usize {
     lock(&hub().peers).len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An inbox let go while a page pushed to it: what came goes to the inbox made in its place
+    // (found in review of FEEDBACK51.md).
+    #[test]
+    fn what_comes_to_an_inbox_let_go_goes_to_the_new_one() {
+        let (p, _rx) = connect(Ticket { session: "{}".into(), tenant: None }, None);
+        let gone = Arc::new(Inbox { name: "unit-let-go".into(), queue: Mutex::new(VecDeque::new()), arrived: Condvar::new(), delivering: AtomicBool::new(false), closed: AtomicBool::new(true) });
+        gone.push(Event { kind: 'm', peer: p.clone(), value: "1".into() });
+        assert!(lock(&gone.queue).is_empty());
+        assert_eq!(lock(&inbox("unit-let-go").queue).len(), 1);
+        disconnect(&p);
+    }
 }
