@@ -280,9 +280,10 @@ fn postgres_money_reads_with_its_currency_s_decimals() {
     let s = support::serve(&d.join("main.qwe"), &[]);
     let body = support::send(s.port, "GET", "/m", &[], "").body;
     assert!(body.contains("\"m\":\"500\""), "{}", body);
-    // Again, on a connection that has asked already.
-    let again = support::send(s.port, "GET", "/m", &[], "").body;
-    assert_eq!(again, body);
+    // Again: requests take turns over four connections, so by the fifth one has asked already.
+    for _ in 0..8 {
+        assert_eq!(support::send(s.port, "GET", "/m", &[], "").body, body);
+    }
     assert!(body.contains("\"m\":\"-1234\""), "{}", body);
 }
 
