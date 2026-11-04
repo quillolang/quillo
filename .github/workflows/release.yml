@@ -29,10 +29,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: The release, with notes from the commits since the last tag
+      - name: The release, with the CHANGELOG's section for it as its notes
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "Quillo $GITHUB_REF_NAME" --generate-notes --verify-tag
+        # GitHub's own notes list pull requests, which this repository has none of: v0.7.0's
+        # page said nothing but a link (the user: "imagine finding only this").
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '$0 ~ "^## " v "( |$)" {on=1; next} /^## / {if (on) exit} on' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then echo "CHANGELOG.md has no section \"## $version\"" >&2; exit 1; fi
+          printf '\n\n[The whole changelog](https://github.com/%s/blob/%s/CHANGELOG.md)\n' "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" >> notes.md
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "Quillo $GITHUB_REF_NAME" --notes-file notes.md --verify-tag
 
   build:
     needs: release
