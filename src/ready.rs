@@ -115,9 +115,6 @@ fn remote_ready(url: &str) -> bool {
     let Ok(_turn) = one.try_lock() else {
         return seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(url).is_some_and(|(_, ok)| *ok);
     };
-    if let Some(ok) = kept() {
-        return ok;
-    }
     // The connection too: ureq's own wait for it was 30 s.
     let agent = ureq::AgentBuilder::new().timeout_connect(WAIT).timeout(WAIT).redirects(0).build();
     let ok = matches!(agent.get(&format!("{}/_quillo/ready", url)).call(), Ok(r) if r.status() == 200);

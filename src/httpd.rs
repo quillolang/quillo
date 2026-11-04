@@ -1719,14 +1719,12 @@ impl Drop for Place {
     fn drop(&mut self) {
         let Some(k) = &self.0 else { return };
         let mut all = PER_CLIENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(m) = all.as_mut() {
-            if let Some(n) = m.get_mut(k) {
-                *n -= 1;
-                if *n == 0 {
-                    m.remove(k);
-                }
-            }
-        }
+        // A place given is counted (see `place_for`): one fewer, and none is no entry.
+        let m = all.get_or_insert_with(HashMap::new);
+        match m.get(k).copied().unwrap_or(1) {
+            1 => m.remove(k),
+            n => m.insert(k.clone(), n - 1),
+        };
     }
 }
 
