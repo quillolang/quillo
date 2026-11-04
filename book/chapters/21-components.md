@@ -210,7 +210,11 @@ route GET / = <html><body><Counter start={5}/></body></html>
   `z-index`, `line-height`, `flex`, `font-weight`, `order`...) and custom properties:
   `{ fontSize: 12, opacity: 0.5, "--gap": 4 }` is `font-size: 12px; opacity: 0.5; --gap: 4`
   *(since 0.7: `12` was written bare, and the browser dropped it)*. `ms` starts a prefix as
-  `Webkit` and `Moz` do: `msFlex` is `-ms-flex`.
+  `Webkit` and `Moz` do: `msFlex` is `-ms-flex`. A value's `{`, `}`, `;` and `\` are
+  written as CSS's escapes (`\7b `, `\7d `, `\3b `, `\5c `), so a value from data is one value
+  and adds no declaration: `{ color: "red;background:url(//evil)" }` is one colour the
+  browser does not take. A key is a property's name (letters, digits, `-` and `_`) or a
+  custom property's; another key is left out *(since 0.7, FEEDBACK51.md, Q-668)*.
 - `class={...}` takes text, a map (the keys whose values are true) or a list (its texts,
   lists inside it flattened, `null`, `false`, `true` and `""` skipped, a map in it giving
   its true keys), as `clsx` does: `class={{ active: on, off: !on }}`, `class={["card", big

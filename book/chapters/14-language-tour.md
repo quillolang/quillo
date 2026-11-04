@@ -593,7 +593,10 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   a `<style>`'s text as markup *(since 0.7)*. A `<script>`'s values are JSON with `&` as
   `\u0026` for the same reason.
   Write it as `` css`...` ``: a template string (braces are plain text, `${...}` fills in
-  values) that editors highlight as CSS. `` sql`...` `` does the same for queries.
+  values) that editors highlight as CSS. Each `${...}` is a CSS value: its `{`, `}`, `;`
+  and `\` are written as CSS's escapes, so `` css`p { color: ${c} }` `` with
+  `c = "red} input[value^=a]{background:url(//evil)}"` adds no rule *(since 0.7)*.
+  `` sql`...` `` does the same for queries.
 - A component's or view's own CSS is `style` at the start of its body, before its markup:
 
   ```quillo
