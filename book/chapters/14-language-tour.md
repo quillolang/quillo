@@ -597,7 +597,8 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   and `\` are written as CSS's escapes, so `` css`p { color: ${c} }` `` with
   `c = "red} input[value^=a]{background:url(//evil)}"` adds no rule *(since 0.7)*.
   `` sql`...` `` does the same for queries.
-- A component's or view's own CSS is `style` at the start of its body, before its markup:
+- A component's or view's own CSS is `style` at the start of its body, before its markup
+  (from the start, with what the page is sent: [Styling a component](#styling-a-component)):
 
   ```quillo
   component Card() {

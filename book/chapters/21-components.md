@@ -647,6 +647,101 @@ component Dashboard() {
   fails as it renders (`prop header of <D> is html, which cannot be sent to the
   browser`). `children` placed from the server travels as its HTML.
 
+## Styling a component
+
+A component or a view carries its own CSS. You write it with the component, and Quillo
+sends it to the browser in a stylesheet of its own: nothing is written into the page's
+HTML for it. The components on [quillolang.org/components](https://quillolang.org/components/)
+all work this way.
+
+**Write it at the start of the body**, before the markup:
+
+```quillo
+component Card(title: str) {
+    style css`
+      .title { color: darkred }
+      .title:hover { text-decoration: underline }
+    `
+    state open = false
+    <div.card @click={() => { open = !open }}><h2.title>{title}</h2>{open && <p>More about {title}</p>}</div>
+}
+
+route GET / = <html><head><title>Cards</title></head><body><Card title="Hello"/></body></html>
+```
+
+The page has a link to the sheet in its `<head>`, and each element the component writes
+carries the component's attribute:
+
+```html
+<link rel="stylesheet" href="/_quillo/s/a1ce371646f1b209.css">
+...
+<h2 class="title" data-q-1df36318="true">Hello</h2>
+```
+
+`/_quillo/s/a1ce371646f1b209.css` holds the component's rules, made to need that
+attribute, so they style the card's `.title` and no other:
+
+```css
+.title[data-q-1df36318] { color: darkred }
+.title[data-q-1df36318]:hover { text-decoration: underline }
+```
+
+**Or keep the CSS in a file of its own**, beside the program, and give `style` its text:
+
+```quillo
+let card_css = read_file("card.css")     // read once, as the program starts
+
+component Card(title: str) {
+    style card_css
+    <div.card><h2.title>{title}</h2></div>
+}
+```
+
+Any text will do: a `.css` file read with `read_file`, or a `` css`...` `` kept in a
+variable. It is scoped and sent the same way.
+
+**Scoped, or as written.** `style` scopes the rules to the component (above). `style
+global` sends them with their selectors as written, for a library whose class names are
+its own already. That is what the downloadable components do: each one is a `.qwe` file
+with its CSS in a variable and `style global` in its body, so copying the file brings the
+styles along.
+
+```quillo
+// ui/collapsible.qwe, from the kit (shortened)
+let collapsible_css = css`
+.ui-collapsible { min-width: 0; color: var(--ui-fg); font: 15px/1.5 var(--ui-font); }
+.ui-collapsible > summary { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+`
+
+view Collapsible(title: str, children) {
+    style global collapsible_css
+    <details class="ui-collapsible"><summary>{title}</summary><div>{children}</div></details>
+}
+```
+
+The kit's `ui_css` (its colours, fonts and the `--ui-...` variables the rules use) is the
+one stylesheet a page itself puts in: `<style>{ui_css}</style>` once, in the `<head>`.
+
+**What reaches the browser:**
+- A page is sent the styles of the components and views on it, and of those they can
+  show later in the browser (a `<Note>` that appears after a click), joined into one
+  sheet, `/_quillo/s/<hash>.css`. A page that shows none gets no sheet.
+- Its name comes from what is in it: two pages with the same components share one sheet,
+  and the browser keeps it for good (`Cache-Control: public, max-age=31536000,
+  immutable`). When the CSS changes, so does the name.
+- The same attribute and rules on the server and in the browser, so a component the
+  browser draws again keeps its style.
+
+**What a style cannot do.** It is the same for every use of the component, so it cannot
+read the component's parameters or state. For a style that changes with them, set a class
+(`<div class={{ open: open }}>`) or a `style={...}` on the element. A page's own
+`<style>`, or a `.css` file under `public/` linked from the page, is for what belongs to
+no component: the page's layout, its fonts.
+
+More: `:global(...)`, scoped `@media` and the other rules, a `style` for all of a file's
+components, `style_with` for PostCSS or Tailwind, and what `quillo check` says of a class
+nothing writes are in [HTML literals](#html-literals).
+
 ## JavaScript libraries
 
 A component can hand an element to a library (a chart, a map, an editor) and call into
