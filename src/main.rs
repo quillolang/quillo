@@ -81,6 +81,12 @@ options for `run`:
   -- a b         what follows is the program's, for args()
   --allow-path DIR  read_file and write_file may use DIR too, for a script
                  used as a tool (any part of the program may then)
+  --allowed-hosts A,B  under --watch, host names answered besides localhost and
+                 addresses (.example.test takes its subdomains too)
+  --max-connections N  connections open at once (default: what the file
+                 descriptors allow, less 4,608)
+  --connections-per-client N  connections one client may hold open (default
+                 512; this machine and --trust-proxy's proxies are not held to it)
   --live-per-client N  pages one client may have waiting for live data (default 256)
                  (separate variables, as N processes would have; the
                  database and `publish` changes reach them all)
@@ -197,7 +203,7 @@ fn main() {
 /// value, not the program.
 const VALUE_OPTIONS: &[&str] = &[
     "--host", "--port", "--listen", "--socket-mode", "--policy", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
-    "--max-body", "--max-compute", "--allow-path", "--trust-proxy", "--live-per-client", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
+    "--max-body", "--max-compute", "--allow-path", "--trust-proxy", "--live-per-client", "--max-connections", "--connections-per-client", "--allowed-hosts", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
     "--scale", "--join", "--with", "--allow-join", "--join-as",
 ];
 
@@ -836,6 +842,27 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 Ok(n) if n > 0 => quillo::server::LIVE_PER_CLIENT.store(n, std::sync::atomic::Ordering::Relaxed),
                 _ => {
                     eprintln!("quillo: --live-per-client needs a positive number");
+                    return Err(2);
+                }
+            },
+            ("--allowed-hosts", Some(v)) => {
+                let names: Vec<String> = v.split(',').map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase()).filter(|h| !h.is_empty()).collect();
+                if names.is_empty() || quillo::server::ALLOWED_HOSTS.set(names).is_err() {
+                    eprintln!("quillo: --allowed-hosts needs host names, as myapp.test or .myapp.test, once");
+                    return Err(2);
+                }
+            }
+            ("--max-connections", Some(v)) => match v.parse::<usize>() {
+                Ok(n) if n > 0 => quillo::httpd::MAX_CONNECTIONS.store(n, std::sync::atomic::Ordering::SeqCst),
+                _ => {
+                    eprintln!("quillo: --max-connections needs a positive number");
+                    return Err(2);
+                }
+            },
+            ("--connections-per-client", Some(v)) => match v.parse::<usize>() {
+                Ok(n) if n > 0 => quillo::httpd::CONNECTIONS_PER_CLIENT.store(n, std::sync::atomic::Ordering::SeqCst),
+                _ => {
+                    eprintln!("quillo: --connections-per-client needs a positive number");
                     return Err(2);
                 }
             },

@@ -515,7 +515,7 @@ fn tokens_are_checked_against_a_jwks() {
     assert!(quillo::svcauth::verify_jwt(&unknown, &rules).unwrap_err().contains("no key `ed-9`"));
     assert!(quillo::svcauth::verify_jwt(&unknown, &rules).unwrap_err().contains("no key `ed-9`"));
     assert_eq!(fetched.load(std::sync::atomic::Ordering::SeqCst), 1, "fetched again at most once a minute");
-    let caller = quillo::svcauth::jwt_caller(&serde_json::json!({ "azp": "x", "scp": ["a", "b"] }));
+    let caller = quillo::svcauth::jwt_caller(&serde_json::json!({ "azp": "x", "scp": ["a", "b"] })).unwrap();
     assert_eq!(caller.display(), "{ name: \"x\", by: \"jwt\", scopes: [\"a\", \"b\"], claims: { azp: \"x\", scp: [\"a\", \"b\"] } }");
 }
 

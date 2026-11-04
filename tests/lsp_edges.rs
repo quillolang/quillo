@@ -113,7 +113,9 @@ impl Session {
 
     fn with(mut c: Client) -> Session {
         let mut notes = Vec::new();
-        c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+        // A folder the editor trusts, where `.qwer` files are compiled as they are saved
+        // (FEEDBACK51.md, Q-653).
+        c.request("initialize", json!({ "capabilities": {}, "initializationOptions": { "trusted": true } }), &mut notes);
         c.notify("initialized", json!({}));
         Session { c, notes }
     }
@@ -489,7 +491,8 @@ fn rust_files_are_checked_one_at_a_time() {
     // Saved while the first check runs: it goes round again.
     s.c.notify("textDocument/didSave", json!({ "textDocument": { "uri": uri } }));
     s.c.notify("textDocument/didSave", json!({ "textDocument": { "uri": uri } }));
-    // One as it opened, one as each was saved, and each of the two checks'.
+    // One as it opened, one as each was saved, and each of the two checks' (the first save's,
+    // and the one it goes round for).
     for _ in 0..5 {
         assert_eq!(s.diags(&uri), json!([]));
     }
@@ -502,6 +505,7 @@ fn a_rust_error_with_no_width_is_shown_on_its_line() {
     let uri = uri_of(&d.join("kv.qwer"));
     let mut s = Session::start();
     s.open(&uri, text);
+    s.c.notify("textDocument/didSave", json!({ "textDocument": { "uri": uri } }));
     let said = loop {
         let got = s.diags(&uri);
         if let Some(m) = got.as_array().unwrap().iter().find(|d| d["message"].as_str().unwrap().contains("unclosed delimiter")) {
@@ -521,6 +525,7 @@ fn with_no_cargo_a_rust_file_says_so() {
     let uri = uri_of(&d.join("kv.qwer"));
     let mut s = Session::with(Client::start_with(&[("CARGO", "/nonexistent/cargo")]));
     s.open(&uri, text);
+    s.c.notify("textDocument/didSave", json!({ "textDocument": { "uri": uri } }));
     let found = loop {
         let got = s.diags(&uri);
         if let Some(first) = got.as_array().and_then(|a| a.first()) {

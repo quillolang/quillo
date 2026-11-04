@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please report vulnerabilities privately, through GitHub: on
-[the repository's Security tab](https://github.com/wisp-one/quillo/security), choose
+[the repository's Security tab](https://github.com/quillolang/quillo/security), choose
 **Report a vulnerability**. Do not open a public issue.
 
 Say what you found, the version or commit, and how to reproduce it (a small `.qwe`
@@ -40,6 +40,15 @@ own: `err(...)`, and `str(r)` of an error, go out as they are.
   links to as well, each `server fn`'s signature, the file and line of every route, and the
   version. Keep it private as `/_quillo/metrics` is, with rules at the proxy, or leave it
   off in production.
+- `/_quillo/health` answers anyone `ok` or `unavailable`. `/_quillo/ready` answers anyone
+  whether the program is ready (200 or 503, `{"ready": ...}`); each check, with the
+  addresses of the services it calls, only with the health token, `QUILLO_HEALTH_TOKEN`,
+  as `Authorization: Bearer ...`.
+- `/_quillo/live` answers any page that names topics it follows. A page follows only its
+  own tenant's topics (and those of no tenant), not another tenant's; within a tenant,
+  topics are not checked: a topic name is no secret.
+- `/_quillo/rpc/<fn>` calls any `server fn` a page may call, for anyone, as a page would:
+  check who calls inside it. A `server fn` with `for [...]` takes no calls there.
 - In a phone app, `env.NAME` values in app.toml are public: anyone can unzip the app and
   read everything in it. A `.env` is not put in the app.
 

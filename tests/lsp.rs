@@ -176,7 +176,7 @@ fn a_used_file_is_checked_as_part_of_its_program() {
 }
 
 /// A `.qwer` file: what Quillo cannot export is said as it is typed, and
-/// the Rust compiler's errors once it is opened or saved; hover shows how
+/// the Rust compiler's errors once it is saved in a folder the editor trusts; hover shows how
 /// Quillo sees an export.
 #[test]
 fn rust_files_get_quillo_and_compiler_diagnostics() {
@@ -190,9 +190,11 @@ fn rust_files_get_quillo_and_compiler_diagnostics() {
     let uri = format!("file://{}", path.display());
     let mut c = Client::start();
     let mut notes = Vec::new();
-    c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    c.request("initialize", json!({ "capabilities": {}, "initializationOptions": { "trusted": true } }), &mut notes);
     c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "rust", "version": 1, "text": text } }));
-    // First what Quillo makes of it, then the compiler's errors with it.
+    // Opened, what Quillo makes of it; saved, the compiler's errors with it (FEEDBACK51.md,
+    // Q-653: opening ran `cargo check`, and so the dependencies' build scripts).
+    c.notify("textDocument/didSave", json!({ "textDocument": { "uri": uri } }));
     let mut quillo_seen = false;
     let diags = loop {
         let m = c.recv();
@@ -235,6 +237,38 @@ fn rust_files_get_quillo_and_compiler_diagnostics() {
     c.request("shutdown", Value::Null, &mut notes);
     c.notify("exit", Value::Null);
     assert!(c.child.wait().unwrap().success());
+}
+
+/// Q-653: in a folder the editor has not said it trusts, the compiler is never run on a `.qwer`,
+/// opened or saved, nor on a `.rs`.
+#[test]
+fn rust_files_are_not_compiled_in_a_folder_not_trusted() {
+    let dir = std::env::temp_dir().join(format!("quillo-lsp-untrusted-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let text = "pub fn add(a: i64, b: i64) -> i64 {\n    a + b + \"x\"\n}\n";
+    let mut c = Client::start();
+    let mut notes = Vec::new();
+    c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    for name in ["lib.qwer", "plain.rs"] {
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        let uri = format!("file://{}", path.display());
+        c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "rust", "version": 1, "text": text } }));
+        c.notify("textDocument/didSave", json!({ "textDocument": { "uri": uri } }));
+    }
+    // Long enough for `cargo check` to have said something, had it run.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while std::time::Instant::now() < until {
+        c.request("textDocument/hover", json!({ "textDocument": { "uri": format!("file://{}", dir.join("lib.qwer").display()) }, "position": { "line": 0, "character": 8 } }), &mut notes);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assert!(!notes.iter().any(|m| m["params"]["diagnostics"].as_array().is_some_and(|d| d.iter().any(|x| x["source"] == "rustc"))), "{:?}", notes);
+    c.request("shutdown", Value::Null, &mut notes);
+    c.notify("exit", Value::Null);
+    assert!(c.child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A word in markup's text is text, even when a component has its name:

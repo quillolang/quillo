@@ -771,6 +771,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("remove", "list | map | null, any", "list | map"),
     ("merge", "map | null, map | null", "map"),
     ("__merge", "map | null...", "map"),
+    ("__css_value", "any", "str"),
     ("__concat", "list | null...", "list"),
     ("err", "any=", "error(any)"),
     ("is_err", "any", "bool"),
@@ -1657,6 +1658,8 @@ struct Checker {
     /// How many scopes deep the route's own is, so a local of the same name is not taken
     /// for its parameter (found in review).
     text_params_depth: usize,
+    /// The route's parameters that are text the visitor writes, `:name` and `*path` (Q-657).
+    path_params: Vec<String>,
     /// `${name}` written in plain strings, by file and line (FEEDBACK45.md, Q-510).
     plain_dollars: HashSet<(String, String, String)>,
     /// The functions being read in their own `let`.
@@ -1848,6 +1851,7 @@ impl Checker {
             plain_dollars: HashSet::new(),
             text_params: Vec::new(),
             text_params_depth: 0,
+            path_params: Vec::new(),
             bodies: HashMap::new(),
             failed_imports: HashSet::new(),
             confined: false,
@@ -3130,8 +3134,14 @@ impl Checker {
             Seg::Param(n, None, _) => Some(n.clone()),
             _ => None,
         }).collect();
+        self.path_params = r.path.iter().filter_map(|seg| match seg {
+            Seg::Param(n, None, _) | Seg::Rest(n) => Some(n.clone()),
+            Seg::Param(n, Some(t), _) if &**t == "str" => Some(n.clone()),
+            _ => None,
+        }).collect();
         self.expr(&r.body);
         self.text_params.clear();
+        self.path_params.clear();
         self.pop();
         self.fns.pop();
         self.fn_ended();
@@ -3617,7 +3627,9 @@ impl Checker {
             } else if let Some((m, f)) = n.split_once('.') {
                 if MODULES.contains(&m) {
                     mask |= builtin_effect(&format!("{}.{}", m, f));
-                } else if self.services.contains_key(m) && !d.params.iter().any(|p| p.name == m) {
+                // A site's function too: a request to it (FEEDBACK51.md, Q-640; branch
+                // feedback51-fixes).
+                } else if (self.services.contains_key(m) || self.sites.contains(m)) && !d.params.iter().any(|p| p.name == m) {
                     mask |= crate::ast::effect_bit("http");
                 } else if self.sql_var(m) == SqlVar::Conn && !d.params.iter().any(|p| p.name == m) {
                     // A connection's call, as `db`'s (Q-488).
@@ -4080,6 +4092,14 @@ impl Checker {
                             if let Some(c) = self.in_component() {
                                 self.error(format!("`{s}.{f}()` calls the site from the server, and <{c}> also runs in the browser: call it in a `server fn`"));
                             }
+                            // A request to the site, as a service's call is (FEEDBACK51.md,
+                            // Q-640; branch feedback51-fixes).
+                            let http = crate::ast::effect_bit("http");
+                            if let Some((allowed, restrictor)) = self.fns.last().map(|x| (x.allowed, x.restrictor.clone())) {
+                                if http & !allowed != 0 {
+                                    self.effect_error(&format!("{}.{}", s, f), http, restrictor.as_ref());
+                                }
+                            }
                         }
                     }
                 }
@@ -4095,6 +4115,21 @@ impl Checker {
                     if n == "sleep" && builtin && *f > 0.0 && *f < 1.0 {
                         let ms = (f * 1000.0).round();
                         self.warn(format!("`sleep` takes milliseconds: `sleep({f})` waits {f} ms; for {f} seconds write `sleep({ms})`"));
+                    }
+                }
+                // `file("public/" + path)` serves `.env` and `main.qwe` when the path is the
+                // visitor's: `files` keeps them back (FEEDBACK51.md, Q-657; branch
+                // feedback51-fixes).
+                if let (Expr::Ident(n, _), Some(a)) = (callee.as_ref(), args.first()) {
+                    let param = |e: &Expr| matches!(e, Expr::Ident(p, _) if self.path_params.iter().any(|q| q == &**p));
+                    let made = match a {
+                        Expr::Binary(BinOp::Add, l, r, _) => matches!(&**l, Expr::Lit(Lit::Str(_))) && param(r),
+                        Expr::Template(parts) => parts.iter().any(|p| matches!(p, TPart::Expr(e) if param(e))),
+                        _ => false,
+                    };
+                    let builtin = !self.is_local("file") && self.globals.get("file").map_or(false, |v| &*v.file == "<builtin>");
+                    if n == "file" && made && builtin {
+                        self.warn("`file` serves the one file it is given, whatever its name: with a path from the request, `files(\"public\", path)` keeps `.env`, `.git` and the program's own files back");
                     }
                 }
                 self.call(callee, args, None)
@@ -5726,6 +5761,27 @@ impl Checker {
                     bits_text(t.bits)
                 ));
             }
+            // Null goes on (Q-534), so a middleware that gives the request back in one place and
+            // can end with no value in another, an `if` with no `else` last, lets in whoever
+            // reaches that end (FEEDBACK51.md, Q-651; branch feedback51-fixes).
+            let falls_through = match arg_exprs.first() {
+                Some(Expr::Call(f, _, _)) => match &**f {
+                    Expr::Ident(n, _) if !self.is_local(n) => self.bodies.get(&**n).is_some_and(|d| ends_without_value(&d.body) && d.params.first().is_some_and(|p| returns_name(&d.body, &p.name))),
+                    Expr::Lambda(d) => ends_without_value(&d.body) && d.params.first().is_some_and(|p| returns_name(&d.body, &p.name)),
+                    _ => false,
+                },
+                _ => false,
+            };
+            if falls_through {
+                let who = match arg_exprs.get(1) {
+                    Some(Expr::Lit(Lit::Str(s))) => s.to_string(),
+                    _ => "this middleware".to_string(),
+                };
+                self.warn(format!(
+                    "`{}` can end with no value, and null lets the request go on: end it with `false` or a `reply` where it should not",
+                    who
+                ));
+            }
         }
         // `db.exec("begin")`, refused as it runs (FEEDBACK44.md, Q-580; branch feedback40-43).
         if sig.builtin && matches!(name, "db.query" | "db.one" | "db.exec") {
@@ -6311,6 +6367,41 @@ fn exits(e: &Expr) -> bool {
 
 fn is_view(d: &FnDef) -> bool {
     d.name.chars().next().map_or(false, |c| c.is_uppercase())
+}
+
+/// Whether `return name` is somewhere in a function's body, outside the functions in it: a
+/// middleware that gives the request back there, and may end with nothing elsewhere. One that
+/// gives `false` there and nothing at its end lets the rest in on purpose (found in review).
+fn returns_name(body: &Expr, name: &str) -> bool {
+    match body {
+        Expr::Block(stmts) => stmts.iter().any(|s| match s {
+            Stmt::Return(Some(Expr::Ident(n, _)), _) => &**n == name,
+            Stmt::Expr(e) => returns_name(e, name),
+            _ => false,
+        }),
+        Expr::If(_, then, other) => returns_name(then, name) || other.as_deref().is_some_and(|o| returns_name(o, name)),
+        Expr::For(_, _, b, _) | Expr::While(_, b, _) => returns_name(b, name),
+        _ => false,
+    }
+}
+
+/// Whether a function's body can end with no value: an `if` with no `else` last, a loop or a
+/// `let` last, nothing at all (Q-651).
+fn ends_without_value(body: &Expr) -> bool {
+    match body {
+        Expr::Block(stmts) => match stmts.last() {
+            None => true,
+            Some(Stmt::Expr(e)) => ends_without_value(e),
+            Some(Stmt::Return(e, _)) => e.is_none(),
+            Some(Stmt::Let(..) | Stmt::Assign(..) | Stmt::SetField(..)) => true,
+            Some(_) => false,
+        },
+        // When the test fails it ends there, whatever the branch does.
+        Expr::If(_, _, None) => true,
+        Expr::If(_, then, Some(other)) => ends_without_value(then) || ends_without_value(other),
+        Expr::For(..) | Expr::While(..) => true,
+        _ => false,
+    }
 }
 
 fn route_path(r: &RouteDef) -> String {

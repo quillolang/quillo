@@ -11,9 +11,13 @@ use std::time::{Duration, Instant};
 use support::{free_port, listening, send, temp_dir, Guard};
 
 const SECRET: &str = "a-test-secret-for-readiness";
+/// Each check is said with the health token only (FEEDBACK51.md, Q-655).
+const TOKEN: &str = "a-health-token-for-readiness";
+const AUTH: (&str, &str) = ("authorization", "Bearer a-health-token-for-readiness");
 
 fn get(it: &mut Interp, url: &str) -> HttpResponse {
-    it.handle(&HttpRequest { method: "GET".into(), url: url.into(), headers: Vec::new(), body: Vec::new(), remote: "127.0.0.1".into() })
+    std::env::set_var("QUILLO_HEALTH_TOKEN", TOKEN);
+    it.handle(&HttpRequest { method: "GET".into(), url: url.into(), headers: vec![(AUTH.0.into(), AUTH.1.into())], body: Vec::new(), remote: "127.0.0.1".into() })
 }
 
 fn ready(it: &mut Interp) -> (u16, serde_json::Value) {
@@ -43,6 +47,7 @@ fn start(file: &Path, port: u16, args: &[&str]) -> Guard {
         .args(["--port", &port.to_string()])
         .args(args)
         .env("QUILLO_SERVICE_SECRET", SECRET)
+        .env("QUILLO_HEALTH_TOKEN", TOKEN)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -144,7 +149,10 @@ fn a_service_elsewhere_is_asked_at_each_of_its_addresses() {
     let _billing = start(&d.join("billing.qwe"), up, &["--as-service"]);
     let url = format!("billing=http://127.0.0.1:{},http://127.0.0.1:{}", up, down);
     let _app = start(&d.join("app.qwe"), app, &["--service-url", &url]);
+    // Without the token, whether; with it, each address.
     let a = send(app, "GET", "/_quillo/ready", &[], "");
+    assert_eq!((a.status, a.body.as_str()), (200, r#"{"ready":true}"#));
+    let a = send(app, "GET", "/_quillo/ready", &[AUTH], "");
     assert_eq!(a.status, 200, "{}", a.body);
     let j: serde_json::Value = serde_json::from_str(&a.body).unwrap();
     let at = &j["checks"]["service billing"];
@@ -194,7 +202,7 @@ fn a_copy_that_joined_is_asked_with_the_service_here() {
     let mut seen = String::new();
     assert!(
         until(|| {
-            seen = send(app, "GET", "/_quillo/ready", &[], "").body;
+            seen = send(app, "GET", "/_quillo/ready", &[AUTH], "").body;
             seen.contains("\"copies\"") && seen.contains(&format!("127.0.0.1:{}\":\"ready\"", copy))
         }),
         "{}",

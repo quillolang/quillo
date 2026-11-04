@@ -126,7 +126,8 @@ fn a_script_takes_values_as_data() {
 #[test]
 fn a_style_sheet_takes_values_as_text() {
     let body = "<style>{null}{false}{[\"a { }\", \"b { }\"]}{1}{\"</style>\"}</style>";
-    assert_eq!(page("", body), "<style>a { }\nb { }1<\\/style></style>");
+    // `<` is CSS's `\3c ` (FEEDBACK51.md, Q-646).
+    assert_eq!(page("", body), "<style>a { }\nb { }1\\3c /style></style>");
 }
 
 #[test]

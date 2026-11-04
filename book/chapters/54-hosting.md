@@ -271,8 +271,9 @@ about 170 MB, most of it Debian; `quillo` needs only the C library from it.
   is still the one to name. HTTP/1.0 clients (`ab`, some monitors) get no chunked
   answers and no `100 Continue`.
 - `GET /_quillo/ready` also says whether what the program needs is there (its database,
-  its services, checks of its own), 200 or 503 with each part as JSON: give it to an
-  orchestrator's readiness probe.
+  its services, checks of its own), 200 or 503: give it to an orchestrator's readiness
+  probe. Each part, as JSON, is said only with the health token (`Authorization: Bearer`
+  and `QUILLO_HEALTH_TOKEN`); anyone else gets `{"ready": ...}` alone *(since 0.7)*.
 - `--log json` writes a JSON line per request (time, method, path with its query, status,
   ms, ip, tenant, and `rid`, the request's id) on stderr, where systemd's journal or the
   container's log collects it. A malformed request is an object of its own,

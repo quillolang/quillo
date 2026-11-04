@@ -67,7 +67,7 @@ schedule("1h", clear_sessions)
 // Every day at 00:30 in Manila: matured deposits; on the 1st, the month's savings interest.
 schedule("30 16 * * *", daily)
 
-route GET /static/*path = file("public/" + path)
+route GET /static/*path = files("public", path)
 
 // ---- public -------------------------------------------------------------------------
 

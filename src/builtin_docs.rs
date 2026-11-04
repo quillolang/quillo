@@ -212,7 +212,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("udp.send", "host, port, data, options", "Sends one packet: text, a list of byte values, or a value as JSON. Null, or an error value."),
     ("udp.reply", "packet, data", "Sends `data` back to where `packet` came from, from the port it came to."),
     // Channels
-    ("channel.on", "name, f, options", "At the top of a program, `f(msg, peer)` gets each message from pages; `{ join, leave }`."),
+    ("channel.on", "name, f, options", "At the top, `f(msg, peer)` gets pages' messages; `{ join, leave, tenants }`, a room per tenant."),
     ("channel.send", "name, peer, value, options", "Sends `value` to one page, by peer or id, and gives whether it was there."),
     ("channel.broadcast", "name, value, options", "Sends `value` to every page in the channel, and gives how many took it; `{ except, reliable }`."),
     ("channel.peers", "name", "The ids of the pages in the channel."),
@@ -220,7 +220,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     // Media
     ("media.rtp", "name, options", "Makes a stream from RTP on `{ video, audio, host }`: H.264 and Opus, each on a port of its own."),
     ("media.close", "name", "Ends a stream and lets its ports go; true if there was such a stream."),
-    ("media.on", "name, options", "Lets pages send stream `name` (ending in `*`, every stream it starts); `publish(peer)` says which."),
+    ("media.on", "name, options", "Who may send stream `name` (`*`: each it starts) and watch it: `{ publish, watch, tenants }`."),
     ("media.streams", "", "The streams, in order of name, as `{ name, viewers, video, audio }`."),
     // Dates
     ("date.today", "tz", "Today's date as `YYYY-MM-DD`, in the zone `tz`: UTC unless given."),

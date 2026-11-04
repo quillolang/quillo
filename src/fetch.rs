@@ -172,13 +172,14 @@ fn proxy_for(url: &str) -> Option<String> {
 }
 
 /// The host of an http(s) URL, without its port or user.
-fn host_of(url: &str) -> &str {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    match authority.strip_prefix('[') {
-        Some(v6) => &authority[..v6.find(']').map_or(authority.len(), |i| i + 2)],
-        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+/// The host of `url` as the client reads it (WHATWG), an IPv6 address in `[...]`; empty if it
+/// does not parse. Split by hand, `http://169.254.169.254\x@example.com` was example.com here
+/// and the metadata address to the client (found in review of FEEDBACK51.md, Q-650).
+fn host_of(url: &str) -> String {
+    match url::Url::parse(url).ok().and_then(|u| u.host().map(|h| h.to_owned())) {
+        Some(url::Host::Ipv6(a)) => format!("[{}]", a),
+        Some(h) => h.to_string(),
+        None => String::new(),
     }
 }
 const STREAM_NAMES: &[&str] = &["method", "body", "headers"];
@@ -324,19 +325,17 @@ fn agent(o: Opts, stream: bool, url: &str) -> Result<ureq::Agent, String> {
     static AGENTS: OnceLock<Mutex<HashMap<Key, ureq::Agent>>> = OnceLock::new();
     let proxy = proxy_for(url);
     let mut agents = AGENTS.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let key = (o.redirects, o.public_only, stream, o.tls, proxy.clone());
+    let key = (0, o.public_only, stream, o.tls, proxy.clone());
     if let Some(a) = agents.get(&key) {
         return Ok(a.clone());
     }
     let b = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
-        // Under a policy that limits where it goes, each redirect is followed here, its address
-        // judged (see `follow`), not by the client, which would go anywhere.
-        .redirects(if crate::policy::get().limits_http() { 0 } else { o.redirects })
-        // `Authorization` goes on to the same host, as `fetch` keeps it for the same origin: an
-        // API that adds a `/` by a redirect answered 401 (FEEDBACK36.md, Q-437; branch
-        // feedback36-39).
-        .redirect_auth_headers(ureq::RedirectAuthHeaders::SameHost)
+        // Each redirect is followed here (see `follow`), its address judged, never by the
+        // client: it sent the program's headers to another port, through a proxy it went past
+        // `public_only`, and a `file:` one panicked (FEEDBACK51.md, Q-649 and Q-650; branch
+        // feedback51-fixes).
+        .redirects(0)
         .user_agent(concat!("quillo/", env!("CARGO_PKG_VERSION")));
     let b = if stream { b.timeout_read(Duration::from_secs(300)) } else { b.timeout(Duration::from_secs(60)) };
     // Through a proxy, the proxy looks the name up: `public_only` checks it before the call.
@@ -371,9 +370,13 @@ struct Reply {
 /// One call: its answer, the head read, the body not yet.
 fn call(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, String)], body: Option<&(String, Vec<u8>)>) -> Result<ureq::Response, String> {
     if o.public_only && proxy_for(url).is_some() {
-        let host = host_of(url).trim_start_matches('[').trim_end_matches(']');
-        let port = if url.starts_with("https://") { 443 } else { 80 };
-        resolve_public(&format!("{}:{}", host, port)).map_err(|e| timed_out(o, url, format!("{}: {}", url, e)))?;
+        // The host and port the client will ask the proxy for.
+        let u = url::Url::parse(url).map_err(|e| format!("{}: {}", url, e))?;
+        let host = host_of(url);
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let port = u.port_or_known_default().unwrap_or(80);
+        let at = if host.contains(':') { format!("[{}]:{}", host, port) } else { format!("{}:{}", host, port) };
+        resolve_public(&at).map_err(|e| timed_out(o, url, format!("{}: {}", url, e)))?;
     }
     let mut req = agent(o, stream, url)?.request(method, url);
     if o.timeout_ms > 0 {
@@ -382,41 +385,42 @@ fn call(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, Stri
     for (k, v) in headers {
         req = req.set(k, v);
     }
-    let res = match body {
-        Some((ctype, bytes)) => {
-            if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
-                req = req.set("content-type", ctype);
-            }
-            req.send_bytes(bytes)
+    if let Some((ctype, _)) = body {
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+            req = req.set("content-type", ctype);
         }
+    }
+    // What the client cannot take is an error value, not a crash of the route (Q-649).
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || match body {
+        Some((_, bytes)) => req.send_bytes(bytes),
         None => req.call(),
-    };
+    }))
+    .map_err(|_| format!("{}: the HTTP client could not make the call", url))?;
     match res {
         Ok(r) | Err(ureq::Error::Status(_, r)) => Ok(r),
         Err(e) => Err(timed_out(o, url, e.to_string())),
     }
 }
 
-/// `call`, and the redirects the client does not follow: a `307` or `308` after a write is
-/// followed with the same method and body, as RFC 9110 §15.4.8 and `fetch` do, where the
-/// redirect was the answer (FEEDBACK36.md, Q-437; branch feedback36-39). To another origin,
-/// `Authorization` and `Cookie` are not sent on.
+/// `call`, and its redirects, each followed here: a `307` or `308` with the same method and
+/// body, as RFC 9110 §15.4.8 and `fetch` do (FEEDBACK36.md, Q-437; branch feedback36-39); a
+/// `301`, `302` or `303` after a write as a GET. To another origin (scheme, host and port), the
+/// program's headers stay behind but for those that say what it takes (`accept`, `user-agent`,
+/// ...): `x-api-key` went on to another port (FEEDBACK51.md, Q-649; branch feedback51-fixes).
 fn follow(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, String)], body: Option<(String, Vec<u8>)>) -> Result<(String, ureq::Response), String> {
     let mut url = url.to_string();
     let mut headers = headers.to_vec();
     let mut hops = 0;
     let (mut method, mut body) = (method.to_string(), body);
-    let policed = crate::policy::get().limits_http();
     loop {
         // Each address, the first and each one it is sent on to (FEEDBACK41.md, Q-478; branch
         // feedback40-43).
         crate::policy::get().http(&url)?;
         let resp = call(o, stream, &method, &url, &headers, body.as_ref())?;
         let status = resp.status();
-        let again = o.redirects > 0
-            && (matches!(status, 307 | 308) && !matches!(method.as_str(), "GET" | "HEAD") || policed && matches!(status, 301 | 302 | 303 | 307 | 308));
-        // As the client does when it follows them: a 301, 302 or 303 after anything but a GET
-        // or a HEAD is a GET with no body.
+        let again = o.redirects > 0 && matches!(status, 301 | 302 | 303 | 307 | 308);
+        // As browsers do: a 301, 302 or 303 after anything but a GET or a HEAD is a GET with no
+        // body.
         if again && matches!(status, 301 | 302 | 303) && !matches!(method.as_str(), "GET" | "HEAD") {
             method = "GET".into();
             body = None;
@@ -429,7 +433,7 @@ fn follow(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, St
             return Err(format!("{}: more than {} redirects", url, o.redirects));
         }
         if origin_of(&next) != origin_of(&url) {
-            headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization") && !k.eq_ignore_ascii_case("cookie"));
+            headers.retain(|(k, _)| ["accept", "accept-language", "content-type", "user-agent"].iter().any(|h| k.eq_ignore_ascii_case(h)));
         }
         url = next;
     }
@@ -760,7 +764,9 @@ fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Va
             reply
         }
     };
-    let json = serde_json::from_str::<serde_json::Value>(&reply.body).map(|j| Value::from_json(&j)).unwrap_or(Value::Nil);
+    // Read straight into values, with a budget of them: an answer of 8 MB of `0,` took 633 MB
+    // (FEEDBACK51.md, Q-660; branch feedback51-fixes).
+    let json = Value::parse_json(&reply.body).unwrap_or(Value::Nil);
     let mut m = Map::new();
     m.insert("status".into(), Value::Int(reply.status as i64));
     m.insert("ok".into(), Value::Bool((200..300).contains(&reply.status)));
@@ -823,7 +829,7 @@ enum Kind {
 }
 
 fn parsed(text: &str) -> Value {
-    serde_json::from_str::<serde_json::Value>(text).map(|j| Value::from_json(&j)).unwrap_or_else(|_| Value::str(text))
+    Value::parse_json(text).unwrap_or_else(|_| Value::str(text))
 }
 
 /// Longest line or event `http.stream` waits for the end of: a server that

@@ -8,7 +8,9 @@
 //! and the answer kept a second or two so a probe does not walk the chain
 //! each time), and the checks the program adds with `ready(name, f)` hold.
 //! 200 when all are, 503 otherwise, with each one's state as JSON. Only
-//! states are said, not error texts: like `/_quillo/health`, anyone may ask.
+//! states are said, not error texts. Anyone may ask; each check, with the
+//! services' addresses, is said only with the health token (FEEDBACK51.md,
+//! Q-655).
 
 use crate::interp::{Ctrl, Interp};
 use crate::value::Value;
@@ -98,12 +100,30 @@ pub fn service(it: &mut Interp, name: &str, url: &str) -> (bool, J) {
 fn remote_ready(url: &str) -> bool {
     static SEEN: OnceLock<Mutex<HashMap<String, (Instant, bool)>>> = OnceLock::new();
     let seen = SEEN.get_or_init(Default::default);
-    if let Some((at, ok)) = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(url) {
-        if at.elapsed() < KEPT {
-            return *ok;
-        }
+    let kept = || seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(url).filter(|(at, _)| at.elapsed() < KEPT).map(|(_, ok)| *ok);
+    if let Some(ok) = kept() {
+        return ok;
     }
-    let agent = ureq::AgentBuilder::new().timeout(WAIT).redirects(0).build();
+    // One asks at a time, and the others take its answer: six probes at once of an address
+    // that does not answer held six workers 30 s each (FEEDBACK51.md, Q-655; branch
+    // feedback51-fixes).
+    let one = {
+        static ASKING: OnceLock<Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>> = OnceLock::new();
+        ASKING.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(url.to_string()).or_default().clone()
+    };
+    // One asking already: what was known, rather than wait for it (found in review).
+    let _turn = match one.try_lock() {
+        Ok(t) => t,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(url).is_some_and(|(_, ok)| *ok);
+        }
+    };
+    if let Some(ok) = kept() {
+        return ok;
+    }
+    // The connection too: ureq's own wait for it was 30 s.
+    let agent = ureq::AgentBuilder::new().timeout_connect(WAIT).timeout(WAIT).redirects(0).build();
     let ok = matches!(agent.get(&format!("{}/_quillo/ready", url)).call(), Ok(r) if r.status() == 200);
     seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(url.to_string(), (Instant::now(), ok));
     ok

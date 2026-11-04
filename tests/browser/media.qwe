@@ -2,6 +2,8 @@
 // VIDEO_PORT and AUDIO_PORT are replaced by the test with free ports.
 
 media.rtp("cam", { video: VIDEO_PORT, audio: AUDIO_PORT })
+// Pages may watch it: a stream with no `watch` rule takes no watchers (FEEDBACK51.md, Q-642).
+media.on("cam", { watch: (peer) => true })
 
 route GET / = <html><body><quillo-media stream="cam" controls/></body></html>
 route GET /streams = media.streams()

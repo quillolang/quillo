@@ -10,12 +10,31 @@
 use crate::interp::{fail, Ctrl, Interp};
 use crate::value::{Map, Value};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 type R = Result<Value, Ctrl>;
 
 /// Each site's cookies, by name: what it set and has not taken away.
 static JARS: Mutex<Option<HashMap<String, Vec<(String, String)>>>> = Mutex::new(None);
+
+/// The values `site` declarations made, kept so their maps are never freed and their
+/// addresses never reused. A site is one of these maps itself, shared, never a copy: any map
+/// with `$site` and `$url` keys was one, so visitor JSON (`request.json.keys()` on
+/// `{"$site": "x", "$url": "http://10.0.0.5/#"}`) and a script's literal made the server POST
+/// where they said, with the site's cookies (FEEDBACK51.md, Q-640; branch feedback51-fixes).
+static DECLARED: Mutex<Vec<Arc<Map>>> = Mutex::new(Vec::new());
+
+/// A value's site, if a `site` declaration made it.
+fn declared(v: &Value) -> Option<Arc<Map>> {
+    let Value::Map(m) = v else { return None };
+    let ours = m.contains_key("$site") && DECLARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|d| Arc::ptr_eq(d, m));
+    ours.then(|| m.clone())
+}
+
+/// Whether a value is a site a `site` declaration made.
+pub fn is_site(v: &Value) -> bool {
+    declared(v).is_some()
+}
 
 /// `__site(name, url)`: the value `site` declares.
 pub fn declare(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
@@ -30,10 +49,27 @@ pub fn declare(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if !ok {
         return fail(line, format!("`site {}` needs an address like https://shop.example.com, got {:?}", name, &**url));
     }
+    // A name for its cookies' file: letters, digits and `_`, as a declaration's is.
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return fail(line, format!("`site` takes a name of ASCII letters, digits and `_`, got {:?}", &**name));
+    }
     let mut m = Map::new();
     m.insert("$site".into(), Value::Str(name.clone()));
     m.insert("$url".into(), Value::str(u));
-    Ok(Value::map(m))
+    // The same declaration run again (a reload, a script) is the one made before: the list
+    // holds each site once.
+    let mut all = DECLARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let same = |d: &Map, k: &str| matches!((d.get(k), m.get(k)), (Some(Value::Str(a)), Some(Value::Str(b))) if a == b);
+    let m = match all.iter().find(|d| same(d, "$site") && same(d, "$url")) {
+        Some(d) => d.clone(),
+        None => {
+            let m = Arc::new(m);
+            all.push(m.clone());
+            m
+        }
+    };
+    drop(all);
+    Ok(Value::Map(m))
 }
 
 /// Whether cookies are kept: in an app of one person, or where whoever runs the program says it
@@ -85,7 +121,9 @@ static SAID_SERVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// `shop.notes(a, b)`, called as `__site_call(site, "notes", a, b)`.
 pub fn call(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let mut args = args.into_iter();
-    let (Some(Value::Map(site)), Some(Value::Str(f))) = (args.next(), args.next()) else { return fail(line, "a site's function was called without its site") };
+    let (Some(site), Some(Value::Str(f))) = (args.next().as_ref().and_then(declared), args.next()) else {
+        return fail(line, "a site's function is called on a value a `site` declaration made");
+    };
     let name = site.get("$site").map(|v| v.display()).unwrap_or_default();
     let url = site.get("$url").map(|v| v.display()).unwrap_or_default();
     let body = serde_json::Value::Array(args.map(|a| crate::interp::island_json(&a)).collect()).to_string();

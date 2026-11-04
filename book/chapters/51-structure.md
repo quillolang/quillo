@@ -297,6 +297,11 @@ vim.api.nvim_create_autocmd("FileType", {
 })
 ```
 
+A `.qwer` file gets the Rust compiler's errors only when it is saved, in a folder the
+editor says it trusts *(since 0.7)*, as compiling it runs its crates' build scripts: the
+VS Code extension says so for a trusted workspace, and Neovim with `init_options = {
+trusted = true }` in `vim.lsp.start`.
+
 The extension's README has Helix's settings, and `quillo dap` for debuggers in other
 editors.
 
@@ -310,4 +315,9 @@ it `use`s changes, and refreshes the pages you have open.
 | `lib/*.qwer` | Rust, `use`d like a `.qwe` file | [Rust](#rust) |
 | `migrations/` | SQL files, run in order, once | `db.migrate("migrations")` ([Database](#database)) |
 | `locales/` | `en.json`, `fr.json`, ... | `translations("locales")` |
-| `public/` | Images, fonts, CSS | `route GET /assets/*path = file("public/" + path)` |
+| `public/` | Images, fonts, CSS | `route GET /assets/*path = files("public", path)` |
+
+`files` serves a folder by the visitor's path, but not `.env`, `.git/` or the program's
+own files. `file("public/" + path)` serves whatever file it is given, `.env` and
+`main.qwe` included *(this guide's example until 0.7)*, and `quillo check` warns about
+it. See [files](https://quillolang.org/docs/reference/files/) and [file](https://quillolang.org/docs/reference/file/).

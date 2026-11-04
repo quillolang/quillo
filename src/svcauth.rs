@@ -632,9 +632,32 @@ pub fn age_jwks(url: &str, by: Duration) {
     }
 }
 
-/// `request.caller` of a token's claims.
-pub fn jwt_caller(claims: &serde_json::Value) -> Value {
+/// `request.caller` of a token's claims; an error for a token a user signed in for. Such a token
+/// names the client the user came through (`azp: "shop"`) and the user (`sub: "user-42"`), and
+/// it passed `for ["shop"]`: a page forwarding its visitor's token called as the shop
+/// (FEEDBACK51.md, Q-665; branch feedback51-fixes). A client's own token has the client as
+/// `sub` (RFC 9068 §2.2, Okta), or is one of Auth0's client-credentials tokens, a Keycloak
+/// service account's, or an Entra ID app's.
+pub fn jwt_caller(claims: &serde_json::Value) -> Result<Value, String> {
     let name = ["client_id", "azp", "sub"].iter().find_map(|k| claims[*k].as_str()).unwrap_or("").to_string();
+    let own = match claims["sub"].as_str() {
+        None => true,
+        Some(sub) => {
+            sub == name
+                || sub == format!("{}@clients", name)
+                || claims["gty"] == "client-credentials"
+                // Keycloak's service account: its name is one a user may be given, so the
+                // client's own claim too (found in review).
+                || claims["client_id"].as_str() == Some(name.as_str()) && claims["preferred_username"].as_str() == Some(format!("service-account-{}", name).as_str())
+                // Entra ID: an app's token says so (`idtyp`), or is its service principal's,
+                // with no delegated scopes (found in review).
+                || claims["idtyp"] == "app"
+                || claims["oid"].as_str() == Some(sub) && claims["scp"].is_null()
+        }
+    };
+    if !own {
+        return Err(format!("the token is one a user signed in for (sub {:?}), not client {:?}'s own: a service calls with its own (the client-credentials grant)", claims["sub"].as_str().unwrap_or(""), name));
+    }
     let scopes: Vec<Value> = match &claims["scope"] {
         serde_json::Value::String(s) => s.split_whitespace().map(Value::str).collect(),
         serde_json::Value::Array(l) => l.iter().filter_map(|v| v.as_str().map(Value::str)).collect(),
@@ -643,7 +666,7 @@ pub fn jwt_caller(claims: &serde_json::Value) -> Value {
             _ => Vec::new(),
         },
     };
-    caller_value(&name, "jwt", vec![("scopes", Value::list(scopes)), ("claims", Value::from_json(claims))])
+    Ok(caller_value(&name, "jwt", vec![("scopes", Value::list(scopes)), ("claims", Value::from_json(claims))]))
 }
 
 pub type Shared = Arc<Accept>;

@@ -493,7 +493,9 @@ again at the same address, with the same call id. The service remembers the call
 answered for eleven minutes (in its database too, `_quillo_calls`, when it has one, so
 copies sharing it remember together) and gives the same answer again, so while the
 service stays up the function runs once however often the call is sent. A call still
-running there is waited for.
+running there is waited for. The same call is the same caller's, to the same function,
+for the same tenant, with the same arguments *(since 0.7: by its id alone, another
+caller that had the id was given the first one's answer)*.
 
 Across a crash a call runs at least once. A service stopped in the middle of a function
 cannot say how far it got, so the call is refused as still running for eleven minutes,
@@ -671,14 +673,19 @@ server fn whoami() -> map = { caller: request.caller, user: request.user, forwar
   rotated.
 - `jwt` takes bearer tokens: their signature against the provider's keys (`jwks`, a URL;
   RS256, ES256 and EdDSA) or a `secret` (HS256), with `exp` required and `iss` and `aud`
-  checked. `audience` is required.
+  checked. `audience` is required. A token a user signed in for, whose `sub` is the user
+  and not the client, is refused *(since 0.7)*: a page passing its visitor's token on
+  called as the shop. A service calls with its own, from the client-credentials grant.
 - `client_cert` takes the identity of a certificate a proxy checked, as Envoy and
   Istio pass it on: Quillo does not end TLS itself. The header is believed only on a
   request from an address `--trust-proxy` names.
-- `check` runs before the arguments are read. `false` refuses the call with 403, a map
-  becomes the caller, and `reply` answers the call.
+- `check` runs before the arguments are read. Only `true` or a map accepts, and a map
+  becomes the caller; anything else refuses the call with 403, `false` and null among
+  them *(since 0.7: null, an `if` with no `else`, let every other caller in)*. An error
+  value refuses with its text, and `reply` answers the call.
 - `for ["shop"]` takes calls from those callers only; others get 403, before their
-  arguments are read.
+  arguments are read. Pages cannot call it at `/_quillo/rpc/refund`, which answers 404,
+  and their script has no `server.refund` *(since 0.7: anyone could)*.
 
 `request.caller` is who called: `{ name, by }`, with `by` one of `"quillo"`, `"key"`,
 `"jwt"` and `"mtls"`; a token adds its `scopes` and `claims`, a certificate its

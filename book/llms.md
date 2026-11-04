@@ -32,7 +32,7 @@ Quillo program:
 | `main.qwe` | the program: what it opens, the files it uses, its routes |
 | `lib/*.qwe`, `ui/*.qwe` | its parts, by convention: helpers and server fns; views and components |
 | `migrations/NNN_name.sql` | the database's tables, run once each, in order, by `db.migrate("migrations")` |
-| `public/` | files served as they are (with a route: `route GET /assets/*path = file("public/" + path)`) |
+| `public/` | files served as they are (with a route: `route GET /assets/*path = files("public", path)`) |
 | `*.qwer`, `*.rs` *(since 0.7)* | Rust a program `use`s (`quillo install <name>` fetches a `.qwer` plugin from quillolang.org/plugins) |
 
 `quillo new my-app` *(since 0.7)* makes a program to start from (`--minimal` for a page and a
@@ -189,7 +189,7 @@ route POST /todos { form: { text: str } } with db {
     redirect("/")
 }
 route POST /api/users { json: User } = respond(201, save(json))      // body made a User
-route GET /assets/*path = file("public/" + path)
+route GET /assets/*path = files("public", path)
 ```
 
 - A route gives: HTML (200 html), a string (200 text), a map, list, number or bool

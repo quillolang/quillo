@@ -498,18 +498,37 @@ fn example_brings_the_example_and_the_files_it_reads() {
 }
 
 #[test]
-fn an_example_here_already_is_kept_unless_forced() {
+fn an_example_here_already_is_kept_even_when_forced() {
     let d = dir("example-kept");
     let (r, _) = with_example();
     std::fs::write(d.join("hi.qwe"), "my own\n").unwrap();
     let o = from(&r, &d, &["hi", "--examples"]);
     assert!(o.status.success());
-    assert!(out(&o).contains("  ./hi.qwe is already here: kept (--force replaces it)\n"), "{}", out(&o));
+    assert!(out(&o).contains("  ./hi.qwe is already here: kept\n"), "{}", out(&o));
     assert_eq!(std::fs::read_to_string(d.join("hi.qwe")).unwrap(), "my own\n");
-    // Up to date itself, the plugin's example still comes when forced.
+    // --force replaces the plugin's file, never the program's own (FEEDBACK51.md, Q-673).
     let o = from(&r, &d, &["hi", "--example", "--force"]);
-    assert!(out(&o).starts_with("hi 1.0.0 is up to date\n  and ./hi.qwe\n"), "{}", out(&o));
-    assert_eq!(std::fs::read_to_string(d.join("hi.qwe")).unwrap(), "use \"hi.qwer\"\nprint(hi())\n");
+    assert!(out(&o).starts_with("hi 1.0.0 is up to date\n  ./hi.qwe is already here: kept\n"), "{}", out(&o));
+    assert_eq!(std::fs::read_to_string(d.join("hi.qwe")).unwrap(), "my own\n");
+}
+
+// Q-673: an extra is a file on the registry with a plain name: not an address of its own, not
+// a name with a `\\` or a `:`.
+#[test]
+fn an_extra_is_a_plain_file_on_the_registry() {
+    let d = dir("example-names");
+    let (r, file) = with_example();
+    let mut e = entry("hi", "1.0.0", &file);
+    e["example"] = "/plugins/files/hi.qwe".into();
+    e["files"] = serde_json::json!([format!("{}/plugins/files/words.txt", r.url), "/plugins/files/..\\..\\x.txt", "/plugins/files/c:main.qwe", "/plugins/files/words.txt"]);
+    r.catalog(&[e]);
+    let o = from(&r, &d, &["hi", "--example"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let said = out(&o);
+    assert!(said.contains(&format!("  {}/plugins/files/words.txt: not a file on the registry: left out\n", r.url)), "{}", said);
+    assert!(said.contains("..\\..\\x.txt: not a file on the registry: left out\n") && said.contains("c:main.qwe: not a file on the registry: left out\n"), "{}", said);
+    assert!(said.contains("  and ./words.txt\n"), "{}", said);
+    assert_eq!(std::fs::read(d.join("hi.qwer")).unwrap(), file);
 }
 
 #[test]

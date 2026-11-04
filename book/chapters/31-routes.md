@@ -666,7 +666,8 @@ fn touch() {
   an `etag` is a 304 to a `GET` or `HEAD` whose `If-None-Match` holds it, as files are:
   `` respond(200, v, { etag: `"${version}"` }) ``. Header names are written in lower case, and a name or value with a control character (a line break) is
   a runtime error. `content-length`, `transfer-encoding`, `connection` and `date` are
-  the server's, whatever is given. `redirect(url, status)` takes 300 to 399.
+  the server's, whatever is given. `redirect(url, status)` takes 300 to 399, and no
+  `javascript:` URL.
 - Every answer carries `server: Quillo` (unless the route sets `server`), `date`,
   `x-request-id` and `x-content-type-options: nosniff`. Every HTML page carries
   `x-frame-options: SAMEORIGIN`, unless the route sets one or a
@@ -1159,7 +1160,7 @@ component Board() {
   called it stands (the component leaving the page closes it): `f` gets each message the
   server sends on it, and `.send(value)` sends one to the server. On the server, while
   the page is rendered, it opens nothing.
-- On the server, `channel.on(name, f, { join, leave })` is written at the top of a
+- On the server, `channel.on(name, f, { join, leave, tenants })` is written at the top of a
   program, once for a name. A name is letters, digits, `_`, `-`, `.` and `:`, at most
   64 characters. `f(msg, peer)` gets each message from a page; `peer` is `{ id,
   session }`, its `id` twelve hex characters made for the connection (a page that
@@ -1179,6 +1180,14 @@ component Board() {
   broadcasts on its channel, or sends to the page that is joining, reaches that page
   too, right after its yes: a roster broadcast as someone enters is the first thing
   they hear. So does what is broadcast between the yes and the page hearing it.
+- **Each tenant has its own room** of a channel (see [Many tenants](#many-tenants)): pages on
+  `acme.example.com` and `evil.example.com` joining `lobby` are in two rooms *(since 0.7:
+  one room for all)*. What code run for a page or a request broadcasts, sends or lists
+  (`channel.peers`) is its tenant's room's; with no tenant, the bare domain's, the room of
+  no tenant. Code run for no one, a job, a tick or the top level, reaches every tenant's
+  room, and `with_tenant(name, f)` one tenant's. `{ tenants: "shared" }` makes one room
+  for every tenant. Under `--split`, a service's channel is per tenant whatever it says.
+  Pages may ask of 4,096 channel names in all; past that a page asking to join is told no.
 
   A chat for people who are signed in, with both sides:
 
@@ -1215,7 +1224,7 @@ component Board() {
   refused at `join`: the list stays empty, and what they send goes nowhere.
 - `channel.broadcast(name, value, { except, reliable })` sends to every page in the
   channel and gives how many took it; `channel.send(name, peer, value, { reliable })`
-  sends to one (the peer, or its id), and gives whether it was there;
+  sends to one (the peer, or its id, in a room the code reaches), and gives whether it was there;
   `channel.peers(name)` gives the ids of the pages in it. They need the `net` effect,
   and wait for nothing: a page that cannot keep up misses messages rather than holding
   up the program. A message is a value, as JSON, up to 1 MiB (bytes go as a list of
@@ -1275,6 +1284,7 @@ play it in its pages, a fraction of a second behind:
 
 ```quillo
 media.rtp("cam", { video: 5004, audio: 5006 })
+media.on("cam", { watch: (peer) => peer.session.user != null })
 
 route GET / = <html><body><quillo-media stream="cam" controls muted/></body></html>
 ```
@@ -1295,7 +1305,11 @@ ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
   watching, without decoding or encoding anything. Any sender that reaches the port is
   taken (the payload type and SSRC are not checked), and there is no RTCP and no SRTP:
   keep the ports to the network the camera is on. The server keeps at most 600 frames
-  since the last keyframe.
+  since the last keyframe, and 32 MiB of them (256 MiB for all streams: past that a stream
+  keeps none, and a page that starts watching it waits for its next keyframe).
+- **Who may watch** is `media.on(name, { watch })`'s `watch(peer)`, asked as a channel's
+  `join` is, with the page's session. A stream no `watch` names is watched by no page
+  *(since 0.7: any page could watch any stream)*.
 - `<quillo-media stream="cam">` in any page plays the stream: the page loads a small
   script for it (4.5 KB compressed, `/_quillo/media.js`, put into any page that writes
   the element), which decodes with the browser's own decoders (WebCodecs) and draws on a
@@ -1314,7 +1328,7 @@ ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
 - `media.streams()` gives a list, by name: `{ name, viewers, video: { frames, fps,
   kbps, lost }, audio: { ... } }`, the viewers being this server's pages, and `fps` and
   `kbps` 0 after 3 s without frames.
-- **Pages send too.** `media.on(name, { publish })` lets pages send stream `name` (or
+- **Pages send too.** `media.on(name, { publish, watch, tenants })` lets pages send stream `name` (or
   every stream a name ending in `*` starts: `"call:*"`), and
   `<quillo-media publish="call:42">` sends the page's camera and microphone to it, for
   every `<quillo-media stream="call:42">` to play. The browser encodes them with WebCodecs
@@ -1323,11 +1337,11 @@ ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
   its channel connection; the server passes them on as it does RTP, decoding nothing.
   Sound needs Chromium's capture API (`MediaStreamTrackProcessor`): a browser without it
   sends the picture alone. `publish(peer)` says which pages may, as a channel's `join`
-  does (with the page's `session()`); without it, any page may. A video call is a
-  stream per person:
+  does (with the page's `session()`); without it, no page may *(since 0.7: any page
+  could)*. A video call is a stream per person:
 
   ```quillo
-  media.on("call:*", { publish: (peer) => session().user != null })
+  media.on("call:*", { publish: (peer) => session().user != null, watch: (peer) => session().user != null })
 
   component Call(room: str, me: str, others: list) {
       <div>
@@ -1344,6 +1358,13 @@ ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
   `el.mediaStats` counts what it encoded and sent. Each person's picture goes once to the
   server, which sends it on to everyone watching (what video services call an SFU); there
   is no TURN relay for networks that block UDP, where the WebSocket carries it.
+- **Each tenant has its own streams** of a name, as it has its own rooms of a channel
+  (see [Channels](#channels)): acme's `call:42` is not evil's, and a tenant's page that
+  watches a name it has no stream of watches the program's own RTP stream of that name.
+  `tenants: "shared"` makes one stream for all. `media.streams()` lists the tenant's and
+  the program's; `media.close(name)` ends the tenant's, and from a job, a tick or the top
+  level every tenant's of that name. Pages make at most 1,024 streams, 256 a tenant, and a
+  page watches at most 32 at once; a stream no page sends or watches any more goes.
 - `media.close(name)` ends a stream: it stops taking RTP, lets its ports go (for another
   stream to take; it waits up to a second for that), and tells its pages, whose
   `data-state` turns `ended`, and stays so until the page reconnects, even if a stream
@@ -1360,9 +1381,16 @@ ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
 ## Static files
 
 ```quillo
-route GET /assets/*path = file("public/" + path)
-route GET /build/*path = file("dist/" + path, { cache: "1y" })   // names that change with content
+route GET /assets/*path = files("public", path)
+route GET /build/*path = files("dist", path, { cache: "1y" })   // names that change with content
+route GET /report = file("exports/report.pdf")
 ```
+
+- **A path from the visitor goes to `files(folder, path)`** (below), which does not serve
+  `.env`, `.git/` or the program's own files. `file()` serves the one file it is given,
+  whatever its name: `file("public/" + path)` gives `/assets/.env` and `/assets/main.qwe`
+  away *(the guide's example until 0.7)*, and `quillo check` warns about a `file()` whose
+  path is made from text (FEEDBACK51.md, Q-657).
 
 - `file(path, options)` takes three options and refuses any other, naming those it takes:
   `cache` (below), `download`, a name, which sends `Content-Disposition: attachment` with
@@ -1416,10 +1444,12 @@ route GET /docs/*p = files("manual", p, { index: "home.htm", extensions: ["htm"]
 
 - `/` and `/docs/` are their folder's `index.html`, `/about` finds `about.html`, and a
   folder named without its `/` (`/docs`) is redirected to it (301), so its pages'
-  relative links work. A miss is the folder's `404.html`, sent with status 404, when it
+  relative links work (`//docs` goes to `/docs/`, never to another host). A miss is the folder's `404.html`, sent with status 404, when it
   has one; else the plain 404.
 - Files whose names start with a dot (`.env`, `.git/`) are not served, but `.well-known/`
-  is; nor are the program's own (`.qwe`, `.qwer`, `.rs`). Each file goes as `file()`
+  is; nor are the program's own (`.qwe`, `.qwer`, `.rs`), however the name is written for
+  the file system: `lib.QWE` on macOS and Windows, `lib.qwe.` and `lib.qwe::$DATA` on
+  Windows *(since 0.7)*. Each file goes as `file()`
   sends it, its `ETag`, ranges and type included. A path that leads out of the program's
   folder through a link is a miss, whether what it leads to is there or not (see [Paths
   and links](#paths-and-links)). `files` and `file` need the `fs` effect.
@@ -1968,7 +1998,8 @@ server fn refund(account: int, cents: int) for ["shop"] {
 
 `server fn refund(...) for ["shop"]` takes calls from those callers only, checked before
 the arguments are read: another gets 403 (`` `refund` takes calls from shop only; this is
-`notify` ``). `quillo check` refuses `for []`, `for [shop]` (a caller is named in plain
+`notify` ``). Pages cannot call it at `/_quillo/rpc/refund`, which answers 404, and their
+script has no `server.refund` *(since 0.7: anyone could)*. `quillo check` refuses `for []`, `for [shop]` (a caller is named in plain
 text, `"shop"`) and `for "shop"`, and `quillo docs` puts each function's callers in
 `x-quillo-callers`, for a gateway to enforce too.
 
@@ -2119,6 +2150,11 @@ empty.
   says so, once), as one visitor's session would be every visitor's.
 - It runs on the server side only: `quillo check` refuses `shop.x()` in a component
   ("call it in a server fn"). `site` stays an ordinary name elsewhere (`let site = ...`).
+- A call is a request to the site: it needs the `http` effect, and `quillo check` says so
+  of a function `with time` that calls `shop.notes` (`` `shop.notes` needs the http
+  effect ``). Only what a `site` declaration made is a site *(since 0.7)*: a map with the
+  same keys, from JSON or a script, is a map, so a visitor cannot point a call elsewhere.
+  The name is ASCII letters, digits and `_`.
 - `/_quillo/rpc/<fn>` is a stable wire for programs: a JSON array of arguments in,
   `{"ok": value}` or `{"err": error}` out. A program needs no `Origin` header; another
   site's `Origin` is refused.

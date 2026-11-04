@@ -241,7 +241,9 @@ fn the_builtins_say_what_they_take() {
     assert!(fails("media.on(\"a b\")").contains("got \"a b\""));
     assert!(fails(&format!("media.on(\"{}\")", "a".repeat(59))).contains("takes a stream's name first"));
     assert!(fails("media.on(\"cam\", { publish: 1 })").contains("`publish` is a function of the page that wants to send"));
-    assert!(fails("media.on(\"cam\", { watch: 1 })").contains("no option `watch` (it takes publish)"));
+    assert!(fails("media.on(\"cam\", { watch: 1 })").contains("`watch` is a function of the page that wants to watch"));
+    assert!(fails("media.on(\"cam\", { other: 1 })").contains("no option `other` (it takes publish, watch and tenants)"));
+    assert!(fails("media.on(\"cam\", { tenants: \"all\" })").contains("`tenants` is \"shared\" (one room for every tenant) or \"own\""));
     assert!(fails("media.on(\"cam\", 5)").contains("takes options as a map, got int"));
     assert!(fails("media.on(\"cam\")\nmedia.on(\"cam\")").contains("already takes stream \"cam\" from pages"));
     assert!(fails("media.close()").contains("takes a stream's name, got nothing"));
@@ -256,7 +258,10 @@ fn the_builtins_say_what_they_take() {
     it.load_source("media.on(\"room:*\", { publish: (p) => true })\nmedia.on(\"open\", null)\nmedia.on(\"any\", {})", "m.qwe").unwrap();
     let names: Vec<&str> = it.site.channels.iter().map(|h| h.name.as_str()).collect();
     assert_eq!(names, ["media:room:*", "media:open", "media:any"]);
-    assert!(it.site.channels[0].join.is_some() && it.site.channels[1].join.is_none());
+    // With no `publish`, a join rule that says no to every page (FEEDBACK51.md, Q-643).
+    assert!(it.site.channels.iter().all(|h| h.join.is_some()));
+    assert!(matches!(&it.site.channels[1].join, Some(quillo::value::Value::Builtin("media.on.nobody", _))));
+    assert!(it.site.channels.iter().all(|h| h.watch.is_none()));
 }
 
 /// A page, as far as a stream can tell.
@@ -313,55 +318,57 @@ fn frames_from_a_page_reach_those_watching_and_a_stream_can_be_closed() {
 
     // A frame cut short, of no kind, or with no name in UTF-8 is not taken.
     let w = watcher();
-    media::watch(name, w.clone());
-    media::from_page(Vec::new());
-    media::from_page(wire(name, media::VIDEO, true, b"")[..5].to_vec());
-    media::from_page(wire(name, 9, true, b"x"));
-    media::from_page(vec![1, 0xff, media::VIDEO, 1, 0, 0, 0, 0]);
+    media::watch(&media::key(name, None), name, w.clone());
+    media::from_page(&media::key(name, None), Vec::new());
+    media::from_page(&media::key(name, None), wire(name, media::VIDEO, true, b"")[..5].to_vec());
+    media::from_page(&media::key(name, None), wire(name, 9, true, b"x"));
+    media::from_page(&media::key(name, None), vec![1, 0xff, media::VIDEO, 1, 0, 0, 0, 0]);
     assert!(kinds(&w).is_empty());
     assert!(!figures(name).contains(name), "not one yet: {}", figures(name));
 
     // Video before any keyframe is skipped; then all of it goes.
-    media::from_page(wire(name, media::VIDEO, false, b"d0"));
-    media::from_page(wire(name, media::VIDEO, true, b"k1"));
-    media::from_page(wire(name, media::VIDEO, false, b"d1"));
-    media::from_page(wire(name, media::AUDIO, true, b"a1"));
+    media::from_page(&media::key(name, None), wire(name, media::VIDEO, false, b"d0"));
+    media::from_page(&media::key(name, None), wire(name, media::VIDEO, true, b"k1"));
+    media::from_page(&media::key(name, None), wire(name, media::VIDEO, false, b"d1"));
+    media::from_page(&media::key(name, None), wire(name, media::AUDIO, true, b"a1"));
     assert_eq!(kinds(&w), [(media::VIDEO, true), (media::VIDEO, false), (media::AUDIO, true)]);
     assert_eq!(w.frames.lock().unwrap()[0].2, wire(name, media::VIDEO, true, b"k1"));
 
     // A page that comes now starts from the keyframe.
     let late = watcher();
-    media::watch(name, late.clone());
+    media::watch(&media::key(name, None), name, late.clone());
     assert_eq!(kinds(&late), [(media::VIDEO, true), (media::VIDEO, false)]);
     let s = figures(name);
     assert!(s.contains("viewers: 2") && s.contains("video: { frames: 3") && s.contains("audio: { frames: 1"), "{}", s);
 
     // One that cannot take a frame skips until the next keyframe, audio aside.
     late.refuse.store(true, Ordering::SeqCst);
-    media::from_page(wire(name, media::VIDEO, false, b"d2"));
+    media::from_page(&media::key(name, None), wire(name, media::VIDEO, false, b"d2"));
     late.refuse.store(false, Ordering::SeqCst);
-    media::from_page(wire(name, media::VIDEO, false, b"d3"));
-    media::from_page(wire(name, media::AUDIO, true, b"a2"));
+    media::from_page(&media::key(name, None), wire(name, media::VIDEO, false, b"d3"));
+    media::from_page(&media::key(name, None), wire(name, media::AUDIO, true, b"a2"));
     assert_eq!(kinds(&late)[2..], [(media::AUDIO, true)]);
-    media::from_page(wire(name, media::VIDEO, true, b"k2"));
+    media::from_page(&media::key(name, None), wire(name, media::VIDEO, true, b"k2"));
     assert_eq!(kinds(&late)[3..], [(media::VIDEO, true)]);
 
     // A page that stops watching gets no more; one watching twice, once.
-    media::unwatch(name, late.id);
-    media::unwatch("no-such-stream", late.id);
-    media::from_page(wire(name, media::AUDIO, true, b"a3"));
+    media::unwatch(&media::key(name, None), late.id);
+    media::unwatch("media:no-such-stream", late.id);
+    media::from_page(&media::key(name, None), wire(name, media::AUDIO, true, b"a3"));
     assert_eq!(kinds(&late).len(), 4);
-    media::watch(name, w.clone());
-    media::from_page(wire(name, media::VIDEO, false, b"d4"));
+    media::watch(&media::key(name, None), name, w.clone());
+    media::from_page(&media::key(name, None), wire(name, media::VIDEO, false, b"d4"));
     let n = w.frames.lock().unwrap().iter().filter(|f| f.2.ends_with(b"d4")).count();
     assert_eq!(n, 1);
     assert!(figures(name).contains("viewers: 1"), "{}", figures(name));
+    // The last one gone, and no page sending from its room: the stream goes (found in review
+    // of FEEDBACK51.md, Q-643).
     media::unwatch_all(w.id);
-    assert!(figures(name).contains("viewers: 0"), "{}", figures(name));
+    assert_eq!(figures(name), "[]");
 
     // Those watching at the end hear of it, and no stream is left.
     let last = watcher();
-    media::watch(name, last.clone());
+    media::watch(&media::key(name, None), name, last.clone());
     let before = last.frames.lock().unwrap().len();
     assert_eq!(ev(&format!("media.close({:?})", name)), "true");
     let f = last.frames.lock().unwrap();
@@ -374,17 +381,17 @@ fn frames_from_a_page_reach_those_watching_and_a_stream_can_be_closed() {
 #[test]
 fn a_keyframe_that_never_comes_lets_go_of_what_is_kept() {
     let name = "long-gop";
-    media::from_page(wire(name, media::VIDEO, true, b"k"));
+    media::from_page(&media::key(name, None), wire(name, media::VIDEO, true, b"k"));
     for _ in 0..600 {
-        media::from_page(wire(name, media::VIDEO, false, b"d"));
+        media::from_page(&media::key(name, None), wire(name, media::VIDEO, false, b"d"));
     }
     // 600 kept is the most: no keyframe to start from, so a new page waits.
     let w = watcher();
-    media::watch(name, w.clone());
+    media::watch(&media::key(name, None), name, w.clone());
     assert!(kinds(&w).is_empty(), "{}", kinds(&w).len());
-    media::from_page(wire(name, media::VIDEO, false, b"d"));
+    media::from_page(&media::key(name, None), wire(name, media::VIDEO, false, b"d"));
     assert!(kinds(&w).is_empty());
-    media::from_page(wire(name, media::VIDEO, true, b"k"));
+    media::from_page(&media::key(name, None), wire(name, media::VIDEO, true, b"k"));
     assert_eq!(kinds(&w), [(media::VIDEO, true)]);
     assert_eq!(ev(&format!("media.close({:?})", name)), "true");
 }
@@ -396,7 +403,7 @@ fn rtp_on_its_ports_makes_frames_with_their_figures() {
     let src = format!("media.rtp({:?}, {{ video: {{ port: {}, codec: \"H264\" }}, audio: {{ port: {} }}, host: \"127.0.0.1\" }})", name, video, audio);
     assert_eq!(ev(&src), "null");
     let w = watcher();
-    media::watch(name, w.clone());
+    media::watch(&media::key(name, None), name, w.clone());
     let s = UdpSocket::bind("127.0.0.1:0").unwrap();
     let sent = |p: Vec<u8>, port: u16| s.send_to(&p, ("127.0.0.1", port)).unwrap();
 
@@ -446,7 +453,7 @@ fn a_rate_is_shown_while_frames_come() {
     let start = Instant::now();
     let mut n = 0;
     while start.elapsed() < Duration::from_millis(1200) {
-        media::from_page(wire(name, media::AUDIO, true, &[0; 100]));
+        media::from_page(&media::key(name, None), wire(name, media::AUDIO, true, &[0; 100]));
         n += 1;
         std::thread::sleep(Duration::from_millis(20));
     }

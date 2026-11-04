@@ -222,38 +222,88 @@ fn most_converting() -> usize {
 /// Most conversions waiting for their turn; past that, an error at once.
 const MOST_WAITING: usize = 64;
 
-/// `f` once fewer than `most_converting()` conversions run, or an error when
-/// too many already wait.
-fn in_turn<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+/// Most pixels an image converted may have. The decode's own cap leaves its copies out
+/// (`to_rgb8`, the resize): a 12,000 × 12,000 PNG of 420 KB took about 0.8 GB (FEEDBACK51.md,
+/// Q-674; branch feedback51-fixes).
+const MOST_PIXELS: u64 = 40_000_000;
+
+/// Most memory one conversion is thought to take (see `cost_of`), and all of those running at
+/// once; one alone may take up to `MOST_BYTES_ONE`. Pixels alone did not bound it: a 40
+/// megapixel PNG resized to 6,399 wide took 975 MB, as the resize works in 16 bytes a pixel
+/// (found in review of FEEDBACK51.md, Q-674).
+const MOST_BYTES_ONE: u64 = 640 << 20;
+const BYTES_AT_ONCE: u64 = 1 << 30;
+
+/// `f` once fewer than `most_converting()` conversions run, with `bytes` more fitting in
+/// `BYTES_AT_ONCE`, or an error when too many already wait.
+fn in_turn<T>(bytes: u64, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     use std::sync::{Condvar, Mutex};
-    // (running, waiting)
-    static AT_ONCE: Mutex<(usize, usize)> = Mutex::new((0, 0));
+    // (running, waiting, their pixels)
+    static AT_ONCE: Mutex<(usize, usize, u64)> = Mutex::new((0, 0, 0));
     static FREED: Condvar = Condvar::new();
     let mut n = AT_ONCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if n.0 >= most_converting() && n.1 >= MOST_WAITING {
+    let full = |n: &(usize, usize, u64)| n.0 >= most_converting() || n.0 > 0 && n.2 + bytes > BYTES_AT_ONCE;
+    if full(&n) && n.1 >= MOST_WAITING {
         return Err("too many images are being converted at once; try again shortly".into());
     }
     n.1 += 1;
-    while n.0 >= most_converting() {
+    while full(&n) {
         n = FREED.wait(n).unwrap_or_else(std::sync::PoisonError::into_inner);
     }
     n.1 -= 1;
     n.0 += 1;
+    n.2 += bytes;
     drop(n);
-    struct Done;
+    struct Done(u64);
     impl Drop for Done {
         fn drop(&mut self) {
-            AT_ONCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0 -= 1;
-            FREED.notify_one();
+            let mut n = AT_ONCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            n.0 -= 1;
+            n.2 -= self.0;
+            // Each waiting one: a large one gone may leave room for several.
+            FREED.notify_all();
         }
     }
-    let _done = Done;
+    let _done = Done(bytes);
     f()
+}
+
+/// The memory converting the image at `src` as `job` says is thought to take, from its header:
+/// the image decoded, the resize's own (16 bytes a pixel, the width it has by the height it
+/// will have) and what it gives, and the copy encoded. An error past `MOST_PIXELS` or
+/// `MOST_BYTES_ONE`.
+fn cost_of(src: &Path, job: &Job) -> Result<u64, String> {
+    let d = reader(src)?.into_decoder().map_err(|e| e.to_string())?;
+    let (w, h) = d.dimensions();
+    let bpp = d.color_type().bytes_per_pixel() as u64;
+    if w as u64 * h as u64 > MOST_PIXELS {
+        return Err(format!("the image is {}×{}, more than the {} megapixels converted", w, h, MOST_PIXELS / 1_000_000));
+    }
+    let (cw, ch) = job.crop.map_or((w as u64, h as u64), |(_, _, cw, ch)| (cw.min(w) as u64, ch.min(h) as u64));
+    let mut bytes = w as u64 * h as u64 * bpp;
+    let (ow, oh) = match job.width {
+        Some(nw) if (nw as u64) < cw && cw > 0 => {
+            let nh = (ch * nw as u64 / cw).max(1);
+            bytes += cw * nh * 16 + nw as u64 * nh * bpp;
+            (nw as u64, nh)
+        }
+        _ => (cw, ch),
+    };
+    bytes += ow * oh * 4;
+    if bytes > MOST_BYTES_ONE {
+        return Err(format!("converting the {}×{} image so would take about {} MiB, more than the {} converted at once", w, h, bytes >> 20, MOST_BYTES_ONE >> 20));
+    }
+    Ok(bytes)
 }
 
 fn convert(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let src = path_arg(it, &args, 0, "image.convert", line)?;
     let dest = path_arg(it, &args, 1, "image.convert", line)?;
+    // Not over the program's own files, as `write_file` will not: `.env`, `main.qwe` and the
+    // database were written over (FEEDBACK51.md, Q-658; branch feedback51-fixes).
+    if let Some(why) = crate::builtins::own_file(it, &dest, false) {
+        return Ok(err_value(format!("will not write {}: {}", args.get(1).map(|v| v.display()).unwrap_or_default(), why)));
+    }
     let job = job_of(args.get(2), std::path::Path::new(&dest), line)?;
     let said = matches!(args.get(2), Some(Value::Map(m)) if !matches!(m.get("format"), None | Some(Value::Nil)));
     // A folder is said as the write's own failure.
@@ -263,7 +313,7 @@ fn convert(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             args.get(1).map(|v| v.display()).unwrap_or_default()
         )));
     }
-    Ok(match it.unlocked(move || in_turn(|| make(&src, &dest, job))) {
+    Ok(match it.unlocked(move || cost_of(&src, &job).and_then(|bytes| in_turn(bytes, || make(&src, &dest, job)))) {
         Ok((w, h)) => {
             let mut m = Map::new();
             m.insert("width".into(), Value::Int(w as i64));
@@ -287,7 +337,7 @@ mod tests {
         let threads: Vec<_> = (0..12)
             .map(|_| {
                 std::thread::spawn(|| {
-                    in_turn(|| {
+                    in_turn(1, || {
                         let n = NOW.fetch_add(1, SeqCst) + 1;
                         MOST.fetch_max(n, SeqCst);
                         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -301,5 +351,32 @@ mod tests {
             t.join().unwrap().unwrap();
         }
         assert!(MOST.load(SeqCst) <= most_converting(), "{} at once", MOST.load(SeqCst));
+    }
+
+    #[test]
+    fn large_images_take_turns_by_their_memory() {
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        // Three of 400 MiB: two at once fit in 1 GiB, three do not (Q-674).
+        static NOW: AtomicU64 = AtomicU64::new(0);
+        static MOST: AtomicU64 = AtomicU64::new(0);
+        let threads: Vec<_> = (0..3)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    in_turn(400 << 20, || {
+                        let n = NOW.fetch_add(400 << 20, SeqCst) + (400 << 20);
+                        MOST.fetch_max(n, SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(60));
+                        NOW.fetch_sub(400 << 20, SeqCst);
+                        Ok(())
+                    })
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap().unwrap();
+        }
+        assert!(MOST.load(SeqCst) <= BYTES_AT_ONCE, "{} bytes at once", MOST.load(SeqCst));
+        // One larger than the budget alone still goes, when nothing else runs.
+        assert_eq!(in_turn(BYTES_AT_ONCE + 1, || Ok(7)), Ok(7));
     }
 }

@@ -50,7 +50,7 @@ const CLIENT_BUILTINS: &[&str] = &[
     "max", "sort", "sort_by", "reverse", "first", "last", "push", "range", "enumerate", "keys", "values", "get", "has",
     "set", "remove", "merge", "err", "is_err", "error", "unwrap", "run_after", "page_updated", "js_has", "cursor_index", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
     "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "count", "group_by",
-    "index_of", "repeat", "format_number", "url", "url_encode", "navigate", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "__merge", "__concat", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
+    "index_of", "repeat", "format_number", "url", "url_encode", "navigate", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "__merge", "__concat", "__css_value", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
     // FEEDBACK13.md, Q-091; branch feedback13-fixes.
     "waiting",
     // In the browser, `defer(x)` is `x` (src/defer.rs; branch defer).
@@ -308,7 +308,9 @@ fn program_text(it: &Interp, c: &Compiler, boots: bool, with_base: bool) -> Stri
     }
     if !it.server_fns.is_empty() {
         program.push_str("const server = {};\n");
-        for name in it.server_fns.iter() {
+        // Not one `for` services only: no page calls it (FEEDBACK51.md, Q-641; branch
+        // feedback51-fixes).
+        for name in it.server_fns.iter().filter(|n| !it.fn_callers.contains_key(n.as_str())) {
             let idem = matches!(lookup(&it.globals, name), Some(Value::Func(c)) if crate::idempotency::used_by(&it.globals, &c.def));
             let _ = writeln!(program, "server[{}] = W.server({}{});", js_str(name), js_str(name), if idem { ", true" } else { "" });
         }
@@ -644,7 +646,7 @@ mod dev {
         let mut boot = String::new();
         if !it.server_fns.is_empty() {
             boot.push_str("const server = {};\n");
-            for name in it.server_fns.iter() {
+            for name in it.server_fns.iter().filter(|n| !it.fn_callers.contains_key(n.as_str())) {
                 let _ = writeln!(boot, "server[{}] = W.server({});", js_str(name), js_str(name));
             }
             boot.push_str("window.quillo = { server, components: C, rpc };\n");

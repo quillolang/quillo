@@ -229,7 +229,7 @@ channel.on("chat", (m, p) => {
     heard = heard + [m]
     channel.broadcast("chat", m, { except: p })
 })
-media.on("cam")
+media.on("cam", { publish: (p) => true, watch: (p) => true })
 route GET /heard = heard
 route GET /say/:n(int) {
     let sent = 0

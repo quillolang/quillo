@@ -2,7 +2,7 @@
 // so the page's own `report()` and a later script's `run()` and Quillo's leave each other
 // alone. Driven by scoped.js.
 
-route GET /assets/*path = file("public/" + path)
+route GET /assets/*path = files("public", path)
 
 component Tally() {
     state n = 0

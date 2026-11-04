@@ -32,4 +32,4 @@ route GET / =
 route GET /api/todos = all_todos()
 route GET /hello/:name = `Hello, ${name}!`
 
-route GET /static/*path = file("public/" + path)
+route GET /static/*path = files("public", path)

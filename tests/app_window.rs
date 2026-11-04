@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 const PROGRAM: &str = r#"route GET / = <html><head><title>First</title></head><body><script src="/assets/first.js"></script></body></html>
 route GET /second = <html><body><p>second</p><script src="/assets/second.js"></script></body></html>
-route GET /assets/*path = file("public/" + path)
+route GET /assets/*path = files("public", path)
 route GET /seen/:what {
     print(`seen ${what}`)
     "ok"

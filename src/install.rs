@@ -243,19 +243,23 @@ fn install_one(agent: &ureq::Agent, registry: &str, e: &Entry, o: &Options, dir:
     })
 }
 
-/// With --example: the plugin's example program and the files it reads, beside it.
-/// One already there is kept, unless --force.
-fn install_extras(agent: &ureq::Agent, registry: &str, e: &Entry, o: &Options, dir: &Path) -> Result<(), String> {
+/// With --example: the plugin's example program and the files it reads, beside it. One
+/// already there is kept, --force or not: --force replaces the plugin's file, never the
+/// program's. An extra is a path on the registry, of a plain file name: with an address of
+/// its own, or a name with `\`, a catalog that was changed wrote over `main.qwe`, or outside
+/// the folder (FEEDBACK51.md, Q-673; branch feedback51-fixes).
+fn install_extras(agent: &ureq::Agent, registry: &str, e: &Entry, _o: &Options, dir: &Path) -> Result<(), String> {
     let mut extra = vec![e.example.clone()];
     extra.extend(e.files.iter().cloned());
     for u in extra.iter().filter(|u| !u.is_empty()) {
         let file = u.rsplit('/').next().unwrap_or("");
-        if file.is_empty() || file.starts_with('.') {
+        if u.contains("://") || file.is_empty() || file.starts_with('.') || file.contains(['\\', ':']) {
+            println!("  {}: not a file on the registry: left out", u);
             continue;
         }
         let target = dir.join(file);
-        if target.exists() && !o.force {
-            println!("  {} is already here: kept (--force replaces it)", target.display());
+        if target.exists() {
+            println!("  {} is already here: kept", target.display());
             continue;
         }
         write_atomic(&target, &download(agent, &absolute(registry, u))?)?;

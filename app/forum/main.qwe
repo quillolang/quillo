@@ -207,7 +207,7 @@ route POST /u/:name/suspend {
 
 // ---- files and data ------------------------------------------------------
 
-route GET /static/*path = file("public/" + path)
+route GET /static/*path = files("public", path)
 
 // Uploaded images: random names that never change content, so kept for good.
 route GET /media/:name {

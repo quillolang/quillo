@@ -324,9 +324,10 @@ fn a_scripts_names_are_its_own() {
     m.insert("program_has_this".into(), quillo::Value::Int(7));
     assert_eq!(run(&mut it, "speed_given_a * 2 + program_has_this", Some(&m)), "17");
     assert!(Sym::known("speed_given_unused").is_none() && Sym::known("speed_given_a").is_none());
-    // A lambda it makes keeps working once it is given back.
+    // A lambda it makes is not given back: it would run without the script's limits
+    // (FEEDBACK51.md, Q-670).
     let f = quillo::script::run_script(&mut it, "(speed_arg) => speed_arg + 1", None);
-    assert_eq!(it.call(&f, vec![quillo::Value::Int(1)], 0).map(|v| v.repr()).unwrap_or_default(), "2");
+    assert!(f.repr().contains("a script gives back no function"), "{}", f.repr());
     // The same script twice gives the same, and a builtin is a builtin.
     assert_eq!(run(&mut it, "let speed_n = [3, 1, 2]\nsort(speed_n)", None), "[1, 2, 3]");
     assert_eq!(run(&mut it, "let speed_n = [3, 1, 2]\nsort(speed_n)", None), "[1, 2, 3]");

@@ -29,4 +29,4 @@ route GET /device = <Page title="This device" here="/device"><DevicePage p={plat
 route GET /export.csv = respond(200, notes_csv(), { "content-type": "text/csv; charset=utf-8", "content-disposition": "attachment; filename=\"fieldbook.csv\"" })
 
 route GET /media/*path = file("media/" + path, { cache: "1d" })
-route GET /static/*path = file("public/" + path)
+route GET /static/*path = files("public", path)

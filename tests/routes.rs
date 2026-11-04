@@ -474,11 +474,18 @@ server fn unbalance() { balanced = false }
 route GET / = "home"
 "#,
     );
-    let r = get(&mut it, "/_quillo/ready");
+    // Each check with the health token (FEEDBACK51.md, Q-655); without it, whether.
+    std::env::set_var("QUILLO_HEALTH_TOKEN", "a-health-token-for-routes");
+    let ready = |it: &mut Interp, token: bool| {
+        let headers = if token { vec![("authorization".to_string(), "Bearer a-health-token-for-routes".to_string())] } else { Vec::new() };
+        it.handle(&HttpRequest { method: "GET".into(), url: "/_quillo/ready".into(), headers, body: Vec::new(), remote: "127.0.0.1".into() })
+    };
+    assert_eq!(ready(&mut it, false).text(), r#"{"ready":true}"#);
+    let r = ready(&mut it, true);
     assert_eq!(r.status, 200, "{}", r.text());
     assert_eq!(serde_json::from_str::<serde_json::Value>(&r.text()).unwrap(), serde_json::json!({ "ready": true, "checks": { "database": "ready", "ledger": "ready" } }));
     rpc(&mut it, "unbalance", "[]");
-    let r = get(&mut it, "/_quillo/ready");
+    let r = ready(&mut it, true);
     assert_eq!((r.status, r.header("cache-control")), (503, Some("no-store")));
     assert!(r.text().contains(r#""ledger":"not ready""#), "{}", r.text());
 }

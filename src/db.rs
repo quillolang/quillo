@@ -513,6 +513,14 @@ fn kind_of(msg: &str) -> Option<&'static str> {
 }
 
 fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
+    // A new file is its owner's alone, and so its `-wal` and `-shm`, which SQLite makes with
+    // the database's mode: sessions and password hashes were readable by every user of the
+    // machine (FEEDBACK51.md, Q-675; branch feedback51-fixes). One there already keeps its own.
+    #[cfg(unix)]
+    if path != ":memory:" && !path.starts_with("file:") && !Path::new(path).exists() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path);
+    }
     let c = if path == ":memory:" { Connection::open_in_memory()? } else { Connection::open(path)? };
     c.execute_batch("pragma foreign_keys = on")?;
     wal(&c)?;
@@ -1338,7 +1346,9 @@ fn slot_for(it: &mut Interp, args: &[Value], f: &str, line: u32) -> Result<Resul
         for u in &urls {
             match open_backend(it, u) {
                 Ok(r) => list.push(Arc::new(r)),
-                Err(e) => return Ok(Err(format!("replica {}: {}", u, e))),
+                // Named without its user and password, as `db.connect`'s errors are: the URL
+                // went to the log whole (FEEDBACK51.md, Q-659; branch feedback51-fixes).
+                Err(e) => return Ok(Err(format!("replica {}: {}", target_label(&it.base_dir, u), e))),
             }
         }
         if !list.is_empty() {

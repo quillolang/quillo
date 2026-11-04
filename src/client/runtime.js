@@ -1477,7 +1477,9 @@ B.__merge = meta((...ms) => {
   for (const m of ms) {
     if (isNil(m)) continue;
     if (!isMap(m)) fail(`\`{...x}\` spreads a map (or null) into a map, but x is ${typeName(m)}`);
-    Object.assign(out, m);
+    // A key at a time: `Object.assign` took a `__proto__` key from JSON for the prototype
+    // (FEEDBACK51.md, from reading; branch feedback51-fixes).
+    for (const k of Object.keys(m)) putKey(out, k, m[k]);
   }
   return out;
 }, "__merge", null);
@@ -1928,6 +1930,7 @@ B.t = meta((k, vars) => translate(k, vars, (s) => s), "t", null);
 B.t_html = (k, vars) => rawHtml(translate(k, vars, B.escape));
 B.url = meta(() => currentUrl(), "url", null);
 B.css = meta((s) => S(s, "css"), "css", null);
+B.__css_value = meta((v) => cssValue(display(v)), "__css_value", null);
 B.sql = meta((s) => S(s, "sql"), "sql", null);
 B.navigate = meta((to) => navigate(S(to, "navigate")), "navigate", null);
 // `waiting(state)` is compiled to W.waiting(signal); given any other way, it
@@ -5530,6 +5533,9 @@ function navStart() {
 }
 
 function navigate(to) {
+  // A javascript: URL runs as the page when nothing follows url(): `navigate(next)` after a
+  // sign-in was XSS (FEEDBACK51.md, Q-645; branch feedback51-fixes).
+  if (scriptURL(to)) fail("`navigate` is not given a javascript: URL");
   const full = withBase(to);
   // Nothing on the page follows url(): load the page there.
   if (!Nav.on) {
@@ -5672,8 +5678,12 @@ const UNITLESS = new Set(("animation-iteration-count aspect-ratio border-image-o
 const styleName = (k) => (k.startsWith("--") ? k : k.replace(/_/g, "-").replace(/[A-Z]/g, (c) => "-" + c.toLowerCase()).replace(/^ms-/, "-ms-"));
 const styleNonzero = (v) => (typeof v === "number" ? v !== 0 && Number.isFinite(v) : typeof v === "bigint" ? v !== 0n : v instanceof Dec && v.m !== 0n);
 const stylePx = (n, v) => styleNonzero(v) && !n.startsWith("--") && !UNITLESS.has(n.replace(/^-(webkit|moz|ms|o)-/, "")) ? "px" : "";
-const styleText = (m) => Object.keys(m).filter((k) => !isNil(m[k]) && m[k] !== false)
-  .map((k) => { const n = styleName(k); return n + ": " + display(m[k]) + stylePx(n, m[k]); }).join("; ");
+// A value put in CSS: `{`, `}`, `;` and `\` as CSS's escapes, as on the server; and only a
+// property's name for a key (FEEDBACK51.md, Q-668; branch feedback51-fixes).
+const cssValue = (s) => s.replace(/[{};\\]/g, (c) => "\\" + c.charCodeAt(0).toString(16) + " ");
+const styleKey = (k) => (k.startsWith("--") ? /^--[\p{L}\p{N}_-]+$/u : /^[A-Za-z0-9_-]+$/).test(k);
+const styleText = (m) => Object.keys(m).filter((k) => !isNil(m[k]) && m[k] !== false && styleKey(k))
+  .map((k) => { const n = styleName(k); return n + ": " + cssValue(display(m[k])) + stylePx(n, m[k]); }).join("; ");
 
 // The text a bool is for an attribute whose values are words, as on the server (see its
 // `bool_attr_text`): "true"/"false" for aria-*, data-*, draggable, spellcheck and

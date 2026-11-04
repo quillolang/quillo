@@ -22,6 +22,8 @@
 // (WebCodecs); click it for sound.
 
 media.rtp("cam", { video: 5004, audio: 5006 })
+// Who may watch: anyone here. With no `watch` rule, no page may.
+media.on("cam", { watch: (peer) => true })
 
 server fn live_streams() -> list = media.streams()
 

@@ -40,8 +40,13 @@ pub struct Server {
     /// From the editor's `initializationOptions` (`{ "strictNull": true }`).
     opts: check::Options,
     /// `.qwer` files' diagnostics: Quillo's (as they are typed) and the Rust
-    /// compiler's (when opened and saved, worked out on a thread of their own).
+    /// compiler's (when saved, worked out on a thread of their own).
     rust: Arc<Mutex<HashMap<String, RustDiags>>>,
+    /// The editor trusts the folder (`initializationOptions.trusted`): only then does the Rust
+    /// compiler look at a `.qwer`, as `cargo check` runs its dependencies' build scripts and
+    /// macros. Opening a file from a cloned repository ran them (FEEDBACK51.md, Q-653; branch
+    /// feedback51-fixes).
+    trusted: bool,
 }
 
 #[derive(Default)]
@@ -499,7 +504,7 @@ fn symbol_kind(k: SymbolKind) -> u32 {
 
 impl Server {
     pub fn new() -> Self {
-        Server { docs: HashMap::new(), out: io::stdout(), opts: check::Options { classes: true, ..Default::default() }, rust: Default::default() }
+        Server { docs: HashMap::new(), out: io::stdout(), opts: check::Options { classes: true, ..Default::default() }, rust: Default::default(), trusted: false }
     }
 
     fn send(&mut self, msg: J) {
@@ -530,6 +535,7 @@ impl Server {
             match method.as_str() {
                 "initialize" => {
                     self.opts.strict_null = params["initializationOptions"]["strictNull"].as_bool().unwrap_or(false);
+                    self.trusted = params["initializationOptions"]["trusted"].as_bool().unwrap_or(false);
                     let caps = json!({
                         "capabilities": {
                             "textDocumentSync": { "openClose": true, "change": 1, "save": { "includeText": false } },
@@ -557,11 +563,8 @@ impl Server {
                 "textDocument/didOpen" => {
                     let uri = params["textDocument"]["uri"].as_str().unwrap_or("").to_string();
                     let text = params["textDocument"]["text"].as_str().unwrap_or("").to_string();
-                    let rust = crate::native::is_rust(&uri);
-                    self.update(uri.clone(), text);
-                    if rust {
-                        self.check_rust(uri);
-                    }
+                    // Quillo's own diagnostics only: the compiler's wait for a save (Q-653).
+                    self.update(uri, text);
                 }
                 "textDocument/didChange" => {
                     let uri = params["textDocument"]["uri"].as_str().unwrap_or("").to_string();
@@ -571,7 +574,7 @@ impl Server {
                 }
                 "textDocument/didSave" => {
                     let uri = params["textDocument"]["uri"].as_str().unwrap_or("").to_string();
-                    if crate::native::is_rust(&uri) {
+                    if self.trusted && crate::native::is_rust(&uri) {
                         self.check_rust(uri);
                     }
                     // Other open files may `use` the saved one.

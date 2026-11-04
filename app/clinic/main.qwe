@@ -77,7 +77,7 @@ schedule("@hourly", morning_lists)
 private fn safe_next(n) -> str = local_path(n) ?? "/book"
 
 route GET / = redirect("/book")
-route GET /public/*path = file("public/" + path)
+route GET /public/*path = files("public", path)
 
 route GET /login ? { next: str = "/book" } = <LoginPage next={safe_next(next)} problem={null}/>
 route POST /login { form: { email: str, password: str } } {

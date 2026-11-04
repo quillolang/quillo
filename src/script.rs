@@ -177,13 +177,17 @@ fn said_as_written(msg: &str, names: &std::collections::HashMap<String, Sym>) ->
 }
 
 fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap<String, Sym>, vars: Option<&Map>) -> Value {
-    // Its world: the safe builtins, then its variables.
+    // Its world: the safe builtins, then its variables. Quillo's own, not what the program's
+    // globals have by those names: a program's `fn upper` was the script's `upper`, run with the
+    // program's effects (FEEDBACK51.md, Q-648; branch feedback51-fixes).
     let root = Scope::root();
-    for name in SAFE {
-        if let Some(v) = lookup(&it.globals, name) {
-            define(&root, name, v);
+    BUILTINS.with(|builtins| {
+        for name in SAFE {
+            if let Some(v) = lookup(builtins, name) {
+                define(&root, name, v);
+            }
         }
-    }
+    });
     // Dates, without the clock: a script gives the same answer each time.
     let mut date = Map::new();
     crate::dates::install_pure(&mut date);
@@ -224,5 +228,35 @@ fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap
     it.allowed = saved_allowed;
     it.restrictor = saved_restrictor;
     it.script = saved_script;
+    // A function it made would run after it, with no budget of steps: `(n) => ...` doubling a
+    // text made 16 MB, and a `while true` ran for good (FEEDBACK51.md, Q-670; branch
+    // feedback51-fixes).
+    if holds_function(&out) {
+        return bad("a script gives back no function (it would run without the script's limits): give back what it computes");
+    }
     out
+}
+
+thread_local! {
+    /// The builtins as Quillo installs them, for scripts' safe names.
+    static BUILTINS: Env = {
+        let g = Scope::root();
+        crate::builtins::install(&g);
+        g
+    };
+}
+
+/// Whether a function is in `v`, however deep.
+fn holds_function(v: &Value) -> bool {
+    let mut todo = vec![v];
+    while let Some(v) = todo.pop() {
+        match v {
+            Value::Func(_) => return true,
+            Value::List(l) => todo.extend(l.iter()),
+            Value::Map(m) => todo.extend(m.values()),
+            Value::Err(e, ..) => todo.push(e),
+            _ => {}
+        }
+    }
+    false
 }

@@ -5,7 +5,7 @@ use crate::interp::{coerce, Ctrl, Interp, Mode};
 use crate::shared::Shared;
 use crate::value::*;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
@@ -277,7 +277,8 @@ fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map {
     let json = if is_json_type(&ctype) || (ctype.trim().is_empty() && looks_json) {
         // RFC 8259 lets a reader skip a byte-order mark (FEEDBACK31.md, Q-386; branch
         // feedback27-35-fixes).
-        serde_json::from_str::<serde_json::Value>(body.strip_prefix('\u{FEFF}').unwrap_or(&body)).map(|j| Value::from_json(&j)).unwrap_or(Value::Nil)
+        // Read straight into values, with a budget of them (FEEDBACK51.md, Q-660).
+        Value::parse_json(body.strip_prefix('\u{FEFF}').unwrap_or(&body)).unwrap_or(Value::Nil)
     } else {
         Value::Nil
     };
@@ -359,6 +360,7 @@ impl Interp {
         self.tenant = None;
         self.tenant_named = false;
         self.no_such_tenant = false;
+        self.answering = true;
         self.upload_body = None;
         self.route_limit = None;
         self.set_cookies.clear();
@@ -865,6 +867,8 @@ impl Interp {
         if req.method != "POST" || !is_job_request(req) {
             return plain(404, "not found\n");
         }
+        // A job or a tick runs for no one (see `wt::reach`).
+        self.answering = false;
         // A job of a service this process runs, `<service>~<name>`, runs in the
         // service (FEEDBACK12.md, Q-083; branch feedback12-fixes).
         if let Some((service, job)) = name.split_once('~') {
@@ -899,6 +903,8 @@ impl Interp {
         if req.method != "POST" || !is_job_request(req) {
             return plain(404, "not found\n");
         }
+        // A job or a tick runs for no one (see `wt::reach`).
+        self.answering = false;
         if let Some((service, tick)) = name.split_once('~') {
             let found = self.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(service).map(|(_, s)| s.fork());
             return match found {
@@ -1075,7 +1081,7 @@ impl Interp {
         // Whether what the program needs is there (FEEDBACK10.md, Q-076;
         // branch feedback10-fixes).
         if rest == "ready" {
-            return ready_response(self);
+            return ready_response(self, req);
         }
         // A copy of one of its services joining (FEEDBACK10.md, Q-074;
         // branch feedback10-fixes).
@@ -1094,6 +1100,12 @@ impl Interp {
             // Without waiting; the server's worker threads answer `live`
             // requests themselves and wait for a change first.
             let (since, server, topics) = live_query(qs);
+            // The tenant is the request's: without it set, none was found, and a tenant's own
+            // topics were dropped too (FEEDBACK51.md, Q-666; branch feedback51-fixes).
+            self.current_request = Some(Value::map(build_request(req, path, &Value::map(Map::new()))));
+            let tenant = self.tenant();
+            self.current_request = None;
+            let topics = own_topics(topics, self.site.tenant_rule.is_some(), tenant.as_deref());
             let (seq, changed) = self.shared.live_now(since, server.as_deref(), &topics);
             return json_response(200, serde_json::json!({ "seq": seq, "server": self.shared.id, "changed": changed }));
         }
@@ -1214,6 +1226,12 @@ impl Interp {
         }
         if !self.server_fns.iter().any(|n| n == name) {
             return rpc_error(404, &format!("no server fn `{}`", name));
+        }
+        // `for [...]` names the services that may call it, over their signed path: no page may,
+        // nor anyone with curl. It was checked on that path only (FEEDBACK51.md, Q-641; branch
+        // feedback51-fixes).
+        if let Some(callers) = self.fn_callers.get(name) {
+            return rpc_error(404, &format!("no server fn `{}` for pages: it takes calls from {} only", name, callers.join(", ")));
         }
         let Some(Value::Func(c)) = lookup(&self.globals, name) else {
             return rpc_error(404, &format!("no server fn `{}`", name));
@@ -1476,6 +1494,35 @@ fn live_query(qs: &str) -> (u64, Option<String>, Vec<String>) {
 /// Most topics one page can wait on; each change looks through them all.
 const MAX_TOPICS: usize = 256;
 
+/// The topics a page may follow: not another tenant's, `acme@dm:alice:bob` from tenant `evil`,
+/// which told it when Bob wrote Alice (FEEDBACK51.md, Q-666; branch feedback51-fixes). A
+/// topic is a tenant's when it starts with a tenant's name and `@` (after a mount's `base|`).
+fn own_topics(topics: Vec<String>, tenants: bool, tenant: Option<&str>) -> Vec<String> {
+    if !tenants {
+        return topics;
+    }
+    let owner = |t: &str| {
+        // A mounted program's topics start `/prefix|`; only that is taken off, as a tenant's
+        // own topic may hold a `|` (`acme@inbox:x|evil@y` was evil's; found in review).
+        let t = if t.starts_with('/') { t.split_once('|').map_or(t, |(_, rest)| rest) } else { t };
+        t.split_once('@').map(|(who, _)| who.to_string()).filter(|who| crate::site::tenant_name_ok(who))
+    };
+    topics.into_iter().filter(|t| owner(t).is_none_or(|who| Some(who.as_str()) == tenant)).collect()
+}
+
+/// The tenant a live request comes from, and whether the program has tenants: worked out by the
+/// program, as for any request.
+fn live_tenant(app: &App, req: &HttpRequest, path: &str) -> (bool, Option<String>) {
+    let current = app.current().1;
+    let Loaded::Ready(it) = &*current else { return (false, None) };
+    if it.site.tenant_rule.is_none() {
+        return (false, None);
+    }
+    let mut it = it.fork();
+    it.current_request = Some(Value::map(build_request(req, path, &Value::map(Map::new()))));
+    (true, it.tenant().map(|t| t.to_string()))
+}
+
 /// Most pages that can wait for changes at once (live data and `--watch`
 /// reloads). Each has a thread; beyond this, pages are told to try later
 /// rather than let anyone with a browser start threads without end.
@@ -1623,8 +1670,9 @@ const LIVE_GATHER: Duration = Duration::from_millis(100);
 /// on to the server's threads. Over a WebSocket, each change to the topics
 /// is sent as `{seq, server, changed}` for as long as the page stays; as a
 /// plain request, the answer is the first change, or none after a while.
-fn serve_live(shared: Arc<Shared>, req: HttpRequest) -> Answer {
+fn serve_live(shared: Arc<Shared>, req: HttpRequest, (tenants, tenant): (bool, Option<String>)) -> Answer {
     let (mut since, server, topics) = live_query(req.url.split_once('?').map_or("", |(_, q)| q));
+    let topics = own_topics(topics, tenants, tenant.as_deref());
     waiter("quillo-live", &req.remote.clone(), move |stream| {
         let _page = crate::metrics::LivePage::new();
         let following = shared.follow(topics);
@@ -2568,6 +2616,26 @@ fn compress(req: &HttpRequest, resp: &mut HttpResponse) {
     resp.headers.push(("vary".into(), "accept-encoding".into()));
 }
 
+/// `--allowed-hosts`: the names a server under `--watch` answers besides `localhost`
+/// (`*.localhost`) and addresses; one starting with `.` takes its subdomains too.
+pub static ALLOWED_HOSTS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Whether the request's `Host` is one a server under `--watch` answers (see `ALLOWED_HOSTS`).
+fn local_host(req: &HttpRequest) -> bool {
+    let Some((_, host)) = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")) else { return true };
+    let host = host.trim().to_ascii_lowercase();
+    // Without the port: `[::1]:8080`, `localhost:8080`.
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => host.rsplit_once(':').filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())).map_or(host.as_str(), |(h, _)| h),
+    };
+    let name = name.trim_end_matches('.');
+    name.parse::<std::net::IpAddr>().is_ok()
+        || name == "localhost"
+        || name.ends_with(".localhost")
+        || ALLOWED_HOSTS.get().is_some_and(|all| all.iter().any(|a| name == a || a.starts_with('.') && (name.ends_with(a.as_str()) || name == &a[1..])))
+}
+
 /// A server thread's own handle on the program, replaced when `--watch`
 /// loads a new version.
 pub(crate) struct Worker {
@@ -2595,6 +2663,13 @@ impl Worker {
                 return Answer::Respond(resp);
             }
         }
+        // Under --watch, a developer's server: a request named for another host is a page
+        // elsewhere that had its name point here (DNS rebinding), and called the server fns
+        // and `/_quillo/dev` with the developer's data (FEEDBACK51.md, Q-663; branch
+        // feedback51-fixes).
+        if app.watch && !local_host(&req) && !is_job_request(&req) {
+            return Answer::Respond(plain(421, "this server, run with --watch, answers localhost and addresses; name another host with --allowed-hosts\n"));
+        }
         let path = req.url.split('?').next().unwrap_or("");
         // A WebSocket is not kept to its site by the browser: a page on
         // another site could open one here and hear the topics changing.
@@ -2611,7 +2686,8 @@ impl Worker {
             return Answer::Respond(plain(204, ""));
         }
         if path.ends_with("/_quillo/live") {
-            return serve_live(app.shared.clone(), req);
+            let tenant = live_tenant(app, &req, path);
+            return serve_live(app.shared.clone(), req, tenant);
         }
         if path.ends_with("/_quillo/wt") && crate::ws::is_upgrade(&req) {
             return serve_channels(req);
@@ -2844,6 +2920,13 @@ fn take_descriptors() {
         if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
             r.rlim_cur = most;
         }
+    }
+    // Room left for the files, databases and services the program opens, and for the
+    // connections handed on, which are not counted then: pages waiting for live data and
+    // large files being sent (256 at once) (Q-672; found in review).
+    if crate::httpd::MAX_CONNECTIONS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        let kept = 256 + MAX_WAITERS + 256;
+        crate::httpd::MAX_CONNECTIONS.store((r.rlim_cur as usize).saturating_sub(kept).max(64), std::sync::atomic::Ordering::SeqCst);
     }
     if (r.rlim_cur as usize) < 2 * MAX_WAITERS {
         eprintln!("quillo: {} file descriptors allowed, about {} pages with live data: raise `ulimit -n` for more", r.rlim_cur, r.rlim_cur / 2);
@@ -3310,8 +3393,14 @@ pub const WORKER_STACK: usize = 16 << 20;
 /// Qwik's Qwikloader and React's selective hydration (README.md,
 /// Acknowledgements; branch acknowledgements).
 /// `/_quillo/ready`: 200 or 503, and each thing the program needs.
-fn ready_response(it: &mut Interp) -> HttpResponse {
+fn ready_response(it: &mut Interp, req: &HttpRequest) -> HttpResponse {
     let (ok, detail) = crate::ready::report(it);
+    // What each check says, the services' internal addresses among them, with the health token;
+    // to anyone else, whether it is ready. Not by the address it comes from: behind a proxy
+    // on the same machine that adds no `X-Forwarded-For` (nginx's `proxy_pass` as it comes),
+    // every visitor is 127.0.0.1 (FEEDBACK51.md, Q-655; branch feedback51-fixes).
+    let auth = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("authorization")).map(|(_, v)| v.as_str());
+    let detail = if crate::querystats::has_token(auth) { detail } else { serde_json::json!({ "ready": ok }) };
     let mut r = json_response(if ok { 200 } else { 503 }, detail);
     r.headers.push(("cache-control".into(), "no-store".into()));
     r

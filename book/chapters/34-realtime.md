@@ -140,6 +140,20 @@ A channel that no `channel.on` names can be joined by anyone, to hear what the p
 broadcasts on it; what pages send on it goes nowhere. `leave(peer)` hears that a page
 left the channel, or closed.
 
+### A room for each tenant
+
+A program with [many tenants](#many-tenants) has a room of each
+channel for each tenant *(since 0.7: one room for all)*: pages on `acme.example.com` and
+`evil.example.com` joining `lobby` are in two rooms. What code run for a page or a
+request broadcasts, sends or lists is its tenant's room's, and a page with no tenant (the
+bare domain) is in the room of no tenant. A job, a tick and the top level reach every
+tenant's room, and `with_tenant(name, f)` one tenant's. `channel.send` reaches only a
+page in a room the code reaches. One room for every tenant is asked for:
+
+```quillo
+channel.on("news", (msg) => msg, { tenants: "shared" })
+```
+
 ## Lost, late, or in order
 
 Not every message has to arrive. A cursor's position or a sensor's reading is out of date
@@ -212,6 +226,7 @@ any page, a fraction of a second behind:
 
 ```quillo
 media.rtp("cam", { video: 5004, audio: 5006 })
+media.on("cam", { watch: (peer) => true })     // any page may watch "cam"
 
 route GET / = <html><body><quillo-media stream="cam" controls muted/></body></html>
 ```
@@ -244,8 +259,13 @@ On a laptop, the picture shows about 0.3 seconds after the page opens, at the st
 - **A dropped connection comes back.** The page opens it again (after half a second, then
   longer, up to 15 seconds) and goes on watching. With no frames for 3 seconds (the
   camera stopped, the connection is down), its `data-state` is `waiting`.
+- **Who may watch** is `media.on(name, { watch })`'s `watch(peer)`, asked as a channel's
+  `join` is, with the page's session. A stream no `watch` names is watched by no page
+  *(since 0.7: any page could watch any stream)*. A camera not for everyone says who:
+  `media.on("cam", { watch: (peer) => peer.session.user != null })`.
 - **How it is going**: `media.streams()` gives each stream's viewers and, per track,
-  `frames`, `fps`, `kbps` and `lost` packets.
+  `frames`, `fps`, `kbps` and `lost` packets: code run for a page or a request, its
+  tenant's streams and the program's RTP ones; a job or the top level, every tenant's.
 
 ```quillo
 server fn live_streams() -> list = media.streams()
@@ -269,7 +289,7 @@ for every `<quillo-media stream>` of that name to play. A video call is a stream
 person:
 
 ```quillo
-media.on("call:*", { publish: (peer) => session().user != null })
+media.on("call:*", { publish: (peer) => session().user != null, watch: (peer) => session().user != null })
 
 component Call(room: str, me: str, others: list) {
     <div>
@@ -283,8 +303,11 @@ component Call(room: str, me: str, others: list) {
   (H.264 baseline and Opus, what the server passes on) and sends the frames on its
   channel connection. The server sends each person's picture on to everyone watching,
   decoding nothing, as it does a camera's RTP: what video services call an SFU.
-- **`publish(peer)` says who may**, as a channel's `join` does, with the page's
-  `session()`. Without it, any page may.
+- **`publish(peer)` says who may send, and `watch(peer)` who may watch**, as a channel's
+  `join` does, with the page's `session()`. Without `publish`, no page sends; without
+  `watch`, no page watches *(since 0.7: any page could)*.
+- **Each tenant has its own streams** of a name, as it has its own rooms of a channel:
+  acme's `call:42` is not evil's. `tenants: "shared"` makes one stream for all.
 - **Not only the camera.** `no-video` or `no-audio` leaves one out. Given a MediaStream as
   its `source` (a canvas's, or the screen's:
   `el.source = js("navigator.mediaDevices.getDisplayMedia")` in `@mount`), it sends that
@@ -300,7 +323,10 @@ component Call(room: str, me: str, others: list) {
 Streams can be made while the program runs: `media.rtp` in a route or a channel's handler
 makes one for each room, once for a name. `media.close(name)` ends one: it stops taking
 RTP, lets its ports go for another stream to take, and tells its pages, whose `data-state`
-turns `ended`. It gives true if there was such a stream.
+turns `ended`. It gives true if there was such a stream. Code run for a page or a
+request ends its tenant's stream; a job, a tick or the top level, every tenant's of that
+name. A room made while the program runs needs a `watch` too, for its name or a name
+ending in `*`: `media.on("room:*", { watch: (peer) => peer.session.user != null })`.
 
 ## Which way a page connects
 
@@ -348,6 +374,12 @@ you would rather keep the name.
   seen so by `join` and `channel.on` once the page reconnects. A page that reconnects has
   a new `peer.id`.
 - **No presence list** beyond `channel.peers(name)` and what `join` and `leave` record.
+- **So many names and streams.** Pages may ask of 4,096 channel names in all; past that,
+  a page asking to join a new one is told no. Pages make at most 1,024 streams, 256 a
+  tenant, and a page watches at most 32 at once; a stream no page sends or watches any
+  more goes. A stream keeps at most 32 MiB of video since its last keyframe, and all of
+  them 256 MiB: past that a stream keeps none, and a page that starts watching it waits
+  for its next keyframe.
 - **One server's pages.** Channels and media streams are kept in memory by the server
   the page is connected to: servers behind limer share live data, not channels or
   streams, and a restart starts them empty (pages reconnect and join again by

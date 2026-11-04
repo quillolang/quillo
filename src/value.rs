@@ -314,6 +314,14 @@ impl Value {
     /// so each level takes little: lists, maps and errors here, the rest
     /// (and their formatting's locals) in `scalar_repr`.
     fn repr_into(&self, out: &mut String) {
+        self.repr_at(out, 0)
+    }
+
+    /// `repr_into`, `depth` levels down: past `DEEPEST`, `…` (FEEDBACK51.md, Q-661).
+    fn repr_at(&self, out: &mut String, depth: usize) {
+        if depth > DEEPEST && matches!(self, Value::List(_) | Value::Map(_) | Value::Err(..)) {
+            return out.push('…');
+        }
         match self {
             Value::List(l) => {
                 out.push('[');
@@ -321,7 +329,7 @@ impl Value {
                     if i > 0 {
                         out.push_str(", ");
                     }
-                    v.repr_into(out);
+                    v.repr_at(out, depth + 1);
                 }
                 out.push(']');
             }
@@ -333,7 +341,7 @@ impl Value {
                         out.push_str(", ");
                     }
                     key_into(k, out);
-                    v.repr_into(out);
+                    v.repr_at(out, depth + 1);
                 }
                 out.push_str(" }");
             }
@@ -343,7 +351,7 @@ impl Value {
                     crate::server::log_hidden(e, at);
                     out.push_str("\"internal error\"");
                 } else {
-                    e.repr_into(out);
+                    e.repr_at(out, depth + 1);
                 }
                 out.push(')');
             }
@@ -371,7 +379,15 @@ impl Value {
     }
 
     pub fn to_json(&self) -> serde_json::Value {
+        self.to_json_at(0)
+    }
+
+    /// `to_json`, `depth` levels down: past `DEEPEST`, null (FEEDBACK51.md, Q-661).
+    fn to_json_at(&self, depth: usize) -> serde_json::Value {
         use serde_json::Value as J;
+        if depth > DEEPEST && matches!(self, Value::List(_) | Value::Map(_) | Value::Err(..)) {
+            return J::Null;
+        }
         match self {
             Value::Nil => J::Null,
             Value::Bool(b) => J::Bool(*b),
@@ -381,9 +397,9 @@ impl Value {
             Value::Dec(d) => J::String(d.to_string()),
             Value::Str(s) => J::String(s.to_string()),
             Value::Html(h) => J::String(h.to_string()),
-            Value::List(l) => J::Array(l.iter().map(|v| v.to_json()).collect()),
-            Value::Map(m) => J::Object(m.iter().map(|(k, v)| (k.to_string(), v.to_json())).collect()),
-            Value::Err(e, _, _) => serde_json::json!({ "error": e.to_json() }),
+            Value::List(l) => J::Array(l.iter().map(|v| v.to_json_at(depth + 1)).collect()),
+            Value::Map(m) => J::Object(m.iter().map(|(k, v)| (k.to_string(), v.to_json_at(depth + 1))).collect()),
+            Value::Err(e, _, _) => serde_json::json!({ "error": e.to_json_at(depth + 1) }),
             Value::Response(r) => serde_json::json!({ "status": r.status }),
             Value::Func(_) | Value::Builtin(..) => J::String(self.repr()),
         }
@@ -448,6 +464,13 @@ impl Value {
 
     /// The JSON text of `to_json`, written straight into `out`.
     pub fn json_into(&self, out: &mut Vec<u8>) {
+        self.json_into_at(out, 0)
+    }
+
+    fn json_into_at(&self, out: &mut Vec<u8>, depth: usize) {
+        if depth > DEEPEST && matches!(self, Value::List(_) | Value::Map(_) | Value::Err(..)) {
+            return out.extend_from_slice(b"null");
+        }
         match self {
             Value::Nil => out.extend_from_slice(b"null"),
             Value::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
@@ -465,7 +488,7 @@ impl Value {
                     if i > 0 {
                         out.push(b',');
                     }
-                    v.json_into(out);
+                    v.json_into_at(out, depth + 1);
                 }
                 out.push(b']');
             }
@@ -477,13 +500,13 @@ impl Value {
                     }
                     json_str_into(k, out);
                     out.push(b':');
-                    v.json_into(out);
+                    v.json_into_at(out, depth + 1);
                 }
                 out.push(b'}');
             }
             Value::Err(e, _, _) => {
                 out.extend_from_slice(b"{\"error\":");
-                e.json_into(out);
+                e.json_into_at(out, depth + 1);
                 out.push(b'}');
             }
             Value::Response(r) => out.extend_from_slice(format!("{{\"status\":{}}}", r.status).as_bytes()),
@@ -517,8 +540,16 @@ impl Value {
     /// JSON text as a value, read as `from_json` reads it, with no tree of serde_json's
     /// made and thrown away between: half of the time it took (FEEDBACK29.md; branch
     /// feedback29-fixes).
+    ///
+    /// At most `max(1,000,000, text.len() / 8)` values: a body of tiny ones, `[0,0,...]`,
+    /// took 100 times its size, 1 GB for a visitor's 10 MB (FEEDBACK51.md, Q-660; branch
+    /// feedback51-fixes). Past it, an error that says so.
     pub fn parse_json(text: &str) -> serde_json::Result<Value> {
-        serde_json::from_str::<Parsed>(text).map(|p| p.0)
+        let budget = (text.len() / 8).max(JSON_VALUES);
+        let outer = JSON_LEFT.with(|l| l.replace(budget));
+        let r = serde_json::from_str::<Parsed>(text).map(|p| p.0);
+        JSON_LEFT.with(|l| l.set(outer));
+        r
     }
 }
 
@@ -550,6 +581,25 @@ impl<'de> serde::Deserialize<'de> for ParsedKey {
 }
 
 struct ParsedVisitor;
+
+/// The fewest values `Value::parse_json` takes from any text.
+pub const JSON_VALUES: usize = 1_000_000;
+
+thread_local! {
+    /// How many more values the JSON being read may have (see `Value::parse_json`).
+    static JSON_LEFT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// One more value read from JSON, or an error past the budget.
+fn one_more<E: serde::de::Error>() -> Result<(), E> {
+    JSON_LEFT.with(|l| match l.get() {
+        0 => Err(E::custom("more values than JSON of its length may have")),
+        n => {
+            l.set(n - 1);
+            Ok(())
+        }
+    })
+}
 
 impl<'de> serde::de::Visitor<'de> for ParsedVisitor {
     type Value = Parsed;
@@ -585,6 +635,7 @@ impl<'de> serde::de::Visitor<'de> for ParsedVisitor {
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Parsed, A::Error> {
         let mut out = Vec::new();
         while let Some(Parsed(v)) = seq.next_element()? {
+            one_more()?;
             out.push(v);
         }
         Ok(Parsed(Value::list(out)))
@@ -593,6 +644,7 @@ impl<'de> serde::de::Visitor<'de> for ParsedVisitor {
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Parsed, A::Error> {
         let mut out = Map::new();
         while let Some((ParsedKey(k), Parsed(v))) = map.next_entry()? {
+            one_more()?;
             out.insert(k, v);
         }
         Ok(Parsed(Value::map(out)))
@@ -726,7 +778,46 @@ fn fmt_key(k: &str) -> String {
     }
 }
 
+/// How deep a value is shown, written as JSON or compared, at most: past it, `…`, null, or not
+/// ordered. A list nested 50,000 deep, as code that nests from data makes it, overflowed the
+/// stack of the request and stopped the server (FEEDBACK51.md, Q-661; branch feedback51-fixes).
+pub const DEEPEST: usize = 10_000;
+
+/// Whether two values are the same, as `==` says: item by item, from a list of pairs still to
+/// compare rather than by recursion, however deep they nest (Q-661).
 pub fn equal(a: &Value, b: &Value) -> bool {
+    use Value::*;
+    let mut todo = vec![(a, b)];
+    while let Some((a, b)) = todo.pop() {
+        let same = match (a, b) {
+            (List(x), List(y)) => x.len() == y.len() && {
+                todo.extend(x.iter().zip(y.iter()));
+                true
+            },
+            (Map(x), Map(y)) => {
+                x.len() == y.len()
+                    && x.iter().all(|(k, v)| match y.get(k) {
+                        Some(w) => {
+                            todo.push((v, w));
+                            true
+                        }
+                        None => false,
+                    })
+            }
+            (Err(x, ..), Err(y, ..)) => {
+                todo.push((x, y));
+                true
+            }
+            _ => scalar_equal(a, b),
+        };
+        if !same {
+            return false;
+        }
+    }
+    true
+}
+
+fn scalar_equal(a: &Value, b: &Value) -> bool {
     use Value::*;
     match (a, b) {
         (Nil, Nil) => true,
@@ -738,9 +829,6 @@ pub fn equal(a: &Value, b: &Value) -> bool {
         }
         (Str(x), Str(y)) => x == y,
         (Html(x), Html(y)) => x == y,
-        (List(x), List(y)) => x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equal(p, q)),
-        (Map(x), Map(y)) => x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).map_or(false, |w| equal(v, w))),
-        (Err(x, ..), Err(y, ..)) => equal(x, y),
         (Func(x), Func(y)) => Arc::ptr_eq(x, y),
         (Builtin(x, _), Builtin(y, _)) => x == y,
         _ => false,
@@ -750,6 +838,10 @@ pub fn equal(a: &Value, b: &Value) -> bool {
 /// Ordered values; None for those that are not (a decimal and a float
 /// are not: one is exact, the other not).
 pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
+    compare_at(a, b, 0)
+}
+
+fn compare_at(a: &Value, b: &Value, depth: usize) -> Option<Ordering> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
         (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
@@ -759,8 +851,11 @@ pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
         // Item by item, which is how to sort by several keys: `sort_by(rows, (r) =>
         // [r.a, r.b])` (FEEDBACK25.md, Q-320; branch feedback26-fixes).
         (Value::List(x), Value::List(y)) => {
+            if depth > DEEPEST {
+                return None;
+            }
             for (p, q) in x.iter().zip(y.iter()) {
-                match compare(p, q)? {
+                match compare_at(p, q, depth + 1)? {
                     Ordering::Equal => {}
                     other => return Some(other),
                 }

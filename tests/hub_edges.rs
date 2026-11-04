@@ -53,9 +53,16 @@ channel.on("jam2", (m) => null)
 channel.on("full", (m) => null)
 channel.on("gone", (m) => null)
 channel.on("plain", () => log("no arguments"))
-media.on("rooms:*")
-media.on("cam", { publish: (p) => p.session.name == "ana" })
-media.on("open")
+media.on("rooms:*", { publish: (p) => true, watch: (p) => true })
+media.on("cam", { publish: (p) => p.session.name == "ana", watch: (p) => true })
+media.on("open", { publish: (p) => true, watch: (p) => true })
+channel.on("lobby", (m) => channel.broadcast("lobby", m))
+channel.on("hall", (m) => channel.broadcast("hall", m), { tenants: "shared" })
+media.on("tv", { publish: (p) => true })
+media.on("radio", { watch: (p) => true })
+channel.on("who", (m) => channel.broadcast("who", channel.peers("who")))
+channel.on("dm", (m) => channel.send("dm", m.to, "a word"))
+media.on("cam2", { publish: (p) => true, watch: (p) => true })
 
 route GET /heard = heard
 "#;
@@ -172,6 +179,22 @@ fn ticket(session: &str) -> wt::Ticket {
     wt::ticket_of(&format!("t={}", sealed)).unwrap()
 }
 
+/// A page's ticket on a tenant's host.
+fn ticket_in(tenant: Option<&str>) -> wt::Ticket {
+    let exp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 100;
+    let sealed = quillo::session::seal("quillo channel ticket", &serde_json::json!({ "s": "{}", "t": tenant, "e": exp }).to_string());
+    wt::ticket_of(&format!("t={}", sealed)).unwrap()
+}
+
+/// A page on `tenant` let into `ch`.
+fn joined_in(tenant: Option<&str>, ch: &str) -> (Arc<Peer>, Receiver<Out>) {
+    hub();
+    let (p, mut rx) = wt::connect(ticket_in(tenant), None);
+    wt::from_page(&p, &serde_json::json!(["j", ch]).to_string());
+    assert_eq!(text(&mut rx), serde_json::json!(["j", ch, true]).to_string());
+    (p, rx)
+}
+
 fn peer(session: &str) -> (Arc<Peer>, Receiver<Out>) {
     wt::connect(ticket(session), None)
 }
@@ -249,7 +272,7 @@ fn the_builtins_say_what_they_take() {
     assert!(fails("channel.on(\"a\")").contains("got nothing"));
     assert!(fails(&format!("{}channel.on(\"a\", on, {{ join: 1 }})", f)).contains("`join` is a function of the page"));
     assert!(fails(&format!("{}channel.on(\"a\", on, {{ leave: 1 }})", f)).contains("`leave` is a function of the page"));
-    assert!(fails(&format!("{}channel.on(\"a\", on, {{ later: 1 }})", f)).contains("no option `later` (it takes join and leave)"));
+    assert!(fails(&format!("{}channel.on(\"a\", on, {{ later: 1 }})", f)).contains("no option `later` (it takes join, leave and tenants)"));
     assert!(fails(&format!("{}channel.on(\"a\", on, 5)", f)).contains("expects options as a map, got int"));
     assert!(fails(&format!("{}channel.on(\"a\", on)\nchannel.on(\"a\", on)", f)).contains("already handles channel \"a\""));
     assert!(fails("channel.send(\"a\", 5, 1)").contains("takes a peer (as the channel's function gets it, or its id) second"));
@@ -417,9 +440,9 @@ fn wire(stream: &str, kind: u8, key: bool, data: &[u8]) -> Vec<u8> {
 fn a_page_watches_a_stream_and_one_that_falls_behind_waits_for_a_keyframe() {
     let name = "watched";
     let (p, mut rx) = peer("{}");
-    wt::from_page(&p, &format!("[\"v\",\"{}\"]", name));
+    wt::let_watch(&p, name);
     for _ in 0..4200 {
-        media::from_page(wire(name, media::VIDEO, true, b"k"));
+        media::from_page(&media::key(name, None), wire(name, media::VIDEO, true, b"k"));
     }
     let mut frames = 0;
     while let Ok(o) = rx.try_recv() {
@@ -427,19 +450,19 @@ fn a_page_watches_a_stream_and_one_that_falls_behind_waits_for_a_keyframe() {
         frames += 1;
     }
     assert_eq!(frames, 4096, "the rest were not taken");
-    media::from_page(wire(name, media::VIDEO, false, b"d"));
+    media::from_page(&media::key(name, None), wire(name, media::VIDEO, false, b"d"));
     assert!(rx.try_recv().is_err(), "behind: only a keyframe will do");
-    media::from_page(wire(name, media::VIDEO, true, b"k"));
+    media::from_page(&media::key(name, None), wire(name, media::VIDEO, true, b"k"));
     assert!(matches!(next(&mut rx), Out::Media(f) if f.key));
     // Stopping, it gets no more.
     wt::from_page(&p, &format!("[\"u\",\"{}\"]", name));
-    media::from_page(wire(name, media::VIDEO, true, b"k"));
+    media::from_page(&media::key(name, None), wire(name, media::VIDEO, true, b"k"));
     assert!(rx.try_recv().is_err());
     // Its connection ends: it watches nothing.
-    wt::from_page(&p, &format!("[\"v\",\"{}\"]", name));
+    wt::let_watch(&p, name);
     assert!(matches!(next(&mut rx), Out::Media(_)));
     wt::disconnect(&p);
-    media::from_page(wire(name, media::VIDEO, true, b"k"));
+    media::from_page(&media::key(name, None), wire(name, media::VIDEO, true, b"k"));
     assert!(rx.try_recv().is_err());
     assert_eq!(ev(&format!("media.close({:?})", name)), "true");
 }
@@ -449,8 +472,8 @@ fn a_page_on_webtransport_gets_frames_on_their_own_queue() {
     let name = "own-queue";
     let (tx, mut frames) = tokio::sync::mpsc::channel(4);
     let (p, mut rx) = wt::connect(ticket("{}"), Some(tx));
-    wt::from_page(&p, &format!("[\"v\",\"{}\"]", name));
-    media::from_page(wire(name, media::VIDEO, true, b"k"));
+    wt::let_watch(&p, name);
+    media::from_page(&media::key(name, None), wire(name, media::VIDEO, true, b"k"));
     assert!(frames.try_recv().unwrap().key);
     assert!(rx.try_recv().is_err());
     assert_eq!(ev(&format!("media.close({:?})", name)), "true");
@@ -657,4 +680,164 @@ fn a_page_that_asked_before_the_server_listened_is_answered() {
     hub();
     let mut rx = EARLY_PEER.lock().unwrap().take().unwrap();
     assert_eq!(text(&mut rx), "[\"j\",\"chat\",true]");
+}
+
+// Q-644: rooms were keyed by the channel's name alone, so a page on tenant `evil` heard tenant
+// `acme`'s `lobby` and wrote into it. Each tenant has its own room now; `tenants: "shared"` makes
+// one for all, and the program with no tenant (a job, a script) reaches every tenant's.
+#[test]
+fn each_tenant_has_its_own_room_unless_the_channel_is_shared() {
+    let (a1, mut a1_rx) = joined_in(Some("acme"), "lobby");
+    let (a2, mut a2_rx) = joined_in(Some("acme"), "lobby");
+    let (e1, mut e1_rx) = joined_in(Some("evil"), "lobby");
+    wt::from_page(&e1, "[\"m\",\"lobby\",\"from evil\"]");
+    assert_eq!(text(&mut e1_rx), "[\"m\",\"lobby\",\"from evil\"]");
+    wt::from_page(&a1, "[\"m\",\"lobby\",\"from acme\"]");
+    // The first each of acme's gets is acme's: evil's went to evil's room only.
+    assert_eq!(text(&mut a1_rx), "[\"m\",\"lobby\",\"from acme\"]");
+    assert_eq!(text(&mut a2_rx), "[\"m\",\"lobby\",\"from acme\"]");
+    assert!(e1_rx.try_recv().is_err(), "acme's reached evil");
+    // A page asking to send to a page of another tenant in its room: there is none.
+    assert_eq!(ev(&format!("channel.send(\"lobby\", {:?}, 1)", format!("{:012x}", e1.id))), "true");
+    assert_eq!(text(&mut e1_rx), "[\"m\",\"lobby\",1]");
+    // From no tenant: every tenant's room.
+    assert_eq!(ev("channel.broadcast(\"lobby\", \"to all\")"), "3");
+    assert_eq!(ev("len(channel.peers(\"lobby\"))"), "3");
+    for rx in [&mut a1_rx, &mut a2_rx, &mut e1_rx] {
+        assert_eq!(text(rx), "[\"m\",\"lobby\",\"to all\"]");
+    }
+    // A tenant's own, as when acme's page is answered: acme's room alone.
+    assert_eq!(ev("with_tenant(\"acme\", () => channel.broadcast(\"lobby\", \"acme only\"))"), "2");
+    assert_eq!(ev("with_tenant(\"evil\", () => len(channel.peers(\"lobby\")))"), "1");
+    assert_eq!(text(&mut a1_rx), "[\"m\",\"lobby\",\"acme only\"]");
+    assert!(e1_rx.try_recv().is_err());
+    // Shared: one room.
+    let (h1, mut h1_rx) = joined_in(Some("acme"), "hall");
+    let (h2, mut h2_rx) = joined_in(Some("evil"), "hall");
+    let (h3, mut h3_rx) = joined_in(None, "hall");
+    wt::from_page(&h2, "[\"m\",\"hall\",\"to everyone\"]");
+    for rx in [&mut h1_rx, &mut h2_rx, &mut h3_rx] {
+        assert_eq!(text(rx), "[\"m\",\"hall\",\"to everyone\"]");
+    }
+    assert_eq!(ev("with_tenant(\"acme\", () => len(channel.peers(\"hall\")))"), "3");
+    // Leaving is leaving the tenant's room.
+    wt::from_page(&a2, "[\"l\",\"lobby\"]");
+    eventually(10, "acme's page did not leave", || (ev("with_tenant(\"acme\", () => len(channel.peers(\"lobby\")))") == "1").then_some(()));
+    for p in [&a1, &a2, &e1, &h1, &h2, &h3] {
+        wt::disconnect(p);
+    }
+}
+
+// Q-642 and Q-643: with no `watch` rule any page watched any stream, and streams were one per
+// name for every tenant. Watching is asked of `media.on` as joining is, and each tenant's
+// stream of a name is its own.
+#[test]
+fn a_stream_is_watched_and_sent_only_as_its_rules_say_and_per_tenant() {
+    hub();
+    // `tv` has no watch rule: the page asking is refused, and gets nothing of what is sent.
+    let (w, mut w_rx) = peer("{}");
+    wt::from_page(&w, "[\"v\",\"tv\"]");
+    let (s, mut s_rx) = peer("{}");
+    wt::from_page(&s, "[\"j\",\"media:tv\"]");
+    assert_eq!(text(&mut s_rx), "[\"j\",\"media:tv\",true]");
+    wt::frame_from_page(&s, wire("tv", media::VIDEO, true, b"tv"));
+    // `radio` has no publish rule: no page sends it.
+    let (r, mut r_rx) = peer("{}");
+    wt::from_page(&r, "[\"j\",\"media:radio\"]");
+    assert_eq!(text(&mut r_rx), "[\"j\",\"media:radio\",false]");
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(w_rx.try_recv().is_err(), "a page watched what no rule lets it");
+    // `open`, per tenant: acme's page sees acme's frames, not evil's, nor those a page with
+    // no tenant sends.
+    let (none, mut none_rx) = peer("{}");
+    wt::from_page(&none, "[\"j\",\"media:open\"]");
+    assert_eq!(text(&mut none_rx), "[\"j\",\"media:open\",true]");
+    wt::frame_from_page(&none, wire("open", media::VIDEO, true, b"none first"));
+    let (aw, mut aw_rx) = wt::connect(ticket_in(Some("acme")), None);
+    wt::from_page(&aw, "[\"v\",\"open\"]");
+    let (evil, mut evil_rx) = joined_in(Some("evil"), "media:open");
+    let (acme, mut acme_rx) = joined_in(Some("acme"), "media:open");
+    wt::frame_from_page(&none, wire("open", media::VIDEO, true, b"none"));
+    wt::frame_from_page(&evil, wire("open", media::VIDEO, true, b"evil"));
+    wt::frame_from_page(&acme, wire("open", media::VIDEO, true, b"acme"));
+    match next(&mut aw_rx) {
+        Out::Media(f) => assert!(f.wire.ends_with(b"acme"), "{:?}", String::from_utf8_lossy(&f.wire)),
+        _ => panic!("no frame"),
+    }
+    assert!(aw_rx.try_recv().is_err());
+    // Its streams are its own and the program's: not another tenant's.
+    let names = ev("with_tenant(\"evil\", () => media.streams().filter((s) => s.name == \"open\").map((s) => s.viewers))");
+    assert_eq!(names, "[0]");
+    assert_eq!(ev("with_tenant(\"acme\", () => media.streams().filter((s) => s.name == \"open\").map((s) => s.viewers))"), "[1]");
+    let _ = (&mut evil_rx, &mut acme_rx, &mut none_rx, &mut r_rx);
+    for p in [&w, &s, &r, &none, &aw, &evil, &acme] {
+        wt::disconnect(p);
+    }
+}
+
+// Found in review of Q-644: a page with no tenant (the bare domain) was taken for the program,
+// which reaches every tenant's rooms; and `channel.send` reached a page of another tenant by its
+// id. A page with no tenant has the rooms of no tenant.
+#[test]
+fn a_page_with_no_tenant_reaches_no_tenants_rooms() {
+    let (acme, mut acme_rx) = joined_in(Some("acme"), "who");
+    let (apex, mut apex_rx) = joined_in(None, "who");
+    wt::from_page(&apex, "[\"m\",\"who\",1]");
+    // It hears its own room's peers, and acme hears nothing.
+    assert_eq!(text(&mut apex_rx), serde_json::json!(["m", "who", [format!("{:012x}", apex.id)]]).to_string());
+    assert!(acme_rx.try_recv().is_err());
+    wt::from_page(&acme, "[\"m\",\"who\",1]");
+    assert_eq!(text(&mut acme_rx), serde_json::json!(["m", "who", [format!("{:012x}", acme.id)]]).to_string());
+    assert!(apex_rx.try_recv().is_err());
+    // A tenant's page sends to another tenant's by its id: it is not there.
+    let (a, mut a_rx) = joined_in(Some("acme"), "dm");
+    let (a2, mut a2_rx) = joined_in(Some("acme"), "dm");
+    let (e, mut e_rx) = joined_in(Some("evil"), "dm");
+    wt::from_page(&e, &serde_json::json!(["m", "dm", { "to": format!("{:012x}", a.id) }]).to_string());
+    wt::from_page(&a2, &serde_json::json!(["m", "dm", { "to": format!("{:012x}", a.id) }]).to_string());
+    // The first thing acme's page gets is acme's word: evil's went nowhere.
+    assert_eq!(text(&mut a_rx), "[\"m\",\"dm\",\"a word\"]");
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(a_rx.try_recv().is_err());
+    let _ = (&mut a2_rx, &mut e_rx);
+    for p in [&acme, &apex, &a, &a2, &e] {
+        wt::disconnect(p);
+    }
+}
+
+// Found in review of Q-642: a page with no tenant asking to watch made a stream that acme's
+// viewer then joined for want of acme's own, and the page's frames reached acme. Only the
+// program's own (RTP) stands in for a tenant's. And `media.close` from a job ends every
+// tenant's stream of the name.
+#[test]
+fn a_tenants_viewer_joins_no_stream_a_page_made_and_a_job_ends_all() {
+    hub();
+    let (apex, mut apex_rx) = joined_in(None, "media:cam2");
+    wt::from_page(&apex, "[\"v\",\"cam2\"]");
+    let (aw, mut aw_rx) = wt::connect(ticket_in(Some("acme")), None);
+    wt::from_page(&aw, "[\"v\",\"cam2\"]");
+    // In the inbox behind both: the yes for acme's sender means both were answered.
+    let (acme, mut acme_rx) = joined_in(Some("acme"), "media:cam2");
+    wt::frame_from_page(&apex, wire("cam2", media::VIDEO, true, b"apex"));
+    wt::frame_from_page(&acme, wire("cam2", media::VIDEO, true, b"acme"));
+    match next(&mut aw_rx) {
+        Out::Media(f) => assert!(f.wire.ends_with(b"acme"), "{:?}", String::from_utf8_lossy(&f.wire)),
+        _ => panic!("no frame"),
+    }
+    assert!(aw_rx.try_recv().is_err());
+    // The page with no tenant watches its own.
+    match next(&mut apex_rx) {
+        Out::Media(f) => assert!(f.wire.ends_with(b"apex")),
+        _ => panic!("no frame"),
+    }
+    // From the program with no tenant, each tenant's `cam2` ends.
+    assert_eq!(ev("media.close(\"cam2\")"), "true");
+    assert!(matches!(next(&mut aw_rx), Out::Media(f) if f.kind == media::END));
+    // Out of the room it sent in, then told the stream it watched ended.
+    assert_eq!(text(&mut apex_rx), "[\"j\",\"media:cam2\",false]");
+    assert!(matches!(next(&mut apex_rx), Out::Media(f) if f.kind == media::END));
+    assert_eq!(text(&mut acme_rx), "[\"j\",\"media:cam2\",false]");
+    for p in [&apex, &aw, &acme] {
+        wt::disconnect(p);
+    }
 }

@@ -2664,6 +2664,20 @@ impl Parser {
                     let parts = self.lx.lex_template()?;
                     self.lx.last = Some(Tok::RParen);
                     let t = self.template(parts)?;
+                    // css`...`'s values are CSS values: `__css_value` escapes what would end one
+                    // (FEEDBACK51.md, Q-668; branch feedback51-fixes).
+                    let t = match t {
+                        Expr::Template(parts) if &*k == "css" => Expr::Template(
+                            parts
+                                .into_iter()
+                                .map(|p| match p {
+                                    TPart::Expr(e) => TPart::Expr(Expr::Call(Box::new(Expr::Ident("__css_value".into(), line)), vec![e], line)),
+                                    lit => lit,
+                                })
+                                .collect(),
+                        ),
+                        other => other,
+                    };
                     Ok(Expr::Call(Box::new(Expr::Ident(k.clone().into(), line)), vec![t], line))
                 }
                 _ => {

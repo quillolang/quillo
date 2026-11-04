@@ -159,7 +159,7 @@ route GET /staff/desk/:code {
 
 // ---- files, and health ------------------------------------------------------
 
-route GET /static/*path = file("public/" + path)
+route GET /static/*path = files("public", path)
 
 // For a load balancer: whether the services answer, and the ledger adds up.
 route GET /health {

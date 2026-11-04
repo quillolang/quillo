@@ -102,4 +102,4 @@ route GET /manpower.csv ? { from: date, to: date } {
     }, { type: "text/csv; charset=utf-8", headers: { "content-disposition": `attachment; filename="manpower-${from}-${to}.csv"` } })
 }
 
-route GET /static/*path = file("public/" + path)
+route GET /static/*path = files("public", path)

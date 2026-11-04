@@ -89,6 +89,85 @@ pub struct Handler {
     pub f: Value,
     pub join: Option<Value>,
     pub leave: Option<Value>,
+    /// For a stream's channel (`media.on`): who may watch it.
+    pub watch: Option<Value>,
+}
+
+// ---- rooms, by tenant ---------------------------------------------------------------
+
+/// Channels (and streams, `media:<name>`) every tenant shares: `{ tenants: "shared" }`. A name
+/// ending in `*` stands for every name it starts.
+static SHARED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// `name` is shared by every tenant.
+pub fn share(name: &str) {
+    let mut all = lock(&SHARED);
+    if !all.iter().any(|n| n == name) {
+        all.push(name.to_string());
+    }
+}
+
+fn shared(ch: &str) -> bool {
+    lock(&SHARED).iter().any(|n| n == ch || n.strip_suffix('*').is_some_and(|p| ch.starts_with(p)))
+}
+
+/// Whether a page is in the room `key`.
+pub fn in_room(key: &str) -> bool {
+    lock(&hub().rooms).get(key).is_some_and(|m| !m.is_empty())
+}
+
+/// Between a tenant and a channel's name in a room's key: no name holds it.
+const SEP: char = '\u{1f}';
+
+/// The room a channel is for a tenant: each tenant's own, unless the channel is shared or there
+/// is no tenant. Rooms were keyed by name, so a user on tenant `evil` heard tenant `acme`'s
+/// `lobby` and wrote into it (FEEDBACK51.md, Q-644; branch feedback51-fixes).
+pub fn room_key(ch: &str, tenant: Option<&str>) -> String {
+    match tenant {
+        Some(t) if !shared(ch) => format!("{}{}{}", t, SEP, ch),
+        _ => ch.to_string(),
+    }
+}
+
+/// The tenant in a room's key, if it has one.
+pub fn key_tenant(key: &str) -> Option<&str> {
+    key.split_once(SEP).map(|(t, _)| t)
+}
+
+/// The channel's name in a room's key.
+pub fn key_channel(key: &str) -> &str {
+    key.rsplit(SEP).next().unwrap_or(key)
+}
+
+/// Whose rooms the running code reaches. `None`, every tenant's: code run for no page and no
+/// request (a job, a tick, the top level). Otherwise that tenant's own, and with no tenant the
+/// rooms of none: a page on the bare domain, with no tenant, was taken for the program and
+/// reached every tenant's (found in review of FEEDBACK51.md, Q-644; branch feedback51-fixes).
+pub fn reach(it: &mut Interp) -> Option<Option<String>> {
+    // `answering` as well: a stream's function or a deferred part runs after the route, with
+    // the request no longer set (found in review).
+    let for_someone = it.tenant_named || FOR_PAGE.with(|f| f.get()) || it.answering || it.current_request.is_some() || it.pending_request.is_some();
+    for_someone.then(|| it.tenant().map(|t| t.to_string()))
+}
+
+thread_local! {
+    /// Set while a channel's function runs for what a page did (see `answer`).
+    static FOR_PAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The rooms of `ch` that code reaching `reach` (see `reach`) reaches.
+fn reaches(ch: &str, reach: Option<Option<&str>>) -> impl Fn(&str) -> bool {
+    let own = reach.map(|t| room_key(ch, t));
+    let ch = ch.to_string();
+    move |key: &str| match &own {
+        Some(k) => key == k,
+        None => key_channel(key) == ch,
+    }
+}
+
+/// What a relayed op says it reaches: `"all"`, or the tenant `"t"`, or none.
+fn reach_of(op: &serde_json::Value) -> Option<Option<&str>> {
+    (op["all"] != true).then(|| op["t"].as_str())
 }
 
 pub fn name_ok(n: &str) -> bool {
@@ -127,6 +206,8 @@ pub struct Peer {
     /// after what is queued, where one was started for each message that did not fit, and each
     /// waited on a writer stuck on a page that does not read (FEEDBACK49.md, Q-594; branch main).
     cut: AtomicBool,
+    /// The channels and streams it asked to join or watch (see `MAX_ASKED`).
+    asked: Mutex<HashSet<String>>,
 }
 
 /// A page, as a stream's viewer.
@@ -208,7 +289,7 @@ pub fn connect(t: Ticket, media_tx: Option<tokio::sync::mpsc::Sender<Arc<crate::
             break id;
         }
     };
-    let p = Arc::new(Peer { id, session: t.session, tenant: t.tenant, tx, media_tx, rooms: Mutex::new(HashSet::new()), cut: AtomicBool::new(false) });
+    let p = Arc::new(Peer { id, session: t.session, tenant: t.tenant, tx, media_tx, rooms: Mutex::new(HashSet::new()), cut: AtomicBool::new(false), asked: Mutex::new(HashSet::new()) });
     lock(&hub().peers).insert(id, p.clone());
     (p, rx)
 }
@@ -224,8 +305,34 @@ pub fn disconnect(p: &Arc<Peer>) {
         if let Some(members) = lock(&hub().rooms).get_mut(&r) {
             members.remove(&p.id);
         }
-        inbox(&r).push(Event { kind: 'l', peer: p.clone(), value: String::new() });
+        inbox(key_channel(&r)).push(Event { kind: 'l', peer: p.clone(), value: String::new() });
+        crate::media::drop_if_idle(&r);
     }
+}
+
+/// Most channels pages may have asked of, each with an inbox and a thread: each name a page
+/// sent made one, whether the program has that channel or not, and none went (found in review
+/// of FEEDBACK51.md, Q-643; branch feedback51-fixes).
+const MAX_INBOXES: usize = 4096;
+
+/// Most names one page asks of, to join or watch, while it is connected.
+const MAX_ASKED: usize = 256;
+
+/// Whether `p` may ask of `ch`: an inbox there, or room for one more, and the page under
+/// `MAX_ASKED`. Inboxes no page uses go after a while (see `deliver_loop`), so a page that
+/// asked of 4,096 names leaves room again (found in review of FEEDBACK51.md).
+fn inbox_ok(p: &Peer, ch: &str) -> bool {
+    {
+        let mut asked = lock(&p.asked);
+        if !asked.contains(ch) {
+            if asked.len() >= MAX_ASKED {
+                return false;
+            }
+            asked.insert(ch.to_string());
+        }
+    }
+    let all = lock(&hub().inboxes);
+    all.contains_key(ch) || all.len() < MAX_INBOXES
 }
 
 /// A message from a page: `["j", channel]` to join, `["l", channel]` to
@@ -237,20 +344,29 @@ pub fn from_page(p: &Arc<Peer>, text: &str) {
     if !name_ok(ch) {
         return;
     }
+    let key = room_key(ch, p.tenant.as_deref());
     match kind {
-        "v" => crate::media::watch(ch, Arc::new(Viewer(p.clone()))),
-        "u" => crate::media::unwatch(ch, p.id),
-        "j" if !lock(&p.rooms).contains(ch) => inbox(ch).push(Event { kind: 'j', peer: p.clone(), value: String::new() }),
+        // Watching a stream is asked of its `media.on`, as joining is (FEEDBACK51.md, Q-642).
+        "v" if inbox_ok(p, &format!("media:{}", ch)) => inbox(&format!("media:{}", ch)).push(Event { kind: 'w', peer: p.clone(), value: String::new() }),
+        "u" => crate::media::unwatch(&room_key(&format!("media:{}", ch), p.tenant.as_deref()), p.id),
+        "j" if !lock(&p.rooms).contains(&key) => {
+            if inbox_ok(p, ch) {
+                inbox(ch).push(Event { kind: 'j', peer: p.clone(), value: String::new() });
+            } else {
+                joined(ch, p, false);
+            }
+        }
         "l" => {
-            if lock(&p.rooms).remove(ch) {
-                if let Some(members) = lock(&hub().rooms).get_mut(ch) {
+            if lock(&p.rooms).remove(&key) {
+                if let Some(members) = lock(&hub().rooms).get_mut(&key) {
                     members.remove(&p.id);
                 }
                 inbox(ch).push(Event { kind: 'l', peer: p.clone(), value: String::new() });
+                crate::media::drop_if_idle(&key);
             }
         }
         // Only from a page the channel took.
-        "m" if lock(&p.rooms).contains(ch) => {
+        "m" if lock(&p.rooms).contains(&key) => {
             let v = a.get(2).cloned().unwrap_or(serde_json::Value::Null);
             inbox(ch).push(Event { kind: 'm', peer: p.clone(), value: v.to_string() });
         }
@@ -258,12 +374,18 @@ pub fn from_page(p: &Arc<Peer>, text: &str) {
     }
 }
 
+/// A page its stream's `watch` let in starts watching it, its tenant's.
+pub fn let_watch(p: &Arc<Peer>, stream: &str) {
+    crate::media::watch(&room_key(&format!("media:{}", stream), p.tenant.as_deref()), stream, Arc::new(Viewer(p.clone())));
+}
+
 /// The page took the channel's answer to its asking to join.
 fn joined(ch: &str, p: &Arc<Peer>, yes: bool) {
-    let held = lock(joining()).remove(&(ch.to_string(), p.id)).unwrap_or_default();
+    let key = room_key(ch, p.tenant.as_deref());
+    let held = lock(joining()).remove(&(key.clone(), p.id)).unwrap_or_default();
     if yes && lock(&hub().peers).contains_key(&p.id) {
-        lock(&p.rooms).insert(ch.to_string());
-        lock(&hub().rooms).entry(ch.to_string()).or_default().insert(p.id);
+        lock(&p.rooms).insert(key.clone());
+        lock(&hub().rooms).entry(key).or_default().insert(p.id);
     }
     p.put(Out::Text { json: serde_json::json!(["j", ch, yes]).to_string(), reliable: true });
     if yes {
@@ -286,13 +408,13 @@ fn joining() -> &'static Mutex<HashMap<(String, u64), Vec<Out>>> {
 /// At most this many messages wait for a page that is joining.
 const HELD: usize = 256;
 
-/// Holds `json` for the pages joining `ch` (all of them, or the one `only`);
+/// Holds `json` for the pages joining the rooms `room` takes (all of them, or the one `only`);
 /// how many it was held for.
-fn hold(ch: &str, json: &str, reliable: bool, only: Option<u64>, except: Option<u64>) -> i64 {
+fn hold(room: &dyn Fn(&str) -> bool, json: &str, reliable: bool, only: Option<u64>, except: Option<u64>) -> i64 {
     let mut j = lock(joining());
     let mut n = 0;
     for ((c, id), q) in j.iter_mut() {
-        if c == ch && only.is_none_or(|o| o == *id) && Some(*id) != except && q.len() < HELD {
+        if room(c) && only.is_none_or(|o| o == *id) && Some(*id) != except && q.len() < HELD {
             q.push(Out::Text { json: json.to_string(), reliable });
             n += 1;
         }
@@ -315,14 +437,24 @@ struct Event {
 }
 
 struct Inbox {
+    name: String,
     queue: Mutex<VecDeque<Event>>,
     arrived: Condvar,
     delivering: AtomicBool,
+    /// Let go, as no page used it (see `deliver_loop`): what comes goes to a new one.
+    closed: AtomicBool,
 }
+
+/// How long an inbox with nothing in it, and no page in its channel's rooms, is kept.
+const INBOX_IDLE: Duration = Duration::from_secs(30);
 
 impl Inbox {
     fn push(self: &Arc<Self>, e: Event) {
         let mut q = lock(&self.queue);
+        if self.closed.load(Relaxed) {
+            drop(q);
+            return inbox(&self.name).push(e);
+        }
         if q.len() >= INBOX {
             // Joining and leaving are kept; a message is not.
             match q.iter().position(|e| e.kind == 'm') {
@@ -348,7 +480,7 @@ fn inbox(ch: &str) -> Arc<Inbox> {
     if let Some(i) = all.get(ch) {
         return i.clone();
     }
-    let i = Arc::new(Inbox { queue: Mutex::new(VecDeque::new()), arrived: Condvar::new(), delivering: AtomicBool::new(false) });
+    let i = Arc::new(Inbox { name: ch.to_string(), queue: Mutex::new(VecDeque::new()), arrived: Condvar::new(), delivering: AtomicBool::new(false), closed: AtomicBool::new(false) });
     all.insert(ch.to_string(), i.clone());
     if let Some(addr) = ADDR.get() {
         start_inbox(*addr, ch.to_string(), i.clone());
@@ -373,6 +505,23 @@ pub fn serving(addr: SocketAddr) {
 
 static HTTP_PORT: OnceLock<u16> = OnceLock::new();
 
+/// Takes the inbox of `ch` away if it is still empty and no page is in its channel's rooms;
+/// whether it did.
+fn let_go(ch: &str, i: &Arc<Inbox>) -> bool {
+    let mut all = lock(&hub().inboxes);
+    let q = lock(&i.queue);
+    let used = !q.is_empty() || lock(&hub().rooms).iter().any(|(k, m)| !m.is_empty() && key_channel(k) == ch);
+    if used {
+        return false;
+    }
+    i.closed.store(true, Relaxed);
+    drop(q);
+    if all.get(ch).is_some_and(|x| Arc::ptr_eq(x, i)) {
+        all.remove(ch);
+    }
+    true
+}
+
 fn start_inbox(addr: SocketAddr, ch: String, i: Arc<Inbox>) {
     if i.delivering.swap(true, Relaxed) {
         return;
@@ -389,9 +538,19 @@ fn deliver_loop(addr: SocketAddr, ch: String, i: Arc<Inbox>) {
     loop {
         let batch: Vec<Event> = {
             let mut q = lock(&i.queue);
+            let idle = std::time::Instant::now();
             while q.is_empty() {
                 if crate::httpd::stopping() {
                     return;
+                }
+                // Nothing for a while and no page in its rooms: let go, with its thread.
+                if idle.elapsed() > INBOX_IDLE {
+                    drop(q);
+                    if let_go(&ch, &i) {
+                        return;
+                    }
+                    q = lock(&i.queue);
+                    continue;
                 }
                 q = i.arrived.wait_timeout(q, Duration::from_millis(500)).unwrap_or_else(std::sync::PoisonError::into_inner).0;
             }
@@ -443,8 +602,15 @@ fn deliver_loop(addr: SocketAddr, ch: String, i: Arc<Inbox>) {
         // asking to join. Without an answer, no one was.
         let verdicts: Vec<bool> = answer.and_then(|a| serde_json::from_slice(&a).ok()).unwrap_or_default();
         let mut v = verdicts.into_iter();
-        for e in batch.iter().filter(|e| e.kind == 'j') {
-            joined(&ch, &e.peer, v.next().unwrap_or(false));
+        for e in batch.iter().filter(|e| matches!(e.kind, 'j' | 'w')) {
+            let yes = v.next().unwrap_or(false);
+            if e.kind == 'j' {
+                joined(&ch, &e.peer, yes);
+            } else if yes && lock(&hub().peers).contains_key(&e.peer.id) {
+                // The prefix once: `["v", "media:x"]` asked of `media:media:x`'s rule watched `x`
+                // (found in review of FEEDBACK51.md).
+                let_watch(&e.peer, ch.strip_prefix("media:").unwrap_or(&ch));
+            }
         }
     }
 }
@@ -514,7 +680,8 @@ fn forward(it: &mut Interp, service: &str, name: &str, body: &[u8]) -> crate::se
         if e["k"] == "j" {
             joins += 1;
             if let Some(id) = e["p"].as_str().and_then(|p| u64::from_str_radix(p, 16).ok()) {
-                lock(joining()).insert((name.to_string(), id), Vec::new());
+                // The tenant's room, as `joined` takes it out (found in review of FEEDBACK51.md).
+                lock(joining()).insert((room_key(name, e["t"].as_str()), id), Vec::new());
             }
         }
     }
@@ -551,6 +718,8 @@ pub fn relay_here(body: &[u8]) -> crate::server::HttpResponse {
         return crate::server::HttpResponse { status: 400, headers: Vec::new(), body: b"not JSON\n".to_vec() };
     };
     let ch = op["ch"].as_str().unwrap_or("");
+    // Whose rooms the service's code reaches (FEEDBACK51.md, Q-644).
+    let reach = reach_of(&op);
     let json = op["json"].as_str().unwrap_or("");
     let reliable = op["reliable"].as_bool().unwrap_or(false);
     let peer = |k: &str| op[k].as_str().and_then(|p| u64::from_str_radix(p, 16).ok());
@@ -558,9 +727,9 @@ pub fn relay_here(body: &[u8]) -> crate::server::HttpResponse {
         serde_json::Value::Null
     } else {
         match op["op"].as_str().unwrap_or("") {
-            "b" => serde_json::json!(broadcast_here(ch, json, reliable, peer("except"))),
-            "s" => serde_json::json!(peer("to").is_some_and(|id| send_here(ch, id, json, reliable))),
-            "p" => serde_json::json!(peers_here(ch)),
+            "b" => serde_json::json!(broadcast_here(ch, reach, json, reliable, peer("except"))),
+            "s" => serde_json::json!(peer("to").is_some_and(|id| send_here(ch, reach, id, json, reliable))),
+            "p" => serde_json::json!(peers_here(ch, reach)),
             _ => serde_json::Value::Null,
         }
     };
@@ -584,9 +753,13 @@ pub fn answer(it: &mut Interp, name: &str, body: &[u8]) -> crate::server::HttpRe
         let kind = e["k"].as_str().unwrap_or("");
         let Some((h, sub)) = handler.as_ref() else {
             // A channel no `channel.on` names: pages may join it (to hear
-            // the program's broadcasts), and what they send goes nowhere.
-            if kind == "j" {
-                verdicts.push(true);
+            // the program's broadcasts), and what they send goes nowhere. Not a stream's,
+            // `media:<name>`, which only a `media.on` lets pages send or watch (FEEDBACK51.md,
+            // Q-643; branch feedback51-fixes).
+            match kind {
+                "j" => verdicts.push(!name.starts_with("media:")),
+                "w" => verdicts.push(false),
+                _ => {}
             }
             continue;
         };
@@ -594,7 +767,7 @@ pub fn answer(it: &mut Interp, name: &str, body: &[u8]) -> crate::server::HttpRe
             Some(path) => match mounted(&mut *it, path) {
                 Some(s) => s,
                 None => {
-                    if kind == "j" {
+                    if matches!(kind, "j" | "w") {
                         verdicts.push(false);
                     }
                     continue;
@@ -611,11 +784,12 @@ pub fn answer(it: &mut Interp, name: &str, body: &[u8]) -> crate::server::HttpRe
         // As if the page asked: its session and tenant.
         let saved = (it.session.replace(session), it.tenant.replace(e["t"].as_str().map(Arc::from)), it.tenant_named);
         it.tenant_named = e["t"].is_string();
+        let was_for_page = FOR_PAGE.with(|f| f.replace(true));
         let res = match kind {
             "j" => match &h.join {
                 Some(f) => {
                     if let Some(id) = e["p"].as_str().and_then(|p| u64::from_str_radix(p, 16).ok()) {
-                        lock(joining()).insert((name.to_string(), id), Vec::new());
+                        lock(joining()).insert((room_key(name, e["t"].as_str()), id), Vec::new());
                     }
                     let r = it.call(f, args_for(f, vec![peer]), 0);
                     let yes = matches!(&r, Ok(v) | Err(Ctrl::Return(v)) if v.truthy());
@@ -624,6 +798,19 @@ pub fn answer(it: &mut Interp, name: &str, body: &[u8]) -> crate::server::HttpRe
                 }
                 None => {
                     verdicts.push(true);
+                    Ok(Value::Nil)
+                }
+            },
+            // Watching a stream: only as its `watch` says; with none, no page watches
+            // (FEEDBACK51.md, Q-642; branch feedback51-fixes).
+            "w" => match &h.watch {
+                Some(f) => {
+                    let r = it.call(f, args_for(f, vec![peer]), 0);
+                    verdicts.push(matches!(&r, Ok(v) | Err(Ctrl::Return(v)) if v.truthy()));
+                    r.map(|_| Value::Nil)
+                }
+                None => {
+                    verdicts.push(false);
                     Ok(Value::Nil)
                 }
             },
@@ -638,6 +825,7 @@ pub fn answer(it: &mut Interp, name: &str, body: &[u8]) -> crate::server::HttpRe
             _ => Ok(Value::Nil),
         };
         (it.session, it.tenant, it.tenant_named) = saved;
+        FOR_PAGE.with(|f| f.set(was_for_page));
         if let Err(Ctrl::Error(e)) = res {
             eprintln!("quillo: error in channel {}: {}", h.name, e);
         }
@@ -701,7 +889,7 @@ fn on(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Some(f @ (Value::Func(_) | Value::Builtin(..))) => f.clone(),
         other => return fail(line, format!("`channel.on` needs a function to call with each message, got {}", other.map_or("nothing", |v| v.type_name()))),
     };
-    let (mut join, mut leave) = (None, None);
+    let (mut join, mut leave, mut everyone) = (None, None, false);
     match args.get(2) {
         None | Some(Value::Nil) => {}
         Some(Value::Map(o)) => {
@@ -710,7 +898,8 @@ fn on(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                     ("join", f @ (Value::Func(_) | Value::Builtin(..))) => join = Some(f.clone()),
                     ("leave", f @ (Value::Func(_) | Value::Builtin(..))) => leave = Some(f.clone()),
                     ("join" | "leave", _) => return fail(line, format!("`channel.on`: `{}` is a function of the page", k.as_str())),
-                    _ => return fail(line, format!("`channel.on` has no option `{}` (it takes join and leave)", k.as_str())),
+                    ("tenants", v) => everyone = shared_opt(v, "channel.on", line)?,
+                    _ => return fail(line, format!("`channel.on` has no option `{}` (it takes join, leave and tenants)", k.as_str())),
                 }
             }
         }
@@ -720,8 +909,20 @@ fn on(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if site.channels.iter().any(|h| h.name == name) {
         return fail(line, format!("`channel.on`: the program already handles channel {:?}", name));
     }
-    site.channels.push(Arc::new(Handler { name, f, join, leave }));
+    if everyone {
+        share(&name);
+    }
+    site.channels.push(Arc::new(Handler { name, f, join, leave, watch: None }));
     Ok(Value::Nil)
+}
+
+/// `tenants: "shared"`: one room for every tenant, where each has its own.
+pub fn shared_opt(v: &Value, f: &str, line: u32) -> Result<bool, Ctrl> {
+    match v {
+        Value::Str(s) if &**s == "shared" => Ok(true),
+        Value::Str(s) if &**s == "own" => Ok(false),
+        other => fail(line, format!("`{}`: `tenants` is \"shared\" (one room for every tenant) or \"own\", got {}", f, other.repr())).map(|_: Value| false),
+    }
 }
 
 /// The peer a value names: a peer map, or its id.
@@ -775,21 +976,29 @@ fn send(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let json = message(&name, &v);
     too_big(&json, "channel.send", line)?;
     // From a service apart, through the app's pages (Q-087).
-    let op = serde_json::json!({ "op": "s", "ch": name, "json": json, "reliable": reliable, "to": format!("{:x}", id) });
+    let reach = reach(it);
+    let op = serde_json::json!({ "op": "s", "ch": name, "json": json, "reliable": reliable, "to": format!("{:x}", id), "t": reach.clone().flatten(), "all": reach.is_none() });
     if let Some(r) = relay(it, op) {
         return Ok(Value::Bool(r.map_or(false, |v| v.as_bool().unwrap_or(false))));
     }
-    Ok(Value::Bool(send_here(&name, id, &json, reliable)))
+    Ok(Value::Bool(send_here(&name, reach.as_ref().map(|t| t.as_deref()), id, &json, reliable)))
 }
 
-fn send_here(name: &str, id: u64, json: &str, reliable: bool) -> bool {
+/// To one page in its tenant's room of `name`, if the code sending reaches that room: one
+/// tenant's handler sent to another tenant's page by its id (found in review of FEEDBACK51.md,
+/// Q-644).
+fn send_here(name: &str, reach: Option<Option<&str>>, id: u64, json: &str, reliable: bool) -> bool {
     let p = lock(&hub().peers).get(&id).cloned();
-    match p {
-        Some(p) if lock(&p.rooms).contains(name) => p.put(Out::Text { json: json.to_string(), reliable }),
-        // Being let in: it gets it after the yes (Q-086).
-        Some(_) => hold(name, json, reliable, Some(id), None) > 0,
-        _ => false,
+    let Some(p) = p else { return false };
+    let key = room_key(name, p.tenant.as_deref());
+    if !reaches(name, reach)(&key) {
+        return false;
     }
+    if lock(&p.rooms).contains(&key) {
+        return p.put(Out::Text { json: json.to_string(), reliable });
+    }
+    // Being let in: it gets it after the yes (Q-086).
+    hold(&|k: &str| k == key, json, reliable, Some(id), None) > 0
 }
 
 /// `channel.broadcast(name, value, { except, reliable })`: to every page in
@@ -801,21 +1010,24 @@ fn broadcast(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let json = message(&name, &v);
     too_big(&json, "channel.broadcast", line)?;
     // From a service apart, to the app's pages (Q-087).
-    let op = serde_json::json!({ "op": "b", "ch": name, "json": json, "reliable": reliable, "except": except.map(|e| format!("{:x}", e)) });
+    let reach = reach(it);
+    let op = serde_json::json!({ "op": "b", "ch": name, "json": json, "reliable": reliable, "except": except.map(|e| format!("{:x}", e)), "t": reach.clone().flatten(), "all": reach.is_none() });
     if let Some(r) = relay(it, op) {
         return Ok(Value::Int(r.map_or(0, |v| v.as_i64().unwrap_or(0))));
     }
-    Ok(Value::Int(broadcast_here(&name, &json, reliable, except)))
+    Ok(Value::Int(broadcast_here(&name, reach.as_ref().map(|t| t.as_deref()), &json, reliable, except)))
 }
 
-fn broadcast_here(name: &str, json: &str, reliable: bool, except: Option<u64>) -> i64 {
+/// To the pages in the rooms of `name` that code reaching `reach` reaches (see `reach`).
+fn broadcast_here(name: &str, reach: Option<Option<&str>>, json: &str, reliable: bool, except: Option<u64>) -> i64 {
     let json = json.to_string();
-    let ids: Vec<u64> = lock(&hub().rooms).get(name).map(|m| m.iter().copied().collect()).unwrap_or_default();
+    let room = reaches(name, reach);
+    let ids: Vec<u64> = lock(&hub().rooms).iter().filter(|(k, _)| room(k)).flat_map(|(_, m)| m.iter().copied()).collect();
     let peers: Vec<Arc<Peer>> = {
         let all = lock(&hub().peers);
         ids.iter().filter(|id| Some(**id) != except).filter_map(|id| all.get(id).cloned()).collect()
     };
-    let mut n = hold(name, &json, reliable, None, except);
+    let mut n = hold(&room, &json, reliable, None, except);
     for p in peers {
         if p.put(Out::Text { json: json.clone(), reliable }) {
             n += 1;
@@ -828,15 +1040,17 @@ fn broadcast_here(name: &str, json: &str, reliable: bool, except: Option<u64>) -
 fn peers(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let name = name_arg(&args, "channel.peers", line)?;
     // A service apart asks the app, whose pages they are (Q-087).
-    if let Some(r) = relay(it, serde_json::json!({ "op": "p", "ch": name })) {
+    let reach = reach(it);
+    if let Some(r) = relay(it, serde_json::json!({ "op": "p", "ch": name, "t": reach.clone().flatten(), "all": reach.is_none() })) {
         let ids = r.ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
         return Ok(Value::list(ids.iter().filter_map(|v| v.as_str()).map(Value::str).collect()));
     }
-    Ok(Value::list(peers_here(&name).into_iter().map(Value::str).collect()))
+    Ok(Value::list(peers_here(&name, reach.as_ref().map(|t| t.as_deref())).into_iter().map(Value::str).collect()))
 }
 
-fn peers_here(name: &str) -> Vec<String> {
-    let mut ids: Vec<u64> = lock(&hub().rooms).get(name).map(|m| m.iter().copied().collect()).unwrap_or_default();
+fn peers_here(name: &str, reach: Option<Option<&str>>) -> Vec<String> {
+    let room = reaches(name, reach);
+    let mut ids: Vec<u64> = lock(&hub().rooms).iter().filter(|(k, _)| room(k)).flat_map(|(_, m)| m.iter().copied()).collect();
     ids.sort();
     ids.into_iter().map(|id| format!("{:012x}", id)).collect()
 }
@@ -1214,21 +1428,23 @@ pub fn over_websocket(mut socket: crate::ws::Socket, ticket: Ticket) {
 /// Q-060; branch feedback6-fixes).
 pub fn frame_from_page(p: &Arc<Peer>, wire: Vec<u8>) {
     let Some(name) = crate::media::frame_stream(&wire) else { return };
-    if !lock(&p.rooms).contains(&format!("media:{}", name)) {
+    // The tenant's own stream, as its room is (FEEDBACK51.md, Q-642; branch feedback51-fixes).
+    let key = room_key(&format!("media:{}", name), p.tenant.as_deref());
+    if !lock(&p.rooms).contains(&key) {
         return;
     }
-    crate::media::from_page(wire);
+    crate::media::from_page(&key, wire);
 }
 
-/// Every page leaves `channel`, as if it had not joined: what `media.close`
-/// does to the pages sending a stream.
-pub fn leave_all(channel: &str) {
-    let members: Vec<u64> = lock(&hub().rooms).remove(channel).map(|m| m.into_iter().collect()).unwrap_or_default();
+/// Every page leaves the room `key`, as if it had not joined: what `media.close` does to the
+/// pages sending a stream.
+pub fn leave_all(key: &str) {
+    let members: Vec<u64> = lock(&hub().rooms).remove(key).map(|m| m.into_iter().collect()).unwrap_or_default();
     let peers = lock(&hub().peers);
     for id in members {
         if let Some(p) = peers.get(&id) {
-            lock(&p.rooms).remove(channel);
-            p.put(Out::Text { json: serde_json::json!(["j", channel, false]).to_string(), reliable: true });
+            lock(&p.rooms).remove(key);
+            p.put(Out::Text { json: serde_json::json!(["j", key_channel(key), false]).to_string(), reliable: true });
         }
     }
 }

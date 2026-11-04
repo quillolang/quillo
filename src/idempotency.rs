@@ -289,7 +289,7 @@ fn session_user(it: &mut Interp, line: u32) -> R {
     }
 }
 
-fn sha256_hex(parts: &[&[u8]]) -> String {
+pub(crate) fn sha256_hex(parts: &[&[u8]]) -> String {
     let mut h = Sha256::new();
     for p in parts {
         h.update((p.len() as u64).to_be_bytes());

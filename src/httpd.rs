@@ -38,6 +38,9 @@ const IDLE: Duration = Duration::from_secs(60);
 /// A request head still arriving after this long, or a body that sends nothing for this
 /// long, is given up on.
 const SLOW: Duration = Duration::from_secs(30);
+/// A body that keeps coming slower than this, past its first `SLOW`, is given up on: a byte
+/// every 25 s held a connection for good (FEEDBACK51.md, Q-672; branch feedback51-fixes).
+const MIN_BODY_RATE: u64 = 1024;
 /// How long a connection being closed may keep sending (see `linger`).
 const LINGER: Duration = Duration::from_secs(2);
 /// A request's stack: address space, used only as needed.
@@ -426,6 +429,11 @@ struct Conn {
     receiving: Option<Instant>,
     /// Its head is read, and this is its line for the log: its body is arriving.
     body_of: Option<String>,
+    /// When the body began to arrive, and how much had come on the connection then.
+    body_from: Option<(Instant, u64)>,
+    /// Bytes that came on the connection.
+    got: u64,
+    _place: Place,
     /// The request being answered came over HTTP/1.0, which has no chunks.
     http10: bool,
     /// `100 Continue` was sent for the request now arriving.
@@ -1021,6 +1029,7 @@ impl Loop {
 
     /// Takes a new connection into this loop.
     fn adopt(&mut self, mut stream: TcpStream, peer: SocketAddr) {
+        let Some(place) = place_for(&peer) else { return };
         let _ = stream.set_nodelay(true);
         let i = self.free.pop().unwrap_or_else(|| {
             self.slots.push(Slot::Free);
@@ -1039,6 +1048,9 @@ impl Loop {
             active: self.now,
             receiving: None,
             body_of: None,
+            body_from: None,
+            got: 0,
+            _place: place,
             http10: false,
             continued: false,
             closing: false,
@@ -1068,7 +1080,7 @@ impl Loop {
                 // A head must come whole in time; a body may take as long as it keeps coming,
                 // as nginx's `client_body_timeout`: a photo from a phone on a weak link took
                 // longer than 30 s and was reset (FEEDBACK36.md, Q-432; branch feedback36-39).
-                Some(_) if c.body_of.is_some() => now.duration_since(c.active) > SLOW,
+                Some(_) if c.body_of.is_some() => now.duration_since(c.active) > SLOW || too_slow(c, now),
                 Some(since) => now.duration_since(since) > SLOW,
                 // A client that takes none of its answer for this long
                 // would hold the connection and the answer forever.
@@ -1083,7 +1095,8 @@ impl Loop {
                     // (FEEDBACK36.md, Q-432 and Q-446; branch feedback36-39).
                     if c.receiving.is_some() && !c.lingering {
                         if let Some(line) = c.body_of.take() {
-                            log_refused(&line, 408, "nothing of the body came for 30 s");
+                            let why = if too_slow(&c, now) { "the body came at less than 1 KiB/s" } else { "nothing of the body came for 30 s" };
+                            log_refused(&line, 408, why);
                         }
                         write_response(&mut c.output, &crate::server::plain_response(408, "request timeout\n"), false, true);
                         if let Ok(true) = flush(&mut c) {
@@ -1187,6 +1200,7 @@ impl Loop {
                     break;
                 }
                 Ok(n) => {
+                    c.got += n as u64;
                     c.input.extend_from_slice(&chunk[..n]);
                     // Less than asked for: that was all there was. (What
                     // arrives later raises a new event, so there is no need
@@ -1418,6 +1432,14 @@ impl Loop {
     }
 }
 
+/// Whether a body, past its first `SLOW`, has come slower than `MIN_BODY_RATE` (Q-672).
+fn too_slow(c: &Conn, now: Instant) -> bool {
+    c.body_from.is_some_and(|(at, from)| {
+        let t = now.duration_since(at);
+        t > SLOW && c.got - from < MIN_BODY_RATE * t.as_secs()
+    })
+}
+
 /// Takes the complete requests out of the connection's input.
 fn take_requests(c: &mut Conn, max_body: usize, now: Instant) -> Vec<Item> {
     let mut items = Vec::new();
@@ -1427,6 +1449,7 @@ fn take_requests(c: &mut Conn, max_body: usize, now: Instant) -> Vec<Item> {
                 c.receiving.get_or_insert(now);
                 if body && c.body_of.is_none() {
                     c.body_of = Some(request_line(&c.input));
+                    c.body_from = Some((now, c.got));
                 }
                 if expects_continue && !c.continued {
                     c.continued = true;
@@ -1441,6 +1464,7 @@ fn take_requests(c: &mut Conn, max_body: usize, now: Instant) -> Vec<Item> {
             Taken::Item(item) => {
                 c.receiving = None;
                 c.body_of = None;
+                c.body_from = None;
                 c.continued = false;
                 items.push(item);
             }
@@ -1675,6 +1699,74 @@ fn ip_of(a: &SocketAddr) -> String {
     a.ip().to_string()
 }
 
+/// `--max-connections`: most connections open at once; past it one more is closed as it
+/// comes, rather than `accept` failing for everyone once descriptors run out (FEEDBACK51.md,
+/// Q-672; branch feedback51-fixes). 0 until the server starts, which sets what its descriptors
+/// allow, less some for files and databases.
+pub static MAX_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// `--connections-per-client`: most one client holds open, an address or an IPv6 /64. This
+/// machine and the proxies `--trust-proxy` names, which bring many clients, are not held to it.
+pub static CONNECTIONS_PER_CLIENT: AtomicUsize = AtomicUsize::new(512);
+
+/// Connections open, by client, of those held to `CONNECTIONS_PER_CLIENT`.
+static PER_CLIENT: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+/// A connection's place among its client's, given back when it is dropped.
+struct Place(Option<String>);
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        let Some(k) = &self.0 else { return };
+        let mut all = PER_CLIENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(m) = all.as_mut() {
+            if let Some(n) = m.get_mut(k) {
+                *n -= 1;
+                if *n == 0 {
+                    m.remove(k);
+                }
+            }
+        }
+    }
+}
+
+/// A place for a connection from `peer`, if the limits leave one.
+fn place_for(peer: &SocketAddr) -> Option<Place> {
+    let most = MAX_CONNECTIONS.load(SeqCst);
+    if most > 0 && crate::metrics::CONNECTIONS.load(SeqCst) as usize >= most {
+        refused_connection(&format!("{} connections are open, the most --max-connections allows", most));
+        return None;
+    }
+    let ip = match peer.ip() {
+        std::net::IpAddr::V6(a) => a.to_ipv4_mapped().map_or(peer.ip(), std::net::IpAddr::V4),
+        v4 => v4,
+    };
+    if ip.is_loopback() || TRUSTED.get().is_some_and(|nets| trusted(ip, nets)) {
+        return Some(Place(None));
+    }
+    let key = crate::statics::client_of(&ip.to_string());
+    let mut all = PER_CLIENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let n = all.get_or_insert_with(HashMap::new).entry(key.clone()).or_insert(0);
+    if *n >= CONNECTIONS_PER_CLIENT.load(SeqCst) {
+        let n = *n;
+        drop(all);
+        refused_connection(&format!("{} holds {} connections, the most --connections-per-client allows: behind a proxy, name it with --trust-proxy", key, n));
+        return None;
+    }
+    *n += 1;
+    Some(Place(Some(key)))
+}
+
+/// Said in the log at most once a minute.
+fn refused_connection(why: &str) {
+    static SAID: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut at = SAID.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if at.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
+        *at = Some(Instant::now());
+        log(format!("quillo: a connection is closed as it comes: {}\n", why));
+    }
+}
+
 /// Set on a request that came from a proxy `--trust-proxy` names.
 pub const PROXIED: &str = "x-quillo-from-trusted-proxy";
 
@@ -1781,6 +1873,7 @@ fn parse(buf: &[u8], peer: &str, max_body: usize, chunked_so_far: &mut Option<De
     let mut hs: Vec<(String, String)> = Vec::with_capacity(r.headers.len());
     let mut length: Option<usize> = None;
     let mut codings: Vec<String> = Vec::new();
+    let mut te_named = false;
     let mut connection = String::new();
     let mut expects_continue = false;
     for h in r.headers.iter() {
@@ -1795,6 +1888,7 @@ fn parse(buf: &[u8], peer: &str, max_body: usize, chunked_so_far: &mut Option<De
                 _ => return Parsed::Bad(400, "bad content-length"),
             }
         } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            te_named = true;
             codings.extend(value.to_ascii_lowercase().split(',').map(|t| t.trim_matches([' ', '\t']).to_string()).filter(|t| !t.is_empty()));
         } else if h.name.eq_ignore_ascii_case("connection") {
             connection = value.to_ascii_lowercase();
@@ -1816,6 +1910,12 @@ fn parse(buf: &[u8], peer: &str, max_body: usize, chunked_so_far: &mut Option<De
     // A body is framed one way only, and only the way both ends of a proxy
     // read alike: `chunked` (last, and alone, since nothing else is decoded)
     // over HTTP/1.1, or a length.
+    // A `Transfer-Encoding` that names nothing (`,`, empty) is no framing a proxy and this
+    // server read alike: it was read by its length (FEEDBACK51.md, Q-654; branch
+    // feedback51-fixes).
+    if te_named && codings.is_empty() {
+        return Parsed::Bad(400, "transfer-encoding names no coding");
+    }
     let chunked = !codings.is_empty();
     if chunked {
         if version == 0 {
@@ -2005,6 +2105,12 @@ fn dechunk(d: &mut Dechunk, buf: &[u8], max_body: usize) -> Chunked {
                     return if rest.len() > MAX_CHUNK_LINE { Chunked::Bad } else { Chunked::Need };
                 };
                 let line = &rest[..eol];
+                // No control character in it: a proxy that ends the line at a bare LF (or
+                // reads a CR or NUL otherwise) saw one request where this server saw two
+                // (FEEDBACK51.md, Q-654; branch feedback51-fixes).
+                if line.iter().any(|&b| is_ctl(b)) {
+                    return Chunked::Bad;
+                }
                 let size_text = line.split(|b| *b == b';').next().unwrap_or(&[]);
                 d.extra += line.len() - size_text.len();
                 if eol > MAX_CHUNK_LINE || d.extra > MAX_CHUNK_EXTRA {
@@ -2055,6 +2161,9 @@ fn dechunk(d: &mut Dechunk, buf: &[u8], max_body: usize) -> Chunked {
                 let Some(eol) = find_crlf(rest) else {
                     return if d.extra + rest.len() > MAX_CHUNK_EXTRA { Chunked::Bad } else { Chunked::Need };
                 };
+                if rest[..eol].iter().any(|&b| is_ctl(b)) {
+                    return Chunked::Bad;
+                }
                 d.used += eol + 2;
                 if eol == 0 {
                     return Chunked::Done(std::mem::take(&mut d.body), d.used);
@@ -2066,6 +2175,11 @@ fn dechunk(d: &mut Dechunk, buf: &[u8], max_body: usize) -> Chunked {
             }
         }
     }
+}
+
+/// A control character, which a chunk's line or a trailer may not hold (but a tab).
+fn is_ctl(b: u8) -> bool {
+    b < 0x20 && b != b'\t' || b == 0x7f
 }
 
 fn find_crlf(b: &[u8]) -> Option<usize> {

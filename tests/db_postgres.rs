@@ -487,8 +487,12 @@ fn replicas_are_left_out_when_they_fail_or_in_a_transaction() {
     assert_eq!(eval(&mut it, "len(db.query(\"select * from only_here\"))"), "0");
     assert_eq!(eval(&mut it, name), "\"primary\"");
     // One that cannot be reached is said at once.
-    let nobody = format!("postgres://quillo@127.0.0.1:{}/x", support::free_port());
-    says(eval(&mut it, &format!("db.open(\"{}\", {{ replicas: [\"{}\"] }})", primary, nobody)), &format!("replica {}", nobody));
+    // Named without its user and password (FEEDBACK51.md, Q-659).
+    let port = support::free_port();
+    let nobody = format!("postgres://quillo:S3cretPassw0rd@127.0.0.1:{}/x", port);
+    let said = eval(&mut it, &format!("db.open(\"{}\", {{ replicas: [\"{}\"] }})", primary, nobody));
+    says(said.clone(), &format!("replica postgres://127.0.0.1:{}/x:", port));
+    assert!(!said.contains("S3cret") && !said.contains("quillo@"), "{}", said);
 }
 
 // ---- tenants ----------------------------------------------------------------------------------

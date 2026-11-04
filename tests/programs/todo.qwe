@@ -54,7 +54,7 @@ route GET / {
     </Layout>
 }
 
-route GET /static/*path = file("public/" + path)
+route GET /static/*path = files("public", path)
 
 // ---- HTML form posts: form fields are matched like any payload --------------
 

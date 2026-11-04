@@ -77,7 +77,7 @@ component AppLayout() {
 
 // ─── PUBLIC APP ROUTING OVERLAYS ───
 
-route GET /static/*path = file("public/" + path)
+route GET /static/*path = files("public", path)
 
 // One route for every page: AppLayout picks what to show from the path
 route GET /*rest =

@@ -4,6 +4,67 @@
 
 ### What to change in your code
 
+From the security review (FEEDBACK51.md, Q-640 to Q-676):
+
+- **Channels and media streams are each tenant's own.** Pages on `acme.example.com` and
+  `evil.example.com` joining `lobby` are in two rooms, and what code run for a page or a
+  request broadcasts, sends or lists reaches its tenant's room; a page with no tenant has
+  the rooms of no tenant. Jobs, ticks and the top level reach every tenant's.
+  `channel.on(name, f, { tenants: "shared" })` and `media.on(name, { tenants: "shared" })`
+  make one for all (Q-644, Q-642).
+- **A stream is watched only as `media.on(name, { watch })` says, and sent only as its
+  `publish` says**: with no `watch`, no page watches it (RTP cameras included: add
+  `media.on("cam", { watch: (peer) => ... })`); with no `publish`, no page sends it
+  (Q-642, Q-643). Pages make at most 1,024 streams, 256 a tenant, and watch 32 each; a
+  stream keeps 32 MiB of video, all of them 256 MiB.
+- **A middleware that gives a map other than the request is a 500** naming it: `{ error:
+  "bad api key" }` let the route run. The request, a copy of it (`merge(r, ...)`) and null
+  go on, as before; `quillo check` warns about an `if` with no `else` after a `return r`,
+  which lets everyone else in (Q-651).
+- **An `accept_calls` `check` accepts only with `true` or a caller map**; null (an `if` with
+  no `else`) refused nobody (Q-652). **A visitor's token is not a service caller's**: a JWT
+  whose `sub` is a user, not the client, is refused (Q-665). **A remembered service answer
+  is the same caller's, function's, tenant's and arguments'** (Q-664).
+- **`server fn f() for [...]` takes no calls from pages** at `/_quillo/rpc/f`, which
+  answers 404, and is not in the page's script (Q-641).
+- **Only what a `site` declaration made is a site**, and calling one needs the `http`
+  effect, which `quillo check` says (Q-640).
+- **`navigate` and `redirect` refuse `javascript:` URLs** (Q-645).
+- **In `<style>`, each `<` of a value is `\3c `** (the same character to CSS), and a
+  `<script>`'s JSON has `&` as `\u0026`, so neither can make markup inside `<svg>` or
+  `<math>` (Q-646). **A css`...`'s `${}` and a style map's values have `{ } ; \` as CSS
+  escapes, and a style map's keys are property names** (Q-668).
+- **Quillo follows each redirect of `http.*` itself**: to another origin (scheme, host,
+  port) only `accept`, `accept-language`, `content-type` and `user-agent` go on;
+  `public_only` is checked at each hop, through a proxy too; `redirects: N` follows N;
+  a `file:` redirect is the answer, not a crash (Q-649, Q-650).
+- **`run_script` uses Quillo's builtins**, never the program's functions of their names, and
+  gives back no function (Q-648, Q-670).
+- **`files()` hides `lib.QWE` and the like** on macOS and Windows, and its folder redirect
+  stays on the host (Q-656, Q-671). The template and the guide serve static files with
+  `files("public", path)`; `quillo check` warns about `file("public/" + path)` (Q-657).
+- **`image.convert` will not write the program's own files** (Q-658), and converts at most
+  40 megapixels, and what would take more than about 640 MiB (a resize works in 16 bytes a
+  pixel); conversions at once take 1 GiB at most (Q-674).
+- **`quillo install --example --force` keeps the program's files**, and takes extras only as
+  plain file names on the registry (Q-673).
+- **`/_quillo/ready` says each check only with the health token** (`QUILLO_HEALTH_TOKEN`);
+  others get `{"ready": ...}` (Q-655).
+- **Under `--watch` the server answers only `localhost`, addresses and `--allowed-hosts`**,
+  with 421 for other names (DNS rebinding, Q-663).
+- **New server options**: `--max-connections` (default: what the file descriptors allow,
+  less 4,608) and `--connections-per-client` (512; this machine and `--trust-proxy`'s
+  proxies are not held to it). A request body must keep coming at 1 KiB/s after its first
+  30 s (Q-672).
+- **A page that reads `request.cookies`, or the cookie or authorization header, is private**
+  (`Cache-Control: private`), as one made with `session()` is (Q-669).
+- **JSON is read with at most a value per 8 bytes (or a million)**, and `==`, `str`, JSON
+  and sorting go 10,000 levels deep at most (Q-660, Q-661).
+- **A new SQLite file is its owner's alone** (0600) (Q-675). **A replica's error names it
+  without its password** (Q-659).
+- **`quillo lsp` compiles a `.qwer` only when it is saved, in a folder the editor says it
+  trusts** (`initializationOptions.trusted`; the VS Code extension sends it) (Q-653).
+
 - **A group's middleware lets the route go on only by giving the request back, or null.**
   `false` now answers 403, an error value answers as a route's error, and `true` or text is
   a 500 naming the middleware; all of them let the route run before. A predicate middleware

@@ -86,7 +86,7 @@ route GET / =
         <Notes/>
     </Page>
 
-route GET /static/*path = file("public/" + path)
+route GET /static/*path = files("public", path)
 
 // The same data as JSON, for scripts.
 route GET /api/notes = all_notes()

@@ -174,7 +174,7 @@ Safety built in:
   the values an SVG `<set>` or `<animate>` gives another attribute (`to`, `from`, `by`,
   each of `values`), which may be an `href`.
 - CSS takes data as it is written, by design: `style={...}` is escaped like any
-  attribute and `<style>{x}</style>` has its `</` rewritten, so neither can end the
+  attribute and `<style>{x}</style>` has its `<` rewritten (`\3c `), so neither can end the
   element, but what they say is CSS. CSS runs no script in today's browsers; data put
   there can still restyle the page (cover it with an overlay,
   hide or move what is on it) and load URLs (`background: url(https://elsewhere/?...)`,
@@ -242,9 +242,14 @@ Safety built in:
   the program's own functions that only return such text
   (`` fn table_of(id: int) = sql_name(`obj_${id}`) ``) is not warned about:
   `let order = match sort { "new" => "created desc", _ => "score desc" }` and then
-  `"select * from posts order by " + order`. A run-time set of columns, from a map `row`:
-  `` `insert into t (${sql_name(keys(row))}) values (${sql_param(keys(row))})` `` with
-  `row` as the parameters, or `` `update t set (${sql_name(cols)}) = (${sql_param(cols)})` ``.
+  `"select * from posts order by " + order`. A run-time set of columns, from a list the
+  program wrote: `` `insert into t (${sql_name(cols)}) values (${sql_param(cols)})` `` with
+  a map of those columns as the parameters, or
+  `` `update t set (${sql_name(cols)}) = (${sql_param(cols)})` ``. Take the columns from
+  the program, never from what the visitor sent: `keys(request.form)` names `is_admin`
+  and `id` as well as `email`, which `sql_name` takes, as they are names, so a sign-up form
+  with `is_admin=1` made an admin (FEEDBACK51.md, Q-662). A record type, `{ form: Signup }`,
+  keeps its fields only.
   It is a warning, not a proof: SQL built in a list made with `map` is not followed.
 - Inside `db.transaction` on SQLite, `sleep`, `http` and queries to another database
   (PostgreSQL, MySQL) hold up other requests instead of letting them read and write
@@ -1464,7 +1469,12 @@ Sent `acme`, the form makes `data/acme.db` (with `migrations/`'s tables) and goe
   for no tenant, such as a request to the bare domain, gets an error from `db`.
 - Live updates stay within a tenant: a change to one tenant's table wakes only that
   tenant's pages, even when the tenants share one database, and a write made for no
-  tenant (a job, a script) wakes none.
+  tenant (a job, a script) wakes none. A page follows only its own tenant's topics and
+  those of no tenant: one naming `acme@db:orders` from evil's host is not told of acme's
+  orders *(since 0.7)*. Topics are not checked further: within a tenant, any page may
+  follow any topic it can name.
+- Channels and media streams are each tenant's own, unless `tenants: "shared"` (see
+  [Channels](#channels) and [Media](#media)).
 - `with_tenant("acme", () => ...)` runs code for a tenant, making its database if there is
   none: outside a request, in a script or a scheduled job.
 - What stays shared: global variables, one copy for the whole process, so keep a

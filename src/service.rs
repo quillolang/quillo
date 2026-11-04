@@ -1313,7 +1313,10 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
         let bearer = header("authorization").and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer "))).map(str::to_string);
         match (accept.as_ref().and_then(|a| a.jwt.clone()), bearer) {
             (Some(rules), Some(token)) => match it.unlocked(move || crate::svcauth::verify_jwt(&token, &rules)) {
-                Ok(claims) => caller = Some(crate::svcauth::jwt_caller(&claims)),
+                Ok(claims) => match crate::svcauth::jwt_caller(&claims) {
+                    Ok(c) => caller = Some(c),
+                    Err(e) => why = e,
+                },
                 Err(e) => why = format!("the bearer token: {}", e),
             },
             (None, Some(_)) if s.sig.is_empty() => why = "a bearer token, and nothing here checks one (accept_calls { jwt })".into(),
@@ -1343,16 +1346,22 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     }
     // Anything else, in Quillo: what `check` gives is the caller from then on.
     if let Some(check) = accept.as_ref().and_then(|a| a.check.clone()) {
-        match it.call(&check, vec![caller.clone()], 0) {
-            Ok(Value::Map(m)) => caller = Value::Map(m),
-            Ok(Value::Bool(false)) => return refused(403, "refused by accept_calls's check"),
-            Ok(Value::Err(e, ..)) => return refused(403, &e.display()),
-            Ok(_) | Err(Ctrl::Return(_)) => {}
+        let given = match it.call(&check, vec![caller.clone()], 0) {
+            Ok(v) | Err(Ctrl::Return(v)) => v,
             Err(Ctrl::Reply(r)) => return crate::server::render_response(&r),
             Err(Ctrl::Error(e)) => {
                 eprintln!("quillo: error in accept_calls's check: {:#}", e);
                 return refused(500, "internal error in accept_calls's check");
             }
+        };
+        // Only `true` or a caller accepts. Anything else did, null among them: an allow-list
+        // written as an `if` with no `else` let every other caller in (FEEDBACK51.md, Q-652;
+        // branch feedback51-fixes).
+        match given {
+            Value::Map(m) => caller = Value::Map(m),
+            Value::Bool(true) => {}
+            Value::Err(e, ..) => return refused(403, &e.display()),
+            _ => return refused(403, "refused by accept_calls's check"),
         }
     }
     let signed_back = |r: HttpResponse| -> HttpResponse {
@@ -1364,7 +1373,15 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     };
     // A call sent again (it got no answer in time, is a call made later
     // delivered twice, or was replayed by someone who saw it): answered as
-    // it was, not run again.
+    // it was, not run again. The same call: by the same caller, to the same function, for the
+    // same tenant, with the same arguments. By its id alone, another caller that had the id was
+    // given the first one's answer (FEEDBACK51.md, Q-664; branch feedback51-fixes).
+    let who = match &caller {
+        Value::Map(m) => m.get("name").map(|n| n.display()).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let key = call_key(c, &who, f, tenant, &req.body);
+    let c = key.as_str();
     {
         let mut seen = seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match seen.get(c) {
@@ -1412,6 +1429,12 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     }
     drop(seen);
     signed_back(r)
+}
+
+/// The key a call is remembered by, in memory and in `_quillo_calls`: its id, its caller, the
+/// function, the tenant and the arguments, hashed to the 64 characters an id there holds.
+pub fn call_key(id: &str, caller: &str, f: &str, tenant: &str, body: &[u8]) -> String {
+    crate::idempotency::sha256_hex(&[id.as_bytes(), caller.as_bytes(), f.as_bytes(), tenant.as_bytes(), body])
 }
 
 /// Calls answered lately, by call id: when, and the answer (none while it runs).

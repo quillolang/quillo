@@ -51,12 +51,16 @@ What a middleware gives back decides what happens:
   sends the visitor to the login page, `reply 401 { error: "..." }` answers JSON.
 - **A response value**, from `respond(...)` or `redirect(...)` returned rather than
   replied, answers the request too.
-- **The request, or null,** lets the route run. Giving the request back is the
-  convention, so the same function works as a pipeline stage inside a route (`request |
-  signed_in | ...`) and as a group's middleware.
+- **The request, a copy of it (`merge(r, ...)`), or null,** lets the route run. Giving
+  the request back is the convention, so the same function works as a pipeline stage
+  inside a route (`request | signed_in | ...`) and as a group's middleware. Null goes on
+  too, so `quillo check` warns about a middleware that gives the request back in one
+  place and can end with no value in another (an `if` with no `else` after a `return
+  r`): whoever reaches that end is let in.
 - **Anything else** stops it *(since 0.7: these let the route run)*: `false` answers
   403, an error value answers as a route's error does, and any other value (`true`,
-  text) is a 500 that names the middleware. So a check is written `(r) => ok(r) ? r :
+  text, a map other than the request, `{ error: "bad api key" }`) is a 500 that names
+  the middleware. So a check is written `(r) => ok(r) ? r :
   reply 403 "..."`, not as a predicate, and `quillo check` says so when a middleware can
   only be a `bool` or text.
 - What it gives does not reach the route: a route that needs the user reads it again

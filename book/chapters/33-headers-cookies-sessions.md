@@ -97,6 +97,10 @@ routes /api | api.key {
 }
 ```
 
+As a group's middleware, a check that gives back a map of its own, `{ error:
+"unauthorized" }`, rather than replying it, is a 500 that names it *(since 0.7: the
+route ran)*.
+
 For a page rather than an API, the check redirects instead: a `reply` with a status and
 a `redirect` goes to the login page from inside the helper (see
 [Sessions](#sessions)).
@@ -454,7 +458,8 @@ route GET /api/me = request | api.key | (r) => respond(200, { ip: r.ip, user: se
 The `next` a login form carries is checked by `local` before it is followed, so a link
 from elsewhere cannot send a visitor to another site after signing in: starting with
 `/` is not enough, since a browser takes `//evil.example` (and `/\evil.example`) as
-another host, and `redirect` sends what it is given. Signing out and the theme are
+another host, and `redirect` sends what it is given, but for a `javascript:` URL, which it
+refuses *(since 0.7)*. Signing out and the theme are
 forms too, posting to their routes: a link cannot log anyone out, since a `GET` would
 let any page do it. The `migrations/` folder holds the `users` table,
 `migrations/001_users.sql`:

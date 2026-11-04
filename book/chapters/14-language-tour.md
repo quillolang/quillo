@@ -587,7 +587,11 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
 - `<html>` gets `<!doctype html>`. A `<!DOCTYPE html>` written before `<html>`, as an HTML
   file has it, is passed over; before another element it is an error (`` `<!DOCTYPE html>`
   goes before an <html> element, which gets one by itself ``).
-- `<style>{style}</style>` takes a style sheet as it is (no escaping, so `a > b` works).
+- `<style>{style}</style>` takes a style sheet as it is (no escaping, so `a > b` works),
+  but for each `<`, written as CSS's own `\3c ` (the same character to CSS), so the text
+  cannot end the element, nor start one inside `<svg>` or `<math>`, where a browser reads
+  a `<style>`'s text as markup *(since 0.7)*. A `<script>`'s values are JSON with `&` as
+  `\u0026` for the same reason.
   Write it as `` css`...` ``: a template string (braces are plain text, `${...}` fills in
   values) that editors highlight as CSS. `` sql`...` `` does the same for queries.
 - A component's or view's own CSS is `style` at the start of its body, before its markup:
@@ -702,7 +706,12 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   <script>{raw(CODE)}</script>, or put it in a file of its own``. A component's `<script>` (made
   in the browser, which runs it) takes only text written in the program. Script built
   as text outside a `<script>` element (`raw("<script>" + ... )`) is not looked at.
-- `raw(s)` marks trusted HTML.
+- `raw(s)` marks trusted HTML. HTML a visitor wrote, even cleaned by a sanitizer, must not
+  keep the attributes Quillo's islands are made of: `data-qi`, `data-c`, `data-p`, `data-s`,
+  `data-l` and `data-v`, nor `<quillo-island>` elements. The page takes such an element up
+  as one of its components, with the props and state it says, and a `children` text in its
+  `data-p` as HTML (FEEDBACK51.md, Q-667). DOMPurify keeps `data-*` unless told not to
+  (`ALLOW_DATA_ATTR: false`).
 - A capitalized tag calls a view: attributes fill parameters by name, and the element's body is passed as `children`.
   A view with no `children` parameter given a body is an error *(since 0.7: the body was
   dropped)*, as an attribute it has no parameter for is; spaces alone are no body.

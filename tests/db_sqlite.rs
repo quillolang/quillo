@@ -695,7 +695,9 @@ fn a_call_sent_again_to_another_copy_is_answered_as_it_was() {
     assert_eq!(entries(&c), 1);
     // One still running on another copy: asked again later, not run here.
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
-    c.execute("insert into _quillo_calls values ('call2', ?, 0, '')", [now]).unwrap();
+    // Remembered by the call as a whole (FEEDBACK51.md, Q-664): its id, caller, function, tenant
+    // and arguments.
+    c.execute("insert into _quillo_calls values (?, ?, 0, '')", rusqlite::params![quillo::service::call_key("call2", "", "add", "", b"[1]"), now]).unwrap();
     let r = call(a.port, "call2", "[1]");
     assert_eq!(r.status, 503, "{}", r.body);
     assert!(r.body.contains("still running"), "{}", r.body);
@@ -715,7 +717,7 @@ fn calls_no_copy_remembers_any_longer_are_forgotten_now_and_then() {
         c.query_row("select count(*) from _quillo_calls where id = 'old'", [], |r| r.get::<_, i64>(0)).unwrap() == 0
     });
     assert!(gone, "an old call was not forgotten in 8000 calls");
-    assert_eq!(c.query_row("select count(*) from _quillo_calls where id = 'first'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(c.query_row("select count(*) from _quillo_calls where id = ?", [quillo::service::call_key("first", "", "add", "", b"[1]")], |r| r.get::<_, i64>(0)).unwrap(), 1);
 }
 
 #[test]

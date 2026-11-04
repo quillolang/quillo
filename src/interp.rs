@@ -159,6 +159,9 @@ pub struct Interp {
     /// The answer read who the visitor is, from a cookie: one visitor's, for caches to keep
     /// apart (FEEDBACK31.md, Q-391; branch feedback27-35-fixes).
     pub visitor_read: bool,
+    /// A request is being answered, the parts made after its route (a stream, a deferred
+    /// part) included: code here runs for someone (see `wt::reach`).
+    pub answering: bool,
     /// The locale the code runs in, once worked out (see `i18n`).
     pub locale: Option<Arc<str>>,
     /// Every statement the program has loaded, for the browser compiler.
@@ -644,6 +647,22 @@ fn shows_script_url(v: &Value) -> bool {
     }
 }
 
+/// A `<style>` child's text: a list's items a line each; nothing for null and false.
+fn sheet_text(v: &Value) -> String {
+    match v {
+        Value::Nil | Value::Bool(false) => String::new(),
+        Value::List(items) => items.iter().map(|x| x.display()).collect::<Vec<_>>().join("\n"),
+        other => other.display(),
+    }
+}
+
+/// The request's fields that are the visitor's own: its cookies, and the headers that carry
+/// them or credentials (see `Interp::read_credential`).
+#[inline]
+fn credential(name: &str) -> bool {
+    matches!(name, "cookies" | "cookie" | "authorization")
+}
+
 /// Whether a URL would run code when followed: `javascript:` or `vbscript:`,
 /// however browsers would read it (they skip leading spaces and control
 /// characters and ignore tabs and line breaks inside).
@@ -768,6 +787,16 @@ pub fn style_text(m: &Map) -> String {
         if matches!(v, Value::Nil | Value::Bool(false)) {
             continue;
         }
+        // A property's name, or a custom property's: a key from data with `;`, `:` or
+        // `{` in it wrote declarations of its own (FEEDBACK51.md, Q-668; branch
+        // feedback51-fixes).
+        let named = match k.strip_prefix("--") {
+            Some(rest) => !rest.is_empty() && rest.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
+            None => !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        };
+        if !named {
+            continue;
+        }
         if !out.is_empty() {
             out.push_str("; ");
         }
@@ -810,7 +839,7 @@ pub fn style_text(m: &Map) -> String {
                 !d.is_zero()
             }
             other => {
-                out.push_str(&other.display());
+                out.push_str(&crate::builtins::css_value(&other.display()));
                 false
             }
         };
@@ -971,9 +1000,11 @@ fn script_value(v: &Value, out: &mut String) {
 }
 
 /// JSON that is safe inside `<script>`: no `</script>`, `<!--` or line
-/// separators (which end a string in older JavaScript).
+/// separators (which end a string in older JavaScript), and no `&`, which inside `<svg>` or
+/// `<math>` the browser decodes: `&quot;` ended a string there (FEEDBACK51.md, Q-646; branch
+/// feedback51-fixes).
 pub fn script_json(j: &serde_json::Value) -> String {
-    serde_json::to_string(j).unwrap_or_default().replace('<', "\\u003c").replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029")
+    serde_json::to_string(j).unwrap_or_default().replace('<', "\\u003c").replace('&', "\\u0026").replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029")
 }
 
 /// JSON for an island's props and state, and for what server fns take and
@@ -1408,6 +1439,7 @@ impl Interp {
             set_cookies: Vec::new(),
             session: None,
             visitor_read: false,
+            answering: false,
             locale: None,
             program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
@@ -1509,6 +1541,7 @@ impl Interp {
             set_cookies: Vec::new(),
             session: None,
             visitor_read: false,
+            answering: false,
             locale: None,
             program: self.program.clone(),
             client_js: self.client_js.clone(),
@@ -2502,11 +2535,14 @@ impl Interp {
                 // A local map's field, without a copy of the map.
                 if let Expr::Ident(var, _) = &**obj {
                     let found = with_local(env, var, |v| match v {
-                        Value::Map(m) if m.len() <= 8 => m.iter().find(|(k, _)| k.as_str() == name).map(|(_, x)| x.clone()),
-                        Value::Map(m) => m.get(name.as_str()).cloned(),
+                        Value::Map(m) if m.len() <= 8 => m.iter().find(|(k, _)| k.as_str() == name).map(|(_, x)| (x.clone(), credential(name).then(|| m.clone()))),
+                        Value::Map(m) => m.get(name.as_str()).cloned().map(|x| (x, credential(name).then(|| m.clone()))),
                         _ => None,
                     });
-                    if let Some(Some(x)) = found {
+                    if let Some(Some((x, of))) = found {
+                        if let Some(m) = of {
+                            self.read_credential(&m);
+                        }
                         return Ok(x);
                     }
                 }
@@ -3083,7 +3119,12 @@ impl Interp {
                 let n = if *n < 0 { l.len() as i64 + n } else { *n };
                 Ok(if n >= 0 { l.get(n as usize).cloned().unwrap_or(Value::Nil) } else { Value::Nil })
             }
-            (Value::Map(m), Value::Str(k)) => Ok(m.get(&**k).cloned().unwrap_or(Value::Nil)),
+            (Value::Map(m), Value::Str(k)) => {
+                if &**k == "cookies" || k.eq_ignore_ascii_case("cookie") || k.eq_ignore_ascii_case("authorization") {
+                    self.read_credential(m);
+                }
+                Ok(m.get(&**k).cloned().unwrap_or(Value::Nil))
+            }
             // Keys are text: a number is the key it is written as, as for
             // `set` and `get`.
             (Value::Map(m), Value::Int(n)) => Ok(m.get(n.to_string().as_str()).cloned().unwrap_or(Value::Nil)),
@@ -3329,7 +3370,9 @@ impl Interp {
             };
             // `shop.notes()` on a `site`: the site's server fn of that name (FEEDBACK33.md,
             // Q-412; branch feedback27-35-fixes).
-            let site = matches!(&recv, Value::Map(m) if m.contains_key("$site")) && method.is_none();
+            // Only a value a `site` declaration made, not any map with its keys (FEEDBACK51.md,
+            // Q-640; branch feedback51-fixes).
+            let site = method.is_none() && crate::sites::is_site(&recv);
             match method {
                 Some(f) => f,
                 None if site => {
@@ -3381,6 +3424,18 @@ impl Interp {
     }
 
     /// `v.name`, read where `env` is the scope of the code that reads it.
+    /// `m` is the request, or its headers, and its cookies or credentials were read: the page
+    /// is the visitor's, as one `session()` or `cookie()` made is. `request.cookies` made a page
+    /// a cache in front kept for everyone (FEEDBACK51.md, Q-669; branch feedback51-fixes).
+    #[cold]
+    fn read_credential(&mut self, m: &Arc<Map>) {
+        if let Some(Value::Map(r)) = &self.current_request {
+            if Arc::ptr_eq(m, r) || matches!(r.get("headers"), Some(Value::Map(h)) if Arc::ptr_eq(h, m)) {
+                self.visitor_read = true;
+            }
+        }
+    }
+
     fn get_field(&mut self, v: Value, name: &str, env: &Env, line: u32) -> Result<Value, Ctrl> {
         match &v {
             Value::Nil => return Ok(Value::Nil),
@@ -3390,7 +3445,11 @@ impl Interp {
                 // A record's few fields are found faster in order than hashed.
                 let found = if m.len() <= 8 { m.iter().find(|(k, _)| k.as_str() == name).map(|(_, x)| x) } else { m.get(name) };
                 if let Some(x) = found {
-                    return Ok(x.clone());
+                    let x = x.clone();
+                    if credential(name) {
+                        self.read_credential(m);
+                    }
+                    return Ok(x);
                 }
             }
             Value::Response(r) => match name {
@@ -3445,7 +3504,7 @@ impl Interp {
         match f {
             Value::Builtin(name, func) => {
                 if self.allowed != ALL_EFFECTS {
-                    self.check_builtin_effect(name, line)?;
+                    self.check_builtin_effect(name, &args, line)?;
                 }
                 if self.writes_noted() && CHANGES.contains(name) {
                     self.no_writes(name, line)?;
@@ -3744,11 +3803,16 @@ impl Interp {
     }
 
     #[cold]
-    fn check_builtin_effect(&self, name: &str, line: u32) -> Result<(), Ctrl> {
+    fn check_builtin_effect(&self, name: &str, args: &[Value], line: u32) -> Result<(), Ctrl> {
         let need = builtin_effect(name);
         if need & !self.allowed != 0 {
             if need == ALL_EFFECTS && name.starts_with("native:") {
                 return fail(line, crate::native::undeclared(crate::native::display_name(name), self.restrictor.as_ref().map(|f| f.name.as_str())));
+            }
+            // A site's function as it is written, `shop.notes` (FEEDBACK51.md, Q-640; branch
+            // feedback51-fixes).
+            if let ("__site_call", [Value::Map(m), Value::Str(f), ..]) = (name, args) {
+                return fail(line, self.effect_denied(&format!("{}.{}", m.get("$site").map_or(String::new(), |s| s.display()), f), need));
             }
             return fail(line, self.effect_denied(name, need));
         }
@@ -4423,6 +4487,16 @@ impl Interp {
         if f.void {
             return Ok(());
         }
+        self.render_contents(el, env, text_value, out)?;
+        out.push_str("</");
+        out.push_str(&el.tag);
+        out.push('>');
+        Ok(())
+    }
+
+    /// An element's contents.
+    fn render_contents(&mut self, el: &HtmlEl, env: &Env, text_value: Option<String>, out: &mut String) -> Result<(), Ctrl> {
+        let f = &el.facts;
         match text_value {
             Some(t) => {
                 // The browser drops a first newline here: one more keeps the text's own
@@ -4456,19 +4530,16 @@ impl Interp {
                     }
                 }
             }
-            // A style sheet is raw text to the browser: `.a > b` must stay
-            // as written. Only `</` is changed, so the text cannot end the
-            // element early.
+            // A style sheet is raw text to the browser: `.a > b` must stay as written. Each `<` is
+            // CSS's `\3c `, the same character to CSS: in HTML the text cannot end the element
+            // early, and inside `<svg>` or `<math>`, where it is markup, it cannot start an
+            // element, wherever the `<style>` was made (FEEDBACK51.md, Q-646; branch
+            // feedback51-fixes).
             None if f.style => {
                 for c in &el.children {
                     if let HtmlChild::Expr(e) = c {
                         let v = self.eval(e, env)?;
-                        let text = match &v {
-                            Value::Nil | Value::Bool(false) => String::new(),
-                            Value::List(items) => items.iter().map(|x| x.display()).collect::<Vec<_>>().join("\n"),
-                            other => other.display(),
-                        };
-                        out.push_str(&text.replace("</", "<\\/"));
+                        out.push_str(&sheet_text(&v).replace('<', "\\3c "));
                     }
                 }
             }
@@ -4485,9 +4556,6 @@ impl Interp {
                 }
             }
         }
-        out.push_str("</");
-        out.push_str(&el.tag);
-        out.push('>');
         Ok(())
     }
 

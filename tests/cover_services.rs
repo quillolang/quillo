@@ -304,7 +304,7 @@ fn an_rs256_token_is_checked_against_its_key() {
 
 #[test]
 fn scopes_given_as_a_list_are_the_callers() {
-    let c = svcauth::jwt_caller(&serde_json::json!({ "client_id": "reports", "scope": ["billing:read", 7, "billing:write"] }));
+    let c = svcauth::jwt_caller(&serde_json::json!({ "client_id": "reports", "scope": ["billing:read", 7, "billing:write"] })).unwrap();
     let shown = c.display();
     assert!(shown.contains("name: \"reports\"") && shown.contains("scopes: [\"billing:read\", \"billing:write\"]"), "{}", shown);
 }

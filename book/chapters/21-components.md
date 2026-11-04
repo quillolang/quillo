@@ -865,7 +865,10 @@ on a page where no component has called `url()`, it loads that page as a link wo
 (Links with a modifier key, `target`, `download` or `data-reload` work as usual.) A link
 or `navigate("#spot")` to a spot on the same page goes there as the browser does:
 scrolled into view, and CSS `:target` set. `navigate("/page#spot")` goes to the spot
-once the new page shows it, and stays at the top if it never does.
+once the new page shows it, and stays at the top if it never does. A `javascript:` or
+`vbscript:` URL, however it is written (`  JaVaScRiPt:`), is an error, in the browser
+and on the server, as it is for `redirect`: `navigate(next)` after a sign-in, with
+`?next=javascript:...`, would have run as the page *(since 0.7)*.
 
 ```quillo
 component App() {

@@ -143,7 +143,8 @@ pub fn builtin_effect(name: &str) -> u8 {
     }
     let e = if name.starts_with("db.") || name == "idempotent" || name == "later.status" {
         "db"
-    } else if name.starts_with("http.") || name == "__service" || name == "__service_later" {
+    // A site's function is a request to it (FEEDBACK51.md, Q-640; branch feedback51-fixes).
+    } else if name.starts_with("http.") || name == "__service" || name == "__service_later" || name == "__site_call" {
         "http"
     } else {
         match name {

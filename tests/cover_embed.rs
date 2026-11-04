@@ -1,10 +1,10 @@
 //! A program inside an app (src/embed.rs), at its corners: programs that cannot be opened, a
 //! cookie jar read back from disk, loading again on a change, a WebSocket asked for as a page, a
 //! large file asked for by HEAD or left midway, connections that the page or the program ends,
-//! and the bridge's binary frames. A program's channels are answered by the first program a
+//! and the bridge's own origin (its frames are in tests/cover_embed_media.rs). A program's channels are answered by the first program a
 //! process opens, so they are tested in a process of their own (tests/cover_embed_channels.rs).
 
-use quillo::embed::{bridge_message, request_of, Frame, Program, Reply};
+use quillo::embed::{request_of, Frame, Program, Reply};
 use quillo::server::HttpResponse;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -42,14 +42,6 @@ fn own() -> Vec<(String, String)> {
     vec![("origin".into(), "quillo://app".into())]
 }
 
-/// A media frame as a page sends one: the stream's name, its kind, whether it is a key frame.
-fn wire(stream: &str, data: &[u8]) -> Vec<u8> {
-    let mut w = vec![stream.len() as u8];
-    w.extend_from_slice(stream.as_bytes());
-    w.extend_from_slice(&[quillo::media::VIDEO, 1, 0, 0, 0, 7]);
-    w.extend_from_slice(data);
-    w
-}
 
 #[test]
 fn an_app_with_no_main_file_a_broken_one_or_no_routes_is_not_opened() {
@@ -225,40 +217,3 @@ fn stopping_the_program_ends_the_connections_still_open() {
     assert!(!p.send(conn, Frame::Text("x".into())));
 }
 
-#[test]
-fn the_bridge_carries_binary_frames_and_a_page_s_own_origin() {
-    let (p, _) = open("bridge", "route GET /origin = request.headers.origin ?? \"none\"\n");
-    let (tx, rx) = mpsc::channel::<String>();
-    let page: std::sync::Arc<dyn Fn(String) + Send + Sync> = std::sync::Arc::new(move |m| {
-        let _ = tx.send(m);
-    });
-    let msg = |m: serde_json::Value| bridge_message(&p, &m.to_string(), page.clone());
-    let next = || serde_json::from_str::<serde_json::Value>(&rx.recv_timeout(WAIT).unwrap()).unwrap();
-
-    // A URL that is a path alone: the app's own origin.
-    msg(serde_json::json!({ "op": "fetch", "id": 1, "method": "GET", "url": "/origin" }));
-    let a = next();
-    assert_eq!((a["op"].as_str(), a["status"].as_u64(), a["body"].as_str()), (Some("answer"), Some(200), Some("cXVpbGxvOi8vYXBw")), "{}", a);
-
-    let t = p.request_whole(request_of("POST", "quillo://app/_quillo/wt-ticket", own(), vec![]));
-    let ticket: serde_json::Value = serde_json::from_slice(&t.body).unwrap();
-    let id = 7001;
-    msg(serde_json::json!({ "op": "open", "id": id, "url": format!("quillo://app/_quillo/wt?t={}", ticket["ticket"].as_str().unwrap()) }));
-    assert_eq!(next()["op"], "opened");
-    // Watching a stream; a send with neither text nor bytes is nothing.
-    msg(serde_json::json!({ "op": "send", "id": id, "text": "[\"v\",\"cover-bridge\"]" }));
-    msg(serde_json::json!({ "op": "send", "id": id }));
-    msg(serde_json::json!({ "op": "send", "id": id, "text": "[\"j\",\"chat\"]" }));
-    let j = next();
-    assert_eq!((j["op"].as_str(), j["text"].as_str()), (Some("frame"), Some("[\"j\",\"chat\",true]")), "{}", j);
-    // A stream's frame reaches the page as bytes.
-    let w = wire("cover-bridge", b"key");
-    quillo::media::from_page(w.clone());
-    let f = next();
-    assert_eq!((f["op"].as_str(), f["id"].as_u64()), (Some("frame"), Some(id)), "{}", f);
-    let b64 = f["bin"].as_str().unwrap();
-    assert_eq!(b64.len(), (w.len() + 2) / 3 * 4, "{}", f);
-    msg(serde_json::json!({ "op": "close", "id": id }));
-    assert_eq!(next()["op"], "closed");
-    p.stop();
-}

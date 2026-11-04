@@ -23,7 +23,7 @@ use crate::interp::{fail, Ctrl, Interp};
 use crate::value::*;
 use std::collections::{BTreeMap, HashMap};
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,21 @@ type R = Result<Value, Ctrl>;
 const REORDER: Duration = Duration::from_millis(50);
 /// Video frames kept for viewers who start watching (from the last keyframe).
 const MAX_GOP: usize = 600;
+/// At most this many bytes of them: 600 frames of 1 MiB from a page were 600 MiB, never freed
+/// (FEEDBACK51.md, Q-643; branch feedback51-fixes).
+const MAX_GOP_BYTES: usize = 32 << 20;
+/// Streams pages may make in all, sending or watching (each a `media.on` let them).
+const MAX_PAGE_STREAMS: usize = 1024;
+/// Of those, the most one tenant's pages (or those of no tenant) may make, so that one tenant
+/// cannot take them all (found in review of FEEDBACK51.md, Q-643; branch feedback51-fixes).
+const MAX_TENANT_STREAMS: usize = 256;
+/// Most streams one page watches at once.
+const MAX_WATCHED: usize = 32;
+/// Most bytes of video kept for viewers to come, in all streams: 1,024 streams of 32 MiB each
+/// were 32 GiB (found in review of FEEDBACK51.md, Q-643).
+const MAX_GOP_TOTAL: usize = 256 << 20;
+/// What all streams keep now (see `MAX_GOP_TOTAL`).
+static GOP_TOTAL: AtomicUsize = AtomicUsize::new(0);
 
 pub const VIDEO: u8 = 1;
 pub const AUDIO: u8 = 2;
@@ -126,8 +141,9 @@ impl Stats {
 pub struct Stream {
     name: String,
     viewers: Mutex<Vec<Arc<Viewer>>>,
-    /// Video since the last keyframe.
+    /// Video since the last keyframe, and its bytes.
     gop: Mutex<Vec<Arc<Frame>>>,
+    gop_bytes: AtomicUsize,
     video: Stats,
     audio: Stats,
     ports: Mutex<Vec<u16>>,
@@ -140,34 +156,99 @@ fn streams_map() -> &'static Mutex<HashMap<String, Arc<Stream>>> {
     S.get_or_init(Default::default)
 }
 
-fn stream(name: &str) -> Arc<Stream> {
-    lock(streams_map())
-        .entry(name.to_string())
-        .or_insert_with(|| {
-            Arc::new(Stream {
-                name: name.to_string(),
-                viewers: Mutex::new(Vec::new()),
-                gop: Mutex::new(Vec::new()),
-                video: Stats::default(),
-                audio: Stats::default(),
-                ports: Mutex::new(Vec::new()),
-                from_pages: AtomicBool::new(false),
-            })
-        })
-        .clone()
+/// A stream's key: its room's, `media:<name>` for the tenant (see `wt::room_key`), so each
+/// tenant has its own streams of a name (FEEDBACK51.md, Q-642; branch feedback51-fixes).
+pub fn key(name: &str, tenant: Option<&str>) -> String {
+    crate::wt::room_key(&format!("media:{}", name), tenant)
+}
+
+fn made(name: &str) -> Arc<Stream> {
+    Arc::new(Stream {
+        name: name.to_string(),
+        viewers: Mutex::new(Vec::new()),
+        gop: Mutex::new(Vec::new()),
+        gop_bytes: AtomicUsize::new(0),
+        video: Stats::default(),
+        audio: Stats::default(),
+        ports: Mutex::new(Vec::new()),
+        from_pages: AtomicBool::new(false),
+    })
+}
+
+/// The stream `key`, made if need be: by the program (RTP), always.
+fn stream(key: &str, name: &str) -> Arc<Stream> {
+    lock(streams_map()).entry(key.to_string()).or_insert_with(|| made(name)).clone()
+}
+
+/// Whether no RTP comes to the stream `key`, and no page sends or watches it.
+fn idle(key: &str, s: &Stream) -> bool {
+    lock(&s.ports).is_empty() && lock(&s.viewers).is_empty() && !crate::wt::in_room(key)
+}
+
+/// The stream `key` for a page a `media.on` let send or watch: made only while pages have made
+/// fewer than `MAX_PAGE_STREAMS`, and its tenant fewer than `MAX_TENANT_STREAMS`.
+fn page_stream(key: &str, name: &str) -> Option<Arc<Stream>> {
+    let mut all = lock(streams_map());
+    if let Some(s) = all.get(key) {
+        return Some(s.clone());
+    }
+    let tenant = crate::wt::key_tenant(key);
+    let full = |all: &HashMap<String, Arc<Stream>>| all.len() >= MAX_PAGE_STREAMS || all.keys().filter(|k| crate::wt::key_tenant(k) == tenant).count() >= MAX_TENANT_STREAMS;
+    if full(&all) {
+        // Those no page sends or watches any more go first: names pass, and a stream stayed
+        // made for each, so the 1,025th room of `rooms:*` would never have one.
+        all.retain(|k, s| !idle(k, s));
+        if full(&all) {
+            return None;
+        }
+    }
+    Some(all.entry(key.to_string()).or_insert_with(|| made(name)).clone())
+}
+
+/// The stream `key` goes, if no RTP comes to it and no page sends or watches it any more: a page
+/// that gone leaves nothing behind (found in review of FEEDBACK51.md, Q-643).
+pub fn drop_if_idle(key: &str) {
+    if !crate::wt::key_channel(key).starts_with("media:") {
+        return;
+    }
+    let mut all = lock(streams_map());
+    if all.get(key).is_some_and(|s| idle(key, s)) {
+        all.remove(key);
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        GOP_TOTAL.fetch_sub(self.gop_bytes.load(Relaxed), Relaxed);
+    }
 }
 
 impl Stream {
+    /// What it kept for viewers to come goes.
+    fn forget(&self, gop: &mut Vec<Arc<Frame>>) {
+        gop.clear();
+        GOP_TOTAL.fetch_sub(self.gop_bytes.swap(0, Relaxed), Relaxed);
+    }
+
     fn push(&self, f: Frame) {
         let f = Arc::new(f);
         if f.kind == VIDEO {
             self.video.count(f.wire.len());
             let mut gop = lock(&self.gop);
-            if f.key || gop.len() >= MAX_GOP {
-                gop.clear();
+            let n = f.wire.len();
+            if f.key || gop.len() >= MAX_GOP || self.gop_bytes.load(Relaxed) + n > MAX_GOP_BYTES {
+                self.forget(&mut gop);
             }
             if f.key || !gop.is_empty() {
-                gop.push(f.clone());
+                // Past what all streams may keep, this one keeps none: those who start watching
+                // wait for its next keyframe.
+                if GOP_TOTAL.load(Relaxed) + n > MAX_GOP_TOTAL {
+                    self.forget(&mut gop);
+                } else {
+                    self.gop_bytes.fetch_add(n, Relaxed);
+                    GOP_TOTAL.fetch_add(n, Relaxed);
+                    gop.push(f.clone());
+                }
             }
         } else {
             self.audio.count(f.wire.len());
@@ -186,10 +267,19 @@ impl Stream {
     }
 }
 
-/// A page starts watching `name`: it gets the video since the last
+/// A page its stream's `watch` let in starts watching `name` (the stream `key`, or with none of
+/// the tenant's the program's own of that name, an RTP camera): it gets the video since the last
 /// keyframe at once, then each frame.
-pub fn watch(name: &str, sink: Arc<dyn Sink>) {
-    let s = stream(name);
+pub fn watch(key: &str, name: &str, sink: Arc<dyn Sink>) {
+    let found = {
+        let all = lock(streams_map());
+        // One page watches so many at most.
+        if all.values().filter(|s| lock(&s.viewers).iter().any(|v| v.sink.id() == sink.id())).count() >= MAX_WATCHED {
+            return;
+        }
+        all.get(key).or_else(|| program_stream(&all, name)).cloned()
+    };
+    let Some(s) = found.or_else(|| page_stream(key, name)) else { return };
     let gop = lock(&s.gop).clone();
     let behind = !gop.iter().all(|f| sink.take(f)) || gop.is_empty();
     let mut viewers = lock(&s.viewers);
@@ -197,16 +287,40 @@ pub fn watch(name: &str, sink: Arc<dyn Sink>) {
     viewers.push(Arc::new(Viewer { sink, behind: AtomicBool::new(behind) }));
 }
 
-pub fn unwatch(name: &str, id: u64) {
-    if let Some(s) = lock(streams_map()).get(name) {
-        lock(&s.viewers).retain(|v| v.sink.id() != id);
+/// The program's own stream of `name`, one RTP comes to, which a tenant's pages watch when it
+/// has none of its own. Not one pages made: a page with no tenant watching a name first made a
+/// stream that tenants' viewers then joined, and its own frames reached them (found in review of
+/// FEEDBACK51.md, Q-642).
+fn program_stream<'a>(all: &'a HashMap<String, Arc<Stream>>, name: &str) -> Option<&'a Arc<Stream>> {
+    all.get(&format!("media:{}", name)).filter(|s| !lock(&s.ports).is_empty())
+}
+
+pub fn unwatch(key: &str, id: u64) {
+    let name = crate::wt::key_channel(key).strip_prefix("media:").unwrap_or_default().to_string();
+    {
+        let all = lock(streams_map());
+        // Its tenant's, and the program's it may watch for want of one.
+        for s in all.get(key).into_iter().chain(program_stream(&all, &name)) {
+            lock(&s.viewers).retain(|v| v.sink.id() != id);
+        }
     }
+    drop_if_idle(key);
 }
 
 /// A page has gone: it watches nothing.
 pub fn unwatch_all(id: u64) {
-    for s in lock(streams_map()).values() {
-        lock(&s.viewers).retain(|v| v.sink.id() != id);
+    let watched: Vec<String> = lock(streams_map())
+        .iter()
+        .filter(|(_, s)| {
+            let mut v = lock(&s.viewers);
+            let before = v.len();
+            v.retain(|v| v.sink.id() != id);
+            v.len() != before
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in watched {
+        drop_if_idle(&k);
     }
 }
 
@@ -579,7 +693,7 @@ fn track_opt(v: &Value, kind: &str, line: u32) -> Result<(u16, Codec), Ctrl> {
 }
 
 /// `media.rtp(name, { video, audio, host })`, at the top of a program.
-fn rtp(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+fn rtp(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let name = match args.first() {
         Some(Value::Str(s)) if crate::wt::name_ok(s) => s.to_string(),
         other => return fail(line, format!("`media.rtp` takes a stream's name first (letters, digits, `_`, `-`, `.` and `:`), got {}", other.map_or("nothing".into(), |v| v.repr()))),
@@ -599,7 +713,7 @@ fn rtp(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if tracks.is_empty() {
         return fail(line, "`media.rtp` needs a video port, an audio port, or both".to_string());
     }
-    let s = stream(&name);
+    let s = stream(&key(&name, it.tenant().as_deref()), &name);
     for (port, codec) in tracks {
         if let Err(e) = listen(&host, port, Track { stream: s.clone(), codec, closed: false, released: false }) {
             return fail(line, format!("`media.rtp`: cannot listen on UDP port {}: {}", port, e));
@@ -620,14 +734,14 @@ fn rtp(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// (see `on`), which src/wt.rs checks before this. The frame goes to every
 /// page watching, as one from RTP does (FEEDBACK6.md, Q-060; branch
 /// feedback6-fixes).
-pub fn from_page(wire: Vec<u8>) {
+pub fn from_page(key: &str, wire: Vec<u8>) {
     let Some(&n) = wire.first() else { return };
     let n = n as usize;
     if wire.len() < 7 + n || !matches!(wire[1 + n], VIDEO | AUDIO) {
         return;
     }
     let Ok(name) = std::str::from_utf8(&wire[1..1 + n]) else { return };
-    let s = stream(name);
+    let Some(s) = page_stream(key, name) else { return };
     s.from_pages.store(true, Relaxed);
     let (kind, key) = (wire[1 + n], wire[2 + n] == 1);
     s.push(Frame { kind, key, wire });
@@ -639,25 +753,30 @@ pub fn frame_stream(wire: &[u8]) -> Option<&str> {
     std::str::from_utf8(wire.get(1..1 + n)?).ok()
 }
 
-/// `media.on(name, { publish })`: pages may send stream `name` (a name ending
-/// in `*`: every stream it starts), with `<quillo-media publish="name">`.
-/// `publish(peer)` says which may, as a channel's `join` does: the page
-/// joins the channel `media:<name>`, and only a page that did is taken frames
-/// from. Without `publish`, any page may.
+/// `media.on(name, { publish, watch, tenants })`: pages may send stream `name` (a name ending
+/// in `*`: every stream it starts), with `<quillo-media publish="name">`, and watch it.
+/// `publish(peer)` says which may send, as a channel's `join` does: the page joins the channel
+/// `media:<name>`, and only a page that did is taken frames from. `watch(peer)` says which may
+/// watch. Without one, no page may: anyone could watch a private call, and send into any
+/// stream, an RTP camera too (FEEDBACK51.md, Q-642 and Q-643; branch feedback51-fixes). Each
+/// tenant has its own streams of a name, unless `tenants: "shared"`.
 fn on(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let name = match args.first() {
         Some(Value::Str(s)) if crate::wt::name_ok(s.trim_end_matches('*')) && s.len() <= 58 => s.to_string(),
         other => return fail(line, format!("`media.on` takes a stream's name first (or one ending in `*`), got {}", other.map_or("nothing".into(), |v| v.repr()))),
     };
-    let mut publish = None;
+    let (mut publish, mut watch, mut everyone) = (None, None, false);
     match args.get(1) {
         None | Some(Value::Nil) => {}
         Some(Value::Map(o)) => {
             for (k, v) in o.iter() {
                 match (k.as_str(), v) {
                     ("publish", f @ (Value::Func(_) | Value::Builtin(..))) => publish = Some(f.clone()),
+                    ("watch", f @ (Value::Func(_) | Value::Builtin(..))) => watch = Some(f.clone()),
                     ("publish", _) => return fail(line, "`media.on`: `publish` is a function of the page that wants to send"),
-                    (other, _) => return fail(line, format!("`media.on` has no option `{}` (it takes publish)", other)),
+                    ("watch", _) => return fail(line, "`media.on`: `watch` is a function of the page that wants to watch"),
+                    ("tenants", v) => everyone = crate::wt::shared_opt(v, "media.on", line)?,
+                    (other, _) => return fail(line, format!("`media.on` has no option `{}` (it takes publish, watch and tenants)", other)),
                 }
             }
         }
@@ -666,12 +785,19 @@ fn on(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     fn nothing(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
         Ok(Value::Nil)
     }
+    fn nobody(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
+        Ok(Value::Bool(false))
+    }
     let channel = format!("media:{}", name);
     let site = std::sync::Arc::make_mut(&mut it.site);
     if site.channels.iter().any(|h| h.name == channel) {
         return fail(line, format!("`media.on`: the program already takes stream {:?} from pages", name));
     }
-    site.channels.push(Arc::new(crate::wt::Handler { name: channel, f: Value::Builtin("media.on.frames", nothing), join: publish, leave: None }));
+    if everyone {
+        crate::wt::share(&channel);
+    }
+    let join = Some(publish.unwrap_or(Value::Builtin("media.on.nobody", nobody)));
+    site.channels.push(Arc::new(crate::wt::Handler { name: channel, f: Value::Builtin("media.on.frames", nothing), join, leave: None, watch }));
     Ok(Value::Nil)
 }
 
@@ -679,12 +805,31 @@ fn on(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// and the pages watching it are told it ended; true if there was one. A
 /// stream made while the program runs (one a room, a call) need not hold its
 /// ports until the program stops (FEEDBACK6.md, Q-061; branch feedback6-fixes).
-fn close(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+fn close(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let name = match args.first() {
         Some(Value::Str(s)) => s.to_string(),
         other => return fail(line, format!("`media.close` takes a stream's name, got {}", other.map_or("nothing".into(), |v| v.repr()))),
     };
-    let Some(s) = lock(streams_map()).remove(&name) else { return Ok(Value::Bool(false)) };
+    // Its tenant's; from a job, a tick or the top level, every tenant's of that name, as
+    // `channel.broadcast` reaches (found in review of FEEDBACK51.md, Q-642).
+    let keys: Vec<String> = match crate::wt::reach(it) {
+        Some(t) => vec![key(&name, t.as_deref())],
+        None => {
+            let ch = format!("media:{}", name);
+            lock(streams_map()).keys().filter(|k| crate::wt::key_channel(k) == ch).cloned().collect()
+        }
+    };
+    let mut any = false;
+    for k in keys {
+        any |= close_key(&k);
+    }
+    Ok(Value::Bool(any))
+}
+
+/// Ends the stream `k`; whether there was one.
+fn close_key(k: &str) -> bool {
+    let k = k.to_string();
+    let Some(s) = lock(streams_map()).remove(&k) else { return false };
     let ports: Vec<u16> = lock(&s.ports).drain(..).collect();
     let closing: Vec<Arc<Mutex<Track>>> = {
         let mut all = lock(sockets());
@@ -699,18 +844,26 @@ fn close(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         std::thread::sleep(Duration::from_millis(5));
     }
     // Pages sending it stop being taken from (they join again to send).
-    crate::wt::leave_all(&format!("media:{}", s.name));
+    crate::wt::leave_all(&k);
     let end = Arc::new(Frame::new(&s.name, END, false, 0, &[]));
     for v in lock(&s.viewers).drain(..) {
         v.sink.take(&end);
     }
-    lock(&s.gop).clear();
-    Ok(Value::Bool(true))
+    s.forget(&mut lock(&s.gop));
+    true
 }
 
-/// `media.streams()`: each stream, with its viewers and its tracks' rates.
-fn streams(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
-    let mut all: Vec<Arc<Stream>> = lock(streams_map()).values().filter(|s| !lock(&s.ports).is_empty() || s.from_pages.load(Relaxed)).cloned().collect();
+/// `media.streams()`: each stream, with its viewers and its tracks' rates; for a page or a
+/// request, its tenant's and the program's RTP ones (FEEDBACK51.md, Q-642); for a job, all.
+fn streams(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
+    let reach = crate::wt::reach(it);
+    // Its own, and the program's RTP ones: those pages with no tenant made are no tenant's.
+    let mine = |k: &str, s: &Stream| match &reach {
+        Some(t) => crate::wt::key_tenant(k) == t.as_deref() || crate::wt::key_tenant(k).is_none() && !lock(&s.ports).is_empty(),
+        None => true,
+    };
+    let mut all: Vec<Arc<Stream>> =
+        lock(streams_map()).iter().filter(|(k, s)| mine(k, s) && (!lock(&s.ports).is_empty() || s.from_pages.load(Relaxed))).map(|(_, s)| s.clone()).collect();
     all.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Value::list(
         all.iter()

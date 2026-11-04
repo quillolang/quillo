@@ -154,7 +154,7 @@ route POST /logout {
     redirect("/")
 }
 
-route GET /static/*path = file("public/" + path)
+route GET /static/*path = files("public", path)
 
 // The board as JSON, for scripts.
 route GET /api/p/:key {
