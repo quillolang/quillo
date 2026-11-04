@@ -259,9 +259,11 @@ fn postgres_money_reads_with_its_currency_s_decimals() {
     let yen = pg.database("yen");
     // A locale with no decimals in its money: as the system names it, if it has one.
     let has_yen = ["ja_JP.UTF-8", "ja_JP.utf8", "ja_JP.eucJP"].iter().any(|l| psql(&pg.url, &format!("alter database yen set lc_monetary = '{}'", l)));
+    // A script: with a route, `quillo run` would serve and never end (found by CI, which has a
+    // PostgreSQL; the server's part is its own program, below).
     let program = |url: &str| {
         format!(
-            "db.open({url:?})\ndb.exec(\"create table t (id serial primary key, m money, n numeric(12, 2))\")\ndb.exec(\"insert into t (m, n) values ($1, $2), ($3, $4)\", 500m, 1.25m, -1234m, 0m)\nprint(db.query(\"select m, n from t order by id\"))\nprint(db.query(\"select n from t order by id\"))\nprint(db.query(\"select m from t order by id\"))\n\nroute GET /m = db.query(\"select m, m::text as t from t order by id\")\n"
+            "db.open({url:?})\ndb.exec(\"create table t (id serial primary key, m money, n numeric(12, 2))\")\ndb.exec(\"insert into t (m, n) values ($1, $2), ($3, $4)\", 500m, 1.25m, -1234m, 0m)\nprint(db.query(\"select m, n from t order by id\"))\nprint(db.query(\"select n from t order by id\"))\nprint(db.query(\"select m from t order by id\"))\n"
         )
     };
     let d = dir("pg-cents", &program(&cents));
@@ -279,7 +281,8 @@ fn postgres_money_reads_with_its_currency_s_decimals() {
     assert!(out.contains("[{ m: 500m, n: 1.25m }, { m: -1234m, n: 0.00m }]"), "{}", out);
     assert!(out.contains("[{ m: 500m }, { m: -1234m }]"), "{}", out);
     // In a server, on the connections requests share.
-    let s = support::serve(&d.join("main.qwe"), &[]);
+    let served = dir("pg-yen-served", &format!("db.open({:?})\nroute GET /m = db.query(\"select m, m::text as t from t order by id\")\n", yen));
+    let s = support::serve(&served.join("main.qwe"), &[]);
     let body = support::send(s.port, "GET", "/m", &[], "").body;
     assert!(body.contains("\"m\":\"500\""), "{}", body);
     // Again: requests take turns over four connections, so by the fifth one has asked already.

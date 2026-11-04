@@ -19,11 +19,13 @@
     $("#more").open = true; await tick(200);
     $("#ask").close(); await tick(200);
     const p = $("#player");
-    for (let i = 0; i < 100 && p.readyState < 1; i++) await tick(30);
+    for (let i = 0; i < 300 && p.readyState < 1; i++) await tick(30);
     p.muted = true; await tick();
     p.volume = 0.25; await tick();
     p.playbackRate = 2; await tick();
-    p.currentTime = 0.5; await tick(300);
+    // Until the seek has landed, however slow the machine (CI read 0 after 300 ms).
+    p.currentTime = 0.5;
+    for (let i = 0; i < 100 && $("#out").textContent.split("|")[12] !== "0.5"; i++) await tick(30);
     out.person = $("#out").textContent;
     out.inputs = [$("#name").value, $("#code").value, $("#locked").value, $("#fixed").value, $("#half").indeterminate, $("#qty").value];
     // What the program does: the element follows.
