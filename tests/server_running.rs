@@ -455,6 +455,24 @@ fn no_check_reloads_what_loads() {
     assert!(until(|| srv.get("/").body == "loaded"), "{}", srv.log());
 }
 
+// A file saved the moment the server says it is listening is a change: the watcher reads the
+// files' times before then, not when its thread first runs (a race CI found in
+// no_check_reloads_what_loads, after FEEDBACK15.md, Q-098; branch main).
+#[test]
+fn a_save_right_after_the_start_is_loaded() {
+    // A file the main one uses, under --watch, and the main file itself, under --reload.
+    let d = folder("save-at-start", &[
+        ("app.qwe", "use lib.qwe\nroute GET / = word()\n"),
+        ("lib.qwe", "fn word() = \"before\"\n"),
+    ]);
+    let srv = run_in(&d, "app.qwe", &["--watch"], &[]);
+    srv.write("lib.qwe", "fn word() = \"after, from the used file\"\n");
+    assert!(until(|| srv.get("/").body == "after, from the used file"), "{}", srv.log());
+    let srv = run("save-at-start-main", "route GET / = \"before\"\n", &["--reload"]);
+    srv.write("app.qwe", "route GET / = \"after\"\n");
+    assert!(until(|| srv.get("/").body == "after"), "{}", srv.log());
+}
+
 #[test]
 fn a_reload_retires_what_the_old_version_mounted() {
     let d = folder("reload-mount", &[

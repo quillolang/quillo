@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `--watch` and `--reload` load a file saved right after the server starts. The watcher read
+  the files' times when its own thread first ran, so a save made before then was taken for
+  the program as it was and never loaded; it now reads them before the server says it is
+  listening (found by CI in `no_check_reloads_what_loads`).
+
 ## 0.7.0 (2026-11-05)
 
 Strict modules, the security review's fixes, money, shared hosting, services the app does not

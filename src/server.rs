@@ -2450,9 +2450,18 @@ mod events {
     }
 }
 
-pub(crate) fn watch(app: Arc<App>) {
-    let mut files = app.watched_files();
-    let mut seen = mtimes(&files);
+/// The program's files and their times, read now, on the caller's thread, then the loop that
+/// watches them. The server says it is listening only after this, so a file saved after that is
+/// a change however late the watcher's own thread starts: read on that thread, a save made
+/// before it ran was taken for the files as they were, and never loaded (a race CI found in
+/// no_check_reloads_what_loads, after FEEDBACK15.md, Q-098; branch main).
+pub(crate) fn watcher(app: Arc<App>) -> impl FnOnce() + Send + 'static {
+    let files = app.watched_files();
+    let seen = mtimes(&files);
+    move || watch(app, files, seen)
+}
+
+fn watch(app: Arc<App>, mut files: Vec<PathBuf>, mut seen: Vec<(Option<std::time::SystemTime>, Option<PathBuf>)>) {
     let mut served: std::collections::HashMap<PathBuf, Option<std::time::SystemTime>> = Default::default();
     // Told of changes by the system where it can be (see `events`); else a
     // stat of each file every 50 ms, cheap for the hundreds a program has
@@ -3209,13 +3218,10 @@ fn serve_from(
         // Before the first request, not on the watcher's thread: it reads every file first, and a
         // file served meanwhile would never be watched (FEEDBACK16.md, Q-149; branch feedback20-fixes).
         crate::statics::WATCH_SERVED.store(app.watch, std::sync::atomic::Ordering::Relaxed);
-        let app = app.clone();
         std::thread::Builder::new()
             .name("quillo-watch".into())
             .stack_size(WORKER_STACK)
-            .spawn(move || {
-                watch(app)
-            })
+            .spawn(watcher(app.clone()))
             .map_err(|e| format!("cannot start file watcher: {}", e))?;
     }
     if let Some(a) = bound {

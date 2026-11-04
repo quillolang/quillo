@@ -222,8 +222,7 @@ impl Program {
     /// Loads the program again when its files change (`quillo app --watch`), as a server does.
     pub fn watch(&self) {
         crate::statics::WATCH_SERVED.store(true, SeqCst);
-        let app = self.inner.app.clone();
-        let _ = std::thread::Builder::new().name("quillo-watch".into()).stack_size(crate::server::WORKER_STACK).spawn(move || crate::server::watch(app));
+        let _ = std::thread::Builder::new().name("quillo-watch".into()).stack_size(crate::server::WORKER_STACK).spawn(crate::server::watcher(self.inner.app.clone()));
     }
 
     /// The app goes behind the home screen: its cookies are kept now, as it may not come back.
