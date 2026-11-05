@@ -81,6 +81,7 @@ fn put<K: std::hash::Hash + Eq>(c: &mut Option<Lru<K>>, budget: usize, k: K, v: 
 }
 
 /// What a file is now: its size, when it changed, and its validators.
+#[derive(Clone)]
 pub struct Info {
     pub len: u64,
     pub etag: String,
@@ -210,13 +211,42 @@ pub fn path_of(f: &std::fs::File) -> Option<PathBuf> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use std::os::unix::io::AsRawFd;
-        std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd())).ok()
+        // A file unlinked since it was opened is named `... (deleted)`: no name to judge it by
+        // (FEEDBACK55.md, Q-701; branch feedback55).
+        std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd())).ok().filter(|p| !p.to_string_lossy().ends_with(" (deleted)"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
     {
         let _ = f;
         None
     }
+}
+
+/// The folder `dir` as the system names the files in it (`path_of` of it opened), so a file's
+/// place and the folder's are compared in one form: realpath keeps `/System/Volumes/Data/...`
+/// where the system names a file `/private/tmp/...`. Kept by the folder's identity, so asking
+/// again costs a look at it, and a link to it pointed elsewhere (a release switched) is resolved
+/// anew (FEEDBACK55.md, Q-701; branch feedback55).
+pub fn real_dir(dir: &Path) -> Option<PathBuf> {
+    static DIRS: Mutex<Option<HashMap<PathBuf, (FileId, PathBuf)>>> = Mutex::new(None);
+    let id = std::fs::metadata(dir).ok().and_then(|m| id_of(&m));
+    if let Some(id) = id {
+        if let Some((was, form)) = lock(&DIRS).as_ref().and_then(|m| m.get(dir)) {
+            if *was == id {
+                return Some(form.clone());
+            }
+        }
+    }
+    let form = std::fs::File::open(dir).ok().and_then(|f| path_of(&f)).or_else(|| dir.canonicalize().ok())?;
+    if let Some(id) = id {
+        let mut dirs = lock(&DIRS);
+        let m = dirs.get_or_insert_with(HashMap::new);
+        if m.len() >= 1024 {
+            m.clear();
+        }
+        m.insert(dir.to_path_buf(), (id, form.clone()));
+    }
+    Some(form)
 }
 
 /// Up to `len` bytes of the file from `start`, read where they are: never more, whatever the file
@@ -240,15 +270,14 @@ pub fn read(full: &Path, info: &Info) -> std::io::Result<Arc<[u8]>> {
         }
     }
     let (f, m) = open_regular(full)?;
-    if !same(info, full, &m) {
+    // Saved anew (another file in its place): looked at again. Written to in place: what is
+    // there, as many bytes as were looked at, kept only as the file was (FEEDBACK55.md, Q-701;
+    // branch feedback55).
+    if id_of(&m) != info.id {
         return Err(changed());
     }
-    let b = read_at(&f, 0, info.len)?;
-    if b.len() as u64 != info.len {
-        return Err(changed());
-    }
-    let b: Arc<[u8]> = Arc::from(b);
-    if info.len <= SMALL {
+    let b: Arc<[u8]> = Arc::from(read_at(&f, 0, info.len)?);
+    if info.len <= SMALL && b.len() as u64 == info.len && same(info, full, &m) {
         put(&mut lock(&FILES), FILES_BUDGET, key, b.clone());
     }
     Ok(b)
@@ -302,13 +331,15 @@ pub struct Hosted {
     pub served: PathBuf,
     pub program: PathBuf,
     pub etag: String,
+    pub id: Option<FileId>,
 }
 
 /// The mark for bytes `start..start + len` of a file, for `files` with what it judged
 /// (FEEDBACK55.md, Q-701; branch feedback55).
 pub fn mark(full: &Path, start: u64, len: u64, hosted: Option<&Hosted>) -> String {
     let b64 = |p: &Path| crate::crypto::b64url(p.to_string_lossy().as_bytes());
-    let h = hosted.map_or(String::new(), |h| format!("{},{},{}", b64(&h.served), b64(&h.program), crate::crypto::b64url(h.etag.as_bytes())));
+    let id = |h: &Hosted| h.id.map_or(String::new(), |(d, i)| format!("{}-{}", d, i));
+    let h = hosted.map_or(String::new(), |h| format!("{},{},{},{}", b64(&h.served), b64(&h.program), crate::crypto::b64url(h.etag.as_bytes()), id(h)));
     let what = format!("{}:{}:{}:{}", start, len, h, full.display());
     let sig = crate::crypto::hmac_sha256(send_key(), what.as_bytes());
     format!("{}.{}", crate::crypto::b64url(what.as_bytes()), crate::crypto::b64url(&sig))
@@ -330,7 +361,12 @@ pub fn marked(v: &str) -> Option<(PathBuf, u64, u64, Option<Hosted>)> {
         "" => None,
         h => {
             let mut h = h.split(',');
-            Some(Hosted { served: PathBuf::from(text(h.next()?)?), program: PathBuf::from(text(h.next()?)?), etag: text(h.next()?)? })
+            let (served, program, etag) = (PathBuf::from(text(h.next()?)?), PathBuf::from(text(h.next()?)?), text(h.next()?)?);
+            let id = match h.next()? {
+                "" => None,
+                id => Some(id.split_once('-').and_then(|(d, i)| Some((d.parse().ok()?, i.parse().ok()?)))?),
+            };
+            Some(Hosted { served, program, etag, id })
         }
     };
     Some((PathBuf::from(parts.next()?), start, len, hosted))
@@ -411,23 +447,38 @@ pub fn send(mut stream: std::net::TcpStream, resp: &crate::server::HttpResponse,
     // A reader that stopped reading lets the thread go.
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
     let mut out = Vec::with_capacity(512);
-    // For `files`, the file opened is judged as it is, and one saved in the place of the one
-    // judged, if it is served, goes whole with its own head: the head made for the other said
-    // another length (FEEDBACK55.md, Q-701; branch feedback55).
+    // For `files`, the file opened is judged as it is. One written to in place since (the same
+    // file) goes as it was marked, as many bytes as were looked at; one saved in the place of the
+    // one judged, if it is served, goes whole with its own length and tags, a part asked for (a
+    // 206) as the whole (a 200), any other answer (the page of a miss) as it was
+    // (FEEDBACK55.md, Q-701; branch feedback55).
     let opened = match &hosted {
-        Some(h) => crate::builtins::open_hosted(&h.served, &h.program, &path).map(|(f, m)| (f, Some(m))).ok_or(()),
+        // One saved anew as it was opened is opened again, three times at most.
+        Some(h) => (0..3)
+            .map(|_| crate::builtins::open_hosted(&h.served, &h.program, &path))
+            .find(|r| r.as_ref().err() != Some(&crate::builtins::Judged::Replaced))
+            .and_then(Result::ok)
+            .map(|(f, m)| (f, Some(m)))
+            .ok_or(()),
         None => open_regular(&path).map(|(f, _)| (f, None)).map_err(|_| ()),
     };
     let mut resp = std::borrow::Cow::Borrowed(resp);
     let (mut start, mut len) = (start, len);
     if let (Ok((_, Some(m))), Some(h)) = (&opened, &hosted) {
-        let now = info_of(&path, m);
-        if now.etag != h.etag {
+        if id_of(m) != h.id {
+            let now = info_of(&path, m);
             let r = resp.to_mut();
-            r.status = 200;
-            r.headers.retain(|(k, _)| !["etag", "last-modified", "content-range"].contains(&k.as_str()));
-            r.headers.push(("etag".into(), now.etag.clone()));
-            r.headers.push(("last-modified".into(), now.last_modified.clone()));
+            if r.status == 206 {
+                r.status = 200;
+            }
+            r.headers.retain(|(k, _)| k != "content-range");
+            for (k, v) in r.headers.iter_mut() {
+                match k.as_str() {
+                    "etag" => *v = now.etag.clone(),
+                    "last-modified" => *v = now.last_modified.clone(),
+                    _ => {}
+                }
+            }
             (start, len) = (0, now.len);
         }
     }

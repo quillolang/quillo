@@ -1238,7 +1238,7 @@ fn a_file_is_read_and_sent_as_it_was_looked_at() {
     let (opened, _) = statics::open_regular(&public.join("alias.txt")).unwrap();
     assert_eq!(statics::path_of(&opened).map(|p| p.canonicalize().unwrap()), Some(f.canonicalize().unwrap()));
     // The mark, and the send.
-    let hosted = statics::Hosted { served: public.clone(), program: d.clone(), etag: now.etag.clone() };
+    let hosted = statics::Hosted { served: public.clone(), program: d.clone(), etag: now.etag.clone(), id: now.id };
     let m = statics::mark(&f, 0, now.len, Some(&hosted));
     assert_eq!(statics::marked(&m), Some((f.clone(), 0, now.len, Some(hosted.clone()))));
     assert_eq!(statics::marked(&statics::mark(&f, 1, 1, None)), Some((f.clone(), 1, 1, None)));
@@ -2496,20 +2496,35 @@ fn files_answers_conditionals_ranges_and_heads_as_it_serves() {
     let s = support::serve(&d.join("main.qwe"), &[]);
     link("../app.db-shm", &d.join("public/x.txt"));
     let send = |method: &str, p: &str, h: &[(&str, &str)]| support::send(s.port, method, p, h, "");
-    // small.txt read once, so in memory; cold.txt not.
+    // small.txt read once, so in memory; cold.txt and big.bin first asked with a HEAD, which
+    // says what the GET then sends.
     let first = send("GET", "/s/small.txt", &[]);
     let tag = first.header("etag").unwrap().to_string();
     for path in ["/s/small.txt", "/s/cold.txt", "/s/big.bin"] {
-        let tag = send("HEAD", path, &[]).header("etag").unwrap_or_else(|| panic!("{}", path)).to_string();
-        let len = send("HEAD", path, &[]).header("content-length").map(str::to_string);
+        let h = send("HEAD", path, &[]);
+        let g = send("GET", path, &[]);
+        assert_eq!((h.status, h.body.as_str(), g.status), (200, "", 200), "{}", path);
+        for k in ["content-length", "etag", "content-type", "last-modified"] {
+            assert_eq!(h.header(k), g.header(k), "{}: {}", path, k);
+        }
+        let tag = g.header("etag").unwrap().to_string();
         let a = send("GET", path, &[("If-None-Match", &tag)]);
         assert_eq!((a.status, a.body.as_str()), (304, ""), "{}", path);
         let a = send("GET", path, &[("Range", "bytes=2-4")]);
         assert_eq!((a.status, a.body.len()), (206, 3), "{}", path);
         assert_eq!(a.header("content-range").map(|r| r.starts_with("bytes 2-4/")), Some(true), "{}", path);
-        let a = send("HEAD", path, &[]);
-        assert_eq!((a.status, a.body.as_str(), a.header("content-length").map(str::to_string)), (200, "", len), "{}", path);
     }
+    // A HEAD with gzip taken, of a file never fetched, says the GET's gzip: its length, its
+    // encoding and its Vary (FEEDBACK55.md, Q-701; branch feedback55).
+    std::fs::write(d.join("public/cold.css"), "body { color: red }\n".repeat(2000)).unwrap();
+    let gz = [("Accept-Encoding", "gzip")];
+    let h = send("HEAD", "/s/cold.css", &gz);
+    let g = send("GET", "/s/cold.css", &gz);
+    assert_eq!(g.header("content-encoding"), Some("gzip"));
+    for k in ["content-length", "content-encoding", "vary", "etag"] {
+        assert_eq!(h.header(k), g.header(k), "{}", k);
+    }
+    assert_eq!(send("HEAD", "/s/cold.css", &[]).header("content-length"), Some("40000"));
     assert_eq!(send("GET", "/s/small.txt", &[("Range", "bytes=2-4")]).body, "234");
     assert_eq!(send("GET", "/s/cold.txt", &[("Range", "bytes=2-4")]).body, "cde");
     assert_eq!(send("HEAD", "/s/small.txt", &[]).header("content-length"), Some("10"));
@@ -2520,5 +2535,166 @@ fn files_answers_conditionals_ranges_and_heads_as_it_serves() {
             assert_eq!(a.status, 404, "{} {} {:?}", method, path, h);
             assert!(!a.body.contains("SECRET") && !a.body.contains("SQLite"), "{}", path);
         }
+    }
+}
+
+// Q-701: package managers' stores right under a `node_modules` are followed through a link as
+// pnpm's is (Deno's `.deno`, Bun's `.bun`, Yarn's `.store`); the same names elsewhere are dot
+// folders like another.
+#[cfg(unix)]
+#[test]
+fn files_follows_a_link_into_a_package_managers_store() {
+    let d = dir("stores", "route GET /nm/*p = files(\"node_modules\", p)\nroute GET /r/*p = files(\".\", p)\n");
+    for store in [".pnpm", ".deno", ".bun", ".store"] {
+        let f = format!("node_modules/{}/lib@1.0.0/node_modules/lib/index.js", store);
+        std::fs::create_dir_all(d.join(&f).parent().unwrap()).unwrap();
+        std::fs::write(d.join(&f), store).unwrap();
+        link(&format!("{}/lib@1.0.0/node_modules/lib", store), &d.join(format!("node_modules/lib{}", store)));
+        // Not under `node_modules`: kept.
+        std::fs::create_dir_all(d.join(format!("other/{}", store))).unwrap();
+        std::fs::write(d.join(format!("other/{}/x.js", store)), "SECRET").unwrap();
+        link(&format!("other/{}/x.js", store), &d.join(format!("x{}.js", store)));
+    }
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    for store in [".pnpm", ".deno", ".bun", ".store"] {
+        let a = support::send(s.port, "GET", &format!("/nm/lib{}/index.js", store), &[], "");
+        assert_eq!((a.status, a.body.as_str()), (200, store));
+        let a = support::send(s.port, "GET", &format!("/r/node_modules/lib{}/index.js", store), &[], "");
+        assert_eq!((a.status, a.body.as_str()), (200, store));
+        statuses(s.port, &[(&format!("/r/x{}.js", store), 404), (&format!("/nm/{}/lib@1.0.0/node_modules/lib/index.js", store), 404)], "SECRET");
+    }
+}
+
+// Q-701: the TLS key and the file `--env-file` names, given as links, are known by where they lead
+// now: certbot points `live.pem` at a new key at each renewal, and the new key and the old are
+// both kept back, under any name.
+#[cfg(unix)]
+#[test]
+fn a_key_given_as_a_link_is_kept_after_a_renewal() {
+    let d = support::temp_dir("feedback55-renewal");
+    std::fs::create_dir_all(d.join("site/archive")).unwrap();
+    let pem = |n: u8| format!("-----BEGIN PRIVATE KEY-----\nKEY{}\n-----END PRIVATE KEY-----\n", n);
+    std::fs::write(d.join("site/archive/k1.pem"), pem(1)).unwrap();
+    std::fs::write(d.join("site/archive/k2.pem"), pem(2)).unwrap();
+    std::fs::write(d.join("site/cert.pem"), "-----BEGIN CERTIFICATE-----\n").unwrap();
+    std::fs::write(d.join("site/index.html"), "<p>site</p>").unwrap();
+    std::fs::write(d.join("env1"), "SECRET=1\n").unwrap();
+    std::fs::write(d.join("env2"), "SECRET=2\n").unwrap();
+    link("archive/k1.pem", &d.join("site/live.pem"));
+    link("../env1", &d.join("site/app.env"));
+    let port = support::free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .args(["serve", "site", "--port", &port.to_string(), "--tls-cert", "site/cert.pem", "--tls-key", "site/live.pem", "--env-file", "site/app.env"])
+        .current_dir(&d)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let _g = support::Guard::new(child);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !support::listening(port) {
+        assert!(std::time::Instant::now() < deadline, "quillo serve did not start");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let kept = ["/live.pem", "/archive/k1.pem", "/app.env"];
+    statuses(port, &kept.iter().map(|p| (*p, 404)).collect::<Vec<_>>(), "KEY");
+    assert_eq!(support::send(port, "GET", "/index.html", &[], "").status, 200);
+    // Renewed: both links lead to new files now.
+    let repoint = |to: &str, at: &str| {
+        link(to, &d.join("site/next.tmp"));
+        std::fs::rename(d.join("site/next.tmp"), d.join(at)).unwrap();
+    };
+    repoint("archive/k2.pem", "site/live.pem");
+    repoint("../env2", "site/app.env");
+    let kept = ["/live.pem", "/archive/k2.pem", "/archive/k1.pem", "/app.env"];
+    statuses(port, &kept.iter().map(|p| (*p, 404)).collect::<Vec<_>>(), "KEY");
+    statuses(port, &[("/app.env", 404)], "SECRET");
+    assert!(support::send(port, "GET", "/cert.pem", &[], "").body.contains("CERTIFICATE"));
+}
+
+// Q-701: on macOS a folder named through the firmlink `/System/Volumes/Data` is the same folder:
+// its files are served, judged in the one form the system names them in.
+#[cfg(target_os = "macos")]
+#[test]
+fn quillo_serve_takes_a_folder_named_through_the_firmlink() {
+    let d = support::temp_dir("feedback55-firmlink").canonicalize().unwrap();
+    let through = Path::new("/System/Volumes/Data").join(d.strip_prefix("/").unwrap());
+    if !through.is_dir() {
+        eprintln!("skipping: no {}", through.display());
+        return;
+    }
+    std::fs::create_dir_all(d.join("site")).unwrap();
+    std::fs::write(d.join("site/index.html"), "<p>through</p>").unwrap();
+    std::fs::write(d.join("site/.env"), "SECRET=1").unwrap();
+    let (_g, port) = serve_folder(Path::new("/"), &through.join("site").to_string_lossy());
+    let a = support::send(port, "GET", "/index.html", &[], "");
+    assert_eq!((a.status, a.body.as_str()), (200, "<p>through</p>"));
+    statuses(port, &[("/.env", 404)], "SECRET");
+}
+
+// Q-701: a file being written to in place (rewritten, or appended to) is served as it is, never as
+// a miss, by `file` and by `files`, whole, in part and for a HEAD; one renamed over again and again
+// is served or, while each look finds another file, a 503 to come back to; a large page of a
+// miss renamed over stays a 404.
+#[cfg(unix)]
+#[test]
+fn a_file_being_written_is_served_never_missed() {
+    let d = dir("busy", "route GET /f = file(\"public/w.txt\")\nroute GET /s/*p = files(\"public\", p)\n");
+    std::fs::create_dir_all(d.join("public")).unwrap();
+    std::fs::write(d.join("public/w.txt"), vec![b'w'; 20 << 10]).unwrap();
+    std::fs::write(d.join("public/grow.bin"), vec![b'g'; 2 << 20]).unwrap();
+    std::fs::write(d.join("public/r.txt"), "r").unwrap();
+    std::fs::write(d.join("public/404.html"), vec![b'm'; 2 << 20]).unwrap();
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = [0, 1, 2, 3]
+        .into_iter()
+        .map(|k| {
+            let (d, stop) = (d.clone(), stop.clone());
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let mut n = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    n += 1;
+                    match k {
+                        // Over what is there, as an editor that writes in place does.
+                        0 => std::fs::OpenOptions::new().write(true).open(d.join("public/w.txt")).unwrap().write_all(&vec![b'a' + (n % 26) as u8; 20 << 10]).unwrap(),
+                        1 => {
+                            let mut f = std::fs::OpenOptions::new().append(true).open(d.join("public/grow.bin")).unwrap();
+                            f.write_all(&[b'g'; 4096]).unwrap();
+                        }
+                        2 => {
+                            std::fs::write(d.join("public/r.tmp"), format!("r{}", n)).unwrap();
+                            std::fs::rename(d.join("public/r.tmp"), d.join("public/r.txt")).unwrap();
+                        }
+                        _ => {
+                            std::fs::write(d.join("public/404.tmp"), vec![b'm'; (2 << 20) + (n as usize % 7)]).unwrap();
+                            std::fs::rename(d.join("public/404.tmp"), d.join("public/404.html")).unwrap();
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    let get = |m: &str, p: &str, h: &[(&str, &str)]| support::send(s.port, m, p, h, "");
+    for i in 0..150 {
+        for (m, p, h, want) in [
+            ("GET", "/f", vec![], 200),
+            ("GET", "/s/w.txt", vec![], 200),
+            ("GET", "/s/w.txt", vec![("Range", "bytes=0-99")], 206),
+            ("HEAD", "/s/grow.bin", vec![], 200),
+            ("GET", "/s/grow.bin", vec![("Range", "bytes=0-99")], 206),
+        ] {
+            let a = get(m, p, &h);
+            assert_eq!(a.status, want, "{} {} {:?} (request {})", m, p, h, i);
+        }
+        let a = get("GET", "/s/r.txt", &[]);
+        assert!(a.status == 200 && a.body.starts_with('r') || a.status == 503 && a.header("retry-after") == Some("1"), "{}: {}", a.status, a.body);
+        let a = get("GET", "/s/missing", &[]);
+        assert!(a.status == 404 || a.status == 503, "the page of a miss came back {}", a.status);
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for w in writers {
+        w.join().unwrap();
     }
 }
