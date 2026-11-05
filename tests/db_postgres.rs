@@ -185,8 +185,10 @@ fn values_are_sent_as_the_column_wants_them() {
     says(stored(&mut it, "i4", "2.5m"), "cannot send");
     says(stored(&mut it, "i4", "\"x\""), "cannot send str \"x\" as int4");
     says(stored(&mut it, "i4", "true"), "cannot send bool true as int4");
-    says(stored(&mut it, "i2", "70000"), "cannot send int 70000 as int2");
-    says(stored(&mut it, "i4", "3000000000"), "cannot send int 3000000000 as int4");
+    // Past the column's range, the server says so: the value goes as an int8, so that in a
+    // `where` it is no match (FEEDBACK55.md, Q-731; branch feedback55).
+    says(stored(&mut it, "i2", "70000"), "smallint out of range [22003]");
+    says(stored(&mut it, "i4", "3000000000"), "integer out of range [22003]");
     // Floats take any number, and numbers in strings.
     assert_eq!(stored(&mut it, "f8", "2"), "2.0");
     assert_eq!(stored(&mut it, "f8", "1.25m"), "1.25");

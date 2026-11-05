@@ -3452,3 +3452,540 @@ fn the_named_paths_are_not_written_while_nothing_is_there() {
     }
     assert_eq!(get("/w/conf/cert.pem"), "written");
 }
+
+// ---- slice 5: the database layer reads SQL as each database does (Q-708, Q-727, Q-728, Q-729,
+// Q-731, Q-738, Q-746..Q-749, Q-755) -------------------------------------------------------
+
+use std::sync::{Arc, Weak};
+
+/// A PostgreSQL server for these tests, shared by those running at once (each with a database of
+/// its own); None when it is not installed.
+fn pg_server() -> Option<Arc<support::Pg>> {
+    static SHARED: Mutex<(Weak<support::Pg>, u32)> = Mutex::new((Weak::new(), 0));
+    let mut g = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = g.0.upgrade() {
+        return Some(s);
+    }
+    g.1 += 1;
+    let s = Arc::new(support::postgres(&format!("f55db{}", g.1))?);
+    g.0 = Arc::downgrade(&s);
+    Some(s)
+}
+
+/// The same for MariaDB.
+fn maria_server() -> Option<Arc<support::Maria>> {
+    static SHARED: Mutex<(Weak<support::Maria>, u32)> = Mutex::new((Weak::new(), 0));
+    let mut g = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = g.0.upgrade() {
+        return Some(s);
+    }
+    g.1 += 1;
+    let s = Arc::new(support::mariadb(&format!("f55db{}", g.1))?);
+    g.0 = Arc::downgrade(&s);
+    Some(s)
+}
+
+/// The servers a test holds while it runs.
+#[allow(dead_code)]
+struct Servers(Option<Arc<support::Pg>>, Option<Arc<support::Maria>>);
+
+/// Each database a test runs on, fresh for `name`: SQLite (a file), and PostgreSQL and MariaDB
+/// where they are installed. As (kind, URL).
+fn databases(name: &str) -> (Vec<(&'static str, String)>, Servers) {
+    let d = support::temp_dir(&format!("feedback55-db-{}", name));
+    let mut out = vec![("sqlite", d.join("app.db").to_string_lossy().into_owned())];
+    let pg = pg_server();
+    match &pg {
+        Some(pg) => out.push(("postgres", pg.database(&format!("f55_{}", name)))),
+        None => eprintln!("skipping PostgreSQL: initdb and pg_ctl were not found"),
+    }
+    let my = maria_server();
+    match &my {
+        Some(my) => {
+            quillo::my::Pool::open_as(&my.url(&format!("f55_{}", name)), true).unwrap();
+            out.push(("mariadb", my.url(&format!("f55_{}", name))));
+        }
+        None => eprintln!("skipping MariaDB: mariadbd and mariadb-install-db were not found"),
+    }
+    (out, Servers(pg, my))
+}
+
+/// A program on `url`, in a folder of its own.
+fn on_db(url: &str, more: &str) -> quillo::Interp {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let d = support::temp_dir(&format!("feedback55-dbp-{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let mut it = quillo::Interp::new(&d);
+    let src = format!("db.open(\"{}\")\n{}", url, more);
+    it.load_source(&src, "app.qwe").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    it
+}
+
+/// What `body` gives, as written by `repr`; a run-time error as "ERROR: ...".
+fn ev(it: &mut quillo::Interp, body: &str) -> String {
+    it.load_source(&format!("fn __t() {{\n{}\n}}\n", body), "case.qwe").unwrap_or_else(|x| panic!("{}\n{}", x, body));
+    match it.call(&quillo::value::lookup(&it.globals, "__t").unwrap(), vec![], 0) {
+        Ok(v) => v.repr().replace("\\\"", "\""),
+        Err(quillo::interp::Ctrl::Error(e)) => format!("ERROR: {}", e.msg),
+        Err(_) => "returned".into(),
+    }
+}
+
+fn has(got: &str, what: &str, case: &str) {
+    assert!(got.contains(what), "{}: wanted {:?} in: {}", case, what, got);
+}
+
+// Q-729: placeholders with no values are refused on every database, where SQLite stored nulls.
+#[test]
+fn placeholders_without_values_are_refused_on_every_database() {
+    let (dbs, _held) = databases("novalues");
+    for (kind, url) in &dbs {
+        let mut it = on_db(url, "db.exec(\"create table ub (name varchar(20), qty int)\")\n");
+        for sql in [
+            "insert into ub (name, qty) values (?, ?)",
+            "insert into ub (name, qty) values (:n, :q)",
+            "insert into ub (name, qty) values (?1, ?2)",
+            "insert into ub (name, qty) values ('a', ?2)",
+        ] {
+            has(&ev(&mut it, &format!("db.exec(\"{}\")", sql)), "the query has 2 parameters, got 0", &format!("{} {}", kind, sql));
+        }
+        // One, in a query too.
+        has(&ev(&mut it, "db.query(\"select * from ub where name = ?\")"), "the query has 1 parameter, got 0", kind);
+        has(&ev(&mut it, "db.one(\"select * from ub where name = :name\")"), "the query has 1 parameter, got 0", kind);
+        assert_eq!(ev(&mut it, "db.query(\"select * from ub\")"), "[]", "{}: nothing stored", kind);
+        // A `?` in a string, a name or a comment is none: as before.
+        let q = if *kind == "mariadb" { "`n?`" } else { "\\\"n?\\\"" };
+        assert_eq!(ev(&mut it, &format!("db.exec(\"insert into ub (name) values ('?') -- ?\")\ndb.query(\"select name as {} from ub /* ? */\") | map((r) => values(r))", q)), "[[\"?\"]]", "{}", kind);
+        // As many values as placeholders, and none for none.
+        assert_eq!(ev(&mut it, "db.exec(\"insert into ub (name, qty) values (?, ?)\", \"é\", 2).changes"), "1", "{}", kind);
+        assert_eq!(ev(&mut it, "db.exec(\"delete from ub\").changes"), "2", "{}", kind);
+        has(&ev(&mut it, "db.exec(\"insert into ub (name, qty) values (?, ?)\", \"a\")"), "the query has 2 parameters, got 1", kind);
+        has(&ev(&mut it, "db.exec(\"insert into ub (name, qty) values (?, ?)\", \"a\", 1, 2)"), "the query has 2 parameters, got 3", kind);
+    }
+}
+
+// Q-727: an error given as a value is given back, saying what it was, and a function is refused,
+// on every database; nothing is stored.
+#[test]
+fn an_error_given_as_a_value_is_given_back_on_every_database() {
+    let (dbs, _held) = databases("errvalue");
+    for (kind, url) in &dbs {
+        let mut it = on_db(url, "db.exec(\"create table people (name varchar(40), age int, meta text)\")\n");
+        let got = ev(&mut it, "let age = int(\"4O\")\ndb.exec(\"insert into people (name, age) values (?, ?)\", \"ann\", age)");
+        has(&got, "value 2 cannot be stored: got error (it failed before this call", kind);
+        has(&got, "not an int: \"4O\"", kind);
+        // By name, inside a list or a map, and a function.
+        has(&ev(&mut it, "db.exec(\"insert into people (name, age) values (:n, :a)\", { n: \"bo\", a: int(\"x\") })"), "value :a cannot be stored: got error (it failed before this call", kind);
+        has(&ev(&mut it, "db.exec(\"insert into people (meta) values (?)\", [1, err(\"no\")])"), "value 1 holds an error, which cannot be stored: got error (it failed before this call", kind);
+        has(&ev(&mut it, "db.exec(\"insert into people (meta) values (?)\", { a: { b: err(\"deep\") } })"), "deep", kind);
+        has(&ev(&mut it, "db.exec(\"insert into people (name) values (?)\", (x) => x)"), "value 1: a fn cannot be stored in the database", kind);
+        has(&ev(&mut it, "db.query(\"select * from people where name = ?\", int(\"x\"))"), "value 1 cannot be stored: got error", kind);
+        // `?` passes it on.
+        has(&ev(&mut it, "db.exec(\"insert into people (name) values (?)\", err(\"mine\"))?\n\"went on\""), "cannot be stored", kind);
+        assert_eq!(ev(&mut it, "db.query(\"select * from people\")"), "[]", "{}: nothing stored", kind);
+        // A key the SQL does not use may hold anything; every other value is stored.
+        assert_eq!(ev(&mut it, "db.exec(\"insert into people (name, age) values (:n, :a)\", { n: \"ünï\", a: 3, later: int(\"x\"), f: (x) => x }).changes"), "1", "{}", kind);
+        assert_eq!(ev(&mut it, "db.exec(\"insert into people (name, age, meta) values (?, ?, ?)\", null, 2.0, [1, \"a\", null]).changes"), "1", "{}", kind);
+        assert_eq!(ev(&mut it, "len(db.query(\"select * from people\"))"), "2", "{}", kind);
+    }
+}
+
+// Q-747: a map of values whose keys the SQL does not use is no value where the SQL has no
+// placeholder, on every database.
+#[test]
+fn a_map_where_the_sql_has_no_placeholder_is_no_value() {
+    let (dbs, _held) = databases("unusedmap");
+    for (kind, url) in &dbs {
+        let mut it = on_db(url, "db.exec(\"create table r6 (id int, author varchar(20))\")\ndb.exec(\"insert into r6 values (1, 'ann'), (2, 'bo')\")\n");
+        let q = |f: &str| format!("let f = {}\nlet sql = \"select id from r6\" + (if f.author != null {{ \" where author = :author\" }} else {{ \"\" }}) + \" order by id\"\ndb.query(sql, f)", f);
+        assert_eq!(ev(&mut it, &q("{ author: null }")), "[{ id: 1 }, { id: 2 }]", "{}", kind);
+        assert_eq!(ev(&mut it, &q("{ author: \"bo\" }")), "[{ id: 2 }]", "{}", kind);
+        assert_eq!(ev(&mut it, &q("{}")), "[{ id: 1 }, { id: 2 }]", "{}", kind);
+        assert_eq!(ev(&mut it, "db.one(\"select count(*) as n from r6\", { unused: 1 }).n"), "2", "{}", kind);
+        assert_eq!(ev(&mut it, "db.exec(\"update r6 set author = 'cy' where id = 1\", { x: 1 }).changes"), "1", "{}", kind);
+        // A name the SQL uses still needs its value; a list is still one value.
+        has(&ev(&mut it, "db.query(\"select id from r6 where author = :author\", { x: 1 })"), "no value for :author", kind);
+        has(&ev(&mut it, "db.query(\"select id from r6\", [1])"), "the query has 0 parameters, got 1", kind);
+    }
+}
+
+// Q-748: one map is the values by name only where the SQL names them: a map or a record as a lone
+// `?`'s value is stored, on every database.
+#[test]
+fn a_map_for_a_lone_placeholder_is_its_value() {
+    let (dbs, _held) = databases("lonemap");
+    for (kind, url) in &dbs {
+        let mut it = on_db(url, "db.exec(\"create table r7 (id int, meta text)\")\ntype Tagged = { tags: list }\n");
+        assert_eq!(ev(&mut it, "db.exec(\"insert into r7 (id, meta) values (1, ?)\", { tags: [\"a\"] }).changes"), "1", "{}", kind);
+        assert_eq!(ev(&mut it, "db.exec(\"insert into r7 (id, meta) values (2, ?)\", Tagged({ tags: [\"é\"] })).changes"), "1", "{}", kind);
+        assert_eq!(ev(&mut it, "db.exec(\"insert into r7 (id, meta) values (3, ?)\", {}).changes"), "1", "{}", kind);
+        assert_eq!(
+            ev(&mut it, "db.query(\"select meta from r7 order by id\") | map((r) => json.parse(r.meta))"),
+            "[{ tags: [\"a\"] }, { tags: [\"é\"] }, {}]",
+            "{}",
+            kind
+        );
+        // `?1` is a number, not a name.
+        assert_eq!(ev(&mut it, "db.one(\"select ?1 as a\", { k: 1 }).a | json.parse()"), "{ k: 1 }", "{}", kind);
+        // By name, as before.
+        assert_eq!(ev(&mut it, "db.one(\"select meta from r7 where id = :id\", { id: 1, other: 2 }).meta | json.parse()"), "{ tags: [\"a\"] }", "{}", kind);
+        has(&ev(&mut it, "db.one(\"select :a + :b as s\", { a: 1 })"), "no value for :b", kind);
+    }
+}
+
+// Q-746: a function's, a procedure's or a trigger's body is one statement with the rest, not a
+// transaction begun or ended by hand.
+#[test]
+fn routine_bodies_are_not_transactions_begun_by_hand() {
+    let (dbs, _held) = databases("bodies");
+    for (kind, url) in &dbs {
+        let mut it = on_db(url, "db.exec(\"create table tg (id int, n int)\")\n");
+        let bodies: Vec<String> = match *kind {
+            "postgres" => vec![
+                "create function f55_add(a int, b int) returns int language plpgsql as $$ begin return a + b; end $$".into(),
+                "create function f55_sq(a int) returns int language sql begin atomic select case when a > 0 then a * a else 0 end; end".into(),
+                "create procedure f55_put(a int) language sql begin atomic insert into tg (id, n) values (a, a); end".into(),
+                "do $$ begin perform 1; end $$".into(),
+                "create function f55_tg() returns trigger language plpgsql as $f$ begin new.n := new.id * 2; return new; end $f$; create trigger tg_bi before insert on tg for each row execute function f55_tg()".into(),
+            ],
+            "mariadb" => vec![
+                "create function f55_add(a int, b int) returns int deterministic begin declare s int default 0; if a > 0 then set s = a; end if; return s + b; end".into(),
+                "create function f55_sq(a int) returns int deterministic return case when a > 0 then a * a else 0 end".into(),
+                "create procedure f55_put(a int) begin l: loop insert into tg (id, n) values (a, a); leave l; end loop l; end".into(),
+                "begin not atomic select 1; end".into(),
+                "create trigger tg_bi before insert on tg for each row begin case when new.id > 0 then set new.n = new.id * 2; else set new.n = 0; end case; end".into(),
+            ],
+            _ => vec!["create trigger tg_bi after insert on tg begin update tg set n = case when new.id > 0 then new.id * 2 end where id = new.id; end".into()],
+        };
+        for b in &bodies {
+            assert_eq!(ev(&mut it, &format!("is_err(db.exec(\"{}\"))", b)), "false", "{}: {}", kind, b);
+        }
+        // Inside a transaction too.
+        assert_eq!(ev(&mut it, "db.transaction(() => db.exec(\"insert into tg (id) values (5)\").changes)"), "1", "{}", kind);
+        assert_eq!(ev(&mut it, "db.one(\"select n from tg where id = 5\").n"), "10", "{}", kind);
+        if *kind != "sqlite" {
+            assert_eq!(ev(&mut it, "db.one(\"select f55_add(2, 3) as v, f55_sq(4) as w\")"), "{ v: 5, w: 16 }", "{}", kind);
+        }
+        // A transaction begun or ended by hand is still refused, alone or among others.
+        for sql in ["begin", "COMMIT", "start transaction", "rollback", "select 1; commit", "begin; insert into tg (id) values (1)"] {
+            has(&ev(&mut it, &format!("db.exec(\"{}\")", sql)), "transaction", &format!("{} {}", kind, sql));
+        }
+        assert_eq!(ev(&mut it, "db.one(\"select 'begin; end' as v\").v"), "\"begin; end\"", "{}", kind);
+    }
+}
+
+// Q-749: PostgreSQL's `?` is read as the server reads it: `?||` is a placeholder and `||`, `@?`
+// jsonpath's operator, `?1` the first value, block comments nest.
+#[test]
+fn postgresql_reads_question_marks_as_the_server_does() {
+    let (dbs, _held) = databases("qmarks");
+    for (kind, url) in &dbs {
+        let mut it = on_db(url, "");
+        // MariaDB reads `||` as `or` (its sql_mode), so not there.
+        if *kind != "mariadb" {
+            assert_eq!(ev(&mut it, "db.one(\"select 'ab' like ?||'%' as v\", \"a\").v == true || db.one(\"select 'ab' like ?||'%' as v\", \"a\").v == 1"), "true", "{}", kind);
+        }
+        assert_eq!(ev(&mut it, "db.one(\"select ?2 as a, ?1 as b, ?2 as c\", \"x\", \"ü\")"), "{ a: \"ü\", b: \"x\", c: \"ü\" }", "{}", kind);
+        assert_eq!(ev(&mut it, "db.one(\"select /* a ? */ ? as v\", 9).v"), "9", "{}", kind);
+        if *kind == "postgres" {
+            assert_eq!(ev(&mut it, "db.one(\"select '%'||?||'%' as v\", \"b\").v"), "\"%b%\"", "{}", kind);
+            assert_eq!(ev(&mut it, "db.one(\"select '{\\\"a\\\":1}'::jsonb @? '$.a' as v, ? as w\", 1)"), "{ v: true, w: 1 }", "{}", kind);
+            assert_eq!(ev(&mut it, "db.one(\"select ?1::int + ?2 as v\", 3, 4).v"), "7", "{}", kind);
+            assert_eq!(ev(&mut it, "db.one(\"select /* /* ? */ ? */ ? as v\", 9).v"), "9", "{}", kind);
+            // jsonb's own `?`, `?|` and `?&` after a value, as before; a query numbering its own.
+            assert_eq!(ev(&mut it, "db.one(\"select '{\\\"a\\\":1}'::jsonb ? 'a' as v, '{\\\"a\\\":1}'::jsonb ?| array['b', ?] as w\", \"a\")"), "{ v: true, w: true }", "{}", kind);
+            assert_eq!(ev(&mut it, "db.one(\"select $1::int as v, '{\\\"a\\\":1}'::jsonb ? 'a' as w\", 5)"), "{ v: 5, w: true }", "{}", kind);
+            assert_eq!(ev(&mut it, "db.one(\"select arr[1:2] as v from (select array[?, 2, 3] as arr) s\", 1).v"), "[1, 2]", "{}", kind);
+        }
+    }
+}
+
+// Q-708: outside a transaction, a setting made to last the session is refused in every form; inside
+// one it is noted, and the connection reset before another request has it.
+#[test]
+fn a_lasting_setting_is_refused_outside_a_transaction_in_every_form() {
+    let Some(pg) = pg_server() else { return };
+    let url = pg.database("f55_session") + "?pool_size=1";
+    let mut it = on_db(&url, "db.exec(\"create table t (x int)\")\n");
+    let refused = "outside `db.transaction` this connection is shared by every request";
+    for (sql, values) in [
+        ("select set_config('app.user_id', ?, ?)", "\"42\", false"),
+        ("select set_config('app.user_id', '42', 'false')", ""),
+        ("values (set_config('app.user_id', '42', false))", ""),
+        ("update t set x = x where set_config('app.user_id', '42', false) is not null", ""),
+        ("select pg_catalog.set_config('app.user_id', :v, :l)", "{ v: \"42\", l: false }"),
+        ("select 1; select set_config('app.user_id', '42', false)", ""),
+        ("do $$ begin perform set_config('app.user_id', '42', false); end $$", ""),
+        ("select set_config('app.user_id', ?, ?)", "\"42\", \"true\""),
+        ("select set_config('app.user_id', ?, ?)", "\"42\", null"),
+        ("set app.user_id = '42'", ""),
+        ("select pg_advisory_lock(?)", "1"),
+    ] {
+        let call = if values.is_empty() { format!("db.exec(\"{}\")", sql) } else { format!("db.exec(\"{}\", {})", sql, values) };
+        has(&ev(&mut it, &call), refused, sql);
+        has(&ev(&mut it, &call.replace("db.exec", "db.query")), refused, sql);
+    }
+    assert_eq!(ev(&mut it, "db.one(\"select current_setting('app.user_id', true) as u\").u ?? \"\""), "\"\"", "nothing leaked");
+    // What ends with its transaction is allowed; text that only names it is no call.
+    for (sql, values) in [
+        ("select set_config('app.user_id', ?, ?)", "\"42\", true"),
+        ("select set_config('app.user_id', '42', TRUE)", ""),
+        ("select 'set_config(''a'', ''b'', false)' as v", ""),
+        ("select pg_advisory_xact_lock(?)", "1"),
+        ("set local app.user_id = '42'", ""),
+    ] {
+        let call = if values.is_empty() { format!("db.exec(\"{}\")", sql) } else { format!("db.exec(\"{}\", {})", sql, values) };
+        assert_eq!(ev(&mut it, &format!("is_err({})", call)), "false", "{}", sql);
+    }
+    // Inside a transaction: noted, read there, and gone after it.
+    assert_eq!(
+        ev(&mut it, "db.transaction(() => {\n    db.exec(\"select set_config('app.user_id', ?, ?)\", \"7\", false)\n    db.one(\"select current_setting('app.user_id', true) as u\").u\n})"),
+        "\"7\""
+    );
+    assert_eq!(ev(&mut it, "db.transaction(() => db.one(\"select current_setting('app.user_id', true) as u\").u) ?? \"\""), "\"\"", "reset");
+}
+
+// Q-731: a value PostgreSQL would take as text, where nothing in the SQL says what it is, is sent
+// as what it is: the same answers as SQLite and MariaDB.
+#[test]
+fn values_with_no_type_in_the_sql_give_the_same_answers_everywhere() {
+    let (dbs, _held) = databases("untyped");
+    for (kind, url) in &dbs {
+        let mut it = on_db(url, "db.exec(\"create table t (id int, name varchar(20), n int)\")\ndb.exec(\"insert into t values (1, '42', 7)\")\n");
+        for (body, want) in [
+            ("db.one(\"select max(x) as m from (select ? as x union all select ?) s\", 10, 9).m", "10"),
+            ("db.one(\"select substring('hello', ?, ?) as s\", 2, 3).s", "\"ell\""),
+            ("db.one(\"select ? as v\", 5).v", "5"),
+            ("db.one(\"select ? as v\", -2147483649).v", "-2147483649"),
+            ("db.one(\"select ? as v\", 2.5).v", "2.5"),
+            ("db.one(\"select ? as v\", \"5\").v", "\"5\""),
+            // An int past what the column holds is no match; at its edge, one.
+            ("db.query(\"select id from t where n = ?\", 5000000000)", "[]"),
+            ("db.query(\"select id from t where n = ?\", 2147483648)", "[]"),
+            ("db.query(\"select id from t where n = ?\", 7)", "[{ id: 1 }]"),
+            // A text column compared with an int, and an int stored in one, as before.
+            ("db.query(\"select id from t where name = ?\", 42)", "[{ id: 1 }]"),
+            ("db.exec(\"insert into t (id, name) values (2, ?)\", 43).changes", "1"),
+            ("db.one(\"select name from t where id = 2\").name", "\"43\""),
+        ] {
+            assert_eq!(ev(&mut it, body), want, "{}: {}", kind, body);
+            // The same in a transaction.
+            if !body.contains("insert") {
+                assert_eq!(ev(&mut it, &format!("db.transaction(() => {})", body)), want, "{} in a transaction: {}", kind, body);
+            }
+        }
+        let greatest = if *kind == "sqlite" { "max" } else { "greatest" };
+        assert_eq!(ev(&mut it, &format!("db.one(\"select {}(?, ?) as g\", 10, 9).g", greatest)), "10", "{}", kind);
+        // Mixed: a value with no type beside one compared with a text column.
+        assert_eq!(
+            ev(&mut it, &format!("db.transaction(() => db.one(\"select {}(?, ?) as g, (select count(*) from t where name = ?) as c\", 10, 9, 42))", greatest)),
+            "{ g: 10, c: 1 }",
+            "{}",
+            kind
+        );
+    }
+}
+
+// Q-728: on MySQL and MariaDB a statement that commits by itself is refused inside a transaction,
+// so all or nothing holds there as on PostgreSQL and SQLite.
+#[test]
+fn a_statement_that_commits_by_itself_is_refused_inside_a_transaction() {
+    let (dbs, _held) = databases("implicit");
+    for (kind, url) in &dbs {
+        let mut it = on_db(url, "db.exec(\"create table rates (cur varchar(3) primary key, v int)\")\ndb.exec(\"insert into rates values ('USD', 1)\")\n");
+        let r = ev(&mut it, "db.transaction(() => {\n    db.exec(\"delete from rates where cur = 'USD'\")\n    db.exec(\"truncate table rates\")\n    db.exec(\"insert into rates values (?, ?)\", \"EUR\", 3)?\n    db.exec(\"insert into rates values (?, ?)\", \"EUR\", 4)?\n})");
+        if *kind == "mariadb" {
+            has(&r, "`db.exec(\"truncate table rates\")` inside a transaction: MySQL and MariaDB commit the transaction around this statement by itself", kind);
+        } else if *kind == "postgres" {
+            has(&r, "duplicate key", kind);
+        }
+        // All or nothing: as it was, on each.
+        assert_eq!(ev(&mut it, "db.query(\"select cur, v from rates\")"), "[{ cur: \"USD\", v: 1 }]", "{}", kind);
+        if *kind != "mariadb" {
+            continue;
+        }
+        for sql in ["create table other (a int)", "CREATE INDEX i ON rates (v)", "drop table rates", "alter table rates add w int", "rename table rates to r2", "lock tables rates write"] {
+            has(&ev(&mut it, &format!("db.transaction(() => db.transaction(() => db.exec(\"{}\")))", sql)), "commit the transaction around this statement", sql);
+            has(&ev(&mut it, &format!("db.transaction(() => db.query(\"{}\"))", sql)), "commit the transaction around this statement", sql);
+        }
+        has(&ev(&mut it, "db.exec_many(\"create table x (a int)\", [[]])"), "commit the transaction around this statement", "exec_many");
+        // What does not commit, inside; and anything outside.
+        assert_eq!(
+            ev(&mut it, "db.transaction(() => {\n    db.exec(\"create temporary table tt (a int)\")\n    db.exec(\"insert into tt values (1)\")\n    db.exec(\"drop temporary table tt\")\n    db.one(\"select 'truncate table rates' as v\").v\n})"),
+            "\"truncate table rates\""
+        );
+        assert_eq!(ev(&mut it, "db.exec(\"truncate table rates\").changes"), "0");
+        assert_eq!(ev(&mut it, "db.query(\"select * from rates\")"), "[]");
+    }
+}
+
+// Q-738: `db.transaction` refuses an option it does not have, naming those it has; `quillo check`
+// says so before it runs.
+#[test]
+fn a_transactions_options_are_only_its_own() {
+    let mut it = quillo::Interp::new(&support::temp_dir("feedback55-txopts"));
+    it.load_source("db.open(\":memory:\")\n", "app.qwe").unwrap();
+    for opts in ["{ isolaton: \"serializable\" }", "{ retrys: 5 }", "{ isolation: \"serializable\", Retries: 1 }", "{ \"\": 1 }"] {
+        has(&ev(&mut it, &format!("db.transaction({}, () => 1)", opts)), "has no option", opts);
+        has(&ev(&mut it, &format!("db.transaction({}, () => 1)", opts)), "(isolation, retries)", opts);
+    }
+    for opts in ["{}", "{ isolation: null }", "{ retries: 0 }", "{ isolation: \"read_committed\", retries: 20 }"] {
+        assert_eq!(ev(&mut it, &format!("db.transaction({}, () => 1)", opts)), "1", "{}", opts);
+    }
+    // `idempotent` takes its own as before.
+    let (ok, out) = check("route POST /pay = idempotent({ max_age: 60, retries: 1, isolation: \"serializable\" }, () => \"paid\")\n");
+    assert!(ok, "{}", out);
+    let (ok, out) = check("db.open(\":memory:\")\nlet a = db.transaction({ isolaton: \"serializable\", retrys: 5 }, () => 1)\nlet b = db.transaction({ isolation: \"serializable\", retries: 2 }, () => 1)\nlet c = db.transaction({ timeout: 1 }, () => 1)\n");
+    assert!(!ok, "{}", out);
+    has(&out, "`db.transaction` has no option `isolaton` (did you mean `isolation`?)", "check");
+    has(&out, "`db.transaction` has no option `retrys` (did you mean `retries`?)", "check");
+    has(&out, "`db.transaction` has no option `timeout` (isolation, retries)", "check");
+    assert_eq!(out.matches("has no option").count(), 3, "{}", out);
+}
+
+// Q-755 and Q-746 in `quillo check`: a list for PostgreSQL's array is no warning, and a function's
+// body is no `begin`.
+#[test]
+fn check_reads_sql_as_the_databases_do() {
+    for (call, warned) in [
+        ("db.query(\"select * from t where x = any(?)\", [1, 2])", false),
+        ("db.query(\"select * from t where x <> ALL (?)\", [1, 2])", false),
+        ("db.exec(\"insert into t values (?::jsonb[])\", [1, 2])", false),
+        ("db.exec(\"insert into t values (?::character varying(10)[])\", [\"a\"])", false),
+        ("db.one(\"select cast(? as int[]) as v\", [1])", false),
+        ("db.query(\"select * from unnest(?)\", [1])", false),
+        ("db.exec(\"insert into t values (?)\", [1, 2])", true),
+        ("db.exec(\"insert into t values (?::int)\", [1, 2])", true),
+        ("db.query(\"select * from t where x = ? and y = any(?)\", [1])", true),
+        ("db.exec(\"insert into t values ('?')\", [1])", false),
+    ] {
+        let (_, out) = check(&format!("db.open(\":memory:\")\nlet r = {}\n", call));
+        assert_eq!(out.contains("this list is one parameter"), warned, "{}: {}", call, out);
+    }
+    for (call, refused) in [
+        ("db.exec(\"create function f(a int) returns int language plpgsql as $$ begin return a; end $$\")", false),
+        ("db.exec(\"create trigger t after insert on x begin update y set n = 1; end\")", false),
+        ("db.exec(\"do $$ begin perform 1; end $$\")", false),
+        ("db.exec(\"begin\")", true),
+        ("db.query(\"Commit\")", true),
+        ("db.one(\"rollback to savepoint a\")", true),
+    ] {
+        let (_, out) = check(&format!("db.open(\":memory:\")\nlet r = {}\n", call));
+        assert_eq!(out.contains("write `db.transaction(() => ...)`"), refused, "{}: {}", call, out);
+    }
+}
+
+// ---- slice 5's review (FEEDBACK55.md, Q-708, Q-728, Q-729, Q-731, Q-746..Q-749; branch feedback55)
+
+// Q-708: what may change the session where Quillo cannot read it (a function of the program's,
+// a `do` block) leaks to no one: outside a transaction it runs on a connection reset after it,
+// and every transaction's connection is reset as it ends; the names PostgreSQL reads as
+// `set_config`, and temporary tables by their schema, are refused outside one.
+#[test]
+fn no_setting_reaches_the_next_request_by_any_way() {
+    let Some(pg) = pg_server() else { return };
+    let url = pg.database("f55_unseen") + "?pool_size=1";
+    let mut it = on_db(&url, "db.exec(\"create table t (a int)\")\ndb.exec(\"create function setu(v text) returns text language sql as $$ select set_config('app.user_id', v, false) $$\")\nfn who() = db.one(\"select current_setting('app.user_id', true) as u\").u ?? \"\"\n");
+    let refused = "outside `db.transaction` this connection is shared by every request";
+    for sql in [
+        "select U&\\\"set\\\\005fconfig\\\"('app.user_id', 'u1', false)",
+        "do $$ begin execute 'select set_config(''app.user_id'', ''u2'', false)'; end $$",
+        "create table pg_temp.x (a int)",
+        "select 1 into pg_temp.y",
+    ] {
+        has(&ev(&mut it, &format!("db.exec(\"{}\")", sql)), refused, sql);
+    }
+    // Run, and gone after: a function of the program's, outside a transaction and inside one,
+    // nested too; a `do` block whose SQL is made as it runs.
+    assert_eq!(ev(&mut it, "db.one(\"select setu('u3') as s\").s"), "\"u3\"");
+    assert_eq!(ev(&mut it, "who()"), "\"\"", "outside");
+    assert_eq!(ev(&mut it, "db.transaction(() => db.transaction(() => db.one(\"select setu(?) as s\", \"u16\").s))"), "\"u16\"");
+    assert_eq!(ev(&mut it, "who()"), "\"\"", "inside");
+    assert_eq!(ev(&mut it, "db.transaction(() => db.exec(\"create table pg_temp.z (a int)\").changes)"), "0");
+    assert_eq!(ev(&mut it, "db.one(\"select count(*) as n from pg_tables where tablename = 'z'\").n"), "0");
+    assert_eq!(ev(&mut it, "is_err(db.exec(\"do $$ begin execute 'select setu(' || quote_literal('u5') || ')'; end $$\"))"), "false");
+    assert_eq!(ev(&mut it, "who()"), "\"\"", "do");
+    // A function made later is known to be the program's at once.
+    assert_eq!(ev(&mut it, "db.one(\"select lower(?) as l\", \"X\").l"), "\"x\"");
+    assert_eq!(ev(&mut it, "is_err(db.exec(\"create function lower2(v text) returns text language sql as $$ select set_config('app.user_id', v, false) $$\"))"), "false");
+    assert_eq!(ev(&mut it, "db.one(\"select lower2('u6') as l\").l"), "\"u6\"");
+    assert_eq!(ev(&mut it, "who()"), "\"\"", "made later");
+    // What is no function is as before: quoted names as PostgreSQL reads them.
+    assert_eq!(ev(&mut it, "is_err(db.one(\"select 'set_config(x, y, false)' as v, \\\"t\\\".a from t\"))"), "false");
+}
+
+// Q-731: a statement PostgreSQL does not take with the values' types is tried at most twice,
+// in a transaction too, whatever the number of values; the answers stay right.
+#[test]
+fn values_with_no_type_are_tried_a_bounded_number_of_times() {
+    let Some(pg) = pg_server() else { return };
+    let url = pg.database("f55_tries");
+    let mut it = on_db(&url, "db.exec(\"create table tt (id int, name text)\")\ndb.exec(\"insert into tt values (1, '42')\")\n");
+    let refusals = |pg: &support::Pg| pg.log().matches("operator does not exist: text = integer").count();
+    for n in [1, 2, 200, 800] {
+        let before = refusals(&pg);
+        let got = ev(&mut it, &format!("let vals = reduce(range({n}), {{}}, (m, i) => set(m, \"v\" + str(i), i + 42))\ndb.transaction(() => db.query(\"select id from tt where name in (\" + join(range({n}) | map((i) => \":v\" + str(i)), \", \") + \")\", vals))", n = n));
+        assert_eq!(got, "[{ id: 1 }]", "{} values", n);
+        let tries = refusals(&pg) - before;
+        assert!(tries <= 2, "{} values: {} refused tries", n, tries);
+    }
+    // Two values PostgreSQL takes as ints beside one compared with text: both answers right.
+    assert_eq!(ev(&mut it, "db.transaction(() => db.one(\"select greatest(?, ?) as g, (select count(*) from tt where name = ?) as c\", 10, 9, 42))"), "{ g: 10, c: 1 }");
+    assert_eq!(ev(&mut it, "db.one(\"select greatest(?, ?) as g\", 10, \"9\").g"), "\"9\"");
+}
+
+// Q-749 (review): a name inside PostgreSQL's brackets is a placeholder, unless a value comes
+// before its `:` (a slice); SQLite's variables may be digits, and `#name`.
+#[test]
+fn names_in_brackets_and_sqlites_numbered_names() {
+    let (dbs, _held) = databases("brackets");
+    for (kind, url) in &dbs {
+        let mut it = on_db(url, "db.exec(\"create table t (a int, b int)\")\n");
+        if *kind == "postgres" {
+            assert_eq!(ev(&mut it, "db.one(\"select array[:a, :b] as v\", { a: 1, b: 2 }).v"), "[1, 2]", "{}", kind);
+            assert_eq!(ev(&mut it, "db.one(\"select 'b' = any(array[:a, :b]) as v, 2 = any(array[:c, :d]::int[]) as w\", { a: \"a\", b: \"b\", c: 1, d: 2 })"), "{ v: true, w: true }", "{}", kind);
+            assert_eq!(ev(&mut it, "db.one(\"select (array[10, 20, 30])[:lo:2] as v\", { lo: 1 }).v"), "[10, 20]", "{}", kind);
+            assert_eq!(ev(&mut it, "db.one(\"select (array[10, 20, 30])[2:3] as v, x[1:1] as w from (select array[5] as x) s\").v"), "[20, 30]", "{}", kind);
+        }
+        if *kind == "sqlite" {
+            has(&ev(&mut it, "db.exec(\"insert into t values (:1, 2)\")"), "the query has 1 parameter, got 0", kind);
+            has(&ev(&mut it, "db.exec(\"insert into t values (@1, #b)\")"), "the query has 2 parameters, got 0", kind);
+            assert_eq!(ev(&mut it, "db.one(\"select :1 as x, @2 as y, #a as z, $3 as w\", { \"1\": 9, \"2\": 8, a: 7, \"3\": 6 })"), "{ x: 9, y: 8, z: 7, w: 6 }", "{}", kind);
+            assert_eq!(ev(&mut it, "db.query(\"select * from t\")"), "[]", "nothing stored");
+        }
+        // A map of values not bound is not looked at (found in review).
+        assert_eq!(ev(&mut it, "db.one(\"select 1 as x\", { cb: (x) => x, e: err(\"no\") }).x"), "1", "{}", kind);
+    }
+}
+
+// Q-728 (review): on MariaDB, a statement that commits where it cannot be read beforehand (a
+// procedure's, `execute immediate`, a `begin not atomic` block) ends the function with the error
+// naming it, by the server's own flag; MariaDB's `analyze select`, `for` loops and `/*M! */` are
+// read right; migrations take schema changes as before.
+#[test]
+fn a_hidden_commit_on_mariadb_ends_the_transaction_with_an_error() {
+    let Some(my) = maria_server() else { return };
+    let url = my.url("f55_hidden");
+    quillo::my::Pool::open_as(&url, true).unwrap();
+    let mut it = on_db(&url, "db.exec(\"create table if not exists r (a int)\")\ndb.exec(\"create procedure mk() begin create table if not exists made (a int); end\")\n");
+    for sql in ["call mk()", "begin not atomic create table if not exists m2 (a int); end", "execute immediate 'create table if not exists m3 (a int)'"] {
+        let got = ev(&mut it, &format!("db.exec(\"delete from r\")\ndb.transaction(() => {{\n    db.exec(\"insert into r values (1)\")\n    db.exec(\"{}\")\n    db.exec(\"insert into r values (2)\")\n}})", sql));
+        has(&got, &format!("`db.exec(\"{}\")` inside a transaction: MySQL and MariaDB committed the transaction around this statement by itself", sql), sql);
+        // What ran after it did not run.
+        assert_eq!(ev(&mut it, "db.query(\"select a from r order by a\")"), "[{ a: 1 }]", "{}", sql);
+    }
+    // Not commits: inside a transaction as before.
+    for sql in ["analyze select 1", "insert into r values (9)", "select /*M!100100 1 + */ 1 as v"] {
+        assert_eq!(ev(&mut it, &format!("is_err(db.transaction(() => db.query(\"{}\")))", sql)), "false", "{}", sql);
+    }
+    assert_eq!(ev(&mut it, "db.one(\"select /*M!100100 1 + */ 1 as v\").v"), "2");
+    assert_eq!(ev(&mut it, "is_err(db.exec(\"create procedure f55_for() begin for i in 1..3 do insert into r values (i); end for; end\"))"), "false");
+    assert_eq!(ev(&mut it, "db.exec(\"delete from r\")\nlet _r = db.transaction(() => db.exec(\"call f55_for()\"))\ndb.query(\"select a from r order by a\")"), "[{ a: 1 }, { a: 2 }, { a: 3 }]");
+    // Migrations change the schema as before: MySQL commits them as they run.
+    let d = support::temp_dir("feedback55-hidden-migrate");
+    std::fs::create_dir_all(d.join("migrations")).unwrap();
+    std::fs::write(d.join("migrations/001_a.sql"), "create table mig_a (a int);\ninsert into mig_a values (1);\n").unwrap();
+    std::fs::write(d.join("migrations/002_b.sql"), "alter table mig_a add b int;\n").unwrap();
+    let mut m = quillo::Interp::new(&d);
+    m.load_source(&format!("db.open(\"{}\")\n", url), "app.qwe").unwrap();
+    assert_eq!(ev(&mut m, "let r = db.migrate()\nis_err(r) ? r : db.query(\"select a, b from mig_a\")"), "[{ a: 1, b: null }]");
+}

@@ -68,6 +68,9 @@ pub struct Options {
 /// The most `retries` may be: past that, something else is wrong.
 const MAX_RETRIES: i64 = 20;
 
+/// The options `db.transaction` takes.
+pub const OPTIONS: [&str; 2] = ["isolation", "retries"];
+
 /// Reads `{ isolation, retries }` (other keys are left to the caller: see
 /// `idempotent`, which takes these too).
 pub fn options(v: &Value, f: &str, line: u32) -> Result<Options, Ctrl> {
@@ -75,6 +78,13 @@ pub fn options(v: &Value, f: &str, line: u32) -> Result<Options, Ctrl> {
         return fail(line, format!("`{}` expects options as a map, like {{ isolation: \"serializable\", retries: 3 }}", f));
     };
     let mut o = Options { given: true, ..Options::default() };
+    // A key misspelled was the default, quietly: `isolaton` ran at read committed (FEEDBACK55.md,
+    // Q-738; branch feedback55). `idempotent` reads its own.
+    if f == "db.transaction" {
+        if let Some(k) = m.keys().find(|k| !OPTIONS.contains(&k.as_str())) {
+            return fail(line, format!("`db.transaction` has no option `{}` ({})", k, OPTIONS.join(", ")));
+        }
+    }
     match m.get("isolation") {
         None | Some(Value::Nil) => {}
         Some(Value::Str(s)) => {

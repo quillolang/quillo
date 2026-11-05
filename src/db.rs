@@ -216,6 +216,16 @@ impl Backend {
         }
         false
     }
+
+    /// How the database reads SQL (src/sql.rs).
+    pub(crate) fn dialect(&self) -> crate::sql::Dialect {
+        match self {
+            Backend::Sqlite(_) => crate::sql::Dialect::Sqlite,
+            Backend::Postgres(_) => crate::sql::Dialect::Postgres,
+            #[cfg(feature = "mysql")]
+            Backend::Mysql(_) => crate::sql::Dialect::Mysql,
+        }
+    }
 }
 
 /// The program's database: one, or one per tenant when `db.open`'s target
@@ -340,106 +350,173 @@ pub struct TxConn {
     backend: Arc<Backend>,
     conn: Option<Pinned>,
     depth: usize,
-    /// A statement in it changed the session (`set`, a temporary table): the connection is
-    /// reset before it goes back (FEEDBACK44.md, Q-581; branch feedback40-43).
-    session: bool,
-}
-
-/// Whether a PostgreSQL statement changes the session, which outlives the transaction and the
-/// request on a pooled connection: another visitor's next request reads it (`set app.user_id`,
-/// row-level security's usual setting, then read by `current_setting`). `set local`,
-/// `set_config(..., true)` and `pg_advisory_xact_lock` end with the transaction (Q-581).
-fn changes_session(sql: &str) -> bool {
-    statements(sql).iter().any(|s| statement_changes_session(s))
-}
-
-fn statement_changes_session(sql: &str) -> bool {
-    let words = first_words(sql);
-    let first = words.split(' ').next().unwrap_or("");
-    let l = sql.to_ascii_lowercase();
-    // `create temp`, `create local temporary`, `create or replace temp view` (found in review).
-    let head: Vec<&str> = l.split(|c: char| !c.is_ascii_alphabetic()).filter(|w| !w.is_empty()).take(6).collect();
-    match first {
-        "set" => !matches!(words.as_str(), "set local" | "set transaction" | "set constraints"),
-        "listen" => true,
-        "create" => head.iter().any(|w| *w == "temp" || *w == "temporary"),
-        "declare" => l.contains(" with hold"),
-        "select" | "with" => {
-            l.contains(" into temp")
-                || l.contains("pg_advisory_lock")
-                || l.contains("pg_try_advisory_lock")
-                || set_config_lasts(&l)
-        }
-        _ => false,
-    }
-}
-
-/// `set_config(name, value, false)`: its own third argument, read past the first two
-/// (`coalesce(null, false)` elsewhere in the statement is not it; found in review).
-fn set_config_lasts(l: &str) -> bool {
-    let mut rest = l;
-    while let Some(at) = rest.find("set_config") {
-        rest = &rest[at + "set_config".len()..];
-        let Some(open) = rest.find('(') else { break };
-        if !rest[..open].trim().is_empty() {
-            continue;
-        }
-        let (mut depth, mut args, mut cur) = (0, Vec::new(), String::new());
-        for c in rest[open + 1..].chars() {
-            match c {
-                '(' => depth += 1,
-                ')' if depth == 0 => break,
-                ')' => depth -= 1,
-                ',' if depth == 0 => {
-                    args.push(std::mem::take(&mut cur));
-                    continue;
-                }
-                _ => {}
-            }
-            cur.push(c);
-        }
-        args.push(cur);
-        if args.get(2).map(|a| a.trim()) == Some("false") {
-            return true;
-        }
-    }
-    false
 }
 
 /// What a session changed is set back, its prepared statements kept (Quillo's own among them):
 /// whether that worked. One that did not is closed, not given back (found in review).
 fn reset_session(c: &mut Pinned) -> bool {
     match c {
-        Pinned::Pg(_) => c
-            .batch("set session authorization default; reset all; close all; discard temp; select pg_advisory_unlock_all(); unlisten *")
-            .is_ok(),
+        Pinned::Pg(_) => c.batch(pg::RESET).is_ok(),
         #[allow(unreachable_patterns)]
         _ => true,
     }
 }
 
-/// A statement that changes the session, on PostgreSQL: noted in the request's transaction,
-/// whose connection is then reset, and refused outside one, where the connection is shared by
-/// every request (Q-581).
-fn session_change(it: &Interp, b: &Arc<Backend>, sql: &str) -> Result<(), String> {
+/// A statement that changes the session, on PostgreSQL: refused outside a transaction, where
+/// the connection is shared by every request (Q-581); inside one it is allowed, and the
+/// connection reset as every transaction ends (see `attempt`). Read by the tokenizer, in any
+/// statement and with the values given (`set_config(?, ?, ?)` with false; FEEDBACK55.md,
+/// Q-708; branch feedback55).
+fn session_change(it: &Interp, b: &Arc<Backend>, scan: &crate::sql::Scan, params: &[Value]) -> Result<(), String> {
     if !matches!(&**b, Backend::Postgres(_)) {
         return Ok(());
     }
     // A statement prepared by name outlives everything, and cannot be let go without Quillo's
     // own (found in review).
-    if statements(sql).iter().any(|s| first_words(s).starts_with("prepare")) {
+    if scan.prepares() {
         return Err("`prepare` makes a statement for the whole session: pass the values as parameters (`?`) instead, which Quillo prepares itself".to_string());
     }
-    if !changes_session(sql) {
+    if !scan.changes_session(params) {
         return Ok(());
     }
-    let mut g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    match g.iter_mut().find(|t| Arc::ptr_eq(&t.backend, b)) {
-        Some(t) => {
-            t.session = true;
-            Ok(())
+    if in_tx_on(it, b) {
+        return Ok(());
+    }
+    Err("outside `db.transaction` this connection is shared by every request, so what this changes would reach others: use `set local` (or `set_config(..., true)`) inside `db.transaction`".to_string())
+}
+
+/// Whether the request has a transaction open on `b`.
+fn in_tx_on(it: &Interp, b: &Arc<Backend>) -> bool {
+    it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|t| Arc::ptr_eq(&t.backend, b))
+}
+
+/// Whether a statement outside a transaction, on PostgreSQL, may change the session where its
+/// reading cannot see: a `do` block, whose SQL may be made as it runs (`execute`), or a call
+/// of a function of the database's own, which may call `set_config` (looked up once a name,
+/// in `pg_proc`). It then runs on a connection of its own, reset before it goes back
+/// (`isolated_run`), not on one other requests share. Inside a transaction every connection is
+/// reset as it ends (FEEDBACK55.md, Q-708; branch feedback55).
+fn isolated(it: &mut Interp, b: &Arc<Backend>, scan: &crate::sql::Scan) -> bool {
+    let Backend::Postgres(pool) = &**b else { return false };
+    if (!scan.unseen && scan.calls.is_empty()) || in_tx_on(it, b) {
+        return false;
+    }
+    if scan.unseen {
+        return true;
+    }
+    if let Some(own) = pool.calls_own(&scan.calls) {
+        return own;
+    }
+    let (names, b) = (scan.calls.clone(), b.clone());
+    // One that cannot be looked up is taken for the program's.
+    it.unlocked(move || match &*b {
+        Backend::Postgres(p) => p.look_up_fns(&names),
+        _ => Ok(false),
+    })
+    .unwrap_or(true)
+}
+
+/// `f` on a connection of the pool's own, reset before it goes back, or closed when that
+/// fails (see `isolated`).
+fn isolated_run<T: Send>(it: &mut Interp, b: &Arc<Backend>, f: impl FnOnce(&mut Pinned) -> Result<T, String> + Send) -> Result<T, String> {
+    let mut c = checkout_for_tx(it, b)?;
+    let b = b.clone();
+    it.unlocked(move || {
+        let r = f(&mut c);
+        if reset_session(&mut c) {
+            b.give_back(c);
+        } else {
+            b.discard(c);
         }
-        None => Err("outside `db.transaction` this connection is shared by every request, so what this changes would reach others: use `set local` (or `set_config(..., true)`) inside `db.transaction`".to_string()),
+        r
+    })
+}
+
+/// On MySQL, a statement that commits the transaction it is in by itself (`truncate`, `create
+/// table`, ...), inside `db.transaction`: refused before it runs, so that what ran before it can
+/// still be rolled back, as PostgreSQL and SQLite roll back theirs; the server would have
+/// committed it, and the rest after it outside any transaction (FEEDBACK55.md, Q-728; branch
+/// feedback55).
+fn no_commit_inside(it: &Interp, b: &Arc<Backend>, scan: &crate::sql::Scan, f: &str, line: u32) -> Result<(), Ctrl> {
+    if !b.is_mysql() || !it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|t| Arc::ptr_eq(&t.backend, b)) {
+        return Ok(());
+    }
+    match scan.commits_by_itself() {
+        Some(stmt) => fail(line, commits_by_itself(f, stmt)),
+        None => Ok(()),
+    }
+}
+
+/// What MySQL's driver says when a statement ended the transaction it was in (the server's
+/// flag after it: a procedure's `create table`, `execute immediate`, a block's).
+pub(crate) const COMMITTED: &str = "\u{1}committed by itself";
+
+/// A statement after which MySQL was no longer in the transaction: it committed what ran before
+/// it, which can no longer be rolled back; the function ends here, as at a refusal
+/// (FEEDBACK55.md, Q-728; branch feedback55).
+fn committed_inside<T>(res: &Result<T, String>, scan: &crate::sql::Scan, f: &str, line: u32) -> Result<(), Ctrl> {
+    match res {
+        Err(e) if e == COMMITTED => fail(line, format!(
+            "`{}(\"{}\")` inside a transaction: MySQL and MariaDB committed the transaction around this statement by itself, with what ran before it, which can no longer be rolled back: run it before or after the transaction",
+            f,
+            scan.sql.trim()
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn commits_by_itself(f: &str, stmt: &str) -> String {
+    format!(
+        "`{}(\"{}\")` inside a transaction: MySQL and MariaDB commit the transaction around this statement by itself, and what ran before it could no longer be rolled back: run it before or after the transaction",
+        f, stmt
+    )
+}
+
+/// The values a statement is given, as every database takes them: an error is given back, and
+/// a function refused, where it was stored as its text (FEEDBACK55.md, Q-727); one map where
+/// the SQL has no placeholder is no value (Q-747); and placeholders with no values are refused
+/// where SQLite stored nulls (Q-729; branch feedback55).
+fn given_values(scan: &crate::sql::Scan, params: Vec<Value>) -> Result<Vec<Value>, String> {
+    // Not a value: not looked at (found in review).
+    if matches!(params.as_slice(), [Value::Map(_)]) && !scan.named && scan.count == 0 {
+        return Ok(Vec::new());
+    }
+    match scan.by_names(&params) {
+        Some(m) => {
+            for name in scan.names() {
+                if let Some(v) = m.get(name).or_else(|| m.get(format!(":{}", name).as_str())) {
+                    storable(v, false, false).map_err(|why| format!("value :{}{}", name, why))?;
+                }
+            }
+        }
+        None => {
+            for (i, v) in params.iter().enumerate() {
+                storable(v, true, false).map_err(|why| format!("value {}{}", i + 1, why))?;
+            }
+        }
+    }
+    if params.is_empty() && scan.count > 0 {
+        return Err(crate::sql::wrong_count(scan.count, 0));
+    }
+    Ok(params)
+}
+
+/// Whether a value can be stored: what it holds, if a list or a map, too (`inside`). An error
+/// the call was given itself (`given`) is told by the interpreter ("it failed before this
+/// call"); one in a map of named values, or inside another value, is told here.
+fn storable(v: &Value, given: bool, inside: bool) -> Result<(), String> {
+    match v {
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Str(_) | Value::Html(_) => Ok(()),
+        Value::List(l) => l.iter().try_for_each(|x| storable(x, false, true)),
+        Value::Map(m) => m.values().try_for_each(|x| storable(x, false, true)),
+        Value::Err(..) if given => Err(" cannot be stored: got error".to_string()),
+        Value::Err(e, _, at) => Err(format!(
+            "{}: got error (it failed before this call, {})",
+            if inside { " holds an error, which cannot be stored" } else { " cannot be stored" },
+            at.before(&crate::value::told(|| e.display()))
+        )),
+        other if inside => Err(format!(" holds a {t}, and a {t} cannot be stored in the database", t = other.type_name())),
+        other => Err(format!(": a {} cannot be stored in the database", other.type_name())),
     }
 }
 
@@ -1142,31 +1219,33 @@ fn from_sql(v: ValueRef, kind: Col) -> Value {
 /// Binds `?` parameters from the arguments, or `:name` parameters from a
 /// single map argument. As with Postgres and MySQL, every name needs a
 /// value; keys the query does not use are left alone, so one map can serve
-/// queries put together from optional parts.
+/// queries put together from optional parts. A map is the values by name only where the SQL
+/// names them (`?1` is a number: FEEDBACK55.md, Q-748), and is no value where the SQL has no
+/// placeholder (Q-747; branch feedback55); a key is a name with any of SQLite's signs
+/// (`:id`, `@id`, `$id`, `#id`), or as written.
 fn bind(stmt: &mut rusqlite::Statement, params: &[Value]) -> Result<(), String> {
+    let want = stmt.parameter_count();
     if let [Value::Map(m)] = params {
-        if stmt.parameter_count() > 0 && stmt.parameter_name(1).is_some() {
-            let mut bound = vec![false; stmt.parameter_count()];
-            for (k, v) in m.iter() {
-                let name = if k.starts_with([':', '@', '$']) { k.to_string() } else { format!(":{}", k) };
-                match stmt.parameter_index(&name).map_err(|e| e.to_string())? {
-                    Some(i) => {
-                        stmt.raw_bind_parameter(i, to_sql(v)).map_err(|e| e.to_string())?;
-                        bound[i - 1] = true;
-                    }
-                    None => {}
+        fn named(n: Option<&str>) -> Option<&str> {
+            n.filter(|n| n.starts_with([':', '@', '$', '#']))
+        }
+        if want == 0 {
+            return Ok(());
+        }
+        if (1..=want).any(|i| named(stmt.parameter_name(i)).is_some()) {
+            for i in 1..=want {
+                let name = stmt.parameter_name(i).map(str::to_string);
+                let v = named(name.as_deref()).and_then(|n| m.get(&n[1..]).or_else(|| m.get(n)));
+                match v {
+                    Some(v) => stmt.raw_bind_parameter(i, to_sql(v)).map_err(|e| e.to_string())?,
+                    None => return Err(format!("no value for {}", name.as_deref().unwrap_or("?"))),
                 }
-            }
-            if let Some(i) = bound.iter().position(|b| !b) {
-                let name = stmt.parameter_name(i + 1).unwrap_or("?").to_string();
-                return Err(format!("no value for {}", name));
             }
             return Ok(());
         }
     }
-    let want = stmt.parameter_count();
     if params.len() != want {
-        return Err(format!("the query has {} parameter{}, got {}", want, if want == 1 { "" } else { "s" }, params.len()));
+        return Err(crate::sql::wrong_count(want, params.len()));
     }
     for (i, v) in params.iter().enumerate() {
         stmt.raw_bind_parameter(i + 1, to_sql(v)).map_err(|e| e.to_string())?;
@@ -1266,104 +1345,18 @@ fn tx_end(it: &mut Interp, mark: usize, committed: bool) {
     }
 }
 
-/// The statement's first two words, past spaces and comments, as they are written ("" for
-/// none): read in place, as every `db.exec` reads them, and a string made each time put 100k
-/// inserts behind Python's.
-fn two_words(sql: &str) -> (&str, &str) {
-    let mut s = sql;
-    loop {
-        s = s.trim_start();
-        if let Some(r) = s.strip_prefix("--") {
-            s = r.split_once('\n').map_or("", |(_, r)| r);
-        } else if let Some(r) = s.strip_prefix("/*") {
-            s = r.split_once("*/").map_or("", |(_, r)| r);
-        } else {
-            break;
-        }
-    }
-    let mut w = s.split(|c: char| !c.is_ascii_alphabetic()).filter(|w| !w.is_empty());
-    (w.next().unwrap_or(""), w.next().unwrap_or(""))
-}
-
-/// The statement's first word or two, past spaces and comments, in lower case.
-fn first_words(sql: &str) -> String {
-    match two_words(sql) {
-        (a, "") => a.to_ascii_lowercase(),
-        (a, b) => format!("{} {}", a, b).to_ascii_lowercase(),
-    }
-}
-
-/// The statements of a script, split at `;` outside quotes and comments, each with text.
-fn statements(sql: &str) -> Vec<&str> {
-    let b = sql.as_bytes();
-    let (mut out, mut start, mut i) = (Vec::new(), 0, 0);
-    while i < b.len() {
-        match b[i] {
-            q @ (b'\'' | b'"') => {
-                i += 1;
-                while i < b.len() && b[i] != q {
-                    i += 1;
-                }
-            }
-            b'-' if b.get(i + 1) == Some(&b'-') => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                    i += 1;
-                }
-                i += 1;
-            }
-            b';' => {
-                out.push(&sql[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    out.push(&sql[start.min(sql.len())..]);
-    out.into_iter().filter(|s| !two_words(s).0.is_empty()).collect()
-}
-
-/// Whether a statement begins or ends a transaction: `begin`, `commit`, `savepoint`...
-fn controls_tx(statement: &str) -> bool {
-    let (first, second) = two_words(statement);
-    ["begin", "commit", "end", "rollback", "savepoint", "release", "abort"].iter().any(|w| first.eq_ignore_ascii_case(w))
-        || (first.eq_ignore_ascii_case("start") && second.eq_ignore_ascii_case("transaction"))
-}
-
-/// A transaction begun or ended by hand: one such statement alone, or, on a server's shared
-/// connection (`server`), one anywhere in a script, as `begin; insert ...` left the lane in it
-/// (found in review). SQLite checks a script's end itself (see `exec`).
-pub fn tx_control_in(sql: &str, server: bool) -> bool {
-    let all = statements(sql);
-    if server {
-        all.iter().any(|s| controls_tx(s))
-    } else {
-        all.len() == 1 && controls_tx(all[0])
-    }
-}
-
-/// One statement that begins or ends a transaction, alone.
-pub fn tx_control(sql: &str) -> bool {
-    tx_control_in(sql, false)
-}
-
 /// A transaction begun or ended by hand, one statement alone: a `begin` whose `commit` was
 /// never reached left the shared connection in it, and every later request's writes with it
 /// (FEEDBACK44.md, Q-580; branch feedback40-43). A script of several statements may hold one
-/// of its own, and is checked for leaving it open where it runs.
-fn no_tx_control(sql: &str, f: &str, line: u32) -> Result<(), Ctrl> {
+/// of its own, and is checked for leaving it open where it runs. The statements are the
+/// database's own (a function's body is one: FEEDBACK55.md, Q-746; branch feedback55).
+fn no_tx_control(scan: &crate::sql::Scan, f: &str, line: u32) -> Result<(), Ctrl> {
     // A query has no use for one anywhere.
-    if tx_control_in(sql, f != "db.exec") {
+    if scan.tx_control(f != "db.exec") {
         return fail(line, format!(
             "`{}(\"{}\")`: write `db.transaction(() => ...)`, which commits, rolls back when something fails, and keeps other requests out of it",
             f,
-            sql.trim()
+            scan.sql.trim()
         ));
     }
     Ok(())
@@ -1802,23 +1795,42 @@ pub(crate) fn warn_lossy_columns(sql: &str) {
 /// `db.exec(sql, ...params)`: `{ changes, last_id }`. Without parameters the
 /// text may hold several statements (a schema, for example).
 fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    exec_as(it, args, line, false)
+}
+
+/// `db.exec`, or Quillo's own statement (`own`), which may make its table inside the program's
+/// transaction.
+fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
     let on = it.db_on.take();
     let sql = sql_arg(&args, "db.exec", line)?;
-    no_tx_control(&sql, "db.exec", line)?;
-    it.wrote_req = Some(crate::httpd::request_number());
-    let params = args[1..].to_vec();
     let b = match backend_on(it, on) {
         Ok(b) => b,
+        Err(e) => {
+            it.wrote_req = Some(crate::httpd::request_number());
+            return Ok(db_err(e));
+        }
+    };
+    // Read as this database reads it, once for each text (FEEDBACK55.md, Q-746; branch
+    // feedback55).
+    let scan = crate::sql::scan(b.dialect(), &sql);
+    no_tx_control(&scan, "db.exec", line)?;
+    it.wrote_req = Some(crate::httpd::request_number());
+    let params = match given_values(&scan, args[1..].to_vec()) {
+        Ok(p) => p,
         Err(e) => return Ok(db_err(e)),
     };
     // A change to the session, noted or refused (FEEDBACK44.md, Q-581).
-    if let Err(e) = session_change(it, &b, &sql) {
+    if let Err(e) = session_change(it, &b, &scan, &params) {
         return Ok(db_err(e));
     }
     // On a server's shared connection, a script's `begin` anywhere (found in review).
-    if !matches!(&*b, Backend::Sqlite(_)) && tx_control_in(&sql, true) {
+    if !matches!(&*b, Backend::Sqlite(_)) && scan.tx_control(true) {
         return fail(line, "`db.exec`: this SQL begins or ends a transaction, which on a shared connection would hold every later request in it: write `db.transaction(() => ...)`, which commits, rolls back when something fails, and keeps other requests out of it");
     }
+    if !own {
+        no_commit_inside(it, &b, &scan, "db.exec", line)?;
+    }
+    let alone = isolated(it, &b, &scan);
     // Timed for /_quillo/health/queries (branch query-stats).
     let started = std::time::Instant::now();
     let res = match &*b {
@@ -1851,6 +1863,10 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 Ok(Value::map(m))
             })()
         }
+        Backend::Postgres(_) if alone => {
+            let sql = sql.clone();
+            isolated_run(it, &b, move |c| c.exec(&sql, &params))
+        }
         Backend::Postgres(pool) => match shared_lanes(it, &b, pool) {
             Some(lanes) => {
                 let sql = sql.clone();
@@ -1869,6 +1885,13 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
     };
     crate::querystats::record(&sql, started.elapsed().as_secs_f64() * 1000.0, res.is_ok());
+    // Functions made or dropped: what the names called are is looked up again (see `isolated`).
+    if let (true, Backend::Postgres(p)) = (scan.defines, &*b) {
+        p.forget_fns();
+    }
+    if !own {
+        committed_inside(&res, &scan, "db.exec", line)?;
+    }
     // An update that changed no row (`set seen = 1 where seen = 0`, once all
     // are seen) is not announced: a loader marking what it shows as read
     // would otherwise wake itself for ever (FEEDBACK13.md, Q-090; branch
@@ -1993,10 +2016,17 @@ fn exec_many(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if rows.is_empty() {
         return Ok(changes(0));
     }
-    let server = match backend_on(it, on) {
-        Ok(b) => !matches!(&*b, Backend::Sqlite(_)),
+    let b = match backend_on(it, on) {
+        Ok(b) => b,
         Err(e) => return Ok(db_err(e)),
     };
+    let server = !matches!(&*b, Backend::Sqlite(_));
+    // Its rows are all or none, in a transaction of its own (FEEDBACK55.md, Q-728).
+    if b.is_mysql() {
+        if let Some(stmt) = crate::sql::scan(b.dialect(), &sql).commits_by_itself() {
+            return fail(line, commits_by_itself("db.exec_many", stmt));
+        }
+    }
     let width = rows[0].len();
     if let Some((i, r)) = rows.iter().enumerate().find(|(_, r)| r.len() != width) {
         return Ok(db_err(format!("row {} has {} value{}, the first has {}", i + 1, r.len(), if r.len() == 1 { "" } else { "s" }, width)));
@@ -2053,12 +2083,12 @@ fn values_tuple(sql: &str, width: usize) -> Option<String> {
 /// `db.exec` / `db.query` on connection `on` (None: the program's).
 pub(crate) fn exec_on(it: &mut Interp, on: Option<usize>, args: Vec<Value>) -> R {
     it.db_on = on;
-    exec(it, args, 0)
+    exec_as(it, args, 0, true)
 }
 
 pub(crate) fn query_on(it: &mut Interp, on: Option<usize>, args: Vec<Value>) -> R {
     it.db_on = on;
-    query(it, args, 0)
+    query_as(it, args, 0, None, true)
 }
 
 pub(crate) fn kind_on(it: &mut Interp, on: Option<usize>) -> bool {
@@ -2444,15 +2474,33 @@ pub(crate) fn call_done(it: &mut Interp, id: &str, status: u16, answer: &str) {
 }
 
 fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
+    let b = backend_on(it, on)?;
+    let scan = crate::sql::scan(b.dialect(), &sql);
+    select_in(it, on, b, &scan, sql, params, limit)
+}
+
+/// `select` on a database already found, its SQL read.
+fn select_in(
+    it: &mut Interp,
+    on: Option<usize>,
+    b: Arc<Backend>,
+    scan: &crate::sql::Scan,
+    sql: String,
+    params: Vec<Value>,
+    limit: Option<usize>,
+) -> Result<Vec<Value>, String> {
     if it.writes_noted() && !only_reads(&sql) && it.no_writes("SQL that writes", 0).is_err() {
         return Err(crate::interp::PREFETCH_REFUSED.into());
     }
-    let b = backend_on(it, on)?;
+    let params = given_values(scan, params)?;
+    // Refused before a replica would take it (found in review).
+    session_change(it, &b, scan, &params)?;
+    let alone = isolated(it, &b, scan);
     // Timed for /_quillo/health/queries (branch query-stats).
     let started = std::time::Instant::now();
     // A read, to a replica: if it fails there, the primary answers (and the
     // replica is left out for ten seconds).
-    if let Some((reps, i)) = reader(it, &b, &sql) {
+    if let Some((reps, i)) = reader(it, &b, &sql).filter(|_| !alone) {
         let r = reps.list[i].clone();
         let (q, p) = (sql.clone(), params.clone());
         match pooled_run(it, &r, move |c| c.query(&q, &p, limit)) {
@@ -2467,7 +2515,6 @@ fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, l
             }
         }
     }
-    session_change(it, &b, &sql)?;
     if !only_reads(&sql) {
         it.wrote_req = Some(crate::httpd::request_number());
     }
@@ -2475,6 +2522,10 @@ fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, l
         Backend::Sqlite(m) => {
             let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             tx_gone(&b, &c).and_then(|_| rows(&c, &sql, &params, limit))
+        }
+        Backend::Postgres(_) if alone => {
+            let sql = sql.clone();
+            isolated_run(it, &b, move |c| c.query(&sql, &params, limit))
         }
         Backend::Postgres(pool) => match shared_lanes(it, &b, pool) {
             Some(lanes) => awaited(crate::httpd::await_elsewhere(Box::pin(lanes.query(crate::httpd::request_number(), sql.clone(), params, limit)))),
@@ -2498,20 +2549,36 @@ fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, l
 
 /// `db.query(sql, ...params)`: every row, as maps from column to value.
 fn query(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let on = it.db_on.take();
-    let sql = sql_arg(&args, "db.query", line)?;
-    no_tx_control(&sql, "db.query", line)?;
-    Ok(select(it, on, sql, args[1..].to_vec(), None).map(Value::list).unwrap_or_else(db_err))
+    query_as(it, args, line, None, false)
 }
 
 /// `db.one(sql, ...params)`: the first row, or null.
 fn one(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    query_as(it, args, line, Some(1), false)
+}
+
+/// `db.query`, or `db.one` (`limit` 1), or Quillo's own (`own`).
+fn query_as(it: &mut Interp, args: Vec<Value>, line: u32, limit: Option<usize>, own: bool) -> R {
     let on = it.db_on.take();
-    let sql = sql_arg(&args, "db.one", line)?;
-    no_tx_control(&sql, "db.one", line)?;
-    Ok(select(it, on, sql, args[1..].to_vec(), Some(1))
-        .map(|r| r.into_iter().next().unwrap_or(Value::Nil))
-        .unwrap_or_else(db_err))
+    let f = if limit.is_some() { "db.one" } else { "db.query" };
+    let sql = sql_arg(&args, f, line)?;
+    let b = match backend_on(it, on) {
+        Ok(b) => b,
+        Err(e) => return Ok(db_err(e)),
+    };
+    let scan = crate::sql::scan(b.dialect(), &sql);
+    no_tx_control(&scan, f, line)?;
+    if !own {
+        no_commit_inside(it, &b, &scan, f, line)?;
+    }
+    let rows = select_in(it, on, b, &scan, sql, args[1..].to_vec(), limit);
+    if !own {
+        committed_inside(&rows, &scan, f, line)?;
+    }
+    Ok(match limit {
+        Some(_) => rows.map(|r| r.into_iter().next().unwrap_or(Value::Nil)).unwrap_or_else(db_err),
+        None => rows.map(Value::list).unwrap_or_else(db_err),
+    })
 }
 
 /// `db.transaction(() => { ... })`: commits if the function returns normally,
@@ -2657,7 +2724,7 @@ pub(crate) fn attempt(
                     Err(e) => return (Ok(db_err(e)), false),
                 };
                 c.watch_conflicts(true);
-                it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(TxConn { backend: b.clone(), conn: Some(c), depth: 0, session: false });
+                it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(TxConn { backend: b.clone(), conn: Some(c), depth: 0 });
             }
             let depth = {
                 let mut g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2713,9 +2780,14 @@ pub(crate) fn attempt(
             // is over, whatever the function made of the error.
             let lost = depth == 1 && conflicted(it);
             let commit = ok(&r) && !lost;
+            // PostgreSQL's connection is reset as the outermost ends, in the same round trip:
+            // what a function of the program's or a `do` block set in it (`set_config(...,
+            // false)`, `pg_temp`) cannot all be read beforehand (FEEDBACK55.md, Q-708; branch
+            // feedback55).
+            let reset = if matches!(&*b, Backend::Postgres(_)) { format!("; {}", pg::RESET) } else { String::new() };
             let end = match (commit, depth == 1) {
-                (true, true) => "commit".to_string(),
-                (false, true) => "rollback".to_string(),
+                (true, true) => format!("commit{}", reset),
+                (false, true) => format!("rollback{}", reset),
                 (true, false) => format!("release savepoint quillo_tx_{}", depth),
                 (false, false) => format!("rollback to savepoint quillo_tx_{d}; release savepoint quillo_tx_{d}", d = depth),
             };
@@ -2733,12 +2805,13 @@ pub(crate) fn attempt(
                     None
                 }
             };
-            if let Some(TxConn { conn: Some(mut c), session, .. }) = done {
+            if let Some(TxConn { conn: Some(mut c), .. }) = done {
                 c.watch_conflicts(false);
-                if session && !reset_session(&mut c) {
-                    pool.discard(c);
-                } else {
+                // Reset with its end, or now where that failed; closed where that fails too.
+                if reset.is_empty() || ended.is_ok() || reset_session(&mut c) {
                     pool.give_back(c);
+                } else {
+                    pool.discard(c);
                 }
             }
             match ended {
@@ -3025,7 +3098,7 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             _ => {
                 match checkout_for_tx(it, &p.b) {
                     Ok(c) => {
-                        it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(TxConn { backend: p.b.clone(), conn: Some(c), depth: 1, session: false });
+                        it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(TxConn { backend: p.b.clone(), conn: Some(c), depth: 1 });
                         let begin = if p.kind == Kind::Pg { "begin".to_string() } else { format!("xa start '{}'", p.gid) };
                         pooled_run(it, &p.b, move |c| c.batch(&begin))
                     }
@@ -3067,8 +3140,9 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             let mut g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             g.iter().position(|t| Arc::ptr_eq(&t.backend, &p.b)).map(|i| g.remove(i))
         };
-        if let Some(TxConn { conn: Some(mut c), session, .. }) = taken {
-            if session && !reset_session(&mut c) {
+        // Reset as any transaction's (FEEDBACK55.md, Q-708).
+        if let Some(TxConn { conn: Some(mut c), .. }) = taken {
+            if !reset_session(&mut c) {
                 p.b.discard(c);
             } else {
                 p.b.give_back(c);
@@ -3230,7 +3304,7 @@ pub fn recover(it: &mut Interp) {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_words, kind_of, statements, tx_control_in, two_words, values_tuple};
+    use super::{kind_of, values_tuple};
 
     // The first words read in place, as every `db.exec` reads them: any case, past comments
     // and spaces, and a transaction's control found among a script's statements.
@@ -3255,35 +3329,39 @@ mod tests {
 
     #[test]
     fn the_first_words_are_read_in_place() {
-        assert_eq!(two_words("  -- a note\n /* and */ Start   Transaction;"), ("Start", "Transaction"));
-        assert_eq!(two_words("begin"), ("begin", ""));
-        assert_eq!(two_words(""), ("", ""));
-        assert_eq!(two_words("-- only a note"), ("", ""));
-        assert_eq!(two_words("/* never closed"), ("", ""));
-        assert_eq!(two_words("insert(1)"), ("insert", ""));
-        assert_eq!(first_words("SET Local x = 1"), "set local");
-        assert_eq!(first_words("Listen"), "listen");
-        assert_eq!(first_words(" ; "), "");
-        for (sql, alone, server) in [
-            ("BEGIN", true, true),
-            ("  commit ;", true, true),
-            ("Start Transaction", true, true),
-            ("start", false, false),
-            ("starting", false, false),
-            ("beginning()", false, false),
-            ("ROLLBACK to savepoint a", true, true),
-            ("select 'begin'", false, false),
-            ("-- begin\nselect 1", false, false),
-            ("begin; insert into t values (1)", false, true),
-            ("insert into t values (1); COMMIT", false, true),
-            ("insert into t values (';begin')", false, false),
-            ("", false, false),
-            (";;", false, false),
-        ] {
-            assert_eq!(tx_control_in(sql, false), alone, "{}", sql);
-            assert_eq!(tx_control_in(sql, true), server, "{}", sql);
+        // As each database reads them now (src/sql.rs; FEEDBACK55.md, Q-746; branch feedback55).
+        for d in crate::sql::Dialect::ALL {
+            let head = |sql: &str| crate::sql::scan(d, sql).first_words().map(|(a, b)| format!("{} {}", a, b).trim().to_ascii_lowercase());
+            assert_eq!(head("  -- a note\n /* and */ Start   Transaction;").as_deref(), Some("start transaction"));
+            assert_eq!(head("begin").as_deref(), Some("begin"));
+            assert_eq!(head(""), None);
+            assert_eq!(head("-- only a note"), None);
+            assert_eq!(head("/* never closed"), None);
+            assert_eq!(head("insert(1)").as_deref(), Some("insert"));
+            assert_eq!(head("SET Local x = 1").as_deref(), Some("set local"));
+            assert_eq!(head(" ; "), None);
+            for (sql, alone, server) in [
+                ("BEGIN", true, true),
+                ("  commit ;", true, true),
+                ("Start Transaction", true, true),
+                ("start", false, false),
+                ("starting", false, false),
+                ("beginning()", false, false),
+                ("ROLLBACK to savepoint a", true, true),
+                ("select 'begin'", false, false),
+                ("-- begin\nselect 1", false, false),
+                ("begin; insert into t values (1)", false, true),
+                ("insert into t values (1); COMMIT", false, true),
+                ("insert into t values (';begin')", false, false),
+                ("", false, false),
+                (";;", false, false),
+            ] {
+                let s = crate::sql::scan(d, sql);
+                assert_eq!(s.tx_control(false), alone, "{:?} {}", d, sql);
+                assert_eq!(s.tx_control(true), server, "{:?} {}", d, sql);
+            }
+            assert_eq!(crate::sql::scan(d, "a; ; -- x\n; b").stmts.len(), 2);
         }
-        assert_eq!(statements("a; ; -- x\n; b").len(), 2);
     }
 
     // An insert of one row's `?`s, with nothing after them, goes as many rows a statement;

@@ -5377,10 +5377,10 @@ impl Checker {
             _ => return,
         };
         let [_, Expr::List(_)] = args else { return };
-        // Outside quoted text and names and comments (found in review).
-        static NOISE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        let noise = NOISE.get_or_init(|| regex::Regex::new(r#"(?s)--[^\n]*|/\*.*?\*/|'(?:[^']|'')*'|"(?:[^"]|"")*""#).unwrap());
-        let marks = noise.replace_all(&sql, " ").matches('?').count();
+        // As the databases read it (outside quoted text, names and comments), and not where
+        // PostgreSQL takes an array: `= any(?)`, `?::int[]` (FEEDBACK55.md, Q-755; branch
+        // feedback55).
+        let marks = crate::sql::values_for_a_list(&sql);
         if marks == 0 {
             return;
         }
@@ -5827,7 +5827,9 @@ impl Checker {
         // `db.exec("begin")`, refused as it runs (FEEDBACK44.md, Q-580; branch feedback40-43).
         if sig.builtin && matches!(name, "db.query" | "db.one" | "db.exec") {
             if let Some(Expr::Lit(Lit::Str(s))) = arg_exprs.first() {
-                if crate::db::tx_control(s) {
+                // As every database reads it: a function's body is not a `begin` (FEEDBACK55.md,
+                // Q-746; branch feedback55).
+                if crate::sql::tx_control_everywhere(s) {
                     self.error(format!("`{}(\"{}\")`: write `db.transaction(() => ...)`, which commits, rolls back when something fails, and keeps other requests out of it", name, s.trim()));
                 }
             }
@@ -5839,6 +5841,18 @@ impl Checker {
         }
         if sig.builtin && matches!(sig.name.as_str(), "db.transaction" | "idempotent") {
             self.retried_effects(name, arg_exprs);
+            // A key misspelled was the default, quietly (FEEDBACK55.md, Q-738; branch feedback55).
+            if sig.name == "db.transaction" {
+                if let [Expr::Map(opts), _, ..] = arg_exprs {
+                    for (k, _) in opts {
+                        if !crate::txn::OPTIONS.contains(&k.as_str()) {
+                            let near = crate::txn::OPTIONS.iter().map(|o| (edit_distance(k, o), *o)).filter(|(d, _)| *d <= 2).min();
+                            let hint = near.map_or_else(|| format!(" ({})", crate::txn::OPTIONS.join(", ")), |(_, o)| format!(" (did you mean `{}`?)", o));
+                            self.error(format!("`{}` has no option `{}`{}", name, k, hint));
+                        }
+                    }
+                }
+            }
         }
         // Effects.
         let (allowed, restrictor) = match self.fns.last() {

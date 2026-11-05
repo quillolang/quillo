@@ -45,6 +45,12 @@ pub struct Conn {
     aside: bool,
     /// The decimals of a `money` value here, once a result has had one (`money_digits`).
     money: Option<u32>,
+    /// Statements prepared with the types of some values declared (`declared`), or None where
+    /// PostgreSQL would not take them: by the types and the SQL.
+    typed: HashMap<String, Option<postgres::Statement>>,
+    /// In a transaction Quillo began (`batch`), where a statement that fails to prepare would
+    /// end it.
+    in_tx: bool,
 }
 
 pub struct Pool {
@@ -56,9 +62,54 @@ pub struct Pool {
     freed: Condvar,
     max: usize,
     lanes: OnceLock<Arc<Lanes>>,
+    /// Names called as functions, and whether one of them is not PostgreSQL's own (a function
+    /// of the program's may change the session: see `db::isolated`).
+    own_fns: Mutex<HashMap<String, bool>>,
 }
 
+/// What a session changed is set back with, its prepared statements kept (Quillo's own among
+/// them): `discard all` but `deallocate all` (FEEDBACK44.md, Q-581).
+pub const RESET: &str = "set session authorization default; reset all; close all; discard temp; select pg_advisory_unlock_all(); unlisten *";
+
+/// Which of the names given are functions of the database's own (not in `pg_catalog`).
+const OWN_FNS: &str = "select distinct p.proname::text as name from pg_proc p join pg_namespace n on n.oid = p.pronamespace \
+                       where p.proname = any($1::text[]) and n.nspname not in ('pg_catalog', 'information_schema')";
+
 impl Pool {
+    /// Whether one of these names is a function of the database's own, as far as known: None
+    /// when a name was never looked up (`look_up_fns`).
+    pub fn calls_own(&self, names: &[Box<str>]) -> Option<bool> {
+        let known = self.own_fns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut own = false;
+        for n in names {
+            own |= *known.get(&**n)?;
+        }
+        Some(own)
+    }
+
+    /// Looks the names up (on a connection of the pool's), and keeps what they are.
+    pub fn look_up_fns(&self, names: &[Box<str>]) -> Result<bool, String> {
+        let mut c = self.checkout_nested()?;
+        let list: Vec<Value> = names.iter().map(|n| Value::str(&**n)).collect();
+        let rows = c.query(OWN_FNS, &[Value::list(list)], None);
+        self.give_back(c);
+        let rows = rows?;
+        let own: Vec<String> = rows.iter().filter_map(|r| if let Value::Map(m) = r { m.get("name").map(|v| v.display().to_string()) } else { None }).collect();
+        let mut known = self.own_fns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if known.len() >= 4096 {
+            known.clear();
+        }
+        for n in names {
+            known.insert(n.to_string(), own.iter().any(|o| o == &**n));
+        }
+        Ok(!own.is_empty())
+    }
+
+    /// The program made, replaced or dropped functions: what names are is looked up again.
+    pub fn forget_fns(&self) {
+        self.own_fns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+    }
+
     /// Parses the URL and opens one connection to check it. TLS is required,
     /// and the server's certificate and name checked, for a server on
     /// another machine; it is used on this one when the server offers it.
@@ -84,6 +135,7 @@ impl Pool {
             freed: Condvar::new(),
             max,
             lanes: OnceLock::new(),
+            own_fns: Mutex::new(HashMap::new()),
         };
         let mut first = pool.checkout()?;
         // A tenant's schema is made when the program first uses it.
@@ -123,6 +175,7 @@ impl Pool {
             freed: Condvar::new(),
             max,
             lanes: OnceLock::new(),
+            own_fns: Mutex::new(HashMap::new()),
         };
         let mut c = pool.checkout()?;
         match c.batch(&format!("create schema \"{}\"", schema)) {
@@ -134,7 +187,7 @@ impl Pool {
 
     fn connect(&self) -> Result<Conn, String> {
         let client = self.config.connect(self.tls.clone()).map_err(|e| describe(&e))?;
-        Ok(Conn { client, stmts: HashMap::new(), conflict: None, aside: false, money: None })
+        Ok(Conn { client, stmts: HashMap::new(), conflict: None, aside: false, money: None, typed: HashMap::new(), in_tx: false })
     }
 
     /// An idle connection or a new one, or None when all `max` are taken.
@@ -616,22 +669,73 @@ impl Conn {
         Ok(s)
     }
 
-    /// Prepares `sql` for `params`, casting from text where needed.
+    /// Prepares `sql` for `params`, casting from text where needed, and with the types of
+    /// values PostgreSQL would take as text declared (`declared`).
     fn statement(&mut self, sql: &str, params: &[Value]) -> Result<postgres::Statement, String> {
         let stmt = self.prepare(sql)?;
         let want = stmt.params().len();
         if want != params.len() {
-            return Err(format!("the query has {} parameter{}, got {}", want, if want == 1 { "" } else { "s" }, params.len()));
+            return Err(crate::sql::wrong_count(want, params.len()));
         }
-        match casts_for(sql, stmt.params()) {
+        let casts = casts_for(sql, stmt.params());
+        if let Some(types) = declared(stmt.params(), params) {
+            if let Some(s) = self.typed(casts.as_deref().unwrap_or(sql), types)? {
+                return Ok(s);
+            }
+        }
+        match casts {
             None => Ok(stmt),
             Some(cast_sql) => self.prepare(&cast_sql),
         }
     }
 
+    /// `sql` prepared with the types `declared` gives, or with those of them PostgreSQL takes
+    /// (not `x = ?` with a text column and an int), or None for none: worked out once, and kept.
+    fn typed(&mut self, sql: &str, (sent, mut want): (Vec<Type>, Vec<Type>)) -> Result<Option<postgres::Statement>, String> {
+        let key = typed_key(sql, &want);
+        if let Some(s) = self.typed.get(&key) {
+            return Ok(s.clone());
+        }
+        let mut s = None;
+        for _ in 0..TRIES {
+            match self.probe(sql, &want)? {
+                Ok(st) => {
+                    s = Some(st);
+                    break;
+                }
+                Err(at) => {
+                    if !as_sent_near(sql, at, &sent, &mut want) {
+                        break;
+                    }
+                }
+            }
+        }
+        if self.typed.len() >= 256 {
+            self.typed.clear();
+        }
+        self.typed.insert(key, s.clone());
+        Ok(s)
+    }
+
+    /// `sql` prepared with these types, or where PostgreSQL's refusal points (see `typed`). In
+    /// a transaction it is tried in a savepoint, as a statement that fails to prepare ends the
+    /// transaction.
+    fn probe(&mut self, sql: &str, types: &[Type]) -> Result<Result<postgres::Statement, Option<usize>>, String> {
+        if self.in_tx {
+            self.client.batch_execute("savepoint quillo_types").map_err(|e| describe(&e))?;
+        }
+        let s = self.client.prepare_typed(sql, types).map_err(|e| refused_at(&e));
+        if self.in_tx {
+            let back = if s.is_ok() { "release savepoint quillo_types" } else { "rollback to savepoint quillo_types; release savepoint quillo_types" };
+            self.client.batch_execute(back).map_err(|e| describe(&e))?;
+        }
+        Ok(s)
+    }
+
     pub fn query(&mut self, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
-        let (sql, params) = translate(sql, params)?;
-        let stmt = self.statement(&sql, &params)?;
+        let (scan, params) = translate(sql, params)?;
+        let sql = scan.native();
+        let stmt = self.statement(sql, &params)?;
         let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
         let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
         let rows = self.client.query(&stmt, &refs);
@@ -647,13 +751,13 @@ impl Conn {
     /// `{ changes, last_id }`; Postgres has no last insert id, so use
     /// `insert ... returning id` with `db.one` for that.
     pub fn exec(&mut self, sql: &str, params: &[Value]) -> Result<Value, String> {
-        let changes = if params.is_empty() && has_several_statements(sql) {
+        let changes = if params.is_empty() && several_statements(sql) {
             let r = self.client.batch_execute(sql);
             r.map_err(|e| self.failed(&e))?;
             Value::Nil
         } else {
-            let (sql, params) = translate(sql, params)?;
-            let stmt = self.statement(&sql, &params)?;
+            let (scan, params) = translate(sql, params)?;
+            let stmt = self.statement(scan.native(), &params)?;
             let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
             let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
             let r = self.client.execute(&stmt, &refs);
@@ -667,6 +771,10 @@ impl Conn {
 
     pub fn batch(&mut self, sql: &str) -> Result<(), String> {
         let r = self.client.batch_execute(sql);
+        // Quillo's own `begin`, `commit`, `prepare transaction`... (the program's are refused).
+        // One that failed leaves it as it was, but a `commit` ends the transaction anyway.
+        let after = in_tx_after(self.in_tx, sql);
+        self.in_tx = if r.is_ok() { after } else { self.in_tx && after };
         r.map_err(|e| self.failed(&e))
     }
 
@@ -784,6 +892,8 @@ const STUCK_MS: u64 = 20;
 struct Lane {
     client: tokio_postgres::Client,
     stmts: Mutex<HashMap<String, tokio_postgres::Statement>>,
+    /// As `Conn::typed`'s (never in a transaction here).
+    typed: Mutex<HashMap<String, Option<tokio_postgres::Statement>>>,
     /// Queries sent and not yet answered.
     waiting: AtomicUsize,
     /// When it last answered, or was given work while it had none (`clock`).
@@ -855,7 +965,7 @@ impl Lanes {
         tokio::spawn(async move {
             let _ = conn.await;
         });
-        let l = Arc::new(Lane { client, stmts: Mutex::new(HashMap::new()), waiting: AtomicUsize::new(0), moved: AtomicU64::new(0), money: OnceLock::new() });
+        let l = Arc::new(Lane { client, stmts: Mutex::new(HashMap::new()), typed: Mutex::new(HashMap::new()), waiting: AtomicUsize::new(0), moved: AtomicU64::new(0), money: OnceLock::new() });
         *self.slots[pick].lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(l.clone());
         Ok(l)
     }
@@ -877,20 +987,54 @@ impl Lanes {
         let stmt = Self::prepare(lane, sql).await?;
         let want = stmt.params().len();
         if want != params.len() {
-            return Err(format!("the query has {} parameter{}, got {}", want, if want == 1 { "" } else { "s" }, params.len()));
+            return Err(crate::sql::wrong_count(want, params.len()));
         }
-        match casts_for(sql, stmt.params()) {
+        let casts = casts_for(sql, stmt.params());
+        if let Some(types) = declared(stmt.params(), params) {
+            if let Some(s) = Self::typed(lane, casts.as_deref().unwrap_or(sql), types).await {
+                return Ok(s);
+            }
+        }
+        match casts {
             None => Ok(stmt),
             Some(cast_sql) => Self::prepare(lane, &cast_sql).await,
         }
     }
 
+    /// As `Conn::typed`.
+    async fn typed(lane: &Lane, sql: &str, (sent, mut want): (Vec<Type>, Vec<Type>)) -> Option<tokio_postgres::Statement> {
+        let key = typed_key(sql, &want);
+        if let Some(s) = lane.typed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key) {
+            return s.clone();
+        }
+        let mut s = None;
+        for _ in 0..TRIES {
+            match lane.client.prepare_typed(sql, &want).await {
+                Ok(st) => {
+                    s = Some(st);
+                    break;
+                }
+                Err(e) => {
+                    if !as_sent_near(sql, refused_at(&e), &sent, &mut want) {
+                        break;
+                    }
+                }
+            }
+        }
+        let mut g = lane.typed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if g.len() >= 256 {
+            g.clear();
+        }
+        g.insert(key, s.clone());
+        s
+    }
+
     /// Runs a query for request `n` (see `lane`).
     pub async fn query(self: Arc<Self>, n: usize, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
-        let (sql, params) = translate(&sql, &params)?;
+        let (scan, params) = translate(&sql, &params)?;
         let lane = self.lane(n).await?;
         let _sent = lane.send();
-        let stmt = Self::statement(&lane, &sql, &params).await?;
+        let stmt = Self::statement(&lane, scan.native(), &params).await?;
         let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
         let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
         let rows = lane.client.query(&stmt, &refs).await.map_err(|e| describe(&e))?;
@@ -908,12 +1052,12 @@ impl Lanes {
     pub async fn exec(self: Arc<Self>, n: usize, sql: String, params: Vec<Value>) -> Result<Value, String> {
         let lane = self.lane(n).await?;
         let _sent = lane.send();
-        let changes = if params.is_empty() && has_several_statements(&sql) {
+        let changes = if params.is_empty() && several_statements(&sql) {
             lane.client.batch_execute(&sql).await.map_err(|e| describe(&e))?;
             Value::Nil
         } else {
-            let (sql, params) = translate(&sql, &params)?;
-            let stmt = Self::statement(&lane, &sql, &params).await?;
+            let (scan, params) = translate(&sql, &params)?;
+            let stmt = Self::statement(&lane, scan.native(), &params).await?;
             let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
             let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
             Value::Int(lane.client.execute(&stmt, &refs).await.map_err(|e| describe(&e))? as i64)
@@ -927,242 +1071,43 @@ impl Lanes {
 
 // ---- placeholders --------------------------------------------------------
 
-/// Calls `f` for each piece of SQL outside quotes, comments and
-/// dollar-quoted strings, and copies everything else through.
-fn scan(sql: &str, mut f: impl FnMut(&[char], &mut usize, &mut String)) -> String {
-    let c: Vec<char> = sql.chars().collect();
-    let mut out = String::with_capacity(sql.len() + 16);
-    let mut i = 0;
-    while i < c.len() {
-        let ch = c[i];
-        // 'text', E'text', "identifier"
-        if ch == '\'' || ch == '"' {
-            let backslash = ch == '\'' && i > 0 && (c[i - 1] == 'E' || c[i - 1] == 'e');
-            out.push(ch);
-            i += 1;
-            while i < c.len() {
-                out.push(c[i]);
-                if backslash && c[i] == '\\' && i + 1 < c.len() {
-                    out.push(c[i + 1]);
-                    i += 2;
-                    continue;
-                }
-                if c[i] == ch {
-                    if i + 1 < c.len() && c[i + 1] == ch {
-                        out.push(ch);
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        // -- comment
-        if ch == '-' && c.get(i + 1) == Some(&'-') {
-            while i < c.len() && c[i] != '\n' {
-                out.push(c[i]);
-                i += 1;
-            }
-            continue;
-        }
-        // /* comment */
-        if ch == '/' && c.get(i + 1) == Some(&'*') {
-            while i < c.len() && !(c[i] == '*' && c.get(i + 1) == Some(&'/')) {
-                out.push(c[i]);
-                i += 1;
-            }
-            out.push_str("*/");
-            i = (i + 2).min(c.len());
-            continue;
-        }
-        // $tag$ ... $tag$
-        if ch == '$' && !c.get(i + 1).map_or(false, |d| d.is_ascii_digit()) {
-            let mut j = i + 1;
-            while j < c.len() && (c[j].is_alphanumeric() || c[j] == '_') {
-                j += 1;
-            }
-            if c.get(j) == Some(&'$') {
-                let tag: String = c[i..=j].iter().collect();
-                let body_start = j + 1;
-                let rest: String = c[body_start..].iter().collect();
-                let end = rest.find(&tag).map_or(c.len(), |e| body_start + rest[..e].chars().count() + tag.chars().count());
-                out.extend(c[i..end].iter());
-                i = end;
-                continue;
-            }
-        }
-        f(&c, &mut i, &mut out);
-    }
-    out
-}
-
-fn ident_at(c: &[char], start: usize) -> usize {
-    let mut j = start;
-    while j < c.len() && (c[j].is_alphanumeric() || c[j] == '_') {
-        j += 1;
-    }
-    j
-}
-
-/// Rewrites `?` and `:name` placeholders to `$n`, and orders the values.
-fn translate(sql: &str, params: &[Value]) -> Result<(String, Vec<Value>), String> {
-    // `:name` with one map of values.
-    if let [Value::Map(m)] = params {
-        let mut names: Vec<String> = Vec::new();
-        let mut uses_names = false;
-        let out = scan(sql, |c, i, out| {
-            let prev_colon = *i > 0 && c[*i - 1] == ':';
-            if c[*i] == ':' && !prev_colon && c.get(*i + 1).map_or(false, |d| d.is_alphabetic() || *d == '_') {
-                let end = ident_at(c, *i + 1);
-                let name: String = c[*i + 1..end].iter().collect();
-                let n = match names.iter().position(|x| *x == name) {
-                    Some(p) => p + 1,
-                    None => {
-                        names.push(name);
-                        names.len()
-                    }
-                };
-                out.push_str(&format!("${}", n));
-                uses_names = true;
-                *i = end;
-            } else {
-                out.push(c[*i]);
-                *i += 1;
-            }
-        });
-        if uses_names {
-            let mut values = Vec::new();
-            for n in &names {
-                let v = m.get(n.as_str()).or_else(|| m.get(format!(":{}", n).as_str())).cloned();
-                values.push(v.ok_or_else(|| format!("no value for :{}", n))?);
-            }
-            return Ok((out, values));
-        }
-    }
-    Ok((positional(sql), params.to_vec()))
-}
-
-/// `?` placeholders as `$1, $2, ...`, unless the query already numbers its
-/// own. Depends on the SQL alone, so it is worked out once per statement.
-fn positional(sql: &str) -> String {
-    static SEEN: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
-    if let Some(done) = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(|m| m.get(sql)) {
-        return done.clone();
-    }
-    let out = if has_numbered(sql) {
-        sql.to_string()
-    } else {
-        let mut n = 0;
-        scan(sql, |c, i, out| {
-            if c[*i] == '?' && !is_question_operator(c, *i) {
-                n += 1;
-                out.push_str(&format!("${}", n));
-            } else {
-                out.push(c[*i]);
-            }
-            *i += 1;
-        })
-    };
-    let mut g = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let m = g.get_or_insert_with(HashMap::new);
-    // Statements are usually written in the program, so few; if they are
-    // built from values instead, the cache starts over now and then.
-    if m.len() >= 1024 {
-        m.clear();
-    }
-    m.insert(sql.to_string(), out.clone());
-    out
-}
-
-/// Words after which a `?` is a value, not jsonb's `?` operator.
-const BEFORE_VALUE: &[&str] = &[
-    "select", "where", "and", "or", "not", "limit", "offset", "by", "on", "having", "when", "then", "else", "case",
-    "in", "is", "like", "ilike", "similar", "to", "between", "symmetric", "asymmetric", "values", "set", "returning",
-    "distinct", "all", "any", "some", "escape", "exists", "return", "first", "next", "using", "from", "for", "zone",
-    "overlaps", "placing", "both", "leading", "trailing",
-];
-
-/// Whether the `?` at `i` is one of jsonb's operators (`data ? 'key'`,
-/// `?|`, `?&`) rather than a parameter. A parameter comes after an
-/// operator, a bracket, a comma or a keyword such as `limit`; the operator
-/// comes after a value: a column, `)`, `]` or a quoted string. A query that
-/// numbers its own parameters (`$1`) is never rewritten, so it can use `?`
-/// freely.
-fn is_question_operator(c: &[char], i: usize) -> bool {
-    if matches!(c.get(i + 1), Some('|') | Some('&')) {
-        return true;
-    }
-    let mut j = i;
-    while j > 0 && c[j - 1].is_whitespace() {
-        j -= 1;
-    }
-    let Some(&before) = j.checked_sub(1).and_then(|k| c.get(k)) else { return false };
-    if matches!(before, ')' | ']' | '\'' | '"') {
-        return true;
-    }
-    if !(before.is_alphanumeric() || before == '_') {
-        return false;
-    }
-    let mut k = j;
-    while k > 0 && (c[k - 1].is_alphanumeric() || c[k - 1] == '_') {
-        k -= 1;
-    }
-    let word = c[k..j].iter().collect::<String>().to_ascii_lowercase();
-    !BEFORE_VALUE.contains(&word.as_str())
-}
-
-fn has_numbered(sql: &str) -> bool {
-    let mut found = false;
-    scan(sql, |c, i, out| {
-        if c[*i] == '$' && c.get(*i + 1).map_or(false, |d| d.is_ascii_digit()) {
-            found = true;
-        }
-        out.push(c[*i]);
-        *i += 1;
-    });
-    found
+/// Quillo's `?`, `?NNN` and `:name` as `$1, $2, ...`, and the values in that order, read by the
+/// tokenizer shared with the other databases (src/sql.rs): a `?` after a value is jsonb's
+/// operator, `?||` a placeholder and `||`, `@?` jsonpath's operator, `?1` the first value, and
+/// comments nest (FEEDBACK55.md, Q-749; branch feedback55). A query that numbers its own (`$1`)
+/// is as written. Read once for each text.
+fn translate(sql: &str, params: &[Value]) -> Result<(Arc<crate::sql::Scan>, Vec<Value>), String> {
+    let scan = crate::sql::scan(crate::sql::Dialect::Postgres, sql);
+    let values = scan.values(params)?;
+    Ok((scan, values))
 }
 
 /// Replaces `$n` where `f(n)` says so.
 fn rewrite_numbered(sql: &str, f: impl Fn(usize) -> Option<String>) -> String {
-    scan(sql, |c, i, out| {
-        if c[*i] == '$' && c.get(*i + 1).map_or(false, |d| d.is_ascii_digit()) {
-            let mut j = *i + 1;
-            while j < c.len() && c[j].is_ascii_digit() {
-                j += 1;
-            }
-            let n: usize = c[*i + 1..j].iter().collect::<String>().parse().unwrap_or(0);
-            match f(n) {
-                Some(s) => out.push_str(&s),
-                None => out.extend(c[*i..j].iter()),
-            }
-            *i = j;
-        } else {
-            out.push(c[*i]);
-            *i += 1;
+    let scan = crate::sql::scan(crate::sql::Dialect::Postgres, sql);
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut at = 0;
+    for &(start, end, n) in scan.marks() {
+        if let Some(s) = f(n) {
+            out.push_str(&sql[at..start]);
+            out.push_str(&s);
+            at = end;
         }
-    })
+    }
+    out.push_str(&sql[at..]);
+    out
 }
 
-fn has_several_statements(sql: &str) -> bool {
-    let mut parts = 0;
-    let mut current = false;
-    scan(sql, |c, i, out| {
-        if c[*i] == ';' {
-            if current {
-                parts += 1;
-            }
-            current = false;
-        } else if !c[*i].is_whitespace() {
-            current = true;
-        }
-        out.push(c[*i]);
-        *i += 1;
-    });
-    parts + current as usize > 1
+fn several_statements(sql: &str) -> bool {
+    crate::sql::scan(crate::sql::Dialect::Postgres, sql).stmts.len() > 1
+}
+
+/// Whether Quillo's own statements leave the connection in a transaction: `begin` and `start
+/// transaction` begin one; `commit`, `end`, `abort`, `rollback` (not `rollback to`) and
+/// `prepare transaction` end it.
+fn in_tx_after(in_tx: bool, sql: &str) -> bool {
+    let scan = crate::sql::scan(crate::sql::Dialect::Postgres, sql);
+    crate::sql::in_tx_after(&scan, in_tx)
 }
 
 // ---- parameters ----------------------------------------------------------
@@ -1176,6 +1121,74 @@ fn is_text_type(t: &Type) -> bool {
 fn encodes_directly(t: &Type) -> bool {
     matches!(*t, Type::BOOL | Type::INT2 | Type::INT4 | Type::INT8 | Type::FLOAT4 | Type::FLOAT8 | Type::JSON | Type::JSONB)
         || is_text_type(t)
+}
+
+/// The types to declare for values PostgreSQL inferred another for, or None for none: an int
+/// or a float where nothing in the SQL says what it is (`select ? as v`, `greatest(?, ?)`,
+/// `substring('hello', ?, ?)`) was taken as text, so 9 came after 10 and `substring` read a
+/// pattern; and an int past an `int4` column's range could not be sent, where it is no match
+/// (FEEDBACK55.md, Q-731; branch feedback55). An int is declared `int4` when it fits (as
+/// functions such as `substring` take), else `int8`; a float `float8`. Where PostgreSQL does
+/// not take the types (`name = ?` with a text column), the statement is as inferred.
+/// As (the types the values go as, inferred or text for a cast; those with the declared).
+fn declared(types: &[Type], params: &[Value]) -> Option<(Vec<Type>, Vec<Type>)> {
+    let mut out: Option<(Vec<Type>, Vec<Type>)> = None;
+    for (i, (t, v)) in types.iter().zip(params).enumerate() {
+        let int = |n: i64| if i32::try_from(n).is_ok() { Type::INT4 } else { Type::INT8 };
+        let want = match (v, t) {
+            (Value::Int(n), t) if matches!(*t, Type::TEXT | Type::UNKNOWN) => int(*n),
+            (Value::Float(_), t) if matches!(*t, Type::TEXT | Type::UNKNOWN) => Type::FLOAT8,
+            (Value::Int(n), t) if *t == Type::INT2 && i16::try_from(*n).is_err() => int(*n),
+            (Value::Int(n), t) if *t == Type::INT4 && i32::try_from(*n).is_err() => Type::INT8,
+            _ => continue,
+        };
+        let (_, w) = out.get_or_insert_with(|| {
+            let sent: Vec<Type> = types.iter().map(|t| if encodes_directly(t) { t.clone() } else { Type::TEXT }).collect();
+            (sent.clone(), sent)
+        });
+        w[i] = want;
+    }
+    out
+}
+
+/// How many times `typed` prepares a statement with types declared: all of them, then without
+/// those near where PostgreSQL refused them. Never once for each value: 800 ints in `name in
+/// (?, ...)` against a text column made 1,601 tries, 305 ms and as many lines in the server's
+/// log (found in review).
+const TRIES: usize = 2;
+
+/// Where PostgreSQL said a statement was wrong, as a character from 1, if it did.
+fn refused_at(e: &postgres::Error) -> Option<usize> {
+    match e.as_db_error()?.position()? {
+        postgres::error::ErrorPosition::Original(n) => Some(*n as usize),
+        _ => None,
+    }
+}
+
+/// After a refusal at character `at` of `sql`: the values near it (inside the parentheses
+/// around it, or all of them) go as inferred again. Whether another try is worth it: some are
+/// still declared, and some changed.
+fn as_sent_near(sql: &str, at: Option<usize>, sent: &[Type], want: &mut [Type]) -> bool {
+    let Some(at) = at else { return false };
+    let byte = sql.char_indices().nth(at.saturating_sub(1)).map_or(sql.len(), |(b, _)| b);
+    let mut changed = false;
+    for n in crate::sql::values_near(sql, byte) {
+        if let (Some(w), Some(s)) = (want.get_mut(n.wrapping_sub(1)), sent.get(n.wrapping_sub(1))) {
+            if w != s {
+                *w = s.clone();
+                changed = true;
+            }
+        }
+    }
+    changed && want != sent
+}
+
+/// What `Conn::typed` keeps a statement by.
+fn typed_key(sql: &str, types: &[Type]) -> String {
+    let mut k: String = types.iter().map(|t| format!("{},", t.oid())).collect();
+    k.push('\0');
+    k.push_str(sql);
+    k
 }
 
 fn quote_ident(s: &str) -> String {
@@ -1541,7 +1554,7 @@ mod tests {
 
     #[test]
     fn placeholders() {
-        let p = |s: &str, v: &[Value]| translate(s, v).unwrap().0;
+        let p = |s: &str, _: &[Value]| crate::sql::scan(crate::sql::Dialect::Postgres, s).native().to_string();
         assert_eq!(p("select * from t where a = ? and b = ?", &[Value::Int(1), Value::Int(2)]), "select * from t where a = $1 and b = $2");
         assert_eq!(p("select '?', \"q?\", e'\\'?' -- ?\n, $$ ? $$, ? /* ? */", &[Value::Int(1)]), "select '?', \"q?\", e'\\'?' -- ?\n, $$ ? $$, $1 /* ? */");
         assert_eq!(p("select $1, ?", &[]), "select $1, ?");
@@ -1555,12 +1568,20 @@ mod tests {
         let mut m = Map::new();
         m.insert("id".into(), Value::Int(1));
         m.insert("name".into(), Value::str("x"));
-        let (sql, vals) = translate("select :id::text, :name, :id, ':no'", &[Value::map(m)]).unwrap();
-        assert_eq!(sql, "select $1::text, $2, $1, ':no'");
+        let (scan, vals) = translate("select :id::text, :name, :id, ':no'", &[Value::map(m)]).unwrap();
+        assert_eq!(scan.native(), "select $1::text, $2, $1, ':no'");
         assert_eq!(vals.len(), 2);
         assert_eq!(rewrite_numbered("a = $1 and b = $12", |n| (n == 12).then(|| "X".into())), "a = $1 and b = X");
-        assert!(has_several_statements("create table a (x int); create table b (y int);"));
-        assert!(!has_several_statements("insert into a values (';');"));
+        assert!(several_statements("create table a (x int); create table b (y int);"));
+        assert!(!several_statements("insert into a values (';');"));
+        // Quillo's own transactions, as `typed` needs to know (FEEDBACK55.md, Q-731).
+        assert!(in_tx_after(false, "begin isolation level serializable"));
+        assert!(in_tx_after(true, "savepoint quillo_tx_2"));
+        assert!(in_tx_after(true, "rollback to savepoint quillo_tx_2; release savepoint quillo_tx_2"));
+        assert!(!in_tx_after(true, "commit"));
+        assert!(!in_tx_after(true, "prepare transaction 'g'"));
+        assert!(!in_tx_after(false, "commit prepared 'g'"));
+        assert!(!in_tx_after(true, "ROLLBACK"));
     }
 
     #[test]

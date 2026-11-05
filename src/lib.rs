@@ -97,6 +97,7 @@ pub mod session;
 pub mod site;
 pub mod statics;
 pub mod stack;
+pub mod sql;
 pub mod sqlinfo;
 pub mod upload;
 pub mod value;

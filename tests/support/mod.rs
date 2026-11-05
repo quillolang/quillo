@@ -109,6 +109,12 @@ pub fn postgres(name: &str) -> Option<Pg> {
 }
 
 impl Pg {
+    /// The server's log, as written so far.
+    #[allow(dead_code)]
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(self.dir.join("log")).unwrap_or_default()
+    }
+
     /// A fresh database, and its URL.
     pub fn database(&self, name: &str) -> String {
         let out = Command::new(self.bin.join("psql"))

@@ -103,10 +103,10 @@ pub struct Pool {
     pool: Option<mysql_async::Pool>,
 }
 
-/// A connection; and, in a transaction that retries, whether a statement
-/// failed because of another transaction (see `crate::txn`; None: not
-/// watching).
-pub struct Conn(Option<mysql_async::Conn>, Option<bool>);
+/// A connection; in a transaction that retries, whether a statement failed because of another
+/// transaction (see `crate::txn`; None: not watching); and whether Quillo began a transaction on
+/// it (`batch`).
+pub struct Conn(Option<mysql_async::Conn>, Option<bool>, bool);
 
 impl Drop for Pool {
     fn drop(&mut self) {
@@ -145,7 +145,7 @@ impl Pool {
         }
         let pool = mysql_async::Pool::new(opts);
         let c = run(pool.get_conn()).map_err(|e| e.to_string())?;
-        drop(Conn(Some(c), None));
+        drop(Conn(Some(c), None, false));
         Ok(Pool { pool: Some(pool) })
     }
 
@@ -169,7 +169,7 @@ impl Pool {
 
     pub fn checkout(&self) -> Result<Conn, String> {
         let pool = self.pool.as_ref().expect("open");
-        run(pool.get_conn()).map(|c| Conn(Some(c), None)).map_err(|e| e.to_string())
+        run(pool.get_conn()).map(|c| Conn(Some(c), None, false)).map_err(|e| e.to_string())
     }
 
     pub fn give_back(&self, c: Conn) {
@@ -210,7 +210,25 @@ impl Conn {
             result.drop_result().await?;
             Ok::<_, mysql_async::Error>(out)
         });
-        r.map_err(|e| self.failed(e))
+        let rows = r.map_err(|e| self.failed(e))?;
+        self.still_in_tx()?;
+        Ok(rows)
+    }
+
+    /// After a statement in a transaction Quillo began: whether the server is still in it, by
+    /// the flag its answer carries. A statement that committed by itself (a procedure's `create
+    /// table`, `execute immediate`, MariaDB's `begin not atomic` block) ended it, with what ran
+    /// before (FEEDBACK55.md, Q-728; branch feedback55).
+    fn still_in_tx(&mut self) -> Result<(), String> {
+        if !self.2 {
+            return Ok(());
+        }
+        let in_tx = self.conn().last_ok_packet().map_or(true, |ok| ok.status_flags().contains(mysql_async::consts::StatusFlags::SERVER_STATUS_IN_TRANS));
+        if in_tx {
+            return Ok(());
+        }
+        self.2 = false;
+        Err(crate::db::COMMITTED.to_string())
     }
 
     /// `{ changes, last_id }`. Without parameters the text may hold several
@@ -223,6 +241,7 @@ impl Conn {
             run(self.conn().exec_drop(sql, params))
         };
         r.map_err(|e| self.failed(e))?;
+        self.still_in_tx()?;
         let c = self.conn();
         let mut m = Map::new();
         m.insert("changes".into(), Value::Int(c.affected_rows() as i64));
@@ -232,6 +251,11 @@ impl Conn {
 
     pub fn batch(&mut self, sql: &str) -> Result<(), String> {
         let r = run(self.conn().query_drop(sql));
+        // Quillo's own `begin`, `commit`, `rollback` (the program's are refused); and a
+        // migration's schema, which commits as it runs there, so not in a transaction after.
+        let after = crate::sql::in_tx_after(&crate::sql::scan(crate::sql::Dialect::Mysql, sql), self.2);
+        let server = self.conn().last_ok_packet().map_or(true, |ok| ok.status_flags().contains(mysql_async::consts::StatusFlags::SERVER_STATUS_IN_TRANS));
+        self.2 = if r.is_ok() { after && server } else { self.2 && after };
         r.map_err(|e| self.failed(e))
     }
 
@@ -322,74 +346,15 @@ fn from_my(v: My, col: &mysql_async::Column) -> Value {
     }
 }
 
-/// `:name` placeholders (with one map of values) to MySQL's `?`, skipping
-/// quotes, backticks and comments; `?` as they are.
+/// `:name` and `?NNN` placeholders to MySQL's `?`, and the values in that order, read by the
+/// tokenizer shared with the other databases (src/sql.rs): quotes, backticks, `#` and `-- `
+/// comments skipped. One map is the values by name only where the SQL names them, so a map or
+/// a record is the value of a lone `?` as on the others (FEEDBACK55.md, Q-748; branch
+/// feedback55). Read once for each text.
 fn translate(sql: &str, params: &[Value]) -> Result<(String, Params), String> {
-    let named = match params {
-        [Value::Map(m)] => Some(m.clone()),
-        _ => None,
-    };
-    let b = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len());
-    let mut values = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        match c {
-            b'\'' | b'"' | b'`' => {
-                let start = i;
-                i += 1;
-                while i < b.len() && b[i] != c {
-                    if b[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-                i = (i + 1).min(b.len());
-                out.push_str(&sql[start..i]);
-                continue;
-            }
-            b'-' if b.get(i + 1) == Some(&b'-') => {
-                let end = sql[i..].find('\n').map_or(b.len(), |n| i + n);
-                out.push_str(&sql[i..end]);
-                i = end;
-                continue;
-            }
-            b'#' => {
-                let end = sql[i..].find('\n').map_or(b.len(), |n| i + n);
-                out.push_str(&sql[i..end]);
-                i = end;
-                continue;
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                let end = sql[i + 2..].find("*/").map_or(b.len(), |n| i + 2 + n + 2);
-                out.push_str(&sql[i..end]);
-                i = end;
-                continue;
-            }
-            b':' if named.is_some() && b.get(i + 1).map_or(false, |n| n.is_ascii_alphabetic() || *n == b'_') && (i == 0 || b[i - 1] != b':') => {
-                let start = i + 1;
-                let mut end = start;
-                while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
-                    end += 1;
-                }
-                let name = &sql[start..end];
-                let m = named.as_ref().unwrap();
-                values.push(to_my(m.get(name).ok_or_else(|| format!("no value for :{}", name))?)?);
-                out.push('?');
-                i = end;
-                continue;
-            }
-            _ => {}
-        }
-        let ch = sql[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    if named.is_none() {
-        values = params.iter().map(to_my).collect::<Result<_, _>>()?;
-    }
-    Ok((out, if values.is_empty() { Params::Empty } else { Params::Positional(values) }))
+    let scan = crate::sql::scan(crate::sql::Dialect::Mysql, sql);
+    let values = scan.values(params)?.iter().map(to_my).collect::<Result<Vec<_>, _>>()?;
+    Ok((scan.native().to_string(), if values.is_empty() { Params::Empty } else { Params::Positional(values) }))
 }
 
 #[cfg(test)]

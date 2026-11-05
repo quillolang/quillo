@@ -93,7 +93,13 @@ pub fn run(db: &Backend, dir: &Path) -> Result<Vec<String>, String> {
         Backend::Postgres(pool) => {
             let mut c = pool.checkout()?;
             let r = pg_run(&mut c, &todo);
-            pool.give_back(c);
+            // What a migration set in the session (`set search_path`) is not the next request's
+            // (FEEDBACK55.md, Q-708; branch feedback55).
+            if c.batch(pg::RESET).is_ok() {
+                pool.give_back(c);
+            } else {
+                pool.discard(c);
+            }
             r
         }
         #[cfg(feature = "mysql")]
