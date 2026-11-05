@@ -3490,8 +3490,32 @@ impl Interp {
             Value::Response(r) => match name {
                 "status" => return Ok(Value::Int(r.status as i64)),
                 "headers" => {
-                    // A header named `null` is null (FEEDBACK55.md, Q-710; branch feedback55).
-                    return Ok(Value::map(r.headers.iter().map(|(k, v)| (k.into(), if v == crate::server::DROPPED { Value::Nil } else { Value::str(v) })).collect()))
+                    // As `respond` takes them back: a header named `null` is null, and `set-cookie`
+                    // sent more than once a list, where each went for the last (FEEDBACK55.md,
+                    // Q-710; branch feedback55).
+                    let mut m = Map::with_capacity(r.headers.len());
+                    for (k, v) in r.headers.iter() {
+                        let v = if v == crate::server::DROPPED { Value::Nil } else { Value::str(v) };
+                        let cookie = k.eq_ignore_ascii_case("set-cookie");
+                        match m.get_mut(k.as_str()) {
+                            Some(was) if cookie => {
+                                *was = match std::mem::replace(was, Value::Nil) {
+                                    Value::List(l) => {
+                                        let mut l = (*l).clone();
+                                        l.push(v);
+                                        Value::list(l)
+                                    }
+                                    Value::Nil => v,
+                                    first => Value::list(vec![first, v]),
+                                };
+                            }
+                            Some(was) => *was = v,
+                            None => {
+                                m.insert(k.as_str().into(), v);
+                            }
+                        }
+                    }
+                    return Ok(Value::map(m));
                 }
                 "body" => {
                     return Ok(match &r.body {

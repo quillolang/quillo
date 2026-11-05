@@ -371,7 +371,7 @@ fn values() {
     let many = range(0, 200) | map((i) => `text ${i}`)
     let long = repeat("x", 500)
     let failed = err("no")
-    let answered = respond(201, "body", { "x-a": "1" })
+    let answered = respond(201, "body", { "x-a": "1", "x-b": null })
     let sent = stream((out) => 1)
     let fun = named
     let lam = (x) => x
@@ -420,6 +420,9 @@ fn the_values_an_editor_is_shown() {
     assert_eq!(held[0].0, "status");
     assert_eq!(held[0].1, "201");
     assert_eq!(held[1].0, "headers");
+    // A header named `null` shows so (FEEDBACK55.md, Q-710; branch feedback55).
+    let headers: Vec<String> = under(&mut d, &json!(held[1].2), json!({})).into_iter().map(|v| v.1).collect();
+    assert_eq!(headers, ["(2) [\"x-a\", \"1\"]", "(2) [\"x-b\", null]"]);
     assert_eq!(held[2].0, "body");
     assert_eq!(held[2].1, "\"body\"");
     // A file sent has no value for a body.

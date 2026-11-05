@@ -1734,7 +1734,7 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // feedback55).
     let moved = |p: &str, q: Option<String>, kept: Option<&str>| -> R {
         let to = format!("/{}{}", p.trim_start_matches(['/', '\\']), q.map_or(String::new(), |q| format!("?{}", q)));
-        let mut headers = vec![("location".to_string(), location(&to))];
+        let mut headers = vec![("location".to_string(), location(&to).unwrap_or_else(|| to.clone()))];
         headers.extend(kept.map(|k| ("cache-control".to_string(), k.to_string())));
         Ok(Value::Response(Arc::new(Response { status: 301, headers, body: Body::Value(Value::Nil) })))
     };
@@ -2041,28 +2041,44 @@ fn redirect(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return fail(line, format!("`redirect` status is 301, 302, 303, 307 or 308, got {}", status));
     }
     let status = status as u16;
-    if !crate::server::valid_header("location", &url) {
-        return fail(line, "`redirect` URL cannot contain line breaks or other control characters");
+    // A tab too, which a header may hold, and browsers take out of a URL: `https://good.com\t@evil.com`
+    // is evil.com's (FEEDBACK55.md, Q-719; branch feedback55; found in review).
+    if !crate::server::valid_header("location", &url) || url.contains('\t') {
+        return fail(line, "`redirect` URL cannot contain line breaks, tabs or other control characters");
     }
     if crate::interp::script_url(&url) {
         return fail(line, "`redirect` is not given a javascript: URL");
     }
+    // A host past ASCII that IDNA cannot write is no host a browser goes to (FEEDBACK55.md, Q-719;
+    // branch feedback55).
+    let Some(to) = location(&url) else {
+        return Ok(Value::err(Value::str(format!("`redirect`: the host of {:?} is no name a browser goes to", &*url))));
+    };
     Ok(Value::Response(Arc::new(Response {
         status,
-        headers: vec![("location".into(), location(&url))],
+        headers: vec![("location".into(), to)],
         body: Body::Value(Value::Nil),
     })))
 }
 
-/// `url` as a `Location` holds it: what a URL may not hold (a space, `"`, `<`, `>`, `\`, `^`, a
-/// backquote, `{`, `|`, `}`, a lone `%`, any byte past ASCII) percent-encoded, and the rest,
-/// a `%XX` already there too, as it is, where `/a b` and `/a"><script>` went as written; a host
-/// past ASCII as IDNA writes it, `bücher.de` as `xn--bcher-kva.de`, and else the authority as it
-/// is (FEEDBACK55.md, Q-719; branch feedback55).
-pub(crate) fn location(url: &str) -> String {
+/// `url` as a `Location` holds it, going where a browser would have taken it: what a URL may not
+/// hold (a space, `"`, `<`, `>`, `^`, a backquote, `{`, `|`, `}`, a lone `%`, any byte past
+/// ASCII) percent-encoded, and the rest, a `%XX` already there too, as it is, where `/a b` and
+/// `/a"><script>` went as written; a host past ASCII as IDNA writes it, `bücher.de` as
+/// `xn--bcher-kva.de`, or None when IDNA cannot (FEEDBACK55.md, Q-719; branch feedback55). In a URL
+/// of a scheme browsers read `\` in as `/` (http, https, ws, wss, ftp, file, and one with no
+/// scheme), a `\` before the query is written `/`, as they read it: `https://good.com\@evil.com/`
+/// is good.com's, which `%5C` would have made evil.com's (found in review).
+pub(crate) fn location(url: &str) -> Option<String> {
     let fine = |c: u8| c.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&'()*+,;=".contains(&c);
+    let scheme = url.find(':').filter(|&i| i > 0 && url.as_bytes()[0].is_ascii_alphabetic() && url[..i].bytes().all(|c| c.is_ascii_alphanumeric() || b"+-.".contains(&c)));
+    let special = scheme.map_or(true, |i| ["http", "https", "ws", "wss", "ftp", "file"].iter().any(|s| url[..i].eq_ignore_ascii_case(s)));
+    let url: std::borrow::Cow<str> = match url.find(['?', '#']).unwrap_or(url.len()) {
+        before if special && url[..before].contains('\\') => format!("{}{}", url[..before].replace('\\', "/"), &url[before..]).into(),
+        _ => url.into(),
+    };
     if url.bytes().all(fine) {
-        return url.to_string();
+        return Some(url.into_owned());
     }
     let encode = |part: &str, out: &mut String| {
         let b = part.as_bytes();
@@ -2076,16 +2092,15 @@ pub(crate) fn location(url: &str) -> String {
         }
     };
     // `scheme://authority` or `//authority`, the authority up to the path, query or fragment.
-    let scheme = url.find("://").filter(|&i| i > 0 && url[..i].bytes().all(|c| c.is_ascii_alphanumeric() || b"+-.".contains(&c)) && url.as_bytes()[0].is_ascii_alphabetic());
-    let at = match (scheme, url.starts_with("//")) {
-        (Some(i), _) => Some(i + 3),
-        (None, true) => Some(2),
+    let at = match scheme {
+        Some(i) if url[i..].starts_with("://") => Some(i + 3),
+        None if url.starts_with("//") => Some(2),
         _ => None,
     };
     let mut out = String::with_capacity(url.len() + 8);
     let rest = match at {
         Some(from) => {
-            let to = url[from..].find(['/', '?', '#', '\\']).map_or(url.len(), |n| from + n);
+            let to = url[from..].find(['/', '?', '#']).map_or(url.len(), |n| from + n);
             out.push_str(&url[..from]);
             let authority = &url[from..to];
             let (user, host_port) = authority.rsplit_once('@').map_or((None, authority), |(u, h)| (Some(u), h));
@@ -2097,18 +2112,25 @@ pub(crate) fn location(url: &str) -> String {
                 Some((h, p)) if !h.starts_with('[') && p.bytes().all(|c| c.is_ascii_digit()) => (h, Some(p)),
                 _ => (host_port, None),
             };
-            let ascii = if host.is_ascii() { String::new() } else { url::quirks::domain_to_ascii(host) };
-            out.push_str(if ascii.is_empty() { host } else { &ascii });
+            if host.is_ascii() {
+                out.push_str(host);
+            } else {
+                let ascii = url::quirks::domain_to_ascii(host);
+                if ascii.is_empty() {
+                    return None;
+                }
+                out.push_str(&ascii);
+            }
             if let Some(p) = port {
                 out.push(':');
                 out.push_str(p);
             }
             &url[to..]
         }
-        None => url,
+        None => &url[..],
     };
     encode(rest, &mut out);
-    out
+    Some(out)
 }
 
 /// `respond(status, body, headers = {})` builds a response value.

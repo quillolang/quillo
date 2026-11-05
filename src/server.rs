@@ -29,6 +29,12 @@ impl HttpResponse {
         self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
     }
 
+    /// `header`, but not one the program named `null` (`DROPPED`), which holds only its name's
+    /// place: what is sent (FEEDBACK55.md, Q-710; branch feedback55).
+    pub fn sent(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, v)| k.eq_ignore_ascii_case(name) && v != DROPPED).map(|(_, v)| v.as_str())
+    }
+
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
@@ -447,7 +453,7 @@ impl Interp {
         // not prefetched; the page is made when the link is followed. One
         // that went well is kept by the browser for the click.
         if let Some(refused) = prefetch {
-            if refused.load(std::sync::atomic::Ordering::Relaxed) || resp.header("set-cookie").is_some() {
+            if refused.load(std::sync::atomic::Ordering::Relaxed) || resp.sent("set-cookie").is_some() {
                 // Not a 2xx, which Chrome's speculation rules would keep and
                 // answer the click with (a 204 leaves the browser where it
                 // was): with a 503 it drops the prefetch and loads the page.
@@ -2635,7 +2641,8 @@ fn serve_events(app: Arc<App>, req: HttpRequest) -> Answer {
 /// An answer whose bytes are named by a validator or a range (`file()`'s, or a route's own
 /// `etag`): sent as it is, nothing added to it (FEEDBACK36.md, Q-447; branch feedback36-39).
 fn as_written(resp: &HttpResponse) -> bool {
-    resp.status == 206 || resp.header("etag").is_some() || resp.header("content-range").is_some()
+    // A header named `null` is none (FEEDBACK55.md, Q-710; branch feedback55).
+    resp.status == 206 || resp.sent("etag").is_some() || resp.sent("content-range").is_some()
 }
 
 fn inject_dev_script(resp: &mut HttpResponse, version: u64) {
@@ -2742,7 +2749,7 @@ fn compress(req: &HttpRequest, resp: &mut HttpResponse) {
         return;
     }
     // A file's gzipped copy is kept (by its ETag) rather than made again.
-    let etag = resp.header("etag").map(str::to_string);
+    let etag = resp.sent("etag").map(str::to_string);
     let kept = etag.as_deref().and_then(|e| crate::statics::gzipped(e, &resp.body));
     let gz = match kept {
         Some(gz) => gz.to_vec(),
@@ -3052,7 +3059,7 @@ fn not_modified(req: &HttpRequest, resp: &mut HttpResponse) {
     if resp.status != 200 || !matches!(req.method.as_str(), "GET" | "HEAD") {
         return;
     }
-    let (Some(etag), Some(asked)) = (resp.header("etag").filter(|e| *e != DROPPED), req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("if-none-match"))) else { return };
+    let (Some(etag), Some(asked)) = (resp.sent("etag"), req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("if-none-match"))) else { return };
     if crate::statics::matches(&asked.1, etag) {
         resp.status = 304;
         resp.body.clear();

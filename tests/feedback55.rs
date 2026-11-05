@@ -2100,19 +2100,113 @@ fn redirect_takes_redirect_statuses_and_a_url_location_holds() {
         ("/%zz", "/%25zz"),
         ("/%4", "/%254"),
         ("/é", "/%C3%A9"),
-        ("/a\\b", "/a%5Cb"),
+        ("/a\\b", "/a/b"),
         ("/{x}|^`", "/%7Bx%7D%7C%5E%60"),
         ("https://example.com/p?q=a&b=c#f", "https://example.com/p?q=a&b=c#f"),
         ("https://bücher.de/x?q=ü", "https://xn--bcher-kva.de/x?q=%C3%BC"),
         ("https://user:pä@bücher.de:8080/ä b", "https://user:p%C3%A4@xn--bcher-kva.de:8080/%C3%A4%20b"),
         ("//bücher.de/x", "//xn--bcher-kva.de/x"),
         ("https://[::1]:8080/é", "https://[::1]:8080/%C3%A9"),
-        ("https://example.com\\é", "https://example.com%5C%C3%A9"),
+        ("https://example.com\\é", "https://example.com/%C3%A9"),
+        // A `\` as browsers read it in these schemes, before the query: a `/`; after, and in
+        // another scheme, a character, encoded.
+        ("https://good.com\\@evil.com/", "https://good.com/@evil.com/"),
+        ("HTTPS://good.com\\@evil.com/", "HTTPS://good.com/@evil.com/"),
+        ("//good.com\\@evil.com", "//good.com/@evil.com"),
+        ("/\\evil.com", "//evil.com"),
+        ("\\\\evil.com", "//evil.com"),
+        ("wss://good.com\\@evil.com", "wss://good.com/@evil.com"),
+        ("https://good.com/a\\b?c\\d#e\\f", "https://good.com/a/b?c%5Cd#e%5Cf"),
+        ("mailto:a\\b", "mailto:a%5Cb"),
+        ("x-app://good.com\\@evil.com", "x-app://good.com%5C@evil.com"),
         ("/x?u=https://bücher.de", "/x?u=https://b%C3%BCcher.de"),
         ("/p?x=[1]&y=@~!$'()*+,;=:", "/p?x=[1]&y=@~!$'()*+,;=:"),
     ] {
         let a = support::send(port, "GET", &format!("/to?u={}", enc(u)), &[], "");
         assert_eq!((a.status, a.header("location")), (303, Some(want)), "{}", u);
+    }
+    // A host IDNA cannot write is no redirect: an error, where the host went as it was.
+    for u in ["https://ü%.com/", "//ü%.com/x"] {
+        let a = support::send(port, "GET", &format!("/to?u={}", enc(u)), &[], "");
+        assert_eq!((a.status, a.header("location")), (500, None), "{}", u);
+    }
+    // Tabs and line breaks, which browsers strip, are refused.
+    for u in ["https://good.com\t@evil.com", "/\n/evil.com"] {
+        assert_eq!(support::send(port, "GET", &format!("/to?u={}", enc(u)), &[], "").status, 500, "{:?}", u);
+    }
+}
+
+/// The host a `Location` takes a browser to, as WHATWG reads it (a `\` as `/`), for the tests.
+fn host_of(location: &str) -> String {
+    let rest = location.split_once("://").map_or(location.strip_prefix("//").unwrap_or(""), |(_, r)| r).replace('\\', "/");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    host.split(':').next().unwrap_or("").to_ascii_lowercase()
+}
+
+// Found in review: a program that checks where a redirect goes and then redirects goes where the
+// check meant, as a browser reads the URL: `https://good.com\@evil.com/` passes a check for
+// good.com, and `%5C` would have sent the browser to evil.com.
+#[test]
+fn a_checked_redirect_goes_where_the_check_meant() {
+    let d = dir("redirect-checked", "route GET /go ? { u: str } = starts_with(u, \"https://good.com\") || starts_with(u, \"//good.com\") ? redirect(u) : \"no\"\n");
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    for u in ["https://good.com\\@evil.com/", "https://good.com\\\\@evil.com", "//good.com\\@evil.com/x", "https://good.com\\.evil.com", "https://good.com/\\@evil.com", "https://good.com"] {
+        let a = support::send(s.port, "GET", &format!("/go?u={}", enc(u)), &[], "");
+        let to = a.header("location").unwrap_or_else(|| panic!("{}: {}", u, a.status));
+        assert_eq!((a.status, host_of(to)), (303, "good.com".to_string()), "{} -> {}", u, to);
+    }
+    assert_eq!(support::send(s.port, "GET", &format!("/go?u={}", enc("https://evil.com")), &[], "").body, "no");
+}
+
+const NAMED_NULL: &str = r#"component Counter() {
+    state n = 0
+    <button @click={() => { n = n + 1 }}>{n}</button>
+}
+route GET /plain = <html><body><Counter/></body></html>
+route GET /etag = respond(200, <html><body><Counter/></body></html>, { etag: null })
+route GET /range = respond(200, <html><body><Counter/></body></html>, { "content-range": null })
+route GET /srv = respond(200, "x", { server: null })
+route GET /srv2 = respond(200, "x", { server: "mine" })
+route GET /pf = respond(200, <html><body><a href="/plain">p</a></body></html>, { "set-cookie": null })
+route GET /pf2 = respond(200, <html><body><a href="/plain">p</a></body></html>, { "set-cookie": "a=1" })
+route GET /back { let r = respond(200, "x", { "set-cookie": ["a=1", "b=2"], "x-n": null }); respond(r.status, r.body, r.headers) }
+route GET /h = respond(200, "x", { "set-cookie": ["a=1", "b=2"], "x-n": null, "x-k": "v" }).headers
+route GET /one = respond(200, "x", { "set-cookie": "a=1" }).headers
+"#;
+
+// Found in review: a header named `null` holds only its name's place. An `etag` or a
+// `content-range` named so made a page "as written", without its component bundle or the
+// `--watch` reload script; `server: null` still sent `server: Quillo`; `set-cookie: null` had
+// every prefetch refused; and a response's `.headers` kept one `set-cookie` of several, so
+// `respond(r.status, r.body, r.headers)` lost the others.
+#[test]
+fn a_header_named_null_is_no_header_anywhere() {
+    let d = dir("named-null", NAMED_NULL);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let get = |path: &str, h: &[(&str, &str)]| support::send(s.port, "GET", path, h, "");
+    let plain = get("/plain", &[]).body;
+    assert!(plain.contains("</script></body>"), "{}", plain);
+    for path in ["/etag", "/range"] {
+        let a = get(path, &[]);
+        assert_eq!((a.status, a.header("etag"), a.header("content-range"), &a.body), (200, None, None, &plain), "{}", path);
+    }
+    assert_eq!(get("/srv", &[]).header("server"), None);
+    assert_eq!(all_of(&get("/srv2", &[]), "server"), ["mine"]);
+    assert_eq!(get("/plain", &[]).header("server"), Some("Quillo"));
+    for h in [("Sec-Purpose", "prefetch"), ("x-quillo-prefetch", "1")] {
+        assert_eq!(get("/pf", &[h]).status, 200, "{:?}", h);
+        assert_eq!(get("/pf2", &[h]).status, 503, "{:?}", h);
+    }
+    assert_eq!(all_of(&get("/back", &[]), "set-cookie"), ["a=1", "b=2"]);
+    assert_eq!(get("/back", &[]).header("x-n"), None);
+    assert_eq!(get("/h", &[]).body, r#"{"set-cookie":["a=1","b=2"],"x-n":null,"x-k":"v"}"#);
+    assert_eq!(get("/one", &[]).body, r#"{"set-cookie":"a=1"}"#);
+    // Under --watch, the reload script goes in as on any page.
+    let w = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+    for path in ["/plain", "/etag", "/range"] {
+        let a = support::send(w.port, "GET", path, &[], "");
+        assert!(a.body.contains("/_quillo/events?v="), "{}: {}", path, a.body);
     }
 }
 

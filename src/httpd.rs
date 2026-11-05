@@ -2226,7 +2226,9 @@ fn write_head_as(out: &mut Vec<u8>, resp: &HttpResponse, len: Option<u64>, close
     let mut server = false;
     for (k, v) in &resp.headers {
         let skip = ["content-length", "transfer-encoding", "connection", "date"].iter().any(|h| k.eq_ignore_ascii_case(h));
-        // Nor one the program named `null` (FEEDBACK55.md, Q-710; branch feedback55).
+        // Nor one the program named `null`, `server: null` taking Quillo's away too (FEEDBACK55.md,
+        // Q-710; branch feedback55).
+        server |= k.eq_ignore_ascii_case("server");
         if skip || v == crate::server::DROPPED {
             continue;
         }
@@ -2234,7 +2236,6 @@ fn write_head_as(out: &mut Vec<u8>, resp: &HttpResponse, len: Option<u64>, close
             log(format!("quillo: header `{}` not sent: its name or value has characters headers cannot have\n", k.escape_debug()));
             continue;
         }
-        server |= k.eq_ignore_ascii_case("server");
         out.extend_from_slice(k.as_bytes());
         out.extend_from_slice(b": ");
         out.extend_from_slice(v.as_bytes());

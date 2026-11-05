@@ -581,7 +581,8 @@ fn children(v: &Value, start: Option<u64>, count: Option<u64>) -> Vec<(String, V
         Value::Err(x, _, _) => vec![("error".into(), (**x).clone())],
         Value::Response(r) => {
             let mut out = vec![("status".to_string(), Value::Int(r.status as i64))];
-            let headers = r.headers.iter().map(|(k, v)| Value::list(vec![Value::str(k), Value::str(v)])).collect();
+            // A header named `null` shows so (FEEDBACK55.md, Q-710; branch feedback55).
+            let headers = r.headers.iter().map(|(k, v)| Value::list(vec![Value::str(k), if v == crate::server::DROPPED { Value::Nil } else { Value::str(v) }])).collect();
             out.push(("headers".into(), Value::list(headers)));
             if let crate::value::Body::Value(b) = &r.body {
                 out.push(("body".into(), b.clone()));

@@ -236,3 +236,32 @@ fn an_apps_head_of_a_large_file_keeps_the_cookie_it_set() {
     assert_eq!(String::from_utf8_lossy(&ask("GET", "/t").body), "1");
     p.stop();
 }
+
+// The app's jar keeps a cookie by name, path and domain, as a browser does and the server's queue
+// does: a deletion at another path leaves it, two paths are two cookies, the longer path's sent
+// first, and the jar read back from disk keeps them apart (FEEDBACK55.md, Q-714; branch
+// feedback55; found in review).
+#[test]
+fn an_apps_jar_keeps_a_cookie_by_name_path_and_domain() {
+    let src = r#"route GET /set { set_cookie("t", "v"); delete_cookie("t", { path: "/old" }); "set" }
+route GET /two { set_cookie("p", "1", { path: "/a" }); set_cookie("p", "2", { path: "/a/b" }); set_cookie("p", "3", { domain: "app" }); "two" }
+route GET /t = cookie("t") ?? "none"
+route GET /a/b/c = request.headers.cookie ?? "none"
+route GET /a/x = cookie("p") ?? "none"
+route GET /del { delete_cookie("p", { path: "/a/b" }); "del" }
+"#;
+    let (from, to) = bundle("jar-keys", src, &[]);
+    let p = Program::open(&from, &to, "", "{}", "mobile").unwrap();
+    assert_eq!(text(&get(&p, "/set")), "set");
+    assert_eq!(text(&get(&p, "/t")), "v");
+    assert_eq!(text(&get(&p, "/two")), "two");
+    assert_eq!(text(&get(&p, "/a/b/c")), "p=2; p=1; p=3; t=v");
+    assert_eq!(text(&get(&p, "/a/x")), "1");
+    p.stop();
+    // Read back from disk, apart.
+    let p = Program::open(&from, &to, "", "{}", "mobile").unwrap();
+    assert_eq!(text(&get(&p, "/a/b/c")), "p=2; p=1; p=3; t=v");
+    assert_eq!(text(&get(&p, "/del")), "del");
+    assert_eq!(text(&get(&p, "/a/b/c")), "p=1; p=3; t=v");
+    p.stop();
+}

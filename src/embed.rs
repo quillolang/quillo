@@ -628,10 +628,12 @@ fn read_frames(mut from: Pipe, mut to_page: Box<dyn FnMut(Frame) -> bool + Send>
 
 // ---- the cookie jar ------------------------------------------------------------------------
 
-/// The program's cookies, for an app of one person: by name, with the path and when they end.
+/// The program's cookies, for an app of one person: by name, path and domain, as a browser keeps
+/// them, where a second path's or a deletion at another path replaced the first (FEEDBACK55.md,
+/// Q-714; branch feedback55); each with its value and when it ends.
 #[derive(Default)]
 pub struct Jar {
-    cookies: HashMap<String, (String, String, Option<i64>)>,
+    cookies: HashMap<(String, String, String), (String, Option<i64>)>,
 }
 
 fn now() -> i64 {
@@ -639,15 +641,20 @@ fn now() -> i64 {
 }
 
 impl Jar {
+    /// The jar kept on disk: a map of records by a name of their own (the cookie's name for one at
+    /// `/` of no domain, as jars before were), each with its `name` (else the record's), `value`,
+    /// `path`, `domain` and `until`.
     fn read(file: &Path) -> Jar {
         let mut jar = Jar::default();
         let Ok(text) = std::fs::read_to_string(file) else { return jar };
         let Ok(serde_json::Value::Object(m)) = serde_json::from_str::<serde_json::Value>(&text) else { return jar };
-        for (name, c) in m {
+        for (key, c) in m {
             let (Some(v), Some(p)) = (c["value"].as_str(), c["path"].as_str()) else { continue };
+            let name = c["name"].as_str().map_or(key, str::to_string);
+            let domain = c["domain"].as_str().unwrap_or("").to_string();
             let until = c["until"].as_i64();
             if until.map_or(true, |u| u > now()) {
-                jar.cookies.insert(name, (v.to_string(), p.to_string(), until));
+                jar.cookies.insert((name, p.to_string(), domain), (v.to_string(), until));
             }
         }
         jar
@@ -655,7 +662,14 @@ impl Jar {
 
     fn keep(&self, file: Option<&Path>) {
         let Some(file) = file else { return };
-        let m: serde_json::Map<String, serde_json::Value> = self.cookies.iter().map(|(n, (v, p, u))| (n.clone(), serde_json::json!({ "value": v, "path": p, "until": u }))).collect();
+        let m: serde_json::Map<String, serde_json::Value> = self
+            .cookies
+            .iter()
+            .map(|((n, p, d), (v, u))| {
+                let key = if p == "/" && d.is_empty() { n.clone() } else { format!("{}; Path={}; Domain={}", n, p, d) };
+                (key, serde_json::json!({ "name": n, "value": v, "path": p, "domain": d, "until": u }))
+            })
+            .collect();
         if let Some(dir) = file.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -673,20 +687,23 @@ impl Jar {
             let Some((name, value)) = parts.next().and_then(|p| p.split_once('=')) else { continue };
             let (name, value) = (name.trim().to_string(), value.trim().to_string());
             let mut path = "/".to_string();
+            let mut domain = String::new();
             let mut until = None;
             for a in parts {
                 let (k, val) = a.split_once('=').map_or((a.trim(), ""), |(k, v)| (k.trim(), v.trim()));
                 match k.to_ascii_lowercase().as_str() {
                     "path" if val.starts_with('/') => path = val.to_string(),
+                    "domain" => domain = val.trim_start_matches('.').to_ascii_lowercase(),
                     "max-age" => until = val.parse::<i64>().ok().map(|s| now() + s),
                     "expires" if until.is_none() => until = crate::dates::http_seconds(val),
                     _ => {}
                 }
             }
+            let key = (name, path, domain);
             if until.is_some_and(|u| u <= now()) || value.is_empty() && until.is_some() {
-                changed |= self.cookies.remove(&name).is_some();
+                changed |= self.cookies.remove(&key).is_some();
             } else {
-                self.cookies.insert(name, (value, path, until));
+                self.cookies.insert(key, (value, until));
                 changed = true;
             }
         }
@@ -695,22 +712,24 @@ impl Jar {
         }
     }
 
-    /// `Cookie` on a request, for its path.
+    /// `Cookie` on a request, for its path: a longer path's first, as browsers send them, so that
+    /// `request.cookies` keeps it (FEEDBACK55.md, Q-714 and Q-718; branch feedback55).
     pub fn add_to(&self, req: &mut HttpRequest) {
         let path = req.url.split('?').next().unwrap_or("/");
         let t = now();
-        let mut pairs: Vec<String> = self
+        let mut pairs: Vec<(&str, &str, &str)> = self
             .cookies
             .iter()
-            .filter(|(_, (_, p, u))| u.map_or(true, |u| u > t) && (path == p || path.starts_with(&format!("{}/", p.trim_end_matches('/'))) || p == "/"))
-            .map(|(n, (v, _, _))| format!("{}={}", n, v))
+            .filter(|((_, p, _), (_, u))| u.map_or(true, |u| u > t) && (path == p || path.starts_with(&format!("{}/", p.trim_end_matches('/'))) || p == "/"))
+            .map(|((n, p, _), (v, _))| (n.as_str(), p.as_str(), v.as_str()))
             .collect();
         if pairs.is_empty() {
             return;
         }
-        pairs.sort();
+        pairs.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)).then(a.2.cmp(b.2)));
+        let line: Vec<String> = pairs.iter().map(|(n, _, v)| format!("{}={}", n, v)).collect();
         req.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("cookie"));
-        req.headers.push(("cookie".into(), pairs.join("; ")));
+        req.headers.push(("cookie".into(), line.join("; ")));
     }
 }
 
