@@ -1994,6 +1994,11 @@ fn site_headers(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         let value = match v {
             Value::Nil => None,
+            // A `location` that runs code or carries a page, as `respond`'s (FEEDBACK55.md, Q-719;
+            // branch feedback55; found in review).
+            Value::Str(s) if name == "location" && runs_or_carries(s) => {
+                return fail(line, format!("`site_headers`: `location` is not given a javascript:, vbscript: or data: URL, got {}", v.repr()))
+            }
             Value::Str(s) if !s.contains(['\r', '\n']) => Some(s.to_string()),
             Value::Int(_) | Value::Bool(_) => Some(v.display().to_string()),
             other => return fail(line, format!("`site_headers`: the value of `{}` is text on one line, or null, got {}", name, other.repr())),
@@ -2088,6 +2093,10 @@ fn redirect(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if crate::interp::script_url(&url) {
         return fail(line, "`redirect` is not given a javascript: URL");
     }
+    // Nor a page of its own (FEEDBACK55.md, Q-719; branch feedback55; found in review).
+    if runs_or_carries(&url) {
+        return fail(line, "`redirect` is not given a data: URL");
+    }
     // A host past ASCII that IDNA cannot write is no host a browser goes to (FEEDBACK55.md, Q-719;
     // branch feedback55).
     let Some(to) = location(&url) else {
@@ -2112,10 +2121,29 @@ pub(crate) fn location(url: &str) -> Option<String> {
     let fine = |c: u8| c.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&'()*+,;=".contains(&c);
     let scheme = url.find(':').filter(|&i| i > 0 && url.as_bytes()[0].is_ascii_alphabetic() && url[..i].bytes().all(|c| c.is_ascii_alphanumeric() || b"+-.".contains(&c)));
     let special = scheme.map_or(true, |i| ["http", "https", "ws", "wss", "ftp", "file"].iter().any(|s| url[..i].eq_ignore_ascii_case(s)));
-    let url: std::borrow::Cow<str> = match url.find(['?', '#']).unwrap_or(url.len()) {
-        before if special && url[..before].contains('\\') => format!("{}{}", url[..before].replace('\\', "/"), &url[before..]).into(),
-        _ => url.into(),
+    let before = url.find(['?', '#']).unwrap_or(url.len());
+    let mut url: std::borrow::Cow<str> = if scheme.is_none() && url.starts_with('/') && url[..before].contains('\\') {
+        // A path of the site's own, `/` first: a `\` in its leading run of `/` and `\` is written
+        // `%5C`, so that the path stays on the site, as a check that it starts with `/` and not
+        // `//` meant, and `--base` still prefixes it: `/\evil.com` written `//evil.com` left the
+        // site (FEEDBACK55.md, Q-719; branch feedback55; found in review). The path's other `\`
+        // are `/`, as browsers read them.
+        let lead = url.bytes().take_while(|b| matches!(b, b'/' | b'\\')).count();
+        format!("{}{}{}", url[..lead].replace('\\', "%5C"), url[lead..before].replace('\\', "/"), &url[before..]).into()
+    } else if special && url[..before].contains('\\') {
+        format!("{}{}", url[..before].replace('\\', "/"), &url[before..]).into()
+    } else {
+        url.into()
     };
+    // A path of the site's own without its `.` and `..` segments (`%2e` too, as browsers read it),
+    // so that one under `--base` cannot climb out of it: `/p\..\..\evil` was `/app/p/../../evil`
+    // (RFC 3986 §5.2.4; FEEDBACK55.md, Q-719; branch feedback55; found in review).
+    if scheme.is_none() && url.starts_with('/') && !url.starts_with("//") {
+        let end = url.find(['?', '#']).unwrap_or(url.len());
+        if url[..end].split('/').any(|seg| dots(seg) > 0) {
+            url = format!("{}{}", without_dots(&url[..end]), &url[end..]).into();
+        }
+    }
     if url.bytes().all(fine) {
         return Some(url.into_owned());
     }
@@ -2172,6 +2200,50 @@ pub(crate) fn location(url: &str) -> Option<String> {
     Some(out)
 }
 
+/// A path segment that is `.` (1) or `..` (2), in any of the forms browsers read so (`%2e`, `.%2E`),
+/// else 0 (FEEDBACK55.md, Q-719; branch feedback55).
+fn dots(seg: &str) -> u8 {
+    if seg.is_empty() || seg.len() > 6 {
+        return 0;
+    }
+    match seg.to_ascii_lowercase().as_str() {
+        "." | "%2e" => 1,
+        ".." | ".%2e" | "%2e." | "%2e%2e" => 2,
+        _ => 0,
+    }
+}
+
+/// `path` (starting `/`) without its dot segments, as RFC 3986 §5.2.4 removes them: `/a/b/../c` is
+/// `/a/c`, `/a/..` is `/`, and a `..` past the root stays at it (FEEDBACK55.md, Q-719; branch
+/// feedback55).
+fn without_dots(path: &str) -> String {
+    let segs: Vec<&str> = path[1..].split('/').collect();
+    let mut out: Vec<&str> = Vec::with_capacity(segs.len());
+    for (i, seg) in segs.iter().enumerate() {
+        let last = i + 1 == segs.len();
+        match dots(seg) {
+            0 => out.push(seg),
+            n => {
+                if n == 2 {
+                    out.pop();
+                }
+                if last {
+                    out.push("");
+                }
+            }
+        }
+    }
+    format!("/{}", out.join("/"))
+}
+
+/// Whether a URL would run code or carry a page of its own when followed: `javascript:`,
+/// `vbscript:` or `data:`, however browsers would read it (FEEDBACK55.md, Q-719; branch
+/// feedback55).
+pub(crate) fn runs_or_carries(url: &str) -> bool {
+    let start: String = url.trim_start_matches(|c: char| c <= ' ').chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).take(5).collect();
+    crate::interp::script_url(url) || start.eq_ignore_ascii_case("data:")
+}
+
 /// `respond(status, body, headers = {})` builds a response value.
 fn respond(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let status = i_arg(&args, 0, "respond", line)?;
@@ -2219,6 +2291,11 @@ pub(crate) fn answer_headers(h: &Map, f: &str, line: u32) -> Result<Vec<(String,
             }
             v => out.push((k, v.display())),
         }
+    }
+    // A `location` that runs code or carries a page is refused, as `redirect` refuses it: an app
+    // went to it (FEEDBACK55.md, Q-719; branch feedback55; found in review).
+    if let Some((_, v)) = out.iter().find(|(k, v)| k == "location" && runs_or_carries(v)) {
+        return fail(line, format!("`{}` header `location` is not given a javascript:, vbscript: or data: URL, got {}", f, Value::str(v.as_str()).repr()));
     }
     // Header text often comes from the request; a line break in it would
     // let the sender add headers (or a whole response) of their own.

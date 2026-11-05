@@ -265,3 +265,25 @@ route GET /del { delete_cookie("p", { path: "/a/b" }); "del" }
     assert_eq!(text(&get(&p, "/a/b/c")), "p=1; p=3; t=v");
     p.stop();
 }
+
+// A cookie set with no `Path` is for the folder of the path asked for, RFC 6265's default-path
+// (§5.1.4), where the jar kept it at `/`, so that a deletion at that path takes it away
+// (FEEDBACK55.md, Q-714; branch feedback55; found in review).
+#[test]
+fn an_apps_jar_keeps_a_cookie_with_no_path_at_its_requests_folder() {
+    let src = r#"route GET /account/settings = respond(200, "set", { "set-cookie": "np=1" })
+route GET /top = respond(200, "set", { "set-cookie": "tp=1" })
+route GET /account/x = request.headers.cookie ?? "none"
+route GET /other = request.headers.cookie ?? "none"
+route GET /account/del = respond(200, "del", { "set-cookie": "np=; Path=/account; Max-Age=0" })
+"#;
+    let (from, to) = bundle("jar-default-path", src, &[]);
+    let p = Program::open(&from, &to, "", "{}", "mobile").unwrap();
+    assert_eq!(text(&get(&p, "/account/settings?a=/b/c")), "set");
+    assert_eq!(text(&get(&p, "/top")), "set");
+    assert_eq!(text(&get(&p, "/account/x")), "np=1; tp=1");
+    assert_eq!(text(&get(&p, "/other")), "tp=1");
+    assert_eq!(text(&get(&p, "/account/del")), "del");
+    assert_eq!(text(&get(&p, "/account/x")), "tp=1");
+    p.stop();
+}

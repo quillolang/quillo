@@ -2113,8 +2113,23 @@ fn redirect_takes_redirect_statuses_and_a_url_location_holds() {
         ("https://good.com\\@evil.com/", "https://good.com/@evil.com/"),
         ("HTTPS://good.com\\@evil.com/", "HTTPS://good.com/@evil.com/"),
         ("//good.com\\@evil.com", "//good.com/@evil.com"),
-        ("/\\evil.com", "//evil.com"),
+        // A path of the site's own keeps the `\` of its leading `/` run, so it stays on the site;
+        // one that does not start with `/` is read as browsers read it (found in review).
+        ("/\\evil.com", "/%5Cevil.com"),
+        ("/\\/evil.com", "/%5C/evil.com"),
+        ("/\\\\evil.com", "/%5C%5Cevil.com"),
+        ("//\\evil.com", "//%5Cevil.com"),
+        ("/a\\b\\c", "/a/b/c"),
         ("\\\\evil.com", "//evil.com"),
+        // Its dot segments taken out, as browsers would, `%2e` too; a query's and an absolute
+        // URL's are let be (RFC 3986 §5.2.4; found in review).
+        ("/p\\..\\..\\evil", "/evil"),
+        ("/p/%2e%2e/%2E./evil?x=/../y", "/evil?x=/../y"),
+        ("/a/./b/../c/", "/a/c/"),
+        ("/a/b/..", "/a/"),
+        ("/..", "/"),
+        ("/a/..b/.c", "/a/..b/.c"),
+        ("https://good.com/a/../b", "https://good.com/a/../b"),
         ("wss://good.com\\@evil.com", "wss://good.com/@evil.com"),
         ("https://good.com/a\\b?c\\d#e\\f", "https://good.com/a/b?c%5Cd#e%5Cf"),
         ("mailto:a\\b", "mailto:a%5Cb"),
@@ -2157,6 +2172,66 @@ fn a_checked_redirect_goes_where_the_check_meant() {
         assert_eq!((a.status, host_of(to)), (303, "good.com".to_string()), "{} -> {}", u, to);
     }
     assert_eq!(support::send(s.port, "GET", &format!("/go?u={}", enc("https://evil.com")), &[], "").body, "no");
+}
+
+// Found in review: a check that a redirect stays on the site (`/` first, not `//`) and a path made
+// of what the visitor sent stay on the site, with `--base` too, which prefixes a path of the
+// site's own: `/\evil.com` sent as `//evil.com` left it, and under `--base` a `..` climbed out.
+#[test]
+fn a_path_of_the_sites_own_stays_on_it_with_or_without_base() {
+    let d = dir(
+        "redirect-base",
+        "route GET /to ? { u: str } = redirect(u)\nroute GET /lang/:l = redirect(\"/\" + l + \"/home\")\nroute GET /safe ? { u: str } = starts_with(u, \"/\") && !starts_with(u, \"//\") ? redirect(u) : \"no\"\n",
+    );
+    for (base, opts) in [("", &[][..]), ("/app", &["--base", "/app"][..])] {
+        let s = support::serve_with(&d.join("main.qwe"), opts);
+        let to = |path: &str| support::send(s.port, "GET", path, &[], "").header("location").unwrap_or_default().to_string();
+        for (u, want) in [
+            ("/\\evil.com", "/%5Cevil.com"),
+            ("/\\/evil.com", "/%5C/evil.com"),
+            ("/\\\\evil.com", "/%5C%5Cevil.com"),
+            ("/p\\..\\..\\evil", "/evil"),
+            ("/../../evil", "/evil"),
+            ("/p/%2e%2e/%2e%2e/evil", "/evil"),
+            ("/x", "/x"),
+        ] {
+            assert_eq!(to(&format!("/safe?u={}", enc(u))), format!("{}{}", base, want), "{} under {:?}", u, base);
+            assert_eq!(to(&format!("/to?u={}", enc(u))), format!("{}{}", base, want), "{} under {:?}", u, base);
+        }
+        assert_eq!(to("/lang/%5Cevil.com"), format!("{}/%5Cevil.com/home", base));
+        assert_eq!(to("/lang/%5C%5Cevil.com"), format!("{}/%5C%5Cevil.com/home", base));
+        // What is not a path of the site's own is as browsers read it, the base not before it.
+        assert_eq!(to(&format!("/to?u={}", enc("\\\\evil.com"))), "//evil.com");
+        assert_eq!(to(&format!("/to?u={}", enc("https://good.com\\@evil.com"))), "https://good.com/@evil.com");
+        assert_eq!(support::send(s.port, "GET", &format!("/safe?u={}", enc("//evil.com")), &[], "").body, "no");
+    }
+}
+
+// Found in review: a `location` that runs code or carries a page is refused in `respond` and
+// `site_headers` as in `redirect` (an app went to it), in any of the forms browsers read.
+#[test]
+fn no_location_runs_code_or_carries_a_page() {
+    let d = dir(
+        "location-scripts",
+        "route GET /r ? { u: str } = respond(302, null, { location: u })\nroute GET /s ? { u: str } = stream((send) => send(\"x\"), { headers: { Location: u } })\nroute GET /to ? { u: str } = redirect(u)\n",
+    );
+    let (_g, port, log) = serve_logged(&d, &[]);
+    for (i, u) in ["javascript:alert(1)", "JavaScript:alert(1)", " java\tscript:alert(1)", "vbscript:x", "data:text/html,<script>alert(1)</script>", "DATA:x", "\u{1}data:x"].iter().enumerate() {
+        for route in ["r", "s"] {
+            let why = error_of(port, &log, &format!("/{}?u={}&i={}", route, enc(u), i));
+            assert!(why.contains("header `location` is not given a javascript:, vbscript: or data: URL"), "{} {:?}: {}", route, u, why);
+        }
+        let why = error_of(port, &log, &format!("/to?u={}&i={}", enc(u), i));
+        assert!(why.contains("`redirect` is not given a") || why.contains("`redirect` URL cannot contain line breaks, tabs or other control characters"), "{:?}: {}", u, why);
+    }
+    for u in ["/ok", "https://example.com/data:x", "?data:x", "datax:y"] {
+        let a = support::send(port, "GET", &format!("/r?u={}", enc(u)), &[], "");
+        assert_eq!((a.status, a.header("location")), (302, Some(u)), "{}", u);
+    }
+    let d = dir("location-site", "site_headers({ location: env(\"L\") ?? \"/\" })\nprint(\"ok\")\n");
+    let ran = script_with_env(&d, "main.qwe", &[("L", "data:x")]);
+    assert!(ran.contains("`site_headers`: `location` is not given a javascript:, vbscript: or data: URL, got \"data:x\""), "{}", ran);
+    assert!(script_with_env(&d, "main.qwe", &[("L", "/elsewhere")]).contains("ok"));
 }
 
 const NAMED_NULL: &str = r#"component Counter() {

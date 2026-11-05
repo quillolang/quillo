@@ -299,6 +299,8 @@ struct ReplySink<'a> {
     reply: &'a mut dyn Reply,
     inner: &'a Inner,
     gone: bool,
+    /// The request's path, whose folder a cookie with no `Path` is for.
+    asked: &'a str,
 }
 
 impl crate::stream::Sink for ReplySink<'_> {
@@ -307,7 +309,7 @@ impl crate::stream::Sink for ReplySink<'_> {
     }
 
     fn start(&mut self, resp: &HttpResponse, _: bool) -> bool {
-        self.inner.jar.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take_from(resp, self.inner.jar_file.as_deref());
+        self.inner.jar.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take_from(resp, self.asked, self.inner.jar_file.as_deref());
         // Not those the program sent none of (FEEDBACK55.md, Q-710; branch feedback55).
         let headers: Vec<(String, String)> = resp.headers.iter().filter(|(_, v)| v != crate::server::DROPPED).cloned().collect();
         self.reply.head(resp.status, &headers);
@@ -325,18 +327,19 @@ impl crate::stream::Sink for ReplySink<'_> {
 
 fn answer(inner: &Arc<Inner>, worker: &mut Worker, req: HttpRequest, reply: &mut dyn Reply) {
     inner.app.shared().gil.acquire();
-    let mut sink = ReplySink { reply, inner, gone: false };
+    let asked = req.url.clone();
+    let mut sink = ReplySink { reply, inner, gone: false, asked: &asked };
     let got = worker.answer(&inner.app, req, Some(&mut sink));
     inner.app.shared().gil.release();
     match got {
         Answer::Respond(resp) => {
-            inner.jar.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take_from(&resp, inner.jar_file.as_deref());
+            inner.jar.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take_from(&resp, &asked, inner.jar_file.as_deref());
             send_whole(reply, &resp);
         }
         // A HEAD of a large file says the length a GET would send (FEEDBACK55.md, Q-725; branch
         // feedback55).
         Answer::Head(mut resp, len) => {
-            inner.jar.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take_from(&resp, inner.jar_file.as_deref());
+            inner.jar.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take_from(&resp, &asked, inner.jar_file.as_deref());
             resp.headers.push(("content-length".into(), len.to_string()));
             send_whole(reply, &resp);
         }
@@ -349,7 +352,7 @@ fn answer(inner: &Arc<Inner>, worker: &mut Worker, req: HttpRequest, reply: &mut
                 return;
             };
             f(as_tcp(theirs), Vec::new());
-            relay(ours, reply, inner);
+            relay(ours, reply, inner, &asked);
         }
     }
 }
@@ -358,6 +361,7 @@ fn answer(inner: &Arc<Inner>, worker: &mut Worker, req: HttpRequest, reply: &mut
 /// and the handshake of a connection (`stream`: the socket end a detached answer gets).
 fn answer_now_with(inner: &Arc<Inner>, req: HttpRequest, stream: Option<Pipe>) -> HttpResponse {
     let mut worker = Worker::new(&inner.app);
+    let asked = req.url.clone();
     inner.app.shared().gil.acquire();
     let got = worker.answer(&inner.app, req, None);
     inner.app.shared().gil.release();
@@ -373,7 +377,7 @@ fn answer_now_with(inner: &Arc<Inner>, req: HttpRequest, stream: Option<Pipe>) -
                 let Ok((ours, theirs)) = pair() else { return crate::server::plain_response(500, "no pipe\n") };
                 f(as_tcp(theirs), Vec::new());
                 let mut w = Whole { status: 0, headers: Vec::new(), body: Vec::new(), done: None };
-                relay(ours, &mut w, inner);
+                relay(ours, &mut w, inner, &asked);
                 HttpResponse { status: w.status, headers: w.headers, body: w.body }
             }
         },
@@ -437,7 +441,7 @@ fn send_whole(reply: &mut dyn Reply, resp: &HttpResponse) {
 
 /// An HTTP answer read from a socket, to `reply`: its head, then its body by its length, in
 /// chunks, or until the end.
-fn relay(mut from: Pipe, reply: &mut dyn Reply, inner: &Inner) {
+fn relay(mut from: Pipe, reply: &mut dyn Reply, inner: &Inner, asked: &str) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 16 << 10];
     let (head_len, status, headers) = loop {
@@ -457,7 +461,7 @@ fn relay(mut from: Pipe, reply: &mut dyn Reply, inner: &Inner) {
         }
     };
     let resp = HttpResponse { status, headers: headers.clone(), body: Vec::new() };
-    inner.jar.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take_from(&resp, inner.jar_file.as_deref());
+    inner.jar.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take_from(&resp, asked, inner.jar_file.as_deref());
     let shown: Vec<(String, String)> = headers.iter().filter(|(k, _)| k != "transfer-encoding" && k != "connection").cloned().collect();
     reply.head(status, &shown);
     let header = |n: &str| headers.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
@@ -636,6 +640,15 @@ pub struct Jar {
     cookies: HashMap<(String, String, String), (String, Option<i64>)>,
 }
 
+/// RFC 6265's default-path of a request's path (§5.1.4): its folder, `/` for one at the root.
+fn default_path(asked: &str) -> String {
+    let path = asked.split(['?', '#']).next().unwrap_or("");
+    match path.rfind('/') {
+        Some(i) if i > 0 && path.starts_with('/') => path[..i].to_string(),
+        _ => "/".to_string(),
+    }
+}
+
 fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
@@ -679,14 +692,17 @@ impl Jar {
         }
     }
 
-    /// The `Set-Cookie`s of an answer, taken in (and kept, when they changed).
-    pub fn take_from(&mut self, resp: &HttpResponse, file: Option<&Path>) {
+    /// The `Set-Cookie`s of the answer to a request for `asked`, taken in (and kept, when they
+    /// changed). One with no `Path` is for the folder of the path asked for, RFC 6265's
+    /// default-path (§5.1.4), where it was kept at `/` (FEEDBACK55.md, Q-714; branch feedback55;
+    /// found in review).
+    pub fn take_from(&mut self, resp: &HttpResponse, asked: &str, file: Option<&Path>) {
         let mut changed = false;
         for (_, v) in resp.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie")) {
             let mut parts = v.split(';');
             let Some((name, value)) = parts.next().and_then(|p| p.split_once('=')) else { continue };
             let (name, value) = (name.trim().to_string(), value.trim().to_string());
-            let mut path = "/".to_string();
+            let mut path = default_path(asked);
             let mut domain = String::new();
             let mut until = None;
             for a in parts {
@@ -803,7 +819,10 @@ pub const SHELL_JS: &str = r#"(() => {
       } else if (m.op === "closed") {
         const s = sockets.get(m.id); if (s) { sockets.delete(m.id); s.readyState = 3; if (s.onclose) s.onclose({ code: 1000 }); }
       } else if (m.op === "posted") {
-        location.href = m.location || ("/_quillo/posted/" + m.page);
+        // Only to the web or the app's own pages (FEEDBACK55.md, Q-719; branch feedback55).
+        const goes = (u) => { try { const p = new URL(u, location.href).protocol; return p === "http:" || p === "https:" || p === location.protocol; } catch (_) { return false; } };
+        if (m.location && goes(m.location)) location.href = m.location;
+        else if (m.page) location.href = "/_quillo/posted/" + m.page;
       }
     },
   };
@@ -851,7 +870,9 @@ pub fn bridge_message(p: &Program, message: &str, to_page: Arc<dyn Fn(String) + 
             std::thread::spawn(move || {
                 if posting {
                     let (page, resp) = p.post(req);
-                    let location = resp.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("location")).map(|(_, v)| v.clone());
+                    // Not one that runs code or carries a page, which the page would go to
+                    // (FEEDBACK55.md, Q-719; branch feedback55; found in review).
+                    let location = resp.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("location")).map(|(_, v)| v.clone()).filter(|l| !crate::builtins::runs_or_carries(l));
                     to_page(serde_json::json!({ "op": "posted", "id": id, "page": page, "location": location }).to_string());
                     return;
                 }
