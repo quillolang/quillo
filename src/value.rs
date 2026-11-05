@@ -477,9 +477,8 @@ impl Value {
             Value::Int(n) => {
                 let _ = serde_json::to_writer(&mut *out, n);
             }
-            Value::Float(f) => {
-                let _ = serde_json::to_writer(&mut *out, f);
-            }
+            // As JavaScript writes it (FEEDBACK55.md, Q-781; branch feedback55).
+            Value::Float(f) => json_float_into(*f, out),
             Value::Dec(d) => json_str_into(&d.to_string(), out),
             Value::Str(s) | Value::Html(s) => json_str_into(s, out),
             Value::List(l) => {
@@ -658,7 +657,154 @@ fn fmt_float(f: f64) -> String {
     if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e16 {
         format!("{:.1}", f)
     } else {
-        format!("{}", f)
+        // Rust's `{}`, with the digit JavaScript takes on a tie (FEEDBACK55.md, Q-777; branch
+        // feedback55): the same text, no exponent, `NaN`, `inf` and `-inf` as before.
+        js_number(f)
+    }
+}
+
+/// Up to 17 digits, with no zero at either end, and where the point goes: x = 0.digits × 10^n.
+struct Digits {
+    d: [u8; 32],
+    k: usize,
+    n: i32,
+}
+
+/// The shortest digits that give `f` (finite, not zero) back. Of two as short and as near, the
+/// even one, as JavaScript's Number::toString takes it; Rust's `{}` takes the other, so
+/// `1916218016406818.25` was `...818.3` here and `...818.2` in the browser (FEEDBACK55.md, Q-777;
+/// branch feedback55). Read from serde_json's text (`1.5e-6`, `1e+16`, `0.001`, `2.0`), five
+/// times as fast as Rust's `{:e}`, and the tie made sure of here.
+fn shortest(f: f64) -> Digits {
+    let mut text = [0u8; 40];
+    let len = {
+        let mut w = &mut text[..];
+        let _ = serde_json::to_writer(&mut w, &f.abs());
+        40 - w.len()
+    };
+    let t = &text[..len];
+    let (mant, exp) = match t.iter().position(|&c| c == b'e') {
+        Some(i) => (&t[..i], std::str::from_utf8(&t[i + 1..]).ok().and_then(|e| e.trim_start_matches('+').parse::<i32>().ok()).unwrap_or(0)),
+        None => (t, 0),
+    };
+    let mut out = Digits { d: [0; 32], k: 0, n: 0 };
+    let (mut point, mut lead, mut whole, mut zeros) = (false, true, 0i32, 0i32);
+    for &c in mant {
+        if c == b'.' {
+            point = true;
+        } else if lead && c == b'0' {
+            zeros += point as i32;
+        } else if out.k < out.d.len() {
+            lead = false;
+            whole += !point as i32;
+            out.d[out.k] = c;
+            out.k += 1;
+        }
+    }
+    while out.k > 1 && out.d[out.k - 1] == b'0' {
+        out.k -= 1;
+    }
+    out.n = if whole > 0 { whole } else { -zeros } + exp;
+    if let Some((q, lower)) = tie_at(f) {
+        let mut d = 0u128;
+        for &c in &out.d[..out.k] {
+            d = d * 10 + (c - b'0') as u128;
+        }
+        // Digits that end where the tie is are one of the two: the even one.
+        if out.n - out.k as i32 == q && (d == lower || d == lower + 1) {
+            let even = if lower % 2 == 0 { lower } else { lower + 1 };
+            let text = even.to_string();
+            out.n = text.len() as i32 + q;
+            let text = text.trim_end_matches('0');
+            out.d[..text.len()].copy_from_slice(text.as_bytes());
+            out.k = text.len();
+        }
+    }
+    out
+}
+
+/// Where `f` lies exactly halfway between two decimals of its shortest length that both give
+/// it back: their last place, 10^q, and the lower as digits. That needs few binary digits after
+/// the point, so a float almost never gets past the first test: x = m × 2^v (m odd) is halfway
+/// between multiples of 10^q (q < 0) when v = q - 1, and both are near enough when 10^q is the
+/// largest power of ten not above the spacing of floats there (2^e).
+#[inline(always)]
+fn tie_at(f: f64) -> Option<(i32, u128)> {
+    let bits = f.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let mantissa = (bits & ((1 << 52) - 1)) | (1 << 52);
+    let e = biased - 1075;
+    // floor(e × log10 2), for e < 0: e × log10 2 is never whole there.
+    let q = -(((-e) * 78913) >> 18) - 1;
+    // Below the normal floats the spacing is too fine for a short tie; inf and NaN have none.
+    if e + mantissa.trailing_zeros() as i32 != q - 1 || biased == 0 || biased == 0x7ff || e >= 0 {
+        return None;
+    }
+    tie_found(f, mantissa, q)
+}
+
+#[inline(never)]
+fn tie_found(f: f64, mantissa: u64, q: i32) -> Option<(i32, u128)> {
+    let tz = mantissa.trailing_zeros();
+    let half = ((mantissa >> tz) as u128).checked_mul(5u128.checked_pow((-q) as u32)?)?;
+    let lower = (half - 1) / 2;
+    // At a power of two the floats below are closer together: both must give it back.
+    let back = |d: u128| format!("{}e{}", d, q).parse::<f64>().ok() == Some(f.abs());
+    (back(lower) && back(lower + 1)).then_some((q, lower))
+}
+
+/// A float in JSON as JavaScript writes it (`String(x)`): its shortest digits, with an exponent
+/// from 1e21 up and below 1e-6, where serde_json's went to one from 1e16 and below 1e-5, so
+/// `json.stringify` gave other text on each side; a whole one ends in `.0`, as before, so it
+/// reads back as a float (FEEDBACK55.md, Q-781; branch feedback55). -0.0 stays `-0.0`, which
+/// reads back as itself on both sides; inf and NaN are null, as JSON has neither.
+fn json_float_into(f: f64, out: &mut Vec<u8>) {
+    if !f.is_finite() {
+        return out.extend_from_slice(b"null");
+    }
+    if f == 0.0 {
+        return out.extend_from_slice(if f.is_sign_negative() { b"-0.0" } else { b"0.0" });
+    }
+    // serde_json's text is JavaScript's where there is no tie, but for the exponent it writes from
+    // 1e16 and below 1e-5: kept as it is unless it has one of those (the usual case, three times
+    // as fast as writing the digits again).
+    if tie_at(f).is_none() {
+        let start = out.len();
+        let _ = serde_json::to_writer(&mut *out, &f);
+        if (1e-4..1e15).contains(&f.abs()) {
+            return;
+        }
+        let Some(at) = out[start..].iter().position(|&c| c == b'e') else { return };
+        let e = std::str::from_utf8(&out[start + at + 1..]).ok().and_then(|e| e.trim_start_matches('+').parse::<i32>().ok());
+        if e.is_some_and(|e| !(-7 < e && e < 21)) {
+            return;
+        }
+        out.truncate(start);
+    }
+    let s = shortest(f);
+    let (d, k, n) = (&s.d[..s.k], s.k as i32, s.n);
+    if f < 0.0 {
+        out.push(b'-');
+    }
+    if k <= n && n <= 21 {
+        out.extend_from_slice(d);
+        out.extend(std::iter::repeat_n(b'0', (n - k) as usize));
+        out.extend_from_slice(b".0");
+    } else if 0 < n && n <= 21 {
+        out.extend_from_slice(&d[..n as usize]);
+        out.push(b'.');
+        out.extend_from_slice(&d[n as usize..]);
+    } else if -6 < n && n <= 0 {
+        out.extend_from_slice(b"0.");
+        out.extend(std::iter::repeat_n(b'0', (-n) as usize));
+        out.extend_from_slice(d);
+    } else {
+        out.push(d[0]);
+        if k > 1 {
+            out.push(b'.');
+            out.extend_from_slice(&d[1..]);
+        }
+        let _ = std::io::Write::write_fmt(out, format_args!("e{}{}", if n > 1 { "+" } else { "-" }, (n - 1).abs()));
     }
 }
 
@@ -708,7 +854,22 @@ pub fn set_loading(on: bool) -> bool {
 }
 
 pub fn hiding() -> bool {
-    HIDING.load(std::sync::atomic::Ordering::Relaxed) && !TOLD.with(|t| t.get())
+    HIDING_HERE.with(|h| h.get()).unwrap_or_else(|| HIDING.load(std::sync::atomic::Ordering::Relaxed)) && !TOLD.with(|t| t.get())
+}
+
+thread_local! {
+    /// Whether errors are hidden on this thread alone, whatever `HIDING` says (`hiding_here`).
+    static HIDING_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `f`, run with errors hidden (or shown) on this thread alone, as a server in production (or
+/// under `--watch`) hides them: for a test, which set `HIDING` for every test of its process and
+/// hid what the others' errors said (found in review of FEEDBACK55.md; branch feedback55).
+pub fn hiding_here<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = HIDING_HERE.with(|h| h.replace(Some(on)));
+    let r = f();
+    HIDING_HERE.with(|h| h.set(was));
+    r
 }
 
 /// `f`, which makes text that stays on this machine, with errors as they are. It
@@ -728,6 +889,31 @@ pub fn js_numbers<R>(on: bool, f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// `f` (finite) in exponent form from its shortest digits, the even one on a tie (`shortest`), as
+/// `{:e}` writes it: a decimal made from a float is the browser's, where `{:e}` took the other
+/// digit (`dec(1e15 + 0.3)` was ...0.3m here and ...0.2m there; FEEDBACK55.md, Q-777; found in
+/// review). Zero is `0e0`.
+pub fn shortest_e(f: f64) -> String {
+    if f == 0.0 {
+        return if f.is_sign_negative() { "-0e0" } else { "0e0" }.into();
+    }
+    let s = shortest(f);
+    // SAFETY: digits only.
+    let digits = unsafe { std::str::from_utf8_unchecked(&s.d[..s.k]) };
+    let mut text = String::with_capacity(s.k + 8);
+    if f < 0.0 {
+        text.push('-');
+    }
+    text.push_str(&digits[..1]);
+    if s.k > 1 {
+        text.push('.');
+        text.push_str(&digits[1..]);
+    }
+    text.push('e');
+    text.push_str(&(s.n - 1).to_string());
+    text
+}
+
 /// A number as the page writes it: `8` for 8.0, with no exponent. An infinity
 /// is `inf`, as everywhere else on both sides (FEEDBACK16.md, Q-120; branch
 /// feedback20-fixes).
@@ -741,23 +927,30 @@ pub fn js_number(f: f64) -> String {
     if f == 0.0 {
         return "0".into();
     }
-    // The shortest digits that give f back, and where the point goes:
-    // f = 0.digits × 10^n.
-    let sci = format!("{:e}", f.abs());
-    let (mant, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
-    let digits: String = mant.chars().filter(|c| *c != '.').collect();
-    let k = digits.len() as i32;
-    let n = exp.parse::<i32>().unwrap_or(0) + 1;
+    // The shortest digits that give f back, and where the point goes: f = 0.digits × 10^n,
+    // the even one on a tie, as the browser writes it (FEEDBACK55.md, Q-777; branch feedback55).
+    let s = shortest(f);
+    // SAFETY: digits only.
+    let (digits, k, n) = (unsafe { std::str::from_utf8_unchecked(&s.d[..s.k]) }, s.k as i32, s.n);
+    let mut text = String::with_capacity(k.max(n).max(1 - n) as usize + 3);
+    if f < 0.0 {
+        text.push('-');
+    }
     // Never in exponent form, on either side (FEEDBACK25.md, Q-309; branch
     // feedback26-fixes).
-    let text = if k <= n {
-        format!("{}{}", digits, "0".repeat((n - k) as usize))
+    if k <= n {
+        text.push_str(digits);
+        text.extend(std::iter::repeat_n('0', (n - k) as usize));
     } else if 0 < n {
-        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
+        text.push_str(&digits[..n as usize]);
+        text.push('.');
+        text.push_str(&digits[n as usize..]);
     } else {
-        format!("0.{}{}", "0".repeat((-n) as usize), digits)
-    };
-    if f < 0.0 { format!("-{}", text) } else { text }
+        text.push_str("0.");
+        text.extend(std::iter::repeat_n('0', (-n) as usize));
+        text.push_str(digits);
+    }
+    text
 }
 
 /// A map's key and its colon, as `repr` writes them.

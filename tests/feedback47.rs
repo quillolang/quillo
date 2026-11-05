@@ -350,9 +350,14 @@ route POST /agree { form: { agree: bool = false } } = `agree=${agree}`
     assert_eq!(send(&mut it, "POST", "/agree", &form, "agree=on").text(), "agree=true");
 }
 
+/// Held by each test that sets `SHOW_ERRORS`, which is the process's: one set it back while another
+/// read it (found in review of FEEDBACK55's slice 9).
+static SHOWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // Q-544: every miss was the same line, with nothing in the log.
 #[test]
 fn a_pattern_miss_says_which_field_and_what_it_wanted() {
+    let _one = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
     quillo::server::SHOW_ERRORS.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut it = app(
         r#"
@@ -486,6 +491,7 @@ fn mistakes_on_the_route_line_say_what_they_are() {
 // The review of FEEDBACK47's first version: what it said or let through wrongly.
 #[test]
 fn the_reviews_cases_for_middleware_and_patterns() {
+    let _one = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
     quillo::server::SHOW_ERRORS.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut it = app(
         r#"

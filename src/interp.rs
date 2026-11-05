@@ -567,7 +567,11 @@ pub fn escape(s: &str) -> String {
 }
 
 /// `escape`, appending to `out`: runs without special characters are
-/// copied whole.
+/// copied whole. The HTML parser makes a CR a newline and drops a NUL from text, so the page
+/// said otherwise than the browser's own text, and it made the component again on every load: a
+/// CR is `&#13;`, which the parser keeps, and a NUL U+FFFD, as the parser makes it in an attribute
+/// and the browser writes it (FEEDBACK55.md, Q-772; branch feedback55). In an attribute too, as
+/// Q-312 had it there (FEEDBACK25.md; branch feedback26-fixes).
 pub fn escape_into(s: &str, out: &mut String) {
     fn entity(b: u8) -> Option<&'static str> {
         Some(match b {
@@ -576,6 +580,8 @@ pub fn escape_into(s: &str, out: &mut String) {
             b'>' => "&gt;",
             b'"' => "&quot;",
             b'\'' => "&#39;",
+            b'\r' => "&#13;",
+            0 => "\u{FFFD}",
             _ => return None,
         })
     }
@@ -591,7 +597,7 @@ pub fn escape_into(s: &str, out: &mut String) {
     let (mut done, mut i) = (0, 0);
     while i + 8 <= b.len() {
         let x = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        if has(x, b'&') | has(x, b'<') | has(x, b'>') | has(x, b'"') | has(x, b'\'') != 0 {
+        if has(x, b'&') | has(x, b'<') | has(x, b'>') | has(x, b'"') | has(x, b'\'') | has(x, b'\r') | has(x, 0) != 0 {
             for j in i..i + 8 {
                 if let Some(e) = entity(b[j]) {
                     out.push_str(&s[done..j]);
@@ -4993,14 +4999,8 @@ impl Interp {
                 out.push('"');
             }
             // The HTML parser folds a CR, so `value={s}` would read otherwise here than
-            // after an update (FEEDBACK25.md, Q-312; branch feedback26-fixes).
-            Value::Str(s) if s.contains('\r') => {
-                out.push(' ');
-                out.push_str(name);
-                out.push_str("=\"");
-                out.push_str(&escape(s).replace('\r', "&#13;"));
-                out.push('"');
-            }
+            // after an update (FEEDBACK25.md, Q-312; branch feedback26-fixes): `escape_into`
+            // writes it `&#13;` (FEEDBACK55.md, Q-772; branch feedback55).
             other => {
                 out.push(' ');
                 out.push_str(name);

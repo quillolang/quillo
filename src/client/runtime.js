@@ -46,8 +46,23 @@ const putKey = (o, k, v) => {
 const fail = (msg) => { throw new QuilloError(msg); };
 const isNil = (v) => v === null || v === undefined;
 const isEvent = (v) => typeof Event !== "undefined" && v instanceof Event;
-const isMap = (v) => v !== null && typeof v === "object" && (v.constructor === Object || (!Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !(v instanceof Dec) && !isEvent(v)));
+const isMap = (v) => v !== null && typeof v === "object" && (v.constructor === Object || (!Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !(v instanceof Dec) && !(v instanceof Fl) && !isEvent(v)));
 const isInt = (v) => typeof v === "number" && Number.isInteger(v);
+
+// A float whose value is whole (2.0, -0.0, 1e300): a JS number cannot say it is no int, so it is
+// held in an Fl, and `2.0 / 0` is inf, an `int` parameter refuses it, and `type_of` says float, as
+// on the server. A float with a fraction, NaN and the infinities stay numbers; an int is a whole
+// number to 2^53, a BigInt past it (FEEDBACK55.md, Q-775; branch feedback55).
+// It reads as its number where the page's code (or the runtime's own) takes one: `Number(x)`, a
+// player's volume, a timer's delay.
+class Fl { constructor(f) { this.f = f; } valueOf() { return this.f; } toString() { return String(this.f); } }
+// A float answer as the page keeps it.
+const fl = (x) => (Number.isInteger(x) ? new Fl(x) : x);
+const isFloat = (v) => v instanceof Fl || (typeof v === "number" && !Number.isInteger(v));
+// A number as a float, as the server's `as_f64` reads it (an int past 2^53 too); null for what is
+// no number.
+const numOf = (v) => (typeof v === "number" ? v : v instanceof Fl ? v.f : typeof v === "bigint" ? Number(v) : null);
+const isNumber = (v) => typeof v === "number" || typeof v === "bigint" || v instanceof Fl;
 
 // ---- decimals (src/decimal.rs, the same answers) -------------------------
 // A decimal is a whole number (a BigInt, at most 2^96 - 1 either way) and
@@ -64,8 +79,7 @@ const babs = (x) => (x < 0n ? -x : x);
 const ROUNDINGS = "half_even, half_up, half_down, up, down, ceiling or floor";
 const DEC_FLOAT = ": a dec is exact and a float is not, so convert one with dec(x) or float(x)";
 const FLOAT_ONLY = " (this works on floats: convert a dec with float(x))";
-const isFloatV = (v) => typeof v === "number" && !Number.isInteger(v);
-const decHint = (a, b) => ((a instanceof Dec && isFloatV(b)) || (b instanceof Dec && isFloatV(a)) ? DEC_FLOAT : "");
+const decHint = (a, b) => ((a instanceof Dec && isFloat(b)) || (b instanceof Dec && isFloat(a)) ? DEC_FLOAT : "");
 const compareHint = (a, b) => (isNil(a) !== isNil(b) ? NIL_COMPARED : decHint(a, b));
 // As on the server (FEEDBACK28.md, Q-347; branch feedback29-fixes).
 const NIL_COMPARED = ": what is not found is null, not -1, from `index_of`, `find` and `get` too, so ask `x == null` first";
@@ -208,6 +222,7 @@ function asDec(v) {
   if (v instanceof Dec) return v;
   if (isInt(v) || typeof v === "bigint") return new Dec(BigInt(v), 0);
   if (typeof v === "number") return decFromFloat(v);
+  if (v instanceof Fl) return decFromFloat(v.f);
   if (typeof v === "string") return decParse(v.trim(), false);
   return null;
 }
@@ -228,20 +243,24 @@ function decArith(a, b, op, verb) {
 const I64_MIN = -(1n << 63n), I64_MAX = (1n << 63n) - 1n;
 const intOf = (b) => (b >= -9007199254740991n && b <= 9007199254740991n ? Number(b) : b);
 const bigChecked = (b) => (b < I64_MIN || b > I64_MAX ? fail("integer overflow") : intOf(b));
-// Arithmetic with an int past 2^53: exact, 64-bit as on the server.
+// Arithmetic with an int past 2^53: exact, 64-bit as on the server; with a float, a float.
 function bigArith(a, b, op, verb) {
   const ai = isInt(a) || typeof a === "bigint", bi = isInt(b) || typeof b === "bigint";
   if (ai && bi) {
     const x = BigInt(a), y = BigInt(b);
     if ((op === "/" || op === "%") && y === 0n) fail("division by zero");
-    if (op === "/") return x % y === 0n ? bigChecked(x / y) : Number(x) / Number(y);
+    // Not exact: a float, whole too past 2^53 (FEEDBACK55.md, Q-775; branch feedback55).
+    if (op === "/") return x % y === 0n ? bigChecked(x / y) : fl(Number(x) / Number(y));
     return bigChecked(op === "+" ? x + y : op === "-" ? x - y : op === "*" ? x * y : x % y);
   }
-  if ((ai || typeof a === "number") && (bi || typeof b === "number")) {
-    const x = Number(a), y = Number(b);
-    return op === "+" ? x + y : op === "-" ? x - y : op === "*" ? x * y : op === "/" ? x / y : x % y;
-  }
-  fail(`cannot ${verb} ${typeName(a)} and ${typeName(b)}`);
+  return flArith(a, b, op, verb);
+}
+// Arithmetic with a float on either side: in floats, an int as its float, as on the server; the
+// answer a float, an Fl when whole (FEEDBACK55.md, Q-775; branch feedback55).
+function flArith(a, b, op, verb) {
+  const x = numOf(a), y = numOf(b);
+  if (x === null || y === null) fail(`cannot ${verb} ${typeName(a)} and ${typeName(b)}`);
+  return fl(op === "+" ? x + y : op === "-" ? x - y : op === "*" ? x * y : op === "/" ? x / y : x % y);
 }
 // What Quillo code does not reach on the page's objects: what runs text as
 // code or HTML (markup in components does that safely), and the way to the
@@ -268,7 +287,7 @@ const foreign = (v) => {
   if (v === null || typeof v !== "object") return false;
   if (v === globalThis) return true;
   const p = Object.getPrototypeOf(v);
-  return p !== Object.prototype && p !== null && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !(v instanceof Dec);
+  return p !== Object.prototype && p !== null && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !(v instanceof Dec) && !(v instanceof Fl);
 };
 // Functions of the page that run text as code or HTML, or that step around
 // the checks here (setting any property, calling a method with any `this`,
@@ -326,7 +345,27 @@ function fromPage(r) {
 }
 function pageCall(f, args) {
   guardArgs(`\`${f.name || "this function"}\``, args, 0);
-  return fromPage(f(...args));
+  return fromPage(f(...forPage(args, 0)));
+}
+// A whole float is a number to the page's code, in a list or a map too: it went as an Fl, so
+// `JSON.stringify({ a: 1.0 })` was {"a":{"f":1}} and `Number.isFinite(2.0)` false, and a chart
+// library's numbers objects (found in review of FEEDBACK55.md's Q-775; branch feedback55). Copied
+// where one changes.
+function forPage(v, depth) {
+  if (v instanceof Fl) return v.f;
+  if (v === null || typeof v !== "object" || depth >= 16 || foreign(v)) return v;
+  if (Array.isArray(v)) {
+    let out = v;
+    v.forEach((x, i) => { const y = forPage(x, depth + 1); if (y !== x) { if (out === v) out = v.slice(); out[i] = y; } });
+    return out;
+  }
+  if (!isMap(v)) return v;
+  let out = v;
+  for (const k of Object.keys(v)) {
+    const y = forPage(v[k], depth + 1);
+    if (y !== v[k]) { if (out === v) out = { ...v }; putKey(out, k, y); }
+  }
+  return out;
 }
 // A call of the page's function f (the method `name`) with args: f is not
 // one of the above, makes no script element, sets no handler or srcdoc,
@@ -372,6 +411,8 @@ function lenient(v, depth) {
     }
     return w;
   }
+  // A number to the page (see `forPage`).
+  if (v instanceof Fl) return v.f;
   if (v === null || typeof v !== "object" || depth >= 16 || foreign(v)) return v;
   if (Array.isArray(v)) {
     let out = v;
@@ -426,7 +467,7 @@ function setField(o, name, v, op) {
   if (isEvent(o) && !(name in o) && o.target) o = o.target;
   if (op) v = (op === "+" ? add : sub)(field(o, name, null), v);
   guardArgs(`setting \`${name}\``, [v], 0);
-  o[name] = v;
+  o[name] = forPage(v, 0);
 }
 
 function typeName(v) {
@@ -438,6 +479,7 @@ function typeName(v) {
     case "function": return "fn";
     case "bigint": return "int";
   }
+  if (v instanceof Fl) return "float";
   if (v instanceof Dec) return "dec";
   if (Array.isArray(v)) return "list";
   if (v instanceof Err) return "error";
@@ -462,9 +504,9 @@ function typeIs(t, v) {
   switch (t) {
     case "any": return true;
     case "int": return isInt(v) || typeof v === "bigint";
-    // JS numbers do not remember whether they were written 2 or 2.0.
-    case "float": return typeof v === "number";
-    case "num": return typeof v === "number" || typeof v === "bigint";
+    // A whole float is an Fl (FEEDBACK55.md, Q-775; branch feedback55).
+    case "float": return isFloat(v);
+    case "num": return isNumber(v);
     case "dec": return v instanceof Dec;
     case "str": return typeof v === "string";
     // Text that is a date (FEEDBACK13.md, Q-093; branch open-fixes).
@@ -542,6 +584,8 @@ function ownFitsName(n, t, v, deep, depth) {
 }
 
 const ownHasRecord = (t, d = 0) => d < 8 && (t.n.some((n) => OWN_TYPES[n] && (OWN_TYPES[n].r || ownHasRecord(OWN_TYPES[n].a, d + 1))) || (!!t.e && ownHasRecord(t.e, d + 1)));
+// Whether a type has a `float` in it, which an int is made into, as the server's `has_float`.
+const ownHasFloat = (t, d = 0) => d < 8 && (t.n.some((n) => n === "float" || (OWN_TYPES[n] && OWN_TYPES[n].a && ownHasFloat(OWN_TYPES[n].a, d + 1))) || (!!t.e && ownHasFloat(t.e, d + 1)));
 
 // v made a value of type t: records made from maps (defaults put in, other
 // fields left out), lists of them item by item, the rest checked as it is.
@@ -574,7 +618,7 @@ function ownMakeName(n, t, v, depth) {
     }
     return { ok: true, v: out };
   }
-  if (n === "list" && Array.isArray(v) && t.e && ownHasRecord(t.e)) {
+  if (n === "list" && Array.isArray(v) && t.e && (ownHasRecord(t.e) || ownHasFloat(t.e))) {
     const out = [];
     for (let i = 0; i < v.length; i++) {
       const r = ownMake(t.e, v[i], depth + 1);
@@ -583,6 +627,9 @@ function ownMakeName(n, t, v, depth) {
     }
     return { ok: true, v: out };
   }
+  // A float takes an int, made a float, as on the server (FEEDBACK18.md, Q-103): the int is no
+  // float here either now (FEEDBACK55.md, Q-775; branch feedback55).
+  if (n === "float" && (isInt(v) || typeof v === "bigint") && !t.n.includes("int")) return { ok: true, v: fl(Number(v)) };
   // A decimal field takes an int, numeric text or a JSON number.
   if (n === "dec") { const d = asDec(v); return d === null ? { ok: false, w: OWN_PLAIN } : { ok: true, v: d }; }
   // Money, held to money.of's rules, with what is wrong (FEEDBACK50.md, Q-621).
@@ -593,7 +640,9 @@ function ownMakeName(n, t, v, depth) {
 
 
 
-const fmtKey = (k) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(k) ? k : JSON.stringify(k);
+// A key as the server's `fmt_key` writes it: bare when it is a name of letters and digits of any
+// script (FEEDBACK55.md, Q-782; branch feedback55).
+const fmtKey = (k) => /^[\p{Alphabetic}_][\p{Alphabetic}\p{Number}_]*$/u.test(k) ? k : JSON.stringify(k);
 
 // A number's text, as the server's: JavaScript writes Infinity (FEEDBACK16.md, Q-120; branch feedback20-fixes).
 // Never in exponent form, as on the server (FEEDBACK25.md, Q-309; branch
@@ -618,6 +667,7 @@ function repr(v) {
   if (typeof v === "number") return numText(v);
   if (typeof v === "boolean") return String(v);
   if (typeof v === "bigint") return String(v);
+  if (v instanceof Fl) return numText(v.f);
   if (v instanceof Dec) return decText(v) + "m";
   if (typeof v === "function") return "<fn " + (v.$name || "<fn>") + ">";
   if (Array.isArray(v)) return "[" + v.map(repr).join(", ") + "]";
@@ -625,13 +675,14 @@ function repr(v) {
   // errors (`--watch`): its text was shown once the browser made the component again, and made
   // it again for that (FEEDBACK55.md, Q-773; branch feedback55).
   if (v instanceof Err) return "err(" + (v.own || ERRORS_SHOWN ? repr(v.error) : "\"internal error\"") + ")";
-  if (v instanceof Html) return "<html>";
+  // Its markup, as on the server (FEEDBACK55.md, Q-779; branch feedback55).
+  if (v instanceof Html) return htmlText(v);
   if (isEvent(v)) return "<event " + v.type + ">";
   const ks = Object.keys(v);
   return ks.length ? "{ " + ks.map((k) => fmtKey(k) + ": " + repr(v[k])).join(", ") + " }" : "{}";
 }
 
-const display = (v) => typeof v === "string" ? v : typeof v === "number" ? numText(v) : v instanceof Dec ? decText(v) : repr(v);
+const display = (v) => typeof v === "string" ? v : typeof v === "number" ? numText(v) : v instanceof Fl ? numText(v.f) : v instanceof Dec ? decText(v) : repr(v);
 // A value as a map key (`set`, `get`, `group_by`): 12.5 and 12.50 are one.
 const keyText = (v) => (v instanceof Dec ? decKey(v) : display(v));
 const short = (v) => { const r = repr(v); return r.length > 40 ? r.slice(0, 40) + "…" : r; };
@@ -641,12 +692,18 @@ function eq(a, b) {
   if (a === b) return true;
   // Different numbers, strings, bools and functions; null and undefined match.
   if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
-    // Two numbers (the usual case) test only their types here.
-    return (typeof a === "object" || typeof b === "object") && (a instanceof Dec || b instanceof Dec) ? decEq(a, b) : isNil(a) && isNil(b);
+    // Two numbers (the usual case) test only their types here; an int past 2^53 (a BigInt) or a
+    // whole float (an Fl) and a number, by their values, exactly (FEEDBACK55.md, Q-776; branch
+    // feedback55).
+    if (typeof a === "object" || typeof b === "object") return a instanceof Dec || b instanceof Dec ? decEq(a, b) : a instanceof Fl || b instanceof Fl ? numEq(a, b) : isNil(a) && isNil(b);
+    return typeof a === "bigint" || typeof b === "bigint" ? numEq(a, b) : isNil(a) && isNil(b);
   }
   if (a instanceof Dec || b instanceof Dec) return decEq(a, b);
+  if (a instanceof Fl || b instanceof Fl) return numEq(a, b);
   if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => eq(x, b[i]));
   if (a instanceof Err && b instanceof Err) return eq(a.error, b.error);
+  // Markup by its text, as on the server (FEEDBACK55.md, Q-779; branch feedback55).
+  if (a instanceof Html && b instanceof Html) return htmlText(a) === htmlText(b);
   // The page's objects are themselves, not their fields: any two elements have none
   // (FEEDBACK28.md, Q-334; branch feedback29-fixes).
   if (foreign(a) || foreign(b)) return false;
@@ -657,26 +714,51 @@ function eq(a, b) {
   return false;
 }
 
+// Two numbers (an int, a BigInt, a float or an Fl) by their values, exactly: JavaScript compares
+// a BigInt with a number as numbers, not through a float (FEEDBACK55.md, Q-776; branch
+// feedback55).
+const numEq = (a, b) => numCmp(a, b) === 0;
+function numCmp(a, b) {
+  const x = a instanceof Fl ? a.f : a, y = b instanceof Fl ? b.f : b;
+  if ((typeof x !== "number" && typeof x !== "bigint") || (typeof y !== "number" && typeof y !== "bigint")) return null;
+  // NaN is not ordered, as on the server (FEEDBACK55.md, Q-780; branch feedback55).
+  return x < y ? -1 : x > y ? 1 : x == y ? 0 : null;
+}
+
 // A decimal and a number, compared as decimals (a float through its text).
 function decEq(a, b) {
-  const x = a instanceof Dec ? a : typeof a === "number" || typeof a === "bigint" ? asDec(a) : null;
-  const y = b instanceof Dec ? b : typeof b === "number" || typeof b === "bigint" ? asDec(b) : null;
+  const x = a instanceof Dec ? a : isNumber(a) ? asDec(a) : null;
+  const y = b instanceof Dec ? b : isNumber(b) ? asDec(b) : null;
   return x !== null && y !== null && decCmp(x, y) === 0;
 }
 
-function cmp(a, b) {
-  if ((typeof a === "number" && typeof b === "number") || (typeof a === "string" && typeof b === "string")) {
-    return a < b ? -1 : a > b ? 1 : 0;
+// Text in the order of its code points, as the server's (by its UTF-8) has it: JavaScript's `<`
+// goes by UTF-16 unit, which puts U+E000 to U+FFFF after the characters past U+FFFF
+// (FEEDBACK55.md, Q-778; branch feedback55).
+function strCmp(a, b) {
+  const n = a.length < b.length ? a.length : b.length;
+  for (let i = 0; i < n; i++) {
+    let x = a.charCodeAt(i), y = b.charCodeAt(i);
+    if (x === y) continue;
+    // A surrogate (half of a character past U+FFFF) comes after U+E000 to U+FFFF.
+    if (x >= 0xd800 && y >= 0xd800) { x += x < 0xe000 ? 0x2000 : -0x800; y += y < 0xe000 ? 0x2000 : -0x800; }
+    return x < y ? -1 : 1;
   }
+  return a.length < b.length ? -1 : a.length > b.length ? 1 : 0;
+}
+
+function cmp(a, b) {
+  // NaN is not ordered, as on the server (FEEDBACK55.md, Q-780; branch feedback55).
+  if (typeof a === "number" && typeof b === "number") return a < b ? -1 : a > b ? 1 : a === b ? 0 : null;
+  if (typeof a === "string" && typeof b === "string") return a === b ? 0 : strCmp(a, b);
   // A decimal with a decimal or an int; not with a float.
   if (a instanceof Dec || b instanceof Dec) {
     const x = a instanceof Dec ? a : isInt(a) || typeof a === "bigint" ? new Dec(BigInt(a), 0) : null;
     const y = b instanceof Dec ? b : isInt(b) || typeof b === "bigint" ? new Dec(BigInt(b), 0) : null;
     return x === null || y === null ? null : decCmp(x, y);
   }
-  if ((typeof a === "bigint" || typeof a === "number") && (typeof b === "bigint" || typeof b === "number")) {
-    return a < b ? -1 : a > b ? 1 : 0;
-  }
+  // Ints past 2^53 and whole floats too, exactly (FEEDBACK55.md, Q-776; branch feedback55).
+  if (isNumber(a) && isNumber(b)) return numCmp(a, b);
   // Item by item, as on the server (FEEDBACK25.md, Q-320; branch feedback26-fixes).
   if (Array.isArray(a) && Array.isArray(b)) {
     for (let i = 0; i < a.length && i < b.length; i++) {
@@ -691,16 +773,28 @@ function cmp(a, b) {
 // ---- operators ---------------------------------------------------------
 
 // Ints past 2^53 are exact, as a literal is, or a sum of money in cents loses units
-// with no error (FEEDBACK25.md, Q-300; branch feedback26-fixes). Past 64 bits it is
-// left as a number: here a whole float cannot be told from an int.
+// with no error (FEEDBACK25.md, Q-300; branch feedback26-fixes); past 64 bits an overflow, as on
+// the server: `3037000500 * 3037000500` was a number (FEEDBACK55.md, Q-776; branch feedback55).
 const SAFE = Number.MAX_SAFE_INTEGER;
-const big = (r, a, b, op, verb) => (r > SAFE || r < -SAFE) && Number.isSafeInteger(a) && Number.isSafeInteger(b) && Math.abs(r) < 2 ** 63 ? bigArith(a, b, op, verb) : r;
+// What `+`, `-` or `*` of two numbers gave, `r`: two ints' past 2^53 worked out exactly; a whole
+// one with a float on a side, an Fl; an int has no -0, which `-3 * 0` gave, and `1.5 / x` was
+// -inf (FEEDBACK55.md, Q-775; branch feedback55).
+const num2 = (r, a, b, op, verb) => (Number.isInteger(a) && Number.isInteger(b) ? (r > SAFE || r < -SAFE ? bigArith(a, b, op, verb) : r + 0) : fl(r));
 
+// Two ints of 32 bits (the usual case) first, with nothing to work out; then a whole float with a
+// number, without the general case (found in review: the float loop was half again as slow).
 function add(a, b) {
-  if (typeof a === "number" && typeof b === "number") { const r = a + b; return r > SAFE || r < -SAFE ? big(r, a, b, "+", "add") : r; }
+  if (typeof a === "number") {
+    if (typeof b === "number") return (a | 0) === a && (b | 0) === b ? a + b : num2(a + b, a, b, "+", "add");
+    if (b instanceof Fl) return fl(a + b.f);
+  } else if (a instanceof Fl) {
+    if (typeof b === "number") return fl(a.f + b);
+    if (b instanceof Fl) return fl(a.f + b.f);
+  }
   if (typeof a === "string") return a + display(b);
   if (typeof b === "string") return display(a) + b;
   if (a instanceof Dec || b instanceof Dec) return decArith(a, b, "+", "add");
+  if (a instanceof Fl || b instanceof Fl) return flArith(a, b, "+", "add");
   if (typeof a === "bigint" || typeof b === "bigint") return bigArith(a, b, "+", "add");
   if (a instanceof Html && b instanceof Html) return frag([a, b]);
   if (Array.isArray(a) && Array.isArray(b)) return a.concat(b);
@@ -708,30 +802,82 @@ function add(a, b) {
   fail(`cannot add ${typeName(a)} and ${typeName(b)}`);
 }
 
-// Numbers: the usual case first; anything else says what is wrong.
+// Numbers: the usual case first; anything else says what is wrong. Only two ints divide by zero
+// with an error: a float on a side gives inf or NaN, as on the server (FEEDBACK55.md, Q-775;
+// branch feedback55).
 function arith(a, b, op, verb) {
   if (a instanceof Dec || b instanceof Dec) return decArith(a, b, op, verb);
+  if (a instanceof Fl || b instanceof Fl) return flArith(a, b, op, verb);
   if (typeof a === "bigint" || typeof b === "bigint") return bigArith(a, b, op, verb);
   if (typeof a !== "number" || typeof b !== "number") fail(`cannot ${verb} ${typeName(a)} and ${typeName(b)}`);
   if (isInt(a) && isInt(b) && b === 0) fail("division by zero");
-  return op === "/" ? a / b : a % b;
+  return fl(op === "/" ? a / b : a % b);
 }
-const sub = (a, b) => (typeof a === "number" && typeof b === "number" ? big(a - b, a, b, "-", "subtract") : (isMap(a) && isMap(b) && moneyOp(a, b, true)) || arith(a, b, "-", "subtract"));
-const mul = (a, b) => (typeof a === "number" && typeof b === "number" ? big(a * b, a, b, "*", "multiply") : arith(a, b, "*", "multiply"));
-const div = (a, b) => (typeof a === "number" && typeof b === "number" && b !== 0 ? a / b : arith(a, b, "/", "divide"));
-const mod = (a, b) => (typeof a === "number" && typeof b === "number" && b !== 0 ? a % b : arith(a, b, "%", "take the remainder of"));
+function sub(a, b) {
+  if (typeof a === "number") {
+    if (typeof b === "number") return (a | 0) === a && (b | 0) === b ? a - b : num2(a - b, a, b, "-", "subtract");
+    if (b instanceof Fl) return fl(a - b.f);
+  } else if (a instanceof Fl) {
+    if (typeof b === "number") return fl(a.f - b);
+    if (b instanceof Fl) return fl(a.f - b.f);
+  }
+  return (isMap(a) && isMap(b) && moneyOp(a, b, true)) || arith(a, b, "-", "subtract");
+}
+function mul(a, b) {
+  if (typeof a === "number") {
+    if (typeof b === "number") {
+      if ((a | 0) === a && (b | 0) === b) { const r = a * b; if (r <= SAFE && r >= -SAFE) return r + 0; }
+      return num2(a * b, a, b, "*", "multiply");
+    }
+    if (b instanceof Fl) return fl(a * b.f);
+  } else if (a instanceof Fl) {
+    if (typeof b === "number") return fl(a.f * b);
+    if (b instanceof Fl) return fl(a.f * b.f);
+  }
+  return arith(a, b, "*", "multiply");
+}
+// Two ints divide to an int, or to a float with a fraction; a float on a side, to a float.
+const div = (a, b) => (typeof a === "number" && typeof b === "number" && b !== 0 ? (Number.isInteger(a) && Number.isInteger(b) ? a / b : fl(a / b)) : arith(a, b, "/", "divide"));
+const mod = (a, b) => (typeof a === "number" && typeof b === "number" && b !== 0 ? (Number.isInteger(a) && Number.isInteger(b) ? (a % b) + 0 : fl(a % b)) : arith(a, b, "%", "take the remainder of"));
 
 function order(a, b) {
   const c = cmp(a, b);
   if (c === null) fail(`cannot compare ${typeName(a)} with ${typeName(b)}${compareHint(a, b)}`);
   return c;
 }
-const lt = (a, b) => order(a, b) < 0;
-const le = (a, b) => order(a, b) <= 0;
-const gt = (a, b) => order(a, b) > 0;
-const ge = (a, b) => order(a, b) >= 0;
+// Two numbers (a whole float too) compared where they stand; NaN, and the rest, through `order`
+// (found in review).
+const fnum = (v) => (typeof v === "number" ? v : v instanceof Fl ? v.f : NaN);
+function lt(a, b) {
+  if (typeof a === "number" && typeof b === "number") { if (a < b) return true; if (a >= b) return false; }
+  else { const x = fnum(a), y = fnum(b); if (x < y) return true; if (x >= y) return false; }
+  return order(a, b) < 0;
+}
+function le(a, b) {
+  if (typeof a === "number" && typeof b === "number") { if (a <= b) return true; if (a > b) return false; }
+  else { const x = fnum(a), y = fnum(b); if (x <= y) return true; if (x > y) return false; }
+  return order(a, b) <= 0;
+}
+function gt(a, b) {
+  if (typeof a === "number" && typeof b === "number") { if (a > b) return true; if (a <= b) return false; }
+  else { const x = fnum(a), y = fnum(b); if (x > y) return true; if (x <= y) return false; }
+  return order(a, b) > 0;
+}
+function ge(a, b) {
+  if (typeof a === "number" && typeof b === "number") { if (a >= b) return true; if (a < b) return false; }
+  else { const x = fnum(a), y = fnum(b); if (x >= y) return true; if (x < y) return false; }
+  return order(a, b) >= 0;
+}
 
 function intRange(a, b) {
+  // Past 2^53 too, each item exact (FEEDBACK55.md, Q-776; branch feedback55).
+  if (typeof a === "bigint" || typeof b === "bigint") {
+    if (!(isInt(a) || typeof a === "bigint") || !(isInt(b) || typeof b === "bigint")) fail("`..` needs two ints");
+    const x = BigInt(a), y = BigInt(b), out = [];
+    if (y - x > 10000000n) fail("range is too large");
+    for (let i = x; i < y; i++) out.push(intOf(i));
+    return out;
+  }
   if (!isInt(a) || !isInt(b)) fail("`..` needs two ints");
   if (b - a > 10000000) fail("range is too large");
   const out = [];
@@ -742,10 +888,11 @@ function intRange(a, b) {
 function neg(v) {
   if (typeof v !== "number") {
     if (v instanceof Dec) return new Dec(-v.m, v.s);
+    if (v instanceof Fl) return new Fl(-v.f);
     if (typeof v === "bigint") return bigChecked(-v);
     fail(`cannot negate ${typeName(v)}`);
   }
-  return -v;
+  return v === 0 ? 0 : -v;
 }
 
 function eventField(e, name) {
@@ -850,6 +997,9 @@ function index(o, i) {
     return n >= 0 && n < cs.length ? cs[n] : null;
   }
   if (isNil(o)) return null;
+  // An int past 2^53 is past any list's end, and a map's key by its digits; one counted as a
+  // BigInt (`W.span`) is the int it is (FEEDBACK55.md, Q-776; branch feedback55).
+  if (typeof i === "bigint") return Number.isSafeInteger(Number(i)) ? index(o, Number(i)) : Array.isArray(o) || typeof o === "string" ? null : isMap(o) ? (hasOwn(o, String(i)) ? o[String(i)] : null) : fail(`cannot index ${typeName(o)} with int`);
   fail(`cannot index ${typeName(o)} with ${typeName(i)}`);
 }
 let indexed = { text: "", chars: null };
@@ -1009,6 +1159,12 @@ const want = (ok, f, what, i, v) => { if (!ok) fail(`\`${f}\` expects ${what} as
 const S = (v, f, i = 1) => { want(typeof v === "string", f, "a str", i, v); return v; };
 const L = (v, f, i = 1) => { if (isNil(v)) return []; want(Array.isArray(v), f, "a list", i, v); return v; };
 const I = (v, f, i = 1) => { want(isInt(v), f, "an int", i, v); return v; };
+// An int, past 2^53 too (a BigInt), where the server takes any (FEEDBACK55.md, Q-776; branch
+// feedback55).
+const II = (v, f, i = 1) => { want(isInt(v) || typeof v === "bigint", f, "an int", i, v); return v; };
+// An int as a JS number, for a count or a place: one past 2^53 is past any length, and clamped or
+// refused as the server clamps or refuses it (found in review).
+const IN = (v, f, i = 1) => Number(II(v, f, i));
 const M = (v, f, i = 1) => { if (isNil(v)) return {}; want(isMap(v), f, "a map", i, v); return v; };
 const F = (v, f, i = 2) => {
   want(typeof v === "function", f, "a function", i, v);
@@ -1017,7 +1173,9 @@ const F = (v, f, i = 2) => {
   if (pageFns.has(v)) fail(`\`${f}\` is given a function of the page: wrap it, as in (x) => f(x)`);
   return v;
 };
-const N = (v, f, i = 1) => { want(typeof v === "number", f, "a number", i, v); return v; };
+// A number, as a float: an int past 2^53 and a whole float too, as the server's `as_f64` reads
+// them (FEEDBACK55.md, Q-775 and Q-776; branch feedback55).
+const N = (v, f, i = 1) => { const x = numOf(v); want(x !== null, f, "a number", i, v); return x; };
 
 // Calls a function given to a builtin; it must not wait on the server.
 // Every caller passes one argument (two for `reduce`).
@@ -1063,7 +1221,9 @@ function coerce(t, s) {
   if (t === "float" || t === "num") {
     const named = /^([+-]?)(inf|infinity|nan)$/i.exec(s);
     if (named) return named[2][0].toLowerCase() === "n" ? NaN : named[1] === "-" ? -Infinity : Infinity;
-    return s !== "" && !isNaN(Number(s)) ? Number(s) : null;
+    // Digits as Rust reads a float, and a float: `0x10`, `0b11` and `0o17` are none, which
+    // JavaScript's Number() took (FEEDBACK55.md, Q-775 and Q-782; branch feedback55).
+    return /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(s) ? fl(Number(s)) : null;
   }
   if (t === "dec") return decParse(s, false);
   if (t === "date") return isDay(s) ? s : null;
@@ -1074,20 +1234,30 @@ function coerce(t, s) {
 // fn's arguments), decimals and large ints tagged ({"$dec": "12.50"}) so
 // they arrive as they are; else a decimal is its text, as the server
 // writes it, and a large int its digits (`jsonText` writes them).
+// A whole float is written as the server writes it, `2.0` (`jsonText` and `wireText` write it), so
+// that it is read back as a float on either side (FEEDBACK55.md, Q-775; branch feedback55);
+// `wire` "tools": as a number, for the developer's tools.
 function toJSON(v, wire) {
   if (isNil(v)) return null;
   if (v instanceof Err) return { error: toJSON(v.error, wire) };
   if (Array.isArray(v)) return v.map((x) => toJSON(x, wire));
-  if (v instanceof Html) return "";
+  // Its markup, as the server writes it (FEEDBACK55.md, Q-779; branch feedback55).
+  if (v instanceof Html) return htmlText(v);
   if (typeof v === "function") return repr(v);
   if (v instanceof Dec) return wire ? { $dec: decText(v) } : decText(v);
   if (typeof v === "bigint") return wire ? { $int: String(v) } : "\u0000int:" + v;
+  if (v instanceof Fl) return wire === "tools" ? v.f : "\u0000flt:" + flJSON(v.f);
   if (isMap(v)) { const o = {}; for (const k of Object.keys(v)) putKey(o, k, toJSON(v[k], wire)); return o; }
   if (typeof v === "number" && !isFinite(v)) return null;
   return v;
 }
-// JSON text of a value, a large int written as its digits.
-const jsonText = (v, indent) => JSON.stringify(toJSON(v), null, indent).replace(/"\\u0000int:(-?\d+)"/g, "$1");
+// A whole float's JSON text, as the server's: `.0` after its digits (`-0.0`), and from 1e21 an
+// exponent, as JavaScript writes it (FEEDBACK55.md, Q-775 and Q-781; branch feedback55).
+const flJSON = (f) => (Object.is(f, -0) ? "-0.0" : (f = String(f), f.includes("e") ? f : f + ".0"));
+// What `toJSON` marked written as it is: a large int's digits, a whole float's.
+const unmark = (t) => t.replace(/"\\u0000(?:int|flt):(-?[\d.e+]+)"/g, "$1");
+// JSON text of a value.
+const jsonText = (v, indent) => unmark(JSON.stringify(toJSON(v), null, indent));
 // What a visitor may read of `v` as JSON (`json.stringify`, an attribute's): a builtin's error
 // says `internal error`, as the server's `hidden` has it, unless the server shows errors
 // (FEEDBACK55.md, Q-773; branch feedback55).
@@ -1111,7 +1281,8 @@ const B = {};
 async function readStream(res, f, who, signal, at) {
   const type = (res.headers.get("content-type") || "").toLowerCase();
   const kind = type.startsWith("text/event-stream") ? "events" : /ndjson|jsonl|json-seq/.test(type) ? "lines" : "text";
-  const parse = (t) => { try { return JSON.parse(t); } catch (_) { return t; } };
+  // Numbers as the server reads them, floats and ints past 2^53 too (found in review).
+  const parse = (t) => { try { return readJSON(t); } catch (_) { return t; } };
   const give = async (args) => {
     const n = Array.isArray(f.$p) ? f.$p.length : f.length;
     const r = f(...args.slice(0, Math.max(n, 1)));
@@ -1193,8 +1364,8 @@ async function httpCall(fname, method, url, body, headers, opts, at) {
   headers = M(headers, fname, at + (fname === "http.get" || fname === "http.delete" ? 1 : 2));
   opts = M(opts, fname, at + (fname === "http.get" || fname === "http.delete" ? 2 : 3));
   for (const k of Object.keys(opts)) if (!HTTP_OPTIONS.includes(k)) fail(`\`${fname}\`: unknown option \`${k}\` (the options are ${HTTP_OPTIONS.join(", ")})`);
-  const secs = opts.timeout;
-  if (!isNil(secs) && !(typeof secs === "number" && secs > 0 && secs <= 300)) fail(`\`${fname}\`: \`timeout\` is seconds, more than 0 and up to 300, got ${display(secs)}`);
+  const secs = numOf(opts.timeout);
+  if (!isNil(opts.timeout) && !(secs !== null && secs > 0 && secs <= 300)) fail(`\`${fname}\`: \`timeout\` is seconds, more than 0 and up to 300, got ${display(opts.timeout)}`);
   if (/^[a-z][a-z0-9+.-]*:/i.test(url) && !/^https?:/i.test(url)) return new Err(`http: not an http(s) URL: ${url}`);
   const init = { method, headers: {} };
   for (const k of Object.keys(headers)) init.headers[k] = display(headers[k]);
@@ -1217,7 +1388,7 @@ async function httpCall(fname, method, url, body, headers, opts, at) {
   const hs = {};
   res.headers.forEach((v, k) => { hs[k] = v; });
   let json = null;
-  try { json = fromJSON(JSON.parse(text)); } catch (e) { json = null; }
+  try { json = fromJSON(readJSON(text)); } catch (e) { json = null; }
   return { status: res.status, ok: res.ok, headers: hs, body: text, json };
 }
 
@@ -1291,7 +1462,7 @@ B.listen = meta((url, f) => {
 // `run_after(ms, f)`: once, gone with the component (FEEDBACK28.md, Q-349; branch
 // feedback29-fixes).
 B.run_after = meta((ms, f) => {
-  N(ms, "run_after");
+  ms = N(ms, "run_after");
   F(f, "run_after", 2);
   const own = Owner || Acting;
   if (own && own.dead) return null;
@@ -1320,14 +1491,14 @@ B.js_has = meta((name) => {
 }, "js_has", null);
 // `cursor_index(s, n)`: a field's cursor counts UTF-16 units, and `slice` counts characters
 // (FEEDBACK28.md, Q-344; branch feedback29-fixes).
-B.cursor_index = meta((s, n) => Array.from(S(s, "cursor_index").slice(0, Math.max(I(n, "cursor_index", 2), 0))).length, "cursor_index", null);
+B.cursor_index = meta((s, n) => Array.from(S(s, "cursor_index").slice(0, Math.max(IN(n, "cursor_index", 2), 0))).length, "cursor_index", null);
 B.every = meta((ms, f) => {
   // In a component, or a handler or `@mount` of one, as `run_after` (FEEDBACK28.md, Q-349;
   // branch feedback29-fixes).
   const own = Owner || Acting;
   if (!own) fail("`every` works in a component");
   if (own.dead) return null;
-  N(ms, "every");
+  ms = N(ms, "every");
   F(f, "every", 2);
   const id = setInterval(() => {
     try {
@@ -1350,14 +1521,16 @@ B.parallel = meta(async (...fs) => {
 B.print = meta((...a) => { console.log(a.map(display).join(" ")); return null; }, "print", null);
 // HTML made from text (by raw or markdown) is that text, as on the server.
 B.error = meta((v) => (v instanceof Err ? v.error : null), "error", null);
-B.str = meta((v) => v instanceof Html && v.text !== undefined ? v.text : display(v), "str", null);
+B.str = meta((v) => display(v), "str", null);
 B.int = meta((v) => {
-  // Past an int's range, as on the server (FEEDBACK16.md, Q-111; branch feedback20-fixes).
-  if (typeof v === "number" && isFinite(v) && Math.abs(v) >= 2 ** 63) return new Err(`${display(v)} is too large for an int`);
   if (isInt(v) || typeof v === "bigint") return v;
+  const f = v instanceof Fl ? v.f : v;
+  // Past an int's range, as on the server (FEEDBACK16.md, Q-111; branch feedback20-fixes): -2^63
+  // is one, and past 2^53 the int is exact (FEEDBACK55.md, Q-776; branch feedback55).
+  if (typeof f === "number" && isFinite(f) && (f < -(2 ** 63) || f >= 2 ** 63)) return new Err(`${display(v)} is too large for an int`);
   // The whole part (toward zero).
   if (v instanceof Dec) { const w = v.m / p10(v.s); return w < I64_MIN || w > I64_MAX ? new Err(`${decText(v)} is too large for an int`) : intOf(w); }
-  if (typeof v === "number" && isFinite(v)) return Math.trunc(v);
+  if (typeof f === "number" && isFinite(f)) { const t = Math.trunc(f) + 0; return Number.isSafeInteger(t) ? t : BigInt(t); }
   if (typeof v === "boolean") return v ? 1 : 0;
   if (typeof v === "string") {
     // By its digits: past 2^53 a number has lost them (FEEDBACK25.md, Q-301; branch feedback26-fixes).
@@ -1369,9 +1542,11 @@ B.int = meta((v) => {
   return new Err(`cannot convert ${typeName(v)} to int`);
 }, "int", null);
 B.float = meta((v) => {
-  if (typeof v === "number") return v;
-  if (v instanceof Dec) return Number(decText(v));
-  if (typeof v === "bigint") return Number(v);
+  // A float, whole too (FEEDBACK55.md, Q-775; branch feedback55).
+  if (typeof v === "number") return fl(v);
+  if (v instanceof Fl) return v;
+  if (v instanceof Dec) return fl(Number(decText(v)));
+  if (typeof v === "bigint") return fl(Number(v));
   if (typeof v === "string") { const n = coerce("float", v); return n === null ? new Err(`not a number: ${JSON.stringify(v)}`) : n; }
   return new Err(`cannot convert ${typeName(v)} to float`);
 }, "float", null);
@@ -1380,6 +1555,8 @@ B.len = meta((v) => {
   if (Array.isArray(v)) return v.length;
   if (isMap(v)) return Object.keys(v).length;
   if (isNil(v)) return 0;
+  // Of its markup, as on the server (FEEDBACK55.md, Q-779; branch feedback55).
+  if (v instanceof Html) return Array.from(htmlText(v)).length;
   fail(`\`len\` expects a str, list or map, got ${typeName(v)}`);
 }, "len", null);
 B.type_of = meta((v) => typeName(v), "type_of", null);
@@ -1388,7 +1565,7 @@ B.type_of = meta((v) => typeName(v), "type_of", null);
 B.dec = meta((v) => {
   if (v instanceof Dec) return v;
   if (Number.isSafeInteger(v) || typeof v === "bigint") return new Dec(BigInt(v), 0);
-  if (typeof v === "number") return decFromFloat(v) ?? new Err("cannot convert float to dec: it is too large, or not a number");
+  if (typeof v === "number" || v instanceof Fl) return decFromFloat(numOf(v)) ?? new Err("cannot convert float to dec: it is too large, or not a number");
   if (typeof v === "string") return decParse(v.trim(), false) ?? new Err(`not a decimal: ${JSON.stringify(v)}`);
   return new Err(`cannot convert ${typeName(v)} to dec`);
 }, "dec", null);
@@ -1409,7 +1586,9 @@ B.normalize = meta((s, form) => {
   if (!["NFC", "NFD", "NFKC", "NFKD"].includes(f)) fail(`\`normalize\`: the form is "NFC", "NFD", "NFKC" or "NFKD", got ${JSON.stringify(f)}`);
   return s.normalize(f);
 }, "normalize", null);
-B.trim = meta((s) => S(s, "trim").trim(), "trim", null);
+// The server's set, Unicode's White_Space: JavaScript's trim takes U+FEFF too, and leaves U+0085
+// (FEEDBACK55.md, Q-778; branch feedback55).
+B.trim = meta((s) => rsTrim(S(s, "trim")), "trim", null);
 // What `||` does in JavaScript, for text (FEEDBACK19.md, Q-151; branch feedback19-fixes).
 B.filled = (x) => (x === "" ? null : x);
 B.split = meta((s, sep = " ") => { S(s, "split"); S(sep, "split", 2); return sep === "" ? Array.from(s) : s.split(sep); }, "split", null);
@@ -1423,10 +1602,17 @@ B.contains = meta((c, x) => {
 }, "contains", null);
 B.starts_with = meta((s, p) => S(s, "starts_with").startsWith(S(p, "starts_with", 2)), "starts_with", null);
 B.ends_with = meta((s, p) => S(s, "ends_with").endsWith(S(p, "ends_with", 2)), "ends_with", null);
-B.replace = meta((s, a, b) => S(s, "replace").split(S(a, "replace", 2)).join(S(b, "replace", 3)), "replace", null);
+// An empty pattern is found before each character and at the end, as Rust's replace finds it, a
+// character past U+FFFF whole (FEEDBACK55.md, Q-778; branch feedback55).
+B.replace = meta((s, a, b) => {
+  S(s, "replace"); S(a, "replace", 2); S(b, "replace", 3);
+  if (a !== "") return s.split(a).join(b);
+  const cs = Array.from(s);
+  return b + cs.join(b) + (cs.length ? b : "");
+}, "replace", null);
 B.slice = meta((v, start, end) => {
-  I(start, "slice", 2);
-  if (end !== undefined) I(end, "slice", 3);
+  start = IN(start, "slice", 2);
+  if (end !== undefined) end = IN(end, "slice", 3);
   if (Array.isArray(v)) { const [s, e] = clampRange(v.length, start, end); return v.slice(s, e); }
   if (typeof v === "string") { const cs = Array.from(v); const [s, e] = clampRange(cs.length, start, end); return cs.slice(s, e).join(""); }
   fail(`\`slice\` expects a list or str, got ${typeName(v)}`);
@@ -1468,10 +1654,10 @@ B.range = meta((a, b, c) => {
   if (c !== undefined) {
     const [from, to, step] = W.stepped(a, b, c), out = [];
     if ((to - from) / step > 10000000) fail("range is too large");
-    for (let i = from; step > 0 ? i < to : i > to; i += step) out.push(i);
+    for (let i = from; step > 0 ? i < to : i > to; i += step) out.push(intOf(i));
     return out;
   }
-  return b === undefined ? intRange(0, I(a, "range")) : intRange(I(a, "range"), I(b, "range", 2));
+  return b === undefined ? intRange(0, II(a, "range")) : intRange(II(a, "range"), II(b, "range", 2));
 }, "range", null);
 B.enumerate = meta((l) => L(l, "enumerate").map((v, i) => [i, v]), "enumerate", null);
 B.keys = meta((m) => Object.keys(M(m, "keys")), "keys", null);
@@ -1480,8 +1666,8 @@ B.get = meta((m, k, d = null) => { m = M(m, "get"); k = keyText(k); return hasOw
 B.has = meta((m, k) => hasOwn(M(m, "has"), keyText(k)), "has", null);
 B.set = meta((m, k, v = null) => {
   if (Array.isArray(m)) {
-    I(k, "set", 2);
-    const at = k < 0 ? m.length + k : k;
+    II(k, "set", 2);
+    const at = typeof k === "bigint" ? -1 : k < 0 ? m.length + k : k;
     if (at < 0 || at >= m.length) fail(`\`set\`: index ${k} is outside a list of ${m.length}`);
     const l = m.slice();
     l[at] = v;
@@ -1532,7 +1718,7 @@ B.markdown = meta(async (s, o) => {
   if (!isNil(o) && !isMap(o)) fail(`\`markdown\` expects options as a map, got ${typeName(o)}`);
   let r, body = null;
   try {
-    r = await wireFetch(BASE + "/_quillo/markdown", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify([s, isNil(o) ? null : toJSON(o)]) });
+    r = await wireFetch(BASE + "/_quillo/markdown", { method: "POST", headers: { "content-type": "application/json" }, body: jsonText([s, isNil(o) ? null : o]) });
     body = await r.json();
   } catch (e) {
     return new Err(`markdown could not be made: ${e.message}`);
@@ -1836,28 +2022,38 @@ const HL = (() => {
 // server gives the markup (FEEDBACK55.md, Q-834; branch feedback55).
 B.highlight = meta((code, lang) => textHtml(HL(display(code), lang == null ? "" : display(lang))), "highlight", null);
 
-B.escape = meta((v) => display(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]), "escape", null);
+// As the server escapes, a CR `&#13;` and a NUL U+FFFD too (FEEDBACK55.md, Q-772; found in review).
+B.escape = meta((v) => escText(display(v)), "escape", null);
 // url_encode(v): as the server's, so links built on either side match.
 const urlPart = (s) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
 B.url_encode = meta((v) => isMap(v)
   ? Object.keys(v).filter((k) => !isNil(v[k])).map((k) => urlPart(k) + "=" + urlPart(display(v[k]))).join("&")
   : urlPart(display(v)), "url_encode", null);
 B.now = meta(() => Date.now(), "now", null);
-B.random = meta(() => Math.random(), "random", null);
+B.random = meta(() => fl(Math.random()), "random", null);
 B.random_int = meta((lo, hi) => {
-  I(lo, "random_int"); I(hi, "random_int", 2);
+  II(lo, "random_int"); II(hi, "random_int", 2);
   if (lo > hi) fail(`\`random_int\` needs lo <= hi, got ${lo} and ${hi}`);
+  // Past 2^53, from 64 random bits (found in review).
+  if (typeof lo === "bigint" || typeof hi === "bigint" || hi - lo >= 2 ** 52) {
+    const span = BigInt(hi) - BigInt(lo) + 1n, bits = (BigInt(Math.floor(Math.random() * 2 ** 32)) << 32n) | BigInt(Math.floor(Math.random() * 2 ** 32));
+    return intOf(BigInt(lo) + bits % span);
+  }
   return lo + Math.floor(Math.random() * (hi - lo + 1));
 }, "random_int", null);
 B.uuid = meta(() => (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID()
   : "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => { const r = Math.random() * 16 | 0; return (c === "x" ? r : (r & 3 | 8)).toString(16); }), "uuid", null);
-B.abs = meta((x) => x instanceof Dec ? new Dec(babs(x.m), x.s) : typeof x === "bigint" ? bigChecked(babs(x)) : Math.abs(N(x, "abs")), "abs", null);
+B.abs = meta((x) => x instanceof Dec ? new Dec(babs(x.m), x.s) : typeof x === "bigint" ? bigChecked(babs(x)) : x instanceof Fl ? new Fl(Math.abs(x.f)) : Math.abs(N(x, "abs")), "abs", null);
 // Halves round away from zero, as on the server (Math.round(-2.5) is -2).
 const roundHalf = (x) => Math.sign(x) * Math.round(Math.abs(x));
+// What `round`, `floor` and `ceil` give: an int below 9e15, else a float, as the server's
+// `to_int_or_float`; an int is itself, exactly (FEEDBACK55.md, Q-776; branch feedback55).
+const intOrFloat = (r) => (Number.isFinite(r) && Math.abs(r) < 9e15 ? r + 0 : fl(r));
+const isWhole = (x) => isInt(x) || typeof x === "bigint";
 // A decimal rounded: round(d, digits = 0, mode = "half_even"), keeping
 // exactly `digits` decimals.
 function roundDec(x, d, mode) {
-  if (!isNil(d)) I(d, "round", 2);
+  if (!isNil(d)) d = IN(d, "round", 2);
   if (isNil(mode)) mode = "half_even";
   else if (typeof mode !== "string") fail(`\`round\` expects a str as argument 3, got ${typeName(mode)}`);
   else if (!["half_even", "half_up", "half_down", "up", "down", "ceiling", "floor"].includes(mode)) fail(`\`round\`: unknown rounding ${JSON.stringify(mode)} (one of ${ROUNDINGS})`);
@@ -1866,18 +2062,19 @@ function roundDec(x, d, mode) {
 B.round = meta((x, d, mode) => {
   if (x instanceof Dec) return roundDec(x, d, mode);
   if (!isNil(mode)) fail("`round` takes a rounding mode for a dec only: convert with dec(x)");
-  N(x, "round"); if (d === undefined) return roundHalf(x);
-  const k = Math.min(Math.max(I(d, "round", 2), 0), 15);
+  if (d === undefined) return isWhole(x) ? x : intOrFloat(roundHalf(N(x, "round")));
+  x = N(x, "round");
+  const k = Math.min(Math.max(IN(d, "round", 2), 0), 15);
   // From the float's shortest decimal, a tie away from zero, as on the server (FEEDBACK50.md,
-  // Q-626; branch feedback50-fixes).
+  // Q-626; branch feedback50-fixes). A float, whole too (FEEDBACK55.md, Q-775).
   const p = 10 ** k, y = x * p;
-  if (!(Math.abs(y) >= 1e9 || Math.abs(Math.abs(y - Math.trunc(y)) - 0.5) < 1e-6)) return roundHalf(y) / p + 0;
+  if (!(Math.abs(y) >= 1e9 || Math.abs(Math.abs(y - Math.trunc(y)) - 0.5) < 1e-6)) return fl(roundHalf(y) / p + 0);
   const dd = decFromFloat(x);
-  if (dd !== null) return Number(decText(decRound(dd, k, "half_up")));
-  return Number.isFinite(y) ? roundHalf(y) / p : x; }, "round", null);
-B.floor = meta((x) => x instanceof Dec ? decRound(x, 0, "floor") : Math.floor(N(x, "floor")), "floor", null);
-B.ceil = meta((x) => x instanceof Dec ? decRound(x, 0, "ceiling") : Math.ceil(N(x, "ceil")), "ceil", null);
-B.sqrt = meta((x) => Math.sqrt(N(x, "sqrt")), "sqrt", null);
+  if (dd !== null) return fl(Number(decText(decRound(dd, k, "half_up"))));
+  return fl(Number.isFinite(y) ? roundHalf(y) / p : x); }, "round", null);
+B.floor = meta((x) => x instanceof Dec ? decRound(x, 0, "floor") : isWhole(x) ? x : intOrFloat(Math.floor(N(x, "floor"))), "floor", null);
+B.ceil = meta((x) => x instanceof Dec ? decRound(x, 0, "ceiling") : isWhole(x) ? x : intOrFloat(Math.ceil(N(x, "ceil"))), "ceil", null);
+B.sqrt = meta((x) => fl(Math.sqrt(N(x, "sqrt"))), "sqrt", null);
 B.pow = meta((x, y) => {
   // A decimal to an int's power, by squaring as src/decimal.rs's powi (FEEDBACK50.md, Q-632;
   // branch feedback50-fixes).
@@ -1906,13 +2103,13 @@ B.pow = meta((x, y) => {
     if (y > 64 && (x > 1 || x < -1)) fail("integer overflow");
     return bigChecked(BigInt(x) ** BigInt(y));
   }
-  return N(x, "pow") ** N(y, "pow", 2);
+  return fl(N(x, "pow") ** N(y, "pow", 2));
 }, "pow", null);
 B.unique = meta((l) => { const out = []; for (const x of L(l, "unique")) if (!out.some((y) => eq(x, y))) out.push(x); return out; }, "unique", null);
 B.flatten = meta((l) => [].concat(...L(l, "flatten").map((x) => Array.isArray(x) ? x : [x])), "flatten", null);
 B.zip = meta((a, b) => { a = L(a, "zip"); b = L(b, "zip", 2); return a.slice(0, Math.min(a.length, b.length)).map((x, i) => [x, b[i]]); }, "zip", null);
-B.take = meta((v, n) => { n = Math.max(I(n, "take", 2), 0); return typeof v === "string" ? Array.from(v).slice(0, n).join("") : L(v, "take").slice(0, n); }, "take", null);
-B.drop = meta((v, n) => { n = Math.max(I(n, "drop", 2), 0); return typeof v === "string" ? Array.from(v).slice(n).join("") : L(v, "drop").slice(n); }, "drop", null);
+B.take = meta((v, n) => { n = Math.max(IN(n, "take", 2), 0); return typeof v === "string" ? Array.from(v).slice(0, n).join("") : L(v, "take").slice(0, n); }, "take", null);
+B.drop = meta((v, n) => { n = Math.max(IN(n, "drop", 2), 0); return typeof v === "string" ? Array.from(v).slice(n).join("") : L(v, "drop").slice(n); }, "drop", null);
 B.count = meta((l, f) => { l = L(l, "count"); if (f === undefined) return l.length; F(f, "count"); let n = 0; for (const x of l) { const r = cb(f, "count", x); if (r instanceof Err) return r; if (truthy(r)) n++; } return n; }, "count", null);
 B.group_by = meta((l, f) => { F(f, "group_by"); const out = {}; for (const x of L(l, "group_by")) { const k = keyText(cb(f, "group_by", x)); if (!hasOwn(out, k)) Object.defineProperty(out, k, { value: [], enumerable: true, writable: true, configurable: true }); out[k].push(x); } return out; }, "group_by", null);
 B.index_of = meta((c, x) => {
@@ -1920,7 +2117,7 @@ B.index_of = meta((c, x) => {
   if (typeof c === "string") { const i = c.indexOf(display(x)); return i < 0 ? null : Array.from(c.slice(0, i)).length; }
   fail(`\`index_of\` expects a list or str, got ${typeName(c)}`);
 }, "index_of", null);
-B.repeat = meta((s, n) => { S(s, "repeat"); I(n, "repeat", 2); if (n < 0 || s.length * n > 1e8) fail("`repeat` count is negative or too large"); return s.repeat(n); }, "repeat", null);
+B.repeat = meta((s, n) => { S(s, "repeat"); n = IN(n, "repeat", 2); if (n < 0 || s.length * n > 1e8) fail("`repeat` count is negative or too large"); return s.repeat(n); }, "repeat", null);
 // What the program's ES modules give, by the program's name for it, or the error
 // value saying why not: here, where the page's scripts cannot reach them or
 // replace them (branch library-hints).
@@ -2025,6 +2222,7 @@ const plural = (locale, n, frac) => {
 // are taken at their number (FEEDBACK30.md, Q-367; branch feedback27-35-fixes).
 const pluralCount = (c) => {
   if (typeof c === "number") return Number.isFinite(c) ? [c, !Number.isInteger(c)] : null;
+  if (c instanceof Fl) return [c.f, false];
   if (typeof c === "bigint") return [Number(c), false];
   if (c instanceof Dec) return [Number(decText(c)), c.s > 0];
   if (typeof c === "string") { const t = c.trim(), f = t === "" ? NaN : Number(t); return Number.isFinite(f) ? [f, t.includes(".")] : null; }
@@ -2060,13 +2258,67 @@ B.defer = meta((v) => v, "defer", null);
 B.json = {
   // An id in a document keeps its digits, where the browser says what they were
   // (FEEDBACK25.md, Q-301; branch feedback26-fixes).
-  parse: (s) => { S(s, "json.parse"); try { return fromJSON(JSON.parse(s, (k, v, c) => typeof v === "number" && !Number.isSafeInteger(v) && c && /^-?\d+$/.test(c.source) && Math.abs(v) < 2 ** 63 ? intOf(BigInt(c.source)) : v)); } catch (e) { return new Err("invalid JSON: " + e.message); } },
+  // Numbers as the server reads them (`jsonNum`); refused as there: one past a float's range
+  // (`1e400`), and text with half of a character (FEEDBACK55.md, Q-782; branch feedback55).
+  parse: (s) => { S(s, "json.parse"); try { return fromJSON(parseData(s, (k, v) => {
+    if ((typeof v === "string" && !wellFormed(v)) || !wellFormed(k)) throw new Error("half of a character (a lone surrogate)");
+    if (typeof v === "number" && !Number.isFinite(v)) throw new Error("number out of range");
+  })); } catch (e) { return new Err("invalid JSON: " + e.message); } },
   stringify: (v, pretty) => jsonText(visible(v), truthy(pretty) ? 2 : undefined),
 };
 
 function fromJSON(j) {
   if (j === undefined) return null;
   return j;
+}
+// A JSON number as the server reads it: written with a point or an exponent, a float (an Fl when
+// whole); digits alone, an int, exact past 2^53, and past 64 bits a float. Without the text it
+// was written as (a browser whose JSON.parse does not give it), a whole one is an int
+// (FEEDBACK55.md, Q-775 and Q-776; branch feedback55).
+function jsonNum(v, c) {
+  if (!c || !Number.isInteger(v)) return v;
+  const t = c.source;
+  // `-0` too is the float -0.0 there.
+  if (/[.eE]/.test(t) || Object.is(v, -0)) return new Fl(v);
+  if (Number.isSafeInteger(v)) return v;
+  const b = BigInt(t);
+  return b >= I64_MIN && b <= I64_MAX ? intOf(b) : new Fl(v);
+}
+const wellFormed = (s) => (s.isWellFormed ? s.isWellFormed() : !/[\ud800-\udfff]/.test(s.replace(/[\ud800-\udbff][\udc00-\udfff]/g, "")));
+// JSON from the server, or from another site, with its numbers read as the server reads them.
+const readJSON = (text) => parseData(text);
+// Whether JSON.parse gives its reviver the text each number was written as (Chrome 114, Firefox
+// 135, Safari 18.4 on), asked once.
+let jsonSource = null;
+const hasJsonSource = () => jsonSource ?? (jsonSource = (() => {
+  try { let ok = false; JSON.parse("[1.0]", (k, v, c) => { if (typeof v === "number") ok = !!c && c.source === "1.0"; return v; }); return ok; } catch (_) { return false; }
+})());
+// A string, or a number, in JSON text.
+const JSON_TOKEN = /"(?:[^"\\]|\\[^])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
+// Whether a number's text says more than its value: a whole float (`2.0`, `1e2`, `-0`), an int
+// past 2^53.
+const tellsType = (t) => { const n = Number(t); return /[.eE]/.test(t) ? Number.isInteger(n) : !Number.isSafeInteger(n) || Object.is(n, -0); };
+let numKey = null;
+// JSON text parsed, each number as the server reads it (`jsonNum`); `check(key, value)` sees each
+// value as it comes (and may throw), `after(value)` makes each one that is no number. In a browser
+// whose JSON.parse does not give the text a number was written as (Safari before 18.4, Firefox
+// before 135), the numbers whose text says more are put first in objects under a key no text has,
+// and made from their text here: there whole floats were ints, and ints past 2^53 lost digits
+// (found in review of FEEDBACK55.md's Q-775 and Q-776; branch feedback55).
+function parseData(text, check, after) {
+  if (hasJsonSource()) return JSON.parse(text, (k, v, c) => { if (check) check(k, v); return typeof v === "number" ? jsonNum(v, c) : after ? after(v) : v; });
+  if (numKey === null) {
+    const r = typeof crypto !== "undefined" && crypto.getRandomValues ? Array.from(crypto.getRandomValues(new Uint32Array(4)), (x) => x.toString(36)).join("") : String(Math.random()).slice(2);
+    numKey = "\u0000n" + r;
+  }
+  const key = numKey, written = "\\u0000n" + key.slice(2);
+  const marked = text.replace(JSON_TOKEN, (t) => (t[0] === '"' || !tellsType(t) ? t : `{"${written}":"${t}"}`));
+  return JSON.parse(marked, (k, v) => {
+    if (k === key) return v;
+    if (v !== null && typeof v === "object" && typeof v[key] === "string") { const n = Number(v[key]); if (check) check(k, n); return jsonNum(n, { source: v[key] }); }
+    if (check) check(k, v);
+    return after ? after(v) : v;
+  });
 }
 
 // `User(fields)`: a User, or an error value saying what is wrong.
@@ -2206,6 +2458,20 @@ function reCheck(p) {
   return null;
 }
 
+// `^` and `$` (outside a class, unescaped) as the server's multi-line ones.
+function reLines(p) {
+  let out = "", cls = false;
+  for (let i = 0; i < p.length; i++) {
+    const c = p[i];
+    if (c === "\\") { out += c + (p[i + 1] ?? ""); i++; }
+    else if (cls) { if (c === "]") cls = false; out += c; }
+    else if (c === "[") { cls = true; out += c; }
+    else if (c === "^") out += "(?<![^\\n\\r])(?!(?<=\\r)\\n)";
+    else if (c === "$") out += "(?![^\\n\\r])(?!(?<=\\r)\\n)";
+    else out += c;
+  }
+  return out;
+}
 const reCache = new Map();
 function reOf(p, flags, f, at) {
   S(p, f, 2);
@@ -2219,7 +2485,10 @@ function reOf(p, flags, f, at) {
     const why = reCheck(p);
     if (why) fail(`\`${f}\`: ${why}`);
     if (reCache.size >= 256) reCache.clear();
-    r = new RegExp(p, "gu" + flags);
+    // With `m`, a line ends at \n or \r, and \r\n is one end, as the server's regex has it
+    // (`(?mR)`): JavaScript's `m` ended one at U+2028 and U+2029 too, and between \r and \n
+    // (FEEDBACK55.md, Q-782; branch feedback55).
+    r = flags.includes("m") ? new RegExp(reLines(p), "gu" + flags.replace("m", "")) : new RegExp(p, "gu" + flags);
     reCache.set(key, r);
   }
   return r;
@@ -2555,7 +2824,7 @@ function moneyArg(v, f, i, exact = true) {
   if (a instanceof Dec) amount = a;
   else if (isInt(a) || typeof a === "bigint") amount = new Dec(BigInt(a), 0);
   else if (typeof a === "string") { amount = /[eE]/.test(a) ? null : decParse(rsTrim(a), false); if (amount === null) bad(`: its amount ${repr(a)} is not an amount`); }
-  else if (typeof a === "number") bad(": its amount is a float: make it with money.of(dec(x), currency)");
+  else if (typeof a === "number" || a instanceof Fl) bad(": its amount is a float: make it with money.of(dec(x), currency)");
   else bad(": its amount must be a dec");
   if (!exact) return { amount, code, units };
   const fitted = decRound(amount, units, "down");
@@ -2576,7 +2845,7 @@ function moneyFromData(v) {
   if (units === null) return { why: "has a currency that is not an ISO 4217 code" };
   if (!hasOwn(v, "amount") || v.amount === undefined) return { why: "has no amount" };
   const a = v.amount;
-  const amount = a instanceof Dec ? a : isInt(a) || typeof a === "bigint" ? new Dec(BigInt(a), 0) : typeof a === "number" ? decFromFloat(a)
+  const amount = a instanceof Dec ? a : isInt(a) || typeof a === "bigint" ? new Dec(BigInt(a), 0) : typeof a === "number" || a instanceof Fl ? decFromFloat(numOf(a))
     : typeof a === "string" && !/[eE]/.test(a) ? decParse(rsTrim(a), false) : null;
   if (amount === null) return { why: "has an amount that is not a number" };
   const fitted = decRound(amount, units, "down");
@@ -2667,7 +2936,7 @@ B.money = {
     // Text as people write an amount, and money whose cents fit an int, as
     // on the server (FEEDBACK14.md, Q-096; branch feedback14-fixes).
     else if (typeof amount === "string") { d = /[eE]/.test(amount) ? null : decParse(rsTrim(amount), false); if (d === null) return new Err(`not an amount: ${repr(amount)}`); }
-    else if (typeof amount === "number") fail("`money.of` takes a dec, an int or text, not a float: convert it with dec(x)");
+    else if (typeof amount === "number" || amount instanceof Fl) fail("`money.of` takes a dec, an int or text, not a float: convert it with dec(x)");
     else fail(`\`money.of\` expects an amount (a dec, int or str) as argument 1, got ${moneyShort(amount)}`);
     return moneyOfAmount(d, c, mode, "money.of", 3);
   },
@@ -2694,7 +2963,7 @@ B.money = {
     let f;
     if (factor instanceof Dec) f = factor;
     else if (isInt(factor) || typeof factor === "bigint") f = new Dec(BigInt(factor), 0);
-    else if (typeof factor === "number") fail("`money.mul` takes a dec or an int, not a float: convert it with dec(x)");
+    else if (typeof factor === "number" || factor instanceof Fl) fail("`money.mul` takes a dec or an int, not a float: convert it with dec(x)");
     else fail(`\`money.mul\` expects a dec or an int as argument 2, got ${moneyShort(factor)}`);
     return moneyIn(decRound(decMul(a.amount, f), a.units, moneyMode(mode, "money.mul")), a.code);
   },
@@ -2736,7 +3005,7 @@ B.format_number = meta((x, locale, digits, mode) => {
   let d;
   if (x instanceof Dec) d = x;
   else if (isInt(x) || typeof x === "bigint") d = new Dec(BigInt(x), 0);
-  else if (typeof x === "number") { d = decFromFloat(x); if (d === null) return display(x); }
+  else if (typeof x === "number" || x instanceof Fl) { d = decFromFloat(numOf(x)); if (d === null) return display(x); }
   else fail(`\`format_number\` expects a number as argument 1, got ${moneyShort(x)}`);
   const loc = localeData(moneyLocale(locale, "format_number", 2));
   const rounding = isNil(mode) ? "half_up" : moneyMode(mode, "format_number", 4);
@@ -2764,7 +3033,32 @@ B.format_number = meta((x, locale, digits, mode) => {
 // The browser cannot tell 2 from 2.0, so ints are numbers that are whole.
 
 const decNote = (v) => (v instanceof Dec ? FLOAT_ONLY : "");
-const NS = (l, f, i = 1) => { l = L(l, f, i); l.forEach((v, k) => { if (typeof v !== "number") fail(`\`${f}\` expects a list of numbers, but item ${k} is ${typeName(v)}${decNote(v)}`); }); return l; };
+// A list of numbers as floats, as the server's `nums` reads them (an int past 2^53 and a whole
+// float too), and whether all were ints (FEEDBACK55.md, Q-775 and Q-776; branch feedback55).
+const NSi = (l, f, i = 1) => {
+  l = L(l, f, i);
+  const out = new Array(l.length);
+  let ints = true;
+  for (let k = 0; k < l.length; k++) {
+    const v = l[k];
+    if (typeof v === "number") { out[k] = v; if (ints && !Number.isInteger(v)) ints = false; continue; }
+    const x = numOf(v);
+    if (x === null) fail(`\`${f}\` expects a list of numbers, but item ${k} is ${typeName(v)}${decNote(v)}`);
+    out[k] = x;
+    if (v instanceof Fl) ints = false;
+  }
+  return [out, ints];
+};
+const NS = (l, f, i = 1) => NSi(l, f, i)[0];
+// An int when the inputs were ints and it is whole (below 9e15), else a float: the server's `back`.
+const back = (x, ints) => (ints && Number.isInteger(x) && Math.abs(x) < 9e15 ? x + 0 : fl(x));
+const fls = (xs) => xs.map(fl);
+// NaN and infinity have no place where data are put in order or counted, as on the server
+// (FEEDBACK49.md, Q-605; FEEDBACK55.md, Q-780; branch feedback55).
+const finiteOf = (x, f, what) => { const i = x.findIndex((v) => !Number.isFinite(v)); if (i >= 0) fail(`\`${f}\`: the ${what} hold ${Number.isNaN(x[i]) ? "NaN" : x[i] > 0 ? "inf" : "-inf"} at index ${i}: NaN and infinity cannot be counted or put in order`); return x; };
+// An int argument of the numeric functions, as the server's `int` takes it: a whole float below
+// 9e15 too, and an int past 2^53 (a BigInt) (FEEDBACK55.md, Q-776; branch feedback55).
+const NI = (v, f, i = 1) => { if (v instanceof Fl && Math.abs(v.f) < 9e15) return v.f + 0; want(isInt(v) || typeof v === "bigint", f, "an int", i, v); return v; };
 const given = (v) => !isNil(v);
 const csum2 = (xs) => {
   let s = 0, c = 0;
@@ -2835,18 +3129,19 @@ const sortedOf = (x) => Float64Array.from(x).sort();
 const overflowed = (n) => { if (!Number.isSafeInteger(n)) fail("integer overflow"); return n; };
 
 const mathDomain = (f, x) => fail(`\`math.${f}\`: math domain error (${display(x)})`);
+// A float answer, an Fl when whole (FEEDBACK55.md, Q-775; branch feedback55).
 const mathChecked = (f, x, y, ok) => {
   if (!ok || (Number.isNaN(y) && !Number.isNaN(x))) mathDomain(f, x);
   if (!Number.isFinite(y) && !Number.isNaN(y) && Number.isFinite(x)) fail(`\`math.${f}\`: math range error (${display(x)})`);
-  return y;
+  return fl(y);
 };
 const checked2 = (f, x, y, r, ok) => {
   const nanIn = Number.isNaN(x) || Number.isNaN(y);
   if (!ok || (Number.isNaN(r) && !nanIn)) fail(`\`math.${f}\`: math domain error (${display(x)}, ${display(y)})`);
   if (!Number.isFinite(r) && !Number.isNaN(r) && Number.isFinite(x) && Number.isFinite(y)) fail(`\`math.${f}\`: math range error (${display(x)}, ${display(y)})`);
-  return r;
+  return fl(r);
 };
-const unary = (f, g, dom = () => true) => (x) => { N(x, "math." + f); return mathChecked(f, x, g(x), Number.isNaN(x) || dom(x)); };
+const unary = (f, g, dom = () => true) => (x) => { x = N(x, "math." + f); return mathChecked(f, x, g(x), Number.isNaN(x) || dom(x)); };
 
 // erf: a series below 2, else from erfc's continued fraction.
 const erfc = (x) => {
@@ -2896,15 +3191,29 @@ const norm2 = (v) => {
   if (big === 0 || Number.isNaN(big)) return big;
   return big * Math.sqrt(csum(v.map((x) => (x / big) * (x / big))));
 };
-const toInt = (f, g) => (x) => { N(x, f); if (!Number.isFinite(x)) fail(`\`${f}\`: cannot convert ${display(x)} to an int`); return overflowed(g(x) + 0); };
-const natural = (n, f, i = 1) => { I(n, f, i); if (n < 0) fail(`\`${f}\` is not defined for negative numbers (${n})`); return n; };
-const gcd2 = (a, b) => { a = Math.abs(a); b = Math.abs(b); while (b) [a, b] = [b, a % b]; return a; };
-const intsOf = (args, f) => (args.length === 1 && Array.isArray(args[0]) ? args[0] : args).map((v, i) => I(v, f, i + 1));
-const pairOf = (a, b, f) => { a = NS(a, f); b = NS(b, f, 2); if (a.length !== b.length) fail(`\`${f}\` needs lists of the same length (${a.length} and ${b.length})`); return [a, b]; };
+// An int is itself; a float its whole part, to 9.2e18 and exact past 2^53, as the server's
+// `rounded` (FEEDBACK55.md, Q-776; branch feedback55).
+const toInt = (f, g) => (x) => {
+  if (isWhole(x)) return x;
+  x = N(x, f);
+  if (!Number.isFinite(x)) fail(`\`${f}\`: cannot convert ${display(x)} to an int`);
+  const y = g(x) + 0;
+  if (Math.abs(y) >= 9.2e18) fail("integer overflow");
+  return Number.isSafeInteger(y) ? y : BigInt(y);
+};
+const natural = (n, f, i = 1) => { n = NI(n, f, i); if (n < 0) fail(`\`${f}\` is not defined for negative numbers (${n})`); return n; };
+const gcd2 = (a, b) => { a = a < 0n ? -a : a; b = b < 0n ? -b : b; while (b) [a, b] = [b, a % b]; return a; };
+const intsOf = (args, f) => (args.length === 1 && Array.isArray(args[0]) ? args[0] : args).map((v, i) => BigInt(NI(v, f, i + 1)));
+// Ints multiplied (or added) exactly, as BigInts past 2^53, and refused past 64 bits as on the
+// server (FEEDBACK55.md, Q-776; branch feedback55).
+const imul = (a, b) => { if (typeof a === "number" && typeof b === "number") { const r = a * b; if (Number.isSafeInteger(r)) return r + 0; } return bigChecked(BigInt(a) * BigInt(b)); };
+const iadd = (a, b) => { if (typeof a === "number" && typeof b === "number") { const r = a + b; if (Number.isSafeInteger(r)) return r; } return bigChecked(BigInt(a) + BigInt(b)); };
+const pairOf = (a, b, f) => { const [x, ix] = NSi(a, f), [y, iy] = NSi(b, f, 2); if (x.length !== y.length) fail(`\`${f}\` needs lists of the same length (${x.length} and ${y.length})`); return [x, y, ix && iy]; };
+// Ints multiplied and added exactly; else a float, as if in twice the precision.
 const dotOf = (a, b, f) => {
-  [a, b] = pairOf(a, b, f);
-  if (a.every(isInt) && b.every(isInt)) { let s = 0; for (let i = 0; i < a.length; i++) s = overflowed(s + overflowed(a[i] * b[i])); return s; }
-  return cdot(a, b);
+  const [x, y, ints] = pairOf(a, b, f);
+  if (ints) { let s = 0; for (let i = 0; i < x.length; i++) s = iadd(s, imul(a[i], b[i])); return s; }
+  return fl(cdot(x, y));
 };
 
 B.math = {
@@ -2915,23 +3224,23 @@ B.math = {
   exp2: unary("exp2", (x) => 2 ** x),
   expm1: unary("expm1", Math.expm1),
   log: (x, b) => {
-    N(x, "math.log");
+    x = N(x, "math.log");
     if (!given(b)) return mathChecked("log", x, Math.log(x), Number.isNaN(x) || x > 0);
-    N(b, "math.log", 2);
+    b = N(b, "math.log", 2);
     if (b <= 0 || b === 1) fail(`\`math.log\`: math domain error (base ${display(b)})`);
     return mathChecked("log", x, Math.log(x) / Math.log(b), Number.isNaN(x) || x > 0);
   },
   log2: unary("log2", Math.log2, (x) => x > 0),
   log10: unary("log10", Math.log10, (x) => x > 0),
   log1p: unary("log1p", Math.log1p, (x) => x > -1),
-  pow: (x, y) => { N(x, "math.pow"); N(y, "math.pow", 2); return checked2("pow", x, y, Math.pow(x, y), !(x === 0 && y < 0)); },
+  pow: (x, y) => { x = N(x, "math.pow"); y = N(y, "math.pow", 2); return checked2("pow", x, y, Math.pow(x, y), !(x === 0 && y < 0)); },
   sin: unary("sin", Math.sin, Number.isFinite),
   cos: unary("cos", Math.cos, Number.isFinite),
   tan: unary("tan", Math.tan, Number.isFinite),
   asin: unary("asin", Math.asin, (x) => Math.abs(x) <= 1),
   acos: unary("acos", Math.acos, (x) => Math.abs(x) <= 1),
   atan: unary("atan", Math.atan),
-  atan2: (y, x) => Math.atan2(N(y, "math.atan2"), N(x, "math.atan2", 2)),
+  atan2: (y, x) => fl(Math.atan2(N(y, "math.atan2"), N(x, "math.atan2", 2))),
   sinh: unary("sinh", Math.sinh),
   cosh: unary("cosh", Math.cosh),
   tanh: unary("tanh", Math.tanh),
@@ -2940,51 +3249,65 @@ B.math = {
   atanh: unary("atanh", Math.atanh, (x) => Math.abs(x) < 1),
   degrees: unary("degrees", (x) => x * (180 / Math.PI)),
   radians: unary("radians", (x) => x * (Math.PI / 180)),
-  hypot: (...v) => norm2(v.map((x, i) => N(x, "math.hypot", i + 1))),
+  hypot: (...v) => fl(norm2(v.map((x, i) => N(x, "math.hypot", i + 1)))),
   dist: (p, q) => {
     p = NS(p, "math.dist"); q = NS(q, "math.dist", 2);
     if (p.length !== q.length) fail(`\`math.dist\`: both points must have the same number of dimensions (${p.length} and ${q.length})`);
-    return norm2(p.map((x, i) => x - q[i]));
+    return fl(norm2(p.map((x, i) => x - q[i])));
   },
   floor: toInt("math.floor", Math.floor),
   ceil: toInt("math.ceil", Math.ceil),
   trunc: toInt("math.trunc", Math.trunc),
   fabs: unary("fabs", Math.abs),
-  copysign: (x, y) => { N(x, "math.copysign"); N(y, "math.copysign", 2); return (y < 0 || Object.is(y, -0)) ? -Math.abs(x) : Math.abs(x); },
-  fmod: (x, y) => { N(x, "math.fmod"); N(y, "math.fmod", 2); return checked2("fmod", x, y, x % y, !(y === 0 || !Number.isFinite(x)) || Number.isNaN(x) || Number.isNaN(y)); },
+  copysign: (x, y) => { x = N(x, "math.copysign"); y = N(y, "math.copysign", 2); return fl((y < 0 || Object.is(y, -0)) ? -Math.abs(x) : Math.abs(x)); },
+  fmod: (x, y) => { x = N(x, "math.fmod"); y = N(y, "math.fmod", 2); return checked2("fmod", x, y, x % y, !(y === 0 || !Number.isFinite(x)) || Number.isNaN(x) || Number.isNaN(y)); },
   remainder: (x, y) => {
-    N(x, "math.remainder"); N(y, "math.remainder", 2);
+    x = N(x, "math.remainder"); y = N(y, "math.remainder", 2);
     const ok = !(y === 0 || !Number.isFinite(x)) || Number.isNaN(x) || Number.isNaN(y);
     if (!Number.isFinite(y)) return checked2("remainder", x, y, x, ok);
     let n = Math.round(x / y);
     if (Math.abs(x / y - Math.trunc(x / y)) === 0.5 && n % 2) n -= 1;
     return checked2("remainder", x, y, x - n * y, ok);
   },
-  modf: (x) => { N(x, "math.modf"); if (!Number.isFinite(x) && !Number.isNaN(x)) return [x < 0 ? -0 : 0, x]; return [x % 1, Math.trunc(x)]; },
+  modf: (x) => { x = N(x, "math.modf"); if (!Number.isFinite(x) && !Number.isNaN(x)) return [fl(x < 0 ? -0 : 0), x]; return [fl(x % 1), fl(Math.trunc(x))]; },
   frexp: (x) => {
-    N(x, "math.frexp");
-    if (x === 0 || !Number.isFinite(x)) return [x, 0];
+    x = N(x, "math.frexp");
+    if (x === 0 || !Number.isFinite(x)) return [fl(x), 0];
     let e = Math.max(-1073, Math.floor(Math.log2(Math.abs(x))) + 1), m = x * 2 ** -e;
     while (Math.abs(m) < 0.5) { m *= 2; e -= 1; }
     while (Math.abs(m) >= 1) { m /= 2; e += 1; }
     return [m, e];
   },
-  ldexp: (x, e) => { N(x, "math.ldexp"); I(e, "math.ldexp", 2); e = Math.min(Math.max(e, -10000), 10000); let r = x; while (e > 1000) { r *= 2 ** 1000; e -= 1000; } while (e < -1000) { r *= 2 ** -1000; e += 1000; } return mathChecked("ldexp", x, r * 2 ** e, true); },
-  factorial: (n) => { natural(n, "math.factorial"); let r = 1; for (let k = 2; k <= n; k++) r = overflowed(r * k); return r; },
-  gcd: (...args) => intsOf(args, "math.gcd").reduce(gcd2, 0),
-  lcm: (...args) => { const v = intsOf(args, "math.lcm"); if (v.includes(0)) return 0; let acc = 1; for (const n of v) acc = overflowed(acc / gcd2(acc, n) * Math.abs(n)); return acc; },
-  comb: (n, k) => {
-    natural(n, "math.comb"); natural(k, "math.comb", 2);
-    if (k > n) return 0;
-    k = Math.min(k, n - k);
-    let r = 1;
-    for (let i = 0; i < k; i++) { const g = gcd2(r, i + 1); r = overflowed((r / g) * ((n - i) / ((i + 1) / g))); }
-    return r;
+  ldexp: (x, e) => { x = N(x, "math.ldexp"); e = Number(NI(e, "math.ldexp", 2)); e = Math.min(Math.max(e, -10000), 10000); let r = x; while (e > 1000) { r *= 2 ** 1000; e -= 1000; } while (e < -1000) { r *= 2 ** -1000; e += 1000; } return mathChecked("ldexp", x, r * 2 ** e, true); },
+  // Exactly, in BigInts past 2^53, to what an int holds, as on the server: `math.factorial(19)`
+  // and `math.comb(60, 30)` were overflows (FEEDBACK55.md, Q-776; branch feedback55).
+  factorial: (n) => { n = BigInt(natural(n, "math.factorial")); let r = 1n; for (let k = 2n; k <= n; k++) { r *= k; if (r > I64_MAX) fail("integer overflow"); } return intOf(r); },
+  gcd: (...args) => { const v = intsOf(args, "math.gcd"); if (v.includes(I64_MIN)) fail("integer overflow"); return intOf(v.reduce(gcd2, 0n)); },
+  lcm: (...args) => {
+    const v = intsOf(args, "math.lcm");
+    if (v.includes(0n)) return 0;
+    let acc = 1n;
+    for (const n of v) { acc = acc / gcd2(acc, n) * babs(n); if (acc > I64_MAX) fail("integer overflow"); }
+    return intOf(acc);
   },
-  perm: (n, k) => { natural(n, "math.perm"); k = given(k) ? natural(k, "math.perm", 2) : n; if (k > n) return 0; let r = 1; for (let x = n - k + 1; x <= n; x++) r = overflowed(r * x); return r; },
-  isqrt: (n) => { natural(n, "math.isqrt"); let s = Math.floor(Math.sqrt(n)); while (s * s > n) s--; while ((s + 1) * (s + 1) <= n) s++; return s; },
+  comb: (n, k) => {
+    n = BigInt(natural(n, "math.comb")); k = BigInt(natural(k, "math.comb", 2));
+    if (k > n) return 0;
+    if (n - k < k) k = n - k;
+    let r = 1n;
+    for (let i = 0n; i < k; i++) { r = r * (n - i) / (i + 1n); if (r > I64_MAX) fail("integer overflow"); }
+    return intOf(r);
+  },
+  perm: (n, k) => {
+    n = BigInt(natural(n, "math.perm")); k = given(k) ? BigInt(natural(k, "math.perm", 2)) : n;
+    if (k > n) return 0;
+    let r = 1n;
+    for (let x = n - k + 1n; x <= n; x++) { r *= x; if (r > I64_MAX) fail("integer overflow"); }
+    return intOf(r);
+  },
+  isqrt: (n) => { n = BigInt(natural(n, "math.isqrt")); let s = BigInt(Math.floor(Math.sqrt(Number(n)))); while (s * s > n) s--; while ((s + 1n) * (s + 1n) <= n) s++; return intOf(s); },
   isclose: (a, b, rel, abs) => {
-    N(a, "math.isclose"); N(b, "math.isclose", 2);
+    a = N(a, "math.isclose"); b = N(b, "math.isclose", 2);
     rel = given(rel) ? N(rel, "math.isclose", 3) : 1e-9; abs = given(abs) ? N(abs, "math.isclose", 4) : 0;
     if (rel < 0 || abs < 0) fail("`math.isclose`: tolerances must be non-negative");
     if (a === b) return true;
@@ -2993,18 +3316,24 @@ B.math = {
     return d <= Math.abs(rel * b) || d <= Math.abs(rel * a) || d <= abs;
   },
   isfinite: (x) => Number.isFinite(N(x, "math.isfinite")),
-  isinf: (x) => { N(x, "math.isinf"); return x === Infinity || x === -Infinity; },
+  isinf: (x) => { x = N(x, "math.isinf"); return x === Infinity || x === -Infinity; },
   isnan: (x) => Number.isNaN(N(x, "math.isnan")),
+  // An int while all are, exactly (FEEDBACK55.md, Q-776; branch feedback55); else a float.
   prod: (l, start) => {
-    let acc = given(start) ? N(start, "math.prod", 2) : 1;
-    for (const x of L(l, "math.prod")) { if (typeof x !== "number") fail(`\`math.prod\` expects numbers, got ${typeName(x)}${decNote(x)}`); acc = isInt(acc) && isInt(x) ? overflowed(acc * x) : acc * x; }
+    let acc = given(start) ? start : 1;
+    for (const x of L(l, "math.prod")) {
+      if (isWhole(acc) && isWhole(x)) { acc = imul(acc, x); continue; }
+      const a = numOf(acc), b = numOf(x);
+      if (a === null || b === null) fail(`\`math.prod\` expects numbers, got ${typeName(x)}${decNote(x)}`);
+      acc = fl(a * b);
+    }
     return acc;
   },
   fsum: (l) => {
     const x = NS(l, "math.fsum"), s = fsum(x);
     if (Number.isNaN(s) && x.includes(Infinity) && x.includes(-Infinity)) fail("`math.fsum`: inf and -inf have no sum");
     if (!Number.isFinite(s) && x.every(Number.isFinite)) fail("`math.fsum`: the sum is too large for a float");
-    return s;
+    return fl(s);
   },
   sumprod: (p, q) => dotOf(p, q, "math.sumprod"),
   erf: unary("erf", erf),
@@ -3016,7 +3345,8 @@ B.math = {
 // The 64 bits of an int, as on the server: JavaScript's own `&` and `<<` keep
 // 32. An int past 2^53 is a BigInt here (FEEDBACK19.md, Q-153; branch
 // feedback19-fixes).
-const bitsOf = (v, f, i = 1) => { want(isInt(v) || typeof v === "bigint", f, "an int", i, v); return BigInt(v); };
+// A whole float too, as the server's `int` takes it (FEEDBACK55.md, Q-775; branch feedback55).
+const bitsOf = (v, f, i = 1) => BigInt(NI(v, f, i));
 const fromBits = (b) => intOf(BigInt.asIntN(64, b));
 const shiftOf = (n, f) => { const k = bitsOf(n, f, 2); if (k < 0n || k > 63n) fail(`\`${f}\`: a shift is 0 to 63, got ${k}`); return k; };
 B.bit = {
@@ -3028,11 +3358,14 @@ B.bit = {
   shr: (a, n) => fromBits(bitsOf(a, "bit.shr") >> shiftOf(n, "bit.shr")),
 };
 
-const dataOf = (l, f, least) => {
-  l = NS(l, f);
-  if (l.length < least) fail(`\`${f}\` requires ${least === 1 ? "at least one data point" : `at least ${least} data points`}`);
-  return l;
+const dataOfI = (l, f, least) => {
+  const d = NSi(l, f);
+  if (d[0].length < least) fail(`\`${f}\` requires ${least === 1 ? "at least one data point" : `at least ${least} data points`}`);
+  return d;
 };
+const dataOf = (l, f, least) => dataOfI(l, f, least)[0];
+// `dataOfI` where data are put in order: NaN and infinity refused (FEEDBACK55.md, Q-780).
+const orderedOf = (l, f, least) => { const d = dataOfI(l, f, least); finiteOf(d[0], f, "data"); return d; };
 const kth = (x, k) => sortedOf(x)[k];
 const atPercent = (d, p) => { const h = p / 100 * (d.length - 1), lo = Math.floor(h), hi = Math.min(lo + 1, d.length - 1); return d[lo] + (d[hi] - d[lo]) * (h - lo); };
 const ranksOf = (x) => {
@@ -3051,9 +3384,10 @@ const momentsOf = (x, y) => {
 };
 const pairedOf = (x, y, f) => { [x, y] = pairOf(x, y, f); if (x.length < 2) fail(`\`${f}\` requires at least two data points`); return [x, y]; };
 const varianceOf = (l, mu, f, sample) => { const x = dataOf(l, f, sample ? 2 : 1); return div2(ssOf(x, given(mu) ? N(mu, f, 2) : meanOf(x)), x.length - (sample ? 1 : 0)); };
-const tallyKey = (v) => typeof v === "number" ? "n" + (v + 0) : typeof v === "string" ? "s" + v : "v" + repr(v);
+// A number by its float, 1 and 1.0 one value, as on the server.
+const tallyKey = (v) => isNumber(v) ? "n" + (numOf(v) + 0) : typeof v === "string" ? "s" + v : "v" + repr(v);
 const tallyOf = (l) => { const at = new Map(), out = []; l.forEach((v, i) => { const k = tallyKey(v); if (at.has(k)) out[at.get(k)][1]++; else { at.set(k, out.length); out.push([i, 1]); } }); return out; };
-const normalArgs = (x, mu, sigma, f) => { N(x, f); mu = given(mu) ? N(mu, f, 2) : 0; sigma = given(sigma) ? N(sigma, f, 3) : 1; if (!(sigma > 0)) fail(`\`${f}\`: sigma must be positive, got ${display(sigma)}`); return [x, mu, sigma]; };
+const normalArgs = (x, mu, sigma, f) => { x = N(x, f); mu = given(mu) ? N(mu, f, 2) : 0; sigma = given(sigma) ? N(sigma, f, 3) : 1; if (!(sigma > 0)) fail(`\`${f}\`: sigma must be positive, got ${display(sigma)}`); return [x, mu, sigma]; };
 const poly = (c, r) => c.reduce((acc, k) => acc * r + k, 0);
 const invCdf = (p) => {
   const q = p - 0.5;
@@ -3081,59 +3415,61 @@ const linspaceOf = (a, b, n, endpoint) => {
   if (endpoint && n > 1) out[n - 1] = b;
   return out;
 };
-const countOf = (n, f) => { I(n, f); if (n < 0 || n > 1e7) fail(`\`${f}\`: ${n} is not a count from 0 to 10000000`); return n; };
+const countOf = (n, f) => { n = NI(n, f); if (n < 0 || n > 1e7) fail(`\`${f}\`: ${n} is not a count from 0 to 10000000`); return Number(n); };
 
+// Floats as the server gives them, an Fl when whole; an int where it gives one (FEEDBACK55.md,
+// Q-775; branch feedback55).
 B.stats = {
-  mean: (l) => meanOf(dataOf(l, "stats.mean", 1)),
+  mean: (l) => fl(meanOf(dataOf(l, "stats.mean", 1))),
   fmean: (l, w) => {
     const x = dataOf(l, "stats.fmean", 1);
-    if (!given(w)) return meanOf(x);
+    if (!given(w)) return fl(meanOf(x));
     w = NS(w, "stats.fmean", 2);
     if (w.length !== x.length) fail("`stats.fmean`: data and weights must be the same length");
     const total = csum(w);
     if (total === 0) fail("`stats.fmean`: the sum of the weights must be non-zero");
-    return cdot(x, w) / total;
+    return fl(cdot(x, w) / total);
   },
-  geometric_mean: (l) => { const x = dataOf(l, "stats.geometric_mean", 1); if (x.some((v) => v <= 0)) fail("`stats.geometric_mean` requires positive numbers"); return Math.exp(csum(x.map(Math.log)) / x.length); },
+  geometric_mean: (l) => { const x = dataOf(l, "stats.geometric_mean", 1); if (x.some((v) => v <= 0)) fail("`stats.geometric_mean` requires positive numbers"); return fl(Math.exp(csum(x.map(Math.log)) / x.length)); },
   harmonic_mean: (l) => {
     const x = dataOf(l, "stats.harmonic_mean", 1);
     if (x.some((v) => v < 0)) fail("`stats.harmonic_mean` does not support negative values");
-    if (x.some((v) => v === 0)) return 0;
+    if (x.some((v) => v === 0)) return new Fl(0);
     const r = x.map((v) => 1 / v), e = x.map((v, i) => { const [p, pe] = twoProd(r[i], v); return ((1 - p) - pe) / v; });
-    return x.length / csum(r.concat(e));
+    return fl(x.length / csum(r.concat(e)));
   },
-  median: (l) => { const d = sortedOf(dataOf(l, "stats.median", 1)), n = d.length; return n % 2 ? d[n >> 1] : (d[n / 2 - 1] + d[n / 2]) / 2; },
-  median_low: (l) => { const d = sortedOf(dataOf(l, "stats.median_low", 1)), n = d.length; return d[n % 2 ? n >> 1 : n / 2 - 1]; },
-  median_high: (l) => { const x = dataOf(l, "stats.median_high", 1); return kth(x, x.length >> 1); },
+  median: (l) => { const [x, ints] = orderedOf(l, "stats.median", 1), d = sortedOf(x), n = d.length; return n % 2 ? back(d[n >> 1], ints) : fl((d[n / 2 - 1] + d[n / 2]) / 2); },
+  median_low: (l) => { const [x, ints] = orderedOf(l, "stats.median_low", 1), d = sortedOf(x), n = d.length; return back(d[n % 2 ? n >> 1 : n / 2 - 1], ints); },
+  median_high: (l) => { const [x, ints] = orderedOf(l, "stats.median_high", 1); return back(kth(x, x.length >> 1), ints); },
   mode: (l) => { l = L(l, "stats.mode"); const t = tallyOf(l); if (!t.length) fail("`stats.mode`: no mode for empty data"); const most = Math.max(...t.map((x) => x[1])); return l[t.find((x) => x[1] === most)[0]]; },
   multimode: (l) => { l = L(l, "stats.multimode"); const t = tallyOf(l), most = Math.max(0, ...t.map((x) => x[1])); return t.filter((x) => x[1] === most).map((x) => l[x[0]]); },
-  pvariance: (l, mu) => varianceOf(l, mu, "stats.pvariance", false),
-  variance: (l, mu) => varianceOf(l, mu, "stats.variance", true),
-  pstdev: (l, mu) => Math.sqrt(varianceOf(l, mu, "stats.pstdev", false)),
-  stdev: (l, mu) => Math.sqrt(varianceOf(l, mu, "stats.stdev", true)),
+  pvariance: (l, mu) => fl(varianceOf(l, mu, "stats.pvariance", false)),
+  variance: (l, mu) => fl(varianceOf(l, mu, "stats.variance", true)),
+  pstdev: (l, mu) => fl(Math.sqrt(varianceOf(l, mu, "stats.pstdev", false))),
+  stdev: (l, mu) => fl(Math.sqrt(varianceOf(l, mu, "stats.stdev", true))),
   quantiles: (l, n, method) => {
-    const f = "stats.quantiles", d = sortedOf(dataOf(l, f, 1)), ld = d.length;
-    n = given(n) ? I(n, f, 2) : 4;
+    const f = "stats.quantiles", d = sortedOf(orderedOf(l, f, 1)[0]), ld = d.length;
+    n = given(n) ? Number(NI(n, f, 2)) : 4;
     if (n < 1 || n > 10000) fail(`\`${f}\`: n must be from 1 to 10000, got ${n}`);
     method = given(method) ? S(method, f, 3) : "exclusive";
-    if (ld === 1) return new Array(n - 1).fill(d[0]);
+    if (ld === 1) return new Array(n - 1).fill(fl(d[0]));
     const out = [];
     if (method === "inclusive") {
       const m = ld - 1;
-      for (let i = 1; i < n; i++) { const j = Math.floor(i * m / n), delta = i * m - j * n; out.push((d[j] * (n - delta) + d[j + 1] * delta) / n); }
+      for (let i = 1; i < n; i++) { const j = Math.floor(i * m / n), delta = i * m - j * n; out.push(fl((d[j] * (n - delta) + d[j + 1] * delta) / n)); }
     } else if (method === "exclusive") {
       const m = ld + 1;
-      for (let i = 1; i < n; i++) { const j = Math.min(Math.max(Math.floor(i * m / n), 1), ld - 1), delta = i * m - j * n; out.push((d[j - 1] * (n - delta) + d[j] * delta) / n); }
+      for (let i = 1; i < n; i++) { const j = Math.min(Math.max(Math.floor(i * m / n), 1), ld - 1), delta = i * m - j * n; out.push(fl((d[j - 1] * (n - delta) + d[j] * delta) / n)); }
     } else fail(`\`${f}\`: unknown method ${JSON.stringify(method)} (exclusive or inclusive)`);
     return out;
   },
   percentile: (l, p) => {
-    const f = "stats.percentile", d = sortedOf(dataOf(l, f, 1));
+    const f = "stats.percentile", d = sortedOf(orderedOf(l, f, 1)[0]);
     const check = (p) => { if (!(p >= 0 && p <= 100)) fail(`\`${f}\`: percentiles are from 0 to 100, got ${display(p)}`); return p; };
-    if (Array.isArray(p)) return NS(p, f, 2).map((q) => atPercent(d, check(q)));
-    return atPercent(d, check(N(p, f, 2)));
+    if (Array.isArray(p)) return NS(p, f, 2).map(check).map((q) => fl(atPercent(d, q)));
+    return fl(atPercent(d, check(N(p, f, 2))));
   },
-  covariance: (x, y) => { [x, y] = pairedOf(x, y, "stats.covariance"); return momentsOf(x, y)[4] / (x.length - 1); },
+  covariance: (x, y) => { [x, y] = pairedOf(x, y, "stats.covariance"); return fl(momentsOf(x, y)[4] / (x.length - 1)); },
   correlation: (x, y, method) => {
     const f = "stats.correlation";
     [x, y] = pairedOf(x, y, f);
@@ -3141,35 +3477,38 @@ B.stats = {
     if (method === "ranked") { x = ranksOf(x); y = ranksOf(y); } else if (method !== "linear") fail(`\`${f}\`: unknown method ${JSON.stringify(method)} (linear or ranked)`);
     const [, , sxx, syy, sxy] = momentsOf(x, y);
     if (sxx === 0 || syy === 0) fail(`\`${f}\`: at least one of the inputs is constant`);
-    return Math.min(1, Math.max(-1, sxy / Math.sqrt(sxx * syy)));
+    return fl(Math.min(1, Math.max(-1, sxy / Math.sqrt(sxx * syy))));
   },
   linear_regression: (x, y, proportional) => {
     const f = "stats.linear_regression";
     [x, y] = pairedOf(x, y, f);
-    if (truthy(proportional)) { const sxx = cdot(x, x); if (sxx === 0) fail(`\`${f}\`: x is all zeros`); return { slope: cdot(x, y) / sxx, intercept: 0 }; }
+    if (truthy(proportional)) { const sxx = cdot(x, x); if (sxx === 0) fail(`\`${f}\`: x is all zeros`); return { slope: fl(cdot(x, y) / sxx), intercept: new Fl(0) }; }
     const [mx, my, sxx, , sxy] = momentsOf(x, y);
     if (sxx === 0) fail(`\`${f}\`: x is constant`);
     const slope = sxy / sxx;
-    return { slope, intercept: my - slope * mx };
+    return { slope: fl(slope), intercept: fl(my - slope * mx) };
   },
   describe: (l) => {
-    const x = NS(l, "stats.describe"), n = x.length, total = csum(x), d = sortedOf(x), q = (p) => n ? atPercent(d, p) : null;
+    const [x, ints] = NSi(l, "stats.describe"), n = x.length;
+    finiteOf(x, "stats.describe", "data");
+    const total = csum(x), d = sortedOf(x), q = (p) => n ? fl(atPercent(d, p)) : null;
     const mean = n ? total / n : null;
-    return { count: n, sum: total, mean, std: n > 1 ? Math.sqrt(div2(ssOf(x, mean), n - 1)) : null, min: n ? d[0] : null, q1: q(25), median: q(50), q3: q(75), max: n ? d[n - 1] : null };
+    return { count: n, sum: back(total, ints), mean: n ? fl(mean) : null, std: n > 1 ? fl(Math.sqrt(div2(ssOf(x, mean), n - 1))) : null, min: n ? back(d[0], ints) : null, q1: q(25), median: q(50), q3: q(75), max: n ? back(d[n - 1], ints) : null };
   },
   histogram: (l, bins) => {
-    const f = "stats.histogram", x = NS(l, f);
+    const f = "stats.histogram", x = finiteOf(NS(l, f), f, "data");
     let edges;
     if (Array.isArray(bins)) {
-      edges = NS(bins, f, 2);
+      edges = finiteOf(NS(bins, f, 2), f, "edges");
       if (edges.length < 2 || edges.some((e, i) => i && e < edges[i - 1])) fail(`\`${f}\`: edges must be at least two, increasing`);
     } else {
-      bins = given(bins) ? I(bins, f, 2) : 10;
+      bins = given(bins) ? Number(NI(bins, f, 2)) : 10;
       if (bins < 1 || bins > 1e6) fail(`\`${f}\`: bins must be from 1 to 1000000, got ${bins}`);
       let lo = Infinity, hi = -Infinity;
       for (const v of x) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
       if (!x.length) [lo, hi] = [0, 1];
       if (lo === hi) [lo, hi] = [lo - 0.5, hi + 0.5];
+      if (!Number.isFinite(hi - lo)) fail(`\`${f}\`: the data spread over more than a float can hold, ${display(lo)} to ${display(hi)}: give the edges`);
       edges = linspaceOf(lo, hi, bins + 1, true);
     }
     const nb = edges.length - 1, lo = edges[0], hi = edges[nb], counts = new Array(nb).fill(0);
@@ -3179,25 +3518,35 @@ B.stats = {
       while (a < b) { const m = (a + b) >> 1; if (edges[m + 1] <= v) a = m + 1; else b = m; }
       counts[Math.min(a, nb - 1)]++;
     }
-    return { counts, edges };
+    return { counts, edges: fls(edges) };
   },
-  zscore: (l) => { const x = NS(l, "stats.zscore"); if (!x.length) return []; const m = meanOf(x), sd = Math.sqrt(div2(ssOf(x, m), x.length)); return x.map((v) => sd === 0 ? 0 : (v - m) / sd); },
-  normalize: (l) => { const x = NS(l, "stats.normalize"); let lo = Infinity, hi = -Infinity; for (const v of x) { lo = Math.min(lo, v); hi = Math.max(hi, v); } const w = hi - lo; return x.map((v) => w > 0 ? (v - lo) / w : 0); },
-  rank: (l) => ranksOf(NS(l, "stats.rank")),
-  normal_pdf: (x, mu, sigma) => { [x, mu, sigma] = normalArgs(x, mu, sigma, "stats.normal_pdf"); const z = (x - mu) / sigma; return Math.exp(-0.5 * z * z) / (sigma * Math.sqrt(2 * Math.PI)); },
-  normal_cdf: (x, mu, sigma) => { [x, mu, sigma] = normalArgs(x, mu, sigma, "stats.normal_cdf"); return 0.5 * (1 + erf((x - mu) / (sigma * Math.SQRT2))); },
+  zscore: (l) => { const x = NS(l, "stats.zscore"); if (!x.length) return []; const m = meanOf(x), sd = Math.sqrt(div2(ssOf(x, m), x.length)); return x.map((v) => fl(sd === 0 ? 0 : (v - m) / sd)); },
+  normalize: (l) => { const x = NS(l, "stats.normalize"); let lo = Infinity, hi = -Infinity; for (const v of x) { lo = Math.min(lo, v); hi = Math.max(hi, v); } const w = hi - lo; return x.map((v) => fl(w > 0 ? (v - lo) / w : 0)); },
+  rank: (l) => ranksOf(finiteOf(NS(l, "stats.rank"), "stats.rank", "data")).map((r) => back(r, true)),
+  normal_pdf: (x, mu, sigma) => { [x, mu, sigma] = normalArgs(x, mu, sigma, "stats.normal_pdf"); const z = (x - mu) / sigma; return fl(Math.exp(-0.5 * z * z) / (sigma * Math.sqrt(2 * Math.PI))); },
+  normal_cdf: (x, mu, sigma) => { [x, mu, sigma] = normalArgs(x, mu, sigma, "stats.normal_cdf"); return fl(0.5 * (1 + erf((x - mu) / (sigma * Math.SQRT2)))); },
   normal_inv: (p, mu, sigma) => {
     [p, mu, sigma] = normalArgs(p, mu, sigma, "stats.normal_inv");
     if (!(p > 0 && p < 1)) fail(`\`stats.normal_inv\`: p must be between 0 and 1 (exclusive), got ${display(p)}`);
-    return mu + invCdf(p) * sigma;
+    return fl(mu + invCdf(p) * sigma);
   },
 };
 
+// As the operators do: ints stay ints, exactly past 2^53 too (`/` when it divides exactly), else
+// floats, an Fl when whole (FEEDBACK55.md, Q-775 and Q-776; branch feedback55).
 const vecArith = (op, f) => (a, b) => {
-  if (typeof a !== "number" || typeof b !== "number") fail(`\`${f}\` expects numbers, got ${typeName(a)} and ${typeName(b)}${decNote(b) || decNote(a)}`);
-  if ((op === "/" || op === "%") && b === 0 && isInt(a) && isInt(b)) fail(`\`${f}\`: division by zero`);
-  const r = op === "+" ? a + b : op === "-" ? a - b : op === "*" ? a * b : op === "%" ? a % b : a / b;
-  return isInt(a) && isInt(b) && Number.isInteger(r) ? overflowed(r) : r;
+  if (isWhole(a) && isWhole(b)) {
+    if ((op === "/" || op === "%") && (b === 0 || b === 0n)) fail(`\`${f}\`: division by zero`);
+    if (typeof a === "number" && typeof b === "number") {
+      const r = op === "+" ? a + b : op === "-" ? a - b : op === "*" ? a * b : op === "%" ? a % b : a / b;
+      if (Number.isSafeInteger(r)) return r + 0;
+      if (op === "/") return r;
+    }
+    return bigArith(a, b, op, f);
+  }
+  const x = numOf(a), y = numOf(b);
+  if (x === null || y === null) fail(`\`${f}\` expects numbers, got ${typeName(a)} and ${typeName(b)}${decNote(b) || decNote(a)}`);
+  return fl(op === "+" ? x + y : op === "-" ? x - y : op === "*" ? x * y : op === "%" ? x % y : x / y);
 };
 const elementwise = (op, f) => (a, b) => {
   const g = vecArith(op, f);
@@ -3206,25 +3555,37 @@ const elementwise = (op, f) => (a, b) => {
   if (Array.isArray(b)) return b.map((y) => g(a, y));
   return g(a, b);
 };
-const accumulate = (op, f) => (l) => { const g = vecArith(op, f), out = []; for (const x of L(l, f)) out.push(out.length ? g(out[out.length - 1], x) : (typeof x === "number" ? x : g(x, 0))); return out; };
+const accumulate = (op, f) => (l) => {
+  const g = vecArith(op, f), out = [];
+  for (const x of L(l, f)) {
+    if (out.length) out.push(g(out[out.length - 1], x));
+    else if (isNumber(x)) out.push(x);
+    else fail(`\`${f}\` expects numbers, got ${typeName(x)}${decNote(x)}`);
+  }
+  return out;
+};
 const argExtreme = (f, better) => (l) => { const x = NS(l, f); let best = null; x.forEach((v, i) => { if (!Number.isNaN(v) && (best === null || better(v, x[best]))) best = i; }); return best; };
+// Numbers in order with NaN after all, as the server's sort keys have them (FEEDBACK55.md, Q-780;
+// branch feedback55).
+const nanLast = (u, v) => (Number.isNaN(u) ? (Number.isNaN(v) ? 0 : 1) : Number.isNaN(v) ? -1 : u < v ? -1 : u > v ? 1 : 0);
 const rollingOf = (l, w, f) => {
   const x = NS(l, f);
-  I(w, f, 2);
+  w = Number(NI(w, f, 2));
   if (w < 1) fail(`\`${f}\`: the window must be at least 1, got ${w}`);
   const out = [];
   for (let i = 0; i + w <= x.length; i++) out.push(csum(x.slice(i, i + w)));
-  return out;
+  return [out, w];
 };
+// Rows of numbers, all of one length, as floats.
 const matrixOf = (rows, f, i = 1) => {
   rows = L(rows, f, i);
   const cols = rows.length ? (Array.isArray(rows[0]) ? rows[0].length : fail(`\`${f}\` expects a list of rows, but row 0 is ${typeName(rows[0])}`)) : 0;
-  rows.forEach((r, k) => {
+  const out = rows.map((r, k) => {
     if (!Array.isArray(r)) fail(`\`${f}\` expects a list of rows, but row ${k} is ${typeName(r)}`);
     if (r.length !== cols) fail(`\`${f}\`: row ${k} has ${r.length} numbers, row 0 has ${cols}`);
-    r.forEach((v) => { if (typeof v !== "number") fail(`\`${f}\` expects numbers, but row ${k} holds ${typeName(v)}${decNote(v)}`); });
+    return r.map((v) => { const x = numOf(v); if (x === null) fail(`\`${f}\` expects numbers, but row ${k} holds ${typeName(v)}${decNote(v)}`); return x; });
   });
-  return [rows, cols];
+  return [out, cols];
 };
 
 B.vec = {
@@ -3233,64 +3594,66 @@ B.vec = {
   mul: elementwise("*", "vec.mul"),
   div: elementwise("/", "vec.div"),
   mod: elementwise("%", "vec.mod"),
-  pow: (l, p) => { const x = NS(l, "vec.pow"); N(p, "vec.pow", 2); return x.map((v) => v ** p); },
+  pow: (l, p) => { const x = NS(l, "vec.pow"); p = N(p, "vec.pow", 2); return x.map((v) => fl(p === 2 ? v * v : v ** p)); },
   dot: (a, b) => dotOf(a, b, "vec.dot"),
   norm: (l, p) => {
     const x = NS(l, "vec.norm");
     p = given(p) ? N(p, "vec.norm", 2) : 2;
-    if (p === 2) return norm2(x);
-    if (p === 1) return csum(x.map(Math.abs));
-    if (p === Infinity) return x.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
-    return csum(x.map((v) => Math.abs(v) ** p)) ** (1 / p);
+    if (p === 2) return fl(norm2(x));
+    if (p === 1) return fl(csum(x.map(Math.abs)));
+    if (p === Infinity) return fl(x.reduce((m, v) => (Number.isNaN(m) || Number.isNaN(v) ? NaN : Math.max(m, Math.abs(v))), 0));
+    return fl(csum(x.map((v) => Math.abs(v) ** p)) ** (1 / p));
   },
   cumsum: accumulate("+", "vec.cumsum"),
   cumprod: accumulate("*", "vec.cumprod"),
   diff: (l) => { l = L(l, "vec.diff"); const g = vecArith("-", "vec.diff"), out = []; for (let i = 1; i < l.length; i++) out.push(g(l[i], l[i - 1])); return out; },
   argmin: argExtreme("vec.argmin", (a, b) => a < b),
   argmax: argExtreme("vec.argmax", (a, b) => a > b),
-  argsort: (l, desc) => { const x = NS(l, "vec.argsort"), d = truthy(desc); return x.map((_, i) => i).sort((a, b) => (d ? x[b] - x[a] : x[a] - x[b]) || a - b); },
+  argsort: (l, desc) => { const x = NS(l, "vec.argsort"), d = truthy(desc); return x.map((_, i) => i).sort((a, b) => (d ? nanLast(x[b], x[a]) : nanLast(x[a], x[b])) || a - b); },
+  // Each kept within lo..hi, as it is, or lo or hi as given.
   clip: (l, lo, hi) => {
-    const x = NS(l, "vec.clip");
-    if (given(lo)) N(lo, "vec.clip", 2);
-    if (given(hi)) N(hi, "vec.clip", 3);
-    return x.map((v) => given(lo) && v < lo ? lo : given(hi) && v > hi ? hi : v);
+    l = L(l, "vec.clip");
+    const a = given(lo) ? N(lo, "vec.clip", 2) : null, b = given(hi) ? N(hi, "vec.clip", 3) : null;
+    return l.map((v, k) => { const x = numOf(v); if (x === null) fail(`\`vec.clip\` expects a list of numbers, but item ${k} is ${typeName(v)}${decNote(v)}`); return a !== null && x < a ? lo : b !== null && x > b ? hi : v; });
   },
-  abs: (l) => NS(l, "vec.abs").map(Math.abs),
-  sqrt: (l) => NS(l, "vec.sqrt").map(Math.sqrt),
-  exp: (l) => NS(l, "vec.exp").map(Math.exp),
-  log: (l) => NS(l, "vec.log").map(Math.log),
+  abs: (l) => { const [x, ints] = NSi(l, "vec.abs"); return x.map((v) => back(Math.abs(v), ints)); },
+  sqrt: (l) => NS(l, "vec.sqrt").map((v) => fl(Math.sqrt(v))),
+  exp: (l) => NS(l, "vec.exp").map((v) => fl(Math.exp(v))),
+  log: (l) => NS(l, "vec.log").map((v) => fl(Math.log(v))),
   round: (l, d) => {
     const x = NS(l, "vec.round");
-    if (!given(d)) return x.map(roundHalf);
-    const p = 10 ** Math.min(Math.max(I(d, "vec.round", 2), 0), 15);
-    return x.map((v) => roundHalf(v * p) / p);
+    if (!given(d)) return x.map((v) => back(roundHalf(v), true));
+    const p = 10 ** Math.min(Math.max(Number(NI(d, "vec.round", 2)), 0), 15);
+    return x.map((v) => fl(roundHalf(v * p) / p));
   },
-  linspace: (a, b, n, endpoint) => { N(a, "vec.linspace"); N(b, "vec.linspace", 2); return linspaceOf(a, b, countOf(given(n) ? n : 50, "vec.linspace"), given(endpoint) ? truthy(endpoint) : true); },
+  linspace: (a, b, n, endpoint) => { a = N(a, "vec.linspace"); b = N(b, "vec.linspace", 2); return fls(linspaceOf(a, b, countOf(given(n) ? n : 50, "vec.linspace"), given(endpoint) ? truthy(endpoint) : true)); },
+  // Ints when start and step are, exactly (FEEDBACK55.md, Q-776); else floats.
   arange: (start, stop, step) => {
     const f = "vec.arange";
     if (!given(stop)) [start, stop] = [0, start];
-    N(start, f); N(stop, f, 2);
-    step = given(step) ? N(step, f, 3) : 1;
-    if (step === 0 || !Number.isFinite(step)) fail(`\`${f}\`: step must be a non-zero number`);
-    const n = countOf(Math.max(0, Math.ceil((stop - start) / step)), f), out = [];
-    for (let i = 0; i < n; i++) out.push(start + i * step);
+    if (!given(step)) step = 1;
+    const a = N(start, f), b = N(stop, f, 2), st = N(step, f, 3);
+    if (st === 0 || !Number.isFinite(st)) fail(`\`${f}\`: step must be a non-zero number`);
+    const k = Math.max(0, Math.ceil((b - a) / st)), n = countOf(Number.isFinite(k) ? k : -1, f), out = [];
+    const ints = isWhole(start) && isWhole(step);
+    for (let i = 0; i < n; i++) out.push(ints ? iadd(start, imul(i, step)) : fl(a + i * st));
     return out;
   },
   zeros: (n) => new Array(countOf(n, "vec.zeros")).fill(0),
   ones: (n) => new Array(countOf(n, "vec.ones")).fill(1),
   full: (n, v) => new Array(countOf(n, "vec.full")).fill(v === undefined ? null : v),
-  rolling_mean: (l, w) => rollingOf(l, w, "vec.rolling_mean").map((s) => s / w),
-  rolling_sum: (l, w) => rollingOf(l, w, "vec.rolling_sum"),
+  rolling_mean: (l, w) => { const [s, k] = rollingOf(l, w, "vec.rolling_mean"); return s.map((v) => fl(v / k)); },
+  rolling_sum: (l, w) => fls(rollingOf(l, w, "vec.rolling_sum")[0]),
   matmul: (a, b) => {
     const f = "vec.matmul", [A, k] = matrixOf(a, f);
     if (Array.isArray(b) && b.length && !Array.isArray(b[0])) {
       const v = NS(b, f, 2);
       if (v.length !== k) fail(`\`${f}\`: a has ${k} columns, b has ${v.length} numbers`);
-      return A.map((r) => cdot(r, v));
+      return A.map((r) => fl(cdot(r, v)));
     }
     const [Bm, m] = matrixOf(b, f, 2);
     if (Bm.length !== k) fail(`\`${f}\`: a has ${k} columns, b has ${Bm.length} rows`);
-    return A.map((r) => { const out = new Array(m).fill(0); r.forEach((x, p) => { for (let j = 0; j < m; j++) out[j] += x * Bm[p][j]; }); return out; });
+    return A.map((r) => { const out = new Array(m).fill(0); r.forEach((x, p) => { for (let j = 0; j < m; j++) out[j] += x * Bm[p][j]; }); return fls(out); });
   },
   transpose: (l) => {
     const rows = L(l, "vec.transpose");
@@ -3418,6 +3781,10 @@ const dtDay = (z, f) => z !== null && dtInRange(dtCivil(z)[0]) ? dtText(z) : dtO
 
 // A zone: a fixed offset (seconds), or a formatter that tells its local time.
 const dtZones = new Map();
+// Names the browser takes that are no zone of the IANA database, which the server's are: old ones
+// it dropped and Java's three letters (FEEDBACK55.md, Q-782; branch feedback55); src/dates.rs's
+// `not_a_zone` is the other half.
+const NOT_ZONES = /^(SystemV\/.*|US\/Pacific-New|Canada\/East-Saskatchewan|ACT|AET|AGT|ART|AST|BET|BST|CAT|CNT|CTT|EAT|ECT|IET|IST|JST|MIT|NET|NST|PLT|PNT|PRT|PST|SST|VST)$/i;
 function dtZone(v, f, i) {
   if (isNil(v)) return 0;
   if (typeof v !== "string") fail(`\`${f}\` expects a time zone (like "Europe/Paris") as argument ${i}, got ${dtGot(v)}`);
@@ -3425,6 +3792,7 @@ function dtZone(v, f, i) {
   if (v[0] === "+" || v[0] === "-") { const o = dtOffset(v); if (o !== null) return o; }
   let fmt = dtZones.get(v);
   if (!fmt) {
+    if (NOT_ZONES.test(v)) fail(`\`${f}\`: unknown time zone ${dtGot(v)}`);
     try {
       fmt = new Intl.DateTimeFormat("en-US", { timeZone: v, hourCycle: "h23", era: "short", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric" });
     } catch (e) {
@@ -4046,7 +4414,7 @@ function chanSocket(q) {
 // `["j", name, yes]`: the answer to joining; `["m", name, value]`: a message.
 function chanGot(text) {
   let m;
-  try { m = JSON.parse(text); } catch (e) { return; }
+  try { m = readJSON(text); } catch (e) { return; }
   const [k, name, v] = m, subs = Chan.subs.get(name);
   if (TOOLS) toolsSay("channel", k === "j" ? { dir: "in", channel: name, joined: !!v } : { dir: "in", channel: name, value: v });
   if (!subs) return;
@@ -4486,12 +4854,12 @@ async function rpcSend(name, args, live, idem) {
   const packed = args.map(pack);
   if (files.length) {
     payload = new FormData();
-    payload.append("args", JSON.stringify(packed));
+    payload.append("args", unmark(JSON.stringify(packed)));
     files.forEach((f, i) => payload.append("file" + i, f, f.name || "file"));
     delete headers["content-type"];
     headers["x-quillo-rpc"] = "1";
   } else {
-    payload = JSON.stringify(packed);
+    payload = unmark(JSON.stringify(packed));
   }
   // A call that fails (no connection, a server error) is an error value,
   // as with http.* on the server, so `??` and `is_err` handle it.
@@ -4512,7 +4880,7 @@ async function rpcSend(name, args, live, idem) {
     await new Promise((ok) => setTimeout(ok, 250 * 2 ** (3 - tries) * (0.75 + Math.random() / 2)));
   }
   let body = null;
-  try { body = await r.json(); if (!body || !hasOwn(body, "patch")) body = untagDeep(body); } catch (_) {}
+  try { body = readJSON(await r.text()); if (!body || !hasOwn(body, "patch")) body = untagDeep(body); } catch (_) {}
   if (!r.ok) return { ...failed(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`), unanswered: RETRIED.includes(r.status) };
   let value = null;
   if (body && hasOwn(body, "patch")) {
@@ -4609,7 +4977,7 @@ async function liveLoop() {
       if (await liveSocket(url, ctrl.signal)) fails = 0;
       else if (!ctrl.signal.aborted) {
         const r = await wireFetch(url, { signal: ctrl.signal, cache: "no-store" });
-        if (r.ok) { liveChanged(await r.json()); fails = 0; continue; }
+        if (r.ok) { liveChanged(readJSON(await r.text())); fails = 0; continue; }
         after = (Number(r.headers.get("retry-after")) || 0) * 1000;
         fails++;
       }
@@ -4635,7 +5003,7 @@ function liveSocket(url, signal) {
     const ws = openSocket(url);
     let opened = false;
     ws.onopen = () => { opened = true; };
-    ws.onmessage = (m) => { if (!signal.aborted) liveChanged(JSON.parse(m.data)); };
+    ws.onmessage = (m) => { if (!signal.aborted) liveChanged(readJSON(m.data)); };
     ws.onclose = () => resolve(opened);
     // Carry on at once: a closing socket finishes closing in its own time
     // (the browser waits for the server's answer), and says nothing more.
@@ -5029,9 +5397,59 @@ keyStale = (key) => {
 
 class Html { constructor(make) { if (make) this.make = make; } }
 
+// An HTML value's text is its markup, as the server writes it: it was "<html>", and empty in JSON
+// (FEEDBACK55.md, Q-779; branch feedback55). What `raw`, `markdown` and `highlight` made has its
+// own text; markup made here is made into nodes off the page, as it is shown, and written out as
+// the server writes HTML, text and attribute values escaped as it escapes them. Without a
+// document (in Node), "<html>".
+const VOID_EL = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
+// (`&\x6ct;` is `&lt;`: the bundle takes in what a word in the runtime names, and `lt` is one.)
+const ESC = { "&": "&amp;", "<": "&\x6ct;", ">": "&\x67t;", '"': "&quot;", "'": "&#39;", "\r": "&#13;", "\0": "\uFFFD" };
+const escText = (t) => t.replace(/[&<>"'\r\0]/g, (c) => ESC[c]);
+function htmlText(h) {
+  if (h.text !== undefined) return h.text;
+  if (typeof document === "undefined" || !h.make) return "<html>";
+  const box = document.createDocumentFragment(), out = [], o = Owner, was = hydrating, cl = claiming;
+  Owner = null;
+  const sc = new Scope();
+  Owner = o;
+  hydrating = null;
+  claiming = 0;
+  marking = true;
+  try { within(sc, () => h.make({ p: box, n: null, claim: false, svg: false }, out)); } finally { hydrating = was; claiming = cl; marking = false; dispose(sc); }
+  return out.map(nodeHtml).join("");
+}
+// While `htmlText` makes markup: each element made from a template is marked with it (`markTpl`),
+// and one set to `true` with the attribute (`setProp`), so that it is written as the server
+// writes it: an attribute of `true` bare, one of "" as `=""`, in the order the source has them
+// (found in review: `alt=""` was bare, and `<input value="v" type="text">` had its type first).
+let marking = false;
+function markTpl(tp, el) {
+  el.__tp = tp;
+  const kids = (tp[0] === "template" && el.content || el).childNodes;
+  tp[2].forEach((k, i) => { if (typeof k === "object") markTpl(k, kids[i]); });
+}
+function nodeHtml(n) {
+  if (n.nodeType === 3) return escText(n.data);
+  if (n.nodeType === 8) return "<!--" + n.data + "-->";
+  if (n.nodeType !== 1) return "";
+  const kids = (n.localName === "template" ? n.content : n).childNodes;
+  if (n.localName === "quillo-raw") return Array.from(kids, nodeHtml).join("");
+  const tp = n.__tp, ord = tp && tp[4], bare = n.__bare;
+  let attrs = Array.from(n.attributes);
+  if (ord) { const at = (a) => { const i = ord.indexOf(a.name); return i < 0 ? ord.length : i; }; attrs = attrs.sort((a, b) => at(a) - at(b)); }
+  let t = "<" + n.localName;
+  for (const a of attrs) {
+    const plain = a.value === "" && ((bare && bare.has(a.name)) || (tp && tp[1].some((f) => f[0] === a.name && f[1] === true)));
+    t += plain ? " " + a.name : " " + a.name + '="' + escText(a.value) + '"';
+  }
+  t += ">";
+  return VOID_EL.has(n.localName) ? t : t + Array.from(kids, nodeHtml).join("") + "</" + n.localName + ">";
+}
+
 const SVG = "http://www.w3.org/2000/svg";
 const inSvg = (el) => el.namespaceURI === SVG && el.localName !== "foreignObject";
-const isText = (x) => typeof x === "string" || typeof x === "number" || x instanceof Dec || typeof x === "bigint";
+const isText = (x) => typeof x === "string" || typeof x === "number" || x instanceof Dec || typeof x === "bigint" || x instanceof Fl;
 // Taking up the server's page: inputs keep what was typed (see setProp).
 let claiming = 0;
 
@@ -5040,7 +5458,17 @@ class Mismatch extends Error {}
 // the browser makes there. A Mismatch is thrown right after, so it is what
 // differed (see `resume`).
 let wanted = null; // dev
-const onPage = (n) => !n ? "nothing" : n.nodeType === 3 ? JSON.stringify(n.data.slice(0, 80)) : n.nodeType === 1 ? `<${n.localName}>` : "a comment"; // dev
+const onPage = (n) => !n ? "nothing" : typeof n === "string" ? n : n.nodeType === 3 ? JSON.stringify(n.data.slice(0, 80)) : n.nodeType === 1 ? `<${n.localName}>` : "a comment"; // dev
+// Taking up the server's page in development, an attribute is compared as text is: one that
+// differs makes the component again, and is said so, where the browser's took the server's place
+// unseen (FEEDBACK55.md, Q-774; branch feedback55). In production the browser's value takes its
+// place, as before: an extension that rewrites a style, or a <details> opened before the code came,
+// would make the component again on every load (decided in review).
+function attrDiffers(el, k, s) {
+  if (DEV) wanted = [attrSaid(k, el.getAttribute(k)), attrSaid(k, s)]; // dev
+  throw new Mismatch("attribute");
+}
+const attrSaid = (k, v) => (v === null ? `no ${k}` : `${k}=${JSON.stringify(v.slice(0, 80))}`); // dev
 
 // The page's text node at `c.n`, taken up as text `t`: split where the
 // browser joined it with text after it; an empty one is made.
@@ -5065,9 +5493,14 @@ function put(v, c, out) {
   if (isNil(v) || typeof v === "boolean" || typeof v === "function") return;
   if (Array.isArray(v)) { for (const x of v) put(x, c, out); return; }
   if (v instanceof Html) { v.make(c, out); return; }
-  const t = display(v);
+  const t = shown(v);
   out.push(c.claim ? claimText(c, t) : document.createTextNode(t));
 }
+// A value as the page shows it: a NUL is U+FFFD, as the server writes it and the HTML parser makes
+// it, or the server's page read otherwise than what the browser makes (FEEDBACK55.md, Q-772;
+// branch feedback55).
+const noNul = (t) => (t.indexOf("\0") < 0 ? t : t.replace(/\0/g, "\uFFFD"));
+const shown = (v) => noNul(display(v));
 
 // A part's nodes now: a dynamic part keeps its own (see `dyn`), ahead of
 // its marker.
@@ -5114,7 +5547,7 @@ function dynApply(x) {
   }
   const one = r.nodes.length === 1 ? r.nodes[0] : null;
   if (one && one.nodeType === 3 && !one.__part && isText(x)) {
-    const t = display(x);
+    const t = shown(x);
     if (one.data !== t) {
       one.data = t;
       textareaFollows(one.parentNode);
@@ -5199,7 +5632,7 @@ function dynAllApply(x) {
   }
   const t = el.firstChild;
   if (t && t === el.lastChild && t.nodeType === 3 && !t.__part && isText(x)) {
-    const s = display(x);
+    const s = shown(x);
     if (t.data !== s) {
       t.data = s;
       textareaFollows(el);
@@ -5290,6 +5723,7 @@ class Tmpl extends Html {
         return;
       }
       const el = blockTemplate(def, svg).cloneNode(true);
+      if (marking) markTpl(def.tpl, el);
       wire(def.tpl, el, this.vals, svg);
       if (def.af) focusSoon(el.hasAttribute("autofocus") ? el : el.querySelector("[autofocus]"));
       out.push(el);
@@ -5426,7 +5860,7 @@ function showIn(el, v, claim, svg, i) {
   }
   const got = [];
   put(v, { claim: false, svg }, got);
-  if (isText(v)) { el.firstChild.data = display(v); return; }
+  if (isText(v)) { el.firstChild.data = shown(v); return; }
   el.replaceChildren(...got);
 }
 
@@ -5824,7 +6258,7 @@ const UNITLESS = new Set(("animation-iteration-count aspect-ratio border-image-o
   "scale stop-opacity stroke-dasharray stroke-dashoffset stroke-miterlimit stroke-opacity stroke-width tab-size widows " +
   "z-index zoom").split(" "));
 const styleName = (k) => (k.startsWith("--") ? k : k.replace(/_/g, "-").replace(/[A-Z]/g, (c) => "-" + c.toLowerCase()).replace(/^ms-/, "-ms-"));
-const styleNonzero = (v) => (typeof v === "number" ? v !== 0 && Number.isFinite(v) : typeof v === "bigint" ? v !== 0n : v instanceof Dec && v.m !== 0n);
+const styleNonzero = (v) => (typeof v === "number" ? v !== 0 && Number.isFinite(v) : typeof v === "bigint" ? v !== 0n : v instanceof Fl ? v.f !== 0 : v instanceof Dec && v.m !== 0n);
 const stylePx = (n, v) => styleNonzero(v) && !n.startsWith("--") && !UNITLESS.has(n.replace(/^-(webkit|moz|ms|o)-/, "")) ? "px" : "";
 // A value put in CSS: `{`, `}`, `;` and `\` as CSS's escapes, as on the server; and only a
 // property's name for a key (FEEDBACK51.md, Q-668; branch feedback51-fixes).
@@ -5867,7 +6301,7 @@ function setProp(el, k, v, old) {
     // not written back as `1`; blank text reads as no number, and as null, which a number field
     // gives for it (FEEDBACK55.md, Q-757; branch feedback55).
     const typed = el.localName === "input" || el.localName === "textarea";
-    if (typed && (isNil(v) ? el.value.trim() === "" : typeof v === "number" && el.value.trim() !== "" && Number(el.value) === v)) return;
+    if (typed && (isNil(v) ? el.value.trim() === "" : (typeof v === "number" || v instanceof Fl) && el.value.trim() !== "" && Number(el.value) === numOf(v))) return;
     const nv = isNil(v) ? "" : display(v);
     if (el.value !== nv) el.value = nv;
     if (el.localName === "option") selFollow(el.parentNode);
@@ -5881,6 +6315,7 @@ function setProp(el, k, v, old) {
     const nv = truthy(v);
     if (el[k] !== nv) el[k] = nv;
     if (nv) el.setAttribute(k, ""); else el.removeAttribute(k);
+    if (marking && nv) (el.__bare || (el.__bare = new Set())).add(k);
     return;
   }
   // What only a property says: a box half ticked, a player's volume, place and speed. The
@@ -5905,6 +6340,7 @@ function setProp(el, k, v, old) {
     return;
   }
   if (typeof v === "boolean") { const t = boolText(k, v); if (t !== null) v = t; }
+  if (marking) { if (v === true) (el.__bare || (el.__bare = new Set())).add(k); else if (el.__bare) el.__bare.delete(k); }
   // Limits set after the value, which the browser brought into the old ones (a range's default
   // `max` of 100): the value again, as the server's page has it (FEEDBACK55.md, Q-765; branch
   // feedback55).
@@ -5916,14 +6352,19 @@ function setProp(el, k, v, old) {
   // On what the page makes later too, as React and Svelte have it (FEEDBACK55.md, Q-771; branch
   // feedback55).
   if (k === "autofocus" && old === undefined && !claiming && truthy(v)) focusSoon(el);
-  if (isNil(v) || v === false) { el.removeAttribute(k); return; }
+  if (isNil(v) || v === false) {
+    if (claiming && el.hasAttribute(k)) attrDiffers(el, k, null); // dev
+    el.removeAttribute(k);
+    return;
+  }
   // Only text written in the program goes there (set with the template),
   // and a page for a sandboxed frame that is kept away from the site.
   if (codeAttr(k) && !(attrKey(k) === "srcdoc" && sandboxed(el))) return;
   if (k === "href" || k === "src" || k === "action" || k === "formaction" || k === "poster") v = withBase(v);
-  let s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? jsonText(visible(v)) : display(v);
+  let s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? jsonText(visible(v)) : noNul(display(v));
   // The text the attribute will say, whatever the value's type (html too).
   if (URL_ATTRS.includes(k.toLowerCase()) && scriptURL(s) || animValueAttr(el, k) && s.split(";").some(scriptURL)) v = s = "about:blank#blocked";
+  if (claiming && el.getAttribute(k) !== s) attrDiffers(el, k, s); // dev
   if (old !== v || el.getAttribute(k) !== s) el.setAttribute(k, s);
 }
 
@@ -6558,7 +6999,7 @@ function run(inst, el, claim, svg) {
 // (`{"$int": "9007199254740993"}`) restored.
 function islandJSON(text, fallback) {
   if (!text) return fallback;
-  return JSON.parse(text, (k, v) => untag(v));
+  return parseData(text, null, untag);
 }
 function untag(v) {
   if (!v || typeof v !== "object" || Array.isArray(v)) return v;
@@ -6662,7 +7103,7 @@ function toolsSay(type, o) {
 // A value as the wire writes it; what cannot be written (a page's object) as its text.
 function toolsWire(v) {
   if (v instanceof Err) return { $quillo_err: toolsWire(v.error) };
-  try { return toJSON(v, true); } catch (_) { return String(v); }
+  try { return toJSON(v, "tools"); } catch (_) { return String(v); }
 }
 
 // The component the code running now belongs to, by its id.
@@ -6872,6 +7313,9 @@ W.Err = Err;
 W.waits = (v) => v instanceof Promise || (v !== null && typeof v === "object" && typeof v.then === "function" && foreign(v));
 // A stop that `??` guards against, and anything else goes on.
 W.guarded = (e) => { if (e instanceof QuilloError) return null; throw e; };
+// `f(a, b, c)` on the left of `??`, a field or an index read, guarded so (FEEDBACK55.md, Q-782;
+// branch feedback55).
+W.tryq = (f, a, b, c) => { try { return f(a, b, c); } catch (e) { return W.guarded(e); } };
 // What `js(...)` gave, waited for if it is a Promise (see `call` in
 // src/client.rs): what it settles to, or its rejection as an error value.
 W.settle = async (v) => {
@@ -6879,6 +7323,7 @@ W.settle = async (v) => {
   try { return fromPage(await v); } catch (e) { return new Err("js: " + (e && e.message || String(e)), true); }
 };
 W.Dec = Dec;
+W.Fl = Fl;
 W.Ret = Ret;
 // The program's modules, `[name, export, address]` each, all in before the page
 // starts. One that fails is said when its name is used, as for a script that did
@@ -6925,14 +7370,22 @@ W.enumlist = (l) => L(l, "enumerate");
 // A loop makes no list, so a list's limit means nothing here (FEEDBACK29.md, Q-356;
 // branch feedback29-fixes).
 W.span = (a, b, dots) => {
-  if (!dots) { if (b === undefined) { b = I(a, "range"); a = 0; } else { a = I(a, "range"); b = I(b, "range", 2); } }
+  if (!dots) { if (b === undefined) { b = II(a, "range"); a = 0; } else { a = II(a, "range"); b = II(b, "range", 2); } }
+  // Past 2^53 counted as BigInts, which a number past it could not be counted by (FEEDBACK55.md,
+  // Q-776; branch feedback55).
+  if (typeof a === "bigint" || typeof b === "bigint") {
+    if (!(isInt(a) || typeof a === "bigint") || !(isInt(b) || typeof b === "bigint")) fail("`..` needs two ints");
+    return [BigInt(a), BigInt(b)];
+  }
   if (!isInt(a) || !isInt(b)) fail("`..` needs two ints");
   return [a, b];
 };
 // `range(a, b, step)` (FEEDBACK29.md, Q-360; branch feedback29-fixes).
 W.stepped = (a, b, c) => {
-  const r = [I(a, "range"), I(b, "range", 2), I(c, "range", 3)];
-  if (r[2] === 0) fail("`range`: a step of 0 never gets anywhere");
+  let r = [II(a, "range"), II(b, "range", 2), II(c, "range", 3)];
+  // Past 2^53 all three counted as BigInts (found in review).
+  if (r.some((x) => typeof x === "bigint")) r = r.map(BigInt);
+  if (r[2] == 0) fail("`range`: a step of 0 never gets anywhere");
   return r;
 };
 W.iter = iter;
@@ -6966,14 +7419,19 @@ W.nofn = (v) => (typeof v === "function" ? null : v);
 // so `qty + 1` after typing 12 is 13, not "121"; other text stays text (an option "02", "1e2",
 // " 7"), which the field and the select show as they are. A state that held a number takes one
 // again once the text is one again (FEEDBACK55.md, Q-760; branch feedback55).
+// A number state gives a number, a float state a float: `state amount = 1.0` made "3" text, and
+// `amount + 1` "31" (FEEDBACK55.md, Q-775; found in review). Which it is, the number it held when
+// first typed into says: an int state that was given 1.5 still gives an int for -3.
 W.typed = (s, t) => {
-  if (typeof s.v === "number") NUMERIC.add(s);
+  const v = s.v;
+  if (!NUMERIC.has(s) && isNumber(v)) { NUMERIC.add(s); if (isFloat(v)) FLOATS.add(s); }
   if (!NUMERIC.has(s) || typeof t !== "string") return t;
   if (t.trim() === "") return null;
   const n = Number(t);
-  return Number.isFinite(n) && display(n) === t ? n : t;
+  return Number.isFinite(n) && display(n) === t ? (FLOATS.has(s) ? fl(n) : n) : t;
 };
 const NUMERIC = new WeakSet();
+const FLOATS = new WeakSet();
 W.component = (name, params, render) => {
   render.$name = name;
   render.$p = params;

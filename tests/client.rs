@@ -246,7 +246,8 @@ fn recursive_functions_that_wait_on_the_server_are_awaited() {
         return;
     }
     // A server that echoes the first argument back.
-    let echo = "globalThis.fetch = async (url, o) => ({ ok: true, json: async () => ({ ok: JSON.parse(o.body)[0] }) });";
+    // The answer as text: the runtime reads its numbers as written (FEEDBACK55.md, Q-775).
+    let echo = "globalThis.fetch = async (url, o) => ({ ok: true, text: async () => JSON.stringify({ ok: JSON.parse(o.body)[0] }) });";
     let defs = "server fn echo(x) = x\nfn sum_to(n) = n == 0 ? 0 : echo(n) + sum_to(n - 1)\nfn even(n) = n == 0 ? echo(true) : odd(n - 1)\nfn odd(n) = n == 0 ? false : even(n - 1)";
     let (server, browser) = both_with(echo, defs, "[sum_to(3), even(4), odd(3)]");
     assert_eq!(server, "[6, true, true]");
@@ -456,7 +457,8 @@ fn while_loops_run_the_same_in_the_browser() {
     same("fn digits(n: int) {\n let out = []\n let x = n\n while x > 0 {\n out = [x % 10] + out\n x = floor(x / 10)\n }\n out\n}", "[digits(9051), digits(0)]");
     same("", "let i = 0\nlet log = []\nlet r = while i < 3 {\n log = push(log, i)\n i += 1\n}\n[log, r]");
     // A server call in the condition is awaited each time round.
-    let echo = "globalThis.fetch = async (url, o) => ({ ok: true, json: async () => ({ ok: JSON.parse(o.body)[0] }) });";
+    // The answer as text: the runtime reads its numbers as written (FEEDBACK55.md, Q-775).
+    let echo = "globalThis.fetch = async (url, o) => ({ ok: true, text: async () => JSON.stringify({ ok: JSON.parse(o.body)[0] }) });";
     let (s, b) = both_with(echo, "server fn echo(x) = x", "let n = 0\nwhile echo(n) < 4 { n += 1 }\nn");
     assert_eq!((s.as_str(), b.as_str()), ("4", "4"));
 }

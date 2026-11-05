@@ -1176,6 +1176,785 @@ route GET / = <html><head><title>t</title></head><body><Focus/></body></html>
     assert_eq!(r, want);
 }
 
+// ---- slice 9: server and browser (Q-772 to Q-782) ----
+
+/// What `js` prints in Node, under a deadline; None without Node.
+fn in_node(js: &str) -> Option<String> {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if !Command::new("node").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+        return None;
+    }
+    let d = support::temp_dir(&format!("feedback55-node-{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    std::fs::write(d.join("t.cjs"), js).unwrap();
+    let mut child = Command::new("node").arg(d.join("t.cjs")).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("node did not end");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let o = child.wait_with_output().unwrap();
+    assert!(o.status.success(), "node failed: {}", String::from_utf8_lossy(&o.stderr));
+    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// Each expression of `cases` on the interpreter (its floats written as a page writes them, as a
+/// component's are) and, compiled for the browser, in Node: `[the type of each value in it, it]`,
+/// or `ERROR: ...`, the same on both sides and what the case wants (FEEDBACK55.md, Q-775 to
+/// Q-782; branch feedback55). Without Node, the server's half.
+fn same_on_both(defs: &str, cases: &[(&str, &str)]) {
+    same_on_both_after("", defs, cases)
+}
+
+/// What a browser whose JSON.parse gives a reviver no text of the numbers does (Safari before
+/// 18.4, Firefox before 135): Node's, made so.
+const OLD_JSON: &str = "const __parse = JSON.parse;\nJSON.parse = function (t, r) { return r ? __parse(t, function (k, v) { return r.call(this, k, v); }) : __parse(t); };";
+
+/// `same_on_both`, with `prelude` run in Node before the browser's half.
+fn same_on_both_after(prelude: &str, defs: &str, cases: &[(&str, &str)]) {
+    const TYPES: &str = "fn v(x) = x\nfn tys(x) = if type_of(x) == \"list\" { x | map((y) => tys(y)) } else if type_of(x) == \"map\" { keys(x) | map((k) => [k, tys(x[k])]) } else { type_of(x) }\n";
+    let one = |expr: &str, want: &str| {
+        let src = format!("{}{}\nfn __t() {{\n  let x = ({})\n  [tys(x), x]\n}}\n", TYPES, defs, expr);
+        let (ok, out) = check(&src);
+        assert!(ok, "{}\n{}", out, src);
+        let mut it = quillo::Interp::new(".");
+        it.load_source(&src, "case.qwe").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+        let server = quillo::value::js_numbers(true, || match it.call(&quillo::value::lookup(&it.globals, "__t").unwrap(), vec![], 0) {
+            Ok(v) | Err(quillo::interp::Ctrl::Return(v)) => v.repr(),
+            Err(quillo::interp::Ctrl::Error(e)) => format!("ERROR: {}", e.msg),
+            Err(_) => "left the function".into(),
+        });
+        assert_eq!(server, want, "server: {}", expr);
+        if let Some(browser) = in_node(&format!("{}\n{}", prelude, quillo::client::test_script(&it, "__t").unwrap())) {
+            assert_eq!(browser, want, "browser: {}", expr);
+        }
+    };
+    let at = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        let jobs: Vec<_> = (0..6)
+            .map(|_| {
+                s.spawn(|| loop {
+                    let i = at.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((expr, want)) = cases.get(i) else { break };
+                    one(expr, want);
+                })
+            })
+            .collect();
+        for j in jobs {
+            j.join().unwrap();
+        }
+    });
+}
+
+// Q-775: a whole float was a JS number with no fraction, an int to the browser's code: `2.0 / 0`
+// stopped with "division by zero", `match` took the int arm, `type_of` said int, an `int`
+// parameter and an index took it, and `9007199254740993 * 1.0` stayed exact. A whole float is an
+// Fl in the browser, an int a number (a BigInt past 2^53), so every case is the server's: inf
+// and NaN for a float divided by zero, int refused for a float parameter and float for an int,
+// a record's float field widening an int as the server's does, and an int with no -0 (`-3 * 0`
+// is 0, and `1.5 / x` inf). The edges: -0.0, 1e300, inf and NaN as floats, ints either side of
+// 2^53, `float("0x10")` and the rest of what Rust reads as no float.
+#[test]
+fn a_whole_float_is_a_float_in_the_browser_too() {
+    let defs = r#"fn fi(x: int) = x
+fn ff(x: float) = x
+fn fnum(x: num) = x
+fn mt(x) = match x { float as f => "float", int as i => "int", _ => "other" }
+fn ml(x) = match x { 2 => "two", _ => "other" }
+type Pt = { n: int }
+type Pf = { n: float }
+type Pu = { n: int | float }
+type Pl = { xs: list<float> }
+"#;
+    same_on_both(defs, &[
+        (r#"[v(2.0) - v(1.0), v(2.0) * v(3.0), v(2.0) + v(1.0), v(2.0) - v(0.5), v(4.0) * v(0.5), v(2.0) - v(3), v(2.0) * v(3), v(0.5) - v(2.0), v(3) * v(2.0)]"#, r#"[["float", "float", "float", "float", "float", "float", "float", "float", "float"], [1, 6, 3, 1.5, 2, -1, 6, -1.5, 6]]"#),
+        (r#"[v(5.0) / v(0), v(1) / v(0.0), v(0.0) / v(0.0), v(-5.0) / v(0), v(5.5) % v(0), v(5.0) % v(0)]"#, r#"[["float", "float", "float", "float", "float", "float"], [inf, inf, NaN, -inf, NaN, NaN]]"#),
+        (r#"v(5) / v(0)"#, r#"ERROR: division by zero"#),
+        (r#"v(5) % v(0)"#, r#"ERROR: division by zero"#),
+        (r#"[mt(v(2)), mt(v(2.0)), mt(v(2.5)), mt(v(-0.0)), mt(v(1e300)), mt(v(math.inf)), mt(v(math.nan)), mt(v(9007199254740993))]"#, r#"[["str", "str", "str", "str", "str", "str", "str", "str"], ["int", "float", "float", "float", "float", "float", "float", "int"]]"#),
+        (r#"[ml(v(2)), ml(v(2.0)), ml(v(2.5))]"#, r#"[["str", "str", "str"], ["two", "two", "other"]]"#),
+        (r#"[type_of(2.0), type_of(sqrt(4)), type_of(json.parse("1e2")), type_of(json.parse("2.0")), type_of(json.parse("2")), type_of(float(2)), type_of(int(2.0)), type_of(-0.0), type_of(1e300)]"#, r#"[["str", "str", "str", "str", "str", "str", "str", "str", "str"], ["float", "float", "float", "float", "int", "float", "int", "float", "float"]]"#),
+        (r#"fi(v(2.0))"#, r#"ERROR: argument `x` of `fi` must be int, got float 2"#),
+        (r#"ff(v(2))"#, r#"ERROR: argument `x` of `ff` must be float, got int 2"#),
+        (r#"[ff(v(2.0)), ff(v(2.5)), fi(v(2)), fnum(v(2)), fnum(v(2.0)), fnum(v(2.5))]"#, r#"[["float", "float", "int", "int", "float", "float"], [2, 2.5, 2, 2, 2, 2.5]]"#),
+        (r#"[Pt(v({ n: 2.0 })), Pt(v({ n: 2 })), Pf(v({ n: 2 })), Pf(v({ n: 2.0 })), Pu(v({ n: 2 })), Pu(v({ n: 2.0 })), Pl(v({ xs: [1, 2.5] }))]"#, r#"[["error", [["n", "int"]], [["n", "float"]], [["n", "float"]], [["n", "int"]], [["n", "float"]], [["xs", ["float", "float"]]]], [err("Pt: `n` must be int, got float 2"), { n: 2 }, { n: 2 }, { n: 2 }, { n: 2 }, { n: 2 }, { xs: [1, 2.5] }]]"#),
+        (r#"[1, 2, 3][v(1.0)]"#, r#"ERROR: cannot index list with float"#),
+        (r#"slice("abcd", v(1.0), v(3.0))"#, r#"ERROR: `slice` expects an int as argument 2, got float"#),
+        (r#"range(v(3.0))"#, r#"ERROR: `range` expects an int as argument 1, got float"#),
+        (r#"repeat("a", v(2.0))"#, r#"ERROR: `repeat` expects an int as argument 2, got float"#),
+        (r#"take([1, 2, 3], v(2.0))"#, r#"ERROR: `take` expects an int as argument 2, got float"#),
+        (r#"round(1.2345, v(2.0))"#, r#"ERROR: `round` expects an int as argument 2, got float"#),
+        (r#"[v(9007199254740993) * v(1.0), v(9007199254740993) + v(0.0), v(9007199254740993) / v(1.0)]"#, r#"[["float", "float", "float"], [9007199254740992, 9007199254740992, 9007199254740992]]"#),
+        (r#"[1.5 + 0.5, 2.0 * 3, 4.0 - 1, 6.0 / 2, 7.0 % 2, -v(2.0), 3 + 0.0, 0.5 * 4, 6 / 3, 7 / 2, 1e300 * 10]"#, r#"[["float", "float", "float", "float", "float", "float", "float", "float", "int", "float", "float"], [2, 6, 3, 3, 1, -2, 3, 2, 2, 3.5, 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000]]"#),
+        (r#"[0 * -1, -3 * 0, -4 % 2, -(0), float(0 * -1), 1.5 / (0 * -1), -0.0 * 1, 1.0 / -0.0]"#, r#"[["int", "int", "int", "int", "float", "float", "float", "float"], [0, 0, 0, 0, 0, inf, 0, -inf]]"#),
+        (r#"[2.0 == 2, 2 == 2.0, [2.0] == [2], { a: 2.0 } == { a: 2 }, 2.0 == dec("2"), 2.5 == 2, 2.0 != 2, contains([1.0], 1), index_of([1, 2.0], 2)]"#, r#"[["bool", "bool", "bool", "bool", "bool", "bool", "bool", "bool", "int"], [true, true, true, true, true, false, false, true, 1]]"#),
+        (r#"[2.0 < 3, 2.0 <= 2, 2 >= 2.0, 1e300 > 9223372036854775807, -0.0 < 0, sort([2.0, 1, 1.5, -0.0, 0])]"#, r#"[["bool", "bool", "bool", "bool", "bool", ["float", "int", "int", "float", "float"]], [true, true, true, true, false, [0, 0, 1, 1.5, 2]]]"#),
+        (r#"[sqrt(4), abs(-2.0), abs(-2), floor(2.5), floor(2.0), ceil(-0.5), round(2.5), round(-2.5), round(2.0), round(5, 2), floor(9.1e15), ceil(-9.1e15)]"#, r#"[["float", "float", "int", "int", "int", "int", "int", "int", "int", "float", "float", "float"], [2, 2, 2, 2, 2, 0, 3, -3, 2, 5, 9100000000000000, -9100000000000000]]"#),
+        (r#"[float(2), float("2"), float("2.5"), float(" 7 "), float("1e3"), float(".5"), float("5."), float("+1.5"), float("-0"), float("1e400"), float("inf"), float("-Infinity"), float("nan")]"#, r#"[["float", "float", "float", "float", "float", "float", "float", "float", "float", "float", "float", "float", "float"], [2, 2, 2.5, 7, 1000, 0.5, 5, 1.5, 0, inf, inf, -inf, NaN]]"#),
+        (r#"[float("0x10"), float("0b11"), float("0o17"), float(" 0x10 "), float("1_000"), float(""), float("."), float("e5"), float("1e")]"#, r#"[["error", "error", "error", "error", "error", "error", "error", "error", "error"], [err("not a number: \"0x10\""), err("not a number: \"0b11\""), err("not a number: \"0o17\""), err("not a number: \" 0x10 \""), err("not a number: \"1_000\""), err("not a number: \"\""), err("not a number: \".\""), err("not a number: \"e5\""), err("not a number: \"1e\"")]]"#),
+        (r#"[int(2.0), int(2.9), int(-2.9), int(1e15), int(9007199254740993.0), int(-9.223372036854775808e18), int(9.223372036854775807e18), int(math.inf), int(-0.5)]"#, r#"[["int", "int", "int", "int", "int", "int", "error", "error", "int"], [2, 2, -2, 1000000000000000, 9007199254740992, -9223372036854775808, err("9223372036854776000 is too large for an int"), err("cannot convert float to int"), 0]]"#),
+        (r#"[min([2.0, 3]), max([2, 3.0]), min([1, 1.0]), max([1.0, 1]), sum([1.0, 2]), sum([1, 2]), sum([0.5, 0.5]), sum([]), sum([2.0])]"#, r#"[["float", "float", "int", "float", "float", "int", "float", "int", "float"], [2, 3, 1, 1, 3, 3, 1, 0, 2]]"#),
+        (r#"[pow(2, 2), pow(2.0, 2), pow(2, 0.5), pow(4, 0.5), pow(2, -1), pow(2, 64.0)]"#, r#"[["int", "float", "float", "float", "float", "float"], [4, 4, 1.4142135623730951, 2, 0.5, 18446744073709552000]]"#),
+        (r#"[2.0 + "a", "a" + 2.0, `${1.0}`, str([1.0, 2]), str({ a: 1.0 }), str(-0.0), str(1e21), str(2.5)]"#, r#"[["str", "str", "str", "str", "str", "str", "str", "str"], ["2a", "a2", "1", "[1, 2]", "{ a: 1 }", "0", "1000000000000000000000", "2.5"]]"#),
+        (r#"[random() >= 0, type_of(random()), type_of(math.pi), dec(2.0), dec(2.5)]"#, r#"[["bool", "str", "str", "dec", "dec"], [true, "float", "float", 2m, 2.5m]]"#),
+        (r#"[money.of(v(2.0), "USD") ?? "refused", money.of(dec("2"), "USD").amount]"#, r#"[["str", "dec"], ["refused", 2.00m]]"#),
+        (r#"[unique([1, 1.0, 2]), group_by([1, 1.0], (x) => x), vec.full(2, 1.0), vec.zeros(v(2.0))]"#, r#"[[["int", "int"], [["1", ["int", "float"]]], ["float", "float"], ["int", "int"]], [[1, 2], { "1": [1, 1] }, [1, 1], [0, 0]]]"#),
+    ]);
+}
+
+// Q-776: an int past 2^53 (a BigInt in the browser) stopped the math functions, `stats` and
+// `vec`; `math.factorial(19)`, `math.comb(60, 30)` and `math.prod` overflowed at 2^53; it was never
+// equal to the same float; `3037000500 * 3037000500` was a number past 64 bits; `int(-2^63)` was
+// refused and `json.parse` rounded the ends of an int's range. Each is exact now, or the server's
+// float where it gives one, or the same overflow, at the edges of 2^53 and 2^63 and either side
+// of them. `floor`, `ceil` and `round` give an int back as it is on the server too: past 2^53 it
+// went through a float (FEEDBACK55.md, Q-776 and Q-789).
+#[test]
+fn ints_past_2_53_are_exact_in_the_browser() {
+    // A loop counts past 2^53 exactly, and across it (FEEDBACK55.md, Q-776; branch feedback55).
+    let defs = r#"fn loop_big() {
+    let out = []
+    for i in range(9007199254740993, 9007199254740995) { out = out + [i + 1] }
+    for i in 9007199254740991..9007199254740993 { out = out + [[i, [10, 20][i - 9007199254740991]]] }
+    out
+}
+fn loop_bad() {
+    for i in v(1.5)..9007199254740995 { print(i) }
+    0
+}
+"#;
+    same_on_both(defs, &[
+        (r#"loop_big()"#, r#"[["int", "int", ["int", "int"], ["int", "int"]], [9007199254740994, 9007199254740995, [9007199254740991, 10], [9007199254740992, 20]]]"#),
+        (r#"loop_bad()"#, r#"ERROR: `..` needs two ints"#),
+        (r#"vec.cumsum(v(["a", 1]))"#, r#"ERROR: `vec.cumsum` expects numbers, got str"#),
+        (r#"vec.cumprod(v([dec("1"), 2]))"#, r#"ERROR: `vec.cumprod` expects numbers, got dec (this works on floats: convert a dec with float(x))"#),
+        (r#"[v(9007199254740992) == v(9007199254740992.0), v(9007199254740993) == v(9007199254740993), v(9007199254740993) != v(9007199254740992)]"#, r#"[["bool", "bool", "bool"], [true, true, true]]"#),
+        (r#"[contains([9007199254740992], 9007199254740992.0), index_of([9007199254740992.0], 9007199254740992), unique([9007199254740992, 9007199254740992.0]), remove([9007199254740992, 1], 9007199254740992.0)]"#, r#"[["bool", "int", ["int"], ["int"]], [true, 0, [9007199254740992], [1]]]"#),
+        (r#"match v(9007199254740992) { 9007199254740992.0 => "yes", _ => "no" }"#, r#"["str", "yes"]"#),
+        (r#"[sort([9007199254740995, 9007199254740993, 1, -9007199254740993]), min([9007199254740993, 9007199254740994]), max([-9007199254740993, -9007199254740994]), 9007199254740993 < 9007199254740994, 9007199254740993 > 1.5, -9007199254740993 < -1e300]"#, r#"[[["int", "int", "int", "int"], "int", "int", "bool", "bool", "bool"], [[-9007199254740993, 1, 9007199254740993, 9007199254740995], 9007199254740993, -9007199254740993, true, true, false]]"#),
+        (r#"[sqrt(9007199254740993), floor(9007199254740993), ceil(9007199254740993), round(9007199254740993), abs(-9007199254740993), math.sqrt(9007199254740993), math.log(9007199254740993)]"#, r#"[["float", "int", "int", "int", "int", "float", "float"], [94906265.62425156, 9007199254740993, 9007199254740993, 9007199254740993, 9007199254740993, 94906265.62425156, 36.7368005696771]]"#),
+        (r#"[math.isqrt(9007199254740993), math.gcd(9007199254740993, 3), math.lcm(9007199254740993, 2), math.floor(9007199254740993), math.trunc(1e17), math.ceil(-1e17)]"#, r#"[["int", "int", "int", "int", "int", "int"], [94906265, 3, 18014398509481986, 9007199254740993, 100000000000000000, -100000000000000000]]"#),
+        (r#"math.floor(1e19)"#, r#"ERROR: integer overflow"#),
+        (r#"[stats.mean([9007199254740993, 1]), stats.median([9007199254740993, 1, 3]), stats.median([9007199254740993]), stats.describe([9007199254740993]).sum]"#, r#"[["float", "int", "float", "float"], [4503599627370496, 3, 9007199254740992, 9007199254740992]]"#),
+        (r#"[vec.add([9007199254740993], [0]), vec.mul([9007199254740993], 2), vec.sub(9007199254740993, [1, 2]), vec.cumsum([9007199254740993, 1]), vec.cumsum([9007199254740991, 1, 1]), vec.diff([9007199254740993, 9007199254740995])]"#, r#"[[["int"], ["int"], ["int", "int"], ["int", "int"], ["int", "int", "int"], ["int"]], [[9007199254740993], [18014398509481986], [9007199254740992, 9007199254740991], [9007199254740993, 9007199254740994], [9007199254740991, 9007199254740992, 9007199254740993], [2]]]"#),
+        (r#"vec.cumprod([3037000500, 3037000500])"#, r#"ERROR: integer overflow"#),
+        (r#"vec.mul([3037000500], 3037000500)"#, r#"ERROR: integer overflow"#),
+        (r#"[vec.arange(9007199254740990, 9007199254740993), vec.dot([9007199254740993], [1]), math.sumprod([4294967296], [2147483647])]"#, r#"[[["int", "int"], "int", "int"], [[9007199254740990, 9007199254740991], 9007199254740993, 9223372032559808512]]"#),
+        (r#"math.sumprod([4294967296], [4294967296])"#, r#"ERROR: integer overflow"#),
+        (r#"[range(9007199254740993, 9007199254740995), 9007199254740993..9007199254740995, len(range(9007199254740990, 9007199254740995))]"#, r#"[[["int", "int"], ["int", "int"], "int"], [[9007199254740993, 9007199254740994], [9007199254740993, 9007199254740994], 5]]"#),
+        (r#"[math.factorial(19), math.factorial(20), math.comb(60, 30), math.comb(66, 33), math.perm(20, 19), math.prod([4294967296, 4194304]), math.prod([2, 3]), math.prod([2.0, 3])]"#, r#"[["int", "int", "int", "int", "int", "int", "int", "float"], [121645100408832000, 2432902008176640000, 118264581564861424, 7219428434016265740, 2432902008176640000, 18014398509481984, 6, 6]]"#),
+        (r#"math.comb(67, 33)"#, r#"ERROR: integer overflow"#),
+        (r#"math.factorial(21)"#, r#"ERROR: integer overflow"#),
+        (r#"math.comb(68, 34)"#, r#"ERROR: integer overflow"#),
+        (r#"math.perm(21, 21)"#, r#"ERROR: integer overflow"#),
+        (r#"math.prod([4294967296, 4294967296])"#, r#"ERROR: integer overflow"#),
+        (r#"math.lcm(9223372036854775807, 2)"#, r#"ERROR: integer overflow"#),
+        (r#"[v(3037000499) * v(3037000499), v(9007199254740991) + v(1), v(-9007199254740991) - v(1), 9223372036854775807 - 1, -9223372036854775807 - 1]"#, r#"[["int", "int", "int", "int", "int"], [9223372030926249001, 9007199254740992, -9007199254740992, 9223372036854775806, -9223372036854775808]]"#),
+        (r#"v(3037000500) * v(3037000500)"#, r#"ERROR: integer overflow"#),
+        (r#"9223372036854775807 + 1"#, r#"ERROR: integer overflow"#),
+        (r#"[9007199254740993 + 1, 9007199254740993 - 1, 9007199254740993 * 1, 9007199254740993 / 1, 9007199254740993 % 2, -9007199254740993, 9007199254740993 / 2, 9007199254740993 + 0.5]"#, r#"[["int", "int", "int", "int", "int", "int", "float", "float"], [9007199254740994, 9007199254740992, 9007199254740993, 9007199254740993, 1, -9007199254740993, 4503599627370496, 9007199254740992]]"#),
+        (r#"[int(-9.223372036854775808e18), json.parse("-9223372036854775808"), json.parse("9223372036854775807"), json.parse("9223372036854775808"), json.parse("-9223372036854775809"), json.parse("[9007199254740993]")]"#, r#"[["int", "int", "int", "float", "float", ["int"]], [-9223372036854775808, -9223372036854775808, 9223372036854775807, 9223372036854776000, -9223372036854776000, [9007199254740993]]]"#),
+        (r#"[[1, 2, 3][9007199254740993], "abc"[9007199254740993], { a: 1 }[9007199254740993]]"#, r#"[["null", "null", "null"], [null, null, null]]"#),
+        (r#"[bit.and(9007199254740993, 1), bit.shl(1, 62), bit.and(v(3.0), 1), json.stringify([9007199254740993, -9007199254740993])]"#, r#"[["int", "int", "int", "str"], [1, 4611686018427387904, 1, "[9007199254740993,-9007199254740993]"]]"#),
+        (r#"math.factorial(v(5.0))"#, r#"["int", 120]"#),
+        (r#"[math.gcd(v([12.0, 18])), math.comb(v(5.0), 2), math.ldexp(1.5, v(2.0))]"#, r#"[["int", "int", "float"], [6, 10, 6]]"#),
+    ]);
+}
+
+// Q-778: the browser ordered text by UTF-16 unit, which puts U+E000 to U+FFFF after the characters
+// past U+FFFF; trimmed with JavaScript's set (U+FEFF, not U+0085); and `replace(s, "", x)` put x
+// between UTF-16 units only, splitting an emoji. Code point order, Unicode's White_Space and the
+// server's empty pattern (before each character and at the end) now, and the patterns that are
+// not empty as before.
+#[test]
+fn text_orders_trims_and_replaces_as_on_the_server() {
+    let defs = "";
+    same_on_both(defs, &[
+        (r#"[sort(["b", "a", "Ａ", "😀", "\ue000", "z", ""]), join(sort(["Ａ", "😀"]), " ")]"#, r#"[[["str", "str", "str", "str", "str", "str", "str"], "str"], [["", "a", "b", "z", "", "Ａ", "😀"], "Ａ 😀"]]"#),
+        (r#"["😀" < "\uffff", "\ue000" < "😀", "\uffff" < "😀", "😀" > "\ufffd", max(["😀", "\uffff"]), min(["😀", "\uffff"]), "a" < "ab", "" < "a", "é" > "z"]"#, r#"[["bool", "bool", "bool", "bool", "str", "str", "bool", "bool", "bool"], [false, true, true, true, "😀", "￿", true, true, true]]"#),
+        (r#"[sort([[1, "😀"], [1, "\uffff"]]), sort_by(["😀", "ﬁ", "a"], (s) => s)]"#, r#"[[[["int", "str"], ["int", "str"]], ["str", "str", "str"]], [[[1, "￿"], [1, "😀"]], ["a", "ﬁ", "😀"]]]"#),
+        (r#"[len(trim("\ufeffname")), len(trim("name\u0085")), len(trim("\u00a0x\u3000")), len(trim("\u200bx")), trim("  x  "), trim(""), trim("\t\n x \r\u2029")]"#, r#"[["int", "int", "int", "int", "str", "str", "str"], [5, 4, 1, 2, "x", "", "x"]]"#),
+        (r#"[replace("abc", "", "-"), replace("😀", "", "-"), replace("", "", "-"), replace("é", "", "-"), replace("a😀b", "", ""), replace("aXbX", "X", ""), replace("abc", "b", "")]"#, r#"[["str", "str", "str", "str", "str", "str", "str"], ["-a-b-c-", "-😀-", "-", "-é-", "a😀b", "ab", "ac"]]"#),
+    ]);
+}
+
+// Q-780: the server refuses to put NaN in order (FEEDBACK49.md, Q-605) and the browser sorted it,
+// gave it as `max`, and `NaN < 1` was false. Refused the same way now, in `sort`, `sort_by`, `min`,
+// `max`, `<` and the rest, `stats.median`; `vec.argsort` puts it last as the server's keys do, and
+// the infinities are ordered as before.
+#[test]
+fn nan_cannot_be_put_in_order_in_the_browser_either() {
+    let defs = "";
+    same_on_both(defs, &[
+        (r#"sort([math.nan, 1])"#, r#"ERROR: `sort` cannot compare int with float"#),
+        (r#"max([math.nan, 1])"#, r#"ERROR: `max` cannot compare int with float"#),
+        (r#"min([1, math.nan])"#, r#"ERROR: `min` cannot compare float with int"#),
+        (r#"v(math.nan) < 1"#, r#"ERROR: cannot compare float with int"#),
+        (r#"v(1) >= v(math.nan)"#, r#"ERROR: cannot compare int with float"#),
+        (r#"sort_by([1, 2], (x) => math.nan)"#, r#"ERROR: `sort_by` cannot compare float with float"#),
+        (r#"stats.median([math.nan, 1])"#, r#"ERROR: `stats.median`: the data hold NaN at index 0: NaN and infinity cannot be counted or put in order"#),
+        (r#"sort([[math.nan], [1]])"#, r#"ERROR: `sort` cannot compare list with list"#),
+        (r#"[vec.argsort([math.nan, 1]), vec.argsort([1, math.nan, 0], true), vec.argsort([2, math.nan, math.nan, 1]), math.nan == math.nan, math.nan != math.nan, contains([math.nan], math.nan)]"#, r#"[[["int", "int"], ["int", "int", "int"], ["int", "int", "int", "int"], "bool", "bool", "bool"], [[1, 0], [1, 0, 2], [3, 0, 1, 2], false, true, false]]"#),
+        (r#"[sort([math.inf, 1, -math.inf]), max([math.inf, 1]), vec.argmin([math.nan, 3, 1]), vec.argmax([math.nan])]"#, r#"[[["float", "int", "float"], "float", "int", "null"], [[-inf, 1, inf], inf, 2, null]]"#),
+    ]);
+}
+
+// Q-781 in the browser: a whole float is written `2.0` in JSON as the server writes it (`-0.0`, and
+// past 1e21 as JavaScript writes it), and read back as a float on both sides; ints, and an int past
+// 2^53, as digits.
+#[test]
+fn json_writes_a_float_as_the_server_does_on_both_sides() {
+    let defs = "";
+    same_on_both(defs, &[
+        (r#"json.stringify([2.0, 2, 2.5, -0.0, 0.0, 1e21, 1e16, 1e20, 0.0000015, 1e-7, 1.5e-6, -1e21, 1e300, 123e-20])"#, r#"["str", "[2.0,2,2.5,-0.0,0.0,1e+21,10000000000000000.0,100000000000000000000.0,0.0000015,1e-7,0.0000015,-1e+21,1e+300,1.23e-18]"]"#),
+        (r#"json.stringify({ a: 2.0, b: [1.0, { c: -2.0 }] }, true)"#, r#"["str", "{\n  \"a\": 2.0,\n  \"b\": [\n    1.0,\n    {\n      \"c\": -2.0\n    }\n  ]\n}"]"#),
+        (r#"[json.parse(json.stringify(2.0)), json.parse(json.stringify(-0.0)), json.parse(json.stringify(1e21)), json.parse(json.stringify([1.0, 2]))]"#, r#"[["float", "float", "float", ["float", "int"]], [2, 0, 1000000000000000000000, [1, 2]]]"#),
+        (r#"[json.stringify(sqrt(4)), json.stringify(9007199254740993), json.stringify(1.0 / 3), json.stringify(math.inf)]"#, r#"[["str", "str", "str", "str"], ["2.0", "9007199254740993", "0.3333333333333333", "null"]]"#),
+    ]);
+}
+
+// Q-782: `json.parse` took 1e400 (as inf) and half of a character, which the server refuses;
+// `??` missed a stop in a field or an index to its left (`v("abc").foo ?? "none"`); a map's key
+// of letters of another script was quoted; `float("0x10")` was 16; with `m`, U+2028 and U+2029
+// ended a line for `^` and `$`, and `^` matched between \r and \n; `posixrules` was a zone on the
+// server, `US/Pacific-New` and Java's `PST` in the browser. Each as the server has it, or refused
+// on both: a zone is a name of the IANA database, its zones and links in any case.
+#[test]
+fn smaller_differences_between_the_sides_are_gone() {
+    let defs = "";
+    same_on_both(defs, &[
+        // What a Linux tzdata has besides: this machine's zone, and the copies (found in review).
+        (r#"[date.now("localtime") ?? "refused", date.now("posix/UTC") ?? "refused", date.now("right/UTC") ?? "refused", date.now("Posix/Europe/Paris") ?? "refused"]"#, r#"[["str", "str", "str", "str"], ["refused", "refused", "refused", "refused"]]"#),
+        (r#"[is_err(json.parse("1e400")), is_err(json.parse("-1e400")), json.parse("1e308"), json.parse("1e-400"), is_err(json.parse("\"\\ud83d\"")), is_err(json.parse("\"\\udc00x\"")), json.parse("\"\\ud83d\\ude00\""), is_err(json.parse("{\"\\ud800\": 1}"))]"#, r#"[["bool", "bool", "float", "float", "bool", "bool", "str", "bool"], [true, true, 100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000, 0, true, true, "😀", true]]"#),
+        (r#"[v("abc").foo ?? "none", [1, 2][v(1.5)] ?? 10, v({ a: { b: 1 } }).a.b ?? 0, v({ a: 1 }).a.b ?? 7, v([[1]])[0][5] ?? 8, v({}).x ?? 9, v(null).foo ?? "n", v([1])[v("x")] ?? "i", v({ a: 1 }).a ?? 5]"#, r#"[["str", "int", "int", "int", "int", "int", "str", "str", "int"], ["none", 10, 1, 7, 8, 9, "n", "i", 1]]"#),
+        (r#"str({ é: 1, Ω: 2, 日本: 3, a²: 4, ǅ: 5, _x: 6, a1: 7, "1a": 8, "a b": 9, "": 10, "x-y": 11, Ⅷ: 12, "٣": 13 })"#, r#"["str", "{ é: 1, Ω: 2, 日本: 3, a²: 4, ǅ: 5, _x: 6, a1: 7, \"1a\": 8, \"a b\": 9, \"\": 10, \"x-y\": 11, Ⅷ: 12, \"٣\": 13 }"]"#),
+        (r#"[float("0x10"), float(" 0x10 "), float("0b11"), float("0o17"), float("16"), float(" 16 ")]"#, r#"[["error", "error", "error", "error", "float", "float"], [err("not a number: \"0x10\""), err("not a number: \" 0x10 \""), err("not a number: \"0b11\""), err("not a number: \"0o17\""), 16, 16]]"#),
+        (r#"[re.find_all("a\u2028b", "^.", "m") | map((m) => m.text), re.find_all("a\r\nb", "^", "m") | map((m) => m.start), re.find_all("a\r\nb", "$", "m") | map((m) => m.start), re.find_all("a\rb\nc", "^\\w", "m") | map((m) => m.text), re.test("x\u2029y", "x$", "m"), re.test("x\u2029y", "x$"), re.replace("a\nb", "^", ">", "m"), re.find_all("[$^]", "[$^]", "m") | map((m) => m.text), re.test("a\u2028", "a$", "m")]"#, r#"[[["str"], ["int", "int"], ["int", "int"], ["str", "str", "str"], "bool", "bool", "str", ["str", "str"], "bool"], [["a"], [0, 3], [1, 4], ["a", "b", "c"], false, false, ">a\n>b", ["$", "^"], false]]"#),
+        (r#"[date.now("posixrules") ?? "refused", date.now("Factory") ?? "refused", date.now("Etc/Unknown") ?? "refused", date.now("US/Pacific-New") ?? "refused", date.now("Canada/East-Saskatchewan") ?? "refused", date.now("SystemV/AST4") ?? "refused", date.now("PST") ?? "refused", date.now("pst") ?? "refused"]"#, r#"[["str", "str", "str", "str", "str", "str", "str", "str"], ["refused", "refused", "refused", "refused", "refused", "refused", "refused", "refused"]]"#),
+        (r#"[date.now("Europe/Paris") != null, date.now("europe/paris") != null, date.now("EST") != null, date.now("US/Pacific") != null, date.now("Asia/Calcutta") != null, date.now("UTC") != null]"#, r#"[["bool", "bool", "bool", "bool", "bool", "bool"], [true, true, true, true, true, true]]"#),
+    ]);
+}
+
+/// `src` served with `opts`, and `body` run in Chrome on `path` once the runtime has started, as
+/// `in_page` does, with what the console warned in `warned`. None without Chrome.
+fn in_page_with(name: &str, src: &str, opts: &[&str], path: &str, body: &str) -> Option<(serde_json::Value, String)> {
+    let (ok, out) = check(src);
+    assert!(ok, "{}", out);
+    let d = dir(name, src);
+    let s = support::serve_with(&d.join("main.qwe"), opts);
+    let html = support::send(s.port, "GET", path, &[], "").body;
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping the browser half: no Chrome");
+        return None;
+    };
+    let script = format!(
+        "(async () => {{\n  const warned = [];\n  const warn = console.warn;\n  console.warn = (...a) => {{ warned.push(a.join(\" \")); return warn.apply(console, a); }};\n  {BOOTED}\n  const $ = (id) => document.getElementById(id);\n  const out = await (async () => {{\n{body}\n  }})();\n  out.remade = QW.remade ?? 0;\n  out.errors = window.__quilloErrors;\n  out.warned = warned.filter((w) => w.startsWith(\"quillo:\"));\n  document.body.dataset.result = JSON.stringify(out);\n}})();"
+    );
+    Some((in_chrome(&chrome, &format!("http://127.0.0.1:{}{}", s.port, path), &script), html))
+}
+
+// Q-772: the server wrote a CR and a NUL in text as they are, which the HTML parser makes a newline
+// and drops, so the page said otherwise than what the browser computes, and the component was made
+// again on every load: two lines typed in a <textarea> and posted come with CRLF. The server writes
+// a CR `&#13;` (in an attribute too, as before) and a NUL U+FFFD, the browser shows a NUL as U+FFFD,
+// and the page is taken up as written: in a state, a prop, an attribute and a <textarea>, a CR
+// alone, one at the end added later, text with neither.
+#[test]
+fn text_with_a_cr_or_a_nul_is_taken_up_as_the_server_wrote_it() {
+    let src = r##"component Note(p: str) {
+    state s = "line one\r\nline two"
+    state t = "a\u0000b"
+    <div><p #a>{s}</p><p #b>{p}</p><p #c>{t}</p><p #d title={s}>x</p><textarea #e>{s}</textarea><p #f>{"a\rb"}</p><p #g>{"plain"}</p><p #h title={t}>y</p><p #i>{"\r"}</p>
+    <button #go @click={() => { s = s + "\r"; t = t + "\u0000" }}>go</button></div>
+}
+route GET / = <html><head><title>t</title></head><body><Note p={"cr\rhere"}/></body></html>
+"##;
+    let body = r#"const text = (id) => $(id).textContent;
+    const out = { a: text("a"), b: text("b"), c: text("c"), d: $("d").getAttribute("title"), e: text("e"), f: text("f"), g: text("g"), h: $("h").getAttribute("title"), i: text("i") };
+    $("go").click(); await tick(60);
+    out.after = [text("a"), text("c")];
+    return out;"#;
+    let Some((r, html)) = in_page("q772", src, "/", body) else { return };
+    assert!(html.contains("<p id=\"a\">line one&#13;\nline two</p>") && html.contains("<p id=\"c\">a\u{FFFD}b</p>") && html.contains("cr&#13;here"), "{}", html);
+    assert!(html.contains("title=\"line one&#13;\nline two\"") && html.contains("<p id=\"g\">plain</p>") && html.contains("<p id=\"i\">&#13;</p>"), "{}", html);
+    assert!(!html.contains('\r') && !html.contains('\0'), "{:?}", html);
+    let want = serde_json::json!({
+        "a": "line one\r\nline two", "b": "cr\rhere", "c": "a\u{FFFD}b", "d": "line one\r\nline two", "e": "line one\r\nline two",
+        "f": "a\rb", "g": "plain", "h": "a\u{FFFD}b", "i": "\r", "after": ["line one\r\nline two\r", "a\u{FFFD}b\u{FFFD}"], "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Q-774: an attribute was not compared as a component was taken up: the browser's value silently
+// took the server's place, so no difference between the sides was ever seen. Under `--watch` it is
+// compared as text is: a page script that changes, removes or adds one the markup sets makes that
+// component again (with the markup's value), said with what the page and the browser have; the
+// others are taken up as they are, and so is one where a person typed (a field's value is the
+// person's) or a script added a class or an attribute the markup does not set. In production the
+// browser's value takes its place, as before, and nothing is made again (decided in review: a
+// browser extension rewriting a style would make components again on every load).
+#[test]
+fn an_attribute_that_differs_makes_the_component_again() {
+    let src = r##"component Card(label: str) {
+    state n = 0
+    state gone = null
+    state on = true
+    <div class="card"><span #lab title={label} data-n={n} aria-busy={on} hidden={gone}>{label}</span><input value={label} readonly/><button class="bump" @click={() => { n += 1 }}>{n}</button></div>
+}
+component Box() {
+    <main><Card label="kept"/><Card label="title"/><Card label="removed"/><Card label="added"/><Card label="typed"/><Card label="classed"/></main>
+}
+// What a script of the page's does before the page is taken up.
+let change = "const c = [...document.querySelectorAll('.card')], s = (i) => c[i].querySelector('span'); s(1).setAttribute('title', 'changed'); s(2).removeAttribute('data-n'); s(3).setAttribute('hidden', ''); c[4].querySelector('input').value = 'typed'; s(5).classList.add('extra'); s(5).setAttribute('data-extra', '1'); window.__before = c.map((x) => x.querySelector('span'));"
+route GET / = <html><head><title>t</title></head><body><Box/><script>{raw(change)}</script></body></html>
+"##;
+    let body = r#"const before = window.__before;
+    await tick(100);
+    for (const c of document.querySelectorAll(".card")) c.querySelector(".bump").click();
+    await tick(150);
+    const now = [...document.querySelectorAll(".card")];
+    return {
+      same: now.map((c, i) => c.querySelector("span") === before[i]),
+      titles: now.map((c) => c.querySelector("span").getAttribute("title")),
+      n: now.map((c) => c.querySelector("span").getAttribute("data-n")),
+      hidden: now.map((c) => c.querySelector("span").hasAttribute("hidden")),
+      typed: now[4].querySelector("input").value,
+      cls: now[5].querySelector("span").className + " " + now[5].querySelector("span").getAttribute("data-extra"),
+    };"#;
+    let Some((r, _)) = in_page_with("q774p", src, &[], "/", body) else { return };
+    let want = serde_json::json!({
+        "same": [true, true, true, true, true, true], "titles": ["kept", "title", "removed", "added", "typed", "classed"],
+        "n": ["1", "1", "1", "1", "1", "1"], "hidden": [false, false, false, false, false, false], "typed": "typed", "cls": "extra 1",
+        "remade": 0, "errors": [], "warned": [],
+    });
+    assert_eq!(r, want);
+    let Some((r, _)) = in_page_with("q774", src, &["--watch"], "/", body) else { return };
+    assert_eq!(r["same"], serde_json::json!([true, false, false, false, true, true]), "{}", r);
+    assert_eq!(r["titles"], serde_json::json!(["kept", "title", "removed", "added", "typed", "classed"]), "{}", r);
+    assert_eq!(r["n"], serde_json::json!(["1", "1", "1", "1", "1", "1"]), "{}", r);
+    assert_eq!(r["hidden"], serde_json::json!([false, false, false, false, false, false]), "{}", r);
+    assert_eq!((r["typed"].as_str(), r["cls"].as_str(), r["remade"].as_i64()), (Some("typed"), Some("extra 1"), Some(3)), "{}", r);
+    let warned = r["warned"].as_array().unwrap();
+    for w in [r#"where it wrote title="changed", the browser makes title="title""#, r#"where it wrote no data-n, the browser makes data-n="0""#, r#"where it wrote hidden="", the browser makes no hidden"#] {
+        assert!(warned.iter().any(|x| x.as_str().unwrap().contains(w)), "{} in {:?}", w, warned);
+    }
+    assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
+}
+
+// Q-775 across the wire: a whole float in a state, a prop and a server fn's answer was an int once
+// the browser had it, and one the page sent a server fn arrived an int. Floats keep their type
+// both ways (the server writes `2.0`, the browser reads the text it was written as, and writes
+// `2.0` back), so the page is taken up as written, `a / 0` is inf, and the server reads them as
+// floats; an int past 2^53, -0.0 and 1e21 too, and ints stay ints.
+#[test]
+fn floats_cross_to_the_page_and_back_as_floats() {
+    let src = r##"server fn kinds(xs) = xs | map((x) => type_of(x))
+server fn two() = 2.0
+server fn halves() = [1.0, 2.5, -0.0, 9007199254740993, 1e21]
+component Floats(p: float, q) {
+    state a = 2.0
+    state b = [1.0, 2, 2.5]
+    state c = 9007199254740993
+    state d = { x: 3.0 }
+    state got = ""
+    state back = ""
+    state z = 0
+    <div><p #types>{json.stringify([type_of(p), type_of(q), type_of(a), b | map((x) => type_of(x)), type_of(c), type_of(d.x)])}</p>
+    <p #vals title={a} data-p={p}>{p} {a} {b} {c} {d.x} {a / z} {json.stringify([p, a, b, c, d])}</p>
+    <p #got>{got}</p><p #back>{back}</p>
+    <button #go @click={() => { got = json.stringify([type_of(two()), halves() | map((x) => type_of(x)), two() / z]); back = json.stringify(kinds([a, 2, 2.5, -0.0, c, d.x, p])) }}>go</button></div>
+}
+route GET / = <html><head><title>t</title></head><body><Floats p={2.0} q={1e21}/></body></html>
+"##;
+    let body = r#"const out = { types: JSON.parse($("types").textContent), vals: $("vals").textContent, title: $("vals").getAttribute("title") };
+    $("go").click();
+    for (let i = 0; i < 100 && !$("back").textContent; i++) await tick(30);
+    out.got = JSON.parse($("got").textContent);
+    out.back = JSON.parse($("back").textContent);
+    return out;"#;
+    let Some((r, html)) = in_page("q775", src, "/", body) else { return };
+    assert!(html.contains("<p id=\"vals\" title=\"2\" data-p=\"2\">2 2 122.5 9007199254740993 3 inf [2.0,2.0,[1.0,2,2.5],9007199254740993,{&quot;x&quot;:3.0}]</p>"), "{}", html);
+    let want = serde_json::json!({
+        "types": ["float", "float", "float", ["float", "int", "float"], "int", "float"],
+        "vals": "2 2 122.5 9007199254740993 3 inf [2.0,2.0,[1.0,2,2.5],9007199254740993,{\"x\":3.0}]", "title": "2",
+        "got": ["float", ["float", "float", "float", "int", "float"], null],
+        "back": ["float", "int", "float", "float", "int", "float", "float"],
+        "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Q-779: markup made into text in the browser was "<html>", empty in `json.stringify`; `len` of it
+// stopped and two of the same markup were not equal. Its text is its markup on both sides, written
+// as the server writes HTML (`&amp;`, `&lt;`, `&quot;`, `&#39;`, a void element without its end, an
+// attribute with no value bare), so the page is taken up as written; markup made later too, and
+// `raw`'s own text.
+#[test]
+fn markup_made_into_text_is_its_html_in_the_browser_too() {
+    let src = r##"component H() {
+    state n = 0
+    let h = <b>x</b>
+    let a = <a href="/x?a=1&b=2" title={"it's \"q\""}>{"a < b & c"}</a>
+    <div><p #s>{str(h)}</p><p #c>{"" + h}</p><p #t>{`${h}!`}</p><p #j>{json.stringify({ h: h })}</p><p #l>{len(h)}</p><p #e>{str(h == <b>x</b>)}</p><p #ne>{str(h == <b>y</b>)}</p>
+    <p #a>{str(a)}</p><p #v>{str(<p>one<br>two</p>)}</p><p #i>{str(<input disabled value="v">)}</p><p #r>{str(raw("<i>r</i>"))}</p><p #ls>{str([h, 1])}</p><p #at title={h}>t</p>
+    <p #n>{n > 0 ? str(<b class="k">{n}</b>) : ""}</p><button #go @click={() => { n += 1 }}>go</button>
+    <p #ea>{str(<img src="x.png" alt="">)}</p><p #et>{str(<p title="">x</p>)}</p><p #vt>{str(<input value="v" type="text">)}</p>
+    <p #bt>{str(<input type="checkbox" checked disabled={true} title={""}>)}</p><p #ot>{str(<a title={"t"} href="/h" class="c" id="i">y</a>)}</p>
+    <p #nt>{str(<input value={"w"} type="text" title={n > 5 ? "big" : ""}>)}</p></div>
+}
+route GET / = <html><head><title>t</title></head><body><H/></body></html>
+"##;
+    let body = r#"const ids = ["s", "c", "t", "j", "l", "e", "ne", "a", "v", "i", "r", "ls", "ea", "et", "vt", "bt", "ot", "nt"];
+    const out = {};
+    for (const id of ids) out[id] = $(id).textContent;
+    out.at = $("at").getAttribute("title");
+    $("go").click(); await tick(60);
+    out.n = $("n").textContent;
+    return out;"#;
+    let Some((r, html)) = in_page("q779", src, "/", body) else { return };
+    assert!(html.contains("<p id=\"s\">&lt;b&gt;x&lt;/b&gt;</p>"), "{}", html);
+    let want = serde_json::json!({
+        "s": "<b>x</b>", "c": "<b>x</b>", "t": "<b>x</b>!", "j": "{\"h\":\"<b>x</b>\"}", "l": "8", "e": "true", "ne": "false",
+        "a": "<a href=\"/x?a=1&amp;b=2\" title=\"it&#39;s &quot;q&quot;\">a &lt; b &amp; c</a>", "v": "<p>one<br>two</p>", "i": "<input disabled value=\"v\">",
+        "r": "<i>r</i>", "ls": "[<b>x</b>, 1]", "at": "<b>x</b>", "n": "<b class=\"k\">1</b>",
+        // An attribute of "" is written `=""`, one of `true` bare, in the source's order (found in review).
+        "ea": "<img src=\"x.png\" alt=\"\">", "et": "<p title=\"\">x</p>", "vt": "<input value=\"v\" type=\"text\">",
+        "bt": "<input type=\"checkbox\" checked disabled title=\"\">", "ot": "<a class=\"c\" title=\"t\" href=\"/h\" id=\"i\">y</a>",
+        "nt": "<input value=\"w\" type=\"text\" title=\"\">", "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Review of Q-775 and Q-776, in Chrome: a state, a prop, a server fn's answer, `http.get`'s JSON, a
+// `listen`ed stream (read with plain JSON.parse before, on every browser) and `json.parse` keep a
+// whole float a float and an int past 2^53 exact, with JSON.parse's text of the numbers and with
+// a page where JSON.parse gives none, as older browsers' does: the page is taken up as written.
+#[test]
+fn numbers_from_the_server_keep_their_type_in_any_browser() {
+    let src = r##"fn tys(x) = if type_of(x) == "list" { x | map((y) => tys(y)) } else if type_of(x) == "map" { keys(x) | map((k) => [k, tys(x[k])]) } else { type_of(x) }
+server fn answer() = { a: 2.0, n: 9007199254740993, f: [1.0, 2.5, -0.0], i: 7 }
+route GET /data = { a: 2.0, n: 9007199254740993 }
+route GET /nums = events((send) => { send({ a: 3.0, n: 9007199254740995 }) })
+component Nums(p: float) {
+    state s = { a: 2.0, n: 9007199254740993, f: [1.0, 2] }
+    state got = ""
+    state far = ""
+    state heard = ""
+    listen("/nums", (m) => { heard = json.stringify([tys(m), m.n + 1]) })
+    <div><p #s>{json.stringify([tys(s), type_of(p), s.n + 1])}</p><p #got>{got}</p><p #far>{far}</p><p #heard>{heard}</p>
+    <p #parsed>{json.stringify(tys(json.parse("[2.0, 9007199254740993, \"1.0\"]")))}</p>
+    <button #go @click={() => {
+        let a = answer()
+        got = json.stringify([tys(a), a.n + 1])
+        let r = http.get("/data")
+        far = json.stringify([tys(r.json), r.json.n + 1])
+    }}>go</button></div>
+}
+let old_json = "const P = JSON.parse; JSON.parse = function (t, r) { return r ? P(t, function (k, v) { return r.call(this, k, v); }) : P(t); };"
+route GET / = <html><head><title>t</title></head><body><Nums p={2.0}/></body></html>
+route GET /old = <html><head><title>t</title><script>{raw(old_json)}</script></head><body><Nums p={2.0}/></body></html>
+"##;
+    let body = r#"let context = false;
+    JSON.parse("1", (k, v, c) => { context = c !== undefined; return v; });
+    $("go").click();
+    for (let i = 0; i < 100 && !($("got").textContent && $("far").textContent && $("heard").textContent); i++) await tick(30);
+    return { context, s: $("s").textContent, got: $("got").textContent, far: $("far").textContent, heard: $("heard").textContent, parsed: $("parsed").textContent };"#;
+    let same = serde_json::json!({
+        "s": r#"[[["a","float"],["n","int"],["f",["float","int"]]],"float",9007199254740994]"#,
+        "got": r#"[[["a","float"],["n","int"],["f",["float","float","float"]],["i","int"]],9007199254740994]"#,
+        "far": r#"[[["a","float"],["n","int"]],9007199254740994]"#,
+        "heard": r#"[[["a","float"],["n","int"]],9007199254740996]"#,
+        "parsed": r#"["float","int","str"]"#,
+        "remade": 0, "errors": [],
+    });
+    for (path, context) in [("/", true), ("/old", false)] {
+        let Some((mut r, _)) = in_page("numbers-anywhere", src, path, body) else { return };
+        assert_eq!(r["context"], serde_json::json!(context), "{}", path);
+        r.as_object_mut().unwrap().remove("context");
+        assert_eq!(r, same, "{}", path);
+    }
+}
+
+// Review of Q-775: a whole float reached the page's JavaScript as the runtime's own object:
+// `JSON.stringify({ a: 1.0 })` gave {"a":{"f":1}}, `Number.isFinite(2.0)` false, and a chart's
+// numbers were objects. It is a number there, inside lists and maps too: given to `js(...)`, to a
+// function the page gave, and set on the page's object.
+#[test]
+fn a_whole_float_is_a_number_to_the_pages_code() {
+    let src = r##"component Lib() {
+    state out = ""
+    <div><p #out>{out}</p><button #go @click={() => {
+        let o = js("pagelib.box")
+        o.n = 2.0
+        let kind = js("pagelib.maker")
+        o.m = { x: 2.0 }
+        out = json.stringify([js("JSON.stringify", { a: 1.0, b: [2.0, 2.5], c: { d: -0.0 }, e: 3 }), js("Number.isFinite", 2.0), js("pagelib.kind", 3.0), kind(4.0), kind([5.0]), kind({ x: 6.0 }), kind({ x: 7 }), js("pagelib.read")])
+    }}>go</button></div>
+}
+let lib = "window.pagelib = { box: new (class Box {})(), kind: (v) => Array.isArray(v) ? typeof v[0] : v && typeof v === 'object' ? typeof v.x : typeof v, maker: () => window.pagelib.kind, read: () => typeof window.pagelib.box.n + ' ' + window.pagelib.box.n + ' ' + typeof window.pagelib.box.m.x };"
+route GET / = <html><head><title>t</title><script>{raw(lib)}</script></head><body><Lib/></body></html>
+"##;
+    let body = r#"$("go").click(); await tick(80); return { out: JSON.parse($("out").textContent) };"#;
+    let Some((r, _)) = in_page("float-to-page", src, "/", body) else { return };
+    let want = serde_json::json!({ "out": [r#"{"a":1,"b":[2,2.5],"c":{"d":0},"e":3}"#, true, "number", "number", "number", "number", "number", "number 2 number"], "remade": 0, "errors": [] });
+    assert_eq!(r, want);
+}
+
+// Review of Q-775: a field held to a float state gave text for a whole number typed (`state amount
+// = 1.0`, then `3`: "3", and `amount + 1` "31"), and an int for one the float state held (0.5).
+// A float state gets a float, a whole one too, an int state an int (one given 1.5 too), as before.
+#[test]
+fn a_field_held_to_a_float_state_gives_floats() {
+    let src = r##"component Amount() {
+    state amount = 1.0
+    state rate = 0.5
+    state qty = 2
+    state sums = ""
+    <div><input #a value={amount}/><input #r bind:value={rate}/><input #q value={qty}/>
+    <p #p>{type_of(amount)} {type_of(rate)} {type_of(qty)}</p><p #sums>{sums}</p>
+    <button #sum @click={() => { sums = `${amount + 1} ${rate * 2} ${qty + 1}` }}>sum</button></div>
+}
+route GET / = <html><head><title>t</title></head><body><Amount/></body></html>
+"##;
+    let body = format!(
+        r#"{TYPE_IN}
+    const out = {{}};
+    for (const v of ["3", "2.5", "0"]) {{
+      await typeIn("a", v); await typeIn("r", v); await typeIn("q", v); await tick(40);
+      $("sum").click(); await tick(40);
+      out[v] = [$("p").textContent, $("sums").textContent];
+    }}
+    return out;"#
+    );
+    let Some((r, _)) = in_page("float-field", src, "/", &body) else { return };
+    let want = serde_json::json!({
+        "3": ["float float int", "4 6 4"], "2.5": ["float float float", "3.5 5 3.5"], "0": ["float float int", "1 0 1"],
+        "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Review of slice 9: a test hid errors for the whole process (`value::HIDING`) while it ran Node,
+// and the database tests running beside it read `internal error`. A test hides them on its own
+// thread now (`value::hiding_here`), for the interpreter and the browser's half alike, and the
+// other threads are left as they were.
+#[test]
+fn errors_hidden_for_one_test_stay_shown_for_the_others() {
+    let mut it = quillo::Interp::new(".");
+    it.load_source("fn __t() = str(int(\"x\"))\n", "case.qwe").unwrap();
+    let call = |it: &mut quillo::Interp| match it.call(&quillo::value::lookup(&it.globals, "__t").unwrap(), vec![], 0) {
+        Ok(v) => v.display(),
+        _ => panic!("the case failed"),
+    };
+    let (hidden, script, elsewhere) = quillo::value::hiding_here(true, || {
+        let other = std::thread::spawn(quillo::value::hiding).join().unwrap();
+        (call(&mut it), quillo::client::test_script(&it, "__t").unwrap(), other)
+    });
+    assert_eq!((hidden.as_str(), elsewhere), ("err(\"internal error\")", quillo::value::HIDING.load(std::sync::atomic::Ordering::Relaxed)));
+    assert!(!script.contains("ERRORS_SHOWN = true"));
+    let (shown, script) = quillo::value::hiding_here(false, || (call(&mut it), quillo::client::test_script(&it, "__t").unwrap()));
+    assert_eq!(shown, "err(\"not an int: \\\"x\\\"\")");
+    assert!(script.contains("ERRORS_SHOWN = true"));
+}
+
+// Review of Q-775 and Q-776: a browser whose JSON.parse gives no text of the numbers (Safari before
+// 18.4, Firefox before 135) read a whole float as an int and an int past 2^53 with lost digits,
+// in island state, server fns' answers, live data, channels, streams, `json.parse` and `http`. The
+// numbers whose text says more are marked in the text first (outside strings), under a key no
+// text has, and made from their text: the same answers as with it, a string holding a number's
+// text left alone, and what is not JSON still refused.
+#[test]
+fn numbers_are_read_by_their_text_where_json_parse_cannot_say_it() {
+    same_on_both_after(OLD_JSON, "", &[
+        (r#"[json.parse("9007199254740993") + 1, json.parse("[2.0, 1e2, -0, 2.5, 9007199254740993, -9223372036854775808, 9223372036854775808, 12, \"2.0\", \"a\\\"9007199254740993\"]")]"#, r#"[["int", ["float", "float", "float", "float", "int", "int", "float", "int", "str", "str"]], [9007199254740994, [2, 100, 0, 2.5, 9007199254740993, -9223372036854775808, 9223372036854776000, 12, "2.0", "a\"9007199254740993"]]]"#),
+        (r#"json.parse("{\"a\": 1.0, \"b\": [1E2, {\"c\": -0.0}], \"d\": \"x 1.0 \\\" 2.0 y\", \"e\": [0.5, -1.5e3]}")"#, r#"[[["a", "float"], ["b", ["float", [["c", "float"]]]], ["d", "str"], ["e", ["float", "float"]]], { a: 1, b: [100, { c: 0 }], d: "x 1.0 \" 2.0 y", e: [0.5, -1500] }]"#),
+        (r#"[is_err(json.parse("01.0")), is_err(json.parse("[1.]")), is_err(json.parse("1e400")), is_err(json.parse("\"\\ud800\"")), json.parse("1e-400"), is_err(json.parse("{\"\\ud800\": 1.0}")), is_err(json.parse("[1.0e400]"))]"#, r#"[["bool", "bool", "bool", "bool", "float", "bool", "bool"], [true, true, true, true, 0, true, true]]"#),
+        (r#"[json.parse("{\"\\u0000n\": \"2.0\"}"), json.parse("[]"), json.parse("{}"), json.parse("\"\""), json.parse("0"), json.parse("-0.5")]"#, r#"[[[["\u0000n", "str"]], [], [], "str", "int", "float"], [{ "\u0000n": "2.0" }, [], {}, "", 0, -0.5]]"#),
+    ]);
+}
+
+// Review of Q-777: a decimal made from a float took Rust's digits on a tie (`{:e}`), the browser
+// JavaScript's: `dec(1e15 + 0.3)` was ...0.3m on the server and ...0.2m in the browser, and so were
+// `money.of`, `format_number` and `==` with a decimal. The even digit on both, and a value away from
+// a tie as before.
+#[test]
+fn a_decimal_from_a_float_has_the_same_digits_on_both_sides() {
+    same_on_both("", &[
+        (r#"[dec(1e15 + 0.3), dec(1916218016406818.2), dec(-1916218016406818.2), dec(1e15 + 0.1), dec(0.1), dec(2.0), dec(1 + pow(2, -17)), dec(5e-324)]"#, r#"[["dec", "dec", "dec", "dec", "dec", "dec", "dec", "dec"], [1000000000000000.2m, 1916218016406818.2m, -1916218016406818.2m, 1000000000000000.1m, 0.1m, 2m, 1.0000076293945312m, 0.0000000000000000000000000000m]]"#),
+        (r#"[1916218016406818.2 == dec("1916218016406818.2"), 1916218016406818.2 == dec("1916218016406818.3"), dec("0.1") == 0.1, money.of(dec(v(1e15 + 0.3)), "USD").amount, format_number(1916218016406818.2), format_number(1e15 + 0.3, "en-US")]"#, r#"[["bool", "bool", "bool", "dec", "str", "str"], [true, false, true, 1000000000000000.20m, "1,916,218,016,406,818.2", "1,000,000,000,000,000.2"]]"#),
+    ]);
+}
+
+// Review of Q-772: `escape` wrote a CR and a NUL as they are in the browser and as `&#13;` and
+// U+FFFD on the server, so `raw("<p>" + escape(note) + "</p>")` made the component again.
+#[test]
+fn escape_writes_a_cr_and_a_nul_the_same_on_both_sides() {
+    same_on_both("", &[
+        (r#"[escape("a\r\nb"), escape("a\rb"), escape("a\u0000b"), escape("<&>\"'"), escape("plain"), escape(""), escape("é😀\r"), escape(2.5)]"#, r#"[["str", "str", "str", "str", "str", "str", "str", "str"], ["a&#13;\nb", "a&#13;b", "a�b", "&lt;&amp;&gt;&quot;&#39;", "plain", "", "é😀&#13;", "2.5"]]"#),
+    ]);
+}
+
+// Review of Q-776: builtins that take an int refused one past 2^53 in the browser, where the server
+// clamps it (`slice`, `take`, `drop`, `round`'s digits, `cursor_index`), refuses it as too large
+// (`repeat`, `set`'s index), or counts with it (`range`'s step, `random_int`).
+#[test]
+fn builtins_that_take_an_int_take_one_past_2_53() {
+    same_on_both("", &[
+        (r#"[slice("abc", 1, 9007199254740993), slice([1, 2, 3], -9007199254740993), slice("abc", 9007199254740993), take("abc", 9007199254740993), take([1], -9007199254740993), drop([1, 2], 9007199254740993), drop("ab", -9007199254740993), round(1.5, 9007199254740993), round(1.25, -9007199254740993), cursor_index("abc", 9007199254740993)]"#, r#"[["str", ["int", "int", "int"], "str", "str", [], [], "str", "float", "float", "int"], ["bc", [1, 2, 3], "", "abc", [], [], "ab", 1.5, 1, 3]]"#),
+        (r#"repeat("a", 9007199254740993)"#, r#"ERROR: `repeat` count is negative or too large"#),
+        (r#"repeat("a", -9007199254740993)"#, r#"ERROR: `repeat` count is negative or too large"#),
+        (r#"set([1, 2], 9007199254740993, 0)"#, r#"ERROR: `set`: index 9007199254740993 is outside a list of 2"#),
+        (r#"set([1, 2], -9007199254740993, 0)"#, r#"ERROR: `set`: index -9007199254740993 is outside a list of 2"#),
+        (r#"[set([1, 2], 1, 0), set([1, 2], -1, 0), take("abc", 2), repeat("ab", 2)]"#, r#"[[["int", "int"], ["int", "int"], "str", "str"], [[1, 0], [1, 0], "ab", "abab"]]"#),
+        (r#"[range(0, 9007199254740993, 4503599627370497), range(9007199254740993, 9007199254740999, 2), range(9007199254740999, 9007199254740993, -3), range(0, 3, 1), type_of(random_int(9007199254740993, 9007199254740995)), random_int(9007199254740993, 9007199254740993), random_int(-9223372036854775807, -9223372036854775807)]"#, r#"[[["int", "int"], ["int", "int", "int"], ["int", "int"], ["int", "int", "int"], "str", "int", "int"], [[0, 4503599627370497], [9007199254740993, 9007199254740995, 9007199254740997], [9007199254740999, 9007199254740996], [0, 1, 2], "int", 9007199254740993, -9223372036854775807]]"#),
+        (r#"random_int(9007199254740995, 9007199254740993)"#, r#"ERROR: `random_int` needs lo <= hi, got 9007199254740995 and 9007199254740993"#),
+        (r#"range(9007199254740993, 9007199254740995, 0)"#, r#"ERROR: `range`: a step of 0 never gets anywhere"#),
+        (r#"[contains([9007199254740993, 9007199254740994, 9007199254740995], random_int(9007199254740993, 9007199254740995)), random_int(0, 4503599627370496) >= 0]"#, r#"[["bool", "bool"], [true, true]]"#),
+    ]);
+}
+
+// ---- slice 9, the server's float text (Q-777, Q-781) ----
+
+// Q-777: of two shortest digits as near, Rust took the upper and JavaScript the even one, so the
+// server wrote `1916218016406818.3` (it is ...818.25) where the browser wrote `...818.2`. The
+// server takes the even one too, in `str`, in a component's text and in JSON: below 2^37 as well
+// (1 + 2^-17); a tie whose even digit is the upper, a value next to a tie, a power of two (whose
+// lower neighbour is nearer) and a large int (which has no tie) are as before.
+#[test]
+fn a_float_on_a_tie_takes_the_even_digit_as_javascript() {
+    let src = "let xs = [1916218016406818.3, 1e15 + 0.3, -1916218016406818.3, 1.0 + 1.0 / 131072, 1.0 + 3.0 / 131072, 1916218016406818.5, 1916218016406818.75, 1152921504606847232.0, 0.1, 1.0 / 3.0, 1.0 / 16777216]\nprint(join(xs | map((x) => str(x)), \" | \"))\nprint(json.stringify(xs))\n";
+    let (ok, out) = check(src);
+    assert!(ok, "{}", out);
+    let d = dir("q777", src);
+    let out = run_script(&d, "main.qwe");
+    let mut lines = out.lines();
+    assert_eq!(
+        lines.next(),
+        Some("1916218016406818.2 | 1000000000000000.2 | -1916218016406818.2 | 1.0000076293945312 | 1.0000228881835938 | 1916218016406818.5 | 1916218016406818.8 | 1152921504606847200 | 0.1 | 0.3333333333333333 | 0.00000005960464477539063"),
+        "{}",
+        out
+    );
+    assert_eq!(
+        lines.next(),
+        Some("[1916218016406818.2,1000000000000000.2,-1916218016406818.2,1.0000076293945312,1.0000228881835938,1916218016406818.5,1916218016406818.8,1152921504606847200.0,0.1,0.3333333333333333,5.960464477539063e-8]"),
+        "{}",
+        out
+    );
+    // A component's text, which the browser writes too.
+    let src = "component Tie() {\n    state x = 1916218016406818.3\n    <p #t>{x} {1.0 + 1.0 / 131072} {-1e15 - 0.3} {1e21} {1916218016406818.5}</p>\n}\nroute GET / = <html><head><title>t</title></head><body><Tie/></body></html>\n";
+    let (ok, out) = check(src);
+    assert!(ok, "{}", out);
+    let d = dir("q777-page", src);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let html = support::send(s.port, "GET", "/", &[], "").body;
+    assert!(html.contains("<p id=\"t\">1916218016406818.2 1.0000076293945312 -1000000000000000.2 1000000000000000000000 1916218016406818.5</p>"), "{}", html);
+}
+
+/// Floats where ties are (odd mantissas of a few bits, at each exponent), both signs, and some of
+/// random bits, as Rust writes them back exactly.
+fn tie_prone_floats() -> Vec<String> {
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut xs = Vec::new();
+    for e in -90..90i32 {
+        for bits in 1..=40u32 {
+            let m = (next() >> (64 - bits)) | 1;
+            let x = m as f64 * 2f64.powi(e - bits as i32 + 1);
+            xs.push(x);
+            xs.push(-x);
+        }
+    }
+    for _ in 0..4000 {
+        let x = f64::from_bits(next());
+        if x.is_finite() && x != 0.0 {
+            xs.push(x);
+        }
+    }
+    xs.iter().map(|x| format!("{:e}", x)).collect()
+}
+
+// Q-777 and Q-781 against JavaScript itself: each of 18,000 floats, most where ties are, written
+// by `json.stringify` as Node's JSON.stringify writes it (a whole one with `.0`), and by `str` as
+// Node's String with no exponent.
+#[test]
+fn floats_are_written_as_node_writes_them() {
+    if support::node(";").map(|o| !o.status.success()).unwrap_or(true) {
+        eprintln!("skipping: no node");
+        return;
+    }
+    let xs = tie_prone_floats();
+    // Written to a file: this much printed would fill the pipe the test reads at the end.
+    let src = "let xs = json.parse(read_file(\"xs.json\"))\nwrite_file(\"out.txt\", join(xs | map((s) => json.stringify(float(s))), \"\\n\") + \"\\n\" + join(xs | map((s) => str(float(s))), \"\\n\"))\nprint(\"done\")\n";
+    let (ok, out) = check(src);
+    assert!(ok, "{}", out);
+    let d = dir("q777-node", src);
+    std::fs::write(d.join("xs.json"), serde_json::to_string(&xs).unwrap()).unwrap();
+    assert_eq!(run_script(&d, "main.qwe").trim(), "done");
+    let server = std::fs::read_to_string(d.join("out.txt")).unwrap();
+    let js = format!(
+        r#"const xs = {};
+const plain = (v) => {{
+  const s = String(v), at = s.indexOf("e");
+  if (at < 0) return s;
+  const neg = s[0] === "-", exp = Number(s.slice(at + 1));
+  const [whole, part = ""] = s.slice(neg ? 1 : 0, at).split(".");
+  const digits = whole + part, point = whole.length + exp;
+  return (neg ? "-" : "") + (point <= 0 ? "0." + "0".repeat(-point) + digits : point >= digits.length ? digits + "0".repeat(point - digits.length) : digits.slice(0, point) + "." + digits.slice(point));
+}};
+const json = xs.map((s) => {{ const t = JSON.stringify(Number(s)); return /[.e]/.test(t) ? t : t + ".0"; }});
+const text = xs.map((s) => {{ const x = Number(s); return Number.isInteger(x) && Math.abs(x) < 1e16 ? x.toFixed(1) : plain(x); }});
+console.log(json.concat(text).join("\n"));"#,
+        serde_json::to_string(&xs).unwrap()
+    );
+    let o = support::node(&js).expect("node");
+    let node = String::from_utf8_lossy(&o.stdout);
+    let (got, want): (Vec<&str>, Vec<&str>) = (server.lines().collect(), node.lines().collect());
+    assert_eq!(got.len(), 2 * xs.len(), "{}", &server[..server.len().min(400)]);
+    let differ: Vec<String> = (0..got.len()).filter(|&i| got[i] != want[i]).take(5).map(|i| format!("{}: {} / {}", xs[i % xs.len()], got[i], want[i])).collect();
+    assert!(differ.is_empty(), "the server / Node: {:?}", differ);
+}
+
+// Q-781: `json.stringify` turned to an exponent from 1e16 up and below 1e-5, JavaScript from
+// 1e21 and below 1e-6. Each boundary and the float either side, both signs, as JavaScript writes
+// them; a whole float keeps its `.0` (so it reads back as a float, -0.0 its sign); inf and NaN are
+// null; ints and indented text as before; what is written reads back as the same floats.
+#[test]
+fn json_stringify_turns_to_an_exponent_where_javascript_does() {
+    let src = r#"let xs = [1e16, 9999999999999998.0, 1e20, 1e21, 999999999999999900000.0, 1.0000000000000001e21, 1e-6, 1.5e-6, 9.999999999999997e-7, 0.0000010000000000000002, 1e-7, -1e21, -1.5e-6, -1e-7, 2.0, -0.0, 0.0, 1e300, 5e-324, 1.7976931348623157e308, 123e-20, 0.1, 100000.0]
+print(json.stringify(xs))
+let back = json.parse(json.stringify(xs))
+print(back == xs, unique(back | map(type_of)), str(back[15]), str(back[4]))
+print(json.stringify([float("inf"), float("-inf"), float("nan"), []]))
+print(json.stringify({ a: 1e16, b: [1.5e-6] }, true))
+print(json.stringify([10000000000000000, 9223372036854775807, -1, 0]))
+"#;
+    let (ok, out) = check(src);
+    assert!(ok, "{}", out);
+    let d = dir("q781", src);
+    let out = run_script(&d, "main.qwe");
+    let want = "[10000000000000000.0,9999999999999998.0,100000000000000000000.0,1e+21,999999999999999900000.0,1.0000000000000001e+21,0.000001,0.0000015,9.999999999999997e-7,0.0000010000000000000002,1e-7,-1e+21,-0.0000015,-1e-7,2.0,-0.0,0.0,1e+300,5e-324,1.7976931348623157e+308,1.23e-18,0.1,100000.0]
+true [\"float\"] -0.0 999999999999999900000
+[null,null,null,[]]
+{
+  \"a\": 10000000000000000.0,
+  \"b\": [
+    0.0000015
+  ]
+}
+[10000000000000000,9223372036854775807,-1,0]
+";
+    assert_eq!(out, want);
+}
+
+// ---- end of slice 9 ----
+
 /// A component with a builtin's errors in each place they become text, and one the program
 /// wrote: `json` with `json.parse`'s, whose message the two sides word differently.
 fn errors_program(json: bool) -> String {
@@ -1429,9 +2208,9 @@ fn the_browser_half_of_a_test_shows_errors_as_the_interpreter() {
     let (s, b) = both();
     assert_eq!(s, r#"[err("not an int: \"abc\""), err("mine"), err(err("not an int: \"x\"")), "{\"k\":{\"error\":\"not an int: \\\"y\\\"\"}}"]"#);
     assert_eq!(b, s);
-    quillo::value::HIDING.store(true, std::sync::atomic::Ordering::Relaxed);
-    let (s, b) = both();
-    quillo::value::HIDING.store(false, std::sync::atomic::Ordering::Relaxed);
+    // Hidden on this test's thread alone: set for the process, the other tests' errors were hidden
+    // while it ran (found in review of slice 9).
+    let (s, b) = quillo::value::hiding_here(true, both);
     assert_eq!(s, r#"[err("internal error"), err("mine"), err(err("internal error")), "{\"k\":{\"error\":\"internal error\"}}"]"#);
     assert_eq!(b, s);
 }

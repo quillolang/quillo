@@ -1038,8 +1038,9 @@ pub fn test_script(it: &Interp, name: &str) -> Result<String, QuilloError> {
         program.push('\n');
     }
     // Errors shown as the interpreter here shows them: in full, but in a server's
-    // (FEEDBACK55.md, Q-773; branch feedback55).
-    if !crate::value::HIDING.load(std::sync::atomic::Ordering::Relaxed) {
+    // (FEEDBACK55.md, Q-773; branch feedback55); as on this thread (`value::hiding_here`), so a
+    // test hides them for itself alone (found in review).
+    if !crate::value::hiding() {
         program.push_str("ERRORS_SHOWN = true;\n");
     }
     let _ = writeln!(
@@ -1912,9 +1913,12 @@ fn lit_js(l: &Lit) -> String {
 }
 
 /// A float as JavaScript. JSON has no `inf`: `1e999` is inf on the server, and
-/// was null here (FEEDBACK16.md, Q-120; branch feedback20-fixes).
+/// was null here (FEEDBACK16.md, Q-120; branch feedback20-fixes). A whole one is an Fl, as the
+/// runtime keeps one, or `2.0` would be the int 2 (FEEDBACK55.md, Q-775; branch feedback55).
 fn float_js(f: f64) -> String {
-    if f.is_finite() {
+    if f.is_finite() && f.fract() == 0.0 {
+        format!("new W.Fl({:?})", f)
+    } else if f.is_finite() {
         format!("{:?}", f)
     } else if f.is_nan() {
         "NaN".into()
@@ -1934,7 +1938,7 @@ fn value_js(v: &Value) -> String {
         match v {
             Value::Dec(_) => false,
             Value::Int(n) => n.unsigned_abs() <= (1 << 53) - 1,
-            Value::Float(f) => f.is_finite(),
+            Value::Float(f) => f.is_finite() && f.fract() != 0.0,
             Value::List(l) => l.iter().all(exact),
             // In a JSON literal `__proto__` sets the prototype, and the key is
             // lost (FEEDBACK16.md, Q-119; branch feedback20-fixes).
@@ -2415,7 +2419,10 @@ impl<'a> Compiler<'a> {
                     .iter()
                     .map(|t| match t.as_str() {
                         "int" => Some(format!("Number.isInteger({})", js)),
-                        "float" | "num" => Some(format!("typeof {} === \"number\"", js)),
+                        // A whole float is an Fl, and a whole number an int (FEEDBACK55.md, Q-775;
+                        // branch feedback55).
+                        "float" => Some(format!("(typeof {0} === \"number\" ? !Number.isInteger({0}) : {0} instanceof W.Fl)", js)),
+                        "num" => Some(format!("typeof {} === \"number\"", js)),
                         "str" => Some(format!("typeof {} === \"string\"", js)),
                         "date" => Some(format!("B.date.valid({}, \"date\")", js)),
                         "bool" => Some(format!("typeof {} === \"boolean\"", js)),
@@ -3031,6 +3038,19 @@ impl<'a> Compiler<'a> {
 
     fn expr(&mut self, e: &Expr) -> Result<String, QuilloError> {
         Ok(match e {
+            // A whole float made once, beside the markup's blocks: `if s > 1000000000.0` made an Fl
+            // each time round a loop (found in review of FEEDBACK55.md's Q-775; branch feedback55).
+            Expr::Lit(Lit::Float(f)) if f.is_finite() && f.fract() == 0.0 => {
+                let made = format!(" = {};", float_js(*f));
+                match self.blocks.iter().find(|b| b.starts_with("const $fl") && b.ends_with(&made)) {
+                    Some(b) => b["const ".len()..b.find(" = ").unwrap()].to_string(),
+                    None => {
+                        let name = format!("$fl{}", self.blocks.len());
+                        self.blocks.push(format!("const {}{}", name, made));
+                        name
+                    }
+                }
+            }
             Expr::Lit(l) => lit_js(l),
             Expr::Template(parts) => {
                 let mut out = Vec::new();
@@ -3132,19 +3152,8 @@ impl<'a> Compiler<'a> {
             }
             Expr::Coalesce(a, b) => {
                 let t = self.temp();
-                let x = self.expr(a)?;
+                let x = self.guarded_left(a)?;
                 let y = self.expr(b)?;
-                // A stop on the left is guarded against too, as on the server
-                // (FEEDBACK25.md, Q-318; branch feedback26-fixes). Not for a name or a
-                // field, which is most of them. Something that cannot wait stays
-                // without a wait, or a handler would lose its place.
-                let plain = matches!(&**a, Expr::Ident(..) | Expr::Lit(_) | Expr::Field(..) | Expr::Index(..));
-                let x = if plain {
-                    x
-                } else {
-                    let body = format!("try {{ return {x}; }} catch (e) {{ return W.guarded(e); }}");
-                    if x.contains("await ") { self.iife(&body) } else { format!("(() => {{ {body} }})()") }
-                };
                 format!("((({t} = {x}) === null || {t} === undefined || {t} instanceof W.Err) ? {y} : {t})")
             }
             Expr::Pipe(lhs, rhs, line) => {
@@ -3185,27 +3194,8 @@ impl<'a> Compiler<'a> {
                     return Ok(format!("B.js_value({})", js_str(&path)));
                 }
                 let o = self.expr(obj)?;
-                let mut fb = self.fallback(name);
-                // `x.js` is no call of `js` with the name x holds.
-                if fb == "B.js" || fb == "B.js_new" {
-                    fb = "null".into();
-                }
-                // Read only if the field is missing: a `let n` beside `x.n` must not
-                // make this depend on `n` (FEEDBACK25.md, Q-310; branch feedback26-fixes).
-                if fb.ends_with(".v") || fb.starts_with("$p.") {
-                    fb = format!("new W.Later(() => {})", fb);
-                }
-                // Names Object.prototype has need the careful check for a
-                // map's own key; any other is read directly when present.
-                const PROTO: &[&str] = &[
-                    "constructor", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toLocaleString", "toString",
-                    "valueOf", "__proto__", "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__",
-                ];
-                if PROTO.contains(&name.as_str()) {
-                    format!("W.field({}, {}, {})", o, js_str(name), fb)
-                } else {
-                    format!("W.fieldp({}, {}, {})", o, js_str(name), fb)
-                }
+                let (f, fb) = self.field_read(name);
+                format!("{}({}, {}, {})", f, o, js_str(name), fb)
             }
             Expr::Index(obj, idx, line) => {
                 self.line = *line;
@@ -3390,6 +3380,56 @@ impl<'a> Compiler<'a> {
             format!("(await {})", call)
         } else {
             call
+        }
+    }
+
+    /// How `x.name` is read: the runtime's function, and what it falls back on.
+    fn field_read(&mut self, name: &str) -> (&'static str, String) {
+        let mut fb = self.fallback(name);
+        // `x.js` is no call of `js` with the name x holds.
+        if fb == "B.js" || fb == "B.js_new" {
+            fb = "null".into();
+        }
+        // Read only if the field is missing: a `let n` beside `x.n` must not
+        // make this depend on `n` (FEEDBACK25.md, Q-310; branch feedback26-fixes).
+        if fb.ends_with(".v") || fb.starts_with("$p.") {
+            fb = format!("new W.Later(() => {})", fb);
+        }
+        // Names Object.prototype has need the careful check for a
+        // map's own key; any other is read directly when present.
+        const PROTO: &[&str] = &[
+            "constructor", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toLocaleString", "toString",
+            "valueOf", "__proto__", "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__",
+        ];
+        (if PROTO.contains(&name) { "W.field" } else { "W.fieldp" }, fb)
+    }
+
+    /// The left of `??`, a stop anywhere in it guarded against, as on the server (FEEDBACK25.md,
+    /// Q-318; branch feedback26-fixes). A name or a literal cannot stop. A field or an index read
+    /// through `W.tryq`, with no function made each time, what they read guarded the same way:
+    /// they were left unguarded, and `v("abc").foo ?? "none"` stopped (FEEDBACK55.md, Q-782;
+    /// branch feedback55). Something that cannot wait stays without a wait, or a handler would
+    /// lose its place.
+    fn guarded_left(&mut self, e: &Expr) -> Result<String, QuilloError> {
+        match e {
+            Expr::Ident(..) | Expr::Lit(_) => self.expr(e),
+            Expr::Field(obj, name, line) if self.lib_path(e)?.is_none() => {
+                self.line = *line;
+                let o = self.guarded_left(obj)?;
+                let (f, fb) = self.field_read(name);
+                Ok(format!("W.tryq({}, {}, {}, {})", f, o, js_str(name), fb))
+            }
+            Expr::Index(obj, idx, line) => {
+                self.line = *line;
+                let o = self.guarded_left(obj)?;
+                let i = self.guarded_left(idx)?;
+                Ok(format!("W.tryq(W.index, {}, {})", o, i))
+            }
+            _ => {
+                let x = self.expr(e)?;
+                let body = format!("try {{ return {x}; }} catch (e) {{ return W.guarded(e); }}");
+                Ok(if x.contains("await ") { self.iife(&body) } else { format!("(() => {{ {body} }})()") })
+            }
         }
     }
 
@@ -4369,7 +4409,39 @@ impl<'a> Compiler<'a> {
             }
         }
         self.line = el.line;
-        Ok(format!("[{}, [{}], [{}], [{}]]", js_str(&el.tag), fixed_attrs.join(", "), kids.join(", "), holes.join(", ")))
+        // The order the server writes its attributes in, where the browser's would be another (the
+        // fixed ones, then the holes): what markup made into text writes (see `nodeHtml`; found in
+        // review of FEEDBACK55.md's Q-779; branch feedback55).
+        let name_of = |part: &str, at: usize| -> Option<String> { part.splitn(3, ", ").nth(at).map(|n| n.trim_matches(|c| c == '"' || c == '[').to_string()) };
+        let made: Vec<String> = fixed_attrs
+            .iter()
+            .filter_map(|f| name_of(f, 0))
+            .chain(holes.iter().filter_map(|h| match h.as_bytes().get(1) {
+                Some(b'0') => name_of(h, 1),
+                Some(b'1') => Some("class".into()),
+                _ => None,
+            }))
+            .collect();
+        let mut source_order: Vec<String> = Vec::new();
+        if el.id.is_some() {
+            source_order.push("id".into());
+        }
+        if !el.classes.is_empty() || el.attrs.iter().any(|(n, _)| n == "class") {
+            source_order.push("class".into());
+        }
+        for (n, v) in &el.attrs {
+            let n = n.strip_prefix("bind:").unwrap_or(n);
+            if !matches!(v, AttrVal::Spread(_)) && !n.starts_with('@') && n != "key" && n != "class" && !source_order.iter().any(|w| w == n) {
+                source_order.push(n.to_string());
+            }
+        }
+        source_order.retain(|w| made.contains(w));
+        let order = if made.iter().filter(|m| source_order.contains(m)).eq(source_order.iter()) {
+            String::new()
+        } else {
+            format!(", [{}]", source_order.iter().map(|w| js_str(w)).collect::<Vec<_>>().join(", "))
+        };
+        Ok(format!("[{}, [{}], [{}], [{}]{}]", js_str(&el.tag), fixed_attrs.join(", "), kids.join(", "), holes.join(", "), order))
     }
 }
 

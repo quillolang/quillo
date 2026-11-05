@@ -449,7 +449,8 @@ impl Dec {
         if !f.is_finite() {
             return None;
         }
-        Dec::parse_rounded(&format!("{:e}", f))
+        // The browser's digits: the even one of two as near (FEEDBACK55.md, Q-777; found in review).
+        Dec::parse_rounded(&crate::value::shortest_e(f))
     }
 
     /// The nearest float (from the text, so correctly rounded).

@@ -2913,12 +2913,22 @@ fn round(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         return Ok(Value::Float((x * p).round() / p));
     }
-    Ok(to_int_or_float(x.round()))
+    Ok(whole_of(&args).unwrap_or_else(|| to_int_or_float(x.round())))
+}
+
+/// An int, which `round`, `floor` and `ceil` give back as it is: past 2^53 it went through a
+/// float, `ceil(9007199254740993)` a float of another number, where the browser gives the int
+/// (FEEDBACK55.md, Q-776; branch feedback55).
+fn whole_of(args: &[Value]) -> Option<Value> {
+    matches!(args.first(), Some(Value::Int(_))).then(|| args[0].clone())
 }
 
 fn floor(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if let Value::Dec(d) = arg(&args, 0) {
         return round_dec(d, &[Value::Nil, Value::Int(0), Value::str("floor")], line);
+    }
+    if let Some(n) = whole_of(&args) {
+        return Ok(n);
     }
     Ok(to_int_or_float(num_arg(&args, 0, "floor", line)?.floor()))
 }
@@ -2926,6 +2936,9 @@ fn floor(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn ceil(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if let Value::Dec(d) = arg(&args, 0) {
         return round_dec(d, &[Value::Nil, Value::Int(0), Value::str("ceiling")], line);
+    }
+    if let Some(n) = whole_of(&args) {
+        return Ok(n);
     }
     Ok(to_int_or_float(num_arg(&args, 0, "ceil", line)?.ceil()))
 }

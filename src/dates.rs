@@ -493,9 +493,20 @@ fn zone(args: &[Value], i: usize, f: &str, line: u32) -> Result<Zone, Ctrl> {
         }
     }
     match jiff::tz::TimeZone::get(name) {
-        Ok(tz) => Ok(Zone::Named(tz)),
-        Err(_) => fail(line, format!("`{}`: unknown time zone {}", f, got(Some(v)))),
+        Ok(tz) if !not_a_zone(name) => Ok(Zone::Named(tz)),
+        _ => fail(line, format!("`{}`: unknown time zone {}", f, got(Some(v)))),
     }
+}
+
+/// What the system's copy of the time zone database holds, or jiff knows, that is no zone the
+/// browser knows: `posixrules` (a file, the rules for a POSIX TZ string), `Factory`, CLDR's
+/// `Etc/Unknown`, and what a Linux tzdata has besides: `localtime` (this machine's zone) and the
+/// copies under `posix/` and `right/` (with leap seconds). A zone is a name of the IANA database, a
+/// zone's or a link's, in any case, on both sides; runtime.js's `NOT_ZONES` is the other half
+/// (FEEDBACK55.md, Q-782; branch feedback55).
+fn not_a_zone(name: &str) -> bool {
+    let folded = name.to_ascii_lowercase();
+    ["posixrules", "factory", "etc/unknown", "localtime"].contains(&folded.as_str()) || folded.starts_with("posix/") || folded.starts_with("right/")
 }
 
 /// The zone's offset at an instant (seconds since 1970, UTC). jiff's times end
