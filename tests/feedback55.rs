@@ -684,3 +684,698 @@ fn under_the_debugger_the_bundle_hides_as_the_server() {
     drop(stdin);
     drop(guard);
 }
+
+// ---- Q-701 to Q-705: what the program's files give away, and what it may write -----------------
+
+/// What `quillo run` prints for a script in `d`, under a deadline.
+fn run_script(d: &Path, file: &str) -> String {
+    run_script_with(d, file, &[])
+}
+
+fn run_script_with(d: &Path, file: &str, args: &[&str]) -> String {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .arg(file)
+        .args(args)
+        .current_dir(d)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the script did not end");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let o = child.wait_with_output().unwrap();
+    String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)
+}
+
+/// `quillo serve folder` in `d`, until the guard is dropped, and its port.
+fn serve_folder(d: &Path, folder: &str) -> (support::Guard, u16) {
+    let port = support::free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .args(["serve", folder, "--port", &port.to_string()])
+        .current_dir(d)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let g = support::Guard::new(child);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !support::listening(port) {
+        assert!(std::time::Instant::now() < deadline, "quillo serve did not start");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    (g, port)
+}
+
+#[cfg(unix)]
+fn link(to: &str, at: &Path) {
+    std::os::unix::fs::symlink(to, at).unwrap();
+}
+
+/// Each path's status, and that no answer gives the secret away.
+fn statuses(port: u16, want: &[(&str, u16)], secret: &str) {
+    for (path, status) in want {
+        let a = support::send(port, "GET", path, &[], "");
+        assert_eq!(a.status, *status, "{}: {}", path, a.body);
+        assert!(!a.body.contains(secret), "{} gave {:?} away: {}", path, secret, a.body);
+    }
+}
+
+// Q-701: `files` judged the name asked for, not where it led: `settings.txt -> ../.env` served
+// the settings and `notes.txt -> ../main.qwe` the program. Now what a link leads to is judged as
+// a name is, however many links lead there, a second hard link to the settings or the program is
+// one of them, and a link to an ordinary file in the folder still serves it. A file kept back is
+// a miss, with the folder's page for one.
+#[cfg(unix)]
+#[test]
+fn files_judges_a_link_by_where_it_leads() {
+    let d = dir(
+        "links",
+        "route GET /s/*p = files(\"public\", p)\nroute GET /x/*p = files(\"site\", p)\nroute GET /p/*p = files(\"pub2\", p)\nroute GET /f = file(\"public/docs2/index.html\")\n",
+    );
+    for f in ["public/docs", "public/docs2", "public/sub", "public/.well-known", "pub2", "conf", ".git"] {
+        std::fs::create_dir_all(d.join(f)).unwrap();
+    }
+    // A folder `--allow-path` names: an index there through a link is not served by `files`, as a
+    // link there named itself is not; `file` serves it, named on purpose.
+    let outside = support::temp_dir("feedback55-links-outside");
+    std::fs::write(outside.join("out.html"), "outside page").unwrap();
+    link(&outside.join("out.html").to_string_lossy(), &d.join("public/docs2/index.html"));
+    link(&outside.join("out.html").to_string_lossy(), &d.join("public/ext.html"));
+    std::fs::write(d.join("pub2/404.html"), "missing page").unwrap();
+    link("../.env", &d.join("pub2/settings.txt"));
+    for (f, text) in [(".env", "SECRET=1\n"), ("public/ok.txt", "ok"), ("public/sub/index.html", "sub"), ("public/page.html", "page"), ("public/docs/real.html", "real"), ("public/.well-known/acme.txt", "acme"), ("conf/app.json", "{}"), ("conf/.env", "SECRET=2\n"), (".git/config", "[core] SECRET\n"), ("lib.qwe", "fn SECRET() = 1\n"), ("Plug.RS", "// SECRET\n"), ("ünï.txt", "unicode")] {
+        std::fs::write(d.join(f), text).unwrap();
+    }
+    let p = d.join("public");
+    for (to, at) in [
+        ("../.env", "settings.txt"),
+        ("../main.qwe", "notes.txt"),
+        ("../.ENV", "upper.txt"),
+        ("../LIB.QWE", "lib.txt"),
+        ("../Plug.RS", "plug.txt"),
+        ("ok.txt", "alias.txt"),
+        ("ok.txt", "c1.txt"),
+        ("c1.txt", "c2.txt"),
+        ("e2.txt", "e1.txt"),
+        ("../.env", "e2.txt"),
+        ("nowhere.txt", "gone.txt"),
+        ("../.git", "repo"),
+        ("..", "up"),
+        ("../conf", "conf"),
+        ("../../.env", "docs/index.html"),
+        ("../.env", "about.html"),
+        ("../.env", "404.html"),
+        ("../ünï.txt", "ünï-link.txt"),
+    ] {
+        link(to, &p.join(at));
+    }
+    link("public", &d.join("site"));
+    std::fs::hard_link(d.join(".env"), d.join("public/hard-env.txt")).unwrap();
+    std::fs::hard_link(d.join("main.qwe"), d.join("public/hard-src.txt")).unwrap();
+    let s = support::serve_with(&d.join("main.qwe"), &["--allow-path", &outside.to_string_lossy()]);
+    statuses(
+        s.port,
+        &[
+            // Through a link to the settings, the program, a hidden folder, or a name of Quillo's
+            // in another case.
+            ("/s/settings.txt", 404),
+            ("/s/notes.txt", 404),
+            ("/s/upper.txt", 404),
+            ("/s/lib.txt", 404),
+            ("/s/plug.txt", 404),
+            ("/s/e1.txt", 404),
+            ("/s/repo/config", 404),
+            ("/s/repo", 404),
+            ("/s/repo/", 404),
+            ("/s/up/.env", 404),
+            ("/s/up/main.qwe", 404),
+            ("/s/conf/.env", 404),
+            ("/s/gone.txt", 404),
+            ("/s/hard-env.txt", 404),
+            ("/s/hard-src.txt", 404),
+            ("/s/ext.html", 404),
+            ("/s/ext", 404),
+            // An index, a name found with its extension and the page of a miss are judged too.
+            ("/s/docs/", 404),
+            ("/s/docs2/", 404),
+            ("/s/about", 404),
+            ("/s/missing", 404),
+            ("/x/settings.txt", 404),
+            // What stays: a link to a file of the folder's, a chain of them, a name of its own.
+            ("/s/alias.txt", 200),
+            ("/s/c2.txt", 200),
+            ("/s/ok.txt", 200),
+            ("/s/docs/real.html", 200),
+            ("/s/up/public/ok.txt", 200),
+            ("/s/conf/app.json", 200),
+            ("/s/.well-known/acme.txt", 200),
+            ("/s/%C3%BCn%C3%AF-link.txt", 200),
+            // A folder that is itself a link serves what it holds, `.well-known` too.
+            ("/s/sub/", 200),
+            ("/s/page", 200),
+            ("/x/ok.txt", 200),
+            ("/x/sub/", 200),
+            ("/x/.well-known/acme.txt", 200),
+        ],
+        "SECRET",
+    );
+    assert_eq!(support::send(s.port, "GET", "/s/c2.txt", &[], "").body, "ok");
+    assert_eq!(support::send(s.port, "GET", "/x/sub/", &[], "").body, "sub");
+    assert_eq!(support::send(s.port, "GET", "/s/%C3%BCn%C3%AF-link.txt", &[], "").body, "unicode");
+    assert_eq!(support::send(s.port, "GET", "/s/missing", &[], "").body, "not found");
+    for path in ["/p/settings.txt", "/p/nothing.txt"] {
+        let a = support::send(s.port, "GET", path, &[], "");
+        assert_eq!((a.status, a.body.as_str()), (404, "missing page"), "{}", path);
+    }
+    let a = support::send(s.port, "GET", "/f", &[], "");
+    assert_eq!((a.status, a.body.as_str()), (200, "outside page"));
+    // `quillo serve` is `files`: the same, and the `.env` of the folder it serves is known by
+    // identity too.
+    let (_g, port) = serve_folder(&d, ".");
+    statuses(port, &[("/public/settings.txt", 404), ("/public/notes.txt", 404), ("/public/e1.txt", 404), ("/public/hard-env.txt", 404), ("/public/alias.txt", 200), ("/public/c2.txt", 200)], "SECRET");
+}
+
+// Q-702: `files(".", path)` served the SQLite database the program had open, and its `-wal` with
+// the password hashes in it, in any case. Now `files` serves no SQLite database, by its first
+// bytes: the program's under any name, case, normalization, link or hard link, a tenant's not
+// opened since the start, another program's, one no one has open (`file` serves one named on
+// purpose); nor its `-wal`, `-shm` or `-journal`. `quillo serve` the same, beside a program that
+// runs or is stopped. A name ending as a journal's beside a file that is no database is served.
+#[cfg(unix)]
+#[test]
+fn files_serves_no_sqlite_database() {
+    let d = dir(
+        "databases",
+        r#"db.open("app.db")
+db.exec("create table if not exists users (email text, password_hash text)")
+db.exec("insert into users values ('alice@example.com', 'HASHVALUE')")
+let other = db.connect("données.data")
+other.exec("create table if not exists t (x int)")
+let tenants = db.connect("t/{tenant}.db")
+route GET /late {
+    let c = db.connect("late/l.db")
+    c.exec("create table if not exists t (x int)")
+    "opened"
+}
+route GET /s/*p = files("public", p)
+route GET /r/*path = files(".", path)
+route GET /f = file("closed.db")
+route POST /into ? { to: str } {
+    save_upload(request.files.doc, to) ?? "refused"
+}
+"#,
+    );
+    for f in ["public", "late", "t"] {
+        std::fs::create_dir_all(d.join(f)).unwrap();
+    }
+    let sqlite = |name: &str, rows: &str| {
+        let c = rusqlite::Connection::open(d.join(name)).unwrap();
+        c.execute_batch(&format!("create table x (a text); insert into x values ('{}')", rows)).unwrap();
+    };
+    std::fs::write(d.join("index.html"), "<p>home</p>").unwrap();
+    // Databases no one has open: one of its own, a tenant's, and one with a journal beside it.
+    sqlite("closed.db", "HASHVALUE-CLOSED");
+    sqlite("t/acme.db", "HASHVALUE-TENANT");
+    sqlite("old.db", "HASHVALUE-OLD");
+    std::fs::write(d.join("old.db-journal"), b"HASHVALUE").unwrap();
+    std::fs::write(d.join("old.db-shm"), b"HASHVALUE").unwrap();
+    // Files that only look so: names ending as a journal's beside notes, or alone; a text about
+    // the format; and the first bytes of a log and of a journal under names of their own.
+    std::fs::write(d.join("public/travel"), "notes").unwrap();
+    std::fs::write(d.join("public/travel-journal"), "notes").unwrap();
+    std::fs::write(d.join("notes-journal"), "notes").unwrap();
+    std::fs::write(d.join("-wal"), "only an ending").unwrap();
+    std::fs::write(d.join("about.txt"), "SQLite format 3 is a file format").unwrap();
+    std::fs::write(d.join("log.bin"), [0x37, 0x7f, 0x06, 0x82, 0, 0, 0, 0]).unwrap();
+    std::fs::write(d.join("j.bin"), [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7, b'H']).unwrap();
+    link("../app.db", &d.join("public/data.bin"));
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    std::fs::hard_link(d.join("app.db"), d.join("public/backup.bin")).unwrap();
+    std::fs::copy(d.join("app.db"), d.join("app.db.bak")).unwrap();
+    std::fs::write(d.join("app.dbx"), "x").unwrap();
+    assert_eq!(support::send(s.port, "GET", "/late", &[], "").body, "opened");
+    let kept = [
+        "/r/app.db",
+        "/r/APP.DB",
+        "/r/App.Db",
+        "/r/app.db-wal",
+        "/r/APP.DB-WAL",
+        "/r/app.db-shm",
+        "/r/app.db-Shm",
+        "/s/data.bin",
+        "/s/backup.bin",
+        "/r/app.db.bak",
+        "/r/donn%C3%A9es.data",
+        "/r/donne%CC%81es.data",
+        "/r/late/l.db",
+        "/r/late/L.DB-WAL",
+        "/r/t/acme.db",
+        "/r/t/ACME.DB",
+        "/r/closed.db",
+        "/r/old.db",
+        "/r/old.db-journal",
+        "/r/old.db-shm",
+        "/r/log.bin",
+        "/r/j.bin",
+        "/r/main.qwe",
+    ];
+    statuses(s.port, &kept.iter().map(|p| (*p, 404)).collect::<Vec<_>>(), "HASHVALUE");
+    let served = ["/s/travel", "/s/travel-journal", "/r/notes-journal", "/r/-wal", "/r/about.txt", "/r/app.dbx", "/r/index.html"];
+    for path in served {
+        assert_eq!(support::send(s.port, "GET", path, &[], "").status, 200, "{}", path);
+    }
+    // A visitor's upload makes no tenant's database, opened or not; a path of another shape is
+    // a file like another.
+    let upload = |to: &str| {
+        let body = "--B\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"x\"\r\nContent-Type: text/plain\r\n\r\nSQLite format 3\r\n--B--\r\n";
+        support::send(s.port, "POST", &format!("/into?to={}", enc(to)), &[("Content-Type", "multipart/form-data; boundary=B")], body).body
+    };
+    for to in ["t/new.db", "t/acme.db", "t/ACME.DB-WAL", "T/Other.Db", "app.db-journal", "late/l.db"] {
+        assert_eq!(upload(to), "refused", "{}", to);
+    }
+    for to in ["t/sub/x.db", "t2/x.db", "t/x.dbx"] {
+        assert_eq!(upload(to), to, "{}", to);
+    }
+    // `file` serves one named on purpose.
+    let f = support::send(s.port, "GET", "/f", &[], "");
+    assert!(f.status == 200 && f.body.starts_with("SQLite format 3"), "{}", f.status);
+    // `quillo serve .` beside the running program, and once it has stopped.
+    let quillo_serve = |running: bool| {
+        let (_g, port) = serve_folder(&d, ".");
+        statuses(port, &[("/app.db", 404), ("/APP.DB", 404), ("/app.db-wal", 404), ("/t/acme.db", 404), ("/closed.db", 404), ("/public/backup.bin", 404), ("/old.db-journal", 404)], "HASHVALUE");
+        for path in ["/index.html", "/app.dbx", "/public/travel-journal"] {
+            assert_eq!(support::send(port, "GET", path, &[], "").status, 200, "{} (running: {})", path, running);
+        }
+    };
+    quillo_serve(true);
+    let mut s = s;
+    s.kill();
+    quillo_serve(false);
+}
+
+// Q-703: `check_program` on a visitor's code read `.env` and `.git/config` for a `use` and said
+// their contents back as unknown names. Now a confined check reads only Quillo files, none whose
+// name or folder starts with a dot, through a link too; what it may use is used as before.
+#[cfg(unix)]
+#[test]
+fn a_confined_check_reads_only_quillo_files() {
+    let d = dir(
+        "confined",
+        r#"fn c(code) = check_program("probe.qwe", { "probe.qwe": code })
+for code in [
+    "use \".env\"",
+    "use \".ENV\"",
+    "use \"site/.git/config\"",
+    "use \".git/config\"",
+    "use \"notes.txt\"",
+    "use \"notes.qwe\"",
+    "use \"%2eenv\"",
+    "mount /x = \".env\"",
+    "service s = \".env\"",
+    "mount /x = \"lib/p.qwer\"",
+    "use \"../x.qwe\"",
+    "use \"/etc/passwd\"",
+    "use \"%2e%2e/x.qwe\"",
+    "use \"lib.qwe\"\nprint(word())",
+    "import lib.qwe use word\nprint(word())",
+    "use \"./lib.qwe\"\nprint(word())",
+    "use \"ünï.qwe\"\nprint(üw())",
+    "import lib/p.qwer use add\nprint(add(1, 2))",
+    "",
+] {
+    print(json.stringify(c(code)))
+}
+print(check_program(".env"))
+print(check_program("notes.txt"))
+print(json.stringify(check_program("lib.qwe")))
+"#,
+    );
+    std::fs::create_dir_all(d.join("site/.git")).unwrap();
+    std::fs::create_dir_all(d.join("lib")).unwrap();
+    for (f, text) in [(".env", "DB_PASSWORD=hunter2-secret\n"), ("site/.git/config", "[core]\n\tgitconfig = 1\n"), ("notes.txt", "SECRET_TEXT = 1\n"), ("lib.qwe", "fn word() = \"w\"\n"), ("ünï.qwe", "fn üw() = 1\n"), ("lib/p.qwer", "pub fn add(a: i64, b: i64) -> i64 { a + b }\n")] {
+        std::fs::write(d.join(f), text).unwrap();
+    }
+    link(".env", &d.join("notes.qwe"));
+    let out = run_script(&d, "main.qwe");
+    for secret in ["hunter2", "secret", "gitconfig", "SECRET_TEXT", "DB_PASSWORD"] {
+        assert!(!out.contains(secret), "{} given away: {}", secret, out);
+    }
+    let lines: Vec<&str> = out.lines().collect();
+    let refused = |path: &str| format!("only Quillo files are read (.qwe, and a plugin's .qwer or .rs for `use`), none whose name or folder starts with a dot: {}", path);
+    for (i, path) in [".env", ".ENV", "site/.git/config", ".git/config", "notes.txt", "notes.qwe", "%2eenv", ".env", ".env", "lib/p.qwer"].iter().enumerate() {
+        assert!(lines[i].contains(&refused(path)) && lines[i].matches("\"message\"").count() == 1, "{}: {}", path, lines[i]);
+    }
+    assert!(lines[10].contains("path must stay inside the program's folder: ../x.qwe"), "{}", lines[10]);
+    assert!(lines[11].contains("path must stay inside the program's folder: /etc/passwd"), "{}", lines[11]);
+    assert!(lines[12].contains("cannot read %2e%2e/x.qwe"), "{}", lines[12]);
+    for (i, line) in lines[13..19].iter().enumerate() {
+        assert_eq!(*line, "[]", "use {}: {}", i, out);
+    }
+    assert_eq!(lines[19], format!("err(\"check_program: {}\")", refused(".env")));
+    assert_eq!(lines[20], format!("err(\"check_program: {}\")", refused("notes.txt")));
+    assert_eq!(lines[21], "[]");
+    // The file checked, through a link into a folder `--allow-path` names: by the name it has
+    // there.
+    let outside = support::temp_dir("feedback55-confined-outside");
+    std::fs::write(outside.join("ok.qwe"), "fn ok() = 1\n").unwrap();
+    std::fs::write(outside.join(".env"), "DB_PASSWORD=hunter2-secret\n").unwrap();
+    link(".env", &outside.join("peek.qwe"));
+    link(&outside.to_string_lossy(), &d.join("ext"));
+    std::fs::write(d.join("b.qwe"), "print(json.stringify(check_program(\"ext/ok.qwe\")))\nprint(check_program(\"ext/peek.qwe\"))\nprint(json.stringify(check_program(\"ext/gone.qwe\")))\n").unwrap();
+    let out = run_script_with(&d, "b.qwe", &["--allow-path", &outside.to_string_lossy()]);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[0], "[]", "{}", out);
+    assert_eq!(lines[1], format!("err(\"check_program: {}\")", refused("ext/peek.qwe")));
+    assert!(lines[2].contains("cannot read file") && !out.contains("hunter2"), "{}", out);
+}
+
+// Q-704: the refusal to write `.env` held only for that spelling: `.ENV` was written, and on macOS
+// read as the settings at the next start; so `.ENV.LOCAL`, `.ENV.PROD` by `image.convert`, an
+// upload named `.ENV`, and `APP.DB-JOURNAL` beside the open database. Now every rule of the
+// program's own files compares names as the file system may, and only those names.
+#[test]
+fn the_programs_own_files_are_refused_in_any_case() {
+    let d = dir(
+        "own-case",
+        r#"print(write_file(".env", "A=1"))
+print(write_file(".ENV", "ADMIN_TOKEN=attacker"))
+print(write_file(".Env", "A=1"))
+print(write_file(".ENV.LOCAL", "A=1"))
+print(write_file(".env.", "A=1"))
+print(write_file("config/.ENV", "A=1"))
+print(image.convert("tiny.png", ".ENV.PROD", { format: "png" }))
+print(delete_file(".ENV"))
+print(write_file(".envrc", "A=1"))
+print(write_file("x.env", "A=1"))
+print(write_file(".env-notes", "A=1"))
+print(write_file("ünï/.ENV", "A=1"))
+db.open("data/app.db")
+print(write_file("data/APP.DB-JOURNAL", "x"))
+print(write_file("data/App.Db-Wal", "x"))
+print(write_file("data/app.db-ſhm", "x"))
+print(write_file("data/app.db-journals", "x"))
+print(write_file("data/app.db2-journal", "x"))
+"#,
+    );
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    image::GrayImage::new(4, 4).save(d.join("tiny.png")).unwrap();
+    let out = run_script(&d, "main.qwe");
+    let lines: Vec<&str> = out.lines().collect();
+    let settings = "it is the program's settings (.env)";
+    for (i, name) in [".env", ".ENV", ".Env", ".ENV.LOCAL", ".env.", "config/.ENV"].iter().enumerate() {
+        assert_eq!(lines[i], format!("err(\"write_file: will not write {}: {}\")", name, settings), "{}", out);
+    }
+    assert_eq!(lines[6], format!("err(\"image: will not write .ENV.PROD: {}\")", settings));
+    assert_eq!(lines[7], format!("err(\"delete_file: will not delete .ENV: {}\")", settings));
+    // Not the settings: `.envrc` is direnv's, `x.env` and `.env-notes` other names.
+    assert_eq!(&lines[8..11], &["null", "null", "null"], "{}", out);
+    assert_eq!(lines[11], format!("err(\"write_file: will not write ünï/.ENV: {}\")", settings));
+    for (i, name) in ["data/APP.DB-JOURNAL", "data/App.Db-Wal", "data/app.db-ſhm"].iter().enumerate() {
+        assert_eq!(lines[12 + i], format!("err(\"write_file: will not write {}: it is the database the program has open\")", name), "{}", out);
+    }
+    assert_eq!(&lines[15..17], &["null", "null"], "{}", out);
+    let names: Vec<String> = std::fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_lowercase()).collect();
+    assert!(!names.iter().any(|n| n == ".env" || n.starts_with(".env.")), "{:?}", names);
+    assert!(!d.join("config").exists() && !d.join("ünï").exists());
+    // The next start has no settings from it.
+    std::fs::write(d.join("b.qwe"), "print(env(\"ADMIN_TOKEN\") ?? \"none\")\n").unwrap();
+    assert_eq!(run_script(&d, "b.qwe").trim(), "none");
+    // An upload, under the visitor's name or a path, in any case.
+    let u = dir(
+        "own-upload",
+        "route POST /drop {\n    let f = request.files.doc\n    save_upload(f, f.filename) ?? \"refused\"\n}\nroute POST /into ? { to: str } {\n    save_upload(request.files.doc, to) ?? \"refused\"\n}\n",
+    );
+    let s = support::serve(&u.join("main.qwe"), &[]);
+    let upload = |path: &str, name: &str| {
+        let body = format!("--B\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"{}\"\r\nContent-Type: text/plain\r\n\r\nADMIN_TOKEN=attacker\r\n--B--\r\n", name);
+        support::send(s.port, "POST", path, &[("Content-Type", "multipart/form-data; boundary=B")], &body).body
+    };
+    for name in [".ENV", ".env", ".Env.Prod", "MAIN.QWE"] {
+        assert_eq!(upload("/drop", name), "refused", "{}", name);
+    }
+    for to in ["MIGRATIONS/002.sql", "Migrations/x.sql", "./.ENV"] {
+        assert_eq!(upload(&format!("/into?to={}", enc(to)), "x.txt"), "refused", "{}", to);
+    }
+    assert_eq!(upload("/drop", "report.txt"), "report.txt");
+    assert_eq!(upload("/into?to=migrations2%2Fx.sql", "x.txt"), "migrations2/x.sql");
+    assert!(!std::fs::read_dir(&u).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().to_lowercase().starts_with(".env")));
+}
+
+// Q-704: a name as Windows takes it, on every system (a stream of `.env`, `app.db.` with its dot),
+// and a second hard link to the settings or the program, which writes into them, are refused.
+#[cfg(unix)]
+#[test]
+fn a_name_windows_shortens_and_a_hard_link_are_the_programs_files() {
+    let d = dir(
+        "own-names",
+        r#"db.open("data/app.db")
+for p in [".env::$DATA", ".env:x", "data/app.db.", "data/app.db:x", "data/app.db-wal ", "hard.txt", "src.txt", "x:y", "z.db.", "e:v", "notes:x.txt", "data/app.dbs", ":x"] {
+    let r = write_file(p, "x")
+    print(is_err(r) ? r : "written")
+}
+"#,
+    );
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    std::fs::write(d.join(".env"), "A=1\n").unwrap();
+    std::fs::hard_link(d.join(".env"), d.join("hard.txt")).unwrap();
+    std::fs::hard_link(d.join("main.qwe"), d.join("src.txt")).unwrap();
+    // Hard links whose names Windows would shorten: judged as the file they are, too.
+    rusqlite::Connection::open(d.join("data/app.db")).unwrap().execute_batch("create table t (x int)").unwrap();
+    std::fs::hard_link(d.join("data/app.db"), d.join("x:y")).unwrap();
+    std::fs::hard_link(d.join("data/app.db"), d.join("z.db.")).unwrap();
+    std::fs::hard_link(d.join(".env"), d.join("e:v")).unwrap();
+    let out = run_script(&d, "main.qwe");
+    let lines: Vec<&str> = out.lines().collect();
+    let (settings, open) = ("it is the program's settings (.env)", "it is the database the program has open");
+    for (i, (name, why)) in [(".env::$DATA", settings), (".env:x", settings), ("data/app.db.", open), ("data/app.db:x", open), ("data/app.db-wal ", open), ("hard.txt", settings), ("src.txt", "it is one of the program's own files"), ("x:y", open), ("z.db.", open), ("e:v", settings)].iter().enumerate() {
+        assert_eq!(lines[i], format!("err(\"write_file: will not write {}: {}\")", name, why), "{}", out);
+    }
+    assert_eq!(&lines[10..], &["written", "written", "written"], "{}", out);
+    assert!(std::fs::read(d.join("data/app.db")).unwrap().starts_with(b"SQLite format 3\0"));
+    assert_eq!(std::fs::read_to_string(d.join(".env")).unwrap(), "A=1\n");
+    assert!(std::fs::read_to_string(d.join("main.qwe")).unwrap().starts_with("db.open"));
+}
+
+// Q-705: `delete_file` refused the open database but deleted the folder holding it. Now a folder
+// holding a database the program has open is refused however it is named, and a folder beside it
+// is deleted as before.
+#[cfg(unix)]
+#[test]
+fn delete_file_keeps_the_folder_of_an_open_database() {
+    let d = dir(
+        "db-folder",
+        r#"import lib/a.qwe use word
+db.open("old/first.db")
+db.exec("create table if not exists t (x int)")
+db.open("data/app.db")
+db.exec("create table if not exists t (x int)")
+let other = db.connect("other/b.db")
+other.exec("create table if not exists t (x int)")
+for p in ["data/app.db", "data", "data/", "data/.", "./data", "DATA", "dlink", "other", "lib", "data/notes.txt", "data2", "dat", "ünï", "old"] {
+    print(`${p}: ${is_err(delete_file(p)) ? "refused" : "gone"}`)
+}
+print(word())
+"#,
+    );
+    for f in ["lib", "data", "other", "data2", "ünï", "old"] {
+        std::fs::create_dir_all(d.join(f)).unwrap();
+    }
+    std::fs::write(d.join("lib/a.qwe"), "fn word() = \"clinic\"\n").unwrap();
+    std::fs::write(d.join("data/notes.txt"), "n").unwrap();
+    std::fs::write(d.join("data2/x"), "x").unwrap();
+    link("data", &d.join("dlink"));
+    let out = run_script(&d, "main.qwe");
+    // The database `db.open` replaced is closed, and a file again; `db.connect`'s stays open.
+    let want = "data/app.db: refused\ndata: refused\ndata/: refused\ndata/.: refused\n./data: refused\nDATA: refused\ndlink: refused\nother: refused\nlib: refused\ndata/notes.txt: gone\ndata2: gone\ndat: gone\nünï: gone\nold: gone\nclinic\n";
+    assert_eq!(out, want);
+    assert!(d.join("data/app.db").is_file() && d.join("other/b.db").is_file() && d.join("lib/a.qwe").is_file());
+    assert!(!d.join("data/notes.txt").exists() && !d.join("data2").exists() && !d.join("ünï").exists() && !d.join("old").exists());
+}
+
+// Q-701: what `files` reads or sends of a file is the file it looked at, or one saved in its place
+// since that it would serve: a link to the settings swapped in, or a SQLite database, is not read
+// in whole, in part, by its first bytes or sent; a file saved anew (a rename over it) is.
+#[cfg(unix)]
+#[test]
+fn a_file_read_is_the_file_looked_at_or_one_served_in_its_place() {
+    use quillo::statics;
+    use std::io::Read;
+    let d = support::temp_dir("feedback55-swap");
+    let f = d.join("ok.txt");
+    std::fs::write(&f, "ok").unwrap();
+    std::fs::write(d.join(".env"), "SECRET=1").unwrap();
+    quillo::builtins::protect(&d.join(".env"), "it is the program's settings (.env)");
+    let info = statics::info(&f).unwrap();
+    assert!(info.id.is_some());
+    // Saved anew: the new file is read.
+    std::fs::write(d.join("new.txt"), "new").unwrap();
+    std::fs::rename(d.join("new.txt"), &f).unwrap();
+    assert_eq!(statics::read_range(&f, 0, 2, info.id).unwrap(), b"new");
+    assert_eq!(statics::head(&f, info.id).unwrap(), b"new");
+    assert_eq!(statics::read_if(&f, &info, |_| true).unwrap().as_deref(), Some(&b"new"[..]));
+    let send = |id| {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_secs(30))).unwrap();
+        let (server, _) = l.accept().unwrap();
+        statics::send(server, &quillo::server::plain(200, ""), (f.clone(), 0, 3, id), false);
+        let mut out = String::new();
+        client.read_to_string(&mut out).unwrap();
+        out
+    };
+    assert!(send(info.id).ends_with("\r\n\r\nnew"));
+    // A link to the settings, or a SQLite database, swapped in: not read, nor sent.
+    let info = statics::info(&f).unwrap();
+    std::fs::remove_file(&f).unwrap();
+    link(".env", &f);
+    assert!(statics::read_if(&f, &info, |_| true).is_err());
+    assert!(statics::head(&f, info.id).is_err());
+    assert!(statics::read_range(&f, 0, 1, info.id).is_err());
+    assert!(send(info.id).starts_with("HTTP/1.1 404"));
+    std::fs::remove_file(&f).unwrap();
+    std::fs::write(&f, b"SQLite format 3\0rows").unwrap();
+    assert!(statics::read_range(&f, 0, 1, info.id).is_err());
+    assert!(send(info.id).starts_with("HTTP/1.1 404"));
+    // Without a file to hold to (`file`, named on purpose), what is there is read.
+    assert_eq!(statics::read_range(&f, 0, 5, None).unwrap(), b"SQLite");
+    let m = statics::mark(&f, 0, 2, info.id);
+    assert_eq!(statics::marked(&m), Some((f.clone(), 0, 2, info.id)));
+    assert_eq!(statics::marked(&statics::mark(&f, 1, 1, None)), Some((f.clone(), 1, 1, None)));
+}
+
+// Q-701: a link into a tool's dot folder inside the folder served is followed, as before: pnpm's
+// `node_modules/htmx.org -> .pnpm/...`, a site built into `.vitepress/dist`. A path asked with a
+// dot part, a dot file, and a folder of secrets or of Quillo's state are not served that way.
+#[cfg(unix)]
+#[test]
+fn files_follows_a_link_into_a_tools_dot_folder() {
+    let d = dir("dot-folders", "route GET /nm/*p = files(\"node_modules\", p)\nroute GET /site/*p = files(\"site\", p)\nroute GET /r/*p = files(\".\", p)\n");
+    for f in ["node_modules/.pnpm/htmx.org@1.9.10/node_modules/htmx.org/dist", ".vitepress/dist", ".git", ".quillo/sites", "node_modules/.cache"] {
+        std::fs::create_dir_all(d.join(f)).unwrap();
+    }
+    for (f, text) in [
+        ("node_modules/.pnpm/htmx.org@1.9.10/node_modules/htmx.org/dist/htmx.min.js", "htmx"),
+        ("node_modules/.pnpm/htmx.org@1.9.10/node_modules/htmx.org/.npmrc", "SECRET token"),
+        (".vitepress/dist/index.html", "<p>docs</p>"),
+        (".git/config", "[core] SECRET"),
+        (".quillo/sites/shop.json", "SECRET cookies"),
+        ("node_modules/.cache/x.js", "cached"),
+    ] {
+        std::fs::write(d.join(f), text).unwrap();
+    }
+    link(".pnpm/htmx.org@1.9.10/node_modules/htmx.org", &d.join("node_modules/htmx.org"));
+    link(".cache", &d.join("node_modules/cache"));
+    link(".vitepress/dist", &d.join("site"));
+    link(".git", &d.join("docs"));
+    link(".quillo", &d.join("state"));
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    statuses(
+        s.port,
+        &[
+            ("/nm/htmx.org/dist/htmx.min.js", 200),
+            ("/nm/cache/x.js", 200),
+            ("/site/", 200),
+            ("/site/index.html", 200),
+            ("/nm/htmx.org/.npmrc", 404),
+            ("/nm/.pnpm/htmx.org@1.9.10/node_modules/htmx.org/dist/htmx.min.js", 404),
+            ("/r/docs/config", 404),
+            ("/r/state/sites/shop.json", 404),
+        ],
+        "SECRET",
+    );
+    assert_eq!(support::send(s.port, "GET", "/nm/htmx.org/dist/htmx.min.js", &[], "").body, "htmx");
+}
+
+// Q-701: the program's own files are known by number with their path: one saved anew (renamed
+// over, as an editor's safe save, `git pull` or a deploy does) leaves its old number to a file
+// that is no longer one of them, which is served and written; a `.env` saved anew is known again
+// when the program reloads.
+#[cfg(unix)]
+#[test]
+fn a_file_saved_anew_leaves_its_old_number() {
+    let d = dir("saved-anew", "import lib.qwe use word\nroute GET /s/*p = files(\"public\", p)\nroute GET /w = is_err(write_file(\"public/copy.txt\", \"x\")) ? \"refused\" : \"written\"\nroute GET / = word()\n");
+    std::fs::create_dir_all(d.join("public")).unwrap();
+    std::fs::write(d.join("lib.qwe"), "fn word() = \"one\"\n").unwrap();
+    std::fs::write(d.join(".env"), "A=1\n").unwrap();
+    std::fs::hard_link(d.join("lib.qwe"), d.join("public/copy.txt")).unwrap();
+    let s = support::serve_with(&d.join("main.qwe"), &["--reload"]);
+    assert_eq!(support::send(s.port, "GET", "/s/copy.txt", &[], "").status, 404);
+    assert_eq!(support::send(s.port, "GET", "/w", &[], "").body, "refused");
+    // `.env` saved anew, and a hard link to the new one: known once the program has reloaded.
+    std::fs::write(d.join("env.tmp"), "A=2\n").unwrap();
+    std::fs::rename(d.join("env.tmp"), d.join(".env")).unwrap();
+    std::fs::hard_link(d.join(".env"), d.join("public/settings.txt")).unwrap();
+    // lib.qwe saved anew: the old number is the copy's alone now.
+    std::fs::write(d.join("lib.tmp"), "fn word() = \"two\"\n").unwrap();
+    std::fs::rename(d.join("lib.tmp"), d.join("lib.qwe")).unwrap();
+    assert_eq!(support::send(s.port, "GET", "/s/copy.txt", &[], "").status, 200);
+    assert_eq!(support::send(s.port, "GET", "/w", &[], "").body, "written");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while support::send(s.port, "GET", "/", &[], "").body != "two" {
+        assert!(std::time::Instant::now() < deadline, "the program did not reload");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(support::send(s.port, "GET", "/s/settings.txt", &[], "").status, 404);
+}
+
+// Q-701: a large file saved anew while it is being sent again and again: every answer is whole,
+// of one version or the other, never a 404.
+#[cfg(unix)]
+#[test]
+fn a_large_file_saved_anew_while_sent_is_served() {
+    let d = dir("large-swap", "route GET /s/*p = files(\"public\", p)\n");
+    std::fs::create_dir_all(d.join("public")).unwrap();
+    let size = 2 << 20;
+    std::fs::write(d.join("public/big.bin"), vec![b'a'; size]).unwrap();
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saver = {
+        let (d, stop) = (d.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut n = 0u8;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let tmp = d.join(format!("public/big.{}.tmp", n % 2));
+                std::fs::write(&tmp, vec![if n % 2 == 0 { b'b' } else { b'a' }; size]).unwrap();
+                std::fs::rename(&tmp, d.join("public/big.bin")).unwrap();
+                n = n.wrapping_add(1);
+            }
+        })
+    };
+    for i in 0..150 {
+        let a = support::send(s.port, "GET", "/s/big.bin", &[], "");
+        assert_eq!((a.status, a.body.len()), (200, size), "request {}", i);
+        assert!(a.body.bytes().all(|b| b == b'a') || a.body.bytes().all(|b| b == b'b'), "request {} mixed two files", i);
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    saver.join().unwrap();
+}
+
+// The user's decision: `files` serves no SQLite file, and `file` serves one named on purpose, with
+// byte ranges, as a database read in the browser over HTTP (sql.js-httpvfs) asks for it.
+#[test]
+fn file_serves_a_database_named_on_purpose_in_ranges() {
+    let d = dir("db-ranges", "route GET /db = file(\"data.db\")\nroute GET /big = file(\"big.db\")\nroute GET /s/*p = files(\".\", p)\n");
+    rusqlite::Connection::open(d.join("data.db")).unwrap().execute_batch("create table t (x text); insert into t values ('row')").unwrap();
+    let mut big = b"SQLite format 3\0".to_vec();
+    big.resize(3 << 20, 7);
+    std::fs::write(d.join("big.db"), &big).unwrap();
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    for path in ["/db", "/big"] {
+        let a = support::send(s.port, "GET", path, &[("Range", "bytes=0-15")], "");
+        assert_eq!((a.status, a.body.as_str()), (206, "SQLite format 3\0"), "{}", path);
+        assert!(a.header("content-range").is_some_and(|r| r.starts_with("bytes 0-15/")), "{}", path);
+        let a = support::send(s.port, "GET", path, &[("Range", "bytes=16-16")], "");
+        assert_eq!((a.status, a.body.len()), (206, 1), "{}", path);
+        assert_eq!(support::send(s.port, "GET", path, &[], "").status, 200, "{}", path);
+    }
+    for path in ["/s/data.db", "/s/big.db"] {
+        assert_eq!(support::send(s.port, "GET", path, &[("Range", "bytes=0-15")], "").status, 404, "{}", path);
+    }
+}

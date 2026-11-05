@@ -416,12 +416,12 @@ fn byte_ranges_are_read_as_asked() {
 
 #[test]
 fn a_mark_names_a_file_only_if_this_process_made_it() {
-    let m = statics::mark(std::path::Path::new("/tmp/a:b"), 5, 10);
-    assert_eq!(statics::marked(&m), Some((std::path::PathBuf::from("/tmp/a:b"), 5, 10)));
+    let m = statics::mark(std::path::Path::new("/tmp/a:b"), 5, 10, None);
+    assert_eq!(statics::marked(&m), Some((std::path::PathBuf::from("/tmp/a:b"), 5, 10, None)));
     assert_eq!(statics::marked("nodot"), None);
     assert_eq!(statics::marked("!!!.!!!"), None);
     let (what, sig) = m.split_once('.').unwrap();
-    let other = statics::mark(std::path::Path::new("/etc/passwd"), 0, 10);
+    let other = statics::mark(std::path::Path::new("/etc/passwd"), 0, 10, None);
     assert_eq!(statics::marked(&format!("{}.{}", what, other.split_once('.').unwrap().1)), None);
     assert_eq!(statics::marked(&format!("{}.{}", other.split_once('.').unwrap().0, sig)), None);
 }
@@ -479,7 +479,7 @@ fn answer_head() -> quillo::server::HttpResponse {
 #[test]
 fn a_file_gone_before_it_is_sent_is_not_found() {
     let (mut client, server) = pair();
-    let gone = (std::path::PathBuf::from("/nonexistent/quillo/file"), 0, 10);
+    let gone = (std::path::PathBuf::from("/nonexistent/quillo/file"), 0, 10, None);
     statics::send(server, &answer_head(), gone, false);
     let mut out = String::new();
     client.read_to_string(&mut out).unwrap();
@@ -493,12 +493,12 @@ fn a_send_gives_the_part_asked_for_and_only_a_head_for_head() {
     let f = d.join("data.txt");
     std::fs::write(&f, "0123456789").unwrap();
     let (mut client, server) = pair();
-    statics::send(server, &answer_head(), (f.clone(), 3, 4), false);
+    statics::send(server, &answer_head(), (f.clone(), 3, 4, None), false);
     let mut out = String::new();
     client.read_to_string(&mut out).unwrap();
     assert!(out.contains("content-length: 4\r\n") && out.ends_with("\r\n\r\n3456"), "{}", out);
     let (mut client, server) = pair();
-    statics::send(server, &answer_head(), (f.clone(), 3, 4), true);
+    statics::send(server, &answer_head(), (f.clone(), 3, 4, None), true);
     let mut out = String::new();
     client.read_to_string(&mut out).unwrap();
     assert!(out.contains("content-length: 4\r\n") && out.ends_with("\r\n\r\n"), "{}", out);
@@ -513,7 +513,7 @@ fn a_send_ends_when_the_reader_leaves() {
     std::fs::File::create(&f).unwrap().set_len(len).unwrap();
     let (mut client, server) = pair();
     let path = f.clone();
-    let send = std::thread::spawn(move || statics::send(server, &answer_head(), (path, 0, len), false));
+    let send = std::thread::spawn(move || statics::send(server, &answer_head(), (path, 0, len, None), false));
     let mut some = [0u8; 4096];
     client.read_exact(&mut some).unwrap();
     drop(client);

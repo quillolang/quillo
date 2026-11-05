@@ -1428,6 +1428,35 @@ pub struct Options {
     pub classes: bool,
 }
 
+/// Why a confined check reads no other file (FEEDBACK55.md, Q-703; branch feedback55).
+pub(crate) const CONFINED_READS: &str = "only Quillo files are read (.qwe, and a plugin's .qwer or .rs for `use`), none whose name or folder starts with a dot";
+
+/// Whether a confined check reads `path`, at `full` under `root`, by its name: a `.qwe` file (or,
+/// for a `use`, a plugin's `.qwer` or `.rs`, of which only its functions' signatures are read),
+/// with no part of its path starting with a dot, and what a link leads to judged the same; that
+/// it stays in the folder is `stays_in`'s to say. `use ".env"` read the settings as Quillo and
+/// said their values back as unknown names, and `use "site/.git/config"` the repository's
+/// (FEEDBACK55.md, Q-703; branch feedback55).
+pub(crate) fn confined_reads(root: &Path, path: &str, full: &Path, rust: bool) -> bool {
+    let quillo = |rel: &Path| {
+        let parts: Vec<String> = rel.components().filter(|c| !matches!(c, std::path::Component::CurDir)).map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+        // Named as Quillo names them, exactly: what is let in is not widened by a case
+        // (FEEDBACK55.md, Q-703; branch feedback55).
+        let last = parts.last().map_or("", |l| l.as_str());
+        !parts.is_empty() && !parts.iter().any(|p| p.starts_with('.')) && (last.ends_with(".qwe") || (rust && crate::native::is_rust(last)))
+    };
+    if !quillo(Path::new(path)) {
+        return false;
+    }
+    match crate::builtins::leads_to(root, full) {
+        Some(Some(real)) => root.canonicalize().ok().and_then(|r| real.strip_prefix(r).ok().map(Path::to_path_buf)).is_some_and(|rel| quillo(&rel)),
+        Some(None) => true,
+        // Out of the folder, into one `--allow-path` named: by the name it has there
+        // (FEEDBACK55.md, Q-703; branch feedback55).
+        None => full.canonicalize().map_or(true, |real| real.file_name().is_some_and(|n| quillo(Path::new(n)))),
+    }
+}
+
 /// How many programs deep `mount` and `service` may lead, and files deep
 /// `use` may: past that the check stops there with an error, instead of
 /// running out of stack.
@@ -1912,12 +1941,18 @@ impl Checker {
 
     /// The file a `use`, `mount` or `service` names; when confined, none
     /// for a path that could lead outside the program's folder.
-    fn file_at(&mut self, base: &Path, path: &str, file: &Arc<str>, line: u32) -> Option<PathBuf> {
+    fn file_at(&mut self, base: &Path, path: &str, file: &Arc<str>, line: u32, rust: bool) -> Option<PathBuf> {
         let plain = !path.is_empty() && Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir));
         // Nor out of it through a link, to read a file elsewhere (FEEDBACK41.md, Q-475; branch
         // feedback40-43).
         if self.confined && (!plain || !crate::builtins::stays_in(&self.root, &base.join(path))) {
             self.diag_at(file.clone(), line, Severity::Error, format!("path must stay inside the program's folder: {}", path));
+            return None;
+        }
+        // Nor a file that is not Quillo's, or hidden, which was read and said back
+        // (FEEDBACK55.md, Q-703; branch feedback55).
+        if self.confined && !confined_reads(&self.root, path, &base.join(path), rust) {
+            self.diag_at(file.clone(), line, Severity::Error, format!("{}: {}", CONFINED_READS, path));
             return None;
         }
         Some(base.join(path))
@@ -1930,7 +1965,8 @@ impl Checker {
         // The `${name}` each file's plain strings hold (Q-510), by the file.
         let mut dollars: Vec<(String, String, String)> = Vec::new();
         self.links = crate::modules::link(Path::new(file), stmts.clone(), base, &mut |path, full| {
-            if confined && (!Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_))) || !crate::builtins::stays_in(&root, full)) {
+            // As `file_at` judges it (FEEDBACK55.md, Q-703; branch feedback55).
+            if confined && (!Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_))) || !crate::builtins::stays_in(&root, full) || !confined_reads(&root, path, full, false)) {
                 return None;
             }
             let text = overrides.get(full).cloned().map_or_else(|| crate::error::read_source(full), Ok).ok()?;
@@ -1982,7 +2018,7 @@ impl Checker {
         for s in stmts.iter() {
             if let Stmt::Service(name, prefix, path, _, line) = s {
                 self.everywhere.insert(name.clone());
-                let Some(full) = self.file_at(base, path, &file, *line) else { continue };
+                let Some(full) = self.file_at(base, path, &file, *line, false) else { continue };
                 match crate::service::offered(&full) {
                     // A service that runs elsewhere need not be here: its calls are checked when
                     // the app asks it for its functions, as it starts (FEEDBACK40.md, Q-471;
@@ -2035,7 +2071,7 @@ impl Checker {
             }
             if let Stmt::Mount(prefix, path, line) = s {
                 // A mounted program is a program of its own: check it alone.
-                let Some(full) = self.file_at(base, path, &file, *line) else { continue };
+                let Some(full) = self.file_at(base, path, &file, *line, false) else { continue };
                 if !full.is_file() {
                     self.diag_at(file.clone(), *line, Severity::Error, format!("cannot read {}: no such file", full.display()));
                 } else {
@@ -2081,7 +2117,7 @@ impl Checker {
                     }
                 }
                 let path = &crate::modules::resolve_from(base, Path::new(&*file), path);
-                let Some(full) = self.file_at(base, path, &file, *line) else { continue };
+                let Some(full) = self.file_at(base, path, &file, *line, true) else { continue };
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
                 // A `.qwer` file's names are taken by each `use` that names some (branch imports).
                 if !seen.insert(key.clone()) && (names.is_none() || !crate::native::is_rust(&path)) {

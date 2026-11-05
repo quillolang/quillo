@@ -1089,13 +1089,31 @@ fn not_found() -> Value {
 /// change with their content. Paths containing `..` or starting at `/` are
 /// refused with a 404.
 fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    file_as(it, args, line, false)
+}
+
+/// `file`; `hosted` for `files`, which serves none of the program's own files under another name
+/// and no SQLite database (see `kept_from_host`; FEEDBACK55.md, Q-701 and Q-702; branch
+/// feedback55).
+fn file_as(it: &mut Interp, args: Vec<Value>, line: u32, hosted: bool) -> R {
     let p = s_arg(&args, 0, "file", line)?;
     let rel = Path::new(&*p);
     if rel.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
         return Ok(not_found());
     }
     let Some(full) = inside(it, it.base_dir.join(rel)) else { return Ok(not_found()) };
-    let Ok(info) = crate::statics::info(&full) else { return Ok(not_found()) };
+    let Ok(mut info) = crate::statics::info(&full) else { return Ok(not_found()) };
+    // For `files`, the file looked at is the one judged, and what is read and sent; `file` reads
+    // what is there (FEEDBACK55.md, Q-701 and Q-702; branch feedback55).
+    let mut body = None;
+    if hosted {
+        match kept_from_host(it, &full, &info) {
+            Some(b) => body = b,
+            None => return Ok(not_found()),
+        }
+    } else {
+        info.id = None;
+    }
     // Options it does not know are refused, naming those it does, as a mistyped `cache` would
     // otherwise go unseen (FEEDBACK27.md, Q-331; branch feedback27-35-fixes). `download` names
     // the file a browser saves, and `type` is its content type (FEEDBACK30.md, limitations).
@@ -1180,12 +1198,12 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         match crate::statics::range(&r, info.len).filter(|_| same) {
             Some(Ok((start, end))) if large => {
                 headers.push(("content-range".into(), format!("bytes {}-{}/{}", start, end, info.len)));
-                headers.push((crate::statics::SEND_HEADER.into(), crate::statics::mark(&full, start, end - start + 1)));
+                headers.push((crate::statics::SEND_HEADER.into(), crate::statics::mark(&full, start, end - start + 1, info.id)));
                 return answer(206, headers, Vec::new());
             }
             Some(Ok((start, end))) => {
-                let from = full.clone();
-                return match it.unlocked(move || crate::statics::read_range(&from, start, end)) {
+                let (from, id) = (full.clone(), info.id);
+                return match it.unlocked(move || crate::statics::read_range(&from, start, end, id)) {
                     Ok(bytes) => {
                         headers.push(("content-range".into(), format!("bytes {}-{}/{}", start, end, info.len)));
                         answer(206, headers, bytes)
@@ -1201,14 +1219,119 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
     }
     if large {
-        headers.push((crate::statics::SEND_HEADER.into(), crate::statics::mark(&full, 0, info.len)));
+        headers.push((crate::statics::SEND_HEADER.into(), crate::statics::mark(&full, 0, info.len, info.id)));
         return answer(200, headers, Vec::new());
     }
     // Small files are kept in memory.
-    match crate::statics::read(&full, &info) {
+    match body.map_or_else(|| crate::statics::read(&full, &info), Ok) {
         Ok(b) => answer(200, headers, b.to_vec()),
         Err(_) => Ok(not_found()),
     }
+}
+
+/// What `files` serves of `full`, the file `info` is of, though its name is fine: None for one of
+/// the program's own files under another name (a second hard link to `.env`, its source or its
+/// database, a name in another normalization), or a SQLite database, open or not, the program's
+/// or another program's, by its first bytes, with its `-wal`, `-shm` or `-journal`; a tenant's not
+/// opened since the start, and the database of a program that is stopped when `quillo serve`
+/// serves its folder, too (FEEDBACK55.md, Q-701 and Q-702; branch feedback55). The bytes looked at
+/// are those served: a small file's, read once and kept only if served; a large file's first,
+/// read off the interpreter's lock.
+fn kept_from_host(it: &mut Interp, full: &Path, info: &crate::statics::Info) -> Option<Option<Arc<[u8]>>> {
+    if info.id.is_some_and(|id| own_id(id).is_some()) {
+        return None;
+    }
+    let body = if crate::statics::small(info) {
+        Some(crate::statics::read_if(full, info, |b| !crate::db::sqlite_bytes(b)).ok()??)
+    } else {
+        let (at, id) = (full.to_path_buf(), info.id);
+        let head = it.unlocked(move || crate::statics::head(&at, id)).ok()?;
+        if crate::db::sqlite_bytes(&head) {
+            return None;
+        }
+        None
+    };
+    if crate::db::journal_of(full).is_some_and(|db| crate::db::sqlite_file(&db)) {
+        return None;
+    }
+    Some(body)
+}
+
+/// Whether `files` keeps to itself the file `f` (`id`), opened in the place of the one it looked
+/// at: one of the program's own, or a SQLite database. Read from its start (FEEDBACK55.md, Q-701;
+/// branch feedback55).
+pub(crate) fn kept_open(f: &mut std::fs::File, id: Option<crate::statics::FileId>) -> bool {
+    use std::io::{Read, Seek};
+    let mut head = Vec::with_capacity(16);
+    id.is_some_and(|id| own_id(id).is_some())
+        || (&mut *f).take(16).read_to_end(&mut head).is_err()
+        || crate::db::sqlite_bytes(&head)
+        || f.seek(std::io::SeekFrom::Start(0)).is_err()
+}
+
+/// The program's own files by identity: its `.env` files and the source it loaded, so that a
+/// second hard link to one, under any name, is one of them too (FEEDBACK55.md, Q-701; branch
+/// feedback55). The databases it has open are `db`'s to say.
+/// Each with its path: a file replaced since (a save, a deploy, `git pull`) leaves its number to
+/// another, which is then no longer one of them.
+static OWN_IDS: std::sync::LazyLock<std::sync::RwLock<std::collections::HashMap<crate::statics::FileId, (std::path::PathBuf, &'static str)>>> = std::sync::LazyLock::new(Default::default);
+
+pub(crate) const OWN_SOURCE: &str = "it is one of the program's own files";
+pub(crate) const OWN_SETTINGS: &str = "it is the program's settings (.env)";
+
+/// Notes `p`, if it is there, as one of the program's own files (FEEDBACK55.md, Q-701; branch
+/// feedback55).
+pub fn protect(p: &Path, why: &'static str) {
+    if let Some(id) = std::fs::metadata(p).ok().and_then(|m| crate::statics::id_of(&m)) {
+        OWN_IDS.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id, (p.to_path_buf(), why));
+    }
+}
+
+/// Notes the settings in `dir`, its `.env` and each `.env.*` (`.env.production`), and the file
+/// `--env-file` named (FEEDBACK55.md, Q-701; branch feedback55).
+pub fn protect_settings(dir: &Path, named: Option<&Path>) {
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let n = fold_name(&e.file_name().to_string_lossy());
+        if n == ".env" || n.starts_with(".env.") {
+            protect(&e.path(), OWN_SETTINGS);
+        }
+    }
+    if let Some(f) = named {
+        protect(f, OWN_SETTINGS);
+    }
+}
+
+/// Why the file `id` is the program's own, if it is (FEEDBACK55.md, Q-701; branch feedback55).
+pub(crate) fn own_id(id: crate::statics::FileId) -> Option<&'static str> {
+    let found = OWN_IDS.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&id).cloned();
+    if let Some((path, why)) = found {
+        // Still that file, looked at off the lock; one that is not is let go.
+        if std::fs::metadata(&path).ok().and_then(|m| crate::statics::id_of(&m)) == Some(id) {
+            return Some(why);
+        }
+        let mut ids = OWN_IDS.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if ids.get(&id).is_some_and(|(p, _)| *p == path) {
+            ids.remove(&id);
+        }
+    }
+    crate::db::open_id(id).then_some(crate::db::OPEN)
+}
+
+/// A name as macOS and Windows compare names: `APP.DB` is `app.db`, `ſ` is `s`, and `é` is
+/// `é` however it is written (FEEDBACK55.md, Q-704; branch feedback55).
+pub(crate) fn fold_name(name: &str) -> String {
+    if name.is_ascii() {
+        return name.to_ascii_lowercase();
+    }
+    use unicode_normalization::UnicodeNormalization;
+    name.nfc().collect::<String>().to_uppercase().to_lowercase()
+}
+
+/// A file's name as Windows takes it: what precedes a `:` (`.env::$DATA` is `.env`'s data), and
+/// no dots or spaces at the end (`app.db.` is `app.db`); held to on every system (FEEDBACK55.md,
+/// Q-704; branch feedback55).
+pub(crate) fn name_as_taken(name: &str) -> &str {
+    name.split(':').next().unwrap_or(name).trim_end_matches(['.', ' '])
 }
 
 /// `accept_calls { keys, shared, jwt, client_cert, check }`: how calls from other services are
@@ -1351,7 +1474,9 @@ fn built_answer(path: &str, v: &Value) -> Value {
 /// host serves it. `/` and `/docs/` are their `index.html`, `/about` finds `about.html`, a folder
 /// named without its `/` is redirected to it, and a miss is the folder's `404.html` when it has
 /// one. Files whose names start with a dot are not served (but `.well-known/`), nor Quillo's own
-/// (`.qwe`, `.qwer`) (FEEDBACK36.md, Q-450; branch feedback36-39).
+/// (`.qwe`, `.qwer`) (FEEDBACK36.md, Q-450; branch feedback36-39), whether named so or reached
+/// through a link, nor a SQLite database that is open (FEEDBACK55.md, Q-701 and Q-702; branch
+/// feedback55).
 fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let dir = s_arg(&args, 0, "files", line)?;
     let path = match args.get(1) {
@@ -1387,10 +1512,33 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let rel = path.trim_matches('/');
     let hidden = hidden_path(rel);
     let base = it.base_dir.join(&*dir);
-    let serve = |it: &mut Interp, name: String| file(it, vec![Value::str(name), Value::map(file_opts.clone())], line);
+    // What a link leads to is judged as its name is: `notes.txt -> ../main.qwe` served the
+    // program's source and `settings.txt -> ../.env` its settings (FEEDBACK55.md, Q-701; branch
+    // feedback55). A link out of the folder is not served, as `stays_in` says, though it leads
+    // into a folder `--allow-path` names: an index, a name found with its extension or the page of
+    // a miss is judged as the path asked for is, which no `--allow-path` let out either; `file`
+    // serves one, named on purpose.
+    let judged = |it: &Interp, led: &Option<Option<std::path::PathBuf>>| match led {
+        None => false,
+        Some(None) => true,
+        Some(Some(real)) => !hidden_target(it, &base, real),
+    };
+    // The file itself is judged as it is read, by `kept_from_host` (FEEDBACK55.md, Q-701 and
+    // Q-702; branch feedback55).
+    let serve = |it: &mut Interp, name: String| file_as(it, vec![Value::str(name), Value::map(file_opts.clone())], line, true);
+    // Whether a file in a folder whose way there was looked at is there, and may be served, in
+    // the one look that said whether it was there: only a link, or a way with one, is followed
+    // (FEEDBACK55.md, Q-701; branch feedback55).
+    let found = |it: &Interp, full: &Path, way: &Option<Option<std::path::PathBuf>>| match std::fs::symlink_metadata(full) {
+        Ok(m) if m.is_file() && way == &Some(None) => Some(true),
+        Ok(m) if m.is_file() || (m.file_type().is_symlink() && full.is_file()) => Some(judged(it, &leads_to(&it.base_dir, full))),
+        _ => None,
+    };
     let joined = |rel: &str| if rel.is_empty() { dir.to_string() } else { format!("{}/{}", dir.trim_end_matches('/'), rel) };
     // Judged before it is looked at: whether a folder outside is there is not said (Q-475).
-    if !hidden && !rel.split('/').any(|s| s == "..") && stays_in(&it.base_dir, &base.join(rel)) {
+    let led = if hidden || rel.split('/').any(|s| s == "..") { None } else { leads_to(&it.base_dir, &base.join(rel)) };
+    let mut answer = None;
+    if judged(it, &led) {
         let target = base.join(rel);
         if target.is_dir() {
             let asked = match it.request_value() {
@@ -1407,20 +1555,28 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                     return Ok(Value::Response(Arc::new(Response { status: 301, headers: vec![("location".into(), format!("{}/{}", p, q))], body: Body::Value(Value::Nil) })));
                 }
             }
-            if target.join(&index).is_file() {
-                return serve(it, joined(&format!("{}/{}", rel, index).trim_start_matches('/').to_string()));
+            if found(it, &target.join(&index), &led) == Some(true) {
+                answer = Some(serve(it, joined(&format!("{}/{}", rel, index).trim_start_matches('/').to_string()))?);
             }
         } else if target.is_file() {
-            return serve(it, joined(rel));
+            answer = Some(serve(it, joined(rel))?);
         } else if Path::new(rel).extension().is_none() {
             for ext in &extensions {
-                if base.join(format!("{}.{}", rel, ext)).is_file() {
-                    return serve(it, joined(&format!("{}.{}", rel, ext)));
+                match found(it, &base.join(format!("{}.{}", rel, ext)), &led) {
+                    Some(true) => answer = Some(serve(it, joined(&format!("{}.{}", rel, ext)))?),
+                    Some(false) => {}
+                    None => continue,
                 }
+                break;
             }
         }
     }
-    if let Some(page) = not_found_page.filter(|p| base.join(p).is_file()) {
+    // A file kept back is a miss like another, with the folder's page for one (FEEDBACK55.md,
+    // Q-701; branch feedback55).
+    if let Some(a) = answer.filter(|a| !matches!(a, Value::Response(r) if r.status == 404)) {
+        return Ok(a);
+    }
+    if let Some(page) = not_found_page.filter(|p| base.join(p).is_file() && judged(it, &leads_to(&it.base_dir, &base.join(p)))) {
         if let Value::Response(r) = serve(it, joined(&page))? {
             if r.status == 200 {
                 let mut r = (*r).clone();
@@ -1447,6 +1603,24 @@ pub(crate) fn hidden_path(rel: &str) -> bool {
     // was `plug.rs` (found in review).
     let last = rel.rsplit('/').next().unwrap_or("").trim_end_matches(['.', ' ']).to_uppercase().to_lowercase();
     rel.split('/').enumerate().any(|(i, seg)| seg.starts_with('.') && !(i == 0 && seg == ".well-known")) || last.ends_with(".qwe") || crate::native::is_rust(&last)
+}
+
+/// Whether `files`, serving the folder `base`, keeps to itself `real`, where a link led: in that
+/// folder, a file `hidden_path` keeps by its own name, or one in a folder of secrets or of
+/// Quillo's state (`.git`, `.ssh`, `.quillo` and the like), though a tool's dot folder of the
+/// folder's is served (`node_modules/htmx.org -> .pnpm/htmx.org@1.9.10/...`, `.vitepress/dist`);
+/// out of it, in the program's, a path it keeps from there (`../.env`, `../.git/config`)
+/// (FEEDBACK55.md, Q-701; branch feedback55).
+fn hidden_target(it: &Interp, base: &Path, real: &Path) -> bool {
+    const KEPT: [&str; 7] = [".git", ".hg", ".svn", ".ssh", ".gnupg", ".aws", ".quillo"];
+    let from = |dir: &Path| dir.canonicalize().ok().and_then(|d| real.strip_prefix(d).ok().map(Path::to_path_buf));
+    if let Some(rel) = from(base) {
+        let parts: Vec<String> = rel.components().map(|c| fold_name(&c.as_os_str().to_string_lossy())).collect();
+        return parts.iter().any(|p| KEPT.contains(&name_as_taken(p))) || hidden_path(parts.last().map_or("", |l| l.as_str()));
+    }
+    let Some(rel) = from(&it.base_dir) else { return true };
+    let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    hidden_path(&parts.join("/"))
 }
 
 /// Seconds from `3600` or `"1h"` (s, m, h, d, w, y).
@@ -1827,9 +2001,17 @@ pub(crate) fn inside(it: &Interp, full: std::path::PathBuf) -> Option<std::path:
 /// which costs ten times that: a static file costs what it did. A link that leads nowhere does
 /// not stay: writing through it would make its target, wherever that is.
 pub(crate) fn stays_in(root: &Path, full: &Path) -> bool {
+    leads_to(root, full).is_some()
+}
+
+/// Where `full`, a path under `root`, leads, as `stays_in` finds it: `Some(None)` when no part
+/// of it is a link, `Some(Some(real))` when a link in it leads to `real`, under `root`, and None
+/// when it leads out of `root` or nowhere. What a link leads to is then judged as its name is
+/// (FEEDBACK55.md, Q-701; branch feedback55).
+pub(crate) fn leads_to(root: &Path, full: &Path) -> Option<Option<std::path::PathBuf>> {
     let resolved = || match (real_path(full), root.canonicalize()) {
-        (Some(real), Ok(base)) => real.starts_with(base),
-        _ => false,
+        (Some(real), Ok(base)) if real.starts_with(&base) => Some(Some(real)),
+        _ => None,
     };
     let Ok(rel) = full.strip_prefix(root) else { return resolved() };
     let mut at = root.to_path_buf();
@@ -1839,10 +2021,10 @@ pub(crate) fn stays_in(root: &Path, full: &Path) -> bool {
             Ok(m) if m.file_type().is_symlink() => return resolved(),
             Ok(_) => {}
             // What follows is not there: no link in it.
-            Err(_) => return true,
+            Err(_) => return Some(None),
         }
     }
-    true
+    Some(None)
 }
 
 /// Where `p` really is: the nearest part of it that is there, resolved, and the names after it.
@@ -1891,46 +2073,71 @@ fn allowed_path(it: &Interp, p: &str) -> Option<std::path::PathBuf> {
 /// upload saved under the visitor's name at the folder's root could otherwise replace
 /// `main.qwe` and run as the program.
 pub(crate) fn own_file(it: &Interp, full: &Path, upload: bool) -> Option<&'static str> {
-    // A file not there yet is where the nearest folder above it that is there really is, so a
-    // folder made later is judged the same as one made before.
-    let real = |p: &Path| -> std::path::PathBuf {
-        let mut rest = Vec::new();
-        let mut at = p;
-        loop {
-            if let Ok(r) = at.canonicalize() {
-                return rest.iter().rev().fold(r, |r: std::path::PathBuf, n| r.join(n));
-            }
-            match (at.parent(), at.file_name()) {
-                (Some(up), Some(n)) => {
-                    rest.push(n.to_os_string());
-                    at = up;
-                }
-                _ => return p.to_path_buf(),
-            }
-        }
-    };
-    let target = real(full);
-    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let real = real_as_made(full);
+    let name = real.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // The name as Windows takes it: `.env::$DATA` is `.env` (FEEDBACK55.md, Q-704; branch
+    // feedback55). The file of the name as written is judged too: `x:y` may be a hard link.
+    let taken = name_as_taken(&name);
+    let target = if taken.len() == name.len() || taken.is_empty() { real.clone() } else { real.with_file_name(taken) };
+    let both = if target == real { vec![&real] } else { vec![&real, &target] };
+    // In the case the file system ignores: on macOS `.ENV` was written, and read as `.env` at the
+    // next start, and so `.ENV.LOCAL`, `data/APP.DB-JOURNAL` and an upload to `MIGRATIONS/`; the
+    // same names are refused where case counts (FEEDBACK55.md, Q-704; branch feedback55).
+    let folded_path = |p: &Path| std::path::PathBuf::from(fold_name(&p.to_string_lossy()));
     // The file, or a folder that holds one (`delete_file("lib")`).
-    if it.loaded.iter().any(|f| real(f).starts_with(&target)) {
-        return Some("it is one of the program's own files");
+    let folded_target = folded_path(&target);
+    if it.loaded.iter().any(|f| folded_path(&real_as_made(f)).starts_with(&folded_target)) {
+        return Some(OWN_SOURCE);
     }
-    if name == ".env" || name.starts_with(".env.") {
-        return Some("it is the program's settings (.env)");
+    let folded = fold_name(taken);
+    if folded == ".env" || folded.starts_with(".env.") {
+        return Some(OWN_SETTINGS);
     }
-    if let Some(db) = &*crate::db::OPENED.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
-        let db = real(Path::new(db));
-        let dn = db.to_string_lossy();
-        let tn = target.to_string_lossy();
-        if target == db || ["-wal", "-shm", "-journal"].iter().any(|x| *tn == format!("{}{}", dn, x)) {
-            return Some("it is the database the program has open");
+    // One of them under another name: a second hard link writes into it (FEEDBACK55.md, Q-701;
+    // branch feedback55).
+    for f in &both {
+        if let Some(why) = std::fs::metadata(f).ok().and_then(|m| crate::statics::id_of(&m)).and_then(own_id) {
+            return Some(why);
         }
     }
-    // A program may write its own migrations; a visitor's upload may not.
-    if upload && target.starts_with(real(&it.base_dir).join("migrations")) {
+    // A database it has open, by any name, and the folder holding one (FEEDBACK55.md, Q-702 and
+    // Q-705; branch feedback55).
+    if let Some(why) = both.iter().find_map(|f| crate::db::database_file(f)) {
+        return Some(why);
+    }
+    if crate::db::opened_under(&folded_target) {
+        return Some("it holds the database the program has open");
+    }
+    // A program may write its own migrations, and its tenants' databases; a visitor's upload may
+    // not, though the tenant's has not been opened since the start (FEEDBACK55.md, Q-702; branch
+    // feedback55).
+    if upload && folded_target.starts_with(folded_path(&real_as_made(&it.base_dir).join("migrations"))) {
         return Some("it is in the program's migrations");
     }
+    if upload && crate::db::tenant_file(&folded_target) {
+        return Some("it is where a tenant's database is");
+    }
     None
+}
+
+/// Where `p` is: the nearest part of it that is there, as it really is, and the names after it,
+/// so a folder made later is judged the same as one made before (`own_file`'s, shared with `db`
+/// for its tenants' folders: FEEDBACK55.md, Q-702; branch feedback55).
+pub(crate) fn real_as_made(p: &Path) -> std::path::PathBuf {
+    let mut rest = Vec::new();
+    let mut at = p;
+    loop {
+        if let Ok(r) = at.canonicalize() {
+            return rest.iter().rev().fold(r, |r: std::path::PathBuf, n: &std::ffi::OsString| r.join(n));
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(up), Some(n)) => {
+                rest.push(n.to_os_string());
+                at = up;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
 }
 
 /// `local_path(next)`: an address on this site, as a browser would read it, or null. Tabs and
@@ -1998,6 +2205,12 @@ fn check_program(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let Some(full) = local_path(it, &p) else {
         return Ok(Value::err(Value::str(format!("check_program: path must stay inside the program's folder: {}", p))));
     };
+    // The file checked is read as Quillo too, as what it uses is: not `.env` (FEEDBACK55.md,
+    // Q-703; branch feedback55). One in a folder `--allow-path` named is the program's to name.
+    let plain = Path::new(&*p).components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+    if plain && !crate::check::confined_reads(&it.base_dir, &p, &full, false) {
+        return Ok(Value::err(Value::str(format!("check_program: {}: {}", crate::check::CONFINED_READS, p))));
+    }
     // `{ "path": "text" }`: check as if those files said that.
     let mut overrides = std::collections::HashMap::new();
     if let Some(Value::Map(m)) = args.get(1) {

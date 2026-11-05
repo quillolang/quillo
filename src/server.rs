@@ -1695,7 +1695,7 @@ fn write_first(mut stream: std::net::TcpStream, before: &[u8]) -> Option<std::ne
 
 /// Sends a large file from disk on a thread of its own (see `statics`),
 /// within the places for such sends; 503 when they are taken.
-fn send_file(resp: HttpResponse, what: (std::path::PathBuf, u64, u64), head: bool, ip: &str) -> Answer {
+fn send_file(resp: HttpResponse, what: (std::path::PathBuf, u64, u64, Option<crate::statics::FileId>), head: bool, ip: &str) -> Answer {
     let Some(place) = crate::statics::SendPlace::take(ip) else {
         let mut busy = plain(503, "too many downloads at once; try again later\n");
         busy.headers.push(("retry-after".into(), "5".into()));
@@ -2238,6 +2238,9 @@ impl App {
         let mut it = Interp::with_shared(&self.base_dir, self.shared.clone());
         it.base = self.base.clone();
         it.is_service = self.is_service;
+        // Its settings and files as they are now, a `.env` saved anew included (its files are,
+        // as they load: FEEDBACK55.md, Q-701; branch feedback55).
+        crate::builtins::protect_settings(&self.base_dir, None);
         let res = if problems.is_empty() {
             it.load_file(&self.main_file)
         } else {

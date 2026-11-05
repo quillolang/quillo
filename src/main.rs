@@ -1145,6 +1145,9 @@ fn before_the_program(file: &str, o: &RunOptions) -> Result<(), i32> {
         eprintln!("quillo: {}", e);
         return Err(2);
     }
+    // Known by identity, so a second hard link to one is not served (FEEDBACK55.md, Q-701; branch
+    // feedback55).
+    quillo::builtins::protect_settings(Path::new(file).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")), Some(&env_file.0));
     // What runs beside the program (FEEDBACK11.md, Q-079; branch
     // feedback11-fixes): started in its folder, stopped with it.
     let dir = Path::new(file).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));

@@ -1668,6 +1668,8 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
                 let dir = full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| it.base_dir.to_path_buf());
                 // Its own settings, beside its file (FEEDBACK9.md, Q-071).
                 let own = crate::dotenv::read(&dir.join(".env"));
+                // Not served under another name (FEEDBACK55.md, Q-701; branch feedback55).
+                crate::builtins::protect_settings(&dir, None);
                 let mut sub = Interp::with_shared(dir, it.shared.clone());
                 sub.services = it.services.clone();
                 sub.is_service = true;

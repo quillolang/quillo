@@ -526,7 +526,198 @@ fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
     wal(&c)?;
     // The statements a program makes, compiled once each (see `rows`).
     c.set_prepared_statement_cache_capacity(64);
+    // Kept from being written over while it is open (FEEDBACK55.md, Q-702; branch feedback55).
+    if path != ":memory:" {
+        opened(Path::new(path));
+    }
     Ok(c)
+}
+
+/// Every SQLite file the program has open (`db.open`, `db.connect`, a tenant's, `$QUILLO_DB`),
+/// as it really is, by identity and by its path folded, with how many connections have it: the
+/// program writes over none of them and deletes no folder holding one, whichever was opened last
+/// and however it is named now, in another case or through a link; one whose connections have
+/// all closed (a database `db.open` replaced, a tenant's let go) is a file again. `OPENED` was the
+/// last one only. And the targets with `{tenant}` in them, by which a visitor's upload makes no
+/// tenant's database, opened or not (FEEDBACK55.md, Q-702 and Q-705; branch feedback55).
+#[derive(Default)]
+struct Opened {
+    files: std::collections::HashMap<std::path::PathBuf, (Option<crate::statics::FileId>, String, usize)>,
+    ids: std::collections::HashMap<crate::statics::FileId, usize>,
+    folded: std::collections::BTreeMap<String, usize>,
+    templates: Vec<(String, String)>,
+}
+
+/// The program's (FEEDBACK55.md, Q-702; branch feedback55).
+static SQLITE_FILES: std::sync::LazyLock<std::sync::RwLock<Opened>> = std::sync::LazyLock::new(Default::default);
+
+fn opened_files() -> std::sync::RwLockReadGuard<'static, Opened> {
+    SQLITE_FILES.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+pub(crate) const OPEN: &str = "it is the database the program has open";
+
+/// One more connection to the SQLite file `p` (FEEDBACK55.md, Q-702; branch feedback55).
+fn opened(p: &Path) {
+    // Looked at before the lock is taken: no call to the system under it.
+    let Ok(real) = std::fs::canonicalize(p) else { return };
+    let id = std::fs::metadata(&real).ok().and_then(|m| crate::statics::id_of(&m));
+    let folded = crate::builtins::fold_name(&real.to_string_lossy());
+    let mut o = SQLITE_FILES.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(e) = o.files.get_mut(&real) {
+        e.2 += 1;
+        return;
+    }
+    if let Some(id) = id {
+        *o.ids.entry(id).or_default() += 1;
+    }
+    *o.folded.entry(folded.clone()).or_default() += 1;
+    o.files.insert(real, (id, folded, 1));
+}
+
+/// One connection fewer: the last closed, the file is no longer the program's to keep
+/// (FEEDBACK55.md, Q-702; branch feedback55).
+fn closed(p: &Path) {
+    let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut o = SQLITE_FILES.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(e) = o.files.get_mut(&real) else { return };
+    e.2 -= 1;
+    if e.2 > 0 {
+        return;
+    }
+    let Some((id, folded, _)) = o.files.remove(&real) else { return };
+    if let Some(id) = id {
+        if let Some(n) = o.ids.get_mut(&id) {
+            *n -= 1;
+            if *n == 0 {
+                o.ids.remove(&id);
+            }
+        }
+    }
+    if let Some(n) = o.folded.get_mut(&folded) {
+        *n -= 1;
+        if *n == 0 {
+            o.folded.remove(&folded);
+        }
+    }
+}
+
+// A database's connection closed, the last of it, lets the file go (FEEDBACK55.md, Q-702;
+// branch feedback55).
+impl Drop for Backend {
+    fn drop(&mut self) {
+        if let Backend::Sqlite(m) = self {
+            let c = m.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(p) = c.path().filter(|p| !p.is_empty()) {
+                closed(Path::new(p));
+            }
+        }
+    }
+}
+
+/// Notes a target with `{tenant}` in it, as the folded path before the name and after it
+/// (`/app/t/` and `.db`), wherever its folder is made later (FEEDBACK55.md, Q-702; branch
+/// feedback55).
+fn tenant_template(base: &Path, t: &str) {
+    if is_server_url(t) {
+        return;
+    }
+    let full = if Path::new(t).is_absolute() { t.to_string() } else { base.join(t).to_string_lossy().into_owned() };
+    let Some((before, after)) = full.split_once("{tenant}") else { return };
+    let (dir, lead) = before.rsplit_once(std::path::MAIN_SEPARATOR).or_else(|| before.rsplit_once('/')).unwrap_or((".", before));
+    let dir = if dir.is_empty() { std::path::MAIN_SEPARATOR_STR } else { dir };
+    let before = crate::builtins::fold_name(&crate::builtins::real_as_made(Path::new(dir)).join(lead).to_string_lossy());
+    let t = (before, crate::builtins::fold_name(after));
+    let mut o = SQLITE_FILES.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !o.templates.contains(&t) {
+        o.templates.push(t);
+    }
+}
+
+/// Whether the file `id` is a database the program has open (FEEDBACK55.md, Q-701; branch
+/// feedback55).
+pub(crate) fn open_id(id: crate::statics::FileId) -> bool {
+    opened_files().ids.contains_key(&id)
+}
+
+/// Whether bytes begin a SQLite database, its write-ahead log or its rollback journal
+/// (FEEDBACK55.md, Q-702; branch feedback55).
+pub(crate) fn sqlite_bytes(head: &[u8]) -> bool {
+    head.starts_with(b"SQLite format 3\0") || head.starts_with(&[0x37, 0x7f, 0x06, 0x82]) || head.starts_with(&[0x37, 0x7f, 0x06, 0x83]) || head.starts_with(&[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7])
+}
+
+/// Whether the file at `p` is a SQLite database, by its first bytes (FEEDBACK55.md, Q-702;
+/// branch feedback55).
+pub(crate) fn sqlite_file(p: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 16];
+    std::fs::File::open(p).and_then(|f| f.take(16).read_exact(&mut head)).is_ok() && head.starts_with(b"SQLite format 3\0")
+}
+
+/// The file whose `-wal`, `-shm` or `-journal` `p` would be, by its name as macOS and Windows
+/// take it (`APP.DB-WAL`, `app.db-ſhm`, `app.db-wal.`). Each letter of those endings folds from
+/// one letter, so the name without its ending is that many letters fewer (FEEDBACK55.md, Q-702
+/// and Q-704; branch feedback55).
+pub(crate) fn journal_of(p: &Path) -> Option<std::path::PathBuf> {
+    let name = p.file_name()?.to_string_lossy();
+    let name = crate::builtins::name_as_taken(&name);
+    let low = crate::builtins::fold_name(name);
+    let suffix = ["-wal", "-shm", "-journal"].into_iter().find(|s| low.ends_with(s))?;
+    let cut = name.char_indices().rev().nth(suffix.len() - 1).map(|(i, _)| i).filter(|&i| i > 0)?;
+    Some(p.with_file_name(&name[..cut]))
+}
+
+/// Why `p` (a path as `builtins::real_as_made` gives it) is no file for the program to write, if
+/// it is a database it has open, or the `-wal`, `-shm` or `-journal` of one or of another SQLite
+/// database beside it, by its name in any case; what is a second hard link to one is
+/// `builtins::own_id`'s to say (FEEDBACK55.md, Q-702 and Q-704; branch feedback55). A database no
+/// connection has open is a file like another. Costs a look in memory while the program has none
+/// open, but for a journal's name.
+pub(crate) fn database_file(p: &Path) -> Option<&'static str> {
+    let journal = journal_of(p);
+    if !opened_files().files.is_empty() {
+        // Folded and looked at before the lock is taken again: no call to the system under it.
+        let low = crate::builtins::fold_name(&p.to_string_lossy());
+        let stem = journal.as_deref().map(|j| (crate::builtins::fold_name(&j.to_string_lossy()), std::fs::metadata(j).ok().and_then(|m| crate::statics::id_of(&m))));
+        let o = opened_files();
+        let ours = |(low, id): &(String, Option<crate::statics::FileId>)| o.folded.contains_key(low) || id.is_some_and(|id| o.ids.contains_key(&id));
+        if o.folded.contains_key(&low) || stem.as_ref().is_some_and(ours) {
+            return Some(OPEN);
+        }
+    }
+    // Only a SQLite database's: `travel-journal` beside the notes `travel` is a file
+    // (FEEDBACK55.md, Q-702; branch feedback55).
+    journal.filter(|db| sqlite_file(db)).map(|_| "it is the journal of the SQLite database beside it")
+}
+
+/// Whether a database the program has open is in the folder `dir`, folded (FEEDBACK55.md, Q-705;
+/// branch feedback55).
+pub(crate) fn opened_under(dir: &Path) -> bool {
+    let mut prefix = dir.to_string_lossy().into_owned();
+    if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
+        prefix.push(std::path::MAIN_SEPARATOR);
+    }
+    opened_files().folded.range(prefix.clone()..).next().is_some_and(|(k, _)| k.starts_with(&prefix))
+}
+
+/// Whether `p`, folded, is where a target with `{tenant}` puts a tenant's database (or its
+/// journal): one name in the place of `{tenant}` (FEEDBACK55.md, Q-702; branch feedback55).
+pub(crate) fn tenant_file(p: &Path) -> bool {
+    let o = opened_files();
+    if o.templates.is_empty() {
+        return false;
+    }
+    let s = p.to_string_lossy();
+    let mut forms = vec![&*s];
+    forms.extend(["-wal", "-shm", "-journal"].iter().filter_map(|x| s.strip_suffix(x)));
+    o.templates.iter().any(|(before, after)| {
+        forms.iter().any(|f| {
+            f.len() > before.len() + after.len() && f.starts_with(before.as_str()) && f.ends_with(after.as_str()) && {
+                let name = &f[before.len()..f.len() - after.len()];
+                !name.contains(['/', std::path::MAIN_SEPARATOR])
+            }
+        })
+    })
 }
 
 /// Puts a database in WAL mode, safely when several connections (several
@@ -640,6 +831,7 @@ fn backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
     }
     let target = std::env::var("QUILLO_DB").unwrap_or_else(|_| ":memory:".into());
     if target.contains("{tenant}") {
+        tenant_template(&it.base_dir, &target);
         let t = Arc::new(TenantDbs::new(Target::Text(target)));
         *it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(DbSlot::PerTenant(t.clone()));
         return tenant_backend(it, &t);
@@ -1359,7 +1551,10 @@ fn slot_for(it: &mut Interp, args: &[Value], f: &str, line: u32) -> Result<Resul
         return Ok(Ok(DbSlot::One(b)));
     }
     match args.first() {
-        Some(Value::Str(t)) if t.contains("{tenant}") => Ok(Ok(DbSlot::PerTenant(Arc::new(TenantDbs::new(Target::Text(t.to_string())))))),
+        Some(Value::Str(t)) if t.contains("{tenant}") => {
+            tenant_template(&it.base_dir, t);
+            Ok(Ok(DbSlot::PerTenant(Arc::new(TenantDbs::new(Target::Text(t.to_string()))))))
+        }
         Some(Value::Str(t)) => Ok(open_backend(it, t).map(|b| DbSlot::One(Arc::new(b)))),
         // Where each tenant's database is, opened when its tenant first uses it.
         Some(fv @ (Value::Func(_) | Value::Builtin(..))) => Ok(Ok(DbSlot::PerTenant(Arc::new(TenantDbs::new(Target::Fn(fv.clone())))))),

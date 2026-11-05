@@ -2139,6 +2139,9 @@ impl Interp {
         let src = crate::error::read_source(path)
             .map_err(|e| QuilloError::new(format!("cannot read {}: {}", path.display(), e), 0))?;
         if let Ok(p) = path.canonicalize() {
+            // Known by identity too, as a second hard link to it is it (FEEDBACK55.md, Q-701;
+            // branch feedback55).
+            crate::builtins::protect(&p, crate::builtins::OWN_SOURCE);
             Arc::make_mut(&mut self.loaded).insert(p);
         }
         self.note_link(path);
@@ -2232,6 +2235,8 @@ impl Interp {
                 if !Arc::make_mut(&mut self.loaded).insert(key.clone()) && (names.is_none() || !crate::native::is_rust(&path)) {
                     return Ok(Value::Nil);
                 }
+                // By identity too (FEEDBACK55.md, Q-701; branch feedback55).
+                crate::builtins::protect(&key, crate::builtins::OWN_SOURCE);
                 // Rust: built, loaded, and its functions defined (see `native`).
                 if crate::native::is_rust(&path) {
                     let fname = full.display().to_string();

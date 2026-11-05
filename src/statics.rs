@@ -85,6 +85,44 @@ pub struct Info {
     /// `last_modified` as seconds since 1970.
     pub modified: i64,
     mtime: u128,
+    /// Which file it is: what is read or sent must still be it (FEEDBACK55.md, Q-701; branch
+    /// feedback55).
+    pub id: Option<FileId>,
+}
+
+/// A file as the system tells it from others, by its device and inode, whatever its name or
+/// the links to it: what `files` holds against the program's own files, and what a file read or
+/// sent must still be, so that a link swapped in after the look is not followed (FEEDBACK55.md,
+/// Q-701 and Q-702; branch feedback55). None where the system gives no such numbers.
+pub type FileId = (u64, u64);
+
+/// The file a look at it found (FEEDBACK55.md, Q-701; branch feedback55). None on Windows:
+/// stable Rust gives no file index there, so it has only the checks by name and by content.
+pub fn id_of(m: &std::fs::Metadata) -> Option<FileId> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = m;
+        None
+    }
+}
+
+/// `full` opened, for `files` (an `id`): if it is another file than the one looked at, put in its
+/// place since (a save, a deploy, or a link to the settings swapped in), it is opened only if
+/// `files` serves it, as `builtins::kept_open` says (FEEDBACK55.md, Q-701; branch feedback55).
+fn open_as(full: &Path, id: Option<FileId>) -> std::io::Result<std::fs::File> {
+    let mut f = std::fs::File::open(full)?;
+    if id.is_some() {
+        let now = id_of(&f.metadata()?);
+        if now != id && crate::builtins::kept_open(&mut f, now) {
+            return Err(std::io::ErrorKind::NotFound.into());
+        }
+    }
+    Ok(f)
 }
 
 pub fn info(full: &Path) -> std::io::Result<Info> {
@@ -113,7 +151,7 @@ pub fn info(full: &Path) -> std::io::Result<Info> {
     let secs = (mtime / 1_000_000_000) as u64;
     // The key of the copy in memory: the time, and the file's identity above it.
     let key = (mtime & u64::MAX as u128) | ((path_hash as u128) << 64);
-    Ok(Info { len: m.len(), etag, last_modified: crate::httpd::http_date(secs), modified: secs as i64, mtime: key })
+    Ok(Info { len: m.len(), etag, last_modified: crate::httpd::http_date(secs), modified: secs as i64, mtime: key, id: id_of(&m) })
 }
 
 /// The whole file, from memory when it is small and unchanged.
@@ -124,16 +162,19 @@ pub fn read(full: &Path, info: &Info) -> std::io::Result<Arc<[u8]>> {
             return Ok(b);
         }
     }
-    let b: Arc<[u8]> = Arc::from(std::fs::read(full)?);
+    let mut b = Vec::with_capacity(info.len.min(SMALL) as usize);
+    open_as(full, info.id)?.read_to_end(&mut b)?;
+    let b: Arc<[u8]> = Arc::from(b);
     if info.len <= SMALL {
         put(&mut lock(&FILES), FILES_BUDGET, key, b.clone());
     }
     Ok(b)
 }
 
-/// Bytes `start..=end` of the file.
-pub fn read_range(full: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
-    let mut f = std::fs::File::open(full)?;
+/// Bytes `start..=end` of the file, if it is still `id` (FEEDBACK55.md, Q-701; branch
+/// feedback55).
+pub fn read_range(full: &Path, start: u64, end: u64, id: Option<FileId>) -> std::io::Result<Vec<u8>> {
+    let mut f = open_as(full, id)?;
     f.seek(SeekFrom::Start(start))?;
     let mut out = vec![0; (end - start + 1) as usize];
     f.read_exact(&mut out)?;
@@ -151,25 +192,62 @@ fn send_key() -> &'static [u8] {
     KEY.get_or_init(|| crate::crypto::secret_bytes(32))
 }
 
-/// The mark for bytes `start..start + len` of a file.
-pub fn mark(full: &Path, start: u64, len: u64) -> String {
-    let what = format!("{}:{}:{}", start, len, full.display());
+/// Whether the file is small enough to be kept in memory (`files` reads it whole to judge it:
+/// FEEDBACK55.md, Q-702; branch feedback55).
+pub fn small(info: &Info) -> bool {
+    info.len <= SMALL
+}
+
+/// `read` of a small file for `files`, if `ok` takes its bytes: only then are they kept, so a file
+/// refused fills no memory (FEEDBACK55.md, Q-702; branch feedback55).
+pub fn read_if(full: &Path, info: &Info, ok: impl Fn(&[u8]) -> bool) -> std::io::Result<Option<Arc<[u8]>>> {
+    let key = (full.to_path_buf(), info.len, info.mtime);
+    if let Some(b) = get(&mut lock(&FILES), FILES_BUDGET, &key) {
+        return Ok(ok(&b).then_some(b));
+    }
+    let mut b = Vec::with_capacity(info.len.min(SMALL) as usize);
+    open_as(full, info.id)?.read_to_end(&mut b)?;
+    if !ok(&b) {
+        return Ok(None);
+    }
+    let b: Arc<[u8]> = Arc::from(b);
+    put(&mut lock(&FILES), FILES_BUDGET, key, b.clone());
+    Ok(Some(b))
+}
+
+/// The first bytes of a file (up to 16), for `files`: what says a SQLite database (FEEDBACK55.md,
+/// Q-702; branch feedback55).
+pub fn head(full: &Path, id: Option<FileId>) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(16);
+    open_as(full, id)?.take(16).read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// The mark for bytes `start..start + len` of a file; with an `id`, for `files`, the file looked
+/// at, which is what is sent (FEEDBACK55.md, Q-701; branch feedback55).
+pub fn mark(full: &Path, start: u64, len: u64, id: Option<FileId>) -> String {
+    let id = id.map_or(String::new(), |(d, i)| format!("{}-{}", d, i));
+    let what = format!("{}:{}:{}:{}", start, len, id, full.display());
     let sig = crate::crypto::hmac_sha256(send_key(), what.as_bytes());
     format!("{}.{}", crate::crypto::b64url(what.as_bytes()), crate::crypto::b64url(&sig))
 }
 
 /// What a mark names, if this process made it.
-pub fn marked(v: &str) -> Option<(PathBuf, u64, u64)> {
+pub fn marked(v: &str) -> Option<(PathBuf, u64, u64, Option<FileId>)> {
     let (what, sig) = v.split_once('.')?;
     let what = crate::crypto::unb64url(what)?;
     if !crate::crypto::same(&crate::crypto::hmac_sha256(send_key(), &what), &crate::crypto::unb64url(sig)?) {
         return None;
     }
     let what = String::from_utf8(what).ok()?;
-    let mut parts = what.splitn(3, ':');
+    let mut parts = what.splitn(4, ':');
     let start = parts.next()?.parse().ok()?;
     let len = parts.next()?.parse().ok()?;
-    Some((PathBuf::from(parts.next()?), start, len))
+    let id = match parts.next()? {
+        "" => None,
+        id => id.split_once('-').and_then(|(d, i)| Some((d.parse().ok()?, i.parse().ok()?))),
+    };
+    Some((PathBuf::from(parts.next()?), start, len, id))
 }
 
 /// Large files being sent at once, in all and to one address: each holds a
@@ -242,12 +320,12 @@ fn keeps_place(took: Duration, sent: u64) -> bool {
 
 /// Answers on a connection of its own: `resp`'s head, then `len` bytes of
 /// the file from `start` (none for `HEAD`), and closes it.
-pub fn send(mut stream: std::net::TcpStream, resp: &crate::server::HttpResponse, (path, start, len): (PathBuf, u64, u64), head: bool) {
+pub fn send(mut stream: std::net::TcpStream, resp: &crate::server::HttpResponse, (path, start, len, id): (PathBuf, u64, u64, Option<FileId>), head: bool) {
     use std::io::Write;
     // A reader that stopped reading lets the thread go.
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
     let mut out = Vec::with_capacity(512);
-    let file = std::fs::File::open(&path).and_then(|mut f| f.seek(SeekFrom::Start(start)).map(|_| f));
+    let file = open_as(&path, id).and_then(|mut f| f.seek(SeekFrom::Start(start)).map(|_| f));
     let Ok(f) = file else {
         crate::httpd::write_response(&mut out, &crate::server::plain_response(404, "not found\n"), head, true);
         let _ = stream.write_all(&out);
