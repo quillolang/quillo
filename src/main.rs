@@ -934,6 +934,11 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
             return Err(2);
         }
     }
+    // The key is not served under any name, nor written over; the certificate is public
+    // (FEEDBACK55.md, Q-701; branch feedback55).
+    if let Some(key) = quillo::wt::TLS_KEY.get() {
+        quillo::builtins::protect_named(key, quillo::builtins::OWN_TLS_KEY);
+    }
     // Query stats: on in development, else when asked (branch query-stats).
     if o.watch || std::env::var("QUILLO_QUERY_STATS").is_ok_and(|v| v == "1" || v == "true") {
         quillo::querystats::ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);

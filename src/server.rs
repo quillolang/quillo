@@ -1714,7 +1714,7 @@ fn write_first(mut stream: std::net::TcpStream, before: &[u8]) -> Option<std::ne
 
 /// Sends a large file from disk on a thread of its own (see `statics`),
 /// within the places for such sends; 503 when they are taken.
-fn send_file(resp: HttpResponse, what: (std::path::PathBuf, u64, u64, Option<crate::statics::FileId>), head: bool, ip: &str) -> Answer {
+fn send_file(resp: HttpResponse, what: (std::path::PathBuf, u64, u64, Option<crate::statics::Hosted>), head: bool, ip: &str) -> Answer {
     // Only what is sent is counted: a HEAD sends no body, so it is answered here, where eight
     // large sends to the client had it refused (FEEDBACK55.md, Q-725; branch feedback55).
     if head {

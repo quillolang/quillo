@@ -1201,92 +1201,144 @@ print(word())
     assert!(!d.join("data/notes.txt").exists() && !d.join("data2").exists() && !d.join("ünï").exists() && !d.join("old").exists());
 }
 
-// Q-701: what `files` reads or sends of a file is the file it looked at, or one saved in its place
-// since that it would serve: a link to the settings swapped in, or a SQLite database, is not read
-// in whole, in part, by its first bytes or sent; a file saved anew (a rename over it) is.
+// Q-701: a file is read as it was looked at: one saved anew in between (renamed over, with
+// another length) is looked at again, not read under the other's head; one opened is a file of
+// bytes, and a FIFO in its place does not hold the reader. A large file's mark for `files` names
+// the folders it judged and the file's tag, and what is sent is the file opened, judged again:
+// one put in the place of the judged is sent whole with its own head, and one that leads out of
+// the folder, to the settings, or is a database, is a 404.
 #[cfg(unix)]
 #[test]
-fn a_file_read_is_the_file_looked_at_or_one_served_in_its_place() {
+fn a_file_is_read_and_sent_as_it_was_looked_at() {
     use quillo::statics;
     use std::io::Read;
     let d = support::temp_dir("feedback55-swap");
-    let f = d.join("ok.txt");
+    let public = d.join("public");
+    std::fs::create_dir_all(&public).unwrap();
+    let f = public.join("ok.txt");
     std::fs::write(&f, "ok").unwrap();
-    std::fs::write(d.join(".env"), "SECRET=1").unwrap();
-    quillo::builtins::protect(&d.join(".env"), "it is the program's settings (.env)");
     let info = statics::info(&f).unwrap();
-    assert!(info.id.is_some());
-    // Saved anew: the new file is read.
-    std::fs::write(d.join("new.txt"), "new").unwrap();
-    std::fs::rename(d.join("new.txt"), &f).unwrap();
-    assert_eq!(statics::read_range(&f, 0, 2, info.id).unwrap(), b"new");
-    assert_eq!(statics::head(&f, info.id).unwrap(), b"new");
-    assert_eq!(statics::read_if(&f, &info, |_| true).unwrap().as_deref(), Some(&b"new"[..]));
-    let send = |id| {
+    std::fs::write(public.join("new.tmp"), "a longer one").unwrap();
+    std::fs::rename(public.join("new.tmp"), &f).unwrap();
+    assert!(statics::read(&f, &info).is_err_and(|e| statics::is_changed(&e)));
+    let now = statics::info(&f).unwrap();
+    assert_eq!(&*statics::read(&f, &now).unwrap(), b"a longer one");
+    assert_eq!(statics::read_range(&f, 2, 7).unwrap(), b"longer");
+    // A FIFO is no file, and opening it does not wait for a writer.
+    let fifo = public.join("pipe");
+    let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let at = fifo.clone();
+    std::thread::spawn(move || tx.send(statics::open_regular(&at).is_err()).unwrap());
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(true));
+    assert!(statics::info(&fifo).is_err());
+    // Where the file opened really is, through a link.
+    link("ok.txt", &public.join("alias.txt"));
+    let (opened, _) = statics::open_regular(&public.join("alias.txt")).unwrap();
+    assert_eq!(statics::path_of(&opened).map(|p| p.canonicalize().unwrap()), Some(f.canonicalize().unwrap()));
+    // The mark, and the send.
+    let hosted = statics::Hosted { served: public.clone(), program: d.clone(), etag: now.etag.clone() };
+    let m = statics::mark(&f, 0, now.len, Some(&hosted));
+    assert_eq!(statics::marked(&m), Some((f.clone(), 0, now.len, Some(hosted.clone()))));
+    assert_eq!(statics::marked(&statics::mark(&f, 1, 1, None)), Some((f.clone(), 1, 1, None)));
+    let send = |what: (std::path::PathBuf, u64, u64, Option<statics::Hosted>)| {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
         client.set_read_timeout(Some(std::time::Duration::from_secs(30))).unwrap();
         let (server, _) = l.accept().unwrap();
-        statics::send(server, &quillo::server::plain(200, ""), (f.clone(), 0, 3, id), false);
+        let mut head = quillo::server::plain(206, "");
+        head.headers.push(("etag".into(), now.etag.clone()));
+        head.headers.push(("content-range".into(), "bytes 2-7/12".into()));
+        statics::send(server, &head, what, false);
         let mut out = String::new();
         client.read_to_string(&mut out).unwrap();
         out
     };
-    assert!(send(info.id).ends_with("\r\n\r\nnew"));
-    // A link to the settings, or a SQLite database, swapped in: not read, nor sent.
-    let info = statics::info(&f).unwrap();
-    std::fs::remove_file(&f).unwrap();
-    link(".env", &f);
-    assert!(statics::read_if(&f, &info, |_| true).is_err());
-    assert!(statics::head(&f, info.id).is_err());
-    assert!(statics::read_range(&f, 0, 1, info.id).is_err());
-    assert!(send(info.id).starts_with("HTTP/1.1 404"));
-    std::fs::remove_file(&f).unwrap();
-    std::fs::write(&f, b"SQLite format 3\0rows").unwrap();
-    assert!(statics::read_range(&f, 0, 1, info.id).is_err());
-    assert!(send(info.id).starts_with("HTTP/1.1 404"));
-    // Without a file to hold to (`file`, named on purpose), what is there is read.
-    assert_eq!(statics::read_range(&f, 0, 5, None).unwrap(), b"SQLite");
-    let m = statics::mark(&f, 0, 2, info.id);
-    assert_eq!(statics::marked(&m), Some((f.clone(), 0, 2, info.id)));
-    assert_eq!(statics::marked(&statics::mark(&f, 1, 1, None)), Some((f.clone(), 1, 1, None)));
+    let out = send((f.clone(), 2, 6, Some(hosted.clone())));
+    assert!(out.starts_with("HTTP/1.1 206") && out.ends_with("\r\n\r\nlonger"), "{}", out);
+    // Saved anew, shorter, since the mark: the whole new file, with its own length and tag.
+    std::fs::write(public.join("new.tmp"), "short").unwrap();
+    std::fs::rename(public.join("new.tmp"), &f).unwrap();
+    let out = send((f.clone(), 2, 6, Some(hosted.clone())));
+    let fresh = statics::info(&f).unwrap();
+    assert!(out.starts_with("HTTP/1.1 200") && out.contains("content-length: 5\r\n") && out.contains(&fresh.etag) && !out.contains("content-range") && out.ends_with("\r\n\r\nshort"), "{}", out);
+    // A link swapped in: out of the folder, to the settings, or to a database.
+    let outside = support::temp_dir("feedback55-swap-outside");
+    std::fs::write(outside.join("id_rsa"), "SECRET key").unwrap();
+    std::fs::write(d.join(".env"), "SECRET=1").unwrap();
+    std::fs::write(d.join("app.db"), b"SQLite format 3\0rows").unwrap();
+    for to in [outside.join("id_rsa"), d.join(".env"), d.join("app.db")] {
+        std::fs::remove_file(&f).unwrap();
+        link(&to.to_string_lossy(), &f);
+        let out = send((f.clone(), 0, 5, Some(hosted.clone())));
+        assert!(out.starts_with("HTTP/1.1 404") && !out.contains("SECRET") && !out.contains("rows"), "{}: {}", to.display(), out);
+    }
+    // `file`, named on purpose, sends what is there.
+    assert!(send((f.clone(), 0, 6, None)).ends_with("SQLite"));
 }
 
-// Q-701: a link into a tool's dot folder inside the folder served is followed, as before: pnpm's
-// `node_modules/htmx.org -> .pnpm/...`, a site built into `.vitepress/dist`. A path asked with a
-// dot part, a dot file, and a folder of secrets or of Quillo's state are not served that way.
+// Q-701: a link into a build tool's output inside the folder served is followed, as before: pnpm's
+// `node_modules/htmx.org -> .pnpm/...`, sites built into `.vitepress/dist`, `.output/public`,
+// `.next/static`, `.vercel/output/static`. Every other dot folder may hold secrets and is not
+// served through a link: `.vscode/sftp.json`, `.config/git/credentials`, `.git`, `.quillo`'s
+// cookies, `.cache`, a tool's server code beside its output; nor a path asked with a dot part.
 #[cfg(unix)]
 #[test]
-fn files_follows_a_link_into_a_tools_dot_folder() {
+fn files_follows_a_link_into_a_tools_output_only() {
     let d = dir("dot-folders", "route GET /nm/*p = files(\"node_modules\", p)\nroute GET /site/*p = files(\"site\", p)\nroute GET /r/*p = files(\".\", p)\n");
-    for f in ["node_modules/.pnpm/htmx.org@1.9.10/node_modules/htmx.org/dist", ".vitepress/dist", ".git", ".quillo/sites", "node_modules/.cache"] {
-        std::fs::create_dir_all(d.join(f)).unwrap();
-    }
-    for (f, text) in [
+    let files = [
         ("node_modules/.pnpm/htmx.org@1.9.10/node_modules/htmx.org/dist/htmx.min.js", "htmx"),
         ("node_modules/.pnpm/htmx.org@1.9.10/node_modules/htmx.org/.npmrc", "SECRET token"),
+        ("node_modules/.cache/x.js", "SECRET cached"),
         (".vitepress/dist/index.html", "<p>docs</p>"),
+        (".output/public/app.js", "app"),
+        (".output/server/index.mjs", "SECRET server"),
+        (".next/static/chunk.js", "chunk"),
+        (".next/server/page.js", "SECRET server"),
+        (".vercel/output/static/v.js", "v"),
+        (".vscode/sftp.json", "{\"password\": \"SECRET\"}"),
+        (".config/git/credentials", "https://u:SECRET@example.com"),
         (".git/config", "[core] SECRET"),
         (".quillo/sites/shop.json", "SECRET cookies"),
-        ("node_modules/.cache/x.js", "cached"),
-    ] {
+    ];
+    for (f, text) in files {
+        std::fs::create_dir_all(d.join(f).parent().unwrap()).unwrap();
         std::fs::write(d.join(f), text).unwrap();
     }
-    link(".pnpm/htmx.org@1.9.10/node_modules/htmx.org", &d.join("node_modules/htmx.org"));
-    link(".cache", &d.join("node_modules/cache"));
-    link(".vitepress/dist", &d.join("site"));
-    link(".git", &d.join("docs"));
-    link(".quillo", &d.join("state"));
+    for (to, at) in [
+        (".pnpm/htmx.org@1.9.10/node_modules/htmx.org", "node_modules/htmx.org"),
+        (".cache", "node_modules/cache"),
+        (".vitepress/dist", "site"),
+        (".output/public/app.js", "app.js"),
+        (".output/server/index.mjs", "server.mjs"),
+        (".next/static/chunk.js", "chunk.js"),
+        (".next/server/page.js", "page.js"),
+        (".vercel/output/static/v.js", "v.js"),
+        (".vscode/sftp.json", "sftp.json"),
+        (".config/git", "gitconf"),
+        (".git", "docs"),
+        (".quillo", "state"),
+    ] {
+        link(to, &d.join(at));
+    }
     let s = support::serve(&d.join("main.qwe"), &[]);
     statuses(
         s.port,
         &[
             ("/nm/htmx.org/dist/htmx.min.js", 200),
-            ("/nm/cache/x.js", 200),
             ("/site/", 200),
             ("/site/index.html", 200),
+            ("/r/app.js", 200),
+            ("/r/chunk.js", 200),
+            ("/r/v.js", 200),
             ("/nm/htmx.org/.npmrc", 404),
             ("/nm/.pnpm/htmx.org@1.9.10/node_modules/htmx.org/dist/htmx.min.js", 404),
+            ("/nm/cache/x.js", 404),
+            ("/r/server.mjs", 404),
+            ("/r/page.js", 404),
+            ("/r/sftp.json", 404),
+            ("/r/gitconf/credentials", 404),
             ("/r/docs/config", 404),
             ("/r/state/sites/shop.json", 404),
         ],
@@ -1295,36 +1347,72 @@ fn files_follows_a_link_into_a_tools_dot_folder() {
     assert_eq!(support::send(s.port, "GET", "/nm/htmx.org/dist/htmx.min.js", &[], "").body, "htmx");
 }
 
-// Q-701: the program's own files are known by number with their path: one saved anew (renamed
-// over, as an editor's safe save, `git pull` or a deploy does) leaves its old number to a file
-// that is no longer one of them, which is served and written; a `.env` saved anew is known again
-// when the program reloads.
+// Q-701: the program's own files are known by number with when they were made: a second hard link
+// to one keeps being one when the file is saved anew (renamed over: an editor's safe save, `git
+// pull`, a deploy) and keeps what it held, the old settings above all; a source file's old
+// version stops being one when the program has loaded the new. A `.env` saved anew, or made
+// later, and the file `--env-file` names, are judged by what is at their paths, with or without
+// a reload; and the TLS key is the program's own.
 #[cfg(unix)]
 #[test]
-fn a_file_saved_anew_leaves_its_old_number() {
+fn a_file_saved_anew_is_judged_as_it_is_now() {
     let d = dir("saved-anew", "import lib.qwe use word\nroute GET /s/*p = files(\"public\", p)\nroute GET /w = is_err(write_file(\"public/copy.txt\", \"x\")) ? \"refused\" : \"written\"\nroute GET / = word()\n");
-    std::fs::create_dir_all(d.join("public")).unwrap();
+    for f in ["public", "conf"] {
+        std::fs::create_dir_all(d.join(f)).unwrap();
+    }
     std::fs::write(d.join("lib.qwe"), "fn word() = \"one\"\n").unwrap();
-    std::fs::write(d.join(".env"), "A=1\n").unwrap();
+    std::fs::write(d.join(".env"), "SECRET=1\n").unwrap();
+    std::fs::write(d.join("conf/app.env"), "SECRET=2\n").unwrap();
     std::fs::hard_link(d.join("lib.qwe"), d.join("public/copy.txt")).unwrap();
-    let s = support::serve_with(&d.join("main.qwe"), &["--reload"]);
-    assert_eq!(support::send(s.port, "GET", "/s/copy.txt", &[], "").status, 404);
-    assert_eq!(support::send(s.port, "GET", "/w", &[], "").body, "refused");
-    // `.env` saved anew, and a hard link to the new one: known once the program has reloaded.
-    std::fs::write(d.join("env.tmp"), "A=2\n").unwrap();
-    std::fs::rename(d.join("env.tmp"), d.join(".env")).unwrap();
-    std::fs::hard_link(d.join(".env"), d.join("public/settings.txt")).unwrap();
-    // lib.qwe saved anew: the old number is the copy's alone now.
-    std::fs::write(d.join("lib.tmp"), "fn word() = \"two\"\n").unwrap();
-    std::fs::rename(d.join("lib.tmp"), d.join("lib.qwe")).unwrap();
-    assert_eq!(support::send(s.port, "GET", "/s/copy.txt", &[], "").status, 200);
-    assert_eq!(support::send(s.port, "GET", "/w", &[], "").body, "written");
+    std::fs::hard_link(d.join(".env"), d.join("public/old-env.txt")).unwrap();
+    let save = |name: &str, text: &str| {
+        std::fs::write(d.join("saved.tmp"), text).unwrap();
+        std::fs::rename(d.join("saved.tmp"), d.join(name)).unwrap();
+    };
+    let named = d.join("conf/app.env").to_string_lossy().into_owned();
+    let s = support::serve_with(&d.join("main.qwe"), &["--reload", "--env-file", &named]);
+    let get = |p: &str| support::send(s.port, "GET", p, &[], "");
+    assert_eq!(get("/s/copy.txt").status, 404);
+    assert_eq!(get("/w").body, "refused");
+    // The settings saved anew: the old file's link is still the settings, and a link to the new
+    // one, and to the file `--env-file` names saved anew, are too, before any reload.
+    save(".env", "SECRET=3\n");
+    save("conf/app.env", "SECRET=4\n");
+    std::fs::hard_link(d.join(".env"), d.join("public/new-env.txt")).unwrap();
+    std::fs::hard_link(d.join("conf/app.env"), d.join("public/named-env.txt")).unwrap();
+    statuses(s.port, &[("/s/old-env.txt", 404), ("/s/new-env.txt", 404), ("/s/named-env.txt", 404)], "SECRET");
+    // lib.qwe saved anew: once the program has loaded it, the old version is a file like another.
+    save("lib.qwe", "fn word() = \"two\"\n");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while support::send(s.port, "GET", "/", &[], "").body != "two" {
+    while get("/").body != "two" {
         assert!(std::time::Instant::now() < deadline, "the program did not reload");
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    assert_eq!(support::send(s.port, "GET", "/s/settings.txt", &[], "").status, 404);
+    assert_eq!(get("/s/copy.txt").status, 200);
+    assert_eq!(get("/w").body, "written");
+    statuses(s.port, &[("/s/old-env.txt", 404), ("/s/new-env.txt", 404), ("/s/named-env.txt", 404)], "SECRET");
+    // The TLS key `quillo serve` was given, by its name and by another; the certificate is public.
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap().self_signed(&key).unwrap();
+    std::fs::write(d.join("public/localhost.pem"), cert.pem()).unwrap();
+    std::fs::write(d.join("public/localhost-key.pem"), key.serialize_pem()).unwrap();
+    std::fs::hard_link(d.join("public/localhost-key.pem"), d.join("public/key-copy.txt")).unwrap();
+    let port = support::free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .args(["serve", "public", "--port", &port.to_string(), "--tls-cert", "public/localhost.pem", "--tls-key", "public/localhost-key.pem"])
+        .current_dir(&d)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let _g = support::Guard::new(child);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !support::listening(port) {
+        assert!(std::time::Instant::now() < deadline, "quillo serve did not start");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    statuses(port, &[("/localhost-key.pem", 404), ("/key-copy.txt", 404)], "PRIVATE KEY");
+    assert!(support::send(port, "GET", "/localhost.pem", &[], "").body.contains("BEGIN CERTIFICATE"));
 }
 
 // Q-701: a large file saved anew while it is being sent again and again: every answer is whole,
@@ -2257,5 +2345,86 @@ fn cookies_and_types_say_what_is_wrong_with_them() {
         ("null", "200"),
     ] {
         says("s.qwe", &[("T", t)], want);
+    }
+}
+
+// Q-701: a file saved anew with another length is served as it is now, with its own length and
+// tag, from memory only as the copy of what was read: a folder switched to another release and
+// back serves each release's own bytes; a small file saved anew as a large one is sent from disk.
+#[cfg(unix)]
+#[test]
+fn a_file_saved_anew_is_served_as_it_is_now() {
+    let d = dir("releases", "route GET /s/*p = files(\"public\", p)\n");
+    for (f, text) in [("releases/a/app.js", "release A".to_string()), ("releases/b/app.js", "release B, which is longer".to_string()), ("grow.txt", "small".to_string())] {
+        std::fs::create_dir_all(d.join(f).parent().unwrap()).unwrap();
+        std::fs::write(d.join(f), text).unwrap();
+    }
+    link("releases/a", &d.join("public"));
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let get = |p: &str| support::send(s.port, "GET", p, &[], "");
+    let switch = |to: &str| {
+        link(to, &d.join("public.new"));
+        std::fs::rename(d.join("public.new"), d.join("public")).unwrap();
+    };
+    for (release, want) in [("releases/a", "release A"), ("releases/b", "release B, which is longer"), ("releases/a", "release A"), ("releases/b", "release B, which is longer")] {
+        switch(release);
+        let a = get("/s/app.js");
+        assert_eq!((a.status, a.body.as_str()), (200, want), "{}", release);
+        assert_eq!(a.header("content-length"), Some(want.len().to_string().as_str()));
+    }
+    // Small, then saved anew as a large one, then small again.
+    std::fs::write(d.join("releases/b/grow.txt"), "small").unwrap();
+    assert_eq!(get("/s/grow.txt").body, "small");
+    std::fs::write(d.join("big.tmp"), vec![b'g'; 3 << 20]).unwrap();
+    std::fs::rename(d.join("big.tmp"), d.join("releases/b/grow.txt")).unwrap();
+    let a = get("/s/grow.txt");
+    assert_eq!((a.status, a.body.len()), (200, 3 << 20));
+    std::fs::write(d.join("small.tmp"), "small again").unwrap();
+    std::fs::rename(d.join("small.tmp"), d.join("releases/b/grow.txt")).unwrap();
+    assert_eq!(get("/s/grow.txt").body, "small again");
+}
+
+// Q-701, Q-702: `files` answers a conditional, a range and a HEAD of a file it serves, small (from
+// memory, or read for the first time) or large, as it answers a GET, and of a file it keeps back
+// with a 404: a SQLite database, a hard link to the settings, a link to a database's `-shm`
+// (judged by the name the link leads to).
+#[cfg(unix)]
+#[test]
+fn files_answers_conditionals_ranges_and_heads_as_it_serves() {
+    let d = dir("conditionals", "db.open(\"app.db\")\ndb.exec(\"create table if not exists t (x text)\")\ndb.exec(\"insert into t values ('SECRET row')\")\nroute GET /s/*p = files(\"public\", p)\n");
+    std::fs::create_dir_all(d.join("public")).unwrap();
+    std::fs::write(d.join(".env"), "SECRET=1\n").unwrap();
+    std::fs::write(d.join("public/small.txt"), "0123456789").unwrap();
+    std::fs::write(d.join("public/cold.txt"), "abcdefghij").unwrap();
+    std::fs::write(d.join("public/big.bin"), vec![b'b'; 2 << 20]).unwrap();
+    rusqlite::Connection::open(d.join("public/data.db")).unwrap().execute_batch("create table t (x text); insert into t values ('SECRET')").unwrap();
+    std::fs::hard_link(d.join(".env"), d.join("public/env.txt")).unwrap();
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    link("../app.db-shm", &d.join("public/x.txt"));
+    let send = |method: &str, p: &str, h: &[(&str, &str)]| support::send(s.port, method, p, h, "");
+    // small.txt read once, so in memory; cold.txt not.
+    let first = send("GET", "/s/small.txt", &[]);
+    let tag = first.header("etag").unwrap().to_string();
+    for path in ["/s/small.txt", "/s/cold.txt", "/s/big.bin"] {
+        let tag = send("HEAD", path, &[]).header("etag").unwrap_or_else(|| panic!("{}", path)).to_string();
+        let len = send("HEAD", path, &[]).header("content-length").map(str::to_string);
+        let a = send("GET", path, &[("If-None-Match", &tag)]);
+        assert_eq!((a.status, a.body.as_str()), (304, ""), "{}", path);
+        let a = send("GET", path, &[("Range", "bytes=2-4")]);
+        assert_eq!((a.status, a.body.len()), (206, 3), "{}", path);
+        assert_eq!(a.header("content-range").map(|r| r.starts_with("bytes 2-4/")), Some(true), "{}", path);
+        let a = send("HEAD", path, &[]);
+        assert_eq!((a.status, a.body.as_str(), a.header("content-length").map(str::to_string)), (200, "", len), "{}", path);
+    }
+    assert_eq!(send("GET", "/s/small.txt", &[("Range", "bytes=2-4")]).body, "234");
+    assert_eq!(send("GET", "/s/cold.txt", &[("Range", "bytes=2-4")]).body, "cde");
+    assert_eq!(send("HEAD", "/s/small.txt", &[]).header("content-length"), Some("10"));
+    assert_eq!(tag, send("HEAD", "/s/small.txt", &[]).header("etag").unwrap());
+    for path in ["/s/data.db", "/s/env.txt", "/s/x.txt"] {
+        for (method, h) in [("GET", vec![("If-None-Match", "*")]), ("GET", vec![("Range", "bytes=0-15")]), ("HEAD", vec![]), ("GET", vec![])] {
+            let a = send(method, path, &h);
+            assert_eq!(a.status, 404, "{} {} {:?}", method, path, h);
+            assert!(!a.body.contains("SECRET") && !a.body.contains("SQLite"), "{}", path);
+        }
     }
 }
