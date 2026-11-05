@@ -466,9 +466,10 @@ pub fn as_dec(v: &Value) -> Option<Dec> {
 }
 
 /// Converts request text to the type a pattern asks for.
-/// Whether `??` may take a stop: not one that means the request must end.
+/// Whether `??` may take a stop: not one that means the request must end, the compute limit's
+/// whether `--max-compute` or a policy set it (FEEDBACK55.md, Q-849; branch feedback55).
 fn guardable(msg: &str) -> bool {
-    !msg.contains(PREFETCH_REFUSED) && !msg.contains("--max-compute") && !msg.contains("the script ")
+    !msg.contains(PREFETCH_REFUSED) && !crate::httpd::is_compute_stop(msg) && !msg.contains("the script ")
 }
 
 /// What is known of a text read by index.
@@ -2870,7 +2871,9 @@ impl Interp {
     #[inline]
     fn within_limit(&mut self, line: u32) -> Result<(), Ctrl> {
         if crate::httpd::OVER_TIME.load(std::sync::atomic::Ordering::Relaxed) && crate::httpd::over_time() {
-            return fail(line, "this request computed for longer than --max-compute allows");
+            // Naming the policy file when its limit is the one (FEEDBACK55.md, Q-849; branch
+            // feedback55).
+            return fail(line, crate::httpd::over_compute());
         }
         Ok(())
     }

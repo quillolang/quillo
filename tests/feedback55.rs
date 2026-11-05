@@ -7143,7 +7143,6 @@ fn a_preview_past_the_policys_limit_ends_as_a_server_error_naming_no_path() {
 // `??` takes that stop no more than `--max-compute`'s. Needs the interp.rs patch (within_limit and
 // guardable), applied once slice 9 is in: scratchpad/f55/fix/13/q849-interp.patch.
 #[test]
-#[ignore = "needs the interp.rs patch q849-interp.patch (slice 13's review), applied after slice 9"]
 fn a_loop_past_the_policys_limit_names_it_and_no_guard_takes_the_stop() {
     let big = "let x = \"a\" + 1; // note\n".repeat(800_000);
     let d = files_dir(
