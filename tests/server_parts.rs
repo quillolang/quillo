@@ -389,6 +389,9 @@ fn only_files_are_files() {
     assert_eq!(statics::info(&d).err().map(|e| e.kind()), Some(std::io::ErrorKind::NotFound));
     let small = d.join("small.txt");
     std::fs::write(&small, "small").unwrap();
+    // Not changed in the last moment, where a write could hide in its clock's tick and no copy
+    // is kept (FEEDBACK55.md, Q-701; branch feedback55).
+    std::thread::sleep(std::time::Duration::from_millis(30));
     let i = statics::info(&small).unwrap();
     assert_eq!(&*statics::read(&small, &i).unwrap(), b"small");
     // From memory: the file need not be there any more.

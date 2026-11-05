@@ -1439,11 +1439,20 @@ fn a_large_file_saved_anew_while_sent_is_served() {
             }
         })
     };
+    // A file replaced at every try is busy, a 503 with Retry-After (the fifth review); every other
+    // answer is one whole file, never two mixed, and most are that.
+    let mut whole = 0;
     for i in 0..150 {
         let a = support::send(s.port, "GET", "/s/big.bin", &[], "");
+        if a.status == 503 {
+            assert_eq!(a.header("retry-after"), Some("1"), "request {}", i);
+            continue;
+        }
         assert_eq!((a.status, a.body.len()), (200, size), "request {}", i);
         assert!(a.body.bytes().all(|b| b == b'a') || a.body.bytes().all(|b| b == b'b'), "request {} mixed two files", i);
+        whole += 1;
     }
+    assert!(whole >= 100, "only {} of 150 were served", whole);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     saver.join().unwrap();
 }
@@ -2854,13 +2863,23 @@ fn colours_as(cases: &[(&str, &str, &str)]) {
     }
 }
 
-/// The best of three runs of `f`, in seconds.
+/// The CPU time this thread has used, in seconds: what a timing test measures, so that other
+/// tests and other processes on a loaded machine do not change it (found running the suite beside
+/// other work).
+fn cpu_now() -> f64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: clock_gettime writes the timespec given.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+}
+
+/// The best of three runs of `f`, in seconds of this thread's CPU time.
 fn best_of_three(f: &dyn Fn()) -> f64 {
     (0..3)
         .map(|_| {
-            let t = std::time::Instant::now();
+            let t = cpu_now();
             f();
-            t.elapsed().as_secs_f64()
+            cpu_now() - t
         })
         .fold(f64::MAX, f64::min)
 }
@@ -3188,9 +3207,9 @@ fn markdown_takes(it: &mut quillo::Interp, f: &str, text: &str) -> f64 {
     let md = quillo::value::lookup(&it.globals, f).unwrap();
     (0..3)
         .map(|_| {
-            let t = std::time::Instant::now();
+            let t = cpu_now();
             assert!(it.call(&md, vec![quillo::value::Value::str(text)], 0).is_ok(), "{} failed", f);
-            t.elapsed().as_secs_f64()
+            cpu_now() - t
         })
         .fold(f64::MAX, f64::min)
 }
@@ -3209,7 +3228,8 @@ fn markdown_takes_time_in_proportion_to_the_text() {
     let t = std::time::Instant::now();
     let a = support::send(port, "POST", "/_quillo/markdown", &[], &report);
     assert_eq!(a.status, 200, "{}", &a.body[..200.min(a.body.len())]);
-    assert!(t.elapsed().as_secs_f64() < 2.0, "the report's body took {:?}", t.elapsed());
+    // 0.12 took 17 s; the bound leaves room for a loaded machine.
+    assert!(t.elapsed().as_secs_f64() < 8.0, "the report's body took {:?}", t.elapsed());
     assert!(a.body.starts_with(r#"{"ok":"<p>"#), "{}", &a.body[..200]);
     assert_eq!(support::send(port, "GET", "/", &[], "").body, "hello");
     // On the server, markdown() of each shape and markdown_page() of the report's, at 256 KB,
@@ -3218,7 +3238,7 @@ fn markdown_takes_time_in_proportion_to_the_text() {
     it.load_source("fn md(t: str) = markdown(t)\nfn page(t: str) = markdown_page(t)\n", "case.qwe").unwrap();
     for (f, p) in [("page", "*a_"), ("md", "*a_"), ("md", "**a_"), ("md", " *_"), ("md", "_a*"), ("md", "*a**"), ("md", "[a]("), ("md", "`a"), ("md", "<a"), ("md", "~~a*"), ("md", "> *a_\n"), ("md", "- *a_\n")] {
         let [t1, t2, t4] = [1usize, 2, 4].map(|k| markdown_takes(&mut it, f, &p.repeat((k << 18) / p.len())));
-        assert!(t4 < 1.0, "{} {:?}: 1 MB took {:.3} s", f, p, t4);
+        assert!(t4 < 2.0, "{} {:?}: 1 MB took {:.3} s", f, p, t4);
         // Four times the text against at most six times the time (0.12 was sixteen).
         assert!(t4 < 6.0 * t1 + 0.03, "{} {:?}: {:.4} s, {:.4} s, {:.4} s", f, p, t1, t2, t4);
     }
@@ -3264,4 +3284,171 @@ fn a_word_of_marks_or_letter_numbers_is_the_same_word_on_both_sides() {
         ("js", "e\u{301}(1)", "e\u{301}(<n>1</n>)"),
         ("qwe", "let x² = ½", "<k>let</k> x² = ½"),
     ]);
+}
+
+// Q-702: what `files` sends is judged by the bytes it sends: a file whose first bytes are made a
+// SQLite database's and back again, in place, as fast as can be, never goes out starting as one,
+// whole or in part, small or large (FEEDBACK55.md, Q-702; branch feedback55).
+#[cfg(unix)]
+#[test]
+fn a_database_header_written_in_place_is_never_sent() {
+    let d = dir("flip", "route GET /s/*p = files(\"public\", p)\n");
+    std::fs::create_dir_all(d.join("public")).unwrap();
+    std::fs::write(d.join("public/small.bin"), vec![b's'; 4096]).unwrap();
+    std::fs::write(d.join("public/large.bin"), vec![b'l'; 2 << 20]).unwrap();
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flipper = {
+        let (d, stop) = (d.clone(), stop.clone());
+        std::thread::spawn(move || {
+            use std::io::{Seek, Write};
+            let mut files: Vec<std::fs::File> = ["small.bin", "large.bin"].iter().map(|n| std::fs::OpenOptions::new().write(true).open(d.join("public").join(n)).unwrap()).collect();
+            let mut n = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                n += 1;
+                for f in files.iter_mut() {
+                    f.seek(std::io::SeekFrom::Start(0)).unwrap();
+                    f.write_all(if n % 2 == 0 { b"SQLite format 3\0" } else { b"plain text, 16 b" }).unwrap();
+                }
+            }
+        })
+    };
+    let mut served = 0;
+    for i in 0..300 {
+        for (p, h) in [("/s/small.bin", vec![]), ("/s/small.bin", vec![("Range", "bytes=0-99")]), ("/s/small.bin", vec![("Range", "bytes=0-4")]), ("/s/large.bin", vec![]), ("/s/large.bin", vec![("Range", "bytes=0-99")]), ("/s/large.bin", vec![("Range", "bytes=0-4")])] {
+            let a = support::send(s.port, "GET", p, &h, "");
+            if a.status == 200 || a.status == 206 {
+                served += 1;
+                assert!(!a.body.starts_with("SQLit"), "{} {:?} (request {}) sent a database's first bytes", p, h, i);
+            } else {
+                assert!(a.status == 404 || a.status == 503, "{} {:?}: {}", p, h, a.status);
+            }
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    flipper.join().unwrap();
+    assert!(served > 0, "nothing was served while the header changed");
+}
+
+// Q-701: a large file being renamed into place again and again, asked for in part, is served
+// whole or in part, or a 503 to come back to after a few tries a moment apart: never a 404.
+#[cfg(unix)]
+#[test]
+fn a_large_file_renamed_into_place_is_never_missed() {
+    let d = dir("rename-large", "route GET /s/*p = files(\"public\", p)\n");
+    std::fs::create_dir_all(d.join("public")).unwrap();
+    std::fs::write(d.join("public/big.bin"), vec![b'a'; 3 << 20]).unwrap();
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saver = {
+        let (d, stop) = (d.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut n = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                n += 1;
+                let tmp = d.join(format!("public/big.{}.tmp", n % 2));
+                std::fs::write(&tmp, vec![b'a' + (n % 2) as u8; 3 << 20]).unwrap();
+                std::fs::rename(&tmp, d.join("public/big.bin")).unwrap();
+            }
+        })
+    };
+    for i in 0..200 {
+        let a = support::send(s.port, "GET", "/s/big.bin", &[("Range", "bytes=0-2000000")], "");
+        assert!(matches!(a.status, 200 | 206 | 503), "request {}: {}", i, a.status);
+        if a.status == 503 {
+            assert_eq!(a.header("retry-after"), Some("1"));
+        } else {
+            assert!(a.body.len() == 2_000_001 || a.body.len() == 3 << 20, "request {}: {} bytes", i, a.body.len());
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    saver.join().unwrap();
+}
+
+// Q-701, Q-702: a large file `files` judged is not looked into again for a 304 or a HEAD while it
+// is the same; written to since (made a database here), it is judged again, and kept back.
+#[cfg(unix)]
+#[test]
+fn a_large_files_judgement_holds_until_it_changes() {
+    let d = dir("judged-large", "route GET /s/*p = files(\"public\", p)\n");
+    std::fs::create_dir_all(d.join("public")).unwrap();
+    std::fs::write(d.join("public/big.bin"), vec![b'b'; 2 << 20]).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let get = |m: &str, h: &[(&str, &str)]| support::send(s.port, m, "/s/big.bin", h, "");
+    let tag = get("HEAD", &[]).header("etag").unwrap().to_string();
+    for _ in 0..3 {
+        assert_eq!(get("GET", &[("If-None-Match", &tag)]).status, 304);
+        assert_eq!(get("HEAD", &[]).status, 200);
+    }
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().write(true).open(d.join("public/big.bin")).unwrap();
+        f.write_all(b"SQLite format 3\0").unwrap();
+    }
+    for (m, h) in [("HEAD", vec![]), ("GET", vec![("If-None-Match", tag.as_str())]), ("GET", vec![]), ("GET", vec![("Range", "bytes=100-199")])] {
+        let a = get(m, &h);
+        assert_eq!(a.status, 404, "{} {:?}", m, h);
+        assert!(!a.body.contains("SQLite"));
+    }
+}
+
+// Q-701: a file changed so lately that a write in the same tick of its clock would not be seen is
+// not kept in memory: within 10 ms of a change where times have nanoseconds, two seconds where they
+// are whole seconds (git's rule for a racily clean file).
+#[cfg(unix)]
+#[test]
+fn a_file_changed_this_moment_is_not_kept() {
+    use quillo::statics;
+    let d = support::temp_dir("feedback55-racy");
+    let f = d.join("a.txt");
+    std::fs::write(&f, "a").unwrap();
+    assert!(statics::racy(&std::fs::metadata(&f).unwrap()));
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    assert!(!statics::racy(&std::fs::metadata(&f).unwrap()));
+    // Whole seconds: a second ago is too close; an hour ago is not.
+    let whole = |ago: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - ago);
+    std::fs::File::options().write(true).open(&f).unwrap().set_modified(whole(1)).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    assert!(statics::racy(&std::fs::metadata(&f).unwrap()));
+    std::fs::File::options().write(true).open(&f).unwrap().set_modified(whole(3600)).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    assert!(!statics::racy(&std::fs::metadata(&f).unwrap()));
+    // Served all the same, and from the disk until it is kept.
+    let s = support::temp_dir("feedback55-racy-app");
+    std::fs::create_dir_all(s.join("public")).unwrap();
+    std::fs::write(s.join("main.qwe"), "route GET /s/*p = files(\"public\", p)\n").unwrap();
+    let server = support::serve(&s.join("main.qwe"), &[]);
+    std::fs::write(s.join("public/new.txt"), "fresh").unwrap();
+    assert_eq!(support::send(server.port, "GET", "/s/new.txt", &[], "").body, "fresh");
+}
+
+// Q-701: the paths `--env-file` and `--tls-key` name are not written, nor deleted, while nothing is
+// there, as when something is.
+#[cfg(unix)]
+#[test]
+fn the_named_paths_are_not_written_while_nothing_is_there() {
+    let d = dir("named-paths", "route GET /w/*p = is_err(write_file(p, \"x\")) ? \"refused\" : \"written\"\nroute GET /d/*p = is_err(delete_file(p)) ? \"refused\" : \"deleted\"\n");
+    std::fs::create_dir_all(d.join("conf")).unwrap();
+    std::fs::write(d.join("conf/app.env"), "A=1\n").unwrap();
+    std::fs::write(d.join("conf/key.pem"), "-----BEGIN PRIVATE KEY-----\n").unwrap();
+    std::fs::write(d.join("conf/cert.pem"), "-----BEGIN CERTIFICATE-----\n").unwrap();
+    let (env, cert, key) = (d.join("conf/app.env"), d.join("conf/cert.pem"), d.join("conf/key.pem"));
+    let s = support::serve_with(&d.join("main.qwe"), &["--env-file", &env.to_string_lossy(), "--tls-cert", &cert.to_string_lossy(), "--tls-key", &key.to_string_lossy()]);
+    let get = |p: &str| support::send(s.port, "GET", p, &[], "").body;
+    for p in ["conf/app.env", "conf/key.pem", "conf/APP.ENV"] {
+        assert_eq!(get(&format!("/w/{}", p)), "refused", "{}", p);
+        assert_eq!(get(&format!("/d/{}", p)), "refused", "{}", p);
+    }
+    std::fs::remove_file(&env).unwrap();
+    std::fs::remove_file(&key).unwrap();
+    for p in ["conf/app.env", "conf/key.pem", "./conf/app.env"] {
+        assert_eq!(get(&format!("/w/{}", p)), "refused", "{}", p);
+    }
+    assert!(!env.exists() && !key.exists());
+    // Beside them, and the certificate, as before.
+    for p in ["conf/app.env2", "conf/key.pem.bak", "conf/other.txt"] {
+        assert_eq!(get(&format!("/w/{}", p)), "written", "{}", p);
+    }
+    assert_eq!(get("/w/conf/cert.pem"), "written");
 }

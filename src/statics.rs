@@ -163,6 +163,100 @@ pub fn same(info: &Info, full: &Path, m: &std::fs::Metadata) -> bool {
     m.len() == info.len && id_of(m) == info.id && info_of(full, m).mtime == info.mtime
 }
 
+/// Whether the file opened, `m`, is another than the one looked at (`id`, `etag`): saved anew in
+/// its place. By identity; where the system gives none (Windows), by its tag, its length and
+/// times, so a file written to in place is taken for another there (FEEDBACK55.md, Q-701; branch
+/// feedback55).
+pub fn replaced(id: Option<FileId>, etag: &str, full: &Path, m: &std::fs::Metadata) -> bool {
+    match (id, id_of(m)) {
+        (Some(was), Some(now)) => was != now,
+        _ => info_of(full, m).etag != etag,
+    }
+}
+
+/// Whether a file `m` changed so lately that a write in the same tick of its clock would not be
+/// seen (ctime is kept in ticks of about 4 ms on Linux before 6.13, whole seconds on some file
+/// systems): no copy of it is kept, as git does not trust such a file (FEEDBACK55.md, Q-701;
+/// branch feedback55).
+pub fn racy(m: &std::fs::Metadata) -> bool {
+    let now = std::time::SystemTime::now();
+    let near = |t: std::time::SystemTime| {
+        let coarse = t.duration_since(UNIX_EPOCH).is_ok_and(|d| d.subsec_nanos() == 0);
+        let window = if coarse { Duration::from_secs(2) } else { Duration::from_millis(10) };
+        now.duration_since(t).map_or(true, |ago| ago < window)
+    };
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt;
+        UNIX_EPOCH.checked_add(Duration::new(m.ctime().max(0) as u64, m.ctime_nsec().clamp(0, 999_999_999) as u32))
+    };
+    #[cfg(not(unix))]
+    let changed: Option<std::time::SystemTime> = None;
+    m.modified().map_or(true, near) || changed.is_some_and(near)
+}
+
+/// At most so many files are read whole into memory at once, off the interpreter's lock: each
+/// holds as much as the file, up to a MiB, and 256 at once held 1.4 GB (FEEDBACK55.md, Q-701;
+/// branch feedback55).
+pub struct ReadPlace;
+
+static READING: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
+
+impl ReadPlace {
+    pub fn take() -> ReadPlace {
+        static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let most = *MOST.get_or_init(|| std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 8));
+        let mut n = lock(&READING.0);
+        while *n >= most {
+            n = READING.1.wait(n).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *n += 1;
+        ReadPlace
+    }
+}
+
+impl Drop for ReadPlace {
+    fn drop(&mut self) {
+        *lock(&READING.0) -= 1;
+        READING.1.notify_one();
+    }
+}
+
+/// Memory for a file of `len` bytes, read into by `read_into`: made on the thread that asks, the
+/// request's, whose memory is used again, not on a thread that reads for it off the lock and
+/// keeps what is freed elsewhere (1 MiB copies made there held 550 MB) (FEEDBACK55.md, Q-701;
+/// branch feedback55).
+pub fn buffer(len: u64) -> Arc<[u8]> {
+    // SAFETY: zeroed bytes are bytes.
+    unsafe { Arc::<[u8]>::new_zeroed_slice(len as usize).assume_init() }
+}
+
+/// The first `len` bytes of the file, read into memory of that size made once: no second copy
+/// (FEEDBACK55.md, Q-701; branch feedback55). Fewer if the file has fewer now.
+pub fn read_whole(f: &std::fs::File, len: u64) -> std::io::Result<Arc<[u8]>> {
+    read_into(f, buffer(len))
+}
+
+/// `read_whole`, into memory made before (`buffer`) (FEEDBACK55.md, Q-701; branch feedback55).
+pub fn read_into(f: &std::fs::File, mut a: Arc<[u8]>) -> std::io::Result<Arc<[u8]>> {
+    let buf = Arc::get_mut(&mut a).ok_or(std::io::ErrorKind::Other)?;
+    let mut f = f;
+    f.seek(SeekFrom::Start(0))?;
+    let mut got = 0;
+    while got < buf.len() {
+        match f.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if got < buf.len() {
+        return Ok(Arc::from(&buf[..got]));
+    }
+    Ok(a)
+}
+
 /// The error of a file that is not what it was when it was looked at: looked at again
 /// (FEEDBACK55.md, Q-701; branch feedback55).
 pub fn changed() -> std::io::Error {
@@ -271,13 +365,18 @@ pub fn read(full: &Path, info: &Info) -> std::io::Result<Arc<[u8]>> {
     }
     let (f, m) = open_regular(full)?;
     // Saved anew (another file in its place): looked at again. Written to in place: what is
-    // there, as many bytes as were looked at, kept only as the file was (FEEDBACK55.md, Q-701;
-    // branch feedback55).
-    if id_of(&m) != info.id {
+    // there, as many bytes as were looked at, kept only as the file was, and not changed so lately
+    // that a write could hide in its clock's tick (FEEDBACK55.md, Q-701; branch feedback55).
+    if replaced(info.id, &info.etag, full, &m) {
         return Err(changed());
     }
-    let b: Arc<[u8]> = Arc::from(read_at(&f, 0, info.len)?);
-    if info.len <= SMALL && b.len() as u64 == info.len && same(info, full, &m) {
+    let b = if info.len <= SMALL {
+        let _place = ReadPlace::take();
+        read_whole(&f, info.len)?
+    } else {
+        Arc::from(read_at(&f, 0, info.len)?)
+    };
+    if info.len <= SMALL && b.len() as u64 == info.len && f.metadata().is_ok_and(|m| same(info, full, &m) && !racy(&m)) {
         put(&mut lock(&FILES), FILES_BUDGET, key, b.clone());
     }
     Ok(b)
@@ -305,6 +404,23 @@ pub fn keep_judged(full: &Path, info: &Info, b: Arc<[u8]>) {
     if info.len <= SMALL {
         put(&mut lock(&FILES), FILES_BUDGET, (full.to_path_buf(), info.len, info.mtime, true), b);
     }
+}
+
+/// The large files `files` judged, by path, length, time and identity, so a 304 or a HEAD of one
+/// not changed since costs a look at it (FEEDBACK55.md, Q-701; branch feedback55).
+static JUDGED_LARGE: Mutex<Option<std::collections::HashSet<(PathBuf, u64, u128)>>> = Mutex::new(None);
+
+pub fn judged_large(full: &Path, info: &Info) -> bool {
+    lock(&JUDGED_LARGE).as_ref().is_some_and(|s| s.contains(&(full.to_path_buf(), info.len, info.mtime)))
+}
+
+pub fn keep_judged_large(full: &Path, info: &Info) {
+    let mut g = lock(&JUDGED_LARGE);
+    let s = g.get_or_insert_with(Default::default);
+    if s.len() >= 4096 {
+        s.clear();
+    }
+    s.insert((full.to_path_buf(), info.len, info.mtime));
 }
 
 /// Larger files go out from disk a piece at a time, on a thread of their
@@ -452,20 +568,37 @@ pub fn send(mut stream: std::net::TcpStream, resp: &crate::server::HttpResponse,
     // one judged, if it is served, goes whole with its own length and tags, a part asked for (a
     // 206) as the whole (a 200), any other answer (the page of a miss) as it was
     // (FEEDBACK55.md, Q-701; branch feedback55).
+    // One saved anew as it was opened is opened again, a moment later each time (on macOS an
+    // open right after a rename can find the file it replaced); one replaced each time is a 503
+    // to come back to, as `file` gives (FEEDBACK55.md, Q-701; branch feedback55).
+    let busy = |stream: &mut std::net::TcpStream, out: &mut Vec<u8>| {
+        let mut r = crate::server::plain_response(503, "the file is being replaced; try again\n");
+        r.headers.push(("retry-after".into(), "1".into()));
+        crate::httpd::write_response(out, &r, head, true);
+        let _ = stream.write_all(out);
+    };
     let opened = match &hosted {
-        // One saved anew as it was opened is opened again, three times at most.
-        Some(h) => (0..3)
-            .map(|_| crate::builtins::open_hosted(&h.served, &h.program, &path))
-            .find(|r| r.as_ref().err() != Some(&crate::builtins::Judged::Replaced))
-            .and_then(Result::ok)
-            .map(|(f, m)| (f, Some(m)))
-            .ok_or(()),
+        Some(h) => {
+            let mut got = Err(crate::builtins::Judged::Replaced);
+            for pause in [0, 2, 8] {
+                std::thread::sleep(Duration::from_millis(pause));
+                got = crate::builtins::open_hosted(&h.served, &h.program, &path);
+                if got.as_ref().err() != Some(&crate::builtins::Judged::Replaced) {
+                    break;
+                }
+            }
+            match got {
+                Ok((f, m)) => Ok((f, Some(m))),
+                Err(crate::builtins::Judged::Replaced) => return busy(&mut stream, &mut out),
+                Err(_) => Err(()),
+            }
+        }
         None => open_regular(&path).map(|(f, _)| (f, None)).map_err(|_| ()),
     };
     let mut resp = std::borrow::Cow::Borrowed(resp);
     let (mut start, mut len) = (start, len);
     if let (Ok((_, Some(m))), Some(h)) = (&opened, &hosted) {
-        if id_of(m) != h.id {
+        if replaced(h.id, &h.etag, &path, m) {
             let now = info_of(&path, m);
             let r = resp.to_mut();
             if r.status == 206 {
@@ -482,20 +615,47 @@ pub fn send(mut stream: std::net::TcpStream, resp: &crate::server::HttpResponse,
             (start, len) = (0, now.len);
         }
     }
-    let file = opened.and_then(|(mut f, _)| f.seek(SeekFrom::Start(start)).map(|_| f).map_err(|_| ()));
-    let Ok(f) = file else {
-        crate::httpd::write_response(&mut out, &crate::server::plain_response(404, "not found\n"), head, true);
-        let _ = stream.write_all(&out);
-        return;
+    let not_found = |stream: &mut std::net::TcpStream, out: &mut Vec<u8>| {
+        crate::httpd::write_response(out, &crate::server::plain_response(404, "not found\n"), head, true);
+        let _ = stream.write_all(out);
     };
+    if let (Ok((f, _)), Some(_)) = (&opened, &hosted) {
+        if !head && start > 0 && crate::builtins::sqlite_head(f) {
+            return not_found(&mut stream, &mut out);
+        }
+    }
+    let file = opened.and_then(|(mut f, _)| f.seek(SeekFrom::Start(start)).map(|_| f).map_err(|_| ()));
+    let Ok(mut f) = file else { return not_found(&mut stream, &mut out) };
+    let mut buf = vec![0u8; 64 << 10];
+    // For `files`, the first bytes sent are judged as they are read, before the head goes, in one
+    // read of 16 at least, though fewer are sent: those of a SQLite database are not sent; a part
+    // from further in by the file's own first bytes, above (FEEDBACK55.md, Q-702; branch
+    // feedback55).
+    let mut first = 0;
+    if hosted.is_some() && !head && start == 0 {
+        while first < 16 {
+            match f.read(&mut buf[first..]) {
+                Ok(0) => break,
+                Ok(n) => first += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        if crate::db::sqlite_bytes(&buf[..first]) {
+            return not_found(&mut stream, &mut out);
+        }
+    }
+    let first = first.min(len as usize);
     crate::httpd::write_head(&mut out, &resp, len, true);
     if stream.write_all(&out).is_err() || head {
         return;
     }
-    let mut f = f.take(len);
-    let mut buf = vec![0u8; 64 << 10];
+    if first > 0 && stream.write_all(&buf[..first]).is_err() {
+        return;
+    }
+    let mut f = f.take(len - first as u64);
     let began = Instant::now();
-    let mut sent = 0u64;
+    let mut sent = first as u64;
     loop {
         let n = match f.read(&mut buf) {
             Ok(0) | Err(_) => return,

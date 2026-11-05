@@ -1147,20 +1147,38 @@ fn file_once(it: &mut Interp, args: &[Value], line: u32, hosted: Option<&Path>, 
         if crate::statics::small(&info) {
             copy = crate::statics::judged_copy(&full, &info);
             if copy.is_none() {
-                let (h, at, looked) = (h.clone(), full.clone(), info.clone());
-                let read = it.unlocked(move || -> Result<Arc<[u8]>, Judged> {
+                let (h, at, looked, buf) = (h.clone(), full.clone(), info.clone(), crate::statics::buffer(info.len));
+                let job = move || -> Result<Arc<[u8]>, Judged> {
                     let (f, m) = open_hosted(&h.served, &h.program, &at)?;
                     // Another file in its place: looked at again; the same, written to: what is
-                    // there, as many bytes as were looked at, kept only as it was then.
-                    if crate::statics::id_of(&m) != h.id {
+                    // there, as many bytes as were looked at, kept only as it was then, and not
+                    // changed so lately that a write could hide in its clock's tick.
+                    if crate::statics::replaced(h.id, &h.etag, &at, &m) {
                         return Err(Judged::Replaced);
                     }
-                    let b: Arc<[u8]> = Arc::from(crate::statics::read_at(&f, 0, looked.len).map_err(|_| Judged::Refused)?);
-                    if b.len() as u64 == looked.len && crate::statics::same(&looked, &at, &m) {
+                    let b = crate::statics::read_into(&f, buf).map_err(|_| Judged::Refused)?;
+                    // The bytes sent are the bytes judged (FEEDBACK55.md, Q-702; branch
+                    // feedback55).
+                    if crate::db::sqlite_bytes(&b) {
+                        return Err(Judged::Refused);
+                    }
+                    if b.len() as u64 == looked.len && f.metadata().is_ok_and(|m| crate::statics::same(&looked, &at, &m) && !crate::statics::racy(&m)) {
                         crate::statics::keep_judged(&at, &looked, b.clone());
                     }
                     Ok(b)
-                });
+                };
+                // Read once into its copy, made on this thread (`statics::buffer`). One of up to
+                // 64 KiB here, where the read costs less than handing it to another thread
+                // (30 µs against 68 a file); a larger one off the lock, a few at a time
+                // (FEEDBACK55.md, Q-701; branch feedback55).
+                let read = if info.len <= 64 << 10 {
+                    job()
+                } else {
+                    it.unlocked(move || {
+                        let _place = crate::statics::ReadPlace::take();
+                        job()
+                    })
+                };
                 match read {
                     Ok(b) => copy = Some(b),
                     Err(Judged::Refused) => return Ok(Some(not_found())),
@@ -1171,14 +1189,25 @@ fn file_once(it: &mut Interp, args: &[Value], line: u32, hosted: Option<&Path>, 
     }
     // A large file judged for an answer that sends none of it: Some(false) for one saved anew in
     // its place (FEEDBACK55.md, Q-701 and Q-702; branch feedback55).
+    // One judged before and not changed since needs no more than the look at it (FEEDBACK55.md,
+    // Q-701; branch feedback55).
     let judge_large = |it: &mut Interp| -> Option<bool> {
         let Some(h) = sent.clone() else { return Some(true) };
-        if copy.is_some() {
+        if copy.is_some() || crate::statics::judged_large(&full, &info) {
             return Some(true);
         }
-        let at = full.clone();
+        let (at, looked) = (full.clone(), info.clone());
         it.unlocked(move || match open_hosted(&h.served, &h.program, &at) {
-            Ok((_, m)) => Some(crate::statics::id_of(&m) == h.id),
+            Ok((_, m)) if crate::statics::replaced(h.id, &h.etag, &at, &m) => Some(false),
+            Ok((f, m)) => {
+                if sqlite_head(&f) {
+                    return None;
+                }
+                if crate::statics::same(&looked, &at, &m) && !crate::statics::racy(&m) {
+                    crate::statics::keep_judged_large(&at, &looked);
+                }
+                Some(true)
+            }
             Err(Judged::Replaced) => Some(false),
             Err(Judged::Refused) => None,
         })
@@ -1306,7 +1335,17 @@ fn file_once(it: &mut Interp, args: &[Value], line: u32, hosted: Option<&Path>, 
                 } else if let Some(h) = sent.clone() {
                     let at = full.clone();
                     it.unlocked(move || match open_hosted(&h.served, &h.program, &at) {
-                        Ok((f, m)) if crate::statics::id_of(&m) == h.id => crate::statics::read_at(&f, start, n),
+                        Ok((f, m)) if !crate::statics::replaced(h.id, &h.etag, &at, &m) => {
+                            // The part sent judged when it is the start, read with 16 bytes at
+                            // least; the file's start else (FEEDBACK55.md, Q-702; branch
+                            // feedback55).
+                            let mut part = crate::statics::read_at(&f, start, if start == 0 { n.max(16) } else { n })?;
+                            if if start == 0 { crate::db::sqlite_bytes(&part) } else { sqlite_head(&f) } {
+                                return Err(std::io::ErrorKind::NotFound.into());
+                            }
+                            part.truncate(n as usize);
+                            Ok(part)
+                        }
                         Ok(_) | Err(Judged::Replaced) => Err(crate::statics::changed()),
                         Err(Judged::Refused) => Err(std::io::ErrorKind::NotFound.into()),
                     })
@@ -1493,9 +1532,10 @@ pub(crate) fn own_meta(m: &std::fs::Metadata) -> Option<&'static str> {
 /// it serves it: a file of bytes with a name, not one of the program's own by number or what a
 /// path of the settings or the key leads to now, where it really is (as the system says of the
 /// file opened, so no link swapped in on the way since it was judged takes it out of the folder
-/// or to what it keeps), and no SQLite database or journal of one, by its first bytes and by the
-/// name it really has (FEEDBACK55.md, Q-701 and Q-702; branch feedback55). The folders are named
-/// as the system names the file, so `/System/Volumes/Data/private/tmp` is `/private/tmp`.
+/// or to what it keeps), and no journal of a SQLite database by the name it really has; its first
+/// bytes are the caller's to judge, as they are sent (`sqlite_head`) (FEEDBACK55.md, Q-701 and
+/// Q-702; branch feedback55). The folders are named as the system names the file, so
+/// `/System/Volumes/Data/private/tmp` is `/private/tmp`.
 pub(crate) fn open_hosted(served: &Path, program: &Path, full: &Path) -> Result<(std::fs::File, std::fs::Metadata), Judged> {
     use Judged::{Refused, Replaced};
     let (f, m) = crate::statics::open_regular(full).map_err(|_| Refused)?;
@@ -1513,11 +1553,17 @@ pub(crate) fn open_hosted(served: &Path, program: &Path, full: &Path) -> Result<
     if !real.starts_with(&program) || hidden_target(&program, &served, &real) {
         return Err(Refused);
     }
-    let head = crate::statics::read_at(&f, 0, 16).map_err(|_| Refused)?;
-    if crate::db::sqlite_bytes(&head) || crate::db::journal_of(&real).is_some_and(|db| crate::db::sqlite_file(&db)) {
+    if crate::db::journal_of(&real).is_some_and(|db| crate::db::sqlite_file(&db)) {
         return Err(Refused);
     }
     Ok((f, m))
+}
+
+/// Whether the file opened begins as a SQLite database, its log or its journal: for an answer of
+/// none of it, or of a part from further in. What is sent from the start is judged by the bytes
+/// sent (FEEDBACK55.md, Q-702; branch feedback55).
+pub(crate) fn sqlite_head(f: &std::fs::File) -> bool {
+    crate::statics::read_at(f, 0, 16).map_or(true, |h| crate::db::sqlite_bytes(&h))
 }
 
 /// Whether `part` has the form of a short name Windows gives a file (`GIT~1`, `ENV~1`, `PROGRA~2.TXT`),
@@ -2569,6 +2615,12 @@ pub(crate) fn own_file(it: &Interp, full: &Path, upload: bool) -> Option<&'stati
     // What a path of the settings or the TLS key leads to now, by any name (FEEDBACK55.md, Q-701;
     // branch feedback55).
     if let Some(why) = both.iter().find_map(|f| std::fs::metadata(f).ok().and_then(|m| crate::statics::id_of(&m)).and_then(named_id)) {
+        return Some(why);
+    }
+    // And the paths themselves, while nothing is there: `--env-file`'s and `--tls-key`'s, as
+    // given or as they lead (FEEDBACK55.md, Q-701; branch feedback55).
+    let named: Vec<(std::path::PathBuf, &'static str)> = own().named.clone();
+    if let Some((_, why)) = named.iter().find(|(n, _)| [n.clone(), real_as_made(n)].iter().any(|n| both.iter().any(|f| fold_name(&n.to_string_lossy()) == fold_name(&f.to_string_lossy())))) {
         return Some(why);
     }
     // On Windows, a short name may be any file's (FEEDBACK55.md, Q-701; branch feedback55).
