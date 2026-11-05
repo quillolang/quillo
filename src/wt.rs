@@ -422,8 +422,12 @@ fn hold(room: &dyn Fn(&str) -> bool, json: &str, reliable: bool, only: Option<u6
     n
 }
 
+/// A message for pages: a builtin's error in it says `internal error`, as everywhere a visitor
+/// reads one, where its text went to every page in the channel (FEEDBACK55.md, Q-773; branch
+/// feedback55).
 fn message(ch: &str, v: &Value) -> String {
-    format!("[\"m\",{},{}]", serde_json::Value::from(ch), v.json_text())
+    let hidden = if crate::value::hiding() { crate::server::hidden(v) } else { None };
+    format!("[\"m\",{},{}]", serde_json::Value::from(ch), hidden.as_ref().unwrap_or(v).json_text())
 }
 
 // ---- what pages send, to the program -----------------------------------------

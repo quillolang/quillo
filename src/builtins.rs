@@ -2862,9 +2862,12 @@ pub fn css_value(s: &str) -> String {
     out
 }
 
-/// `__css_value(v)`: what css`...` makes of each `${v}` (see `css_value`).
+/// `__css_value(v)`: what css`...` makes of each `${v}` (see `css_value`). And `&` as CSS's
+/// `\26 `: a `<style>` inside `<svg>` or `<math>` is markup, whose character references the
+/// browser decodes, and `&#125` (a `}` with no `;`) added a rule there (FEEDBACK55.md, Q-707;
+/// branch feedback55). The template's own text, CSS nesting's `&` say, stays as written.
 fn css_value_fn(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    Ok(Value::str(&css_value(&arg(&args, 0).display())))
+    Ok(Value::str(&css_value(&arg(&args, 0).display()).replace('&', "\\26 ")))
 }
 
 /// `css` and `sql`: css`...` and sql`...` are the text as written; the tag

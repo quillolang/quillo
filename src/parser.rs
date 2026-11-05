@@ -3398,6 +3398,21 @@ impl Parser {
             };
             return Err(QuilloError::new(msg, line));
         }
+        // An element marked as a component's island, `<quillo-island>` or `data-qi` (or `data-qd`,
+        // one waiting for its state, and `data-qt`, what is swapped in for it), is taken up by the
+        // runtime as the component its `data-c` names, with the props and state its `data-p` and
+        // `data-s` say: only the server writes them, as `data-c={request.query.c}` handed the page
+        // to the visitor (FEEDBACK55.md, Q-700; branch feedback55).
+        if tag.eq_ignore_ascii_case("quillo-island") {
+            return Err(QuilloError::new(format!("<{}> is Quillo's own element, which the server writes around a component: write the component", tag), line));
+        }
+        let island_mark = |n: &str| {
+            let n = n.get(..5).filter(|p| p.eq_ignore_ascii_case("bind:")).map_or(n, |_| &n[5..]);
+            n.eq_ignore_ascii_case("data-qi") || n.eq_ignore_ascii_case("data-qd") || n.eq_ignore_ascii_case("data-qt")
+        };
+        if let Some((name, _)) = attrs.iter().find(|(n, _)| island_mark(n)).filter(|_| tag.starts_with(|c: char| c.is_ascii_lowercase())) {
+            return Err(QuilloError::new(format!("`{}` in <{}> is Quillo's own attribute, which marks a component's island in the page: only the server writes it", name, tag), line));
+        }
         let mut children = Vec::new();
         let mut dollars = Vec::new();
         let mut joined = Vec::new();

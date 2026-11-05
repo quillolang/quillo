@@ -33,6 +33,50 @@ pub fn own_root(html: &str) -> Option<usize> {
     None
 }
 
+/// A component's own root element from just after its tag name (see `own_root`), written to `out`
+/// without the attributes of an island its markup gave it (`data-c={x}`, `data-e`; a spread's are
+/// dropped already): the server's, written before them, are the island's, and one the server did
+/// not write (`data-l`, `data-e`) was taken as the island's (FEEDBACK55.md, Q-700; branch
+/// feedback55).
+pub fn root_without_island_attrs(rest: &str, out: &mut String) {
+    let b = rest.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i] != b'>' {
+        if !b[i].is_ascii_whitespace() {
+            let s = i;
+            while i < b.len() && !b[i].is_ascii_whitespace() && b[i] != b'>' {
+                i += 1;
+            }
+            out.push_str(&rest[s..i]);
+            continue;
+        }
+        // ` name`, ` name="value"`: the value as written here, escaped, so its `"` ends it.
+        let start = i;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let name = i;
+        while i < b.len() && !b[i].is_ascii_whitespace() && !matches!(b[i], b'=' | b'>' | b'/') {
+            i += 1;
+        }
+        let named = &rest[name..i];
+        if b.get(i) == Some(&b'=') {
+            i += 1;
+            if b.get(i) == Some(&b'"') {
+                i += 1 + rest[i + 1..].find('"').map_or(rest.len() - i - 1, |n| n + 1);
+            } else {
+                while i < b.len() && !b[i].is_ascii_whitespace() && b[i] != b'>' {
+                    i += 1;
+                }
+            }
+        }
+        if named.is_empty() || !crate::interp::island_attr(&named.to_ascii_lowercase()) {
+            out.push_str(&rest[start..i]);
+        }
+    }
+    out.push_str(&rest[i..]);
+}
+
 /// Builtins that, called while a component renders, make it run without
 /// anyone touching it: timers, live data, the page's own JavaScript.
 const BY_ITSELF: &[&str] = &["every", "live", "listen", "js", "js_new"];

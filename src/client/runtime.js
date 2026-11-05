@@ -9,6 +9,10 @@ let BASE = "";
 // taking up the server's HTML, says why. Lines ending `// dev` say it, and
 // are left out of production bundles (see `runtime_units` in client.rs).
 let DEV = false;
+// Whether the server shows a builtin's errors (`--watch`), which it hides from visitors else: the
+// browser does as it does (see `repr`); the bundle sets it (FEEDBACK55.md, Q-773; branch
+// feedback55).
+let ERRORS_SHOWN = false;
 const withBase = (u) => (BASE && typeof u === "string" && u[0] === "/" && u[1] !== "/" ? BASE + u : u);
 // In an app, the one way out the app's shell gives (FEEDBACK39.md, Q-465 and Q-470; branch
 // feedback36-39): the page comes from the app itself, through a scheme, and what a scheme cannot
@@ -23,7 +27,12 @@ const openSocket = (path) => (WIRE && WIRE.socket ? WIRE.socket(path) : new WebS
 
 class QuilloError extends Error {}
 class Ret { constructor(v) { this.v = v; } }
-class Err { constructor(e) { this.error = e === undefined ? null : e; } }
+// `own`: shown as it is. The program wrote it (`err(x)`, a record's), the server sent it (having
+// hidden what a visitor is not to read), or it is of the page's own JavaScript (`js`, a library's
+// or a module's name), which has no server side and holds nothing of the server's. The rest are a
+// builtin's, whose text is hidden as the server hides it (see `repr`; FEEDBACK55.md, Q-773; branch
+// feedback55).
+class Err { constructor(e, own) { this.error = e === undefined ? null : e; this.own = own === true; } }
 
 const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 // Puts a key in a map the program made: "__proto__" is a key like any
@@ -612,7 +621,10 @@ function repr(v) {
   if (v instanceof Dec) return decText(v) + "m";
   if (typeof v === "function") return "<fn " + (v.$name || "<fn>") + ">";
   if (Array.isArray(v)) return "[" + v.map(repr).join(", ") + "]";
-  if (v instanceof Err) return "err(" + repr(v.error) + ")";
+  // A builtin's error says `internal error` as the server writes it, unless the server shows
+  // errors (`--watch`): its text was shown once the browser made the component again, and made
+  // it again for that (FEEDBACK55.md, Q-773; branch feedback55).
+  if (v instanceof Err) return "err(" + (v.own || ERRORS_SHOWN ? repr(v.error) : "\"internal error\"") + ")";
   if (v instanceof Html) return "<html>";
   if (isEvent(v)) return "<event " + v.type + ">";
   const ks = Object.keys(v);
@@ -1073,6 +1085,18 @@ function toJSON(v, wire) {
 }
 // JSON text of a value, a large int written as its digits.
 const jsonText = (v, indent) => JSON.stringify(toJSON(v), null, indent).replace(/"\\u0000int:(-?\d+)"/g, "$1");
+// What a visitor may read of `v` as JSON (`json.stringify`, an attribute's): a builtin's error
+// says `internal error`, as the server's `hidden` has it, unless the server shows errors
+// (FEEDBACK55.md, Q-773; branch feedback55).
+// The value itself when it holds no such error, as the server's `holds_hidden_error` finds.
+const visible = (v) => (ERRORS_SHOWN || !holdsHidden(v) ? v : hiddenIn(v));
+const holdsHidden = (v) => (v instanceof Err ? !v.own || holdsHidden(v.error) : Array.isArray(v) ? v.some(holdsHidden) : isMap(v) && Object.keys(v).some((k) => holdsHidden(v[k])));
+function hiddenIn(v) {
+  if (v instanceof Err) return v.own ? new Err(hiddenIn(v.error), true) : new Err("internal error");
+  if (Array.isArray(v)) return v.map(hiddenIn);
+  if (isMap(v)) { const o = {}; for (const k of Object.keys(v)) putKey(o, k, hiddenIn(v[k])); return o; }
+  return v;
+}
 
 const B = {};
 
@@ -1492,7 +1516,7 @@ B.__concat = meta((...ls) => {
   }
   return out;
 }, "__concat", null);
-B.err = meta((v = null) => new Err(v), "err", null);
+B.err = meta((v = null) => new Err(v, true), "err", null);
 B.is_err = meta((v) => v instanceof Err, "is_err", null);
 B.unwrap = meta((v) => { if (v instanceof Err) fail(`unwrap of an error: ${display(v.error)}`); return v; }, "unwrap", null);
 const textHtml = (s) => Object.assign(rawHtml(s), { text: s });
@@ -1658,7 +1682,10 @@ const HL = (() => {
     return after && (!partial || partial[0] === "/");
   };
   return (code, name) => {
-    const l = langs[String(name || "").toLowerCase()] || plain;
+    // A language of its own: `constructor` or `__proto__` found the object's, and threw
+    // (FEEDBACK55.md, Q-711; branch feedback55).
+    const key = String(name || "").toLowerCase();
+    const l = hasOwn(langs, key) ? langs[key] : plain;
     const s = Array.from(code);
     const n = s.length;
     const starts = (i, p) => { const ps = Array.from(p); for (let k = 0; k < ps.length; k++) if (s[i + k] !== ps[k]) return false; return true; };
@@ -1825,7 +1852,7 @@ function jsPath(path, f) {
   }
   for (const p of parts) {
     foreignName(p);
-    if (v === null || v === undefined || !(p in Object(v))) return [null, null, new Err(`${f}: ${path} is not defined on this page${jsNear(v, p)}`)];
+    if (v === null || v === undefined || !(p in Object(v))) return [null, null, new Err(`${f}: ${path} is not defined on this page${jsNear(v, p)}`, true)];
     owner = v;
     v = v[p];
   }
@@ -1930,7 +1957,8 @@ B.t = meta((k, vars) => translate(k, vars, (s) => s), "t", null);
 B.t_html = (k, vars) => rawHtml(translate(k, vars, B.escape));
 B.url = meta(() => currentUrl(), "url", null);
 B.css = meta((s) => S(s, "css"), "css", null);
-B.__css_value = meta((v) => cssValue(display(v)), "__css_value", null);
+// And `&` as `\26 `, as on the server, for a sheet in <svg> or <math> (FEEDBACK55.md, Q-707; branch feedback55).
+B.__css_value = meta((v) => cssValue(display(v)).replace(/&/g, "\\26 "), "__css_value", null);
 B.sql = meta((s) => S(s, "sql"), "sql", null);
 B.navigate = meta((to) => navigate(S(to, "navigate")), "navigate", null);
 // `waiting(state)` is compiled to W.waiting(signal); given any other way, it
@@ -1943,7 +1971,7 @@ B.json = {
   // An id in a document keeps its digits, where the browser says what they were
   // (FEEDBACK25.md, Q-301; branch feedback26-fixes).
   parse: (s) => { S(s, "json.parse"); try { return fromJSON(JSON.parse(s, (k, v, c) => typeof v === "number" && !Number.isSafeInteger(v) && c && /^-?\d+$/.test(c.source) && Math.abs(v) < 2 ** 63 ? intOf(BigInt(c.source)) : v)); } catch (e) { return new Err("invalid JSON: " + e.message); } },
-  stringify: (v, pretty) => jsonText(v, truthy(pretty) ? 2 : undefined),
+  stringify: (v, pretty) => jsonText(visible(v), truthy(pretty) ? 2 : undefined),
 };
 
 function fromJSON(j) {
@@ -1956,10 +1984,10 @@ B.__record = meta((name, v) => {
   const td = OWN_TYPES[name];
   if (!td) fail(`there is no type \`${name}\``);
   if (td.r && isNil(v)) v = {};
-  if (td.r && !isMap(v)) return new Err(`${name}: expects a map of its fields, got ${typeName(v)} ${short(v)}`);
+  if (td.r && !isMap(v)) return new Err(`${name}: expects a map of its fields, got ${typeName(v)} ${short(v)}`, true);
   const r = ownMake(ownTyOf(name), v);
   if (r.ok) return r.v;
-  return new Err(`${name}: ${ownWhyText(ownWhyHere(r.w, { t: td.a ? td.a.t : name }, v))}`);
+  return new Err(`${name}: ${ownWhyText(ownWhyHere(r.w, { t: td.a ? td.a.t : name }, v))}`, true);
 }, "__record", null);
 
 // ---- re (src/re.rs, the same matches) ---------------------------------------
@@ -4400,7 +4428,7 @@ async function rpcSend(name, args, live, idem) {
   if (body && hasOwn(body, "patch")) {
     if (!had) return failed(`server fn \`${name}\`: a patch to nothing`);
     value = livePatched(base, body.patch);
-  } else value = body && hasOwn(body, "err") ? new Err(body.err) : body && hasOwn(body, "ok") ? body.ok : null;
+  } else value = body && hasOwn(body, "err") ? new Err(body.err, true) : body && hasOwn(body, "ok") ? body.ok : null;
   return { value, topics: (body && body.topics) || [], seq: (body && body.seq) || 0, server: (body && body.server) || "", h: (body && body.h) || "" };
 }
 
@@ -5606,8 +5634,17 @@ function codeAttr(k) {
 // The name that would be written is checked (`bind:onclick` is `onclick`);
 // names with `:` (but xlink:href) come only from the program.
 function spreadAttrOk(k) {
-  return /^[^\s"'<>\/=`{}\u0000-\u001f\u007f]+$/.test(k) && !codeAttr(k) && !k.startsWith("__") && (!k.includes(":") || attrKey(k) === "xlink:href");
+  return /^[^\s"'<>\/=`{}\u0000-\u001f\u007f]+$/.test(k) && !codeAttr(k) && !runtimeAttr(attrKey(k)) && !k.startsWith("__") && (!k.includes(":") || attrKey(k) === "xlink:href");
 }
+
+// The attributes this runtime reads to take an element up as a component (an island's mark,
+// component, props, state, live data, whether it starts by itself), and Quillo's own
+// `data-q-<style>` and `data-quillo-…`: never from a spread, as on the server, where visitor
+// JSON made any element a component of its choosing (FEEDBACK55.md, Q-700; branch feedback55).
+// The island's own, as the server writes them (`island_attr` in src/interp.rs), `data-qt` on what
+// is swapped in for a waiting one (src/defer.rs).
+const ISLAND_ATTRS = new Set(["data-qi", "data-qd", "data-qt", "data-c", "data-p", "data-s", "data-l", "data-v", "data-e"]);
+const runtimeAttr = (n) => ISLAND_ATTRS.has(n) || n.startsWith("data-q-") || n.startsWith("data-quillo-");
 
 const sandboxed = (el) => el.hasAttribute("sandbox") && !/allow-same-origin/i.test(el.getAttribute("sandbox"));
 
@@ -5696,6 +5733,10 @@ function boolText(k, v) {
 }
 
 function setProp(el, k, v, old) {
+  // A component's own root that is its island (a table's row): the island's attributes are the
+  // server's, and the markup's own neither change them nor add one (FEEDBACK55.md, Q-700; branch
+  // feedback55).
+  if (el.__q && ISLAND_ATTRS.has(attrKey(k))) return;
   // A function is no value of an attribute's, as on the server (found in review).
   if (typeof v === "function") v = null;
   if (k === "style" && isMap(v)) v = styleText(v);
@@ -5737,7 +5778,7 @@ function setProp(el, k, v, old) {
   // and a page for a sandboxed frame that is kept away from the site.
   if (codeAttr(k) && !(attrKey(k) === "srcdoc" && sandboxed(el))) return;
   if (k === "href" || k === "src" || k === "action" || k === "formaction" || k === "poster") v = withBase(v);
-  let s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? jsonText(v) : display(v);
+  let s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? jsonText(visible(v)) : display(v);
   // The text the attribute will say, whatever the value's type (html too).
   if (URL_ATTRS.includes(k.toLowerCase()) && scriptURL(s) || animValueAttr(el, k) && s.split(";").some(scriptURL)) v = s = "about:blank#blocked";
   if (old !== v || el.getAttribute(k) !== s) el.setAttribute(k, s);
@@ -6206,6 +6247,9 @@ function wrapper(name) {
 function asOwnRoot(w, inst) {
   const r = w.firstChild;
   if (!r || r !== w.lastChild || !TABLE_PART.test(r.localName)) return w;
+  // Its markup's own island attributes left out, as the server leaves them out (FEEDBACK55.md,
+  // Q-700; branch feedback55).
+  for (const a of ISLAND_ATTRS) r.removeAttribute(a);
   r.setAttribute("data-qi", "");
   r.dataset.c = w.dataset.c;
   r.__q = true;
@@ -6298,7 +6342,7 @@ function untag(v) {
   if (!v || typeof v !== "object" || Array.isArray(v)) return v;
   const ks = Object.keys(v);
   if (ks.length !== 1) return v;
-  if (ks[0] === "$quillo_err") return new Err(v.$quillo_err);
+  if (ks[0] === "$quillo_err") return new Err(v.$quillo_err, true);
   if (ks[0] === "$dec" && typeof v.$dec === "string") return decParse(v.$dec, false) ?? v.$dec;
   if (ks[0] === "$int" && typeof v.$int === "string" && /^-?\d{1,19}$/.test(v.$int)) return intOf(BigInt(v.$int));
   return v;
@@ -6609,7 +6653,7 @@ W.guarded = (e) => { if (e instanceof QuilloError) return null; throw e; };
 // src/client.rs): what it settles to, or its rejection as an error value.
 W.settle = async (v) => {
   if (v === null || typeof v !== "object" || typeof v.then !== "function" || foreign(v) && !(v instanceof Promise)) return v;
-  try { return fromPage(await v); } catch (e) { return new Err("js: " + (e && e.message || String(e))); }
+  try { return fromPage(await v); } catch (e) { return new Err("js: " + (e && e.message || String(e)), true); }
 };
 W.Dec = Dec;
 W.Ret = Ret;
@@ -6618,8 +6662,8 @@ W.Ret = Ret;
 // not load, and the rest of the page runs. A script with no exports at all is not
 // a module, and says so (branch library-hints).
 W.imports = (mods) => Promise.all(mods.map(([name, exp, url]) => import(url).then(
-  (m) => { MODS.set(name, exp === "*" ? m : exp in m ? m[exp] : new Err(Object.keys(m).length ? `${name}: ${url} has no export \`${exp}\`` : `${name}: ${url} exports nothing: a plain script, so leave out \`with module\``)); },
-  (e) => { MODS.set(name, new Err(`${name}: ${url} did not load: ${e && e.message || e}`)); },
+  (m) => { MODS.set(name, exp === "*" ? m : exp in m ? m[exp] : new Err(Object.keys(m).length ? `${name}: ${url} has no export \`${exp}\`` : `${name}: ${url} exports nothing: a plain script, so leave out \`with module\``, true)); },
+  (e) => { MODS.set(name, new Err(`${name}: ${url} did not load: ${e && e.message || e}`, true)); },
 )));
 W.fail = fail;
 W.truthy = truthy;

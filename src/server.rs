@@ -2160,6 +2160,10 @@ impl App {
         App {
             slot: Mutex::new((1, {
                 let loaded = Arc::new(loaded);
+                // Whether errors are hidden, as the server sets it when it starts: the development
+                // bundle made now says it to the browser, under the debugger without `--watch` as
+                // well (FEEDBACK55.md, Q-773; branch feedback55).
+                crate::value::HIDING.store(!watch, std::sync::atomic::Ordering::Relaxed);
                 warm_client(&loaded);
                 loaded
             })),

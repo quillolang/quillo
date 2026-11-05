@@ -740,9 +740,34 @@ fn spread_attr_allowed(name: &str) -> bool {
     let key = attr_key(name);
     attr_name_ok(name)
         && !code_attr(&key)
+        && !runtime_attr(&key)
         && !name.starts_with("__")
         && !name.starts_with('@')
         && (!name.contains(':') || key == "xlink:href")
+}
+
+/// Whether `key`, an attribute's name in lower case, is one the runtime or the page's loader
+/// reads to take an element up as a component (see `island_attr`), or Quillo's own
+/// `data-q-<style>` and `data-quillo-…`. Visitor JSON in a spread wrote them, and the element became a component of
+/// the visitor's choosing, with a string `children` put in as HTML (FEEDBACK55.md, Q-700;
+/// branch feedback55).
+fn runtime_attr(key: &str) -> bool {
+    island_attr(key) || key.starts_with("data-q-") || key.starts_with("data-quillo-")
+}
+
+/// Whether `key`, an attribute's name in lower case, is one the server writes on a component's
+/// island: its mark, `data-qd` while it waits and `data-qt` on what is swapped in for it
+/// (src/defer.rs), its component, props, state, live data and whether it starts by itself.
+pub(crate) fn island_attr(key: &str) -> bool {
+    matches!(key, "data-qi" | "data-qd" | "data-qt" | "data-c" | "data-p" | "data-s" | "data-l" | "data-v" | "data-e")
+}
+
+/// A list's or map's JSON as an attribute's value: a builtin's error in it says `internal error`
+/// where the server hides them, as `json.stringify` does (FEEDBACK55.md, Q-773; branch
+/// feedback55).
+fn attr_json(v: &Value) -> String {
+    let hidden = if crate::value::hiding() { crate::server::hidden(v) } else { None };
+    hidden.as_ref().unwrap_or(v).json_text()
 }
 
 /// Whether `lower`, an attribute's name in lower case, is React's handler form, `onclick`
@@ -4663,9 +4688,9 @@ impl Interp {
                 Value::Bool(b) => write_bool_attr(name, b, &mut rest),
                 // A function, as in `write_attr` (found in review).
                 Value::Nil | Value::Func(_) | Value::Builtin(..) => {}
-                Value::List(_) | Value::Map(_) => {
-                    rest.push_str(&format!(" {}=\"{}\"", name, escape(&v.json_text())))
-                }
+                // A builtin's error in it says `internal error`, as `json.stringify` has it: its
+                // text went out in the attribute (FEEDBACK55.md, Q-773; branch feedback55).
+                Value::List(_) | Value::Map(_) => rest.push_str(&format!(" {}=\"{}\"", name, escape(&attr_json(&v)))),
                 other => rest.push_str(&format!(" {}=\"{}\"", name, escape(&other.display()))),
             }
         }
@@ -4808,7 +4833,8 @@ impl Interp {
                 out.push(' ');
                 out.push_str(name);
                 out.push_str("=\"");
-                escape_into(&v.json_text(), out);
+                // As in `render_attrs` (FEEDBACK55.md, Q-773; branch feedback55).
+                escape_into(&attr_json(&v), out);
                 out.push('"');
             }
             // The HTML parser folds a CR, so `value={s}` would read otherwise here than
@@ -5020,7 +5046,7 @@ impl Interp {
             out.push_str(&body[..at]);
             out.push_str(" data-qi");
             out.push_str(&data);
-            out.push_str(&body[at..]);
+            crate::island::root_without_island_attrs(&body[at..], out);
             return;
         }
         out.push_str("<quillo-island style=\"display:contents\"");

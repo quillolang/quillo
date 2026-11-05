@@ -590,6 +590,12 @@ mod dev {
         // Room in a stack for the calls an error came through (FEEDBACK21.md, Q-173; branch
         // feedback20-fixes).
         let mut prelude = format!("DEV = true;\nError.stackTraceLimit = 64;\n{}", version_line());
+        // A builtin's errors in full where the server shows them (`--watch`), and hidden where it
+        // hides them, as under the debugger without `--watch` (FEEDBACK55.md, Q-773; branch
+        // feedback55). Made when first asked for, once the server has said which.
+        if !crate::value::HIDING.load(std::sync::atomic::Ordering::Relaxed) {
+            prelude.push_str("ERRORS_SHOWN = true;\n");
+        }
         if !it.base.is_empty() {
             let _ = writeln!(prelude, "BASE = {};", js_str(&it.base));
         }
@@ -1030,6 +1036,11 @@ pub fn test_script(it: &Interp, name: &str) -> Result<String, QuilloError> {
     for d in c.defs.iter().chain(c.view_defs.iter()) {
         program.push_str(d);
         program.push('\n');
+    }
+    // Errors shown as the interpreter here shows them: in full, but in a server's
+    // (FEEDBACK55.md, Q-773; branch feedback55).
+    if !crate::value::HIDING.load(std::sync::atomic::Ordering::Relaxed) {
+        program.push_str("ERRORS_SHOWN = true;\n");
     }
     let _ = writeln!(
         program,
