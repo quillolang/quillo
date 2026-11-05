@@ -28,6 +28,8 @@ pub(crate) struct Deferred {
     pub state: Map,
     pub live: Map,
     pub line: u32,
+    /// Placed inside `<svg>` (see `island::own_root_in`; FEEDBACK55.md, Q-763; branch feedback55).
+    pub svg: bool,
 }
 
 /// A page whose waiting components follow it: its HTML up to `</body>`, what comes

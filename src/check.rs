@@ -3002,9 +3002,44 @@ impl Checker {
         self.params(d);
         let t = self.expr(&d.body);
         self.check_return_expr(&d.body, t);
+        if d.component {
+            self.run_once_assignments(d);
+        }
         self.pop();
         self.fns.pop();
         self.fn_ended();
+    }
+
+    /// `count = len(items)` in a component's body runs once, as it starts, on the server and in
+    /// the browser: it does not follow `items`, or a prop, when they change, which reads as if it
+    /// would (as a `let` does). Made an effect, cycles went round (`a = b + 1`, `b = a + 1`), a
+    /// conversion rewrote what was being typed, and a parent's equal new value undid a pick: said
+    /// instead (FEEDBACK55.md, Q-764; branch feedback55).
+    fn run_once_assignments(&mut self, d: &FnDef) {
+        let Expr::Block(stmts) = &d.body else { return };
+        let mut changing: Vec<&str> = d.params.iter().map(|p| p.name.as_str()).collect();
+        changing.extend(stmts.iter().filter_map(|st| if let Stmt::State(n, ..) = st { Some(n.as_str()) } else { None }));
+        for st in stmts {
+            let Stmt::Assign(name, AssignOp::Set, e, line) = st else { continue };
+            if !changing.contains(&name.as_str()) {
+                continue;
+            }
+            let mut read: Option<String> = None;
+            crate::client::each_expr(e, &mut |x| {
+                if let Expr::Ident(n, _) = x {
+                    if read.is_none() && n.as_str() != name.as_str() && changing.contains(&n.as_str()) {
+                        read = Some(n.to_string());
+                    }
+                }
+            });
+            if let Some(r) = read {
+                self.line = *line;
+                self.warn(format!(
+                    "`{} = ...` runs once, as <{}> starts: it does not follow `{}` when that changes; for a value that follows it, write `let {} = ...` in place of the state",
+                    name, d.name, r, name
+                ));
+            }
+        }
     }
 
     fn params(&mut self, d: &FnDef) {

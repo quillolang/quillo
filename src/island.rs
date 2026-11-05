@@ -13,8 +13,17 @@ const TABLE_PARTS: &[&str] = &["tr", "td", "th", "thead", "tbody", "tfoot", "cap
 /// Where a component's island data goes in its own root element (just
 /// after `<tr`), when its HTML is one element of `TABLE_PARTS`.
 pub fn own_root(html: &str) -> Option<usize> {
+    own_root_in(html, false)
+}
+
+/// The same, for a component rendered inside `<svg>` when `svg`: there its root, whatever it is
+/// (`rect`, `g`, `a`, an `svg`), is its own island, as SVG draws only elements of its own, not a
+/// `<quillo-island>`, as the browser makes it (FEEDBACK55.md, Q-763; branch feedback55).
+pub fn own_root_in(html: &str, svg: bool) -> Option<usize> {
     let starts = |at: &str, tag: &str| at.strip_prefix(tag).is_some_and(|r| r.starts_with([' ', '>', '/', '\t', '\n']));
-    let tag = *TABLE_PARTS.iter().find(|t| html.strip_prefix('<').is_some_and(|r| starts(r, t)))?;
+    let name = html.strip_prefix('<')?;
+    let name = &name[..name.find([' ', '>', '/', '\t', '\n'])?];
+    let tag = if svg { Some(name).filter(|n| n.starts_with(|c: char| c.is_ascii_alphabetic()))? } else { *TABLE_PARTS.iter().find(|t| **t == name)? };
     // One element, not several: its own end tag is the last thing.
     let mut depth = 0usize;
     for (i, _) in html.match_indices('<') {

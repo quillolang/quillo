@@ -183,6 +183,19 @@ pub struct Interp {
     /// State of the components being rendered, innermost last, with the
     /// `live(...)` subscriptions of each.
     islands: Vec<(Map, Map)>,
+    /// The value of the `<select>` whose start tag is being written, then what its options are
+    /// rendered against (see `render_option_into`; FEEDBACK55.md, Q-758; branch feedback55).
+    select_pending: Option<Value>,
+    select_want: Option<SelectWant>,
+    /// Where each component being rendered keeps its states, innermost last, to read them as its
+    /// first render leaves them; and the states a second render of one starts with, with how deep
+    /// it is (see `render_again`; FEEDBACK55.md, Q-770; branch feedback55).
+    island_scopes: Vec<(usize, Env, Option<Value>)>,
+    island_scopes_at: Vec<usize>,
+    /// Rendering inside `<svg>` (and not in a `<foreignObject>` there): a component's root is its
+    /// own island (see `island_wrap`; FEEDBACK55.md, Q-763; branch feedback55).
+    in_svg: bool,
+    state_again: Option<(usize, Map)>,
     /// While the server renders a component: its code also runs in the
     /// browser, where `http.*` calls are made (see src/fetch.rs). A
     /// `server fn` it calls runs on the server, and clears it.
@@ -1475,6 +1488,12 @@ impl Interp {
             current_request: None,
             pending_request: None,
             islands: Vec::new(),
+            select_pending: None,
+            select_want: None,
+            island_scopes: Vec::new(),
+            island_scopes_at: Vec::new(),
+            in_svg: false,
+            state_again: None,
             in_component: false,
             pg_tx: std::sync::Mutex::new(Vec::new()),
             reads: None,
@@ -1577,6 +1596,12 @@ impl Interp {
             current_request: None,
             pending_request: None,
             islands: Vec::new(),
+            select_pending: None,
+            select_want: None,
+            island_scopes: Vec::new(),
+            island_scopes_at: Vec::new(),
+            in_svg: false,
+            state_again: None,
             in_component: false,
             pg_tx: std::sync::Mutex::new(Vec::new()),
             reads: None,
@@ -2360,7 +2385,9 @@ impl Interp {
                 // `defer(...)`: null now, worked out after the page. Its second
                 // render takes the other states as they were (src/defer.rs; branch defer).
                 let top = self.islands.len() == 1;
-                let v = match self.state_preset.as_ref().filter(|_| top).and_then(|m| m.get(name.as_str()).cloned()) {
+                let given = self.state_preset.as_ref().filter(|_| top).and_then(|m| m.get(name.as_str()).cloned());
+                let again = || self.state_again.as_ref().filter(|(d, _)| *d == self.islands.len()).and_then(|(_, m)| m.get(name.as_str()).cloned());
+                let v = match given.or_else(again) {
                     Some(v) => v,
                     None if top && self.state_preset.is_none() && defer_call(e, env) => {
                         self.island_defers.push(name.clone());
@@ -2370,10 +2397,11 @@ impl Interp {
                 };
                 let live = self.last_live.take();
                 if let Some((state, subs)) = self.islands.last_mut() {
-                    state.insert(name.into(), v.clone());
+                    let (at, _) = state.insert_full(name.into(), v.clone());
                     if let Some(l) = live {
                         subs.insert(name.into(), l);
                     }
+                    self.island_scopes.push((at, env.clone(), None));
                 }
                 define(env, name, v);
                 Ok(Value::Nil)
@@ -4123,6 +4151,10 @@ impl Interp {
                     for s in rest {
                         self.exec_stmt(s, &scope)?;
                     }
+                    // A component's body that declared its states here: its markup starts.
+                    if self.island_scopes.last().is_some_and(|(_, e, _)| Arc::ptr_eq(e, &scope)) {
+                        self.markup_starts();
+                    }
                     if crate::debug::on() {
                         return crate::debug::around(self, end, &scope, |it| it.render_expr_into(last, &scope, out));
                     }
@@ -4466,6 +4498,9 @@ impl Interp {
         if f.component {
             return self.render_component_into(el, env, out);
         }
+        if self.select_want.is_some() && (el.tag == "option" || el.tag == "optgroup") {
+            return self.render_option_into(el, env, out);
+        }
         // An element whose HTML never changes is made once.
         if f.fixed {
             if let Some(h) = f.html_once.get() {
@@ -4490,16 +4525,62 @@ impl Interp {
                 }
                 let _ = f.pieces.set(pieces);
             }
-            for p in f.pieces.get().expect("set above") {
-                match p {
-                    Piece::Html(h) => out.push_str(h),
-                    Piece::Expr(e) => self.render_expr_into(e, env, out)?,
-                    Piece::El(e) => self.render_el_into(e, env, out)?,
+            // In an `<svg>` (or out of it, in a `<foreignObject>`): see `in_svg`.
+            let outer = f.svg.map(|v| std::mem::replace(&mut self.in_svg, v));
+            let r = (|| {
+                for p in f.pieces.get().expect("set above") {
+                    match p {
+                        Piece::Html(h) => out.push_str(h),
+                        Piece::Expr(e) => self.render_expr_into(e, env, out)?,
+                        Piece::El(e) => self.render_el_into(e, env, out)?,
+                    }
                 }
+                Ok(())
+            })();
+            if let Some(v) = outer {
+                self.in_svg = v;
             }
-            return Ok(());
+            return r;
         }
         self.render_tag_into(el, env, out)
+    }
+
+    /// An option (or a group of them) of a `<select value={...}>`, made each time: ` selected` on
+    /// the first the value names, as the browser shows a select given that value; for a list
+    /// (`<select multiple>`), on each it names. An option's value is its `value`, else its text,
+    /// spaces trimmed and run together, as the browser reads it; one marked `selected` already
+    /// stays as written (FEEDBACK55.md, Q-758 and Q-761; branch feedback55).
+    fn render_option_into(&mut self, el: &HtmlEl, env: &Env, out: &mut String) -> Result<(), Ctrl> {
+        let start = out.len();
+        let option = el.tag == "option";
+        // An option whose HTML never changes is made once, as elsewhere, and marked here.
+        match el.facts.html_once.get() {
+            Some(h) if option && el.facts.fixed => out.push_str(h),
+            _ => {
+                self.render_tag_into(el, env, out)?;
+                if option && el.facts.fixed {
+                    let _ = el.facts.html_once.set(Arc::from(&out[start..]));
+                }
+            }
+        }
+        let html = &out[start..];
+        let (Some(want), Some(end), true) = (self.select_want.as_mut(), html.find('>'), option) else { return Ok(()) };
+        let tag = &html[..end];
+        if want.done || start_tag_attr(tag, "selected").is_some() {
+            return Ok(());
+        }
+        let named = match start_tag_attr(tag, "value") {
+            Some(v) => want.values.iter().any(|w| w == v),
+            None => {
+                let text = html[end + 1..html.len() - "</option>".len()].split_ascii_whitespace().collect::<Vec<_>>().join(" ");
+                want.values.iter().any(|w| *w == text)
+            }
+        };
+        if named {
+            want.done = !want.many;
+            out.insert_str(start + "<option".len(), " selected");
+        }
+        Ok(())
     }
 
     /// `el` as pieces (see `ElFacts::pieces`): its tags and those of the
@@ -4514,7 +4595,8 @@ impl Interp {
         }
         for c in &el.children {
             match c {
-                HtmlChild::El(e) if e.facts.tags_fixed && !drops_first_newline(&e.tag) => self.pieces_into(e, env, pieces, html)?,
+                // Not an `<svg>` or a `<foreignObject>`, which change what is in them (`in_svg`).
+                HtmlChild::El(e) if e.facts.tags_fixed && !drops_first_newline(&e.tag) && e.facts.svg.is_none() => self.pieces_into(e, env, pieces, html)?,
                 HtmlChild::Expr(e @ Expr::Lit(Lit::Str(_))) => self.render_expr_into(e, env, html)?,
                 _ => {
                     if !html.is_empty() {
@@ -4542,12 +4624,31 @@ impl Interp {
         out.push_str(&el.tag);
         // Most elements have no spread, no `class=` and are no <textarea>:
         // their attributes are written as they are evaluated.
+        let select = el.tag == "select";
+        if select {
+            // Only its own value (one left by a select whose attributes failed is not).
+            self.select_pending = None;
+        }
         let text_value = if f.plain_attrs { self.render_attrs_fast(el, env, out)?; None } else { self.render_attrs(el, env, out)? };
         out.push('>');
         if f.void {
             return Ok(());
         }
-        self.render_contents(el, env, text_value, out)?;
+        if select {
+            // Its options, against its value (see `render_option_into`).
+            let want = self.select_pending.take().map(|v| SelectWant::of(&v));
+            let outer = std::mem::replace(&mut self.select_want, want);
+            let r = self.render_contents(el, env, text_value, out);
+            self.select_want = outer;
+            r?;
+        } else if let Some(v) = f.svg {
+            let outer = std::mem::replace(&mut self.in_svg, v);
+            let r = self.render_contents(el, env, text_value, out);
+            self.in_svg = outer;
+            r?;
+        } else {
+            self.render_contents(el, env, text_value, out)?;
+        }
         out.push_str("</");
         out.push_str(&el.tag);
         out.push('>');
@@ -4702,6 +4803,12 @@ impl Interp {
                 text_value = Some(if matches!(v, Value::Nil) { String::new() } else { v.display() });
                 continue;
             }
+            // Browsers ignore `value` on a select: its options show it (FEEDBACK55.md, Q-758;
+            // branch feedback55).
+            if name == "value" && el.tag == "select" {
+                self.select_pending = Some(v);
+                continue;
+            }
             if name.eq_ignore_ascii_case("class") {
                 match &v {
                     Value::Nil | Value::Bool(false) | Value::Func(_) | Value::Builtin(..) => {}
@@ -4767,6 +4874,19 @@ impl Interp {
             }
             let name = name.strip_prefix("bind:").unwrap_or(name);
             if !attr_name_ok(name) {
+                continue;
+            }
+            // As in `render_attrs` (FEEDBACK55.md, Q-758; branch feedback55).
+            if el.facts.select_value && name == "value" {
+                self.select_pending = Some(match val {
+                    AttrVal::Expr(Expr::Template(parts)) => {
+                        let mut t = String::new();
+                        self.template_into(parts, env, &mut t)?;
+                        Value::str(&t)
+                    }
+                    AttrVal::Expr(e) => self.eval(e, env)?,
+                    _ => Value::Bool(true),
+                });
                 continue;
             }
             match val {
@@ -4985,15 +5105,33 @@ impl Interp {
         }
         self.mark_impure();
         self.islands.push((Map::new(), Map::new()));
+        self.island_scopes_at.push(self.island_scopes.len());
         // A component placed in the page may defer: what renders it again (branch defer).
         let again = (!nested).then(|| args.clone());
+        // What renders it once more (see `render_again`), but inside another's second render, and
+        // the options of a select it is in, as they were before it.
+        let twice = self.state_again.is_none().then(|| (args.clone(), self.select_want.clone()));
         let mut body = String::new();
         let was = std::mem::replace(&mut self.in_component, true);
         let r = crate::value::js_numbers(true, || self.render_call_into(&c, args, line, &mut body));
         self.in_component = was;
-        let (state, live) = self.islands.pop().unwrap_or_default();
+        let (mut state, mut live) = self.islands.pop().unwrap_or_default();
+        let now = self.states_now(&state);
         let defers = if nested { Vec::new() } else { std::mem::take(&mut self.island_defers) };
         r?;
+        if let (Some(now), Some((args, options))) = (now, twice) {
+            let after = std::mem::replace(&mut self.select_want, options);
+            match self.render_again(&c, args, line, now) {
+                Some((b, s, l)) => {
+                    body = b;
+                    state = s;
+                    for (k, v) in l {
+                        live.insert(k, v);
+                    }
+                }
+                None => self.select_want = after,
+            }
+        }
         let props = if nested { Map::new() } else { props };
         for (what, m) in [("prop", &props), ("state", &state)] {
             for (k, x) in m.iter() {
@@ -5023,18 +5161,75 @@ impl Interp {
             }
             self.deferred.push(crate::defer::Deferred {
                 id, c: c.clone(), args: again.unwrap_or_default(), tag: el.tag.clone(), props: props.clone(), state: kept, live: live.clone(), line,
+                svg: self.in_svg,
             });
             extra = format!(" data-qd=\"{}\"", id);
         }
         let eager = crate::island::runs_by_itself(&c.def.body);
-        self.island_wrap(&el.tag, props, state, live, eager, &extra, &body, out);
+        self.island_wrap(&el.tag, props, state, live, eager, &extra, &body, self.in_svg, out);
         Ok(())
+    }
+
+    /// A component whose state changed while its markup was rendered, after what was rendered
+    /// before showed it (a child calling back `on_ready(5)` as it starts): rendered again, its
+    /// states as declared but those, which start as the first render left them, so that its page
+    /// shows one value, and its island carries it, as the browser ends up showing. What its own
+    /// statements set before the markup (`user = "ana"`, `n += 1`) is no reason: the browser runs
+    /// them as the server did. Kept only when the second render's markup changes nothing again
+    /// (`count += n` from the child does, and keeps the first, as before); at most once each, and
+    /// not inside another's second render, so that what is below is not rendered over and over
+    /// (FEEDBACK55.md, Q-770; branch feedback55).
+    fn render_again(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32, now: Map) -> Option<(String, Map, Map)> {
+        self.islands.push((Map::new(), Map::new()));
+        self.island_scopes_at.push(self.island_scopes.len());
+        let outer = self.state_again.replace((self.islands.len(), now));
+        let mut body = String::new();
+        let was = std::mem::replace(&mut self.in_component, true);
+        let r = crate::value::js_numbers(true, || self.render_call_into(c, args, line, &mut body));
+        self.in_component = was;
+        self.state_again = outer;
+        let (state, live) = self.islands.pop().unwrap_or_default();
+        let again = self.states_now(&state);
+        (r.is_ok() && again.is_none()).then_some((body, state, live))
+    }
+
+    /// The states of the component just rendered (its island's `state`, as declared), those that
+    /// changed while its markup was rendered as the render left them, when there are any, else
+    /// none; their places are let go of either way (see `render_again`).
+    fn states_now(&mut self, state: &Map) -> Option<Map> {
+        let from = self.island_scopes_at.pop().unwrap_or(0).min(self.island_scopes.len());
+        let mut now: Option<Map> = None;
+        for (at, env, seen) in self.island_scopes.drain(from..) {
+            let (Some(was), Some((name, _))) = (seen, state.get_index(at)) else { continue };
+            let Some(v) = lookup(&env, name.as_str()) else { continue };
+            let same = match (&was, &v) {
+                (Value::List(a), Value::List(b)) => Arc::ptr_eq(a, b) || crate::value::equal(&was, &v),
+                (Value::Map(a), Value::Map(b)) => Arc::ptr_eq(a, b) || crate::value::equal(&was, &v),
+                _ => crate::value::equal(&was, &v),
+            };
+            if !same {
+                now.get_or_insert_with(|| state.clone()).insert(name.clone(), v);
+            }
+        }
+        now
+    }
+
+    /// A component's markup starts (its body's statements are done): its states as they are now,
+    /// which a change while the markup renders is told by (see `states_now`).
+    fn markup_starts(&mut self) {
+        let from = self.island_scopes_at.last().copied().unwrap_or(0).min(self.island_scopes.len());
+        let Some((state, _)) = self.islands.last() else { return };
+        for (at, env, seen) in &mut self.island_scopes[from..] {
+            if let Some((name, _)) = state.get_index(*at) {
+                *seen = lookup(env, name.as_str());
+            }
+        }
     }
 
     /// A component's island: its HTML in a `<quillo-island>` carrying its props and
     /// state (or, inside a table or a select, its own root element carrying them).
     #[allow(clippy::too_many_arguments)]
-    fn island_wrap(&self, tag: &str, props: Map, mut state: Map, live: Map, eager: bool, extra: &str, body: &str, out: &mut String) {
+    fn island_wrap(&self, tag: &str, props: Map, mut state: Map, live: Map, eager: bool, extra: &str, body: &str, svg: bool, out: &mut String) {
         // A state that still holds its very prop, as `state items = initial` does, is written as
         // a reference to it, not as a second copy of the list (FEEDBACK30.md, Q-371; branch
         // feedback27-35-fixes).
@@ -5076,8 +5271,10 @@ impl Interp {
         );
         // Inside a table or a select the browser's parser moves any other
         // element out, island and all: there the component's own root
-        // element is its island.
-        if let Some(at) = crate::island::own_root(body) {
+        // element is its island. So it is inside an `<svg>` (`svg`), whatever
+        // it is, as SVG draws no `<quillo-island>` (FEEDBACK55.md, Q-763; branch
+        // feedback55).
+        if let Some(at) = crate::island::own_root_in(body, svg) {
             out.push_str(&body[..at]);
             out.push_str(" data-qi");
             out.push_str(&data);
@@ -5096,11 +5293,16 @@ impl Interp {
     pub(crate) fn render_deferred(&mut self, d: &crate::defer::Deferred) -> Result<String, Ctrl> {
         self.state_preset = Some(d.state.clone());
         self.islands.push((Map::new(), Map::new()));
+        self.island_scopes_at.push(self.island_scopes.len());
         let mut body = String::new();
         let was = std::mem::replace(&mut self.in_component, true);
+        // Where it stands, in an `<svg>` or not (see `in_svg`).
+        let outer = std::mem::replace(&mut self.in_svg, d.svg);
         let r = crate::value::js_numbers(true, || self.render_call_into(&d.c, d.args.clone(), d.line, &mut body));
         self.in_component = was;
         let (state, mut live) = self.islands.pop().unwrap_or_default();
+        let _ = self.states_now(&state);
+        self.in_svg = outer;
         self.state_preset = None;
         r?;
         // What it followed the first time, it follows still.
@@ -5115,8 +5317,50 @@ impl Interp {
             }
         }
         let mut out = String::new();
-        self.island_wrap(&d.tag, d.props.clone(), state, live, crate::island::runs_by_itself(&d.c.def.body), "", &body, &mut out);
+        self.island_wrap(&d.tag, d.props.clone(), state, live, crate::island::runs_by_itself(&d.c.def.body), "", &body, d.svg, &mut out);
         Ok(out)
+    }
+}
+
+/// Attribute `name`'s value (as written, escaped) in a start tag the server wrote (`<option a="x"
+/// b`, its `>` left out): `name="..."`, or a bare `name`.
+fn start_tag_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let mut rest = tag.split_once(' ')?.1;
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return None;
+        }
+        // (At least the `=` of one written without a name, so each turn moves on.)
+        let n = rest.find(['=', ' ']).unwrap_or(rest.len()).max(1);
+        let (here, after) = rest.split_at(n);
+        let (value, after) = match after.strip_prefix("=\"") {
+            Some(v) => v.split_once('"').unwrap_or((v, "")),
+            None => ("", after),
+        };
+        if here == name {
+            return Some(value);
+        }
+        rest = after;
+    }
+}
+
+/// What a `<select>`'s options are rendered against: the texts its value names (escaped, as its
+/// options' are written), all of them for a list, else the first (see `render_option_into`).
+#[derive(Clone)]
+struct SelectWant {
+    values: Vec<String>,
+    many: bool,
+    done: bool,
+}
+
+impl SelectWant {
+    fn of(v: &Value) -> SelectWant {
+        let text = |v: &Value| if matches!(v, Value::Nil) { String::new() } else { escape(&v.display()) };
+        match v {
+            Value::List(xs) => SelectWant { values: xs.iter().map(text).collect(), many: true, done: false },
+            v => SelectWant { values: vec![text(v)], many: false, done: false },
+        }
     }
 }
 

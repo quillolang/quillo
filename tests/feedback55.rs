@@ -381,6 +381,801 @@ route GET / = <html><head><title>t</title></head><body>
     assert_eq!((r["n"].as_u64(), &r["differ"], &r["errors"]), (Some(15), &serde_json::json!([]), &serde_json::json!([])), "{}", r);
 }
 
+// ---- Components in the browser and on the server (slice 8: Q-757 to Q-771) ----------------------
+
+/// `src` served, and `body` run in Chrome on `path` once the runtime has started, with `$(id)` and
+/// `tick(ms)`; what it gives back is the result. None without Chrome.
+fn in_page(name: &str, src: &str, path: &str, body: &str) -> Option<(serde_json::Value, String)> {
+    let (ok, out) = check(src);
+    assert!(ok, "{}", out);
+    let d = dir(name, src);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let html = support::send(s.port, "GET", path, &[], "").body;
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping the browser half: no Chrome");
+        return None;
+    };
+    let script = format!(
+        "(async () => {{\n  {BOOTED}\n  const $ = (id) => document.getElementById(id);\n  const out = await (async () => {{\n{body}\n  }})();\n  out.remade = QW.remade ?? 0;\n  out.errors = window.__quilloErrors;\n  document.body.dataset.result = JSON.stringify(out);\n}})();"
+    );
+    Some((in_chrome(&chrome, &format!("http://127.0.0.1:{}{}", s.port, path), &script), html))
+}
+
+/// Typing `text` into field `id` a key at a time (after emptying it), as a person does.
+const TYPE_IN: &str = "const typeIn = async (id, text) => { const el = $(id); el.focus(); el.select(); document.execCommand(\"delete\"); await tick(20); for (const ch of text) { document.execCommand(\"insertText\", false, ch); await tick(20); } };";
+
+// Q-757: a two-way number input wrote the state back as text while it was typed in: `1.0` on the
+// way to `1.05` became `1`, and the next key made `15`. A number the field's text already reads as
+// stays as typed; another number the program sets is written; blank text reads as no number.
+#[test]
+fn a_number_field_keeps_what_is_typed() {
+    let src = r##"component Price() {
+    state amount = 0
+    state qty = 1
+    <div><input #n type="number" step="0.01" value={amount}/><p #pa>{amount}</p><p #ta>{type_of(amount)}</p>
+    <input #q value={qty}/><p #pq>{qty}</p>
+    <button #three @click={() => { amount = 3 }}>3</button><button #same @click={() => { amount = 1.5 }}>1.5</button>
+    <button #zero @click={() => { qty = 0 }}>0</button></div>
+}
+route GET / = <html><head><title>t</title></head><body><Price/></body></html>
+"##;
+    let body = format!(
+        r#"{TYPE_IN}
+    const out = {{}};
+    for (const s of ["1.05", "-0.5", "2.50", "0.001", "1e3", "0", "007", ""]) {{ await typeIn("n", s); await tick(30); out["n" + s] = $("n").value + " " + $("pa").textContent + " " + $("ta").textContent; }}
+    await typeIn("n", "1.50"); $("same").click(); await tick(50); out.same = $("n").value + " " + $("pa").textContent;
+    $("three").click(); await tick(50); out.three = $("n").value + " " + $("pa").textContent;
+    await typeIn("q", "1.0"); await tick(30); out.q = $("q").value + " " + $("pq").textContent;
+    await typeIn("q", "  "); await tick(30); $("zero").click(); await tick(50); out.blank = "[" + $("q").value + "] " + $("pq").textContent;
+    return out;"#
+    );
+    let Some((r, _)) = in_page("q757", src, "/", &body) else { return };
+    let want = serde_json::json!({
+        "n1.05": "1.05 1.05 float", "n-0.5": "-0.5 -0.5 float", "n2.50": "2.50 2.5 float", "n0.001": "0.001 0.001 float",
+        "n1e3": "1e3 1000 int", "n0": "0 0 int", "n007": "007 7 int", "n": "  null",
+        "same": "1.50 1.5", "three": "3 3", "q": "1.0 1.0", "blank": "[0] 0", "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Q-758: `<select value={x}>` wrote `value` on the select, which browsers ignore, so the page
+// showed its first option; made in the browser before its options, it showed none; options that
+// came after the value did not take it. The server marks the option it names `selected` (the first
+// that does; by its text when it has no `value`), and the browser sets the value again once its
+// options are in and whenever they change.
+#[test]
+fn a_select_shows_the_option_its_value_names() {
+    let src = r##"component Pick(start: str) {
+    state size = start
+    state show = false
+    state opts = ["a", "b"]
+    state v = "c"
+    state w = "q"
+    state wopts = ["p", "q"]
+    state fopts = ["p", "q", "r"]
+    <div><select #s value={size}><option value="s">S</option><option value="m">M</option><option value="m">M again</option></select>
+    <button #show @click={() => { show = true }}>show</button>
+    {show && <select #made value={size}><option value="s">S</option><option value="m">M</option></select>}
+    {show && <select #none value="zz"><option value="x" disabled>X</option><option value="y">Y</option></select>}
+    <select #later value={v}>{for o in opts => <option value={o}>{o}</option>}</select>
+    <button #addc @click={() => { opts = opts + ["c"] }}>add c</button>
+    <select #both value={w}>{for o in wopts => <option value={o}>{o}</option>}</select>
+    <button #both-go @click={() => { wopts = ["q", "r"]; w = "r" }}>both</button>
+    <select #bound bind:value={size}><option value="s">S</option><option value="m">M</option></select>
+    <select #free value="q">{for o in fopts => <option key={o} value={o}>{o}</option>}</select>
+    <button #same-opts @click={() => { fopts = fopts | map((o) => o) }}>same</button><button #rev-opts @click={() => { fopts = reverse(fopts) }}>rev</button>
+    <button #more-opts @click={() => { fopts = fopts + ["s"] }}>more</button></div>
+}
+view Shapes() = <div>
+    <select #text value={"two words"}><option>one</option><option>
+        two   words
+    </option></select>
+    <select #nil value={null}><option value="a">A</option><option value="">none</option></select>
+    <select #kept value="b"><option value="a" selected>A</option><option value="b">B</option></select>
+    <select #grouped value="ü"><optgroup label="g"><option value="a">A</option><option value="ü">Ü</option></optgroup></select>
+    <select #tricky value="t"><option title=" value=&quot;t&quot;" value="u">U</option><option value="t" class="x">T</option></select>
+    <select #plain><option value="a">A</option><option value="b">B</option></select>
+    <select #num value={2}>{for i in [1, 2, 3] => <option value={i}>{i}</option>}</select>
+    <select #tmpl value={`o${1}`}><option value="o0">0</option><option value="o1">1</option></select>
+    <select #brace value="o{1}"><option value="o1">1</option><option value="o{1}">brace</option></select>
+</div>
+route GET / = <html><head><title>t</title></head><body><Pick start={request.query.s ?? "m"}/><Shapes/></body></html>
+"##;
+    let (ok, out) = check(src);
+    assert!(ok, "{}", out);
+    let d = dir("q758", src);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let b = support::send(s.port, "GET", "/", &[], "").body;
+    for want in [
+        r#"<select id="s"><option value="s">S</option><option selected value="m">M</option><option value="m">M again</option></select>"#,
+        r#"<select id="later"><option value="a">a</option><option value="b">b</option></select>"#,
+        r#"<select id="text"><option>one</option><option selected>two   words</option></select>"#,
+        r#"<select id="nil"><option value="a">A</option><option selected value="">none</option></select>"#,
+        r#"<select id="kept"><option value="a" selected>A</option><option selected value="b">B</option></select>"#,
+        r#"<select id="grouped"><optgroup label="g"><option value="a">A</option><option selected value="ü">Ü</option></optgroup></select>"#,
+        r#"<select id="tricky"><option title=" value=&quot;t&quot;" value="u">U</option><option selected class="x" value="t">T</option></select>"#,
+        r#"<select id="plain"><option value="a">A</option><option value="b">B</option></select>"#,
+        r#"<select id="num"><option value="1">1</option><option selected value="2">2</option><option value="3">3</option></select>"#,
+        r#"<select id="tmpl"><option value="o0">0</option><option selected value="o1">1</option></select>"#,
+        r#"<select id="bound"><option value="s">S</option><option selected value="m">M</option></select>"#,
+        r#"<select id="brace"><option value="o1">1</option><option selected value="o{1}">brace</option></select>"#,
+    ] {
+        assert!(b.contains(want), "{} not in {}", want, b);
+    }
+    // The first option, the last, one named by nothing.
+    for (q, want) in [("s", r#"<option selected value="s">S</option><option value="m">M</option>"#), ("zz", r#"<option value="s">S</option><option value="m">M</option><option value="m">M again</option>"#)] {
+        let b = support::send(s.port, "GET", &format!("/?s={}", q), &[], "").body;
+        assert!(b.contains(want), "{}: {}", q, b);
+    }
+    drop(s);
+    let body = r#"const shown = (id) => { const s = $(id); return s ? s.selectedIndex + ":" + s.value : null; };
+    const out = { s: shown("s"), later: shown("later"), both: shown("both"), text: shown("text"), nil: shown("nil"), kept: shown("kept"), grouped: shown("grouped"), tricky: shown("tricky"), num: shown("num") };
+    $("s").dispatchEvent(new PointerEvent("pointerover", { bubbles: true }));
+    await tick(200);
+    $("show").click(); await tick(100);
+    out.made = shown("made"); out.none = shown("none");
+    // Made here, marked as the server marks them, so that a form's reset comes back to them.
+    const marked = (id) => [...$(id).options].map((o) => (o.hasAttribute("selected") ? 1 : 0)).join("");
+    out.marked = marked("s") + " " + marked("made") + " " + marked("none");
+    $("addc").click(); await tick(100); out.later2 = shown("later");
+    $("both-go").click(); await tick(100); out.both2 = shown("both");
+    // What a person picked stays while the options only move or stay; options that come show the
+    // value again (found in review).
+    $("free").value = "r"; $("free").dispatchEvent(new Event("change", { bubbles: true }));
+    const free = [];
+    for (const id of ["same-opts", "rev-opts", "more-opts"]) { $(id).click(); await tick(80); free.push($("free").value); }
+    out.free = free.join(" ");
+    return out;"#;
+    let Some((r, _)) = in_page("q758b", src, "/", body) else { return };
+    let want = serde_json::json!({
+        "s": "1:m", "later": "0:a", "both": "1:q", "text": "1:two words", "nil": "1:", "kept": "1:b", "grouped": "1:ü", "tricky": "1:t", "num": "1:2",
+        "made": "1:m", "none": "1:y", "marked": "010 01 00", "later2": "2:c", "both2": "1:r", "free": "r r q", "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Q-759: rows keyed inside `? :` or `match` were kept by place, each branch keyed on its own: every
+// row was made again when they moved, what was typed and the focus lost. When every branch of a
+// row has a `key`, the list is keyed by it; with one branch unkeyed, by place as before.
+#[test]
+fn rows_keyed_in_a_choice_move_with_their_items() {
+    let src = r##"component Rows() {
+    state items = [{id: 1, big: true}, {id: 2, big: false}, {id: 3, big: true}]
+    <div><ol #ol>{for it in items => it.big ? <li key={it.id} class="big"><input/></li> : <li key={it.id}><input/></li>}</ol>
+    <ul #ul>{for it in items => match it.big { true => <li key={it.id} class="big"><input/></li>, _ => <li key={it.id}><input/></li> }}</ul>
+    <ul #blk>{for it in items { let k = it.id * 10; if it.big { <li key={k} class="big"><input/></li> } else if it.id == 2 { <li key={k}><input/></li> } else { <li key={k}><input/></li> } }}</ul>
+    <ul #half>{for it in items => it.big ? <li key={it.id} class="big"><input/></li> : <li><input/></li>}</ul>
+    <ul #one>{for it in take(items, 1) => it.big ? <li key={it.id}><input/></li> : <li key={it.id}><input/></li>}</ul>
+    <button #rot @click={() => { items = drop(items, 1) + take(items, 1) }}>rot</button>
+    <button #flip @click={() => { items = items | map((x) => x.id == 1 ? {id: 1, big: false} : x) }}>flip</button>
+    <button #none @click={() => { items = [] }}>none</button></div>
+}
+route GET / = <html><head><title>t</title></head><body><Rows/></body></html>
+"##;
+    let body = r#"const ins = (id) => [...$(id).querySelectorAll("input")];
+    const vals = (id) => ins(id).map((x) => x.value).join(",");
+    for (const id of ["ol", "ul", "blk", "half", "one"]) ins(id).forEach((x, i) => { x.value = id + i; });
+    ins("ol")[1].focus();
+    $("rot").click(); await tick(100);
+    const out = { ol: vals("ol"), ul: vals("ul"), blk: vals("blk"), half: vals("half"), one: vals("one"), focus: document.activeElement.value };
+    $("flip").click(); await tick(100);
+    out.flip = vals("ol") + " " + [...$("ol").children].map((li) => li.className).join(",");
+    $("none").click(); await tick(100);
+    out.none = $("ol").children.length + " " + $("ul").children.length;
+    return out;"#;
+    let Some((r, _)) = in_page("q759", src, "/", body) else { return };
+    let want = serde_json::json!({
+        "ol": "ol1,ol2,ol0", "ul": "ul1,ul2,ul0", "blk": "blk1,blk2,blk0", "half": ",,", "one": "", "focus": "ol1",
+        "flip": "ol1,ol2, ,big,", "none": "0 0", "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Q-760: a text input or a select bound to an int state made it text: typing a 0 after the 1 gave
+// `qty + 1` as "101". It gives the state's own type back: a number for a number state when the text
+// is that number as Quillo writes it (null when empty, as a number input), and text otherwise, so
+// an option "02" or "10.00" stays chosen (found in review); a text state stays text.
+#[test]
+fn a_field_bound_to_a_number_state_gives_numbers() {
+    let src = r##"component Q() {
+    state qty = 1
+    state n = 1
+    state name = "7"
+    state code = "1"
+    state month = 1
+    state price = 10
+    <div><input #q value={qty}/><p #pq>{type_of(qty)} {qty}</p>
+    <textarea #ta value={qty}></textarea>
+    <select #s value={n}>{for i in [1, 2, 3] => <option value={i}>{i}</option>}<option value="">none</option></select><p #ps>{type_of(n)} {n}</p>
+    <input #name value={name}/><p #pname>{type_of(name)} {name}</p>
+    <select #code value={code}><option value="1">one</option><option value="2">two</option></select><p #pcode>{type_of(code)} {code}</p>
+    <select #month value={month}><option value="01">Jan</option><option value="02">Feb</option></select><p #pmonth>{type_of(month)} {month}</p>
+    <select #price value={price}><option value="5">5</option><option value="10.00">10.00</option><option value="1e2">1e2</option><option value=" 7"> 7</option></select><p #pprice>{type_of(price)}</p></div>
+}
+route GET / = <html><head><title>t</title></head><body><Q/></body></html>
+"##;
+    let body = format!(
+        r#"{TYPE_IN}
+    const pick = async (id, v) => {{ $(id).value = v; $(id).dispatchEvent(new Event("input", {{ bubbles: true }})); $(id).dispatchEvent(new Event("change", {{ bubbles: true }})); await tick(40); }};
+    const out = {{}};
+    for (const s of ["10", "1.5", " 7 ", "1e3", "-3", "", "abc", "0x10", "12", "99999999999999999999", "٣"]) {{ await typeIn("q", s); await tick(30); out["q" + s] = $("pq").textContent; }}
+    await typeIn("ta", "42"); await tick(30); out.ta = $("pq").textContent;
+    await pick("s", "2"); out.s2 = $("ps").textContent;
+    await pick("s", ""); out.s0 = $("ps").textContent;
+    await pick("s", "3"); out.s3 = $("ps").textContent;
+    await typeIn("name", "12"); await tick(30); out.name = $("pname").textContent;
+    await pick("code", "2"); out.code = $("pcode").textContent;
+    await pick("month", "02"); out.month = $("month").value + " " + $("pmonth").textContent;
+    for (const v of ["10.00", "1e2", " 7", "5"]) {{ await pick("price", v); out["price" + v] = "[" + $("price").value + "] " + $("pprice").textContent; }}
+    return out;"#
+    );
+    let Some((r, _)) = in_page("q760", src, "/", &body) else { return };
+    let want = serde_json::json!({
+        "q10": "int 10", "q1.5": "float 1.5", "q 7 ": "str  7 ", "q1e3": "str 1e3", "q-3": "int -3", "q": "null ", "qabc": "str abc", "q0x10": "str 0x10",
+        "q12": "int 12", "q99999999999999999999": "str 99999999999999999999", "q٣": "str ٣", "ta": "int 42",
+        "s2": "int 2", "s0": "null ", "s3": "int 3", "name": "str 12", "code": "str 2", "month": "02 str 02",
+        "price10.00": "[10.00] str", "price1e2": "[1e2] str", "price 7": "[ 7] str", "price5": "[5] int", "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Q-761: `<select multiple value={list}>` showed nothing chosen (the server wrote the list as the
+// select's `value`), and the browser set the select's value to the list's text, so each change kept
+// only the newest option. A list marks each option it names, on both sides.
+#[test]
+fn a_select_multiple_shows_each_value_of_its_list() {
+    let src = r##"component M(start: list) {
+    state picked = start
+    state show = false
+    <div><select #m multiple value={picked} @change={(e) => { picked = js("Array.from", e.target.selectedOptions) | map((o) => o.value) }}><option value="a">A</option><option value="b">B</option><option value="ü">Ü</option></select><p #pm>{join(picked, ",")}</p>
+    <button #ac @click={() => { picked = ["a", "ü"] }}>a and ü</button><button #empty @click={() => { picked = [] }}>none</button>
+    <button #show @click={() => { show = true }}>show</button>{show && <select #mm multiple value={picked}><option value="a">A</option><option value="b">B</option><option value="ü">Ü</option></select>}</div>
+}
+view Lists() = <div>
+    <select #nums multiple value={[1, 3]}><option value="1">1</option><option value="2">2</option><option value="3">3</option></select>
+    <select #one multiple value={["b"]}><option value="a">A</option><option value="b">B</option></select>
+    <select #empty0 multiple value={[]}><option value="a">A</option></select>
+    <select #single value={["a", "b"]}><option value="a">A</option><option value="b">B</option></select>
+</div>
+route GET / = <html><head><title>t</title></head><body><M start={json.parse(request.query.p ?? "[\"b\"]") ?? []}/><Lists/></body></html>
+"##;
+    let (ok, out) = check(src);
+    assert!(ok, "{}", out);
+    let d = dir("q761", src);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let b = support::send(s.port, "GET", "/", &[], "").body;
+    for want in [
+        r#"<select id="m" multiple><option value="a">A</option><option selected value="b">B</option><option value="ü">Ü</option></select>"#,
+        r#"<select id="nums" multiple><option selected value="1">1</option><option value="2">2</option><option selected value="3">3</option></select>"#,
+        r#"<select id="one" multiple><option value="a">A</option><option selected value="b">B</option></select>"#,
+        r#"<select id="empty0" multiple><option value="a">A</option></select>"#,
+        r#"<select id="single"><option selected value="a">A</option><option selected value="b">B</option></select>"#,
+    ] {
+        assert!(b.contains(want), "{} not in {}", want, b);
+    }
+    let b = support::send(s.port, "GET", &format!("/?p={}", enc(r#"["a","b","ü"]"#)), &[], "").body;
+    assert!(b.contains(r#"<option selected value="a">A</option><option selected value="b">B</option><option selected value="ü">Ü</option>"#), "{}", b);
+    drop(s);
+    let body = r#"const chosen = (id) => [...$(id).selectedOptions].map((o) => o.value).join(",");
+    const out = { m: chosen("m"), nums: chosen("nums"), single: chosen("single") };
+    $("m").dispatchEvent(new PointerEvent("pointerover", { bubbles: true }));
+    await tick(200);
+    $("m").options[2].selected = true; $("m").dispatchEvent(new Event("change", { bubbles: true })); await tick(80);
+    out.added = chosen("m") + " " + $("pm").textContent;
+    $("ac").click(); await tick(80); out.ac = chosen("m");
+    $("show").click(); await tick(80);
+    out.made = chosen("mm") + " " + [...$("mm").options].map((o) => (o.hasAttribute("selected") ? 1 : 0)).join("");
+    $("empty").click(); await tick(80); out.empty = chosen("m") + "|" + $("pm").textContent + "|" + chosen("mm");
+    return out;"#;
+    let Some((r, _)) = in_page("q761b", src, "/", body) else { return };
+    let want = serde_json::json!({ "m": "b", "nums": "1,3", "single": "b", "added": "b,ü b,ü", "ac": "a,ü", "made": "a,ü 101", "empty": "||", "remade": 0, "errors": [] });
+    assert_eq!(r, want);
+}
+
+// Q-762: a component that had left the page followed its parent's new props: what its `@mount`
+// returned said `leave 2` for the room that was 1, a `let` made from a prop too. Its props are as
+// it last read them once it has gone.
+#[test]
+fn a_component_that_left_keeps_the_props_it_had() {
+    let src = r##"component Room(id: int, name: str, on_log) {
+    let label = name + " " + str(id)
+    <div #room @mount={() => { on_log("join " + label); () => { on_log("leave " + label + " " + str(id)) } }}>room {id}</div>
+}
+component App() {
+    state id = 1
+    state log = []
+    <div><button #next @click={() => { id += 1 }}>next</button>
+    <Room key={id} id={id} name={"rüm"} on_log={(m) => { log = log + [m] }}/><p #log>{join(log, ", ")}</p></div>
+}
+route GET / = <html><head><title>t</title></head><body><App/></body></html>
+"##;
+    let body = r#"await tick(100);
+    const out = { first: $("log").textContent };
+    $("next").click(); await tick(100);
+    out.once = $("log").textContent + " / " + $("room").textContent;
+    $("next").click(); await tick(100);
+    out.twice = $("log").textContent + " / " + $("room").textContent;
+    return out;"#;
+    let Some((r, _)) = in_page("q762", src, "/", body) else { return };
+    let want = serde_json::json!({
+        "first": "join rüm 1",
+        "once": "join rüm 1, leave rüm 1 1, join rüm 2 / room 2",
+        "twice": "join rüm 1, leave rüm 1 1, join rüm 2, leave rüm 2 2, join rüm 3 / room 3",
+        "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Q-763: a component whose root is an SVG element was put in a `<quillo-island>`, which SVG does
+// not draw, so it was 0x0 inside `<svg>`, from the server and when made in the browser. Inside an
+// `<svg>` its root is its island, whatever it is (a `<rect>`, a `<g>`, an `<a>`, an `<svg>`), on
+// both sides; outside one, and in a `<foreignObject>`, it is in its island as before, and a row
+// is its own as before.
+#[test]
+fn a_component_whose_root_is_svgs_draws_inside_svg() {
+    let src = r##"component Bar(h: int) {
+    state tall = false
+    <rect class="bar" width="10" height={tall ? h * 2 : h} fill="teal" @click={() => { tall = true }}/>
+}
+component Dot() { <circle class="dot" r="5" cx="50" cy="50"/> }
+component Group() { <g class="grp"><circle r="3" cx="5" cy="5"/><text x="1" y="9">ü</text></g> }
+component Link() { <a href="/x"><rect class="lnk" width="10" height="10"/></a> }
+component Inner() { <svg class="inner" width="20" height="20"><rect width="20" height="20"/></svg> }
+component Icon() { <svg class="icon" width="8" height="8"><rect width="8" height="8"/></svg> }
+component Loose() { <rect class="loose"/> }
+component Note() { <span class="note">n</span> }
+component Row(t: str) { <tr class="row"><td>{t}</td></tr> }
+component Chart() {
+    state on = false
+    <div><svg #chart width="100" height="100"><Bar h={40}/><Bar h={70}/><Group/><Link/><Inner/><foreignObject width="50" height="20"><Note/></foreignObject>{on && <Dot/>}{on && <Group/>}{on && <Link/>}{on && <Inner/>}</svg>
+    <Icon/><Loose/>{on && <Loose/>}<table><tbody><Row t="a"/></tbody></table>
+    <button #on @click={() => { on = true }}>on</button></div>
+}
+route GET / = <html><head><title>t</title></head><body><Chart/></body></html>
+"##;
+    let body = r#"const size = (el) => { const b = el.getBoundingClientRect(); return Math.round(b.width) + "x" + Math.round(b.height); };
+    const drawn = (el) => { const b = el.getBoundingClientRect(); return b.width > 0 && b.height > 0; };
+    const svg = (el) => (el.namespaceURI === "http://www.w3.org/2000/svg" ? "svg" : "html") + ":" + el.parentNode.localName;
+    const all = (sel, f) => [...document.querySelectorAll(sel)].map(f).join(" ");
+    const bars = [...document.querySelectorAll("rect.bar")];
+    const out = { bars: bars.map(size).join(" "), grp: all("g.grp", drawn), lnk: all("rect.lnk", size), inner: all("svg.inner", size) };
+    bars[0].dispatchEvent(new MouseEvent("click", { bubbles: true })); await tick(100);
+    out.tall = size(document.querySelectorAll("rect.bar")[0]);
+    $("on").click(); await tick(100);
+    const dot = document.querySelector("circle.dot"), grps = document.querySelectorAll("g.grp");
+    out.dot = size(dot) + " " + svg(dot) + " " + dot.hasAttribute("data-qi") + " " + dot.dataset.c;
+    out.grp2 = grps.length + " " + drawn(grps[1]) + " " + svg(grps[1]) + " " + svg(grps[1].querySelector("text"));
+    out.made = all("rect.lnk", size) + " / " + all("svg.inner", size) + " / " + all("svg.inner", svg) + " / " + all("rect.lnk", (r) => svg(r.parentNode));
+    out.html = [document.querySelector("svg.icon"), ...document.querySelectorAll("rect.loose"), document.querySelector("span.note")].map((e) => e.parentNode.localName).join(" ");
+    out.row = document.querySelector("tr.row").dataset.c;
+    return out;"#;
+    let Some((r, html)) = in_page("q763", src, "/", body) else { return };
+    for want in [
+        r#"<svg id="chart" width="100" height="100"><rect data-qi data-c="Bar" data-p="{}" data-s="{&quot;tall&quot;:false}" class="bar" width="10" height="40" fill="teal"></rect>"#,
+        r#"<g data-qi data-c="Group" data-p="{}" data-s="{}" class="grp">"#,
+        r#"<a data-qi data-c="Link" data-p="{}" data-s="{}" href="/x"><rect class="lnk" width="10" height="10"></rect></a>"#,
+        r#"<svg data-qi data-c="Inner" data-p="{}" data-s="{}" class="inner" width="20" height="20">"#,
+        r#"<foreignObject width="50" height="20"><quillo-island style="display:contents" data-c="Note" data-p="{}" data-s="{}"><span class="note">"#,
+        r#"<quillo-island style="display:contents" data-c="Icon" data-p="{}" data-s="{}"><svg class="icon""#,
+        r#"<quillo-island style="display:contents" data-c="Loose" data-p="{}" data-s="{}"><rect class="loose"></rect></quillo-island>"#,
+        r#"<tr data-qi data-c="Row" data-p="{}" data-s="{}" class="row">"#,
+    ] {
+        assert!(html.contains(want), "{} not in {}", want, html);
+    }
+    let want = serde_json::json!({
+        "bars": "10x40 10x70", "grp": "true", "lnk": "10x10", "inner": "20x20", "tall": "10x80", "dot": "10x10 svg:svg true Dot", "grp2": "2 true svg:svg svg:g",
+        "made": "10x10 10x10 / 20x20 20x20 / svg:svg svg:svg / svg:svg svg:svg", "html": "quillo-island quillo-island quillo-island quillo-island",
+        "row": "Row", "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// The server's half of the above, on a component's HTML: inside an `<svg>` an element alone is
+// its own island, whatever its name, nested ones of its name counted; two, text after it, are not;
+// outside one only a table's or a select's part is.
+#[test]
+fn a_root_alone_inside_svg_is_its_own_island() {
+    use quillo::island::own_root_in;
+    for (html, want) in [
+        ("<rect></rect>", Some(5)),
+        ("<rect class=\"a\" width=\"10\"></rect>", Some(5)),
+        ("<g><g><circle></circle></g><text>ü</text></g>", Some(2)),
+        ("<a href=\"#\"><rect></rect></a>", Some(2)),
+        ("<svg><svg></svg><rect></rect></svg>", Some(4)),
+        ("<textPath>x</textPath>", Some(9)),
+        ("<line\n></line>", Some(5)),
+        ("<rect></rect><rect></rect>", None),
+        ("<g></g>text", None),
+        ("<gx></g>", None),
+        ("<1x></1x>", None),
+        ("text", None),
+        ("", None),
+    ] {
+        assert_eq!(own_root_in(html, true), want, "{}", html);
+    }
+    for (html, want) in [("<rect></rect>", None), ("<svg></svg>", None), ("<a></a>", None), ("<tr><td>a</td></tr>", Some(3))] {
+        assert_eq!(own_root_in(html, false), want, "{}", html);
+    }
+}
+
+// Q-764: `count = len(items)` in a component runs once, as it starts, while the same in an `if`
+// follows `items`; made an effect, cycles went round, a conversion rewrote what was typed and a
+// parent's equal new value undid a pick, so it stays as it was (decided in review). `quillo check`
+// says so of one that reads a prop or another state, and points to `let`; not of one that reads
+// only itself or nothing that changes.
+#[test]
+fn an_assignment_in_a_component_runs_once_and_check_says_so() {
+    let src = r##"component T(base: list) {
+    state items = base
+    state count = 0
+    state count2 = 0
+    state n = 0
+    state m = 0
+    state fixed = 0
+    count = len(items)
+    if true { count2 = len(items) }
+    n += 1
+    m = m + 1
+    fixed = 7
+    <div><p #cc>{count} {count2} {n} {m} {fixed}</p><button #add @click={() => { items = items + ["x"] }}>add</button></div>
+}
+component Mutual() {
+    state a = 0
+    state b = 0
+    a = b + 1
+    b = a + 1
+    <div><p #ab>{a} {b}</p><button #mgo @click={() => { a = 10 }}>go</button></div>
+}
+component Temp() {
+    state c = 0
+    state f = 32
+    f = c * 9 / 5 + 32
+    c = (f - 32) * 5 / 9
+    <div><input #c type="number" value={c}/><input #f type="number" value={f}/></div>
+}
+component Child(items: list) {
+    state sel = 0
+    sel = items[0]
+    <div><p #sel>{sel}</p><button #pick @click={() => { sel = 99 }}>pick</button></div>
+}
+component Draft(initial: str) {
+    state draft = ""
+    draft = initial
+    <div><input #draft value={draft}/><p #dp>{draft}</p></div>
+}
+component Host() {
+    state all = [1, 2, 3]
+    state saved = "hello"
+    <div><Child items={take(all, 3)}/><button #more @click={() => { all = all + [9] }}>more</button>
+    <Draft initial={saved}/><button #same @click={() => { saved = "hello" }}>same</button></div>
+}
+route GET / = <html><head><title>t</title></head><body><T base={json.parse(request.query.b ?? "[]") ?? []}/><Mutual/><Temp/><Host/></body></html>
+"##;
+    let (_, said) = check(src);
+    let warned: Vec<&str> = said.lines().filter(|l| l.contains("runs once")).collect();
+    for (line, name, read, comp) in [(8, "count", "items", "T"), (18, "a", "b", "Mutual"), (19, "b", "a", "Mutual"), (25, "f", "c", "Temp"), (26, "c", "f", "Temp"), (31, "sel", "items", "Child"), (36, "draft", "initial", "Draft")] {
+        let want = format!(":{}: warning: `{} = ...` runs once, as <{}> starts: it does not follow `{}` when that changes; for a value that follows it, write `let {} = ...` in place of the state", line, name, comp, read, name);
+        assert!(warned.iter().any(|l| l.contains(&want)), "{} not in {}", want, said);
+    }
+    // Not of `n += 1`, `m = m + 1` (its own state), `fixed = 7`, or the `if` (an effect).
+    assert_eq!(warned.len(), 7, "{}", said);
+    let body = r#"const out = { start: $("cc").textContent + " | " + $("ab").textContent };
+    $("add").click(); await tick(80); out.one = $("cc").textContent;
+    $("add").click(); await tick(80); out.two = $("cc").textContent;
+    $("mgo").click(); await tick(80); out.go = $("ab").textContent;
+    const f0 = $("f").value;
+    $("c").focus(); $("c").select(); document.execCommand("delete"); for (const ch of "0.1") { document.execCommand("insertText", false, ch); await tick(20); }
+    await tick(50); out.temp = $("c").value + " " + ($("f").value === f0);
+    $("pick").click(); await tick(60); $("more").click(); await tick(60); out.sel = $("sel").textContent;
+    $("draft").value = "edited"; $("draft").dispatchEvent(new Event("input", { bubbles: true })); await tick(60);
+    $("same").click(); await tick(60); out.draft = $("draft").value + " " + $("dp").textContent;
+    return out;"#;
+    let Some((r, html)) = in_page("q764", src, "/?b=%5B1%2C2%5D", body) else { return };
+    // The server's page shows what the browser does: each runs once.
+    assert!(html.contains(r#"<p id="cc">2 2 1 1 7</p>"#), "{}", html);
+    assert!(html.contains(r#"<p id="ab">1 2</p>"#), "{}", html);
+    let want = serde_json::json!({
+        "start": "2 2 1 1 7 | 1 2", "one": "2 3 1 1 7", "two": "2 4 1 1 7", "go": "10 2", "temp": "0.1 true", "sel": "99", "draft": "edited edited",
+        "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Q-765: a range's `value` set before its dynamic `max` was brought into the default `max` of 100,
+// and after `hi = 2000; v = 1500` the field showed 1000. The value is set again when `min`, `max`
+// or `step` change; a value past the new limit is brought into it, as the browser does.
+#[test]
+fn a_range_value_set_before_its_limits_is_kept() {
+    let src = r##"component R() {
+    state v = 500
+    state hi = 1000
+    state lo = 0
+    state st = 1
+    state show = false
+    <div><input #r type="range" value={v} min="0" max={hi}/>
+    {show && <input #made type="range" value={v} min="0" max={hi}/>}
+    {show && <input #low type="range" value={v} min={lo} max="2000" step={st}/>}
+    <button #show @click={() => { show = true }}>show</button>
+    <button #raise @click={() => { hi = 2000; v = 1500 }}>raise</button>
+    <button #over @click={() => { v = 5000 }}>over</button>
+    <button #edge @click={() => { v = 2000 }}>edge</button>
+    <button #neg @click={() => { lo = -100; v = -50; st = 25 }}>neg</button></div>
+}
+route GET / = <html><head><title>t</title></head><body><R/></body></html>
+"##;
+    let body = r#"const vals = () => ["r", "made", "low"].map((id) => ($(id) ? $(id).value : "-")).join(" ");
+    const out = { start: vals() };
+    $("show").click(); await tick(80); out.shown = vals();
+    $("raise").click(); await tick(80); out.raised = vals();
+    $("edge").click(); await tick(80); out.edge = vals();
+    $("over").click(); await tick(80); out.over = vals();
+    $("neg").click(); await tick(80); out.neg = vals();
+    return out;"#;
+    let Some((r, _)) = in_page("q765", src, "/", body) else { return };
+    let want = serde_json::json!({
+        "start": "500 - -", "shown": "500 500 500", "raised": "1500 1500 1500", "edge": "2000 2000 2000", "over": "2000 2000 2000", "neg": "0 0 -50",
+        "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Q-766: without `Element.moveBefore` (Safari), a focused keyed row that moved lost the focus. The
+// focus and what was selected in the field come back after the move; with `moveBefore` they stay.
+#[test]
+fn a_focused_row_that_moves_keeps_the_focus() {
+    let src = r##"component Moves() {
+    state rows = ["a", "b", "c"]
+    <ul #mv>{for r in rows => <li key={r}><input id={"in-" + r} value={"text " + r} @keydown={(e) => { if e.key == "ArrowUp" { let i = index_of(rows, r); if i > 0 { rows = take(rows, i - 1) + [r, rows[i - 1]] + drop(rows, i + 1) } } }}/></li>}</ul>
+}
+route GET / = <html><head><title>t</title></head><body><Moves/></body></html>
+"##;
+    for without in [true, false] {
+        let body = format!(
+            r##"if ({without}) delete Element.prototype.moveBefore;
+    const order = () => [...document.querySelectorAll("#mv input")].map((x) => x.id.slice(3)).join("");
+    const up = async () => {{ document.activeElement.dispatchEvent(new KeyboardEvent("keydown", {{ key: "ArrowUp", bubbles: true }})); await tick(80); }};
+    const c = $("in-c"); c.focus(); c.setSelectionRange(2, 4, "backward");
+    const at = () => document.activeElement.id + " " + order() + " " + c.selectionStart + "-" + c.selectionEnd + " " + c.selectionDirection;
+    await up(); const out = {{ one: at() }};
+    await up(); out.two = at();
+    await up(); out.top = at();
+    return out;"##
+        );
+        let Some((r, _)) = in_page("q766", src, "/", &body) else { return };
+        let want = serde_json::json!({ "one": "in-c acb 2-4 backward", "two": "in-c cab 2-4 backward", "top": "in-c cab 2-4 backward", "remade": 0, "errors": [] });
+        assert_eq!(r, want, "without moveBefore: {}", without);
+    }
+}
+
+// Q-767: `e.form` left out the button that sent the form; the browser sends its name and value. It
+// has them now; a form sent without one (`requestSubmit()`), and `e.form` of a field's own event,
+// have the fields alone.
+#[test]
+fn a_forms_value_names_the_button_that_sent_it() {
+    let src = r##"component Forms() {
+    state got = ""
+    state typed = ""
+    <div><form #f @submit={(e) => { got = json.stringify(e.form) }}><input #title name="title" value="t1" @input={(e) => { typed = json.stringify(e.form) }}/>
+    <button #save name="action" value="save">Save</button><button #del name="action" value="délete">Delete</button><button #plain>Plain</button></form>
+    <form #other><button #elsewhere name="action" value="other">x</button></form>
+    <p #got>{got}</p><p #typed>{typed}</p></div>
+}
+route GET / = <html><head><title>t</title></head><body><Forms/></body></html>
+"##;
+    let body = r#"const out = {};
+    $("del").click(); await tick(60); out.del = $("got").textContent;
+    $("save").click(); await tick(60); out.save = $("got").textContent;
+    $("plain").click(); await tick(60); out.plain = $("got").textContent;
+    $("f").requestSubmit(); await tick(60); out.none = $("got").textContent;
+    $("f").dispatchEvent(new SubmitEvent("submit", { bubbles: true, cancelable: true, submitter: $("elsewhere") })); await tick(60); out.elsewhere = $("got").textContent;
+    $("title").dispatchEvent(new Event("input", { bubbles: true })); await tick(60); out.typed = $("typed").textContent;
+    return out;"#;
+    let Some((r, _)) = in_page("q767", src, "/", body) else { return };
+    let want = serde_json::json!({
+        "del": r#"{"title":"t1","action":"délete"}"#, "save": r#"{"title":"t1","action":"save"}"#, "plain": r#"{"title":"t1"}"#,
+        "none": r#"{"title":"t1"}"#, "elsewhere": r#"{"title":"t1"}"#, "typed": r#"{"title":"t1"}"#, "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Q-768: a form reset emptied the inputs the browser had made (their first value was set as the
+// field's value only), while the server's came back to it. The first value is the field's default
+// too, as the server writes it; one set later is not.
+#[test]
+fn a_form_reset_brings_back_the_first_values() {
+    let src = r##"component Forms(start: str) {
+    state show = false
+    state x = start
+    <div><form #f1><input #s1 value="default"/><input #s2 value={x}/><button #r1 type="reset">reset</button></form>
+    <button #show @click={() => { show = true }}>show</button>
+    {show && <form #f2><input #d1 value="default"/><input #d2 value={x}/><input #d3/><input #d4 value={null}/><textarea #ta value="tdéf"></textarea><button #r2 type="reset">reset</button></form>}
+    <button #change @click={() => { x = "later" }}>change</button></div>
+}
+route GET / = <html><head><title>t</title></head><body><Forms start={request.query.s ?? "ünï"}/></body></html>
+"##;
+    let body = r#"const ids = ["s1", "s2", "d1", "d2", "d3", "d4", "ta"];
+    const vals = () => ids.map((id) => ($(id) ? $(id).value : "-")).join("|");
+    $("show").click(); await tick(80);
+    $("change").click(); await tick(80);
+    const out = { shown: vals(), attrs: ids.map((id) => $(id).getAttribute("value")).join("|") };
+    for (const id of ids) $(id).value = "typed";
+    $("r1").click(); $("r2").click(); await tick(80);
+    out.reset = vals();
+    return out;"#;
+    let Some((r, _)) = in_page("q768", src, "/", body) else { return };
+    let want = serde_json::json!({
+        "shown": "default|later|default|later|||tdéf", "attrs": "default|ünï|default|ünï|||",
+        "reset": "default|ünï|default|ünï|||tdéf", "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Q-769: a `<template>` in a component was taken up through its children, which the browser's
+// parser puts in its `.content`: a mismatch on every load, and the one the browser made had its
+// rows as children, not content. Its children are its content, from the server and made here.
+#[test]
+fn a_template_keeps_its_content() {
+    let src = r##"component Tpl() {
+    state name = "row"
+    state show = false
+    <div><input/><template #tpl><li class="t">{name}</li></template><template #empty></template><template #txt>just ü</template>
+    <button #show @click={() => { show = true }}>show</button><button #rename @click={() => { name = "renamed" }}>rename</button>
+    {show && <div><template #made><li class="m">{name}</li><li>two</li></template></div>}</div>
+}
+route GET / = <html><head><title>t</title></head><body><Tpl/></body></html>
+"##;
+    let body = r#"const t = (id) => $(id).content.childNodes.length + " " + $(id).childNodes.length + " " + $(id).content.textContent;
+    const out = { tpl: t("tpl"), empty: t("empty"), txt: t("txt") };
+    $("show").click(); await tick(80);
+    out.made = t("made");
+    $("rename").click(); await tick(80);
+    out.renamed = t("tpl") + " / " + t("made");
+    return out;"#;
+    let Some((r, html)) = in_page("q769", src, "/", body) else { return };
+    assert!(html.contains(r#"<template id="tpl"><li class="t">row</li></template>"#), "{}", html);
+    let want = serde_json::json!({
+        "tpl": "1 0 row", "empty": "0 0 ", "txt": "1 0 just ü", "made": "2 0 rowtwo", "renamed": "1 0 renamed / 2 0 renamedtwo", "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Q-770: a child that set its parent's state as it started made the server's page show the old
+// value above it and the new one below, with the island holding the old. The server renders the
+// parent again, the states its markup changed starting as the first render left them, when that
+// render's markup changes them no more; one that sets them anew each time (`count += n`) keeps its
+// first render, as before. What its own statements set (`n += 1`) is run again from where it was,
+// and a select's options are marked once.
+#[test]
+fn a_child_setting_its_parents_state_as_it_starts_shows_one_value() {
+    let src = r##"component Child(on_ready) {
+    on_ready(5)
+    <span>child</span>
+}
+component Quiet(on_ready) { <span>quiet</span> }
+component Parent() {
+    state count = 0
+    <div><p #c1>{count}</p><Child on_ready={(n) => { count = n }}/><p #c2>{count}</p></div>
+}
+component Bump() {
+    state count = 0
+    <div><p #b1>{count}</p><Child on_ready={(n) => { count += n }}/><p #b2>{count}</p></div>
+}
+component Calm() {
+    state count = 0
+    <div><p #q1>{count}</p><Quiet on_ready={(n) => { count = n }}/><p #q2>{count}</p></div>
+}
+component Inner() {
+    state count = 0
+    <div><p #i1>{count}</p><Child on_ready={(n) => { count = n }}/><p #i2>{count}</p></div>
+}
+component Outer() { <section><Inner/></section> }
+component Mixed() {
+    state n = 0
+    state count = 0
+    n += 1
+    <div><p #x1>{count} {n}</p><Child on_ready={(v) => { count = v }}/><p #x2>{count} {n}</p></div>
+}
+component Opt(v: str) {
+    state label = ""
+    label = v + "!"
+    <option value={v}>{label}</option>
+}
+component Pick() {
+    state x = "b"
+    <div><select #ps value={x}><Opt v="a"/><Opt v="b"/><Opt v="c"/></select></div>
+}
+route GET / = <html><head><title>t</title></head><body><Parent/><Bump/><Calm/><Outer/><Mixed/><Pick/></body></html>
+"##;
+    let body = r#"for (const el of document.querySelectorAll("quillo-island")) el.dispatchEvent(new PointerEvent("pointerover", { bubbles: true }));
+    await tick(200);
+    const two = (a, b) => $(a).textContent + " " + $(b).textContent;
+    return { parent: two("c1", "c2"), bump: two("b1", "b2"), calm: two("q1", "q2"), inner: two("i1", "i2"), mixed: two("x1", "x2"), pick: $("ps").value };"#;
+    let Some((r, html)) = in_page("q770", src, "/", body) else { return };
+    for want in [
+        r#"data-c="Parent" data-p="{}" data-s="{&quot;count&quot;:5}"><div><p id="c1">5</p>"#,
+        r#"<p id="c2">5</p>"#,
+        r#"data-c="Bump" data-p="{}" data-s="{&quot;count&quot;:0}"><div><p id="b1">0</p>"#,
+        r#"<p id="b2">5</p>"#,
+        r#"data-c="Calm" data-p="{}" data-s="{&quot;count&quot;:0}"><div><p id="q1">0</p>"#,
+        r#"data-c="Inner" data-p="{}" data-s="{&quot;count&quot;:5}"><div><p id="i1">5</p>"#,
+        r#"data-c="Mixed" data-p="{}" data-s="{&quot;n&quot;:0,&quot;count&quot;:5}"><div><p id="x1">5 1</p>"#,
+        r#"<p id="x2">5 1</p>"#,
+        r#"<option data-qi data-c="Opt" data-p="{}" data-s="{&quot;label&quot;:&quot;&quot;}" value="a">a!</option><option data-qi data-c="Opt" data-p="{}" data-s="{&quot;label&quot;:&quot;&quot;}" selected value="b">b!</option>"#,
+    ] {
+        assert!(html.contains(want), "{} not in {}", want, html);
+    }
+    let want = serde_json::json!({ "parent": "5 5", "bump": "5 5", "calm": "0 0", "inner": "5 5", "mixed": "5 1 5 1", "pick": "b", "remade": 0, "errors": [] });
+    assert_eq!(r, want);
+}
+
+// The review of Q-770: a component whose own statements set its state (`c = 1`) was rendered again,
+// and each in a chain doubled what was below it: 16 deep, the leaf 65,536 times, and a server fn a
+// state of it calls as often. Its statements are no reason; and inside one rendered again, none is
+// rendered again, so each is rendered at most twice.
+#[test]
+fn components_setting_their_own_state_render_once() {
+    let mut src = String::from("let hits = 0\nserver fn hit(s: str) -> int {\n    hits += 1\n    return hits\n}\ncomponent Leaf() {\n    state v = hit(\"leaf\")\n    <p class=\"leaf\">{v}</p>\n}\n");
+    for i in (1..=16).rev() {
+        let inner = if i == 16 { "<Leaf/>".to_string() } else { format!("<D{}/>", i + 1) };
+        src.push_str(&format!("component D{i}() {{\n    state c = 0\n    c = 1\n    <div class=\"d{i}\">{inner}</div>\n}}\n"));
+    }
+    // Two that are rendered again, one inside the other.
+    src.push_str("component Child(on_ready) {\n    on_ready(5)\n    <Leaf/>\n}\ncomponent In() {\n    state count = 0\n    <div><p>{count}</p><Child on_ready={(n) => { count = n }}/></div>\n}\ncomponent Out() {\n    state count = 0\n    <div><p>{count}</p><Child on_ready={(n) => { count = n }}/><In/></div>\n}\n");
+    src.push_str("route GET / = <html><head><title>t</title></head><body><D1/></body></html>\nroute GET /two = <html><head><title>t</title></head><body><Out/></body></html>\nroute GET /hits = <p>{hits}</p>\n");
+    let (ok, out) = check(&src);
+    assert!(ok, "{}", out);
+    let d = dir("q770chain", &src);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let t = std::time::Instant::now();
+    let b = support::send(s.port, "GET", "/", &[], "").body;
+    assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
+    assert!(b.contains(r#"<div class="d16"><quillo-island style="display:contents" data-c="Leaf" data-p="{}" data-s="{&quot;v&quot;:1}"><p class="leaf">1</p>"#), "{}", b);
+    assert!(b.contains(r#"data-c="D1" data-p="{}" data-s="{&quot;c&quot;:0}">"#), "{}", b);
+    assert_eq!(support::send(s.port, "GET", "/hits", &[], "").body, "<p>1</p>");
+    // Out once and again (2 leaves each), In inside each, once more inside Out's first: 7 at most,
+    // not 2 x 2 x 2 for each.
+    let b = support::send(s.port, "GET", "/two", &[], "").body;
+    assert!(b.contains(r#"data-c="Out" data-p="{}" data-s="{&quot;count&quot;:5}"><div><p>5</p>"#), "{}", b);
+    let hits: u32 = support::send(s.port, "GET", "/hits", &[], "").body.trim_start_matches("<p>").trim_end_matches("</p>").parse().unwrap();
+    assert!(hits - 1 <= 7, "{} renders of the leaves", hits - 1);
+}
+
+// Q-771: `autofocus` on markup that appeared later did nothing, as browsers do with what is put in
+// after the page loaded; React and Svelte focus it. It is focused once on the page, unless someone
+// is typing in another field then; `autofocus={false}` is not, and of rows the first is.
+#[test]
+fn autofocus_focuses_what_is_made_later() {
+    let src = r##"component Focus() {
+    state show = false
+    state on = false
+    state rows = []
+    <div><input #other/><button #fs @click={() => { show = true }}>show</button>{show && <div><input #af autofocus/></div>}
+    <button #fon @click={() => { on = true }}>on</button>{on && <input #hole autofocus={on}/>}
+    <input #never autofocus={false}/>
+    <button #rows @click={() => { rows = ["a", "b"] }}>rows</button><ul>{for r in rows => <li key={r}><input id={"row-" + r} autofocus/></li>}</ul></div>
+}
+route GET / = <html><head><title>t</title></head><body><Focus/></body></html>
+"##;
+    let body = r#"const at = () => document.activeElement.id || document.activeElement.localName;
+    $("other").dispatchEvent(new PointerEvent("pointerover", { bubbles: true }));
+    await tick(200);
+    const out = { start: at() };
+    $("other").focus();
+    $("fs").click(); await tick(80);
+    out.typing = at();
+    $("other").blur();
+    $("fon").click(); await tick(80);
+    out.hole = at();
+    $("hole").blur();
+    $("rows").click(); await tick(80);
+    out.rows = at();
+    return out;"#;
+    let Some((r, html)) = in_page("q771", src, "/", body) else { return };
+    assert!(html.contains(r#"<input id="never">"#), "{}", html);
+    let want = serde_json::json!({ "start": "body", "typing": "other", "hole": "hole", "rows": "row-a", "remade": 0, "errors": [] });
+    assert_eq!(r, want);
+}
+
 /// A component with a builtin's errors in each place they become text, and one the program
 /// wrote: `json` with `json.parse`'s, whose message the two sides word differently.
 fn errors_program(json: bool) -> String {

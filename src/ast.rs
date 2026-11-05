@@ -443,14 +443,22 @@ pub struct ElFacts {
     pub pieces: std::sync::OnceLock<Vec<Piece>>,
     /// The length of its HTML last time, to make room for it at once.
     pub last_len: std::sync::atomic::AtomicUsize,
+    /// A `<select value={...}>`: its value is shown as `selected` on its options, rendered each
+    /// time (FEEDBACK55.md, Q-758; branch feedback55).
+    pub select_value: bool,
+    /// `<svg>` (true) and `<foreignObject>` (false): what is in it is SVG's or HTML's, which the
+    /// components in it are made for (FEEDBACK55.md, Q-763; branch feedback55).
+    pub svg: Option<bool>,
 }
 
 impl ElFacts {
     pub fn of(tag: &str, id: &Option<Expr>, classes: &[Expr], attrs: &[(String, AttrVal)], children: &[HtmlChild], void: bool) -> ElFacts {
         let lit = |e: &Expr| matches!(e, Expr::Lit(_));
         let component = tag.starts_with(|c: char| c.is_uppercase());
+        let select_value = tag == "select" && attrs.iter().any(|(n, _)| n == "value" || n == "bind:value");
         let plain_attrs = tag != "textarea" && attrs.iter().all(|(n, a)| !matches!(a, AttrVal::Spread(_)) && n != "class");
         let tags_fixed = !component
+            && !select_value
             && plain_attrs
             && tag != "html"
             && tag != "style"
@@ -463,6 +471,7 @@ impl ElFacts {
                 AttrVal::Spread(_) => false,
             });
         let fixed = !component
+            && !select_value
             && id.as_ref().map_or(true, lit)
             && classes.iter().all(lit)
             && attrs.iter().all(|(n, v)| match v {
@@ -487,6 +496,12 @@ impl ElFacts {
             tags_fixed,
             pieces: std::sync::OnceLock::new(),
             last_len: std::sync::atomic::AtomicUsize::new(0),
+            select_value,
+            svg: match tag {
+                "svg" => Some(true),
+                "foreignObject" => Some(false),
+                _ => None,
+            },
         }
     }
 }

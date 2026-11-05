@@ -760,7 +760,10 @@ function eventField(e, name) {
       const f = t.tagName === "FORM" ? t : t.form;
       if (!f) return {};
       const out = {};
-      for (const [k, v] of new FormData(f)) putKey(out, k, typeof v === "string" ? v : v.name);
+      // With the button that sent it, as the browser sends the form (FEEDBACK55.md, Q-767; branch
+      // feedback55).
+      const s = e.submitter;
+      for (const [k, v] of (s && s.form === f ? new FormData(f, s) : new FormData(f))) putKey(out, k, typeof v === "string" ? v : v.name);
       return out;
     }
   }
@@ -5133,6 +5136,9 @@ function dynApply(x) {
   if (p) for (const n of got) p.insertBefore(n, r.end);
   r.nodes = got;
   textareaFollows(p);
+  // Options shown or hidden: their select shows its value again (FEEDBACK55.md, Q-758; branch
+  // feedback55).
+  selFollow(p);
 }
 
 // Whether two lists of nodes are the same elements and texts, in the same order, all the way
@@ -5158,6 +5164,7 @@ function morph(old, now) {
   for (const k of ["value", "checked", "selected", "muted", "indeterminate"]) if (k in now && old[k] !== now[k]) old[k] = now[k];
   old.__click = now.__click;
   old.__own = now.__own;
+  if (now.__want !== undefined) old.__want = now.__want;
   if (now.__w) {
     const cur = old.__w || (old.__w = {}), listening = old.__wl || (old.__wl = {});
     for (const t of Object.keys(cur)) if (!(t in now.__w)) delete cur[t];
@@ -5204,6 +5211,7 @@ function dynAllApply(x) {
   if (isText(x) && got.length === 0) got.push(document.createTextNode(""));
   el.replaceChildren(...got);
   textareaFollows(el);
+  selFollow(el);
 }
 
 // What is left of an element's children after taking it up: empty text
@@ -5228,8 +5236,11 @@ function rest(el, n) {
 
 function block(tpl) {
   plan(tpl);
-  return { tpl, html: null, svg: null };
+  return { tpl, html: null, svg: null, af: autofocused(tpl) };
 }
+
+// Whether a template writes `autofocus` itself, which its copies are focused for (see `focusSoon`).
+const autofocused = (tp) => tp[1].some((a) => a[0].toLowerCase() === "autofocus") || tp[2].some((k) => typeof k === "object" && autofocused(k));
 
 // Which of a template's children have holes: `tp.dyn`, whether `tp` or
 // what is in it has any; `tp.last`, its last child that does (made copies
@@ -5246,7 +5257,9 @@ function blockTemplate(def, svg) {
     const here = inSvg || t[0] === "svg";
     const el = here ? document.createElementNS(SVG, t[0]) : document.createElement(t[0]);
     for (const [k, v] of t[1]) codeAttr(k) ? el.setAttribute(k, v === true ? "" : display(v)) : setProp(el, k, v, undefined);
-    for (const k of t[2]) el.appendChild(typeof k === "string" ? document.createTextNode(k) : typeof k === "number" ? document.createTextNode("") : make(k, here && t[0] !== "foreignObject"));
+    // A <template>'s children go in its content (see `wire`).
+    const box = t[0] === "template" && el.content || el;
+    for (const k of t[2]) box.appendChild(typeof k === "string" ? document.createTextNode(k) : typeof k === "number" ? document.createTextNode("") : make(k, here && t[0] !== "foreignObject"));
     return el;
   };
   return svg ? (def.svg || (def.svg = make(def.tpl, true))) : (def.html || (def.html = make(def.tpl, false)));
@@ -5278,6 +5291,7 @@ class Tmpl extends Html {
       }
       const el = blockTemplate(def, svg).cloneNode(true);
       wire(def.tpl, el, this.vals, svg);
+      if (def.af) focusSoon(el.hasAttribute("autofocus") ? el : el.querySelector("[autofocus]"));
       out.push(el);
     } finally {
       rowNow = r;
@@ -5299,14 +5313,22 @@ function wire(tp, el, vals, svg) {
   const kids = tp[2], last = tp.last;
   if (last < 0) return;
   const sv = inner(tp, svg);
-  if (kids.length === 1 && typeof kids[0] === "number") { showIn(el, vals[kids[0]], false, sv, kids[0]); return; }
-  let n = el.firstChild;
-  for (let i = 0; i <= last; i++) {
-    const k = kids[i], next = i < last ? n.nextSibling : null;
-    if (typeof k === "number") showAt(el, n, vals[k], sv, k);
-    else if (typeof k === "object" && k.dyn) wire(k, n, vals, sv);
-    n = next;
+  // A <template>'s children are its content, where the browser's parser puts them (FEEDBACK55.md,
+  // Q-769; branch feedback55).
+  const box = tp[0] === "template" && el.content || el;
+  if (kids.length === 1 && typeof kids[0] === "number") showIn(box, vals[kids[0]], false, sv, kids[0]);
+  else {
+    let n = box.firstChild;
+    for (let i = 0; i <= last; i++) {
+      const k = kids[i], next = i < last ? n.nextSibling : null;
+      if (typeof k === "number") showAt(box, n, vals[k], sv, k);
+      else if (typeof k === "object" && k.dyn) wire(k, n, vals, sv);
+      n = next;
+    }
   }
+  // Its options are in now: the value it was given before them (FEEDBACK55.md, Q-758; branch
+  // feedback55).
+  if (tp[0] === "select" && el.__want !== undefined) selectShow(el, el.__want, true);
 }
 
 const inner = (tp, svg) => (svg || tp[0] === "svg") && tp[0] !== "foreignObject";
@@ -5320,14 +5342,16 @@ function claimEl(tp, el, vals, svg) {
   const kids = tp[2], sv = inner(tp, svg);
   // The server writes a textarea's value as its text.
   if (kids.length === 0 && tp[0] === "textarea") return;
-  if (kids.length === 1 && typeof kids[0] === "number") { showIn(el, vals[kids[0]], true, sv, kids[0]); return; }
-  const c = { p: el, n: el.firstChild, claim: true, svg: sv };
+  // A <template>'s children: its content (see `wire`).
+  const box = tp[0] === "template" && el.content || el;
+  if (kids.length === 1 && typeof kids[0] === "number") { showIn(box, vals[kids[0]], true, sv, kids[0]); return; }
+  const c = { p: box, n: box.firstChild, claim: true, svg: sv };
   for (const k of kids) {
     if (typeof k === "string") claimText(c, k);
     else if (typeof k === "number") showClaim(c, vals[k], k);
     else { const n = c.n; claimEl(k, n, vals, sv); c.n = n.nextSibling; }
   }
-  rest(el, c.n);
+  rest(box, c.n);
 }
 
 const live = (name) => name === "value" || name === "checked" || name === "selected";
@@ -5830,12 +5854,33 @@ function setProp(el, k, v, old) {
   if (k === "style" && isMap(old)) old = styleText(old);
   // What the attribute is only the default of, as `value` (FEEDBACK28.md, Q-338; branch
   // feedback29-fixes).
-  if (k === "value" || k === "checked" || k === "selected" || k === "muted") {
+  if (k === "value") {
+    // What the program wants it to show, kept for when a select's options, or a range's `min`,
+    // `max` or `step`, come or change after it (see `selFollow`, and `min` below; FEEDBACK55.md,
+    // Q-758 and Q-765; branch feedback55).
+    const first = el.__want === undefined;
+    el.__want = v === undefined ? null : v;
     // Taking up the server's HTML: what the page shows (typed, ticked) stays.
     if (claiming) return;
-    const nv = k === "value" ? (isNil(v) ? "" : display(v)) : truthy(v);
+    if (el.localName === "select") { selectShow(el, v, first); return; }
+    // A number the field's text already reads as stays as typed: `1.0` on the way to `1.05` is
+    // not written back as `1`; blank text reads as no number, and as null, which a number field
+    // gives for it (FEEDBACK55.md, Q-757; branch feedback55).
+    const typed = el.localName === "input" || el.localName === "textarea";
+    if (typed && (isNil(v) ? el.value.trim() === "" : typeof v === "number" && el.value.trim() !== "" && Number(el.value) === v)) return;
+    const nv = isNil(v) ? "" : display(v);
+    if (el.value !== nv) el.value = nv;
+    if (el.localName === "option") selFollow(el.parentNode);
+    // Made here, its first value is its default too, as the server writes it, so that a form's
+    // reset brings it back (FEEDBACK55.md, Q-768; branch feedback55).
+    if (first && !isNil(v)) { if (el.localName === "input") el.setAttribute("value", nv); else if (el.localName === "textarea") el.defaultValue = nv; }
+    return;
+  }
+  if (k === "checked" || k === "selected" || k === "muted") {
+    if (claiming) return;
+    const nv = truthy(v);
     if (el[k] !== nv) el[k] = nv;
-    if (k !== "value") { if (nv) el.setAttribute(k, ""); else el.removeAttribute(k); }
+    if (nv) el.setAttribute(k, ""); else el.removeAttribute(k);
     return;
   }
   // What only a property says: a box half ticked, a player's volume, place and speed. The
@@ -5860,6 +5905,17 @@ function setProp(el, k, v, old) {
     return;
   }
   if (typeof v === "boolean") { const t = boolText(k, v); if (t !== null) v = t; }
+  // Limits set after the value, which the browser brought into the old ones (a range's default
+  // `max` of 100): the value again, as the server's page has it (FEEDBACK55.md, Q-765; branch
+  // feedback55).
+  if (k === "min" || k === "max" || k === "step") {
+    if (isNil(v) || v === false) el.removeAttribute(k); else el.setAttribute(k, v === true ? "" : display(v));
+    if (el.__want !== undefined && !claiming) setProp(el, "value", el.__want, undefined);
+    return;
+  }
+  // On what the page makes later too, as React and Svelte have it (FEEDBACK55.md, Q-771; branch
+  // feedback55).
+  if (k === "autofocus" && old === undefined && !claiming && truthy(v)) focusSoon(el);
   if (isNil(v) || v === false) { el.removeAttribute(k); return; }
   // Only text written in the program goes there (set with the template),
   // and a page for a sandboxed frame that is kept away from the site.
@@ -5869,6 +5925,28 @@ function setProp(el, k, v, old) {
   // The text the attribute will say, whatever the value's type (html too).
   if (URL_ATTRS.includes(k.toLowerCase()) && scriptURL(s) || animValueAttr(el, k) && s.split(";").some(scriptURL)) v = s = "about:blank#blocked";
   if (old !== v || el.getAttribute(k) !== s) el.setAttribute(k, s);
+}
+
+// A select shows the option its value names; a list (`<select multiple>`) each option it names;
+// a one-line select that names none its first option, as the server's page shows them (it marks
+// those `selected`, as one `made` here is marked: a form's reset comes back to them). Browsers
+// ignore `value` on a select (FEEDBACK55.md, Q-758 and Q-761; branch feedback55).
+function selectShow(el, v, made) {
+  if (Array.isArray(v)) {
+    const want = new Set(v.map((x) => (isNil(x) ? "" : display(x))));
+    for (const o of el.options) { const on = want.has(o.value); if (o.selected !== on) o.selected = on; if (made && on) o.defaultSelected = true; }
+  } else {
+    const nv = isNil(v) ? "" : display(v);
+    if (el.value !== nv) el.value = nv;
+    if (made && el.selectedIndex >= 0) el.options[el.selectedIndex].defaultSelected = true;
+  }
+  if (el.selectedIndex < 0 && !el.multiple && el.size <= 1) for (const o of el.options) if (!o.disabled) { o.selected = true; break; }
+}
+
+// Options made, moved or changed after their select's value was set: it shows that value again.
+function selFollow(p) {
+  const s = p && p.localName === "optgroup" ? p.parentNode : p;
+  if (s && s.localName === "select" && s.__want !== undefined && !claiming) selectShow(s, s.__want);
 }
 
 function fire(el, type, ev) {
@@ -5965,6 +6043,22 @@ function $mount(el, f) {
 }
 $mount.q = [];
 mountHook = $mount;
+
+// `autofocus` on what the page makes after it loaded, which the browser leaves alone: focused once
+// it is on the page, as React and Svelte do, the first of those made at once on the page, unless
+// someone is typing in another field by then (FEEDBACK55.md, Q-771; branch feedback55).
+function focusSoon(el) {
+  if (!el) return;
+  if (focusSoon.q.length === 0) queueMicrotask(() => {
+    let first = null;
+    for (const e of focusSoon.q.splice(0)) if (e.isConnected && (!first || first.compareDocumentPosition(e) & Node.DOCUMENT_POSITION_PRECEDING)) first = e;
+    const a = document.activeElement;
+    if (first && !(a && a !== first && typingIn(a))) first.focus();
+  });
+  focusSoon.q.push(el);
+}
+focusSoon.q = [];
+const typingIn = (a) => a.isContentEditable || a.localName === "textarea" || (a.localName === "input" && !/^(button|submit|reset|checkbox|radio|file|image|color|range)$/.test(a.type));
 
 function delegated(ev) {
   for (const n of ev.composedPath()) {
@@ -6156,6 +6250,9 @@ function reconcile(st, items, key, row, svg) {
       if (j !== undefined && !used[j]) { from[i] = j; used[j] = 1; byKey.delete(keys[i]); left--; }
     }
   }
+  // Rows that come or go: a select of them shows its value again (see `selFollow`); rows that
+  // only move or change keep what a person picked (FEEDBACK55.md, Q-758; branch feedback55).
+  const came = left > 0 || w + left > n;
   // None kept: the old rows go at once.
   if (left === n && w > 0) { clearRows(st, p); old = []; w = 0; }
   for (let j = 0; j < w; j++) if (!used[j]) dropRow(old[j]);
@@ -6164,6 +6261,9 @@ function reconcile(st, items, key, row, svg) {
   let moved = false, last = -1;
   for (let i = 0; i < n; i++) { const j = from[i]; if (j < 0) continue; if (j < last) moved = true; else last = j; }
   const stay = moved ? inOrder(from) : null;
+  // Without `moveBefore` (Safari), an element moved loses the focus: given back (FEEDBACK55.md,
+  // Q-766; branch feedback55).
+  const back = moved ? focusBack(p) : null;
   const rows = new Array(n);
   let after = end, pend = null;
   for (let i = n - 1; i >= 0; i--) {
@@ -6191,6 +6291,21 @@ function reconcile(st, items, key, row, svg) {
   }
   if (pend) p.insertBefore(pend, after);
   st.rows = rows;
+  if (back) back();
+  if (came) selFollow(p);
+}
+
+// The focused element in `p`, and what is selected in it: what puts them back after a move, when
+// the move took the focus away.
+function focusBack(p) {
+  const a = document.activeElement;
+  if (!a || !p.contains(a)) return null;
+  const sel = typeof a.selectionStart === "number" ? [a.selectionStart, a.selectionEnd, a.selectionDirection] : null;
+  return () => {
+    if (document.activeElement === a || !a.isConnected) return;
+    a.focus({ preventScroll: true });
+    if (sel) a.setSelectionRange(sel[0], sel[1], sel[2]);
+  };
 }
 
 // The positions of a longest increasing run of `a`'s values (skipping -1).
@@ -6272,7 +6387,7 @@ class Inst extends Scope {
   constructor(def, props, state, liveInfo) {
     super();
     this.def = def;
-    this.props = props;
+    this.props = heldProps(props, this);
     this.s0 = state || {};
     this.liveInfo = liveInfo || null;
     this.el = null;
@@ -6313,6 +6428,22 @@ class Inst extends Scope {
   }
 }
 
+// A component's props that follow its parent's values, each as the component last read it once
+// it has left the page: what runs then (what `@mount` returned, a handler still waiting) reads
+// what it was made with, not the values its parent has moved on to (FEEDBACK55.md, Q-762; branch
+// feedback55).
+function heldProps(p, inst) {
+  const ks = Object.keys(p);
+  if (!ks.some((k) => Object.getOwnPropertyDescriptor(p, k).get)) return p;
+  const o = {};
+  for (const k of ks) {
+    const d = Object.getOwnPropertyDescriptor(p, k), get = d.get;
+    let last, seen = false;
+    Object.defineProperty(o, k, get ? { enumerable: true, get() { if (!inst.dead || !seen) { last = get.call(p); seen = true; } return last; } } : d);
+  }
+  return o;
+}
+
 // Islands on the page: <quillo-island>, or, inside a table or a select
 // (where the browser's parser moves other elements out), the component's
 // own root element, marked data-qi.
@@ -6330,10 +6461,12 @@ function wrapper(name) {
 }
 // A component the page made in wrapper `w`: when its markup is one table
 // or select part, that element becomes the island, as the server writes it
-// (src/island.rs), so a row is a row of its table (`tbody.rows`, CSS).
-function asOwnRoot(w, inst) {
+// (src/island.rs), so a row is a row of its table (`tbody.rows`, CSS). In
+// <svg> (`svg`), any one element, as SVG draws only its own elements, not a
+// <quillo-island> (FEEDBACK55.md, Q-763; branch feedback55).
+function asOwnRoot(w, inst, svg) {
   const r = w.firstChild;
-  if (!r || r !== w.lastChild || !TABLE_PART.test(r.localName)) return w;
+  if (!r || r !== w.lastChild || !(TABLE_PART.test(r.localName) || svg && r.nodeType === 1)) return w;
   // Its markup's own island attributes left out, as the server leaves them out (FEEDBACK55.md,
   // Q-700; branch feedback55).
   for (const a of ISLAND_ATTRS) r.removeAttribute(a);
@@ -6366,9 +6499,9 @@ function island(def, props, h, c) {
   } else el = wrapper(def.$name);
   inst.el = el;
   if (!c.claim) {
-    run(inst, el, false);
+    run(inst, el, false, c.svg);
     if (TOOLS) toolsMade(inst);
-    return asOwnRoot(el, inst);
+    return asOwnRoot(el, inst, c.svg);
   }
   // One inside another that cannot be taken up is made again by itself, and
   // said so, as one at the top is; before, its outer one reported a bare
@@ -6389,8 +6522,9 @@ function island(def, props, h, c) {
   return el;
 }
 
-// The component's code, once; then its markup put in its island.
-function run(inst, el, claim) {
+// The component's code, once; then its markup put in its island (in <svg>
+// when `svg`, as SVG's).
+function run(inst, el, claim, svg) {
   within(inst, () => {
     let view;
     try {
@@ -6400,9 +6534,10 @@ function run(inst, el, claim) {
       else { report(e); return; }
     }
     if (claim && ownRoot(el)) {
-      // The island is the markup's root: taken up from where it stands.
+      // The island is the markup's root: taken up from where it stands, in <svg> as SVG's
+      // (FEEDBACK55.md, Q-763; branch feedback55).
       const after = el.nextSibling;
-      const c = { p: el.parentNode, n: el, claim: true, svg: false };
+      const c = { p: el.parentNode, n: el, claim: true, svg: inSvg(el.parentNode) };
       put(view, c, []);
       if (DEV) wanted = [c.n, "nothing"]; // dev
       if (c.n !== after) throw new Mismatch("extra");
@@ -6412,7 +6547,7 @@ function run(inst, el, claim) {
       rest(el, c.n);
     } else {
       const got = [];
-      put(view, { claim: false, svg: false }, got);
+      put(view, { claim: false, svg: !!svg }, got);
       el.append(...got);
     }
   });
@@ -6653,8 +6788,9 @@ function resume(el) {
     } else el.replaceChildren();
     inst = new Inst(def, props, state, liveInfo);
     inst.el = el;
-    run(inst, el, false);
-    const r = asOwnRoot(el, inst);
+    const svg = inSvg(el.parentNode || el);
+    run(inst, el, false, svg);
+    const r = asOwnRoot(el, inst, svg);
     if (r !== el) { el.replaceWith(r); el = r; }
   }
   hydrating = null;
@@ -6825,6 +6961,19 @@ W.short = short;
 W.cls = (xs) => { const out = []; clsWords(xs, out); return out.join(" "); };
 W.cls1 = (x) => (typeof x === "string" ? x : W.cls([x]));
 W.nofn = (v) => (typeof v === "function" ? null : v);
+// What a text field or a select bound to state `s` gives it: a number when the state is one and
+// the text is that number written as Quillo writes it (null when empty, as a number input gives),
+// so `qty + 1` after typing 12 is 13, not "121"; other text stays text (an option "02", "1e2",
+// " 7"), which the field and the select show as they are. A state that held a number takes one
+// again once the text is one again (FEEDBACK55.md, Q-760; branch feedback55).
+W.typed = (s, t) => {
+  if (typeof s.v === "number") NUMERIC.add(s);
+  if (!NUMERIC.has(s) || typeof t !== "string") return t;
+  if (t.trim() === "") return null;
+  const n = Number(t);
+  return Number.isFinite(n) && display(n) === t ? n : t;
+};
+const NUMERIC = new WeakSet();
 W.component = (name, params, render) => {
   render.$name = name;
   render.$p = params;

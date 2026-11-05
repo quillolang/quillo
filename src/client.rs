@@ -3835,34 +3835,18 @@ impl<'a> Compiler<'a> {
         let p = if matches!(pat, Pattern::Bind(_)) { None } else { Some(self.pattern(pat)?) };
         let mut names = Vec::new();
         pattern_names(pat, &mut names);
-        let key_of = |el: &HtmlEl| {
-            el.attrs.iter().find_map(|(n, v)| match (n.as_str(), v) {
-                ("key", AttrVal::Expr(k)) => Some(k.clone()),
-                _ => None,
-            })
-        };
         // A block whose value is one element is keyed by it too, as `=>` is:
         // `for p in xs { let n = p.name; <li key={n}/> }` (FEEDBACK6.md, Q-055;
-        // branch feedback6-fixes). Its statements before the element run
-        // in the key's function as well, so the key may use them.
-        let (root, key, before) = match body {
-            Expr::Html(el, _) => (Some(&**el), key_of(el), &[][..]),
-            Expr::Block(stmts) => match stmts.split_last() {
-                Some((Stmt::Expr(Expr::Html(el, _)), before)) => (None, key_of(el), before),
-                _ => (None, None, &[][..]),
-            },
-            _ => (None, None, &[][..]),
+        // branch feedback6-fixes); and a choice of keyed elements (see `row_key`).
+        let root = match body {
+            Expr::Html(el, _) => Some(&**el),
+            _ => None,
         };
+        let key = row_key(body);
         let key_js = match &key {
             Some(k) => {
                 self.push_scope();
-                // With statements before it: the key is that block's value.
-                let k = if before.is_empty() {
-                    k.clone()
-                } else {
-                    Expr::Block(before.iter().cloned().chain(std::iter::once(Stmt::Expr(k.clone()))).collect())
-                };
-                let k = self.bind_pattern(pat, "$x", "`for` pattern does not match ").and_then(|binds| Ok((binds, self.reactive_expr(&k)?.0)));
+                let k = self.bind_pattern(pat, "$x", "`for` pattern does not match ").and_then(|binds| Ok((binds, self.reactive_expr(k)?.0)));
                 self.pop_scope();
                 let (binds, k) = k?;
                 format!("($x) => {{ {}return {}; }}", binds, k)
@@ -4280,13 +4264,13 @@ impl<'a> Compiler<'a> {
                 };
                 // A number input's value as a number (null when empty), not its text: `qty + 1`
                 // after typing 3 is 4, not "31".
-                let read = if field == "value" && el.tag == "input" && matches!(kind, Some("number" | "range")) {
-                    "(e.target.value === \"\" ? null : e.target.valueAsNumber)".to_string()
-                } else {
-                    format!("e.target.{}", field)
-                };
+                let number = field == "value" && el.tag == "input" && matches!(kind, Some("number" | "range"));
+                let read = if number { "(e.target.value === \"\" ? null : e.target.valueAsNumber)".to_string() } else { format!("e.target.{}", field) };
                 let saved = self.reactive;
                 let (get, set) = match self.resolve(var)? {
+                    // Another field's or a select's text, as the state's own type: a number back
+                    // for a number state (FEEDBACK55.md, Q-760; branch feedback55).
+                    Resolved::State(js) if field == "value" && !number && !el.tag.contains('-') => (format!("() => {}.v", js), format!("{}.set(W.typed({}, {}))", js, js, read)),
                     Resolved::State(js) => (format!("() => {}.v", js), format!("{}.set({})", js, read)),
                     Resolved::Local(js, _) => (js.clone(), format!("({} = {})", js, read)),
                     _ => return self.err(format!("`bind:{}` needs component state, like `state {}`", prop, var)),
@@ -4386,6 +4370,30 @@ impl<'a> Compiler<'a> {
         }
         self.line = el.line;
         Ok(format!("[{}, [{}], [{}], [{}]]", js_str(&el.tag), fixed_attrs.join(", "), kids.join(", "), holes.join(", ")))
+    }
+}
+
+/// The key of a `for` row: its element's `key`; in a block, the block's statements, then that
+/// (they run in the key's function too, so the key may use them); in a choice (`? :`, `if`,
+/// `match`) of elements that each have a `key`, the same choice of their keys, as React keys them
+/// (FEEDBACK55.md, Q-759; branch feedback55).
+fn row_key(e: &Expr) -> Option<Expr> {
+    match e {
+        Expr::Html(el, _) => el.attrs.iter().find_map(|(n, v)| match (n.as_str(), v) {
+            ("key", AttrVal::Expr(k)) => Some(k.clone()),
+            _ => None,
+        }),
+        Expr::Block(stmts) => match stmts.split_last() {
+            Some((Stmt::Expr(x), [])) => row_key(x),
+            Some((Stmt::Expr(x), before)) => Some(Expr::Block(before.iter().cloned().chain(std::iter::once(Stmt::Expr(row_key(x)?))).collect())),
+            _ => None,
+        },
+        Expr::If(c, a, Some(b)) => Some(Expr::If(c.clone(), Box::new(row_key(a)?), Some(Box::new(row_key(b)?)))),
+        Expr::Match(subj, arms, line) => {
+            let arms = arms.iter().map(|a| Some(Arm { body: row_key(&a.body)?, ..a.clone() })).collect::<Option<Vec<_>>>()?;
+            Some(Expr::Match(subj.clone(), arms, *line))
+        }
+        _ => None,
     }
 }
 
