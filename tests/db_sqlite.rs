@@ -751,13 +751,23 @@ fn a_call_runs_when_its_copies_cannot_share_it() {
 
 // ---- what `sqlinfo` reads ---------------------------------------------------------------------
 
+// The tables as each database reads the SQL, from the tokenizer they share (src/sql.rs;
+// FEEDBACK55.md; branch feedback55): SQLite's here, but where a case is another's.
+fn rw_as(d: quillo::sql::Dialect, sql: &str) -> (Vec<String>, Vec<String>) {
+    let s = quillo::sql::scan(d, sql);
+    (s.tables.reads.clone(), s.tables.writes.clone())
+}
+
 fn rw(sql: &str) -> (Vec<String>, Vec<String>) {
-    let t = quillo::sqlinfo::tables(sql);
-    (t.reads, t.writes)
+    rw_as(quillo::sql::Dialect::Sqlite, sql)
+}
+
+fn reads_as(d: quillo::sql::Dialect, sql: &str, want: &[&str]) {
+    assert_eq!(rw_as(d, sql), (want.iter().map(|s| s.to_string()).collect(), Vec::new()), "{:?} {}", d, sql);
 }
 
 fn reads(sql: &str, want: &[&str]) {
-    assert_eq!(rw(sql), (want.iter().map(|s| s.to_string()).collect(), Vec::new()), "{}", sql);
+    reads_as(quillo::sql::Dialect::Sqlite, sql, want);
 }
 
 fn writes(sql: &str, want: &[&str]) {
@@ -767,15 +777,20 @@ fn writes(sql: &str, want: &[&str]) {
 #[test]
 fn strings_and_comments_hold_no_table_names() {
     reads("select 'from fake', 'it''s from fake' from real", &["real"]);
-    reads("select 'a\\' from fake' from real", &["real"]);
+    // `\'` ends nothing on MySQL; elsewhere the string ends at it.
+    reads_as(quillo::sql::Dialect::Mysql, "select 'a\\' from fake' from real", &["real"]);
+    reads("select 'a\\' from real", &["real"]);
     reads("select 1 -- from fake\n from real", &["real"]);
     reads("select 1 -- from fake", &[]);
     reads("select 1 /* from fake */ from real", &["real"]);
     reads("select 1 /* from fake", &[]);
-    reads("select $$ from fake $$ from real", &["real"]);
-    reads("select $tag$ from fake $tag$ from real", &["real"]);
-    reads("select $tag$ from fake", &[]);
-    reads("select $1, $x from real", &["real"]);
+    // PostgreSQL's dollar quotes.
+    use quillo::sql::Dialect::Postgres;
+    reads_as(Postgres, "select $$ from fake $$ from real", &["real"]);
+    reads_as(Postgres, "select $tag$ from fake $tag$ from real", &["real"]);
+    reads_as(Postgres, "select $tag$ from fake", &[]);
+    reads_as(Postgres, "select $1, $x from real", &["real"]);
+    reads("select $x from real", &["real"]);
     reads("select 1 from \"My Table\"", &["my table"]);
     reads("select 1 from `Ticks`", &["ticks"]);
     reads("select 1 from [Brackets]", &["brackets"]);
@@ -822,14 +837,16 @@ fn writes_are_found_wherever_they_are_named() {
 
 #[test]
 fn statements_are_worked_out_once_and_more_of_them_start_the_list_over() {
-    let a = quillo::sqlinfo::tables_of("select 1 from cached_one");
-    let b = quillo::sqlinfo::tables_of("select 1 from cached_one");
+    // Kept with the rest of what is read of a text (src/sql.rs).
+    let scan = |sql: &str| quillo::sql::scan(quillo::sql::Dialect::Sqlite, sql);
+    let a = scan("select 1 from cached_one");
+    let b = scan("select 1 from cached_one");
     assert!(std::sync::Arc::ptr_eq(&a, &b));
-    assert_eq!(a.reads, ["cached_one"]);
+    assert_eq!(a.tables.reads, ["cached_one"]);
     // Past the list's size, older ones are worked out anew, the same.
     for i in 0..1100 {
         let sql = format!("select 1 from generated_{}", i);
-        assert_eq!(quillo::sqlinfo::tables_of(&sql).reads, [format!("generated_{}", i)]);
+        assert_eq!(scan(&sql).tables.reads, [format!("generated_{}", i)]);
     }
-    assert_eq!(quillo::sqlinfo::tables_of("select 1 from cached_one").reads, ["cached_one"]);
+    assert_eq!(scan("select 1 from cached_one").tables.reads, ["cached_one"]);
 }

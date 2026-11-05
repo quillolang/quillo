@@ -102,19 +102,22 @@ fn every_way_of_naming_a_server_reaches_it() {
     let mut it = program("urls3", &s.url(""), "");
     assert_eq!(v(&mut it, "1"), "1");
     assert_eq!(eval(&mut it, "db.one(\"select database() as d\").d"), "null");
-    // A database not there is made; not made, it is an error.
-    assert!(Pool::open_as(&s.url("not_there"), false).is_err());
-    assert!(Pool::open_as(&s.url("made_now"), true).is_ok());
-    assert!(Pool::open_as(&s.url("made_now"), false).unwrap().databases().unwrap().iter().any(|d| d == "made_now"));
+    // A database not there is made for a tenant (`make`); not made, it is an error, and
+    // `db.open` makes none (FEEDBACK55.md, Q-736; branch feedback55).
+    assert!(Pool::open_as(&s.url_of("not_there"), false).is_err());
+    assert!(Pool::open_as(&s.url_of("made_now"), true).is_ok());
+    assert!(Pool::open_as(&s.url_of("made_now"), false).unwrap().databases().unwrap().iter().any(|d| d == "made_now"));
 }
 
 #[test]
 fn every_type_comes_back_as_a_value() {
     let Some(s) = server() else { return };
     let mut it = program("types", &s.url("types"), "");
-    // Unsigned, and past what an int holds.
+    // Unsigned, and past what an int holds: a dec, exactly, where it was a float (FEEDBACK55.md,
+    // Q-756; branch feedback55).
     assert_eq!(v(&mut it, "cast(5 as unsigned)"), "5");
-    assert_eq!(v(&mut it, "cast(18446744073709551615 as unsigned)"), "18446744073709552000");
+    assert_eq!(v(&mut it, "cast(18446744073709551615 as unsigned)"), "18446744073709551615m");
+    assert_eq!(v(&mut it, "cast(9223372036854775808 as unsigned)"), "9223372036854775808m");
     // Dates and times, with and without their fractions.
     assert_eq!(v(&mut it, "cast('2024-01-02' as date)"), "\"2024-01-02\"");
     assert_eq!(v(&mut it, "cast('2024-01-02 03:04:05' as datetime)"), "\"2024-01-02 03:04:05\"");

@@ -126,7 +126,10 @@ fn a_json_column_comes_back_as_values() {
     assert_eq!(docs(&[r#"{"a": [1, 2]}"#, "7"], "values"), r#"[{ doc: { a: [1, 2] } }, { doc: 7 }]"#);
 }
 
+// As PostgreSQL's json: an error value in that row's column, the rest read (FEEDBACK55.md,
+// Q-732; branch feedback55), where it was its text, a str in place of the value.
 #[test]
-fn what_a_json_column_holds_that_is_not_json_comes_back_as_its_text() {
-    assert_eq!(docs(&["not json"], "text"), r#"[{ doc: "not json" }]"#);
+fn what_a_json_column_holds_that_is_not_json_is_an_error_in_its_cell() {
+    assert_eq!(docs(&["not json"], "text"), r#"[{ doc: err("db: this JSON could not be read: a word that is not true, false or null") }]"#);
+    assert_eq!(docs(&["1e400", "[1]"], "text2"), r#"[{ doc: err("db: this JSON could not be read: the number 1e400 is past what a float holds") }, { doc: [1] }]"#);
 }

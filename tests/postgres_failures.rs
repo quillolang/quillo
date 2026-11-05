@@ -68,8 +68,9 @@ fn outside_a_request_failures_of_several_statements_and_of_values_give_error_val
     let d = support::temp_dir("pgfail-values");
     let mut it = load(&d, &format!("db.open(\"{}\")\n", pg.url));
     says(eval(&mut it, "db.exec(\"select 1; select 1 / 0\")"), "division by zero");
-    // A number PostgreSQL's json keeps as written, and JSON readers can't hold.
-    says(eval(&mut it, "db.query(\"select '1e999'::json as j\")"), "error deserializing column 0: number out of range");
+    // A number PostgreSQL's json keeps as written, and a float can't hold: that cell is an error
+    // value, not the whole query (FEEDBACK55.md, Q-732; branch feedback55).
+    says(eval(&mut it, "db.query(\"select '1e999'::json as j, 2 as k\")"), "[{ j: err(\"db: this JSON could not be read: the number 1e999 is past what a float holds\"), k: 2 }]");
     says(eval(&mut it, "db.one(\"select ?::bigint as n\", 100000000000000000000000000m)"), "cannot send dec 100000000000000000000000000m as int8");
     assert_eq!(eval(&mut it, "db.one(\"select ?::bigint as n\", 7m).n"), "7", "one that fits goes");
 }

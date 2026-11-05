@@ -139,7 +139,7 @@ pub struct Scan {
     /// PostgreSQL: it may change the session where this reading cannot see: a `do` block, whose
     /// SQL may be made as it runs (`execute`).
     pub unseen: bool,
-    /// PostgreSQL: the names it calls as functions, as the server reads them (a function of
+    /// PostgreSQL and MySQL: the names it calls as functions, as the server reads them (a function of
     /// the program's may change the session too).
     pub calls: Vec<Box<str>>,
     /// PostgreSQL: it makes, replaces or drops functions (or an extension's).
@@ -148,6 +148,31 @@ pub struct Scan {
     commits: Option<(usize, usize)>,
     /// PostgreSQL takes the first placeholder's value as an array.
     array_first: bool,
+    /// The tables it reads and writes (live updates, replicas), read from these tokens
+    /// (FEEDBACK55.md, Q-750; branch feedback55).
+    pub tables: crate::sqlinfo::Tables,
+    /// It only reads, wherever it runs: see `reads_only`.
+    reads_only: bool,
+    /// MySQL's `@name` variables, as ranges of `sql` without the `@`.
+    vars: Vec<(usize, usize)>,
+    /// `insert ... values (?, ...)` and nothing after: where `values` starts, and how many `?`.
+    tuple: Option<(usize, usize)>,
+    /// SQLite: the columns a `create table` or `alter table` gives a type kept as a float
+    /// (`warn_lossy_columns`), as (table, column, type).
+    pub lossy: Vec<(Box<str>, Box<str>, Box<str>)>,
+    /// MySQL: one `replace` or `insert ... on duplicate key update`, whose rows MySQL counts
+    /// twice when it replaces or updates them.
+    twice: bool,
+    /// MySQL: it has `||`, which MariaDB reads as `or` unless the session says otherwise.
+    bars: bool,
+    /// PostgreSQL: for each value (from 1), whether a placeholder of it is a column's value as
+    /// written (`Reader::assigned_at`).
+    assigned: Vec<bool>,
+    /// PostgreSQL: it changes a schema, and the names it changes (None: any; `Reader::ddl`).
+    ddl: Option<Option<Vec<Box<str>>>>,
+    /// MySQL: for each value (from 1), the column it is given to or compared with, in lower
+    /// case (`Reader::column_at`).
+    columns: Vec<Option<Box<str>>>,
 }
 
 /// When what `set_config` sets ends.
@@ -346,7 +371,7 @@ fn pg_ops(s: &str, start: usize, out: &mut Vec<Tok>) -> usize {
 }
 
 /// The tokens, and how many block comments the text leaves open at its end.
-fn lex(d: Dialect, s: &str) -> (Vec<Tok>, usize) {
+pub(crate) fn lex(d: Dialect, s: &str) -> (Vec<Tok>, usize) {
     let b = s.as_bytes();
     let n = b.len();
     let mut out: Vec<Tok> = Vec::with_capacity(n / 4 + 2);
@@ -888,6 +913,360 @@ impl<'a> Reader<'a> {
         };
         (self.kind(t + 1) == Some(Kind::Cast) && array_after(t + 2)) || (call("cast") && self.is_word(t + 1, "as") && array_after(t + 2))
     }
+
+    /// Whether the SQL only reads, wherever it runs, so a read replica can answer it: one
+    /// statement, a `select`, `with`, `values`, `table` or `show`, that writes no table, puts
+    /// nothing `into` a table or a variable, locks no row (`for update`, `for share`, `lock in
+    /// share mode`), takes no sequence's next value (`next value for`) and calls none of the
+    /// databases' own functions that write or keep something in the session (`nextval`,
+    /// `pg_advisory_lock`, `get_lock`...). A `select nextval('s')` went to the replica, which
+    /// refused it, and took the replica out of use for ten seconds (FEEDBACK55.md, Q-750; branch
+    /// feedback55). A function of the program's own is looked up where it is known
+    /// (`db::reader`).
+    fn reads_only(&self, tables: &crate::sqlinfo::Tables) -> bool {
+        let [sp] = self.spans.as_slice() else { return false };
+        let first = self.head_text(sp).0;
+        if !["select", "with", "values", "table", "show"].iter().any(|w| first.eq_ignore_ascii_case(w)) || !tables.writes.is_empty() {
+            return false;
+        }
+        let is = |k: usize, w: &str| self.is_word(k, w);
+        !(sp.from..sp.to).any(|k| {
+            (is(k, "for") && (is(k + 1, "update") || is(k + 1, "share") || (is(k + 1, "no") && is(k + 2, "key")) || (is(k + 1, "key") && is(k + 2, "share"))))
+                || (is(k, "lock") && is(k + 1, "in") && is(k + 2, "share"))
+                || is(k, "into")
+                || (is(k, "next") && is(k + 1, "value") && is(k + 2, "for"))
+                || (self.kind(k + 1) == Some(Kind::Open) && self.name(k).map_or(false, |n| writes_when_called(&n)))
+        })
+    }
+
+    /// Whether the placeholder at token `t` is a column's value as written: an item of an
+    /// `insert`'s `values (...)`, or the whole right side of `set col = ?` (in an `update`, an
+    /// upsert's `do update set`), a cast after it or not. Elsewhere (a function's argument, a
+    /// comparison) it is a value of an expression (FEEDBACK55.md, Q-733; branch feedback55).
+    fn assigned_at(&self, t: usize) -> bool {
+        let Some(sp) = self.spans.iter().find(|sp| sp.from <= t && t < sp.to) else { return false };
+        // After it, past a cast (`::jsonb`, `::varchar(10)[]`): where the item ends.
+        let mut k = t + 1;
+        if self.kind(k) == Some(Kind::Cast) {
+            k += 1;
+            while matches!(self.kind(k), Some(Kind::Word | Kind::Quoted | Kind::Dot)) {
+                k += 1;
+            }
+            if self.kind(k) == Some(Kind::Open) {
+                while k < sp.to && self.kind(k) != Some(Kind::Close) {
+                    k += 1;
+                }
+                k += 1;
+            }
+            while self.kind(k) == Some(Kind::OpenBracket) && self.kind(k + 1) == Some(Kind::CloseBracket) {
+                k += 2;
+            }
+        }
+        if !(k >= sp.to || matches!(self.kind(k), Some(Kind::Comma | Kind::Close | Kind::Word))) || t == sp.from {
+            return false;
+        }
+        // How deep in parentheses it is, and the `(` it is in.
+        let (mut depth, mut open) = (0usize, None);
+        for j in (sp.from..t).rev() {
+            match self.toks[j].kind {
+                Kind::Close => depth += 1,
+                Kind::Open if depth == 0 => {
+                    open = Some(j);
+                    break;
+                }
+                Kind::Open => depth -= 1,
+                _ => {}
+            }
+        }
+        let before = self.toks[t - 1].kind;
+        match open {
+            // `set col = ?`, `set a = 1, col = ?`.
+            None => {
+                t >= sp.from + 3
+                    && before == Kind::Op
+                    && self.text(t - 1) == "="
+                    && matches!(self.kind(t - 2), Some(Kind::Word | Kind::Quoted))
+                    && (self.is_word(t - 3, "set") || (self.kind(t - 3) == Some(Kind::Comma) && (sp.from..t).any(|j| self.is_word(j, "set"))))
+            }
+            // An item of `values (...)`, the first row's or another's.
+            Some(o) => {
+                let head = self.is_word(sp.from, "insert") || self.is_word(sp.from, "replace") || self.is_word(sp.from, "with");
+                let tuple = o > sp.from && (self.is_word(o - 1, "values") || (self.kind(o - 1) == Some(Kind::Comma) && o >= 2 && self.kind(o - 2) == Some(Kind::Close)));
+                head && tuple && matches!(before, Kind::Open | Kind::Comma) && self.kind(k) != Some(Kind::Word)
+            }
+        }
+    }
+
+    /// MySQL: the column the placeholder at token `t` is given to or compared with, as written
+    /// beside it: `insert into t (a, b) values (?, ?)`, `set a = ?`, `a = ?`, `? <> a`, `a in (?,
+    /// ?)`. Without a column's type a value has none of its own (a BIT's digits, a FLOAT's
+    /// range: FEEDBACK55.md, Q-741; found in review, branch feedback55).
+    fn column_at(&self, t: usize) -> Option<Box<str>> {
+        let sp = self.spans.iter().find(|sp| sp.from <= t && t < sp.to)?;
+        // A name as MySQL writes it: a word, or in backticks.
+        let col = |k: usize| {
+            let t = self.text(k);
+            let n = if self.kind(k) == Some(Kind::Quoted) { t.trim_start_matches('`').trim_end_matches('`').replace("``", "`") } else { t.to_string() };
+            Some(n.to_lowercase().into_boxed_str())
+        };
+        let named = |k: usize| matches!(self.kind(k), Some(Kind::Word | Kind::Quoted)) && !["and", "or", "not", "where", "set", "on", "when", "then", "else"].iter().any(|w| self.is_word(k, w));
+        // An operator written next to the placeholder, of MySQL's one-character tokens: where it
+        // starts (before) or ends (after), if it compares.
+        let op = |from: usize, to: usize| ["=", "<>", "!=", "<", ">", "<=", ">=", "<=>"].contains(&&self.sql[self.toks[from].start..self.toks[to].end]);
+        let mut b = t;
+        while b > sp.from && self.kind(b - 1) == Some(Kind::Op) && (b == t || self.toks[b - 1].end == self.toks[b].start) {
+            b -= 1;
+        }
+        // The whole operand: `a = ? + 1` compares no value of `a`'s with the placeholder's.
+        if b < t && op(b, t - 1) && b > sp.from && named(b - 1) && self.kind(t + 1) != Some(Kind::Op) {
+            return col(b - 1);
+        }
+        let mut a = t;
+        while self.kind(a + 1) == Some(Kind::Op) && (a == t || self.toks[a].end == self.toks[a + 1].start) {
+            a += 1;
+        }
+        if a > t && op(t + 1, a) && a + 1 < sp.to && named(a + 1) && (t == sp.from || self.kind(t - 1) != Some(Kind::Op)) && self.kind(a + 2) != Some(Kind::Op) {
+            return col(a + 1);
+        }
+        // Inside parentheses: `a in (?, ?)`, or an insert's values by its column list.
+        let mut depth = 0usize;
+        let mut item = 0usize;
+        let mut open = None;
+        for j in (sp.from..t).rev() {
+            match self.toks[j].kind {
+                Kind::Close => depth += 1,
+                Kind::Open if depth == 0 => {
+                    open = Some(j);
+                    break;
+                }
+                Kind::Open => depth -= 1,
+                Kind::Comma if depth == 0 => item += 1,
+                _ => {}
+            }
+        }
+        let o = open?;
+        if !matches!(self.toks[t - 1].kind, Kind::Open | Kind::Comma) || !matches!(self.kind(t + 1), Some(Kind::Comma | Kind::Close)) {
+            return None;
+        }
+        if o >= sp.from + 2 && self.is_word(o - 1, "in") && named(o - 2) {
+            return col(o - 2);
+        }
+        if !(self.is_word(sp.from, "insert") || self.is_word(sp.from, "replace")) {
+            return None;
+        }
+        let tuple = o > sp.from && (self.is_word(o - 1, "values") || self.is_word(o - 1, "value") || (self.kind(o - 1) == Some(Kind::Comma) && self.kind(o - 2) == Some(Kind::Close)));
+        if !tuple {
+            return None;
+        }
+        // The column list: the first `(` of the statement, before `values`.
+        let list = (sp.from..o).find(|&j| self.kind(j) == Some(Kind::Open))?;
+        let names: Vec<usize> = (list + 1..sp.to).take_while(|&j| self.kind(j) != Some(Kind::Close)).filter(|&j| matches!(self.kind(j), Some(Kind::Word | Kind::Quoted))).collect();
+        (list < o).then(|| names.get(item).and_then(|&j| col(j))).flatten()
+    }
+
+    /// PostgreSQL: whether it changes what a kept statement may read (`alter`, `drop`, `create
+    /// or replace`), and the tables, views and functions it names, in lower case (None: it may
+    /// change any, as `drop ... cascade` and `alter schema` do). A new table, index or function
+    /// changes none: `create table if not exists`, which Quillo's own tables run often, lets
+    /// nothing go (FEEDBACK55.md, Q-745; found in review, branch feedback55).
+    fn ddl(&self) -> Option<Option<Vec<Box<str>>>> {
+        // What is named after the word; any other (`schema`, `owned`, `role`...): all.
+        const OBJECTS: &[&str] = &["table", "view", "function", "procedure", "routine", "aggregate", "type", "domain", "sequence", "index", "trigger", "rule", "policy", "statistics"];
+        let name = |k: usize| self.name(k).map(|n| n.to_lowercase().into_boxed_str());
+        let mut names = Vec::new();
+        let mut any = false;
+        for sp in &self.spans {
+            let (a, b) = self.head_text(sp);
+            let mut k = sp.from + 1;
+            if a.eq_ignore_ascii_case("create") && b.eq_ignore_ascii_case("or") && self.is_word(k + 1, "replace") {
+                k += 2;
+            } else if !a.eq_ignore_ascii_case("alter") && !a.eq_ignore_ascii_case("drop") {
+                continue;
+            }
+            any = true;
+            while ["materialized", "foreign", "temp", "temporary", "recursive", "trusted", "procedural", "unlogged"].iter().any(|w| self.is_word(k, w)) {
+                k += 1;
+            }
+            let kind = self.toks.get(k).filter(|t| t.kind == Kind::Word).map(|t| self.sql[t.start..t.end].to_ascii_lowercase());
+            if !kind.as_deref().map_or(false, |w| OBJECTS.contains(&w)) || (sp.from..sp.to).any(|j| self.is_word(j, "cascade")) {
+                return Some(None);
+            }
+            k += 1;
+            while ["if", "not", "exists", "only", "concurrently"].iter().any(|w| self.is_word(k, w)) {
+                k += 1;
+            }
+            // `a`, `s.a`, `a, b` (a drop's list), `f(int)`.
+            loop {
+                let mut last = None;
+                while matches!(self.kind(k), Some(Kind::Word | Kind::Quoted)) {
+                    last = name(k);
+                    k += 1;
+                    if self.kind(k) != Some(Kind::Dot) {
+                        break;
+                    }
+                    k += 1;
+                }
+                names.extend(last);
+                if self.kind(k) == Some(Kind::Open) {
+                    let mut depth = 0;
+                    while k < sp.to {
+                        match self.toks[k].kind {
+                            Kind::Open => depth += 1,
+                            Kind::Close => depth -= 1,
+                            _ => {}
+                        }
+                        k += 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                if self.kind(k) != Some(Kind::Comma) || k >= sp.to {
+                    break;
+                }
+                k += 1;
+            }
+            // `alter table a rename to b`: b too.
+            for j in sp.from..sp.to {
+                if self.is_word(j, "rename") {
+                    if let Some(to) = (j + 1..sp.to).find(|&t| self.is_word(t, "to")) {
+                        names.extend(name(to + 1));
+                    }
+                }
+            }
+        }
+        any.then_some(Some(names))
+    }
+
+    /// MySQL's `@name` variables (not `@@` the server's), as ranges of the text without the `@`
+    /// (and the quotes of `@'name'`).
+    fn vars(&self) -> Vec<(usize, usize)> {
+        self.toks
+            .iter()
+            .filter(|t| t.kind == Kind::Var && !self.sql[t.start..t.end].starts_with("@@"))
+            .map(|t| {
+                let quoted = matches!(self.sql.as_bytes().get(t.start + 1), Some(b'\'' | b'"' | b'`'));
+                if quoted && t.end >= t.start + 3 {
+                    (t.start + 2, t.end - 1)
+                } else {
+                    (t.start + 1, t.end)
+                }
+            })
+            .collect()
+    }
+
+    /// `insert ... values (?, ...)` with nothing after its values, as one statement, its only
+    /// placeholders in that tuple: where its `values` starts, and how many `?` it has. Read from
+    /// the tokens, where it was read from the text, which a string or a comment could mislead.
+    fn tuple(&self) -> Option<(usize, usize)> {
+        let [sp] = self.spans.as_slice() else { return None };
+        if !self.is_word(sp.from, "insert") || sp.to < sp.from + 3 || self.kind(sp.to - 1) != Some(Kind::Close) {
+            return None;
+        }
+        let at = (sp.from..sp.to).rev().find(|&k| self.is_word(k, "values"))?;
+        if self.kind(at + 1) != Some(Kind::Open) {
+            return None;
+        }
+        // `(?, ?, ...)`, its `)` the statement's last token.
+        let mut n = 0;
+        for (j, k) in (at + 2..sp.to - 1).enumerate() {
+            let want = if j % 2 == 0 { Kind::Param(Mark::Question) } else { Kind::Comma };
+            if self.toks[k].kind != want {
+                return None;
+            }
+            n += (j % 2 == 0) as usize;
+        }
+        let before = (sp.from..at).any(|k| matches!(self.toks[k].kind, Kind::Param(_)));
+        (n > 0 && (sp.to - at - 3) % 2 == 1 && !before).then(|| (self.toks[at].start, n))
+    }
+
+    /// SQLite: the columns a `create table` or an `alter table ... add` gives `money`, `decimal`,
+    /// `numeric(p, s)` or `dec`, which it keeps with NUMERIC affinity, as (table, column, type):
+    /// read from the tokens, where comments and strings are none (FEEDBACK50.md, Q-628).
+    fn lossy(&self) -> Vec<(Box<str>, Box<str>, Box<str>)> {
+        let unquote = |t: &str| t.trim_matches(|c| matches!(c, '"' | '`' | '[' | ']')).into();
+        // A name, `schema.name` too, at `k`: as written, and where it ends.
+        let name_at = |mut k: usize| -> Option<(Box<str>, usize)> {
+            let from = k;
+            while matches!(self.kind(k), Some(Kind::Word | Kind::Quoted)) {
+                k += 1;
+                if self.kind(k) != Some(Kind::Dot) {
+                    break;
+                }
+                k += 1;
+            }
+            (k > from).then(|| (unquote(&self.sql[self.toks[from].start..self.toks[k - 1].end]), k))
+        };
+        let lossy_type = |k: usize| -> Option<Box<str>> {
+            let w = self.text(k).to_ascii_lowercase();
+            let open = self.kind(k + 1) == Some(Kind::Open);
+            (self.kind(k) == Some(Kind::Word) && (w.starts_with("money") || w == "decimal" || w == "dec" || (w == "numeric" && open))).then(|| w.into())
+        };
+        let mut out = Vec::new();
+        for sp in &self.spans {
+            let mut k = sp.from;
+            if self.is_word(k, "create") {
+                k += 1;
+                if self.is_word(k, "temp") || self.is_word(k, "temporary") {
+                    k += 1;
+                }
+                if !self.is_word(k, "table") {
+                    continue;
+                }
+                k += 1;
+                if self.is_word(k, "if") && self.is_word(k + 1, "not") && self.is_word(k + 2, "exists") {
+                    k += 3;
+                }
+                let Some((table, mut k)) = name_at(k) else { continue };
+                if self.kind(k) != Some(Kind::Open) {
+                    continue;
+                }
+                // Each column, after the table's `(` or a `,` directly inside it.
+                let mut depth = 0;
+                while k < sp.to {
+                    match self.toks[k].kind {
+                        Kind::Open => depth += 1,
+                        Kind::Close => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 1 && matches!(self.toks[k].kind, Kind::Open | Kind::Comma) {
+                        if let Some((col, at)) = name_at(k + 1).filter(|(_, at)| *at == k + 2) {
+                            if let Some(ty) = lossy_type(at) {
+                                out.push((table.clone(), col, ty));
+                            }
+                        }
+                    }
+                    k += 1;
+                }
+            } else if self.is_word(k, "alter") && self.is_word(k + 1, "table") {
+                let Some((table, k)) = name_at(k + 2) else { continue };
+                if !self.is_word(k, "add") {
+                    continue;
+                }
+                let k = if self.is_word(k + 1, "column") { k + 2 } else { k + 1 };
+                if let Some((col, at)) = name_at(k).filter(|(_, at)| *at == k + 1) {
+                    if let Some(ty) = lossy_type(at) {
+                        out.push((table, col, ty));
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The databases' own functions that write, or keep something in the session a later statement
+/// reads, which only the primary can run (see `Reader::reads_only`): PostgreSQL's sequences,
+/// locks, settings, notices, large objects, transaction ids and WAL; MySQL's and MariaDB's
+/// sequences and locks, and the session's last id and counts.
+fn writes_when_called(name: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "nextval", "setval", "currval", "lastval", "set_config", "pg_notify", "setseed", "txid_current", "txid_current_if_assigned", "pg_switch_wal",
+        "pg_reload_conf", "pg_rotate_logfile", "pg_terminate_backend", "pg_cancel_backend", "pg_promote", "pg_import_system_collations", "dblink_exec",
+        "get_lock", "release_lock", "release_all_locks", "last_insert_id", "found_rows", "row_count",
+    ];
+    const STARTS: &[&str] = &["pg_advisory", "pg_try_advisory", "lo_", "pg_stat_reset", "pg_create_", "pg_drop_", "pg_replication_", "pg_logical_", "pg_current_", "pg_backup_", "pg_start_backup", "pg_stop_backup"];
+    NAMES.contains(&name) || STARTS.iter().any(|p| name.starts_with(p))
 }
 
 /// `U&"..."`'s text decoded: `\XXXX`, `\+XXXXXX` and `\\`.
@@ -958,9 +1337,13 @@ impl Scan {
             if given.len() < at.len() {
                 lasting = true;
             }
+        }
+        // The functions it calls, PostgreSQL's and MySQL's (whose own may write, which a replica
+        // must not be asked: FEEDBACK55.md, Q-750; found in review, branch feedback55).
+        if d != Dialect::Sqlite {
             for sp in &r.spans {
                 let a = r.head_text(sp).0.to_ascii_lowercase();
-                unseen |= a == "do";
+                unseen |= pg && a == "do";
                 defines |= matches!(a.as_str(), "create" | "drop" | "alter")
                     && (sp.from + 1..(sp.from + 5).min(sp.to)).any(|k| ["function", "procedure", "routine", "extension"].iter().any(|w| r.is_word(k, w)));
                 if sp.routine {
@@ -970,7 +1353,9 @@ impl Scan {
                     if r.kind(k + 1) != Some(Kind::Open) {
                         continue;
                     }
-                    if let Some(n) = r.name(k) {
+                    // MySQL's names in any case are one.
+                    let name = if pg { r.name(k) } else { r.name(k).map(|n| n.to_lowercase()) };
+                    if let Some(n) = name {
                         if !(r.toks[k].kind == Kind::Word && NOT_CALLS.contains(&n.as_str())) && !calls.iter().any(|c| **c == *n) {
                             calls.push(n.into_boxed_str());
                         }
@@ -987,6 +1372,35 @@ impl Scan {
             None
         };
         let array_first = pg && marks.first().map_or(false, |&(t, _)| r.takes_an_array(t));
+        let tables = crate::sqlinfo::tables_in(sql, &r.toks);
+        let reads_only = r.reads_only(&tables);
+        let vars = if d == Dialect::Mysql { r.vars() } else { Vec::new() };
+        let tuple = r.tuple();
+        let bars = d == Dialect::Mysql && r.toks.windows(2).any(|w| w[0].end == w[1].start && &sql[w[0].start..w[1].end] == "||");
+        let ddl = if pg { r.ddl() } else { None };
+        let mut columns: Vec<Option<Box<str>>> = Vec::new();
+        if d == Dialect::Mysql {
+            columns.resize(count, None);
+            for &(t, slot) in &marks {
+                if slot >= 1 && slot <= count && columns[slot - 1].is_none() {
+                    columns[slot - 1] = r.column_at(t);
+                }
+            }
+        }
+        let mut assigned = Vec::new();
+        if pg {
+            assigned.resize(count, false);
+            for &(t, slot) in &marks {
+                if slot >= 1 && slot <= count && r.assigned_at(t) {
+                    assigned[slot - 1] = true;
+                }
+            }
+        }
+        let twice = d == Dialect::Mysql
+            && r.spans.len() == 1
+            && (r.is_word(r.spans[0].from, "replace")
+                || (r.is_word(r.spans[0].from, "insert") && (r.spans[0].from..r.spans[0].to).any(|k| r.is_word(k, "duplicate") && r.is_word(k + 1, "key") && r.is_word(k + 2, "update"))));
+        let lossy = if d == Dialect::Sqlite && r.spans.iter().any(|sp| r.is_word(sp.from, "create") || r.is_word(sp.from, "alter")) { r.lossy() } else { Vec::new() };
         let stmts = r.spans.iter().map(|sp| Stmt { start: r.toks[sp.from].start, end: r.toks[sp.to - 1].end, routine: sp.routine, head: r.head(sp) }).collect();
         let marks = marks.iter().map(|&(i, slot)| (r.toks[i].start, r.toks[i].end, slot)).collect();
         Scan {
@@ -1009,6 +1423,16 @@ impl Scan {
             defines,
             commits,
             array_first,
+            tables,
+            reads_only,
+            vars,
+            tuple,
+            lossy,
+            twice,
+            bars,
+            assigned,
+            ddl,
+            columns,
         }
     }
 
@@ -1021,6 +1445,12 @@ impl Scan {
             + self.order.as_ref().map_or(0, |o| o.len() * 8)
             + self.stmts.len() * std::mem::size_of::<Stmt>()
             + self.calls.iter().map(|c| c.len() + 16).sum::<usize>()
+            + self.tables.reads.iter().chain(&self.tables.writes).map(|t| t.len() + 24).sum::<usize>()
+            + self.vars.len() * 16
+            + self.assigned.len()
+            + self.columns.iter().flatten().map(|c| c.len() + 24).sum::<usize>()
+            + self.ddl.iter().flatten().flatten().map(|n| n.len() + 16).sum::<usize>()
+            + self.lossy.iter().map(|(a, b, c)| a.len() + b.len() + c.len() + 48).sum::<usize>()
     }
 
     /// The SQL as the database takes it.
@@ -1053,14 +1483,14 @@ impl Scan {
         self.names.get(slot - 1).copied().flatten().map(|(a, b)| &self.sql[a..b])
     }
 
-    /// The names the SQL takes its values by, without their sign.
-    pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.names.iter().flatten().map(|&(a, b)| &self.sql[a + 1..b])
+    /// The names the SQL takes its values by, as written (`:id`, SQLite's `@id`).
+    pub fn signed_names(&self) -> impl Iterator<Item = &str> {
+        self.names.iter().flatten().map(|&(a, b)| &self.sql[a..b])
     }
 
     /// The value of a named placeholder in a map of values: by its name, or as written
     /// (`":id"`).
-    fn by_name<'a>(m: &'a Map, name: &str) -> Option<&'a Value> {
+    pub fn by_name<'a>(m: &'a Map, name: &str) -> Option<&'a Value> {
         m.get(&name[1..]).or_else(|| m.get(name))
     }
 
@@ -1145,6 +1575,86 @@ impl Scan {
     pub fn first_takes_an_array(&self) -> bool {
         self.array_first
     }
+
+    /// Whether it only reads, wherever it runs (a read replica's answer is the primary's): see
+    /// `Reader::reads_only` (FEEDBACK55.md, Q-750; branch feedback55).
+    pub fn reads_only(&self) -> bool {
+        self.reads_only
+    }
+
+    /// It holds no statement: empty, blank, or comments alone (FEEDBACK55.md, Q-753).
+    pub fn is_empty(&self) -> bool {
+        self.stmts.is_empty()
+    }
+
+    /// One statement that reads rows and changes none: its `changes` is 0 on every database
+    /// (PostgreSQL counted a `select`'s rows; FEEDBACK55.md, Q-753; branch feedback55).
+    pub fn reads(&self) -> bool {
+        self.stmts.len() == 1 && self.first_words().map_or(false, |(a, _)| reading_word(a))
+    }
+
+    /// One `insert`, `update`, `delete` or `replace` (a `with` before it too): when it changed
+    /// no row, nothing changed that a page could show (FEEDBACK13.md, Q-090). Read from its
+    /// statements, where a `;` in a string made two (FEEDBACK55.md; branch feedback55).
+    pub fn changes_rows(&self) -> bool {
+        self.stmts.len() == 1 && self.first_words().map_or(false, |(a, _)| ["insert", "update", "delete", "replace", "with"].iter().any(|w| a.eq_ignore_ascii_case(w)))
+    }
+
+    /// MySQL: the first of the SQL's `@name` variables that `params`, one map of values, has a
+    /// value for. MySQL reads `@name` as a variable of the session, which is null unless set,
+    /// where SQLite reads it as a value's name: a map's `name` would be silently left out
+    /// (FEEDBACK55.md, Q-752; branch feedback55).
+    pub fn var_given<'a>(&'a self, params: &[Value]) -> Option<&'a str> {
+        let [Value::Map(m)] = params else { return None };
+        self.vars.iter().map(|&(a, b)| &self.sql[a..b]).find(|v| m.get(*v).is_some() || m.get(format!("@{}", v).as_str()).is_some())
+    }
+
+    /// MySQL: one `replace` or `insert ... on duplicate key update`, whose rows MySQL counts
+    /// twice when it replaces or updates them (`my::Conn::exec` counts them once).
+    pub fn counts_twice(&self) -> bool {
+        self.twice
+    }
+
+    /// The value (from 1) the database's own placeholder `i` (from 0) takes.
+    pub fn native_slot(&self, i: usize) -> usize {
+        self.order.as_ref().map_or(i + 1, |o| o.get(i).copied().unwrap_or(0))
+    }
+
+    /// MySQL: the column value `slot` (from 1) is given to or compared with, in lower case (see
+    /// `Reader::column_at`).
+    pub fn column(&self, slot: usize) -> Option<&str> {
+        self.columns.get(slot.wrapping_sub(1)).and_then(|c| c.as_deref())
+    }
+
+    /// PostgreSQL: whether it changes what a kept statement may read, and the names it changes
+    /// (None: any; see `Reader::ddl`).
+    pub fn ddl(&self) -> Option<Option<&[Box<str>]>> {
+        self.ddl.as_ref().map(|n| n.as_deref())
+    }
+
+    /// PostgreSQL: whether value `slot` (from 1) is a column's value as written, where a str
+    /// for a json column is the JSON text it holds (`Reader::assigned_at`).
+    pub fn assigned(&self, slot: usize) -> bool {
+        self.assigned.get(slot.wrapping_sub(1)).copied().unwrap_or(false)
+    }
+
+    /// MySQL: the SQL has `||`, which joins text on the other databases (see `my::Conn::bars`).
+    pub fn has_bars(&self) -> bool {
+        self.bars
+    }
+
+    /// `insert into t (a, b) values (?, ?)` with nothing after its values, as many `?` as
+    /// `width`: the statement up to `values`, and `values `, to which more rows' `(?, ?)` can be
+    /// added. None for any other statement, which runs once a row.
+    pub fn values_tuple(&self, width: usize) -> Option<String> {
+        let (at, _) = self.tuple.filter(|(_, n)| *n == width)?;
+        Some(format!("{}values ", &self.sql[..at]))
+    }
+}
+
+/// A statement's first word when it reads rows and changes none.
+pub fn reading_word(w: &str) -> bool {
+    ["select", "values", "table", "show"].iter().any(|x| w.eq_ignore_ascii_case(x))
 }
 
 /// Whether Quillo's own statements (`batch`) leave a connection in a transaction: `begin`
@@ -1567,5 +2077,127 @@ mod tests {
         for (sql, n) in [("insert into t values (?)", 1), ("select ?::int", 1), ("select ?, ?", 2), ("select '?'", 0), ("select x from t where data ? 'k' and y = ?", 1)] {
             assert_eq!(values_for_a_list(sql), n, "{}", sql);
         }
+    }
+
+    // FEEDBACK55.md, Q-750: what a read replica may answer, read from the tokens.
+    #[test]
+    fn what_only_reads() {
+        for d in Dialect::ALL {
+            for sql in ["select * from t", "  SELECT 1", "with x as (select 1) select * from x", "values (1)", "show tables", "select 'for update', \"into\" from t", "select * from t -- for update\n", "select substring(a from 1 for 2) from t", "select now(), lower(x) from t"] {
+                assert!(Scan::new(d, sql).reads_only(), "{:?} {}", d, sql);
+            }
+            for sql in [
+                "insert into t values (1)",
+                "select * from t for update",
+                "select * from t for no key update",
+                "select * from t FOR SHARE",
+                "select * from t for key share",
+                "select * from t lock in share mode",
+                "select * into t2 from t",
+                "select nextval('s')",
+                "select setval('s', 1)",
+                "select currval('s'), lastval()",
+                "select pg_advisory_lock(1)",
+                "select pg_try_advisory_xact_lock(1)",
+                "select lo_create(0)",
+                "select get_lock('a', 1)",
+                "select next value for s",
+                "with d as (delete from t returning *) select * from d",
+                "select 1; delete from t",
+                "",
+                "update t set a = 1",
+                "explain analyze delete from t",
+            ] {
+                assert!(!Scan::new(d, sql).reads_only(), "{:?} {}", d, sql);
+            }
+        }
+        // As PostgreSQL names a function: in any case, its schema before it, quoted.
+        for sql in ["select NEXTVAL('s')", "select pg_catalog.nextval('s')", "select \"nextval\"('s')"] {
+            assert!(!Scan::new(Dialect::Postgres, sql).reads_only(), "{}", sql);
+        }
+        // MySQL's `@x` and `into @x`.
+        assert!(!Scan::new(Dialect::Mysql, "select 1 into @x").reads_only());
+    }
+
+    // FEEDBACK55.md, Q-752, Q-753, Q-739 and the readers moved onto the tokens.
+    #[test]
+    fn what_the_drivers_read_of_a_statement() {
+        let my = |sql: &str| Scan::new(Dialect::Mysql, sql);
+        let with = |pairs: &[(&str, i64)]| vec![Value::map(pairs.iter().map(|(k, v)| ((*k).into(), Value::Int(*v))).collect())];
+        // MySQL's variables, given a value by a map.
+        assert_eq!(my("select @x as v").var_given(&with(&[("x", 1)])), Some("x"));
+        assert_eq!(my("select @`x y` + @'z' as v").var_given(&with(&[("z", 1)])), Some("z"));
+        assert_eq!(my("select @x as v").var_given(&with(&[("@x", 1)])), Some("x"));
+        assert_eq!(my("select @x as v").var_given(&with(&[("y", 1)])), None);
+        assert_eq!(my("select @@sql_mode as v").var_given(&with(&[("sql_mode", 1)])), None);
+        assert_eq!(my("select '@x' as v").var_given(&with(&[("x", 1)])), None);
+        assert_eq!(my("select @x as v").var_given(&[Value::Int(1)]), None);
+        assert_eq!(Scan::new(Dialect::Sqlite, "select @x as v").var_given(&with(&[("x", 1)])), None);
+        // No statement; a statement that reads; one that changes rows.
+        for sql in ["", "  ", "-- x", ";", "/* */ ; ;"] {
+            assert!(Scan::new(Dialect::Postgres, sql).is_empty(), "{:?}", sql);
+        }
+        assert!(!Scan::new(Dialect::Postgres, "select 1").is_empty());
+        assert!(Scan::new(Dialect::Postgres, "select 1").reads() && Scan::new(Dialect::Postgres, " Values (1)").reads());
+        assert!(!Scan::new(Dialect::Postgres, "insert into t select 1").reads() && !Scan::new(Dialect::Postgres, "select 1; select 2").reads());
+        for (sql, rows) in [("insert into t values (1)", true), ("with x as (select 1) update t set a = 1", true), ("replace into t values (1)", true), ("delete from t", true), ("create table t (a int)", false), ("insert into t values (';'); delete from t", false), ("insert into t values (';')", true)] {
+            assert_eq!(Scan::new(Dialect::Sqlite, sql).changes_rows(), rows, "{}", sql);
+        }
+        // MySQL counts these rows twice; `||` it reads as `or`.
+        for (sql, twice) in [("replace into t values (1)", true), ("insert into t values (1) on duplicate key update a = 1", true), ("insert into t values (1)", false), ("insert into t select 'on duplicate key update'", false), ("insert into t values (1) on duplicate key update a = 1; select 1", false)] {
+            assert_eq!(my(sql).counts_twice(), twice, "{}", sql);
+        }
+        for (sql, bars) in [("select 'a' || ?", true), ("select a||b", true), ("select '||'", false), ("select a | | b", false), ("select 1 -- ||", false), ("select a or b", false)] {
+            assert_eq!(my(sql).has_bars(), bars, "{}", sql);
+        }
+        assert!(!Scan::new(Dialect::Postgres, "select 'a' || ?").has_bars());
+    }
+
+    // Found in review: which values are a column's (Q-733), which column a MySQL value meets
+    // (Q-741), and what a schema's statement changes (Q-745).
+    #[test]
+    fn what_the_drivers_read_of_each_value_and_each_schema_change() {
+        let pg = |sql: &str| Scan::new(Dialect::Postgres, sql);
+        let given = |sql: &str| (1..=pg(sql).count).map(|i| pg(sql).assigned(i)).collect::<Vec<_>>();
+        assert_eq!(given("insert into t (a, b) values (?, ?::jsonb), (?, f(?))"), [true, true, true, false]);
+        assert_eq!(given("update t set a = ?, b = ?::jsonb[], c = jsonb_set(c, '{a}', ?) where d = ?"), [true, true, false, false]);
+        assert_eq!(given("insert into t values (?) on conflict (k) do update set j = ?"), [true, true]);
+        assert_eq!(given("select jsonb_set('{}', '{a}', ?), ?::json"), [false, false]);
+        assert_eq!(given("insert into t select ?"), [false]);
+        assert_eq!(given("update t set a = ? || 'x'"), [false]);
+        assert_eq!(given("insert into t (j) values ($1)"), [true]);
+        let my = |sql: &str| {
+            let s = Scan::new(Dialect::Mysql, sql);
+            (1..=s.count).map(|i| s.column(i).map(str::to_string)).collect::<Vec<_>>()
+        };
+        let c = |xs: &[Option<&str>]| xs.iter().map(|x| x.map(str::to_string)).collect::<Vec<_>>();
+        assert_eq!(my("insert into t (a, `B`) values (?, ?), (?, ?)"), c(&[Some("a"), Some("b"), Some("a"), Some("b")]));
+        assert_eq!(my("update t set b = ? where t.k <> ? and ? = c and d in (?, ?) and e <=> ?"), c(&[Some("b"), Some("k"), Some("c"), Some("d"), Some("d"), Some("e")]));
+        assert_eq!(my("select f(?) from t where a = ? + 1 and b like ?"), c(&[None, None, None]));
+        assert_eq!(my("insert into t values (?)"), c(&[None]));
+        assert_eq!(my("select ? where x = :n"), c(&[None, Some("x")]));
+        let ddl = |sql: &str| pg(sql).ddl().map(|n| n.map(|n| n.iter().map(|x| x.to_string()).collect::<Vec<_>>()));
+        assert_eq!(ddl("select 1"), None);
+        assert_eq!(ddl("create table if not exists t (a int)"), None);
+        assert_eq!(ddl("drop table if exists a, public.\"B\""), Some(Some(vec!["a".to_string(), "b".to_string()])));
+        assert_eq!(ddl("alter table only t add column c int"), Some(Some(vec!["t".to_string()])));
+        assert_eq!(ddl("alter table t rename to u"), Some(Some(vec!["t".to_string(), "u".to_string()])));
+        assert_eq!(ddl("create or replace view v as select * from t"), Some(Some(vec!["v".to_string()])));
+        assert_eq!(ddl("drop function if exists f(int, text), g()"), Some(Some(vec!["f".to_string(), "g".to_string()])));
+        assert_eq!(ddl("drop materialized view m"), Some(Some(vec!["m".to_string()])));
+        for all in ["drop table t cascade", "alter schema s rename to r", "drop owned by x", "alter role r set search_path = a"] {
+            assert_eq!(ddl(all), Some(None), "{}", all);
+        }
+    }
+
+    // SQLite's columns kept as floats (FEEDBACK50.md, Q-628), read from the tokens.
+    #[test]
+    fn sqlites_lossy_columns_from_the_tokens() {
+        let lossy = |sql: &str| Scan::new(Dialect::Sqlite, sql).lossy.iter().map(|(t, c, ty)| format!("{}.{} {}", t, c, ty)).collect::<Vec<_>>();
+        assert_eq!(lossy("create table t (id integer primary key, price money, p2 DECIMAL(12, 2), p3 decimal_text, n numeric, d dec(5,1), \"q\" numeric ( 10, 2), dx decimal, c money_cents, check (price > 0))"), ["t.price money", "t.p2 decimal", "t.d dec", "t.q numeric", "t.dx decimal", "t.c money_cents"]);
+        assert_eq!(lossy("create temp table if not exists main.u (\"unit price\" money) -- , note decimal"), ["main.u.unit price money"]);
+        assert_eq!(lossy("alter table t add column fee decimal; alter table t add tax money; alter table t rename to v"), ["t.fee decimal", "t.tax money"]);
+        assert!(lossy("create table v (a text default ', x money', /* , y money */ b int)").is_empty());
+        assert!(lossy("create index i on t (price)").is_empty() && lossy("").is_empty() && lossy("create table").is_empty());
     }
 }

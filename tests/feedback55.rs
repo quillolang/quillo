@@ -3739,10 +3739,8 @@ fn postgresql_reads_question_marks_as_the_server_does() {
     let (dbs, _held) = databases("qmarks");
     for (kind, url) in &dbs {
         let mut it = on_db(url, "");
-        // MariaDB reads `||` as `or` (its sql_mode), so not there.
-        if *kind != "mariadb" {
-            assert_eq!(ev(&mut it, "db.one(\"select 'ab' like ?||'%' as v\", \"a\").v == true || db.one(\"select 'ab' like ?||'%' as v\", \"a\").v == 1"), "true", "{}", kind);
-        }
+        // On MariaDB too, whose driver reads `||` as the others do (slice 6).
+        assert_eq!(ev(&mut it, "db.one(\"select 'ab' like ?||'%' as v\", \"a\").v == true || db.one(\"select 'ab' like ?||'%' as v\", \"a\").v == 1"), "true", "{}", kind);
         assert_eq!(ev(&mut it, "db.one(\"select ?2 as a, ?1 as b, ?2 as c\", \"x\", \"ü\")"), "{ a: \"ü\", b: \"x\", c: \"ü\" }", "{}", kind);
         assert_eq!(ev(&mut it, "db.one(\"select /* a ? */ ? as v\", 9).v"), "9", "{}", kind);
         if *kind == "postgres" {
@@ -4047,4 +4045,760 @@ fn a_hidden_commit_on_mariadb_ends_the_transaction_with_an_error() {
     let mut m = quillo::Interp::new(&d);
     m.load_source(&format!("db.open(\"{}\")\n", url), "app.qwe").unwrap();
     assert_eq!(ev(&mut m, "let r = db.migrate()\nis_err(r) ? r : db.query(\"select a, b from mig_a\")"), "[{ a: 1, b: null }]");
+}
+
+// ---- slice 6: each driver gives the program the same values on every database (Q-730,
+// Q-732..Q-737, Q-739..Q-745, Q-750..Q-754, Q-756) ----------------------------------------------
+
+/// A fresh PostgreSQL database for `name`, and its server, held while the test runs.
+fn pg_db(name: &str) -> Option<(Arc<support::Pg>, String)> {
+    let Some(pg) = pg_server() else {
+        eprintln!("skipping PostgreSQL: initdb and pg_ctl were not found");
+        return None;
+    };
+    let url = pg.database(&format!("f55_{}", name));
+    Some((pg, url))
+}
+
+/// The same on MariaDB (made: `db.open` makes none).
+fn maria_db(name: &str) -> Option<(Arc<support::Maria>, String)> {
+    let Some(my) = maria_server() else {
+        eprintln!("skipping MariaDB: mariadbd and mariadb-install-db were not found");
+        return None;
+    };
+    let url = my.url(&format!("f55_{}", name));
+    Some((my, url))
+}
+
+/// `sql` run by psql on `url`, each statement to its end.
+fn psql(pg: &support::Pg, url: &str, sql: &[&str]) {
+    let mut c = Command::new(pg.bin.join("psql"));
+    c.args([url, "-q", "-v", "ON_ERROR_STOP=1"]);
+    for s in sql {
+        c.args(["-c", s]);
+    }
+    let out = c.output().unwrap();
+    assert!(out.status.success(), "{:?}: {}", sql, String::from_utf8_lossy(&out.stderr));
+}
+
+// Q-730: a `bit(n)` value keeps its digits: the cast Quillo adds is to `varbit`, not the bare
+// `bit` that is `bit(1)`.
+#[test]
+fn a_bit_value_keeps_its_length_on_postgresql() {
+    let Some((_pg, url)) = pg_db("bits") else { return };
+    let mut it = on_db(&url, "db.exec(\"create table perms (id int, flags bit(8), one bit(1), v varbit(4), many bit(2)[])\")\n");
+    assert_eq!(ev(&mut it, r#"db.exec("insert into perms (id, flags) values (1, ?::bit(8))", "00000101").changes"#), "1");
+    assert_eq!(ev(&mut it, r#"db.exec("insert into perms (id, flags, one, v) values (2, ?, ?, ?)", "11111111", "1", "101").changes"#), "1");
+    assert_eq!(ev(&mut it, r#"db.query("select flags, one, v from perms where id < 3 order by id")"#), r#"[{ flags: "00000101", one: null, v: null }, { flags: "11111111", one: "1", v: "101" }]"#);
+    assert_eq!(ev(&mut it, r#"db.one("select ?::bit(4) as v", "1010").v"#), r#""1010""#);
+    assert_eq!(ev(&mut it, r#"db.one("select ?::bit(1) as v", "1").v"#), r#""1""#);
+    // An array of them.
+    assert_eq!(ev(&mut it, r#"db.exec("insert into perms (id, many) values (3, ?)", ["01", "10"]).changes"#), "1");
+    assert_eq!(ev(&mut it, r#"db.one("select many from perms where id = 3").many"#), r#"["01", "10"]"#);
+    // Too many digits, too few, and one that is no digit: as PostgreSQL says.
+    has(&ev(&mut it, r#"db.exec("insert into perms (id, flags) values (4, ?)", "000001011")"#), "bit string length 9 does not match type bit(8)", "9 digits");
+    has(&ev(&mut it, r#"db.exec("insert into perms (id, flags) values (4, ?)", "0101")"#), "bit string length 4 does not match type bit(8)", "4 digits");
+    has(&ev(&mut it, r#"db.exec("insert into perms (id, flags) values (4, ?)", "0102")"#), "is not a valid binary digit", "a 2");
+    has(&ev(&mut it, r#"db.exec("insert into perms (id, v) values (4, ?)", "10101")"#), "bit string too long for type bit varying(4)", "varbit");
+}
+
+// Q-732: a whole number past an int in json and jsonb is a `dec`, so two of them are two; a value
+// serde_json could not read fails only its own cell.
+#[test]
+fn json_numbers_past_an_int_are_decs_and_a_bad_value_fails_only_its_cell() {
+    let Some((_pg, url)) = pg_db("jsonnum") else { return };
+    let mut it = on_db(&url, "db.exec(\"create table r4 (id int, p jsonb, q json)\")\n");
+    ev(&mut it, r#"db.exec("insert into r4 (id, p) values (1, '{\"n\": 18446744073709551615}'), (2, '{\"n\": 18446744073709551614}'), (3, '{\"n\": 9223372036854775807}'), (4, '{\"n\": 9223372036854775808}'), (5, '{\"n\": -9223372036854775808}'), (6, '{\"n\": -9223372036854775809}'), (7, '{\"n\": 0.1, \"é\": [true, null, \"ü\"]}')")"#);
+    assert_eq!(
+        ev(&mut it, r#"db.query("select p from r4 order by id") | map((r) => r.p.n)"#),
+        "[18446744073709551615m, 18446744073709551614m, 9223372036854775807, 9223372036854775808m, -9223372036854775808, -9223372036854775809m, 0.1]"
+    );
+    assert_eq!(ev(&mut it, r#"let a = db.query("select p from r4 where id < 3 order by id")
+a[0].p.n == a[1].p.n"#), "false");
+    assert_eq!(ev(&mut it, r#"db.one("select p from r4 where id = 7").p"#), r#"{ n: 0.1, é: [true, null, "ü"] }"#);
+    // Past a dec and a float, a lone surrogate, deep nesting: each its own row, read with the rest.
+    ev(&mut it, r#"db.exec("insert into r4 (id, p, q) values (8, '{\"n\": 1e400}', '{\"n\": 1e400}'), (9, null, '\"\\ud800x\"'), (10, null, '1e-400'), (11, (repeat('[', 1000) || '1' || repeat(']', 1000))::jsonb, null), (12, (repeat('[', 1001) || '1' || repeat(']', 1001))::jsonb, null), (13, '[]', '{}')")"#);
+    let rows = ev(&mut it, r#"db.query("select id, p, q from r4 where id >= 8 order by id") | map((r) => [r.id, is_err(r.p) ? str(r.p.error) : type_of(r.p), is_err(r.q) ? str(r.q.error) : r.q])"#);
+    has(&rows, r#"[8, "db: this JSON could not be read: the number 1000000000000000... (401 characters) is past what a float holds", "db: this JSON could not be read: the number 1e400 is past what a float holds"]"#, "past a float");
+    has(&rows, "[9, \"null\", \"\u{fffd}x\"]", "a lone surrogate");
+    has(&rows, r#"[10, "null", "db: this JSON could not be read: the number 1e-400 is past what a float holds"]"#, "below a float");
+    has(&rows, r#"[11, "list", null]"#, "1,000 deep");
+    has(&rows, r#"[12, "db: this JSON could not be read: it nests more than 1000 deep", null]"#, "1,001 deep");
+    has(&rows, r#"[13, "list", {}]"#, "empty");
+    assert_eq!(ev(&mut it, "len(db.query(\"select p from r4\"))"), "13");
+    // Past a dec, a float, as jsonb writes a float's whole number in digits: the program's own
+    // floats come back (found in review).
+    ev(&mut it, r#"db.exec("insert into r4 (id, p) values (20, ?)", { f: 1.5e30, big: 1e300, top: 1.7976931348623157e308, small: 0.5 })"#);
+    assert_eq!(ev(&mut it, r#"let p = db.one("select p from r4 where id = 20").p
+[p.f == 1.5e30, p.big == 1e300, p.top == 1.7976931348623157e308, p.small]"#), "[true, true, true, 0.5]");
+    assert_eq!(ev(&mut it, r#"let r = db.one("select '1e30'::jsonb as a, '79228162514264337593543950335'::jsonb as b, '79228162514264337593543950336'::jsonb as c")
+[r.a == 1e30, r.b, r.c == 79228162514264337593543950336.0]"#), "[true, 79228162514264337593543950335m, true]");
+}
+
+// Q-733: JSON text given for a json column is the JSON it holds, as MySQL's JSON takes it, not a
+// JSON string; a map is as before.
+#[test]
+fn json_text_given_for_a_json_column_is_stored_as_json() {
+    let (dbs, _held) = databases("jsontext");
+    for (kind, url) in &dbs {
+        let col = if *kind == "postgres" { "jsonb" } else { "json" };
+        let mut it = on_db(url, &format!("db.exec(\"create table items (id int, doc {})\")\n", col));
+        let back = |it: &mut quillo::Interp, id: i32| ev(it, &format!("let d = db.one(\"select doc from items where id = {}\").doc\ntype_of(d) == \"str\" ? json.parse(d) : d", id));
+        assert_eq!(ev(&mut it, r#"db.exec("insert into items (id, doc) values (1, ?)", json.stringify({ sku: "a1", n: [1, 2] })).changes"#), "1", "{}", kind);
+        // jsonb keeps its keys in an order of its own.
+        assert_eq!(ev(&mut it, "let d = db.one(\"select doc from items where id = 1\").doc\nlet m = type_of(d) == \"str\" ? json.parse(d) : d\n[m.sku, m.n]"), r#"["a1", [1, 2]]"#, "{}", kind);
+        assert_eq!(ev(&mut it, r#"db.exec("insert into items (id, doc) values (2, ?)", { sku: "b2" }).changes"#), "1", "{}", kind);
+        assert_eq!(back(&mut it, 2), r#"{ sku: "b2" }"#, "{}", kind);
+        assert_eq!(ev(&mut it, r#"db.exec("insert into items (id, doc) values (3, ?)", "[1, \"é\"]").changes"#), "1", "{}", kind);
+        assert_eq!(back(&mut it, 3), r#"[1, "é"]"#, "{}", kind);
+        assert_eq!(ev(&mut it, r#"db.exec("insert into items (id, doc) values (4, ?)", "\"just text\"").changes"#), "1", "{}", kind);
+        // PostgreSQL's jsonb gives the string; the others the JSON text, quotes and all.
+        let text = if *kind == "postgres" { r#""just text""# } else { r#"""just text"""# };
+        assert_eq!(ev(&mut it, "db.one(\"select doc from items where id = 4\").doc"), text, "{}: a JSON string", kind);
+        if *kind == "postgres" {
+            assert_eq!(ev(&mut it, r#"db.exec("insert into items (id, doc) values (5, ?::jsonb)", json.stringify({ sku: "c3" })).changes"#), "1");
+            assert_eq!(ev(&mut it, r#"db.query("select jsonb_typeof(doc) as t, doc->>'sku' as sku from items where id in (1, 4, 5) order by id")"#), r#"[{ t: "object", sku: "a1" }, { t: "string", sku: null }, { t: "object", sku: "c3" }]"#);
+            assert_eq!(ev(&mut it, r#"db.one("select count(*) as n from items where doc @> ?", { sku: "c3" }).n"#), "1");
+            // Not a column's value: a JSON string, as MySQL's functions take one (found in review).
+            assert_eq!(ev(&mut it, r#"db.one("select ?::json as j", "{}").j"#), r#""{}""#);
+            assert_eq!(ev(&mut it, r#"db.one("select count(*) as n from items where doc @> ?", "{\"sku\": \"c3\"}").n"#), "0");
+        }
+        // Text that is no JSON: refused where the column checks it.
+        if *kind != "sqlite" {
+            assert_eq!(ev(&mut it, r#"is_err(db.exec("insert into items (id, doc) values (6, ?)", "not json"))"#), "true", "{}", kind);
+        }
+    }
+}
+
+// Q-733, found in review: a str is JSON text only as a json column's value (an insert's values,
+// `set col = ?`), as MySQL's JSON column takes it; given to a function it is a JSON string, as
+// MySQL's `json_set` takes it.
+#[test]
+fn a_str_is_json_text_only_as_a_json_columns_value() {
+    let (dbs, _held) = databases("jsonargs");
+    for (kind, url) in dbs.iter().filter(|(k, _)| *k != "sqlite") {
+        let (col, set) = if *kind == "postgres" { ("jsonb", "jsonb_set('{}', '{a}', ?)") } else { ("json", "json_set('{}', '$.a', ?)") };
+        let mut it = on_db(url, &format!("db.exec(\"create table ja (id int, j {})\")\n", col));
+        let read = |it: &mut quillo::Interp, sql: &str| ev(it, &format!("let v = db.one(\"{}\", \"123\", \"Bob\")\n[v.a, v.b] | map((x) => type_of(x) == \"str\" ? json.parse(x) : x)", sql));
+        assert_eq!(read(&mut it, &format!("select {} as a, {} as b", set, set)), r#"[{ a: "123" }, { a: "Bob" }]"#, "{}", kind);
+        // A column's value, by insert and by update, a cast after it or not: the JSON it holds.
+        assert_eq!(ev(&mut it, "db.exec(\"insert into ja (id, j) values (1, ?), (2, ?)\", \"123\", \"[\\\"é\\\"]\").changes"), "2", "{}", kind);
+        assert_eq!(ev(&mut it, "db.exec(\"update ja set j = ?, id = id where id = 2\", \"{\\\"b\\\": true}\").changes"), "1", "{}", kind);
+        let back = ev(&mut it, "db.query(\"select j from ja order by id\") | map((r) => type_of(r.j) == \"str\" ? json.parse(r.j) : r.j)");
+        assert_eq!(back, "[123, { b: true }]", "{}", kind);
+        // A function's argument inside a value is a JSON string there too.
+        assert_eq!(ev(&mut it, &format!("db.exec(\"update ja set j = {} where id = 1\", \"Bob\").changes", set)), "1", "{}", kind);
+        assert_eq!(ev(&mut it, "let j = db.one(\"select j from ja where id = 1\").j\ntype_of(j) == \"str\" ? json.parse(j) : j"), r#"{ a: "Bob" }"#, "{}", kind);
+        if *kind == "postgres" {
+            assert_eq!(ev(&mut it, "db.exec(\"insert into ja (id, j) values (3, ?::jsonb) on conflict do nothing\", \"[1]\").changes"), "1");
+            assert_eq!(ev(&mut it, "db.one(\"select jsonb_typeof(j) as t from ja where id = 3\").t"), r#""array""#);
+        }
+    }
+}
+
+// Found in review: a whole `dec` inside a JSON value is written as a number, so a number past an
+// int read from a JSON column (a dec) goes back as the number it was; a dec with a fraction stays
+// a string, as a JSON number with one reads as a float.
+#[test]
+fn a_whole_dec_inside_json_is_a_number() {
+    let (dbs, _held) = databases("jsondec");
+    for (kind, url) in &dbs {
+        let col = if *kind == "postgres" { "jsonb" } else { "json" };
+        let mut it = on_db(url, &format!("db.exec(\"create table jd (id int, j {})\")\n", col));
+        assert_eq!(ev(&mut it, "db.exec(\"insert into jd values (1, ?)\", { d: 18446744073709551615m, m: 12.50m, n: [5m, -7m] }).changes"), "1", "{}", kind);
+        let j = ev(&mut it, "let j = db.one(\"select j from jd\").j\nlet m = type_of(j) == \"str\" ? json.parse(j) : j\n[m.d, m.m, m.n]");
+        if *kind == "postgres" {
+            assert_eq!(j, r#"[18446744073709551615m, "12.50", [5, -7]]"#);
+            // Written back, it finds its row.
+            assert_eq!(ev(&mut it, "let j = db.one(\"select j from jd\").j\ndb.one(\"select count(*) as n from jd where j = ?\", j).n"), "1");
+        } else {
+            // json.parse reads a number past an int as a float; the text holds the number.
+            assert_eq!(ev(&mut it, "let j = db.one(\"select j from jd\").j\ntype_of(j) == \"str\" ? (j | contains(\"18446744073709551615\")) : j"), "true", "{}", kind);
+        }
+    }
+}
+
+// Q-734: a float past `real`'s or `double precision`'s range is refused, as PostgreSQL refuses it
+// in text, where it was stored as Infinity or 0.
+#[test]
+fn a_float_past_its_columns_range_is_refused_on_postgresql() {
+    let Some((_pg, url)) = pg_db("floatrange") else { return };
+    let mut it = on_db(&url, "db.exec(\"create table r2 (id int, r real, d float8)\")\n");
+    for v in ["1e39", "-1e39", "1e-46", "-1e-46", "\"1e39\"", "\"1e-46\""] {
+        has(&ev(&mut it, &format!("db.exec(\"insert into r2 (id, r) values (1, ?)\", {})", v)), "is out of range for type real", v);
+    }
+    for v in ["\"1e400\"", "\"-1e400\"", "\"1e-400\""] {
+        has(&ev(&mut it, &format!("db.exec(\"insert into r2 (id, d) values (1, ?)\", {})", v)), "is out of range for type double precision", v);
+    }
+    has(&ev(&mut it, "db.exec(\"insert into r2 (id, d) values (1, ?)\", \"NaN\")"), "cannot be stored", "NaN as text");
+    assert_eq!(ev(&mut it, "len(db.query(\"select * from r2\"))"), "0");
+    // The limits, and the forms that go as before.
+    for (i, v) in ["3.4e38", "-3.4e38", "1.4e-45", "0.0", "-0.0", "1", "\"2.5\"", "\"0e-400\"", "2.5m"].iter().enumerate() {
+        assert_eq!(ev(&mut it, &format!("db.exec(\"insert into r2 (id, r) values ({}, ?)\", {}).changes", i, v)), "1", "{}", v);
+    }
+    for (i, v) in ["\"1e308\"", "\"4.9e-324\"", "1.7976931348623157e308"].iter().enumerate() {
+        assert_eq!(ev(&mut it, &format!("db.exec(\"insert into r2 (id, d) values ({}, ?)\", {}).changes", 20 + i, v)), "1", "{}", v);
+    }
+    assert_eq!(ev(&mut it, "[db.one(\"select r from r2 where id = 0\").r == 3.4e38, db.one(\"select r from r2 where id = 2\").r > 0.0, db.one(\"select r from r2 where id = 6\").r]"), "[true, true, 2.5]");
+}
+
+// Q-735: NaN and the infinities are refused, naming them, on every database (SQLite stored NaN
+// as null, MariaDB refused both as "out of range", PostgreSQL kept them); -0.0 is 0.0 on every
+// one (SQLite and MariaDB cannot keep it).
+#[test]
+fn nan_and_the_infinities_are_refused_and_minus_zero_is_zero_on_every_database() {
+    let (dbs, _held) = databases("nan");
+    for (kind, url) in &dbs {
+        let mut it = on_db(url, "db.exec(\"create table m (id int, y double precision not null)\")\n");
+        for (v, name) in [("sqrt(-1.0)", "NaN"), ("1.0 / 0.0", "inf"), ("-1.0 / 0.0", "-inf")] {
+            has(&ev(&mut it, &format!("db.exec(\"insert into m (id, y) values (1, ?)\", {})", v)), &format!("value 1 is {}, which cannot be stored", name), kind);
+        }
+        has(&ev(&mut it, "db.exec(\"insert into m (id, y) values (:id, :y)\", { id: 1, y: sqrt(-1.0) })"), "value :y is NaN, which cannot be stored", kind);
+        has(&ev(&mut it, "db.exec(\"insert into m (id, y) values (1, ?)\", [1.5, 1.0 / 0.0])"), "value 1 holds inf, which cannot be stored", kind);
+        has(&ev(&mut it, "db.query(\"select * from m where y = ?\", sqrt(-1.0))"), "value 1 is NaN", kind);
+        assert_eq!(ev(&mut it, "len(db.query(\"select * from m\"))"), "0", "{}: nothing stored", kind);
+        // -0.0 is stored as 0.0; the largest and the smallest floats as they are.
+        assert_eq!(ev(&mut it, "db.exec(\"insert into m (id, y) values (2, ?)\", -0.0).changes"), "1", "{}", kind);
+        assert_eq!(ev(&mut it, "let y = db.one(\"select y from m where id = 2\").y\n[y, 1.0 / y > 0.0]"), "[0.0, true]", "{}", kind);
+        for (i, v) in ["1.7976931348623157e308", "-1.7976931348623157e308", "2.2250738585072014e-308", "0.0", "2.5"].iter().enumerate() {
+            assert_eq!(ev(&mut it, &format!("db.exec(\"insert into m (id, y) values ({}, ?)\", {}).changes", 10 + i, v)), "1", "{} {}", kind, v);
+        }
+        assert_eq!(ev(&mut it, "db.one(\"select y from m where id = 10\").y == 1.7976931348623157e308"), "true", "{}", kind);
+    }
+}
+
+// Q-736: on MySQL, `db.open` of a database that is not there is an error, as on PostgreSQL (the
+// user's decision): a typo in a URL made a new, empty database. A tenant's is made by its driver.
+#[test]
+fn a_mysql_database_that_is_not_there_is_not_made_by_opening_it() {
+    let Some(my) = maria_server() else { return };
+    let url = my.url_of("f55_typo");
+    let d = support::temp_dir("feedback55-typo");
+    let mut it = quillo::Interp::new(&d);
+    it.load_source("let first = 1\n", "app.qwe").unwrap();
+    has(&ev(&mut it, &format!("let r = db.open(\"{}\")\nis_err(r) ? str(r.error) : \"opened\"", url)), "Unknown database 'f55_typo'", "db.open");
+    has(&ev(&mut it, &format!("let c = db.connect(\"{}\")\nis_err(c) ? str(c.error) : \"opened\"", url)), "Unknown database 'f55_typo'", "db.connect");
+    assert!(quillo::my::Pool::open_as(&url, false).is_err(), "it was made");
+    // One that is there opens, as before; and no database named in the URL is none.
+    let there = my.url("f55_there");
+    assert_eq!(ev(&mut it, &format!("let r = db.open(\"{}\")\ndb.one(\"select database() as d\").d", there)), "\"f55_there\"");
+    let mut it = on_db(&my.url(""), "");
+    assert_eq!(ev(&mut it, "db.one(\"select database() as d\").d"), "null");
+    // A tenant's database is made by the driver when the program names the tenant; asking
+    // whether one is there makes none.
+    let mut it = on_db(&my.url_of("f55t_{tenant}"), "");
+    assert_eq!(ev(&mut it, "db.tenant_exists(\"ghost\")"), "false");
+    assert!(quillo::my::Pool::open_as(&my.url_of("f55t_ghost"), false).is_err());
+    assert_eq!(ev(&mut it, "new_tenant(\"acme\", () => db.exec(\"create table a (x int)\").changes)"), "0");
+    assert!(quillo::my::Pool::open_as(&my.url_of("f55t_acme"), false).is_ok());
+    assert_eq!(ev(&mut it, "with_tenant(\"beta\", () => db.one(\"select database() as d\").d)"), "\"f55t_beta\"");
+    assert_eq!(ev(&mut it, "db.tenant_exists(\"beta\")"), "true");
+}
+
+// Q-737: a URL's `options` are kept with its `schema`, which replaced them.
+#[test]
+fn a_urls_options_are_kept_with_its_schema() {
+    let Some((_pg, url)) = pg_db("options") else { return };
+    for (extra, timeout, schema) in [
+        ("options=-c%20statement_timeout%3D100&schema=f55s", "100ms", "f55s"),
+        ("schema=f55s&options=-c%20statement_timeout%3D200", "200ms", "f55s"),
+        ("options=-c%20statement_timeout%3D300", "300ms", "public"),
+        ("schema=f55t", "0", "f55t"),
+        ("options=&schema=f55u", "0", "f55u"),
+    ] {
+        let mut it = on_db(&format!("{}?{}", url, extra), "");
+        assert_eq!(ev(&mut it, "db.one(\"show statement_timeout\").statement_timeout"), format!("\"{}\"", timeout), "{}", extra);
+        assert_eq!(ev(&mut it, "db.one(\"select current_schema() as s\").s"), format!("\"{}\"", schema), "{}", extra);
+    }
+    let mut it = on_db(&format!("{}?options=-c%20statement_timeout%3D100&schema=f55s", url), "");
+    has(&ev(&mut it, "db.one(\"select pg_sleep(0.5) is null as v\")"), "statement timeout", "the server's timeout");
+}
+
+// Q-739: `changes` counts the rows a statement matched, on every database: MySQL counted those it
+// changed, so "update, else insert" inserted again; an upsert's or a replace's row counts once.
+#[test]
+fn changes_counts_the_rows_matched_on_every_database() {
+    let (dbs, _held) = databases("matched");
+    for (kind, url) in &dbs {
+        let mut it = on_db(url, "db.exec(\"create table stock (sku varchar(10) primary key, qty int)\")\ndb.exec(\"insert into stock values ('a', 5), ('b', 1)\")\n");
+        let c = |it: &mut quillo::Interp, sql: &str| ev(it, &format!("db.exec(\"{}\").changes", sql));
+        assert_eq!(c(&mut it, "update stock set qty = 5 where sku = 'a'"), "1", "{}: the value it had", kind);
+        assert_eq!(c(&mut it, "update stock set qty = 6 where sku = 'a'"), "1", "{}", kind);
+        assert_eq!(c(&mut it, "update stock set qty = qty where sku in ('a', 'b')"), "2", "{}", kind);
+        assert_eq!(c(&mut it, "update stock set qty = 1 where sku = 'zz'"), "0", "{}", kind);
+        assert_eq!(
+            ev(&mut it, "let r = db.exec(\"update stock set qty = 6 where sku = ?\", \"a\")\nr.changes == 0 ? db.exec(\"insert into stock values (?, 6)\", \"a\").changes : \"updated\""),
+            "\"updated\"",
+            "{}",
+            kind
+        );
+        let up = |rows: &str| match *kind {
+            "mariadb" => format!("insert into stock values {} on duplicate key update qty = values(qty)", rows),
+            _ => format!("insert into stock values {} on conflict (sku) do update set qty = excluded.qty", rows),
+        };
+        assert_eq!(c(&mut it, &up("('c', 1)")), "1", "{}: inserted", kind);
+        assert_eq!(c(&mut it, &up("('c', 2)")), "1", "{}: updated", kind);
+        assert_eq!(c(&mut it, &up("('c', 2)")), "1", "{}: as it was", kind);
+        assert_eq!(c(&mut it, &up("('c', 3), ('d', 1)")), "2", "{}: one of each", kind);
+        if *kind != "postgres" {
+            assert_eq!(c(&mut it, "replace into stock values ('a', 9)"), "1", "{}", kind);
+            assert_eq!(c(&mut it, "replace into stock values ('a', 9), ('e', 1)"), "2", "{}", kind);
+        }
+        assert_eq!(ev(&mut it, "db.one(\"select qty from stock where sku = 'c'\").qty"), "3", "{}", kind);
+    }
+    // MySQL's own count, where the URL asks for it.
+    let Some((_my, url)) = maria_db("matched_own") else { return };
+    let mut it = on_db(&format!("{}?client_found_rows=false", url), "db.exec(\"create table s (k int primary key, v int)\")\ndb.exec(\"insert into s values (1, 1)\")\n");
+    assert_eq!(ev(&mut it, "db.exec(\"update s set v = 1 where k = 1\").changes"), "0");
+}
+
+// Q-740: on MySQL, an id at or past 2^63 is a `dec`, found by itself, where it was negative.
+#[test]
+fn a_mysql_id_past_2_63_is_a_dec() {
+    let Some((_my, url)) = maria_db("bigid") else { return };
+    let mut it = on_db(&url, "db.exec(\"create table ub (id bigint unsigned auto_increment primary key, n int)\")\ndb.exec(\"alter table ub auto_increment = 9223372036854775806\")\n");
+    for (n, id) in [(1, "9223372036854775806"), (2, "9223372036854775807"), (3, "9223372036854775808m"), (4, "9223372036854775809m")] {
+        assert_eq!(ev(&mut it, &format!("let r = db.exec(\"insert into ub (n) values ({})\")\n[r.last_id, db.one(\"select n from ub where id = ?\", r.last_id).n]", n)), format!("[{}, {}]", id, n));
+    }
+    assert_eq!(ev(&mut it, "db.exec(\"insert into ub (id, n) values (18446744073709551615, 5)\").last_id"), "18446744073709551615m");
+    assert_eq!(ev(&mut it, "db.query(\"select id from ub where id > ? order by id\", 9223372036854775807m) | map((r) => r.id)"), "[9223372036854775808m, 9223372036854775809m, 18446744073709551615m]");
+}
+
+// Q-741: a MariaDB `BIT(n)` reads as PostgreSQL's `bit(n)`: its n digits, where its bytes were
+// passed off as text.
+#[test]
+fn bit_columns_read_as_their_digits_on_mariadb_as_on_postgresql() {
+    let (dbs, _held) = databases("bitcols");
+    let ones = "1".repeat(64);
+    for (kind, url) in dbs.iter().filter(|(k, _)| *k != "sqlite") {
+        let mut it = on_db(url, "db.exec(\"create table bits (k int, b bit(8), b1 bit(1), b64 bit(64))\")\n");
+        ev(&mut it, &format!("db.exec(\"insert into bits values (1, b'00000101', b'1', b'{}'), (2, b'11111111', b'0', b'{}1'), (3, b'01000001', null, null)\")", ones, "0".repeat(63)));
+        assert_eq!(
+            ev(&mut it, "db.query(\"select b, b1, b64 from bits order by k\")"),
+            format!(r#"[{{ b: "00000101", b1: "1", b64: "{}" }}, {{ b: "11111111", b1: "0", b64: "{}1" }}, {{ b: "01000001", b1: null, b64: null }}]"#, ones, "0".repeat(63)),
+            "{}",
+            kind
+        );
+    }
+}
+
+// Q-742: a PostgreSQL type with no reader of its own comes back the same way in every row, by its
+// type: hex, where bytes that happened to be UTF-8 were text; `timetz`, `pg_lsn` and `xid8` as
+// PostgreSQL writes them.
+#[test]
+fn postgresql_types_without_a_reader_read_one_way_in_every_row() {
+    let Some((_pg, url)) = pg_db("othertypes") else { return };
+    let mut it = on_db(&url, "");
+    assert_eq!(
+        ev(&mut it, "db.one(\"select 'int4'::regtype as t, '00:00:00+00'::timetz as a, '12:00:00+02'::timetz as b, '05:30:15.5-05:30'::timetz as c, '16/B374D848'::pg_lsn as l, '42'::xid8 as x\")"),
+        r#"{ t: "\\x00000017", a: "00:00:00+00", b: "12:00:00+02", c: "05:30:15.5-05:30", l: "16/B374D848", x: 42 }"#
+    );
+    // A range, in two rows: hex both times.
+    let r = ev(&mut it, "db.query(\"select r from (values ('[1,5)'::int4range), ('[2,3)'::int4range)) v(r)\") | map((x) => x.r)");
+    assert!(r.starts_with(r#"["\\x"#) && r.matches(r#""\\x"#).count() == 2, "{}", r);
+    // Text in its kinds stays text.
+    assert_eq!(ev(&mut it, "db.one(\"select 'é'::text as a, 'x'::\\\"char\\\" as b, '<a/>'::xml as c, 'n'::name as d\")"), r#"{ a: "é", b: "x", c: "<a/>", d: "n" }"#);
+}
+
+// Q-743: a BC date reads as ISO 8601 writes it (`-0043-03-15` for 44 BC, `0000` for 1 BC), and
+// that text is written back as the same date.
+#[test]
+fn bc_dates_read_as_iso_and_are_written_back() {
+    let Some((_pg, url)) = pg_db("bcdates") else { return };
+    let mut it = on_db(&url, "db.exec(\"create table ds (id int, d date, t timestamp, tz timestamptz)\")\n");
+    for (pg, iso) in [("0044-03-15 BC", "-0043-03-15"), ("0001-06-01 BC", "0000-06-01"), ("0002-01-01 BC", "-0001-01-01"), ("0001-01-01", "0001-01-01"), ("4713-11-24 BC", "-4712-11-24"), ("9999-12-31", "9999-12-31")] {
+        let got = ev(&mut it, &format!("let d = db.one(\"select '{}'::date as d\").d\n[d, db.one(\"select ?::date = '{}'::date as same\", d).same]", pg, pg));
+        assert_eq!(got, format!("[\"{}\", true]", iso), "{}", pg);
+    }
+    assert_eq!(ev(&mut it, "let t = db.one(\"select '4714-11-24 00:00:00+00 BC'::timestamptz as t\").t\n[t, db.one(\"select ?::timestamptz = '4714-11-24 00:00:00+00 BC'::timestamptz as same\", t).same]"), "[\"-4713-11-24T00:00:00Z\", true]");
+    assert_eq!(ev(&mut it, "let t = db.one(\"select '0044-03-15 12:30:00 BC'::timestamp as t\").t\n[t, db.one(\"select ?::timestamp = '0044-03-15 12:30:00 BC'::timestamp as same\", t).same]"), "[\"-0043-03-15T12:30:00\", true]");
+    // Into columns, by plain `?`; and as before for what is not BC.
+    assert_eq!(ev(&mut it, "db.exec(\"insert into ds values (1, ?, ?, ?)\", \"-0043-03-15\", \"0000-01-02T03:04:05\", \"-0100-06-01T00:00:00Z\").changes"), "1");
+    assert_eq!(ev(&mut it, "db.one(\"select d, t, tz, d = '0044-03-15 BC'::date as same from ds where id = 1\")"), "{ d: \"-0043-03-15\", t: \"0000-01-02T03:04:05\", tz: \"-0100-06-01T00:00:00Z\", same: true }");
+    assert_eq!(ev(&mut it, "db.exec(\"insert into ds (id, d) values (2, ?), (3, ?)\", \"2026-11-06\", \"infinity\").changes"), "2");
+    assert_eq!(ev(&mut it, "db.query(\"select d from ds where id > 1 order by id\") | map((r) => r.d)"), "[\"2026-11-06\", \"infinity\"]");
+}
+
+// Q-744: PostgreSQL's `real` and MariaDB's `FLOAT` read back as the shortest float that prints as
+// they do: 0.1, not 0.10000000149011612.
+#[test]
+fn real_and_float_columns_read_back_as_written() {
+    let (dbs, _held) = databases("reals");
+    for (kind, url) in dbs.iter().filter(|(k, _)| *k != "sqlite") {
+        let ty = if *kind == "mariadb" { "float" } else { "real" };
+        let mut it = on_db(url, &format!("db.exec(\"create table fl (id int, r {})\")\n", ty));
+        for (i, v) in ["0.1", "-0.1", "1.5", "3.4e38", "16777217", "0.3"].iter().enumerate() {
+            assert_eq!(ev(&mut it, &format!("db.exec(\"insert into fl values ({}, ?)\", {}).changes", i, v)), "1", "{} {}", kind, v);
+        }
+        assert_eq!(
+            ev(&mut it, "let r = db.query(\"select r from fl order by id\") | map((x) => x.r)\n[r[0], r[1], r[2], r[3] == 3.4e38, r[4], r[5]]"),
+            "[0.1, -0.1, 1.5, true, 16777216.0, 0.3]",
+            "{}",
+            kind
+        );
+    }
+}
+
+// Q-745: after an `alter table`, a statement a connection kept is prepared again, once, where
+// every request on it failed ("cached plan must not change result type") until the server
+// restarted: on the pool's connections, in a transaction, and on the server's shared ones; a
+// change made here, or seen on one connection, is a change for every connection of the pool.
+#[test]
+fn a_kept_statement_is_prepared_again_after_its_table_changes() {
+    let Some((pg, url)) = pg_db("replan") else { return };
+    let mut it = on_db(&url, "db.exec(\"create table cp (a int)\")\ndb.exec(\"insert into cp values (1)\")\n");
+    let all = "db.query(\"select * from cp\")";
+    let in_tx = "db.transaction(() => db.query(\"select * from cp\"))";
+    assert_eq!(ev(&mut it, all), "[{ a: 1 }]");
+    assert_eq!(ev(&mut it, in_tx), "[{ a: 1 }]");
+    assert_eq!(ev(&mut it, "db.query(\"select * from cp where a = ?\", 1)"), "[{ a: 1 }]");
+    // Changed here: every connection knows, in a transaction too.
+    ev(&mut it, "db.exec(\"alter table cp add column b int default 2\")");
+    assert_eq!(ev(&mut it, in_tx), "[{ a: 1, b: 2 }]");
+    assert_eq!(ev(&mut it, all), "[{ a: 1, b: 2 }]");
+    assert_eq!(ev(&mut it, "db.query(\"select * from cp where a = ?\", 1)"), "[{ a: 1, b: 2 }]");
+    assert_eq!(ev(&mut it, "db.exec(\"update cp set b = ? where a = ?\", 3, 1).changes"), "1");
+    // A column's type changed, and one dropped, in a script.
+    ev(&mut it, "db.exec(\"alter table cp alter column b type text; select 1\")");
+    assert_eq!(ev(&mut it, all), "[{ a: 1, b: \"3\" }]");
+    ev(&mut it, "db.exec(\"alter table cp drop column b\")");
+    assert_eq!(ev(&mut it, "db.query(\"select * from cp where a = ?\", 1)"), "[{ a: 1 }]");
+    // Changed elsewhere (another server's migration): tried again once outside a transaction,
+    // and the others then know.
+    psql(&pg, &url, &["alter table cp add column c int default 4"]);
+    assert_eq!(ev(&mut it, all), "[{ a: 1, c: 4 }]");
+    assert_eq!(ev(&mut it, in_tx), "[{ a: 1, c: 4 }]");
+    // A transaction that met it first: it fails, as the error ended it; the next one is right.
+    psql(&pg, &url, &["alter table cp add column d int default 6"]);
+    let first = ev(&mut it, in_tx);
+    assert!(first == "[{ a: 1, c: 4, d: 6 }]" || first.contains("cached plan must not change result type"), "{}", first);
+    assert_eq!(ev(&mut it, in_tx), "[{ a: 1, c: 4, d: 6 }]");
+    assert_eq!(ev(&mut it, all), "[{ a: 1, c: 4, d: 6 }]");
+    // The server's shared connections, each of which kept the old statement.
+    let d = dir("replan-server", &format!("db.open(\"{}\")\nroute GET /all = json.stringify(db.query(\"select * from cp\"))\nroute GET /alter = str(db.exec(\"alter table cp add column e int default 5\").changes)\n", url));
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let get = |path: &str| {
+        let a = support::send(s.port, "GET", path, &[], "");
+        (a.status, a.body)
+    };
+    for _ in 0..12 {
+        assert_eq!(get("/all"), (200, "[{\"a\":1,\"c\":4,\"d\":6}]".to_string()));
+    }
+    assert_eq!(get("/alter"), (200, "0".to_string()));
+    for i in 0..12 {
+        assert_eq!(get("/all"), (200, "[{\"a\":1,\"c\":4,\"d\":6,\"e\":5}]".to_string()), "request {}", i);
+    }
+    psql(&pg, &url, &["alter table cp drop column e"]);
+    for i in 0..12 {
+        assert_eq!(get("/all"), (200, "[{\"a\":1,\"c\":4,\"d\":6}]".to_string()), "request {} after another's change", i);
+    }
+}
+
+// Q-750: a statement that writes where its words do not show it goes to the primary, and a
+// replica's refusal of one leaves the replica in use, where it was out for ten seconds. Each
+// request is its own (a request that wrote reads from the primary after).
+#[test]
+fn a_select_that_writes_goes_to_the_primary_and_leaves_the_replica_in_use() {
+    let Some(pg) = pg_server() else { return };
+    let (primary, replica) = (pg.database("f55_rprimary"), pg.database("f55_rreplica"));
+    for (url, who) in [(&primary, "primary"), (&replica, "replica")] {
+        psql(&pg, url, &[
+            "create table which (v text)",
+            &format!("insert into which values ('{}')", who),
+            "create sequence rs",
+            "create view nv as select nextval('rs') as n",
+            &format!("create function f55_mark() returns text language sql as $$ select '{}'::text $$", who),
+        ]);
+    }
+    let name = replica.rsplit('/').next().unwrap().to_string();
+    psql(&pg, &primary, &[&format!("alter database {} set default_transaction_read_only = on", name)]);
+    let src = format!(
+        "db.open(\"{}\", {{ replicas: [\"{}\"] }})\nlet sqls = [\"select nextval('rs') as n, (select v from which) as w\", \"select setval('rs', 10) as n, (select v from which) as w\", \"select v as w, 1 as n from which for update\", \"select pg_catalog.nextval('rs') as n, (select v from which) as w\", \"select f55_mark() as w, 0 as n\", \"select n, (select v from which) as w from nv\", \"select (select v from which) as w, 1 as n from nv\"]\nfn w(i: int) = db.one(sqls[i]).w\nroute GET /read = db.one(\"select v from which\").v\nroute GET /w/:i = w(int(i))\nroute GET /only = str(len(db.query(\"select * from only_here\")))\n",
+        primary, replica
+    );
+    let d = dir("replicas-write", &src);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let get = |path: &str| support::send(s.port, "GET", path, &[], "").body;
+    assert_eq!(get("/read"), "replica");
+    // Each read the replica refuses or the words show writes: the primary, and the replica stays
+    // in use; the last two take the sequence through a view, which the replica refuses.
+    for i in 0..7 {
+        assert_eq!(get(&format!("/w/{}", i)), "primary", "statement {}", i);
+        assert_eq!(get("/read"), "replica", "after statement {}", i);
+    }
+    // A replica that fails otherwise is left out, as before.
+    psql(&pg, &primary, &["create table only_here (x int)"]);
+    assert_eq!(get("/only"), "0");
+    assert_eq!(get("/read"), "primary");
+}
+
+// Q-751: on MySQL, a value past the server's `max_allowed_packet` is refused, naming the limit,
+// where it failed as "Broken pipe" or "Packets out of sync"; the other databases take it.
+#[test]
+fn a_value_past_max_allowed_packet_is_refused_saying_so() {
+    let (dbs, _held) = databases("packet");
+    for (kind, url) in &dbs {
+        let col = if *kind == "mariadb" { "longtext" } else { "text" };
+        let mut it = on_db(url, &format!("db.exec(\"create table r11 (v {})\")\n", col));
+        let big = ev(&mut it, "db.exec(\"insert into r11 values (?)\", repeat(\"a\", 17000000))");
+        if *kind == "mariadb" {
+            has(&big, "past the server's max_allowed_packet of 16777216 bytes", kind);
+            has(&ev(&mut it, "db.one(\"select ? as v\", repeat(\"é\", 9000000))"), "max_allowed_packet", kind);
+            has(&ev(&mut it, &format!("db.exec(\"insert into r11 values ('{}')\")", "b".repeat(17_000_000))), "max_allowed_packet", "text");
+        } else {
+            has(&big, "{ changes: 1, last_id: ", kind);
+        }
+        // Below it, as before, on the connection after the refusal too.
+        assert_eq!(ev(&mut it, "db.exec(\"insert into r11 values (?)\", repeat(\"a\", 1000000)).changes"), "1", "{}", kind);
+        assert_eq!(ev(&mut it, "db.exec(\"insert into r11 values (?)\", \"ü\").changes"), "1", "{}", kind);
+    }
+}
+
+// Q-752: SQLite's `@name` and `$name` take a map's `name`; on MySQL `@name` is a variable of the
+// session, so a map with `name` is refused, saying to write `:name`, where it gave null.
+#[test]
+fn named_values_and_mysqls_variables() {
+    let (dbs, _held) = databases("atnames");
+    for (kind, url) in &dbs {
+        let mut it = on_db(url, "");
+        match *kind {
+            "sqlite" => {
+                assert_eq!(ev(&mut it, "db.one(\"select @x as v, $y as w, :z as u\", { x: 3, y: \"é\", z: null })"), "{ v: 3, w: \"é\", u: null }");
+                assert_eq!(ev(&mut it, "db.one(\"select @x as v\", { \"@x\": 4 })"), "{ v: 4 }");
+                has(&ev(&mut it, "db.one(\"select @x as v\", { y: 1 })"), "no value for @x", kind);
+            }
+            "mariadb" => {
+                has(&ev(&mut it, "db.one(\"select @x as v\", { x: 3 })"), "`@x` is a variable of MySQL's session (null unless set), not one of the values: write `:x`", kind);
+                has(&ev(&mut it, "db.one(\"select @`x` + :y as v\", { x: 3, y: 1 })"), "`@x` is a variable", kind);
+                // Not a value of the map's: the variable, as MySQL has it.
+                assert_eq!(ev(&mut it, "db.one(\"select @x as v\", { y: 1 })"), "{ v: null }");
+                assert_eq!(ev(&mut it, "db.one(\"select @@sql_mode is not null as v\", { sql_mode: 1 }).v"), "1");
+                assert_eq!(ev(&mut it, "db.one(\"select :x as v\", { x: 3 })"), "{ v: 3 }");
+            }
+            _ => assert_eq!(ev(&mut it, "db.one(\"select :x as v\", { x: 3 })"), "{ v: 3 }"),
+        }
+    }
+}
+
+// Q-753: `changes` and `last_id` mean the same on every database, and SQL with no statement is
+// refused.
+#[test]
+fn changes_and_last_id_mean_the_same_on_every_database() {
+    let (dbs, _held) = databases("counts");
+    for (kind, url) in &dbs {
+        let key = if *kind == "mariadb" { "id int auto_increment primary key" } else if *kind == "postgres" { "id serial primary key" } else { "id integer primary key" };
+        let mut it = on_db(url, &format!("db.exec(\"create table t3 ({}, n int)\")\n", key));
+        let r = |it: &mut quillo::Interp, sql: &str| ev(it, &format!("let r = db.exec({})\n[r.changes, r.last_id]", sql));
+        let one = if *kind == "postgres" { "null" } else { "1" };
+        assert_eq!(r(&mut it, "\"insert into t3 (n) values (?)\", 7"), format!("[1, {}]", one), "{}: one row", kind);
+        assert_eq!(r(&mut it, "\"insert into t3 (n) values (1), (2), (3)\""), "[3, null]", "{}: several", kind);
+        assert_eq!(r(&mut it, "\"update t3 set n = 9 where id = 100\""), "[0, null]", "{}: none", kind);
+        assert_eq!(r(&mut it, "\"update t3 set n = 8 where id = 1\""), "[1, null]", "{}: an update", kind);
+        assert_eq!(r(&mut it, "\"select * from t3\""), "[0, null]", "{}: a select", kind);
+        assert_eq!(r(&mut it, "\"select * from t3 where n > ?\", 0"), "[0, null]", "{}: a select with values", kind);
+        assert_eq!(r(&mut it, "\"create table t4 (x int)\""), "[0, null]", "{}: a schema", kind);
+        assert_eq!(r(&mut it, "\"insert into t4 values (1); insert into t4 values (2), (3)\""), "[2, null]", "{}: a script's last", kind);
+        assert_eq!(r(&mut it, "\"insert into t4 values (4); select 1\""), "[0, null]", "{}: a script ending in a read", kind);
+        for sql in ["\"\"", "\"   \"", "\"-- only a note\"", "\";\"", "\"/* */ ;\""] {
+            has(&ev(&mut it, &format!("db.exec({})", sql)), "the SQL has no statement in it", &format!("{} {}", kind, sql));
+            has(&ev(&mut it, &format!("db.one({})", sql)), "the SQL has no statement in it", &format!("{} {}", kind, sql));
+            has(&ev(&mut it, &format!("db.query({})", sql)), "the SQL has no statement in it", &format!("{} {}", kind, sql));
+        }
+        assert_eq!(ev(&mut it, "db.one(\"select count(*) as n from t3\").n"), "4", "{}", kind);
+        if *kind != "mariadb" {
+            assert_eq!(ev(&mut it, "db.exec(\"insert into t3 (n) values (?) returning id\", 5).changes"), "1", "{}: returning", kind);
+        }
+    }
+    // SQLite's own `last_insert_rowid()` is what it was, and what the program's SQL reads: a
+    // child's parent id (found in review: it was i64::MIN).
+    let (dbs, _held) = databases("rowid");
+    let mut it = on_db(&dbs[0].1, "db.exec(\"create table t (id integer primary key, n int)\")\ndb.exec(\"insert into t (n) values (1)\")\n");
+    assert_eq!(ev(&mut it, "db.exec(\"update t set n = 2\").last_id"), "null");
+    assert_eq!(ev(&mut it, "db.one(\"select last_insert_rowid() as i\").i"), "1");
+    let mut it = on_db(&dbs[0].1, "db.exec(\"create table parent (id integer primary key, name text)\")\ndb.exec(\"create table child (parent_id int, n text)\")\n");
+    assert_eq!(ev(&mut it, "db.exec(\"insert into parent (name) values (?)\", \"p1\")"), "{ changes: 1, last_id: 1 }");
+    assert_eq!(ev(&mut it, "db.exec(\"insert into child (parent_id, n) values (last_insert_rowid(), ?)\", \"c1\")"), "{ changes: 1, last_id: 1 }");
+    assert_eq!(ev(&mut it, "db.exec(\"update child set n = 'c2'\")\ndb.exec(\"insert into child (parent_id, n) values (last_insert_rowid(), 'c3')\").changes"), "1");
+    // The update set no id: the second child's parent is the first child's row id, as SQLite has it.
+    assert_eq!(ev(&mut it, "db.query(\"select parent_id, n from child order by rowid\")"), r#"[{ parent_id: 1, n: "c2" }, { parent_id: 1, n: "c3" }]"#);
+    // A script follows its last statement, as on the others; the same id put back is none.
+    assert_eq!(ev(&mut it, "db.exec(\"insert into parent (name) values ('x'); update parent set name = 'y' where id = 1\")"), "{ changes: 1, last_id: null }");
+    assert_eq!(ev(&mut it, "db.exec(\"update parent set name = 'z' where id = 1; insert into parent (name) values ('w')\")"), "{ changes: 1, last_id: 3 }");
+    assert_eq!(ev(&mut it, "db.exec(\"insert or replace into parent (id, name) values (9, 'a')\").last_id"), "9");
+    assert_eq!(ev(&mut it, "db.exec(\"insert or replace into parent (id, name) values (9, 'b')\").last_id"), "9");
+    // An upsert that updated inserted no row.
+    assert_eq!(ev(&mut it, "db.exec(\"insert into parent (id, name) values (9, 'c') on conflict (id) do update set name = excluded.name\").last_id"), "null");
+    assert_eq!(ev(&mut it, "db.exec(\"insert into parent (id, name) values (10, 'c') on conflict (id) do update set name = excluded.name\").last_id"), "10");
+}
+
+// Q-754: the guide's column-list `update` fails on MySQL, and on PostgreSQL with one column;
+// written as pairs from the columns, it works on every database.
+#[test]
+fn an_update_written_as_pairs_from_the_columns_works_on_every_database() {
+    let (dbs, _held) = databases("pairs");
+    for (kind, url) in &dbs {
+        let mut it = on_db(url, "db.exec(\"create table cl (id int, a int, b varchar(10))\")\ndb.exec(\"insert into cl values (1, 0, 'x')\")\n");
+        for cols in ["[\"a\", \"b\"]", "[\"a\"]"] {
+            let got = ev(&mut it, &format!("let cols = {}\nlet set = cols | map((c) => `${{sql_name(c)}} = ${{sql_param(c)}}`) | join(\", \")\ndb.exec(`update cl set ${{set}} where id = :id`, {{ a: 1, b: \"é\", id: 1 }}).changes", cols));
+            assert_eq!(got, "1", "{} {}", kind, cols);
+        }
+        assert_eq!(ev(&mut it, "db.one(\"select a, b from cl\")"), "{ a: 1, b: \"é\" }", "{}", kind);
+    }
+}
+
+// Q-756: PostgreSQL arrays keep their bounds, and a jsonb[] takes lists; MySQL's IPv6 hosts,
+// unsigned ints past 2^63 and `tinyint(1)` holding more than 0 and 1.
+#[test]
+fn smaller_differences_of_the_drivers() {
+    if let Some((_pg, url)) = pg_db("arrays") {
+        let mut it = on_db(&url, "db.exec(\"create table ar (id int, a int[], j jsonb[])\")\n");
+        assert_eq!(ev(&mut it, "db.one(\"select '[0:2]={1,2,3}'::int[] as a, '{1,2}'::int[] as b, '[2:3][1:1]={{5},{6}}'::int[] as c, '{}'::int[] as d\")"), "{ a: \"[0:2]={\"1\",\"2\",\"3\"}\", b: [1, 2], c: \"[2:3][1:1]={{\"5\"},{\"6\"}}\", d: [] }");
+        assert_eq!(ev(&mut it, "let a = db.one(\"select '[0:2]={1,2,3}'::int[] as a\").a\ndb.exec(\"insert into ar (id, a) values (1, ?)\", a).changes"), "1");
+        assert_eq!(ev(&mut it, "db.one(\"select a[0] as z, array_lower(a, 1) as lo from ar where id = 1\")"), "{ z: 1, lo: 0 }");
+        assert_eq!(ev(&mut it, "db.exec(\"insert into ar (id, j) values (2, ?)\", [[1, 2], { a: [3] }, \"[4]\", null, \"\\\"é\\\"\"]).changes"), "1");
+        assert_eq!(ev(&mut it, "db.one(\"select j from ar where id = 2\").j"), "[[1, 2], { a: [3] }, [4], null, \"é\"]");
+    }
+    let Some((my, url)) = maria_db("smaller") else { return };
+    // An IPv6 host is connected to, not looked up as a name.
+    let six = format!("mysql://root@[::1]:{}/f55_smaller", support::free_port());
+    let mut it = on_db(&url, "");
+    let said = ev(&mut it, &format!("let r = db.connect(\"{}\")\nstr(r.error)", six));
+    assert!(!said.contains("lookup") && said.contains("refused"), "{}", said);
+    drop(my);
+    ev(&mut it, "db.exec(\"create table u (k int, ubi bigint unsigned, t tinyint(1))\")");
+    ev(&mut it, "db.exec(\"insert into u values (1, 18446744073709551615, 0), (2, 18446744073709551614, 1), (3, 9223372036854775808, 2), (4, 9223372036854775807, -1), (5, 0, 5)\")");
+    assert_eq!(ev(&mut it, "db.query(\"select ubi, t from u order by k\")"), "[{ ubi: 18446744073709551615m, t: false }, { ubi: 18446744073709551614m, t: true }, { ubi: 9223372036854775808m, t: 2 }, { ubi: 9223372036854775807, t: -1 }, { ubi: 0, t: 5 }]");
+    // The value read finds its own row alone.
+    assert_eq!(ev(&mut it, "let r = db.one(\"select ubi from u where k = 2\")\ndb.query(\"select k from u where ubi = ?\", r.ubi)"), "[{ k: 2 }]");
+}
+
+// From slice 5: MariaDB read `||` as `or` under its default sql_mode, so `'%' || ? || '%'` was 0
+// or 1 there; its driver adds PIPES_AS_CONCAT to the session before SQL with `||`, until the
+// pool resets the connection.
+#[test]
+fn double_bars_join_text_on_every_database() {
+    let (dbs, _held) = databases("pipes");
+    for (kind, url) in &dbs {
+        let mut it = on_db(url, "db.exec(\"create table pp (name varchar(10))\")\ndb.exec(\"insert into pp values ('ab'), ('cd')\")\n");
+        for _ in 0..4 {
+            assert_eq!(ev(&mut it, "db.one(\"select '%' || ? || '%' as l, 'a' || null as n\", \"é\")"), "{ l: \"%é%\", n: null }", "{}", kind);
+        }
+        assert_eq!(ev(&mut it, "db.query(\"select name from pp where name like '%' || ? || '%'\", \"b\")"), "[{ name: \"ab\" }]", "{}", kind);
+        if *kind == "mariadb" {
+            // The rest of its mode as the server has it; in a transaction; and SQL without `||`
+            // on a session the pool reset.
+            assert_eq!(ev(&mut it, "db.one(\"select 'x' || 'y' as v, @@sql_mode like '%STRICT_TRANS_TABLES%' as s\")"), "{ v: \"xy\", s: 1 }");
+            assert_eq!(ev(&mut it, "db.transaction(() => [db.one(\"select 1 as v\").v, db.one(\"select 'x' || 'y' as v\").v, db.one(\"select 'p' || ? as v\", \"q\").v])"), "[1, \"xy\", \"pq\"]");
+            assert_eq!(ev(&mut it, "db.one(\"select 1 or 0 as v\").v"), "1");
+        }
+    }
+}
+
+// ---- slice 6, after review -------------------------------------------------------------------
+
+// Found in review: MariaDB's `||` joins text on every path that runs the program's SQL, a
+// migration's (views and all) and `db.exec_many`'s too.
+#[test]
+fn double_bars_join_text_in_migrations_too() {
+    let (dbs, _held) = databases("barsmig");
+    for (kind, url) in &dbs {
+        let d = support::temp_dir(&format!("feedback55-barsmig-{}", kind));
+        std::fs::create_dir_all(d.join("migrations")).unwrap();
+        std::fs::write(d.join("migrations/001_a.sql"), "create table mm (v varchar(10));\ninsert into mm values ('a' || 'b');\ncreate view mv as select 'x' || 'y' as c;\n").unwrap();
+        let mut it = quillo::Interp::new(&d);
+        it.load_source(&format!("db.open(\"{}\")\n", url), "app.qwe").unwrap();
+        assert_eq!(ev(&mut it, "db.migrate()"), r#"["001_a.sql"]"#, "{}", kind);
+        assert_eq!(ev(&mut it, "[db.one(\"select v from mm\").v, db.one(\"select c from mv\").c]"), r#"["ab", "xy"]"#, "{}", kind);
+        assert_eq!(ev(&mut it, "db.exec_many(\"insert into mm (v) values (? || 'z')\", [[\"b\"], [\"é\"]]).changes"), "2", "{}", kind);
+        assert_eq!(ev(&mut it, "db.query(\"select v from mm where v like '%z' order by v\") | map((r) => r.v)"), r#"["bz", "éz"]"#, "{}", kind);
+    }
+}
+
+// Found in review (Q-741): a MariaDB `BIT`'s digits, as Quillo reads them, go back in: stored,
+// compared and updated, as PostgreSQL's `bit` takes its digits; a text column's "0101" stays text.
+#[test]
+fn bit_digits_read_go_back_in_on_mariadb_as_on_postgresql() {
+    let (dbs, _held) = databases("bitback");
+    for (kind, url) in dbs.iter().filter(|(k, _)| *k != "sqlite") {
+        let mut it = on_db(url, "db.exec(\"create table bt (k int, b bit(8), s varchar(10))\")\ndb.exec(\"insert into bt values (1, b'00000101', '0101')\")\n");
+        assert_eq!(ev(&mut it, "let b = db.one(\"select b from bt where k = 1\").b\ndb.exec(\"insert into bt (k, b, s) values (?, ?, ?)\", 2, b, \"0101\").changes"), "1", "{}", kind);
+        assert_eq!(ev(&mut it, "db.query(\"select k from bt where b = ? order by k\", \"00000101\") | map((r) => r.k)"), "[1, 2]", "{}", kind);
+        assert_eq!(ev(&mut it, "db.query(\"select k from bt where s = ? order by k\", \"0101\") | map((r) => r.k)"), "[1, 2]", "{}", kind);
+        assert_eq!(ev(&mut it, "db.exec(\"update bt set b = ? where k = ?\", \"11111111\", 2).changes"), "1", "{}", kind);
+        assert_eq!(ev(&mut it, "db.query(\"select k, b from bt where b in (?, ?) order by k\", \"00000101\", \"11111111\")"), r#"[{ k: 1, b: "00000101" }, { k: 2, b: "11111111" }]"#, "{}", kind);
+        assert_eq!(ev(&mut it, "db.query(\"select k from bt where ? = b\", \"11111111\") | map((r) => r.k)"), "[2]", "{}", kind);
+        assert_eq!(ev(&mut it, "db.query(\"select k from bt where b <> ? order by k\", \"11111111\") | map((r) => r.k)"), "[1]", "{}", kind);
+        // As each database says of digits that do not fit.
+        assert_eq!(ev(&mut it, "is_err(db.exec(\"insert into bt (k, b) values (3, ?)\", \"111111111\"))"), "true", "{}", kind);
+    }
+}
+
+// Found in review (Q-734): a float a MariaDB `FLOAT` would keep as 0 is refused as out of its
+// range, as PostgreSQL's `real` refuses it; one it keeps goes in.
+#[test]
+fn a_float_a_float_column_would_keep_as_zero_is_refused() {
+    let (dbs, _held) = databases("floatzero");
+    for (kind, url) in dbs.iter().filter(|(k, _)| *k != "sqlite") {
+        let ty = if *kind == "mariadb" { "float" } else { "real" };
+        let mut it = on_db(url, &format!("db.exec(\"create table fz (k int, f {}, d double precision)\")\n", ty));
+        has(&ev(&mut it, "db.exec(\"insert into fz (k, f) values (1, ?)\", 1e-46)"), "out of range", kind);
+        has(&ev(&mut it, "db.exec(\"update fz set f = ? where k = 1\", -1e-50)"), "out of range", kind);
+        for v in ["1e-40", "0.0", "1.5", "-0.0"] {
+            assert_eq!(ev(&mut it, &format!("db.exec(\"insert into fz (k, f) values (2, ?)\", {}).changes", v)), "1", "{} {}", kind, v);
+        }
+        assert_eq!(ev(&mut it, "db.exec(\"insert into fz (k, d) values (3, ?)\", 1e-46).changes"), "1", "{}: a double holds it", kind);
+    }
+}
+
+// Found in review (Q-750): on MySQL, a read that calls the database's own function goes to the
+// primary, as on PostgreSQL (looked up once a name); the server's own functions do not.
+#[test]
+fn a_mysql_read_calling_its_own_function_goes_to_the_primary() {
+    let Some(my) = maria_server() else { return };
+    let (primary, replica) = (my.url("f55_myprimary"), my.url("f55_myreplica"));
+    for (url, who) in [(&primary, "primary"), (&replica, "replica")] {
+        let mut it = on_db(url, "");
+        ev(&mut it, &format!("db.exec(\"create table which (v varchar(10))\")\ndb.exec(\"insert into which values ('{}')\")\ndb.exec(\"create function f55_mark() returns varchar(10) deterministic return '{}'\")", who, who));
+    }
+    let src = format!(
+        "db.open(\"{}\", {{ replicas: [\"{}\"] }})\nroute GET /read = db.one(\"select v from which\").v\nroute GET /own = db.one(\"select F55_Mark() as w\").w\nroute GET /built = db.one(\"select lower(v) as w from which\").w\n",
+        primary, replica
+    );
+    let d = dir("mysql-own-fns", &src);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let get = |path: &str| support::send(s.port, "GET", path, &[], "").body;
+    assert_eq!(get("/read"), "replica");
+    assert_eq!(get("/own"), "primary");
+    assert_eq!(get("/own"), "primary");
+    assert_eq!(get("/built"), "replica");
+    assert_eq!(get("/read"), "replica");
+}
+
+// Found in review (Q-745): a schema's statement lets go only the kept statements on what it
+// names; the others keep working, and those on it are prepared again.
+#[test]
+fn a_schema_change_lets_go_only_the_statements_on_what_it_names() {
+    let Some((_pg, url)) = pg_db("replanlocal") else { return };
+    let mut it = on_db(&url, "db.exec(\"create table a (x int)\")\ndb.exec(\"create table b (y int)\")\ndb.exec(\"insert into a values (1)\")\ndb.exec(\"insert into b values (2)\")\n");
+    for _ in 0..3 {
+        assert_eq!(ev(&mut it, "[db.query(\"select * from a\"), db.query(\"select * from b\")]"), "[[{ x: 1 }], [{ y: 2 }]]");
+        assert_eq!(ev(&mut it, "db.exec(\"drop table if exists missing_one\").changes"), "0");
+    }
+    ev(&mut it, "db.exec(\"alter table b add column z int default 3\")");
+    assert_eq!(ev(&mut it, "[db.query(\"select * from a\"), db.query(\"select * from b\")]"), "[[{ x: 1 }], [{ y: 2, z: 3 }]]");
+    ev(&mut it, "db.exec(\"create or replace view vb as select * from b\")");
+    assert_eq!(ev(&mut it, "db.query(\"select * from vb\")"), "[{ y: 2, z: 3 }]");
+    ev(&mut it, "db.exec(\"drop view vb\")\ndb.exec(\"create view vb as select y from b\")");
+    assert_eq!(ev(&mut it, "db.transaction(() => db.query(\"select * from vb\"))"), "[{ y: 2 }]");
+    ev(&mut it, "db.exec(\"alter table \\\"b\\\" rename to c\")");
+    assert_eq!(ev(&mut it, "db.query(\"select * from c\")"), "[{ y: 2, z: 3 }]");
+}
+
+// Found in review (Q-735): -0 already stored in PostgreSQL reads as 0.0, as every database is
+// now given 0.0.
+#[test]
+fn a_stored_minus_zero_reads_as_zero() {
+    let Some((_pg, url)) = pg_db("minuszero") else { return };
+    let mut it = on_db(&url, "");
+    assert_eq!(ev(&mut it, "let r = db.one(\"select '-0'::float8 as a, '-0'::float4 as b, '[-0.0]'::json as c\")\n[r.a, 1.0 / r.a > 0.0, r.b, 1.0 / r.c[0] > 0.0]"), "[0.0, true, 0.0, true]");
 }

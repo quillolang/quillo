@@ -51,6 +51,9 @@ pub struct Conn {
     /// In a transaction Quillo began (`batch`), where a statement that fails to prepare would
     /// end it.
     in_tx: bool,
+    /// The pool's schema changes, and the count of them its statements were prepared under
+    /// (`Pool::schema`).
+    schema: (Arc<Schema>, u64),
 }
 
 pub struct Pool {
@@ -65,6 +68,12 @@ pub struct Pool {
     /// Names called as functions, and whether one of them is not PostgreSQL's own (a function
     /// of the program's may change the session: see `db::isolated`).
     own_fns: Mutex<HashMap<String, bool>>,
+    /// Its tables known to have changed: by a schema's statement run here, or a kept statement
+    /// PostgreSQL refused as prepared before one ("cached plan must not change result type").
+    /// Each connection lets go its statements on what changed when it is behind, so one that
+    /// saw the change saves the others (in a transaction too) the failure (FEEDBACK55.md, Q-745;
+    /// branch feedback55).
+    schema: Arc<Schema>,
 }
 
 /// What a session changed is set back with, its prepared statements kept (Quillo's own among
@@ -124,8 +133,15 @@ impl Pool {
         let Options { url, max, schema, tls } = take_options(url)?;
         let mut config: tokio_postgres::Config = url.parse().map_err(|e| format!("bad Postgres URL: {}", e))?;
         let tls = tls.settle(&mut config)?;
+        // Added to the URL's own `options`, which it replaced: `?options=-c statement_timeout=100`
+        // was lost with `&schema=` (FEEDBACK55.md, Q-737; branch feedback55).
         if let Some(s) = &schema {
-            config.options(&search_path(s));
+            let path = search_path(s);
+            let options = match config.get_options() {
+                Some(o) if !o.trim().is_empty() => format!("{} {}", o, path),
+                _ => path,
+            };
+            config.options(&options);
         }
         let pool = Pool {
             config: config.clone().into(),
@@ -136,6 +152,7 @@ impl Pool {
             max,
             lanes: OnceLock::new(),
             own_fns: Mutex::new(HashMap::new()),
+            schema: Arc::default(),
         };
         let mut first = pool.checkout()?;
         // A tenant's schema is made when the program first uses it.
@@ -176,6 +193,7 @@ impl Pool {
             max,
             lanes: OnceLock::new(),
             own_fns: Mutex::new(HashMap::new()),
+            schema: Arc::default(),
         };
         let mut c = pool.checkout()?;
         match c.batch(&format!("create schema \"{}\"", schema)) {
@@ -187,7 +205,8 @@ impl Pool {
 
     fn connect(&self) -> Result<Conn, String> {
         let client = self.config.connect(self.tls.clone()).map_err(|e| describe(&e))?;
-        Ok(Conn { client, stmts: HashMap::new(), conflict: None, aside: false, money: None, typed: HashMap::new(), in_tx: false })
+        let schema = (self.schema.clone(), self.schema.count.load(Relaxed));
+        Ok(Conn { client, stmts: HashMap::new(), conflict: None, aside: false, money: None, typed: HashMap::new(), in_tx: false, schema })
     }
 
     /// An idle connection or a new one, or None when all `max` are taken.
@@ -249,6 +268,7 @@ impl Pool {
                     config: self.async_config.clone(),
                     tls: self.tls.clone(),
                     slots: (0..self.max).map(|_| Mutex::new(None)).collect(),
+                    schema: self.schema.clone(),
                 })
             })
             .clone()
@@ -656,7 +676,95 @@ fn describe(e: &postgres::Error) -> String {
 
 // ---- running SQL ---------------------------------------------------------
 
+/// A pool's schema changes (`Pool::schema`): how many, and the names each touched (None: any),
+/// the last `SCHEMA_LOG` of them.
+#[derive(Default)]
+pub struct Schema {
+    count: AtomicU64,
+    log: Mutex<std::collections::VecDeque<(u64, Option<Vec<Box<str>>>)>>,
+}
+
+/// How many schema changes a pool remembers the names of; one further behind lets go all.
+const SCHEMA_LOG: usize = 64;
+
+impl Schema {
+    /// A change to the tables, views or functions `names` (lower case; None: any).
+    fn note(&self, names: Option<Vec<Box<str>>>) {
+        let mut log = self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = self.count.load(Relaxed) + 1;
+        log.push_back((n, names));
+        if log.len() > SCHEMA_LOG {
+            log.pop_front();
+        }
+        self.count.store(n, Relaxed);
+    }
+
+    /// The names changed since count `seen`; None: any (one said so, or it is too far back).
+    fn since(&self, seen: u64) -> Option<Vec<Box<str>>> {
+        let log = self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if log.front().map_or(true, |(n, _)| *n > seen + 1) {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (_, names) in log.iter().filter(|(n, _)| *n > seen) {
+            out.extend(names.as_ref()?.iter().cloned());
+        }
+        Some(out)
+    }
+
+    /// What a statement changed, if it changed a schema (see `sql::Scan::ddl`).
+    fn changed_by(&self, scan: &crate::sql::Scan) {
+        if let Some(names) = scan.ddl() {
+            self.note(names.map(<[Box<str>]>::to_vec));
+        }
+    }
+
+    /// After a kept statement was refused as prepared before a change: what it reads changed.
+    fn refused(&self, scan: &crate::sql::Scan) {
+        let names: Vec<Box<str>> = touched(scan).map(|t| t.to_lowercase().into_boxed_str()).collect();
+        self.note((!names.is_empty()).then_some(names));
+    }
+}
+
+/// The tables and functions a statement reads, writes or calls (tables in lower case, names
+/// as PostgreSQL folds them).
+fn touched(scan: &crate::sql::Scan) -> impl Iterator<Item = &str> + '_ {
+    scan.tables.reads.iter().chain(&scan.tables.writes).map(String::as_str).chain(scan.calls.iter().map(|c| &**c))
+}
+
+/// Whether the statement kept as `sql` touches any of `names`. A schema's statement itself
+/// (`drop table if exists x` run each time) keeps no plan of its tables, and is kept.
+fn touches(sql: &str, names: &[Box<str>]) -> bool {
+    let scan = crate::sql::scan(crate::sql::Dialect::Postgres, sql);
+    let found = scan.ddl().is_none() && touched(&scan).any(|t| names.iter().any(|n| n.eq_ignore_ascii_case(t)));
+    found
+}
+
+/// Lets go the statements kept that touch what changed since `seen` (all, when not known).
+fn let_go<V>(schema: &Schema, seen: u64, stmts: &mut HashMap<String, V>, typed: &mut HashMap<String, Option<V>>) {
+    match schema.since(seen) {
+        None => {
+            stmts.clear();
+            typed.clear();
+        }
+        Some(names) => {
+            stmts.retain(|k, _| !touches(k, &names));
+            typed.retain(|k, _| !touches(k.split_once('\0').map_or(k.as_str(), |(_, s)| s), &names));
+        }
+    }
+}
+
 impl Conn {
+    /// Its statements on what changed let go, when the pool's tables changed since they were
+    /// prepared.
+    fn current(&mut self) {
+        let now = self.schema.0.count.load(Relaxed);
+        if now != self.schema.1 {
+            let_go(&self.schema.0, self.schema.1, &mut self.stmts, &mut self.typed);
+            self.schema.1 = now;
+        }
+    }
+
     fn prepare(&mut self, sql: &str) -> Result<postgres::Statement, String> {
         if let Some(s) = self.stmts.get(sql) {
             return Ok(s.clone());
@@ -670,8 +778,10 @@ impl Conn {
     }
 
     /// Prepares `sql` for `params`, casting from text where needed, and with the types of
-    /// values PostgreSQL would take as text declared (`declared`).
-    fn statement(&mut self, sql: &str, params: &[Value]) -> Result<postgres::Statement, String> {
+    /// values PostgreSQL would take as text declared (`declared`); and the statement as
+    /// PostgreSQL inferred it, whose types say how a value goes as text (`PgParam`).
+    fn statement(&mut self, sql: &str, params: &[Value]) -> Result<(postgres::Statement, postgres::Statement), String> {
+        self.current();
         let stmt = self.prepare(sql)?;
         let want = stmt.params().len();
         if want != params.len() {
@@ -680,13 +790,27 @@ impl Conn {
         let casts = casts_for(sql, stmt.params());
         if let Some(types) = declared(stmt.params(), params) {
             if let Some(s) = self.typed(casts.as_deref().unwrap_or(sql), types)? {
-                return Ok(s);
+                return Ok((s, stmt));
             }
         }
         match casts {
-            None => Ok(stmt),
-            Some(cast_sql) => self.prepare(&cast_sql),
+            None => Ok((stmt.clone(), stmt)),
+            Some(cast_sql) => Ok((self.prepare(&cast_sql)?, stmt)),
         }
+    }
+
+    /// After PostgreSQL said a kept statement's plan no longer fits its tables ("cached plan
+    /// must not change result type", once an `alter table` changed them, here or from another
+    /// server): this connection's statements are let go, to be prepared again. Whether to try
+    /// once more: not in a transaction, which the error ended. Each request on the connection
+    /// failed until the server restarted (FEEDBACK55.md, Q-745; branch feedback55).
+    fn replanned(&mut self, e: &postgres::Error, scan: &crate::sql::Scan) -> bool {
+        if !plan_changed(e) {
+            return false;
+        }
+        self.schema.0.refused(scan);
+        self.current();
+        !self.in_tx
     }
 
     /// `sql` prepared with the types `declared` gives, or with those of them PostgreSQL takes
@@ -735,11 +859,17 @@ impl Conn {
     pub fn query(&mut self, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
         let (scan, params) = translate(sql, params)?;
         let sql = scan.native();
-        let stmt = self.statement(sql, &params)?;
-        let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
-        let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
-        let rows = self.client.query(&stmt, &refs);
-        let rows = rows.map_err(|e| self.failed(&e))?;
+        let mut again = true;
+        let rows = loop {
+            let (stmt, inferred) = self.statement(sql, &params)?;
+            let args = pg_params(&params, &inferred, &scan);
+            let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
+            match self.client.query(&stmt, &refs) {
+                Ok(rows) => break rows,
+                Err(e) if again && self.replanned(&e, &scan) => again = false,
+                Err(e) => return Err(self.failed(&e)),
+            }
+        };
         let digits = match (has_money(&rows), self.money) {
             (false, _) => 2,
             (true, Some(d)) => d,
@@ -749,28 +879,39 @@ impl Conn {
     }
 
     /// `{ changes, last_id }`; Postgres has no last insert id, so use
-    /// `insert ... returning id` with `db.one` for that.
+    /// `insert ... returning id` with `db.one` for that. `changes` as the other databases count
+    /// them: 0 for a statement that reads (PostgreSQL counted a `select`'s rows), and a
+    /// script's last statement's, where it was null (FEEDBACK55.md, Q-753; branch feedback55).
     pub fn exec(&mut self, sql: &str, params: &[Value]) -> Result<Value, String> {
-        let changes = if params.is_empty() && several_statements(sql) {
-            let r = self.client.batch_execute(sql);
-            r.map_err(|e| self.failed(&e))?;
-            Value::Nil
+        let scan = crate::sql::scan(crate::sql::Dialect::Postgres, sql);
+        let changes = if params.is_empty() && scan.stmts.len() > 1 {
+            let r = self.client.simple_query(sql);
+            last_count(&scan, &r.map_err(|e| self.failed(&e))?)
         } else {
-            let (scan, params) = translate(sql, params)?;
-            let stmt = self.statement(scan.native(), &params)?;
-            let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
-            let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
-            let r = self.client.execute(&stmt, &refs);
-            Value::Int(r.map_err(|e| self.failed(&e))? as i64)
+            let params = scan.values(params)?;
+            let mut again = true;
+            let n = loop {
+                let (stmt, inferred) = self.statement(scan.native(), &params)?;
+                let args = pg_params(&params, &inferred, &scan);
+                let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
+                match self.client.execute(&stmt, &refs) {
+                    Ok(n) => break n,
+                    Err(e) if again && self.replanned(&e, &scan) => again = false,
+                    Err(e) => return Err(self.failed(&e)),
+                }
+            };
+            if scan.reads() { 0 } else { n as i64 }
         };
-        let mut m = Map::new();
-        m.insert("changes".into(), changes);
-        m.insert("last_id".into(), Value::Nil);
-        Ok(Value::map(m))
+        self.schema.0.changed_by(&scan);
+        Ok(exec_result(changes))
     }
 
     pub fn batch(&mut self, sql: &str) -> Result<(), String> {
         let r = self.client.batch_execute(sql);
+        // A migration's schema.
+        if r.is_ok() {
+            self.schema.0.changed_by(&crate::sql::scan(crate::sql::Dialect::Postgres, sql));
+        }
         // Quillo's own `begin`, `commit`, `prepare transaction`... (the program's are refused).
         // One that failed leaves it as it was, but a `commit` ends the transaction anyway.
         let after = in_tx_after(self.in_tx, sql);
@@ -843,7 +984,7 @@ fn values(rows: &[postgres::Row], limit: Option<usize>, digits: u32) -> Result<V
 /// parameter types, if any.
 fn casts_for(sql: &str, types: &[Type]) -> Option<String> {
     let casts: Vec<(usize, String)> =
-        types.iter().enumerate().filter(|(_, t)| !encodes_directly(t)).map(|(i, t)| (i + 1, type_name(t))).collect();
+        types.iter().enumerate().filter(|(_, t)| !encodes_directly(t)).map(|(i, t)| (i + 1, cast_name(t))).collect();
     if casts.is_empty() {
         return None;
     }
@@ -882,6 +1023,8 @@ pub struct Lanes {
     config: tokio_postgres::Config,
     tls: Connector,
     slots: Vec<Mutex<Option<Arc<Lane>>>>,
+    /// The pool's schema changes (`Pool::schema`).
+    schema: Arc<Schema>,
 }
 
 /// How many connections requests share while none is stuck.
@@ -900,6 +1043,8 @@ struct Lane {
     moved: AtomicU64,
     /// The decimals of a `money` value here, once a result has had one (`money_digits`).
     money: OnceLock<u32>,
+    /// The pool's count of schema changes its statements were prepared under (`Pool::schema`).
+    seen: AtomicU64,
 }
 
 /// Milliseconds since the first call.
@@ -965,7 +1110,15 @@ impl Lanes {
         tokio::spawn(async move {
             let _ = conn.await;
         });
-        let l = Arc::new(Lane { client, stmts: Mutex::new(HashMap::new()), typed: Mutex::new(HashMap::new()), waiting: AtomicUsize::new(0), moved: AtomicU64::new(0), money: OnceLock::new() });
+        let l = Arc::new(Lane {
+            client,
+            stmts: Mutex::new(HashMap::new()),
+            typed: Mutex::new(HashMap::new()),
+            waiting: AtomicUsize::new(0),
+            moved: AtomicU64::new(0),
+            money: OnceLock::new(),
+            seen: AtomicU64::new(self.schema.count.load(Relaxed)),
+        });
         *self.slots[pick].lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(l.clone());
         Ok(l)
     }
@@ -983,7 +1136,19 @@ impl Lanes {
         Ok(s)
     }
 
-    async fn statement(lane: &Lane, sql: &str, params: &[Value]) -> Result<tokio_postgres::Statement, String> {
+    /// As `Conn::current`.
+    fn current(&self, lane: &Lane) {
+        let now = self.schema.count.load(Relaxed);
+        let seen = lane.seen.swap(now, Relaxed);
+        if seen != now {
+            let mut stmts = lane.stmts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut typed = lane.typed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let_go(&self.schema, seen, &mut *stmts, &mut *typed);
+        }
+    }
+
+    async fn statement(&self, lane: &Lane, sql: &str, params: &[Value]) -> Result<(tokio_postgres::Statement, tokio_postgres::Statement), String> {
+        self.current(lane);
         let stmt = Self::prepare(lane, sql).await?;
         let want = stmt.params().len();
         if want != params.len() {
@@ -992,13 +1157,23 @@ impl Lanes {
         let casts = casts_for(sql, stmt.params());
         if let Some(types) = declared(stmt.params(), params) {
             if let Some(s) = Self::typed(lane, casts.as_deref().unwrap_or(sql), types).await {
-                return Ok(s);
+                return Ok((s, stmt));
             }
         }
         match casts {
-            None => Ok(stmt),
-            Some(cast_sql) => Self::prepare(lane, &cast_sql).await,
+            None => Ok((stmt.clone(), stmt)),
+            Some(cast_sql) => Ok((Self::prepare(lane, &cast_sql).await?, stmt)),
         }
+    }
+
+    /// As `Conn::replanned`: the lane's statements are let go (it is never in a transaction).
+    fn replanned(&self, lane: &Lane, e: &tokio_postgres::Error, scan: &crate::sql::Scan) -> bool {
+        if !plan_changed(e) {
+            return false;
+        }
+        self.schema.refused(scan);
+        self.current(lane);
+        true
     }
 
     /// As `Conn::typed`.
@@ -1034,10 +1209,17 @@ impl Lanes {
         let (scan, params) = translate(&sql, &params)?;
         let lane = self.lane(n).await?;
         let _sent = lane.send();
-        let stmt = Self::statement(&lane, scan.native(), &params).await?;
-        let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
-        let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
-        let rows = lane.client.query(&stmt, &refs).await.map_err(|e| describe(&e))?;
+        let mut again = true;
+        let rows = loop {
+            let (stmt, inferred) = self.statement(&lane, scan.native(), &params).await?;
+            let args = pg_params(&params, &inferred, &scan);
+            let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
+            match lane.client.query(&stmt, &refs).await {
+                Ok(rows) => break rows,
+                Err(e) if again && self.replanned(&lane, &e, &scan) => again = false,
+                Err(e) => return Err(describe(&e)),
+            }
+        };
         let digits = match (has_money(&rows), lane.money.get()) {
             (false, _) => 2,
             (true, Some(d)) => *d,
@@ -1052,20 +1234,26 @@ impl Lanes {
     pub async fn exec(self: Arc<Self>, n: usize, sql: String, params: Vec<Value>) -> Result<Value, String> {
         let lane = self.lane(n).await?;
         let _sent = lane.send();
-        let changes = if params.is_empty() && several_statements(&sql) {
-            lane.client.batch_execute(&sql).await.map_err(|e| describe(&e))?;
-            Value::Nil
+        let scan = crate::sql::scan(crate::sql::Dialect::Postgres, &sql);
+        let changes = if params.is_empty() && scan.stmts.len() > 1 {
+            last_count(&scan, &lane.client.simple_query(&sql).await.map_err(|e| describe(&e))?)
         } else {
-            let (scan, params) = translate(&sql, &params)?;
-            let stmt = Self::statement(&lane, scan.native(), &params).await?;
-            let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
-            let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
-            Value::Int(lane.client.execute(&stmt, &refs).await.map_err(|e| describe(&e))? as i64)
+            let params = scan.values(&params)?;
+            let mut again = true;
+            let n = loop {
+                let (stmt, inferred) = self.statement(&lane, scan.native(), &params).await?;
+                let args = pg_params(&params, &inferred, &scan);
+                let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
+                match lane.client.execute(&stmt, &refs).await {
+                    Ok(n) => break n,
+                    Err(e) if again && self.replanned(&lane, &e, &scan) => again = false,
+                    Err(e) => return Err(describe(&e)),
+                }
+            };
+            if scan.reads() { 0 } else { n as i64 }
         };
-        let mut m = Map::new();
-        m.insert("changes".into(), changes);
-        m.insert("last_id".into(), Value::Nil);
-        Ok(Value::map(m))
+        self.schema.changed_by(&scan);
+        Ok(exec_result(changes))
     }
 }
 
@@ -1098,8 +1286,27 @@ fn rewrite_numbered(sql: &str, f: impl Fn(usize) -> Option<String>) -> String {
     out
 }
 
-fn several_statements(sql: &str) -> bool {
-    crate::sql::scan(crate::sql::Dialect::Postgres, sql).stmts.len() > 1
+/// `{ changes, last_id }`: PostgreSQL has no id of the last row inserted (`returning id` gives
+/// it).
+fn exec_result(changes: i64) -> Value {
+    let mut m = Map::new();
+    m.insert("changes".into(), Value::Int(changes));
+    m.insert("last_id".into(), Value::Nil);
+    Value::map(m)
+}
+
+/// A script's `changes`: its last statement's, 0 when that one reads.
+fn last_count(scan: &crate::sql::Scan, said: &[tokio_postgres::SimpleQueryMessage]) -> i64 {
+    let last = said.iter().rev().find_map(|m| if let tokio_postgres::SimpleQueryMessage::CommandComplete(n) = m { Some(*n) } else { None });
+    let reads = scan.heads().last().map_or(true, |(a, _)| crate::sql::reading_word(a));
+    if reads { 0 } else { last.unwrap_or(0) as i64 }
+}
+
+/// Whether PostgreSQL refused a kept statement because the tables it reads changed since it
+/// was prepared: by the routine that says so (`RevalidateCachedQuery`), which does not change
+/// with the server's language, and its SQLSTATE, 0A000.
+fn plan_changed(e: &tokio_postgres::Error) -> bool {
+    e.as_db_error().map_or(false, |d| d.code().code() == "0A000" && d.routine() == Some("RevalidateCachedQuery"))
 }
 
 /// Whether Quillo's own statements leave the connection in a transaction: `begin` and `start
@@ -1195,6 +1402,18 @@ fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// The type a value sent as text is cast to: its own, but `varbit` for `bit`, as a bare `bit` is
+/// `bit(1)`, which cut `?::bit(8)` to its first digit (`10100000` to `10000000`). The column's
+/// or the SQL's own `bit(n)` then holds it, as it would the text (FEEDBACK55.md, Q-730; branch
+/// feedback55).
+fn cast_name(t: &Type) -> String {
+    match *t {
+        Type::BIT => "varbit".into(),
+        Type::BIT_ARRAY => "varbit[]".into(),
+        _ => type_name(t),
+    }
+}
+
 fn type_name(t: &Type) -> String {
     if t.schema() == "pg_catalog" || t.schema().is_empty() {
         t.name().to_string()
@@ -1217,26 +1436,104 @@ fn pg_text(v: &Value) -> String {
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
-        Value::Map(_) => v.to_json().to_string(),
+        Value::Map(_) => crate::db::json_text(v),
         other => other.display(),
     }
 }
 
-struct PgParam(Value);
+/// A value's text for the type PostgreSQL inferred for it (`inferred`), which it casts that
+/// text to: a year of 0 or before as PostgreSQL writes it, `0044-03-15 BC`, where ISO 8601's
+/// `-0043-03-15` (which Quillo reads) was taken for a time zone (FEEDBACK55.md, Q-743); and the
+/// items of a json or jsonb array as JSON, where a list was taken for a sub-array (Q-756; branch
+/// feedback55).
+fn pg_text_as(v: &Value, inferred: &Type, assigned: bool) -> String {
+    match (v, inferred) {
+        (Value::Str(s), t) if matches!(*t, Type::DATE | Type::TIMESTAMP | Type::TIMESTAMPTZ) => bc_text(s).unwrap_or_else(|| s.to_string()),
+        (Value::List(items), t) if matches!(*t, Type::JSON_ARRAY | Type::JSONB_ARRAY) => {
+            let quote = |t: &str| format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\""));
+            let parts: Vec<String> = items
+                .iter()
+                .map(|x| match x {
+                    Value::Nil => "NULL".to_string(),
+                    // JSON text, as a json column's value takes it (Q-733).
+                    Value::Str(s) if assigned => quote(s),
+                    other => quote(&crate::db::json_text(other)),
+                })
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        _ => pg_text(v),
+    }
+}
 
-impl std::fmt::Debug for PgParam {
+/// An ISO 8601 date (or time stamp) whose year is 0 or before (`0000-06-01`, `-0043-03-15`), as
+/// PostgreSQL writes it: year 0 is 1 BC, -43 is 44 BC. None for any other text.
+fn bc_text(s: &str) -> Option<String> {
+    let t = s.trim();
+    let (neg, rest) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t),
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits < 4 || rest.as_bytes().get(digits) != Some(&b'-') {
+        return None;
+    }
+    let year: i64 = rest[..digits].parse().ok()?;
+    if !neg && year != 0 {
+        return None;
+    }
+    Some(format!("{:04}{} BC", year + 1, &rest[digits..]))
+}
+
+/// A value, the type PostgreSQL inferred for it (see `pg_text_as`), and whether it is a column's
+/// value as written (`sql::Scan::assigned`).
+struct PgParam<'a>(&'a Value, &'a Type, bool);
+
+fn pg_params<'a>(params: &'a [Value], inferred: &'a postgres::Statement, scan: &crate::sql::Scan) -> Vec<PgParam<'a>> {
+    params.iter().zip(inferred.params()).enumerate().map(|(i, (v, t))| PgParam(v, t, scan.assigned(i + 1))).collect()
+}
+
+impl std::fmt::Debug for PgParam<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(&self.0.repr())
     }
+}
+
+/// A float for `real` or `double precision`: one past the type's range is refused, as the
+/// server refuses it in text, where it was stored as Infinity or 0 (`1e39`, `1e-46` for a
+/// `real`; text `1e400` for a `double precision`; FEEDBACK55.md, Q-734); -0.0 goes as 0.0
+/// (Q-735; branch feedback55).
+fn float_for(v: &Value, ty: &Type) -> Result<f64, BoxErr> {
+    let (f, nonzero) = match v {
+        Value::Int(n) => (*n as f64, *n != 0),
+        Value::Float(f) => (*f, *f != 0.0),
+        Value::Dec(d) => (d.to_f64(), !d.is_zero()),
+        Value::Str(s) => {
+            let t = s.trim();
+            let f: f64 = t.parse().map_err(|_| bad(v, ty))?;
+            if !f.is_finite() && !t.bytes().any(|c| c.is_ascii_digit()) {
+                return Err(format!("{} cannot be stored: SQLite keeps NaN as null and MySQL refuses NaN and the infinities, so no database is given one", v.repr()).into());
+            }
+            (f, t.bytes().take_while(|c| !matches!(c, b'e' | b'E')).any(|c| (b'1'..=b'9').contains(&c)))
+        }
+        _ => return Err(bad(v, ty)),
+    };
+    let real = *ty == Type::FLOAT4;
+    let kept = if real { f as f32 as f64 } else { f };
+    if !kept.is_finite() || (kept == 0.0 && nonzero) {
+        let shown = if let Value::Float(f) = v { format!("{:e}", f) } else { v.repr() };
+        return Err(format!("{} is out of range for type {}", shown, if real { "real" } else { "double precision" }).into());
+    }
+    Ok(kept + 0.0)
 }
 
 fn bad(v: &Value, t: &Type) -> BoxErr {
     format!("cannot send {} {} as {}", v.type_name(), v.repr(), t).into()
 }
 
-impl ToSql for PgParam {
+impl ToSql for PgParam<'_> {
     fn to_sql(&self, ty: &Type, out: &mut BytesMut) -> Result<IsNull, BoxErr> {
-        let v = &self.0;
+        let v = self.0;
         if matches!(v, Value::Nil) {
             return Ok(IsNull::Yes);
         }
@@ -1259,26 +1556,22 @@ impl ToSql for PgParam {
             Type::INT2 => out.put_i16(i16::try_from(int()?).map_err(|_| bad(v, ty))?),
             Type::INT4 => out.put_i32(i32::try_from(int()?).map_err(|_| bad(v, ty))?),
             Type::INT8 => out.put_i64(int()?),
-            Type::FLOAT4 | Type::FLOAT8 => {
-                let f = match v {
-                    Value::Int(n) => *n as f64,
-                    Value::Float(f) => *f,
-                    Value::Dec(d) => d.to_f64(),
-                    Value::Str(s) => s.trim().parse().map_err(|_| bad(v, ty))?,
-                    _ => return Err(bad(v, ty)),
-                };
-                if *ty == Type::FLOAT4 {
-                    out.put_f32(f as f32)
-                } else {
-                    out.put_f64(f)
+            Type::FLOAT4 => out.put_f32(float_for(v, ty)? as f32),
+            Type::FLOAT8 => out.put_f64(float_for(v, ty)?),
+            // A str given as a json column's value is JSON text, as MySQL's JSON column takes it:
+            // `json.stringify(m)` was stored as one JSON string (FEEDBACK55.md, Q-733). Elsewhere
+            // (`jsonb_set(j, '{a}', ?)`, a comparison) it is a JSON string, as MySQL's
+            // `json_set` takes it (found in review; branch feedback55).
+            Type::JSON | Type::JSONB => {
+                if *ty == Type::JSONB {
+                    out.put_u8(1);
+                }
+                match v {
+                    Value::Str(s) if self.2 => out.put_slice(s.as_bytes()),
+                    _ => out.put_slice(crate::db::json_text(v).as_bytes()),
                 }
             }
-            Type::JSON => out.put_slice(v.to_json().to_string().as_bytes()),
-            Type::JSONB => {
-                out.put_u8(1);
-                out.put_slice(v.to_json().to_string().as_bytes());
-            }
-            _ => out.put_slice(pg_text(v).as_bytes()),
+            _ => out.put_slice(pg_text_as(v, self.1, self.2).as_bytes()),
         }
         Ok(IsNull::No)
     }
@@ -1322,11 +1615,12 @@ fn decode(ty: &Type, raw: &[u8]) -> Result<Value, BoxErr> {
         Type::INT4 => Value::Int(i32::from_be_bytes(take(raw, &mut at)?) as i64),
         Type::INT8 => Value::Int(i64::from_be_bytes(take(raw, &mut at)?)),
         Type::OID => Value::Int(u32::from_be_bytes(take(raw, &mut at)?) as i64),
-        Type::FLOAT4 => Value::Float(f32::from_be_bytes(take(raw, &mut at)?) as f64),
-        Type::FLOAT8 => Value::Float(f64::from_be_bytes(take(raw, &mut at)?)),
+        // -0 as 0.0, as every database is given (FEEDBACK55.md, Q-735; branch feedback55).
+        Type::FLOAT4 => Value::Float(f32_wide(f32::from_be_bytes(take(raw, &mut at)?)) + 0.0),
+        Type::FLOAT8 => Value::Float(f64::from_be_bytes(take(raw, &mut at)?) + 0.0),
         Type::NUMERIC => numeric(raw)?,
-        Type::JSON => json(raw)?,
-        Type::JSONB => json(raw.get(1..).unwrap_or_default())?,
+        Type::JSON => json_cell(raw),
+        Type::JSONB => json_cell(raw.get(1..).unwrap_or_default()),
         Type::UUID => {
             let h: String = raw.iter().map(|b| format!("{:02x}", b)).collect();
             if h.len() != 32 {
@@ -1384,9 +1678,244 @@ fn decode(ty: &Type, raw: &[u8]) -> Result<Value, BoxErr> {
     })
 }
 
-fn json(raw: &[u8]) -> Result<Value, BoxErr> {
-    let j: serde_json::Value = serde_json::from_slice(raw)?;
-    Ok(Value::from_json(&j))
+/// A `real` (or MySQL's `FLOAT`) as the float that prints as it does, through its shortest text:
+/// 0.1 read back as 0.10000000149011612, and 3.4e38 as 3.3999999521443642e+38, where psql and
+/// Python's drivers show 0.1 (FEEDBACK55.md, Q-744; branch feedback55).
+pub(crate) fn f32_wide(f: f32) -> f64 {
+    if f.is_finite() {
+        format!("{:e}", f).parse().unwrap_or(f as f64)
+    } else {
+        f as f64
+    }
+}
+
+/// How deep JSON a database gives may nest: PostgreSQL keeps what its stack allows, past
+/// serde_json's 128, which failed the whole query.
+const JSON_DEPTH: usize = 1000;
+
+/// JSON a database gives (PostgreSQL's json and jsonb, MySQL's JSON), as a value, read here
+/// rather than by serde_json, whose limits failed the whole query for one value (FEEDBACK55.md,
+/// Q-732; branch feedback55): a whole number past an int is a `dec` (2^64 - 1 and 2^64 - 2 read
+/// as one float, and matched each other's rows); a lone surrogate (`"\ud800"`, which `json`
+/// keeps) is U+FFFD; nesting goes to 1,000. What cannot be read even so (a number past a `dec`
+/// or a float, `1e400`; deeper nesting) is an error value in that row's column, the other rows
+/// and columns read.
+pub(crate) fn json_cell(raw: &[u8]) -> Value {
+    let mut r = Json { b: raw, i: 0 };
+    let v = r.value(0).and_then(|v| {
+        r.space();
+        if r.i == raw.len() {
+            Ok(v)
+        } else {
+            Err("text after its end".to_string())
+        }
+    });
+    v.unwrap_or_else(|why| Value::err(Value::str(format!("db: this JSON could not be read: {}", why))))
+}
+
+/// A number's text in a message: its first digits, and how many there are, past 24.
+fn shown(text: &str) -> String {
+    if text.len() <= 24 {
+        return text.to_string();
+    }
+    format!("{}... ({} characters)", &text[..16], text.len())
+}
+
+struct Json<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl Json<'_> {
+    fn space(&mut self) {
+        while matches!(self.b.get(self.i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.i += 1;
+        }
+    }
+
+    fn value(&mut self, depth: usize) -> Result<Value, String> {
+        self.space();
+        let deeper = |depth: usize| if depth >= JSON_DEPTH { Err(format!("it nests more than {} deep", JSON_DEPTH)) } else { Ok(()) };
+        match self.b.get(self.i) {
+            None => Err("it ends early".into()),
+            Some(b'{') => {
+                deeper(depth)?;
+                self.i += 1;
+                let mut m = Map::new();
+                self.space();
+                if self.b.get(self.i) == Some(&b'}') {
+                    self.i += 1;
+                    return Ok(Value::map(m));
+                }
+                loop {
+                    self.space();
+                    if self.b.get(self.i) != Some(&b'"') {
+                        return Err("a key is not a string".into());
+                    }
+                    let k = self.string()?;
+                    self.space();
+                    if self.b.get(self.i) != Some(&b':') {
+                        return Err("no `:` after a key".into());
+                    }
+                    self.i += 1;
+                    let v = self.value(depth + 1)?;
+                    m.insert(k.as_str().into(), v);
+                    self.space();
+                    match self.b.get(self.i) {
+                        Some(b',') => self.i += 1,
+                        Some(b'}') => {
+                            self.i += 1;
+                            return Ok(Value::map(m));
+                        }
+                        _ => return Err("an object is not closed".into()),
+                    }
+                }
+            }
+            Some(b'[') => {
+                deeper(depth)?;
+                self.i += 1;
+                let mut l = Vec::new();
+                self.space();
+                if self.b.get(self.i) == Some(&b']') {
+                    self.i += 1;
+                    return Ok(Value::list(l));
+                }
+                loop {
+                    l.push(self.value(depth + 1)?);
+                    self.space();
+                    match self.b.get(self.i) {
+                        Some(b',') => self.i += 1,
+                        Some(b']') => {
+                            self.i += 1;
+                            return Ok(Value::list(l));
+                        }
+                        _ => return Err("an array is not closed".into()),
+                    }
+                }
+            }
+            Some(b'"') => Ok(Value::str(self.string()?)),
+            Some(b't') => self.word("true", Value::Bool(true)),
+            Some(b'f') => self.word("false", Value::Bool(false)),
+            Some(b'n') => self.word("null", Value::Nil),
+            Some(_) => self.number(),
+        }
+    }
+
+    fn word(&mut self, w: &str, v: Value) -> Result<Value, String> {
+        if self.b[self.i..].starts_with(w.as_bytes()) {
+            self.i += w.len();
+            Ok(v)
+        } else {
+            Err("a word that is not true, false or null".into())
+        }
+    }
+
+    /// A number: an int, a `dec` past an int, a float with a fraction or an exponent.
+    fn number(&mut self) -> Result<Value, String> {
+        let start = self.i;
+        let at = |i: usize| self.b.get(i).copied();
+        let mut i = start;
+        if at(i) == Some(b'-') {
+            i += 1;
+        }
+        let digits = |mut i: usize| {
+            while at(i).map_or(false, |c| c.is_ascii_digit()) {
+                i += 1;
+            }
+            i
+        };
+        let whole = digits(i);
+        if whole == i {
+            return Err("a value that is not JSON".into());
+        }
+        let mut end = whole;
+        if at(end) == Some(b'.') {
+            end = digits(end + 1);
+        }
+        if matches!(at(end), Some(b'e' | b'E')) {
+            let mut e = end + 1;
+            if matches!(at(e), Some(b'+' | b'-')) {
+                e += 1;
+            }
+            end = digits(e);
+        }
+        self.i = end;
+        let text = std::str::from_utf8(&self.b[start..end]).unwrap_or("");
+        if end == whole {
+            if let Ok(n) = text.parse::<i64>() {
+                return Ok(Value::Int(n));
+            }
+            // Past a dec (about 7.9e28), a float, as jsonb writes a float's whole number out in
+            // digits (1.5e30 as 1500000000000000000000000000000): only one past a float is an
+            // error (found in review).
+            if let Some(d) = crate::decimal::Dec::parse(text) {
+                return Ok(Value::Dec(d));
+            }
+        }
+        let f: f64 = text.parse().map_err(|_| format!("the number {} is not one", shown(text)))?;
+        let nonzero = self.b[start..end].iter().take_while(|c| !matches!(c, b'e' | b'E')).any(|c| (b'1'..=b'9').contains(c));
+        if !f.is_finite() || (f == 0.0 && nonzero) {
+            return Err(format!("the number {} is past what a float holds", shown(text)));
+        }
+        Ok(Value::Float(f + 0.0))
+    }
+
+    /// A string: its escapes read, a lone surrogate as U+FFFD.
+    fn string(&mut self) -> Result<String, String> {
+        self.i += 1;
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let run = self.b[self.i..].iter().position(|&c| c == b'"' || c == b'\\').ok_or("a string is not closed")?;
+            out.extend_from_slice(&self.b[self.i..self.i + run]);
+            self.i += run;
+            if self.b[self.i] == b'"' {
+                self.i += 1;
+                return Ok(String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()));
+            }
+            let c = *self.b.get(self.i + 1).ok_or("a string is not closed")?;
+            self.i += 2;
+            let one = match c {
+                b'"' => '"',
+                b'\\' => '\\',
+                b'/' => '/',
+                b'b' => '\u{8}',
+                b'f' => '\u{c}',
+                b'n' => '\n',
+                b'r' => '\r',
+                b't' => '\t',
+                b'u' => {
+                    let hi = self.hex4()?;
+                    let low = (0xD800..0xDC00).contains(&hi) && self.b[self.i..].starts_with(b"\\u");
+                    let lo = if low {
+                        let save = self.i;
+                        self.i += 2;
+                        let lo = self.hex4()?;
+                        if (0xDC00..0xE000).contains(&lo) {
+                            Some(lo)
+                        } else {
+                            self.i = save;
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    match lo {
+                        Some(lo) => char::from_u32(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)).unwrap_or('\u{fffd}'),
+                        None => char::from_u32(hi).unwrap_or('\u{fffd}'),
+                    }
+                }
+                _ => return Err("a string has an escape JSON does not have".into()),
+            };
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(one.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+
+    fn hex4(&mut self) -> Result<u32, String> {
+        let h = self.b.get(self.i..self.i + 4).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u32::from_str_radix(h, 16).ok()).ok_or("a \\u escape without four hex digits")?;
+        self.i += 4;
+        Ok(h)
+    }
 }
 
 /// Postgres's binary NUMERIC: an int when it has no scale (as `sum` of
@@ -1453,9 +1982,10 @@ fn array(elem: &Type, raw: &[u8]) -> Result<Value, BoxErr> {
     let _has_null = i32::from_be_bytes(take(raw, &mut at)?);
     let _oid = u32::from_be_bytes(take(raw, &mut at)?);
     let mut dims = Vec::with_capacity(ndim);
+    let mut lower = Vec::with_capacity(ndim);
     for _ in 0..ndim {
         dims.push(usize::try_from(i32::from_be_bytes(take(raw, &mut at)?)).map_err(|_| "bad array size")?);
-        let _lower = i32::from_be_bytes(take(raw, &mut at)?);
+        lower.push(i32::from_be_bytes(take(raw, &mut at)?));
     }
     let total: usize = if ndim == 0 { 0 } else { dims.iter().try_fold(1usize, |t, d| t.checked_mul(*d)).ok_or("bad array size")? };
     // Each item is at least its 4-byte length.
@@ -1481,7 +2011,15 @@ fn array(elem: &Type, raw: &[u8]) -> Result<Value, BoxErr> {
             [n, rest @ ..] => Value::list((0..*n).map(|_| nest(items, rest)).collect()),
         }
     }
-    Ok(if dims.is_empty() { Value::list(Vec::new()) } else { nest(&mut items.into_iter(), &dims) })
+    let list = if dims.is_empty() { Value::list(Vec::new()) } else { nest(&mut items.into_iter(), &dims) };
+    // An array that does not start at 1 (`'[0:2]={1,2,3}'`) as PostgreSQL writes it, which
+    // written back keeps its bounds: as a list, written back, every index moved (FEEDBACK55.md,
+    // Q-756; branch feedback55).
+    if lower.iter().any(|&l| l != 1) {
+        let bounds: String = lower.iter().zip(&dims).map(|(l, n)| format!("[{}:{}]", l, *l as i64 + *n as i64 - 1)).collect();
+        return Ok(Value::str(format!("{}={}", bounds, pg_text(&list))));
+    }
+    Ok(list)
 }
 
 /// Days since 2000-01-01 as YYYY-MM-DD.
@@ -1497,14 +2035,23 @@ fn date_text(days: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02}", y, m, d)
+    // A year before 1 with its sign and four digits, ISO 8601's way (1 BC is 0000, 44 BC is
+    // -0043), which Quillo writes back as PostgreSQL's BC (`bc_text`); `{:04}` wrote -043
+    // (FEEDBACK55.md, Q-743; branch feedback55).
+    if y < 0 {
+        format!("-{:04}-{:02}-{:02}", -y, m, d)
+    } else {
+        format!("{:04}-{:02}-{:02}", y, m, d)
+    }
 }
 
-/// Microseconds since midnight as HH:MM:SS[.ffffff].
 /// A value of a type with no reader of its own. Types with a binary form of their own are
 /// read as PostgreSQL writes them; text-like ones (text, varchar, enums, citext) are text
 /// already, and what is left is shown as `bytea` is, as bytes passed off as text say nothing
-/// (FEEDBACK16.md, Q-117; branch feedback20-fixes).
+/// (FEEDBACK16.md, Q-117; branch feedback20-fixes). By its type alone, always: bytes that
+/// happened to be UTF-8 were text, so `regtype` came back as control characters and one
+/// `timetz` column as NULs in one row and hex in the next (FEEDBACK55.md, Q-742; branch
+/// feedback55). `timetz`, `pg_lsn`, `xid` and `xid8` are read as PostgreSQL writes them.
 fn other_type(ty: &Type, raw: &[u8]) -> Value {
     if let ("money", Ok(units)) = (ty.name(), <[u8; 8]>::try_from(raw)) {
         if let Some(d) = crate::decimal::Dec::new(i64::from_be_bytes(units) as i128, MONEY.with(|m| m.get())) {
@@ -1528,15 +2075,45 @@ fn other_type(ty: &Type, raw: &[u8]) -> Value {
             let n = u32::from_be_bytes([*a, *b, *c, *d]) as usize;
             Some(bytes.iter().flat_map(|x| (0..8).rev().map(move |i| if x >> i & 1 == 1 { '1' } else { '0' })).take(n).collect())
         }
+        ("timetz", b) if b.len() == 12 => {
+            let us = i64::from_be_bytes(b[..8].try_into().unwrap_or_default());
+            // Seconds west of UTC, as PostgreSQL keeps them; written east, as it writes them.
+            let east = -(i32::from_be_bytes(b[8..].try_into().unwrap_or_default()) as i64);
+            let (sign, a) = (if east < 0 { '-' } else { '+' }, east.unsigned_abs());
+            let mut zone = format!("{}{:02}", sign, a / 3600);
+            if a % 3600 != 0 {
+                zone.push_str(&format!(":{:02}", a % 3600 / 60));
+            }
+            if a % 60 != 0 {
+                zone.push_str(&format!(":{:02}", a % 60));
+            }
+            Some(format!("{}{}", time_text(us.max(0) as u64), zone))
+        }
+        ("pg_lsn", b) if b.len() == 8 => {
+            let n = u64::from_be_bytes(b.try_into().unwrap_or_default());
+            Some(format!("{:X}/{:X}", n >> 32, n & 0xffff_ffff))
+        }
+        ("xid" | "cid", b) if b.len() == 4 => return Value::Int(u32::from_be_bytes(b.try_into().unwrap_or_default()) as i64),
+        ("xid8", b) if b.len() == 8 => {
+            let n = u64::from_be_bytes(b.try_into().unwrap_or_default());
+            return i64::try_from(n).map_or_else(|_| crate::decimal::Dec::parse(&n.to_string()).map_or(Value::Nil, Value::Dec), Value::Int);
+        }
         _ => None,
     };
-    match (text, std::str::from_utf8(raw)) {
-        (Some(t), _) => Value::str(t),
-        (None, Ok(s)) => Value::str(s),
-        (None, Err(_)) => Value::str(format!("\\x{}", hex(raw, ""))),
+    match text {
+        Some(t) => Value::str(t),
+        None if text_form(ty) => Value::str(String::from_utf8_lossy(raw)),
+        None => Value::str(format!("\\x{}", hex(raw, ""))),
     }
 }
 
+/// Whether a type's binary form is its text: text and its kin, enums, citext, `xml`, `"char"`,
+/// `refcursor`.
+fn text_form(ty: &Type) -> bool {
+    is_text_type(ty) || matches!(*ty, Type::XML | Type::CHAR | Type::REFCURSOR)
+}
+
+/// Microseconds since midnight as HH:MM:SS[.ffffff].
 fn time_text(us: u64) -> String {
     let secs = us / 1_000_000;
     let frac = us % 1_000_000;
@@ -1572,8 +2149,9 @@ mod tests {
         assert_eq!(scan.native(), "select $1::text, $2, $1, ':no'");
         assert_eq!(vals.len(), 2);
         assert_eq!(rewrite_numbered("a = $1 and b = $12", |n| (n == 12).then(|| "X".into())), "a = $1 and b = X");
-        assert!(several_statements("create table a (x int); create table b (y int);"));
-        assert!(!several_statements("insert into a values (';');"));
+        let several = |sql: &str| crate::sql::scan(crate::sql::Dialect::Postgres, sql).stmts.len() > 1;
+        assert!(several("create table a (x int); create table b (y int);"));
+        assert!(!several("insert into a values (';');"));
         // Quillo's own transactions, as `typed` needs to know (FEEDBACK55.md, Q-731).
         assert!(in_tx_after(false, "begin isolation level serializable"));
         assert!(in_tx_after(true, "savepoint quillo_tx_2"));
@@ -1595,7 +2173,141 @@ mod tests {
         assert_eq!((o.url.as_str(), o.max, o.schema, o.tls.mode), ("postgres://h/db", 3, None, Some(SslMode::Require)));
         let o = take_options("postgres://h/db?schema=acme").unwrap();
         assert_eq!((o.url.as_str(), o.max, o.schema), ("postgres://h/db", DEFAULT_POOL, Some("acme".into())));
+        // Other options stay in the URL, for the driver (FEEDBACK55.md, Q-737).
+        let o = take_options("postgres://h/db?options=-c%20statement_timeout%3D100&schema=acme").unwrap();
+        assert_eq!((o.url.as_str(), o.schema), ("postgres://h/db?options=-c%20statement_timeout%3D100", Some("acme".into())));
         assert!(take_options("postgres://h/db?schema=a;drop").is_err());
+    }
+
+    // FEEDBACK55.md, Q-732: JSON as a database gives it, read with no limit that fails the
+    // whole query.
+    #[test]
+    fn json_a_database_gives_is_read_cell_by_cell() {
+        // An error's own words (another test may have errors hidden as the server hides them).
+        let j = |t: &str| match json_cell(t.as_bytes()) {
+            Value::Err(e, _, _) => format!("err(\"{}\")", e.display()),
+            v => v.repr(),
+        };
+        assert_eq!(j(r#"{"a": [1, -2, 0.5, true, false, null, "x"], "b": {}}"#), r#"{ a: [1, -2, 0.5, true, false, null, "x"], b: {} }"#);
+        assert_eq!(j("9223372036854775807"), "9223372036854775807");
+        assert_eq!(j("9223372036854775808"), "9223372036854775808m");
+        assert_eq!(j("-9223372036854775809"), "-9223372036854775809m");
+        assert_eq!(j("79228162514264337593543950335"), "79228162514264337593543950335m");
+        // Past a dec, a float; past a float, an error.
+        assert_eq!(json_cell(b"79228162514264337593543950336").repr(), Value::Float(79228162514264337593543950336.0).repr());
+        assert_eq!(json_cell(format!("1{}", "0".repeat(308)).as_bytes()).repr(), Value::Float(1e308).repr());
+        assert!(j(&format!("1{}", "0".repeat(309))).contains("past what a float holds"));
+        assert_eq!(json_cell(b"1e20").repr(), Value::Float(1e20).repr());
+        assert!(j("1e400").contains("the number 1e400 is past what a float holds"));
+        assert!(j("-1e-400").contains("past what a float holds"));
+        assert_eq!(j("0e-400"), "0.0");
+        assert_eq!(j(r#""a\"b\\c\/\n\t\u00e9\ud83d\ude00""#), "\"a\\\"b\\\\c/\\n\\té😀\"");
+        assert_eq!(j(r#""\ud800x""#), "\"\u{fffd}x\"");
+        assert_eq!(j(r#""\udc00\ud800\u0041""#), "\"\u{fffd}\u{fffd}A\"");
+        assert_eq!(j(" [ ] "), "[]");
+        let deep = |n: usize| format!("{}1{}", "[".repeat(n), "]".repeat(n));
+        assert!(!j(&deep(1000)).contains("err("));
+        assert!(j(&deep(1001)).contains("it nests more than 1000 deep"));
+        for bad in ["", "[1,", "{\"a\" 1}", "{1: 2}", "tru", "[1] x", "\"abc", "\"\\q\"", "\"\\u12\"", "-", "nul"] {
+            assert!(j(bad).starts_with("err(\"db: this JSON could not be read"), "{:?}: {}", bad, j(bad));
+        }
+    }
+
+    // FEEDBACK55.md, Q-743, Q-744, Q-734, Q-742, Q-730.
+    #[test]
+    fn values_both_ways_as_postgresql_writes_them() {
+        assert_eq!(date_text(-730_485), "0000-01-01");
+        assert_eq!(date_text(-730_486), "-0001-12-31");
+        assert_eq!(bc_text("-0043-03-15").as_deref(), Some("0044-03-15 BC"));
+        assert_eq!(bc_text("0000-06-01").as_deref(), Some("0001-06-01 BC"));
+        assert_eq!(bc_text(" -4713-11-24T00:00:00Z").as_deref(), Some("4714-11-24T00:00:00Z BC"));
+        for t in ["0001-01-01", "2026-11-06", "-43-03-15", "infinity", "", "-", "0000", "12:00"] {
+            assert_eq!(bc_text(t), None, "{}", t);
+        }
+        assert_eq!(f32_wide(0.1), 0.1);
+        assert_eq!(f32_wide(3.4e38), 3.4e38);
+        assert_eq!(f32_wide(-1.5), -1.5);
+        assert!(f32_wide(f32::INFINITY).is_infinite() && f32_wide(f32::NAN).is_nan());
+        let real = |v: Value| float_for(&v, &Type::FLOAT4).map_err(|e| e.to_string());
+        let double = |v: Value| float_for(&v, &Type::FLOAT8).map_err(|e| e.to_string());
+        assert!(real(Value::Float(1e39)).unwrap_err().contains("1e39 is out of range for type real"));
+        assert!(real(Value::Float(1e-46)).unwrap_err().contains("out of range for type real"));
+        assert!(real(Value::str("1e39")).unwrap_err().contains("out of range for type real"));
+        assert!(double(Value::str("1e400")).unwrap_err().contains("out of range for type double precision"));
+        assert!(double(Value::str("1e-400")).unwrap_err().contains("out of range"));
+        assert!(double(Value::str("inf")).unwrap_err().contains("cannot be stored"));
+        assert!(double(Value::str("x")).unwrap_err().contains("cannot send"));
+        assert_eq!(real(Value::Float(-0.0)).unwrap().to_bits(), 0.0f64.to_bits());
+        assert_eq!(double(Value::str("0e-400")).unwrap(), 0.0);
+        assert_eq!(real(Value::Int(16_777_217)).unwrap(), 16_777_216.0);
+        assert_eq!(double(Value::Dec(crate::decimal::Dec::parse("2.5").unwrap())).unwrap(), 2.5);
+        assert_eq!(cast_name(&Type::BIT), "varbit");
+        assert_eq!(cast_name(&Type::BIT_ARRAY), "varbit[]");
+        assert_eq!(cast_name(&Type::DATE), "date");
+        // By its type, whatever the bytes are.
+        let tz = |us: i64, west: i32| other_type(&Type::TIMETZ, &[us.to_be_bytes().to_vec(), west.to_be_bytes().to_vec()].concat()).repr();
+        assert_eq!(tz(0, 0), "\"00:00:00+00\"");
+        assert_eq!(tz(43_200_000_000, -7200), "\"12:00:00+02\"");
+        assert_eq!(tz(1_500_000, 19_815), "\"00:00:01.5-05:30:15\"");
+        assert_eq!(other_type(&Type::REGTYPE, &[0, 0, 0, 23]).repr(), "\"\\\\x00000017\"");
+        assert_eq!(other_type(&Type::REGTYPE, b"abcd").repr(), "\"\\\\x61626364\"");
+        assert_eq!(other_type(&Type::PG_LSN, &0x16_b374_d848u64.to_be_bytes()).repr(), "\"16/B374D848\"");
+        assert_eq!(other_type(&Type::XID, &7u32.to_be_bytes()).repr(), "7");
+        assert_eq!(other_type(&Type::XID8, &u64::MAX.to_be_bytes()).repr(), "18446744073709551615m");
+        assert_eq!(other_type(&Type::TEXT, "é".as_bytes()).repr(), "\"é\"");
+        assert_eq!(other_type(&Type::XML, b"<a/>").repr(), "\"<a/>\"");
+        assert_eq!(other_type(&Type::CHAR, b"x").repr(), "\"x\"");
+        assert_eq!(other_type(&Type::TIMETZ, b"short").repr(), "\"\\\\x73686f7274\"");
+    }
+
+    // FEEDBACK55.md, Q-745 (found in review): what a connection lets go after a schema change.
+    #[test]
+    fn statements_on_what_changed_are_let_go() {
+        let schema = Schema::default();
+        let keep = |names: &[&str]| -> (HashMap<String, u8>, HashMap<String, Option<u8>>) {
+            let stmts = names.iter().map(|n| (n.to_string(), 0)).collect();
+            let typed = names.iter().map(|n| (format!("23,\0{}", n), Some(0))).collect();
+            (stmts, typed)
+        };
+        let sqls = ["select * from a", "select * from b join c on true", "select f(x) from d"];
+        schema.note(Some(vec!["b".into()]));
+        let (mut stmts, mut typed) = keep(&sqls);
+        let_go(&schema, 0, &mut stmts, &mut typed);
+        assert!(stmts.contains_key("select * from a") && !stmts.contains_key("select * from b join c on true") && stmts.len() == 2);
+        assert_eq!(typed.len(), 2);
+        // A function's change; then one of any name, which lets go all.
+        schema.note(Some(vec!["f".into()]));
+        let (mut stmts, mut typed) = keep(&sqls);
+        let_go(&schema, 1, &mut stmts, &mut typed);
+        assert!(!stmts.contains_key("select f(x) from d") && stmts.len() == 2);
+        schema.note(None);
+        let (mut stmts, mut typed) = keep(&sqls);
+        let_go(&schema, 2, &mut stmts, &mut typed);
+        assert!(stmts.is_empty() && typed.is_empty());
+        // Further behind than it remembers: all.
+        for _ in 0..SCHEMA_LOG {
+            schema.note(Some(vec!["zz".into()]));
+        }
+        assert_eq!(schema.since(2), None);
+        assert_eq!(schema.since(3).map(|n| n.len()), Some(SCHEMA_LOG));
+        assert_eq!(schema.since(schema.count.load(Relaxed) - 1), Some(vec!["zz".into()]));
+        assert_eq!(schema.since(schema.count.load(Relaxed)), Some(Vec::new()));
+    }
+
+    // FEEDBACK55.md, Q-756: an array that does not start at 1, and a jsonb[]'s lists.
+    #[test]
+    fn arrays_keep_their_bounds_and_json_arrays_their_items() {
+        let be = |xs: &[i32]| xs.iter().flat_map(|x| x.to_be_bytes()).collect::<Vec<u8>>();
+        assert_eq!(array(&Type::INT4, &be(&[1, 0, 23, 2, 0, 4, 7, 4, 8])).unwrap().repr(), "\"[0:1]={\\\"7\\\",\\\"8\\\"}\"");
+        assert_eq!(array(&Type::INT4, &be(&[1, 0, 23, 2, 1, 4, 7, 4, 8])).unwrap().repr(), "[7, 8]");
+        assert_eq!(array(&Type::INT4, &be(&[1, 0, 23, 1, -3, 4, 7])).unwrap().repr(), "\"[-3:-3]={\\\"7\\\"}\"");
+        assert_eq!(array(&Type::INT4, &be(&[0, 0, 23])).unwrap().repr(), "[]");
+        let list = Value::list(vec![Value::list(vec![Value::Int(1)]), Value::str("{\"a\":1}"), Value::Nil, Value::map(Map::new())]);
+        assert_eq!(pg_text_as(&list, &Type::JSONB_ARRAY, true), r#"{"[1]","{\"a\":1}",NULL,"{}"}"#);
+        assert_eq!(pg_text_as(&list, &Type::JSONB_ARRAY, false), r#"{"[1]","\"{\\\"a\\\":1}\"",NULL,"{}"}"#);
+        assert_eq!(pg_text_as(&list, &Type::INT4_ARRAY, true), pg_text(&list));
+        assert_eq!(pg_text_as(&Value::str("-0043-03-15"), &Type::DATE, false), "0044-03-15 BC");
+        assert_eq!(pg_text_as(&Value::str("-0043-03-15"), &Type::TEXT, false), "-0043-03-15");
     }
 
     #[test]

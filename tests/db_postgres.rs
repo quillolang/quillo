@@ -589,7 +589,9 @@ fn requests_share_connections_that_can_get_stuck_and_die() {
     assert_eq!(get(port, "/bad"), "db: the query has 0 parameters, got 1");
     assert_eq!(get(port, "/badexec"), "db: the query has 0 parameters, got 1");
     assert_eq!(get(port, "/cast"), "1.50");
-    assert_eq!(get(port, "/two"), "null");
+    // A script's last statement's, as on the other databases (FEEDBACK55.md, Q-753; branch
+    // feedback55), where it was null.
+    assert_eq!(get(port, "/two"), "1");
     assert_eq!(get(port, "/count"), "2");
     // The database ended it: the next request gets a new one.
     psql(&pg, &pg.url, &["select pg_terminate_backend(pid) from pg_stat_activity where datname = 'postgres' and pid <> pg_backend_pid()"]);

@@ -184,7 +184,20 @@ pub fn mariadb(name: &str) -> Option<Maria> {
 }
 
 impl Maria {
+    /// A database's URL, the database made first if it is not there: `db.open` makes none, as
+    /// PostgreSQL's does not (FEEDBACK55.md, Q-736; branch feedback55). One with `{tenant}` in
+    /// it is the tenants', made by `new_tenant`.
     pub fn url(&self, db: &str) -> String {
+        let url = self.url_of(db);
+        if !db.is_empty() && !db.contains('{') {
+            quillo::my::Pool::open_as(&url, true).unwrap_or_else(|e| panic!("making {}: {}", db, e));
+        }
+        url
+    }
+
+    /// A database's URL, as it is.
+    #[allow(dead_code)]
+    pub fn url_of(&self, db: &str) -> String {
         format!("mysql://root@127.0.0.1:{}/{}", self.port, db)
     }
 }

@@ -260,21 +260,20 @@ fn replicas_of(b: &Arc<Backend>) -> Option<Arc<Replicas>> {
     sets.iter().find(|(w, _)| std::ptr::eq(w.as_ptr(), Arc::as_ptr(b))).map(|(_, r)| r.clone())
 }
 
-/// Whether a statement only reads: `select` or `with` (writing nothing),
-/// and no `for update` or `for share` (which lock, on the primary).
-fn only_reads(sql: &str) -> bool {
-    let lower = sql.trim_start().to_ascii_lowercase();
-    let first = lower.split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
-    (first == "select" || first == "with")
-        && crate::sqlinfo::tables_of(sql).writes.is_empty()
-        && !["for update", "for share", "for no key update", "for key share", "lock in share mode"].iter().any(|k| lower.contains(k))
+/// Whether a statement only reads, as its database reads it: see `sql::Scan::reads_only`
+/// (FEEDBACK55.md, Q-750; branch feedback55).
+fn only_reads(scan: &crate::sql::Scan) -> bool {
+    scan.reads_only()
 }
 
 /// Where a read goes: a replica of `b`, unless it is in a transaction on
-/// `b`, or this request wrote (it reads what it wrote, on the primary).
-fn reader(it: &Interp, b: &Arc<Backend>, sql: &str) -> Option<(Arc<Replicas>, usize)> {
+/// `b`, or this request wrote (it reads what it wrote, on the primary). A statement that
+/// writes where its words do not say so (`select nextval('s')`, a function that writes) goes
+/// to the primary: the databases' own such functions by name, the program's own when looked up
+/// (`isolated`, which the caller asks first; FEEDBACK55.md, Q-750; branch feedback55).
+fn reader(it: &Interp, b: &Arc<Backend>, scan: &crate::sql::Scan) -> Option<(Arc<Replicas>, usize)> {
     let reps = replicas_of(b)?;
-    if it.wrote_req == Some(crate::httpd::request_number()) || !only_reads(sql) {
+    if it.wrote_req == Some(crate::httpd::request_number()) || !only_reads(scan) {
         return None;
     }
     if it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|t| Arc::ptr_eq(&t.backend, b)) {
@@ -477,15 +476,22 @@ fn commits_by_itself(f: &str, stmt: &str) -> String {
 /// the SQL has no placeholder is no value (Q-747); and placeholders with no values are refused
 /// where SQLite stored nulls (Q-729; branch feedback55).
 fn given_values(scan: &crate::sql::Scan, params: Vec<Value>) -> Result<Vec<Value>, String> {
+    // `@name` with a map that has `name`, on MySQL: a variable of the session, null unless set,
+    // where SQLite takes the map's value; the map was silently left out (FEEDBACK55.md, Q-752;
+    // branch feedback55).
+    if let Some(v) = scan.var_given(&params) {
+        return Err(format!("`@{}` is a variable of MySQL's session (null unless set), not one of the values: write `:{}` for the value", v, v));
+    }
     // Not a value: not looked at (found in review).
     if matches!(params.as_slice(), [Value::Map(_)]) && !scan.named && scan.count == 0 {
         return Ok(Vec::new());
     }
     match scan.by_names(&params) {
         Some(m) => {
-            for name in scan.names() {
-                if let Some(v) = m.get(name).or_else(|| m.get(format!(":{}", name).as_str())) {
-                    storable(v, false, false).map_err(|why| format!("value :{}{}", name, why))?;
+            // By the name as written (`:id`, SQLite's `@id`), as the value is looked up.
+            for name in scan.signed_names() {
+                if let Some(v) = crate::sql::Scan::by_name(m, name) {
+                    storable(v, false, false).map_err(|why| format!("value {}{}", name, why))?;
                 }
             }
         }
@@ -504,8 +510,17 @@ fn given_values(scan: &crate::sql::Scan, params: Vec<Value>) -> Result<Vec<Value
 /// Whether a value can be stored: what it holds, if a list or a map, too (`inside`). An error
 /// the call was given itself (`given`) is told by the interpreter ("it failed before this
 /// call"); one in a map of named values, or inside another value, is told here.
+///
+/// NaN and the infinities are refused, naming them, on every database: SQLite stored NaN as
+/// null, and MySQL and MariaDB refuse both as "out of range", while PostgreSQL keeps them
+/// (FEEDBACK55.md, Q-735; branch feedback55).
 fn storable(v: &Value, given: bool, inside: bool) -> Result<(), String> {
     match v {
+        Value::Float(f) if !f.is_finite() => Err(format!(
+            "{} {}, which cannot be stored: SQLite keeps NaN as null and MySQL refuses NaN and the infinities, so no database is given one",
+            if inside { " holds" } else { " is" },
+            v.repr()
+        )),
         Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Str(_) | Value::Html(_) => Ok(()),
         Value::List(l) => l.iter().try_for_each(|x| storable(x, false, true)),
         Value::Map(m) => m.values().try_for_each(|x| storable(x, false, true)),
@@ -518,6 +533,47 @@ fn storable(v: &Value, given: bool, inside: bool) -> Result<(), String> {
         other if inside => Err(format!(" holds a {t}, and a {t} cannot be stored in the database", t = other.type_name())),
         other => Err(format!(": a {} cannot be stored in the database", other.type_name())),
     }
+}
+
+/// A list or a map as JSON for a database, as `Value::to_json` writes it but a whole `dec` as a
+/// JSON number: written as a string, a number past an int read from a JSON column (a `dec`)
+/// went back as a string, and no longer matched its row (FEEDBACK55.md, Q-732; branch
+/// feedback55). A `dec` with a fraction stays a string, as a JSON number with a fraction reads
+/// as a float.
+pub(crate) fn json_text(v: &Value) -> String {
+    fn write(v: &Value, depth: usize, out: &mut String) {
+        match v {
+            // Deeper than this, as `to_json` (which stops at its own depth).
+            _ if depth > 512 => out.push_str(&v.to_json().to_string()),
+            Value::List(l) => {
+                out.push('[');
+                for (i, x) in l.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write(x, depth + 1, out);
+                }
+                out.push(']');
+            }
+            Value::Map(m) => {
+                out.push('{');
+                for (i, (k, x)) in m.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&serde_json::Value::String(k.to_string()).to_string());
+                    out.push(':');
+                    write(x, depth + 1, out);
+                }
+                out.push('}');
+            }
+            Value::Dec(d) if d.scale() == 0 => out.push_str(&d.to_string()),
+            other => out.push_str(&other.to_json().to_string()),
+        }
+    }
+    let mut out = String::new();
+    write(v, 0, &mut out);
+    out
 }
 
 fn db_err(e: impl std::fmt::Display) -> Value {
@@ -828,17 +884,21 @@ fn wal(c: &Connection) -> Result<(), rusqlite::Error> {
 
 /// Opens a path (SQLite) or a postgres:// URL. Connecting to Postgres
 /// waits on the network, so the interpreter lock is released meanwhile.
+/// A MySQL database that is not there is an error, as PostgreSQL's is: a typo in a URL made a
+/// new, empty database (FEEDBACK55.md, Q-736; branch feedback55, the user's decision); only a
+/// tenant's is made, by its driver (`tenant_backend`).
 fn open_backend(it: &mut Interp, target: &str) -> Result<Backend, String> {
-    open_backend_as(it, target, true)
+    open_backend_as(it, target, true, false)
 }
 
 /// `open_backend`; with `make` false, a Postgres schema (`?schema=`) must
-/// exist already.
-fn open_backend_as(it: &mut Interp, target: &str, make: bool) -> Result<Backend, String> {
+/// exist already; with `tenant` (and `make`), MySQL's database is made when not there.
+fn open_backend_as(it: &mut Interp, target: &str, make: bool, tenant: bool) -> Result<Backend, String> {
     if is_mysql_url(target) {
         #[cfg(feature = "mysql")]
         {
             let url = target.to_string();
+            let make = make && tenant;
             return it.unlocked(move || crate::my::Pool::open_as(&url, make)).map(Backend::Mysql);
         }
         #[cfg(not(feature = "mysql"))]
@@ -969,7 +1029,7 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
     }
     // A server that is down stays an error; only a schema or a database that is not there
     // means no such tenant.
-    let b = match open_backend_as(it, &target, make) {
+    let b = match open_backend_as(it, &target, make, true) {
         Err(e) if !make && (e.contains("there is no schema") || e.contains("Unknown database") || (e.contains("database") && e.contains("does not exist"))) => {
             return Err(no_such(it));
         }
@@ -1157,12 +1217,15 @@ fn to_sql(v: &Value) -> Sql {
         Value::Nil => Sql::Null,
         Value::Bool(b) => Sql::Integer(*b as i64),
         Value::Int(n) => Sql::Integer(*n),
-        Value::Float(f) => Sql::Real(*f),
+        // -0.0 as 0.0: SQLite keeps a whole real as an integer, and MariaDB reads 0, so -0.0
+        // came back 0.0 there and -0 from PostgreSQL; every database is given 0.0
+        // (FEEDBACK55.md, Q-735; branch feedback55).
+        Value::Float(f) => Sql::Real(*f + 0.0),
         // SQLite has no decimals: the text, exactly (see `Col::Dec`).
         Value::Dec(d) => Sql::Text(d.to_string()),
         Value::Str(s) => Sql::Text(s.to_string()),
         Value::Html(h) => Sql::Text(h.to_string()),
-        other => Sql::Text(other.to_json().to_string()),
+        other => Sql::Text(json_text(other)),
     }
 }
 
@@ -1210,7 +1273,8 @@ fn from_sql(v: ValueRef, kind: Col) -> Value {
             crate::decimal::Dec::parse(s.trim()).map_or_else(|| Value::str(&*s), Value::Dec)
         }
         ValueRef::Integer(n) => Value::Int(n),
-        ValueRef::Real(f) => Value::Float(f),
+        // -0 as 0.0, as every database is given (FEEDBACK55.md, Q-735; branch feedback55).
+        ValueRef::Real(f) => Value::Float(f + 0.0),
         ValueRef::Text(t) => Value::str(String::from_utf8_lossy(t)),
         ValueRef::Blob(b) => Value::str(String::from_utf8_lossy(b)),
     }
@@ -1285,13 +1349,14 @@ pub(crate) fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option
 /// and its writes are announced (after the transaction, if any, commits).
 /// A connection's tables are topics of their own (`db@<label>:orders`), so
 /// that one `orders` changing does not refresh pages showing another.
-pub(crate) fn announce(it: &mut Interp, sql: &str, on: Option<usize>) {
-    announce_as(it, sql, on, true)
+pub(crate) fn announce(it: &mut Interp, scan: &crate::sql::Scan, on: Option<usize>) {
+    announce_as(it, scan, on, true)
 }
 
-/// As `announce`, the writes left out when the statement changed nothing.
-fn announce_as(it: &mut Interp, sql: &str, on: Option<usize>, wrote: bool) {
-    let t = crate::sqlinfo::tables_of(sql);
+/// As `announce`, the writes left out when the statement changed nothing. The tables as the
+/// statement's database reads them (src/sql.rs; FEEDBACK55.md; branch feedback55).
+fn announce_as(it: &mut Interp, scan: &crate::sql::Scan, on: Option<usize>, wrote: bool) {
+    let t = &scan.tables;
     let label = on.and_then(|i| it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(i).map(|(l, _)| l.split('#').next().unwrap_or(l).to_string()));
     let prefix = match label {
         Some(label) => format!("db@{}:", label),
@@ -1305,16 +1370,6 @@ fn announce_as(it: &mut Interp, sql: &str, on: Option<usize>, wrote: bool) {
     if wrote && !t.writes.is_empty() {
         it.publish(t.writes.iter().map(|w| format!("{}{}", prefix, w)).collect());
     }
-}
-
-/// One `insert`, `update` or `delete` (a `with` before it too, and `replace`):
-/// when it changed no row, nothing changed that a page could show. A schema
-/// statement changes no row and still counts (FEEDBACK13.md, Q-090; branch
-/// feedback13-fixes).
-fn rows_statement(sql: &str) -> bool {
-    let s = sql.trim().trim_end_matches(';');
-    let first = s.split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("").to_ascii_lowercase();
-    matches!(first.as_str(), "insert" | "update" | "delete" | "replace" | "with") && !s.contains(';')
 }
 
 /// Starts a transaction level; returns where its announcements begin.
@@ -1745,42 +1800,13 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// The columns a `create table` or `alter table` gives SQLite as `money`, `decimal` or
 /// `numeric(p, s)`: read back as decimals, but kept with NUMERIC affinity, as a float past
 /// 15 digits and without the scale. Only the guide said so; the log says it once for each
-/// column (FEEDBACK50.md, Q-628; branch feedback50-fixes). As (table, column, type), with
-/// comments and quoted text left out.
-pub(crate) fn lossy_columns(sql: &str) -> Vec<(String, String, String)> {
-    use std::sync::OnceLock;
-    const NAME: &str = r#"("[^"]+"|`[^`]+`|\[[^\]]+\]|[\w.]+)"#;
-    static GATE: OnceLock<regex::Regex> = OnceLock::new();
-    static COL: OnceLock<regex::Regex> = OnceLock::new();
-    static NOISE: OnceLock<regex::Regex> = OnceLock::new();
-    let gate = GATE.get_or_init(|| {
-        regex::Regex::new(&format!(r"(?is)\b(?:create\s+(?:temp(?:orary)?\s+)?table(?:\s+if\s+not\s+exists)?|alter\s+table)\s+{}", NAME)).unwrap()
-    });
-    if !gate.is_match(sql) {
-        return Vec::new();
-    }
-    let col = COL.get_or_init(|| {
-        regex::Regex::new(&format!(r"(?is)(?:\(|,|\badd\s+(?:column\s+)?)\s*{}\s+(money\w*|decimal\b|numeric\s*\(|dec\s*\(|dec\b)", NAME)).unwrap()
-    });
-    let noise = NOISE.get_or_init(|| regex::Regex::new(r"(?s)--[^\n]*|/\*.*?\*/|'(?:[^']|'')*'").unwrap());
-    let unquote = |n: &str| n.trim_matches(|c| matches!(c, '"' | '`' | '[' | ']')).to_string();
-    let clean = noise.replace_all(sql, " ");
-    let mut out = Vec::new();
-    for stmt in clean.split(';') {
-        let Some(head) = gate.captures(stmt) else { continue };
-        let body = &stmt[head.get(0).unwrap().end()..];
-        for c in col.captures_iter(body) {
-            let ty: String = c[2].split_whitespace().collect::<String>().trim_end_matches('(').to_ascii_lowercase();
-            out.push((unquote(&head[1]), unquote(&c[1]), ty));
-        }
-    }
-    out
-}
-
-/// `lossy_columns`, said once each in the log (64 at most).
+/// column (FEEDBACK50.md, Q-628; branch feedback50-fixes), 64 at most. Read by SQLite's
+/// tokenizer (src/sql.rs), where a regex looked past comments and strings (FEEDBACK55.md;
+/// branch feedback55).
 pub(crate) fn warn_lossy_columns(sql: &str) {
     static SAID: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
-    for (table, col, ty) in lossy_columns(sql) {
+    let scan = crate::sql::scan(crate::sql::Dialect::Sqlite, sql);
+    for (table, col, ty) in &scan.lossy {
         let key = format!("{}.{}", table, col);
         let mut said = SAID.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if said.len() < 64 && said.insert(key.clone()) {
@@ -1798,6 +1824,62 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     exec_as(it, args, line, false)
 }
 
+/// SQL with no statement in it, refused on every database: SQLite gave the statement before's
+/// `changes`, and `db.one` an error saying "not an error", PostgreSQL null (FEEDBACK55.md, Q-753;
+/// branch feedback55).
+const NO_STATEMENT: &str = "the SQL has no statement in it (it is empty, or only comments)";
+
+/// `db.exec` on SQLite: `{ changes, last_id }` of the statement, the last of a script, as the
+/// other databases count them (FEEDBACK55.md, Q-753; branch feedback55). `changes` is the rows
+/// it changed, 0 for one that changes none (a `select`, a schema's statement), where SQLite's
+/// count was still that of the insert, update or delete before it; `last_id` the id of the one
+/// row it inserted, null when it inserted none or several (MySQL gave a multi-row insert's
+/// first, SQLite its last, and both the id of an insert long before). A statement that returns
+/// rows runs as on the others, where SQLite refused it ("Execute returned results").
+///
+/// Told by SQLite's counts and its last row id, which are left as SQLite has them: the program's
+/// own SQL may read `last_insert_rowid()` (setting it aside stored i64::MIN as a child's parent
+/// id; found in review). An insert of one row gives that row's id; an upsert's, only when the id
+/// moved, as its update leaves the id of the insert before it.
+fn sqlite_exec(c: &Connection, scan: &crate::sql::Scan, sql: &str, params: &[Value]) -> Result<Value, String> {
+    let head = scan.heads().last().map_or("", |(a, _)| a);
+    let inserts = head.eq_ignore_ascii_case("insert") || head.eq_ignore_ascii_case("replace");
+    let upsert = inserts && {
+        let text = scan.stmts.last().map_or("", |st| scan.stmt_text(st));
+        let mut words = text.split_ascii_whitespace();
+        let mut before = "";
+        words.any(|w| {
+            let found = before.eq_ignore_ascii_case("do") && w.eq_ignore_ascii_case("update");
+            before = w;
+            found
+        })
+    };
+    let (mut changed, mut id) = (0, None);
+    let mut run = |stmt: &mut rusqlite::Statement| -> Result<(), String> {
+        let (before, was) = (c.total_changes(), c.last_insert_rowid());
+        // Its first step does all it changes, rows it returns or not; they are not wanted.
+        stmt.raw_query().next().map_err(|e| e.to_string())?;
+        changed = if c.total_changes() == before { 0 } else { c.changes() };
+        let now = c.last_insert_rowid();
+        id = (changed == 1 && inserts && (!upsert || now != was)).then_some(now);
+        Ok(())
+    };
+    if params.is_empty() {
+        let mut batch = rusqlite::Batch::new(c, sql);
+        while let Some(mut stmt) = batch.next().map_err(|e| e.to_string())? {
+            run(&mut stmt)?;
+        }
+    } else {
+        let mut stmt = c.prepare_cached(sql).map_err(|e| e.to_string())?;
+        bind(&mut stmt, params)?;
+        run(&mut stmt)?;
+    }
+    let mut m = Map::new();
+    m.insert("changes".into(), Value::Int(changed as i64));
+    m.insert("last_id".into(), id.map_or(Value::Nil, Value::Int));
+    Ok(Value::map(m))
+}
+
 /// `db.exec`, or Quillo's own statement (`own`), which may make its table inside the program's
 /// transaction.
 fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
@@ -1813,6 +1895,9 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
     // Read as this database reads it, once for each text (FEEDBACK55.md, Q-746; branch
     // feedback55).
     let scan = crate::sql::scan(b.dialect(), &sql);
+    if scan.is_empty() {
+        return Ok(db_err(NO_STATEMENT));
+    }
     no_tx_control(&scan, "db.exec", line)?;
     it.wrote_req = Some(crate::httpd::request_number());
     let params = match given_values(&scan, args[1..].to_vec()) {
@@ -1842,25 +1927,17 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
             let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             (|| {
                 tx_gone(&b, &c)?;
-                if params.is_empty() {
-                    let before = c.is_autocommit();
-                    c.execute_batch(&sql).map_err(|e| e.to_string())?;
-                    // A script run whole (`sqlite3 .dump`'s `BEGIN TRANSACTION; ... COMMIT;`) may
-                    // hold its own transaction, but must end it: one left open took every
-                    // later request's writes into it (FEEDBACK44.md, Q-580).
-                    if before && !c.is_autocommit() {
-                        let _ = c.execute_batch("rollback");
-                        return Err("this SQL left a transaction open, so it was rolled back: write `db.transaction(() => ...)`, which commits, rolls back when something fails, and keeps other requests out of it".to_string());
-                    }
-                } else {
-                    let mut stmt = c.prepare_cached(&sql).map_err(|e| e.to_string())?;
-                    bind(&mut stmt, &params)?;
-                    stmt.raw_execute().map_err(|e| e.to_string())?;
+                let before = c.is_autocommit();
+                let r = sqlite_exec(&c, &scan, &sql, &params);
+                // A script run whole (`sqlite3 .dump`'s `BEGIN TRANSACTION; ... COMMIT;`) may
+                // hold its own transaction, but must end it: one left open took every
+                // later request's writes into it (FEEDBACK44.md, Q-580).
+                if params.is_empty() && before && !c.is_autocommit() {
+                    let _ = c.execute_batch("rollback");
+                    r?;
+                    return Err("this SQL left a transaction open, so it was rolled back: write `db.transaction(() => ...)`, which commits, rolls back when something fails, and keeps other requests out of it".to_string());
                 }
-                let mut m = Map::new();
-                m.insert("changes".into(), Value::Int(c.changes() as i64));
-                m.insert("last_id".into(), Value::Int(c.last_insert_rowid()));
-                Ok(Value::map(m))
+                r
             })()
         }
         Backend::Postgres(_) if alone => {
@@ -1886,8 +1963,11 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
     };
     crate::querystats::record(&sql, started.elapsed().as_secs_f64() * 1000.0, res.is_ok());
     // Functions made or dropped: what the names called are is looked up again (see `isolated`).
-    if let (true, Backend::Postgres(p)) = (scan.defines, &*b) {
-        p.forget_fns();
+    match (scan.defines, &*b) {
+        (true, Backend::Postgres(p)) => p.forget_fns(),
+        #[cfg(feature = "mysql")]
+        (true, Backend::Mysql(p)) => p.forget_fns(),
+        _ => {}
     }
     if !own {
         committed_inside(&res, &scan, "db.exec", line)?;
@@ -1897,8 +1977,10 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
     // would otherwise wake itself for ever (FEEDBACK13.md, Q-090; branch
     // feedback13-fixes).
     match &res {
-        Ok(Value::Map(m)) if matches!(m.get("changes"), Some(Value::Int(0))) && rows_statement(&sql) => announce_as(it, &sql, on, false),
-        Ok(_) => announce(it, &sql, on),
+        // A schema statement changes no row and still counts (FEEDBACK13.md, Q-090; branch
+        // feedback13-fixes).
+        Ok(Value::Map(m)) if matches!(m.get("changes"), Some(Value::Int(0))) && scan.changes_rows() => announce_as(it, &scan, on, false),
+        Ok(_) => announce(it, &scan, on),
         Err(_) => {}
     }
     Ok(res.unwrap_or_else(db_err))
@@ -2033,7 +2115,7 @@ fn exec_many(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     // Rows by the statement each, or many to a statement: as many as fit under the servers'
     // 65,535 parameters, and at most 1,000.
-    let many = if server { values_tuple(&sql, width) } else { None };
+    let many = if server { crate::sql::scan(b.dialect(), &sql).values_tuple(width) } else { None };
     let per = many.as_ref().map_or(1, |_| (60_000 / width.max(1)).clamp(1, 1000));
     let mut body = |it: &mut Interp| -> R {
         let mut total = 0;
@@ -2060,26 +2142,6 @@ fn exec_many(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     crate::txn::run(it, on, &crate::txn::Options::default(), line, &mut body)
 }
 
-/// `insert into t (a, b) values (?, ?)`, with nothing after its values: the statement up to
-/// and with `values `, to which more rows' `(?, ?)` can be added. None for any other statement,
-/// which runs once a row.
-fn values_tuple(sql: &str, width: usize) -> Option<String> {
-    let t = sql.trim().trim_end_matches(';').trim_end();
-    if !t.get(..6).map_or(false, |w| w.eq_ignore_ascii_case("insert")) || !t.ends_with(')') {
-        return None;
-    }
-    let lower = t.to_ascii_lowercase();
-    let at = lower.rfind("values")?;
-    let head = &t[..at];
-    let tuple = t[at + 6..].trim_start();
-    let inner = tuple.strip_prefix('(')?.strip_suffix(')')?;
-    let marks: Vec<&str> = inner.split(',').map(str::trim).collect();
-    if marks.len() != width || marks.iter().any(|m| *m != "?") || head.contains(['?', '\'', '"', '`', '-', '/']) {
-        return None;
-    }
-    Some(format!("{}values ", head))
-}
-
 /// `db.exec` / `db.query` on connection `on` (None: the program's).
 pub(crate) fn exec_on(it: &mut Interp, on: Option<usize>, args: Vec<Value>) -> R {
     it.db_on = on;
@@ -2098,8 +2160,23 @@ pub(crate) fn kind_on(it: &mut Interp, on: Option<usize>) -> bool {
 /// Whether this server runs a scheduled job's run due at `at`: with a
 /// database for Quillo's own tables (which other servers may share), only
 /// if no one recorded that run before; otherwise always.
+/// A job's key in `_quillo_jobs`: its name, or past the 255 characters MySQL's column holds, a
+/// part of it and a hash of the whole. `insert ignore` cut a longer one, the update then matched
+/// nothing, and the job never ran again (found in review, branch feedback55); the same key on
+/// every database. (`schedule` and `every` take names of 64 characters at most, so this is for
+/// what may come to it some other way.)
+fn job_key(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.chars().count() <= 255 {
+        return name.into();
+    }
+    use sha2::Digest;
+    let head: String = name.chars().take(180).collect();
+    format!("{}#{}", head, crate::crypto::hex(&sha2::Sha256::digest(name.as_bytes()))).into()
+}
+
 pub(crate) fn claim_job(it: &mut Interp, name: &str, at: u64) -> bool {
     let Some(on) = system_on(it, true) else { return true };
+    let name = &*job_key(name);
     let mysql = kind_on(it, on);
     let table = if mysql {
         "create table if not exists _quillo_jobs (name varchar(255) primary key, at bigint not null)"
@@ -2109,17 +2186,22 @@ pub(crate) fn claim_job(it: &mut Interp, name: &str, at: u64) -> bool {
     if !matches!(exec_on(it, on, vec![Value::str(table)]), Ok(Value::Map(_))) {
         return true;
     }
-    // A later run claims it (MySQL counts a row it leaves as it was as no change).
-    let sql = if mysql {
-        "insert into _quillo_jobs (name, at) values (?, ?) on duplicate key update at = if(at < values(at), values(at), at)"
-    } else {
-        "insert into _quillo_jobs (name, at) values (?, ?) \
-         on conflict (name) do update set at = excluded.at where _quillo_jobs.at < excluded.at"
-    };
-    match exec_on(it, on, vec![Value::str(sql), Value::str(name), Value::Int(at as i64)]) {
+    // A later run claims it. MySQL counts the rows an update matches, as the others do
+    // (FEEDBACK55.md, Q-739), so a row left as it was is no longer "no change" there: the row
+    // goes in if it is not there, else only a later run moves it (branch feedback55).
+    let claimed = |r: R| match r {
         Ok(Value::Map(m)) => !matches!(m.get("changes"), Some(Value::Int(0))),
         _ => true,
+    };
+    if mysql {
+        let first = exec_on(it, on, vec![Value::str("insert ignore into _quillo_jobs (name, at) values (?, ?)"), Value::str(name), Value::Int(at as i64)]);
+        if !matches!(first, Ok(Value::Map(ref m)) if matches!(m.get("changes"), Some(Value::Int(0)))) {
+            return claimed(first);
+        }
+        return claimed(exec_on(it, on, vec![Value::str("update _quillo_jobs set at = ? where name = ? and at < ?"), Value::Int(at as i64), Value::str(name), Value::Int(at as i64)]));
     }
+    let sql = "insert into _quillo_jobs (name, at) values (?, ?) on conflict (name) do update set at = excluded.at where _quillo_jobs.at < excluded.at";
+    claimed(exec_on(it, on, vec![Value::str(sql), Value::str(name), Value::Int(at as i64)]))
 }
 
 // ---- calls made later (src/service.rs), kept with the work they go with ----
@@ -2489,7 +2571,7 @@ fn select_in(
     params: Vec<Value>,
     limit: Option<usize>,
 ) -> Result<Vec<Value>, String> {
-    if it.writes_noted() && !only_reads(&sql) && it.no_writes("SQL that writes", 0).is_err() {
+    if it.writes_noted() && !only_reads(scan) && it.no_writes("SQL that writes", 0).is_err() {
         return Err(crate::interp::PREFETCH_REFUSED.into());
     }
     let params = given_values(scan, params)?;
@@ -2499,23 +2581,27 @@ fn select_in(
     // Timed for /_quillo/health/queries (branch query-stats).
     let started = std::time::Instant::now();
     // A read, to a replica: if it fails there, the primary answers (and the
-    // replica is left out for ten seconds).
-    if let Some((reps, i)) = reader(it, &b, &sql).filter(|_| !alone) {
+    // replica is left out for ten seconds). One the replica refused as a write (a function
+    // that writes, which its words did not show) goes to the primary, and the replica stays in
+    // use (FEEDBACK55.md, Q-750; branch feedback55).
+    let replica = if alone { None } else { reader(it, &b, scan) };
+    if let Some((reps, i)) = replica.filter(|_| !calls_own_on_mysql(it, &b, scan)) {
         let r = reps.list[i].clone();
         let (q, p) = (sql.clone(), params.clone());
         match pooled_run(it, &r, move |c| c.query(&q, &p, limit)) {
             Ok(rows) => {
                 crate::querystats::record(&sql, started.elapsed().as_secs_f64() * 1000.0, true);
-                announce(it, &sql, on);
+                announce(it, scan, on);
                 return Ok(rows);
             }
+            Err(e) if read_only_refusal(&e) => {}
             Err(e) => {
                 eprintln!("quillo: a read replica failed ({}); reading from the primary", e);
                 reps.down.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[i] = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
             }
         }
     }
-    if !only_reads(&sql) {
+    if !only_reads(scan) {
         it.wrote_req = Some(crate::httpd::request_number());
     }
     let res = match &*b {
@@ -2542,9 +2628,42 @@ fn select_in(
     };
     crate::querystats::record(&sql, started.elapsed().as_secs_f64() * 1000.0, res.is_ok());
     if res.is_ok() {
-        announce(it, &sql, on);
+        announce(it, scan, on);
     }
     res
+}
+
+/// On MySQL, whether a read calls a function of the database's own, which may write and so is
+/// the primary's: looked up once a name in `information_schema.routines`, as PostgreSQL's are
+/// in `pg_proc` (`isolated`). One that cannot be looked up is taken for one (FEEDBACK55.md,
+/// Q-750; found in review, branch feedback55).
+fn calls_own_on_mysql(it: &mut Interp, b: &Arc<Backend>, scan: &crate::sql::Scan) -> bool {
+    #[cfg(feature = "mysql")]
+    if let Backend::Mysql(pool) = &**b {
+        if scan.calls.is_empty() {
+            return false;
+        }
+        if let Some(own) = pool.calls_own(&scan.calls) {
+            return own;
+        }
+        let (names, b) = (scan.calls.clone(), b.clone());
+        return it
+            .unlocked(move || match &*b {
+                Backend::Mysql(p) => p.look_up_fns(&names),
+                _ => Ok(false),
+            })
+            .unwrap_or(true);
+    }
+    let _ = (it, b, scan);
+    false
+}
+
+/// A replica's refusal of a statement that writes: PostgreSQL's 25006 (a read-only transaction,
+/// as a standby's are) or its "recovery is in progress", MySQL's 1290 (`--read-only`), 1792 (a
+/// read-only transaction) and 1836 (read-only mode). The statement is the primary's, not the
+/// replica down (FEEDBACK55.md, Q-750; branch feedback55).
+fn read_only_refusal(e: &str) -> bool {
+    e.ends_with("[25006]") || (e.ends_with("[55000]") && e.contains("recovery")) || ["ERROR 1290 ", "ERROR 1792 ", "ERROR 1836 ", "(1290)", "(1792)", "(1836)"].iter().any(|c| e.contains(c))
 }
 
 /// `db.query(sql, ...params)`: every row, as maps from column to value.
@@ -2567,6 +2686,9 @@ fn query_as(it: &mut Interp, args: Vec<Value>, line: u32, limit: Option<usize>, 
         Err(e) => return Ok(db_err(e)),
     };
     let scan = crate::sql::scan(b.dialect(), &sql);
+    if scan.is_empty() {
+        return Ok(db_err(NO_STATEMENT));
+    }
     no_tx_control(&scan, f, line)?;
     if !own {
         no_commit_inside(it, &b, &scan, f, line)?;
@@ -3304,7 +3426,11 @@ pub fn recover(it: &mut Interp) {
 
 #[cfg(test)]
 mod tests {
-    use super::{kind_of, values_tuple};
+    use super::kind_of;
+
+    fn values_tuple(sql: &str, width: usize) -> Option<String> {
+        crate::sql::scan(crate::sql::Dialect::Postgres, sql).values_tuple(width)
+    }
 
     // The first words read in place, as every `db.exec` reads them: any case, past comments
     // and spaces, and a transaction's control found among a script's statements.
@@ -3369,8 +3495,13 @@ mod tests {
     #[test]
     fn which_statements_take_many_rows() {
         assert_eq!(values_tuple("insert into t (a, b) values (?, ?)", 2).as_deref(), Some("insert into t (a, b) values "));
-        assert_eq!(values_tuple("  INSERT INTO t VALUES (?,?) ; ", 2).as_deref(), Some("INSERT INTO t values "));
+        assert_eq!(values_tuple("  INSERT INTO t VALUES (?,?) ; ", 2).as_deref(), Some("  INSERT INTO t values "));
         assert_eq!(values_tuple("insert into t values(?)", 1).as_deref(), Some("insert into t values "));
+        // Read by the tokenizer: a quoted name or a comment no longer misleads it (FEEDBACK55.md;
+        // branch feedback55).
+        assert_eq!(values_tuple("insert into \"values\" values (?)", 1).as_deref(), Some("insert into \"values\" values "));
+        assert_eq!(values_tuple("insert into t (a) values (?) -- note", 1).as_deref(), Some("insert into t (a) values "));
+        assert_eq!(values_tuple("insert /* values (?) */ into t values (?, ?)", 2).as_deref(), Some("insert /* values (?) */ into t values "));
         for (sql, width) in [
             ("insert into t values (?, ?)", 3),                          // not the rows' width
             ("insert into t values (?, 1)", 2),                          // a value written in
@@ -3378,12 +3509,46 @@ mod tests {
             ("insert into t values (?, ?) returning id", 2),
             ("insert into t select ?, ?", 2),
             ("update t set a = ? where b = ?", 2),
-            ("insert into \"values\" values (?)", 1),                     // quoted names: not taken apart
-            ("insert into t (a) values (?) -- note", 1),
+            ("insert into t (a) values (?, ?), (?, ?)", 2),               // rows of its own
+            ("insert into t (a) values (?,)", 1),
+            ("insert into t (a) values ()", 0),
+            ("insert into t (a, b) values (?, :b)", 2),
+            ("insert into t (a) values (?); insert into u values (?)", 1),
             ("insert into t (a) select ? where 'values (?)' = ''", 1),
             ("ins", 1),
         ] {
             assert_eq!(values_tuple(sql, width), None, "{}", sql);
+        }
+    }
+
+    // A job's key fits MySQL's column, and tells long names apart (found in review).
+    #[test]
+    fn a_jobs_key_fits_the_column() {
+        let key = |n: &str| super::job_key(n).into_owned();
+        assert_eq!(key("nightly"), "nightly");
+        let at = "é".repeat(255);
+        assert_eq!(key(&at), at);
+        let (a, b) = (format!("{}a", "é".repeat(255)), format!("{}b", "é".repeat(255)));
+        assert!(key(&a).chars().count() <= 255 && key(&b).chars().count() <= 255);
+        assert_ne!(key(&a), key(&b));
+        assert!(key(&a).starts_with(&"é".repeat(180)));
+        assert_eq!(key(&a), key(&a));
+    }
+
+    // A replica's refusal of a statement that writes (FEEDBACK55.md, Q-750).
+    #[test]
+    fn a_replicas_refusal_of_a_write_is_told_apart() {
+        for e in [
+            "db: cannot execute nextval() in a read-only transaction [25006]",
+            "db: recovery is in progress [55000]",
+            "Server error: `ERROR HY000 (1290): The MariaDB server is running with the --read-only option so it cannot execute this statement'",
+            "Server error: `ERROR 25006 (1792): Cannot execute statement in a READ ONLY transaction.'",
+            "Server error: `ERROR HY000 (1836): Running in read-only mode'",
+        ] {
+            assert!(super::read_only_refusal(e), "{}", e);
+        }
+        for e in ["db: relation \"t\" does not exist [42P01]", "db: object not in prerequisite state [55000]", "db: connection closed", "a value of 25006", ""] {
+            assert!(!super::read_only_refusal(e), "{}", e);
         }
     }
 

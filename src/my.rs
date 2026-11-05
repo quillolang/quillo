@@ -15,6 +15,9 @@ use crate::value::*;
 use mysql_async::prelude::*;
 use mysql_async::consts::ColumnType;
 use mysql_async::{Opts, OptsBuilder, Params, Value as My};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
 
 pub fn is_url(s: &str) -> bool {
     s.starts_with("mysql://") || s.starts_with("mariadb://")
@@ -67,8 +70,21 @@ fn opts_of(url: &str) -> Result<Opts, String> {
             _ => rest.push(pair),
         }
     }
+    let found_rows = !rest.iter().any(|p| p.starts_with("client_found_rows="));
     let url = if rest.is_empty() { base.to_string() } else { format!("{}?{}", base, rest.join("&")) };
     let opts = Opts::from_url(&url).map_err(|e| e.to_string())?;
+    let mut b = OptsBuilder::from_opts(opts.clone());
+    // An IPv6 address, `[::1]`, without its brackets, which the driver looked up as a name
+    // (FEEDBACK55.md, Q-756; branch feedback55).
+    let host = opts.ip_or_hostname();
+    if let Some(ip) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        b = b.ip_or_hostname(ip.to_string());
+    }
+    // `changes` counts the rows a statement matched, as SQLite and PostgreSQL count them: MySQL
+    // counted those it changed, so an update to the value a row had was 0, and "update, else
+    // insert" inserted a second row (FEEDBACK55.md, Q-739; branch feedback55).
+    b = b.client_found_rows(found_rows || opts.client_found_rows());
+    let opts: Opts = b.into();
     let remote = opts.socket().is_none() && !crate::pg::local_host(opts.ip_or_hostname());
     if !require.unwrap_or(remote || ca.is_some()) {
         return Ok(opts);
@@ -101,12 +117,27 @@ fn run<T>(f: impl std::future::Future<Output = T>) -> T {
 /// The database's connections.
 pub struct Pool {
     pool: Option<mysql_async::Pool>,
+    /// What its connections asked the server, once for all of them.
+    asked: Arc<Asked>,
+}
+
+/// What a pool's connections asked the server, kept for all of them.
+#[derive(Default)]
+struct Asked {
+    /// The server's `max_allowed_packet` (0 before asked).
+    packet: AtomicUsize,
+    /// Tables' columns and their types, in lower case (`Conn::by_columns`); let go when the
+    /// program changes a schema.
+    columns: Mutex<HashMap<String, Vec<(String, String)>>>,
+    /// Names called as functions, and whether each is one of the database's own (`calls_own`).
+    fns: Mutex<HashMap<String, bool>>,
 }
 
 /// A connection; in a transaction that retries, whether a statement failed because of another
-/// transaction (see `crate::txn`; None: not watching); and whether Quillo began a transaction on
-/// it (`batch`).
-pub struct Conn(Option<mysql_async::Conn>, Option<bool>, bool);
+/// transaction (see `crate::txn`; None: not watching); whether Quillo began a transaction on
+/// it (`batch`); what its pool asked the server (`Asked`); and whether its session reads `||`
+/// as the other databases do (`bars`).
+pub struct Conn(Option<mysql_async::Conn>, Option<bool>, bool, Arc<Asked>, bool);
 
 impl Drop for Pool {
     fn drop(&mut self) {
@@ -144,9 +175,10 @@ impl Pool {
             }
         }
         let pool = mysql_async::Pool::new(opts);
+        let asked = Arc::new(Asked::default());
         let c = run(pool.get_conn()).map_err(|e| e.to_string())?;
-        drop(Conn(Some(c), None, false));
-        Ok(Pool { pool: Some(pool) })
+        drop(Conn(Some(c), None, false, asked.clone(), false));
+        Ok(Pool { pool: Some(pool), asked })
     }
 
     /// Makes the database a URL names, or says false when it is there. Of two at once, the
@@ -169,7 +201,44 @@ impl Pool {
 
     pub fn checkout(&self) -> Result<Conn, String> {
         let pool = self.pool.as_ref().expect("open");
-        run(pool.get_conn()).map(|c| Conn(Some(c), None, false)).map_err(|e| e.to_string())
+        run(pool.get_conn()).map(|c| Conn(Some(c), None, false, self.asked.clone(), false)).map_err(|e| e.to_string())
+    }
+
+    /// Whether one of these names is a function of the database's own (which may write, so a
+    /// replica is not asked), as far as known: None when a name was never looked up. MySQL's
+    /// own functions are not in `information_schema.routines` (FEEDBACK55.md, Q-750; found in
+    /// review, branch feedback55).
+    pub fn calls_own(&self, names: &[Box<str>]) -> Option<bool> {
+        let known = self.asked.fns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut own = false;
+        for n in names {
+            own |= *known.get(&**n)?;
+        }
+        Some(own)
+    }
+
+    /// Looks the names up, and keeps what they are.
+    pub fn look_up_fns(&self, names: &[Box<str>]) -> Result<bool, String> {
+        let mut c = self.checkout()?;
+        let sql = format!(
+            "select lower(routine_name) as name from information_schema.routines where routine_schema = database() and routine_type = 'FUNCTION' and lower(routine_name) in ({})",
+            vec!["?"; names.len()].join(", ")
+        );
+        let rows = c.query(&sql, &names.iter().map(|n| Value::str(&**n)).collect::<Vec<_>>(), None)?;
+        let own: Vec<String> = rows.iter().filter_map(|r| if let Value::Map(m) = r { m.get("name").map(|v| v.display().to_string()) } else { None }).collect();
+        let mut known = self.asked.fns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if known.len() >= 4096 {
+            known.clear();
+        }
+        for n in names {
+            known.insert(n.to_string(), own.iter().any(|o| o == &**n));
+        }
+        Ok(!own.is_empty())
+    }
+
+    /// The program made or dropped functions: what names are is looked up again.
+    pub fn forget_fns(&self) {
+        self.asked.fns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     }
 
     pub fn give_back(&self, c: Conn) {
@@ -190,7 +259,11 @@ impl Conn {
     }
 
     pub fn query(&mut self, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
-        let (sql, params) = translate(sql, params)?;
+        let (scan, mut params) = translate(sql, params)?;
+        let sql = scan.native().to_string();
+        self.fits(&sql, &params)?;
+        self.bars(&scan)?;
+        self.by_columns(&scan, &mut params)?;
         let c = self.conn();
         let r = run(async move {
             let mut result = c.exec_iter(sql, params).await?;
@@ -231,29 +304,185 @@ impl Conn {
         Err(crate::db::COMMITTED.to_string())
     }
 
+    /// Before SQL with `||`: the session reads it as text joined, as SQLite and PostgreSQL do,
+    /// where MariaDB read it as `or` (`'%' || ? || '%'` was 0 or 1; FEEDBACK55.md, after slice 5;
+    /// branch feedback55). PIPES_AS_CONCAT is added to the session's sql_mode, nothing else of
+    /// ANSI's, until the pool resets the connection: for such SQL only, as MariaDB sends every
+    /// row slower under it (300,000 rows, 20 ms more).
+    fn bars(&mut self, scan: &crate::sql::Scan) -> Result<(), String> {
+        if !scan.has_bars() || self.4 {
+            return Ok(());
+        }
+        let r = run(self.conn().query_drop("set session sql_mode = concat_ws(',', nullif(@@sql_mode, ''), 'PIPES_AS_CONCAT')"));
+        r.map_err(|e| self.failed(e))?;
+        self.4 = true;
+        Ok(())
+    }
+
+    /// Values whose column says what they are, as the others take them (FEEDBACK55.md; found
+    /// in review, branch feedback55): a `BIT`'s digits, as Quillo reads one (`00000101`), as its
+    /// number, where MySQL took the text's bytes (1406 Data too long) and compared none alike
+    /// (Q-741); a float a `FLOAT` would keep as 0 (1e-46), refused as out of its range, as
+    /// PostgreSQL's `real` refuses it (Q-734). Columns are known by the SQL beside the value
+    /// (`sql::Scan::column`) and asked of the server once a table, only for such values.
+    fn by_columns(&mut self, scan: &crate::sql::Scan, params: &mut Params) -> Result<(), String> {
+        let Params::Positional(values) = params else { return Ok(()) };
+        let want: Vec<(usize, String)> = values
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| match v {
+                My::Bytes(b) => !b.is_empty() && b.len() <= 64 && b.iter().all(|c| *c == b'0' || *c == b'1'),
+                My::Double(f) => *f != 0.0 && *f as f32 == 0.0,
+                _ => false,
+            })
+            .filter_map(|(i, _)| scan.column(scan.native_slot(i)).map(|c| (i, c.to_string())))
+            .collect();
+        if want.is_empty() {
+            return Ok(());
+        }
+        let tables: Vec<String> = scan.tables.reads.iter().chain(&scan.tables.writes).map(|t| t.to_lowercase()).collect();
+        let types = self.column_types(&tables);
+        for (i, col) in want {
+            let kinds: Vec<&str> = tables.iter().filter_map(|t| types.get(t)).flatten().filter(|(c, _)| *c == col).map(|(_, ty)| ty.as_str()).collect();
+            let only = |ty: &str| !kinds.is_empty() && kinds.iter().all(|k| *k == ty);
+            match &values[i] {
+                My::Bytes(b) if only("bit") => {
+                    let digits = std::str::from_utf8(b).unwrap_or("0");
+                    values[i] = My::UInt(u64::from_str_radix(digits, 2).unwrap_or(0));
+                }
+                My::Double(f) if only("float") => {
+                    return Err(format!("value {} is {:e}, out of range for the FLOAT column `{}`, which would keep it as 0", scan.native_slot(i), f, col));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The columns of these tables and their types, asked of the server once a table.
+    fn column_types(&mut self, tables: &[String]) -> HashMap<String, Vec<(String, String)>> {
+        let asked = self.3.clone();
+        let missing: Vec<String> = {
+            let known = asked.columns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            tables.iter().filter(|t| !known.contains_key(*t)).cloned().collect()
+        };
+        if !missing.is_empty() {
+            let sql = format!(
+                "select lower(table_name) as t, lower(column_name) as c, lower(data_type) as ty from information_schema.columns where table_schema = database() and lower(table_name) in ({})",
+                vec!["?"; missing.len()].join(", ")
+            );
+            let args = Params::Positional(missing.iter().map(|t| My::Bytes(t.as_bytes().to_vec())).collect());
+            let rows: Result<Vec<(String, String, String)>, _> = run(self.conn().exec(sql, args));
+            if let Ok(rows) = rows {
+                let mut known = asked.columns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if known.len() >= 4096 {
+                    known.clear();
+                }
+                for t in &missing {
+                    known.insert(t.clone(), rows.iter().filter(|(rt, _, _)| rt == t).map(|(_, c, ty)| (c.clone(), ty.clone())).collect());
+                }
+            }
+        }
+        let known = asked.columns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        tables.iter().filter_map(|t| known.get(t).map(|cols| (t.clone(), cols.clone()))).collect()
+    }
+
+    /// After SQL that may change a schema (`create`, `alter`, `drop`, `rename`), what columns
+    /// were asked is asked again.
+    fn changed(&self, scan: &crate::sql::Scan) {
+        if scan.heads().any(|(a, _)| ["create", "alter", "drop", "rename"].iter().any(|w| a.eq_ignore_ascii_case(w))) {
+            self.3.columns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        }
+    }
+
+    /// The server's `max_allowed_packet`: asked once a pool, when a statement is large enough
+    /// to need it.
+    fn packet_limit(&mut self) -> Result<usize, String> {
+        let known = self.3.packet.load(Relaxed);
+        if known > 0 {
+            return Ok(known);
+        }
+        let n: Option<usize> = run(self.conn().query_first("select @@max_allowed_packet")).map_err(|e| e.to_string())?;
+        let n = n.unwrap_or(usize::MAX);
+        self.3.packet.store(n, Relaxed);
+        Ok(n)
+    }
+
+    /// A statement whose text, or values, are more than the server takes in one packet
+    /// (`max_allowed_packet`), refused saying so: the driver sent it, and it failed as "Broken
+    /// pipe" or "Packets out of sync", in turn (FEEDBACK55.md, Q-751; branch feedback55). The
+    /// values go in one packet with the statement's id up to 16 MB, each in packets of its own
+    /// past that.
+    fn fits(&mut self, sql: &str, params: &Params) -> Result<(), String> {
+        let (mut total, mut largest) = (16, 0);
+        if let Params::Positional(v) = params {
+            for x in v {
+                let n = if let My::Bytes(b) = x { b.len() + 9 } else { 9 };
+                total += n;
+                largest = largest.max(n);
+            }
+        }
+        let need = sql.len().max(if total < mysql_async::consts::MAX_PAYLOAD_LEN { total } else { largest });
+        // Below the least a server can be set to.
+        if need < 1024 {
+            return Ok(());
+        }
+        let limit = self.packet_limit()?;
+        if need <= limit {
+            return Ok(());
+        }
+        Err(format!(
+            "this statement is {} bytes with its values, past the server's max_allowed_packet of {} bytes, the most MySQL and MariaDB take in one: raise max_allowed_packet on the server, or send less at once",
+            need, limit
+        ))
+    }
+
     /// `{ changes, last_id }`. Without parameters the text may hold several
-    /// statements.
+    /// statements. As the other databases count them (FEEDBACK55.md, Q-753; branch
+    /// feedback55): `changes` is the rows matched (`CLIENT_FOUND_ROWS`, Q-739), a row an
+    /// upsert or a `replace` took counted once, where MySQL counts an update or a replacement
+    /// twice; `last_id` the id of the one row the statement inserted, past 2^63 a `dec` (it was
+    /// negative; Q-740), and null for none or several (MySQL gave a multi-row insert's first,
+    /// and 0 for none).
     pub fn exec(&mut self, sql: &str, params: &[Value]) -> Result<Value, String> {
+        let scan = crate::sql::scan(crate::sql::Dialect::Mysql, sql);
+        self.bars(&scan)?;
         let r = if params.is_empty() {
+            self.fits(sql, &Params::Empty)?;
             run(self.conn().query_drop(sql))
         } else {
-            let (sql, params) = translate(sql, params)?;
+            let (scan, mut params) = translate(sql, params)?;
+            let sql = scan.native().to_string();
+            self.fits(&sql, &params)?;
+            self.by_columns(&scan, &mut params)?;
             run(self.conn().exec_drop(sql, params))
         };
         r.map_err(|e| self.failed(e))?;
+        self.changed(&scan);
         self.still_in_tx()?;
         let c = self.conn();
+        let raw = c.affected_rows();
+        let twice = scan.counts_twice();
+        let changes = if twice { records(&c.info()).unwrap_or(raw.min(1)) } else { raw };
+        let head = scan.heads().last().map(|(a, _)| a.to_ascii_lowercase()).unwrap_or_default();
+        // An upsert's update counts 2, and its insert 1.
+        let one = if twice && head == "insert" { raw == 1 } else { changes == 1 };
+        let id = c.last_insert_id().filter(|&n| n > 0 && one && (head == "insert" || head == "replace"));
         let mut m = Map::new();
-        m.insert("changes".into(), Value::Int(c.affected_rows() as i64));
-        m.insert("last_id".into(), Value::Int(c.last_insert_id().unwrap_or(0) as i64));
+        m.insert("changes".into(), Value::Int(changes as i64));
+        m.insert("last_id".into(), id.map_or(Value::Nil, unsigned));
         Ok(Value::map(m))
     }
 
     pub fn batch(&mut self, sql: &str) -> Result<(), String> {
+        let scan = crate::sql::scan(crate::sql::Dialect::Mysql, sql);
+        // A migration's `||` too (found in review).
+        self.bars(&scan)?;
         let r = run(self.conn().query_drop(sql));
+        self.changed(&scan);
         // Quillo's own `begin`, `commit`, `rollback` (the program's are refused); and a
         // migration's schema, which commits as it runs there, so not in a transaction after.
-        let after = crate::sql::in_tx_after(&crate::sql::scan(crate::sql::Dialect::Mysql, sql), self.2);
+        let after = crate::sql::in_tx_after(&scan, self.2);
         let server = self.conn().last_ok_packet().map_or(true, |ok| ok.status_flags().contains(mysql_async::consts::StatusFlags::SERVER_STATUS_IN_TRANS));
         self.2 = if r.is_ok() { after && server } else { self.2 && after };
         r.map_err(|e| self.failed(e))
@@ -291,25 +520,52 @@ fn to_my(v: &Value) -> Result<My, String> {
         Value::Nil => My::NULL,
         Value::Bool(b) => My::Int(*b as i64),
         Value::Int(n) => My::Int(*n),
-        Value::Float(f) => My::Double(*f),
-        // As text, which MySQL converts to a DECIMAL exactly.
+        // -0.0 as 0.0, on every database (FEEDBACK55.md, Q-735; branch feedback55).
+        Value::Float(f) => My::Double(*f + 0.0),
+        // A whole one as an integer, which MySQL compares as one: as text, an unsigned id past
+        // 2^63 was compared as a float, and matched its neighbours' rows (FEEDBACK55.md, Q-756;
+        // branch feedback55). Else as text, which MySQL converts to a DECIMAL exactly.
+        Value::Dec(d) if d.scale() == 0 && i64::try_from(d.mantissa()).is_ok() => My::Int(d.mantissa() as i64),
+        Value::Dec(d) if d.scale() == 0 && u64::try_from(d.mantissa()).is_ok() => My::UInt(d.mantissa() as u64),
         Value::Dec(d) => My::Bytes(d.to_string().into_bytes()),
         Value::Str(s) => My::Bytes(s.as_bytes().to_vec()),
         Value::Html(h) => My::Bytes(h.as_bytes().to_vec()),
-        Value::List(_) | Value::Map(_) => My::Bytes(v.json_text().into_bytes()),
+        Value::List(_) | Value::Map(_) => My::Bytes(crate::db::json_text(v).into_bytes()),
         other => return Err(format!("a {} cannot be stored in the database", other.type_name())),
     })
+}
+
+/// The rows a statement took, from the server's note on one of several rows ("Records: 3
+/// Duplicates: 1 Warnings: 0").
+fn records(info: &str) -> Option<u64> {
+    info.strip_prefix("Records: ")?.split_whitespace().next()?.parse().ok()
+}
+
+/// An unsigned integer: an int, or past 2^63 a `dec`, where it was a float (2^64 - 1 and
+/// 2^64 - 2 read equal, and matched each other's rows) or a negative int (FEEDBACK55.md,
+/// Q-740, Q-756; branch feedback55).
+fn unsigned(n: u64) -> Value {
+    i64::try_from(n).map(Value::Int).unwrap_or_else(|_| Value::Dec(crate::decimal::Dec::new(n as i128, 0).expect("a u64 fits a dec")))
 }
 
 fn from_my(v: My, col: &mysql_async::Column) -> Value {
     let ty = col.column_type();
     match v {
         My::NULL => Value::Nil,
-        My::Int(n) if ty == ColumnType::MYSQL_TYPE_TINY && col.column_length() == 1 => Value::Bool(n != 0),
+        // `tinyint(1)` is MySQL's boolean, but holds any byte: 2 or -1 read `true` (FEEDBACK55.md,
+        // Q-756; branch feedback55).
+        My::Int(n @ (0 | 1)) if ty == ColumnType::MYSQL_TYPE_TINY && col.column_length() == 1 => Value::Bool(n == 1),
         My::Int(n) => Value::Int(n),
-        My::UInt(n) => i64::try_from(n).map(Value::Int).unwrap_or(Value::Float(n as f64)),
-        My::Float(f) => Value::Float(f as f64),
-        My::Double(f) => Value::Float(f),
+        My::UInt(n) => unsigned(n),
+        // -0 as 0.0, as every database is given (FEEDBACK55.md, Q-735; branch feedback55).
+        My::Float(f) => Value::Float(crate::pg::f32_wide(f) + 0.0),
+        My::Double(f) => Value::Float(f + 0.0),
+        // A `BIT(n)` as PostgreSQL gives `bit(n)`: its n digits, "00000101", where its bytes were
+        // passed off as text (FEEDBACK55.md, Q-741; branch feedback55).
+        My::Bytes(b) if ty == ColumnType::MYSQL_TYPE_BIT && !b.is_empty() => {
+            let n = (col.column_length() as usize).clamp(1, b.len() * 8);
+            Value::str(b.iter().flat_map(|x| (0..8).rev().map(move |i| if x >> i & 1 == 1 { '1' } else { '0' })).skip(b.len() * 8 - n).collect::<String>())
+        }
         My::Bytes(b) => {
             let text = String::from_utf8_lossy(&b);
             match ty {
@@ -319,9 +575,8 @@ fn from_my(v: My, col: &mysql_async::Column) -> Value {
                     Ok(n) => Value::Int(n),
                     Err(_) => crate::decimal::Dec::parse(&text).map_or_else(|| Value::str(&*text), Value::Dec),
                 },
-                ColumnType::MYSQL_TYPE_JSON => {
-                    serde_json::from_str::<serde_json::Value>(&text).map(|j| Value::from_json(&j)).unwrap_or_else(|_| Value::str(text))
-                }
+                // Read as PostgreSQL's json is (FEEDBACK55.md, Q-732; branch feedback55).
+                ColumnType::MYSQL_TYPE_JSON => crate::pg::json_cell(&b),
                 _ => Value::str(text),
             }
         }
@@ -351,10 +606,10 @@ fn from_my(v: My, col: &mysql_async::Column) -> Value {
 /// comments skipped. One map is the values by name only where the SQL names them, so a map or
 /// a record is the value of a lone `?` as on the others (FEEDBACK55.md, Q-748; branch
 /// feedback55). Read once for each text.
-fn translate(sql: &str, params: &[Value]) -> Result<(String, Params), String> {
+fn translate(sql: &str, params: &[Value]) -> Result<(Arc<crate::sql::Scan>, Params), String> {
     let scan = crate::sql::scan(crate::sql::Dialect::Mysql, sql);
     let values = scan.values(params)?.iter().map(to_my).collect::<Result<Vec<_>, _>>()?;
-    Ok((scan.native().to_string(), if values.is_empty() { Params::Empty } else { Params::Positional(values) }))
+    Ok((scan, if values.is_empty() { Params::Empty } else { Params::Positional(values) }))
 }
 
 #[cfg(test)]
@@ -394,16 +649,39 @@ mod tests {
         assert!(opts_of("mysql://u@db.example.com/app?verify_ca=no").is_err());
     }
 
+    // FEEDBACK55.md, Q-739, Q-740, Q-756.
+    #[test]
+    fn what_the_driver_is_told_and_counts() {
+        // An IPv6 host without its brackets; rows matched unless the URL says otherwise.
+        let o = opts_of("mysql://root@[::1]:3306/app").unwrap();
+        assert_eq!((o.ip_or_hostname(), o.client_found_rows()), ("::1", true));
+        assert_eq!(opts_of("mysql://root@[fe80::1]/app?require_ssl=false").unwrap().ip_or_hostname(), "fe80::1");
+        assert_eq!(opts_of("mysql://root@db.internal/app?client_found_rows=false&require_ssl=false").unwrap().client_found_rows(), false);
+        assert_eq!(opts_of("mysql://root@127.0.0.1/app").unwrap().ip_or_hostname(), "127.0.0.1");
+        assert_eq!(records("Records: 3  Duplicates: 1  Warnings: 0"), Some(3));
+        assert_eq!(records("Rows matched: 1  Changed: 0  Warnings: 0"), None);
+        assert_eq!(records(""), None);
+        assert_eq!(unsigned(9_223_372_036_854_775_807).repr(), "9223372036854775807");
+        assert_eq!(unsigned(9_223_372_036_854_775_808).repr(), "9223372036854775808m");
+        assert_eq!(unsigned(u64::MAX).repr(), "18446744073709551615m");
+        let dec = |t: &str| to_my(&Value::Dec(crate::decimal::Dec::parse(t).unwrap())).unwrap();
+        assert_eq!(dec("9223372036854775808"), My::UInt(9_223_372_036_854_775_808));
+        assert_eq!(dec("-5"), My::Int(-5));
+        assert_eq!(dec("2.50"), My::Bytes(b"2.50".to_vec()));
+        assert_eq!(dec("18446744073709551616"), My::Bytes(b"18446744073709551616".to_vec()));
+        assert_eq!(to_my(&Value::Float(-0.0)).unwrap(), My::Double(0.0));
+    }
+
     #[test]
     fn placeholders() {
         let mut m = Map::new();
         m.insert("id".into(), Value::Int(1));
         m.insert("name".into(), Value::str("x"));
-        let (sql, p) = translate("select :id, ':no', `:no`, :name -- :no\n, :id", &[Value::map(m)]).unwrap();
-        assert_eq!(sql, "select ?, ':no', `:no`, ? -- :no\n, ?");
+        let (scan, p) = translate("select :id, ':no', `:no`, :name -- :no\n, :id", &[Value::map(m)]).unwrap();
+        assert_eq!(scan.native(), "select ?, ':no', `:no`, ? -- :no\n, ?");
         assert!(matches!(p, Params::Positional(v) if v.len() == 3));
-        let (sql, _) = translate("select ? + ?", &[Value::Int(1), Value::Int(2)]).unwrap();
-        assert_eq!(sql, "select ? + ?");
+        let (scan, _) = translate("select ? + ?", &[Value::Int(1), Value::Int(2)]).unwrap();
+        assert_eq!(scan.native(), "select ? + ?");
         // Every name needs a value; keys the query does not use are ignored.
         let mut m = Map::new();
         m.insert("a".into(), Value::Int(1));

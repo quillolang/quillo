@@ -41,7 +41,8 @@ fn a_database_the_server_will_not_make_says_why() {
     let d = support::temp_dir("myfail-name");
     let mut it = load(&d, "");
     let name = "n".repeat(70);
-    says(eval(&mut it, &format!("db.open(\"{}\")", m.url(&name))), "Incorrect database name");
+    // Not made by `db.open` (FEEDBACK55.md, Q-736): the server says why it cannot open it.
+    says(eval(&mut it, &format!("db.open(\"{}\")", m.url_of(&name))), "Incorrect database name");
 }
 
 #[test]
