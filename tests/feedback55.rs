@@ -1277,6 +1277,22 @@ fn a_file_is_read_and_sent_as_it_was_looked_at() {
     }
     // `file`, named on purpose, sends what is there.
     assert!(send((f.clone(), 0, 6, None)).ends_with("SQLite"));
+    // A HEAD is judged too, by the file's first bytes (FEEDBACK55.md, Q-702; branch feedback55).
+    let head = |what: (std::path::PathBuf, u64, u64, Option<statics::Hosted>)| {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_secs(30))).unwrap();
+        let (server, _) = l.accept().unwrap();
+        statics::send(server, &quillo::server::plain(200, ""), what, true);
+        let mut out = String::new();
+        client.read_to_string(&mut out).unwrap();
+        out
+    };
+    let out = head((f.clone(), 0, 20, Some(hosted.clone())));
+    assert!(out.starts_with("HTTP/1.1 404") && !out.contains("SQLite"), "{}", out);
+    std::fs::remove_file(&f).unwrap();
+    std::fs::write(&f, "plain again").unwrap();
+    assert!(head((f.clone(), 0, 11, Some(hosted.clone()))).starts_with("HTTP/1.1 200"));
 }
 
 // Q-701: a link into a build tool's output inside the folder served is followed, as before: pnpm's
@@ -3394,33 +3410,76 @@ fn a_large_files_judgement_holds_until_it_changes() {
 }
 
 // Q-701: a file changed so lately that a write in the same tick of its clock would not be seen is
-// not kept in memory: within 10 ms of a change where times have nanoseconds, two seconds where they
-// are whole seconds (git's rule for a racily clean file).
+// not kept in memory: within 50 ms of a change where times have nanoseconds, two seconds where they
+// are whole seconds (git's rule for a racily clean file), judged by ctime on unix, which no
+// program sets; a time ahead of now by more than that is the clock's, and the file is kept: one
+// unpacked with an mtime in 2030 is served from memory as another.
 #[cfg(unix)]
 #[test]
 fn a_file_changed_this_moment_is_not_kept() {
-    use quillo::statics;
+    use quillo::statics::{self, racy_time};
+    use std::time::{Duration, UNIX_EPOCH};
+    let now = UNIX_EPOCH + Duration::new(1_800_000_000, 500_000_000);
+    let ms = |n: u64| Duration::from_millis(n);
+    // Nanoseconds: 50 ms either side.
+    for (t, want) in [(now, true), (now - ms(49), true), (now - ms(50), false), (now - ms(51), false), (now - ms(3600_000), false), (now + ms(49), true), (now + ms(51), false), (now + ms(3600_000), false)] {
+        assert_eq!(racy_time(t, now), want, "{:?}", t);
+    }
+    // Whole seconds: two seconds either side.
+    let second = |n: u64| UNIX_EPOCH + Duration::from_secs(n);
+    for (t, want) in [(second(1_800_000_000), true), (second(1_799_999_999), true), (second(1_799_999_998), false), (second(1_800_000_002), true), (second(1_800_000_003), false), (second(0), false)] {
+        assert_eq!(racy_time(t, now), want, "{:?}", t);
+    }
+    // A file with its mtime in 2030, not changed since by ctime: kept, so read again from memory
+    // after it is gone.
     let d = support::temp_dir("feedback55-racy");
-    let f = d.join("a.txt");
-    std::fs::write(&f, "a").unwrap();
-    assert!(statics::racy(&std::fs::metadata(&f).unwrap()));
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    assert!(!statics::racy(&std::fs::metadata(&f).unwrap()));
-    // Whole seconds: a second ago is too close; an hour ago is not.
-    let whole = |ago: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - ago);
-    std::fs::File::options().write(true).open(&f).unwrap().set_modified(whole(1)).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    assert!(statics::racy(&std::fs::metadata(&f).unwrap()));
-    std::fs::File::options().write(true).open(&f).unwrap().set_modified(whole(3600)).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    assert!(!statics::racy(&std::fs::metadata(&f).unwrap()));
-    // Served all the same, and from the disk until it is kept.
-    let s = support::temp_dir("feedback55-racy-app");
-    std::fs::create_dir_all(s.join("public")).unwrap();
-    std::fs::write(s.join("main.qwe"), "route GET /s/*p = files(\"public\", p)\n").unwrap();
-    let server = support::serve(&s.join("main.qwe"), &[]);
-    std::fs::write(s.join("public/new.txt"), "fresh").unwrap();
-    assert_eq!(support::send(server.port, "GET", "/s/new.txt", &[], "").body, "fresh");
+    let f = d.join("future.txt");
+    std::fs::write(&f, "from the future").unwrap();
+    std::fs::File::options().write(true).open(&f).unwrap().set_modified(second(1_893_456_000)).unwrap();
+    std::thread::sleep(ms(120));
+    assert!(!statics::racy(&std::fs::metadata(&f).unwrap(), std::time::SystemTime::now()));
+    let info = statics::info(&f).unwrap();
+    assert_eq!(&*statics::read(&f, &info).unwrap(), b"from the future");
+    std::fs::remove_file(&f).unwrap();
+    assert_eq!(&*statics::read(&f, &info).unwrap(), b"from the future");
+    // Just written: not kept, so gone with the file.
+    let g = d.join("fresh.txt");
+    std::fs::write(&g, "fresh").unwrap();
+    let info = statics::info(&g).unwrap();
+    assert_eq!(&*statics::read(&g, &info).unwrap(), b"fresh");
+    if statics::racy(&std::fs::metadata(&g).unwrap(), std::time::SystemTime::now()) {
+        std::fs::remove_file(&g).unwrap();
+        assert!(statics::read(&g, &info).is_err());
+    }
+}
+
+// Q-701: files of 64 KiB to 1 MiB read side by side are read a few at a time off the lock, each
+// as it is; and inside a SQLite transaction, where a request cannot wait elsewhere, on its own
+// thread.
+#[test]
+fn files_read_side_by_side_and_in_a_transaction() {
+    let d = dir("side-by-side", "db.open(\"app.db\")\nroute GET /s/*p = files(\"public\", p)\nroute GET /t/*p = db.transaction(() => files(\"public\", p))\n");
+    std::fs::create_dir_all(d.join("public")).unwrap();
+    for i in 0..48 {
+        std::fs::write(d.join(format!("public/f{}.bin", i)), vec![b'a' + (i % 26) as u8; (100 << 10) + i * 1000]).unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let port = s.port;
+    let threads: Vec<_> = (0..48)
+        .map(|i| {
+            std::thread::spawn(move || {
+                let a = support::send(port, "GET", &format!("/s/f{}.bin", i), &[], "");
+                (a.status, a.body.len(), a.body.bytes().all(|b| b == b'a' + (i % 26) as u8))
+            })
+        })
+        .collect();
+    for (i, t) in threads.into_iter().enumerate() {
+        assert_eq!(t.join().unwrap(), (200, (100 << 10) + i * 1000, true), "f{}", i);
+    }
+    let a = support::send(port, "GET", "/t/f7.bin", &[], "");
+    assert_eq!((a.status, a.body.len()), (200, (100 << 10) + 7000));
+    assert_eq!(support::send(port, "GET", "/t/f8.bin", &[("Range", "bytes=0-9")], "").body, "iiiiiiiiii");
 }
 
 // Q-701: the paths `--env-file` and `--tls-key` name are not written, nor deleted, while nothing is

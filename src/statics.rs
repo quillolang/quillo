@@ -174,52 +174,43 @@ pub fn replaced(id: Option<FileId>, etag: &str, full: &Path, m: &std::fs::Metada
     }
 }
 
-/// Whether a file `m` changed so lately that a write in the same tick of its clock would not be
-/// seen (ctime is kept in ticks of about 4 ms on Linux before 6.13, whole seconds on some file
-/// systems): no copy of it is kept, as git does not trust such a file (FEEDBACK55.md, Q-701;
-/// branch feedback55).
-pub fn racy(m: &std::fs::Metadata) -> bool {
-    let now = std::time::SystemTime::now();
-    let near = |t: std::time::SystemTime| {
-        let coarse = t.duration_since(UNIX_EPOCH).is_ok_and(|d| d.subsec_nanos() == 0);
-        let window = if coarse { Duration::from_secs(2) } else { Duration::from_millis(10) };
-        now.duration_since(t).map_or(true, |ago| ago < window)
-    };
+/// Whether a file `m`, read from `now` (the time before the read), changed so lately that a write
+/// in the same tick of its clock would not be seen (ctime is kept in ticks of about 4 ms on Linux
+/// before 6.13, 10 ms on a kernel of 100 Hz, whole seconds on some file systems): no copy of it is
+/// kept, as git does not trust such a file. By ctime on unix, which the kernel sets from its own
+/// clock; elsewhere by mtime, which a program may set, as an archive unpacked or `rsync -t` from
+/// a clock ahead does (FEEDBACK55.md, Q-701; branch feedback55).
+pub fn racy(m: &std::fs::Metadata, now: std::time::SystemTime) -> bool {
     #[cfg(unix)]
-    let changed = {
+    {
         use std::os::unix::fs::MetadataExt;
-        UNIX_EPOCH.checked_add(Duration::new(m.ctime().max(0) as u64, m.ctime_nsec().clamp(0, 999_999_999) as u32))
-    };
+        UNIX_EPOCH.checked_add(Duration::new(m.ctime().max(0) as u64, m.ctime_nsec().clamp(0, 999_999_999) as u32)).is_none_or(|t| racy_time(t, now))
+    }
     #[cfg(not(unix))]
-    let changed: Option<std::time::SystemTime> = None;
-    m.modified().map_or(true, near) || changed.is_some_and(near)
-}
-
-/// At most so many files are read whole into memory at once, off the interpreter's lock: each
-/// holds as much as the file, up to a MiB, and 256 at once held 1.4 GB (FEEDBACK55.md, Q-701;
-/// branch feedback55).
-pub struct ReadPlace;
-
-static READING: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
-
-impl ReadPlace {
-    pub fn take() -> ReadPlace {
-        static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let most = *MOST.get_or_init(|| std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 8));
-        let mut n = lock(&READING.0);
-        while *n >= most {
-            n = READING.1.wait(n).unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        *n += 1;
-        ReadPlace
+    {
+        m.modified().map_or(true, |t| racy_time(t, now))
     }
 }
 
-impl Drop for ReadPlace {
-    fn drop(&mut self) {
-        *lock(&READING.0) -= 1;
-        READING.1.notify_one();
+/// Whether a change at `t` is too near `now` to trust a copy read then: within 50 ms of it, or two
+/// seconds where the time has whole seconds only; one ahead of now by more than that is the
+/// clock's, not a change during the read (FEEDBACK55.md, Q-701; branch feedback55).
+pub fn racy_time(t: std::time::SystemTime, now: std::time::SystemTime) -> bool {
+    let coarse = t.duration_since(UNIX_EPOCH).is_ok_and(|d| d.subsec_nanos() == 0);
+    let window = if coarse { Duration::from_secs(2) } else { Duration::from_millis(50) };
+    match now.duration_since(t) {
+        Ok(ago) => ago < window,
+        Err(ahead) => ahead.duration() < window,
     }
+}
+
+/// At most so many files are read whole into memory at once off the interpreter's lock, each
+/// holding as much as the file, up to a MiB (256 at once held 1.4 GB); waited for without a thread,
+/// so the threads that wait for databases and fetches are not taken by reads waiting their turn.
+/// Reads on the request's own thread take none (FEEDBACK55.md, Q-701; branch feedback55).
+pub fn read_places() -> &'static tokio::sync::Semaphore {
+    static PLACES: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    PLACES.get_or_init(|| tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 8)))
 }
 
 /// Memory for a file of `len` bytes, read into by `read_into`: made on the thread that asks, the
@@ -363,6 +354,7 @@ pub fn read(full: &Path, info: &Info) -> std::io::Result<Arc<[u8]>> {
             return Ok(b);
         }
     }
+    let now = std::time::SystemTime::now();
     let (f, m) = open_regular(full)?;
     // Saved anew (another file in its place): looked at again. Written to in place: what is
     // there, as many bytes as were looked at, kept only as the file was, and not changed so lately
@@ -370,13 +362,8 @@ pub fn read(full: &Path, info: &Info) -> std::io::Result<Arc<[u8]>> {
     if replaced(info.id, &info.etag, full, &m) {
         return Err(changed());
     }
-    let b = if info.len <= SMALL {
-        let _place = ReadPlace::take();
-        read_whole(&f, info.len)?
-    } else {
-        Arc::from(read_at(&f, 0, info.len)?)
-    };
-    if info.len <= SMALL && b.len() as u64 == info.len && f.metadata().is_ok_and(|m| same(info, full, &m) && !racy(&m)) {
+    let b = if info.len <= SMALL { read_whole(&f, info.len)? } else { Arc::from(read_at(&f, 0, info.len)?) };
+    if info.len <= SMALL && b.len() as u64 == info.len && f.metadata().is_ok_and(|m| same(info, full, &m) && !racy(&m, now)) {
         put(&mut lock(&FILES), FILES_BUDGET, key, b.clone());
     }
     Ok(b)
@@ -619,8 +606,10 @@ pub fn send(mut stream: std::net::TcpStream, resp: &crate::server::HttpResponse,
         crate::httpd::write_response(out, &crate::server::plain_response(404, "not found\n"), head, true);
         let _ = stream.write_all(out);
     };
+    // A HEAD, or a part from further in, by the file's own first bytes (FEEDBACK55.md, Q-702;
+    // branch feedback55).
     if let (Ok((f, _)), Some(_)) = (&opened, &hosted) {
-        if !head && start > 0 && crate::builtins::sqlite_head(f) {
+        if (head || start > 0) && crate::builtins::sqlite_head(f) {
             return not_found(&mut stream, &mut out);
         }
     }
@@ -645,7 +634,9 @@ pub fn send(mut stream: std::net::TcpStream, resp: &crate::server::HttpResponse,
             return not_found(&mut stream, &mut out);
         }
     }
-    let first = first.min(len as usize);
+    // In u64: a length of 4 GiB or more is no `usize` on 32 bits (FEEDBACK55.md, Q-701; branch
+    // feedback55).
+    let first = if first as u64 > len { len as usize } else { first };
     crate::httpd::write_head(&mut out, &resp, len, true);
     if stream.write_all(&out).is_err() || head {
         return;

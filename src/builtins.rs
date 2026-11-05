@@ -1149,6 +1149,7 @@ fn file_once(it: &mut Interp, args: &[Value], line: u32, hosted: Option<&Path>, 
             if copy.is_none() {
                 let (h, at, looked, buf) = (h.clone(), full.clone(), info.clone(), crate::statics::buffer(info.len));
                 let job = move || -> Result<Arc<[u8]>, Judged> {
+                    let now = std::time::SystemTime::now();
                     let (f, m) = open_hosted(&h.served, &h.program, &at)?;
                     // Another file in its place: looked at again; the same, written to: what is
                     // there, as many bytes as were looked at, kept only as it was then, and not
@@ -1162,22 +1163,29 @@ fn file_once(it: &mut Interp, args: &[Value], line: u32, hosted: Option<&Path>, 
                     if crate::db::sqlite_bytes(&b) {
                         return Err(Judged::Refused);
                     }
-                    if b.len() as u64 == looked.len && f.metadata().is_ok_and(|m| crate::statics::same(&looked, &at, &m) && !crate::statics::racy(&m)) {
+                    if b.len() as u64 == looked.len && f.metadata().is_ok_and(|m| crate::statics::same(&looked, &at, &m) && !crate::statics::racy(&m, now)) {
                         crate::statics::keep_judged(&at, &looked, b.clone());
                     }
                     Ok(b)
                 };
                 // Read once into its copy, made on this thread (`statics::buffer`). One of up to
                 // 64 KiB here, where the read costs less than handing it to another thread
-                // (30 µs against 68 a file); a larger one off the lock, a few at a time
-                // (FEEDBACK55.md, Q-701; branch feedback55).
-                let read = if info.len <= 64 << 10 {
+                // (30 µs against 68 a file), as is any where the request cannot wait elsewhere (in
+                // a SQLite transaction); a larger one off the lock, a few at a time: its place
+                // waited for on the async runtime, with no thread held, then read on one of its
+                // threads for blocking work (FEEDBACK55.md, Q-701; branch feedback55).
+                let read = if info.len <= 64 << 10 || !crate::httpd::in_task() || crate::httpd::held() {
                     job()
                 } else {
-                    it.unlocked(move || {
-                        let _place = crate::statics::ReadPlace::take();
-                        job()
-                    })
+                    let waited = crate::httpd::await_elsewhere(Box::pin(async move {
+                        let _place = crate::statics::read_places().acquire().await;
+                        tokio::task::spawn_blocking(job).await
+                    }));
+                    match waited {
+                        Some(Ok(Ok(r))) => r,
+                        Some(Ok(Err(e))) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                        _ => Err(Judged::Refused),
+                    }
                 };
                 match read {
                     Ok(b) => copy = Some(b),
@@ -1197,19 +1205,19 @@ fn file_once(it: &mut Interp, args: &[Value], line: u32, hosted: Option<&Path>, 
             return Some(true);
         }
         let (at, looked) = (full.clone(), info.clone());
-        it.unlocked(move || match open_hosted(&h.served, &h.program, &at) {
-            Ok((_, m)) if crate::statics::replaced(h.id, &h.etag, &at, &m) => Some(false),
-            Ok((f, m)) => {
+        it.unlocked(move || match (std::time::SystemTime::now(), open_hosted(&h.served, &h.program, &at)) {
+            (_, Ok((_, m))) if crate::statics::replaced(h.id, &h.etag, &at, &m) => Some(false),
+            (now, Ok((f, m))) => {
                 if sqlite_head(&f) {
                     return None;
                 }
-                if crate::statics::same(&looked, &at, &m) && !crate::statics::racy(&m) {
+                if crate::statics::same(&looked, &at, &m) && !crate::statics::racy(&m, now) {
                     crate::statics::keep_judged_large(&at, &looked);
                 }
                 Some(true)
             }
-            Err(Judged::Replaced) => Some(false),
-            Err(Judged::Refused) => None,
+            (_, Err(Judged::Replaced)) => Some(false),
+            (_, Err(Judged::Refused)) => None,
         })
     };
     // Options it does not know are refused, naming those it does, as a mistyped `cache` would

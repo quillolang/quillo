@@ -391,7 +391,7 @@ fn only_files_are_files() {
     std::fs::write(&small, "small").unwrap();
     // Not changed in the last moment, where a write could hide in its clock's tick and no copy
     // is kept (FEEDBACK55.md, Q-701; branch feedback55).
-    std::thread::sleep(std::time::Duration::from_millis(30));
+    std::thread::sleep(std::time::Duration::from_millis(120));
     let i = statics::info(&small).unwrap();
     assert_eq!(&*statics::read(&small, &i).unwrap(), b"small");
     // From memory: the file need not be there any more.
