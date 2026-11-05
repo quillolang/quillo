@@ -263,8 +263,15 @@ pub fn serve_with(file: &Path, opts: &[&str]) -> Server {
 }
 
 fn serve_opts(file: &Path, env: &[(&str, &str)], opts: &[&str]) -> Server {
-    let port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+    // The system picks the port (`--port 0`) and the server says which: a port picked here and
+    // bound there could be taken in between by another process on a loaded machine, and then a
+    // test's requests went to another test's server (FEEDBACK55.md, found running its slices;
+    // branch feedback55). A test that names its own port or socket keeps it.
+    // Under --split the services' own lines come first: those tests pick the port here as before.
+    let own = opts.iter().any(|o| *o == "--port" || o.starts_with("--port=") || *o == "--listen" || o.starts_with("--listen=") || *o == "--split");
+    let port = if own { free_port() } else { 0 };
+    let log = std::env::var("QUILLO_TEST_LOG").is_ok();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(file)
         .args(["--port", &port.to_string(), "--workers", "8"])
@@ -273,18 +280,54 @@ fn serve_opts(file: &Path, env: &[(&str, &str)], opts: &[&str]) -> Server {
         .env("QUILLO_SECRET", "test secret for the tests")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(if std::env::var("QUILLO_TEST_LOG").is_ok() { Stdio::inherit() } else { Stdio::null() })
+        .stderr(if own { if log { Stdio::inherit() } else { Stdio::null() } } else { Stdio::piped() })
         .spawn()
         .expect("cannot start quillo");
     stop_with_tests(&child);
-    let mut s = Server { child, port };
     let deadline = Instant::now() + Duration::from_secs(20);
-    while !listening(port) {
+    if own {
+        let mut s = Server { child, port };
+        while !listening(port) {
+            if let Ok(Some(status)) = s.child.try_wait() {
+                panic!("quillo run {} stopped: {}", file.display(), status);
+            }
+            assert!(Instant::now() < deadline, "server did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        return s;
+    }
+    // Read the server's lines to the end, so its pipe never fills: the port from its first
+    // "listening on", the rest shown under QUILLO_TEST_LOG.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let err = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+            if log {
+                eprintln!("{}", line);
+            }
+            if let Some(url) = line.split("listening on ").nth(1) {
+                let hostport = url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("");
+                if let Some(p) = hostport.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
+                    let _ = tx.send(p);
+                }
+            }
+        }
+    });
+    let mut s = Server { child, port: 0 };
+    loop {
+        if let Ok(p) = rx.recv_timeout(Duration::from_millis(20)) {
+            s.port = p;
+            break;
+        }
         if let Ok(Some(status)) = s.child.try_wait() {
             panic!("quillo run {} stopped: {}", file.display(), status);
         }
         assert!(Instant::now() < deadline, "server did not start");
-        std::thread::sleep(Duration::from_millis(20));
+    }
+    while !listening(s.port) {
+        assert!(Instant::now() < deadline, "server did not start");
+        std::thread::sleep(Duration::from_millis(5));
     }
     s
 }
