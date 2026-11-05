@@ -1089,13 +1089,15 @@ fn not_found() -> Value {
 /// change with their content. Paths containing `..` or starting at `/` are
 /// refused with a 404.
 fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    file_as(it, args, line, false)
+    file_as(it, args, line, false, false)
 }
 
 /// `file`; `hosted` for `files`, which serves none of the program's own files under another name
 /// and no SQLite database (see `kept_from_host`; FEEDBACK55.md, Q-701 and Q-702; branch
+/// feedback55). `whole` for the page of a miss, which is no copy the browser holds or a part of,
+/// so the request's conditionals and range are not applied to it (FEEDBACK55.md, Q-722; branch
 /// feedback55).
-fn file_as(it: &mut Interp, args: Vec<Value>, line: u32, hosted: bool) -> R {
+fn file_as(it: &mut Interp, args: Vec<Value>, line: u32, hosted: bool, whole: bool) -> R {
     let p = s_arg(&args, 0, "file", line)?;
     let rel = Path::new(&*p);
     if rel.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
@@ -1124,7 +1126,9 @@ fn file_as(it: &mut Interp, args: Vec<Value>, line: u32, hosted: bool) -> R {
             match (&**k, v) {
                 ("cache", _) => {}
                 ("download", Value::Str(n)) if !n.is_empty() => download = Some(n.clone()),
-                ("type", Value::Str(t)) if !t.is_empty() && !t.contains(['\r', '\n']) => given_type = Some(t.clone()),
+                // What is wrong with a str, said (FEEDBACK55.md, Q-726; branch feedback55).
+                ("download", Value::Str(_)) => return fail(line, "`file`'s download is empty: give the name a browser saves the file as, or leave it out"),
+                ("type", Value::Str(t)) => given_type = Some(content_type(t, "file", line)?),
                 ("download" | "type", Value::Nil) => {}
                 ("download" | "type", other) => return fail(line, format!("`file`'s {} is a str, got {}", k, other.repr())),
                 (k, _) => return fail(line, format!("`file` has no option `{}`: it takes `cache`, `download` and `type`", k)),
@@ -1156,6 +1160,9 @@ fn file_as(it: &mut Interp, args: Vec<Value>, line: u32, hosted: bool) -> R {
     };
     // What the browser already has, or wants a part of.
     let asked = |name: &str, it: &mut Interp| -> Option<String> {
+        if whole {
+            return None;
+        }
         let Some(Value::Map(req)) = it.request_value() else { return None };
         let Some(Value::Map(h)) = req.get("headers") else { return None };
         h.get(name).map(|v| v.display())
@@ -1171,6 +1178,12 @@ fn file_as(it: &mut Interp, args: Vec<Value>, line: u32, hosted: bool) -> R {
     // when the file is not the one meant; then `If-None-Match`, else `If-Modified-Since`, give a
     // 304 for a file not changed since the date given, a later one or one in another of HTTP's
     // forms too (FEEDBACK36.md, Q-441; branch feedback36-39).
+    // `If-Match` and `If-Range` take the file's own tag with or without its `W/`, as nginx does:
+    // every file's tag is weak, as its gzipped copy is the same content, and a part or a check
+    // before a write is of its bytes as they are, so a strong comparison would have every resume
+    // and seek fetch the whole file again (FEEDBACK55.md, Q-723; branch feedback55). A matching
+    // `If-None-Match` is a 412 for a method that is not GET or HEAD, which `If-Modified-Since`
+    // does not apply to (RFC 9110 §13.1.2 and §13.1.3; FEEDBACK55.md, Q-723; branch feedback55).
     let since = |v: Option<String>| v.and_then(|v| crate::dates::http_seconds(&v));
     let changed = match asked("if-match", it) {
         Some(v) => !crate::statics::matches(&v, &info.etag),
@@ -1179,12 +1192,17 @@ fn file_as(it: &mut Interp, args: Vec<Value>, line: u32, hosted: bool) -> R {
     if changed {
         return answer(412, headers, Vec::new());
     }
+    let reads = match it.request_value() {
+        Some(Value::Map(req)) => req.get("method").map_or(true, |m| matches!(m, Value::Str(m) if &**m == "GET" || &**m == "HEAD")),
+        _ => true,
+    };
     let fresh = match asked("if-none-match", it) {
         Some(v) => crate::statics::matches(&v, &info.etag),
-        None => since(asked("if-modified-since", it)).is_some_and(|t| info.modified <= t),
+        None if reads => since(asked("if-modified-since", it)).is_some_and(|t| info.modified <= t),
+        None => false,
     };
     if fresh {
-        return answer(304, headers, Vec::new());
+        return answer(if reads { 304 } else { 412 }, headers, Vec::new());
     }
     headers.push(("content-type".into(), given_type.map_or_else(|| mime(&full).to_string(), |t| t.to_string())));
     headers.push(("accept-ranges".into(), "bytes".into()));
@@ -1194,9 +1212,13 @@ fn file_as(it: &mut Interp, args: Vec<Value>, line: u32, hosted: bool) -> R {
     // Larger files are sent from disk as they are written (see `statics`).
     let large = info.len > 1 << 20;
     if let Some(r) = asked("range", it) {
-        let same = asked("if-range", it).map_or(true, |v| v == info.etag || v == info.last_modified);
+        // The file's own tag, with or without its `W/`, or its date as it is (FEEDBACK55.md,
+        // Q-723; branch feedback55).
+        let same = asked("if-range", it).map_or(true, |v| crate::statics::same_tag(&v, &info.etag) || v.trim() == info.last_modified);
         match crate::statics::range(&r, info.len).filter(|_| same) {
-            Some(Ok((start, end))) if large => {
+            // A part of a large file is sent from disk only when it is large itself: a small one
+            // takes no place among the large sends (FEEDBACK55.md, Q-725; branch feedback55).
+            Some(Ok((start, end))) if large && !crate::statics::small_len(end - start + 1) => {
                 headers.push(("content-range".into(), format!("bytes {}-{}/{}", start, end, info.len)));
                 headers.push((crate::statics::SEND_HEADER.into(), crate::statics::mark(&full, start, end - start + 1, info.id)));
                 return answer(206, headers, Vec::new());
@@ -1477,6 +1499,10 @@ fn built_answer(path: &str, v: &Value) -> Value {
 /// (`.qwe`, `.qwer`) (FEEDBACK36.md, Q-450; branch feedback36-39), whether named so or reached
 /// through a link, nor a SQLite database that is open (FEEDBACK55.md, Q-701 and Q-702; branch
 /// feedback55).
+/// Set by `quillo serve`, whose URLs are its own: a file asked for with a `/` after it is moved to
+/// its path without it (FEEDBACK55.md, Q-721; branch feedback55).
+pub static SERVES_FOLDER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let dir = s_arg(&args, 0, "files", line)?;
     let path = match args.get(1) {
@@ -1525,7 +1551,7 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     };
     // The file itself is judged as it is read, by `kept_from_host` (FEEDBACK55.md, Q-701 and
     // Q-702; branch feedback55).
-    let serve = |it: &mut Interp, name: String| file_as(it, vec![Value::str(name), Value::map(file_opts.clone())], line, true);
+    let serve = |it: &mut Interp, name: String| file_as(it, vec![Value::str(name), Value::map(file_opts.clone())], line, true, false);
     // Whether a file in a folder whose way there was looked at is there, and may be served, in
     // the one look that said whether it was there: only a link, or a way with one, is followed
     // (FEEDBACK55.md, Q-701; branch feedback55).
@@ -1538,31 +1564,60 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // Judged before it is looked at: whether a folder outside is there is not said (Q-475).
     let led = if hidden || rel.split('/').any(|s| s == "..") { None } else { leads_to(&it.base_dir, &base.join(rel)) };
     let mut answer = None;
+    let asked = |it: &mut Interp| match it.request_value() {
+        Some(Value::Map(r)) => (r.get("path").map(|p| p.display()), r.get("query_string").map(|q| q.display()).filter(|q| !q.is_empty())),
+        _ => (None, None),
+    };
+    // The path asked for, `p` as the page's links resolve against it: one `/` first, as `//docs/`
+    // is another host to a browser, and so is `/\docs/` (FEEDBACK51.md, Q-671; branch
+    // feedback51-fixes); written as a `Location` holds it (FEEDBACK55.md, Q-719; branch
+    // feedback55).
+    let moved = |p: &str, q: Option<String>, kept: Option<&str>| -> R {
+        let to = format!("/{}{}", p.trim_start_matches(['/', '\\']), q.map_or(String::new(), |q| format!("?{}", q)));
+        let mut headers = vec![("location".to_string(), location(&to))];
+        headers.extend(kept.map(|k| ("cache-control".to_string(), k.to_string())));
+        Ok(Value::Response(Arc::new(Response { status: 301, headers, body: Body::Value(Value::Nil) })))
+    };
+    // Under `quillo serve`, which owns its URLs, a file asked for as a folder, `/a.txt/` or
+    // `/about/`, has one URL, as a folder has: it is moved to its path without the `/` (for an
+    // hour), as `/docs` is to `/docs/`, when it would be served there, and else it is the miss a
+    // file not there is, which says nothing of a file kept back (FEEDBACK55.md, Q-721; branch
+    // feedback55). A program's routes say what their URLs are, a `/` at the end too, so for them
+    // `files` serves what is asked for as it did. A route's `*p` has no `/` at its end: the
+    // request's path says, when it ends in the path given.
+    let as_folder = |it: &mut Interp| {
+        SERVES_FOLDER.load(std::sync::atomic::Ordering::Relaxed)
+            && match it.request_value() {
+                Some(Value::Map(r)) => matches!(r.get("path"), Some(Value::Str(p)) if p.ends_with('/')
+                    && crate::server::percent_decode(p.trim_end_matches('/'), false).ends_with(&format!("/{}", rel))),
+                _ => false,
+            }
+    };
+    let unslashed = |it: &mut Interp, name: String| -> R {
+        let served = matches!(file_as(it, vec![Value::str(name), Value::map(file_opts.clone())], line, true, true)?, Value::Response(r) if r.status == 200);
+        match asked(it) {
+            (Some(p), q) if served => moved(p.trim_end_matches('/'), q, Some("max-age=3600")),
+            _ => Ok(not_found()),
+        }
+    };
     if judged(it, &led) {
         let target = base.join(rel);
         if target.is_dir() {
-            let asked = match it.request_value() {
-                Some(Value::Map(r)) => (r.get("path").map(|p| p.display()), r.get("query_string").map(|q| q.display())),
-                _ => (None, None),
-            };
             // `/docs` is `/docs/`, so that the page's own relative links resolve.
-            if let (Some(p), q) = asked {
+            if let (Some(p), q) = asked(it) {
                 if !p.ends_with('/') {
-                    let q = q.filter(|q| !q.is_empty()).map_or(String::new(), |q| format!("?{}", q));
-                    // One `/` first: `//docs/` is another host to a browser, and so is `/\docs/`
-                    // (FEEDBACK51.md, Q-671; branch feedback51-fixes).
-                    let p = format!("/{}", p.trim_start_matches(['/', '\\']));
-                    return Ok(Value::Response(Arc::new(Response { status: 301, headers: vec![("location".into(), format!("{}/{}", p, q))], body: Body::Value(Value::Nil) })));
+                    return moved(&format!("{}/", p), q, None);
                 }
             }
             if found(it, &target.join(&index), &led) == Some(true) {
                 answer = Some(serve(it, joined(&format!("{}/{}", rel, index).trim_start_matches('/').to_string()))?);
             }
         } else if target.is_file() {
-            answer = Some(serve(it, joined(rel))?);
+            answer = Some(if as_folder(it) { unslashed(it, joined(rel))? } else { serve(it, joined(rel))? });
         } else if Path::new(rel).extension().is_none() {
             for ext in &extensions {
                 match found(it, &base.join(format!("{}.{}", rel, ext)), &led) {
+                    Some(true) if as_folder(it) => answer = Some(unslashed(it, joined(&format!("{}.{}", rel, ext)))?),
                     Some(true) => answer = Some(serve(it, joined(&format!("{}.{}", rel, ext)))?),
                     Some(false) => {}
                     None => continue,
@@ -1577,12 +1632,17 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return Ok(a);
     }
     if let Some(page) = not_found_page.filter(|p| base.join(p).is_file() && judged(it, &leads_to(&it.base_dir, &base.join(p)))) {
-        if let Value::Response(r) = serve(it, joined(&page))? {
+        // The page whole, whatever the request's conditionals and range, which are of the URL
+        // asked for: its 206 or 304 was thrown away for the plain page (FEEDBACK55.md, Q-722;
+        // branch feedback55).
+        if let Value::Response(r) = file_as(it, vec![Value::str(joined(&page)), Value::map(file_opts.clone())], line, true, true)? {
             if r.status == 200 {
                 let mut r = (*r).clone();
                 r.status = 404;
-                // Not the page's validators: they are of another URL's answer.
-                r.headers.retain(|(k, _)| !["etag", "last-modified", "accept-ranges"].contains(&k.as_str()));
+                // Not the page's validators: they are of another URL's answer. Nor `cache`'s
+                // year: the file may be there tomorrow (FEEDBACK55.md, Q-715; branch feedback55).
+                r.headers.retain(|(k, _)| !["etag", "last-modified", "accept-ranges", "cache-control"].contains(&k.as_str()));
+                r.headers.push(("cache-control".into(), "no-cache".into()));
                 return Ok(Value::Response(Arc::new(r)));
             }
         }
@@ -1807,8 +1867,11 @@ fn new_tenant(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn redirect(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let url = s_arg(&args, 0, "redirect", line)?;
     let status = if args.len() > 1 { i_arg(&args, 1, "redirect", line)? } else { 303 };
-    if !(300..=399).contains(&status) {
-        return fail(line, format!("`redirect` status must be 300-399, got {}", status));
+    // The statuses that redirect: a 300 is a choice for the visitor, a 304 says the copy held is
+    // current, a 305 is gone from HTTP, and 309 to 399 mean nothing (FEEDBACK55.md, Q-719; branch
+    // feedback55).
+    if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+        return fail(line, format!("`redirect` status is 301, 302, 303, 307 or 308, got {}", status));
     }
     let status = status as u16;
     if !crate::server::valid_header("location", &url) {
@@ -1819,9 +1882,66 @@ fn redirect(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     Ok(Value::Response(Arc::new(Response {
         status,
-        headers: vec![("location".into(), url.to_string())],
+        headers: vec![("location".into(), location(&url))],
         body: Body::Value(Value::Nil),
     })))
+}
+
+/// `url` as a `Location` holds it: what a URL may not hold (a space, `"`, `<`, `>`, `\`, `^`, a
+/// backquote, `{`, `|`, `}`, a lone `%`, any byte past ASCII) percent-encoded, and the rest,
+/// a `%XX` already there too, as it is, where `/a b` and `/a"><script>` went as written; a host
+/// past ASCII as IDNA writes it, `bücher.de` as `xn--bcher-kva.de`, and else the authority as it
+/// is (FEEDBACK55.md, Q-719; branch feedback55).
+pub(crate) fn location(url: &str) -> String {
+    let fine = |c: u8| c.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&'()*+,;=".contains(&c);
+    if url.bytes().all(fine) {
+        return url.to_string();
+    }
+    let encode = |part: &str, out: &mut String| {
+        let b = part.as_bytes();
+        for (i, &c) in b.iter().enumerate() {
+            let escape = c == b'%' && b.get(i + 1..i + 3).is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit));
+            if fine(c) || escape {
+                out.push(c as char);
+            } else {
+                out.push_str(&format!("%{:02X}", c));
+            }
+        }
+    };
+    // `scheme://authority` or `//authority`, the authority up to the path, query or fragment.
+    let scheme = url.find("://").filter(|&i| i > 0 && url[..i].bytes().all(|c| c.is_ascii_alphanumeric() || b"+-.".contains(&c)) && url.as_bytes()[0].is_ascii_alphabetic());
+    let at = match (scheme, url.starts_with("//")) {
+        (Some(i), _) => Some(i + 3),
+        (None, true) => Some(2),
+        _ => None,
+    };
+    let mut out = String::with_capacity(url.len() + 8);
+    let rest = match at {
+        Some(from) => {
+            let to = url[from..].find(['/', '?', '#', '\\']).map_or(url.len(), |n| from + n);
+            out.push_str(&url[..from]);
+            let authority = &url[from..to];
+            let (user, host_port) = authority.rsplit_once('@').map_or((None, authority), |(u, h)| (Some(u), h));
+            if let Some(u) = user {
+                encode(u, &mut out);
+                out.push('@');
+            }
+            let (host, port) = match host_port.rsplit_once(':') {
+                Some((h, p)) if !h.starts_with('[') && p.bytes().all(|c| c.is_ascii_digit()) => (h, Some(p)),
+                _ => (host_port, None),
+            };
+            let ascii = if host.is_ascii() { String::new() } else { url::quirks::domain_to_ascii(host) };
+            out.push_str(if ascii.is_empty() { host } else { &ascii });
+            if let Some(p) = port {
+                out.push(':');
+                out.push_str(p);
+            }
+            &url[to..]
+        }
+        None => url,
+    };
+    encode(rest, &mut out);
+    out
 }
 
 /// `respond(status, body, headers = {})` builds a response value.
@@ -1836,20 +1956,61 @@ fn respond(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return fail(line, format!("`respond` status must be 200-599, got {}", status));
     }
     let headers = if args.len() > 2 { m_arg(&args, 2, "respond", line)? } else { Arc::new(Map::new()) };
-    let headers: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.display())).collect();
-    // Header text often comes from the request; a line break in it would
-    // let the sender add headers (or a whole response) of their own.
-    if let Some((k, _)) = headers.iter().find(|(k, v)| !crate::server::valid_header(k, v)) {
-        return fail(
-            line,
-            format!("`respond` header `{}`: names are letters, digits and -, values cannot contain line breaks", k.escape_debug()),
-        );
-    }
+    let headers = answer_headers(&headers, "respond", line)?;
     Ok(Value::Response(Arc::new(Response {
         status: status as u16,
         headers,
         body: Body::Value(arg(&args, 1)),
     })))
+}
+
+/// The headers a program gives its answer (`respond`'s, `stream`'s and `events`'), names in lower
+/// case. `null` is no such header, Quillo's own for it neither, as in `site_headers` (it holds
+/// its place as `server::DROPPED`); a list is one header an item for `set-cookie`, and an error
+/// for another header, as a map is: each went out as text, `x-content-type-options: null` and
+/// `set-cookie: ["a=1", "b=2"]` (FEEDBACK55.md, Q-710; branch feedback55).
+pub(crate) fn answer_headers(h: &Map, f: &str, line: u32) -> Result<Vec<(String, String)>, Ctrl> {
+    let mut out = Vec::with_capacity(h.len());
+    for (k, v) in h.iter() {
+        let k = k.to_ascii_lowercase();
+        match v {
+            Value::Nil => out.push((k, crate::server::DROPPED.to_string())),
+            Value::List(items) if k == "set-cookie" => {
+                for item in items.iter() {
+                    match item {
+                        Value::List(_) | Value::Map(_) | Value::Nil => {
+                            return fail(line, format!("`{}` header `set-cookie` takes a list of cookie lines, one a header, got {} in it", f, item.type_name()))
+                        }
+                        item => out.push((k.clone(), item.display())),
+                    }
+                }
+            }
+            Value::List(_) | Value::Map(_) => {
+                let only = if matches!(v, Value::List(_)) { ": only `set-cookie` takes a list, one header an item; join the values with \", \"" } else { "" };
+                return fail(line, format!("`{}` header `{}` is a str, got {}{}", f, k.escape_debug(), v.type_name(), only));
+            }
+            v => out.push((k, v.display())),
+        }
+    }
+    // Header text often comes from the request; a line break in it would
+    // let the sender add headers (or a whole response) of their own.
+    if let Some((k, _)) = out.iter().find(|(k, v)| !crate::server::valid_header(k, if v == crate::server::DROPPED { "" } else { v })) {
+        return fail(line, format!("`{}` header `{}`: names are letters, digits and -, values cannot contain line breaks", f, k.escape_debug()));
+    }
+    Ok(out)
+}
+
+/// A content type a program gives (`file`'s and `stream`'s `type`), or an error that says what is
+/// wrong with it: "`file`'s type is a str" was said of a str, and a control character dropped the
+/// header as the answer was written (FEEDBACK55.md, Q-726; branch feedback55).
+pub(crate) fn content_type(t: &str, f: &str, line: u32) -> Result<String, Ctrl> {
+    if t.trim().is_empty() {
+        return fail(line, format!("`{}`'s type is empty: give a content type, like \"text/csv\", or leave it out", f));
+    }
+    if !crate::server::valid_header("content-type", t) {
+        return fail(line, format!("`{}`'s type cannot hold line breaks or other control characters, got {}", f, Value::str(t).repr()));
+    }
+    Ok(t.to_string())
 }
 
 fn json_parse(_: &mut Interp, args: Vec<Value>, line: u32) -> R {

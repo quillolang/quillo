@@ -308,7 +308,9 @@ impl crate::stream::Sink for ReplySink<'_> {
 
     fn start(&mut self, resp: &HttpResponse, _: bool) -> bool {
         self.inner.jar.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take_from(resp, self.inner.jar_file.as_deref());
-        self.reply.head(resp.status, &resp.headers);
+        // Not those the program sent none of (FEEDBACK55.md, Q-710; branch feedback55).
+        let headers: Vec<(String, String)> = resp.headers.iter().filter(|(_, v)| v != crate::server::DROPPED).cloned().collect();
+        self.reply.head(resp.status, &headers);
         true
     }
 
@@ -329,6 +331,13 @@ fn answer(inner: &Arc<Inner>, worker: &mut Worker, req: HttpRequest, reply: &mut
     match got {
         Answer::Respond(resp) => {
             inner.jar.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take_from(&resp, inner.jar_file.as_deref());
+            send_whole(reply, &resp);
+        }
+        // A HEAD of a large file says the length a GET would send (FEEDBACK55.md, Q-725; branch
+        // feedback55).
+        Answer::Head(mut resp, len) => {
+            inner.jar.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take_from(&resp, inner.jar_file.as_deref());
+            resp.headers.push(("content-length".into(), len.to_string()));
             send_whole(reply, &resp);
         }
         Answer::Streamed { .. } => reply.end(),
@@ -353,7 +362,7 @@ fn answer_now_with(inner: &Arc<Inner>, req: HttpRequest, stream: Option<Pipe>) -
     let got = worker.answer(&inner.app, req, None);
     inner.app.shared().gil.release();
     match got {
-        Answer::Respond(resp) => resp,
+        Answer::Respond(resp) | Answer::Head(resp, _) => resp,
         Answer::Streamed { .. } => crate::server::plain_response(200, ""),
         Answer::Detach(f) => match stream {
             Some(s) => {
@@ -417,7 +426,8 @@ fn as_tcp(s: Pipe) -> std::net::TcpStream {
 
 fn send_whole(reply: &mut dyn Reply, resp: &HttpResponse) {
     let mut headers = resp.headers.clone();
-    headers.retain(|(k, _)| !k.eq_ignore_ascii_case(crate::statics::SEND_HEADER));
+    // Nor those the program sent none of (FEEDBACK55.md, Q-710; branch feedback55).
+    headers.retain(|(k, v)| !k.eq_ignore_ascii_case(crate::statics::SEND_HEADER) && v != crate::server::DROPPED);
     reply.head(resp.status, &headers);
     if !resp.body.is_empty() {
         reply.body(&resp.body);

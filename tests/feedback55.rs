@@ -15,7 +15,9 @@ fn dir(name: &str, src: &str) -> PathBuf {
 
 /// What `quillo check` says of a program, and whether it passed, under a deadline.
 fn check(src: &str) -> (bool, String) {
-    let d = dir("check", src);
+    // A folder of each check's own: tests run at once.
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let d = dir(&format!("check-{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)), src);
     let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("check")
         .arg(d.join("main.qwe"))
@@ -1377,5 +1379,883 @@ fn file_serves_a_database_named_on_purpose_in_ranges() {
     }
     for path in ["/s/data.db", "/s/big.db"] {
         assert_eq!(support::send(s.port, "GET", path, &[("Range", "bytes=0-15")], "").status, 404, "{}", path);
+    }
+}
+
+// ---- Q-709 to Q-726: answers, cookies, forms, ranges and conditionals ---------------------------
+
+/// `quillo run main.qwe` in `d` with `opts`, its log kept, until the guard is dropped: the guard,
+/// its port and the log.
+fn serve_logged(d: &Path, opts: &[&str]) -> (support::Guard, u16, PathBuf) {
+    let port = support::free_port();
+    let log = d.join("server.log");
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .arg("main.qwe")
+        .args(["--port", &port.to_string(), "--no-check"])
+        .args(opts)
+        .current_dir(d)
+        .env("QUILLO_SECRET", "test secret for the tests")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let g = support::Guard::new(child);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !support::listening(port) {
+        assert!(std::time::Instant::now() < deadline, "did not start: {}", std::fs::read_to_string(&log).unwrap_or_default());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    (g, port, log)
+}
+
+/// The error a GET of `path` is answered 500 for, as the log says it.
+fn error_of(port: u16, log: &Path, path: &str) -> String {
+    let a = support::send(port, "GET", path, &[], "");
+    assert_eq!(a.status, 500, "{}: {}", path, a.body);
+    let mark = format!("GET {} (rid ", path);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let l = std::fs::read_to_string(log).unwrap_or_default();
+        if let Some(line) = l.lines().find(|x| x.contains(&mark)) {
+            return line.split_once("): ").map_or(line, |(_, m)| m).to_string();
+        }
+        assert!(std::time::Instant::now() < deadline, "no error for {} in {}", path, l);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// What a server sends on one connection for `requests`, written at once (the last asking it to
+/// close), until it closes it.
+fn on_one_connection(port: u16, requests: &str) -> String {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+    s.write_all(requests.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Every value of header `name` in an answer.
+fn all_of<'a>(a: &'a support::Answer, name: &str) -> Vec<&'a str> {
+    a.headers.iter().filter(|(k, _)| k == name).map(|(_, v)| v.as_str()).collect()
+}
+
+/// What `quillo run file` in `d` prints with `env` set, under a deadline.
+fn script_with_env(d: &Path, file: &str, env: &[(&str, &str)]) -> String {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .arg(file)
+        .current_dir(d)
+        .envs(env.iter().copied())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the script did not end");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let o = child.wait_with_output().unwrap();
+    String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)
+}
+
+const NO_BODY: &str = r#"route GET /s/:n = stream((send) => { sleep(20); send("leftover") }, { status: int(n) })
+route GET /e/:n = events((send) => send({ a: 1 }), { status: int(n) })
+route GET /r/:n { reply int(n) stream((send) => send("x")) }
+route GET /re/:n { reply int(n) events((send) => send(1)) }
+route GET /next = "next answer"
+"#;
+
+// Q-709: `stream` and `events` with 204, 205 or 304 sent a head that says there is no body, then
+// the function's chunks, which the next answer on the connection began with. Now those statuses,
+// and a 1xx, are an error for both, given as their option or by `reply`; the statuses either side
+// of them stream as before, and the next answer on the connection is whole.
+#[test]
+fn a_stream_takes_no_status_without_a_body() {
+    let d = dir("no-body", NO_BODY);
+    let (_g, port, log) = serve_logged(&d, &[]);
+    for n in [204, 205, 304] {
+        for (kind, name) in [("s", "stream"), ("e", "events"), ("r", "stream"), ("re", "events")] {
+            let why = error_of(port, &log, &format!("/{}/{}", kind, n));
+            assert!(why.contains(&format!("`{}` cannot answer {}: that status has no body", name, n)), "{}", why);
+        }
+        // The report's repro: two requests on one connection.
+        let out = on_one_connection(port, &format!("GET /s/{} HTTP/1.1\r\nHost: x\r\n\r\nGET /next HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", n));
+        let second = out.find("HTTP/1.1 200 OK").unwrap_or_else(|| panic!("{}", out));
+        assert!(out.starts_with("HTTP/1.1 500") && out[..second].ends_with("internal error\n") && !out.contains("leftover"), "{}", out);
+        assert!(out.ends_with("next answer"), "{}", out);
+    }
+    for n in [100, 103, 199, 600] {
+        assert_eq!(support::send(port, "GET", &format!("/s/{}", n), &[], "").status, 500, "{}", n);
+        assert_eq!(support::send(port, "GET", &format!("/r/{}", n), &[], "").status, 500, "{}", n);
+    }
+    // Either side, and others with a body: streamed, and the next answer follows the last chunk.
+    for n in [200, 203, 206, 303, 305, 404, 599] {
+        for kind in ["s", "e", "r"] {
+            let out = on_one_connection(port, &format!("GET /{}/{} HTTP/1.1\r\nHost: x\r\n\r\nGET /next HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", kind, n));
+            assert!(out.starts_with(&format!("HTTP/1.1 {} ", n)), "{}", out);
+            let second = out.rfind("HTTP/1.1 200 OK").unwrap_or_else(|| panic!("{}", out));
+            assert!(second > 0 && out[..second].ends_with("\r\n0\r\n\r\n") && out.ends_with("next answer"), "{}", out);
+        }
+    }
+}
+
+const HEADERS: &str = r#"route GET /nul = respond(200, "x", { "x-content-type-options": null, "x-mine": null, "x-n": 5 })
+route GET /me { set_session({ user: "u" }); respond(200, "hi", { "cache-control": null }) }
+route GET /two = respond(200, "x", { "Set-Cookie": ["a=1", "b=ü"] })
+route GET /one = respond(200, "x", { "set-cookie": ["a=1"] })
+route GET /none = respond(200, "x", { "set-cookie": [] })
+route GET /list = respond(200, "x", { "x-list": ["a", "b"] })
+route GET /map = respond(200, "x", { "x-map": { a: 1 } })
+route GET /deep = respond(200, "x", { "set-cookie": ["a=1", ["b=2"]] })
+route GET /hole = respond(200, "x", { "set-cookie": ["a=1", null] })
+route GET /break = respond(200, "x", { "set-cookie": ["a=1", "b=2\r\nx: y"] })
+route GET /s = stream((send) => send("s"), { headers: { "set-cookie": ["a=1", "b=2"], "x-accel-buffering": null, "x-n": 1 } })
+route GET /sl = stream((send) => send("s"), { headers: { "x-l": [1] } })
+route GET /sh = stream((send) => send("s"), { headers: 5 })
+route GET /vary { let _c = cookie("a"); respond(200, "x", { "vary": null }) }
+route GET /kept { let _c = cookie("a"); respond(200, "x", { "x-n": 1 }) }
+route GET /type = respond(200, "x", { "content-type": null })
+route GET /e = events((send) => send(1), { headers: { "cache-control": null } })
+route GET /seen = respond(200, "x", { "x-a": null, "x-b": "b" }).headers
+route GET /et = events((send) => send(1), { type: 5 })
+route GET /es = events((send) => send(1), { type: "text/plain" })
+"#;
+
+// Q-710: `respond` sent `null`, a list and a map as text: `x-content-type-options: null`,
+// `cache-control: null`, and one `set-cookie: ["a=1", "b=2"]`. Now `null` is no such header, nor
+// Quillo's own for it (the user's decision, as `site_headers` has it), while a header the program
+// does not name keeps Quillo's; a list is one `set-cookie` an item (none for an empty one) and an
+// error for another header, as a map is; `stream`'s and `events`' headers are taken the same way,
+// and `events` refuses a type that is no str, as `stream` does.
+#[test]
+fn an_answers_headers_take_null_and_lists_as_http_has_them() {
+    let d = dir("headers", HEADERS);
+    let (_g, port, log) = serve_logged(&d, &[]);
+    let a = support::send(port, "GET", "/nul", &[], "");
+    assert!(all_of(&a, "x-content-type-options").is_empty(), "{:?}", a.headers);
+    assert_eq!((a.header("x-mine"), a.header("x-n")), (None, Some("5")));
+    let a = support::send(port, "GET", "/me", &[], "");
+    assert!(all_of(&a, "cache-control").is_empty(), "{:?}", a.headers);
+    assert!(a.header("set-cookie").is_some_and(|c| c.contains("quillo_session=")), "{:?}", a.headers);
+    let a = support::send(port, "GET", "/vary", &[], "");
+    assert_eq!((all_of(&a, "vary").len(), a.header("cache-control")), (0, Some("private")), "{:?}", a.headers);
+    let a = support::send(port, "GET", "/kept", &[], "");
+    assert_eq!((a.header("vary"), a.header("cache-control"), a.header("x-content-type-options")), (Some("Cookie"), Some("private"), Some("nosniff")));
+    let a = support::send(port, "GET", "/type", &[], "");
+    assert_eq!((a.status, a.header("content-type"), a.body.as_str()), (200, None, "x"));
+    let a = support::send(port, "GET", "/e", &[], "");
+    assert_eq!((a.header("content-type"), a.header("cache-control")), (Some("text/event-stream"), None));
+    assert_eq!(support::send(port, "GET", "/seen", &[], "").body, r#"{"x-a":null,"x-b":"b"}"#);
+    assert_eq!(support::send(port, "GET", "/es", &[], "").header("content-type"), Some("text/event-stream"));
+    assert_eq!(all_of(&support::send(port, "GET", "/two", &[], ""), "set-cookie"), ["a=1", "b=ü"]);
+    assert_eq!(all_of(&support::send(port, "GET", "/one", &[], ""), "set-cookie"), ["a=1"]);
+    assert!(all_of(&support::send(port, "GET", "/none", &[], ""), "set-cookie").is_empty());
+    for (path, want) in [
+        ("/list", "`respond` header `x-list` is a str, got list: only `set-cookie` takes a list"),
+        ("/map", "`respond` header `x-map` is a str, got map"),
+        ("/deep", "`respond` header `set-cookie` takes a list of cookie lines, one a header, got list in it"),
+        ("/hole", "got null in it"),
+        ("/break", "`respond` header `set-cookie`: names are letters, digits and -, values cannot contain line breaks"),
+        ("/sl", "`stream` header `x-l` is a str, got list"),
+        ("/sh", "`stream`'s headers are a map, got int"),
+        ("/et", "`events`'s type is a str, like \"text/csv\", got int"),
+    ] {
+        let why = error_of(port, &log, path);
+        assert!(why.contains(want), "{}: {}", path, why);
+    }
+    let a = support::send(port, "GET", "/s", &[], "");
+    assert_eq!((a.status, all_of(&a, "set-cookie"), a.header("x-n")), (200, vec!["a=1", "b=2"], Some("1")));
+    assert!(all_of(&a, "x-accel-buffering").is_empty(), "{:?}", a.headers);
+}
+
+// Q-712: `set_cookie` read only the options it knew, so Express's `sameSite: "Strict"` left the
+// cookie `Lax` and `maxAge` made it last the session, and `quillo check` said ok. Now an option it
+// does not take is an error, when it runs and in `check` for one written out, naming the snake_case
+// option for any spelling of one (`sameSite`, `Max-Age`, `HTTPONLY`) and the options taken for
+// others; `delete_cookie` takes them but `max_age`.
+#[test]
+fn set_cookie_refuses_options_it_does_not_take() {
+    let d = dir(
+        "cookie-options",
+        r#"route GET /all { set_cookie("x", "v", { max_age: 60, path: "/", domain: "example.com", http_only: false, secure: true, same_site: "Strict" }); "ok" }
+route GET /empty { set_cookie("x", "v", {}); "ok" }
+route GET /nulls { set_cookie("x", "v", { max_age: null, same_site: null }); "ok" }
+route GET /del { delete_cookie("x", { path: "/a", domain: "example.com", secure: true, same_site: "Lax", http_only: true }); "ok" }
+route GET /zero { delete_cookie("x", { max_age: 0 }); "ok" }
+route GET /age/:n { delete_cookie("x", { max_age: int(n) }); "ok" }
+"#,
+    );
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let cookie = |path: &str| support::send(s.port, "GET", path, &[], "").header("set-cookie").unwrap_or_default().to_string();
+    assert_eq!(cookie("/all"), "x=v; Path=/; Domain=example.com; Max-Age=60; Secure; SameSite=Strict");
+    assert_eq!(cookie("/empty"), "x=v; Path=/; HttpOnly; Secure; SameSite=Lax");
+    assert_eq!(cookie("/nulls"), "x=v; Path=/; HttpOnly; Secure; SameSite=Lax");
+    assert_eq!(cookie("/del"), "x=; Path=/a; Domain=example.com; Max-Age=0; HttpOnly; Secure; SameSite=Lax");
+    assert_eq!(cookie("/zero"), "x=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+    assert_eq!(cookie("/age/0"), "x=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+    assert_eq!(support::send(s.port, "GET", "/age/5", &[], "").status, 500);
+    let (ok, out) = check("route GET / { set_cookie(\"x\", \"v\", { httpOnly: false, maxAge: 60, sameSite: \"Strict\" }); \"ok\" }\nroute GET /d { delete_cookie(\"x\", { max_age: 5, expires: 1 }); \"ok\" }\nroute GET /k { set_cookie(\"x\", \"v\", { max_age: 5, path: \"/\" }); delete_cookie(\"x\", { path: \"/\", max_age: 0 }); delete_cookie(\"x\", { max_age: null }); delete_cookie(\"x\", { max_age: int(\"5\") }); \"ok\" }\n");
+    assert!(!ok, "{}", out);
+    for want in [
+        "main.qwe:1: error: `set_cookie` has no option `httpOnly`: write it `http_only`",
+        "main.qwe:1: error: `set_cookie` has no option `maxAge`: write it `max_age`",
+        "main.qwe:1: error: `set_cookie` has no option `sameSite`: write it `same_site`",
+        "main.qwe:2: error: `delete_cookie` has no option `max_age` but 0: a deleted cookie's age is 0",
+        "main.qwe:2: error: `delete_cookie` has no option `expires`: it takes `path`, `domain`, `http_only`, `secure` and `same_site`",
+    ] {
+        assert!(out.contains(want), "{} not in {}", want, out);
+    }
+    assert!(!out.contains("main.qwe:3:"), "{}", out);
+    // When it runs, the map made as it runs.
+    let d = dir("cookie-options-run", "let o = json.parse(env(\"O\") ?? \"null\")\nset_cookie(\"x\", env(\"V\") ?? \"v\", o)\nprint(\"ok\")\n");
+    for (o, want) in [
+        (r#"{"sameSite": "Strict"}"#, "`set_cookie` has no option `sameSite`: write it `same_site`"),
+        (r#"{"Max-Age": 1}"#, "`set_cookie` has no option `Max-Age`: write it `max_age`"),
+        (r#"{"HTTPONLY": true}"#, "`set_cookie` has no option `HTTPONLY`: write it `http_only`"),
+        (r#"{"expires": "2027-01-01"}"#, "`set_cookie` has no option `expires`: it takes `max_age`, `path`, `domain`, `http_only`, `secure` and `same_site` (`max_age` is how long it lasts"),
+        (r#"{"ünï": 1}"#, "`set_cookie` has no option `ünï`: it takes `max_age`"),
+        (r#"{"": 1}"#, "`set_cookie` has no option ``: it takes"),
+        (r#"{"same_site": "Strict", "secure": true}"#, "ok"),
+        ("{}", "ok"),
+    ] {
+        let out = script_with_env(&d, "main.qwe", &[("O", o)]);
+        assert!(out.contains(want), "{}: {}", o, out);
+    }
+}
+
+// Q-713: `__Host-` and `__Secure-` cookies went out breaking their prefix's rules, which browsers
+// drop: a `__Host-` one with a path, a domain or `secure: false`, a `__Secure-` one with `secure:
+// false`, and either without `Secure` under `--watch`. Now those options are an error, and a
+// prefixed name (in any case, as browsers read it) is `Secure`, a `__Host-` one at `Path=/`, under
+// `--watch` too; other names are as they were.
+#[test]
+fn a_prefixed_cookie_keeps_its_prefixs_rules() {
+    let src = r#"route GET /host { set_cookie("__Host-id", "v"); "ok" }
+route GET /host-root { set_cookie("__Host-id", "v", { path: "/" }); "ok" }
+route GET /host-lower { set_cookie("__host-id", "v"); "ok" }
+route GET /secure { set_cookie("__Secure-t", "v", { path: "/x", domain: "example.com" }); "ok" }
+route GET /plain { set_cookie("__Hostx", "v"); "ok" }
+route GET /del { delete_cookie("__Host-id"); "ok" }
+route GET /c/:n ? { o: str } = { set_cookie(n, "v", json.parse(o)); "ok" }
+"#;
+    let d = dir("prefixes", src);
+    let (_g, port, log) = serve_logged(&d, &[]);
+    let cookie = |path: &str| support::send(port, "GET", path, &[], "").header("set-cookie").unwrap_or_default().to_string();
+    assert_eq!(cookie("/host"), "__Host-id=v; Path=/; HttpOnly; Secure; SameSite=Lax");
+    assert_eq!(cookie("/host-root"), "__Host-id=v; Path=/; HttpOnly; Secure; SameSite=Lax");
+    assert_eq!(cookie("/host-lower"), "__host-id=v; Path=/; HttpOnly; Secure; SameSite=Lax");
+    assert_eq!(cookie("/secure"), "__Secure-t=v; Path=/x; Domain=example.com; HttpOnly; Secure; SameSite=Lax");
+    assert_eq!(cookie("/plain"), "__Hostx=v; Path=/; HttpOnly; Secure; SameSite=Lax");
+    assert_eq!(cookie("/del"), "__Host-id=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax");
+    for (name, o, want) in [
+        ("__Host-a", r#"{"path": "/app"}"#, "a `__Host-` cookie's path is /, as browsers take it no other way, got \"/app\""),
+        ("__Host-b", r#"{"path": "//"}"#, "a `__Host-` cookie's path is /"),
+        ("__Host-c", r#"{"domain": "example.com"}"#, "a `__Host-` cookie has no domain"),
+        ("__Host-d", r#"{"secure": false}"#, "a `__Host-` cookie is `Secure`"),
+        ("__HOST-e", r#"{"secure": false}"#, "a `__Host-` cookie is `Secure`"),
+        ("__Secure-f", r#"{"secure": false}"#, "a `__Secure-` cookie is `Secure`"),
+    ] {
+        let why = error_of(port, &log, &format!("/c/{}?o={}", name, enc(o)));
+        assert!(why.contains(want), "{} {}: {}", name, o, why);
+    }
+    // `secure: true` and a null are what it is anyway.
+    let a = support::send(port, "GET", &format!("/c/__Secure-g?o={}", enc(r#"{"secure": true, "path": null}"#)), &[], "");
+    assert_eq!(a.header("set-cookie"), Some("__Secure-g=v; Path=/; HttpOnly; Secure; SameSite=Lax"));
+    // Under --watch, served over plain HTTP: a prefixed name is still `Secure`, which browsers take
+    // from localhost; another is not.
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+    let cookie = |path: &str| support::send(s.port, "GET", path, &[], "").header("set-cookie").unwrap_or_default().to_string();
+    assert_eq!(cookie("/host"), "__Host-id=v; Path=/; HttpOnly; Secure; SameSite=Lax");
+    assert_eq!(cookie("/secure"), "__Secure-t=v; Path=/x; Domain=example.com; HttpOnly; Secure; SameSite=Lax");
+    assert_eq!(cookie("/plain"), "__Hostx=v; Path=/; HttpOnly; SameSite=Lax");
+    assert_eq!(cookie("/del"), "__Host-id=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax");
+}
+
+// Q-714: a cookie queued twice kept only the last by name alone, so `delete_cookie("theme", {
+// path: "/old" })` then `set_cookie("theme", "dark")` sent only the new one, and the old cookie
+// stayed. Now one replaces another only at the same name, path and domain (a domain in any case,
+// with or without its leading `.`), as browsers keep them.
+#[test]
+fn a_cookie_replaces_one_only_at_its_name_path_and_domain() {
+    let d = dir(
+        "cookie-keys",
+        r#"route GET /move { delete_cookie("theme", { path: "/old" }); set_cookie("theme", "dark"); "ok" }
+route GET /paths { set_cookie("t", "1", { path: "/a" }); set_cookie("t", "2", { path: "/b" }); "ok" }
+route GET /again { set_cookie("t", "1", { path: "/a" }); set_cookie("t", "2", { path: "/a" }); "ok" }
+route GET /domains { set_cookie("t", "1", { domain: "Example.com" }); set_cookie("t", "2", { domain: ".example.com" }); set_cookie("t", "3", { domain: "a.example.com" }); "ok" }
+route GET /names { set_cookie("t", "1"); set_cookie("T", "2"); set_cookie("t", "ü"); "ok" }
+route GET /session { set_session({ a: 1 }); set_session({ a: 2 }); "ok" }
+"#,
+    );
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let cookies = |path: &str| -> Vec<String> { all_of(&support::send(s.port, "GET", path, &[], ""), "set-cookie").iter().map(|c| c.to_string()).collect() };
+    assert_eq!(cookies("/move"), ["theme=; Path=/old; Max-Age=0; HttpOnly; SameSite=Lax", "theme=dark; Path=/; HttpOnly; Secure; SameSite=Lax"]);
+    assert_eq!(cookies("/paths"), ["t=1; Path=/a; HttpOnly; Secure; SameSite=Lax", "t=2; Path=/b; HttpOnly; Secure; SameSite=Lax"]);
+    assert_eq!(cookies("/again"), ["t=2; Path=/a; HttpOnly; Secure; SameSite=Lax"]);
+    assert_eq!(cookies("/domains"), ["t=2; Path=/; Domain=.example.com; HttpOnly; Secure; SameSite=Lax", "t=3; Path=/; Domain=a.example.com; HttpOnly; Secure; SameSite=Lax"]);
+    assert_eq!(cookies("/names"), ["T=2; Path=/; HttpOnly; Secure; SameSite=Lax", "t=%C3%BC; Path=/; HttpOnly; Secure; SameSite=Lax"]);
+    let session = cookies("/session");
+    assert_eq!(session.len(), 1, "{:?}", session);
+}
+
+fn files_site(name: &str) -> PathBuf {
+    let d = dir(
+        name,
+        "route GET /build/*p = files(\"dist\", p, { cache: \"1y\" })\nroute GET /plain/*p = files(\"dist\", p)\nroute GET /bare/*p = files(\"dist\", p, { not_found: null })\nroute GET /given = files(\"dist\", \"a.txt/\")\n",
+    );
+    std::fs::create_dir_all(d.join("dist/docs")).unwrap();
+    std::fs::write(d.join("dist/404.html"), "<h1>missing</h1>\n").unwrap();
+    std::fs::write(d.join("dist/a.txt"), "hello\n").unwrap();
+    std::fs::write(d.join("dist/about.html"), "<p>about</p>\n").unwrap();
+    std::fs::write(d.join("dist/é.txt"), "accent\n").unwrap();
+    std::fs::write(d.join("dist/docs/index.html"), "<p>docs</p>\n").unwrap();
+    d
+}
+
+// Q-715: `files()` with `cache` sent its 404 page `public, max-age=31536000, immutable`, so a file
+// asked for before it was deployed stayed missing in caches for a year. Now the page of a miss is
+// `no-cache`, with `cache` or without, and a file found keeps `cache`'s year.
+#[test]
+fn files_page_of_a_miss_is_not_kept() {
+    let d = files_site("miss-cache");
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    for path in ["/build/app.2.js", "/plain/app.2.js", "/build/x/y.css"] {
+        let a = support::send(s.port, "GET", path, &[], "");
+        assert_eq!((a.status, a.body.as_str()), (404, "<h1>missing</h1>\n"), "{}", path);
+        assert_eq!(all_of(&a, "cache-control"), ["no-cache"], "{}", path);
+        assert_eq!((a.header("etag"), a.header("last-modified"), a.header("accept-ranges")), (None, None, None), "{}", path);
+    }
+    let a = support::send(s.port, "GET", "/build/a.txt", &[], "");
+    assert_eq!((a.status, a.header("cache-control")), (200, Some("public, max-age=31536000, immutable")));
+    let a = support::send(s.port, "GET", "/bare/app.2.js", &[], "");
+    assert_eq!((a.status, a.body.as_str()), (404, "not found"));
+}
+
+// Q-721: `files()` served a file at its path with a `/` added, `/s/a.txt/` and `/s/about/`, whose
+// relative links then resolved under the wrong folder. The user's decision: a program's URLs are
+// its own, so `files()` in a route serves what is asked for as it did, a site that keeps its URLs
+// with a `/` at the end and a route declared so too, and a file kept back is the miss one not there
+// is, a `/` after it or not. `quillo serve`, whose URLs are its own, moves a file asked for so to
+// its path without the `/`, for an hour, only when it would serve it there.
+#[test]
+fn a_programs_files_serve_a_path_as_its_routes_ask() {
+    let d = files_site("file-slash");
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    for (path, status, body) in [
+        ("/build/a.txt/", 200, "hello\n"),
+        ("/build/about/", 200, "<p>about</p>\n"),
+        ("/build/%C3%A9.txt/", 200, "accent\n"),
+        ("/build/a.txt", 200, "hello\n"),
+        ("/build/docs/", 200, "<p>docs</p>\n"),
+        ("/build/nope/", 404, "<h1>missing</h1>\n"),
+        ("/given", 200, "hello\n"),
+    ] {
+        let a = support::send(s.port, "GET", path, &[], "");
+        assert_eq!((a.status, a.body.as_str()), (status, body), "{}", path);
+    }
+    let a = support::send(s.port, "GET", "/build/docs", &[], "");
+    assert_eq!((a.status, a.header("location")), (301, Some("/build/docs/")));
+    // A site whose URLs end in `/`: no loop.
+    let d = dir("slash-site", "route GET /*p = ends_with(request.path, \"/\") ? files(\"public\", p) : redirect(request.path + \"/\", 301)\n");
+    std::fs::create_dir_all(d.join("public")).unwrap();
+    std::fs::write(d.join("public/about.html"), "<p>about</p>\n").unwrap();
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let a = support::send(s.port, "GET", "/about", &[], "");
+    assert_eq!((a.status, a.header("location")), (301, Some("/about/")));
+    let a = support::send(s.port, "GET", "/about/", &[], "");
+    assert_eq!((a.status, a.body.as_str()), (200, "<p>about</p>\n"));
+    // A route declared with a `/`, and a database kept back: the same miss as a file not there.
+    let d = dir("slash-route", "route GET /about/ = files(\"s\", \"about\")\nroute GET /s/*p = files(\"s\", p)\n");
+    std::fs::create_dir_all(d.join("s")).unwrap();
+    std::fs::write(d.join("s/about.html"), "<p>s</p>\n").unwrap();
+    rusqlite::Connection::open(d.join("s/app.db")).unwrap().execute_batch("create table t (x)").unwrap();
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    assert_eq!(support::send(s.port, "GET", "/about/", &[], "").body, "<p>s</p>\n");
+    let kept: Vec<(u16, String)> = ["/s/app.db/", "/s/nothere.db/", "/s/app.db", "/s/nothere.db"].iter().map(|p| { let a = support::send(s.port, "GET", p, &[], ""); (a.status, a.body) }).collect();
+    assert!(kept.iter().all(|k| k == &kept[0]) && kept[0].0 == 404, "{:?}", kept);
+}
+
+#[cfg(unix)]
+#[test]
+fn quillo_serve_moves_a_file_asked_for_as_a_folder() {
+    let d = files_site("serve-slash");
+    std::fs::write(d.join("dist/.env"), "SECRET=s3cr3t\n").unwrap();
+    std::fs::hard_link(d.join("dist/.env"), d.join("dist/notes.txt")).unwrap();
+    rusqlite::Connection::open(d.join("dist/app.db")).unwrap().execute_batch("create table t (x)").unwrap();
+    let (_g, port) = serve_folder(&d, "dist");
+    for (path, to) in [
+        ("/a.txt/", "/a.txt"),
+        ("/about/?q=1", "/about?q=1"),
+        ("/a.txt//", "/a.txt"),
+        ("/%C3%A9.txt/", "/%C3%A9.txt"),
+        ("/about.html/", "/about.html"),
+    ] {
+        let a = support::send(port, "GET", path, &[], "");
+        assert_eq!((a.status, a.header("location"), a.header("cache-control")), (301, Some(to), Some("max-age=3600")), "{}", path);
+    }
+    let a = support::send(port, "GET", "/docs", &[], "");
+    assert_eq!((a.status, a.header("location")), (301, Some("/docs/")));
+    for (path, status, body) in [("/a.txt", 200, "hello\n"), ("/about", 200, "<p>about</p>\n"), ("/docs/", 200, "<p>docs</p>\n")] {
+        let a = support::send(port, "GET", path, &[], "");
+        assert_eq!((a.status, a.body.as_str()), (status, body), "{}", path);
+    }
+    // What it would not serve says nothing more with a `/` after it: the miss of a file not there.
+    let missing = support::send(port, "GET", "/nothere.db/", &[], "");
+    assert_eq!((missing.status, missing.body.as_str()), (404, "<h1>missing</h1>\n"));
+    for path in ["/app.db/", "/notes.txt/", "/.env/", "/nothere.txt/", "/app.db", "/notes.txt"] {
+        let a = support::send(port, "GET", path, &[], "");
+        assert_eq!((a.status, a.body.as_str(), a.header("location")), (404, missing.body.as_str(), None), "{}", path);
+    }
+}
+
+// Q-722: a miss asked for with a range or a conditional got the plain `not found`: they were
+// applied to the 404 page, and its 206, 304 or 412 thrown away. Now the page is sent whole, whatever
+// they are; a file found still answers them.
+#[test]
+fn files_page_of_a_miss_is_whole_whatever_the_request_asks() {
+    let d = files_site("miss-whole");
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let page_etag = support::send(s.port, "GET", "/plain/404.html", &[], "").header("etag").unwrap().to_string();
+    for h in [
+        ("Range", "bytes=0-1"),
+        ("Range", "bytes=-1"),
+        ("Range", "bytes=100-"),
+        ("If-None-Match", "*"),
+        ("If-None-Match", page_etag.as_str()),
+        ("If-Modified-Since", "Thu, 01 Jan 2099 00:00:00 GMT"),
+        ("If-Match", "\"other\""),
+        ("If-Unmodified-Since", "Thu, 01 Jan 1970 00:00:00 GMT"),
+    ] {
+        let a = support::send(s.port, "GET", "/plain/nope.txt", &[h], "");
+        assert_eq!((a.status, a.body.as_str(), a.header("content-range")), (404, "<h1>missing</h1>\n", None), "{:?}", h);
+    }
+    let a = support::send(s.port, "GET", "/plain/a.txt", &[("Range", "bytes=0-1")], "");
+    assert_eq!((a.status, a.body.as_str()), (206, "he"));
+    let etag = support::send(s.port, "GET", "/plain/a.txt", &[], "").header("etag").unwrap().to_string();
+    assert_eq!(support::send(s.port, "GET", "/plain/a.txt", &[("If-None-Match", &etag)], "").status, 304);
+}
+
+/// A multipart body of `fields` text parts and `files` file parts.
+fn multipart(fields: usize, files: usize) -> String {
+    let mut b = String::new();
+    for i in 0..fields {
+        b.push_str(&format!("--XyZ\r\nContent-Disposition: form-data; name=\"f{}\"\r\n\r\nv{}\r\n", i, i));
+    }
+    for i in 0..files {
+        b.push_str(&format!("--XyZ\r\nContent-Disposition: form-data; name=\"up{}\"; filename=\"a{}.txt\"\r\nContent-Type: text/plain\r\n\r\nbody{}\r\n", i, i, i));
+    }
+    b.push_str("--XyZ--\r\n");
+    b
+}
+
+const FORM: (&str, &str) = ("Content-Type", "multipart/form-data; boundary=XyZ");
+
+// Q-716: a multipart body of more than 1,000 parts had those past the 1,000th dropped, and the
+// answer was a 200. Now it is a 413 before the route runs; 1,000 parts, fields and files together,
+// are read whole.
+#[test]
+fn a_form_of_more_parts_than_are_read_is_too_large() {
+    let d = dir("parts", "route POST /up = { fields: len(request.form), files: len(request.files) }\nroute POST /fn = \"ran\"\n");
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    for (fields, files, want) in [
+        (1000, 0, Some((1000, 0))),
+        (999, 1, Some((999, 1))),
+        (995, 5, Some((995, 5))),
+        (0, 0, Some((0, 0))),
+        (0, 2, Some((0, 2))),
+        (1001, 0, None),
+        (999, 5, None),
+        (1500, 0, None),
+    ] {
+        let a = support::send(s.port, "POST", "/up", &[FORM], &multipart(fields, files));
+        match want {
+            Some((f, n)) => {
+                let j: serde_json::Value = serde_json::from_str(&a.body).unwrap_or_else(|e| panic!("{}: {}", e, a.body));
+                assert_eq!((a.status, j["fields"].as_u64(), j["files"].as_u64()), (200, Some(f), Some(n)), "{} + {}", fields, files);
+            }
+            None => assert_eq!((a.status, a.body.as_str()), (413, "a form of more than 1000 parts\n"), "{} + {}", fields, files),
+        }
+    }
+    // The route does not run.
+    assert_eq!(support::send(s.port, "POST", "/fn", &[FORM], &multipart(1001, 0)).status, 413);
+    assert_eq!(support::send(s.port, "POST", "/fn", &[FORM], &multipart(1000, 0)).body, "ran");
+}
+
+/// The file the field `f` of a multipart part with `disposition` is, and the form, as `/name` gives.
+fn uploaded(port: u16, disposition: &str) -> serde_json::Value {
+    let body = format!("--XyZ\r\nContent-Disposition: {}\r\nContent-Type: text/plain\r\n\r\nbytes\r\n--XyZ--\r\n", disposition);
+    let a = support::send(port, "POST", "/name", &[FORM], &body);
+    assert_eq!(a.status, 200, "{}", a.body);
+    serde_json::from_str(&a.body).unwrap()
+}
+
+// Q-720: a filename with `\"` in it, which Go's mime/multipart and curl write for a quote, was cut
+// at the backslash, and a part with only RFC 5987's `filename*=UTF-8''...` was a field of the form.
+// Now `\"` and `\\` are read as the character they stand for, `filename*` is taken when there is no
+// `filename` (UTF-8 or ISO-8859-1), and what browsers send reads as before: a Windows path, `%22`.
+#[test]
+fn a_multipart_filename_is_read_as_other_clients_write_it() {
+    let d = dir("filenames", "route POST /name = { files: request.files, form: request.form }\n");
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    for (disposition, name) in [
+        (r#"form-data; name="f"; filename="a\"b.txt""#, "a\"b.txt"),
+        (r#"form-data; name="f"; filename="\"q\".txt""#, "\"q\".txt"),
+        (r#"form-data; name="f"; filename="a\\b.txt""#, "b.txt"),
+        (r#"form-data; name="f"; filename*=UTF-8''%E2%82%AC%20rates.txt"#, "€ rates.txt"),
+        (r#"form-data; name="f"; filename*=utf-8'en'%C3%BC.txt"#, "ü.txt"),
+        (r#"form-data; name="f"; filename*=ISO-8859-1''caf%E9.txt"#, "café.txt"),
+        (r#"form-data; name="f"; filename="plain.txt"; filename*=UTF-8''other.txt"#, "plain.txt"),
+        (r#"form-data; name="f"; filename="C:\Users\me\x.txt""#, "x.txt"),
+        (r#"form-data; name="f"; filename="%22q%22.txt""#, "\"q\".txt"),
+        (r#"form-data; name="f"; filename="ünï.txt""#, "ünï.txt"),
+        (r#"form-data; name="f"; filename="a\b.txt""#, "b.txt"),
+        (r#"form-data; name="f"; filename="dir\""#, ""),
+    ] {
+        let j = uploaded(s.port, disposition);
+        assert_eq!(j["files"]["f"]["filename"].as_str(), Some(name), "{}: {}", disposition, j);
+        assert_eq!(j["form"], serde_json::json!({}), "{}", disposition);
+    }
+    // A field named with a `\` at its end, as a browser sends it, `\"` followed by the next
+    // parameter: its quote ends the name.
+    let j = uploaded(s.port, r#"form-data; name="f\"; filename="a.txt""#);
+    assert_eq!((j["files"]["f\\"]["filename"].as_str(), &j["form"]), (Some("a.txt"), &serde_json::json!({})), "{}", j);
+    let j = uploaded(s.port, r#"form-data; name="f\" ;  filename*=UTF-8''%C3%BC.txt"#);
+    assert_eq!(j["files"]["f\\"]["filename"].as_str(), Some("ü.txt"), "{}", j);
+    // A field is still a field.
+    let j = uploaded(s.port, r#"form-data; name="f""#);
+    assert_eq!((j["form"]["f"].as_str(), &j["files"]), (Some("bytes"), &serde_json::json!({})));
+}
+
+// Q-717: a form whose type was not in lower case read as empty. Now the type is compared by its
+// essence in any case, with parameters or without; another type is no form, as before.
+#[test]
+fn a_forms_type_is_read_in_any_case() {
+    let d = dir("form-type", "route POST /form = request.form\n");
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    for (ctype, want) in [
+        ("Application/x-www-form-urlencoded", r#"{"a":"1","b":"ü"}"#),
+        ("APPLICATION/X-WWW-FORM-URLENCODED; charset=UTF-8", r#"{"a":"1","b":"ü"}"#),
+        ("application/x-www-form-urlencoded ;charset=utf-8", r#"{"a":"1","b":"ü"}"#),
+        ("application/x-www-form-urlencoded", r#"{"a":"1","b":"ü"}"#),
+        ("application/x-www-form-urlencodedx", "{}"),
+        ("text/plain", "{}"),
+    ] {
+        let a = support::send(s.port, "POST", "/form", &[("Content-Type", ctype)], "a=1&b=%C3%BC");
+        assert_eq!(a.status, 200, "{}", ctype);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&a.body).unwrap(), serde_json::from_str::<serde_json::Value>(want).unwrap(), "{}", ctype);
+    }
+}
+
+// Q-718: `Cookie: a=admin; a=root` gave `root`, though a browser sends the cookie with the longer
+// path first; `a = 1` gave the name `a ` and the value ` 1`, and `a="q"` kept its quotes. Now the
+// first of a name is kept, spaces around `=` are not part of either, and one pair of quotes around
+// a value is taken off, for `request.cookies`, `cookie()` and the session's.
+#[test]
+fn the_cookie_header_is_read_as_browsers_send_it() {
+    let d = dir("cookie-header", "route GET /c = request.cookies\nroute GET /one = cookie(\"a\") ?? \"none\"\nroute GET /in { set_session({ u: 7 }); \"in\" }\nroute GET /who = str(session().u)\n");
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    for (header, want) in [
+        ("a=admin; a=root", serde_json::json!({ "a": "admin" })),
+        ("a = 1 ; b= 2", serde_json::json!({ "a": "1", "b": "2" })),
+        ("a=\"q\"", serde_json::json!({ "a": "q" })),
+        ("a=\"\"", serde_json::json!({ "a": "" })),
+        ("a=\"", serde_json::json!({ "a": "\"" })),
+        ("a=\"\"q\"\"", serde_json::json!({ "a": "\"q\"" })),
+        ("a=\"caf%C3%A9\"", serde_json::json!({ "a": "café" })),
+        ("a=1;b=2;;", serde_json::json!({ "a": "1", "b": "2" })),
+        ("a", serde_json::json!({})),
+        ("", serde_json::json!({})),
+    ] {
+        let a = support::send(s.port, "GET", "/c", &[("Cookie", header)], "");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&a.body).unwrap(), want, "{:?}", header);
+    }
+    assert_eq!(support::send(s.port, "GET", "/one", &[("Cookie", "a=admin; a=root")], "").body, "admin");
+    // The session's cookie read the same way: with spaces around `=`, and quoted.
+    let line = support::send(s.port, "GET", "/in", &[], "").header("set-cookie").unwrap().to_string();
+    let (name, value) = line.split(';').next().unwrap().split_once('=').unwrap();
+    for header in [format!("{}={}", name, value), format!("{} = {}", name, value), format!("{}=\"{}\"", name, value)] {
+        assert_eq!(support::send(s.port, "GET", "/who", &[("Cookie", &header)], "").body, "7", "{}", header);
+    }
+}
+
+// Q-719: `redirect()` took any status from 300 to 399, `304 Not Modified` with a `Location` too,
+// and wrote `Location` as given, `/a b` and `/a"><script>` too. Now it takes 301, 302, 303, 307 and
+// 308, and percent-encodes what a URL cannot hold, leaving a `%XX` already there and what a URL
+// holds as they are.
+#[test]
+fn redirect_takes_redirect_statuses_and_a_url_location_holds() {
+    let d = dir("redirects", "route GET /r/:n = redirect(\"/x\", int(n))\nroute GET /d = redirect(\"/x\")\nroute GET /to ? { u: str } = redirect(u)\n");
+    let (_g, port, log) = serve_logged(&d, &[]);
+    for n in [301, 302, 303, 307, 308] {
+        let a = support::send(port, "GET", &format!("/r/{}", n), &[], "");
+        assert_eq!((a.status, a.header("location")), (n, Some("/x")));
+    }
+    assert_eq!(support::send(port, "GET", "/d", &[], "").status, 303);
+    for n in [200, 300, 304, 305, 306, 309, 399] {
+        let why = error_of(port, &log, &format!("/r/{}", n));
+        assert!(why.contains(&format!("`redirect` status is 301, 302, 303, 307 or 308, got {}", n)), "{}", why);
+    }
+    for (u, want) in [
+        ("/a b", "/a%20b"),
+        ("/a\"><script>", "/a%22%3E%3Cscript%3E"),
+        ("/%41", "/%41"),
+        ("/%c3%a9", "/%c3%a9"),
+        ("/100%", "/100%25"),
+        ("/%zz", "/%25zz"),
+        ("/%4", "/%254"),
+        ("/é", "/%C3%A9"),
+        ("/a\\b", "/a%5Cb"),
+        ("/{x}|^`", "/%7Bx%7D%7C%5E%60"),
+        ("https://example.com/p?q=a&b=c#f", "https://example.com/p?q=a&b=c#f"),
+        ("https://bücher.de/x?q=ü", "https://xn--bcher-kva.de/x?q=%C3%BC"),
+        ("https://user:pä@bücher.de:8080/ä b", "https://user:p%C3%A4@xn--bcher-kva.de:8080/%C3%A4%20b"),
+        ("//bücher.de/x", "//xn--bcher-kva.de/x"),
+        ("https://[::1]:8080/é", "https://[::1]:8080/%C3%A9"),
+        ("https://example.com\\é", "https://example.com%5C%C3%A9"),
+        ("/x?u=https://bücher.de", "/x?u=https://b%C3%BCcher.de"),
+        ("/p?x=[1]&y=@~!$'()*+,;=:", "/p?x=[1]&y=@~!$'()*+,;=:"),
+    ] {
+        let a = support::send(port, "GET", &format!("/to?u={}", enc(u)), &[], "");
+        assert_eq!((a.status, a.header("location")), (303, Some(want)), "{}", u);
+    }
+}
+
+// Q-723: a POST with a matching `If-None-Match` got a 304, where RFC 9110 says 412; a range end
+// past 2^64 gave the whole file as a 200; `Bytes=0-1` was let go and `bytes=+2-4` taken. Now each is
+// as RFC 9110 has it, and what was right stays. `If-Match` and `If-Range` take the file's own
+// (weak) tag, the user's decision.
+#[test]
+fn ranges_and_conditionals_are_as_rfc_9110_has_them() {
+    let d = dir("rfc9110", "route GET /f = file(\"a.txt\")\nroute POST /f = file(\"a.txt\")\nroute GET /big = file(\"big.bin\")\n");
+    std::fs::write(d.join("a.txt"), "hello\n").unwrap();
+    std::fs::write(d.join("big.bin"), vec![b'b'; 2 << 20]).unwrap();
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let first = support::send(s.port, "GET", "/f", &[], "");
+    let (etag, modified) = (first.header("etag").unwrap().to_string(), first.header("last-modified").unwrap().to_string());
+    assert!(etag.starts_with("W/\""), "{}", etag);
+    let strong = etag.trim_start_matches("W/").to_string();
+    let status = |method: &str, path: &str, h: &[(&str, &str)]| support::send(s.port, method, path, h, "").status;
+    // The user's decision: the file's own tag, with or without its `W/`, passes If-Match and
+    // If-Range, as nginx has it, so a resume or a seek gets its part; another tag does not.
+    assert_eq!(status("GET", "/f", &[("If-Match", &etag)]), 200);
+    assert_eq!(status("GET", "/f", &[("If-Match", &strong)]), 200);
+    assert_eq!(status("GET", "/f", &[("If-Match", "*")]), 200);
+    assert_eq!(status("GET", "/f", &[("If-Match", &format!("\"x\", {}", etag))]), 200);
+    assert_eq!(status("GET", "/f", &[("If-Match", "\"x\", W/\"y\"")]), 412);
+    let resumed = support::send(s.port, "GET", "/f", &[("Range", "bytes=2-"), ("If-Range", &etag)], "");
+    assert_eq!((resumed.status, resumed.body.as_str()), (206, "llo\n"));
+    assert_eq!(status("GET", "/f", &[("Range", "bytes=0-1"), ("If-Range", &strong)]), 206);
+    assert_eq!(status("GET", "/f", &[("Range", "bytes=0-1"), ("If-Range", "W/\"other\"")]), 200);
+    assert_eq!(status("GET", "/f", &[("Range", "bytes=0-1"), ("If-Range", "*")]), 200);
+    assert_eq!(status("GET", "/f", &[("Range", "bytes=0-1"), ("If-Range", &modified)]), 206);
+    assert_eq!(status("GET", "/f", &[("Range", "bytes=0-1"), ("If-Range", "Thu, 01 Jan 2099 00:00:00 GMT")]), 200);
+    // If-None-Match: a 304 for GET and HEAD, a 412 for another method; If-Modified-Since only for
+    // those two.
+    assert_eq!(status("GET", "/f", &[("If-None-Match", &etag)]), 304);
+    assert_eq!(status("HEAD", "/f", &[("If-None-Match", &etag)]), 304);
+    assert_eq!(status("POST", "/f", &[("If-None-Match", &etag)]), 412);
+    assert_eq!(status("POST", "/f", &[("If-None-Match", "*")]), 412);
+    assert_eq!(status("POST", "/f", &[("If-None-Match", "\"other\"")]), 200);
+    assert_eq!(status("POST", "/f", &[("If-Modified-Since", "Thu, 01 Jan 2099 00:00:00 GMT")]), 200);
+    assert_eq!(status("GET", "/f", &[("If-Modified-Since", "Thu, 01 Jan 2099 00:00:00 GMT")]), 304);
+    for (range, status, part) in [
+        ("bytes=0-99999999999999999999", 206, Some("bytes 0-5/6")),
+        ("bytes=0-18446744073709551615", 206, Some("bytes 0-5/6")),
+        ("bytes=-99999999999999999999", 206, Some("bytes 0-5/6")),
+        ("bytes=99999999999999999999-", 416, Some("bytes */6")),
+        ("Bytes=0-1", 206, Some("bytes 0-1/6")),
+        ("BYTES=1-2", 206, Some("bytes 1-2/6")),
+        ("bytes=0-0", 206, Some("bytes 0-0/6")),
+        ("bytes=5-5", 206, Some("bytes 5-5/6")),
+        ("bytes=6-", 416, Some("bytes */6")),
+        ("bytes=+2-4", 200, None),
+        ("bytes=2-+4", 200, None),
+        ("bytes=-+1", 200, None),
+        ("bytes=0x1-2", 200, None),
+        ("bytes=", 200, None),
+        ("bytes=-", 200, None),
+        ("bytés=0-1", 200, None),
+        ("bytes=0-1,3-4", 200, None),
+    ] {
+        let a = support::send(s.port, "GET", "/f", &[("Range", range)], "");
+        assert_eq!((a.status, a.header("content-range")), (status, part), "{}", range);
+    }
+    // A large file's part, resumed with its tag, and its end past 2^64, from disk.
+    let big_tag = support::send(s.port, "HEAD", "/big", &[], "").header("etag").unwrap().to_string();
+    let a = support::send(s.port, "GET", "/big", &[("Range", "bytes=1048576-"), ("If-Range", &big_tag)], "");
+    assert_eq!((a.status, a.body.len()), (206, 1 << 20));
+    let a = support::send(s.port, "GET", "/big", &[("Range", "bytes=1-99999999999999999999")], "");
+    assert_eq!((a.status, a.header("content-range"), a.body.len()), (206, Some("bytes 1-2097151/2097152"), (2 << 20) - 1));
+}
+
+// Q-724: only the gzipped copy of a compressible answer said `Vary: accept-encoding`, so a shared
+// cache that saw a request without `Accept-Encoding` first kept the plain copy for everyone. Now
+// each answer that would have been gzipped for a client that takes it says so, once; an answer too
+// small to be, or of another type, does not.
+#[test]
+fn a_compressible_answer_varies_by_accept_encoding() {
+    let d = dir(
+        "vary",
+        "route GET /t/:n = repeat(\"x\", int(n))\nroute GET /j = for i in 0..300 => i\nroute GET /png = respond(200, repeat(\"x\", 2000), { \"content-type\": \"image/png\" })\nroute GET /own = respond(200, repeat(\"x\", 2000), { \"vary\": \"Accept-Encoding\" })\nroute GET /star = respond(200, repeat(\"x\", 2000), { \"vary\": \"*\" })\nroute GET /cookie = `${cookie(\"a\") ?? \"\"}${repeat(\"x\", 2000)}`\nroute GET /s/*p = files(\"pub\", p)\n",
+    );
+    std::fs::create_dir_all(d.join("pub")).unwrap();
+    std::fs::write(d.join("pub/app.css"), ".a { color: red; margin: 0 auto; }\n".repeat(60)).unwrap();
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let gz = ("Accept-Encoding", "gzip");
+    let varies = |a: &support::Answer| all_of(a, "vary").iter().filter(|v| v.to_ascii_lowercase().contains("accept-encoding")).count();
+    for path in ["/t/2000", "/t/1024", "/j", "/s/app.css"] {
+        let plain = support::send(s.port, "GET", path, &[], "");
+        assert_eq!((plain.status, plain.header("content-encoding"), varies(&plain)), (200, None, 1), "{}", path);
+        let zipped = support::send(s.port, "GET", path, &[gz], "");
+        assert_eq!((zipped.header("content-encoding"), varies(&zipped)), (Some("gzip"), 1), "{}", path);
+    }
+    for path in ["/t/1023", "/t/0", "/png"] {
+        for h in [&[][..], &[gz][..]] {
+            let a = support::send(s.port, "GET", path, h, "");
+            assert_eq!((a.status, a.header("content-encoding"), varies(&a)), (200, None, 0), "{} {:?}", path, h);
+        }
+    }
+    let own = support::send(s.port, "GET", "/own", &[], "");
+    assert_eq!(all_of(&own, "vary"), ["Accept-Encoding"]);
+    assert_eq!(all_of(&support::send(s.port, "GET", "/star", &[], ""), "vary"), ["*"]);
+    let personal = support::send(s.port, "GET", "/cookie", &[], "");
+    assert!(all_of(&personal, "vary").contains(&"Cookie") && varies(&personal) == 1, "{:?}", personal.headers);
+    // A copy not changed since is no answer of a type.
+    let etag = support::send(s.port, "GET", "/s/app.css", &[], "").header("etag").unwrap().to_string();
+    let a = support::send(s.port, "GET", "/s/app.css", &[("If-None-Match", &etag)], "");
+    assert_eq!(a.status, 304);
+}
+
+/// A GET of `path` written on a connection of its own, left unread.
+fn asked_and_unread(port: u16, path: &str) -> std::net::TcpStream {
+    use std::io::Write;
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+    s.write_all(format!("GET {} HTTP/1.1\r\nHost: x\r\n\r\n", path).as_bytes()).unwrap();
+    s
+}
+
+/// What comes on `s` up to the end of the first head.
+fn head_of(s: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+    let mut out = Vec::new();
+    let mut b = [0u8; 1];
+    while !out.ends_with(b"\r\n\r\n") && s.read(&mut b).unwrap_or(0) == 1 {
+        out.push(b[0]);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// Q-725: with eight large sends to one client running, a HEAD of a large file, or a 10-byte range
+// of one, was refused with a 503, though neither sends much. Now only what is sent from disk takes
+// a place: a HEAD sends no body (and its connection carries on), and a range of up to 1 MiB is sent
+// from memory; a larger range and the whole file wait their turn, as before.
+#[test]
+fn a_head_or_a_small_range_takes_no_place_among_the_large_sends() {
+    let d = dir("places", "route GET /big = file(\"big.bin\")\nroute GET / = \"hi\"\n");
+    let size: u64 = 64 << 20;
+    std::fs::File::create(d.join("big.bin")).unwrap().set_len(size).unwrap();
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let mut held: Vec<std::net::TcpStream> = (0..8).map(|_| asked_and_unread(s.port, "/big")).collect();
+    for h in held.iter_mut() {
+        assert!(head_of(h).starts_with("HTTP/1.1 200"));
+    }
+    let a = support::send(s.port, "HEAD", "/big", &[], "");
+    assert_eq!((a.status, a.header("content-length"), a.body.as_str()), (200, Some(&*size.to_string()), ""));
+    let a = support::send(s.port, "HEAD", "/big", &[("Range", "bytes=0-1048576")], "");
+    assert_eq!((a.status, a.header("content-length"), a.header("content-range")), (206, Some("1048577"), Some(&*format!("bytes 0-1048576/{}", size))));
+    // Two on one connection: the first leaves it open.
+    let out = on_one_connection(s.port, "HEAD /big HTTP/1.1\r\nHost: x\r\n\r\nHEAD /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    assert_eq!(out.matches("HTTP/1.1 200 OK").count(), 2, "{}", out);
+    assert_eq!(out.matches(&format!("content-length: {}\r\n", size)).count(), 2, "{}", out);
+    for (range, len) in [("bytes=0-9", 10), ("bytes=-10", 10), ("bytes=0-1048575", 1 << 20)] {
+        let a = support::send(s.port, "GET", "/big", &[("Range", range)], "");
+        assert_eq!((a.status, a.body.len()), (206, len), "{}", range);
+    }
+    for range in ["bytes=0-1048576", "bytes=0-"] {
+        assert_eq!(support::send(s.port, "GET", "/big", &[("Range", range)], "").status, 503, "{}", range);
+    }
+    assert_eq!(support::send(s.port, "GET", "/big", &[], "").status, 503);
+    assert_eq!(support::send(s.port, "GET", "/", &[], "").body, "hi");
+    drop(held);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let mut s = asked_and_unread(s.port, "/big");
+        if head_of(&mut s).starts_with("HTTP/1.1 200") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "no place came free");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+// Q-726: `set_cookie` sent a 5,000-byte cookie, which browsers drop; `file()`'s type errors said a
+// str was not a str, and a type with a control character went out as an answer with no
+// Content-Type, as `stream`'s did; a cookie path of `/a b` was told it "starts with /". Now each
+// says what is wrong: a cookie over 3,900 bytes as sent (as `set_session`'s), an empty type or
+// download, a control character, and a path's characters.
+#[test]
+fn cookies_and_types_say_what_is_wrong_with_them() {
+    let d = dir(
+        "messages",
+        "let o = json.parse(env(\"O\") ?? \"null\")\nset_cookie(\"x\", env(\"V\") ?? \"v\", o)\nprint(\"ok\")\n",
+    );
+    std::fs::write(d.join("f.qwe"), "let t = env(\"T\") ?? \"text/csv\"\nlet n = json.parse(env(\"D\") ?? \"null\")\nprint(file(\"a.txt\", { type: t, download: n }).status)\n").unwrap();
+    std::fs::write(d.join("s.qwe"), "let t = json.parse(env(\"T\") ?? \"null\")\nprint(stream((send) => send(\"x\"), { type: t }).status)\n").unwrap();
+    std::fs::write(d.join("a.txt"), "a\n").unwrap();
+    let says = |file: &str, env: &[(&str, &str)], want: &str| {
+        let out = script_with_env(&d, file, env);
+        assert!(out.contains(want), "{:?}: {}", env, out);
+    };
+    let x = |n: usize| "x".repeat(n);
+    says("main.qwe", &[("V", &x(3898))], "ok");
+    says("main.qwe", &[("V", &x(3899))], "`set_cookie`: the cookie `x` is 3901 bytes as sent (its value percent-encoded), more than a browser keeps with its attributes (3900)");
+    says("main.qwe", &[("V", &"é".repeat(649))], "ok");
+    says("main.qwe", &[("V", &"é".repeat(650))], "the cookie `x` is 3902 bytes as sent");
+    says("main.qwe", &[("V", "")], "ok");
+    for (path, want) in [
+        (r#""/a b""#, "`set_cookie`'s path cannot hold a space, a `;`, a control character or a letter past ASCII (percent-encode them), got \"/a b\""),
+        (r#""/a; Domain=x""#, "path cannot hold a space, a `;`"),
+        (r#""/é""#, "path cannot hold a space"),
+        (r#""/a\tb""#, "path cannot hold a space"),
+        (r#""x""#, "`set_cookie`'s path starts with /, got \"x\""),
+        (r#""""#, "`set_cookie`'s path starts with /, got \"\""),
+        ("5", "`set_cookie`'s path is a str that starts with /, got int"),
+        (r#""/a%20b""#, "ok"),
+        (r#""/""#, "ok"),
+    ] {
+        says("main.qwe", &[("O", &format!("{{\"path\": {}}}", path))], want);
+    }
+    for (t, want) in [
+        ("", "`file`'s type is empty: give a content type, like \"text/csv\", or leave it out"),
+        ("  ", "`file`'s type is empty"),
+        ("text/plain\r\nx: y", "`file`'s type cannot hold line breaks or other control characters, got \"text/plain\\r\\nx: y\""),
+        ("text/plain\u{1}", "`file`'s type cannot hold line breaks or other control characters"),
+        ("text/plain\u{7f}", "`file`'s type cannot hold line breaks"),
+        ("text/plain;\tcharset=utf-8", "200"),
+        ("text/csv", "200"),
+        ("text/ünï", "200"),
+    ] {
+        says("f.qwe", &[("T", t)], want);
+    }
+    says("f.qwe", &[("D", r#""""#)], "`file`'s download is empty: give the name a browser saves the file as, or leave it out");
+    says("f.qwe", &[("D", "3")], "`file`'s download is a str, got 3");
+    says("f.qwe", &[("D", r#""r.csv""#)], "200");
+    for (t, want) in [
+        (r#""a\u0001""#, "`stream`'s type cannot hold line breaks or other control characters, got \"a\\u0001\""),
+        (r#""""#, "`stream`'s type is empty"),
+        ("5", "`stream`'s type is a str, like \"text/csv\", got int"),
+        (r#""text/csv""#, "200"),
+        ("null", "200"),
+    ] {
+        says("s.qwe", &[("T", t)], want);
     }
 }

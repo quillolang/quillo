@@ -110,13 +110,21 @@ fn response(args: &[Value], name: &str, events: bool, line: u32) -> R {
     };
     let status = match opts.get("status") {
         None | Some(Value::Nil) => 200,
+        // A 204, 205 or 304 has no body: what the function sent was read as the start of the next
+        // answer on the connection (FEEDBACK55.md, Q-709; branch feedback55).
+        Some(Value::Int(n)) if bodyless(*n) => return fail(line, no_body(name, *n)),
         Some(Value::Int(n)) if (200..600).contains(n) => *n as u16,
         Some(other) => return fail(line, format!("`{}`: status must be an int from 200 to 599, got {}", name, other.repr())),
     };
+    // A type that is no str, or that a header cannot hold, is an error, as `respond`'s is, where
+    // the first was let go and the second dropped as the head was written (FEEDBACK55.md, Q-726;
+    // branch feedback55).
     let ctype = match opts.get("type") {
-        Some(Value::Str(t)) if !events => t.to_string(),
-        _ if events => "text/event-stream".into(),
-        _ => "text/plain; charset=utf-8".into(),
+        Some(Value::Str(t)) if !events => crate::builtins::content_type(t, name, line)?,
+        None | Some(Value::Nil) => if events { "text/event-stream" } else { "text/plain; charset=utf-8" }.into(),
+        // `events`' type is its own, but a type that is no str is refused there too.
+        Some(Value::Str(_)) => "text/event-stream".into(),
+        Some(other) => return fail(line, format!("`{}`'s type is a str, like \"text/csv\", got {}", name, other.type_name())),
     };
     let mut headers = vec![("content-type".to_string(), ctype)];
     if events {
@@ -124,13 +132,32 @@ fn response(args: &[Value], name: &str, events: bool, line: u32) -> R {
     }
     // Proxies such as nginx would otherwise hold the answer back until it ends.
     headers.push(("x-accel-buffering".into(), "no".into()));
-    if let Some(Value::Map(h)) = opts.get("headers") {
-        for (k, v) in h.iter() {
-            headers.retain(|(n, _)| !n.eq_ignore_ascii_case(k.as_str()));
-            headers.push((k.to_string(), v.display()));
+    match opts.get("headers") {
+        // As `respond` takes them (FEEDBACK55.md, Q-710; branch feedback55).
+        Some(Value::Map(h)) => {
+            for (k, v) in crate::builtins::answer_headers(h, name, line)? {
+                if k != "set-cookie" {
+                    headers.retain(|(n, _)| *n != k);
+                }
+                headers.push((k, v));
+            }
         }
+        None | Some(Value::Nil) => {}
+        Some(other) => return fail(line, format!("`{}`'s headers are a map, got {}", name, other.type_name())),
     }
     Ok(Value::Response(Arc::new(Response { status, headers, body: Body::Stream { f, events } })))
+}
+
+/// A status whose answer has no body (RFC 9110 §15.3.5, §15.3.6 and §15.4.5; FEEDBACK55.md, Q-709;
+/// branch feedback55).
+pub(crate) fn bodyless(status: i64) -> bool {
+    matches!(status, 204 | 205 | 304)
+}
+
+/// What `stream` and `events` (and `reply` with one) say of a status with no body (FEEDBACK55.md,
+/// Q-709; branch feedback55).
+pub(crate) fn no_body(name: &str, status: i64) -> String {
+    format!("`{}` cannot answer {}: that status has no body, and what it sends would be read as the next answer; give respond({}, null)", name, status, status)
 }
 
 /// `stream(f, { type, status, headers })`: an answer sent as `f` makes it.

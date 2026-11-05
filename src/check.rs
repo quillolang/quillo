@@ -4123,6 +4123,7 @@ impl Checker {
                 }
                 self.upload_named_by_visitor(callee, args);
                 self.interim_status(callee, args);
+                self.cookie_options(callee, args);
                 if let Expr::Field(o, f, _) = callee.as_ref() {
                     if let Expr::Ident(s, _) = o.as_ref() {
                         if self.sites.contains(s.as_str()) && !self.is_local(s) {
@@ -4668,6 +4669,28 @@ impl Checker {
         if let Some(Expr::Lit(Lit::Int(n))) = args.first() {
             if (100..200).contains(n) {
                 self.error(format!("`respond` status must be 200-599, got {}: a 1xx is an interim answer, and the client would wait for the real one", n));
+            }
+        }
+    }
+
+    /// `set_cookie("t", v, { sameSite: "Strict" })`: an option written out that it does not take,
+    /// which it refuses when it runs, said before (FEEDBACK55.md, Q-712; branch feedback55).
+    fn cookie_options(&mut self, callee: &Expr, args: &[Expr]) {
+        let (f, at) = match callee {
+            Expr::Ident(n, _) if n == "set_cookie" => ("set_cookie", 2),
+            Expr::Ident(n, _) if n == "delete_cookie" => ("delete_cookie", 1),
+            _ => return,
+        };
+        if self.is_local(f) {
+            return;
+        }
+        if let Some(Expr::Map(entries)) = args.get(at) {
+            for (k, v) in entries {
+                // A value not written out may be 0, which a deletion's `max_age` may be.
+                let zero = !matches!(v, Expr::Lit(_)) || matches!(v, Expr::Lit(Lit::Int(0) | Lit::Nil));
+                if let Some(why) = crate::session::option_refused(f, k, zero) {
+                    self.error(why);
+                }
             }
         }
     }

@@ -6,7 +6,26 @@
 use crate::value::{Key, Map, Value};
 
 /// Most parts one request may have.
-const MAX_PARTS: usize = 1000;
+pub const MAX_PARTS: usize = 1000;
+
+/// Whether a multipart body has more parts than `MAX_PARTS`, which are answered 413 before the
+/// route runs, where the parts past it were dropped and the answer was a 200 (FEEDBACK55.md,
+/// Q-716; branch feedback55). Counted as `parse` walks them.
+pub fn too_many_parts(boundary: &str, body: &[u8]) -> bool {
+    let delim = format!("--{}", boundary).into_bytes();
+    let next_delim = format!("\r\n--{}", boundary).into_bytes();
+    let Some(mut at) = find(body, &delim, 0) else { return false };
+    for _ in 0..=MAX_PARTS {
+        at += delim.len();
+        if body.get(at..at + 2) == Some(b"--") {
+            return false;
+        }
+        let Some(head_end) = find(body, b"\r\n\r\n", at) else { return false };
+        let Some(end) = find(body, &next_delim, head_end + 4) else { return false };
+        at = end + 2;
+    }
+    true
+}
 
 /// The boundary a multipart content type names, if it is one.
 pub fn boundary(ctype: &str) -> Option<String> {
@@ -50,6 +69,21 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 /// writes, `%22` for `"`, `%0D` and `%0A`, are undone (FEEDBACK30.md, Q-373; branch
 /// feedback27-35-fixes).
 fn param(header: &str, name: &str) -> Option<String> {
+    param_as_sent(header, name).map(|v| v.replace("%22", "\"").replace("%0D", "\r").replace("%0A", "\n"))
+}
+
+/// Whether a quote before `rest` ends a parameter's value: the end follows, or `;` and another
+/// parameter, `name=` (FEEDBACK55.md, Q-720; branch feedback55).
+fn ends_value(rest: &str) -> bool {
+    let rest = rest.trim_start();
+    let Some(after) = rest.strip_prefix(';') else { return rest.is_empty() };
+    let after = after.trim_start();
+    let name = after.bytes().take_while(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(b)).count();
+    after.is_empty() || name > 0 && after[name..].trim_start().starts_with('=')
+}
+
+/// A parameter's value as it was sent, unquoted (FEEDBACK55.md, Q-720; branch feedback55).
+fn param_as_sent(header: &str, name: &str) -> Option<String> {
     let mut rest = header.split_once(';')?.1;
     loop {
         let (k, after) = rest.split_once('=')?;
@@ -57,12 +91,20 @@ fn param(header: &str, name: &str) -> Option<String> {
         let (v, next) = match after.strip_prefix('"') {
             Some(q) => {
                 let mut v = String::new();
-                let mut chars = q.char_indices();
+                let mut chars = q.char_indices().peekable();
                 let mut end = q.len();
-                // No backslash escapes: browsers send `\` as it is (a Windows path), and a quote
-                // as `%22`.
-                for (i, c) in chars.by_ref() {
+                // Browsers send `\` as it is (a Windows path, `name="f\"`), and a quote as `%22`;
+                // other clients (Go's mime/multipart, curl) write a quote `\"`, as RFC 9110's
+                // quoted-string has it, where `filename="a\"b.txt"` was the name `a\`. A `\"` is
+                // read as the browser wrote it when that reading parses, its quote ending the value
+                // before `;` and another parameter or the end, and else as a quote (FEEDBACK55.md,
+                // Q-720; branch feedback55).
+                while let Some((i, c)) = chars.next() {
                     match c {
+                        '\\' if matches!(chars.peek(), Some((_, '"'))) && !ends_value(&q[i + 2..]) => {
+                            v.push('"');
+                            chars.next();
+                        }
                         '"' => {
                             end = i + 1;
                             break;
@@ -79,7 +121,7 @@ fn param(header: &str, name: &str) -> Option<String> {
             },
         };
         if k.trim().eq_ignore_ascii_case(name) {
-            return Some(v.replace("%22", "\"").replace("%0D", "\r").replace("%0A", "\n"));
+            return Some(v);
         }
         if next.is_empty() {
             return None;
@@ -102,6 +144,30 @@ pub fn attachment(name: &str) -> String {
         }
     }
     format!("attachment; filename=\"{}\"; filename*=UTF-8''{}", plain, enc)
+}
+
+/// A `filename*` of RFC 5987 (`UTF-8''%E2%82%AC%20rates.txt`), which a client may send in place of
+/// a `filename`: the part was a field of the form (FEEDBACK55.md, Q-720; branch feedback55). Its
+/// bytes are UTF-8 or ISO-8859-1, as it names; another charset is read as UTF-8.
+fn ext_value(v: &str) -> Option<String> {
+    let (charset, rest) = v.trim().split_once('\'')?;
+    let (_, enc) = rest.split_once('\'')?;
+    let b = enc.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], b.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok())) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                i += 3;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Some(if charset.eq_ignore_ascii_case("iso-8859-1") { out.iter().map(|&c| c as char).collect() } else { String::from_utf8_lossy(&out).into_owned() })
 }
 
 /// A browser's file name without any folders it sent along.
@@ -140,7 +206,7 @@ pub fn parse(boundary: &str, body: &[u8]) -> (Map, Map) {
             }
         }
         if let Some(name) = param(&disposition, "name") {
-            match param(&disposition, "filename") {
+            match param(&disposition, "filename").or_else(|| param_as_sent(&disposition, "filename*").and_then(|v| ext_value(&v))) {
                 Some(filename) => {
                     let filename = base_name(&filename);
                     // An empty file input sends a part with no name and no bytes.

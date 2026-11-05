@@ -364,28 +364,53 @@ pub fn send(mut stream: std::net::TcpStream, resp: &crate::server::HttpResponse,
 /// end)))`, `Some(Err(()))` when it cannot be served (416), or `None` to
 /// send the whole file (no range, several ranges, or not bytes).
 pub fn range(header: &str, len: u64) -> Option<Result<(u64, u64), ()>> {
-    let spec = header.trim().strip_prefix("bytes=")?;
+    // The unit in any case, and positions of digits only, however many: `Bytes=0-1` was let go,
+    // `bytes=+2-4` taken, and an end past 2^64 sent the whole file as a 200, where it is the
+    // file's end (RFC 9110 §14.1; FEEDBACK55.md, Q-723; branch feedback55).
+    let header = header.trim();
+    let spec = header.get(6..).filter(|_| header[..6].eq_ignore_ascii_case("bytes="))?;
     if spec.contains(',') || len == 0 {
         return None;
     }
     let (a, b) = spec.split_once('-')?;
     let (a, b) = (a.trim(), b.trim());
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    let pos = |s: &str| s.parse::<u64>().unwrap_or(u64::MAX);
+    if !(digits(a) || a.is_empty()) || !(digits(b) || b.is_empty()) {
+        return None;
+    }
     let r = if a.is_empty() {
         // The last N bytes.
-        let n: u64 = b.parse().ok()?;
+        if b.is_empty() {
+            return None;
+        }
+        let n = pos(b);
         if n == 0 {
             return Some(Err(()));
         }
         (len.saturating_sub(n), len - 1)
     } else {
-        let start: u64 = a.parse().ok()?;
-        let end = if b.is_empty() { len - 1 } else { b.parse::<u64>().ok()?.min(len - 1) };
+        let start = pos(a);
+        let end = if b.is_empty() { len - 1 } else { pos(b).min(len - 1) };
         if start > end || start >= len {
             return Some(Err(()));
         }
         (start, end)
     };
     Some(Ok(r))
+}
+
+/// Whether `If-Range`'s tag is the file's `etag`, with or without `W/` on either (FEEDBACK55.md,
+/// Q-723; branch feedback55).
+pub fn same_tag(tag: &str, etag: &str) -> bool {
+    let bare = |t: &str| t.trim().strip_prefix("W/").unwrap_or(t.trim()).to_string();
+    bare(tag) == bare(etag)
+}
+
+/// Whether bytes this many are sent from memory, not from disk on a thread of their own (a range
+/// of a large file: FEEDBACK55.md, Q-725; branch feedback55).
+pub fn small_len(n: u64) -> bool {
+    n <= SMALL
 }
 
 /// Whether an `If-None-Match` header names `etag` (weakly) or `*`.

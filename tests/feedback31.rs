@@ -383,8 +383,10 @@ fn a_page_made_for_one_visitor_is_private_and_no_site_frames_a_page() {
     assert_eq!((me.header("cache-control"), me.header("vary"), me.header("x-frame-options")), (Some("private"), Some("Cookie"), Some("SAMEORIGIN")));
     assert_eq!(me.header("content-security-policy"), Some("default-src 'self'"));
     assert_eq!(h("/c").header("cache-control"), Some("private"));
+    // Not `Vary: Cookie`; a page gzipped for a client that takes it varies by that, plain too
+    // (FEEDBACK55.md, Q-724; branch feedback55).
     let plain = h("/plain");
-    assert_eq!((plain.header("cache-control"), plain.header("vary"), plain.header("x-frame-options"), plain.header("x-extra")), (None, None, Some("SAMEORIGIN"), Some("1")));
+    assert_eq!((plain.header("cache-control"), plain.header("vary"), plain.header("x-frame-options"), plain.header("x-extra")), (None, Some("accept-encoding"), Some("SAMEORIGIN"), Some("1")));
     let embed = h("/embed/x");
     assert_eq!((embed.header("x-frame-options"), embed.header("x-extra")), (None, Some("2")));
     let own = h("/own");

@@ -274,13 +274,14 @@ fn a_chunk_not_ended_by_a_line_break_is_refused() {
     assert!(a.starts_with("HTTP/1.1 400") && a.contains("bad chunked body"), "{}", a);
 }
 
+// A header a response cannot carry is the program's error, as `respond`'s is, where `stream`'s was
+// left out as the head was written (FEEDBACK55.md, Q-726; branch feedback55).
 #[test]
-fn a_header_a_response_cannot_carry_is_left_out_and_logged() {
+fn a_header_a_response_cannot_carry_is_an_error() {
     let srv = start("bad-header", APP, &[]);
     let a = raw(srv.port, b"GET /bad-header HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
-    assert!(a.starts_with("HTTP/1.1 200"), "{}", a);
-    assert!(a.contains("x-fine: yes") && !a.contains("x-bad"), "{}", a);
-    assert!(srv.logged("header `x-bad` not sent"), "{}", srv.log());
+    assert!(a.starts_with("HTTP/1.1 500") && !a.contains("x-bad") && !a.contains("x-fine"), "{}", a);
+    assert!(srv.logged("`stream` header `x-bad`: names are letters, digits and -, values cannot contain line breaks"), "{}", srv.log());
 }
 
 #[test]

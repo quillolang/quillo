@@ -75,8 +75,11 @@ fn ranges_are_served_on_their_own() {
     // If-Range names another version: the whole (new) file.
     let r = get(&mut it, "/f/b.txt", &[("Range", "bytes=2-5"), ("If-Range", "W/\"old\"")]);
     assert_eq!((r.status, r.text().as_str()), (200, "0123456789"));
+    // The file's own tag, and its date (FEEDBACK55.md, Q-723; branch feedback55).
     let etag = r.header("etag").unwrap().to_string();
     assert_eq!(get(&mut it, "/f/b.txt", &[("Range", "bytes=2-5"), ("If-Range", &etag)]).status, 206);
+    let modified = r.header("last-modified").unwrap().to_string();
+    assert_eq!(get(&mut it, "/f/b.txt", &[("Range", "bytes=2-5"), ("If-Range", &modified)]).status, 206);
     let _ = std::fs::remove_dir_all(&d);
 }
 

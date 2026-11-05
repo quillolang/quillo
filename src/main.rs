@@ -365,6 +365,8 @@ fn serve(args: &[String]) -> i32 {
     }
     let program = Path::new(&dir).join(".quillo-serve.qwe");
     quillo::error::set_virtual(program.clone(), "route GET /*path = files(\".\", path)\n".into());
+    // Its URLs are its own (FEEDBACK55.md, Q-721; branch feedback55).
+    quillo::builtins::SERVES_FOLDER.store(true, std::sync::atomic::Ordering::Relaxed);
     run(&program.to_string_lossy(), &flags)
 }
 

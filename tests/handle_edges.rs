@@ -117,7 +117,7 @@ route GET /no-options { set_cookie("a", "b", null); "set" }
         ("/empty-domain", "domain is a host name"),
         ("/number-domain", "domain is a host name"),
         ("/bad-path", "path starts with /"),
-        ("/path-break", "path starts with /"),
+        ("/path-break", "path cannot hold a space, a `;`, a control character"),
         ("/bad-age", "max_age is seconds or a duration"),
         ("/bad-same-site", "same_site is \"Lax\""),
         ("/number-same-site", "same_site is a str, got int"),

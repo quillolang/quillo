@@ -254,15 +254,29 @@ pub fn host_name(host: &str) -> String {
     }
 }
 
+/// One `name=value` of a `Cookie` header, trimmed around `=`, its value out of one pair of quotes
+/// (FEEDBACK55.md, Q-718; branch feedback55).
+pub(crate) fn cookie_pair(part: &str) -> Option<(&str, &str)> {
+    let (k, v) = part.split_once('=')?;
+    let v = v.trim();
+    let v = v.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(v);
+    Some((k.trim(), v))
+}
+
 fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map {
     let header = |name: &str| {
         req.headers.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()).unwrap_or("")
     };
     let ctype = header("content-type").to_string();
+    // As RFC 6265 reads them: the first of a name, which a browser sends with the longest path, so
+    // `/admin`'s is not lost to `/`'s; the name and value without spaces around `=`; and one pair
+    // of quotes around the value taken off (FEEDBACK55.md, Q-718; branch feedback55).
     let mut cookies = Map::new();
     for part in header("cookie").split(';') {
-        if let Some((k, v)) = part.trim().split_once('=') {
-            cookies.insert(k.into(), Value::str(percent_decode(v, false)));
+        if let Some((k, v)) = cookie_pair(part) {
+            if !cookies.contains_key(k) {
+                cookies.insert(k.into(), Value::str(percent_decode(v, false)));
+            }
         }
     }
     // Files: their bytes stay in the body (see `upload`), which is no text.
@@ -284,7 +298,8 @@ fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map {
     };
     let (form, files) = match &multipart {
         Some(b) => crate::upload::parse(b, &req.body),
-        None if ctype.contains("application/x-www-form-urlencoded") => (parse_urlencoded(&body), Map::new()),
+        // The type in any case, with or without parameters (FEEDBACK55.md, Q-717; branch feedback55).
+        None if essence(&ctype) == "application/x-www-form-urlencoded" => (parse_urlencoded(&body), Map::new()),
         None => (Map::new(), Map::new()),
     };
 
@@ -423,7 +438,7 @@ impl Interp {
         self.site_headers_into(path, sets_cookie, &mut resp);
         if !self.base.is_empty() {
             for (k, v) in resp.headers.iter_mut() {
-                if k.eq_ignore_ascii_case("location") {
+                if k.eq_ignore_ascii_case("location") && *v != DROPPED {
                     *v = self.with_base(v);
                 }
             }
@@ -1051,7 +1066,8 @@ impl Interp {
                 resp.headers.push((k, v));
             }
         }
-        if personal && !resp.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("vary") && v.to_ascii_lowercase().contains("cookie")) {
+        // Not when the program said `vary: null` (FEEDBACK55.md, Q-710; branch feedback55).
+        if personal && !resp.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("vary") && (v == DROPPED || v.to_ascii_lowercase().contains("cookie"))) {
             resp.headers.push(("vary".into(), "Cookie".into()));
         }
     }
@@ -1672,6 +1688,9 @@ impl Drop for Waiter {
 /// What the server does with a request.
 pub(crate) enum Answer {
     Respond(HttpResponse),
+    /// The head of a large file's answer to a HEAD, with the length a GET would send, and no
+    /// body: it takes no place among the large sends (FEEDBACK55.md, Q-725; branch feedback55).
+    Head(HttpResponse, u64),
     /// The connection goes to a thread of its own (pages waiting for live
     /// data or reloads, large files), which answers on it directly.
     Detach(crate::httpd::Detached),
@@ -1696,6 +1715,11 @@ fn write_first(mut stream: std::net::TcpStream, before: &[u8]) -> Option<std::ne
 /// Sends a large file from disk on a thread of its own (see `statics`),
 /// within the places for such sends; 503 when they are taken.
 fn send_file(resp: HttpResponse, what: (std::path::PathBuf, u64, u64, Option<crate::statics::FileId>), head: bool, ip: &str) -> Answer {
+    // Only what is sent is counted: a HEAD sends no body, so it is answered here, where eight
+    // large sends to the client had it refused (FEEDBACK55.md, Q-725; branch feedback55).
+    if head {
+        return Answer::Head(resp, what.2);
+    }
     let Some(place) = crate::statics::SendPlace::take(ip) else {
         let mut busy = plain(503, "too many downloads at once; try again later\n");
         busy.headers.push(("retry-after".into(), "5".into()));
@@ -2646,11 +2670,26 @@ pub const MAX_BODY: usize = 10 << 20;
 /// Whether a header can be sent as it is: a name made of token characters,
 /// and a value without line breaks or other control characters, which would
 /// let text from a request add headers of its own.
+/// The value of a header the program named `null` (`respond`, `stream`, `events`): it holds the
+/// name's place, so that Quillo adds none of its own for it, and is not written (FEEDBACK55.md,
+/// Q-710; branch feedback55).
+pub const DROPPED: &str = "\0";
+
 pub fn valid_header(name: &str, value: &str) -> bool {
     let token = |c: u8| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c);
     !name.is_empty()
         && name.bytes().all(token)
         && value.bytes().all(|c| c == b'\t' || (c >= 0x20 && c != 0x7f))
+}
+
+/// Whether the request is a multipart form of more parts than are read (FEEDBACK55.md, Q-716;
+/// branch feedback55).
+fn too_many_parts(req: &HttpRequest) -> bool {
+    if req.body.is_empty() {
+        return false;
+    }
+    let ctype = req.headers.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map_or("", |(_, v)| v.as_str());
+    crate::upload::boundary(ctype).is_some_and(|b| crate::upload::too_many_parts(&b, &req.body))
 }
 
 /// Runs a request in the program (the caller holds the lock). A panic (a
@@ -2692,7 +2731,14 @@ fn compress(req: &HttpRequest, resp: &mut HttpResponse) {
     }
     let ctype = resp.header("content-type").unwrap_or("");
     let text = ctype.starts_with("text/") || ctype.contains("json") || ctype.contains("javascript") || ctype.contains("svg");
-    if !text || !accepts_gzip(req) {
+    if !text {
+        return;
+    }
+    // The copy not compressed varies by the header too: a shared cache that kept it from a
+    // request without `Accept-Encoding` gave it to everyone (FEEDBACK55.md, Q-724; branch
+    // feedback55).
+    if !accepts_gzip(req) {
+        vary_by_encoding(resp);
         return;
     }
     // A file's gzipped copy is kept (by its ETag) rather than made again.
@@ -2714,7 +2760,15 @@ fn compress(req: &HttpRequest, resp: &mut HttpResponse) {
     };
     resp.body = gz;
     resp.headers.push(("content-encoding".into(), "gzip".into()));
-    resp.headers.push(("vary".into(), "accept-encoding".into()));
+    vary_by_encoding(resp);
+}
+
+/// `vary: accept-encoding`, unless a `vary` says it already, or is `*`, or the program said
+/// `vary: null` (FEEDBACK55.md, Q-710 and Q-724; branch feedback55).
+fn vary_by_encoding(resp: &mut HttpResponse) {
+    if !resp.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("vary") && (v == DROPPED || v.trim() == "*" || v.to_ascii_lowercase().contains("accept-encoding"))) {
+        resp.headers.push(("vary".into(), "accept-encoding".into()));
+    }
 }
 
 /// `--allowed-hosts`: the names a server under `--watch` answers besides `localhost`
@@ -2849,6 +2903,10 @@ impl Worker {
             // browser drops the 503, and a click is made as usual (FEEDBACK22.md, Q-179;
             // branch feedback22-fixes).
             HttpResponse { status: 503, headers: vec![("cache-control".into(), "no-store".into())], body: Vec::new() }
+        } else if too_many_parts(&req) {
+            // As a body past the limit is, before the route runs: the parts past it were dropped
+            // and the answer was a 200 (FEEDBACK55.md, Q-716; branch feedback55).
+            plain(413, &format!("a form of more than {} parts\n", crate::upload::MAX_PARTS))
         } else {
             match (&mut self.local, &*self.program) {
                 (Some(it), _) => match {
@@ -2896,11 +2954,17 @@ impl Worker {
                         let script = dev_script(self.generation);
                         page.tail.splice(0..0, script.into_bytes());
                     }
-                    resp.headers.push(("x-content-type-options".into(), "nosniff".into()));
+                    // Unless the program sent its own, or none (FEEDBACK55.md, Q-710; branch
+                    // feedback55).
+                    if resp.header("x-content-type-options").is_none() {
+                        resp.headers.push(("x-content-type-options".into(), "nosniff".into()));
+                    }
                     let chunked = sink.chunked();
                     let close = if !sink.start(&resp, chunked) {
                         true
-                    } else if req.method == "HEAD" {
+                    } else if req.method == "HEAD" || crate::stream::bodyless(resp.status as i64) {
+                        // A head that says there is no body has none after it (FEEDBACK55.md,
+                        // Q-709; branch feedback55).
                         !chunked
                     } else {
                         // Unchunked, the end of the answer is the end of the connection.
@@ -2988,7 +3052,7 @@ fn not_modified(req: &HttpRequest, resp: &mut HttpResponse) {
     if resp.status != 200 || !matches!(req.method.as_str(), "GET" | "HEAD") {
         return;
     }
-    let (Some(etag), Some(asked)) = (resp.header("etag"), req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("if-none-match"))) else { return };
+    let (Some(etag), Some(asked)) = (resp.header("etag").filter(|e| *e != DROPPED), req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("if-none-match"))) else { return };
     if crate::statics::matches(&asked.1, etag) {
         resp.status = 304;
         resp.body.clear();

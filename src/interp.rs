@@ -3352,6 +3352,11 @@ impl Interp {
             None => Value::Nil,
         };
         let resp = match body {
+            // A stream's function would send a body after a head that says there is none
+            // (FEEDBACK55.md, Q-709; branch feedback55).
+            Value::Response(r) if matches!(r.body, Body::Stream { .. }) && crate::stream::bodyless(code as i64) => {
+                return fail(line, crate::stream::no_body(if matches!(r.body, Body::Stream { events: true, .. }) { "events" } else { "stream" }, code as i64));
+            }
             Value::Response(r) => Response { status: code, ..(*r).clone() },
             b => Response { status: code, headers: Vec::new(), body: Body::Value(b) },
         };
@@ -3485,7 +3490,8 @@ impl Interp {
             Value::Response(r) => match name {
                 "status" => return Ok(Value::Int(r.status as i64)),
                 "headers" => {
-                    return Ok(Value::map(r.headers.iter().map(|(k, v)| (k.into(), Value::str(v))).collect()))
+                    // A header named `null` is null (FEEDBACK55.md, Q-710; branch feedback55).
+                    return Ok(Value::map(r.headers.iter().map(|(k, v)| (k.into(), if v == crate::server::DROPPED { Value::Nil } else { Value::str(v) })).collect()))
                 }
                 "body" => {
                     return Ok(match &r.body {

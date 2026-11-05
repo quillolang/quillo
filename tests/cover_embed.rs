@@ -217,3 +217,22 @@ fn stopping_the_program_ends_the_connections_still_open() {
     assert!(!p.send(conn, Frame::Text("x".into())));
 }
 
+// A HEAD of a large file is answered at once, and the cookie its route set is kept in the app's
+// jar, as a GET's is (FEEDBACK55.md, Q-725; branch feedback55; found in review).
+#[test]
+fn an_apps_head_of_a_large_file_keeps_the_cookie_it_set() {
+    let root = std::env::temp_dir().join(format!("quillo-cover-embed-head-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (from, to) = (root.join("bundle"), root.join("data"));
+    std::fs::create_dir_all(&from).unwrap();
+    std::fs::write(from.join("main.qwe"), "route GET /big { set_cookie(\"seen\", \"1\"); file(\"big.bin\") }\nroute GET /t = cookie(\"seen\") ?? \"none\"\n").unwrap();
+    std::fs::write(from.join("big.bin"), vec![7u8; 2 << 20]).unwrap();
+    let p = quillo::embed::Program::open(&from, &to, "", "{}", "mobile").unwrap();
+    let ask = |method: &str, path: &str| p.request_whole(quillo::embed::request_of(method, path, vec![], vec![]));
+    assert_eq!(String::from_utf8_lossy(&ask("GET", "/t").body), "none");
+    let head = ask("HEAD", "/big");
+    assert_eq!((head.status, head.body.len()), (200, 0));
+    assert!(head.headers.iter().any(|(k, v)| k == "content-length" && *v == (2 << 20).to_string()), "{:?}", head.headers);
+    assert_eq!(String::from_utf8_lossy(&ask("GET", "/t").body), "1");
+    p.stop();
+}

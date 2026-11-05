@@ -1618,6 +1618,13 @@ fn answer(app: &Arc<App>, worker: &mut Worker, c: &mut Conn, items: Vec<Item>) -
                             return Fate::Keep;
                         }
                     }
+                    Answer::Head(resp, len) => {
+                        write_head(&mut c.output, &resp, len, !keep_alive);
+                        if !keep_alive {
+                            c.closing = true;
+                            return Fate::Keep;
+                        }
+                    }
                     Answer::Detach(f) => return Fate::Detach(f),
                 }
             }
@@ -2219,7 +2226,8 @@ fn write_head_as(out: &mut Vec<u8>, resp: &HttpResponse, len: Option<u64>, close
     let mut server = false;
     for (k, v) in &resp.headers {
         let skip = ["content-length", "transfer-encoding", "connection", "date"].iter().any(|h| k.eq_ignore_ascii_case(h));
-        if skip {
+        // Nor one the program named `null` (FEEDBACK55.md, Q-710; branch feedback55).
+        if skip || v == crate::server::DROPPED {
             continue;
         }
         if !crate::server::valid_header(k, v) {
