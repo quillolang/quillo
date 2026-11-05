@@ -53,6 +53,23 @@ pub static PORT: AtomicU16 = AtomicU16::new(0);
 pub static TLS_CERT: OnceLock<std::path::PathBuf> = OnceLock::new();
 pub static TLS_KEY: OnceLock<std::path::PathBuf> = OnceLock::new();
 
+/// Why a certificate and a key that both read are no pair, if they are not: said as the server
+/// starts, where WebTransport presented the one with the other's key and no page could connect
+/// (`--tls-cert a.pem --tls-key a.key --tls-cert b.pem`: FEEDBACK55.md, Q-852; branch feedback55).
+/// Files that do not read as PEM are left to WebTransport, which is then off and says why.
+pub fn tls_pair_problem(cert: &std::path::Path, key: &std::path::Path) -> Option<String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert).ok()?.collect::<Result<_, _>>().ok()?;
+    let private = PrivateKeyDer::from_pem_file(key).ok()?;
+    if chain.is_empty() {
+        return None;
+    }
+    match rustls::sign::CertifiedKey::from_der(chain, private, &rustls::crypto::ring::default_provider()) {
+        Err(rustls::Error::InconsistentKeys(_)) => Some(format!("--tls-cert {} and --tls-key {} are no pair: the key is not the certificate's", cert.display(), key.display())),
+        _ => None,
+    }
+}
+
 /// Messages a page may have waiting for it; past that, a datagram is
 /// dropped, and a page that cannot take a reliable message is let go (it
 /// connects again).

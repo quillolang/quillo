@@ -1,8 +1,9 @@
 //! `quillo new <folder>`: a program to start from (FEEDBACK34.md, Q-422; branch
 //! feedback27-35-fixes). The to-do app is `app/`'s own files, embedded, so the sample and what
 //! `new` writes cannot differ; `--minimal` is a page, a component and a function both sides use.
-//! It writes into a folder beside the target and moves it in place at the end, so a failed `new`
-//! leaves nothing half made, and it never writes an empty folder (Q-423).
+//! It writes into a folder beside the target (or inside it, when it is there and empty) and moves
+//! it in place at the end, so a failed `new` leaves nothing half made, and it never writes an empty
+//! folder (Q-423).
 
 use std::path::{Path, PathBuf};
 
@@ -172,6 +173,25 @@ pub fn files(name: &str, minimal: bool) -> Vec<(String, String)> {
     out
 }
 
+/// The folder a `new` builds in inside the target, and its process's id.
+const BUILDING: &str = ".quillo-new-";
+
+/// Whether `name` is the folder of a `new` whose process is gone.
+fn left_by_a_stopped_new(name: &str) -> bool {
+    let Some(pid) = name.strip_prefix(BUILDING).and_then(|p| p.parse::<u32>().ok()) else { return false };
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 sends nothing; it asks whether the process is there.
+        let gone = unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        // This process's own id: made by another before it, as it has made none yet.
+        pid == std::process::id() || gone
+    }
+    #[cfg(not(unix))]
+    {
+        pid == std::process::id()
+    }
+}
+
 fn make(target: &Path, minimal: bool, binary: bool) -> Result<Vec<String>, String> {
     let mut said = Vec::new();
     let abs = if target.is_absolute() { target.to_path_buf() } else { std::env::current_dir().map_err(|e| e.to_string())?.join(target) };
@@ -184,7 +204,10 @@ fn make(target: &Path, minimal: bool, binary: bool) -> Result<Vec<String>, Strin
         if !abs.is_dir() {
             return Err(format!("{} is a file, not a folder", target.display()));
         }
+        // What a `new` that was stopped left building in it is no part of it: removed, when the
+        // process that made it is gone (FEEDBACK55.md, Q-850; branch feedback55).
         let mut there: Vec<String> = std::fs::read_dir(&abs).map_err(|e| e.to_string())?.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n != ".git" && n != ".DS_Store").collect();
+        there.retain(|n| !(left_by_a_stopped_new(n) && std::fs::remove_dir_all(abs.join(n)).is_ok()));
         there.sort();
         if !there.is_empty() {
             let shown: Vec<&str> = there.iter().take(5).map(String::as_str).collect();
@@ -195,9 +218,18 @@ fn make(target: &Path, minimal: bool, binary: bool) -> Result<Vec<String>, Strin
     if parent.ancestors().any(|a| a.join("main.qwe").is_file()) {
         said.push(format!("warning: {} is inside another program (a folder above has a main.qwe): a phone build of that one leaves this out", target.display()));
     }
-    std::fs::create_dir_all(&parent).map_err(|e| format!("cannot make {}: {}", parent.display(), e))?;
-    let temp = parent.join(format!(".{}.quillo-new-{}", name, std::process::id()));
-    let _ = std::fs::remove_dir_all(&temp);
+    // A folder that is there is built in, so its parent need not be writable; one that is not,
+    // beside it (FEEDBACK55.md, Q-850; branch feedback55).
+    let temp = if exists {
+        let temp = abs.join(format!("{}{}", BUILDING, std::process::id()));
+        std::fs::create_dir(&temp).map_err(|e| format!("cannot write in {}, to make the program there: {}", target.display(), e))?;
+        temp
+    } else {
+        std::fs::create_dir_all(&parent).map_err(|e| format!("cannot make {}: {}", parent.display(), e))?;
+        let temp = parent.join(format!(".{}.quillo-new-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        temp
+    };
     let mut write = || -> Result<(), String> {
         for (p, text) in files(&name, minimal) {
             let f = temp.join(&p);

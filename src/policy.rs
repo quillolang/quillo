@@ -60,6 +60,9 @@ pub struct Policy {
     pub workers: Option<usize>,
     pub max_compute: Option<Duration>,
     pub max_body: Option<usize>,
+    /// The file each limit came from, for the messages that hold a program to it (FEEDBACK55.md,
+    /// Q-849; branch feedback55).
+    pub max_compute_from: Option<PathBuf>,
 }
 
 impl Default for Policy {
@@ -78,6 +81,7 @@ impl Default for Policy {
             workers: None,
             max_compute: None,
             max_body: None,
+            max_compute_from: None,
         }
     }
 }
@@ -136,6 +140,9 @@ enum V {
 /// `[section]` and `key = value` lines: booleans, integers, strings, and lists of strings
 /// (which may span lines); `#` begins a comment.
 fn parse(text: &str) -> Result<Vec<(String, String, V, usize)>, String> {
+    // A byte-order mark is no part of the first line, as in `.qwe` and `.env` files (FEEDBACK55.md,
+    // Q-852; branch feedback55).
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let mut out = Vec::new();
     let mut section = String::new();
     let mut lines = text.lines().enumerate().peekable();
@@ -204,12 +211,15 @@ fn value(v: &str) -> Option<V> {
 fn duration(s: &str) -> Option<Duration> {
     let (n, unit) = s.find(|c: char| !c.is_ascii_digit()).map_or((s, "s"), |i| (&s[..i], &s[i..]));
     let n: u64 = n.parse().ok()?;
-    Some(match unit.trim() {
-        "ms" => Duration::from_millis(n),
-        "s" => Duration::from_secs(n),
-        "m" => Duration::from_secs(n * 60),
+    // In milliseconds that fit, as `--max-compute` reads a time (FEEDBACK55.md, Q-849; branch
+    // feedback55).
+    n.checked_mul(match unit.trim() {
+        "ms" => 1,
+        "s" => 1000,
+        "m" => 60_000,
         _ => return None,
     })
+    .map(Duration::from_millis)
 }
 
 /// `"10MB"`, `"512KB"`, `1048576`.
@@ -277,13 +287,26 @@ impl Policy {
                 }
                 ("http", "hosts", _) => self.hosts.push((file.to_path_buf(), list(&v)?)),
                 ("env", "names", _) => self.env.push((file.to_path_buf(), list(&v)?)),
+                // The command line's ranges: 0 is no limit to nginx and refused by `--max-body 0`,
+                // and was taken as one that refused every body, or ended every request at once
+                // (FEEDBACK55.md, Q-849; branch feedback55).
                 ("limits", "workers", V::Int(n)) if *n > 0 => self.workers = Some(self.workers.map_or(*n as usize, |w| w.min(*n as usize))),
+                ("limits", "workers", V::Int(_)) => return Err(at(line, "`workers` is a positive number, as `--workers` takes".into())),
                 ("limits", "max_compute", V::Str(s)) => {
                     let d = duration(s).ok_or_else(|| at(line, format!("`{}` is not a time such as \"10s\" or \"500ms\"", s)))?;
-                    self.max_compute = Some(self.max_compute.map_or(d, |m| m.min(d)));
+                    if d.is_zero() {
+                        return Err(at(line, format!("`max_compute` is a time longer than 0, as `--max-compute` takes, not \"{}\"", s)));
+                    }
+                    if self.max_compute.map_or(true, |m| d < m) {
+                        self.max_compute = Some(d);
+                        self.max_compute_from = Some(file.to_path_buf());
+                    }
                 }
                 ("limits", "max_body", _) => {
                     let b = bytes(&v).ok_or_else(|| at(line, "`max_body` is a size such as \"10MB\"".into()))?;
+                    if b == 0 {
+                        return Err(at(line, "`max_body` is a size larger than 0, as `--max-body` takes, such as \"10MB\"".into()));
+                    }
                     self.max_body = Some(self.max_body.map_or(b, |m| m.min(b)));
                 }
                 (s, k, _) => {
@@ -368,6 +391,17 @@ impl Policy {
         }
         if !self.private {
             out.push("no private addresses".into());
+        }
+        // Its limits, so a request held to one is seen to be (FEEDBACK55.md, Q-849; branch
+        // feedback55).
+        if let Some(w) = self.workers {
+            out.push(format!("workers {}", w));
+        }
+        if let Some(c) = self.max_compute {
+            out.push(format!("max_compute {}ms", c.as_millis()));
+        }
+        if let Some(b) = self.max_body {
+            out.push(format!("max_body {} byte{}", b, if b == 1 { "" } else { "s" }));
         }
         format!("policy {}{}", self.files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(" + "), if out.is_empty() { String::new() } else { format!(" ({})", out.join("; ")) })
     }

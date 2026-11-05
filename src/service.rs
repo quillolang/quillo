@@ -1664,10 +1664,14 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
             Some((p, _)) => return fail(line, format!("service `{}` is {} elsewhere in this app, and {} here", name, p.display(), key.display())),
             None if it.services.loading.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(name) => None,
             None => {
-                it.services.loading.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name.to_string());
                 let dir = full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| it.base_dir.to_path_buf());
-                // Its own settings, beside its file (FEEDBACK9.md, Q-071).
-                let own = crate::dotenv::read(&dir.join(".env"));
+                // Its own settings, beside its file (FEEDBACK9.md, Q-071); one it cannot read is
+                // said, as the program's is (FEEDBACK55.md, Q-835; branch feedback55).
+                let own = match crate::dotenv::read(&dir.join(".env")) {
+                    Ok(own) => own,
+                    Err(e) => return fail(line, format!("service `{}`: {}", name, e)),
+                };
+                it.services.loading.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name.to_string());
                 // Not served under another name (FEEDBACK55.md, Q-701; branch feedback55).
                 crate::builtins::protect_settings(&dir, None);
                 let mut sub = Interp::with_shared(dir, it.shared.clone());
@@ -2088,7 +2092,7 @@ fn supervise(services: Arc<Mutex<Vec<Running>>>, stop: Arc<std::sync::atomic::At
 /// `--scale risk=3`, a service runs as that many copies, each on a port of
 /// its own, taking calls in turn and sharing its database (FEEDBACK10.md,
 /// Q-075; branch feedback10-fixes).
-pub fn split(path: &Path, watch: bool, static_check: bool, checked: bool, scale: &[(String, usize)], app_url: &str) -> Result<Split, String> {
+pub fn split(path: &Path, watch: bool, reload: bool, static_check: bool, checked: bool, scale: &[(String, usize)], app_url: &str) -> Result<Split, String> {
     let services = declared(path)?;
     let _ = APP_URL.set(app_url.to_string());
     if let Some((name, _)) = scale.iter().find(|(n, _)| !services.iter().any(|(s, _, _)| s == n)) {
@@ -2125,6 +2129,10 @@ pub fn split(path: &Path, watch: bool, static_check: bool, checked: bool, scale:
         }
         if watch {
             args.push("--watch".into());
+        } else if reload {
+            // Each service takes a change to its files, as under --watch (FEEDBACK55.md, Q-842;
+            // branch feedback55).
+            args.push("--reload".into());
         }
         if crate::native::NO_BUILD.load(std::sync::atomic::Ordering::Relaxed) {
             args.push("--no-build".into());

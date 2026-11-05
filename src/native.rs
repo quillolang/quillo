@@ -1018,7 +1018,7 @@ fn keep_lib(qwer: &Path, lib: &Path, crate_name: &str, target: &Path) -> Result<
 }
 
 pub fn build(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
-    let src = std::fs::read_to_string(qwer).map_err(|e| format!("cannot read {}: {}", qwer.display(), e))?;
+    let src = crate::error::read_source(qwer).map_err(|e| format!("cannot read {}: {}", qwer.display(), e))?;
     let parsed = parse(&src);
     let abs = qwer.canonicalize().unwrap_or_else(|_| qwer.to_path_buf());
     let lib = lib_path(qwer, &src);
@@ -1356,7 +1356,9 @@ pub fn walk_program(main: &Path, visit: &mut dyn FnMut(&Path, &[crate::ast::Stmt
             out.push(f);
             continue;
         }
-        let src = std::fs::read_to_string(&f).map_err(|e| format!("cannot read {}: {}", f.display(), e))?;
+        // Where a file that is not UTF-8 is not, as `check` and `run` say it (FEEDBACK55.md,
+        // Q-852; branch feedback55).
+        let src = crate::error::read_source(&f).map_err(|e| format!("cannot read {}: {}", f.display(), e))?;
         let prog = crate::parser::Parser::new(&src).parse_program().map_err(|e| e.in_file(&f.display().to_string()).to_string())?;
         visit(&f, &prog);
         for s in prog {

@@ -169,9 +169,11 @@ fn a_dotenv_with_a_byte_order_mark_and_values_over_lines_is_read_and_a_skipped_l
         ],
     );
     let (out, err) = text(&quillo(&d, &["run", "main.qwe"]));
-    assert_eq!(out, "FIRST \"one\"\nMULTI \"line1\\nline2\"\nAFTER \"ok\"\nCOLON null\nPEM \"-----BEGIN-----\\nabc\\n-----END-----\"\nOPEN \"never closed\"\n", "{}", err);
+    // A quote never closed is skipped as it is said to be, its value not kept (FEEDBACK55.md,
+    // Q-839; branch feedback55).
+    assert_eq!(out, "FIRST \"one\"\nMULTI \"line1\\nline2\"\nAFTER \"ok\"\nCOLON null\nPEM \"-----BEGIN-----\\nabc\\n-----END-----\"\nOPEN null\n", "{}", err);
     assert!(err.contains(".env:5: not KEY=value, skipped"), "{}", err);
-    assert!(err.contains(".env:9: not KEY=value, skipped"), "{}", err);
+    assert!(err.contains(".env:9: its quote is not closed, skipped"), "{}", err);
 }
 
 // ---- Q-381, Q-389: the command line --------------------------------------------------------

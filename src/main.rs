@@ -74,6 +74,7 @@ options for `run`:
   --host H       address to listen on (default 127.0.0.1)
   --listen unix:PATH  listen on a Unix socket, for a web server in front (mode 0600; --socket-mode 660)
   --policy FILE  narrow what it may do, after /etc/quillo/policy.toml and before quillo.policy
+  --env-file F   the settings from F, not the .env beside the program (F must be there)
   --no-build     load the .qwer libraries .quillo holds, as plugins.lock names them; never run cargo
   --instances N  run the program N times over, each on a core of its own
   --max-compute 2s  end a request that computes this long without letting go, as a 500
@@ -180,6 +181,10 @@ fn main() {
             let _ = quillo::builtins::PROGRAM_ARGS.set(theirs);
         }
     }
+    if let Some(usage) = help_asked(&args) {
+        println!("{}", usage);
+        std::process::exit(0);
+    }
     // The window must run on the main thread (macOS requires it); the
     // program gets a thread of its own.
     if args.get(1).map(String::as_str) == Some("app") {
@@ -258,6 +263,45 @@ fn has_program(args: &[String]) -> bool {
 /// value. A folder, or no program at all, is that folder's main.qwe, and
 /// nothing else (FEEDBACK6.md, Q-058 and Q-059; branch feedback6-fixes).
 fn program_and_flags(args: &[String]) -> Result<(String, Vec<String>), String> {
+    let (program, flags) = word_and_flags(args)?;
+    let mut named = program.unwrap_or_else(|| ".".to_string());
+    // `quillo check main`: the file is `main.qwe`, as a `use` path without its extension is
+    // (FEEDBACK45.md, Q-528; branch feedback40-43).
+    if !Path::new(&named).exists() && Path::new(&format!("{}.qwe", named)).is_file() {
+        named = format!("{}.qwe", named);
+    }
+    if Path::new(&named).is_dir() {
+        let main = Path::new(&named).join("main.qwe");
+        if !main.is_file() {
+            // A folder of pages: said how to serve it (FEEDBACK36.md, Q-450; branch feedback36-39).
+            let pages = Path::new(&named).join("index.html").is_file();
+            let serve = if pages { format!("; to serve its files as they are, `quillo serve {}`", named) } else { String::new() };
+            return Err(if named == "." {
+                format!("no program: name a .qwe file, or add a main.qwe here{}", serve)
+            } else {
+                format!("no program: {} has no main.qwe; name a .qwe file{}", named, serve)
+            });
+        }
+        return Ok((if named == "." { "main.qwe".to_string() } else { main.to_string_lossy().into_owned() }, flags));
+    }
+    // A file of another kind is said to be one, with how to serve it, rather than read as Quillo
+    // and refused at its first character (FEEDBACK36.md, Q-450; branch feedback36-39).
+    let ext = Path::new(&named).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let folder = Path::new(&named).parent().map(|p| p.to_string_lossy().into_owned()).filter(|p| !p.is_empty()).unwrap_or_else(|| ".".into());
+    match ext.as_str() {
+        "html" | "htm" => return Err(format!("{} is HTML, not a Quillo program: serve its folder as it is with `quillo serve {}`, or from a program with `route GET /*path = files(\"{}\", path)`", named, folder, folder)),
+        "md" | "markdown" => return Err(format!("{} is Markdown, not a Quillo program: show it as a page with `route GET / = markdown_page(read_file(\"{}\"))`, or serve its folder with `quillo serve {}`", named, named, folder)),
+        "rs" | "qwer" => return Err(format!("{} is Rust, not a Quillo program: a program uses it with `use \"{}\"`, and calls its `pub fn`s", named, Path::new(&named).file_name().map_or(named.clone(), |n| n.to_string_lossy().into_owned()))),
+        "css" | "js" | "mjs" | "json" | "txt" | "xml" | "csv" | "svg" => return Err(format!("{} is not a Quillo program (a .qwe file): serve it with `file(\"{}\")` in a route, or its folder with `quillo serve {}`", named, named, folder)),
+        _ => {}
+    }
+    Ok((named, flags))
+}
+
+/// The first word that is neither an option nor an option's value, and the options around it
+/// (the words after it among them, for the command to refuse): `program_and_flags`'s reading,
+/// which `quillo serve` reads its folder by too (FEEDBACK55.md, Q-847; branch feedback55).
+fn word_and_flags(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
     let mut program = None;
     let mut flags = Vec::new();
     let mut i = 0;
@@ -296,64 +340,27 @@ fn program_and_flags(args: &[String]) -> Result<(String, Vec<String>), String> {
         }
         i += 1;
     }
-    let mut named = program.unwrap_or_else(|| ".".to_string());
-    // `quillo check main`: the file is `main.qwe`, as a `use` path without its extension is
-    // (FEEDBACK45.md, Q-528; branch feedback40-43).
-    if !Path::new(&named).exists() && Path::new(&format!("{}.qwe", named)).is_file() {
-        named = format!("{}.qwe", named);
-    }
-    if Path::new(&named).is_dir() {
-        let main = Path::new(&named).join("main.qwe");
-        if !main.is_file() {
-            // A folder of pages: said how to serve it (FEEDBACK36.md, Q-450; branch feedback36-39).
-            let pages = Path::new(&named).join("index.html").is_file();
-            let serve = if pages { format!("; to serve its files as they are, `quillo serve {}`", named) } else { String::new() };
-            return Err(if named == "." {
-                format!("no program: name a .qwe file, or add a main.qwe here{}", serve)
-            } else {
-                format!("no program: {} has no main.qwe; name a .qwe file{}", named, serve)
-            });
-        }
-        return Ok((if named == "." { "main.qwe".to_string() } else { main.to_string_lossy().into_owned() }, flags));
-    }
-    // A file of another kind is said to be one, with how to serve it, rather than read as Quillo
-    // and refused at its first character (FEEDBACK36.md, Q-450; branch feedback36-39).
-    let ext = Path::new(&named).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    let folder = Path::new(&named).parent().map(|p| p.to_string_lossy().into_owned()).filter(|p| !p.is_empty()).unwrap_or_else(|| ".".into());
-    match ext.as_str() {
-        "html" | "htm" => return Err(format!("{} is HTML, not a Quillo program: serve its folder as it is with `quillo serve {}`, or from a program with `route GET /*path = files(\"{}\", path)`", named, folder, folder)),
-        "md" | "markdown" => return Err(format!("{} is Markdown, not a Quillo program: show it as a page with `route GET / = markdown_page(read_file(\"{}\"))`, or serve its folder with `quillo serve {}`", named, named, folder)),
-        "rs" | "qwer" => return Err(format!("{} is Rust, not a Quillo program: a program uses it with `use \"{}\"`, and calls its `pub fn`s", named, Path::new(&named).file_name().map_or(named.clone(), |n| n.to_string_lossy().into_owned()))),
-        "css" | "js" | "mjs" | "json" | "txt" | "xml" | "csv" | "svg" => return Err(format!("{} is not a Quillo program (a .qwe file): serve it with `file(\"{}\")` in a route, or its folder with `quillo serve {}`", named, named, folder)),
-        _ => {}
-    }
-    Ok((named, flags))
+    Ok((program, flags))
 }
 
 /// `quillo serve DIR`: the folder's files as they are, by a program of one route that is no file
 /// in it (FEEDBACK36.md, Q-450; branch feedback36-39).
 fn serve(args: &[String]) -> i32 {
-    let mut dir = None;
-    let mut flags = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        if a == "-h" || a == "--help" {
-            println!("{}", USAGE);
-            return 0;
+    // Its options read as `run`'s are: `--port=8080`, and no option taken as a value
+    // (FEEDBACK55.md, Q-847; branch feedback55).
+    let (dir, flags) = match word_and_flags(args) {
+        Ok(read) => read,
+        Err(e) => {
+            eprintln!("quillo: {}", e);
+            return 2;
         }
-        if a.starts_with('-') {
-            flags.push(a.clone());
-            if VALUE_OPTIONS.contains(&a.as_str()) {
-                if let Some(v) = args.get(i + 1) {
-                    flags.push(v.clone());
-                    i += 1;
-                }
-            }
-        } else if dir.is_none() {
-            dir = Some(a.clone());
-        } else {
-            eprintln!("quillo: unknown argument `{}`: `serve` takes one folder", a);
+    };
+    let mut i = 0;
+    while i < flags.len() {
+        if VALUE_OPTIONS.contains(&flags[i].as_str()) {
+            i += 1;
+        } else if !flags[i].starts_with('-') {
+            eprintln!("quillo: unknown argument `{}`: `serve` takes one folder", flags[i]);
             return 2;
         }
         i += 1;
@@ -514,7 +521,21 @@ fn real_main(args: Vec<String>) -> i32 {
         }),
         // `-i`: the prompts and the greeting, from a pipe too, as Python's `-i` (FEEDBACK31.md,
         // Q-388; branch feedback27-35-fixes).
-        Some("repl") => repl(args[2..].iter().any(|a| a == "-i")),
+        // Its one option: anything else is said, not passed over (FEEDBACK55.md, Q-852; branch
+        // feedback55).
+        Some("repl") => {
+            if let Some(a) = args[2..].iter().find(|a| *a != "-i") {
+                if a.starts_with('-') {
+                    eprintln!("quillo: unknown option `{}` for `repl` (it takes -i)", a);
+                } else if a.to_ascii_lowercase().ends_with(".qwe") {
+                    eprintln!("quillo: unknown argument `{}`: `repl` takes no file; to run it: quillo run {}", a, a);
+                } else {
+                    eprintln!("quillo: unknown argument `{}`: `repl` takes no file", a);
+                }
+                return 2;
+            }
+            repl(args.len() > 2)
+        }
         None => repl(false),
         Some("lsp") => quillo::lsp::Server::new().run(),
         Some("version" | "--version" | "-V") => {
@@ -531,7 +552,6 @@ fn real_main(args: Vec<String>) -> i32 {
         // A misspelt command is told the nearest, and a file given without `run` how to run it
         // (FEEDBACK31.md, Q-389; branch feedback27-35-fixes).
         Some(c) if !c.starts_with('-') => {
-            const COMMANDS: &[&str] = &["run", "check", "docs", "build", "fix", "install", "repl", "lsp", "dap", "app", "new", "version", "help"];
             let near = nearest(c, COMMANDS.iter());
             if Path::new(c).is_file() {
                 eprintln!("quillo: unknown command `{}`{}; to run the file: quillo run {}", c, near, c);
@@ -540,7 +560,66 @@ fn real_main(args: Vec<String>) -> i32 {
             }
             2
         }
-        Some(_) => usage(),
+        // `quillo --watch main.qwe`: one line that says what to write, not the whole usage
+        // (FEEDBACK55.md, Q-851; branch feedback55).
+        Some(o) => {
+            let name = o.split('=').next().unwrap_or(o);
+            if VALUE_OPTIONS.contains(&name) || FLAG_OPTIONS.contains(&name) || name == "-w" {
+                // A command written after the options is the one put first: `quillo --watch run
+                // tool.qwe` is `quillo run --watch tool.qwe`, not `run` of a file named run.
+                let rest = &args[1..];
+                let mut i = 0;
+                let mut named = None;
+                while i < rest.len() {
+                    let a = rest[i].as_str();
+                    if VALUE_OPTIONS.contains(&a) {
+                        i += 1;
+                    } else if !a.starts_with('-') {
+                        named = COMMANDS.contains(&a).then_some(i);
+                        break;
+                    }
+                    i += 1;
+                }
+                let command = match named {
+                    Some(at) => rest[at].as_str(),
+                    None if name == "--strict-null" => "check",
+                    None => "run",
+                };
+                let rest: Vec<String> = rest.iter().enumerate().filter(|(i, _)| Some(*i) != named).map(|(_, a)| shell_word(a)).collect();
+                eprintln!("quillo: put the command first: `quillo {} {}`", command, rest.join(" "));
+            } else {
+                eprintln!("quillo: unknown option `{}`{}; `quillo help` lists the commands and their options", o, meant(name));
+            }
+            2
+        }
+    }
+}
+
+/// The commands, for the nearest to a misspelt one (FEEDBACK31.md, Q-389; `serve`, `classes` and
+/// `fcgi` too: FEEDBACK55.md, Q-852; branch feedback55).
+const COMMANDS: &[&str] = &["run", "check", "docs", "build", "fix", "install", "repl", "lsp", "dap", "app", "new", "serve", "classes", "fcgi", "version", "help"];
+
+/// `-h` or `--help` after a command (or a program's file), wherever it stands: the command's usage,
+/// on stdout, read before anything else, so that `run -h` needs no main.qwe and `lsp --help` starts
+/// no server (FEEDBACK55.md, Q-851; branch feedback55).
+fn help_asked(args: &[String]) -> Option<&'static str> {
+    let c = args.get(1)?.as_str();
+    if !COMMANDS.contains(&c) && !c.to_ascii_lowercase().ends_with(".qwe") {
+        return None;
+    }
+    args[2..].iter().any(|a| a == "-h" || a == "--help").then(|| match c {
+        "install" => quillo::install::USAGE,
+        "new" => quillo::new::USAGE,
+        _ => USAGE,
+    })
+}
+
+/// A word as a shell takes it back.
+fn shell_word(s: &str) -> String {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./=:,@".contains(&b)) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }
 
@@ -552,11 +631,6 @@ fn app(args: &[String]) -> i32 {
 #[cfg(not(feature = "app"))]
 fn app(_: &[String]) -> i32 {
     eprintln!("quillo: this quillo was built without windows; build it with `cargo build --release --features app`");
-    2
-}
-
-fn usage() -> i32 {
-    eprintln!("{}", USAGE);
     2
 }
 
@@ -626,6 +700,7 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         join: None,
         with: Vec::new(),
     };
+    let mut tls: (Option<PathBuf>, Option<PathBuf>) = (None, None);
     let mut i = 0;
     while i < flags.len() {
         let value = flags.get(i + 1);
@@ -712,12 +787,10 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                     return Err(2);
                 }
             },
-            ("--tls-cert", Some(v)) => {
-                let _ = quillo::wt::TLS_CERT.set(v.into());
-            }
-            ("--tls-key", Some(v)) => {
-                let _ = quillo::wt::TLS_KEY.set(v.into());
-            }
+            // The last given, as for every option, and the one checked (FEEDBACK55.md, Q-852;
+            // branch feedback55).
+            ("--tls-cert", Some(v)) => tls.0 = Some(PathBuf::from(v)),
+            ("--tls-key", Some(v)) => tls.1 = Some(PathBuf::from(v)),
             ("--no-prefetch", _) => {
                 quillo::server::PREFETCH.store(false, std::sync::atomic::Ordering::Relaxed);
                 i += 1;
@@ -922,6 +995,12 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         }
         i += 2;
     }
+    if let Some(c) = tls.0 {
+        let _ = quillo::wt::TLS_CERT.set(c);
+    }
+    if let Some(k) = tls.1 {
+        let _ = quillo::wt::TLS_KEY.set(k);
+    }
     if quillo::wt::TLS_CERT.get().is_some() != quillo::wt::TLS_KEY.get().is_some() {
         eprintln!("quillo: --tls-cert and --tls-key go together");
         return Err(2);
@@ -933,6 +1012,10 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
             eprintln!("quillo: {} {}: there is no such file", flag, f.display());
             return Err(2);
         }
+    }
+    if let Some(why) = quillo::wt::TLS_CERT.get().zip(quillo::wt::TLS_KEY.get()).and_then(|(c, k)| quillo::wt::tls_pair_problem(c, k)) {
+        eprintln!("quillo: {}", why);
+        return Err(2);
     }
     // The key is not served under any name, nor written over; the certificate is public
     // (FEEDBACK55.md, Q-701; branch feedback55).
@@ -955,7 +1038,9 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     // Signed service calls name the service they are for (see `service::answer`).
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     quillo::service::serve_as(o.service_name.as_deref().unwrap_or(&stem));
-    let checked = if o.static_check && !o.checked { static_errors(path) } else { Ok(()) };
+    // The files read or tried, watched under --watch while the program does not load
+    // (FEEDBACK55.md, Q-836; branch feedback55).
+    let (checked, mut tried) = quillo::error::noting_reads(|| if o.static_check && !o.checked { static_errors(path) } else { Ok(()) });
     if let (Err(_), false) = (&checked, o.watch) {
         return Err(1);
     }
@@ -964,8 +1049,15 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     shared.service_urls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(o.service_urls.iter().cloned());
     interp.base = o.base.clone().unwrap_or_default();
     interp.is_service = o.as_service;
-    let loaded = match checked.and_then(|()| interp.load_file(path).map_err(|e| format!("{:#}", e))) {
-        Ok(_) => Loaded::Ready(interp),
+    let loaded = match checked.and_then(|()| {
+        let (r, read) = quillo::error::noting_reads(|| interp.load_file(path).map_err(|e| format!("{:#}", e)));
+        tried.extend(read);
+        r
+    }) {
+        Ok(_) => {
+            tried.clear();
+            Loaded::Ready(interp)
+        }
         Err(e) => {
             if !e.is_empty() {
                 eprintln!("quillo: {}", e);
@@ -989,6 +1081,7 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
         }
     }
     let mut app = App::new(loaded, shared, path, base, o.watch);
+    app.tried(tried);
     app.static_check = o.static_check;
     app.max_body = o.max_body;
     app.reload = o.reload;
@@ -1242,6 +1335,10 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
             let (now, c) = (quillo::httpd::compute_limit_ms(), c.as_millis().max(1) as u64);
             if now == 0 || now > c {
                 quillo::httpd::limit_compute(c);
+                // Its message names the file (FEEDBACK55.md, Q-849; branch feedback55).
+                if let Some(f) = &p.max_compute_from {
+                    quillo::httpd::compute_limit_from(f);
+                }
             }
         }
     }
@@ -1282,13 +1379,29 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
         return 2;
     }
     // Each service its own process: started first, told where the others are.
+    let mut bound = None;
     let _split = if o.split {
         if o.instances > 1 || o.register.is_some() {
             eprintln!("quillo: --split does not go with --instances or --register");
             return 2;
         }
         // Where the app listens, for its services' channels (FEEDBACK12.md,
-        // Q-087; branch open-fixes).
+        // Q-087; branch open-fixes). `--port 0`: bound before they start, so that they are told
+        // the port the system gave, not 0 (FEEDBACK55.md, Q-843; branch feedback55).
+        let port = if port.parse::<u16>() == Ok(0) {
+            let listener = match std::net::TcpListener::bind(format!("{}:{}", host, port)) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("quillo: cannot listen on {}:{}: {}", host, port, e);
+                    return 1;
+                }
+            };
+            let given = listener.local_addr().map_or_else(|_| port.clone(), |a| a.port().to_string());
+            bound = Some(listener);
+            given
+        } else {
+            port.clone()
+        };
         let reach = if host == "0.0.0.0" || host == "::" { "127.0.0.1" } else { host.as_str() };
         let app_url = if reach.contains(':') { format!("http://[{}]:{}", reach, port) } else { format!("http://{}:{}", reach, port) };
         // The whole tree checked once, here, before any service starts: an error in a service is
@@ -1303,7 +1416,7 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
                 return 1;
             }
         }
-        match quillo::service::split(path, o.watch, o.static_check, o.checked, &o.scale, &app_url) {
+        match quillo::service::split(path, o.watch, o.reload, o.static_check, o.checked, &o.scale, &app_url) {
             Ok(s) => Some(s),
             Err(e) => {
                 eprintln!("quillo: {}", e);
@@ -1379,7 +1492,11 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
             }
         };
     }
-    match quillo::server::serve(app, &format!("{}:{}", host, port), o.workers) {
+    let served = match bound {
+        Some(listener) => quillo::server::serve_bound(app, listener, o.workers),
+        None => quillo::server::serve(app, &format!("{}:{}", host, port), o.workers),
+    };
+    match served {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("quillo: {}", e);
@@ -1490,8 +1607,22 @@ fn repl(prompts: bool) -> i32 {
             print!("{}", if buf.is_empty() { "quillo> " } else { "....> " });
             let _ = io::stdout().flush();
         }
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
+        // Read as bytes: a line that is not UTF-8 is said and skipped, and the input goes on, where
+        // it was taken for the end, with exit 0 (FEEDBACK55.md, Q-848; branch feedback55).
+        let mut bytes = Vec::new();
+        let read = stdin.lock().read_until(b'\n', &mut bytes).unwrap_or(0);
+        let line = match String::from_utf8(bytes) {
+            Ok(l) => l,
+            Err(e) => {
+                line_no += 1;
+                let ok = &e.as_bytes()[..e.utf8_error().valid_up_to()];
+                let col = String::from_utf8_lossy(ok).chars().count() + 1;
+                eprintln!("error: line {} is not UTF-8 text (byte 0x{:02X} at column {}): skipped", line_no, e.as_bytes()[ok.len()], col);
+                failed = true;
+                continue;
+            }
+        };
+        if read == 0 {
             if !buf.trim().is_empty() {
                 let what = Parser::new(&buf).parse_program().err().map_or_else(String::new, |e| format!(": {}", e.msg));
                 eprintln!("error: the input ended inside the statement that began on line {}{}", began, what);

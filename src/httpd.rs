@@ -102,6 +102,42 @@ pub fn limit_compute(ms: u64) {
     MAX_COMPUTE.store(ms, SeqCst);
 }
 
+/// The policy file the compute limit came from, when it was not `--max-compute`.
+static COMPUTE_FROM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The limit is a policy's, said in the message of a request it ends (FEEDBACK55.md, Q-849;
+/// branch feedback55).
+pub fn compute_limit_from(file: &std::path::Path) {
+    let _ = COMPUTE_FROM.set(file.display().to_string());
+}
+
+/// How every message of a request ended for computing too long begins, wherever its limit came
+/// from: what tells that stop from an error, which `??` may take and an endpoint answers 400
+/// (FEEDBACK55.md, Q-849; branch feedback55).
+pub const COMPUTE_STOP: &str = "this request computed for longer than ";
+
+/// Whether `msg` is the stop of a request that computed too long (see `COMPUTE_STOP`).
+pub fn is_compute_stop(msg: &str) -> bool {
+    msg.contains(COMPUTE_STOP)
+}
+
+/// Why a request was ended for computing too long: the option, or the policy file, that set it.
+pub fn over_compute() -> String {
+    match COMPUTE_FROM.get() {
+        Some(f) => format!("{}the policy {} allows (max_compute)", COMPUTE_STOP, f),
+        None => format!("{}--max-compute allows", COMPUTE_STOP),
+    }
+}
+
+/// `over_compute()` as a page is told it: the policy's file is the server's to know, and said in
+/// its log only.
+pub fn over_compute_said_to_pages() -> String {
+    match COMPUTE_FROM.get() {
+        Some(_) => format!("{}the server's policy allows (max_compute)", COMPUTE_STOP),
+        None => over_compute(),
+    }
+}
+
 /// The limit now, in milliseconds; 0 for none.
 pub fn compute_limit_ms() -> u64 {
     MAX_COMPUTE.load(SeqCst)

@@ -566,3 +566,37 @@ fn it_says_when_cargo_is_needed_and_not_to_be_found() {
     assert!(!said(&tools, None).contains(hint));
     assert!(!said(&empty, Some("/somewhere/cargo")).contains(hint));
 }
+
+// ---- slice 13 ----
+// FEEDBACK55.md, Q-846: `--dir --force demo` installed into a folder named `--force`, the option
+// lost, and `--registry --list` asked "--list" for the catalog. An option is no value now, as
+// `run` refuses one since Q-381; after `=` a value is as written, and one dash alone is a name.
+#[test]
+fn an_option_is_no_value_of_dir_or_registry() {
+    let d = dir("option-values");
+    for (args, said) in [
+        (&["--dir", "--force", "hi"][..], "quillo install: `--dir` needs a folder, and `--force` is an option\nusage:"),
+        (&["--dir", "-f", "hi"], "quillo install: `--dir` needs a folder, and `-f` is an option\n"),
+        (&["--dir", "--update"], "quillo install: `--dir` needs a folder, and `--update` is an option\n"),
+        (&["--dir", "--"], "quillo install: `--dir` needs a folder, and `--` is an option\n"),
+        (&["--registry", "--list"], "quillo install: `--registry` needs a URL, and `--list` is an option\n"),
+        (&["--registry", "-l"], "quillo install: `--registry` needs a URL, and `-l` is an option\n"),
+    ] {
+        let o = install(&d, args);
+        assert_eq!(o.status.code(), Some(2), "{:?}", args);
+        assert!(err(&o).starts_with(said), "{:?}: {}", args, err(&o));
+    }
+    assert!(std::fs::read_dir(&d).unwrap().next().is_none(), "no folder made");
+    let r = Registry::hi();
+    let o = from(&r, &d, &["--dir", "plugins", "--force", "hi"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(std::fs::read(d.join("plugins/hi.qwer")).unwrap(), plugin("1.0.0"));
+    for (args, folder) in [(&["--dir=--odd", "hi"][..], "--odd"), (&["--dir", "-x", "hi"], "-x"), (&["--dir", "ünï", "hi"], "ünï")] {
+        let o = from(&r, &d, args);
+        assert!(o.status.success(), "{:?}: {}", args, err(&o));
+        assert!(d.join(folder).join("hi.qwer").is_file(), "{:?}", args);
+    }
+    // `-h` is on stdout, as every command's usage is (Q-851).
+    let o = install(&d, &["-h"]);
+    assert!(o.status.success() && err(&o).is_empty() && out(&o).starts_with("usage:\n  quillo install"), "{}", err(&o));
+}

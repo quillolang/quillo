@@ -87,7 +87,9 @@ const HELLO: &str = "route GET / = \"hi\"\n";
 fn an_option_where_the_command_goes_is_told_the_usage() {
     let d = dir("usage", &[]);
     let o = quillo(&d, &["--frobnicate"], &[]);
-    refused(&o, "usage:");
+    // One line, where it was the whole usage (FEEDBACK55.md, Q-851; branch feedback55).
+    refused(&o, "quillo: unknown option `--frobnicate`; `quillo help` lists the commands and their options");
+    assert!(!said(&o).contains("usage:"), "{}", said(&o));
     // The library's own list of what a program may be refused: this file uses it too.
     assert!(quillo::policy::Policy::default().files.is_empty());
 }
@@ -256,7 +258,8 @@ fn new_says_why_it_cannot_make_the_folder_above_or_move_the_program_in() {
     let o = quillo(&d, &["new", "locked"], &[]);
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_ne!(o.status.code(), Some(0));
-    assert!(said(&o).contains("cannot move the program into locked"), "{}", said(&o));
+    // Said as what failed: writing in it (FEEDBACK55.md, Q-850; branch feedback55).
+    assert!(said(&o).contains("cannot write in locked, to make the program there: Permission denied"), "{}", said(&o));
     assert_eq!(std::fs::read_dir(&locked).unwrap().count(), 0);
     assert!(!std::fs::read_dir(&d).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains("quillo-new")), "no folder of its own left beside it");
     // A folder that cannot be read.

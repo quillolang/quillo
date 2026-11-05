@@ -72,7 +72,8 @@ fn publish_rust(uri: &str, d: &RustDiags) {
     send_any(&json!({ "jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": { "uri": uri, "diagnostics": all } }));
 }
 
-fn read_message(input: &mut impl BufRead) -> io::Result<Option<J>> {
+/// The next message: `None` at the end of the input, `Some(None)` for a body that is not JSON.
+fn read_message(input: &mut impl BufRead) -> io::Result<Option<Option<J>>> {
     let mut len = None;
     loop {
         let mut line = String::new();
@@ -83,14 +84,16 @@ fn read_message(input: &mut impl BufRead) -> io::Result<Option<J>> {
         if line.is_empty() {
             break;
         }
-        if let Some(v) = line.strip_prefix("Content-Length:") {
+        // A header's name in any case, as HTTP's: `content-length: N` was read as no length, and
+        // the body as headers (FEEDBACK55.md, Q-845; branch feedback55).
+        if let Some((_, v)) = line.split_once(':').filter(|(n, _)| n.trim().eq_ignore_ascii_case("content-length")) {
             len = v.trim().parse::<usize>().ok();
         }
     }
-    let Some(len) = len else { return Ok(Some(J::Null)) };
+    let Some(len) = len else { return Ok(Some(Some(J::Null))) };
     let mut buf = vec![0; len];
     input.read_exact(&mut buf)?;
-    Ok(Some(serde_json::from_slice(&buf).unwrap_or(J::Null)))
+    Ok(Some(serde_json::from_slice(&buf).ok()))
 }
 
 /// The main file of the program `file` belongs to, when another file
@@ -323,6 +326,18 @@ fn use_text(lines: &[&str], at: usize, col: usize) -> Option<(String, usize)> {
     Some((this.to_string(), col))
 }
 
+/// `main`, a real path, as the client reaches it: by the links `file` was opened through, so that
+/// the program's files are named as the editor has them open (FEEDBACK55.md, Q-844; branch
+/// feedback55).
+fn as_opened(main: &Path, file: &Path) -> PathBuf {
+    for dir in file.ancestors().skip(1) {
+        if let Some(rest) = dir.canonicalize().ok().and_then(|real| main.strip_prefix(real).ok().map(Path::to_path_buf)) {
+            return dir.join(rest);
+        }
+    }
+    main.to_path_buf()
+}
+
 /// The folder a file's `use` paths are read from: its program's main
 /// file's (branch use-editor).
 fn use_base(file: &Path) -> PathBuf {
@@ -524,16 +539,33 @@ impl Server {
         let stdin = io::stdin();
         let mut input = stdin.lock();
         let mut shutdown = false;
+        let mut initialized = false;
         loop {
             let msg = match read_message(&mut input) {
-                Ok(Some(m)) => m,
+                Ok(Some(Some(m))) => m,
+                // The protocol's answers to what it does not allow (FEEDBACK55.md, Q-852; branch
+                // feedback55): a body that is not JSON...
+                Ok(Some(None)) => {
+                    self.send(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "the message is not JSON" } }));
+                    continue;
+                }
                 Ok(None) | Err(_) => return if shutdown { 0 } else { 1 },
             };
             let method = msg["method"].as_str().unwrap_or("").to_string();
             let id = msg.get("id").cloned();
             let params = &msg["params"];
+            // ...a request before `initialize`, and one after `shutdown`; a notification then is
+            // dropped, but `exit`.
+            if method != "exit" && ((!initialized && method != "initialize") || shutdown) {
+                if let Some(id) = id {
+                    let (code, message) = if shutdown { (-32600, "the server has been shut down") } else { (-32002, "the server is not initialized yet") };
+                    self.send(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }));
+                }
+                continue;
+            }
             match method.as_str() {
                 "initialize" => {
+                    initialized = true;
                     self.opts.strict_null = params["initializationOptions"]["strictNull"].as_bool().unwrap_or(false);
                     self.trusted = params["initializationOptions"]["trusted"].as_bool().unwrap_or(false);
                     let caps = json!({
@@ -652,16 +684,38 @@ impl Server {
         let base = path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
         // A file another one `use`s is part of that program: checked as the
         // program, from its main file, with what is open in the editor.
+        // The open documents by their real paths as well as the client's, and the main file
+        // reached the way this one was opened, through its links: a project opened by a link
+        // got its errors under the real path, of the file on disk, and none here (FEEDBACK55.md,
+        // Q-844; branch feedback55).
         let analysis = match program_entry(&path) {
             Some(main) => {
-                let mut open: HashMap<PathBuf, String> = self.docs.iter().map(|(u, d)| (uri_to_path(u), d.text.clone())).collect();
-                open.insert(path.clone(), text.clone());
-                check::check_file_opts(&main, open, self.opts)
+                let mut open: HashMap<PathBuf, String> = HashMap::new();
+                for (p, t) in self.docs.iter().map(|(u, d)| (uri_to_path(u), &d.text)).chain([(path.clone(), &text)]) {
+                    if let Ok(real) = p.canonicalize() {
+                        open.insert(real, t.clone());
+                    }
+                    open.insert(p, t.clone());
+                }
+                check::check_file_opts(&as_opened(&main, &path), open, self.opts)
             }
             None => check::check_source_opts(&text, &file, &base, self.opts),
         };
+        // Which open document a file is, by its real path.
+        let real = |f: &str| Path::new(f).canonicalize().ok();
+        // Every URI each real file is open by: one file open through two links is told under both.
+        let mut opened: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        for u in self.docs.keys() {
+            if let Ok(p) = uri_to_path(u).canonicalize() {
+                opened.entry(p).or_default().push(u.clone());
+            }
+        }
+        let here = real(&file);
+        let aliases: Vec<String> = here.as_ref().and_then(|h| opened.get(h)).map(|us| us.iter().filter(|u| **u != uri).cloned().collect()).unwrap_or_default();
         let mut by_file: HashMap<String, Vec<J>> = HashMap::new();
-        by_file.insert(uri.clone(), Vec::new());
+        for u in std::iter::once(&uri).chain(&aliases) {
+            by_file.insert(u.clone(), Vec::new());
+        }
         for d in &analysis.diagnostics {
             // A file that does not parse may be for a newer Quillo than
             // this server: say which it is.
@@ -670,23 +724,31 @@ impl Server {
             } else {
                 d.message.clone()
             };
-            let (duri, range) = if d.file == file {
-                (uri.clone(), diag_range(&text, d.line, &d.message))
-            } else {
-                let other = std::fs::read_to_string(&d.file).unwrap_or_default();
-                (path_to_uri(&d.file), diag_range(&other, d.line, &d.message))
-            };
-            // Problems in a `use`d file are shown there only if it is not
-            // open (it is checked on its own when open).
-            if duri != uri && self.docs.contains_key(&duri) {
-                continue;
-            }
-            by_file.entry(duri).or_default().push(json!({
+            let said = |range: J| json!({
                 "range": range,
                 "severity": match d.severity { Severity::Error => 1, Severity::Warning => 2, Severity::Hint => 4 },
                 "source": "quillo",
                 "message": message,
-            }));
+            });
+            let theirs = if d.file == file { None } else { real(&d.file) };
+            if d.file == file || (theirs.is_some() && theirs == here) {
+                let range = diag_range(&text, d.line, &d.message);
+                for u in std::iter::once(&uri).chain(&aliases) {
+                    by_file.entry(u.clone()).or_default().push(said(range.clone()));
+                }
+                continue;
+            }
+            // Problems in a `use`d file are shown there only if it is not
+            // open (it is checked on its own when open).
+            if theirs.as_ref().is_some_and(|t| opened.contains_key(t)) {
+                continue;
+            }
+            let other = std::fs::read_to_string(&d.file).unwrap_or_default();
+            let duri = path_to_uri(&d.file);
+            if duri != uri && self.docs.contains_key(&duri) {
+                continue;
+            }
+            by_file.entry(duri).or_default().push(said(diag_range(&other, d.line, &d.message)));
         }
         for (u, diags) in by_file {
             self.send(json!({ "jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": { "uri": u, "diagnostics": diags } }));

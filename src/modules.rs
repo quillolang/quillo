@@ -382,15 +382,26 @@ fn after_path(line: &str) -> &str {
 /// `text` with the `use` on `r`'s line written anew. A line that has more than the `use`
 /// before it stays as it was: the warning stays too.
 fn respelled(text: &str, r: &Respell) -> String {
+    let (bom, text) = without_bom(text);
     let mut lines: Vec<String> = text.split('\n').map(String::from).collect();
     let at = r.line as usize - 1;
     let l = lines[at].clone();
     let body = l.trim_start();
     if body.starts_with("use ") {
         let indent = &l[..l.len() - body.len()];
-        lines[at] = format!("{}{}{}", indent, r.written().replace('\n', &format!("\n{}", indent)), after_path(&l));
+        let eol = if l.ends_with('\r') { "\r\n" } else { "\n" };
+        lines[at] = format!("{}{}{}", indent, r.written().replace('\n', &format!("{}{}", eol, indent)), after_path(&l));
     }
-    lines.join("\n")
+    format!("{}{}", bom, lines.join("\n"))
+}
+
+/// A file's byte-order mark, and the rest: `fix` writes after it, the mark kept first, where an
+/// import written before it made the file fail to parse (FEEDBACK55.md, Q-837; branch feedback55).
+fn without_bom(text: &str) -> (&str, &str) {
+    match text.strip_prefix('\u{FEFF}') {
+        Some(rest) => ("\u{FEFF}", rest),
+        None => ("", text),
+    }
 }
 
 /// The statement that takes a script, for another file that needs it too.
@@ -459,7 +470,12 @@ pub fn fix(main: &Path) -> Result<Vec<String>, String> {
 
 /// `text` with a line added below the `use`s and `import`s at its start, or, with none,
 /// above its code.
+/// The line and the blank after it end as the file's lines do, CRLF in a CRLF file (FEEDBACK55.md,
+/// Q-837; branch feedback55).
 fn with_use(text: &str, line: &str) -> String {
+    let (bom, text) = without_bom(text);
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let line = line.replace('\n', eol);
     let lines: Vec<&str> = text.split('\n').collect();
     let mut last_use = None;
     let mut code = lines.len();
@@ -472,13 +488,18 @@ fn with_use(text: &str, line: &str) -> String {
             break;
         }
     }
-    let mut out: Vec<&str> = lines.clone();
-    match last_use {
-        Some(i) => out.insert(i + 1, line),
-        None => {
-            out.insert(code, line);
-            out.insert(code + 1, "");
-        }
+    // Where line `n` starts; past the end, a last line with no line end of its own.
+    let start = |n: usize| lines[..n].iter().map(|l| l.len() + 1).sum::<usize>();
+    let (at, added) = match last_use {
+        Some(i) => (i + 1, format!("{}{}", line, eol)),
+        None => (code, format!("{}{}{}", line, eol, eol)),
+    };
+    if at < lines.len() {
+        let n = start(at);
+        format!("{}{}{}{}", bom, &text[..n], added, &text[n..])
+    } else if last_use.is_some() {
+        format!("{}{}{}{}", bom, text, eol, line)
+    } else {
+        format!("{}{}{}{}{}", bom, text, eol, line, eol)
     }
-    out.join("\n")
 }

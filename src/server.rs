@@ -1306,8 +1306,13 @@ impl Interp {
             };
             return match crate::builtins::markdown(self, args, 0) {
                 Ok(v) => json_response(200, serde_json::json!({ "ok": v.display() })),
-                // Past `--max-compute`: the server's limit, a 500 as a route's (Q-706).
-                Err(Ctrl::Error(e)) if e.msg.contains("--max-compute") => rpc_error(500, &e.msg),
+                // Past `--max-compute`: the server's limit, a 500 as a route's (Q-706); the policy's
+                // too, known by the stop's own words, its file said in the log and not to the page
+                // (FEEDBACK55.md, Q-849; branch feedback55).
+                Err(Ctrl::Error(e)) if crate::httpd::is_compute_stop(&e.msg) => {
+                    crate::httpd::error_line(&e.msg);
+                    rpc_error(500, &crate::httpd::over_compute_said_to_pages())
+                }
                 Err(Ctrl::Error(e)) => rpc_error(400, &e.msg),
                 Err(_) => rpc_error(500, "markdown failed"),
             };
@@ -2190,6 +2195,9 @@ pub struct App {
     /// many times, and the paths they were asked for at the last time
     /// (FEEDBACK11.md, Q-078; branch feedback11-fixes).
     css: Mutex<(u64, Vec<String>)>,
+    /// The files the last load that failed read or tried, watched with the version served
+    /// until one loads (FEEDBACK55.md, Q-836; branch feedback55).
+    tried: Mutex<Vec<PathBuf>>,
 }
 
 impl App {
@@ -2219,7 +2227,13 @@ impl App {
             reload: false,
             addr: Mutex::new(None),
             css: Mutex::new((0, Vec::new())),
+            tried: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The files a first load that failed read or tried (see `tried`).
+    pub fn tried(&self, files: Vec<PathBuf>) {
+        *self.tried.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = files;
     }
 
     /// The pages swap these stylesheets, as they are.
@@ -2260,16 +2274,27 @@ impl App {
     }
 
     /// Loads the program again from disk and makes it current. A program that
-    /// fails to load does not replace one that works.
-    pub fn reload(&self) {
+    /// fails to load does not replace one that works. Whether it loaded.
+    pub fn reload(&self) -> bool {
+        self.reload_saying(true)
+    }
+
+    /// `reload`; `say` false for the other instances of `--instances`, which load what the first
+    /// has just loaded and said (FEEDBACK55.md, Q-841; branch feedback55).
+    fn reload_saying(&self, say: bool) -> bool {
         let mut problems = String::new();
-        if self.static_check {
-            let analysis = crate::check::check_file(&self.main_file);
-            for d in &analysis.diagnostics {
-                eprintln!("{}", d);
+        let (_, mut tried) = crate::error::noting_reads(|| {
+            if self.static_check {
+                let analysis = crate::check::check_file(&self.main_file);
+                for d in &analysis.diagnostics {
+                    eprintln!("{}", d);
+                }
+                problems = analysis.errors().map(|d| d.to_string()).collect::<Vec<_>>().join("\n");
             }
-            problems = analysis.errors().map(|d| d.to_string()).collect::<Vec<_>>().join("\n");
-        }
+        });
+        // Said once: the checker's lines above are the errors (FEEDBACK55.md, Q-852; branch
+        // feedback55).
+        let checked_out = !problems.is_empty();
         self.shared.gil.acquire();
         // Services are loaded again with it (into a table of its own: see
         // `shared::Services`).
@@ -2280,15 +2305,25 @@ impl App {
         // as they load: FEEDBACK55.md, Q-701; branch feedback55).
         crate::builtins::protect_settings(&self.base_dir, None);
         let res = if problems.is_empty() {
-            it.load_file(&self.main_file)
+            let (res, read) = crate::error::noting_reads(|| it.load_file(&self.main_file));
+            tried.extend(read);
+            res
         } else {
             Err(crate::error::QuilloError::new(problems, 0))
         };
         self.shared.gil.release();
+        // What a failed load read or tried is watched until one loads (FEEDBACK55.md, Q-836;
+        // branch feedback55).
+        self.tried(if res.is_ok() { Vec::new() } else { tried });
         let mut slot = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let loaded = res.is_ok();
         match res {
             Ok(_) => {
-                eprintln!("quillo: reloaded {} ({} routes)", self.main_file.display(), it.routes.iter().filter(|r| r.method != crate::ast::GUARD_METHOD).count());
+                // "1 route", as when it starts (FEEDBACK55.md, Q-852; branch feedback55).
+                let n = it.routes.iter().filter(|r| r.method != crate::ast::GUARD_METHOD).count();
+                if say {
+                    eprintln!("quillo: reloaded {} ({} route{})", self.main_file.display(), n, if n == 1 { "" } else { "s" });
+                }
                 // A version that is the first to use services or `db.atomic`
                 // needs what delivers and recovers in the background.
                 let addr = *self.addr.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2305,7 +2340,9 @@ impl App {
                 *slot = (slot.0 + 1, loaded);
             }
             Err(e) => {
-                eprintln!("quillo: {}", e);
+                if !checked_out {
+                    eprintln!("quillo: {}", e);
+                }
                 if matches!(*slot.1, Loaded::Failed(_)) {
                     *slot = (slot.0 + 1, Arc::new(Loaded::Failed(e.to_string())));
                 } else {
@@ -2314,6 +2351,7 @@ impl App {
             }
         }
         self.changed.notify_all();
+        loaded
     }
 
     /// Waits up to `timeout` for a version newer than `seen`, or a
@@ -2336,6 +2374,13 @@ impl App {
         if let Loaded::Ready(it) = &*self.current().1 {
             files.extend(it.files());
         }
+        // And what the last load that failed named: a used file fixed, or one it lacked made,
+        // loads it (FEEDBACK55.md, Q-836; branch feedback55).
+        for f in self.tried.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
+            if !files.contains(f) {
+                files.push(f.clone());
+            }
+        }
         files
     }
 }
@@ -2353,7 +2398,7 @@ fn mtimes(files: &[PathBuf]) -> Vec<(Option<std::time::SystemTime>, Option<PathB
 /// feedback11-fixes).
 /// Where the system tells of changes to files, the watcher waits for them
 /// instead of looking every 50 ms: kqueue on macOS, inotify on Linux.
-/// Elsewhere, and when the system refuses (a file missing, too many open),
+/// Elsewhere, and when the system refuses (a folder missing, too many open),
 /// it looks every 50 ms as before. Under events it still looks once a
 /// second, for a filesystem that tells nothing (a network mount)
 /// (FEEDBACK15.md, Q-099; branch file-events).
@@ -2377,6 +2422,10 @@ mod events {
             }
             let mut ev = Events { kq, fds: Vec::with_capacity(files.len()) };
             for f in files {
+                // A file not there yet (one a load that failed lacked): its folder, which tells
+                // when the file is made (FEEDBACK55.md, Q-836; branch feedback55).
+                let dir = f.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+                let f = if !f.exists() && dir.is_dir() { dir } else { f.as_path() };
                 let c = std::ffi::CString::new(f.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
                 let fd = unsafe { libc::open(c.as_ptr(), libc::O_EVTONLY | libc::O_CLOEXEC) };
                 if fd < 0 {
@@ -2501,12 +2550,18 @@ mod events {
 /// before it ran was taken for the files as they were, and never loaded (a race CI found in
 /// no_check_reloads_what_loads, after FEEDBACK15.md, Q-098; branch main).
 pub(crate) fn watcher(app: Arc<App>) -> impl FnOnce() + Send + 'static {
-    let files = app.watched_files();
-    let seen = mtimes(&files);
-    move || watch(app, files, seen)
+    watcher_of(app, Vec::new())
 }
 
-fn watch(app: Arc<App>, mut files: Vec<PathBuf>, mut seen: Vec<(Option<std::time::SystemTime>, Option<PathBuf>)>) {
+/// `watcher`, reloading `others` too once `app` has loaded: the instances of `--instances`, which
+/// serve one version (FEEDBACK55.md, Q-841; branch feedback55).
+fn watcher_of(app: Arc<App>, others: Vec<Arc<App>>) -> impl FnOnce() + Send + 'static {
+    let files = app.watched_files();
+    let seen = mtimes(&files);
+    move || watch(app, others, files, seen)
+}
+
+fn watch(app: Arc<App>, others: Vec<Arc<App>>, mut files: Vec<PathBuf>, mut seen: Vec<(Option<std::time::SystemTime>, Option<PathBuf>)>) {
     let mut served: std::collections::HashMap<PathBuf, Option<std::time::SystemTime>> = Default::default();
     // Told of changes by the system where it can be (see `events`); else a
     // stat of each file every 50 ms, cheap for the hundreds a program has
@@ -2535,7 +2590,11 @@ fn watch(app: Arc<App>, mut files: Vec<PathBuf>, mut seen: Vec<(Option<std::time
         if now != seen {
             // Editors often write in several steps; let them finish.
             std::thread::sleep(Duration::from_millis(30));
-            app.reload();
+            if app.reload() {
+                for o in &others {
+                    o.reload_saying(false);
+                }
+            }
             files = app.watched_files();
             seen = mtimes(&files);
             // A save that renamed a new file over the old one left the
@@ -3165,6 +3224,18 @@ pub fn serve(app: App, addr: &str, workers: usize) -> Result<(), String> {
 pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(std::net::SocketAddr)) -> Result<(), String> {
     take_descriptors();
     let listener = std::net::TcpListener::bind(addr).map_err(|e| format!("cannot listen on {}: {}", addr, e))?;
+    serve_listener(app, listener, addr, workers, listening)
+}
+
+/// `serve` on a port bound already: `--split` binds the app's before it starts its services, to
+/// tell them the port (FEEDBACK55.md, Q-843; branch feedback55).
+pub fn serve_bound(app: App, listener: std::net::TcpListener, workers: usize) -> Result<(), String> {
+    take_descriptors();
+    let addr = listener.local_addr().map_or_else(|_| "?".to_string(), |a| a.to_string());
+    serve_listener(app, listener, &addr, workers, |_| {})
+}
+
+fn serve_listener(app: App, listener: std::net::TcpListener, addr: &str, workers: usize, listening: impl FnOnce(std::net::SocketAddr)) -> Result<(), String> {
     let bound = listener.local_addr().ok();
     if let Some(b) = bound {
         crate::platform::set_listening(&b.ip().to_string(), b.port());
@@ -3386,6 +3457,15 @@ pub fn serve_many(apps: Vec<App>, addr: &str, workers: usize) -> Result<(), Stri
     }
     if let Ok(a) = listener.local_addr() {
         start_jobs(&apps[0], a);
+    }
+    // `--reload`: each instance loads the program again, the first checking it and saying so
+    // (FEEDBACK55.md, Q-841; branch feedback55).
+    if apps[0].reload {
+        std::thread::Builder::new()
+            .name("quillo-watch".into())
+            .stack_size(WORKER_STACK)
+            .spawn(watcher_of(apps[0].clone(), apps[1..].to_vec()))
+            .map_err(|e| format!("cannot start file watcher: {}", e))?;
     }
     crate::httpd::serve_instances(apps, listener, workers + 1)
 }

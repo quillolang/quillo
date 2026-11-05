@@ -23,7 +23,7 @@ const REGISTRY: &str = "https://quillolang.org";
 /// No plugin, example or catalog is bigger than this.
 const MAX_DOWNLOAD: u64 = 8 << 20;
 
-const USAGE: &str = "\
+pub const USAGE: &str = "\
 usage:
   quillo install <name>[@version]...   download plugins into this folder
   quillo install --update              update the plugins installed here
@@ -73,7 +73,14 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 return Ok(v);
             }
             i += 1;
-            args.get(i).cloned().ok_or(format!("{} takes {}", flag, what))
+            let v = args.get(i).cloned().ok_or(format!("{} takes {}", flag, what))?;
+            // `--dir --force demo`: an option is no folder, and would be made one, the option lost
+            // (`--dir=--force` names one on purpose), as `run` refuses it since Q-381
+            // (FEEDBACK55.md, Q-846; branch feedback55).
+            if v.starts_with("--") || matches!(v.as_str(), "-f" | "-u" | "-l" | "-h") {
+                return Err(format!("`{}` needs {}, and `{}` is an option", flag, what, v));
+            }
+            Ok(v)
         };
         match flag {
             "--example" | "--examples" => o.example = true,
@@ -272,12 +279,16 @@ fn install_extras(agent: &ureq::Agent, registry: &str, e: &Entry, _o: &Options, 
 pub fn main(args: &[String]) -> i32 {
     let o = match parse_args(args) {
         Ok(o) => o,
+        // Asked for, the usage is the answer, on stdout as every command's is (FEEDBACK55.md,
+        // Q-851; branch feedback55).
+        Err(e) if e.is_empty() => {
+            println!("{}", USAGE);
+            return 0;
+        }
         Err(e) => {
-            if !e.is_empty() {
-                eprintln!("quillo install: {}", e);
-            }
+            eprintln!("quillo install: {}", e);
             eprintln!("{}", USAGE);
-            return if e.is_empty() { 0 } else { 2 };
+            return 2;
         }
     };
     let registry = o.registry.clone().or_else(|| std::env::var("QUILLO_REGISTRY").ok().filter(|r| !r.is_empty())).unwrap_or_else(|| REGISTRY.into());

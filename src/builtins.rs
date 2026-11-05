@@ -3236,7 +3236,7 @@ pub(crate) fn markdown(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let mut out = String::with_capacity(s.len() * 3 / 2);
     pulldown_cmark::html::push_html(&mut out, events);
     if over.get() {
-        return fail(line, "this request computed for longer than --max-compute allows");
+        return fail(line, crate::httpd::over_compute());
     }
     if inline {
         out = out.trim_end().to_string();
@@ -3255,7 +3255,7 @@ fn highlight(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // A long text counts against `--max-compute` (FEEDBACK55.md, Q-706; branch feedback55).
     match crate::highlight::highlight_within(&code, &lang) {
         Some(h) => Ok(Value::html(h)),
-        None => fail(line, "this request computed for longer than --max-compute allows"),
+        None => fail(line, crate::httpd::over_compute()),
     }
 }
 

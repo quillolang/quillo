@@ -5597,3 +5597,949 @@ fn a_stored_minus_zero_reads_as_zero() {
     let mut it = on_db(&url, "");
     assert_eq!(ev(&mut it, "let r = db.one(\"select '-0'::float8 as a, '-0'::float4 as b, '[-0.0]'::json as c\")\n[r.a, 1.0 / r.a > 0.0, r.b, 1.0 / r.c[0] > 0.0]"), "[0.0, true, 0.0, true]");
 }
+
+// ---- slice 13 ----
+// Q-835 to Q-852: the command line, `.env`, the policy and the language server.
+
+/// `quillo args...` in `d`, `input` on its stdin, under a deadline: its status, stdout and stderr.
+fn quillo_in(d: &Path, args: &[&str], input: &[u8]) -> (Option<i32>, String, String) {
+    use std::io::{Read, Write};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .args(args)
+        .current_dir(d)
+        .env("HOME", d)
+        .env("QUILLO_REGISTRY", "http://127.0.0.1:9")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (mut stdin, mut out, mut err) = (child.stdin.take().unwrap(), child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let input = input.to_vec();
+    std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let o = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = out.read_to_end(&mut b);
+        b
+    });
+    let e = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = err.read_to_end(&mut b);
+        b
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("quillo {:?} did not end", args);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let text = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
+    (status.code(), text(o.join().unwrap()), text(e.join().unwrap()))
+}
+
+/// A folder of these files (bytes), for one test.
+fn files_dir(name: &str, files: &[(&str, &[u8])]) -> PathBuf {
+    let d = support::temp_dir(&format!("feedback55-{}", name));
+    for (f, bytes) in files {
+        let p = d.join(f);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    }
+    d
+}
+
+/// `quillo run args...` in `d` on a port of its own, its log kept, until the guard is dropped:
+/// the guard, the port and the log.
+fn run_logged(d: &Path, args: &[&str]) -> (support::Guard, u16, PathBuf) {
+    let port = support::free_port();
+    let log = d.join(format!("server-{}.log", port));
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .args(args)
+        .args(["--port", &port.to_string()])
+        .current_dir(d)
+        .env("QUILLO_SECRET", "test secret for the tests")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let g = support::Guard::new(child);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !support::listening(port) {
+        assert!(std::time::Instant::now() < deadline, "did not start: {}", std::fs::read_to_string(&log).unwrap_or_default());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    (g, port, log)
+}
+
+/// Waits, up to 15 s, for `f` to hold; else fails with the log.
+fn until_logged(log: &Path, what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !f() {
+        assert!(std::time::Instant::now() < deadline, "{}: {}", what, std::fs::read_to_string(log).unwrap_or_default());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn body_of(port: u16, path: &str) -> String {
+    support::send(port, "GET", path, &[], "").body
+}
+
+// Q-835: a `.env` that was not UTF-8, or could not be read, was skipped without a word, and every
+// `env()` was null. Now only a missing one (or a folder of that name) is nothing; any other is
+// said with where, and stops the start with 2, as `--env-file` does. A service's own is said too.
+#[test]
+fn a_dotenv_that_cannot_be_read_is_said_and_stops_the_start() {
+    let prog: &[u8] = b"print(env(\"OTHER\"))\n";
+    let d = files_dir("dotenv-bad", &[("main.qwe", prog), (".env", b"KEY=s3cr\xe9t\nOTHER=2\n")]);
+    let (code, out, err) = quillo_in(&d, &["run", "main.qwe"], b"");
+    assert_eq!(code, Some(2), "{}{}", out, err);
+    assert!(out.is_empty() && err.contains("cannot read .env: it is not UTF-8 text: byte 0xE9 at line 1, column 9 (save it as UTF-8); to start without it, remove it or give `--env-file"), "{}", err);
+    // A UTF-16 file, as Notepad saves one.
+    let utf16: Vec<u8> = [0xFF, 0xFE].into_iter().chain("OTHER=2\n".encode_utf16().flat_map(|u| u.to_le_bytes())).collect();
+    std::fs::write(d.join(".env"), &utf16).unwrap();
+    let (code, _, err) = quillo_in(&d, &["run", "main.qwe"], b"");
+    assert_eq!(code, Some(2), "{}", err);
+    assert!(err.contains("byte 0xFF at line 1, column 1"), "{}", err);
+    // One that cannot be read.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(d.join(".env"), "OTHER=2\n").unwrap();
+        std::fs::set_permissions(d.join(".env"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(d.join(".env")).is_err() {
+            let (code, _, err) = quillo_in(&d, &["run", "main.qwe"], b"");
+            assert_eq!(code, Some(2), "{}", err);
+            assert!(err.contains("cannot read .env: Permission denied") && err.contains("; make it readable, or, to start without it, remove it or give `--env-file /dev/null`"), "{}", err);
+            // The way out it says.
+            assert_eq!(quillo_in(&d, &["run", "main.qwe", "--env-file", "/dev/null"], b""), (Some(0), "null\n".into(), String::new()));
+        }
+        std::fs::set_permissions(d.join(".env"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    // A link that leads nowhere: said with where it leads (review of slice 13).
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(d.join(".env")).unwrap();
+        std::os::unix::fs::symlink(d.join("gone/prod.env"), d.join(".env")).unwrap();
+        let (code, _, err) = quillo_in(&d, &["run", "main.qwe"], b"");
+        assert_eq!(code, Some(2), "{}", err);
+        assert!(err.contains(&format!("cannot read .env: it is a link to {}, which is not there; to start without it", d.join("gone/prod.env").display())), "{}", err);
+        // Named with --env-file: no way out said, it was asked for.
+        let (code, _, err) = quillo_in(&d, &["run", "main.qwe", "--env-file", ".env"], b"");
+        assert_eq!(code, Some(2), "{}", err);
+        assert!(err.contains("which is not there") && !err.contains("to start without it"), "{}", err);
+        // Leading to a file: read through the link.
+        std::fs::create_dir_all(d.join("gone")).unwrap();
+        std::fs::write(d.join("gone/prod.env"), "OTHER=linked\n").unwrap();
+        assert_eq!(quillo_in(&d, &["run", "main.qwe"], b""), (Some(0), "linked\n".into(), String::new()));
+        std::fs::remove_file(d.join(".env")).unwrap();
+    }
+    // The edges that read as before: UTF-8 with text past ASCII and a byte-order mark, an empty
+    // file, none at all, and a folder named `.env` (a Python virtual environment).
+    std::fs::write(d.join(".env"), "\u{FEFF}OTHER=ünï ✓\n").unwrap();
+    assert_eq!(quillo_in(&d, &["run", "main.qwe"], b""), (Some(0), "ünï ✓\n".into(), String::new()));
+    std::fs::write(d.join(".env"), "").unwrap();
+    assert_eq!(quillo_in(&d, &["run", "main.qwe"], b""), (Some(0), "null\n".into(), String::new()));
+    std::fs::remove_file(d.join(".env")).unwrap();
+    assert_eq!(quillo_in(&d, &["run", "main.qwe"], b""), (Some(0), "null\n".into(), String::new()));
+    std::fs::create_dir(d.join(".env")).unwrap();
+    assert_eq!(quillo_in(&d, &["run", "main.qwe"], b""), (Some(0), "null\n".into(), String::new()));
+    // Named, a folder is no file.
+    let (code, _, err) = quillo_in(&d, &["run", "main.qwe", "--env-file", ".env"], b"");
+    assert_eq!(code, Some(2), "{}", err);
+    assert!(err.contains("cannot read .env"), "{}", err);
+}
+
+#[test]
+fn a_services_own_dotenv_that_cannot_be_read_stops_its_load() {
+    let d = files_dir(
+        "dotenv-service",
+        &[("app.qwe", b"service billing = \"svc/billing.qwe\"\nroute GET / = billing.who()\n"), ("svc/billing.qwe", b"server fn who() = env(\"B\") ?? \"none\"\n"), ("svc/.env", b"B=\xe9\n")],
+    );
+    let (code, _, err) = quillo_in(&d, &["run", "app.qwe", "--port", "0"], b"");
+    assert_eq!(code, Some(1), "{}", err);
+    assert!(err.contains("service `billing`: cannot read ./svc/.env: it is not UTF-8 text: byte 0xE9 at line 1, column 3"), "{}", err);
+    // Read, its skipped lines said as the program's are.
+    std::fs::write(d.join("svc/.env"), b"B=ok\nC=x\0\n").unwrap();
+    let (_g, port, log) = run_logged(&d, &["app.qwe"]);
+    assert_eq!(body_of(port, "/"), "ok");
+    assert!(std::fs::read_to_string(&log).unwrap().contains("svc/.env:2: a value cannot hold a NUL byte, skipped"));
+}
+
+// Q-838: `KEY= # note` set "# note", though the guide says ` #` ends a bare value. Now a value that
+// starts with `#` after spaces or a tab is empty; `KEY=#fff` and a quoted `#` keep theirs.
+#[test]
+fn dotenv_a_note_after_the_spaces_is_no_value() {
+    use quillo::dotenv::parse;
+    let one = |text: &str| parse(text).into_iter().next().map(|(_, v)| v);
+    for (text, want) in [
+        ("KEY= # note", ""),
+        ("KEY=   # set me", ""),
+        ("KEY=\t#x", ""),
+        ("KEY= #", ""),
+        ("KEY = # spaced key", ""),
+        ("KEY=#fff", "#fff"),
+        ("KEY=x # note", "x"),
+        ("KEY=x#y", "x#y"),
+        ("KEY= \"# quoted\"", "# quoted"),
+        ("KEY= '# single'", "# single"),
+        ("KEY=", ""),
+        ("KEY= ünï # n", "ünï"),
+    ] {
+        assert_eq!(one(text).as_deref(), Some(want), "{:?}", text);
+    }
+}
+
+// Q-839: an unclosed quote took the rest of the file as its value while saying the line was
+// skipped. Now the line is skipped, as said, and the lines after it are read as their own.
+#[test]
+fn dotenv_an_unclosed_quote_skips_its_line_alone() {
+    use quillo::dotenv::{parse, parse_noting};
+    let pairs = |t: &str| parse(t).into_iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>();
+    assert_eq!(parse_noting("KEY='abc\nOTHER=2\n"), (vec![("OTHER".to_string(), "2".to_string())], vec![(1, "its quote is not closed")]));
+    assert_eq!(pairs("KEY=\"abc\nOTHER=2\nLAST=3"), ["OTHER=2", "LAST=3"]);
+    // On the last line, alone in the file.
+    assert_eq!(parse_noting("A=1\nKEY=\"open"), (vec![("A".to_string(), "1".to_string())], vec![(2, "its quote is not closed")]));
+    assert_eq!(pairs("KEY='"), Vec::<String>::new());
+    // Closed on a later line: one value over lines, as a PEM key, and closed on the last line.
+    assert_eq!(pairs("PEM='-----BEGIN-----\nabc\n-----END-----'\nNEXT=1"), ["PEM=-----BEGIN-----\nabc\n-----END-----", "NEXT=1"]);
+    assert_eq!(pairs("Q=\"ünï\n✓\""), ["Q=ünï\n✓"]);
+    // A quote inside a bare value is no opening one.
+    assert_eq!(pairs("A=it's\nB=2"), ["A=it's", "B=2"]);
+}
+
+// Q-840: a NUL in a value panicked as it was set. Now the line is said and skipped, and the others
+// are read; a NUL in a quoted value too, and `\0` written in double quotes is the digit.
+#[test]
+fn dotenv_a_nul_in_a_value_is_said_and_skipped() {
+    use quillo::dotenv::parse_noting;
+    assert_eq!(parse_noting("KEY=x\0\nB=2\n"), (vec![("B".to_string(), "2".to_string())], vec![(1, "a value cannot hold a NUL byte")]));
+    assert_eq!(parse_noting("KEY=\"a\0b\"").1, vec![(1, "a value cannot hold a NUL byte")]);
+    assert_eq!(parse_noting("KEY='\0'").1, vec![(1, "a value cannot hold a NUL byte")]);
+    assert_eq!(parse_noting("KEY=\"\\0\"").0, vec![("KEY".to_string(), "0".to_string())]);
+    assert_eq!(parse_noting("# a note \0\nK\0=1\n"), (vec![], vec![(2, "not KEY=value")]));
+    let d = files_dir("dotenv-nul", &[("main.qwe", b"for k in [\"KEY\", \"B\"] { print(k, json.stringify(env(k))) }\n"), (".env", b"KEY=x\0\nB=2\n")]);
+    let (code, out, err) = quillo_in(&d, &["run", "main.qwe"], b"");
+    assert_eq!((code, out.as_str()), (Some(0), "KEY null\nB \"2\"\n"), "{}", err);
+    assert!(err.contains(".env:1: a value cannot hold a NUL byte, skipped") && !err.contains("panicked"), "{}", err);
+}
+
+// Q-836: `--watch` started while a used file was broken watched only the main file, and a fixed
+// `lib.qwe` never loaded; a reload that failed for a missing import watched the version before's
+// files, and making that file loaded nothing. Now every file the failed load read or tried is
+// watched, and the folders of those not there. Q-852: each error is said once, and "1 route".
+#[test]
+fn watch_reloads_when_a_file_the_failed_load_named_is_fixed_or_made() {
+    let d = files_dir("watch-broken", &[("main.qwe", b"import lib.qwe use ver\nroute GET / = str(ver())\n"), ("lib.qwe", b"fn ver() = 1 +\n")]);
+    let (_g, port, log) = run_logged(&d, &["main.qwe", "--watch"]);
+    assert_eq!(support::send(port, "GET", "/", &[], "").status, 500);
+    std::fs::write(d.join("lib.qwe"), "fn ver() = 2\n").unwrap();
+    until_logged(&log, "the fixed lib.qwe loads", || body_of(port, "/") == "2");
+    let said = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(said.matches("expected an expression, found end of input").count(), 1, "{}", said);
+    assert!(said.contains("quillo: reloaded main.qwe (1 route)\n"), "{}", said);
+    // A reload that fails for a file not there: the version before is served, the error said
+    // once, and the file, made, loads it.
+    std::fs::write(d.join("main.qwe"), "import lib.qwe use ver\nimport b.qwe use bee\nroute GET / = str(ver()) + bee()\n").unwrap();
+    until_logged(&log, "the failed reload is said", || std::fs::read_to_string(&log).unwrap().contains("still serving the previous version"));
+    let said = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(said.matches("cannot read b.qwe").count(), 1, "{}", said);
+    assert_eq!(body_of(port, "/"), "2");
+    std::fs::write(d.join("b.qwe"), "fn bee() = \"B\"\n").unwrap();
+    until_logged(&log, "the file made loads", || body_of(port, "/") == "2B");
+    // In a folder not there either, made with it; then two routes.
+    std::fs::write(d.join("main.qwe"), "import lib.qwe use ver\nimport sub/c.qwe use sea\nroute GET / = str(ver()) + sea()\nroute GET /x = \"x\"\n").unwrap();
+    until_logged(&log, "the second failed reload is said", || std::fs::read_to_string(&log).unwrap().matches("still serving the previous version").count() == 2);
+    std::fs::create_dir(d.join("sub")).unwrap();
+    std::fs::write(d.join("sub/c.qwe"), "fn sea() = \"C\"\n").unwrap();
+    until_logged(&log, "the file in the folder made loads", || body_of(port, "/") == "2C");
+    assert!(std::fs::read_to_string(&log).unwrap().contains("quillo: reloaded main.qwe (2 routes)\n"));
+    // The main file broken on its own, as before.
+    std::fs::write(d.join("main.qwe"), "route GET / = \n").unwrap();
+    until_logged(&log, "the third failed reload is said", || std::fs::read_to_string(&log).unwrap().matches("still serving the previous version").count() == 3);
+    std::fs::write(d.join("main.qwe"), "route GET / = \"main again\"\n").unwrap();
+    until_logged(&log, "the main file fixed loads", || body_of(port, "/") == "main again");
+}
+
+#[test]
+fn watch_started_on_a_missing_import_loads_once_it_is_made() {
+    let d = files_dir("watch-missing", &[("main.qwe", b"import gone.qwe use g\nroute GET / = g()\n")]);
+    let (_g, port, log) = run_logged(&d, &["main.qwe", "--watch", "--no-check"]);
+    assert_eq!(support::send(port, "GET", "/", &[], "").status, 500);
+    std::fs::write(d.join("gone.qwe"), "fn g() = \"here\"\n").unwrap();
+    until_logged(&log, "the file made loads", || body_of(port, "/") == "here");
+    assert!(!std::fs::read_to_string(&log).unwrap().contains("every 50 ms"), "its folder is watched");
+}
+
+// Q-841: `--reload` with `--instances` started no watcher, and nothing said so. Now each instance
+// loads a change, the first checking it: a change that does not check reaches none of them.
+#[test]
+fn reload_with_instances_reloads_every_instance() {
+    let d = files_dir("reload-instances", &[("main.qwe", b"route GET / = \"v=1\"\n")]);
+    let (_g, port, log) = run_logged(&d, &["main.qwe", "--reload", "--instances", "2"]);
+    assert_eq!(body_of(port, "/"), "v=1");
+    std::fs::write(d.join("main.qwe"), "route GET / = \"v=2\"\n").unwrap();
+    until_logged(&log, "every instance reloads", || (0..12).all(|_| body_of(port, "/") == "v=2"));
+    assert_eq!(std::fs::read_to_string(&log).unwrap().matches("reloaded main.qwe").count(), 1, "said once");
+    std::fs::write(d.join("main.qwe"), "route GET / = \"v=\" + \n").unwrap();
+    until_logged(&log, "the broken change is said", || std::fs::read_to_string(&log).unwrap().contains("still serving the previous version"));
+    assert!((0..12).all(|_| body_of(port, "/") == "v=2"));
+    // One instance, as before.
+    std::fs::write(d.join("main.qwe"), "route GET / = \"v=2\"\n").unwrap();
+    let (_g1, port1, log1) = run_logged(&d, &["main.qwe", "--reload", "--instances", "1"]);
+    std::fs::write(d.join("main.qwe"), "route GET / = \"v=3\"\n").unwrap();
+    until_logged(&log1, "one instance reloads", || body_of(port1, "/") == "v=3");
+    let (code, _, err) = quillo_in(&d, &["run", "main.qwe", "--instances", "2", "--watch"], b"");
+    assert_eq!(code, Some(2));
+    assert!(err.ends_with("quillo: --instances does not go with --watch or --register\n"), "{}", err);
+}
+
+// Q-842: `--split --reload` gave only `--watch` to its services, so a change to a service's file
+// was never taken. Now `--reload` goes to them too.
+#[test]
+fn split_reload_takes_a_change_to_a_services_file() {
+    let d = files_dir("split-reload", &[("app.qwe", b"service billing = \"billing.qwe\"\nroute GET / = billing.who()\n"), ("billing.qwe", b"server fn who() = \"billing v1\"\n")]);
+    let (_g, port, log) = run_logged(&d, &["app.qwe", "--split", "--reload"]);
+    assert_eq!(body_of(port, "/"), "billing v1");
+    std::fs::write(d.join("billing.qwe"), "server fn who() = \"billing v2 ✓\"\n").unwrap();
+    until_logged(&log, "the service reloads", || body_of(port, "/") == "billing v2 ✓");
+    assert!(std::fs::read_to_string(&log).unwrap().contains("[billing] quillo: reloaded billing.qwe"));
+}
+
+/// `quillo run args...` in `d` with `--port 0`, its log kept: the guard, the app's port (from its
+/// own "listening on" line, not a service's) and the log.
+fn run_on_any_port(d: &Path, args: &[&str]) -> (support::Guard, u16, PathBuf) {
+    let log = d.join("any-port.log");
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .args(args)
+        .args(["--port", "0"])
+        .current_dir(d)
+        .env("QUILLO_SECRET", "test secret for the tests")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let g = support::Guard::new(child);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let said = std::fs::read_to_string(&log).unwrap_or_default();
+        let port = said.lines().filter(|l| l.starts_with("quillo: ")).find_map(|l| l.split("listening on http://127.0.0.1:").nth(1)).and_then(|p| p.split_whitespace().next()?.parse::<u16>().ok());
+        if let Some(port) = port.filter(|p| support::listening(*p)) {
+            return (g, port, log);
+        }
+        assert!(std::time::Instant::now() < deadline, "did not start: {}", said);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+// Q-843: `--split --port 0` told every service the app was at port 0, so a service's channel
+// relay went nowhere. Now the services are told the port the app was given.
+#[test]
+fn split_on_any_port_tells_the_services_the_port_given() {
+    let d = files_dir("split-port0", &[("app.qwe", b"service billing = \"billing.qwe\"\nroute GET / = billing.who()\n"), ("billing.qwe", b"server fn who() = env(\"QUILLO_APP_URL\") ?? \"none\"\n")]);
+    let (_g, port, _log) = run_on_any_port(&d, &["app.qwe", "--split"]);
+    assert_ne!(port, 0);
+    assert_eq!(body_of(port, "/"), format!("http://127.0.0.1:{}", port));
+    // A port named is told as it was.
+    let (_g2, named, _) = run_logged(&d, &["app.qwe", "--split"]);
+    assert_eq!(body_of(named, "/"), format!("http://127.0.0.1:{}", named));
+    // An address that cannot be listened on is said before any service starts.
+    let (code, _, err) = quillo_in(&d, &["run", "app.qwe", "--split", "--port", "0", "--host", "203.0.113.1"], b"");
+    assert_eq!(code, Some(1), "{}", err);
+    assert!(err.starts_with("quillo: cannot listen on 203.0.113.1:0: ") && !err.contains("service billing"), "{}", err);
+}
+
+// Q-837: `quillo fix` wrote its import before a file's byte-order mark, and the file no longer
+// parsed; the line it added was LF in a CRLF file. Now the mark stays first and the lines added
+// end as the file's do.
+#[test]
+fn fix_writes_after_a_byte_order_mark_with_the_files_line_ends() {
+    let main: &[u8] = b"import lib.qwe use ver\nimport ui.qwe use page\nroute GET / = page()\n";
+    let d = files_dir("fix-bom", &[("lib.qwe", b"fn ver() = 1\n"), ("main.qwe", main), ("ui.qwe", b"\xef\xbb\xbf// ui\r\nfn page() {\r\n  str(ver())\r\n}")]);
+    let (code, out, err) = quillo_in(&d, &["fix", "main.qwe"], b"");
+    assert_eq!(code, Some(0), "{}{}", out, err);
+    assert_eq!(std::fs::read(d.join("ui.qwe")).unwrap(), b"\xef\xbb\xbf// ui\r\nimport lib.qwe use ver\r\n\r\nfn page() {\r\n  str(ver())\r\n}");
+    let (code, out, err) = quillo_in(&d, &["check", "main.qwe"], b"");
+    assert_eq!(code, Some(0), "{}{}", out, err);
+    assert!(!err.contains("U+FEFF"), "{}", err);
+    // A file that starts with an import, after its mark: the new one goes below it.
+    std::fs::write(d.join("two.qwe"), "fn two() = 2\n").unwrap();
+    std::fs::write(d.join("ui.qwe"), b"\xef\xbb\xbfimport lib.qwe use ver\r\nfn page() {\r\n  str(ver()) + str(two())\r\n}\r\n").unwrap();
+    std::fs::write(d.join("main.qwe"), "import lib.qwe use ver\nimport ui.qwe use page\nimport two.qwe use two\nroute GET / = page()\n").unwrap();
+    assert_eq!(quillo_in(&d, &["fix", "main.qwe"], b"").0, Some(0));
+    assert_eq!(std::fs::read(d.join("ui.qwe")).unwrap(), b"\xef\xbb\xbfimport lib.qwe use ver\r\nimport two.qwe use two\r\nfn page() {\r\n  str(ver()) + str(two())\r\n}\r\n");
+    // CRLF without a mark, and a plain LF file, as before.
+    std::fs::write(d.join("ui.qwe"), "fn page() {\r\n  str(ver())\r\n}\r\n").unwrap();
+    std::fs::write(d.join("main.qwe"), main).unwrap();
+    assert_eq!(quillo_in(&d, &["fix", "main.qwe"], b"").0, Some(0));
+    assert_eq!(std::fs::read_to_string(d.join("ui.qwe")).unwrap(), "import lib.qwe use ver\r\n\r\nfn page() {\r\n  str(ver())\r\n}\r\n");
+    std::fs::write(d.join("ui.qwe"), "// ünï\nfn page() {\n  str(ver())\n}").unwrap();
+    assert_eq!(quillo_in(&d, &["fix", "main.qwe"], b"").0, Some(0));
+    assert_eq!(std::fs::read_to_string(d.join("ui.qwe")).unwrap(), "// ünï\nimport lib.qwe use ver\n\nfn page() {\n  str(ver())\n}");
+}
+
+/// `quillo lsp`, its messages read on a thread of their own so that a test waits on a deadline.
+struct Lsp {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    got: std::sync::mpsc::Receiver<serde_json::Value>,
+    next: u64,
+}
+
+impl Lsp {
+    fn start() -> Lsp {
+        use std::io::{BufRead, Read};
+        let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+            .arg("lsp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        support::stop_with_tests(&child);
+        let stdin = child.stdin.take().unwrap();
+        let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+        let (tx, got) = std::sync::mpsc::channel();
+        std::thread::spawn(move || loop {
+            let mut len = 0;
+            loop {
+                let mut line = String::new();
+                if out.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                if line.trim_end().is_empty() {
+                    break;
+                }
+                if let Some((_, v)) = line.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("content-length")) {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0; len];
+            if out.read_exact(&mut body).is_err() || tx.send(serde_json::from_slice(&body).unwrap()).is_err() {
+                return;
+            }
+        });
+        Lsp { child, stdin, got, next: 1 }
+    }
+
+    fn raw(&mut self, bytes: &[u8]) {
+        use std::io::Write;
+        self.stdin.write_all(bytes).unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    fn send(&mut self, msg: serde_json::Value) {
+        let body = msg.to_string();
+        self.raw(format!("Content-Length: {}\r\n\r\n{}", body.len(), body).as_bytes());
+    }
+
+    fn next(&self) -> serde_json::Value {
+        self.got.recv_timeout(std::time::Duration::from_secs(20)).expect("the language server answers")
+    }
+
+    /// The answer to a request, whole (`result` or `error`), the notifications before it passed over.
+    fn ask(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let id = self.next;
+        self.next += 1;
+        self.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+        self.answer(id)
+    }
+
+    fn answer(&self, id: u64) -> serde_json::Value {
+        loop {
+            let m = self.next();
+            if m["id"] == serde_json::json!(id) {
+                return m;
+            }
+        }
+    }
+
+    fn notify(&mut self, method: &str, params: serde_json::Value) {
+        self.send(serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params }));
+    }
+
+    fn open(&mut self, uri: &str, text: &str) {
+        self.notify("textDocument/didOpen", serde_json::json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": text } }));
+    }
+
+    /// The diagnostics published for each URI until a request asked after them is answered.
+    fn published(&mut self) -> std::collections::HashMap<String, Vec<String>> {
+        let id = self.next;
+        self.next += 1;
+        self.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": "textDocument/documentSymbol", "params": { "textDocument": { "uri": "file:///nowhere.qwe" } } }));
+        let mut out = std::collections::HashMap::new();
+        loop {
+            let m = self.next();
+            if m["id"] == serde_json::json!(id) {
+                return out;
+            }
+            if m["method"] == "textDocument/publishDiagnostics" {
+                let msgs = m["params"]["diagnostics"].as_array().unwrap().iter().map(|d| d["message"].as_str().unwrap().to_string()).collect();
+                out.insert(m["params"]["uri"].as_str().unwrap().to_string(), msgs);
+            }
+        }
+    }
+}
+
+impl Drop for Lsp {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+// Q-844: a project opened through a link got no diagnostics: they went to the real path, and
+// were of the file on disk, not the editor's text. Now open documents are known by their real
+// paths too, and diagnostics go to the URI the editor opened, from what it holds.
+#[cfg(unix)]
+#[test]
+fn lsp_a_project_opened_through_a_link_gets_its_diagnostics() {
+    let d = files_dir("lsp-link", &[("prog/main.qwe", b"import lib.qwe use ver\nroute GET / = str(ver())\n"), ("prog/lib.qwe", b"fn ver() = 1\n")]);
+    std::os::unix::fs::symlink(d.join("prog"), d.join("proglink")).unwrap();
+    let real = d.canonicalize().unwrap();
+    let uri = format!("file://{}/proglink/lib.qwe", d.display());
+    let mut s = Lsp::start();
+    s.ask("initialize", serde_json::json!({ "capabilities": {} }));
+    // Unsaved text with an error, the file on disk without.
+    s.open(&uri, "fn ver() = 1 +\n");
+    let got = s.published();
+    assert!(got.get(&uri).is_some_and(|m| m.len() == 1 && m[0].contains("expected an expression")), "{:?}", got);
+    assert!(!got.keys().any(|u| u.contains("/prog/lib.qwe")), "nothing under the real path: {:?}", got);
+    // Fixed in the editor, though the disk is not: none.
+    std::fs::write(d.join("prog/lib.qwe"), "fn ver() = 1 +\n").unwrap();
+    s.notify("textDocument/didChange", serde_json::json!({ "textDocument": { "uri": uri, "version": 2 }, "contentChanges": [{ "text": "fn ver() = 2\n" }] }));
+    let got = s.published();
+    assert_eq!(got.get(&uri), Some(&Vec::new()), "{:?}", got);
+    // Opened by its real path, as before: the same, under that URI.
+    let real_uri = format!("file://{}/prog/lib.qwe", real.display());
+    s.notify("textDocument/didClose", serde_json::json!({ "textDocument": { "uri": uri } }));
+    s.open(&real_uri, "fn ver() = 1 +\n");
+    let got = s.published();
+    assert!(got.get(&real_uri).is_some_and(|m| m.len() == 1 && m[0].contains("expected an expression")), "{:?}", got);
+    s.notify("textDocument/didClose", serde_json::json!({ "textDocument": { "uri": real_uri } }));
+    // Both files open through the link: what the program says of the main file is left to the
+    // main file's own check, not published again under its real path.
+    std::fs::write(d.join("prog/lib.qwe"), "fn ver() = 1\n").unwrap();
+    let main_uri = format!("file://{}/proglink/main.qwe", d.display());
+    s.open(&main_uri, "import lib.qwe use ver\nroute GET / = str(ver())\n");
+    s.open(&uri, "fn ver() = 1\n");
+    s.published();
+    s.notify("textDocument/didChange", serde_json::json!({ "textDocument": { "uri": uri, "version": 4 }, "contentChanges": [{ "text": "fn other() = 2\n" }] }));
+    let got = s.published();
+    assert_eq!(got.get(&uri), Some(&Vec::new()), "{:?}", got);
+    assert!(got.keys().all(|u| u == &uri || u == &main_uri), "{:?}", got);
+}
+
+// Review of slice 13 (Q-844): one file open through two links is two documents of one file: what
+// is said of it is said under both URIs.
+#[cfg(unix)]
+#[test]
+fn lsp_one_file_open_through_two_links_is_told_under_both() {
+    let d = files_dir("lsp-two-links", &[("prog/main.qwe", b"import lib.qwe use ver\nroute GET / = str(ver())\n"), ("prog/lib.qwe", b"fn ver() = 1\n")]);
+    for l in ["l1", "l2"] {
+        std::os::unix::fs::symlink(d.join("prog"), d.join(l)).unwrap();
+    }
+    let (u1, u2) = (format!("file://{}/l1/lib.qwe", d.display()), format!("file://{}/l2/lib.qwe", d.display()));
+    let mut s = Lsp::start();
+    s.ask("initialize", serde_json::json!({ "capabilities": {} }));
+    s.open(&u1, "fn ver() = 1\n");
+    assert_eq!(s.published().get(&u1), Some(&Vec::new()));
+    s.open(&u2, "fn ver() = 1 +\n");
+    let got = s.published();
+    for u in [&u1, &u2] {
+        assert!(got.get(u).is_some_and(|m| m.len() == 1 && m[0].contains("expected an expression")), "{}: {:?}", u, got);
+    }
+    // Fixed in one: cleared under both.
+    s.notify("textDocument/didChange", serde_json::json!({ "textDocument": { "uri": u1, "version": 2 }, "contentChanges": [{ "text": "fn ver() = 2\n" }] }));
+    let got = s.published();
+    assert_eq!((got.get(&u1), got.get(&u2)), (Some(&Vec::new()), Some(&Vec::new())), "{:?}", got);
+    // Closed in one: the other alone.
+    s.notify("textDocument/didClose", serde_json::json!({ "textDocument": { "uri": u1 } }));
+    s.published();
+    s.notify("textDocument/didChange", serde_json::json!({ "textDocument": { "uri": u2, "version": 3 }, "contentChanges": [{ "text": "fn ver() = \n" }] }));
+    let got = s.published();
+    assert!(got.get(&u2).is_some_and(|m| m.len() == 1) && !got.contains_key(&u1), "{:?}", got);
+}
+
+// Q-845: a `content-length` header in another case was no length, and the body was read as
+// headers: that request and every one after it went unanswered. Q-852: before `initialize` and
+// after `shutdown` requests were answered as usual, and a body that was not JSON got nothing.
+#[test]
+fn lsp_reads_headers_in_any_case_and_answers_out_of_turn_as_the_protocol_asks() {
+    let mut s = Lsp::start();
+    let early = s.ask("textDocument/hover", serde_json::json!({}));
+    assert_eq!(early["error"]["code"], -32002, "{}", early);
+    // A notification then is dropped: the next answer is the request's.
+    s.open("file:///early.qwe", "let x = ");
+    let body = serde_json::json!({ "jsonrpc": "2.0", "id": 50, "method": "initialize", "params": { "capabilities": {} } }).to_string();
+    s.raw(format!("content-length: {}\r\n\r\n{}", body.len(), body).as_bytes());
+    let init = s.next();
+    assert_eq!((init["id"].clone(), init["result"]["serverInfo"]["name"].clone()), (serde_json::json!(50), serde_json::json!("quillo")), "{}", init);
+    for header in ["CONTENT-LENGTH:{}", "Content-length:{}", "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\ncontent-LENGTH :  {}"] {
+        let id = s.next;
+        s.next += 1;
+        let body = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": "textDocument/documentSymbol", "params": { "textDocument": { "uri": "file:///ünï.qwe" } } }).to_string();
+        s.raw(format!("{}\r\n\r\n{}", header.replace("{}", &body.len().to_string()), body).as_bytes());
+        assert!(s.answer(id).get("result").is_some(), "{}", header);
+    }
+    // Not JSON: -32700, and the next request is answered.
+    s.raw(b"Content-Length: 5\r\n\r\n{bad}");
+    let bad = s.next();
+    assert_eq!((bad["error"]["code"].clone(), bad["id"].clone()), (serde_json::json!(-32700), serde_json::Value::Null), "{}", bad);
+    assert!(s.ask("textDocument/documentSymbol", serde_json::json!({ "textDocument": { "uri": "file:///a.qwe" } })).get("result").is_some());
+    assert_eq!(s.ask("shutdown", serde_json::Value::Null)["result"], serde_json::Value::Null);
+    let late = s.ask("textDocument/hover", serde_json::json!({}));
+    assert_eq!(late["error"]["code"], -32600, "{}", late);
+    s.notify("exit", serde_json::Value::Null);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(st) = s.child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(std::time::Instant::now() < deadline, "exit ends it");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(0));
+}
+
+// Q-847: `quillo serve` read its options its own way: `--port=8080` was an unknown option and
+// `--with --watch` started "--watch". Now it reads them as `run` does.
+#[test]
+fn quillo_serve_reads_its_options_as_run_does() {
+    let d = files_dir("serve-options", &[("site/index.html", b"<p>home</p>")]);
+    let port = support::free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .args(["serve", &format!("--port={}", port), "--workers=4", "--log=json", "site"])
+        .current_dir(&d)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let _g = support::Guard::new(child);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !support::listening(port) {
+        assert!(std::time::Instant::now() < deadline, "quillo serve --port= did not start");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(body_of(port, "/"), "<p>home</p>");
+    for (args, said) in [
+        (&["serve", "site", "--with", "--watch"][..], "quillo: `--with` needs a value, and `--watch` is an option\n"),
+        (&["serve", "site", "--port"][..], "quillo: `--port` needs a value\n"),
+        (&["serve", "site", "extra"][..], "quillo: unknown argument `extra`: `serve` takes one folder\n"),
+        (&["serve", "--port", "1", "site", "extra"][..], "quillo: unknown argument `extra`: `serve` takes one folder\n"),
+        (&["serve", "site", "--watch=1"][..], "quillo: `--watch` takes no value: write `--watch` alone\n"),
+        (&["serve", "site", "--port=abc"][..], "quillo: --port is a number from 1 to 65535 (or 0 for any free one), got \"abc\"\n"),
+        (&["serve", "nowhere"][..], "quillo: nowhere is not a folder: `quillo serve` serves a folder's files\n"),
+    ] {
+        assert_eq!(quillo_in(&d, args, b""), (Some(2), String::new(), said.to_string()), "{:?}", args);
+    }
+}
+
+// Q-848: the REPL fed from a pipe took a line that was not UTF-8 for the end of its input, and
+// stopped with 0. Now the line is said, by number, and skipped; the rest runs, and it ends with 1.
+#[test]
+fn the_repl_says_a_line_that_is_not_utf8_and_goes_on() {
+    let d = files_dir("repl-utf8", &[]);
+    let (code, out, err) = quillo_in(&d, &["repl"], b"print(\"one\")\nprint(\"\xe9\")\nprint(\"three\")\n");
+    assert_eq!((code, out.as_str(), err.as_str()), (Some(1), "one\nthree\n", "error: line 2 is not UTF-8 text (byte 0xE9 at column 8): skipped\n"));
+    // The first line, and a last one with no line end.
+    let (code, out, err) = quillo_in(&d, &["repl"], b"\xff\nprint(1)\n\xc3");
+    assert_eq!((code, out.as_str()), (Some(1), "1\n"), "{}", err);
+    assert!(err.contains("line 1 is not UTF-8 text (byte 0xFF at column 1)") && err.contains("line 3 is not UTF-8 text (byte 0xC3 at column 1)"), "{}", err);
+    // UTF-8 past ASCII, as before; and with -i the prompts go on after the line, which ends with
+    // 0 as its other errors do.
+    assert_eq!(quillo_in(&d, &["repl"], "print(\"é ✓\")\n".as_bytes()), (Some(0), "é ✓\n".into(), String::new()));
+    let (code, out, err) = quillo_in(&d, &["repl", "-i"], b"print(\"\xe9\")\nprint(2)\n");
+    assert_eq!(code, Some(0));
+    assert!(out.contains("quillo> 2\n") && err.contains("line 1 is not UTF-8 text"), "{}{}", out, err);
+    // Q-852: what `repl` does not take is said, not passed over.
+    assert_eq!(quillo_in(&d, &["repl", "hello.qwe"], b""), (Some(2), String::new(), "quillo: unknown argument `hello.qwe`: `repl` takes no file; to run it: quillo run hello.qwe\n".into()));
+    assert_eq!(quillo_in(&d, &["repl", "--bogus"], b""), (Some(2), String::new(), "quillo: unknown option `--bogus` for `repl` (it takes -i)\n".into()));
+    assert_eq!(quillo_in(&d, &["repl", "-i", "x"], b"").0, Some(2));
+}
+
+// Q-849: a policy took limits of 0 that the command line refuses: `max_body = 0` answered every
+// POST 413, `max_compute = "0s"` ended every request; and the message named `--max-compute`
+// though none was given. Now they are refused as the options are, and the message and the start
+// name the policy.
+#[test]
+fn a_policy_takes_the_limits_the_command_line_takes() {
+    let d = files_dir("policy-zero", &[("main.qwe", b"route GET / = \"hi\"\n")]);
+    let policy = |text: &str| {
+        std::fs::write(d.join("p.toml"), text).unwrap();
+        quillo_in(&d, &["check", "main.qwe", "--policy", "p.toml"], b"")
+    };
+    for (text, said) in [
+        ("[limits]\nmax_body = 0\n", "p.toml:2: `max_body` is a size larger than 0"),
+        ("[limits]\nmax_body = \"0KB\"\n", "p.toml:2: `max_body` is a size larger than 0"),
+        ("[limits]\nmax_compute = \"0s\"\n", "p.toml:2: `max_compute` is a time longer than 0"),
+        ("[limits]\nmax_compute = \"0ms\"\n", "p.toml:2: `max_compute` is a time longer than 0"),
+        ("[limits]\nmax_compute = \"0\"\n", "p.toml:2: `max_compute` is a time longer than 0"),
+        ("[limits]\nmax_compute = \"99999999999999999m\"\n", "p.toml:2: `99999999999999999m` is not a time"),
+        ("[limits]\nworkers = 0\n", "p.toml:2: `workers` is a positive number"),
+        ("[limits]\nworkers = -1\n", "p.toml:2: `workers` is a positive number"),
+    ] {
+        let (code, _, err) = policy(text);
+        assert_eq!(code, Some(2), "{:?}: {}", text, err);
+        assert!(err.contains(said), "{:?}: {}", text, err);
+    }
+    // The least each takes, and the start says what holds the program.
+    let (code, _, err) = policy("[limits]\nmax_body = 1\nmax_compute = \"1ms\"\nworkers = 1\n");
+    assert_eq!(code, Some(0), "{}", err);
+    assert!(err.contains("quillo: policy p.toml (workers 1; max_compute 1ms; max_body 1 byte)"), "{}", err);
+    let (_, _, err) = policy("[limits]\nmax_body = \"2KB\"\n");
+    assert!(err.contains("(max_body 2048 bytes)"), "{}", err);
+    // Q-852: a byte-order mark is no part of its first line.
+    let (code, _, err) = policy("\u{FEFF}[limits]\nworkers = 2\n");
+    assert_eq!(code, Some(0), "{}", err);
+    assert!(err.contains("(workers 2)"), "{}", err);
+}
+
+#[test]
+fn a_request_ended_by_the_policys_limit_names_the_policy() {
+    // Long enough to take several of the watchdog's 100 ms looks.
+    let big = "let x = \"a\" + 1; // note\n".repeat(800_000);
+    let d = files_dir("policy-names", &[("main.qwe", b"route GET /h = highlight(read_file(\"big.js\"), \"js\")\nroute GET / = \"hi\"\n"), ("big.js", big.as_bytes()), ("p.toml", b"[limits]\nmax_compute = \"10ms\"\n")]);
+    let ended = |args: &[&str]| {
+        let (_g, port, log) = run_logged(&d, args);
+        assert_eq!(support::send(port, "GET", "/h", &[], "").status, 500);
+        assert_eq!(body_of(port, "/"), "hi", "it goes on");
+        let mut said = String::new();
+        until_logged(&log, "the request's error", || {
+            said = std::fs::read_to_string(&log).unwrap();
+            said.contains("computed for longer than")
+        });
+        said
+    };
+    assert!(ended(&["main.qwe", "--policy", "p.toml"]).contains("this request computed for longer than the policy p.toml allows (max_compute)"));
+    assert!(ended(&["main.qwe", "--max-compute", "10ms"]).contains("this request computed for longer than --max-compute allows"));
+    // The tighter of the two is the one said.
+    assert!(ended(&["main.qwe", "--max-compute", "5ms", "--policy", "p.toml"]).contains("longer than --max-compute allows"));
+    assert!(ended(&["main.qwe", "--max-compute", "1m", "--policy", "p.toml"]).contains("longer than the policy p.toml allows"));
+}
+
+// Review of slice 13 (Q-849): the stop of a request past the policy's limit is known by its own
+// words, as `--max-compute`'s is: `/_quillo/markdown` answers it 500, as a route's, not 400, and
+// tells the page no path of the server's (the log has it).
+#[test]
+fn a_preview_past_the_policys_limit_ends_as_a_server_error_naming_no_path() {
+    let d = files_dir("policy-preview", &[("main.qwe", b"route GET / = \"hello\"\n"), ("p.toml", b"[limits]\nmax_compute = \"1ms\"\n")]);
+    let (_g, port, log) = run_logged(&d, &["main.qwe", "--policy", "p.toml"]);
+    let mut text = String::new();
+    while text.len() < 900_000 {
+        text.push_str("```js\nlet a = f(1) // c\n```\n");
+    }
+    let body = serde_json::json!([text]).to_string();
+    let mut ended = false;
+    for _ in 0..200 {
+        let a = support::send(port, "POST", "/_quillo/markdown", &[], &body);
+        match a.status {
+            200 => {}
+            500 => {
+                assert_eq!(a.body, r#"{"error":"this request computed for longer than the server's policy allows (max_compute)"}"#);
+                ended = true;
+                break;
+            }
+            s => panic!("{}: {}", s, a.body),
+        }
+    }
+    assert!(ended, "no preview was found past the limit");
+    until_logged(&log, "the log names the policy", || std::fs::read_to_string(&log).unwrap().contains("this request computed for longer than the policy p.toml allows (max_compute)"));
+    assert_eq!(body_of(port, "/"), "hello");
+}
+
+// Review of slice 13 (Q-849): an ordinary loop ended by the policy's limit names the policy, and
+// `??` takes that stop no more than `--max-compute`'s. Needs the interp.rs patch (within_limit and
+// guardable), applied once slice 9 is in: scratchpad/f55/fix/13/q849-interp.patch.
+#[test]
+#[ignore = "needs the interp.rs patch q849-interp.patch (slice 13's review), applied after slice 9"]
+fn a_loop_past_the_policys_limit_names_it_and_no_guard_takes_the_stop() {
+    let big = "let x = \"a\" + 1; // note\n".repeat(800_000);
+    let d = files_dir(
+        "policy-loop",
+        &[
+            ("main.qwe", b"route GET /forever {\n    let i = 0\n    while i >= 0 { i = i + 1 }\n    \"never\"\n}\nroute GET /guarded = highlight(read_file(\"big.js\"), \"js\") ?? \"taken\"\nroute GET /md = markdown(\"```js\\n\" + read_file(\"big.js\") + \"\\n```\") ?? \"taken\"\nroute GET / = \"hi\"\n"),
+            ("big.js", big.as_bytes()),
+            ("p.toml", b"[limits]\nmax_compute = \"10ms\"\n"),
+        ],
+    );
+    for opts in [&["main.qwe", "--policy", "p.toml"][..], &["main.qwe", "--max-compute", "10ms"]] {
+        let (_g, port, log) = run_logged(&d, opts);
+        let said = if opts.contains(&"--policy") { "this request computed for longer than the policy p.toml allows (max_compute)" } else { "this request computed for longer than --max-compute allows" };
+        for path in ["/forever", "/guarded", "/md"] {
+            let a = support::send(port, "GET", path, &[], "");
+            assert_eq!(a.status, 500, "{} {:?}: {}", path, opts, a.body);
+            until_logged(&log, path, || std::fs::read_to_string(&log).unwrap().lines().any(|l| l.contains(&format!("GET {} ", path)) && l.contains(said)));
+        }
+        assert_eq!(body_of(port, "/"), "hi");
+    }
+}
+
+// Q-850: `quillo new` into an empty folder that is there made its folder beside it, and needed
+// to write in the parent. Now it builds inside the folder; one that is not there is still made
+// beside it.
+#[cfg(unix)]
+#[test]
+fn quillo_new_builds_inside_an_empty_folder_whose_parent_it_cannot_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = files_dir("new-locked", &[]);
+    for f in ["locked/empty", "locked/withgit/.git"] {
+        std::fs::create_dir_all(d.join(f)).unwrap();
+    }
+    std::fs::set_permissions(d.join("locked"), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let writable = std::fs::write(d.join("locked/probe"), "").is_ok();
+    let (code, out, err) = quillo_in(&d.join("locked/empty"), &["new", ".", "--minimal"], b"");
+    let made = |dir: &Path| std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(code, Some(0), "{}{}", out, err);
+    assert_eq!(made(&d.join("locked/empty")), [".gitignore", "lib", "main.qwe", "ui"].iter().map(|s| s.to_string()).collect());
+    let (code, _, err) = quillo_in(&d.join("locked"), &["new", "withgit", "--minimal"], b"");
+    assert_eq!(code, Some(0), "{}", err);
+    assert_eq!(made(&d.join("locked/withgit")), [".git", ".gitignore", "lib", "main.qwe", "ui"].iter().map(|s| s.to_string()).collect());
+    // One that is not there needs the parent, and says so.
+    if !writable {
+        let (code, _, err) = quillo_in(&d.join("locked"), &["new", "fresh"], b"");
+        assert_eq!(code, Some(1));
+        assert!(err.contains("Permission denied") && !d.join("locked/fresh").exists(), "{}", err);
+    }
+    std::fs::set_permissions(d.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    // And one not empty is refused, as before.
+    let (code, _, err) = quillo_in(&d.join("locked"), &["new", "empty"], b"");
+    assert_eq!(code, Some(1));
+    assert!(err.contains("is not empty"), "{}", err);
+    let (code, _, _) = quillo_in(&d, &["new", "fresh", "--minimal"], b"");
+    assert_eq!(code, Some(0));
+    assert!(d.join("fresh/main.qwe").is_file() && !std::fs::read_dir(&d).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().contains("quillo-new")));
+    // What a `new` that was stopped left building inside is cleared, when its process is gone;
+    // one whose process runs is someone's, and the folder is not empty (review of slice 13).
+    let mut ended = Command::new("true").spawn().unwrap();
+    let gone = ended.id();
+    ended.wait().unwrap();
+    std::fs::create_dir_all(d.join(format!("stale/.quillo-new-{}/lib", gone))).unwrap();
+    let (code, _, err) = quillo_in(&d.join("stale"), &["new", ".", "--minimal"], b"");
+    assert_eq!(code, Some(0), "{}", err);
+    assert_eq!(made(&d.join("stale")), [".gitignore", "lib", "main.qwe", "ui"].iter().map(|s| s.to_string()).collect());
+    let busy = format!(".quillo-new-{}", std::process::id());
+    std::fs::create_dir_all(d.join("busy").join(&busy)).unwrap();
+    let (code, _, err) = quillo_in(&d.join("busy"), &["new", ".", "--minimal"], b"");
+    assert_eq!(code, Some(1));
+    assert!(err.contains(&format!("is not empty: it has {}", busy)), "{}", err);
+    std::fs::create_dir_all(d.join("busy/.quillo-new-x")).unwrap();
+    assert!(quillo_in(&d.join("busy"), &["new", ".", "--minimal"], b"").2.contains(".quillo-new-x"), "a name of no process is kept");
+    // An empty folder it cannot write in says so.
+    std::fs::create_dir(d.join("ro")).unwrap();
+    std::fs::set_permissions(d.join("ro"), std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(d.join("ro/probe"), "").is_err() {
+        let (code, _, err) = quillo_in(&d, &["new", "ro"], b"");
+        assert_eq!(code, Some(1));
+        assert!(err.contains("cannot write in ro, to make the program there: Permission denied"), "{}", err);
+    }
+    std::fs::set_permissions(d.join("ro"), std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+const USAGE_START: &str = "Quillo — a small web language\n";
+
+// Q-851: `run -h` without a main.qwe said "no program", `lsp --help` started the server,
+// `install -h` printed to stderr, and an option before the command printed the whole usage. Now
+// `-h` and `--help` are read first, for every command, to stdout; an option before the command
+// is told in one line where the command goes.
+#[test]
+fn help_is_read_first_for_every_command_and_on_stdout() {
+    let d = files_dir("help-first", &[("tool.qwe", b"print(args())\n")]);
+    for args in [&["run", "-h"][..], &["fcgi", "--help"], &["lsp", "--help"], &["repl", "--help"], &["dap", "--help"], &["serve", "--help"], &["check", "-h"], &["docs", "--help"], &["classes", "-h"], &["build", "-h"], &["fix", "-h"], &["app", "--help"], &["tool.qwe", "-h"], &["run", "--port", "1", "--help"]] {
+        let (code, out, err) = quillo_in(&d, args, b"");
+        assert_eq!(code, Some(0), "{:?}: {}", args, err);
+        assert!(out.starts_with(USAGE_START) && err.is_empty(), "{:?}: {}{}", args, out, err);
+    }
+    let (code, out, err) = quillo_in(&d, &["install", "-h"], b"");
+    assert_eq!((code, err.as_str()), (Some(0), ""));
+    assert!(out.starts_with("usage:\n  quillo install <name>[@version]..."), "{}", out);
+    let (code, out, _) = quillo_in(&d, &["new", "--help"], b"");
+    assert!(code == Some(0) && out.starts_with("usage: quillo new <folder>"), "{}", out);
+    // A program's own `--help`, after `--`, is the program's.
+    assert_eq!(quillo_in(&d, &["run", "tool.qwe", "--", "--help"], b""), (Some(0), "[\"--help\"]\n".into(), String::new()));
+    // An option before the command: one line.
+    for (args, said) in [
+        (&["--watch", "main.qwe"][..], "quillo: put the command first: `quillo run --watch main.qwe`\n"),
+        (&["--port", "0", "srv.qwe"], "quillo: put the command first: `quillo run --port 0 srv.qwe`\n"),
+        (&["-w"], "quillo: put the command first: `quillo run -w`\n"),
+        (&["--port=0", "my app.qwe"], "quillo: put the command first: `quillo run --port=0 'my app.qwe'`\n"),
+        (&["--strict-null", "main.qwe"], "quillo: put the command first: `quillo check --strict-null main.qwe`\n"),
+        // A command after the options is the one put first; an option's value is no command.
+        (&["--watch", "run", "tool.qwe"], "quillo: put the command first: `quillo run --watch tool.qwe`\n"),
+        (&["--policy", "p.toml", "check", "x.qwe"], "quillo: put the command first: `quillo check --policy p.toml x.qwe`\n"),
+        (&["--strict-null", "check", "x.qwe"], "quillo: put the command first: `quillo check --strict-null x.qwe`\n"),
+        (&["--port=0", "serve", "site"], "quillo: put the command first: `quillo serve --port=0 site`\n"),
+        (&["--service", "run", "x.qwe"], "quillo: put the command first: `quillo run --service run x.qwe`\n"),
+        (&["--bogus"], "quillo: unknown option `--bogus`; `quillo help` lists the commands and their options\n"),
+        (&["--wach"], "quillo: unknown option `--wach` (did you mean `--watch`?); `quillo help` lists the commands and their options\n"),
+    ] {
+        assert_eq!(quillo_in(&d, args, b""), (Some(2), String::new(), said.to_string()), "{:?}", args);
+    }
+    // What already worked.
+    for args in [&["-h"][..], &["--help"], &["help"]] {
+        let (code, out, _) = quillo_in(&d, args, b"");
+        assert!(code == Some(0) && out.starts_with(USAGE_START), "{:?}", args);
+    }
+    assert_eq!(quillo_in(&d, &["--version"], b"").0, Some(0));
+}
+
+// Q-852, the smaller ones of the command line.
+#[test]
+fn misspelt_commands_are_told_every_command_and_help_names_env_file() {
+    let d = files_dir("commands-near", &[]);
+    for (typed, near) in [("fcg", "fcgi"), ("serv", "serve"), ("classe", "classes"), ("chek", "check"), ("srve", "serve")] {
+        let (code, _, err) = quillo_in(&d, &[typed], b"");
+        assert_eq!(code, Some(2));
+        assert!(err.contains(&format!("unknown command `{}` (did you mean `{}`?)", typed, near)), "{}", err);
+    }
+    let (_, out, _) = quillo_in(&d, &["help"], b"");
+    assert!(out.contains("\n  --env-file F   "), "{}", out);
+}
+
+#[test]
+fn tls_cert_given_twice_takes_the_last_and_checks_it() {
+    let d = files_dir("tls-twice", &[("main.qwe", b"print(\"ran\")\n"), ("cert.pem", b"cert"), ("key.pem", b"key")]);
+    let (code, _, err) = quillo_in(&d, &["run", "main.qwe", "--tls-cert", "cert.pem", "--tls-cert", "missing.pem", "--tls-key", "key.pem"], b"");
+    assert_eq!((code, err.as_str()), (Some(2), "quillo: --tls-cert missing.pem: there is no such file\n"));
+    assert_eq!(quillo_in(&d, &["run", "main.qwe", "--tls-cert", "missing.pem", "--tls-cert", "cert.pem", "--tls-key", "key.pem"], b""), (Some(0), "ran\n".into(), String::new()));
+    let (code, _, err) = quillo_in(&d, &["run", "main.qwe", "--tls-cert", "cert.pem", "--tls-key", "key.pem", "--tls-key", "gone.pem"], b"");
+    assert_eq!((code, err.as_str()), (Some(2), "quillo: --tls-key gone.pem: there is no such file\n"));
+    assert_eq!(quillo_in(&d, &["run", "main.qwe", "--tls-cert", "cert.pem"], b"").2, "quillo: --tls-cert and --tls-key go together\n");
+    // The last of each is a pair, or refused as it starts (review of slice 13).
+    for n in ["a", "b"] {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap().self_signed(&key).unwrap();
+        std::fs::write(d.join(format!("{}.pem", n)), cert.pem()).unwrap();
+        std::fs::write(d.join(format!("{}.key", n)), key.serialize_pem()).unwrap();
+    }
+    let (code, _, err) = quillo_in(&d, &["run", "main.qwe", "--tls-cert", "a.pem", "--tls-key", "a.key", "--tls-cert", "b.pem"], b"");
+    assert_eq!((code, err.as_str()), (Some(2), "quillo: --tls-cert b.pem and --tls-key a.key are no pair: the key is not the certificate's\n"));
+    let (code, _, err) = quillo_in(&d, &["run", "main.qwe", "--tls-key", "b.key", "--tls-cert", "a.pem"], b"");
+    assert_eq!((code, err.as_str()), (Some(2), "quillo: --tls-cert a.pem and --tls-key b.key are no pair: the key is not the certificate's\n"));
+    for (c, k) in [("a.pem", "a.key"), ("b.pem", "b.key")] {
+        assert_eq!(quillo_in(&d, &["run", "main.qwe", "--tls-cert", "b.pem", "--tls-cert", c, "--tls-key", k], b""), (Some(0), "ran\n".into(), String::new()), "{}", c);
+    }
+}
+
+#[test]
+fn classes_and_build_say_where_a_file_is_not_utf8() {
+    let d = files_dir("classes-utf8", &[("main.qwe", b"route GET / = <p.a>x</p>\n// \xe9\n")]);
+    for cmd in ["classes", "build"] {
+        let (code, _, err) = quillo_in(&d, &[cmd, "main.qwe"], b"");
+        assert_eq!((code, err.as_str()), (Some(1), "quillo: cannot read main.qwe: it is not UTF-8 text: byte 0xE9 at line 2, column 4 (save it as UTF-8)\n"), "{}", cmd);
+    }
+    std::fs::write(d.join("main.qwe"), b"\xef\xbb\xbfroute GET / = <p.a>\xc3\xbc</p>\n").unwrap();
+    assert_eq!(quillo_in(&d, &["classes", "main.qwe"], b""), (Some(0), "a\n".into(), String::new()));
+}

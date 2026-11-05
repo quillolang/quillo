@@ -36,15 +36,11 @@ fn set_by_file(name: &str) -> bool {
 /// environment set alone. Called at startup, before any other thread runs.
 /// A file that is not there is nothing, unless it was named (`required`).
 pub fn load_into_process(path: &Path, required: bool) -> Result<(), String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(_) if !required => return Ok(()),
-        Err(e) => return Err(format!("cannot read {}: {}", path.display(), e)),
-    };
+    let Some(text) = read_file(path, required, true)? else { return Ok(()) };
     let mut keys = from_file().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (pairs, skipped) = parse_noting(&text);
-    for n in skipped {
-        eprintln!("quillo: {}:{}: not KEY=value, skipped", path.display(), n);
+    for (n, why) in skipped {
+        eprintln!("quillo: {}:{}: {}, skipped", path.display(), n, why);
     }
     for (k, v) in pairs {
         if std::env::var_os(&k).is_some() && !keys.contains(&k) {
@@ -59,9 +55,43 @@ pub fn load_into_process(path: &Path, required: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// A service's own `.env` in this process: its values, by name.
-pub fn read(path: &Path) -> HashMap<String, String> {
-    std::fs::read_to_string(path).map(|t| parse(&t).into_iter().collect()).unwrap_or_default()
+/// The text of a `.env`, or none when there is no such file and it was not named. Only a file that
+/// is not there (or a folder of that name, as a Python virtual environment called `.env` is) is
+/// nothing: one that is not UTF-8 text, or cannot be read, is said and stops the start, as with
+/// `--env-file`, rather than every `env()` being null without a word (FEEDBACK55.md, Q-835; branch
+/// feedback55).
+/// One that is there and cannot be read says the ways out: as a program's, `--env-file` too
+/// (`program`); a link that leads nowhere says where it leads.
+fn read_file(path: &Path, required: bool, program: bool) -> Result<Option<String>, String> {
+    if !required && (path.is_dir() || std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)) {
+        return Ok(None);
+    }
+    let way_out = |e: std::io::ErrorKind| match (required, program) {
+        (true, _) => String::new(),
+        (false, true) if e == std::io::ErrorKind::PermissionDenied => format!("; make it readable, or, to start without it, remove it or give `--env-file {}`", NO_FILE),
+        (false, true) => format!("; to start without it, remove it or give `--env-file {}`", NO_FILE),
+        (false, false) if e == std::io::ErrorKind::PermissionDenied => "; make it readable, or remove it to start without it".into(),
+        (false, false) => "; remove it to start without it".into(),
+    };
+    if let (Ok(to), Err(e)) = (std::fs::read_link(path), std::fs::metadata(path)) {
+        let why = if e.kind() == std::io::ErrorKind::NotFound { "which is not there".to_string() } else { format!("which cannot be read ({})", e) };
+        return Err(format!("cannot read {}: it is a link to {}, {}{}", path.display(), to.display(), why, way_out(e.kind())));
+    }
+    crate::error::read_source(path).map(Some).map_err(|e| format!("cannot read {}: {}{}", path.display(), e, way_out(e.kind())))
+}
+
+/// A file that is always there and empty, for `--env-file`: no settings.
+const NO_FILE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
+/// A service's own `.env` in this process: its values, by name; the lines skipped said as the
+/// program's are, and one that cannot be read an error (FEEDBACK55.md, Q-835; branch feedback55).
+pub fn read(path: &Path) -> Result<HashMap<String, String>, String> {
+    let Some(text) = read_file(path, false, false)? else { return Ok(HashMap::new()) };
+    let (pairs, skipped) = parse_noting(&text);
+    for (n, why) in skipped {
+        eprintln!("quillo: {}:{}: {}, skipped", path.display(), n, why);
+    }
+    Ok(pairs.into_iter().collect())
 }
 
 /// `env(name)` for a program whose own file holds `own`: the environment's
@@ -75,6 +105,9 @@ pub fn var(own: &HashMap<String, String>, name: &str) -> Option<String> {
     }
 }
 
+/// Why most skipped lines are.
+const NOT_A_PAIR: &str = "not KEY=value";
+
 /// `KEY=value` lines: blank lines and `#` comments skipped, `export `
 /// allowed, values bare (to a ` #`), in double quotes (with `\n`, `\"` and
 /// `\\`) or in single quotes (as written).
@@ -82,10 +115,10 @@ pub fn parse(text: &str) -> Vec<(String, String)> {
     parse_noting(text).0
 }
 
-/// `parse`, and the lines it skipped, by number. A byte-order mark is no part of the first key,
-/// and a quoted value goes on to its closing quote, over several lines, as a PEM key is kept in
-/// Node's `dotenv` and Docker Compose (FEEDBACK31.md, Q-380; branch feedback27-35-fixes).
-pub fn parse_noting(text: &str) -> (Vec<(String, String)>, Vec<usize>) {
+/// `parse`, and the lines it skipped, by number, with why. A byte-order mark is no part of the
+/// first key, and a quoted value goes on to its closing quote, over several lines, as a PEM key is
+/// kept in Node's `dotenv` and Docker Compose (FEEDBACK31.md, Q-380; branch feedback27-35-fixes).
+pub fn parse_noting(text: &str) -> (Vec<(String, String)>, Vec<(usize, &'static str)>) {
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
@@ -100,15 +133,17 @@ pub fn parse_noting(text: &str) -> (Vec<(String, String)>, Vec<usize>) {
         }
         let line = line.strip_prefix("export ").unwrap_or(line);
         let Some((k, v)) = line.split_once('=') else {
-            skipped.push(at);
+            skipped.push((at, NOT_A_PAIR));
             continue;
         };
         let k = k.trim();
         if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            skipped.push(at);
+            skipped.push((at, NOT_A_PAIR));
             continue;
         }
+        let spaced = v.starts_with(char::is_whitespace);
         let v = v.trim_start();
+        let mut unclosed = false;
         let value = if let Some(first) = v.strip_prefix('"') {
             let mut s = String::new();
             let mut rest = first.to_string();
@@ -132,7 +167,7 @@ pub fn parse_noting(text: &str) -> (Vec<(String, String)>, Vec<usize>) {
                 }
                 if closed || i >= lines.len() {
                     if !closed {
-                        skipped.push(at);
+                        unclosed = true;
                     }
                     break;
                 }
@@ -157,16 +192,32 @@ pub fn parse_noting(text: &str) -> (Vec<(String, String)>, Vec<usize>) {
                         i += 1;
                     }
                     None => {
-                        s.push_str(rest);
-                        skipped.push(at);
+                        unclosed = true;
                         break;
                     }
                 }
             }
             s
+        } else if spaced && v.starts_with('#') {
+            // `KEY= # note`: a note after the spaces is no value, as ` #` ends a bare one;
+            // `KEY=#fff` is still "#fff" (FEEDBACK55.md, Q-838; branch feedback55).
+            String::new()
         } else {
             v.split(" #").next().unwrap_or("").trim_end().to_string()
         };
+        // A quote never closed is skipped as said, and the lines after it read as their own, not
+        // taken into its value (FEEDBACK55.md, Q-839; branch feedback55).
+        if unclosed {
+            skipped.push((at, "its quote is not closed"));
+            i = at;
+            continue;
+        }
+        // The environment cannot hold a NUL, and setting one panicked (FEEDBACK55.md, Q-840;
+        // branch feedback55).
+        if value.contains('\0') {
+            skipped.push((at, "a value cannot hold a NUL byte"));
+            continue;
+        }
         out.push((k.to_string(), value));
     }
     (out, skipped)

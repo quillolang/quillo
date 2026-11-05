@@ -260,6 +260,27 @@ pub fn which_quillo() -> String {
 /// branch feedback36-39).
 static VIRTUAL: std::sync::OnceLock<(std::path::PathBuf, String)> = std::sync::OnceLock::new();
 
+thread_local! {
+    /// The files read, or tried, on this thread while `noting_reads` runs.
+    static TRIED: std::cell::RefCell<Option<Vec<std::path::PathBuf>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `f`, and every file it read or tried to read as a program's: what a load that failed named,
+/// for `--watch` to watch until it loads, a file not there yet included (FEEDBACK55.md, Q-836;
+/// branch feedback55).
+pub fn noting_reads<T>(f: impl FnOnce() -> T) -> (T, Vec<std::path::PathBuf>) {
+    let outer = TRIED.with(|t| t.borrow_mut().replace(Vec::new()));
+    let r = f();
+    let mut files = TRIED.with(|t| std::mem::replace(&mut *t.borrow_mut(), outer)).unwrap_or_default();
+    files.dedup();
+    TRIED.with(|t| {
+        if let Some(o) = t.borrow_mut().as_mut() {
+            o.extend(files.iter().cloned());
+        }
+    });
+    (r, files)
+}
+
 /// Sets the program read for `path` from now on.
 pub fn set_virtual(path: std::path::PathBuf, source: String) {
     let _ = VIRTUAL.set((path, source));
@@ -270,6 +291,11 @@ pub fn read_source(path: impl AsRef<std::path::Path>) -> std::io::Result<String>
         let _ = p;
         return Ok(s.clone());
     }
+    TRIED.with(|t| {
+        if let Some(files) = t.borrow_mut().as_mut() {
+            files.push(path.as_ref().to_path_buf());
+        }
+    });
     let bytes = std::fs::read(path)?;
     String::from_utf8(bytes).map_err(|e| {
         let ok = &e.as_bytes()[..e.utf8_error().valid_up_to()];

@@ -25,9 +25,15 @@ fn dotenv_files_fill_in_what_the_environment_does_not_set() {
     assert_eq!(pairs("A=bare # a note"), one("A", "bare"));
     assert_eq!(pairs("A=bare#not a note"), one("A", "bare#not a note"));
     assert_eq!(pairs(r#"A="two\nlines\tand \"quotes\" \\ \q" ignored"#), one("A", "two\nlines\tand \"quotes\" \\ q"));
-    assert_eq!(pairs(r#"A="ends in a slash\"#), one("A", "ends in a slash"));
+    // `\"` is a quote in the value: this one is never closed, and is skipped as said
+    // (FEEDBACK55.md, Q-839; branch feedback55); a slash at the end is written `\\`.
+    assert_eq!(pairs(r#"A="ends in a slash\"#), vec![]);
+    assert_eq!(pairs(r#"A="ends in a slash\\""#), one("A", "ends in a slash\\"));
     assert_eq!(pairs("A='as $written\\n' ignored"), one("A", "as $written\\n"));
-    assert_eq!(pairs("A='no end"), one("A", "no end"));
+    // A quote never closed: the line is skipped (FEEDBACK55.md, Q-839; branch feedback55).
+    assert_eq!(pairs("A='no end"), vec![]);
+    // A note after the spaces is no value (FEEDBACK55.md, Q-838; branch feedback55).
+    assert_eq!(pairs("A= # note"), one("A", ""));
 
     let d = std::env::temp_dir().join(format!("quillo-dotenv-{}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
@@ -54,9 +60,9 @@ fn dotenv_files_fill_in_what_the_environment_does_not_set() {
     assert!(e.starts_with("cannot read ") && e.contains("missing.env"), "{}", e);
 
     // A service's own file: the environment first, unless a file set it.
-    let own: HashMap<String, String> = read(&f);
+    let own: HashMap<String, String> = read(&f).unwrap();
     assert_eq!(own.len(), 2);
-    assert!(read(&missing).is_empty());
+    assert!(read(&missing).unwrap().is_empty());
     assert_eq!(var(&own, "QUILLO_T_REAL").as_deref(), Some("real"));
     assert_eq!(var(&own, "QUILLO_T_FILE").as_deref(), Some("from file"));
     assert_eq!(var(&HashMap::new(), "QUILLO_T_FILE").as_deref(), Some("second"));
