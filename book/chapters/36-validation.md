@@ -113,7 +113,17 @@ route GET / = <html><body><SignupForm/></body></html>
   it. It needs a state, not a field of a map, which is why each input has its own
   `state`. An `@input` of the input's own makes it one way (a transform, say); for a
   handler that runs after the state is set, write `bind:value={name} @input={...}`. Work
-  out what depends on the input with `let`, as `draft` is here.
+  out what depends on the input with `let`, as `draft` is here: an assignment written
+  alone in the body (`count = len(items)`) runs once, as the component starts, and
+  `quillo check` warns of one that reads a prop or another state.
+- **Fields give the state's kind back.** A number input gives a number (`null` when
+  empty, or only spaces, hence `seats ?? 0`), and leaves text being typed that already
+  reads as the state's number as it is (`1.0`, `2.50`). A text input or a `<select>`
+  bound to a state that holds a number gives a number when the text is that number's
+  own form, and text otherwise (`"02"`). `<select value={plan}>` is written on the
+  server as `selected` on the option `plan` names (by its `value`, else its text), and
+  the browser shows that option again when the options change or arrive later; what a
+  person picked is kept while the page updates.
 - **There is no debounce.** Rules run on every keystroke, in the browser, which is cheap.
   A check only the server can make (is the address taken?) waits for the submit, as
   here, or for a pause in the typing: count the keystrokes in a state, and in

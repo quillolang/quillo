@@ -263,6 +263,9 @@ component Tasks() {
 - A statement in a component body that reads state runs again when that state changes;
   what it starts (`every(ms, f)`, a listener) stops when it no longer runs. There is no
   `useEffect`, no dependency list and no `useMemo`: `let` is already derived.
+- An assignment alone in a component body (`count = len(items)`) runs once, as the
+  component starts, and follows nothing: write `let count = len(items)` for a value that
+  follows; `quillo check` warns.
 
 ## Database
 
@@ -282,6 +285,8 @@ db.transaction(() => {
 
 - Always pass values as `?` or `:name` placeholders; never build SQL with `+` or `${}`.
 - A row is a map: `select a.id, b.id` leaves one `id`, so name columns apart with `as`.
+- `last_id` is the one inserted row's id, else `null` (always `null` on PostgreSQL: write
+  `insert ... returning id` with `db.one`); `changes` is the rows matched, on every database.
 - `with db` on a function says it uses the database; a function with `with` may do only
   what it declares (`db`, `http`, `fs`, `env`, `time`, `random`, `net`). Routes and
   route groups take it too *(since 0.7)*, before the body: `route GET /report with db = ...`,

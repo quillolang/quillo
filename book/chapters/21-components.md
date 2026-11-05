@@ -26,7 +26,12 @@ route GET / = <html><body><Counter start={5}/></body></html>
   is a table's or a select's part (`tr`, `td`, `th`, `thead`, `tbody`, `tfoot`,
   `caption`, `colgroup`, `option`, `optgroup`) has no island element, since the browser
   would move it out of the table: its root element carries the island (`data-qi`), so a
-  row component is a row. `raw(...)` in a component is likewise in a
+  row component is a row; the island's attributes on it are the server's, and those the
+  markup writes of their names are left out. Inside an `<svg>`, which draws no
+  `<quillo-island>`, a component whose root is one element (`<rect>`, `<g>`, `<a>`, an
+  inner `<svg>`) is its own island the same way, from the server and when the browser
+  makes it, a deferred one too; outside an `<svg>`, and in a `<foreignObject>`, it is in
+  its island as before. `raw(...)` in a component is likewise in a
   `<quillo-raw style="display: contents">`, which a child selector does not see through.
 
   ```quillo
@@ -46,9 +51,14 @@ route GET / = <html><body><Counter start={5}/></body></html>
   After that it is just `count`, and assigning to it (`count += 1`) updates what reads
   it, and nothing else. A component's code runs once. A `let` that reads state or props
   (`let double = count * 2`) is worked out again when they change. So is a statement
-  that reads them (`if running { every(...) }`). Each place in the markup that shows a
-  value follows only that value: changing one row's text changes that text. Assigning
-  the value a state already has does nothing.
+  that reads them (`if running { every(...) }`). An assignment written alone in the body,
+  `count = len(items)`, runs once, as the component starts, and does not follow what it
+  reads: `quillo check` warns of one that reads a prop or another state (`` `count = ...`
+  runs once, as <T> starts: it does not follow `items` when that changes; for a value that
+  follows it, write `let count = ...` in place of the state ``), so a value worked out
+  from others is a `let`. Each place in the
+  markup that shows a value follows only that value: changing one row's text changes that
+  text. Assigning the value a state already has does nothing.
 
   ```quillo
   component Total(price: int) {
@@ -65,8 +75,12 @@ route GET / = <html><body><Counter start={5}/></body></html>
   `key` is the list's, not passed to the view or component, so neither may take a
   parameter named `key` (a load-time error); an attribute written twice on one element
   is an error too.
+  A row that is a choice (`? :`, `if`/`else`, `match`) of elements that each have a `key`
+  is keyed by it; with one branch that has none, the rows are kept by place.
   A row whose item changed is updated where it shows what changed, and moved rows keep
-  their DOM (and focus). `if`, `? :`, `match` and `cond && <markup>` in markup make a
+  their DOM, focus and the selection in a field (in browsers without
+  `Element.moveBefore`, Safari, the focus and selection are put back after the move).
+  `if`, `? :`, `match` and `cond && <markup>` in markup make a
   branch again only when another one is chosen: an input in one keeps its focus and
   what was typed while the page updates. Nested components keep their own state.
 
@@ -96,7 +110,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   - `e.value` and `e.checked` of the input (`null` and `false` when it has none), `e.key`
     of a key press, `e.type`;
   - `e.form`: the fields of the form, as a map (a file field gives the file's name; a
-    name given twice, the last);
+    name given twice, the last), with the name and value of the button that sent it,
+    as the browser sends them;
   - `e.target`: the element itself;
   - any other field of the browser's event (`e.clientX`, `e.deltaY`, `e.shiftKey`,
     ...), then of the element (`e.scrollTop`, `e.scrollHeight`, `e.clientHeight`,
@@ -154,8 +169,15 @@ route GET / = <html><body><Counter start={5}/></body></html>
   }
   ```
 
-  A number or range input gives a number back (`null` when empty), so `qty + 1` after
-  typing 3 is 4. A player's `volume` is kept between 0 and 1 and its `playbackRate`
+  A number or range input gives a number back (`null` when empty, or only spaces), so
+  `qty + 1` after typing 3 is 4, and text being typed that already reads as the state's
+  number is left as typed (`1.0`, `2.50`, `1e3` are not rewritten to `1`, `2.5`, `1000`).
+  A text input, `<textarea>` or `<select>` bound to a state that holds a number gives a
+  number when the text is that number's own form, and text otherwise (`"02"` stays text),
+  `null` when empty; bound to a text state it gives text. A range's value is set again
+  when its `min`, `max` or `step` change, so a value set with a new `max` is kept, and one
+  past the new limits is brought into them, as the browser does. A player's `volume` is
+  kept between 0 and 1 and its `playbackRate`
   between 1/16 and 16, whatever the state says, and a place the player has just reported
   is not sought back to while it plays.
 
@@ -170,7 +192,16 @@ route GET / = <html><body><Counter start={5}/></body></html>
   - what the element is cannot be known when the program is compiled: a `type={...}`
     decided as it runs, or a `{...spread}` (which may hold a handler);
   - it is a radio (unticking one fires no event, so each cannot follow a state of its
-    own: give the group one state and `checked={size == "s"}`), or a `<select multiple>`.
+    own: give the group one state and `checked={size == "s"}`), or a `<select multiple>`,
+    whose `value={list}` marks each option the list names, on the server and in the
+    browser.
+
+  A `<select value={x}>` is written on the server as `selected` on the first option `x`
+  names (by its `value`, else by its text, spaces collapsed), or none, which shows the
+  first; the select itself gets no `value` attribute, which HTML does not have. In the
+  browser the value is set once its options are in, and again when they change, so
+  options made from a list that arrives later still show the one `x` names; what a person
+  picked is kept while the page updates, unless options are added or taken away.
 
   `quillo check` warns of an input whose value is a parameter (a view's, or a component's
   prop) or a state's field (`value={form.name}`) when nothing on it takes what is typed: no
@@ -879,6 +910,9 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   server's element too, when the component is resumed). A function it returns runs when
   the element leaves the page, or its component does. That is the only lifecycle hook:
   what runs when state changes is a statement that reads it.
+- `autofocus` on markup made later (a dialog's field, a row added) is focused once it is
+  on the page, the first of several, unless someone is typing in another field; the
+  browser itself focuses only what the page had as it loaded.
 - A Quillo function handed to the page's JavaScript (an event listener, a callback) is
   called with as many arguments as it declares, so `marker.on("click", () => ...)`
   works, and `off` finds what `on` was given.

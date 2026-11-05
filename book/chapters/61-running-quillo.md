@@ -44,8 +44,8 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | `--port N`, `--host H` | where to listen (default `$PORT` or 8080, on 127.0.0.1). Give `--port` when 8080 is taken or a host names the port; `--port 0` takes any free one (`platform().server.port` says which). Give `--host 0.0.0.0` to be reached from other machines without a proxy in front; `--host localhost` is 127.0.0.1 |
 | `--listen unix:PATH` *(since 0.7)* | listen on a Unix socket instead of a TCP port, when a web server on the same machine passes requests on (on a shared server, so the neighbours cannot reach the port): made with mode 0600, removed when the server stops, and at most 100 bytes long (a short path relative to the folder `quillo` runs in). A `$PORT` that holds an absolute path (`/home/u/app.sock`, or `unix:/home/u/app.sock`) is taken the same way. Not with `--split`, `--instances`, `--register` or `--join` (see [Quillo on a shared server](#quillo-on-a-shared-server-cpanel)) |
 | `--socket-mode 660` *(since 0.7)* | with `--listen`: the socket's permissions, in octal, when the web server reaches it through the owner's group; the owner must keep read and write (`600`, the default) |
-| `--watch`, `-w` | while you work on the program: reload when it or a `use`d file changes (a symbolic link pointed elsewhere, to a file or a folder, counts, within a second), show errors on the page, and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's). Not in production |
-| `--reload` | in production, for a program whose files change while it runs (a deploy that copies new files, a plugin editor): reload when files change, with no errors shown on pages and no page refreshes |
+| `--watch`, `-w` | while you work on the program: reload when it or a `use`d file changes (a symbolic link pointed elsewhere, to a file or a folder, counts, within a second), show errors on the page, and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's). Started, or reloaded, while a file is broken or missing, it watches every file that load read or tried and the folders of those not there, so fixing or making one loads the program; each error is said once. Not in production |
+| `--reload` | in production, for a program whose files change while it runs (a deploy that copies new files, a plugin editor): reload when files change, with no errors shown on pages and no page refreshes; with `--instances`, each instance loads the change, the first checking it, so one that does not check reaches none; `--split` passes it to its services |
 | `--env-file F` | when the settings are not in the `.env` beside the program: a file kept outside the site's folder, or one file per place (`--env-file prod.env`); a path from the folder `quillo` runs in, which must exist |
 | `--policy FILE` *(since 0.7)* | before a deploy, or on a server you share: narrow what the program may do, after `/etc/quillo/policy.toml` and before the `quillo.policy` beside it; may be given more than once (see [The policy](#the-policy)) |
 | `--no-build` *(since 0.7)* | on a server with no Rust, or one that must never run cargo: load only libraries `quillo build` made, as `.quillo/plugins.lock` names them (see [Rust](#rust)) |
@@ -68,7 +68,7 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | `--no-jobs` | on all but one of several servers that do not share a database, or on a copy that must not run them: run none of the program's scheduled jobs here (see [Scheduled jobs](#scheduled-jobs)) |
 | `--no-prefetch` | when links must not be fetched before they are clicked (to measure, or a site whose `GET`s are counted): turn prefetching off (see [Prefetching](#routes-prefetching)) |
 | `--base PATH` | when a proxy serves the program under a path (`/shop`) and takes the path off before passing a request on: the program sees `/x` for `/shop/x`, and its links and redirects carry the prefix (`/y` is written `/shop/y`) |
-| `--split` | to try the app as separate processes, as it will run deployed: run each `service` as a process of its own (see [Services](#services)) |
+| `--split` | to try the app as separate processes, as it will run deployed: run each `service` as a process of its own (see [Services](#services)); with `--port 0`, the services are told the port the app was given |
 | `--scale NAME=N` | with `--split`, for a service that needs more than one process: run service NAME as N copies (1 to 64), called in turn (see [Services](#services)) |
 | `--service-url NAME=URL` | when service NAME runs on another machine: where it is (also `QUILLO_SERVICE_<NAME>`, the name in capitals); several addresses, comma-separated, are taken in turn (see [Services](#services)) |
 | `--as-service` | to run a service on a machine of its own: serve the program as a service, its `server fn`s answering other services' signed calls, not pages (see [Services](#services)) |
@@ -78,7 +78,7 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | `--no-join`, `--allow-join A,B` *(since 0.7)* | on the app, to take no copies that join, or only copies of these services |
 | `--register URL`, `--service S` | to run several servers behind limer: join its pool at its admin address (the pool named `S`, else the file's name), and share live updates with its other servers; needs `LIMER_ADMIN_SECRET` (see [Several servers](#several-servers)) |
 | `--wt-port N` | when the UDP port of the HTTP port's number is taken or not open: the UDP port pages connect to over WebTransport (see [Channels](#channels)) |
-| `--tls-cert F`, `--tls-key F` | when WebTransport should present a real certificate, instead of one of its own; the files must exist |
+| `--tls-cert F`, `--tls-key F` | when WebTransport should present a real certificate, instead of one of its own; the files must exist, go together and be a pair (`--tls-cert b.pem and --tls-key a.key are no pair: the key is not the certificate's`); given twice, the last wins |
 | `--no-wt` | when UDP is blocked between pages and the server: no WebTransport, so pages' channels and streams use a WebSocket at once |
 
 ## Other commands
@@ -91,8 +91,10 @@ component and a function both sides use. Both get a `.gitignore` (`*.db`, `*.db-
 `<folder>/.quillo/bin/quillo`. It refuses a folder that is not empty (an empty one, or one
 holding only `.git`, is used) and a name Windows refuses (`con`, `aux`, `nul`, `prn`,
 `com1` to `com9`, `lpt1` to `lpt9`, any of `<>:"|?*\`, a trailing dot or space, a line
-break). It writes into a folder beside the target and moves it in place at the end, so a
-failed `new` leaves nothing half made, and it never writes an empty folder. It warns when
+break). A new folder is written beside the target and moved in place at the end, so a
+failed `new` leaves nothing half made, and it never writes an empty folder; an empty
+folder that is there is built inside, so its parent need not be writable (a leftover of a
+`new` whose process is gone is removed). It warns when
 the folder is inside another program, and prints the next step:
 
 ```sh
@@ -117,7 +119,10 @@ it reads the `COMMIT` file `git archive` writes, else says `(commit unknown)`. `
 <file.qwe>` is `quillo run <file.qwe>`, options and all, whatever the case of its
 extension (`quillo MAIN.QWE`). A misspelt command is told the nearest (``unknown command
 `chek` (did you mean `check`?)``), and a file of another extension given with no command is
-told how to run it (`to run the file: quillo run tool`). `quillo run` given a file that is
+told how to run it (`to run the file: quillo run tool`). An option given before the
+command is told where it goes, in one line: ``quillo: put the command first: `quillo run
+--watch main.qwe` ``. `-h` and `--help` are read first, after any command (`quillo run -h`
+with no program, `quillo lsp --help`), and print to stdout. `quillo run` given a file that is
 not a program says what it is and how to serve it: ``page.html is HTML, not a Quillo
 program: serve its folder as it is with `quillo serve .` ``, and the same for Markdown
 (with `markdown_page`), Rust (`use "t.rs"`), and `.css`, `.js`, `.json`, `.txt`, `.xml`,
@@ -128,7 +133,7 @@ fail it), `quillo run` 1 when the program does not load or the port cannot be ta
 either 2 for a usage mistake (an unknown option, an option without its value, no program, `--register` without its
 secret, options that do not go together, a `--port` outside 0 to 65535, a `--tls-cert` or
 `--tls-key` file that is not there, a policy file that cannot be read or says something
-a policy does not say). An option that takes a value refuses another option
+a policy does not say, a `.env` that cannot be read). An option that takes a value refuses another option
 in its place: `--service-name --watch` says `needs a value, and --watch is an option`. A stopped server exits 0 (see [Stopping and
 health](#stopping-and-health)).
 
@@ -150,12 +155,20 @@ Their options, given after the command as `quillo run`'s are:
 ## Settings and the environment
 
 The `.env` beside the program is read into its environment as it starts: `KEY=value`
-lines (`export` allowed, `#` for comments, and ` #` ends a bare value; values in `"..."`
+lines (`export` allowed, `#` for comments, and ` #` ends a bare value, so `KEY= # set me`
+is `""` while `KEY=#fff` is `#fff`; values in `"..."`
 take `\n`, `\t`, `\"` and `\\`, and `'...'` is as written; a quoted value goes on to its
-closing quote across lines, as a PEM key does; a byte-order mark at the start is skipped;
-a key is letters, digits and `_`, and a line that is not `KEY=value` is skipped and said
+closing quote across lines, as a PEM key does, and a quote never closed skips its own line
+only; a byte-order mark at the start is skipped;
+a key is letters, digits and `_`, and a line that is not `KEY=value`, or whose value holds
+a NUL byte, is skipped and said
 at the start: `quillo: .env:3: not KEY=value, skipped`), for `env("API_KEY")` and for Quillo's own
-settings (`PORT`, `QUILLO_SECRET`). A variable the environment already has wins, so a
+settings (`PORT`, `QUILLO_SECRET`). Only a `.env` that is not there (or a folder of that
+name) is nothing: one that cannot be read, is not UTF-8, or is a link to nothing stops
+the start with exit 2, saying where and the ways out (``quillo: cannot read .env: it is not
+UTF-8 text: byte 0xE9 at line 1, column 9 (save it as UTF-8); to start without it, remove
+it or give `--env-file /dev/null` ``), as a missing `--env-file` does, and a service's own
+`.env` stops its load the same way. A variable the environment already has wins, so a
 `.env` left on a server cannot override what production sets. It is read once: a program
 started with [`--reload`](#options-of-quillo-run) does not read it again when its files change. Another file is
 named when the program starts: `quillo run main.qwe --env-file /etc/shop/prod.env`. A service reads the `.env` beside its own file as
@@ -253,4 +266,8 @@ of classes (also from the CSS files under `public/`, when the client sends them)
 completion after `.`, `<`, `</` and `@` (and of classes after `<tag.` and in `class="`), diagnostics on
 open, change and save, quick fixes as code actions, and `quillo/closeTag`: at a position
 just after a start tag's `>` or after `</`, the text to insert there, or null; `initializationOptions: { "strictNull": true }` for the extra
-warnings) and `quillo dap` directly.
+warnings) and `quillo dap` directly. The language server reads the editor's text, not the
+file on disk, and says diagnostics under every URI a file is open by, so a project opened
+through a link gets them; it reads headers in any case (`content-length`), answers
+`-32002` to a request before `initialize`, `-32600` after `shutdown`, and `-32700` to a
+body that is not JSON.

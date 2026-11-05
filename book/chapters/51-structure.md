@@ -137,8 +137,9 @@ file at a time. A later release makes it an error.
 ui/cart.qwe:7: warning: `price` comes from lib/money.qwe, which this file does not take: add `import lib/money.qwe use price` (`quillo fix` writes it)
 ```
 
-`quillo fix` writes those lines, in every file of the program. Run it once for each
-program, a service's or a mounted one's too:
+`quillo fix` writes those lines, in every file of the program, after a byte-order mark
+and with the file's own line ends (CRLF in a CRLF file). Run it once for each program, a
+service's or a mounted one's too:
 
 ```sh
 quillo fix main.qwe
@@ -287,7 +288,9 @@ npm install && npm run package    # builds quillo-lang-<version>.vsix
 code --install-extension quillo-lang-*.vsix
 ```
 
-**Other editors** run `quillo lsp`, over stdin and stdout, for `*.qwe` files. In Neovim:
+**Other editors** run `quillo lsp`, over stdin and stdout, for `*.qwe` files. It reads
+the editor's text, not the file on disk, and gives diagnostics under every URI a file
+is open by, so a project opened through a link gets them. In Neovim:
 
 ```lua
 vim.filetype.add({ extension = { qwe = "quillo" } })
@@ -306,7 +309,10 @@ The extension's README has Helix's settings, and `quillo dap` for debuggers in o
 editors.
 
 **While it runs**, `quillo run main.qwe --watch` reloads the program when it or any file
-it `use`s changes, and refreshes the pages you have open.
+it `use`s changes, and refreshes the pages you have open. Started, or reloaded, while a
+file is broken or missing, it watches every file that load read or tried, and the
+folders of those not there, so fixing or making one loads the program; each error is
+said once.
 
 ## Other files in a program
 
@@ -317,7 +323,7 @@ it `use`s changes, and refreshes the pages you have open.
 | `locales/` | `en.json`, `fr.json`, ... | `translations("locales")` |
 | `public/` | Images, fonts, CSS | `route GET /assets/*path = files("public", path)` |
 
-`files` serves a folder by the visitor's path, but not `.env`, `.git/` or the program's
-own files. `file("public/" + path)` serves whatever file it is given, `.env` and
-`main.qwe` included *(this guide's example until 0.7)*, and `quillo check` warns about
-it. See [files](https://quillolang.org/docs/reference/files/) and [file](https://quillolang.org/docs/reference/file/).
+`files` serves a folder by the visitor's path, but not `.env`, `.git/`, the program's
+own files or a SQLite database, under any name. `file("public/" + path)` serves
+whatever file it is given, `.env` and `main.qwe` included *(this guide's example until
+0.7)*, and `quillo check` warns about it. See [files](https://quillolang.org/docs/reference/files/) and [file](https://quillolang.org/docs/reference/file/).

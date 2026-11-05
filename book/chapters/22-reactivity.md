@@ -36,6 +36,7 @@ list is not touched. The page shows the new total once the keystroke's handler i
 | `let y = ...` that reads nothing that changes | a constant | never |
 | `let y = ...` whose name is assigned somewhere (`y = 5`) | a plain variable | never by itself |
 | a statement that reads something that changes (`if running { every(...) }`) | an effect | after what it read changed |
+| an assignment alone in the body (`count = len(items)`, `n += 1`) | a step as it starts | never: it runs once, and `quillo check` warns when it reads a prop or another state (write `let`) |
 | `{expr}` in markup, an attribute's or a class's `{...}` | a place on the page | when what it read changed; text that comes out the same is not written |
 | `cond ? <a/> : <b/>`, `if`, `match`, `cond && <x/>` in markup | a branch | made again only when another branch is chosen |
 | `for x in xs => <row/>` | a row for each item | rows are kept by `key` (else by place) and given their new item |
@@ -136,6 +137,12 @@ starts clean (`<Product key={id} id={id}/>`).
 - `state x = prop` reads the prop once: state is the component's own. To follow the
   parent, read the prop (or a `let` of it); to start over when it changes, give the
   child a `key` that changes with it.
+- A component that has left the page (its branch gone, its `key` changed) keeps the
+  props it last read: the function its `@mount` returned, and a handler that runs late,
+  see its own values, not the parent's new ones.
+- A child that changes its parent's state as it starts (a callback it calls in its body)
+  has the server render the parent once more, so the page shows one value and its island
+  carries it; at most once, and never inside another component's second render.
 - A view used as a tag runs once with its props live, as a component does; a plain
   function used as a tag (`<Row item={x}/>` where `Row` is neither) is called again as a
   whole when what it is given changes.

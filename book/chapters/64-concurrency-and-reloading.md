@@ -30,7 +30,9 @@ computing, so one stuck instance holds up only the connections already on it.
 An instance computing for 5 s is logged, with its request. Started with
 [`--max-compute 2s`](#options-of-quillo-run) (`quillo run main.qwe --max-compute 2s`), the server ends a request
 that computes that long without letting go: a 500, between two statements, so nothing is
-left half done, and a line in the log. Time spent waiting does not count. Compiled code has
+left half done, and a line in the log. `highlight`, `markdown` and `markdown_page` end at
+it too, inside a long text, and their end is not an error value a `??` takes, as a loop's
+is not. Time spent waiting does not count. Compiled code has
 nowhere to stop, so under `--max-compute` functions are not compiled. `quillo check` warns on
 a `while` that cannot end.
 
@@ -313,7 +315,9 @@ quillo> db.query("select * from notes")
   repl` adds them.
 - From a pipe (`quillo repl < steps.qwe`) it prints only the answers: no greeting and
   no prompts. Input that ends inside a statement is an error naming the line it began
-  on, and a statement that failed makes the exit status 1. `quillo repl -i` keeps the
+  on, and a statement that failed makes the exit status 1. A line that is not UTF-8 is
+  said by its number (`line 3 is not UTF-8 text (byte 0xC3 at column 1)`) and skipped,
+  the rest runs, and the exit status is 1. `quillo repl -i` keeps the
   greeting and the prompts from a pipe too, as Python's `-i` does.
 
 ## Scripts as tools
@@ -603,7 +607,7 @@ hosts = ["api.stripe.com", "*.mapbox.com"]
 | `[http] hosts` | the hosts `http.*` may reach: `api.stripe.com`, `*.mapbox.com` (its subdomains, not itself), `*`. Each redirect is judged before it is followed |
 | `[http] private` | `false`: `http.*` reaches nothing on this machine or its networks (loopback, private, link-local and the cloud's metadata at `169.254.169.254`, carrier-grade NAT, IPv6's unique-local), as the name resolves when it connects |
 | `[env] names` | the variables `env()` may read; any other reads as not set, so `env("HOME") ?? "none"` gives `"none"` |
-| `[limits] workers`, `max_compute`, `max_body` | the most [`--workers`](#options-of-quillo-run), [`--max-compute`](#options-of-quillo-run) and [`--max-body`](#options-of-quillo-run) may be: a smaller value given on the command line stays (`"10s"`, `"500ms"`, `"2m"`; `"10MB"`, `"512KB"` or bytes) |
+| `[limits] workers`, `max_compute`, `max_body` | the most [`--workers`](#options-of-quillo-run), [`--max-compute`](#options-of-quillo-run) and [`--max-body`](#options-of-quillo-run) may be: a smaller value given on the command line stays (`"10s"`, `"500ms"`, `"2m"`; `"10MB"`, `"512KB"` or bytes). Each takes what the option takes: 0 is refused (`p.toml:2: `max_body` is a size larger than 0`), as the option refuses it |
 
 Under the two files above, with `APP_NAME=Shop`:
 
@@ -623,7 +627,13 @@ main.qwe:6: error: `udp.listen` needs the net effect, which host.toml does not a
 ```
 
 - `quillo check` and `quillo run` always read the host's file and `quillo.policy`;
-  `--policy` adds one, and `check` names the files only when one is given.
+  `--policy` adds one, and `check` names the files only when one is given. A byte-order
+  mark at a file's start is skipped. The start line lists the limits that hold the
+  program: `quillo: policy p.toml (workers 8; max_compute 10s; max_body 10485760 bytes)`.
+- A request the policy's `max_compute` ends is a 500, as one `--max-compute` ends, and
+  the log names whichever is the tighter: `this request computed for longer than the
+  policy p.toml allows (max_compute)`, or `... than --max-compute allows`. A page (a
+  Markdown preview) is told `the server's policy`, with no path of the server's.
 - [`--split`](#options-of-quillo-run) passes the `--policy` files and `quillo.policy` to its services; a service
   reads the host's file itself.
 - What a policy holds to is Quillo code and what it loads. A plugin is Rust in the

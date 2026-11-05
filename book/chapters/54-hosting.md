@@ -35,7 +35,7 @@ options](#running-quillo) lists every one, `--watch` and `--split` included.
 | `--host H` | the address to listen on. The default, `127.0.0.1`, takes connections from this machine only, which is right behind a proxy on the same machine; `localhost` is 127.0.0.1 too. `0.0.0.0` in a container |
 | `--instances N` | the program N times over, a core each (see [several cores](#several-cores-several-servers)) |
 | `--log json` | a JSON line per request, for log collectors |
-| `--reload` | reload when the program's files change, without dropping requests (see [new versions](#new-versions)) |
+| `--reload` | reload when the program's files change, without dropping requests (see [new versions](#new-versions)); with `--instances`, each instance loads the change, and `--split` passes it to its services |
 | `--max-body 50MB` | the largest request body (default 10 MiB): raise it for big uploads. Past its first 30 s a body must keep coming at 1 KiB/s *(since 0.7)*, and one that sends nothing for 30 s is answered `408`, with a line in the log. A gzipped body (`Content-Encoding: gzip`) is decoded, and the limit counts what it decodes to |
 | `--max-connections N` | connections open at once (default: what the file descriptors allow, less 4,608); past it one more is closed as it comes *(since 0.7)* |
 | `--connections-per-client N` | connections one client (an address, or an IPv6 /64) may hold open (default 512); this machine and `--trust-proxy`'s proxies are not held to it *(since 0.7)* |
@@ -79,7 +79,11 @@ cannot call it.
 Keep them out of the program's files: in the service manager's environment file, or the
 container platform's secrets. `quillo run` also reads a `.env` beside the program (or the file
 `quillo run main.qwe --env-file prod.env` names), handy on your own machine; a variable the environment has wins over it,
-so a `.env` left on a server cannot override production's. The one other
+so a `.env` left on a server cannot override production's. Only a `.env` that is not
+there is nothing: one that cannot be read, is not UTF-8, or is a link to nothing stops
+the start with exit 2, saying where and the ways out (save it as UTF-8, remove it, or
+give `--env-file /dev/null`). A line that is not `KEY=value` is skipped and said at the
+start; `KEY= # set me` is `""`, while `KEY=#fff` is `#fff`. The one other
 configuration is a policy, which only takes away: `/etc/quillo/policy.toml`,
 `--policy FILE` and `quillo.policy` beside the program (see [the
 policy](#the-policy)).
@@ -170,12 +174,14 @@ site_headers("/embed", { "x-frame-options": null })
 
 - **What `site_headers` takes.** Names are checked and values are one line.
   `content-length`, `transfer-encoding`, `connection`, `set-cookie` and `content-type`
-  are refused.
+  are refused, and so is a `location` that is a `javascript:`, `vbscript:` or `data:`
+  URL.
 - **WebTransport** (channels over HTTP/3) goes over UDP, which these proxies do not pass.
   Open the UDP port, the HTTP port's number unless `quillo run main.qwe --wt-port 4433`
   says another, to the
   server itself: Quillo presents a certificate of its own, which pages take by its hash,
-  or yours with `--tls-cert cert.pem --tls-key key.pem`. Otherwise pages use a WebSocket, which
+  or yours with `--tls-cert cert.pem --tls-key key.pem` (the two go together, and must
+  be a pair: a key that is not the certificate's is refused). Otherwise pages use a WebSocket, which
   works through the proxy; `quillo run main.qwe --no-wt` turns WebTransport off.
 
 ## Keeping it running
@@ -245,8 +251,9 @@ about 170 MB, most of it Debian; `quillo` needs only the C library from it.
 - **The program's files.** With `--reload`, copying new files over the old ones reloads
   the program: requests in progress finish on the old version, later ones get the new
   one, and none is dropped. A version that fails to load or check does not replace the
-  one running; the errors are in the log. Copy all files at once
-  (`rsync -a --delay-updates`), so it does not load half of them. Global variables start
+  one running; the errors are in the log. With `--instances`, each instance loads the
+  change, the first checking it, so a version that does not check reaches none. Copy
+  all files at once (`rsync -a --delay-updates`), so it does not load half of them. Global variables start
   afresh; sessions, being signed cookies, stay valid.
 - **A new `quillo`.** Replace the binary and restart the service. Requests in progress
   finish first; new ones are refused for the moment it takes to start again (there is no
@@ -303,10 +310,13 @@ about 170 MB, most of it Debian; `quillo` needs only the C library from it.
 Quillo can be the static host too. `quillo serve site` serves a folder of files as they
 are, with the options of `quillo run` (`--port`, `--host`, `--log`): a folder's
 `index.html` for `/` and `/docs/`, `/about` for `about.html`, `/docs` redirected to
-`/docs/`, the folder's `404.html` for a miss, and no file whose name starts with a dot
-(but `.well-known/`). Inside a program, `route GET /*path = files("site", path)` does the
-same beside its other routes. Each file goes out as it is on disk, with its `ETag`,
-`Last-Modified`, ranges and gzip.
+`/docs/`, the folder's `404.html` for a miss (sent `no-cache`), and no file whose name
+starts with a dot (but `.well-known/`), no program source and no SQLite database,
+whatever its name. A file asked for with a `/` after it (`/about/`) is moved to its path
+without one (`301`), when it would be served there. Inside a program, `route GET /*path
+= files("site", path)` does the same beside its other routes, but serves `/about/` as
+`/about`, since a program's URLs are its own. Each file goes out as it is on disk, with
+its `ETag`, `Last-Modified`, ranges and gzip.
 
 ```sh
 quillo serve dist --port 8080 --host 0.0.0.0

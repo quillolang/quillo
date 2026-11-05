@@ -124,9 +124,19 @@ route GET /log = stream((out) => { for line in tail_log() { out(line) } },
 
 - Header names are lower case. A name or value with a line break is a runtime error,
   so text from a request cannot add headers of its own.
+- A header's value is text, or a number. `null` means no such header: none is sent, not
+  even the one Quillo would send itself, so `{ "cache-control": null }` leaves out the
+  `private` a page with a session gets. A header the route does not name keeps Quillo's.
+  A list is one header per item for `set-cookie` alone (`{ "set-cookie": ["a=1", "b=2"]
+  }` sends two), and an error for any other header, as a map is.
 - `content-length`, `transfer-encoding`, `connection` and `date` are the server's,
-  whatever is given. `server: Quillo` is sent unless the route sets `server`;
-  `x-request-id` and `x-content-type-options: nosniff` are always added.
+  whatever is given. `server: Quillo` is sent unless the route sets `server` (`null`
+  for none); `x-request-id` and `x-content-type-options: nosniff` are added unless the
+  route names them.
+- A `location` that is a `javascript:`, `vbscript:` or `data:` URL is refused, in
+  `respond`, `stream`, `events` and `site_headers` as in `redirect`.
+- `stream` and `events` refuse a status that has no body (204, 205, 304), so no
+  function runs after a head that says nothing follows.
 - Setting `content-encoding` turns off Quillo's gzip for that answer.
 - A plain value (html, a map, a str) gets the default headers and no way to add one:
   switch that route to `respond` when it needs a header.
@@ -195,19 +205,34 @@ The options, and what a cookie is without them:
 | option | default | takes |
 |---|---|---|
 | `max_age` | none: the cookie lasts until the browser closes | seconds, or a duration: `"30d"` with `s`, `m`, `h`, `d`, `w`, `y` |
-| `path` | `/` (or the prefix the program is served under: `quillo run main.qwe --base /shop`, or a mounted program's path) | a path starting with `/` |
+| `path` | `/` (or the prefix the program is served under: `quillo run main.qwe --base /shop`, or a mounted program's path) | a path starting with `/`, with no space, `;`, control character or letter past ASCII (percent-encode them) |
 | `domain` | the host only | a host name, letters, digits, `.` and `-` |
 | `http_only` | `true`: the page's scripts cannot read it | `false` to let them |
 | `secure` | `true`: sent over HTTPS only | `false` |
 | `same_site` | `"Lax"` | `"Lax"`, `"Strict"` or `"None"` |
 
 - Values are percent-encoded on the way out and decoded when read, so any text fits.
-  Browsers hold about 4 KB per cookie.
+  A cookie of more than 3,900 bytes as sent is an error, as browsers drop it with its
+  attributes.
+- Another option is an error, when the program runs and in `quillo check` for one
+  written out; Express's and the header's spellings are told the name here:
+  `` `set_cookie` has no option `sameSite`: write it `same_site` `` (`maxAge`,
+  `Max-Age`, `httpOnly` alike).
 - `same_site: "None"` makes the cookie `Secure` whatever was asked: browsers take it
   no other way.
+- A name starting `__Host-` or `__Secure-` (in any case) keeps its prefix's rules, or
+  browsers drop the cookie: it is `Secure`, with `--watch` and `--plain-http` too, and
+  a `__Host-` one is at `Path=/` with no `Domain`. Asking otherwise (`secure: false`, a
+  `domain`) is an error: `` a `__Host-` cookie has no domain ``.
 - `delete_cookie(name, { path, domain })` must name the path and domain the cookie was
-  set with, or the browser keeps it.
-- A cookie set twice in one request is sent once, the last.
+  set with, or the browser keeps it. It takes `http_only`, `secure` and `same_site` too,
+  and `max_age` only as 0.
+- A cookie replaces another set in the same request only at the same name, path and
+  domain, as browsers keep them: `delete_cookie("theme", { path: "/old" })` and then
+  `set_cookie("theme", "dark")` send both.
+- The `Cookie` header is read as browsers send it: a name sent twice gives the first
+  (the cookie of the longer path), spaces around `=` belong to neither side, and one
+  pair of quotes around a value is taken off.
 - `cookie(name)` works in any function the request runs, so a helper that reads the
   visitor's time zone from a cookie need not be handed `request`. Outside a request (a
   job, a script) it is null.
@@ -461,9 +486,11 @@ route GET /api/me = request | api.key | (r) => respond(200, { ip: r.ip, user: se
 
 The `next` a login form carries is checked by `local` before it is followed, so a link
 from elsewhere cannot send a visitor to another site after signing in: starting with
-`/` is not enough, since a browser takes `//evil.example` (and `/\evil.example`) as
-another host, and `redirect` sends what it is given, but for a `javascript:` URL, which
-it refuses *(since 0.7)*. Signing out and the theme are
+`/` is not enough, since a browser takes `//evil.example` as another host, and
+`redirect` sends a URL to another host as it is given (encoded where a URL must be). It
+refuses only a `javascript:`, `vbscript:` or `data:` URL, and keeps a path of the site's
+own on the site: `/\evil.example` is written `/%5Cevil.example`, and `..` is taken out.
+Signing out and the theme are
 forms too, posting to their routes: a link cannot log anyone out, since a `GET` would
 let any page do it. The `migrations/` folder holds the `users` table,
 `migrations/001_users.sql`:

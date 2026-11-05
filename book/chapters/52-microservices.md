@@ -76,9 +76,10 @@ options](#running-quillo) lists them all.
   (`quillo run billing.qwe --base /billing`) is the path it is served under, which its links and redirects carry.
 - **`--split`** runs each service the app declares (and those they declare) as a
   process of its own, each on its own port, its log lines marked with its name, all
-  signed with one secret. They stop with the app. `--describe`, `--no-build` and the
-  `--policy` files, given to the app (`quillo run app.qwe --split --no-build --policy
-  prod.toml`), are given to each of them too. It is the quickest
+  signed with one secret. They stop with the app. `--describe`, `--no-build`,
+  `--reload` and the `--policy` files, given to the app (`quillo run app.qwe --split
+  --no-build --policy prod.toml`), are given to each of them too, and with `--port 0`
+  the services are told the port the app was given. It is the quickest
   way to see an app as it would run split, on one machine.
 - **Checked once.** Before `--split` starts any service, the app checks the whole tree,
   its own files and every service's, and says each warning once. An error in a service

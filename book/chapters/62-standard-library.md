@@ -43,9 +43,15 @@
   highlighting included), awaited like a `server fn`: call it in an event handler or a
   `state` initializer, and keep the text in state:
   `oninput={(e) => { preview = str(markdown(e.value)) }}` and `<div>{raw(preview)}</div>`.
+  `/_quillo/markdown` takes at most 1 MB of text (a larger one is answered 413, and
+  `markdown` in the component gives an error value), and one that computes past
+  [`--max-compute`](#options-of-quillo-run) is a 500.
   `markdown_page(text, { title, lang, html })` is the same as a whole page, for a route:
   a doctype, a `<head>` with its `<title>` (the option's, else the text's first `#`
-  heading), and the HTML in its `<body>`.
+  heading), and the HTML in its `<body>`. Markdown takes time in proportion to the text,
+  whatever marks it holds (a megabyte of `*a_` is 0.03 s), and `markdown`, `markdown_page`
+  and `highlight` end at `--max-compute` as a loop does. A fence's language, for
+  highlighting, is its first word, to a space or a comma (```` ```rust,ignore ```` is Rust).
 - **Lists:** `map filter find any all reduce sum min max sort sort_by reverse first last push range enumerate slice unique flatten zip take drop count group_by join_on index_of`
 - **Maps:** `keys values get has set remove merge` (`get(m, k, default)`; `merge` takes
   two maps; there is no `entries`: `for [k, v] in m`)
@@ -63,7 +69,17 @@
   out keys whose value is null); in the browser too. `env(name, default)` gives the
   default when the variable is not set.
 - **Program and pages:** `highlight(code, lang)` (Quillo, JavaScript and TypeScript,
-  Python, Rust, shell, SQL, CSS, HTML and XML, JSON; anything else as escaped text),
+  Python, Rust, shell, SQL, CSS, HTML and XML, JSON; anything else as escaped text, no
+  word coloured), the same on the server and in the browser, where `str(highlight(...))`
+  is the markup too. It reads each line once, so it takes time in proportion to the text,
+  and colours strings as each language reads them: Python's triple-quoted and Rust's
+  strings run over lines, Rust's raw strings `r#"..."#` have no escapes, a Rust
+  character such as `'"'` is a string and a lifetime `'a` is not, a JavaScript regex
+  literal is one token, a shell's `it's` or a `#` inside a word starts nothing, and a
+  range's `..` ends the number before it (`0..10` is two numbers); a word is Unicode
+  letters and digits on both sides.
+  The browser knows only its own languages: `"constructor"` and `"__proto__"` are escaped
+  text,
   `check_program`, `run_script`, `delete_file`, `save_upload`, `read_upload`,
   `schedule`, `idempotent`, `parallel`, `ready`, `style_with`, `classes`, `accept_calls`, `allow_cross_site`,
   `tenant`, `tenant_from`, `with_tenant`, `platform` (below), and in components `url`, `navigate`, `every`,
@@ -166,8 +182,9 @@ Safety built in:
 - Text in HTML and attribute values is escaped. Keys of a `{...map}` spread on an element
   become attributes only if they are plain names that run nothing: `onclick` (in any
   case, and as `bind:onclick`), `srcdoc`, names with `:` (but `xlink:href`), `@` or
-  quotes or `>` are dropped, and a key cannot replace an attribute written out, in
-  another case either. Event handler attributes and `srcdoc` take only text written in
+  quotes or `>` are dropped, and so are the attributes Quillo's runtime reads (`data-qi`,
+  `data-c`, `data-p`, `data-s` and the rest), so a spread cannot make a component; a key
+  cannot replace an attribute written out, in another case either. Event handler attributes and `srcdoc` take only text written in
   the program (see [HTML literals](#html-literals)). `javascript:` URLs in `href`, `src`
   and the like render as `about:blank#blocked`, whatever the value's type: the text the
   attribute would say is checked, so `href={markdown(u, { inline: true })}` too. So do
@@ -175,7 +192,8 @@ Safety built in:
   each of `values`), which may be an `href`.
 - CSS takes data as it is written, but for what would end it: `style={...}` is escaped
   like any attribute, a style map's values and css`...`'s `${...}` have `{ } ; \` written
-  as CSS's escapes (so a value adds no rule or declaration), and `<style>{x}</style>` has
+  as CSS's escapes, and css`...`'s `&` as `\26 ` (so a value adds no rule or declaration,
+  in `<svg>` and `<math>` too), and `<style>{x}</style>` has
   its `<` rewritten (`\3c `), so none can end the element; within a value, what it says is
   CSS. CSS runs no script in today's browsers; data put
   there can still restyle the page (cover it with an overlay,
@@ -188,9 +206,11 @@ Safety built in:
 - Code nested more than 256 levels deep (brackets, operators, elements, ...) is refused
   when it is parsed, so source from anywhere cannot use up the stack.
 - `respond` and `redirect` refuse header values with line breaks, which would let text
-  from a request add headers of its own.
+  from a request add headers of its own, and a location that runs code or carries a page
+  (`javascript:`, `vbscript:`, `data:`).
 - A failing request answers `internal error`; the message, with file and line, goes to
-  the terminal (and to the page too with [`--watch`](#options-of-quillo-run)).
+  the terminal (and to the page too with [`--watch`](#options-of-quillo-run)). A builtin's
+  error is `internal error` to a visitor in the browser too, in production.
 - A `json:` pattern matches only a body sent as JSON (or with no content type), not a
   `text/plain` one, which a page on another site could send.
 - A page on another site cannot post a form here: a `POST`, `PUT`, `PATCH` or `DELETE`
@@ -246,8 +266,12 @@ Safety built in:
   `let order = match sort { "new" => "created desc", _ => "score desc" }` and then
   `"select * from posts order by " + order`. A run-time set of columns, from a list the
   program wrote: `` `insert into t (${sql_name(cols)}) values (${sql_param(cols)})` `` with
-  a map of those columns as the parameters, or
-  `` `update t set (${sql_name(cols)}) = (${sql_param(cols)})` ``. Take the columns from
+  a map of those columns as the parameters, or for an update the pairs, which every
+  database takes (a column list, `set (a, b) = (...)`, is not MySQL's, nor PostgreSQL's for
+  one column): `` let set = cols | map((c) => `${sql_name(c)} = ${sql_param(c)}`) | join(", ") ``
+  and then `` `update t set ${set} where id = :id` `` (`quillo check` warns of this one,
+  as it does not follow what a `map` makes: every name in it is `sql_name`'s and every
+  value a parameter). Take the columns from
   the program, never from what the visitor sent: `keys(request.form)` names `is_admin`
   and `id` as well as `email`, which `sql_name` takes, as they are names, so a sign-up form
   with `is_admin=1` made an admin (FEEDBACK51.md, Q-662). A record type, `{ form: Signup }`,
@@ -360,7 +384,8 @@ turns it around. A later release removes it.
 - **For now a name the file did not take still works, with a warning** *(since 0.7)*: "`price` comes
   from lib/money.qwe, which this file does not take: add `import lib/money.qwe use
   price`". `quillo fix main.qwe` writes those lines, in every file of the program
-  (run it once for each program, a service's or a mounted one's too). A later release
+  (run it once for each program, a service's or a mounted one's too), after a byte-order
+  mark and with the file's own line ends (CRLF in a CRLF file). A later release
   makes this an error.
 - Two files may define one name: a `helper` in `lib/a.qwe` and a `helper` in `lib/b.qwe`
   are two functions, and each `fn`, `view`, `component` and top-level `let` works this
@@ -410,7 +435,7 @@ turns it around. A later release removes it.
 - A `use` list may go on over lines, each line after a `,`. A `,` at the end of the
   list is an error: the next line is the next statement, not a name to take.
 - **A file's text.** A file is UTF-8; one that is not is refused with the line and column
-  of the first bad byte. A byte-order mark at the start is skipped, and so is a first line
+  of the first bad byte, by `run`, `check`, `build` and `classes` alike. A byte-order mark at the start is skipped, and so is a first line
   starting `#!`, in the main file and in a `use`d one, so a script with
   `#!/usr/bin/env quillo` runs as `./tool.qwe`. A CRLF is a line break, so a string over
   two lines is the same text from a Windows checkout (`\r` written as `\r` stays). A
@@ -563,7 +588,8 @@ as `5.00m`)*. It carries no currency: `numeric(p, s)` and a currency column say 
 A list given as a query's parameters, `db.exec("insert ... values (?)", [x])` as Python's
 `sqlite3` takes them, is one parameter, stored as the list's JSON text. Parameters are
 separate arguments: `db.exec(sql, a, b)`. `quillo check` says so when the SQL is written
-out and has a `?` *(since 0.7)*.
+out and has a `?` *(since 0.7)*, but not where a list is PostgreSQL's array: a `?` in
+`any(...)` or `all(...)`, or cast to an array type (`?::int[]`, `?::jsonb[]`).
 
 ## Money {#standard-library-money}
 
@@ -972,22 +998,51 @@ cursor: page with `limit` and keyset or `offset`); `db.one` the first row or `nu
 PostgreSQL it fetches the whole answer and keeps one: write `limit 1`); `db.exec`
 `{ changes, last_id }`. A row is a map from column names, so two columns of one name
 (`select a.id, b.id`) leave the last: name them apart with `as`. SQL `NULL` is `null`.
-`last_id` is the last row SQLite inserted on the connection (after an `update`, an old
-one), MySQL's new `auto_increment` id or `0`, and `null` on PostgreSQL.
+The two numbers mean the same on every database. `changes` is the rows the statement
+matched: an `update` that sets a value a row already has counts that row (MySQL's own
+count, of rows changed, is `?client_found_rows=false` in its URL), an upsert's or a
+`replace`'s row counts once, a read and a schema statement count 0, and a script's is its
+last statement's. `last_id` is the id of the one row an `insert` made (on SQLite and
+MySQL), and `null` after anything else: an `insert` of several rows, an upsert that
+updated, an `update`. PostgreSQL has no such id, so it is always `null` there: write
+`insert ... returning id` with `db.one`, or `db.query` for several rows. SQL with no
+statement in it (`""`, only spaces or comments) is an error value, on all three, from
+`db.exec`, `db.query` and `db.one` alike.
 
 **One statement, or several.** With values, `db.exec` runs one statement: on SQLite what
 follows the first `;` is ignored, on PostgreSQL it is an error. Without values the whole
 text runs, statement by statement (a seed file: `db.exec(read_file("seed.sql"))`), and
-`changes` is the last one's (`null` on PostgreSQL). On SQLite, `db.exec` with values on
-a statement that gives rows (`insert ... returning id`) is an error: use `db.one`.
+`changes` is the last one's. The text is split where the database would split it: a
+function's, procedure's or trigger's body (`$$ ... $$`, `begin ... end`), a `do` block and
+`begin atomic` are one statement with the rest, never a transaction begun by hand.
+`db.exec` of a statement that gives rows (`insert ... returning id`) runs it, on SQLite
+too; its rows are `db.one`'s and `db.query`'s.
 
 **Parameters.** `?` takes values in order, as many as there are `?` (a different count
-is an error), or `:name` takes them from one map (a name needs a value; other keys are
-ignored). SQLite also reads `@name` and `$name`. PostgreSQL's `$1` turns the `?`
-translation off for that statement, so `$1` and `?` do not mix; a `?` right after a
-word that is not SQL's (`interval ?`, `date ?`) is taken for jsonb's operator and left
-alone: write `?::interval`. At most 32,766 values in a statement on SQLite, 65,535 on
-the others.
+is an error, and so are placeholders given no values, on every database), or `:name`
+takes them from one map (a name needs a value; other keys are ignored). One map is the
+values by name only where the SQL has names: given to SQL with none, it is no value, so
+a query put together from optional parts can always pass the same map; given for a lone
+`?`, it is that value (a map stored as JSON). SQLite also reads `@name`, `$name` and
+`#name`, and numbered ones (`?1`, `:1`), taking `name` from the map; on MySQL `@name` is a
+variable of the session, so a map with that name is refused (`` `@x` is a variable of
+MySQL's session (null unless set), not one of the values: write `:x` ``). `?NNN` is the
+NNN-th value everywhere. PostgreSQL's `$1` turns the `?` translation off for that
+statement, so `$1` and `?` do not mix; a `?` right after a word that is not SQL's
+(`interval ?`, `date ?`) is taken for jsonb's operator and left alone: write
+`?::interval`. PostgreSQL's `?|`, `?&` and `@?` are operators, `?||` is a value then
+`||`, a `:name` inside brackets is a value unless it is a slice's (`a[1:n]`), and block
+comments nest, as the server reads them. At most 32,766 values in a statement on SQLite,
+65,535 on the others.
+
+A value is what it is on every database: an error value given as a parameter is not
+stored, but given back as the error it was (`value 2 cannot be stored: got error (it
+failed before this call, ...)`), so `int("4O")` never becomes a row; a function is
+refused. NaN and the infinities are refused, naming them (`value 1 is NaN, which cannot
+be stored`), since SQLite keeps NaN as null and MySQL refuses both; `-0.0` is stored and
+read as `0.0`, as SQLite and MySQL cannot keep it. A `||` joins text on all three: on
+MariaDB, whose `||` is `or` by default, the driver sets `PIPES_AS_CONCAT` for SQL that has
+one, migrations and scripts too.
 
 **Bytes and other types.** There is no bytes value: a SQLite BLOB or a MySQL BLOB
 comes back as text (bytes that are not UTF-8 replaced), and PostgreSQL's `bytea` as
@@ -1028,6 +1083,9 @@ fn withdraw(account: int, cents: int) -> map with db =
     })
 ```
 
+- Those are its two options; another is refused, when it runs and in `quillo check`
+  (`` `db.transaction` has no option `isolaton` (did you mean `isolation`?) ``), where a
+  misspelt key ran the transaction as if none were given.
 - `isolation` is `"serializable"`, `"repeatable_read"` or `"read_committed"`; left out,
   it is the database's default (read committed on PostgreSQL, repeatable read on MySQL).
   PostgreSQL begins with `begin isolation level ...`, MySQL runs `set transaction
@@ -1095,24 +1153,54 @@ queries run under the interpreter's lock, on the loop's thread: a SQLite query h
 the other requests of its instance while it runs. Several processes (a program started
 with [`--instances`](#options-of-quillo-run) or [`--split`](#options-of-quillo-run), `quillo run main.qwe --instances 4`; another program) may share a file: readers do not wait, writers take turns.
 There is no SQLCipher (no encryption at rest), and a file is opened by path, not as a
-`file:` URI (so no read-only mode). Back it up with `db.exec("vacuum into
+`file:` URI (so no read-only mode). `files()` and `quillo serve` never send a SQLite
+file, whatever its name or folder (see [Static files](#static-files)); `file("app.db")`
+sends one on purpose. Back it up with `db.exec("vacuum into
 'backup.db'")` or `sqlite3 app.db ".backup ..."`, not by copying the file while it runs.
 
 **PostgreSQL:**
 
 - Placeholders can be `?`, `:name` (with a map) or Postgres's own `$1`; the first two
-  are translated, skipping quotes, comments and `$$` strings. Queries are prepared, so
-  values never become SQL text.
+  are translated, skipping quotes (`U&"..."` names too), comments and `$$` strings, as
+  the server reads them. Queries are prepared, so values never become SQL text.
 - Values convert both ways: numbers, text, booleans, `json`/`jsonb` as maps and lists,
   arrays as lists (up to six dimensions), `numeric` as [decimals](#decimals) (an int
-  when it has no scale), and `uuid`, `date`, `time`, `timestamptz` (ISO 8601, in UTC,
-  with `Z`), `timestamp` (as stored, with no zone) and `interval` (PostgreSQL's own text,
-  `1 mon 2 days 03:00:00`) as strings. Other types (`inet`, `money`, ranges, `hstore`,
-  composites, `tsvector`) arrive garbled: cast them in the query (`ip::text`).
+  when it has no scale), `money` as a decimal (with its `lc_monetary`'s decimals), `xid`
+  and `xid8` as ints, `bit(n)` and `varbit` as their digits (`"00000101"`, kept at their
+  length), and `inet`, `cidr`, `macaddr`, `uuid`, `date`, `time`, `timetz`,
+  `timestamptz` (ISO 8601, in UTC, with `Z`), `timestamp` (as stored, with no zone),
+  `interval` (PostgreSQL's own text, `1 mon 2 days 03:00:00`) and `pg_lsn` as strings,
+  as PostgreSQL writes them. A BC date is ISO 8601's, `-0043-03-15` for 44 BC (`0000` is
+  1 BC), and is written back as the same date. A `real` reads as the shortest float that
+  prints the same (`0.1`, not `0.10000000149011612`). A type with no reader of its own
+  (ranges, `hstore`, composites, `tsvector`, `regtype`) is its bytes in hex (`\x...`),
+  the same way in every row: cast it in the query (`r::text`). An array whose lower
+  bound is not 1 (`'[0:2]={1,2,3}'`) comes back as its text, which written back keeps
+  its bounds, so a column's value may be a list in one row and text in another.
+- JSON is read cell by cell by Quillo's own reader: a whole number past an int is a
+  [decimal](#decimals), past a decimal a float, so two large ids stay two; a value that
+  cannot be read (a number past a float, a nesting deeper than 1,000) is an error value
+  in its own cell (`db: this JSON could not be read: ...`), and the other cells and rows
+  read; a lone surrogate is U+FFFD. A whole decimal inside a value sent is written as a
+  JSON number, so it goes back as it came.
 - Parameters are typed by the column: a `bool` takes only a boolean (not 1), the integer
-  types take ints (or whole numbers and numeric text, range-checked), and other types
-  are sent as text and cast. A list sent to an array column is an array.
+  types take ints (or whole numbers and numeric text, range-checked: an int past the
+  column's range is the server's own error, and compared with the column it matches no row), and other types are sent as text and cast.
+  A list sent to an array column is an array, and a list inside a `jsonb[]`'s list is one
+  JSON value. A text given as a `json` or `jsonb` column's value (an insert's values,
+  `set doc = ?`) is the JSON it holds, as MySQL's JSON column takes it:
+  `json.stringify(m)` stores an object, not a string; given to a function, it is a JSON
+  string, as MySQL's `json_set` takes it. A float past `real`'s or `double precision`'s
+  range is refused (`1e39 is out of range for type real`), where it was stored as
+  Infinity or 0. A value where nothing in the SQL says its type (`select greatest(?,
+  ?)`, `select ? as v`) is declared `int4`, `int8` or `float8` by what it is (text as
+  text), so `greatest(10, 9)` is `10` and `select ? as v` with 5 is `5`, as on the others; when PostgreSQL refuses those types, the
+  statement is tried once more without them.
 - `last_id` is `null`: use `insert ... returning id` with `db.one`.
+- After a schema statement (`alter table`, `create or replace view`, a `drop`), the
+  statements kept on what it names are prepared again, on every connection; one whose
+  plan another server changed is prepared again and tried once.
+- `?schema=` in the URL is added to `?options=`, not in its place.
 - Connections come from a pool (8 by default; `?pool_size=N` in the URL) for
   transactions and migrations. A query releases the interpreter lock while it waits,
   so other requests keep running. A transaction keeps one connection until it ends, so
@@ -1121,11 +1209,16 @@ There is no SQLCipher (no encryption at rest), and a file is opened by path, not
   request to another, so what a statement changes beyond its transaction would reach the
   next visitor: `set` (without `local`), `set_config(..., false)`, a `create temp` table,
   `listen`, a session's advisory lock, a cursor `with hold`, `set session authorization`.
-  In a transaction, such a statement is noted, and the connection is reset before it goes
-  back (`set session authorization default`, `reset all`, `close all`, `discard temp`,
-  advisory locks let go, `unlisten *`; Quillo's prepared statements kept), or closed if the
-  reset fails. Outside one, where the connection is shared by every request, it is refused,
-  and so is a `begin` anywhere in a script. `prepare` is refused everywhere: pass values as
+  Every transaction's connection (`db.transaction`, `db.atomic` and migrations alike) is
+  reset as it ends, before it goes back (`set session authorization default`, `reset
+  all`, `close all`, `discard temp`, advisory locks let go, `unlisten *`; Quillo's
+  prepared statements kept), or closed if the reset fails. Outside one, where the
+  connection is shared by every request, such a statement is refused, in any form and
+  place: `set_config` with values, inside `values (...)` or an `update`, and whatever its
+  case or quoting, unless its third argument is `true`; a `pg_temp` table; and a `begin`
+  anywhere in a script. A `do` block, and a call of a function of the database's own
+  (which may change the session where Quillo cannot read it), runs outside a transaction
+  on a connection of its own, reset after it. `prepare` is refused everywhere: pass values as
   parameters (`?`), which Quillo prepares itself. Inside a SQLite transaction a PostgreSQL
   query takes a free connection at once or is an error, as waiting would hold every request. Row-level
   security's setting per request is therefore written inside the transaction, as local:
@@ -1165,20 +1258,40 @@ There is no SQLCipher (no encryption at rest), and a file is opened by path, not
 --no-default-features` leaves it out):
 
 - Placeholders are `?`, or `:name` with a map (translated, skipping quotes, backticks
-  and comments). Statements are prepared, so values never become SQL text.
-- Values convert both ways: numbers, text, `tinyint(1)` as booleans, `decimal` as
-  [decimals](#decimals), MySQL's `json` as maps and lists (MariaDB's JSON is text: `json.parse` it),
-  and dates and times as text (`2026-10-27 14:30:00`, with a space and no zone; `TIME`
-  as `HH:MM:SS`, hours past 24 too). A `bigint unsigned` past 2^63 becomes a float.
-  `last_id` is the new row's `auto_increment` id, or `0`.
+  and comments: `#` lines, and `/*! */` and MariaDB's `/*M! */`, which the server runs,
+  read as SQL). Statements are prepared, so values never become SQL text.
+- Values convert both ways: numbers, text, `tinyint(1)` as booleans when it holds 0 or 1
+  (another value is an int), `decimal` as [decimals](#decimals), MySQL's `json` as maps
+  and lists (MariaDB's JSON is text: `json.parse` it), `BIT(n)` as its digits
+  (`"00000101"`, as PostgreSQL's `bit`), which it takes back, and dates and times as
+  text (`2026-10-27 14:30:00`, with a space and no zone; `TIME` as `HH:MM:SS`, hours past
+  24 too). A `FLOAT` reads as the shortest float that prints the same, and a value a
+  `FLOAT` column would keep as 0 (`1e-46`) is refused as out of its range. An unsigned
+  value or an id past 2^63 is a [decimal](#decimals) (`9223372036854775808m`), which finds
+  its own row. `last_id` is the new row's `auto_increment` id (see above for several
+  rows).
+- `db.open` of a database that is not there is an error (`Unknown database 'shop'`), as
+  on PostgreSQL, so a typo in a URL makes no empty database; a tenant's is made by the
+  driver (below). A host may be an IPv6 address, `mysql://app@[::1]:3306/app`.
+- A statement larger than the server's `max_allowed_packet`, its values included, is
+  refused, saying so and how big it is, where the connection broke.
+- Inside `db.transaction` and `db.exec_many`, a statement that commits by itself
+  (`truncate`, `create table`, `alter`, `drop`, ...) is refused before it runs, so what
+  ran before it can still be rolled back: `` `db.exec("truncate table rates")` inside a
+  transaction: MySQL and MariaDB commit the transaction around this statement by itself
+  ... run it before or after the transaction ``. One that cannot be seen beforehand (a
+  procedure's, `execute immediate`, a `begin not atomic` block) ends the transaction with
+  the same error, read from the server's in-transaction flag. PostgreSQL and SQLite roll
+  their schema statements back, and take them in a transaction.
 - Connections come from the driver's pool (10 to 100), and a query releases the
   interpreter lock while it waits, as with Postgres. `pool_size` is PostgreSQL's: in a
   MySQL URL it stops the database from opening; the driver's own `pool_min` and
   `pool_max` set the pool. A transaction keeps one connection until it ends; nested
   ones are savepoints. A Unix socket is `?socket=/path`.
-- `db.migrate()` takes turns through a named lock (`get_lock`). A statement that
-  changes the schema commits at once in MySQL, so a migration that fails part way
-  keeps what it did before the failure: put one change in each file.
+- `db.migrate()` takes turns through a named lock (`get_lock`). A migration may change
+  the schema, but such a statement commits at once in MySQL (outside the refusal above),
+  so a migration that fails part way keeps what it did before the failure: put one
+  change in each file.
 - A database per tenant: `mysql://host/app_{tenant}`, made when the program makes the
   tenant, and listed by `db.tenants()`.
 - TLS is required for a server on another machine, with its certificate and name
@@ -1304,8 +1417,11 @@ db.open(env("DATABASE_URL"), { replicas: [env("REPLICA_1"), env("REPLICA_2")] })
 - Reads (`select`, and `with` that writes nothing) go to the replicas in turn. Writes,
   reads that lock (`for update`, `for share`), anything in a transaction, and every
   read of a request after it wrote go to the primary: a request reads what it wrote.
-  A `select` that writes through a function (`select nextval(...)`) fails on the
-  replica, and is answered by the primary.
+  Only pure reads go to a replica: a `select` that calls a function that may write
+  (`nextval`, `setval`, or one made in the database with `create function`, on
+  PostgreSQL and MySQL alike) goes to the primary; built-in functions that only compute
+  (`lower`) do not. A replica's read-only refusal sends that statement to the primary
+  without taking the replica out of use.
 - Every replica must open when the database does, or `db.open` fails. A replica that
   fails later is left out for ten seconds; its read goes to the primary. Replicas are
   for a database named by its URL: not SQLite, not a database per tenant.

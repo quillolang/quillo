@@ -389,10 +389,16 @@ goes to a `server fn` instead, without a form (see `save_upload` in the referenc
   this request's; a path that leads outside the folder, by `..` or through a link
   (see [Paths and links](#paths-and-links)), is a runtime error. `save_upload` needs the
   `fs` effect.
-- `save_upload`, `write_file` and `delete_file` refuse the program's own files, and give
-  an error value saying so: the `.qwe` and Rust (`.qwer`, `.rs`) files it loaded (or a folder holding
-  one), `.env` and `.env.*`, the SQLite database it has open with its `-wal`, `-shm` and
-  `-journal` files, and anything in `migrations/`.
+- `save_upload`, `write_file`, `delete_file` and `image.convert` refuse the program's own
+  files, and give an error value saying so: the `.qwe` and Rust (`.qwer`, `.rs`) files it
+  loaded (or a folder holding one), `.env` and `.env.*`, the paths given to
+  [`--env-file`](#options-of-quillo-run) and [`--tls-key`](#options-of-quillo-run) (while
+  nothing is there too), the SQLite databases it has open with their `-wal`, `-shm` and
+  `-journal` files (or a folder holding one), a tenant's database not made yet, and
+  anything in `migrations/`. Names are compared as the file system may take them, on
+  every system: in any case and Unicode form (`.ENV`, `Main.QWE`), and as Windows reads
+  them (cut at `:`, trailing dots and spaces dropped), so `.ENV` is not written to be
+  read as the settings at the next start.
 - `filename` is what the browser sent, without any folders; name saved files yourself
   (as above) rather than trusting it. Save under a folder of the program's with a name the
   program makes (`uploads/${uuid()}.pdf`), and keep the visitor's name in the database.
@@ -401,7 +407,13 @@ goes to a `server fn` instead, without a form (see `save_upload` in the referenc
   file's place in the body.
 - A file's name and a field's name decode the three escapes HTML's multipart encoding
   writes (`%22` for `"`, `%0D`, `%0A`) and nothing else, and a quoted name keeps a `;` in it.
-- A multipart body may hold up to 1,000 parts; a text field given twice keeps the last.
+  Clients other than browsers are read too: a `\"` in a quoted name (Go, curl) is a `"`,
+  and `filename*=UTF-8''...` (RFC 5987, UTF-8 or ISO-8859-1) gives the name when no
+  `filename` is there, a browser's plain `filename` coming first.
+- A multipart body may hold up to 1,000 parts, fields and files together; one with more is
+  answered 413 before the route runs. A text field given twice keeps the last. The body's
+  content type is read in any
+  case (`Multipart/Form-Data`, `Application/X-WWW-Form-Urlencoded`), as HTTP has it.
 - A request body may be up to 10MB, the files and the form's fields together; a larger one
   is answered 413. For larger files, start the program with a higher limit, the option
   [`--max-body`](#options-of-quillo-run): `quillo run main.qwe --max-body 50MB`.
@@ -436,8 +448,11 @@ place of what is on disk: a tool that writes Quillo code can check it before wri
 it. The code checked may come from users, so it reads only files inside the program's
 folder: a `use`, `mount` or `service` path with `..`, starting with `/`, or leading out
 of the folder through a link is reported as an error (`path must stay inside the
-program's folder: data/x.qwe`), not read. `delete_file(path)` removes a file or folder inside the
-program's folder.
+program's folder: data/x.qwe`), not read. It reads only Quillo's files, `.qwe` (and the
+signatures of `.qwer` and `.rs` files for a `use`), no path with a dot folder or file in
+it, and a link judged by where it leads, so `use .env` or `use .git/config` reads
+nothing; its messages never show a file's text. `delete_file(path)` removes a file or folder inside the
+program's folder, but not a folder that holds a database the program has open.
 
 ## Scripts from users
 
@@ -602,14 +617,36 @@ fn touch() {
   32 bytes, as it does for `QUILLO_SERVICE_SECRET` and `LIMER_ADMIN_SECRET`: a short one
   can be guessed offline from one signed cookie.
 - `set_cookie(name, value, { max_age, path, domain, http_only, secure, same_site })` and
-  `delete_cookie(name, { path, domain })` add `Set-Cookie` to the response, whatever
-  the route returns. Cookies are `HttpOnly`, `SameSite=Lax`, `Path=/` and `Secure` by
-  default. `max_age` is seconds or a duration (`"30d"`: `s`, `m`, `h`, `d`, `w`, `y`);
-  `path` must start with `/`; `domain` takes letters, digits, `.` and `-`; `same_site`
-  is `"Lax"`, `"Strict"` or `"None"`, and `"None"` makes the cookie `Secure` whatever
-  was asked, since browsers take it no other way. Values are percent-encoded. A cookie
-  set twice in one request is sent once, the last. In a mounted program, or under
-  [`--base`](#options-of-quillo-run), the default `Path` is the prefix.
+  `delete_cookie(name, { path, domain, http_only, secure, same_site })` add `Set-Cookie`
+  to the response, whatever the route returns. Cookies are `HttpOnly`, `SameSite=Lax`,
+  `Path=/` and `Secure` by default. `max_age` is seconds or a duration (`"30d"`: `s`, `m`,
+  `h`, `d`, `w`, `y`); `path` starts with `/` and holds no space, `;`, control character
+  or letter past ASCII (percent-encode them); `domain` takes letters, digits, `.` and `-`;
+  `same_site` is `"Lax"`, `"Strict"` or `"None"`, and `"None"` makes the cookie `Secure`
+  whatever was asked, since browsers take it no other way. Values are percent-encoded.
+  In a mounted program, or under [`--base`](#options-of-quillo-run), the default `Path`
+  is the prefix.
+- An option `set_cookie` does not take is an error, when the program runs and in `quillo
+  check` for one written out, and Express's and the header's spellings are told the name
+  here: `` `set_cookie` has no option `sameSite`: write it `same_site` `` (`maxAge`,
+  `Max-Age`, `httpOnly` alike); `expires` is told that `max_age` is how long it lasts.
+  `delete_cookie` takes `max_age` only as 0.
+- A cookie replaces another set in the same request only at the same name, path and
+  domain (a domain in any case, with or without its leading `.`), as browsers keep them:
+  `delete_cookie("theme", { path: "/old" })` and then `set_cookie("theme", "dark")` send
+  both. A cookie of more than 3,900 bytes as sent (its value percent-encoded) is an
+  error, as browsers drop it with its attributes.
+- A name starting `__Host-` or `__Secure-` (in any case, as browsers read it) keeps its
+  prefix's rules, or browsers drop the cookie: it is `Secure`, under `--watch` and
+  `--plain-http` too (browsers take it from `localhost`), and a `__Host-` one is at
+  `Path=/` with no `Domain`. Asking otherwise (`secure: false`, a `domain`, a `path` other
+  than `/` for `__Host-`) is an error: `` a `__Host-` cookie has no domain ``.
+
+  ```quillo
+  route POST /cart/:id { set_cookie("__Host-cart", id, { max_age: "7d" }); "kept" }
+  // Set-Cookie: __Host-cart=...; Path=/; Max-Age=604800; HttpOnly; Secure; SameSite=Lax
+  // set_cookie("theme", "dark", { sameSite: "Strict" }) is an error: write it `same_site`
+  ```
   `Secure` is left out with `--watch` and in desktop apps, which are served
   over plain HTTP on this machine; in production, serve the site over HTTPS (a proxy
   such as limer in front). A browser drops a `Secure` cookie that comes over plain HTTP
@@ -672,8 +709,33 @@ fn touch() {
   an `etag` is a 304 to a `GET` or `HEAD` whose `If-None-Match` holds it, as files are:
   `` respond(200, v, { etag: `"${version}"` }) ``. Header names are written in lower case, and a name or value with a control character (a line break) is
   a runtime error. `content-length`, `transfer-encoding`, `connection` and `date` are
-  the server's, whatever is given. `redirect(url, status)` takes 300 to 399, and no
-  `javascript:` URL.
+  the server's, whatever is given.
+- A header's value is text, or a number. `null` means no such header: none is sent, not
+  even the one Quillo would send itself, as in `site_headers`, so `{ "cache-control": null }`
+  leaves out the `private` a page with a session gets, and `{ server: null }` the
+  `server: Quillo`; a header the route does not name keeps Quillo's. A list is one header
+  per item for `set-cookie` alone (`{ "set-cookie": ["a=1", "b=2"] }` sends two, `[]`
+  none), and is an error for any other header, as a map is (`` `respond` header `x-list`
+  is a str, got list: only `set-cookie` takes a list ``). `stream` and `events` take their
+  `headers` the same way. A response's `.headers` gives `set-cookie` sent several times as
+  a list.
+- `redirect(url, status)` takes 301, 302, 303 (the default), 307 and 308; another status
+  is an error. `Location` is written as a URL holds it: what a URL cannot hold is
+  percent-encoded (`/a b` is `/a%20b`, a `%XX` already there is kept), a non-ASCII host is
+  written as IDNA (`bücher.de` is `xn--bcher-kva.de`), and a host IDNA cannot write, a tab
+  or a line break, is an error. A `\` is read as browsers read it: in `http(s)`, `ws(s)`,
+  `ftp`, `file` and relative URLs it is a `/` before the query, so a check that the URL
+  starts with `https://good.com` holds for `https://good.com\@evil.com/`, which goes to
+  good.com. A path of the site's own, starting with `/`, stays on the site: a `\` among its
+  leading slashes is `%5C` (`/\evil.com` is `/%5Cevil.com`, so a check for `/` and not `//`
+  holds), and its `.` and `..` segments (`%2e` too) are taken out before
+  [`--base`](#options-of-quillo-run) is put in front, so `..` cannot climb out of it.
+  A `javascript:`, `vbscript:` or `data:` location is refused, in any form browsers read
+  (`JavaScript:`, a tab inside), by `redirect` and as a `location` header given to
+  `respond`, `stream`, `events` or `site_headers`.
+- `stream` and `events` refuse a status that has no body (204, 205, 304) and a 1xx, as
+  their function would write one (`` `stream` cannot answer 204: that status has no body
+  ``), and `events` refuses a `type` that is not text, as `stream` does.
 - Every answer carries `server: Quillo` (unless the route sets `server`), `date`,
   `x-request-id` and `x-content-type-options: nosniff`. Every HTML page carries
   `x-frame-options: SAMEORIGIN`, unless the route sets one or a
@@ -693,7 +755,8 @@ fn touch() {
   ```
 - Text answers are gzipped for browsers that accept it: a 200 with a body of 1 KiB or
   more whose type is `text/*` or names `json`, `javascript` or `svg`, with `vary:
-  accept-encoding`. `Accept-Encoding` is read as HTTP says: names in any case, `x-gzip`
+  accept-encoding`, which the plain copy of such an answer, sent to a client that takes
+  no gzip, carries too. `Accept-Encoding` is read as HTTP says: names in any case, `x-gzip`
   as `gzip`, `gzip;q=0` refusing it, and `*` standing for gzip when gzip is not named. Not when the route set `content-encoding`, not streams, not partial
   files (206). There is no brotli.
 - A header cannot be added from a helper: what `respond`, `stream` and `events` are given
@@ -1026,6 +1089,9 @@ route POST /ask with http, env = events((send) => http.stream("https://api.examp
       }
   })
   ```
+- `{ status, headers }` are those of [`respond`](#what-a-route-returns): a status with no
+  body (204, 205, 304) or a 1xx is refused, so no function runs after a head that has no
+  body to send, and a header's `null` is no such header.
 - An HTTP/1.0 client, which reads no chunks, gets a stream with no length, ended by
   closing the connection.
 - The rest of the server carries on meanwhile. A `send` waits only when the client
@@ -1402,16 +1468,20 @@ route GET /report = file("exports/report.pdf")
   `cache` (below), `download`, a name, which sends `Content-Disposition: attachment` with
   that name (written so a name in any script arrives whole), and `type`, the content type
   in place of the one the extension gives: `file("exports/r.csv", { download: "rapport
-  d'été.csv", type: "text/csv; charset=utf-8" })`.
+  d'été.csv", type: "text/csv; charset=utf-8" })`. An empty `type` or `download` is an
+  error that says so, and so is a `type` with a line break or another control character.
 - Each file goes out with an `ETag` (a weak one, from the file's size, time, inode and
   change time) and `Last-Modified`, and as it is on disk: nothing is added to an HTML
-  file, so a range of it is the bytes its `Content-Range` names. A browser asking with a
-  current copy (`If-None-Match`, or an `If-Modified-Since` the file has not changed
-  since, in any of HTTP's three date forms) gets a `304` with no body. `If-Match` that
-  does not name the file's `ETag`, or an `If-Unmodified-Since` it has changed since, gets
-  a `412`, on a `GET` as on a write. A file replaced by one of the same size and
-  modified time (`cp -p`, `touch -t`, a build that sets every file's time) is a new
-  file, in memory and to the browser.
+  file, so a range of it is the bytes its `Content-Range` names. Conditionals are as
+  RFC 9110 has them. A browser asking with a current copy (`If-None-Match`, or an
+  `If-Modified-Since` the file has not changed since, in any of HTTP's three date forms)
+  gets a `304` with no body, to a `GET` or a `HEAD`; another method whose `If-None-Match`
+  matches gets a `412`. `If-Match` that does not name the file's `ETag`, or an
+  `If-Unmodified-Since` it has changed since, gets a `412`, on a `GET` as on a write. The
+  file's own weak tag, with its `W/` or without, passes `If-Match` and `If-Range`, as
+  nginx has it, so a download resumed or a video sought gets its part. A file replaced by
+  one of the same size and modified time (`cp -p`, `touch -t`, a build that sets every
+  file's time) is a new file, in memory and to the browser.
 - The type comes from the extension: `html htm css js mjs json map webmanifest xml xsl
   txt csv svg png jpg jpeg gif webp avif ico mp4 m4v webm mp3 ogg oga wav wasm woff2
   woff ttf otf pdf zip`, and `md` (`text/markdown`), `vtt` (subtitles for `<track>`),
@@ -1427,18 +1497,28 @@ route GET /report = file("exports/report.pdf")
   seconds, or `"10m"`, `"12h"`, `"30d"`, `"1y"`, which allows keeping it that long
   without asking (`immutable`). Use it for files whose name changes with their content.
 - `Range: bytes=…` gets a `206` with only those bytes (audio and video seeking; `If-Range`
-  is honoured); a range past the end gets a `416`, and several ranges at once the whole
-  file.
+  is honoured); the unit is read in any case (`Bytes=0-1`), the numbers are digits only
+  (`bytes=+2-4` is no range, and gets the whole file), an end past the file is the
+  file's end, a range that starts past the end gets a `416`, and several ranges at once
+  the whole file.
 - Files up to 1 MiB are kept in memory (64 MiB in all) and re-read when they change on
-  disk, or are replaced. Larger ones are sent from disk as they are written, on a thread of their own
-  with a 64 KiB buffer, so a video costs no more memory than a page. At most 256 such
+  disk, or are replaced. A file changed in the last moment (50 ms, or 2 s where the file
+  system keeps whole seconds) is read but not kept, as git does, so one being written is
+  never kept half written. A file rewritten in place while it is read is served as it was
+  read (a short range says what it sent), and only one replaced at every try is
+  answered `503` with `Retry-After`; a busy file is never a 404. Larger ones are sent
+  from disk as they are written, on a thread of their own
+  with a 64 KiB buffer, so a video costs no more memory than a page, and read a few at a
+  time, so many cold files at once do not fill the memory. At most 256 such
   sends run at once, 8 for one client (an IPv4 address, or an IPv6 /64 network; past
-  that, a `503` with `Retry-After`). A reader slower than 16 KiB/s is let go after 20
+  that, a `503` with `Retry-After`); a `HEAD`, and a range of 1 MiB or less, take no place
+  among them. A reader slower than 16 KiB/s is let go after 20
   seconds, and any send stops after an hour: a browser or player goes on from there
   with a `Range` request. Behind a proxy every visitor shares the proxy's address and so
   its 8 places; limit clients at the proxy instead. The gzipped copy of a text file up
   to 1 MiB is kept too (32 MiB of them in all), rather than compressed again for each
-  request.
+  request. Its plain copy says `Vary: accept-encoding` as the gzipped one does, so a
+  shared cache keeps both, and a `HEAD` answers as a `GET` would, gzip included.
 - Paths with `..`, or starting at `/`, get a `404`.
 
 A folder of files, as a static host serves it, is `files(folder, path, options)`:
@@ -1451,14 +1531,40 @@ route GET /docs/*p = files("manual", p, { index: "home.htm", extensions: ["htm"]
 - `/` and `/docs/` are their folder's `index.html`, `/about` finds `about.html`, and a
   folder named without its `/` (`/docs`) is redirected to it (301), so its pages'
   relative links work (`//docs` goes to `/docs/`, never to another host). A miss is the folder's `404.html`, sent with status 404, when it
-  has one; else the plain 404.
+  has one; else the plain 404. The page of a miss is `no-cache`, with `cache` or without
+  (a file asked for before it was deployed is not missing in caches for a year), and is
+  sent whole whatever `Range` or conditional the request had. A route's URLs are the
+  program's: `files()` serves what it is asked for, `/build/a.txt/` as `a.txt`, so a
+  site whose URLs end in `/` keeps them.
 - Files whose names start with a dot (`.env`, `.git/`) are not served, but `.well-known/`
   is; nor are the program's own (`.qwe`, `.qwer`, `.rs`), however the name is written for
   the file system: `lib.QWE` on macOS and Windows, `lib.qwe.` and `lib.qwe::$DATA` on
-  Windows *(since 0.7)*. Each file goes as `file()`
+  Windows *(since 0.7)*, and a Windows short name (`ENV~1`) is refused. Each file goes as `file()`
   sends it, its `ETag`, ranges and type included. A path that leads out of the program's
   folder through a link is a miss, whether what it leads to is there or not (see [Paths
   and links](#paths-and-links)). `files` and `file` need the `fs` effect.
+- A file is judged by where it leads, not by the name asked for: the index, extension and
+  `404.html` pages too. A link inside the folder to an ordinary file in it is served; a
+  link to `.env` or `main.qwe` under a harmless name (`settings.txt -> ../.env`) is not.
+  Links inside the served folder are followed only through the dot folders a build or a
+  package manager makes: `.pnpm`, `.vitepress/dist`, `.output/public`, `.next/static`,
+  `.svelte-kit/output/client`, `.nuxt/dist/client`, `.vercel/output/static`, `.well-known`
+  at the top, and `.pnpm`, `.deno`, `.bun` and `.store` directly under `node_modules`.
+  Other dot folders (`.git`, `.ssh`, `.quillo`, `.vscode`, `.docker`, `.config`, `.cache`
+  and the tools' server parts) stay refused.
+- The program's own files are known by their device and inode as well as by name: the
+  `.env` and `.env.*` (a service's too), the [`--env-file`](#options-of-quillo-run) and
+  [`--tls-key`](#options-of-quillo-run) (kept by the path given, so a key renewed through
+  a link, as certbot does, stays refused), the `.qwe`, `.qwer` and `.rs` files loaded, and
+  the databases open. So a hard link to one, or one saved anew, is refused too.
+- No SQLite database is served by `files()` or `quillo serve`, whatever its name:
+  each is known by its content (the header, a `-wal`, `-shm` or `-journal` beside it), the
+  program's, a tenant's, another program's, or one no one has open. `file("backup.db")`
+  sends one named on purpose, with ranges.
+- Only regular files are served (not a FIFO, a device or a folder), and the file sent is
+  the one judged: a file swapped for a link to a protected one between the look and the
+  open is a miss, and one saved anew is served as it is now. A file kept back is the
+  miss a file not there is, with the folder's `404.html`.
 - The options: `index` (a file name, `index.html` unless given), `extensions` (those a
   clean URL may leave out, `["html"]` unless given), `not_found` (the page for a miss,
   `404.html` unless given; `null` for none) and `cache`, as `file()`'s. Another option is
@@ -1466,7 +1572,9 @@ route GET /docs/*p = files("manual", p, { index: "home.htm", extensions: ["htm"]
 
 `quillo serve site` serves a folder that way with no program at all: `index.html`, clean
 URLs and `404.html`, on [`--port`](#options-of-quillo-run) (8080 unless given: `quillo serve site --port 3000`) and with
-the other [options of `run`](#options-of-quillo-run).
+the other [options of `run`](#options-of-quillo-run), read as `run` reads them. Its URLs are
+its own, so a file asked for with a `/` after it (`/a.txt/`, `/about/`) is moved to its path
+without one (301, `cache-control: max-age=3600`), only when it would be served there.
 A Markdown file goes out as `text/markdown`; to show one as a page,
 `markdown_page(read_file("notes.md"))` gives a whole page (a doctype, a `<head>` with
 `<title>`, the first `#` heading unless `title` is given, and `lang` and `html` as

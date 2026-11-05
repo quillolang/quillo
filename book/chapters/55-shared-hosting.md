@@ -164,6 +164,14 @@ names = ["QUILLO_SECRET", "DATABASE_URL"]
 workers = 8
 ```
 
+A limit takes what its option takes: `workers = 0` is refused (`` p.toml:2: `workers` is
+a positive number, as `--workers` takes ``), and so is a `max_body` or `max_compute` of
+0. The start line lists the limits that hold the program: `quillo: policy
+quillo.policy (workers 8)`. A request the policy's `max_compute` ends is a 500, as one
+`--max-compute` ends, and the log names whichever is the tighter (`this request
+computed for longer than the policy p.toml allows (max_compute)`); a page is told `the
+server's policy`, with no path of the server's.
+
 `quillo check --policy policy.toml main.qwe`, run before uploading, says what the
 program would be refused. The sections and what each does are in [The
 policy](#the-policy).

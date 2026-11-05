@@ -2,12 +2,235 @@
 
 ## Unreleased
 
+The fixes of FEEDBACK55.md's sweep, so far: what a program writes into markup, the files
+`files()` serves, HTTP's answers and cookies, highlighting and Markdown, the three
+databases, components' fields, and the command line: Q-700 to Q-771, Q-773 and Q-834 to
+Q-852. The rest of the report (Q-772, Q-774 to Q-833) is still to come.
+
+### What to change in your code
+
+Databases (each driver hides its database's quirks, so a value means the same on all three;
+the user's decision, Q-736):
+
+- **NaN and the infinities are refused as values** on every database, naming them (`value 1
+  is NaN, which cannot be stored`): SQLite stored NaN as null, PostgreSQL kept them. **`-0.0`
+  is stored and read as `0.0`** everywhere (Q-735).
+- **`last_id` is the one inserted row's id, else `null`**: after an insert of several rows
+  (SQLite gave the last, MySQL the first), an upsert that updated, an `update` (SQLite gave an
+  old one) or a read. It is `null` on PostgreSQL as before: `returning id` there (Q-753).
+- **`changes` is the rows matched on MySQL too**, as on SQLite and PostgreSQL: an `update`
+  that sets the value a row has counts it, and an upsert's or a `replace`'s row counts once
+  (`?client_found_rows=false` gives MySQL's own count). `changes` is 0 for a read and a
+  schema statement, and a script's last statement's (Q-739, Q-753).
+- **SQL with no statement (`""`, spaces, a comment) is an error value**, from `db.exec`,
+  `db.query` and `db.one` (Q-753).
+- **An error value given as a parameter is given back**, not stored as its JSON text, and a
+  function is refused (Q-727). **Placeholders given no values are refused** on SQLite, which
+  stored nulls (Q-729). **A map given to SQL with no named placeholder is no value**, and a
+  map for a lone `?` is that value, on all three (Q-747, Q-748).
+- **On MySQL, `@name` with a map holding `name` is refused**: it is the session's variable
+  (null); write `:name`. SQLite's `@name`, `$name` and `#name` take the map's plain `name`
+  (Q-752).
+- **MySQL and MariaDB: a statement that commits by itself (`truncate`, `create table`,
+  `alter`, ...) is refused inside `db.transaction` and `db.exec_many`**, and one that could
+  not be seen beforehand ends the transaction with an error naming it, where everything
+  before it was committed (Q-728, the user's decision: MySQL only). Migrations take them as
+  before.
+- **MySQL and MariaDB: `db.open` of a database that is not there is an error**, as on
+  PostgreSQL; it made an empty one. A tenant's is still made, by the driver (Q-736).
+- **MySQL and MariaDB values:** `BIT(n)` reads as its digits (`"00000101"`) and takes them
+  back (Q-741); ids and unsigned values past 2^63 are decimals, not negative or floats
+  (Q-740, Q-756); `tinyint(1)` is a bool only for 0 and 1 (Q-756); `FLOAT` reads as the
+  shortest float that prints the same, and a value it would keep as 0 is refused (Q-744,
+  Q-734); a statement past `max_allowed_packet` is refused saying so (Q-751); `||` joins
+  text on MariaDB, in migrations and scripts too, where it was `or`.
+- **PostgreSQL values:** whole numbers in JSON past an int are decimals, and a JSON value that
+  cannot be read is an error in its own cell, not a failed query (Q-732); a str written as a
+  `json`/`jsonb` column's value is the JSON it holds, so `json.stringify(m)` stores an object
+  (Q-733); a float past `real`'s or `double precision`'s range is refused (Q-734); `real`
+  reads as the shortest float (`0.1`) (Q-744); BC dates read as ISO 8601 (`-0043-03-15`) and
+  go back in (Q-743); a type with no reader is hex in every row, and `timetz`, `pg_lsn`,
+  `xid`, `xid8` read as PostgreSQL writes them (Q-742); `bit(n)` keeps its length (Q-730); an
+  array not starting at 1 comes back as its text, keeping its bounds (Q-756); a value with no
+  type in the SQL is declared `int4`, `int8` or `float8`, so `select ? as v` with 5 is `5`,
+  not `"5"`, and `greatest(10, 9)` is 10 (Q-731).
+- **PostgreSQL: `set_config(..., false)` is refused outside a transaction in every form**
+  (with values, inside `values (...)`, in an `update`, any case or quoting), and so are
+  `pg_temp` tables; `do` blocks and calls of the database's own functions run on a connection
+  of their own, reset after; every transaction's connection is reset as it ends (Q-708).
+- **`db.transaction` refuses an option it does not have**, at run time and in `quillo check`
+  (`` has no option `isolaton` (did you mean `isolation`?) ``); a misspelt key ran with none
+  (Q-738).
+- **The guide's column-list update, `` set (${sql_name(cols)}) = (${sql_param(cols)}) ``,
+  fails on MySQL and on PostgreSQL with one column**: write the pairs, `a = :a, b = :b`,
+  built from the columns (the guide shows how) (Q-754).
+
+Files and HTTP:
+
+- **`files()` and `quillo serve` serve no SQLite database, whatever its name** (by its
+  header, `-wal`, `-shm` or `-journal`): the program's, a tenant's, another's. `file("x.db")`
+  serves one on purpose, with ranges (Q-702, the user's decision).
+- **A link inside `files()`' folder is followed only through build-output and package-store
+  dot folders** (`.pnpm`, `.vitepress/dist`, `.output/public`, `.next/static`,
+  `.svelte-kit/output/client`, `.nuxt/dist/client`, `.vercel/output/static`, `.well-known`,
+  and `node_modules`' `.pnpm`, `.deno`, `.bun`, `.store`); a file is judged by where it leads,
+  and the program's own files (`.env`, `--env-file`, `--tls-key`, loaded sources, open
+  databases) by device and inode too, so a hard link to one is a miss (Q-701).
+- **`write_file`, `save_upload`, `delete_file` and `image.convert` refuse the program's own
+  files in any case and Unicode form, and as Windows reads names**, on every system (`.ENV`
+  was written, then read as the settings) (Q-704); **`delete_file` refuses a folder that holds
+  an open database** (Q-705); **`check_program` reads only `.qwe` files** (and `.qwer`/`.rs`
+  signatures), no dot paths, and its messages show no file's text (Q-703).
+- **A header's `null` in `respond`, `stream` and `events` is no such header**, Quillo's own
+  default included (`{ "cache-control": null }` drops a session page's `private`, `{ server:
+  null }` the `server` header); it was sent as the text `null`. A list is one header per item
+  for `set-cookie` only, and an error for another header, as a map is (Q-710).
+- **`stream` and `events` refuse 204, 205, 304 and 1xx**, which corrupted the next answer on
+  the connection (Q-709).
+- **`redirect` takes 301, 302, 303, 307 and 308** (it took 300 to 399, 304 too), and writes
+  `Location` percent-encoded, a non-ASCII host as IDNA, a `\` as browsers read it, a site
+  path's `\` among its leading slashes as `%5C` and its dot segments taken out before
+  `--base`; `javascript:`, `vbscript:` and `data:` locations are refused in `redirect`,
+  `respond`, `stream`, `events` and `site_headers` (Q-719).
+- **`set_cookie` refuses an option it does not take** (it ignored them), naming the
+  snake_case one for `sameSite`, `maxAge`, `Max-Age`, `httpOnly`, also in `quillo check`;
+  `delete_cookie` takes `path`, `domain`, `http_only`, `secure`, `same_site`, and `max_age` 0
+  only (Q-712). **`__Host-` and `__Secure-` cookies keep their prefix's rules**, `Secure`
+  under `--watch` too, and asking otherwise is an error (Q-713). **A cookie replaces another
+  only at the same name, path and domain** (Q-714). **A cookie over 3,900 bytes as sent is
+  refused** (Q-726).
+- **The `Cookie` header keeps the first cookie of a name** (the browser's longer path),
+  trimmed, one pair of quotes taken off; it kept the last (Q-718).
+- **A multipart body of more than 1,000 parts is a 413**; those past the 1,000th were dropped
+  with a 200 (Q-716).
+- **A non-GET request whose `If-None-Match` matches a file is a 412**, not a 304, and a range
+  unit is read in any case, its numbers digits only (Q-723).
+- **`quillo serve` moves a file asked for with a `/` after it to its path** (301,
+  `max-age=3600`); `files()` in a route serves what it is asked, as before (Q-721, the
+  user's decision).
+- **`/_quillo/markdown` takes at most 1 MB** (413), and `highlight`, `markdown` and
+  `markdown_page` end at `--max-compute` as a loop does (Q-706).
+
+Markup and components:
+
+- **A spread never writes `data-qi`, `data-qd`, `data-qt`, `data-c`, `data-p`, `data-s`,
+  `data-l`, `data-v`, `data-e`, `data-q-*` or `data-quillo-*`**, in any case: they are left
+  out. Written out, `data-qi`, `data-qd`, `data-qt` and `<quillo-island>` are errors
+  (Q-700).
+- **In production the browser hides a builtin's error as the server does** (text,
+  templates, markup, attributes, `json.stringify`: `internal error`), and so do attribute JSON
+  on the server and channel messages (Q-773).
+- **`<select value={x}>` is written as `selected` on the option `x` names**, not as a
+  `value` attribute on the select; `<select multiple value={list}>` marks each (Q-758, Q-761).
+- **A text input or select bound to a number state gives a number** when the text is that
+  number's own form (`"02"` stays text), `null` when empty; it gave text (Q-760). Blank text
+  in a number field is `null` (Q-757).
+- **An assignment alone in a component's body runs once**, as before, and `quillo check` now
+  warns when it reads a prop or another state: write `let` (Q-764).
+- **`highlight` of a language it does not know is only escaped**, with no colours (Q-834).
+
+The command line:
+
+- **A `.env` that cannot be read, is not UTF-8 or is a link to nothing stops the start**
+  (exit 2), saying where and the ways out; it was skipped without a word. A service's own
+  likewise (Q-835). **`KEY= # note` is `""`** (Q-838); **an unclosed quote skips its line
+  only** (Q-839); **a NUL in a value skips the line** (Q-840).
+- **A policy's limits of 0 are refused**, as the options refuse them: `max_body = 0` answered
+  every POST 413 (Q-849).
+- **`--tls-cert` and `--tls-key`: the last given wins, and they must be a pair** (Q-852).
+- **An option before the command is an error that says where the command goes**:
+  `quillo --watch main.qwe` is told `` put the command first: `quillo run --watch main.qwe` ``
+  (Q-851).
+- **The REPL fed from a pipe skips a line that is not UTF-8 and exits 1**; it stopped there
+  with 0 (Q-848).
+
 ### Fixed
 
 - `--watch` and `--reload` load a file saved right after the server starts. The watcher read
   the files' times when its own thread first ran, so a save made before then was taken for
   the program as it was and never loaded; it now reads them before the server says it is
   listening (found by CI in `no_check_reloads_what_loads`).
+
+From FEEDBACK55.md:
+
+- **Markup (Q-700, Q-707, Q-711, Q-773):** visitor JSON spread on an element cannot make it a
+  component, and a component whose root is a table's part keeps only the server's island
+  attributes, which an update cannot set; a `css` template's `&` is `\26 `, so `<svg><style>`
+  and `<math><style>` gain no rule; `highlight` in the browser takes `"constructor"` and
+  `"__proto__"` as unknown languages; the debugger's bundle hides errors as the server does.
+- **`files()` (Q-701, Q-702):** the file opened is the file judged (regular files only, its
+  real path from the system, a file swapped for a link a miss); `--tls-key` and every `.env`
+  stay refused after a renewal through a link or a save; on Windows `~1` short names are
+  refused. Small files are judged and kept off the interpreter lock, so a 304 costs what it
+  did before (342k in 4 s on a 42 KB css); a large one's judgement is kept by its identity, so
+  its 304 is a stat (58.6 to 11.1 µs). A file changed in the last 50 ms is not kept (git's
+  racily-clean rule), one dated ahead of the clock is; a file rewritten in place is served as
+  read, and only one replaced at every try answers 503 with `Retry-After`, never a 404. Files
+  over 64 KiB are read a few at a time on the async runtime, holding no thread or lock:
+  128 cold 1 MiB files peak at 110 MB, not 465.
+- **HTTP (Q-715, Q-717, Q-720, Q-722 to Q-725):** `files()`' 404 page is `no-cache`, and sent
+  whole whatever the request's ranges and conditionals; a form's content type is read in any
+  case; filenames with `\"` (Go, curl) and RFC 5987's `filename*` are read; a range's end
+  past the file is clamped, and the file's own weak tag passes `If-Range` and `If-Match`, as
+  nginx has it, so resumes and seeks get 206; the plain copy of a compressible answer carries
+  `Vary: accept-encoding`; a HEAD, or a range of 1 MiB or less, takes no place among the
+  large sends, and a small HEAD answers as GET would, gzip included; `file()`'s type errors
+  say what is wrong; a page with `{ etag: null }` keeps its component bundle and scripts; an
+  app's cookie jar keeps cookies by name, path and domain, one with no `Path` at the
+  request's folder, and an app goes only to `http(s)` or its own pages.
+- **Highlighting and Markdown (Q-706, Q-834):** the highlighter reads each line once on both
+  sides (64,000 `/*` took 5.88 s, now about 2 ms); Markdown is pulldown-cmark 0.13 (0.12 was
+  quadratic on mixed emphasis: a megabyte of `*a_` took 17 s, now 0.03 s). Python's
+  triple-quoted and Rust's strings run over lines, Rust's raw strings have no escapes, Rust
+  characters such as `'"'` are strings and lifetimes are not, a JavaScript regex is one token,
+  a shell's `it's` and a `#` inside a word start nothing, a range's `..` ends its number; a
+  fence's language is its first word to a space or comma (`rust,ignore`); words are Unicode
+  letters and digits on both sides; `str(highlight(...))` in the browser is the markup.
+- **Databases (Q-708, Q-727 to Q-756):** one SQL tokenizer per dialect (`src/sql.rs`) is read
+  by every part that reads SQL: function, procedure and trigger bodies, `do $$` and `begin
+  atomic` are one statement, not a transaction begun by hand (Q-746); PostgreSQL's `?||`,
+  `@?`, `?1`, `[:name]` and nested comments, and MySQL's `/*! */` and MariaDB's `/*M! */`, are
+  read as the servers read them (Q-749); `?schema=` keeps `?options=` (Q-737); a kept
+  statement whose table changed is prepared again, once, on every connection (Q-745); a
+  replica gets only pure reads, and its read-only refusal goes to the primary without taking
+  it out of use (Q-750); MySQL hosts may be IPv6 addresses (Q-756); a `jsonb[]` takes lists
+  (Q-756); `quillo check` gives no list warning for PostgreSQL arrays (Q-755); SQLite's own
+  `last_insert_rowid()` is untouched, and `db.exec` of a statement returning rows runs.
+- **Components (Q-757 to Q-771):** a number field keeps `1.0`, `2.50` and `1e3` as typed; a
+  select shows the option its value names once its options are in, and keeps a person's
+  pick unless options are added or taken away; a range's value is set again when its limits
+  change; rows chosen by `? :`, `if` or `match` with a key on each branch are keyed; a
+  component that has left keeps the props it last read; inside `<svg>` a component's
+  one-element root is its own island, on both sides; focus and selection come back when a
+  keyed row moves without `moveBefore` (Safari); `e.form` names the button that sent it; a
+  form reset brings back browser-made fields' first values; `<template>` keeps its content;
+  a child that sets its parent's state as it starts has the server render the parent once
+  more, so the page shows one value; `autofocus` on markup made later is focused.
+- **The command line, the policy and the language server (Q-836, Q-837, Q-841 to Q-852):**
+  `--watch` started or reloaded while a file is broken or missing watches every file that
+  load named and the folders of those not there; errors are said once, and "1 route";
+  `--reload` works with `--instances` and passes to `--split`'s services; `--split --port 0`
+  tells the services the app's real port; `quillo fix` keeps a byte-order mark first and the
+  file's CRLF; `quillo install` refuses an option as a value; `quillo serve` reads its
+  options as `run` does; `quillo new` builds inside an empty folder whose parent it cannot
+  write; `-h` and `--help` are read first for every command, on stdout; suggestions name every
+  command; `quillo help` lists `--env-file`; `classes` and `build` say where a file is not
+  UTF-8; a policy file's byte-order mark is skipped, its limits are listed at the start, and
+  a request it ends names it in the log (`the policy p.toml allows (max_compute)`) and "the
+  server's policy" to pages; the language server gives diagnostics to projects opened through
+  links, reads headers in any case, and answers -32002, -32600 and -32700 as the protocol
+  asks.
+
+### Changed
+
+- Markdown is rendered by pulldown-cmark 0.13; the 545 Markdown files of the projects render
+  byte for byte as before (Q-706).
+- Speed: highlighting ordinary code is as fast or faster (6 KB: Quillo 36 µs, Rust 56, JS 47,
+  Python 40); databases within noise of before and ahead of Python on all three (SQLite 100k
+  inserts in 0.96 of Python's time); rendering 200 bound selects 1-3% slower on the server
+  (the `selected` marks); runtime.js 1.3 KB larger gzipped.
+- Tests: a server a test starts takes a port the system picks (`--port 0`) and reads it from
+  its "listening on" line, so another process cannot take it between the pick and the bind.
 
 ## 0.7.0 (2026-11-05)
 

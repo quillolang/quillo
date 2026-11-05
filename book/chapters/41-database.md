@@ -40,7 +40,7 @@ Three functions do the work:
 |---|---|
 | `db.query(sql, ...values)` | every row, as a list of maps |
 | `db.one(sql, ...values)` | the first row as a map, or `null` |
-| `db.exec(sql, ...values)` | `{ changes, last_id }` for statements that return no rows |
+| `db.exec(sql, ...values)` | `{ changes, last_id }` for statements that change the database |
 
 ```quillo
 db.exec("create table if not exists todos (
@@ -58,22 +58,43 @@ let missing = db.one("select * from todos where id = ?", 999)               // n
 Values are given after the SQL, one for each `?`, or as a map for `:name`
 placeholders. PostgreSQL also takes its own `$1`, `$2`. Every `:name` needs a value, but
 keys the SQL does not use are ignored, so one map can serve a query put together from
-optional parts. Rows are maps from column
-names to values, so `todo.text` reads a column, and a list of rows goes straight into
-`for` in a page or out as JSON.
+optional parts; given to SQL with no names it is no value, and given for a lone `?` it
+is that value, stored as JSON. Placeholders given no values are an error. SQLite also
+reads `@name`, `$name` and `#name`, and `?1` as the first value; on MySQL `@name` is a
+variable of the session, so a map with that name is refused: write `:name`. Rows are
+maps from column names to values, so `todo.text` reads a column, and a list of rows
+goes straight into `for` in a page or out as JSON.
 
-Four things that surprise people:
+`changes` and `last_id` mean the same on every database. `changes` is the rows the
+statement matched: an `update` that sets a value a row already has counts that row
+(MySQL's own count, of rows changed, is `?client_found_rows=false` in its URL), an
+upsert's or a `replace`'s row counts once, and a read or a schema statement counts 0.
+`last_id` is the id of the one row an `insert` made, on SQLite and MySQL, and `null`
+after anything else: an `insert` of several rows, an upsert that updated, an `update`.
+PostgreSQL has no such id, so it is always `null` there: write `insert ... returning id`
+with `db.one`.
+
+Five things that surprise people:
 
 - **A row is a map**, so two columns with one name (`select a.id, b.id`) leave only the
   last: name them apart with `as`.
 - **`db.exec` with values runs one statement.** On SQLite, what follows the first `;` is
-  ignored; without values, the whole text runs (a seed file). On SQLite, a statement
-  that gives rows (`insert ... returning id`) goes to `db.one`, not `db.exec`.
+  ignored; without values, the whole text runs (a seed file), split where the database
+  would split it, so a trigger's or function's body (`begin ... end`, `$$ ... $$`) is
+  one statement. A statement that gives rows (`insert ... returning id`) runs in
+  `db.exec` too; its rows are `db.one`'s and `db.query`'s.
 - **`db.query` gives every row at once**, in memory: page through large tables with
   `limit` and the last row's key.
 - **Values are separate arguments**, `db.exec(sql, a, b)`, not a list as Python's
   `sqlite3` takes them: `db.exec("insert ... values (?)", [x])` stores the list as its
-  JSON text. `quillo check` says so when the SQL is written out.
+  JSON text. `quillo check` says so when the SQL is written out, but not where a list is
+  PostgreSQL's array: a `?` in `any(...)` or `all(...)`, or cast to an array type
+  (`?::int[]`).
+- **A value is what it is on every database.** NaN and the infinities are refused,
+  naming them, since SQLite keeps NaN as null and MySQL refuses both; `-0.0` is stored
+  and read as `0.0`. An error value given as a value is not stored but given back as the
+  error it was, so `int("4O")` never becomes a row. SQL with no statement in it (`""`,
+  only comments) is an error value.
 
 A query that fails (a syntax error, a constraint, the server unreachable) is an error
 value with the database's message:
@@ -166,6 +187,14 @@ fn transfer(from: int, to: int, amount: int) -> map with db =
   replies early. Otherwise it commits, and gives what the function gave.
 - Transactions nest, as savepoints: one inside another that fails undoes only its own
   part, and the outer one goes on.
+- `db.transaction({ isolation, retries }, f)` takes those two options; another is an
+  error, when it runs and in `quillo check` (`` `db.transaction` has no option
+  `isolaton` (did you mean `isolation`?) ``).
+- On MySQL and MariaDB a statement that commits by itself (`truncate`, `create table`,
+  `alter`, `drop`) is refused inside a transaction and in `db.exec_many`, before it
+  runs, so what ran before it can still be rolled back: run it before or after.
+  PostgreSQL and SQLite roll their schema statements back, and take them in a
+  transaction.
 - On PostgreSQL and MySQL a transaction keeps one connection until it ends, so other
   requests never see its changes early. On SQLite, `sleep` and `http` calls inside a
   transaction hold up other requests rather than let them write into it.
@@ -200,8 +229,9 @@ db.migrate()
   new file to change the schema again.
 - Servers that start together take turns (an advisory lock on PostgreSQL, a named lock
   on MySQL, an immediate transaction on SQLite), so each file still runs once.
-- MySQL commits a schema change at once, inside a transaction or not: a file that fails
-  part way keeps what it did before the failure. Put one change in each file.
+- MySQL commits a schema change at once, so a file that fails part way keeps what it did
+  before the failure (a migration may hold one, which `db.transaction` refuses). Put one
+  change in each file.
 
 ## Live data {#database-live-data}
 
@@ -297,7 +327,11 @@ A PostgreSQL or MySQL database's replicas can take its reads:
 db.open(env("DATABASE_URL"), { replicas: [env("REPLICA_1"), env("REPLICA_2")] }) | unwrap
 ```
 
-- Reads (`select`, and `with` that writes nothing) go to the replicas in turn.
+- Reads (`select`, and `with` that writes nothing) go to the replicas in turn. Only pure
+  reads do: a `select` that calls a function that may write (`nextval`, `setval`, or one
+  made in the database with `create function`) goes to the primary; built-in functions
+  that only compute (`lower`) do not. A replica's read-only refusal sends that
+  statement to the primary without taking the replica out of use.
 - Writes, reads that lock (`for update`, `for share`), everything in a transaction, and
   every read a request makes after it wrote go to the primary: a request always reads
   what it wrote.
@@ -459,14 +493,30 @@ wait, writers take turns, for up to 5 seconds before a write fails as a conflict
 ### PostgreSQL
 
 - Placeholders: `?`, `:name` with a map, or `$1`. The first two are translated, skipping
-  quotes, comments and `$$` strings.
+  quotes (`U&"..."` names too), comments (nested, as the server reads them) and `$$`
+  strings; `?|`, `?&` and `@?` are operators.
 - Values convert both ways: numbers, text, booleans, `json` and `jsonb` as maps and
   lists, arrays as lists, `numeric` as [decimals](#money) with their scale (an int
   when it has none), `money` as a decimal with its `lc_monetary` currency's decimals (no
-  currency comes with it: `numeric(p, s)` and a currency column say more); `uuid`, `date`, `timestamptz` (ISO 8601, in UTC), `timestamp` (as
-  stored, no zone) and `interval` (PostgreSQL's own text) as text. Other parameters are
-  sent as text for PostgreSQL to convert; columns of types it does not decode (`inet`,
-  ranges, composites) are cast to text in the query: `ip::text`.
+  currency comes with it: `numeric(p, s)` and a currency column say more), `xid` and
+  `xid8` as ints, `bit(n)` and `varbit` as their digits (`"00000101"`, kept at their
+  length); `inet`, `cidr`, `macaddr`, `uuid`, `date`, `time`, `timetz`, `timestamptz`
+  (ISO 8601, in UTC), `timestamp` (as stored, no zone), `interval` (PostgreSQL's own
+  text) and `pg_lsn` as text. A BC date is ISO 8601's, `-0043-03-15` for 44 BC, and a
+  `real` reads as the shortest float that prints the same (`0.1`). A type with no reader
+  of its own (ranges, `hstore`, composites, `tsvector`) is its bytes in hex (`\x...`):
+  cast it in the query (`r::text`). An array whose lower bound is not 1
+  (`'[0:2]={1,2,3}'`) comes back as its text.
+- JSON is read cell by cell: a whole number past an int is a decimal, past a decimal a
+  float, so two large ids stay two; a value that cannot be read is an error value in
+  its own cell, and the other cells read. A text given as a `json` or `jsonb` column's
+  value is the JSON it holds, as MySQL's JSON column takes it: `json.stringify(m)`
+  stores an object, not a string.
+- Parameters are typed by the column, and those of other types are sent as text for
+  PostgreSQL to convert. A float past `real`'s or `double precision`'s range is
+  refused, and a value where nothing in the SQL says its type (`select greatest(?, ?)`)
+  is sent as an `int8`, a `float8` or text, by what it is, so `greatest(10, 9)` is `10`
+  as on the others.
 - `last_id` is `null`: use `insert ... returning id` with `db.one`. `db.one` fetches the
   whole answer and keeps the first row, so write `limit 1`.
 - Connections come from a pool, 8 unless the URL says `?pool_size=N`, and queries outside
@@ -480,11 +530,21 @@ wait, writers take turns, for up to 5 seconds before a write fails as a conflict
 ### MySQL and MariaDB
 
 - Placeholders: `?`, or `:name` with a map (translated, skipping quotes, backticks and
-  comments).
-- Values convert both ways: numbers, text, `tinyint(1)` as booleans, `decimal` as
-  decimals, MySQL's `json` as maps and lists (MariaDB's JSON is text: `json.parse` it),
-  dates and times as text (`2026-10-27 14:30:00`). `last_id` is the new row's
-  `auto_increment` id, or `0`.
+  comments; `/*! */` and MariaDB's `/*M! */`, which the server runs, are read as SQL).
+- Values convert both ways: numbers, text, `tinyint(1)` as booleans when it holds 0 or 1
+  (another value is an int), `decimal` as decimals, MySQL's `json` as maps and lists
+  (MariaDB's JSON is text: `json.parse` it), `BIT(n)` as its digits (`"00000101"`),
+  which it takes back, dates and times as text (`2026-10-27 14:30:00`). An unsigned
+  value or an id past 2^63 is a decimal (`9223372036854775808m`), and a `FLOAT` reads
+  as the shortest float that prints the same. `last_id` is the new row's
+  `auto_increment` id when one row was inserted, else `null`.
+- `db.open` of a database that is not there is an error (`Unknown database 'shop'`), as
+  on PostgreSQL, so a typo in a URL makes no empty database; a tenant's is made by the
+  driver. A host may be an IPv6 address, `mysql://app@[::1]:3306/app`.
+- A `||` joins text, as on the other two: on MariaDB, whose `||` is `or` by default, the
+  driver sets `PIPES_AS_CONCAT` for SQL that has one, migrations and scripts too.
+- A statement larger than the server's `max_allowed_packet`, its values included, is
+  refused, saying so and how big it is.
 - Connections come from the driver's pool, and a query lets other requests run while it
   waits. `pool_size` is PostgreSQL's: in a MySQL URL it stops the database from opening.
 - TLS is required for a server on another machine, as for PostgreSQL; `?ssl_ca=` names a
@@ -528,7 +588,8 @@ Functions without `with` may do anything.
 - **An ORM or a query builder.** SQL with parameters; [records](#records)
   check the shape of what comes back.
 - **Bytes.** There is no bytes value: a BLOB comes back as text, `bytea` as hex. Keep
-  files on disk, or base64 text.
+  files on disk, or base64 text. `files()` and `quillo serve` never send a SQLite file,
+  whatever its name; `file("app.db")` sends one on purpose.
 - **Streaming, `COPY`, `LISTEN`/`NOTIFY`.** Page with `limit`; insert many rows with
   `values (?, ?), (?, ?)`; use `publish` for notifications.
 - **Per-query time limits, read-only connections, encryption at rest.** These are the

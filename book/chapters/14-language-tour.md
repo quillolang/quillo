@@ -415,6 +415,12 @@ wherever they were made.
 
 In a page under `--watch`, the browser's console says the same, from the error's stack:
 the `.qwe` file and line, and the calls. In production it says the message alone.
+The browser hides a builtin's error in production as the server does (see [What a route
+returns](#what-a-route-returns)): shown as text, in a template, in markup or an attribute,
+or written by `json.stringify`, it is `internal error`, so a component made again in the
+browser shows no more than the server's page did; so are a builtin's errors in attribute
+JSON and in channel messages. Errors the program wrote, a `server fn`'s errors (which the
+server has judged already) and the page's own JavaScript's are shown as they are.
 
 ## Effects
 
@@ -537,6 +543,15 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   from both are kept. On a view or component, spread
   keys that are not parameters are ignored, so data with extra fields can be passed
   straight through; a misspelled attribute written out is still an error.
+  A spread never writes an attribute Quillo's runtime or loader reads: `data-qi`,
+  `data-qd`, `data-qt`, `data-c`, `data-p`, `data-s`, `data-l`, `data-v`, `data-e`, and
+  names starting `data-q-` or `data-quillo-`, in any case, are left out, on the server and
+  in the browser, so a visitor's JSON spread on an element cannot make it a component of
+  the visitor's choosing. The marks of an island are the server's alone: `data-qi`,
+  `data-qd` and `data-qt` written out, and a `<quillo-island>` tag, are errors when the
+  program loads and in `quillo check` (`` `data-qi` in <div> is Quillo's own attribute ``).
+  The other names written out are the program's, but on a component whose root is its own
+  island (a table's row, below), where the island's attributes are the server's.
 - Attributes: `"text"` (plain, as in JSX) or `{expr}`, for example
   ``href={`/todos/${id}`}``. `"text"` is plain as HTML's is: a backslash is a backslash
   (`title="C:\new"`, `pattern="\d{3}"`) and entities are decoded (`href="?a=1&amp;b=2"`)
@@ -595,7 +610,9 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   Write it as `` css`...` ``: a template string (braces are plain text, `${...}` fills in
   values) that editors highlight as CSS. Each `${...}` is a CSS value: its `{`, `}`, `;`
   and `\` are written as CSS's escapes, so `` css`p { color: ${c} }` `` with
-  `c = "red} input[value^=a]{background:url(//evil)}"` adds no rule *(since 0.7)*.
+  `c = "red} input[value^=a]{background:url(//evil)}"` adds no rule *(since 0.7)*, and
+  so is its `&`, as `\26 `, since inside `<svg>` and `<math>` a browser reads a
+  `<style>`'s `&#125` as a `}`.
   `` sql`...` `` does the same for queries.
 - A component's or view's own CSS is `style` at the start of its body, before its markup
   (from the start, with what the page is sent: [Styling a component](#styling-a-component)):
@@ -711,8 +728,9 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   in the browser, which runs it) takes only text written in the program. Script built
   as text outside a `<script>` element (`raw("<script>" + ... )`) is not looked at.
 - `raw(s)` marks trusted HTML. HTML a visitor wrote, even cleaned by a sanitizer, must not
-  keep the attributes Quillo's islands are made of: `data-qi`, `data-c`, `data-p`, `data-s`,
-  `data-l` and `data-v`, nor `<quillo-island>` elements. The page takes such an element up
+  keep the attributes Quillo's islands are made of: `data-qi`, `data-qd`, `data-qt`,
+  `data-c`, `data-p`, `data-s`, `data-l`, `data-v` and `data-e`, nor `<quillo-island>`
+  elements. The page takes such an element up
   as one of its components, with the props and state it says, and a `children` text in its
   `data-p` as HTML (FEEDBACK51.md, Q-667). DOMPurify keeps `data-*` unless told not to
   (`ALLOW_DATA_ATTR: false`).
@@ -746,7 +764,9 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
 HTML pasted into a literal mostly stays as it is: entities, bare attributes,
 `onclick="..."`, SVG's `viewBox`, custom elements, `<template>`, `<!-- comments -->`,
 `'single-quoted'` and unquoted attribute values, and a `<!DOCTYPE html>` before `<html>`.
-What to change:
+A `<template>`'s markup is its content (`tpl.content` in the page's JavaScript), from the
+server and made in the browser alike. A form's reset brings the fields a component made in
+the browser back to their first values, as it does the server's. What to change:
 
 | HTML as written | In Quillo |
 |---|---|
