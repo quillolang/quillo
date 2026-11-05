@@ -3107,9 +3107,15 @@ pub(crate) fn markdown(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // A fenced code block that names its language comes out highlighted
     // (after the HTML in the text was made text, above).
     let mut code: Option<(String, String)> = None;
+    // Past `--max-compute` in a block's highlighting: the rest are not highlighted, and it fails
+    // (FEEDBACK55.md, Q-706; branch feedback55).
+    let over = std::cell::Cell::new(false);
+    let over = &over;
     let events = events.filter_map(move |e| match (e, code.as_mut()) {
+        // The language is the info's first word, to a comma: `rust,ignore` is Rust
+        // (FEEDBACK55.md, Q-834; branch feedback55).
         (Event::Start(Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(lang))), None) if !lang.trim().is_empty() => {
-            code = Some((lang.split_whitespace().next().unwrap_or("").to_string(), String::new()));
+            code = Some((lang.split(|c: char| c.is_whitespace() || c == ',').find(|w| !w.is_empty()).unwrap_or("").to_string(), String::new()));
             None
         }
         (Event::Text(t), Some((_, body))) => {
@@ -3119,7 +3125,9 @@ pub(crate) fn markdown(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         (Event::End(pulldown_cmark::TagEnd::CodeBlock), Some(_)) => {
             let (lang, body) = code.take().unwrap();
             let class: String = lang.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
-            Some(Event::Html(CowStr::from(format!("<pre class=\"hl\"><code class=\"language-{}\">{}</code></pre>\n", class, crate::highlight::highlight(&body, &lang)))))
+            let html = if over.get() { None } else { crate::highlight::highlight_within(&body, &lang) };
+            over.set(html.is_none());
+            html.map(|h| Event::Html(CowStr::from(format!("<pre class=\"hl\"><code class=\"language-{}\">{}</code></pre>\n", class, h))))
         }
         (e, _) => Some(e),
     });
@@ -3167,6 +3175,9 @@ pub(crate) fn markdown(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     });
     let mut out = String::with_capacity(s.len() * 3 / 2);
     pulldown_cmark::html::push_html(&mut out, events);
+    if over.get() {
+        return fail(line, "this request computed for longer than --max-compute allows");
+    }
     if inline {
         out = out.trim_end().to_string();
     }
@@ -3181,7 +3192,11 @@ fn highlight(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         None | Some(Value::Nil) => Arc::from(""),
         Some(_) => s_arg(&args, 1, "highlight", line)?,
     };
-    Ok(Value::html(crate::highlight::highlight(&code, &lang)))
+    // A long text counts against `--max-compute` (FEEDBACK55.md, Q-706; branch feedback55).
+    match crate::highlight::highlight_within(&code, &lang) {
+        Some(h) => Ok(Value::html(h)),
+        None => fail(line, "this request computed for longer than --max-compute allows"),
+    }
 }
 
 /// `ask` and `notify` are the browser's (a dialog, a note on the page): on

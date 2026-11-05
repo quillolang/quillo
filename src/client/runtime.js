@@ -1666,36 +1666,89 @@ const HL = (() => {
   const langs = { qwe, quillo: qwe, js, javascript: js, ts: js, typescript: js, jsx: js, tsx: js, mjs: js, py, python: py, rs: rust, rust,
     sh, bash: sh, shell: sh, zsh: sh, console: sh, sql, css, html, xml: html, svg: html, json };
   const esc = (t) => t.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
-  const alpha = (c) => c !== undefined && /\p{L}/u.test(c);
-  const alnum = (c) => c !== undefined && /[\p{L}\p{N}]/u.test(c);
+  // Rust's is_alphabetic and is_alphanumeric: with marks such as U+093F and numbers such as `Ⅰ`,
+  // where `\p{L}` left them out, and a word or a quote was read as another on the server
+  // (FEEDBACK55.md, Q-834; branch feedback55).
+  const alpha = (c) => c !== undefined && /\p{Alphabetic}/u.test(c);
+  const alnum = (c) => c !== undefined && /[\p{Alphabetic}\p{N}]/u.test(c);
   const digit = (c) => c !== undefined && c >= "0" && c <= "9";
   const identStart = (c) => alpha(c) || c === "_" || c === "$";
   const identChar = (c, isCss) => alnum(c) || c === "_" || c === "$" || (isCss && c === "-");
-  // In a route's path (`route ANY /*rest`, `routes /admin`, `mount /blog`) `/*` starts no
-  // comment, as the lexer reads a path (highlight.rs in_route_path; branch feedback40-43).
-  const inRoutePath = (s, i) => {
-    let b = i; while (b > 0 && s[b - 1] !== "\n") b--;
-    const line = s.slice(b, i).join(""), words = line.split(/\s+/).filter(Boolean);
-    const partial = /\s$/.test(line) || !words.length ? "" : words[words.length - 1];
-    const before = partial ? words.slice(0, -1) : words;
-    const after = (before.length === 2 && before[0] === "route" && /^[A-Z]*$/.test(before[1])) || (before.length === 1 && (before[0] === "routes" || before[0] === "mount"));
-    return after && (!partial || partial[0] === "/");
+  // Where a route's path is on the line from `b` (`route ANY /*rest`, `routes /admin`, `mount /blog`):
+  // `/*` there starts no comment, as the lexer reads a path (branch feedback40-43). Found once a line,
+  // as highlight.rs route_path: read from the line's start for each `/*`, it was quadratic
+  // (FEEDBACK55.md, Q-706; branch feedback55).
+  const routePath = (s, b) => {
+    const space = (c) => c === " " || c === "\t" || c === "\r";
+    const skip = (j) => { while (j < s.length && space(s[j])) j++; return j; };
+    const word = (j) => { const f = j; while (j < s.length && s[j] !== "\n" && !space(s[j])) j++; return [f, j]; };
+    let [f, t] = word(skip(b)), at = skip(t);
+    const first = s.slice(f, t).join("");
+    if (first === "route") {
+      [f, t] = word(at);
+      if (f === t || !s.slice(f, t).every((c) => c >= "A" && c <= "Z")) return null;
+      at = skip(t);
+    } else if (first !== "routes" && first !== "mount") return null;
+    [f, t] = word(at);
+    return f < t && s[f] === "/" ? [f, t] : null;
+  };
+  // Where a Rust raw string at `i` ends, `r"..."`, `r#"..."#`, `br"..."`, as highlight.rs raw_end;
+  // -1 where none starts (FEEDBACK55.md, Q-834; branch feedback55).
+  const rawEnd = (s, i) => {
+    let j = i + (s[i] === "b" ? 1 : 0);
+    if (s[j] !== "r") return -1;
+    const from = ++j;
+    while (j < s.length && s[j] === "#") j++;
+    const hashes = j - from;
+    if (s[j] !== '"') return -1;
+    for (j++; j < s.length; j++) {
+      if (s[j] === '"' && s.length - (j + 1) >= hashes && s.slice(j + 1, j + 1 + hashes).every((c) => c === "#")) return j + 1 + hashes;
+    }
+    return s.length;
+  };
+  // Whether a `/` at `i` starts a regular expression in JavaScript, as highlight.rs regex_may_start
+  // (FEEDBACK55.md, Q-834; branch feedback55).
+  const regexMayStart = (s, i) => {
+    let k = i; while (k > 0 && " \t\r\n".includes(s[k - 1])) k--;
+    if (k === 0 || "(,=:[!&|?{};+-*%>~^".includes(s[k - 1])) return true;
+    let b = k; while (b > 0 && k - b < 11 && identChar(s[b - 1], false)) b--;
+    return (b === 0 || !identChar(s[b - 1], false))
+      && ["return", "typeof", "instanceof", "case", "do", "else", "in", "of", "new", "delete", "void", "throw", "yield", "await"].includes(s.slice(b, k).join(""));
   };
   return (code, name) => {
     // A language of its own: `constructor` or `__proto__` found the object's, and threw
     // (FEEDBACK55.md, Q-711; branch feedback55).
     const key = String(name || "").toLowerCase();
     const l = hasOwn(langs, key) ? langs[key] : plain;
+    // A language it does not know is text, only escaped (FEEDBACK55.md, Q-834; branch feedback55).
+    if (l === plain) return esc(code);
     const s = Array.from(code);
     const n = s.length;
     const starts = (i, p) => { const ps = Array.from(p); for (let k = 0; k < ps.length; k++) if (s[i + k] !== ps[k]) return false; return true; };
     let out = "", i = 0, plainAt = 0, depth = 0, inTag = false;
     const span = (from, to, cls) => { out += esc(s.slice(plainAt, from).join("")) + `<span class="${cls}">` + esc(s.slice(from, to).join("")) + "</span>"; plainAt = to; };
     const block = l.block || (l.tags ? ["<!--", "-->"] : null);
+    // The last line a route's path was looked for on: where it ends, and the path, so that each
+    // line is read once (Q-706); where a regular expression may start again, after one that did
+    // not close on its line (Q-834).
+    let seen = [0, 0, 0], noRegex = 0;
+    const inPath = (i) => {
+      if (i >= seen[0]) {
+        let b = i, e = i;
+        while (b > seen[0] && s[b - 1] !== "\n") b--;
+        while (e < n && s[e] !== "\n") e++;
+        const p = routePath(s, b) || [0, 0];
+        seen = [e, p[0], p[1]];
+      }
+      return seen[1] <= i && i < seen[2];
+    };
+    // A range's `..` ends a number and starts none: `0..n` (Q-834).
+    const dots = (j) => s[j] === "." && (s[j + 1] === "." || (j > 0 && s[j - 1] === "."));
     while (i < n) {
       const c = s[i];
-      if (l.line.some((p) => starts(i, p))) { let j = i; while (j < n && s[j] !== "\n") j++; span(i, j, "hl-c"); i = j; continue; }
-      if (block && starts(i, block[0]) && !(l.tags && block[0] === "/*" && inTag) && !(l === qwe && inRoutePath(s, i))) {
+      // The shell's `#` starts a comment at a word's start only: `${#a[@]}` (Q-834).
+      if (l.line.some((p) => starts(i, p)) && !(l === sh && i > 0 && !" \t\r\n;|&()<>".includes(s[i - 1]))) { let j = i; while (j < n && s[j] !== "\n") j++; span(i, j, "hl-c"); i = j; continue; }
+      if (block && starts(i, block[0]) && !(l.tags && block[0] === "/*" && inTag) && !(l === qwe && inPath(i))) {
         let j = i + Array.from(block[0]).length; while (j < n && !starts(j, block[1])) j++;
         j = Math.min(j + Array.from(block[1]).length, n); span(i, j, "hl-c"); i = j; continue;
       }
@@ -1710,12 +1763,44 @@ const HL = (() => {
         else if (alpha(c) || c === "@" || c === ":") { let j = i; while (j < n && (alnum(s[j]) || "-_:@.".includes(s[j]))) j++; span(i, j, "hl-a"); i = j; continue; }
         i++; continue;
       }
-      if (l.quotes.includes(c)) {
+      // Python's `"""` and `'''` go on over lines, as Rust's `"` does (Q-834).
+      const triple = c === '"' ? '"""' : "'''";
+      if (l === py && (c === '"' || c === "'") && starts(i, triple)) {
+        let j = i + 3; while (j < n && !starts(j, triple)) { if (s[j] === "\\") j++; j++; }
+        j = Math.min(j + 3, n); span(i, j, "hl-s"); i = j; continue;
+      }
+      // Rust's raw `r"..."` (Q-834).
+      if (l === rust && (c === "r" || c === "b") && !(i > 0 && identChar(s[i - 1], false))) {
+        const j = rawEnd(s, i);
+        if (j >= 0) { span(i, j, "hl-s"); i = j; continue; }
+      }
+      // Rust's `'"'` is a character and `'a` a lifetime (Q-834).
+      if (l === rust && c === "'") {
+        let close = -1;
+        if (s[i + 1] === "\\" && s[i + 2] !== undefined && s[i + 2] !== "\n") {
+          for (let j = i + 3; j < n && j < i + 12 && s[j] !== "\n"; j++) if (s[j] === "'") { close = j; break; }
+        } else if (i + 2 < n && s[i + 1] !== "\n" && s[i + 1] !== "'" && s[i + 2] === "'") close = i + 2;
+        if (close >= 0) { span(i, close + 1, "hl-s"); i = close + 1; continue; }
+      }
+      // The shell's `it's`: a `'` in a word is no quote (Q-834).
+      if (l.quotes.includes(c) && !(l === sh && c === "'" && i > 0 && identChar(s[i - 1], false))) {
         let j = i + 1;
-        while (j < n && s[j] !== c && (c === "`" || s[j] !== "\n")) { if (s[j] === "\\") j++; j++; }
+        while (j < n && s[j] !== c && (c === "`" || (l === rust && c === '"') || s[j] !== "\n")) { if (s[j] === "\\") j++; j++; }
         j = Math.min(j + 1, n);
         let k = j; while (k < n && (s[k] === " " || s[k] === "\t")) k++;
         span(i, j, l.json && s[k] === ":" ? "hl-a" : "hl-s"); i = j; continue;
+      }
+      // A JavaScript regular expression, to its `/` on the line, with its flags (Q-834).
+      if (l === js && c === "/" && i >= noRegex && regexMayStart(s, i)) {
+        let j = i + 1, inClass = false;
+        while (j < n && s[j] !== "\n" && (inClass || s[j] !== "/")) {
+          if (s[j] === "\\" && j + 1 < n && s[j + 1] !== "\n") j++;
+          else if (s[j] === "[") inClass = true;
+          else if (s[j] === "]") inClass = false;
+          j++;
+        }
+        if (s[j] === "/") { j++; while (j < n && /[A-Za-z]/.test(s[j])) j++; span(i, j, "hl-s"); i = j; continue; }
+        noRegex = j;
       }
       if (l.css) {
         if (c === "{") depth++; else if (c === "}") depth = Math.max(depth - 1, 0);
@@ -1725,8 +1810,8 @@ const HL = (() => {
         if (c === "@" || (c === "!" && starts(i, "!important"))) { let j = i + 1; while (j < n && identChar(s[j], true)) j++; span(i, j, "hl-k"); i = j; continue; }
       }
       const prevIdent = i > 0 && identChar(s[i - 1], l.css);
-      if (!(i > 0 && identChar(s[i - 1], false)) && (digit(c) || (c === "." && digit(s[i + 1])))) {
-        let j = i; while (j < n && (/[A-Za-z0-9._]/.test(s[j]) || (l.css && s[j] === "%"))) j++; span(i, j, "hl-n"); i = j; continue;
+      if (!(i > 0 && identChar(s[i - 1], false)) && (digit(c) || (c === "." && digit(s[i + 1]) && !dots(i)))) {
+        let j = i; while (j < n && ((/[A-Za-z0-9_]/.test(s[j]) || (s[j] === "." && !dots(j))) || (l.css && s[j] === "%"))) j++; span(i, j, "hl-n"); i = j; continue;
       }
       if (identStart(c) && !prevIdent) {
         let j = i; while (j < n && identChar(s[j], l.css)) j++;
@@ -1744,7 +1829,9 @@ const HL = (() => {
     return out + esc(s.slice(plainAt).join(""));
   };
 })();
-B.highlight = meta((code, lang) => rawHtml(HL(display(code), lang == null ? "" : display(lang))), "highlight", null);
+// With its text, as `markdown`'s and `raw`'s: `str(highlight(...))` was "<html>", where the
+// server gives the markup (FEEDBACK55.md, Q-834; branch feedback55).
+B.highlight = meta((code, lang) => textHtml(HL(display(code), lang == null ? "" : display(lang))), "highlight", null);
 
 B.escape = meta((v) => display(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]), "escape", null);
 // url_encode(v): as the server's, so links built on either side match.

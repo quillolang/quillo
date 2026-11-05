@@ -362,7 +362,8 @@ route GET / = <html><head><title>t</title></head><body>
     );
     let s = support::serve(&d.join("main.qwe"), &[]);
     let b = support::send(s.port, "GET", "/", &[], "").body;
-    let plain = "<pre class=\"hl\">let x = <span class=\"hl-n\">1</span> // c\n&lt;b&gt; &amp; &quot;y&quot;</pre>";
+    // Only escaped: a language it does not know colours nothing (Q-834).
+    let plain = "<pre class=\"hl\">let x = 1 // c\n&lt;b&gt; &amp; &quot;y&quot;</pre>";
     assert_eq!(b.matches(plain).count(), 11, "{}", b);
     assert!(b.contains("<pre class=\"hl\"><span class=\"hl-k\">let</span> x"), "{}", b);
     let Some(chrome) = chrome() else {
@@ -2772,4 +2773,495 @@ fn a_file_being_written_is_served_never_missed() {
     for w in writers {
         w.join().unwrap();
     }
+}
+
+// ---- Q-706, Q-834: the highlighter, on the server (highlight.rs) and in the browser (runtime.js) --
+
+/// A Quillo string literal of `s`.
+fn lit(s: &str) -> String {
+    let mut o = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '\\' | '"' | '$' | '{' | '}' => {
+                o.push('\\');
+                o.push(c);
+            }
+            '\n' => o.push_str("\\n"),
+            '\t' => o.push_str("\\t"),
+            '\r' => o.push_str("\\r"),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+/// `want` with `<k>`...`</k>` for `<span class="hl-k">`...`</span>`, and so for each class.
+fn spans(want: &str) -> String {
+    let mut s = want.to_string();
+    for c in ["k", "s", "c", "n", "f", "t", "a"] {
+        s = s.replace(&format!("<{}>", c), &format!("<span class=\"hl-{}\">", c)).replace(&format!("</{}>", c), "</span>");
+    }
+    s
+}
+
+fn node_here() -> bool {
+    Command::new("node").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// What `__t` in `src` gives on the server, as `repr` writes it, once the browser's runtime (in
+/// Node) has given the same; the server's value too.
+fn both_sides(src: &str) -> (String, quillo::value::Value) {
+    let mut it = quillo::Interp::new(".");
+    it.load_source(src, "case.qwe").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    let v = match it.call(&quillo::value::lookup(&it.globals, "__t").unwrap(), vec![], 0) {
+        Ok(v) => v,
+        Err(quillo::interp::Ctrl::Error(e)) => panic!("{}", e.msg),
+        Err(_) => panic!("the case did not give a value"),
+    };
+    let server = v.repr();
+    if node_here() {
+        let js = quillo::client::test_script(&it, "__t").unwrap_or_else(|e| panic!("{}", e));
+        let out = support::node(&js).expect("node");
+        assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+        let browser = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if browser != server {
+            let at = server.chars().zip(browser.chars()).take_while(|(a, b)| a == b).count();
+            let around = |t: &str| t.chars().skip(at.saturating_sub(120)).take(240).collect::<String>();
+            panic!("the browser differs at character {}:\nserver:  {}\nbrowser: {}", at, around(&server), around(&browser));
+        }
+    } else {
+        eprintln!("skipping the browser half: no Node");
+    }
+    (server, v)
+}
+
+/// `highlight(code, lang)` of each case as the server makes it, once the browser has made the
+/// same, token for token.
+fn highlighted(cases: &[(&str, &str)]) -> Vec<String> {
+    let calls: Vec<String> = cases.iter().map(|(l, c)| format!("str(highlight({}, {}))", lit(c), lit(l))).collect();
+    let (_, v) = both_sides(&format!("fn __t() = [{}]\n", calls.join(", ")));
+    let quillo::value::Value::List(l) = v else { panic!("not a list") };
+    l.iter().map(|x| x.display()).collect()
+}
+
+/// Each case highlighted as `want` (written with `spans`), on both sides.
+#[track_caller]
+fn colours_as(cases: &[(&str, &str, &str)]) {
+    let got = highlighted(&cases.iter().map(|(l, c, _)| (*l, *c)).collect::<Vec<_>>());
+    for ((l, c, want), g) in cases.iter().zip(got) {
+        assert_eq!(g, spans(want), "{} {:?}", l, c);
+    }
+}
+
+/// The best of three runs of `f`, in seconds.
+fn best_of_three(f: &dyn Fn()) -> f64 {
+    (0..3)
+        .map(|_| {
+            let t = std::time::Instant::now();
+            f();
+            t.elapsed().as_secs_f64()
+        })
+        .fold(f64::MAX, f64::min)
+}
+
+/// Texts of `n` pieces that were quadratic, or could be: the report's (`route GET /*/*...`, read
+/// again from the line's start for each `/*`), and each rule Q-834 added that looks along a line.
+fn slow_shapes(n: usize) -> Vec<(&'static str, String)> {
+    vec![
+        ("quillo", format!("route GET {}", "/*".repeat(n))),
+        ("quillo", "route GET /*a /*b\n".repeat(n / 8)),
+        ("quillo", format!("route GET /a {}", "/*".repeat(n))),
+        ("js", format!("x = [{}", "/[".repeat(n))),
+        ("js", "(/".repeat(n)),
+        ("js", format!("x{}{}", " ".repeat(n), "/ /".repeat(n / 4))),
+        ("rust", "'\\".repeat(n)),
+        ("python", format!("\"\"\"{}", "a\n".repeat(n))),
+        ("sh", "a#".repeat(n)),
+        ("rust", "0..".repeat(n)),
+    ]
+}
+
+// Q-706: `highlight("route GET " + repeat("/*", n), "quillo")` read the line again from its start
+// for each `/*`: 5.88 s at n = 64,000, four times as long for each doubling. Each line is read once
+// now: 64,000 take milliseconds, and twice the text takes about twice the time, for the report's
+// text and for each rule that looks along a line.
+#[test]
+fn highlighting_takes_time_in_proportion_to_the_text() {
+    use quillo::highlight::highlight;
+    let report = format!("route GET {}", "/*".repeat(64_000));
+    assert!(best_of_three(&|| drop(highlight(&report, "quillo"))) < 0.5, "64,000 `/*` took too long");
+    // The path is a path to its end: no comment in it.
+    let h = highlight(&report, "quillo");
+    assert!(!h.contains("hl-c") && h.ends_with("/*/*"), "{}", &h[..200]);
+    // Four times the text against at most six times the time: linear passes with room for a
+    // loaded machine, quadratic (sixteen times) does not.
+    let (small, large) = (slow_shapes(100_000), slow_shapes(400_000));
+    for ((lang, a), (_, b)) in small.iter().zip(large.iter()) {
+        let (ta, tb) = (best_of_three(&|| drop(highlight(a, lang))), best_of_three(&|| drop(highlight(b, lang))));
+        assert!(tb < 1.5, "{} {:?}...: {:.3} s", lang, &a[..20], tb);
+        assert!(tb < 6.0 * ta + 0.02, "{} {:?}...: {:.4} s, then {:.4} s for four times the text", lang, &a[..20], ta, tb);
+    }
+    // The edges: none, one, and a path after the route's, which is a comment to the end.
+    assert_eq!(highlight("route GET ", "quillo"), "<span class=\"hl-k\">route</span> <span class=\"hl-t\">GET</span> ");
+    assert_eq!(highlight("route GET /*", "quillo"), "<span class=\"hl-k\">route</span> <span class=\"hl-t\">GET</span> /*");
+    assert_eq!(highlight("", "quillo"), "");
+    let h = highlight(&format!("route GET /a {}", "/* ".repeat(1000)), "quillo");
+    assert_eq!(h.matches("hl-c").count(), 1, "{}", &h[..200]);
+}
+
+// Q-706 in the browser: runtime.js's `inRoutePath` had the same loop (2 s at 16,000 `/*`). The
+// same texts in Node, timed by the program itself.
+#[test]
+fn the_browser_highlights_in_proportion_to_the_text() {
+    if !node_here() {
+        eprintln!("skipping: needs Node");
+        return;
+    }
+    let shape = |n: usize| -> Vec<String> {
+        vec![
+            format!("took(\"route GET \" + repeat(\"/*\", {}), \"quillo\")", n),
+            format!("took(repeat(\"route GET /*a /*b\\n\", {}), \"quillo\")", n / 8),
+            format!("took(\"x = [\" + repeat(\"/[\", {}), \"js\")", n),
+            format!("took(repeat(\"(/\", {}), \"js\")", n),
+            format!("took(\"x\" + repeat(\" \", {}) + repeat(\"/ /\", {}), \"js\")", n, n / 4),
+            format!("took(repeat(\"'\\\\\", {}), \"rust\")", n),
+            format!("took(\"\\\"\\\"\\\"\" + repeat(\"a\\n\", {}), \"python\")", n),
+            format!("took(repeat(\"a#\", {}), \"sh\")", n),
+            format!("took(repeat(\"0..\", {}), \"rust\")", n),
+        ]
+    };
+    let src = format!(
+        "fn took(code: str, lang: str) -> int {{\n    let best = 1000000\n    for r in [1, 2, 3] {{\n        let t0 = now()\n        let _h = highlight(code, lang)\n        let d = now() - t0\n        if d < best {{\n            best = d\n        }}\n    }}\n    return best\n}}\nfn __t() = [{}, {}, took(\"route GET \" + repeat(\"/*\", 64000), \"quillo\")]\n",
+        shape(50_000).join(", "),
+        shape(200_000).join(", ")
+    );
+    let mut it = quillo::Interp::new(".");
+    it.load_source(&src, "case.qwe").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    let js = quillo::client::test_script(&it, "__t").unwrap();
+    let out = support::node(&js).expect("node");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let ms: Vec<f64> = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{}: {}", e, String::from_utf8_lossy(&out.stdout)));
+    let n = shape(1).len();
+    assert!(ms[2 * n] < 1000.0, "64,000 `/*` took {} ms in the browser", ms[2 * n]);
+    for k in 0..n {
+        // Four times the text against at most six times the time (quadratic is sixteen).
+        assert!(ms[n + k] < 3000.0 && ms[n + k] < 6.0 * ms[k] + 30.0, "shape {}: {} ms, then {} ms for four times the text", k, ms[k], ms[n + k]);
+    }
+}
+
+// Q-706: what the server and the browser make of a large text is the same, token for token, in
+// every language (each sample has the cases Q-834 fixed), and the report's text.
+#[test]
+fn server_and_browser_highlight_a_large_text_alike() {
+    let samples = [
+        ("quillo", "route GET /*rest = respond(404, rest) // last\nroutes /*x with db { }\nlet a = f(\"<a>\") /* c */ `t ${1.5}` 0..10\n"),
+        ("js", "let r = /\"[/]/g, d = a / b; return /x/.test(s) // c\nconst t = `a\nb` + 'it''s' + 1e3;\n"),
+        ("python", "def f(x):\n    \"\"\"Doc for if.\n    and\"\"\"\n    return '''a\nb''' if x else None  # c\n"),
+        ("rust", "fn f<'a>(x: &'a str) -> char { let s = \"a\nb\"; for i in 0..n {} '\"' } // c\n"),
+        ("sh", "echo it's ${#a[@]} $# 'q' # c\nexport A=1\n"),
+        ("sql", "SELECT a, 'it''s' FROM t -- c\nwhere b = 1 /* d */;\n"),
+        ("css", ".a:hover { color: #fff; margin: -0.5em .5em !important } /* c */\n"),
+        ("html", "<!-- c --><a href=\"/x\" data-k='v'>y &amp; z</a><br/>\n"),
+        ("json", "{\"a\": [1, true, null], \"b\": \"c\"}\n"),
+        ("nope", "print(1) <b> & 'x'\n"),
+    ];
+    let calls: Vec<String> = samples.iter().map(|(l, c)| format!("str(highlight(repeat({}, 2000), {}))", lit(c), lit(l))).collect();
+    let (server, v) = both_sides(&format!("fn __t() = [{}, str(highlight(\"route GET \" + repeat(\"/*\", 64000), \"quillo\"))]\n", calls.join(", ")));
+    assert!(server.len() > 1_000_000, "{}", server.len());
+    let quillo::value::Value::List(l) = v else { panic!("not a list") };
+    assert!(l[..9].iter().all(|h| h.display().contains("<span")) && !l[9].display().contains("<span"), "{}", &server[..400]);
+}
+
+// Q-706: `/_quillo/markdown`, on every server with no route asking for it, took any body
+// `--max-body` let through (10 MB), where a 256 KB one held the server 22 s. It takes what a page
+// previews as someone writes: a megabyte of JSON, the limit itself, and refuses one byte more.
+#[test]
+fn the_markdown_endpoint_takes_a_preview_and_no_more() {
+    let d = dir("md-endpoint", "route GET / = \"hello\"\n");
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let post = |body: &str| support::send(s.port, "POST", "/_quillo/markdown", &[], body);
+    // The report's body: 256 KB of `/*` in a route's path, answered at once.
+    let report = serde_json::json!([format!("```quillo\nroute GET {}\n```", "/*".repeat(128_000)), {}]).to_string();
+    let t = std::time::Instant::now();
+    let a = post(&report);
+    assert_eq!(a.status, 200, "{}", &a.body[..200.min(a.body.len())]);
+    assert!(t.elapsed().as_secs_f64() < 2.0, "{:?}", t.elapsed());
+    assert!(!a.body.contains("hl-c") && a.body.contains("hl-k"), "{}", &a.body[..200]);
+    assert_eq!(support::send(s.port, "GET", "/", &[], "").body, "hello");
+    // The limit, one byte under and one over, in bytes whatever the characters.
+    let of = |text: String| format!("[\"{}\"]", text);
+    let limit = quillo::server::MARKDOWN_BODY;
+    assert_eq!(limit, 1 << 20);
+    assert_eq!(post(&of("a".repeat(limit - 4))).status, 200);
+    assert_eq!(post(&of("a".repeat(limit - 5))).status, 200);
+    let a = post(&of("a".repeat(limit - 3)));
+    assert_eq!(a.status, 413, "{}", a.body);
+    assert_eq!(a.body, r#"{"error":"markdown here takes at most 1 MB of JSON: make a longer text's in a route or a server fn"}"#);
+    let e = of("é".repeat((limit - 4) / 2));
+    assert_eq!(e.len(), limit);
+    assert_eq!(post(&e).status, 200);
+    assert_eq!(post(&of(format!("{}a", "é".repeat((limit - 4) / 2)))).status, 413);
+    // Small texts as before: empty, one character, unicode, with options.
+    assert_eq!(post(r#"[""]"#).body, r#"{"ok":""}"#);
+    assert_eq!(post(r#"["*a*"]"#).body, r#"{"ok":"<p><em>a</em></p>\n"}"#);
+    assert_eq!(post(r#"["ünï *😀*", {"inline": true}]"#).body, r#"{"ok":"ünï <em>😀</em>"}"#);
+    // Refused before it is read as JSON.
+    assert_eq!(post(&format!("[{}", " ".repeat(limit))).status, 413);
+    assert_eq!(post(&format!("[{}", " ".repeat(10))).status, 400);
+}
+
+// Q-706: `--max-compute` did not stop a highlight, which is one call: the log said the instance had
+// been computing for 5 s, and nothing ended it. A long highlight, a Markdown block's and a text of
+// many small blocks now end at the limit, as a loop does, and the instance answers the next
+// request at once; what is in time is answered as before.
+#[test]
+fn max_compute_ends_a_long_highlight() {
+    let d = dir(
+        "max-compute",
+        "route GET / = \"hello\"\nroute GET /h = len(str(highlight(repeat(\"a \", 12000000), \"quillo\")))\nroute GET /small = str(highlight(\"let x = 1\", \"quillo\"))\nroute GET /md = len(str(markdown(\"```quillo\\n\" + repeat(\"a \", 12000000) + \"\\n```\")))\nroute GET /blocks = len(str(markdown(repeat(\"```js\\nlet a = 1\\n```\\n\", 1000000))))\nroute GET /plain = len(str(markdown(repeat(\"```nope\\nx\\n```\\n\", 2000000))))\n",
+    );
+    assert!(check(&std::fs::read_to_string(d.join("main.qwe")).unwrap()).0);
+    let (_g, port, log) = serve_logged(&d, &["--max-compute", "100ms"]);
+    for path in ["/h", "/md", "/blocks", "/plain"] {
+        let t = std::time::Instant::now();
+        assert_eq!(error_of(port, &log, path), format!("main.qwe:{}: this request computed for longer than --max-compute allows", match path { "/h" => 2, "/md" => 4, "/blocks" => 5, _ => 6 }));
+        assert!(t.elapsed().as_secs_f64() < 5.0, "{}: {:?}", path, t.elapsed());
+        let a = support::send(port, "GET", "/", &[], "");
+        assert_eq!((a.status, a.body.as_str()), (200, "hello"));
+    }
+    let a = support::send(port, "GET", "/small", &[], "");
+    assert_eq!((a.status, a.body.as_str()), (200, "<span class=\"hl-k\">let</span> x = <span class=\"hl-n\">1</span>"));
+    let a = support::send(port, "POST", "/_quillo/markdown", &[], r#"["```rust,ignore\nfn\n```"]"#);
+    assert_eq!(a.body, r#"{"ok":"<pre class=\"hl\"><code class=\"language-rust\"><span class=\"hl-k\">fn</span>\n</code></pre>\n"}"#);
+}
+
+// Q-706: a preview at `/_quillo/markdown` past `--max-compute` ends as a route does, a 500 that
+// says so, where the endpoint said 400. Under a limit of 1 ms some full-size previews are found
+// past it (the watcher looks every 100 ms); the others are made whole.
+#[test]
+fn a_preview_past_max_compute_ends_as_a_server_error() {
+    let d = dir("max-compute-preview", "route GET / = \"hello\"\n");
+    let (_g, port, _log) = serve_logged(&d, &["--max-compute", "1ms"]);
+    let mut text = String::new();
+    while text.len() < 900_000 {
+        text.push_str("```js\nlet a = f(1) // c\n```\n");
+    }
+    let body = serde_json::json!([text]).to_string();
+    assert!(body.len() <= quillo::server::MARKDOWN_BODY, "{}", body.len());
+    let mut ended = false;
+    for _ in 0..200 {
+        let a = support::send(port, "POST", "/_quillo/markdown", &[], &body);
+        match a.status {
+            200 => assert!(a.body.starts_with(r#"{"ok":"<pre class=\"hl\"><code class=\"language-js\"><span class=\"hl-k\">let</span>"#), "{}", &a.body[..200]),
+            500 => {
+                assert_eq!(a.body, r#"{"error":"this request computed for longer than --max-compute allows"}"#);
+                ended = true;
+                break;
+            }
+            s => panic!("{}: {}", s, a.body),
+        }
+    }
+    assert!(ended, "no preview was found past the limit");
+    assert_eq!(support::send(port, "GET", "/", &[], "").body, "hello");
+}
+
+// Q-834: a Python docstring over lines coloured its inner lines as code, and so did a Rust string
+// over lines. Both are strings to their close now, or to the end; Quillo's and JavaScript's `"`
+// still end at their line's end.
+#[test]
+fn a_docstring_and_a_rust_string_over_lines_are_strings() {
+    colours_as(&[
+        ("py", "def f():\n    \"\"\"Docs for and if.\n    more\n    \"\"\"\n    return 1", "<k>def</k> <f>f</f>():\n    <s>&quot;&quot;&quot;Docs for and if.\n    more\n    &quot;&quot;&quot;</s>\n    <k>return</k> <n>1</n>"),
+        ("python", "x = '''a\nfor b'''\ny = \"\" if x else ''", "x = <s>'''a\nfor b'''</s>\ny = <s>&quot;&quot;</s> <k>if</k> x <k>else</k> <s>''</s>"),
+        ("py", "\"\"\"never\nfor", "<s>&quot;&quot;&quot;never\nfor</s>"),
+        ("py", "\"\"\"a\\\"\"\"b\"\"\" + 'y'", "<s>&quot;&quot;&quot;a\\&quot;&quot;&quot;b&quot;&quot;&quot;</s> + <s>'y'</s>"),
+        ("py", "\"\"\"\"\"\"x", "<s>&quot;&quot;&quot;&quot;&quot;&quot;</s>x"),
+        ("py", "'''é\n日本😀'''", "<s>'''é\n日本😀'''</s>"),
+        ("rust", "let s = \"one\nfor two\";\nlet d = 1;", "<k>let</k> s = <s>&quot;one\nfor two&quot;</s>;\n<k>let</k> d = <n>1</n>;"),
+        ("rs", "\"a\\\"\nb\" c", "<s>&quot;a\\&quot;\nb&quot;</s> c"),
+        ("rust", "\"open\nfn", "<s>&quot;open\nfn</s>"),
+        ("qwe", "let a = \"x\nlet b = 1", "<k>let</k> a = <s>&quot;x\n</s><k>let</k> b = <n>1</n>"),
+        ("js", "let a = \"x\nlet b = 1", "<k>let</k> a = <s>&quot;x\n</s><k>let</k> b = <n>1</n>"),
+    ]);
+}
+
+// Q-834: Rust's `'"'`, JavaScript's `/"/` and the shell's `it's` made the rest of the line a
+// string. A Rust character is one (a lifetime is not), a JavaScript regular expression is one
+// where a value cannot end (a `/` after one divides), and a `'` in a shell word is no quote.
+#[test]
+fn a_quote_in_a_character_a_regex_or_a_word_starts_no_string() {
+    colours_as(&[
+        ("rust", "let c = '\"'; let d = 1;", "<k>let</k> c = <s>'&quot;'</s>; <k>let</k> d = <n>1</n>;"),
+        ("rust", "fn f<'a>(x: &'a str) -> &'static str { \"y\" }", "<k>fn</k> f&lt;'a&gt;(x: &amp;'a str) -&gt; &amp;'<k>static</k> str { <s>&quot;y&quot;</s> }"),
+        (
+            "rust",
+            "['\\'', '\\\\', '\\n', '\\u{1F600}', '\\u{10FFFF}', 'é', '日', 'ab']",
+            "[<s>'\\''</s>, <s>'\\\\'</s>, <s>'\\n'</s>, <s>'\\u{1F600}'</s>, <s>'\\u{10FFFF}'</s>, <s>'é'</s>, <s>'日'</s>, 'ab']",
+        ),
+        // Past an escape's length, over a line, or at the end: no character.
+        ("rust", "'\\u{10FFFFF}'", "'\\u{<n>10FFFFF</n>}'"),
+        ("rust", "'\\\nx'", "'\\\nx'"),
+        ("rust", "'\n'", "'\n'"),
+        ("rust", "'", "'"),
+        ("rust", "' '", "<s>' '</s>"),
+        ("js", "let r = /\"/g; let s = \"x\";", "<k>let</k> r = <s>/&quot;/g</s>; <k>let</k> s = <s>&quot;x&quot;</s>;"),
+        ("js", "if (/[/\"]/.test(s)) return /a\\/b/i", "<k>if</k> (<s>/[/&quot;]/</s>.<f>test</f>(s)) <k>return</k> <s>/a\\/b/i</s>"),
+        ("js", "/re/.test(s); typeof /y/", "<s>/re/</s>.<f>test</f>(s); <k>typeof</k> <s>/y/</s>"),
+        ("ts", "let d = a / b / c, e = (a) / 2, f = x[1] / 3, g = this / 4;", "<k>let</k> d = a / b / c, e = (a) / <n>2</n>, f = x[<n>1</n>] / <n>3</n>, g = <k>this</k> / <n>4</n>;"),
+        // One that does not close on its line is a `/`.
+        ("js", "x = /abc \"s\"\ny = /d/", "x = /abc <s>&quot;s&quot;</s>\ny = <s>/d/</s>"),
+        ("js", "x = /é日😀/u", "x = <s>/é日😀/u</s>"),
+        ("sh", "echo it's fine 'quoted' # c", "<k>echo</k> it's fine <s>'quoted'</s> <c># c</c>"),
+        ("bash", "'a' don't x='b' \"it's\"", "<s>'a'</s> don't x=<s>'b'</s> <s>&quot;it's&quot;</s>"),
+        // Python's prefixes are a word's: its quotes are quotes.
+        ("py", "f'x' + b'y'", "f<s>'x'</s> + b<s>'y'</s>"),
+    ]);
+}
+
+// Q-834: the shell's `${#arr[@]}` started a comment. A `#` starts one at a word's start only, as
+// the shell reads it; Python's `#` is a comment anywhere.
+#[test]
+fn the_shells_hash_inside_a_word_starts_no_comment() {
+    colours_as(&[
+        ("sh", "n=${#arr[@]} $# x # note\n# start\na;# c\na#b", "n=${#arr[@]} $# x <c># note</c>\n<c># start</c>\na;<c># c</c>\na#b"),
+        ("sh", "#", "<c>#</c>"),
+        ("zsh", "a|#c\n(#d)\nx\t#e", "a|<c>#c</c>\n(<c>#d)</c>\nx\t<c>#e</c>"),
+        ("sh", "é#x 日 #y", "é#x 日 <c>#y</c>"),
+        ("py", "x#c", "x<c>#c</c>"),
+    ]);
+}
+
+// Q-834: `0..n` was one number. A range's `..` ends the number before it and starts none; decimals,
+// exponents, hex and CSS's `.5em` are as they were.
+#[test]
+fn a_range_is_two_numbers() {
+    colours_as(&[
+        ("rust", "for i in 0..n { a[1..=5]; 1.5; 1.5..2.5; ..5; x.. }", "<k>for</k> i <k>in</k> <n>0</n>..n { a[<n>1</n>..=<n>5</n>]; <n>1.5</n>; <n>1.5</n>..<n>2.5</n>; ..<n>5</n>; x.. }"),
+        ("qwe", "for i in 0..10 { }", "<k>for</k> i <k>in</k> <n>0</n>..<n>10</n> { }"),
+        ("rust", "0..", "<n>0</n>.."),
+        ("rust", "0...5", "<n>0</n>...<n>5</n>"),
+        ("css", "a { margin: .5em -0.5em }", "<t>a</t> { <a>margin</a>: <n>.5em</n> -<n>0.5em</n> }"),
+        ("js", "1e3 + 0x1F + 1_000 + 2.5 + .5", "<n>1e3</n> + <n>0x1F</n> + <n>1_000</n> + <n>2.5</n> + <n>.5</n>"),
+    ]);
+}
+
+// Q-834: `highlight("print(1)", "nope")` gave `hl-f` and `hl-n` spans, where the guide says a
+// language it does not know is escaped text. It is, on both sides; a language it knows, in any
+// case, still colours.
+#[test]
+fn a_language_it_does_not_know_is_only_escaped() {
+    colours_as(&[
+        ("nope", "print(1)", "print(1)"),
+        ("", "f(1) <b>&\"x\" 'y'", "f(1) &lt;b&gt;&amp;&quot;x&quot; 'y'"),
+        ("ﬁ", "x(1) // c", "x(1) // c"),
+        ("c", "", ""),
+        ("text", "é 日本 😀 f(2)", "é 日本 😀 f(2)"),
+        ("PYTHON", "print(1)", "<f>print</f>(<n>1</n>)"),
+    ]);
+    // With no language at all, as with an unknown one.
+    let (server, _) = both_sides("fn __t() = [str(highlight(\"f(1) < 2\")), str(highlight(\"f(1) < 2\", null))]\n");
+    assert_eq!(server, r#"["f(1) &lt; 2", "f(1) &lt; 2"]"#);
+}
+
+// Q-834: a fence's info `rust,ignore` was not read as Rust (nor its class `language-rust`). The
+// language is the info's first word, to a space or a comma.
+#[test]
+fn a_fences_language_is_its_first_word_to_a_comma() {
+    let md = |m: &str| {
+        let mut it = quillo::Interp::new(".");
+        it.load_source(&format!("fn __t() = str(markdown({}))\n", lit(m)), "case.qwe").unwrap();
+        it.call(&quillo::value::lookup(&it.globals, "__t").unwrap(), vec![], 0).unwrap_or_else(|_| panic!("{}", m)).display()
+    };
+    let rust = "<pre class=\"hl\"><code class=\"language-rust\"><span class=\"hl-k\">fn</span>\n</code></pre>\n";
+    for m in ["```rust,ignore\nfn\n```", "```rust ignore\nfn\n```", "```rust\nfn\n```", "``` rust,no_run\nfn\n```", "```,rust\nfn\n```", "```rust,\nfn\n```", "```rs,should_panic,edition2021\nfn\n```"] {
+        let want = if m.contains("rs,") { rust.replace("language-rust", "language-rs") } else { rust.to_string() };
+        assert_eq!(md(m), want, "{}", m);
+    }
+    assert_eq!(md("```nope,x\nf(1)\n```"), "<pre class=\"hl\"><code class=\"language-nope\">f(1)\n</code></pre>\n");
+    assert_eq!(md("```\nf(1)\n```"), "<pre><code>f(1)\n</code></pre>\n");
+    assert_eq!(md("```日本,rust\nf(1)\n```"), "<pre class=\"hl\"><code class=\"language-\">f(1)\n</code></pre>\n");
+}
+
+/// Seconds `markdown(text)` takes, the best of three, on the server.
+fn markdown_takes(it: &mut quillo::Interp, f: &str, text: &str) -> f64 {
+    let md = quillo::value::lookup(&it.globals, f).unwrap();
+    (0..3)
+        .map(|_| {
+            let t = std::time::Instant::now();
+            assert!(it.call(&md, vec![quillo::value::Value::str(text)], 0).is_ok(), "{} failed", f);
+            t.elapsed().as_secs_f64()
+        })
+        .fold(f64::MAX, f64::min)
+}
+
+// Q-706 in Markdown: pulldown-cmark 0.12 was quadratic on mixed emphasis, `*a_*a_...`: a megabyte
+// at `/_quillo/markdown`, under its limit, held the server 17.4 s, past `--max-compute 2s`, and a
+// request sent after it waited; `markdown()` and `markdown_page()` of a visitor's text in a route,
+// up to `--max-body`'s 10 MB, worse. 0.13 is linear: the report's body is answered at once, the
+// next request too, and each shape takes about twice as long at twice the size.
+#[test]
+fn markdown_takes_time_in_proportion_to_the_text() {
+    let d = dir("md-linear", "route GET / = \"hello\"\n");
+    let (_g, port, _log) = serve_logged(&d, &["--max-compute", "2s"]);
+    let report = serde_json::json!(["*a_".repeat(349_521)]).to_string();
+    assert!(report.len() <= quillo::server::MARKDOWN_BODY, "{}", report.len());
+    let t = std::time::Instant::now();
+    let a = support::send(port, "POST", "/_quillo/markdown", &[], &report);
+    assert_eq!(a.status, 200, "{}", &a.body[..200.min(a.body.len())]);
+    assert!(t.elapsed().as_secs_f64() < 2.0, "the report's body took {:?}", t.elapsed());
+    assert!(a.body.starts_with(r#"{"ok":"<p>"#), "{}", &a.body[..200]);
+    assert_eq!(support::send(port, "GET", "/", &[], "").body, "hello");
+    // On the server, markdown() of each shape and markdown_page() of the report's, at 256 KB,
+    // 512 KB and 1 MB (0.12: 1.1 s, 4.4 s and 17 s).
+    let mut it = quillo::Interp::new(".");
+    it.load_source("fn md(t: str) = markdown(t)\nfn page(t: str) = markdown_page(t)\n", "case.qwe").unwrap();
+    for (f, p) in [("page", "*a_"), ("md", "*a_"), ("md", "**a_"), ("md", " *_"), ("md", "_a*"), ("md", "*a**"), ("md", "[a]("), ("md", "`a"), ("md", "<a"), ("md", "~~a*"), ("md", "> *a_\n"), ("md", "- *a_\n")] {
+        let [t1, t2, t4] = [1usize, 2, 4].map(|k| markdown_takes(&mut it, f, &p.repeat((k << 18) / p.len())));
+        assert!(t4 < 1.0, "{} {:?}: 1 MB took {:.3} s", f, p, t4);
+        // Four times the text against at most six times the time (0.12 was sixteen).
+        assert!(t4 < 6.0 * t1 + 0.03, "{} {:?}: {:.4} s, {:.4} s, {:.4} s", f, p, t1, t2, t4);
+    }
+    // Ordinary Markdown, as it was: emphasis, links, code, lists, tables, a task.
+    let mut md = |t: &str| it.call(&quillo::value::lookup(&it.globals, "md").unwrap(), vec![quillo::value::Value::str(t)], 0).unwrap_or_else(|_| panic!("{}", t)).display();
+    assert_eq!(md("*a* _b_ **c** __d__ ***e*** *f_ g_h `i` ~~j~~"), "<p><em>a</em> <em>b</em> <strong>c</strong> <strong>d</strong> <em><strong>e</strong></em> *f_ g_h <code>i</code> <del>j</del></p>\n");
+    assert_eq!(md("[a](/x \"t\") ![b](/y) <https://z.example>"), "<p><a href=\"/x\" title=\"t\">a</a> <img src=\"/y\" alt=\"b\" /> <a href=\"https://z.example\">https://z.example</a></p>\n");
+    assert_eq!(md("- [x] done\n- [ ] todo\n\n| a | b |\n|---|--:|\n| 1 | 2 |"), "<ul>\n<li><input disabled=\"\" type=\"checkbox\" checked=\"\"/>\ndone</li>\n<li><input disabled=\"\" type=\"checkbox\"/>\ntodo</li>\n</ul>\n<table><thead><tr><th>a</th><th style=\"text-align: right\">b</th></tr></thead><tbody>\n<tr><td>1</td><td style=\"text-align: right\">2</td></tr>\n</tbody></table>\n");
+    assert_eq!(md(""), "");
+    assert_eq!(md("ünï *😀*"), "<p>ünï <em>😀</em></p>\n");
+}
+
+// Q-834: a Rust raw string, read as a `"` string that goes on over lines, coloured the rest of the
+// text: `r"C:\temp\"` and `r#"""#`. `r"..."`, `r#"..."#` (to a `"` and as many `#`) and `br"..."`
+// are raw: no escapes, over lines, to the end when they do not close. Elsewhere `r` is a word.
+#[test]
+fn a_rust_raw_string_has_no_escapes() {
+    colours_as(&[
+        ("rust", "let p = r\"C:\\temp\\\";\nlet x = 1;", "<k>let</k> p = <s>r&quot;C:\\temp\\&quot;</s>;\n<k>let</k> x = <n>1</n>;"),
+        ("rust", "let q = r#\"\"\"#; let y = 2;", "<k>let</k> q = <s>r#&quot;&quot;&quot;#</s>; <k>let</k> y = <n>2</n>;"),
+        ("rust", "br\"a\\\" b r##\"x\"#y\"## r#type rx\"z\"", "<s>br&quot;a\\&quot;</s> b <s>r##&quot;x&quot;#y&quot;##</s> r#<k>type</k> rx<s>&quot;z&quot;</s>"),
+        ("rust", "r##\"a\"#\"## r\"\"", "<s>r##&quot;a&quot;#&quot;##</s> <s>r&quot;&quot;</s>"),
+        ("rust", "r\"a\nfn b\" fn", "<s>r&quot;a\nfn b&quot;</s> <k>fn</k>"),
+        ("rust", "r#\"a\" fn", "<s>r#&quot;a&quot; fn</s>"),
+        ("rs", "r r# br \"r\" b\"x\\\"y\" r\"é日😀\"", "r r# br <s>&quot;r&quot;</s> b<s>&quot;x\\&quot;y&quot;</s> <s>r&quot;é日😀&quot;</s>"),
+        ("rust", "r", "r"),
+        ("js", "r\"x\" br\"y\"", "r<s>&quot;x&quot;</s> br<s>&quot;y&quot;</s>"),
+    ]);
+}
+
+// Q-834 (found in review): a word's letters were Rust's `is_alphanumeric` on the server and
+// `\p{L}\p{N}` in the browser, so a mark (U+093F in `कि`) or a letter number (`Ⅰ`) ended a word on
+// one side only: `echo कि'x'` was a string in the browser alone. Both read Unicode's Alphabetic and
+// numbers now.
+#[test]
+fn a_word_of_marks_or_letter_numbers_is_the_same_word_on_both_sides() {
+    colours_as(&[
+        ("sh", "echo कि'x' y", "<k>echo</k> कि'x' y"),
+        ("sh", "echo ा'x' ॅ'y' a'z'", "<k>echo</k> ा'x' ॅ'y' a'z'"),
+        ("js", "Ⅰ(1) f\u{345}(2)", "<f>Ⅰ</f>(<n>1</n>) <f>f\u{345}</f>(<n>2</n>)"),
+        ("py", "Ⅻ = 1", "<t>Ⅻ</t> = <n>1</n>"),
+        ("rust", "let नमस्ते = 'x';", "<k>let</k> नमस्ते = <s>'x'</s>;"),
+        ("js", "e\u{301}(1)", "e\u{301}(<n>1</n>)"),
+        ("qwe", "let x² = ½", "<k>let</k> x² = ½"),
+    ]);
 }

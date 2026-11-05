@@ -1294,12 +1294,20 @@ impl Interp {
             if cross_site(req) {
                 return rpc_error(403, "only the program's own pages make markdown here");
             }
+            // What a page previews as someone writes: a megabyte, more than a person writes in
+            // one, where any request could send `--max-body`'s 10 MB to every server
+            // (FEEDBACK55.md, Q-706; branch feedback55).
+            if req.body.len() > MARKDOWN_BODY {
+                return rpc_error(413, "markdown here takes at most 1 MB of JSON: make a longer text's in a route or a server fn");
+            }
             let args = match serde_json::from_slice::<serde_json::Value>(&req.body) {
                 Ok(serde_json::Value::Array(a)) if (1..=2).contains(&a.len()) => a.iter().map(Value::from_json).collect(),
                 _ => return rpc_error(400, "the body must be a JSON array: [text, options]"),
             };
             return match crate::builtins::markdown(self, args, 0) {
                 Ok(v) => json_response(200, serde_json::json!({ "ok": v.display() })),
+                // Past `--max-compute`: the server's limit, a 500 as a route's (Q-706).
+                Err(Ctrl::Error(e)) if e.msg.contains("--max-compute") => rpc_error(500, &e.msg),
                 Err(Ctrl::Error(e)) => rpc_error(400, &e.msg),
                 Err(_) => rpc_error(500, "markdown failed"),
             };
@@ -2673,6 +2681,9 @@ fn error_page(msg: &str) -> HttpResponse {
 
 /// Largest request body accepted by default (`--max-body`), in bytes.
 pub const MAX_BODY: usize = 10 << 20;
+
+/// Largest body `/_quillo/markdown` takes, in bytes (FEEDBACK55.md, Q-706; branch feedback55).
+pub const MARKDOWN_BODY: usize = 1 << 20;
 
 /// Whether a header can be sent as it is: a name made of token characters,
 /// and a value without line breaks or other control characters, which would

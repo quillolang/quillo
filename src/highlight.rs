@@ -202,23 +202,168 @@ fn starts(s: &[char], i: usize, p: &str) -> bool {
     true
 }
 
-/// Whether `i` is in a route's path (`route ANY /*rest`, `routes /admin`, `mount /blog`),
-/// which the lexer reads as a path: `/*` there starts no comment (branch feedback40-43).
-fn in_route_path(s: &[char], i: usize) -> bool {
-    let mut b = i;
-    while b > 0 && s[b - 1] != '\n' {
+/// Where the route's path is on the line that starts at `b` (`route ANY /*rest`, `routes /admin`,
+/// `mount /blog`), which the lexer reads as a path: `/*` there starts no comment (branch
+/// feedback40-43). Found once a line: a line of many `/*` was read again from its start for
+/// each, and highlighting was quadratic (FEEDBACK55.md, Q-706; branch feedback55).
+fn route_path(s: &[char], b: usize) -> Option<(usize, usize)> {
+    let space = |c: char| matches!(c, ' ' | '\t' | '\r');
+    let skip = |mut j: usize| {
+        while j < s.len() && space(s[j]) {
+            j += 1;
+        }
+        j
+    };
+    let word = |mut j: usize| {
+        let from = j;
+        while j < s.len() && s[j] != '\n' && !space(s[j]) {
+            j += 1;
+        }
+        (from, j)
+    };
+    let (f, t) = word(skip(b));
+    let mut at = skip(t);
+    match s[f..t].iter().collect::<String>().as_str() {
+        "route" => {
+            let (f, t) = word(at);
+            if f == t || !s[f..t].iter().all(|c| c.is_ascii_uppercase()) {
+                return None;
+            }
+            at = skip(t);
+        }
+        "routes" | "mount" => {}
+        _ => return None,
+    }
+    let (f, t) = word(at);
+    (f < t && s[f] == '/').then_some((f, t))
+}
+
+/// Whether `i` is in a route's path. `seen` is the last line looked at: where it ends, and where
+/// its path is, so that each line is read once (Q-706).
+#[inline(never)]
+fn in_route_path(s: &[char], i: usize, seen: &mut (usize, usize, usize)) -> bool {
+    if i >= seen.0 {
+        let (mut b, mut e) = (i, i);
+        while b > seen.0 && s[b - 1] != '\n' {
+            b -= 1;
+        }
+        while e < s.len() && s[e] != '\n' {
+            e += 1;
+        }
+        let (f, t) = route_path(s, b).unwrap_or((0, 0));
+        *seen = (e, f, t);
+    }
+    seen.1 <= i && i < seen.2
+}
+
+/// Where a Python string that starts with `"""` or `'''` at `i` ends, over lines: None when `i`
+/// starts none (FEEDBACK55.md, Q-834; branch feedback55). This and the scans below are out of
+/// `highlight`'s loop, which stays as fast as it was.
+#[inline(never)]
+fn triple_end(s: &[char], i: usize) -> Option<usize> {
+    let triple = if s[i] == '"' { "\"\"\"" } else { "'''" };
+    if !starts(s, i, triple) {
+        return None;
+    }
+    let mut j = i + 3;
+    while j < s.len() && !starts(s, j, triple) {
+        if s[j] == '\\' {
+            j += 1;
+        }
+        j += 1;
+    }
+    Some((j + 3).min(s.len()))
+}
+
+/// Where a Rust character that starts at `i` ends: on the character (`'"'`), or on an escape
+/// (`'\n'`, `'\u{1F600}'`); None for a lifetime, `'a` (Q-834).
+#[inline(never)]
+fn char_end(s: &[char], i: usize) -> Option<usize> {
+    if s.get(i + 1) == Some(&'\\') && s.get(i + 2).is_some_and(|&e| e != '\n') {
+        let mut j = i + 3;
+        while j < s.len() && j < i + 12 && s[j] != '\n' {
+            if s[j] == '\'' {
+                return Some(j + 1);
+            }
+            j += 1;
+        }
+        return None;
+    }
+    (i + 2 < s.len() && !matches!(s[i + 1], '\n' | '\'') && s[i + 2] == '\'').then_some(i + 3)
+}
+
+/// Where a Rust raw string that starts at `i` ends: `r"..."`, `r#"..."#` (to a `"` and as many
+/// `#`), `br"..."`, with no escapes, over lines; None where none starts (a word, `r#type`). Read
+/// as a `"` string, `r"C:\temp\"` went on to the end of the text (FEEDBACK55.md, Q-834; branch
+/// feedback55).
+#[inline(never)]
+fn raw_end(s: &[char], i: usize) -> Option<usize> {
+    let mut j = i + usize::from(s[i] == 'b');
+    if s.get(j) != Some(&'r') {
+        return None;
+    }
+    j += 1;
+    let from = j;
+    while j < s.len() && s[j] == '#' {
+        j += 1;
+    }
+    let hashes = j - from;
+    if s.get(j) != Some(&'"') {
+        return None;
+    }
+    j += 1;
+    while j < s.len() {
+        if s[j] == '"' && s.len() - (j + 1) >= hashes && s[j + 1..j + 1 + hashes].iter().all(|&c| c == '#') {
+            return Some(j + 1 + hashes);
+        }
+        j += 1;
+    }
+    Some(s.len())
+}
+
+/// Where a JavaScript regular expression that starts at `i` ends: at its `/` on the line (one in
+/// `[...]` or escaped is in it), with its flags; else Err, with where its line ends (Q-834).
+#[inline(never)]
+fn regex_end(s: &[char], i: usize) -> Result<usize, usize> {
+    let (mut j, mut class) = (i + 1, false);
+    while j < s.len() && s[j] != '\n' && (class || s[j] != '/') {
+        match s[j] {
+            '\\' if j + 1 < s.len() && s[j + 1] != '\n' => j += 1,
+            '[' => class = true,
+            ']' => class = false,
+            _ => {}
+        }
+        j += 1;
+    }
+    if j == s.len() || s[j] != '/' {
+        return Err(j);
+    }
+    j += 1;
+    while j < s.len() && s[j].is_ascii_alphabetic() {
+        j += 1;
+    }
+    Ok(j)
+}
+
+/// Whether a `/` at `i` starts a JavaScript regular expression: at the start, or after an
+/// operator, a bracket that opens or a keyword such as `return`, where no value has ended
+/// (FEEDBACK55.md, Q-834; branch feedback55).
+#[inline(never)]
+fn regex_may_start(s: &[char], i: usize) -> bool {
+    let mut k = i;
+    while k > 0 && matches!(s[k - 1], ' ' | '\t' | '\r' | '\n') {
+        k -= 1;
+    }
+    if k == 0 || "(,=:[!&|?{};+-*%>~^".contains(s[k - 1]) {
+        return true;
+    }
+    let mut b = k;
+    while b > 0 && k - b < 11 && ident_char(s[b - 1], false) {
         b -= 1;
     }
-    let line: String = s[b..i].iter().collect();
-    let words: Vec<&str> = line.split_whitespace().collect();
-    let partial = if line.ends_with(char::is_whitespace) || words.is_empty() { "" } else { words[words.len() - 1] };
-    let before = &words[..words.len() - usize::from(!partial.is_empty())];
-    let after = match before {
-        ["route", m] => m.chars().all(|c| c.is_ascii_uppercase()),
-        ["routes"] | ["mount"] => true,
-        _ => false,
-    };
-    after && (partial.is_empty() || partial.starts_with('/'))
+    let word: String = s[b..k].iter().collect();
+    (b == 0 || !ident_char(s[b - 1], false))
+        && ["return", "typeof", "instanceof", "case", "do", "else", "in", "of", "new", "delete", "void", "throw", "yield", "await"].contains(&word.as_str())
 }
 
 fn ident_start(c: char) -> bool {
@@ -230,9 +375,38 @@ fn ident_char(c: char, css: bool) -> bool {
 }
 
 pub fn highlight(code: &str, lang: &str) -> String {
+    colour(code, lang, false).unwrap_or_default()
+}
+
+/// `highlight` for a request: None once the request has computed past `--max-compute`, which
+/// it asks every few thousand tokens, so that no text holds its instance past the limit
+/// (FEEDBACK55.md, Q-706; branch feedback55).
+pub fn highlight_within(code: &str, lang: &str) -> Option<String> {
+    colour(code, lang, true)
+}
+
+/// Whether a request, `timed`, has computed past `--max-compute`: it asks once (Q-706).
+fn over(timed: bool) -> bool {
+    timed && crate::httpd::OVER_TIME.load(std::sync::atomic::Ordering::Relaxed) && crate::httpd::over_time()
+}
+
+fn colour(code: &str, lang: &str, timed: bool) -> Option<String> {
     let l = lang_of(lang);
     let s: Vec<char> = code.chars().collect();
     let mut out = String::with_capacity(code.len() * 2);
+    // A language it does not know is text, only escaped, as the guide says: its numbers and
+    // calls were coloured (FEEDBACK55.md, Q-834; branch feedback55).
+    if std::ptr::eq(l, &PLAIN) {
+        escape_into(&mut out, &s);
+        return (!over(timed)).then_some(out);
+    }
+    let (qwe, js, rust, py, sh) = (std::ptr::eq(l, &QWE), std::ptr::eq(l, &JS), std::ptr::eq(l, &RUST), std::ptr::eq(l, &PY), std::ptr::eq(l, &SH));
+    // The last line a route's path was looked for on: where it ends, and the path (Q-706).
+    let mut seen = (0usize, 0usize, 0usize);
+    // JavaScript: where a regular expression may start again, after one that did not close on
+    // its line, so that each line is read for one once (FEEDBACK55.md, Q-834; branch feedback55).
+    let mut no_regex = 0usize;
+    let mut steps = 0u32;
     let mut i = 0;
     let mut plain = 0; // where the text not yet written starts
     let mut depth = 0i32; // CSS: inside braces
@@ -247,10 +421,16 @@ pub fn highlight(code: &str, lang: &str) -> String {
         *plain = to;
     };
     while i < s.len() {
+        // `--max-compute`, every 4096 steps and at the first too, as Markdown's many small blocks
+        // are a call each (FEEDBACK55.md, Q-706; branch feedback55).
+        if steps % 4096 == 0 && over(timed) {
+            return None;
+        }
+        steps = steps.wrapping_add(1);
         let c = s[i];
-        // Comments.
-        if let Some(p) = l.line.iter().find(|p| starts(&s, i, p)) {
-            let _ = p;
+        // Comments. The shell's `#` starts one at a word's start only: `${#a[@]}` and `$#` are
+        // code (FEEDBACK55.md, Q-834; branch feedback55).
+        if l.line.iter().any(|p| starts(&s, i, p)) && !(sh && i > 0 && !matches!(s[i - 1], ' ' | '\t' | '\r' | '\n' | ';' | '|' | '&' | '(' | ')' | '<' | '>')) {
             let mut j = i;
             while j < s.len() && s[j] != '\n' {
                 j += 1;
@@ -261,7 +441,7 @@ pub fn highlight(code: &str, lang: &str) -> String {
         }
         let block = l.block.or(if l.tags { Some(("<!--", "-->")) } else { None });
         if let Some((open, close)) = block {
-            if starts(&s, i, open) && !(l.tags && open == "/*" && in_tag) && !(std::ptr::eq(l, &QWE) && in_route_path(&s, i)) {
+            if starts(&s, i, open) && !(l.tags && open == "/*" && in_tag) && !(qwe && in_route_path(&s, i, &mut seen)) {
                 let mut j = i + open.chars().count();
                 while j < s.len() && !starts(&s, j, close) {
                     j += 1;
@@ -323,10 +503,27 @@ pub fn highlight(code: &str, lang: &str) -> String {
             i += 1;
             continue;
         }
-        // Strings.
-        if l.quotes.contains(c) {
+        // Strings. Python's `"""` and `'''` go on over lines, as Rust's `"` does: a docstring's
+        // lines were coloured as code. Rust's `'"'` is a character and `'a` a lifetime, and
+        // `r"..."` a raw string (FEEDBACK55.md, Q-834; branch feedback55).
+        let quoted = if (c == '"' || c == '\'') && py {
+            triple_end(&s, i)
+        } else if c == '\'' && rust {
+            char_end(&s, i)
+        } else if (c == 'r' || c == 'b') && rust && !(i > 0 && ident_char(s[i - 1], false)) {
+            raw_end(&s, i)
+        } else {
+            None
+        };
+        if let Some(j) = quoted {
+            span(&mut out, &mut plain, i, j, "hl-s");
+            i = j;
+            continue;
+        }
+        // The shell's `it's`: a `'` in a word is no quote (Q-834).
+        if c.is_ascii() && l.quotes.as_bytes().contains(&(c as u8)) && !(sh && c == '\'' && i > 0 && ident_char(s[i - 1], false)) {
             let mut j = i + 1;
-            while j < s.len() && s[j] != c && (c == '`' || s[j] != '\n') {
+            while j < s.len() && s[j] != c && (c == '`' || (rust && c == '"') || s[j] != '\n') {
                 if s[j] == '\\' {
                     j += 1;
                 }
@@ -341,6 +538,18 @@ pub fn highlight(code: &str, lang: &str) -> String {
             span(&mut out, &mut plain, i, j, if key { "hl-a" } else { "hl-s" });
             i = j;
             continue;
+        }
+        // A JavaScript regular expression: `/"/` started a string (FEEDBACK55.md, Q-834; branch
+        // feedback55).
+        if c == '/' && js && i >= no_regex && regex_may_start(&s, i) {
+            match regex_end(&s, i) {
+                Ok(j) => {
+                    span(&mut out, &mut plain, i, j, "hl-s");
+                    i = j;
+                    continue;
+                }
+                Err(line_end) => no_regex = line_end,
+            }
         }
         if l.css {
             match c {
@@ -372,9 +581,12 @@ pub fn highlight(code: &str, lang: &str) -> String {
         let prev_ident = i > 0 && ident_char(s[i - 1], l.css);
         // `-0.5em` is a number in CSS, though `-` is part of its names.
         let prev_word = i > 0 && ident_char(s[i - 1], false);
-        if !prev_word && (c.is_ascii_digit() || (c == '.' && i + 1 < s.len() && s[i + 1].is_ascii_digit())) {
+        // A range's `..` ends a number and starts none: `0..n` was one number (FEEDBACK55.md,
+        // Q-834; branch feedback55).
+        let dots = |j: usize| s[j] == '.' && (s.get(j + 1) == Some(&'.') || (j > 0 && s[j - 1] == '.'));
+        if !prev_word && (c.is_ascii_digit() || (c == '.' && i + 1 < s.len() && s[i + 1].is_ascii_digit() && !dots(i))) {
             let mut j = i;
-            while j < s.len() && (s[j].is_ascii_alphanumeric() || s[j] == '.' || s[j] == '_' || (l.css && s[j] == '%')) {
+            while j < s.len() && (s[j].is_ascii_alphanumeric() || (s[j] == '.' && !dots(j)) || s[j] == '_' || (l.css && s[j] == '%')) {
                 j += 1;
             }
             span(&mut out, &mut plain, i, j, "hl-n");
@@ -388,7 +600,16 @@ pub fn highlight(code: &str, lang: &str) -> String {
                 j += 1;
             }
             let word: String = s[i..j].iter().collect();
-            let probe = if l.nocase { word.to_ascii_lowercase() } else { word.clone() };
+            // The word itself, not a copy of it: this, and a quote looked for among bytes
+            // (above), keep highlighting as fast as before the checks Q-834 added
+            // (FEEDBACK55.md; branch feedback55).
+            let lower;
+            let probe = if l.nocase {
+                lower = word.to_ascii_lowercase();
+                &lower
+            } else {
+                &word
+            };
             let mut k = j;
             while k < s.len() && (s[k] == ' ' || s[k] == '\t') {
                 k += 1;
@@ -423,7 +644,7 @@ pub fn highlight(code: &str, lang: &str) -> String {
         i += 1;
     }
     escape_into(&mut out, &s[plain..]);
-    out
+    Some(out)
 }
 
 #[cfg(test)]
