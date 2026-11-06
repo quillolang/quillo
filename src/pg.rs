@@ -1690,8 +1690,9 @@ pub(crate) fn f32_wide(f: f32) -> f64 {
 }
 
 /// How deep JSON a database gives may nest: PostgreSQL keeps what its stack allows, past
-/// serde_json's 128, which failed the whole query.
-const JSON_DEPTH: usize = 1000;
+/// serde_json's 128, which failed the whole query. As every reader takes (FEEDBACK55.md, Q-875's
+/// second review; branch feedback55).
+const JSON_DEPTH: usize = crate::value::JSON_NESTING;
 
 /// JSON a database gives (PostgreSQL's json and jsonb, MySQL's JSON), as a value, read here
 /// rather than by serde_json, whose limits failed the whole query for one value (FEEDBACK55.md,
@@ -2206,8 +2207,8 @@ mod tests {
         assert_eq!(j(r#""\udc00\ud800\u0041""#), "\"\u{fffd}\u{fffd}A\"");
         assert_eq!(j(" [ ] "), "[]");
         let deep = |n: usize| format!("{}1{}", "[".repeat(n), "]".repeat(n));
-        assert!(!j(&deep(1000)).contains("err("));
-        assert!(j(&deep(1001)).contains("it nests more than 1000 deep"));
+        assert!(!j(&deep(128)).contains("err("));
+        assert!(j(&deep(129)).contains("it nests more than 128 deep"));
         for bad in ["", "[1,", "{\"a\" 1}", "{1: 2}", "tru", "[1] x", "\"abc", "\"\\q\"", "\"\\u12\"", "-", "nul"] {
             assert!(j(bad).starts_with("err(\"db: this JSON could not be read"), "{:?}: {}", bad, j(bad));
         }

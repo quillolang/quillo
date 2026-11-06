@@ -158,7 +158,8 @@ pub fn call(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             eprintln!("quillo: site {}: the cookies it set are not kept on a server, where one visitor's session with it would be every visitor's", name);
         }
     }
-    let j: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    // As deep as every reader takes (FEEDBACK55.md, Q-875's second review; branch feedback55).
+    let j: serde_json::Value = crate::value::json_value(text.as_bytes()).unwrap_or(serde_json::Value::Null);
     if let Some(v) = j.get("ok") {
         return Ok(crate::interp::from_island_json(v));
     }

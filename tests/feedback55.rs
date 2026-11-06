@@ -6563,7 +6563,7 @@ fn a_bit_value_keeps_its_length_on_postgresql() {
 // serde_json could not read fails only its own cell.
 #[test]
 fn json_numbers_past_an_int_are_decs_and_a_bad_value_fails_only_its_cell() {
-    // On a request's stack: a debug build's frames are larger, and reading 1,000 levels
+    // On a request's stack: a debug build's frames are larger, and reading 128 levels (1,000 before)
     // overflowed the test thread's 2 MiB in CI (as feedback51's deep-JSON check does).
     std::thread::Builder::new()
         .stack_size(if cfg!(debug_assertions) { 64 << 20 } else { 16 << 20 })
@@ -6585,13 +6585,13 @@ fn json_numbers_past_an_int_on_a_requests_stack() {
 a[0].p.n == a[1].p.n"#), "false");
     assert_eq!(ev(&mut it, r#"db.one("select p from r4 where id = 7").p"#), r#"{ n: 0.1, é: [true, null, "ü"] }"#);
     // Past a dec and a float, a lone surrogate, deep nesting: each its own row, read with the rest.
-    ev(&mut it, r#"db.exec("insert into r4 (id, p, q) values (8, '{\"n\": 1e400}', '{\"n\": 1e400}'), (9, null, '\"\\ud800x\"'), (10, null, '1e-400'), (11, (repeat('[', 1000) || '1' || repeat(']', 1000))::jsonb, null), (12, (repeat('[', 1001) || '1' || repeat(']', 1001))::jsonb, null), (13, '[]', '{}')")"#);
+    ev(&mut it, r#"db.exec("insert into r4 (id, p, q) values (8, '{\"n\": 1e400}', '{\"n\": 1e400}'), (9, null, '\"\\ud800x\"'), (10, null, '1e-400'), (11, (repeat('[', 128) || '1' || repeat(']', 128))::jsonb, null), (12, (repeat('[', 129) || '1' || repeat(']', 129))::jsonb, null), (13, '[]', '{}')")"#);
     let rows = ev(&mut it, r#"db.query("select id, p, q from r4 where id >= 8 order by id") | map((r) => [r.id, is_err(r.p) ? str(r.p.error) : type_of(r.p), is_err(r.q) ? str(r.q.error) : r.q])"#);
     has(&rows, r#"[8, "db: this JSON could not be read: the number 1000000000000000... (401 characters) is past what a float holds", "db: this JSON could not be read: the number 1e400 is past what a float holds"]"#, "past a float");
     has(&rows, "[9, \"null\", \"\u{fffd}x\"]", "a lone surrogate");
     has(&rows, r#"[10, "null", "db: this JSON could not be read: the number 1e-400 is past what a float holds"]"#, "below a float");
-    has(&rows, r#"[11, "list", null]"#, "1,000 deep");
-    has(&rows, r#"[12, "db: this JSON could not be read: it nests more than 1000 deep", null]"#, "1,001 deep");
+    has(&rows, r#"[11, "list", null]"#, "128 deep");
+    has(&rows, r#"[12, "db: this JSON could not be read: it nests more than 128 deep", null]"#, "129 deep");
     has(&rows, r#"[13, "list", {}]"#, "empty");
     assert_eq!(ev(&mut it, "len(db.query(\"select p from r4\"))"), "13");
     // Past a dec, a float, as jsonb writes a float's whole number in digits: the program's own
@@ -11452,33 +11452,39 @@ fn text_that_looks_like_a_mark_stays_text_in_json() {
 }
 
 // Review of Q-875: json.parse took 128 levels on the server (serde's limit) and some 3,000 in the
-// browser, which then stopped. Both take 1,000, lists and maps, and refuse 1,001 with what the
-// database's JSON says; a map with a key of digits at the bottom keeps its order; brackets in a
-// string are no levels; far deeper is refused, not a stack run out.
+// browser, which then stopped. Both take 128 (the second review: 1,000 let a visitor's body stop
+// the server), lists and maps, and refuse 129 with the same words; a map with a key of digits at
+// the bottom keeps its order; brackets in a string are no levels; far deeper is refused, not a
+// stack run out.
 #[test]
-fn json_nests_1000_levels_on_both_sides() {
+fn json_nests_128_levels_on_both_sides() {
     let cases = [
-        (r#"said(json.parse(deep(1000, "1")))"#, r#"["str", "list"]"#),
-        (r#"said(json.parse(deep(1001, "1")))"#, r#"["str", "invalid JSON: it nests more than 1000 deep"]"#),
-        (r#"said(json.parse(deepm(999, "1")))"#, r#"["str", "map"]"#),
-        (r#"said(json.parse(deepm(1000, "1")))"#, r#"["str", "map"]"#),
-        (r#"said(json.parse(deep(999, "{\"b\":1,\"1\":2}")))"#, r#"["str", "list"]"#),
-        (r#"said(json.parse(deep(1000, "{\"b\":1,\"1\":2}")))"#, r#"["str", "invalid JSON: it nests more than 1000 deep"]"#),
-        (r#"keys(innermost(json.parse(deep(999, "{\"b\":1,\"1\":2}"))))"#, r#"[["str", "str"], ["b", "1"]]"#),
-        (r#"said(json.parse(deepm(500, deep(499, "{\"b\":1,\"1\":2}"))))"#, r#"["str", "map"]"#),
-        (r#"said(json.parse(deepm(500, deep(500, "{\"b\":1,\"1\":2}"))))"#, r#"["str", "invalid JSON: it nests more than 1000 deep"]"#),
-        (r#"said(json.parse(deep(1001, "\"[[[\"")))"#, r#"["str", "invalid JSON: it nests more than 1000 deep"]"#),
-        (r#"said(json.parse(deep(5000, "1")))"#, r#"["str", "invalid JSON: it nests more than 1000 deep"]"#),
-        (r#"said(json.parse(deep(1000, json.stringify(repeat("[", 3000) + "\"]]}{\\"))))"#, r#"["str", "list"]"#),
+        (r#"said(json.parse(deep(128, "1")))"#, r#"["str", "list"]"#),
+        (r#"said(json.parse(deep(129, "1")))"#, r#"["str", "invalid JSON: it nests more than 128 deep"]"#),
+        (r#"said(json.parse(deepm(127, "1")))"#, r#"["str", "map"]"#),
+        (r#"said(json.parse(deepm(128, "1")))"#, r#"["str", "map"]"#),
+        (r#"said(json.parse(deepm(129, "1")))"#, r#"["str", "invalid JSON: it nests more than 128 deep"]"#),
+        (r#"said(json.parse(deep(127, "{\"b\":1,\"1\":2}")))"#, r#"["str", "list"]"#),
+        (r#"said(json.parse(deep(128, "{\"b\":1,\"1\":2}")))"#, r#"["str", "invalid JSON: it nests more than 128 deep"]"#),
+        (r#"keys(innermost(json.parse(deep(127, "{\"b\":1,\"1\":2}"))))"#, r#"[["str", "str"], ["b", "1"]]"#),
+        (r#"said(json.parse(deepm(64, deep(63, "{\"b\":1,\"1\":2}"))))"#, r#"["str", "map"]"#),
+        (r#"said(json.parse(deepm(64, deep(64, "{\"b\":1,\"1\":2}"))))"#, r#"["str", "invalid JSON: it nests more than 128 deep"]"#),
+        (r#"said(json.parse(deep(129, "\"[[[\"")))"#, r#"["str", "invalid JSON: it nests more than 128 deep"]"#),
+        (r#"said(json.parse(deep(5000, "1")))"#, r#"["str", "invalid JSON: it nests more than 128 deep"]"#),
+        (r#"said(json.parse(deep(100000, "1")))"#, r#"["str", "invalid JSON: it nests more than 128 deep"]"#),
+        (r#"said(json.parse(deep(128, json.stringify(repeat("[", 3000) + "\"]]}{\\"))))"#, r#"["str", "list"]"#),
+        (r#"said(json.parse(deep(1, deep(127, "[]"))))"#, r#"["str", "invalid JSON: it nests more than 128 deep"]"#),
+        (r#"said(json.parse(deep(1, deep(128, "[]"))))"#, r#"["str", "invalid JSON: it nests more than 128 deep"]"#),
+        (r#"said(json.parse(deep(1, deep(126, "[]"))))"#, r#"["str", "list"]"#),
     ];
     same_on_both(Q875_REVIEW, &cases);
     same_on_both_after(OLD_JSON, Q875_REVIEW, &cases);
 }
 
-// Review of Q-875: what a program reads as JSON on the server takes 1,000 levels too, a request's
-// body and an answer to `http.get`, and is none past it, as json.parse refuses it (it took 128).
+// Review of Q-875: what a program reads as JSON on the server takes 128 levels too, a request's
+// body and an answer to `http.get`, and is none past it, as json.parse refuses it (serde took 127).
 #[test]
-fn a_request_and_an_answer_nest_1000_levels_of_json() {
+fn a_request_and_an_answer_nest_128_levels_of_json() {
     let src = r#"fn nest(n) = repeat("[", n) + "1" + repeat("]", n)
 route POST /j = type_of(request.json)
 route GET /deep/:n = respond(200, nest(int(n) ?? 0), { "content-type": "application/json" })
@@ -11492,11 +11498,11 @@ route GET /far/:n {
     let d = dir("q875-deep", src);
     let s = support::serve(&d.join("main.qwe"), &[]);
     let nest = |n: usize| format!("{}1{}", "[".repeat(n), "]".repeat(n));
-    for (n, want) in [(129, "list"), (1000, "list"), (1001, "null"), (100_000, "null")] {
+    for (n, want) in [(127, "list"), (128, "list"), (129, "null"), (1000, "null"), (100_000, "null")] {
         let a = support::send(s.port, "POST", "/j", &[("content-type", "application/json")], &nest(n));
         assert_eq!(a.body, want, "a body {} deep", n);
     }
-    for (n, want) in [(1000, "list"), (1001, "null")] {
+    for (n, want) in [(128, "list"), (129, "null")] {
         let a = support::send(s.port, "GET", &format!("/far/{}?port={}", n, s.port), &[], "");
         assert_eq!(a.body, want, "an answer {} deep", n);
     }
@@ -11508,7 +11514,7 @@ route GET /far/:n {
 // crosses as `{"$": [key, value]}` and is read back as the map, in a server fn's answer, in island
 // state, in an argument; the mark still works. Values from the review: one map a visitor's text
 // made `?q=%00int:5` an int on the server, and `a"\0int:5` broke the JSON sent, on either JSON
-// path; JSON deeper than 1,000 levels from http is none; a map with a key of digits to
+// path; JSON deeper than 128 levels from http is none; a map with a key of digits to
 // URLSearchParams and Headers; a markup constant's text.
 #[test]
 fn wire_tags_and_marks_cannot_be_made_from_a_visitors_text() {
@@ -11539,7 +11545,7 @@ component Wire(p) {
         }
         out = push(out, js("String", js_new("URLSearchParams", { page: "2", "10": "x" })))
         out = push(out, js("hdr", { "x-a": "1", "10": "x" }))
-        out = push(out, `${type_of(http.get("/deep/1000").json)} ${type_of(http.get("/deep/1001").json)}`)
+        out = push(out, `${type_of(http.get("/deep/128").json)} ${type_of(http.get("/deep/129").json)}`)
         got = json.stringify(out)
     }}>go</button><p #got>{got}</p></div>
 }
@@ -11623,3 +11629,154 @@ fn maps_in_javascripts_order_merge_in_the_order_set() {
 // ---- end of slice 14's review ----
 
 // ---- end of slice 14 ----
+
+// ---- slice 14's second review ----
+
+// Second review of Q-875, a crash: a visitor's JSON was read 1,000 levels deep, past what the
+// server's own recursion (json.stringify, str, ==, markup, dropping it) takes on a parallel
+// function's stack, and the whole process stopped. Every reader takes 128 levels, as serde took
+// 127: a request's body, json.parse of it, a server fn's arguments, the session. Each reader's
+// deepest value goes through json.stringify, str, ==, unique, markup and being dropped, on the
+// request's thread and inside a parallel of two, in a debug build too (CI's): the server answers
+// each and is there after; one level more is null, an error, or refused; a session that could not
+// be read back is refused at set_session, saying why.
+#[test]
+fn the_deepest_json_a_visitor_sends_is_worked_on_without_a_crash() {
+    let src = r#"fn work(x) = [len(json.stringify(x)), len(str(x)), x == x, len(unique([x, x])), len(str(<p>{x}</p>)) > 0]
+fn both(f) = parallel(f, () => 0)[0]
+route POST /req = work(request.json)
+route POST /par = both(() => work(request.json))
+route POST /parse = work(json.parse(request.body))
+route POST /ppar = both(() => work(json.parse(request.body)))
+route POST /drop {
+    let _x = request.json
+    "dropped"
+}
+route POST /pdrop = both(() => type_of(json.parse(request.body)))
+route POST /sess {
+    set_session({ deep: request.json })
+    "set"
+}
+route GET /who = len(json.stringify(session().deep ?? "nobody"))
+server fn works(x) = work(x)
+server fn pworks(x) = both(() => work(x))
+route GET /alive = "yes"
+"#;
+    let (ok, out) = check(src);
+    assert!(ok, "{}", out);
+    let d = dir("q875-crash", src);
+    let (_g, port, log) = serve_logged(&d, &[]);
+    let json = [("content-type", "application/json")];
+    let list = |n: usize| format!("{}1{}", "[".repeat(n), "]".repeat(n));
+    let map = |n: usize| format!("{}1{}", "{\"a\":".repeat(n), "}".repeat(n));
+    let post = |path: &str, body: &str| {
+        let a = support::send(port, "POST", path, &json, body);
+        (a.status, a.body)
+    };
+    for (body, n) in [(list(128), 257), (map(128), 769)] {
+        for path in ["/req", "/par", "/parse", "/ppar"] {
+            let (status, text) = post(path, &body);
+            assert_eq!(status, 200, "{} {}", path, text);
+            assert!(text.starts_with(&format!("[{},", n)) && text.ends_with(",true,1,true]"), "{}: {}", path, text);
+        }
+        assert_eq!(post("/drop", &body), (200, "dropped".to_string()));
+        assert!(matches!(post("/pdrop", &body), (200, t) if t == "list" || t == "map"));
+    }
+    for body in [list(129), map(129), list(100_000)] {
+        assert_eq!(post("/req", &body), (200, "[4,4,true,1,true]".to_string()), "request.json is null");
+        assert_eq!(post("/pdrop", &body), (200, "error".to_string()), "json.parse refuses it");
+    }
+    // A server fn's arguments: the list of them is a level.
+    assert!(matches!(post("/_quillo/rpc/works", &format!("[{}]", list(127))), (200, t) if t.starts_with("{\"ok\":[255,")));
+    assert!(matches!(post("/_quillo/rpc/pworks", &format!("[{}]", map(127))), (200, t) if t.starts_with("{\"ok\":[763,")));
+    assert_eq!(post("/_quillo/rpc/works", &format!("[{}]", list(128))), (400, r#"{"error":"the arguments' JSON it nests more than 128 deep"}"#.to_string()));
+    // The session is kept as `{"e": ..., "d": {"deep": ...}}`: two levels around what is set.
+    let set = support::send(port, "POST", "/sess", &json, &list(126));
+    assert_eq!((set.status, set.body.as_str()), (200, "set"));
+    let cookie = set.header("set-cookie").unwrap().split(';').next().unwrap().to_string();
+    assert_eq!(support::send(port, "GET", "/who", &[("cookie", &cookie)], "").body, "253");
+    assert_eq!(post("/sess", &list(127)).0, 500);
+    assert_eq!(support::send(port, "GET", "/alive", &[], "").body, "yes");
+    let log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(log.contains("`set_session`'s map nests more than 128 deep as it is stored, which no request could read back"), "{}", log);
+}
+
+// Second review of Q-875: a map of rising ids (a key of each set in rising order, which keeps no
+// list) merged with a map adding a named key took the other's largest id or kept its own, and a
+// later id went before the named key; `+`, a spread and group_by's the same. Merged, its order is
+// exact, the merged ids as they are.
+#[test]
+fn rising_ids_merged_keep_the_order_set() {
+    same_on_both("", &[
+        (r#"keys(set(merge(set({}, "5", "a"), { x: 1 }), "7", 1))"#, r#"[["str", "str", "str"], ["5", "x", "7"]]"#),
+        (r#"keys(set(merge({ "1": 1, "5": 5 }, set({}, "1", 2)), "3", 3))"#, r#"[["str", "str", "str"], ["1", "5", "3"]]"#),
+        (r#"keys(set(set({}, "5", "a") + { x: 1 }, "7", 1))"#, r#"[["str", "str", "str"], ["5", "x", "7"]]"#),
+        (r#"keys(set(merge(group_by([1, 2], (x) => x), { x: 1 }), "3", 0))"#, r#"[["str", "str", "str", "str"], ["1", "2", "x", "3"]]"#),
+        (r#"keys(set(merge(set({}, "5", "a"), set({}, "5", "b")), "6", 1))"#, r#"[["str", "str"], ["5", "6"]]"#),
+        (r#"keys(set(merge(set({}, "5", "a"), {}), "6", 1))"#, r#"[["str", "str"], ["5", "6"]]"#),
+        (r#"keys(set({ ...set({}, "5", "a"), x: 1 }, "7", 1))"#, r#"[["str", "str", "str"], ["5", "x", "7"]]"#),
+        (r#"keys(set(set(set({}, "1", "a"), "x", 1), "2", 0))"#, r#"[["str", "str", "str"], ["1", "x", "2"]]"#),
+    ]);
+}
+
+// Second review of Q-875: a map of rising ids reached the page's code with its own symbol
+// (URLSearchParams and Headers threw, lodash's isEqual said false); and past 16 levels a whole
+// float was the runtime's own object, `{f: 2}`. The page gets plain copies, numbers.
+#[test]
+fn the_page_gets_no_symbol_of_rising_ids_and_numbers_past_16_levels() {
+    let src = r#"fn __t() {
+  let ids = set(set({}, "1", "a"), "2", "b")
+  let deep = [[[[[[[[[[[[[[[[[[[[{ "1": 2.0, b: set({}, "3", 1.0) }]]]]]]]]]]]]]]]]]]]]
+  [js("own", ids), js("own", [ids, { x: ids }]), js("String", js_new("URLSearchParams", ids)), js("hdr", set(set({}, "1", "a"), "x-b", "c")), js("own", deep), js("nums", deep)]
+}
+"#;
+    let (ok, out) = check(src);
+    assert!(ok, "{}", out);
+    let mut it = quillo::Interp::new(".");
+    it.load_source(src, "case.qwe").unwrap();
+    let prelude = r#"globalThis.own = (...xs) => { let n = 0; const walk = (v) => { if (v && typeof v === "object") { n += Reflect.ownKeys(v).filter((k) => typeof k === "symbol").length; for (const k of Object.keys(v)) walk(v[k]); } }; xs.forEach(walk); return n; };
+globalThis.hdr = (o) => [...new Headers(o)].map((p) => p.join("=")).join(";");
+globalThis.nums = (v) => { let x = v; while (Array.isArray(x)) x = x[0]; return typeof x["1"] + " " + typeof x.b["3"] + " " + JSON.stringify(x); };"#;
+    let Some(got) = in_node(&format!("{}\n{}", prelude, quillo::client::test_script(&it, "__t").unwrap())) else { return };
+    assert_eq!(got, r#"[0, 0, "1=a&2=b", "1=a;x-b=c", 0, "number number {\"1\":2,\"b\":{\"3\":1}}"]"#);
+}
+
+// Second review of Q-875: a map of one `$` key that keeps a list (the rest of its keys taken out)
+// went to the server unescaped, read there as an int, a decimal, an error value or a file; and in
+// island props and state a map under such a key lost its order (untagged before it was put in
+// order). Each tag is a map on the server, and the maps under them keep their order.
+#[test]
+fn a_dollar_key_with_a_list_and_island_data_under_one_keep_their_place() {
+    let src = r##"fn ks(x) = keys(x) | join(",")
+server fn kind(x) = `${type_of(x)} ${str(x)}`
+component P(data) {
+    state s = { "$s": { b: 1, "1": 2 }, t: { "$u": [{ c: 1, "0": 2 }] } }
+    state got = ""
+    <div><p #p>{ks(data["$p"])} {ks(s["$s"])} {ks(s.t["$u"][0])}</p>
+    <button #go @click={() => {
+        let out = []
+        for k in ["$int", "$dec", "$quillo_err", "$quillo_file", "$", "$x"] {
+            out = push(out, kind(remove(set(set({}, k, "5"), "1", 0), "1")))
+        }
+        out = push(out, kind(remove({ "$int": "5", "1": 0 }, "1")))
+        got = json.stringify(out)
+    }}>go</button><p #got>{got}</p></div>
+}
+route GET / = <html><head><title>t</title></head><body><P data={{ "$p": { b: 1, "1": 2 } }}/></body></html>
+"##;
+    let body = r#"const out = { p: $("p").textContent };
+    $("go").click();
+    for (let i = 0; i < 200 && !$("got").textContent; i++) await tick(30);
+    out.got = JSON.parse($("got").textContent);
+    return out;"#;
+    let Some((r, html)) = in_page("q875-dollar-list", src, "/", body) else { return };
+    assert!(html.contains("<p id=\"p\">b,1 b,1 c,0</p>"), "{}", html);
+    let want = serde_json::json!({
+        "p": "b,1 b,1 c,0",
+        "got": [r#"map { "$int": "5" }"#, r#"map { "$dec": "5" }"#, r#"map { "$quillo_err": "5" }"#, r#"map { "$quillo_file": "5" }"#, r#"map { "$": "5" }"#, r#"map { "$x": "5" }"#, r#"map { "$int": "5" }"#],
+        "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// ---- end of slice 14's second review ----

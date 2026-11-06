@@ -99,7 +99,8 @@ fn open(ctx: &str, cookie: &str) -> Option<Value> {
     if !crate::crypto::same(sign(ctx, payload).as_bytes(), sig.as_bytes()) {
         return None;
     }
-    let j: serde_json::Value = serde_json::from_slice(&unb64url(payload)?).ok()?;
+    // At most as deep as every reader takes (FEEDBACK55.md, Q-875's second review; branch feedback55).
+    let j: serde_json::Value = crate::value::json_value(&unb64url(payload)?).ok()?;
     if j.get("e")?.as_u64()? <= now() {
         return None;
     }
@@ -475,8 +476,14 @@ fn set_session(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             _ => return fail(line, format!("`set_session`'s max_age is seconds or a duration like \"30d\", got {}", v.repr())),
         },
     };
+    let stored = serde_json::json!({ "e": now() + age, "d": crate::interp::island_json(&data) });
+    // Read back as JSON at most `JSON_NESTING` deep: one deeper was stored, and the next request
+    // had no session (FEEDBACK55.md, Q-875's second review; branch feedback55).
+    if crate::value::json_value_depth(&stored) > crate::value::JSON_NESTING {
+        return fail(line, format!("`set_session`'s map nests more than {} deep as it is stored, which no request could read back: keep it flatter, or the rest in the database", crate::value::JSON_NESTING));
+    }
     let mut json = Vec::new();
-    serde_json::to_writer(&mut json, &serde_json::json!({ "e": now() + age, "d": crate::interp::island_json(&data) })).ok();
+    serde_json::to_writer(&mut json, &stored).ok();
     let payload = b64url(&json);
     let ctx = context(it);
     let value = format!("{}.{}", payload, sign(&ctx, &payload));

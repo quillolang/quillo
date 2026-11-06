@@ -171,7 +171,7 @@ pub fn join_here(it: &Interp, req: &HttpRequest) -> HttpResponse {
     let Some(nonce) = header("x-quillo-call").filter(|c| !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric())) else {
         return refused(401, "a join carries its nonce (x-quillo-call)");
     };
-    let Ok(body) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+    let Ok(body) = crate::value::json_value(&req.body) else {
         return refused(400, "the body is JSON: {\"service\": ..., \"port\": ...}");
     };
     let service = body["service"].as_str().unwrap_or("").to_string();
@@ -1197,7 +1197,9 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
                         return Outcome::Refused(502, format!("service {}: the answer from {} is not signed by the service", name, url));
                     }
                 }
-                let answer = serde_json::from_str::<serde_json::Value>(&text).ok().filter(|_| status == 200);
+                // As deep as every reader takes (FEEDBACK55.md, Q-875's second review; branch
+                // feedback55), as the bodies below.
+                let answer = crate::value::json_value(text.as_bytes()).ok().filter(|_| status == 200);
                 // What the call published there is announced here too, for
                 // pages of this program watching it (FEEDBACK4.md, Q-038;
                 // branch bank-fixes).
@@ -1497,7 +1499,7 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, caller: V
     if let Some(theirs) = theirs.filter(|t| *t != ours) {
         return refused(409, &format!("`{}` here is `{}`; the caller's copy of this service says `{}`", f, ours, theirs));
     }
-    let args = match serde_json::from_slice::<serde_json::Value>(&req.body) {
+    let args = match crate::value::json_value(&req.body) {
         Ok(serde_json::Value::Array(a)) => a.iter().map(from_wire).collect::<Vec<_>>(),
         _ => return refused(400, "the body must be a JSON array of arguments"),
     };
@@ -1918,7 +1920,7 @@ enum Tried {
 /// mid-deploy, and a call deleted then is lost (FEEDBACK23.md, Q-184; branch
 /// feedback23-fixes). Arguments it refuses (400) will not do any better.
 fn make_later(it: &mut Interp, c: &Later) -> Tried {
-    let args = match serde_json::from_str::<serde_json::Value>(&c.args) {
+    let args = match crate::value::json_value(c.args.as_bytes()) {
         Ok(serde_json::Value::Array(a)) => a.iter().map(from_wire).collect(),
         _ => Vec::new(),
     };
@@ -1960,7 +1962,7 @@ fn later_status(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(match crate::db::later_status(it, id) {
         None => Value::Nil,
         Some((_, _, Some(answer))) => {
-            let j = serde_json::from_str::<serde_json::Value>(&answer).unwrap_or_default();
+            let j = crate::value::json_value(answer.as_bytes()).unwrap_or_default();
             state("done", vec![("result", from_answer(&j))])
         }
         Some((tries, e, None)) if tries < 0 => state("failed", vec![("error", error(e))]),

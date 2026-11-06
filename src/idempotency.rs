@@ -379,7 +379,8 @@ fn render_step(r: R) -> Result<HttpResponse, Ctrl> {
 
 /// The value kept by `render_step`.
 fn step_value(a: &HttpResponse) -> Value {
-    crate::service::from_answer(&serde_json::from_slice(&a.body).unwrap_or_default())
+    // As deep as every reader takes (FEEDBACK55.md, Q-875's second review; branch feedback55).
+    crate::service::from_answer(&crate::value::json_value(&a.body).unwrap_or_default())
 }
 
 /// Ends the request with an answer (kept, or given again).

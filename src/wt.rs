@@ -364,7 +364,8 @@ fn inbox_ok(p: &Peer, ch: &str) -> bool {
 /// leave, `["m", channel, value]` for the channel's handler; `["v", stream]`
 /// to watch a stream (see `media`), `["u", stream]` to stop.
 pub fn from_page(p: &Arc<Peer>, text: &str) {
-    let Ok(serde_json::Value::Array(a)) = serde_json::from_str::<serde_json::Value>(text) else { return };
+    // As deep as every reader takes (FEEDBACK55.md, Q-875's second review; branch feedback55).
+    let Ok(serde_json::Value::Array(a)) = crate::value::json_value(text.as_bytes()) else { return };
     let (Some(kind), Some(ch)) = (a.first().and_then(|k| k.as_str()), a.get(1).and_then(|c| c.as_str())) else { return };
     if !name_ok(ch) {
         return;
@@ -789,7 +790,7 @@ fn relay(it: &mut Interp, op: serde_json::Value) -> Option<Result<serde_json::Va
 /// `POST /_quillo/channel-relay`, in the app: a service's `channel.broadcast`,
 /// `send` or `peers`, done with the app's pages.
 pub fn relay_here(body: &[u8]) -> crate::server::HttpResponse {
-    let Ok(op) = serde_json::from_slice::<serde_json::Value>(body) else {
+    let Ok(op) = crate::value::json_value(body) else {
         return crate::server::HttpResponse { status: 400, headers: Vec::new(), body: b"not JSON\n".to_vec() };
     };
     let ch = op["ch"].as_str().unwrap_or("");
@@ -842,7 +843,7 @@ pub fn answer(it: &mut Interp, name: &str, body: &[u8]) -> crate::server::HttpRe
             Some(path) => mounted(&mut *it, path),
             None => &mut *it,
         };
-        let session = serde_json::from_str::<serde_json::Value>(e["s"].as_str().unwrap_or("{}")).map(|j| Value::from_json(&j)).unwrap_or(Value::Nil);
+        let session = crate::value::json_value(e["s"].as_str().unwrap_or("{}").as_bytes()).map(|j| Value::from_json(&j)).unwrap_or(Value::Nil);
         let session = if matches!(session, Value::Map(_)) { session } else { Value::map(Map::new()) };
         let mut peer = Map::new();
         peer.insert("id".into(), Value::str(e["p"].as_str().unwrap_or("")));
@@ -886,7 +887,7 @@ pub fn answer(it: &mut Interp, name: &str, body: &[u8]) -> crate::server::HttpRe
                 None => Ok(Value::Nil),
             },
             "m" => {
-                let v = serde_json::from_str::<serde_json::Value>(e["v"].as_str().unwrap_or("null")).map(|j| Value::from_json(&j)).unwrap_or(Value::Nil);
+                let v = crate::value::json_value(e["v"].as_str().unwrap_or("null").as_bytes()).map(|j| Value::from_json(&j)).unwrap_or(Value::Nil);
                 it.call(&h.f, args_for(&h.f, vec![v, peer]), 0)
             }
             _ => Ok(Value::Nil),

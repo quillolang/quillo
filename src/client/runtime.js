@@ -68,6 +68,7 @@ function isIdx(k) {
 }
 // The order map o keeps, or undefined; a page's Proxy that refuses the read has none.
 const ordOf = (o) => { try { return o[ORD]; } catch (_) { return undefined; } };
+const topOf = (o) => { try { return o[IDXTOP]; } catch (_) { return undefined; } };
 // o, kept in the order of the first n of ks (its keys, each once).
 const ordered = (o, ks, n = ks.length) => { o[ORD] = ks; o[ORDN] = n; return o; };
 // The keys of map o in the order they were set, to read, not to change.
@@ -108,7 +109,13 @@ function mdel(o, k) {
 // JavaScript's order when both are and b adds no array index.
 function mmerge(a, b) {
   const out = { ...a, ...b };
-  if (ordOf(a) === undefined && ordOf(b) === undefined && !newIdx(a, b)) return out;
+  if (ordOf(a) === undefined && ordOf(b) === undefined && !newIdx(a, b)) {
+    // b's rising ids are not out's, and a key of b's after a's (FEEDBACK55.md, Q-875's second
+    // review; branch feedback55).
+    const ta = topOf(a);
+    if (ta !== undefined || topOf(b) !== undefined) out[IDXTOP] = ta === undefined ? undefined : Infinity;
+    return out;
+  }
   const ks = mkeys(a).slice();
   for (const k of mkeys(b)) if (!hasOwn(a, k)) ks.push(k);
   return ordered(out, ks);
@@ -118,6 +125,9 @@ function newIdx(a, b) {
   for (const k of Object.keys(b)) { if (!isIdx(k)) return false; if (!hasOwn(a, k)) return true; }
   return false;
 }
+// Whether map v keeps an order of its own (a list, or rising ids), which the page's code is not
+// given (see `forPage`; FEEDBACK55.md, Q-875's second review; branch feedback55).
+const keepsOrder = (v) => ordOf(v) !== undefined || topOf(v) !== undefined;
 // Map v as the page's code has it: a plain copy, in the order JavaScript lists it.
 function plainOf(v) {
   const o = {};
@@ -445,7 +455,7 @@ function forPage(v, depth) {
     return out;
   }
   if (!isMap(v)) return v;
-  let out = ordOf(v) === undefined ? v : plainOf(v);
+  let out = keepsOrder(v) ? plainOf(v) : v;
   for (const k of Object.keys(v)) {
     const y = forPage(v[k], depth + 1);
     if (y !== v[k]) { if (out === v) out = { ...v }; putKey(out, k, y); }
@@ -454,14 +464,16 @@ function forPage(v, depth) {
 }
 // Past where `forPage` and `lenient` go (16 levels), a map that keeps its order still given as a
 // plain copy, and what holds one copied; anything else as it is, the page's own objects once.
+// A whole float there too is a number (FEEDBACK55.md, Q-875's second review; branch feedback55).
 function noOrd(v, seen) {
+  if (v instanceof Fl) return v.f;
   if (v === null || typeof v !== "object" || foreign(v)) return v;
   if (seen.has(v)) return seen.get(v);
   seen.set(v, v);
   let out = v;
   if (Array.isArray(v)) v.forEach((x, i) => { const y = noOrd(x, seen); if (y !== x) { if (out === v) out = v.slice(); out[i] = y; } });
   else if (isMap(v)) {
-    if (ordOf(v) !== undefined) out = plainOf(v);
+    if (keepsOrder(v)) out = plainOf(v);
     for (const k of Object.keys(v)) { const y = noOrd(v[k], seen); if (y !== v[k]) { if (out === v) out = { ...v }; putKey(out, k, y); } }
   }
   seen.set(v, out);
@@ -524,7 +536,7 @@ function lenient(v, depth) {
     return out;
   }
   if (!isMap(v)) return v;
-  let out = ordOf(v) === undefined ? v : plainOf(v);
+  let out = keepsOrder(v) ? plainOf(v) : v;
   for (const k of Object.keys(v)) {
     const y = lenient(v[k], depth + 1);
     if (y !== v[k]) { if (out === v) out = { ...v }; out[k] = y; }
@@ -1422,13 +1434,12 @@ function toJSON(v, wire) {
   if (v instanceof Fl) return wire === "tools" ? v.f : rawNum(flJSON(v.f));
   if (isMap(v)) {
     // In the order set (FEEDBACK55.md, Q-875; branch feedback55).
-    const ord = ordOf(v);
-    if (ord !== undefined) { const ks = mkeys(v); return new Kept(ks, ks.map((k) => toJSON(v[k], wire))); }
-    const ks = Object.keys(v);
+    const ord = ordOf(v), ks = ord === undefined ? Object.keys(v) : mkeys(v);
     // A map of one key that starts with `$` goes to the server as `{"$": [key, value]}`, which it
     // reads back as that map: a visitor's key made `{"$int": "5"}` an int there (FEEDBACK55.md,
-    // Q-875's review; branch feedback55).
+    // Q-875's review; branch feedback55); one that keeps a list too (its second review).
     if (wire && ks.length === 1 && ks[0].charCodeAt(0) === 36) return { $: [ks[0], toJSON(v[ks[0]], wire)] };
+    if (ord !== undefined) return new Kept(ks, ks.map((k) => toJSON(v[k], wire)));
     const o = {};
     for (const k of ks) putKey(o, k, toJSON(v[k], wire));
     return o;
@@ -1948,7 +1959,7 @@ B.set = meta((m, k, v = null) => {
   const key = keyText(k);
   // A map that keeps its order, or a key JavaScript would put first, in its place (FEEDBACK55.md,
   // Q-875; branch feedback55).
-  return ordOf(m) === undefined && m[IDXTOP] === undefined && !isIdx(key) ? putKey({ ...m }, key, v) : mput({ ...m }, key, v);
+  return ordOf(m) === undefined && topOf(m) === undefined && !isIdx(key) ? putKey({ ...m }, key, v) : mput({ ...m }, key, v);
 }, "set", null);
 B.remove = meta((c, k) => {
   if (Array.isArray(c)) return c.filter((v) => !eq(v, k));
@@ -2794,7 +2805,7 @@ function jsonNum(v, c) {
 }
 const wellFormed = (s) => (s.isWellFormed ? s.isWellFormed() : !/[\ud800-\udfff]/.test(s.replace(/[\ud800-\udbff][\udc00-\udfff]/g, "")));
 // JSON from the server, or from another site, with its numbers read as the server reads them;
-// `limit`: at most 1,000 levels deep (`JSON_DEEP`).
+// `limit`: at most 128 levels deep (`JSON_DEEP`).
 const readJSON = (text, limit) => parseData(text, null, null, limit);
 // Whether JSON.parse gives its reviver the text each number was written as (Chrome 114, Firefox
 // 135, Safari 18.4 on), asked once.
@@ -2815,53 +2826,60 @@ let numKey = null;
 // and made from their text here: there whole floats were ints, and ints past 2^53 lost digits
 // (found in review of FEEDBACK55.md's Q-775 and Q-776; branch feedback55).
 // A map read from text with a key JavaScript puts first (an array index) is given the order its
-// keys were written in, as the server reads it: from the text, read for its keys too, which costs
-// a fifth of JSON.parse; marking such keys for JSON.parse made it four times as slow. The rest as
-// before (FEEDBACK55.md, Q-875; branch feedback55).
-// `limit`: refused past 1,000 levels, as the server refuses JSON a program reads (FEEDBACK55.md,
-// Q-875's review; branch feedback55); the text read for its keys finds how deep it is too.
+// keys were written in, as the server reads it: from the text, read for its keys, which costs a
+// fifth of JSON.parse; marking such keys for JSON.parse made it four times as slow. Whether one is
+// there, and how deep the text is, the reviver JSON.parse calls on each value already sees
+// (`jsonWalk`): reading the text for them first made json.parse of 1 MB a tenth slower
+// (FEEDBACK55.md, Q-875 and its reviews; branch feedback55).
+// `limit`: refused past 128 levels, as the server refuses JSON a program reads.
 function parseData(text, check, after, limit) {
-  let shape = null;
-  if (IDX_KEY.test(text)) shape = jsonShape(text, limit);
-  else if (limit && tooDeep(text)) throw new SyntaxError(JSON_DEEP);
-  const v = parseNums(text, check, after);
-  if (shape !== null && v !== null && typeof v === "object") keyOrder(v, shape);
+  const walk = jsonWalk(limit);
+  let v;
+  try {
+    v = parseNums(text, check, after, walk);
+  } catch (e) {
+    // Far past 128: JSON.parse ran out of stack before the reviver saw the first level.
+    if (limit && e instanceof RangeError) throw new SyntaxError(JSON_DEEP);
+    throw e;
+  }
+  if (walk.idx && v !== null && typeof v === "object") keyOrder(v, jsonShape(text));
   return v;
 }
 // How deep JSON the program reads may nest, and what is said past it, as the server's
-// `json_too_deep` (FEEDBACK55.md, Q-875's review; branch feedback55).
-const JSON_DEEP = "it nests more than 1000 deep";
-// Whether JSON text `t` nests deeper than that: 1,001 levels take 2,002 characters.
-function tooDeep(t) {
-  if (t.length < 2002) return false;
-  let d = 0;
-  for (let i = 0; i < t.length; i++) {
-    const c = t.charCodeAt(i);
-    if (c === 34) {
-      // To the string's end: a quote after an even number of backslashes.
-      for (;;) {
-        i = t.indexOf("\"", i + 1);
-        if (i < 0) return false;
-        let b = i - 1;
-        while (t.charCodeAt(b) === 92) b--;
-        if ((i - b) % 2 === 1) break;
+// `json_too_deep` (FEEDBACK55.md, Q-875's second review; branch feedback55).
+const JSON_DEEP = "it nests more than 128 deep";
+// What the reviver of JSON.parse sees of each value (`see(holder, key, value)`), which comes after
+// the values inside it: how deep the text is, an error past `limit`, and whether a map has an
+// array index (`idx`). Each holder is a level, with its deepest so far, and whether it is a list.
+function jsonWalk(limit) {
+  const holders = [], heights = [], lists = [];
+  let top = -1, idx = false;
+  return {
+    get idx() { return idx; },
+    see(holder, k, v) {
+      let h = 0;
+      if (typeof v === "object" && v !== null) {
+        if (top >= 0 && holders[top] === v) { h = heights[top] + 1; holders[top--] = null; } else h = 1;
+        if (limit && h > 128) throw new SyntaxError(JSON_DEEP);
       }
-    } else if (c === 91 || c === 123) {
-      if (++d > 1000) return true;
-    } else if (c === 93 || c === 125) d--;
-  }
-  return false;
+      if (top >= 0 && holders[top] === holder) {
+        if (h > heights[top]) heights[top] = h;
+        if (!idx && !lists[top] && isIdx(k)) idx = true;
+      } else {
+        const list = Array.isArray(holder);
+        holders[++top] = holder; heights[top] = h; lists[top] = list;
+        if (!idx && !list && isIdx(k)) idx = true;
+      }
+    },
+  };
 }
-// A key of digits, written or escaped (`\u0031`), in JSON text.
-const IDX_KEY = /"(?:\d|\\u003\d)+"\s*:/;
 // The objects and lists of JSON text `t`, which JSON.parse took, that hold a map with an array
 // index in another place than JavaScript puts it (null for the rest): each such map's keys in the
 // order written, a key written twice in its first place (its value the last one, as JSON.parse
 // takes it). Array indexes first, by number, are where JavaScript has them: such a map needs no
 // order of its own, and is read without taking its keys out of the text.
-function jsonShape(t, limit) {
-  let i = 0, depth = 0;
-  const deeper = () => { if (++depth > 1000 && limit) throw new SyntaxError(JSON_DEEP); };
+function jsonShape(t) {
+  let i = 0;
   const ws = () => { for (;;) { const c = t.charCodeAt(i); if (c === 32 || c === 9 || c === 10 || c === 13) i++; else return; } };
   // The closing quote of the string at `i`: one after an even number of backslashes.
   const strEnd = () => {
@@ -2897,9 +2915,8 @@ function jsonShape(t, limit) {
   // its start (`ordObj`).
   const obj = () => {
     const start = i;
-    deeper();
     i++; ws();
-    if (t.charCodeAt(i) === 125) { i++; depth--; return null; }
+    if (t.charCodeAt(i) === 125) { i++; return null; }
     let kids = null, named = false, last = -1;
     // (Text JSON.parse took: the ends are there, but never read past them.)
     while (i < t.length) {
@@ -2908,7 +2925,7 @@ function jsonShape(t, limit) {
       i = e + 1;
       const x = idxAt(s, e);
       if (x >= 0) {
-        if (named || x <= last) { i = start; depth--; return ordObj(); }
+        if (named || x <= last) { i = start; return ordObj(); }
         last = x;
       } else named = true;
       ws(); i++;
@@ -2917,11 +2934,9 @@ function jsonShape(t, limit) {
       ws();
       if (t.charCodeAt(i++) === 125) break;
     }
-    depth--;
     return kids !== null ? { keys: null, kids, items: null } : null;
   };
   const ordObj = () => {
-    deeper();
     i++;
     const seen = [];
     let kids = null;
@@ -2937,7 +2952,6 @@ function jsonShape(t, limit) {
       ws();
       if (t.charCodeAt(i++) === 125) break;
     }
-    depth--;
     return { keys: seen, kids, items: null };
   };
   // Key k put in `seen` when not there yet: looked for there in a small map, in a set past it.
@@ -2951,9 +2965,8 @@ function jsonShape(t, limit) {
     const c = t.charCodeAt(i);
     if (c === 123) return obj();
     if (c === 91) {
-      deeper();
       i++; ws();
-      if (t.charCodeAt(i) === 93) { i++; depth--; return null; }
+      if (t.charCodeAt(i) === 93) { i++; return null; }
       let items = null, at = 0;
       while (i < t.length) {
         const n = val();
@@ -2961,7 +2974,6 @@ function jsonShape(t, limit) {
         at++; ws();
         if (t.charCodeAt(i++) === 93) break;
       }
-      depth--;
       return items === null ? null : { keys: null, kids: null, items };
     }
     if (c === 34) { i = strEnd() + 1; return null; }
@@ -2980,16 +2992,17 @@ function keyOrder(v, n) {
   if (n.keys !== null) ordered(v, n.keys);
   if (n.kids !== null) for (const [k, c] of n.kids) if (hasOwn(v, k)) keyOrder(v[k], c);
 }
-// `parseData`'s numbers.
-function parseNums(text, check, after) {
-  if (hasJsonSource()) return JSON.parse(text, (k, v, c) => { if (check) check(k, v); return typeof v === "number" ? jsonNum(v, c) : after ? after(v) : v; });
+// `parseData`'s numbers; `walk` sees each value (see `jsonWalk`).
+function parseNums(text, check, after, walk) {
+  if (hasJsonSource()) return JSON.parse(text, function (k, v, c) { if (check) check(k, v); walk.see(this, k, v); return typeof v === "number" ? jsonNum(v, c) : after ? after(v) : v; });
   if (numKey === null) numKey = "\u0000n" + randomTag();
   const key = numKey, written = "\\u0000n" + key.slice(2);
   const marked = text.replace(JSON_TOKEN, (t) => (t[0] === '"' || !tellsType(t) ? t : `{"${written}":"${t}"}`));
-  return JSON.parse(marked, (k, v) => {
+  return JSON.parse(marked, function (k, v) {
     if (k === key) return v;
-    if (v !== null && typeof v === "object" && typeof v[key] === "string") { const n = Number(v[key]); if (check) check(k, n); return jsonNum(n, { source: v[key] }); }
+    if (v !== null && typeof v === "object" && typeof v[key] === "string") { const n = Number(v[key]); if (check) check(k, n); walk.see(this, k, n); return jsonNum(n, { source: v[key] }); }
     if (check) check(k, v);
+    walk.see(this, k, v);
     return after ? after(v) : v;
   });
 }
@@ -5568,10 +5581,9 @@ async function rpcSend(name, args, live, idem) {
     // In the order set, and a map of one key that starts with `$` as `toJSON` writes it
     // (FEEDBACK55.md, Q-875 and its review; branch feedback55).
     if (isMap(v)) {
-      const ord = ordOf(v);
-      if (ord !== undefined) { const ks = mkeys(v); return new Kept(ks, ks.map((k) => pack(v[k]))); }
-      const ks = Object.keys(v);
+      const ord = ordOf(v), ks = ord === undefined ? Object.keys(v) : mkeys(v);
       if (ks.length === 1 && ks[0].charCodeAt(0) === 36) return { $: [ks[0], pack(v[ks[0]])] };
+      if (ord !== undefined) return new Kept(ks, ks.map((k) => pack(v[k])));
       const o = {};
       for (const k of ks) putKey(o, k, pack(v[k]));
       return o;
@@ -7750,9 +7762,11 @@ function run(inst, el, claim, svg) {
 // Island JSON (and a server fn's answer), with error values
 // (`{"$quillo_err": x}`), decimals (`{"$dec": "12.50"}`) and large ints
 // (`{"$int": "9007199254740993"}`) restored.
+// Untagged once read in order: a map under a tag (`{"$": [key, map]}`) lost its order when the
+// reviver untagged it first (FEEDBACK55.md, Q-875's second review; branch feedback55).
 function islandJSON(text, fallback) {
   if (!text) return fallback;
-  return parseData(text, null, untag);
+  return untagDeep(parseData(text));
 }
 function untag(v) {
   if (!v || typeof v !== "object" || Array.isArray(v)) return v;

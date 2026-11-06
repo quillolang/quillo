@@ -1308,7 +1308,7 @@ impl Interp {
             if req.body.len() > MARKDOWN_BODY {
                 return rpc_error(413, "markdown here takes at most 1 MB of JSON: make a longer text's in a route or a server fn");
             }
-            let args = match serde_json::from_slice::<serde_json::Value>(&req.body) {
+            let args = match crate::value::json_value(&req.body) {
                 Ok(serde_json::Value::Array(a)) if (1..=2).contains(&a.len()) => a.iter().map(Value::from_json).collect(),
                 _ => return rpc_error(400, "the body must be a JSON array: [text, options]"),
             };
@@ -1397,8 +1397,11 @@ impl Interp {
                 other => crate::interp::from_island_json(other),
             }
         }
-        let args = match serde_json::from_slice::<serde_json::Value>(&json_args) {
+        // As deep as every reader takes, and said so (FEEDBACK55.md, Q-875's second review; branch
+        // feedback55).
+        let args = match crate::value::json_value(&json_args) {
             Ok(serde_json::Value::Array(a)) => a.iter().map(|j| arg_of(j, &files)).collect::<Vec<_>>(),
+            Err(e) if e == crate::value::json_too_deep() => return rpc_error(400, &format!("the arguments' JSON {}", e)),
             _ => return rpc_error(400, "the body must be a JSON array of arguments"),
         };
         let args = match take_args(self, &c.def, args) {

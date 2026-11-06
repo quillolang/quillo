@@ -560,9 +560,8 @@ impl Value {
     /// took 100 times its size, 1 GB for a visitor's 10 MB (FEEDBACK51.md, Q-660; branch
     /// feedback51-fixes). Past it, an error that says so.
     ///
-    /// At most `JSON_NESTING` levels deep, as the database's JSON and the browser's take: serde's
-    /// own limit refused 128 here, and the browser took some 3,000 (FEEDBACK55.md, Q-875's
-    /// review; branch feedback55). Each level makes room on the stack for the next.
+    /// At most `JSON_NESTING` levels deep, as every reader of JSON takes (`json_value`), the
+    /// database's and the browser's too (FEEDBACK55.md, Q-875's reviews; branch feedback55).
     pub fn parse_json(text: &str) -> serde_json::Result<Value> {
         use serde::Deserialize;
         let budget = (text.len() / 8).max(JSON_VALUES);
@@ -577,12 +576,66 @@ impl Value {
     }
 }
 
-/// How deep JSON a program reads may nest (`Value::parse_json`, the database's JSON).
-pub const JSON_NESTING: usize = 1000;
+/// How deep JSON may nest, for every reader: a program's (`Value::parse_json`), the database's,
+/// sessions', channels', server fns' arguments, services' and idempotent answers (`json_value`),
+/// and the browser's. 1,000 let a visitor's body nest past what the server's recursion
+/// (`json_into`, `repr`, `equal`, Drop) takes on a parallel function's stack, and the process
+/// stopped; serde's own limit took 127 (FEEDBACK55.md, Q-875's second review; branch feedback55).
+pub const JSON_NESTING: usize = 128;
 
-/// What reading JSON nested deeper than `JSON_NESTING` says, as the database's does.
+/// What reading JSON nested deeper than `JSON_NESTING` says, on both sides.
 pub fn json_too_deep() -> String {
     format!("it nests more than {} deep", JSON_NESTING)
+}
+
+/// How many levels JSON text `b` nests (its lists and maps, not what is in its strings), counted
+/// up to one past `JSON_NESTING`.
+pub fn json_depth(b: &[u8]) -> usize {
+    let (mut d, mut most, mut i) = (0usize, 0usize, 0);
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'[' | b'{' => {
+                d += 1;
+                most = most.max(d);
+                if most > JSON_NESTING {
+                    return most;
+                }
+            }
+            b']' | b'}' => d = d.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    most
+}
+
+/// How many levels a JSON value nests (its lists and maps).
+pub fn json_value_depth(j: &serde_json::Value) -> usize {
+    match j {
+        serde_json::Value::Array(a) => 1 + a.iter().map(json_value_depth).max().unwrap_or(0),
+        serde_json::Value::Object(o) => 1 + o.values().map(json_value_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// JSON text read as serde's values, at most `JSON_NESTING` deep, as `Value::parse_json` reads a
+/// program's: serde's own limit took 127.
+pub fn json_value(b: &[u8]) -> Result<serde_json::Value, String> {
+    use serde::Deserialize;
+    if json_depth(b) > JSON_NESTING {
+        return Err(json_too_deep());
+    }
+    let mut de = serde_json::Deserializer::from_slice(b);
+    de.disable_recursion_limit();
+    let j = serde_json::Value::deserialize(&mut de).map_err(|e| e.to_string())?;
+    de.end().map_err(|e| e.to_string())?;
+    Ok(j)
 }
 
 /// A value read from JSON (`Value::parse_json`).
