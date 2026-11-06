@@ -1346,3 +1346,263 @@ fn a_file_opened_by_a_relative_path_is_checked_with_its_program() {
     let d = diags(&rx);
     assert!(d.as_array().is_some_and(|a| a.len() == 1) && d[0]["message"].as_str().unwrap().contains("unknown name `shuot` (did you mean `shout`?)"), "{}", d);
 }
+
+// ---- found while covering ----
+
+// Q-809: a plugin's map of one key whose value is NaN or an infinity came back as the glue's own
+// map of it (`{ k: { "\u0000f64": "NaN" } }`), where one of two keys was right: every shape now
+// gives the float back, inside lists and maps, an f32's too; a map of one finite float, an empty
+// one and the text "NaN" are as they were, and a map given in comes back the same.
+#[test]
+fn a_plugins_map_of_one_float_that_json_has_no_number_for_comes_back_as_the_float() {
+    if !cargo() {
+        return;
+    }
+    let rust = r#"//! effects: none
+use std::collections::HashMap;
+fn one_of(k: &str, x: f64) -> HashMap<String, f64> {
+    let mut m = HashMap::new();
+    m.insert(k.to_string(), x);
+    m
+}
+pub fn one() -> HashMap<String, f64> { one_of("k", f64::NAN) }
+pub fn rows() -> Vec<HashMap<String, f64>> { vec![one(), one_of("a", f64::INFINITY), one_of("b", 1.5), HashMap::new()] }
+pub fn nested() -> HashMap<String, HashMap<String, f32>> {
+    let mut inner = HashMap::new();
+    inner.insert("inner".to_string(), f32::NEG_INFINITY);
+    let mut m = HashMap::new();
+    m.insert("outer".to_string(), inner);
+    m
+}
+pub fn deep() -> Vec<Vec<HashMap<String, Option<f64>>>> {
+    let mut a = HashMap::new();
+    a.insert("x".to_string(), Some(-f64::INFINITY));
+    let mut b = HashMap::new();
+    b.insert("y".to_string(), None);
+    vec![vec![a, b], vec![]]
+}
+pub fn finite() -> HashMap<String, f64> { one_of("k", 2.5) }
+pub fn wide() -> HashMap<String, f64> { one_of("ключ ü", f64::NAN) }
+pub fn texts() -> HashMap<String, String> { let mut m = HashMap::new(); m.insert("k".to_string(), "NaN".to_string()); m }
+pub fn back(m: HashMap<String, f64>) -> HashMap<String, f64> { m }
+pub fn backs(v: Vec<HashMap<String, f32>>) -> Vec<HashMap<String, f32>> { v }
+"#;
+    let main = "use n.rs\nlet a = one()\nprint(a, a.k == a.k, type_of(a.k))\nprint(rows(), nested(), deep())\nprint(finite(), wide(), texts())\nlet nan = 0.0 / 0.0\nprint(back({ k: nan }), back({ k: -1.0 / 0.0 }), back({ k: 0.5 }), back({}), backs([{ s: 1.0 / 0.0 }, {}]))\n";
+    let d = folder("plugin-one-key");
+    std::fs::write(d.join("n.rs"), rust).unwrap();
+    std::fs::write(d.join("main.qwe"), main).unwrap();
+    let (code, out, err) = quillo(&d, &["check", "main.qwe"], 300);
+    assert_eq!(code, Some(0), "{}{}", out, err);
+    let (code, out, err) = quillo(&d, &["run", "main.qwe"], 300);
+    assert_eq!(code, Some(0), "{}", err);
+    assert_eq!(
+        out,
+        "{ k: NaN } false float\n\
+         [{ k: NaN }, { a: inf }, { b: 1.5 }, {}] { outer: { inner: -inf } } [[{ x: -inf }, { y: null }], []]\n\
+         { k: 2.5 } { \"ключ ü\": NaN } { k: \"NaN\" }\n\
+         { k: NaN } { k: -inf } { k: 0.5 } {} [{ s: inf }, {}]\n"
+    );
+}
+
+// Q-792: a function the route's block makes itself, by `fn` or a lambda bound by `let`, is a
+// function in the answer as the program's of that name is: check said nothing and the route
+// answered 500. A call of it is a value; a `let` of a value after the `fn` hides it, and a `fn`
+// after the `let` is the function again; a `match` arm's name is a value.
+#[test]
+fn a_function_the_routes_block_makes_is_told_in_its_answer() {
+    let warn = |line: u32, at: &str, name: &str| format!("{} warning: this route's answer holds a function at `{}` (the function `{}`): JSON has none, so the answer is an internal error (500): leave it out, or call it", line, at, name);
+    let src = "fn helper() = 1
+route GET /a {
+    fn helper() = 2
+    { a: helper }
+}
+route GET /b {
+    fn helper() = 2
+    { n: helper() }
+}
+route GET /c {
+    let f = (x) => x
+    { a: [1, f] }
+}
+route GET /d {
+    let helper = 5
+    { a: helper }
+}
+route GET /e {
+    fn g() = 1
+    let g = 2
+    { a: g }
+}
+route GET /f {
+    let g = 2
+    fn g() = 1
+    { a: g }
+}
+route GET /g {
+    fn größe() = 3
+    if true {
+        let x = 1
+        { \"ü k\": größe, n: x }
+    } else {
+        { \"ü k\": x2() }
+    }
+}
+fn x2() = 4
+route GET /h/:id {
+    fn h() = 1
+    match id {
+        \"1\" => { a: h() }
+        h => { a: h }
+    }
+}
+route GET /i {
+    let f = (x) => x * 2
+    { a: f(3), b: helper(), c: [helper()] }
+}
+";
+    assert_eq!(said(src), [warn(2, "a", "helper"), warn(10, "a[1]", "f"), warn(23, "a", "g"), warn(28, "[\"ü k\"]", "größe")]);
+    // What check tells of is what the route does: an internal error; what it does not, an answer.
+    let (_d, mut it) = program("block-fn-answer", src, &[]);
+    for (url, status, body) in [
+        ("/a", 500, ""),
+        ("/c", 500, ""),
+        ("/f", 500, ""),
+        ("/g", 500, ""),
+        ("/b", 200, "{\"n\":2}"),
+        ("/d", 200, "{\"a\":5}"),
+        ("/e", 200, "{\"a\":2}"),
+        ("/h/2", 200, "{\"a\":\"2\"}"),
+        ("/i", 200, "{\"a\":6,\"b\":1,\"c\":[1]}"),
+    ] {
+        let r = ask(&mut it, "GET", url, &[], b"");
+        assert_eq!(r.status, status, "{}: {}", url, String::from_utf8_lossy(&r.body));
+        if status == 200 {
+            assert_eq!(String::from_utf8_lossy(&r.body), body, "{}", url);
+        }
+    }
+}
+
+// The values a PostgreSQL refusal is about: at a function's name (as written, schema-qualified,
+// quoted), the values in its parentheses alone; at an operator, those beside it; else as before.
+#[test]
+fn values_near_a_function_or_an_operator_are_its_own() {
+    use quillo::sql::values_near;
+    let sql = "select upper($1) as u, $2 as v, pg_catalog.lower($3) as l, \"f\"($4, ($5)) as q, $6 = name";
+    assert_eq!(values_near(sql, sql.find("upper").unwrap()), [1]);
+    assert_eq!(values_near(sql, sql.find("upper").unwrap() + 2), [1]);
+    assert_eq!(values_near(sql, sql.find("pg_catalog").unwrap()), [3]);
+    assert_eq!(values_near(sql, sql.find("\"f\"").unwrap()), [4, 5]);
+    assert_eq!(values_near(sql, sql.find("= name").unwrap()), [6]);
+    // A name with no parentheses after it, an operator with no value beside it: as before.
+    assert_eq!(values_near(sql, sql.find("as v").unwrap()), [1, 2, 3, 4, 5, 6]);
+    assert_eq!(values_near("select 1 + 2, $1", 9), [1]);
+    // An empty call, one never closed, `name.` with nothing after it.
+    assert_eq!(values_near("select now(), $1", 7), Vec::<usize>::new());
+    assert_eq!(values_near("select f($1, $2", 7), [1, 2]);
+    assert_eq!(values_near("select t. ($1), $2", 7), [1, 2]);
+}
+
+/// Each database, fresh for `name`: SQLite (a file), and PostgreSQL and MariaDB where they are
+/// installed. As (kind, URL), and the servers, held while the test runs.
+#[allow(clippy::type_complexity)]
+fn every_db(name: &str) -> (Vec<(&'static str, String)>, (Option<Arc<support::Pg>>, Option<Arc<support::Maria>>)) {
+    let mut out = vec![("sqlite", folder(&format!("db-{}", name)).join("app.db").to_string_lossy().into_owned())];
+    let pg = pg_server();
+    if let Some(pg) = &pg {
+        out.push(("postgres", pg.database(&format!("cf55_{}", name))));
+    }
+    let my = maria_server();
+    if let Some(my) = &my {
+        out.push(("mariadb", my.url(&format!("cf55_{}", name))));
+    }
+    (out, (pg, my))
+}
+
+// Q-731: PostgreSQL's refusal of `upper(?)` with an int is at the function's name, outside its
+// parentheses, and every value went as text again: `select upper(?), ? as v` gave v as "5" where
+// SQLite and MariaDB give 5. Only the values the refusal is about go as text now: the same
+// answers on the three, with ints, floats, text, nulls and decimals, several functions in one
+// statement, an operator against a text column, and in a transaction.
+#[test]
+fn a_value_beside_a_function_that_takes_text_keeps_its_type_everywhere() {
+    let (dbs, _held) = every_db("beside_fn");
+    for (kind, url) in &dbs {
+        let mut it = on_db(&format!("beside-fn-{}", kind), url, "db.exec(\"create table bt (id int, name varchar(20))\")\ndb.exec(\"insert into bt values (1, '42')\")\n");
+        for (body, want) in [
+            ("db.one(\"select upper(?) as u, ? as v\", 12345, 5)", "{ u: \"12345\", v: 5 }"),
+            ("db.one(\"select ? as v, upper(?) as u\", 5, 12345)", "{ v: 5, u: \"12345\" }"),
+            ("db.one(\"select upper(?) as u, ? as v\", 2.5, -0.5)", "{ u: \"2.5\", v: -0.5 }"),
+            ("db.one(\"select upper(?) as u, ? as v, ? as w\", \"ab\", \"5\", \"ü\")", "{ u: \"AB\", v: \"5\", w: \"ü\" }"),
+            ("db.one(\"select upper(?) as u, ? as v\", 12345, null)", "{ u: \"12345\", v: null }"),
+            ("db.one(\"select upper(?) as u, ? as v\", null, 5)", "{ u: null, v: 5 }"),
+            ("db.one(\"select upper(?) as u, ? as v\", 2.50m, 7)", "{ u: \"2.50\", v: 7 }"),
+            ("db.one(\"select upper(?) as u, ? as v\", 2147483648, -2147483649)", "{ u: \"2147483648\", v: -2147483649 }"),
+            ("db.one(\"select upper(?) as a, lower(?) as b, ltrim(?) as c, ? as v, ? as w\", 1, 2, 3, 4, 0.25)", "{ a: \"1\", b: \"2\", c: \"3\", v: 4, w: 0.25 }"),
+            ("db.one(\"select lower(upper(?)) as u, ? as v\", 9, 5)", "{ u: \"9\", v: 5 }"),
+            ("db.one(\"select id, ? as v from bt where name = ?\", 5, 42)", "{ id: 1, v: 5 }"),
+            ("db.one(\"select substring('hello', ?, ?) as s, upper(?) as u, ? as v\", 2, 3, 1, 5)", "{ s: \"ell\", u: \"1\", v: 5 }"),
+        ] {
+            assert_eq!(ev(&mut it, body), want, "{}: {}", kind, body);
+            assert_eq!(ev(&mut it, &format!("db.transaction(() => {})", body)), want, "{} in a transaction: {}", kind, body);
+        }
+    }
+}
+
+// The same on the connections a running server's requests share (PostgreSQL's pipelined ones);
+// and the number of refused tries stays bounded: five functions that take text are each refused
+// once and the value beside them is an int; with more, every value goes as PostgreSQL inferred
+// it, after at most six tries.
+#[test]
+fn a_value_beside_a_function_keeps_its_type_on_shared_connections_in_bounded_tries() {
+    let Some(pg) = pg_server() else { return };
+    let url = pg.database("cf55_beside_lanes");
+    let src = format!(
+        "db.open(\"{}\")\nfn typed(v) = [v, type_of(v)]\nroute GET /one = typed(db.one(\"select upper(?) as u, ? as v\", 12345, 5).v)\nroute GET /float = typed(db.one(\"select upper(?) as u, ? as v\", 1, 2.5).v)\nroute GET /three = db.one(\"select upper(?) as a, lower(?) as b, ltrim(?) as c, ? as v\", 1, 2, 3, 4)\n",
+        url
+    );
+    let d = main_dir("pg-beside-lanes", &src);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    for _ in 0..2 {
+        assert_eq!(support::send(s.port, "GET", "/one", &[], "").body, "[5,\"int\"]");
+        assert_eq!(support::send(s.port, "GET", "/float", &[], "").body, "[2.5,\"float\"]");
+        assert_eq!(support::send(s.port, "GET", "/three", &[], "").body, "{\"a\":\"1\",\"b\":\"2\",\"c\":\"3\",\"v\":4}");
+    }
+    let mut it = on_db("pg-beside-tries", &url, "");
+    // Each refusal is logged with its statement, which says which test's it is.
+    let refusals = |pg: &support::Pg, mark: &str| pg.log().matches(mark).count();
+    let five = "upper(?) as a, lower(?) as b, ltrim(?) as c, rtrim(?) as d, md5(?) as e";
+    assert_eq!(ev(&mut it, &format!("db.one(\"select {}, ? as cf55_five\", 1, 2, 3, 4, 5, 6).cf55_five", five)), "6");
+    assert_eq!(refusals(&pg, "cf55_five"), 5);
+    let got = ev(&mut it, &format!("db.one(\"select {}, upper(?) as f, ? as cf55_six\", 1, 2, 3, 4, 5, 6, 7)", five));
+    assert!(got.starts_with("{ a: \"1\", b: \"2\", c: \"3\", d: \"4\", e: \"e4da3b7fbbce2345d7772b0674a318d5\", f: \"6\", cf55_six: "), "{}", got);
+    assert_eq!(refusals(&pg, "cf55_six"), 6);
+}
+
+// `math` has no `round` (it is Python's math module, whose `round` is a builtin; the guide lists
+// `floor ceil trunc`): `math.round(7 / 2)` went as `round(7 / 2)` on the server and gave 4, where
+// the browser refused it. Refused on both now, as `math.round(3.5)` and a module in a variable
+// are; check says so; the forms the guide gives are exact on both.
+#[test]
+fn math_round_is_refused_on_both_sides_and_the_guides_forms_are_exact() {
+    for body in ["math.round(7 / 2)", "math.round(3.5)", "let m = math\nm.round(7 / 2)", "let x = 5\nx.floor(7 / 2)"] {
+        let Some((server, browser)) = on_both("", body) else { return };
+        assert!(server.starts_with("ERROR: "), "{}: {}", body, server);
+        assert_eq!(browser, server, "{}", body);
+    }
+    for (body, want) in [
+        ("math.floor(7 / 2)", "3"),
+        ("math.ceil(7 / 2)", "4"),
+        ("math.trunc(-7 / 2)", "-3"),
+        ("round(7 / 2)", "4"),
+        ("round(-7 / 2)", "-4"),
+        ("(7 / 2).round()", "4"),
+        ("7 / 2 | round", "4"),
+        ("let m = math\nm.floor(9007199254740995 / 2)", "4503599627370497"),
+        ("round(9007199254740995 / 2)", "4503599627370498"),
+    ] {
+        let Some((server, browser)) = on_both("", body) else { return };
+        assert_eq!(server, want, "{}", body);
+        assert_eq!(browser, server, "{}", body);
+    }
+    assert_eq!(said("print(math.round(7 / 2))"), ["1: `math` has no function `round`"]);
+}

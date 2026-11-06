@@ -1672,10 +1672,46 @@ pub fn in_tx_after(scan: &Scan, mut in_tx: bool) -> bool {
     in_tx
 }
 
-/// The placeholders PostgreSQL's error at byte `at` of `sql` (its `$n` form) is about: those
+/// The placeholders PostgreSQL's error at byte `at` of `sql` (its `$n` form) is about: at a
+/// function's name, those in its parentheses; at an operator, those beside it; else those
 /// inside the innermost parentheses around it, or every one where it is in none. As `$n`'s n.
 pub fn values_near(sql: &str, at: usize) -> Vec<usize> {
     let (toks, _) = lex(Dialect::Postgres, sql);
+    let dollar = |t: &Tok| if let Kind::Param(Mark::Dollar(n)) = t.kind { Some(n) } else { None };
+    // PostgreSQL says "function upper(integer) does not exist" at the name, outside the
+    // parentheses, and "operator does not exist: text = integer" at the `=`: every value went
+    // as text again, so `select upper(?), ? as v` gave v as "5" (FEEDBACK55.md, Q-731; branch
+    // feedback55).
+    if let Some(i) = toks.iter().position(|t| t.start <= at && at < t.end) {
+        match toks[i].kind {
+            Kind::Word | Kind::Quoted => {
+                // `upper(`, `pg_catalog.upper(`, `"f"(`.
+                let mut j = i + 1;
+                while toks.get(j).is_some_and(|t| t.kind == Kind::Dot) && toks.get(j + 1).is_some_and(|t| matches!(t.kind, Kind::Word | Kind::Quoted)) {
+                    j += 2;
+                }
+                if toks.get(j).is_some_and(|t| t.kind == Kind::Open) {
+                    let mut depth = 0usize;
+                    let close = toks[j..].iter().position(|t| {
+                        match t.kind {
+                            Kind::Open => depth += 1,
+                            Kind::Close => depth -= 1,
+                            _ => {}
+                        }
+                        depth == 0
+                    });
+                    return toks[j..close.map_or(toks.len(), |k| j + k)].iter().filter_map(dollar).collect();
+                }
+            }
+            Kind::Op => {
+                let beside: Vec<usize> = [i.checked_sub(1), Some(i + 1)].into_iter().flatten().filter_map(|k| toks.get(k)).filter_map(dollar).collect();
+                if !beside.is_empty() {
+                    return beside;
+                }
+            }
+            _ => {}
+        }
+    }
     let (mut from, mut to) = (0, toks.len());
     let mut opened: Vec<usize> = Vec::new();
     for (i, t) in toks.iter().enumerate() {
@@ -1691,7 +1727,7 @@ pub fn values_near(sql: &str, at: usize) -> Vec<usize> {
             _ => {}
         }
     }
-    toks[from..to].iter().filter_map(|t| if let Kind::Param(Mark::Dollar(n)) = t.kind { Some(n) } else { None }).collect()
+    toks[from..to].iter().filter_map(dollar).collect()
 }
 
 /// What a string token holds: `$tag$...$tag$`, `'...'`, `E'...'`, without its quotes.

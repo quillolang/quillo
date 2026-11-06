@@ -3767,7 +3767,10 @@ impl Interp {
         // `floor(9007199254740995 / 2)` ...498 (FEEDBACK55.md, Q-788; branch feedback55).
         // However the builtin is reached: `fl(a / b)` with `fl` holding it, `m.floor(a / b)` with
         // the module in a variable (found in review).
-        if let (None, [Expr::Binary(BinOp::Div, a, b, at)], Value::Builtin(name, _)) = (&pre, args, &f) {
+        // Not where the builtin is a value's method, `name(recv, a / b)`: `math.round(7 / 2)`,
+        // which `math` has not, went as `round(7 / 2)` and gave 4, where the browser and
+        // `math.round(3.5)` refuse it (FEEDBACK55.md, Q-788; branch feedback55).
+        if let (None, [Expr::Binary(BinOp::Div, a, b, at)], Value::Builtin(name, _), true) = (&pre, args, &f, argv.is_empty()) {
             if ROUNDERS.contains(name) {
                 return match self.div_of(a, b, Some(name), env, *at)? {
                     Ok(exact) => Ok(exact),

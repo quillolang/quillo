@@ -3400,35 +3400,48 @@ impl Checker {
 
     /// The first function written in what `e`, a route's body, answers: a function's name or a
     /// lambda, in the maps and lists written there (through blocks, `if` and `match`), with
-    /// where it is and what it is.
-    fn function_in_answer(&self, e: &Expr, path: &str, hidden: &[String], found: &mut Option<(String, String)>) {
+    /// where it is and what it is. `local`: the names the blocks around it bind, the last one
+    /// counting, each with whether it is a function the block makes.
+    fn function_in_answer(&self, e: &Expr, path: &str, local: &[(String, bool)], found: &mut Option<(String, String)>) {
         if found.is_some() {
             return;
         }
         match e {
             Expr::Lambda(_) if !path.is_empty() => *found = Some((path.to_string(), "a function written there".into())),
+            // A function the block makes (`fn helper() = 2`, `let f = (x) => x`) is a function
+            // in the answer too, as the program's of that name is: check said nothing and the
+            // route answered 500 (FEEDBACK55.md, Q-792; branch feedback55).
+            Expr::Ident(n, _) if !path.is_empty() && local.iter().rev().find(|(h, _)| h == n.as_str()).is_some_and(|(_, f)| *f) => {
+                *found = Some((path.to_string(), format!("the function `{}`", n)));
+            }
             // A function of the program's, or a builtin, by its name, where nothing hides it.
-            Expr::Ident(n, _) if !path.is_empty() && !hidden.iter().any(|h| h == n.as_str()) && !self.is_local(n) && self.globals.get(n.as_str()).is_some_and(|g| g.t.bits == FN) => {
+            Expr::Ident(n, _) if !path.is_empty() && !local.iter().any(|(h, _)| h == n.as_str()) && !self.is_local(n) && self.globals.get(n.as_str()).is_some_and(|g| g.t.bits == FN) => {
                 *found = Some((path.to_string(), format!("the function `{}`", n)));
             }
             Expr::Map(entries) => {
                 for (k, v) in entries {
                     let step = if fmt_key_bare(k) { format!("{}.{}", path, k) } else { format!("{}[{}]", path, serde_json::to_string(k).unwrap_or_default()) };
-                    self.function_in_answer(v, &step, hidden, found);
+                    self.function_in_answer(v, &step, local, found);
                 }
             }
             Expr::List(items) => {
                 for (i, v) in items.iter().enumerate() {
-                    self.function_in_answer(v, &format!("{}[{}]", path, i), hidden, found);
+                    self.function_in_answer(v, &format!("{}[{}]", path, i), local, found);
                 }
             }
             Expr::Block(stmts) => {
-                // The names the block binds itself hide the program's.
-                let mut inner = hidden.to_vec();
+                // The names the block binds itself hide the program's: a value, or a function
+                // of its own.
+                let mut inner = local.to_vec();
                 for st in stmts {
                     match st {
-                        Stmt::Let(p, _, _) => pattern_names(p, &mut inner),
-                        Stmt::Fn(d) => inner.push(d.name.clone()),
+                        Stmt::Let(Pattern::Bind(n), Expr::Lambda(_), _) => inner.push((n.to_string(), true)),
+                        Stmt::Let(p, _, _) => {
+                            let mut names = Vec::new();
+                            pattern_names(p, &mut names);
+                            inner.extend(names.into_iter().map(|n| (n, false)));
+                        }
+                        Stmt::Fn(d) => inner.push((d.name.clone(), true)),
                         _ => {}
                     }
                 }
@@ -3437,15 +3450,17 @@ impl Checker {
                 }
             }
             Expr::If(_, a, b) => {
-                self.function_in_answer(a, path, hidden, found);
+                self.function_in_answer(a, path, local, found);
                 if let Some(b) = b {
-                    self.function_in_answer(b, path, hidden, found);
+                    self.function_in_answer(b, path, local, found);
                 }
             }
             Expr::Match(_, arms, _) => {
                 for a in arms {
-                    let mut inner = hidden.to_vec();
-                    pattern_names(&a.pat, &mut inner);
+                    let mut names = Vec::new();
+                    pattern_names(&a.pat, &mut names);
+                    let mut inner = local.to_vec();
+                    inner.extend(names.into_iter().map(|n| (n, false)));
                     self.function_in_answer(&a.body, path, &inner, found);
                 }
             }

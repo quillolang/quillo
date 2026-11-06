@@ -368,6 +368,13 @@ The command line:
   the files' times when its own thread first ran, so a save made before then was taken for
   the program as it was and never loaded; it now reads them before the server says it is
   listening (found by CI in `no_check_reloads_what_loads`).
+- Found while covering FEEDBACK55's new lines: a Rust plugin's map of one key whose value is
+  NaN or an infinity came back as `{ k: { "\u0000f64": "NaN" } }` (Q-809); on PostgreSQL,
+  `select upper(?) as u, ? as v` gave `v` as text, as every value went as text when one
+  function refused its type: only the values a refusal is about do now, as SQLite and
+  MariaDB give (Q-731); `check` said nothing of a function the route's block makes written
+  in its answer, which answered 500 (Q-792); `math.round(7 / 2)` gave 4 on the server and an
+  error in the browser: `math` has no `round`, and both refuse it (Q-788).
 
 From FEEDBACK55.md:
 

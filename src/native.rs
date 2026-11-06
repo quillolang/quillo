@@ -1616,7 +1616,10 @@ fn answer(v: &serde_json::Value) -> Value {
     }
     fn go(v: &serde_json::Value) -> Value {
         match v {
-            serde_json::Value::Object(o) if o.len() == 1 => match o.get(SPECIAL).and_then(|t| t.as_str()) {
+            // The float's map alone: any other map of one key is gone inside, as one of two is;
+            // `{"k": NaN}` was read as a map of the glue's own (FEEDBACK55.md, Q-809; branch
+            // feedback55).
+            serde_json::Value::Object(o) if o.len() == 1 && o.contains_key(SPECIAL) => match o.get(SPECIAL).and_then(|t| t.as_str()) {
                 Some("NaN") => Value::Float(f64::NAN),
                 Some("inf") => Value::Float(f64::INFINITY),
                 Some("-inf") => Value::Float(f64::NEG_INFINITY),

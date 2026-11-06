@@ -71,16 +71,6 @@ pub fn key(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// A `use` that takes names from a path with no extension says `.qwer`, as the parser
-/// cannot look: it is a `.qwe` file when that is the one there.
-/// A `use` path as `resolve` reads it, but one that starts `./` or `../` counts from the folder of
-/// the file that writes it, `from`, so a library's file can name its neighbour and be checked
-/// alone (FEEDBACK25.md, Q-325; branch feedback27-35-fixes). Given back as the program's folder
-/// counts it, so every file names one file the same way.
-pub fn resolve_from(base: &Path, from: &Path, path: &str) -> String {
-    resolve_use(base, from, path, crate::native::ends_with_any_case(path, ".qwer"))
-}
-
 /// The folder a program's `use`, `import`, `mount` and `service` paths count from: its main
 /// file's, and for a main file that is a link, the folder of the file it leads to, so a tool
 /// linked into the PATH finds its files, which were looked for beside the link (FEEDBACK55.md,
@@ -129,8 +119,11 @@ fn tidy(p: &Path) -> PathBuf {
     out.iter().collect()
 }
 
-/// `resolve_from` for a `use` whose path the parser gave its extension, `implied`
-/// (`LibOptions::implied`), or that was written with one.
+/// A `use` path as `resolve_as` reads it, but one that starts `./` or `../` counts from the
+/// folder of the file that writes it, `from`, so a library's file can name its neighbour and be
+/// checked alone (FEEDBACK25.md, Q-325; branch feedback27-35-fixes). Given back as the program's
+/// folder counts it, so every file names one file the same way. `implied`: whether the parser
+/// gave the path its extension (`LibOptions::implied`), or it was written with one.
 pub fn resolve_use(base: &Path, from: &Path, path: &str, implied: bool) -> String {
     let (base, rel) = from_program(base, from, path);
     resolve_as(&base, &rel, implied)
@@ -189,10 +182,6 @@ fn lexical(p: &Path) -> std::path::PathBuf {
         }
     }
     out
-}
-
-pub fn resolve(base: &Path, path: &str) -> String {
-    resolve_as(base, path, crate::native::ends_with_any_case(path, ".qwer"))
 }
 
 /// A path whose extension the parser gave (`import imaging use img`, `use lib/b`) is whichever of

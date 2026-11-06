@@ -1359,10 +1359,13 @@ fn declared(types: &[Type], params: &[Value]) -> Option<(Vec<Type>, Vec<Type>)> 
 }
 
 /// How many times `typed` prepares a statement with types declared: all of them, then without
-/// those near where PostgreSQL refused them. Never once for each value: 800 ints in `name in
-/// (?, ...)` against a text column made 1,601 tries, 305 ms and as many lines in the server's
-/// log (found in review).
-const TRIES: usize = 2;
+/// those near where PostgreSQL refused them, each time. Never once for each value: 800 ints in
+/// `name in (?, ...)` against a text column made 1,601 tries, 305 ms and as many lines in the
+/// server's log (found in review). Each refusal now lets go only the values it is about (a
+/// function's, an operator's: `sql::values_near`), so `select upper(?), lower(?), ? as v` is
+/// refused twice before `v` goes as what it is; past five such refusals every value goes as
+/// PostgreSQL inferred it, as before (FEEDBACK55.md, Q-731; branch feedback55).
+const TRIES: usize = 6;
 
 /// Where PostgreSQL said a statement was wrong, as a character from 1, if it did.
 fn refused_at(e: &postgres::Error) -> Option<usize> {

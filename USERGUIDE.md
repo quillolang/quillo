@@ -390,7 +390,7 @@ Operators are as in JavaScript, with these meanings:
 |---|---|
 | `+` | numbers add; a string with anything is text (`"n=" + 1` is `"n=1"`, `"a" + null` is `"anull"`); two lists join; two maps merge, the right one's values winning; `true + 1` and `null + 1` are errors |
 | `- * %` | as in JavaScript on numbers; nothing else is converted (`"5" * 2` is an error) |
-| `/` | exact division: `7 / 2` is `3.5`, and a whole result stays an integer (`6 / 2` is `3`); `floor(7 / 2)` is integer division, done in ints past 2^53 too: `floor`, `ceil`, `round`, `math.floor`, `math.ceil` and `math.trunc` of an int divided by an int, written in the call (`floor(a / b)`, `a / b \| floor`, `(a / b).floor()`, `math.floor(a / b)`, a builtin held in a variable), give the exact int, as Python's `a // b` does; a quotient kept in a variable first (`let q = a / b`) is a float, and its digits past 2^53 are gone |
+| `/` | exact division: `7 / 2` is `3.5`, and a whole result stays an integer (`6 / 2` is `3`); `floor(7 / 2)` is integer division, done in ints past 2^53 too: `floor`, `ceil`, `round`, `math.floor`, `math.ceil` and `math.trunc` of an int divided by an int, written in the call (`floor(a / b)`, `a / b \| floor`, `(a / b).floor()`, `math.floor(a / b)`, a builtin held in a variable), give the exact int, as Python's `a // b` does; a quotient kept in a variable first (`let q = a / b`) is a float, and its digits past 2^53 are gone; `math` has no `round` (write `round(a / b)`), on both sides |
 | `== !=` | deep equality, like comparing JSON: `1 == 1.0` and `0.1m == 0.1`, but `1 == "1"` is false (nothing is converted); an int and a float compare exactly, as in Python (`9007199254740993 == 9007199254740992.0` is false), in compiled code and in the browser too; functions are equal only to themselves |
 | `< <= > >=` | comparison of two numbers (ints, floats and decimals mix, exactly; not a decimal and a float), or two strings by code point; a string and a number, booleans, or NaN is an error |
 | `!`, `&&`, `\|\|` | not, and, or; `a && b` and `a \|\| b` give back one of their operands, so `{loading && <Spinner/>}` works |
@@ -6691,8 +6691,10 @@ sends one on purpose. Back it up with `db.exec("vacuum into
   range is refused (`1e39 is out of range for type real`), where it was stored as
   Infinity or 0. A value where nothing in the SQL says its type (`select greatest(?,
   ?)`, `select ? as v`) is declared `int4`, `int8` or `float8` by what it is (text as
-  text), so `greatest(10, 9)` is `10` and `select ? as v` with 5 is `5`, as on the others; when PostgreSQL refuses those types, the
-  statement is tried once more without them.
+  text), so `greatest(10, 9)` is `10` and `select ? as v` with 5 is `5`, as on the others; when PostgreSQL refuses those types, only
+  the values that refusal is about (a function's arguments, an operator's two sides) go as
+  text, so `select upper(?) as u, ? as v` with 12345 and 5 gives `v` as `5`, as SQLite and
+  MariaDB do; a statement is tried at most six times.
 - `last_id` is `null`: use `insert ... returning id` with `db.one`.
 - After a schema statement (`alter table`, `create or replace view`, a `drop`), the
   statements kept on what it names are prepared again, on every connection; one whose
@@ -7237,7 +7239,8 @@ number; a misspelt attribute or event (`clas`, `@clik`), `className`, and `<card
 view `Card`; a name imported as a builtin's; a key written twice in a map
 (`{ a: 1, b: 2, a: 3 }`, `{ a, "a": 2 }`: the last value is the one kept; a spread
 before it is no second key); a function written in a route's answer, which cannot be
-JSON (`` this route's answer holds a function at `f` ``); a job or tick named twice where
+JSON (`` this route's answer holds a function at `f` ``), the program's own or one the
+route's block makes (`fn helper() = 2`, `let f = (x) => x`; a call of it is a value); a job or tick named twice where
 both calls may run. Warnings never make
 it fail.
 
@@ -8185,7 +8188,7 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   A `u64` past `i64`'s range inside a returned `serde_json::Value` is a runtime error
   that names where it is (`.id`, `[1].n`), not a float that has lost digits, and one
   returned alone names its function. NaN and the infinities cross to an `f64` and back
-  as they are (they arrived as `null`); a `serde_json::Value` argument that holds one is
+  as they are, at any depth, a map of one key too (they arrived as `null`); a `serde_json::Value` argument that holds one is
   refused by the argument's name, as JSON has none. An error value given to a Rust
   function, at the top or inside a list or map, is given back, and the function does not
   run.
