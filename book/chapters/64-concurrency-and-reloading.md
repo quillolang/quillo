@@ -370,8 +370,8 @@ exit(total > 0m ? 0 : 3)
 ```
 
 Written the way each is usually written, a script is faster than Python's: `bench/vs-python/run.py`
-times seventeen everyday programs in both, process start included, and Quillo is ahead in all of
-them. Against Python 3.9 on a 10-core Mac, the middle of three runs each:
+times eighteen everyday programs in both, process start included, and Quillo is ahead in all of
+them. Against Python 3.9 on a 10-core Mac, the best of 21 runs each:
 
 | | Python | Quillo |
 |---|---:|---:|
@@ -384,13 +384,16 @@ them. Against Python 3.9 on a 10-core Mac, the middle of three runs each:
 | a grid of 1,000 by 1,000, 100,000 writes | 0.02 s | 0.01 s |
 | a field read a million times | 0.03 s | 0.02 s |
 | 300,000 JSON rows grouped | 0.17 s | 0.14 s |
-| word frequency over 1.2 million words | 0.22 s | 0.20 s |
+| word frequency over 1.2 million words | 0.21 s | 0.15 s |
+| a million counts by an int key | 0.08 s | 0.03 s |
 | a sieve to 2 million | 0.09 s | 0.07 s |
-| `s += "x"` a million times | 0.04 s | 0.04 s |
-| `s[i]` over 300,000 characters | 0.02 s | 0.02 s |
+| `s += "x"` a million times | 0.04 s | 0.01 s |
+| `s[i]` over 300,000 characters | 0.02 s | 0.01 s |
+| a `while` over 200,000 characters | 0.02 s | 0.01 s |
 
-The closest are a `while` over a text and a map of lists, a little under Python's time;
-loops over numbers and lists of them run in machine code (see [Compiled numbers](#compiled-numbers)).
+The closest are a map of lists (0.85 of Python's time), 300,000 JSON rows grouped (0.81) and
+the sieve (0.79); loops over numbers, lists of them, texts and counts run in machine code (see
+[Compiled numbers](#compiled-numbers)).
 
 ## Debugging
 

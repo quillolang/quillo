@@ -29,9 +29,14 @@ things too, or at a script's top. Its first 256 rounds run in the interpreter; a
 has gone that far is compiled for the types its variables have then, and goes on from the
 round it is at. Its body may use ints, floats and bools, lists of them and lists of such
 lists held in variables: `xs[i]`, `g[y][x]`, `len(xs)`, and `xs = xs | set(i, v)`, `g =
-set(g, y, set(g[y], x, v))` and `xs = xs | push(v)` in any of their forms; `let`,
-assignment, `if`, `for` over a range and `while`. A list read in a loop costs about 4 ns a
-round, written about 5, where the interpreter takes 45 (FEEDBACK29.md).
+set(g, y, set(g[y], x, v))` and `xs = xs | push(v)` in any of their forms; texts: `s[i]`
+(a character, as the interpreter gives it), `let c = s[i]`, `len(s)`, a character compared
+with a quoted text, another character or `null`, and `s += x` or `s = s + x`; counting into a
+map by an int key, `m = m | set(k, get(m, k, d) + e)` (also `-`, `*` and `set(m, ...)`, with a
+number for `d`); `let`, assignment, `if`, `for` over a range and `while`. A list read in a
+loop costs about 4 ns a round, written about 5, where the interpreter takes 45 (FEEDBACK29.md);
+a text read by index about 1. A loop that appends to a text and reads it by index in the
+same loop is not compiled.
 
 - What it does is what the interpreter does: an error is the interpreter's own, made from
   the same values (an overflow, a `%` by zero, a `set` past the end, a step of 0).

@@ -505,6 +505,14 @@ From FEEDBACK55.md:
 
 ### Changed
 
+- Loops over a text are compiled (`s[i]`, `len(s)`, a character compared, `s += x`): `s += "x"`
+  a million times, `s[i]` and a `while` over a text take about a quarter of Python's time,
+  where they took about as long. Counting into a map by an int key (`m = m | set(k, get(m, k,
+  0) + 1)`) is compiled too, and looks the key up once in the interpreter for any key: a
+  million counts took 66 times Python's time (each round copied the map) and take a third of
+  it. `==` and `+=` on a text no longer allocate. Every case of `bench/vs-python` is ahead of
+  Python.
+
 - Markdown is rendered by pulldown-cmark 0.13; the 545 Markdown files of the projects render
   byte for byte as before (Q-706).
 - Speed: highlighting ordinary code is as fast or faster (6 KB: Quillo 36 µs, Rust 56, JS 47,
