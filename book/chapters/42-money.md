@@ -28,7 +28,9 @@ A decimal keeps its digits (`12.50m` shows as "12.50"), `+`, `-` and `*` are exa
 and `round` takes the modes banks use: `half_even` (the default), `half_up`, `down`,
 `floor` and the rest. Mixing a decimal with a float is an error, never a silent float:
 `1.5m + 0.5` says to convert one with `dec(x)` or `float(x)`, and `quillo check` finds it
-before the program runs. A route's pattern takes `amount: dec` from a query, a form or
+before the program runs. The browser gives the same answers: a whole float is a float
+there too, so `1.5m + 2.0` is the same error in a component, and `money.of(2.0, "USD")`
+is refused on both sides, as an amount never goes through a float. A route's pattern takes `amount: dec` from a query, a form or
 JSON (`"12.50"` or `12.5`), and JSON answers write decimals as strings, so nothing that
 reads them rounds them. See [Decimals](#decimals).
 

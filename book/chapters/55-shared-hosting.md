@@ -135,7 +135,17 @@ scripts there.
    the lock names is refused rather than built again:
 
 ```
-quillo: will not load the library of ./hi.qwer: libhi-687dd0b24f29e5cf.so is not the library that was built (its SHA-256 differs from .quillo/plugins.lock's); build it with `quillo build`, which writes the lock, and bring .quillo along
+quillo: will not load the library of ./hi.qwer: libhi-d7fb9105-g2-687dd0b24f29e5cf.so is not the library that was built (its SHA-256 differs from .quillo/plugins.lock's); build it with `quillo build`, which writes the lock, and bring .quillo along
+```
+
+A library is named by its file's whole name (so `hi.rs` and `hi.qwer` keep one each), the
+glue's version and a hash of the file's text. A new `quillo` whose glue changed loads
+none of the libraries an older one built: run `quillo build main.qwe` with it once, as
+part of the deploy that brings it, and upload `.quillo/` again. Until then the server
+says so:
+
+```
+quillo: ./hi.qwer was built by an older Quillo, whose libraries this one cannot load, and --no-build says not to build it here: run `quillo build` once where Rust is, and bring .quillo along
 ```
 
 A plugin called inside a `with` function needs a `//! effects:` line in its header. A
@@ -168,9 +178,11 @@ A limit takes what its option takes: `workers = 0` is refused (`` p.toml:2: `wor
 a positive number, as `--workers` takes ``), and so is a `max_body` or `max_compute` of
 0. The start line lists the limits that hold the program: `quillo: policy
 quillo.policy (workers 8)`. A request the policy's `max_compute` ends is a 500, as one
-`--max-compute` ends, and the log names whichever is the tighter (`this request
-computed for longer than the policy p.toml allows (max_compute)`); a page is told `the
-server's policy`, with no path of the server's.
+`--max-compute` ends, wherever it is ended (a loop, a call, `highlight`, `markdown`),
+and the log names whichever is the tighter (`this request computed for longer than the
+policy p.toml allows (max_compute)`, or `... than --max-compute allows`). No `??` takes
+that stop, `highlight(x) ?? x` included. A page is told `the server's policy`, with no
+path of the server's.
 
 `quillo check --policy policy.toml main.qwe`, run before uploading, says what the
 program would be refused. The sections and what each does are in [The

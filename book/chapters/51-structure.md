@@ -80,7 +80,16 @@ losing its orders at each restart.
 - **Paths count from the main file's folder, in every file.** A `use` in `ui/cart.qwe`
   is written `use "lib/money.qwe"`, not `"../lib/money.qwe"`. Paths outside the folder
   work too (`use "../shared/auth.qwe"`). There are no globs: list each file. `quillo
-  run` with no file, or a folder, runs that folder's `main.qwe`.
+  run` with no file, or a folder, runs that folder's `main.qwe`. A main file that is
+  itself a link (`app.qwe -> /srv/releases/42/main.qwe`) takes its `use`, `import`,
+  `mount` and `service` files from beside the real file, while its policy, `.env` and
+  data stay at the link's folder.
+- **A path without an extension is the `.qwe`, `.qwer` or `.rs` file there**, and an
+  error when two are: `` `lib/helpers` could be lib/helpers.qwe or lib/helpers.rs:
+  write the one you mean with its extension ``. Written with its extension, in any case
+  (`MAIN.QWE`, `x.RS`), it is that file only. A file that is not there is one error at
+  its line, with a file near it: `cannot read lib/helper.qwe: No such file or directory
+  (os error 2) (did you mean lib/helpers.qwe?)`.
 - **The main file lists the parts, and each part takes what it calls.** One list in one
   place shows the whole program at a glance, and its order says what comes first. A
   part's own `use` lines say what it depends on.
@@ -111,6 +120,11 @@ import lib/money.qwe use price, tax           // only these
 import lib/money.qwe use price as shop_price  // this one, under another name here
 ```
 
+A type taken `as` another, `import lib/geo.qwe use Point as Pt`, is `Pt` in annotations,
+patterns and type definitions too. `as` cannot take the name of one of the program's
+types, and a name no type can be written as (`P`, one letter) is warned of with one
+that can (`Pt`).
+
 The file comes first, and the first word says what kind of thing it is. There are three
 reasons for that order:
 
@@ -132,6 +146,10 @@ What a file takes is for that file, and is not passed on: when `ui/cart.qwe` tak
 
 For now a name a file did not take still works, with a warning, so a program can move a
 file at a time. A later release makes it an error.
+
+A `return` at the top level of a file ends the file there: nothing after it is defined,
+and `quillo check` says so at the first line after it (``this never runs: the `return`
+at line 2 leaves the file first, so nothing below it is defined``).
 
 ```
 ui/cart.qwe:7: warning: `price` comes from lib/money.qwe, which this file does not take: add `import lib/money.qwe use price` (`quillo fix` writes it)
@@ -184,9 +202,13 @@ main.qwe:3: error: `total` is private to lib/cart.qwe: only that file sees it (m
 ```
 
 A `server fn` cannot be private (it is an address on the server anyone can call: keep the
-work in a private `fn` it calls), and neither can a `type` yet. A top-level `let` named like a builtin (`let last = ...`) or a module (`let
-json = request.json`, `let date = ...`) hides it in every file of the program: name such
-values otherwise (`body`, `created`).
+work in a private `fn` it calls), and neither can a `type` yet. A private function given
+to `schedule` or `every` keeps its job under a name of its own, made from the file's
+path from the main file's folder, so copies of a program started from different folders
+(`quillo run current/main.qwe`, a service under `--split`) share the job. A top-level
+`let` named like a builtin (`let last = ...`) or a module (`let json = request.json`,
+`let date = ...`) hides it in every file of the program: name such values otherwise
+(`body`, `created`).
 
 When a part needs names of its own, give it a boundary:
 
@@ -222,6 +244,11 @@ preload "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
     use Chart
 client /assets/leaflet.js use L
 ```
+
+A file taken whole does not pass its browser names on: a name used through it is warned
+of, with the `client` line to write. One name from two scripts (or a script and a
+module's export) is an error, in `quillo check` and as the program starts, since the
+page would have only the last: take one `as` another name.
 
 So keep the helpers components use in files of their own (`lib/money.qwe` above), apart
 from the files that hold `server fn`s and queries. It is then clear at a glance what runs where, and rules written once check

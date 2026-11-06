@@ -115,7 +115,11 @@ What a reload keeps, and what it starts afresh:
   a stop (requests in progress finish, up to 10 s) and a start, during which the port
   answers nothing. For no gap, run two servers behind limer ([`--register`](#options-of-quillo-run); `/_quillo/health`
   says 503 as soon as one starts stopping) and restart them one at a time. Two programs
-  cannot share a port: `mount` or `service /prefix` them in one.
+  cannot share a port: `mount` or `service /prefix` them in one. A new binary whose Rust
+  glue changed builds the program's Rust files again: run `quillo build` with it as part
+  of the deploy, before the restart (see [Rust](#rust)). While an old and a new copy
+  share one database, a job whose name changed between them may run under both for one
+  slot.
 
 ## Stopping and health
 
@@ -630,10 +634,12 @@ main.qwe:6: error: `udp.listen` needs the net effect, which host.toml does not a
   `--policy` adds one, and `check` names the files only when one is given. A byte-order
   mark at a file's start is skipped. The start line lists the limits that hold the
   program: `quillo: policy p.toml (workers 8; max_compute 10s; max_body 10485760 bytes)`.
-- A request the policy's `max_compute` ends is a 500, as one `--max-compute` ends, and
-  the log names whichever is the tighter: `this request computed for longer than the
-  policy p.toml allows (max_compute)`, or `... than --max-compute allows`. A page (a
-  Markdown preview) is told `the server's policy`, with no path of the server's.
+- A request the policy's `max_compute` ends is a 500, as one `--max-compute` ends,
+  wherever it is ended (a loop, a call, `highlight`, `markdown`), and the log names
+  whichever is the tighter: `this request computed for longer than the policy p.toml
+  allows (max_compute)`, or `... than --max-compute allows`. No `??` takes that stop
+  (`highlight(x) ?? x` too). A page (a Markdown preview) is told `the server's policy`,
+  with no path of the server's.
 - [`--split`](#options-of-quillo-run) passes the `--policy` files and `quillo.policy` to its services; a service
   reads the host's file itself.
 - What a policy holds to is Quillo code and what it loads. A plugin is Rust in the
@@ -735,7 +741,10 @@ no newer than the server's (a plugin linked against a newer glibc does not load 
 older one: build in a CentOS 7 or AlmaLinux 8 container). Upload `.quillo/` with the
 program: `.quillo/native/` and `.quillo/plugins.lock`. Run with [`--no-build`](#options-of-quillo-run), so that
 nothing is ever built on the server, and a library that is not the one built is refused
-rather than built again.
+rather than built again. A new `quillo` whose glue changed (the libraries' names carry its
+version) loads none of the old libraries: run `quillo build main.qwe` with it as part of
+the deploy that brings it, and upload `.quillo/` again; under `--no-build` the server says
+which file was `built by an older Quillo`.
 
 **A policy.** The host's `/etc/quillo/policy.toml` says what any program may do there;
 `quillo.policy` beside the program narrows it for the site (see [The

@@ -4,8 +4,9 @@
 
 The fixes of FEEDBACK55.md's sweep, so far: what a program writes into markup, the files
 `files()` serves, HTTP's answers and cookies, highlighting and Markdown, the three
-databases, components' fields, and the command line: Q-700 to Q-771, Q-773 and Q-834 to
-Q-852. The rest of the report (Q-772, Q-774 to Q-833) is still to come.
+databases, components' fields, the server and the browser giving one answer, a program's
+files and Rust modules, plurals, dates, numbers and images, and the command line: Q-700 to
+Q-782 and Q-807 to Q-852. The rest of the report (Q-783 to Q-806) is still to come.
 
 ### What to change in your code
 
@@ -129,6 +130,96 @@ Markup and components:
   warns when it reads a prop or another state: write `let` (Q-764).
 - **`highlight` of a language it does not know is only escaped**, with no colours (Q-834).
 
+The server and the browser give one answer (the user's rule: money, and every number,
+accurate; Q-775, Q-776):
+
+- **In the browser a whole float is a float**: `2.0 / 0` is `inf` (it stopped with "division
+  by zero"), `type_of(2.0)` is `float`, `match` takes the `float` arm, an `int` parameter,
+  an index, `slice`, `range`, `repeat`, `take` and `round`'s digits refuse `2.0`, and a
+  `float` parameter refuses `2`; a record's `float` field widens an int. Code that relied on
+  the browser taking `2.0` for `2` now stops there as it does on the server (Q-775).
+- **Ints past 2^53 are exact in the browser**, and past 64 bits are the server's `integer
+  overflow` where they were a wrong number: `3037000500 * 3037000500`,
+  `math.factorial(21)`, `math.comb(67, 33)` (Q-776). **`floor`, `ceil` and `round` of an int
+  give the int**, on the server too (it went through a float past 2^53).
+- **`money.of` refuses a whole float in the browser too**, as on the server: an amount
+  never goes through a float (Q-775).
+- **Text orders by code point in the browser**, `trim` takes Unicode's White_Space (U+0085,
+  not U+FEFF), and `replace(s, "", x)` puts `x` before each character and at the end, as on
+  the server (Q-778). **NaN cannot be ordered there either** (`sort`, `min`, `max`, `<`,
+  `stats.median`); `vec.argsort` puts it last (Q-780).
+- **`json.stringify` writes a whole float `2.0` and turns to an exponent where JavaScript
+  does** (`1e+21`, `1e-7`; the server did from 1e16 and below 1e-5), on both sides, and the
+  server's float text takes JavaScript's digit on a tie (`1916218016406818.2`) (Q-777,
+  Q-781). **`json.parse` refuses `1e400` and lone surrogates** in the browser too, and
+  **`float("0x10")`**, `"0b11"` and `"0o17"` are refused there (Q-782).
+- **A CR in text is written `&#13;` and a NUL U+FFFD**, on both sides, `escape()` too
+  (Q-772).
+- **Time zones are the IANA database's names on both sides**: `posixrules`, `Factory`,
+  `Etc/Unknown`, `localtime`, `posix/...`, `right/...`, `US/Pacific-New`,
+  `Canada/East-Saskatchewan`, `SystemV/...` and Java's three-letter ids (`PST`) are unknown
+  zones on both (Q-782); **`+0530` and `+05` are zones on both**, and any other name with a
+  sign (`+5`, a U+2212 minus) on neither (Q-829).
+
+A program's files and Rust (Q-807 to Q-822):
+
+- **Every Rust plugin library is built again once** after this update: the glue is version 2,
+  and libraries are named by the whole file name and the glue version (`x.rs` and `x.qwer`
+  deleted each other's). A deploy with `--no-build` is told `` built by an older Quillo ...
+  run `quillo build` once ``: run `quillo build` with the new binary as part of the deploy,
+  and bring `.quillo/` along. An older Quillo's libraries and lock lines stay, so going back
+  still runs (going back and forward again builds once more) (Q-812, Q-809).
+- **A private name's tag counts from the main file's folder**, not the folder `quillo` was
+  started in, and `--split` services take the app's (Q-807). The tags, and so the names of
+  private `schedule` and `every` jobs, change once for a program started from another folder
+  (`quillo run current/main.qwe`), for files outside the program's folder, and for split
+  services; while an old and a new copy share a database during a rolling deploy, a renamed
+  job may run under both names for one slot: stop the old copy first, or accept it.
+- **A path written with its extension is that file only**: `import lib.qwer use hi` with only
+  `lib.qwe`, or `use helpers.rs` with only `helpers.qwe`, is a missing file, said once at the
+  import line with the near file; **a path without its extension that two files match is an
+  error** (`` `helpers` could be helpers.qwe or helpers.rs: write the one you mean with its
+  extension ``) (Q-819).
+- **A main file reached through a link takes its `use`, `import`, `mount` and `service`
+  files from beside the real file**; its policy, `.env`, data and messages stay at the link's
+  folder (Q-817). A service's file follows the same rules, and a Rust file it uses is built by
+  the service, not read as Quillo by the app.
+- **One browser name from two scripts is an error**, in check and as the program starts
+  (the page had only the last): take one `as` another name (Q-808).
+- **NaN and the infinities reach a Rust `f64` as they are** (they were `null`), and a
+  `serde_json::Value` argument holding one is refused; **an error value given to a Rust
+  function is given back and the function does not run** (it arrived as a map) (Q-809,
+  Q-810).
+- **Rust signatures with a reference inside another type (`Option<&str>`, `Vec<&str>`,
+  `&[&str]`) or a lifetime are not exported**, with the owned type to take, where the glue
+  failed to build the whole file (Q-813). **Rust names are the file's that takes them**:
+  two Rust files may export one name, and a file taking both is told to choose (Q-816).
+- **`use Point as Pt` makes `Pt` a type, and `as` cannot take a type's name** (Q-821).
+- **`quillo check` says code after a top-level `return` never runs**, and does not define
+  what follows it, as the program does (Q-818).
+
+Plurals, dates, numbers and images (Q-823 to Q-833):
+
+- **A count's plural form is CLDR 47's for the number as it is shown**, by its operands, on
+  both sides: `1.5` and `0.5` are `one` in French (they were `other`), `"1.0"` is `one` in
+  Spanish, `2.0` `two` in Arabic, Slovenian's fractions `few`, Filipino and Tagalog count by
+  their last digit. A whole float count takes the form of what `{count}` shows: `1.0` in a
+  route ("1.0 items" in English), `1` in a component ("1 item"), on both sides; a written
+  `zero` form is used only for a 0 shown with no point (Q-823, Q-832).
+- **`date.format`'s styles for `en-CA`, `en-IE`, `en-AU`, `en-IN`, `en-ZA`, `de-AT`, `fr-CA`,
+  `fr-CH`, `es-MX`, `it-CH`, `nl-BE` and `pt-PT` are CLDR's**, where they were the language's
+  or Britain's: `en-CA`'s short date is `2026-09-05`, `de-AT`'s January `Jänner` (Q-828).
+- **`format_number` with no digits keeps every digit** in the browser too, a large whole
+  float is written by its decimal digits there, and a negative number rounded to zero keeps
+  its minus (`-0.00`, `-0`), as `Intl` writes it (Q-827).
+- **`image.convert` and `image.info` follow EXIF orientation**: `width`, `height` and a
+  `crop` are the turned image's (Q-825). **Transparent pixels are white in a JPEG**, where
+  they were black (Q-826).
+- **A service `timeout` or `cooldown` past a century is a century, and one no duration
+  holds is refused** as the program loads, where it panicked (Q-830).
+- **`markdown_page`'s title is the first level-one heading**, setext too, as its text; a `#`
+  line in a code block is none (Q-831).
+
 The command line:
 
 - **A `.env` that cannot be read, is not UTF-8 or is a link to nothing stops the start**
@@ -143,6 +234,9 @@ The command line:
   (Q-851).
 - **The REPL fed from a pipe skips a line that is not UTF-8 and exits 1**; it stopped there
   with 0 (Q-848).
+- **A request the policy's `max_compute` ends is the policy's wherever it is ended**, a loop
+  or a call too, and **no `??` takes that stop** (`highlight(x) ?? y` under a policy took it)
+  (Q-849).
 
 ### Fixed
 
@@ -220,6 +314,32 @@ From FEEDBACK55.md:
   server's policy" to pages; the language server gives diagnostics to projects opened through
   links, reads headers in any case, and answers -32002, -32600 and -32700 as the protocol
   asks.
+- **The server and the browser (Q-772, Q-774, Q-777 to Q-782):** an attribute is compared
+  as a component is taken up: under `--watch` a difference is said (`where it wrote
+  title="x", the browser makes title="y"`) and the component made again, and in production
+  the browser's value is put in place, so an extension rewriting styles makes nothing again;
+  numbers cross as their JSON text in every browser (where `JSON.parse` gives no number's
+  text, Safari before 18.4 and Firefox before 135, one pass marks them first), so a float in
+  a state, a prop or a `server fn`'s answer stays a float both ways; markup made into text
+  is its HTML in the browser (`str`, `+`, `${}`, `json.stringify`, `len`, `==`), as the
+  server writes it; `??` guards a stop in a field or an index on its left in the browser;
+  a map's keys of letters in any script are bare in its text; with `m`, a line ends at
+  `\n` or `\r` (`\r\n` one end), not U+2028; `dec(float)` takes the server's digits on a
+  tie, so money from a float agrees.
+- **A program's files and Rust (Q-811, Q-814, Q-815, Q-820, Q-822):** `r#type` is a name,
+  and the functions after it are read; the `//!` header may follow comments, blank lines and
+  `#![...]`; `std::` paths, `-> &'static str` and comments in a signature are read; a `pub
+  fn`'s `#[cfg(...)]` is kept, and a call of one left out says so; extensions are read in
+  any case (`MAIN.QWE`, `x.RS`), by the language server too; a missing file is one error at
+  its import line for every form, with a near file of any kind, and no cascade of unknown
+  names; a browser name used through a file taken whole is warned of; messages: no `!`
+  marker in list items, a `u64` too large to return names its function, a repeated `use`
+  in a used file at the program's path, "chain" for 65 files, `client "javascript:..."`
+  neither a script nor a module, Quillo's keywords (`view`, `match`) not exported from
+  Rust, and the suggested fixes parse.
+- **Plurals, dates and images (Q-824, Q-833):** two `image.convert` calls to one target at
+  once each write a temporary file of their own and both finish; `Accept-Language`'s `q`
+  weight is read in any case (`Q=0.1`); a locale file may start with a byte-order mark.
 
 ### Changed
 
@@ -231,6 +351,12 @@ From FEEDBACK55.md:
   (the `selected` marks); runtime.js 1.3 KB larger gzipped.
 - Tests: a server a test starts takes a port the system picks (`--port 0`) and reads it from
   its "listening on" line, so another process cannot take it between the pick and the bind.
+  A test's error hiding is the thread's, not the whole process's.
+- The browser's numbers (Q-775): an int `while` loop 263 to 165 ms, `fib(30)` 12 to 9 ms, a
+  float loop 85 to 81 ms (Node); a counter page's runtime 24.4 to 26.4 KB gzipped, as the
+  JSON fallback for older browsers ships with every page. Plurals read the digits of their
+  count: 100,000 `t()` calls with a float count take 32 ms on the server (26 before; with an
+  int, 24), Python's equivalent 54 to 73 ms.
 
 ## 0.7.0 (2026-11-05)
 

@@ -120,9 +120,10 @@ route GET / = <html><body><SignupForm/></body></html>
   empty, or only spaces, hence `seats ?? 0`), and leaves text being typed that already
   reads as the state's number as it is (`1.0`, `2.50`). A text input or a `<select>`
   bound to a state that holds a number gives a number when the text is that number's
-  own form, and text otherwise (`"02"`). `<select value={plan}>` is written on the
-  server as `selected` on the option `plan` names (by its `value`, else its text), and
-  the browser shows that option again when the options change or arrive later; what a
+  own form, and text otherwise (`"02"`); one bound to a float state gives floats, a
+  whole number typed too. `<select value={plan}>` is written on the server as
+  `selected` on the option `plan` names (by its `value`, else its text), and the
+  browser shows that option again when the options change or arrive later; what a
   person picked is kept while the page updates.
 - **There is no debounce.** Rules run on every keystroke, in the browser, which is cheap.
   A check only the server can make (is the address taken?) waits for the submit, as

@@ -2,8 +2,11 @@
 
 - **General:** `print str int float dec len type_of`
 - **Strings:** `upper lower trim split join contains starts_with ends_with replace slice repeat index_of normalize`
-  (`upper` and `lower` know all of Unicode: `"straße"` is `"STRASSE"`; `replace`
-  replaces every occurrence of plain text, not a pattern; regular expressions are `re`,
+  (`upper` and `lower` know all of Unicode: `"straße"` is `"STRASSE"`; `trim` takes off
+  Unicode's White_Space (U+0085 too, not U+FEFF); `replace` replaces every occurrence of
+  plain text, not a pattern, and an empty pattern puts the text before each character and
+  at the end (`replace("abc", "", "-")` is `-a-b-c-`); text orders by code point; each the
+  same in the browser; regular expressions are `re`,
   below). `normalize(s, form)` *(since 0.7)* gives one Unicode form of the text, `"NFC"` unless
   `"NFD"`, `"NFKC"` or `"NFKD"` is given, on both sides: an `é` typed as one character and
   one typed as `e` and an accent are two texts until normalized. Compare emails and user
@@ -14,7 +17,7 @@
   match; `with` is text where `$1`, `$<name>`, `$0` and `$$` stand for the groups, the
   match and `$`, or a function given the match) and `re.split`. A match is
   `{ text, start, end, groups, named }`, positions counting characters as `slice` does.
-  Flags come last: `"i"` (any case), `"m"` (`^` and `$` at each line) and `"s"` (`.`
+  Flags come last: `"i"` (any case), `"m"` (`^` and `$` at each line, a line ending at `\n` or `\r`, `\r\n` as one end, on both sides) and `"s"` (`.`
   matches line breaks too). `re.valid(p, flags)` *(since 0.7)* asks whether a pattern can be run, for
   one from data. They give the same answers on the server and in the browser, but for
   groups in a loop (`(?:(a)|b)*` on `ab`, where the server keeps the group's last match and
@@ -47,8 +50,9 @@
   `markdown` in the component gives an error value), and one that computes past
   [`--max-compute`](#options-of-quillo-run) is a 500.
   `markdown_page(text, { title, lang, html })` is the same as a whole page, for a route:
-  a doctype, a `<head>` with its `<title>` (the option's, else the text's first `#`
-  heading), and the HTML in its `<body>`. Markdown takes time in proportion to the text,
+  a doctype, a `<head>` with its `<title>` (the option's, else the text's first level-one
+  heading, `# Title` or a line underlined with `=`, as the text it shows, without its
+  marks; a `#` line in a code block or in HTML is no heading), and the HTML in its `<body>`. Markdown takes time in proportion to the text,
   whatever marks it holds (a megabyte of `*a_` is 0.03 s), and `markdown`, `markdown_page`
   and `highlight` end at `--max-compute` as a loop does. A fence's language, for
   highlighting, is its first word, to a space or a comma (```` ```rust,ignore ```` is Rust).
@@ -103,7 +107,7 @@ What each does at its edges, where the answer is not what another language would
 
 | Call | Gives |
 |---|---|
-| `sort(xs)`, `sort_by(xs, f)` | ascending and stable; `f` may give a list to sort by several keys, `sort_by(rows, (r) => [r.a, r.b])`, as lists compare item by item, and so do `<`, `>`, `<=` and `>=` (`[1, 2] < [1, 3]`); no comparator and no descending flag (`reverse(sort(xs))`, or `vec.argsort(xs, true)`). Numbers (ints, floats and decimals together), strings (by code point: `"B"` before `"a"`) and lists of those order; `null`, booleans, maps, a string with a number, or a decimal with a float are an error, and comparing `null` says that a miss of `index_of`, `find` or `get` is `null`, not -1 |
+| `sort(xs)`, `sort_by(xs, f)` | ascending and stable; `f` may give a list to sort by several keys, `sort_by(rows, (r) => [r.a, r.b])`, as lists compare item by item, and so do `<`, `>`, `<=` and `>=` (`[1, 2] < [1, 3]`); no comparator and no descending flag (`reverse(sort(xs))`, or `vec.argsort(xs, true)`). Numbers (ints, floats and decimals together), strings (by code point: `"B"` before `"a"`) and lists of those order; `null`, booleans, maps, a string with a number, a decimal with a float, or NaN are an error, in the browser too (`vec.argsort` puts NaN last), and comparing `null` says that a miss of `index_of`, `find` or `get` is `null`, not -1 |
 | `split(s, sep = " ")` | at each single `sep` (`"a  b"` is `["a", "", "b"]`); `split(s, "")` is the characters; no limit |
 | `join(xs, sep = "")` | the items as text, with `sep` between |
 | `filled(x)` | `x`, or `null` for `""`, so `filled(name) ?? "anonymous"` replaces a blank or missing name; `0`, `false`, `[]` and `" "` stay as they are (`filled(trim(x))` counts spaces as blank) |
@@ -116,9 +120,11 @@ What each does at its edges, where the answer is not what another language would
 | `contains(x, y)` | in a string, `y` as text; in a list, an equal item; in a map, a key |
 | `remove(list, x)` | every item equal to `x` gone; `remove(map, k)` the key |
 | `set(xs, i, v)` | `i` past the end is an error |
-| `round(x)` | a float rounds half away from zero (`round(-2.5)` is `-3`) to an int; `round(x, 2)` a float with at most 15 places, from its shortest decimal (`round(1.005, 2)` is `1.01`, as `format_number` writes it); a decimal takes a mode (see [Decimals](#decimals)) |
+| `round(x)` | a float rounds half away from zero (`round(-2.5)` is `-3`) to an int, and an int is itself (exact past 2^53); `round(x, 2)` a float with at most 15 places, from its shortest decimal (`round(1.005, 2)` is `1.01`, as `format_number` writes it); a decimal takes a mode (see [Decimals](#decimals)) |
 | `int(x)` | a float or decimal cut toward zero (an error value when too large for an int); `true` is 1; text of digits only (`int("1.0")`, `int("1e3")` are error values) |
-| `str(x)` | a whole float as `2.0`, never in exponent form (`1e16` is `10000000000000000`); a list or map as Quillo writes it (`{ a: 1, b: "x" }`); `null` as `null` |
+| `float(x)` | a number as a float; text as Rust reads a float (`"2.5"`, `" 7 "`, `"1e3"`, `".5"`, `"inf"`, `"nan"`), so `"0x10"`, `"0b11"`, `"1_000"` and `""` are error values, in the browser too |
+| `floor(x)`, `ceil(x)` | a float to an int; an int as it is, past 2^53 too, as `round(x)` gives it |
+| `str(x)` | a whole float as `2.0` (in a component's text, `2`, on both sides), never in exponent form (`1e16` is `10000000000000000`); a float's shortest digits, a tie taking the even digit as JavaScript does (`1916218016406818.3`, which is held as ...818.25, is written `1916218016406818.2`); markup as its HTML, in the browser too; a list or map as Quillo writes it (`{ a: 1, b: "x" }`, a key of letters, digits and `_` of any script, not starting with a digit, bare (`{ é: 1, 日本: 2 }`), another quoted (`{ "a b": 3, "1a": 4 }`), on both sides); `null` as `null` |
 | `type_of(x)` | one of `null bool int float dec str list map fn html response error` (`promise` for a JavaScript Promise in the browser) |
 | `len(x)` | a string's characters, a list's items, a map's keys; an `html` value's bytes |
 | `min([])`, `max([])`, `first([])` | `null`; `sum([])` is `0`, and a sum of decimals stays exact |
@@ -132,8 +138,8 @@ What each does at its edges, where the answer is not what another language would
 | `read_file(path)` | text: bytes that are not UTF-8 are replaced; a missing file is an error value |
 | `write_file(path, v)` | `v` as text, folders made, the file replaced; `null` or an error value |
 | `escape(s)` | `& < > " '` as entities |
-| `json.parse(s)` | an error value for bad JSON; an int past 64 bits becomes a float; a key given twice keeps the last value |
-| `json.stringify(v, pretty)` | indented by two spaces when `pretty` is true; a decimal as a string, NaN and infinities as `null`, an error value as `{"error": ...}`; JSON past 256 MiB, or nested more than 10,000 deep, is an error value, counted before it is made, as lists that hold one part twice can double at each step *(since 0.7)*; a route's answer the same, a 500 with the reason in the log |
+| `json.parse(s)` | an error value for bad JSON, for a number past a float (`1e400`) and for half of a character (a lone `\ud83d`), on both sides; an int past 64 bits becomes a float; a key given twice keeps the last value |
+| `json.stringify(v, pretty)` | indented by two spaces when `pretty` is true; a whole float as `2.0` (`-0.0` too), so it reads back as a float, and an exponent where JavaScript writes one (`1e+21`, `1e-7`), on both sides; markup as its HTML; a decimal as a string, NaN and infinities as `null`, an error value as `{"error": ...}`; JSON past 256 MiB, or nested more than 10,000 deep, is an error value, counted before it is made, as lists that hold one part twice can double at each step *(since 0.7)*; a route's answer the same, a 500 with the reason in the log |
 
 What is not in the standard library, and what to do instead:
 
@@ -324,7 +330,11 @@ path is judged where it really leads, with its links followed:
 - A link that leads nowhere is refused too: writing through it would make its target,
   wherever that is.
 - A program run through a link (a deploy's `current -> releases/42`) is inside the
-  folder the link leads to, so its own files work as before.
+  folder the link leads to, so its own files work as before. A main file that is itself
+  a link (`app.qwe -> /srv/releases/42/main.qwe`) takes its `use`, `import`, `mount` and
+  `service` files from beside the real file (a `./` path from the real file's folder),
+  while its policy, `.env`, data, Quillo's own tables and messages stay at the link's
+  folder, with the path as it was given.
 - `--allow-path DIR` opens a folder outside on purpose (a path from the folder `quillo`
   runs in, taken as it really is): a deploy's `uploads -> /srv/shared/uploads` needs
   `--allow-path /srv/shared/uploads`.
@@ -422,16 +432,29 @@ turns it around. A later release removes it.
   file); there are no globs, and a `.qwer` file is `use`d the same way (see
   [Rust](#rust)) (FEEDBACK25.md, Q-325).
 - A path may be written without quotes: `use lib/auth.qwe`, `use ../shared/auth.qwe`,
-  and `use lib\auth.qwe`, its backslash read as `/`. Without an extension it is a
-  `.qwe` file (`use lib/auth`). An `import` finds whichever of `.qwer` and `.qwe` is
-  there. `import lib/auth.qwe use *` says the same as `use lib/auth.qwe`: every public
-  name.
+  and `use lib\auth.qwe`, its backslash read as `/`. Without an extension it is the
+  `.qwe`, `.qwer` or `.rs` file there (`use lib/auth`), and an error when two are
+  (`` `helpers` could be helpers.qwe or helpers.rs: write the one you mean with its
+  extension ``); written with its extension, in any case (`MAIN.QWE`, `x.RS`), it is that
+  file only, so `import lib.qwer use hi` with only `lib.qwe` there is an error. A file
+  that is not there is one error at its import line, for every form, with a file near it
+  (`cannot read lib/helpers.rs: No such file or directory (did you mean
+  lib/helpers.qwe?)`), and its names are not said again as unknown. `import lib/auth.qwe
+  use *` says the same as `use lib/auth.qwe`: every public name.
 - A file `use`d twice, or by several files, runs once. Within one file, a second `use`
   of a file, or a name taken twice from it, is a warning: one is enough.
 - A name taken `as` another is called that in the file: after `import lib/m.qwe use
   price as cost`, writing `price` is a warning ("this file takes `price` as `cost`"),
   and still works, as a name not taken does. Take both to have both: `use price as cost,
-  price`.
+  price`. A type taken `as` another, `import lib/geo.qwe use Point as Pt`, is `Pt` in
+  annotations, patterns and type definitions too; `as` cannot take the name of one of
+  the program's types (`import lib.qwe use one as Point` is told `` `Point` is a type of
+  the program: take `one` from lib.qwe under another name ``), and a name no type can be written as (`P`, one letter) is warned of
+  with one that can (`Pt`).
+- A `return` at the top level of a file ends the file there: nothing after it is
+  defined, and `quillo check` says so at the first line after it (``this never runs: the
+  `return` at line 2 leaves the file first, so nothing below it is defined``), as the
+  program does when it runs.
 - A `use` list may go on over lines, each line after a `,`. A `,` at the end of the
   list is an error: the next line is the next statement, not a name to take.
 - **A file's text.** A file is UTF-8; one that is not is refused with the line and column
@@ -470,7 +493,9 @@ turns it around. A later release removes it.
   name two files define.
   Elsewhere `private` and `public` are ordinary names (`{ private: true }`). A private
   function given to `schedule` or `every` keeps its job to itself, under a name of its
-  own (`tick__pv` and eight hex digits in the log).
+  own (`tick__pv` and eight hex digits in the log), made from the file's path from the
+  main file's folder, so copies of a program started from different folders (`quillo
+  run current/main.qwe`, a service under `--split`) share the job.
 - An editor finds the program a file belongs to by looking, in the file's folder and up
   to three above it (stopping at a folder with `.git` or `Cargo.toml`), for the first
   `.qwe` file by name that `use`s it, directly or through others. Keep a program's files
@@ -538,8 +563,9 @@ dec("12.50")  dec(42)  dec(0.1)        // 12.50m, 42m, 0.1m
   answers: arithmetic, comparison, rounding, display. They cross between the server
   and the page (props, state, server fns' arguments and answers) as decimals. Ints too
   large for a JavaScript number (past 2^53) reach the page whole, as BigInts, and show
-  as on the server. The browser cannot tell `2.0` from `2`, so there a whole float
-  added to a decimal counts as an int.
+  as on the server. A whole float is a float there too, so adding one to a decimal is an
+  error on both sides, and `money.of(2.0, "USD")` is refused in both: an amount never goes
+  through a float.
 - `quillo check` knows them: `12.5m + 1` is a `dec`, `12.5m + 0.5` an error, and `round`,
   `abs`, `floor`, `ceil`, `pow`, `sum`, `min` and `max` keep the type they are given. `num`
   is still `int | float`.
@@ -681,7 +707,11 @@ money.format(price, "de-DE")                    // "19,99 $"
   `1.01`; `mode` rounds as `round` does instead (`"half_even"`, as money) *(since 0.7)*.
   `digits` may be `{ min, max }` (`max` is `max(min, 3)` when left out), for as many digits
   as the number needs within them: `format_number(10, "en-US", { max: 3 })` is `10`,
-  `8.875` stays `8.875`, and `{ min: 2, max: 3 }` writes `8.8` as `8.80`.
+  `8.875` stays `8.875`, and `{ min: 2, max: 3 }` writes `8.8` as `8.80`. With no
+  `digits`, every digit of the number is written (`Intl` stops at three), on both sides.
+  A negative number rounded to zero keeps its minus, as `Intl` writes it: `-0.001` to 2
+  digits is `-0.00`, and `-0.0` is `-0`. A whole float past 2^53 is written by its
+  decimal digits in the browser too, from Quillo or from the page's JavaScript.
 - There are no exchange rates: an amount stays in its currency, and converting is the
   program's arithmetic with a rate it chose.
 
@@ -842,8 +872,14 @@ date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or a
   second; when they go forward, a skipped time is moved on by the gap (02:30 becoming
   03:30), or `{ skipped: "earlier" }` moved back, or `{ skipped: "error" }` an error
   value: `date.at: 2026-03-08 02:30 is skipped in that zone, as its clocks move
-  forward`. A zone is an IANA name (`"Europe/Paris"`), `"UTC"`, or
-  an offset (`"+05:30"`); left out, it is UTC. An offset of zero is written `Z`. The server
+  forward`. A zone is a name of the IANA database, a zone or a link, in any case
+  (`"Europe/Paris"`, `"US/Pacific"`, `"EST"`), `"UTC"`, or an offset as `date.parse` reads
+  one (`"+05:30"`, `"+0530"`, `"+05"`, up to `+23:59`); left out, it is UTC. An offset of
+  zero is written `Z`. The server and the browser take the same zones and refuse the same
+  names, as an unknown time zone: `posixrules`, `Factory`, `Etc/Unknown`, `localtime`,
+  `posix/...` and `right/...` (copies some systems keep), names the database dropped
+  (`US/Pacific-New`, `Canada/East-Saskatchewan`, `SystemV/...`), Java's three-letter ids
+  (`PST`), and any other name with a sign (`+5`, `+0560`, a U+2212 minus). The server
   reads the system's time zone database, or a copy built into `quillo` where there is none
   (Windows, small containers); the browser asks its own (`Intl`).
 - **Text:** `date.format(d, pattern)` with `YYYY YY`, `MM M` (month number, padded or
@@ -852,10 +888,13 @@ date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or a
   `[brackets]`, is kept as it is. A date-time shows its time as written: `date.to_zone` it
   first to show another zone's. `date.format(d, { locale, style })` gives a locale's
   `"short"`, `"medium"` (the default), `"long"` or `"full"` date, and `{ locale, pattern }`
-  the pattern with that language's names. The locales are English (US, and the British
-  style for `en-GB`, `en-AU`, `en-IE`, `en-NZ`, `en-IN`, `en-ZA`), German, French, Spanish,
-  Italian, Dutch and Portuguese, as the server and the browser both have them (CLDR's
-  forms); any other gives English. `date.parse(s)` reads a date or a date-time, with `T` or
+  the pattern with that language's names. The locales are English, German, French,
+  Spanish, Italian, Dutch and Portuguese, and the regions whose styles CLDR gives their
+  own: `en-GB`, `en-CA` (`2026-09-05` short), `en-IE`, `en-AU`, `en-NZ`, `en-IN`,
+  `en-ZA`, `de-AT` (`Jänner`, `Jän.`), `fr-CA`, `fr-CH`, `es-MX`, `it-CH`, `nl-BE` and
+  `pt-PT`, the same on the server and in the browser (CLDR's forms, names in a pattern
+  too); another region takes its language's (`de-CH` is German's), and any other
+  language gives English. `date.parse(s)` reads a date or a date-time, with `T` or
   a space and an offset (`+01`, `+0100`, `+01:00` or `Z`), and gives it back as above;
   a date-time with no offset is an error value that says to read it with `date.at(v,
   zone)`, as it names no instant until a zone is given; an HTTP date (`Tue, 27 Oct 2026

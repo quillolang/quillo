@@ -460,8 +460,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
   browser (`{open && <Detail/>}` after a click) carries `data-c` alone (FEEDBACK42.md,
   Q-487). Values cross as JSON, with these marked so they come back as they were: a
   decimal (`{"$dec": "12.50"}`), an int past 2^53 (`{"$int": "..."}`, a BigInt in the
-  browser), an error value (`{"$quillo_err": ...}`). NaN and infinities become `null`;
-  dates are their text, as everywhere.
+  browser), an error value (`{"$quillo_err": ...}`); a whole float is written `2.0`, and
+  read back as a float. NaN and infinities become `null`; dates are their text, as
+  everywhere.
 
   `<Counter start={5}/>` from the top of this section is sent as:
 
@@ -486,7 +487,15 @@ route GET / = <html><body><Counter start={5}/></body></html>
   they are the same) instead of replacing them, so images do not reload, a scrolled
   list stays where it is and what someone typed stays typed. Each component is resumed
   when it is first reached, the others when they are needed. An element whose tag or
-  text differs (a script changed the page) is made again, for that component only.
+  text differs (a script changed the page) is made again, for that component only. An
+  attribute the markup sets that differs (changed, removed or added) is the browser's
+  value: under `--watch` it is said (`where it wrote title="changed", the browser makes
+  title="title"`) and the component is made again, and in production the value is put
+  in place, so a browser extension that rewrites styles makes no component again.
+  Classes a script adds, attributes the markup does not set, and a field's `value`,
+  `checked` or `selected` (what a person typed or picked) are not compared. A CR in text
+  is written `&#13;` and a NUL U+FFFD, on both sides, so a note typed in a `<textarea>`
+  and posted with CRLF is taken up as written.
   `state` initializers do not run again in the browser: the server's values win. There
   is no virtual DOM: each state is a signal, tied to the text, attributes and classes
   that show it, and a list's rows are moved by key.
@@ -563,14 +572,23 @@ route GET / = <html><body><Counter start={5}/></body></html>
   .q-dialog.q-danger .q-ok { background: crimson; color: white; }
   .q-toast.q-success { border-left: 4px solid seagreen; }
   ```
-- In the browser, numbers are JavaScript numbers, so a whole float such as `2.0` prints
-  as `2`, and `json.stringify(json.parse("1.0"))` gives `1`. While the server renders a
-  component it writes numbers the same way, so the page it sends is the one the browser
-  would make and is taken up, not made again. Neither side uses an exponent. Arithmetic
-  gives the same results on both sides: ints stay exact past 2^53, to 64 bits, as do
-  those from `json.parse` where the browser says what the text was (Chrome, Edge,
-  Firefox and Safari since 2025). Elsewhere the server writes `2.0`. `math.*` may differ
-  in the last digits, as each side has its own library.
+- In the browser a value is what it is on the server, or an error, never another value.
+  A whole float keeps its type: `type_of(2.0)` is `float`, `2.0 / 0` is `inf`, an `int`
+  parameter, an index or `range` refuses `2.0` and a `float` parameter refuses `2`, a
+  record's `float` field widens an int, and a field bound to a float state gives floats.
+  Ints past 2^53 are exact (BigInts) in arithmetic, comparisons, `math`, `stats`, `vec`,
+  ranges and every builtin that takes an int, and past 64 bits they are the server's
+  `integer overflow` (`math.factorial(20)` is exact, `math.factorial(21)` overflows on
+  both sides); an int is never `-0`. Numbers cross between the server and the page as
+  their JSON text, so a float stays a float both ways (state, props, a `server fn`'s
+  arguments and answers); in a browser whose `JSON.parse` gives no number's text (Safari
+  before 18.4, Firefox before 135), one pass over the text marks them first. The page's
+  own JavaScript (`js(...)`, a library) gets plain numbers. Text in a component writes a
+  whole float as `2`, on both sides, so the page the server sends is the one the browser
+  would make and is taken up, not made again; elsewhere the server writes `2.0`. Text has
+  no exponent; `json.stringify` writes `2.0` on both sides, and turns to an exponent where
+  JavaScript does (`1e+21`, `1e-7`). `math.*` may differ in the last digits, as each side
+  has its own library.
 
   ```quillo
   component Price() {
@@ -812,7 +830,11 @@ route GET / = <html><body><Sales points={load_points()}/></body></html>
 - `client`, `preload`, `preconnect` and `module` are still names everywhere else:
   `client / 2` is a division. It is the `use` after a file that makes the line an import.
 - Each file that calls a library says so, as for any name: another file that calls
-  `Chart` writes the same line. The page still loads the script once.
+  `Chart` writes the same line. The page still loads the script once. A file taken whole
+  does not pass its browser names on: one used through it is warned of, with the
+  `client` line to write. One name from two scripts (or a script and a module's export)
+  is an error, in `quillo check` and as the program starts, since the page would have
+  only the last: take one `as` another name.
 - `Name.new(args)` makes an object of a class (`new Chart(el, config)`); `Name(args)`
   calls a function (`confetti()`); `Name.fn(args)` calls one of its functions
   (`L.map(el)`, `dayjs.extend(...)`); `Name.field` reads a value (`Chart.version`).

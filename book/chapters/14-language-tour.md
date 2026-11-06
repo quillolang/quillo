@@ -333,7 +333,8 @@ match event {
 return errors instead of crashing. `?` after an expression returns the error from
 the current function, and `??` falls back when the left side is null or an error, or
 could not be worked out: `1m / 0m ?? 0m`, `date.of(y, m, d) ?? today`,
-`re.test(s, typed) ?? false`. Without `??`, such a stop ends the request with a 500, so
+`re.test(s, typed) ?? false`, `v.foo ?? "none"` for a `v` that is text, `xs[i] ?? 0` for
+an `i` that is not an int, in the browser as on the server. Without `??`, such a stop ends the request with a 500, so
 a total that overflows cannot go on as a value and reach the database unseen; with it,
 you have said what to do. `is_err(r)` asks whether a value failed and `error(r)` (or
 `r.error`, `r.message`) what it says, and on any other value that is null. Field access

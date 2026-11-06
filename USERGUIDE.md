@@ -692,7 +692,8 @@ match event {
 return errors instead of crashing. `?` after an expression returns the error from
 the current function, and `??` falls back when the left side is null or an error, or
 could not be worked out: `1m / 0m ?? 0m`, `date.of(y, m, d) ?? today`,
-`re.test(s, typed) ?? false`. Without `??`, such a stop ends the request with a 500, so
+`re.test(s, typed) ?? false`, `v.foo ?? "none"` for a `v` that is text, `xs[i] ?? 0` for
+an `i` that is not an int, in the browser as on the server. Without `??`, such a stop ends the request with a 500, so
 a total that overflows cannot go on as a value and reach the database unseen; with it,
 you have said what to do. `is_err(r)` asks whether a value failed and `error(r)` (or
 `r.error`, `r.message`) what it says, and on any other value that is null. Field access
@@ -1627,8 +1628,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
   browser (`{open && <Detail/>}` after a click) carries `data-c` alone (FEEDBACK42.md,
   Q-487). Values cross as JSON, with these marked so they come back as they were: a
   decimal (`{"$dec": "12.50"}`), an int past 2^53 (`{"$int": "..."}`, a BigInt in the
-  browser), an error value (`{"$quillo_err": ...}`). NaN and infinities become `null`;
-  dates are their text, as everywhere.
+  browser), an error value (`{"$quillo_err": ...}`); a whole float is written `2.0`, and
+  read back as a float. NaN and infinities become `null`; dates are their text, as
+  everywhere.
 
   `<Counter start={5}/>` from the top of this section is sent as:
 
@@ -1653,7 +1655,15 @@ route GET / = <html><body><Counter start={5}/></body></html>
   they are the same) instead of replacing them, so images do not reload, a scrolled
   list stays where it is and what someone typed stays typed. Each component is resumed
   when it is first reached, the others when they are needed. An element whose tag or
-  text differs (a script changed the page) is made again, for that component only.
+  text differs (a script changed the page) is made again, for that component only. An
+  attribute the markup sets that differs (changed, removed or added) is the browser's
+  value: under `--watch` it is said (`where it wrote title="changed", the browser makes
+  title="title"`) and the component is made again, and in production the value is put
+  in place, so a browser extension that rewrites styles makes no component again.
+  Classes a script adds, attributes the markup does not set, and a field's `value`,
+  `checked` or `selected` (what a person typed or picked) are not compared. A CR in text
+  is written `&#13;` and a NUL U+FFFD, on both sides, so a note typed in a `<textarea>`
+  and posted with CRLF is taken up as written.
   `state` initializers do not run again in the browser: the server's values win. There
   is no virtual DOM: each state is a signal, tied to the text, attributes and classes
   that show it, and a list's rows are moved by key.
@@ -1730,14 +1740,23 @@ route GET / = <html><body><Counter start={5}/></body></html>
   .q-dialog.q-danger .q-ok { background: crimson; color: white; }
   .q-toast.q-success { border-left: 4px solid seagreen; }
   ```
-- In the browser, numbers are JavaScript numbers, so a whole float such as `2.0` prints
-  as `2`, and `json.stringify(json.parse("1.0"))` gives `1`. While the server renders a
-  component it writes numbers the same way, so the page it sends is the one the browser
-  would make and is taken up, not made again. Neither side uses an exponent. Arithmetic
-  gives the same results on both sides: ints stay exact past 2^53, to 64 bits, as do
-  those from `json.parse` where the browser says what the text was (Chrome, Edge,
-  Firefox and Safari since 2025). Elsewhere the server writes `2.0`. `math.*` may differ
-  in the last digits, as each side has its own library.
+- In the browser a value is what it is on the server, or an error, never another value.
+  A whole float keeps its type: `type_of(2.0)` is `float`, `2.0 / 0` is `inf`, an `int`
+  parameter, an index or `range` refuses `2.0` and a `float` parameter refuses `2`, a
+  record's `float` field widens an int, and a field bound to a float state gives floats.
+  Ints past 2^53 are exact (BigInts) in arithmetic, comparisons, `math`, `stats`, `vec`,
+  ranges and every builtin that takes an int, and past 64 bits they are the server's
+  `integer overflow` (`math.factorial(20)` is exact, `math.factorial(21)` overflows on
+  both sides); an int is never `-0`. Numbers cross between the server and the page as
+  their JSON text, so a float stays a float both ways (state, props, a `server fn`'s
+  arguments and answers); in a browser whose `JSON.parse` gives no number's text (Safari
+  before 18.4, Firefox before 135), one pass over the text marks them first. The page's
+  own JavaScript (`js(...)`, a library) gets plain numbers. Text in a component writes a
+  whole float as `2`, on both sides, so the page the server sends is the one the browser
+  would make and is taken up, not made again; elsewhere the server writes `2.0`. Text has
+  no exponent; `json.stringify` writes `2.0` on both sides, and turns to an exponent where
+  JavaScript does (`1e+21`, `1e-7`). `math.*` may differ in the last digits, as each side
+  has its own library.
 
   ```quillo
   component Price() {
@@ -1979,7 +1998,11 @@ route GET / = <html><body><Sales points={load_points()}/></body></html>
 - `client`, `preload`, `preconnect` and `module` are still names everywhere else:
   `client / 2` is a division. It is the `use` after a file that makes the line an import.
 - Each file that calls a library says so, as for any name: another file that calls
-  `Chart` writes the same line. The page still loads the script once.
+  `Chart` writes the same line. The page still loads the script once. A file taken whole
+  does not pass its browser names on: one used through it is warned of, with the
+  `client` line to write. One name from two scripts (or a script and a module's export)
+  is an error, in `quillo check` and as the program starts, since the page would have
+  only the last: take one `as` another name.
 - `Name.new(args)` makes an object of a class (`new Chart(el, config)`); `Name(args)`
   calls a function (`confetti()`); `Name.fn(args)` calls one of its functions
   (`L.map(el)`, `dayjs.extend(...)`); `Name.field` reads a value (`Chart.version`).
@@ -3385,6 +3408,13 @@ in any case *(since 0.7: it was JPEG whatever the name, and `out.png` held a JPE
 its transparency)*. A name that says none of them (`.gif`, no extension), with no
 `format`, is an error value, and nothing is written. A `format` given wins over the name.
 
+A photo is read as it is shown: its EXIF orientation is applied, so `image.info`'s
+`width` and `height` are those of the turned image, a `crop` is in its pixels, and the
+copy is upright. JPEG has no transparency, so transparent pixels are laid on white in a
+JPEG (they went black); there is no option for another colour. Each conversion writes to
+a temporary file of its own and moves it in place, so two at once to one target both
+finish, the last one's file kept.
+
 JPEG, PNG, WebP and GIF are read. `image.info` reads only the header, so it is a cheap
 check that an upload is an image at all. Decoding is limited to 12,000 pixels a side
 and 512 MiB, so a small file claiming to be enormous is refused before anything is
@@ -3571,7 +3601,7 @@ fn touch() {
 | `redirect(url, status = 303)` | a redirect |
 | `file(path, { cache })` | a file under the program's folder (see [Static files](#static-files)) |
 | `files(folder, path, options)` *(since 0.7)* | a folder of files, as a static host serves it (see [Static files](#static-files)) |
-| `markdown_page(text, { title, lang, html })` *(since 0.7)* | Markdown as a whole page: a doctype, a `<head>` with the title (the option's, else the first `#` heading), and the HTML |
+| `markdown_page(text, { title, lang, html })` *(since 0.7)* | Markdown as a whole page: a doctype, a `<head>` with the title (the option's, else the first level-one heading's text, `#` or underlined with `=`), and the HTML |
 | `stream(f, { type, status, headers })` | sent as `f` makes it (see [Streaming](#streaming)) |
 | `events(f, { status, headers })` | Server-Sent Events, as `f` sends them |
 | a runtime error | 500 `text/plain`, `internal error` |
@@ -4468,7 +4498,7 @@ its own, so a file asked for with a `/` after it (`/a.txt/`, `/about/`) is moved
 without one (301, `cache-control: max-age=3600`), only when it would be served there.
 A Markdown file goes out as `text/markdown`; to show one as a page,
 `markdown_page(read_file("notes.md"))` gives a whole page (a doctype, a `<head>` with
-`<title>`, the first `#` heading unless `title` is given, and `lang` and `html` as
+`<title>`, the text of the first level-one heading unless `title` is given, and `lang` and `html` as
 options; `html: true` keeps HTML written in the text, as `markdown` does).
 
 A file the program makes as it starts, a stylesheet compiled by an engine in Rust, is
@@ -4516,10 +4546,11 @@ view Header(user) = <header>
 
 - The folder holds one JSON object per locale, `<dir>/<locale>.json`, the locale named
   as `en`, `pt-BR` or `zh-Hant`. A file named with `_` (`fr_FR.json`, as other tools
-  write them) is read as `fr-FR`; two files for one locale are an error.
+  write them) is read as `fr-FR`; two files for one locale are an error. A byte-order mark
+  at a file's start, as Windows editors save one, is skipped.
 - A request's locale is what `locale_from((request) => ...)` gives (a query parameter,
   a user's setting), else its `locale` cookie, else the best match in `Accept-Language`
-  (`fr-CA` is served by `fr`, `pt` by `pt-BR`; `q` weights count, `*` does not), else
+  (`fr-CA` is served by `fr`, `pt` by `pt-BR`; `q` weights count, `Q=` too, `*` does not), else
   the default: `translations(dir, { default: "en" })`, or `en` when there is one, or
   else the first locale by name. `locale()` gives it. A choice of language a visitor makes
   is that cookie, set by a route the page's form posts to:
@@ -4556,21 +4587,28 @@ view Header(user) = <header>
 - Nested keys are written with dots. A key missing in a locale comes from the default
   locale; a key missing there shows as itself.
 - `{name}` is replaced by that value. An entry of plural forms (`zero one two few many
-  other`) picks the form for `count` by the language's rules, CLDR's, which are built in,
-  the same table on the server and in the browser: English and the languages that count
-  as it, French, Brazilian Portuguese and Hindi (where 0 is singular), European
-  Portuguese (`pt-PT`, where only 1 is), Russian, Ukrainian and Belarusian, Serbian,
-  Croatian and Bosnian, Polish, Czech and Slovak, Romanian (0, 2 to 19 and x01 to x19 are
-  `few`), Lithuanian, Latvian, Slovenian, Icelandic, Macedonian, Irish, Welsh, Maltese,
-  Arabic, Hebrew, and `other` alone for Japanese, Chinese, Korean, Thai, Vietnamese,
-  Indonesian, Malay and their kin. French, Spanish, Italian, Catalan and Portuguese take
-  `many` for exact millions (`1000000`). A `zero` form, where one is written, is used for
-  0 in every language.
-- `count` may be a number, or numeric text (`"1"`, as a query or a form gives it), taken
-  at its number. A fraction takes the language's form for fractions: `many` in
-  Lithuanian, Czech and Slovak, `few` in Romanian, `other` elsewhere. A decimal or text
-  written with a fraction's digits counts as a fraction, as CLDR has it: `1.0m` and
-  `"1.0"` take `other` in English ("1.0 items").
+  other`) picks the form for `count` by the language's rules, CLDR 47's, which are built
+  in, the same on the server and in the browser, for about 110 languages: English and the
+  languages that count as it, French, Brazilian Portuguese and Hindi (where 0 is
+  singular), European Portuguese (`pt-PT`, where only 1 is), Russian, Ukrainian and
+  Belarusian, Serbian, Croatian and Bosnian, Polish, Czech and Slovak, Romanian, Lithuanian,
+  Latvian, Slovenian, Icelandic, Macedonian, Danish, Sinhala, Filipino and Tagalog (`one`
+  but for a last digit of 4, 6 or 9), Irish, Scottish Gaelic, Welsh, Maltese, Arabic,
+  Hebrew, Lower and Upper Sorbian, Sami, and `other` alone for Japanese, Chinese, Korean,
+  Thai, Vietnamese, Indonesian, Malay and their kin; old codes (`iw`, `jw`, `tl`) too.
+  French, Spanish, Italian, Catalan and Portuguese take `many` for exact millions
+  (`1000000`). A `zero` form, where one is written, is used for a 0 shown with no point
+  (`0`, not `0.0`) in every language.
+- `count` may be a number, or numeric text (`"1"`, as a query or a form gives it). The form
+  is CLDR's for the number as `{count}` shows it, read from its digits (CLDR's operands:
+  the whole part, and the fraction's digits with and without their trailing zeros), so a
+  fraction is not one rule for all: `1.5` and `0.5` are `one` in French, `"1.0"` is `one`
+  in Spanish and `other` in English ("1.0 items"), `2.0` is `two` in Arabic, and
+  Slovenian's fractions are `few`. A decimal keeps its digits (`1.0m` is "1.0 items"). A
+  whole float shows as a route writes it, `1.0`, so it takes `other` in English there,
+  and as a component writes it, `1`, so it takes `one` there, on both sides alike (a
+  float past 2^53 by the digits it shows too). `"1e3"` is 1000; `"0x1"`, `"Infinity"`
+  and a full-width digit are not numbers, on either side, and take `other`.
 - As it loads, a form the language never picks is warned of: ``translations (en): `a` has
   a `few` form, which en never picks (it has one, other)``.
 - Translations are text, escaped in pages like any other; `raw(t(...))` for markup you
@@ -4652,6 +4690,11 @@ them: `action="/buy"` reaches the page as `/shop/buy`, as the shop's links and r
 do (`action="/shop/buy"` would become `/shop/shop/buy`). `quillo run app.qwe --split`
 answers the same, with billing in a process of its own.
 
+- A service's file is found as a `use`d file is: from the main file's folder (beside the
+  real file when the main file is a link), and its own `use` paths with the same rules,
+  a path without an extension being the `.qwe`, `.qwer` or `.rs` there. A Rust file a
+  service's file uses is the service's: the service builds it, and the app passes over
+  it when it reads the service's functions.
 - **In one process** (the default) a service is loaded once and shared by every program
   in the process that names it: one copy of its variables and its database. A call
   goes straight to it.
@@ -4828,7 +4871,10 @@ When a service runs elsewhere, its calls are made to hold up:
 
   Those are the defaults, except `timeout` (10 s). Durations are `"500ms"`, `"2s"`,
   `"1m"` (`ms`, `s` and `m` only), or a number of milliseconds; `timeout` is more than
-  0, `retries` 0 to 10, `failures` 1 or more. A try that runs out says so: `service
+  0, `retries` 0 to 10, `failures` 1 or more. A duration past a century counts as a
+  century; one no duration can hold (past about 1.8e19 s, infinite, NaN or negative) is
+  refused as the program loads (`` service work: `timeout` is a duration ``), as `"1.5h"`
+  is. A try that runs out says so: `service
   billing: took more than 2 s (its timeout)`. They apply when a service runs elsewhere
   (`--split`, or at an address); in one process a call is a function's, which runs to
   its end.
@@ -5321,8 +5367,11 @@ stays the simpler choice when the next move depends on the answer.
 
 - **General:** `print str int float dec len type_of`
 - **Strings:** `upper lower trim split join contains starts_with ends_with replace slice repeat index_of normalize`
-  (`upper` and `lower` know all of Unicode: `"straße"` is `"STRASSE"`; `replace`
-  replaces every occurrence of plain text, not a pattern; regular expressions are `re`,
+  (`upper` and `lower` know all of Unicode: `"straße"` is `"STRASSE"`; `trim` takes off
+  Unicode's White_Space (U+0085 too, not U+FEFF); `replace` replaces every occurrence of
+  plain text, not a pattern, and an empty pattern puts the text before each character and
+  at the end (`replace("abc", "", "-")` is `-a-b-c-`); text orders by code point; each the
+  same in the browser; regular expressions are `re`,
   below). `normalize(s, form)` *(since 0.7)* gives one Unicode form of the text, `"NFC"` unless
   `"NFD"`, `"NFKC"` or `"NFKD"` is given, on both sides: an `é` typed as one character and
   one typed as `e` and an accent are two texts until normalized. Compare emails and user
@@ -5333,7 +5382,7 @@ stays the simpler choice when the next move depends on the answer.
   match; `with` is text where `$1`, `$<name>`, `$0` and `$$` stand for the groups, the
   match and `$`, or a function given the match) and `re.split`. A match is
   `{ text, start, end, groups, named }`, positions counting characters as `slice` does.
-  Flags come last: `"i"` (any case), `"m"` (`^` and `$` at each line) and `"s"` (`.`
+  Flags come last: `"i"` (any case), `"m"` (`^` and `$` at each line, a line ending at `\n` or `\r`, `\r\n` as one end, on both sides) and `"s"` (`.`
   matches line breaks too). `re.valid(p, flags)` *(since 0.7)* asks whether a pattern can be run, for
   one from data. They give the same answers on the server and in the browser, but for
   groups in a loop (`(?:(a)|b)*` on `ab`, where the server keeps the group's last match and
@@ -5366,8 +5415,9 @@ stays the simpler choice when the next move depends on the answer.
   `markdown` in the component gives an error value), and one that computes past
   [`--max-compute`](#options-of-quillo-run) is a 500.
   `markdown_page(text, { title, lang, html })` is the same as a whole page, for a route:
-  a doctype, a `<head>` with its `<title>` (the option's, else the text's first `#`
-  heading), and the HTML in its `<body>`. Markdown takes time in proportion to the text,
+  a doctype, a `<head>` with its `<title>` (the option's, else the text's first level-one
+  heading, `# Title` or a line underlined with `=`, as the text it shows, without its
+  marks; a `#` line in a code block or in HTML is no heading), and the HTML in its `<body>`. Markdown takes time in proportion to the text,
   whatever marks it holds (a megabyte of `*a_` is 0.03 s), and `markdown`, `markdown_page`
   and `highlight` end at `--max-compute` as a loop does. A fence's language, for
   highlighting, is its first word, to a space or a comma (```` ```rust,ignore ```` is Rust).
@@ -5422,7 +5472,7 @@ What each does at its edges, where the answer is not what another language would
 
 | Call | Gives |
 |---|---|
-| `sort(xs)`, `sort_by(xs, f)` | ascending and stable; `f` may give a list to sort by several keys, `sort_by(rows, (r) => [r.a, r.b])`, as lists compare item by item, and so do `<`, `>`, `<=` and `>=` (`[1, 2] < [1, 3]`); no comparator and no descending flag (`reverse(sort(xs))`, or `vec.argsort(xs, true)`). Numbers (ints, floats and decimals together), strings (by code point: `"B"` before `"a"`) and lists of those order; `null`, booleans, maps, a string with a number, or a decimal with a float are an error, and comparing `null` says that a miss of `index_of`, `find` or `get` is `null`, not -1 |
+| `sort(xs)`, `sort_by(xs, f)` | ascending and stable; `f` may give a list to sort by several keys, `sort_by(rows, (r) => [r.a, r.b])`, as lists compare item by item, and so do `<`, `>`, `<=` and `>=` (`[1, 2] < [1, 3]`); no comparator and no descending flag (`reverse(sort(xs))`, or `vec.argsort(xs, true)`). Numbers (ints, floats and decimals together), strings (by code point: `"B"` before `"a"`) and lists of those order; `null`, booleans, maps, a string with a number, a decimal with a float, or NaN are an error, in the browser too (`vec.argsort` puts NaN last), and comparing `null` says that a miss of `index_of`, `find` or `get` is `null`, not -1 |
 | `split(s, sep = " ")` | at each single `sep` (`"a  b"` is `["a", "", "b"]`); `split(s, "")` is the characters; no limit |
 | `join(xs, sep = "")` | the items as text, with `sep` between |
 | `filled(x)` | `x`, or `null` for `""`, so `filled(name) ?? "anonymous"` replaces a blank or missing name; `0`, `false`, `[]` and `" "` stay as they are (`filled(trim(x))` counts spaces as blank) |
@@ -5435,9 +5485,11 @@ What each does at its edges, where the answer is not what another language would
 | `contains(x, y)` | in a string, `y` as text; in a list, an equal item; in a map, a key |
 | `remove(list, x)` | every item equal to `x` gone; `remove(map, k)` the key |
 | `set(xs, i, v)` | `i` past the end is an error |
-| `round(x)` | a float rounds half away from zero (`round(-2.5)` is `-3`) to an int; `round(x, 2)` a float with at most 15 places, from its shortest decimal (`round(1.005, 2)` is `1.01`, as `format_number` writes it); a decimal takes a mode (see [Decimals](#decimals)) |
+| `round(x)` | a float rounds half away from zero (`round(-2.5)` is `-3`) to an int, and an int is itself (exact past 2^53); `round(x, 2)` a float with at most 15 places, from its shortest decimal (`round(1.005, 2)` is `1.01`, as `format_number` writes it); a decimal takes a mode (see [Decimals](#decimals)) |
 | `int(x)` | a float or decimal cut toward zero (an error value when too large for an int); `true` is 1; text of digits only (`int("1.0")`, `int("1e3")` are error values) |
-| `str(x)` | a whole float as `2.0`, never in exponent form (`1e16` is `10000000000000000`); a list or map as Quillo writes it (`{ a: 1, b: "x" }`); `null` as `null` |
+| `float(x)` | a number as a float; text as Rust reads a float (`"2.5"`, `" 7 "`, `"1e3"`, `".5"`, `"inf"`, `"nan"`), so `"0x10"`, `"0b11"`, `"1_000"` and `""` are error values, in the browser too |
+| `floor(x)`, `ceil(x)` | a float to an int; an int as it is, past 2^53 too, as `round(x)` gives it |
+| `str(x)` | a whole float as `2.0` (in a component's text, `2`, on both sides), never in exponent form (`1e16` is `10000000000000000`); a float's shortest digits, a tie taking the even digit as JavaScript does (`1916218016406818.3`, which is held as ...818.25, is written `1916218016406818.2`); markup as its HTML, in the browser too; a list or map as Quillo writes it (`{ a: 1, b: "x" }`, a key of letters, digits and `_` of any script, not starting with a digit, bare (`{ é: 1, 日本: 2 }`), another quoted (`{ "a b": 3, "1a": 4 }`), on both sides); `null` as `null` |
 | `type_of(x)` | one of `null bool int float dec str list map fn html response error` (`promise` for a JavaScript Promise in the browser) |
 | `len(x)` | a string's characters, a list's items, a map's keys; an `html` value's bytes |
 | `min([])`, `max([])`, `first([])` | `null`; `sum([])` is `0`, and a sum of decimals stays exact |
@@ -5451,8 +5503,8 @@ What each does at its edges, where the answer is not what another language would
 | `read_file(path)` | text: bytes that are not UTF-8 are replaced; a missing file is an error value |
 | `write_file(path, v)` | `v` as text, folders made, the file replaced; `null` or an error value |
 | `escape(s)` | `& < > " '` as entities |
-| `json.parse(s)` | an error value for bad JSON; an int past 64 bits becomes a float; a key given twice keeps the last value |
-| `json.stringify(v, pretty)` | indented by two spaces when `pretty` is true; a decimal as a string, NaN and infinities as `null`, an error value as `{"error": ...}`; JSON past 256 MiB, or nested more than 10,000 deep, is an error value, counted before it is made, as lists that hold one part twice can double at each step *(since 0.7)*; a route's answer the same, a 500 with the reason in the log |
+| `json.parse(s)` | an error value for bad JSON, for a number past a float (`1e400`) and for half of a character (a lone `\ud83d`), on both sides; an int past 64 bits becomes a float; a key given twice keeps the last value |
+| `json.stringify(v, pretty)` | indented by two spaces when `pretty` is true; a whole float as `2.0` (`-0.0` too), so it reads back as a float, and an exponent where JavaScript writes one (`1e+21`, `1e-7`), on both sides; markup as its HTML; a decimal as a string, NaN and infinities as `null`, an error value as `{"error": ...}`; JSON past 256 MiB, or nested more than 10,000 deep, is an error value, counted before it is made, as lists that hold one part twice can double at each step *(since 0.7)*; a route's answer the same, a 500 with the reason in the log |
 
 What is not in the standard library, and what to do instead:
 
@@ -5643,7 +5695,11 @@ path is judged where it really leads, with its links followed:
 - A link that leads nowhere is refused too: writing through it would make its target,
   wherever that is.
 - A program run through a link (a deploy's `current -> releases/42`) is inside the
-  folder the link leads to, so its own files work as before.
+  folder the link leads to, so its own files work as before. A main file that is itself
+  a link (`app.qwe -> /srv/releases/42/main.qwe`) takes its `use`, `import`, `mount` and
+  `service` files from beside the real file (a `./` path from the real file's folder),
+  while its policy, `.env`, data, Quillo's own tables and messages stay at the link's
+  folder, with the path as it was given.
 - `--allow-path DIR` opens a folder outside on purpose (a path from the folder `quillo`
   runs in, taken as it really is): a deploy's `uploads -> /srv/shared/uploads` needs
   `--allow-path /srv/shared/uploads`.
@@ -5741,16 +5797,29 @@ turns it around. A later release removes it.
   file); there are no globs, and a `.qwer` file is `use`d the same way (see
   [Rust](#rust)) (FEEDBACK25.md, Q-325).
 - A path may be written without quotes: `use lib/auth.qwe`, `use ../shared/auth.qwe`,
-  and `use lib\auth.qwe`, its backslash read as `/`. Without an extension it is a
-  `.qwe` file (`use lib/auth`). An `import` finds whichever of `.qwer` and `.qwe` is
-  there. `import lib/auth.qwe use *` says the same as `use lib/auth.qwe`: every public
-  name.
+  and `use lib\auth.qwe`, its backslash read as `/`. Without an extension it is the
+  `.qwe`, `.qwer` or `.rs` file there (`use lib/auth`), and an error when two are
+  (`` `helpers` could be helpers.qwe or helpers.rs: write the one you mean with its
+  extension ``); written with its extension, in any case (`MAIN.QWE`, `x.RS`), it is that
+  file only, so `import lib.qwer use hi` with only `lib.qwe` there is an error. A file
+  that is not there is one error at its import line, for every form, with a file near it
+  (`cannot read lib/helpers.rs: No such file or directory (did you mean
+  lib/helpers.qwe?)`), and its names are not said again as unknown. `import lib/auth.qwe
+  use *` says the same as `use lib/auth.qwe`: every public name.
 - A file `use`d twice, or by several files, runs once. Within one file, a second `use`
   of a file, or a name taken twice from it, is a warning: one is enough.
 - A name taken `as` another is called that in the file: after `import lib/m.qwe use
   price as cost`, writing `price` is a warning ("this file takes `price` as `cost`"),
   and still works, as a name not taken does. Take both to have both: `use price as cost,
-  price`.
+  price`. A type taken `as` another, `import lib/geo.qwe use Point as Pt`, is `Pt` in
+  annotations, patterns and type definitions too; `as` cannot take the name of one of
+  the program's types (`import lib.qwe use one as Point` is told `` `Point` is a type of
+  the program: take `one` from lib.qwe under another name ``), and a name no type can be written as (`P`, one letter) is warned of
+  with one that can (`Pt`).
+- A `return` at the top level of a file ends the file there: nothing after it is
+  defined, and `quillo check` says so at the first line after it (``this never runs: the
+  `return` at line 2 leaves the file first, so nothing below it is defined``), as the
+  program does when it runs.
 - A `use` list may go on over lines, each line after a `,`. A `,` at the end of the
   list is an error: the next line is the next statement, not a name to take.
 - **A file's text.** A file is UTF-8; one that is not is refused with the line and column
@@ -5789,7 +5858,9 @@ turns it around. A later release removes it.
   name two files define.
   Elsewhere `private` and `public` are ordinary names (`{ private: true }`). A private
   function given to `schedule` or `every` keeps its job to itself, under a name of its
-  own (`tick__pv` and eight hex digits in the log).
+  own (`tick__pv` and eight hex digits in the log), made from the file's path from the
+  main file's folder, so copies of a program started from different folders (`quillo
+  run current/main.qwe`, a service under `--split`) share the job.
 - An editor finds the program a file belongs to by looking, in the file's folder and up
   to three above it (stopping at a folder with `.git` or `Cargo.toml`), for the first
   `.qwe` file by name that `use`s it, directly or through others. Keep a program's files
@@ -5857,8 +5928,9 @@ dec("12.50")  dec(42)  dec(0.1)        // 12.50m, 42m, 0.1m
   answers: arithmetic, comparison, rounding, display. They cross between the server
   and the page (props, state, server fns' arguments and answers) as decimals. Ints too
   large for a JavaScript number (past 2^53) reach the page whole, as BigInts, and show
-  as on the server. The browser cannot tell `2.0` from `2`, so there a whole float
-  added to a decimal counts as an int.
+  as on the server. A whole float is a float there too, so adding one to a decimal is an
+  error on both sides, and `money.of(2.0, "USD")` is refused in both: an amount never goes
+  through a float.
 - `quillo check` knows them: `12.5m + 1` is a `dec`, `12.5m + 0.5` an error, and `round`,
   `abs`, `floor`, `ceil`, `pow`, `sum`, `min` and `max` keep the type they are given. `num`
   is still `int | float`.
@@ -6000,7 +6072,11 @@ money.format(price, "de-DE")                    // "19,99 $"
   `1.01`; `mode` rounds as `round` does instead (`"half_even"`, as money) *(since 0.7)*.
   `digits` may be `{ min, max }` (`max` is `max(min, 3)` when left out), for as many digits
   as the number needs within them: `format_number(10, "en-US", { max: 3 })` is `10`,
-  `8.875` stays `8.875`, and `{ min: 2, max: 3 }` writes `8.8` as `8.80`.
+  `8.875` stays `8.875`, and `{ min: 2, max: 3 }` writes `8.8` as `8.80`. With no
+  `digits`, every digit of the number is written (`Intl` stops at three), on both sides.
+  A negative number rounded to zero keeps its minus, as `Intl` writes it: `-0.001` to 2
+  digits is `-0.00`, and `-0.0` is `-0`. A whole float past 2^53 is written by its
+  decimal digits in the browser too, from Quillo or from the page's JavaScript.
 - There are no exchange rates: an amount stays in its currency, and converting is the
   program's arithmetic with a rate it chose.
 
@@ -6161,8 +6237,14 @@ date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or a
   second; when they go forward, a skipped time is moved on by the gap (02:30 becoming
   03:30), or `{ skipped: "earlier" }` moved back, or `{ skipped: "error" }` an error
   value: `date.at: 2026-03-08 02:30 is skipped in that zone, as its clocks move
-  forward`. A zone is an IANA name (`"Europe/Paris"`), `"UTC"`, or
-  an offset (`"+05:30"`); left out, it is UTC. An offset of zero is written `Z`. The server
+  forward`. A zone is a name of the IANA database, a zone or a link, in any case
+  (`"Europe/Paris"`, `"US/Pacific"`, `"EST"`), `"UTC"`, or an offset as `date.parse` reads
+  one (`"+05:30"`, `"+0530"`, `"+05"`, up to `+23:59`); left out, it is UTC. An offset of
+  zero is written `Z`. The server and the browser take the same zones and refuse the same
+  names, as an unknown time zone: `posixrules`, `Factory`, `Etc/Unknown`, `localtime`,
+  `posix/...` and `right/...` (copies some systems keep), names the database dropped
+  (`US/Pacific-New`, `Canada/East-Saskatchewan`, `SystemV/...`), Java's three-letter ids
+  (`PST`), and any other name with a sign (`+5`, `+0560`, a U+2212 minus). The server
   reads the system's time zone database, or a copy built into `quillo` where there is none
   (Windows, small containers); the browser asks its own (`Intl`).
 - **Text:** `date.format(d, pattern)` with `YYYY YY`, `MM M` (month number, padded or
@@ -6171,10 +6253,13 @@ date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or a
   `[brackets]`, is kept as it is. A date-time shows its time as written: `date.to_zone` it
   first to show another zone's. `date.format(d, { locale, style })` gives a locale's
   `"short"`, `"medium"` (the default), `"long"` or `"full"` date, and `{ locale, pattern }`
-  the pattern with that language's names. The locales are English (US, and the British
-  style for `en-GB`, `en-AU`, `en-IE`, `en-NZ`, `en-IN`, `en-ZA`), German, French, Spanish,
-  Italian, Dutch and Portuguese, as the server and the browser both have them (CLDR's
-  forms); any other gives English. `date.parse(s)` reads a date or a date-time, with `T` or
+  the pattern with that language's names. The locales are English, German, French,
+  Spanish, Italian, Dutch and Portuguese, and the regions whose styles CLDR gives their
+  own: `en-GB`, `en-CA` (`2026-09-05` short), `en-IE`, `en-AU`, `en-NZ`, `en-IN`,
+  `en-ZA`, `de-AT` (`Jänner`, `Jän.`), `fr-CA`, `fr-CH`, `es-MX`, `it-CH`, `nl-BE` and
+  `pt-PT`, the same on the server and in the browser (CLDR's forms, names in a pattern
+  too); another region takes its language's (`de-CH` is German's), and any other
+  language gives English. `date.parse(s)` reads a date or a date-time, with `T` or
   a space and an offset (`+01`, `+0100`, `+01:00` or `Z`), and gives it back as above;
   a date-time with no offset is an error value that says to read it with `date.at(v,
   zone)`, as it names no instant until a zone is given; an HTTP date (`Tue, 27 Oct 2026
@@ -7219,7 +7304,11 @@ What a reload keeps, and what it starts afresh:
   a stop (requests in progress finish, up to 10 s) and a start, during which the port
   answers nothing. For no gap, run two servers behind limer ([`--register`](#options-of-quillo-run); `/_quillo/health`
   says 503 as soon as one starts stopping) and restart them one at a time. Two programs
-  cannot share a port: `mount` or `service /prefix` them in one.
+  cannot share a port: `mount` or `service /prefix` them in one. A new binary whose Rust
+  glue changed builds the program's Rust files again: run `quillo build` with it as part
+  of the deploy, before the restart (see [Rust](#rust)). While an old and a new copy
+  share one database, a job whose name changed between them may run under both for one
+  slot.
 
 ### Stopping and health
 
@@ -7734,10 +7823,12 @@ main.qwe:6: error: `udp.listen` needs the net effect, which host.toml does not a
   `--policy` adds one, and `check` names the files only when one is given. A byte-order
   mark at a file's start is skipped. The start line lists the limits that hold the
   program: `quillo: policy p.toml (workers 8; max_compute 10s; max_body 10485760 bytes)`.
-- A request the policy's `max_compute` ends is a 500, as one `--max-compute` ends, and
-  the log names whichever is the tighter: `this request computed for longer than the
-  policy p.toml allows (max_compute)`, or `... than --max-compute allows`. A page (a
-  Markdown preview) is told `the server's policy`, with no path of the server's.
+- A request the policy's `max_compute` ends is a 500, as one `--max-compute` ends,
+  wherever it is ended (a loop, a call, `highlight`, `markdown`), and the log names
+  whichever is the tighter: `this request computed for longer than the policy p.toml
+  allows (max_compute)`, or `... than --max-compute allows`. No `??` takes that stop
+  (`highlight(x) ?? x` too). A page (a Markdown preview) is told `the server's policy`,
+  with no path of the server's.
 - [`--split`](#options-of-quillo-run) passes the `--policy` files and `quillo.policy` to its services; a service
   reads the host's file itself.
 - What a policy holds to is Quillo code and what it loads. A plugin is Rust in the
@@ -7839,7 +7930,10 @@ no newer than the server's (a plugin linked against a newer glibc does not load 
 older one: build in a CentOS 7 or AlmaLinux 8 container). Upload `.quillo/` with the
 program: `.quillo/native/` and `.quillo/plugins.lock`. Run with [`--no-build`](#options-of-quillo-run), so that
 nothing is ever built on the server, and a library that is not the one built is refused
-rather than built again.
+rather than built again. A new `quillo` whose glue changed (the libraries' names carry its
+version) loads none of the old libraries: run `quillo build main.qwe` with it as part of
+the deploy that brings it, and upload `.quillo/` again; under `--no-build` the server says
+which file was `built by an older Quillo`.
 
 **A policy.** The host's `/etc/quillo/policy.toml` says what any program may do there;
 `quillo.policy` beside the program narrows it for the site (see [The
@@ -7972,7 +8066,12 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   `Result<T, E>` gives `T`, or an error value with `E`'s message, so `?` and `??` work
   on it. `()` is `null`. References (`&String`, `&Vec<T>`) are fine as parameters.
   A `u64` past `i64`'s range inside a returned `serde_json::Value` is a runtime error
-  that names where it is (`.id`, `[1].n`), not a float that has lost digits.
+  that names where it is (`.id`, `[1].n`), not a float that has lost digits, and one
+  returned alone names its function. NaN and the infinities cross to an `f64` and back
+  as they are (they arrived as `null`); a `serde_json::Value` argument that holds one is
+  refused by the argument's name, as JSON has none. An error value given to a Rust
+  function, at the top or inside a list or map, is given back, and the function does not
+  run.
 - An argument that does not fit is refused with the parameter's name: `` `small`:
   argument `n` does not fit in i32: 5000000000 ``. Values cross at most 126 levels deep:
   an argument nested deeper is refused (`` `deep`: argument `v` is nested too deeply: a
@@ -7986,7 +8085,14 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
 - The rest of the file is ordinary Rust: private functions, structs, `impl`s, modules,
   `use`. A `pub fn` that is generic (a written lifetime counts: `fn f<'a>`), `async`,
   takes `&mut`, or has a type that cannot cross, as a fixed-size array cannot, is not
-  exported, and `quillo check` says why. Another crate's type named `Value` passes the
+  exported, and `quillo check` says why. So is one with a reference inside another type,
+  `Option<&str>`, `Vec<&str>` or `&[&str]`, which the glue cannot build: the message
+  names the owned type to take (`Option<String>`, `Vec<String>`). `&str` and `-> &'static
+  str` are fine, as are paths (`std::string::String`, `std::collections::HashMap`) and
+  comments in a signature. A raw name, `pub fn r#type`, is the function `type`, and the
+  functions after it are read; a function named like a Quillo keyword (`view`, `match`,
+  `reply`) is not exported. A `#[cfg(...)]` on a `pub fn` is kept: called where it was
+  left out of the build, it says the function is not in this build. Another crate's type named `Value` passes the
   check and fails the build. A signature may name what the file's own `use` lines bring
   in: after `use serde_json::Value;` and `use std::collections::HashMap;`, `pub fn
   role(auth: Value)` and `pub fn total(m: HashMap<String, i64>)` build as written in
@@ -7995,7 +8101,9 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   from crates.io or git. They come first, after other `//!` lines if any; the first line
   that is not `//!` ends them. Only that table is read (no `[features]` table, no
   `[patch]`, no `build.rs` of the file's own; a crate's own build scripts do run).
-  `serde_json` is always there. C libraries come through `-sys` crates.
+  `serde_json` is always there. C libraries come through `-sys` crates. The `//!` lines
+  may follow `//` comments, blank lines, block comments and `#![...]` attributes at the
+  top of the file.
 - **`//! effects: fs, http`**, a header line, says what the file's functions do, in the
   words of `with` (`db`, `http`, `fs`, `env`, `time`, `random`, `net`; `db.analytics` is
   `db`), or `//! effects: none`. It is what lets a `with` function call them: a function
@@ -8011,8 +8119,12 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   names the nearest it does. `import redis.qwer use *`, or `use redis.qwer`, takes them
   all. Each file takes what it calls, as with a `.qwe` file (see [Files of a
   program](#files-of-a-program)).
-- Two `.qwer` files exporting one name: the last `use`d replaces the other, with a
-  warning that says how to take one under another name.
+- A Rust file's names are the file's that takes them, as a `.qwe` file's are: two Rust
+  files exporting one name are two functions, and a file that takes both is told to
+  choose, naming the files (`` comes from a.rs and b.rs: ... import a.rs use who ``);
+  one function taken by several files is one function. A name from a Rust file taken
+  whole gives way to the file's own definitions and to names it takes by name. The fix a
+  warning suggests (`import x.qwer use len as x_len`) parses.
 - A `pub fn` named like a builtin (`len`, `get`) hides the builtin in the files that
   take it, and `quillo check` warns of it at the `.qwer` file's line, with how to take it
   under another name: `import x.qwer use len as x_len` (FEEDBACK27.md, Q-326).
@@ -8039,8 +8151,11 @@ How it runs:
   its own in Quillo's cache: `QUILLO_NATIVE_CACHE`, else `$XDG_CACHE_HOME/quillo/native`,
   else `~/.cache/quillo/native`, else the system's temporary folder. The crates' builds
   are shared there, and nothing old is removed (it grows: clear it now and then). The
-  library is kept in `.quillo/native/` next to the file, named by a hash of the file's
-  text, the glue's version and the processor: the next start loads it without building.
+  library is kept in `.quillo/native/` next to the file, named by the file's whole name
+  (so `x.rs` and `x.qwer` side by side keep one each), the glue's version, and a hash of
+  the file's text, the glue and the processor: the next start loads it without building.
+  An older Quillo's libraries, and their lock lines, are kept, so going back to it still
+  runs.
   A build takes seconds the first time, more with large crates, and needs crates.io
   (or cargo's own offline mode).
 - `quillo build app.qwe` builds every Rust file the program and its mounted programs
@@ -8049,7 +8164,7 @@ How it runs:
   program, and the server needs no Rust: it loads what was built for that content, on
   the same processor and system (there is no cross-compiling: build on Linux for
   Linux), by the same Quillo glue. A Quillo whose glue changed builds again, and needs
-  cargo then.
+  cargo then: run `quillo build` once as part of the deploy that brings it.
 - **`.quillo/plugins.lock`** *(since 0.7)*, beside `.quillo/native/`, holds each library's file name
   and SHA-256, a line each, written by every build: `quillo build`, a `use` that built,
   [`--watch`](#options-of-quillo-run). Deploy it with `.quillo/native/`. A library is loaded only when it is the one
@@ -8065,7 +8180,11 @@ How it runs:
 - **[`--no-build`](#options-of-quillo-run)** never runs cargo, so no crate's build script runs on the server: a
   library is loaded only as the lock names it, and a file not built is an error
   (`./hi.qwer is not built, and --no-build says not to build it here: build it with
-  quillo build and bring .quillo along`). Under it, a folder with no lock loads nothing.
+  quillo build and bring .quillo along`); one built only by an older Quillo is said to
+  be (``./hi.qwer was built by an older Quillo, whose libraries this one cannot load, and
+  --no-build says not to build it here: run `quillo build` once where Rust is, and bring
+  .quillo along``). Under it, a folder with no
+  lock loads nothing.
   [`--split`](#options-of-quillo-run) passes it to its services, and a policy's `[plugins] build = false` is the
   same (see [The policy](#the-policy)).
 - **A policy's `[plugins] allow`** names the plugins a program may `use`: `"csv"` any

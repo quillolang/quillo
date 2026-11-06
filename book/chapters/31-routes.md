@@ -494,6 +494,13 @@ in any case *(since 0.7: it was JPEG whatever the name, and `out.png` held a JPE
 its transparency)*. A name that says none of them (`.gif`, no extension), with no
 `format`, is an error value, and nothing is written. A `format` given wins over the name.
 
+A photo is read as it is shown: its EXIF orientation is applied, so `image.info`'s
+`width` and `height` are those of the turned image, a `crop` is in its pixels, and the
+copy is upright. JPEG has no transparency, so transparent pixels are laid on white in a
+JPEG (they went black); there is no option for another colour. Each conversion writes to
+a temporary file of its own and moves it in place, so two at once to one target both
+finish, the last one's file kept.
+
 JPEG, PNG, WebP and GIF are read. `image.info` reads only the header, so it is a cheap
 check that an upload is an image at all. Decoding is limited to 12,000 pixels a side
 and 512 MiB, so a small file claiming to be enormous is refused before anything is
@@ -680,7 +687,7 @@ fn touch() {
 | `redirect(url, status = 303)` | a redirect |
 | `file(path, { cache })` | a file under the program's folder (see [Static files](#static-files)) |
 | `files(folder, path, options)` *(since 0.7)* | a folder of files, as a static host serves it (see [Static files](#static-files)) |
-| `markdown_page(text, { title, lang, html })` *(since 0.7)* | Markdown as a whole page: a doctype, a `<head>` with the title (the option's, else the first `#` heading), and the HTML |
+| `markdown_page(text, { title, lang, html })` *(since 0.7)* | Markdown as a whole page: a doctype, a `<head>` with the title (the option's, else the first level-one heading's text, `#` or underlined with `=`), and the HTML |
 | `stream(f, { type, status, headers })` | sent as `f` makes it (see [Streaming](#streaming)) |
 | `events(f, { status, headers })` | Server-Sent Events, as `f` sends them |
 | a runtime error | 500 `text/plain`, `internal error` |
@@ -1577,7 +1584,7 @@ its own, so a file asked for with a `/` after it (`/a.txt/`, `/about/`) is moved
 without one (301, `cache-control: max-age=3600`), only when it would be served there.
 A Markdown file goes out as `text/markdown`; to show one as a page,
 `markdown_page(read_file("notes.md"))` gives a whole page (a doctype, a `<head>` with
-`<title>`, the first `#` heading unless `title` is given, and `lang` and `html` as
+`<title>`, the text of the first level-one heading unless `title` is given, and `lang` and `html` as
 options; `html: true` keeps HTML written in the text, as `markdown` does).
 
 A file the program makes as it starts, a stylesheet compiled by an engine in Rust, is
@@ -1625,10 +1632,11 @@ view Header(user) = <header>
 
 - The folder holds one JSON object per locale, `<dir>/<locale>.json`, the locale named
   as `en`, `pt-BR` or `zh-Hant`. A file named with `_` (`fr_FR.json`, as other tools
-  write them) is read as `fr-FR`; two files for one locale are an error.
+  write them) is read as `fr-FR`; two files for one locale are an error. A byte-order mark
+  at a file's start, as Windows editors save one, is skipped.
 - A request's locale is what `locale_from((request) => ...)` gives (a query parameter,
   a user's setting), else its `locale` cookie, else the best match in `Accept-Language`
-  (`fr-CA` is served by `fr`, `pt` by `pt-BR`; `q` weights count, `*` does not), else
+  (`fr-CA` is served by `fr`, `pt` by `pt-BR`; `q` weights count, `Q=` too, `*` does not), else
   the default: `translations(dir, { default: "en" })`, or `en` when there is one, or
   else the first locale by name. `locale()` gives it. A choice of language a visitor makes
   is that cookie, set by a route the page's form posts to:
@@ -1665,21 +1673,28 @@ view Header(user) = <header>
 - Nested keys are written with dots. A key missing in a locale comes from the default
   locale; a key missing there shows as itself.
 - `{name}` is replaced by that value. An entry of plural forms (`zero one two few many
-  other`) picks the form for `count` by the language's rules, CLDR's, which are built in,
-  the same table on the server and in the browser: English and the languages that count
-  as it, French, Brazilian Portuguese and Hindi (where 0 is singular), European
-  Portuguese (`pt-PT`, where only 1 is), Russian, Ukrainian and Belarusian, Serbian,
-  Croatian and Bosnian, Polish, Czech and Slovak, Romanian (0, 2 to 19 and x01 to x19 are
-  `few`), Lithuanian, Latvian, Slovenian, Icelandic, Macedonian, Irish, Welsh, Maltese,
-  Arabic, Hebrew, and `other` alone for Japanese, Chinese, Korean, Thai, Vietnamese,
-  Indonesian, Malay and their kin. French, Spanish, Italian, Catalan and Portuguese take
-  `many` for exact millions (`1000000`). A `zero` form, where one is written, is used for
-  0 in every language.
-- `count` may be a number, or numeric text (`"1"`, as a query or a form gives it), taken
-  at its number. A fraction takes the language's form for fractions: `many` in
-  Lithuanian, Czech and Slovak, `few` in Romanian, `other` elsewhere. A decimal or text
-  written with a fraction's digits counts as a fraction, as CLDR has it: `1.0m` and
-  `"1.0"` take `other` in English ("1.0 items").
+  other`) picks the form for `count` by the language's rules, CLDR 47's, which are built
+  in, the same on the server and in the browser, for about 110 languages: English and the
+  languages that count as it, French, Brazilian Portuguese and Hindi (where 0 is
+  singular), European Portuguese (`pt-PT`, where only 1 is), Russian, Ukrainian and
+  Belarusian, Serbian, Croatian and Bosnian, Polish, Czech and Slovak, Romanian, Lithuanian,
+  Latvian, Slovenian, Icelandic, Macedonian, Danish, Sinhala, Filipino and Tagalog (`one`
+  but for a last digit of 4, 6 or 9), Irish, Scottish Gaelic, Welsh, Maltese, Arabic,
+  Hebrew, Lower and Upper Sorbian, Sami, and `other` alone for Japanese, Chinese, Korean,
+  Thai, Vietnamese, Indonesian, Malay and their kin; old codes (`iw`, `jw`, `tl`) too.
+  French, Spanish, Italian, Catalan and Portuguese take `many` for exact millions
+  (`1000000`). A `zero` form, where one is written, is used for a 0 shown with no point
+  (`0`, not `0.0`) in every language.
+- `count` may be a number, or numeric text (`"1"`, as a query or a form gives it). The form
+  is CLDR's for the number as `{count}` shows it, read from its digits (CLDR's operands:
+  the whole part, and the fraction's digits with and without their trailing zeros), so a
+  fraction is not one rule for all: `1.5` and `0.5` are `one` in French, `"1.0"` is `one`
+  in Spanish and `other` in English ("1.0 items"), `2.0` is `two` in Arabic, and
+  Slovenian's fractions are `few`. A decimal keeps its digits (`1.0m` is "1.0 items"). A
+  whole float shows as a route writes it, `1.0`, so it takes `other` in English there,
+  and as a component writes it, `1`, so it takes `one` there, on both sides alike (a
+  float past 2^53 by the digits it shows too). `"1e3"` is 1000; `"0x1"`, `"Infinity"`
+  and a full-width digit are not numbers, on either side, and take `other`.
 - As it loads, a form the language never picks is warned of: ``translations (en): `a` has
   a `few` form, which en never picks (it has one, other)``.
 - Translations are text, escaped in pages like any other; `raw(t(...))` for markup you
@@ -1761,6 +1776,11 @@ them: `action="/buy"` reaches the page as `/shop/buy`, as the shop's links and r
 do (`action="/shop/buy"` would become `/shop/shop/buy`). `quillo run app.qwe --split`
 answers the same, with billing in a process of its own.
 
+- A service's file is found as a `use`d file is: from the main file's folder (beside the
+  real file when the main file is a link), and its own `use` paths with the same rules,
+  a path without an extension being the `.qwe`, `.qwer` or `.rs` there. A Rust file a
+  service's file uses is the service's: the service builds it, and the app passes over
+  it when it reads the service's functions.
 - **In one process** (the default) a service is loaded once and shared by every program
   in the process that names it: one copy of its variables and its database. A call
   goes straight to it.
@@ -1937,7 +1957,10 @@ When a service runs elsewhere, its calls are made to hold up:
 
   Those are the defaults, except `timeout` (10 s). Durations are `"500ms"`, `"2s"`,
   `"1m"` (`ms`, `s` and `m` only), or a number of milliseconds; `timeout` is more than
-  0, `retries` 0 to 10, `failures` 1 or more. A try that runs out says so: `service
+  0, `retries` 0 to 10, `failures` 1 or more. A duration past a century counts as a
+  century; one no duration can hold (past about 1.8e19 s, infinite, NaN or negative) is
+  refused as the program loads (`` service work: `timeout` is a duration ``), as `"1.5h"`
+  is. A try that runs out says so: `service
   billing: took more than 2 s (its timeout)`. They apply when a service runs elsewhere
   (`--split`, or at an address); in one process a call is a function's, which runs to
   its end.

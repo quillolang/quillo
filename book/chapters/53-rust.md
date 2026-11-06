@@ -34,7 +34,12 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   `Result<T, E>` gives `T`, or an error value with `E`'s message, so `?` and `??` work
   on it. `()` is `null`. References (`&String`, `&Vec<T>`) are fine as parameters.
   A `u64` past `i64`'s range inside a returned `serde_json::Value` is a runtime error
-  that names where it is (`.id`, `[1].n`), not a float that has lost digits.
+  that names where it is (`.id`, `[1].n`), not a float that has lost digits, and one
+  returned alone names its function. NaN and the infinities cross to an `f64` and back
+  as they are (they arrived as `null`); a `serde_json::Value` argument that holds one is
+  refused by the argument's name, as JSON has none. An error value given to a Rust
+  function, at the top or inside a list or map, is given back, and the function does not
+  run.
 - An argument that does not fit is refused with the parameter's name: `` `small`:
   argument `n` does not fit in i32: 5000000000 ``. Values cross at most 126 levels deep:
   an argument nested deeper is refused (`` `deep`: argument `v` is nested too deeply: a
@@ -48,7 +53,14 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
 - The rest of the file is ordinary Rust: private functions, structs, `impl`s, modules,
   `use`. A `pub fn` that is generic (a written lifetime counts: `fn f<'a>`), `async`,
   takes `&mut`, or has a type that cannot cross, as a fixed-size array cannot, is not
-  exported, and `quillo check` says why. Another crate's type named `Value` passes the
+  exported, and `quillo check` says why. So is one with a reference inside another type,
+  `Option<&str>`, `Vec<&str>` or `&[&str]`, which the glue cannot build: the message
+  names the owned type to take (`Option<String>`, `Vec<String>`). `&str` and `-> &'static
+  str` are fine, as are paths (`std::string::String`, `std::collections::HashMap`) and
+  comments in a signature. A raw name, `pub fn r#type`, is the function `type`, and the
+  functions after it are read; a function named like a Quillo keyword (`view`, `match`,
+  `reply`) is not exported. A `#[cfg(...)]` on a `pub fn` is kept: called where it was
+  left out of the build, it says the function is not in this build. Another crate's type named `Value` passes the
   check and fails the build. A signature may name what the file's own `use` lines bring
   in: after `use serde_json::Value;` and `use std::collections::HashMap;`, `pub fn
   role(auth: Value)` and `pub fn total(m: HashMap<String, i64>)` build as written in
@@ -57,7 +69,9 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   from crates.io or git. They come first, after other `//!` lines if any; the first line
   that is not `//!` ends them. Only that table is read (no `[features]` table, no
   `[patch]`, no `build.rs` of the file's own; a crate's own build scripts do run).
-  `serde_json` is always there. C libraries come through `-sys` crates.
+  `serde_json` is always there. C libraries come through `-sys` crates. The `//!` lines
+  may follow `//` comments, blank lines, block comments and `#![...]` attributes at the
+  top of the file.
 - **`//! effects: fs, http`**, a header line, says what the file's functions do, in the
   words of `with` (`db`, `http`, `fs`, `env`, `time`, `random`, `net`; `db.analytics` is
   `db`), or `//! effects: none`. It is what lets a `with` function call them: a function
@@ -73,8 +87,12 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   names the nearest it does. `import redis.qwer use *`, or `use redis.qwer`, takes them
   all. Each file takes what it calls, as with a `.qwe` file (see [Files of a
   program](#files-of-a-program)).
-- Two `.qwer` files exporting one name: the last `use`d replaces the other, with a
-  warning that says how to take one under another name.
+- A Rust file's names are the file's that takes them, as a `.qwe` file's are: two Rust
+  files exporting one name are two functions, and a file that takes both is told to
+  choose, naming the files (`` comes from a.rs and b.rs: ... import a.rs use who ``);
+  one function taken by several files is one function. A name from a Rust file taken
+  whole gives way to the file's own definitions and to names it takes by name. The fix a
+  warning suggests (`import x.qwer use len as x_len`) parses.
 - A `pub fn` named like a builtin (`len`, `get`) hides the builtin in the files that
   take it, and `quillo check` warns of it at the `.qwer` file's line, with how to take it
   under another name: `import x.qwer use len as x_len` (FEEDBACK27.md, Q-326).
@@ -101,8 +119,11 @@ How it runs:
   its own in Quillo's cache: `QUILLO_NATIVE_CACHE`, else `$XDG_CACHE_HOME/quillo/native`,
   else `~/.cache/quillo/native`, else the system's temporary folder. The crates' builds
   are shared there, and nothing old is removed (it grows: clear it now and then). The
-  library is kept in `.quillo/native/` next to the file, named by a hash of the file's
-  text, the glue's version and the processor: the next start loads it without building.
+  library is kept in `.quillo/native/` next to the file, named by the file's whole name
+  (so `x.rs` and `x.qwer` side by side keep one each), the glue's version, and a hash of
+  the file's text, the glue and the processor: the next start loads it without building.
+  An older Quillo's libraries, and their lock lines, are kept, so going back to it still
+  runs.
   A build takes seconds the first time, more with large crates, and needs crates.io
   (or cargo's own offline mode).
 - `quillo build app.qwe` builds every Rust file the program and its mounted programs
@@ -111,7 +132,7 @@ How it runs:
   program, and the server needs no Rust: it loads what was built for that content, on
   the same processor and system (there is no cross-compiling: build on Linux for
   Linux), by the same Quillo glue. A Quillo whose glue changed builds again, and needs
-  cargo then.
+  cargo then: run `quillo build` once as part of the deploy that brings it.
 - **`.quillo/plugins.lock`** *(since 0.7)*, beside `.quillo/native/`, holds each library's file name
   and SHA-256, a line each, written by every build: `quillo build`, a `use` that built,
   [`--watch`](#options-of-quillo-run). Deploy it with `.quillo/native/`. A library is loaded only when it is the one
@@ -127,7 +148,11 @@ How it runs:
 - **[`--no-build`](#options-of-quillo-run)** never runs cargo, so no crate's build script runs on the server: a
   library is loaded only as the lock names it, and a file not built is an error
   (`./hi.qwer is not built, and --no-build says not to build it here: build it with
-  quillo build and bring .quillo along`). Under it, a folder with no lock loads nothing.
+  quillo build and bring .quillo along`); one built only by an older Quillo is said to
+  be (``./hi.qwer was built by an older Quillo, whose libraries this one cannot load, and
+  --no-build says not to build it here: run `quillo build` once where Rust is, and bring
+  .quillo along``). Under it, a folder with no
+  lock loads nothing.
   [`--split`](#options-of-quillo-run) passes it to its services, and a policy's `[plugins] build = false` is the
   same (see [The policy](#the-policy)).
 - **A policy's `[plugins] allow`** names the plugins a program may `use`: `"csv"` any

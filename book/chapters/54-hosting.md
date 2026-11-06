@@ -258,8 +258,12 @@ about 170 MB, most of it Debian; `quillo` needs only the C library from it.
 - **A new `quillo`.** Replace the binary and restart the service. Requests in progress
   finish first; new ones are refused for the moment it takes to start again (there is no
   handing the port from one process to the next). With several servers behind a load
-  balancer, restart them one at a time. `.qwer` libraries built by an older Quillo may be
-  built again, which needs Rust there: run `quillo build` with the new binary first.
+  balancer, restart them one at a time. A new `quillo` whose glue changed (the
+  libraries' names carry its version) loads none of the libraries an older one built:
+  run `quillo build main.qwe` with the new binary as part of the deploy that brings it,
+  and deploy `.quillo/` again. Under `--no-build` the server says which file was `built
+  by an older Quillo`. The older libraries are kept, so going back to the old binary
+  still runs.
 - **What a restart keeps.** The database, `quillo-system.db` beside the program, and
   sessions (with `QUILLO_SECRET`). Global variables, channels and what is cached in
   memory start empty.
