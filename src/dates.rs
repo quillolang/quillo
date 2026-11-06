@@ -487,10 +487,14 @@ fn zone(args: &[Value], i: usize, f: &str, line: u32) -> Result<Zone, Ctrl> {
     if name.eq_ignore_ascii_case("UTC") || &**name == "Z" {
         return Ok(Zone::Fixed(0));
     }
+    // An offset is one as `date.parse` reads it, `+05:30`, `+0530` or `+05`, on both sides: the
+    // browser took the last two (its Intl does) and the server none (FEEDBACK55.md, Q-829; branch
+    // feedback55). No other name starts with a sign.
     if name.starts_with(['+', '-']) {
-        if let Some(o) = parse_offset(name.as_bytes()) {
-            return Ok(Zone::Fixed(o));
-        }
+        return match written_offset(name) {
+            Some(o) => Ok(Zone::Fixed(o)),
+            None => fail(line, format!("`{}`: unknown time zone {}", f, got(Some(v)))),
+        };
     }
     match jiff::tz::TimeZone::get(name) {
         Ok(tz) if !not_a_zone(name) => Ok(Zone::Named(tz)),
@@ -740,70 +744,102 @@ struct Names {
     styles: [&'static str; 4],
 }
 
+// Each language's names, shared by its regions' rows.
+const EN_MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const EN_MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const GB_MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"];
+const EN_DAYS: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+const EN_DY: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const DE_MONTHS: [&str; 12] = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"];
+const DE_MON: [&str; 12] = ["Jan.", "Feb.", "März", "Apr.", "Mai", "Juni", "Juli", "Aug.", "Sept.", "Okt.", "Nov.", "Dez."];
+const DE_DAYS: [&str; 7] = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"];
+const DE_DY: [&str; 7] = ["Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So."];
+const DE_STYLES: [&str; 4] = ["DD.MM.YY", "DD.MM.YYYY", "D. MMMM YYYY", "dddd, D. MMMM YYYY"];
+const FR_MONTHS: [&str; 12] = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"];
+const FR_MON: [&str; 12] = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."];
+const FR_DAYS: [&str; 7] = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"];
+const FR_DY: [&str; 7] = ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."];
+const ES_MONTHS: [&str; 12] = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
+const ES_MON: [&str; 12] = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sept", "oct", "nov", "dic"];
+const ES_DAYS: [&str; 7] = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"];
+const ES_DY: [&str; 7] = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"];
+const IT_MONTHS: [&str; 12] = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
+const IT_MON: [&str; 12] = ["gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic"];
+const IT_DAYS: [&str; 7] = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"];
+const IT_DY: [&str; 7] = ["lun", "mar", "mer", "gio", "ven", "sab", "dom"];
+const NL_MONTHS: [&str; 12] = ["januari", "februari", "maart", "april", "mei", "juni", "juli", "augustus", "september", "oktober", "november", "december"];
+const NL_MON: [&str; 12] = ["jan", "feb", "mrt", "apr", "mei", "jun", "jul", "aug", "sep", "okt", "nov", "dec"];
+const NL_DAYS: [&str; 7] = ["maandag", "dinsdag", "woensdag", "donderdag", "vrijdag", "zaterdag", "zondag"];
+const NL_DY: [&str; 7] = ["ma", "di", "wo", "do", "vr", "za", "zo"];
+const PT_MONTHS: [&str; 12] = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"];
+const PT_MON: [&str; 12] = ["jan.", "fev.", "mar.", "abr.", "mai.", "jun.", "jul.", "ago.", "set.", "out.", "nov.", "dez."];
+const PT_DAYS: [&str; 7] = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"];
+
+/// The rows: a language's, and its regions' that CLDR writes otherwise (en-CA's short date is
+/// 2026-09-05, de-AT's January Jänner, pt-PT's medium one 05/09/2026), each region's styles and
+/// names as CLDR 47 has them (FEEDBACK55.md, Q-828; branch feedback55).
 const LOCALES: &[Names] = &[
+    Names { tags: &["en", "en-us"], months: EN_MONTHS, mon: EN_MON, days: EN_DAYS, dy: EN_DY, styles: ["M/D/YY", "MMM D, YYYY", "MMMM D, YYYY", "dddd, MMMM D, YYYY"] },
+    Names { tags: &["en-gb", "en-nz"], months: EN_MONTHS, mon: GB_MON, days: EN_DAYS, dy: EN_DY, styles: ["DD/MM/YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd, D MMMM YYYY"] },
+    Names { tags: &["en-ie"], months: EN_MONTHS, mon: GB_MON, days: EN_DAYS, dy: EN_DY, styles: ["DD/MM/YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"] },
     Names {
-        tags: &["en", "en-us"],
-        months: ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
-        mon: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
-        days: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
-        dy: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-        styles: ["M/D/YY", "MMM D, YYYY", "MMMM D, YYYY", "dddd, MMMM D, YYYY"],
+        tags: &["en-au"],
+        months: EN_MONTHS,
+        mon: ["Jan", "Feb", "Mar", "Apr", "May", "June", "July", "Aug", "Sept", "Oct", "Nov", "Dec"],
+        days: EN_DAYS,
+        dy: EN_DY,
+        styles: ["D/M/YY", "D MMM YYYY", "D MMMM YYYY", "dddd, D MMMM YYYY"],
     },
+    Names { tags: &["en-in"], months: EN_MONTHS, mon: GB_MON, days: EN_DAYS, dy: EN_DY, styles: ["DD/MM/YY", "D MMM YYYY", "D MMMM YYYY", "dddd, D MMMM YYYY"] },
+    Names { tags: &["en-za"], months: EN_MONTHS, mon: GB_MON, days: EN_DAYS, dy: EN_DY, styles: ["YYYY/MM/DD", "DD MMM YYYY", "DD MMMM YYYY", "dddd, DD MMMM YYYY"] },
+    Names { tags: &["en-ca"], months: EN_MONTHS, mon: EN_MON, days: EN_DAYS, dy: EN_DY, styles: ["YYYY-MM-DD", "MMM D, YYYY", "MMMM D, YYYY", "dddd, MMMM D, YYYY"] },
+    Names { tags: &["de"], months: DE_MONTHS, mon: DE_MON, days: DE_DAYS, dy: DE_DY, styles: DE_STYLES },
     Names {
-        tags: &["en-gb", "en-ie", "en-au", "en-nz", "en-in", "en-za"],
-        months: ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
-        mon: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"],
-        days: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
-        dy: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-        styles: ["DD/MM/YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd, D MMMM YYYY"],
+        tags: &["de-at"],
+        months: ["Jänner", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"],
+        mon: ["Jän.", "Feb.", "März", "Apr.", "Mai", "Juni", "Juli", "Aug.", "Sep.", "Okt.", "Nov.", "Dez."],
+        days: DE_DAYS,
+        dy: DE_DY,
+        styles: DE_STYLES,
     },
+    Names { tags: &["fr"], months: FR_MONTHS, mon: FR_MON, days: FR_DAYS, dy: FR_DY, styles: ["DD/MM/YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"] },
     Names {
-        tags: &["de"],
-        months: ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"],
-        mon: ["Jan.", "Feb.", "März", "Apr.", "Mai", "Juni", "Juli", "Aug.", "Sept.", "Okt.", "Nov.", "Dez."],
-        days: ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"],
-        dy: ["Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So."],
-        styles: ["DD.MM.YY", "DD.MM.YYYY", "D. MMMM YYYY", "dddd, D. MMMM YYYY"],
+        tags: &["fr-ca"],
+        months: FR_MONTHS,
+        mon: ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juill.", "août", "sept.", "oct.", "nov.", "déc."],
+        days: FR_DAYS,
+        dy: FR_DY,
+        styles: ["YYYY-MM-DD", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"],
     },
+    Names { tags: &["fr-ch"], months: FR_MONTHS, mon: FR_MON, days: FR_DAYS, dy: FR_DY, styles: ["DD.MM.YY", "D MMM YYYY", "D MMMM YYYY", "dddd, D MMMM YYYY"] },
+    Names { tags: &["es"], months: ES_MONTHS, mon: ES_MON, days: ES_DAYS, dy: ES_DY, styles: ["D/M/YY", "D MMM YYYY", "D [de] MMMM [de] YYYY", "dddd, D [de] MMMM [de] YYYY"] },
     Names {
-        tags: &["fr"],
-        months: ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"],
-        mon: ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."],
-        days: ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"],
-        dy: ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."],
-        styles: ["DD/MM/YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"],
+        tags: &["es-mx"],
+        months: ES_MONTHS,
+        mon: ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"],
+        days: ES_DAYS,
+        dy: ES_DY,
+        styles: ["DD/MM/YY", "D MMM YYYY", "D [de] MMMM [de] YYYY", "dddd, D [de] MMMM [de] YYYY"],
     },
-    Names {
-        tags: &["es"],
-        months: ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"],
-        mon: ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sept", "oct", "nov", "dic"],
-        days: ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"],
-        dy: ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"],
-        styles: ["D/M/YY", "D MMM YYYY", "D [de] MMMM [de] YYYY", "dddd, D [de] MMMM [de] YYYY"],
-    },
-    Names {
-        tags: &["it"],
-        months: ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"],
-        mon: ["gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic"],
-        days: ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"],
-        dy: ["lun", "mar", "mer", "gio", "ven", "sab", "dom"],
-        styles: ["DD/MM/YY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"],
-    },
-    Names {
-        tags: &["nl"],
-        months: ["januari", "februari", "maart", "april", "mei", "juni", "juli", "augustus", "september", "oktober", "november", "december"],
-        mon: ["jan", "feb", "mrt", "apr", "mei", "jun", "jul", "aug", "sep", "okt", "nov", "dec"],
-        days: ["maandag", "dinsdag", "woensdag", "donderdag", "vrijdag", "zaterdag", "zondag"],
-        dy: ["ma", "di", "wo", "do", "vr", "za", "zo"],
-        styles: ["DD-MM-YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"],
-    },
+    Names { tags: &["it"], months: IT_MONTHS, mon: IT_MON, days: IT_DAYS, dy: IT_DY, styles: ["DD/MM/YY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"] },
+    Names { tags: &["it-ch"], months: IT_MONTHS, mon: IT_MON, days: IT_DAYS, dy: IT_DY, styles: ["DD.MM.YY", "D MMM YYYY", "D MMMM YYYY", "dddd, D MMMM YYYY"] },
+    Names { tags: &["nl"], months: NL_MONTHS, mon: NL_MON, days: NL_DAYS, dy: NL_DY, styles: ["DD-MM-YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"] },
+    Names { tags: &["nl-be"], months: NL_MONTHS, mon: NL_MON, days: NL_DAYS, dy: NL_DY, styles: ["D/MM/YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"] },
     Names {
         tags: &["pt"],
-        months: ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"],
-        mon: ["jan.", "fev.", "mar.", "abr.", "mai.", "jun.", "jul.", "ago.", "set.", "out.", "nov.", "dez."],
-        days: ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"],
+        months: PT_MONTHS,
+        mon: PT_MON,
+        days: PT_DAYS,
         dy: ["seg.", "ter.", "qua.", "qui.", "sex.", "sáb.", "dom."],
         styles: ["DD/MM/YYYY", "D [de] MMM [de] YYYY", "D [de] MMMM [de] YYYY", "dddd, D [de] MMMM [de] YYYY"],
+    },
+    Names {
+        tags: &["pt-pt"],
+        months: PT_MONTHS,
+        mon: PT_MON,
+        days: PT_DAYS,
+        dy: ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"],
+        styles: ["DD/MM/YY", "DD/MM/YYYY", "D [de] MMMM [de] YYYY", "dddd, D [de] MMMM [de] YYYY"],
     },
 ];
 
@@ -1108,11 +1144,18 @@ fn read_iso(s: &str) -> Option<String> {
     let o = &s[i..];
     let off = match o.len() {
         1 => parse_offset(o.to_ascii_uppercase().as_bytes())?,
-        3 => parse_offset(format!("{}:00", o).as_bytes())?,
-        5 if !o.contains(':') => parse_offset(format!("{}:{}", &o[..3], &o[3..]).as_bytes())?,
-        _ => parse_offset(o.as_bytes())?,
+        _ => written_offset(o)?,
     };
     stamp_text(day * 86400 + sec - off, &frac, off)
+}
+
+/// An offset as people write one: `+01`, `+0100`, `+01:00` (and `+00:09:21`), in seconds.
+fn written_offset(o: &str) -> Option<i64> {
+    match o.len() {
+        3 => parse_offset(format!("{}:00", o).as_bytes()),
+        5 if !o.contains(':') => parse_offset(format!("{}:{}", o.get(..3)?, o.get(3..)?).as_bytes()),
+        _ => parse_offset(o.as_bytes()),
+    }
 }
 
 /// An HTTP date, `Tue, 27 Oct 2026 14:30:00 GMT` (RFC 9110's IMF-fixdate), as UTC.

@@ -1,13 +1,11 @@
 //! `image.info` and `image.convert` when the files don't cooperate: a path
 //! with nothing there, a folder for a file, a folder it can't write in, a
-//! place to write that stops taking bytes. What the program gets is an error
+//! disk that stops taking bytes. What the program gets is an error
 //! value saying why, and no half-made file is left.
 
 mod support;
 
 use quillo::Interp;
-use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -93,25 +91,33 @@ fn a_finished_image_that_has_nowhere_to_go_leaves_nothing_behind() {
     assert!(left.is_empty(), "{:?}", left);
 }
 
-/// The place `image.convert` writes to before the rename, as a pipe whose
-/// reader goes away at once: each write past what a pipe holds then fails.
-fn stops_taking_bytes(dest: &Path) -> std::thread::JoinHandle<()> {
-    // The whole name, then `.tmp<pid>` (FEEDBACK53.md's review).
-    let tmp = dest.with_file_name(format!("{}.tmp{}", dest.file_name().unwrap().to_string_lossy(), std::process::id()));
-    let c = CString::new(tmp.as_os_str().as_bytes()).unwrap();
-    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
-    std::thread::spawn(move || drop(std::fs::File::open(tmp).unwrap()))
+/// `quillo run app.qwe` in `d` where no file may grow past a block (`ulimit -f 1`, as on a full
+/// disk), under a deadline: what it printed.
+fn run_with_a_full_disk(d: &Path) -> String {
+    let script = format!("trap '' XFSZ; ulimit -f 1; exec '{}' run app.qwe", env!("CARGO_BIN_EXE_quillo"));
+    let mut child = Command::new("sh").args(["-c", &script]).current_dir(d).env_remove("LLVM_PROFILE_FILE").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the conversion did not end");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
 }
 
+/// A write that fails as the image is written, not only at the last flush. It was a pipe made
+/// where the temp file goes, whose reader went away; each call now names its temp file for itself
+/// (FEEDBACK55.md, Q-824; branch feedback55), so the writes fail as on a full disk instead.
 fn a_write_that_fails_ends_the_conversion(format: &str) {
-    let d = folder(&format!("broken-pipe-{}", format));
+    let d = folder(&format!("broken-write-{}", format));
     noisy(&d);
-    let dest = d.join(format!("out.{}", format));
-    let reader = stops_taking_bytes(&dest);
-    let got = run(&d, &format!(r#"image.convert("noise.png", "out.{}", {{ format: "{}" }})"#, format, format));
-    reader.join().unwrap();
-    says(got, "Broken pipe");
-    assert!(!dest.exists());
+    std::fs::write(d.join("app.qwe"), format!("print(image.convert(\"noise.png\", \"out.{}\", {{ format: \"{}\" }}))\n", format, format)).unwrap();
+    let got = run_with_a_full_disk(&d);
+    assert!(got.contains("image: ") && got.contains("too large"), "{}", got);
+    assert!(!d.join(format!("out.{}", format)).exists());
     let left: Vec<_> = std::fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.contains("tmp")).collect();
     assert!(left.is_empty(), "{:?}", left);
 }

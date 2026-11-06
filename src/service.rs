@@ -363,11 +363,23 @@ pub fn opts(name: &str) -> Opts {
     opts_table().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).copied().unwrap_or_default()
 }
 
-/// A duration given as milliseconds (`1500`) or text (`"1.5s"`, `"500ms"`, `"2m"`).
+/// The longest wait taken: a century, as long as for ever.
+const LONGEST: Duration = Duration::from_secs(100 * 365 * 86_400);
+
+/// A duration given as milliseconds (`1500`) or text (`"1.5s"`, `"500ms"`, `"2m"`). One no
+/// `Duration` holds (`1e300`, `math.inf`, `"99999999999999999999s"`) is no duration, as `"1.5h"`
+/// is not: `from_secs_f64` stopped the program as it loaded. One longer than a century is a
+/// century: an `Instant` holds less than a `Duration`, so `now + cooldown` stopped the program and
+/// every call with such a timeout failed, "Request deadline overflowed" (FEEDBACK55.md, Q-830;
+/// branch feedback55).
 fn duration(v: &Value) -> Option<Duration> {
+    given_duration(v).map(|d| d.min(LONGEST))
+}
+
+fn given_duration(v: &Value) -> Option<Duration> {
     match v {
         Value::Int(n) if *n >= 0 => Some(Duration::from_millis(*n as u64)),
-        Value::Float(f) if *f >= 0.0 => Some(Duration::from_secs_f64(f / 1000.0)),
+        Value::Float(f) if *f >= 0.0 => Duration::try_from_secs_f64(f / 1000.0).ok(),
         Value::Str(s) => {
             let s = s.trim();
             let (num, unit) = s.split_at(s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len()));
@@ -378,7 +390,7 @@ fn duration(v: &Value) -> Option<Duration> {
                 "m" => n * 60_000.0,
                 _ => return None,
             };
-            Some(Duration::from_secs_f64(ms / 1000.0))
+            Duration::try_from_secs_f64(ms / 1000.0).ok()
         }
         _ => None,
     }
@@ -466,7 +478,7 @@ fn went_wrong(url: &str, o: &Opts) {
     st.fails += 1;
     if st.fails >= o.failures {
         let times = 1u32 << (st.fails - o.failures).min(4);
-        let wait = o.cooldown * times;
+        let wait = o.cooldown.saturating_mul(times);
         if st.until.is_none() {
             eprintln!("quillo: {} failed {} times in a row; left alone for {:.1}s", url, st.fails, wait.as_secs_f64());
         }

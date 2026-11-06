@@ -16,6 +16,7 @@
 
 use crate::interp::{fail, Ctrl, Interp};
 use crate::value::*;
+use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -60,6 +61,27 @@ fn reader(path: &Path) -> Result<ImageReader<std::io::BufReader<std::fs::File>>,
     Ok(r)
 }
 
+/// Whether an orientation turns the image a quarter, so that its width is its height.
+fn turned(o: Orientation) -> bool {
+    matches!(o, Orientation::Rotate90 | Orientation::Rotate270 | Orientation::Rotate90FlipH | Orientation::Rotate270FlipH)
+}
+
+/// The image decoded and turned as its EXIF orientation says (FEEDBACK55.md, Q-825; branch
+/// feedback55): `decode` alone left a phone's photo on its side, with no EXIF in what was
+/// written for a browser to turn it by.
+fn decode_upright(path: &Path) -> Result<DynamicImage, String> {
+    let mut d = reader(path)?.into_decoder().map_err(|e| e.to_string())?;
+    let o = d.orientation().unwrap_or(Orientation::NoTransforms);
+    // As `ImageReader::decode` does: the pixels taken from the budget, and the decoder's own
+    // buffers held to what is left, so both stay within `MOST_BYTES` (found in review).
+    let mut l = limits();
+    l.reserve(d.total_bytes()).map_err(|e| e.to_string())?;
+    d.set_limits(l).map_err(|e| e.to_string())?;
+    let mut img = DynamicImage::from_decoder(d).map_err(|e| e.to_string())?;
+    img.apply_orientation(o);
+    Ok(img)
+}
+
 fn path_arg(it: &Interp, args: &[Value], i: usize, f: &str, line: u32) -> Result<PathBuf, Ctrl> {
     match args.get(i) {
         Some(Value::Str(p)) => match crate::builtins::local_path(it, p) {
@@ -80,11 +102,14 @@ fn info(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let found = it.unlocked(move || -> Result<(u32, u32, &'static str, bool), String> {
         let r = reader(&path)?;
         let format = format_name(r.format().unwrap_or(ImageFormat::Png));
-        let d = r.into_decoder().map_err(|e| e.to_string())?;
+        let mut d = r.into_decoder().map_err(|e| e.to_string())?;
         let (w, h) = d.dimensions();
         if w > MOST_SIDE || h > MOST_SIDE {
             return Err(format!("{}×{} pixels is larger than {} a side", w, h, MOST_SIDE));
         }
+        // The size it is shown at: a phone's photo taken upright is stored on its side, with an
+        // EXIF orientation that says to turn it (FEEDBACK55.md, Q-825; branch feedback55).
+        let (w, h) = if turned(d.orientation().unwrap_or(Orientation::NoTransforms)) { (h, w) } else { (w, h) };
         Ok((w, h, format, d.color_type().has_alpha()))
     });
     Ok(match found {
@@ -163,7 +188,7 @@ fn job_of(opts: Option<&Value>, dest: &std::path::Path, line: u32) -> Result<Job
 }
 
 fn make(src: &Path, dest: &Path, job: Job) -> Result<(u32, u32), String> {
-    let mut img: DynamicImage = reader(src)?.decode().map_err(|e| e.to_string())?;
+    let mut img = decode_upright(src)?;
     if let Some((x, y, w, h)) = job.crop {
         if x.saturating_add(w) > img.width() || y.saturating_add(h) > img.height() {
             return Err(format!("the crop {}×{} at {},{} is outside the {}×{} image", w, h, x, y, img.width(), img.height()));
@@ -185,13 +210,27 @@ fn make(src: &Path, dest: &Path, job: Job) -> Result<(u32, u32), String> {
     }
     // Written beside, then renamed: a request never sees half a file.
     // The whole name in it: `a.png` and `a.webp` made at once shared `a.tmp<pid>` (found in
-    // review of FEEDBACK53.md, Q-684).
-    let tmp = dest.with_file_name(format!("{}.tmp{}", dest.file_name().map_or(std::borrow::Cow::Borrowed("image"), |n| n.to_string_lossy()), std::process::id()));
-    let out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    // review of FEEDBACK53.md, Q-684). And a number of each call's own: two made to one name at
+    // once wrote one temp file, and the second's rename found none (FEEDBACK55.md, Q-824; branch
+    // feedback55). The name cut to 128 bytes, so that what is added fits in a name.
+    // Random, and made only where nothing is: two containers sharing a folder are each PID 1, with
+    // counters of their own (found in review).
+    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = dest.file_name().map_or(std::borrow::Cow::Borrowed("image"), |n| n.to_string_lossy());
+    let cut = (0..=name.len().min(128)).rev().find(|i| name.is_char_boundary(*i)).unwrap_or(0);
+    let (tmp, out) = loop {
+        let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dest.with_file_name(format!("{}.tmp{}-{}-{:08x}", &name[..cut], std::process::id(), n, fastrand::u32(..)));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(out) => break (tmp, out),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    };
     let mut w = std::io::BufWriter::new(out);
     let encoded = match job.format {
         ImageFormat::Jpeg => {
-            let rgb = img.to_rgb8();
+            let rgb = on_white(&img);
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut w, job.quality).encode_image(&rgb).map_err(|e| e.to_string())
         }
         ImageFormat::WebP => img.to_rgba8().write_with_encoder(image::codecs::webp::WebPEncoder::new_lossless(&mut w)).map_err(|e| e.to_string()),
@@ -211,6 +250,24 @@ fn make(src: &Path, dest: &Path, job: Job) -> Result<(u32, u32), String> {
         return Err(e.to_string());
     }
     Ok((img.width(), img.height()))
+}
+
+/// The pixels for a format with no transparency: what is see-through laid on white, as a browser
+/// shows it on a page; `to_rgb8` dropped the alpha, so a transparent corner came out black
+/// (FEEDBACK55.md, Q-826; branch feedback55).
+fn on_white(img: &DynamicImage) -> image::RgbImage {
+    if !img.color().has_alpha() {
+        return img.to_rgb8();
+    }
+    let mix = |c: u8, a: u8| ((c as u32 * a as u32 + 255 * (255 - a as u32) + 127) / 255) as u8;
+    let lay = |rgba: &image::RgbaImage| image::RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let image::Rgba([r, g, b, a]) = *rgba.get_pixel(x, y);
+        image::Rgb([mix(r, a), mix(g, a), mix(b, a)])
+    });
+    match img {
+        DynamicImage::ImageRgba8(rgba) => lay(rgba),
+        other => lay(&other.to_rgba8()),
+    }
 }
 
 /// Most images converted at once: each may take up to `MOST_BYTES` to
@@ -273,14 +330,19 @@ fn in_turn<T>(bytes: u64, f: impl FnOnce() -> Result<T, String>) -> Result<T, St
 /// will have) and what it gives, and the copy encoded. An error past `MOST_PIXELS` or
 /// `MOST_BYTES_ONE`.
 fn cost_of(src: &Path, job: &Job) -> Result<u64, String> {
-    let d = reader(src)?.into_decoder().map_err(|e| e.to_string())?;
+    let mut d = reader(src)?.into_decoder().map_err(|e| e.to_string())?;
     let (w, h) = d.dimensions();
     let bpp = d.color_type().bytes_per_pixel() as u64;
+    let alpha = d.color_type().has_alpha();
     if w as u64 * h as u64 > MOST_PIXELS {
         return Err(format!("the image is {}×{}, more than the {} megapixels converted", w, h, MOST_PIXELS / 1_000_000));
     }
+    // Turned a quarter, it is turned into a copy, and cropped as it is shown (FEEDBACK55.md, Q-825;
+    // branch feedback55).
+    let quarter = turned(d.orientation().unwrap_or(Orientation::NoTransforms));
+    let (w, h) = if quarter { (h, w) } else { (w, h) };
     let (cw, ch) = job.crop.map_or((w as u64, h as u64), |(_, _, cw, ch)| (cw.min(w) as u64, ch.min(h) as u64));
-    let mut bytes = w as u64 * h as u64 * bpp;
+    let mut bytes = w as u64 * h as u64 * bpp * if quarter { 2 } else { 1 };
     let (ow, oh) = match job.width {
         Some(nw) if (nw as u64) < cw && cw > 0 => {
             let nh = (ch * nw as u64 / cw).max(1);
@@ -290,6 +352,11 @@ fn cost_of(src: &Path, job: &Job) -> Result<u64, String> {
         _ => (cw, ch),
     };
     bytes += ow * oh * 4;
+    // Laid on white for a JPEG, through a copy with its alpha (FEEDBACK55.md, Q-826; branch
+    // feedback55).
+    if alpha && job.format == ImageFormat::Jpeg {
+        bytes += ow * oh * 4;
+    }
     if bytes > MOST_BYTES_ONE {
         return Err(format!("converting the {}×{} image so would take about {} MiB, more than the {} converted at once", w, h, bytes >> 20, MOST_BYTES_ONE >> 20));
     }

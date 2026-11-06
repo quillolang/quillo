@@ -2187,58 +2187,114 @@ B.js_new = meta((path, ...args) => {
 // page's `__quilloErrors` are the only names (FEEDBACK42.md, Q-486; branch feedback40-43).
 const QW = typeof window === "undefined" ? {} : window[Symbol.for("quillo")] || (window[Symbol.for("quillo")] = {});
 const i18n = () => QW.i18n || null;
-// The plural form of n, as on the server (CLDR's rules), `frac` when it is written with a
-// fraction's digits (FEEDBACK30.md, Q-366; branch feedback27-35-fixes).
-const plural = (locale, n, frac) => {
+// CLDR's operands of a number as it is written, as on the server (src/i18n.rs's `Operands`): i
+// its integer digits (the last nine, `ib` when a digit before them is not 0), v how many digits
+// it shows after the point, f those digits and t them without their zeros at the end (the last
+// nine of each), `fb` when a digit of f's before its last nine is not 0 (FEEDBACK55.md, Q-823;
+// branch feedback55).
+const pluralOps = (int, frac) => {
+  let k = frac.length;
+  while (k > 0 && frac.charCodeAt(k - 1) === 48) k--;
+  return { i: Number(int.slice(-9) || 0), ib: int.length > 9 && /[1-9]/.test(int.slice(0, -9)), v: frac.length, f: Number(frac.slice(-9) || 0),
+    fb: frac.length > 9 && /[1-9]/.test(frac.slice(0, -9)), t: Number(frac.slice(Math.max(k - 9, 0), k) || 0) };
+};
+const pluralInt = (n) => ({ i: n % 1e9, ib: n >= 1e9, v: 0, f: 0, fb: false, t: 0 });
+// Numeric text: digits with a sign, a point and an exponent (`12`, `-1.50`, `.5`, `5.`, `1e3`),
+// the point moved by the exponent; null for any other (`0x1`, `Infinity`).
+const pluralText = (s) => {
+  const m = /^[+-]?(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/.exec(s);
+  if (!m) return null;
+  const int = m[1] ?? "", frac = m[2] ?? m[3] ?? "", e = m[4] === undefined ? 0 : Number(m[4]);
+  if (e === 0) return pluralOps(int, frac);
+  const d = int + frac, p = int.length + e;
+  if (p <= 0) return { ...pluralOps("", d), v: d.length - p };
+  if (p >= d.length) return p - d.length >= 9 ? { ...pluralInt(0), ib: /[1-9]/.test(d) } : pluralOps(d + "0".repeat(p - d.length), "");
+  return pluralOps(d.slice(0, p), d.slice(p));
+};
+// The languages with no plural forms, and those whose `one` is n = 1, as CLDR 47 lists them (old
+// codes too: `in`, `jw`); src/i18n.rs's `plural_of` has the same (found in review of FEEDBACK55.md's
+// Q-823).
+const PLURAL_NONE = new Set("bm bo dz hnj id ig ii in ja jbo jv jw kde kea km ko lkt lo ms my nqo osa sah ses sg su th to tpi vi wo yo yue zh".split(" "));
+const PLURAL_N1 = new Set(("af an asa az bal bem bez bg brx ce cgg chr ckb dv ee el eo eu fo fur gsw ha haw hu jgo jmc ka kaj kcg kk kkj kl ks ksb ku ky lb lg mas mgo ml mn "
+  + "mr nah nb nd ne nn nnh no nr ny nyn om or os pap ps rm rof rwk saq sd sdh seh sn so sq ss ssy st syr ta te teo tig tk tn tr ts ug uz ve vo vun wae xh xog").split(" "));
+// The plural form of a number by its operands, as on the server (CLDR 47's rules); any other
+// language is read as English (FEEDBACK30.md, Q-366; branch feedback27-35-fixes).
+const plural = (locale, o) => {
   const parts = String(locale).split(/[-_]/), lang = parts[0].toLowerCase(), region = (parts[1] || "").toUpperCase();
-  if (frac || !Number.isInteger(n)) return lang === "lt" || lang === "cs" || lang === "sk" ? "many" : lang === "ro" ? "few" : "other";
-  n = Math.abs(n);
-  const m10 = n % 10, m100 = n % 100, millions = n !== 0 && n % 1000000 === 0;
-  const few = m10 >= 2 && m10 <= 4 && !(m100 >= 12 && m100 <= 14), teen = m100 >= 11 && m100 <= 19;
+  const { i, ib, v, f, fb, t } = o, whole = f === 0 && !fb, n = (k) => whole && !ib && i === k, nIn = (a, b) => whole && !ib && i >= a && i <= b;
+  const is = (k) => !ib && i === k, i10 = i % 10, i100 = i % 100, f10 = f % 10, f100 = f % 100, within = (x, a, b) => x >= a && x <= b;
+  const millions = v === 0 && (ib || i !== 0) && i % 1000000 === 0;
+  if (PLURAL_NONE.has(lang)) return "other";
+  if (PLURAL_N1.has(lang)) return n(1) ? "one" : "other";
   switch (lang) {
-    case "ja": case "zh": case "ko": case "th": case "vi": case "id": case "ms": case "lo": case "my": case "km": case "yue": return "other";
-    case "pt": if (region === "PT") return n === 1 ? "one" : millions ? "many" : "other";
-    case "fr": return n <= 1 ? "one" : millions ? "many" : "other";
-    case "es": case "it": case "ca": return n === 1 ? "one" : millions ? "many" : "other";
-    case "hi": case "bn": case "fa": case "gu": case "kn": case "zu": case "am": return n <= 1 ? "one" : "other";
-    case "ro": case "mo": return n === 1 ? "one" : n === 0 || (m100 >= 1 && m100 <= 19) ? "few" : "other";
-    case "lt": return m10 === 1 && !teen ? "one" : m10 >= 2 && !teen ? "few" : "other";
-    case "lv": return m10 === 0 || teen ? "zero" : m10 === 1 && m100 !== 11 ? "one" : "other";
-    case "sl": return m100 === 1 ? "one" : m100 === 2 ? "two" : m100 === 3 || m100 === 4 ? "few" : "other";
-    case "is": case "mk": return m10 === 1 && m100 !== 11 ? "one" : "other";
-    case "ga": return n === 1 ? "one" : n === 2 ? "two" : n >= 3 && n <= 6 ? "few" : n >= 7 && n <= 10 ? "many" : "other";
-    case "cy": return n === 0 ? "zero" : n === 1 ? "one" : n === 2 ? "two" : n === 3 ? "few" : n === 6 ? "many" : "other";
-    case "mt": return n === 1 ? "one" : n === 2 ? "two" : n === 0 || (m100 >= 3 && m100 <= 10) ? "few" : teen ? "many" : "other";
-    case "ru": case "uk": case "be": return m10 === 1 && m100 !== 11 ? "one" : few ? "few" : "many";
-    case "sr": case "hr": case "bs": return m10 === 1 && m100 !== 11 ? "one" : few ? "few" : "other";
-    case "pl": return n === 1 ? "one" : few ? "few" : "many";
-    case "cs": case "sk": return n === 1 ? "one" : n >= 2 && n <= 4 ? "few" : "other";
-    case "ar": return n === 0 ? "zero" : n === 1 ? "one" : n === 2 ? "two" : m100 >= 3 && m100 <= 10 ? "few" : m100 >= 11 ? "many" : "other";
-    case "he": return n === 1 ? "one" : n === 2 ? "two" : "other";
-    default: return n === 1 ? "one" : "other";
+    case "am": case "as": case "bn": case "doi": case "fa": case "gu": case "hi": case "kn": case "pcm": case "zu": return is(0) || n(1) ? "one" : "other";
+    case "hy": case "ff": case "kab": return !ib && i <= 1 ? "one" : "other";
+    case "ak": case "bho": case "guw": case "ln": case "mg": case "nso": case "pa": case "ti": case "wa": return nIn(0, 1) ? "one" : "other";
+    // European Portuguese counts as Italian.
+    case "pt": if (region !== "PT") return !ib && i <= 1 ? "one" : millions ? "many" : "other";
+    // falls through
+    case "it": case "ca": case "scn": case "vec": case "lld": return is(1) && v === 0 ? "one" : millions ? "many" : "other";
+    case "fr": return !ib && i <= 1 ? "one" : millions ? "many" : "other";
+    case "es": return n(1) ? "one" : millions ? "many" : "other";
+    case "da": return n(1) || (!whole && !ib && i <= 1) ? "one" : "other";
+    case "is": return (whole && i10 === 1 && i100 !== 11) || (t % 10 === 1 && t % 100 !== 11) ? "one" : "other";
+    case "mk": return (v === 0 && i10 === 1 && i100 !== 11) || (f10 === 1 && f100 !== 11) ? "one" : "other";
+    case "si": return n(0) || n(1) || (is(0) && f === 1 && !fb) ? "one" : "other";
+    case "fil": case "tl": case "ceb": return (v === 0 && !ib && within(i, 1, 3)) || (v === 0 && i10 !== 4 && i10 !== 6 && i10 !== 9) || (v !== 0 && f10 !== 4 && f10 !== 6 && f10 !== 9) ? "one" : "other";
+    case "lv": case "prg": return (whole && (i10 === 0 || within(i100, 11, 19))) || (v === 2 && within(f100, 11, 19)) ? "zero"
+      : (whole && i10 === 1 && i100 !== 11) || (v === 2 && f10 === 1 && f100 !== 11) || (v !== 2 && f10 === 1) ? "one" : "other";
+    case "he": case "iw": return (is(1) && v === 0) || (is(0) && v !== 0) ? "one" : is(2) && v === 0 ? "two" : "other";
+    case "ro": case "mo": return is(1) && v === 0 ? "one" : v !== 0 || n(0) || (!n(1) && whole && within(i100, 1, 19)) ? "few" : "other";
+    case "bs": case "hr": case "sr": case "sh": return (v === 0 && i10 === 1 && i100 !== 11) || (f10 === 1 && f100 !== 11) ? "one"
+      : (v === 0 && within(i10, 2, 4) && !within(i100, 12, 14)) || (within(f10, 2, 4) && !within(f100, 12, 14)) ? "few" : "other";
+    case "sl": return v !== 0 ? "few" : i100 === 1 ? "one" : i100 === 2 ? "two" : i100 === 3 || i100 === 4 ? "few" : "other";
+    case "dsb": case "hsb": return (v === 0 && i100 === 1) || f100 === 1 ? "one" : (v === 0 && i100 === 2) || f100 === 2 ? "two" : (v === 0 && within(i100, 3, 4)) || within(f100, 3, 4) ? "few" : "other";
+    case "cs": case "sk": return v !== 0 ? "many" : is(1) ? "one" : !ib && within(i, 2, 4) ? "few" : "other";
+    case "pl": return v !== 0 ? "other" : is(1) ? "one" : within(i10, 2, 4) && !within(i100, 12, 14) ? "few" : "many";
+    case "ru": case "uk": return v !== 0 ? "other" : i10 === 1 && i100 !== 11 ? "one" : within(i10, 2, 4) && !within(i100, 12, 14) ? "few" : "many";
+    case "be": return !whole ? "other" : i10 === 1 && i100 !== 11 ? "one" : within(i10, 2, 4) && !within(i100, 12, 14) ? "few" : "many";
+    case "lt": return !whole ? "many" : i10 === 1 && !within(i100, 11, 19) ? "one" : i10 >= 2 && !within(i100, 11, 19) ? "few" : "other";
+    case "mt": return n(1) ? "one" : n(2) ? "two" : n(0) || (whole && within(i100, 3, 10)) ? "few" : whole && within(i100, 11, 19) ? "many" : "other";
+    case "ga": return n(1) ? "one" : n(2) ? "two" : nIn(3, 6) ? "few" : nIn(7, 10) ? "many" : "other";
+    case "gd": return n(1) || n(11) ? "one" : n(2) || n(12) ? "two" : nIn(3, 10) || nIn(13, 19) ? "few" : "other";
+    case "ar": case "ars": return n(0) ? "zero" : n(1) ? "one" : n(2) ? "two" : whole && within(i100, 3, 10) ? "few" : whole && i100 >= 11 ? "many" : "other";
+    case "cy": return n(0) ? "zero" : n(1) ? "one" : n(2) ? "two" : n(3) ? "few" : n(6) ? "many" : "other";
+    case "iu": case "naq": case "sat": case "se": case "sma": case "smi": case "smj": case "smn": case "sms": return n(1) ? "one" : n(2) ? "two" : "other";
+    default: return is(1) && v === 0 ? "one" : "other";
   }
 };
-// A count's number and whether it has a fraction's digits: text from a form, and a decimal,
-// are taken at their number (FEEDBACK30.md, Q-367; branch feedback27-35-fixes).
-const pluralCount = (c) => {
-  if (typeof c === "number") return Number.isFinite(c) ? [c, !Number.isInteger(c)] : null;
-  if (c instanceof Fl) return [c.f, false];
-  if (typeof c === "bigint") return [Number(c), false];
-  if (c instanceof Dec) return [Number(decText(c)), c.s > 0];
-  if (typeof c === "string") { const t = c.trim(), f = t === "" ? NaN : Number(t); return Number.isFinite(f) ? [f, t.includes(".")] : null; }
+// A count's operands, from the text `{count}` shows of it, as on the server: a whole float as
+// the number it shows (`1`, as a component writes it), a decimal with its digits, numeric text
+// trimmed as Rust trims (not `0x1`, which Number reads) (FEEDBACK30.md,
+// Q-367; FEEDBACK55.md, Q-832; branch feedback55).
+const pluralCount = (c, shown) => {
+  if (typeof c === "number" || c instanceof Fl) {
+    const x = numOf(c);
+    if (Number.isSafeInteger(x)) return pluralInt(Math.abs(x));
+    if (!Number.isFinite(x)) return null;
+    // By its shortest decimal, as the server reads it, not its binary value: 1e23 is 1 and 23 zeros
+    // (found in review of FEEDBACK55.md's Q-823). numText writes no exponent.
+    const s = shown[0] === "-" ? shown.slice(1) : shown, at = s.indexOf(".");
+    return at < 0 ? pluralOps(s, "") : pluralOps(s.slice(0, at), s.slice(at + 1));
+  }
+  if (typeof c === "bigint" || c instanceof Dec) return pluralText(shown);
+  if (typeof c === "string") return pluralText(rsTrim(c));
   return null;
 };
 B.locale = meta(() => { const d = i18n(); return d ? d.locale : null; }, "locale", null);
 const translate = (k, vars, esc) => {
   S(k, "t"); vars = M(vars, "t", 2);
   const d = i18n();
-  let e = d && hasOwn(d.t, k) ? d.t[k] : k;
+  let e = d && hasOwn(d.t, k) ? d.t[k] : k, shown = null;
   if (e && typeof e === "object") {
-    const c = pluralCount(vars.count);
-    const cat = c === null ? "other" : c[0] === 0 && !c[1] && hasOwn(e, "zero") ? "zero" : plural(d.locale, c[0], c[1]);
+    // A number's text, made once: for its form and for `{count}`.
+    const n = vars.count;
+    if (typeof n === "number" || typeof n === "bigint" || n instanceof Fl || n instanceof Dec) shown = display(n);
+    const c = pluralCount(n, shown);
+    const cat = c === null ? "other" : c.i === 0 && !c.ib && c.v === 0 && hasOwn(e, "zero") ? "zero" : plural(d.locale, c);
     e = hasOwn(e, cat) ? e[cat] : (e.other ?? "");
   }
-  return String(e).replace(/\{(\w+)\}/g, (m, name) => hasOwn(vars, name) ? esc(display(vars[name])) : m);
+  return String(e).replace(/\{(\w+)\}/g, (m, name) => hasOwn(vars, name) ? esc(name === "count" && shown !== null ? shown : display(vars[name])) : m);
 };
 B.t = meta((k, vars) => translate(k, vars, (s) => s), "t", null);
 // raw(t(key, vars)): the translation's markup, with the values put in escaped.
@@ -3004,11 +3060,17 @@ B.money = {
 B.format_number = meta((x, locale, digits, mode) => {
   let d;
   if (x instanceof Dec) d = x;
-  else if (isInt(x) || typeof x === "bigint") d = new Dec(BigInt(x), 0);
+  // A whole number past 2^53 from the page's code is a float, by its shortest decimal: BigInt
+  // wrote its binary digits, 6.022e23 as 602,200,000,000,000,027,262,976 (FEEDBACK55.md, Q-827;
+  // branch feedback55).
+  else if (Number.isSafeInteger(x) || typeof x === "bigint") d = new Dec(BigInt(x), 0);
   else if (typeof x === "number" || x instanceof Fl) { d = decFromFloat(numOf(x)); if (d === null) return display(x); }
   else fail(`\`format_number\` expects a number as argument 1, got ${moneyShort(x)}`);
   const loc = localeData(moneyLocale(locale, "format_number", 2));
   const rounding = isNil(mode) ? "half_up" : moneyMode(mode, "format_number", 4);
+  // Below 0, and -0.0, keep the sign rounded to 0, as on the server and in Intl: -0.001 to two
+  // digits is "-0.00" (FEEDBACK55.md, not counted; branch feedback55).
+  const neg = d.m < 0n || ((typeof x === "number" || x instanceof Fl) && (numOf(x) < 0 || Object.is(numOf(x), -0)));
   // Ties away from zero, as Intl writes them; `{ min, max }` digits too (FEEDBACK30.md, Q-369;
   // branch feedback27-35-fixes).
   if (!isNil(digits)) {
@@ -3026,7 +3088,7 @@ B.format_number = meta((x, locale, digits, mode) => {
     d = decRound(d, max, rounding);
     while (d.s > min && d.m % 10n === 0n) d = new Dec(d.m / 10n, d.s - 1);
   }
-  return (d.m < 0n ? loc.minus : "") + moneyDigits(loc, loc.number, d, loc.numberIndian);
+  return (neg ? loc.minus : "") + moneyDigits(loc, loc.number, d, loc.numberIndian);
 }, "format_number", null);
 
 // ---- math, stats, vec (src/numeric.rs, the same answers) ------------------
@@ -3789,7 +3851,10 @@ function dtZone(v, f, i) {
   if (isNil(v)) return 0;
   if (typeof v !== "string") fail(`\`${f}\` expects a time zone (like "Europe/Paris") as argument ${i}, got ${dtGot(v)}`);
   if (v.toUpperCase() === "UTC" || v === "Z") return 0;
-  if (v[0] === "+" || v[0] === "-") { const o = dtOffset(v); if (o !== null) return o; }
+  // An offset is one as `date.parse` reads it, `+05:30`, `+0530` or `+05`, as on the server; no
+  // other name with a sign goes to Intl, which takes some, and U+2212's minus (FEEDBACK55.md,
+  // Q-829; branch feedback55).
+  if (/^[-+\u2212]/.test(v)) { const o = dtWrittenOffset(v); if (o === null) fail(`\`${f}\`: unknown time zone ${dtGot(v)}`); return o; }
   let fmt = dtZones.get(v);
   if (!fmt) {
     if (NOT_ZONES.test(v)) fail(`\`${f}\`: unknown time zone ${dtGot(v)}`);
@@ -3866,55 +3931,82 @@ const dtEn = {
   dy: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
   styles: ["M/D/YY", "MMM D, YYYY", "MMMM D, YYYY", "dddd, MMMM D, YYYY"],
 };
-const dtLocales = [dtEn, {
-  tags: ["en-gb", "en-ie", "en-au", "en-nz", "en-in", "en-za"],
-  months: dtEn.months,
-  mon: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"],
-  days: dtEn.days, dy: dtEn.dy,
-  styles: ["DD/MM/YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd, D MMMM YYYY"],
-}, {
+// A row for a language, and for each region CLDR writes otherwise, as on the server
+// (FEEDBACK55.md, Q-828; branch feedback55): `row` with other tags, styles and names.
+const dtOf = (row, tags, styles, names) => ({ ...row, ...names, tags, styles });
+const dtGb = dtOf(dtEn, ["en-gb", "en-nz"], ["DD/MM/YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd, D MMMM YYYY"],
+  { mon: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"] });
+const dtDe = {
   tags: ["de"],
   months: ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"],
   mon: ["Jan.", "Feb.", "März", "Apr.", "Mai", "Juni", "Juli", "Aug.", "Sept.", "Okt.", "Nov.", "Dez."],
   days: ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"],
   dy: ["Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So."],
   styles: ["DD.MM.YY", "DD.MM.YYYY", "D. MMMM YYYY", "dddd, D. MMMM YYYY"],
-}, {
+};
+const dtFr = {
   tags: ["fr"],
   months: ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"],
   mon: ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."],
   days: ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"],
   dy: ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."],
   styles: ["DD/MM/YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"],
-}, {
+};
+const dtEs = {
   tags: ["es"],
   months: ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"],
   mon: ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sept", "oct", "nov", "dic"],
   days: ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"],
   dy: ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"],
   styles: ["D/M/YY", "D MMM YYYY", "D [de] MMMM [de] YYYY", "dddd, D [de] MMMM [de] YYYY"],
-}, {
+};
+const dtIt = {
   tags: ["it"],
   months: ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"],
   mon: ["gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic"],
   days: ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"],
   dy: ["lun", "mar", "mer", "gio", "ven", "sab", "dom"],
   styles: ["DD/MM/YY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"],
-}, {
+};
+const dtNl = {
   tags: ["nl"],
   months: ["januari", "februari", "maart", "april", "mei", "juni", "juli", "augustus", "september", "oktober", "november", "december"],
   mon: ["jan", "feb", "mrt", "apr", "mei", "jun", "jul", "aug", "sep", "okt", "nov", "dec"],
   days: ["maandag", "dinsdag", "woensdag", "donderdag", "vrijdag", "zaterdag", "zondag"],
   dy: ["ma", "di", "wo", "do", "vr", "za", "zo"],
   styles: ["DD-MM-YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"],
-}, {
+};
+const dtPt = {
   tags: ["pt"],
   months: ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"],
   mon: ["jan.", "fev.", "mar.", "abr.", "mai.", "jun.", "jul.", "ago.", "set.", "out.", "nov.", "dez."],
   days: ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"],
   dy: ["seg.", "ter.", "qua.", "qui.", "sex.", "sáb.", "dom."],
   styles: ["DD/MM/YYYY", "D [de] MMM [de] YYYY", "D [de] MMMM [de] YYYY", "dddd, D [de] MMMM [de] YYYY"],
-}];
+};
+const dtLocales = [dtEn, dtGb,
+  dtOf(dtGb, ["en-ie"], ["DD/MM/YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"]),
+  dtOf(dtGb, ["en-au"], ["D/M/YY", "D MMM YYYY", "D MMMM YYYY", "dddd, D MMMM YYYY"], { mon: ["Jan", "Feb", "Mar", "Apr", "May", "June", "July", "Aug", "Sept", "Oct", "Nov", "Dec"] }),
+  dtOf(dtGb, ["en-in"], ["DD/MM/YY", "D MMM YYYY", "D MMMM YYYY", "dddd, D MMMM YYYY"]),
+  dtOf(dtGb, ["en-za"], ["YYYY/MM/DD", "DD MMM YYYY", "DD MMMM YYYY", "dddd, DD MMMM YYYY"]),
+  dtOf(dtEn, ["en-ca"], ["YYYY-MM-DD", "MMM D, YYYY", "MMMM D, YYYY", "dddd, MMMM D, YYYY"]),
+  dtDe,
+  dtOf(dtDe, ["de-at"], dtDe.styles, {
+    months: ["Jänner", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"],
+    mon: ["Jän.", "Feb.", "März", "Apr.", "Mai", "Juni", "Juli", "Aug.", "Sep.", "Okt.", "Nov.", "Dez."],
+  }),
+  dtFr,
+  dtOf(dtFr, ["fr-ca"], ["YYYY-MM-DD", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"], { mon: ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juill.", "août", "sept.", "oct.", "nov.", "déc."] }),
+  dtOf(dtFr, ["fr-ch"], ["DD.MM.YY", "D MMM YYYY", "D MMMM YYYY", "dddd, D MMMM YYYY"]),
+  dtEs,
+  dtOf(dtEs, ["es-mx"], ["DD/MM/YY", "D MMM YYYY", "D [de] MMMM [de] YYYY", "dddd, D [de] MMMM [de] YYYY"], { mon: ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"] }),
+  dtIt,
+  dtOf(dtIt, ["it-ch"], ["DD.MM.YY", "D MMM YYYY", "D MMMM YYYY", "dddd, D MMMM YYYY"]),
+  dtNl,
+  dtOf(dtNl, ["nl-be"], ["D/MM/YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"]),
+  dtPt,
+  dtOf(dtPt, ["pt-pt"], ["DD/MM/YY", "DD/MM/YYYY", "D [de] MMMM [de] YYYY", "dddd, D [de] MMMM [de] YYYY"], { dy: ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"] }),
+];
 function dtNames(locale) {
   const tag = locale.trim().toLowerCase().replaceAll("_", "-"), lang = tag.split("-")[0];
   return dtLocales.find((n) => n.tags.includes(tag)) || dtLocales.find((n) => n.tags.includes(lang)) || dtEn;
@@ -4046,10 +4138,11 @@ function dtReadIso(s) {
     if (i === fs + 1 || i > fs + 10) return null;
   }
   const frac = i > fs ? "." + s.slice(fs + 1, i) : "", o = s.slice(i);
-  const off = o.length === 1 ? dtOffset(o.toUpperCase()) : o.length === 3 ? dtOffset(o + ":00")
-    : o.length === 5 && !o.includes(":") ? dtOffset(o.slice(0, 3) + ":" + o.slice(3)) : dtOffset(o);
+  const off = o.length === 1 ? dtOffset(o.toUpperCase()) : dtWrittenOffset(o);
   return off === null ? null : dtStampText(day * 86400 + sec - off, frac, off);
 }
+// An offset as people write one: `+01`, `+0100`, `+01:00` (and `+00:09:21`), in seconds.
+const dtWrittenOffset = (o) => o.length === 3 ? dtOffset(o + ":00") : o.length === 5 && !o.includes(":") ? dtOffset(o.slice(0, 3) + ":" + o.slice(3)) : dtOffset(o);
 
 B.date = {
   today: (tz) => { const z = dtZone(tz, "date.today", 1), t = dtClock(); return dtText(Math.floor((t + dtOffsetAt(z, t)) / 86400)); },

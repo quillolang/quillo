@@ -81,7 +81,10 @@ fn load_dir(dir: &std::path::Path) -> Result<Vec<(String, Map)>, String> {
         }
         let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
         let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-        let j: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{}: invalid JSON: {}", path.display(), e))?;
+        // A byte-order mark, as Windows' editors write one, is no part of the JSON: it was
+        // "invalid JSON ... column 1" (FEEDBACK55.md, not counted; branch feedback55).
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        let j: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("{}: invalid JSON: {}", path.display(), e))?;
         match Value::from_json(&j) {
             Value::Map(m) => out.push((name, (*m).clone())),
             _ => return Err(format!("{} must hold a JSON object", path.display())),
@@ -232,7 +235,11 @@ impl I18n {
             .filter_map(|(i, part)| {
                 let mut bits = part.split(';');
                 let tag = bits.next()?.trim();
-                let q = bits.find_map(|b| b.trim().strip_prefix("q=")).map_or(1.0, |q| q.trim().parse().unwrap_or(0.0));
+                // `Q=0.1` as `q=0.1`: a parameter's name is in any case (RFC 9110, 5.6.6)
+                // (FEEDBACK55.md, Q-833; branch feedback55).
+                let q = bits
+                    .find_map(|b| b.split_once('=').filter(|(k, _)| k.trim().eq_ignore_ascii_case("q")).map(|(_, q)| q))
+                    .map_or(1.0, |q| q.trim().parse().unwrap_or(0.0));
                 (q > 0.0 && tag != "*").then_some((q, i, tag))
             })
             .collect();
@@ -400,9 +407,9 @@ fn translate(it: &mut Interp, args: Vec<Value>, line: u32, html: bool) -> R {
             let n = count.and_then(count_of);
             let cat = match n {
                 // `zero`, where one is written, for 0 in any language, as Rails and i18next read it
-                // (FEEDBACK30.md, Q-366).
-                Some((n, false)) if n == 0.0 && forms.contains_key("zero") => "zero",
-                Some((n, frac)) => plural_of(&l, n, frac),
+                // (FEEDBACK30.md, Q-366): a 0 shown with no fraction's digits.
+                Some(o) if o.is_zero() && forms.contains_key("zero") => "zero",
+                Some(o) => plural_of(&l, &o),
                 None => "other",
             };
             forms.get(cat).or_else(|| forms.get("other")).map(|v| v.display().to_string()).unwrap_or_default()
@@ -463,9 +470,10 @@ fn warn_unused_forms(locale: &str, flat: &HashMap<String, Value>) {
 /// The plural forms a locale's rules can pick.
 pub fn categories(locale: &str) -> Vec<&'static str> {
     let mut seen: Vec<&'static str> = Vec::new();
-    let samples = (0..=1000).map(|n| (n as f64, false)).chain([(1e6, false), (2e6, false), (1.5, true), (0.5, true), (21.5, true)]);
-    for (n, frac) in samples {
-        let c = plural_of(locale, n, frac);
+    let fractions = ["1.5", "0.5", "21.5"].map(|s| Operands::of_text(s).expect("a number"));
+    let samples = (0..=1000).chain([1_000_000, 2_000_000]).map(Operands::of_int).chain(fractions);
+    for o in samples {
+        let c = plural_of(locale, &o);
         if !seen.contains(&c) {
             seen.push(c);
         }
@@ -498,158 +506,328 @@ pub fn interpolate(text: &str, vars: Option<&Map>) -> String {
     out
 }
 
-/// A `count`'s number, and whether it is written with a fraction's digits (`1.0m`, `"1.5"`).
-fn count_of(v: &Value) -> Option<(f64, bool)> {
+/// A `count`'s operands, from the text `{count}` shows of it: a float as it is written where `t`
+/// runs (`1.0` on the server, `1` in a component, as in the browser), a decimal with its digits
+/// (`1.0m`), and numeric text trimmed (`"1.5"`, `" 2 "`), but not `0x1` or `inf`, which no side
+/// reads as a number (FEEDBACK55.md, Q-832; branch feedback55).
+fn count_of(v: &Value) -> Option<Operands> {
     match v {
-        Value::Int(i) => Some((*i as f64, false)),
-        Value::Float(f) if f.is_finite() => Some((*f, f.fract() != 0.0)),
-        Value::Dec(d) => Some((d.to_f64(), d.scale() > 0)),
-        Value::Str(s) => {
-            let t = s.trim();
-            let f: f64 = t.parse().ok().filter(|f: &f64| f.is_finite())?;
-            Some((f, t.contains('.')))
-        }
+        Value::Int(i) => Some(Operands::of_int(i.unsigned_abs())),
+        Value::Float(f) if f.is_finite() => Operands::of_text(&v.display()),
+        Value::Dec(d) => Operands::of_text(&d.to_string()),
+        Value::Str(s) => Operands::of_text(s.trim()),
         _ => None,
     }
 }
 
-/// The plural form of `n` in a language (CLDR's rules for whole numbers;
-/// fractions take `other`). The browser runtime has the same table.
-pub fn plural(locale: &str, n: f64) -> &'static str {
-    plural_of(locale, n, n.fract() != 0.0)
+/// CLDR's operands of a number as it is written: `i` its integer digits (the last nine, `ib` when
+/// a digit before them is not 0), `v` how many digits it shows after the point, `f` those digits
+/// and `t` them without the zeros at their end (the last nine of each), and `fb` when a digit of
+/// f's before its last nine is not 0. The rules ask no more of them: a remainder by at most a
+/// million, and small values. runtime.js's `pluralOps` makes the same (FEEDBACK55.md, Q-823;
+/// branch feedback55).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Operands {
+    i: u64,
+    ib: bool,
+    v: u64,
+    f: u64,
+    fb: bool,
+    t: u64,
 }
 
-/// The plural form of `n`, `frac` when it is written with a fraction's digits. CLDR's rules,
-/// for the languages below; any other is read as English. The browser runtime has the same
-/// table (FEEDBACK30.md, Q-366; branch feedback27-35-fixes).
-pub fn plural_of(locale: &str, n: f64, frac: bool) -> &'static str {
-    let lang = locale.split(['-', '_']).next().unwrap_or("").to_ascii_lowercase();
-    let region = locale.split(['-', '_']).nth(1).unwrap_or("").to_ascii_uppercase();
-    if frac || n.fract() != 0.0 || !n.is_finite() {
-        return match lang.as_str() {
-            "lt" => "many",
-            "ro" => "few",
-            "cs" | "sk" => "many",
-            _ => "other",
-        };
+const NINE: u64 = 1_000_000_000;
+
+/// The value of the last nine digits of `d`, and whether a digit before them is not 0.
+fn last_nine(d: &[u8]) -> (u64, bool) {
+    let at = d.len().saturating_sub(9);
+    (d[at..].iter().fold(0, |n, c| n * 10 + (c - b'0') as u64), d[..at].iter().any(|c| *c != b'0'))
+}
+
+impl Operands {
+    /// A whole number's.
+    pub fn of_int(n: u64) -> Operands {
+        Operands { i: n % NINE, ib: n >= NINE, v: 0, f: 0, fb: false, t: 0 }
     }
-    let n = n.abs() as u64;
-    let (m10, m100) = (n % 10, n % 100);
-    let millions = n != 0 && n % 1_000_000 == 0;
+
+    /// The operands of the digits before the point and after it.
+    fn of_digits(int: &[u8], frac: &[u8]) -> Operands {
+        let (i, ib) = last_nine(int);
+        let (f, fb) = last_nine(frac);
+        let kept = frac.len() - frac.iter().rev().take_while(|c| **c == b'0').count();
+        Operands { i, ib, v: frac.len() as u64, f, fb, t: last_nine(&frac[..kept]).0 }
+    }
+
+    /// The operands of numeric text: digits with a sign, a point and an exponent, as `12`,
+    /// `-1.50`, `.5`, `5.` and `1e3` are written; None for any other.
+    pub fn of_text(s: &str) -> Option<Operands> {
+        let b = s.as_bytes();
+        let mut k = usize::from(matches!(b.first(), Some(b'+' | b'-')));
+        let digits = |k: &mut usize| {
+            let at = *k;
+            while b.get(*k).is_some_and(u8::is_ascii_digit) {
+                *k += 1;
+            }
+            &b[at..*k]
+        };
+        let int = digits(&mut k);
+        let frac = if b.get(k) == Some(&b'.') {
+            k += 1;
+            digits(&mut k)
+        } else {
+            &b[k..k]
+        };
+        if int.is_empty() && frac.is_empty() {
+            return None;
+        }
+        let mut e: i64 = 0;
+        if matches!(b.get(k), Some(b'e' | b'E')) {
+            k += 1;
+            let neg = b.get(k) == Some(&b'-');
+            k += usize::from(matches!(b.get(k), Some(b'+' | b'-')));
+            let ds = digits(&mut k);
+            if ds.is_empty() {
+                return None;
+            }
+            // Past a few billion places every exponent gives the same operands.
+            e = ds.iter().fold(0i64, |n, c| (n * 10 + (c - b'0') as i64).min(1 << 40));
+            if neg {
+                e = -e;
+            }
+        }
+        if k != b.len() {
+            return None;
+        }
+        if e == 0 {
+            return Some(Operands::of_digits(int, frac));
+        }
+        // The point moved by the exponent: `1.5e1` is 15, and `1e-3` 0.001.
+        let d = [int, frac].concat();
+        let p = int.len() as i64 + e;
+        Some(if p <= 0 {
+            Operands { v: (d.len() as i64 - p) as u64, ..Operands::of_digits(&[], &d) }
+        } else if p as usize >= d.len() {
+            let zeros = p as usize - d.len();
+            if zeros >= 9 {
+                Operands { ib: d.iter().any(|c| *c != b'0'), ..Operands::of_int(0) }
+            } else {
+                Operands::of_digits(&[d, vec![b'0'; zeros]].concat(), &[])
+            }
+        } else {
+            Operands::of_digits(&d[..p as usize], &d[p as usize..])
+        })
+    }
+
+    /// 0, shown with no fraction's digits.
+    fn is_zero(&self) -> bool {
+        self.i == 0 && !self.ib && self.v == 0
+    }
+}
+
+/// The plural form of `n` in a language, a whole number taken as one written with no point
+/// (`plural("en", 1.0)` is `one`), and a fraction as its shortest decimal.
+pub fn plural(locale: &str, n: f64) -> &'static str {
+    let o = if !n.is_finite() {
+        return "other";
+    } else if n.fract() == 0.0 && n.abs() < 1e18 {
+        Operands::of_int(n.abs() as u64)
+    } else {
+        Operands::of_text(&format!("{}", n.abs())).unwrap_or(Operands::of_int(0))
+    };
+    plural_of(locale, &o)
+}
+
+/// The plural form of a number by its operands: CLDR's rules (CLDR 47), for the languages
+/// below; any other is read as English. The browser runtime has the same table (FEEDBACK30.md,
+/// Q-366; branch feedback27-35-fixes). The fractions and the counts written with a point are
+/// CLDR's too, not `other` for all but four languages: `1.5` is `one` in French, `1.0` `one` in
+/// Spanish and `other` in English, and Filipino has its rules (FEEDBACK55.md, Q-823; branch
+/// feedback55).
+pub fn plural_of(locale: &str, o: &Operands) -> &'static str {
+    let mut parts = locale.split(['-', '_']);
+    let lang = parts.next().unwrap_or("").to_ascii_lowercase();
+    let region = parts.next().unwrap_or("");
+    let &Operands { i, ib, v, f, fb, t } = o;
+    // n, the number itself, is i when no digit after the point is other than 0.
+    let whole = f == 0 && !fb;
+    let n = |k: u64| whole && !ib && i == k;
+    let n_in = |a: u64, b: u64| whole && !ib && (a..=b).contains(&i);
+    let is = |k: u64| !ib && i == k;
+    let (i10, i100, f10, f100) = (i % 10, i % 100, f % 10, f % 100);
+    let within = |x: u64, a: u64, b: u64| (a..=b).contains(&x);
+    let millions = v == 0 && (ib || i != 0) && i % 1_000_000 == 0;
     match lang.as_str() {
-        "ja" | "zh" | "ko" | "th" | "vi" | "id" | "ms" | "lo" | "my" | "km" | "yue" => "other",
-        "pt" if region == "PT" => match n {
-            1 => "one",
+        // No forms, and `one` for n = 1, as CLDR 47 lists them, old codes too (`in`, `jw`, `iw`), as
+        // runtime.js's PLURAL_NONE and PLURAL_N1 (found in review of FEEDBACK55.md's Q-823).
+        "bm" | "bo" | "dz" | "hnj" | "id" | "ig" | "ii" | "in" | "ja" | "jbo" | "jv" | "jw" | "kde" | "kea" | "km" | "ko" | "lkt" | "lo" | "ms" | "my" | "nqo" | "osa" | "sah" | "ses" | "sg" | "su"
+        | "th" | "to" | "tpi" | "vi" | "wo" | "yo" | "yue" | "zh" => "other",
+        "af" | "an" | "asa" | "az" | "bal" | "bem" | "bez" | "bg" | "brx" | "ce" | "cgg" | "chr" | "ckb" | "dv" | "ee" | "el" | "eo" | "eu" | "fo" | "fur" | "gsw" | "ha" | "haw" | "hu" | "jgo" | "jmc"
+        | "ka" | "kaj" | "kcg" | "kk" | "kkj" | "kl" | "ks" | "ksb" | "ku" | "ky" | "lb" | "lg" | "mas" | "mgo" | "ml" | "mn" | "mr" | "nah" | "nb" | "nd" | "ne" | "nn" | "nnh" | "no" | "nr" | "ny"
+        | "nyn" | "om" | "or" | "os" | "pap" | "ps" | "rm" | "rof" | "rwk" | "saq" | "sd" | "sdh" | "seh" | "sn" | "so" | "sq" | "ss" | "ssy" | "st" | "syr" | "ta" | "te" | "teo" | "tig" | "tk"
+        | "tn" | "tr" | "ts" | "ug" | "uz" | "ve" | "vo" | "vun" | "wae" | "xh" | "xog" => {
+            if n(1) {
+                "one"
+            } else {
+                "other"
+            }
+        }
+        "am" | "as" | "bn" | "doi" | "fa" | "gu" | "hi" | "kn" | "pcm" | "zu" => {
+            if is(0) || n(1) {
+                "one"
+            } else {
+                "other"
+            }
+        }
+        "hy" | "ff" | "kab" => {
+            if !ib && i <= 1 {
+                "one"
+            } else {
+                "other"
+            }
+        }
+        "ak" | "bho" | "guw" | "ln" | "mg" | "nso" | "pa" | "ti" | "wa" => {
+            if n_in(0, 1) {
+                "one"
+            } else {
+                "other"
+            }
+        }
+        // European Portuguese counts as Italian.
+        "pt" if !region.eq_ignore_ascii_case("PT") => match () {
+            _ if !ib && i <= 1 => "one",
             _ if millions => "many",
             _ => "other",
         },
-        "fr" | "pt" if n <= 1 => "one",
-        "fr" | "pt" if millions => "many",
-        "es" | "it" | "ca" if n == 1 => "one",
-        "es" | "it" | "ca" if millions => "many",
-        "es" | "it" | "ca" => "other",
-        "fr" | "pt" | "hi" | "bn" | "fa" | "gu" | "kn" | "zu" | "am" if n <= 1 => "one",
-        "fr" | "pt" | "hi" | "bn" | "fa" | "gu" | "kn" | "zu" | "am" => "other",
-        "ro" | "mo" => match n {
-            1 => "one",
-            0 => "few",
-            _ if (1..=19).contains(&m100) => "few",
+        "it" | "ca" | "scn" | "vec" | "lld" | "pt" => match () {
+            _ if is(1) && v == 0 => "one",
+            _ if millions => "many",
             _ => "other",
         },
-        "lt" => {
-            if m10 == 1 && !(11..=19).contains(&m100) {
-                "one"
-            } else if (2..=9).contains(&m10) && !(11..=19).contains(&m100) {
-                "few"
-            } else {
-                "other"
-            }
-        }
-        "lv" => {
-            if m10 == 0 || (11..=19).contains(&m100) {
+        "fr" => match () {
+            _ if !ib && i <= 1 => "one",
+            _ if millions => "many",
+            _ => "other",
+        },
+        "es" => match () {
+            _ if n(1) => "one",
+            _ if millions => "many",
+            _ => "other",
+        },
+        "da" if n(1) || (!whole && !ib && i <= 1) => "one",
+        "is" if (whole && i10 == 1 && i100 != 11) || (t % 10 == 1 && t % 100 != 11) => "one",
+        "mk" if (v == 0 && i10 == 1 && i100 != 11) || (f10 == 1 && f100 != 11) => "one",
+        "si" if n(0) || n(1) || (is(0) && f == 1 && !fb) => "one",
+        "fil" | "tl" | "ceb" if (v == 0 && !ib && within(i, 1, 3)) || (v == 0 && ![4, 6, 9].contains(&i10)) || (v != 0 && ![4, 6, 9].contains(&f10)) => "one",
+        "da" | "is" | "mk" | "si" | "fil" | "tl" | "ceb" => "other",
+        "lv" | "prg" => {
+            if (whole && (i10 == 0 || within(i100, 11, 19))) || (v == 2 && within(f100, 11, 19)) {
                 "zero"
-            } else if m10 == 1 && m100 != 11 {
+            } else if (whole && i10 == 1 && i100 != 11) || (v == 2 && f10 == 1 && f100 != 11) || (v != 2 && f10 == 1) {
                 "one"
             } else {
                 "other"
             }
         }
-        "sl" => match m100 {
+        "he" | "iw" => match () {
+            _ if (is(1) && v == 0) || (is(0) && v != 0) => "one",
+            _ if is(2) && v == 0 => "two",
+            _ => "other",
+        },
+        "ro" | "mo" => match () {
+            _ if is(1) && v == 0 => "one",
+            _ if v != 0 || n(0) || (!n(1) && whole && within(i100, 1, 19)) => "few",
+            _ => "other",
+        },
+        "bs" | "hr" | "sr" | "sh" => match () {
+            _ if (v == 0 && i10 == 1 && i100 != 11) || (f10 == 1 && f100 != 11) => "one",
+            _ if (v == 0 && within(i10, 2, 4) && !within(i100, 12, 14)) || (within(f10, 2, 4) && !within(f100, 12, 14)) => "few",
+            _ => "other",
+        },
+        "sl" => match i100 {
+            _ if v != 0 => "few",
             1 => "one",
             2 => "two",
             3 | 4 => "few",
             _ => "other",
         },
-        "is" | "mk" if m10 == 1 && m100 != 11 => "one",
-        "is" | "mk" => "other",
-        "ga" => match n {
-            1 => "one",
-            2 => "two",
-            3..=6 => "few",
-            7..=10 => "many",
+        "dsb" | "hsb" => match () {
+            _ if (v == 0 && i100 == 1) || f100 == 1 => "one",
+            _ if (v == 0 && i100 == 2) || f100 == 2 => "two",
+            _ if (v == 0 && within(i100, 3, 4)) || within(f100, 3, 4) => "few",
             _ => "other",
         },
-        "cy" => match n {
-            0 => "zero",
-            1 => "one",
-            2 => "two",
-            3 => "few",
-            6 => "many",
+        "cs" | "sk" => match () {
+            _ if v != 0 => "many",
+            _ if is(1) => "one",
+            _ if !ib && within(i, 2, 4) => "few",
             _ => "other",
         },
-        "mt" => match (n, m100) {
-            (1, _) => "one",
-            (2, _) => "two",
-            (0, _) | (_, 3..=10) => "few",
-            (_, 11..=19) => "many",
+        "pl" => match () {
+            _ if v != 0 => "other",
+            _ if is(1) => "one",
+            _ if within(i10, 2, 4) && !within(i100, 12, 14) => "few",
+            _ => "many",
+        },
+        "ru" | "uk" => match () {
+            _ if v != 0 => "other",
+            _ if i10 == 1 && i100 != 11 => "one",
+            _ if within(i10, 2, 4) && !within(i100, 12, 14) => "few",
+            _ => "many",
+        },
+        "be" => match () {
+            _ if !whole => "other",
+            _ if i10 == 1 && i100 != 11 => "one",
+            _ if within(i10, 2, 4) && !within(i100, 12, 14) => "few",
+            _ => "many",
+        },
+        "lt" => match () {
+            _ if !whole => "many",
+            _ if i10 == 1 && !within(i100, 11, 19) => "one",
+            _ if i10 >= 2 && !within(i100, 11, 19) => "few",
             _ => "other",
         },
-        "ru" | "uk" | "be" => {
-            if m10 == 1 && m100 != 11 {
-                "one"
-            } else if (2..=4).contains(&m10) && !(12..=14).contains(&m100) {
-                "few"
-            } else {
-                "many"
-            }
-        }
-        "sr" | "hr" | "bs" => {
-            if m10 == 1 && m100 != 11 {
-                "one"
-            } else if (2..=4).contains(&m10) && !(12..=14).contains(&m100) {
-                "few"
-            } else {
-                "other"
-            }
-        }
-        "pl" => {
-            if n == 1 {
-                "one"
-            } else if (2..=4).contains(&m10) && !(12..=14).contains(&m100) {
-                "few"
-            } else {
-                "many"
-            }
-        }
-        "cs" | "sk" => match n {
-            1 => "one",
-            2..=4 => "few",
+        "mt" => match () {
+            _ if n(1) => "one",
+            _ if n(2) => "two",
+            _ if n(0) || (whole && within(i100, 3, 10)) => "few",
+            _ if whole && within(i100, 11, 19) => "many",
             _ => "other",
         },
-        "ar" => match (n, m100) {
-            (0, _) => "zero",
-            (1, _) => "one",
-            (2, _) => "two",
-            (_, 3..=10) => "few",
-            (_, 11..=99) => "many",
+        "ga" => match () {
+            _ if n(1) => "one",
+            _ if n(2) => "two",
+            _ if n_in(3, 6) => "few",
+            _ if n_in(7, 10) => "many",
             _ => "other",
         },
-        "he" => match n {
-            1 => "one",
-            2 => "two",
+        "gd" => match () {
+            _ if n(1) || n(11) => "one",
+            _ if n(2) || n(12) => "two",
+            _ if n_in(3, 10) || n_in(13, 19) => "few",
             _ => "other",
         },
-        _ if n == 1 => "one",
+        "ar" | "ars" => match () {
+            _ if n(0) => "zero",
+            _ if n(1) => "one",
+            _ if n(2) => "two",
+            _ if whole && within(i100, 3, 10) => "few",
+            _ if whole && i100 >= 11 => "many",
+            _ => "other",
+        },
+        "cy" => match () {
+            _ if n(0) => "zero",
+            _ if n(1) => "one",
+            _ if n(2) => "two",
+            _ if n(3) => "few",
+            _ if n(6) => "many",
+            _ => "other",
+        },
+        "iu" | "naq" | "sat" | "se" | "sma" | "smi" | "smj" | "smn" | "sms" => match () {
+            _ if n(1) => "one",
+            _ if n(2) => "two",
+            _ => "other",
+        },
+        _ if is(1) && v == 0 => "one",
         _ => "other",
     }
 }
@@ -662,7 +840,8 @@ mod tests {
     fn plurals_and_interpolation() {
         let forms = |l: &str| [0.0, 1.0, 2.0, 5.0, 11.0, 21.0, 22.0, 1.5].map(|n| plural(l, n));
         assert_eq!(forms("en"), ["other", "one", "other", "other", "other", "other", "other", "other"]);
-        assert_eq!(forms("fr-CA"), ["one", "one", "other", "other", "other", "other", "other", "other"]);
+        // 1.5 is French's `one`, as CLDR has it (FEEDBACK55.md, Q-823; branch feedback55).
+        assert_eq!(forms("fr-CA"), ["one", "one", "other", "other", "other", "other", "other", "one"]);
         assert_eq!(forms("ru"), ["many", "one", "few", "many", "many", "one", "few", "other"]);
         assert_eq!(forms("ja"), ["other"; 8]);
         let mut v = Map::new();

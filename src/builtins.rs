@@ -3124,7 +3124,7 @@ fn markdown_page(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             return fail(line, format!("`markdown_page` has no option `{}`: it takes `title`, `lang` and `html`", k));
         }
     }
-    let heading = || text.lines().find_map(|l| l.trim_start().strip_prefix("# ").map(|t| t.trim().to_string()));
+    let heading = || markdown_title(&text, opts.get("html").is_some_and(|v| v.truthy()));
     let title = match opts.get("title") {
         Some(Value::Str(t)) => t.to_string(),
         None | Some(Value::Nil) => heading().unwrap_or_default(),
@@ -3146,6 +3146,31 @@ fn markdown_page(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         crate::interp::escape(&title),
         body
     ).into()))
+}
+
+/// The text of the first level-1 heading with any, `# Title` or a setext one (`Title` over `===`),
+/// as `markdown` shows it: its words without their marks (`*Emph*` is Emph), HTML in it as the text
+/// it is shown as unless `html` keeps it, and none from a `#` line in a code block or a comment, a
+/// closing `#`, or a heading inside a quote or a list (FEEDBACK55.md, Q-831; branch feedback55).
+fn markdown_title(text: &str, html: bool) -> Option<String> {
+    use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+    let (mut depth, mut title) = (0usize, None::<String>);
+    for e in Parser::new_ext(text, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS) {
+        match (e, title.as_mut()) {
+            (Event::Start(Tag::BlockQuote(_) | Tag::List(_)), None) => depth += 1,
+            (Event::End(TagEnd::BlockQuote(_) | TagEnd::List(_)), None) => depth -= 1,
+            (Event::Start(Tag::Heading { level: HeadingLevel::H1, .. }), None) if depth == 0 => title = Some(String::new()),
+            (Event::End(TagEnd::Heading(_)), Some(t)) => match t.trim() {
+                "" => title = None,
+                words => return Some(words.to_string()),
+            },
+            (Event::Text(w) | Event::Code(w), Some(t)) => t.push_str(&w),
+            (Event::InlineHtml(w), Some(t)) if !html => t.push_str(&w),
+            (Event::SoftBreak | Event::HardBreak, Some(t)) => t.push(' '),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `markdown(text)`: Markdown as HTML (CommonMark, with tables,

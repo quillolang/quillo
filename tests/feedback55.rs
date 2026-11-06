@@ -8190,3 +8190,586 @@ fn classes_and_build_say_where_a_file_is_not_utf8() {
     std::fs::write(d.join("main.qwe"), b"\xef\xbb\xbfroute GET / = <p.a>\xc3\xbc</p>\n").unwrap();
     assert_eq!(quillo_in(&d, &["classes", "main.qwe"], b""), (Some(0), "a\n".into(), String::new()));
 }
+
+// ---- slice 12: dates, i18n, images, text (Q-823 to Q-833) ----
+
+/// The languages whose plural rules Quillo has, and regions that count otherwise or not (a
+/// language it has not is read as English; Intl has CLDR's root for it, `other` alone).
+const S12_LOCALES: &[&str] = &[
+    "en", "de", "nl", "sv", "fi", "et", "sw", "ur", "gl", "fr", "fr-CA", "pt", "pt-BR", "pt-PT", "es", "es-MX", "it", "ca", "hi", "bn", "fa", "gu", "kn", "zu", "am", "as",
+    "ru", "uk", "be", "pl", "cs", "sk", "ro", "mo", "lt", "lv", "sl", "is", "mk", "ga", "gd", "cy", "mt", "ar", "he", "sr", "sr-Latn", "hr", "bs", "ja", "zh", "zh-TW", "ko", "th",
+    "vi", "id", "ms", "km", "lo", "my", "yue", "tr", "el", "hu", "da", "fil", "tl", "ceb", "pa", "nb", "nn", "no", "af", "az", "bg", "eu", "ka", "kk", "ky", "ml", "mn", "mr", "ne",
+    "sq", "ta", "te", "uz", "ckb", "hy", "ff", "ak", "ln", "si", "dsb", "hsb", "se", "iw", "jw", "in", "ee", "rm", "gsw", "ks", "chr", "nah", "haw", "pap", "fur",
+    "doi", "pcm", "bho", "nso", "iu", "sat", "sms", "prg", "scn", "vec", "lld", "kea", "ses", "ji",
+];
+
+/// Counts as a program gives them, and the text each shows, what `Intl.PluralRules` is given
+/// with as many fraction digits as the text has: text, ints, floats (in a component, as the
+/// browser writes them) and decimals.
+fn s12_counts() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut text = |s: &str| out.push((format!("{:?}", s), s.to_string()));
+    for n in (0..=125).chain([200, 201, 1000, 1001, 999_999, 1_000_000, 2_000_000, 1_000_001, 21_000_000, 1_000_000_000, 2_000_000_000, 1_000_000_011]) {
+        text(&n.to_string());
+    }
+    for s in [
+        "0.0", "1.0", "2.0", "3.0", "4.0", "6.0", "11.0", "21.0", "101.0", "1000000.0", "0.00", "1.00", "2.00", "0.5", "1.5", "2.5", "21.5", "0.1", "1.1", "2.1", "1.2", "1.3", "1.4", "1.6",
+        "1.9", "0.2", "0.4", "0.6", "0.9", "5.1", "5.2", "5.4", "11.1", "0.01", "0.02", "0.03", "0.04", "0.10", "0.11", "0.12", "0.14", "0.21", "0.22", "1.01", "1.02", "1.11", "1.12",
+        "1.21", "1.50", "0.001", "0.011", "1.001", "1.111", "-1", "-2", "-1.5", "-0.5", "+1", "1.", ".5", "-0", "1e3", "2e6", "1E6",
+    ] {
+        text(s);
+    }
+    // Not numbers, on either side: `other`, as Intl gives NaN.
+    for s in ["0x1", "", " ", "Infinity", "1_0", "１"] {
+        out.push((format!("{:?}", s), "NaN".into()));
+    }
+    out.push(("\" 2 \"".into(), "2".into()));
+    for (q, s) in [
+        ("0", "0"), ("1", "1"), ("2", "2"), ("-1", "-1"), ("21", "21"), ("1000000", "1000000"), ("1.0", "1"), ("2.0", "2"), ("0.5", "0.5"), ("1.5", "1.5"), ("2.5", "2.5"), ("0.1", "0.1"),
+        ("1.1", "1.1"), ("1.2", "1.2"), ("21.5", "21.5"), ("-1.5", "-1.5"), ("0.0", "0"), ("1e6", "1000000"), ("1.0m", "1.0"), ("1.50m", "1.50"), ("0.0m", "0.0"), ("2.0m", "2.0"),
+        ("21m", "21"), ("1.5m", "1.5"), ("-1.0m", "-1.0"), ("0.10m", "0.10"),
+    ] {
+        out.push((q.to_string(), s.to_string()));
+    }
+    out
+}
+
+// Q-823, Q-832: a fraction took `other` in every language but four, and a count written `1.0`
+// counted as a fraction in English and as 1 in none: 0.5 and 1.5 are `one` in French, `1.0`
+// `one` in Spanish and `2.0` `two` in Arabic, Slovenian's fractions are `few`, Filipino had
+// English's rules. Now each count's form is CLDR's by its operands, read from the text it shows:
+// for each language Quillo has, region and an unknown one (English), and counts as text, ints,
+// floats and decimals, the server, the browser and `Intl.PluralRules` agree. The edges: 0 and the
+// written `zero`, millions (`many`), past nine digits, negative counts, `+1`, `1.`, `.5`, an
+// exponent, and text no side reads as a number (`0x1`, `Infinity`, a full-width digit).
+#[test]
+fn every_count_takes_cldrs_plural_form_on_both_sides() {
+    let counts = s12_counts();
+    let mut src = String::from("translations({\n");
+    for l in S12_LOCALES {
+        let forms: Vec<String> = quillo::i18n::categories(l).iter().map(|c| format!("{}: \"{}\"", c, c)).collect();
+        src.push_str(&format!("    \"{}\": {{ k: {{ {} }} }},\n", l, forms.join(", ")));
+    }
+    let list: Vec<&str> = counts.iter().map(|(q, _)| q.as_str()).collect();
+    src.push_str(&format!("}})\nfn __t() = [{}] | map((c) => t(\"k\", {{ count: c }}))\nfn __s(l) = with_locale(l, () => __t())\n", list.join(", ")));
+    let mut it = quillo::Interp::new(".");
+    it.load_source(&src, "case.qwe").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    let s = quillo::value::lookup(&it.globals, "__s").unwrap();
+    let server: Vec<serde_json::Value> = S12_LOCALES
+        .iter()
+        .map(|l| {
+            let v = quillo::value::js_numbers(true, || it.call(&s, vec![quillo::value::Value::str(*l)], 0)).unwrap_or_else(|_| panic!("{}", l));
+            serde_json::from_str(&v.repr()).unwrap()
+        })
+        .collect();
+    // Intl's form for each, where it is not the server's (what Node prints is kept short: a pipe
+    // holds 64 KiB).
+    let texts: Vec<&str> = counts.iter().map(|(_, s)| s.as_str()).collect();
+    let intl = format!(
+        "const texts = {}, locales = {}, server = {}, wrong = [];\nlocales.forEach((l, k) => texts.forEach((s, j) => {{ const fd = (s.split('.')[1] || '').length, r = new Intl.PluralRules(l, {{ minimumFractionDigits: fd, maximumFractionDigits: fd }}).select(Number(s)); if (r !== server[k][j]) wrong.push([k, j, r]); }}));\nconsole.log(JSON.stringify(wrong.slice(0, 200)));",
+        serde_json::to_string(&texts).unwrap(),
+        serde_json::to_string(S12_LOCALES).unwrap(),
+        serde_json::to_string(&server).unwrap()
+    );
+    let Some(not_intls) = in_node(&intl) else { return };
+    let not_intls: Vec<(usize, usize, String)> = serde_json::from_str(&not_intls).unwrap();
+    let script = quillo::client::test_script(&it, "__t").unwrap();
+    let i18n = it.site.i18n.clone().unwrap();
+    let words: Vec<String> = S12_LOCALES.iter().map(|l| i18n.browser_json(&i18n.best(l).unwrap(), None)).collect();
+    let at = std::sync::atomic::AtomicUsize::new(0);
+    let browser: Vec<Mutex<Option<serde_json::Value>>> = S12_LOCALES.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|sc| {
+        for _ in 0..6 {
+            sc.spawn(|| loop {
+                let k = at.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(words) = words.get(k) else { break };
+                let out = in_node(&format!("globalThis.window = {{ [Symbol.for(\"quillo\")]: {{ i18n: {} }} }};\n{}", words, script)).unwrap();
+                *browser[k].lock().unwrap() = Some(serde_json::from_str(&out).unwrap_or_else(|e| panic!("{}: {}", e, out)));
+            });
+        }
+    });
+    let mut wrong: Vec<String> = not_intls.iter().map(|(k, j, r)| format!("{} {}: server {}, Intl {:?}", S12_LOCALES[*k], counts[*j].0, server[*k][*j], r)).collect();
+    for (k, l) in S12_LOCALES.iter().enumerate() {
+        let b = browser[k].lock().unwrap().take().unwrap();
+        for (j, (q, _)) in counts.iter().enumerate() {
+            if server[k][j] != b[j] {
+                wrong.push(format!("{} {}: server {}, browser {}", l, q, server[k][j], b[j]));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{} of {}:\n{}", wrong.len(), S12_LOCALES.len() * counts.len(), wrong.join("\n"));
+    // The report's cases, by name.
+    let form = |l: &str, q: &str| server[S12_LOCALES.iter().position(|x| *x == l).unwrap()][counts.iter().position(|(x, _)| x == q).unwrap()].as_str().unwrap().to_string();
+    assert_eq!([form("fr", "1.5"), form("fr", "0.5"), form("fr", "\"1.5\""), form("es", "\"1.0\""), form("ar", "\"2.0\""), form("lt", "\"1.0\""), form("sl", "0.5")], ["one", "one", "one", "one", "two", "one", "few"]);
+    assert_eq!([form("en", "\"1.0\""), form("en", "1.0m"), form("en", "1.0"), form("en", "\"0x1\""), form("fil", "\"7\""), form("fil", "\"4\""), form("tl", "\"1.5\""), form("pt-PT", "0.5")], ["other", "other", "one", "other", "one", "other", "one", "other"]);
+}
+
+/// A program of `translations` and routes, loaded.
+fn s12_app(src: &str) -> quillo::Interp {
+    let mut it = quillo::Interp::new(&std::env::temp_dir());
+    it.load_source(src, "app.qwe").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    it
+}
+
+/// What the program answers `url` with these headers.
+fn s12_get(it: &mut quillo::Interp, url: &str, headers: &[(&str, &str)]) -> String {
+    let mut h = vec![("Host".to_string(), "x".to_string())];
+    h.extend(headers.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    it.handle(&quillo::server::HttpRequest { method: "GET".into(), url: url.into(), headers: h, body: vec![], remote: "127.0.0.1".into() }).text()
+}
+
+// Q-832: `count: 1.0` was "1.0 item" on the server (it shows 1.0, and picked `one`) and "1 item"
+// in the browser, and `"0x1"` was `one` in the browser (Number reads it) and `other` on the server.
+// Now the form is the one of the text `{count}` shows: a route's float shows `1.0` and takes
+// `other`, a component's shows `1` on both sides and takes `one`; `0x1` is no number on either.
+// The edges: a decimal's digits (`1.0m`), text with a point, 0 shown as `0.0` (no `zero` form),
+// -0.0, a float past 2^53, and text trimmed as each side trims (U+0085 and U+FEFF).
+#[test]
+fn a_count_takes_the_form_of_the_number_it_shows() {
+    let words = r#"translations({ en: { items: { zero: "no items", one: "{count} item", other: "{count} items" } } })
+"#;
+    let mut it = s12_app(&format!("{}route GET / = [t(\"items\", {{ count: 1.0 }}), t(\"items\", {{ count: 1 }}), t(\"items\", {{ count: 1.0m }}), t(\"items\", {{ count: \"1.0\" }}), t(\"items\", {{ count: \"0x1\" }}), t(\"items\", {{ count: 0.0 }}), t(\"items\", {{ count: 0 }}), t(\"items\", {{ count: -0.0 }}), t(\"items\", {{ count: \"-0\" }}), t(\"items\", {{ count: -1.0 }}), t(\"items\", {{ count: 1e16 }})] | join(\"|\")\n", words));
+    assert_eq!(s12_get(&mut it, "/", &[]), "1.0 items|1 item|1.0 items|1.0 items|0x1 items|0.0 items|no items|-0.0 items|no items|-1.0 items|10000000000000000 items");
+    let i18n = r#"globalThis.window = { [Symbol.for("quillo")]: { i18n: {"locale":"en","t":{"items":{"zero":"no items","one":"{count} item","other":"{count} items"}}} } };"#;
+    same_on_both_after(
+        i18n,
+        words,
+        &[
+            (r#"[t("items", { count: 1.0 }), t("items", { count: -1.0 }), t("items", { count: 2.0 }), t("items", { count: 0.0 }), t("items", { count: -0.0 }), t("items", { count: 9007199254740993.0 })]"#, r#"[["str", "str", "str", "str", "str", "str"], ["1 item", "-1 item", "2 items", "no items", "no items", "9007199254740992 items"]]"#),
+            (r#"[t("items", { count: "0x1" }), t("items", { count: "0b1" }), t("items", { count: "1.0" }), t("items", { count: 1.0m }), t("items", { count: "\u{85}1\u{85}" }) == "\u{85}1\u{85} item", t("items", { count: "\u{feff}1" }) == "\u{feff}1 items"]"#, r#"[["str", "str", "str", "str", "bool", "bool"], ["0x1 items", "0b1 items", "1.0 items", "1.0 items", true, true]]"#),
+            (r#"[t("items", { count: 1.5 }), t("items", { count: 9223372036854775807 }), t("items", { count: -9223372036854775807 - 1 }), t("items", { count: "1e400" }), t("items", { count: "1e-400" }), t("items", { count: "-0.0" })]"#, r#"[["str", "str", "str", "str", "str", "str"], ["1.5 items", "9223372036854775807 items", "-9223372036854775808 items", "1e400 items", "1e-400 items", "-0.0 items"]]"#),
+            (r#"[t("items", { count: "1e0" }), t("items", { count: "0.1e1" }), t("items", { count: "10e-1" }), t("items", { count: math.inf }), t("items", { count: math.nan }), t("items", { count: true }), t("items", { count: null }), t("items", { count: [1] })]"#, r#"[["str", "str", "str", "str", "str", "str", "str", "str"], ["1e0 item", "0.1e1 item", "10e-1 items", "inf items", "NaN items", "true items", "null items", "[1] items"]]"#),
+        ],
+    );
+}
+
+// Q-823, found in review: in the browser a whole float past 2^53 took its operands from its binary
+// value (1e23 is 99999999999999991611392 there), where the server and `{count}` show its shortest
+// decimal: Russian `few` against `many`, French `other` against `many`. Now both read the digits
+// shown, for floats from Quillo and numbers from the page's code. The edges: 2^53 either side, a
+// negative one, 1e300, and one whose binary and decimal digits end alike (2^53 + 2).
+#[test]
+fn a_whole_float_past_2_53_takes_the_form_of_its_digits() {
+    let cases = r#"[t("k", { count: 1e23 }), t("k", { count: 1.23456789e20 }), t("k", { count: 1e300 }) == "many", t("k", { count: -1e23 }), t("k", { count: 9007199254740992.0 }), t("k", { count: 9007199254740994.0 }), t("k", { count: 9007199254740991.0 }), t("k", { count: 21.0 })]"#;
+    for (l, forms, want) in [
+        ("ru", r#"{ one: "one {count}", few: "few {count}", many: "many", other: "other {count}" }"#, r#"[["str", "str", "bool", "str", "str", "str", "str", "str"], ["many", "many", true, "many", "few 9007199254740992", "few 9007199254740994", "one 9007199254740991", "one 21"]]"#),
+        ("fr", r#"{ one: "one {count}", many: "many", other: "other {count}" }"#, r#"[["str", "str", "bool", "str", "str", "str", "str", "str"], ["many", "many", true, "many", "other 9007199254740992", "other 9007199254740994", "other 9007199254740991", "other 21"]]"#),
+    ] {
+        let words = format!("translations({{ {}: {{ k: {} }} }})\n", l, forms);
+        let mut it = quillo::Interp::new(".");
+        it.load_source(&words, "w.qwe").unwrap();
+        let i18n = format!("globalThis.window = {{ [Symbol.for(\"quillo\")]: {{ i18n: {} }} }};", it.site.i18n.as_ref().unwrap().browser_json(l, None));
+        same_on_both_after(&i18n, &words, &[(cases, want)]);
+        // A number from the page's code, past 2^53.
+        let src = format!("{}fn __t() = [t(\"k\", {{ count: js(\"Number\", \"1e23\") }}), t(\"k\", {{ count: js(\"Number\", \"-1.23456789e20\") }}), t(\"k\", {{ count: js(\"Number\", \"21\") }})]\n", words);
+        let mut it = quillo::Interp::new(".");
+        it.load_source(&src, "case.qwe").unwrap();
+        if let Some(out) = in_node(&format!("{}\n{}", i18n, quillo::client::test_script(&it, "__t").unwrap())) {
+            assert_eq!(out, if l == "ru" { r#"["many", "many", "one 21"]"# } else { r#"["many", "many", "other 21"]"# }, "{}", l);
+        }
+    }
+}
+
+// Q-823: Filipino and Tagalog fell back to English, so 2, 3, 5, 7 and 10 took `other`; CLDR's
+// rule is `one` but for a last digit of 4, 6 or 9, in the whole number or the fraction. No form
+// of theirs is warned of as one the language never picks.
+#[test]
+fn filipino_and_tagalog_count_by_their_last_digit() {
+    use quillo::i18n::plural;
+    for l in ["fil", "tl", "fil-PH"] {
+        let got: Vec<&str> = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 9.0, 10.0, 14.0, 16.0, 19.0, 21.0, 1.4, 1.5, 0.6, 0.9, 2.1].iter().map(|n| plural(l, *n)).collect();
+        assert_eq!(got, ["one", "one", "one", "one", "other", "one", "other", "one", "other", "one", "other", "other", "other", "one", "other", "one", "other", "other", "one"], "{}", l);
+    }
+    assert_eq!(quillo::i18n::categories("fil"), ["one", "other"]);
+    // The CLDR forms of more languages, by name: Danish 0.5, Icelandic 0.1, Macedonian 1.01, and
+    // Hebrew's `one` for any fraction below 1.
+    assert_eq!([plural("da", 0.5), plural("is", 0.1), plural("is", 11.0), plural("mk", 1.01), plural("he", 0.5), plural("he", 1.5), plural("si", 0.1), plural("si", 0.2)], ["one", "one", "other", "one", "one", "other", "one", "other"]);
+    assert_eq!([plural("en", f64::NAN), plural("fr", f64::INFINITY), plural("fr", -1.5), plural("fr", 1e300), plural("fr", 2e6)], ["other", "other", "one", "many", "many"]);
+    // A language Quillo has no rules for counts as English.
+    assert_eq!([plural("xx", 1.0), plural("xx", 2.0), plural("xx", 1.5), plural("", 1.0)], ["one", "other", "other", "one"]);
+}
+
+// Q-833: `Accept-Language` read the weight only as `q=`, so `fr;Q=0.1, de;q=0.9` served fr. A
+// parameter's name is in any case; the edges: `q=0` still refuses, spaces around `=`, a parameter
+// before the weight, a weight that is no number (0), and no weight (1).
+#[test]
+fn accept_languages_weight_is_read_in_any_case() {
+    let mut it = s12_app("translations({ fr: { a: \"fr\" }, de: { a: \"de\" }, en: { a: \"en\" } }, { default: \"en\" })\nroute GET / = t(\"a\")\n");
+    for (header, want) in [
+        ("fr;Q=0.1, de;q=0.9", "de"),
+        ("fr;q=0.1, de;Q=0.9", "de"),
+        ("fr;Q=0.9, de;q=0.1", "fr"),
+        ("fr;Q=0, de;Q=0.1", "de"),
+        ("fr;q = 0.5, de;q=0.4", "fr"),
+        ("fr;level=1;Q=0.2, de;q=0.3", "de"),
+        ("fr;Q=x, de;q=0.1", "de"),
+        ("fr, de;Q=0.9", "fr"),
+        ("xx;Q=1, de;Q=0.5", "de"),
+    ] {
+        assert_eq!(s12_get(&mut it, "/", &[("Accept-Language", header)]), want, "{}", header);
+    }
+}
+
+// Not counted in the report: a locale file that starts with a byte-order mark, as Windows'
+// editors save one, was "invalid JSON ... column 1". Now the mark is skipped; JSON that is wrong
+// after it is still said, and a mark anywhere else is the text's.
+#[test]
+fn a_locale_file_may_start_with_a_byte_order_mark() {
+    let d = dir("s12-bom", "");
+    std::fs::create_dir_all(d.join("locales")).unwrap();
+    std::fs::write(d.join("locales/en.json"), "\u{feff}{\"a\": \"Hello\", \"b\": \"x\u{feff}y\"}").unwrap();
+    std::fs::write(d.join("locales/fr.json"), "{\"a\": \"Salut\"}").unwrap();
+    let mut it = quillo::Interp::new(&d);
+    it.load_source("translations(\"locales\")\nroute GET / = t(\"a\") + t(\"b\")\n", "app.qwe").unwrap();
+    assert_eq!(s12_get(&mut it, "/", &[]), "Hellox\u{feff}y");
+    for (text, want) in [("\u{feff}", "invalid JSON: EOF while parsing a value"), ("\u{feff}{", "invalid JSON: EOF while parsing an object"), ("\u{feff}\u{feff}{}", "invalid JSON: expected value at line 1 column 1")] {
+        std::fs::write(d.join("locales/en.json"), text).unwrap();
+        let e = quillo::Interp::new(&d).load_source("translations(\"locales\")\n", "app.qwe").err().unwrap().to_string();
+        assert!(e.contains(want), "{:?}: {}", text, e);
+    }
+}
+
+// Q-828: the regional styles were the language's, or Britain's: en-CA's short date 9/5/26 where
+// CLDR has 2026-09-05, de-AT's January Januar for Jänner, pt-PT's medium "5 de set. de 2026" for
+// 05/09/2026, en-ZA, en-AU, en-IN, en-IE, fr-CA, fr-CH, it-CH, nl-BE and es-MX each their own. Now
+// every style of each locale Quillo lists is Intl's, on the server and in the browser, for days
+// with one and two digits, and the names in a pattern are the region's (`juill.`, `June`, `Jän.`).
+// The edges: a region Quillo has no row for takes its language's (de-CH, es-419), case and `_`.
+#[test]
+fn each_regions_date_styles_are_cldrs_on_both_sides() {
+    const LOCALES: &[&str] = &["en-US", "en", "en-GB", "en-AU", "en-IE", "en-NZ", "en-IN", "en-ZA", "en-CA", "de-DE", "de", "de-AT", "de-CH", "fr-FR", "fr", "fr-CA", "fr-CH", "es-ES", "es", "es-MX", "es-419", "it-IT", "it", "it-CH", "nl-NL", "nl", "nl-BE", "pt-BR", "pt", "pt-PT"];
+    let days = ["2026-09-05", "2026-01-01", "2026-12-25", "2026-05-31", "2026-07-10", "2026-06-14"];
+    let styles = ["short", "medium", "long", "full"];
+    let mut calls = Vec::new();
+    for l in LOCALES {
+        for d in days {
+            for s in styles {
+                calls.push(format!("date.format(\"{}\", {{ locale: \"{}\", style: \"{}\" }})", d, l, s));
+            }
+        }
+    }
+    let src = format!("fn __t() = [{}]\n", calls.join(", "));
+    let mut it = quillo::Interp::new(".");
+    it.load_source(&src, "case.qwe").unwrap();
+    let server: Vec<String> = match it.call(&quillo::value::lookup(&it.globals, "__t").unwrap(), vec![], 0) {
+        Ok(v) => serde_json::from_str(&v.repr()).unwrap(),
+        Err(_) => panic!("date.format stopped"),
+    };
+    let intl = format!(
+        "const out = [];\nfor (const l of {}) for (const d of {}) for (const s of {}) out.push(new Intl.DateTimeFormat(l, {{ dateStyle: s, timeZone: 'UTC' }}).format(new Date(d + 'T00:00:00Z')));\nconsole.log(JSON.stringify(out));",
+        serde_json::to_string(LOCALES).unwrap(),
+        serde_json::to_string(&days).unwrap(),
+        serde_json::to_string(&styles).unwrap()
+    );
+    let Some(reference) = in_node(&intl) else { return };
+    let reference: Vec<String> = serde_json::from_str(&reference).unwrap();
+    let browser: Vec<String> = serde_json::from_str(&in_node(&quillo::client::test_script(&it, "__t").unwrap()).unwrap()).unwrap();
+    let wrong: Vec<String> = (0..calls.len()).filter(|k| server[*k] != reference[*k] || browser[*k] != reference[*k]).map(|k| format!("{}: server {:?}, browser {:?}, Intl {:?}", calls[k], server[k], browser[k], reference[k])).collect();
+    assert!(wrong.is_empty(), "{} of {}:\n{}", wrong.len(), calls.len(), wrong.join("\n"));
+    same_on_both(
+        "",
+        &[
+            (r#"[date.format("2026-01-05", { locale: "de-AT", pattern: "MMMM MMM" }), date.format("2026-09-05", { locale: "de-AT", pattern: "MMM" }), date.format("2026-06-05", { locale: "en-AU", pattern: "MMM" }), date.format("2026-07-05", { locale: "en-AU", pattern: "MMM" }), date.format("2026-07-05", { locale: "fr-CA", pattern: "MMM" }), date.format("2026-09-05", { locale: "es-MX", pattern: "MMM" })]"#, r#"[["str", "str", "str", "str", "str", "str"], ["Jänner Jän.", "Sep.", "June", "July", "juill.", "sep"]]"#),
+            (r#"[date.format("2026-09-05", { locale: "pt-PT", pattern: "ddd" }), date.format("2026-09-05", { locale: "EN_ca", style: "short" }), date.format("2026-09-05", { locale: " fr-ch ", style: "short" }), date.format("2026-09-05", { locale: "de-AT-x", style: "long" }), date.format("2026-01-05", { locale: "de-ch", style: "long" }), date.format("2026-09-05T10:00:00Z", { locale: "en-ZA", style: "full" })]"#, r#"[["str", "str", "str", "str", "str", "str"], ["sábado", "2026-09-05", "05.09.26", "5. September 2026", "5. Januar 2026", "Saturday, 05 September 2026"]]"#),
+        ],
+    );
+}
+
+// Q-829: `+0530` and `+05` were zones in the browser (its Intl takes them) and not on the server;
+// now both take an offset as `date.parse` reads one, `+05:30`, `+0530` or `+05` (and `+00:09:21`),
+// and no other name with a sign: the browser no longer asks Intl, which takes U+2212's minus too.
+// The edges: the largest offset (+23:59) and the one past it, `-00`, one digit too few or many,
+// seconds without a colon, and `Etc/Unknown` and `Factory`, which neither side takes.
+#[test]
+fn an_offset_is_a_zone_on_both_sides_as_date_parse_reads_it() {
+    same_on_both(
+        "fn vz(z) = date.valid_zone(z)\nfn tz(z) = date.to_zone(\"2026-10-27T12:00:00Z\", z)\n",
+        &[
+            (r#"[vz("+0530"), vz("+05"), vz("+05:30"), vz("-0800"), vz("-08"), vz("+00:09:21"), vz("+23:59"), vz("+2359"), vz("-00"), vz("+00")]"#, r#"[["bool", "bool", "bool", "bool", "bool", "bool", "bool", "bool", "bool", "bool"], [true, true, true, true, true, true, true, true, true, true]]"#),
+            (r#"[vz("+5"), vz("+05:3"), vz("+053"), vz("+05300"), vz("+24:00"), vz("+2400"), vz("+24"), vz("+0560"), vz("+05:30:00.5"), vz("\u{2212}05:30"), vz("+"), vz("-"), vz("+05 "), vz("Etc/Unknown"), vz("Factory")]"#, r#"[["bool", "bool", "bool", "bool", "bool", "bool", "bool", "bool", "bool", "bool", "bool", "bool", "bool", "bool", "bool"], [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false]]"#),
+            (r#"[tz("+0530"), tz("+05"), tz("-0330"), tz("-00"), date.at("2026-10-27", "12:00", "+0530"), date.date_in("2026-10-27T20:00:00Z", "+05"), date.from_ms(0, "-0130")]"#, r#"[["str", "str", "str", "str", "str", "str", "str"], ["2026-10-27T17:30:00+05:30", "2026-10-27T17:00:00+05:00", "2026-10-27T08:30:00-03:30", "2026-10-27T12:00:00Z", "2026-10-27T12:00:00+05:30", "2026-10-28", "1969-12-31T22:30:00-01:30"]]"#),
+            (r#"tz("+5")"#, r#"ERROR: `date.to_zone`: unknown time zone "+5""#),
+            (r#"tz("\u{2212}05:30")"#, "ERROR: `date.to_zone`: unknown time zone \"\u{2212}05:30\""),
+            (r#"date.today("+0560")"#, r#"ERROR: `date.today`: unknown time zone "+0560""#),
+            (r#"[date.parse("2026-10-27T14:30:00+0530"), date.parse("2026-10-27T14:30:00-05"), date.parse("2026-10-27T14:30:00z"), date.parse("2026-10-27T14:30:00+05:30"), is_err(date.parse("2026-10-27T14:30:00+5")), is_err(date.parse("2026-10-27T14:30:00+05300"))]"#, r#"[["str", "str", "str", "str", "bool", "bool"], ["2026-10-27T14:30:00+05:30", "2026-10-27T14:30:00-05:00", "2026-10-27T14:30:00Z", "2026-10-27T14:30:00+05:30", true, true]]"#),
+        ],
+    );
+}
+
+// Q-827: in the browser a whole float past 2^53 from the page's code went through BigInt, so
+// 6.022e23 was written 602,200,000,000,000,027,262,976. Now such a number is a float by its
+// shortest decimal, as the server writes the float, and past a decimal's digits plainly; floats
+// from Quillo agree too. The edges: 2^53 either side, 1e21 (JavaScript's exponent), 7.9e28.
+#[test]
+fn format_number_of_a_large_whole_float_writes_its_decimal_digits() {
+    same_on_both(
+        "",
+        &[(
+            r#"[format_number(6.022e23, "en-US", 0), format_number(1e23, "en-US", 0), format_number(1e21, "de-DE"), format_number(9007199254740992.0, "en-US"), format_number(7.9e28, "en-US", 0), format_number(1e29, "en-US", 0), format_number(-6.022e23, "en-US")]"#,
+            r#"[["str", "str", "str", "str", "str", "str", "str"], ["602,200,000,000,000,000,000,000", "100,000,000,000,000,000,000,000", "1.000.000.000.000.000.000.000", "9,007,199,254,740,992", "79,000,000,000,000,000,000,000,000,000", "100000000000000000000000000000", "-602,200,000,000,000,000,000,000"]]"#,
+        )],
+    );
+    let src = r#"fn __t() = [format_number(js("Number", "6.022e23"), "en-US", 0), format_number(js("Number", "1e23"), "en-US"), format_number(js("Number", "9007199254740993"), "en-US"), format_number(js("Number", "9007199254740991"), "en-US"), format_number(js("Number", "1e29"), "en-US"), format_number(js("Number", "-1e22"), "en-US")]
+"#;
+    let mut it = quillo::Interp::new(".");
+    it.load_source(src, "case.qwe").unwrap();
+    if let Some(out) = in_node(&quillo::client::test_script(&it, "__t").unwrap()) {
+        assert_eq!(out, r#"["602,200,000,000,000,000,000,000", "100,000,000,000,000,000,000,000", "9,007,199,254,740,992", "9,007,199,254,740,991", "100000000000000000000000000000", "-10,000,000,000,000,000,000,000"]"#);
+    }
+}
+
+// Not counted in the report: -0.001 to two digits was "0.00", where Intl and Python write
+// "-0.00". Now a number below 0 keeps its sign rounded to 0, and -0.0 is "-0", as Intl writes it,
+// on both sides. The edges: a tie that rounds away from 0 (-0.005), +0.001, an int 0, a decimal,
+// a locale whose minus is U+2212, `{ min, max }`, and a mode that rounds toward 0. With no digits
+// a number is written with every digit it has (Intl stops at three): the guide's choice, kept.
+#[test]
+fn a_negative_number_rounded_to_zero_keeps_its_sign() {
+    same_on_both(
+        "",
+        &[
+            (r#"[format_number(-0.001, "en-US", 2), format_number(-0.004m, "en-US", 2), format_number(-0.005, "en-US", 2), format_number(0.001, "en-US", 2), format_number(-0.0, "en-US"), format_number(-0.0, "de-DE", 2), format_number(0.0, "en-US", 2), format_number(0, "en-US", 2), format_number(-0.4, "en-US", 0)]"#, r#"[["str", "str", "str", "str", "str", "str", "str", "str", "str"], ["-0.00", "-0.00", "-0.01", "0.00", "-0", "-0,00", "0.00", "0.00", "-0"]]"#),
+            (r#"[format_number(-0.001, "sv-SE", 2), format_number(-1e-30, "en-US", { max: 2 }), format_number(-0.009, "en-US", 2, "down"), format_number(-0.001, "en-US"), format_number(1.23456, "en-US"), format_number(-1.5, "en-US", 0, "half_even")]"#, "[[\"str\", \"str\", \"str\", \"str\", \"str\", \"str\"], [\"\u{2212}0,00\", \"-0\", \"-0.00\", \"-0.001\", \"1.23456\", \"-2\"]]"),
+        ],
+    );
+}
+
+// Q-830: a service's `timeout` or `cooldown` too long for a Duration (1e300 ms, math.inf,
+// "99999999999999999999s") stopped the program as it loaded with Rust's panic. Now it is "not a
+// duration", as "1.5h" is; one a Duration holds but longer than a century is a century, so a call
+// with the longest timeout taken is made and answered (an Instant holds less than a Duration:
+// "Request deadline overflowed"), and a failing address is left alone without stopping on
+// `now + cooldown`.
+#[test]
+fn a_service_duration_too_long_is_said_not_to_be_one() {
+    let d = dir("s12-svc", "");
+    std::fs::write(d.join("work.qwe"), "server fn add(a: int) -> int = a\n").unwrap();
+    for (opt, given) in [
+        ("timeout", "1e300"),
+        ("timeout", "math.inf"),
+        ("timeout", "\"99999999999999999999s\""),
+        ("timeout", "\"1e300ms\""),
+        ("timeout", "math.nan"),
+        ("cooldown", "1e300"),
+        ("cooldown", "math.inf"),
+        ("cooldown", "\"99999999999999999999s\""),
+        ("cooldown", "\"1e18m\""),
+        ("cooldown", "-1"),
+    ] {
+        std::fs::write(d.join("main.qwe"), format!("service work = \"work.qwe\" {{ {}: {} }}\n", opt, given)).unwrap();
+        let e = quillo::Interp::new(&d).load_file(&d.join("main.qwe")).err().unwrap_or_else(|| panic!("{} {} loaded", opt, given));
+        assert!(e.msg.contains(&format!("service work: `{}` is a duration", opt)), "{} {}: {}", opt, given, e.msg);
+    }
+    // The longest are taken, as a century: just under what a Duration holds, an int's
+    // milliseconds, a float's; a century itself, and a day, as they are.
+    let century = std::time::Duration::from_secs(100 * 365 * 86_400);
+    for (given, want) in [("\"18000000000000000000s\"", century), ("9223372036854775807", century), ("1.8e22", century), ("3153600000000", century), ("3153600000001", century), ("86400000", std::time::Duration::from_secs(86_400))] {
+        std::fs::write(d.join("main.qwe"), format!("service work = \"work.qwe\" {{ timeout: {}, cooldown: {} }}\n", given, given)).unwrap();
+        quillo::Interp::new(&d).load_file(&d.join("main.qwe")).unwrap_or_else(|e| panic!("{}: {}", given, e.msg));
+        let o = quillo::service::opts("work");
+        assert_eq!((o.timeout, o.cooldown), (want, want), "{}", given);
+    }
+    let secret = "s12-a-secret-for-this-test-alone-0123456789";
+    let opts = "{ retries: 0, failures: 1, timeout: \"18000000000000000000s\", cooldown: \"18000000000000000000s\" }";
+    // Called where the service answers: the call is made.
+    let port = support::free_port();
+    let _work = support::Guard::new(Command::new(env!("CARGO_BIN_EXE_quillo")).args(["run", "work.qwe", "--as-service", "--port", &port.to_string()]).current_dir(&d).env("QUILLO_SERVICE_SECRET", secret).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !support::listening(port) {
+        assert!(std::time::Instant::now() < deadline, "the service did not start");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::fs::write(d.join("main.qwe"), format!("service work = \"work.qwe\" {}\nprint(work.add(41))\n", opts)).unwrap();
+    let out = script_with_env(&d, "main.qwe", &[("QUILLO_SERVICE_SECRET", secret), ("QUILLO_SERVICE_WORK", &format!("http://127.0.0.1:{}", port))]);
+    assert_eq!(out, "41\n");
+    // Called where nothing answers: refused, then left alone "for ever".
+    let closed = support::free_port();
+    std::fs::write(d.join("main.qwe"), format!("service work = \"work.qwe\" {}\nprint(work.add(1))\nprint(work.add(2))\n", opts)).unwrap();
+    let out = script_with_env(&d, "main.qwe", &[("QUILLO_SERVICE_SECRET", secret), ("QUILLO_SERVICE_WORK", &format!("http://127.0.0.1:{}", closed))]);
+    let lines: Vec<&str> = out.lines().filter(|l| l.starts_with("err(")).collect();
+    assert!(!out.contains("panicked") && !out.contains("overflow") && lines.len() == 2 && lines[0].contains("unreachable at") && lines[1].contains("unavailable"), "{}", out);
+}
+
+// Q-831: `markdown_page`'s title was the first line starting `# `, in a code block or an HTML
+// comment too, `# Title #` kept its `#`, a tab after `#` or a setext heading gave none, and marks
+// stayed. Now it is the text the first level-1 heading shows, as `markdown` shows it, at the top
+// level. The edges: a level-2 heading first, `#` with no space (no heading), a setext heading of two
+// lines, `---` (level 2), an entity, unicode, inline HTML (shown as text, or markup with `html`),
+// an empty heading first, an image's alt text, a heading in a quote or a list, no heading at all,
+// and `title` given.
+#[test]
+fn markdown_pages_title_is_its_first_level_one_heading() {
+    let title = |md: &str| -> String {
+        let mut it = quillo::Interp::new(".");
+        it.load_source(&format!("let out = markdown_page({:?})\n", md), "t.qwe").unwrap();
+        let page = quillo::value::lookup(&it.globals, "out").unwrap().display();
+        page[page.find("<title>").unwrap() + 7..page.find("</title>").unwrap()].to_string()
+    };
+    for (md, want) in [
+        ("```sh\n# install the tools\nnpm i\n```\n\n# Getting started\n", "Getting started"),
+        ("Setext Title\n============\n\ntext", "Setext Title"),
+        ("    # indented code\n\n# Real", "Real"),
+        ("<!-- # hidden -->\n\n# Real", "Real"),
+        ("# Title #", "Title"),
+        ("#\tTabbed", "Tabbed"),
+        ("# *Emph* and `code` and [a link](/x)", "Emph and code and a link"),
+        ("## Sub\n\n# Main", "Main"),
+        ("#NoSpace\n", ""),
+        ("Line one\nline two\n===\n", "Line one line two"),
+        ("Second\n---\n", ""),
+        ("# A &amp; B &lt;3", "A &amp; B &lt;3"),
+        ("# Café ☕ 日本", "Café ☕ 日本"),
+        ("# a <b>bold</b>", "a &lt;b&gt;bold&lt;/b&gt;"),
+        ("# <script>alert(1)</script> x", "&lt;script&gt;alert(1)&lt;/script&gt; x"),
+        ("# a<br>b", "a&lt;br&gt;b"),
+        ("#\n\n# Real", "Real"),
+        ("# ![logo](a.png) Docs", "logo Docs"),
+        ("> # Quoted\n\n# Top", "Top"),
+        ("- # In a list\n\n# Top", "Top"),
+        ("> # Quoted only", ""),
+        ("just text", ""),
+        ("", ""),
+        ("#", ""),
+    ] {
+        assert_eq!(title(md), want, "{:?}", md);
+    }
+    let mut it = quillo::Interp::new(".");
+    it.load_source("let out = markdown_page(\"# Heading\", { title: \"Given\" })\nlet kept = markdown_page(\"# a <b>bold</b><br>b\", { html: true })\n", "t.qwe").unwrap();
+    assert!(quillo::value::lookup(&it.globals, "out").unwrap().display().contains("<title>Given</title>"));
+    // With the HTML kept, its tags are markup, not the heading's text.
+    assert!(quillo::value::lookup(&it.globals, "kept").unwrap().display().contains("<title>a boldb</title>"));
+}
+
+/// A folder for image tests, and a program in it run: what `expr` gives.
+fn s12_image(d: &Path, expr: &str) -> String {
+    let mut it = quillo::Interp::new(d);
+    it.load_source(&format!("let out = {}\n", expr), "t.qwe").unwrap_or_else(|e| panic!("{}", e));
+    quillo::value::lookup(&it.globals, "out").unwrap().repr()
+}
+
+// Q-824: two conversions to one target at once wrote one temp file, `<name>.tmp<pid>`: the one
+// that renamed second found none ("No such file or directory"), and the file could hold the other's
+// image. Now each call has its own: every one of them is done, each says the size it wrote, the file
+// is one of them whole, and no temp file stays. The edges: a target's name of 255 bytes, and one
+// whose 128th byte is inside a character.
+#[test]
+fn conversions_to_one_file_at_once_each_finish() {
+    let d = dir("s12-race", "");
+    image::RgbImage::from_fn(1600, 1200, |x, y| image::Rgb([(x % 251) as u8, (y % 241) as u8, 9])).save(d.join("big.png")).unwrap();
+    image::RgbImage::from_fn(40, 20, |_, _| image::Rgb([200, 10, 10])).save(d.join("small.png")).unwrap();
+    for round in 0..3 {
+        let start = std::sync::Arc::new(std::sync::Barrier::new(6));
+        let threads: Vec<_> = (0..6)
+            .map(|k| {
+                let (d, start) = (d.clone(), start.clone());
+                std::thread::spawn(move || {
+                    let src = if k % 2 == 0 { "big.png" } else { "small.png" };
+                    let mut it = quillo::Interp::new(&d);
+                    it.load_source(&format!("fn go() = image.convert(\"{}\", \"out/mix.png\")\n", src), "t.qwe").unwrap();
+                    let go = quillo::value::lookup(&it.globals, "go").unwrap();
+                    start.wait();
+                    (src, it.call(&go, vec![], 0).map(|v| v.repr()).unwrap_or_else(|_| "stopped".into()))
+                })
+            })
+            .collect();
+        for t in threads {
+            let (src, got) = t.join().unwrap();
+            assert_eq!(got, if src == "big.png" { "{ width: 1600, height: 1200 }" } else { "{ width: 40, height: 20 }" }, "round {}", round);
+        }
+        let size = image::image_dimensions(d.join("out/mix.png")).unwrap();
+        assert!(size == (1600, 1200) || size == (40, 20), "{:?}", size);
+        let left: Vec<_> = std::fs::read_dir(d.join("out")).unwrap().flatten().map(|e| e.file_name()).filter(|n| n != "mix.png").collect();
+        assert!(left.is_empty(), "{:?}", left);
+    }
+    let long = format!("{}.png", "a".repeat(251));
+    assert_eq!(s12_image(&d, &format!("image.convert(\"small.png\", \"out/{}\")", long)), "{ width: 40, height: 20 }");
+    let wide = format!("{}é{}.png", "b".repeat(127), "c".repeat(100));
+    assert_eq!(s12_image(&d, &format!("image.convert(\"small.png\", \"out/{}\")", wide)), "{ width: 40, height: 20 }");
+    assert_eq!(std::fs::read_dir(d.join("out")).unwrap().count(), 3);
+}
+
+/// A JPEG of `w` by `h`, its left half red and its right half blue, with an EXIF orientation when
+/// one is given (an APP1 segment after the start).
+fn s12_jpeg(w: u32, h: u32, orientation: Option<u16>) -> Vec<u8> {
+    let img = image::RgbImage::from_fn(w, h, |x, _| if x < w / 2 { image::Rgb([230, 20, 20]) } else { image::Rgb([20, 20, 230]) });
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 95).encode_image(&img).unwrap();
+    let Some(o) = orientation else { return out };
+    let mut exif = b"Exif\0\0MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01".to_vec();
+    exif.extend_from_slice(&o.to_be_bytes());
+    exif.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    let mut app1 = vec![0xff, 0xe1];
+    app1.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+    app1.extend_from_slice(&exif);
+    [&out[..2], &app1[..], &out[2..]].concat()
+}
+
+// Q-825: a phone's photo stored on its side with an EXIF orientation of 6 was said to be 400 by
+// 200 and converted on its side, with no EXIF left for a browser to turn it by. Now `info` and
+// `convert` take the image as it is shown: turned a quarter (6 and 8, and 5 and 7 mirrored too),
+// half (3), or mirrored (2, 4), and `crop` and `width` are in the turned image's pixels. The
+// edges: orientation 1, none, and a value no orientation has (9).
+#[test]
+fn images_are_read_turned_as_their_exif_says() {
+    let d = dir("s12-exif", "");
+    for (o, size) in [(Some(6), "{ width: 200, height: 400, format: \"jpeg\", alpha: false }"), (Some(8), "{ width: 200, height: 400, format: \"jpeg\", alpha: false }"), (Some(5), "{ width: 200, height: 400, format: \"jpeg\", alpha: false }"), (Some(7), "{ width: 200, height: 400, format: \"jpeg\", alpha: false }"), (Some(3), "{ width: 400, height: 200, format: \"jpeg\", alpha: false }"), (Some(1), "{ width: 400, height: 200, format: \"jpeg\", alpha: false }"), (None, "{ width: 400, height: 200, format: \"jpeg\", alpha: false }"), (Some(9), "{ width: 400, height: 200, format: \"jpeg\", alpha: false }")] {
+        std::fs::write(d.join("p.jpg"), s12_jpeg(400, 200, o)).unwrap();
+        assert_eq!(s12_image(&d, "image.info(\"p.jpg\")"), size, "{:?}", o);
+    }
+    // Turned clockwise (6): the left half, red, is on top; anticlockwise (8), at the bottom.
+    let red = |p: image::Rgb<u8>| p.0[0] > 150 && p.0[2] < 100;
+    let blue = |p: image::Rgb<u8>| p.0[2] > 150 && p.0[0] < 100;
+    for (o, top_red) in [(6, true), (8, false)] {
+        std::fs::write(d.join("p.jpg"), s12_jpeg(400, 200, Some(o))).unwrap();
+        assert_eq!(s12_image(&d, "image.convert(\"p.jpg\", \"out.png\", { width: 100 })"), "{ width: 100, height: 200 }", "{}", o);
+        let img = image::open(d.join("out.png")).unwrap().to_rgb8();
+        assert_eq!((red(*img.get_pixel(50, 20)), blue(*img.get_pixel(50, 180))), (top_red, top_red), "{}", o);
+        assert_eq!((blue(*img.get_pixel(50, 20)), red(*img.get_pixel(50, 180))), (!top_red, !top_red), "{}", o);
+        // A crop in what is shown: the top 200 by 100.
+        assert_eq!(s12_image(&d, "image.convert(\"p.jpg\", \"top.png\", { crop: { x: 0, y: 0, w: 200, h: 100 } })"), "{ width: 200, height: 100 }");
+        let top = image::open(d.join("top.png")).unwrap().to_rgb8();
+        assert_eq!(red(*top.get_pixel(100, 50)), top_red, "{}", o);
+        assert!(s12_image(&d, "image.convert(\"p.jpg\", \"x.png\", { crop: { x: 0, y: 0, w: 400, h: 100 } })").contains("outside the 200×400 image"));
+    }
+    // Half turned (3): red on the right; mirrored (2): the same.
+    for o in [3, 2] {
+        std::fs::write(d.join("p.jpg"), s12_jpeg(400, 200, Some(o))).unwrap();
+        s12_image(&d, "image.convert(\"p.jpg\", \"out.png\")");
+        let img = image::open(d.join("out.png")).unwrap().to_rgb8();
+        assert!(red(*img.get_pixel(350, 100)) && blue(*img.get_pixel(50, 100)), "{}", o);
+    }
+    std::fs::write(d.join("p.jpg"), s12_jpeg(400, 200, Some(1))).unwrap();
+    s12_image(&d, "image.convert(\"p.jpg\", \"out.png\")");
+    let img = image::open(d.join("out.png")).unwrap().to_rgb8();
+    assert!(red(*img.get_pixel(50, 100)) && blue(*img.get_pixel(350, 100)));
+}
+
+// Q-826: a PNG's transparent pixels came out black in a JPEG, as `to_rgb8` dropped the alpha. Now
+// what is see-through is laid on white, as a page shows it: clear is white, half clear half
+// mixed, opaque as it was; gray with alpha too. PNG and WebP keep the alpha as before.
+#[test]
+fn transparent_pixels_are_white_in_a_jpeg() {
+    let d = dir("s12-alpha", "");
+    let img = image::RgbaImage::from_fn(40, 40, |x, _| match x / 10 {
+        0 => image::Rgba([0, 0, 0, 0]),
+        1 => image::Rgba([255, 0, 0, 128]),
+        2 => image::Rgba([0, 0, 255, 255]),
+        _ => image::Rgba([0, 255, 0, 1]),
+    });
+    img.save(d.join("a.png")).unwrap();
+    assert_eq!(s12_image(&d, "image.convert(\"a.png\", \"a.jpg\", { quality: 100 })"), "{ width: 40, height: 40 }");
+    let out = image::open(d.join("a.jpg")).unwrap().to_rgb8();
+    let near = |p: &image::Rgb<u8>, want: [u8; 3]| p.0.iter().zip(want).all(|(a, b)| (*a as i32 - b as i32).abs() <= 12);
+    for (x, want) in [(5, [255, 255, 255]), (15, [255, 127, 127]), (25, [0, 0, 255]), (35, [254, 255, 254])] {
+        assert!(near(out.get_pixel(x, 20), want), "{}: {:?}", x, out.get_pixel(x, 20));
+    }
+    image::GrayAlphaImage::from_fn(10, 10, |_, _| image::LumaA([0, 0])).save(d.join("g.png")).unwrap();
+    s12_image(&d, "image.convert(\"g.png\", \"g.jpg\")");
+    assert!(near(image::open(d.join("g.jpg")).unwrap().to_rgb8().get_pixel(5, 5), [255, 255, 255]));
+    for f in ["png", "webp"] {
+        s12_image(&d, &format!("image.convert(\"a.png\", \"b.{}\")", f));
+        assert_eq!(image::open(d.join(format!("b.{}", f))).unwrap().to_rgba8().get_pixel(5, 5).0[3], 0, "{}", f);
+    }
+}
+
+// ---- end of slice 12 ----

@@ -415,6 +415,9 @@ pub fn format_number(d: Dec, places: Option<u32>, loc_name: &str) -> String {
 /// half to even writes what `money` works out (FEEDBACK50.md, Q-626; branch feedback50-fixes).
 pub fn format_number_between(d: Dec, places: Option<(u32, u32)>, mode: Rounding, loc_name: &str) -> String {
     let loc = locale_data(loc_name);
+    // A number below 0 keeps its sign when it rounds to 0, as `Intl` and Python write -0.001 to two
+    // digits: "-0.00" (FEEDBACK55.md, not counted; branch feedback55).
+    let neg = d.is_negative();
     let d = match places {
         Some((min, max)) => {
             let mut r = d.round(max as i32, mode).unwrap_or(d);
@@ -425,7 +428,7 @@ pub fn format_number_between(d: Dec, places: Option<(u32, u32)>, mode: Rounding,
         }
         None => d,
     };
-    let sign = if d.is_negative() { loc.minus } else { "" };
+    let sign = if neg { loc.minus } else { "" };
     format!("{}{}", sign, digits(loc, loc.number, loc.number_indian, d))
 }
 
@@ -973,7 +976,14 @@ pub fn format_number_fn(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         None | Some(Value::Nil) => Rounding::HalfUp,
         Some(_) => mode(&args, 3, F, line)?,
     };
-    Ok(Value::str(format_number_between(d, places, rounding, &loc)))
+    let text = format_number_between(d, places, rounding, &loc);
+    // A float below 0 that its decimal holds as 0 (-1e-30), and -0.0, are written "-0", as `Intl`
+    // writes them; a decimal has no -0 to keep.
+    let minus = locale_data(&loc).minus;
+    if matches!(args.first(), Some(Value::Float(f)) if f.is_sign_negative()) && !text.starts_with(minus) {
+        return Ok(Value::str(format!("{}{}", minus, text)));
+    }
+    Ok(Value::str(text))
 }
 
 #[cfg(test)]
