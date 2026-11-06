@@ -296,6 +296,9 @@ pub struct Interp {
     /// Running a scheduled job or a tick, not a request: its `sleep` ends at a
     /// stop or a reload (FEEDBACK12.md, Q-081 and Q-082; branch feedback12-sleep).
     pub(crate) in_job: bool,
+    /// The `parallel` call this runs a function of, once another of its functions failed: this
+    /// one stops at its next step (see `Stop`).
+    pub(crate) stop: Option<Arc<Stop>>,
     /// A service's own `.env`, beside its file (FEEDBACK9.md, Q-071; branch
     /// feedback9-fixes). The app's is in the process's environment.
     pub env_file: Arc<std::collections::HashMap<String, String>>,
@@ -361,6 +364,24 @@ pub const MAX_DEPTH: usize = 10_000;
 /// What stops a prefetched page that would change something; the server
 /// answers it "not prefetched" and does not log it.
 pub const PREFETCH_REFUSED: &str = "not while the page is prefetched";
+
+/// What a `parallel` function is stopped with once another has failed (see `Stop`).
+pub const PARALLEL_STOPPED: &str = "stopped: another function given to `parallel` failed";
+
+/// A `parallel` call, for its functions: once one fails, the others stop at their next step (a
+/// call, a loop's round, the end of a `sleep`), as the guide says, where they all ran to their
+/// end and kept what they wrote (FEEDBACK55.md, Q-804; branch feedback55). Inside another
+/// `parallel`'s function, that call's stop is this one's too.
+pub(crate) struct Stop {
+    now: std::sync::atomic::AtomicBool,
+    up: Option<Arc<Stop>>,
+}
+
+impl Stop {
+    pub(crate) fn stopped(&self) -> bool {
+        self.now.load(std::sync::atomic::Ordering::Relaxed) || self.up.as_ref().is_some_and(|u| u.stopped())
+    }
+}
 
 /// A source file's absolute path, as the parser records it on what it
 /// parses (see `FnDef::file`).
@@ -477,7 +498,20 @@ pub fn as_dec(v: &Value) -> Option<Dec> {
 /// Whether `??` may take a stop: not one that means the request must end, the compute limit's
 /// whether `--max-compute` or a policy set it (FEEDBACK55.md, Q-849; branch feedback55).
 fn guardable(msg: &str) -> bool {
-    !msg.contains(PREFETCH_REFUSED) && !crate::httpd::is_compute_stop(msg) && !msg.contains("the script ")
+    !msg.contains(PREFETCH_REFUSED) && !crate::httpd::is_compute_stop(msg) && !msg.contains("the script ") && msg != PARALLEL_STOPPED
+}
+
+/// What a `parallel` function did to the answer being made (see `Interp::back`).
+#[derive(Default)]
+struct Back {
+    cookies: Vec<String>,
+    session: Option<Value>,
+    visitor_read: bool,
+    read_request: bool,
+    /// What it announced while answering another service's call, and whether it wrote to the
+    /// database (FEEDBACK55.md, Q-796, found in review; branch feedback55).
+    published: Option<Vec<String>>,
+    wrote_req: Option<usize>,
 }
 
 /// What is known of a text read by index.
@@ -1574,6 +1608,7 @@ impl Interp {
             text: None,
             text_small: None,
             in_job: false,
+            stop: None,
             env_file: Default::default(),
             declared_services: Default::default(),
             accept: None,
@@ -1685,6 +1720,7 @@ impl Interp {
             text: None,
             text_small: None,
             in_job: self.in_job,
+            stop: None,
             env_file: self.env_file.clone(),
             declared_services: self.declared_services.clone(),
             accept: self.accept.clone(),
@@ -1939,33 +1975,40 @@ impl Interp {
         }
         // In the server: each function as a coroutine on the event loop, so
         // their waits (queries, `http.*`) overlap without threads.
+        let stop = Arc::new(Stop { now: Default::default(), up: self.stop.clone() });
         if crate::httpd::in_task() {
-            let mut results: Vec<Option<Result<Value, Ctrl>>> = (0..fs.len()).map(|_| None).collect();
+            let mut results: Vec<Option<(Result<Value, Ctrl>, Back)>> = (0..fs.len()).map(|_| None).collect();
             let base = results.as_mut_ptr() as usize;
             let children: Vec<Box<dyn FnOnce()>> = fs
                 .into_iter()
                 .enumerate()
                 .map(|(i, f)| {
                     let mut it = self.task_fork();
+                    it.stop = Some(stop.clone());
                     Box::new(move || {
                         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| it.call(&f, Vec::new(), line)))
                             .unwrap_or_else(|_| fail(line, "a function given to `parallel` failed unexpectedly"));
+                        it.failed(&r);
+                        let back = it.back();
                         // SAFETY: `results` is not touched (or moved) while
                         // the children run; the request waits for them.
-                        unsafe { *(base as *mut Option<Result<Value, Ctrl>>).add(i) = Some(r) };
+                        unsafe { *(base as *mut Option<(Result<Value, Ctrl>, Back)>).add(i) = Some((r, back)) };
                     }) as Box<dyn FnOnce()>
                 })
                 .collect();
             crate::httpd::run_children(children);
-            let mut out = Vec::with_capacity(results.len());
-            for r in results {
-                out.push(r.unwrap_or_else(|| fail(line, "a function given to `parallel` failed unexpectedly"))?);
-            }
-            return Ok(Value::list(out));
+            return self.parallel_results(results.into_iter().map(|r| r.unwrap_or_else(|| (fail(line, "a function given to `parallel` failed unexpectedly"), Back::default()))));
         }
-        let tasks: Vec<(Interp, Value)> = fs.into_iter().map(|f| (self.task_fork(), f)).collect();
+        let tasks: Vec<(Interp, Value)> = fs
+            .into_iter()
+            .map(|f| {
+                let mut it = self.task_fork();
+                it.stop = Some(stop.clone());
+                (it, f)
+            })
+            .collect();
         let shared = self.shared.clone();
-        let results: Vec<Result<Value, Ctrl>> = self.unlocked(|| {
+        let results: Vec<(Result<Value, Ctrl>, Back)> = self.unlocked(|| {
             std::thread::scope(|s| {
                 let running: Vec<_> = tasks
                     .into_iter()
@@ -1973,26 +2016,90 @@ impl Interp {
                         let shared = &shared;
                         std::thread::Builder::new().name("quillo-parallel".into()).stack_size(8 << 20).spawn_scoped(s, move || {
                             shared.gil.acquire();
-                            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| it.call(&f, Vec::new(), line)));
+                            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| it.call(&f, Vec::new(), line)))
+                                .unwrap_or_else(|_| fail(line, "a function given to `parallel` failed unexpectedly"));
+                            it.failed(&r);
+                            let back = it.back();
                             shared.gil.release();
-                            r.unwrap_or_else(|_| fail(line, "a function given to `parallel` failed unexpectedly"))
+                            (r, back)
                         })
                     })
                     .collect();
                 running
                     .into_iter()
                     .map(|t| match t {
-                        Ok(h) => h.join().unwrap_or_else(|_| fail(line, "a function given to `parallel` failed unexpectedly")),
-                        Err(e) => fail(line, format!("`parallel` could not start a thread: {}", e)),
+                        Ok(h) => h.join().unwrap_or_else(|_| (fail(line, "a function given to `parallel` failed unexpectedly"), Back::default())),
+                        Err(e) => (fail(line, format!("`parallel` could not start a thread: {}", e)), Back::default()),
                     })
                     .collect()
             })
         });
-        let mut out = Vec::with_capacity(results.len());
-        for r in results {
-            out.push(r?);
+        self.parallel_results(results.into_iter())
+    }
+
+    /// The functions' results in order, the first failure being the call's; what each did to the
+    /// answer is the request's, in their order, as if they had run one after another
+    /// (FEEDBACK55.md, Q-796; branch feedback55).
+    /// A function stopped because another failed is not the failure (Q-804), unless that is all
+    /// there is: a `parallel` around this one was stopped.
+    fn parallel_results(&mut self, results: impl Iterator<Item = (Result<Value, Ctrl>, Back)>) -> Result<Value, Ctrl> {
+        let mut out = Vec::with_capacity(results.size_hint().0);
+        let (mut first, mut stopped): (Option<Ctrl>, Option<Ctrl>) = (None, None);
+        for (r, back) in results {
+            self.take_back(back);
+            match r {
+                Ok(v) => out.push(v),
+                Err(Ctrl::Error(e)) if e.msg == PARALLEL_STOPPED => {
+                    stopped.get_or_insert(Ctrl::Error(e));
+                }
+                Err(e) => {
+                    first.get_or_insert(e);
+                }
+            }
         }
-        Ok(Value::list(out))
+        match first.or(stopped) {
+            Some(e) => Err(e),
+            None => Ok(Value::list(out)),
+        }
+    }
+
+    /// A `parallel` function that failed stops the others (Q-804).
+    fn failed(&self, r: &Result<Value, Ctrl>) {
+        if let (Err(_), Some(s)) = (r, &self.stop) {
+            s.now.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// What a `parallel` function did to the answer being made: the cookies it queued and the
+    /// session it set, which a function's own handle on the program dropped (a logout with
+    /// `end_session()` in one left the visitor signed in), and whether it read who the visitor
+    /// is, which makes the answer theirs (FEEDBACK55.md, Q-796; branch feedback55).
+    /// What it announced while answering another service's call goes back with that answer, and
+    /// a write makes the request's reads go to the primary, after `parallel` as in it (found in
+    /// review).
+    fn back(&mut self) -> Back {
+        Back {
+            cookies: std::mem::take(&mut self.set_cookies),
+            session: self.session.take(),
+            visitor_read: self.visitor_read,
+            read_request: self.read_request,
+            published: self.published.take(),
+            wrote_req: self.wrote_req,
+        }
+    }
+
+    fn take_back(&mut self, b: Back) {
+        self.visitor_read |= b.visitor_read;
+        self.read_request |= b.read_request;
+        if let Some(p) = b.published {
+            self.note_published(p);
+        }
+        if b.wrote_req.is_some() {
+            self.wrote_req = b.wrote_req;
+        }
+        if !b.cookies.is_empty() || self.session.is_none() {
+            crate::session::take_back(self, b.cookies, b.session);
+        }
     }
 
     /// A handle for a `parallel` task: the program, and what the caller may
@@ -2011,6 +2118,13 @@ impl Interp {
         it.changed = self.changed.clone();
         it.upload_body = self.upload_body.clone();
         it.locale = self.locale.clone();
+        // The session as the request has it now: one it set before is the one a function reads
+        // (FEEDBACK55.md, Q-796; branch feedback55). What it announces for a calling service is
+        // gathered as the request's is, and a write the request made before sends its reads to
+        // the primary (found in review).
+        it.session = self.session.clone();
+        it.published = self.published.as_ref().map(|_| Vec::new());
+        it.wrote_req = self.wrote_req;
         it
     }
 
@@ -2989,7 +3103,22 @@ impl Interp {
             // feedback55).
             return fail(line, crate::httpd::over_compute());
         }
+        // Another function of its `parallel` failed (FEEDBACK55.md, Q-804; branch feedback55).
+        if self.stop.is_some() {
+            return self.stopped_here(line);
+        }
         Ok(())
+    }
+
+    /// In a `parallel` function: stopped, once another has failed (see `Stop`). Out of the way of
+    /// every other step, which a check in place slowed by a tenth.
+    #[cold]
+    #[inline(never)]
+    fn stopped_here(&self, line: u32) -> Result<(), Ctrl> {
+        match &self.stop {
+            Some(s) if s.stopped() => fail(line, PARALLEL_STOPPED),
+            _ => Ok(()),
+        }
     }
 
     /// `s[n]`: a character, from the end when negative. A long text is indexed once
@@ -3774,6 +3903,11 @@ impl Interp {
                 }
                 if self.writes_noted() && CHANGES.contains(name) {
                     self.no_writes(name, line)?;
+                }
+                // Another function of its `parallel` failed: not a write more (FEEDBACK55.md,
+                // Q-804; branch feedback55).
+                if self.stop.is_some() {
+                    self.stopped_here(line)?;
                 }
                 if !self.tracks.is_empty() && crate::viewcache::impure_builtin(name) {
                     self.mark_impure();

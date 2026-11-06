@@ -1841,6 +1841,30 @@ struct Checker {
     /// `url_fixed`), as `sql_vars` is kept, and the next one's.
     url_vars: Vec<(usize, String, bool)>,
     next_url: bool,
+    /// The ticks (`true`) and jobs the top level adds, by name, with where and on what path
+    /// (FEEDBACK55.md, Q-803; branch feedback55).
+    job_names: HashMap<(bool, String), Vec<(Arc<str>, u32, Vec<Step>)>>,
+    /// The branches (of an `if` or a `match`) and loops the code being checked is in, outermost
+    /// first, and the last branch point's number (see `jobs_as_started`; found in review).
+    path: Vec<Step>,
+    branches: u32,
+}
+
+/// Where code is, for whether two of its calls can both run (see `Checker::path`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Step {
+    /// Arm `.1` of branch point `.0`.
+    Arm(u32, u32),
+    Loop,
+}
+
+/// Whether code on path `a` and code on path `b` can both run in one go: unless they part in two
+/// arms of one branch point.
+fn both_run(a: &[Step], b: &[Step]) -> bool {
+    match a.iter().zip(b).find(|(x, y)| x != y) {
+        Some((Step::Arm(i, _), Step::Arm(j, _))) => i != j,
+        _ => true,
+    }
 }
 
 /// What a variable holds, as far as SQL goes.
@@ -1941,7 +1965,23 @@ impl Checker {
             next_sql: SqlVar::Other,
             url_vars: Vec::new(),
             next_url: false,
+            job_names: HashMap::new(),
+            path: Vec::new(),
+            branches: 0,
         }
+    }
+
+    /// `f` checked in arm `arm` of branch point `at`, or in a loop's body.
+    fn on_path<R>(&mut self, step: Step, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.path.push(step);
+        let r = f(self);
+        self.path.pop();
+        r
+    }
+
+    fn branch_point(&mut self) -> u32 {
+        self.branches += 1;
+        self.branches
     }
 
     fn finish(mut self) -> Analysis {
@@ -4286,6 +4326,8 @@ impl Checker {
                 self.upload_named_by_visitor(callee, args);
                 self.interim_status(callee, args);
                 self.cookie_options(callee, args);
+                self.jobs_as_started(callee, args);
+                self.topics_written(callee, args);
                 if let Expr::Field(o, f, _) = callee.as_ref() {
                     if let Expr::Ident(s, _) = o.as_ref() {
                         if self.sites.contains(s.as_str()) && !self.is_local(s) {
@@ -4396,11 +4438,12 @@ impl Checker {
                 self.facts(c, true, &mut yes);
                 self.facts(c, false, &mut no);
                 self.block_kind = matches!(&**a, Expr::Block(_)).then_some("if");
-                let x = self.under(yes, |s| s.expr(a));
+                let at = self.branch_point();
+                let x = self.on_path(Step::Arm(at, 0), |s| s.under(yes, |s| s.expr(a)));
                 let y = match b {
                     Some(b) => {
                         self.block_kind = matches!(&**b, Expr::Block(_)).then_some("if");
-                        self.under(no, |s| s.expr(b))
+                        self.on_path(Step::Arm(at, 1), |s| s.under(no, |s| s.expr(b)))
                     }
                     None => T::of(NIL),
                 };
@@ -4418,7 +4461,8 @@ impl Checker {
                 // after it that never match (FEEDBACK45.md, Q-527).
                 let mut taken: Option<u32> = None;
                 let mut seen_lits: Vec<String> = Vec::new();
-                for arm in arms {
+                let at = self.branch_point();
+                for (n, arm) in arms.iter().enumerate() {
                     self.line = arm.line;
                     if let Some(at) = taken {
                         self.warn(format!("this arm never matches: the one on line {} takes any value", at));
@@ -4449,7 +4493,7 @@ impl Checker {
                     if let Some(g) = &arm.guard {
                         self.expr(g);
                     }
-                    t = t.union(self.expr(&arm.body));
+                    t = t.union(self.on_path(Step::Arm(at, n as u32), |s| s.expr(&arm.body)));
                     // `intt => ...`: a name, which takes any value, and goes unused; written for
                     // a type, most likely (FEEDBACK45.md, Q-504).
                     if let Pattern::Bind(n) = &arm.pat {
@@ -4484,7 +4528,7 @@ impl Checker {
                     self.define(&n, bt, sig, Kind::Bound);
                 }
                 self.block_kind = matches!(&**body, Expr::Block(_)).then_some("for");
-                self.expr(body);
+                self.on_path(Step::Loop, |s| s.expr(body));
                 self.pop();
                 T::of(LIST)
             }
@@ -4522,7 +4566,7 @@ impl Checker {
                 let mut yes = Vec::new();
                 self.facts(c, true, &mut yes);
                 self.block_kind = matches!(&**body, Expr::Block(_)).then_some("while");
-                self.under(yes, |s| s.expr(body));
+                self.on_path(Step::Loop, |s| s.under(yes, |s| s.expr(body)));
                 // It leaves only by a `return`: nothing comes after it (FEEDBACK25.md,
                 // Q-322; branch feedback26-fixes).
                 if matches!(&**c, Expr::Lit(Lit::Bool(true))) {
@@ -4851,6 +4895,120 @@ impl Checker {
                 // A value not written out may be 0, which a deletion's `max_age` may be.
                 let zero = !matches!(v, Expr::Lit(_)) || matches!(v, Expr::Lit(Lit::Int(0) | Lit::Nil));
                 if let Some(why) = crate::session::option_refused(f, k, zero) {
+                    self.error(why);
+                }
+            }
+        }
+    }
+
+    /// `every` and `schedule` read as the program's start reads them: what it refuses is said
+    /// before (`every(0, f)`, a cron field of 60, `@reboot`, a bad `{ name }`, a job's name
+    /// twice), and so is either called in a route or a `server fn`, where what it adds would
+    /// never run (FEEDBACK55.md, Q-803; branch feedback55).
+    fn jobs_as_started(&mut self, callee: &Expr, args: &[Expr]) {
+        use crate::value::Value;
+        let f = match callee {
+            Expr::Ident(n, _) if n == "every" || n == "schedule" => n.as_str(),
+            _ => return,
+        };
+        if self.quiet_mode() || self.is_local(f) || !self.globals.get(f).is_some_and(|v| &*v.file == "<builtin>") {
+            return;
+        }
+        let every = f == "every";
+        // A component's `every` is the browser's.
+        if every && self.in_component().is_some() {
+            return;
+        }
+        let outer = self.fns.first().map(|c| c.name.clone());
+        if let Some(name) = outer {
+            // A route's frame is named for its method and path; a `server fn` by its name.
+            if name.contains(' ') || self.bodies.get(&name).is_some_and(|d| d.server) {
+                self.error(crate::jobs::not_at_top(f));
+            }
+        }
+        let lit = |e: &Expr| -> Option<Value> {
+            Some(match e {
+                Expr::Lit(Lit::Int(n)) => Value::Int(*n),
+                Expr::Lit(Lit::Float(x)) => Value::Float(*x),
+                Expr::Lit(Lit::Str(s)) => Value::Str(s.clone()),
+                Expr::Lit(Lit::Bool(b)) => Value::Bool(*b),
+                Expr::Lit(Lit::Nil) => Value::Nil,
+                Expr::Unary(UnOp::Neg, x, _) => match &**x {
+                    Expr::Lit(Lit::Int(n)) => Value::Int(n.wrapping_neg()),
+                    Expr::Lit(Lit::Float(x)) => Value::Float(-x),
+                    _ => return None,
+                },
+                _ => return None,
+            })
+        };
+        if let Some(v) = args.first().and_then(lit) {
+            let refused = if every { crate::jobs::every_ms(&v).err() } else { crate::jobs::when_of(&v).err() };
+            if let Some(why) = refused {
+                self.error(why);
+            }
+        }
+        // The options, when what they hold is written out.
+        let named = match args.get(2) {
+            None => Ok(None),
+            Some(Expr::Map(entries)) => match entries.iter().find(|(k, _)| k == "name") {
+                None => Ok(None),
+                Some((_, v)) => match lit(v) {
+                    Some(v) => crate::jobs::name_opt(f, Some(&Value::map([("name".into(), v)].into_iter().collect()))),
+                    None => return,
+                },
+            },
+            // `null`, or what the types' check says of.
+            Some(Expr::Lit(Lit::Nil)) => Ok(None),
+            Some(_) => return,
+        };
+        let named = match named {
+            Ok(n) => n,
+            Err(why) => return self.error(why),
+        };
+        let name = match (named, args.get(1)) {
+            (Some(n), _) => n,
+            // Named after its function, as the start names it.
+            (None, Some(Expr::Ident(n, _))) if !self.is_local(n) => match self.bodies.get(n.as_str()) {
+                Some(d) if crate::jobs::name_ok(&d.name) => d.name.clone(),
+                Some(_) => format!("{}-{}", if every { "every" } else { "job" }, self.line),
+                None => return,
+            },
+            (None, Some(Expr::Lambda(_))) => format!("{}-{}", if every { "every" } else { "job" }, self.line),
+            _ => return,
+        };
+        if let Some(why) = crate::jobs::name_problem(f, &name) {
+            return self.error(why);
+        }
+        // Twice as the top level runs, which the start refuses: two calls that can both run in
+        // one start (not in two arms of one `if` or `match`), or one in a loop, which can add it
+        // again the next round (found in review).
+        if self.fns.is_empty() {
+            let (file, line, path) = (self.file.clone(), self.line, self.path.clone());
+            let in_loop = path.contains(&Step::Loop);
+            let seen = self.job_names.entry((every, name.clone())).or_default();
+            let twice = in_loop || seen.iter().any(|(f, l, p)| (f, *l) != (&file, line) && both_run(p, &path));
+            if !seen.iter().any(|(f, l, _)| (f, *l) == (&file, line)) {
+                seen.push((file, line, path));
+            }
+            if twice {
+                self.error(crate::jobs::named_twice(f, &name));
+            }
+        }
+    }
+
+    /// `watch("")`, or a topic past the longest, written out: refused as it runs (FEEDBACK55.md,
+    /// Q-801; branch feedback55).
+    fn topics_written(&mut self, callee: &Expr, args: &[Expr]) {
+        let f = match callee {
+            Expr::Ident(n, _) if n == "watch" || n == "publish" => n.as_str(),
+            _ => return,
+        };
+        if self.quiet_mode() || self.is_local(f) || !self.globals.get(f).is_some_and(|v| &*v.file == "<builtin>") {
+            return;
+        }
+        for a in args {
+            if let Expr::Lit(Lit::Str(t)) = a {
+                if let Some(why) = crate::shared::topic_problem(f, t) {
                     self.error(why);
                 }
             }

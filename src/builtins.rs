@@ -1021,21 +1021,61 @@ fn sleep(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
     let retired = it.retired.clone();
     let in_job = it.in_job;
-    let ended = it.unlocked(move || loop {
-        let left = until.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            return None;
-        }
+    // A `parallel` function ends its sleep once another has failed (FEEDBACK55.md, Q-804; branch
+    // feedback55).
+    let stop = it.stop.clone();
+    let slice = std::time::Duration::from_millis(if stop.is_some() { 20 } else { 50 });
+    let why = move || {
         if in_job && crate::httpd::stopping() {
             return Some("the server is stopping");
         }
         if in_job && retired.load(std::sync::atomic::Ordering::Relaxed) {
             return Some("the program was loaded again");
         }
-        std::thread::sleep(left.min(std::time::Duration::from_millis(50)));
-    });
+        if stop.as_ref().is_some_and(|s| s.stopped()) {
+            return Some(crate::interp::PARALLEL_STOPPED);
+        }
+        None
+    };
+    let sliced = in_job || it.stop.is_some();
+    // A request waits on a timer, which wakes it: it held one of the threads that wait for
+    // requests for the whole sleep, and 65 sleeping in a stream's loop held up every other
+    // request that waited for anything (FEEDBACK55.md, Q-802; branch feedback55). A sleep of a
+    // few milliseconds waits on a thread as before: the timer's are whole milliseconds, rounded
+    // up, and `sleep(1)` took 2.5 ms (found in review).
+    let timed = if it.sqlite_tx == 0 && ms >= SHORT_SLEEP_MS {
+        let why = why.clone();
+        crate::httpd::await_elsewhere(Box::pin(async move {
+            loop {
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return None;
+                }
+                if let Some(w) = why() {
+                    return Some(w);
+                }
+                tokio::time::sleep(if sliced { left.min(slice) } else { left }).await;
+            }
+        }))
+    } else {
+        None
+    };
+    let ended = match timed {
+        Some(r) => r.unwrap_or(None),
+        None => it.unlocked(move || loop {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            if let Some(w) = why() {
+                return Some(w);
+            }
+            std::thread::sleep(left.min(slice));
+        }),
+    };
     match ended {
         None => Ok(Value::Nil),
+        Some(why) if why == crate::interp::PARALLEL_STOPPED => fail(line, why),
         Some(why) => Err(Ctrl::Reply(Arc::new(Response {
             status: 503,
             headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
@@ -1043,6 +1083,9 @@ fn sleep(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }))),
     }
 }
+
+/// Sleeps shorter than this wait on a thread, for their accuracy (see `sleep`).
+const SHORT_SLEEP_MS: u64 = 5;
 
 fn short_type(v: &Value) -> &'static str {
     v.type_name()
@@ -3600,16 +3643,20 @@ fn style_noop(it: &mut Interp, args: Vec<Value>, _: u32) -> R {
 }
 
 fn every(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    // At the top of a program (no request in hand), it runs on the server: a
-    // tick (FEEDBACK12.md, Q-080; branch feedback12-fixes). Met while a page is
-    // made, it is the component's, which runs in the browser.
-    if it.current_request.is_none() && it.pending_request.is_none() && !it.in_component {
-        return crate::jobs::every_at_top(it, &args, line);
+    // Met while a page is made, it is the component's, which runs in the browser.
+    if it.in_component {
+        return match (args.first(), args.get(1)) {
+            (Some(Value::Int(_) | Value::Float(_)), Some(Value::Func(_) | Value::Builtin(..))) => Ok(Value::Nil),
+            _ => fail(line, "`every` takes milliseconds and a function: every(100, step)"),
+        };
     }
-    match (args.first(), args.get(1)) {
-        (Some(Value::Int(_) | Value::Float(_)), Some(Value::Func(_) | Value::Builtin(..))) => Ok(Value::Nil),
-        _ => fail(line, "`every` takes milliseconds and a function: every(100, step)"),
+    // At the top of a program, as it starts, it runs on the server: a tick (FEEDBACK12.md, Q-080;
+    // branch feedback12-fixes). Anywhere else (a route, a job, a tick) it said yes and never ran
+    // (FEEDBACK55.md, Q-803; branch feedback55).
+    if !crate::value::loading() || it.current_request.is_some() || it.pending_request.is_some() {
+        return fail(line, crate::jobs::not_at_top("every"));
     }
+    crate::jobs::every_at_top(it, &args, line)
 }
 
 /// `js("Chart", ...)` and `js_new(...)` in a component call the page's
@@ -3638,17 +3685,32 @@ fn parallel(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 /// `publish("topic", ...)`: wakes pages whose `live` data watched the topic.
-fn publish(it: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    it.publish(args.iter().map(|a| a.display()).collect());
+fn publish(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let topics = topics_arg("publish", &args, line)?;
+    it.publish(topics);
     Ok(Value::Nil)
 }
 
 /// `watch("topic", ...)`: inside a `live` loader, also refresh on `publish("topic")`.
-fn watch(it: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    for a in &args {
-        it.watch(a.display());
+fn watch(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    for t in topics_arg("watch", &args, line)? {
+        it.watch(t);
     }
     Ok(Value::Nil)
+}
+
+/// The topics `publish` and `watch` are given, each a name a page can follow (FEEDBACK55.md,
+/// Q-801; branch feedback55).
+fn topics_arg(f: &str, args: &[Value], line: u32) -> Result<Vec<String>, Ctrl> {
+    let mut out = Vec::with_capacity(args.len());
+    for a in args {
+        let t = a.display();
+        if let Some(why) = crate::shared::topic_problem(f, &t) {
+            return fail(line, why);
+        }
+        out.push(t);
+    }
+    Ok(out)
 }
 
 /// `unwatched(f)`: calls `f`; what it reads (tables, globals, `watch`es)

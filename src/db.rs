@@ -1382,8 +1382,19 @@ fn tx_begin(it: &mut Interp) -> usize {
 /// once the outermost transaction commits.
 fn tx_end(it: &mut Interp, mark: usize, committed: bool) {
     if !committed {
-        it.pending.truncate(mark);
-        it.pending_raw.truncate(mark);
+        // A global keeps what the transaction gave it, so its announcement stays, made when the
+        // outermost one ends: pages showed the old value for good (FEEDBACK55.md, Q-797; branch
+        // feedback55).
+        let mut kept = mark;
+        for i in mark..it.pending.len() {
+            if it.pending_raw[i].starts_with("var:") {
+                it.pending.swap(kept, i);
+                it.pending_raw.swap(kept, i);
+                kept += 1;
+            }
+        }
+        it.pending.truncate(kept);
+        it.pending_raw.truncate(kept);
     }
     it.tx_depth -= 1;
     if it.tx_depth == 0 {

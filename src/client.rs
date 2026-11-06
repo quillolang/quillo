@@ -1052,6 +1052,31 @@ pub fn test_script(it: &Interp, name: &str) -> Result<String, QuilloError> {
     Ok(assemble("(async function () {", &program, "})();"))
 }
 
+/// `code` with each wait's mark made the claims taken before it: on each state the function sets
+/// after that wait, as written. Taken there, on the way that waits, not as the function begins:
+/// a scroll handler that only loads now and then took the load's states from the one loading, and
+/// the feed stopped (found in review of FEEDBACK55.md, Q-800; branch feedback55).
+fn claimed(ctx: &FnCtx, code: String) -> String {
+    if !code.contains('\u{1}') {
+        return code;
+    }
+    let mut out = code;
+    for (i, m) in ctx.marks.iter().enumerate() {
+        let Mark::Wait(n) = m else { continue };
+        let mut states: Vec<usize> = Vec::new();
+        for later in &ctx.marks[i + 1..] {
+            if let Mark::Set(at) = later {
+                if !states.contains(at) {
+                    states.push(*at);
+                }
+            }
+        }
+        let claims: String = states.iter().map(|&at| format!("{} = W.claim({}), ", ctx.claims[at].1, ctx.claims[at].0)).collect();
+        out = out.replace(&wait_mark(*n), &claims);
+    }
+    out
+}
+
 /// The parts of the runtime `program` needs, then the program, minified.
 fn assemble(open: &str, program: &str, close: &str) -> String {
     let rt = runtime_units();
@@ -1407,6 +1432,22 @@ struct FnCtx {
     /// The function written in an `@event` or `@mount` attribute itself, not
     /// one inside it: a Promise its `js(...)` gives is waited for here.
     waits_js: bool,
+    /// In a function that waits: the states it sets, each with the temp holding the claim it takes
+    /// on that state, and its waits and sets in the order written (see `Stmt::Assign` and
+    /// `claimed`; FEEDBACK55.md, Q-800; branch feedback55).
+    claims: Vec<(String, String)>,
+    marks: Vec<Mark>,
+}
+
+/// A wait (its number) or a set of a state (its claim's temp), in a function that waits.
+enum Mark {
+    Wait(usize),
+    Set(usize),
+}
+
+/// What stands for the claims taken before wait `n`, until the function is compiled (`claimed`).
+fn wait_mark(n: usize) -> String {
+    format!("\u{1}C{}\u{1}", n)
 }
 
 enum Resolved {
@@ -2394,7 +2435,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn new_ctx(&mut self, component: Option<String>, is_async: bool) {
-        self.ctxs.push(FnCtx { scopes: vec![HashMap::new()], temps: 0, is_async, needs_async: false, component, view: false, hoisted: false, state_init: false, waits_js: false });
+        self.ctxs.push(FnCtx { scopes: vec![HashMap::new()], temps: 0, is_async, needs_async: false, component, view: false, hoisted: false, state_init: false, waits_js: false, claims: Vec::new(), marks: Vec::new() });
     }
 
     fn temps_decl(n: usize) -> String {
@@ -2498,6 +2539,7 @@ impl<'a> Compiler<'a> {
         for t in def.ret.iter().chain(def.err.iter()) {
             self.need_types_in(t)?;
         }
+        let body = claimed(&ctx, body);
         let run = if leaves_early(&def.body) {
             format!(
                 "{}try {{\n{}}} catch ($e) {{ if ($e instanceof W.Ret) return $e.v; throw $e; }}\n",
@@ -2873,8 +2915,30 @@ impl<'a> Compiler<'a> {
                         AssignOp::Sub => format!("W.sub({}, {})", cur, rhs),
                     };
                     match target {
+                        // The latest set of a state wins: every set claims its state, and a
+                        // function that waits claims, before each wait, the states it sets after
+                        // it (see `claimed`), whose sets land only while no set made since
+                        // (another call's, a plain one) has claimed them. Answers were shown in
+                        // the order they came, so typing "abcd" ended on "a"'s, and clearing the
+                        // field showed the answer still on its way (FEEDBACK55.md, Q-800; branch
+                        // feedback55).
+                        Resolved::State(js) if self.ctx().is_async => {
+                            let at = match self.ctx().claims.iter().position(|(s, _)| *s == js) {
+                                Some(i) => i,
+                                None => {
+                                    let c = self.temp();
+                                    self.ctx().claims.push((js.clone(), c));
+                                    self.ctx().claims.len() - 1
+                                }
+                            };
+                            self.ctx().marks.push(Mark::Set(at));
+                            let c = self.ctx().claims[at].1.clone();
+                            // Before any wait it is a set as any other; after one, its claim's.
+                            // The claim is read after the value, which may take it.
+                            let _ = writeln!(body, "W.to({js}, {v}, {c});");
+                        }
                         Resolved::State(js) => {
-                            let _ = writeln!(body, "{}.set({});", js, v);
+                            let _ = writeln!(body, "W.put({}, {});", js, v);
                         }
                         _ => {
                             let _ = writeln!(body, "{} = {};", cur, v);
@@ -2933,7 +2997,7 @@ impl<'a> Compiler<'a> {
                     let mut init_ctx = self.ctxs.pop().unwrap();
                     let mut init = first?;
                     if init_ctx.needs_async {
-                        self.ctxs.push(FnCtx { scopes: outer.clone(), temps: 0, is_async: true, needs_async: false, component: None, view: false, hoisted: false, state_init: true, waits_js: false });
+                        self.ctxs.push(FnCtx { scopes: outer.clone(), temps: 0, is_async: true, needs_async: false, component: None, view: false, hoisted: false, state_init: true, waits_js: false, claims: Vec::new(), marks: Vec::new() });
                         self.ctxs.last_mut().unwrap().scopes.push(HashMap::new());
                         let again = self.expr(e);
                         init_ctx = self.ctxs.pop().unwrap();
@@ -2945,6 +3009,7 @@ impl<'a> Compiler<'a> {
                     // browser when the component is resumed (FEEDBACK18.md,
                     // Q-105; branch feedback18-fixes).
                     let page = ["B.js(", "B.js_new(", "B.js_value("].iter().any(|f| init.contains(f));
+                    let init = claimed(&init_ctx, init);
                     let _ = writeln!(
                         body,
                         "const {} = $i.sig({}, {}() => {{ {}return {}; }}{});",
@@ -3419,7 +3484,10 @@ impl<'a> Compiler<'a> {
         let c = self.ctx();
         c.needs_async = true;
         if c.is_async {
-            format!("(await {})", call)
+            // The claims on what is set after this wait, taken before it (see `claimed`).
+            let n = c.marks.len();
+            c.marks.push(Mark::Wait(n));
+            format!("({}await {})", wait_mark(n), call)
         } else {
             call
         }
@@ -4411,8 +4479,9 @@ impl<'a> Compiler<'a> {
                 let (get, set) = match self.resolve(var)? {
                     // Another field's or a select's text, as the state's own type: a number back
                     // for a number state (FEEDBACK55.md, Q-760; branch feedback55).
-                    Resolved::State(js) if field == "value" && !number && !el.tag.contains('-') => (format!("() => {}.v", js), format!("{}.set(W.typed({}, {}))", js, js, read)),
-                    Resolved::State(js) => (format!("() => {}.v", js), format!("{}.set({})", js, read)),
+                    // A set as any other: it claims the state (FEEDBACK55.md, Q-800).
+                    Resolved::State(js) if field == "value" && !number && !el.tag.contains('-') => (format!("() => {}.v", js), format!("W.put({}, W.typed({}, {}))", js, js, read)),
+                    Resolved::State(js) => (format!("() => {}.v", js), format!("W.put({}, {})", js, read)),
                     Resolved::Local(js, _) => (js.clone(), format!("({} = {})", js, read)),
                     _ => return self.err(format!("`bind:{}` needs component state, like `state {}`", prop, var)),
                 };

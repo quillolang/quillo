@@ -329,6 +329,22 @@ fn queue(it: &mut Interp, line: String) {
     it.set_cookies.push(line);
 }
 
+/// What a `parallel` function queued, taken by the request it ran for (the functions in their
+/// order): its cookies, each replacing one of its name, path and domain as `queue` does, and the
+/// session, when it set one or the request has not read it yet (FEEDBACK55.md, Q-796; branch
+/// feedback55).
+pub(crate) fn take_back(it: &mut Interp, cookies: Vec<String>, session: Option<Value>) {
+    let name = cookie_name(it);
+    let mut set = false;
+    for c in cookies {
+        set |= cookie_key(&c).0 == name;
+        queue(it, c);
+    }
+    if session.is_some() && (set || it.session.is_none()) {
+        it.session = session;
+    }
+}
+
 /// A `Set-Cookie` line's name, path and domain (lower case, without a leading `.`), which a
 /// browser keeps it by (FEEDBACK55.md, Q-714; branch feedback55).
 fn cookie_key(line: &str) -> (&str, &str, String) {

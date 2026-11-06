@@ -9566,3 +9566,1198 @@ fn unique_keeps_what_equality_keeps_at_every_edge() {
 // ---- end of slice 10's review ----
 
 // ---- end of slice 10 ----
+
+// ---- slice 7 ----
+// Concurrency, live data, jobs and channels (FEEDBACK55.md, Q-796 to Q-806; branch feedback55).
+
+/// A test's folder, taken away once the test has passed.
+struct S7Dir(PathBuf);
+
+impl Drop for S7Dir {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+impl std::ops::Deref for S7Dir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// `src` as a program's main file, after `quillo check` passed it, in a folder of its own.
+fn s7_dir(name: &str, src: &str) -> S7Dir {
+    let d = S7Dir(support::temp_dir(&format!("feedback55-s7-{}", name)));
+    std::fs::write(d.join("main.qwe"), src).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo")).arg("check").arg(d.join("main.qwe")).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the check did not end");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let o = child.wait_with_output().unwrap();
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    d
+}
+
+/// What `quillo check` says of `src`, in a folder taken away after.
+fn s7_check(name: &str, src: &str) -> (bool, String) {
+    let d = S7Dir(support::temp_dir(&format!("feedback55-s7-check-{}", name)));
+    std::fs::write(d.join("main.qwe"), src).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo")).arg("check").arg(d.join("main.qwe")).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the check did not end");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let o = child.wait_with_output().unwrap();
+    (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr))
+}
+
+/// `f` until it gives something, for `secs` at most.
+fn s7_until<T>(secs: u64, what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        if let Some(v) = f() {
+            return v;
+        }
+        assert!(std::time::Instant::now() < deadline, "{}", what);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// The `Set-Cookie` lines of an answer, each up to its first `;` (name and value).
+fn s7_cookies(a: &support::Answer) -> Vec<String> {
+    a.headers.iter().filter(|(k, _)| k == "set-cookie").map(|(_, v)| v.split(';').next().unwrap_or("").to_string()).collect()
+}
+
+/// A page's WebSocket, by hand (`/_quillo/wt` for channels, `/_quillo/live` for live data).
+struct S7Ws(std::net::TcpStream);
+
+impl S7Ws {
+    fn open(port: u16, path: &str) -> S7Ws {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(30))).unwrap();
+        write!(s, "GET {} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", path).unwrap();
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            s.read_exact(&mut b).unwrap();
+            head.push(b[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&head));
+        S7Ws(s)
+    }
+
+    /// A page connected for channels, with its ticket.
+    fn channels(port: u16) -> S7Ws {
+        let t: serde_json::Value = serde_json::from_str(&support::send(port, "POST", "/_quillo/wt-ticket", &[], "").body).unwrap();
+        S7Ws::open(port, &format!("/_quillo/wt?t={}", t["ticket"].as_str().unwrap()))
+    }
+
+    fn text(&mut self, t: &str) {
+        self.try_text(t).unwrap();
+    }
+
+    /// `text`, to a server that may close the connection before it is all written.
+    fn try_text(&mut self, t: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let data = t.as_bytes();
+        let mut f = vec![0x81];
+        if data.len() < 126 {
+            f.push(0x80 | data.len() as u8);
+        } else if data.len() <= 0xffff {
+            f.push(0x80 | 126);
+            f.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        } else {
+            f.push(0x80 | 127);
+            f.extend_from_slice(&(data.len() as u64).to_be_bytes());
+        }
+        let mask = [7, 1, 3, 9];
+        f.extend_from_slice(&mask);
+        f.extend(data.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        self.0.write_all(&f)
+    }
+
+    /// The next text message (pings and pongs passed over); None once the connection ends.
+    fn read(&mut self) -> Option<String> {
+        use std::io::Read;
+        loop {
+            let mut h = [0u8; 2];
+            self.0.read_exact(&mut h).ok()?;
+            let mut n = (h[1] & 0x7f) as u64;
+            if n == 126 {
+                let mut l = [0u8; 2];
+                self.0.read_exact(&mut l).ok()?;
+                n = u16::from_be_bytes(l) as u64;
+            } else if n == 127 {
+                let mut l = [0u8; 8];
+                self.0.read_exact(&mut l).ok()?;
+                n = u64::from_be_bytes(l);
+            }
+            let mut data = vec![0u8; n as usize];
+            self.0.read_exact(&mut data).ok()?;
+            match h[0] & 0x0f {
+                1 => return Some(String::from_utf8(data).unwrap()),
+                8 => return None,
+                _ => {}
+            }
+        }
+    }
+
+    fn close(mut self) {
+        use std::io::Write;
+        let _ = self.0.write_all(&[0x88, 0x80, 0, 0, 0, 0]);
+    }
+
+    /// Whether the server ends the connection within `secs`, sending nothing first.
+    fn ended_within(&mut self, secs: u64) -> bool {
+        use std::io::Read;
+        // A socket the server has reset takes no timeout (macOS says EINVAL).
+        if self.0.set_read_timeout(Some(std::time::Duration::from_secs(secs))).is_err() {
+            return true;
+        }
+        let mut b = [0u8; 1];
+        match self.0.read(&mut b) {
+            Ok(0) => true,
+            Err(e) => matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe),
+            Ok(_) => false,
+        }
+    }
+}
+
+// Q-796: `set_cookie`, `set_session` and `end_session` in a `parallel` function were dropped, each
+// function having a handle on the program of its own: a logout in one left the visitor signed in.
+// What each queued is the answer's, in the functions' order (as if they ran one after another), a
+// function reads the session as the request has it then, and one that read who the visitor is
+// makes the answer theirs (`Cache-Control: private`). The edges: one function (run as it is), two
+// of one name, `parallel` inside `parallel`, none set, a session in unicode.
+const S7_COOKIES: &str = r#"fn crumbs() {
+    set_cookie("deep", "1")
+    2
+}
+route GET /c = { parallel(() => set_cookie("a", "1"), () => set_cookie("b", "2")); "ok" }
+route GET /same = { parallel(() => set_cookie("a", "1"), () => set_cookie("a", "2")); "ok" }
+route GET /s = { parallel(() => set_session({ name: "Zoë 😀" }), () => 2); "ok" }
+route GET /e = { parallel(() => end_session(), () => 2); "ok" }
+route GET /one = { parallel(() => set_cookie("solo", "1")); "ok" }
+route GET /seen = { set_session({ name: "before" }); let [a, b] = parallel(() => session().name, () => 2); a }
+route GET /nested = { parallel(() => parallel(crumbs, () => 1), () => 2); "ok" }
+route GET /who = { let [n, x] = parallel(() => session().name ?? "nobody", () => 2); n }
+route GET /plain = { let [a, b] = parallel(() => 1, () => 2); a + b }
+"#;
+
+fn s7_cookie_answers(get: &mut dyn FnMut(&str, &[(&str, &str)]) -> support::Answer) {
+    assert_eq!(s7_cookies(&get("/c", &[])), ["a=1", "b=2"]);
+    assert_eq!(s7_cookies(&get("/same", &[])), ["a=2"]);
+    assert_eq!(s7_cookies(&get("/one", &[])), ["solo=1"]);
+    assert_eq!(s7_cookies(&get("/nested", &[])), ["deep=1"]);
+    let plain = get("/plain", &[]);
+    assert_eq!((plain.body.as_str(), s7_cookies(&plain).len(), plain.header("cache-control")), ("3", 0, None));
+    // The session a function set is the visitor's, and reads back.
+    // `__Host-` unless a test in this process runs as over plain HTTP.
+    let session = |c: &str| c.trim_start_matches("__Host-").starts_with("quillo_session=");
+    let s = get("/s", &[]);
+    let set = s7_cookies(&s);
+    assert!(set.len() == 1 && session(&set[0]) && !set[0].ends_with('='), "{:?}", set);
+    let who = get("/who", &[("Cookie", &set[0])]);
+    assert_eq!((who.body.as_str(), who.header("cache-control")), ("Zoë 😀", Some("private")));
+    // Read in a function only, it still makes the answer the visitor's.
+    let nobody = get("/who", &[]);
+    assert_eq!((nobody.body.as_str(), nobody.header("cache-control")), ("nobody", Some("private")));
+    // A logout in a function logs out.
+    let e = get("/e", &[("Cookie", &set[0])]);
+    let ended: Vec<&str> = e.headers.iter().filter(|(k, _)| k == "set-cookie").map(|(_, v)| v.as_str()).collect();
+    assert!(ended.len() == 1 && session(ended[0]) && ended[0].contains("_session=;") && ended[0].contains("Max-Age=0"), "{:?}", ended);
+    // What the request set before is what a function reads.
+    let seen = get("/seen", &[]);
+    assert_eq!((seen.body.as_str(), s7_cookies(&seen).len()), ("before", 1));
+}
+
+#[test]
+fn cookies_and_the_session_a_parallel_function_sets_go_with_the_answer() {
+    let d = s7_dir("q796", S7_COOKIES);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    s7_cookie_answers(&mut |path, h| support::send(s.port, "GET", path, h, ""));
+}
+
+// The same where `parallel` runs its functions on threads (no event loop: a request handled in
+// the process, a script), not as coroutines.
+#[test]
+fn a_parallel_function_on_a_thread_hands_back_its_cookies_too() {
+    let d = S7Dir(support::temp_dir("feedback55-s7-q796-threads"));
+    let mut it = quillo::Interp::new(&*d);
+    it.load_source(S7_COOKIES, "main.qwe").unwrap();
+    s7_cookie_answers(&mut |path, h| {
+        let mut headers = vec![("Host".to_string(), "localhost".to_string())];
+        headers.extend(h.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let r = it.handle(&quillo::server::HttpRequest { method: "GET".into(), url: path.into(), headers, body: vec![], remote: "127.0.0.1".into() });
+        support::Answer { status: r.status, headers: r.headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.clone())).collect(), body: r.text() }
+    });
+}
+
+// Q-804: the guide says a failure stops the whole `parallel` call; the others ran to their end and
+// kept what they wrote (500 after 610 ms, both writes kept). Now they stop at their next step (a
+// call, a loop's round, a builtin, a `sleep`, which ends at once), on the event loop and on
+// threads. The call's failure is the one that happened, not a stop. The edges: an error value is a
+// result and stops nothing, `parallel` inside `parallel` is stopped too, two failing.
+const S7_STOPS: &str = r#"db.open(":memory:")
+db.exec("create table w (k int)")
+let rounds = 0
+fn slow(ms: int, k: int) {
+    sleep(ms)
+    db.exec("insert into w (k) values (?)", k)
+    k
+}
+fn spin() {
+    for i in 0..100000000 {
+        rounds += 1
+        sleep(1)
+    }
+}
+fn boom() {
+    sleep(30)
+    int("x") + 1
+}
+route GET /p = parallel(() => slow(3000, 1), () => boom(), () => slow(6000, 2))
+route GET /loop = parallel(() => spin(), () => boom())
+route GET /err = { let [a, b] = parallel(() => err("an error value"), () => slow(10, 3)); is_err(a) }
+route GET /first = parallel(() => { sleep(3000); int("first") + 1 }, () => int("second") + 1)
+route GET /inner = parallel(() => parallel(() => slow(3000, 4), () => 1), () => boom())
+route GET /w = db.query("select k from w order by k") | map((r) => r.k)
+route GET /rounds = rounds
+"#;
+
+#[test]
+fn one_failing_parallel_function_stops_the_others() {
+    let d = s7_dir("q804", S7_STOPS);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let timed = |path: &str| {
+        let t = std::time::Instant::now();
+        let a = support::send(s.port, "GET", path, &[], "");
+        (a.status, t.elapsed())
+    };
+    // The slow ones would take 3 and 6 seconds; they stop as `boom` fails, at 30 ms.
+    for path in ["/p", "/loop", "/inner", "/first"] {
+        let (status, took) = timed(path);
+        assert_eq!(status, 500, "{}", path);
+        assert!(took < std::time::Duration::from_millis(2500), "{} took {:?}", path, took);
+    }
+    // They wrote nothing: when `parallel` gives back, its functions have all ended.
+    assert_eq!(support::send(s.port, "GET", "/w", &[], "").body, "[]");
+    let rounds: u64 = support::send(s.port, "GET", "/rounds", &[], "").body.parse().unwrap();
+    assert!(rounds < 2500, "{}", rounds);
+    // An error value is a result: the others go on.
+    assert_eq!(support::send(s.port, "GET", "/err", &[], "").body, "true");
+    assert_eq!(support::send(s.port, "GET", "/w", &[], "").body, "[3]");
+}
+
+#[test]
+fn a_parallel_call_fails_with_the_failure_not_with_a_stop() {
+    let d = S7Dir(support::temp_dir("feedback55-s7-q804-threads"));
+    let mut it = quillo::Interp::new(&*d);
+    it.load_source(S7_STOPS, "main.qwe").unwrap();
+    // On threads (outside a request) as on the event loop.
+    let t = std::time::Instant::now();
+    let got = ev(&mut it, "parallel(() => slow(3000, 1), () => boom(), () => slow(6000, 2))");
+    assert!(got.starts_with("ERROR: cannot add error and int"), "{}", got);
+    assert!(t.elapsed() < std::time::Duration::from_millis(2500), "{:?}", t.elapsed());
+    assert_eq!(ev(&mut it, "db.query(\"select k from w\") | map((r) => r.k)"), "[]");
+    // The failure that happened; the stopped ones are not the failure. Two failing at once: the
+    // first in order of those that failed before they saw the other's.
+    let got = ev(&mut it, "let n = 1\nparallel(() => { sleep(3000); n.alpha }, () => n.beta)");
+    assert_eq!(got, "ERROR: int has no field `beta`");
+    let got = ev(&mut it, "let n = 1\nparallel(() => n.gamma, () => n.delta)");
+    assert!(got == "ERROR: int has no field `gamma`" || got == "ERROR: int has no field `delta`", "{}", got);
+    // A stop is no error `??` takes: the function does not go on to write.
+    let got = ev(&mut it, "parallel(() => { sleep(3000) ?? 0; db.exec(\"insert into w (k) values (9)\") }, () => boom())");
+    assert!(got.starts_with("ERROR: cannot add error and int"), "{}", got);
+    assert_eq!(ev(&mut it, "db.query(\"select k from w\") | map((r) => r.k)"), "[]");
+    // One function alone, and none failing: as before.
+    assert_eq!(ev(&mut it, "parallel(() => slow(1, 5))"), "[5]");
+    assert_eq!(ev(&mut it, "parallel(() => 1, () => err(\"e\")) | map((v) => is_err(v))"), "[false, true]");
+    assert_eq!(ev(&mut it, "parallel()"), "[]");
+}
+
+// Q-797: a global changed in a transaction that rolled back kept its value, as globals are no part
+// of a transaction, but its announcement was dropped with the rollback: live pages showed the old
+// value for good. A global's announcement now stays, made when the outermost transaction ends,
+// whatever its outcome; a table's still goes with a rollback. The edges: an error value, a run-time
+// error, only an inner level rolled back, a commit (as before), a rollback that changed no global.
+const S7_ROLLBACK: &str = r#"db.open(":memory:")
+db.exec("create table t (id integer primary key, v int)")
+let count = 0
+let other = { a: 0, b: 0 }
+server fn load_count() -> int = count
+route GET /tx = { let _r = db.transaction(() => { count += 1; db.exec("insert into t (v) values (1)"); err("no") }); count }
+route GET /boom = { let _r = db.transaction(() => { count += 1; int("x") }); count }
+route GET /inner = {
+    let _r = db.transaction(() => {
+        db.exec("insert into t (v) values (2)")
+        let _i = db.transaction(() => { other = { ...other, a: other.a + 1 }; err("inner only") })
+        "kept"
+    })
+    other.a
+}
+route GET /ok = { let _r = db.transaction(() => { count += 1; db.exec("insert into t (v) values (3)") }); count }
+route GET /none = { let _r = db.transaction(() => { db.exec("insert into t (v) values (4)"); err("no") }); count }
+route GET /rows = db.one("select count(*) as n from t").n
+"#;
+
+/// The live data's number now, as a page that knows none is told it.
+fn s7_seq(port: u16) -> u64 {
+    let a = support::send(port, "GET", "/_quillo/live?since=0&t=var:count", &[], "");
+    let j: serde_json::Value = serde_json::from_str(&a.body).unwrap_or_else(|e| panic!("{}: {}", e, a.body));
+    j["seq"].as_u64().unwrap()
+}
+
+/// What changed since `since`, of `topics` (the `t` of a live request), waited for at most 20 s.
+fn s7_changed(port: u16, since: u64, topics: &str) -> Vec<String> {
+    let a = support::send(port, "GET", &format!("/_quillo/live?since={}&t={}", since, topics), &[], "");
+    let j: serde_json::Value = serde_json::from_str(&a.body).unwrap_or_else(|e| panic!("{}: {}", e, a.body));
+    j["changed"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn a_global_a_rolled_back_transaction_changed_is_announced() {
+    let d = s7_dir("q797", S7_ROLLBACK);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let get = |path: &str| support::send(s.port, "GET", path, &[], "").body;
+    for (path, topic, value) in [("/tx", "var:count", "1"), ("/boom", "var:count", "2"), ("/inner", "var:other", "1"), ("/ok", "var:count", "3")] {
+        let before = s7_seq(s.port);
+        assert_eq!(get(path), value, "{}", path);
+        assert!(s7_seq(s.port) > before, "{}: nothing announced", path);
+        let changed = s7_changed(s.port, before, &format!("{},db:t", topic));
+        assert!(changed.contains(&topic.to_string()), "{}: {:?}", path, changed);
+        // The table's rows went with the rollback, and so did its announcement; a commit's stays.
+        assert_eq!(changed.contains(&"db:t".to_string()), path == "/ok" || path == "/inner", "{}: {:?}", path, changed);
+    }
+    assert_eq!(get("/rows"), "2");
+    // A rollback that changed no global announces nothing.
+    let before = s7_seq(s.port);
+    assert_eq!(get("/none"), "3");
+    assert_eq!(s7_seq(s.port), before);
+}
+
+// Q-798: a cron job was first seen in the first minute that matched, which then counted as seen,
+// so its first time after a start was skipped: `"2 * * * *"` started at 04:01:06 first ran at
+// 05:02, and a nightly job of a server deployed each day before 03:00 never ran. A job is first
+// seen when the scheduler first looks, whatever the minute. The edges: started in the minute
+// itself (it waits for the next, as the guide says), one second before, a range, a list, daily,
+// an interval, every minute.
+#[test]
+fn a_cron_jobs_first_time_after_a_start_is_kept() {
+    use quillo::jobs::{due, Cron, When};
+    // 2026-11-06, from 00:00 UTC.
+    let at = |h: u64, m: u64, s: u64| 1793923200 + h * 3600 + m * 60 + s;
+    let cron = |c: &str| When::Cron(Cron::parse(c).unwrap());
+    // Each second from `from` to `to`, the times the job ran.
+    let runs = |when: &When, from: u64, to: u64| -> Vec<u64> {
+        let mut last = std::collections::HashMap::new();
+        (from..=to).filter_map(|now| due(&mut last, "j", when, now)).collect()
+    };
+    assert_eq!(runs(&cron("2 * * * *"), at(4, 1, 6), at(5, 2, 30)), [at(4, 2, 0), at(5, 2, 0)]);
+    assert_eq!(runs(&cron("2 4 * * *"), at(4, 1, 6), at(4, 10, 0)), [at(4, 2, 0)]);
+    assert_eq!(runs(&cron("2-4 * * * *"), at(4, 1, 6), at(4, 10, 0)), [at(4, 2, 0), at(4, 3, 0), at(4, 4, 0)]);
+    assert_eq!(runs(&cron("0,1 * * * *"), at(4, 0, 10), at(4, 30, 0)), [at(4, 1, 0)]);
+    // Started in the minute that matches: not at once.
+    assert_eq!(runs(&cron("0 * * * *"), at(4, 0, 30), at(5, 0, 30)), [at(5, 0, 0)]);
+    assert_eq!(runs(&cron("2 * * * *"), at(4, 2, 0), at(4, 59, 0)), Vec::<u64>::new());
+    // A second before it: on time.
+    assert_eq!(runs(&cron("0 * * * *"), at(3, 59, 59), at(4, 0, 30)), [at(4, 0, 0)]);
+    assert_eq!(runs(&cron("@daily"), at(23, 59, 30) - 86400, at(0, 0, 10)), [at(0, 0, 0)]);
+    assert_eq!(runs(&cron("* * * * *"), at(4, 1, 6), at(4, 3, 0)), [at(4, 2, 0), at(4, 3, 0)]);
+    assert_eq!(runs(&When::Every(60), at(4, 1, 6), at(4, 3, 0)), [at(4, 2, 0), at(4, 3, 0)]);
+    assert_eq!(runs(&When::Every(300), at(4, 4, 59), at(4, 10, 0)), [at(4, 5, 0), at(4, 10, 0)]);
+    // A job first seen later (a reload) waits for its own next time; one already seen keeps its.
+    let mut last = std::collections::HashMap::new();
+    assert_eq!(due(&mut last, "a", &cron("5 * * * *"), at(4, 1, 0)), None);
+    assert_eq!(due(&mut last, "b", &cron("5 * * * *"), at(4, 5, 0)), None);
+    assert_eq!(due(&mut last, "a", &cron("5 * * * *"), at(4, 5, 0)), Some(at(4, 5, 0)));
+    assert_eq!(due(&mut last, "a", &cron("5 * * * *"), at(4, 5, 59)), None);
+}
+
+// The scheduler itself, asked of a server: a job due in the next minute runs then.
+#[test]
+fn a_job_due_in_the_minute_after_the_start_is_asked_for() {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let seen: std::sync::Arc<Mutex<Vec<String>>> = Default::default();
+    let s2 = seen.clone();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { return };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            s2.lock().unwrap().push(String::from_utf8_lossy(&buf).into_owned());
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n");
+        }
+    });
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    // The next minute, or the one after when this one is about to end.
+    let next = (now / 60 + if now % 60 < 50 { 1 } else { 2 }) * 60;
+    let line = format!("{} * * * *", (next / 60) % 60);
+    let when = quillo::jobs::When::Cron(quillo::jobs::Cron::parse(&line).unwrap());
+    quillo::jobs::start(addr, move || vec![("s7-next".to_string(), when.clone())]);
+    let head = s7_until(100, "the job was not asked for in its minute", || seen.lock().unwrap().iter().find(|h| h.contains("/_quillo/job/s7-next")).cloned());
+    assert!(head.starts_with(&format!("POST /_quillo/job/s7-next?at={} ", next)), "{}", head);
+}
+
+// Q-799: channel `join` and `leave` did not pair: a page that went within its join had no leave
+// (10 pages: 10 joins, no leaves), `["j"]` twice ran `join` twice and `leave` once, and
+// `["j"],["l"],["j"]`, which runtime.js sends for a component gone and back before its answer, did
+// the same, and `["j"],["l"]` left the page in the room. Now a page asks once at a time, and each
+// `join` that lets one in has one `leave`. The edges: a join refused (no leave), joined and left
+// in turn (as before), joining again after.
+const S7_ROOMS: &str = r#"let joins = 0
+let leaves = 0
+channel.on("room", (m, p) => {}, {
+    join: (peer) => {
+        sleep(150)
+        joins += 1
+        true
+    },
+    leave: (peer) => { leaves += 1 },
+})
+channel.on("vip", (m, p) => {}, {
+    join: (peer) => {
+        sleep(50)
+        joins += 100
+        false
+    },
+    leave: (peer) => { leaves += 100 },
+})
+route GET /stats = `${joins} ${leaves} ${len(channel.peers("room"))}`
+route GET /say = channel.broadcast("room", "hello", { reliable: true })
+"#;
+
+#[test]
+fn each_join_a_channel_takes_has_one_leave() {
+    let d = s7_dir("q799", S7_ROOMS);
+    let s = support::serve_with(&d.join("main.qwe"), &["--no-wt"]);
+    let stats = || support::send(s.port, "GET", "/stats", &[], "").body;
+    let settled = |want: &str| s7_until(20, &format!("the channel did not come to {:?}", want), || (stats() == want).then_some(()));
+    // Ten pages go within their join: each join has its leave.
+    let pages: Vec<S7Ws> = (0..10)
+        .map(|_| {
+            let mut p = S7Ws::channels(s.port);
+            p.text("[\"j\",\"room\"]");
+            p
+        })
+        .collect();
+    for p in pages {
+        p.close();
+    }
+    settled("10 10 0");
+    // Asked twice: one join, one answer.
+    let mut a = S7Ws::channels(s.port);
+    a.text("[\"j\",\"room\"]");
+    a.text("[\"j\",\"room\"]");
+    assert_eq!(a.read().as_deref(), Some("[\"j\",\"room\",true]"));
+    settled("11 10 1");
+    // Gone and back before the answer, as runtime.js asks then: one join, and in the room.
+    let mut b = S7Ws::channels(s.port);
+    b.text("[\"j\",\"room\"]");
+    b.text("[\"l\",\"room\"]");
+    b.text("[\"j\",\"room\"]");
+    assert_eq!(b.read().as_deref(), Some("[\"j\",\"room\",true]"));
+    settled("12 10 2");
+    // Gone before the answer: the join runs, then its leave, and the page is in no room.
+    let mut c = S7Ws::channels(s.port);
+    c.text("[\"j\",\"room\"]");
+    c.text("[\"l\",\"room\"]");
+    settled("13 11 2");
+    assert_eq!(support::send(s.port, "GET", "/say", &[], "").body, "2");
+    assert_eq!(a.read().as_deref(), Some("[\"m\",\"room\",\"hello\"]"));
+    // Joined, left, and joined again: as before.
+    c.text("[\"j\",\"room\"]");
+    assert_eq!(c.read().as_deref(), Some("[\"j\",\"room\",true]"));
+    settled("14 11 3");
+    c.text("[\"l\",\"room\"]");
+    settled("14 12 2");
+    // Refused: no leave, gone or not.
+    let mut v = S7Ws::channels(s.port);
+    v.text("[\"j\",\"vip\"]");
+    assert_eq!(v.read().as_deref(), Some("[\"j\",\"vip\",false]"));
+    let w = S7Ws::channels(s.port);
+    let mut w = w;
+    w.text("[\"j\",\"vip\"]");
+    w.close();
+    settled("214 12 2");
+    for p in [a, b, c, v] {
+        p.close();
+    }
+    settled("214 14 0");
+}
+
+/// `in_page`, in a folder taken away once the test has passed.
+fn s7_in_page(name: &str, src: &str, path: &str, body: &str) -> Option<serde_json::Value> {
+    let d = s7_dir(name, src);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping the browser half: no Chrome");
+        return None;
+    };
+    let script = format!(
+        "(async () => {{\n  {BOOTED}\n  const $ = (id) => document.getElementById(id);\n  const out = await (async () => {{\n{body}\n  }})();\n  out.remade = QW.remade ?? 0;\n  out.errors = window.__quilloErrors;\n  document.body.dataset.result = JSON.stringify(out);\n}})();"
+    );
+    Some(in_chrome(&chrome, &format!("http://127.0.0.1:{}{}", s.port, path), &script))
+}
+
+// Q-800 (decided 2026-11-05: the latest call only): a state set from a server fn's answer took the
+// answers in the order they came, so typing "abcd" ended on "results for a" and five quick clicks
+// on the first click's answer. An older call's answer that comes after a newer call for the same
+// state was made is dropped. The edges: one call, calls one after another in one handler (each
+// shown), an answer that came before the next call (kept), another state's call (its own).
+#[test]
+fn a_state_shows_the_answer_of_its_latest_call() {
+    let src = r##"server fn search(q: str) -> str {
+    sleep(max([0, 400 - q.len * 80]))
+    `results for ${q}`
+}
+server fn echo(k: int, ms: int) -> int {
+    sleep(ms)
+    k
+}
+component Search() {
+    state q = ""
+    state shown = ""
+    state last = 0
+    state n = 0
+    state other = 0
+    state steps = []
+    <div>
+        <input #q value={q} oninput={(e) => { q = e.target.value; shown = search(q) }}/>
+        <p #shown>{shown}</p>
+        <button #b @click={() => { n += 1; let k = n; last = echo(k, max([0, (6 - k) * 80])) }}>go</button>
+        <button #o @click={() => { other = echo(n * 10, 300) }}>other</button>
+        <button #seq @click={() => { for k in [1, 2, 3] { last = echo(k, 10); steps = steps + [last] } }}>seq</button>
+        <p #last>{last}</p><p #other>{other}</p><p #steps>{str(steps)}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Search/></body></html>
+"##;
+    let body = format!(
+        r#"{TYPE_IN}
+    const until = async (f) => {{ for (let i = 0; i < 500 && !f(); i++) await tick(20); return f(); }};
+    const out = {{}};
+    await typeIn("q", "abcd");
+    await until(() => $("shown").textContent === "results for abcd");
+    // "a"'s answer comes last, 400 ms after it was asked.
+    await tick(600);
+    out.typed = $("shown").textContent;
+    for (let i = 0; i < 5; i++) $("b").click();
+    $("o").click();
+    await until(() => $("last").textContent === "5" && $("other").textContent === "50");
+    await tick(600);
+    out.clicked = $("last").textContent + " " + $("other").textContent;
+    // One at a time: each answer is in before the next call.
+    $("b").click();
+    await until(() => $("last").textContent === "6");
+    $("b").click();
+    await until(() => $("last").textContent === "7");
+    out.alone = $("last").textContent;
+    $("seq").click();
+    await until(() => $("steps").textContent === "[1, 2, 3]");
+    out.seq = $("last").textContent + " " + $("steps").textContent;
+    return out;"#
+    );
+    let Some(r) = s7_in_page("q800", src, "/", &body) else { return };
+    let want = serde_json::json!({ "typed": "results for abcd", "clicked": "5 50", "alone": "7", "seq": "3 [1, 2, 3]", "remade": 0, "errors": [] });
+    assert_eq!(r, want);
+}
+
+// Q-801 (decided 2026-11-05: `:*` stays a wildcard, and goes in the guide): a topic with a comma
+// was two topics to the page's live request, which never heard of it; an empty one was never
+// woken; one of 70,000 characters, or 100 of 120 "é" (an address of 72,787 bytes), got a 414 and
+// the page never updated. A comma in a topic is written out on the wire, `watch` and `publish`
+// refuse an empty topic and one of more than 256 bytes, and topics too long for an address go
+// after it (the socket's first message, or a POST's body). The edges: 256 bytes and 257, in
+// unicode, `%` in a topic, the old comma-joined form, the wildcard.
+const S7_TOPICS: &str = r#"let hits = 0
+server fn load_hits(topic: str) -> int {
+    watch(topic)
+    unwatched(() => hits)
+}
+route GET /bump/:t = {
+    hits += 1
+    publish(t)
+    hits
+}
+route GET /w = { let t = ""; watch(t); "no" }
+route GET /p = { let t = ""; publish("x", t); "no" }
+route GET /long/:n(int) = { publish("é".repeat(n)); "ok" }
+route GET /emoji/:n(int) = { watch("😀".repeat(n)); "ok" }
+"#;
+
+/// `topics` as runtime.js's `liveKey` writes them.
+fn s7_key(topics: &[&str]) -> String {
+    topics.iter().map(|t| t.replace('%', "%25").replace(',', "%2C")).collect::<Vec<_>>().join(",")
+}
+
+#[test]
+fn a_topic_is_one_name_on_the_wire_and_has_its_limits() {
+    let d = s7_dir("q801", S7_TOPICS);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let get = |path: &str| support::send(s.port, "GET", path, &[], "");
+    // Refused where they are named.
+    assert_eq!(get("/w").status, 500);
+    assert_eq!(get("/p").status, 500);
+    assert_eq!((get("/long/128").body, get("/long/129").status), ("ok".to_string(), 500));
+    assert_eq!((get("/emoji/64").body, get("/emoji/65").status), ("ok".to_string(), 500));
+    // A comma, and a `%`, in a topic: the page that follows it is told of it alone.
+    for (topic, near) in [("search:a,b", "search:a"), ("50%", "50"), ("a%2Cb", "a"), ("é,ü", "é")] {
+        let before = s7_seq(s.port);
+        assert_eq!(get(&format!("/bump/{}", enc(near))).status, 200);
+        assert_eq!(get(&format!("/bump/{}", enc(topic))).status, 200);
+        assert_eq!(s7_changed(s.port, before, &enc(&s7_key(&[topic, "other"]))), [topic], "{}", topic);
+    }
+    // The old form, from a page loaded before: topics joined by commas.
+    let before = s7_seq(s.port);
+    get("/bump/y:2");
+    assert_eq!(s7_changed(s.port, before, "x:1,y:2"), ["y:2"]);
+    // The wildcard is a wildcard.
+    let before = s7_seq(s.port);
+    get("/bump/room:*");
+    assert_eq!(s7_changed(s.port, before, &enc(&s7_key(&["room:7", "hall:1"]))), ["room:7"]);
+    // Topics too long for an address: in a POST's body, and in the socket's first message.
+    let long: Vec<String> = (0..100).map(|i| format!("{}:{}", i, "é".repeat(120))).collect();
+    let mut all: Vec<&str> = long.iter().map(String::as_str).collect();
+    all.push("search:a,b");
+    let key = s7_key(&all);
+    assert!(enc(&key).len() > 64 << 10);
+    let before = s7_seq(s.port);
+    get(&format!("/bump/{}", enc(&long[57])));
+    let a = support::send(s.port, "POST", &format!("/_quillo/live?since={}&tm=1", before), &[("Content-Type", "text/plain")], &key);
+    let j: serde_json::Value = serde_json::from_str(&a.body).unwrap_or_else(|e| panic!("{}: {}", e, a.body));
+    assert_eq!(j["changed"], serde_json::json!([long[57]]));
+    let before = s7_seq(s.port);
+    let mut ws = S7Ws::open(s.port, &format!("/_quillo/live?since={}&tm=1", before));
+    ws.text(&key);
+    get("/bump/search:a%2Cb");
+    let j: serde_json::Value = serde_json::from_str(&ws.read().unwrap()).unwrap();
+    assert_eq!(j["changed"], serde_json::json!(["search:a,b"]));
+    ws.close();
+}
+
+#[test]
+fn check_refuses_an_empty_topic_written_out() {
+    let (ok, out) = s7_check("q801", "route GET /w = { watch(\"\"); \"no\" }\nroute GET /p = { publish(\"x\", \"\"); \"no\" }\nroute GET /ok = { publish(\"x\", \"é\"); \"ok\" }\n");
+    assert!(!ok, "{}", out);
+    assert!(out.contains("main.qwe:1: error: `watch`: a topic is a name, and this one is empty"), "{}", out);
+    assert!(out.contains("main.qwe:2: error: `publish`: a topic is a name, and this one is empty"), "{}", out);
+    assert!(!out.contains("main.qwe:3"), "{}", out);
+    let (ok, out) = s7_check("q801-long", &format!("route GET /p = {{ publish(\"{}\"); \"no\" }}\nroute GET /q = {{ publish(\"{}\"); \"ok\" }}\n", "é".repeat(129), "é".repeat(128)));
+    assert!(!ok && out.contains("main.qwe:1: error: `publish`: a topic is at most 256 bytes, and this one is 258") && !out.contains("main.qwe:2"), "{}", out);
+}
+
+// A page following 101 topics, 100 of them 240 bytes of "é" and one with a comma, over its socket
+// and, where it has none, by asking (a POST): each change reaches it.
+#[test]
+fn a_page_follows_topics_too_long_for_an_address() {
+    let src = r##"let hits = 0
+fn long_topic(i: int) -> str = `${i}:${"é".repeat(120)}`
+server fn load_hits() -> int {
+    for i in 0..100 {
+        watch(long_topic(i))
+    }
+    watch("search:a,b")
+    unwatched(() => hits)
+}
+server fn bump(t: str) -> int {
+    hits += 1
+    publish(t)
+    hits
+}
+server fn bump_long(i: int) -> int {
+    hits += 1
+    publish(long_topic(i))
+    hits
+}
+component Hits() {
+    state h = live(load_hits)
+    <div><p #h>{h}</p><button #a @click={() => bump("search:a,b")}>a</button><button #l @click={() => bump_long(57)}>l</button></div>
+}
+route GET / = <html><head><title>t</title></head><body><Hits/></body></html>
+route GET /poll = <html><head><title>t</title><script>{raw("window.WebSocket = undefined;")}</script></head><body><Hits/></body></html>
+"##;
+    let body = r#"
+    const until = async (f) => { for (let i = 0; i < 500 && !f(); i++) await tick(20); return f(); };
+    const start = Number($("h").textContent);
+    // The page is waiting for changes before it is asked to see one.
+    await tick(500);
+    $("a").click();
+    await until(() => Number($("h").textContent) === start + 1);
+    const one = Number($("h").textContent) - start;
+    $("l").click();
+    await until(() => Number($("h").textContent) === start + 2);
+    return { seen: [one, Number($("h").textContent) - start] };"#;
+    for path in ["/", "/poll"] {
+        let Some(r) = s7_in_page("q801-page", src, path, body) else { return };
+        assert_eq!(r, serde_json::json!({ "seen": [1, 2], "remade": 0, "errors": [] }), "{}", path);
+    }
+}
+
+// Q-802: `sleep` held one of the threads that wait for requests for its whole length: with as
+// many streams sleeping in their loop as there are such threads, a route's `sleep(10)` took up to
+// a second, and longer behind longer sleeps. A request's sleep is a timer now. Shown by state, not
+// by time: the route's answer comes while every stream is still in its sleep of 20 seconds.
+#[test]
+fn a_sleep_holds_no_thread_others_wait_for() {
+    use std::io::{Read, Write};
+    let src = r#"route GET /feed = events((send) => {
+    send({ i: 0 })
+    sleep(20000)
+    send({ i: 1 })
+})
+route GET /napping = { sleep(10); "ok" }
+route GET /zero = { sleep(0); "ok" }
+"#;
+    let d = s7_dir("q802", src);
+    // Nine threads wait for requests with `--workers 8`: thirty streams take them all.
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let mut feeds: Vec<std::net::TcpStream> = (0..30)
+        .map(|_| {
+            let mut f = std::net::TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+            f.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+            f.write_all(b"GET /feed HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n").unwrap();
+            f
+        })
+        .collect();
+    for f in &mut feeds {
+        let mut got = Vec::new();
+        let mut b = [0u8; 4096];
+        while !String::from_utf8_lossy(&got).contains("\"i\":0") {
+            let n = f.read(&mut b).unwrap();
+            assert!(n > 0, "the stream ended");
+            got.extend_from_slice(&b[..n]);
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let port = s.port;
+    std::thread::spawn(move || {
+        let _ = tx.send((support::send(port, "GET", "/napping", &[], "").body, support::send(port, "GET", "/zero", &[], "").body));
+    });
+    let answered = rx.recv_timeout(std::time::Duration::from_secs(15)).expect("a short sleep waited for the streams' sleeps");
+    assert_eq!(answered, ("ok".to_string(), "ok".to_string()));
+    // And every stream is still asleep: none has sent its second event.
+    for f in &mut feeds {
+        f.set_nonblocking(true).unwrap();
+        let mut b = [0u8; 4096];
+        match f.read(&mut b) {
+            Ok(n) => assert!(!String::from_utf8_lossy(&b[..n]).contains("\"i\":1"), "a stream woke"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock),
+        }
+    }
+}
+
+// Q-803: `every` and `schedule` in a route answered 200 and never ran, and `quillo check` passed
+// what the start refuses. Both are refused once the program has started, and `check` reads their
+// written-out arguments as the start does. The edges: at the top, in a function the top calls, a
+// component's `every` (the browser's), tabs in a cron line (taken now, as cron takes them).
+#[test]
+fn every_and_schedule_are_refused_where_they_would_never_run() {
+    let src = "fn tick() = null\nfn job() = null\nroute GET /e = { every(50, tick); \"added\" }\nroute GET /s = { schedule(\"1s\", job); \"added\" }\nserver fn add_later() = schedule(\"5m\", job, { name: \"later\" })\n";
+    let (ok, out) = s7_check("q803", src);
+    assert!(!ok, "{}", out);
+    for l in [3, 4, 5] {
+        assert!(out.contains(&format!("main.qwe:{}: error: `", l)) && out.contains("would never run"), "{}: {}", l, out);
+    }
+    // As it runs: a 500, not "added".
+    let d = S7Dir(support::temp_dir("feedback55-s7-q803"));
+    std::fs::write(d.join("main.qwe"), src).unwrap();
+    let s = support::serve_unchecked(&d.join("main.qwe"));
+    assert_eq!(support::send(s.port, "GET", "/e", &[], "").status, 500);
+    assert_eq!(support::send(s.port, "GET", "/s", &[], "").status, 500);
+    let mut it = quillo::Interp::new(&*d);
+    it.load_source(src, "main.qwe").unwrap();
+    assert_eq!(ev(&mut it, "every(50, tick)"), format!("ERROR: {}", quillo::jobs::not_at_top("every")));
+    assert_eq!(ev(&mut it, "schedule(\"1s\", job)"), format!("ERROR: {}", quillo::jobs::not_at_top("schedule")));
+    // Where they run: the top, a function it calls, a component.
+    let ok_src = "fn tick() = null\nfn job() = null\nfn setup() {\n    schedule(\"@hourly\", job, { name: \"hourly\" })\n}\nevery(50, tick)\nschedule(\"1s\", job)\nschedule(\"0\t3\t*\t*\t*\", job, { name: \"tabs\" })\nschedule(\"2-4 * * * *\", () => 1)\nevery(1, () => 2)\nsetup()\ncomponent Clock() {\n    state n = 0\n    every(1000, () => { n += 1 })\n    <p>{n}</p>\n}\nroute GET / = <html><body><Clock/></body></html>\n";
+    let (ok, out) = s7_check("q803-ok", ok_src);
+    assert!(ok, "{}", out);
+    let mut it = quillo::Interp::new(&*d);
+    it.load_source(ok_src, "main.qwe").unwrap();
+    let jobs: Vec<String> = it.site.jobs.iter().map(|j| j.name.clone()).collect();
+    assert_eq!(jobs, ["job", "tabs", "job-9", "hourly"]);
+    assert_eq!(it.site.ticks.iter().map(|t| (t.name.clone(), t.ms)).collect::<Vec<_>>(), [("tick".to_string(), 50), ("every-10".to_string(), 1)]);
+    assert!(it.handle(&quillo::server::HttpRequest { method: "GET".into(), url: "/".into(), headers: vec![("Host".into(), "x".into())], body: vec![], remote: "127.0.0.1".into() }).text().contains("<p"));
+}
+
+#[test]
+fn check_reads_every_and_schedule_as_the_start_does() {
+    let cases: &[(&str, &str)] = &[
+        ("every(0, run)", "`every` on the server takes at least 1 millisecond"),
+        ("every(-5, run)", "`every` on the server takes at least 1 millisecond"),
+        ("every(0.5, run)", "`every` on the server takes at least 1 millisecond"),
+        ("schedule(\"60 * * * *\", run)", "the minute field \"60\" is not a number from 0 to 59"),
+        ("schedule(\"*/0 * * * *\", run)", "the minute field \"*/0\""),
+        ("schedule(\"5-1 * * * *\", run)", "the minute field \"5-1\""),
+        ("schedule(\"0 0 * * MON\", run)", "the weekday field \"MON\""),
+        ("schedule(\"0 0 1 JAN *\", run)", "the month field \"JAN\""),
+        ("schedule(\"@reboot\", run)", "unknown \"@reboot\""),
+        ("schedule(\"0 0 * * * *\", run)", "a cron line has 5 fields"),
+        ("schedule(\"0\", run)", "takes a duration such as \"5m\""),
+        ("schedule(\"5m\", run, { name: \"a b\" })", "a job's name is letters, digits"),
+        ("every(10, run, { name: \"é\" })", "a tick's name is letters, digits"),
+        ("schedule(\"5m\", run, { name: 7 })", "`schedule`'s name is a str, got int"),
+        ("schedule(\"5m\", run)\nschedule(\"1m\", run)", "there is already a job named \"run\""),
+        ("every(10, run)\nevery(20, run, null)", "there is already a tick named \"run\""),
+        ("schedule(\"5m\", run, { name: \"x\" })\nschedule(\"1m\", () => 1, { name: \"x\" })", "there is already a job named \"x\""),
+    ];
+    for (i, (code, said)) in cases.iter().enumerate() {
+        let src = format!("fn run() = null\n{}\n", code);
+        let (ok, out) = s7_check(&format!("q803-{}", i), &src);
+        assert!(!ok && out.contains(said), "{}: {}", code, out);
+        // The start says the same.
+        let mut it = quillo::Interp::new(".");
+        let e = it.load_source(&src, "main.qwe").err().unwrap_or_else(|| panic!("{} started", code));
+        assert!(e.to_string().contains(said), "{}: {}", code, e);
+    }
+    // What the start takes, check takes: the limits themselves, a job and a tick of one name, one
+    // name each for two lambdas.
+    let fine = "fn run() = null\nevery(1, run)\nschedule(\"59 23 31 12 7\", run)\nschedule(1, () => 1)\nschedule(\"1s\", () => 2)\nevery(1.5, () => 3, { name: \"a-b.c_d\" })\nschedule(\"0-59/30 * * * *\", () => 4, { name: null, other: 1 })\n";
+    let (ok, out) = s7_check("q803-fine", fine);
+    assert!(ok, "{}", out);
+    let mut it = quillo::Interp::new(".");
+    it.load_source(fine, "main.qwe").unwrap();
+    assert_eq!(it.site.jobs.iter().map(|j| j.name.clone()).collect::<Vec<_>>(), ["run", "job-4", "job-5", "job-7"]);
+}
+
+// Q-806: over a WebSocket a burst lost a third of its messages to a page reading at full speed:
+// the page's queue filled because its writer wrote a message at a time, one system call each. What
+// waits goes in one write, and the writer waits a moment for more before it sleeps, so the program
+// sending pays no wake-up a message. Shown as a page that keeps up gets a burst of 20,000 whole, in
+// order: a machine too busy to run the page's writer for a few milliseconds loses some (as a page
+// that does not keep up does), so of five bursts one whole is asked for, where before none was.
+// The edges: several pages at once, each in order, text in unicode.
+#[test]
+fn a_page_reading_at_full_speed_gets_a_whole_burst() {
+    let src = "route GET /burst/:b(int)/:n(int) {\n    let sent = 0\n    for i in 0..n {\n        sent = sent + channel.broadcast(\"room\", { b, i, s: \"ünï\" })\n    }\n    sent\n}\nroute GET /peers = len(channel.peers(\"room\"))\n";
+    let d = s7_dir("q806", src);
+    let s = support::serve_with(&d.join("main.qwe"), &["--no-wt"]);
+    let mut pages: Vec<S7Ws> = (0..3).map(|_| S7Ws::channels(s.port)).collect();
+    for p in &mut pages {
+        p.text("[\"j\",\"room\"]");
+        assert_eq!(p.read().as_deref(), Some("[\"j\",\"room\",true]"));
+    }
+    // Each page's reader counts each burst's messages, which come in order.
+    let counts: Vec<std::sync::Arc<Mutex<Vec<usize>>>> = (0..3).map(|_| std::sync::Arc::new(Mutex::new(vec![0; 5]))).collect();
+    for (mut p, c) in pages.into_iter().zip(counts.clone()) {
+        std::thread::spawn(move || {
+            let mut last = (-1i64, -1i64);
+            while let Some(m) = p.read() {
+                let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+                let (b, i) = (v[2]["b"].as_i64().unwrap(), v[2]["i"].as_i64().unwrap());
+                assert!((b, i) > last && v[2]["s"] == "ünï", "{} after {:?}", m, last);
+                last = (b, i);
+                c.lock().unwrap()[b as usize] += 1;
+            }
+        });
+    }
+    let mut whole = 0;
+    for b in 0..5 {
+        let sent: usize = support::send(s.port, "GET", &format!("/burst/{}/20000", b), &[], "").body.parse().unwrap();
+        // What was put on the pages' queues reaches them.
+        s7_until(30, "a burst did not arrive", || (counts.iter().map(|c| c.lock().unwrap()[b]).sum::<usize>() == sent).then_some(()));
+        if sent == 60000 {
+            whole += 1;
+            break;
+        }
+    }
+    assert_eq!(whole, 1, "no burst of five reached its pages whole");
+}
+
+// ---- slice 7's review ----
+
+/// A live socket, with its topics sent after the address (`tm=1`) in one message of `text`.
+fn s7_live_later(port: u16, since: u64, text: &str) -> S7Ws {
+    let mut ws = S7Ws::open(port, &format!("/_quillo/live?since={}&tm=1", since));
+    ws.text(text);
+    ws
+}
+
+/// The server's resident memory, in KiB.
+fn s7_rss(pid: u32) -> u64 {
+    let o = Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().unwrap();
+    String::from_utf8_lossy(&o.stdout).trim().parse().unwrap()
+}
+
+// Found in review (Q-801): the topics sent after the address were read whole, up to 4 MiB, and
+// one page's socket held 8 MiB, one visitor 2 GiB. They are read a part at a time, up to what 256
+// topics of the longest that can be told of take (each `%` and `,` in them written out), and a
+// topic longer than that is dropped as it comes. The limit itself is taken and one more refused,
+// for the socket's message and a POST's body alike; a 4 MiB one costs the server nothing.
+#[test]
+fn topics_after_the_address_are_held_to_what_a_page_follows() {
+    const MOST_TEXT: usize = 256 * (448 * 3 + 1);
+    let d = s7_dir("q801-later", "route GET /bump/:t = {\n    publish(t)\n    \"ok\"\n}\nroute GET / = \"ok\"\n");
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    // 255 topics of 448 commas each, the longest, and one to publish: padded to the limit.
+    let longest = ",".repeat(448);
+    let mut topics = vec!["s7:t".to_string()];
+    topics.extend((0..255).map(|_| longest.clone()));
+    let key = s7_key(&topics.iter().map(String::as_str).collect::<Vec<_>>());
+    let at_limit = format!("{}{}", key, ",".repeat(MOST_TEXT - key.len()));
+    assert_eq!(at_limit.len(), MOST_TEXT);
+    let before = s7_seq(s.port);
+    let mut ws = s7_live_later(s.port, before, &at_limit);
+    assert_eq!(support::send(s.port, "GET", "/bump/s7:t", &[], "").body, "ok");
+    let j: serde_json::Value = serde_json::from_str(&ws.read().unwrap()).unwrap();
+    assert_eq!(j["changed"], serde_json::json!(["s7:t"]));
+    ws.close();
+    // One byte more: the socket is closed, unread (perhaps before it is all sent).
+    let mut over = S7Ws::open(s.port, &format!("/_quillo/live?since={}&tm=1", before));
+    let _ = over.try_text(&format!("{},", at_limit));
+    assert!(over.ended_within(10));
+    // A POST's body: told of every topic it follows (a number from another server).
+    let post = |body: &str| support::send(s.port, "POST", "/_quillo/live?since=1&s=other&tm=1", &[("Content-Type", "text/plain")], body);
+    let a = post(&at_limit);
+    let j: serde_json::Value = serde_json::from_str(&a.body).unwrap_or_else(|e| panic!("{}: {}", e, a.body));
+    assert_eq!((j["changed"].as_array().unwrap().len(), j["changed"][0].as_str()), (256, Some("s7:t")));
+    assert_eq!(post(&format!("{},", at_limit)).status, 413);
+    // The longest that can be told of is kept, one byte more dropped; 256 topics at most.
+    let j: serde_json::Value = serde_json::from_str(&post(&format!("{},{},s7:a", "x".repeat(448), "y".repeat(449))).body).unwrap();
+    assert_eq!(j["changed"], serde_json::json!(["x".repeat(448), "s7:a"]));
+    let many: Vec<String> = (0..300).map(|i| format!("t{:03}", i)).collect();
+    let j: serde_json::Value = serde_json::from_str(&post(&many.join(",")).body).unwrap();
+    assert_eq!(j["changed"].as_array().unwrap().len(), 256);
+    // Sixty sockets each sending 4 MiB: refused as they start, and the server's memory stays.
+    let rss = s7_rss(s.pid());
+    let big = format!("{},", "z".repeat(4 << 20));
+    let socks: Vec<S7Ws> = (0..60)
+        .map(|_| {
+            let mut w = S7Ws::open(s.port, &format!("/_quillo/live?since={}&tm=1", before));
+            use std::io::Write;
+            let _ = w.0.write_all(&[0x81, 0xff]);
+            let _ = w.0.write_all(&(big.len() as u64).to_be_bytes());
+            let _ = w.0.write_all(&[1, 2, 3, 4]);
+            let _ = w.0.write_all(&big.as_bytes()[..1 << 20]);
+            w
+        })
+        .collect();
+    for mut w in socks {
+        assert!(w.ended_within(10));
+    }
+    assert_eq!(support::send(s.port, "GET", "/", &[], "").body, "ok");
+    let grew = s7_rss(s.pid()).saturating_sub(rss);
+    assert!(grew < 64 << 10, "{} KiB more", grew);
+}
+
+// Found in review (Q-803): `check` said a job's name was used twice when it was in both arms of
+// an `if`, which only ever runs one, and `quillo run` would not start the program. Twice is two
+// calls that can both run in one start, as the start sees it: not two arms of one `if` or
+// `match` (or a ternary), but one arm and what follows, two `if`s, or one call in a loop.
+#[test]
+fn a_jobs_name_is_twice_only_where_both_can_run() {
+    let both = "fn backup() { print(\"backup\") }\nfn tick() { print(\"tick\") }\nif env(\"PROD\") == \"1\" {\n    schedule(\"0 3 * * *\", backup)\n    every(60000, tick)\n} else {\n    schedule(\"5m\", backup)\n    every(1000, tick)\n}\nroute GET / = \"ok\"\n";
+    let d = s7_dir("q803-both", both);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    assert_eq!(support::send(s.port, "GET", "/", &[], "").body, "ok");
+    let ok = [
+        "fn b() = null\nlet m = env(\"MODE\")\nmatch m {\n    \"a\" => schedule(\"5m\", b),\n    \"b\" => schedule(\"1h\", b),\n    _ => schedule(\"1d\", b),\n}\n",
+        "fn b() = null\nlet x = env(\"X\") == \"1\" ? schedule(\"1m\", b) : schedule(\"2m\", b)\n",
+        "fn b() = null\nif env(\"A\") == \"1\" {\n    if env(\"B\") == \"1\" {\n        schedule(\"1m\", b)\n    } else {\n        schedule(\"2m\", b)\n    }\n} else {\n    schedule(\"3m\", b)\n}\n",
+        "fn b() = null\nfor i in 0..2 {\n    schedule(\"5m\", b, { name: `b${i}` })\n}\n",
+    ];
+    for (i, src) in ok.iter().enumerate() {
+        let (good, out) = s7_check(&format!("q803-arms-{}", i), src);
+        assert!(good, "{}: {}", src, out);
+    }
+    let twice = [
+        ("fn b() = null\nif env(\"P\") == \"1\" {\n    schedule(\"5m\", b)\n}\nschedule(\"1h\", b)\n", 5),
+        ("fn b() = null\nif env(\"A\") == \"1\" {\n    schedule(\"5m\", b)\n}\nif env(\"B\") == \"1\" {\n    schedule(\"1h\", b)\n}\n", 6),
+        ("fn b() = null\nif env(\"P\") == \"1\" {\n    schedule(\"5m\", b)\n    schedule(\"1h\", b)\n} else {\n    schedule(\"1d\", b)\n}\n", 4),
+        ("fn b() = null\nfor i in 0..2 {\n    schedule(\"5m\", b)\n}\n", 3),
+        ("fn b() = null\nfor i in 0..2 {\n    if i == 0 {\n        every(5, b)\n    }\n}\n", 4),
+        ("fn b() = null\nlet n = 0\nwhile n < 2 {\n    every(5, b, { name: \"w\" })\n    n += 1\n}\n", 4),
+    ];
+    for (i, (src, line)) in twice.iter().enumerate() {
+        let (good, out) = s7_check(&format!("q803-twice-{}", i), src);
+        assert!(!good && out.contains(&format!("main.qwe:{}: error: `", line)) && out.contains("there is already a"), "{}: {}", src, out);
+    }
+}
+
+// Found in review (Q-800): only a state set straight from a call took the latest: clearing the
+// field (`shown = ""`) left the answer still on its way to show, and `let r = search(q); via = r`
+// ended on the first call's. The latest set of a state wins: every set claims it, a function
+// that waits claims each state it sets as it begins, and its sets land only while no set made
+// since has claimed it. The edges: a state made from a call (`state first = slow_init()`) that
+// the page set before the answer came, a field bound to a state typed in before a call's answer.
+#[test]
+fn the_latest_set_of_a_state_wins() {
+    let src = r##"server fn search(q: str) -> str {
+    sleep(max([0, 400 - q.len * 80]))
+    `results for ${q}`
+}
+server fn slow_init() -> str {
+    sleep(400)
+    "from the server"
+}
+component Late() {
+    state later = slow_init()
+    <div><button #lf @click={() => { later = "set by the page" }}>f</button><p #later>{later}</p></div>
+}
+component Search() {
+    state q = ""
+    state shown = ""
+    state via = ""
+    state first = slow_init()
+    state word = ""
+    state open = false
+    <div>
+        <button #open @click={() => { open = true }}>open</button>{open ? <Late/> : null}
+        <input #q value={q} oninput={(e) => { q = e.target.value; if q == "" { shown = "" } else { shown = search(q) } }}/>
+        <input #r oninput={(e) => { let r = search(e.target.value); via = r }}/>
+        <input #w bind:value={word}/>
+        <button #f @click={() => { first = "set by the page" }}>f</button>
+        <button #s @click={() => { word = search("x") }}>s</button>
+        <p #shown>{shown}</p><p #via>{via}</p><p #first>{first}</p><p #word>{word}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Search/></body></html>
+"##;
+    let body = format!(
+        r#"{TYPE_IN}
+    const until = async (f) => {{ for (let i = 0; i < 500 && !f(); i++) await tick(20); return f(); }};
+    const out = {{}};
+    // Set before its answer came: the page's value stays. Rendered by the server, the state came
+    // with its value; made in the page, it waits for it.
+    $("f").click();
+    $("open").click();
+    await until(() => $("lf"));
+    $("lf").click();
+    await tick(800);
+    out.first = $("first").textContent + " / " + $("later").textContent;
+    // "a", then cleared before its answer (320 ms later).
+    await typeIn("q", "a"); await tick(30); $("q").focus(); $("q").select(); document.execCommand("delete");
+    await tick(700);
+    out.cleared = "[" + $("q").value + "] [" + $("shown").textContent + "]";
+    // Typed again: the latest answer shows.
+    await typeIn("q", "ab");
+    await until(() => $("shown").textContent === "results for ab");
+    out.again = $("shown").textContent;
+    await typeIn("r", "abcd");
+    await until(() => $("via").textContent === "results for abcd");
+    await tick(600);
+    out.via = $("via").textContent;
+    // A call, then the field it sets typed in before the answer: what was typed stays.
+    $("s").click(); await tick(30);
+    await typeIn("w", "typed");
+    await tick(700);
+    out.word = $("w").value + " " + $("word").textContent;
+    return out;"#
+    );
+    let Some(r) = s7_in_page("q800-sets", src, "/", &body) else { return };
+    let want = serde_json::json!({ "first": "set by the page / set by the page", "cleared": "[] []", "again": "results for ab", "via": "results for abcd", "word": "typed typed", "remade": 0, "errors": [] });
+    assert_eq!(r, want);
+}
+
+// Found in review (Q-796): a `parallel` function's `publish`, in a service answering another's
+// call, was missing from the answer's "published", so the calling app's pages were never told.
+// The functions' topics go back with it, in their order, each once.
+#[test]
+fn what_a_parallel_function_publishes_goes_back_with_a_services_answer() {
+    let secret = "a-test-secret-for-services";
+    let src = "server fn plain() -> int {\n    publish(\"news\")\n    1\n}\nserver fn par() -> int {\n    parallel(() => publish(\"b\", \"news\"), () => publish(\"a\", \"news\"), () => 2)\n    1\n}\nserver fn none() -> int {\n    let [a, b] = parallel(() => 1, () => 2)\n    a + b\n}\n";
+    let d = s7_dir("q796-services", src);
+    let s = support::serve(&d.join("main.qwe"), &[("QUILLO_SERVICE_SECRET", secret)]);
+    let call = |f: &str| {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let id = quillo::service::new_id(16);
+        let sig = quillo::service::signature(secret, t, "main", f, "", &id, b"[]");
+        let h = [("X-Quillo-Service", format!("t={},sig={}", t, sig)), ("X-Quillo-To", "main".to_string()), ("X-Quillo-Call", id)];
+        let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        support::send(s.port, "POST", &format!("/_quillo/service/{}", f), &h, "[]").body
+    };
+    assert_eq!(call("plain"), r#"{"ok":1,"published":["news"]}"#);
+    assert_eq!(call("par"), r#"{"ok":1,"published":["b","news","a"]}"#);
+    assert_eq!(call("none"), r#"{"ok":3}"#);
+}
+
+// Found in review (Q-796): read-your-writes broke both ways in `parallel`: a write in a function
+// and then a read after it read the replica, and so did a read in a function after a write before
+// it. The functions have the request's mark of its write, and give theirs back.
+#[test]
+fn reads_after_a_write_in_parallel_go_to_the_primary() {
+    let Some(pg) = pg_server() else { return };
+    let (primary, replica) = (pg.database("f55_s7primary"), pg.database("f55_s7replica"));
+    for (url, who) in [(&primary, "primary"), (&replica, "replica")] {
+        psql(&pg, url, &["create table which (v text)", &format!("insert into which values ('{}')", who), "create table log (x int)"]);
+    }
+    let name = replica.rsplit('/').next().unwrap().to_string();
+    psql(&pg, &primary, &[&format!("alter database {} set default_transaction_read_only = on", name)]);
+    let src = format!(
+        "db.open(\"{}\", {{ replicas: [\"{}\"] }})\nfn which() -> str = db.one(\"select v from which\").v\nroute GET /read = which()\nroute GET /par = {{\n    parallel(() => db.exec(\"insert into log (x) values (1)\"), () => 0)\n    which()\n}}\nroute GET /inpar = {{\n    db.exec(\"insert into log (x) values (2)\")\n    let [a, b] = parallel(() => which(), () => 0)\n    a\n}}\nroute GET /none = {{\n    let [a, b] = parallel(() => which(), () => which())\n    `${{a}} ${{b}}`\n}}\n",
+        primary, replica
+    );
+    let d = s7_dir("q796-replicas", &src);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let get = |path: &str| support::send(s.port, "GET", path, &[], "").body;
+    assert_eq!(get("/read"), "replica");
+    assert_eq!(get("/par"), "primary");
+    assert_eq!(get("/inpar"), "primary");
+    // Each request is its own, and with no write reads go to the replica, in `parallel` too.
+    assert_eq!(get("/read"), "replica");
+    assert_eq!(get("/none"), "replica replica");
+}
+
+// Found in review (Q-806): with a fixed wait after every write, traffic a message at a time cost
+// a third more of the server's time; and a buffer grown on each page's thread kept 5 to 20 MiB
+// for 256 pages after a burst. A batch is written as it is, each frame's head made beside it:
+// frames of every length (the 7-bit, 16-bit and 64-bit ones, at their edges) and more than one
+// batch's worth, in order, whole, in unicode.
+#[test]
+fn frames_of_every_length_go_out_whole_in_a_batch() {
+    let src = "route GET /sizes = {\n    let sent = 0\n    for n in [110, 111, 112, 65520, 65521, 69985, 1] {\n        sent = sent + channel.broadcast(\"room\", \"x\".repeat(n))\n    }\n    for i in 0..200 {\n        sent = sent + channel.broadcast(\"room\", \"é\".repeat(i % 7))\n    }\n    sent\n}\n";
+    let d = s7_dir("q806-frames", src);
+    let s = support::serve_with(&d.join("main.qwe"), &["--no-wt"]);
+    let mut p = S7Ws::channels(s.port);
+    p.text("[\"j\",\"room\"]");
+    assert_eq!(p.read().as_deref(), Some("[\"j\",\"room\",true]"));
+    assert_eq!(support::send(s.port, "GET", "/sizes", &[], "").body, "207");
+    let mut want: Vec<String> = [110, 111, 112, 65520, 65521, 69985, 1].iter().map(|n| format!("[\"m\",\"room\",\"{}\"]", "x".repeat(*n))).collect();
+    want.extend((0..200).map(|i| format!("[\"m\",\"room\",\"{}\"]", "é".repeat(i % 7))));
+    assert_eq!(want[..6].iter().map(|w| w.len()).collect::<Vec<_>>(), [125, 126, 127, 65535, 65536, 70000]);
+    for w in &want {
+        assert_eq!(p.read().as_deref(), Some(w.as_str()));
+    }
+    p.close();
+}
+
+// Found in review (Q-802): on the timer, whose times are whole milliseconds rounded up, `sleep(1)`
+// took 2.5 ms on average, where it took 1.5. A sleep of a few milliseconds waits on a thread, as
+// before; a longer one on the timer. Each waits at least what it is asked, either side of where
+// the two meet. How close `sleep(1)` comes to 1 ms is measured, not tested: on a busy machine a
+// thread wakes late too.
+#[test]
+fn a_short_sleep_is_as_long_as_asked() {
+    let d = s7_dir("q802-short", "route GET /acc/:ms(int)/:n(int) = {\n    let t = now()\n    for i in 0..n {\n        sleep(ms)\n    }\n    (now() - t) / float(n)\n}\n");
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let avg = |ms: u32, n: u32| -> f64 { support::send(s.port, "GET", &format!("/acc/{}/{}", ms, n), &[], "").body.parse().unwrap() };
+    for ms in [0, 1, 4, 5, 6, 20] {
+        assert!(avg(ms, 10) >= ms as f64, "sleep({}) was short", ms);
+    }
+}
+
+// ---- end of slice 7's review ----
+
+// ---- end of slice 7 ----

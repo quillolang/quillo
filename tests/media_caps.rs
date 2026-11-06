@@ -167,7 +167,7 @@ fn pages_make_so_many_inboxes_at_most() {
         let mut no = Vec::new();
         while let Ok(o) = rx.try_recv() {
             if let Out::Text { json, .. } = o {
-                no.push(json);
+                no.push(json.to_string());
             }
         }
         no

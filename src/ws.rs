@@ -75,6 +75,67 @@ impl Socket {
         let _ = self.0.set_write_timeout(Some(d));
     }
 
+    /// The first message the page sends, when it is text of at most `max` bytes that comes
+    /// within `wait`: what a live page follows, when that is too long for its address
+    /// (FEEDBACK55.md, Q-801; branch feedback55). Handed to `f` a part at a time as it is read,
+    /// never held whole: a message of 4 MiB held for each socket took 8 MiB a socket, 2 GiB for
+    /// one visitor's 256 (found in review). False if it is not such a message (or none came).
+    pub fn first_text_parts(&mut self, max: usize, wait: std::time::Duration, mut f: impl FnMut(&[u8])) -> bool {
+        if self.0.set_read_timeout(Some(wait)).is_err() {
+            return false;
+        }
+        let ok = (|| -> std::io::Result<bool> {
+            let mut r = &self.0;
+            let (mut total, mut first) = (0u64, true);
+            loop {
+                let mut head = [0u8; 2];
+                r.read_exact(&mut head)?;
+                let (fin, opcode) = (head[0] & 0x80 != 0, head[0] & 0x0f);
+                // Text, then its continuations, masked, as a page sends them; nothing else first.
+                if head[0] & 0x70 != 0 || head[1] & 0x80 == 0 || opcode != if first { 0x1 } else { 0x0 } {
+                    return Ok(false);
+                }
+                first = false;
+                let len = match head[1] & 0x7f {
+                    126 => {
+                        let mut b = [0u8; 2];
+                        r.read_exact(&mut b)?;
+                        u16::from_be_bytes(b) as u64
+                    }
+                    127 => {
+                        let mut b = [0u8; 8];
+                        r.read_exact(&mut b)?;
+                        u64::from_be_bytes(b)
+                    }
+                    n => n as u64,
+                };
+                total = total.saturating_add(len);
+                if total > max as u64 {
+                    return Ok(false);
+                }
+                let mut mask = [0u8; 4];
+                r.read_exact(&mut mask)?;
+                let mut buf = [0u8; 4096];
+                let (mut left, mut at) = (len as usize, 0usize);
+                while left > 0 {
+                    let n = left.min(buf.len());
+                    r.read_exact(&mut buf[..n])?;
+                    for (i, b) in buf[..n].iter_mut().enumerate() {
+                        *b ^= mask[(at + i) % 4];
+                    }
+                    f(&buf[..n]);
+                    (left, at) = (left - n, at + n);
+                }
+                if fin {
+                    return Ok(true);
+                }
+            }
+        })()
+        .unwrap_or(false);
+        let _ = self.0.set_read_timeout(None);
+        ok
+    }
+
     pub fn reader(&self, max: usize) -> std::io::Result<Reader<std::net::TcpStream>> {
         Ok(Reader::new(self.0.try_clone()?, max))
     }
@@ -128,27 +189,74 @@ impl Socket {
     }
 
     fn frame(&mut self, opcode: u8, payload: &[u8]) -> bool {
-        let mut f = vec![0x80 | opcode];
-        match payload.len() {
-            n if n < 126 => f.push(n as u8),
-            n if n <= 0xffff => {
-                f.push(126);
-                f.extend_from_slice(&(n as u16).to_be_bytes());
-            }
-            n => {
-                f.push(127);
-                f.extend_from_slice(&(n as u64).to_be_bytes());
-            }
+        let mut f = Vec::with_capacity(payload.len() + 10);
+        frame_into(&mut f, opcode, payload);
+        self.write_frames(&f)
+    }
+
+    /// Frames, each an opcode (0x1 text, 0x2 binary, 0x9 ping, 0xA pong) and its payload, in one
+    /// write: what a page has waiting, not a system call each, with each frame's head made here
+    /// and its payload written from where it is, nothing copied (see `wt::over_websocket`;
+    /// FEEDBACK55.md, Q-806; branch feedback55). At most 64.
+    pub fn send_all(&mut self, frames: &[(u8, &[u8])]) -> bool {
+        const MOST: usize = 64;
+        let frames = &frames[..frames.len().min(MOST)];
+        let mut heads = [[0u8; 10]; MOST];
+        let mut lens = [0usize; MOST];
+        for (i, (op, payload)) in frames.iter().enumerate() {
+            lens[i] = head_into(&mut heads[i], *op, payload.len());
         }
-        f.extend_from_slice(payload);
+        let mut slices = [std::io::IoSlice::new(&[]); 2 * MOST];
+        for (i, (_, payload)) in frames.iter().enumerate() {
+            slices[2 * i] = std::io::IoSlice::new(&heads[i][..lens[i]]);
+            slices[2 * i + 1] = std::io::IoSlice::new(payload);
+        }
+        let mut rest = &mut slices[..2 * frames.len()];
+        let wait = self.1;
+        let until = wait.map(|w| std::time::Instant::now() + w);
+        let (mut part, mut shortened) = (false, false);
+        let ok = loop {
+            while rest.first().is_some_and(|s| s.is_empty()) {
+                rest = &mut rest[1..];
+            }
+            if rest.is_empty() {
+                break true;
+            }
+            // As `write_frames`: the deadline is for the whole write, and set again only after a
+            // part of it was written.
+            if let (true, Some(until)) = (part, until) {
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() || self.0.set_write_timeout(Some(left)).is_err() {
+                    break false;
+                }
+                shortened = true;
+            }
+            match self.0.write_vectored(rest) {
+                Ok(0) => break false,
+                Ok(n) => {
+                    std::io::IoSlice::advance_slices(&mut rest, n);
+                    part = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break false,
+            }
+        };
+        if shortened {
+            let _ = self.0.set_write_timeout(wait);
+        }
+        ok
+    }
+
+    /// Frames made with `frame_into`, written at once.
+    pub fn write_frames(&mut self, f: &[u8]) -> bool {
         let Some(wait) = self.1 else {
-            return self.0.write_all(&f).and_then(|_| self.0.flush()).is_ok();
+            return self.0.write_all(f).and_then(|_| self.0.flush()).is_ok();
         };
         // The socket's own timeout is `wait` already: set again only after a part was written,
         // to what is left, and put back after, so a frame written whole costs no system call
         // more (found in review).
         let until = std::time::Instant::now() + wait;
-        let mut rest = &f[..];
+        let mut rest = f;
         let mut shortened = false;
         let ok = loop {
             if rest.is_empty() {
@@ -172,6 +280,36 @@ impl Socket {
             let _ = self.0.set_write_timeout(Some(wait));
         }
         ok
+    }
+}
+
+/// A frame of the server's (not masked) put at the end of `f`: an opcode (0x1 text, 0x2 binary,
+/// 0x9 ping, 0xA pong) and its payload.
+pub fn frame_into(f: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
+    let mut head = [0u8; 10];
+    let n = head_into(&mut head, opcode, payload.len());
+    f.extend_from_slice(&head[..n]);
+    f.extend_from_slice(payload);
+}
+
+/// A frame's head, for a payload of `len` bytes, in `h`; how many bytes it takes.
+fn head_into(h: &mut [u8; 10], opcode: u8, len: usize) -> usize {
+    h[0] = 0x80 | opcode;
+    match len {
+        n if n < 126 => {
+            h[1] = n as u8;
+            2
+        }
+        n if n <= 0xffff => {
+            h[1] = 126;
+            h[2..4].copy_from_slice(&(n as u16).to_be_bytes());
+            4
+        }
+        n => {
+            h[1] = 127;
+            h[2..10].copy_from_slice(&(n as u64).to_be_bytes());
+            10
+        }
     }
 }
 

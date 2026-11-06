@@ -1206,7 +1206,15 @@ impl Interp {
         if rest == "live" {
             // Without waiting; the server's worker threads answer `live`
             // requests themselves and wait for a change first.
-            let (since, server, topics) = live_query(qs);
+            let (since, server, topics, later) = live_query(qs);
+            let topics = if later {
+                match later_topics(&req.body) {
+                    Ok(t) => t,
+                    Err(r) => return r,
+                }
+            } else {
+                topics
+            };
             // The tenant is the request's: without it set, none was found, and a tenant's own
             // topics were dropped too (FEEDBACK51.md, Q-666; branch feedback51-fixes).
             self.current_request = Some(Value::map(build_request(req, path, &Value::map(Map::new()))));
@@ -1599,16 +1607,111 @@ impl Drop for Landing {
 }
 
 /// `/_quillo/live?since=N&s=S&t=a,b`: the sequence number the page has
-/// seen, the server it came from, and the topics it is showing.
-fn live_query(qs: &str) -> (u64, Option<String>, Vec<String>) {
+/// seen, the server it came from, and the topics it is showing; with `tm=1`, the page sends its
+/// topics after the address (see `serve_live`).
+fn live_query(qs: &str) -> (u64, Option<String>, Vec<String>, bool) {
     let q = parse_urlencoded(qs);
     let since = q.get("since").and_then(|v| v.display().parse::<u64>().ok()).unwrap_or(0);
     let server = q.get("s").map(|v| v.display()).filter(|s| !s.is_empty());
-    let topics: Vec<String> = q
-        .get("t")
-        .map(|v| v.display().split(',').filter(|s| !s.is_empty()).take(MAX_TOPICS).map(String::from).collect())
-        .unwrap_or_default();
-    (since, server, topics)
+    let topics = q.get("t").map_or_else(Vec::new, |v| topics_of(&v.display()));
+    (since, server, topics, q.get("tm").is_some_and(|v| v.display() == "1"))
+}
+
+/// The topics a page follows, as `liveLoop` writes them: joined by commas, each with its `%` and
+/// `,` written `%25` and `%2C`, so a topic with a comma in it is one topic, where it was two and
+/// its page never heard of it (FEEDBACK55.md, Q-801; branch feedback55).
+/// A topic longer than any a change can be told of is dropped, as `liveKey` drops it (found in
+/// review).
+fn topics_of(t: &str) -> Vec<String> {
+    t.split(',')
+        .filter(|s| !s.is_empty() && s.len() <= MAX_PAGE_TOPIC * 3)
+        .map(|s| if s.contains('%') { unescape_topic(s) } else { s.to_string() })
+        .filter(|s| s.len() <= MAX_PAGE_TOPIC)
+        .take(MAX_TOPICS)
+        .collect()
+}
+
+fn unescape_topic(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find('%') {
+        out.push_str(&rest[..at]);
+        let code = rest.get(at + 1..at + 3).unwrap_or("");
+        let c = if code.eq_ignore_ascii_case("2c") { Some(',') } else if code == "25" { Some('%') } else { None };
+        match c {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[at + 3..];
+            }
+            None => {
+                out.push('%');
+                rest = &rest[at + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The longest topic a page follows that a change can be told of: the longest a program names,
+/// with room before it for a tenant's name and a mount's path (found in review of FEEDBACK55.md,
+/// Q-801; branch feedback55).
+const MAX_PAGE_TOPIC: usize = crate::shared::MAX_TOPIC + 192;
+
+/// The most of a page's topics taken after its address (`tm=1`): 256 of the longest, each `%` and
+/// `,` in them written as three bytes, as `liveKey` sends them. One page's socket was let hold 8
+/// MiB with 4 MiB, and one visitor 2 GiB with 256 sockets (found in review).
+const MAX_TOPICS_TEXT: usize = MAX_TOPICS * (MAX_PAGE_TOPIC * 3 + 1);
+
+/// Topics read as they come, a part at a time, as `topics_of` reads them all: a topic too long to be
+/// told of is skipped as it comes, not kept (found in review).
+#[derive(Default)]
+struct TopicReader {
+    topics: Vec<String>,
+    cur: Vec<u8>,
+    skip: bool,
+}
+
+impl TopicReader {
+    fn take(&mut self, part: &[u8]) {
+        for &b in part {
+            if b == b',' {
+                self.topic();
+            } else if !self.skip {
+                if self.cur.len() == MAX_PAGE_TOPIC * 3 {
+                    self.cur.clear();
+                    self.skip = true;
+                } else {
+                    self.cur.push(b);
+                }
+            }
+        }
+    }
+
+    fn topic(&mut self) {
+        if !self.skip && !self.cur.is_empty() && self.topics.len() < MAX_TOPICS {
+            let t = String::from_utf8_lossy(&self.cur);
+            let t = if t.contains('%') { unescape_topic(&t) } else { t.into_owned() };
+            if t.len() <= MAX_PAGE_TOPIC {
+                self.topics.push(t);
+            }
+        }
+        self.cur.clear();
+        self.skip = false;
+    }
+
+    fn end(mut self) -> Vec<String> {
+        self.topic();
+        self.topics
+    }
+}
+
+/// A live request's topics sent after its address, in its body: past `MAX_TOPICS_TEXT`, a 413.
+fn later_topics(body: &[u8]) -> Result<Vec<String>, HttpResponse> {
+    if body.len() > MAX_TOPICS_TEXT {
+        return Err(plain(413, "more topics than a page follows\n"));
+    }
+    Ok(topics_of(&String::from_utf8_lossy(body)))
 }
 
 /// Most topics one page can wait on; each change looks through them all.
@@ -1799,13 +1902,36 @@ const LIVE_GATHER: Duration = Duration::from_millis(100);
 /// is sent as `{seq, server, changed}` for as long as the page stays; as a
 /// plain request, the answer is the first change, or none after a while.
 fn serve_live(shared: Arc<Shared>, req: HttpRequest, (tenants, tenant): (bool, Option<String>)) -> Answer {
-    let (mut since, server, topics) = live_query(req.url.split_once('?').map_or("", |(_, q)| q));
-    let topics = own_topics(topics, tenants, tenant.as_deref());
+    let (mut since, server, topics, later) = live_query(req.url.split_once('?').map_or("", |(_, q)| q));
+    // Topics too many or too long for an address come after it: the first message of the socket,
+    // or the body of a POST (FEEDBACK55.md, Q-801; branch feedback55).
+    let upgrade = crate::ws::is_upgrade(&req);
+    let topics = if later && !upgrade {
+        match later_topics(&req.body) {
+            Ok(t) => t,
+            Err(r) => return Answer::Respond(r),
+        }
+    } else {
+        topics
+    };
     waiter("quillo-live", &req.remote.clone(), move |stream| {
         let _page = crate::metrics::LivePage::new();
-        let following = shared.follow(topics);
-        if crate::ws::is_upgrade(&req) {
+        if upgrade {
             let Some(mut socket) = crate::ws::Socket::accept(&req, stream) else { return };
+            let topics = if later {
+                let mut read = TopicReader::default();
+                if !socket.first_text_parts(MAX_TOPICS_TEXT, Duration::from_secs(10), |part| read.take(part)) {
+                    return;
+                }
+                read.end()
+            } else {
+                topics
+            };
+            let following = shared.follow(own_topics(topics, tenants, tenant.as_deref()));
+            if later {
+                // SAFETY: mimalloc's own call, for this thread's heap.
+                unsafe { libmimalloc_sys::mi_collect(true) };
+            }
             // A page that does not read is let go, not waited on for good (FEEDBACK49.md,
             // Q-594; found in review).
             socket.write_timeout(Duration::from_secs(30));
@@ -1847,6 +1973,7 @@ fn serve_live(shared: Arc<Shared>, req: HttpRequest, (tenants, tenant): (bool, O
                 server = None;
             }
         }
+        let following = shared.follow(own_topics(topics, tenants, tenant.as_deref()));
         let (seq, changed) = following.wait(since, server.as_deref(), Duration::from_secs(25));
         let mut resp = json_response(200, serde_json::from_str(&live_json(&shared, seq, &changed)).unwrap_or_default());
         resp.headers.push(("cache-control".into(), "no-store".into()));

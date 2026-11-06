@@ -199,8 +199,10 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// What goes to a page.
 pub enum Out {
-    /// `["m", channel, value]` and the like, as JSON.
-    Text { json: String, reliable: bool },
+    /// `["m", channel, value]` and the like, as JSON: one text for all the pages a message goes
+    /// to, where each had a copy, a burst to 256 pages 256 copies of each message (found in review
+    /// of FEEDBACK55.md, Q-806; branch feedback55).
+    Text { json: Arc<str>, reliable: bool },
     /// A frame of a stream it watches (see `media`), over a WebSocket.
     Media(Arc<crate::media::Frame>),
     Ping,
@@ -317,6 +319,12 @@ pub fn disconnect(p: &Arc<Peer>) {
         return;
     }
     crate::media::unwatch_all(p.id);
+    // A join still waiting is left once it has run, when it let the page in (Q-799).
+    for ((id, _), left) in lock(join_waits()).iter_mut() {
+        if *id == p.id {
+            *left = true;
+        }
+    }
     let rooms: Vec<String> = lock(&p.rooms).drain().collect();
     for r in rooms {
         if let Some(members) = lock(&hub().rooms).get_mut(&r) {
@@ -367,19 +375,39 @@ pub fn from_page(p: &Arc<Peer>, text: &str) {
         "v" if inbox_ok(p, &format!("media:{}", ch)) => inbox(&format!("media:{}", ch)).push(Event { kind: 'w', peer: p.clone(), value: String::new() }),
         "u" => crate::media::unwatch(&room_key(&format!("media:{}", ch), p.tenant.as_deref()), p.id),
         "j" if !lock(&p.rooms).contains(&key) => {
-            if inbox_ok(p, ch) {
-                inbox(ch).push(Event { kind: 'j', peer: p.clone(), value: String::new() });
-            } else {
-                joined(ch, p, false);
+            // Asked again while its join waits: that join is the answer, and a leave asked
+            // meanwhile is taken back (Q-799).
+            {
+                let mut waiting = lock(join_waits());
+                if let Some(left) = waiting.get_mut(&(p.id, key.clone())) {
+                    *left = false;
+                    return;
+                }
+                // Let in meanwhile: `joined` moves a page from waiting to the room under this lock.
+                if lock(&p.rooms).contains(&key) {
+                    return;
+                }
+                if !inbox_ok(p, ch) {
+                    drop(waiting);
+                    return joined(ch, p, false);
+                }
+                waiting.insert((p.id, key), false);
             }
+            inbox(ch).push(Event { kind: 'j', peer: p.clone(), value: String::new() });
         }
         "l" => {
+            // Under the lock `joined` lets a page in with, so that one or the other sees it.
+            let mut waiting = lock(join_waits());
             if lock(&p.rooms).remove(&key) {
+                drop(waiting);
                 if let Some(members) = lock(&hub().rooms).get_mut(&key) {
                     members.remove(&p.id);
                 }
                 inbox(ch).push(Event { kind: 'l', peer: p.clone(), value: String::new() });
                 crate::media::drop_if_idle(&key);
+            } else if let Some(left) = waiting.get_mut(&(p.id, key)) {
+                // Its join has not answered: left once it has (Q-799).
+                *left = true;
             }
         }
         // Only from a page the channel took.
@@ -396,20 +424,46 @@ pub fn let_watch(p: &Arc<Peer>, stream: &str) {
     crate::media::watch(&room_key(&format!("media:{}", stream), p.tenant.as_deref()), stream, Arc::new(Viewer(p.clone())));
 }
 
-/// The page took the channel's answer to its asking to join.
+/// The page took the channel's answer to its asking to join. A page that left the room, or went, while its join ran is not let in, and the channel's `leave`
+/// hears of it when its `join` let it in: one `leave` for each `join` that said yes, where a page
+/// gone within the join was in no room and its `leave` never ran (FEEDBACK55.md, Q-799; branch
+/// feedback55). Whether it left or went is read under the lock `disconnect` marks it with, before
+/// the page is put in the room, so one of the two always sees the other.
 fn joined(ch: &str, p: &Arc<Peer>, yes: bool) {
     let key = room_key(ch, p.tenant.as_deref());
     let held = lock(joining()).remove(&(key.clone(), p.id)).unwrap_or_default();
-    if yes && lock(&hub().peers).contains_key(&p.id) {
-        lock(&p.rooms).insert(key.clone());
-        lock(&hub().rooms).entry(key).or_default().insert(p.id);
+    let left = {
+        let mut waiting = lock(join_waits());
+        let left = waiting.remove(&(p.id, key.clone())).unwrap_or(false) || !lock(&hub().peers).contains_key(&p.id);
+        if yes && !left {
+            lock(&p.rooms).insert(key.clone());
+            lock(&hub().rooms).entry(key.clone()).or_default().insert(p.id);
+        }
+        left
+    };
+    if left {
+        if yes {
+            inbox(ch).push(Event { kind: 'l', peer: p.clone(), value: String::new() });
+            crate::media::drop_if_idle(&key);
+        }
+        return;
     }
-    p.put(Out::Text { json: serde_json::json!(["j", ch, yes]).to_string(), reliable: true });
+    p.put(Out::Text { json: Arc::from(serde_json::json!(["j", ch, yes]).to_string()), reliable: true });
     if yes {
         for out in held {
             p.put(out);
         }
     }
+}
+
+/// The rooms pages asked to join whose `join` has not answered yet, by page and room, each with
+/// whether the page left it (or went) meanwhile: one join a room at a time, and a `leave` for each
+/// `join` that let a page in (see `joined`; FEEDBACK55.md, Q-799; branch feedback55). One map for
+/// all pages, not one each: a page's own cost each page's thread memory of its own (found in
+/// review).
+fn join_waits() -> &'static Mutex<HashMap<(u64, String), bool>> {
+    static W: OnceLock<Mutex<HashMap<(u64, String), bool>>> = OnceLock::new();
+    W.get_or_init(Default::default)
 }
 
 /// Pages being let into a channel: from the moment its `join` is called to
@@ -432,7 +486,7 @@ fn hold(room: &dyn Fn(&str) -> bool, json: &str, reliable: bool, only: Option<u6
     let mut n = 0;
     for ((c, id), q) in j.iter_mut() {
         if room(c) && only.is_none_or(|o| o == *id) && Some(*id) != except && q.len() < HELD {
-            q.push(Out::Text { json: json.to_string(), reliable });
+            q.push(Out::Text { json: Arc::from(json), reliable });
             n += 1;
         }
     }
@@ -1009,7 +1063,7 @@ fn send_here(name: &str, reach: Option<Option<&str>>, id: u64, json: &str, relia
         return false;
     }
     if lock(&p.rooms).contains(&key) {
-        return p.put(Out::Text { json: json.to_string(), reliable });
+        return p.put(Out::Text { json: Arc::from(json), reliable });
     }
     // Being let in: it gets it after the yes (Q-086).
     hold(&|k: &str| k == key, json, reliable, Some(id), None) > 0
@@ -1034,7 +1088,7 @@ fn broadcast(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 /// To the pages in the rooms of `name` that code reaching `reach` reaches (see `reach`).
 fn broadcast_here(name: &str, reach: Option<Option<&str>>, json: &str, reliable: bool, except: Option<u64>) -> i64 {
-    let json = json.to_string();
+    let json: Arc<str> = Arc::from(json);
     let room = reaches(name, reach);
     let ids: Vec<u64> = lock(&hub().rooms).iter().filter(|(k, _)| room(k)).flat_map(|(_, m)| m.iter().copied()).collect();
     let peers: Vec<Arc<Peer>> = {
@@ -1325,7 +1379,7 @@ mod quic {
                     Some(Out::Text { json, reliable }) => {
                         let fits = conn.max_datagram_size().map_or(false, |m| json.len() <= m);
                         if !reliable && fits {
-                            let _ = conn.send_datagram(json.into_bytes());
+                            let _ = conn.send_datagram(json.as_bytes().to_vec());
                         } else {
                             let mut framed = Vec::with_capacity(json.len() + 4);
                             framed.extend_from_slice(&(json.len() as u32).to_be_bytes());
@@ -1419,23 +1473,82 @@ pub fn over_websocket(mut socket: crate::ws::Socket, ticket: Ticket) {
             return;
         }
     });
+    // What waits for the page goes in one write, up to `BATCH` messages: a write each made the
+    // writer slower than one request broadcasting, and a page reading at full speed lost a third
+    // of a burst of 20,000 to a queue that filled (FEEDBACK55.md, Q-806; branch feedback55). The
+    // messages are written as they are (see `ws::Socket::send_all`), with no buffer made: one,
+    // grown on each page's thread, kept 5 to 20 MiB for 256 pages after a burst (found in review).
+    // In a burst (more than one message came at once, or this one soon after the last write) it
+    // waits a moment for more before it sleeps on the queue: woken for each message, it cost the
+    // program sending a wake-up each, six times what the message did. Traffic that comes a message
+    // at a time is written as it comes, with no wait, which cost a third more of the server's time
+    // with 300 pages (found in review); and after a batch of many, what comes is taken at once, so
+    // that the queue, whose room is kept after, stays short.
     let mut clean = true;
-    while let Some(o) = rx.blocking_recv() {
-        let alive = match o {
-            Out::Text { json, .. } => socket.send(&json),
-            Out::Media(f) => socket.send_binary(&f.wire),
-            Out::Ping => socket.ping(),
-            Out::Pong(data) => socket.pong(&data),
-            Out::Close => break,
-        };
-        if !alive {
-            clean = false;
-            break;
+    let mut wrote = std::time::Instant::now().checked_sub(BURST).unwrap_or_else(std::time::Instant::now);
+    let mut batch: [Option<Out>; BATCH] = std::array::from_fn(|_| None);
+    'page: while let Some(first) = rx.blocking_recv() {
+        let mut next = Some(first);
+        let mut burst = wrote.elapsed() < BURST;
+        while next.is_some() {
+            let (mut n, mut close) = (0, false);
+            while let Some(o) = next.take() {
+                if matches!(o, Out::Close) {
+                    close = true;
+                    break;
+                }
+                batch[n] = Some(o);
+                n += 1;
+                if n < BATCH {
+                    next = rx.try_recv().ok();
+                }
+            }
+            if n > 0 && !send_batch(&mut socket, &mut batch[..n]) {
+                clean = false;
+                break 'page;
+            }
+            wrote = std::time::Instant::now();
+            if close {
+                break 'page;
+            }
+            burst |= n > 1;
+            if next.is_none() {
+                if burst && n < LINGER_UNDER {
+                    std::thread::sleep(LINGER);
+                }
+                next = rx.try_recv().ok();
+            }
         }
     }
     disconnect(&peer);
     socket.end(clean);
 }
+
+/// Writes the messages in `batch` at once, and empties it: whether the page is still there.
+fn send_batch(socket: &mut crate::ws::Socket, batch: &mut [Option<Out>]) -> bool {
+    let frames: [(u8, &[u8]); BATCH] = std::array::from_fn(|i| match batch.get(i) {
+        Some(Some(Out::Text { json, .. })) => (0x1, json.as_bytes()),
+        Some(Some(Out::Media(f))) => (0x2, &f.wire[..]),
+        Some(Some(Out::Ping)) => (0x9, &[][..]),
+        Some(Some(Out::Pong(data))) => (0xA, &data[..]),
+        _ => (0, &[][..]),
+    });
+    let alive = socket.send_all(&frames[..batch.len()]);
+    for o in batch.iter_mut() {
+        *o = None;
+    }
+    alive
+}
+
+/// How long a page's writer waits for more after a write in a burst, and how soon after its last
+/// write a message makes one (see `over_websocket`).
+const LINGER: Duration = Duration::from_micros(500);
+const BURST: Duration = Duration::from_millis(1);
+/// A batch of this many messages or more is followed by no wait (see `over_websocket`).
+const LINGER_UNDER: usize = 32;
+
+/// The most messages a page's WebSocket is written at once (see `over_websocket`).
+const BATCH: usize = 64;
 
 /// A frame a page sends to a stream (`<quillo-media publish>`): taken only
 /// from a page that joined the stream's channel, `media:<name>` (FEEDBACK6.md,
@@ -1458,7 +1571,7 @@ pub fn leave_all(key: &str) {
     for id in members {
         if let Some(p) = peers.get(&id) {
             lock(&p.rooms).remove(key);
-            p.put(Out::Text { json: serde_json::json!(["j", key_channel(key), false]).to_string(), reliable: true });
+            p.put(Out::Text { json: Arc::from(serde_json::json!(["j", key_channel(key), false]).to_string()), reliable: true });
         }
     }
 }

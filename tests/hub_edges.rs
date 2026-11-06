@@ -221,7 +221,7 @@ fn next(rx: &mut Receiver<Out>) -> Out {
 
 fn text(rx: &mut Receiver<Out>) -> String {
     match next(rx) {
-        Out::Text { json, .. } => json,
+        Out::Text { json, .. } => json.to_string(),
         Out::Media(_) => panic!("a frame came"),
         Out::Ping | Out::Pong(_) => panic!("a ping came"),
         Out::Close => panic!("it was closed"),
@@ -566,14 +566,17 @@ fn a_full_inbox_lets_go_of_messages_before_joins() {
     let held = h.held.load(Ordering::SeqCst);
     wt::from_page(&p, "[\"m\",\"jam2\",0]");
     eventually(10, "the server was not asked", || (h.held.load(Ordering::SeqCst) > held).then_some(()));
-    let (q, q_rx) = peer("{}");
-    drop(q_rx);
+    // A page asks to join a room once at a time (FEEDBACK55.md, Q-799; branch feedback55): the
+    // joins of 10,000 pages fill it.
+    let others: Vec<Arc<Peer>> = (0..10_000).map(|_| peer("{}").0).collect();
     let dropped = wt::DROPPED.load(Ordering::SeqCst);
-    for _ in 0..10_000 {
-        wt::from_page(&q, "[\"j\",\"jam2\"]");
+    for o in &others {
+        wt::from_page(o, "[\"j\",\"jam2\"]");
     }
     wt::from_page(&p, "[\"m\",\"jam2\",\"lost\"]");
     assert_eq!(wt::DROPPED.load(Ordering::SeqCst) - dropped, 1);
+    let (q, q_rx) = peer("{}");
+    drop(q_rx);
     wt::from_page(&q, "[\"j\",\"jam2\"]");
     assert_eq!(wt::DROPPED.load(Ordering::SeqCst) - dropped, 2);
     h.modes.lock().unwrap().remove("jam2");
@@ -581,6 +584,9 @@ fn a_full_inbox_lets_go_of_messages_before_joins() {
     eventually(30, "the joins did not come", || ev("channel.peers(\"jam2\")").contains(&format!("{:012x}", q.id)).then_some(()));
     wt::disconnect(&p);
     wt::disconnect(&q);
+    for o in &others {
+        wt::disconnect(o);
+    }
 }
 
 fn line(kind: &str, peer: &str, value: &str) -> String {

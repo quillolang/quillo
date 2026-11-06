@@ -258,6 +258,11 @@ impl Drop for Server {
 }
 
 impl Server {
+    /// Its process, for what a test measures of it (its memory, say).
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Stops it at once, as a crash would.
     pub fn kill(&mut self) {
         let _ = self.child.kill();

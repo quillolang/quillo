@@ -21,6 +21,6 @@ fn with_no_server_to_ask_no_one_is_let_in() {
         assert!(Instant::now() < deadline, "no answer");
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert!(matches!(out, Out::Text { json, reliable: true } if json == "[\"j\",\"room\",false]"));
+    assert!(matches!(out, Out::Text { json, reliable: true } if &*json == "[\"j\",\"room\",false]"));
     wt::disconnect(&p);
 }

@@ -65,36 +65,82 @@ pub struct Tick {
 /// one met while rendering on the server does nothing).
 pub(crate) fn every_at_top(it: &mut Interp, args: &[Value], line: u32) -> R {
     let ms = match args.first() {
-        Some(Value::Int(n)) if *n >= 1 => *n as u64,
-        Some(Value::Float(f)) if *f >= 1.0 => *f as u64,
-        _ => return fail(line, "`every` on the server takes at least 1 millisecond: every(50, step)"),
+        Some(v) => every_ms(v).or_else(|e| fail(line, e))?,
+        None => return fail(line, "`every` on the server takes at least 1 millisecond: every(50, step)"),
     };
     let f = match args.get(1) {
         Some(f @ (Value::Func(_) | Value::Builtin(..))) => f.clone(),
         _ => return fail(line, "`every` takes milliseconds and a function: every(100, step)"),
     };
-    let named = match args.get(2) {
-        Some(Value::Map(o)) => match o.get("name") {
-            Some(Value::Str(n)) => Some(n.to_string()),
-            None | Some(Value::Nil) => None,
-            Some(v) => return fail(line, format!("`every`'s name is a str, got {}", v.type_name())),
-        },
-        None | Some(Value::Nil) => None,
-        Some(v) => return fail(line, format!("`every` expects options as a map, got {}", v.type_name())),
-    };
+    let named = name_opt("every", args.get(2)).or_else(|e| fail(line, e))?;
     let name = named.unwrap_or_else(|| match &f {
         Value::Func(c) if name_ok(&c.def.name) => c.def.name.clone(),
         _ => format!("every-{}", line),
     });
-    if !name_ok(&name) {
-        return fail(line, format!("`every`: a tick's name is letters, digits, `_`, `-` and `.`, got {:?}", name));
+    if let Some(why) = name_problem("every", &name) {
+        return fail(line, why);
     }
     let site = Arc::make_mut(&mut it.site);
     if site.ticks.iter().any(|t| t.name == name) {
-        return fail(line, format!("`every`: there is already a tick named {:?}; give this one another with {{ name: ... }}", name));
+        return fail(line, named_twice("every", &name));
     }
     site.ticks.push(Arc::new(Tick { name, ms, f }));
     Ok(Value::Nil)
+}
+
+/// Why `every` or `schedule` called once the program has started is refused: what it added would
+/// never run, and the request that called it answered as if it would (FEEDBACK55.md, Q-803;
+/// branch feedback55).
+pub fn not_at_top(f: &str) -> String {
+    let (f, what) = if f == "every" { ("`every` on the server", "tick") } else { ("`schedule`", "job") };
+    format!("{f} adds a {what} as the program starts, at its top level: called here, once it has started (in a route, a server fn, a job or a tick), the {what} would never run")
+}
+
+/// The interval of `every(ms, f)` on the server, as the start and `quillo check` read it.
+pub fn every_ms(v: &Value) -> Result<u64, String> {
+    match v {
+        Value::Int(n) if *n >= 1 => Ok(*n as u64),
+        Value::Float(f) if *f >= 1.0 => Ok(*f as u64),
+        _ => Err("`every` on the server takes at least 1 millisecond: every(50, step)".to_string()),
+    }
+}
+
+/// When `schedule(when, f)` runs, as the start and `quillo check` read it: a cron line has a space
+/// (or a tab) or starts with `@`; anything else is a duration.
+pub fn when_of(v: &Value) -> Result<When, String> {
+    match v {
+        Value::Str(s) if s.contains(char::is_whitespace) || s.starts_with('@') => Cron::parse(s).map(When::Cron).map_err(|e| format!("`schedule`: {}", e)),
+        Value::Str(_) | Value::Int(_) => match crate::builtins::duration_seconds(v) {
+            Some(n) if n > 0 => Ok(When::Every(n)),
+            _ => Err(format!("`schedule` takes a duration such as \"5m\" or a cron line such as \"0 3 * * *\", got {}", v.repr())),
+        },
+        other => Err(format!("`schedule` takes a duration or a cron line first, got {}", other.type_name())),
+    }
+}
+
+/// The `{ name }` of `every`'s or `schedule`'s options, as the start and `quillo check` read it.
+pub fn name_opt(f: &str, o: Option<&Value>) -> Result<Option<String>, String> {
+    match o {
+        Some(Value::Map(o)) => match o.get("name") {
+            Some(Value::Str(n)) => Ok(Some(n.to_string())),
+            None | Some(Value::Nil) => Ok(None),
+            Some(v) => Err(format!("`{}`'s name is a str, got {}", f, v.type_name())),
+        },
+        None | Some(Value::Nil) => Ok(None),
+        Some(v) => Err(format!("`{}` expects options as a map, got {}", f, v.type_name())),
+    }
+}
+
+/// Why a tick's (`every`) or a job's name is refused.
+pub fn name_problem(f: &str, name: &str) -> Option<String> {
+    let what = if f == "every" { "a tick's" } else { "a job's" };
+    (!name_ok(name)).then(|| format!("`{}`: {} name is letters, digits, `_`, `-` and `.`, got {:?}", f, what, name))
+}
+
+/// Why a second tick or job of a name is refused.
+pub fn named_twice(f: &str, name: &str) -> String {
+    let what = if f == "every" { "tick" } else { "job" };
+    format!("`{}`: there is already a {} named {:?}; give this one another with {{ name: ... }}", f, what, name)
 }
 
 /// The secret a job request carries.
@@ -103,48 +149,35 @@ pub fn token() -> &'static str {
     TOKEN.get_or_init(|| crate::crypto::b64url(&crate::crypto::secret_bytes(32)))
 }
 
-fn name_ok(n: &str) -> bool {
+pub fn name_ok(n: &str) -> bool {
     !n.is_empty() && n.len() <= 64 && n.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
 }
 
 /// `schedule(when, f, { name })`, at the top of a program.
 fn schedule(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let when = match args.first() {
-        Some(Value::Str(s)) if s.contains(' ') || s.starts_with('@') => match Cron::parse(s) {
-            Ok(c) => When::Cron(c),
-            Err(e) => return fail(line, format!("`schedule`: {}", e)),
-        },
-        Some(v @ (Value::Str(_) | Value::Int(_))) => match crate::builtins::duration_seconds(v) {
-            Some(n) if n > 0 => When::Every(n),
-            _ => return fail(line, format!("`schedule` takes a duration such as \"5m\" or a cron line such as \"0 3 * * *\", got {}", v.repr())),
-        },
-        other => {
-            return fail(line, format!("`schedule` takes a duration or a cron line first, got {}", other.map_or("nothing", |v| v.type_name())))
-        }
+        Some(v) => when_of(v).or_else(|e| fail(line, e))?,
+        None => return fail(line, "`schedule` takes a duration or a cron line first, got nothing"),
     };
     let f = match args.get(1) {
         Some(f @ (Value::Func(_) | Value::Builtin(..))) => f.clone(),
         other => return fail(line, format!("`schedule` needs a function to run, got {}", other.map_or("nothing", |v| v.type_name()))),
     };
-    let named = match args.get(2) {
-        Some(Value::Map(o)) => match o.get("name") {
-            Some(Value::Str(n)) => Some(n.to_string()),
-            None | Some(Value::Nil) => None,
-            Some(v) => return fail(line, format!("`schedule`'s name is a str, got {}", v.type_name())),
-        },
-        None | Some(Value::Nil) => None,
-        Some(v) => return fail(line, format!("`schedule` expects options as a map, got {}", v.type_name())),
-    };
+    let named = name_opt("schedule", args.get(2)).or_else(|e| fail(line, e))?;
+    // Only as the program starts (FEEDBACK55.md, Q-803; branch feedback55).
+    if !crate::value::loading() || it.current_request.is_some() || it.pending_request.is_some() {
+        return fail(line, not_at_top("schedule"));
+    }
     let name = named.unwrap_or_else(|| match &f {
         Value::Func(c) if name_ok(&c.def.name) => c.def.name.clone(),
         _ => format!("job-{}", line),
     });
-    if !name_ok(&name) {
-        return fail(line, format!("`schedule`: a job's name is letters, digits, `_`, `-` and `.`, got {:?}", name));
+    if let Some(why) = name_problem("schedule", &name) {
+        return fail(line, why);
     }
     let site = Arc::make_mut(&mut it.site);
     if site.jobs.iter().any(|j| j.name == name) {
-        return fail(line, format!("`schedule`: there is already a job named {:?}; give this one another with {{ name: ... }}", name));
+        return fail(line, named_twice("schedule", &name));
     }
     site.jobs.push(Arc::new(Job { name, when, f }));
     Ok(Value::Nil)
@@ -245,6 +278,28 @@ pub fn slot(when: &When, now: u64) -> Option<u64> {
     }
 }
 
+/// The time `name` is due at now, when it was not run for it yet. A job first seen waits for its
+/// next time, counted from the second it was first seen: from the first minute that matched, a
+/// cron line's first time after a start was skipped, `"2 * * * *"` started at 04:01 first ran at
+/// 05:02, and a nightly job of a server deployed each day never ran (FEEDBACK55.md, Q-798; branch
+/// feedback55).
+pub fn due(last: &mut std::collections::HashMap<String, u64>, name: &str, when: &When, now: u64) -> Option<u64> {
+    if !last.contains_key(name) {
+        let seen = match when {
+            When::Every(n) => now / n * n,
+            When::Cron(_) => now / 60 * 60,
+        };
+        last.insert(name.to_string(), seen);
+    }
+    let due = slot(when, now)?;
+    let prev = last.get_mut(name)?;
+    if due <= *prev {
+        return None;
+    }
+    *prev = due;
+    Some(due)
+}
+
 /// Runs the scheduler: `jobs` gives the program's jobs as they are now
 /// (they change when `--watch` reloads it), and each due job is asked of
 /// the server at `addr`.
@@ -266,13 +321,7 @@ pub fn start(addr: std::net::SocketAddr, jobs: impl Fn() -> Vec<(String, When)> 
             }
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
             for (name, when) in jobs() {
-                let Some(due) = slot(&when, now) else { continue };
-                // A job first seen now waits for its next time.
-                let prev = last.entry(name.clone()).or_insert(due);
-                if due <= *prev {
-                    continue;
-                }
-                *prev = due;
+                let Some(due) = due(&mut last, &name, &when, now) else { continue };
                 if !running.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name.clone()) {
                     if said.insert(name.clone()) {
                         eprintln!("quillo: job {} is still running; skipped until it ends", name);

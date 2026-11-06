@@ -5243,13 +5243,19 @@ function liveTopics() {
   return [...all].sort();
 }
 
+// The topics as the server reads them: each one's own `%` and `,` written out, so that a comma in
+// one is no separator (FEEDBACK55.md, Q-801; branch feedback55). The 256 the server follows, and
+// none longer than it can be told of (its `MAX_PAGE_TOPIC`), which keeps what is sent within what
+// it reads.
+const liveKey = (topics) => topics.filter((t) => t.length <= 448).slice(0, 256).map((t) => t.replace(/%/g, "%25").replace(/,/g, "%2C")).join(",");
+
 // Starts waiting, or starts again when the set of topics changed.
 function liveRestart() {
   queueMicrotask(() => {
     if (!Live.running) {
       Live.running = true;
       liveLoop();
-    } else if (liveTopics().join(",") !== Live.key && Live.ctrl) {
+    } else if (liveKey(liveTopics()) !== Live.key && Live.ctrl) {
       Live.ctrl.abort();
     }
   });
@@ -5260,16 +5266,20 @@ async function liveLoop() {
   let fails = 0;
   for (;;) {
     const topics = liveTopics();
-    Live.key = topics.join(",");
+    // Topics too long for an address go after it, in the socket's first message or a POST's
+    // body, where the server refused the address and the page never heard of a change
+    // (FEEDBACK55.md, Q-801; branch feedback55).
+    Live.key = liveKey(topics);
     if (!topics.length) { Live.running = false; return; }
     const ctrl = (Live.ctrl = new AbortController());
-    const url = BASE + "/_quillo/live?since=" + Live.seq + "&s=" + Live.server + "&t=" + encodeURIComponent(Live.key);
+    const t = encodeURIComponent(Live.key), later = t.length > LIVE_IN_URL;
+    const url = BASE + "/_quillo/live?since=" + Live.seq + "&s=" + Live.server + (later ? "&tm=1" : "&t=" + t);
     // What a refusal asks for: a server that is full says when to try again.
     let after = 0;
     try {
-      if (await liveSocket(url, ctrl.signal)) fails = 0;
+      if (await liveSocket(url, ctrl.signal, later ? Live.key : null)) fails = 0;
       else if (!ctrl.signal.aborted) {
-        const r = await wireFetch(url, { signal: ctrl.signal, cache: "no-store" });
+        const r = await wireFetch(url, later ? { method: "POST", body: Live.key, signal: ctrl.signal, cache: "no-store" } : { signal: ctrl.signal, cache: "no-store" });
         if (r.ok) { liveChanged(readJSON(await r.text())); fails = 0; continue; }
         after = (Number(r.headers.get("retry-after")) || 0) * 1000;
         fails++;
@@ -5289,13 +5299,16 @@ async function liveLoop() {
   }
 }
 
-// Resolves when the socket closes: true if it had opened.
-function liveSocket(url, signal) {
+// The longest a live request's topics are in its address (see `liveLoop`).
+const LIVE_IN_URL = 6000;
+
+// Resolves when the socket closes: true if it had opened. `first`: the topics, sent once it has.
+function liveSocket(url, signal, first) {
   return new Promise((resolve) => {
     if (typeof WebSocket !== "function" && !(WIRE && WIRE.socket)) return resolve(false);
     const ws = openSocket(url);
     let opened = false;
-    ws.onopen = () => { opened = true; };
+    ws.onopen = () => { opened = true; if (first !== null) ws.send(first); };
     ws.onmessage = (m) => { if (!signal.aborted) liveChanged(readJSON(m.data)); };
     ws.onclose = () => resolve(opened);
     // Carry on at once: a closing socket finishes closing in its own time
@@ -5433,7 +5446,8 @@ function onCleanup(f) {
 // its `src`]. Either side lets go in constant time. Small arrays are made
 // to size (a pushed-to array would keep room for a dozen more).
 class Sig {
-  constructor(v) { this._v = v; this.obs = null; this.keys = null; }
+  // `n`: the claims made on it, the program's sets (see `W.claim`).
+  constructor(v) { this._v = v; this.obs = null; this.keys = null; this.n = 0; }
   get v() { if (Listener) link(Listener, this); return this._v; }
   set(v) {
     const was = this._v;
@@ -7152,13 +7166,14 @@ class Inst extends Scope {
       let v = this.s0[name];
       if (v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length === 1 && typeof v.$quillo_prop === "string") v = this.props[v.$quillo_prop];
       const s = new Sig(v);
-      if (page) Promise.resolve().then(init).then((x) => s.set(x), report);
+      // Set by the page before this comes, it keeps what the page set (Q-800).
+      if (page) { const n = W.claim(s); Promise.resolve().then(init).then((x) => W.latest(s, n, x), report); }
       return s;
     }
     const v = init();
     if (v instanceof Promise) {
-      const s = new Sig(null);
-      v.then((x) => s.set(x), report);
+      const s = new Sig(null), n = W.claim(s);
+      v.then((x) => W.latest(s, n, x), report);
       return s;
     }
     return new Sig(v);
@@ -7618,6 +7633,14 @@ W.settle = async (v) => {
   if (v === null || typeof v !== "object" || typeof v.then !== "function" || foreign(v) && !(v instanceof Promise)) return v;
   try { return fromPage(await v); } catch (e) { return new Err("js: " + (e && e.message || String(e)), true); }
 };
+// The latest set of a state wins (see `Stmt::Assign` in src/client.rs): a set claims its state,
+// and a function that waits claims each state it sets as it begins; what it sets once another set
+// has claimed the state since is dropped (FEEDBACK55.md, Q-800; branch feedback55).
+W.claim = (s) => ++s.n;
+W.latest = (s, n, v) => { if (s.n === n) s.set(v); return null; };
+W.put = (s, v) => { s.n++; return s.set(v); };
+// A set in a function that waits: a plain one until it took a claim on the state, then its claim's.
+W.to = (s, v, n) => (n === undefined ? W.put(s, v) : W.latest(s, n, v));
 W.Dec = Dec;
 W.Fl = Fl;
 W.Ret = Ret;

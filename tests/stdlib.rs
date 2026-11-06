@@ -238,11 +238,16 @@ fn a_browser_librarys_name_is_null_on_the_server() {
     assert_eq!(ev("use Chart from \"https://example.com/chart.js\"\nChart(1, 2)"), "null");
 }
 
+// A component's `every` is the browser's, and gives null as the server renders it. In a route's
+// own code it said null and never ran: an error now, as `schedule` there (FEEDBACK55.md, Q-803;
+// branch feedback55).
 #[test]
 fn every_in_a_request_belongs_to_the_browser() {
     let d = folder("every");
-    let mut it = program(&d, "route GET /good = str(every(100, () => 1))\nroute GET /bad = str(every(1, 2))\n");
-    assert_eq!(get(&mut it, "/good").text(), "null");
+    let mut it = program(&d, "component Ticking() {\n    state n = 0\n    every(100, () => { n += 1 })\n    <p>{n}</p>\n}\nroute GET /good = <Ticking/>\nroute GET /route = str(every(100, () => 1))\nroute GET /bad = str(every(1, 2))\n");
+    let good = get(&mut it, "/good");
+    assert!(good.status == 200 && good.text().contains("<p"), "{}", good.text());
+    assert_eq!(get(&mut it, "/route").status, 500);
     assert_eq!(get(&mut it, "/bad").status, 500);
 }
 

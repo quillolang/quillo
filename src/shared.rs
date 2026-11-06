@@ -149,6 +149,19 @@ pub struct Live {
     wilds: Vec<(String, u64, Instant)>,
 }
 
+/// The longest topic a program may name, in bytes (FEEDBACK55.md, Q-801; branch feedback55).
+pub const MAX_TOPIC: usize = 256;
+
+/// Why `watch` or `publish` (`f`) refuses a topic: an empty one, which no page could follow, or one
+/// past `MAX_TOPIC`, whose page asked for it in an address the server refused (414), and never
+/// heard of a change (FEEDBACK55.md, Q-801; branch feedback55).
+pub fn topic_problem(f: &str, t: &str) -> Option<String> {
+    if t.is_empty() {
+        return Some(format!("`{}`: a topic is a name, and this one is empty", f));
+    }
+    (t.len() > MAX_TOPIC).then(|| format!("`{}`: a topic is at most {} bytes, and this one is {}", f, MAX_TOPIC, t.len()))
+}
+
 /// How long a wildcard is kept as one (see `wilds_expire`).
 const WILD_FOR: Duration = Duration::from_secs(60);
 
