@@ -266,7 +266,8 @@ fn json_too_large_or_too_deep_is_an_error_and_the_server_goes_on() {
     // 3.5 GB and 3 s (found in review).
     let t = std::time::Instant::now();
     assert_eq!(support::send(s.port, "GET", "/len/24", &[], "").body, "100663293");
-    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    // As above: CI's debug build took 5.04 s once.
+    assert!(t.elapsed() < Duration::from_secs(if cfg!(debug_assertions) { 30 } else { 5 }), "{:?}", t.elapsed());
     // Under the limits, as before.
     assert_eq!(support::send(s.port, "GET", "/shared/3", &[], "").body, "[[[[1],[1]],[[1],[1]]],[[[1],[1]],[[1],[1]]]]");
     assert!(support::send(s.port, "GET", "/deep/9999", &[], "").body.starts_with("[[[["));
