@@ -34,7 +34,9 @@ fn what_it_is_given_is_checked() {
     let it = |src: &str| Interp::new(".").load_source(&format!("db.open(\":memory:\")\n{}", src), "many.qwe").map(|v| v.repr()).map_err(|e| e.to_string());
     assert!(it("db.exec_many(\"select 1\", [1, 2])").unwrap_err().contains("row 1 is int, not a list of the statement's values"));
     assert!(it("db.exec_many(\"select 1\")").unwrap_err().contains("takes the SQL and a list of rows"));
-    assert!(it("db.exec_many(\"select 1\", [[1]], [[2]])").unwrap_err().contains("takes the SQL and a list of rows"));
+    // More than it takes is said by the call, as for every builtin (FEEDBACK55.md, Q-786; branch
+    // feedback55).
+    assert!(it("db.exec_many(\"select 1\", [[1]], [[2]])").unwrap_err().contains("`db.exec_many` takes 2 arguments, got 3: db.exec_many(sql, rows)"));
     // The checker knows it, and that it needs the db effect.
     let diags = |src: &str| check_source(src, "t.qwe", Path::new(".")).diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>();
     assert!(diags("let n = db.exec_many(\"insert into t values (?)\", [[1]])\n").is_empty());

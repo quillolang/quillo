@@ -1291,7 +1291,9 @@ type Pl = { xs: list<float> }
         (r#"[0 * -1, -3 * 0, -4 % 2, -(0), float(0 * -1), 1.5 / (0 * -1), -0.0 * 1, 1.0 / -0.0]"#, r#"[["int", "int", "int", "int", "float", "float", "float", "float"], [0, 0, 0, 0, 0, inf, 0, -inf]]"#),
         (r#"[2.0 == 2, 2 == 2.0, [2.0] == [2], { a: 2.0 } == { a: 2 }, 2.0 == dec("2"), 2.5 == 2, 2.0 != 2, contains([1.0], 1), index_of([1, 2.0], 2)]"#, r#"[["bool", "bool", "bool", "bool", "bool", "bool", "bool", "bool", "int"], [true, true, true, true, true, false, false, true, 1]]"#),
         (r#"[2.0 < 3, 2.0 <= 2, 2 >= 2.0, 1e300 > 9223372036854775807, -0.0 < 0, sort([2.0, 1, 1.5, -0.0, 0])]"#, r#"[["bool", "bool", "bool", "bool", "bool", ["float", "int", "int", "float", "float"]], [true, true, true, true, false, [0, 0, 1, 1.5, 2]]]"#),
-        (r#"[sqrt(4), abs(-2.0), abs(-2), floor(2.5), floor(2.0), ceil(-0.5), round(2.5), round(-2.5), round(2.0), round(5, 2), floor(9.1e15), ceil(-9.1e15)]"#, r#"[["float", "float", "int", "int", "int", "int", "int", "int", "int", "float", "float", "float"], [2, 2, 2, 2, 2, 0, 3, -3, 2, 5, 9100000000000000, -9100000000000000]]"#),
+        // An int rounded to places is itself, and a float made whole is an int past 9e15 too
+        // (slice 10: FEEDBACK55.md, Q-788 and Q-789).
+        (r#"[sqrt(4), abs(-2.0), abs(-2), floor(2.5), floor(2.0), ceil(-0.5), round(2.5), round(-2.5), round(2.0), round(5, 2), floor(9.1e15), ceil(-9.1e15)]"#, r#"[["float", "float", "int", "int", "int", "int", "int", "int", "int", "int", "int", "int"], [2, 2, 2, 2, 2, 0, 3, -3, 2, 5, 9100000000000000, -9100000000000000]]"#),
         (r#"[float(2), float("2"), float("2.5"), float(" 7 "), float("1e3"), float(".5"), float("5."), float("+1.5"), float("-0"), float("1e400"), float("inf"), float("-Infinity"), float("nan")]"#, r#"[["float", "float", "float", "float", "float", "float", "float", "float", "float", "float", "float", "float", "float"], [2, 2, 2.5, 7, 1000, 0.5, 5, 1.5, 0, inf, inf, -inf, NaN]]"#),
         (r#"[float("0x10"), float("0b11"), float("0o17"), float(" 0x10 "), float("1_000"), float(""), float("."), float("e5"), float("1e")]"#, r#"[["error", "error", "error", "error", "error", "error", "error", "error", "error"], [err("not a number: \"0x10\""), err("not a number: \"0b11\""), err("not a number: \"0o17\""), err("not a number: \" 0x10 \""), err("not a number: \"1_000\""), err("not a number: \"\""), err("not a number: \".\""), err("not a number: \"e5\""), err("not a number: \"1e\"")]]"#),
         (r#"[int(2.0), int(2.9), int(-2.9), int(1e15), int(9007199254740993.0), int(-9.223372036854775808e18), int(9.223372036854775807e18), int(math.inf), int(-0.5)]"#, r#"[["int", "int", "int", "int", "int", "int", "error", "error", "int"], [2, 2, -2, 1000000000000000, 9007199254740992, -9223372036854775808, err("9223372036854776000 is too large for an int"), err("cannot convert float to int"), 0]]"#),
@@ -1802,7 +1804,9 @@ fn escape_writes_a_cr_and_a_nul_the_same_on_both_sides() {
 #[test]
 fn builtins_that_take_an_int_take_one_past_2_53() {
     same_on_both("", &[
-        (r#"[slice("abc", 1, 9007199254740993), slice([1, 2, 3], -9007199254740993), slice("abc", 9007199254740993), take("abc", 9007199254740993), take([1], -9007199254740993), drop([1, 2], 9007199254740993), drop("ab", -9007199254740993), round(1.5, 9007199254740993), round(1.25, -9007199254740993), cursor_index("abc", 9007199254740993)]"#, r#"[["str", ["int", "int", "int"], "str", "str", [], [], "str", "float", "float", "int"], ["bc", [1, 2, 3], "", "abc", [], [], "ab", 1.5, 1, 3]]"#),
+        // `round(1.25, -9007199254740993)` rounds to a power of ten past every float: 0 (slice 10:
+        // FEEDBACK55.md, Q-789).
+        (r#"[slice("abc", 1, 9007199254740993), slice([1, 2, 3], -9007199254740993), slice("abc", 9007199254740993), take("abc", 9007199254740993), take([1], -9007199254740993), drop([1, 2], 9007199254740993), drop("ab", -9007199254740993), round(1.5, 9007199254740993), round(1.25, -9007199254740993), cursor_index("abc", 9007199254740993)]"#, r#"[["str", ["int", "int", "int"], "str", "str", [], [], "str", "float", "float", "int"], ["bc", [1, 2, 3], "", "abc", [], [], "ab", 1.5, 0, 3]]"#),
         (r#"repeat("a", 9007199254740993)"#, r#"ERROR: `repeat` count is negative or too large"#),
         (r#"repeat("a", -9007199254740993)"#, r#"ERROR: `repeat` count is negative or too large"#),
         (r#"set([1, 2], 9007199254740993, 0)"#, r#"ERROR: `set`: index 9007199254740993 is outside a list of 2"#),
@@ -4688,7 +4692,8 @@ fn no_location_runs_code_or_carries_a_page() {
     for (i, u) in ["javascript:alert(1)", "JavaScript:alert(1)", " java\tscript:alert(1)", "vbscript:x", "data:text/html,<script>alert(1)</script>", "DATA:x", "\u{1}data:x"].iter().enumerate() {
         for route in ["r", "s"] {
             let why = error_of(port, &log, &format!("/{}?u={}&i={}", route, enc(u), i));
-            assert!(why.contains("header `location` is not given a javascript:, vbscript: or data: URL"), "{} {:?}: {}", route, u, why);
+            // The scheme given is named (slice 10).
+            assert!(why.contains("header `location` is not given a ") && why.contains(" URL, got "), "{} {:?}: {}", route, u, why);
         }
         let why = error_of(port, &log, &format!("/to?u={}&i={}", enc(u), i));
         assert!(why.contains("`redirect` is not given a") || why.contains("`redirect` URL cannot contain line breaks, tabs or other control characters"), "{:?}: {}", u, why);
@@ -4699,7 +4704,7 @@ fn no_location_runs_code_or_carries_a_page() {
     }
     let d = dir("location-site", "site_headers({ location: env(\"L\") ?? \"/\" })\nprint(\"ok\")\n");
     let ran = script_with_env(&d, "main.qwe", &[("L", "data:x")]);
-    assert!(ran.contains("`site_headers`: `location` is not given a javascript:, vbscript: or data: URL, got \"data:x\""), "{}", ran);
+    assert!(ran.contains("`site_headers`: `location` is not given a data: URL, got \"data:x\""), "{}", ran);
     assert!(script_with_env(&d, "main.qwe", &[("L", "/elsewhere")]).contains("ok"));
 }
 
@@ -8851,3 +8856,713 @@ fn a_services_file_is_found_as_a_used_file_is() {
         assert!(ok && out == "7\n", "{}: {}{}", f, out, err);
     }
 }
+
+// ---- slice 10 ----
+
+/// What `expr` gives in the browser alone (compiled for it, in Node), `prelude` run first: as
+/// `same_on_both` writes it, `ERROR: ...` for an error. None without Node.
+fn s10_browser(prelude: &str, defs: &str, expr: &str) -> Option<String> {
+    let src = format!("{}\nfn __t() = ({})\n", defs, expr);
+    let mut it = quillo::Interp::new(".");
+    it.load_source(&src, "case.qwe").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    in_node(&format!("{}\n{}", prelude, quillo::client::test_script(&it, "__t").unwrap()))
+}
+
+/// `quillo run` of `src`, under a deadline: what it wrote, both streams.
+fn s10_run(src: &str) -> String {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let d = dir(&format!("s10-run-{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)), src);
+    script_with_env(&d, "main.qwe", &[])
+}
+
+// Q-783: `sum` of text joined it after a "0": `sum(["12.50", "5.00"])` was "012.505.00", and
+// `sum([1, 2, "3"])` "33". Text is refused, at the item it is, on both sides; numbers, decimals
+// and floats from text keep adding up, and an empty list or null is 0.
+#[test]
+fn sum_adds_numbers_and_refuses_text() {
+    const TEXT: &str = ": use `float(...)` or `dec(...)` first";
+    same_on_both(
+        "fn amounts() = map(split(\"apples,12.50\\npears,5.00\", \"\\n\"), (l) => split(l, \",\")[1])\nfn v2(x) = x",
+        &[
+            ("sum(amounts())", &format!("ERROR: `sum` adds numbers; got the str \"12.50\" at item 0{}", TEXT)),
+            ("sum([1, 2, \"3\"])", &format!("ERROR: `sum` adds numbers; got the str \"3\" at item 2{}", TEXT)),
+            ("sum([\"\"])", &format!("ERROR: `sum` adds numbers; got the str \"\" at item 0{}", TEXT)),
+            ("sum([1.5, \"é\"])", &format!("ERROR: `sum` adds numbers; got the str \"é\" at item 1{}", TEXT)),
+            ("sum(map(amounts(), (a) => float(a)))", "[\"float\", 17.5]"),
+            ("sum(map(amounts(), (a) => dec(a)))", "[\"dec\", 17.50m]"),
+            ("sum([1, 2, 3])", "[\"int\", 6]"),
+            ("sum([2.5])", "[\"float\", 2.5]"),
+            ("sum([])", "[\"int\", 0]"),
+            ("sum(v2(null))", "[\"int\", 0]"),
+            ("sum([1, 0.5, 1.5m] | filter((x) => type_of(x) != \"dec\"))", "[\"float\", 1.5]"),
+        ],
+    );
+}
+
+// Q-784: an error became text where a builtin took it as text: a key of `group_by`, `set`, `get`,
+// `has` and `remove`, the text `re.replace`'s function gave, a value of `url_encode`. Each gives
+// the error back, as `filter` gives its function's; an error as a map's value is kept as it was.
+#[test]
+fn an_error_is_given_back_not_made_text() {
+    same_on_both(
+        "fn bad(s) = int(s)\nfn v2(x) = x",
+        &[
+            ("group_by([\"1\", \"x\"], (s) => bad(s))", "[\"error\", err(\"not an int: \\\"x\\\"\")]"),
+            ("group_by([\"1\", \"2\", \"1\"], (s) => bad(s))", "[[[\"1\", [\"str\", \"str\"]], [\"2\", [\"str\"]]], { \"1\": [\"1\", \"1\"], \"2\": [\"2\"] }]"),
+            ("group_by([], (s) => bad(s))", "[[], {}]"),
+            ("set({}, bad(\"q\"), 1)", "[\"error\", err(\"not an int: \\\"q\\\"\")]"),
+            ("set({ a: 1 }, err(\"k\"), 1)", "[\"error\", err(\"k\")]"),
+            ("get({ a: 1 }, err(\"k\"))", "[\"error\", err(\"k\")]"),
+            ("get({ a: 1 }, err(\"k\"), 0)", "[\"error\", err(\"k\")]"),
+            ("has({}, err(\"k\"))", "[\"error\", err(\"k\")]"),
+            ("remove({ a: 1 }, err(\"k\"))", "[\"error\", err(\"k\")]"),
+            ("set({}, \"a\", err(\"v\"))", "[[[\"a\", \"error\"]], { a: err(\"v\") }]"),
+            ("[get({ \"1\": \"one\" }, 1), has({ \"é\": 1 }, \"é\"), remove({ a: 1, b: 2 }, \"a\")]", "[[\"str\", \"bool\", [[\"b\", \"int\"]]], [\"one\", true, { b: 2 }]]"),
+            ("re.replace(\"ab\", \"a\", (m) => err(\"bad\"))", "[\"error\", err(\"bad\")]"),
+            ("re.replace(\"aba\", \"a\", (m) => m.start == 2 ? err(\"second\") : \"x\")", "[\"error\", err(\"second\")]"),
+            ("re.replace(\"ab\", \"a\", (m) => upper(m.text))", "[\"str\", \"Ab\"]"),
+            ("re.replace(\"\", \"a\", (m) => err(\"never\"))", "[\"str\", \"\"]"),
+            ("url_encode({ a: err(\"e\") })", "[\"error\", err(\"e\")]"),
+            ("url_encode({ a: 1, b: err(\"first\"), c: err(\"second\") })", "[\"error\", err(\"first\")]"),
+            ("url_encode(err(\"e\"))", "[\"error\", err(\"e\")]"),
+            ("url_encode({ a: 1, b: null, é: \"x y\" })", "[\"str\", \"a=1&%C3%A9=x%20y\"]"),
+            ("url_encode(v2(null))", "[\"str\", \"null\"]"),
+        ],
+    );
+}
+
+// Q-785: a pattern binding one name twice matched anything, the last part's value kept:
+// `[x, x]` took `[1, 2]`, and `let [y, y] = [1, 2]` made y 2. Refused in the parser, so `check`
+// and a run say it; each alternative binds its own, and a guard tests two parts for equality.
+#[test]
+fn a_name_bound_twice_in_one_pattern_is_refused() {
+    const TWICE: &str = "is bound twice in this pattern: to test that two parts are equal, use `[";
+    for (src, name) in [
+        ("fn same(v) = match v {\n    [x, x] => \"same\"\n    _ => \"different\"\n}\n", "x"),
+        ("let [y, y] = [1, 2]\n", "y"),
+        ("fn f(v) = match v {\n    { p: a, q: a } => a\n    _ => 0\n}\n", "a"),
+        ("fn f(v) = match v {\n    { a, b: { a } } => a\n    _ => 0\n}\n", "a"),
+        ("fn f(v) = match v {\n    [x, ..x] => x\n    _ => 0\n}\n", "x"),
+        ("fn f(v) = match v {\n    [a] as a => a\n    _ => 0\n}\n", "a"),
+        ("fn f(v) = match v {\n    { page: int, n: page } => page\n    _ => 0\n}\n", "page"),
+        ("fn f(v) = match v {\n    [é, [é]] => é\n    _ => 0\n}\n", "é"),
+        ("fn f(v) = match v {\n    [x, 1 | x] => x\n    _ => 0\n}\n", "x"),
+        ("for [k, k] in [[1, 2]] {\n    print(k)\n}\n", "k"),
+        ("route POST /r { json: { a, b: a } } {\n    a\n}\n", "a"),
+    ] {
+        let (ok, out) = check(src);
+        assert!(!ok && out.contains(&format!("`{}` {}", name, TWICE)), "{}\n{}", src, out);
+    }
+    let ran = s10_run("fn same(v) = match v {\n    [x, x] => \"same\"\n    _ => \"different\"\n}\nprint(same([1, 2]))\n");
+    assert!(ran.contains(&format!("main.qwe:2: error: `x` {}", TWICE)) && !ran.contains("same\n"), "{}", ran);
+    // What must keep working: alternatives, a guard, different names, nested and wild parts.
+    let src = "fn same(v) = match v {\n    [x, y] if x == y => \"same\"\n    [x, _] | [_, x] if x == 0 => \"a zero\"\n    [1, x] | [x, 1] => `one and ${x}`\n    { a: [b, c], d } => `${b}${c}${d}`\n    [_, _] => \"different\"\n    _ => \"other\"\n}\nlet [p, q] = [1, 2]\nprint(same([1, 1]), same([0, 5]), same([7, 1]), same({ a: [1, 2], d: 3 }), same([2, 3]), p + q)\n";
+    let (ok, out) = check(src);
+    assert!(ok, "{}", out);
+    assert_eq!(s10_run(src), "same a zero one and 7 123 different 3\n");
+}
+
+// Q-786: a builtin ignored arguments past the ones it takes, where `check` could not see the
+// call: on an untyped value (`xs.sort((a, b) => b - a)` sorted up, `line.split(",", 2)` split
+// at every comma), through a variable or a list, or given to another builtin
+// (`reduce(xs, 0, max)`). Each is refused as it is called, on both sides, with what it takes;
+// as many as it takes, fewer where they are optional, and any number for `print`, still work.
+#[test]
+fn a_builtin_given_more_than_it_takes_says_so_on_both_sides() {
+    const SORT: &str = "ERROR: `sort` takes 1 argument, got 2: sort(xs); to sort by a key, `sort_by(xs, (x) => key)`, and `reverse` of it for the other way";
+    same_on_both(
+        "fn mods() = [math.trunc, math.floor]\nfn desc(xs) = xs.sort((a, b) => b - a)\nfn two(line) = line.split(\",\", 2)\nfn one(line) = line.split(\",\")\nfn all(line) = line.split()\nfn fs() = [split, upper]\nfn via(f, a, b, c) = f(a, b, c)\nfn top(xs) = xs.reduce(0, max)\nfn m(x) = x.max()\nfn v2(x) = x",
+        &[
+            ("desc([3, 1, 2])", SORT),
+            ("two(\"a,b,c\")", "ERROR: `split` takes 2 arguments, got 3: split(s, sep)"),
+            ("via(split, \"a b\", \" \", 1)", "ERROR: `split` takes 2 arguments, got 3: split(s, sep)"),
+            ("fs()[0](\"a,b\", \",\", 2)", "ERROR: `split` takes 2 arguments, got 3: split(s, sep)"),
+            ("via(uuid, 1, 2, 3)", "ERROR: `uuid` takes 0 arguments, got 3: uuid()"),
+            ("top([1, 5, 2])", "ERROR: `max` takes 1 argument, got 2: max(xs)"),
+            ("mods()[0](2.5, 1)", "ERROR: `math.trunc` takes 1 argument, got 2: math.trunc(x)"),
+            ("mods()[1](2.5)", "[\"int\", 2]"),
+            ("reduce([[1], [2]], [], v2(merge)) ?? \"merge takes two\"", "[\"str\", \"merge takes two\"]"),
+            ("one(\"a,b\")", "[[\"str\", \"str\"], [\"a\", \"b\"]]"),
+            ("all(\"a b\")", "[[\"str\", \"str\"], [\"a\", \"b\"]]"),
+            ("fs()[1](\"é\")", "[\"str\", \"É\"]"),
+            ("m([1, 3])", "[\"int\", 3]"),
+            ("map([\"1\", \"2\"], int)", "[[\"int\", \"int\"], [1, 2]]"),
+            ("sort_by([\"bb\", \"a\"], len)", "[[\"str\", \"str\"], [\"a\", \"bb\"]]"),
+            ("[desc([]) ?? \"refused\", [1].len]", "[[\"str\", \"int\"], [\"refused\", 1]]"),
+        ],
+    );
+    // A call `check` cannot see refused as it runs, at its line.
+    let ran = s10_run("fn desc(xs) = xs.sort((a, b) => b - a)\nprint(\"before\")\nprint(desc([3, 1, 2]))\n");
+    assert!(ran.starts_with("before\n") && ran.contains(&format!("main.qwe:1: {}", &SORT["ERROR: ".len()..])), "{}", ran);
+    // `print` takes any number; a module's function is held to its own.
+    assert_eq!(s10_run("let p = print\np(1, 2, 3, 4, 5)\nlet t = [math.trunc][0]\nprint(t(2.5))\nprint(t(2.5, 1) ?? \"no\")\n"), "1 2 3 4 5\n2\nno\n");
+}
+
+// The same written where the call is seen: `check` says it, and the browser's code says it as the
+// server does, if run anyway (a method of a module's too).
+#[test]
+fn a_call_with_more_than_a_builtin_takes_is_refused_in_the_browser_where_it_is_written() {
+    let (ok, out) = check("print(sort([3, 1], (a, b) => b - a))\n");
+    assert!(!ok && out.contains("`sort` takes 1 argument, got 2"), "{}", out);
+    let Some(js) = s10_browser("", "", "sort([3, 1], (a, b) => b - a)") else { return };
+    assert!(js.starts_with("ERROR: `sort` takes 1 argument, got 2: sort(xs); to sort by a key"), "{}", js);
+    assert_eq!(s10_browser("", "", "math.trunc(2.5, 1)").unwrap(), "ERROR: `math.trunc` takes 1 argument, got 2: math.trunc(x)");
+    assert_eq!(s10_browser("", "", "[1, 2].sort(3)").unwrap(), "ERROR: `sort` takes 1 argument, got 2: sort(xs); to sort by a key, `sort_by(xs, (x) => key)`, and `reverse` of it for the other way");
+    // A map's own method of that name is its own.
+    assert_eq!(s10_browser("", "fn mk() = { sort: (a, b) => a + b }", "mk().sort(1, 2)").unwrap(), "3");
+    assert_eq!(s10_browser("", "", "math.trunc(2.5)").unwrap(), "2");
+    let mut it = quillo::Interp::new(".");
+    it.load_source("fn mk() = { sort: (a, b) => a + b }\n", "case.qwe").unwrap();
+    assert_eq!(ev(&mut it, "mk().sort(1, 2)"), "3");
+}
+
+// Q-787: an int and a float were compared through a float: `9007199254740993 == 9007199254740992.0`
+// was true, `sort` put ...993 before ...992.0 and `unique` kept one of them. Exactly now, as in
+// Python, on both sides; ints and floats each among themselves as before, NaN refused, 2^63
+// above every int.
+#[test]
+fn an_int_and_a_float_compare_exactly() {
+    same_on_both(
+        "fn v2(x) = x",
+        &[
+            ("[9007199254740993 == 9007199254740992.0, 9007199254740993 != 9007199254740992.0, 9007199254740993 > 9007199254740992.0, 9007199254740992.0 < 9007199254740993]", "[[\"bool\", \"bool\", \"bool\", \"bool\"], [false, true, true, true]]"),
+            ("[9007199254740992 == 9007199254740992.0, 9007199254740992 <= 9007199254740992.0, 9007199254740992 >= 9007199254740992.0, 9007199254740991 < 9007199254740992.0]", "[[\"bool\", \"bool\", \"bool\", \"bool\"], [true, true, true, true]]"),
+            // Stable: 992.0 and 992 are equal, and stay in their order (Python's too). A whole float is
+            // written as a page writes it, with no `.0`; its type says float.
+            ("sort([9007199254740993, 9007199254740992.0, 9007199254740992])", "[[\"float\", \"int\", \"int\"], [9007199254740992, 9007199254740992, 9007199254740993]]"),
+            ("[9223372036854775807 < 9223372036854775808.0, 9223372036854775807 == 9223372036854775808.0, 9223372036854775808.0 > 9223372036854775807]", "[[\"bool\", \"bool\", \"bool\"], [true, false, true]]"),
+            ("[-9223372036854775808 == -9223372036854775808.0, -9223372036854775807 > -9223372036854775808.0, 1 == 1.0, 0 == -0.0, 2 < 2.5, -3 > -3.5]", "[[\"bool\", \"bool\", \"bool\", \"bool\", \"bool\", \"bool\"], [true, true, true, true, true, true]]"),
+            ("[max([9007199254740993, 9007199254740992.0]), min([9007199254740992.0, 9007199254740993]), 5 < math.inf, -5 > -math.inf]", "[[\"int\", \"float\", \"bool\", \"bool\"], [9007199254740993, 9007199254740992, true, true]]"),
+            ("[contains([9007199254740992.0], 9007199254740993), index_of([1.0, 9007199254740993], 9007199254740993)]", "[[\"bool\", \"int\"], [false, 1]]"),
+            ("1 < math.nan", "ERROR: cannot compare int with float"),
+        ],
+    );
+}
+
+// The same in machine code: a function on numbers, compiled once called again, and a loop at the
+// top level, compiled as it goes on; either side's int and float, at 2^53, 2^63 and NaN.
+#[test]
+fn compiled_code_compares_an_int_and_a_float_exactly() {
+    let defs = "fn lt(a: int, b: float) -> bool = a < b\nfn le(a: int, b: float) -> bool = a <= b\nfn gt(a: float, b: int) -> bool = a > b\nfn ge(a: float, b: int) -> bool = a >= b\nfn count(n: int, lim: float) -> int {\n    let c = 0\n    let i = 9007199254740990\n    while i < n {\n        if i <= lim { c += 1 }\n        if lim > i { c += 100 }\n        i += 1\n    }\n    c\n}";
+    let mut it = quillo::Interp::new(".");
+    it.load_source(defs, "case.qwe").unwrap();
+    let before = quillo::jit::compiled();
+    let cases = [
+        ("lt(9007199254740993, 9007199254740992.0)", "false"),
+        ("lt(9007199254740991, 9007199254740992.0)", "true"),
+        ("lt(9007199254740992, 9007199254740992.0)", "false"),
+        ("le(9007199254740992, 9007199254740992.0)", "true"),
+        ("le(9007199254740993, 9007199254740992.0)", "false"),
+        ("lt(9223372036854775807, 9223372036854775808.0)", "true"),
+        ("le(9223372036854775807, 9223372036854775808.0)", "true"),
+        ("lt(-9223372036854775808, -9223372036854775808.0)", "false"),
+        ("le(-9223372036854775808, -9223372036854775808.0)", "true"),
+        ("lt(1, 1.5)", "true"),
+        ("lt(2, 1.5)", "false"),
+        ("lt(0, -0.0)", "false"),
+        ("le(0, -0.0)", "true"),
+        ("lt(5, math.inf)", "true"),
+        ("le(5, -math.inf)", "false"),
+        ("gt(9007199254740992.0, 9007199254740993)", "false"),
+        ("ge(9007199254740992.0, 9007199254740993)", "false"),
+        ("ge(9007199254740992.0, 9007199254740992)", "true"),
+        ("gt(9223372036854775808.0, 9223372036854775807)", "true"),
+        ("ge(9223372036854775808.0, 9223372036854775807)", "true"),
+        ("gt(-9223372036854775808.0, -9223372036854775808)", "false"),
+        ("ge(-9223372036854775808.0, -9223372036854775808)", "true"),
+        ("gt(2.5, 2)", "true"),
+        ("lt(1, math.nan) ?? \"refused\"", "\"refused\""),
+        // From ...990 to ...994 against ...992.0: ...990, ...991 and ...992 are at or below it.
+        ("count(9007199254740995, 9007199254740992.0)", "203"),
+        // ...993.5 is the float ...994.0: all five at or below it, four below.
+        ("count(9007199254740995, 9007199254740993.5)", "405"),
+    ];
+    for _ in 0..3 {
+        for (call, want) in cases {
+            assert_eq!(ev(&mut it, call), want, "{}", call);
+        }
+    }
+    assert!(quillo::jit::compiled() > before, "nothing was compiled");
+    // A loop at the top level, compiled after its first rounds (src/jitloop.rs).
+    let loops = quillo::jitloop::compiled();
+    let mut it = quillo::Interp::new(".");
+    it.load_source("let c = 0\nlet lim = 9007199254740992.0\nlet big = 9223372036854775808.0\nfor i in 9007199254740000..9007199254741000 {\n    if i <= lim { c += 1 }\n    if lim >= i { c += 1000 }\n    if i < big { c += 1000000 }\n}\nlet r = c\n", "main.qwe").unwrap();
+    assert!(quillo::jitloop::compiled() > loops, "the loop was not compiled");
+    // ...000 to ...992 are at or below 2^53 as a float, ...993 to ...999 above; all below 2^63.
+    assert_eq!(ev(&mut it, "r"), "1000993993");
+    // A list written in the round first, so the round cannot be given back to the interpreter:
+    // worked out in the loop's code.
+    let loops = quillo::jitloop::compiled();
+    let mut it = quillo::Interp::new(".");
+    it.load_source("let xs = []\nlet c = 0\nlet lim = 9007199254740992.0\nfor i in 9007199254740000..9007199254741000 {\n    xs = xs | push(i)\n    if i <= lim { c += 1 }\n    if lim > i { c += 1000 }\n    if i < 1.5 { c += 1000000 }\n}\nlet r = [c, len(xs)]\n", "main.qwe").unwrap();
+    assert!(quillo::jitloop::compiled() > loops, "the loop was not compiled");
+    assert_eq!(ev(&mut it, "r"), "[992993, 1000]");
+    // NaN met in compiled code: refused as the interpreter refuses it, with or without a list
+    // written first.
+    for write in ["", "xs = xs | push(i)\n    "] {
+        let loops = quillo::jitloop::compiled();
+        let mut it = quillo::Interp::new(".");
+        let src = format!("let xs = []\nlet c = 0\nlet z = 0.0\nfor i in 0..1000 {{\n    {}let lim = i < 500 ? 0.5 : z / z\n    if i < lim {{ c += 1 }}\n}}\nlet r = c\n", write);
+        let Err(e) = it.load_source(&src, "main.qwe") else { panic!("no error: {}", src) };
+        assert!(quillo::jitloop::compiled() > loops, "not compiled: {}", src);
+        assert!(e.to_string().contains("cannot compare int with float"), "{}", e);
+    }
+}
+
+// Q-788: `floor(a / b)`, the guide's integer division, went through the float `a / b`, wrong past
+// 2^53 (`floor(9007199254740995 / 2)` ...498, Python's ...497) and a float past 9e15. Two ints
+// divide in ints for `floor`, `ceil`, `round` and math's `floor`, `ceil` and `trunc`, on both
+// sides; with a float on a side it is as before.
+#[test]
+fn floor_of_an_int_division_is_exact() {
+    same_on_both(
+        "fn v2(x) = x",
+        &[
+            ("[floor(9007199254740995 / 2), floor(9223372036854775807 / 10), ceil(9223372036854775807 / 2)]", "[[\"int\", \"int\", \"int\"], [4503599627370497, 922337203685477580, 4611686018427387904]]"),
+            ("[floor(7 / 2), floor(-7 / 2), floor(7 / -2), floor(-7 / -2), floor(6 / 3), floor(0 / 5)]", "[[\"int\", \"int\", \"int\", \"int\", \"int\", \"int\"], [3, -4, -4, 3, 2, 0]]"),
+            ("[ceil(7 / 2), ceil(-7 / 2), ceil(7 / -2), ceil(6 / 3)]", "[[\"int\", \"int\", \"int\", \"int\"], [4, -3, -3, 2]]"),
+            ("[round(7 / 2), round(-7 / 2), round(5 / 3), round(4 / 3), round(-5 / 3), round(1 / 2), round(-1 / 2), round(1 / 3)]", "[[\"int\", \"int\", \"int\", \"int\", \"int\", \"int\", \"int\", \"int\"], [4, -4, 2, 1, -2, 1, -1, 0]]"),
+            ("[math.floor(-7 / 2), math.ceil(-7 / 2), math.trunc(-7 / 2), math.trunc(9007199254740995 / 2)]", "[[\"int\", \"int\", \"int\", \"int\"], [-4, -3, -3, 4503599627370497]]"),
+            ("[floor(-9223372036854775807 / 2), floor(-9223372036854775808 / 1), floor(9007199254740993 / 9007199254740993)]", "[[\"int\", \"int\", \"int\"], [-4611686018427387904, -9223372036854775808, 1]]"),
+            ("[round(9223372036854775807 / 2), round(-9223372036854775807 / 2), round(9007199254740993 / 4), ceil(-9223372036854775807 / 2)]", "[[\"int\", \"int\", \"int\", \"int\"], [4611686018427387904, -4611686018427387904, 2251799813685248, -4611686018427387903]]"),
+            ("[floor(7.5 / 2), floor(7 / 2.0), ceil(1 / 3.0), round(2.5 / 1)]", "[[\"int\", \"int\", \"int\", \"int\"], [3, 3, 1, 3]]"),
+            ("floor(1 / v2(0))", "ERROR: division by zero"),
+            ("floor(-9223372036854775808 / v2(-1))", "ERROR: integer overflow"),
+            ("[floor(1.5), ceil(-1.5), round(2.5), floor(9007199254740993)]", "[[\"int\", \"int\", \"int\", \"int\"], [1, -1, 3, 9007199254740993]]"),
+            ("[type_of(round(1e16)), round(1e16), floor(-9.2e18), ceil(9223372036854774784.0)]", "[[\"str\", \"int\", \"int\", \"int\"], [\"int\", 10000000000000000, -9200000000000000000, 9223372036854774784]]"),
+            ("[round(1e19), floor(-math.inf), ceil(math.nan) == ceil(math.nan)]", "[[\"float\", \"float\", \"bool\"], [10000000000000000000, -inf, false]]"),
+        ],
+    );
+}
+
+// Q-789: `round(x, n)` took a negative `n` as 0 for a float (`round(1234.5678, -2)` 1235.0) and
+// rounded an int through a float (`round(9007199254740993, 2)` ...992.0). A float to fewer than no
+// places rounds to tens and hundreds as a decimal does, a half away from zero; an int is itself
+// to any places, and exact to fewer than none; past an int, the overflow.
+#[test]
+fn round_to_places_is_exact_for_ints_and_takes_fewer_than_none() {
+    same_on_both(
+        "fn v2(x) = x",
+        &[
+            ("[round(1234.5678, -2), round(1250.0, -2), round(-1250.0, -2), round(1249.9, -2), round(5.0, -1), round(-1234.5, -1)]", "[[\"float\", \"float\", \"float\", \"float\", \"float\", \"float\"], [1200, 1300, -1300, 1200, 10, -1230]]"),
+            ("[round(1255, -1), round(1250, -2), round(-1250, -2), round(1249, -2), round(-4, -1), round(4, -1)]", "[[\"int\", \"int\", \"int\", \"int\", \"int\", \"int\"], [1260, 1300, -1300, 1200, 0, 0]]"),
+            ("[round(9007199254740993, 2), round(9007199254740993, 0), round(5, 2), round(-7, 15), round(9007199254740995, -1)]", "[[\"int\", \"int\", \"int\", \"int\", \"int\"], [9007199254740993, 9007199254740993, 5, -7, 9007199254741000]]"),
+            ("[round(4999999999999999999, -19), round(-9223372036854775808, -20), round(9223372036854775807, -400), round(1234.5m, -2)]", "[[\"int\", \"int\", \"int\", \"dec\"], [0, 0, 0, 1200m]]"),
+            ("round(9223372036854775807, -1)", "ERROR: integer overflow"),
+            ("round(5000000000000000000, -19)", "ERROR: integer overflow"),
+            ("[round(1.5, -400), round(-1.5, -1), round(0.0, -3), round(1e300, -2) == 1e300, round(math.inf, -2)]", "[[\"float\", \"float\", \"float\", \"bool\", \"float\"], [0, 0, 0, true, inf]]"),
+            ("[round(1e29, -29), round(4e28, -29), round(123456789012345678901234567890.0, -28)]", "[[\"float\", \"float\", \"float\"], [100000000000000000000000000000, 0, 120000000000000000000000000000]]"),
+            // A decimal holds 7.5e28, not the 8e28 it rounds to: by floats then.
+            ("round(75000000000000000000000000000.0, -28)", "[\"float\", 80000000000000000000000000000]"),
+            ("[round(1.005, 2), round(2.5), round(1234.5678, 2)]", "[[\"float\", \"int\", \"float\"], [1.01, 3, 1234.57]]"),
+            // Places of a float past a decimal's size, and past a float's: by floats, or itself.
+            ("[round(1e30, 2), round(1e300, 15) == 1e300]", "[[\"float\", \"bool\"], [1000000000000000000000000000000, true]]"),
+        ],
+    );
+}
+
+// Q-790: `pow(int, int)` with a power of 2^32 or more fell back to a float: `pow(-1, 9007199254740993)`
+// 1.0 (the sign wrong), `pow(2, 4294967296)` inf. The int it is for -1, 0 and 1, the overflow for
+// any other base, on both sides; a power below 2^32 and a negative one as before.
+#[test]
+fn pow_of_ints_is_an_int_or_the_overflow() {
+    same_on_both(
+        "fn v2(x) = x",
+        &[
+            ("[pow(-1, 9007199254740993), pow(-1, 9007199254740994), pow(0, 4294967296), pow(1, 4294967296), pow(-1, 4294967296), pow(-1, 4294967295)]", "[[\"int\", \"int\", \"int\", \"int\", \"int\", \"int\"], [-1, 1, 0, 1, 1, -1]]"),
+            ("[pow(1, 9223372036854775807), pow(-1, 9223372036854775807), pow(0, 0), pow(-1, 0), pow(2, 62), pow(-2, 63)]", "[[\"int\", \"int\", \"int\", \"int\", \"int\", \"int\"], [1, -1, 1, 1, 4611686018427387904, -9223372036854775808]]"),
+            ("pow(2, 4294967296)", "ERROR: integer overflow"),
+            ("pow(-2, 9007199254740993)", "ERROR: integer overflow"),
+            ("pow(2, 4294967295)", "ERROR: integer overflow"),
+            ("pow(2, 63)", "ERROR: integer overflow"),
+            ("[pow(2, -1), pow(4, 0.5), pow(-1, -4294967297)]", "[[\"float\", \"float\", \"float\"], [0.5, 2, -1]]"),
+        ],
+    );
+}
+
+// Q-791: `unique` compared each item with every one kept: 20,000 ints took 1.4 s. Hashed as `==`
+// keys them, on both sides (a list of 200,000 in a second at most, where it took minutes), and
+// what it keeps is as before: 1, 1.0 and 1m are one, NaN is never equal, maps in any key order.
+#[test]
+fn unique_is_hashed_and_keeps_what_equality_says() {
+    same_on_both(
+        "fn v2(x) = x\nfn mk(t) = <b>{t}</b>",
+        &[
+            ("unique([1, 1.0, 1m, 2, \"2\", 2.0, \"2\", null, null, true, true])", "[[\"int\", \"int\", \"str\", \"null\", \"bool\"], [1, 2, \"2\", null, true]]"),
+            ("unique([9007199254740993, 9007199254740992.0, 9007199254740992, 9007199254740993.0])", "[[\"int\", \"float\"], [9007199254740993, 9007199254740992]]"),
+            ("unique([0, -0.0, 0m, 0.1, 0.1m, 0.10m, 1e-30, 2.5])", "[[\"int\", \"float\", \"float\", \"float\"], [0, 0.1, 0.000000000000000000000000000001, 2.5]]"),
+            // 1e-30 == 0m (28 places hold none of it) and 0m == 0, but 1e-30 is not 0: the first of
+            // those equal is kept, as before.
+            ("unique([1e-30, 0m, 0])", "[[\"float\", \"int\"], [0.000000000000000000000000000001, 0]]"),
+            ("unique([0m, 1e-30, 0])", "[[\"dec\"], [0m]]"),
+            ("unique([[1, 2], [1, 2.0], [2, 1], { a: 1, b: [2] }, { b: [2.0], a: 1 }, err(\"e\"), err(\"e\")])", "[[[\"int\", \"int\"], [\"int\", \"int\"], [[\"a\", \"int\"], [\"b\", [\"int\"]]], \"error\"], [[1, 2], [2, 1], { a: 1, b: [2] }, err(\"e\")]]"),
+            ("len(unique([math.nan, math.nan]))", "[\"int\", 2]"),
+            ("[len(unique([upper, upper, lower])), len(unique([[[[[[1]]]]], [[[[[1.0]]]]], [[[[[2]]]]]])), len(unique([mk(\"x\"), mk(\"x\")]))]", "[[\"int\", \"int\", \"int\"], [2, 2, 1]]"),
+            ("unique([\"é\", \"e\\u{301}\", \"é\", \"\"])", "[[\"str\", \"str\", \"str\"], [\"é\", \"e\u{301}\", \"\"]]"),
+            ("[unique([]), unique(v2(null)), unique([5])]", "[[[], [], [\"int\"]], [[], [], [5]]]"),
+            ("[len(unique(range(0, 200000))), len(unique(range(0, 200000) | map((i) => i % 1000))), len(unique(range(0, 100000) | map((i) => str(i % 5000))))]", "[[\"int\", \"int\", \"int\"], [200000, 1000, 5000]]"),
+        ],
+    );
+    // In time: ints, text and lists, each 200,000 long.
+    let mut it = quillo::Interp::new(".");
+    it.load_source("let xs = range(0, 200000)\nlet ts = xs | map((i) => `w${i}`)\nlet ls = xs | map((i) => [i % 100, i % 7])\n", "case.qwe").unwrap();
+    let start = std::time::Instant::now();
+    assert_eq!(ev(&mut it, "[len(unique(xs)), len(unique(ts)), len(unique(ls)), unique(xs)[199999]]"), "[200000, 200000, 700, 199999]");
+    assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+}
+
+// Q-792: `json.stringify` wrote a function as its text (`{"f":"<fn <fn>>"}`), and a route's
+// answer too. It is an error naming where the function is, on both sides; a route answering
+// with one is an internal error, said in the log.
+#[test]
+fn json_has_no_functions() {
+    const NO: &str = "is a function, which cannot be written as JSON";
+    same_on_both(
+        "fn v2(x) = x",
+        &[
+            ("json.stringify({ f: (x) => x, g: print })", &format!("[\"error\", err(\"json.stringify: `f` {}\")]", NO)),
+            ("json.stringify({ a: 1, b: [2, { c: print }] })", &format!("[\"error\", err(\"json.stringify: `b[1].c` {}\")]", NO)),
+            ("json.stringify([1, upper])", &format!("[\"error\", err(\"json.stringify: `[1]` {}\")]", NO)),
+            ("json.stringify({ \"my key\": upper, é: 1 })", &format!("[\"error\", err(\"json.stringify: `[\\\"my key\\\"]` {}\")]", NO)),
+            ("json.stringify({ é: [upper] })", &format!("[\"error\", err(\"json.stringify: `é[0]` {}\")]", NO)),
+            ("json.stringify(err(upper))", &format!("[\"error\", err(\"json.stringify: `error` {}\")]", NO)),
+            ("json.stringify(v2(upper))", "[\"error\", err(\"json.stringify: a function cannot be written as JSON\")]"),
+            ("json.stringify({ a: [1, \"<fn>\"], b: null, c: {}, d: 1.5m })", "[\"str\", \"{\\\"a\\\":[1,\\\"<fn>\\\"],\\\"b\\\":null,\\\"c\\\":{},\\\"d\\\":\\\"1.5\\\"}\"]"),
+            ("json.stringify([])", "[\"str\", \"[]\"]"),
+        ],
+    );
+    let d = dir("s10-json-fn", "route GET /f = { ok: true, f: (x) => x }\nroute GET /ok = { ok: true }\n");
+    let (_g, port, log) = serve_logged(&d, &[]);
+    assert_eq!(support::send(port, "GET", "/ok", &[], "").body, "{\"ok\":true}");
+    let a = support::send(port, "GET", "/f", &[], "");
+    assert_eq!((a.status, a.body.as_str()), (500, "{\"error\":\"internal error\"}"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let l = std::fs::read_to_string(&log).unwrap_or_default();
+        if l.contains(&format!("the answer's value cannot be written as JSON: `f` {}", NO)) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{}", l);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+// Q-793: `math.trunc`, `floor` and `ceil` refused what is between 9.2e18 and 2^63, though `int`
+// takes it. The test is 2^63 now, on both sides: the largest float below it is an int, 2^63 and
+// past it the overflow, -2^63 the smallest int.
+#[test]
+fn math_trunc_floor_and_ceil_reach_2_63() {
+    same_on_both(
+        "fn v2(x) = x",
+        &[
+            ("[math.trunc(9.2e18), math.floor(9223372036854774784.0), math.ceil(-9223372036854775808.0), math.trunc(-9.2e18), math.floor(1.5), math.ceil(-0.5)]", "[[\"int\", \"int\", \"int\", \"int\", \"int\", \"int\"], [9200000000000000000, 9223372036854774784, -9223372036854775808, -9200000000000000000, 1, 0]]"),
+            ("math.trunc(9223372036854775808.0)", "ERROR: integer overflow"),
+            ("math.ceil(9223372036854774784.5e0 + 2048.0)", "ERROR: integer overflow"),
+            ("math.floor(-9223372036854777856.0)", "ERROR: integer overflow"),
+            ("math.trunc(math.inf)", "ERROR: `math.trunc`: cannot convert inf to an int"),
+            ("[int(9.2e18), math.trunc(9007199254740993)]", "[[\"int\", \"int\"], [9200000000000000000, 9007199254740993]]"),
+        ],
+    );
+}
+
+// Q-794: a map literal with a key written twice kept the last value with no word, however each was
+// written. `check` warns; a spread between them, or keys that differ in case, are no repeat.
+#[test]
+fn a_map_key_written_twice_is_warned_of() {
+    const TWICE: &str = "is written twice in this map: the last value is the one kept";
+    for (src, key) in [
+        ("print({ a: 1, b: 2, a: 3 })\n", "a"),
+        ("print({ a: 1, \"a\": 2 })\n", "a"),
+        ("let a = 1\nprint({ a, a: 2 })\n", "a"),
+        ("print({ é: 1, \"é\": 2 })\n", "é"),
+        ("print({\n    name: \"x\",\n    total: 1,\n    name: \"y\",\n})\n", "name"),
+        ("let m = {}\nprint({ ...m, b: 1, b: 2 })\n", "b"),
+    ] {
+        let (ok, out) = check(src);
+        assert!(ok && out.contains(&format!("warning: the key `{}` {}", key, TWICE)), "{}\n{}", src, out);
+    }
+    for src in ["let m = {}\nprint({ a: 1, ...m, a: 2 })\n", "print({ a: 1, A: 2, \"a b\": 3, ab: 4 })\n", "print({})\n", "print({ a: { a: 1 }, b: { a: 2 } })\n"] {
+        let (ok, out) = check(src);
+        assert!(ok && !out.contains("warning"), "{}\n{}", src, out);
+    }
+}
+
+// Q-795: the smallest int could not be written: `-9223372036854775808` was "number ... is too
+// large", where Rust, Java and Python take it. It is that int, in a pattern too, on both sides;
+// the digits alone, or after a `-` that subtracts, are past an int, and say how it is written.
+#[test]
+fn the_smallest_int_can_be_written() {
+    same_on_both(
+        "fn m(v) = match v {\n    -9223372036854775808 => \"smallest\"\n    _ => \"other\"\n}",
+        &[
+            ("[-9223372036854775808, -9223372036854775807 - 1 == -9223372036854775808, - 9223372036854775808]", "[[\"int\", \"bool\", \"int\"], [-9223372036854775808, true, -9223372036854775808]]"),
+            ("[m(-9223372036854775807 - 1), m(-9223372036854775807), m(0)]", "[[\"str\", \"str\", \"str\"], [\"smallest\", \"other\", \"other\"]]"),
+            ("-9223372036854775808 - 1", "ERROR: integer overflow"),
+            ("-(-9223372036854775808)", "ERROR: integer overflow"),
+        ],
+    );
+    for (src, msg) in [
+        ("print(5 - 9223372036854775808)\n", "number `9223372036854775808` is too large: the smallest int is written `-9223372036854775808`"),
+        ("print(9223372036854775808)\n", "number `9223372036854775808` is too large"),
+        ("print(-9223372036854775809)\n", "number `9223372036854775809` is too large"),
+    ] {
+        let (ok, out) = check(src);
+        assert!(!ok && out.contains(msg), "{}\n{}", src, out);
+    }
+}
+
+// Left from slice 6 (Q-754): `quillo check` warned of the update the guide gives, a `set` made of
+// pairs with `map` and `join` over `sql_name` and `sql_param`, as it did not follow them. Text
+// made only of those is SQL-safe, however it is written (piped, called, methods, in a variable,
+// `map` of `sql_name` itself); a raw value in the same shape still warns, and so does a function's
+// parameter named as a variable that holds safe text.
+#[test]
+fn check_follows_map_and_join_over_sql_names() {
+    const WARN: &str = "with SQL built from values";
+    let head = "let cols = [\"title\", \"body\"]\n";
+    for body in [
+        "let set = cols | map((c) => `${sql_name(c)} = ${sql_param(c)}`) | join(\", \")\nroute POST /a = db.exec(`update t set ${set} where id = :id`, { id: 1, title: \"a\", body: \"b\" })\n",
+        "let set = join(map(cols, (c) => `${sql_name(c)} = ${sql_param(c)}`), \", \")\nroute POST /a = db.exec(`update t set ${set} where id = :id`, { id: 1 })\n",
+        "route POST /a = db.exec(`update t set ${cols.map((c) => `${sql_name(c)} = ${sql_param(c)}`).join(\", \")} where id = :id`, { id: 1 })\n",
+        "route POST /a = db.exec(`insert into t (${cols | map(sql_name) | join(\", \")}) values (${sql_param(cols)})`, { title: \"a\", body: \"b\" })\n",
+        "route POST /a = db.exec(`select ${join([sql_name(\"a\"), sql_name(\"b\")], \", \")} from t`)\n",
+        "route POST /a = db.exec(`update t set ${cols | map((é) => `${sql_name(é)} = ${sql_param(é)}`) | join(\", \")} where id = :id`, { id: 1 })\n",
+    ] {
+        let (ok, out) = check(&format!("{}{}", head, body));
+        assert!(ok && !out.contains(WARN), "{}\n{}", body, out);
+    }
+    for body in [
+        "let set = cols | map((c) => `${c} = ${sql_param(c)}`) | join(\", \")\nroute POST /a = db.exec(`update t set ${set} where id = :id`, { id: 1 })\n",
+        "let q = \"x\"\nlet set = cols | map((q) => `${q} = 1`) | join(\", \")\nroute POST /a = db.exec(`update t set ${set} where id = :id`, { id: 1 })\n",
+        "route POST /a ? { s: str } = db.exec(`update t set ${[s] | map((c) => `${sql_name(c)} = ${c}`) | join(\", \")} where id = 1`)\n",
+        "route POST /a ? { s: str } = db.exec(`update t set ${cols | map((c) => `${sql_name(c)} = 1`) | join(s)} where id = 1`)\n",
+        "route POST /a ? { s: str } = db.exec(`update t set ${cols | map((c) => s) | join(\",\")} where id = 1`)\n",
+        "route POST /a ? { s: str } = db.exec(`select ${join([sql_name(\"a\"), s], \", \")} from t`)\n",
+    ] {
+        let (ok, out) = check(&format!("{}{}", head, body));
+        assert!(ok && out.contains(WARN), "{}\n{}", body, out);
+    }
+}
+
+// Left from slice 6 (Q-756): `sql_name("名前")` stopped the program, "letters" meaning ASCII.
+// Letters and digits of any script are a name, quoted, with the marks that go on a letter (found
+// in review: Hindi's, Thai's, an accent written apart), and work as one on SQLite, PostgreSQL and
+// MariaDB: tables and columns made, written and read back, one of 63 bytes too. A character past
+// the first 65,536 (MySQL takes none in a name), a mark on no letter, and a name past 63 bytes
+// (PostgreSQL keeps 63, so two names would be one there) are refused on every database, as text
+// that is no name is.
+#[test]
+fn sql_names_of_any_script_are_quoted_on_every_database() {
+    let program = "let t = sql_name(\"表_é\")\nlet c = sql_name([\"名前\", \"ǅx\", \"n٣\"])\nfn setup() = db.exec(`create table ${t} (${sql_name(\"名前\")} varchar(10), ${sql_name(\"ǅx\")} int, ${sql_name(\"n٣\")} int)`)\n";
+    let body = "setup()\ndb.exec(`insert into ${t} (${c}) values (${sql_param([\"名前\", \"ǅx\", \"n٣\"])})`, { 名前: \"a\", ǅx: 1, n٣: 2 })\ndb.query(`select ${sql_name(\"名前\")} as v, ${sql_name(\"n٣\")} as w from ${t}`)";
+    let sqlite = support::temp_dir("feedback55-s10-names").join("n.db");
+    let mut urls = vec![sqlite.to_string_lossy().into_owned()];
+    let pg = pg_db("s10names");
+    let maria = maria_db("s10names");
+    urls.extend(pg.iter().map(|(_, u)| u.clone()));
+    urls.extend(maria.iter().map(|(_, u)| u.clone()));
+    for url in &urls {
+        let mut it = on_db(url, program);
+        assert_eq!(ev(&mut it, body), "[{ v: \"a\", w: 2 }]", "{}", url);
+        // Refused alike: past the first 65,536, more than 63 bytes, starting with a digit of any
+        // script, and no letter or digit; 63 bytes is a name.
+        for (bad, why) in [("\"x😀\"", "letters, digits and _"), ("\"٣x\"", "letters, digits and _"), ("\"a b\"", "letters, digits and _"), ("\"\"", "letters, digits and _"), ("\"\\u{301}a\"", "letters, digits and _"), ("\"a_\\u{301}\"", "letters, digits and _"), (&format!("\"{}\"", "é".repeat(32)), "at most 63 bytes"), (&format!("\"{}\"", "a".repeat(64)), "at most 63 bytes")] {
+            has(&ev(&mut it, &format!("sql_name({})", bad)), &format!("is not a name SQL can take ({})", why), bad);
+        }
+        assert_eq!(ev(&mut it, &format!("len(sql_name(\"{}\"))", "a".repeat(63))), "65", "{}", url);
+        // Marks on a letter: Devanagari's vowel sign and virama, Thai's tone mark, an accent
+        // written apart, two marks on one letter.
+        let marks = "let t3 = sql_name(\"हिन्दी\")\nlet c3 = [\"ชื่อ\", \"cafe\\u{301}\", \"a\\u{301}\\u{323}\"]\ndb.exec(`create table ${t3} (${sql_name(c3[0])} int, ${sql_name(c3[1])} int, ${sql_name(c3[2])} int)`)\ndb.exec(`insert into ${t3} (${sql_name(c3)}) values (${sql_param(c3)})`, { \"ชื่อ\": 1, \"cafe\\u{301}\": 2, \"a\\u{301}\\u{323}\": 3 })\ndb.query(`select ${sql_name(c3[1])} as v from ${t3}`)";
+        assert_eq!(ev(&mut it, marks), "[{ v: 2 }]", "{}", url);
+        let long = format!("{}x", "é".repeat(31));
+        let made = format!("let w = sql_name(\"{}\")\ndb.exec(`create table ${{w}} (${{w}} int)`)\ndb.exec(`insert into ${{w}} (${{w}}) values (?)`, 7)\ndb.query(`select ${{w}} as v from ${{w}}`)", long);
+        assert_eq!(ev(&mut it, &made), "[{ v: 7 }]", "{}", url);
+        // A refusal is what `??` guards.
+        assert_eq!(ev(&mut it, "sql_name(\"x😀\") ?? \"guarded\""), "\"guarded\"");
+    }
+}
+
+// A refused location named javascript: whatever it was given (`redirect("vbscript:...")`, and the
+// three schemes listed in a header's); each names the one given, on the server and in the
+// browser's `navigate`.
+#[test]
+fn a_refused_url_names_its_scheme() {
+    let d = dir(
+        "s10-schemes",
+        "route GET /to ? { u: str } = redirect(u)\nroute GET /r ? { u: str } = respond(302, null, { location: u })\nroute GET /s ? { u: str } = stream((send) => send(\"x\"), { headers: { Location: u } })\nroute GET /n ? { u: str } = navigate(u)\n",
+    );
+    let (_g, port, log) = serve_logged(&d, &[]);
+    for (i, (u, scheme)) in [("vbscript:x", "vbscript:"), ("VBScript:msgbox(1)", "vbscript:"), (" java\tscript:alert(1)", "javascript:"), ("javascript:x", "javascript:"), ("data:text/html,x", "data:")].iter().enumerate() {
+        let why = error_of(port, &log, &format!("/to?u={}&i={}", enc(u), i));
+        assert!(why.contains(&format!("`redirect` is not given a {} URL", scheme)) || why.contains("`redirect` URL cannot contain"), "{:?}: {}", u, why);
+        for route in ["r", "s"] {
+            let why = error_of(port, &log, &format!("/{}?u={}&i={}", route, enc(u), i));
+            assert!(why.contains(&format!("header `location` is not given a {} URL, got ", scheme)), "{} {:?}: {}", route, u, why);
+        }
+        if scheme != &"data:" {
+            let why = error_of(port, &log, &format!("/n?u={}&i={}", enc(u), i));
+            assert!(why.contains(&format!("`navigate` is not given a {} URL", scheme)), "{:?}: {}", u, why);
+        }
+    }
+    let d = dir("s10-schemes-site", "site_headers({ location: env(\"L\") ?? \"/\" })\nprint(\"ok\")\n");
+    assert!(script_with_env(&d, "main.qwe", &[("L", "vbscript:x")]).contains("`site_headers`: `location` is not given a vbscript: URL, got \"vbscript:x\""));
+    // The browser's `navigate`, and what is handed to the page's code.
+    let Some(js) = s10_browser("", "", "navigate(\"vbscript:x\")") else { return };
+    assert_eq!(js, "ERROR: `navigate` is not given a vbscript: URL");
+    assert_eq!(s10_browser("", "", "navigate(\"javascript:x\")").unwrap(), "ERROR: `navigate` is not given a javascript: URL");
+    let lib = "globalThis.window = globalThis; globalThis.lib = { go: (...a) => a.length };";
+    assert!(s10_browser(lib, "", "js(\"lib.go\", [\"vbscript:x\"])").unwrap().contains("is not given a vbscript: URL"));
+    assert!(s10_browser(lib, "", "js(\"lib.go\", [\"javascript:x\"])").unwrap().contains("is not given a javascript: URL"));
+}
+
+// ---- slice 10's review ----
+
+// Found in review (Q-785): a field that only tests a type binds the field's name too, but such
+// names may be the same, `{ user.id: int, order.id: int }` testing two ids; and braces a route's
+// body may be, `{ ok \n ok }`, are looked at only once they are a pattern. A name written out
+// twice, or written where a tested field binds it, is still refused, in a route's pattern too.
+#[test]
+fn tested_fields_may_share_a_name_and_a_routes_block_stays_a_block() {
+    let ok = "fn f(v) = match v {\n    { user.id: int, order.id: int } => \"both ints\"\n    { user.id: int as uid, order.id: int as oid } => [uid, oid]\n    { a: int } | { a: str } => \"one a\"\n    _ => \"no\"\n}\nprint(f({ user: { id: 1 }, order: { id: 2 } }), f({ user: { id: 1 }, order: { id: \"x\" } }), f({ a: \"é\" }))\n";
+    let (fine, out) = check(ok);
+    assert!(fine, "{}", out);
+    assert_eq!(s10_run(ok), "both ints no one a\n");
+    let d = dir("s10-review-routes", "let ok = \"fine\"\nroute GET /x {\n    ok\n    ok\n}\nroute POST /order { json.user.id: int, json.order.id: int } = \"ok\"\n");
+    let (fine, out, err) = s11_check(&d, "main.qwe");
+    assert!(fine && !out.contains("error"), "{}{}", out, err);
+    let (_g, port, _log) = serve_logged(&d, &[]);
+    assert_eq!(support::send(port, "GET", "/x", &[], "").body, "fine");
+    let a = support::send(port, "POST", "/order", &[("content-type", "application/json")], r#"{"user": {"id": 1}, "order": {"id": 2}}"#);
+    assert_eq!((a.status, a.body.as_str()), (200, "ok"));
+    for (src, name) in [
+        ("fn f(v) = match v {\n    { page: int, n: page } => page\n    _ => 0\n}\n", "page"),
+        ("fn f(v) = match v {\n    { page: int, b: [page] } => page\n    _ => 0\n}\n", "page"),
+        ("fn f(v) = match v {\n    [x, [x]] => 1\n    _ => 0\n}\n", "x"),
+        ("route POST /r { json: { a, b: a } } = a\n", "a"),
+        ("route POST /r { json: { a, b: a } } {\n    a\n}\n", "a"),
+        ("routes /g { json: { a, b: a } } {\n    route GET /x = \"x\"\n}\n", "a"),
+    ] {
+        let (fine, out) = check(src);
+        assert!(!fine && out.contains(&format!("`{}` is bound twice in this pattern: to test that two parts are equal, use `[{}, {}2] if {} == {}2`", name, name, name, name, name)), "{}\n{}", src, out);
+    }
+}
+
+// Found in review (Q-754): a function given to `map` is followed through every value it can give:
+// a `return` of raw text inside it warned no more, and a name it binds itself (a `let`, a `match`
+// arm, a `for`, an inner function's parameter) or assigns was taken for a variable of that name
+// outside holding safe text. Those warn as before the fix; a `return` of safe text, and a name of
+// its own that holds none of it, do not.
+#[test]
+fn a_function_given_to_map_is_followed_through_its_returns_and_names() {
+    const WARN: &str = "with SQL built from values";
+    let head = "fn update(id, data) {\n    let cols = keys(data)\n    let q = sql_name(\"id\")\n";
+    let tail = "\n    db.exec(\"update items set \" + sets + \" where \" + q + \" = ?\", id)\n}\nprint(update)\n";
+    for body in [
+        "let sets = join(map(cols, (c) => {\n        if c == \"x\" {\n            return c\n        }\n        `${sql_name(c)} = ?`\n    }), \", \")",
+        "let sets = cols.map((c) => {\n        let q = c\n        q\n    }).join(\", \")",
+        "let sets = cols.map((c) => match c { q => q }).join(\", \")",
+        "let sets = cols.map((c) => {\n        q = c\n        q\n    }).join(\", \")",
+        "let sets = cols.map((c) => [for q in [c] { q }][0]).join(\", \")",
+        "let sets = cols.map((c) => ((q) => q)(c)).join(\", \")",
+        "let sets = cols.map((q) => q).join(\", \")",
+    ] {
+        let (ok, out) = check(&format!("{}    {}{}", head, body, tail));
+        assert!(ok && out.contains(WARN), "{}\n{}", body, out);
+    }
+    for body in [
+        "let sets = join(map(cols, (c) => {\n        if c == \"x\" {\n            return sql_name(\"x\")\n        }\n        `${sql_name(c)} = ?`\n    }), \", \")",
+        "let sets = join(map(cols, (c) => {\n        let n = 1\n        `${sql_name(c)} = ?`\n    }), \", \")",
+        "let sets = join(map(cols, (c) => `${sql_name(c)} = ${sql_param(c)}`), \", \")",
+        "let sets = cols.map((c) => match c { \"é\" => sql_name(\"é\"), _ => sql_name(c) }).join(\", \")",
+    ] {
+        let (ok, out) = check(&format!("{}    {}{}", head, body, tail));
+        assert!(ok && !out.contains(WARN), "{}\n{}", body, out);
+    }
+}
+
+// Found in review (Q-788): `floor(a / b)` was exact on the server however `floor` was reached (a
+// variable holding it, a module in a variable), and in the browser only where its name was
+// written. Now on both sides, and for a pipe and a method too; a quotient kept first is a float by
+// then, and one of the program's own functions takes it as it is.
+#[test]
+fn floor_of_a_quotient_is_exact_however_floor_is_reached() {
+    same_on_both(
+        "fn v2(x) = x\nfn fl() = floor\nfn half(x) = x\nfn mods() = math\nfn own() = { floor: (x) => x }\nfn via(f, a, b) = f(a / b)",
+        &[
+            ("[via(floor, 9007199254740995, 2), [ceil][0](9007199254740995 / 2), mods().floor(9007199254740995 / 2), [math.floor][0](-7 / 2), [round][0](-7 / 2)]", "[[\"int\", \"int\", \"int\", \"int\", \"int\"], [4503599627370497, 4503599627370498, 4503599627370497, -4, -4]]"),
+            ("[9007199254740995 / 2 | floor, 9007199254740995 / 2 | floor(), 9007199254740995 / 2 | math.floor, 9007199254740995 / 2 | mods().floor, 9007199254740995 / 2 | [floor][0], -7 / 2 | ceil]", "[[\"int\", \"int\", \"int\", \"int\", \"int\", \"int\"], [4503599627370497, 4503599627370497, 4503599627370497, 4503599627370497, 4503599627370497, -3]]"),
+            ("[(9007199254740995 / 2).floor(), (9007199254740995 / 2).ceil(), (-7 / 2).round(), (7 / 2.0).floor(), (6 / 3).floor()]", "[[\"int\", \"int\", \"int\", \"int\", \"int\"], [4503599627370497, 4503599627370498, -4, 3, 2]]"),
+            ("[half(7 / 2), own().floor(7 / 2), 7 / 2 | half, 7.5 / 2 | floor, via(floor, 7.0, 2)]", "[[\"float\", \"float\", \"float\", \"int\", \"int\"], [3.5, 3.5, 3.5, 3, 3]]"),
+            ("[(7 / 2).abs(), 9007199254740995 / 2 | str, 9007199254740995 / 2 | round(1)]", "[[\"float\", \"str\", \"float\"], [3.5, \"4503599627370498\", 4503599627370498]]"),
+            ("via(floor, 1, v2(0))", "ERROR: division by zero"),
+            ("(-9223372036854775808 / v2(-1)).floor()", "ERROR: integer overflow"),
+        ],
+    );
+    // Kept first, a float: as `floor` of a float is.
+    let src = "let q = 9007199254740995 / 2\nprint(floor(q), type_of(q))\n";
+    assert_eq!(s10_run(src), "4503599627370498 float\n");
+}
+
+// Found in review (Q-784): the in-place path for `m = set(m, k, ...)` took an error as the key and
+// wrote its text; it is the long way's now, which gives the error back.
+#[test]
+fn an_error_as_a_key_is_given_back_in_place_too() {
+    same_on_both(
+        "fn bad(s) = int(s)",
+        &[
+            ("{\n  let m = { a: {} }\n  let s = \"q\"\n  m = set(m, \"a\", set(m[\"a\"], bad(s), 1))\n  m\n}", "[[[\"a\", \"error\"]], { a: err(\"not an int: \\\"q\\\"\") }]"),
+            ("{\n  let m = {}\n  m = set(m, bad(\"q\"), 1)\n  m\n}", "[\"error\", err(\"not an int: \\\"q\\\"\")]"),
+            ("{\n  let m = { a: { b: 1 } }\n  m = set(m, \"a\", set(m[\"a\"], \"b\", 2))\n  m\n}", "[[[\"a\", [[\"b\", \"int\"]]]], { a: { b: 2 } }]"),
+            ("{\n  let m = { k: [1] }\n  m = set(m, \"k\", get(m, \"k\", []) | push(2))\n  m\n}", "[[[\"k\", [\"int\", \"int\"]]], { k: [1, 2] }]"),
+        ],
+    );
+    let mut it = quillo::Interp::new(".");
+    it.load_source("fn bad(s) = int(s)\n", "case.qwe").unwrap();
+    let nested = "{\n  let m = {}\n  let s = \"q\"\n  m = set(m, bad(s), get(m, bad(s), []) | push(1))\n  m\n}";
+    let got = ev(&mut it, &format!("let x = {}\nx", nested));
+    assert!(got.starts_with("ERROR: `push` expects a list as argument 1, got error") && got.contains("not an int"), "{}", got);
+    if let Some(js) = s10_browser("", "fn bad(s) = int(s)", nested) {
+        assert!(js.starts_with("ERROR: `push` expects a list as argument 1, got error"), "{}", js);
+    }
+}
+
+// Found in review (Q-791): one key for every value below 1e-10 made 20,000 tiny floats from a
+// visitor quadratic again (1.3 s), and the keys of big numbers disagreed with `==`: `unique` kept
+// 2^60 and 1152921504606847000m, which are equal, and past 2^63 the sides split. `==` is exact but
+// between a float and a decimal, so only there do keys go by the decimal a float is equal to: in
+// time for any list, and the same items kept as by comparing each with every one kept, on both
+// sides, at 2^53, 2^63, among ints, floats, decimals and money, -0.0, NaN, lists and maps.
+#[test]
+fn unique_keeps_what_equality_keeps_at_every_edge() {
+    same_on_both(
+        "fn v2(x) = x",
+        &[
+            // A whole float as a page writes it, its shortest digits: 2^60 is 1152921504606847000.
+            ("unique([1152921504606846976.0, 1152921504606847000m])", "[[\"float\"], [1152921504606847000]]"),
+            ("unique([[1152921504606846976.0], [1152921504606847000m], { a: [1152921504606847000m] }, { a: [1152921504606846976.0] }])", "[[[\"float\"], [[\"a\", [\"dec\"]]]], [[1152921504606847000], { a: [1152921504606847000m] }]]"),
+            ("unique([123456789012345680000000.0, dec(123456789012345680000000.0), 1.5e20, 150000000000000000000m])", "[[\"float\", \"float\"], [123456789012345690000000, 150000000000000000000]]"),
+            ("unique([1152921504606846976, 1152921504606846976.0, 1152921504606847000m, 1152921504606846976m])", "[[\"int\", \"dec\"], [1152921504606846976, 1152921504606847000m]]"),
+            ("unique([9007199254740993, 9007199254740992.0, 9007199254740992, 9007199254740993m, 9007199254740992m])", "[[\"int\", \"float\"], [9007199254740993, 9007199254740992]]"),
+            // 2^63 as a float is the decimal of its shortest text, 9223372036854776000m, not 2^63m.
+            ("unique([9223372036854775807, 9223372036854775808.0, 9223372036854775807m, 9223372036854775808m, 9223372036854776000m, -9223372036854775808, -9223372036854775808.0])", "[[\"int\", \"float\", \"dec\", \"int\"], [9223372036854775807, 9223372036854776000, 9223372036854775808m, -9223372036854775808]]"),
+            // Each is equal to 0m, though not to one another: the first kept, the rest equal to it.
+            ("unique([0m, 1e-30, 2e-30, 0, -0.0, 1e-30])", "[[\"dec\"], [0m]]"),
+            ("unique([1e-30, 2e-30, 0m, 0])", "[[\"float\", \"float\", \"int\"], [0.000000000000000000000000000001, 0.000000000000000000000000000002, 0]]"),
+            ("unique([0.1, 0.1m, 0.10m, 0.30000000000000004, 0.3m, 0.1 + 0.2])", "[[\"float\", \"float\", \"dec\"], [0.1, 0.30000000000000004, 0.3m]]"),
+            ("unique([money.of(1, \"USD\"), money.of(\"1.00\", \"USD\"), money.of(1, \"EUR\")]) | map((m) => m.currency)", "[[\"str\", \"str\"], [\"USD\", \"EUR\"]]"),
+            ("[len(unique([math.nan, math.nan, [math.nan], [math.nan], { a: math.nan }])), len(unique([[1, [2, [3]]], [1.0, [2, [3.0]]], [1, [2, [3m]]]]))]", "[[\"int\", \"int\"], [5, 1]]"),
+            ("[len(unique(range(0, 20000) | map((i) => float(`${i + 1}e-20`)))), len(unique(range(0, 20000) | map((i) => 4611686018427387904 + i))), len(unique(range(0, 20000) | map((i) => [float(`${i + 1}e-40`)])))]", "[[\"int\", \"int\", \"int\"], [20000, 20000, 20000]]"),
+            ("len(unique(range(0, 20000) | map((i) => i % 2 == 0 ? dec(`${i}.5`) : float(`${i - 1}.5`))))", "[\"int\", 10000]"),
+        ],
+    );
+    // In time, for what a visitor sends: 40,000 tiny floats, and ints that share a float.
+    let mut it = quillo::Interp::new(".");
+    it.load_source("let tiny = json.parse(json.stringify(range(0, 40000) | map((i) => (i + 1) * 1e-20)))\nlet near = range(0, 40000) | map((i) => 4611686018427387904 + i)\nlet mixed = tiny + [0m, 0.0000000000000000000000000001m]\n", "case.qwe").unwrap();
+    let start = std::time::Instant::now();
+    assert_eq!(ev(&mut it, "[len(unique(tiny)), len(unique(near)), len(unique(mixed))]"), "[40000, 40000, 40002]");
+    assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+}
+
+// ---- end of slice 10's review ----
+
+// ---- end of slice 10 ----

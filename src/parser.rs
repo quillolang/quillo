@@ -222,6 +222,70 @@ fn can_start_expr(t: &Tok) -> bool {
     }
 }
 
+/// A name `p` binds more than once, if one is: alternatives each bind their own (FEEDBACK55.md,
+/// Q-785; branch feedback55). A record's field that only tests a type binds the field's name as
+/// well, but such names may be the same: `{ user.id: int, order.id: int }` tests two ids, which
+/// is no name written twice (found in review); a name written out may be none of them.
+fn bound_twice(p: &Pattern) -> Option<String> {
+    // Each name, and whether it is written out (`x`, `as x`, `..x`), not a tested field's.
+    fn put(n: &str, written: bool, out: &mut Vec<(String, bool)>) -> Option<String> {
+        if out.iter().any(|(m, w)| m == n && (written || *w)) {
+            return Some(n.to_string());
+        }
+        out.push((n.to_string(), written));
+        None
+    }
+    fn names(p: &Pattern, out: &mut Vec<(String, bool)>) -> Option<String> {
+        match p {
+            Pattern::Wild | Pattern::Lit(_) | Pattern::Type(_) => None,
+            Pattern::Bind(n) => put(n.as_str(), true, out),
+            Pattern::As(q, n) => names(q, out).or_else(|| put(n, true, out)),
+            Pattern::List(items, rest) => items.iter().find_map(|q| names(q, out)).or_else(|| match rest {
+                Some(Some(n)) => put(n, true, out),
+                _ => None,
+            }),
+            Pattern::Record(fields) => fields.iter().find_map(|f| match f.path.last() {
+                Some(n) if f.pat.is_type_test() => put(n, false, out),
+                _ => names(&f.pat, out),
+            }),
+            Pattern::Alt(ps) => {
+                let before = out.len();
+                let mut all: Vec<(String, bool)> = Vec::new();
+                for q in ps {
+                    let mut own = out[..before].to_vec();
+                    if let Some(n) = names(q, &mut own) {
+                        return Some(n);
+                    }
+                    for (n, w) in own.drain(before..) {
+                        match all.iter_mut().find(|(m, _)| *m == n) {
+                            Some(kept) => kept.1 |= w,
+                            None => all.push((n, w)),
+                        }
+                    }
+                }
+                for (n, w) in all {
+                    if let Some(d) = put(&n, w, out) {
+                        return Some(d);
+                    }
+                }
+                None
+            }
+        }
+    }
+    names(p, &mut Vec::new())
+}
+
+/// `p`, written at `line`, refused if it binds a name twice: such a pattern matched anything, the
+/// last part's value kept, and `[x, x]` took `[1, 2]` (FEEDBACK55.md, Q-785; branch feedback55).
+/// Refused as Python and Rust refuse it. Where braces may be a pattern or a block (a route's
+/// body), only once they are taken for a pattern (found in review: `{ ok \n ok }` is a block).
+fn bound_once(p: &Pattern, line: u32) -> PResult<()> {
+    match bound_twice(p) {
+        Some(n) => Err(QuilloError::new(format!("`{}` is bound twice in this pattern: to test that two parts are equal, use `[{}, {}2] if {} == {}2`", n, n, n, n, n), line)),
+        None => Ok(()),
+    }
+}
+
 fn lit_string(parts: Vec<StrPart>) -> Option<String> {
     let mut s = String::new();
     for p in parts {
@@ -1897,11 +1961,16 @@ impl Parser {
         let mut body_pat = None;
         if self.at(&Tok::LBrace)? {
             let saved = self.save();
-            let res = self.parse_pattern();
+            let at = self.line()?;
+            let res = self.parse_inner_pattern();
             let is_pat = match &res {
                 Ok(_) => matches!(self.peek(), Ok(Tok::LBrace) | Ok(Tok::Assign)) || matches!(self.peek(), Ok(Tok::Ident(k)) if k == "with"),
                 Err(_) => false,
             };
+            // Its names, once the braces are a pattern (Q-785).
+            if let (true, Ok(p)) = (is_pat, &res) {
+                bound_once(p, at)?;
+            }
             if let (Ok(Pattern::Record(fields)), false) = (&res, is_pat) {
                 if self.at(&Tok::Question)? {
                     return self.err_at("the query pattern goes before the request pattern: `route POST /x ? { q: str } { json: j } = ...`");
@@ -1943,7 +2012,7 @@ impl Parser {
         // `route POST /x with db { json: j } = j`: the pattern was read as the body (Q-546).
         if effects.is_some() && body_pat.is_none() && self.at(&Tok::LBrace)? {
             let saved = self.save();
-            let pat = self.parse_pattern();
+            let pat = self.parse_inner_pattern();
             let pattern_then_body = pat.is_ok() && matches!(self.peek(), Ok(Tok::LBrace | Tok::Assign));
             self.restore(saved);
             if pattern_then_body {
@@ -2052,8 +2121,10 @@ impl Parser {
         let mut guards = guards.to_vec();
         if self.at(&Tok::LBrace)? {
             let saved = self.save();
-            match self.parse_pattern() {
+            let at = self.line()?;
+            match self.parse_inner_pattern() {
                 Ok(p) if self.at(&Tok::LBrace)? => {
+                    bound_once(&p, at)?;
                     // `routes /api { headers: ... } | g { ... }`: `| g` was an alternative that
                     // takes anything, so neither the pattern nor `g` ever refused a request
                     // (FEEDBACK47.md, Q-536; branch feedback40-43).
@@ -2452,6 +2523,12 @@ impl Parser {
     fn parse_unary(&mut self) -> PResult<Expr> {
         let line = self.line()?;
         if self.eat(&Tok::Minus)? {
+            // `-9223372036854775808`, the smallest int, written as Rust, Java and Python take it:
+            // its digits alone are past an int (FEEDBACK55.md, Q-795; branch feedback55).
+            if self.at(&Tok::Int(i64::MIN))? {
+                self.next()?;
+                return Ok(Expr::Lit(Lit::Int(i64::MIN)));
+            }
             let e = self.nested(Self::parse_unary)?;
             return Ok(Expr::Unary(UnOp::Neg, Box::new(e), line));
         }
@@ -2582,6 +2659,8 @@ impl Parser {
         let t = self.next()?;
         let line = t.line;
         match t.tok {
+            // 2^63 after a `-` that is not its sign, `x - 9223372036854775808` (Q-795).
+            Tok::Int(i64::MIN) => Err(QuilloError::new("number `9223372036854775808` is too large: the smallest int is written `-9223372036854775808`", line)),
             Tok::Int(n) => Ok(Expr::Lit(Lit::Int(n))),
             Tok::Float(f) => Ok(Expr::Lit(Lit::Float(f))),
             Tok::Dec(d) => Ok(Expr::Lit(Lit::Dec(d))),
@@ -3027,6 +3106,15 @@ impl Parser {
     // ---- patterns ------------------------------------------------------
 
     pub fn parse_pattern(&mut self) -> PResult<Pattern> {
+        let line = self.line()?;
+        let p = self.parse_inner_pattern()?;
+        bound_once(&p, line)?;
+        Ok(p)
+    }
+
+    /// A pattern inside another, whose names are looked at with the whole one's; or braces that
+    /// may be one, looked at once they are (`bound_once`).
+    fn parse_inner_pattern(&mut self) -> PResult<Pattern> {
         self.nested(Self::parse_pattern_alts)
     }
 
@@ -3065,6 +3153,8 @@ impl Parser {
             Tok::Minus => {
                 let t = self.next()?;
                 match t.tok {
+                    // The smallest int (Q-795).
+                    Tok::Int(i64::MIN) => Ok(Pattern::Lit(Lit::Int(i64::MIN))),
                     Tok::Int(n) => Ok(Pattern::Lit(Lit::Int(-n))),
                     Tok::Float(f) => Ok(Pattern::Lit(Lit::Float(-f))),
                     Tok::Dec(d) => Ok(Pattern::Lit(Lit::Dec(d.neg()))),
@@ -3099,7 +3189,7 @@ impl Parser {
                         rest = Some(name);
                         break;
                     }
-                    items.push(self.parse_pattern()?);
+                    items.push(self.parse_inner_pattern()?);
                     if !self.eat(&Tok::Comma)? {
                         break;
                     }
@@ -3119,7 +3209,7 @@ impl Parser {
                         path.push(self.pattern_key()?);
                     }
                     let pat = if self.eat(&Tok::Colon)? {
-                        self.parse_pattern()?
+                        self.parse_inner_pattern()?
                     } else {
                         Pattern::Bind(path.last().unwrap().clone().into())
                     };

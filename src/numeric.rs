@@ -1065,7 +1065,9 @@ fn rounded(args: &[Value], f: &str, line: u32, r: fn(f64) -> f64) -> R {
         return fail(line, format!("`{}`: cannot convert {} to an int", f, x));
     }
     let y = r(x);
-    if y.abs() >= 9.2e18 {
+    // Past an int: from 2^63 up, or below -2^63. The test was 9.2e18, below 2^63, so
+    // `math.trunc(9.2e18)` overflowed, which `int` takes (FEEDBACK55.md, Q-793; branch feedback55).
+    if !(-9223372036854775808.0..9223372036854775808.0).contains(&y) {
         return Err(overflow(line));
     }
     Ok(Value::Int(y as i64))

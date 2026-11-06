@@ -141,9 +141,13 @@ fn enumerate_and_ranges_in_a_loop() {
     same_is("", "let out = []\nfor i in 1..3 { out = out + [i] }\nout", "[1, 2]");
     same_is("", "let out = []\nfor i in range(2, 4) { out = out + [i] }\nout", "[2, 3]");
     same_is("", "let out = []\nfor [a, b] in [[1, 2]] { out = out + [a + b] }\nout", "[3]");
-    same_is("", "let out = []\nfor [a, a] in [[1, 1]] { out = out + [a] }\nout", "[1]");
     same_is("", "let out = []\nfor [a, ..rest] in [[1, 2, 3]] { out = out + rest }\nout", "[2, 3]");
-    same_is("", "let out = []\nfor [a, ..a] in [[1, 2, 3]] { out = out + [a] }\nout", "[[2, 3]]");
+    // A name bound twice in a pattern is refused, where the last part's value was taken
+    // (FEEDBACK55.md, Q-785; branch feedback55).
+    for body in ["let out = []\nfor [a, a] in [[1, 1]] { out = out + [a] }\nout", "let out = []\nfor [a, ..a] in [[1, 2, 3]] { out = out + [a] }\nout"] {
+        let Err(e) = Interp::new(".").load_source(&format!("fn __t() {{\n{}\n}}\n", body), "case.qwe") else { panic!("taken: {}", body) };
+        assert!(e.to_string().contains("`a` is bound twice in this pattern"), "{}", e);
+    }
     same_is("", "let out = []\nfor [1, b] in [[1, 2]] { out = out + [b] }\nout", "[2]");
     same_is("", "let out = []\nfor { a } in [{ a: 7 }] { out = out + [a] }\nout", "[7]");
 }

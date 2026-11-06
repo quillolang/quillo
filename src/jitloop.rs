@@ -849,7 +849,14 @@ impl Gen<'_> {
 
     /// When `cond` holds, fails as `arith_fail` says.
     fn arith_check(&mut self, cond: V, op: BinOp, ta: T, tb: T, x: V, y: V, line: u32) {
-        let (bad, go) = (self.b.create_block(), self.b.create_block());
+        let go = self.b.create_block();
+        self.arith_check_to(cond, go, op, ta, tb, x, y, line);
+    }
+
+    /// `arith_check`, going on in `go`.
+    #[allow(clippy::too_many_arguments)]
+    fn arith_check_to(&mut self, cond: V, go: Block, op: BinOp, ta: T, tb: T, x: V, y: V, line: u32) {
+        let bad = self.b.create_block();
         self.b.ins().brif(cond, bad, &[], go, &[]);
         self.b.switch_to_block(bad);
         self.arith_fail(op, ta, tb, x, y, line);
@@ -1064,16 +1071,40 @@ impl Gen<'_> {
                 let nothing = self.b.ins().iconst(types::I64, 0);
                 self.b.ins().select(neg1, nothing, r)
             }
+            // An int with a float, exactly, in ints (FEEDBACK55.md, Q-787; branch feedback55).
+            // As floats, as before, unless they could be wrong: the same float past 2^53 (rare).
+            // Then the round is the interpreter's, which compares exactly, or, once a list was
+            // written in it, worked out here; NaN is refused, as before.
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge if ta != tb => {
+                let (i, fi, f, side) = if ta == I { (x0, x, y, op) } else { (y0, y, x, crate::jit::swapped(op)) };
+                let (_, go) = crate::jit::float_needs_look(&mut self.b, f);
+                let nan = self.b.ins().fcmp(FloatCC::Unordered, fi, f);
+                let checked = self.b.create_block();
+                self.b.set_cold_block(checked);
+                self.arith_check_to(nan, checked, op, ta, tb, x0, y0, line);
+                let same = self.b.ins().fcmp(FloatCC::Equal, fi, f);
+                if !self.written {
+                    self.b.ins().brif(same, self.bail, &[], go, &[]);
+                    self.b.switch_to_block(go);
+                    self.b.ins().fcmp(crate::jit::float_cc(side), fi, f)
+                } else {
+                    let join = self.b.create_block();
+                    let out = self.b.append_block_param(join, types::I8);
+                    let exact = crate::jit::int_float_same_ir(&mut self.b, side, i, f);
+                    let by_float = self.b.ins().fcmp(crate::jit::float_cc(side), fi, f);
+                    let r = self.b.ins().select(same, exact, by_float);
+                    self.b.ins().jump(join, &[r.into()]);
+                    self.b.switch_to_block(go);
+                    let r = self.b.ins().fcmp(crate::jit::float_cc(side), fi, f);
+                    self.b.ins().jump(join, &[r.into()]);
+                    self.b.switch_to_block(join);
+                    out
+                }
+            }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge if floats => {
                 let nan = self.b.ins().fcmp(FloatCC::Unordered, x, y);
                 self.arith_check(nan, op, ta, tb, x0, y0, line);
-                let cc = match op {
-                    BinOp::Lt => FloatCC::LessThan,
-                    BinOp::Le => FloatCC::LessThanOrEqual,
-                    BinOp::Gt => FloatCC::GreaterThan,
-                    _ => FloatCC::GreaterThanOrEqual,
-                };
-                self.b.ins().fcmp(cc, x, y)
+                self.b.ins().fcmp(crate::jit::float_cc(op), x, y)
             }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 let cc = match op {

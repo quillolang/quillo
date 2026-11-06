@@ -1079,6 +1079,40 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("vec.column", "list | null, str | int", "list"),
 ];
 
+/// How many arguments the builtin `name` takes at most, as the table above has it: None for one
+/// that takes any number (`print`) or is not in it. A call holds to it as it runs, in the browser
+/// too, where the rest were dropped (FEEDBACK55.md, Q-786; branch feedback55).
+pub fn most_args(name: &str) -> Option<usize> {
+    static MOST: std::sync::OnceLock<HashMap<&'static str, usize>> = std::sync::OnceLock::new();
+    MOST.get_or_init(|| {
+        BUILTINS
+            .iter()
+            .filter(|(_, params, _)| !params.contains("..."))
+            .map(|(name, params, _)| (*name, params.split(',').filter(|p| !p.trim().is_empty()).count()))
+            .collect()
+    })
+    .get(name)
+    .copied()
+}
+
+/// What a call of the builtin `name` with `got` arguments, more than it takes, is told, here and
+/// in the browser: how many it takes, and its call as the docs write it, `sort(xs)`. `sort` given
+/// a function to compare with, as in JavaScript, is told how to sort by a key.
+pub fn too_many_args(name: &str, got: usize) -> String {
+    let most = most_args(name).unwrap_or(0);
+    let hint = if name == "sort" { "; to sort by a key, `sort_by(xs, (x) => key)`, and `reverse` of it for the other way" } else { "" };
+    format!("`{}` takes {} argument{}, got {}: {}{}", name, most, if most == 1 { "" } else { "s" }, got, call_shape(name), hint)
+}
+
+/// A call of the builtin `name` as its docs write it: `sort(xs)`, `split(s, sep)`.
+pub fn call_shape(name: &str) -> String {
+    let names: Vec<String> = match crate::builtin_docs::DOCS.iter().find(|(n, _, _)| *n == name) {
+        Some((_, p, _)) => p.split(',').map(str::trim).filter(|p| !p.is_empty()).map(String::from).collect(),
+        None => (1..=most_args(name).unwrap_or(0)).map(|i| format!("arg{}", i)).collect(),
+    };
+    format!("{}({})", name, names.join(", "))
+}
+
 /// Modules the browser has too (src/client/runtime.js).
 const BROWSER_MODULES: &[&str] = &["json", "math", "bit", "stats", "vec", "date", "money", "re"];
 
@@ -4103,6 +4137,13 @@ impl Checker {
                 let mut fields: Vec<(Arc<str>, T)> = Vec::new();
                 for (k, v) in entries {
                     let t = self.expr(v);
+                    // A key written twice: the last value is kept, with nothing said, however each
+                    // was written (`a`, `"a"`, `{ a, a: 2 }`). A spread between them is no map
+                    // literal's key: the parser makes a map of each part (FEEDBACK55.md, Q-794;
+                    // branch feedback55).
+                    if fields.iter().any(|(n, _)| &**n == k) {
+                        self.warn(format!("the key `{}` is written twice in this map: the last value is the one kept", k));
+                    }
                     fields.retain(|(n, _)| &**n != k);
                     fields.push((Arc::from(k.as_str()), t));
                 }
@@ -5715,6 +5756,10 @@ impl Checker {
         match e {
             Expr::Lit(_) => true,
             Expr::Ident(n, _) => self.sql_var(n) == SqlVar::Safe,
+            // `join(map(cols, (c) => `${sql_name(c)} = ${sql_param(c)}`), ", ")`, and piped or
+            // as methods, the pairs form the guide gives for an update: a list each of whose
+            // items is safe, joined with safe text (FEEDBACK55.md, Q-754; branch feedback55).
+            _ if self.sql_safe_join(e) => true,
             Expr::Call(f, args, _) => {
                 self.sql_safe_call(f)
                     || (is_join(f) && matches!(args.as_slice(), [Expr::List(items), rest @ ..] if items.iter().chain(rest).all(|x| self.sql_safe(x))))
@@ -5799,6 +5844,105 @@ impl Checker {
             _ => {}
         });
         if other { None } else { service }
+    }
+
+    /// `join(xs, sep)`, however written (`xs | join(sep)`, `xs.join(sep)`), where every item of
+    /// `xs` is SQL-safe text (`sql_items`) and `sep` is too.
+    fn sql_safe_join(&self, e: &Expr) -> bool {
+        let (list, sep): (&Expr, &[Expr]) = match e {
+            Expr::Call(f, args, _) if is_join(f) => match args.split_first() {
+                Some((l, sep)) => (l, sep),
+                None => return false,
+            },
+            Expr::Call(f, args, _) => match &**f {
+                Expr::Field(l, n, _) if n == "join" => (&**l, args.as_slice()),
+                _ => return false,
+            },
+            Expr::Pipe(l, rhs, _) => match &**rhs {
+                Expr::Call(f, sep, _) if is_join(f) => (&**l, sep.as_slice()),
+                f if is_join(f) => (&**l, &[]),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        sep.len() <= 1 && sep.iter().all(|x| self.sql_safe(x)) && self.sql_items(list)
+    }
+
+    /// Whether `e` is a list whose items are all SQL-safe text: written so (`[sql_name(a), ...]`),
+    /// or `map` of a function that gives only such text (`(c) => `${sql_name(c)} = ${sql_param(c)}``,
+    /// `sql_name` itself) over any list. The function's parameters are the list's items, which
+    /// may be anything: one named as a variable holding safe text is not taken for it.
+    fn sql_items(&self, e: &Expr) -> bool {
+        let (f, _list) = match e {
+            Expr::List(items) => return items.iter().all(|x| self.sql_safe(x)),
+            Expr::Call(m, args, _) if matches!(&**m, Expr::Ident(n, _) if n == "map" && !self.is_local(n)) => match args.as_slice() {
+                [l, f] => (f, Some(l)),
+                _ => return false,
+            },
+            Expr::Call(m, args, _) => match (&**m, args.as_slice()) {
+                (Expr::Field(l, n, _), [f]) if n == "map" => (f, Some(&**l)),
+                _ => return false,
+            },
+            Expr::Pipe(l, rhs, _) => match &**rhs {
+                Expr::Call(m, args, _) if matches!(&**m, Expr::Ident(n, _) if n == "map" && !self.is_local(n)) => match args.as_slice() {
+                    [f] => (f, Some(&**l)),
+                    _ => return false,
+                },
+                _ => return false,
+            },
+            _ => return false,
+        };
+        match f {
+            Expr::Ident(..) => self.sql_safe_call(f),
+            Expr::Lambda(def) => self.lambda_gives_sql_safe(def),
+            _ => false,
+        }
+    }
+
+    /// Whether every value the function `def` can give is SQL-safe text: its last value, and each
+    /// `return`'s. A name it binds itself (a parameter, a `let`, a `match` arm's or a `for`'s
+    /// pattern, an inner function's parameter) or assigns that is a variable holding text here
+    /// would be taken for that variable, so the function is not followed then: `return c` and
+    /// `{ let q = c; q }` with an outer `q = sql_name(...)` went without the warning (FEEDBACK55.md,
+    /// Q-754; found in review).
+    fn lambda_gives_sql_safe(&self, def: &FnDef) -> bool {
+        let tracked = |n: &str| self.sql_var(n) != SqlVar::Other;
+        if def.params.iter().any(|p| tracked(p.name.as_str())) {
+            return false;
+        }
+        let mut ok = true;
+        walk_expr(&def.body, &mut |e| match e {
+            Expr::Block(stmts) => {
+                for st in stmts {
+                    match st {
+                        Stmt::Let(p, _, _) => {
+                            let mut names = Vec::new();
+                            pattern_names(p, &mut names);
+                            ok &= !names.iter().any(|n| tracked(n));
+                        }
+                        Stmt::Assign(n, _, _, _) => ok &= !tracked(n.as_str()),
+                        Stmt::Return(Some(v), _) => ok &= self.sql_safe(v),
+                        Stmt::Fn(_) => ok = false,
+                        _ => {}
+                    }
+                }
+            }
+            Expr::Match(_, arms, _) => {
+                for a in arms {
+                    let mut names = Vec::new();
+                    pattern_names(&a.pat, &mut names);
+                    ok &= !names.iter().any(|n| tracked(n));
+                }
+            }
+            Expr::For(p, _, _, _) => {
+                let mut names = Vec::new();
+                pattern_names(p, &mut names);
+                ok &= !names.iter().any(|n| tracked(n));
+            }
+            Expr::Lambda(inner) => ok &= !inner.params.iter().any(|p| tracked(p.name.as_str())),
+            _ => {}
+        });
+        ok && self.sql_safe(&def.body)
     }
 
     /// Whether calling `f` gives SQL-safe text: `sql_name`, `sql_param`, or

@@ -561,6 +561,12 @@ impl Lexer {
         if float {
             return s.parse::<f64>().map(Tok::Float).map_err(|_| QuilloError::new("bad number", line));
         }
+        // After a `-`, 2^63 is the smallest int, -9223372036854775808, which the parser takes
+        // (as Rust, Java and Python do): it stands for itself here, as no int literal is below 0
+        // (FEEDBACK55.md, Q-795; branch feedback55). Anywhere else it is too large.
+        if s == "9223372036854775808" && matches!(self.last, Some(Tok::Minus)) {
+            return Ok(Tok::Int(i64::MIN));
+        }
         s.parse::<i64>()
             .map(Tok::Int)
             .map_err(|_| QuilloError::new(format!("number `{}` is too large", s), line))

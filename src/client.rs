@@ -1899,6 +1899,19 @@ fn pattern_names(p: &Pattern, out: &mut Vec<String>) {
     out.retain(|n| seen.insert(n.clone()));
 }
 
+/// What a call of the builtin `name` with `got` arguments is told, if they are more than it takes
+/// (FEEDBACK55.md, Q-786; branch feedback55).
+fn too_many(name: &str, got: usize) -> Option<String> {
+    crate::check::most_args(name).filter(|m| got > *m).map(|_| crate::check::too_many_args(name, got))
+}
+
+/// `js`, the builtin `name` as a value, with how many arguments it takes and its call as the
+/// docs write it (runtime.js's `most`): None for one that takes any number.
+fn most_js(name: &str, js: String) -> Option<String> {
+    let m = crate::check::most_args(name)?;
+    Some(format!("W.most({}, {}, {}, {})", js, js_str(name), m, js_str(&crate::check::call_shape(name))))
+}
+
 fn lit_js(l: &Lit) -> String {
     match l {
         Lit::Nil => "null".into(),
@@ -3076,7 +3089,10 @@ impl<'a> Compiler<'a> {
                     Resolved::Global(js, _) if js == "B.js" || js == "B.js_new" => {
                         return self.err(format!("`{}` can only be called, with the name of what it calls written out", n));
                     }
-                    Resolved::Global(js, _) => js,
+                    // A builtin as a value: how many arguments it takes goes with it, for a call
+                    // of it with more to say so, as on the server (FEEDBACK55.md, Q-786; branch
+                    // feedback55).
+                    Resolved::Global(js, _) => most_js(js.strip_prefix("B.").unwrap_or(""), js.clone()).unwrap_or(js),
                 }
             }
             Expr::List(items) => {
@@ -3158,6 +3174,27 @@ impl<'a> Compiler<'a> {
             }
             Expr::Pipe(lhs, rhs, line) => {
                 self.line = *line;
+                // `a / b | floor`, as `floor(a / b)`: in ints for two ints, however the function is
+                // reached, as on the server (FEEDBACK55.md, Q-788; branch feedback55).
+                if let Expr::Binary(BinOp::Div, a, b, _) = &**lhs {
+                    match &**rhs {
+                        Expr::Call(callee, args, l) if args.is_empty() => {
+                            self.line = *l;
+                            return self.call(callee, std::slice::from_ref(&**lhs), None);
+                        }
+                        Expr::Call(..) => {}
+                        other => {
+                            let f = self.callee_value(other)?;
+                            let (x, y) = (self.expr(a)?, self.expr(b)?);
+                            let name = if let Expr::Ident(n, _) = other { n.to_string() } else { "this function".into() };
+                            let call = match f.0.as_str() {
+                                "B.floor" | "B.ceil" | "B.round" => format!("W.idiv({}, {}, {}, {})", js_str(&f.0[2..]), x, y, f.0),
+                                _ => format!("W.divCall({}, {}, {})", f.0, x, y),
+                            };
+                            return self.finish_call(&name, f.1, call);
+                        }
+                    }
+                }
                 let v = self.expr(lhs)?;
                 match &**rhs {
                     Expr::Call(callee, args, l) => {
@@ -3195,7 +3232,12 @@ impl<'a> Compiler<'a> {
                 }
                 let o = self.expr(obj)?;
                 let (f, fb) = self.field_read(name);
-                format!("{}({}, {}, {})", f, o, js_str(name), fb)
+                let read = format!("{}({}, {}, {})", f, o, js_str(name), fb);
+                // `math.trunc` as a value, as a builtin's (Q-786).
+                match o.strip_prefix("B.").filter(|m| crate::check::MODULES.contains(m)) {
+                    Some(m) => most_js(&format!("{}.{}", m, name), read.clone()).unwrap_or(read),
+                    None => read,
+                }
             }
             Expr::Index(obj, idx, line) => {
                 self.line = *line;
@@ -3497,17 +3539,52 @@ impl<'a> Compiler<'a> {
             return self.lib_call(&path, args, pre);
         }
         let mut argv: Vec<String> = pre.into_iter().collect();
+        // `(a / b).floor()`: the quotient's method, in ints for two ints (Q-788).
+        if let (Expr::Field(obj, name, _), [], true) = (callee, args, argv.is_empty()) {
+            if let Expr::Binary(BinOp::Div, a, b, _) = &**obj {
+                let fb = self.fallback(name);
+                if !fb.starts_with("B.") || matches!(fb.as_str(), "B.floor" | "B.ceil" | "B.round") {
+                    let (x, y) = (self.expr(a)?, self.expr(b)?);
+                    return Ok(format!("W.divMethod({}, {}, {}, {})", x, y, js_str(name), fb));
+                }
+            }
+        }
         if let Expr::Field(obj, name, _) = callee {
             let saved = std::mem::replace(&mut self.keep_promise, matches!(name.as_str(), "then" | "catch" | "finally"));
             let recv = self.expr(obj);
             self.keep_promise = saved;
             let recv = recv?;
-            let fb = self.fallback(name);
+            let mut fb = self.fallback(name);
             if fb == "B.js" || fb == "B.js_new" {
                 return self.err(format!("`{}` needs the name of what it calls written out, like {}(\"Chart\", ...)", name, name));
             }
-            for a in args {
-                argv.push(self.expr(a)?);
+            // `math.floor(a / b)` of two ints, in ints, as on the server (FEEDBACK55.md, Q-788;
+            // branch feedback55).
+            if let ("B.math", true, [Expr::Binary(BinOp::Div, a, b, _)]) = (recv.as_str(), argv.is_empty(), args) {
+                if matches!(name.as_str(), "floor" | "ceil" | "trunc") {
+                    let (x, y) = (self.expr(a)?, self.expr(b)?);
+                    return Ok(format!("W.idiv({}, {}, {}, B.math.{})", js_str(&format!("math.{}", name)), x, y, name));
+                }
+            }
+            // `m.floor(a / b)` with `m` a map in a variable, which may hold `floor` (the `math`
+            // module): in ints for two ints, as on the server (Q-788; found in review).
+            let mut div_parts = None;
+            if let (false, true, [Expr::Binary(BinOp::Div, a, b, _)]) = (recv.starts_with("B."), argv.is_empty(), args) {
+                div_parts = Some((self.expr(a)?, self.expr(b)?));
+            } else {
+                for a in args {
+                    argv.push(self.expr(a)?);
+                }
+            }
+            // More arguments than the builtin takes: said where it is called, as the server says it
+            // (FEEDBACK55.md, Q-786; branch feedback55). A module's function by its whole name; a
+            // value's method falls back on the builtin only if the value has none of its own.
+            if let Some(m) = recv.strip_prefix("B.").filter(|m| crate::check::MODULES.contains(m)) {
+                if let Some(msg) = too_many(&format!("{}.{}", m, name), argv.len()) {
+                    return Ok(format!("W.fail({}, {})", js_str(&msg), argv.join(", ")));
+                }
+            } else if let Some(msg) = fb.strip_prefix("B.").and_then(|b| too_many(b, argv.len() + 1 + div_parts.is_some() as usize)) {
+                fb = format!("() => W.fail({})", js_str(&msg));
             }
             if recv == "B.http" {
                 return self.http_call(name, argv);
@@ -3521,7 +3598,10 @@ impl<'a> Compiler<'a> {
             // falls back to: outside code that waits it is not waited for, so a function given to
             // the page, a Promise's executor, stays one that can throw (Q-420).
             let is_async = !module && (waits_here || self.ctx().component.is_some()) && self.is_async_name(name);
-            let call = format!("W.mcall({}, {}, {}, [{}])", recv, js_str(name), fb, argv.join(", "));
+            let call = match &div_parts {
+                Some((x, y)) => format!("W.mcallDiv({}, {}, {}, {}, {})", recv, js_str(name), fb, x, y),
+                None => format!("W.mcall({}, {}, {}, [{}])", recv, js_str(name), fb, argv.join(", ")),
+            };
             if module {
                 return self.finish_call(name, false, call);
             }
@@ -3561,6 +3641,22 @@ impl<'a> Compiler<'a> {
             }
         }
         let (f, is_async, known) = self.callee_value(callee)?;
+        // `floor(a / b)`, `ceil` and `round` of it, of two ints, in ints, as on the server
+        // (FEEDBACK55.md, Q-788; branch feedback55).
+        if let (true, [Expr::Binary(BinOp::Div, a, b, _)]) = (argv.is_empty(), args) {
+            if matches!(f.as_str(), "B.floor" | "B.ceil" | "B.round") {
+                let (x, y) = (self.expr(a)?, self.expr(b)?);
+                return Ok(format!("W.idiv({}, {}, {}, {})", js_str(&f[2..]), x, y, f));
+            }
+            // Any callee that may hold one (`let fl = floor`, `[ceil][0]`): asked as it runs; not
+            // another builtin, nor a function of the program's own (found in review).
+            let own_fn = matches!(callee, Expr::Ident(n, _) if matches!(lookup(&self.it.globals, n), Some(Value::Func(_))) && f.starts_with("G["));
+            if !f.starts_with("B.") && !own_fn {
+                let (x, y) = (self.expr(a)?, self.expr(b)?);
+                let name = if let Expr::Ident(n, _) = callee { n.to_string() } else { "this function".into() };
+                return self.finish_call(&name, is_async, format!("W.divCall({}, {}, {})", f, x, y));
+            }
+        }
         // The component's own functions, the program's and url() may read
         // what changes: what calls them follows it.
         if matches!(callee, Expr::Ident(..)) && (self.last_here || f.starts_with("G[") || f == "B.url") {
@@ -3581,6 +3677,11 @@ impl<'a> Compiler<'a> {
             Expr::Ident(n, _) => n.clone(),
             _ => "this function".into(),
         };
+        // More arguments than the builtin takes (Q-786): the arguments are worked out, then the
+        // call refused, as on the server.
+        if let Some(msg) = f.strip_prefix("B.").and_then(|b| too_many(b, argv.len())) {
+            return Ok(format!("W.fail({}, {})", js_str(&msg), argv.join(", ")));
+        }
         let call = if f.starts_with("B.") || f.starts_with("G[") {
             format!("{}({})", f, argv.join(", "))
         } else {

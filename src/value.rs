@@ -417,10 +417,18 @@ impl Value {
             let inner = |x: &Value, out: &mut Vec<u8>| -> Result<(), String> {
                 match x {
                     Value::List(_) | Value::Map(_) | Value::Err(..) => go(x, out, max, left - 1, depth),
+                    Value::Func(_) | Value::Builtin(..) => Err(FUNCTION_IN_JSON.into()),
                     scalar => {
                         scalar.json_into(out);
                         Ok(())
                     }
+                }
+            };
+            // Where in the value a function was met, from the outside in: `items[2].f`.
+            let at = |e: String, step: &dyn Fn() -> String| -> String {
+                match e.strip_prefix(FUNCTION_IN_JSON) {
+                    Some(rest) => format!("{}{}{}", FUNCTION_IN_JSON, step(), rest),
+                    None => e,
                 }
             };
             match v {
@@ -431,7 +439,7 @@ impl Value {
                         if i > 0 {
                             out.push(b',');
                         }
-                        inner(x, out)?;
+                        inner(x, out).map_err(|e| at(e, &|| format!("[{}]", i)))?;
                     }
                     out.push(b']');
                 }
@@ -443,15 +451,16 @@ impl Value {
                         }
                         json_str_into(k, out);
                         out.push(b':');
-                        inner(x, out)?;
+                        inner(x, out).map_err(|e| at(e, &|| if fmt_key(k).starts_with('"') { format!("[{}]", fmt_key(k)) } else { format!(".{}", k) }))?;
                     }
                     out.push(b'}');
                 }
                 Value::Err(e, _, _) => {
                     out.extend_from_slice(b"{\"error\":");
-                    inner(e, out)?;
+                    inner(e, out).map_err(|e| at(e, &|| ".error".into()))?;
                     out.push(b'}');
                 }
+                Value::Func(_) | Value::Builtin(..) => return Err(FUNCTION_IN_JSON.into()),
                 scalar => scalar.json_into(out),
             }
             if out.len() > max {
@@ -459,7 +468,14 @@ impl Value {
             }
             Ok(())
         }
-        go(self, out, max, depth + 1, depth)
+        // A function has no JSON: it was written as its text, `"<fn f>"`, where JavaScript leaves
+        // it out and Python refuses it; said, and where it is (FEEDBACK55.md, Q-792; branch
+        // feedback55).
+        go(self, out, max, depth + 1, depth).map_err(|e| match e.strip_prefix(FUNCTION_IN_JSON) {
+            Some("") => "a function cannot be written as JSON".into(),
+            Some(path) => format!("`{}` is a function, which cannot be written as JSON", path.trim_start_matches('.')),
+            None => e,
+        })
     }
 
     /// The JSON text of `to_json`, written straight into `out`.
@@ -971,6 +987,9 @@ fn fmt_key(k: &str) -> String {
     }
 }
 
+/// The mark `json_into_within` puts before where it met a function.
+const FUNCTION_IN_JSON: &str = "\u{1}fn";
+
 /// How deep a value is shown, written as JSON or compared, at most: past it, `…`, null, or not
 /// ordered. A list nested 50,000 deep, as code that nests from data makes it, overflowed the
 /// stack of the request and stopped the server (FEEDBACK51.md, Q-661; branch feedback51-fixes).
@@ -1016,7 +1035,10 @@ fn scalar_equal(a: &Value, b: &Value) -> bool {
         (Nil, Nil) => true,
         (Bool(x), Bool(y)) => x == y,
         (Int(x), Int(y)) => x == y,
-        (Int(_) | Float(_), Int(_) | Float(_)) => a.as_f64() == b.as_f64(),
+        (Float(x), Float(y)) => x == y,
+        // Exactly, as Python has it: through a float, 9007199254740993 == 9007199254740992.0
+        // (FEEDBACK55.md, Q-787; branch feedback55).
+        (Int(i), Float(f)) | (Float(f), Int(i)) => int_float_cmp(*i, *f) == Some(Ordering::Equal),
         (Dec(_), Int(_) | Float(_) | Dec(_)) | (Int(_) | Float(_), Dec(_)) => {
             dec_pair(a, b).map_or(false, |(x, y)| x == y)
         }
@@ -1055,7 +1077,233 @@ fn compare_at(a: &Value, b: &Value, depth: usize) -> Option<Ordering> {
             }
             Some(x.len().cmp(&y.len()))
         }
-        _ => a.as_f64()?.partial_cmp(&b.as_f64()?),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
+        // An int and a float exactly, not the int made a float: `sort` put 9007199254740993
+        // before 9007199254740992.0 (FEEDBACK55.md, Q-787; branch feedback55).
+        (Value::Int(i), Value::Float(f)) => int_float_cmp(*i, *f),
+        (Value::Float(f), Value::Int(i)) => int_float_cmp(*i, *f).map(Ordering::reverse),
+        _ => None,
+    }
+}
+
+/// An int against a float, exactly (None for NaN), as Python compares them: the int as a float
+/// decides it unless the two are the same float, and then the float is whole and within an
+/// int's reach, or 2^63, above every int. Rounding keeps order, so `i as f64 < f` means `i < f`
+/// (FEEDBACK55.md, Q-787; branch feedback55). The JIT compiles the same steps (src/jit.rs,
+/// `int_float_cmp_ir`).
+#[inline]
+pub fn int_float_cmp(i: i64, f: f64) -> Option<Ordering> {
+    let fi = i as f64;
+    if fi < f {
+        Some(Ordering::Less)
+    } else if fi > f {
+        Some(Ordering::Greater)
+    } else if fi == f {
+        Some(if f >= 9223372036854775808.0 { Ordering::Less } else { i.cmp(&(f as i64)) })
+    } else {
+        None
+    }
+}
+
+/// `items` without those `==` calls equal to one kept before them, in order: `unique`
+/// (FEEDBACK55.md, Q-791; branch feedback55). Each was compared with every one kept, and 20,000
+/// took 1.4 s; here an item is looked for only among those kept under its key, which `==` gives
+/// equal values alike, and which values that are not equal share only rarely, whatever a visitor
+/// sends (found in review: one key for all below 1e-10 made 20,000 tiny floats quadratic again):
+///
+/// - A float by its bits (-0.0 as 0.0), an int by the float that is exactly it (an int and a
+///   float are equal only exactly) or else by itself, text by itself, lists item by item, maps
+///   pair by pair in any order.
+/// - `==` is exact everywhere but between a float and a decimal: the float is its shortest text
+///   as a decimal, rounded to 28 places, so `1e-30 == 0m` and `2^60 == 1152921504606847000m`,
+///   though `1e-30 != 0` and `2^60 != 1152921504606847000`. So a decimal is looked for by its
+///   value among the decimals kept, the decimals floats kept are equal to, and the int it is; a
+///   float or an int among the decimals kept by the decimal it is equal to.
+/// - A list or a map holding a decimal, where those meet item by item, has a rough key: each
+///   number by the float nearest the decimal it is equal to (a float's own, rounded so), which
+///   every value it is equal to shares; it is looked for among those of its rough key.
+///
+/// What holds NaN (or an answer) is equal to nothing: kept without a look. Keyed for the process,
+/// text by SipHash, so a visitor's values cannot be made to share keys.
+pub fn unique_of(items: &[Value]) -> Vec<Value> {
+    use std::collections::{HashMap, HashSet};
+    use std::hash::BuildHasher;
+    type Fast<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<Hashed>>;
+    static KEY: std::sync::OnceLock<(std::collections::hash_map::RandomState, u64)> = std::sync::OnceLock::new();
+    let (key, seed) = KEY.get_or_init(|| {
+        let k = std::collections::hash_map::RandomState::new();
+        let seed = k.hash_one(0u8);
+        (k, seed)
+    });
+    const DEEP: u32 = 32;
+    const END: u32 = u32::MAX;
+    fn mix(h: u64, x: u64) -> u64 {
+        // MurmurHash3's finish, after the two are put together.
+        let mut x = (h.rotate_left(23) ^ x).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        x = (x ^ (x >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x = (x ^ (x >> 33)).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        x ^ (x >> 33)
+    }
+    // A float's bits, -0.0 as 0.0.
+    fn bits(f: f64) -> u64 {
+        (f + 0.0).to_bits()
+    }
+    // A decimal's value, as a key: 12.5m and 12.50m are one.
+    fn value(d: crate::decimal::Dec) -> (i128, u32) {
+        let n = d.normalized();
+        (n.mantissa(), n.scale())
+    }
+    struct K<'a> {
+        key: &'a std::collections::hash_map::RandomState,
+        seed: u64,
+        rough: bool,
+        dec: bool,
+        never: bool,
+    }
+    impl K<'_> {
+        fn go(&mut self, v: &Value, depth: u32) -> u64 {
+            let seed = self.seed;
+            match v {
+                Value::Nil => mix(seed, 1),
+                Value::Bool(b) => mix(seed, 2 + *b as u64),
+                Value::Float(f) if f.is_nan() => {
+                    self.never = true;
+                    0
+                }
+                Value::Float(f) if self.rough => mix(seed ^ 3, bits(crate::decimal::Dec::from_f64(*f).map_or(*f, |d| d.to_f64()))),
+                Value::Float(f) => mix(seed ^ 3, bits(*f)),
+                Value::Int(n) if self.rough || (*n as f64) as i128 == *n as i128 => mix(seed ^ 3, bits(*n as f64)),
+                Value::Int(n) => mix(seed ^ 7, *n as u64),
+                Value::Dec(d) => {
+                    self.dec = true;
+                    mix(seed ^ 3, bits(d.to_f64()))
+                }
+                Value::Str(s) | Value::Html(s) => self.key.hash_one(&**s),
+                Value::List(_) | Value::Map(_) | Value::Err(..) if depth > DEEP => mix(seed, 5),
+                Value::List(l) => l.iter().fold(mix(seed, 11 ^ l.len() as u64), |h, x| mix(h, self.go(x, depth + 1))),
+                Value::Map(m) => m.iter().fold(mix(seed, 13 ^ m.len() as u64), |h, (k, x)| {
+                    let kh = self.key.hash_one(&**k);
+                    h.wrapping_add(mix(kh, self.go(x, depth + 1)))
+                }),
+                Value::Err(e, ..) => mix(seed, self.go(e, depth + 1) ^ 17),
+                Value::Builtin(n, _) => self.key.hash_one(n),
+                Value::Func(f) => mix(seed, Arc::as_ptr(f) as u64),
+                Value::Response(_) => {
+                    self.never = true;
+                    mix(seed, 19)
+                }
+            }
+        }
+    }
+    let holder = |v: &Value| matches!(v, Value::List(_) | Value::Map(_) | Value::Err(..));
+    let mut probe = K { key, seed: *seed, rough: false, dec: false, never: false };
+    let exact: Vec<(u64, bool, bool)> = items
+        .iter()
+        .map(|x| {
+            probe.dec = false;
+            probe.never = false;
+            let h = probe.go(x, 0);
+            (h, probe.dec, probe.never)
+        })
+        .collect();
+    let decs = exact.iter().any(|(_, d, _)| *d);
+    let held_decs = items.iter().zip(&exact).any(|(x, (_, d, _))| *d && holder(x));
+    let mut out: Vec<Value> = Vec::new();
+    // What is kept, by key: where each key's chain starts, and the next.
+    let mut first: Fast<u64, u32> = Default::default();
+    let mut next: Vec<u32> = Vec::new();
+    // The decimals kept, by value, and those the floats kept are equal to.
+    let mut kept_decs: HashSet<(i128, u32)> = HashSet::new();
+    let mut float_decs: HashSet<(i128, u32)> = HashSet::new();
+    // Lists and maps, by rough key: those holding a decimal, and those not.
+    let mut with_dec: Fast<u64, Vec<u32>> = Default::default();
+    let mut without: Fast<u64, Vec<u32>> = Default::default();
+    let mut rough = K { key, seed: *seed, rough: true, dec: false, never: false };
+    let in_chain = |h: u64, x: &Value, out: &[Value], first: &Fast<u64, u32>, next: &[u32]| {
+        let mut i = first.get(&h).copied().unwrap_or(END);
+        while i != END {
+            if equal(x, &out[i as usize]) {
+                return true;
+            }
+            i = next[i as usize];
+        }
+        false
+    };
+    for (x, &(h, dec, never)) in items.iter().zip(&exact) {
+        if never {
+            out.push(x.clone());
+            next.push(END);
+            continue;
+        }
+        let r = if held_decs && holder(x) { rough.go(x, 0) } else { 0 };
+        let seen = match x {
+            Value::Dec(d) => {
+                let v = value(*d);
+                kept_decs.contains(&v)
+                    || float_decs.contains(&v)
+                    || d.trunc_i64().filter(|_| v.1 == 0).is_some_and(|i| {
+                        let mut p = K { key, seed: *seed, rough: false, dec: false, never: false };
+                        in_chain(p.go(&Value::Int(i), 0), x, &out, &first, &next)
+                    })
+            }
+            _ if dec => [with_dec.get(&r), without.get(&r)].iter().flatten().any(|l| l.iter().any(|&i| equal(x, &out[i as usize]))),
+            _ => {
+                in_chain(h, x, &out, &first, &next)
+                    || (decs
+                        && match x {
+                            Value::Float(f) => crate::decimal::Dec::from_f64(*f).is_some_and(|d| kept_decs.contains(&value(d))),
+                            Value::Int(i) => kept_decs.contains(&value(crate::decimal::Dec::from_i64(*i))),
+                            _ if held_decs && holder(x) => with_dec.get(&r).is_some_and(|l| l.iter().any(|&i| equal(x, &out[i as usize]))),
+                            _ => false,
+                        })
+            }
+        };
+        if seen {
+            continue;
+        }
+        let at = out.len() as u32;
+        out.push(x.clone());
+        next.push(END);
+        match x {
+            Value::Dec(d) => {
+                kept_decs.insert(value(*d));
+            }
+            _ if dec => with_dec.entry(r).or_default().push(at),
+            _ => {
+                // At the chain's start: the newest first, as good as any.
+                if let Some(head) = first.insert(h, at) {
+                    next[at as usize] = head;
+                }
+                match x {
+                    Value::Float(f) if decs => {
+                        if let Some(d) = crate::decimal::Dec::from_f64(*f) {
+                            float_decs.insert(value(d));
+                        }
+                    }
+                    _ if held_decs && holder(x) => without.entry(r).or_default().push(at),
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A hasher for keys made mixed already (`unique_of`).
+#[derive(Default)]
+pub struct Hashed(u64);
+
+impl std::hash::Hasher for Hashed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, b: &[u8]) {
+        for x in b {
+            self.0 = (self.0 << 8) | *x as u64;
+        }
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = x;
     }
 }
 
@@ -1664,6 +1912,9 @@ pub fn update_inside(whole: &mut Value, key: &Value, start: Option<Value>, mut v
                 let Some(i) = at(l, *i) else { return false };
                 Arc::make_mut(l)[i] = last;
             }
+            // An error is no key: the long way gives it back (FEEDBACK55.md, Q-784; found in
+            // review).
+            (Value::Map(_), Some(Value::Err(..))) => return false,
             (Value::Map(m), Some(k)) => {
                 Arc::make_mut(m).insert(k.key_text().into(), last);
             }
@@ -1677,6 +1928,7 @@ pub fn update_inside(whole: &mut Value, key: &Value, start: Option<Value>, mut v
             let Some(i) = at(l, *i) else { return false };
             change(&mut Arc::make_mut(l)[i], last, inner)
         }
+        (Value::Map(_), Value::Err(..)) => false,
         (Value::Map(m), k) => {
             let text;
             let k: &str = match k {

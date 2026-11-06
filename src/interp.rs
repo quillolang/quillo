@@ -122,6 +122,8 @@ pub struct Interp {
     pub(crate) services: Arc<crate::shared::Services>,
     /// Calls in progress on this thread, to stop runaway recursion cleanly.
     depth: usize,
+    /// The quotient of two ints a pipe is passing on, for `floor` to make in ints (`eval_pipe`).
+    exact_div: Option<ExactDiv>,
     /// The file of the function running, and of the one that called it:
     /// a run-time error is told where it happened (see `enter_call`).
     pub(crate) cur_file: Option<Arc<str>>,
@@ -689,13 +691,35 @@ fn credential(name: &str) -> bool {
     matches!(name, "cookies" | "cookie" | "authorization")
 }
 
+/// The builtins that make a quotient of two ints whole in ints (`floor(a / b)`; FEEDBACK55.md,
+/// Q-788; branch feedback55).
+const ROUNDERS: &[&str] = &["floor", "ceil", "round", "math.floor", "math.ceil", "math.trunc"];
+
+/// A quotient of two ints a pipe passes on as a float (`eval_pipe`): its bits, the ints, how deep
+/// the pipe's call is, and its line.
+#[derive(Clone, Copy)]
+pub struct ExactDiv {
+    bits: u64,
+    a: i64,
+    b: i64,
+    depth: usize,
+    line: u32,
+}
+
 /// Whether a URL would run code when followed: `javascript:` or `vbscript:`,
 /// however browsers would read it (they skip leading spaces and control
 /// characters and ignore tabs and line breaks inside).
 pub fn script_url(url: &str) -> bool {
+    script_scheme(url).is_some()
+}
+
+/// The scheme of a URL that would run code when followed, as `script_url` reads it:
+/// `javascript:` or `vbscript:`, for a refusal to name the one given (`redirect("vbscript:...")`
+/// was told of javascript:; FEEDBACK55.md; branch feedback55).
+pub fn script_scheme(url: &str) -> Option<&'static str> {
     // Paths and fragments, the usual case, have no scheme.
     if matches!(url.as_bytes().first(), Some(b'/' | b'#' | b'?')) {
-        return false;
+        return None;
     }
     let mut scheme = [0u8; 11];
     let mut n = 0;
@@ -711,7 +735,13 @@ pub fn script_url(url: &str) -> bool {
         n += 1;
     }
     let scheme = &scheme[..n];
-    scheme.starts_with(b"javascript:") || scheme.starts_with(b"vbscript:")
+    if scheme.starts_with(b"javascript:") {
+        Some("javascript:")
+    } else if scheme.starts_with(b"vbscript:") {
+        Some("vbscript:")
+    } else {
+        None
+    }
 }
 
 /// An integer's digits, appended to `out` (without `fmt`'s machinery).
@@ -1474,6 +1504,7 @@ impl Interp {
             shared,
             services: Default::default(),
             depth: 0,
+            exact_div: None,
             cur_file: None,
             caller_file: None,
             fuel: u64::MAX,
@@ -1584,6 +1615,7 @@ impl Interp {
             shared: self.shared.clone(),
             services: self.services.clone(),
             depth: 0,
+            exact_div: None,
             cur_file: None,
             caller_file: None,
             fuel: u64::MAX,
@@ -2771,7 +2803,33 @@ impl Interp {
 
     #[inline(never)]
     fn eval_pipe(&mut self, lhs: &Expr, rhs: &Expr, env: &Env, line: u32) -> Result<Value, Ctrl> {
-        let v = self.eval(lhs, env)?;
+        // `a / b | floor` of two ints, in ints, as `floor(a / b)` is, however the function is
+        // reached (`m.floor`, `[floor][0]`, `floor()`): the quotient goes on as the float it is,
+        // and `floor` given that float alone, here, makes it from the ints (FEEDBACK55.md,
+        // Q-788; found in review).
+        let v = match lhs {
+            Expr::Binary(BinOp::Div, a, b, at) => {
+                let x = self.eval(a, env)?;
+                let y = self.eval(b, env)?;
+                let ints = match (&x, &y) {
+                    (Value::Int(p), Value::Int(q)) if *q != 0 && p.checked_rem(*q) != Some(0) => Some((*p, *q)),
+                    _ => None,
+                };
+                let v = if self.fuel != u64::MAX { self.script_binop(BinOp::Div, x, y, *at)? } else { binop(BinOp::Div, x, y, *at)? };
+                if let (Some((p, q)), Value::Float(f)) = (ints, &v) {
+                    self.exact_div = Some(ExactDiv { bits: f.to_bits(), a: p, b: q, depth: self.depth, line: *at });
+                }
+                v
+            }
+            _ => self.eval(lhs, env)?,
+        };
+        let r = self.pipe_into(v, rhs, env, line);
+        self.exact_div = None;
+        r
+    }
+
+    /// `v | rhs`.
+    fn pipe_into(&mut self, v: Value, rhs: &Expr, env: &Env, line: u32) -> Result<Value, Ctrl> {
         match rhs {
             Expr::Call(callee, args, l) => self.eval_call(callee, args, Some(v), env, *l),
             // `sql | analytics.one`: on that connection.
@@ -3475,6 +3533,18 @@ impl Interp {
         let mut argv = Vec::with_capacity(args.len() + 2);
         // `analytics.query(...)` on a connection from `db.connect`: which one.
         let mut db_on = None;
+        // `(a / b).floor()`, as `floor(a / b)` (Q-788).
+        if let (Expr::Field(obj, name, _), [], None) = (callee, args, &pre) {
+            if let Expr::Binary(BinOp::Div, a, b, at) = &**obj {
+                // What a number's method is: the function of that name.
+                if let Some(f @ Value::Builtin(n, _)) = lookup(env, name).filter(|f| matches!(f, Value::Builtin(n, _) if ROUNDERS.contains(n))) {
+                    return match self.div_of(a, b, Some(n), env, *at)? {
+                        Ok(exact) => Ok(exact),
+                        Err(v) => self.call(&f, vec![v], line),
+                    };
+                }
+            }
+        }
         let f = if let Expr::Field(obj, name, _) = callee {
             // `Chart.new(...)`, `L.control.zoom(...)`: the browser's, null here
             // (branch js-libraries).
@@ -3530,6 +3600,19 @@ impl Interp {
                 return crate::i18n::t_html(self, tv, *l);
             }
         }
+        // `floor(a / b)` of two ints, `ceil` and `round` of it too, and math's: worked out in ints,
+        // the guide's integer division; through the float `a / b` it was off past 2^53,
+        // `floor(9007199254740995 / 2)` ...498 (FEEDBACK55.md, Q-788; branch feedback55).
+        // However the builtin is reached: `fl(a / b)` with `fl` holding it, `m.floor(a / b)` with
+        // the module in a variable (found in review).
+        if let (None, [Expr::Binary(BinOp::Div, a, b, at)], Value::Builtin(name, _)) = (&pre, args, &f) {
+            if ROUNDERS.contains(name) {
+                return match self.div_of(a, b, Some(name), env, *at)? {
+                    Ok(exact) => Ok(exact),
+                    Err(v) => self.call(&f, vec![v], line),
+                };
+            }
+        }
         if let Some(p) = pre {
             argv.push(p);
         }
@@ -3549,6 +3632,20 @@ impl Interp {
             }
         }
         self.call(&f, argv, line)
+    }
+
+    /// `a / b` for `rounder`, `floor` or one of its kind, when there is one: Ok with its answer in
+    /// ints when both are ints, else Err with the quotient, for the call to go on with.
+    fn div_of(&mut self, a: &Expr, b: &Expr, rounder: Option<&str>, env: &Env, at: u32) -> Result<Result<Value, Value>, Ctrl> {
+        let x = self.eval(a, env)?;
+        let y = self.eval(b, env)?;
+        if let (Some(name), Value::Int(p), Value::Int(q)) = (rounder, &x, &y) {
+            if self.fuel != u64::MAX {
+                self.burn(at)?;
+            }
+            return crate::builtins::int_div_rounded(name, *p, *q, at).map(Ok);
+        }
+        Ok(Err(if self.fuel != u64::MAX { self.script_binop(BinOp::Div, x, y, at)? } else { binop(BinOp::Div, x, y, at)? }))
     }
 
     /// `v.name`, read where `env` is the scope of the code that reads it.
@@ -3656,6 +3753,22 @@ impl Interp {
         }
         match f {
             Value::Builtin(name, func) => {
+                // More than it takes: said, as `check` says it where it knows the function; the rest
+                // were dropped, and `xs.sort((a, b) => b - a)` sorted up (FEEDBACK55.md, Q-786;
+                // branch feedback55).
+                if args.len() > crate::builtins::most_args(name) {
+                    return fail(line, crate::check::too_many_args(name, args.len()));
+                }
+                // The quotient a pipe made of two ints, given here alone to `floor` or its kind,
+                // as the pipe called it: in ints (see `eval_pipe`).
+                if let Some(d) = self.exact_div.filter(|d| d.depth == self.depth) {
+                    if let ([Value::Float(f)], true) = (args.as_slice(), ROUNDERS.contains(name)) {
+                        if f.to_bits() == d.bits {
+                            self.exact_div = None;
+                            return crate::builtins::int_div_rounded(name, d.a, d.b, d.line);
+                        }
+                    }
+                }
                 if self.allowed != ALL_EFFECTS {
                     self.check_builtin_effect(name, &args, line)?;
                 }

@@ -651,7 +651,7 @@ fn reduce(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn sum(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let l = l_arg(&args, 0, "sum", line)?;
     let mut acc = Value::Int(0);
-    for x in l.iter() {
+    for (i, x) in l.iter().enumerate() {
         // Numbers as `+` adds them, without its general case for each.
         let next = match (&acc, x) {
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(a + b)),
@@ -662,10 +662,19 @@ fn sum(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         };
         acc = match next {
             Some(v) => v,
+            // Text is no number: `+` joined it, and amounts read from a form or a CSV summed to
+            // "012.505.00" (FEEDBACK55.md, Q-783; branch feedback55).
+            None if matches!(x, Value::Str(_)) => return fail(line, sum_of_text(x, i)),
             None => crate::interp::binop(crate::ast::BinOp::Add, acc, x.clone(), line)?,
         };
     }
     Ok(acc)
+}
+
+/// What `sum` says of text at item `i` (the browser's `sum` says the same).
+#[cold]
+fn sum_of_text(x: &Value, i: usize) -> String {
+    format!("`sum` adds numbers; got the str {} at item {}: use `float(...)` or `dec(...)` first", x.repr(), i)
 }
 
 fn extreme(args: &[Value], name: &str, line: u32, want: std::cmp::Ordering) -> R {
@@ -804,12 +813,21 @@ fn get(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return Ok(m.get(&**k).cloned().unwrap_or_else(|| arg(&args, 2)));
     }
     let m = m_arg(&args, 0, "get", line)?;
+    // An error is no key: its text was one (FEEDBACK55.md, Q-784; branch feedback55).
+    if let k @ Value::Err(..) = arg(&args, 1) {
+        return Ok(k);
+    }
     let k = arg(&args, 1).key_text();
     Ok(m.get(k.as_str()).cloned().unwrap_or_else(|| arg(&args, 2)))
 }
 
 fn has(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    Ok(Value::Bool(m_arg(&args, 0, "has", line)?.contains_key(arg(&args, 1).key_text().as_str())))
+    let m = m_arg(&args, 0, "has", line)?;
+    // An error is no key (FEEDBACK55.md, Q-784; branch feedback55).
+    if let k @ Value::Err(..) = arg(&args, 1) {
+        return Ok(k);
+    }
+    Ok(Value::Bool(m.contains_key(arg(&args, 1).key_text().as_str())))
 }
 
 fn set(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
@@ -836,6 +854,11 @@ pub(crate) fn set_of(args: Vec<Value>, line: u32) -> R {
         return Ok(Value::List(l));
     }
     let mut m = m_arg(&args, 0, "set", line)?;
+    // An error is no key: `set({}, int("q"), 1)` made its text one (FEEDBACK55.md, Q-784; branch
+    // feedback55).
+    if let k @ Value::Err(..) = arg(&args, 1) {
+        return Ok(k);
+    }
     let (k, v) = (arg(&args, 1).key_text(), arg(&args, 2));
     // The arguments let go first: a map no one else holds is changed, not
     // copied (see `in_place` in src/interp.rs).
@@ -852,6 +875,10 @@ fn remove(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         _ => {
             let m = m_arg(&args, 0, "remove", line)?;
+            // An error is no key (FEEDBACK55.md, Q-784; branch feedback55).
+            if let k @ Value::Err(..) = arg(&args, 1) {
+                return Ok(k);
+            }
             let k = arg(&args, 1).key_text();
             drop(args);
             let mut m = Arc::unwrap_or_clone(m);
@@ -940,6 +967,10 @@ fn url_encode(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
     }
     let mut out = String::new();
     match arg(&args, 0) {
+        // An error is given back, not its text in the URL (FEEDBACK55.md, Q-784; branch
+        // feedback55).
+        e @ Value::Err(..) => return Ok(e),
+        Value::Map(m) if m.values().any(|v| matches!(v, Value::Err(..))) => return Ok(m.values().find(|v| matches!(v, Value::Err(..))).cloned().unwrap_or(Value::Nil)),
         Value::Map(m) => {
             for (k, v) in m.iter().filter(|(_, v)| !matches!(v, Value::Nil)) {
                 if !out.is_empty() {
@@ -2051,7 +2082,7 @@ fn site_headers(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             // A `location` that runs code or carries a page, as `respond`'s (FEEDBACK55.md, Q-719;
             // branch feedback55; found in review).
             Value::Str(s) if name == "location" && runs_or_carries(s) => {
-                return fail(line, format!("`site_headers`: `location` is not given a javascript:, vbscript: or data: URL, got {}", v.repr()))
+                return fail(line, format!("`site_headers`: `location` is not given a {} URL, got {}", carried_scheme(s).unwrap_or("data:"), v.repr()))
             }
             Value::Str(s) if !s.contains(['\r', '\n']) => Some(s.to_string()),
             Value::Int(_) | Value::Bool(_) => Some(v.display().to_string()),
@@ -2144,8 +2175,8 @@ fn redirect(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if !crate::server::valid_header("location", &url) || url.contains('\t') {
         return fail(line, "`redirect` URL cannot contain line breaks, tabs or other control characters");
     }
-    if crate::interp::script_url(&url) {
-        return fail(line, "`redirect` is not given a javascript: URL");
+    if let Some(scheme) = crate::interp::script_scheme(&url) {
+        return fail(line, format!("`redirect` is not given a {} URL", scheme));
     }
     // Nor a page of its own (FEEDBACK55.md, Q-719; branch feedback55; found in review).
     if runs_or_carries(&url) {
@@ -2294,8 +2325,14 @@ fn without_dots(path: &str) -> String {
 /// `vbscript:` or `data:`, however browsers would read it (FEEDBACK55.md, Q-719; branch
 /// feedback55).
 pub(crate) fn runs_or_carries(url: &str) -> bool {
+    carried_scheme(url).is_some()
+}
+
+/// Which of those schemes `url` has, for a refusal to name the one given: each said
+/// "javascript:" (or all three), whatever it was given (FEEDBACK55.md; branch feedback55).
+pub(crate) fn carried_scheme(url: &str) -> Option<&'static str> {
     let start: String = url.trim_start_matches(|c: char| c <= ' ').chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).take(5).collect();
-    crate::interp::script_url(url) || start.eq_ignore_ascii_case("data:")
+    crate::interp::script_scheme(url).or_else(|| start.eq_ignore_ascii_case("data:").then_some("data:"))
 }
 
 /// `respond(status, body, headers = {})` builds a response value.
@@ -2349,7 +2386,7 @@ pub(crate) fn answer_headers(h: &Map, f: &str, line: u32) -> Result<Vec<(String,
     // A `location` that runs code or carries a page is refused, as `redirect` refuses it: an app
     // went to it (FEEDBACK55.md, Q-719; branch feedback55; found in review).
     if let Some((_, v)) = out.iter().find(|(k, v)| k == "location" && runs_or_carries(v)) {
-        return fail(line, format!("`{}` header `location` is not given a javascript:, vbscript: or data: URL, got {}", f, Value::str(v.as_str()).repr()));
+        return fail(line, format!("`{}` header `location` is not given a {} URL, got {}", f, carried_scheme(v).unwrap_or("data:"), Value::str(v.as_str()).repr()));
     }
     // Header text often comes from the request; a line break in it would
     // let the sender add headers (or a whole response) of their own.
@@ -2852,8 +2889,12 @@ fn abs(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
 }
 
+/// What `round`, `floor` and `ceil` give for a float made whole: the int, wherever one holds it.
+/// Past 9e15 it was a float, so `type_of(round(1e16))` said float though `round(x)` is an int:
+/// the browser has ints past 2^53 now (Q-776), as the server (FEEDBACK55.md, Q-788 and Q-789;
+/// branch feedback55). Past 2^63, and inf or NaN, the float.
 fn to_int_or_float(f: f64) -> Value {
-    if f.is_finite() && f.abs() < 9.0e15 {
+    if (-9223372036854775808.0..9223372036854775808.0).contains(&f) {
         Value::Int(f as i64)
     } else {
         Value::Float(f)
@@ -2889,9 +2930,21 @@ fn round(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if !matches!(arg(&args, 2), Value::Nil) {
         return fail(line, "`round` takes a rounding mode for a dec only: convert with dec(x)");
     }
+    // An int rounded to `digits` places is itself, and to fewer than none, a multiple of a power
+    // of ten, exactly: it went through a float, `round(9007199254740993, 2)` another number
+    // (FEEDBACK55.md, Q-789; branch feedback55).
+    if let (Value::Int(n), true) = (arg(&args, 0), args.len() > 1) {
+        return round_int(n, i_arg(&args, 1, "round", line)?, line);
+    }
     let x = num_arg(&args, 0, "round", line)?;
     if args.len() > 1 {
-        let d = i_arg(&args, 1, "round", line)?.clamp(0, 15) as i32;
+        let d = i_arg(&args, 1, "round", line)?;
+        // Fewer than no digits: to tens, hundreds, as a decimal has them; they were taken as 0
+        // (FEEDBACK55.md, Q-789; branch feedback55).
+        if d < 0 {
+            return Ok(Value::Float(round_left(x, d)));
+        }
+        let d = d.min(15) as i32;
         // From the float's shortest decimal, a tie away from zero, as `format_number` rounds:
         // `round(1.005, 2)` was 1.0, as 1.005 * 100 is 100.49999... in binary, while
         // `format_number` wrote 1.01 (FEEDBACK50.md, Q-626; branch feedback50-fixes). Away from
@@ -2914,6 +2967,84 @@ fn round(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return Ok(Value::Float((x * p).round() / p));
     }
     Ok(whole_of(&args).unwrap_or_else(|| to_int_or_float(x.round())))
+}
+
+/// `floor(a / b)` (or `ceil`, `round`, `math.floor`, `math.ceil`, `math.trunc` of it) of two ints,
+/// in ints: what is left over decides, a half away from zero for `round` (FEEDBACK55.md, Q-788;
+/// branch feedback55). The smallest int over -1 is past an int.
+pub(crate) fn int_div_rounded(f: &str, a: i64, b: i64, line: u32) -> R {
+    if b == 0 {
+        return fail(line, "division by zero");
+    }
+    let (a, b) = (a as i128, b as i128);
+    let (q, r) = (a / b, a % b);
+    let q = match f {
+        "floor" | "math.floor" if r != 0 && (r < 0) != (b < 0) => q - 1,
+        "ceil" | "math.ceil" if r != 0 && (r < 0) == (b < 0) => q + 1,
+        "round" if r != 0 && 2 * r.abs() >= b.abs() => q + if (a < 0) == (b < 0) { 1 } else { -1 },
+        _ => q,
+    };
+    i64::try_from(q).map(Value::Int).or_else(|_| fail(line, "integer overflow"))
+}
+
+/// How many arguments the builtin `name` takes at most, from check.rs's table (`usize::MAX`: any
+/// number, or one the table does not have), for each call to be held to (FEEDBACK55.md, Q-786;
+/// branch feedback55). Asked by where the name is, in a table of the names seen: a load and a
+/// compare, which a call of a builtin does not notice.
+#[inline(always)]
+pub(crate) fn most_args(name: &'static str) -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    let p = name.as_ptr() as u64;
+    let slot = &MOST[((p >> 3) ^ (p >> 11)) as usize & (MOST.len() - 1)];
+    let e = slot.load(Relaxed);
+    if e >> 8 == p {
+        return if e & 0xff == 0xff { usize::MAX } else { (e & 0xff) as usize };
+    }
+    most_args_found(name, slot)
+}
+
+static MOST: [std::sync::atomic::AtomicU64; 1024] = [const { std::sync::atomic::AtomicU64::new(0) }; 1024];
+
+#[cold]
+#[inline(never)]
+fn most_args_found(name: &'static str, slot: &std::sync::atomic::AtomicU64) -> usize {
+    let n = crate::check::most_args(name);
+    let p = name.as_ptr() as u64;
+    // Where a pointer has its top byte, nothing is kept (and the table is asked each time).
+    if p >> 56 == 0 {
+        slot.store(p << 8 | n.map_or(0xff, |n| n.min(0xfe) as u64), std::sync::atomic::Ordering::Relaxed);
+    }
+    n.unwrap_or(usize::MAX)
+}
+
+/// `round(n, digits)` of an int: itself for `digits` from 0, else the nearest multiple of
+/// 10^-digits, a half away from zero as a float's is; past what an int holds, the overflow.
+fn round_int(n: i64, digits: i64, line: u32) -> R {
+    if digits >= 0 {
+        return Ok(Value::Int(n));
+    }
+    let p = 10i128.pow(digits.unsigned_abs().min(20) as u32);
+    let q = (n.unsigned_abs() as i128 + p / 2) / p * p;
+    i64::try_from(if n < 0 { -q } else { q }).map(Value::Int).or_else(|_| fail(line, "integer overflow"))
+}
+
+/// `round(x, digits)` of a float with `digits` below 0: to the nearest multiple of 10^-digits, a
+/// half away from zero, from its shortest decimal as `round` to places is; past a decimal's
+/// size, by floats (where 10^-digits is below the float's spacing it is `x`).
+pub(crate) fn round_left(x: f64, digits: i64) -> f64 {
+    let exact = (digits >= -28).then(|| crate::decimal::Dec::from_f64(x)).flatten();
+    if let Some(r) = exact.and_then(|v| v.round(digits as i32, crate::decimal::Rounding::HalfUp).ok()) {
+        return r.to_f64() + 0.0;
+    }
+    if !x.is_finite() {
+        return x;
+    }
+    let p = 10f64.powi(digits.unsigned_abs().min(400) as i32);
+    if p.is_infinite() {
+        return 0.0;
+    }
+    let r = (x / p).round() * p;
+    if r.is_finite() { r + 0.0 } else { x }
 }
 
 /// An int, which `round`, `floor` and `ceil` give back as it is: past 2^53 it went through a
@@ -2965,6 +3096,16 @@ fn pow(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 None => fail(line, "integer overflow"),
             };
         }
+        // A power from 2^32 up: the int it is for -1, 0 and 1, the overflow for any other base;
+        // it was a float, `pow(-1, 9007199254740993)` 1.0 and `pow(2, 4294967296)` inf
+        // (FEEDBACK55.md, Q-790; branch feedback55).
+        if y > 0 {
+            return match x {
+                0 | 1 => Ok(Value::Int(x)),
+                -1 => Ok(Value::Int(if y % 2 == 0 { 1 } else { -1 })),
+                _ => fail(line, "integer overflow"),
+            };
+        }
     }
     Ok(Value::Float(num_arg(&args, 0, "pow", line)?.powf(num_arg(&args, 1, "pow", line)?)))
 }
@@ -2973,13 +3114,9 @@ fn pow(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 fn unique(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let l = l_arg(&args, 0, "unique", line)?;
-    let mut out: Vec<Value> = Vec::new();
-    for x in l.iter() {
-        if !out.iter().any(|y| equal(x, y)) {
-            out.push(x.clone());
-        }
-    }
-    Ok(Value::list(out))
+    // In time linear in the list, keeping what `==` keeps (FEEDBACK55.md, Q-791; branch
+    // feedback55): see `value::unique_of`.
+    Ok(Value::list(crate::value::unique_of(&l)))
 }
 
 /// `flatten([[1], [2, 3], 4])` is `[1, 2, 3, 4]` (one level).
@@ -3041,7 +3178,12 @@ fn group_by(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = f_arg(&args, 1, "group_by", line)?;
     let mut groups: IndexMap<String, Vec<Value>> = IndexMap::new();
     for x in l.iter() {
-        let k = it.call1(&f, x.clone(), line)?.key_text();
+        // The function's error is given back, as `filter`'s is: its text was a key
+        // (FEEDBACK55.md, Q-784; branch feedback55).
+        let k = match it.call1(&f, x.clone(), line)? {
+            e @ Value::Err(..) => return Ok(e),
+            k => k.key_text(),
+        };
         groups.entry(k).or_default().push(x.clone());
     }
     Ok(Value::map(groups.into_iter().map(|(k, v)| (k.into(), Value::list(v))).collect()))
@@ -3542,8 +3684,8 @@ fn url(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
 /// On the server there is no page to change; use `redirect` there.
 fn navigate(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // As in the browser, where it would run (FEEDBACK51.md, Q-645; branch feedback51-fixes).
-    if crate::interp::script_url(&s_arg(&args, 0, "navigate", line)?) {
-        return fail(line, "`navigate` is not given a javascript: URL");
+    if let Some(scheme) = crate::interp::script_scheme(&s_arg(&args, 0, "navigate", line)?) {
+        return fail(line, format!("`navigate` is not given a {} URL", scheme));
     }
     Ok(Value::Nil)
 }
@@ -3605,16 +3747,35 @@ fn waiting(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
 }
 
 /// A name a program puts in SQL (a table's, a column's): letters, digits
-/// and `_`, not starting with a digit, at most 64 characters. Anything else
+/// and `_`, not starting with a digit, at most 63 bytes. Anything else
 /// is refused, so the name cannot carry SQL of its own.
+///
+/// Letters and digits of any script, quoted, as every database takes them, and the marks that
+/// go on a letter (Hindi's vowel signs, Thai's tone marks, an accent written apart):
+/// `sql_name("名前")` stopped the program, "letters" meaning ASCII. Of the first 65,536
+/// characters only, which is all MySQL takes in a name, and in 63 bytes, all PostgreSQL keeps of
+/// one, so that two names are two on every database (FEEDBACK55.md, Q-756; branch feedback55;
+/// 63 and the marks found in review).
 fn sql_ident(v: &Value, f: &str, line: u32) -> Result<String, Ctrl> {
     let Value::Str(s) = v else { return fail(line, format!("`{}` takes a name (a str) or a list of them, got {}", f, v.type_name())) };
-    let ok = !s.is_empty()
-        && s.len() <= 64
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !s.starts_with(|c: char| c.is_ascii_digit());
+    let mark = unicode_normalization::char::is_combining_mark;
+    let mut after_letter = false;
+    let mut chars_ok = true;
+    for c in s.chars() {
+        let here = if (c as u32) >= 0x10000 {
+            false
+        } else if c.is_alphanumeric() {
+            true
+        } else {
+            after_letter && mark(c)
+        };
+        chars_ok &= here || c == '_';
+        after_letter = here;
+    }
+    let ok = !s.is_empty() && s.len() <= 63 && chars_ok && !s.starts_with(char::is_numeric);
     if !ok {
-        return fail(line, format!("`{}`: {:?} is not a name SQL can take (letters, digits and _)", f, &**s));
+        let why = if s.len() > 63 && chars_ok { "at most 63 bytes" } else { "letters, digits and _" };
+        return fail(line, format!("`{}`: {:?} is not a name SQL can take ({})", f, &**s, why));
     }
     Ok(s.to_string())
 }

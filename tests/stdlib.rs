@@ -129,7 +129,8 @@ fn sum_adds_floats_and_ints_as_plus_does() {
     assert_eq!(ev("sum([1, 2.5])"), "3.5");
     assert_eq!(ev("sum([1.5, 1])"), "2.5");
     assert_eq!(ev("sum([0.5m, 1])"), "1.5m");
-    assert_eq!(ev("sum([\"a\", \"b\"])"), "\"0ab\"");
+    // Text is refused, at its item: it was joined, "0ab" (FEEDBACK55.md, Q-783; branch feedback55).
+    fails("sum([\"a\", \"b\"])", "`sum` adds numbers; got the str \"a\" at item 0");
 }
 
 #[test]
@@ -454,8 +455,10 @@ fn functions_and_responses_have_a_type_and_a_text() {
 fn json_writes_what_has_no_json_form() {
     assert_eq!(ev("json.stringify(respond(404, \"no\"))"), "\"{\\\"status\\\":404}\"");
     assert_eq!(ev("json.stringify({ r: respond(201, \"x\") })"), "\"{\\\"r\\\":{\\\"status\\\":201}}\"");
-    assert_eq!(ev("json.stringify(len)"), "\"\\\"<builtin len>\\\"\"");
-    assert_eq!(ev("fn f() = 1\njson.stringify([f])"), "\"[\\\"<fn f>\\\"]\"");
+    // A function has none: an error naming where it is, where it was written as its text
+    // (FEEDBACK55.md, Q-792; branch feedback55).
+    assert_eq!(ev("json.stringify(len)"), "err(\"json.stringify: a function cannot be written as JSON\")");
+    assert_eq!(ev("fn f() = 1\njson.stringify([f])"), "err(\"json.stringify: `[0]` is a function, which cannot be written as JSON\")");
     let v = eval_str("respond(404, \"no\")").unwrap();
     assert_eq!(v.to_json(), serde_json::json!({ "status": 404 }));
     assert_eq!(v.repr(), "<response 404>");
@@ -464,8 +467,11 @@ fn json_writes_what_has_no_json_form() {
 #[test]
 fn a_route_answers_json_for_what_has_no_json_form() {
     let d = folder("json");
-    let mut it = program(&d, "route GET /j = { r: respond(201, \"x\"), f: len }\n");
-    assert_eq!(get(&mut it, "/j").text(), "{\"r\":{\"status\":201},\"f\":\"<builtin len>\"}");
+    let mut it = program(&d, "route GET /j = { r: respond(201, \"x\") }\nroute GET /f = { r: respond(201, \"x\"), f: len }\n");
+    assert_eq!(get(&mut it, "/j").text(), "{\"r\":{\"status\":201}}");
+    // A function has no JSON: the answer is an internal error, said in the log (FEEDBACK55.md,
+    // Q-792; branch feedback55).
+    assert_eq!(get(&mut it, "/f").status, 500);
 }
 
 #[test]

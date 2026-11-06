@@ -109,8 +109,9 @@ fn a_map_set_from_a_call_that_is_not_its_own_read_is_made_the_long_way() {
     assert_eq!(value("let m = { k: [1] }\nm = set(m, \"k\", push(m[\"k\"], [3]))\nm"), "{ k: [1, [3]] }");
     assert_eq!(value("let m = { k: [1] }\nm = set(m, \"k\", push(m[\"k\"], { a: 1 }))\nm"), "{ k: [1, { a: 1 }] }");
     assert_eq!(value("let m = { k: [1] }\nm = set(m, \"k\", push(m[\"k\"], (x) => x))\nlen(m.k)"), "2");
-    // What to start from that is not a constant, or more of them than `get` takes.
-    assert_eq!(value("let m = { a: { b: 1 } }\nm = set(m, \"a\", set(get(m, \"a\", {}, 1), \"b\", 2))\nm"), "{ a: { b: 2 } }");
+    // What to start from that is not a constant, or more of them than `get` takes: refused, as the
+    // long way calls it (FEEDBACK55.md, Q-786; branch feedback55).
+    assert_eq!(error("let m = { a: { b: 1 } }\nm = set(m, \"a\", set(get(m, \"a\", {}, 1), \"b\", 2))\nm"), "2 `get` takes 3 arguments, got 4: get(m, key, default)");
     assert_eq!(value("let d = {}\nlet m = { a: { b: 1 } }\nm = set(m, \"a\", set(get(m, \"a\", d), \"b\", 2))\nm"), "{ a: { b: 2 } }");
     assert_eq!(value("let xs = [[1], [2]]\nxs = set(xs, 0, set(xs[0], 0, 5))\nxs"), "[[5], [2]]");
 }
@@ -119,7 +120,8 @@ fn a_map_set_from_a_call_that_is_not_its_own_read_is_made_the_long_way() {
 fn merge_remove_and_a_long_set_on_a_variable_give_the_new_value() {
     assert_eq!(value("let m = { a: 1 }\nm = merge(m, { b: 2 })\nm"), "{ a: 1, b: 2 }");
     assert_eq!(value("let m = { a: 1, b: 2 }\nm = remove(m, \"a\")\nm"), "{ b: 2 }");
-    assert_eq!(value("let m = { a: 1 }\nm = set(m, \"a\", 2, 3)\nm"), "{ a: 2 }");
+    // More than `set` takes goes the long way, and is refused there (Q-786).
+    assert_eq!(error("let m = { a: 1 }\nm = set(m, \"a\", 2, 3)\nm"), "2 `set` takes 3 arguments, got 4: set(m, key, value)");
 }
 
 #[test]

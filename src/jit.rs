@@ -565,6 +565,65 @@ pub(crate) fn arith_type(op: BinOp, x: T, y: T) -> Option<T> {
     }
 }
 
+/// `i op f` of an int `i` and a float `f` that are the same float (`i as f64 == f`), exactly, the
+/// rest of the interpreter's `value::int_float_cmp`: the float is whole then, and the int is
+/// compared with it as an int, 2^63 above every int. Compiled code went through the float alone,
+/// and `9007199254740993 > 9007199254740992.0` was false (FEEDBACK55.md, Q-787; branch
+/// feedback55). Where the two are different floats those decide, and where the int is within
+/// 2^53 its float is itself: only past 2^53 does this case need it (`float_needs_look`).
+pub(crate) fn int_float_same_ir(b: &mut FunctionBuilder, op: BinOp, i: V, f: V) -> V {
+    let icc = match op {
+        BinOp::Lt => IntCC::SignedLessThan,
+        BinOp::Le => IntCC::SignedLessThanOrEqual,
+        BinOp::Gt => IntCC::SignedGreaterThan,
+        _ => IntCC::SignedGreaterThanOrEqual,
+    };
+    let whole = b.ins().fcvt_to_sint_sat(types::I64, f);
+    let by_int = b.ins().icmp(icc, i, whole);
+    let two63 = b.ins().f64const(9223372036854775808.0);
+    let top = b.ins().fcmp(FloatCC::GreaterThanOrEqual, f, two63);
+    let below = b.ins().iconst(types::I8, matches!(op, BinOp::Lt | BinOp::Le) as i64);
+    b.ins().select(top, below, by_int)
+}
+
+/// Whether the float compare of an int and the float `f` needs a closer look: `f` is NaN, which
+/// cannot be compared, or 2^53 or more either way, where floats skip ints and an int's float can
+/// be `f` though the int is not. One compare (`uge`, a single branch on every machine), which
+/// stands for the NaN test the usual path had, and is taken out of a loop when `f` does not
+/// change in it; the closer look in a block at the end (Q-787). Gives the block (switched to)
+/// and the usual path's, to go on in.
+pub(crate) fn float_needs_look(b: &mut FunctionBuilder, f: V) -> (Block, Block) {
+    let a = b.ins().fabs(f);
+    let edge = b.ins().f64const(9007199254740992.0);
+    let odd = b.ins().fcmp(FloatCC::UnorderedOrGreaterThanOrEqual, a, edge);
+    let (cold, go) = (b.create_block(), b.create_block());
+    b.set_cold_block(cold);
+    b.ins().brif(odd, cold, &[], go, &[]);
+    b.switch_to_block(cold);
+    (cold, go)
+}
+
+/// The float compare of `op`.
+pub(crate) fn float_cc(op: BinOp) -> FloatCC {
+    match op {
+        BinOp::Lt => FloatCC::LessThan,
+        BinOp::Le => FloatCC::LessThanOrEqual,
+        BinOp::Gt => FloatCC::GreaterThan,
+        _ => FloatCC::GreaterThanOrEqual,
+    }
+}
+
+/// `op` with its sides swapped: `x < y` is `y > x`.
+pub(crate) fn swapped(op: BinOp) -> BinOp {
+    match op {
+        BinOp::Lt => BinOp::Gt,
+        BinOp::Le => BinOp::Ge,
+        BinOp::Gt => BinOp::Lt,
+        BinOp::Ge => BinOp::Le,
+        other => other,
+    }
+}
+
 // ---- making the code ---------------------------------------------------
 
 fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
@@ -953,17 +1012,23 @@ impl Gen<'_, '_> {
                 self.check(over);
                 self.b.ins().srem(x, y)
             }
+            // An int with a float, exactly, in ints (FEEDBACK55.md, Q-787; branch feedback55).
+            // As floats, as before, unless they could be wrong: the same float past 2^53 (rare),
+            // where the call is the interpreter's, which compares exactly, as for NaN.
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge if ta != tb => {
+                let (fi, f, op) = if ta == I { (x, y, op) } else { (y, x, swapped(op)) };
+                let (_, go) = float_needs_look(&mut self.b, f);
+                // NaN cannot be compared: the interpreter fails there.
+                let same = self.b.ins().fcmp(FloatCC::UnorderedOrEqual, fi, f);
+                self.b.ins().brif(same, self.bail, &[], go, &[]);
+                self.b.switch_to_block(go);
+                self.b.ins().fcmp(float_cc(op), fi, f)
+            }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge if floats => {
                 // NaN cannot be compared: the interpreter fails there.
                 let nan = self.b.ins().fcmp(FloatCC::Unordered, x, y);
                 self.check(nan);
-                let cc = match op {
-                    BinOp::Lt => FloatCC::LessThan,
-                    BinOp::Le => FloatCC::LessThanOrEqual,
-                    BinOp::Gt => FloatCC::GreaterThan,
-                    _ => FloatCC::GreaterThanOrEqual,
-                };
-                self.b.ins().fcmp(cc, x, y)
+                self.b.ins().fcmp(float_cc(op), x, y)
             }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 let cc = match op {

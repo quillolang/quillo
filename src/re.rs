@@ -475,7 +475,12 @@ fn replace(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             Value::Str(t) => expand(t, &s, &m, &names, &mut out).or_else(|e| fail(line, format!("`re.replace`: {}", e)))?,
             f => {
                 let v = match_value(&r, &s, &m, &mut chars);
-                out.push_str(&it.call(f, vec![v], line)?.display());
+                // The function's error is given back: its text went into the text, and a `?` in
+                // it wrote "err(...)" (FEEDBACK55.md, Q-784; branch feedback55).
+                match it.call(f, vec![v], line)? {
+                    e @ Value::Err(..) => return Ok(e),
+                    v => out.push_str(&v.display()),
+                }
             }
         }
         last = m.end;
