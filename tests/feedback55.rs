@@ -5472,7 +5472,7 @@ fn the_markdown_endpoint_takes_a_preview_and_no_more() {
     let t = std::time::Instant::now();
     let a = post(&report);
     assert_eq!(a.status, 200, "{}", &a.body[..200.min(a.body.len())]);
-    assert!(t.elapsed().as_secs_f64() < 2.0, "{:?}", t.elapsed());
+    assert!(t.elapsed().as_secs_f64() < 2.0 * DEBUG_SLOWER, "{:?}", t.elapsed());
     assert!(!a.body.contains("hl-c") && a.body.contains("hl-k"), "{}", &a.body[..200]);
     assert_eq!(support::send(s.port, "GET", "/", &[], "").body, "hello");
     // The limit, one byte under and one over, in bytes whatever the characters.
@@ -5670,6 +5670,11 @@ fn a_fences_language_is_its_first_word_to_a_comma() {
     assert_eq!(md("```日本,rust\nf(1)\n```"), "<pre class=\"hl\"><code class=\"language-\">f(1)\n</code></pre>\n");
 }
 
+/// How much longer work takes in a debug build, which CI runs the tests in (1 MB of Markdown took
+/// 2.5 s there): an absolute bound on the time work takes grows by it; a ratio between two sizes
+/// does not.
+const DEBUG_SLOWER: f64 = if cfg!(debug_assertions) { 10.0 } else { 1.0 };
+
 /// Seconds `markdown(text)` takes, the best of three, on the server.
 fn markdown_takes(it: &mut quillo::Interp, f: &str, text: &str) -> f64 {
     let md = quillo::value::lookup(&it.globals, f).unwrap();
@@ -5697,7 +5702,7 @@ fn markdown_takes_time_in_proportion_to_the_text() {
     let a = support::send(port, "POST", "/_quillo/markdown", &[], &report);
     assert_eq!(a.status, 200, "{}", &a.body[..200.min(a.body.len())]);
     // 0.12 took 17 s; the bound leaves room for a loaded machine.
-    assert!(t.elapsed().as_secs_f64() < 8.0, "the report's body took {:?}", t.elapsed());
+    assert!(t.elapsed().as_secs_f64() < 8.0 * DEBUG_SLOWER, "the report's body took {:?}", t.elapsed());
     assert!(a.body.starts_with(r#"{"ok":"<p>"#), "{}", &a.body[..200]);
     assert_eq!(support::send(port, "GET", "/", &[], "").body, "hello");
     // On the server, markdown() of each shape and markdown_page() of the report's, at 256 KB,
@@ -5706,7 +5711,7 @@ fn markdown_takes_time_in_proportion_to_the_text() {
     it.load_source("fn md(t: str) = markdown(t)\nfn page(t: str) = markdown_page(t)\n", "case.qwe").unwrap();
     for (f, p) in [("page", "*a_"), ("md", "*a_"), ("md", "**a_"), ("md", " *_"), ("md", "_a*"), ("md", "*a**"), ("md", "[a]("), ("md", "`a"), ("md", "<a"), ("md", "~~a*"), ("md", "> *a_\n"), ("md", "- *a_\n")] {
         let [t1, t2, t4] = [1usize, 2, 4].map(|k| markdown_takes(&mut it, f, &p.repeat((k << 18) / p.len())));
-        assert!(t4 < 2.0, "{} {:?}: 1 MB took {:.3} s", f, p, t4);
+        assert!(t4 < 2.0 * DEBUG_SLOWER, "{} {:?}: 1 MB took {:.3} s", f, p, t4);
         // Four times the text against at most six times the time (0.12 was sixteen).
         assert!(t4 < 6.0 * t1 + 0.03, "{} {:?}: {:.4} s, {:.4} s, {:.4} s", f, p, t1, t2, t4);
     }
