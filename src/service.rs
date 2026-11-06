@@ -527,12 +527,21 @@ fn statements(path: &Path, base: &Path, seen: &mut HashSet<PathBuf>, out: &mut V
         }
     };
     for s in stmts {
-        if let Stmt::Use(file, ..) = &s {
+        if let Stmt::Use(file, _, _, options) = &s {
             if crate::ast::is_script(file) {
                 out.push(s);
                 continue;
             }
-            statements(&base.join(crate::modules::resolve_from(base, path, file)), base, seen, out)?;
+            // A path written without its extension is the file there; one written with it is
+            // that file. A Rust file has no `server fn` or `service` of its own (the service
+            // builds it as it loads): it was read as Quillo, and the app did not start
+            // (FEEDBACK55.md, Q-819; branch feedback55).
+            let used = crate::modules::resolve_use(base, path, file, options.implied);
+            if crate::native::is_rust(&used) {
+                out.push(s);
+                continue;
+            }
+            statements(&base.join(used), base, seen, out)?;
         }
         out.push(s);
     }
@@ -1617,7 +1626,9 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
             crate::svcauth::set_auth(name, m.get("auth"), m.get("forward"), &it.base_dir).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
         }
     }
-    let full = it.base_dir.join(file);
+    // From the folder of the file a main file that is a link leads to, as `use` and `mount`
+    // paths are (FEEDBACK55.md, Q-817; branch feedback55).
+    let full = it.src_dir().join(file);
     let fail_at = |e: String| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line)));
     // A service that runs elsewhere and whose file is not here: asked for its functions, as it
     // gives them, signed (FEEDBACK40.md, Q-471; branch feedback40-43).

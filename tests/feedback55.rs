@@ -8773,3 +8773,81 @@ fn transparent_pixels_are_white_in_a_jpeg() {
 }
 
 // ---- end of slice 12 ----
+
+// ---- slice 11's services (Q-817, Q-819) ----
+
+// Q-817 and Q-819 for `service name = "file.qwe"`: a main file through a link took its service's
+// file from beside the link, and a `use` in a service's file was its `.qwe` whatever was there; a
+// Rust file a service's file used was read as Quillo, and the app did not start. Now a service's
+// file is found as a used file is, and its own `use` paths too.
+#[test]
+fn a_services_file_is_found_as_a_used_file_is() {
+    let svc = "service billing = \"billing.qwe\"\nprint(billing.total())\n";
+    let d = s11_dir("services", &[
+        ("opt/äpp/main.qwe", "service billing = \"billing.qwe\"\nroute GET / = str(billing.total())\n"),
+        ("opt/äpp/p.qwe", svc),
+        ("opt/äpp/billing.qwe", "use helpers\nserver fn total() = five()\n"),
+        ("opt/äpp/helpers.qwe", "fn five() = 5\n"),
+        ("real/main.qwe", svc),
+        ("at/billing.qwe", "server fn total() = 9\n"),
+        ("releases/r1/main.qwe", svc),
+        ("releases/r1/billing.qwe", "server fn total() = 3\n"),
+        ("two/main.qwe", svc),
+        ("two/billing.qwe", "use helpers\nserver fn total() = h()\n"),
+        ("two/written.qwe", "service billing = \"billing2.qwe\"\nprint(billing.total())\n"),
+        ("two/billing2.qwe", "use helpers.qwe\nserver fn total() = h()\n"),
+        ("two/helpers.qwe", "fn h() = 1\n"),
+        ("two/helpers.rs", "//! effects: none\npub fn h() -> i64 { 2 }\n"),
+        ("one/main.qwe", svc),
+        ("one/billing.qwe", "use helpers\nserver fn total() = h()\n"),
+        ("one/helpers.qwe", "fn h() = 4\n"),
+        ("rs/main.qwe", svc),
+        ("rs/billing.qwe", "use tools\nserver fn total() = seven()\n"),
+        ("rs/written.qwe", "service billing = \"billing2.qwe\"\nprint(billing.total())\n"),
+        ("rs/billing2.qwe", "use tools.rs\nserver fn total() = seven()\n"),
+        ("rs/tools.rs", "//! effects: none\npub fn seven() -> i64 { 7 }\n"),
+    ]);
+    let link = |to: &str, at: &str| std::os::unix::fs::symlink(to, d.join(at)).unwrap();
+    std::fs::create_dir_all(d.join("site")).unwrap();
+    link("../opt/äpp/main.qwe", "site/main.qwe");
+    link("../opt/äpp/p.qwe", "site/p.qwe");
+    link("p.qwe", "site/again.qwe");
+    link("../real/main.qwe", "at/main.qwe");
+    link("releases/r1", "current");
+    // Through a link, a link to a link, and as a site's routes call it; check finds it too.
+    for (cwd, f) in [(d.clone(), "site/p.qwe"), (d.join("site"), "p.qwe"), (d.clone(), "site/again.qwe")] {
+        let (ok, out, err) = s11_quillo(&cwd, &["run", f]);
+        assert!(ok && out == "5\n", "{}: {}{}", f, out, err);
+    }
+    let s = support::serve(&d.join("site/main.qwe"), &[]);
+    assert_eq!(support::send(s.port, "GET", "/", &[], "").body, "5");
+    let (ok, out, _) = s11_check(&d, "site/main.qwe");
+    assert!(ok && !out.contains("warning"), "{}", out);
+    // Not beside the real file: not taken from beside the link.
+    let (ok, out, err) = s11_quillo(&d.join("at"), &["run", "main.qwe"]);
+    assert!(!ok && out.is_empty() && err.contains("main.qwe:1: cannot read ../real/billing.qwe: No such file or directory"), "{}{}", out, err);
+    // A folder that is a link is the folder given.
+    let (ok, out, err) = s11_quillo(&d.join("current"), &["run", "main.qwe"]);
+    assert!(ok && out == "3\n", "{}{}", out, err);
+    // A path without its extension two files could be: said, at check and as it runs; one file
+    // there is that file, and one written with its extension is the one meant.
+    let two = d.join("two");
+    let (ok, out, _) = s11_check(&two, "main.qwe");
+    assert!(!ok && out.contains("billing.qwe:1: error: `helpers` could be helpers.qwe or helpers.rs: write the one you mean with its extension"), "{}", out);
+    let (ok, out, err) = s11_quillo(&two, &["run", "main.qwe", "--no-check"]);
+    assert!(!ok && out.is_empty() && err.contains("`helpers` could be helpers.qwe or helpers.rs"), "{}{}", out, err);
+    let (ok, out, err) = s11_quillo(&two, &["run", "written.qwe"]);
+    assert!(ok && out == "1\n", "{}{}", out, err);
+    let (ok, out, err) = s11_quillo(&d.join("one"), &["run", "main.qwe"]);
+    assert!(ok && out == "4\n", "{}{}", out, err);
+    // A Rust file, written with its extension or without.
+    let (ok, out, _) = s11_check(&d.join("rs"), "main.qwe");
+    assert!(ok, "{}", out);
+    if !s11_cargo() {
+        return;
+    }
+    for f in ["main.qwe", "written.qwe"] {
+        let (ok, out, err) = s11_quillo(&d.join("rs"), &["run", f]);
+        assert!(ok && out == "7\n", "{}: {}{}", f, out, err);
+    }
+}
