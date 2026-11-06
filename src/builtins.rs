@@ -3054,24 +3054,60 @@ pub(crate) fn int_div_rounded(f: &str, a: i64, b: i64, line: u32) -> R {
 pub(crate) fn most_args(name: &'static str) -> usize {
     use std::sync::atomic::Ordering::Relaxed;
     let p = name.as_ptr() as u64;
-    let slot = &MOST[((p >> 3) ^ (p >> 11)) as usize & (MOST.len() - 1)];
-    let e = slot.load(Relaxed);
+    let at = most_slot(p);
+    let e = MOST[at].load(Relaxed);
     if e >> 8 == p {
         return if e & 0xff == 0xff { usize::MAX } else { (e & 0xff) as usize };
     }
-    most_args_found(name, slot)
+    let e = MOST[(at + 1) & (MOST.len() - 1)].load(Relaxed);
+    if e >> 8 == p {
+        return if e & 0xff == 0xff { usize::MAX } else { (e & 0xff) as usize };
+    }
+    most_args_found(name, at)
 }
 
 static MOST: [std::sync::atomic::AtomicU64; 1024] = [const { std::sync::atomic::AtomicU64::new(0) }; 1024];
 
+/// Slots a name is looked for in after its own, when another name has that one.
+const MOST_PROBES: usize = 8;
+
+#[inline(always)]
+fn most_slot(p: u64) -> usize {
+    ((p >> 3) ^ (p >> 11)) as usize & (MOST.len() - 1)
+}
+
+/// A name not in its slot: in one of the next, or else found and kept in the first free one.
+/// Two names of one slot took it from each other at each call, each then asking check.rs's
+/// table, a hash of the name: which two did was a matter of where the linker put them, and
+/// one build's loop of builtin calls was a tenth slower for it (FEEDBACK55.md, string speed;
+/// branch feedback55).
 #[cold]
 #[inline(never)]
-fn most_args_found(name: &'static str, slot: &std::sync::atomic::AtomicU64) -> usize {
-    let n = crate::check::most_args(name);
+fn most_args_found(name: &'static str, at: usize) -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
     let p = name.as_ptr() as u64;
+    let decode = |e: u64| if e & 0xff == 0xff { usize::MAX } else { (e & 0xff) as usize };
+    for k in 2..MOST_PROBES {
+        let e = MOST[(at + k) & (MOST.len() - 1)].load(Relaxed);
+        if e >> 8 == p {
+            return decode(e);
+        }
+        if e == 0 {
+            break;
+        }
+    }
+    let n = crate::check::most_args(name);
     // Where a pointer has its top byte, nothing is kept (and the table is asked each time).
     if p >> 56 == 0 {
-        slot.store(p << 8 | n.map_or(0xff, |n| n.min(0xfe) as u64), std::sync::atomic::Ordering::Relaxed);
+        let e = p << 8 | n.map_or(0xff, |n| n.min(0xfe) as u64);
+        for k in 0..MOST_PROBES {
+            let slot = &MOST[(at + k) & (MOST.len() - 1)];
+            match slot.compare_exchange(0, e, Relaxed, Relaxed) {
+                Ok(_) => break,
+                Err(had) if had == e => break,
+                Err(_) => {}
+            }
+        }
     }
     n.unwrap_or(usize::MAX)
 }
@@ -3952,4 +3988,40 @@ fn css_value_fn(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
 /// tells editors to highlight it as CSS or SQL.
 fn tag_text(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::str(&*s_arg(&args, 0, "css", line)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// Names of one slot in `most_args`' table are each kept, in the slots after it, and each
+    /// still says how many arguments its builtin takes (FEEDBACK55.md, string speed; branch
+    /// feedback55).
+    #[test]
+    fn names_of_one_slot_are_each_kept() {
+        // `len` at addresses of the test's choosing: many of one block.
+        let block: &'static str = Box::leak("len".repeat(40_000).into_boxed_str());
+        let names: Vec<&'static str> = (0..40_000).map(|i| &block[i * 3..i * 3 + 3]).collect();
+        // Three of a slot whose neighbours no other name has yet.
+        let free = |home: usize| (0..MOST_PROBES).all(|k| MOST[(home + k) & (MOST.len() - 1)].load(Relaxed) == 0);
+        let home = names.iter().map(|n| most_slot(n.as_ptr() as u64)).find(|h| free(*h)).expect("a free slot");
+        let same: Vec<&'static str> = names.iter().copied().filter(|n| most_slot(n.as_ptr() as u64) == home).take(3).collect();
+        assert_eq!(same.len(), 3);
+        for _ in 0..3 {
+            for n in &same {
+                assert_eq!(most_args(n), 1);
+            }
+        }
+        // Anywhere among the slots a name is looked for in: tests run at once, and another's
+        // first call of a builtin may have taken one of these meanwhile.
+        let kept: Vec<u64> = (0..MOST_PROBES).map(|k| MOST[(home + k) & (MOST.len() - 1)].load(Relaxed)).collect();
+        for n in &same {
+            assert!(kept.contains(&((n.as_ptr() as u64) << 8 | 1)), "{:x?}", kept);
+        }
+        // A name the table does not have takes any number, kept too.
+        let other: &'static str = Box::leak("no_such_builtin".to_string().into_boxed_str());
+        assert_eq!(most_args(other), usize::MAX);
+        assert_eq!(most_args(other), usize::MAX);
+    }
 }

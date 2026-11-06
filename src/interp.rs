@@ -518,6 +518,9 @@ struct Back {
     wrote_req: Option<usize>,
 }
 
+/// A text shorter than this is looked at each time it is read by index, not kept.
+const TEXT_SMALL: usize = 64;
+
 /// What is known of a text read by index.
 struct TextIndex {
     text: Arc<str>,
@@ -1298,6 +1301,27 @@ fn constant(e: &Expr) -> bool {
         Expr::Map(xs) => xs.iter().all(|(_, x)| constant(x)),
         _ => false,
     }
+}
+
+/// An int's text, as `str` and a map's key have it, written into `buf` with nothing made
+/// (FEEDBACK55.md, string speed; branch feedback55).
+pub(crate) fn int_text(i: i64, buf: &mut [u8; 20]) -> &str {
+    let mut n = i.unsigned_abs();
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if i < 0 {
+        at -= 1;
+        buf[at] = b'-';
+    }
+    // SAFETY: ASCII digits and a sign, written just above.
+    unsafe { std::str::from_utf8_unchecked(&buf[at..]) }
 }
 
 /// Whether two quiet expressions are written the same.
@@ -3173,7 +3197,7 @@ impl Interp {
 
     /// How many characters `s` has, and where each is unless each is a byte.
     fn text_index(&mut self, s: &Arc<str>) -> (usize, Option<&[u32]>) {
-        const SMALL: usize = 64;
+        const SMALL: usize = TEXT_SMALL;
         let kept = matches!(&self.text, Some(t) if Arc::ptr_eq(&t.text, s));
         if !kept {
             let plain = s.is_ascii();
@@ -3195,6 +3219,32 @@ impl Interp {
     /// `len(s)`, with what `s[i]` keeps: `while i < len(s)` asks each round.
     pub(crate) fn text_len(&mut self, s: &Arc<str>) -> usize {
         self.text_index(s).0
+    }
+
+    /// What `text_index` knows of `s`, for a compiled loop that reads it or adds to it
+    /// (src/jitloop.rs): what was kept of it is taken, as holding it would make the loop's
+    /// first `+=` a copy; worked out when nothing was and `want` says to (FEEDBACK55.md,
+    /// string speed; branch feedback55).
+    pub(crate) fn text_index_take(&mut self, s: &Arc<str>, want: bool) -> Option<(usize, Option<Vec<u32>>)> {
+        if let Some(t) = self.text.take_if(|t| Arc::ptr_eq(&t.text, s)) {
+            return Some((t.chars, t.offsets));
+        }
+        if !want {
+            None
+        } else if s.is_ascii() {
+            Some((s.len(), None))
+        } else {
+            let o = s.char_indices().map(|(i, _)| i as u32).collect::<Vec<u32>>();
+            Some((o.len(), Some(o)))
+        }
+    }
+
+    /// What `text_index_take` took, back after the loop, so the interpreter reading on does not
+    /// work it out again.
+    pub(crate) fn text_index_back(&mut self, s: Arc<str>, chars: usize, offsets: Option<Vec<u32>>) {
+        if s.len() >= TEXT_SMALL {
+            self.text = Some(TextIndex { text: s, chars, offsets });
+        }
     }
 
     /// `v`, unless a sandboxed script made it too big; a script also pays
@@ -3347,7 +3397,11 @@ impl Interp {
             return Ok(None);
         }
         if fname == set && self.fuel == u64::MAX {
-            if let Some(v) = self.in_place_nested(name, args, env)? {
+            if let [key, Expr::Binary(bop @ (BinOp::Add | BinOp::Sub | BinOp::Mul), read, more, line)] = args {
+                if let Some(v) = self.in_place_counted(name, key, *bop, read, more, *line, env, stored)? {
+                    return Ok(Some(v));
+                }
+            } else if let Some(v) = self.in_place_nested(name, args, env)? {
                 return Ok(Some(v));
             }
         }
@@ -3366,7 +3420,10 @@ impl Interp {
             }
             let Some(old) = take_local(env, name) else { return Ok(None) };
             few[0] = old;
-            return self.call(&b, few.to_vec(), line).map(Some);
+            // Moved, not copied: a copy held the list or map, which `set` then copied, each
+            // round of `m = m | set(i % 100, v)`, a key that is not a text (found in review of
+            // FEEDBACK55.md, string speed; branch feedback55).
+            return self.call(&b, few.iter_mut().map(|v| std::mem::replace(v, Value::Nil)).collect(), line).map(Some);
         }
         let mut vals = Vec::with_capacity(args.len() + 1);
         vals.push(Value::Nil);
@@ -3422,6 +3479,82 @@ impl Interp {
         }
         let done = crate::value::with_slot(env, name, |whole| crate::value::update_inside(whole, &key, start, vals));
         Ok(if done == Some(true) { take_local(env, name) } else { None })
+    }
+
+    /// `m = set(m, k, get(m, k, d) + e)` (or `-`, `*`), a count kept in a map, as word
+    /// frequencies and histograms are written: the key is looked for once, where `get` and
+    /// then `set` looked for it twice, and with no call made (FEEDBACK55.md, string speed; branch
+    /// feedback55). All that can send it the long way is asked before anything is worked out;
+    /// then the key, what to start from and `e` are each worked out once, in the long way's
+    /// order (the key is pure, so `get`'s, written again, is the same), and what fails fails as
+    /// the long way fails, with the same values at the same line. A key is read as `get` and
+    /// `set` read it: a text as it is, anything else as its text, an int with no text made; an
+    /// error is no key, and both give it back (found in review: int keys went the long way, after
+    /// their key had been worked out, and a histogram was 5% slower). `stored`: an assignment's,
+    /// whose map stays where it is, as `in_place_call` leaves one.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn in_place_counted(&mut self, name: Sym, key: &Expr, op: BinOp, read: &Expr, more: &Expr, line: u32, env: &Env, stored: bool) -> Result<Option<Value>, Ctrl> {
+        static GET: OnceLock<Sym> = OnceLock::new();
+        let Some((f, Expr::Ident(n, _), [k, start @ ..], _)) = call_on(read) else { return Ok(None) };
+        if f != *GET.get_or_init(|| Sym::new("get")) || *n != name || start.len() > 1 || !start.iter().all(constant) || !same_expr(key, k) || !pure(key, env) || !pure(more, env) {
+            return Ok(None);
+        }
+        // `m.get(k)` is a function the map holds, if it does.
+        let field = matches!(read, Expr::Call(g, ..) if matches!(&**g, Expr::Field(..)));
+        if !matches!(lookup(env, f), Some(Value::Builtin("get", _))) || crate::value::with_var(env, name, |v| matches!(v, Value::Map(m) if !(field && m.contains_key("get")))) != Some(true) {
+            return Ok(None);
+        }
+        let kv = self.eval(key, env)?;
+        let start = match start.first() {
+            Some(d) => self.eval(d, env)?,
+            None => Value::Nil,
+        };
+        let more = self.eval(more, env)?;
+        let mut digits = [0u8; 20];
+        let owned;
+        let k: &str = match &kv {
+            Value::Str(s) => s,
+            Value::Int(i) => int_text(*i, &mut digits),
+            // `get` gives the error back, and `+` of it fails, or else `set` gives it back too,
+            // which the variable then holds (builtins.rs: `get`, `set_of`).
+            Value::Err(..) => {
+                binop(op, kv.clone(), more, line)?;
+                return Ok(Some(kv));
+            }
+            v => {
+                owned = v.key_text();
+                &owned
+            }
+        };
+        let done = crate::value::with_slot(env, name, |whole| -> Result<bool, Ctrl> {
+            let Value::Map(m) = whole else { return Ok(false) };
+            let at = m.get_index_of(k);
+            let old = match at {
+                Some(i) => m[i].clone(),
+                None => start,
+            };
+            let now = binop(op, old, more, line)?;
+            let m = Arc::make_mut(m);
+            match at {
+                Some(i) => m[i] = now,
+                None => {
+                    m.insert(crate::value::Key::new(k), now);
+                }
+            }
+            Ok(true)
+        });
+        match done {
+            // An assignment has nothing left to do: the map is where it goes.
+            Some(Ok(true)) if stored => {
+                self.stored = true;
+                Ok(Some(Value::Nil))
+            }
+            Some(Ok(true)) => Ok(take_local(env, name)),
+            Some(Err(e)) => Err(e),
+            // Asked above: it is a map.
+            _ => Ok(None),
+        }
     }
 
     #[inline(never)]

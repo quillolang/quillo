@@ -36,6 +36,8 @@ CASES = [
      "import json\nrows = json.load(open('rows.json'))\nby = {}\nfor r in rows:\n    by.setdefault(r['region'], []).append(r)\nprint(len(by))\nprint(sum(r['total'] for r in by['r1']))\n"),
     ("word frequency", "let counts = {}\nfor w in re.split(lower(read_file(\"words.txt\")), \"\\\\W+\") {\n    counts = counts | set(w, get(counts, w, 0) + 1)\n}\nprint(len(counts))\n",
      "import re\ncounts = {}\nfor w in re.split(r'\\W+', open('words.txt').read().lower()):\n    counts[w] = counts.get(w, 0) + 1\nprint(len(counts))\n"),
+    ("int histogram", "fn f(n) {\n    let counts = {}\n    for i in 0..n {\n        let k = i * 7 % 1000\n        counts = counts | set(k, get(counts, k, 0) + 1)\n    }\n    len(counts)\n}\nprint(f(1000000))\n",
+     "def f(n):\n    counts = {}\n    for i in range(n):\n        k = i * 7 % 1000\n        counts[k] = counts.get(k, 0) + 1\n    return len(counts)\nprint(f(1000000))\n"),
     ("sieve", "fn sieve(n) {\n    let flags = range(0, n + 1) | map((_i) => true)\n    let i = 2\n    while i * i <= n {\n        if flags[i] {\n            for j in range(i * i, n + 1, i) {\n                flags = flags | set(j, false)\n            }\n        }\n        i += 1\n    }\n    count(flags, (f) => f) - 2\n}\nprint(sieve(2000000))\n",
      "def sieve(n):\n    flags = [True] * (n + 1)\n    i = 2\n    while i * i <= n:\n        if flags[i]:\n            for j in range(i * i, n + 1, i):\n                flags[j] = False\n        i += 1\n    return sum(flags) - 2\nprint(sieve(2000000))\n"),
     ("string +=", "fn f(n) {\n    let s = \"\"\n    for i in 0..n {\n        s += \"x\"\n    }\n    len(s)\n}\nprint(f(1000000))\n",

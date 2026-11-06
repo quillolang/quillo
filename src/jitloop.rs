@@ -9,8 +9,12 @@
 //! variables, read with `xs[i]` and `g[y][x]`, measured with `len`, and changed as the
 //! interpreter changes them in place, `xs = xs | set(i, v)`, `xs = set(xs, i, v)`,
 //! `xs.set(i, v)`, `g = set(g, y, set(g[y], x, v))`, `xs = xs | push(v)` and their other
-//! forms; `let`, assignment, `if`, `for` over a range, and `while`. Nothing it does can be
-//! told from the interpreter's doing it:
+//! forms; `let`, assignment, `if`, `for` over a range, and `while`. Texts too: read with
+//! `s[i]`, a character, which is compared with `==`, `!=`, `<` and the others, or kept in a
+//! `let`; measured with `len`; and added to with `s += x` and `s = s + x` (FEEDBACK55.md,
+//! string speed; branch feedback55). And a count kept in a map by an int,
+//! `m = m | set(k, get(m, k, 0) + 1)` and its other forms (found in review). Nothing it does
+//! can be told from the interpreter's doing it:
 //!
 //! - An error is the interpreter's own, made from the same values (`binop`, `set_of`): an
 //!   int that overflows, a `%` by zero, NaN compared, a `set` past the end, a step of 0.
@@ -46,6 +50,10 @@ pub(crate) enum Kind {
     Num(T),
     /// A list, and what its first item is, if it has one.
     List(Option<Item>),
+    /// A text (FEEDBACK55.md, string speed; branch feedback55).
+    Text,
+    /// A map, which only a count changes (found in review of the same).
+    Map,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -61,6 +69,9 @@ fn kind_of(v: &Value) -> Option<Kind> {
             Value::List(inner) => inner.first().and_then(T::of).map(Item::List),
             x => T::of(x).map(Item::Num),
         })),
+        // Where each character starts is kept in 32 bits, as the interpreter keeps it.
+        Value::Str(s) if s.len() <= u32::MAX as usize => Kind::Text,
+        Value::Map(_) => Kind::Map,
         v => Kind::Num(T::of(v)?),
     })
 }
@@ -80,6 +91,9 @@ struct Cx {
     end: i64,
     step: i64,
     miss: u64,
+    /// The run's texts, in the order of their places (FEEDBACK55.md, string speed; branch
+    /// feedback55).
+    texts: *mut Text,
     err: Option<Ctrl>,
 }
 
@@ -87,6 +101,67 @@ const K: i32 = 0;
 const END: i32 = 8;
 const STEP: i32 = 16;
 const MISS: i32 = 24;
+const TEXTS: i32 = 32;
+
+/// A text a loop reads or adds to, as its code takes it: the numbers first, at fixed places
+/// (FEEDBACK55.md, string speed; branch feedback55).
+#[repr(C)]
+struct Text {
+    bytes: *const u8,
+    /// How many characters, or -1 for a text added to whose length is not read.
+    chars: i64,
+    /// 1 when each character is a byte.
+    plain: i64,
+    /// The one character it is, as `code` has it, or -2 when it is not one.
+    code: i64,
+    /// Where each character starts, when they are not each a byte.
+    offsets: *const u32,
+    /// The text, a `Value::Str`, and what `offsets` points into.
+    value: Value,
+    index: Option<Vec<u32>>,
+}
+
+const T_BYTES: i32 = 0;
+const T_CHARS: i32 = 8;
+const T_PLAIN: i32 = 16;
+const T_CODE: i32 = 24;
+
+/// What a text compares by against a character: its one character, or -2, which no character
+/// is (a character is its code, -1 for null).
+fn one_code(s: &str) -> i64 {
+    let mut cs = s.chars();
+    match (cs.next(), cs.next()) {
+        (Some(c), None) => c as i64,
+        _ => -2,
+    }
+}
+
+impl Text {
+    fn new(value: Value, known: Option<(usize, Option<Vec<u32>>)>) -> Text {
+        let (chars, index) = known.map_or((-1, None), |(n, o)| (n as i64, o));
+        let mut t = Text { bytes: std::ptr::null(), chars, plain: 0, code: -2, offsets: std::ptr::null(), value, index };
+        t.refresh();
+        t
+    }
+
+    /// What is known of it worked out again, after null was added.
+    fn count(&mut self) {
+        if let (Value::Str(s), true) = (&self.value, self.chars >= 0) {
+            self.index = (!s.is_ascii()).then(|| s.char_indices().map(|(i, _)| i as u32).collect());
+            self.chars = self.index.as_ref().map_or(s.len(), Vec::len) as i64;
+        }
+        self.refresh();
+    }
+
+    /// Its numbers, after it changed.
+    fn refresh(&mut self) {
+        let Value::Str(s) = &self.value else { return };
+        self.bytes = s.as_ptr();
+        self.plain = (self.index.is_none() && s.len() as i64 == self.chars) as i64;
+        self.offsets = self.index.as_ref().map_or(std::ptr::null(), |o| o.as_ptr());
+        self.code = if self.chars == 1 { one_code(s) } else { -2 };
+    }
+}
 
 type Entry = unsafe extern "C" fn(*mut u64, *mut Value, *mut Cx) -> u64;
 
@@ -100,6 +175,11 @@ struct Shape {
 
 struct Code {
     entry: Entry,
+    /// The quoted texts in the loop (`"a"`), which its code points into.
+    _lits: Vec<Arc<str>>,
+    /// Whether the code reads how many characters each of the run's texts has: one only
+    /// added to is not counted (FEEDBACK55.md, string speed; branch feedback55).
+    counted: Vec<bool>,
 }
 
 type ShapeKey = (u64, usize);
@@ -146,30 +226,54 @@ pub(crate) fn run(it: &mut Interp, node: &Expr, env: &Env, range: Option<(i64, i
     };
     let mut scalars = vec![0u64; shape.free.len()];
     let mut lists: Vec<Value> = Vec::new();
+    let mut texts: Vec<Text> = Vec::new();
     for (i, ((n, written), k)) in shape.free.iter().zip(&kinds).enumerate() {
         match k {
             Kind::Num(_) => scalars[i] = value::with_var(env, *n, bits_of)??,
-            // Taken, so that it is changed where it is.
-            Kind::List(_) if *written => lists.push(value::take_local(env, *n)?),
-            Kind::List(_) => lists.push(value::lookup(env, *n)?),
+            // Taken, so that it is changed where it is. A map goes with the lists.
+            Kind::List(_) | Kind::Map if *written => lists.push(value::take_local(env, *n)?),
+            Kind::List(_) | Kind::Map => lists.push(value::lookup(env, *n)?),
+            // A text added to is taken, as a list is; one read is held. Each with where its
+            // characters start, if they are read, as the interpreter keeps it (FEEDBACK55.md,
+            // string speed; branch feedback55).
+            Kind::Text => {
+                let v = if *written { value::take_local(env, *n)? } else { value::lookup(env, *n)? };
+                let want = code.counted.get(texts.len()).copied().unwrap_or(true);
+                let known = match &v {
+                    Value::Str(s) => it.text_index_take(s, want).filter(|_| want),
+                    _ => None,
+                };
+                texts.push(Text::new(v, known));
+            }
         }
     }
     let (k, end, step) = range.unwrap_or((0, 0, 1));
-    let mut cx = Cx { k, end, step, miss: 0, err: None };
+    let mut cx = Cx { k, end, step, miss: 0, texts: texts.as_mut_ptr(), err: None };
     // SAFETY: the code was made for exactly these kinds: a number for each in `scalars`, a
-    // list for each in `lists`, in order, which outlive the call, as `cx` does.
+    // list for each in `lists`, a text for each in `texts`, in order, which outlive the call,
+    // as `cx` does.
     let status = unsafe { (code.entry)(scalars.as_mut_ptr(), lists.as_mut_ptr(), &mut cx) };
     let mut lists = lists.into_iter();
+    let mut texts = texts.into_iter();
     for (i, ((n, written), k)) in shape.free.iter().zip(&kinds).enumerate() {
         match k {
             Kind::Num(t) if *written => {
                 value::assign(env, *n, value_of(*t, scalars[i]));
             }
             Kind::Num(_) => {}
-            Kind::List(_) => {
+            Kind::List(_) | Kind::Map => {
                 let v = lists.next().unwrap_or(Value::Nil);
                 if *written {
                     value::assign(env, *n, v);
+                }
+            }
+            Kind::Text => {
+                let Some(t) = texts.next() else { continue };
+                if let (Value::Str(s), true) = (&t.value, t.chars >= 0) {
+                    it.text_index_back(s.clone(), t.chars as usize, t.index);
+                }
+                if *written {
+                    value::assign(env, *n, t.value);
                 }
             }
         }
@@ -245,6 +349,32 @@ fn update<'a>(name: Sym, op: &AssignOp, e: &'a Expr) -> Option<Update<'a>> {
     }
 }
 
+/// `m = set(m, k, get(m, k, d) + e)` (or `-`, `*`, and `m | set(...)`), a count kept in a
+/// map, `d` a number: as the interpreter's `in_place_counted` does it, the key looked for
+/// once. Not `m.set(...)` nor `m.get(...)`, a function the map may hold (found in review of
+/// FEEDBACK55.md, string speed; branch feedback55).
+struct Count<'a> {
+    key: &'a Expr,
+    op: BinOp,
+    start: &'a Lit,
+    more: &'a Expr,
+    line: u32,
+}
+
+fn count<'a>(name: Sym, op: &AssignOp, e: &'a Expr) -> Option<Count<'a>> {
+    let field = |e: &Expr| matches!(e, Expr::Call(f, ..) if matches!(&**f, Expr::Field(..)));
+    if !matches!(op, AssignOp::Set) || field(e) {
+        return None;
+    }
+    let (f, recv, rest, _) = call_on(e)?;
+    let (Expr::Ident(m, _), [key, Expr::Binary(bop @ (BinOp::Add | BinOp::Sub | BinOp::Mul), read, more, line)]) = (recv, rest) else { return None };
+    if f.as_str() != "set" || *m != name || field(read) {
+        return None;
+    }
+    let (g, Expr::Ident(m2, _), [k2, Expr::Lit(start @ (Lit::Int(_) | Lit::Float(_)))], _) = call_on(read)? else { return None };
+    (g.as_str() == "get" && *m2 == name && same_expr(key, k2)).then_some(Count { key, op: *bop, start, more, line: *line })
+}
+
 /// `a..b`, `range(b)`, `range(a, b)` or `range(a, b, step)`: its bounds and step.
 fn range_parts(iter: &Expr) -> Option<(Option<&Expr>, &Expr, Option<&Expr>)> {
     match iter {
@@ -261,21 +391,6 @@ fn range_parts(iter: &Expr) -> Option<(Option<&Expr>, &Expr, Option<&Expr>)> {
 
 fn is_range_call(iter: &Expr) -> bool {
     matches!(iter, Expr::Call(..))
-}
-
-/// Whether running `e` may write into a list.
-fn writes(e: &Expr) -> bool {
-    let mut found = false;
-    crate::check::walk_expr(e, &mut |x| {
-        if let Expr::Block(ss) = x {
-            for s in ss {
-                if let Stmt::Assign(n, op, e, _) = s {
-                    found |= update(*n, op, e).is_some();
-                }
-            }
-        }
-    });
-    found
 }
 
 struct Walk {
@@ -327,7 +442,9 @@ impl Walk {
 
     fn expr(&mut self, e: &Expr) -> Option<()> {
         match e {
-            Expr::Lit(Lit::Int(_) | Lit::Float(_) | Lit::Bool(_)) => {}
+            // Texts and null, to compare characters with and add to texts (FEEDBACK55.md,
+            // string speed; branch feedback55).
+            Expr::Lit(Lit::Int(_) | Lit::Float(_) | Lit::Bool(_) | Lit::Str(_) | Lit::Nil) => {}
             Expr::Ident(n, _) => self.use_name(*n, false),
             Expr::Unary(_, x, _) => self.expr(x)?,
             Expr::Binary(op, a, b, _) if *op != BinOp::Range => {
@@ -390,6 +507,14 @@ impl Walk {
             Stmt::Let(Pattern::Bind(n), e, _) => {
                 self.expr(e)?;
                 self.bound.last_mut()?.push(*n);
+            }
+            Stmt::Assign(n, op, e, _) if count(*n, op, e).is_some() => {
+                let c = count(*n, op, e)?;
+                self.builtin("set");
+                self.builtin("get");
+                self.expr(c.key)?;
+                self.expr(c.more)?;
+                self.use_name(*n, true);
             }
             Stmt::Assign(n, op, e, _) => {
                 match update(*n, op, e) {
@@ -568,6 +693,134 @@ unsafe extern "C" fn push1(list: *mut Value, t: u64, bits: u64) {
     }
 }
 
+/// `s[i]` of a text whose characters are not each a byte, `i` within it: the character's code
+/// (FEEDBACK55.md, string speed; branch feedback55).
+unsafe extern "C" fn text_char(text: *const Text, i: i64) -> i64 {
+    // SAFETY: `text` is one of the run's texts.
+    let t = unsafe { &*text };
+    match (&t.value, &t.index) {
+        (Value::Str(s), Some(o)) => o.get(i as usize).and_then(|at| s.get(*at as usize..)).and_then(|r| r.chars().next()).map_or(-1, |c| c as i64),
+        _ => -1,
+    }
+}
+
+/// A character as the interpreter has it: its text, or null.
+fn char_value(code: i64) -> Value {
+    match u32::try_from(code).ok().and_then(char::from_u32) {
+        Some(c) => Value::str(c.encode_utf8(&mut [0u8; 4])),
+        None => Value::Nil,
+    }
+}
+
+/// `s += x`: `x` another of the run's texts (`src`), a quoted text (`ptr`, `len`), or
+/// else a character (`code`). Added where it is when nothing else holds the text, as the
+/// interpreter adds; null, or the text added to itself, as `+` has it. Only its length and its
+/// one character are read after (FEEDBACK55.md, string speed; branch feedback55).
+unsafe extern "C" fn text_add(text: *mut Text, src: *const Text, ptr: *const u8, len: u64, code: i64, line: u64, cx: *mut Cx) -> u64 {
+    // SAFETY: `text` and `src` are the run's texts, and `ptr` a quoted text the code holds; nothing
+    // else reads or writes them while this runs. `src` is read before `text` is written, as
+    // they may be the same; what is added is held, so that a text added to itself is not
+    // changed while it is read.
+    let held = (!src.is_null()).then(|| match unsafe { &(*src).value } {
+        Value::Str(s) => s.clone(),
+        _ => Arc::from(""),
+    });
+    let t = unsafe { &mut *text };
+    let mut buf = [0u8; 4];
+    let add: &str = if let Some(h) = &held {
+        h
+    } else if !ptr.is_null() {
+        // SAFETY: the bytes of a `str` the code holds (`Code::_lits`).
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) }
+    } else {
+        match u32::try_from(code).ok().and_then(char::from_u32) {
+            Some(c) => c.encode_utf8(&mut buf),
+            None => {
+                let now = std::mem::replace(&mut t.value, Value::Nil);
+                match binop(BinOp::Add, now, Value::Nil, line as u32) {
+                    Ok(v) => {
+                        t.value = v;
+                        t.count();
+                        return 0;
+                    }
+                    Err(e) => return failed(cx, e),
+                }
+            }
+        }
+    };
+    if let Value::Str(s) = &mut t.value {
+        if !value::append_text(s, add) {
+            let mut both = String::with_capacity(s.len() + add.len());
+            both.push_str(s);
+            both.push_str(add);
+            *s = Arc::from(both);
+        }
+        // Where each character starts, kept as `text_added` in src/interp.rs keeps it: once
+        // one is not a byte, from then on.
+        if t.chars >= 0 {
+            let start = s.len() - add.len();
+            t.chars += if add.is_ascii() { add.len() } else { add.chars().count() } as i64;
+            match &mut t.index {
+                Some(o) => o.extend(add.char_indices().map(|(i, _)| (start + i) as u32)),
+                None if !add.is_ascii() => t.index = Some(s.char_indices().map(|(i, _)| i as u32).collect()),
+                None => {}
+            }
+        }
+        t.refresh();
+    }
+    0
+}
+
+/// The interpreter's error for comparing two characters, or a character and a text: each is
+/// a character's code, or a quoted text when its `ptr` is not null.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn compare_failed(op: u64, a: i64, aptr: *const u8, alen: u64, b: i64, bptr: *const u8, blen: u64, line: u64, cx: *mut Cx) {
+    let side = |code: i64, ptr: *const u8, len: u64| {
+        if ptr.is_null() {
+            char_value(code)
+        } else {
+            // SAFETY: as in `text_add`.
+            Value::str(unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) })
+        }
+    };
+    let e = match binop(OPS[op as usize], side(a, aptr, alen), side(b, bptr, blen), line as u32) {
+        Err(e) => e,
+        Ok(_) => Ctrl::Error(Box::new(crate::error::QuilloError::new("a compiled loop failed where the interpreter would not", line as u32))),
+    };
+    failed(cx, e);
+}
+
+/// `m = set(m, k, get(m, k, d) op e)` of an int `k`: where it is, the key looked for once, or
+/// the error `op` gives, as the interpreter's `in_place_counted` (found in review of
+/// FEEDBACK55.md, string speed; branch feedback55).
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn map_count(map: *mut Value, key: i64, op: u64, st: u64, sb: u64, mt: u64, mb: u64, line: u64, cx: *mut Cx) -> u64 {
+    // SAFETY: `map` is one of the run's lists and maps, written by nothing else while it runs.
+    let Value::Map(m) = (unsafe { &mut *map }) else {
+        return failed(cx, Ctrl::Error(Box::new(crate::error::QuilloError::new("a compiled loop's map is not a map", line as u32))));
+    };
+    let mut digits = [0u8; 20];
+    let k = crate::interp::int_text(key, &mut digits);
+    let at = m.get_index_of(k);
+    let old = match at {
+        Some(i) => m[i].clone(),
+        None => value_of(of_tag(st), sb),
+    };
+    match binop(OPS[op as usize], old, value_of(of_tag(mt), mb), line as u32) {
+        Ok(now) => {
+            let m = Arc::make_mut(m);
+            match at {
+                Some(i) => m[i] = now,
+                None => {
+                    m.insert(value::Key::new(k), now);
+                }
+            }
+            0
+        }
+        Err(e) => failed(cx, e),
+    }
+}
+
 const OPS: [BinOp; 10] = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod, BinOp::Lt, BinOp::Le, BinOp::Gt, BinOp::Ge, BinOp::Eq];
 
 /// The interpreter's error for `a op b`, which the code found it would give.
@@ -592,6 +845,13 @@ enum Var {
     Num(Variable, T),
     /// A list: its place among the run's lists.
     List(u32),
+    /// A text: its place among the run's texts (FEEDBACK55.md, string speed; branch
+    /// feedback55).
+    Text(u32),
+    /// A character, `s[i]`, by its code: -1 for null, past the end.
+    Char(Variable),
+    /// A map: its place among the run's lists, which it goes with.
+    Map(u32),
 }
 
 struct Gen<'f> {
@@ -600,6 +860,13 @@ struct Gen<'f> {
     ptr: Type,
     lists: V,
     cx: V,
+    texts: V,
+    /// Whether the loop adds to each text, by its place: one it adds to is not read by index.
+    text_written: Vec<bool>,
+    /// Whether it reads how many characters each has.
+    text_counted: Vec<bool>,
+    /// The quoted texts in the loop (`"a"`) that its code points into.
+    lits: Vec<Arc<str>>,
     sc: Vec<Vec<(Sym, Var)>>,
     /// Each list's kind, by its place.
     items: Vec<Option<Item>>,
@@ -623,19 +890,21 @@ fn compile(node: &Expr, shape: &Shape, kinds: &[Kind]) -> Option<Code> {
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(1, id.as_u32());
         let mut fctx = FunctionBuilderContext::new();
+        let (lits, counted);
         {
             let b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-            let mut g = Gen { b, cc, ptr, lists: V::from_u32(0), cx: V::from_u32(0), sc: vec![Vec::new()], items: Vec::new(), written: false, bail: Block::from_u32(0), fail: Block::from_u32(0) };
+            let mut g = Gen { b, cc, ptr, lists: V::from_u32(0), cx: V::from_u32(0), texts: V::from_u32(0), text_written: Vec::new(), text_counted: Vec::new(), lits: Vec::new(), sc: vec![Vec::new()], items: Vec::new(), written: false, bail: Block::from_u32(0), fail: Block::from_u32(0) };
             g.function(node, shape, kinds)?;
             g.b.seal_all_blocks();
             g.b.finalize(module.target_config());
+            (lits, counted) = (g.lits, g.text_counted);
         }
         module.define_function(id, &mut ctx).ok()?;
         module.clear_context(&mut ctx);
         module.finalize_definitions().ok()?;
         let code = module.get_finalized_function(id);
         // SAFETY: the function was made with exactly this signature.
-        Some(Code { entry: unsafe { std::mem::transmute::<*const u8, Entry>(code) } })
+        Some(Code { entry: unsafe { std::mem::transmute::<*const u8, Entry>(code) }, _lits: lits, counted })
     })
 }
 
@@ -648,6 +917,7 @@ impl Gen<'_> {
         let (scalars, lists, cx) = (params[0], params[1], params[2]);
         self.lists = lists;
         self.cx = cx;
+        self.texts = self.b.ins().load(self.ptr, MemFlagsData::trusted(), cx, TEXTS);
         // The variables from around, and for those it assigns, their values as a round began.
         let mut outs = Vec::new();
         for (i, ((n, written), k)) in shape.free.iter().zip(kinds).enumerate() {
@@ -667,6 +937,15 @@ impl Gen<'_> {
                 Kind::List(item) => {
                     self.sc[0].push((*n, Var::List(self.items.len() as u32)));
                     self.items.push(*item);
+                }
+                Kind::Map => {
+                    self.sc[0].push((*n, Var::Map(self.items.len() as u32)));
+                    self.items.push(None);
+                }
+                Kind::Text => {
+                    self.sc[0].push((*n, Var::Text(self.text_written.len() as u32)));
+                    self.text_written.push(*written);
+                    self.text_counted.push(!*written);
                 }
             }
         }
@@ -798,6 +1077,203 @@ impl Gen<'_> {
         self.b.ins().iadd_imm_s(self.lists, slot as i64 * std::mem::size_of::<Value>() as i64)
     }
 
+    fn text_addr(&mut self, slot: u32) -> V {
+        self.b.ins().iadd_imm_s(self.texts, slot as i64 * std::mem::size_of::<Text>() as i64)
+    }
+
+    /// A quoted text, held with the code: where its bytes are, and how many.
+    fn lit(&mut self, s: &Arc<str>) -> (V, V) {
+        self.lits.push(s.clone());
+        let p = self.b.ins().iconst(self.ptr, s.as_ptr() as i64);
+        let n = self.b.ins().iconst(types::I64, s.len() as i64);
+        (p, n)
+    }
+
+    /// Whether running `e` may write into a list, or add to a text (FEEDBACK55.md, string
+    /// speed; branch feedback55).
+    fn writes(&self, e: &Expr) -> bool {
+        let mut found = false;
+        crate::check::walk_expr(e, &mut |x| {
+            if let Expr::Block(ss) = x {
+                for s in ss {
+                    if let Stmt::Assign(n, op, e, _) = s {
+                        found |= update(*n, op, e).is_some() || count(*n, op, e).is_some() || matches!(self.lookup(*n), Some(Var::Text(_)));
+                    }
+                }
+            }
+        });
+        found
+    }
+
+    /// Whether `e` is a character: `s[i]` of a text, or a variable that holds one (FEEDBACK55.md,
+    /// string speed; branch feedback55).
+    fn is_char(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Index(o, _, _) => matches!(&**o, Expr::Ident(n, _) if matches!(self.lookup(*n), Some(Var::Text(_)))),
+            Expr::Ident(n, _) => matches!(self.lookup(*n), Some(Var::Char(_))),
+            _ => false,
+        }
+    }
+
+    /// What `e` compares by with a character: a character's code (-1 for null), or a text's
+    /// one character (-2 when it is not one character, which no character is); null is -1.
+    fn code(&mut self, e: &Expr) -> Option<V> {
+        Some(match e {
+            Expr::Lit(Lit::Str(s)) => self.b.ins().iconst(types::I64, one_code(s)),
+            Expr::Lit(Lit::Nil) => self.b.ins().iconst(types::I64, -1),
+            Expr::Ident(n, _) => match self.lookup(*n)? {
+                Var::Char(v) => self.b.use_var(v),
+                Var::Text(slot) => {
+                    self.text_counted[slot as usize] = true;
+                    let a = self.text_addr(slot);
+                    self.b.ins().load(types::I64, MemFlagsData::trusted(), a, T_CODE)
+                }
+                Var::Num(..) | Var::List(_) | Var::Map(_) => return None,
+            },
+            Expr::Index(o, i, _) => {
+                let Expr::Ident(n, _) = &**o else { return None };
+                let Var::Text(slot) = self.lookup(*n)? else { return None };
+                if self.text_written[slot as usize] {
+                    return None;
+                }
+                let iv = self.int(i)?;
+                self.char_at(slot, iv)?
+            }
+            _ => return None,
+        })
+    }
+
+    /// `s[i]`: the character's code, from the end when `i` is negative, or -1 (null) past
+    /// either end, as the interpreter reads it.
+    fn char_at(&mut self, slot: u32, i: V) -> Option<V> {
+        let a = self.text_addr(slot);
+        let n = self.b.ins().load(types::I64, MemFlagsData::trusted(), a, T_CHARS);
+        let neg = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, i, 0);
+        let back = self.b.ins().iadd(i, n);
+        let j = self.b.ins().select(neg, back, i);
+        let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, j, n);
+        let (within, byte, wide, join) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let out = self.b.append_block_param(join, types::I64);
+        let none = self.b.ins().iconst(types::I64, -1);
+        self.b.ins().brif(inside, within, &[], join, &[none.into()]);
+        self.b.switch_to_block(within);
+        let plain = self.b.ins().load(types::I64, MemFlagsData::trusted(), a, T_PLAIN);
+        self.b.ins().brif(plain, byte, &[], wide, &[]);
+        self.b.switch_to_block(byte);
+        let bytes = self.b.ins().load(self.ptr, MemFlagsData::trusted(), a, T_BYTES);
+        let at = self.b.ins().iadd(bytes, j);
+        let c = self.b.ins().uload8(types::I64, MemFlagsData::trusted(), at, 0);
+        self.b.ins().jump(join, &[c.into()]);
+        self.b.switch_to_block(wide);
+        let c = self.helper(text_char as *const () as usize, &[a, j], true)?;
+        self.b.ins().jump(join, &[c.into()]);
+        self.b.switch_to_block(join);
+        Some(out)
+    }
+
+    /// A character compared with a character or a text: `==` and `!=` by
+    /// code; `<` and the others by code as well, as a text is ordered by its bytes and UTF-8
+    /// keeps the order of codes, with null refused as the interpreter refuses it.
+    fn char_compare(&mut self, op: BinOp, a: &Expr, b: &Expr, line: u32) -> Option<V> {
+        let x = self.code(a)?;
+        let y = self.code(b)?;
+        if matches!(op, BinOp::Eq | BinOp::Ne) {
+            return Some(self.b.ins().icmp(if op == BinOp::Eq { IntCC::Equal } else { IntCC::NotEqual }, x, y));
+        }
+        // A character with a character, or with a quoted text: then by its first
+        // character, and a longer text is after a character it starts with.
+        let lit = |e: &Expr| match e {
+            Expr::Lit(Lit::Str(s)) => Some(s.clone()),
+            _ => None,
+        };
+        let (la, lb) = (lit(a), lit(b));
+        if !(self.is_char(a) || la.is_some()) || !(self.is_char(b) || lb.is_some()) || (la.is_some() && lb.is_some()) {
+            return None;
+        }
+        // The character on the left.
+        let (c, side, l) = match (&la, &lb) {
+            (Some(l), None) => (y, crate::jit::swapped(op), Some(l.clone())),
+            _ => (x, op, lb.clone()),
+        };
+        let other = match &l {
+            Some(_) => None,
+            None => Some(y),
+        };
+        // Null, on either side, fails.
+        let mut null = self.b.ins().icmp_imm_s(IntCC::Equal, c, -1);
+        if let Some(o) = other {
+            let n2 = self.b.ins().icmp_imm_s(IntCC::Equal, o, -1);
+            null = self.b.ins().bor(null, n2);
+        }
+        let (bad, go) = (self.b.create_block(), self.b.create_block());
+        self.b.set_cold_block(bad);
+        self.b.ins().brif(null, bad, &[], go, &[]);
+        self.b.switch_to_block(bad);
+        let i = OPS.iter().position(|o| *o == op).unwrap_or(0);
+        let zero = self.b.ins().iconst(self.ptr, 0);
+        let nothing = self.b.ins().iconst(types::I64, 0);
+        let (ap, al) = match &la {
+            Some(s) => self.lit(s),
+            None => (zero, nothing),
+        };
+        let (bp, bl) = match &lb {
+            Some(s) => self.lit(s),
+            None => (zero, nothing),
+        };
+        let args = [self.b.ins().iconst(types::I64, i as i64), x, ap, al, y, bp, bl, self.b.ins().iconst(types::I64, line as i64), self.cx];
+        self.helper(compare_failed as *const () as usize, &args, false);
+        self.b.ins().jump(self.fail, &[]);
+        self.b.switch_to_block(go);
+        let cc = |o: BinOp| match o {
+            BinOp::Lt => IntCC::SignedLessThan,
+            BinOp::Le => IntCC::SignedLessThanOrEqual,
+            BinOp::Gt => IntCC::SignedGreaterThan,
+            _ => IntCC::SignedGreaterThanOrEqual,
+        };
+        Some(match (l, other) {
+            (_, Some(o)) => self.b.ins().icmp(cc(side), c, o),
+            (Some(l), None) => {
+                let mut cs = l.chars();
+                let first = cs.next().map_or(-1, |ch| ch as i64);
+                let longer = cs.next().is_some();
+                let side = match side {
+                    BinOp::Lt if longer => BinOp::Le,
+                    BinOp::Ge if longer => BinOp::Gt,
+                    s => s,
+                };
+                self.b.ins().icmp_imm_s(cc(side), c, first)
+            }
+            (None, None) => return None,
+        })
+    }
+
+    /// `s += x` and `s = s + x` of a text: another text, a quoted one, or a character.
+    fn text_add(&mut self, slot: u32, x: &Expr, line: u32) -> Option<()> {
+        let zero = self.b.ins().iconst(self.ptr, 0);
+        let nothing = self.b.ins().iconst(types::I64, 0);
+        let (src, p, n, code) = match x {
+            Expr::Lit(Lit::Str(s)) => {
+                let (p, n) = self.lit(s);
+                (zero, p, n, nothing)
+            }
+            Expr::Ident(m, _) if matches!(self.lookup(*m), Some(Var::Text(_))) => {
+                let Some(Var::Text(other)) = self.lookup(*m) else { return None };
+                (self.text_addr(other), zero, nothing, nothing)
+            }
+            e if self.is_char(e) => {
+                let c = self.code(e)?;
+                (zero, zero, nothing, c)
+            }
+            _ => return None,
+        };
+        let a = self.text_addr(slot);
+        let args = [a, src, p, n, code, self.b.ins().iconst(types::I64, line as i64), self.cx];
+        let r = self.helper(text_add as *const () as usize, &args, true)?;
+        self.leave_if(r, self.fail);
+        self.written = true;
+        Some(())
+    }
+
     /// Calls `f`, a helper, with `args`.
     fn helper(&mut self, f: usize, args: &[V], ret: bool) -> Option<V> {
         let mut sig = Signature::new(self.cc);
@@ -878,7 +1354,7 @@ impl Gen<'_> {
         match e {
             Expr::Ident(n, _) => match self.lookup(*n)? {
                 Var::List(slot) => Some((slot, None)),
-                Var::Num(..) => None,
+                Var::Num(..) | Var::Text(_) | Var::Char(_) | Var::Map(_) => None,
             },
             Expr::Index(o, y, _) => {
                 let Expr::Ident(n, _) = &**o else { return None };
@@ -898,7 +1374,7 @@ impl Gen<'_> {
             Expr::Lit(Lit::Bool(x)) => (self.b.ins().iconst(types::I8, *x as i64), B),
             Expr::Ident(n, _) => match self.lookup(*n)? {
                 Var::Num(var, t) => (self.b.use_var(var), t),
-                Var::List(_) => return None,
+                Var::List(_) | Var::Text(_) | Var::Char(_) | Var::Map(_) => return None,
             },
             Expr::Unary(UnOp::Neg, x, line) => {
                 let (v, t) = self.value(x)?;
@@ -940,6 +1416,10 @@ impl Gen<'_> {
                 self.b.ins().jump(join, &[y.into()]);
                 self.b.switch_to_block(join);
                 (out, B)
+            }
+            // A character compared (FEEDBACK55.md, string speed; branch feedback55).
+            Expr::Binary(op @ (BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge), a, b, line) if self.is_char(a) || self.is_char(b) => {
+                (self.char_compare(*op, a, b, *line)?, B)
             }
             Expr::Binary(op, a, b, line) => {
                 let (x, ta) = self.value(a)?;
@@ -1003,6 +1483,15 @@ impl Gen<'_> {
                 let (Expr::Ident(n, _), [x]) = (&**f, args.as_slice()) else { return None };
                 if n != "len" {
                     return None;
+                }
+                // A text's length, in characters, as the run keeps it (FEEDBACK55.md, string
+                // speed; branch feedback55).
+                if let Expr::Ident(t, _) = x {
+                    if let Some(Var::Text(slot)) = self.lookup(*t) {
+                        self.text_counted[slot as usize] = true;
+                        let a = self.text_addr(slot);
+                        return Some((self.b.ins().load(types::I64, MemFlagsData::trusted(), a, T_CHARS), I));
+                    }
                 }
                 let (slot, row) = self.list(x)?;
                 let addr = self.list_addr(slot);
@@ -1125,6 +1614,14 @@ impl Gen<'_> {
     fn stmt(&mut self, s: &Stmt) -> Option<()> {
         match s {
             Stmt::Expr(e) => self.stmt_expr(e),
+            // A character kept (FEEDBACK55.md, string speed; branch feedback55).
+            Stmt::Let(Pattern::Bind(n), e, _) if self.is_char(e) => {
+                let c = self.code(e)?;
+                let var = self.b.declare_var(types::I64);
+                self.b.def_var(var, c);
+                self.sc.last_mut()?.push((*n, Var::Char(var)));
+                Some(())
+            }
             Stmt::Let(Pattern::Bind(n), e, _) => {
                 let (v, t) = self.value(e)?;
                 let var = self.b.declare_var(t.ir());
@@ -1133,8 +1630,26 @@ impl Gen<'_> {
                 Some(())
             }
             Stmt::Assign(n, op, e, line) => {
+                if let Some(c) = count(*n, op, e) {
+                    return self.count(*n, c);
+                }
                 if let Some(u) = update(*n, op, e) {
                     return self.update(*n, u);
+                }
+                // A text added to, or a character changed (FEEDBACK55.md, string speed; branch
+                // feedback55).
+                match (self.lookup(*n)?, op, e) {
+                    (Var::Text(slot), AssignOp::Add, x) => return self.text_add(slot, x, *line),
+                    (Var::Text(slot), AssignOp::Set, Expr::Binary(BinOp::Add, a, x, _)) if matches!(&**a, Expr::Ident(m, _) if m == n) => {
+                        return self.text_add(slot, x, *line);
+                    }
+                    (Var::Char(var), AssignOp::Set, x) if self.is_char(x) => {
+                        let c = self.code(x)?;
+                        self.b.def_var(var, c);
+                        return Some(());
+                    }
+                    (Var::Text(_) | Var::Char(_), ..) => return None,
+                    _ => {}
                 }
                 let Var::Num(var, t) = self.lookup(*n)? else { return None };
                 let (v, te) = self.value(e)?;
@@ -1158,6 +1673,41 @@ impl Gen<'_> {
             }
             _ => None,
         }
+    }
+
+    /// A count kept in a map, by an int key, through `map_count` (found in review of
+    /// FEEDBACK55.md, string speed; branch feedback55). The key, then `e`, as the interpreter
+    /// works them out.
+    fn count(&mut self, n: Sym, c: Count) -> Option<()> {
+        let Var::Map(slot) = self.lookup(n)? else { return None };
+        let key = self.int(c.key)?;
+        let (mv, mt) = self.value(c.more)?;
+        if mt == T::B {
+            return None;
+        }
+        let (st, sb) = match c.start {
+            Lit::Int(i) => (T::I, *i),
+            Lit::Float(f) => (T::F, f.to_bits() as i64),
+            _ => return None,
+        };
+        let addr = self.list_addr(slot);
+        let bits = self.to_bits(mt, mv);
+        let i = OPS.iter().position(|o| *o == c.op)?;
+        let args = [
+            addr,
+            key,
+            self.b.ins().iconst(types::I64, i as i64),
+            self.b.ins().iconst(types::I64, tag(st)),
+            self.b.ins().iconst(types::I64, sb),
+            self.b.ins().iconst(types::I64, tag(mt)),
+            bits,
+            self.b.ins().iconst(types::I64, c.line as i64),
+            self.cx,
+        ];
+        let r = self.helper(map_count as *const () as usize, &args, true)?;
+        self.leave_if(r, self.fail);
+        self.written = true;
+        Some(())
     }
 
     fn update(&mut self, n: Sym, u: Update) -> Option<()> {
@@ -1257,7 +1807,7 @@ impl Gen<'_> {
                     None => self.b.ins().iconst(types::I64, 1),
                 };
                 // A body that writes is run again after its writes.
-                let after = self.written || writes(body);
+                let after = self.written || self.writes(body);
                 self.written = after;
                 let k = self.b.declare_var(types::I64);
                 self.b.def_var(k, start);
@@ -1282,7 +1832,7 @@ impl Gen<'_> {
                 Some(())
             }
             Expr::While(c, body, _) => {
-                let after = self.written || writes(body);
+                let after = self.written || self.writes(body);
                 self.written = after;
                 let (head, step_blk, exit) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
                 self.b.ins().jump(head, &[]);

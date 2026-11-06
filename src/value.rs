@@ -1093,6 +1093,12 @@ pub const DEEPEST: usize = 10_000;
 /// compare rather than by recursion, however deep they nest (Q-661).
 pub fn equal(a: &Value, b: &Value) -> bool {
     use Value::*;
+    // Two that hold no others, as `s[i] == "a"` and `n == 0` are, with no list of what is
+    // left to compare: making one each time was a fifth of such a loop (FEEDBACK55.md, string
+    // speed; branch feedback55).
+    if !matches!((a, b), (List(_), List(_)) | (Map(_), Map(_)) | (Err(..), Err(..))) {
+        return scalar_equal(a, b);
+    }
     let mut todo = vec![(a, b)];
     while let Some((a, b)) = todo.pop() {
         let same = match (a, b) {
@@ -1123,6 +1129,7 @@ pub fn equal(a: &Value, b: &Value) -> bool {
     true
 }
 
+#[inline]
 fn scalar_equal(a: &Value, b: &Value) -> bool {
     use Value::*;
     match (a, b) {
@@ -2007,22 +2014,25 @@ pub fn append_text(s: &mut Arc<str>, t: &str) -> bool {
     let new = old + t.len();
     let Ok(layout) = Layout::from_size_align(round(HEADER + old), ALIGN) else { return false };
     let Ok(_) = Layout::from_size_align(round(HEADER + new), ALIGN) else { return false };
-    let held = std::mem::replace(s, Arc::from(""));
     // SAFETY: nothing else holds the block (asked above), which starts `HEADER` before the
     // text and has `layout` (see the test); `realloc` gives a block of the size `Arc` works
     // out for the longer text, with the counts as they were, and the new bytes are text
     // added to the end of text. If it fails, the old block is still there and is taken back.
+    // The `Arc` is read out of `s` and another written in, with nothing between that can
+    // unwind: an empty one put there meanwhile was an allocation for each `+=` (FEEDBACK55.md,
+    // string speed; branch feedback55).
     unsafe {
+        let held = std::ptr::read(s);
         let text = Arc::into_raw(held) as *const u8 as *mut u8;
         let block = text.sub(HEADER);
         let grown = realloc(block, layout, round(HEADER + new));
         if grown.is_null() {
-            *s = Arc::from_raw(std::ptr::slice_from_raw_parts(text as *const u8, old) as *const str);
+            std::ptr::write(s, Arc::from_raw(std::ptr::slice_from_raw_parts(text as *const u8, old) as *const str));
             return false;
         }
         let text = grown.add(HEADER);
         std::ptr::copy_nonoverlapping(t.as_ptr(), text.add(old), t.len());
-        *s = Arc::from_raw(std::ptr::slice_from_raw_parts(text as *const u8, new) as *const str);
+        std::ptr::write(s, Arc::from_raw(std::ptr::slice_from_raw_parts(text as *const u8, new) as *const str));
     }
     true
 }
@@ -2147,6 +2157,31 @@ pub fn assign_local(env: &Env, name: Sym, v: Value) -> Result<(), Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `append_text` adds where the text is when nothing else holds it, of any length and in
+    /// any script, and leaves a held one as it was, with no empty one put in its place
+    /// meanwhile (FEEDBACK55.md, string speed; branch feedback55).
+    #[test]
+    fn a_text_is_added_to_where_it_is_when_nothing_else_holds_it() {
+        let mut s: Arc<str> = Arc::from("ab");
+        assert!(append_text(&mut s, "cé"));
+        assert_eq!(&*s, "abcé");
+        assert!(append_text(&mut s, ""));
+        assert_eq!(&*s, "abcé");
+        let held = s.clone();
+        assert!(!append_text(&mut s, "x"));
+        assert_eq!((&*s, &*held), ("abcé", "abcé"));
+        drop(held);
+        assert!(append_text(&mut s, "x"));
+        assert_eq!(&*s, "abcéx");
+        let mut e: Arc<str> = Arc::from("");
+        assert!(append_text(&mut e, "😀"));
+        for _ in 0..1000 {
+            assert!(append_text(&mut e, "y"));
+        }
+        assert_eq!((e.len(), e.chars().count(), e.chars().next()), (1004, 1001, Some('😀')));
+        assert_eq!(Arc::strong_count(&e), 1);
+    }
 
     /// What `append_text` takes for granted of `Arc<str>`: the counts, then the text, in a
     /// block of the size it works out. A new Rust that lays it out otherwise fails here.
