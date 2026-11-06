@@ -81,7 +81,10 @@ options](#running-quillo) lists them all.
   (`quillo run billing.qwe --base /billing`) is the path it is served under, which its links and redirects carry.
 - **`--split`** runs each service the app declares (and those they declare) as a
   process of its own, each on its own port, its log lines marked with its name, all
-  signed with one secret. They stop with the app. `--describe`, `--no-build`,
+  signed with one secret. They stop with the app, whatever way it ends (Ctrl-C, a
+  SIGTERM, a SIGKILL, a crash): each holds a pipe from the app, which closes then, so no
+  service is left serving with its port taken. A service started on its own, by hand or
+  by systemd, serves on whatever its input is. `--describe`, `--no-build`,
   `--reload` and the `--policy` files, given to the app (`quillo run app.qwe --split
   --no-build --policy prod.toml`), are given to each of them too, and with `--port 0`
   the services are told the port the app was given. It is the quickest

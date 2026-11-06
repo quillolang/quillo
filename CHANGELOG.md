@@ -2,11 +2,12 @@
 
 ## Unreleased
 
-The fixes of FEEDBACK55.md's sweep, so far: what a program writes into markup, the files
-`files()` serves, HTTP's answers and cookies, highlighting and Markdown, the three
-databases, components' fields, the server and the browser giving one answer, a program's
-files and Rust modules, plurals, dates, numbers and images, and the command line: Q-700 to
-Q-782 and Q-807 to Q-852. The rest of the report (Q-783 to Q-806) is still to come.
+The fixes of FEEDBACK55.md's sweep, all of it: what a program writes into markup, the
+files `files()` serves, HTTP's answers and cookies, highlighting and Markdown, the three
+databases, components' fields, the server and the browser giving one answer, values that
+are exact or an error, what runs at the same time, a program's files and Rust modules,
+plurals, dates, numbers and images, and the command line: Q-700 to Q-852, and Q-875, found
+while fixing (a map's order in the browser).
 
 ### What to change in your code
 
@@ -220,6 +221,126 @@ Plurals, dates, numbers and images (Q-823 to Q-833):
 - **`markdown_page`'s title is the first level-one heading**, setext too, as its text; a `#`
   line in a code block is none (Q-831).
 
+A value is exact or an error, the same on the server, in compiled code and in the browser
+(Q-783 to Q-795):
+
+- **`sum` of text stops** at the item, saying what to write: `` `sum` adds numbers; got the
+  str "12.50" at item 1: use `float(...)` or `dec(...)` first ``. It joined the text after a
+  `0` (`"012.505.00"`), and amounts read from a form or a CSV are text (Q-783).
+- **A builtin given more arguments than it takes stops**, saying what it takes: `` `split`
+  takes 2 arguments, got 3: split(s, sep) ``, in `quillo check` where the call is written
+  out, as the program runs however it is reached (a method on an untyped value, a builtin
+  in a variable or given to another, `reduce(xs, 0, max)`), and in the browser. The extra
+  ones were dropped: `xs.sort((a, b) => b - a)` sorted up (it now says to use `sort_by`),
+  `line.split(",", 2)` split at every comma, and `uuid(1)`, `random(1)` and `merge(a, b, c)`
+  ran as if they were not there (Q-786).
+- **A name bound twice in one pattern is an error**, in `quillo check` and as the program
+  runs: `[x, x]`, `{ p: a, q: a }`, `let [y, y] = ...` matched anything, keeping the last
+  part; test two parts with a guard, `[x, x2] if x == x2`. A tested field binds its last
+  name, so `{ user.id: int, order.id: int }` still tests two ids, but using `id` there is an
+  error naming both fields (name one with `as`), and so is a route binding one name by two
+  of its path, query and request patterns (Q-785).
+- **An int and a float compare exactly**, as in Python, in the interpreter, both JITs and
+  the browser: `9007199254740993 == 9007199254740992.0` is false, and `sort` puts
+  `9007199254740992.0` before `9007199254740993`; they went through a float (Q-787).
+- **`floor(a / b)` of two ints is the exact int** past 2^53, and so are `ceil`, `round`,
+  `math.floor`, `math.ceil` and `math.trunc` of it, however the builtin is reached (called,
+  piped, as a method, from a module or a variable): `floor(9007199254740995 / 2)` is
+  `4503599627370497` (it was ...498, a float's digits). A quotient kept in a variable first
+  (`let q = a / b`) is a float, as before. **A float `floor`, `ceil` or `round` makes whole is
+  an int up to 2^63**: `type_of(round(1e16))` is `int`, where it was `float` from 9e15
+  (Q-788).
+- **`round` takes negative digits for floats and ints, and an int rounded to places is
+  itself**: `round(1234.5678, -2)` is `1200.0` (it was `1235.0`, the digits taken as 0),
+  `round(1255, -1)` is `1260` (it was `1255.0`), `round(2, 2)` is `2` (it was `2.0`), and
+  `round(9007199254740993, 2)` keeps every digit. Ints to negative digits round a half away
+  from zero, where Python rounds it to even (`round(1250, -2)` is `1300`) (Q-789).
+- **`pow` with a power of 2^32 or more is exact for a base of -1, 0 or 1, and an `integer
+  overflow` for any other**: `pow(-1, 9007199254740993)` was `1.0`, `pow(2, 4294967296)`
+  `inf` (Q-790).
+- **`unique` keeps exactly what `==` keeps**, so `unique([9007199254740993,
+  9007199254740992.0])` has both (Q-791).
+- **`json.stringify` of a function is an error value naming where it is** (`` `a.f` is a
+  function, which cannot be written as JSON ``), where it wrote `"<fn <fn>>"`; **a route
+  answering a value that holds a function is a 500**, its log line naming the path, where
+  it was a 200 with `"<fn f>"` in it, and `quillo check` warns of a function written in a
+  route's answer (Q-792).
+- **An error is given back, not made into text**: by `get`, `has`, `set` and `remove` given
+  one as the key, by `group_by` and `re.replace` given one by their function, and by
+  `url_encode` given one or a map holding one; its text became a key, part of the text or
+  of the URL (Q-784).
+- **`sql_name` and `sql_param` take letters and digits of any script and the marks on
+  them, at most 63 bytes on every database**: a name of 64 bytes is refused, as PostgreSQL
+  keeps 63, and `sql_name("名前")` is `"名前"`. **`quillo check` follows `map` and `join`
+  over them**, through every return of the lambda, so the guide's update from pairs
+  (`` cols | map((c) => `${sql_name(c)} = ${sql_param(c)}`) | join(", ") ``) gives no
+  warning, while raw text in the lambda still does; only the builtins are trusted, not a
+  name the program or the lambda binds again.
+
+What runs at the same time comes out as if done one after another (Q-796 to Q-806):
+
+- **One failing `parallel` function stops the others** at their next step (a call, a
+  loop's round, a builtin, a `sleep`), nested `parallel` too; what they did before stays,
+  and the call fails with the failure that happened. They ran to their ends, their writes
+  kept, and the first error was raised after (Q-804). Error values stop nothing.
+- **`set_cookie`, `set_session`, `end_session`, `session()`, `publish` and read-your-writes
+  work inside `parallel`'s functions**, merged into the answer in the functions' order;
+  reading the visitor there makes the answer private. They were dropped: a logout in a
+  `parallel` function left the visitor signed in (Q-796).
+- **A global set inside a transaction is announced when the outermost transaction ends,
+  whatever its outcome**, since the global keeps its value: pages kept the old one after a
+  rollback. A table's announcement still goes with the rollback (Q-797).
+- **A cron job's first time after a start runs**: counted from when the server first looks,
+  so started at 04:01, `"2 * * * *"` runs at 04:02 (it first ran at 05:02), and a nightly
+  job of a server deployed each day before its hour runs (Q-798). Cron fields may be apart
+  by tabs.
+- **`every` and `schedule` called once the program has started stop with an error** (a 500
+  in a route): they answered and the job never ran. `quillo check` reads their written-out
+  arguments as the start does, and **refuses one name twice only where both calls surely
+  run** (twice at the top level, or a top-level function adding it called twice); where
+  both may run (two `if`s, `&&`, `||`, `??`, a loop) it warns, and the start refuses the
+  second add that happens (Q-803).
+- **A state set after a wait gives way to a newer set of it** (the user's decision, "the
+  latest call only"): every set of a state claims it (plain, `bind:`, from a call), and a
+  handler that waited keeps only the sets it makes while no newer set claimed the state, so
+  a search box ends on the answer for what was typed last. A set that reads the state it
+  sets is a fold (`n += 1`, `xs = xs + [x]`, `s = f(s)`) and is always made (Q-800).
+- **A topic is 1 to 256 bytes**, any characters, a comma too; an empty or longer one stops
+  `watch` and `publish` with an error, where its page never heard of it. A trailing `:*` is
+  a wildcard, as before, now in the guide: a topic built from a visitor's text must not end
+  in `:*` (Q-801).
+
+Maps in the browser, and JSON (Q-875):
+
+- **A map keeps the order its keys were set in the browser too**, keys like `"1"` included
+  (JavaScript lists those first): `keys`, `values`, `for`, `str`, `json.stringify`,
+  `url_encode`, `merge`, spreads, `+`, `group_by` and records read `{ b: 1, "1": 2 }` with
+  `b` first, as the server does, and JSON the browser reads (`json.parse`, `http`'s `json`,
+  `server fn` answers, island state and props, live data, channels, streams) keeps the order
+  written. Code that counted on such keys coming first in a component sorts them.
+- **`js(...)`: a map holding a key that is an array index out of JavaScript's order reaches
+  page code as a plain copy**, in JavaScript's order, and what page code changes in it does
+  not show in Quillo; a map without such keys is handed over as before. What a program's
+  function called by page code returns is converted the same way.
+- **JSON nests 128 levels on both sides**, for every reader: `json.parse` past it is
+  `invalid JSON: it nests more than 128 deep` (the browser took some 3,000 and then
+  stopped), `request.json` and an `http` answer's `json` are `null`, a stream's line is its
+  text, and a database's JSON cell is that error (it took 1,000); sessions, channels, a
+  `server fn`'s arguments and a service's body read the same depth, and `set_session`
+  refuses a value nested deeper.
+- **A top-level constant holding an error value is an error value in the browser** (`is_err`
+  true, a builtin's text hidden), where it was a map.
+
+Services and time zones:
+
+- **A service `--split` started stops when its app ends, whatever way** (a SIGKILL, a crash,
+  the app's own exit after a second Ctrl-C), as a first SIGTERM stops it: the app holds a
+  pipe on the service's input, which closes then. A killed app's services served on with
+  their ports taken. A service started on its own (by hand, by systemd) serves on.
+- **A time zone the system's database leaves out is taken from Quillo's own copy**: Ubuntu
+  24.04 moved `EST`, `US/Pacific`, `Asia/Calcutta` and `EST5EDT` to `tzdata-legacy`, and a
+  program using one stopped there while it ran on a Mac and in the browser.
+
 The command line:
 
 - **A `.env` that cannot be read, is not UTF-8 or is a link to nothing stops the start**
@@ -340,6 +461,37 @@ From FEEDBACK55.md:
 - **Plurals, dates and images (Q-824, Q-833):** two `image.convert` calls to one target at
   once each write a temporary file of their own and both finish; `Accept-Language`'s `q`
   weight is read in any case (`Q=0.1`); a locale file may start with a byte-order mark.
+- **Values (Q-791, Q-793 to Q-795):** `unique` is hashed, linear for any list on both
+  sides, deep lists and tiny floats beside decimals too (20,000 ints took 1.38 s; 8,000
+  lists 34 deep 4,812 to 3 ms); `math.trunc`, `math.floor` and `math.ceil` reach 2^63
+  (`math.trunc(9.2e18)` was an overflow); `quillo check` warns of a map key written twice
+  (`{ a: 1, b: 2, a: 3 }`, `{ a, "a": 2 }`); `-9223372036854775808` can be written, in a
+  pattern too, `x - 9223372036854775808` says how, and `-9223372036854775808.f()` says to
+  write `(-9223372036854775808).f()`. A refused URL names the scheme it was given
+  (`` `redirect` is not given a vbscript: URL ``), in `redirect`, `respond`, `stream`,
+  `site_headers` and `navigate`, where each said `javascript:`. In a component, `x | f`
+  and `f(x / y)` follow what `f` reads, as `f(x)` does.
+- **At the same time (Q-799, Q-802, Q-805, Q-806):** a page joins a channel's room once at
+  a time, and each `join` that said yes gets exactly one `leave`, also when the page left
+  or closed while its `join` ran (10 pages closing during a slow `join` left `online` at
+  10, 20, 30); a request's `sleep` of 5 ms or more waits on a timer and holds no thread
+  (with 65 streams sleeping in their loops, a plain request took 0.5 to 0.9 s); over a
+  WebSocket a page reading at full speed gets every message of a burst, in order (one got
+  13,378 of 20,000), and the guide says the queue's rules hold once a page is 4,096
+  behind; the guide says that two requests of one visitor setting the session at once
+  lose one's change (the last cookie wins), and to keep such data in a table.
+- **Maps and the wire (Q-875's review):** the browser marked big ints and whole floats in
+  the JSON it writes with fixed prefixes any text could hold, so `?q=%00int:5` reached a
+  `server fn` as the int 5, and `a"\0int:5` broke the whole body; they go through
+  `JSON.rawJSON`, or marks made from the page's random tag. A map whose one key starts
+  with `$` crosses every wire both ways as `{"$": [key, value]}` (`server fn` arguments
+  and answers, island state and props, live data, services, sessions, `idempotent`
+  answers), so a key a visitor chose can no longer make an error value, an int, a decimal,
+  a file or a prop in another visitor's page or on the server. A state the developer
+  tools set reads its JSON as the server does (`2.0` a float, ints past 2^53 exact, keys in
+  the order written), and their messages list a map's keys in the order set.
+- **CI on Linux:** pulldown-cmark 0.13.6 (RUSTSEC-2026-0433: 0.13.5 parsed nested image
+  wikilinks in quadratic time; Quillo does not turn wikilinks on).
 
 ### Changed
 
@@ -357,6 +509,27 @@ From FEEDBACK55.md:
   JSON fallback for older browsers ships with every page. Plurals read the digits of their
   count: 100,000 `t()` calls with a float count take 32 ms on the server (26 before; with an
   int, 24), Python's equivalent 54 to 73 ms.
+- Exact values (Q-783 to Q-795): int and float loops and builtin calls as before or faster;
+  a compiled loop comparing ints with floats about 12% slower, as a float past 2^53 or NaN
+  takes a cold path, still far ahead of Python.
+- What runs at the same time (Q-796 to Q-806): a page's channel writer sends up to 64
+  messages in one write, and in a burst waits at most 50 µs for more, in steps of 10 µs:
+  bursts to pages 30 to 60 times faster at a tenth of the CPU (64 pages x 2,000 messages:
+  1,454 to 112 ms), an echo's round trip 0.058 ms; a broadcast's text is made once and
+  shared by its pages. A request's sleep holds no thread (100 sleeping streams: 25 to
+  13,122 requests a second beside them); a sleep under 5 ms still waits on a thread, as a
+  timer's are whole milliseconds. A page's topics too many or too long for its address go
+  after it (`tm=1`), read 4 KiB at a time and held to what 256 topics take (a socket closes
+  and a POST gets 413 past it). Parallel calls and plain routes as before.
+- Maps in the browser (Q-875): field reads, literals, keys and `for` as before, and maps
+  keyed by ids set in rising order too; a map holding an array-index key out of
+  JavaScript's order keeps its key list beside it; `json.parse` of maps whose digit keys are
+  out of JavaScript's order 1.38 times as long (their keys read from the text); a component
+  showing 1,000 maps again 8.71 to 8.97 ms; the served runtime 2.7 KB larger gzipped.
+- Tests: absolute time bounds on work are ten times as long in a debug build, which CI
+  runs (the ratios that tell linear from quadratic stay); a browser test's script goes
+  to node from a file (it passed Linux's 128 KiB argument limit), and deep JSON is read on
+  a request's stack in a debug build.
 
 ## 0.7.0 (2026-11-05)
 

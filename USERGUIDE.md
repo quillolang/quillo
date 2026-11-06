@@ -390,9 +390,9 @@ Operators are as in JavaScript, with these meanings:
 |---|---|
 | `+` | numbers add; a string with anything is text (`"n=" + 1` is `"n=1"`, `"a" + null` is `"anull"`); two lists join; two maps merge, the right one's values winning; `true + 1` and `null + 1` are errors |
 | `- * %` | as in JavaScript on numbers; nothing else is converted (`"5" * 2` is an error) |
-| `/` | exact division: `7 / 2` is `3.5`, and a whole result stays an integer (`6 / 2` is `3`); `floor(7 / 2)` is integer division |
-| `== !=` | deep equality, like comparing JSON: `1 == 1.0` and `0.1m == 0.1`, but `1 == "1"` is false (nothing is converted); functions are equal only to themselves |
-| `< <= > >=` | comparison of two numbers (ints, floats and decimals mix; not a decimal and a float), or two strings by code point; a string and a number, booleans, or NaN is an error |
+| `/` | exact division: `7 / 2` is `3.5`, and a whole result stays an integer (`6 / 2` is `3`); `floor(7 / 2)` is integer division, done in ints past 2^53 too: `floor`, `ceil`, `round`, `math.floor`, `math.ceil` and `math.trunc` of an int divided by an int, written in the call (`floor(a / b)`, `a / b \| floor`, `(a / b).floor()`, `math.floor(a / b)`, a builtin held in a variable), give the exact int, as Python's `a // b` does; a quotient kept in a variable first (`let q = a / b`) is a float, and its digits past 2^53 are gone |
+| `== !=` | deep equality, like comparing JSON: `1 == 1.0` and `0.1m == 0.1`, but `1 == "1"` is false (nothing is converted); an int and a float compare exactly, as in Python (`9007199254740993 == 9007199254740992.0` is false), in compiled code and in the browser too; functions are equal only to themselves |
+| `< <= > >=` | comparison of two numbers (ints, floats and decimals mix, exactly; not a decimal and a float), or two strings by code point; a string and a number, booleans, or NaN is an error |
 | `!`, `&&`, `\|\|` | not, and, or; `a && b` and `a \|\| b` give back one of their operands, so `{loading && <Spinner/>}` works |
 | `??` | the right side when the left is `null` or an error value |
 | `cond ? a : b` | `a` if `cond` is truthy, else `b` |
@@ -407,7 +407,9 @@ Because `""` is truthy, `name || "anonymous"` keeps an empty name: write
 `name ?? "anonymous"` to replace only null (`quillo check` points these out).
 
 Ints are 64-bit: `+`, `-`, `*` and unary `-` past their range are a runtime error
-(`integer overflow`), never a wrap. An int divided by int 0, or `%` 0, is an error;
+(`integer overflow`), never a wrap. The smallest, `-9223372036854775808`, can be written,
+in a pattern too; `-` comes after a call, so a method on it takes brackets,
+`(-9223372036854775808).str()`, as `quillo check` says. An int divided by int 0, or `%` 0, is an error;
 a float divided by zero is `inf` or `NaN`, written so, and ordering either is an error.
 There is no `**`, no bitwise `& | ^ << >>`, no `++`, no `*=` or `/=` (only `=`, `+=`,
 `-=`), no `?.`, no `===`, no `in`; `pow(a, b)` and `math.*` do the arithmetic, and
@@ -435,9 +437,12 @@ Most expressions read as they would in JavaScript. The differences:
   top level of a `use`d file it leaves that file). Of two elements side by side, the
   first goes nowhere and `quillo check` warns: wrap them in one element. A call
   gives every parameter without a default, and no more: `f(1, 2)` for a one-parameter
-  `f` is an error, as is a missing one. A default is worked out at each call, in order,
+  `f` is an error, as is a missing one, and so is a builtin given more than it takes
+  (`split(s, ",", 2)`). A default is worked out at each call, in order,
   and may use the parameters before it (`fn page(n, size = n * 10)`).
 - `==` compares values deeply (`[1, 2] == [1, 2]`); there is no `===`.
+- A map keeps its keys in the order they were set, where a JavaScript object lists keys
+  like `"1"` first: `keys({ b: 1, "1": 2 })` is `["b", "1"]`, in the browser too.
 - There are no semicolons to forget (`;` does separate statements on one line): a line
   break ends a statement unless the next line continues it (`|`, `.method`, `&&`,
   `||`, `??`, `?`, `:`, `else`, `*`, `%`, `==`, `!=`, or `- b` and `+ b` with a
@@ -677,6 +682,15 @@ binding: `let Max = 1` fails, and `match x { Foo => ... }` with no type `Foo` ne
 matches. In `"a" | "b"` alternatives, a name bound in one alternative only is unbound
 when the other matched.
 
+A name binds once in a pattern: `[x, x]`, `{ p: a, q: a }` and `let [y, y] = ...` are
+errors, in `quillo check` and as the program runs (`` `x` is bound twice in this pattern:
+to test that two parts are equal, use `[x, x2] if x == x2` ``), where they matched
+anything and kept the last part. Each alternative of `|` binds its own. A tested field
+binds its last name by itself, so `{ user.id: int, order.id: int }` may test two ids;
+but using `id` there is an error, since two fields bind it: name the one you mean,
+`user.id: int as user_id`. A route that binds one name by two of its path, its query
+pattern and its request pattern (`/a/:id ? { id: str }`) is an error too.
+
 ```quillo
 match event {
     { type: "click", x: int, y: int } => `click at ${x},${y}`
@@ -742,7 +756,11 @@ json.parse expects a str as argument 1, got error (it failed before this call, m
 check` says so. To stop at the first failure, use a `for` loop, where `?` leaves the
 function around it. `filter`, `find`, `any`, `all` and `count` give back an error their
 function gives, since it has said neither yes nor no, so `filter(xs, f)?` stops there;
-`map` keeps each result, an error too. In a component's body, `?` and `return` are ways
+`map` keeps each result, an error too. An error is never made into text where a value
+is wanted: `get`, `has`, `set` and `remove` given one as the key, `group_by` and
+`re.replace` given one by their function, and `url_encode` given one (or a map holding
+one) give that error back, where its text became a key, a part of the text or of the
+URL. In a component's body, `?` and `return` are ways
 out of it, so a body with one is made again whole on each change, which loses the focus
 of an input; `x?.y` is such a `?`, and `quillo check` says so. A field of null is null, so
 write `x.y`.
@@ -1630,7 +1648,12 @@ route GET / = <html><body><Counter start={5}/></body></html>
   decimal (`{"$dec": "12.50"}`), an int past 2^53 (`{"$int": "..."}`, a BigInt in the
   browser), an error value (`{"$quillo_err": ...}`); a whole float is written `2.0`, and
   read back as a float. NaN and infinities become `null`; dates are their text, as
-  everywhere.
+  everywhere. A map whose one key starts with `$` is written `{"$": [key, value]}` and
+  read back as that map, so a key a visitor chose (`set({}, k, v)`) cannot pass for one
+  of these marks in another visitor's page or on the server, both ways: in a `server
+  fn`'s arguments and answer, island state and props, live data, services and sessions.
+  Nor can any text become a number in the JSON the browser writes (`?q=%00int:5` reached
+  a `server fn` as the int 5).
 
   `<Counter start={5}/>` from the top of this section is sent as:
 
@@ -1766,11 +1789,15 @@ route GET / = <html><body><Counter start={5}/></body></html>
   ```
 
   Both sides show `2 3.5`.
-- A map keeps its keys in order on the server. In the browser, keys that look like whole
-  numbers come first, in number order, as in any JavaScript object, so `keys`, `values`
-  and `for [k, v] in m` over `group_by(xs, (x) => x.id)` can differ, and a page showing
-  such a map is made again. Sort the keys, or keep a list. With `--watch`, a component the browser had to make again says which,
-  and what differed, in the console.
+- A map keeps its keys in the order they were set, on the server and in the browser,
+  keys that look like whole numbers too (a JavaScript object puts those first, in number
+  order): `keys`, `values`, `for [k, v] in m`, `str`, `json.stringify`, `url_encode`,
+  `merge`, spreads, `+`, `group_by` and records read them alike on both sides, so a
+  map of ids, years or prices shows in one order, and a signature or a cache key made
+  from `json.stringify` is the same. JSON the browser reads (`json.parse`, an
+  `http` answer's `json`, a `server fn`'s answer, island state and props, live data,
+  channels, streams) keeps its keys in the order written. With `--watch`, a component the
+  browser had to make again says which, and what differed, in the console.
 
   ```quillo
   component Keys() {
@@ -1779,8 +1806,10 @@ route GET / = <html><body><Counter start={5}/></body></html>
   }
   ```
 
-  The server writes `b 10 a / 10 a b`, the browser `10 b a / 10 a b`: the first half
-  differs, the sorted half does not.
+  Both sides write `b 10 a / 10 a b`.
+- A top-level constant holding an error value (`let bad = int("x")`) is an error value
+  in a component too, `is_err` true, its text hidden as the server hides a builtin's;
+  it was a map there.
 
 ### Composition
 
@@ -2112,6 +2141,12 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   name from `use` is the same call written as JavaScript reads, with the same checks.
   The name is written in the code: one from data could reach anything on the page, so a variable is
   an error when the program loads, as are `eval`, `Function` and the like.
+- A map reaches the page's JavaScript as the object it is, but one holding a key that is
+  an array index (`"0"` to `"4294967294"`) out of JavaScript's order: that one reaches it
+  as a plain copy, its keys in JavaScript's order, so `URLSearchParams`, `Headers` and
+  deep-equality libraries take it, and what page code changes in that copy does not
+  show in Quillo. What a program's function called by page code returns is handed over
+  the same way.
 - Objects from the page (elements, a library's objects) have their properties and
   methods as fields: `el.value`, `chart.update()`; and their fields can be set:
   `el.value = ""`, `el.scrollTop += 100` (only theirs: a map's fields are made anew,
@@ -2314,13 +2349,21 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
   says. With tenants, every topic but a global's belongs to the tenant, so a `publish`
   wakes only the same tenant's pages; in a mounted program they are the mount's.
   `watch` and `publish` take several topics at once; `unwatched(f)` calls `f` with
-  nothing.
+  nothing. A topic is 1 to 256 bytes of any characters, a comma too; an empty or longer
+  one stops `watch` and `publish` with an error, where the page never heard of it.
+- A topic ending in `:*` is a wildcard: `publish("room:*")` wakes every page following a
+  topic under it (`room:7`, `room:lobby`), and `publish("db:*")` every table's. So a
+  topic built from a visitor's text must not end in `:*`: write `` `room:${id}` `` with
+  an `id` the program checked (an int), not one taken as it came.
 - A loader that gives an error value makes the state that error value, sent whole; one
   that fails with a runtime error, or `reply`s a status that is not a success, leaves
   the page's state as it was (the console says so), and the next change tries again.
-- A page may follow at most 256 topics; past that, the rest hear nothing.
-- Inside `db.transaction`, the announcement waits for the commit, and is dropped
-  on rollback.
+- A page may follow at most 256 topics; past that, the rest hear nothing. A list too
+  long for an address goes after it, so long topics are heard too.
+- Inside `db.transaction`, a table's announcement waits for the commit, and is dropped
+  on rollback. A global's waits for the outermost transaction to end, whatever its
+  outcome, since a global keeps its value through a rollback: pages are told it, where
+  they kept showing the old one.
 - `publish("topic")` announces anything else, and `watch("topic")` inside a loader
   subscribes to it.
 - What a loader reads includes what the functions it calls read: a `me()` that looks up
@@ -2538,6 +2581,18 @@ page to show the words. Nothing happens by itself on a 401 or a 500 (no redirect
 retry, except for [idempotent](#idempotent-requests) calls); there is no loading flag
 either: set a state of your own around the call.
 
+**The latest call wins.** A handler can run again before its call has answered (a
+letter typed in a search box, a second click), and answers come back in any order. An
+older call's answer never replaces a newer value: every set of a state claims it (a
+plain `shown = "x"`, a field bound with `bind:`, a set from a call), and a handler that
+waited keeps only the sets it makes while no newer set has claimed that state. So
+`oninput={(e) => { shown = search(e.value) }}` ends on the answer for what was typed
+last, however late the first one comes. A set that reads the state it sets is a fold
+(`n += 1`, `busy -= 1`, `xs = xs + [x]`, `s = s | push(x)`, `s = f(s)`) and is always
+made, on what the state holds then: three quick likes that each call `save()` and then
+`likes += 1` count three, and two uploads that each do `busy += 1`, wait, and `busy -= 1`
+end at 0.
+
 **Slow data: `defer`.** A `state` initializer runs while the server renders, so the
 page waits for its slowest one. `defer` lets a slow one follow the page instead:
 
@@ -2587,8 +2642,14 @@ In the browser that is `Promise.all`. In a request on the server each function r
 coroutine of its own on the event loop (outside a request, on a thread of its own), so
 their waits (database, `http.*`, `sleep`) overlap. Their computing does not: Quillo code
 runs one piece at a time, so `parallel` shortens waiting, not arithmetic. Inside a
-transaction they run one after another, since the others' SQL would not be part of it. A
-failure stops the whole call; error values are results like any other.
+transaction they run one after another, since the others' SQL would not be part of it.
+A function that fails stops the others at their next step (a call, a loop's round, a
+builtin, a `sleep`, which ends at once), nested `parallel` too; what they did before it
+stays done, and the call fails with the failure that happened. Error values are results
+like any other and stop nothing. Inside the functions, `set_cookie`, `set_session`,
+`end_session`, `session()`, `publish` and a replica's read-your-writes work as they do
+outside, and what each sets goes into the answer in the functions' order, as if they had
+run one after another; one that reads who the visitor is makes the answer private to them.
 
 Each call is a `POST /_quillo/rpc/<name>` with a JSON array of arguments (or, when an
 argument is a file, multipart: see [Uploads](#uploads)), checked against
@@ -2759,7 +2820,8 @@ list is not touched. The page shows the new total once the keystroke's handler i
 
 "Something that changes" is: a `state`, a prop, a `let` that is itself derived, a `for`
 row's item, a `live(...)` state, `url()`, and a call of the component's own functions or
-the program's (taken as reading what changes, since they may). Builtins on constant
+the program's (taken as reading what changes, since they may), however it is written:
+`x | show` and `show(x / 2)` follow what `show` reads, as `show(x)` does. Builtins on constant
 values are not: `let started = now()` is the time the component started, and stays so.
 What is followed is what a run actually read: `let shown = open ? details : summary`
 follows `open` and `details` while `open` is true, and `open` and `summary` while it is
@@ -3523,6 +3585,11 @@ fn touch() {
   the session and the rest in the database. The signature covers its expiry, its tenant
   and the program's mount point, so it is no session past its time, for another
   tenant, or in another mounted program.
+- Two requests of one visitor that set the session at once each start from the cookie
+  the browser sent, and the browser keeps the last cookie it is given: what the other
+  added is lost. Twenty adds to a cart kept in the session, sent at once, each
+  `set_session({ ...s, cart: (s.cart ?? []) + [item] })`, kept one item. Keep what must
+  not be lost (a cart, a draft) in a table, keyed by an id in the session.
 - `end_session()` removes the cookie from the browser, but a copy someone kept stays
   valid until it expires. To end sessions on the server (log out everywhere, a stolen
   laptop), keep an id in the session and check it against the database.
@@ -3586,7 +3653,8 @@ fn touch() {
   `{}` and `cookie(name)` is null.
 - `set_session` takes only `max_age`; `set_session(null)` ends the session too. The
   cookie's value is the session as JSON, with its expiry, base64url-encoded and signed,
-  so a session over about 3,900 bytes is a runtime error.
+  so a session over about 3,900 bytes is a runtime error, and so is one nested deeper
+  than 128 levels, as deep as JSON is read back.
 
 ### What a route returns
 
@@ -3594,7 +3662,7 @@ fn touch() {
 |---|---|
 | html | 200 `text/html`; XML when its root names a namespace (`<urlset xmlns="...">`, a sitemap) or it starts `<?xml`: `application/xml`, `application/rss+xml` for `<rss>`, `application/atom+xml` for `<feed xmlns="...">`, and `image/svg+xml` for `<svg xmlns="...">` |
 | str | 200 `text/plain` |
-| map, list, number, bool | 200 JSON |
+| map, list, number, bool | 200 JSON; one holding a function is a 500, its log line naming where (`the answer's value cannot be written as JSON: `f` is a function, ...`), and `quillo check` warns of a function written in the answer |
 | null | 204 |
 | error | 500 `{"error": ...}` |
 | `respond(status, body, headers)` | exactly that |
@@ -4172,7 +4240,10 @@ component Board() {
   present beyond `channel.peers` and what `join` and `leave` record. What `join`
   broadcasts on its channel, or sends to the page that is joining, reaches that page
   too, right after its yes: a roster broadcast as someone enters is the first thing
-  they hear. So does what is broadcast between the yes and the page hearing it.
+  they hear. So does what is broadcast between the yes and the page hearing it. A page
+  asks to join a room once at a time, and each `join` that said yes gets exactly one
+  `leave`, also when the page left or closed while its `join` was still running, so a
+  count kept by the two (`online += 1`, `online -= 1`) stays right.
 - **Each tenant has its own room** of a channel (see [Many tenants](#many-tenants)): pages on
   `acme.example.com` and `evil.example.com` joining `lobby` are in two rooms *(since 0.7:
   one room for all)*. What code run for a page or a request broadcasts, sends or lists
@@ -4240,8 +4311,10 @@ How messages travel:
   a stream: all of them, in order.
 - Where WebTransport cannot be had (the browser lacks it, UDP is blocked, the page is
   served from a name its certificate does not cover, or it is not ready within 1.5 s),
-  the page uses a WebSocket for the rest of its life, which carries every message
-  reliably and in order (`reliable` changes nothing there). The connection is opened
+  the page uses a WebSocket for the rest of its life, which carries messages in order,
+  none lost while the page keeps up, even in a burst of thousands (`reliable` changes
+  nothing there but past the queue's limit: one 4,096 messages behind loses a plain
+  message and is closed for a `reliable` one, as above). The connection is opened
   again when it drops (after half a second, then longer, up to 15 s), the channels
   joined again, and what was queued sent. A page that also shows live data has two
   connections, `/_quillo/live` and `/_quillo/wt`. In a phone app or `quillo app`, which
@@ -4724,7 +4797,10 @@ answers the same, with billing in a process of its own.
   same again when it is restarted), its log lines marked with its name, all signed with
   one secret (32 random bytes from the system, unless `QUILLO_SERVICE_SECRET` is set,
   so a copy started by hand elsewhere cannot join a split app unless the secret is
-  set); they stop with it (killed, not drained). Before any service starts, the app
+  set); they stop with it (killed, not drained), and when the app's process ends any
+  other way (killed with SIGKILL, a crash), each stops as a first SIGTERM stops it, as
+  the pipe the app holds on its input closes, so none is left serving with its port
+  taken. A service started on its own, by hand or by systemd, serves on. Before any service starts, the app
   checks the whole tree once, its own files and every service's, and says each warning
   once; an error anywhere stops it there, before anything waits. Each is then started as
   `quillo run <file> --port P --as-service --service-name NAME`, with `--base`, [`--watch`](#options-of-quillo-run),
@@ -5423,7 +5499,8 @@ stays the simpler choice when the next move depends on the answer.
   highlighting, is its first word, to a space or a comma (```` ```rust,ignore ```` is Rust).
 - **Lists:** `map filter find any all reduce sum min max sort sort_by reverse first last push range enumerate slice unique flatten zip take drop count group_by join_on index_of`
 - **Maps:** `keys values get has set remove merge` (`get(m, k, default)`; `merge` takes
-  two maps; there is no `entries`: `for [k, v] in m`)
+  two maps; there is no `entries`: `for [k, v] in m`). A map keeps the order its keys
+  were set, number-like keys too, in the browser as on the server.
 - **Math:** `abs round floor ceil sqrt pow`, and the three modules under
   [Numbers and data](#numbers-and-data). For money, [Decimals](#decimals) and
   [Money](#money); `format_number(x, locale, digits)` writes a number as a locale does.
@@ -5468,6 +5545,13 @@ stays the simpler choice when the next move depends on the answer.
   machine (`0.0.0.0` is written `127.0.0.1`), so a program that reads its own pages need not be
   told its address again. It is null in a script and while the program loads.
 
+A builtin given more arguments than it takes stops and says what it takes: `` `split`
+takes 2 arguments, got 3: split(s, sep) `` (and for `sort` given a comparator, to use
+`sort_by`), in `quillo check` where the call is written out, as the program runs however
+it is called (a method on an untyped value, `line.split(",", 2)`; a builtin held in a
+variable or passed to another, `reduce(xs, 0, max)`), and in the browser. Nothing is
+ignored: `uuid(1)`, `random(1)` and `merge(a, b, c)` are errors.
+
 What each does at its edges, where the answer is not what another language would give:
 
 | Call | Gives |
@@ -5479,32 +5563,32 @@ What each does at its edges, where the answer is not what another language would
 | `slice(x, start, end)` | negative positions from the end; both kept within the list or string; `end` before `start` gives an empty one |
 | `take(x, n)`, `drop(x, n)` | a negative `n` counts as 0, unlike `slice`: `take(xs, -2)` is empty, `drop(xs, -1)` all of it, so a count worked out by subtraction stays safe |
 | `range(n)`, `range(a, b)`, `a..b`, `range(a, b, step)` | `b` left out, step 1, empty when `b <= a`; a negative step counts down; a list of at most ten million, while a `for` whose list no one keeps counts without one |
-| `group_by(xs, f)` | a map from each key, as text, to the items with it, in order: `1` and `"1"` are one key |
-| `unique(xs)` | the first of equal items (equal as `==` says) |
+| `group_by(xs, f)` | a map from each key, as text, to the items with it, in order: `1` and `"1"` are one key; an error `f` gives is given back, not made a key |
+| `unique(xs)` | the first of equal items, keeping exactly what `==` keeps (`unique([1, 1.0, 1m, "1"])` is `[1, "1"]`), in time linear in the list on both sides: 40,000 items take milliseconds, not seconds |
 | `zip(a, b)` | pairs, as long as the shorter |
 | `contains(x, y)` | in a string, `y` as text; in a list, an equal item; in a map, a key |
 | `remove(list, x)` | every item equal to `x` gone; `remove(map, k)` the key |
 | `set(xs, i, v)` | `i` past the end is an error |
-| `round(x)` | a float rounds half away from zero (`round(-2.5)` is `-3`) to an int, and an int is itself (exact past 2^53); `round(x, 2)` a float with at most 15 places, from its shortest decimal (`round(1.005, 2)` is `1.01`, as `format_number` writes it); a decimal takes a mode (see [Decimals](#decimals)) |
+| `round(x)` | a float rounds half away from zero (`round(-2.5)` is `-3`) to an int, up to 2^63 (`type_of(round(1e16))` is `int`; past it, and NaN and the infinities, the float), and an int is itself (exact past 2^53); `round(x, 2)` a float with at most 15 places, from its shortest decimal (`round(1.005, 2)` is `1.01`, as `format_number` writes it); fewer than no places round to tens, hundreds, ...: `round(1234.5678, -2)` is `1200.0`, past 28 places by floats; an int to 0 places or more is itself (`round(5, 2)` is `5`, as in Python), and to fewer the nearest multiple, exactly, a half away from zero (`round(1250, -2)` is `1300`, where Python's is `1200`, half to even); `round(a / b)` of two ints is exact (see `/` under [Values](#values)); a decimal takes a mode (see [Decimals](#decimals)) |
 | `int(x)` | a float or decimal cut toward zero (an error value when too large for an int); `true` is 1; text of digits only (`int("1.0")`, `int("1e3")` are error values) |
 | `float(x)` | a number as a float; text as Rust reads a float (`"2.5"`, `" 7 "`, `"1e3"`, `".5"`, `"inf"`, `"nan"`), so `"0x10"`, `"0b11"`, `"1_000"` and `""` are error values, in the browser too |
-| `floor(x)`, `ceil(x)` | a float to an int; an int as it is, past 2^53 too, as `round(x)` gives it |
+| `floor(x)`, `ceil(x)` | a float to an int, up to 2^63 (`type_of(floor(1e16))` is `int`; past it the float); an int as it is, past 2^53 too, as `round(x)` gives it; `floor(a / b)` of two ints divides in ints, exactly (see `/` under [Values](#values)) |
 | `str(x)` | a whole float as `2.0` (in a component's text, `2`, on both sides), never in exponent form (`1e16` is `10000000000000000`); a float's shortest digits, a tie taking the even digit as JavaScript does (`1916218016406818.3`, which is held as ...818.25, is written `1916218016406818.2`); markup as its HTML, in the browser too; a list or map as Quillo writes it (`{ a: 1, b: "x" }`, a key of letters, digits and `_` of any script, not starting with a digit, bare (`{ é: 1, 日本: 2 }`), another quoted (`{ "a b": 3, "1a": 4 }`), on both sides); `null` as `null` |
 | `type_of(x)` | one of `null bool int float dec str list map fn html response error` (`promise` for a JavaScript Promise in the browser) |
 | `len(x)` | a string's characters, a list's items, a map's keys; an `html` value's bytes |
-| `min([])`, `max([])`, `first([])` | `null`; `sum([])` is `0`, and a sum of decimals stays exact |
+| `min([])`, `max([])`, `first([])` | `null`; `sum([])` is `0`, and a sum of decimals stays exact; `sum` adds numbers only, and text stops it at its item (`` `sum` adds numbers; got the str "12.50" at item 1: use `float(...)` or `dec(...)` first ``), where it was joined after a `0` |
 | `sqrt(-1)` | `NaN`, while `math.sqrt(-1)` is an error, as in Python |
-| `pow(2, 10)` | an int, exact, or an overflow as `*` gives (`pow(2, 63)`); a float on either side, or a negative power, gives a float; a decimal to an int's power, a decimal (see [Decimals](#decimals)) |
+| `pow(2, 10)` | an int, exact, or an overflow as `*` gives (`pow(2, 63)`, and `pow(2, 4294967296)`: a power of 2^32 or more is exact for a base of -1, 0 or 1, and an overflow for any other); a float on either side, or a negative power, gives a float; a decimal to an int's power, a decimal (see [Decimals](#decimals)) |
 | `print(a, b)` | the values as text, a space between, on stdout (the console in a page) |
 | `now()` | milliseconds since 1970, an int |
-| `sleep(ms)` | no maximum; other requests run meanwhile; in a scheduled job or a tick, ends it (status 503) when the server stops or the program is loaded again, so a loop that runs for ever stops; a request waits it out (it is answered at a stop, up to 10 s, and finishes on its version at a reload) |
+| `sleep(ms)` | no maximum; other requests run meanwhile, and a request's sleep of 5 ms or more holds no thread (a timer wakes it), so a hundred streams sleeping in their loops hold up nothing; in a scheduled job or a tick, ends it (status 503) when the server stops or the program is loaded again, so a loop that runs for ever stops; a request waits it out (it is answered at a stop, up to 10 s, and finishes on its version at a reload) |
 | `random_int(lo, hi)` | both ends included |
 | `uuid()` | a version 4 UUID |
 | `read_file(path)` | text: bytes that are not UTF-8 are replaced; a missing file is an error value |
 | `write_file(path, v)` | `v` as text, folders made, the file replaced; `null` or an error value |
 | `escape(s)` | `& < > " '` as entities |
-| `json.parse(s)` | an error value for bad JSON, for a number past a float (`1e400`) and for half of a character (a lone `\ud83d`), on both sides; an int past 64 bits becomes a float; a key given twice keeps the last value |
-| `json.stringify(v, pretty)` | indented by two spaces when `pretty` is true; a whole float as `2.0` (`-0.0` too), so it reads back as a float, and an exponent where JavaScript writes one (`1e+21`, `1e-7`), on both sides; markup as its HTML; a decimal as a string, NaN and infinities as `null`, an error value as `{"error": ...}`; JSON past 256 MiB, or nested more than 10,000 deep, is an error value, counted before it is made, as lists that hold one part twice can double at each step *(since 0.7)*; a route's answer the same, a 500 with the reason in the log |
+| `json.parse(s)` | an error value for bad JSON, for a number past a float (`1e400`) and for half of a character (a lone `\ud83d`), on both sides; an int past 64 bits becomes a float; a key given twice keeps the last value; keys in the order written, on both sides; at most 128 levels deep, on both sides, past which it is `invalid JSON: it nests more than 128 deep` (`request.json` and an `http` answer's `json` are `null`, a stream's line is its text, and a database's JSON cell is that error); every other reader of JSON (sessions, channels, a `server fn`'s arguments, a service's body) takes the same depth |
+| `json.stringify(v, pretty)` | indented by two spaces when `pretty` is true; a whole float as `2.0` (`-0.0` too), so it reads back as a float, and an exponent where JavaScript writes one (`1e+21`, `1e-7`), on both sides; markup as its HTML; a decimal as a string, NaN and infinities as `null`, an error value as `{"error": ...}`; a function is an error value naming where it is (`` json.stringify: `a.f` is a function, which cannot be written as JSON ``), where it was written as text; JSON past 256 MiB, or nested more than 10,000 deep, is an error value, counted before it is made, as lists that hold one part twice can double at each step *(since 0.7)*; a route's answer the same, a 500 with the reason in the log |
 
 What is not in the standard library, and what to do instead:
 
@@ -5578,7 +5662,8 @@ Safety built in:
   when it is parsed, so source from anywhere cannot use up the stack.
 - `respond` and `redirect` refuse header values with line breaks, which would let text
   from a request add headers of its own, and a location that runs code or carries a page
-  (`javascript:`, `vbscript:`, `data:`).
+  (`javascript:`, `vbscript:`, `data:`), naming the one given (`` `redirect` is not given
+  a vbscript: URL ``), as `stream`, `site_headers` and `navigate` do.
 - A failing request answers `internal error`; the message, with file and line, goes to
   the terminal (and to the page too with [`--watch`](#options-of-quillo-run)). A builtin's
   error is `internal error` to a visitor in the browser too, in production.
@@ -5629,25 +5714,29 @@ Safety built in:
   the program's database is MySQL; `conn.sql_name(name)` quotes for the connection it is
   called on, `db.sql_name(name)` for the program's), and named parameters with
   `sql_param(name)` (or a list: `sql_param(["title", "body"])` is `:title, :body`) —
-  both take only letters, digits and `_`, whatever their argument is made of
-  (`` sql_name(`obj_${id}`) ``). SQL made of them, text as written (also kept in a
+  both take only letters and digits of any script (`sql_name("名前")`), the marks that go
+  on a letter (Hindi's vowel signs, an accent written apart) and `_`, not starting with a
+  digit, at most 63 bytes, so that two names are two on every database, whatever their
+  argument is made of (`` sql_name(`obj_${id}`) ``). SQL made of them, text as written (also kept in a
   variable), choices between those (`if`, `match`), joins of them with `+`, and calls of
   the program's own functions that only return such text
-  (`` fn table_of(id: int) = sql_name(`obj_${id}`) ``) is not warned about:
+  (`` fn table_of(id: int) = sql_name(`obj_${id}`) ``), and a `map` whose function gives
+  only such text on every way it returns, joined with `join`, is not warned about:
   `let order = match sort { "new" => "created desc", _ => "score desc" }` and then
   `"select * from posts order by " + order`. A run-time set of columns, from a list the
   program wrote: `` `insert into t (${sql_name(cols)}) values (${sql_param(cols)})` `` with
   a map of those columns as the parameters, or for an update the pairs, which every
   database takes (a column list, `set (a, b) = (...)`, is not MySQL's, nor PostgreSQL's for
   one column): `` let set = cols | map((c) => `${sql_name(c)} = ${sql_param(c)}`) | join(", ") ``
-  and then `` `update t set ${set} where id = :id` `` (`quillo check` warns of this one,
-  as it does not follow what a `map` makes: every name in it is `sql_name`'s and every
-  value a parameter). Take the columns from
+  and then `` `update t set ${set} where id = :id` ``. Only the builtins are trusted:
+  a `sql_name`, `sql_param`, `map` or `join` the program defines, or a name the lambda
+  binds again, is followed no further, and raw text in the lambda
+  (`` keys(data) | map((c) => `${c} = 1`) ``) is warned of. Take the columns from
   the program, never from what the visitor sent: `keys(request.form)` names `is_admin`
   and `id` as well as `email`, which `sql_name` takes, as they are names, so a sign-up form
   with `is_admin=1` made an admin (FEEDBACK51.md, Q-662). A record type, `{ form: Signup }`,
   keeps its fields only.
-  It is a warning, not a proof: SQL built in a list made with `map` is not followed.
+  It is a warning, not a proof.
 - Inside `db.transaction` on SQLite, `sleep`, `http` and queries to another database
   (PostgreSQL, MySQL) hold up other requests instead of letting them read and write
   inside the open transaction *(since 0.7: a query to another database let them in)*.
@@ -6110,7 +6199,8 @@ math.comb(52, 5)  math.log(8, 2)  math.fsum(xs)  math.isclose(a, b)  math.pi
 
 - **`math`:** `sqrt cbrt exp exp2 expm1 log(x, base) log2 log10 log1p pow`, `sin cos tan
   asin acos atan atan2` and their hyperbolic forms, `degrees radians hypot dist`, `floor
-  ceil trunc` (ints) `fabs copysign fmod remainder modf frexp ldexp`, `factorial gcd lcm
+  ceil trunc` (ints, up to 2^63; of an int divided by an int, written in the call, the
+  exact int, as `floor` gives it) `fabs copysign fmod remainder modf frexp ldexp`, `factorial gcd lcm
   comb perm isqrt` (ints), `isclose isfinite isinf isnan`, `prod fsum sumprod`, `erf erfc
   gamma lgamma`, and `pi e tau inf nan`. What Python raises is an error here too: a math
   domain error (`math.sqrt(-1)`, `math.log(0)`), a range error (`math.exp(1000)`), an int
@@ -6245,8 +6335,11 @@ date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or a
   `posix/...` and `right/...` (copies some systems keep), names the database dropped
   (`US/Pacific-New`, `Canada/East-Saskatchewan`, `SystemV/...`), Java's three-letter ids
   (`PST`), and any other name with a sign (`+5`, `+0560`, a U+2212 minus). The server
-  reads the system's time zone database, or a copy built into `quillo` where there is none
-  (Windows, small containers); the browser asks its own (`Intl`).
+  reads the system's time zone database, and a copy built into `quillo` where there is none
+  (Windows, small containers) and for a name the system's leaves out (Ubuntu 24.04 moved
+  `EST`, `US/Pacific`, `Asia/Calcutta` and `EST5EDT` to a package of their own,
+  `tzdata-legacy`), so a program takes the same zones on every machine; the browser asks
+  its own (`Intl`).
 - **Text:** `date.format(d, pattern)` with `YYYY YY`, `MM M` (month number, padded or
   not), `MMMM MMM` (its name), `DD D`, `dddd ddd` (the weekday's name), `HH H` and `hh h`
   (24 or 12 hours), `mm ss A` (AM/PM) and `Z` (the offset); anything else, and text in
@@ -6583,7 +6676,7 @@ sends one on purpose. Back it up with `db.exec("vacuum into
   its bounds, so a column's value may be a list in one row and text in another.
 - JSON is read cell by cell by Quillo's own reader: a whole number past an int is a
   [decimal](#decimals), past a decimal a float, so two large ids stay two; a value that
-  cannot be read (a number past a float, a nesting deeper than 1,000) is an error value
+  cannot be read (a number past a float, a nesting deeper than 128 levels) is an error value
   in its own cell (`db: this JSON could not be read: ...`), and the other cells and rows
   read; a lone surrogate is U+FFFD. A whole decimal inside a value sent is written as a
   JSON number, so it goes back as it came.
@@ -7113,8 +7206,13 @@ type the program has not (`Usr`); a `let` or a `match` that cannot match what it
 (`let [a, b] = [1]`, `match x { }`); a lambda called with the wrong number of arguments,
 by its `let` name or given to `map`, `filter`, `reduce`, `sort_by` and the like; a list
 whose item is not what `list<T>` takes (`[1, "a"]` for `list<int>`); a field `request`
-does not have (`request.qurey`); and top-level code calling a function that reads a
-global defined further down.
+does not have (`request.qurey`); top-level code calling a function that reads a
+global defined further down; a name bound twice in one pattern (`[x, x]`), a name two
+tested fields bind used (`{ user.id: int, order.id: int } => id`), and a route binding
+one name by two of its path, query and request patterns; and `every` and `schedule` as
+the start reads them, their written-out arguments (`every(0, f)`, a cron field `60`,
+`@reboot`) and a job or tick named twice where both calls surely run (see [Scheduled
+jobs](#scheduled-jobs)).
 When a call to a function of your own named like a builtin (`notify`, `first`) has the
 wrong arguments, the error says so: this `notify` is the program's own, from line 1,
 which hides the builtin `notify`.
@@ -7136,7 +7234,11 @@ after one that takes any value, or with a value an arm before it has; `xs.push(2
 nothing in it changes; `"Hello ${name}"` in a plain string; `index_of(...) == -1`, a
 function used as a condition (`if ready {`), and a path's untyped parameter added to a
 number; a misspelt attribute or event (`clas`, `@clik`), `className`, and `<card>` for a
-view `Card`; a name imported as a builtin's. Warnings never make
+view `Card`; a name imported as a builtin's; a key written twice in a map
+(`{ a: 1, b: 2, a: 3 }`, `{ a, "a": 2 }`: the last value is the one kept; a spread
+before it is no second key); a function written in a route's answer, which cannot be
+JSON (`` this route's answer holds a function at `f` ``); a job or tick named twice where
+both calls may run. Warnings never make
 it fail.
 
 [`quillo check --policy FILE`](#other-commands) (`quillo check main.qwe --policy host.toml`)
@@ -7194,7 +7296,8 @@ reads and parses requests, runs the program on them and writes the answers. Each
 runs as a coroutine with its own stack. A handler runs on its own from start to end,
 except while it waits: a database query, `http.*` or `sleep` pauses it, the waiting is
 done elsewhere (on a pool thread, or for PostgreSQL on connections all requests share,
-with queries pipelined), and the loop answers other requests meanwhile. Code is written
+with queries pipelined, and a `sleep` of 5 ms or more on a timer, holding no thread),
+and the loop answers other requests meanwhile. Code is written
 as if it simply waited; there is no `async` or `await`. Updating shared state such as
 `todos = todos | push(t)` is safe without locks, since only one handler runs at a time.
 
@@ -7414,9 +7517,18 @@ waiting for 03:00, give it `"10s"` while you work on it.
 - The first argument is a duration (seconds, or `"30s"`, `"5m"`, `"1h"`, `"1d"`,
   `"2w"`, `"1y"`), counted from 1970 in UTC, so that every server agrees and `"5m"` runs
   at :00, :05, ...; or a cron line: `minute hour day month weekday` in UTC, with `*`,
-  `1-5`, `*/15` and lists, or `@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly`. A
-  job first seen (at start, or after a reload) waits for its next time; it never runs at
-  once. The clock is looked at once a second.
+  `1-5`, `*/15` and lists, its fields apart by spaces or tabs, or `@hourly`, `@daily`,
+  `@weekly`, `@monthly`, `@yearly`. A job first seen (at start, or after a reload) waits
+  for its next time, counted from when the server first looks: started at 04:01,
+  `"2 * * * *"` runs at 04:02, and a nightly `"0 3 * * *"` of a server deployed each day
+  at 02:00 runs at 03:00 that day; it never runs at once. The clock is looked at once a
+  second.
+- `schedule` and `every` add a job or a tick as the program starts, at its top level
+  (or in a function the top level calls): called once it has started, in a route, a
+  `server fn`, a job or a tick, they stop with an error (a 500 in a route), where they
+  answered as if added and the job never ran. `quillo check` reads their written-out
+  arguments as the start does (`every(0, f)`, a cron field `60`, `*/0`, `5-1`, `MON`,
+  `@reboot`, six fields, a bad `{ name }` are errors there too).
 - A job runs on the server like a request: waiting for the database lets requests run
   meanwhile, its errors are printed, and it is logged (`POST
   /_quillo/job/clean_sessions?at=1761600000 -> 200`, the time it was due for). A job
@@ -7424,7 +7536,11 @@ waiting for 03:00, give it `"10s"` while you work on it.
   running jobs finish, and starts no more.
 - Jobs are named after their function (`{ name: "..." }` for a lambda, else
   `job-<line>`, or to run one function twice): letters, digits, `_`, `-` and `.`, at
-  most 64, and no two alike. Nobody outside the server can start one.
+  most 64, and no two alike. The start refuses a second job of a name when it is added;
+  `quillo check` says so as an error where both calls surely run (twice at the top level,
+  or a top-level function that adds it called twice), and warns where both may (two
+  `if`s, `&&`, `||`, `??`, a loop); the arms of one `if`/`else` or `match` are
+  alternatives, and say nothing. Nobody outside the server can start one.
 - A job that runs for ever (a loop with `sleep` in it) is told to end when the server
   stops, and when [`--watch`](#options-of-quillo-run) (`quillo run main.qwe --watch`) loads the program again: its `sleep` ends the job, so a
   new version never runs beside the old one (a tick's too; a request's `sleep` is waited
@@ -7471,7 +7587,8 @@ opened later picks it up where it is.
   loop of a game, a sensor read, a short poll. In a component it is the page's clock
   instead (see [Components](#components)).
 - A tick is named after its function (`{ name: "..." }` for a lambda, else
-  `every-<line>`), and no two alike. It runs like a job, one at a time: a tick still
+  `every-<line>`), and no two alike, as jobs are (above); `every` on the server is
+  only for the top level, as `schedule` is. It runs like a job, one at a time: a tick still
   running when the next is due skips that one, so a slow step slows the loop and never
   doubles it. Ticks are not logged or counted in [`--metrics`](#options-of-quillo-run) (`quillo run main.qwe --metrics`), are not recorded in
   `_quillo_jobs` (each server runs its own), and stop with the server and on a reload.
@@ -7663,7 +7780,7 @@ A tool asks with a `quillo:devtools-ask` event, its `detail` a JSON string
 |---|---|
 | `list` | each component now, as a `component` message |
 | `where`, `target` | marks the component's element with `data-quillo-devtools-id` (the mark moves with the next `where`) |
-| `set`, `target`, `name`, `value` | sets a state; under `--watch` only |
+| `set`, `target`, `name`, `value` | sets a state; under `--watch` only. The JSON is read as the server reads it: `2.0` is a float, an int past 2^53 exact, a map's keys in the order written |
 
 Reading is open in production, as the page can be read with the browser's debugger anyway;
 setting is not (FEEDBACK42.md, Part C).

@@ -31,9 +31,9 @@ Operators are as in JavaScript, with these meanings:
 |---|---|
 | `+` | numbers add; a string with anything is text (`"n=" + 1` is `"n=1"`, `"a" + null` is `"anull"`); two lists join; two maps merge, the right one's values winning; `true + 1` and `null + 1` are errors |
 | `- * %` | as in JavaScript on numbers; nothing else is converted (`"5" * 2` is an error) |
-| `/` | exact division: `7 / 2` is `3.5`, and a whole result stays an integer (`6 / 2` is `3`); `floor(7 / 2)` is integer division |
-| `== !=` | deep equality, like comparing JSON: `1 == 1.0` and `0.1m == 0.1`, but `1 == "1"` is false (nothing is converted); functions are equal only to themselves |
-| `< <= > >=` | comparison of two numbers (ints, floats and decimals mix; not a decimal and a float), or two strings by code point; a string and a number, booleans, or NaN is an error |
+| `/` | exact division: `7 / 2` is `3.5`, and a whole result stays an integer (`6 / 2` is `3`); `floor(7 / 2)` is integer division, done in ints past 2^53 too: `floor`, `ceil`, `round`, `math.floor`, `math.ceil` and `math.trunc` of an int divided by an int, written in the call (`floor(a / b)`, `a / b \| floor`, `(a / b).floor()`, `math.floor(a / b)`, a builtin held in a variable), give the exact int, as Python's `a // b` does; a quotient kept in a variable first (`let q = a / b`) is a float, and its digits past 2^53 are gone |
+| `== !=` | deep equality, like comparing JSON: `1 == 1.0` and `0.1m == 0.1`, but `1 == "1"` is false (nothing is converted); an int and a float compare exactly, as in Python (`9007199254740993 == 9007199254740992.0` is false), in compiled code and in the browser too; functions are equal only to themselves |
+| `< <= > >=` | comparison of two numbers (ints, floats and decimals mix, exactly; not a decimal and a float), or two strings by code point; a string and a number, booleans, or NaN is an error |
 | `!`, `&&`, `\|\|` | not, and, or; `a && b` and `a \|\| b` give back one of their operands, so `{loading && <Spinner/>}` works |
 | `??` | the right side when the left is `null` or an error value |
 | `cond ? a : b` | `a` if `cond` is truthy, else `b` |
@@ -48,7 +48,9 @@ Because `""` is truthy, `name || "anonymous"` keeps an empty name: write
 `name ?? "anonymous"` to replace only null (`quillo check` points these out).
 
 Ints are 64-bit: `+`, `-`, `*` and unary `-` past their range are a runtime error
-(`integer overflow`), never a wrap. An int divided by int 0, or `%` 0, is an error;
+(`integer overflow`), never a wrap. The smallest, `-9223372036854775808`, can be written,
+in a pattern too; `-` comes after a call, so a method on it takes brackets,
+`(-9223372036854775808).str()`, as `quillo check` says. An int divided by int 0, or `%` 0, is an error;
 a float divided by zero is `inf` or `NaN`, written so, and ordering either is an error.
 There is no `**`, no bitwise `& | ^ << >>`, no `++`, no `*=` or `/=` (only `=`, `+=`,
 `-=`), no `?.`, no `===`, no `in`; `pow(a, b)` and `math.*` do the arithmetic, and
@@ -76,9 +78,12 @@ Most expressions read as they would in JavaScript. The differences:
   top level of a `use`d file it leaves that file). Of two elements side by side, the
   first goes nowhere and `quillo check` warns: wrap them in one element. A call
   gives every parameter without a default, and no more: `f(1, 2)` for a one-parameter
-  `f` is an error, as is a missing one. A default is worked out at each call, in order,
+  `f` is an error, as is a missing one, and so is a builtin given more than it takes
+  (`split(s, ",", 2)`). A default is worked out at each call, in order,
   and may use the parameters before it (`fn page(n, size = n * 10)`).
 - `==` compares values deeply (`[1, 2] == [1, 2]`); there is no `===`.
+- A map keeps its keys in the order they were set, where a JavaScript object lists keys
+  like `"1"` first: `keys({ b: 1, "1": 2 })` is `["b", "1"]`, in the browser too.
 - There are no semicolons to forget (`;` does separate statements on one line): a line
   break ends a statement unless the next line continues it (`|`, `.method`, `&&`,
   `||`, `??`, `?`, `:`, `else`, `*`, `%`, `==`, `!=`, or `- b` and `+ b` with a
@@ -318,6 +323,15 @@ binding: `let Max = 1` fails, and `match x { Foo => ... }` with no type `Foo` ne
 matches. In `"a" | "b"` alternatives, a name bound in one alternative only is unbound
 when the other matched.
 
+A name binds once in a pattern: `[x, x]`, `{ p: a, q: a }` and `let [y, y] = ...` are
+errors, in `quillo check` and as the program runs (`` `x` is bound twice in this pattern:
+to test that two parts are equal, use `[x, x2] if x == x2` ``), where they matched
+anything and kept the last part. Each alternative of `|` binds its own. A tested field
+binds its last name by itself, so `{ user.id: int, order.id: int }` may test two ids;
+but using `id` there is an error, since two fields bind it: name the one you mean,
+`user.id: int as user_id`. A route that binds one name by two of its path, its query
+pattern and its request pattern (`/a/:id ? { id: str }`) is an error too.
+
 ```quillo
 match event {
     { type: "click", x: int, y: int } => `click at ${x},${y}`
@@ -383,7 +397,11 @@ json.parse expects a str as argument 1, got error (it failed before this call, m
 check` says so. To stop at the first failure, use a `for` loop, where `?` leaves the
 function around it. `filter`, `find`, `any`, `all` and `count` give back an error their
 function gives, since it has said neither yes nor no, so `filter(xs, f)?` stops there;
-`map` keeps each result, an error too. In a component's body, `?` and `return` are ways
+`map` keeps each result, an error too. An error is never made into text where a value
+is wanted: `get`, `has`, `set` and `remove` given one as the key, `group_by` and
+`re.replace` given one by their function, and `url_encode` given one (or a map holding
+one) give that error back, where its text became a key, a part of the text or of the
+URL. In a component's body, `?` and `return` are ways
 out of it, so a body with one is made again whole on each change, which loses the focus
 of an input; `x?.y` is such a `?`, and `quillo check` says so. A field of null is null, so
 write `x.y`.

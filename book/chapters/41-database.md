@@ -140,15 +140,29 @@ change what a query does. `quillo check` warns where SQL is put together from va
 (`${x}` or `+`): pass them as `?` parameters instead.
 
 Names cannot be parameters. When a table or a column comes from a choice (a column to
-sort by, say), put it in with `sql_name`, which takes only letters, digits and `_`, or
-a list of such names:
+sort by, say), put it in with `sql_name`, which takes only letters and digits of any
+script (with the marks written on a letter) and `_`, at most 63 bytes, so a name is the
+same name on every database, or a list of such names:
 
 ```quillo
 fn sorted(by: "text" | "id") -> list with db = db.query(`select id, text from todos order by ${sql_name(by)}`)
 ```
 
 SQL built only from text as written, `sql_name` and `sql_param`, and choices between
-those, is not warned about.
+those, is not warned about, nor is a `map` over such pieces joined with `join`, which
+`quillo check` follows through every value its function returns. So an update of the
+columns the program chose passes:
+
+```quillo
+fn save(id: int, data: map) with db {
+    let cols = ["title", "body"]                       // chosen here, never from the form
+    let set = cols | map((c) => `${sql_name(c)} = ${sql_param(c)}`) | join(", ")
+    db.exec(`update notes set ${set} where id = :id`, { ...data, id })
+}
+```
+
+while `` map((c) => `${c} = 1`) `` warns. Only the builtins count: a `sql_name` the
+program or the function defines for itself is followed as any other value.
 
 `sql_name` quotes for the program's database: `"title"`, or `` `title` `` on MySQL. For
 SQL sent to another database, quote with that connection's own:
@@ -200,7 +214,10 @@ fn transfer(from: int, to: int, amount: int) -> map with db =
   transaction hold up other requests rather than let them write into it.
 - `parallel` inside a transaction runs its functions one after another, since queries
   on other threads would not be part of it.
-- Live pages hear of its changes when it commits, and not at all if it rolls back.
+- Live pages hear of its changes to tables when it commits, and not at all if it rolls
+  back. A global variable it changes keeps its new value either way (variables are not
+  rolled back), so pages showing it hear of it when the outermost transaction ends,
+  whatever its outcome.
 
 ## Migrations
 
@@ -282,6 +299,12 @@ server fn reply_to(thread: int, text: str) {
     publish(`thread:${thread}`)
 }
 ```
+
+A topic is any text of 1 to 256 bytes, commas included; `watch` and `publish` stop on an
+empty or a longer one. One that ends in `:*` is a
+wildcard: `publish("thread:*")` wakes every page watching a `thread:` topic. So a topic
+built from what a visitor typed must not end in `:*`; one built from an int, as here,
+cannot.
 
 What a loader's helpers read counts too: a `me()` that looks up `sessions` makes every
 loader calling it run again when anyone signs in, so call it as `unwatched(() => me())`.

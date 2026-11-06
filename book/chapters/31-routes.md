@@ -609,6 +609,11 @@ fn touch() {
   the session and the rest in the database. The signature covers its expiry, its tenant
   and the program's mount point, so it is no session past its time, for another
   tenant, or in another mounted program.
+- Two requests of one visitor that set the session at once each start from the cookie
+  the browser sent, and the browser keeps the last cookie it is given: what the other
+  added is lost. Twenty adds to a cart kept in the session, sent at once, each
+  `set_session({ ...s, cart: (s.cart ?? []) + [item] })`, kept one item. Keep what must
+  not be lost (a cart, a draft) in a table, keyed by an id in the session.
 - `end_session()` removes the cookie from the browser, but a copy someone kept stays
   valid until it expires. To end sessions on the server (log out everywhere, a stolen
   laptop), keep an id in the session and check it against the database.
@@ -672,7 +677,8 @@ fn touch() {
   `{}` and `cookie(name)` is null.
 - `set_session` takes only `max_age`; `set_session(null)` ends the session too. The
   cookie's value is the session as JSON, with its expiry, base64url-encoded and signed,
-  so a session over about 3,900 bytes is a runtime error.
+  so a session over about 3,900 bytes is a runtime error, and so is one nested deeper
+  than 128 levels, as deep as JSON is read back.
 
 ## What a route returns
 
@@ -680,7 +686,7 @@ fn touch() {
 |---|---|
 | html | 200 `text/html`; XML when its root names a namespace (`<urlset xmlns="...">`, a sitemap) or it starts `<?xml`: `application/xml`, `application/rss+xml` for `<rss>`, `application/atom+xml` for `<feed xmlns="...">`, and `image/svg+xml` for `<svg xmlns="...">` |
 | str | 200 `text/plain` |
-| map, list, number, bool | 200 JSON |
+| map, list, number, bool | 200 JSON; one holding a function is a 500, its log line naming where (`the answer's value cannot be written as JSON: `f` is a function, ...`), and `quillo check` warns of a function written in the answer |
 | null | 204 |
 | error | 500 `{"error": ...}` |
 | `respond(status, body, headers)` | exactly that |
@@ -1258,7 +1264,10 @@ component Board() {
   present beyond `channel.peers` and what `join` and `leave` record. What `join`
   broadcasts on its channel, or sends to the page that is joining, reaches that page
   too, right after its yes: a roster broadcast as someone enters is the first thing
-  they hear. So does what is broadcast between the yes and the page hearing it.
+  they hear. So does what is broadcast between the yes and the page hearing it. A page
+  asks to join a room once at a time, and each `join` that said yes gets exactly one
+  `leave`, also when the page left or closed while its `join` was still running, so a
+  count kept by the two (`online += 1`, `online -= 1`) stays right.
 - **Each tenant has its own room** of a channel (see [Many tenants](#many-tenants)): pages on
   `acme.example.com` and `evil.example.com` joining `lobby` are in two rooms *(since 0.7:
   one room for all)*. What code run for a page or a request broadcasts, sends or lists
@@ -1326,8 +1335,10 @@ How messages travel:
   a stream: all of them, in order.
 - Where WebTransport cannot be had (the browser lacks it, UDP is blocked, the page is
   served from a name its certificate does not cover, or it is not ready within 1.5 s),
-  the page uses a WebSocket for the rest of its life, which carries every message
-  reliably and in order (`reliable` changes nothing there). The connection is opened
+  the page uses a WebSocket for the rest of its life, which carries messages in order,
+  none lost while the page keeps up, even in a burst of thousands (`reliable` changes
+  nothing there but past the queue's limit: one 4,096 messages behind loses a plain
+  message and is closed for a `reliable` one, as above). The connection is opened
   again when it drops (after half a second, then longer, up to 15 s), the channels
   joined again, and what was queued sent. A page that also shows live data has two
   connections, `/_quillo/live` and `/_quillo/wt`. In a phone app or `quillo app`, which
@@ -1810,7 +1821,10 @@ answers the same, with billing in a process of its own.
   same again when it is restarted), its log lines marked with its name, all signed with
   one secret (32 random bytes from the system, unless `QUILLO_SERVICE_SECRET` is set,
   so a copy started by hand elsewhere cannot join a split app unless the secret is
-  set); they stop with it (killed, not drained). Before any service starts, the app
+  set); they stop with it (killed, not drained), and when the app's process ends any
+  other way (killed with SIGKILL, a crash), each stops as a first SIGTERM stops it, as
+  the pipe the app holds on its input closes, so none is left serving with its port
+  taken. A service started on its own, by hand or by systemd, serves on. Before any service starts, the app
   checks the whole tree once, its own files and every service's, and says each warning
   once; an error anywhere stops it there, before anything waits. Each is then started as
   `quillo run <file> --port P --as-service --service-name NAME`, with `--base`, [`--watch`](#options-of-quillo-run),

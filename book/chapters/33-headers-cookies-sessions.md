@@ -307,6 +307,11 @@ route POST /logout { end_session(); redirect("/") }
 - The cookie holds the whole session as JSON, with its expiry, signed; one over about
   3,900 bytes signed is a runtime error. Keep an id in the session and the rest in the
   database.
+- Two requests of one visitor that set the session at once each start from the cookie
+  the browser sent, and the browser keeps the last cookie it is given: what the other
+  added is lost. Twenty adds to a cart kept in the session, sent at once, each
+  `set_session({ ...s, cart: (s.cart ?? []) + [item] })`, kept one item. Keep what must
+  not be lost (a cart, a draft) in a table, keyed by an id in the session.
 
 **Requiring a session.** One helper, used by every page that needs a visitor. `reply`
 with a status and a `redirect` ends the request from inside it:

@@ -46,7 +46,8 @@ list is not touched. The page shows the new total once the keystroke's handler i
 
 "Something that changes" is: a `state`, a prop, a `let` that is itself derived, a `for`
 row's item, a `live(...)` state, `url()`, and a call of the component's own functions or
-the program's (taken as reading what changes, since they may). Builtins on constant
+the program's (taken as reading what changes, since they may), however it is written:
+`x | show` and `show(x / 2)` follow what `show` reads, as `show(x)` does. Builtins on constant
 values are not: `let started = now()` is the time the component started, and stays so.
 What is followed is what a run actually read: `let shown = open ? details : summary`
 follows `open` and `details` while `open` is true, and `open` and `summary` while it is

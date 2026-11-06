@@ -462,7 +462,12 @@ route GET / = <html><body><Counter start={5}/></body></html>
   decimal (`{"$dec": "12.50"}`), an int past 2^53 (`{"$int": "..."}`, a BigInt in the
   browser), an error value (`{"$quillo_err": ...}`); a whole float is written `2.0`, and
   read back as a float. NaN and infinities become `null`; dates are their text, as
-  everywhere.
+  everywhere. A map whose one key starts with `$` is written `{"$": [key, value]}` and
+  read back as that map, so a key a visitor chose (`set({}, k, v)`) cannot pass for one
+  of these marks in another visitor's page or on the server, both ways: in a `server
+  fn`'s arguments and answer, island state and props, live data, services and sessions.
+  Nor can any text become a number in the JSON the browser writes (`?q=%00int:5` reached
+  a `server fn` as the int 5).
 
   `<Counter start={5}/>` from the top of this section is sent as:
 
@@ -598,11 +603,15 @@ route GET / = <html><body><Counter start={5}/></body></html>
   ```
 
   Both sides show `2 3.5`.
-- A map keeps its keys in order on the server. In the browser, keys that look like whole
-  numbers come first, in number order, as in any JavaScript object, so `keys`, `values`
-  and `for [k, v] in m` over `group_by(xs, (x) => x.id)` can differ, and a page showing
-  such a map is made again. Sort the keys, or keep a list. With `--watch`, a component the browser had to make again says which,
-  and what differed, in the console.
+- A map keeps its keys in the order they were set, on the server and in the browser,
+  keys that look like whole numbers too (a JavaScript object puts those first, in number
+  order): `keys`, `values`, `for [k, v] in m`, `str`, `json.stringify`, `url_encode`,
+  `merge`, spreads, `+`, `group_by` and records read them alike on both sides, so a
+  map of ids, years or prices shows in one order, and a signature or a cache key made
+  from `json.stringify` is the same. JSON the browser reads (`json.parse`, an
+  `http` answer's `json`, a `server fn`'s answer, island state and props, live data,
+  channels, streams) keeps its keys in the order written. With `--watch`, a component the
+  browser had to make again says which, and what differed, in the console.
 
   ```quillo
   component Keys() {
@@ -611,8 +620,10 @@ route GET / = <html><body><Counter start={5}/></body></html>
   }
   ```
 
-  The server writes `b 10 a / 10 a b`, the browser `10 b a / 10 a b`: the first half
-  differs, the sorted half does not.
+  Both sides write `b 10 a / 10 a b`.
+- A top-level constant holding an error value (`let bad = int("x")`) is an error value
+  in a component too, `is_err` true, its text hidden as the server hides a builtin's;
+  it was a map there.
 
 ## Composition
 
@@ -944,6 +955,12 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   name from `use` is the same call written as JavaScript reads, with the same checks.
   The name is written in the code: one from data could reach anything on the page, so a variable is
   an error when the program loads, as are `eval`, `Function` and the like.
+- A map reaches the page's JavaScript as the object it is, but one holding a key that is
+  an array index (`"0"` to `"4294967294"`) out of JavaScript's order: that one reaches it
+  as a plain copy, its keys in JavaScript's order, so `URLSearchParams`, `Headers` and
+  deep-equality libraries take it, and what page code changes in that copy does not
+  show in Quillo. What a program's function called by page code returns is handed over
+  the same way.
 - Objects from the page (elements, a library's objects) have their properties and
   methods as fields: `el.value`, `chart.update()`; and their fields can be set:
   `el.value = ""`, `el.scrollTop += 100` (only theirs: a map's fields are made anew,
@@ -1146,13 +1163,21 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
   says. With tenants, every topic but a global's belongs to the tenant, so a `publish`
   wakes only the same tenant's pages; in a mounted program they are the mount's.
   `watch` and `publish` take several topics at once; `unwatched(f)` calls `f` with
-  nothing.
+  nothing. A topic is 1 to 256 bytes of any characters, a comma too; an empty or longer
+  one stops `watch` and `publish` with an error, where the page never heard of it.
+- A topic ending in `:*` is a wildcard: `publish("room:*")` wakes every page following a
+  topic under it (`room:7`, `room:lobby`), and `publish("db:*")` every table's. So a
+  topic built from a visitor's text must not end in `:*`: write `` `room:${id}` `` with
+  an `id` the program checked (an int), not one taken as it came.
 - A loader that gives an error value makes the state that error value, sent whole; one
   that fails with a runtime error, or `reply`s a status that is not a success, leaves
   the page's state as it was (the console says so), and the next change tries again.
-- A page may follow at most 256 topics; past that, the rest hear nothing.
-- Inside `db.transaction`, the announcement waits for the commit, and is dropped
-  on rollback.
+- A page may follow at most 256 topics; past that, the rest hear nothing. A list too
+  long for an address goes after it, so long topics are heard too.
+- Inside `db.transaction`, a table's announcement waits for the commit, and is dropped
+  on rollback. A global's waits for the outermost transaction to end, whatever its
+  outcome, since a global keeps its value through a rollback: pages are told it, where
+  they kept showing the old one.
 - `publish("topic")` announces anything else, and `watch("topic")` inside a loader
   subscribes to it.
 - What a loader reads includes what the functions it calls read: a `me()` that looks up
@@ -1370,6 +1395,18 @@ page to show the words. Nothing happens by itself on a 401 or a 500 (no redirect
 retry, except for [idempotent](#idempotent-requests) calls); there is no loading flag
 either: set a state of your own around the call.
 
+**The latest call wins.** A handler can run again before its call has answered (a
+letter typed in a search box, a second click), and answers come back in any order. An
+older call's answer never replaces a newer value: every set of a state claims it (a
+plain `shown = "x"`, a field bound with `bind:`, a set from a call), and a handler that
+waited keeps only the sets it makes while no newer set has claimed that state. So
+`oninput={(e) => { shown = search(e.value) }}` ends on the answer for what was typed
+last, however late the first one comes. A set that reads the state it sets is a fold
+(`n += 1`, `busy -= 1`, `xs = xs + [x]`, `s = s | push(x)`, `s = f(s)`) and is always
+made, on what the state holds then: three quick likes that each call `save()` and then
+`likes += 1` count three, and two uploads that each do `busy += 1`, wait, and `busy -= 1`
+end at 0.
+
 **Slow data: `defer`.** A `state` initializer runs while the server renders, so the
 page waits for its slowest one. `defer` lets a slow one follow the page instead:
 
@@ -1419,8 +1456,14 @@ In the browser that is `Promise.all`. In a request on the server each function r
 coroutine of its own on the event loop (outside a request, on a thread of its own), so
 their waits (database, `http.*`, `sleep`) overlap. Their computing does not: Quillo code
 runs one piece at a time, so `parallel` shortens waiting, not arithmetic. Inside a
-transaction they run one after another, since the others' SQL would not be part of it. A
-failure stops the whole call; error values are results like any other.
+transaction they run one after another, since the others' SQL would not be part of it.
+A function that fails stops the others at their next step (a call, a loop's round, a
+builtin, a `sleep`, which ends at once), nested `parallel` too; what they did before it
+stays done, and the call fails with the failure that happened. Error values are results
+like any other and stop nothing. Inside the functions, `set_cookie`, `set_session`,
+`end_session`, `session()`, `publish` and a replica's read-your-writes work as they do
+outside, and what each sets goes into the answer in the functions' order, as if they had
+run one after another; one that reads who the visitor is makes the answer private to them.
 
 Each call is a `POST /_quillo/rpc/<name>` with a JSON array of arguments (or, when an
 argument is a file, multipart: see [Uploads](#uploads)), checked against

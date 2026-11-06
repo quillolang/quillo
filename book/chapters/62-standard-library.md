@@ -58,7 +58,8 @@
   highlighting, is its first word, to a space or a comma (```` ```rust,ignore ```` is Rust).
 - **Lists:** `map filter find any all reduce sum min max sort sort_by reverse first last push range enumerate slice unique flatten zip take drop count group_by join_on index_of`
 - **Maps:** `keys values get has set remove merge` (`get(m, k, default)`; `merge` takes
-  two maps; there is no `entries`: `for [k, v] in m`)
+  two maps; there is no `entries`: `for [k, v] in m`). A map keeps the order its keys
+  were set, number-like keys too, in the browser as on the server.
 - **Math:** `abs round floor ceil sqrt pow`, and the three modules under
   [Numbers and data](#numbers-and-data). For money, [Decimals](#decimals) and
   [Money](#standard-library-money); `format_number(x, locale, digits)` writes a number as a locale does.
@@ -103,6 +104,13 @@
   machine (`0.0.0.0` is written `127.0.0.1`), so a program that reads its own pages need not be
   told its address again. It is null in a script and while the program loads.
 
+A builtin given more arguments than it takes stops and says what it takes: `` `split`
+takes 2 arguments, got 3: split(s, sep) `` (and for `sort` given a comparator, to use
+`sort_by`), in `quillo check` where the call is written out, as the program runs however
+it is called (a method on an untyped value, `line.split(",", 2)`; a builtin held in a
+variable or passed to another, `reduce(xs, 0, max)`), and in the browser. Nothing is
+ignored: `uuid(1)`, `random(1)` and `merge(a, b, c)` are errors.
+
 What each does at its edges, where the answer is not what another language would give:
 
 | Call | Gives |
@@ -114,32 +122,32 @@ What each does at its edges, where the answer is not what another language would
 | `slice(x, start, end)` | negative positions from the end; both kept within the list or string; `end` before `start` gives an empty one |
 | `take(x, n)`, `drop(x, n)` | a negative `n` counts as 0, unlike `slice`: `take(xs, -2)` is empty, `drop(xs, -1)` all of it, so a count worked out by subtraction stays safe |
 | `range(n)`, `range(a, b)`, `a..b`, `range(a, b, step)` | `b` left out, step 1, empty when `b <= a`; a negative step counts down; a list of at most ten million, while a `for` whose list no one keeps counts without one |
-| `group_by(xs, f)` | a map from each key, as text, to the items with it, in order: `1` and `"1"` are one key |
-| `unique(xs)` | the first of equal items (equal as `==` says) |
+| `group_by(xs, f)` | a map from each key, as text, to the items with it, in order: `1` and `"1"` are one key; an error `f` gives is given back, not made a key |
+| `unique(xs)` | the first of equal items, keeping exactly what `==` keeps (`unique([1, 1.0, 1m, "1"])` is `[1, "1"]`), in time linear in the list on both sides: 40,000 items take milliseconds, not seconds |
 | `zip(a, b)` | pairs, as long as the shorter |
 | `contains(x, y)` | in a string, `y` as text; in a list, an equal item; in a map, a key |
 | `remove(list, x)` | every item equal to `x` gone; `remove(map, k)` the key |
 | `set(xs, i, v)` | `i` past the end is an error |
-| `round(x)` | a float rounds half away from zero (`round(-2.5)` is `-3`) to an int, and an int is itself (exact past 2^53); `round(x, 2)` a float with at most 15 places, from its shortest decimal (`round(1.005, 2)` is `1.01`, as `format_number` writes it); a decimal takes a mode (see [Decimals](#decimals)) |
+| `round(x)` | a float rounds half away from zero (`round(-2.5)` is `-3`) to an int, up to 2^63 (`type_of(round(1e16))` is `int`; past it, and NaN and the infinities, the float), and an int is itself (exact past 2^53); `round(x, 2)` a float with at most 15 places, from its shortest decimal (`round(1.005, 2)` is `1.01`, as `format_number` writes it); fewer than no places round to tens, hundreds, ...: `round(1234.5678, -2)` is `1200.0`, past 28 places by floats; an int to 0 places or more is itself (`round(5, 2)` is `5`, as in Python), and to fewer the nearest multiple, exactly, a half away from zero (`round(1250, -2)` is `1300`, where Python's is `1200`, half to even); `round(a / b)` of two ints is exact (see `/` under [Values](#values)); a decimal takes a mode (see [Decimals](#decimals)) |
 | `int(x)` | a float or decimal cut toward zero (an error value when too large for an int); `true` is 1; text of digits only (`int("1.0")`, `int("1e3")` are error values) |
 | `float(x)` | a number as a float; text as Rust reads a float (`"2.5"`, `" 7 "`, `"1e3"`, `".5"`, `"inf"`, `"nan"`), so `"0x10"`, `"0b11"`, `"1_000"` and `""` are error values, in the browser too |
-| `floor(x)`, `ceil(x)` | a float to an int; an int as it is, past 2^53 too, as `round(x)` gives it |
+| `floor(x)`, `ceil(x)` | a float to an int, up to 2^63 (`type_of(floor(1e16))` is `int`; past it the float); an int as it is, past 2^53 too, as `round(x)` gives it; `floor(a / b)` of two ints divides in ints, exactly (see `/` under [Values](#values)) |
 | `str(x)` | a whole float as `2.0` (in a component's text, `2`, on both sides), never in exponent form (`1e16` is `10000000000000000`); a float's shortest digits, a tie taking the even digit as JavaScript does (`1916218016406818.3`, which is held as ...818.25, is written `1916218016406818.2`); markup as its HTML, in the browser too; a list or map as Quillo writes it (`{ a: 1, b: "x" }`, a key of letters, digits and `_` of any script, not starting with a digit, bare (`{ é: 1, 日本: 2 }`), another quoted (`{ "a b": 3, "1a": 4 }`), on both sides); `null` as `null` |
 | `type_of(x)` | one of `null bool int float dec str list map fn html response error` (`promise` for a JavaScript Promise in the browser) |
 | `len(x)` | a string's characters, a list's items, a map's keys; an `html` value's bytes |
-| `min([])`, `max([])`, `first([])` | `null`; `sum([])` is `0`, and a sum of decimals stays exact |
+| `min([])`, `max([])`, `first([])` | `null`; `sum([])` is `0`, and a sum of decimals stays exact; `sum` adds numbers only, and text stops it at its item (`` `sum` adds numbers; got the str "12.50" at item 1: use `float(...)` or `dec(...)` first ``), where it was joined after a `0` |
 | `sqrt(-1)` | `NaN`, while `math.sqrt(-1)` is an error, as in Python |
-| `pow(2, 10)` | an int, exact, or an overflow as `*` gives (`pow(2, 63)`); a float on either side, or a negative power, gives a float; a decimal to an int's power, a decimal (see [Decimals](#decimals)) |
+| `pow(2, 10)` | an int, exact, or an overflow as `*` gives (`pow(2, 63)`, and `pow(2, 4294967296)`: a power of 2^32 or more is exact for a base of -1, 0 or 1, and an overflow for any other); a float on either side, or a negative power, gives a float; a decimal to an int's power, a decimal (see [Decimals](#decimals)) |
 | `print(a, b)` | the values as text, a space between, on stdout (the console in a page) |
 | `now()` | milliseconds since 1970, an int |
-| `sleep(ms)` | no maximum; other requests run meanwhile; in a scheduled job or a tick, ends it (status 503) when the server stops or the program is loaded again, so a loop that runs for ever stops; a request waits it out (it is answered at a stop, up to 10 s, and finishes on its version at a reload) |
+| `sleep(ms)` | no maximum; other requests run meanwhile, and a request's sleep of 5 ms or more holds no thread (a timer wakes it), so a hundred streams sleeping in their loops hold up nothing; in a scheduled job or a tick, ends it (status 503) when the server stops or the program is loaded again, so a loop that runs for ever stops; a request waits it out (it is answered at a stop, up to 10 s, and finishes on its version at a reload) |
 | `random_int(lo, hi)` | both ends included |
 | `uuid()` | a version 4 UUID |
 | `read_file(path)` | text: bytes that are not UTF-8 are replaced; a missing file is an error value |
 | `write_file(path, v)` | `v` as text, folders made, the file replaced; `null` or an error value |
 | `escape(s)` | `& < > " '` as entities |
-| `json.parse(s)` | an error value for bad JSON, for a number past a float (`1e400`) and for half of a character (a lone `\ud83d`), on both sides; an int past 64 bits becomes a float; a key given twice keeps the last value |
-| `json.stringify(v, pretty)` | indented by two spaces when `pretty` is true; a whole float as `2.0` (`-0.0` too), so it reads back as a float, and an exponent where JavaScript writes one (`1e+21`, `1e-7`), on both sides; markup as its HTML; a decimal as a string, NaN and infinities as `null`, an error value as `{"error": ...}`; JSON past 256 MiB, or nested more than 10,000 deep, is an error value, counted before it is made, as lists that hold one part twice can double at each step *(since 0.7)*; a route's answer the same, a 500 with the reason in the log |
+| `json.parse(s)` | an error value for bad JSON, for a number past a float (`1e400`) and for half of a character (a lone `\ud83d`), on both sides; an int past 64 bits becomes a float; a key given twice keeps the last value; keys in the order written, on both sides; at most 128 levels deep, on both sides, past which it is `invalid JSON: it nests more than 128 deep` (`request.json` and an `http` answer's `json` are `null`, a stream's line is its text, and a database's JSON cell is that error); every other reader of JSON (sessions, channels, a `server fn`'s arguments, a service's body) takes the same depth |
+| `json.stringify(v, pretty)` | indented by two spaces when `pretty` is true; a whole float as `2.0` (`-0.0` too), so it reads back as a float, and an exponent where JavaScript writes one (`1e+21`, `1e-7`), on both sides; markup as its HTML; a decimal as a string, NaN and infinities as `null`, an error value as `{"error": ...}`; a function is an error value naming where it is (`` json.stringify: `a.f` is a function, which cannot be written as JSON ``), where it was written as text; JSON past 256 MiB, or nested more than 10,000 deep, is an error value, counted before it is made, as lists that hold one part twice can double at each step *(since 0.7)*; a route's answer the same, a 500 with the reason in the log |
 
 What is not in the standard library, and what to do instead:
 
@@ -213,7 +221,8 @@ Safety built in:
   when it is parsed, so source from anywhere cannot use up the stack.
 - `respond` and `redirect` refuse header values with line breaks, which would let text
   from a request add headers of its own, and a location that runs code or carries a page
-  (`javascript:`, `vbscript:`, `data:`).
+  (`javascript:`, `vbscript:`, `data:`), naming the one given (`` `redirect` is not given
+  a vbscript: URL ``), as `stream`, `site_headers` and `navigate` do.
 - A failing request answers `internal error`; the message, with file and line, goes to
   the terminal (and to the page too with [`--watch`](#options-of-quillo-run)). A builtin's
   error is `internal error` to a visitor in the browser too, in production.
@@ -264,25 +273,29 @@ Safety built in:
   the program's database is MySQL; `conn.sql_name(name)` quotes for the connection it is
   called on, `db.sql_name(name)` for the program's), and named parameters with
   `sql_param(name)` (or a list: `sql_param(["title", "body"])` is `:title, :body`) —
-  both take only letters, digits and `_`, whatever their argument is made of
-  (`` sql_name(`obj_${id}`) ``). SQL made of them, text as written (also kept in a
+  both take only letters and digits of any script (`sql_name("名前")`), the marks that go
+  on a letter (Hindi's vowel signs, an accent written apart) and `_`, not starting with a
+  digit, at most 63 bytes, so that two names are two on every database, whatever their
+  argument is made of (`` sql_name(`obj_${id}`) ``). SQL made of them, text as written (also kept in a
   variable), choices between those (`if`, `match`), joins of them with `+`, and calls of
   the program's own functions that only return such text
-  (`` fn table_of(id: int) = sql_name(`obj_${id}`) ``) is not warned about:
+  (`` fn table_of(id: int) = sql_name(`obj_${id}`) ``), and a `map` whose function gives
+  only such text on every way it returns, joined with `join`, is not warned about:
   `let order = match sort { "new" => "created desc", _ => "score desc" }` and then
   `"select * from posts order by " + order`. A run-time set of columns, from a list the
   program wrote: `` `insert into t (${sql_name(cols)}) values (${sql_param(cols)})` `` with
   a map of those columns as the parameters, or for an update the pairs, which every
   database takes (a column list, `set (a, b) = (...)`, is not MySQL's, nor PostgreSQL's for
   one column): `` let set = cols | map((c) => `${sql_name(c)} = ${sql_param(c)}`) | join(", ") ``
-  and then `` `update t set ${set} where id = :id` `` (`quillo check` warns of this one,
-  as it does not follow what a `map` makes: every name in it is `sql_name`'s and every
-  value a parameter). Take the columns from
+  and then `` `update t set ${set} where id = :id` ``. Only the builtins are trusted:
+  a `sql_name`, `sql_param`, `map` or `join` the program defines, or a name the lambda
+  binds again, is followed no further, and raw text in the lambda
+  (`` keys(data) | map((c) => `${c} = 1`) ``) is warned of. Take the columns from
   the program, never from what the visitor sent: `keys(request.form)` names `is_admin`
   and `id` as well as `email`, which `sql_name` takes, as they are names, so a sign-up form
   with `is_admin=1` made an admin (FEEDBACK51.md, Q-662). A record type, `{ form: Signup }`,
   keeps its fields only.
-  It is a warning, not a proof: SQL built in a list made with `map` is not followed.
+  It is a warning, not a proof.
 - Inside `db.transaction` on SQLite, `sleep`, `http` and queries to another database
   (PostgreSQL, MySQL) hold up other requests instead of letting them read and write
   inside the open transaction *(since 0.7: a query to another database let them in)*.
@@ -745,7 +758,8 @@ math.comb(52, 5)  math.log(8, 2)  math.fsum(xs)  math.isclose(a, b)  math.pi
 
 - **`math`:** `sqrt cbrt exp exp2 expm1 log(x, base) log2 log10 log1p pow`, `sin cos tan
   asin acos atan atan2` and their hyperbolic forms, `degrees radians hypot dist`, `floor
-  ceil trunc` (ints) `fabs copysign fmod remainder modf frexp ldexp`, `factorial gcd lcm
+  ceil trunc` (ints, up to 2^63; of an int divided by an int, written in the call, the
+  exact int, as `floor` gives it) `fabs copysign fmod remainder modf frexp ldexp`, `factorial gcd lcm
   comb perm isqrt` (ints), `isclose isfinite isinf isnan`, `prod fsum sumprod`, `erf erfc
   gamma lgamma`, and `pi e tau inf nan`. What Python raises is an error here too: a math
   domain error (`math.sqrt(-1)`, `math.log(0)`), a range error (`math.exp(1000)`), an int
@@ -880,8 +894,11 @@ date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or a
   `posix/...` and `right/...` (copies some systems keep), names the database dropped
   (`US/Pacific-New`, `Canada/East-Saskatchewan`, `SystemV/...`), Java's three-letter ids
   (`PST`), and any other name with a sign (`+5`, `+0560`, a U+2212 minus). The server
-  reads the system's time zone database, or a copy built into `quillo` where there is none
-  (Windows, small containers); the browser asks its own (`Intl`).
+  reads the system's time zone database, and a copy built into `quillo` where there is none
+  (Windows, small containers) and for a name the system's leaves out (Ubuntu 24.04 moved
+  `EST`, `US/Pacific`, `Asia/Calcutta` and `EST5EDT` to a package of their own,
+  `tzdata-legacy`), so a program takes the same zones on every machine; the browser asks
+  its own (`Intl`).
 - **Text:** `date.format(d, pattern)` with `YYYY YY`, `MM M` (month number, padded or
   not), `MMMM MMM` (its name), `DD D`, `dddd ddd` (the weekday's name), `HH H` and `hh h`
   (24 or 12 hours), `mm ss A` (AM/PM) and `Z` (the offset); anything else, and text in
@@ -1218,7 +1235,7 @@ sends one on purpose. Back it up with `db.exec("vacuum into
   its bounds, so a column's value may be a list in one row and text in another.
 - JSON is read cell by cell by Quillo's own reader: a whole number past an int is a
   [decimal](#decimals), past a decimal a float, so two large ids stay two; a value that
-  cannot be read (a number past a float, a nesting deeper than 1,000) is an error value
+  cannot be read (a number past a float, a nesting deeper than 128 levels) is an error value
   in its own cell (`db: this JSON could not be read: ...`), and the other cells and rows
   read; a lone surrogate is U+FFFD. A whole decimal inside a value sent is written as a
   JSON number, so it goes back as it came.

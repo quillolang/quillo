@@ -73,8 +73,13 @@ let kind = match user {
 - Only `null`, `false` and error values are falsy. **`0` and `""` are truthy**, so
   `name || "anonymous"` keeps an empty name: write `filled(name) ?? "anonymous"` *(since 0.7)*, and
   `count != 0 && <Badge/>`, not `count && <Badge/>`.
-- `/` is exact: `7 / 2` is `3.5`, `6 / 2` is `3`; `floor(7 / 2)` divides whole numbers.
-  Ints are 64-bit and overflow is an error, never a wrap.
+- `/` is exact: `7 / 2` is `3.5`, `6 / 2` is `3`; `floor(7 / 2)` divides whole numbers,
+  exactly. Ints are 64-bit and overflow is an error, never a wrap.
+- A builtin takes no more arguments than it lists: `split(s, ",", 2)` and `sort(xs, f)`
+  are errors (`sort_by(xs, (x) => key)`). `sum` adds numbers only: text read from a form
+  or a CSV is converted first, `sum(map(prices, dec))`.
+- A name binds once in a pattern: `[x, x]` is an error; write `[x, y] if x == y`.
+- A map keeps its keys in the order they were set, in the browser too.
 - A field of `null` is `null`, so `user.address.city` needs no `?.` (there is none).
 - `a..b` is the ints from `a` up to, not including, `b`: `for i in 0..10 => i`.
 - Comments are `//` and `/* */`. A line break ends a statement; a line starting with
@@ -200,7 +205,10 @@ route GET /assets/*path = files("public", path)
   pattern does not match lets the next route try.
 - `reply 401 "Log in"` ends the request from anywhere, a helper too.
 - Sessions: `set_session({ user })`, `session().user`, `end_session()`. Cookies:
-  `set_cookie`, `delete_cookie`.
+  `set_cookie`, `delete_cookie`. Two requests that set the session at once lose one's
+  change: keep a cart or a draft in a table, keyed by an id in the session.
+- `schedule("0 3 * * *", job)` and `every(50, tick)` go at the top level of the program;
+  called in a route they are an error.
 
 ## HTML, views and components
 
@@ -259,7 +267,9 @@ component Tasks() {
 ```
 
 - `state x = load()` with a `server fn` loads on the server while the page is made, so
-  the page arrives with its data.
+  the page arrives with its data. A state set from a call shows the latest call's
+  answer: an older answer that comes late is dropped, but `n += 1` after a call is
+  always made.
 - A statement in a component body that reads state runs again when that state changes;
   what it starts (`every(ms, f)`, a listener) stops when it no longer runs. There is no
   `useEffect`, no dependency list and no `useMemo`: `let` is already derived.

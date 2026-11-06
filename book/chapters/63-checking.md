@@ -15,8 +15,13 @@ type the program has not (`Usr`); a `let` or a `match` that cannot match what it
 (`let [a, b] = [1]`, `match x { }`); a lambda called with the wrong number of arguments,
 by its `let` name or given to `map`, `filter`, `reduce`, `sort_by` and the like; a list
 whose item is not what `list<T>` takes (`[1, "a"]` for `list<int>`); a field `request`
-does not have (`request.qurey`); and top-level code calling a function that reads a
-global defined further down.
+does not have (`request.qurey`); top-level code calling a function that reads a
+global defined further down; a name bound twice in one pattern (`[x, x]`), a name two
+tested fields bind used (`{ user.id: int, order.id: int } => id`), and a route binding
+one name by two of its path, query and request patterns; and `every` and `schedule` as
+the start reads them, their written-out arguments (`every(0, f)`, a cron field `60`,
+`@reboot`) and a job or tick named twice where both calls surely run (see [Scheduled
+jobs](#scheduled-jobs)).
 When a call to a function of your own named like a builtin (`notify`, `first`) has the
 wrong arguments, the error says so: this `notify` is the program's own, from line 1,
 which hides the builtin `notify`.
@@ -38,7 +43,11 @@ after one that takes any value, or with a value an arm before it has; `xs.push(2
 nothing in it changes; `"Hello ${name}"` in a plain string; `index_of(...) == -1`, a
 function used as a condition (`if ready {`), and a path's untyped parameter added to a
 number; a misspelt attribute or event (`clas`, `@clik`), `className`, and `<card>` for a
-view `Card`; a name imported as a builtin's. Warnings never make
+view `Card`; a name imported as a builtin's; a key written twice in a map
+(`{ a: 1, b: 2, a: 3 }`, `{ a, "a": 2 }`: the last value is the one kept; a spread
+before it is no second key); a function written in a route's answer, which cannot be
+JSON (`` this route's answer holds a function at `f` ``); a job or tick named twice where
+both calls may run. Warnings never make
 it fail.
 
 [`quillo check --policy FILE`](#other-commands) (`quillo check main.qwe --policy host.toml`)

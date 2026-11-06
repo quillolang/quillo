@@ -103,6 +103,31 @@ fn add_twice(text: str) {
 }
 ```
 
+**The latest call wins.** A handler can run again before its last call has answered (a
+letter typed in a search field, a second click), and the answers then come back in any
+order. An older answer never replaces a newer value: every set of a state claims it,
+whether written plainly, through `bind:` or from a call, and a handler that waits keeps
+only the sets it makes while no newer set has claimed that state.
+
+```quillo
+server fn search(q: str) -> str = `results for ${q}`
+
+component Search() {
+    state shown = ""
+    <div>
+        <input oninput={(e) => { let q = e.target.value; if q == "" { shown = "" } else { shown = search(q) } }}/>
+        <p>{shown}</p>
+    </div>
+}
+```
+
+Typing `abcd` ends on `results for abcd`, however late the answer for `a` comes, and
+emptying the field leaves it empty, with no answer still on its way showing up after. A
+set that reads the state it sets is a fold (`n += 1`, `xs = xs + [x]`, `s = f(s)`) and is
+always made, on what the state holds then: three quick clicks on a button whose handler
+calls `save()` and then does `likes += 1` count three, and two uploads at once that each
+do `busy += 1`, wait for the upload, and `busy -= 1` end at 0.
+
 ## Errors are values
 
 A call that cannot be made (the connection drops, the server is down, the server fails)
@@ -145,8 +170,15 @@ together instead of 600. On the server each function runs as a coroutine of its 
 the event loop, so their waits (on the database, `http.*`, `sleep`) overlap the same way.
 Their computing does not: Quillo code runs one piece at a time, so `parallel` shortens
 waiting, not arithmetic. Inside a transaction they run one after another, since the
-others' SQL would not be part of it. A function that fails stops the whole call; error
-values are results like any other.
+others' SQL would not be part of it.
+
+A function that fails stops the others at their next step (a call, a loop's round, a
+builtin, a `sleep`, which ends at once). What they did before it stays done, and the
+call fails with the failure that happened. An error value is a result like any other and
+stops nothing. Inside the functions, `set_cookie`, `set_session`, `end_session`,
+`session()`, `publish` and a replica's read-your-writes work as they do outside, and what
+each sets goes into the answer in the functions' order, as if they had run one after
+another; one that reads who the visitor is makes the answer private to them.
 
 ## On the server, too
 

@@ -138,7 +138,10 @@ quillo: the server did not let this page join channel chat
 
 A channel that no `channel.on` names can be joined by anyone, to hear what the program
 broadcasts on it; what pages send on it goes nowhere. `leave(peer)` hears that a page
-left the channel, or closed.
+left the channel, or closed. A page asks to join a room once at a time, and each `join`
+that said yes gets exactly one `leave`, also when the page left or closed while its
+`join` was still running, so a count kept by the two (`online += 1`, `online -= 1`)
+stays right.
 
 ### A room for each tenant
 
@@ -183,8 +186,13 @@ component Cursors() {
 
 | Message | Over WebTransport | Over a WebSocket |
 |---|---|---|
-| Small (about 1,100 bytes or less, as JSON) | A datagram: as soon as it can, but it may come out of order or not at all | Reliably, in order |
-| Larger, or sent with `{ reliable: true }` | On a stream: all of them, in order | Reliably, in order |
+| Small (about 1,100 bytes or less, as JSON) | A datagram: as soon as it can, but it may come out of order or not at all | In order, none lost while the page keeps up |
+| Larger, or sent with `{ reliable: true }` | On a stream: all of them, in order | In order, none lost while the page keeps up |
+
+Over a WebSocket, a page that reads as fast as messages come gets every one, in order,
+even from a burst of thousands. One that falls behind meets the queue's rules (see
+[the limits](#limits-and-what-it-does-not-do)): past 4,096 messages waiting for it, a
+plain one is dropped, and a `reliable` one closes the connection, so the page joins again.
 
 The positions go as datagrams. A lost one is replaced by the next, a moment later, and
 nothing waits for it, which is what keeps cursors smooth on a poor connection.
@@ -337,8 +345,9 @@ joins its channels again) when it drops:
   number. This is what carries datagrams.
 - **A WebSocket** where it cannot: the browser lacks WebTransport, UDP is blocked on the
   way, or the server cannot be reached over it within a second and a half. Everything
-  still arrives, reliably and in order, so a page works the same, only without
-  datagrams. A page that fell back keeps the WebSocket until it is loaded again.
+  arrives in order, and none is lost while the page keeps up (one 4,096 messages behind
+  meets the queue's rules, below), so a page works the same, only without datagrams. A
+  page that fell back keeps the WebSocket until it is loaded again.
 
 In the Network panel, the connection is the request to `/_quillo/wt`; if its type is
 **websocket**, the page fell back.

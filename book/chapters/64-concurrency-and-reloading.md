@@ -5,7 +5,8 @@ reads and parses requests, runs the program on them and writes the answers. Each
 runs as a coroutine with its own stack. A handler runs on its own from start to end,
 except while it waits: a database query, `http.*` or `sleep` pauses it, the waiting is
 done elsewhere (on a pool thread, or for PostgreSQL on connections all requests share,
-with queries pipelined), and the loop answers other requests meanwhile. Code is written
+with queries pipelined, and a `sleep` of 5 ms or more on a timer, holding no thread),
+and the loop answers other requests meanwhile. Code is written
 as if it simply waited; there is no `async` or `await`. Updating shared state such as
 `todos = todos | push(t)` is safe without locks, since only one handler runs at a time.
 
@@ -225,9 +226,18 @@ waiting for 03:00, give it `"10s"` while you work on it.
 - The first argument is a duration (seconds, or `"30s"`, `"5m"`, `"1h"`, `"1d"`,
   `"2w"`, `"1y"`), counted from 1970 in UTC, so that every server agrees and `"5m"` runs
   at :00, :05, ...; or a cron line: `minute hour day month weekday` in UTC, with `*`,
-  `1-5`, `*/15` and lists, or `@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly`. A
-  job first seen (at start, or after a reload) waits for its next time; it never runs at
-  once. The clock is looked at once a second.
+  `1-5`, `*/15` and lists, its fields apart by spaces or tabs, or `@hourly`, `@daily`,
+  `@weekly`, `@monthly`, `@yearly`. A job first seen (at start, or after a reload) waits
+  for its next time, counted from when the server first looks: started at 04:01,
+  `"2 * * * *"` runs at 04:02, and a nightly `"0 3 * * *"` of a server deployed each day
+  at 02:00 runs at 03:00 that day; it never runs at once. The clock is looked at once a
+  second.
+- `schedule` and `every` add a job or a tick as the program starts, at its top level
+  (or in a function the top level calls): called once it has started, in a route, a
+  `server fn`, a job or a tick, they stop with an error (a 500 in a route), where they
+  answered as if added and the job never ran. `quillo check` reads their written-out
+  arguments as the start does (`every(0, f)`, a cron field `60`, `*/0`, `5-1`, `MON`,
+  `@reboot`, six fields, a bad `{ name }` are errors there too).
 - A job runs on the server like a request: waiting for the database lets requests run
   meanwhile, its errors are printed, and it is logged (`POST
   /_quillo/job/clean_sessions?at=1761600000 -> 200`, the time it was due for). A job
@@ -235,7 +245,11 @@ waiting for 03:00, give it `"10s"` while you work on it.
   running jobs finish, and starts no more.
 - Jobs are named after their function (`{ name: "..." }` for a lambda, else
   `job-<line>`, or to run one function twice): letters, digits, `_`, `-` and `.`, at
-  most 64, and no two alike. Nobody outside the server can start one.
+  most 64, and no two alike. The start refuses a second job of a name when it is added;
+  `quillo check` says so as an error where both calls surely run (twice at the top level,
+  or a top-level function that adds it called twice), and warns where both may (two
+  `if`s, `&&`, `||`, `??`, a loop); the arms of one `if`/`else` or `match` are
+  alternatives, and say nothing. Nobody outside the server can start one.
 - A job that runs for ever (a loop with `sleep` in it) is told to end when the server
   stops, and when [`--watch`](#options-of-quillo-run) (`quillo run main.qwe --watch`) loads the program again: its `sleep` ends the job, so a
   new version never runs beside the old one (a tick's too; a request's `sleep` is waited
@@ -282,7 +296,8 @@ opened later picks it up where it is.
   loop of a game, a sensor read, a short poll. In a component it is the page's clock
   instead (see [Components](#components)).
 - A tick is named after its function (`{ name: "..." }` for a lambda, else
-  `every-<line>`), and no two alike. It runs like a job, one at a time: a tick still
+  `every-<line>`), and no two alike, as jobs are (above); `every` on the server is
+  only for the top level, as `schedule` is. It runs like a job, one at a time: a tick still
   running when the next is due skips that one, so a slow step slows the loop and never
   doubles it. Ticks are not logged or counted in [`--metrics`](#options-of-quillo-run) (`quillo run main.qwe --metrics`), are not recorded in
   `_quillo_jobs` (each server runs its own), and stop with the server and on a reload.
@@ -474,7 +489,7 @@ A tool asks with a `quillo:devtools-ask` event, its `detail` a JSON string
 |---|---|
 | `list` | each component now, as a `component` message |
 | `where`, `target` | marks the component's element with `data-quillo-devtools-id` (the mark moves with the next `where`) |
-| `set`, `target`, `name`, `value` | sets a state; under `--watch` only |
+| `set`, `target`, `name`, `value` | sets a state; under `--watch` only. The JSON is read as the server reads it: `2.0` is a float, an int past 2^53 exact, a map's keys in the order written |
 
 Reading is open in production, as the page can be read with the browser's debugger anyway;
 setting is not (FEEDBACK42.md, Part C).
