@@ -31,7 +31,7 @@ Operators are as in JavaScript, with these meanings:
 |---|---|
 | `+` | numbers add; a string with anything is text (`"n=" + 1` is `"n=1"`, `"a" + null` is `"anull"`); two lists join; two maps merge, the right one's values winning; `true + 1` and `null + 1` are errors |
 | `- * %` | as in JavaScript on numbers; nothing else is converted (`"5" * 2` is an error) |
-| `/` | exact division: `7 / 2` is `3.5`, and a whole result stays an integer (`6 / 2` is `3`); `floor(7 / 2)` is integer division, done in ints past 2^53 too: `floor`, `ceil`, `round`, `math.floor`, `math.ceil` and `math.trunc` of an int divided by an int, written in the call (`floor(a / b)`, `a / b \| floor`, `(a / b).floor()`, `math.floor(a / b)`, a builtin held in a variable), give the exact int, as Python's `a // b` does; a quotient kept in a variable first (`let q = a / b`) is a float, and its digits past 2^53 are gone |
+| `/` | exact division: `7 / 2` is `3.5`, and a whole result stays an integer (`6 / 2` is `3`); `floor(7 / 2)` is integer division, done in ints past 2^53 too: `floor`, `ceil`, `round`, `math.floor`, `math.ceil` and `math.trunc` of an int divided by an int, written in the call (`floor(a / b)`, `a / b \| floor`, `(a / b).floor()`, `math.floor(a / b)`, a builtin held in a variable), give the exact int, as Python's `a // b` does; a quotient kept in a variable first (`let q = a / b`) is a float, and its digits past 2^53 are gone; `math` has no `round` (write `round(a / b)`), on both sides |
 | `== !=` | deep equality, like comparing JSON: `1 == 1.0` and `0.1m == 0.1`, but `1 == "1"` is false (nothing is converted); an int and a float compare exactly, as in Python (`9007199254740993 == 9007199254740992.0` is false), in compiled code and in the browser too; functions are equal only to themselves |
 | `< <= > >=` | comparison of two numbers (ints, floats and decimals mix, exactly; not a decimal and a float), or two strings by code point; a string and a number, booleans, or NaN is an error |
 | `!`, `&&`, `\|\|` | not, and, or; `a && b` and `a \|\| b` give back one of their operands, so `{loading && <Spinner/>}` works |
@@ -399,9 +399,9 @@ function around it. `filter`, `find`, `any`, `all` and `count` give back an erro
 function gives, since it has said neither yes nor no, so `filter(xs, f)?` stops there;
 `map` keeps each result, an error too. An error is never made into text where a value
 is wanted: `get`, `has`, `set` and `remove` given one as the key, `group_by` and
-`re.replace` given one by their function, and `url_encode` given one (or a map holding
-one) give that error back, where its text became a key, a part of the text or of the
-URL. In a component's body, `?` and `return` are ways
+`re.replace` given one by their function, and `url_encode` given one or a value holding
+one at any depth (a list, a map in a list) give that error back, the first in order, where
+its text became a key, a part of the text or of the URL. In a component's body, `?` and `return` are ways
 out of it, so a body with one is made again whole on each change, which loses the focus
 of an input; `x?.y` is such a `?`, and `quillo check` says so. A field of null is null, so
 write `x.y`.

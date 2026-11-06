@@ -46,7 +46,8 @@ number; a misspelt attribute or event (`clas`, `@clik`), `className`, and `<card
 view `Card`; a name imported as a builtin's; a key written twice in a map
 (`{ a: 1, b: 2, a: 3 }`, `{ a, "a": 2 }`: the last value is the one kept; a spread
 before it is no second key); a function written in a route's answer, which cannot be
-JSON (`` this route's answer holds a function at `f` ``); a job or tick named twice where
+JSON (`` this route's answer holds a function at `f` ``), the program's own or one the
+route's block makes (`fn helper() = 2`, `let f = (x) => x`; a call of it is a value); a job or tick named twice where
 both calls may run. Warnings never make
 it fail.
 

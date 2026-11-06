@@ -36,7 +36,7 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   A `u64` past `i64`'s range inside a returned `serde_json::Value` is a runtime error
   that names where it is (`.id`, `[1].n`), not a float that has lost digits, and one
   returned alone names its function. NaN and the infinities cross to an `f64` and back
-  as they are (they arrived as `null`); a `serde_json::Value` argument that holds one is
+  as they are, at any depth, a map of one key too (they arrived as `null`); a `serde_json::Value` argument that holds one is
   refused by the argument's name, as JSON has none. An error value given to a Rust
   function, at the top or inside a list or map, is given back, and the function does not
   run.
