@@ -7121,13 +7121,14 @@ fn smaller_differences_of_the_drivers() {
         assert_eq!(ev(&mut it, "db.exec(\"insert into ar (id, j) values (2, ?)\", [[1, 2], { a: [3] }, \"[4]\", null, \"\\\"é\\\"\"]).changes"), "1");
         assert_eq!(ev(&mut it, "db.one(\"select j from ar where id = 2\").j"), "[[1, 2], { a: [3] }, [4], null, \"é\"]");
     }
-    let Some((my, url)) = maria_db("smaller") else { return };
+    // Held to the end: the server is shared, and dropping the last hold stops it (CI saw the
+    // queries below refused).
+    let Some((_my, url)) = maria_db("smaller") else { return };
     // An IPv6 host is connected to, not looked up as a name.
     let six = format!("mysql://root@[::1]:{}/f55_smaller", support::free_port());
     let mut it = on_db(&url, "");
     let said = ev(&mut it, &format!("let r = db.connect(\"{}\")\nstr(r.error)", six));
     assert!(!said.contains("lookup") && said.contains("refused"), "{}", said);
-    drop(my);
     ev(&mut it, "db.exec(\"create table u (k int, ubi bigint unsigned, t tinyint(1))\")");
     ev(&mut it, "db.exec(\"insert into u values (1, 18446744073709551615, 0), (2, 18446744073709551614, 1), (3, 9223372036854775808, 2), (4, 9223372036854775807, -1), (5, 0, 5)\")");
     assert_eq!(ev(&mut it, "db.query(\"select ubi, t from u order by k\")"), "[{ ubi: 18446744073709551615m, t: false }, { ubi: 18446744073709551614m, t: true }, { ubi: 9223372036854775808m, t: 2 }, { ubi: 9223372036854775807, t: -1 }, { ubi: 0, t: 5 }]");
@@ -7580,7 +7581,8 @@ fn split_reload_takes_a_change_to_a_services_file() {
     assert_eq!(body_of(port, "/"), "billing v1");
     std::fs::write(d.join("billing.qwe"), "server fn who() = \"billing v2 ✓\"\n").unwrap();
     until_logged(&log, "the service reloads", || body_of(port, "/") == "billing v2 ✓");
-    assert!(std::fs::read_to_string(&log).unwrap().contains("[billing] quillo: reloaded billing.qwe"));
+    // The service's line comes through the app's relay of its log, which may follow the answer.
+    until_logged(&log, "the service says it reloaded", || std::fs::read_to_string(&log).unwrap().contains("[billing] quillo: reloaded billing.qwe"));
 }
 
 /// `quillo run args...` in `d` with `--port 0`, its log kept: the guard, the app's port (from its
