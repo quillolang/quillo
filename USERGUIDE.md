@@ -758,9 +758,9 @@ function around it. `filter`, `find`, `any`, `all` and `count` give back an erro
 function gives, since it has said neither yes nor no, so `filter(xs, f)?` stops there;
 `map` keeps each result, an error too. An error is never made into text where a value
 is wanted: `get`, `has`, `set` and `remove` given one as the key, `group_by` and
-`re.replace` given one by their function, and `url_encode` given one (or a map holding
-one) give that error back, where its text became a key, a part of the text or of the
-URL. In a component's body, `?` and `return` are ways
+`re.replace` given one by their function, and `url_encode` given one or a value holding
+one at any depth (a list, a map in a list) give that error back, the first in order, where
+its text became a key, a part of the text or of the URL. In a component's body, `?` and `return` are ways
 out of it, so a body with one is made again whole on each change, which loses the focus
 of an input; `x?.y` is such a `?`, and `quillo check` says so. A field of null is null, so
 write `x.y`.
@@ -5569,7 +5569,7 @@ What each does at its edges, where the answer is not what another language would
 | `contains(x, y)` | in a string, `y` as text; in a list, an equal item; in a map, a key |
 | `remove(list, x)` | every item equal to `x` gone; `remove(map, k)` the key |
 | `set(xs, i, v)` | `i` past the end is an error |
-| `round(x)` | a float rounds half away from zero (`round(-2.5)` is `-3`) to an int, up to 2^63 (`type_of(round(1e16))` is `int`; past it, and NaN and the infinities, the float), and an int is itself (exact past 2^53); `round(x, 2)` a float with at most 15 places, from its shortest decimal (`round(1.005, 2)` is `1.01`, as `format_number` writes it); fewer than no places round to tens, hundreds, ...: `round(1234.5678, -2)` is `1200.0`, past 28 places by floats; an int to 0 places or more is itself (`round(5, 2)` is `5`, as in Python), and to fewer the nearest multiple, exactly, a half away from zero (`round(1250, -2)` is `1300`, where Python's is `1200`, half to even); `round(a / b)` of two ints is exact (see `/` under [Values](#values)); a decimal takes a mode (see [Decimals](#decimals)) |
+| `round(x)` | a float rounds half away from zero (`round(-2.5)` is `-3`) to an int, up to 2^63 (`type_of(round(1e16))` is `int`; past it, and NaN and the infinities, the float), and an int is itself (exact past 2^53); `round(x, 2)` a float with at most 15 places, from its shortest decimal (`round(1.005, 2)` is `1.01`, as `format_number` writes it); fewer than no places round to tens, hundreds, ...: `round(1234.5678, -2)` is `1200.0`, from the float's shortest digits and exact at every place (`round(1e30, -29)` is `1e30`), and a result past the largest float is an error; an int to 0 places or more is itself (`round(5, 2)` is `5`, as in Python), and to fewer the nearest multiple, exactly, a half away from zero (`round(1250, -2)` is `1300`, where Python's is `1200`, half to even); `round(a / b)` of two ints is exact (see `/` under [Values](#values)); a decimal takes a mode (see [Decimals](#decimals)) |
 | `int(x)` | a float or decimal cut toward zero (an error value when too large for an int); `true` is 1; text of digits only (`int("1.0")`, `int("1e3")` are error values) |
 | `float(x)` | a number as a float; text as Rust reads a float (`"2.5"`, `" 7 "`, `"1e3"`, `".5"`, `"inf"`, `"nan"`), so `"0x10"`, `"0b11"`, `"1_000"` and `""` are error values, in the browser too |
 | `floor(x)`, `ceil(x)` | a float to an int, up to 2^63 (`type_of(floor(1e16))` is `int`; past it the float); an int as it is, past 2^53 too, as `round(x)` gives it; `floor(a / b)` of two ints divides in ints, exactly (see `/` under [Values](#values)) |

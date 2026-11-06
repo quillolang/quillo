@@ -254,7 +254,10 @@ A value is exact or an error, the same on the server, in compiled code and in th
   itself**: `round(1234.5678, -2)` is `1200.0` (it was `1235.0`, the digits taken as 0),
   `round(1255, -1)` is `1260` (it was `1255.0`), `round(2, 2)` is `2` (it was `2.0`), and
   `round(9007199254740993, 2)` keeps every digit. Ints to negative digits round a half away
-  from zero, where Python rounds it to even (`round(1250, -2)` is `1300`) (Q-789).
+  from zero, where Python rounds it to even (`round(1250, -2)` is `1300`). A float to negative
+  digits works on its shortest digits, exact at every place (`round(1e30, -29)` is `1e30`;
+  past 28 digits it went through floats and gave `999999999999999900000000000000`), and a
+  result past the largest float is an error, as in Python (it gave the float back) (Q-789).
 - **`pow` with a power of 2^32 or more is exact for a base of -1, 0 or 1, and an `integer
   overflow` for any other**: `pow(-1, 9007199254740993)` was `1.0`, `pow(2, 4294967296)`
   `inf` (Q-790).
@@ -267,8 +270,8 @@ A value is exact or an error, the same on the server, in compiled code and in th
   route's answer (Q-792).
 - **An error is given back, not made into text**: by `get`, `has`, `set` and `remove` given
   one as the key, by `group_by` and `re.replace` given one by their function, and by
-  `url_encode` given one or a map holding one; its text became a key, part of the text or
-  of the URL (Q-784).
+  `url_encode` given one or a value holding one at any depth (the first in order); its text
+  became a key, part of the text or of the URL (Q-784).
 - **`sql_name` and `sql_param` take letters and digits of any script and the marks on
   them, at most 63 bytes on every database**: a name of 64 bytes is refused, as PostgreSQL
   keeps 63, and `sql_name("名前")` is `"名前"`. **`quillo check` follows `map` and `join`

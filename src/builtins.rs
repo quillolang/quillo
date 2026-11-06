@@ -955,6 +955,20 @@ fn escape_fn(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
 /// `url_encode(v)`: `v` as text for a URL, every byte but letters, digits
 /// and `-_.~` written `%XX`. A map gives a query string (`a=1&b=x%20y`),
 /// leaving out keys whose value is null. The browser's gives the same.
+/// The first error in `v`, itself or held in its lists and maps at any depth, in their order.
+fn first_error(v: &Value) -> Option<Value> {
+    let mut todo = vec![v];
+    while let Some(x) = todo.pop() {
+        match x {
+            Value::Err(..) => return Some(x.clone()),
+            Value::List(l) => todo.extend(l.iter().rev()),
+            Value::Map(m) => todo.extend(m.values().rev()),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn url_encode(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
     fn enc(s: &str, out: &mut String) {
         for b in s.bytes() {
@@ -966,11 +980,13 @@ fn url_encode(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
         }
     }
     let mut out = String::new();
+    // An error is given back, not its text in the URL, wherever it is: in a map's value, in a
+    // list there, a map in a list (FEEDBACK55.md, Q-784; branch feedback55; nested ones found
+    // later). The first, in order.
+    if let Some(e) = first_error(&arg(&args, 0)) {
+        return Ok(e);
+    }
     match arg(&args, 0) {
-        // An error is given back, not its text in the URL (FEEDBACK55.md, Q-784; branch
-        // feedback55).
-        e @ Value::Err(..) => return Ok(e),
-        Value::Map(m) if m.values().any(|v| matches!(v, Value::Err(..))) => return Ok(m.values().find(|v| matches!(v, Value::Err(..))).cloned().unwrap_or(Value::Nil)),
         Value::Map(m) => {
             for (k, v) in m.iter().filter(|(_, v)| !matches!(v, Value::Nil)) {
                 if !out.is_empty() {
@@ -2985,7 +3001,7 @@ fn round(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         // Fewer than no digits: to tens, hundreds, as a decimal has them; they were taken as 0
         // (FEEDBACK55.md, Q-789; branch feedback55).
         if d < 0 {
-            return Ok(Value::Float(round_left(x, d)));
+            return Ok(Value::Float(round_left(x, d, line)?));
         }
         let d = d.min(15) as i32;
         // From the float's shortest decimal, a tie away from zero, as `format_number` rounds:
@@ -3072,24 +3088,59 @@ fn round_int(n: i64, digits: i64, line: u32) -> R {
 }
 
 /// `round(x, digits)` of a float with `digits` below 0: to the nearest multiple of 10^-digits, a
-/// half away from zero, from its shortest decimal as `round` to places is; past a decimal's
-/// size, by floats (where 10^-digits is below the float's spacing it is `x`).
-pub(crate) fn round_left(x: f64, digits: i64) -> f64 {
-    let exact = (digits >= -28).then(|| crate::decimal::Dec::from_f64(x)).flatten();
-    if let Some(r) = exact.and_then(|v| v.round(digits as i32, crate::decimal::Rounding::HalfUp).ok()) {
-        return r.to_f64() + 0.0;
+/// half away from zero, from its shortest decimal as `round` to places is, worked out on those
+/// digits and made the float nearest to it: exact at every `digits`. Past a decimal's 28 digits it
+/// went through floats, and `round(1e30, -29)` was 999999999999999900000000000000 (the user's
+/// rule: a number is exact or an error; FEEDBACK55.md, Q-789; found writing the docs). Past the
+/// largest float, an error, as Python's.
+pub(crate) fn round_left(x: f64, digits: i64, line: u32) -> Result<f64, Ctrl> {
+    if !x.is_finite() || x == 0.0 {
+        return Ok(x + 0.0);
     }
-    if !x.is_finite() {
-        return x;
+    // x = 0.d1d2...dk × 10^n, its shortest digits.
+    let text = crate::value::shortest_e(x.abs());
+    let (mant, exp) = text.split_once('e').unwrap_or((&text, "0"));
+    let mut ds: Vec<u8> = mant.bytes().filter(|c| c.is_ascii_digit()).collect();
+    let n = exp.parse::<i128>().unwrap_or(0) + 1;
+    let m = digits.unsigned_abs() as i128;
+    let keep = n - m;
+    let kept: Vec<u8> = if keep < 0 {
+        return Ok(0.0);
+    } else if keep as usize >= ds.len() {
+        // A multiple of 10^m already.
+        return Ok(x);
+    } else {
+        let up = ds[keep as usize] >= b'5';
+        ds.truncate(keep as usize);
+        if up {
+            // One more in the last place kept, carried.
+            let mut i = ds.len();
+            loop {
+                if i == 0 {
+                    ds.insert(0, b'1');
+                    break;
+                }
+                i -= 1;
+                if ds[i] == b'9' {
+                    ds[i] = b'0';
+                } else {
+                    ds[i] += 1;
+                    break;
+                }
+            }
+        }
+        ds
+    };
+    if kept.is_empty() {
+        return Ok(0.0);
     }
-    // 10^n as the nearest float to it, as the browser reads "1e{n}": `powi` multiplies, and
-    // `round(1e300, -300)` was 1.0000000000000006e300 (found in review).
-    let p: f64 = format!("1e{}", digits.unsigned_abs().min(400)).parse().unwrap_or(f64::INFINITY);
-    if p.is_infinite() {
-        return 0.0;
+    // SAFETY: digits only.
+    let digits_text = unsafe { std::str::from_utf8_unchecked(&kept) };
+    let r: f64 = format!("{}e{}", digits_text, m).parse().unwrap_or(f64::INFINITY);
+    if r.is_infinite() {
+        return fail(line, "`round`: the rounded value is past the largest float");
     }
-    let r = (x / p).round() * p;
-    if r.is_finite() { r + 0.0 } else { x }
+    Ok(if x < 0.0 { -r } else { r } + 0.0)
 }
 
 /// An int, which `round`, `floor` and `ceil` give back as it is: past 2^53 it went through a

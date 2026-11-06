@@ -11032,7 +11032,8 @@ fn round_to_tens_past_a_decimal_is_the_same_on_both_sides() {
         "fn v2(x) = x",
         &[
             ("[round(1e300, -300) == 1e300, round(3e200, -200) == 3e200, round(1.5e100, -100) == 2e100, round(1e50, -50) == 1e50, round(7e45, -44) == 7e45, round(1e30, -30) == 1e30]", "[[\"bool\", \"bool\", \"bool\", \"bool\", \"bool\", \"bool\"], [true, true, true, true, true, true]]"),
-            ("[round(5e307, -308) == 1e308, round(4e307, -308), round(1e300, -309), round(1.7976931348623157e308, -308) == 1.7976931348623157e308, round(-1.5e100, -100) == -2e100, round(1e29, -29) == 1e29]", "[[\"bool\", \"float\", \"float\", \"bool\", \"bool\", \"bool\"], [true, 0, 0, true, true, true]]"),
+            // The largest float rounded past itself is an error now (slice 10's third round).
+            ("[round(5e307, -308) == 1e308, round(4e307, -308), round(1e300, -309), round(1.7976931348623157e308, -292) == 1.7976931348623157e308, round(-1.5e100, -100) == -2e100, round(1e29, -29) == 1e29]", "[[\"bool\", \"float\", \"float\", \"bool\", \"bool\", \"bool\"], [true, 0, 0, true, true, true]]"),
         ],
     );
 }
@@ -11780,3 +11781,46 @@ route GET / = <html><head><title>t</title></head><body><P data={{ "$p": { b: 1, 
 }
 
 // ---- end of slice 14's second review ----
+
+// ---- slice 10's third round ----
+
+// Found writing the docs (Q-784): `url_encode` gave back an error given to it, or a map's value
+// that is one, but wrote the text of one held deeper, in a list or a map in a list. The first
+// error, wherever it is held, is given back, on both sides; what holds none is encoded as before.
+#[test]
+fn url_encode_gives_back_an_error_held_at_any_depth() {
+    same_on_both(
+        "fn v2(x) = x",
+        &[
+            ("url_encode([err(\"e\")])", "[\"error\", err(\"e\")]"),
+            ("url_encode({ a: [err(\"e\")] })", "[\"error\", err(\"e\")]"),
+            ("url_encode({ a: [1, { b: [2, err(\"deep\")] }], c: err(\"later\") })", "[\"error\", err(\"deep\")]"),
+            ("url_encode([{ a: 1 }, [2, 3], { b: err(\"after good ones\") }])", "[\"error\", err(\"after good ones\")]"),
+            ("url_encode({ é: [[err(\"two deep\")]] })", "[\"error\", err(\"two deep\")]"),
+            ("[url_encode([]), url_encode({ a: [] }), url_encode({ a: [1, 2], b: { c: \"x y\" } }), url_encode([1, \"é\"])]", "[[\"str\", \"str\", \"str\", \"str\"], [\"%5B%5D\", \"a=%5B%5D\", \"a=%5B1%2C%202%5D&b=%7B%20c%3A%20%22x%20y%22%20%7D\", \"%5B1%2C%20%22%C3%A9%22%5D\"]]"),
+        ],
+    );
+}
+
+// The user's rule, a number exact or an error (Q-789, found writing the docs): `round(x, -d)` past
+// a decimal's 28 digits went through floats, and `round(1e30, -29)` was
+// 999999999999999900000000000000. It works on the float's shortest digits at every `d`, a half
+// away from zero, and gives the float nearest to that, on both sides; past the largest float, an
+// error, as Python's.
+#[test]
+fn round_to_tens_is_exact_at_every_place() {
+    same_on_both(
+        "fn v2(x) = x",
+        &[
+            ("[round(1e30, -29), round(1e30, -30), round(1e30, -31), round(1e30, -32), round(-1e30, -29)]", "[[\"float\", \"float\", \"float\", \"float\", \"float\"], [1000000000000000000000000000000, 1000000000000000000000000000000, 0, 0, -1000000000000000000000000000000]]"),
+            ("[round(1.5e100, -100) == 2e100, round(2.5e300, -300) == 3e300, round(-2.5e300, -300) == -3e300, round(1.4e100, -100) == 1e100, round(9.5e300, -300) == 1e301, round(1.2345678901234567e200, -190) == 1.2345678901e200, round(1.2345678905e200, -190) == 1.2345678905e200, round(1.23456789055e200, -190) == 1.2345678906e200]", "[[\"bool\", \"bool\", \"bool\", \"bool\", \"bool\", \"bool\", \"bool\", \"bool\"], [true, true, true, true, true, true, true, true]]"),
+            ("[round(5e-324, -1), round(-5e-324, -300), round(25.0, -1), round(-25.0, -1), round(15.0, -1), round(0.5, -1), round(5.0, -1), round(999.0, -1), round(-0.0, -2)]", "[[\"float\", \"float\", \"float\", \"float\", \"float\", \"float\", \"float\", \"float\", \"float\"], [0, 0, 30, -30, 20, 0, 10, 1000, 0]]"),
+            ("[round(1.7976931348623157e308, -292) == 1.7976931348623157e308, round(1.7976931348623157e308, -309), round(8.9e307, -308) == 1e308, round(1234.5678, -9007199254740993)]", "[[\"bool\", \"float\", \"bool\", \"float\"], [true, 0, true, 0]]"),
+            ("round(1.7976931348623157e308, -308)", "ERROR: `round`: the rounded value is past the largest float"),
+            ("round(v2(-1.7976931348623157e308), -307)", "ERROR: `round`: the rounded value is past the largest float"),
+            ("[round(math.inf, -2), round(1e16, -1) == 1e16, round(123456789012345678.0, 3) == 123456789012345678.0, round(1234.5678, -2), round(1255.0, -1)]", "[[\"float\", \"bool\", \"bool\", \"float\", \"float\"], [inf, true, true, 1200, 1260]]"),
+        ],
+    );
+}
+
+// ---- end of slice 10's third round ----

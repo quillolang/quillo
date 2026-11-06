@@ -2317,9 +2317,21 @@ B.escape = meta((v) => escText(display(v)), "escape", null);
 const urlPart = (s) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
 // An error is given back, not its text in the URL (FEEDBACK55.md, Q-784; branch feedback55). In
 // the order set (FEEDBACK55.md, Q-875; branch feedback55).
-B.url_encode = meta((v) => v instanceof Err ? v : isMap(v)
-  ? mkeys(v).map((k) => v[k]).find((x) => x instanceof Err) || mkeys(v).filter((k) => !isNil(v[k])).map((k) => urlPart(k) + "=" + urlPart(display(v[k]))).join("&")
-  : urlPart(display(v)), "url_encode", null);
+B.url_encode = meta((v) => firstErr(v) || (isMap(v)
+  ? mkeys(v).filter((k) => !isNil(v[k])).map((k) => urlPart(k) + "=" + urlPart(display(v[k]))).join("&")
+  : urlPart(display(v))), "url_encode", null);
+// The first error in `v`, itself or held in its lists and maps at any depth, in their order, as
+// the server's `first_error`: `url_encode` gives it back (FEEDBACK55.md, Q-784; branch feedback55).
+function firstErr(v) {
+  const todo = [v];
+  while (todo.length) {
+    const x = todo.pop();
+    if (x instanceof Err) return x;
+    if (Array.isArray(x)) for (let i = x.length - 1; i >= 0; i--) todo.push(x[i]);
+    else if (isMap(x) && !foreign(x)) { const ks = mkeys(x); for (let i = ks.length - 1; i >= 0; i--) todo.push(x[ks[i]]); }
+  }
+  return null;
+}
 B.now = meta(() => Date.now(), "now", null);
 B.random = meta(() => fl(Math.random()), "random", null);
 B.random_int = meta((lo, hi) => {
@@ -2375,16 +2387,23 @@ function roundInt(n, d) {
   const p = 10n ** BigInt(Math.min(-d, 20)), m = BigInt(n), q = ((m < 0n ? -m : m) + p / 2n) / p * p;
   return bigChecked(m < 0n ? -q : q);
 }
+// The server's `round_left`: on the float's shortest digits, a half away from zero, made the float
+// nearest to it, at every `d`; past the largest float, an error (FEEDBACK55.md, Q-789; found
+// writing the docs: past 28 digits it went through floats).
 function roundLeft(x, d) {
-  const dd = d >= -28 ? decFromFloat(x) : null;
-  if (dd !== null) {
-    try { return Number(decText(decRound(dd, d, "half_up"))) + 0; } catch (e) { if (!(e instanceof QuilloError)) throw e; }
-  }
-  if (!Number.isFinite(x)) return x;
-  const p = Number("1e" + Math.min(-d, 400));
-  if (!Number.isFinite(p)) return 0;
-  const r = roundHalf(x / p) * p;
-  return Number.isFinite(r) ? r + 0 : x;
+  if (!Number.isFinite(x) || x === 0) return x + 0;
+  const [mant, exp] = Math.abs(x).toExponential().split("e");
+  let ds = mant.replace(".", "");
+  const keep = Number(exp) + 1 + d;
+  if (keep < 0) return 0;
+  if (keep >= ds.length) return x;
+  const up = ds.charCodeAt(keep) >= 53;
+  ds = ds.slice(0, keep);
+  if (up) ds = keep === 0 ? "1" : String(BigInt(ds) + 1n);
+  if (ds === "") return 0;
+  const r = Number(ds + "e" + -d);
+  if (!Number.isFinite(r)) fail("`round`: the rounded value is past the largest float");
+  return (x < 0 ? -r : r) + 0;
 }
 B.floor = divides(meta((x) => x instanceof Dec ? decRound(x, 0, "floor") : isWhole(x) ? x : intOrFloat(Math.floor(N(x, "floor"))), "floor", null), "floor");
 B.ceil = divides(meta((x) => x instanceof Dec ? decRound(x, 0, "ceiling") : isWhole(x) ? x : intOrFloat(Math.ceil(N(x, "ceil"))), "ceil", null), "ceil");
