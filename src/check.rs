@@ -1539,14 +1539,17 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
     let parsed = parser.parse_program();
     let parse_failed = parsed.is_err();
     c.plain_dollars.extend(parser.plain_dollars().into_iter().map(|(text, n)| (file.to_string(), text, n)));
-    match parsed.map(Arc::new).and_then(|stmts| c.link(stmts, src, file, base_dir)) {
+    // `use` paths count from the folder of the file a main file that is a link leads to; the
+    // rest from the folder given (FEEDBACK55.md, Q-817; branch feedback55).
+    let src_dir = crate::modules::source_dir_or(Path::new(file), base_dir);
+    match parsed.map(Arc::new).and_then(|stmts| c.link(stmts, src, file, &src_dir)) {
         Ok(stmts) => {
             let mut seen = HashSet::new();
             if let Ok(p) = Path::new(file).canonicalize() {
                 seen.insert(p);
             }
             let mut order = Vec::new();
-            c.expand(stmts, main, base_dir, &mut seen, &mut order);
+            c.expand(stmts, main, &src_dir, &mut seen, &mut order);
             c.out.classes = class_rules(&order, base_dir);
             for it in &order {
                 if !c.out.files.iter().any(|f| **f == *it.file) {
@@ -1680,6 +1683,8 @@ struct Item {
 struct Checker {
     /// Names an import line could not take, said there and not again where used (Q-523).
     failed_imports: HashSet<(PathBuf, String)>,
+    /// The files that take a file whole that could not be read (FEEDBACK55.md, Q-819).
+    failed_whole: HashSet<PathBuf>,
     /// Top-level functions and `let` lambdas, by name (Q-514).
     bodies: HashMap<String, Arc<FnDef>>,
     /// The route's path parameters with no type, while its body is checked (Q-513).
@@ -1883,6 +1888,7 @@ impl Checker {
             path_params: Vec::new(),
             bodies: HashMap::new(),
             failed_imports: HashSet::new(),
+            failed_whole: HashSet::new(),
             confined: false,
             root: PathBuf::new(),
             uses: 0,
@@ -1980,15 +1986,18 @@ impl Checker {
         // Said at the import line, by the path the program wrote, and once: the name it could
         // not take is not said again where it is used (FEEDBACK45.md, Q-523).
         let main_key = Path::new(file).canonicalize().ok();
+        // A used file by the path the program writes, as every other message names it, not the
+        // machine's (FEEDBACK55.md, Q-822; branch feedback55).
+        let shown_file = |links: &crate::modules::Links, f: &Path| if f.canonicalize().ok() == main_key { file.to_string() } else { base.join(links.written(f)).display().to_string() };
         for p in std::mem::take(&mut self.links.problems) {
-            let shown = if p.file.canonicalize().ok() == main_key { file.to_string() } else { p.file.display().to_string() };
+            let shown = shown_file(&self.links, &p.file);
             if let Some(n) = &p.name {
                 self.failed_imports.insert((p.file.clone(), n.clone()));
             }
             self.diag_at(Arc::from(shown), p.line, Severity::Error, p.message);
         }
         for p in std::mem::take(&mut self.links.repeats) {
-            let shown = if p.file.canonicalize().ok() == main_key { file.to_string() } else { p.file.display().to_string() };
+            let shown = shown_file(&self.links, &p.file);
             self.diag_at(Arc::from(shown), p.line, Severity::Warning, p.message);
         }
         match self.renames_for(&crate::modules::key(Path::new(file)), src) {
@@ -2015,7 +2024,19 @@ impl Checker {
 
     /// Lists statements in the order the top level runs them, following `use`.
     fn expand(&mut self, stmts: Arc<Vec<Stmt>>, file: Arc<str>, base: &Path, seen: &mut HashSet<PathBuf>, order: &mut Vec<Item>) {
-        for s in stmts.iter() {
+        for (i, s) in stmts.iter().enumerate() {
+            // A `return` at a file's top level leaves the file there when it runs: what follows is
+            // never defined, so it is not here either, and its first line says so. `check` took
+            // a `fn` after it as defined, and the program did not start (FEEDBACK55.md, Q-818;
+            // branch feedback55).
+            if let Stmt::Return(_, at) = s {
+                if let Some(next) = stmts[i + 1..].iter().find_map(top_line) {
+                    self.diag_at(file.clone(), next, Severity::Warning, format!(
+                        "this never runs: the `return` at line {} leaves the file first, so nothing below it is defined", at));
+                }
+                order.push(Item { stmt: s.clone(), file: file.clone() });
+                break;
+            }
             if let Stmt::Service(name, prefix, path, _, line) = s {
                 self.everywhere.insert(name.clone());
                 let Some(full) = self.file_at(base, path, &file, *line, false) else { continue };
@@ -2091,7 +2112,7 @@ impl Checker {
             // The file comes first now (FEEDBACK19.md, Q-156; branch feedback19-fixes).
             if let Stmt::Use(path, names, line, options) = s {
                 if options.old {
-                    let r = crate::modules::Respell::new(&file, *line, &crate::modules::resolve_from(base, Path::new(&*file), path), names.as_deref(), options);
+                    let r = crate::modules::Respell::new(&file, *line, &crate::modules::resolve_use(base, Path::new(&*file), path, options.implied), names.as_deref(), options);
                     self.diag_at(file.clone(), *line, Severity::Warning, format!("write this as `{} use {}` (`quillo fix` does)", r.head, r.names));
                     self.out.respell.push(r);
                 }
@@ -2099,12 +2120,19 @@ impl Checker {
             if let (Stmt::Use(path, Some(names), line, _), true) = (s, crate::ast::is_script(match s { Stmt::Use(p, ..) => p, _ => "" })) {
                 for (global, name) in names {
                     let src = if global == name { path.clone() } else { format!("{} ({})", path, global) };
+                    // A page has one of each name: from two scripts, the last was every file's, with
+                    // no word, where two `.qwe` files' are an error (FEEDBACK55.md, Q-808; branch
+                    // feedback55).
+                    if let Some((_, other, f, l)) = self.js_libs.iter().find(|(n, o, ..)| n == name && *o != src) {
+                        let msg = format!("`{}` is taken from {} at {}, and here from {}: a page has one `{}`, so take one of them under another name (`use {} as ...`)", name, other, self.shown_at(f, *l), src, name, global);
+                        self.diag_at(file.clone(), *line, Severity::Error, msg);
+                    }
                     self.js_libs.push((name.clone(), src, file.clone(), *line));
                     self.scripts.entry(name.clone()).or_insert((file.clone(), *line));
                 }
                 continue;
             }
-            if let Stmt::Use(path, names, line, _) = s {
+            if let Stmt::Use(path, names, line, options) = s {
                 // `import lib/m.qwe use price as print`: a builtin replaced everywhere, as a
                 // `fn print` would be, which is warned of (FEEDBACK45.md, Q-507; branch
                 // feedback40-43). A plugin's is said at its own line, below.
@@ -2116,11 +2144,34 @@ impl Checker {
                         }
                     }
                 }
-                let path = &crate::modules::resolve_from(base, Path::new(&*file), path);
+                // A path without its extension that two files could be: said, as the program
+                // says it (FEEDBACK55.md, Q-819; branch feedback55).
+                if options.implied {
+                    let could = crate::modules::implied_files(base, Path::new(&*file), path);
+                    if could.len() > 1 {
+                        for (_, alias) in names.iter().flatten() {
+                            let k = self.key_of(&file);
+                            self.failed_imports.insert((k, alias.clone()));
+                        }
+                        if names.is_none() {
+                            let k = self.key_of(&file);
+                            self.failed_whole.insert(k);
+                        }
+                        self.diag_at(file.clone(), *line, Severity::Error, crate::modules::two_files(&could));
+                        continue;
+                    }
+                }
+                let path = &crate::modules::resolve_use(base, Path::new(&*file), path, options.implied);
                 let Some(full) = self.file_at(base, path, &file, *line, true) else { continue };
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
-                // A `.qwer` file's names are taken by each `use` that names some (branch imports).
-                if !seen.insert(key.clone()) && (names.is_none() || !crate::native::is_rust(&path)) {
+                // A `.qwer` file's names are taken by each `use` that names some (branch imports),
+                // by each file whose names for them are its own, and by the first that takes them
+                // all, after one that took some (Q-816), as the program defines them.
+                let file_key = self.key_of(&file);
+                let renames = self.links.rust_names(&file_key).cloned();
+                let first = seen.insert(key.clone());
+                let again = if crate::native::is_rust(path) { names.is_none() && renames.is_none() && !seen.insert(key.join("\0whole")) } else { !first };
+                if again {
                     continue;
                 }
                 let fname: Arc<str> = Arc::from(full.display().to_string());
@@ -2150,21 +2201,33 @@ impl Checker {
                                     None => vec![e.name.clone()],
                                 };
                                 for alias in taken {
+                                    // The file's own name for it: another file's of the same spelling is
+                                    // another name (FEEDBACK55.md, Q-816; branch feedback55).
+                                    let alias = match renames.as_ref().and_then(|m| m.get(&alias)) {
+                                        Some(Some(other)) => other.clone(),
+                                        // Of a file taken whole, another of that name, the file's
+                                        // or taken by name, wins.
+                                        Some(None) if names.is_none() => continue,
+                                        _ => alias,
+                                    };
+                                    // How to take it under a name that parses: the export's name, after
+                                    // the file's (Q-816).
+                                    let other_name = crate::native::other_name(&short, &e.name);
                                     // A plugin's function replaces a builtin as a program's would, and its
                                     // user cannot see it: said at the `.qwer` file's line (FEEDBACK27.md,
                                     // Q-326; branch feedback27-35-fixes).
                                     if self.globals.get(&alias).is_some_and(|g| &*g.file == "<builtin>") {
                                         self.diag_at(fname.clone(), e.line, Severity::Warning, format!(
-                                            "`{}` hides the builtin `{}`: the plugin's is used everywhere in the program, so rename it, or take it under another name: import {} use {} as {}_{}",
-                                            alias, alias, path, alias, short.trim_end_matches(".qwer"), alias));
+                                            "`{}` hides the builtin `{}`: the plugin's is used everywhere in the program, so rename it, or take it under another name: import {} use {} as {}",
+                                            alias, alias, path, e.name, other_name));
                                     }
-                                    // One name from two plugins: the last `use`d wins, so say so,
-                                    // and how to keep both (branch imports).
+                                    // One name from two plugins in one file: the last `use`d wins, so say
+                                    // so, and how to keep both (branch imports).
                                     if let Some((other, _)) = self.natives.iter().find(|(f, x)| *f != fname && x.name == alias) {
                                         let other = std::path::Path::new(&**other).file_name().map_or(String::new(), |f| f.to_string_lossy().to_string());
                                         self.diag_at(file.clone(), *line, Severity::Warning, format!(
-                                            "`{}` comes from {} and {}: this one replaces the other; take one under another name: import {} use {} as {}_{}",
-                                            alias, other, short, path, alias, short.trim_end_matches(".qwer"), alias));
+                                            "`{}` comes from {} and {}: this one replaces the other; take one under another name: import {} use {} as {}",
+                                            crate::privacy::demangle(&alias), other, short, path, e.name, other_name));
                                     }
                                     if !self.natives.iter().any(|(f, x)| *f == fname && x.name == alias) {
                                         self.natives.push((fname.clone(), crate::native::Export { name: alias, ..e.clone() }));
@@ -2172,12 +2235,14 @@ impl Checker {
                                 }
                             }
                         }
-                        Err(e) => self.diag_at(file.clone(), *line, Severity::Error, format!("cannot read {}: {}", full.display(), e)),
+                        Err(e) => self.missing_file(&file, *line, path, &full, names.as_deref(), e),
                     }
                     continue;
                 }
+                // Only a chain gets here: a file used again is not read again, so no cycle does
+                // (FEEDBACK55.md, Q-822; branch feedback55).
                 if self.uses >= MAX_USES {
-                    self.diag_at(file.clone(), *line, Severity::Error, format!("files `use` each other more than {} deep", MAX_USES));
+                    self.diag_at(file.clone(), *line, Severity::Error, format!("this `use` is the end of a chain of files more than {} deep, each used by the one before, which is as far as files are followed: take some of them from one file", MAX_USES));
                     continue;
                 }
                 match text {
@@ -2201,27 +2266,42 @@ impl Checker {
                             self.diag_at(fname, e.line, Severity::Error, e.msg)
                         }
                     },
-                    Err(e) => {
-                        // Its names are not said again as unknown, and a file near it is offered
-                        // (FEEDBACK45.md, Q-523; branch feedback40-43).
-                        for (_, alias) in names.iter().flatten() {
-                            let k = self.key_of(&file);
-                            self.failed_imports.insert((k, alias.clone()));
-                        }
-                        let near = full.parent().and_then(|d| std::fs::read_dir(d).ok()).and_then(|entries| {
-                            let names: Vec<String> = entries.flatten().map(|en| en.file_name().to_string_lossy().to_string()).filter(|n| n.ends_with(".qwe")).collect();
-                            let want = full.file_name()?.to_string_lossy().to_string();
-                            closest(&want, names.iter().map(|n| n.as_str()))
-                        });
-                        let shown = path.trim_start_matches("./");
-                        let hint = near.map_or(String::new(), |n| format!(" (did you mean {}?)", Path::new(shown).with_file_name(n).display()));
-                        self.diag_at(file.clone(), *line, Severity::Error, format!("cannot read {}: {}{}", shown, e, hint));
-                    }
+                    Err(e) => self.missing_file(&file, *line, path, &full, names.as_deref(), e),
                 }
                 continue;
             }
             order.push(Item { stmt: s.clone(), file: file.clone() });
         }
+    }
+
+    /// A file a `use` names that cannot be read: said once, at the import line, with a file near
+    /// it, and its names not said again as unknown (FEEDBACK45.md, Q-523; branch feedback40-43).
+    /// For every form: a file taken whole, whose names are not known, and a Rust one, where
+    /// only `import x.qwe use name` was, and a near file of any of the program's kinds
+    /// (FEEDBACK55.md, Q-819; branch feedback55).
+    fn missing_file(&mut self, file: &Arc<str>, line: u32, path: &str, full: &Path, names: Option<&[(String, String)]>, e: std::io::Error) {
+        let k = self.key_of(file);
+        match names {
+            Some(list) => {
+                for (_, alias) in list {
+                    self.failed_imports.insert((k.clone(), alias.clone()));
+                }
+            }
+            None => {
+                self.failed_whole.insert(k);
+            }
+        }
+        let want = full.file_name().map_or(String::new(), |f| f.to_string_lossy().to_string());
+        let near = full.parent().and_then(|d| std::fs::read_dir(d).ok()).and_then(|entries| {
+            let kinds = |n: &str| crate::native::ends_with_any_case(n, ".qwe") || crate::native::is_rust(n);
+            let names: Vec<String> = entries.flatten().map(|en| en.file_name().to_string_lossy().to_string()).filter(|n| kinds(n)).collect();
+            // The same name of another kind first: `helpers.rs` for `helpers.qwe`.
+            let stem = |n: &str| n.rsplit_once('.').map_or(n.to_string(), |(s, _)| s.to_string());
+            names.iter().find(|n| stem(n) == stem(&want) && **n != want).cloned().or_else(|| closest(&want, names.iter().map(|n| n.as_str())))
+        });
+        let shown = path.trim_start_matches("./");
+        let hint = near.map_or(String::new(), |n| format!(" (did you mean {}?)", Path::new(shown).with_file_name(n).display()));
+        self.diag_at(file.clone(), line, Severity::Error, format!("cannot read {}: {}{}", shown, e, hint));
     }
 
     /// `lib/a.qwe:1`: a place in the program, from the main file's folder.
@@ -2700,10 +2780,13 @@ impl Checker {
             self.error(format!("`{}` comes from {}: take the one you mean: import {} use {}", name, shown.join(" and "), shown[0], name));
             return;
         }
-        if self.links.sees(&file, &from, name) || !self.told.insert((self.file.clone(), name.to_string())) {
+        // A browser name is taken by a file's own `client` line: a file taken whole does not pass
+        // its on, as it passes no name it takes (FEEDBACK55.md, Q-822; branch feedback55).
+        let script = self.scripts.get(name).cloned();
+        let sees = if script.is_some() { self.links.took(&file, name) } else { self.links.sees(&file, &from, name) };
+        if sees || !self.told.insert((self.file.clone(), name.to_string())) {
             return;
         }
-        let script = self.scripts.get(name).cloned();
         let shown = crate::privacy::demangle(name);
         let at = self.links.written(&from);
         self.warn(match script {
@@ -2743,7 +2826,9 @@ impl Checker {
         let mut written: HashMap<String, HashMap<String, String>> = HashMap::new();
         for file in self.out.files.clone() {
             let Some(names) = links.renames(&crate::modules::key(Path::new(&file))) else { continue };
-            let mut names: Vec<(&String, &String)> = names.iter().collect();
+            // What annotations' types are called is no name an editor shows (FEEDBACK55.md,
+            // Q-821; branch feedback55).
+            let mut names: Vec<(&String, &String)> = names.iter().filter(|(n, _)| !n.starts_with(crate::privacy::TYPE_ALIAS)).collect();
             names.sort();
             for (name, inner) in names.iter().rev() {
                 written.entry(file.clone()).or_default().insert(inner.to_string(), name.to_string());
@@ -2890,11 +2975,12 @@ impl Checker {
     /// A name this file's import line could not take, said there (Q-523): by file, as
     /// another file's own unknown name of that spelling is still said (found in review).
     fn failed_import(&mut self, name: &str) -> bool {
-        if self.failed_imports.is_empty() {
+        if self.failed_imports.is_empty() && self.failed_whole.is_empty() {
             return false;
         }
         let k = self.key_of(&self.file.clone());
-        self.failed_imports.contains(&(k, name.to_string()))
+        // A file taken whole that is not there may have had any name (Q-819).
+        self.failed_whole.contains(&k) || self.failed_imports.contains(&(k, name.to_string()))
     }
 
     /// `a` where the program has `а`, a Cyrillic letter: the same to the eye, another name
@@ -5896,7 +5982,7 @@ impl Checker {
         };
         let needs = if sig.builtin { sig.effects.unwrap_or(0) } else { sig.effects.unwrap_or(0) };
         if needs & !allowed != 0 && needs == ALL_EFFECTS && sig.native.is_some() {
-            let msg = crate::native::undeclared(name, restrictor.as_ref().map(|(f, _)| f.as_str()));
+            let msg = crate::native::undeclared(name, sig.native.as_deref().unwrap_or(""), restrictor.as_ref().map(|(f, _)| f.as_str()));
             self.error(msg);
         } else if needs & !allowed != 0 {
             self.effect_error(name, needs & !allowed, restrictor.as_ref());
@@ -6509,6 +6595,26 @@ fn reparsed(src: &str, names: &HashMap<String, String>) -> Result<Vec<Stmt>, cra
     let mut stmts = Parser::new(src).parse_program()?;
     crate::privacy::rename_as(&mut stmts, names, "a name another file has too")?;
     Ok(stmts)
+}
+
+/// `alias` as a name a type can have: `P` and `PT` are `Pt` (Q-821).
+pub(crate) fn type_like(alias: &str) -> String {
+    let mut cs = alias.chars();
+    let first = cs.next().map_or('T', |c| c.to_ascii_uppercase());
+    let rest: String = cs.map(|c| c.to_ascii_lowercase()).collect();
+    if rest.chars().any(|c| c.is_ascii_lowercase()) { format!("{}{}", first, rest) } else { format!("{}{}t", first, rest) }
+}
+
+/// The line a top-level statement starts on, when the parser recorded one (Q-818).
+fn top_line(s: &Stmt) -> Option<u32> {
+    let l = match s {
+        Stmt::Fn(d) => d.line,
+        Stmt::Route(r) => r.line,
+        Stmt::Type(t) => t.line,
+        Stmt::Return(_, l) | Stmt::Mount(_, _, l) | Stmt::Service(_, _, _, _, l) => *l,
+        s => crate::debug::stmt_line(s).unwrap_or(0),
+    };
+    (l > 0).then_some(l)
 }
 
 /// Where a value is used as true or false.

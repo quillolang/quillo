@@ -611,6 +611,9 @@ pub struct LibOptions {
     /// Written as 0.6 did, `use names from file`, which `quillo fix` turns around
     /// (FEEDBACK19.md, Q-156; branch feedback19-fixes).
     pub old: bool,
+    /// Its path was written without an extension, which the parser gave it: the file is the
+    /// `.qwe`, `.qwer` or `.rs` one there (FEEDBACK55.md, Q-819; branch feedback55).
+    pub implied: bool,
 }
 
 /// Whether a script says by its name that it is an ES module (branch library-hints).

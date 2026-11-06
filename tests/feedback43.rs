@@ -129,7 +129,7 @@ route GET /time = str(time_only())
     assert_eq!(
         said,
         [
-            "3 `store_put` is Rust whose file does not say what it does, so it may do anything and is refused in `pure_time`, whose `with` limits what it may do: put `//! effects: ...` (or `//! effects: none`) at the top of its .qwer file",
+            "3 `store_put` is Rust whose file does not say what it does, so it may do anything and is refused in `pure_time`, whose `with` limits what it may do: put `//! effects: ...` (or `//! effects: none`) at the top of store.qwer",
             "5 `put2` needs the fs effect, but `time_only` is declared `with time`",
         ]
     );

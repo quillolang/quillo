@@ -1044,6 +1044,12 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     if let (Err(_), false) = (&checked, o.watch) {
         return Err(1);
     }
+    // A service the app started apart: the app's folder (Q-807).
+    if o.as_service {
+        if let Some(dir) = std::env::var_os(quillo::privacy::ROOT_ENV).filter(|d| !d.is_empty()) {
+            quillo::privacy::set_root(Path::new(&dir));
+        }
+    }
     let mut interp = Interp::new(base);
     let shared = interp.shared.clone();
     shared.service_urls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(o.service_urls.iter().cloned());
@@ -1415,6 +1421,11 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
             if !o.checked && !o.watch {
                 return 1;
             }
+        }
+        // The services' processes count their private names' tags from the app's folder, as
+        // they do in its process (FEEDBACK55.md, Q-807; branch feedback55).
+        if let Some(dir) = path.canonicalize().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+            std::env::set_var(quillo::privacy::ROOT_ENV, dir);
         }
         match quillo::service::split(path, o.watch, o.reload, o.static_check, o.checked, &o.scale, &app_url) {
             Ok(s) => Some(s),

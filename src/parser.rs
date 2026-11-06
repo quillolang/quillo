@@ -26,7 +26,7 @@ fn key_not_a_param(def: &FnDef) -> PResult<()> {
 pub const TYPE_NAMES: &[&str] = &["int", "float", "dec", "num", "str", "date", "money", "bool", "list", "map", "html", "fn", "any", "response"];
 pub const VOID_TAGS: &[&str] =
     &["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"];
-const KEYWORDS: &[&str] = &[
+pub(crate) const KEYWORDS: &[&str] = &[
     "let", "fn", "view", "route", "use", "return", "if", "then", "else", "match", "for", "in", "and", "or", "not",
     "true", "false", "null", "nil", "reply", "as", "component", "while",
 ];
@@ -86,6 +86,8 @@ pub struct Parser {
     /// branch public-private), and what their new names end in.
     privates: std::collections::HashSet<String>,
     privacy_tag: String,
+    /// The last `use` path read had its extension given here (`LibOptions::implied`).
+    implied_ext: bool,
 }
 
 /// An element whose end tag has not been read yet.
@@ -253,7 +255,7 @@ impl Parser {
 
     pub fn with_line(src: &str, line: u32) -> Self {
         Parser { lx: Lexer::new(src, line), peeked: None, in_typedef: false, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None, styling: None, file_style: None, file_styles: 0, components: 0, callers_ok: false, callers: None, view_next: false, open: Vec::new(), unclosed_at_end: None, top: false, more: Vec::new(),
-                 privates: Default::default(), privacy_tag: crate::privacy::tag(None, src) }
+                 privates: Default::default(), privacy_tag: crate::privacy::tag(None, src), implied_ext: false }
     }
 
     /// Records `file` on the functions and routes parsed (see `FnDef::file`).
@@ -420,7 +422,9 @@ impl Parser {
         if at(n) == Some('"') {
             n += 1;
             while !matches!(at(n), None | Some('"' | '\n')) {
-                n += 1;
+                // `"x\".js"`: an escaped quote is in the path (FEEDBACK55.md, Q-822; branch
+                // feedback55).
+                n += if at(n) == Some('\\') && at(n + 1).is_some_and(|c| c != '\n') { 2 } else { 1 };
             }
             n += 1;
         } else {
@@ -463,6 +467,7 @@ impl Parser {
     /// `../shared/auth`, `lib\\auth`, a backslash read as `/`). Without an extension it
     /// is a `.qwe` file, or a `.qwer` one when the `use` takes names (branch imports).
     fn use_path(&mut self, names: bool, line: u32) -> PResult<String> {
+        self.implied_ext = false;
         let quoted = self.peeked.is_some() || {
             self.lx.skip_spaces();
             self.lx.peek_char() == Some('"')
@@ -486,8 +491,10 @@ impl Parser {
             return Err(QuilloError::new("`use` expects a file: use lib/auth.qwe", line));
         }
         self.lx.last = Some(Tok::RParen);
-        if !p.ends_with(".qwe") && !crate::native::is_rust(&p) && !crate::ast::is_script(&p) {
+        // `.QWE` is `.qwe`: it became `Lib.QWE.qwe` (FEEDBACK55.md, Q-820; branch feedback55).
+        if !crate::native::ends_with_any_case(&p, ".qwe") && !crate::native::is_rust(&p) && !crate::ast::is_script(&p) {
             p.push_str(if names { ".qwer" } else { ".qwe" });
+            self.implied_ext = true;
         }
         Ok(p)
     }
@@ -582,14 +589,21 @@ impl Parser {
                 "`import` is for Quillo and Rust files; what runs in the browser starts with `client`, `preload` or `preconnect`: client \"{}\" use ...", path), line));
         }
         if word != "import" && !crate::ast::is_script(&path) {
+            // Only a Quillo or Rust file is said to be one: `javascript:...` was told it is
+            // Quillo (FEEDBACK55.md, Q-822; branch feedback55).
+            if !crate::native::ends_with_any_case(&path, ".qwe") && !crate::native::is_rust(&path) {
+                return Err(QuilloError::new(format!(
+                    "`{}` is for what runs in the browser, a .js or .mjs file or an http(s) address, and `{}` is neither", word, path), line));
+            }
             return Err(QuilloError::new(format!(
                 "`{}` is for what runs in the browser, a .js or .mjs file or an address; {} is Quillo: import {} use ...", word, path, path), line));
         }
-        self.use_stmt(path, names, line, LibOptions { module, hint, old: false })
+        self.use_stmt(path, names, line, LibOptions { module, hint, old: false, implied: false })
     }
 
     /// What every way of taking from a file must agree with, however it was written.
     fn use_stmt(&mut self, path: String, names: Option<Vec<(String, String)>>, line: u32, mut options: LibOptions) -> PResult<Stmt> {
+        options.implied = std::mem::take(&mut self.implied_ext);
         if let Some(why) = crate::ast::bad_use_path(&path) {
             return Err(QuilloError::new(why, line));
         }
@@ -1181,7 +1195,8 @@ impl Parser {
                         };
                         let mut words = rest.splitn(2, char::is_whitespace);
                         let file = format!("{}{}", module, words.next().unwrap_or(""));
-                        let names = words.next().map(str::trim).filter(|n| !n.is_empty()).unwrap_or("...");
+                        // Its `use` there already is not written twice (Q-822).
+                        let names = words.next().map(str::trim).map(|n| n.strip_prefix("use").filter(|r| r.is_empty() || r.starts_with(char::is_whitespace)).map_or(n, str::trim)).filter(|n| !n.is_empty()).unwrap_or("...");
                         return Err(QuilloError::new(format!("`{}` takes names from a file, and says which after `use`: {} {} use {}", w, w, file, names), line));
                     }
                 }

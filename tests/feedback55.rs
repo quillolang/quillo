@@ -1955,6 +1955,875 @@ true [\"float\"] -0.0 999999999999999900000
 
 // ---- end of slice 9 ----
 
+// ---- slice 11: files of a program, plugins, native Rust (Q-807 to Q-822) ----
+
+/// A fresh folder with `files` in it (paths with folders made), for slice 11.
+fn s11_dir(name: &str, files: &[(&str, &str)]) -> PathBuf {
+    let d = support::temp_dir(&format!("feedback55-s11-{}", name));
+    for (f, text) in files {
+        let p = d.join(f);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+    d
+}
+
+/// `quillo args` run in `cwd`, under a deadline a plugin's first build fits in: whether it
+/// passed, and what it printed, stdout then stderr.
+fn s11_quillo(cwd: &Path, args: &[&str]) -> (bool, String, String) {
+    use std::io::Read;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .args(args)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Read as it runs: a failed build says a lot, and a full pipe would hold it up.
+    let (mut o, mut e) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let out = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = o.read_to_string(&mut s);
+        s
+    });
+    let err = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = e.read_to_string(&mut s);
+        s
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("quillo {:?} did not end", args);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    (status.success(), out.join().unwrap(), err.join().unwrap())
+}
+
+/// `quillo check file` in `cwd`: whether it passed, what it said (its lines, then its summary),
+/// and its lines alone.
+fn s11_check(cwd: &Path, file: &str) -> (bool, String, String) {
+    let (ok, out, err) = s11_quillo(cwd, &["check", file]);
+    (ok, err.clone() + &out, err)
+}
+
+/// Whether there is a Rust to build plugins with.
+fn s11_cargo() -> bool {
+    Command::new("cargo").arg("--version").output().is_ok_and(|o| o.status.success())
+}
+
+/// The eight hex digits privacy.rs gives a file by its path: FNV-1a.
+fn s11_fnv(key: &str) -> String {
+    let mut h: u32 = 0x811c9dc5;
+    for b in key.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    format!("{:08x}", h)
+}
+
+// Q-807: a private function's tag came from its path as seen from the folder the program was
+// started in, so copies started from two folders each ran a `schedule` job of one. Now it is
+// its path from the program's folder: the same from any folder, the same as before from the
+// program's own, and a file outside that folder by its way from there.
+#[test]
+fn a_private_names_tag_is_the_same_from_any_folder() {
+    let root = s11_dir("q807", &[
+        ("prögram-ü/lib/t.qwe", "private fn tick() = 1\nfn name_of() = str(tick)\n"),
+        ("prögram-ü/lib/a.qwe", "fn helper() = 1\nfn a_of() = str(helper)\n"),
+        ("prögram-ü/lib/b.qwe", "fn helper() = 2\nfn b_of() = str(helper)\n"),
+        ("shared/s.qwe", "private fn far() = 1\nfn far_of() = str(far)\n"),
+        ("prögram-ü/main.qwe", "private fn mine() = 1\nuse lib/t.qwe\nimport lib/a.qwe use a_of\nimport lib/b.qwe use b_of\nuse ../shared/s.qwe\nprint(name_of(), a_of(), b_of(), far_of(), str(mine))\n"),
+    ]);
+    let prog = root.join("prögram-ü");
+    let want = format!(
+        "<fn tick__pv{}> <fn helper__pv{}> <fn helper__pv{}> <fn far__pv{}> <fn mine__pv{}>\n",
+        s11_fnv("lib/t.qwe"),
+        s11_fnv("lib/a.qwe"),
+        s11_fnv("lib/b.qwe"),
+        s11_fnv("../shared/s.qwe"),
+        s11_fnv("main.qwe")
+    );
+    let main = prog.join("main.qwe").display().to_string();
+    // From its folder, its parent, a folder inside it, and one elsewhere.
+    for (cwd, file) in [(prog.clone(), "main.qwe".to_string()), (root.clone(), "prögram-ü/main.qwe".to_string()), (prog.join("lib"), "../main.qwe".to_string()), (std::env::temp_dir(), main.clone())] {
+        let (ok, out, err) = s11_quillo(&cwd, &["run", &file]);
+        assert!(ok, "{}", err);
+        assert_eq!(out, want, "from {}", cwd.display());
+    }
+}
+
+// Q-807: a service run apart (`--split`) set its own folder as the root, so its tags differed
+// from those the app's process gives the same file; it is told the app's folder.
+#[test]
+fn a_split_service_gives_the_tags_the_app_gives() {
+    let d = s11_dir("q807-split", &[
+        ("app.qwe", "service tags = \"svc/tags.qwe\"\nroute GET / = tags.name_of()\n"),
+        ("svc/tags.qwe", "private fn tick() = 1\nserver fn name_of() -> str = str(tick)\n"),
+    ]);
+    let want = format!("<fn tick__pv{}>", s11_fnv("svc/tags.qwe"));
+    for opts in [&[][..], &["--split"][..]] {
+        let s = support::serve_with(&d.join("app.qwe"), opts);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let a = support::send(s.port, "GET", "/", &[], "");
+            if a.status == 200 {
+                assert_eq!(a.body, want, "{:?}", opts);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{:?}: {} {}", opts, a.status, a.body);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+// Q-808: a browser name taken from two scripts was the last one's in every file, with no word.
+// Now it is an error, in `check` and as the program starts, where the sources differ: in two
+// files, or two lines of one.
+#[test]
+fn a_browser_name_from_two_scripts_is_refused() {
+    let a = "client /m1.mjs use helper\ncomponent A() { state s = \"\"\n    <p id=\"a\" @mount={(el) => { s = helper() }}>{s}</p> }\n";
+    let b = "client /m2.mjs use helper\ncomponent B() { state s = \"\"\n    <p id=\"b\" @mount={(el) => { s = helper() }}>{s}</p> }\n";
+    let main = "import a.qwe use A\nimport b.qwe use B\nroute GET /:f = file(f)\nroute GET / = <html><body><A/><B/></body></html>\n";
+    let d = s11_dir("q808", &[("a.qwe", a), ("b.qwe", b), ("main.qwe", main)]);
+    let (ok, out, err) = s11_check(&d, "main.qwe");
+    assert!(!ok, "{}{}", out, err);
+    assert!(out.contains("./b.qwe:1: error: `helper` is taken from /m1.mjs at a.qwe:1, and here from /m2.mjs: a page has one `helper`, so take one of them under another name (`use helper as ...`)"), "{}", out);
+    // The program does not start with it either.
+    std::fs::write(d.join("one.qwe"), "client /m1.mjs use helper\nclient \"/m2.mjs\" use helper\nprint(\"started\")\n").unwrap();
+    let (ok, out, err) = s11_quillo(&d, &["run", "one.qwe"]);
+    assert!(!ok && !out.contains("started") && (out.clone() + &err).contains("one.qwe:2: error: `helper` is taken from /m1.mjs at one.qwe:1"), "{}{}", out, err);
+    let (ok, out, err) = s11_quillo(&d, &["run", "one.qwe", "--no-check"]);
+    assert!(!ok && !out.contains("started"), "{}{}", out, err);
+    assert!(err.contains("one.qwe:2: `helper` is taken from /m1.mjs already, and here from /m2.mjs"), "{}", err);
+    // One script given the name again, in one file or two: as before.
+    std::fs::write(d.join("again.qwe"), "client /m1.mjs use helper\nclient /m1.mjs use helper\nprint(\"started\")\n").unwrap();
+    let (ok, out, _) = s11_quillo(&d, &["run", "again.qwe"]);
+    assert!(ok && out == "started\n", "{}", out);
+    std::fs::write(d.join("b.qwe"), b.replace("/m2.mjs", "/m1.mjs")).unwrap();
+    let (ok, out, _) = s11_check(&d, "main.qwe");
+    assert!(ok && !out.contains("taken from"), "{}", out);
+    // Under another name, two scripts each give theirs.
+    std::fs::write(d.join("b.qwe"), b.replace("use helper", "use helper as helper2").replace("s = helper()", "s = helper2()")).unwrap();
+    let (ok, out, _) = s11_check(&d, "main.qwe");
+    assert!(ok && !out.contains("taken from"), "{}", out);
+    // One name for two exports of one module is two sources too.
+    std::fs::write(d.join("mod.qwe"), "client module /m.mjs use one as pick\nclient module /m.mjs use two as pick\nprint(1)\n").unwrap();
+    let (ok, out, _) = s11_check(&d, "mod.qwe");
+    assert!(!ok && out.contains("`pick` is taken from /m.mjs (one)"), "{}", out);
+}
+
+// Q-822: a file that takes another whole was given that file's browser names, so their use went
+// unwarned; a file's own `client` line is what gives one.
+#[test]
+fn a_browser_name_a_file_does_not_take_is_warned_of() {
+    let a = "client /m1.mjs use helper\nfn from_a() = 1\n";
+    let d = s11_dir("q822-browser", &[
+        ("a.qwe", a),
+        ("d.qwe", "use a.qwe\ncomponent D() { state s = \"\"\n    <p id=\"d\" @mount={(el) => { s = helper() }}>{s}</p> }\n"),
+        ("main.qwe", "import d.qwe use D\nroute GET / = <html><body><D/></body></html>\n"),
+        ("own.qwe", "use a.qwe\nclient /m1.mjs use helper\ncomponent E() { state s = \"\"\n    <p @mount={(el) => { s = helper() + str(from_a()) }}>{s}</p> }\nroute GET / = <html><body><E/></body></html>\n"),
+    ]);
+    let (ok, out, _) = s11_check(&d, "main.qwe");
+    assert!(ok && out.contains("./d.qwe:3: warning: `helper` is a browser library this file does not take: write its line here too"), "{}", out);
+    // Taken by its own line: nothing to say; the file's other names still come with `use`.
+    let (ok, out, _) = s11_check(&d, "own.qwe");
+    assert!(ok && !out.contains("warning"), "{}", out);
+}
+
+// Q-809 and Q-810: NaN and the infinities reached Rust as null, and an error value as a map of
+// its message. Now a float crosses as it is, both ways; a `serde_json::Value`, which has no
+// NaN, is refused it by the argument's name; and an error given to a Rust function is given
+// back, untouched, as the function cannot take it.
+#[test]
+fn floats_cross_to_rust_as_they_are_and_an_error_is_given_back() {
+    if !s11_cargo() {
+        return;
+    }
+    let rust = r#"//! effects: none
+use std::collections::HashMap;
+pub fn seen(x: Option<f64>) -> String { format!("{:?}", x) }
+pub fn plain(x: f64) -> String { format!("{:?}", x) }
+pub fn small(x: f32) -> String { format!("{:?}", x) }
+pub fn many(xs: Vec<f64>) -> String { format!("{:?}", xs) }
+pub fn keyed(m: HashMap<String, f64>) -> String { format!("{:?}", m.get("k")) }
+pub fn back(x: f64) -> f64 { x }
+pub fn backs() -> Vec<f64> { vec![f64::NAN, f64::INFINITY, -f64::INFINITY, 1.5] }
+pub fn dump(v: serde_json::Value) -> String { v.to_string() }
+pub fn dumps(v: Vec<serde_json::Value>) -> usize { v.len() }
+pub fn store(v: serde_json::Value) -> String { format!("stored {}", v) }
+pub fn num(n: i64) -> i64 { n }
+pub fn two(a: i64, b: i64) -> i64 { a + b }
+"#;
+    let main = r#"use n.rs
+let nan = 0.0 / 0.0
+let inf = 1.0 / 0.0
+print(seen(nan), seen(inf), seen(-inf), seen(2.5), seen(null))
+print(plain(nan), small(-inf), many([nan, inf, 2.5]), many([]), keyed({ k: -inf }))
+let b = back(nan)
+print(b == b, back(inf), back(-inf), back(0.1), backs())
+print(dump([1, 2.5, "ü"]), dump(null))
+let bad = json.parse("{oops")
+print(store(bad) == bad, num(bad) == bad, two(1, bad) == bad, store([1, bad]) == bad, store({ k: [bad] }) == bad)
+print(store(err("mine")) ?? "given back", dumps([1, err("mine")]) ?? "given back")
+fn f(v) = { let x = store(v)?
+    `went on with ${x}` }
+print(f(bad) == bad, f(1))
+"#;
+    let d = s11_dir("q809", &[("n.rs", rust), ("main.qwe", main)]);
+    let (ok, out, err) = s11_check(&d, "main.qwe");
+    assert!(ok, "{}{}", out, err);
+    let (ok, out, err) = s11_quillo(&d, &["run", "main.qwe"]);
+    assert!(ok, "{}", err);
+    assert_eq!(
+        out,
+        "Some(NaN) Some(inf) Some(-inf) Some(2.5) None\n\
+         NaN -inf [NaN, inf, 2.5] [] Some(-inf)\n\
+         false inf -inf 0.1 [NaN, inf, -inf, 1.5]\n\
+         [1,2.5,\"ü\"] null\n\
+         true true true true true\n\
+         given back given back\n\
+         true went on with stored 1\n"
+    );
+    // A NaN or an infinity, at the top or inside: refused by the argument's name.
+    for (arg, said) in [("0.0 / 0.0", "NaN"), ("[1, -1.0 / 0.0]", "-inf"), ("{ a: { b: 1.0 / 0.0 } }", "inf")] {
+        std::fs::write(d.join("bad.qwe"), format!("use n.rs\nprint(dump({}))\n", arg)).unwrap();
+        let (ok, _, err) = s11_quillo(&d, &["run", "bad.qwe"]);
+        assert!(!ok && err.contains(&format!("bad.qwe:2: `dump`: argument `v` holds {}, which a serde_json::Value cannot: give it as text, or take an f64", said)), "{}", err);
+    }
+    std::fs::write(d.join("bad.qwe"), "use n.rs\nprint(dumps([1.0 / 0.0]))\n").unwrap();
+    let (ok, _, err) = s11_quillo(&d, &["run", "bad.qwe"]);
+    assert!(!ok && err.contains("`dumps`: argument `v` holds inf"), "{}", err);
+    // A float where an int is wanted is said to be one.
+    std::fs::write(d.join("bad.qwe"), "use n.rs\nprint(num(0.0 / 0.0))\n").unwrap();
+    let (ok, _, err) = s11_quillo(&d, &["run", "bad.qwe", "--no-check"]);
+    assert!(!ok && err.contains("`num`: argument `n` must be int, got float"), "{}", err);
+}
+
+// Q-811: `r#` before a letter was read as a raw string that never ended, and every `pub fn`
+// after it was lost; raw strings are `r"`, `r#"` and `br#"`.
+#[test]
+fn a_raw_identifier_hides_no_function() {
+    use quillo::native::parse;
+    let names = |src: &str| parse(src).exports.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+    assert_eq!(names("pub fn kind(r#type: i64) -> i64 { r#type }\npub fn later_one() -> i64 { 5 }\n"), ["kind", "later_one"]);
+    assert_eq!(parse("pub fn kind(r#type: i64) -> i64 { r#type }").exports[0].params[0].0, "type");
+    // In a body, a raw identifier, then a raw string with a brace and a `pub fn` in it.
+    let src = "pub fn a() -> i64 { let r#in = 1; let s = r\"} pub fn not_a() {\"; let t = r#\"}\"# ; let u = br##\"} pub fn nor_b() {\"##; r#in }\npub fn b() -> i64 { 2 }\npub fn r#loop() -> i64 { 3 }\n";
+    assert_eq!(names(src), ["a", "b", "loop"]);
+    // `r` alone, `r` before a `#` that starts nothing, an identifier ending in `r`.
+    assert_eq!(names("pub fn r(r: i64) -> i64 { r }\npub fn c() -> i64 { let ar = 1; let r = ar; r }\npub fn d() {}\n"), ["r", "c", "d"]);
+    // A Quillo word, raw in Rust, is not exported, and says so.
+    let p = parse("pub fn r#match() -> i64 { 1 }\npub fn e() {}\n");
+    assert_eq!(p.exports.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["e"]);
+    assert!(p.problems.iter().any(|(_, m)| m.contains("`match` is not exported: `match` is a word of Quillo's")), "{:?}", p.problems);
+    if !s11_cargo() {
+        return;
+    }
+    // Built: called by their names, `loop` too.
+    let d = s11_dir("q811", &[("k.rs", &format!("//! effects: none\n{}", src.replace("pub fn r#loop()", "pub fn r#loop(r#ref: i64) -> i64 { r#ref }\npub fn old()"))), ("main.qwe", "use k.rs\nprint(a(), b(), loop(4))\n")]);
+    let (ok, out, err) = s11_quillo(&d, &["run", "main.qwe"]);
+    assert!(ok && out == "1 2 4\n", "{}{}", out, err);
+}
+
+// Q-812: `x.rs` and `x.qwer`, or `a-b.rs` and `a_b.rs`, made libraries of one name, and each
+// build deleted the other's. Now each has its own library and lock line, which `--no-build`
+// loads; a build lets go of only its own file's earlier libraries of its own glue, so those an
+// older Quillo built stay for it; and `--no-build` meeting only those says to run `quillo build`.
+#[test]
+fn two_rust_files_of_one_stem_keep_a_library_each() {
+    if !s11_cargo() {
+        return;
+    }
+    let x_rs = "//! effects: none\npub fn from_rs() -> i64 { 1 }\n";
+    let d = s11_dir("q812", &[
+        ("x.rs", x_rs),
+        ("x.qwer", "//! effects: none\npub fn from_qwer() -> i64 { 2 }\n"),
+        ("a-b.rs", "//! effects: none\npub fn ab1() -> i64 { 3 }\n"),
+        ("a_b.rs", "//! effects: none\npub fn ab2() -> i64 { 4 }\n"),
+        ("main.qwe", "use x.rs\nuse x.qwer\nuse a-b.rs\nuse a_b.rs\nprint(from_rs(), from_qwer(), ab1(), ab2())\n"),
+    ]);
+    let libs = |d: &Path| {
+        let mut v: Vec<String> = std::fs::read_dir(d.join(".quillo/native")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    };
+    // What the first glue named this content's library, by the stem alone, with its lock line.
+    let (pre, ext) = (std::env::consts::DLL_PREFIX, std::env::consts::DLL_EXTENSION);
+    let first = {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        for p in [x_rs.as_bytes(), b"1", std::env::consts::ARCH.as_bytes()] {
+            h.update(p);
+            h.update([0]);
+        }
+        let hex: String = h.finalize()[..8].iter().map(|b| format!("{:02x}", b)).collect();
+        format!("{}x-{}.{}", pre, hex, ext)
+    };
+    std::fs::create_dir_all(d.join(".quillo/native")).unwrap();
+    std::fs::write(d.join(".quillo/native").join(&first), "built by the first glue").unwrap();
+    std::fs::write(d.join(".quillo/plugins.lock"), format!("{} 00\n", first)).unwrap();
+    std::fs::write(d.join("only_x.qwe"), "use x.rs\nprint(from_rs())\n").unwrap();
+    let (ok, _, err) = s11_quillo(&d, &["run", "only_x.qwe", "--no-build"]);
+    assert!(!ok && err.contains("./x.rs was built by an older Quillo, whose libraries this one cannot load, and --no-build says not to build it here: run `quillo build` once"), "{}", err);
+    // Another file of that stem, which no Quillo built: not built, as before.
+    std::fs::write(d.join("only_qwer.qwe"), "use x.qwer\nprint(from_qwer())\n").unwrap();
+    let (ok, _, err) = s11_quillo(&d, &["run", "only_qwer.qwe", "--no-build"]);
+    assert!(!ok && err.contains("./x.qwer is not built, and --no-build"), "{}", err);
+    let (ok, out, err) = s11_quillo(&d, &["build", "main.qwe"]);
+    assert!(ok, "{}{}", out, err);
+    let built = libs(&d);
+    assert_eq!(built.len(), 5, "{:?}", built);
+    // The older one stays, with its lock line.
+    assert!(built.contains(&first), "{:?}", built);
+    let lock = std::fs::read_to_string(d.join(".quillo/plugins.lock")).unwrap();
+    assert_eq!(lock.lines().count(), 5, "{}", lock);
+    assert!(lock.contains(&format!("{} 00", first)), "{}", lock);
+    let (ok, out, err) = s11_quillo(&d, &["run", "main.qwe", "--no-build"]);
+    assert!(ok && out == "1 2 3 4\n", "{}{}", out, err);
+    // A change to one builds it alone; the other's library stays, and the file's earlier one goes.
+    std::fs::write(d.join("x.rs"), "//! effects: none\npub fn from_rs() -> i64 { 10 }\n").unwrap();
+    let (ok, out, err) = s11_quillo(&d, &["run", "main.qwe"]);
+    assert!(ok && out == "10 2 3 4\n", "{}{}", out, err);
+    assert!(err.contains("building ./x.rs") && !err.contains("x.qwer"), "{}", err);
+    let now = libs(&d);
+    assert_eq!(now.len(), 5, "{:?}", now);
+    assert_eq!(now.iter().filter(|l| !built.contains(l)).count(), 1, "{:?} {:?}", built, now);
+    assert!(now.contains(&first), "{:?}", now);
+    let (ok, out, err) = s11_quillo(&d, &["run", "main.qwe", "--no-build"]);
+    assert!(ok && out == "10 2 3 4\n", "{}{}", out, err);
+}
+
+// Q-813: Rust `check` took and the glue could not build. A reference inside another type is
+// refused, with the type to take; a `#[cfg(...)]` goes on the glue too, and a function left out
+// says so when called.
+#[test]
+fn rust_the_glue_cannot_build_is_refused_and_cfg_is_kept() {
+    use quillo::native::parse;
+    let p = parse(
+        "pub fn a(name: Option<&str>) -> String { String::new() }\npub fn b(xs: Vec<&str>) -> usize { 0 }\npub fn c(xs: Option<&[i64]>) -> usize { 0 }\npub fn d(m: std::collections::HashMap<String, &str>) -> usize { 0 }\npub fn e(s: &'static str) -> usize { 0 }\n\
+         pub fn ok1(s: &str, xs: &[i64], v: &Vec<i64>, o: Option<String>) -> usize { 0 }\npub fn ok2() -> Option<&'static str> { None }\npub fn ok3() -> Vec<&'static str> { vec![] }\n\
+         pub fn f(xs: &[&str]) -> usize { 0 }\npub fn g(x: Option<&[u8; 4]>) -> usize { 0 }\npub fn h(m: Option<&std::collections::HashMap<String, &str>>) -> usize { 0 }\n",
+    );
+    assert_eq!(p.exports.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["ok1", "ok2", "ok3"]);
+    let said: Vec<String> = p.problems.iter().map(|(l, m)| format!("{} {}", l, m)).collect();
+    for want in [
+        "1 `a` is not exported: a parameter of type `Option<&str>` cannot be made from a Quillo value: take `Option<String>`",
+        "2 `b` is not exported: a parameter of type `Vec<&str>` cannot be made from a Quillo value: take `Vec<String>`",
+        "3 `c` is not exported: a parameter of type `Option<&[i64]>` cannot be made from a Quillo value: take `Option<Vec<i64>>`",
+        "4 `d` is not exported: a parameter of type `std::collections::HashMap<String, &str>` cannot be made from a Quillo value: take `std::collections::HashMap<String, String>`",
+        "5 `e` is not exported: a parameter of type `&'static str` cannot be made from a Quillo value: take `&str` or `String`",
+        "9 `f` is not exported: a parameter of type `&[&str]` cannot be made from a Quillo value: take `Vec<String>`",
+        "10 `g` is not exported: a parameter of type `Option<&[u8; 4]>` cannot be made from a Quillo value: take `Option<Vec<u8>>`",
+        "11 `h` is not exported: a parameter of type `Option<&std::collections::HashMap<String, &str>>` cannot be made from a Quillo value: take `Option<std::collections::HashMap<String, String>>`",
+    ] {
+        assert!(said.iter().any(|s| s == want), "{} not in {:?}", want, said);
+    }
+    // Attributes: each `cfg` of a `pub fn`, and none of another item's or a module's.
+    let p = parse("#[cfg(unix)]\n#[inline]\n#[cfg(feature = \"x]\")]\n/// Doc.\npub fn one() {}\n#[cfg(test)]\nfn private() {}\npub fn two() {}\n#[cfg(test)]\nmod tests {\n    pub fn inner() {}\n}\npub fn three() {}\n#[cfg(windows)] pub struct S;\npub fn four() {}\n");
+    let cfgs: Vec<(String, Vec<String>)> = p.exports.iter().map(|e| (e.name.clone(), e.cfg.clone())).collect();
+    assert_eq!(
+        cfgs,
+        [("one".to_string(), vec!["unix".to_string(), "feature = \"x]\"".to_string()]), ("two".into(), vec![]), ("three".into(), vec![]), ("four".into(), vec![])]
+    );
+    assert_eq!(p.exports[0].doc, "Doc.");
+    if !s11_cargo() {
+        return;
+    }
+    let (here, there) = if cfg!(target_os = "linux") { ("linux", "macos") } else { ("macos", "linux") };
+    let rust = format!(
+        "//! effects: none\n#[cfg(target_os = \"{there}\")]\npub fn elsewhere() -> i64 {{ 1 }}\n#[cfg(target_os = \"{here}\")]\n#[cfg(unix)]\npub fn here() -> i64 {{ 2 }}\n#[cfg(not(target_os = \"{there}\"))]\npub fn also_here(n: i64) -> i64 {{ n }}\n"
+    );
+    let d = s11_dir("q813", &[("c.rs", &rust), ("main.qwe", "use c.rs\nprint(here(), also_here(3))\nprint(elsewhere())\n")]);
+    let (ok, out, err) = s11_check(&d, "main.qwe");
+    assert!(ok, "{}{}", out, err);
+    let (ok, out, err) = s11_quillo(&d, &["run", "main.qwe"]);
+    assert!(!ok && out == "2 3\n", "{}{}", out, err);
+    assert!(err.contains(&format!("main.qwe:3: `elsewhere`: it is not in this build, as its #[cfg(target_os = \"{}\")] leaves it out", there)), "{}", err);
+}
+
+// Q-814: a `//` line, a block comment or `#![...]` before the `//!` header made Quillo miss it;
+// the message about effects named a `.qwer` file for a `.rs` one.
+#[test]
+fn the_header_is_read_after_comments_and_attributes() {
+    use quillo::native::parse;
+    for top in [
+        "// SPDX-License-Identifier: MIT\n",
+        "\n\n",
+        "#![allow(clippy::all)]\n",
+        "#![allow(\n    clippy::all,\n    dead_code\n)]\n",
+        "/* A licence,\n   on two lines. */\n",
+        "/* one line */ \n// and a comment\n\n#![deny(unsafe_code)]\n",
+        "",
+    ] {
+        let p = parse(&format!("{}//! effects: none\n//! [dependencies]\n//! itoa = \"1\"\npub fn twice(n: i64) -> i64 {{ n * 2 }}\n", top));
+        assert_eq!((p.effects, p.deps.trim()), (Some(0), "itoa = \"1\""), "{:?}", top);
+        assert_eq!(p.exports[0].name, "twice");
+    }
+    // What is an item's, or after one, is no header.
+    assert_eq!(parse("/// The doc of twice.\n//! effects: none\npub fn twice() {}\n").effects, None);
+    assert_eq!(parse("use std::fmt;\n//! effects: none\npub fn twice() {}\n").effects, None);
+    assert_eq!(parse("/** doc */\n//! effects: none\n").effects, None);
+    if !s11_cargo() {
+        return;
+    }
+    let d = s11_dir("q814", &[
+        ("t.rs", "// SPDX-License-Identifier: MIT\n#![allow(dead_code)]\n//! effects: none\n//! [dependencies]\n//! itoa = \"1\"\npub fn twice(n: i64) -> String { itoa::Buffer::new().format(n * 2).to_string() }\n"),
+        ("u.rs", "// SPDX-License-Identifier: MIT\npub fn thrice(n: i64) -> i64 { n * 3 }\n"),
+        ("v.qwer", "pub fn four(n: i64) -> i64 { n * 4 }\n"),
+        ("main.qwe", "use t.rs\nfn calc(n: int) with time = twice(n)\nprint(calc(21))\n"),
+        ("bad.qwe", "use u.rs\nuse v.qwer\nfn calc3(n: int) with time = thrice(n)\nfn calc4(n: int) with time = four(n)\n"),
+    ]);
+    let (ok, out, err) = s11_quillo(&d, &["run", "main.qwe"]);
+    assert!(ok && out == "42\n", "{}{}", out, err);
+    let (ok, out, _) = s11_check(&d, "bad.qwe");
+    assert!(!ok, "{}", out);
+    assert!(out.contains("bad.qwe:3: error: `thrice` is Rust whose file does not say what it does") && out.contains("(or `//! effects: none`) at the top of u.rs\n"), "{}", out);
+    assert!(out.contains("bad.qwe:4: error: `four` is Rust") && out.contains("at the top of v.qwer\n"), "{}", out);
+}
+
+// Q-815: `std::` paths, `-> &'static str` and comments in a signature were refused.
+#[test]
+fn common_rust_signatures_are_read() {
+    use quillo::native::{parse, quillo_type};
+    for (rust, q) in [
+        ("std::io::Result<String>", "str | error(str)"),
+        ("std::vec::Vec<i64>", "list"),
+        ("alloc::vec::Vec<std::string::String>", "list"),
+        ("std::option::Option<i64>", "int | null"),
+        ("core::option::Option<std::option::Option<f64>>", "float | null"),
+        ("std::result::Result<i64, String>", "int | error(str)"),
+        ("std::collections::HashMap<std::string::String, i64>", "map"),
+        ("&'static str", "str"),
+        ("Option<&'static str>", "str | null"),
+        ("Vec<&'static str>", "list"),
+    ] {
+        assert_eq!(quillo_type(rust).as_deref(), Ok(q), "{}", rust);
+    }
+    // Paths of types Quillo has not are still refused, by what was written.
+    assert!(quillo_type("std::rc::Rc<i64>").unwrap_err().contains("`Rc<i64>` cannot cross"));
+    let p = parse("pub fn price(\n    amount: i64, // in cents; {not a body}\n    rate: f64, /* a share, (of it) */\n) -> f64 { 0.0 }\npub fn add(a: i64 /* left */, b: i64 /* right */) -> i64 { a + b }\npub fn after() -> &'static str { \"x\" }\n");
+    assert!(p.problems.is_empty(), "{:?}", p.problems);
+    let e: Vec<(String, Vec<(String, String)>)> = p.exports.iter().map(|e| (e.name.clone(), e.params.clone())).collect();
+    assert_eq!(e[0].1, [("amount".to_string(), "i64".to_string()), ("rate".to_string(), "f64".to_string())]);
+    assert_eq!(e[1].1, [("a".to_string(), "i64".to_string()), ("b".to_string(), "i64".to_string())]);
+    assert_eq!((e[2].0.as_str(), p.exports[2].ret.as_deref()), ("after", Some("&'static str")));
+    // The line numbers after a signature on several lines are still right.
+    assert_eq!(p.exports.iter().map(|e| e.line).collect::<Vec<_>>(), [1, 5, 6]);
+    if !s11_cargo() {
+        return;
+    }
+    let rust = "//! effects: none\npub fn read_it(p: &str) -> std::io::Result<String> { if p.is_empty() { Err(std::io::Error::other(\"empty\")) } else { Ok(p.to_string()) } }\npub fn evens(n: i64) -> std::vec::Vec<i64> { (0..n).filter(|x| x % 2 == 0).collect() }\npub fn maybe(n: std::option::Option<i64>) -> std::option::Option<i64> { n.map(|x| x + 1) }\npub fn name() -> &'static str { \"static\" }\npub fn names() -> Vec<&'static str> { vec![\"a\", \"ü\"] }\npub fn price(\n    amount: i64, // in cents\n    rate: f64, /* a share */\n) -> f64 { amount as f64 * rate }\n";
+    let d = s11_dir("q815", &[("s.rs", rust), ("main.qwe", "use s.rs\nprint(read_it(\"x\"), read_it(\"\") ?? \"none\", evens(5), maybe(1), maybe(null), name(), names(), price(200, 0.5))\n")]);
+    let (ok, out, err) = s11_check(&d, "main.qwe");
+    assert!(ok && !out.contains("warning"), "{}{}", out, err);
+    let (ok, out, err) = s11_quillo(&d, &["run", "main.qwe"]);
+    assert!(ok && out == "x none [0, 2, 4] 2 null static [\"a\", \"ü\"] 100.0\n", "{}{}", out, err);
+}
+
+// Q-816: a Rust alias was the program's, so a used file's `import b.rs use who as name` changed
+// `name` for every file; and the fix the warning gave did not parse. Now a file's names from
+// Rust are its own, and the fix names the export under a name that parses.
+#[test]
+fn a_rust_alias_is_the_files_own() {
+    if !s11_cargo() {
+        return;
+    }
+    let d = s11_dir("q816", &[
+        ("a.rs", "//! effects: none\npub fn who() -> String { \"a\".into() }\n"),
+        ("b.rs", "//! effects: none\npub fn who() -> String { \"b\".into() }\n"),
+        ("imei.rs", "//! effects: none\npub fn imei_valid(s: &str) -> bool { s.len() == 15 }\n"),
+        ("other.qwe", "import b.rs use who as name\nfn from_other() = name()\n"),
+        ("same.qwe", "import a.rs use who as name\nfn from_same() = name()\n"),
+        ("whole.qwe", "use b.rs\nfn from_whole() = who()\n"),
+        ("main.qwe", "import a.rs use who as name\nuse other.qwe\nuse same.qwe\nuse whole.qwe\nprint(name(), from_other(), from_same(), from_whole())\n"),
+        // A library's own function of a plugin's name, which it never takes, and the other way.
+        ("lib/v.qwe", "fn imei_valid(s) = \"lib\"\nfn lib_check(s) = imei_valid(s)\n"),
+        ("lib/w.qwe", "import imei.rs use imei_valid\nfn lib2(s) = imei_valid(s)\n"),
+        ("libs.qwe", "import imei.rs use imei_valid\nimport lib/v.qwe use lib_check\nprint(imei_valid(\"123456789012345\"), lib_check(\"x\"))\n"),
+        ("libs2.qwe", "fn imei_valid(s) = \"main\"\nimport lib/w.qwe use lib2\nprint(imei_valid(\"x\"), lib2(\"123456789012345\"))\n"),
+    ]);
+    for (file, want) in [("main.qwe", "a b a b\n"), ("libs.qwe", "true lib\n"), ("libs2.qwe", "main true\n")] {
+        let (ok, out, err) = s11_check(&d, file);
+        assert!(ok && !out.contains("warning"), "{}: {}{}", file, out, err);
+        let (ok, out, err) = s11_quillo(&d, &["run", file]);
+        assert!(ok && out == want, "{}: {}{}", file, out, err);
+    }
+    // Two plugins' one name in one file: the warning's fix parses, and works.
+    std::fs::write(d.join("both.qwe"), "use a.rs\nuse b.rs\nprint(who())\n").unwrap();
+    let (_, out, _) = s11_check(&d, "both.qwe");
+    let fix = out.split("take one under another name: ").nth(1).and_then(|r| r.lines().next()).unwrap_or_else(|| panic!("{}", out)).to_string();
+    assert_eq!(fix, "import b.rs use who as b_who");
+    std::fs::write(d.join("both.qwe"), format!("use a.rs\n{}\nprint(who(), b_who())\n", fix)).unwrap();
+    let (ok, out, err) = s11_quillo(&d, &["run", "both.qwe"]);
+    assert!(ok && out == "a b\n", "{}{}", out, err);
+    // A builtin's name from a file whose name has a `-`: the fix parses too.
+    std::fs::write(d.join("lib/my-tools.rs"), "//! effects: none\npub fn len(s: &str) -> i64 { 7 }\n").unwrap();
+    std::fs::write(d.join("tools.qwe"), "use lib/my-tools.rs\nprint(len(\"x\"))\n").unwrap();
+    let (_, out, _) = s11_check(&d, "tools.qwe");
+    let fix = out.split("take it under another name: ").nth(1).and_then(|r| r.lines().next()).unwrap_or_else(|| panic!("{}", out)).to_string();
+    assert_eq!(fix, "import lib/my-tools.rs use len as my_tools_len");
+    std::fs::write(d.join("tools.qwe"), format!("{}\nprint(my_tools_len(\"x\"), len(\"xy\"))\n", fix)).unwrap();
+    let (ok, out, err) = s11_quillo(&d, &["run", "tools.qwe"]);
+    assert!(ok && out == "7 2\n", "{}{}", out, err);
+    // One function of one file, taken by two files, is not two: a file that takes neither is
+    // told to take it from the Rust file, as before, and it runs.
+    std::fs::write(d.join("x.qwe"), "import a.rs use who\nfn fx() = who()\n").unwrap();
+    std::fs::write(d.join("y.qwe"), "use a.rs\nfn fy() = who()\n").unwrap();
+    std::fs::write(d.join("xy.qwe"), "use x.qwe\nuse y.qwe\nprint(who(), fx(), fy())\n").unwrap();
+    let (ok, out, _) = s11_check(&d, "xy.qwe");
+    assert!(ok && out.contains("xy.qwe:3: warning: `who` comes from a.rs, which this file does not take: add `import a.rs use who`"), "{}", out);
+    let (ok, out, err) = s11_quillo(&d, &["run", "xy.qwe"]);
+    assert!(ok && out == "a a a\n", "{}{}", out, err);
+    // Two functions of that name: told to take one, from the Rust file.
+    std::fs::write(d.join("z.qwe"), "import b.rs use who\nfn fz() = who()\n").unwrap();
+    std::fs::write(d.join("xz.qwe"), "use x.qwe\nuse z.qwe\nprint(who())\n").unwrap();
+    let (ok, out, _) = s11_check(&d, "xz.qwe");
+    assert!(!ok && out.contains("xz.qwe:3: error: `who` comes from a.rs and b.rs: take the one you mean: import a.rs use who"), "{}", out);
+    std::fs::write(d.join("xz.qwe"), "use x.qwe\nuse z.qwe\nimport a.rs use who\nprint(who(), fx(), fz())\n").unwrap();
+    let (ok, out, err) = s11_quillo(&d, &["run", "xz.qwe"]);
+    assert!(ok && out == "a a b\n", "{}{}", out, err);
+    // A name taken by name wins over the same name of a Rust file taken whole, in either order.
+    std::fs::write(d.join("helper.rs"), "//! effects: none\npub fn helper() -> String { \"rust\".into() }\npub fn other() -> i64 { 9 }\n").unwrap();
+    std::fs::write(d.join("lib/h.qwe"), "fn helper() = \"lib\"\n").unwrap();
+    for (f, src) in [("named1.qwe", "import lib/h.qwe use helper\nuse helper.rs\nprint(helper(), other())\n"), ("named2.qwe", "use helper.rs\nimport lib/h.qwe use helper\nprint(helper(), other())\n")] {
+        std::fs::write(d.join(f), src).unwrap();
+        let (ok, out, _) = s11_check(&d, f);
+        assert!(ok && !out.contains("warning"), "{}: {}", f, out);
+        let (ok, out, err) = s11_quillo(&d, &["run", f]);
+        assert!(ok && out == "lib 9\n", "{}: {}{}", f, out, err);
+    }
+    // A Rust file's function taken by name wins over another's of that name taken whole, and
+    // one file taken both ways is that file.
+    for (f, src, want) in [
+        ("forms1.qwe", "import a.rs use who\nuse b.rs\nprint(who())\n", "a\n"),
+        ("forms2.qwe", "use b.rs\nimport a.rs use who\nprint(who())\n", "a\n"),
+        ("forms3.qwe", "import a.rs use who\nuse a.rs\nprint(who())\n", "a\n"),
+    ] {
+        std::fs::write(d.join(f), src).unwrap();
+        let (ok, out, _) = s11_check(&d, f);
+        assert!(ok, "{}: {}", f, out);
+        let (ok, out, err) = s11_quillo(&d, &["run", f]);
+        assert!(ok && out == want, "{}: {}{}", f, out, err);
+    }
+    // Both by name: said, as two names taken.
+    std::fs::write(d.join("named3.qwe"), "import lib/h.qwe use helper\nimport helper.rs use helper\nprint(helper())\n").unwrap();
+    let (ok, out, _) = s11_check(&d, "named3.qwe");
+    assert!(!ok && out.contains("`helper` is defined in this file, and taken from lib/h.qwe"), "{}", out);
+    assert_eq!(quillo::native::other_name("9lives.qwer", "f"), "_9lives_f");
+    assert_eq!(quillo::native::other_name("lib/ünï code.RS", "f"), "ünï_code_f");
+}
+
+// Q-817: a main file run through a link looked for its used files beside the link. Now its
+// `use`, `import` and `mount` paths count from the folder of the file the link leads to, and
+// everything else (the policy, `.env`, data, messages) from the folder given, as before; a folder
+// that is a link is the folder given.
+#[test]
+fn a_main_file_through_a_link_uses_the_files_beside_it() {
+    let d = s11_dir("q817", &[
+        ("opt/tool/tool.qwe", "use lib/a.qwe\nuse ./lib/b.qwe\nimport lib/c use c\nprint(a(), b(), c())\n"),
+        ("opt/tool/lib/a.qwe", "fn a() = 1\n"),
+        ("opt/tool/lib/b.qwe", "fn b() = 2\n"),
+        ("opt/tool/lib/c.qwe", "fn c() = 3\n"),
+        ("opt/tool/app.qwe", "use lib/a.qwe\nprint(a(), env(\"WHO\"), read_file(\"data.txt\"))\ndb.open(\"data.db\")\ndb.exec(\"create table if not exists t (x int)\")\ndb.exec(\"insert into t values (1)\")\nprint(db.query(\"select count(*) as n from t\")[0].n)\n"),
+        ("opt/tool/sub/m.qwe", "route GET / = \"m\"\n"),
+        ("opt/tool/mounts.qwe", "mount /m = \"sub/m.qwe\"\nroute GET / = \"top\"\n"),
+        ("opt/tool/.env", "WHO=real\n"),
+        ("opt/tool/data.txt", "real data"),
+        ("opt/tool/policed.qwe", "print(env(\"HOME\") ?? \"none\")\n"),
+        ("opt/tool/broken.qwe", "use lib/a.qwe\nprint(a(), missing_name)\n"),
+        ("site/.env", "WHO=site\n"),
+        ("site/data.txt", "site data"),
+        ("guarded/quillo.policy", "[effects]\nallow = [\"db\"]\n"),
+        ("releases/r1/main.qwe", "use lib/a.qwe\nprint(a(), env(\"WHO\"))\n"),
+        ("releases/r1/lib/a.qwe", "fn a() = 7\n"),
+        ("releases/r1/.env", "WHO=r1\n"),
+    ]);
+    let link = |to: &str, at: &str| std::os::unix::fs::symlink(to, d.join(at)).unwrap();
+    std::fs::create_dir_all(d.join("bin")).unwrap();
+    link("../opt/tool/tool.qwe", "bin/tool.qwe");
+    link("tool.qwe", "bin/again.qwe");
+    link("../opt/tool/app.qwe", "site/main.qwe");
+    link("../opt/tool/mounts.qwe", "site/mounts.qwe");
+    link("../opt/tool/broken.qwe", "site/broken.qwe");
+    link("../opt/tool/policed.qwe", "guarded/main.qwe");
+    link("releases/r1", "current");
+    // `use` beside the file the link leads to: through a link, a link to a link, and from the
+    // link's own folder.
+    for (cwd, args) in [(d.clone(), vec!["run", "bin/tool.qwe"]), (d.join("bin"), vec!["tool.qwe"]), (d.clone(), vec!["run", "bin/again.qwe"])] {
+        let (ok, out, err) = s11_quillo(&cwd, &args);
+        assert!(ok && out == "1 2 3\n", "{:?}: {}{}", args, out, err);
+    }
+    let (ok, out, _) = s11_check(&d, "bin/tool.qwe");
+    assert!(ok && out.starts_with("bin/tool.qwe: ok (0 routes, 3 functions"), "{}", out);
+    // `mount` from the file's folder.
+    let s = support::serve(&d.join("site/mounts.qwe"), &[]);
+    assert_eq!(support::send(s.port, "GET", "/m/", &[], "").body, "m");
+    // The data, `.env` and files beside the link, where the program was put.
+    let (ok, out, err) = s11_quillo(&d, &["run", "site/main.qwe"]);
+    assert!(ok && out == "1 site site data\n1\n", "{}{}", out, err);
+    assert!(d.join("site/data.db").is_file() && !d.join("opt/tool/data.db").exists());
+    // The policy beside the link is the program's.
+    let (ok, out, err) = s11_quillo(&d, &["run", "guarded/main.qwe"]);
+    assert!(!ok && !out.contains('/') && err.contains("guarded/main.qwe:1: error: `env` needs the env effect, which guarded/quillo.policy does not allow"), "{}{}", out, err);
+    // Messages name the file as it was given; a used file by where it is.
+    let (ok, out, _) = s11_check(&d, "site/broken.qwe");
+    assert!(!ok && out.starts_with("site/broken.qwe:2: error: unknown name `missing_name`"), "{}", out);
+    // A folder that is a link is the folder given.
+    let (ok, out, err) = s11_quillo(&d, &["run", "current/main.qwe"]);
+    assert!(ok && out == "7 r1\n", "{}{}", out, err);
+    let (ok, out, err) = s11_quillo(&d.join("current"), &["run", "main.qwe"]);
+    assert!(ok && out == "7 r1\n", "{}{}", out, err);
+    // Where the paths count from.
+    assert_eq!(quillo::modules::source_dir(&d.join("bin/tool.qwe")), d.join("opt/tool"));
+    assert_eq!(quillo::modules::source_dir(Path::new("main.qwe")), Path::new("."));
+    assert_eq!(quillo::modules::source_dir(&d.join("current/main.qwe")), d.join("current"));
+}
+
+// Q-818: a `fn` after a top-level `return` in a used file passed `check`, and the program did
+// not start. `check` now does as the program does: nothing after it is defined, and its first
+// line says it never runs.
+#[test]
+fn code_after_a_top_level_return_is_said_never_to_run() {
+    let d = s11_dir("q818", &[
+        ("lib.qwe", "fn early() = 1\nreturn\nfn late() = 2\nroute GET /late = \"late\"\n"),
+        ("main.qwe", "use lib.qwe\nprint(early(), late())\n"),
+        ("early.qwe", "use lib.qwe\nprint(early())\n"),
+        ("end.qwe", "fn early2() = 1\nreturn\n"),
+        ("cond.qwe", "fn one_q818() = 1\nif env(\"NOT_SET_Q818\") == \"x\" { return }\nfn two_q818() = 2\n"),
+        ("uses.qwe", "use end.qwe\nuse cond.qwe\nprint(early2(), one_q818(), two_q818())\n"),
+        ("top.qwe", "print(\"ran\")\nreturn\nfn never() = 1\nprint(never())\n"),
+    ]);
+    let (ok, out, _) = s11_check(&d, "main.qwe");
+    assert!(!ok, "{}", out);
+    assert!(out.contains("main.qwe:2: error: unknown name `late`"), "{}", out);
+    assert!(out.contains("./lib.qwe:3: warning: this never runs: the `return` at line 2 leaves the file first, so nothing below it is defined"), "{}", out);
+    assert_eq!(out.matches("never runs").count(), 1, "{}", out);
+    let (ok, _, err) = s11_quillo(&d, &["run", "main.qwe", "--no-check"]);
+    assert!(!ok && err.contains("main.qwe:2: unknown name `late`"), "{}", err);
+    // What comes before it is there, and a `return` at the end, or in an `if`, says nothing.
+    let (ok, out, err) = s11_quillo(&d, &["run", "early.qwe"]);
+    assert!(ok && out == "1\n", "{}{}", out, err);
+    let (ok, out, _) = s11_check(&d, "uses.qwe");
+    assert!(ok && !out.contains("warning"), "{}", out);
+    let (ok, out, _) = s11_quillo(&d, &["run", "uses.qwe"]);
+    assert!(ok && out == "1 1 2\n", "{}", out);
+    // In the main file too.
+    let (ok, out, _) = s11_check(&d, "top.qwe");
+    assert!(ok && out.contains("top.qwe:3: warning: this never runs: the `return` at line 2"), "{}", out);
+    let (ok, out, _) = s11_quillo(&d, &["run", "top.qwe"]);
+    assert!(ok && out == "ran\n", "{}", out);
+}
+
+// Q-819: Q-523's one message at the import line was only for `import x.qwe use name`. Now a file
+// taken whole that is not there, and a Rust one, are said once, with a near file of any kind; a
+// path written without its extension is the file there, and one written with it is that file.
+#[test]
+fn a_missing_file_is_said_once_for_every_form() {
+    let d = s11_dir("q819", &[
+        ("lib/bx.qwe", "fn bb() = 2\n"),
+        ("imaging.rs", "//! effects: none\npub fn img() -> i64 { 3 }\n"),
+        ("helpers.qwe", "fn h() = 1\n"),
+        ("lib/m.qwe", "fn price() = 4\n"),
+        ("whole.qwe", "use lib/b.qwe\nprint(bb(), b())\nfn f() = mistyped_but_not_said()\n"),
+        ("rs.qwe", "import imagin.rs use img\nprint(img())\n"),
+        ("rs_whole.qwe", "use imagin.rs\nprint(img())\n"),
+        ("explicit.qwe", "use helpers.rs\nprint(h())\n"),
+        ("explicit2.qwe", "import helpers.qwer use h\nprint(h())\n"),
+        ("implied.qwe", "import imaging use img\nimport lib/m use price\nuse helpers\nprint(img(), price(), h())\n"),
+        ("other.qwe", "use lib/bx.qwe\nprint(nope)\n"),
+        ("two/helpers.qwe", "fn h() = 1\n"),
+        ("two/helpers.rs", "//! effects: none\npub fn h() -> i64 { 2 }\n"),
+        ("two/m.qwer", "//! effects: none\npub fn m() -> i64 { 2 }\n"),
+        ("two/m.qwe", "fn m() = 1\n"),
+        ("two/whole.qwe", "use helpers\nprint(h())\n"),
+        ("two/named.qwe", "import m use m\nprint(m())\n"),
+        ("two/written.qwe", "use helpers.qwe\nimport m.qwe use m\nprint(h(), m())\n"),
+    ]);
+    let check = |f: &str| s11_check(&d, f);
+    let (ok, out, _) = check("whole.qwe");
+    assert!(!ok && out == "whole.qwe:1: error: cannot read lib/b.qwe: No such file or directory (os error 2) (did you mean lib/bx.qwe?)\nquillo: 1 error\n", "{}", out);
+    for (f, want) in [
+        ("rs.qwe", "rs.qwe:1: error: cannot read imagin.rs: No such file or directory (os error 2) (did you mean imaging.rs?)\n"),
+        ("rs_whole.qwe", "rs_whole.qwe:1: error: cannot read imagin.rs: No such file or directory (os error 2) (did you mean imaging.rs?)\n"),
+        ("explicit.qwe", "explicit.qwe:1: error: cannot read helpers.rs: No such file or directory (os error 2) (did you mean helpers.qwe?)\n"),
+        ("explicit2.qwe", "explicit2.qwe:1: error: cannot read helpers.qwer: No such file or directory (os error 2) (did you mean helpers.qwe?)\n"),
+    ] {
+        let (ok, out, _) = check(f);
+        assert!(!ok && out == format!("{}quillo: 1 error\n", want), "{}: {}", f, out);
+    }
+    // A file there: its names, and a name no file has, as before.
+    let (ok, out, _) = check("other.qwe");
+    assert!(!ok && out.contains("other.qwe:2: error: unknown name `nope`"), "{}", out);
+    let (ok, out, _) = check("implied.qwe");
+    assert!(ok, "{}", out);
+    // Two files a path without its extension could be: said, at check and as it runs; written
+    // with its extension, the one meant.
+    let two = d.join("two");
+    for (f, want) in [("whole.qwe", "whole.qwe:1: error: `helpers` could be helpers.qwe or helpers.rs: write the one you mean with its extension\n"), ("named.qwe", "named.qwe:1: error: `m` could be m.qwe or m.qwer: write the one you mean with its extension\n")] {
+        let (ok, out, _) = s11_check(&two, f);
+        assert!(!ok && out == format!("{}quillo: 1 error\n", want), "{}: {}", f, out);
+        let (ok, _, err) = s11_quillo(&two, &["run", f, "--no-check"]);
+        assert!(!ok && err.contains(&format!("{}:1: `", f)) && err.contains("write the one you mean with its extension"), "{}: {}", f, err);
+    }
+    let (ok, out, err) = s11_quillo(&two, &["run", "written.qwe"]);
+    assert!(ok && out == "1 1\n", "{}{}", out, err);
+    if !s11_cargo() {
+        return;
+    }
+    let (ok, out, err) = s11_quillo(&d, &["run", "implied.qwe"]);
+    assert!(ok && out == "3 4 1\n", "{}{}", out, err);
+    let (ok, _, err) = s11_quillo(&d, &["run", "explicit.qwe"]);
+    assert!(!ok && err.contains("helpers.rs"), "{}", err);
+}
+
+// Q-820: `use Lib.QWE` became `Lib.QWE.qwe`, and `use "Tools.RS"` read the Rust as Quillo.
+#[test]
+fn extensions_are_read_in_any_case() {
+    use quillo::native::is_rust;
+    for (p, rust) in [("a.rs", true), ("a.RS", true), ("a.Rs", true), ("a.QWER", true), ("a.qwer", true), ("a.rsx", false), ("rs", false), ("", false), ("a.qwe", false), ("ä.RS", true)] {
+        assert_eq!(is_rust(p), rust, "{}", p);
+    }
+    let d = s11_dir("q820", &[
+        ("Lib.QWE", "fn lib_one() = 1\n"),
+        ("Tools.RS", "//! effects: none\npub fn tool_two() -> i64 { 2 }\n"),
+        ("Other.Qwer", "//! effects: none\npub fn other_three() -> i64 { 3 }\n"),
+        ("main.qwe", "use Lib.QWE\nuse \"Tools.RS\"\nimport Other.Qwer use other_three\nprint(lib_one(), tool_two(), other_three())\n"),
+    ]);
+    let (ok, out, err) = s11_check(&d, "main.qwe");
+    assert!(ok && out.contains("ok (0 routes, 3 functions"), "{}{}", out, err);
+    if !s11_cargo() {
+        return;
+    }
+    let (ok, out, err) = s11_quillo(&d, &["run", "main.qwe"]);
+    assert!(ok && out == "1 2 3\n", "{}{}", out, err);
+    // `quillo build` knows them for Rust too.
+    let (ok, out, err) = s11_quillo(&d, &["build", "main.qwe"]);
+    assert!(ok && out.matches("built ").count() == 2, "{}{}", out, err);
+}
+
+// Q-821: `use Point as Pt` made `Pt(...)` a Point but not a type; `use one as Point` replaced the
+// program's type's constructor in that file.
+#[test]
+fn a_types_alias_is_a_type_and_as_takes_no_types_name() {
+    let d = s11_dir("q821", &[
+        ("lib.qwe", "type Point = { x: int }\nfn one() = 1\n"),
+        ("main.qwe", "import lib.qwe use Point as Pt\nfn norm(p: Pt) -> Pt = p\nfn kind(v) = match v { Pt as p => \"point\", _ => \"other\" }\nfn count_all(ps: list<Pt>) = len(ps)\ntype Pair = { a: Pt, b: Pt }\nprint(norm(Pt({ x: 3 })), kind(Pt({ x: 1 })), kind(3), count_all([Pt({ x: 1 })]), Pair({ a: Pt({ x: 1 }), b: Pt({ x: 2 }) }).b.x)\n"),
+        ("wrong.qwe", "import lib.qwe use Point as Pt\nfn norm(p: Pt) = p\nprint(norm(5))\n"),
+        ("shadow.qwe", "import lib.qwe use one as Point\nprint(Point({ x: 1 }))\n"),
+        ("short.qwe", "import lib.qwe use Point as P\nprint(P({ x: 3 }))\n"),
+        ("plain.qwe", "import lib.qwe use Point, one as uno\nimport lib.qwe use Point as Point\nfn norm(p: Point) = p\nprint(norm(Point({ x: 3 })), uno())\n"),
+    ]);
+    let (ok, out, _) = s11_check(&d, "main.qwe");
+    assert!(ok && !out.contains("warning"), "{}", out);
+    let (ok, out, err) = s11_quillo(&d, &["run", "main.qwe"]);
+    assert!(ok && out == "{ x: 3 } point other 1 2\n", "{}{}", out, err);
+    let (ok, out, _) = s11_check(&d, "wrong.qwe");
+    assert!(!ok && out.contains("wrong.qwe:3: error: argument `p` of `norm` must be map, got int"), "{}", out);
+    let (ok, out, _) = s11_check(&d, "shadow.qwe");
+    assert!(!ok && out.contains("shadow.qwe:1: error: `Point` is a type of the program: take `one` from lib.qwe under another name"), "{}", out);
+    let (ok, _, err) = s11_quillo(&d, &["run", "shadow.qwe", "--no-check"]);
+    assert!(!ok && err.contains("shadow.qwe:1: `Point` is a type of the program"), "{}", err);
+    // A name no type can have still makes one, and is told the name it could take.
+    let (ok, out, _) = s11_check(&d, "short.qwe");
+    assert!(ok && out.contains("short.qwe:1: warning: `P` is `Point` here, but no type is written `P`") && out.contains("take it as `Pt`"), "{}", out);
+    let (ok, out, _) = s11_quillo(&d, &["run", "short.qwe"]);
+    assert!(ok && out == "{ x: 3 }\n", "{}", out);
+    // What an editor is told: the names as written, none the annotations' renaming makes.
+    let a = quillo::check::check_file(&d.join("main.qwe"));
+    let names: Vec<&str> = a.references.iter().map(|r| r.name.as_str()).chain(a.symbols.iter().map(|s| s.name.as_str())).chain(a.taken.iter().map(|(_, s)| s.name.as_str())).collect();
+    assert!(names.contains(&"Pt") && !names.iter().any(|n| n.starts_with("type ")), "{:?}", names);
+    let (ok, out, _) = s11_check(&d, "plain.qwe");
+    assert!(ok, "{}", out);
+    let (ok, out, _) = s11_quillo(&d, &["run", "plain.qwe"]);
+    assert!(ok && out == "{ x: 3 } 1\n", "{}", out);
+}
+
+// Q-822: the smaller messages.
+#[test]
+fn smaller_messages_of_plugins_and_imports_are_plain() {
+    // `pub fn view()` was exported and could be called by no name.
+    let p = quillo::native::parse("pub fn view() -> i64 { 1 }\npub fn views() -> i64 { 2 }\npub fn component() {}\npub fn reply() {}\npub fn viewing() {}\n");
+    assert_eq!(p.exports.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["views", "viewing"]);
+    assert!(p.problems.iter().any(|(l, m)| *l == 1 && m == "`view` is not exported: `view` is a word of Quillo's, which no call can name, so rename it"), "{:?}", p.problems);
+    assert_eq!(p.problems.len(), 3, "{:?}", p.problems);
+    // A chain of files: 64 used, then 65, which is said to be a chain, not a cycle.
+    let chain = |n: usize| {
+        let mut files: Vec<(String, String)> = (1..n).map(|i| (format!("u{}.qwe", i), format!("use u{}.qwe\n", i + 1))).collect();
+        files.push((format!("u{}.qwe", n), "fn last() = 1\n".to_string()));
+        files.push(("main.qwe".into(), "use u1.qwe\nprint(last())\n".into()));
+        files
+    };
+    for (n, passes) in [(64, true), (65, false)] {
+        let files = chain(n);
+        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let d = s11_dir(&format!("q822-chain-{}", n), &refs);
+        let (ok, out, _) = s11_check(&d, "main.qwe");
+        assert_eq!(ok, passes, "{}: {}", n, out);
+        if !passes {
+            assert!(out.contains("./u64.qwe:1: error: this `use` is the end of a chain of files more than 64 deep, each used by the one before"), "{}", out);
+            assert!(!out.contains("each other"), "{}", out);
+        }
+    }
+    // A used file's repeated `use` is said at the path the program writes.
+    let d = s11_dir("q822-paths", &[
+        ("lib/a.qwe", "use lib/b.qwe\nuse lib/b.qwe\nfn a() = b()\n"),
+        ("lib/b.qwe", "fn b() = 1\n"),
+        ("main.qwe", "use lib/a.qwe\nprint(a())\n"),
+        ("js1.qwe", "client \"javascript:alert(1)\" use L\n"),
+        ("js2.qwe", "client \"data:text/javascript,1\" use L\n"),
+        ("js3.qwe", "client \"x\\\".js\" use L\nprint(1)\n"),
+        ("js4.qwe", "client \"x\\\".js\" L\n"),
+        ("js5.qwe", "client lib/a.qwe use a\n"),
+    ]);
+    let (ok, out, _) = s11_check(&d, "main.qwe");
+    assert!(ok && out.starts_with("./lib/a.qwe:2: warning: lib/b.qwe is taken a second time in this file: once is enough\n"), "{}", out);
+    for (f, want) in [
+        ("js1.qwe", "js1.qwe:1: error: `client` is for what runs in the browser, a .js or .mjs file or an http(s) address, and `javascript:alert(1)` is neither\n"),
+        ("js2.qwe", "js2.qwe:1: error: `client` is for what runs in the browser, a .js or .mjs file or an http(s) address, and `data:text/javascript,1` is neither\n"),
+        ("js4.qwe", "js4.qwe:1: error: `client` takes names from a file, and says which after `use`: client \"x\\\".js\" use L\n"),
+        ("js5.qwe", "js5.qwe:1: error: `client` is for what runs in the browser, a .js or .mjs file or an address; lib/a.qwe is Quillo: import lib/a.qwe use ...\n"),
+    ] {
+        let (ok, out, _) = s11_check(&d, f);
+        assert!(!ok && out == format!("{}quillo: 1 error\n", want), "{}: {}", f, out);
+    }
+    let (ok, out, _) = s11_check(&d, "js3.qwe");
+    assert!(ok, "{}", out);
+    if !s11_cargo() {
+        return;
+    }
+    // The `!` of "does not fit" stays out of the text, in a list and in a list of lists; a
+    // number too large for an int names the function.
+    let d = s11_dir("q822-native", &[
+        ("n.rs", "//! effects: none\npub fn small(xs: Vec<u8>) -> i64 { xs.len() as i64 }\npub fn deeper(xs: Vec<Vec<u8>>) -> i64 { xs.len() as i64 }\npub fn big() -> u64 { u64::MAX }\npub fn fits() -> u64 { i64::MAX as u64 }\n"),
+        ("broken.rs", "pub fn none() -> i64 { not_there() }\npub fn also_none() -> i64 { 2 }\n"),
+        ("main.qwe", "use n.rs\nprint(small([1, 255]), deeper([[1], [2, 3]]), fits())\n"),
+    ]);
+    let (ok, out, err) = s11_quillo(&d, &["run", "main.qwe"]);
+    assert!(ok && out == "2 2 9223372036854775807\n", "{}{}", out, err);
+    for (call, want) in [
+        ("small([1, 256])", "`small`: argument `xs` does not fit in u8: 256 (item 1)"),
+        ("deeper([[1], [1, -1]])", "`deeper`: argument `xs` does not fit in u8: -1 (item 1) (item 1)"),
+        ("small([\"x\"])", "`small`: argument `xs` must be a list of int, got str (item 0)"),
+        ("big()", "`big` (n.rs) gave back 18446744073709551615, which is too large for Quillo's int: give it back as text"),
+    ] {
+        std::fs::write(d.join("bad.qwe"), format!("use n.rs\nprint({})\n", call)).unwrap();
+        let (ok, _, err) = s11_quillo(&d, &["run", "bad.qwe"]);
+        assert!(!ok && err.contains(&format!("bad.qwe:2: {}\n", want)) && !err.contains('!'), "{}: {}", call, err);
+    }
+    // A failed build of functions that take nothing shows the file's error, not the glue's.
+    std::fs::write(d.join("bad.qwe"), "use broken.rs\nprint(also_none())\n").unwrap();
+    let (ok, _, err) = s11_quillo(&d, &["run", "bad.qwe"]);
+    assert!(!ok && err.contains("not_there") && !err.contains("unused variable"), "{}", err);
+}
+
+// ---- end of slice 11 ----
+
 /// A component with a builtin's errors in each place they become text, and one the program
 /// wrote: `json` with `json.parse`'s, whose message the two sides word differently.
 fn errors_program(json: bool) -> String {

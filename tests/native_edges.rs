@@ -156,7 +156,7 @@ fn types_are_written_any_way_rust_takes() {
 
 #[test]
 fn a_name_that_is_not_there_gets_the_nearest() {
-    let e = |n: &str, f: &str| Export { name: n.into(), params: Vec::new(), ret: None, line: 1, doc: f.into(), effects: quillo::ast::ALL_EFFECTS };
+    let e = |n: &str, f: &str| Export { name: n.into(), params: Vec::new(), ret: None, line: 1, doc: f.into(), effects: quillo::ast::ALL_EFFECTS, cfg: Vec::new() };
     let have = [e("greet", ""), e("sum", "")];
     assert_eq!(native::missing_export("x.qwer", "gret", &have), "x.qwer has no function `gret` (did you mean `greet`?)");
     assert_eq!(native::missing_export("x.qwer", "completely", &have), "x.qwer has no function `completely`; it has `greet`, `sum`");
@@ -252,8 +252,9 @@ fn a_name_that_cannot_start_a_crate_is_made_one_that_can() {
 fn the_compiler_is_heard_on_what_is_not_the_files_fault_too() {
     building();
     let d = dir("check");
-    // The code made around the file cannot take this: on its first line.
-    std::fs::write(d.join("around.qwer"), "pub fn f(x: Vec<&str>) -> i64 { x.len() as i64 }\n").unwrap();
+    // The code made around the file cannot take this: on its first line. (`Vec<&str>` was such a
+    // case, and is refused before the build now: FEEDBACK55.md, Q-813; branch feedback55.)
+    std::fs::write(d.join("around.qwer"), "pub struct P;\npub fn f() -> Result<i64, P> { Ok(1) }\n").unwrap();
     let notes = native::check(&d.join("around.qwer")).unwrap();
     assert!(notes.iter().any(|n| n.error && n.line == 1 && n.col == 0), "{:?}", notes);
     // A crate that cannot be had: what cargo says.

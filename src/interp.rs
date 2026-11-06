@@ -102,7 +102,13 @@ pub struct Interp {
     // on the program (`fork`), which is then a few reference counts.
     pub routes: Arc<Vec<Arc<RouteDef>>>,
     pub base_dir: Arc<Path>,
+    /// What `use`, `mount` and `service` paths count from, for a main file that is a link: the
+    /// folder of the file it leads to; empty, `base_dir` (see `src_dir()`).
+    src_dir: Arc<Path>,
     pub(crate) loaded: Arc<HashSet<PathBuf>>,
+    /// The Rust files a `use` has taken every name of, where the names are the program's
+    /// (FEEDBACK55.md, Q-816; branch feedback55).
+    rust_whole: Arc<HashSet<PathBuf>>,
     /// What each file's names are called in the program (src/modules.rs).
     links: Arc<crate::modules::Links>,
     /// Files of programs this one mounts or calls as services: watched
@@ -1459,7 +1465,9 @@ impl Interp {
             globals,
             routes: Arc::new(Vec::new()),
             base_dir: Arc::from(base_dir.into().as_path()),
+            src_dir: Arc::from(Path::new("")),
             loaded: Arc::new(HashSet::new()),
+            rust_whole: Arc::new(HashSet::new()),
             links: Default::default(),
             watched: Arc::new(HashSet::new()),
             via_links: Arc::new(HashSet::new()),
@@ -1567,7 +1575,9 @@ impl Interp {
             globals: self.globals.clone(),
             routes: self.routes.clone(),
             base_dir: self.base_dir.clone(),
+            src_dir: self.src_dir.clone(),
             loaded: self.loaded.clone(),
+            rust_whole: self.rust_whole.clone(),
             links: self.links.clone(),
             watched: self.watched.clone(),
             via_links: self.via_links.clone(),
@@ -1677,6 +1687,18 @@ impl Interp {
     /// A file reached through a symbolic link, of its own or of a folder on its way, is watched
     /// by that way too, so a link pointed elsewhere (`ln -sfn`, a `current` release) is seen
     /// (FEEDBACK31.md, Q-383; branch feedback27-35-fixes).
+    /// What `use`, `mount` and `service` paths count from: the program's folder, or for a main
+    /// file that is a link, the folder of the file it leads to, where they were looked for
+    /// beside the link (FEEDBACK55.md, Q-817; branch feedback55). The policy, `.env` and data
+    /// count from `base_dir`, as given.
+    pub(crate) fn src_dir(&self) -> &Path {
+        if self.src_dir.as_os_str().is_empty() {
+            &self.base_dir
+        } else {
+            &self.src_dir
+        }
+    }
+
     fn note_link(&mut self, path: &Path) {
         let abs = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir().map(|d| d.join(path)).unwrap_or_else(|_| path.to_path_buf()) };
         if abs.ancestors().any(|a| a.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink())) {
@@ -2015,7 +2037,8 @@ impl Interp {
         let mut stmts = parse_cached(src, abs.clone(), file, None)?;
         // What each file sees, before any of them runs (src/modules.rs).
         if stmts.iter().any(|s| matches!(s, Stmt::Use(p, ..) if !crate::ast::is_script(p))) {
-            let links = crate::modules::link(Path::new(file), stmts.clone(), &self.base_dir, &mut |_, full| {
+            let src_dir = self.src_dir().to_path_buf();
+            let links = crate::modules::link(Path::new(file), stmts.clone(), &src_dir, &mut |_, full| {
                 let src = crate::error::read_source(full).ok()?;
                 parse_cached(&src, source_path(full), &full.display().to_string(), None).ok()
             });
@@ -2171,12 +2194,20 @@ impl Interp {
         let src = crate::error::read_source(path)
             .map_err(|e| QuilloError::new(format!("cannot read {}: {}", path.display(), e), 0))?;
         if let Ok(p) = path.canonicalize() {
+            // Its private names' tags count from its folder, wherever it was started from
+            // (FEEDBACK55.md, Q-807; branch feedback55).
+            crate::privacy::set_root(p.parent().unwrap_or(Path::new("/")));
             // Known by identity too, as a second hard link to it is it (FEEDBACK55.md, Q-701;
             // branch feedback55).
             crate::builtins::protect(&p, crate::builtins::OWN_SOURCE);
             Arc::make_mut(&mut self.loaded).insert(p);
         }
         self.note_link(path);
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            self.src_dir = Arc::from(crate::modules::source_dir(path).as_path());
+        } else {
+            self.src_dir = Arc::from(Path::new(""));
+        }
         // Nothing asks a program run from its file for its value.
         let keep = std::mem::replace(&mut self.keep_last, false);
         let r = self.load_source(&src, &path.display().to_string());
@@ -2244,27 +2275,52 @@ impl Interp {
             }
             // A browser library: its names, for components' code; on the server
             // they give null, as `js(...)` does (branch js-libraries).
-            Stmt::Use(path, Some(names), _, options) if crate::ast::is_script(path) => {
+            Stmt::Use(path, Some(names), line, options) if crate::ast::is_script(path) => {
                 for (global, name) in names {
-                    let libs = Arc::make_mut(&mut self.js_libs);
-                    let order = libs.get(name).map_or(libs.len(), |l| l.order);
                     // A module's exports go by the program's name for them, in the
                     // runtime (branch library-hints).
                     let (page_name, export) = if options.module { (name.clone(), Some(global.clone())) } else { (global.clone(), None) };
+                    // One name from two scripts: refused, as `check` refuses it, where the last
+                    // was every file's (FEEDBACK55.md, Q-808; branch feedback55).
+                    if let Some(l) = self.js_libs.get(name).filter(|l| l.src != *path || l.global != page_name || l.export != export) {
+                        return fail(*line, format!("`{}` is taken from {} already, and here from {}: a page has one `{}`, so take one of them under another name (`use {} as ...`)", name, l.src, path, name, global));
+                    }
+                    let libs = Arc::make_mut(&mut self.js_libs);
+                    let order = libs.get(name).map_or(libs.len(), |l| l.order);
                     libs.insert(name.clone(), crate::client::JsLib { global: page_name, src: path.clone(), order, hint: options.hint, export });
                     define(env, name, Value::Builtin("__jslib", crate::builtins::js_lib));
                 }
                 Ok(Value::Nil)
             }
-            Stmt::Use(path, names, line, _) => {
-                let from = self.cur_file.as_deref().map_or_else(|| self.base_dir.join("main.qwe"), PathBuf::from);
-                let path = &crate::modules::resolve_from(&self.base_dir, &from, path);
-                let full = self.base_dir.join(path);
+            Stmt::Use(path, names, line, options) => {
+                let src_dir = self.src_dir().to_path_buf();
+                let from = self.cur_file.as_deref().map_or_else(|| src_dir.join("main.qwe"), PathBuf::from);
+                // A path without its extension that two files could be: said, not one taken
+                // (FEEDBACK55.md, Q-819; branch feedback55).
+                if options.implied {
+                    let could = crate::modules::implied_files(&src_dir, &from, path);
+                    if could.len() > 1 {
+                        return fail(*line, crate::modules::two_files(&could));
+                    }
+                }
+                let path = &crate::modules::resolve_use(&src_dir, &from, path, options.implied);
+                let full = src_dir.join(path);
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
                 self.note_link(&full);
-                // A `.qwer` file's names are defined for each `use` that takes some
-                // (its library is built and opened once); anything else runs once.
-                if !Arc::make_mut(&mut self.loaded).insert(key.clone()) && (names.is_none() || !crate::native::is_rust(&path)) {
+                // The file's names for a Rust file's functions, its own (FEEDBACK55.md, Q-816;
+                // branch feedback55).
+                let links = self.links.clone();
+                let renames = if crate::native::is_rust(path) { links.rust_names(&crate::modules::key(&from)) } else { None };
+                // A `.qwer` file's names are defined for each `use` that takes some, or that
+                // calls them its own way, or the first that takes them all, after one that took
+                // some (its library is built and opened once); anything else runs once. A file
+                // taken whole after another took names of it had none (Q-816).
+                let first = Arc::make_mut(&mut self.loaded).insert(key.clone());
+                if crate::native::is_rust(path) {
+                    if names.is_none() && renames.is_none() && !Arc::make_mut(&mut self.rust_whole).insert(key.clone()) {
+                        return Ok(Value::Nil);
+                    }
+                } else if !first {
                     return Ok(Value::Nil);
                 }
                 // By identity too (FEEDBACK55.md, Q-701; branch feedback55).
@@ -2272,7 +2328,7 @@ impl Interp {
                 // Rust: built, loaded, and its functions defined (see `native`).
                 if crate::native::is_rust(&path) {
                     let fname = full.display().to_string();
-                    return match crate::native::use_file(self, &full, names.as_deref(), *line) {
+                    return match crate::native::use_file(self, &full, names.as_deref(), renames, *line) {
                         Err(Ctrl::Error(e)) => Err(Ctrl::Error(Box::new(e.in_file(&fname)))),
                         other => other.map(|_| Value::Nil),
                     };
@@ -2370,7 +2426,7 @@ impl Interp {
                 if !Arc::ptr_eq(env, &self.globals) {
                     return fail(*line, "`mount` must be at the top level");
                 }
-                let full = self.base_dir.join(file);
+                let full = self.src_dir().join(file);
                 let dir = full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| self.base_dir.to_path_buf());
                 let mut sub = Interp::with_shared(dir, self.shared.clone());
                 sub.services = self.services.clone();
@@ -3904,7 +3960,7 @@ impl Interp {
         let need = builtin_effect(name);
         if need & !self.allowed != 0 {
             if need == ALL_EFFECTS && name.starts_with("native:") {
-                return fail(line, crate::native::undeclared(crate::native::display_name(name), self.restrictor.as_ref().map(|f| f.name.as_str())));
+                return fail(line, crate::native::undeclared(crate::native::display_name(name), &crate::native::file_of(name), self.restrictor.as_ref().map(|f| f.name.as_str())));
             }
             // A site's function as it is written, `shop.notes` (FEEDBACK51.md, Q-640; branch
             // feedback51-fixes).

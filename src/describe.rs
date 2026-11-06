@@ -39,7 +39,9 @@ pub fn of_interp(it: &Interp, title: &str) -> J {
 pub fn of_source(path: &Path) -> Result<J, QuilloError> {
     let mut parts = Parts::default();
     let mut seen = Vec::new();
-    collect_file(path, path.parent().unwrap_or(Path::new(".")), "", &mut parts, &mut seen, 0)?;
+    // Its `use`s from the folder of the file a link leads to (FEEDBACK55.md, Q-817; branch feedback55).
+    let base = crate::modules::source_dir_or(path, path.parent().unwrap_or(Path::new(".")));
+    collect_file(path, &base, "", &mut parts, &mut seen, 0)?;
     let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     Ok(parts.document(&title))
 }
@@ -133,7 +135,7 @@ fn collect_file(path: &Path, base: &Path, prefix: &str, parts: &mut Parts, seen:
                     parts.callers.insert(format!("{}{}", prefix, name), who);
                 }
             }
-            Stmt::Use(p, ..) if !crate::ast::is_script(&p) => collect_file(&base.join(crate::modules::resolve_from(base, path, &p)), base, prefix, parts, seen, depth + 1)?,
+            Stmt::Use(p, _, _, o) if !crate::ast::is_script(&p) => collect_file(&base.join(crate::modules::resolve_use(base, path, &p, o.implied)), base, prefix, parts, seen, depth + 1)?,
             // A service with a prefix: its routes are served here.
             Stmt::Service(_, Some(p), file, _, _) => {
                 let full = base.join(&file);

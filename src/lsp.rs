@@ -137,7 +137,7 @@ fn uses_transitively(main: &Path, base: &Path, target: &Path) -> bool {
         for n in 0..lines.len() {
             let Some(u) = use_text(&lines, n, 0).and_then(|(l, _)| use_line(&l)) else { continue };
             // A `.qwer` file uses no other.
-            let path = crate::modules::resolve(base, &u.path);
+            let path = crate::modules::resolve_use(base, &f, &u.path, u.implied);
             if crate::native::is_rust(&path) {
                 continue;
             }
@@ -162,6 +162,9 @@ struct UseLine {
     at: (usize, usize),
     /// A first line whose `use` is on the next one, or not written yet.
     open: bool,
+    /// Its path was written without an extension, as `LibOptions::implied` (FEEDBACK55.md,
+    /// Q-819; branch feedback55).
+    implied: bool,
 }
 
 fn use_line(src: &str) -> Option<UseLine> {
@@ -201,8 +204,9 @@ fn use_line(src: &str) -> Option<UseLine> {
         }
         u.path = word(start, e).replace('\\', "/");
         u.at = (start, e);
-        if !u.path.ends_with(".qwe") && !crate::native::is_rust(&u.path) && !crate::ast::is_script(&u.path) {
+        if !crate::native::ends_with_any_case(&u.path, ".qwe") && !crate::native::is_rust(&u.path) && !crate::ast::is_script(&u.path) {
             u.path.push_str(".qwer");
+            u.implied = true;
         }
         i = skip((e + quoted as usize).min(chars.len()));
         if word(i, word_end(i)) != "use" {
@@ -300,8 +304,9 @@ fn use_line(src: &str) -> Option<UseLine> {
         return None;
     }
     u.path = word(i, e).replace('\\', "/");
-    if !u.path.ends_with(".qwe") && !crate::native::is_rust(&u.path) {
+    if !crate::native::ends_with_any_case(&u.path, ".qwe") && !crate::native::is_rust(&u.path) {
         u.path.push_str(if u.names.is_empty() { ".qwe" } else { ".qwer" });
+        u.implied = true;
     }
     u.at = (i, e);
     Some(u)
@@ -924,7 +929,7 @@ impl Server {
         let (src, at) = use_text(&lines, line, char_col(lines.get(line)?, col))?;
         let u = use_line(&src)?;
         let base = use_base(&uri_to_path(&uri));
-        let full = base.join(crate::modules::resolve_from(&base, &uri_to_path(&uri), &u.path));
+        let full = base.join(crate::modules::resolve_use(&base, &uri_to_path(&uri), &u.path, u.implied));
         if at >= u.at.0 && at <= u.at.1 {
             return Some((u, full, None));
         }
@@ -1033,7 +1038,7 @@ impl Server {
     /// The names a file gives, but for those `u` takes elsewhere than column `a`.
     fn names_of(&self, doc: &Doc, uri: &str, u: &UseLine, a: usize) -> Vec<J> {
         let base = use_base(&uri_to_path(uri));
-        let full = base.join(crate::modules::resolve_from(&base, &uri_to_path(uri), &u.path));
+        let full = base.join(crate::modules::resolve_use(&base, &uri_to_path(uri), &u.path, u.implied));
         // A `.qwe` file: its public names, of those not yet taken (FEEDBACK19.md,
         // Q-154; branch feedback19-fixes).
         if full.extension().is_some_and(|e| e == "qwe") {

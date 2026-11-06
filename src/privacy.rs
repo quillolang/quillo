@@ -20,14 +20,34 @@ use std::sync::Arc;
 /// What ends every private name: `helper` is `helper__pv1a2b3c4d`.
 pub const MARK: &str = "__pv";
 
-/// The eight hex digits of a file: from its path as seen from the folder the program
-/// runs in, so they are the same on every server and after every deploy.
+/// What starts a renaming's key for a type's name, as written in annotations (`p: P`), which
+/// no other name is renamed in: `import lib.qwe use Point as P` (FEEDBACK55.md, Q-821; branch
+/// feedback55). No name has a space.
+pub const TYPE_ALIAS: &str = "type ";
+
+/// The folder of the program's main file, once it is loaded: what a file's tag counts from.
+static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Where a service run apart (`--split`) is told the app's folder, so its tags are the ones
+/// the app's process gives the same files.
+pub const ROOT_ENV: &str = "QUILLO_PROGRAM_ROOT";
+
+/// Says where the program is: the folder of the file given to `quillo run` (the first one
+/// loaded in the process; a mounted program's files count from there too).
+pub fn set_root(dir: &std::path::Path) {
+    let _ = ROOT.get_or_init(|| dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()));
+}
+
+/// The eight hex digits of a file: from its path as seen from the program's folder, so they
+/// are the same on every server, after every deploy, and from whatever folder the program was
+/// started: it was the folder it ran in, so copies started from two folders each ran a
+/// `schedule` job of a private function (FEEDBACK55.md, Q-807; branch feedback55). A file
+/// outside the program's folder is its way from there (`../shared/x.qwe`).
 pub fn tag(file: Option<&str>, src: &str) -> String {
     let key = match file {
         Some(f) => {
-            let p = std::path::Path::new(f);
-            let rel = std::env::current_dir().ok().and_then(|d| p.strip_prefix(&d).ok().map(|r| r.to_path_buf()));
-            rel.map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_else(|| f.to_string())
+            let root = ROOT.get().cloned().or_else(|| std::env::current_dir().ok());
+            root.and_then(|r| relative(std::path::Path::new(f), &r)).unwrap_or_else(|| f.to_string())
         }
         None => src.to_string(),
     };
@@ -38,6 +58,21 @@ pub fn tag(file: Option<&str>, src: &str) -> String {
         h = h.wrapping_mul(0x01000193);
     }
     format!("{:08x}", h)
+}
+
+/// `p` as a way from the folder `root`, `/` between its parts: both absolute, or nothing.
+fn relative(p: &std::path::Path, root: &std::path::Path) -> Option<String> {
+    if !p.is_absolute() || !root.is_absolute() {
+        return None;
+    }
+    let (a, b): (Vec<_>, Vec<_>) = (p.components().collect(), root.components().collect());
+    // Another drive (Windows) has no way from here.
+    if a.first() != b.first() {
+        return None;
+    }
+    let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let parts: Vec<String> = std::iter::repeat_n("..".to_string(), b.len() - common).chain(a[common..].iter().map(|c| c.as_os_str().to_string_lossy().into_owned())).collect();
+    Some(parts.join("/"))
 }
 
 pub fn mangle(name: &str, tag: &str) -> String {
@@ -85,7 +120,8 @@ pub fn rename(stmts: &mut [Stmt], names: &HashSet<String>, tag: &str) -> Result<
 /// Renames names in a parsed file as `map` says, which is how a file's names get their
 /// names in the program (src/modules.rs). `what` is how an error calls such a name.
 pub fn rename_as(stmts: &mut [Stmt], map: &HashMap<String, String>, what: &str) -> Result<(), crate::error::QuilloError> {
-    let r = Renamer { map, what };
+    let types = map.keys().any(|k| k.starts_with(TYPE_ALIAS));
+    let r = Renamer { map, what, types };
     for s in stmts.iter_mut() {
         r.stmt(s)?;
     }
@@ -95,6 +131,8 @@ pub fn rename_as(stmts: &mut [Stmt], map: &HashMap<String, String>, what: &str) 
 struct Renamer<'a> {
     map: &'a HashMap<String, String>,
     what: &'a str,
+    /// Whether `map` renames a type.
+    types: bool,
 }
 
 type R = Result<(), crate::error::QuilloError>;
@@ -109,6 +147,30 @@ impl Renamer<'_> {
     fn sym(&self, n: &mut Sym) {
         if let Some(to) = self.map.get(n.as_str()) {
             *n = to.into();
+        }
+    }
+
+    /// A type annotation, by what the file calls its types (Q-821).
+    fn ty(&self, t: &mut Ty) {
+        if !self.types {
+            return;
+        }
+        for n in t.names.iter_mut() {
+            self.type_name(n);
+        }
+        if let Some(e) = t.elem.as_mut() {
+            self.ty(e);
+        }
+        for (_, f) in t.fields.iter_mut().flatten() {
+            self.ty(f);
+        }
+    }
+
+    fn type_name(&self, n: &mut String) {
+        if self.types {
+            if let Some(to) = self.map.get(&format!("{}{}", TYPE_ALIAS, n)) {
+                *n = to.clone();
+            }
         }
     }
 
@@ -146,6 +208,12 @@ impl Renamer<'_> {
                 self.expr(e)
             }
             Stmt::Service(_, _, _, Some(e), _) => self.expr(e),
+            Stmt::Type(td) if self.types => {
+                if let Some(td) = Arc::get_mut(td) {
+                    self.ty(&mut td.ty);
+                }
+                Ok(())
+            }
             Stmt::Type(_) | Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Return(None, _) => Ok(()),
         }
     }
@@ -162,9 +230,15 @@ impl Renamer<'_> {
                 ));
             }
             self.sym(&mut p.name);
+            if let Some(t) = p.ty.as_mut() {
+                self.ty(t);
+            }
             if let Some(d) = p.default.as_mut() {
                 self.expr(d)?;
             }
+        }
+        for t in def.ret.iter_mut().chain(def.err.iter_mut()) {
+            self.ty(t);
         }
         self.expr(&mut def.body)
     }
@@ -203,7 +277,8 @@ impl Renamer<'_> {
                     }
                 }
             }
-            Pattern::Wild | Pattern::Lit(_) | Pattern::Type(_) => {}
+            Pattern::Type(n) => self.type_name(n),
+            Pattern::Wild | Pattern::Lit(_) => {}
         }
         Ok(())
     }

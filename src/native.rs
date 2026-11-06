@@ -41,13 +41,20 @@ use std::sync::{Arc, Mutex, OnceLock};
 type R = Result<Value, Ctrl>;
 
 /// Bumped when the generated code changes, so libraries are built again.
-const GLUE_VERSION: &str = "1";
+const GLUE_VERSION: &str = "2";
 
 /// Whether `path` is Rust for the program: a `.qwer` file, or a `.rs` one a `use` names, which
 /// editors, `rustfmt` and clippy know as Rust (FEEDBACK37.md, Q-453; branch feedback36-39). A
 /// crate's own `src/*.rs` beside the program is left alone, as nothing uses it.
 pub fn is_rust(path: &str) -> bool {
-    path.ends_with(".qwer") || path.ends_with(".rs")
+    // In any case, as `is_script` reads `.JS`: `use "Tools.RS"` read the Rust as Quillo
+    // (FEEDBACK55.md, Q-820; branch feedback55).
+    ends_with_any_case(path, ".qwer") || ends_with_any_case(path, ".rs")
+}
+
+/// Whether `path` ends with `ext` (ASCII), whatever their case.
+pub fn ends_with_any_case(path: &str, ext: &str) -> bool {
+    path.len() >= ext.len() && path.as_bytes()[path.len() - ext.len()..].eq_ignore_ascii_case(ext.as_bytes())
 }
 
 // ---- reading a .qwer file ----------------------------------------------------
@@ -66,6 +73,8 @@ pub struct Export {
     /// What it may do, from the file's `//! effects:` line: every effect when the file
     /// declares none (FEEDBACK41.md, Q-476; FEEDBACK43.md, Q-489; branch feedback40-43).
     pub effects: u8,
+    /// What its `#[cfg(...)]` attributes say, each: its glue is built where it is (Q-813).
+    pub cfg: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -84,7 +93,31 @@ pub fn parse(src: &str) -> Parsed {
     let mut out = Parsed::default();
     // The header: `//!` lines at the top, from `[dependencies]` on.
     let mut in_deps = false;
+    let mut skipping: Option<&str> = None;
     for (n, line) in src.lines().enumerate() {
+        // A licence line, a blank one or `#![allow(...)]` before it is no end of the header: Rust
+        // takes `//!` lines after them, and the header was missed (FEEDBACK55.md, Q-814; branch
+        // feedback55). A `///` line is the first item's.
+        let t = line.trim();
+        // A block comment, or an attribute, on several lines: to its end.
+        if let Some(close) = skipping {
+            if t.contains(close) {
+                skipping = None;
+            }
+            continue;
+        }
+        let block = t.starts_with("/*") && !t.starts_with("/*!") && !t.starts_with("/**");
+        if block || t.starts_with("#![") {
+            let (open, close) = if block { ("/*", "*/") } else { ("#![", "]") };
+            if !t[open.len()..].contains(close) {
+                skipping = Some(close);
+            }
+            continue;
+        }
+        let doc = t.starts_with("///") && !t.starts_with("////");
+        if t.is_empty() || (t.starts_with("//") && !t.starts_with("//!") && !doc) {
+            continue;
+        }
         let Some(rest) = line.trim_start().strip_prefix("//!") else { break };
         let rest = rest.strip_prefix(' ').unwrap_or(rest);
         if let Some(list) = rest.trim().strip_prefix("effects:") {
@@ -113,6 +146,7 @@ pub fn parse(src: &str) -> Parsed {
     let b = src.as_bytes();
     let (mut i, mut depth, mut line) = (0usize, 0i32, 1u32);
     let mut doc = String::new();
+    let mut cfg: Vec<String> = Vec::new();
     while i < b.len() {
         let c = b[i];
         // Comments: `///` above an item is its documentation.
@@ -132,7 +166,7 @@ pub fn parse(src: &str) -> Parsed {
             i = end;
             continue;
         }
-        if c == b'"' || (c == b'r' && matches!(b.get(i + 1), Some(b'"' | b'#')) && (i == 0 || !is_ident(b[i - 1]))) {
+        if c == b'"' || raw_string_at(b, i) {
             let end = skip_string(src, i);
             line += src[i..end].matches('\n').count() as u32;
             i = end;
@@ -141,6 +175,23 @@ pub fn parse(src: &str) -> Parsed {
         if c == b'\'' {
             i = skip_char(b, i);
             continue;
+        }
+        // An attribute: a `pub fn`'s `#[cfg(...)]` goes on its glue too, which called a function
+        // the build left out (FEEDBACK55.md, Q-813; branch feedback55).
+        if depth == 0 && c == b'#' && matches!(b.get(i + 1), Some(b'[' | b'!')) {
+            let open = if b[i + 1] == b'!' { i + 2 } else { i + 1 };
+            if b.get(open) == Some(&b'[') {
+                let end = attribute_end(src, open);
+                let inner = if end > open + 1 && b[end - 1] == b']' { src[open + 1..end - 1].trim() } else { "" };
+                if open == i + 1 {
+                    if let Some(p) = inner.strip_prefix("cfg").map(str::trim_start).and_then(|r| r.strip_prefix('(')).and_then(|r| r.strip_suffix(')')) {
+                        cfg.push(p.trim().to_string());
+                    }
+                }
+                line += src[i..end].matches('\n').count() as u32;
+                i = end;
+                continue;
+            }
         }
         match c {
             b'\n' => {
@@ -151,7 +202,12 @@ pub fn parse(src: &str) -> Parsed {
                 }
             }
             b'{' => depth += 1,
-            b'}' => depth -= 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    cfg.clear();
+                }
+            }
             _ => {}
         }
         if depth == 0 && c == b'p' && (i == 0 || !is_ident(b[i - 1])) && src[i..].starts_with("pub") && !b.get(i + 3).is_some_and(|x| is_ident(*x)) {
@@ -159,6 +215,7 @@ pub fn parse(src: &str) -> Parsed {
                 Some((Ok(mut e), end)) => {
                     e.line = line;
                     e.doc = std::mem::take(&mut doc).trim_end().to_string();
+                    e.cfg = std::mem::take(&mut cfg);
                     line += src[i..end].matches('\n').count() as u32;
                     out.exports.push(e);
                     i = end;
@@ -168,9 +225,11 @@ pub fn parse(src: &str) -> Parsed {
                 None => {}
             }
             doc.clear();
+            cfg.clear();
         }
         if depth == 0 && c == b';' {
             doc.clear();
+            cfg.clear();
         }
         i += 1;
     }
@@ -180,6 +239,20 @@ pub fn parse(src: &str) -> Parsed {
     for e in std::mem::take(&mut out.exports) {
         if e.params.iter().any(|(_, t)| t.starts_with("&mut")) {
             out.problems.push((e.line, format!("`{}` is not exported: a `&mut` parameter would change nothing Quillo sees", e.name)));
+            continue;
+        }
+        // What the glue cannot make from a value: a reference inside another type, or one that
+        // lives longer than the call. `check` took them, and the build failed in Quillo's own
+        // file (FEEDBACK55.md, Q-813 and Q-815; branch feedback55).
+        if let Some((_, t)) = e.params.iter().find(|(_, t)| t.contains('\'') || t.trim_start_matches('&').contains('&')) {
+            let hint = if t.contains('\'') { "take `&str` or `String`".to_string() } else { format!("take `{}`", owned(t)) };
+            out.problems.push((e.line, format!("`{}` is not exported: a parameter of type `{}` cannot be made from a Quillo value: {}", e.name, t, hint)));
+            continue;
+        }
+        // A word of Quillo's names no function a program can call (FEEDBACK55.md, Q-822; branch
+        // feedback55).
+        if crate::parser::KEYWORDS.contains(&e.name.as_str()) {
+            out.problems.push((e.line, format!("`{}` is not exported: `{}` is a word of Quillo's, which no call can name, so rename it", e.name, e.name)));
             continue;
         }
         let bad = e.params.iter().map(|(_, t)| t.as_str()).chain(e.ret.as_deref()).find_map(|t| quillo_type(t).err());
@@ -192,8 +265,53 @@ pub fn parse(src: &str) -> Parsed {
     out
 }
 
+/// A type with each reference in it made a value of its own: `Option<&str>` is `Option<String>`,
+/// `&[i64]` is `Vec<i64>` (Q-813).
+fn owned(t: &str) -> String {
+    let mut out = String::new();
+    let mut rest = t;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = rest[at + 1..].trim_start();
+        if let Some(r) = rest.strip_prefix("str").filter(|r| !r.starts_with(|c: char| c.is_alphanumeric() || c == '_')) {
+            out.push_str("String");
+            rest = r;
+        } else if rest.starts_with('[') {
+            // A slice, or an array, which cannot cross either: a Vec of what it holds.
+            let close = matching(rest, 0).unwrap_or(rest.len() - 1);
+            let inner = &rest[1..close];
+            let mut depth = 0;
+            let semi = inner.find(|c| {
+                match c {
+                    '[' | '<' | '(' => depth += 1,
+                    ']' | '>' | ')' => depth -= 1,
+                    _ => {}
+                }
+                depth == 0 && c == ';'
+            });
+            let item = inner[..semi.unwrap_or(inner.len())].trim();
+            out.push_str(&format!("Vec<{}>", owned(&item)));
+            rest = &rest[close + 1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn is_ident(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
+}
+
+/// Whether a raw string starts at `i`: `r"`, `r#"` (as many `#`), or after a `b`, `br"`. `r#`
+/// and a letter is a raw identifier, `r#type`, which was read as a string that never ended
+/// and hid every `pub fn` after it (FEEDBACK55.md, Q-811; branch feedback55).
+fn raw_string_at(b: &[u8], i: usize) -> bool {
+    let starts_word = |at: usize| at == 0 || !is_ident(b[at - 1]);
+    if b[i] != b'r' || !(starts_word(i) || (b[i - 1] == b'b' && starts_word(i - 1))) {
+        return false;
+    }
+    let hashes = b[i + 1..].iter().take_while(|c| **c == b'#').count();
+    b.get(i + 1 + hashes) == Some(&b'"')
 }
 
 fn skip_string(src: &str, i: usize) -> usize {
@@ -241,22 +359,43 @@ fn item(src: &str, from: usize, _line: u32) -> Option<(Result<Export, String>, u
     };
     let at = from + after;
     let body = &src[at..];
-    let name: String = body.trim_start().chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    // `pub fn r#match()`: its name is `match` (Q-811).
+    let named = body.trim_start();
+    let named = named.strip_prefix("r#").unwrap_or(named);
+    let name: String = named.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    if name.is_empty() {
+        return None;
+    }
     let name_end = at + body.find(&name)? + name.len();
     // The signature runs to the body's `{` (or a `;`), outside brackets: an
     // array type has a `;` of its own (FEEDBACK16.md, Q-142; branch feedback20-fixes).
-    let mut depth = 0;
-    let sig_end = name_end
-        + src[name_end..].find(|c| {
-            match c {
-                '(' | '[' => depth += 1,
-                ')' | ']' => depth -= 1,
-                _ => {}
-            }
-            depth == 0 && matches!(c, '{' | ';')
-        })?;
-    let sig = &src[name_end..sig_end];
-    let end = if src.as_bytes()[sig_end] == b'{' { block_end(src, sig_end) } else { sig_end + 1 };
+    // Comments in it are not read: `// in cents` after a parameter, or `/* left */`, was read
+    // as part of it (FEEDBACK55.md, Q-815; branch feedback55).
+    let (mut depth, mut j, b) = (0, name_end, src.as_bytes());
+    let mut sig = String::new();
+    let sig_end = loop {
+        let c = *b.get(j)?;
+        if c == b'/' && b.get(j + 1) == Some(&b'/') {
+            j = src[j..].find('\n').map_or(b.len(), |n| j + n);
+            sig.push(' ');
+            continue;
+        }
+        if c == b'/' && b.get(j + 1) == Some(&b'*') {
+            j = src[j + 2..].find("*/").map_or(b.len(), |n| j + 2 + n + 2);
+            sig.push(' ');
+            continue;
+        }
+        match c {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b'{' | b';' if depth == 0 => break j,
+            _ => {}
+        }
+        let ch = src[j..].chars().next()?;
+        sig.push(ch);
+        j += ch.len_utf8();
+    };
+    let end = if b[sig_end] == b'{' { block_end(src, sig_end) } else { sig_end + 1 };
     if !kind.is_empty() {
         return Some((Err(format!("`{}` is not exported: `{} fn` cannot be called from Quillo", name, kind)), end));
     }
@@ -271,11 +410,40 @@ fn item(src: &str, from: usize, _line: u32) -> Option<(Result<Export, String>, u
         let Some((pat, ty)) = p.split_once(':') else {
             return Some((Err(format!("`{}`: cannot read the parameter `{}`", name, p)), end));
         };
-        let pat = pat.trim().trim_start_matches("mut ").trim().to_string();
+        let pat = pat.trim().trim_start_matches("mut ").trim();
+        let pat = pat.strip_prefix("r#").unwrap_or(pat).to_string();
         params.push((pat, norm(ty)));
     }
     let ret = sig[close + 1..].trim().strip_prefix("->").map(norm).filter(|t| t != "()");
-    Some((Ok(Export { name, params, ret, line: 0, doc: String::new(), effects: crate::ast::ALL_EFFECTS }), end))
+    Some((Ok(Export { name, params, ret, line: 0, doc: String::new(), effects: crate::ast::ALL_EFFECTS, cfg: Vec::new() }), end))
+}
+
+/// Where the attribute whose `[` is at `open` ends (past its `]`), strings and all.
+fn attribute_end(src: &str, open: usize) -> usize {
+    let b = src.as_bytes();
+    let (mut i, mut depth) = (open, 0);
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i = skip_string(src, i);
+                continue;
+            }
+            b'r' if raw_string_at(b, i) => {
+                i = skip_string(src, i);
+                continue;
+            }
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    b.len()
 }
 
 /// Where the block opening at `open` ends (past its `}`).
@@ -296,7 +464,7 @@ fn block_end(src: &str, open: usize) -> usize {
                 i = skip_string(src, i);
                 continue;
             }
-            b'r' if matches!(b.get(i + 1), Some(b'"' | b'#')) && !is_ident(b[i - 1]) => {
+            b'r' if raw_string_at(b, i) => {
                 i = skip_string(src, i);
                 continue;
             }
@@ -374,6 +542,19 @@ fn norm(t: &str) -> String {
 pub fn quillo_type(t: &str) -> Result<String, String> {
     let t = t.trim();
     let t = t.strip_prefix('&').map_or(t, str::trim);
+    // `&'static str`, as a function gives it back, is a `&str` (FEEDBACK55.md, Q-815; branch
+    // feedback55); a parameter that borrows for a lifetime is refused before this.
+    let t = t.strip_prefix("'static").map_or(t, str::trim);
+    // `std::io::Result<String>`, `std::vec::Vec<i64>`: the type by its own name, as a type
+    // without `<>` is (Q-815).
+    let unpathed;
+    let t = match t.find('<') {
+        Some(lt) if t[..lt].contains("::") => {
+            unpathed = format!("{}{}", t[..lt].rsplit("::").next().unwrap_or(""), &t[lt..]);
+            unpathed.as_str()
+        }
+        _ => t,
+    };
     let inner = |t: &str, head: &str| t.strip_prefix(head).and_then(|r| r.strip_suffix('>')).map(str::to_string);
     let last = t.rsplit("::").next().unwrap_or(t);
     Ok(match last {
@@ -406,7 +587,8 @@ pub fn quillo_type(t: &str) -> Result<String, String> {
             for h in ["HashMap<", "BTreeMap<", "std::collections::HashMap<", "std::collections::BTreeMap<"] {
                 if let Some(x) = inner(t, h) {
                     let parts = split_top(&x);
-                    if parts.first().map(|k| k.as_str()) != Some("String") {
+                    // `std::string::String` too (Q-815).
+                    if parts.first().map(|k| k.rsplit("::").next().unwrap_or(k)) != Some("String") {
                         return Err(format!("a map's keys are text: {} must have String keys", t));
                     }
                     quillo_type(parts.get(1).map_or("()", |s| s.as_str()))?;
@@ -430,7 +612,24 @@ mod __quillo {
     use serde_json::Value;
     use std::collections::{BTreeMap, HashMap, VecDeque};
 
+    /// A float JSON has no number for (NaN, an infinity), as Quillo sends it, and is sent it.
+    pub const SPECIAL: &str = "\u{0}f64";
+    fn special(v: &Value) -> Option<f64> {
+        match v {
+            Value::Object(o) if o.len() == 1 => match o.get(SPECIAL)?.as_str()? {
+                "NaN" => Some(f64::NAN),
+                "inf" => Some(f64::INFINITY),
+                "-inf" => Some(f64::NEG_INFINITY),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn kind(v: &Value) -> &'static str {
+        if special(v).is_some() {
+            return "float";
+        }
         match v {
             Value::Null => "null",
             Value::Bool(_) => "bool",
@@ -463,7 +662,7 @@ mod __quillo {
             }
             impl ToQ for $t {
                 fn to_q(self) -> Result<Value, String> {
-                    i64::try_from(self).map(Value::from).map_err(|_| format!("{} is too large for Quillo's int", self))
+                    i64::try_from(self).map(Value::from).map_err(|_| format!("{}, which is too large for Quillo's int: give it back as text", self))
                 }
             }
         )*};
@@ -472,6 +671,9 @@ mod __quillo {
 
     impl FromQ for f64 {
         fn from_q(v: Value) -> Result<Self, String> {
+            if let Some(f) = special(&v) {
+                return Ok(f);
+            }
             v.as_f64().ok_or_else(|| format!("float, got {}", kind(&v)))
         }
     }
@@ -482,7 +684,14 @@ mod __quillo {
     }
     impl ToQ for f64 {
         fn to_q(self) -> Result<Value, String> {
-            serde_json::Number::from_f64(self).map(Value::Number).ok_or_else(|| format!("{} is not a number Quillo has", self))
+            Ok(match serde_json::Number::from_f64(self) {
+                Some(n) => Value::Number(n),
+                None => {
+                    let mut o = serde_json::Map::new();
+                    o.insert(SPECIAL.to_string(), Value::from(if self.is_nan() { "NaN" } else if self > 0.0 { "inf" } else { "-inf" }));
+                    Value::Object(o)
+                }
+            })
         }
     }
     impl ToQ for f32 {
@@ -564,7 +773,11 @@ mod __quillo {
     impl<T: FromQ> FromQ for Vec<T> {
         fn from_q(v: Value) -> Result<Self, String> {
             match v {
-                Value::Array(a) => a.into_iter().enumerate().map(|(i, x)| T::from_q(x).map_err(|e| format!("a list of {} (item {})", e, i))).collect(),
+                // "does not fit" keeps its mark in front (FEEDBACK55.md, Q-822; branch feedback55).
+                Value::Array(a) => a.into_iter().enumerate().map(|(i, x)| T::from_q(x).map_err(|e| match e.strip_prefix('!') {
+                    Some(e) => format!("!{} (item {})", e, i),
+                    None => format!("a list of {} (item {})", e, i),
+                })).collect(),
                 v => Err(format!("list, got {}", kind(&v))),
             }
         }
@@ -664,12 +877,19 @@ fn glue(qwer: &Path, exports: &[Export]) -> String {
     s.push_str(
         "#[no_mangle]\npub unsafe extern \"C\" fn quillo_native_free(p: *mut u8, len: usize) {\n    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, len)));\n}\n",
     );
-    s.push_str("#[no_mangle]\npub unsafe extern \"C\" fn quillo_native_call(index: u32, args: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {\n");
+    // Its `a` is unused when no function takes anything: the warning showed in every failed
+    // build of such a file (FEEDBACK55.md, Q-822; branch feedback55).
+    s.push_str("#[no_mangle]\n#[allow(unused_variables)]\npub unsafe extern \"C\" fn quillo_native_call(index: u32, args: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {\n");
     s.push_str("    let input = std::slice::from_raw_parts(args, len);\n");
     s.push_str("    let out = __quillo::run(|| {\n");
     s.push_str("        let mut a: Vec<serde_json::Value> = serde_json::from_slice(input).map_err(|e| e.to_string())?;\n");
     s.push_str("        match index {\n");
     for (i, e) in exports.iter().enumerate() {
+        // Built where its `#[cfg(...)]` says, and said to be left out elsewhere (Q-813).
+        let only = (!e.cfg.is_empty()).then(|| format!("all({})", e.cfg.join(", ")));
+        if let Some(only) = &only {
+            let _ = writeln!(s, "            #[cfg({})]", only);
+        }
         let _ = writeln!(s, "            {} => {{", i);
         let mut call_args = Vec::new();
         for (j, (pname, ty)) in e.params.iter().enumerate() {
@@ -687,8 +907,13 @@ fn glue(qwer: &Path, exports: &[Export]) -> String {
             let _ = writeln!(s, "                let a{}{} = __quillo::arg(&mut a, {}, {:?}, {:?})?;", j, owned, j, e.name, pname);
             call_args.push(call);
         }
-        let _ = writeln!(s, "                __quillo::Back::back(user::{}({}))", e.name, call_args.join(", "));
+        // By its raw name, which any function's is, `match` too (Q-811).
+        let _ = writeln!(s, "                __quillo::Back::back(user::r#{}({}))", e.name, call_args.join(", "));
         s.push_str("            }\n");
+        if let Some(only) = &only {
+            let why = format!("`{}`: it is not in this build, as its #[cfg({})] leaves it out", e.name, e.cfg.join(")] #[cfg("));
+            let _ = writeln!(s, "            #[cfg(not({}))]\n            {} => Err({:?}.to_string()),", only, i, why);
+        }
     }
     s.push_str("            _ => Err(\"no such function\".to_string()),\n        }\n    });\n");
     s.push_str("    let b = out.into_boxed_slice();\n    *out_len = b.len();\n    Box::into_raw(b) as *mut u8\n}\n");
@@ -732,6 +957,29 @@ fn stem(qwer: &Path) -> String {
     } else {
         s
     }
+}
+
+/// What a file's libraries are named by: its stem, and a hash of its whole name, so `x.rs` and
+/// `x.qwer`, `a-b.rs` and `a_b.rs`, or `Img.rs` and `img.rs` each keep a library and a lock line
+/// of their own, where each build deleted the other's (FEEDBACK55.md, Q-812; branch feedback55).
+/// And the glue's version, so a build lets go of only its own version's libraries: another
+/// Quillo's stay, and run when it comes back.
+fn lib_stem(qwer: &Path) -> String {
+    let whole = qwer.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    format!("{}-{}-g{}", stem(qwer), &hex_hash(&[whole.as_bytes()])[..8], GLUE_VERSION)
+}
+
+/// Where a Quillo of the first glue built the library of this content, named by the stem alone.
+fn first_glue_lib(qwer: &Path, src: &str) -> PathBuf {
+    let abs = qwer.canonicalize().unwrap_or_else(|_| qwer.to_path_buf());
+    let hash = hex_hash(&[src.as_bytes(), b"1", std::env::consts::ARCH.as_bytes()]);
+    abs.parent().unwrap_or(Path::new(".")).join(".quillo").join("native").join(format!("{}{}-{}.{}", std::env::consts::DLL_PREFIX, stem(qwer), hash, std::env::consts::DLL_EXTENSION))
+}
+
+/// Whether `file` is one of the libraries named `{prefix}{16 hex digits}.{extension}`.
+fn is_lib_of(file: &str, prefix: &str) -> bool {
+    let tail = format!(".{}", std::env::consts::DLL_EXTENSION);
+    file.strip_prefix(prefix).and_then(|r| r.strip_suffix(&tail)).is_some_and(|h| h.len() == 16 && h.bytes().all(|c| c.is_ascii_hexdigit()))
 }
 
 fn hex_hash(parts: &[&[u8]]) -> String {
@@ -839,7 +1087,7 @@ fn lib_path(qwer: &Path, src: &str) -> PathBuf {
     let abs = qwer.canonicalize().unwrap_or_else(|_| qwer.to_path_buf());
     let hash = hex_hash(&[src.as_bytes(), GLUE_VERSION.as_bytes(), std::env::consts::ARCH.as_bytes()]);
     let out_dir = abs.parent().unwrap_or(Path::new(".")).join(".quillo").join("native");
-    out_dir.join(format!("{}{}-{}.{}", std::env::consts::DLL_PREFIX, stem(qwer), hash, std::env::consts::DLL_EXTENSION))
+    out_dir.join(format!("{}{}-{}.{}", std::env::consts::DLL_PREFIX, lib_stem(qwer), hash, std::env::consts::DLL_EXTENSION))
 }
 
 /// One build at a time in this process (instances load the same files).
@@ -909,14 +1157,15 @@ fn lock_guard(_: &Path) -> Option<()> {
     Some(())
 }
 
-/// Puts `lib`'s line in the lock, in place of those of the same file's earlier libraries.
-fn lock_built(lib: &Path, stem: &str) -> Result<(), String> {
+/// Puts `lib`'s line in the lock, in place of those of the same file's earlier libraries, of
+/// this glue: another Quillo's lines stay, for its libraries.
+fn lock_built(lib: &Path, prefixes: &[String]) -> Result<(), String> {
     let hash = file_hash(lib)?;
     let path = lock_file(lib);
     let _guard = lock_guard(&path);
-    let prefix = format!("{}{}-", std::env::consts::DLL_PREFIX, stem);
     let old = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut lines: Vec<String> = old.lines().filter(|l| !l.starts_with(&prefix) && !l.trim().is_empty()).map(String::from).collect();
+    let ours = |l: &str| l.split_once(' ').is_some_and(|(f, _)| prefixes.iter().any(|p| is_lib_of(f, p)));
+    let mut lines: Vec<String> = old.lines().filter(|l| !ours(l) && !l.trim().is_empty()).map(String::from).collect();
     lines.push(format!("{} {}", lib_name(lib), hash));
     lines.sort();
     let tmp = path.with_extension(format!("lock.{}.tmp", std::process::id()));
@@ -991,7 +1240,7 @@ pub fn prebuild(files: &[PathBuf]) {
 /// Copies the library cargo built for `crate_name` to `lib`, and lets those of the file's earlier
 /// contents go.
 fn keep_lib(qwer: &Path, lib: &Path, crate_name: &str, target: &Path) -> Result<(), String> {
-    let name = stem(qwer);
+    let prefixes = [format!("{}{}-", std::env::consts::DLL_PREFIX, lib_stem(qwer))];
     let out_dir = lib.parent().unwrap_or(Path::new("."));
     let built = target
         .join("release")
@@ -1002,14 +1251,13 @@ fn keep_lib(qwer: &Path, lib: &Path, crate_name: &str, target: &Path) -> Result<
     let tmp = lib.with_extension("tmp");
     std::fs::copy(&built, &tmp).map_err(|e| format!("cannot copy {}: {}", built.display(), e))?;
     std::fs::rename(&tmp, lib).map_err(|e| e.to_string())?;
-    lock_built(lib, &name)?;
+    lock_built(lib, &prefixes)?;
     // Libraries of this file's earlier contents go (those loaded stay loaded).
     if let Ok(rd) = std::fs::read_dir(out_dir) {
-        let prefix = format!("{}{}-", std::env::consts::DLL_PREFIX, name);
         for e in rd.flatten() {
             let p = e.path();
             let f = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-            if p != lib && f.starts_with(&prefix) && f.len() == prefix.len() + 16 + 1 + std::env::consts::DLL_EXTENSION.len() {
+            if p != lib && prefixes.iter().any(|pre| is_lib_of(&f, pre)) {
                 let _ = std::fs::remove_file(p);
             }
         }
@@ -1054,6 +1302,11 @@ pub fn build(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
         return Ok((lib, parsed));
     }
     if no_build() {
+        // A library of the same content, from a Quillo whose glue was another: said, as a deploy
+        // after an upgrade meets it (FEEDBACK55.md, Q-809 and Q-812; branch feedback55).
+        if first_glue_lib(qwer, &src).is_file() {
+            return Err(format!("{} was built by an older Quillo, whose libraries this one cannot load, and --no-build says not to build it here: run `quillo build` once where Rust is, and bring .quillo along", qwer.display()));
+        }
         return Err(format!("{} is not built, and --no-build says not to build it here: build it with `quillo build` and bring .quillo along", qwer.display()));
     }
     let (crate_name, dir) = prepare(&abs, &parsed)?;
@@ -1103,6 +1356,8 @@ struct Function {
     name: String,
     file: String,
     params: Vec<String>,
+    /// Whether each parameter's type has a `serde_json::Value` in it, which holds no NaN.
+    any: Vec<bool>,
     effects: u8,
 }
 
@@ -1154,7 +1409,10 @@ pub fn plugin_allowed(qwer: &Path) -> Result<(), String> {
 }
 
 /// `use "x.qwer"`: builds and loads it, and defines its functions.
-pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>, line: u32) -> Result<(), Ctrl> {
+/// `renames`: what the file that takes them defines the names it takes as, where another file
+/// has the same spelling for another function, or (`None`) that it does not, as a name it takes
+/// from elsewhere wins (src/modules.rs; FEEDBACK55.md, Q-816).
+pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>, renames: Option<&HashMap<String, Option<String>>>, line: u32) -> Result<(), Ctrl> {
     let path = qwer.to_path_buf();
     // A plugin the policy names, at a version it names (FEEDBACK41.md, Q-478; branch feedback40-43).
     plugin_allowed(qwer).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
@@ -1184,9 +1442,23 @@ pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>,
         // a version loaded later has names of its own.
         let key: &'static str = Box::leak(format!("native:{}:{}", lib_path.display(), e.name).into_boxed_str());
         functions().lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(key).or_insert_with(|| {
-            Arc::new(Function { lib: lib.clone(), index: i as u32, name: e.name.clone(), file: file.clone(), params: e.params.iter().map(|(n, _)| n.clone()).collect(), effects: e.effects })
+            Arc::new(Function {
+                lib: lib.clone(),
+                index: i as u32,
+                name: e.name.clone(),
+                file: file.clone(),
+                params: e.params.iter().map(|(n, _)| n.clone()).collect(),
+                any: e.params.iter().map(|(_, t)| holds_any(t)).collect(),
+                effects: e.effects,
+            })
         });
         for n in names {
+            let n = match renames.and_then(|r| r.get(n)) {
+                Some(Some(other)) => other.as_str(),
+                // Of a file taken whole: another of that name wins.
+                Some(None) if only.is_none() => continue,
+                _ => n,
+            };
             define(&it.globals, n, Value::Builtin(key, call_placeholder));
         }
     }
@@ -1230,14 +1502,24 @@ pub fn call(it: &mut Interp, key: &str, args: Vec<Value>, line: u32) -> R {
     let Some(f) = functions().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(key).cloned() else {
         return fail(line, "a Rust function was called without its library");
     };
-    let json: Vec<serde_json::Value> = args.iter().map(|a| a.to_json()).collect();
-    // The plugin reads its arguments with serde_json, which stops past 128 levels with a line
-    // and column of a text the program never wrote: said here, by the argument's name
-    // (FEEDBACK27.md, Q-328; branch feedback27-35-fixes).
-    for (i, a) in json.iter().enumerate() {
-        if depth(a) > MAX_DEPTH {
-            let name = f.params.get(i).cloned().unwrap_or_else(|| format!("{}", i + 1));
-            return fail(line, format!("`{}`: argument `{}` is nested too deeply: a plugin takes values at most {} levels deep", f.name, name, MAX_DEPTH));
+    // Each argument as the plugin reads it: a float as it is, NaN and the infinities too, where
+    // they were null; an error value is given back, as the function cannot take it, where it
+    // was a map of its message (FEEDBACK55.md, Q-809 and Q-810; branch feedback55).
+    let mut json: Vec<serde_json::Value> = Vec::with_capacity(args.len());
+    for (i, a) in args.iter().enumerate() {
+        let name = || f.params.get(i).cloned().unwrap_or_else(|| format!("{}", i + 1));
+        match crossing(a, f.any.get(i).copied().unwrap_or(true), 1) {
+            Ok(j) => json.push(j),
+            Err(Refused::Error(e)) => return Ok(e),
+            Err(Refused::NoNumber(x)) => {
+                return fail(line, format!("`{}`: argument `{}` holds {}, which a serde_json::Value cannot: give it as text, or take an f64", f.name, name(), x));
+            }
+            // The plugin reads its arguments with serde_json, which stops past 128 levels with a
+            // line and column of a text the program never wrote: said here, by the argument's
+            // name (FEEDBACK27.md, Q-328; branch feedback27-35-fixes).
+            Err(Refused::Deep) => {
+                return fail(line, format!("`{}`: argument `{}` is nested too deeply: a plugin takes values at most {} levels deep", f.name, name(), MAX_DEPTH));
+            }
         }
     }
     let input = serde_json::to_vec(&serde_json::Value::Array(json)).unwrap_or_default();
@@ -1267,38 +1549,91 @@ pub fn call(it: &mut Interp, key: &str, args: Vec<Value>, line: u32) -> R {
         if let Some((at, n)) = too_large(v, String::new()) {
             return fail(line, format!("`{}` ({}) gave back {} at {}, which is too large for Quillo's int: give it back as text", f.name, f.file, n, if at.is_empty() { "the top".to_string() } else { at }));
         }
-        return Ok(Value::from_json(v));
+        return Ok(answer(v));
     }
     if let Some(e) = j.get("err") {
         return Ok(Value::err(Value::from_json(e)));
     }
+    // What the glue could not give back is said with the function's name, as what it could
+    // not take is (FEEDBACK55.md, Q-822; branch feedback55).
     if let Some(e) = j.get("bad").and_then(|e| e.as_str()) {
-        return fail(line, e.to_string());
+        if e.starts_with(&format!("`{}`", f.name)) {
+            return fail(line, e.to_string());
+        }
+        return fail(line, format!("`{}` ({}) gave back {}", f.name, f.file, e));
     }
     let why = j.get("panic").and_then(|e| e.as_str()).unwrap_or("it gave back nothing");
     fail(line, format!("`{}` ({}) panicked: {}", f.name, f.file, why))
 }
 
+/// Why an argument does not go to a plugin: an error, given back; a float a
+/// `serde_json::Value` cannot hold; or a value nested past `MAX_DEPTH`.
+enum Refused {
+    Error(Value),
+    NoNumber(String),
+    Deep,
+}
+
+/// The key of the map that carries a float JSON has no number for: the glue's `SPECIAL`.
+const SPECIAL: &str = "\u{0}f64";
+
+/// Whether a Rust type has a `serde_json::Value` in it.
+fn holds_any(t: &str) -> bool {
+    t.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':')).any(|w| w.rsplit("::").next() == Some("Value"))
+}
+
+/// `v` as JSON for a plugin, as `Value::to_json` writes it but for what `Refused` names. A NaN or
+/// an infinity is a map the glue reads as that float, unless `any` (Q-809).
+fn crossing(v: &Value, any: bool, depth: usize) -> Result<serde_json::Value, Refused> {
+    use serde_json::Value as J;
+    if depth > MAX_DEPTH {
+        return Err(Refused::Deep);
+    }
+    Ok(match v {
+        Value::Float(x) if !x.is_finite() => {
+            let text = if x.is_nan() { "NaN" } else if *x > 0.0 { "inf" } else { "-inf" };
+            if any {
+                return Err(Refused::NoNumber(if x.is_nan() { "NaN".into() } else { format!("{}inf", if *x > 0.0 { "" } else { "-" }) }));
+            }
+            J::Object(std::iter::once((SPECIAL.to_string(), J::from(text))).collect())
+        }
+        Value::List(l) => J::Array(l.iter().map(|x| crossing(x, any, depth + 1)).collect::<Result<_, _>>()?),
+        Value::Map(m) => J::Object(m.iter().map(|(k, x)| Ok((k.to_string(), crossing(x, any, depth + 1)?))).collect::<Result<_, _>>()?),
+        Value::Err(..) => return Err(Refused::Error(v.clone())),
+        other => other.to_json(),
+    })
+}
+
+/// A plugin's answer as Quillo's value: `crossing`'s map of a NaN or an infinity is that float.
+fn answer(v: &serde_json::Value) -> Value {
+    fn special(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Object(o) if o.len() == 1 && o.contains_key(SPECIAL) => true,
+            serde_json::Value::Object(o) => o.values().any(special),
+            serde_json::Value::Array(a) => a.iter().any(special),
+            _ => false,
+        }
+    }
+    fn go(v: &serde_json::Value) -> Value {
+        match v {
+            serde_json::Value::Object(o) if o.len() == 1 => match o.get(SPECIAL).and_then(|t| t.as_str()) {
+                Some("NaN") => Value::Float(f64::NAN),
+                Some("inf") => Value::Float(f64::INFINITY),
+                Some("-inf") => Value::Float(f64::NEG_INFINITY),
+                _ => Value::from_json(v),
+            },
+            serde_json::Value::Object(o) if o.values().any(special) => Value::map(o.iter().map(|(k, x)| (k.into(), go(x))).collect()),
+            serde_json::Value::Array(a) if a.iter().any(special) => Value::list(a.iter().map(go).collect()),
+            _ => Value::from_json(v),
+        }
+    }
+    // The usual answer has none, and is read as it always was.
+    if special(v) { go(v) } else { Value::from_json(v) }
+}
+
 /// How deep a value may go across a plugin's edge: serde_json's own limit is 128, counting
 /// the list the arguments come in and the answer's `{"ok": ...}`.
 const MAX_DEPTH: usize = 126;
-
-fn depth(v: &serde_json::Value) -> usize {
-    let mut most = 0;
-    let mut todo = vec![(v, 1)];
-    while let Some((v, d)) = todo.pop() {
-        most = most.max(d);
-        match v {
-            serde_json::Value::Array(a) => todo.extend(a.iter().map(|x| (x, d + 1))),
-            serde_json::Value::Object(o) => todo.extend(o.values().map(|x| (x, d + 1))),
-            _ => {}
-        }
-        if most > MAX_DEPTH {
-            break;
-        }
-    }
-    most
-}
 
 /// The first whole number in `v` past i64's range, and where it is (`.id`, `[2].n`).
 fn too_large(v: &serde_json::Value, at: String) -> Option<(String, String)> {
@@ -1312,9 +1647,31 @@ fn too_large(v: &serde_json::Value, at: String) -> Option<(String, String)> {
 
 /// What a `native:` builtin is called, for messages: its function's name.
 /// Why a `.qwer` function whose file declares no effects is refused inside a `with`.
-pub fn undeclared(name: &str, within: Option<&str>) -> String {
+/// `file`: its file, named in the message by its own name (`n.rs`), not as a `.qwer` file
+/// (FEEDBACK55.md, Q-814; branch feedback55).
+pub fn undeclared(name: &str, file: &str, within: Option<&str>) -> String {
     let at = within.map_or("here".to_string(), |f| format!("in `{}`, whose `with` limits what it may do", f));
-    format!("`{}` is Rust whose file does not say what it does, so it may do anything and is refused {}: put `//! effects: ...` (or `//! effects: none`) at the top of its .qwer file", name, at)
+    let file = Path::new(file).file_name().map_or(file.to_string(), |f| f.to_string_lossy().into_owned());
+    let file = if file.is_empty() { "its file".to_string() } else { file };
+    format!("`{}` is Rust whose file does not say what it does, so it may do anything and is refused {}: put `//! effects: ...` (or `//! effects: none`) at the top of {}", name, at, file)
+}
+
+/// A name to take `export` of `file` as, which parses: `my-tools.rs` and `len` are
+/// `my_tools_len`, where the warnings wrote `my-tools.rs_len` (FEEDBACK55.md, Q-816; branch
+/// feedback55).
+pub fn other_name(file: &str, export: &str) -> String {
+    let short = Path::new(file).file_name().map_or(file.to_string(), |f| f.to_string_lossy().into_owned());
+    let stem = if ends_with_any_case(&short, ".qwer") { &short[..short.len() - 5] } else if ends_with_any_case(&short, ".rs") { &short[..short.len() - 3] } else { &short };
+    let mut name: String = stem.chars().map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' }).collect();
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        name.insert(0, '_');
+    }
+    format!("{}_{}", name, export)
+}
+
+/// The file of a `native:` builtin, by its key.
+pub fn file_of(key: &str) -> String {
+    functions().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(key).map_or(String::new(), |f| f.file.clone())
 }
 
 pub fn display_name(key: &str) -> &str {
@@ -1346,13 +1703,15 @@ pub fn walk_program(main: &Path, visit: &mut dyn FnMut(&Path, &[crate::ast::Stmt
     let mut out = Vec::new();
     // A `use` counts from its program's folder, in every file; a mounted program is
     // one of its own (FEEDBACK19.md, Q-154; branch feedback19-fixes).
-    let mut todo = vec![(main.to_path_buf(), main.parent().unwrap_or(Path::new(".")).to_path_buf())];
+    // Through a link, from the folder of the file it leads to (FEEDBACK55.md, Q-817).
+    let mut todo = vec![(main.to_path_buf(), crate::modules::source_dir_or(main, main.parent().unwrap_or(Path::new("."))))];
     while let Some((f, base)) = todo.pop() {
         let key = f.canonicalize().unwrap_or_else(|_| f.clone());
         if !seen.insert(key) {
             continue;
         }
-        if f.extension().is_some_and(|e| e == "qwer" || e == "rs") {
+        // In any case (Q-820).
+        if is_rust(&f.to_string_lossy()) {
             out.push(f);
             continue;
         }
@@ -1363,7 +1722,7 @@ pub fn walk_program(main: &Path, visit: &mut dyn FnMut(&Path, &[crate::ast::Stmt
         visit(&f, &prog);
         for s in prog {
             match s {
-                crate::ast::Stmt::Use(p, ..) if !crate::ast::is_script(&p) => todo.push((base.join(crate::modules::resolve_from(&base, &f, &p)), base.clone())),
+                crate::ast::Stmt::Use(p, _, _, o) if !crate::ast::is_script(&p) => todo.push((base.join(crate::modules::resolve_use(&base, &f, &p, o.implied)), base.clone())),
                 crate::ast::Stmt::Mount(_, p, _) => {
                     let full = base.join(p);
                     let dir = full.parent().unwrap_or(&base).to_path_buf();
