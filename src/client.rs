@@ -1445,6 +1445,24 @@ enum Mark {
     Set(usize),
 }
 
+/// Whether `name = e` (or `+=`, `-=`) folds the state into its new value: reads it.
+fn folds(op: AssignOp, e: &Expr, name: &str) -> bool {
+    if !matches!(op, AssignOp::Set) {
+        return true;
+    }
+    let mut reads = false;
+    each_expr_in(
+        e,
+        &mut |x| {
+            if matches!(x, Expr::Ident(n, _) if n == name) {
+                reads = true;
+            }
+        },
+        true,
+    );
+    reads
+}
+
 /// What stands for the claims taken before wait `n`, until the function is compiled (`claimed`).
 fn wait_mark(n: usize) -> String {
     format!("\u{1}C{}\u{1}", n)
@@ -2921,8 +2939,11 @@ impl<'a> Compiler<'a> {
                         // (another call's, a plain one) has claimed them. Answers were shown in
                         // the order they came, so typing "abcd" ended on "a"'s, and clearing the
                         // field showed the answer still on its way (FEEDBACK55.md, Q-800; branch
-                        // feedback55).
-                        Resolved::State(js) if self.ctx().is_async => {
+                        // feedback55). A set that reads the state it sets (`n += 1`, `xs = xs +
+                        // [x]`, `s = f(s)`) is a fold, made on what the state holds, and always
+                        // made: dropped, three likes counted one and an upload's `uploading -= 1`
+                        // left the page busy for good (found in review).
+                        Resolved::State(js) if self.ctx().is_async && !folds(*op, e, name) => {
                             let at = match self.ctx().claims.iter().position(|(s, _)| *s == js) {
                                 Some(i) => i,
                                 None => {

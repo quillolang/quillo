@@ -10597,6 +10597,7 @@ fn a_jobs_name_is_twice_only_where_both_can_run() {
         let (good, out) = s7_check(&format!("q803-arms-{}", i), src);
         assert!(good, "{}: {}", src, out);
     }
+    // Where both may run: said, and the program starts (see the second review's test below).
     let twice = [
         ("fn b() = null\nif env(\"P\") == \"1\" {\n    schedule(\"5m\", b)\n}\nschedule(\"1h\", b)\n", 5),
         ("fn b() = null\nif env(\"A\") == \"1\" {\n    schedule(\"5m\", b)\n}\nif env(\"B\") == \"1\" {\n    schedule(\"1h\", b)\n}\n", 6),
@@ -10607,7 +10608,7 @@ fn a_jobs_name_is_twice_only_where_both_can_run() {
     ];
     for (i, (src, line)) in twice.iter().enumerate() {
         let (good, out) = s7_check(&format!("q803-twice-{}", i), src);
-        assert!(!good && out.contains(&format!("main.qwe:{}: error: `", line)) && out.contains("there is already a"), "{}: {}", src, out);
+        assert!(good && out.contains(&format!("main.qwe:{}: warning: `", line)) && out.contains(" named "), "{}: {}", src, out);
     }
 }
 
@@ -10774,6 +10775,159 @@ fn a_short_sleep_is_as_long_as_asked() {
 }
 
 // ---- end of slice 7's review ----
+
+// ---- slice 7's second review ----
+
+// Found in the second review (Q-800): a wait claimed every state set after it, so a fold made after
+// the answer was dropped when another call had begun: three quick likes counted one, three adds
+// showed one item, and two uploads at once left `uploading` at 1 and the page busy for good. A set
+// that reads the state it sets (`+=`, `-=`, `s = s + ...`, `s = s | push(...)`) is a fold, and
+// always made; a replacing set after a wait still gives way to a newer set (typing then clearing,
+// `let r = search(q); via = r`, and set straight from the call).
+#[test]
+fn a_fold_after_a_wait_is_always_made() {
+    let src = r##"server fn save(n: int) -> int {
+    sleep(150)
+    n
+}
+server fn upload_image(n: int) -> int {
+    sleep(150)
+    n
+}
+server fn search(q: str) -> str {
+    sleep(max([0, 400 - q.len * 80]))
+    `results for ${q}`
+}
+component Likes() {
+    state count = 0
+    state items = []
+    state total = 0
+    state piped = []
+    state uploading = 0
+    state shown = ""
+    state via = ""
+    state direct = ""
+    let upload = (n) => {
+        uploading += 1
+        let _r = upload_image(n)
+        uploading -= 1
+    }
+    <div>
+        <button #b onclick={() => { save(1); count += 1 }}>like</button>
+        <button #a onclick={() => { let t = save(items.len); items = items + [t] }}>add</button>
+        <button #t onclick={() => { let n = save(2); total = total + n }}>total</button>
+        <button #p onclick={() => { let n = save(3); piped = piped | push(n) }}>pipe</button>
+        <button #u onclick={() => upload(1)}>upload</button>
+        <input #q oninput={(e) => { let q = e.target.value; if q == "" { shown = "" } else { shown = search(q) } }}/>
+        <input #r oninput={(e) => { let r = search(e.target.value); via = r }}/>
+        <input #d oninput={(e) => { direct = search(e.target.value) }}/>
+        <p #c>{count}</p><p #i>{items.len}</p><p #tt>{total}</p><p #pp>{piped.len}</p>
+        <p #busy class={uploading > 0 && "busy"}>{uploading}</p>
+        <p #shown>{shown}</p><p #via>{via}</p><p #direct>{direct}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Likes/></body></html>
+"##;
+    let body = format!(
+        r#"{TYPE_IN}
+    const until = async (f) => {{ for (let i = 0; i < 500 && !f(); i++) await tick(20); return f(); }};
+    const out = {{}};
+    for (const id of ["b", "a", "t", "p", "u"]) for (let i = 0; i < 3; i++) {{ $(id).click(); await tick(20); }}
+    await until(() => $("c").textContent === "3" && $("i").textContent === "3" && $("tt").textContent === "6" && $("pp").textContent === "3" && $("busy").textContent === "0");
+    await tick(400);
+    out.folds = [$("c").textContent, $("i").textContent, $("tt").textContent, $("pp").textContent, $("busy").textContent, $("busy").className];
+    // Replacing sets: only the latest.
+    await typeIn("q", "a"); await tick(30); $("q").focus(); $("q").select(); document.execCommand("delete");
+    await tick(700);
+    out.cleared = "[" + $("shown").textContent + "]";
+    await typeIn("r", "abcd"); await typeIn("d", "abcd");
+    await until(() => $("via").textContent === "results for abcd" && $("direct").textContent === "results for abcd");
+    await tick(600);
+    out.latest = [$("via").textContent, $("direct").textContent];
+    return out;"#
+    );
+    let Some(r) = s7_in_page("q800-folds", src, "/", &body) else { return };
+    let want = serde_json::json!({ "folds": ["3", "3", "6", "3", "0", ""], "cleared": "[]", "latest": ["results for abcd", "results for abcd"], "remade": 0, "errors": [] });
+    assert_eq!(r, want);
+}
+
+// Found in the second review (Q-803): programs that started before were refused, `if a { every(1000,
+// tick) }` then `if !a { ... }`, a loop of one round, `a && every(...)` then `!a && every(...)`; and
+// two calls on one line, and a helper adding a tick called twice, passed `check` and failed to start.
+// An error where both calls surely run (the top level's own path, a helper's own statements called
+// there), as the start then surely refuses; a warning where both may, as the start refuses only a
+// second add that happens. `check` and the start agree on each.
+#[test]
+fn check_and_the_start_agree_on_a_tick_added_twice() {
+    let head = "fn tick() = null\nlet a = env(\"S7_UNSET_FLAG\") == \"1\"\n";
+    // (the program after `head`, what `check` says: "" ok, "warning", "error"; whether it starts)
+    let cases: &[(&str, &str, bool)] = &[
+        ("if a { every(1000, tick) }\nif !a { every(1000, tick) }\n", "warning", true),
+        ("for i in 0..1 { every(1000, tick) }\n", "warning", true),
+        ("a && every(1000, tick)\n!a && every(1000, tick)\n", "warning", true),
+        ("let x = a ?? every(1000, tick)\nevery(1000, tick)\n", "warning", true),
+        ("if a { every(1000, tick) } else { every(1000, tick) }\n", "", true),
+        ("match env(\"S7_UNSET_FLAG\") { \"1\" => every(1000, tick), _ => every(1000, tick) }\n", "", true),
+        ("let x = a ? every(1000, tick) : every(1000, tick)\n", "", true),
+        ("every(1000, tick); every(1000, tick)\n", "error", false),
+        ("every(1000, tick)\nevery(1000, tick)\n", "error", false),
+        ("fn setup() { every(1000, tick) }\nsetup()\nsetup()\n", "error", false),
+        ("fn setup() {\n    every(1000, tick)\n}\nsetup()\nevery(10, tick)\n", "error", false),
+        ("fn setup() { if a { every(1000, tick) } }\nsetup()\nsetup()\n", "warning", true),
+        ("fn setup() { every(1000, tick) }\nsetup()\n", "", true),
+        ("fn setup() { every(1000, tick, { name: \"t2\" }) }\nsetup()\nevery(1000, tick)\n", "", true),
+        ("every(1000, tick)\nevery(1000, tick, { name: \"other\" })\nschedule(\"5m\", tick)\n", "", true),
+    ];
+    for (i, (code, said, starts)) in cases.iter().enumerate() {
+        let src = format!("{}{}", head, code);
+        let (good, out) = s7_check(&format!("q803-agree-{}", i), &src);
+        match *said {
+            "" => assert!(good && !out.contains("warning") && !out.contains("error"), "{}: {}", code, out),
+            "warning" => assert!(good && out.contains("warning: `every`: a tick named \"tick\""), "{}: {}", code, out),
+            _ => assert!(!good && out.contains("error: `every`: there is already a tick named \"tick\""), "{}: {}", code, out),
+        }
+        let mut it = quillo::Interp::new(".");
+        let started = it.load_source(&src, "main.qwe");
+        assert_eq!(started.is_ok(), *starts, "{}: {:?}", code, started.err().map(|e| e.to_string()));
+        if let Err(e) = started {
+            assert!(e.to_string().contains("there is already a tick named \"tick\""), "{}: {}", code, e);
+        }
+    }
+}
+
+// Found in the second review (Q-806): a page asking one thing after another over its socket waited
+// 0.75 ms for each answer, where it took 0.05: an answer soon after the last write made a burst, and
+// the writer slept 0.5 ms (0.7 on macOS) with nothing to wake it when the next was queued. It waits
+// now in short steps, and goes on as soon as one comes. Shown as a ratio, for a busy machine: one
+// after another is no slower than with a pause between, when the writer has stopped waiting.
+#[test]
+fn an_answer_on_a_channel_is_not_held_back() {
+    let d = s7_dir("q806-echo", "channel.on(\"room\", (msg, peer) => {\n    channel.send(\"room\", peer, msg)\n})\nroute GET / = \"ok\"\n");
+    let s = support::serve_with(&d.join("main.qwe"), &["--no-wt"]);
+    let mut p = S7Ws::channels(s.port);
+    p.text("[\"j\",\"room\"]");
+    assert_eq!(p.read().as_deref(), Some("[\"j\",\"room\",true]"));
+    let mut echo = |i: usize| {
+        let t = std::time::Instant::now();
+        p.text(&format!("[\"m\",\"room\",{}]", i));
+        assert_eq!(p.read(), Some(format!("[\"m\",\"room\",{}]", i)));
+        t.elapsed()
+    };
+    let median = |mut v: Vec<std::time::Duration>| {
+        v.sort();
+        v[v.len() / 2]
+    };
+    let mut spaced = Vec::new();
+    for i in 0..60 {
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        spaced.push(echo(i));
+    }
+    let back_to_back = median((0..300).map(|i| echo(1000 + i)).collect());
+    let spaced = median(spaced);
+    assert!(back_to_back < spaced * 2 + std::time::Duration::from_micros(150), "{:?} one after another, {:?} with a pause", back_to_back, spaced);
+}
+
+// ---- end of slice 7's second review ----
 
 // ---- end of slice 7 ----
 

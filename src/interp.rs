@@ -3111,8 +3111,10 @@ impl Interp {
     }
 
     /// A step of a loop or a call: `--max-compute` ends a request here, between statements,
-    /// so nothing is left half done (FEEDBACK20.md, Q-163; branch feedback20-fixes).
-    #[inline]
+    /// so nothing is left half done (FEEDBACK20.md, Q-163; branch feedback20-fixes). Always in
+    /// place: with the stop's branch it was no longer inlined, and calls took 4% longer (found
+    /// in review of FEEDBACK55.md, Q-804; branch feedback55).
+    #[inline(always)]
     fn within_limit(&mut self, line: u32) -> Result<(), Ctrl> {
         if crate::httpd::OVER_TIME.load(std::sync::atomic::Ordering::Relaxed) && crate::httpd::over_time() {
             // Naming the policy file when its limit is the one (FEEDBACK55.md, Q-849; branch

@@ -1479,11 +1479,11 @@ pub fn over_websocket(mut socket: crate::ws::Socket, ticket: Ticket) {
     // messages are written as they are (see `ws::Socket::send_all`), with no buffer made: one,
     // grown on each page's thread, kept 5 to 20 MiB for 256 pages after a burst (found in review).
     // In a burst (more than one message came at once, or this one soon after the last write) it
-    // waits a moment for more before it sleeps on the queue: woken for each message, it cost the
-    // program sending a wake-up each, six times what the message did. Traffic that comes a message
-    // at a time is written as it comes, with no wait, which cost a third more of the server's time
-    // with 300 pages (found in review); and after a batch of many, what comes is taken at once, so
-    // that the queue, whose room is kept after, stays short.
+    // waits a moment for more before it sleeps on the queue (`LINGER`): woken for each message, it
+    // cost the program sending a wake-up each, six times what the message did. Traffic that comes
+    // a message at a time is written as it comes, with no wait, which cost a third more of the
+    // server's time with 300 pages (found in review); and after a batch of many, what comes is
+    // taken at once, so that the queue, whose room is kept after, stays short.
     let mut clean = true;
     let mut wrote = std::time::Instant::now().checked_sub(BURST).unwrap_or_else(std::time::Instant::now);
     let mut batch: [Option<Out>; BATCH] = std::array::from_fn(|_| None);
@@ -1513,8 +1513,14 @@ pub fn over_websocket(mut socket: crate::ws::Socket, ticket: Ticket) {
             }
             burst |= n > 1;
             if next.is_none() {
+                // Yielding, not asleep, and on as soon as one comes: asleep it was woken by
+                // nothing, and an answer to a page asking one after another waited the whole
+                // sleep, 0.7 ms where it took 0.05 (found in review).
                 if burst && n < LINGER_UNDER {
-                    std::thread::sleep(LINGER);
+                    let until = std::time::Instant::now() + LINGER;
+                    while rx.is_empty() && std::time::Instant::now() < until {
+                        std::thread::sleep(LINGER_STEP);
+                    }
                 }
                 next = rx.try_recv().ok();
             }
@@ -1542,7 +1548,10 @@ fn send_batch(socket: &mut crate::ws::Socket, batch: &mut [Option<Out>]) -> bool
 
 /// How long a page's writer waits for more after a write in a burst, and how soon after its last
 /// write a message makes one (see `over_websocket`).
-const LINGER: Duration = Duration::from_micros(500);
+const LINGER: Duration = Duration::from_micros(50);
+/// What it sleeps at a time meanwhile: yielding, a busy machine left it off the processor for
+/// milliseconds, and spinning would take one.
+const LINGER_STEP: Duration = Duration::from_micros(10);
 const BURST: Duration = Duration::from_millis(1);
 /// A batch of this many messages or more is followed by no wait (see `over_websocket`).
 const LINGER_UNDER: usize = 32;
@@ -1591,9 +1600,17 @@ mod tests {
     fn what_comes_to_an_inbox_let_go_goes_to_the_new_one() {
         let (p, _rx) = connect(Ticket { session: "{}".into(), tenant: None }, None);
         let gone = Arc::new(Inbox { name: "unit-let-go".into(), queue: Mutex::new(VecDeque::new()), arrived: Condvar::new(), delivering: AtomicBool::new(false), closed: AtomicBool::new(true) });
+        // The one made in its place, as `inbox` makes it, with no thread taking what comes to it:
+        // another test of this process serving a program (src/mobile.rs) gave each new inbox a
+        // thread, which took the message before it was looked for (CI, found in the second review
+        // of FEEDBACK55.md's slice 7; branch feedback55).
+        let new = Arc::new(Inbox { name: "unit-let-go".into(), queue: Mutex::new(VecDeque::new()), arrived: Condvar::new(), delivering: AtomicBool::new(true), closed: AtomicBool::new(false) });
+        lock(&hub().inboxes).insert("unit-let-go".into(), new.clone());
         gone.push(Event { kind: 'm', peer: p.clone(), value: "1".into() });
         assert!(lock(&gone.queue).is_empty());
-        assert_eq!(lock(&inbox("unit-let-go").queue).len(), 1);
+        assert!(Arc::ptr_eq(&inbox("unit-let-go"), &new));
+        assert_eq!(lock(&new.queue).len(), 1);
+        lock(&hub().inboxes).remove("unit-let-go");
         disconnect(&p);
     }
 }

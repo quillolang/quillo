@@ -1843,11 +1843,18 @@ struct Checker {
     next_url: bool,
     /// The ticks (`true`) and jobs the top level adds, by name, with where and on what path
     /// (FEEDBACK55.md, Q-803; branch feedback55).
-    job_names: HashMap<(bool, String), Vec<(Arc<str>, u32, Vec<Step>)>>,
+    job_names: HashMap<(bool, String), Vec<JobSeen>>,
     /// The branches (of an `if` or a `match`) and loops the code being checked is in, outermost
     /// first, and the last branch point's number (see `jobs_as_started`; found in review).
     path: Vec<Step>,
     branches: u32,
+}
+
+/// A tick or job the top level adds (see `Checker::job_names`): the call (its arguments' place in
+/// the program, which a second look at it finds again), and on what path.
+struct JobSeen {
+    call: usize,
+    path: Vec<Step>,
 }
 
 /// Where code is, for whether two of its calls can both run (see `Checker::path`).
@@ -1856,6 +1863,9 @@ enum Step {
     /// Arm `.1` of branch point `.0`.
     Arm(u32, u32),
     Loop,
+    /// What may run or not: the right side of `&&`, `||` or `??`, a helper's body below its first
+    /// branch (found in the second review).
+    Maybe,
 }
 
 /// Whether code on path `a` and code on path `b` can both run in one go: unless they part in two
@@ -4282,7 +4292,8 @@ impl Checker {
                     BinOp::Or => self.facts(a, false, &mut facts),
                     _ => {}
                 }
-                let y = self.under(facts, |c| c.expr(b));
+                let maybe = matches!(op, BinOp::And | BinOp::Or);
+                let y = if maybe { self.on_path(Step::Maybe, |s| s.under(facts, |c| c.expr(b))) } else { self.under(facts, |c| c.expr(b)) };
                 self.line = *line;
                 self.js_comparisons(op, a, b, x, y);
                 self.line = *line;
@@ -4329,7 +4340,7 @@ impl Checker {
             }
             Expr::Coalesce(a, b) => {
                 let x = self.expr(a);
-                let y = self.expr(b);
+                let y = self.on_path(Step::Maybe, |s| s.expr(b));
                 x.without(NIL | ERR).union(y)
             }
             Expr::Pipe(lhs, rhs, line) => {
@@ -4391,6 +4402,7 @@ impl Checker {
                 self.interim_status(callee, args);
                 self.cookie_options(callee, args);
                 self.jobs_as_started(callee, args);
+                self.helper_jobs(callee);
                 self.topics_written(callee, args);
                 if let Expr::Field(o, f, _) = callee.as_ref() {
                     if let Expr::Ident(s, _) = o.as_ref() {
@@ -5043,20 +5055,100 @@ impl Checker {
         if let Some(why) = crate::jobs::name_problem(f, &name) {
             return self.error(why);
         }
-        // Twice as the top level runs, which the start refuses: two calls that can both run in
-        // one start (not in two arms of one `if` or `match`), or one in a loop, which can add it
-        // again the next round (found in review).
+        // Twice as the top level runs, which the start refuses (found in review, and in the second
+        // review): an error where both surely run (on the top level's own path, not in a branch, a
+        // loop or after `&&`), as two on one line do; a warning where both may (two `if`s, a loop
+        // of one round), as the start then refuses only a second add that happens. Two arms of
+        // one `if` or `match` never both run.
         if self.fns.is_empty() {
-            let (file, line, path) = (self.file.clone(), self.line, self.path.clone());
-            let in_loop = path.contains(&Step::Loop);
-            let seen = self.job_names.entry((every, name.clone())).or_default();
-            let twice = in_loop || seen.iter().any(|(f, l, p)| (f, *l) != (&file, line) && both_run(p, &path));
-            if !seen.iter().any(|(f, l, _)| (f, *l) == (&file, line)) {
-                seen.push((file, line, path));
+            let path = self.path.clone();
+            self.job_seen(f, every, name, args.as_ptr() as usize, path);
+        }
+    }
+
+    /// Notes tick or job `name` added by the call at `call` on `path`, and says if it is twice.
+    fn job_seen(&mut self, f: &str, every: bool, name: String, call: usize, path: Vec<Step>) {
+        let seen = self.job_names.entry((every, name.clone())).or_default();
+        if seen.iter().any(|j| j.call == call) {
+            return;
+        }
+        let sure = |p: &[Step]| p.is_empty();
+        let looped = path.contains(&Step::Loop);
+        let surely_twice = sure(&path) && seen.iter().any(|j| sure(&j.path));
+        let other = seen.iter().any(|j| both_run(&j.path, &path));
+        seen.push(JobSeen { call, path });
+        let what = if every { "tick" } else { "job" };
+        if surely_twice {
+            self.error(crate::jobs::named_twice(f, &name));
+        } else if other {
+            self.warn(format!("`{f}`: a {what} named {name:?} is added before too: if both run, the start refuses the second (give one another with {{ name: ... }})"));
+        } else if looped {
+            self.warn(format!("`{f}`: a {what} named {name:?} in a loop is added each time round: from the second, the start refuses it (give each another with {{ name: ... }})"));
+        }
+    }
+
+    /// A top-level function called at the top level: the ticks and jobs it adds, as if added here
+    /// (`fn setup() { every(1000, tick) }` called twice adds `tick` twice, which the start refused
+    /// and `check` passed; found in the second review). One under a branch of the function's may
+    /// run or not.
+    fn helper_jobs(&mut self, callee: &Expr) {
+        let Expr::Ident(n, _) = callee else { return };
+        if !self.fns.is_empty() || self.is_local(n) || self.quiet_mode() {
+            return;
+        }
+        let Some(d) = self.bodies.get(n.as_str()).cloned() else { return };
+        if d.server || d.component {
+            return;
+        }
+        let mut found: Vec<(bool, String, bool, usize, bool)> = Vec::new();
+        let mut sure_stmts: HashSet<usize> = HashSet::new();
+        // The calls written as the function's own statements surely run when it does.
+        if let Expr::Block(stmts) = &d.body {
+            for st in stmts.iter() {
+                if let Stmt::Expr(Expr::Call(_, args, _)) = st {
+                    sure_stmts.insert(args.as_ptr() as usize);
+                }
             }
-            if twice {
-                self.error(crate::jobs::named_twice(f, &name));
+        } else if let Expr::Call(_, args, _) = &d.body {
+            sure_stmts.insert(args.as_ptr() as usize);
+        }
+        walk_expr(&d.body, &mut |x| {
+            let Expr::Call(c, args, _) = x else { return };
+            let Expr::Ident(g, _) = &**c else { return };
+            if g != "every" && g != "schedule" {
+                return;
             }
+            let every = g == "every";
+            let named = match args.get(2) {
+                Some(Expr::Map(entries)) => match entries.iter().find(|(k, _)| k == "name") {
+                    Some((_, Expr::Lit(Lit::Str(s)))) => Some(s.to_string()),
+                    Some(_) => return,
+                    None => None,
+                },
+                None | Some(Expr::Lit(Lit::Nil)) => None,
+                Some(_) => return,
+            };
+            let (name, written) = match (named, args.get(1)) {
+                (Some(n), _) => (n, true),
+                (None, Some(Expr::Ident(f, _))) => (f.to_string(), false),
+                _ => return,
+            };
+            let key = args.as_ptr() as usize;
+            found.push((every, name, written, key, sure_stmts.contains(&key)));
+        });
+        for (every, name, written, key, sure) in found {
+            // Named after a top-level function, as the start names it, or written out.
+            if !crate::jobs::name_ok(&name) || !written && !self.bodies.get(name.as_str()).is_some_and(|b| b.name == name) {
+                continue;
+            }
+            let mut path = self.path.clone();
+            if !sure {
+                path.push(Step::Maybe);
+            }
+            // Each call of the function adds them again: the call's place, with the job's.
+            let f = if every { "every" } else { "schedule" };
+            let call = key ^ (callee as *const Expr as usize).rotate_left(17);
+            self.job_seen(f, every, name, call, path);
         }
     }
 
