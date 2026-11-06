@@ -611,3 +611,41 @@ fn every_day_of_four_centuries_follows_the_one_before() {
     assert_eq!(quillo::dates::parse_date("2026-10-27"), Some(quillo::dates::days(2026, 10, 27)));
     assert_eq!(quillo::dates::parse_date("2026-10-32"), None);
 }
+
+// A zone the system's copy of the database leaves out is taken from Quillo's own copy: Ubuntu
+// 24.04 moved the IANA `backward` links (`EST`, `US/Pacific`, `Asia/Calcutta`) to tzdata-legacy,
+// and a program that ran on a Mac stopped there, its server refusing what its browser took (found
+// by CI on Linux, FEEDBACK55.md's Q-782; branch feedback55). TZDIR stands for such a system: a
+// copy of the database holding Europe/Paris alone.
+#[test]
+fn a_zone_the_systems_database_leaves_out_is_still_a_zone() {
+    let Ok(paris) = std::fs::read("/usr/share/zoneinfo/Europe/Paris") else { return };
+    let d = std::env::temp_dir().join(format!("quillo-dates-tzdir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(d.join("zones/Europe")).unwrap();
+    std::fs::write(d.join("zones/Europe/Paris"), paris).unwrap();
+    let names = ["Europe/Paris", "EST", "US/Pacific", "us/pacific", "Asia/Calcutta", "EST5EDT", "Mars/Olympus", "posixrules", "Factory", "Etc/Unknown", "localtime"];
+    let program: String = names
+        .iter()
+        .map(|z| format!("print(\"{z}\", date.valid_zone(\"{z}\"), date.valid_zone(\"{z}\") ? date.to_zone(\"2026-01-15T12:00:00Z\", \"{z}\") : \"-\")\n"))
+        .collect();
+    std::fs::write(d.join("main.qwe"), program).unwrap();
+    let run = |tzdir: Option<&std::path::Path>| {
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"));
+        c.arg("run").arg(d.join("main.qwe"));
+        match tzdir {
+            Some(t) => c.env("TZDIR", t),
+            None => c.env_remove("TZDIR"),
+        };
+        let o = c.output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    let (whole, partial) = (run(None), run(Some(&d.join("zones"))));
+    assert_eq!(partial, whole);
+    assert_eq!(
+        whole,
+        "Europe/Paris true 2026-01-15T13:00:00+01:00\nEST true 2026-01-15T07:00:00-05:00\nUS/Pacific true 2026-01-15T04:00:00-08:00\nus/pacific true 2026-01-15T04:00:00-08:00\nAsia/Calcutta true 2026-01-15T17:30:00+05:30\nEST5EDT true 2026-01-15T07:00:00-05:00\nMars/Olympus false -\nposixrules false -\nFactory false -\nEtc/Unknown false -\nlocaltime false -\n"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}

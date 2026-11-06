@@ -3979,7 +3979,9 @@ fn error_of(port: u16, log: &Path, path: &str) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let l = std::fs::read_to_string(log).unwrap_or_default();
-        if let Some(line) = l.lines().find(|x| x.contains(&mark)) {
+        // Not the watchdog's word that an instance is still computing, which names the request
+        // too: a debug build's Markdown takes seconds past the limit before it stops (CI).
+        if let Some(line) = l.lines().find(|x| x.contains(&mark) && !x.contains("has been computing for")) {
             return line.split_once("): ").map_or(line, |(_, m)| m).to_string();
         }
         assert!(std::time::Instant::now() < deadline, "no error for {} in {}", path, l);
@@ -5415,7 +5417,7 @@ fn the_browser_highlights_in_proportion_to_the_text() {
         ]
     };
     let src = format!(
-        "fn took(code: str, lang: str) -> int {{\n    let best = 1000000\n    for r in [1, 2, 3] {{\n        let t0 = now()\n        let _h = highlight(code, lang)\n        let d = now() - t0\n        if d < best {{\n            best = d\n        }}\n    }}\n    return best\n}}\nfn __t() = [{}, {}, took(\"route GET \" + repeat(\"/*\", 64000), \"quillo\")]\n",
+        "fn took(code: str, lang: str) -> int {{\n    let best = 1000000\n    for r in [1, 2, 3, 4, 5] {{\n        let t0 = now()\n        let _h = highlight(code, lang)\n        let d = now() - t0\n        if d < best {{\n            best = d\n        }}\n    }}\n    return best\n}}\nfn __t() = [{}, {}, took(\"route GET \" + repeat(\"/*\", 64000), \"quillo\")]\n",
         shape(50_000).join(", "),
         shape(200_000).join(", ")
     );
@@ -5428,8 +5430,9 @@ fn the_browser_highlights_in_proportion_to_the_text() {
     let n = shape(1).len();
     assert!(ms[2 * n] < 1000.0, "64,000 `/*` took {} ms in the browser", ms[2 * n]);
     for k in 0..n {
-        // Four times the text against at most six times the time (quadratic is sixteen).
-        assert!(ms[n + k] < 3000.0 && ms[n + k] < 6.0 * ms[k] + 30.0, "shape {}: {} ms, then {} ms for four times the text", k, ms[k], ms[n + k]);
+        // Four times the text against at most eight times the time (quadratic is sixteen), the
+        // best of five runs each: a CI runner's Node took 7.2 times once.
+        assert!(ms[n + k] < 3000.0 && ms[n + k] < 8.0 * ms[k] + 30.0, "shape {}: {} ms, then {} ms for four times the text", k, ms[k], ms[n + k]);
     }
 }
 
@@ -5509,7 +5512,8 @@ fn max_compute_ends_a_long_highlight() {
     for path in ["/h", "/md", "/blocks", "/plain"] {
         let t = std::time::Instant::now();
         assert_eq!(error_of(port, &log, path), format!("main.qwe:{}: this request computed for longer than --max-compute allows", match path { "/h" => 2, "/md" => 4, "/blocks" => 5, _ => 6 }));
-        assert!(t.elapsed().as_secs_f64() < 5.0, "{}: {:?}", path, t.elapsed());
+        // A debug build parses the 12 MB of Markdown in seconds before the stop can come.
+        assert!(t.elapsed().as_secs_f64() < if cfg!(debug_assertions) { 30.0 } else { 5.0 }, "{}: {:?}", path, t.elapsed());
         let a = support::send(port, "GET", "/", &[], "");
         assert_eq!((a.status, a.body.as_str()), (200, "hello"));
     }

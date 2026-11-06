@@ -496,11 +496,18 @@ fn zone(args: &[Value], i: usize, f: &str, line: u32) -> Result<Zone, Ctrl> {
             None => fail(line, format!("`{}`: unknown time zone {}", f, got(Some(v)))),
         };
     }
-    match jiff::tz::TimeZone::get(name) {
+    match jiff::tz::TimeZone::get(name).or_else(|_| BUNDLED.get(name)) {
         Ok(tz) if !not_a_zone(name) => Ok(Zone::Named(tz)),
         _ => fail(line, format!("`{}`: unknown time zone {}", f, got(Some(v)))),
     }
 }
+
+/// jiff's own copy of the database, for a name the system's copy leaves out: Ubuntu 24.04 moved
+/// the IANA links of its `backward` file (`EST`, `US/Pacific`, `Asia/Calcutta`) to a package of
+/// their own, tzdata-legacy, so a program that ran on one machine stopped on another, and the
+/// server refused what the browser took (found by CI on Linux, FEEDBACK55.md's Q-782; branch
+/// feedback55).
+static BUNDLED: std::sync::LazyLock<jiff::tz::TimeZoneDatabase> = std::sync::LazyLock::new(jiff::tz::TimeZoneDatabase::bundled);
 
 /// What the system's copy of the time zone database holds, or jiff knows, that is no zone the
 /// browser knows: `posixrules` (a file, the rules for a POSIX TZ string), `Factory`, CLDR's
