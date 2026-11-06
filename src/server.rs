@@ -1382,6 +1382,15 @@ impl Interp {
                     None => Value::Nil,
                 },
                 serde_json::Value::Array(a) => Value::list(a.iter().map(|x| arg_of(x, files)).collect()),
+                // A map of one key that starts with `$`, as the page sends it so that it is not
+                // taken for one of these (`island_json`; FEEDBACK55.md, Q-875's review; branch
+                // feedback55).
+                serde_json::Value::Object(o) if o.len() == 1 && o.get("$").and_then(|x| x.as_array()).is_some_and(|a| a.len() == 2 && a[0].is_string()) => {
+                    let a = o["$"].as_array().map(Vec::as_slice).unwrap_or_default();
+                    let mut m = Map::new();
+                    m.insert(a[0].as_str().unwrap_or_default().into(), arg_of(&a[1], files));
+                    Value::map(m)
+                }
                 // Decimals and large ints as the page sends them ({"$dec": "12.50"}).
                 serde_json::Value::Object(o) if o.len() == 1 && o.keys().all(|k| matches!(k.as_str(), "$dec" | "$int" | "$quillo_err")) => crate::interp::from_island_json(j),
                 serde_json::Value::Object(o) => Value::map(o.iter().map(|(k, v)| (k.as_str().into(), arg_of(v, files))).collect()),

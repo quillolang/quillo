@@ -2001,6 +2001,35 @@ fn float_js(f: f64) -> String {
     }
 }
 
+/// Whether JavaScript puts key `k` of an object before the others, in number order: an array
+/// index, "0" to "4294967294" written so (FEEDBACK55.md, Q-875; branch feedback55).
+fn array_index(k: &str) -> bool {
+    k.bytes().all(|b| b.is_ascii_digit()) && (k == "0" || !k.starts_with('0')) && k.parse::<u64>().is_ok_and(|n| n <= 4_294_967_294)
+}
+
+/// A map literal `js` with keys `keys` (as written, a key written twice once): with an array
+/// index among them where JavaScript would not have it, made a map that keeps the order they were
+/// written in, as the server's does (FEEDBACK55.md, Q-875; branch feedback55).
+fn kept_in_order<'k>(js: String, keys: impl Iterator<Item = &'k str> + Clone) -> String {
+    // Array indexes first, rising, are where JavaScript puts them.
+    let (mut named, mut last, mut js_order) = (false, -1i64, true);
+    for k in keys.clone() {
+        if array_index(k) {
+            let x: i64 = k.parse().unwrap_or(0);
+            js_order = js_order && !named && x > last;
+            last = x;
+        } else {
+            named = true;
+        }
+    }
+    if js_order {
+        return js;
+    }
+    let mut seen = HashSet::new();
+    let order: Vec<String> = keys.filter(|k| seen.insert(*k)).map(js_str).collect();
+    format!("W.ordered({}, [{}])", js, order.join(", "))
+}
+
 /// A top-level constant's value as JavaScript, for the bundle. JSON would
 /// do but for decimals (text in JSON) and ints past 2^53 (rounded): those
 /// are written as the literals `lit_js` gives, wherever they are inside
@@ -2013,8 +2042,11 @@ fn value_js(v: &Value) -> String {
             Value::Float(f) => f.is_finite() && f.fract() != 0.0,
             Value::List(l) => l.iter().all(exact),
             // In a JSON literal `__proto__` sets the prototype, and the key is
-            // lost (FEEDBACK16.md, Q-119; branch feedback20-fixes).
-            Value::Map(m) => m.iter().all(|(k, x)| &**k != "__proto__" && exact(x)),
+            // lost (FEEDBACK16.md, Q-119; branch feedback20-fixes); an array index
+            // is put first (FEEDBACK55.md, Q-875; branch feedback55).
+            Value::Map(m) => m.iter().all(|(k, x)| &**k != "__proto__" && !array_index(k) && exact(x)),
+            // JSON makes an error value a map (FEEDBACK55.md, Q-875's review; branch feedback55).
+            Value::Err(..) => false,
             _ => true,
         }
     }
@@ -2027,13 +2059,21 @@ fn value_js(v: &Value) -> String {
         Value::Float(f) => float_js(*f),
         Value::List(l) => format!("[{}]", l.iter().map(value_js).collect::<Vec<_>>().join(",")),
         // `"__proto__": x` in a literal would set the object's prototype.
-        Value::Map(m) => format!(
-            "{{{}}}",
-            m.iter()
-                .map(|(k, x)| if &**k == "__proto__" { format!("[{}]:{}", js_str(k), value_js(x)) } else { format!("{}:{}", js_str(k), value_js(x)) })
-                .collect::<Vec<_>>()
-                .join(",")
+        Value::Map(m) => kept_in_order(
+            format!(
+                "{{{}}}",
+                m.iter()
+                    .map(|(k, x)| if &**k == "__proto__" { format!("[{}]:{}", js_str(k), value_js(x)) } else { format!("{}:{}", js_str(k), value_js(x)) })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            m.keys().map(|k| &**k),
         ),
+        // An error value as the runtime's, the program's own or a builtin's, its value inside as
+        // the rest: JSON wrote `{"error": ...}`, a map to the browser, `is_err` false
+        // (FEEDBACK55.md, Q-875's review; branch feedback55). Markup and functions never come
+        // here (`not_sendable`: they are made in the browser from their definition).
+        Value::Err(e, own, _) => format!("new W.Err({}, {})", value_js(e), own),
         other => other.to_json().to_string(),
     }
 }
@@ -2393,7 +2433,9 @@ impl<'a> Compiler<'a> {
                     }
                     return self.err(format!("`{}` is {}, which cannot be sent to the browser", name, bad));
                 }
-                self.defs.push(format!("{} = {};", js, value_js(other)));
+                // What a visitor may see of it, as the server sends a value to a page: a builtin's
+                // error says `internal error` (FEEDBACK55.md, Q-875's review; branch feedback55).
+                self.defs.push(format!("{} = {};", js, value_js(&crate::server::for_visitor(other.clone()))));
                 let r = (js, false);
                 self.globals.insert(name.to_string(), r.clone());
                 Ok(r)
@@ -3198,7 +3240,7 @@ impl<'a> Compiler<'a> {
                         out.push(format!("{}: {}", js_str(k), self.expr(v)?));
                     }
                 }
-                format!("{{{}}}", out.join(", "))
+                kept_in_order(format!("{{{}}}", out.join(", ")), entries.iter().map(|(k, _)| k.as_str()))
             }
             Expr::Unary(op, x, line) => {
                 self.line = *line;

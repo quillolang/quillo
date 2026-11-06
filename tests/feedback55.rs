@@ -11150,3 +11150,476 @@ fn a_name_two_tested_fields_bind_is_refused_where_it_is_used() {
 }
 
 // ---- end of slice 10's second review ----
+
+// ---- slice 14 ----
+
+// Q-875: the browser keeps a map as a plain JavaScript object, which lists its keys that are array
+// indexes ("0" to "4294967294" written so) first, in number order: `keys`, `values`, `for`,
+// `json.stringify`, `str`, `url_encode`, `merge` and `group_by` read `{ b: 1, "1": 2, a: 3, "0": 4 }`
+// in another order than the server, which keeps the order the keys were set. A map with such a
+// key keeps its order beside it in the browser, so every one reads as on the server: a literal, a
+// top-level constant, a map made by a builtin, one read from JSON, one sent and one received.
+const Q875: &str = r#"type Row = { b: int, "1": int, a: int = 5, "0": int }
+let m = { b: 1, "1": 2, a: 3, "0": 4 }
+let edge = { "4294967295": 1, "4294967294": 2, "01": 3, "-1": 4, "1.5": 5, "10": 6, "0": 7, "1": 8, "é": 9, "日本": 10, "🙂": 11, "": 12, z: 13 }
+let rows = [{ "2": 1, a: 2 }, { a: 1, "2": 2, "__proto__": 3 }]
+fn lit() = { b: 1, "1": 2, a: 3, "0": 4 }
+fn twice() = { "1": 1, "1": 2, b: 3 }
+fn walk(m) {
+  let out = []
+  for [k, x] in m {
+    out = push(out, k)
+  }
+  out
+}
+fn nested() = { z: { b: 1, "1": [{ "9": 1, a: 2 }] }, "0": null }
+fn built() {
+  let out = {}
+  for k in ["b", "1", "a", "0", "1"] {
+    out = set(out, k, len(out))
+  }
+  out
+}
+"#;
+
+#[test]
+fn a_maps_keys_read_in_the_order_set_in_the_browser_too() {
+    same_on_both(Q875, &[
+        (r#"keys(m)"#, r#"[["str", "str", "str", "str"], ["b", "1", "a", "0"]]"#),
+        (r#"values(m)"#, r#"[["int", "int", "int", "int"], [1, 2, 3, 4]]"#),
+        (r#"walk(m)"#, r#"[["str", "str", "str", "str"], ["b", "1", "a", "0"]]"#),
+        (r#"json.stringify(m)"#, r#"["str", "{\"b\":1,\"1\":2,\"a\":3,\"0\":4}"]"#),
+        (r#"str(m)"#, r#"["str", "{ b: 1, \"1\": 2, a: 3, \"0\": 4 }"]"#),
+        (r#"url_encode(m)"#, r#"["str", "b=1&1=2&a=3&0=4"]"#),
+        (r#"merge({ b: 1 }, { "2": 2 })"#, r#"[[["b", "int"], ["2", "int"]], { b: 1, "2": 2 }]"#),
+        (r#"group_by(["b", "1"], (x) => x) | keys"#, r#"[["str", "str"], ["b", "1"]]"#),
+        (r#"keys(lit())"#, r#"[["str", "str", "str", "str"], ["b", "1", "a", "0"]]"#),
+        (r#"walk(lit())"#, r#"[["str", "str", "str", "str"], ["b", "1", "a", "0"]]"#),
+        (r#"`m is ${m}`"#, r#"["str", "m is { b: 1, \"1\": 2, a: 3, \"0\": 4 }"]"#),
+    ]);
+}
+
+// The keys JavaScript puts first are the array indexes only: "0", "1", "10" and "4294967294" kept
+// in their place, and "01", "-1", "1.5" and "4294967295", which it never moved, with unicode keys,
+// the empty key, an empty map and a map of one key.
+#[test]
+fn number_like_and_unicode_keys_keep_their_place_in_the_browser() {
+    same_on_both(Q875, &[
+        (r#"keys(edge)"#, r#"[["str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str"], ["4294967295", "4294967294", "01", "-1", "1.5", "10", "0", "1", "é", "日本", "🙂", "", "z"]]"#),
+        (r#"json.stringify(edge)"#, r#"["str", "{\"4294967295\":1,\"4294967294\":2,\"01\":3,\"-1\":4,\"1.5\":5,\"10\":6,\"0\":7,\"1\":8,\"é\":9,\"日本\":10,\"🙂\":11,\"\":12,\"z\":13}"]"#),
+        (r#"str(edge)"#, r#"["str", "{ \"4294967295\": 1, \"4294967294\": 2, \"01\": 3, \"-1\": 4, \"1.5\": 5, \"10\": 6, \"0\": 7, \"1\": 8, é: 9, 日本: 10, \"🙂\": 11, \"\": 12, z: 13 }"]"#),
+        (r#"url_encode(edge)"#, r#"["str", "4294967295=1&4294967294=2&01=3&-1=4&1.5=5&10=6&0=7&1=8&%C3%A9=9&%E6%97%A5%E6%9C%AC=10&%F0%9F%99%82=11&=12&z=13"]"#),
+        (r#"keys({})"#, r#"[[], []]"#),
+        (r#"json.stringify({})"#, r#"["str", "{}"]"#),
+        (r#"str({})"#, r#"["str", "{}"]"#),
+        (r#"url_encode({})"#, r#"["str", ""]"#),
+        (r#"keys({ "7": 1 })"#, r#"[["str"], ["7"]]"#),
+        (r#"json.stringify({ "7": 1 })"#, r#"["str", "{\"7\":1}"]"#),
+        (r#"keys(rows[1]) + keys(rows[0])"#, r#"[["str", "str", "str", "str", "str"], ["a", "2", "__proto__", "2", "a"]]"#),
+    ]);
+}
+
+// A key set again keeps its first place, as on the server; one removed and set again goes last; a
+// spread, `merge`, `+`, `set` in a loop, `group_by` and a record (in its type's order, a quoted
+// "1" field too) keep the order, and a key written twice in a literal is in its first place.
+#[test]
+fn a_key_set_again_removed_or_merged_keeps_the_servers_place() {
+    same_on_both(Q875, &[
+        (r#"keys(set(m, "b", 9))"#, r#"[["str", "str", "str", "str"], ["b", "1", "a", "0"]]"#),
+        (r#"values(set(m, "b", 9))"#, r#"[["int", "int", "int", "int"], [9, 2, 3, 4]]"#),
+        (r#"keys(set(m, "1", 9))"#, r#"[["str", "str", "str", "str"], ["b", "1", "a", "0"]]"#),
+        (r#"keys(remove(m, "b"))"#, r#"[["str", "str", "str"], ["1", "a", "0"]]"#),
+        (r#"keys(remove(m, "1"))"#, r#"[["str", "str", "str"], ["b", "a", "0"]]"#),
+        (r#"keys(set(remove(m, "1"), "1", 9))"#, r#"[["str", "str", "str", "str"], ["b", "a", "0", "1"]]"#),
+        (r#"keys(remove(m, "nothing"))"#, r#"[["str", "str", "str", "str"], ["b", "1", "a", "0"]]"#),
+        (r#"keys({ ...m, "5": 1, b: 0 })"#, r#"[["str", "str", "str", "str", "str"], ["b", "1", "a", "0", "5"]]"#),
+        (r#"values({ ...m, "5": 1, b: 0 })"#, r#"[["int", "int", "int", "int", "int"], [0, 2, 3, 4, 1]]"#),
+        (r#"keys({ "1": 1, ...{ a: 1 }, "0": 1 })"#, r#"[["str", "str", "str"], ["1", "a", "0"]]"#),
+        (r#"keys(m + { "9": 1, b: 7 })"#, r#"[["str", "str", "str", "str", "str"], ["b", "1", "a", "0", "9"]]"#),
+        (r#"keys({ a: 1 } + { "3": 1 })"#, r#"[["str", "str"], ["a", "3"]]"#),
+        (r#"keys(merge(m, { "1": 0, c: 1 }))"#, r#"[["str", "str", "str", "str", "str"], ["b", "1", "a", "0", "c"]]"#),
+        (r#"keys(merge({ a: 1 }, m))"#, r#"[["str", "str", "str", "str"], ["a", "b", "1", "0"]]"#),
+        (r#"keys(built())"#, r#"[["str", "str", "str", "str"], ["b", "1", "a", "0"]]"#),
+        (r#"values(built())"#, r#"[["int", "int", "int", "int"], [0, 4, 2, 3]]"#),
+        (r#"group_by(["b", "1", "a", "0", "b"], (x) => x) | keys"#, r#"[["str", "str", "str", "str"], ["b", "1", "a", "0"]]"#),
+        (r#"group_by([3, 1, 2, 1], (x) => x) | keys"#, r#"[["str", "str", "str"], ["3", "1", "2"]]"#),
+        (r#"keys(Row({ "0": 1, b: 2, "1": 3 }))"#, r#"[["str", "str", "str", "str"], ["b", "1", "a", "0"]]"#),
+        (r#"str(Row({ "0": 1, b: 2, "1": 3 }))"#, r#"["str", "{ b: 2, \"1\": 3, a: 5, \"0\": 1 }"]"#),
+        (r#"keys(json.parse("{\"b\":1,\"1\":2}") | set("0", 3))"#, r#"[["str", "str", "str"], ["b", "1", "0"]]"#),
+        (r#"twice()"#, r#"[[["1", "int"], ["b", "int"]], { "1": 2, b: 3 }]"#),
+    ]);
+}
+
+// JSON read keeps the order written, a key escaped (`\u0030`), nested in lists and maps at any
+// place, empty ones beside them, a key written twice (the last value, in the first place, a map
+// there too), spaces, tabs and lines between, and `"1":`, quotes and braces inside a string; JSON
+// written keeps the map's, pretty too. The same where JSON.parse gives no text of its numbers (the
+// path that marks them), as Safari before 18.4 and Firefox before 135; and text that is no JSON
+// is still refused.
+#[test]
+fn json_reads_and_writes_a_maps_keys_in_their_order_in_any_browser() {
+    let cases = [
+        (r#"keys(json.parse("{\"b\":1,\"1\":2,\"\\u0030\":3,\"a\":4}"))"#, r#"[["str", "str", "str", "str"], ["b", "1", "0", "a"]]"#),
+        (r#"json.parse("{\"b\":1,\"1\":2,\"\\u0030\":3,\"a\":4}")"#, r#"[[["b", "int"], ["1", "int"], ["0", "int"], ["a", "int"]], { b: 1, "1": 2, "0": 3, a: 4 }]"#),
+        (r#"json.parse(json.stringify(nested()))"#, r#"[[["z", [["b", "int"], ["1", [[["9", "int"], ["a", "int"]]]]]], ["0", "null"]], { z: { b: 1, "1": [{ "9": 1, a: 2 }] }, "0": null }]"#),
+        (r#"json.stringify(json.parse("{\"b\": {\"2\": 1, \"a\": [1, {\"1\": 2, \"x\": 3}]}, \"0\": 4.0}"))"#, r#"["str", "{\"b\":{\"2\":1,\"a\":[1,{\"1\":2,\"x\":3}]},\"0\":4.0}"]"#),
+        (r#"json.stringify(json.parse("{\"1\":1,\"1\":2,\"b\":3}"))"#, r#"["str", "{\"1\":2,\"b\":3}"]"#),
+        (r#"json.stringify(nested(), true)"#, r#"["str", "{\n  \"z\": {\n    \"b\": 1,\n    \"1\": [\n      {\n        \"9\": 1,\n        \"a\": 2\n      }\n    ]\n  },\n  \"0\": null\n}"]"#),
+        (r#"str(nested())"#, r#"["str", "{ z: { b: 1, \"1\": [{ \"9\": 1, a: 2 }] }, \"0\": null }"]"#),
+        (r#"keys(json.parse("[{\"5\":1,\"a\":2}]")[0])"#, r#"[["str", "str"], ["5", "a"]]"#),
+        (r#"keys(json.parse("{\"a\":\"\\\"1\\\": 2\",\"9\":1}"))"#, r#"[["str", "str"], ["a", "9"]]"#),
+        (r#"json.parse("{ \"b\" : 1 ,\n \"1\" :\t[ { \"2\" : 1 , \"a\" : \"x\\\"y}\" } , 3 ] }")"#, r#"[[["b", "int"], ["1", [[["2", "int"], ["a", "str"]], "int"]]], { b: 1, "1": [{ "2": 1, a: "x\"y}" }, 3] }]"#),
+        (r#"json.parse("[1, {\"b\": 1, \"0\": 2}, [{\"3\": 1, \"a\": 2}], {\"c\": {\"5\": [], \"d\": {}}}]")"#, r#"[["int", [["b", "int"], ["0", "int"]], [[["3", "int"], ["a", "int"]]], [["c", [["5", []], ["d", []]]]]], [1, { b: 1, "0": 2 }, [{ "3": 1, a: 2 }], { c: { "5": [], d: {} } }]]"#),
+        (r#"keys(json.parse("{\"\\n1\": 1, \"1\": 2, \"\\u00e9\": 3}"))"#, r#"[["str", "str", "str"], ["\n1", "1", "é"]]"#),
+        (r#"json.parse("{\"a\": \"{\\\"9\\\": 1}\", \"1\": 2, \"4294967295\": 3, \"4294967294\": 4}")"#, r#"[[["a", "str"], ["1", "int"], ["4294967295", "int"], ["4294967294", "int"]], { a: "{\"9\": 1}", "1": 2, "4294967295": 3, "4294967294": 4 }]"#),
+        (r#"json.parse("{\"1\": {}, \"b\": [], \"0\": [{}], \"c\": [[{\"7\": 1, \"e\": 2}]]}")"#, r#"[[["1", []], ["b", []], ["0", [[]]], ["c", [[[["7", "int"], ["e", "int"]]]]]], { "1": {}, b: [], "0": [{}], c: [[{ "7": 1, e: 2 }]] }]"#),
+        (r#"json.parse("{\"1\": {\"x\": 1, \"2\": 1}, \"1\": {\"y\": 1, \"3\": 1}, \"b\": 0}")"#, r#"[[["1", [["y", "int"], ["3", "int"]]], ["b", "int"]], { "1": { y: 1, "3": 1 }, b: 0 }]"#),
+        (r#"json.parse("{\"1\": {\"x\": 1, \"2\": 1}, \"b\": 0, \"1\": 5}")"#, r#"[[["1", "int"], ["b", "int"]], { "1": 5, b: 0 }]"#),
+        (r#"[is_err(json.parse("{\"1\": 1,}")), is_err(json.parse("{\"\\x\": 1, \"2\": 2}")), is_err(json.parse("{\"2\": \"\\ud800\"}"))]"#, r#"[["bool", "bool", "bool"], [true, true, true]]"#),
+    ];
+    same_on_both(Q875, &cases);
+    same_on_both_after(OLD_JSON, Q875, &cases);
+}
+
+// The browser half, where only it has the case: the page's code is given a plain copy of a map that
+// keeps its order (review of Q-875: its symbol broke URLSearchParams, Headers and deep equality), so
+// what it changes in it (a library adding to its options) is its own and the map stays as it was;
+// a map with no array index is still the map itself, and a change the page makes shows (in
+// JavaScript's order). No symbol reaches the page: in a list, past 16 levels, or given back by a
+// function of the program's the page calls; a Proxy of the page's that refuses a symbol is read;
+// JSON text with a key of digits that is no JSON says what JSON.parse says of it.
+#[test]
+fn the_pages_code_gets_a_plain_copy_of_a_map_that_keeps_its_order() {
+    let src = r#"fn mk(x) = { "1": x, b: 2 }
+fn __t() {
+  let m = { b: 1, "1": 2, a: 3 }
+  let n = { b: 1, "1": 2, a: 3 }
+  let p = { b: 1, a: 3 }
+  let deep = [[[[[[[[[[[[[[[[[[[[{ b: 1, "1": 2 }]]]]]]]]]]]]]]]]]]]]
+  js("grow", m)
+  js("swap", n)
+  js("grow", p)
+  [keys(m), json.stringify(m), keys(n), values(n), keys(p), js("syms", m), js("syms", [m, { x: m }]), js("syms", deep), js("eq", m, { "1": 2, b: 1, a: 3 }), js("String", js_new("URLSearchParams", { page: "2", "10": "x" })), js("hdr", { "x-a": "1", "10": "x" }), js("callBack", mk), keys(js("prox")), error(json.parse("{\"1\": 1,}")) == "invalid JSON: " + js("said")]
+}
+"#;
+    let (ok, out) = check(src);
+    assert!(ok, "{}", out);
+    let mut it = quillo::Interp::new(".");
+    it.load_source(src, "case.qwe").unwrap();
+    let prelude = r#"globalThis.grow = (m) => { delete m.a; m.z = 9; m["0"] = 8; return null; };
+globalThis.swap = (m) => { delete m.a; m.y = 7; return null; };
+globalThis.syms = (...xs) => { let n = 0; const walk = (v) => { if (v && typeof v === "object") { n += Object.getOwnPropertySymbols(v).length; for (const k of Object.keys(v)) walk(v[k]); } }; xs.forEach(walk); return n; };
+globalThis.eq = (a, b) => require("util").isDeepStrictEqual(a, b);
+globalThis.hdr = (o) => [...new Headers(o)].map((p) => p.join("=")).join(";");
+globalThis.callBack = (f) => { const r = f(5); return Object.getOwnPropertySymbols(r).length + " " + Object.keys(r).join(","); };
+globalThis.prox = () => new Proxy({ b: 1, "1": 2 }, { get(t, k) { if (typeof k === "symbol") throw new Error("no " + String(k)); return t[k]; } });
+globalThis.said = () => { try { JSON.parse('{"1": 1,}'); } catch (e) { return e.message; } };"#;
+    let Some(got) = in_node(&format!("{}\n{}", prelude, quillo::client::test_script(&it, "__t").unwrap())) else { return };
+    assert_eq!(got, r#"[["b", "1", "a"], "{\"b\":1,\"1\":2,\"a\":3}", ["b", "1", "a"], [1, 2, 3], ["0", "b", "z"], 0, 0, 0, true, "10=x&page=2", "10=x;x-a=1", "0 1,b", ["1", "b"], true]"#);
+}
+
+// In Chrome: a component listing a map by key shows the server's order, and is taken up as the
+// server wrote it (made again before, the order being another); after an update too, a key set
+// again in its place and one removed. Island state and props, a server fn's argument and answer,
+// `http.get`'s JSON, a `listen`ed stream, a form's values, `url().query`, a class map and an error
+// value holding a map keep the order set; where JSON.parse gives no text of its numbers too (the
+// path that marks them).
+#[test]
+fn a_component_shows_a_map_in_the_order_set_from_the_server_on() {
+    let src = r##"fn ks(x) = keys(x) | join(",")
+server fn echo(x) = { got: ks(x), back: set(x, "0", 0) }
+server fn bad() = [err({ b: 1, "1": 2 })]
+route GET /data = { b: 1, "1": 2, a: 3, "0": 4 }
+route GET /feed = events((send) => { send({ b: 1, "1": 2, a: 3, "0": 4 }) })
+component Board(p) {
+    state m = { b: 1, "10": 2, a: 3, "2": 4 }
+    state e = err({ b: 1, "1": 2 })
+    state got = ""
+    state far = ""
+    state heard = ""
+    state sent = ""
+    listen("/feed", (x) => { heard = ks(x) })
+    <div><ul #l>{for [k, v] in m => <li>{k}={v}</li>}</ul>
+    <p #k>{ks(m)} {ks(p)} {json.stringify(m)} {str(p)}</p>
+    <p #q>{ks(url().query)}</p><p #e>{str(e)}</p>
+    <p #c class={{ b: true, "1": true, a: true }}>c</p>
+    <form #f @submit={(e) => { sent = ks(e.form) }}><input name="b" value="1"/><input name="1" value="2"/><input name="0" value="3"/><button #send>send</button></form>
+    <p #got>{got}</p><p #far>{far}</p><p #heard>{heard}</p><p #sent>{sent}</p>
+    <button #add @click={() => { m = set(m, "0", 5) }}>add</button>
+    <button #again @click={() => { m = remove(set(m, "b", 9), "10") }}>again</button>
+    <button #go @click={() => {
+        let r = echo({ z: 1, "5": 2, "4": 3 })
+        got = r.got + " " + ks(r.back) + " " + json.stringify(r.back) + " " + str(bad())
+        let h = http.get("/data")
+        far = ks(h.json)
+    }}>go</button></div>
+}
+let old_json = "const P = JSON.parse; JSON.parse = function (t, r) { return r ? P(t, function (k, v) { return r.call(this, k, v); }) : P(t); };"
+route GET / = <html><head><title>t</title></head><body><Board p={{ z: 1, "3": 2, y: 3 }}/></body></html>
+route GET /old = <html><head><title>t</title><script>{raw(old_json)}</script></head><body><Board p={{ z: 1, "3": 2, y: 3 }}/></body></html>
+"##;
+    let body = r#"const items = () => [...$("l").children].map((li) => li.textContent).join(" ");
+    const out = { first: items(), k: $("k").textContent, q: $("q").textContent, e: $("e").textContent, c: $("c").className };
+    $("add").click(); await tick(60); out.add = items() + " | " + $("k").textContent;
+    $("again").click(); await tick(60); out.again = items();
+    $("send").click(); await tick(60); out.sent = $("sent").textContent;
+    $("go").click();
+    for (let i = 0; i < 100 && !($("got").textContent && $("far").textContent && $("heard").textContent); i++) await tick(30);
+    out.got = $("got").textContent; out.far = $("far").textContent; out.heard = $("heard").textContent;
+    return out;"#;
+    let want = serde_json::json!({
+        "first": "b=1 10=2 a=3 2=4", "k": r#"b,10,a,2 z,3,y {"b":1,"10":2,"a":3,"2":4} { z: 1, "3": 2, y: 3 }"#, "q": "b,1,a,0", "e": r#"err({ b: 1, "1": 2 })"#, "c": "b 1 a",
+        "add": r#"b=1 10=2 a=3 2=4 0=5 | b,10,a,2,0 z,3,y {"b":1,"10":2,"a":3,"2":4,"0":5} { z: 1, "3": 2, y: 3 }"#, "again": "b=9 a=3 2=4 0=5",
+        "sent": "b,1,0", "got": r#"z,5,4 z,5,4,0 {"z":1,"5":2,"4":3,"0":0} [err({ b: 1, "1": 2 })]"#, "far": "b,1,a,0", "heard": "b,1,a,0",
+        "remade": 0, "errors": [],
+    });
+    for path in ["/?b=1&1=2&a=3&0=4", "/old?b=1&1=2&a=3&0=4"] {
+        let Some((r, html)) = in_page("q875", src, path, body) else { return };
+        assert!(html.contains("<li>b=1</li><li>10=2</li><li>a=3</li><li>2=4</li>") && html.contains("<p id=\"q\">b,1,a,0</p>") && html.contains("class=\"b 1 a\""), "{}", html);
+        assert_eq!(r, want, "{}", path);
+    }
+}
+
+
+// ---- slice 14's review ----
+
+const Q875_REVIEW: &str = r#"let e = err("nope")
+let e2 = [err({ code: 1, "1": 2 })]
+let e3 = err({ b: 1, "1": 2 })
+let shared = { b: 1, "1": 2 }
+fn deep(n, inner) = repeat("[", n) + inner + repeat("]", n)
+fn deepm(n, inner) = repeat("{\"a\":", n) + inner + repeat("}", n)
+fn said(x) = if is_err(x) { error(x) } else { type_of(x) }
+fn branches() {
+  let a = shared
+  let x = set(a, "2", 3)
+  let y = set(a, "3", 4)
+  let z = set(x, "4", 5)
+  let w = remove(z, "4")
+  [keys(a), keys(x), keys(y), keys(z), keys(w), keys(set(w, "9", 1)), keys(x), keys(set(remove(z, "1"), "7", 0)), keys({ ...z, "0": 1 }), keys({ ...x, ...y }), keys(remove(remove(z, "4"), "2")), keys(set(z, "b", 0)), keys(z)]
+}
+fn innermost(x) = if type_of(x) == "list" { innermost(x[0]) } else { x }
+"#;
+
+// Review of Q-875: a top-level constant holding an error value was written as JSON, `{"error":
+// ...}`, a map in the browser (`is_err` false), its map's keys in JavaScript's order. It is the
+// runtime's error value, the program's own, its value inside kept in order; in a list too. A
+// builtin's error says only `internal error` in the bundle, as the server hides it from a page.
+#[test]
+fn a_constant_error_value_is_an_error_value_in_the_browser() {
+    let src = "let bad = int(\"x\")\nlet bads = { \"1\": bad, b: [bad] }\nfn __t() = [is_err(bad), str(bad), str(bads)]\n";
+    let (ok, out) = check(src);
+    assert!(ok, "{}", out);
+    let mut it = quillo::Interp::new(".");
+    it.load_source(src, "case.qwe").unwrap();
+    if let Some(got) = in_node(&quillo::client::test_script(&it, "__t").unwrap()) {
+        assert_eq!(got, r#"[true, "err(\"internal error\")", "{ \"1\": err(\"internal error\"), b: [err(\"internal error\")] }"]"#);
+    }
+    same_on_both(Q875_REVIEW, &[
+        (r#"[is_err(e), type_of(e), str(e)]"#, r#"[["bool", "str", "str"], [true, "error", "err(\"nope\")"]]"#),
+        (r#"[is_err(e2[0]), str(e2), keys(error(e2[0]))]"#, r#"[["bool", "str", ["str", "str"]], [true, "[err({ code: 1, \"1\": 2 })]", ["code", "1"]]]"#),
+        (r#"[is_err(e3), str(e3), keys(error(e3)), json.stringify(error(e3))]"#, r#"[["bool", "str", ["str", "str"], "str"], [true, "err({ b: 1, \"1\": 2 })", ["b", "1"], "{\"b\":1,\"1\":2}"]]"#),
+    ]);
+}
+
+// Review of Q-875: a map shares its list of keys with the maps made from it, and adds to its end
+// while no other has (setting a key in a map of 1,000 made the list again): two maps made from one,
+// a key taken from the end and from the middle, spreads and a key set again keep each one's own.
+// Read from JSON, a long map out of JavaScript's order keeps a key written twice in its first place.
+#[test]
+fn maps_made_from_one_keep_each_its_own_order() {
+    same_on_both(Q875_REVIEW, &[
+        (r#"json.parse("{\"z\":0," + (range(20) | map((i) => "\"" + str(i) + "\":" + str(i)) | join(",")) + ",\"5\":99,\"a\":1,\"z\":2}") | keys"#, r#"[["str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str"], ["z", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "a"]]"#),
+        (r#"json.parse("{\"z\":0," + (range(20) | map((i) => "\"" + str(i) + "\":" + str(i)) | join(",")) + ",\"5\":99,\"a\":1,\"z\":2}") | values"#, r#"[["int", "int", "int", "int", "int", "int", "int", "int", "int", "int", "int", "int", "int", "int", "int", "int", "int", "int", "int", "int", "int", "int"], [2, 0, 1, 2, 3, 4, 99, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 1]]"#),
+        (r#"branches()"#, r#"[[["str", "str"], ["str", "str", "str"], ["str", "str", "str"], ["str", "str", "str", "str"], ["str", "str", "str"], ["str", "str", "str", "str"], ["str", "str", "str"], ["str", "str", "str", "str"], ["str", "str", "str", "str", "str"], ["str", "str", "str", "str"], ["str", "str"], ["str", "str", "str", "str"], ["str", "str", "str", "str"]], [["b", "1"], ["b", "1", "2"], ["b", "1", "3"], ["b", "1", "2", "4"], ["b", "1", "2"], ["b", "1", "2", "9"], ["b", "1", "2"], ["b", "2", "4", "7"], ["b", "1", "2", "4", "0"], ["b", "1", "2", "3"], ["b", "1"], ["b", "1", "2", "4"], ["b", "1", "2", "4"]]]"#),
+    ]);
+}
+
+// Review of Q-875 (an older bug): a large int and a whole float were marked "\u0000int:" and
+// "\u0000flt:" for JSON.stringify and the mark taken out wherever it was, a visitor's text too:
+// `?q=%00int:5` reached a server fn as the int 5, and `a"\0int:5` broke the JSON. They are written
+// with JSON.rawJSON, or, where a browser has none, with letters only the page knows: the text
+// stays text on both sides, in a map's key too, pretty too; the numbers are written as before.
+#[test]
+fn text_that_looks_like_a_mark_stays_text_in_json() {
+    let cases = [
+        (r#"json.stringify(["\u0000int:5", { "\u0000flt:2.0": 1 }, "a\"\u0000int:5", "\u0000flt:1e999", set({ a: 1 }, "\u0000int:5", 2)])"#, r#"["str", "[\"\\u0000int:5\",{\"\\u0000flt:2.0\":1},\"a\\\"\\u0000int:5\",\"\\u0000flt:1e999\",{\"a\":1,\"\\u0000int:5\":2}]"]"#),
+        (r#"json.stringify([9007199254740993, 2.0, -0.0, 1e21, [9007199254740993, { "1": 2.0, b: -9007199254740993 }]])"#, r#"["str", "[9007199254740993,2.0,-0.0,1e+21,[9007199254740993,{\"1\":2.0,\"b\":-9007199254740993}]]"]"#),
+        (r#"json.stringify({ "1": [{ "2": 9007199254740993, a: 1.0 }], b: "\u0000int:7" }, true)"#, r#"["str", "{\n  \"1\": [\n    {\n      \"2\": 9007199254740993,\n      \"a\": 1.0\n    }\n  ],\n  \"b\": \"\\u0000int:7\"\n}"]"#),
+    ];
+    same_on_both(Q875_REVIEW, &cases);
+    same_on_both_after(&format!("delete JSON.rawJSON;\n{}", OLD_JSON), Q875_REVIEW, &cases);
+}
+
+// Review of Q-875: json.parse took 128 levels on the server (serde's limit) and some 3,000 in the
+// browser, which then stopped. Both take 1,000, lists and maps, and refuse 1,001 with what the
+// database's JSON says; a map with a key of digits at the bottom keeps its order; brackets in a
+// string are no levels; far deeper is refused, not a stack run out.
+#[test]
+fn json_nests_1000_levels_on_both_sides() {
+    let cases = [
+        (r#"said(json.parse(deep(1000, "1")))"#, r#"["str", "list"]"#),
+        (r#"said(json.parse(deep(1001, "1")))"#, r#"["str", "invalid JSON: it nests more than 1000 deep"]"#),
+        (r#"said(json.parse(deepm(999, "1")))"#, r#"["str", "map"]"#),
+        (r#"said(json.parse(deepm(1000, "1")))"#, r#"["str", "map"]"#),
+        (r#"said(json.parse(deep(999, "{\"b\":1,\"1\":2}")))"#, r#"["str", "list"]"#),
+        (r#"said(json.parse(deep(1000, "{\"b\":1,\"1\":2}")))"#, r#"["str", "invalid JSON: it nests more than 1000 deep"]"#),
+        (r#"keys(innermost(json.parse(deep(999, "{\"b\":1,\"1\":2}"))))"#, r#"[["str", "str"], ["b", "1"]]"#),
+        (r#"said(json.parse(deepm(500, deep(499, "{\"b\":1,\"1\":2}"))))"#, r#"["str", "map"]"#),
+        (r#"said(json.parse(deepm(500, deep(500, "{\"b\":1,\"1\":2}"))))"#, r#"["str", "invalid JSON: it nests more than 1000 deep"]"#),
+        (r#"said(json.parse(deep(1001, "\"[[[\"")))"#, r#"["str", "invalid JSON: it nests more than 1000 deep"]"#),
+        (r#"said(json.parse(deep(5000, "1")))"#, r#"["str", "invalid JSON: it nests more than 1000 deep"]"#),
+        (r#"said(json.parse(deep(1000, json.stringify(repeat("[", 3000) + "\"]]}{\\"))))"#, r#"["str", "list"]"#),
+    ];
+    same_on_both(Q875_REVIEW, &cases);
+    same_on_both_after(OLD_JSON, Q875_REVIEW, &cases);
+}
+
+// Review of Q-875: what a program reads as JSON on the server takes 1,000 levels too, a request's
+// body and an answer to `http.get`, and is none past it, as json.parse refuses it (it took 128).
+#[test]
+fn a_request_and_an_answer_nest_1000_levels_of_json() {
+    let src = r#"fn nest(n) = repeat("[", n) + "1" + repeat("]", n)
+route POST /j = type_of(request.json)
+route GET /deep/:n = respond(200, nest(int(n) ?? 0), { "content-type": "application/json" })
+route GET /far/:n {
+    let r = http.get(`http://127.0.0.1:${request.query.port}/deep/${n}`, {}, { public_only: false })
+    type_of(r.json)
+}
+"#;
+    let (ok, out) = check(src);
+    assert!(ok, "{}", out);
+    let d = dir("q875-deep", src);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let nest = |n: usize| format!("{}1{}", "[".repeat(n), "]".repeat(n));
+    for (n, want) in [(129, "list"), (1000, "list"), (1001, "null"), (100_000, "null")] {
+        let a = support::send(s.port, "POST", "/j", &[("content-type", "application/json")], &nest(n));
+        assert_eq!(a.body, want, "a body {} deep", n);
+    }
+    for (n, want) in [(1000, "list"), (1001, "null")] {
+        let a = support::send(s.port, "GET", &format!("/far/{}?port={}", n, s.port), &[], "");
+        assert_eq!(a.body, want, "an answer {} deep", n);
+    }
+}
+
+// Review of Q-875 (an older bug), the wire both ways: a map of one key that starts with `$` (a key
+// a visitor chose) was read as a tag, an error value, an int or a decimal, in the browser, and in
+// the server when the page sent it; the server's own mark for a state that is its prop too. It
+// crosses as `{"$": [key, value]}` and is read back as the map, in a server fn's answer, in island
+// state, in an argument; the mark still works. Values from the review: one map a visitor's text
+// made `?q=%00int:5` an int on the server, and `a"\0int:5` broke the JSON sent, on either JSON
+// path; JSON deeper than 1,000 levels from http is none; a map with a key of digits to
+// URLSearchParams and Headers; a markup constant's text.
+#[test]
+fn wire_tags_and_marks_cannot_be_made_from_a_visitors_text() {
+    let src = r##"fn ks(x) = keys(x) | join(",")
+server fn kind(x) = `${type_of(x.q)} ${json.stringify(x)}`
+server fn tag(k) = set({}, k, "boom")
+server fn tags(k) = [set({}, k, "123"), { inner: set({}, k, [1, 2]) }]
+server fn back(x) = `${type_of(x)} ${str(x)}`
+route POST /raw = `${request.body} => ${type_of(request.json)}`
+route GET /deep/:n = respond(200, repeat("[", int(n) ?? 0) + "1" + repeat("]", int(n) ?? 0), { "content-type": "application/json" })
+let h = <b>hi</b>
+component Wire(p) {
+    state got = ""
+    state mine = set({}, "$quillo_prop", "p")
+    state esc = set({}, "$quillo_err", "boom")
+    state same = p
+    <div><p #h>{str(h)}</p><p #st>{str(mine)} {str(esc)} {is_err(esc) ? "err" : ""} {str(same)}</p>
+    <button #go @click={() => {
+        let q = url().query.q ?? ""
+        let out = [kind({ q: q })]
+        out = push(out, http.post("/raw", { q: q, n: 1 }).body)
+        out = push(out, http.post("/raw", [set({ a: 1 }, q, 2)]).body)
+        out = push(out, json.stringify({ q: q, list: [q, "x"] }))
+        for k in ["$quillo_err", "$int", "$dec", "$quillo_prop", "$", "$quillo_file", "$x"] {
+            let a = tag(k)
+            let b = tags(k)
+            out = push(out, `${k} ${is_err(a)} ${type_of(a)} ${str(a)} ${type_of(b[0][k])} ${str(b)} ${back(set({}, k, "123"))} ${back([set({}, k, 0)])}`)
+        }
+        out = push(out, js("String", js_new("URLSearchParams", { page: "2", "10": "x" })))
+        out = push(out, js("hdr", { "x-a": "1", "10": "x" }))
+        out = push(out, `${type_of(http.get("/deep/1000").json)} ${type_of(http.get("/deep/1001").json)}`)
+        got = json.stringify(out)
+    }}>go</button><p #got>{got}</p></div>
+}
+let hdr = "window.hdr = (o) => [...new Headers(o)].map((p) => p.join(\"=\")).join(\";\");"
+let old_json = "delete JSON.rawJSON; const P = JSON.parse; JSON.parse = function (t, r) { return r ? P(t, function (k, v) { return r.call(this, k, v); }) : P(t); };"
+route GET / = <html><head><title>t</title><script>{raw(hdr)}</script></head><body><Wire p={{ items: [1] }}/></body></html>
+route GET /old = <html><head><title>t</title><script>{raw(hdr + old_json)}</script></head><body><Wire p={{ items: [1] }}/></body></html>
+"##;
+    let body = r#"$("go").click();
+    for (let i = 0; i < 200 && !$("got").textContent; i++) await tick(30);
+    return { h: $("h").textContent, st: $("st").textContent, got: JSON.parse($("got").textContent) };"#;
+    let tag_lines = |q: &str| -> Vec<String> {
+        let qj = serde_json::to_string(q).unwrap();
+        let mut out = vec![
+            format!("str {{\"q\":{}}}", qj),
+            format!("{{\"q\":{},\"n\":1}} => map", qj),
+            format!("[{{\"a\":1,{}:2}}] => list", qj),
+            format!("{{\"q\":{},\"list\":[{},\"x\"]}}", qj, qj),
+        ];
+        for k in ["$quillo_err", "$int", "$dec", "$quillo_prop", "$", "$quillo_file", "$x"] {
+            out.push(format!("{k} false map {{ \"{k}\": \"boom\" }} str [{{ \"{k}\": \"123\" }}, {{ inner: {{ \"{k}\": [1, 2] }} }}] map {{ \"{k}\": \"123\" }} list [{{ \"{k}\": 0 }}]"));
+        }
+        out.extend(["10=x&page=2".to_string(), "10=x;x-a=1".to_string(), "list null".to_string()]);
+        out
+    };
+    for (path, q) in [("/?q=%00int:5", "\u{0}int:5"), ("/?q=a%22%00int:5", "a\"\u{0}int:5"), ("/?q=%00flt:1e999", "\u{0}flt:1e999"), ("/old?q=%00int:5", "\u{0}int:5"), ("/old?q=a%22%00int:5", "a\"\u{0}int:5")] {
+        let Some((r, html)) = in_page("q875-wire", src, path, body) else { return };
+        assert!(html.contains("<p id=\"h\">&lt;b&gt;hi&lt;/b&gt;</p>") && html.contains("&quot;$quillo_prop&quot;:&quot;p&quot;") && html.contains("&quot;same&quot;:{&quot;$quillo_prop&quot;:&quot;p&quot;}"), "{}", html);
+        let want = serde_json::json!({
+            "h": "<b>hi</b>", "st": r#"{ "$quillo_prop": "p" } { "$quillo_err": "boom" }  { items: [1] }"#,
+            "got": tag_lines(q), "remade": 0, "errors": [],
+        });
+        assert_eq!(r, want, "{}", path);
+    }
+}
+
+// Review of Q-875: what crosses between servers and sessions (`island_json` both ways: services,
+// sites, sessions, idempotent answers) reads back a map of one `$` key as the map, in a list and a
+// map too; the tags themselves as before; `{"$": ...}` that is no pair is a map as it was.
+#[test]
+fn a_map_of_one_dollar_key_crosses_between_servers_as_a_map() {
+    use quillo::interp::{from_island_json, island_json};
+    use quillo::value::Value;
+    for k in ["$quillo_err", "$int", "$dec", "$quillo_prop", "$", "$quillo_file", "$x"] {
+        let text = format!(r#"[{{"{k}": "123"}}, {{"a": {{"{k}": [1, {{"{k}": 2}}]}}}}, {{"{k}": "1", "b": 2}}]"#);
+        let v = Value::parse_json(&text).unwrap();
+        let back = from_island_json(&island_json(&v));
+        assert_eq!(back.repr(), v.repr(), "{}", k);
+        assert!(quillo::value::equal(&back, &v), "{}", k);
+    }
+    let tags = Value::parse_json(r#"[{"$int": "9007199254740993"}, {"$dec": "1.50"}, {"$quillo_err": "x"}, {"$": 5}, {"$": [1, 2]}, {"$": ["k"]}]"#).unwrap();
+    assert_eq!(from_island_json(&tags.to_json()).repr(), r#"[9007199254740993, 1.50m, err("x"), { "$": 5 }, { "$": [1, 2] }, { "$": ["k"] }]"#);
+}
+
+// Review of Q-875: a map that keeps no list is in JavaScript's order, as one read from JSON so, a
+// literal so, or one of ids set in rising order: merged, spread, added to or set so that an
+// array index lands where JavaScript would not put it, it keeps the order set; a key set again
+// after one was taken from the end, and group_by of rising and of mixed keys, too.
+#[test]
+fn maps_in_javascripts_order_merge_in_the_order_set() {
+    same_on_both("fn rising(n) {\n  let m = {}\n  for i in range(n) {\n    m = set(m, str(i), i)\n  }\n  m\n}\n", &[
+        (r#"keys(merge(json.parse("{\"5\":1}"), json.parse("{\"1\":2}")))"#, r#"[["str", "str"], ["5", "1"]]"#),
+        (r#"keys({ ...json.parse("{\"5\":1}"), ...json.parse("{\"1\":2,\"a\":3}") })"#, r#"[["str", "str", "str"], ["5", "1", "a"]]"#),
+        (r#"keys(json.parse("{\"5\":1}") + { "1": 2 })"#, r#"[["str", "str"], ["5", "1"]]"#),
+        (r#"keys(merge({ "1": 1, "2": 2 }, { "0": 0 }))"#, r#"[["str", "str", "str"], ["1", "2", "0"]]"#),
+        (r#"keys(merge({ "1": 1, "2": 2 }, { "2": 9, a: 1 }))"#, r#"[["str", "str", "str"], ["1", "2", "a"]]"#),
+        (r#"keys({ ...{ "1": 1 }, a: 2, "0": 3 })"#, r#"[["str", "str", "str"], ["1", "a", "0"]]"#),
+        (r#"keys(set(set(set(set({}, "1", 1), "2", 2), "a", 3), "0", 0))"#, r#"[["str", "str", "str", "str"], ["1", "2", "a", "0"]]"#),
+        (r#"keys(set(set({}, "5", 1), "3", 2))"#, r#"[["str", "str"], ["5", "3"]]"#),
+        (r#"keys(rising(21) | set("x", 0) | set("21", 1))"#, r#"[["str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str"], ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "x", "21"]]"#),
+        (r#"keys(rising(5) | remove("4") | set("4", 9) | set("2", 0))"#, r#"[["str", "str", "str", "str", "str"], ["0", "1", "2", "3", "4"]]"#),
+        (r#"keys(rising(5) | remove("1") | set("1", 9))"#, r#"[["str", "str", "str", "str", "str"], ["0", "2", "3", "4", "1"]]"#),
+        (r#"keys(set(json.parse("{\"1\":1,\"2\":2}"), "0", 0))"#, r#"[["str", "str", "str"], ["1", "2", "0"]]"#),
+        (r#"keys(set(json.parse("{\"1\":1,\"2\":2,\"b\":0}"), "3", 0))"#, r#"[["str", "str", "str", "str"], ["1", "2", "b", "3"]]"#),
+        (r#"keys(group_by([3, 5, 1, 5], (x) => x))"#, r#"[["str", "str", "str"], ["3", "5", "1"]]"#),
+        (r#"keys(group_by([1, 2, 3, 2], (x) => x))"#, r#"[["str", "str", "str"], ["1", "2", "3"]]"#),
+        (r#"json.stringify(rising(3) | set("b", 1) | set("0", 7))"#, r#"["str", "{\"0\":7,\"1\":1,\"2\":2,\"b\":1}"]"#),
+    ]);
+}
+
+// ---- end of slice 14's review ----
+
+// ---- end of slice 14 ----

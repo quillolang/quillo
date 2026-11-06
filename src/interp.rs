@@ -1129,14 +1129,21 @@ pub fn script_json(j: &serde_json::Value) -> String {
 /// give: like `to_json`, but an error value becomes `{"$quillo_err":
 /// payload}`, a decimal `{"$dec": "12.50"}` and an int past what a JS number
 /// holds whole `{"$int": "9007199254740993"}`, which the browser turns back
-/// into an error value, its decimal and a BigInt.
+/// into an error value, its decimal and a BigInt. A map of one key that starts
+/// with `$` is `{"$": [key, value]}`, read back as that map: a visitor's key
+/// (`set({}, k, "boom")`) made an error value, an int or a decimal of it in the
+/// browser, and on the server it was sent (FEEDBACK55.md, Q-875's review; branch
+/// feedback55).
 pub fn island_json(v: &Value) -> serde_json::Value {
     match v {
         Value::Err(e, _, _) => serde_json::json!({ "$quillo_err": island_json(e) }),
         Value::Dec(d) => serde_json::json!({ "$dec": d.to_string() }),
         Value::Int(n) if n.unsigned_abs() > JS_SAFE => serde_json::json!({ "$int": n.to_string() }),
         Value::List(l) => serde_json::Value::Array(l.iter().map(island_json).collect()),
-        Value::Map(m) => serde_json::Value::Object(m.iter().map(|(k, x)| (k.to_string(), island_json(x))).collect()),
+        Value::Map(m) => match m.iter().next() {
+            Some((k, x)) if m.len() == 1 && k.starts_with('$') => serde_json::json!({ "$": [k.to_string(), island_json(x)] }),
+            _ => serde_json::Value::Object(m.iter().map(|(k, x)| (k.to_string(), island_json(x))).collect()),
+        },
         other => other.to_json(),
     }
 }
@@ -1155,6 +1162,12 @@ pub fn from_island_json(j: &serde_json::Value) -> Value {
                 ("$dec", J::String(s)) => Dec::parse(s).map_or_else(|| Value::str(s), Value::Dec),
                 ("$int", J::String(s)) => s.parse::<i64>().map_or_else(|_| Value::str(s), Value::Int),
                 ("$quillo_err", x) => Value::err(from_island_json(x)),
+                // A map of one key that starts with `$` (see `island_json`).
+                ("$", J::Array(a)) if a.len() == 2 && a[0].is_string() => {
+                    let mut m = Map::new();
+                    m.insert(a[0].as_str().unwrap_or_default().into(), from_island_json(&a[1]));
+                    Value::map(m)
+                }
                 _ => Value::map(o.iter().map(|(k, v)| (k.into(), from_island_json(v))).collect()),
             }
         }
@@ -5578,6 +5591,10 @@ impl Interp {
         // A state that still holds its very prop, as `state items = initial` does, is written as
         // a reference to it, not as a second copy of the list (FEEDBACK30.md, Q-371; branch
         // feedback27-35-fixes).
+        // Written into the state's JSON as it is, after `island_json`, which writes a map the
+        // program made of that shape as one, not as the mark (FEEDBACK55.md, Q-875's review;
+        // branch feedback55).
+        let mut marks: Vec<(String, String)> = Vec::new();
         for (k, v) in state.iter_mut() {
             let same = |p: &Value| match (p, &*v) {
                 (Value::List(a), Value::List(b)) => Arc::ptr_eq(a, b) && !a.is_empty(),
@@ -5586,10 +5603,14 @@ impl Interp {
                 _ => false,
             };
             if let Some((name, _)) = props.iter().find(|(_, p)| same(p)) {
-                let mut m = Map::new();
-                m.insert("$quillo_prop".into(), Value::str(&**name));
-                let _ = k;
-                *v = Value::map(m);
+                marks.push((k.to_string(), name.to_string()));
+                *v = Value::Nil;
+            }
+        }
+        let mut state_json = island_json(&crate::server::for_visitor(Value::map(state)));
+        if let serde_json::Value::Object(o) = &mut state_json {
+            for (k, name) in marks {
+                o.insert(k, serde_json::json!({ "$quillo_prop": name }));
             }
         }
         let live_attrs = if live.is_empty() {
@@ -5609,7 +5630,7 @@ impl Interp {
             " data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}{}{}",
             escape(tag),
             escape(&island_json(&crate::server::for_visitor(Value::map(props))).to_string()),
-            escape(&island_json(&crate::server::for_visitor(Value::map(state))).to_string()),
+            escape(&state_json.to_string()),
             live_attrs,
             if eager { " data-e" } else { "" },
             extra

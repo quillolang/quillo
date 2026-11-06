@@ -559,13 +559,30 @@ impl Value {
     /// At most `max(1,000,000, text.len() / 8)` values: a body of tiny ones, `[0,0,...]`,
     /// took 100 times its size, 1 GB for a visitor's 10 MB (FEEDBACK51.md, Q-660; branch
     /// feedback51-fixes). Past it, an error that says so.
+    ///
+    /// At most `JSON_NESTING` levels deep, as the database's JSON and the browser's take: serde's
+    /// own limit refused 128 here, and the browser took some 3,000 (FEEDBACK55.md, Q-875's
+    /// review; branch feedback55). Each level makes room on the stack for the next.
     pub fn parse_json(text: &str) -> serde_json::Result<Value> {
+        use serde::Deserialize;
         let budget = (text.len() / 8).max(JSON_VALUES);
         let outer = JSON_LEFT.with(|l| l.replace(budget));
-        let r = serde_json::from_str::<Parsed>(text).map(|p| p.0);
+        let outer_depth = JSON_DEPTH.with(|d| d.replace(0));
+        let mut de = serde_json::Deserializer::from_str(text);
+        de.disable_recursion_limit();
+        let r = Parsed::deserialize(&mut de).and_then(|p| de.end().map(|_| p.0));
         JSON_LEFT.with(|l| l.set(outer));
-        r
+        let deep = JSON_DEPTH.with(|d| d.replace(outer_depth)) > JSON_NESTING;
+        r.map_err(|e| if deep { <serde_json::Error as serde::de::Error>::custom(json_too_deep()) } else { e })
     }
+}
+
+/// How deep JSON a program reads may nest (`Value::parse_json`, the database's JSON).
+pub const JSON_NESTING: usize = 1000;
+
+/// What reading JSON nested deeper than `JSON_NESTING` says, as the database's does.
+pub fn json_too_deep() -> String {
+    format!("it nests more than {} deep", JSON_NESTING)
 }
 
 /// A value read from JSON (`Value::parse_json`).
@@ -603,6 +620,26 @@ pub const JSON_VALUES: usize = 1_000_000;
 thread_local! {
     /// How many more values the JSON being read may have (see `Value::parse_json`).
     static JSON_LEFT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    /// How deep the JSON being read is now; past `JSON_NESTING` once it was too deep.
+    static JSON_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A list or a map read from JSON, inside what is being read: an error past `JSON_NESTING`, and
+/// `f` run with room on the stack for it.
+fn nested<R, E: serde::de::Error>(f: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
+    let depth = JSON_DEPTH.with(|d| {
+        let n = d.get() + 1;
+        d.set(n);
+        n
+    });
+    if depth > JSON_NESTING {
+        return Err(E::custom(json_too_deep()));
+    }
+    let r = crate::stack::maybe_grow(64 << 10, 1 << 20, f);
+    if r.is_ok() {
+        JSON_DEPTH.with(|d| d.set(depth - 1));
+    }
+    r
 }
 
 /// One more value read from JSON, or an error past the budget.
@@ -648,21 +685,25 @@ impl<'de> serde::de::Visitor<'de> for ParsedVisitor {
     }
 
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Parsed, A::Error> {
-        let mut out = Vec::new();
-        while let Some(Parsed(v)) = seq.next_element()? {
-            one_more()?;
-            out.push(v);
-        }
-        Ok(Parsed(Value::list(out)))
+        nested(|| {
+            let mut out = Vec::new();
+            while let Some(Parsed(v)) = seq.next_element()? {
+                one_more()?;
+                out.push(v);
+            }
+            Ok(Parsed(Value::list(out)))
+        })
     }
 
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Parsed, A::Error> {
-        let mut out = Map::new();
-        while let Some((ParsedKey(k), Parsed(v))) = map.next_entry()? {
-            one_more()?;
-            out.insert(k, v);
-        }
-        Ok(Parsed(Value::map(out)))
+        nested(|| {
+            let mut out = Map::new();
+            while let Some((ParsedKey(k), Parsed(v))) = map.next_entry()? {
+                one_more()?;
+                out.insert(k, v);
+            }
+            Ok(Parsed(Value::map(out)))
+        })
     }
 }
 

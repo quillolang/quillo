@@ -43,6 +43,87 @@ const putKey = (o, k, v) => {
   else o[k] = v;
   return o;
 };
+
+// A map's keys in the order they were set, as the server keeps them: JavaScript lists an object's
+// keys that are array indexes ("0" to "4294967294" written so) first, by number, then the others
+// in the order they were set, so `{ b: 1, "1": 2 }` listed "1" first (FEEDBACK55.md, Q-875; branch
+// feedback55). A map with such a key keeps its keys in their order beside it: a list (ORD) and how
+// many of it are the map's (ORDN), symbols set as plain properties (defineProperty took 70 ns, and
+// made a spread of the map 20 times as slow). The rest, nearly all, need none. The page's code
+// never has such a map, but a plain copy of it (`forPage`, `lenient`), so the order kept is always
+// the map's: nothing changes a map once it is made. A map made from another shares its list, and
+// adds a key to its end while no other map has: setting a key in a map of 1,000 made the list
+// again, twice the time of the copy itself. A map with no list is in JavaScript's order: its keys
+// as Object.keys lists them (read from JSON so, or made with array indexes alone set in rising
+// order, ids, whose largest is under IDXTOP, Infinity once another key came after them).
+const ORD = Symbol("order"), ORDN = Symbol("count"), IDXTOP = Symbol("top");
+function isIdx(k) {
+  const c = k.charCodeAt(0);
+  if (!(c >= 48 && c <= 57)) return false;
+  const n = k.length;
+  if (n === 1) return true;
+  if (c === 48 || n > 10) return false;
+  for (let i = 1; i < n; i++) { const d = k.charCodeAt(i); if (d < 48 || d > 57) return false; }
+  return n < 10 || k <= "4294967294";
+}
+// The order map o keeps, or undefined; a page's Proxy that refuses the read has none.
+const ordOf = (o) => { try { return o[ORD]; } catch (_) { return undefined; } };
+// o, kept in the order of the first n of ks (its keys, each once).
+const ordered = (o, ks, n = ks.length) => { o[ORD] = ks; o[ORDN] = n; return o; };
+// The keys of map o in the order they were set, to read, not to change.
+const mkeys = (o) => { const ord = ordOf(o); if (ord === undefined) return Object.keys(o); const n = o[ORDN]; return n === ord.length ? ord : ord.slice(0, n); };
+// Key k set to v in o, a map being made (a copy, or a new one), in its place: a key set again keeps
+// its first place.
+function mput(o, k, v) {
+  const ord = o[ORD];
+  if (ord !== undefined) {
+    if (!hasOwn(o, k)) {
+      const n = o[ORDN];
+      if (n === ord.length) { ord.push(k); o[ORDN] = n + 1; } else { const ks = ord.slice(0, n); ks.push(k); ordered(o, ks); }
+    }
+  } else if (!hasOwn(o, k)) {
+    const top = o[IDXTOP];
+    if (isIdx(k)) {
+      const x = +k;
+      if (top === undefined ? isEmpty(o) : x > top) o[IDXTOP] = x;
+      else { const ks = Object.keys(o); ks.push(k); ordered(o, ks); }
+    } else if (top !== undefined) o[IDXTOP] = Infinity;
+  }
+  return putKey(o, k, v);
+}
+const isEmpty = (o) => { for (const _ in o) return false; return true; };
+// Key k taken out of o, a map being made (a copy, or a new one).
+function mdel(o, k) {
+  if (!hasOwn(o, k)) return o;
+  delete o[k];
+  const ord = o[ORD];
+  if (ord !== undefined) {
+    const n = o[ORDN];
+    if (ord[n - 1] === k) o[ORDN] = n - 1;
+    else { const ks = ord.slice(0, n); ks.splice(ks.indexOf(k), 1); ordered(o, ks); }
+  }
+  return o;
+}
+// a's keys and b's, in a's order and then b's new ones; b's values where both have one: in
+// JavaScript's order when both are and b adds no array index.
+function mmerge(a, b) {
+  const out = { ...a, ...b };
+  if (ordOf(a) === undefined && ordOf(b) === undefined && !newIdx(a, b)) return out;
+  const ks = mkeys(a).slice();
+  for (const k of mkeys(b)) if (!hasOwn(a, k)) ks.push(k);
+  return ordered(out, ks);
+}
+// Whether map b, in JavaScript's order, has an array index that a has not.
+function newIdx(a, b) {
+  for (const k of Object.keys(b)) { if (!isIdx(k)) return false; if (!hasOwn(a, k)) return true; }
+  return false;
+}
+// Map v as the page's code has it: a plain copy, in the order JavaScript lists it.
+function plainOf(v) {
+  const o = {};
+  for (const k of Object.keys(v)) putKey(o, k, v[k]);
+  return o;
+}
 const fail = (msg) => { throw new QuilloError(msg); };
 const isNil = (v) => v === null || v === undefined;
 const isEvent = (v) => typeof Event !== "undefined" && v instanceof Event;
@@ -351,20 +432,39 @@ function pageCall(f, args) {
 // `JSON.stringify({ a: 1.0 })` was {"a":{"f":1}} and `Number.isFinite(2.0)` false, and a chart
 // library's numbers objects (found in review of FEEDBACK55.md's Q-775; branch feedback55). Copied
 // where one changes.
+// A map that keeps its order is given as a plain copy, in the order JavaScript lists it: its
+// symbol broke URLSearchParams, Headers and the page's deep equality (FEEDBACK55.md, Q-875's
+// review; branch feedback55); past 16 levels too (`noOrd`).
 function forPage(v, depth) {
   if (v instanceof Fl) return v.f;
-  if (v === null || typeof v !== "object" || depth >= 16 || foreign(v)) return v;
+  if (v === null || typeof v !== "object" || foreign(v)) return v;
+  if (depth >= 16) return noOrd(v, new Map());
   if (Array.isArray(v)) {
     let out = v;
     v.forEach((x, i) => { const y = forPage(x, depth + 1); if (y !== x) { if (out === v) out = v.slice(); out[i] = y; } });
     return out;
   }
   if (!isMap(v)) return v;
-  let out = v;
+  let out = ordOf(v) === undefined ? v : plainOf(v);
   for (const k of Object.keys(v)) {
     const y = forPage(v[k], depth + 1);
     if (y !== v[k]) { if (out === v) out = { ...v }; putKey(out, k, y); }
   }
+  return out;
+}
+// Past where `forPage` and `lenient` go (16 levels), a map that keeps its order still given as a
+// plain copy, and what holds one copied; anything else as it is, the page's own objects once.
+function noOrd(v, seen) {
+  if (v === null || typeof v !== "object" || foreign(v)) return v;
+  if (seen.has(v)) return seen.get(v);
+  seen.set(v, v);
+  let out = v;
+  if (Array.isArray(v)) v.forEach((x, i) => { const y = noOrd(x, seen); if (y !== x) { if (out === v) out = v.slice(); out[i] = y; } });
+  else if (isMap(v)) {
+    if (ordOf(v) !== undefined) out = plainOf(v);
+    for (const k of Object.keys(v)) { const y = noOrd(v[k], seen); if (y !== v[k]) { if (out === v) out = { ...v }; putKey(out, k, y); } }
+  }
+  seen.set(v, out);
   return out;
 }
 // A call of the page's function f (the method `name`) with args: f is not
@@ -402,25 +502,29 @@ function lenient(v, depth) {
       // What the page passes as `undefined` is null to Quillo, as what its functions give
       // back is: a Promise of nothing calls `.then`'s function so (FEEDBACK28.md, Q-336;
       // branch feedback29-fixes).
+      // What it gives back is the page's as an argument is (FEEDBACK55.md, Q-875's review; branch
+      // feedback55).
       w = function (...a) {
         const b = a.slice(0, f.length);
         for (let i = 0; i < b.length; i++) if (b[i] === undefined) b[i] = null;
-        return f.apply(this, b);
+        const r = f.apply(this, b);
+        return r instanceof Promise ? r.then((x) => forPage(x, 0)) : forPage(r, 0);
       };
       lenientFns.set(v, w);
     }
     return w;
   }
-  // A number to the page (see `forPage`).
+  // A number to the page, and a map that keeps its order a plain copy (see `forPage`).
   if (v instanceof Fl) return v.f;
-  if (v === null || typeof v !== "object" || depth >= 16 || foreign(v)) return v;
+  if (v === null || typeof v !== "object" || foreign(v)) return v;
+  if (depth >= 16) return noOrd(v, new Map());
   if (Array.isArray(v)) {
     let out = v;
     v.forEach((x, i) => { const y = lenient(x, depth + 1); if (y !== x) { if (out === v) out = v.slice(); out[i] = y; } });
     return out;
   }
   if (!isMap(v)) return v;
-  let out = v;
+  let out = ordOf(v) === undefined ? v : plainOf(v);
   for (const k of Object.keys(v)) {
     const y = lenient(v[k], depth + 1);
     if (y !== v[k]) { if (out === v) out = { ...v }; out[k] = y; }
@@ -614,7 +718,8 @@ function ownMakeName(n, t, v, depth) {
       }
       const r = ownMake(ft, x, depth + 1);
       if (!r.ok) return { ok: false, w: ownWhyAt(k, ownWhyHere(r.w, ft, x)) };
-      Object.defineProperty(out, k, { value: r.v, enumerable: true, writable: true, configurable: true });
+      // In the order the type has its fields, a quoted "1" too (FEEDBACK55.md, Q-875; branch feedback55).
+      mput(out, k, r.v);
     }
     return { ok: true, v: out };
   }
@@ -678,7 +783,8 @@ function repr(v) {
   // Its markup, as on the server (FEEDBACK55.md, Q-779; branch feedback55).
   if (v instanceof Html) return htmlText(v);
   if (isEvent(v)) return "<event " + v.type + ">";
-  const ks = Object.keys(v);
+  // In the order set (FEEDBACK55.md, Q-875; branch feedback55).
+  const ks = mkeys(v);
   return ks.length ? "{ " + ks.map((k) => fmtKey(k) + ": " + repr(v[k])).join(", ") + " }" : "{}";
 }
 
@@ -798,7 +904,7 @@ function add(a, b) {
   if (typeof a === "bigint" || typeof b === "bigint") return bigArith(a, b, "+", "add");
   if (a instanceof Html && b instanceof Html) return frag([a, b]);
   if (Array.isArray(a) && Array.isArray(b)) return a.concat(b);
-  if (isMap(a) && isMap(b)) return moneyOp(a, b, false) ?? { ...a, ...b };
+  if (isMap(a) && isMap(b)) return moneyOp(a, b, false) ?? mmerge(a, b);
   fail(`cannot add ${typeName(a)} and ${typeName(b)}`);
 }
 
@@ -910,7 +1016,8 @@ function eventField(e, name) {
       // With the button that sent it, as the browser sends the form (FEEDBACK55.md, Q-767; branch
       // feedback55).
       const s = e.submitter;
-      for (const [k, v] of (s && s.form === f ? new FormData(f, s) : new FormData(f))) putKey(out, k, typeof v === "string" ? v : v.name);
+      // In the form's order, as the server reads it (FEEDBACK55.md, Q-875; branch feedback55).
+      for (const [k, v] of (s && s.form === f ? new FormData(f, s) : new FormData(f))) mput(out, k, typeof v === "string" ? v : v.name);
       return out;
     }
   }
@@ -1091,7 +1198,8 @@ function tryv(v) {
 
 function iter(v) {
   if (Array.isArray(v)) return v;
-  if (isMap(v)) return Object.keys(v).map((k) => [k, v[k]]);
+  // In the order set (FEEDBACK55.md, Q-875; branch feedback55).
+  if (isMap(v)) return mkeys(v).map((k) => [k, v[k]]);
   if (typeof v === "string") return Array.from(v);
   if (isNil(v)) return [];
   fail(`cannot loop over ${typeName(v)}`);
@@ -1298,8 +1406,8 @@ function coerce(t, s) {
 // A value as JSON data. `wire`: for the program's own server (a server
 // fn's arguments), decimals and large ints tagged ({"$dec": "12.50"}) so
 // they arrive as they are; else a decimal is its text, as the server
-// writes it, and a large int its digits (`jsonText` writes them).
-// A whole float is written as the server writes it, `2.0` (`jsonText` and `wireText` write it), so
+// writes it, and a large int its digits (`writeJSON` writes them).
+// A whole float is written as the server writes it, `2.0` (`writeJSON` writes it), so
 // that it is read back as a float on either side (FEEDBACK55.md, Q-775; branch feedback55);
 // `wire` "tools": as a number, for the developer's tools.
 function toJSON(v, wire) {
@@ -1310,19 +1418,107 @@ function toJSON(v, wire) {
   if (v instanceof Html) return htmlText(v);
   if (typeof v === "function") return repr(v);
   if (v instanceof Dec) return wire ? { $dec: decText(v) } : decText(v);
-  if (typeof v === "bigint") return wire ? { $int: String(v) } : "\u0000int:" + v;
-  if (v instanceof Fl) return wire === "tools" ? v.f : "\u0000flt:" + flJSON(v.f);
-  if (isMap(v)) { const o = {}; for (const k of Object.keys(v)) putKey(o, k, toJSON(v[k], wire)); return o; }
+  if (typeof v === "bigint") return wire ? { $int: String(v) } : rawNum(String(v));
+  if (v instanceof Fl) return wire === "tools" ? v.f : rawNum(flJSON(v.f));
+  if (isMap(v)) {
+    // In the order set (FEEDBACK55.md, Q-875; branch feedback55).
+    const ord = ordOf(v);
+    if (ord !== undefined) { const ks = mkeys(v); return new Kept(ks, ks.map((k) => toJSON(v[k], wire))); }
+    const ks = Object.keys(v);
+    // A map of one key that starts with `$` goes to the server as `{"$": [key, value]}`, which it
+    // reads back as that map: a visitor's key made `{"$int": "5"}` an int there (FEEDBACK55.md,
+    // Q-875's review; branch feedback55).
+    if (wire && ks.length === 1 && ks[0].charCodeAt(0) === 36) return { $: [ks[0], toJSON(v[ks[0]], wire)] };
+    const o = {};
+    for (const k of ks) putKey(o, k, toJSON(v[k], wire));
+    return o;
+  }
   if (typeof v === "number" && !isFinite(v)) return null;
   return v;
 }
 // A whole float's JSON text, as the server's: `.0` after its digits (`-0.0`), and from 1e21 an
 // exponent, as JavaScript writes it (FEEDBACK55.md, Q-775 and Q-781; branch feedback55).
 const flJSON = (f) => (Object.is(f, -0) ? "-0.0" : (f = String(f), f.includes("e") ? f : f + ".0"));
-// What `toJSON` marked written as it is: a large int's digits, a whole float's.
-const unmark = (t) => t.replace(/"\\u0000(?:int|flt):(-?[\d.e+]+)"/g, "$1");
+// A number's JSON text `t` (a large int's digits, a whole float's), written as it is: JSON.rawJSON
+// where the browser has it; else marked with letters the page alone knows, which `unmark` takes
+// out of the text. A fixed mark ("\u0000int:") was taken out of a visitor's text too: `?q=%00int:5`
+// reached a server fn as the int 5, and `a"\0int:5` made its JSON broken (FEEDBACK55.md, Q-875's
+// review; branch feedback55).
+let rawOk = null;
+const rawNum = (t) => ((rawOk ?? (rawOk = typeof JSON.rawJSON === "function")) ? JSON.rawJSON(t) : marks().num + t);
+// The marks of a page, made once at random: a number's text (`num`), a map in order (`kept`); and
+// how JSON writes them (`numText`, `keptText`).
+let marksMade = null;
+function marks() {
+  if (marksMade === null) {
+    const r = randomTag();
+    marksMade = { num: "\u0000n" + r + ":", numText: "\"\\u0000n" + r + ":", numRe: new RegExp("\"\\\\u0000n" + r + ":(-?[\\d.e+]+)\"", "g"),
+      kept: "\u0000k" + r + ":", keptText: "\"\\u0000k" + r + ":", keptRe: new RegExp("\"\\\\u0000k" + r + ":(\\d+)\"", "g") };
+  }
+  return marksMade;
+}
+// What `rawNum` marked written as it is.
+const unmark = (t) => (marksMade !== null && t.includes(marksMade.numText) ? t.replace(marksMade.numRe, "$1") : t);
+// Letters no text holds, by chance.
+function randomTag() {
+  return typeof crypto !== "undefined" && crypto.getRandomValues ? Array.from(crypto.getRandomValues(new Uint32Array(4)), (x) => x.toString(36)).join("") : String(Math.random()).slice(2);
+}
+// A map that keeps its order, as `toJSON` makes it: its keys and their values. JSON.stringify would
+// put its array indexes first, so it writes a mark in its place, which `writeJSON` takes out for
+// the map's text, keys in order (FEEDBACK55.md, Q-875; branch feedback55).
+class Kept {
+  constructor(ks, vs) { this.ks = ks; this.vs = vs; }
+  toJSON() {
+    if (keptOut === null) return [this.ks, this.vs];
+    keptOut.push(this);
+    return marks().kept + (keptOut.length - 1);
+  }
+}
+// The maps in order met while `writeJSON` writes.
+let keptOut = null;
+// JSON text of what `toJSON` made, `indent` spaces a level when given.
+function writeJSON(j, indent) {
+  const was = keptOut, out = [];
+  keptOut = out;
+  try {
+    const t = JSON.stringify(j, null, indent);
+    return unmark(out.length ? keptIn(t, out, indent) : t);
+  } finally {
+    keptOut = was;
+  }
+}
+// Text `t` with each map in order written where its mark is.
+const keptIn = (t, out, indent) => t.replace(marksMade.keptRe, (m, n, at) => keptText(out[n], out, indent, indent ? lineIndent(t, at) : ""));
+function lineIndent(t, at) {
+  const s = t.lastIndexOf("\n", at) + 1;
+  let e = s;
+  while (t.charCodeAt(e) === 32) e++;
+  return t.slice(s, e);
+}
+// Map k's text, as JSON.stringify writes an object, its lines `base` in.
+function keptText(k, out, indent, base) {
+  const n = k.ks.length;
+  if (n === 0) return "{}";
+  const gap = indent ? " ".repeat(indent) : "", sep = indent ? ",\n" + base + gap : ",", colon = indent ? ": " : ":";
+  const parts = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const key = k.ks[i], x = k.vs[i];
+    let t;
+    if (x === null) t = "null";
+    else if (x === true) t = "true";
+    else if (x === false) t = "false";
+    else if (typeof x === "number") t = String(x);
+    else {
+      t = JSON.stringify(x, null, indent);
+      if (typeof x === "object" && t.includes(marksMade.keptText)) t = keptIn(t, out, indent);
+      if (indent) t = t.replace(/\n/g, "\n" + base + gap);
+    }
+    parts[i] = (isIdx(key) ? "\"" + key + "\"" : JSON.stringify(key)) + colon + t;
+  }
+  return indent ? "{\n" + base + gap + parts.join(sep) + "\n" + base + "}" : "{" + parts.join(",") + "}";
+}
 // JSON text of a value.
-const jsonText = (v, indent) => unmark(JSON.stringify(toJSON(v), null, indent));
+const jsonText = (v, indent) => writeJSON(toJSON(v), indent);
 // What a visitor may read of `v` as JSON (`json.stringify`, an attribute's): a builtin's error
 // says `internal error`, as the server's `hidden` has it, unless the server shows errors
 // (FEEDBACK55.md, Q-773; branch feedback55).
@@ -1332,7 +1528,8 @@ const holdsHidden = (v) => (v instanceof Err ? !v.own || holdsHidden(v.error) : 
 function hiddenIn(v) {
   if (v instanceof Err) return v.own ? new Err(hiddenIn(v.error), true) : new Err("internal error");
   if (Array.isArray(v)) return v.map(hiddenIn);
-  if (isMap(v)) { const o = {}; for (const k of Object.keys(v)) putKey(o, k, hiddenIn(v[k])); return o; }
+  // In the order set (FEEDBACK55.md, Q-875; branch feedback55).
+  if (isMap(v)) { const o = {}, ks = mkeys(v); for (const k of ks) putKey(o, k, hiddenIn(v[k])); return ordOf(v) === undefined ? o : ordered(o, ks); }
   return v;
 }
 
@@ -1347,7 +1544,9 @@ async function readStream(res, f, who, signal, at) {
   const type = (res.headers.get("content-type") || "").toLowerCase();
   const kind = type.startsWith("text/event-stream") ? "events" : /ndjson|jsonl|json-seq/.test(type) ? "lines" : "text";
   // Numbers as the server reads them, floats and ints past 2^53 too (found in review).
-  const parse = (t) => { try { return readJSON(t); } catch (_) { return t; } };
+  // Deeper than 1,000 levels, its text, as on the server (FEEDBACK55.md, Q-875's review; branch
+  // feedback55).
+  const parse = (t) => { try { return readJSON(t, true); } catch (_) { return t; } };
   const give = async (args) => {
     const n = Array.isArray(f.$p) ? f.$p.length : f.length;
     const r = f(...args.slice(0, Math.max(n, 1)));
@@ -1428,7 +1627,8 @@ async function httpCall(fname, method, url, body, headers, opts, at) {
   S(url, fname, at);
   headers = M(headers, fname, at + (fname === "http.get" || fname === "http.delete" ? 1 : 2));
   opts = M(opts, fname, at + (fname === "http.get" || fname === "http.delete" ? 2 : 3));
-  for (const k of Object.keys(opts)) if (!HTTP_OPTIONS.includes(k)) fail(`\`${fname}\`: unknown option \`${k}\` (the options are ${HTTP_OPTIONS.join(", ")})`);
+  // The first one set named, as on the server (FEEDBACK55.md, Q-875; branch feedback55).
+  for (const k of mkeys(opts)) if (!HTTP_OPTIONS.includes(k)) fail(`\`${fname}\`: unknown option \`${k}\` (the options are ${HTTP_OPTIONS.join(", ")})`);
   const secs = numOf(opts.timeout);
   if (!isNil(opts.timeout) && !(secs !== null && secs > 0 && secs <= 300)) fail(`\`${fname}\`: \`timeout\` is seconds, more than 0 and up to 300, got ${display(opts.timeout)}`);
   if (/^[a-z][a-z0-9+.-]*:/i.test(url) && !/^https?:/i.test(url)) return new Err(`http: not an http(s) URL: ${url}`);
@@ -1453,7 +1653,9 @@ async function httpCall(fname, method, url, body, headers, opts, at) {
   const hs = {};
   res.headers.forEach((v, k) => { hs[k] = v; });
   let json = null;
-  try { json = fromJSON(readJSON(text)); } catch (e) { json = null; }
+  // JSON deeper than 1,000 levels is none, as on the server (FEEDBACK55.md, Q-875's review; branch
+  // feedback55).
+  try { json = fromJSON(readJSON(text, true)); } catch (e) { json = null; }
   return { status: res.status, ok: res.ok, headers: hs, body: text, json };
 }
 
@@ -1726,8 +1928,9 @@ B.range = meta((a, b, c) => {
   return b === undefined ? intRange(0, II(a, "range")) : intRange(II(a, "range"), II(b, "range", 2));
 }, "range", null);
 B.enumerate = meta((l) => L(l, "enumerate").map((v, i) => [i, v]), "enumerate", null);
-B.keys = meta((m) => Object.keys(M(m, "keys")), "keys", null);
-B.values = meta((m) => { m = M(m, "values"); return Object.keys(m).map((k) => m[k]); }, "values", null);
+// In the order set, as the rest that read or make a map (FEEDBACK55.md, Q-875; branch feedback55).
+B.keys = meta((m) => { m = M(m, "keys"); const ord = ordOf(m); return ord === undefined ? Object.keys(m) : ord.slice(0, m[ORDN]); }, "keys", null);
+B.values = meta((m) => { m = M(m, "values"); return mkeys(m).map((k) => m[k]); }, "values", null);
 // An error is no key: it is given back, as on the server (FEEDBACK55.md, Q-784; branch feedback55).
 B.get = meta((m, k, d = null) => { m = M(m, "get"); if (k instanceof Err) return k; k = keyText(k); return hasOwn(m, k) ? m[k] : d; }, "get", null);
 B.has = meta((m, k) => { m = M(m, "has"); return k instanceof Err ? k : hasOwn(m, keyText(k)); }, "has", null);
@@ -1742,29 +1945,34 @@ B.set = meta((m, k, v = null) => {
   }
   m = M(m, "set");
   if (k instanceof Err) return k;
-  return putKey({ ...m }, keyText(k), v);
+  const key = keyText(k);
+  // A map that keeps its order, or a key JavaScript would put first, in its place (FEEDBACK55.md,
+  // Q-875; branch feedback55).
+  return ordOf(m) === undefined && m[IDXTOP] === undefined && !isIdx(key) ? putKey({ ...m }, key, v) : mput({ ...m }, key, v);
 }, "set", null);
 B.remove = meta((c, k) => {
   if (Array.isArray(c)) return c.filter((v) => !eq(v, k));
   const m = { ...M(c, "remove") };
   if (k instanceof Err) return k;
-  delete m[keyText(k)];
-  return m;
+  return mdel(m, keyText(k));
 }, "remove", null);
-B.merge = meta((a, b) => ({ ...M(a, "merge"), ...M(b, "merge", 2) }), "merge", null);
+B.merge = meta((a, b) => mmerge(M(a, "merge"), M(b, "merge", 2)), "merge", null);
 // Spreads, which the parser makes calls of (FEEDBACK3.md, Q-036; branch
 // feedback6-fixes): null spreads nothing; anything else that is not a map
 // (a list) is said as the spread it is.
 B.__merge = meta((...ms) => {
-  const out = {};
+  let out = null;
   for (const m of ms) {
     if (isNil(m)) continue;
     if (!isMap(m)) fail(`\`{...x}\` spreads a map (or null) into a map, but x is ${typeName(m)}`);
     // A key at a time: `Object.assign` took a `__proto__` key from JSON for the prototype
-    // (FEEDBACK51.md, from reading; branch feedback51-fixes).
-    for (const k of Object.keys(m)) putKey(out, k, m[k]);
+    // (FEEDBACK51.md, from reading; branch feedback51-fixes). The first map whole, as a spread
+    // takes it, its order shared; the rest a key at a time in their order (FEEDBACK55.md, Q-875;
+    // branch feedback55).
+    if (out === null) out = { ...m };
+    else for (const k of mkeys(m)) mput(out, k, m[k]);
   }
-  return out;
+  return out ?? {};
 }, "__merge", null);
 B.__concat = meta((...ls) => {
   const out = [];
@@ -2096,9 +2304,10 @@ B.highlight = meta((code, lang) => textHtml(HL(display(code), lang == null ? "" 
 B.escape = meta((v) => escText(display(v)), "escape", null);
 // url_encode(v): as the server's, so links built on either side match.
 const urlPart = (s) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
-// An error is given back, not its text in the URL (FEEDBACK55.md, Q-784; branch feedback55).
+// An error is given back, not its text in the URL (FEEDBACK55.md, Q-784; branch feedback55). In
+// the order set (FEEDBACK55.md, Q-875; branch feedback55).
 B.url_encode = meta((v) => v instanceof Err ? v : isMap(v)
-  ? Object.keys(v).map((k) => v[k]).find((x) => x instanceof Err) || Object.keys(v).filter((k) => !isNil(v[k])).map((k) => urlPart(k) + "=" + urlPart(display(v[k]))).join("&")
+  ? mkeys(v).map((k) => v[k]).find((x) => x instanceof Err) || mkeys(v).filter((k) => !isNil(v[k])).map((k) => urlPart(k) + "=" + urlPart(display(v[k]))).join("&")
   : urlPart(display(v)), "url_encode", null);
 B.now = meta(() => Date.now(), "now", null);
 B.random = meta(() => fl(Math.random()), "random", null);
@@ -2328,7 +2537,8 @@ B.zip = meta((a, b) => { a = L(a, "zip"); b = L(b, "zip", 2); return a.slice(0, 
 B.take = meta((v, n) => { n = Math.max(IN(n, "take", 2), 0); return typeof v === "string" ? Array.from(v).slice(0, n).join("") : L(v, "take").slice(0, n); }, "take", null);
 B.drop = meta((v, n) => { n = Math.max(IN(n, "drop", 2), 0); return typeof v === "string" ? Array.from(v).slice(n).join("") : L(v, "drop").slice(n); }, "drop", null);
 B.count = meta((l, f) => { l = L(l, "count"); if (f === undefined) return l.length; F(f, "count"); let n = 0; for (const x of l) { const r = cb(f, "count", x); if (r instanceof Err) return r; if (truthy(r)) n++; } return n; }, "count", null);
-B.group_by = meta((l, f) => { F(f, "group_by"); const out = {}; for (const x of L(l, "group_by")) { const r = cb(f, "group_by", x); if (r instanceof Err) return r; const k = keyText(r); if (!hasOwn(out, k)) Object.defineProperty(out, k, { value: [], enumerable: true, writable: true, configurable: true }); out[k].push(x); } return out; }, "group_by", null);
+// Its groups in the order met (FEEDBACK55.md, Q-875; branch feedback55).
+B.group_by = meta((l, f) => { F(f, "group_by"); const out = {}; for (const x of L(l, "group_by")) { const r = cb(f, "group_by", x); if (r instanceof Err) return r; const k = keyText(r); if (!hasOwn(out, k)) mput(out, k, []); out[k].push(x); } return out; }, "group_by", null);
 B.index_of = meta((c, x) => {
   if (Array.isArray(c)) { const i = c.findIndex((y) => eq(y, x)); return i < 0 ? null : i; }
   if (typeof c === "string") { const i = c.indexOf(display(x)); return i < 0 ? null : Array.from(c.slice(0, i)).length; }
@@ -2533,10 +2743,11 @@ B.json = {
   // (FEEDBACK25.md, Q-301; branch feedback26-fixes).
   // Numbers as the server reads them (`jsonNum`); refused as there: one past a float's range
   // (`1e400`), and text with half of a character (FEEDBACK55.md, Q-782; branch feedback55).
+  // At most 1,000 levels deep, as on the server (FEEDBACK55.md, Q-875's review; branch feedback55).
   parse: (s) => { S(s, "json.parse"); try { return fromJSON(parseData(s, (k, v) => {
     if ((typeof v === "string" && !wellFormed(v)) || !wellFormed(k)) throw new Error("half of a character (a lone surrogate)");
     if (typeof v === "number" && !Number.isFinite(v)) throw new Error("number out of range");
-  })); } catch (e) { return new Err("invalid JSON: " + e.message); } },
+  }, null, true)); } catch (e) { return new Err("invalid JSON: " + e.message); } },
   // A function has no JSON: said, and where it is, as on the server (FEEDBACK55.md, Q-792;
   // branch feedback55).
   stringify: (v, pretty) => {
@@ -2555,7 +2766,8 @@ function fnIn(v, path, depth) {
   if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) { const r = fnIn(v[i], path + "[" + i + "]", depth + 1); if (r !== null) return r; } return null; }
   if (v instanceof Err) return fnIn(v.error, path + ".error", depth + 1);
   if (!isMap(v)) return null;
-  for (const k of Object.keys(v)) {
+  // The first in the order set (FEEDBACK55.md, Q-875; branch feedback55).
+  for (const k of mkeys(v)) {
     const key = fmtKey(k);
     const r = fnIn(v[k], path + (key.startsWith('"') ? "[" + key + "]" : "." + k), depth + 1);
     if (r !== null) return r;
@@ -2581,8 +2793,9 @@ function jsonNum(v, c) {
   return b >= I64_MIN && b <= I64_MAX ? intOf(b) : new Fl(v);
 }
 const wellFormed = (s) => (s.isWellFormed ? s.isWellFormed() : !/[\ud800-\udfff]/.test(s.replace(/[\ud800-\udbff][\udc00-\udfff]/g, "")));
-// JSON from the server, or from another site, with its numbers read as the server reads them.
-const readJSON = (text) => parseData(text);
+// JSON from the server, or from another site, with its numbers read as the server reads them;
+// `limit`: at most 1,000 levels deep (`JSON_DEEP`).
+const readJSON = (text, limit) => parseData(text, null, null, limit);
 // Whether JSON.parse gives its reviver the text each number was written as (Chrome 114, Firefox
 // 135, Safari 18.4 on), asked once.
 let jsonSource = null;
@@ -2601,12 +2814,176 @@ let numKey = null;
 // before 135), the numbers whose text says more are put first in objects under a key no text has,
 // and made from their text here: there whole floats were ints, and ints past 2^53 lost digits
 // (found in review of FEEDBACK55.md's Q-775 and Q-776; branch feedback55).
-function parseData(text, check, after) {
-  if (hasJsonSource()) return JSON.parse(text, (k, v, c) => { if (check) check(k, v); return typeof v === "number" ? jsonNum(v, c) : after ? after(v) : v; });
-  if (numKey === null) {
-    const r = typeof crypto !== "undefined" && crypto.getRandomValues ? Array.from(crypto.getRandomValues(new Uint32Array(4)), (x) => x.toString(36)).join("") : String(Math.random()).slice(2);
-    numKey = "\u0000n" + r;
+// A map read from text with a key JavaScript puts first (an array index) is given the order its
+// keys were written in, as the server reads it: from the text, read for its keys too, which costs
+// a fifth of JSON.parse; marking such keys for JSON.parse made it four times as slow. The rest as
+// before (FEEDBACK55.md, Q-875; branch feedback55).
+// `limit`: refused past 1,000 levels, as the server refuses JSON a program reads (FEEDBACK55.md,
+// Q-875's review; branch feedback55); the text read for its keys finds how deep it is too.
+function parseData(text, check, after, limit) {
+  let shape = null;
+  if (IDX_KEY.test(text)) shape = jsonShape(text, limit);
+  else if (limit && tooDeep(text)) throw new SyntaxError(JSON_DEEP);
+  const v = parseNums(text, check, after);
+  if (shape !== null && v !== null && typeof v === "object") keyOrder(v, shape);
+  return v;
+}
+// How deep JSON the program reads may nest, and what is said past it, as the server's
+// `json_too_deep` (FEEDBACK55.md, Q-875's review; branch feedback55).
+const JSON_DEEP = "it nests more than 1000 deep";
+// Whether JSON text `t` nests deeper than that: 1,001 levels take 2,002 characters.
+function tooDeep(t) {
+  if (t.length < 2002) return false;
+  let d = 0;
+  for (let i = 0; i < t.length; i++) {
+    const c = t.charCodeAt(i);
+    if (c === 34) {
+      // To the string's end: a quote after an even number of backslashes.
+      for (;;) {
+        i = t.indexOf("\"", i + 1);
+        if (i < 0) return false;
+        let b = i - 1;
+        while (t.charCodeAt(b) === 92) b--;
+        if ((i - b) % 2 === 1) break;
+      }
+    } else if (c === 91 || c === 123) {
+      if (++d > 1000) return true;
+    } else if (c === 93 || c === 125) d--;
   }
+  return false;
+}
+// A key of digits, written or escaped (`\u0031`), in JSON text.
+const IDX_KEY = /"(?:\d|\\u003\d)+"\s*:/;
+// The objects and lists of JSON text `t`, which JSON.parse took, that hold a map with an array
+// index in another place than JavaScript puts it (null for the rest): each such map's keys in the
+// order written, a key written twice in its first place (its value the last one, as JSON.parse
+// takes it). Array indexes first, by number, are where JavaScript has them: such a map needs no
+// order of its own, and is read without taking its keys out of the text.
+function jsonShape(t, limit) {
+  let i = 0, depth = 0;
+  const deeper = () => { if (++depth > 1000 && limit) throw new SyntaxError(JSON_DEEP); };
+  const ws = () => { for (;;) { const c = t.charCodeAt(i); if (c === 32 || c === 9 || c === 10 || c === 13) i++; else return; } };
+  // The closing quote of the string at `i`: one after an even number of backslashes.
+  const strEnd = () => {
+    let e = i;
+    for (;;) {
+      e = t.indexOf("\"", e + 1);
+      if (e < 0) return t.length;
+      let b = e - 1;
+      while (t.charCodeAt(b) === 92) b--;
+      if ((e - b) % 2 === 1) return e;
+    }
+  };
+  // The key from `s` to its closing quote `e`, as text.
+  const keyAt = (s, e) => {
+    for (let j = s + 1; j < e; j++) if (t.charCodeAt(j) === 92) return JSON.parse(t.slice(s, e + 1));
+    return t.slice(s + 1, e);
+  };
+  // The array index that key is, or -1.
+  const idxAt = (s, e) => {
+    let x = 0;
+    for (let j = s + 1; j < e; j++) {
+      const c = t.charCodeAt(j);
+      if (c === 92) return escIdx(s, e);
+      if (c < 48 || c > 57) return -1;
+      x = x * 10 + c - 48;
+    }
+    const n = e - s - 1;
+    return n >= 1 && n <= 10 && (n === 1 || t.charCodeAt(s + 1) !== 48) && x <= 4294967294 ? x : -1;
+  };
+  const escIdx = (s, e) => { const k = keyAt(s, e); return isIdx(k) ? +k : -1; };
+  // An object read for its keys, from its `{`: one whose keys are in JavaScript's order needs none
+  // of its own, and is read without taking them out of the text; one out of it is read again from
+  // its start (`ordObj`).
+  const obj = () => {
+    const start = i;
+    deeper();
+    i++; ws();
+    if (t.charCodeAt(i) === 125) { i++; depth--; return null; }
+    let kids = null, named = false, last = -1;
+    // (Text JSON.parse took: the ends are there, but never read past them.)
+    while (i < t.length) {
+      ws();
+      const s = i, e = strEnd();
+      i = e + 1;
+      const x = idxAt(s, e);
+      if (x >= 0) {
+        if (named || x <= last) { i = start; depth--; return ordObj(); }
+        last = x;
+      } else named = true;
+      ws(); i++;
+      const n = val();
+      if (n !== null) (kids || (kids = new Map())).set(keyAt(s, e), n); else if (kids !== null) kids.delete(keyAt(s, e));
+      ws();
+      if (t.charCodeAt(i++) === 125) break;
+    }
+    depth--;
+    return kids !== null ? { keys: null, kids, items: null } : null;
+  };
+  const ordObj = () => {
+    deeper();
+    i++;
+    const seen = [];
+    let kids = null;
+    while (i < t.length) {
+      ws();
+      const s = i, e = strEnd();
+      i = e + 1;
+      const k = keyAt(s, e);
+      ws(); i++;
+      const n = val();
+      keyIn(seen, k);
+      if (n !== null) (kids || (kids = new Map())).set(k, n); else if (kids !== null) kids.delete(k);
+      ws();
+      if (t.charCodeAt(i++) === 125) break;
+    }
+    depth--;
+    return { keys: seen, kids, items: null };
+  };
+  // Key k put in `seen` when not there yet: looked for there in a small map, in a set past it.
+  const keyIn = (seen, k) => {
+    if (seen.length < 16) { if (!seen.includes(k)) seen.push(k); return; }
+    const has = seen.$has || (seen.$has = new Set(seen));
+    if (!has.has(k)) { has.add(k); seen.push(k); }
+  };
+  const val = () => {
+    ws();
+    const c = t.charCodeAt(i);
+    if (c === 123) return obj();
+    if (c === 91) {
+      deeper();
+      i++; ws();
+      if (t.charCodeAt(i) === 93) { i++; depth--; return null; }
+      let items = null, at = 0;
+      while (i < t.length) {
+        const n = val();
+        if (n !== null) (items || (items = [])).push([at, n]);
+        at++; ws();
+        if (t.charCodeAt(i++) === 93) break;
+      }
+      depth--;
+      return items === null ? null : { keys: null, kids: null, items };
+    }
+    if (c === 34) { i = strEnd() + 1; return null; }
+    while (i < t.length) { const d = t.charCodeAt(i); if (d <= 32 || d === 44 || d === 93 || d === 125) break; i++; }
+    return null;
+  };
+  return val();
+}
+// The order `jsonShape` found put on what JSON.parse made of the text: an error value (`$quillo_err`)
+// holds what it was written with.
+function keyOrder(v, n) {
+  if (n === null || v === null || typeof v !== "object") return;
+  if (n.items !== null) { if (Array.isArray(v)) for (const [i, c] of n.items) keyOrder(v[i], c); return; }
+  if (v instanceof Err) { if (n.kids !== null && n.kids.has("$quillo_err")) keyOrder(v.error, n.kids.get("$quillo_err")); return; }
+  if (!isMap(v)) return;
+  if (n.keys !== null) ordered(v, n.keys);
+  if (n.kids !== null) for (const [k, c] of n.kids) if (hasOwn(v, k)) keyOrder(v[k], c);
+}
+// `parseData`'s numbers.
+function parseNums(text, check, after) {
+  if (hasJsonSource()) return JSON.parse(text, (k, v, c) => { if (check) check(k, v); return typeof v === "number" ? jsonNum(v, c) : after ? after(v) : v; });
+  if (numKey === null) numKey = "\u0000n" + randomTag();
   const key = numKey, written = "\\u0000n" + key.slice(2);
   const marked = text.replace(JSON_TOKEN, (t) => (t[0] === '"' || !tellsType(t) ? t : `{"${written}":"${t}"}`));
   return JSON.parse(marked, (k, v) => {
@@ -3320,7 +3697,8 @@ B.format_number = meta((x, locale, digits, mode) => {
     const clamp = (n) => Math.min(Math.max(n, 0), 28);
     let min, max;
     if (isMap(digits)) {
-      const k = Object.keys(digits).find((k) => k !== "min" && k !== "max");
+      // The first one set, as on the server (FEEDBACK55.md, Q-875; branch feedback55).
+      const k = mkeys(digits).find((k) => k !== "min" && k !== "max");
       if (k !== undefined) fail(`\`format_number\`'s digits are \`{ min, max }\`, not \`${k}\``);
       const get = (k) => { const v = digits[k]; if (isNil(v)) return null; if (!isInt(v)) fail(`\`format_number\`'s ${k} is an int, got ${moneyShort(v)}`); return clamp(v); };
       min = get("min") ?? 0; max = get("max") ?? Math.max(min, 3);
@@ -4143,7 +4521,8 @@ const dtAtLocal = (z, local, opts, f, n) => {
   let later = false, skipped = "later";
   if (!isNil(opts)) {
     if (!isMap(opts)) fail(`\`${f}\` expects options as a map as argument ${n}, got ${dtGot(opts)}`);
-    for (const k of Object.keys(opts)) {
+    // In the order set, as on the server (FEEDBACK55.md, Q-875; branch feedback55).
+    for (const k of mkeys(opts)) {
       const v = opts[k];
       if (k === "repeated") { if (v !== "earlier" && v !== "later") fail(`\`${f}\`'s repeated is "earlier" or "later", got ${dtGot(v)}`); later = v === "later"; }
       else if (k === "skipped") { if (v !== "later" && v !== "earlier" && v !== "error") fail(`\`${f}\`'s skipped is "later", "earlier" or "error", got ${dtGot(v)}`); skipped = v; }
@@ -4487,7 +4866,8 @@ B.date = {
     else if (isMap(how)) {
       const has = (k) => hasOwn(how, k), loc = has("locale") ? how.locale : null;
       if (!isNil(loc)) { if (typeof loc !== "string") fail(`\`${f}\`: locale is a str, like "de-DE", got ${dtGot(loc)}`); n = dtNames(loc); }
-      const k = Object.keys(how).find((k) => k !== "locale" && k !== "style" && k !== "pattern");
+      // The first one set, as on the server (FEEDBACK55.md, Q-875; branch feedback55).
+      const k = mkeys(how).find((k) => k !== "locale" && k !== "style" && k !== "pattern");
       if (k !== undefined) fail(`\`${f}\`: the options are locale, style and pattern, not \`${k}\``);
       const P = has("pattern") ? how.pattern : undefined, St = has("style") ? how.style : undefined;
       if (typeof P === "string") pattern = P;
@@ -5134,7 +5514,7 @@ const Sent = new Map();
 
 function rpcOnce(name, args) {
   if (args.some((a) => typeof Blob !== "undefined" && a instanceof Blob)) return rpcRaw(name, args, false, idemKey());
-  const id = name + "\0" + JSON.stringify(args.map((a) => toJSON(a, true)));
+  const id = name + "\0" + writeJSON(args.map((a) => toJSON(a, true)));
   let call = Sent.get(id);
   if (call && call.running) return call.running;
   if (!call) {
@@ -5185,18 +5565,28 @@ async function rpcSend(name, args, live, idem) {
     if (typeof Blob !== "undefined" && v instanceof Blob) { files.push(v); return { $quillo_file: files.length - 1 }; }
     if (typeof FileList !== "undefined" && v instanceof FileList) return Array.from(v, pack);
     if (Array.isArray(v)) return v.map(pack);
-    if (isMap(v)) { const o = {}; for (const k of Object.keys(v)) putKey(o, k, pack(v[k])); return o; }
+    // In the order set, and a map of one key that starts with `$` as `toJSON` writes it
+    // (FEEDBACK55.md, Q-875 and its review; branch feedback55).
+    if (isMap(v)) {
+      const ord = ordOf(v);
+      if (ord !== undefined) { const ks = mkeys(v); return new Kept(ks, ks.map((k) => pack(v[k]))); }
+      const ks = Object.keys(v);
+      if (ks.length === 1 && ks[0].charCodeAt(0) === 36) return { $: [ks[0], pack(v[ks[0]])] };
+      const o = {};
+      for (const k of ks) putKey(o, k, pack(v[k]));
+      return o;
+    }
     return toJSON(v, true);
   };
   const packed = args.map(pack);
   if (files.length) {
     payload = new FormData();
-    payload.append("args", unmark(JSON.stringify(packed)));
+    payload.append("args", writeJSON(packed));
     files.forEach((f, i) => payload.append("file" + i, f, f.name || "file"));
     delete headers["content-type"];
     headers["x-quillo-rpc"] = "1";
   } else {
-    payload = unmark(JSON.stringify(packed));
+    payload = writeJSON(packed);
   }
   // A call that fails (no connection, a server error) is an error value,
   // as with http.* on the server, so `??` and `is_err` handle it.
@@ -5233,11 +5623,14 @@ function livePatched(old, p) {
   if (hasOwn(p, "$=")) return old;
   if (hasOwn(p, "$v")) return untagDeep(p.$v);
   const put = (o, k, v) => Object.defineProperty(o, k, { value: v, enumerable: true, writable: true, configurable: true });
+  // In the order set, which the server sends a patch for only when it is the old keys' and then
+  // the new ones' (FEEDBACK55.md, Q-875; branch feedback55).
   if (hasOwn(p, "$m")) {
-    const o = {}, gone = new Set(p.$x || []);
-    for (const k of Object.keys(old)) if (!gone.has(k)) put(o, k, hasOwn(p.$m, k) ? livePatched(old[k], p.$m[k]) : old[k]);
-    for (const k of Object.keys(p.$m)) if (!hasOwn(old, k)) put(o, k, livePatched(undefined, p.$m[k]));
-    return o;
+    const o = {}, gone = new Set(p.$x || []), ks = [];
+    let idx = false;
+    for (const k of mkeys(old)) if (!gone.has(k)) { put(o, k, hasOwn(p.$m, k) ? livePatched(old[k], p.$m[k]) : old[k]); ks.push(k); }
+    for (const k of mkeys(p.$m)) if (!hasOwn(old, k)) { put(o, k, livePatched(undefined, p.$m[k])); ks.push(k); idx = idx || isIdx(k); }
+    return ordOf(old) === undefined && !idx ? o : ordered(o, ks);
   }
   const out = [];
   for (const op of p.$l) {
@@ -6252,7 +6645,8 @@ function spreadAttrs(maps, written, tag) {
   for (const m of maps) {
     if (isNil(m)) continue;
     if (!isMap(m)) fail(`\`{...}\` needs a map, got ${typeName(m)}`);
-    for (let k of Object.keys(m)) {
+    // In the order set (FEEDBACK55.md, Q-875; branch feedback55).
+    for (let k of mkeys(m)) {
       const v = m[k];
       const lower = k.toLowerCase();
       let n = attrKey(k);
@@ -6288,12 +6682,13 @@ function reactEvent(tag, written, ev) {
 function clsWords(x, out) {
   if (isNil(x) || typeof x === "boolean" || typeof x === "function" || x === "") return;
   if (Array.isArray(x)) { for (const y of x) clsWords(y, out); return; }
-  if (isMap(x)) { for (const k of Object.keys(x)) if (k !== "" && truthy(x[k])) out.push(k); return; }
+  // In the order set (FEEDBACK55.md, Q-875; branch feedback55).
+  if (isMap(x)) { for (const k of mkeys(x)) if (k !== "" && truthy(x[k])) out.push(k); return; }
   out.push(display(x));
 }
 
 // `CLASS` and `Class` too, as the server takes them (found in review).
-const spreadClasses = (maps) => maps.filter(isMap).flatMap((m) => Object.keys(m).filter((k) => { const l = k.toLowerCase(); return l === "class" || l === "classname"; }).map((k) => m[k]));
+const spreadClasses = (maps) => maps.filter(isMap).flatMap((m) => mkeys(m).filter((k) => { const l = k.toLowerCase(); return l === "class" || l === "classname"; }).map((k) => m[k]));
 
 // Several values side by side, each fixed or following what it reads.
 function frag(items) {
@@ -6510,7 +6905,8 @@ function currentUrl() {
   const p = location.pathname;
   return {
     path: BASE && p.startsWith(BASE) ? p.slice(BASE.length) || "/" : p,
-    query: Object.fromEntries(new URLSearchParams(location.search)),
+    // In the order of the address, as on the server (FEEDBACK55.md, Q-875; branch feedback55).
+    query: [...new URLSearchParams(location.search)].reduce((o, [k, v]) => mput(o, k, v), {}),
     hash: location.hash.slice(1),
   };
 }
@@ -6618,7 +7014,8 @@ const stylePx = (n, v) => styleNonzero(v) && !n.startsWith("--") && !UNITLESS.ha
 // property's name for a key (FEEDBACK51.md, Q-668; branch feedback51-fixes).
 const cssValue = (s) => s.replace(/[{};\\]/g, (c) => "\\" + c.charCodeAt(0).toString(16) + " ");
 const styleKey = (k) => (k.startsWith("--") ? /^--[\p{L}\p{N}_-]+$/u : /^[A-Za-z0-9_-]+$/).test(k);
-const styleText = (m) => Object.keys(m).filter((k) => !isNil(m[k]) && m[k] !== false && styleKey(k))
+// In the order set (FEEDBACK55.md, Q-875; branch feedback55).
+const styleText = (m) => mkeys(m).filter((k) => !isNil(m[k]) && m[k] !== false && styleKey(k))
   .map((k) => { const n = styleName(k); return n + ": " + cssValue(display(m[k])) + stylePx(n, m[k]); }).join("; ");
 
 // The text a bool is for an attribute whose values are words, as on the server (see its
@@ -7206,9 +7603,10 @@ class Inst extends Scope {
   made(name, init, page) {
     if (hasOwn(this.s0, name)) {
       // `{"$quillo_prop": "initial"}`: the prop's own value, written once (FEEDBACK30.md, Q-371;
-      // branch feedback27-35-fixes).
+      // branch feedback27-35-fixes). Read as the server's mark only, not from a map the program
+      // made of the same shape (FEEDBACK55.md, Q-875's review; branch feedback55).
       let v = this.s0[name];
-      if (v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length === 1 && typeof v.$quillo_prop === "string") v = this.props[v.$quillo_prop];
+      if (v instanceof PropOf) v = this.props[v.name];
       const s = new Sig(v);
       // Set by the page before this comes, it keeps what the page set (Q-800).
       if (page) { const n = W.claim(s); Promise.resolve().then(init).then((x) => W.latest(s, n, x), report); }
@@ -7360,11 +7758,19 @@ function untag(v) {
   if (!v || typeof v !== "object" || Array.isArray(v)) return v;
   const ks = Object.keys(v);
   if (ks.length !== 1) return v;
+  // A map of one key that starts with `$`, which the server writes `{"$": [key, value]}` so that
+  // it is not taken for one of these: a visitor's key made an error value, an int or a decimal of
+  // it (FEEDBACK55.md, Q-875's review; branch feedback55).
+  if (ks[0] === "$" && Array.isArray(v.$) && v.$.length === 2 && typeof v.$[0] === "string") return putKey({}, v.$[0], v.$[1]);
+  // The server's mark for a state that is a prop's own value (see `made`).
+  if (ks[0] === "$quillo_prop" && typeof v.$quillo_prop === "string") return new PropOf(v.$quillo_prop);
   if (ks[0] === "$quillo_err") return new Err(v.$quillo_err, true);
   if (ks[0] === "$dec" && typeof v.$dec === "string") return decParse(v.$dec, false) ?? v.$dec;
   if (ks[0] === "$int" && typeof v.$int === "string" && /^-?\d{1,19}$/.test(v.$int)) return intOf(BigInt(v.$int));
   return v;
 }
+// A state the server wrote as a prop's own value.
+class PropOf { constructor(name) { this.name = name; } }
 // `untag` throughout JSON already parsed, from the inside out.
 function untagDeep(v) {
   if (v === null || typeof v !== "object") return v;
@@ -7451,8 +7857,9 @@ function toolsStart() {
   toolsSay("hello", { protocol: 1, version: VERSION, dev: DEV, base: BASE });
 }
 
+// A map's keys in the order set, as `toolsWire` gives them (FEEDBACK55.md, Q-875; branch feedback55).
 function toolsSay(type, o) {
-  document.dispatchEvent(new CustomEvent("quillo:devtools", { detail: JSON.stringify(Object.assign({ type }, o)) }));
+  document.dispatchEvent(new CustomEvent("quillo:devtools", { detail: writeJSON(Object.assign({ type }, o)) }));
 }
 
 // A value as the wire writes it; what cannot be written (a page's object) as its text.
@@ -7512,7 +7919,8 @@ function toolsSig(inst, name, s) {
 // moves with the next `where`); `set`: sets a state, under --watch only.
 function toolsAsk(e) {
   let q;
-  try { q = JSON.parse(e.detail); } catch (_) { return; }
+  // A map set from the tool keeps the order the tool wrote (FEEDBACK55.md, Q-875; branch feedback55).
+  try { q = readJSON(e.detail); } catch (_) { return; }
   if (!q || typeof q !== "object") return;
   const answer = (ok, more) => toolsSay("answer", Object.assign({ id: q.id === undefined ? null : q.id, ok }, more));
   const inst = TOOLS.all.get(q.target);
@@ -7757,6 +8165,7 @@ W.stepped = (a, b, c) => {
   return r;
 };
 W.iter = iter;
+W.ordered = ordered;
 W.match = match;
 W.arity = arity;
 W.missing = missing;
