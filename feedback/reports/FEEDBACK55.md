@@ -1920,6 +1920,31 @@ Each service is started with `QUILLO_APP_URL=http://127.0.0.1:0` (seen with `ps 
 - The language server answers requests before `initialize` and after `shutdown` as usual (the protocol asks for -32002 and InvalidRequest), and a body that is not JSON gets no -32700.
 - `quillo repl hello.qwe` and `quillo repl --bogus` ignore their arguments.
 
+## Found while fixing
+
+Added on 2026-11-06, during slice 10's review on branch feedback55. The number is the next free one after FEEDBACK58.md's Q-874.
+
+### Q-875. In the browser, a map's number-like keys come first, so every map reads in another order than on the server
+
+**Kind:** silent. **Where:** the browser's maps are plain JavaScript objects ([runtime.js](../../src/client/runtime.js)), and JavaScript lists an object's integer-like keys first, in number order, then the others in the order they were set. The server keeps the order they were set ([src/value.rs](../../src/value.rs)).
+
+For `m = { b: 1, "1": 2, a: 3, "0": 4 }`, in a component (the browser) and in a route (the server):
+
+| | server | browser |
+|---|---|---|
+| `keys(m)` | `["b","1","a","0"]` | `["0","1","b","a"]` |
+| `values(m)` | `[1,2,3,4]` | `[4,2,1,3]` |
+| `for [k, v] in m` | b, 1, a, 0 | 0, 1, b, a |
+| `json.stringify(m)` | `{"b":1,"1":2,"a":3,"0":4}` | `{"0":4,"1":2,"b":1,"a":3}` |
+| `str(m)` | b first | `"0"` first |
+| `url_encode(m)` | `b=1&1=2&a=3&0=4` | `0=4&1=2&b=1&a=3` |
+| `merge({ b: 1 }, { "2": 2 })` | `{ b: 1, "2": 2 }` | `{ "2": 2, b: 1 }` |
+| `group_by(["b", "1"], (x) => x) \| keys` | `["b","1"]` | `["1","b"]` |
+
+A component listing a map of ids, years or prices by key shows another order once it runs in the browser than the page the server sent, and a signature or a cache key made from `json.stringify` or `url_encode` differs between the two.
+
+**Suggestion:** the browser keeps a map's keys in the order they were set, as the server does (a `Map`, or an object with its key order beside it), in every builtin that reads or builds a map; measure it, since maps are on every hot path of a page.
+
 ## What behaves well
 
 Counts are cases. Most of the sweep is here: about 6,900 of its 7,500 cases gave the right answer.
