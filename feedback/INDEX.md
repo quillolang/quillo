@@ -713,4 +713,4 @@ rewrites **Status**. Rows without a repro are kept up to date by hand.
 | Q-850 | `quillo new` into an existing empty folder needs write permission on its parent | loud | c15588c, [FEEDBACK55 §Q-850](reports/FEEDBACK55.md) | edge sweep | fixed on feedback55 (65eca80) | [test](../tests/feedback55.rs) |
 | Q-851 | `--help` and leading options | loud | c15588c, [FEEDBACK55 §Q-851](reports/FEEDBACK55.md) | edge sweep | fixed on feedback55 (65eca80) | [test](../tests/feedback55.rs) |
 | Q-852 | Smaller ones | loud | c15588c, [FEEDBACK55 §Q-852](reports/FEEDBACK55.md) | edge sweep | fixed on feedback55 (65eca80) | [test](../tests/feedback55.rs) |
-| Q-875 | In the browser, a map's number-like keys come first, so every map reads in another order than on the server | silent | 39ef78c, [FEEDBACK55 §Q-875](reports/FEEDBACK55.md) | slice 10 review | open: FEEDBACK55 slice 14 | – |
+| Q-875 | In the browser, a map's number-like keys come first, so every map reads in another order than on the server | silent | 39ef78c, [FEEDBACK55 §Q-875](reports/FEEDBACK55.md) | slice 10 review | fixed on feedback55 (1c4ede2, 2bdf087) | [test](../tests/feedback55.rs) |
