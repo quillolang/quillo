@@ -275,6 +275,79 @@ fn bound_twice(p: &Pattern) -> Option<String> {
     names(p, &mut Vec::new())
 }
 
+/// The names that more than one field `p` tests binds, each with those fields' paths and the
+/// first one's test: `{ user.id: int, order.id: int }` binds `id` twice so, which is no mistake
+/// until `id` is used, and then the last field's is the one taken (found in review). Alternatives
+/// each bind their own.
+fn tested_twice(p: &Pattern) -> Vec<(String, Vec<String>, String)> {
+    fn test_text(p: &Pattern) -> String {
+        match p {
+            Pattern::Type(t) => t.clone(),
+            Pattern::Lit(Lit::Nil) => "null".into(),
+            Pattern::Alt(ps) => ps.iter().map(test_text).collect::<Vec<_>>().join(" | "),
+            Pattern::List(items, _) => format!("[{}]", items.iter().map(test_text).collect::<Vec<_>>().join(", ")),
+            _ => "...".into(),
+        }
+    }
+    fn names(p: &Pattern, at: &[String], out: &mut Vec<(String, String, String)>) {
+        match p {
+            Pattern::As(q, _) => names(q, at, out),
+            Pattern::List(items, _) => items.iter().for_each(|q| names(q, at, out)),
+            Pattern::Alt(ps) => {
+                if let Some(q) = ps.first() {
+                    names(q, at, out);
+                }
+            }
+            Pattern::Record(fields) => {
+                for f in fields {
+                    let mut path = at.to_vec();
+                    path.extend(f.path.iter().cloned());
+                    match f.path.last() {
+                        Some(n) if f.pat.is_type_test() => out.push((n.clone(), path.join("."), test_text(&f.pat))),
+                        _ => names(&f.pat, &path, out),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut all = Vec::new();
+    names(p, &[], &mut all);
+    let mut out: Vec<(String, Vec<String>, String)> = Vec::new();
+    for (n, path, test) in all {
+        match out.iter_mut().find(|(m, _, _)| *m == n) {
+            Some(e) => e.1.push(path),
+            None => out.push((n, vec![path], test)),
+        }
+    }
+    out.retain(|(_, paths, _)| paths.len() > 1);
+    out
+}
+
+/// Refused where a name more than one tested field of `p` binds is used in `uses`: which field's
+/// it is cannot be told (see `tested_twice`).
+fn tested_once(p: &Pattern, uses: &[&Expr], line: u32) -> PResult<()> {
+    for (n, paths, test) in tested_twice(p) {
+        let mut used = false;
+        for u in uses {
+            crate::check::walk_expr(u, &mut |e| used |= matches!(e, Expr::Ident(m, _) if m.as_str() == n));
+        }
+        if used {
+            let first = &paths[0];
+            return Err(QuilloError::new(format!(
+                "`{}` is bound by each field tested here that ends in it, {}, and the last one's value is taken: name the one you mean with `as`, `{}: {} as {}_{}`",
+                n,
+                paths.iter().map(|p| format!("`{}`", p)).collect::<Vec<_>>().join(" and "),
+                first,
+                test,
+                first.split('.').rev().nth(1).unwrap_or("first"),
+                n,
+            ), line));
+        }
+    }
+    Ok(())
+}
+
 /// `p`, written at `line`, refused if it binds a name twice: such a pattern matched anything, the
 /// last part's value kept, and `[x, x]` took `[1, 2]` (FEEDBACK55.md, Q-785; branch feedback55).
 /// Refused as Python and Rust refuse it. Where braces may be a pattern or a block (a route's
@@ -2026,6 +2099,26 @@ impl Parser {
         } else {
             return self.err_at("expected `=` or `{` to start the route body");
         };
+        // The names the path, the query pattern and the request pattern bind together: one bound
+        // by two of them was one value of the three with nothing said, the request's last
+        // (found in review; the guide has no rule for it).
+        // A path's own name written twice is said by `check` as such: each once here.
+        let mut named: Vec<&String> = Vec::new();
+        for seg in &path {
+            if let Seg::Param(n, _, _) | Seg::Rest(n) = seg {
+                if !named.contains(&n) {
+                    named.push(n);
+                }
+            }
+        }
+        let mut all: Vec<Pattern> = named.into_iter().map(|n| Pattern::Bind(n.clone().into())).collect();
+        all.extend(query.iter().cloned());
+        all.extend(body_pat.iter().cloned());
+        let together = Pattern::List(all, None);
+        if let Some(n) = bound_twice(&together) {
+            return Err(QuilloError::new(format!("`{}` is bound twice by this route, by two of its path, its query pattern and its request pattern: name one apart with `as` (`? {{ {}: str as query_{} }}`)", n, n, n), line));
+        }
+        tested_once(&together, &[&body], line)?;
         let uses_request = body_pat.is_some()
             || names_request(&body)
             || query.as_ref().map_or(false, pattern_names_request);
@@ -2347,10 +2440,18 @@ impl Parser {
     }
 
     fn parse_block_rest(&mut self) -> PResult<Expr> {
-        let mut stmts = Vec::new();
+        let mut stmts: Vec<Stmt> = Vec::new();
         loop {
             self.skip_seps()?;
             if self.eat(&Tok::RBrace)? {
+                // A `let` whose tested fields bind one name, used after it (`tested_once`).
+                for (i, st) in stmts.iter().enumerate() {
+                    if let Stmt::Let(p, _, line) = st {
+                        if !tested_twice(p).is_empty() {
+                            tested_once(p, &[&Expr::Block(stmts[i + 1..].to_vec())], *line)?;
+                        }
+                    }
+                }
                 return Ok(Expr::Block(stmts));
             }
             if self.at(&Tok::Eof)? {
@@ -2527,6 +2628,10 @@ impl Parser {
             // its digits alone are past an int (FEEDBACK55.md, Q-795; branch feedback55).
             if self.at(&Tok::Int(i64::MIN))? {
                 self.next()?;
+                // `-x.f()` is `-(x.f())`, and these digits alone are past an int (found in review).
+                if matches!(self.peek()?, Tok::Dot | Tok::LBracket) {
+                    return self.err_at("`-9223372036854775808.f()` reads as `-(9223372036854775808.f())`, and 9223372036854775808 alone is past an int: write `(-9223372036854775808).f()`");
+                }
                 return Ok(Expr::Lit(Lit::Int(i64::MIN)));
             }
             let e = self.nested(Self::parse_unary)?;
@@ -3010,6 +3115,7 @@ impl Parser {
             }
             self.expect(&Tok::FatArrow, "`=>` after the match pattern")?;
             let body = self.parse_arrow_body()?;
+            tested_once(&pat, &[&body].into_iter().chain(guard.iter()).collect::<Vec<_>>(), arm_line)?;
             arms.push(Arm { pat, guard, body, line: arm_line });
         }
         Ok(Expr::Match(Box::new(subj), arms, line))
@@ -3094,6 +3200,7 @@ impl Parser {
             }
             return self.err_at("expected `=>` or `{` after the `for` list");
         };
+        tested_once(&pat, &[&body], line)?;
         Ok(Expr::For(pat, Box::new(iter), Box::new(body), line))
     }
 

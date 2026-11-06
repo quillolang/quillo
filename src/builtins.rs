@@ -3082,7 +3082,9 @@ pub(crate) fn round_left(x: f64, digits: i64) -> f64 {
     if !x.is_finite() {
         return x;
     }
-    let p = 10f64.powi(digits.unsigned_abs().min(400) as i32);
+    // 10^n as the nearest float to it, as the browser reads "1e{n}": `powi` multiplies, and
+    // `round(1e300, -300)` was 1.0000000000000006e300 (found in review).
+    let p: f64 = format!("1e{}", digits.unsigned_abs().min(400)).parse().unwrap_or(f64::INFINITY);
     if p.is_infinite() {
         return 0.0;
     }

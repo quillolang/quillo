@@ -3372,11 +3372,75 @@ impl Checker {
             _ => None,
         }).collect();
         self.expr(&r.body);
+        // A function in the answer, where it is written: JSON has none, and the answer is an
+        // internal error (FEEDBACK55.md, Q-792; found in review: it went out as "<fn f>" before).
+        let mut found = None;
+        self.function_in_answer(&r.body, "", &[], &mut found);
+        if let Some((path, what)) = found {
+            self.line = r.line;
+            let at = if path.is_empty() { String::new() } else { format!(" at `{}`", path.trim_start_matches('.')) };
+            self.warn(format!("this route's answer holds a function{} ({}): JSON has none, so the answer is an internal error (500): leave it out, or call it", at, what));
+        }
         self.text_params.clear();
         self.path_params.clear();
         self.pop();
         self.fns.pop();
         self.fn_ended();
+    }
+
+    /// The first function written in what `e`, a route's body, answers: a function's name or a
+    /// lambda, in the maps and lists written there (through blocks, `if` and `match`), with
+    /// where it is and what it is.
+    fn function_in_answer(&self, e: &Expr, path: &str, hidden: &[String], found: &mut Option<(String, String)>) {
+        if found.is_some() {
+            return;
+        }
+        match e {
+            Expr::Lambda(_) if !path.is_empty() => *found = Some((path.to_string(), "a function written there".into())),
+            // A function of the program's, or a builtin, by its name, where nothing hides it.
+            Expr::Ident(n, _) if !path.is_empty() && !hidden.iter().any(|h| h == n.as_str()) && !self.is_local(n) && self.globals.get(n.as_str()).is_some_and(|g| g.t.bits == FN) => {
+                *found = Some((path.to_string(), format!("the function `{}`", n)));
+            }
+            Expr::Map(entries) => {
+                for (k, v) in entries {
+                    let step = if fmt_key_bare(k) { format!("{}.{}", path, k) } else { format!("{}[{}]", path, serde_json::to_string(k).unwrap_or_default()) };
+                    self.function_in_answer(v, &step, hidden, found);
+                }
+            }
+            Expr::List(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    self.function_in_answer(v, &format!("{}[{}]", path, i), hidden, found);
+                }
+            }
+            Expr::Block(stmts) => {
+                // The names the block binds itself hide the program's.
+                let mut inner = hidden.to_vec();
+                for st in stmts {
+                    match st {
+                        Stmt::Let(p, _, _) => pattern_names(p, &mut inner),
+                        Stmt::Fn(d) => inner.push(d.name.clone()),
+                        _ => {}
+                    }
+                }
+                if let Some(Stmt::Expr(last)) = stmts.last() {
+                    self.function_in_answer(last, path, &inner, found);
+                }
+            }
+            Expr::If(_, a, b) => {
+                self.function_in_answer(a, path, hidden, found);
+                if let Some(b) = b {
+                    self.function_in_answer(b, path, hidden, found);
+                }
+            }
+            Expr::Match(_, arms, _) => {
+                for a in arms {
+                    let mut inner = hidden.to_vec();
+                    pattern_names(&a.pat, &mut inner);
+                    self.function_in_answer(&a.body, path, &inner, found);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn stmt(&mut self, s: &Stmt, last: bool) -> T {
@@ -5920,7 +5984,7 @@ impl Checker {
             _ if self.sql_safe_join(e) => true,
             Expr::Call(f, args, _) => {
                 self.sql_safe_call(f)
-                    || (is_join(f) && matches!(args.as_slice(), [Expr::List(items), rest @ ..] if items.iter().chain(rest).all(|x| self.sql_safe(x))))
+                    || (self.builtin_named(f, "join") && matches!(args.as_slice(), [Expr::List(items), rest @ ..] if items.iter().chain(rest).all(|x| self.sql_safe(x))))
                     // `` sql`select ...` ``, the tag editors highlight, is the text written in it:
                     // `BASE + "where id = ?"` warned for good (FEEDBACK53.md, Q-029; branch main).
                     || (matches!(&**f, Expr::Ident(n, _) if n == "sql" && !self.is_local(n) && self.globals.get("sql").is_some_and(|g| &*g.file == "<builtin>"))
@@ -6008,17 +6072,17 @@ impl Checker {
     /// `xs` is SQL-safe text (`sql_items`) and `sep` is too.
     fn sql_safe_join(&self, e: &Expr) -> bool {
         let (list, sep): (&Expr, &[Expr]) = match e {
-            Expr::Call(f, args, _) if is_join(f) => match args.split_first() {
+            Expr::Call(f, args, _) if self.builtin_named(f, "join") => match args.split_first() {
                 Some((l, sep)) => (l, sep),
                 None => return false,
             },
             Expr::Call(f, args, _) => match &**f {
-                Expr::Field(l, n, _) if n == "join" => (&**l, args.as_slice()),
+                Expr::Field(l, n, _) if n == "join" && self.builtin_in_scope("join") => (&**l, args.as_slice()),
                 _ => return false,
             },
             Expr::Pipe(l, rhs, _) => match &**rhs {
-                Expr::Call(f, sep, _) if is_join(f) => (&**l, sep.as_slice()),
-                f if is_join(f) => (&**l, &[]),
+                Expr::Call(f, sep, _) if self.builtin_named(f, "join") => (&**l, sep.as_slice()),
+                f if self.builtin_named(f, "join") => (&**l, &[]),
                 _ => return false,
             },
             _ => return false,
@@ -6033,16 +6097,17 @@ impl Checker {
     fn sql_items(&self, e: &Expr) -> bool {
         let (f, _list) = match e {
             Expr::List(items) => return items.iter().all(|x| self.sql_safe(x)),
-            Expr::Call(m, args, _) if matches!(&**m, Expr::Ident(n, _) if n == "map" && !self.is_local(n)) => match args.as_slice() {
+            Expr::Call(m, args, _) if self.builtin_named(m, "map") => match args.as_slice() {
                 [l, f] => (f, Some(l)),
                 _ => return false,
             },
+            // `xs.map(f)`: the builtin, where `xs` holds no map, whose own `map` it would be.
             Expr::Call(m, args, _) => match (&**m, args.as_slice()) {
-                (Expr::Field(l, n, _), [f]) if n == "map" => (f, Some(&**l)),
+                (Expr::Field(l, n, _), [f]) if n == "map" && self.builtin_in_scope("map") && !self.may_be_map(l) => (f, Some(&**l)),
                 _ => return false,
             },
             Expr::Pipe(l, rhs, _) => match &**rhs {
-                Expr::Call(m, args, _) if matches!(&**m, Expr::Ident(n, _) if n == "map" && !self.is_local(n)) => match args.as_slice() {
+                Expr::Call(m, args, _) if self.builtin_named(m, "map") => match args.as_slice() {
                     [f] => (f, Some(&**l)),
                     _ => return false,
                 },
@@ -6064,7 +6129,11 @@ impl Checker {
     /// `{ let q = c; q }` with an outer `q = sql_name(...)` went without the warning (FEEDBACK55.md,
     /// Q-754; found in review).
     fn lambda_gives_sql_safe(&self, def: &FnDef) -> bool {
-        let tracked = |n: &str| self.sql_var(n) != SqlVar::Other;
+        // A name the function binds that is one of those, or one this rule trusts as a function
+        // (`sql_name`, `join`, the program's own function of safe text): taken for it, so
+        // `let sql_name = (x) => x` in it let raw text through (found in review).
+        let trusted = ["sql_name", "sql_param", "sql", "join", "map", "db"];
+        let tracked = |n: &str| self.sql_var(n) != SqlVar::Other || trusted.contains(&n) || self.sql_name_fns.contains(n);
         if def.params.iter().any(|p| tracked(p.name.as_str())) {
             return false;
         }
@@ -6080,7 +6149,7 @@ impl Checker {
                         }
                         Stmt::Assign(n, _, _, _) => ok &= !tracked(n.as_str()),
                         Stmt::Return(Some(v), _) => ok &= self.sql_safe(v),
-                        Stmt::Fn(_) => ok = false,
+                        Stmt::Fn(_) | Stmt::Use(..) => ok = false,
                         _ => {}
                     }
                 }
@@ -6103,11 +6172,32 @@ impl Checker {
         ok && self.sql_safe(&def.body)
     }
 
+    /// Whether `f` is the builtin `name`, not a local or the program's own of that name, which
+    /// hides it (found in review: a program's `fn join` was followed as the builtin).
+    fn builtin_named(&self, f: &Expr, name: &str) -> bool {
+        matches!(f, Expr::Ident(n, _) if n == name) && self.builtin_in_scope(name)
+    }
+
+    /// Whether `name` here is the builtin of that name.
+    fn builtin_in_scope(&self, name: &str) -> bool {
+        !self.is_local(name) && self.globals.get(name).is_some_and(|g| &*g.file == "<builtin>")
+    }
+
+    /// Whether `e` may hold a map, whose own `map` its `.map(...)` would call: a map written out,
+    /// or a variable that may hold one.
+    fn may_be_map(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Map(_) => true,
+            Expr::Ident(n, _) => self.scopes.iter().rev().find_map(|sc| sc.get(n.as_str())).or_else(|| self.globals.get(n.as_str())).map_or(true, |v| v.t.bits == 0 || v.t.bits & MAP != 0),
+            _ => false,
+        }
+    }
+
     /// Whether calling `f` gives SQL-safe text: `sql_name`, `sql_param`, or
     /// a function of the program that only returns such text.
     fn sql_safe_call(&self, f: &Expr) -> bool {
         matches!(f, Expr::Ident(n, _) if !self.is_local(n)
-            && (n == "sql_name" || n == "sql_param" || self.sql_name_fns.contains(n.as_str())))
+            && (((n == "sql_name" || n == "sql_param") && self.builtin_in_scope(n)) || self.sql_name_fns.contains(n.as_str())))
             || matches!(f, Expr::Field(o, n, _) if n == "sql_name" && matches!(&**o, Expr::Ident(m, _) if (m == "db" && !self.is_local(m)) || self.sql_var(m) == SqlVar::Conn))
     }
 
@@ -7618,6 +7708,11 @@ fn hides(sig: &Sig, name: &str) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// Whether a map's key is written bare in a path, as `repr` writes it (`a`, `é`), not `["a b"]`.
+fn fmt_key_bare(k: &str) -> bool {
+    k.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && k.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 fn is_join(f: &Expr) -> bool {

@@ -2205,80 +2205,124 @@ B.pow = meta((x, y) => {
 }, "pow", null);
 // Each item looked for only among those kept under its key, as the server's `unique_of` keys
 // them, which `==` gives equal values alike: it compared each with every one kept, quadratic
-// (FEEDBACK55.md, Q-791; branch feedback55). A float by its value, an int by the float that is
-// exactly it or else itself, text by itself, lists and maps item by item. `==` is exact but for a
-// float and a decimal (the float's shortest text, rounded to 28 places: `1e-30 == 0m`), so a
-// decimal is looked for by its value among the decimals kept, those the floats kept are equal to,
-// and the int it is; a float or an int among the decimals kept; a list or a map holding a decimal
-// by its rough key, each number as the float nearest the decimal it is equal to (found in review).
-// What holds NaN is equal to nothing, kept without a look.
+// (FEEDBACK55.md, Q-791; branch feedback55). Keys are made from a stack, each part once: a part
+// was quoted again at each level, twice as long each time (found in review). Without a decimal in
+// the list, a float by its value, an int by the float that is exactly it or else itself. With
+// one, each number by the decimal it is equal to (past 2^53 its nearest float), but a float its
+// decimal does not give back by itself; where it meets a small decimal it may be equal to, the
+// item is kept too under its key with such floats made decimals, by the kinds there, and looked
+// for among those of other kinds (found in review: `[k * 1e-40, 1m]` was quadratic).
 B.unique = meta((l) => {
   l = L(l, "unique");
-  const out = [], byKey = new Map(), keptDecs = new Set(), floatDecs = new Set(), withDec = new Map(), without = new Map();
-  const probes = l.map((x) => { const p = { dec: false, never: false }; return [uniqueKey(x, 0, p, false), p.dec, p.never]; });
-  const decs = probes.some((p) => p[1]);
-  const holder = (v) => Array.isArray(v) || v instanceof Err || isMap(v);
-  const held = l.some((x, i) => probes[i][1] && holder(x));
-  const has = (m, k, x) => { const kept = m.get(k); return kept !== undefined && kept.some((y) => eq(x, y)); };
-  const put = (m, k, x) => { const kept = m.get(k); if (kept === undefined) m.set(k, [x]); else kept.push(x); };
-  const decOfFloat = (x) => decFromFloat(x instanceof Fl ? x.f : x);
-  l.forEach((x, i) => {
-    const [k, dec, never] = probes[i];
-    if (never) { out.push(x); return; }
-    const r = held && holder(x) ? uniqueKey(x, 0, { dec: false, never: false }, true) : null;
-    let seen;
-    if (x instanceof Dec) {
-      const v = decKey(x), p = p10(x.s), n = x.m % p === 0n ? wholeOf(x.m / p) : null;
-      seen = keptDecs.has(v) || floatDecs.has(v) || (n !== null && has(byKey, uniqueKey(n, 0, {}, false), x));
-    } else if (dec) seen = has(withDec, r, x) || has(without, r, x);
-    else {
-      seen = has(byKey, k, x);
-      if (!seen && decs) {
-        if (isFloat(x)) { const d = decOfFloat(x); seen = d !== null && keptDecs.has(decKey(d)); }
-        else if (isWhole(x)) seen = keptDecs.has(decKey(new Dec(BigInt(x), 0)));
-        else if (held && holder(x)) seen = has(withDec, r, x);
-      }
+  const decs = l.some(holdsDec);
+  const out = [], byKey = new Map(), groups = new Map();
+  for (const x of l) {
+    const k = uniqueKeys(x, decs);
+    if (k.never) { out.push(x); continue; }
+    const kept = byKey.get(k.main);
+    let seen = kept !== undefined && kept.some((y) => eq(x, y));
+    if (!seen && k.small > 0) {
+      const kinds = groups.get(k.canon);
+      if (kinds !== undefined) for (const [p, ys] of kinds) if (p !== k.pattern && ys.some((y) => eq(x, y))) { seen = true; break; }
     }
-    if (seen) return;
+    if (seen) continue;
     out.push(x);
-    if (x instanceof Dec) keptDecs.add(decKey(x));
-    else if (dec) put(withDec, r, x);
-    else {
-      put(byKey, k, x);
-      if (decs && isFloat(x)) { const d = decOfFloat(x); if (d !== null) floatDecs.add(decKey(d)); }
-      else if (held && holder(x)) put(without, r, x);
+    if (kept === undefined) byKey.set(k.main, [x]); else kept.push(x);
+    if (k.small > 0) {
+      let kinds = groups.get(k.canon);
+      if (kinds === undefined) groups.set(k.canon, (kinds = new Map()));
+      const ys = kinds.get(k.pattern);
+      if (ys === undefined) kinds.set(k.pattern, [x]); else ys.push(x);
     }
-  });
+  }
   return out;
 }, "unique", null);
-// A whole decimal's int, as the server's `trunc_i64` gives it (null past an int).
-const wholeOf = (b) => (b < I64_MIN || b > I64_MAX ? null : intOf(b));
+// Whether `v` holds a decimal anywhere.
+function holdsDec(v) {
+  const todo = [v];
+  while (todo.length) {
+    const x = todo.pop();
+    if (x instanceof Dec) return true;
+    if (Array.isArray(x)) todo.push(...x);
+    else if (x instanceof Err) todo.push(x.error);
+    else if (isMap(x)) for (const k of Object.keys(x)) todo.push(x[k]);
+  }
+  return false;
+}
 const uniqueIds = new WeakMap();
 let uniqueNext = 0;
-// `unique`'s key for `v`, as the server's: `rough` for what holds a decimal; `p` told whether `v`
-// holds one, and whether it holds NaN.
-function uniqueKey(v, depth, p, rough) {
-  if (typeof v === "string") return v;
-  if (isNil(v)) return null;
-  if (typeof v === "boolean") return v;
-  if (typeof v === "number" || v instanceof Fl) {
-    const f = v instanceof Fl ? v.f : v;
-    if (Number.isNaN(f)) { p.never = true; return 0; }
-    if (rough && !Number.isInteger(v)) { const d = decFromFloat(f); return d === null ? f + 0 : Number(decText(d)) + 0; }
-    return f + 0;
-  }
-  if (typeof v === "bigint") return rough || BigInt(Number(v)) === v ? Number(v) : "i" + v;
-  if (v instanceof Dec) { p.dec = true; return Number(decText(v)) + 0; }
-  if (v instanceof Html) return "h" + htmlText(v);
-  const part = (x) => { const k = uniqueKey(x, depth + 1, p, rough); return typeof k === "string" ? "s" + JSON.stringify(k) : typeof k === "number" ? "n" + k : "o" + String(k); };
-  if (depth > 32) return "deep";
-  if (Array.isArray(v)) return "[" + v.map(part).join(",") + "]";
-  if (v instanceof Err) return "e" + part(v.error);
-  if (isMap(v)) return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + part(v[k])).join(",") + "}";
-  // A function, or the page's object, by itself.
-  if (!uniqueIds.has(v)) uniqueIds.set(v, ++uniqueNext);
-  return "f" + uniqueIds.get(v);
+const TWO53 = 2 ** 53;
+// A decimal's token: by its value, or past 2^53 by its nearest float.
+function decTok(d) {
+  const a = d.m < 0n ? -d.m : d.m;
+  return a >= (1n << 53n) * p10(d.s) ? "N" + Number(decText(d)) : "V" + decKey(d);
 }
+// `|d| < 1e-10`: a decimal a float its text does not give back may be equal to.
+function smallDec(d) {
+  let m = d.m < 0n ? -d.m : d.m, s = d.s;
+  while (s > 0 && m % 10n === 0n) { m /= 10n; s--; }
+  return m === 0n || (s > 10 && m < p10(s - 10));
+}
+// `unique`'s keys for `v`, as the server's: its own, the one with each float made its decimal, and
+// the kinds of its small numbers that may meet, with how many there are.
+function uniqueKeys(v, decs) {
+  const main = [], canon = [], k = { pattern: "", small: 0, never: false };
+  const put = (a, b) => { main.push(a); canon.push(b === undefined ? a : b); };
+  const todo = [v];
+  while (todo.length) {
+    const x = todo.pop();
+    if (x === MARK_END) { put("]"); continue; }
+    if (x instanceof MapKey) { put("k" + JSON.stringify(x.k)); continue; }
+    if (typeof x === "string") { put("s" + JSON.stringify(x)); continue; }
+    if (isNil(x)) { put("z"); continue; }
+    if (typeof x === "boolean") { put(x ? "b1" : "b0"); continue; }
+    if (typeof x === "number" || x instanceof Fl || typeof x === "bigint") {
+      const f = x instanceof Fl ? x.f : x;
+      if (typeof f === "number" && Number.isNaN(f)) { k.never = true; put("n"); continue; }
+      const int = typeof f === "bigint" || (!(x instanceof Fl) && Number.isInteger(f));
+      if (!decs) {
+        if (!int || typeof f === "number" || BigInt(Number(f)) === f) put("f" + (Number(f) + 0));
+        else put("i" + f);
+        continue;
+      }
+      const n = Number(f);
+      if (Math.abs(n) >= TWO53 || !Number.isFinite(n)) { put("N" + n); continue; }
+      if (int) { put("V" + f); continue; }
+      // Finite, below 2^53: a decimal holds it.
+      const d = decFromFloat(n);
+      if (Math.abs(n) >= 1e-10 || Number(decText(d)) === n) { put(decTok(d)); continue; }
+      k.small++; k.pattern += "F";
+      put("X" + n, decTok(d));
+      continue;
+    }
+    if (x instanceof Dec) {
+      if (smallDec(x)) { k.small++; k.pattern += "D"; }
+      put(decTok(x));
+      continue;
+    }
+    if (x instanceof Html) { put("h" + JSON.stringify(htmlText(x))); continue; }
+    if (Array.isArray(x)) {
+      put("[" + x.length);
+      todo.push(MARK_END);
+      for (let i = x.length - 1; i >= 0; i--) todo.push(x[i]);
+      continue;
+    }
+    if (x instanceof Err) { put("e"); todo.push(MARK_END, x.error); continue; }
+    if (isMap(x) && !foreign(x)) {
+      const ks = Object.keys(x).sort();
+      put("{" + ks.length);
+      todo.push(MARK_END);
+      for (let i = ks.length - 1; i >= 0; i--) todo.push(x[ks[i]], new MapKey(ks[i]));
+      continue;
+    }
+    // A function, or the page's object, by itself.
+    if (!uniqueIds.has(x)) uniqueIds.set(x, ++uniqueNext);
+    put("o" + uniqueIds.get(x));
+  }
+  return { main: main.join("\u0001"), canon: canon.join("\u0001"), pattern: k.pattern, small: k.small, never: k.never };
+}
+const MARK_END = Symbol("end");
+class MapKey { constructor(k) { this.k = k; } }
 B.flatten = meta((l) => [].concat(...L(l, "flatten").map((x) => Array.isArray(x) ? x : [x])), "flatten", null);
 B.zip = meta((a, b) => { a = L(a, "zip"); b = L(b, "zip", 2); return a.slice(0, Math.min(a.length, b.length)).map((x, i) => [x, b[i]]); }, "zip", null);
 B.take = meta((v, n) => { n = Math.max(IN(n, "take", 2), 0); return typeof v === "string" ? Array.from(v).slice(0, n).join("") : L(v, "take").slice(0, n); }, "take", null);

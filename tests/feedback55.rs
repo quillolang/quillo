@@ -10772,3 +10772,216 @@ fn a_short_sleep_is_as_long_as_asked() {
 // ---- end of slice 7's review ----
 
 // ---- end of slice 7 ----
+
+// ---- slice 10's second review ----
+
+/// Milliseconds the browser's runtime (in Node) takes for `unique` of what `make` gives `n` for,
+/// the best of three, for `n` and four times `n`; None without Node.
+fn s10_browser_unique_ms(defs: &str, make: &str, n: usize) -> Option<(f64, f64)> {
+    if !node_here() {
+        return None;
+    }
+    let src = format!("{}\nfn took(n: int) -> int {{\n    let xs = {}\n    let best = 1000000\n    for r in [1, 2, 3] {{\n        let t0 = now()\n        let _u = unique(xs)\n        let d = now() - t0\n        if d < best {{\n            best = d\n        }}\n    }}\n    return best\n}}\nfn __t() = [took({}), took({})]\n", defs, make, n, 4 * n);
+    let mut it = quillo::Interp::new(".");
+    it.load_source(&src, "case.qwe").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    let out = support::node(&quillo::client::test_script(&it, "__t").unwrap()).expect("node");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let ms: Vec<f64> = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{}: {}", e, String::from_utf8_lossy(&out.stdout)));
+    Some((ms[0], ms[1]))
+}
+
+/// This thread's CPU seconds for `unique` of what `make` gives `n` for on the server, the best of
+/// three, for `n` and four times `n`.
+fn s10_server_unique_s(defs: &str, make: &str, n: usize) -> (f64, f64) {
+    let mut it = quillo::Interp::new(".");
+    it.load_source(&format!("{}\nfn mk(n: int) = {}\n", defs, make), "case.qwe").unwrap();
+    let small = quillo::value::lookup(&it.globals, "mk").map(|f| it.call(&f, vec![quillo::Value::Int(n as i64)], 0).ok().unwrap()).unwrap();
+    let large = quillo::value::lookup(&it.globals, "mk").map(|f| it.call(&f, vec![quillo::Value::Int(4 * n as i64)], 0).ok().unwrap()).unwrap();
+    let time = |v: &quillo::Value| {
+        let quillo::Value::List(l) = v else { panic!("not a list") };
+        best_of_three(&|| {
+            let _ = quillo::value::unique_of(l);
+        })
+    };
+    (time(&small), time(&large))
+}
+
+// Found in review (slice 10, Q-788 in the browser): a component's function given a one-argument
+// quotient went the `divCall` way, which left out what follows the call, so `show(7 / 2)` kept its
+// first unit; the pipe's way too. Each form now follows what the function reads.
+#[test]
+fn a_components_function_given_a_quotient_follows_what_it_reads() {
+    let src = "component C() {\n  state unit = \"kg\"\n  fn show(x) = str(x) + \" \" + unit\n  <div>\n    <p #a>{show(7 / 2)}</p>\n    <p #b>{7 / 2 | show}</p>\n    <p #c>{show(3.5)}</p>\n    <p #d>{show(7.0 / 2)}</p>\n    <p #e>{show(8 / 2)}</p>\n    <button #go @click={() => { unit = \"lb\" }}>go</button>\n  </div>\n}\nroute GET / = <html><head><title>t</title></head><body><C/></body></html>\n";
+    let body = "const at = () => [\"a\", \"b\", \"c\", \"d\", \"e\"].map((i) => $(i).textContent);\n  const before = at();\n  $(\"go\").click(); await tick(200);\n  return { before, after: at() };";
+    let Some((r, _)) = in_page("s10b-quotient", src, "/", body) else { return };
+    assert_eq!(r["before"], serde_json::json!(["3.5 kg", "3.5 kg", "3.5 kg", "3.5 kg", "4 kg"]), "{}", r);
+    assert_eq!(r["after"], serde_json::json!(["3.5 lb", "3.5 lb", "3.5 lb", "3.5 lb", "4 lb"]), "{}", r);
+    assert!(r["errors"].as_array().map_or(true, |e| e.is_empty()), "{}", r);
+}
+
+// Found in review (Q-791): the browser's key quoted each level's key again, twice as long at each,
+// so 30 levels failed ("Invalid string length"); the server's key stopped at 32 levels, so lists
+// differing only below shared one key (8,000 took 4.4 s). Both make it all the way down now: the
+// same items kept, and four times the items take about four times as long (quadratic is
+// sixteen), on both sides.
+#[test]
+fn unique_of_deep_lists_is_linear_on_both_sides() {
+    let defs = "fn deep(n, v) = if n == 0 { v } else { [deep(n - 1, v)] }\nfn v2(x) = x";
+    same_on_both(
+        defs,
+        &[
+            ("[len(unique([deep(30, 1), deep(30, 1), 2])), len(unique([deep(60, 1), deep(60, 1.0), deep(60, 2)])), len(unique(range(0, 300) | map((i) => deep(40, i % 100))))]", "[[\"int\", \"int\", \"int\"], [2, 2, 100]]"),
+            ("len(unique([json.parse(\"[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\"), json.parse(\"[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[2]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\")]))", "[\"int\", 2]"),
+        ],
+    );
+    let make = "range(0, n) | map((i) => deep(40, i))";
+    let (small, large) = s10_server_unique_s(defs, make, 2000);
+    assert!(large < 6.0 * small + 0.02, "server: {} s, then {} s for four times the items", small, large);
+    if let Some((small, large)) = s10_browser_unique_ms(defs, make, 1000) {
+        assert!(large < 6.0 * small + 30.0, "browser: {} ms, then {} ms for four times the items", small, large);
+    }
+}
+
+// Found in review (Q-788): the pipe's quotient of two ints reached other rounding calls made while
+// its right side was worked out: `a / 2 | pair(floor(q))` gave `floor(q)` the ints' answer on the
+// server alone. It reaches the pipe's own call given the quotient alone, and no argument, inner
+// call or later call.
+#[test]
+fn a_pipes_quotient_reaches_only_the_pipes_own_call() {
+    same_on_both(
+        "fn pair(x, y) = [x, y]\nfn g(x) = floor(x)\nfn q() = 9007199254740995 / 2\nfn after() {\n  let r = 9007199254740995 / 2 | pair(1)\n  [r[1], floor(q())]\n}",
+        &[
+            ("[floor(q()), 9007199254740995 / 2 | pair(floor(q())), 9007199254740995 / 2 | pair(floor(9007199254740995 / 2.0)), floor(9007199254740995 / 2), 9007199254740995 / 2 | floor]", "[[\"int\", [\"float\", \"int\"], [\"float\", \"int\"], \"int\", \"int\"], [4503599627370498, [4503599627370498, 4503599627370498], [4503599627370498, 4503599627370498], 4503599627370497, 4503599627370497]]"),
+            ("[9007199254740995 / 2 | g, 9007199254740995 / 2 | (x) => floor(x), 9007199254740995 / 2 | pair([q()] | map(floor)), 9007199254740995 / 2 | pair(q().floor()), 9007199254740995 / 2 | pair(round(q())), 9007199254740995 / 2 | pair(math.floor(q()))]", "[[\"int\", \"int\", [\"float\", [\"int\"]], [\"float\", \"int\"], [\"float\", \"int\"], [\"float\", \"int\"]], [4503599627370498, 4503599627370498, [4503599627370498, [4503599627370498]], [4503599627370498, 4503599627370498], [4503599627370498, 4503599627370498], [4503599627370498, 4503599627370498]]]"),
+            ("[after(), 9007199254740995 / 2 | (floor(q()) > 0 ? floor : ceil), 9007199254740995 / 2 | floor() | pair(floor(q()))]", "[[[\"int\", \"int\"], \"int\", [\"int\", \"int\"]], [[1, 4503599627370498], 4503599627370497, [4503599627370497, 4503599627370498]]]"),
+        ],
+    );
+}
+
+// Found in review (Q-789): `round(x, -d)` past a decimal's size made 10^d by multiplying, and
+// `round(1e300, -300)` was 1.0000000000000006e300 on the server; it is the float "1e{d}" reads as
+// now, as in the browser, at those and at the ends of the range.
+#[test]
+fn round_to_tens_past_a_decimal_is_the_same_on_both_sides() {
+    same_on_both(
+        "fn v2(x) = x",
+        &[
+            ("[round(1e300, -300) == 1e300, round(3e200, -200) == 3e200, round(1.5e100, -100) == 2e100, round(1e50, -50) == 1e50, round(7e45, -44) == 7e45, round(1e30, -30) == 1e30]", "[[\"bool\", \"bool\", \"bool\", \"bool\", \"bool\", \"bool\"], [true, true, true, true, true, true]]"),
+            ("[round(5e307, -308) == 1e308, round(4e307, -308), round(1e300, -309), round(1.7976931348623157e308, -308) == 1.7976931348623157e308, round(-1.5e100, -100) == -2e100, round(1e29, -29) == 1e29]", "[[\"bool\", \"float\", \"float\", \"bool\", \"bool\", \"bool\"], [true, 0, 0, true, true, true]]"),
+        ],
+    );
+}
+
+// Found in review (Q-791): with a decimal in the list, every float below about 5e-29 had one key
+// (all are equal to 0m), so `[k * 1e-40, 1m]` was quadratic (20,000 took 3.8 s). Such a float is
+// keyed by itself, and only where it may meet a small decimal is the item looked for among those
+// of other kinds: four times the items take about four times as long on both sides, and what is
+// kept is what comparing each with every one kept keeps.
+#[test]
+fn unique_with_decimals_and_tiny_floats_is_linear_and_exact() {
+    for make in ["range(1, n + 1) | map((k) => [k * 1e-40, 1m])", "range(1, n + 1) | map((k) => [k * 1e-40, 0m])", "range(1, n + 1) | map((k) => ({ a: k * 1e-40, b: [0m, k * 1e-35] }))"] {
+        let (small, large) = s10_server_unique_s("", make, 2000);
+        assert!(large < 6.0 * small + 0.02, "server, {}: {} s, then {} s for four times the items", make, small, large);
+        if let Some((small, large)) = s10_browser_unique_ms("", make, 1000) {
+            assert!(large < 6.0 * small + 30.0, "browser, {}: {} ms, then {} ms for four times the items", make, small, large);
+        }
+    }
+    // Against comparing each with every one kept, over values where `==` is not transitive.
+    let defs = "fn pool() = [0m, 1e-30, 2e-30, 0, -0.0, 1e-40, 0.0000000000000000000000000001m, 1e-28, 1152921504606846976, 1152921504606846976.0, 1152921504606847000m, 1152921504606846976m, 0.1, 0.1m, 0.30000000000000004, 0.3m, [1e-30, 0m], [0m, 1e-30], [0m, 0m], [2e-30, 1e-30], { a: 1e-30, b: 0m }, { b: 0m, a: 2e-30 }, [1152921504606846976.0, 0m], [1152921504606847000m, 1e-30], math.nan, \"0\", null]\nfn each(xs) {\n  let out = []\n  for x in xs {\n    if !any(out, (y) => y == x) {\n      out = out | push(x)\n    }\n  }\n  out\n}\nfn mix(n) = range(0, n) | map((i) => pool()[(i * 7919 + i * i) % len(pool())])";
+    same_on_both(
+        defs,
+        &[
+            ("[str(unique(mix(400))) == str(each(mix(400))), str(unique(pool())) == str(each(pool())), str(unique(reverse(pool()))) == str(each(reverse(pool()))), len(unique(pool()))]", "[[\"bool\", \"bool\", \"bool\", \"int\"], [true, true, true, 15]]"),
+        ],
+    );
+}
+
+// Found in review (Q-754, security): the map/join rule took a name the lambda binds for the
+// function it trusts: `let sql_name = (x) => x` in it, a parameter named `sql_name`, a `let col`
+// over the program's safe `fn col`, and a program's own `fn map`, `fn join` or `fn sql_name`,
+// which hide the builtins. Each warns; the guide's form stays silent.
+#[test]
+fn the_sql_rule_trusts_only_the_builtins_and_what_the_lambda_does_not_rebind() {
+    const WARN: &str = "with SQL built from values";
+    for src in [
+        "route POST /a ? { s: str } = db.exec(`update t set ${[s] | map((c) => { let sql_name = (x) => x\n sql_name(c) }) | join(\",\")} where id = 1`)\n",
+        "route POST /a ? { s: str } = db.exec(`update t set ${[(x) => s] | map((sql_name) => sql_name(\"a\")) | join(\",\")} where id = 1`)\n",
+        "fn col(c) = sql_name(c)\nroute POST /a ? { s: str } = db.exec(`update t set ${[s] | map((c) => { let col = (x) => x\n col(c) }) | join(\",\")} where id = 1`)\n",
+        "fn map(xs, f) = xs\nroute POST /a ? { s: str } = db.exec(`update t set ${[s] | map(sql_name) | join(\",\")} where id = 1`)\n",
+        "fn join(xs, sep) = \"x = 1; drop table t; --\"\nroute POST /a ? { s: str } = db.exec(`update t set ${[sql_name(\"a\")] | join(\",\")} where id = 1`)\n",
+        "fn sql_name(x) = x\nroute POST /a ? { s: str } = db.exec(`update t set ${[s] | map(sql_name) | join(\",\")} where id = 1`)\n",
+        "route POST /a ? { s: str } = db.exec(`update t set ${[s] | map((c) => { let f = sql_name\n f = (x) => x\n f(c) }) | join(\",\")} where id = 1`)\n",
+        "route POST /a ? { s: str } = db.exec(`update t set ${[s] | map((c) => match c { sql_name => sql_name }) | join(\",\")} where id = 1`)\n",
+        "route POST /a ? { s: str } {\n  let m = { map: (f) => [s] }\n  db.exec(`update t set ${m.map((c) => sql_name(c)).join(\",\")} where id = 1`)\n}\n",
+    ] {
+        let (ok, out) = check(src);
+        assert!(ok && out.contains(WARN), "{}\n{}", src, out);
+    }
+    for src in [
+        "let cols = [\"title\", \"body\"]\nroute POST /a = db.exec(`update t set ${cols | map((c) => `${sql_name(c)} = ${sql_param(c)}`) | join(\", \")} where id = :id`, { id: 1 })\n",
+        "route POST /a ? { s: str } = db.exec(`update t set ${[s] | map((c) => sql_name(c)) | join(\",\")} where id = 1`)\n",
+        "fn col(c) = sql_name(c)\nroute POST /a ? { s: str } = db.exec(`update t set ${[s] | map((c) => col(c)) | join(\",\")} where id = 1`)\n",
+        "let cols = [\"a\", \"é\"]\nroute POST /a = db.exec(`update t set ${cols.map((c) => `${sql_name(c)} = 1`).join(\", \")} where id = 1`)\n",
+    ] {
+        let (ok, out) = check(src);
+        assert!(ok && !out.contains(WARN), "{}\n{}", src, out);
+    }
+}
+
+// Decided after review (Q-792): a route answering a value that holds a function is an internal
+// error, said in the log; `check` warns where the function is written in the answer: a map or a
+// list holding a function's name or a lambda, through blocks and branches. A name a block binds
+// itself, a call's value, and text are no function.
+#[test]
+fn check_warns_of_a_function_written_in_a_routes_answer() {
+    const WARN: &str = "this route's answer holds a function";
+    for (src, at) in [
+        ("route GET /a = { ok: true, f: (x) => x }\n", "at `f` (a function written there)"),
+        ("route GET /b = [1, { g: print }]\n", "at `[1].g` (the function `print`)"),
+        ("fn helper(x) = x\nroute GET /c = { \"a b\": [helper] }\n", "at `[\"a b\"][0]` (the function `helper`)"),
+        ("fn helper(x) = x\nroute GET /d ? { n: int } {\n  if n > 0 { { é: helper } } else { { é: 1 } }\n}\n", "at `é` (the function `helper`)"),
+    ] {
+        let (ok, out) = check(src);
+        assert!(ok && out.contains(&format!("{} {}", WARN, at)), "{}\n{}", src, out);
+    }
+    for src in [
+        "fn helper(x) = x\nroute GET /c {\n  let helper = 5\n  { h: helper }\n}\n",
+        "fn helper(x) = x\nroute GET /d = { n: helper(1), s: str(1), t: \"print\" }\n",
+        "route GET /e = { ok: true }\n",
+    ] {
+        let (ok, out) = check(src);
+        assert!(ok && !out.contains(WARN), "{}\n{}", src, out);
+    }
+}
+
+// Found in review (Q-785): using a name two tested fields bind, `{ user.id: int, order.id: int } =>
+// id`, gave the last field's with nothing said; it is refused where it is used, at check and as it
+// runs, naming the fields and how to name one, in a `match`, a `for`, a `let` and a route. A
+// route binding one name by two of its path, query and request patterns is refused (the guide has
+// no rule for which wins). `-9223372036854775808.abs()` says how to write it.
+#[test]
+fn a_name_two_tested_fields_bind_is_refused_where_it_is_used() {
+    for (src, want) in [
+        ("fn f(v) = match v { { user.id: int, order.id: int } => id, _ => 0 }\nprint(f({ user: { id: 1 }, order: { id: 2 } }))\n", "`id` is bound by each field tested here that ends in it, `user.id` and `order.id`, and the last one's value is taken: name the one you mean with `as`, `user.id: int as user_id`"),
+        ("route POST /a { json: { user.id: int, order.id: str } } = id\n", "`json.user.id` and `json.order.id`"),
+        ("for { a.n: int, b.n: int } in [] {\n  print(n)\n}\n", "`a.n` and `b.n`"),
+        ("fn f(v) {\n  let { a.é: int | null, b.é: str } = v\n  é\n}\n", "`a.é` and `b.é`, and the last one's value is taken: name the one you mean with `as`, `a.é: int | null as a_é`"),
+        ("route POST /a/:id ? { id: str } { json: { id: str } } = id\n", "`id` is bound twice by this route, by two of its path, its query pattern and its request pattern"),
+        ("route GET /a/:id ? { id: str } = \"x\"\n", "`id` is bound twice by this route"),
+        ("print(-9223372036854775808.abs())\n", "write `(-9223372036854775808).f()`"),
+    ] {
+        let (ok, out) = check(src);
+        assert!(!ok && out.contains(want), "{}\n{}", src, out);
+    }
+    let ran = s10_run("fn f(v) = match v { { user.id: int, order.id: int } => id, _ => 0 }\nprint(f({ user: { id: 1 }, order: { id: 2 } }))\n");
+    assert!(ran.contains("`id` is bound by each field tested here") && !ran.contains("\n2\n"), "{}", ran);
+    // Not used, named apart, or one field each: as before.
+    let ok_src = "fn f(v) = match v {\n  { user.id: int as u, order.id: int as o } => [u, o]\n  { user.id: int, order.id: int } => \"both\"\n  _ => 0\n}\nprint(f({ user: { id: 1 }, order: { id: 2 } }), f({ user: { id: \"x\" }, order: { id: 2 } }), (-9223372036854775807 - 1 + 1).abs())\n";
+    let (ok, out) = check(ok_src);
+    assert!(ok, "{}", out);
+    let (ok, out) = check("route POST /a/:id { json: { name: str } } = `${id} ${name}`\nroute POST /b ? { id: str as q } { json: { id: str } } = `${q} ${id}`\n");
+    assert!(ok, "{}", out);
+    assert_eq!(s10_run(ok_src), "[1, 2] 0 9223372036854775807\n");
+}
+
+// ---- end of slice 10's second review ----

@@ -3250,6 +3250,7 @@ impl<'a> Compiler<'a> {
                         Expr::Call(..) => {}
                         other => {
                             let f = self.callee_value(other)?;
+                            self.follow_call(other, &f.0);
                             let (x, y) = (self.expr(a)?, self.expr(b)?);
                             let name = if let Expr::Ident(n, _) = other { n.to_string() } else { "this function".into() };
                             let call = match f.0.as_str() {
@@ -3270,6 +3271,8 @@ impl<'a> Compiler<'a> {
                     // component's markup (FEEDBACK16.md, Q-127; branch feedback20-fixes).
                     other => {
                         let f = self.callee_value(other)?;
+                        // `x | show` follows what `show` reads, as `show(x)` does (found in review).
+                        self.follow_call(other, &f.0);
                         self.finish_call(if let Expr::Ident(n, _) = other { n } else { "this function" }, f.1, format!("W.call({}, [{}])", f.0, v))?
                     }
                 }
@@ -3587,6 +3590,17 @@ impl<'a> Compiler<'a> {
         Ok((self.expr(e)?, false, false))
     }
 
+    /// The component's own functions, the program's and url() may read what changes: what calls
+    /// them follows it. `f` is what `callee` was made into (`callee_value`).
+    fn follow_call(&mut self, callee: &Expr, f: &str) {
+        if matches!(callee, Expr::Ident(..)) && (self.last_here || f.starts_with("G[") || f == "B.url") {
+            self.reactive = true;
+            if let Some(log) = &mut self.read_log {
+                log.push("*".into());
+            }
+        }
+    }
+
     fn call(&mut self, callee: &Expr, args: &[Expr], pre: Option<String>) -> Result<String, QuilloError> {
         if matches!(callee, Expr::Ident(n, _) if (n == "t" || n == "t_html") && lookup(&self.it.globals, n).is_some_and(|v| matches!(v, Value::Builtin(..)))) {
             let key = match args.first() {
@@ -3709,6 +3723,9 @@ impl<'a> Compiler<'a> {
             }
         }
         let (f, is_async, known) = self.callee_value(callee)?;
+        // What it reads is followed whichever way the call is made below (found in review: the
+        // `divCall` way left it out, and a component's `show(7 / 2)` kept its first unit).
+        self.follow_call(callee, &f);
         // `floor(a / b)`, `ceil` and `round` of it, of two ints, in ints, as on the server
         // (FEEDBACK55.md, Q-788; branch feedback55).
         if let (true, [Expr::Binary(BinOp::Div, a, b, _)]) = (argv.is_empty(), args) {
@@ -3723,14 +3740,6 @@ impl<'a> Compiler<'a> {
                 let (x, y) = (self.expr(a)?, self.expr(b)?);
                 let name = if let Expr::Ident(n, _) = callee { n.to_string() } else { "this function".into() };
                 return self.finish_call(&name, is_async, format!("W.divCall({}, {}, {})", f, x, y));
-            }
-        }
-        // The component's own functions, the program's and url() may read
-        // what changes: what calls them follows it.
-        if matches!(callee, Expr::Ident(..)) && (self.last_here || f.starts_with("G[") || f == "B.url") {
-            self.reactive = true;
-            if let Some(log) = &mut self.read_log {
-                log.push("*".into());
             }
         }
         if f == "B.js" || f == "B.js_new" {

@@ -66,7 +66,9 @@ route POST /fine = idempotent({{ transaction: true, max_age: "1h" }}, () => "ran
     says(post(&mut it, "/isolation", "k"), 500, "takes no isolation or retries");
     says(post(&mut it, "/transaction", "k"), 500, "`idempotent`'s transaction is true or false, got \"yes\"");
     says(post(&mut it, "/no-function", "k"), 500, "`idempotent` expects a function");
-    says(post(&mut it, "/too-many", "k"), 500, "`idempotent` expects a function");
+    // More than it takes is said by the call, as for every builtin (FEEDBACK55.md, Q-786; branch
+    // feedback55).
+    says(post(&mut it, "/too-many", "k"), 500, "`idempotent` takes 2 arguments, got 3: idempotent(options, f)");
     says(post(&mut it, "/nested", "k"), 500, "call it outside `db.transaction`");
     says(post(&mut it, "/fine", "k"), 200, "ran");
 }

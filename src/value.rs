@@ -1108,25 +1108,28 @@ pub fn int_float_cmp(i: i64, f: f64) -> Option<Ordering> {
 /// `items` without those `==` calls equal to one kept before them, in order: `unique`
 /// (FEEDBACK55.md, Q-791; branch feedback55). Each was compared with every one kept, and 20,000
 /// took 1.4 s; here an item is looked for only among those kept under its key, which `==` gives
-/// equal values alike, and which values that are not equal share only rarely, whatever a visitor
-/// sends (found in review: one key for all below 1e-10 made 20,000 tiny floats quadratic again):
+/// equal values alike and values that are not equal share only rarely, whatever a visitor sends.
+/// Keys are made all the way down, from a stack, not by recursion (found in review: below 32
+/// levels all lists had one key).
 ///
-/// - A float by its bits (-0.0 as 0.0), an int by the float that is exactly it (an int and a
-///   float are equal only exactly) or else by itself, text by itself, lists item by item, maps
-///   pair by pair in any order.
+/// - Without a decimal in the list: a float by its bits (-0.0 as 0.0), an int by the float that
+///   is exactly it (an int and a float are equal only exactly) or else by itself, text by itself,
+///   lists item by item, maps pair by pair in any order.
 /// - `==` is exact everywhere but between a float and a decimal: the float is its shortest text
 ///   as a decimal, rounded to 28 places, so `1e-30 == 0m` and `2^60 == 1152921504606847000m`,
-///   though `1e-30 != 0` and `2^60 != 1152921504606847000`. So a decimal is looked for by its
-///   value among the decimals kept, the decimals floats kept are equal to, and the int it is; a
-///   float or an int among the decimals kept by the decimal it is equal to.
-/// - A list or a map holding a decimal, where those meet item by item, has a rough key: each
-///   number by the float nearest the decimal it is equal to (a float's own, rounded so), which
-///   every value it is equal to shares; it is looked for among those of its rough key.
+///   though `1e-30 != 0`, `1e-30 != 2e-30` and `2^60 != 1152921504606847000`. With a decimal in
+///   the list each number is keyed by the decimal it is equal to (past 2^53, by its nearest float,
+///   which the ints, floats and decimals equal to it share). A float whose decimal does not give
+///   it back (one below 1e-10 with too many digits for 28 places) is keyed by its bits instead,
+///   or many unequal floats would share one key (found in review: `[k * 1e-40, 1m]` was
+///   quadratic again); where it meets a small decimal it may be equal to, the item is also kept
+///   under its key with each such float made its decimal, and the kinds there (float or decimal):
+///   an item is looked for there among those whose kinds there differ from its own.
 ///
 /// What holds NaN (or an answer) is equal to nothing: kept without a look. Keyed for the process,
 /// text by SipHash, so a visitor's values cannot be made to share keys.
 pub fn unique_of(items: &[Value]) -> Vec<Value> {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::hash::BuildHasher;
     type Fast<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<Hashed>>;
     static KEY: std::sync::OnceLock<(std::collections::hash_map::RandomState, u64)> = std::sync::OnceLock::new();
@@ -1135,8 +1138,8 @@ pub fn unique_of(items: &[Value]) -> Vec<Value> {
         let seed = k.hash_one(0u8);
         (k, seed)
     });
-    const DEEP: u32 = 32;
     const END: u32 = u32::MAX;
+    const TWO53: f64 = 9007199254740992.0;
     fn mix(h: u64, x: u64) -> u64 {
         // MurmurHash3's finish, after the two are put together.
         let mut x = (h.rotate_left(23) ^ x).wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -1148,145 +1151,202 @@ pub fn unique_of(items: &[Value]) -> Vec<Value> {
     fn bits(f: f64) -> u64 {
         (f + 0.0).to_bits()
     }
-    // A decimal's value, as a key: 12.5m and 12.50m are one.
-    fn value(d: crate::decimal::Dec) -> (i128, u32) {
-        let n = d.normalized();
-        (n.mantissa(), n.scale())
+    enum Step<'a> {
+        Val(&'a Value),
+        Tok(u64),
     }
-    struct K<'a> {
-        key: &'a std::collections::hash_map::RandomState,
-        seed: u64,
-        rough: bool,
+    // An item's keys: its own (`main`), the one with each float made its decimal (`canon`), and
+    // the kinds of its small numbers that may meet (`pattern`, `small` of them).
+    #[derive(Default)]
+    struct Keys {
+        main: u64,
+        canon: u64,
+        pattern: u64,
+        small: u32,
         dec: bool,
         never: bool,
     }
-    impl K<'_> {
-        fn go(&mut self, v: &Value, depth: u32) -> u64 {
-            let seed = self.seed;
-            match v {
-                Value::Nil => mix(seed, 1),
-                Value::Bool(b) => mix(seed, 2 + *b as u64),
-                Value::Float(f) if f.is_nan() => {
-                    self.never = true;
-                    0
-                }
-                Value::Float(f) if self.rough => mix(seed ^ 3, bits(crate::decimal::Dec::from_f64(*f).map_or(*f, |d| d.to_f64()))),
-                Value::Float(f) => mix(seed ^ 3, bits(*f)),
-                Value::Int(n) if self.rough || (*n as f64) as i128 == *n as i128 => mix(seed ^ 3, bits(*n as f64)),
-                Value::Int(n) => mix(seed ^ 7, *n as u64),
-                Value::Dec(d) => {
-                    self.dec = true;
-                    mix(seed ^ 3, bits(d.to_f64()))
-                }
-                Value::Str(s) | Value::Html(s) => self.key.hash_one(&**s),
-                Value::List(_) | Value::Map(_) | Value::Err(..) if depth > DEEP => mix(seed, 5),
-                Value::List(l) => l.iter().fold(mix(seed, 11 ^ l.len() as u64), |h, x| mix(h, self.go(x, depth + 1))),
-                Value::Map(m) => m.iter().fold(mix(seed, 13 ^ m.len() as u64), |h, (k, x)| {
-                    let kh = self.key.hash_one(&**k);
-                    h.wrapping_add(mix(kh, self.go(x, depth + 1)))
-                }),
-                Value::Err(e, ..) => mix(seed, self.go(e, depth + 1) ^ 17),
-                Value::Builtin(n, _) => self.key.hash_one(n),
-                Value::Func(f) => mix(seed, Arc::as_ptr(f) as u64),
-                Value::Response(_) => {
-                    self.never = true;
-                    mix(seed, 19)
-                }
+    struct Walk<'a, 'v> {
+        key: &'a std::collections::hash_map::RandomState,
+        seed: u64,
+        decs: bool,
+        // The stack the walk goes by, kept from item to item.
+        todo: Vec<Step<'v>>,
+    }
+    impl<'v> Walk<'_, 'v> {
+        // A decimal's token: by its value, or past 2^53 by its nearest float.
+        fn dec_tok(d: crate::decimal::Dec, key: &std::collections::hash_map::RandomState) -> u64 {
+            let n = d.normalized();
+            let (m, sc) = (n.mantissa(), n.scale());
+            let big = 10i128.checked_pow(sc).and_then(|p| p.checked_mul(1 << 53)).is_some_and(|edge| m.unsigned_abs() >= edge as u128);
+            if big {
+                mix(31, bits(d.to_f64()))
+            } else {
+                mix(37, key.hash_one((m, sc)))
             }
+        }
+        // `|d| < 1e-10`: a decimal a float its text does not give back may be equal to.
+        fn small_dec(d: crate::decimal::Dec) -> bool {
+            let n = d.normalized();
+            let sc = n.scale();
+            n.mantissa() == 0 || (sc > 10 && n.mantissa().unsigned_abs() < 10u128.pow(sc - 10))
+        }
+        fn keys(&mut self, v: &'v Value) -> Keys {
+            let mut k = Keys { main: self.seed, canon: self.seed, pattern: self.seed, ..Keys::default() };
+            let mut todo = std::mem::take(&mut self.todo);
+            todo.push(Step::Val(v));
+            while let Some(step) = todo.pop() {
+                let x = match step {
+                    Step::Tok(t) => {
+                        k.main = mix(k.main, t);
+                        k.canon = mix(k.canon, t);
+                        continue;
+                    }
+                    Step::Val(x) => x,
+                };
+                let (m, c) = match x {
+                    Value::Nil => (1, 1),
+                    Value::Bool(b) => (2 + *b as u64, 2 + *b as u64),
+                    Value::Float(f) if f.is_nan() => {
+                        k.never = true;
+                        (0, 0)
+                    }
+                    Value::Float(f) if !self.decs => (mix(3, bits(*f)), mix(3, bits(*f))),
+                    Value::Float(f) if f.abs() >= TWO53 || !f.is_finite() => (mix(31, bits(*f)), mix(31, bits(*f))),
+                    Value::Float(f) => match crate::decimal::Dec::from_f64(*f) {
+                        Some(d) if f.abs() >= 1e-10 || d.to_f64() == *f => {
+                            let t = Self::dec_tok(d, self.key);
+                            (t, t)
+                        }
+                        Some(d) => {
+                            k.small += 1;
+                            k.pattern = mix(k.pattern, 41);
+                            (mix(43, bits(*f)), Self::dec_tok(d, self.key))
+                        }
+                        None => (mix(3, bits(*f)), mix(3, bits(*f))),
+                    },
+                    Value::Int(n) if !self.decs => {
+                        let t = if (*n as f64) as i128 == *n as i128 { mix(3, bits(*n as f64)) } else { mix(7, *n as u64) };
+                        (t, t)
+                    }
+                    Value::Int(n) => {
+                        let t = if (*n as f64).abs() >= TWO53 { mix(31, bits(*n as f64)) } else { Self::dec_tok(crate::decimal::Dec::from_i64(*n), self.key) };
+                        (t, t)
+                    }
+                    Value::Dec(d) => {
+                        k.dec = true;
+                        if Self::small_dec(*d) {
+                            k.small += 1;
+                            k.pattern = mix(k.pattern, 47);
+                        }
+                        let t = Self::dec_tok(*d, self.key);
+                        (t, t)
+                    }
+                    Value::Str(s) | Value::Html(s) => {
+                        let t = self.key.hash_one(&**s);
+                        (t, t)
+                    }
+                    Value::List(l) => {
+                        todo.push(Step::Tok(53));
+                        for item in l.iter().rev() {
+                            todo.push(Step::Val(item));
+                        }
+                        (mix(11, l.len() as u64), mix(11, l.len() as u64))
+                    }
+                    Value::Map(m) => {
+                        // In the order of the keys' hashes, so that any order of the pairs is one.
+                        let mut pairs: Vec<(u64, &str, &Value)> = m.iter().map(|(name, x)| (self.key.hash_one(&**name), &**name, x)).collect();
+                        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)));
+                        todo.push(Step::Tok(59));
+                        for (kh, _, x) in pairs.into_iter().rev() {
+                            todo.push(Step::Val(x));
+                            todo.push(Step::Tok(kh));
+                        }
+                        (mix(13, m.len() as u64), mix(13, m.len() as u64))
+                    }
+                    Value::Err(e, ..) => {
+                        todo.push(Step::Tok(61));
+                        todo.push(Step::Val(e));
+                        (17, 17)
+                    }
+                    Value::Builtin(n, _) => {
+                        let t = self.key.hash_one(n);
+                        (t, t)
+                    }
+                    Value::Func(f) => (Arc::as_ptr(f) as u64, Arc::as_ptr(f) as u64),
+                    Value::Response(_) => {
+                        k.never = true;
+                        (19, 19)
+                    }
+                };
+                k.main = mix(k.main, m);
+                k.canon = mix(k.canon, c);
+            }
+            self.todo = todo;
+            k
         }
     }
-    let holder = |v: &Value| matches!(v, Value::List(_) | Value::Map(_) | Value::Err(..));
-    let mut probe = K { key, seed: *seed, rough: false, dec: false, never: false };
-    let exact: Vec<(u64, bool, bool)> = items
-        .iter()
-        .map(|x| {
-            probe.dec = false;
-            probe.never = false;
-            let h = probe.go(x, 0);
-            (h, probe.dec, probe.never)
-        })
-        .collect();
-    let decs = exact.iter().any(|(_, d, _)| *d);
-    let held_decs = items.iter().zip(&exact).any(|(x, (_, d, _))| *d && holder(x));
+    let decs = items.iter().any(holds_dec);
+    let mut walk = Walk { key, seed: *seed, decs, todo: Vec::new() };
     let mut out: Vec<Value> = Vec::new();
-    // What is kept, by key: where each key's chain starts, and the next.
+    // What is kept, by its own key: where each key's chain starts, and the next.
     let mut first: Fast<u64, u32> = Default::default();
     let mut next: Vec<u32> = Vec::new();
-    // The decimals kept, by value, and those the floats kept are equal to.
-    let mut kept_decs: HashSet<(i128, u32)> = HashSet::new();
-    let mut float_decs: HashSet<(i128, u32)> = HashSet::new();
-    // Lists and maps, by rough key: those holding a decimal, and those not.
-    let mut with_dec: Fast<u64, Vec<u32>> = Default::default();
-    let mut without: Fast<u64, Vec<u32>> = Default::default();
-    let mut rough = K { key, seed: *seed, rough: true, dec: false, never: false };
-    let in_chain = |h: u64, x: &Value, out: &[Value], first: &Fast<u64, u32>, next: &[u32]| {
-        let mut i = first.get(&h).copied().unwrap_or(END);
-        while i != END {
-            if equal(x, &out[i as usize]) {
-                return true;
-            }
-            i = next[i as usize];
-        }
-        false
-    };
-    for (x, &(h, dec, never)) in items.iter().zip(&exact) {
-        if never {
+    // What is kept with small numbers that may meet, by its key with them made decimals: for
+    // each kind of them, those kept.
+    let mut groups: Fast<u64, Vec<(u64, Vec<u32>)>> = Default::default();
+    for x in items {
+        let k = walk.keys(x);
+        if k.never {
             out.push(x.clone());
             next.push(END);
             continue;
         }
-        let r = if held_decs && holder(x) { rough.go(x, 0) } else { 0 };
-        let seen = match x {
-            Value::Dec(d) => {
-                let v = value(*d);
-                kept_decs.contains(&v)
-                    || float_decs.contains(&v)
-                    || d.trunc_i64().filter(|_| v.1 == 0).is_some_and(|i| {
-                        let mut p = K { key, seed: *seed, rough: false, dec: false, never: false };
-                        in_chain(p.go(&Value::Int(i), 0), x, &out, &first, &next)
-                    })
+        let mut seen = false;
+        let mut i = first.get(&k.main).copied().unwrap_or(END);
+        while i != END && !seen {
+            seen = equal(x, &out[i as usize]);
+            i = next[i as usize];
+        }
+        if !seen && k.small > 0 {
+            if let Some(kinds) = groups.get(&k.canon) {
+                seen = kinds.iter().filter(|(p, _)| *p != k.pattern).any(|(_, kept)| kept.iter().any(|&i| equal(x, &out[i as usize])));
             }
-            _ if dec => [with_dec.get(&r), without.get(&r)].iter().flatten().any(|l| l.iter().any(|&i| equal(x, &out[i as usize]))),
-            _ => {
-                in_chain(h, x, &out, &first, &next)
-                    || (decs
-                        && match x {
-                            Value::Float(f) => crate::decimal::Dec::from_f64(*f).is_some_and(|d| kept_decs.contains(&value(d))),
-                            Value::Int(i) => kept_decs.contains(&value(crate::decimal::Dec::from_i64(*i))),
-                            _ if held_decs && holder(x) => with_dec.get(&r).is_some_and(|l| l.iter().any(|&i| equal(x, &out[i as usize]))),
-                            _ => false,
-                        })
-            }
-        };
+        }
         if seen {
             continue;
         }
         let at = out.len() as u32;
         out.push(x.clone());
         next.push(END);
-        match x {
-            Value::Dec(d) => {
-                kept_decs.insert(value(*d));
-            }
-            _ if dec => with_dec.entry(r).or_default().push(at),
-            _ => {
-                // At the chain's start: the newest first, as good as any.
-                if let Some(head) = first.insert(h, at) {
-                    next[at as usize] = head;
-                }
-                match x {
-                    Value::Float(f) if decs => {
-                        if let Some(d) = crate::decimal::Dec::from_f64(*f) {
-                            float_decs.insert(value(d));
-                        }
-                    }
-                    _ if held_decs && holder(x) => without.entry(r).or_default().push(at),
-                    _ => {}
-                }
+        // At the chain's start: the newest first, as good as any.
+        if let Some(head) = first.insert(k.main, at) {
+            next[at as usize] = head;
+        }
+        if k.small > 0 {
+            let kinds = groups.entry(k.canon).or_default();
+            match kinds.iter_mut().find(|(p, _)| *p == k.pattern) {
+                Some((_, kept)) => kept.push(at),
+                None => kinds.push((k.pattern, vec![at])),
             }
         }
     }
     out
+}
+
+/// Whether `v` holds a decimal anywhere, looked at from a stack.
+fn holds_dec(v: &Value) -> bool {
+    let mut todo = vec![v];
+    while let Some(x) = todo.pop() {
+        match x {
+            Value::Dec(_) => return true,
+            Value::List(l) => todo.extend(l.iter()),
+            Value::Map(m) => todo.extend(m.values()),
+            Value::Err(e, ..) => todo.push(e),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// A hasher for keys made mixed already (`unique_of`).

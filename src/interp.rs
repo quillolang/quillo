@@ -122,8 +122,12 @@ pub struct Interp {
     pub(crate) services: Arc<crate::shared::Services>,
     /// Calls in progress on this thread, to stop runaway recursion cleanly.
     depth: usize,
-    /// The quotient of two ints a pipe is passing on, for `floor` to make in ints (`eval_pipe`).
-    exact_div: Option<ExactDiv>,
+    /// The quotient of two ints a pipe is passing on, for `floor` to make in ints (`eval_pipe`):
+    /// for the pipe's own call to take as it begins (`pipe_div`), then for the call itself, set
+    /// just before it and taken by it (`exact_div`), so that no argument, inner or later call
+    /// sees it (found in review).
+    pipe_div: Option<Box<ExactDiv>>,
+    exact_div: Option<Box<ExactDiv>>,
     /// The file of the function running, and of the one that called it:
     /// a run-time error is told where it happened (see `enter_call`).
     pub(crate) cur_file: Option<Arc<str>>,
@@ -729,14 +733,13 @@ fn credential(name: &str) -> bool {
 /// Q-788; branch feedback55).
 const ROUNDERS: &[&str] = &["floor", "ceil", "round", "math.floor", "math.ceil", "math.trunc"];
 
-/// A quotient of two ints a pipe passes on as a float (`eval_pipe`): its bits, the ints, how deep
-/// the pipe's call is, and its line.
+/// A quotient of two ints a pipe passes on as a float (`eval_pipe`): its bits, the ints, and its
+/// line.
 #[derive(Clone, Copy)]
 pub struct ExactDiv {
     bits: u64,
     a: i64,
     b: i64,
-    depth: usize,
     line: u32,
 }
 
@@ -1538,6 +1541,7 @@ impl Interp {
             shared,
             services: Default::default(),
             depth: 0,
+            pipe_div: None,
             exact_div: None,
             cur_file: None,
             caller_file: None,
@@ -1650,6 +1654,7 @@ impl Interp {
             shared: self.shared.clone(),
             services: self.services.clone(),
             depth: 0,
+            pipe_div: None,
             exact_div: None,
             cur_file: None,
             caller_file: None,
@@ -2930,32 +2935,43 @@ impl Interp {
                     _ => None,
                 };
                 let v = if self.fuel != u64::MAX { self.script_binop(BinOp::Div, x, y, *at)? } else { binop(BinOp::Div, x, y, *at)? };
-                if let (Some((p, q)), Value::Float(f)) = (ints, &v) {
-                    self.exact_div = Some(ExactDiv { bits: f.to_bits(), a: p, b: q, depth: self.depth, line: *at });
-                }
-                v
+                // Boxed: the interpreter carries a pointer's room for it, not its own (a call does
+                // not notice either).
+                let pending = match (ints, &v) {
+                    (Some((p, q)), Value::Float(f)) => Some(Box::new(ExactDiv { bits: f.to_bits(), a: p, b: q, line: *at })),
+                    _ => None,
+                };
+                return self.pipe_into(v, rhs, env, line, pending);
             }
             _ => self.eval(lhs, env)?,
         };
-        let r = self.pipe_into(v, rhs, env, line);
-        self.exact_div = None;
-        r
+        self.pipe_into(v, rhs, env, line, None)
     }
 
-    /// `v | rhs`.
-    fn pipe_into(&mut self, v: Value, rhs: &Expr, env: &Env, line: u32) -> Result<Value, Ctrl> {
+    /// `v | rhs`. `pending`, a quotient of two ints `v` is, goes to the call the pipe makes with
+    /// `v` alone, and to no other.
+    fn pipe_into(&mut self, v: Value, rhs: &Expr, env: &Env, line: u32, pending: Option<Box<ExactDiv>>) -> Result<Value, Ctrl> {
         match rhs {
-            Expr::Call(callee, args, l) => self.eval_call(callee, args, Some(v), env, *l),
+            Expr::Call(callee, args, l) => {
+                if args.is_empty() {
+                    self.pipe_div = pending;
+                }
+                let r = self.eval_call(callee, args, Some(v), env, *l);
+                self.pipe_div = None;
+                r
+            }
             // `sql | analytics.one`: on that connection.
             Expr::Field(obj, name, l) => {
                 let recv = self.eval(obj, env)?;
                 let db_on = crate::db::conn_of(&recv, name);
                 let f = self.get_field(recv, name, env, *l)?;
                 self.db_on = db_on;
+                self.exact_div = pending;
                 self.call(&f, vec![v], line)
             }
             other => {
                 let f = self.eval(other, env)?;
+                self.exact_div = pending;
                 self.call(&f, vec![v], line)
             }
         }
@@ -3662,6 +3678,8 @@ impl Interp {
         let mut argv = Vec::with_capacity(args.len() + 2);
         // `analytics.query(...)` on a connection from `db.connect`: which one.
         let mut db_on = None;
+        // The pipe's quotient of two ints, for this call alone (see `eval_pipe`).
+        let piped = if pre.is_some() && self.pipe_div.is_some() { self.pipe_div.take() } else { None };
         // `(a / b).floor()`, as `floor(a / b)` (Q-788).
         if let (Expr::Field(obj, name, _), [], None) = (callee, args, &pre) {
             if let Expr::Binary(BinOp::Div, a, b, at) = &**obj {
@@ -3760,7 +3778,22 @@ impl Interp {
                 return fail(line, component_called(&c.def.name));
             }
         }
+        if let (Some(p), true) = (piped, args.is_empty()) {
+            self.exact_div = Some(p);
+        }
         self.call(&f, argv, line)
+    }
+
+    /// The pipe's quotient of two ints given alone to `name`, one of `floor`'s kind: in ints.
+    /// The record is taken whatever `name` is, so that no later call sees it.
+    #[cold]
+    #[inline(never)]
+    fn piped_rounder(&mut self, name: &str, args: &[Value]) -> Option<Result<Value, Ctrl>> {
+        let d = self.exact_div.take()?;
+        match args {
+            [Value::Float(f)] if f.to_bits() == d.bits && ROUNDERS.contains(&name) => Some(crate::builtins::int_div_rounded(name, d.a, d.b, d.line)),
+            _ => None,
+        }
     }
 
     /// `a / b` for `rounder`, `floor` or one of its kind, when there is one: Ok with its answer in
@@ -3888,14 +3921,11 @@ impl Interp {
                 if args.len() > crate::builtins::most_args(name) {
                     return fail(line, crate::check::too_many_args(name, args.len()));
                 }
-                // The quotient a pipe made of two ints, given here alone to `floor` or its kind,
-                // as the pipe called it: in ints (see `eval_pipe`).
-                if let Some(d) = self.exact_div.filter(|d| d.depth == self.depth) {
-                    if let ([Value::Float(f)], true) = (args.as_slice(), ROUNDERS.contains(name)) {
-                        if f.to_bits() == d.bits {
-                            self.exact_div = None;
-                            return crate::builtins::int_div_rounded(name, d.a, d.b, d.line);
-                        }
+                // The quotient a pipe made of two ints, given by the pipe alone to `floor` or its
+                // kind: in ints (see `eval_pipe`). Set for this call alone, and taken by it.
+                if self.exact_div.is_some() {
+                    if let Some(r) = self.piped_rounder(name, &args) {
+                        return r;
                     }
                 }
                 if self.allowed != ALL_EFFECTS {
@@ -3949,10 +3979,17 @@ impl Interp {
                 }
             }
             Value::Func(c) => {
+                // The pipe's quotient is no function's to take (see `eval_pipe`).
+                if self.exact_div.is_some() {
+                    self.exact_div = None;
+                }
                 let c = c.clone();
                 self.call_closure_given(&c, args, line)
             }
-            other => fail(line, format!("cannot call {}: it is not a function", other.type_name())),
+            other => {
+                self.exact_div = None;
+                fail(line, format!("cannot call {}: it is not a function", other.type_name()))
+            }
         }
     }
 
