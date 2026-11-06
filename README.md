@@ -314,21 +314,23 @@ for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; 
 
 ### Test coverage
 
-**Rust: 98.69% of lines** run under the tests (53,417 lines, 699 not run), **97.15% of
-regions** (128,134, 3,652 not run).
-**Browser runtime (`src/client/runtime.js`): 99.86% of lines** (4,875 lines, 7 not run).
-Both were measured together on 2026-11-05 on the FEEDBACK51 work (0.7.0-dev, f319177, now
-main) on macOS, from 2,689 tests with Chrome, PostgreSQL and MariaDB included; 4 failed
-under the run's load and passed when run again by themselves, as `scripts/coverage.sh`
-does before it writes a number. Every line FEEDBACK51 changed runs in a test. The Rust
+**Rust: 98.69% of lines** run under the tests (60,588 lines, 796 not run), **97.23% of
+regions** (145,910, 4,037 not run).
+**Browser runtime (`src/client/runtime.js`): 99.88% of lines** (5,781 lines, 7 not run).
+Both were measured together on 2026-11-07 on the FEEDBACK55 work (0.7.0-dev, fc95e09, on
+branch feedback55) on macOS, from 3,076 tests with Chrome, PostgreSQL and MariaDB included;
+none failed. Every line of runtime.js FEEDBACK55 changed runs in a test, and of the 8,169
+lines of Rust it added, all but 75 do: other systems' branches, failures the tests cannot
+cause and races. The Rust
 figures are the Lines and Regions columns of `cargo llvm-cov`'s total. A line counts as
 run when any part of it ran, so `let x = f()?;` is run though `f` never failed; regions
 count each part, which is why they are lower (FEEDBACK49.md). The runtime's is V8's own
 coverage from headless Chrome and every Node a test starts, mapped back to runtime.js's
 lines. What Rust does not run is mostly operating system failures (a thread or a socket
 that cannot be made), other systems' branches (`src/platform.rs`, `src/desktop.rs`),
-`unreachable!` arms and timers; the files with the most are `src/builtins.rs` (64 lines),
-`src/httpd.rs` (57) and `src/embed.rs` (40). The runtime's 7 lines are defensive guards.
+`unreachable!` arms and timers; the files with the most are `src/httpd.rs` (59 lines),
+`src/builtins.rs` (48), `src/embed.rs` and `src/db.rs` (41 each). The runtime's 7 lines are
+defensive guards.
 
 Rust must stay at **97.90% of lines or above** (the aim is 99%), and runtime.js at
 **99.50% or above** on every change, and every line a change
