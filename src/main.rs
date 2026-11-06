@@ -1279,31 +1279,64 @@ struct Stop {
 static STOP: std::sync::Mutex<Stop> = std::sync::Mutex::new(Stop { serving: false, member: None, joining: None });
 
 fn install_stop() {
-    let again = std::sync::atomic::AtomicBool::new(false);
-    let _ = ctrlc::set_handler(move || {
-        let stop = STOP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if again.swap(true, std::sync::atomic::Ordering::SeqCst) || !stop.serving {
-            with::stop_all();
-            std::process::exit(130);
-        }
-        // A message that cannot be written no longer panics (the `eprintln!` above), so the
-        // handler goes on to stop the server (FEEDBACK37.md, Q-452; branch feedback36-39).
-        eprintln!("quillo: stopping once the requests in progress are answered (again to stop now)");
-        if let Some(m) = &stop.member {
-            m.leave();
-        }
-        if let Some(j) = &stop.joining {
-            j.leave();
-        }
+    let _ = ctrlc::set_handler(stop_asked);
+}
+
+/// Whether a stop was asked for already: the next one exits at once.
+static STOP_AGAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A stop asked for: by Ctrl-C or SIGTERM, or for a service `--split` started, by its app
+/// ending (`stop_with_app`).
+fn stop_asked() {
+    let stop = STOP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if STOP_AGAIN.swap(true, std::sync::atomic::Ordering::SeqCst) || !stop.serving {
         with::stop_all();
-        quillo::httpd::stop();
-        // A request computing never comes back to its loop, so the time is kept from here
-        // (FEEDBACK20.md, Q-164; branch feedback20-fixes).
-        std::thread::spawn(|| {
-            std::thread::sleep(quillo::httpd::DRAIN + std::time::Duration::from_millis(500));
-            eprintln!("quillo: stopping with requests in progress: {}", quillo::httpd::in_progress().join(", "));
-            std::process::exit(0);
-        });
+        std::process::exit(130);
+    }
+    // A message that cannot be written no longer panics (the `eprintln!` above), so the
+    // handler goes on to stop the server (FEEDBACK37.md, Q-452; branch feedback36-39).
+    eprintln!("quillo: stopping once the requests in progress are answered (again to stop now)");
+    if let Some(m) = &stop.member {
+        m.leave();
+    }
+    if let Some(j) = &stop.joining {
+        j.leave();
+    }
+    with::stop_all();
+    quillo::httpd::stop();
+    // A request computing never comes back to its loop, so the time is kept from here
+    // (FEEDBACK20.md, Q-164; branch feedback20-fixes).
+    std::thread::spawn(|| {
+        std::thread::sleep(quillo::httpd::DRAIN + std::time::Duration::from_millis(500));
+        eprintln!("quillo: stopping with requests in progress: {}", quillo::httpd::in_progress().join(", "));
+        std::process::exit(0);
+    });
+}
+
+/// A service `--split` started stops when its app ends, whatever way it ends (SIGKILL and a
+/// crash included): the app holds the other end of the service's stdin, which closes then. A
+/// stop under way already goes on as it was asked (found in review of FEEDBACK55.md's Q-807;
+/// branch feedback55).
+fn stop_with_app() {
+    if std::env::var_os(quillo::service::STOP_WITH_APP).is_none() {
+        return;
+    }
+    std::env::remove_var(quillo::service::STOP_WITH_APP);
+    std::thread::spawn(|| {
+        use std::io::Read;
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 64];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        if !quillo::httpd::stopping() {
+            stop_asked();
+        }
     });
 }
 
@@ -1325,6 +1358,7 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
         Err(code) => return code,
     };
     install_stop();
+    stop_with_app();
     // What whoever runs it allows (FEEDBACK41.md, Q-478; branch feedback40-43).
     if let Err(code) = with_policy(Path::new(file), &o.policies, true) {
         return code;

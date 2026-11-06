@@ -1044,3 +1044,63 @@ fn a_service_that_cannot_be_started_again_is_tried_later() {
     std::fs::copy(env!("CARGO_BIN_EXE_quillo"), &exe).unwrap();
     r.logged("service work started again", 10);
 }
+
+/// The processes whose parent is `pid`.
+#[cfg(unix)]
+fn children_of(pid: u32) -> Vec<u32> {
+    let out = Command::new("pgrep").args(["-P", &pid.to_string()]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).split_whitespace().filter_map(|p| p.parse().ok()).collect()
+}
+
+#[cfg(unix)]
+fn alive(pid: u32) -> bool {
+    Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+}
+
+// A service `--split` started stops when its app ends, whatever way the app ends: SIGKILL too,
+// as a crash, the OOM killer or a test harness end it, and a copy started again after it ended.
+// Before, a killed app's services served on, their ports taken, for ever. One started alone
+// with nothing on its stdin, as systemd starts it, serves on (found in review of FEEDBACK55.md's
+// Q-807; branch feedback55).
+#[cfg(unix)]
+#[test]
+fn a_split_service_stops_when_its_app_is_killed() {
+    let d = dir("killed-app");
+    std::fs::write(d.join("app.qwe"), "service billing = \"billing.qwe\"\nroute GET / = str(billing.total())\nroute GET /url = env(\"QUILLO_SERVICE_BILLING\") ?? \"none\"\n").unwrap();
+    std::fs::write(d.join("billing.qwe"), "server fn total() = 5\n").unwrap();
+    for (copies, again) in [(1, false), (3, false), (1, true)] {
+        let mut r = run(&d.join("app.qwe"), support::free_port(), &["--split", "--scale", &format!("billing={}", copies)], &[]);
+        assert_eq!(r.get("/"), (200, "5".to_string()));
+        let ports: Vec<u16> = r.get("/url").1.split(',').map(|u| u.rsplit(':').next().unwrap().parse().unwrap()).collect();
+        assert_eq!(ports.len(), copies, "{:?}", ports);
+        let mut services = children_of(r.child.id());
+        assert_eq!(services.len(), copies, "{:?}", services);
+        if again {
+            // One that ends is started again, on the same port; the new one stops with the app too.
+            let _ = Command::new("kill").args(["-KILL", &services[0].to_string()]).status();
+            r.logged("started again", 15);
+            eventually(15, "the service is not started again", || {
+                let now = children_of(r.child.id());
+                (now.len() == 1 && now[0] != services[0] && support::listening(ports[0])).then_some(now)
+            });
+            services = children_of(r.child.id());
+        }
+        // While the app runs, the pipe stays open: a moment later its services still answer.
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!(r.get("/"), (200, "5".to_string()));
+        assert!(services.iter().all(|p| alive(*p)) && ports.iter().all(|p| support::listening(*p)));
+        let _ = r.child.kill();
+        let _ = r.child.wait();
+        eventually(10, "a service of a killed app still runs", || services.iter().all(|p| !alive(*p)).then_some(()));
+        assert!(ports.iter().all(|p| !support::listening(*p)));
+    }
+    // Started alone, its stdin at its end from the start: it serves on.
+    let mut alone = spawn(Path::new(env!("CARGO_BIN_EXE_quillo")), &d.join("billing.qwe"), support::free_port(), &["--as-service"], &[]);
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while !support::listening(alone.port) {
+        assert!(Instant::now() < deadline && alone.child.try_wait().unwrap().is_none(), "{}", alone.log());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+    assert!(alone.child.try_wait().unwrap().is_none() && support::listening(alone.port), "{}", alone.log());
+}

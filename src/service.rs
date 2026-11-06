@@ -2038,6 +2038,10 @@ fn free_port() -> std::io::Result<u16> {
     Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
 
+/// Set for a service `--split` starts: its stdin is the app's pipe, and it stops when that
+/// closes (main.rs's `stop_with_app`).
+pub const STOP_WITH_APP: &str = "QUILLO_STOP_WITH_APP";
+
 /// Starts a service's process, its log lines marked with its name.
 fn start_service(exe: &Path, args: &[String], name: &str) -> Result<std::process::Child, String> {
     let mut command = std::process::Command::new(exe);
@@ -2046,6 +2050,10 @@ fn start_service(exe: &Path, args: &[String], name: &str) -> Result<std::process
     if let Some(u) = APP_URL.get() {
         command.env("QUILLO_APP_URL", u);
     }
+    // Its stdin is a pipe the app holds, which closes however the app's process ends: the
+    // service stops then. A service whose app was killed served on, its port taken, for ever
+    // (found in review of FEEDBACK55.md's Q-807; branch feedback55).
+    command.env(STOP_WITH_APP, "1").stdin(std::process::Stdio::piped());
     let mut child = command
         .args(args)
         .stdout(std::process::Stdio::piped())
