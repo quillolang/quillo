@@ -11003,7 +11003,8 @@ fn unique_of_deep_lists_is_linear_on_both_sides() {
     let (small, large) = s10_server_unique_s(defs, make, 2000);
     assert!(large < 6.0 * small + 0.02, "server: {} s, then {} s for four times the items", small, large);
     if let Some((small, large)) = s10_browser_unique_ms(defs, make, 1000) {
-        assert!(large < 6.0 * small + 30.0, "browser: {} ms, then {} ms for four times the items", small, large);
+        // Eight times in the browser, whose timer and collector a CI runner shares (7 once).
+        assert!(large < 8.0 * small + 30.0, "browser: {} ms, then {} ms for four times the items", small, large);
     }
 }
 
@@ -11049,7 +11050,7 @@ fn unique_with_decimals_and_tiny_floats_is_linear_and_exact() {
         let (small, large) = s10_server_unique_s("", make, 2000);
         assert!(large < 6.0 * small + 0.02, "server, {}: {} s, then {} s for four times the items", make, small, large);
         if let Some((small, large)) = s10_browser_unique_ms("", make, 1000) {
-            assert!(large < 6.0 * small + 30.0, "browser, {}: {} ms, then {} ms for four times the items", make, small, large);
+            assert!(large < 8.0 * small + 30.0, "browser, {}: {} ms, then {} ms for four times the items", make, small, large);
         }
     }
     // Against comparing each with every one kept, over values where `==` is not transitive.
