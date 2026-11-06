@@ -314,7 +314,10 @@ fn the_browser_receives_as_it_comes() {
     it.load_source(&src, "case.qwe").unwrap();
     let js = quillo::client::test_script(&it, "__t").unwrap();
     let js = js.replace("console.log(W.repr(G[\"__t\"]()))", "G[\"__t\"]().then((v) => console.log(W.repr(v)), (e) => console.log(\"ERROR: \" + e.message))");
-    let out = Command::new("node").arg("-e").arg(&js).output().unwrap();
+    // From a file: the script holds the runtime, longer than one argument may be on Linux (128 KiB).
+    let script = d.join("case.js");
+    std::fs::write(&script, &js).unwrap();
+    let out = Command::new("node").arg(&script).output().unwrap();
     let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert_eq!(
         got,
