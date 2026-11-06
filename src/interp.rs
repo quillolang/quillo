@@ -2480,98 +2480,10 @@ impl Interp {
                 }
                 Ok(Value::Nil)
             }
-            Stmt::Use(path, names, line, options) => {
-                let src_dir = self.src_dir().to_path_buf();
-                let from = self.cur_file.as_deref().map_or_else(|| src_dir.join("main.qwe"), PathBuf::from);
-                // A path without its extension that two files could be: said, not one taken
-                // (FEEDBACK55.md, Q-819; branch feedback55).
-                if options.implied {
-                    let could = crate::modules::implied_files(&src_dir, &from, path);
-                    if could.len() > 1 {
-                        return fail(*line, crate::modules::two_files(&could));
-                    }
-                }
-                let path = &crate::modules::resolve_use(&src_dir, &from, path, options.implied);
-                let full = src_dir.join(path);
-                let key = full.canonicalize().unwrap_or_else(|_| full.clone());
-                self.note_link(&full);
-                // The file's names for a Rust file's functions, its own (FEEDBACK55.md, Q-816;
-                // branch feedback55).
-                let links = self.links.clone();
-                let renames = if crate::native::is_rust(path) { links.rust_names(&crate::modules::key(&from)) } else { None };
-                // A `.qwer` file's names are defined for each `use` that takes some, or that
-                // calls them its own way, or the first that takes them all, after one that took
-                // some (its library is built and opened once); anything else runs once. A file
-                // taken whole after another took names of it had none (Q-816).
-                let first = Arc::make_mut(&mut self.loaded).insert(key.clone());
-                if crate::native::is_rust(path) {
-                    if names.is_none() && renames.is_none() && !Arc::make_mut(&mut self.rust_whole).insert(key.clone()) {
-                        return Ok(Value::Nil);
-                    }
-                } else if !first {
-                    return Ok(Value::Nil);
-                }
-                // By identity too (FEEDBACK55.md, Q-701; branch feedback55).
-                crate::builtins::protect(&key, crate::builtins::OWN_SOURCE);
-                // Rust: built, loaded, and its functions defined (see `native`).
-                if crate::native::is_rust(&path) {
-                    let fname = full.display().to_string();
-                    return match crate::native::use_file(self, &full, names.as_deref(), renames, *line) {
-                        Err(Ctrl::Error(e)) => Err(Ctrl::Error(Box::new(e.in_file(&fname)))),
-                        other => other.map(|_| Value::Nil),
-                    };
-                }
-                let src = crate::error::read_source(&full)
-                    .map_err(|e| QuilloError::new(format!("cannot read {}: {}", full.display(), e), *line))?;
-                let fname = full.display().to_string();
-                let abs = source_path(&full);
-                self.uses_atomic |= src.contains(".atomic");
-                let links = self.links.clone();
-                let stmts = parse_cached(&src, abs.clone(), &fname, links.renames(&key))?;
-                Arc::make_mut(&mut self.program).push(stmts.clone());
-                let g = self.globals.clone();
-                let debugging = crate::debug::on();
-                if debugging {
-                    crate::debug::enter(self, path, abs, 1);
-                }
-                let mut r = Ok(Value::Nil);
-                // Its statements are in its file: a `use ./x.qwe` in it counts from there
-                // (FEEDBACK25.md, Q-325; branch feedback27-35-fixes).
-                let was_file = self.cur_file.replace(Arc::from(fname.as_str()));
-                for s in stmts.iter() {
-                    // A used file's statements give nothing to anyone.
-                    let ran = match s {
-                        Stmt::Expr(node @ Expr::For(pat, iter, body, line)) if !crate::debug::on() => self.eval_for(node, pat, iter, body, &g, *line, false),
-                        s => self.exec_stmt(s, &g),
-                    };
-                    match ran {
-                        Ok(_) => {}
-                        // An error is the program's failure from a used file too, and
-                        // the file it came from says so (FEEDBACK29.md, Q-350; branch
-                        // feedback29-fixes).
-                        Err(Ctrl::Return(Value::Err(e, _, at))) => {
-                            let text = crate::value::told(|| e.display());
-                            r = Err(Ctrl::Error(Box::new(QuilloError::new(at.before(&text), 0).in_file(&fname))));
-                            break;
-                        }
-                        // `return` at a file's top level leaves that file, not the one
-                        // that used it (FEEDBACK16.md, Q-109; branch feedback20-fixes).
-                        Err(Ctrl::Return(_)) => break,
-                        Err(e) => {
-                            r = Err(match e {
-                                Ctrl::Error(e) => Ctrl::Error(Box::new(e.in_file(&fname))),
-                                other => other,
-                            });
-                            break;
-                        }
-                    }
-                }
-                self.cur_file = was_file;
-                if debugging {
-                    crate::debug::leave(self);
-                }
-                r
-            }
+            // Out of line: inlined, its lookups made every statement's frame save registers,
+            // and a loop of `t += x` was 4% slower (found in review of FEEDBACK55.md, string
+            // speed; branch feedback55).
+            Stmt::Use(path, names, line, options) => self.run_use(path, names, line, options),
             Stmt::Type(td) => {
                 if !Arc::ptr_eq(env, &self.globals) {
                     return fail(td.line, "`type` must be at the top level");
@@ -2665,6 +2577,103 @@ impl Interp {
                 Err(Ctrl::Return(v))
             }
         }
+    }
+
+    /// `use`: a file's statements run, or a Rust file built and its functions defined, once
+    /// (see `run_stmt`).
+    #[cold]
+    #[inline(never)]
+    fn run_use(&mut self, path: &str, names: &Option<Vec<(String, String)>>, line: &u32, options: &LibOptions) -> Result<Value, Ctrl> {
+        let src_dir = self.src_dir().to_path_buf();
+        let from = self.cur_file.as_deref().map_or_else(|| src_dir.join("main.qwe"), PathBuf::from);
+        // A path without its extension that two files could be: said, not one taken
+        // (FEEDBACK55.md, Q-819; branch feedback55).
+        if options.implied {
+            let could = crate::modules::implied_files(&src_dir, &from, path);
+            if could.len() > 1 {
+                return fail(*line, crate::modules::two_files(&could));
+            }
+        }
+        let path = &crate::modules::resolve_use(&src_dir, &from, path, options.implied);
+        let full = src_dir.join(path);
+        let key = full.canonicalize().unwrap_or_else(|_| full.clone());
+        self.note_link(&full);
+        // The file's names for a Rust file's functions, its own (FEEDBACK55.md, Q-816;
+        // branch feedback55).
+        let links = self.links.clone();
+        let renames = if crate::native::is_rust(path) { links.rust_names(&crate::modules::key(&from)) } else { None };
+        // A `.qwer` file's names are defined for each `use` that takes some, or that
+        // calls them its own way, or the first that takes them all, after one that took
+        // some (its library is built and opened once); anything else runs once. A file
+        // taken whole after another took names of it had none (Q-816).
+        let first = Arc::make_mut(&mut self.loaded).insert(key.clone());
+        if crate::native::is_rust(path) {
+            if names.is_none() && renames.is_none() && !Arc::make_mut(&mut self.rust_whole).insert(key.clone()) {
+                return Ok(Value::Nil);
+            }
+        } else if !first {
+            return Ok(Value::Nil);
+        }
+        // By identity too (FEEDBACK55.md, Q-701; branch feedback55).
+        crate::builtins::protect(&key, crate::builtins::OWN_SOURCE);
+        // Rust: built, loaded, and its functions defined (see `native`).
+        if crate::native::is_rust(&path) {
+            let fname = full.display().to_string();
+            return match crate::native::use_file(self, &full, names.as_deref(), renames, *line) {
+                Err(Ctrl::Error(e)) => Err(Ctrl::Error(Box::new(e.in_file(&fname)))),
+                other => other.map(|_| Value::Nil),
+            };
+        }
+        let src = crate::error::read_source(&full)
+            .map_err(|e| QuilloError::new(format!("cannot read {}: {}", full.display(), e), *line))?;
+        let fname = full.display().to_string();
+        let abs = source_path(&full);
+        self.uses_atomic |= src.contains(".atomic");
+        let links = self.links.clone();
+        let stmts = parse_cached(&src, abs.clone(), &fname, links.renames(&key))?;
+        Arc::make_mut(&mut self.program).push(stmts.clone());
+        let g = self.globals.clone();
+        let debugging = crate::debug::on();
+        if debugging {
+            crate::debug::enter(self, path, abs, 1);
+        }
+        let mut r = Ok(Value::Nil);
+        // Its statements are in its file: a `use ./x.qwe` in it counts from there
+        // (FEEDBACK25.md, Q-325; branch feedback27-35-fixes).
+        let was_file = self.cur_file.replace(Arc::from(fname.as_str()));
+        for s in stmts.iter() {
+            // A used file's statements give nothing to anyone.
+            let ran = match s {
+                Stmt::Expr(node @ Expr::For(pat, iter, body, line)) if !crate::debug::on() => self.eval_for(node, pat, iter, body, &g, *line, false),
+                s => self.exec_stmt(s, &g),
+            };
+            match ran {
+                Ok(_) => {}
+                // An error is the program's failure from a used file too, and
+                // the file it came from says so (FEEDBACK29.md, Q-350; branch
+                // feedback29-fixes).
+                Err(Ctrl::Return(Value::Err(e, _, at))) => {
+                    let text = crate::value::told(|| e.display());
+                    r = Err(Ctrl::Error(Box::new(QuilloError::new(at.before(&text), 0).in_file(&fname))));
+                    break;
+                }
+                // `return` at a file's top level leaves that file, not the one
+                // that used it (FEEDBACK16.md, Q-109; branch feedback20-fixes).
+                Err(Ctrl::Return(_)) => break,
+                Err(e) => {
+                    r = Err(match e {
+                        Ctrl::Error(e) => Ctrl::Error(Box::new(e.in_file(&fname))),
+                        other => other,
+                    });
+                    break;
+                }
+            }
+        }
+        self.cur_file = was_file;
+        if debugging {
+            crate::debug::leave(self);
+        }
+        r
     }
 
     /// `name = e`, `+=` and `-=`: out of `run_stmt`, whose frame every statement pays for and
@@ -3418,11 +3427,13 @@ impl Interp {
                 self.stored = stored;
                 return Ok(if stored { Some(Value::Nil) } else { take_local(env, name) });
             }
-            let Some(old) = take_local(env, name) else { return Ok(None) };
+            // What `update` does not change where it is, `set` or `push` refuses, or has
+            // nothing to copy (null, an error for a key): the builtin is given the value, and the
+            // variable keeps it, as the long way keeps it. Taken, a refusal caught by `??` left
+            // the variable null (found in review of FEEDBACK55.md, string speed; branch
+            // feedback55). The arguments are not worked out again.
+            let Some(old) = lookup(env, name) else { return Ok(None) };
             few[0] = old;
-            // Moved, not copied: a copy held the list or map, which `set` then copied, each
-            // round of `m = m | set(i % 100, v)`, a key that is not a text (found in review of
-            // FEEDBACK55.md, string speed; branch feedback55).
             return self.call(&b, few.iter_mut().map(|v| std::mem::replace(v, Value::Nil)).collect(), line).map(Some);
         }
         let mut vals = Vec::with_capacity(args.len() + 1);
@@ -3430,7 +3441,19 @@ impl Interp {
         for a in args {
             vals.push(self.eval(a, env)?);
         }
-        let Some(old) = take_local(env, name) else { return Ok(None) };
+        // Taken, to be changed where it is, only where the builtin cannot refuse it (a map
+        // merged with a map, a key removed from a list or a map); anything else is given the
+        // value, which the variable keeps if the call fails (the same review).
+        let sure = self.fuel == u64::MAX
+            && vals.len() == 2
+            && crate::value::with_var(env, name, |v| {
+                if fname == merge {
+                    matches!(v, Value::Map(_) | Value::Nil) && matches!(vals[1], Value::Map(_) | Value::Nil)
+                } else {
+                    fname == remove && matches!(v, Value::List(_) | Value::Map(_) | Value::Nil)
+                }
+            }) == Some(true);
+        let Some(old) = (if sure { take_local(env, name) } else { lookup(env, name) }) else { return Ok(None) };
         vals[0] = old;
         self.call(&b, vals, line).map(Some)
     }

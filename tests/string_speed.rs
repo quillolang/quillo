@@ -283,3 +283,31 @@ fn counts_in_loops_are_compiled() {
     it.load_source(src, "main.qwe").unwrap();
     assert_eq!(quillo::jitloop::compiled(), before, "compiled:\n{}", src);
 }
+
+/// A `set`, `push`, `merge` or `remove` that the builtin refuses, caught by `??`, leaves the
+/// variable as it was, as the long way leaves it, with the builtin's own error; the variable
+/// was null (found in review of FEEDBACK55.md, string speed; branch feedback55).
+#[test]
+fn a_refused_update_keeps_the_variable() {
+    // A float index, past the end, a text, an int, a merge of an int, a key removed from a text.
+    same("keep-forms", "fn given(x) = x\nlet ys = [1, 2]\nlet r1 = {\n    ys = set(ys, 1.5, 0)\n    0\n} ?? \"c\"\nlet xs = [1, 2]\nlet r2 = {\n    xs = xs | set(10, 1)\n    0\n} ?? \"c\"\nlet s = \"ab\"\nlet r3 = {\n    s = s | set(1, \"x\")\n    0\n} ?? \"c\"\nlet n = 5\nlet r4 = {\n    n = n | push(1)\n    0\n} ?? \"c\"\nlet q = { a: 1 }\nlet r5 = {\n    q = q | merge(given(5))\n    0\n} ?? \"c\"\nlet t = \"t\"\nlet r6 = {\n    t = t | remove(given(1))\n    0\n} ?? \"c\"\nprint(r1, ys, r2, xs, r3, s, r4, n, r5, q, r6, t)\n", "c [1, 2] c [1, 2] c ab c 5 c { a: 1 } c t\n");
+    // The error, unchanged: a float index.
+    fails("keep-error-1", "fn given(x) = x\nlet ys = [1, 2]\nys = set(ys, 1.5, 0)\n", "", "main.qwe:3: `set` expects an int as argument 2, got float");
+    // The error, unchanged: past the end.
+    fails("keep-error-2", "fn given(x) = x\nlet ys = [1, 2]\nys = ys | set(10, 1)\n", "", "main.qwe:3: `set`: index 10 is outside a list of 2");
+    // The error, unchanged: a text set.
+    fails("keep-error-3", "fn given(x) = x\nlet ys = \"ab\"\nys = ys | set(1, \"x\")\n", "", "main.qwe:3: `set` expects a map as argument 1, got str");
+    // The error, unchanged: an int pushed to.
+    fails("keep-error-4", "fn given(x) = x\nlet ys = 5\nys = ys | push(1)\n", "", "main.qwe:3: `push` expects a list as argument 1, got int");
+    // The error, unchanged: an int merged.
+    fails("keep-error-5", "fn given(x) = x\nlet ys = { a: 1 }\nys = ys | merge(given(5))\n", "", "main.qwe:3: `merge` expects a map as argument 2, got int");
+    // The error, unchanged: a text a key is removed from.
+    fails("keep-error-6", "fn given(x) = x\nlet ys = \"t\"\nys = ys | remove(given(1))\n", "", "main.qwe:3: `remove` expects a map as argument 1, got str");
+    // In loops, in the interpreter: the rounds before the refused one are kept.
+    same("keep-loop", "fn f() {\n    let xs = range(0, 10) | map((i) => 0)\n    let r = {\n        for i in 0..1000 {\n            xs = set(xs, i, i)\n        }\n        0\n    } ?? \"stopped\"\n    [r, len(xs), xs[9]]\n}\nfn g() {\n    let m = {}\n    let r = {\n        for i in 0..1000 {\n            m = m | set(i % 7, get(m, i % 7, 0) + (i < 600 ? 1 : true))\n        }\n        0\n    } ?? \"stopped\"\n    [r, m]\n}\nprint(f(), g())\n", "[\"stopped\", 10, 9] [\"stopped\", { \"0\": 86, \"1\": 86, \"2\": 86, \"3\": 86, \"4\": 86, \"5\": 85, \"6\": 85 }]\n");
+    // In compiled loops: `set` past the end, and a count past the last int.
+    same("keep-compiled", "fn f() {\n    let xs = range(0, 600) | map((i) => 0)\n    let r = {\n        for i in 0..1000 {\n            xs = set(xs, i, i)\n        }\n        0\n    } ?? \"stopped\"\n    [r, len(xs), xs[599]]\n}\nfn g() {\n    let m = {}\n    let r = {\n        for i in 0..1000 {\n            m = m | set(i % 7, get(m, i % 7, 9223372036854775700) + 1)\n        }\n        0\n    } ?? \"stopped\"\n    [r, m]\n}\nprint(f(), g())\n", "[\"stopped\", 600, 599] [\"stopped\", { \"0\": 9223372036854775807, \"1\": 9223372036854775807, \"2\": 9223372036854775807, \"3\": 9223372036854775807, \"4\": 9223372036854775807, \"5\": 9223372036854775807, \"6\": 9223372036854775807 }]\n");
+    // What is not refused: keys that are not texts set where they are, a push, null made a
+    // map, and an error for a key, which `set` gives back.
+    same("keep-taken", "fn f(xs) {\n    let m = { \"0\": 0 }\n    let l = []\n    let u = null\n    for x in xs {\n        m = m | set(x % 3, x)\n        m = set(m, x * 0.5, 1)\n        l = l | push(x)\n        u = u | set(\"k\", x)\n    }\n    m = m | set(int(\"q\"), 1)\n    [len(l), u, m]\n}\nprint(f(range(0, 10)))\n", "[10, { k: 9 }, err(\"not an int: \\\"q\\\"\")]\n");
+}

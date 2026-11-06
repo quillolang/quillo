@@ -2054,6 +2054,11 @@ pub fn update(slot: &mut Value, vals: &mut [Value]) -> bool {
         (Value::Map(m), [_, Value::Str(k), x]) => {
             Arc::make_mut(m).insert(Key::new(k), std::mem::replace(x, Value::Nil));
         }
+        // Any other key as `set` reads it, its text, but an error, which is no key and `set`
+        // gives back (found in review of FEEDBACK55.md, string speed; branch feedback55).
+        (Value::Map(m), [_, k, x]) if !matches!(k, Value::Err(..)) => {
+            Arc::make_mut(m).insert(Key::from(k.key_text()), std::mem::replace(x, Value::Nil));
+        }
         _ => return false,
     }
     true

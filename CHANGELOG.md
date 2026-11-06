@@ -512,6 +512,8 @@ From FEEDBACK55.md:
   million counts took 66 times Python's time (each round copied the map) and take a third of
   it. `==` and `+=` on a text no longer allocate. Every case of `bench/vs-python` is ahead of
   Python.
+- A `set`, `push`, `merge` or `remove` that fails, caught by `??`, keeps the variable's value
+  (`ys = set(ys, 1.5, 0)` left `ys` null).
 
 - Markdown is rendered by pulldown-cmark 0.13; the 545 Markdown files of the projects render
   byte for byte as before (Q-706).
