@@ -192,6 +192,27 @@ pub struct FnDef {
     /// How often it was called, for compiling it (src/jit.rs); `u32::MAX`
     /// once it is known that it cannot be.
     pub hot: std::sync::atomic::AtomicU32,
+    /// What its code does with `request`, once asked (see `FnDef::request_use`).
+    pub request_use: std::sync::atomic::AtomicU8,
+}
+
+impl FnDef {
+    /// Whether its parameters' defaults or its body name `request`, and whether they can read the
+    /// visitor from it (see `parser::request_use`). Worked out once: it was walked on each call
+    /// of a server fn in a `live` run (FEEDBACK55.md, Q-880; branch feedback55).
+    pub fn request_use(&self) -> (bool, bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        const KNOWN: u8 = 1;
+        const NAMES: u8 = 2;
+        const VISITOR: u8 = 4;
+        let mut known = self.request_use.load(Relaxed);
+        if known == 0 {
+            let (names, visitor) = crate::parser::request_use(|f| crate::check::walk_fn(self, f));
+            known = KNOWN | if names { NAMES } else { 0 } | if visitor { VISITOR } else { 0 };
+            self.request_use.store(known, Relaxed);
+        }
+        (known & NAMES != 0, known & VISITOR != 0)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +288,11 @@ pub struct RouteDef {
     /// against it. Otherwise the request map is made only if something asks
     /// for it (`url()`, a server fn).
     pub uses_request: bool,
+    /// Whether its body or its patterns can read the visitor from the request: the page is
+    /// theirs (see `parser::request_use`; FEEDBACK55.md, Q-886; branch feedback55).
+    pub reads_visitor: bool,
+    /// Whether its groups' middleware can, once known (see `Interp::middleware_reads`).
+    pub middleware_reads: std::sync::OnceLock<bool>,
     /// `route GET /report/:day with db { ... }`: what its body, and the middleware of its
     /// groups, may do; the group's `with` narrowed by its own (branch feedback40-43).
     pub effects: Option<Vec<String>>,
@@ -315,6 +341,7 @@ impl RouteDef {
                 nesting: 1,
                 file: self.file.clone(),
                 hot: Default::default(),
+                request_use: Default::default(),
             })
         });
         self

@@ -21,8 +21,43 @@ while fixing (a map's order in the browser).
   `if no_user { redirect("/login") }` with more after it, the redirect is made and left, and
   the route goes on: the visitor is shown the page. Write `reply 303 redirect("/login")`.
   Look for this in your code: two of the sample apps had it (Q-877).
+- **Eleven more ways one visitor's data reached another are closed** (an audit after
+  Q-876; in 0.7.0 and most in 0.6.0):
+  - a view's cache kept a service's answer until restart, so one visitor saw another's
+    `Authorization`, and one tenant another's data (Q-878);
+  - a tenant told by a function, or named with `with_tenant`, was not in a run's key, so a
+    tenant saw another's rows (Q-879);
+  - `request` in a parameter, pattern or lambda default went unseen, and the run was
+    shared (Q-880);
+  - visitors were told apart by five fields, so `X-Api-Key`, `?token=` or `X-Tenant`
+    reached the next visitor from the same address (Q-881);
+  - mounted programs shared runs (Q-882);
+  - **a worker kept a finished request**, memory-unsafely: a job or a channel handler read
+    the last visitor's query, and a stream could go to the wrong visitor (Q-883);
+  - kept values answered to a hash anyone could work out, so a visitor could guess another's
+    short secret offline (Q-884);
+  - a kept run lost its marks, so a page lost `Cache-Control: private` (Q-885);
+  - a page showing the session with a status of 400 or more, one read through
+    `get(request, ...)` or a pattern, and a translated page had no `private` or `Vary`
+    (Q-886);
+  - an idempotency key was shared by every session without `.user` (Q-887);
+  - a run with `crypto.token`, `random` or a write was shared, so two visitors got one
+    token and a second write was skipped (Q-888).
 
 ### What to change in your code
+
+- **A run that read the visitor is shared with nobody**, not even their other tabs, and one
+  that did anything but read is not shared either. A loader for everyone is one run, as
+  before, now per tenant too. Loaders calling a service, a site or a plugin stop sharing.
+  Builtins are classified: one not named is neither kept nor shared (Q-881, Q-888).
+- **An idempotency key runs at most once, whoever asks**, the user's decision: a double
+  charge is the worst outcome. With nothing in common the answer is 409, nothing run or
+  shown, also after signing out or losing a cookie. **Two visitors with one key used to each
+  run; the second now gets 409**: pass `{ user }` (a str or an int; a record is refused) or
+  use unique keys (Q-887).
+- **Pages reading `request.headers`, `request.cookies` or `request.ip`, or passing `request`
+  on, are private**, whatever their status, and so are those under middleware that reads the
+  visitor or cannot be read (Q-886).
 
 Databases (each driver hides its database's quirks, so a value means the same on all three;
 the user's decision, Q-736):

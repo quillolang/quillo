@@ -2462,13 +2462,16 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
   `live({ every: "2s" }, load)` asks for a gap of its own between a page's refreshes,
   as `500`, `"500ms"`, `"2s"` or `"1m"`, written here as it is.
 - A loader's run is shared by the pages that ask, within two seconds, for the same
-  function with the same arguments (and the same `Host`) while nothing it read has
-  changed: fifty open boards run `load_board` once, and that goes for a page's first
-  load too. Calls that come while a run is under way wait for it. A run that read the
-  request (`session()`, cookies, headers, the locale) is shared only by the same viewer's
-  pages (their tabs), wherever in the run it read it; a viewer is told by address,
-  cookies, `Authorization`, `Accept-Language` and `User-Agent` together. A run that
-  wrote, set a cookie, took a file, or answered with `respond` is not shared.
+  function with the same arguments, `Host` and tenant while nothing it read has changed:
+  fifty open boards run `load_board` once, and that goes for a page's first load too.
+  Calls that come while a run is under way wait for it. A run that read the visitor
+  (`session()`, cookies, `request`, the locale), wherever in the run it read it, or did
+  anything but read (wrote, called a service or plugin, `crypto.token`, `uuid`, `random`,
+  set a cookie, took a file, answered with `respond`), is shared with nobody, not even
+  the visitor's other tabs, and nothing waits for it. Randomness made in SQL (`select
+  hex(randomblob(8))`) is a read, so such a run is shared: make tokens with
+  `crypto.token`. `nextval` or a writing function behind a view is not seen either: put
+  it in the query.
 - **What a thousand pages cost** depends on whether the loader is shared. A loader for
   everyone runs once a change however many pages show it. One that reads the viewer runs
   once for each page, on every change to what it read, so with many pages and a busy
@@ -3732,6 +3735,10 @@ fn touch() {
   `` respond(200, v, { etag: `"${version}"` }) ``. Header names are written in lower case, and a name or value with a control character (a line break) is
   a runtime error. `content-length`, `transfer-encoding`, `connection` and `date` are
   the server's, whatever is given.
+- A page whose route, group middleware or server fn reads `request.headers`,
+  `request.cookies` or `request.ip`, or passes `request` on, is `private`, whatever its
+  status, and a translated page varies by `Accept-Language` and `Cookie`. Middleware that
+  cannot be read, a factory's too, makes its pages private; it is read once.
 - A header's value is text, or a number. `null` means no such header: none is sent, not
   even the one Quillo would send itself, as in `site_headers`, so `{ "cache-control": null }`
   leaves out the `private` a page with a session gets, and `{ server: null }` the
@@ -3921,11 +3928,17 @@ curl -i localhost:8080/_quillo/rpc/transfer -H "Idempotency-Key: k-77" --json '[
   "7d" }` (seconds, or a duration as for cookies, up to 366 days) keeps them longer.
   Expired ones are deleted as requests come. When the database that keeps them cannot
   be reached, the request is answered 503.
-- Keys belong to the tenant, the mount point and the user: `session().user`, or the
-  `user` option for a request that names its caller otherwise (`{ user:
-  token.owner }`). The same key from another user is another request, and cannot read
-  this one's answer. Without a user (no session), keys are the clients' own random
-  values, shared by everyone who knows one.
+- A key runs at most once, whoever asks, within the tenant and the mount point. Who may
+  see its answer is compared at the strongest level both sides have: the `user` option
+  (a str or an int, as `{ user: token.owner }`), then the session (a hidden id its cookie
+  carries, or an older cookie's `session().user`), then each of `Authorization`,
+  `Proxy-Authorization`, `X-Api-Key`, `Api-Key`, `X-Auth-Token` and `X-Access-Token`,
+  then nobody. The same gets the answer. Different, or no level in common, gets 409, with
+  nothing run or shown, also after signing out or losing a cookie: the work is never done
+  twice. A plain cookie is not seen. The `user` option gives each user a row of their
+  own, so two accounts may use one key; clients sharing keys without it get the 409, so
+  pass `{ user }` or use unique keys. A header key and a form field's key are two keys,
+  and rows from before 0.8 have no owners.
 - Without the header, `f` simply runs; `{ required: true }` answers 400 instead.
   Outside a request (a script, a job), `f` runs.
 - **A plain form** cannot send a header, so `<form method="post" idempotent>` carries a key
@@ -4009,7 +4022,9 @@ commits: the work and its answer are kept together, or neither is.
   fn's error value is not kept: the page's retry asks again.
 - If the server stops (or loses the database) part way, the database rolls the
   transaction back, and the claim is left. A minute after it was made, the next request
-  with the key takes it over and runs. If the first was only slow, and is still running
+  with the key, from the same visitor, takes it over and runs; without a transaction
+  (`transaction: false`) every try gets 409 until the key expires, so keep `max_age`
+  longer than such work. If the first was only slow, and is still running
   then, at most one of the two commits: the claim is taken over only while it is not
   answered, and an answer is written only by the claim's holder, in its transaction; the
   other rolls back and gets the first's answer, or 409.

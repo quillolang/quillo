@@ -35,7 +35,7 @@ static NEXT_CODE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 /// Builtins that change something: a page prefetched does not call them
 /// (see `Interp::no_writes`).
-const CHANGES: &[&str] = &[
+pub(crate) const CHANGES: &[&str] = &[
     "db.exec",
     "db.migrate",
     "db.atomic",
@@ -168,9 +168,14 @@ pub struct Interp {
     pub set_cookies: Vec<String>,
     /// The request's session, once read or set.
     pub session: Option<Value>,
+    /// Its hidden id, once read or made; `Some(None)` once it ended (see `session::session_id`).
+    pub(crate) session_id: Option<Option<Arc<str>>>,
     /// The answer read who the visitor is, from a cookie: one visitor's, for caches to keep
     /// apart (FEEDBACK31.md, Q-391; branch feedback27-35-fixes).
     pub visitor_read: bool,
+    /// The answer was made in the visitor's language: it varies by what chose it
+    /// (FEEDBACK55.md, Q-886; branch feedback55).
+    pub locale_read: bool,
     /// A request is being answered, the parts made after its route (a stream, a deferred
     /// part) included: code here runs for someone (see `wt::reach`).
     pub answering: bool,
@@ -192,6 +197,10 @@ pub struct Interp {
     /// The request being handled, when its map has not been made yet (see
     /// `RouteDef::uses_request`): made on first use by `request_value`.
     pub(crate) pending_request: Option<crate::server::PendingRequest>,
+    /// The request being answered, and whose a kept value of it is once that was asked (see
+    /// `Asked`, `Interp::who`).
+    pub(crate) asked: Option<crate::server::Asked>,
+    pub(crate) who: Option<u64>,
     /// State of the components being rendered, innermost last, with the
     /// `live(...)` subscriptions of each.
     islands: Vec<(Map, Map)>,
@@ -217,6 +226,10 @@ pub struct Interp {
     /// The code read the request (its session, cookies, headers): what it
     /// made is this viewer's (FEEDBACK2.md, Q-028; branch feedback6-fixes).
     pub read_request: bool,
+    /// A `live` run is under way, in `unwatched` too; and it acted (see `viewcache::Kind::Acts`):
+    /// what it made goes to no one else (FEEDBACK55.md, Q-888; branch feedback55).
+    pub in_run: bool,
+    pub acted: bool,
     /// The subscription the last `live(...)` call set up, for `state`.
     pub last_live: Option<Value>,
     /// Open `db.transaction`s, and changes to announce when they commit.
@@ -511,7 +524,9 @@ struct Back {
     cookies: Vec<String>,
     session: Option<Value>,
     visitor_read: bool,
+    locale_read: bool,
     read_request: bool,
+    acted: bool,
     /// What it announced while answering another service's call, and whether it wrote to the
     /// database (FEEDBACK55.md, Q-796, found in review; branch feedback55).
     published: Option<Vec<String>>,
@@ -723,13 +738,6 @@ fn sheet_text(v: &Value) -> String {
         Value::List(items) => items.iter().map(|x| x.display()).collect::<Vec<_>>().join("\n"),
         other => other.display(),
     }
-}
-
-/// The request's fields that are the visitor's own: its cookies, and the headers that carry
-/// them or credentials (see `Interp::read_credential`).
-#[inline]
-fn credential(name: &str) -> bool {
-    matches!(name, "cookies" | "cookie" | "authorization")
 }
 
 /// The builtins that make a quotient of two ints whole in ints (`floor(a / b)`; FEEDBACK55.md,
@@ -1597,7 +1605,9 @@ impl Interp {
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
+            session_id: None,
             visitor_read: false,
+            locale_read: false,
             answering: false,
             locale: None,
             program: Arc::new(Vec::new()),
@@ -1608,6 +1618,8 @@ impl Interp {
             styles: Default::default(),
             current_request: None,
             pending_request: None,
+            asked: None,
+            who: None,
             islands: Vec::new(),
             select_pending: None,
             select_want: None,
@@ -1619,6 +1631,8 @@ impl Interp {
             pg_tx: std::sync::Mutex::new(Vec::new()),
             reads: None,
             read_request: false,
+            in_run: false,
+            acted: false,
             last_live: None,
             tx_depth: 0,
             pending: Vec::new(),
@@ -1710,7 +1724,9 @@ impl Interp {
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
+            session_id: None,
             visitor_read: false,
+            locale_read: false,
             answering: false,
             locale: None,
             program: self.program.clone(),
@@ -1721,6 +1737,8 @@ impl Interp {
             styles: self.styles.clone(),
             current_request: None,
             pending_request: None,
+            asked: None,
+            who: None,
             islands: Vec::new(),
             select_pending: None,
             select_want: None,
@@ -1732,6 +1750,8 @@ impl Interp {
             pg_tx: std::sync::Mutex::new(Vec::new()),
             reads: None,
             read_request: false,
+            in_run: false,
+            acted: false,
             last_live: None,
             tx_depth: 0,
             pending: Vec::new(),
@@ -1875,6 +1895,12 @@ impl Interp {
 
     /// The renders being cached used the locale: they are kept per locale.
     pub fn note_locale(&mut self) {
+        self.locale_read = true;
+        // A rule of the program's can read anything of the visitor's (FEEDBACK55.md, Q-886; branch
+        // feedback55).
+        if self.site.locale_rule.is_some() {
+            self.visitor_read = true;
+        }
         for t in &mut self.tracks {
             t.locale = true;
         }
@@ -1884,6 +1910,20 @@ impl Interp {
     pub(crate) fn mark_impure(&mut self) {
         for t in &mut self.tracks {
             t.impure = true;
+        }
+    }
+
+    /// What a builtin called in a render being kept or a `live` run does to it (see
+    /// `viewcache::Kind`).
+    fn note_builtin(&mut self, name: &'static str) {
+        use crate::viewcache::Kind;
+        match crate::viewcache::kind_of(name) {
+            Kind::Pure => {}
+            Kind::Reads => self.mark_impure(),
+            Kind::Acts => {
+                self.mark_impure();
+                self.acted = true;
+            }
         }
     }
 
@@ -1951,8 +1991,8 @@ impl Interp {
     pub fn request_value(&mut self) -> Option<Value> {
         self.read_request = true;
         if self.current_request.is_none() {
-            if let Some(p) = &self.pending_request {
-                let mut r = p.make();
+            if let (Some(p), Some(req)) = (&self.pending_request, self.asked()) {
+                let mut r = p.make(req);
                 // `request.id`: the id calls to services pass on.
                 if let (Value::Map(m), Some(id)) = (&mut r, &self.request_id) {
                     Arc::make_mut(m).insert("id".into(), Value::str(&**id));
@@ -2124,7 +2164,9 @@ impl Interp {
             cookies: std::mem::take(&mut self.set_cookies),
             session: self.session.take(),
             visitor_read: self.visitor_read,
+            locale_read: self.locale_read,
             read_request: self.read_request,
+            acted: self.acted,
             published: self.published.take(),
             wrote_req: self.wrote_req,
         }
@@ -2132,7 +2174,9 @@ impl Interp {
 
     fn take_back(&mut self, b: Back) {
         self.visitor_read |= b.visitor_read;
+        self.locale_read |= b.locale_read;
         self.read_request |= b.read_request;
+        self.acted |= b.acted;
         if let Some(p) = b.published {
             self.note_published(p);
         }
@@ -2152,7 +2196,8 @@ impl Interp {
         it.allowed = self.allowed;
         it.restrictor = self.restrictor.clone();
         it.in_component = self.in_component;
-        it.current_request = self.current_request.clone().or_else(|| self.pending_request.as_ref().map(|p| p.make()));
+        it.current_request = self.current_request.clone().or_else(|| self.pending_request.as_ref().zip(self.asked()).map(|(p, req)| p.make(req)));
+        it.in_run = self.in_run;
         it.tenant = self.tenant.clone();
         it.tenant_named = self.tenant_named;
         it.request_id = self.request_id.clone();
@@ -2180,6 +2225,10 @@ impl Interp {
             self.tenant = Some(None);
             return None;
         };
+        // Told by the program's own rule, from anything in the request, the page is the visitor's.
+        // A run is kept by the tenant in force, whoever told it (see `run_scope`; FEEDBACK55.md,
+        // Q-879; branch feedback55).
+        self.visitor_read |= matches!(rule, crate::site::TenantRule::Function(_));
         let Some(Value::Map(req)) = self.request_value() else { return None };
         let found = match rule {
             crate::site::TenantRule::Subdomain(domain) => {
@@ -2508,6 +2557,7 @@ impl Interp {
                     nesting: 0,
                     file: None,
                     hot: Default::default(),
+                    request_use: Default::default(),
                 });
                 define(env, &td.name, Value::Func(Arc::new(Closure { def, env: env.clone() })));
                 Ok(Value::Nil)
@@ -2853,14 +2903,11 @@ impl Interp {
                 // A local map's field, without a copy of the map.
                 if let Expr::Ident(var, _) = &**obj {
                     let found = with_local(env, var, |v| match v {
-                        Value::Map(m) if m.len() <= 8 => m.iter().find(|(k, _)| k.as_str() == name).map(|(_, x)| (x.clone(), credential(name).then(|| m.clone()))),
-                        Value::Map(m) => m.get(name.as_str()).cloned().map(|x| (x, credential(name).then(|| m.clone()))),
+                        Value::Map(m) if m.len() <= 8 => m.iter().find(|(k, _)| k.as_str() == name).map(|(_, x)| x.clone()),
+                        Value::Map(m) => m.get(name.as_str()).cloned(),
                         _ => None,
                     });
-                    if let Some(Some((x, of))) = found {
-                        if let Some(m) = of {
-                            self.read_credential(&m);
-                        }
+                    if let Some(Some(x)) = found {
                         return Ok(x);
                     }
                 }
@@ -3616,12 +3663,7 @@ impl Interp {
                 let n = if *n < 0 { l.len() as i64 + n } else { *n };
                 Ok(if n >= 0 { l.get(n as usize).cloned().unwrap_or(Value::Nil) } else { Value::Nil })
             }
-            (Value::Map(m), Value::Str(k)) => {
-                if &**k == "cookies" || k.eq_ignore_ascii_case("cookie") || k.eq_ignore_ascii_case("authorization") {
-                    self.read_credential(m);
-                }
-                Ok(m.get(&**k).cloned().unwrap_or(Value::Nil))
-            }
+            (Value::Map(m), Value::Str(k)) => Ok(m.get(&**k).cloned().unwrap_or(Value::Nil)),
             // Keys are text: a number is the key it is written as, as for
             // `set` and `get`.
             (Value::Map(m), Value::Int(n)) => Ok(m.get(n.to_string().as_str()).cloned().unwrap_or(Value::Nil)),
@@ -3985,18 +4027,6 @@ impl Interp {
     }
 
     /// `v.name`, read where `env` is the scope of the code that reads it.
-    /// `m` is the request, or its headers, and its cookies or credentials were read: the page
-    /// is the visitor's, as one `session()` or `cookie()` made is. `request.cookies` made a page
-    /// a cache in front kept for everyone (FEEDBACK51.md, Q-669; branch feedback51-fixes).
-    #[cold]
-    fn read_credential(&mut self, m: &Arc<Map>) {
-        if let Some(Value::Map(r)) = &self.current_request {
-            if Arc::ptr_eq(m, r) || matches!(r.get("headers"), Some(Value::Map(h)) if Arc::ptr_eq(h, m)) {
-                self.visitor_read = true;
-            }
-        }
-    }
-
     fn get_field(&mut self, v: Value, name: &str, env: &Env, line: u32) -> Result<Value, Ctrl> {
         match &v {
             Value::Nil => return Ok(Value::Nil),
@@ -4006,11 +4036,7 @@ impl Interp {
                 // A record's few fields are found faster in order than hashed.
                 let found = if m.len() <= 8 { m.iter().find(|(k, _)| k.as_str() == name).map(|(_, x)| x) } else { m.get(name) };
                 if let Some(x) = found {
-                    let x = x.clone();
-                    if credential(name) {
-                        self.read_credential(m);
-                    }
-                    return Ok(x);
+                    return Ok(x.clone());
                 }
             }
             Value::Response(r) => match name {
@@ -4113,8 +4139,8 @@ impl Interp {
                 if self.stop.is_some() {
                     self.stopped_here(line)?;
                 }
-                if !self.tracks.is_empty() && crate::viewcache::impure_builtin(name) {
-                    self.mark_impure();
+                if self.in_run || !self.tracks.is_empty() {
+                    self.note_builtin(name);
                 }
                 if name.starts_with("native:") {
                     return crate::native::call(self, name, args, line);
@@ -4471,10 +4497,13 @@ impl Interp {
             }
             // `request` given to a server fn is read only if its code names
             // it: a live loader that does not is shared between viewers
-            // (FEEDBACK2.md, Q-028; branch feedback6-fixes).
-            if self.reads.is_some() && !was && !crate::parser::names_request(&def.body) {
+            // (FEEDBACK2.md, Q-028; branch feedback6-fixes). Its code is all of it, the
+            // defaults of its parameters too (FEEDBACK55.md, Q-880; branch feedback55).
+            let (names, visitor) = def.request_use();
+            if self.reads.is_some() && !was && !names {
                 self.read_request = false;
             }
+            self.visitor_read |= visitor;
         }
         let mut it = args.into_iter();
         for p in &def.params {

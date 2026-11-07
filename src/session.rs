@@ -27,7 +27,7 @@
 use crate::crypto::{b64url, hmac_sha256, unb64url};
 use crate::interp::{fail, Ctrl, Interp};
 use crate::value::*;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 type R = Result<Value, Ctrl>;
 
@@ -93,8 +93,8 @@ fn sign(ctx: &str, payload: &str) -> String {
     b64url(&hmac_sha256(key(), &msg))
 }
 
-/// The session in a cookie value, if it is signed for here and current.
-fn open(ctx: &str, cookie: &str) -> Option<Value> {
+/// The session in a cookie value, and its hidden id, if it is signed for here and current.
+fn open(ctx: &str, cookie: &str) -> Option<(Value, Option<String>)> {
     let (payload, sig) = cookie.split_once('.')?;
     if !crate::crypto::same(sign(ctx, payload).as_bytes(), sig.as_bytes()) {
         return None;
@@ -106,7 +106,73 @@ fn open(ctx: &str, cookie: &str) -> Option<Value> {
     }
     // Decimals and ints past 2^53 come back as they went, as an island's do, not as text
     // that `+` would join (FEEDBACK30.md, Q-374; branch feedback27-35-fixes).
-    Some(crate::interp::from_island_json(j.get("d")?))
+    Some((crate::interp::from_island_json(j.get("d")?), j.get("i").and_then(|i| i.as_str()).map(str::to_string)))
+}
+
+/// The session the request came with, and its hidden id. One valid among others is the session;
+/// two are none, since one of them was planted (by a sibling subdomain, say).
+fn arrived(it: &mut Interp) -> Option<(Value, Option<String>)> {
+    let ctx = context(it);
+    let mut valid: Vec<(Value, Option<String>)> = cookies(it).iter().filter_map(|v| open(&ctx, v)).collect();
+    if valid.len() == 1 {
+        valid.pop()
+    } else {
+        None
+    }
+}
+
+/// What a session says of who the visitor is, for an `Idempotency-Key`'s owners: its hidden id,
+/// which stays from the first `set_session` to `end_session`, whatever else it comes to hold. One
+/// with no id (from before there were ids, or too full for one) says `user`, when that is a name,
+/// and else the session itself: a false refusal is fine where `nobody` would be anyone.
+fn owner_in(id: Option<&str>, data: &Value) -> Option<String> {
+    if let Some(id) = id {
+        return Some(format!("id {}", id));
+    }
+    let Value::Map(m) = data else { return None };
+    match m.get("user") {
+        _ if m.is_empty() => None,
+        Some(u @ (Value::Str(_) | Value::Int(_))) => Some(format!("user {}", u.display())),
+        _ => Some(format!("session {}", crate::interp::island_json(data))),
+    }
+}
+
+/// That, of the session the request came with.
+pub(crate) fn arrived_owner(it: &mut Interp) -> Option<String> {
+    arrived(it).and_then(|(data, id)| owner_in(id.as_deref(), &data))
+}
+
+/// That, of the session as it is now, which the answer's cookie will carry.
+pub(crate) fn current_owner(it: &mut Interp) -> Option<String> {
+    match (&it.session_id, &it.session) {
+        (None, _) => arrived_owner(it),
+        (Some(id), Some(data)) => owner_in(id.as_deref(), data),
+        (Some(id), None) => id.as_deref().map(|id| format!("id {}", id)),
+    }
+}
+
+/// `session().user` of the session the request came with, for rows from before owners.
+pub(crate) fn old_user(it: &mut Interp) -> Option<Value> {
+    match arrived(it) {
+        Some((Value::Map(m), _)) => m.get("user").filter(|u| !matches!(u, Value::Nil)).cloned(),
+        _ => None,
+    }
+}
+
+/// The id `set_session` writes: the session's own, kept, or a new one for a session new in this
+/// request. `session()` never shows it. It is not made anew at sign-in, from no `user` to one, as
+/// a session's id usually should be: this one is no credential, the cookie's signature is, and
+/// the owners kept at the end of the work already cover a work that signs in. From one `user` to
+/// another it is (see `set_session`): Bob on Alice's browser is not Alice (FEEDBACK55.md, Q-887;
+/// branch feedback55).
+fn session_id(it: &mut Interp) -> Arc<str> {
+    if let Some(Some(id)) = &it.session_id {
+        return id.clone();
+    }
+    let id = if it.session_id.is_none() { arrived(it).and_then(|(_, id)| id) } else { None };
+    let id: Arc<str> = id.unwrap_or_else(|| crate::service::new_id(32)).into();
+    it.session_id = Some(Some(id.clone()));
+    id
 }
 
 /// `payload`, signed with the session key for `purpose`: something the
@@ -439,11 +505,7 @@ fn session(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
     if let Some(s) = &it.session {
         return Ok(s.clone());
     }
-    let ctx = context(it);
-    let mut valid: Vec<Value> = cookies(it).iter().filter_map(|v| open(&ctx, v)).collect();
-    // One valid among others is the session; two are none, since one of
-    // them was planted (by a sibling subdomain, say).
-    let found = if valid.len() == 1 { valid.remove(0) } else { Value::map(Map::new()) };
+    let found = arrived(it).map_or_else(|| Value::map(Map::new()), |(d, _)| d);
     it.session = Some(found.clone());
     Ok(found)
 }
@@ -480,17 +542,40 @@ fn set_session(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             _ => return fail(line, format!("`set_session`'s max_age is seconds or a duration like \"30d\", got {}", v.repr())),
         },
     };
-    let stored = serde_json::json!({ "e": now() + age, "d": crate::interp::island_json(&data) });
+    let mut stored = serde_json::json!({ "e": now() + age, "d": crate::interp::island_json(&data) });
     // Read back as JSON at most `JSON_NESTING` deep: one deeper was stored, and the next request
     // had no session (FEEDBACK55.md, Q-875's second review; branch feedback55).
     if crate::value::json_value_depth(&stored) > crate::value::JSON_NESTING {
         return fail(line, format!("`set_session`'s map nests more than {} deep as it is stored, which no request could read back: keep it flatter, or the rest in the database", crate::value::JSON_NESTING));
     }
-    let mut json = Vec::new();
-    serde_json::to_writer(&mut json, &stored).ok();
-    let payload = b64url(&json);
     let ctx = context(it);
-    let value = format!("{}.{}", payload, sign(&ctx, &payload));
+    let seal = |stored: &serde_json::Value| {
+        let mut json = Vec::new();
+        serde_json::to_writer(&mut json, stored).ok();
+        let payload = b64url(&json);
+        let signed = sign(&ctx, &payload);
+        format!("{}.{}", payload, signed)
+    };
+    let bare = seal(&stored);
+    let user_of = |v: &Value| match v {
+        Value::Map(m) => m.get("user").filter(|u| !matches!(u, Value::Nil)).cloned(),
+        _ => None,
+    };
+    let was = it.session.clone().or_else(|| arrived(it).map(|(d, _)| d));
+    if let (Some(a), Some(b)) = (was.as_ref().and_then(user_of), user_of(&data)) {
+        if !crate::value::equal(&a, &b) {
+            it.session_id = Some(None);
+        }
+    }
+    stored["i"] = serde_json::json!(&*session_id(it));
+    let mut value = seal(&stored);
+    // What a program can keep in a session is what it always was: an id that does not fit is left
+    // out, and an `Idempotency-Key` goes by what else says who this is (FEEDBACK55.md, Q-887; branch
+    // feedback55).
+    if value.len() > MAX_COOKIE {
+        value = bare;
+        it.session_id = Some(None);
+    }
     if value.len() > MAX_COOKIE {
         return fail(
             line,
@@ -506,5 +591,6 @@ fn set_session(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn end_session(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
     send_cookie(it, "", Some(0), line)?;
     it.session = Some(Value::map(Map::new()));
+    it.session_id = Some(None);
     Ok(Value::Nil)
 }

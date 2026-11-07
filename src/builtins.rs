@@ -3632,26 +3632,31 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let rest: Vec<Value> = args[1..].to_vec();
     // A page load shares a run as a refresh does: a thousand arrivals are not a
     // thousand runs (FEEDBACK24.md, Q-193; branch feedback24-fixes).
-    let key = it.live_key(&name, &rest);
+    let scope = it.run_scope();
+    let everyone = crate::livecache::everyone(&scope);
+    let key = it.live_key(&name, &rest, &scope);
     let (found, landing) = match &key {
-        Some((k, viewer)) => it.live_turn(k, *viewer),
+        Some(k) => it.live_turn(k),
         None => (None, None),
     };
-    let (r, mut topics, kept) = match found {
+    let (r, mut topics, kept, personal) = match found {
         Some((a, topics, _)) => {
             crate::metrics::live_run(true);
             if let Some(o) = &mut it.reads {
                 o.extend(topics.iter().cloned());
             }
-            (Ok(crate::interp::from_island_json(&a.value)), topics, Some(a))
+            (Ok(crate::interp::from_island_json(&a.value)), topics, Some(a), false)
         }
         None => {
             crate::metrics::live_run(false);
             let seq = it.shared.live_seq();
-            let (cookies, own, read) = (it.set_cookies.len(), it.own_seqs.len(), it.read_request);
+            let (cookies, own, read, acted) = (it.set_cookies.len(), it.own_seqs.len(), it.read_request, it.acted);
             it.read_request = false;
+            it.acted = false;
             let outer = it.reads.replace(std::collections::HashSet::new());
+            let in_run = std::mem::replace(&mut it.in_run, true);
             let r = it.call(&f, rest.clone(), line);
+            it.in_run = in_run;
             let topics = std::mem::replace(&mut it.reads, outer).unwrap_or_default();
             if let Some(o) = &mut it.reads {
                 o.extend(topics.iter().cloned());
@@ -3660,19 +3665,25 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             topics.sort();
             let personal = it.read_request;
             it.read_request |= read;
+            // What it did is told to a run around it; one that read the viewer or acted is no one
+            // else's, even the viewer's other tab (FEEDBACK55.md, Q-881 and Q-888; branch
+            // feedback55).
+            let did = it.acted;
+            it.acted |= acted;
+            let nobody_elses = personal || did;
             let answer = r.as_ref().ok().filter(|v| !matches!(v, Value::Err(..) | Value::Response(_)) && crate::server::hidden(v).is_none()).map(|v| {
                 Arc::new(crate::value::js_numbers(false, || crate::livecache::Answer::new(crate::interp::island_json(v), false)))
             });
-            if let (Some((k, viewer)), Some(a)) = (key, &answer) {
-                if it.set_cookies.len() == cookies && it.own_seqs.len() == own && it.shared.unchanged_since(&topics, seq) {
+            if let (Some(k), Some(a)) = (key, &answer) {
+                if !nobody_elses && it.set_cookies.len() == cookies && it.own_seqs.len() == own && it.shared.unchanged_since(&topics, seq) {
                     let mut cache = it.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    cache.share(k, personal.then_some(viewer), seq, topics.clone(), a.clone());
+                    cache.share(k, seq, topics.clone(), a.clone());
                 }
             }
             if let Some(mut l) = landing {
-                l.personal = personal;
+                l.personal = nobody_elses;
             }
-            (r, topics, answer)
+            (r, topics, answer, personal)
         }
     };
     topics.sort();
@@ -3686,7 +3697,11 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if let Ok(v) = &r {
         if !matches!(v, Value::Err(..)) {
             let a = kept.unwrap_or_else(|| Arc::new(crate::value::js_numbers(false, || crate::livecache::Answer::new(crate::interp::island_json(v), false))));
-            it.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keep(a.h, &a.text);
+            // A viewer's value is theirs (FEEDBACK55.md, Q-884; branch feedback55); with no
+            // request to tell them by, it is not kept.
+            if let Some(owner) = if personal { it.who() } else { Some(everyone) } {
+                it.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keep(a.h, &a.text, owner);
+            }
             info.insert("h".into(), Value::str(&crate::livecache::hash_text(a.h)));
         }
     }

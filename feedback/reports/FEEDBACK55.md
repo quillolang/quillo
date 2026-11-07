@@ -1989,6 +1989,22 @@ route GET / {
 
 **Fixed:** `quillo check` warns of a `redirect` or `respond` that is not the code's answer, in an `if`, an `else`, a `match` arm or alone, and says to write `reply 303 redirect(...)` or `return respond(...)`.
 
+### Q-878 to Q-888. What an audit after Q-876 found: everything shared between requests
+
+**Kind:** silent, security. All reproduced with two visitors, on the fixed binary; in 0.7.0, and most in 0.6.0. **Decided (2026-11-07):** a run that read the visitor is shared with nobody, which removed the viewer from the run key and with it a list of ignored headers that let `Referer` reach another visitor; and for one idempotency key the work runs at most once, whoever asks: owners only decide who sees the answer, and no match is a loud 409, accepted over a second run or a false receipt.
+
+- **Q-878.** The view cache kept a view calling a service, a site or the clock until restart: Bob saw `Bearer alice`. Builtins are now an allow-list (`viewcache.rs:kind`), and a test fails on one not said.
+- **Q-879.** The kept tenant was not marked, and the tenant was not in the run key: Globex saw `acme-secret`. The tenant in force is in every run key.
+- **Q-880.** `request` in a parameter, pattern or lambda default went unseen: Bob got `alice`. The walkers have no catch-all arm, so a new form does not compile until handled.
+- **Q-881.** Viewers were told by five fields: `X-Api-Key`, `?token=`, `X-Forwarded-For` reached the next visitor. Gone with the design above.
+- **Q-882.** `RunKey` had no mount point: `/two` showed `one-private`.
+- **Q-883.** A worker kept a finished request through a raw pointer, read after it was freed: a job saw `query=reset-token-of-alice`, a channel handler the same, and Alice received `stream of bob`. One pointer now, set and cleared only by a drop guard.
+- **Q-884.** Kept values answered to a zero-key hash: Bob computed hashes offline and found Alice's PIN in 200 guesses through `x-quillo-had`. A keyed hash from `QUILLO_SECRET`, and values are kept per owner.
+- **Q-885.** A kept run lost its marks: a reload lost `Cache-Control: private`. Gone with the design above.
+- **Q-886.** No `private` on a 4xx page showing the session, through `get`, `values` or patterns on `request`, or `Vary` on a translated page. One parse-time rule, `parser.rs:request_use`.
+- **Q-887.** Idempotency read only `session().user`, so a session of `{ uid }` shared keys. Redesigned as decided above, over four reviews: a first version keyed on the whole session charged twice.
+- **Q-888.** A run with `crypto.token`, `random` or a write was shared: two visitors got one token, and a second `write_file` was skipped. Such a run is not shared, nor one running a statement that is not a plain read.
+
 ## What behaves well
 
 Counts are cases. Most of the sweep is here: about 6,900 of its 7,500 cases gave the right answer.

@@ -8,14 +8,17 @@
 //!   moment (`SHARED_FOR`): the other pages asking for the same function
 //!   with the same arguments while none of those topics changed get it
 //!   without running the loader again. A run that read the request (the
-//!   session, cookies, headers, the locale) is shared only with the same
-//!   viewer's pages; one that wrote, set a cookie or answered with a
-//!   response of its own is not kept.
+//!   session, cookies, headers, the locale), wrote anything, made something
+//!   of its own (`viewcache::Kind::Acts`), set a cookie or answered with a
+//!   response of its own is not kept, for anyone: what told viewers apart
+//!   was a list of what identifies nobody, and `Referer` was on it.
 //! - Patches. Each live answer carries a hash of the value. The page sends
 //!   back the hash of the value it has (`x-quillo-had`), and when the server
 //!   still knows that value, the answer is what changed instead of the whole
 //!   value. Lists of rows are matched by `id`, so a row moved, added or
-//!   changed costs that row, not the list.
+//!   changed costs that row, not the list. A viewer's value is kept for that
+//!   viewer, a tenant's for that tenant, and the hashes have a key nobody
+//!   outside can work out: nobody else can make one, nor be answered against it.
 //!
 //! The patch format, which src/client/runtime.js `livePatched` applies:
 //!
@@ -38,23 +41,45 @@ use std::time::{Duration, Instant};
 /// How long a run is shared: the pages told of one change ask within it.
 pub const SHARED_FOR: Duration = Duration::from_secs(2);
 
-/// Values kept to make patches against, and patches, in bytes of JSON.
+/// Values kept to make patches against, and patches, in bytes.
 const KEPT_BYTES: usize = 64 << 20;
+/// What keeping a value costs besides its text, as near as it can be said: its place in the map
+/// and its allocation. Counted by their text alone, a million values of `1` were nothing, and the
+/// process grew without end (FEEDBACK55.md, Q-884, found in review; branch feedback55).
+const KEPT_ENTRY: usize = 160;
 /// How many values are looked at to choose the one to let go.
 const CANDIDATES: usize = 4;
 
+/// Whose a kept value is, when it read nobody, in a program with no tenants or mounts (see
+/// `everyone`): a viewer's is under their `Interp::who`.
+pub const EVERYONE: u64 = 0;
+
+/// Whose a run for everyone is, in `scope`: everyone there. Another tenant's are not theirs.
+pub fn everyone(scope: &str) -> u64 {
+    if scope.is_empty() {
+        EVERYONE
+    } else {
+        hash(scope)
+    }
+}
+
 #[derive(Default)]
 pub struct LiveCache {
-    runs: HashMap<RunKey, Vec<Run>>,
-    values: HashMap<u64, Kept>,
+    runs: HashMap<RunKey, Run>,
+    /// By the value's hash and whose it is: one store for all viewers answered a page that said
+    /// it had any value, and the patch told it what that viewer's held, so that Bob found Alice's
+    /// PIN with hashes he worked out at home (FEEDBACK55.md, Q-884; branch feedback55).
+    values: HashMap<(u64, u64), Kept>,
     bytes: usize,
-    patches: HashMap<(u64, u64), Arc<str>>,
+    patches: HashMap<((u64, u64), u64), Arc<str>>,
     patch_bytes: usize,
     swept: Option<Instant>,
-    /// Runs under way, and the runs known to read the request, which cannot be
-    /// given to another viewer, so that nothing waits for them.
+    /// Runs under way, and the runs known to read the request or to act, which cannot be
+    /// given to anyone, so that nothing waits for them.
     flights: HashMap<RunKey, Arc<Flight>>,
-    personal: HashSet<RunKey>,
+    /// By the hash of the key, as a key holds its arguments: 4,096 of a megabyte each were 4 GB
+    /// (FEEDBACK55.md, Q-881, found in review; branch feedback55).
+    personal: HashSet<u64>,
 }
 
 /// A run under way. On a database that lets go of the lock while it works, the
@@ -88,17 +113,15 @@ pub enum Begun {
     Run,
     /// It waits for the run under way.
     Wait(Arc<Flight>),
-    /// It runs, beside the others: each viewer's run is its own.
+    /// It runs, beside the others: its run is nobody else's.
     Alone,
 }
 
-/// The function, its arguments as the page sent them, and the host (each
-/// tenant has its own data).
-pub type RunKey = (String, Vec<u8>, String);
+/// Whose it is (`Interp::run_scope`: the program and the tenant in force, however it was named),
+/// the function, its arguments as the page sent them, and the host.
+pub type RunKey = (String, String, Vec<u8>, String);
 
 struct Run {
-    /// The viewer, when the run read the request.
-    viewer: Option<u64>,
     seq: u64,
     topics: Vec<String>,
     at: Instant,
@@ -135,16 +158,18 @@ struct Kept {
 impl LiveCache {
     /// A run another page made that this one may have: the answer, its
     /// topics and the sequence number it was made at.
-    pub fn shared(&mut self, key: &RunKey, viewer: u64, unchanged: impl Fn(&[String], u64) -> bool) -> Option<Shared> {
-        let runs = self.runs.get_mut(key)?;
-        runs.retain(|r| r.at.elapsed() < SHARED_FOR);
-        let r = runs.iter().rev().find(|r| r.viewer.map_or(true, |v| v == viewer) && unchanged(&r.topics, r.seq))?;
-        Some((r.answer.clone(), r.topics.clone(), r.seq))
+    pub fn shared(&mut self, key: &RunKey, unchanged: impl Fn(&[String], u64) -> bool) -> Option<Shared> {
+        let r = self.runs.get(key)?;
+        if r.at.elapsed() >= SHARED_FOR {
+            self.runs.remove(key);
+            return None;
+        }
+        unchanged(&r.topics, r.seq).then(|| (r.answer.clone(), r.topics.clone(), r.seq))
     }
 
     /// A call with no answer to share, for `key`.
     pub fn begin(&mut self, key: &RunKey) -> Begun {
-        if self.personal.contains(key) {
+        if self.personal.contains(&key_hash(key)) {
             return Begun::Alone;
         }
         if let Some(f) = self.flights.get(key) {
@@ -155,7 +180,7 @@ impl LiveCache {
     }
 
     /// The run `begin` said to make has ended, whatever became of it; `personal`
-    /// if it read the request.
+    /// if it can be nobody else's.
     pub fn land(&mut self, key: &RunKey, personal: bool) {
         if let Some(f) = self.flights.remove(key) {
             f.end();
@@ -164,53 +189,47 @@ impl LiveCache {
             if self.personal.len() >= 4096 {
                 self.personal.clear();
             }
-            self.personal.insert(key.clone());
+            self.personal.insert(key_hash(key));
         } else {
-            self.personal.remove(key);
+            self.personal.remove(&key_hash(key));
         }
     }
 
-    pub fn share(&mut self, key: RunKey, viewer: Option<u64>, seq: u64, topics: Vec<String>, answer: Arc<Answer>) {
+    pub fn share(&mut self, key: RunKey, seq: u64, topics: Vec<String>, answer: Arc<Answer>) {
         if self.runs.len() > 256 && self.swept.map_or(true, |t| t.elapsed() >= Duration::from_secs(1)) {
             self.swept = Some(Instant::now());
-            self.runs.retain(|_, rs| {
-                rs.retain(|r| r.at.elapsed() < SHARED_FOR);
-                !rs.is_empty()
-            });
+            self.runs.retain(|_, r| r.at.elapsed() < SHARED_FOR);
         }
-        let runs = self.runs.entry(key).or_default();
-        runs.retain(|r| r.at.elapsed() < SHARED_FOR && r.viewer != viewer);
-        runs.push(Run { viewer, seq, topics, at: Instant::now(), answer });
+        self.runs.insert(key, Run { seq, topics, at: Instant::now(), answer });
     }
 
     /// Drops the shared runs that read a topic under one of `wildcards` (`db:*`).
     pub fn forget_under(&mut self, wildcards: &[&str]) {
-        self.runs.retain(|_, rs| {
-            rs.retain(|r| !r.topics.iter().any(|t| wildcards.iter().any(|w| crate::shared::under(w, t))));
-            !rs.is_empty()
-        });
+        self.runs.retain(|_, r| !r.topics.iter().any(|t| wildcards.iter().any(|w| crate::shared::under(w, t))));
     }
 
-    /// Keeps a value a page now has, by its hash, for patches against it.
-    pub fn keep(&mut self, h: u64, text: &Arc<str>) {
-        if let Some(k) = self.values.get_mut(&h) {
+    /// Keeps a value a page now has, by its hash, for patches against it: `owner` is whose it is,
+    /// `everyone(scope)` or the viewer's `who`.
+    pub fn keep(&mut self, h: u64, text: &Arc<str>, owner: u64) {
+        let at = (h, owner);
+        if let Some(k) = self.values.get_mut(&at) {
             k.uses += 1;
             return;
         }
         if text.len() > KEPT_BYTES / 4 {
             return;
         }
-        self.bytes += text.len();
-        self.values.insert(h, Kept { text: text.clone(), uses: 1 });
+        self.bytes += text.len() + KEPT_ENTRY;
+        self.values.insert(at, Kept { text: text.clone(), uses: 1 });
         while self.bytes + self.patch_bytes > KEPT_BYTES {
             if self.patch_bytes > 0 {
                 self.patches.clear();
                 self.patch_bytes = 0;
                 continue;
             }
-            let Some(old) = self.least_used(h) else { break };
+            let Some(old) = self.least_used(at) else { break };
             if let Some(k) = self.values.remove(&old) {
-                self.bytes -= k.text.len();
+                self.bytes -= k.text.len() + KEPT_ENTRY;
             }
         }
     }
@@ -219,21 +238,25 @@ impl LiveCache {
     /// be asked for: dropping it, past the budget, would leave no patches at all
     /// where some random ones cost a part. Of a few, the one least used goes, as
     /// a value many pages have is worth more than one for a single viewer.
-    fn least_used(&self, not: u64) -> Option<u64> {
+    fn least_used(&self, not: (u64, u64)) -> Option<(u64, u64)> {
         let from = fastrand::usize(..self.values.len().min(1024));
         self.values.iter().skip(from).chain(self.values.iter()).filter(|(h, _)| **h != not).take(CANDIDATES).min_by_key(|(_, k)| k.uses).map(|(h, _)| *h)
     }
 
     /// The patch from the value hashed `from` to `to` (which is `new`), as text,
-    /// when `from` is still known; made once for all the pages that had it.
-    pub fn patch(&mut self, from: u64, to: u64, new: &J) -> Option<Arc<str>> {
+    /// when `from` is still known and is one of `owners`' (the asker's, and everyone's where they
+    /// are); made once for all the pages that had it. Another viewer's or another tenant's is not
+    /// there for them, whatever hash they bring: the answer is the same, and takes the same
+    /// lookups, as for a value nobody has (FEEDBACK55.md, Q-884; branch feedback55).
+    pub fn patch(&mut self, from: u64, to: u64, new: &J, owners: [u64; 2]) -> Option<Arc<str>> {
         if from == to {
             return Some(Arc::from("{\"$=\":1}"));
         }
-        if let Some(p) = self.patches.get(&(from, to)) {
+        let at = owners.into_iter().map(|o| (from, o)).find(|at| self.values.contains_key(at))?;
+        if let Some(p) = self.patches.get(&(at, to)) {
             return Some(p.clone());
         }
-        let kept = self.values.get_mut(&from)?;
+        let kept = self.values.get_mut(&at)?;
         kept.uses += 1;
         let old: J = serde_json::from_str(&kept.text).ok()?;
         let p: Arc<str> = diff(&old, new).to_string().into();
@@ -242,14 +265,41 @@ impl LiveCache {
             self.patch_bytes = 0;
         }
         self.patch_bytes += p.len();
-        self.patches.insert((from, to), p.clone());
+        self.patches.insert((at, to), p.clone());
         Some(p)
     }
 }
 
+/// The key of what is hashed here, from the site's secret: servers behind a balancer sharing
+/// `QUILLO_SECRET` agree on a value's hash, so a page that moves to another still gets a patch.
+/// Without one, a random key for this process. `DefaultHasher::new()` has no key, and anyone
+/// could work out the hash of a guess (FEEDBACK55.md, Q-884; branch feedback55).
+fn key_of(secret: &[u8]) -> (u64, u64) {
+    let k = crate::crypto::hmac_sha256(secret, b"quillo live values");
+    let half = |at: usize| k[at..at + 8].iter().fold(0u64, |n, b| n << 8 | *b as u64);
+    (half(0), half(8))
+}
+
+/// A hasher with that key.
+#[allow(deprecated)]
+pub fn hasher() -> std::hash::SipHasher {
+    static KEY: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    let (a, b) = *KEY.get_or_init(|| match std::env::var("QUILLO_SECRET") {
+        Ok(s) if !s.is_empty() => key_of(s.as_bytes()),
+        _ => key_of(&crate::crypto::secret_bytes(32)),
+    });
+    std::hash::SipHasher::new_with_keys(a, b)
+}
+
+fn key_hash(key: &RunKey) -> u64 {
+    let mut h = hasher();
+    key.hash(&mut h);
+    h.finish()
+}
+
 /// The hash a value's JSON text is known by.
 pub fn hash(text: &str) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = hasher();
     text.hash(&mut h);
     h.finish()
 }
@@ -464,8 +514,8 @@ mod tests {
         for round in 0..6 {
             for i in 0..100u64 {
                 asked += (round > 2) as u32;
-                found += (round > 2 && c.values.contains_key(&i)) as u32;
-                c.keep(i, &text(i));
+                found += (round > 2 && c.values.contains_key(&(i, EVERYONE))) as u32;
+                c.keep(i, &text(i), EVERYONE);
             }
         }
         assert!(c.bytes <= KEPT_BYTES);
@@ -477,27 +527,97 @@ mod tests {
         let text = |i: u64| -> Arc<str> { format!("[{}{}]", i, " ".repeat(1 << 20)).into() };
         let mut c = LiveCache::default();
         for _ in 0..50 {
-            c.keep(1_000_000, &text(1_000_000));
+            c.keep(1_000_000, &text(1_000_000), EVERYONE);
         }
         for i in 0..300 {
-            c.keep(i, &text(i));
+            c.keep(i, &text(i), EVERYONE);
         }
-        assert!(c.values.contains_key(&1_000_000));
+        assert!(c.values.contains_key(&(1_000_000, EVERYONE)));
     }
 
     #[test]
     fn patches_are_counted_and_let_go_first() {
         let mut c = LiveCache::default();
         let a: Arc<str> = "[1]".into();
-        c.keep(1, &a);
-        let p = c.patch(1, 2, &json!([1, 2])).unwrap();
+        c.keep(1, &a, EVERYONE);
+        let p = c.patch(1, 2, &json!([1, 2]), [7, EVERYONE]).unwrap();
         assert_eq!(c.patch_bytes, p.len());
-        assert_eq!(c.patch(1, 1, &json!([1])).unwrap().as_ref(), "{\"$=\":1}");
+        assert_eq!(c.patch(1, 1, &json!([1]), [7, EVERYONE]).unwrap().as_ref(), "{\"$=\":1}");
         let big: Arc<str> = " ".repeat(KEPT_BYTES / 4).into();
         for i in 10..15 {
-            c.keep(i, &big);
+            c.keep(i, &big, EVERYONE);
         }
         assert_eq!(c.patch_bytes, 0);
+    }
+
+    /// A viewer's value is for them, and a patch made for them is not another's (FEEDBACK55.md,
+    /// Q-884; branch feedback55).
+    #[test]
+    fn a_viewers_value_is_no_one_elses() {
+        let mut c = LiveCache::default();
+        let a: Arc<str> = "[1]".into();
+        c.keep(1, &a, 7);
+        assert!(c.patch(1, 2, &json!([1, 2]), [8, EVERYONE]).is_none());
+        assert!(c.patch(1, 2, &json!([1, 2]), [EVERYONE, EVERYONE]).is_none());
+        assert!(c.patch(1, 2, &json!([1, 2]), [7, EVERYONE]).is_some());
+        // Made for 7 and kept: still not 8's.
+        assert!(c.patch(1, 2, &json!([1, 2]), [8, EVERYONE]).is_none());
+        // The same value kept for everyone as well is everyone's, and the same for each.
+        c.keep(1, &a, EVERYONE);
+        assert!(c.patch(1, 2, &json!([1, 2]), [8, EVERYONE]).is_some());
+    }
+
+    /// One tenant's value for everyone there is not the next tenant's.
+    #[test]
+    fn a_tenants_value_is_no_other_tenants() {
+        let mut c = LiveCache::default();
+        let a: Arc<str> = "[1]".into();
+        c.keep(1, &a, everyone("\0acme"));
+        assert!(c.patch(1, 2, &json!([1, 2]), [everyone("\0globex"); 2]).is_none());
+        assert!(c.patch(1, 2, &json!([1, 2]), [EVERYONE; 2]).is_none());
+        assert!(c.patch(1, 2, &json!([1, 2]), [everyone("\0acme"); 2]).is_some());
+        assert_eq!(everyone(""), EVERYONE);
+    }
+
+    /// Each value costs what it holds, however small: the store cannot be filled by the million
+    /// with values it counted as nothing (FEEDBACK55.md, Q-884, found in review; branch feedback55).
+    #[test]
+    fn small_values_are_counted_too() {
+        let mut c = LiveCache::default();
+        let one: Arc<str> = "1".into();
+        for i in 0..(KEPT_BYTES / KEPT_ENTRY) as u64 + 5000 {
+            c.keep(1, &one, i + 1);
+        }
+        assert!(c.values.len() <= KEPT_BYTES / KEPT_ENTRY, "{}", c.values.len());
+        assert!(c.bytes <= KEPT_BYTES);
+        // And all of it is given back as values go.
+        assert_eq!(c.bytes, c.values.len() * (KEPT_ENTRY + 1));
+    }
+
+    /// A key known to be nobody else's is remembered, not kept: its arguments may be megabytes.
+    #[test]
+    fn what_is_known_of_a_key_holds_no_argument() {
+        let mut c = LiveCache::default();
+        let key = |n: u8| (String::new(), "f".to_string(), vec![n; 1 << 20], String::new());
+        assert!(matches!(c.begin(&key(1)), Begun::Run));
+        c.land(&key(1), true);
+        assert!(matches!(c.begin(&key(1)), Begun::Alone));
+        assert!(matches!(c.begin(&key(2)), Begun::Run));
+        c.land(&key(2), false);
+        assert!(matches!(c.begin(&key(2)), Begun::Run));
+        c.land(&key(2), false);
+        assert_eq!(std::mem::size_of_val(c.personal.iter().next().unwrap()), 8);
+    }
+
+    /// Two servers with one secret agree; with another, or none, they do not.
+    #[test]
+    fn hashes_are_keyed_by_the_sites_secret() {
+        assert_eq!(key_of(b"one"), key_of(b"one"));
+        assert_ne!(key_of(b"one"), key_of(b"two"));
+        let mut plain = std::collections::hash_map::DefaultHasher::new();
+        "[1]".hash(&mut plain);
+        assert_ne!(hash("[1]"), plain.finish());
+        assert_eq!(hash("[1]"), hash("[1]"));
     }
 
     #[test]

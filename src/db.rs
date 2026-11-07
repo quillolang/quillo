@@ -2589,6 +2589,11 @@ fn select_in(
     // Refused before a replica would take it (found in review).
     session_change(it, &b, scan, &params)?;
     let alone = isolated(it, &b, scan);
+    // A read to look at, that is not one (`select nextval('s')`, a function that writes): a `live`
+    // run through it gave two pages one ticket (FEEDBACK55.md, Q-888; branch feedback55).
+    if it.in_run && (alone || !only_reads(scan) || calls_own_on_mysql(it, &b, scan)) {
+        it.acted = true;
+    }
     // Timed for /_quillo/health/queries (branch query-stats).
     let started = std::time::Instant::now();
     // A read, to a replica: if it fails there, the primary answers (and the

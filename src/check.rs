@@ -6492,6 +6492,18 @@ impl Checker {
         }
         if sig.builtin && matches!(sig.name.as_str(), "db.transaction" | "idempotent") {
             self.retried_effects(name, arg_exprs);
+            // What a key's `user` cannot be, where it shows (FEEDBACK55.md, Q-887; branch feedback55).
+            if sig.name == "idempotent" {
+                if let [Expr::Map(opts), _, ..] = arg_exprs {
+                    for (k, v) in opts {
+                        match v {
+                            Expr::Map(_) if k == "user" => self.error(crate::idempotency::user_not_a_name("a map")),
+                            Expr::List(_) if k == "user" => self.error(crate::idempotency::user_not_a_name("a list")),
+                            _ => {}
+                        }
+                    }
+                }
+            }
             // A key misspelled was the default, quietly (FEEDBACK55.md, Q-738; branch feedback55).
             if sig.name == "db.transaction" {
                 if let [Expr::Map(opts), _, ..] = arg_exprs {
@@ -7560,18 +7572,24 @@ pub fn walk_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
         Expr::Match(s, arms, _) => {
             walk_expr(s, f);
             for a in arms {
+                walk_pattern(&a.pat, f);
                 if let Some(g) = &a.guard {
                     walk_expr(g, f)
                 }
                 walk_expr(&a.body, f)
             }
         }
-        Expr::For(_, i, b, _) | Expr::While(i, b, _) => {
+        Expr::For(p, i, b, _) => {
+            walk_pattern(p, f);
+            walk_expr(i, f);
+            walk_expr(b, f)
+        }
+        Expr::While(i, b, _) => {
             walk_expr(i, f);
             walk_expr(b, f)
         }
         Expr::Block(stmts) => walk_stmts(stmts, f),
-        Expr::Lambda(d) => walk_expr(&d.body, f),
+        Expr::Lambda(d) => walk_fn(d, f),
         Expr::Reply(s, b, _) => {
             walk_expr(s, f);
             if let Some(b) = b {
@@ -7582,18 +7600,54 @@ pub fn walk_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     }
 }
 
+/// A function's parameters' defaults, and its body: what it can run. A default is code as its
+/// body is: `server fn load(who = request.cookies.uid)` read the visitor where the body did not,
+/// and went to every viewer (FEEDBACK55.md, Q-880; branch feedback55).
+pub fn walk_fn(d: &FnDef, f: &mut dyn FnMut(&Expr)) {
+    d.params.iter().filter_map(|p| p.default.as_ref()).for_each(|e| walk_expr(e, f));
+    walk_expr(&d.body, f)
+}
+
+/// The expressions a pattern holds: its fields' defaults. No `_` here, in `walk_expr` or in
+/// `walk_stmts`: a form added later does not compile until it says what it holds, as a form
+/// these miss is code nobody looks at, and for `names_request` a run shared with every viewer
+/// (FEEDBACK55.md, Q-880; branch feedback55).
+pub fn walk_pattern(p: &Pattern, f: &mut dyn FnMut(&Expr)) {
+    match p {
+        Pattern::Record(fields) => {
+            for field in fields {
+                if let Some(d) = &field.default {
+                    walk_expr(d, f)
+                }
+                walk_pattern(&field.pat, f)
+            }
+        }
+        Pattern::List(items, _) | Pattern::Alt(items) => items.iter().for_each(|q| walk_pattern(q, f)),
+        Pattern::As(q, _) => walk_pattern(q, f),
+        Pattern::Wild | Pattern::Bind(_) | Pattern::Lit(_) | Pattern::Type(_) => {}
+    }
+}
+
 fn walk_stmts(stmts: &[Stmt], f: &mut dyn FnMut(&Expr)) {
     for s in stmts {
         match s {
-            Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::Expr(e) | Stmt::State(_, e, _) => walk_expr(e, f),
+            Stmt::Let(p, e, _) => {
+                walk_pattern(p, f);
+                walk_expr(e, f)
+            }
+            Stmt::Assign(_, _, e, _) | Stmt::Expr(e) | Stmt::State(_, e, _) => walk_expr(e, f),
             Stmt::SetField(o, _, _, e, _) => {
                 walk_expr(o, f);
                 walk_expr(e, f)
             }
             Stmt::Return(Some(e), _) => walk_expr(e, f),
-            Stmt::Fn(d) => walk_expr(&d.body, f),
-            Stmt::Route(r) => walk_expr(&r.body, f),
-            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Return(None, _) => {}
+            Stmt::Fn(d) => walk_fn(d, f),
+            Stmt::Route(r) => {
+                r.query.iter().chain(r.body_pat.iter()).chain(r.guards.iter()).for_each(|p| walk_pattern(p, f));
+                walk_expr(&r.body, f)
+            }
+            Stmt::Service(_, _, _, Some(e), _) => walk_expr(e, f),
+            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(_, _, _, None, _) | Stmt::Return(None, _) => {}
             Stmt::Type(td) => td.defaults.iter().for_each(|(_, e)| walk_expr(e, f)),
         }
     }
@@ -7605,8 +7659,9 @@ fn walk_html(el: &HtmlEl, f: &mut dyn FnMut(&Expr)) {
     }
     el.classes.iter().for_each(|c| walk_expr(c, f));
     for (_, v) in &el.attrs {
-        if let AttrVal::Expr(e) | AttrVal::Spread(e) = v {
-            walk_expr(e, f)
+        match v {
+            AttrVal::Expr(e) | AttrVal::Spread(e) => walk_expr(e, f),
+            AttrVal::Bool => {}
         }
     }
     for c in &el.children {

@@ -213,27 +213,61 @@ fn sends_form(req: &HttpRequest) -> bool {
 }
 
 /// The `request` value a route sees.
-/// What `build_request` needs, kept until the request map is wanted.
+/// What `build_request` needs but the request, kept until the request map is wanted.
 pub(crate) struct PendingRequest {
-    /// The request being handled; set only while it is handled.
-    req: *const HttpRequest,
     path: String,
     query: Value,
     params: Value,
 }
 
-// SAFETY: it points at the request its handler is answering, and is
-// cleared before the handler returns.
-unsafe impl Send for PendingRequest {}
-unsafe impl Sync for PendingRequest {}
-
 impl PendingRequest {
-    pub(crate) fn make(&self) -> Value {
-        // SAFETY: see above.
-        let req = unsafe { &*self.req };
+    pub(crate) fn make(&self, req: &HttpRequest) -> Value {
         let mut m = build_request(req, &self.path, &self.query);
         m.insert("params".into(), self.params.clone());
         Value::map(m)
+    }
+}
+
+/// The request being answered, for what is worked out from it only if something asks (its map,
+/// who asks). The one pointer to it: only `Answering` sets it and clears it, so it cannot outlive
+/// the `&HttpRequest` it was made from (FEEDBACK55.md, Q-883; branch feedback55).
+pub(crate) struct Asked(*const HttpRequest);
+
+// SAFETY: see `Answering`, the only place one is made: it is cleared before the reference it was
+// made from ends. A request's `parallel` functions on other threads are handed what it holds,
+// never this.
+unsafe impl Send for Asked {}
+unsafe impl Sync for Asked {}
+
+/// `handle_inner` as it answers a request. What the request left on the interpreter goes when this
+/// does, however the answer ended: a return, a `?`, a panic. A route whose query pattern failed
+/// returned with `pending_request` still pointing at its request, which was freed, and the next
+/// thing on that worker that read the request read through it, a job handed the last visitor's
+/// query and whatever was in that memory; and a service's call left its `current_request`, the
+/// forwarded token of a visitor, for the next job (FEEDBACK55.md, Q-883; branch feedback55).
+struct Answering<'a>(&'a mut Interp);
+
+impl<'a> Answering<'a> {
+    fn begin(it: &'a mut Interp, req: &HttpRequest) -> Self {
+        it.asked = Some(Asked(req as *const HttpRequest));
+        Answering(it)
+    }
+}
+
+impl Drop for Answering<'_> {
+    fn drop(&mut self) {
+        self.0.asked = None;
+        self.0.pending_request = None;
+        self.0.current_request = None;
+        self.0.who = None;
+    }
+}
+
+impl Interp {
+    /// The request being answered, while it is (see `Answering`).
+    pub(crate) fn asked(&self) -> Option<&HttpRequest> {
+        // SAFETY: `Answering` set it from a reference that outlives it, and clears it.
+        self.asked.as_ref().map(|a| unsafe { &*a.0 })
     }
 }
 
@@ -386,7 +420,9 @@ impl Interp {
         self.route_limit = None;
         self.set_cookies.clear();
         self.session = None;
+        self.session_id = None;
         self.visitor_read = false;
+        self.locale_read = false;
         self.locale = None;
         if !req.body.is_empty() {
             let ctype = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map_or("", |(_, v)| v.as_str());
@@ -399,7 +435,10 @@ impl Interp {
         self.prefetching = prefetch.clone();
         let changed = (req.method != "GET" && req.method != "HEAD").then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         self.changed = changed.clone();
-        let mut resp = self.handle_inner(req);
+        let mut resp = Answering::begin(self, req).0.handle_inner(req);
+        // Before anything that can wait: another request on the thread would find it
+        // (FEEDBACK55.md, Q-883; branch feedback55).
+        let made = crate::stream::take_made();
         // A transaction begun by hand and left open (FEEDBACK44.md, Q-580).
         crate::db::left_open(self, &format!("{} {}", req.method, path));
         // A prefetch's deferred parts: worked out now, as part of the prefetch, which
@@ -422,7 +461,6 @@ impl Interp {
         // A streamed answer: its function, for the server to run after the
         // head; or, with no server to, run now into the body.
         if resp.header(crate::stream::MARK).is_some() {
-            let made = crate::stream::take_made();
             if self.streams_direct {
                 self.pending_stream = made;
             } else {
@@ -668,8 +706,7 @@ impl Interp {
                 define(&scope, "request", reqv.clone());
                 reqv
             } else {
-                self.pending_request =
-                    Some(PendingRequest { req: req as *const HttpRequest, path: path.to_string(), query: query_v.clone(), params: params_v });
+                self.pending_request = Some(PendingRequest { path: path.to_string(), query: query_v.clone(), params: params_v });
                 Value::Nil
             };
             for (k, v) in params {
@@ -716,6 +753,7 @@ impl Interp {
             }
 
             self.current_request = r.uses_request.then_some(reqv);
+            self.visitor_read |= r.reads_visitor || self.middleware_reads(&r);
             let file = std::mem::replace(&mut self.cur_file, r.file.clone());
             // `route ... with db`: its body runs as a `with` function's, narrowed, never widened
             // (branch feedback40-43).
@@ -731,11 +769,13 @@ impl Interp {
                 self.pending_request = None;
                 continue;
             }
-            let resp = finish(crate::interp::in_file(ran, &r.file));
-            // The page's components will need the locale (see `handle`).
+            // The page's components will need the locale (see `handle`). Before `finish`, which
+            // may leave a stream for `handle`, as a rule that waits lets another request run
+            // (FEEDBACK55.md, Q-883; branch feedback55).
             if self.rendered_island && self.site.i18n.is_some() {
                 self.locale();
             }
+            let resp = finish(crate::interp::in_file(ran, &r.file));
             self.current_request = None;
             self.pending_request = None;
             // A `HEAD` is answered with the GET's headers, its length included; the body is left
@@ -812,6 +852,35 @@ impl Interp {
 }
 
 impl Interp {
+    /// Whether the middleware of a route's groups can read the visitor. Each is read as the route
+    /// calls it, in its body: there the file's own names are what they run as, where the group
+    /// wrote `gate`, a file's `private fn gate` lost to the program's, and the page lost
+    /// `private`. What is not one function of the program's, a call that makes one say, cannot
+    /// be read, and counts (FEEDBACK55.md, Q-886; branch feedback55).
+    fn middleware_reads(&self, r: &crate::ast::RouteDef) -> bool {
+        use crate::ast::{Expr, Stmt};
+        let Expr::Block(stmts) = &r.body else { return false };
+        *r.middleware_reads.get_or_init(|| {
+            stmts.iter().any(|s| {
+                let Stmt::Expr(Expr::Call(f, args, _)) = s else { return false };
+                if !matches!(&**f, Expr::Ident(n, _) if n == "__answer") {
+                    return false;
+                }
+                match args.first() {
+                    Some(Expr::Call(m, _, _)) => match &**m {
+                        Expr::Lambda(d) => crate::parser::middleware_reads_visitor(d),
+                        Expr::Ident(n, _) => match lookup(&self.globals, n) {
+                            Some(Value::Func(c)) => crate::parser::middleware_reads_visitor(&c.def),
+                            _ => true,
+                        },
+                        _ => true,
+                    },
+                    _ => true,
+                }
+            })
+        })
+    }
+
     /// The middleware of the innermost guarded group whose path the request is under, when no
     /// route answered it: its answer if it refuses, else none, and the server's answer stands.
     fn guard_first(
@@ -880,6 +949,7 @@ impl Interp {
                 define(&scope, &k, v);
             }
             self.current_request = Some(reqv);
+            self.visitor_read |= r.reads_visitor || self.middleware_reads(r);
             let file = std::mem::replace(&mut self.cur_file, r.file.clone());
             self.route_limit = r.limit.clone();
             let answered = self.under_route(|it| it.eval(&r.body, &scope));
@@ -1060,7 +1130,9 @@ impl Interp {
         if html && !framed_by_policy && !want.iter().any(|(k, _)| k == "x-frame-options") {
             want.push(("x-frame-options".into(), Some("SAMEORIGIN".into())));
         }
-        let personal = (self.visitor_read || sets_cookie) && resp.status < 400;
+        // Whatever the status: a 403 or a 404 naming the visitor is theirs too, and a cache keeps
+        // those as well (FEEDBACK55.md, Q-886; branch feedback55).
+        let personal = self.visitor_read || sets_cookie;
         if personal && !want.iter().any(|(k, _)| k == "cache-control") {
             want.push(("cache-control".into(), Some("private".into())));
         }
@@ -1073,8 +1145,21 @@ impl Interp {
             }
         }
         // Not when the program said `vary: null` (FEEDBACK55.md, Q-710; branch feedback55).
-        if personal && !resp.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("vary") && (v == DROPPED || v.to_ascii_lowercase().contains("cookie"))) {
-            resp.headers.push(("vary".into(), "Cookie".into()));
+        let vary = |resp: &mut HttpResponse, name: &str| {
+            let lower = name.to_ascii_lowercase();
+            if !resp.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("vary") && (v == DROPPED || v.to_ascii_lowercase().contains(&lower))) {
+                resp.headers.push(("vary".into(), name.into()));
+            }
+        };
+        // A page in the visitor's language is told by what chose it, the `locale` cookie or
+        // `Accept-Language`, and a page with components carries its locale's text: a cache gave
+        // the first visitor's language to everyone (FEEDBACK55.md, Q-886; branch feedback55).
+        let translated = self.site.i18n.is_some() && (self.locale_read || self.rendered_island);
+        if personal || translated {
+            vary(resp, "Cookie");
+        }
+        if translated {
+            vary(resp, "Accept-Language");
         }
     }
 
@@ -1437,26 +1522,30 @@ impl Interp {
             };
         }
         let had = hdr("x-quillo-had").and_then(crate::livecache::parse_hash);
-        let key = boundary.is_none().then(|| (name.to_string(), json_args.clone(), hdr("host").unwrap_or("").to_string()));
-        let viewer = viewer_of(&req.remote, |n| hdr(n).map(str::to_string));
+        let scope = self.run_scope();
+        let everyone = crate::livecache::everyone(&scope);
+        let key = boundary.is_none().then(|| (scope, name.to_string(), json_args.clone(), hdr("host").unwrap_or("").to_string()));
         let (found, mut flying) = match &key {
-            Some(k) => self.live_turn(k, viewer),
+            Some(k) => self.live_turn(k),
             None => (None, None),
         };
-        let (answer, topics, seq) = match found {
-            Some(f) => {
+        let (answer, topics, seq, personal) = match found {
+            Some((answer, topics, seq)) => {
                 crate::metrics::live_run(true);
                 self.current_request = None;
-                f
+                (answer, topics, seq, false)
             }
             None => {
                 crate::metrics::live_run(false);
                 let seq = self.shared.live_seq();
                 self.reads = Some(Default::default());
                 self.read_request = false;
+                self.acted = false;
                 self.own_seqs.clear();
                 let cookies = self.set_cookies.len();
+                self.in_run = true;
                 let res = self.call_closure(&c, args.into_iter().map(Some).collect(), 0);
+                self.in_run = false;
                 let mut topics: Vec<String> = self.reads.take().unwrap_or_default().into_iter().collect();
                 // Every change since the run began its own (it marked what it
                 // shows as read, say): the answer has them already, so the
@@ -1480,26 +1569,33 @@ impl Interp {
                         return rpc_error(500, &format!("internal error in `{}`", name));
                     }
                 });
+                // Neither one that read the viewer nor one that acted (see `viewcache::Kind`) can be
+                // given to anyone, even the same viewer's other tab, so nothing waits for it
+                // either: telling viewers apart took a list of what identifies nobody, and Bob
+                // was given `Referer: ...?token=ALICE` (FEEDBACK55.md, Q-881 and Q-888; branch
+                // feedback55).
+                let nobody_elses = self.read_request || self.acted;
                 if let Some(f) = &mut flying {
-                    f.personal = self.read_request;
+                    f.personal = nobody_elses;
                 }
                 // Not shared: a run that wrote, or set a cookie, or read what
                 // changed as it ran. What others wrote elsewhere has nothing
                 // to do with it (FEEDBACK24.md, Q-191; branch feedback24-fixes).
                 if let Some(k) = key {
-                    if self.set_cookies.len() == cookies && own.is_empty() && self.shared.unchanged_since(&topics, seq) {
+                    if !nobody_elses && self.set_cookies.len() == cookies && own.is_empty() && self.shared.unchanged_since(&topics, seq) {
                         let mut cache = self.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        cache.share(k, self.read_request.then_some(viewer), seq, topics.clone(), answer.clone());
+                        cache.share(k, seq, topics.clone(), answer.clone());
                     }
                 }
-                (answer, topics, seen)
+                (answer, topics, seen, self.read_request)
             }
         };
         let mut patch = None;
         if !answer.err {
+            let owner = if personal { self.who().unwrap_or(everyone) } else { everyone };
             let mut cache = self.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            cache.keep(answer.h, &answer.text);
-            patch = had.and_then(|from| cache.patch(from, answer.h, &answer.value)).filter(|p| p.len() < answer.text.len());
+            cache.keep(answer.h, &answer.text, owner);
+            patch = had.and_then(|from| cache.patch(from, answer.h, &answer.value, [owner, everyone])).filter(|p| p.len() < answer.text.len());
         }
         // Past what a page should be sent, whoever wrote the loader should hear of it.
         if answer.text.len() > LIVE_LARGE {
@@ -1546,26 +1642,49 @@ impl Interp {
 
     /// What a page load shares a run by: the same as a refresh's, where it can
     /// tell who is asking.
-    pub(crate) fn live_key(&mut self, name: &str, args: &[Value]) -> Option<(crate::livecache::RunKey, u64)> {
+    pub(crate) fn live_key(&mut self, name: &str, args: &[Value], scope: &str) -> Option<crate::livecache::RunKey> {
         let read = self.read_request;
         let req = self.request_value();
         self.read_request = read;
         let Some(Value::Map(req)) = req else { return None };
         let Some(Value::Map(headers)) = req.get("headers") else { return None };
-        let hdr = |n: &str| headers.get(n).map(|v| v.display());
-        let ip = req.get("ip").map_or(String::new(), |v| v.display());
-        let viewer = viewer_of(&ip, hdr);
+        let host = headers.get("host").map(|v| v.display()).unwrap_or_default();
+        // What a key cannot hold, folded to null, was any other such argument: a closure over one
+        // visitor's value went to the next (FEEDBACK55.md, Q-881; branch feedback55).
+        if !args.iter().all(fits_a_key) {
+            return None;
+        }
         let json = serde_json::Value::Array(args.iter().map(crate::interp::island_json).collect()).to_string().into_bytes();
-        Some(((name.to_string(), json, hdr("host").unwrap_or_default()), viewer))
+        Some((scope.to_string(), name.to_string(), json, host))
+    }
+
+    /// Whose a run is, for its key: the program, as two mounted programs' `load` are two
+    /// functions and `/two` was given `/one`'s run (FEEDBACK55.md, Q-882; branch feedback55), and
+    /// the tenant in force, however it was named: `with_tenant(session().org, ...)` around a page
+    /// gave Globex "secret of acme" (FEEDBACK55.md, Q-879, found in review; branch feedback55).
+    /// With it here a run that used the tenant is that tenant's, read from the request or not.
+    pub(crate) fn run_scope(&mut self) -> String {
+        match self.tenant() {
+            None if self.base.is_empty() => String::new(),
+            t => format!("{}\0{}", self.base, t.as_deref().unwrap_or("")),
+        }
+    }
+
+    /// Who a viewer's kept value is theirs by (see `LiveCache::keep`), worked out if one is kept.
+    pub(crate) fn who(&mut self) -> Option<u64> {
+        if self.who.is_none() {
+            self.who = self.asked().map(who_of);
+        }
+        self.who
     }
 
     /// A call of a live loader: a run it may have, or else it runs, its turn taken
     /// (the landing, for those that wait for it). One run at a time of a call.
-    pub(crate) fn live_turn(&mut self, key: &crate::livecache::RunKey, viewer: u64) -> (Option<crate::livecache::Shared>, Option<Landing>) {
+    pub(crate) fn live_turn(&mut self, key: &crate::livecache::RunKey) -> (Option<crate::livecache::Shared>, Option<Landing>) {
         let shared = self.shared.clone();
         let find = || {
             let mut cache = shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            cache.shared(key, viewer, |t, seq| shared.unchanged_since(t, seq))
+            cache.shared(key, |t, seq| shared.unchanged_since(t, seq))
         };
         if let Some(f) = find() {
             return (Some(f), None);
@@ -1589,15 +1708,30 @@ impl Interp {
     }
 }
 
-/// Who asks, for a run that read the request: the address, without the port each
-/// connection has its own of, and what identifies them.
-fn viewer_of(remote: &str, hdr: impl Fn(&str) -> Option<String>) -> u64 {
-    let mut text = remote.parse::<std::net::SocketAddr>().map_or_else(|_| remote.to_string(), |a| a.ip().to_string());
-    for n in ["cookie", "authorization", "accept-language", "user-agent"] {
-        text.push('\n');
-        text.push_str(&hdr(n).unwrap_or_default());
+/// Whether an argument of a loader comes out of its JSON as itself.
+fn fits_a_key(v: &Value) -> bool {
+    match v {
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Dec(_) | Value::Str(_) => true,
+        Value::Float(f) => f.is_finite(),
+        Value::List(l) => l.iter().all(fits_a_key),
+        Value::Map(m) => m.values().all(fits_a_key),
+        Value::Func(_) | Value::Builtin(..) | Value::Html(_) | Value::Response(_) | Value::Err(..) => false,
     }
-    crate::livecache::hash(&text)
+}
+
+/// Whose a kept value is: the address, without the port each connection has its own of, every
+/// `Cookie` line and `Authorization`, the same for a page and its refreshes. Two people this
+/// cannot tell apart are told apart by the hash of the value, which nobody can work out.
+fn who_of(req: &HttpRequest) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = crate::livecache::hasher();
+    req.remote.parse::<std::net::SocketAddr>().map_or_else(|_| req.remote.clone(), |a| a.ip().to_string()).hash(&mut h);
+    for (k, v) in &req.headers {
+        if k.eq_ignore_ascii_case("cookie") || k.eq_ignore_ascii_case("authorization") {
+            v.hash(&mut h);
+        }
+    }
+    h.finish()
 }
 
 /// A loader's answer past this is said in the log, once for each.

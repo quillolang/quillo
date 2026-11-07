@@ -19,9 +19,19 @@
 //! - The same key with another request (method, path, query or body) is
 //!   refused with 422, and while the first is running, a second gets 409:
 //!   neither runs.
-//! - Keys belong to a tenant, a mount point and a user (the session's
-//!   `user`, or `{ user }`), so one user cannot read another's answer.
-//!   They are kept 24 hours (`{ max_age }`), as Stripe's are.
+//! - For one key the work runs at most once, whoever asks. A key is one row, of a tenant and a
+//!   mount point, claimed atomically on the key alone: who asks never chooses the row, it only
+//!   decides who may see the answer. The row keeps who that is, as a set: what the first try
+//!   said of itself as it began and, as the work may sign in, sign out or change the session,
+//!   as it ended (see `says`). They are compared at the strongest level both sides have, `{ user }`,
+//!   then the session, then credentials, then nobody, and only there (see `same_visitor`): the
+//!   same replays, or waits while it runs. Different, or no level in common, gets 409 and nothing
+//!   else, nothing run and nothing shown: a second client with the same key, or the same visitor
+//!   after signing out or losing a cookie. Neither a second run nor another's receipt.
+//! - `{ user }` is a namespace: two accounts may use one key, each a row of its own. A try under
+//!   one also looks at the key's row with no `{ user }`, and that at those, so that `{ user:
+//!   session().user }` going from null to signed in, or back, finds the first try.
+//! - Answers are kept 24 hours (`{ max_age }`), as Stripe's are.
 //!
 //! It is a function rather than a word before `route`, for three reasons:
 //! it runs where it is called, so the program's own checks (`auth.required`,
@@ -44,8 +54,9 @@
 //!   sent but not kept. Nothing happened, so the client may try again, and
 //!   it runs again. (To keep a refusal, return it: `respond(402, ...)`.)
 //! - The server stops (or the database goes away) part way: the database
-//!   rolls the transaction back, and the claim is left. After a minute it
-//!   is taken over by the next request with the key, which runs.
+//!   rolls the transaction back, and the claim is left. Until its minute is
+//!   up, every try gets 409. Then the next try by the same visitor takes it
+//!   over and runs; anyone else gets 409, and the row stays until it expires.
 //! - A claim is taken over only if it is still running; the answer is
 //!   written only if the claim is still this request's. So if a request
 //!   is slower than the minute, and another takes it over, at most one of
@@ -55,8 +66,9 @@
 //! `db.connect`) is not part of the transaction. For such handlers,
 //! `{ transaction: false }` runs `f` without one: every answer is kept,
 //! failures too, as Stripe does, since part of the work may have happened.
-//! A server that stops there leaves the key running: requests with it get
-//! 409 until it expires, as it is not known whether the work happened.
+//! A server that stops there leaves the key running: requests with it, from
+//! anyone, get 409 until it expires, as it is not known whether the work
+//! happened. It never runs again before that.
 //!
 //! Without the header, `f` simply runs (in its transaction), unless
 //! `{ required: true }`, which answers 400. Outside a request (a script,
@@ -125,6 +137,11 @@ fn options(v: Option<&Value>, line: u32) -> Result<Options, Ctrl> {
         }
     }
     o.user = m.get("user").cloned();
+    // A namespace has one name: a record the work changes would be a new one, and the work would
+    // run again (FEEDBACK55.md, Q-887; branch feedback55).
+    if let Some(u) = o.user.as_ref().filter(|u| !matches!(u, Value::Nil | Value::Str(_) | Value::Int(_))) {
+        return fail(line, user_not_a_name(u.type_name()));
+    }
     o.required = matches!(m.get("required"), Some(Value::Bool(true)));
     match m.get("transaction") {
         None | Some(Value::Bool(true)) => {}
@@ -137,6 +154,11 @@ fn options(v: Option<&Value>, line: u32) -> Result<Options, Ctrl> {
         Some(other) => return fail(line, format!("`idempotent`'s transaction is true or false, got {}", other.repr())),
     }
     Ok(o)
+}
+
+/// What `{ user }` being anything but a name is told, here and by `quillo check`.
+pub fn user_not_a_name(given: &str) -> String {
+    format!("`idempotent`'s `user` says whose a key is, and is a str or an int, got {}: pass what does not change, its `.id`", given)
 }
 
 /// `idempotent(f)` or `idempotent(options, f)`.
@@ -193,24 +215,33 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if key.is_empty() || key.len() > MAX_KEY || !key.bytes().all(|b| (0x21..0x7f).contains(&b)) {
         return refuse(400, &format!("an Idempotency-Key is 1 to {} visible ASCII characters", MAX_KEY));
     }
-    let user = match &opts.user {
-        Some(u) => u.clone(),
-        None if step => Value::Nil,
-        None => session_user(it, line)?,
-    };
     let tenant = it.tenant();
     let print = fingerprint(it, &req, &header("content-type").unwrap_or_default());
     let form_print = if by_form { print.as_str() } else { "" };
-    let id = sha256_hex(&[tenant.as_deref().unwrap_or("").as_bytes(), it.base.as_bytes(), crate::interp::island_json(&user).to_string().as_bytes(), key.as_bytes(), form_print.as_bytes()]);
-    let mut claimed = claim(it, &id, &path, &print, opts.keep_ms, opts.transaction);
-    let until = now_ms() + FORM_WAIT_MS;
-    while by_form && matches!(claimed, Ok(Claim::Refused(409, _))) && now_ms() < until {
-        it.unlocked(|| std::thread::sleep(std::time::Duration::from_millis(50)));
-        claimed = claim(it, &id, &path, &print, opts.keep_ms, opts.transaction);
+    let named = opts.user.as_ref().filter(|u| !matches!(u, Value::Nil));
+    let base = it.base.clone();
+    let row_of = |owner: &str| sha256_hex(&[tenant.as_deref().unwrap_or("").as_bytes(), base.as_bytes(), owner.as_bytes(), key.as_bytes(), form_print.as_bytes()]);
+    let bare = row_of("null");
+    let id = named.map_or_else(|| bare.clone(), |u| row_of(&crate::interp::island_json(u).to_string()));
+    // Rows of before the key's row was the key's: they went by `session().user`. A retry that
+    // spans the upgrade finds its first try there.
+    let old_user = crate::session::old_user(it);
+    let old = old_user.as_ref().filter(|_| named.is_none()).map(|u| row_of(&crate::interp::island_json(u).to_string()));
+    let mut owners = says(named, &header, crate::session::arrived_owner(it));
+    if owners.is_empty() {
+        owners.push(NOBODY.to_string());
     }
-    let token = match claimed {
-        Ok(Claim::Mine(t)) => t,
+    let attempt = Attempt { id: &id, bare: &bare, old: old.as_deref(), path: &path, print: &print, keep_ms: opts.keep_ms, take_over: opts.transaction, owners: &owners };
+    let mut claimed = take(it, &attempt);
+    let until = now_ms() + FORM_WAIT_MS;
+    while by_form && matches!(claimed, Ok(Claim::Busy)) && now_ms() < until {
+        it.unlocked(|| std::thread::sleep(std::time::Duration::from_millis(50)));
+        claimed = take(it, &attempt);
+    }
+    let (token, mut owners) = match claimed {
+        Ok(Claim::Mine(t, known)) => (t, known),
         Ok(Claim::Answer(a)) => return give(a, true),
+        Ok(Claim::Busy) => return no(409, RUNNING),
         Ok(Claim::Refused(status, msg)) => return no(status, &msg),
         Err(e) => return no(503, &format!("could not record the Idempotency-Key: {}", e)),
     };
@@ -225,7 +256,9 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 return Err(e);
             }
         };
-        match store(it, &id, &token, &a) {
+        let after = says(named, &header, crate::session::current_owner(it));
+        add_owners(&mut owners, after);
+        match store(it, &id, &token, &a, &owners) {
             Ok(true) => {}
             Ok(false) => eprintln!("quillo: an idempotent request's claim was gone when its answer was kept"),
             Err(e) => eprintln!("quillo: could not keep an idempotent request's answer: {}", e),
@@ -245,7 +278,9 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             other => return other,
         };
         let a = if step { render_step(Ok(v.clone()))? } else { render(rpc.as_deref(), Ok(v.clone()))? };
-        match store(it, &id, &token, &a) {
+        let mut all = owners.clone();
+        add_owners(&mut all, says(named, &header, crate::session::current_owner(it)));
+        match store(it, &id, &token, &a, &all) {
             Ok(true) => {
                 kept = Some(a);
                 Ok(v)
@@ -265,12 +300,13 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             // run again.
             release(it, &id, &token);
             if lost {
-                return match claim(it, &id, &path, &print, opts.keep_ms, true) {
+                return match claim(it, &attempt) {
                     Ok(Claim::Answer(a)) => give(a, true),
-                    Ok(Claim::Mine(t)) => {
+                    Ok(Claim::Mine(t, _)) => {
                         release(it, &id, &t);
                         no(409, "a request with this Idempotency-Key was running at the same time; try again")
                     }
+                    Ok(Claim::Busy) => no(409, RUNNING),
                     Ok(Claim::Refused(status, msg)) => no(status, &msg),
                     Err(e) => no(503, &format!("could not read the Idempotency-Key: {}", e)),
                 };
@@ -280,16 +316,74 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
 }
 
-/// `session().user`, through the `session` builtin.
-fn session_user(it: &mut Interp, line: u32) -> R {
-    let Some((_, f)) = crate::session::BUILTINS.iter().find(|(n, _)| *n == "session") else { return Ok(Value::Nil) };
-    match f(it, Vec::new(), line)? {
-        Value::Map(m) => Ok(m.get("user").cloned().unwrap_or(Value::Nil)),
-        _ => Ok(Value::Nil),
+/// Who a row is when nothing was said of who asked.
+const NOBODY: &str = "nobody";
+
+/// The headers that say who a client is. A plain cookie of the program's is not one of them:
+/// `{ user }` says so.
+const CREDENTIALS: &[&str] = &["authorization", "proxy-authorization", "x-api-key", "api-key", "x-auth-token", "x-access-token"];
+
+/// Whether a credential header says nothing: empty, or what a page sent for a token it did not
+/// have, as the whole value or after the scheme (`Bearer undefined`). Such a header is everyone's.
+fn no_credential(v: &str) -> bool {
+    let words: Vec<&str> = v.split_whitespace().collect();
+    let scheme_alone = |w: &str| ["bearer", "basic", "token"].iter().any(|s| w.eq_ignore_ascii_case(s));
+    match words.as_slice() {
+        [] => true,
+        [only] if scheme_alone(only) => true,
+        [.., last] => ["undefined", "null"].iter().any(|n| last.eq_ignore_ascii_case(n)),
     }
 }
 
-pub(crate) fn sha256_hex(parts: &[&[u8]]) -> String {
+/// What a try says of who it is, strongest first: the program's `{ user }`, the session
+/// (`session::arrived_owner`, `current_owner`), each credential header apart, as one more on a
+/// retry must still match. These only say who may see the answer, and none of them chooses the
+/// row: a claim filed under one of several owners could not be found by a retry presenting
+/// another, and each way of doing that double-charged (FEEDBACK55.md, Q-887; branch feedback55).
+/// `nobody` is said by a try with none of these as it begins, and never at the end of the work:
+/// a work that ends the session is no one's to replay to a stranger.
+fn says(named: Option<&Value>, header: &dyn Fn(&str) -> Option<String>, session: Option<String>) -> Vec<String> {
+    let mark = |level: &str, kind: &str, value: &str| format!("{}{}", level, sha256_hex(&[kind.as_bytes(), value.as_bytes()]));
+    let mut out = Vec::new();
+    if let Some(u) = named {
+        out.push(mark(LEVELS[0], "user", &crate::interp::island_json(u).to_string()));
+    }
+    if let Some(s) = session {
+        out.push(mark(LEVELS[1], "session", &s));
+    }
+    for h in CREDENTIALS {
+        if let Some(v) = header(h).filter(|v| !no_credential(v)) {
+            out.push(mark(LEVELS[2], h, &v));
+        }
+    }
+    out
+}
+
+/// The levels an owner is at, strongest first.
+const LEVELS: [&str; 4] = ["user:", "session:", "credential:", NOBODY];
+
+/// Whether two sets of owners are one visitor: at the strongest level both have, and only there.
+/// A public `X-Api-Key` two visitors share says nothing when each has a session. No level in
+/// common is no one in common.
+fn same_visitor(a: &[String], b: &[String]) -> bool {
+    for level in LEVELS {
+        let (x, y): (Vec<&String>, Vec<&String>) = (a.iter().filter(|o| o.starts_with(level)).collect(), b.iter().filter(|o| o.starts_with(level)).collect());
+        if !x.is_empty() && !y.is_empty() {
+            return x.iter().any(|o| y.contains(o));
+        }
+    }
+    false
+}
+
+fn add_owners(owners: &mut Vec<String>, more: Vec<String>) {
+    for o in more {
+        if !owners.contains(&o) {
+            owners.push(o);
+        }
+    }
+}
+
+pub fn sha256_hex(parts: &[&[u8]]) -> String {
     let mut h = Sha256::new();
     for p in parts {
         h.update((p.len() as u64).to_be_bytes());
@@ -400,11 +494,127 @@ fn refuse(status: u16, msg: &str) -> R {
 // ---- the table ----------------------------------------------------------------------------
 
 enum Claim {
-    /// This request runs; the claim's token.
-    Mine(String),
+    /// This request runs: the claim's token, and who may see the answer so far.
+    Mine(String, Vec<String>),
     /// The first request's answer.
     Answer(HttpResponse),
+    /// The first request is still running, and this one may wait for it.
+    Busy,
     Refused(u16, String),
+}
+
+const RUNNING: &str = "a request with this Idempotency-Key is still running; try again shortly";
+/// The same for a row done or running: nothing is said of what is there.
+const SOMEONE_ELSES: &str = "this Idempotency-Key is someone else's: nothing was run; use a key of your own, or say whose it is with `{ user }`";
+
+/// A try of `idempotent`, as far as the table goes.
+struct Attempt<'a> {
+    /// Its row, and the key's row with no `{ user }`, which is the same one when it gave none.
+    id: &'a str,
+    bare: &'a str,
+    /// A row of before there were owners, by `session().user`.
+    old: Option<&'a str>,
+    path: &'a str,
+    print: &'a str,
+    keep_ms: i64,
+    /// A claim past its lease may be taken: the work is in a transaction of its own.
+    take_over: bool,
+    owners: &'a [String],
+}
+
+/// What a row means to a try.
+enum Verdict {
+    /// Past `expires_at`: there is no such key.
+    Expired,
+    Final(Claim),
+    /// Past its lease, in a transaction: the work rolled back, or cannot commit once taken over.
+    Stale,
+}
+
+/// The owners a row keeps. Only a row from before there were owners has none.
+fn owners_of(row: &Map) -> Option<Vec<String>> {
+    serde_json::from_str(&row_text(row, "owners")).ok()
+}
+
+fn judge(row: &Map, a: &Attempt) -> Verdict {
+    let now = now_ms();
+    if row_int(row, "expires_at") <= now {
+        return Verdict::Expired;
+    }
+    let ours = owners_of(row).map_or(true, |o| same_visitor(&o, a.owners));
+    let someone_elses = || Verdict::Final(Claim::Refused(409, SOMEONE_ELSES.into()));
+    let same = row_text(row, "fingerprint") == a.print;
+    let other = || Verdict::Final(Claim::Refused(422, "this Idempotency-Key was used with another request".into()));
+    let done = row_int(row, "done") == 1;
+    if done || row_int(row, "lease_until") > now {
+        return match (ours, same) {
+            (false, _) => someone_elses(),
+            (true, false) => other(),
+            _ if done => Verdict::Final(Claim::Answer(row_answer(row))),
+            _ => Verdict::Final(Claim::Busy),
+        };
+    }
+    // Past its lease it is no more absent for one than for another, and a stranger takes nothing
+    // over: the row stays until it expires.
+    if !ours {
+        return someone_elses();
+    }
+    if !same {
+        return other();
+    }
+    if !a.take_over {
+        return Verdict::Final(Claim::Refused(409, "the first request with this Idempotency-Key stopped before it finished; whether it took effect is not known".into()));
+    }
+    Verdict::Stale
+}
+
+/// Takes the key for this try, or says why not. The claim comes first, and then the key's rows
+/// under other names are looked for: a claim there cannot then slip in between. Of two at once
+/// each sees the other and gives up, and the work runs once, on the next try. Reads come after
+/// the claim's write, so that they are the primary's, never a replica's, which may not have a
+/// first try yet (`Interp::wrote_req`; FEEDBACK55.md, Q-887; branch feedback55).
+fn take(it: &mut Interp, a: &Attempt) -> Result<Claim, String> {
+    let c = claim(it, a)?;
+    if let Claim::Mine(token, _) = &c {
+        if let Some(found) = elsewhere(it, a)? {
+            release(it, a.id, token);
+            return Ok(found);
+        }
+    }
+    Ok(c)
+}
+
+const ROW: &str = "select id, fingerprint, token, done, lease_until, expires_at, status, headers, body, body_b64, owners from _quillo_idempotency";
+
+/// The key's rows under other names: of a `{ user }`, the row with none; of none, each `{ user }`'s
+/// (see the module's notes); and a row from before owners.
+fn elsewhere(it: &mut Interp, a: &Attempt) -> Result<Option<Claim>, String> {
+    let (text, p) = if a.id == a.bare {
+        (format!("{} where bare = ? and id <> ?", ROW), vec![Value::str(a.bare), Value::str(a.id)])
+    } else {
+        (format!("{} where id = ?", ROW), vec![Value::str(a.bare)])
+    };
+    let mut found = Vec::new();
+    if let Value::List(rows) = sql(it, true, &text, p)? {
+        found.extend(rows.iter().cloned());
+    }
+    if let Some(old) = a.old {
+        if let Value::List(rows) = sql(it, true, &format!("{} where id = ? and owners is null", ROW), vec![Value::str(old)])? {
+            found.extend(rows.iter().cloned());
+        }
+    }
+    for row in &found {
+        let Value::Map(row) = row else { continue };
+        match judge(row, a) {
+            Verdict::Final(c) => return Ok(Some(c)),
+            // Its work rolled back, or cannot commit without its row.
+            Verdict::Expired | Verdict::Stale => {
+                let p = vec![Value::str(row_text(row, "id")), Value::str(row_text(row, "token"))];
+                sql(it, false, "delete from _quillo_idempotency where id = ? and token = ? and done = 0", p)?;
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn now_ms() -> i64 {
@@ -423,7 +633,17 @@ fn make_table(it: &mut Interp) -> Value {
          lease_until bigint not null, expires_at bigint not null, status int, headers text, body text, body_b64 int);\n\
          create index if not exists _quillo_idempotency_expires on _quillo_idempotency (expires_at)"
     };
-    crate::db::exec_on(it, None, vec![Value::str(sql)]).unwrap_or_else(|_| Value::Nil)
+    let made = crate::db::exec_on(it, None, vec![Value::str(sql)]).unwrap_or_else(|_| Value::Nil);
+    // Who may see the answer, and the key's row with no `{ user }`: on a table of an older Quillo
+    // too. One there already says so, and that is all.
+    for add in [
+        "alter table _quillo_idempotency add column owners text",
+        "alter table _quillo_idempotency add column bare varchar(64)",
+        "create index _quillo_idempotency_bare on _quillo_idempotency (bare)",
+    ] {
+        let _ = crate::db::exec_on(it, None, vec![Value::str(add)]);
+    }
+    made
 }
 
 /// A statement on the program's database: its result, or the database's
@@ -436,7 +656,7 @@ fn sql(it: &mut Interp, query: bool, sql: &str, params: Vec<Value>) -> Result<Va
         match r {
             Ok(Value::Err(e, _, _)) => {
                 let msg = e.display();
-                if first && msg.contains(TABLE) {
+                if first && (msg.contains(TABLE) || msg.contains("owners") || msg.contains("bare")) {
                     make_table(it);
                     continue;
                 }
@@ -459,79 +679,80 @@ fn changes(v: &Value) -> i64 {
     }
 }
 
-/// Claims key `id` for this request, or says why not.
-fn claim(it: &mut Interp, id: &str, path: &str, print: &str, keep_ms: i64, take_over: bool) -> Result<Claim, String> {
+/// Claims the try's row, on the key alone: its owners go along, and decide nothing here but who
+/// sees what is found (see `judge`).
+fn claim(it: &mut Interp, a: &Attempt) -> Result<Claim, String> {
+    let columns = "(id, path, fingerprint, token, lease_until, expires_at, owners, bare) values (?, ?, ?, ?, ?, ?, ?, ?)";
     let insert = if crate::db::kind_on(it, None) {
-        "insert ignore into _quillo_idempotency (id, path, fingerprint, token, lease_until, expires_at) values (?, ?, ?, ?, ?, ?)"
+        format!("insert ignore into _quillo_idempotency {}", columns)
     } else {
-        "insert into _quillo_idempotency (id, path, fingerprint, token, lease_until, expires_at) values (?, ?, ?, ?, ?, ?) on conflict (id) do nothing"
+        format!("insert into _quillo_idempotency {} on conflict (id) do nothing", columns)
     };
-    let path: String = path.chars().take(1000).collect();
+    let path: String = a.path.chars().take(1000).collect();
+    let owners = serde_json::to_string(a.owners).unwrap_or_else(|_| "[]".into());
     for _ in 0..4 {
         let now = now_ms();
         let token = crate::crypto::hex(&crate::crypto::secret_bytes(16));
-        let p = vec![Value::str(id), Value::str(&path), Value::str(print), Value::str(&token), Value::Int(now + LEASE_MS), Value::Int(now + keep_ms)];
-        if changes(&sql(it, false, insert, p)?) == 1 {
-            return Ok(Claim::Mine(token));
+        let p = vec![Value::str(a.id), Value::str(&path), Value::str(a.print), Value::str(&token), Value::Int(now + LEASE_MS), Value::Int(now + a.keep_ms), Value::str(&owners), Value::str(a.bare)];
+        if changes(&sql(it, false, &insert, p)?) == 1 {
+            return Ok(Claim::Mine(token, a.owners.to_vec()));
         }
         // Someone has the key.
-        let rows = sql(
-            it,
-            true,
-            "select fingerprint, token, done, lease_until, expires_at, status, headers, body, body_b64 from _quillo_idempotency where id = ?",
-            vec![Value::str(id)],
-        )?;
-        let Value::List(rows) = rows else { continue };
+        let Value::List(rows) = sql(it, true, &format!("{} where id = ?", ROW), vec![Value::str(a.id)])? else { continue };
         let Some(Value::Map(row)) = rows.first() else { continue };
-        let int = |k: &str| match row.get(k) {
-            Some(Value::Int(n)) => *n,
-            Some(Value::Bool(b)) => *b as i64,
-            Some(Value::Str(s)) => s.parse().unwrap_or(0),
-            _ => 0,
-        };
-        let text = |k: &str| row.get(k).map_or(String::new(), |v| if matches!(v, Value::Nil) { String::new() } else { v.display() });
-        let theirs = text("token");
-        if int("expires_at") <= now {
-            sql(it, false, "delete from _quillo_idempotency where id = ? and token = ?", vec![Value::str(id), Value::str(&theirs)])?;
-            continue;
-        }
-        if text("fingerprint") != print {
-            return Ok(Claim::Refused(422, "this Idempotency-Key was used with another request".into()));
-        }
-        if int("done") == 1 {
-            let headers: Vec<(String, String)> = serde_json::from_str(&text("headers")).unwrap_or_default();
-            let body = text("body");
-            let body = if int("body_b64") == 1 { crate::crypto::unb64url(&body).unwrap_or_default() } else { body.into_bytes() };
-            return Ok(Claim::Answer(HttpResponse { status: int("status") as u16, headers, body }));
-        }
-        if int("lease_until") > now {
-            return Ok(Claim::Refused(409, "a request with this Idempotency-Key is still running; try again shortly".into()));
-        }
-        if !take_over {
-            return Ok(Claim::Refused(
-                409,
-                "the first request with this Idempotency-Key stopped before it finished; whether it took effect is not known".into(),
-            ));
-        }
-        // Its server stopped part way, and its transaction rolled back.
-        let p = vec![Value::str(&token), Value::Int(now + LEASE_MS), Value::str(id), Value::str(&theirs)];
-        if changes(&sql(it, false, "update _quillo_idempotency set token = ?, lease_until = ? where id = ? and token = ? and done = 0", p)?) == 1 {
-            return Ok(Claim::Mine(token));
+        let theirs = row_text(row, "token");
+        match judge(row, a) {
+            Verdict::Final(c) => return Ok(c),
+            Verdict::Expired => {
+                sql(it, false, "delete from _quillo_idempotency where id = ? and token = ?", vec![Value::str(a.id), Value::str(&theirs)])?;
+            }
+            // Its server stopped part way, and its transaction rolled back. A run that is in fact
+            // still going finds its row taken and cannot commit, so at most one does.
+            Verdict::Stale => {
+                let mut known = owners_of(row).unwrap_or_default();
+                add_owners(&mut known, a.owners.to_vec());
+                let text = serde_json::to_string(&known).unwrap_or_else(|_| "[]".into());
+                let p = vec![Value::str(&token), Value::Int(now + LEASE_MS), Value::str(text), Value::str(a.id), Value::str(&theirs)];
+                if changes(&sql(it, false, "update _quillo_idempotency set token = ?, lease_until = ?, owners = ? where id = ? and token = ? and done = 0", p)?) == 1 {
+                    return Ok(Claim::Mine(token, known));
+                }
+            }
         }
     }
-    Ok(Claim::Refused(409, "a request with this Idempotency-Key is still running; try again shortly".into()))
+    Ok(Claim::Busy)
+}
+
+fn row_int(row: &Map, k: &str) -> i64 {
+    match row.get(k) {
+        Some(Value::Int(n)) => *n,
+        Some(Value::Bool(b)) => *b as i64,
+        Some(Value::Str(s)) => s.parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn row_text(row: &Map, k: &str) -> String {
+    row.get(k).map_or(String::new(), |v| if matches!(v, Value::Nil) { String::new() } else { v.display() })
+}
+
+fn row_answer(row: &Map) -> HttpResponse {
+    let headers: Vec<(String, String)> = serde_json::from_str(&row_text(row, "headers")).unwrap_or_default();
+    let body = row_text(row, "body");
+    let body = if row_int(row, "body_b64") == 1 { crate::crypto::unb64url(&body).unwrap_or_default() } else { body.into_bytes() };
+    HttpResponse { status: row_int(row, "status") as u16, headers, body }
 }
 
 /// Keeps the answer, if the claim is still this request's: Ok(false) if not.
-fn store(it: &mut Interp, id: &str, token: &str, a: &HttpResponse) -> Result<bool, String> {
+fn store(it: &mut Interp, id: &str, token: &str, a: &HttpResponse, owners: &[String]) -> Result<bool, String> {
     let headers: Vec<&(String, String)> = a.headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("set-cookie")).collect();
     let headers = serde_json::to_string(&headers).unwrap_or_else(|_| "[]".into());
     let (body, b64) = match std::str::from_utf8(&a.body) {
         Ok(s) => (s.to_string(), 0),
         Err(_) => (crate::crypto::b64url(&a.body), 1),
     };
-    let p = vec![Value::Int(a.status as i64), Value::str(headers), Value::str(body), Value::Int(b64), Value::str(id), Value::str(token)];
-    let r = sql(it, false, "update _quillo_idempotency set done = 1, status = ?, headers = ?, body = ?, body_b64 = ? where id = ? and token = ? and done = 0", p)?;
+    let owners = serde_json::to_string(owners).unwrap_or_else(|_| "[]".into());
+    let p = vec![Value::Int(a.status as i64), Value::str(headers), Value::str(body), Value::Int(b64), Value::str(owners), Value::str(id), Value::str(token)];
+    let r = sql(it, false, "update _quillo_idempotency set done = 1, status = ?, headers = ?, body = ?, body_b64 = ?, owners = ? where id = ? and token = ? and done = 0", p)?;
     Ok(changes(&r) == 1)
 }
 

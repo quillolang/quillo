@@ -395,7 +395,9 @@ fn a_page_made_for_one_visitor_is_private_and_no_site_frames_a_page() {
     assert_eq!((own.header("x-frame-options"), own.header("cache-control"), own.header("x-extra")), (Some("DENY"), Some("no-store"), Some("3")));
     let api = h("/api");
     assert_eq!((api.header("cache-control"), api.header("x-frame-options")), (Some("private"), None));
-    assert_eq!(h("/missing").header("cache-control"), None);
+    // Whatever the status: a 404 that names the visitor is theirs (FEEDBACK55.md, Q-886; branch
+    // feedback55).
+    assert_eq!(h("/missing").header("cache-control"), Some("private"));
     for (bad, said) in [
         ("site_headers(\"admin\", {})", "needs a path that starts with /"),
         ("site_headers({ \"bad name\": \"1\" })", "is not a header's name"),

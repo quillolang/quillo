@@ -187,11 +187,15 @@ fn keys_belong_to_a_user_and_a_tenant() {
     };
     let (ada, bob) = (login("ada"), login("bob"));
     let mine = |cookie: &str| send(s.port, "POST", "/mine", &[("Idempotency-Key", "shared"), ("Cookie", cookie)], "").body;
+    // A key runs once, whoever asks: bob cannot read ada's answer, and is told so, with nothing run.
+    // Two accounts with one key say so with `{ user }`, below (FEEDBACK55.md, Q-887; branch
+    // feedback55).
+    let refused = |answer: String| assert!(answer.contains("someone else's") && !answer.contains("runs"), "{}", answer);
     assert_eq!(mine(&ada), r#"{"user":"ada","runs":1}"#);
-    assert_eq!(mine(&bob), r#"{"user":"bob","runs":2}"#, "bob's request runs: he cannot read ada's answer");
+    refused(mine(&bob));
     assert_eq!(mine(&ada), r#"{"user":"ada","runs":1}"#);
-    assert_eq!(mine(&bob), r#"{"user":"bob","runs":2}"#);
-    assert_eq!(runs(s.port, "mine"), "2");
+    refused(mine(&bob));
+    assert_eq!(runs(s.port, "mine"), "1");
 
     // The user an option names (a token's, say), and the tenant.
     let api = |user: &str, tenant: &str| {

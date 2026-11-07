@@ -1128,6 +1128,8 @@ impl Parser {
                                     line,
                                     file: self.file.clone(),
                                     uses_request: false,
+                                    reads_visitor: false,
+                                    middleware_reads: Default::default(),
                                     effects: None,
                                     limit: None,
                                 })));
@@ -1440,7 +1442,7 @@ impl Parser {
         let ours = std::mem::replace(&mut self.styling, outer);
         let (mut body, nesting) = body?;
         name_unmarked_styles(&mut body, ours);
-        Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line, nesting, file: self.file.clone(), hot: Default::default() })
+        Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line, nesting, file: self.file.clone(), hot: Default::default(), request_use: Default::default() })
     }
 
     /// `style <css>` at a file's top level: the CSS of the components the file declares, and no
@@ -1472,7 +1474,7 @@ impl Parser {
             args[1] = Expr::Lit(Lit::Nil);
         }
         let body = Expr::Block(vec![Stmt::Expr(Expr::Call(Box::new(Expr::Ident("__style".into(), line)), args, line))]);
-        Ok(Stmt::Fn(Arc::new(FnDef { name, params: Vec::new(), ret: None, err: None, effects: None, server: false, component: false, body, line, nesting: 1, file: self.file.clone(), hot: Default::default() })))
+        Ok(Stmt::Fn(Arc::new(FnDef { name, params: Vec::new(), ret: None, err: None, effects: None, server: false, component: false, body, line, nesting: 1, file: self.file.clone(), hot: Default::default(), request_use: Default::default() })))
     }
 
     /// `style <css>` in a component's or view's body: the call of `__style`,
@@ -1560,7 +1562,7 @@ impl Parser {
         let ours = std::mem::replace(&mut self.styling, outer);
         let (mut body, nesting) = body?;
         name_unmarked_styles(&mut body, ours);
-        let def = FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line, nesting, file: self.file.clone(), hot: Default::default() };
+        let def = FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line, nesting, file: self.file.clone(), hot: Default::default(), request_use: Default::default() };
         key_not_a_param(&def)?;
         Ok(def)
     }
@@ -2122,7 +2124,13 @@ impl Parser {
         let uses_request = body_pat.is_some()
             || names_request(&body)
             || query.as_ref().map_or(false, pattern_names_request);
-        Ok(RouteDef { method, path, query, body_pat, guards: Vec::new(), body, line, file: self.file.clone(), uses_request, effects, limit: None }.limited())
+        let reads_visitor = body_pat.as_ref().is_some_and(pattern_reads_visitor)
+            || request_use(|f| {
+                query.iter().chain(body_pat.iter()).for_each(|p| crate::check::walk_pattern(p, f));
+                crate::check::walk_expr(&body, f)
+            })
+            .1;
+        Ok(RouteDef { method, path, query, body_pat, guards: Vec::new(), body, line, file: self.file.clone(), uses_request, reads_visitor, middleware_reads: Default::default(), effects, limit: None }.limited())
     }
 
     /// Whether what follows `routes` is a group's path: `/` and a path
@@ -2287,6 +2295,7 @@ impl Parser {
                         r.body = Expr::Block(stmts);
                     }
                     r.uses_request = r.uses_request || !before.is_empty() || !r.guards.is_empty();
+                    r.reads_visitor = r.reads_visitor || r.guards.iter().any(pattern_reads_visitor);
                     if let Some(g) = &effects {
                         match &r.effects {
                             Some(own) => {
@@ -2333,6 +2342,8 @@ impl Parser {
                     line,
                     file: self.file.clone(),
                     uses_request: true,
+                    reads_visitor: guards.iter().any(pattern_reads_visitor),
+                    middleware_reads: Default::default(),
                     effects: effects.clone(),
                     limit: None,
                 }
@@ -4005,6 +4016,7 @@ fn arrow(params: Vec<Param>, ret: Option<Ty>, (body, nesting): (Expr, u32), line
         nesting,
         file,
         hot: Default::default(),
+        request_use: Default::default(),
     }))
 }
 
@@ -4348,23 +4360,73 @@ fn push_text(children: &mut Vec<HtmlChild>, text: &mut String) {
 
 /// Whether `e` mentions `request` anywhere (closures included).
 pub(crate) fn names_request(e: &Expr) -> bool {
-    let mut found = false;
-    crate::check::walk_expr(e, &mut |x| {
-        if let Expr::Ident(n, _) = x {
-            found |= n == "request";
-        }
-    });
-    found
+    request_use(|f| crate::check::walk_expr(e, f)).0
 }
 
 fn pattern_names_request(p: &Pattern) -> bool {
+    request_use(|f| crate::check::walk_pattern(p, f)).0
+}
+
+/// The fields of `request` that say who nobody is: what the URL says, which a cache keeps pages
+/// by, and what was sent, which it does not keep. Every other one, a field added later too, is
+/// the visitor's (FEEDBACK55.md, Q-886; branch feedback55).
+const NOBODYS_FIELDS: &[&str] = &["path", "route_path", "host", "query", "query_string", "params", "method", "id", "body", "json", "form", "files"];
+
+/// Whether the code `walk` goes over names `request`, and whether it can read the visitor from
+/// it: a field of theirs (`headers`, `cookies`, `ip`), or the request itself going anywhere, to
+/// a helper, a pattern, `get` or `values`, as all that is left of who reads what from there is
+/// that it left. Reading it where it leaves the map, here, is one rule for every way of reading
+/// it, where the fields' reads were followed one by one and `get(request.headers, "x")`, `let {
+/// cookies } = request` and `request.headers["x-api-key"]` were not, and such a page was kept
+/// for everyone by a cache in front (FEEDBACK55.md, Q-886; branch feedback55).
+pub(crate) fn request_use(walk: impl FnOnce(&mut dyn FnMut(&Expr))) -> (bool, bool) {
+    let (named, nobodys) = uses_of("request", walk);
+    (named > 0, named > nobodys)
+}
+
+/// How often the code `walk` goes over names `name`, and how often as a field of nobody's.
+fn uses_of(name: &str, walk: impl FnOnce(&mut dyn FnMut(&Expr))) -> (u32, u32) {
+    let (mut named, mut nobodys) = (0u32, 0u32);
+    walk(&mut |x| match x {
+        Expr::Ident(n, _) if n == name => named += 1,
+        Expr::Field(o, f, _) if matches!(&**o, Expr::Ident(n, _) if n == name) && NOBODYS_FIELDS.contains(&f.as_str()) => nobodys += 1,
+        _ => {}
+    });
+    (named, nobodys)
+}
+
+/// Whether a group's middleware can read the visitor from the request it is given, its first
+/// parameter: `request_use` of it, but that handing the request back is how it lets the route
+/// go on, not the request going anywhere (FEEDBACK55.md, Q-886; branch feedback55).
+pub(crate) fn middleware_reads_visitor(d: &FnDef) -> bool {
+    let Some(p) = d.params.first() else { return d.request_use().1 };
+    let (named, nobodys) = uses_of(p.name.as_str(), |f| crate::check::walk_fn(d, f));
+    d.request_use().1 || named > nobodys + given_back(&d.body, p.name.as_str())
+}
+
+/// How often `e` gives `name` as its value, or returns it.
+fn given_back(e: &Expr, name: &str) -> u32 {
+    match e {
+        Expr::Ident(n, _) if n == name => 1,
+        Expr::If(_, a, b) => given_back(a, name) + b.as_ref().map_or(0, |b| given_back(b, name)),
+        Expr::Match(_, arms, _) => arms.iter().map(|a| given_back(&a.body, name)).sum(),
+        Expr::Block(stmts) => stmts
+            .iter()
+            .map(|s| match s {
+                Stmt::Expr(x) | Stmt::Return(Some(x), _) => given_back(x, name),
+                _ => 0,
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
+/// Whether a request pattern reads the visitor: it binds the request, or a field of theirs.
+pub(crate) fn pattern_reads_visitor(p: &Pattern) -> bool {
     match p {
-        Pattern::Record(fields) => {
-            fields.iter().any(|f| f.default.as_ref().map_or(false, names_request) || pattern_names_request(&f.pat))
-        }
-        Pattern::List(items, _) | Pattern::Alt(items) => items.iter().any(pattern_names_request),
-        Pattern::As(q, _) => pattern_names_request(q),
-        _ => false,
+        Pattern::Record(fields) => fields.iter().any(|f| f.path.first().map_or(true, |n| !NOBODYS_FIELDS.contains(&n.as_str()))),
+        Pattern::Wild | Pattern::Lit(_) | Pattern::Type(_) => false,
+        Pattern::Bind(_) | Pattern::As(..) | Pattern::List(..) | Pattern::Alt(_) => true,
     }
 }
 

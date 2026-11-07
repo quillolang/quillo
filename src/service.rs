@@ -1022,6 +1022,8 @@ fn forwarded(it: &mut Interp, names: &[String]) -> Vec<(String, String)> {
     }
     let Some(Value::Map(r)) = it.request_value() else { return Vec::new() };
     let Some(Value::Map(h)) = r.get("headers") else { return Vec::new() };
+    // What comes back may be theirs (FEEDBACK55.md, Q-886; branch feedback55).
+    it.visitor_read = true;
     names.iter().filter_map(|n| h.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| (format!("x-quillo-forward-{}", n), v.display()))).collect()
 }
 

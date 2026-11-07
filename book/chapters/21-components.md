@@ -1276,13 +1276,16 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
   `live({ every: "2s" }, load)` asks for a gap of its own between a page's refreshes,
   as `500`, `"500ms"`, `"2s"` or `"1m"`, written here as it is.
 - A loader's run is shared by the pages that ask, within two seconds, for the same
-  function with the same arguments (and the same `Host`) while nothing it read has
-  changed: fifty open boards run `load_board` once, and that goes for a page's first
-  load too. Calls that come while a run is under way wait for it. A run that read the
-  request (`session()`, cookies, headers, the locale) is shared only by the same viewer's
-  pages (their tabs), wherever in the run it read it; a viewer is told by address,
-  cookies, `Authorization`, `Accept-Language` and `User-Agent` together. A run that
-  wrote, set a cookie, took a file, or answered with `respond` is not shared.
+  function with the same arguments, `Host` and tenant while nothing it read has changed:
+  fifty open boards run `load_board` once, and that goes for a page's first load too.
+  Calls that come while a run is under way wait for it. A run that read the visitor
+  (`session()`, cookies, `request`, the locale), wherever in the run it read it, or did
+  anything but read (wrote, called a service or plugin, `crypto.token`, `uuid`, `random`,
+  set a cookie, took a file, answered with `respond`), is shared with nobody, not even
+  the visitor's other tabs, and nothing waits for it. Randomness made in SQL (`select
+  hex(randomblob(8))`) is a read, so such a run is shared: make tokens with
+  `crypto.token`. `nextval` or a writing function behind a view is not seen either: put
+  it in the query.
 - **What a thousand pages cost** depends on whether the loader is shared. A loader for
   everyone runs once a change however many pages show it. One that reads the viewer runs
   once for each page, on every change to what it read, so with many pages and a busy

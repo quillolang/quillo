@@ -159,8 +159,8 @@ than the balance gives `422 {"error":"Not enough money","balance":{"amount":"87.
   the server stops part way, the database rolls the transaction back, and a minute later
   the next request with the key runs it.
 - The same key with another body is refused with 422; one sent while the first is still
-  running gets 409. Keys belong to the signed-in user: another user's key is another
-  request.
+  running gets 409. A key runs at most once, whoever asks: another visitor with it gets 409
+  too, with nothing run or shown, unless the `user` option gives each their own.
 - A `reply` rolls back and keeps nothing, so a retry runs again: right for a request
   that was wrong. `respond(422, ...)` is an answer like any other: "Not enough money" is
   kept, and the same request again gets it, even if money has come in since.

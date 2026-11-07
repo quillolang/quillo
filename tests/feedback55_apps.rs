@@ -162,15 +162,17 @@ route GET / {
     assert_eq!((metric(&s, "ran"), metric(&s, "shared")), (1, 2));
 }
 
-// And one viewer's two tabs still share their own run.
+// And a run that read the visitor is no one else's, not even their other tab's: telling viewers
+// apart took a list of what identifies nobody, and that let one see another's (FEEDBACK55.md,
+// Q-881; branch feedback55).
 #[test]
-fn a_viewers_tabs_share_their_run() {
+fn a_viewers_tabs_run_for_themselves() {
     let d = app("tabs", &[("main.qwe", AFTER_THE_ROUTE)]);
     let s = run(&d);
     let one = sign_in(&s, 1);
     assert_eq!(page(&s, "/", &[("cookie", &one)]), ["1", "1"]);
     assert_eq!(page(&s, "/", &[("cookie", &one)]), ["1", "1"]);
-    assert_eq!((metric(&s, "ran"), metric(&s, "shared")), (1, 1));
+    assert_eq!((metric(&s, "ran"), metric(&s, "shared")), (2, 0));
 }
 
 /// What `quillo check` warns of `src`, "line: message".

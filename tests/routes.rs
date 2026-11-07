@@ -590,22 +590,31 @@ fn live_runs_are_shared_and_answers_are_patches() {
         r#"
 let rows = for i in range(500) => { id: i, title: `Row ${i}` }
 let count = 0
-server fn load_rows() with random = { stamp: random(), rows }
-server fn mine() with random = { stamp: random(), who: request.headers["cookie"] }
-server fn counted() with random { count += 1; random() }
+server fn load_rows() with time {
+    sleep(2)
+    { stamp: now(), rows }
+}
+server fn mine() with time {
+    sleep(2)
+    { stamp: now(), who: request.headers["cookie"] }
+}
+server fn counted() { count += 1; count }
 server fn rename(id: int) { rows = for r in rows => r.id == id ? merge(r, { title: "Renamed" }) : r }
 "#,
     );
+    // Told apart by the clock: a run that takes a random number is not shared at all
+    // (FEEDBACK55.md, Q-888; branch feedback55).
     // Not the viewer's: one run for both.
     let a = live_as(&mut it, "load_rows", "a", None);
     let b = live_as(&mut it, "load_rows", "b", None);
     assert_eq!(a["ok"]["stamp"], b["ok"]["stamp"]);
     assert_eq!(a["h"], b["h"]);
-    // The viewer's: one run each, and the same viewer's pages share theirs.
+    // The viewer's: one run each time, their own pages' too (FEEDBACK55.md, Q-881; branch
+    // feedback55).
     let ma = live_as(&mut it, "mine", "a", None);
     let mb = live_as(&mut it, "mine", "b", None);
     assert_ne!(ma["ok"]["stamp"], mb["ok"]["stamp"]);
-    assert_eq!(live_as(&mut it, "mine", "a", None)["ok"]["stamp"], ma["ok"]["stamp"]);
+    assert_ne!(live_as(&mut it, "mine", "a", None)["ok"]["stamp"], ma["ok"]["stamp"]);
     // A run that writes is never shared.
     assert_ne!(live_as(&mut it, "counted", "a", None)["ok"], live_as(&mut it, "counted", "b", None)["ok"]);
     // After a change, a page that says what it has is sent a patch to it.
