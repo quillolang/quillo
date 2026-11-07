@@ -5382,13 +5382,13 @@ fn highlighting_takes_time_in_proportion_to_the_text() {
     // The path is a path to its end: no comment in it.
     let h = highlight(&report, "quillo");
     assert!(!h.contains("hl-c") && h.ends_with("/*/*"), "{}", &h[..200]);
-    // Four times the text against at most six times the time: linear passes with room for a
-    // loaded machine, quadratic (sixteen times) does not.
+    // Four times the text against at most eight times the time: linear passes with room for a
+    // loaded machine (a CI runner took 6.4), quadratic (sixteen times) does not.
     let (small, large) = (slow_shapes(100_000), slow_shapes(400_000));
     for ((lang, a), (_, b)) in small.iter().zip(large.iter()) {
         let (ta, tb) = (best_of_three(&|| drop(highlight(a, lang))), best_of_three(&|| drop(highlight(b, lang))));
         assert!(tb < 1.5, "{} {:?}...: {:.3} s", lang, &a[..20], tb);
-        assert!(tb < 6.0 * ta + 0.02, "{} {:?}...: {:.4} s, then {:.4} s for four times the text", lang, &a[..20], ta, tb);
+        assert!(tb < 8.0 * ta + 0.02, "{} {:?}...: {:.4} s, then {:.4} s for four times the text", lang, &a[..20], ta, tb);
     }
     // The edges: none, one, and a path after the route's, which is a comment to the end.
     assert_eq!(highlight("route GET ", "quillo"), "<span class=\"hl-k\">route</span> <span class=\"hl-t\">GET</span> ");
