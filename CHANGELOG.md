@@ -12,9 +12,6 @@
 - A component of a file with a top-level `style` gets that style when it is first shown in the
   browser, from a file nothing on the server's page came from. It had no CSS at all from the
   file (FEEDBACK37.md, Q-457).
-- A server fn answered with a 200 that is no answer, such as a sign-in page a redirect led to, an
-  empty body or one cut short, gives an error in the browser. It gave `null`, as if the call
-  had worked (FEEDBACK49.md, Q-598).
 
 ## 0.8.0 (2026-11-07)
 

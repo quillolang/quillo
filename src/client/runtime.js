@@ -5661,20 +5661,15 @@ async function rpcSend(name, args, live, idem) {
     // 0.25 s, 0.5 s, 1 s, give or take a quarter.
     await new Promise((ok) => setTimeout(ok, 250 * 2 ** (3 - tries) * (0.75 + Math.random() / 2)));
   }
-  let body = null, text = "";
-  try { text = await r.text(); body = readJSON(text); if (!body || !hasOwn(body, "patch")) body = untagDeep(body); } catch (_) {}
+  let body = null;
+  try { body = readJSON(await r.text()); if (!body || !hasOwn(body, "patch")) body = untagDeep(body); } catch (_) {}
   if (!r.ok) return { ...failed(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`), unanswered: RETRIED.includes(r.status) };
-  // A 200 that is no answer (a sign-in page a redirect led to, nothing, a body cut short) gave
-  // `null`, as if the call had worked (FEEDBACK49.md, Q-598; branch feedback61).
-  if (!body || !["ok", "err", "patch"].some((k) => hasOwn(body, k))) {
-    return failed(`server fn \`${name}\` answered something that is not its answer (${(r.headers && r.headers.get("content-type")) || "no type"}, ${text.length} characters)`);
-  }
   let value = null;
-  if (hasOwn(body, "patch")) {
+  if (body && hasOwn(body, "patch")) {
     if (!had) return failed(`server fn \`${name}\`: a patch to nothing`);
     value = livePatched(base, body.patch);
-  } else value = hasOwn(body, "err") ? new Err(body.err, true) : body.ok;
-  return { value, topics: body.topics || [], seq: body.seq || 0, server: body.server || "", h: body.h || "" };
+  } else value = body && hasOwn(body, "err") ? new Err(body.err, true) : body && hasOwn(body, "ok") ? body.ok : null;
+  return { value, topics: (body && body.topics) || [], seq: (body && body.seq) || 0, server: (body && body.server) || "", h: (body && body.h) || "" };
 }
 
 // A live value made from the last one and what changed (the format is in
