@@ -1,0 +1,71 @@
+// How often each frame, picture and player is asked for: once, while the page is taken up, where
+// the server's page already says it (FEEDBACK61.md, Q-893; branch feedback61).
+
+let lit = 0
+let held = 0
+let from_state = 0
+let tpl0 = 0
+let tpl1 = 0
+let pic = 0
+let row = 0
+let film = 0
+let odd = 0
+
+route GET /inner/lit {
+    lit += 1
+    <p>x</p>
+}
+route GET /inner/held {
+    held += 1
+    <p>x</p>
+}
+route GET /inner/state {
+    from_state += 1
+    <p>x</p>
+}
+route GET /inner/tpl0 {
+    tpl0 += 1
+    <p>x</p>
+}
+route GET /inner/tpl1 {
+    tpl1 += 1
+    <p>x</p>
+}
+route GET /pic/one {
+    pic += 1
+    <p>x</p>
+}
+route GET /pic/row1 {
+    row += 1
+    <p>x</p>
+}
+route GET /film {
+    film += 1
+    <p>x</p>
+}
+route GET /odd/:x {
+    odd += 1
+    <p>x</p>
+}
+route GET /counts = { lit: lit, held: held, state: from_state, tpl0: tpl0, tpl1: tpl1, pic: pic, row: row, film: film, odd: odd }
+
+component Embed() {
+    state n = 0
+    state page = "/inner/state"
+    let kept = "/inner/held"
+    // Not the same on both sides: the browser's must still reach the page.
+    let made = `/odd/${random_int(1, 1000000000)}`
+    <div>
+        <iframe src="/inner/lit"></iframe>
+        <iframe src={kept}></iframe>
+        <iframe src={page}></iframe>
+        <iframe id="tpl" src={`/inner/tpl${n}`}></iframe>
+        <img src={`/pic/one`}/>
+        {for x in [1] => <img src={`/pic/row${x}`}/>}
+        <video src={`/film`}></video>
+        <iframe id="made" src={made}></iframe>
+        <button id="go" onclick={() => { n += 1 }}>{n}</button>
+    </div>
+}
+
+route GET / = <html><body><Embed/></body></html>

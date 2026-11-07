@@ -155,14 +155,17 @@ impl Styles {
 }
 
 /// The classes the program's markup writes, sorted: the `.name` shorthand, `class="..."`, the
-/// text in `class={...}`, and `class:name` toggles; for a CSS engine, which a scanner of the
-/// source as text served badly (FEEDBACK37.md, Q-456; branch feedback36-39). A class made from
-/// parts (`` `bg-${color}` ``) is in none of them: only whole words written out are.
+/// text in `class={...}` and a class map's keys there, and `class:name` toggles; for a CSS engine,
+/// which a scanner of the source as text served badly (FEEDBACK37.md, Q-456; branch
+/// feedback36-39). A class made from parts (`` `bg-${color}` ``) is in none of them: only whole
+/// words written out are. A map held in a name is not read: only a map written in `class={...}`,
+/// or in a list or choice there, is known to hold classes (FEEDBACK61.md, Q-898; branch feedback61).
 pub fn written_classes(files: &[&[crate::ast::Stmt]]) -> Vec<String> {
     use crate::ast::{AttrVal, Expr, HtmlChild, HtmlEl, Lit, TPart};
     fn texts(e: &Expr, out: &mut std::collections::BTreeSet<String>) {
         crate::check::walk_expr(e, &mut |x| match x {
             Expr::Lit(Lit::Str(s)) => out.extend(s.split_whitespace().map(str::to_string)),
+            Expr::Map(fields) => out.extend(fields.iter().flat_map(|(k, _)| k.split_whitespace().map(str::to_string))),
             Expr::Template(parts) => {
                 for (k, p) in parts.iter().enumerate() {
                     let TPart::Lit(t) = p else { continue };

@@ -806,6 +806,25 @@ fn the_server_and_the_browser_agree() {
 /// Where Quillo meets the page: what compares, what waits, what a handler set by hand, and
 /// the rows and timers around it (FEEDBACK28.md; branch feedback29-fixes).
 #[test]
+fn a_src_the_page_already_says_is_not_asked_for_again() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("src_once.qwe"), free_port(), Some(&dir.join("src_once.js")));
+    assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
+    for k in ["lit", "held", "state", "tpl0", "pic", "row", "film"] {
+        assert_eq!(r["seen"][k], 1, "{} on load: {}", k, r);
+    }
+    // A change still asks, once, and what differs from the page is still written.
+    assert_ne!(r["clicked"], "0", "{}", r);
+    assert_eq!(r["seen"]["tpl1"], 1, "{}", r);
+    assert_eq!(r["tpl"], "/inner/tpl1", "{}", r);
+    assert_eq!(r["seen"]["odd"], 2, "the server's value, then the browser's: {}", r);
+}
+
+#[test]
 fn the_seam_with_the_page_holds() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {
         eprintln!("skipping: needs Chrome and Node 22 or later");

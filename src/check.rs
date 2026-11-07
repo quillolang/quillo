@@ -7484,6 +7484,10 @@ fn unused_classes(order: &[Item], base: &Path, unparsed: &[String]) -> Vec<(Arc<
             _ => {}
         });
     }
+    // What markup writes that no string says: a class map's keys and `class:name`. Told as
+    // unused, a rule in use looked safe to delete (FEEDBACK61.md, Q-898; branch feedback61).
+    let items: Vec<&[Stmt]> = order.iter().map(|it| std::slice::from_ref(&it.stmt)).collect();
+    written.extend(crate::styles::written_classes(&items));
     // A file that does not parse may write any class its text holds
     // (FEEDBACK13.md, Q-092; branch feedback13-fixes).
     for src in unparsed {

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- `quillo check` no longer calls a class unused when `class={{ active: on }}`, a map in a list or
+  choice inside `class={...}`, or `class:active={on}` writes it, and `classes()` and
+  `quillo classes` now list a map's keys, so a CSS engine makes rules for them. A map held in a
+  name is still not read (FEEDBACK61.md, Q-898).
+- A frame, picture or player with `src={...}` in a component is asked for once when the page
+  loads, not twice: taking up the server's page no longer writes the same text again
+  (FEEDBACK61.md, Q-893).
+
 ## 0.8.0 (2026-11-07)
 
 **Upgrade from 0.7.0: see Security below.** One visitor's data could reach another in 0.7.0,

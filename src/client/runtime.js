@@ -7177,7 +7177,9 @@ function setProp(el, k, v, old) {
   // The text the attribute will say, whatever the value's type (html too).
   if (URL_ATTRS.includes(k.toLowerCase()) && scriptURL(s) || animValueAttr(el, k) && s.split(";").some(scriptURL)) v = s = "about:blank#blocked";
   if (claiming && el.getAttribute(k) !== s) attrDiffers(el, k, s); // dev
-  if (old !== v || el.getAttribute(k) !== s) el.setAttribute(k, s);
+  // What the server's page already says is not written again while taking it up: that starts a
+  // frame or a player over, and asks the server twice (FEEDBACK61.md, Q-893; branch feedback61).
+  if ((old !== v && !claiming) || el.getAttribute(k) !== s) el.setAttribute(k, s);
 }
 
 // A select shows the option its value names; a list (`<select multiple>`) each option it names;
