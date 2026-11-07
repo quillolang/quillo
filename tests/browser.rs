@@ -806,6 +806,51 @@ fn the_server_and_the_browser_agree() {
 /// Where Quillo meets the page: what compares, what waits, what a handler set by hand, and
 /// the rows and timers around it (FEEDBACK28.md; branch feedback29-fixes).
 #[test]
+fn a_2xx_its_server_did_not_send_is_an_error_not_null() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("rpc_no_answer.qwe"), free_port(), Some(&dir.join("rpc_no_answer.js")));
+    assert_eq!(r["first"], "value: real", "{}", r);
+    let no = "err: server fn `question` answered something that is not its answer";
+    for (k, tail) in [
+        ("html", "(text/html; charset=utf-8, 20 characters)"),
+        ("empty", "(no type, 0 characters)"),
+        ("json_null", "(application/json, 4 characters)"),
+        ("list", "(application/json, 3 characters)"),
+        ("number", "(application/json, 2 characters)"),
+        ("other", "(application/json, 7 characters)"),
+        ("cut", "(application/json, 0 characters)"),
+    ] {
+        assert_eq!(r["seen"][k], format!("{} {}", no, tail), "{}: {}", k, r);
+    }
+    // An answer whose mark a proxy dropped, and what the server marks, are answers.
+    assert_eq!(r["seen"]["ok_null"], "value: null", "{}", r);
+    assert_eq!(r["seen"]["ok_text"], "value: x", "{}", r);
+    assert_eq!(r["seen"]["marked"], "value: null", "{}", r);
+    // The server's own, through the real server.
+    assert_eq!(r["real"], "value: real", "{}", r);
+    assert_eq!(r["nothing"], "value: null", "{}", r);
+    assert_eq!(r["refused"], "err: no", "{}", r);
+    for k in ["made", "early", "record", "blank"] {
+        assert_eq!(r[k], "value: null", "{}: {}", k, r);
+    }
+    let moved = r["moved"].as_str().unwrap();
+    assert!(moved.starts_with("err: server fn `moved` answered something that is not its answer"), "{}", r);
+    // Cut short, it may have run: the same key goes again, and a new one after it is answered.
+    assert_eq!(r["paid"], "value: me", "{}", r);
+    assert_eq!(r["keys"][0], r["keys"][1], "{}", r);
+    assert_ne!(r["keys"][1], r["keys"][2], "{}", r);
+    // Every way out of a server fn says it is the server's.
+    for k in ["ok", "err", "respond", "reply", "empty", "none", "live", "replayed"] {
+        assert_eq!(r["marks"][k], "1", "{}: {}", k, r);
+    }
+    assert_eq!(r["marks"]["page"], serde_json::Value::Null, "a page is not marked: {}", r);
+}
+
+#[test]
 fn a_files_style_reaches_a_component_first_shown_in_the_browser() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {
         eprintln!("skipping: needs Chrome and Node 22 or later");

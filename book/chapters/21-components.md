@@ -1398,7 +1398,12 @@ The error value's text says what happened: ``server fn `x` could not be reached:
 ...`` when there was no answer, ``server fn `x` failed (403): ...`` when the server
 refused it (400 with the argument that did not fit, 403 from another site, 404 for no
 such function, 500 `internal error in x`, whose real message is on the server's
-stderr). A function that returns `err(v)` gives an error value with `v`. A `reply 401
+stderr), and ``server fn `x` answered something that is not its answer (text/html, 1234
+characters)`` when a 2xx came back that the server did not send, or cut short: a sign-in page a
+redirect led to, a proxy's page, an empty body. Quillo's server marks what it sends with
+`x-quillo-answer`, so `respond` and `reply` still give `null` (a proxy that drops the mark turns those
+into this error; ordinary answers go through). A `redirect` from the function itself is followed
+by the browser, and gives this error too. A function that returns `err(v)` gives an error value with `v`. A `reply 401
 "Log in first"` inside it gives only the status (``failed (401)``), since its body is
 not JSON: return `err("Log in first")`, or `reply 401 { error: "Log in first" }`, for the
 page to show the words. Nothing happens by itself on a 401 or a 500 (no redirect, no

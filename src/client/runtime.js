@@ -5661,9 +5661,19 @@ async function rpcSend(name, args, live, idem) {
     // 0.25 s, 0.5 s, 1 s, give or take a quarter.
     await new Promise((ok) => setTimeout(ok, 250 * 2 ** (3 - tries) * (0.75 + Math.random() / 2)));
   }
-  let body = null;
-  try { body = readJSON(await r.text()); if (!body || !hasOwn(body, "patch")) body = untagDeep(body); } catch (_) {}
+  let body = null, text = "", cut = false;
+  try { text = await r.text(); } catch (_) { cut = true; }
+  try { body = readJSON(text); if (!body || !hasOwn(body, "patch")) body = untagDeep(body); } catch (_) {}
   if (!r.ok) return { ...failed(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`), unanswered: RETRIED.includes(r.status) };
+  // A 2xx that is no answer, a sign-in page a redirect led to, nothing, a body cut short, gave
+  // `null` as if the call had worked. The server marks what it sends, since `respond` and `reply`
+  // hold what they like; a proxy may drop the mark, so an answer's own shape counts too. It may
+  // have run: its key is kept, so that trying again cannot run it twice (FEEDBACK49.md, Q-598;
+  // branch feedback61).
+  const shaped = body && ["ok", "err", "patch"].some((k) => hasOwn(body, k));
+  if (cut || (!shaped && !(r.headers && r.headers.get("x-quillo-answer")))) {
+    return { ...failed(`server fn \`${name}\` answered something that is not its answer (${(r.headers && r.headers.get("content-type")) || "no type"}, ${text.length} characters)`), unanswered: true };
+  }
   let value = null;
   if (body && hasOwn(body, "patch")) {
     if (!had) return failed(`server fn \`${name}\`: a patch to nothing`);

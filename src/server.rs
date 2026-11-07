@@ -646,7 +646,14 @@ impl Interp {
     fn handle_inner(&mut self, req: &HttpRequest) -> HttpResponse {
         let (path, qs) = req.url.split_once('?').unwrap_or((req.url.as_str(), ""));
         if let Some(rest) = path.strip_prefix("/_quillo/") {
-            return self.handle_internal(rest, req, path, qs);
+            let mut resp = self.handle_internal(rest, req, path, qs);
+            // Says this came from the server fn's own server, whatever it holds: `respond` and
+            // `reply` answer as they like, and the page has to tell them from a sign-in page or a
+            // proxy's (FEEDBACK49.md, Q-598; branch feedback61).
+            if rest.starts_with("rpc/") {
+                resp.headers.push(("x-quillo-answer".into(), "1".into()));
+            }
+            return resp;
         }
         // A page on another site can have the browser send a form (or text)
         // here, with this site's cookies: refused for anything but reading,

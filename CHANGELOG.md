@@ -6,6 +6,11 @@
   choice inside `class={...}`, or `class:active={on}` writes it, and `classes()` and
   `quillo classes` now list a map's keys, so a CSS engine makes rules for them. A map held in a
   name is still not read (FEEDBACK61.md, Q-898).
+- A server fn answered with a 2xx that its server did not send, or that was cut short, gives an
+  error in the browser: a sign-in page a redirect led to, a proxy's page, an empty body. It gave
+  `null`, as if the call had worked. Server fn answers now carry `x-quillo-answer`, so `respond` and
+  `reply` go on giving `null`. A `redirect` from the function itself, which the browser follows,
+  gives the same error (FEEDBACK49.md, Q-598).
 - A frame, picture or player with `src={...}` in a component is asked for once when the page
   loads, not twice: taking up the server's page no longer writes the same text again. A frame or
   player with a listener other than a click is still started over, since the load it waits for

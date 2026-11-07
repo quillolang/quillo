@@ -1,0 +1,47 @@
+// What a server fn's call gives when what comes back is not its answer, and when it is, whatever
+// it holds (FEEDBACK49.md, Q-598; branch feedback61).
+
+db.exec("create table if not exists paid (who text)")
+
+server fn question() = "real"
+server fn nothing() = null
+server fn refused() = err("no")
+server fn made() = respond(201, "made")
+server fn early() {
+    reply 202 "early"
+    1
+}
+server fn record() {
+    reply 200 { id: 5 }
+}
+server fn blank() = respond(204, "")
+server fn moved() = redirect("/elsewhere")
+server fn pay(who: str) = idempotent(() => {
+    db.exec("insert into paid (who) values (?)", who)
+    who
+})
+
+route GET /elsewhere = <p>here</p>
+
+component Ask() {
+    state n = 0
+    state said = "-"
+    let tell = (r) => {
+        n += 1
+        said = is_err(r) ? `${n} err: ${r.error}` : `${n} value: ${r ?? "null"}`
+    }
+    <div>
+        <button id="question" onclick={() => { tell(question()) }}>question</button>
+        <button id="nothing" onclick={() => { tell(nothing()) }}>nothing</button>
+        <button id="refused" onclick={() => { tell(refused()) }}>refused</button>
+        <button id="made" onclick={() => { tell(made()) }}>made</button>
+        <button id="early" onclick={() => { tell(early()) }}>early</button>
+        <button id="record" onclick={() => { tell(record()) }}>record</button>
+        <button id="blank" onclick={() => { tell(blank()) }}>blank</button>
+        <button id="moved" onclick={() => { tell(moved()) }}>moved</button>
+        <button id="pay" onclick={() => { tell(pay("me")) }}>pay</button>
+        <p id="said">{said}</p>
+    </div>
+}
+
+route GET / = <html><body><Ask/></body></html>
