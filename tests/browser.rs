@@ -820,6 +820,19 @@ fn a_files_style_reaches_a_component_first_shown_in_the_browser() {
 }
 
 #[test]
+fn a_frame_or_player_with_a_listener_still_hears_its_load() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("src_heard.qwe"), free_port(), Some(&dir.join("src_heard.js")));
+    assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
+    assert_eq!(r["after"], "1", "the listener written after src: {}", r);
+    assert_eq!(r["before"], "1", "the listener written before src: {}", r);
+}
+
+#[test]
 fn a_src_the_page_already_says_is_not_asked_for_again() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {
         eprintln!("skipping: needs Chrome and Node 22 or later");

@@ -7178,8 +7178,12 @@ function setProp(el, k, v, old) {
   if (URL_ATTRS.includes(k.toLowerCase()) && scriptURL(s) || animValueAttr(el, k) && s.split(";").some(scriptURL)) v = s = "about:blank#blocked";
   if (claiming && el.getAttribute(k) !== s) attrDiffers(el, k, s); // dev
   // What the server's page already says is not written again while taking it up: that starts a
-  // frame or a player over, and asks the server twice (FEEDBACK61.md, Q-893; branch feedback61).
-  if ((old !== v && !claiming) || el.getAttribute(k) !== s) el.setAttribute(k, s);
+  // frame or a player over, and asks the server twice. One with a listener is started over all
+  // the same, whichever came first (`listen` does it if `src` did): the load it waits for may have
+  // been and gone, and only an image can say so (FEEDBACK61.md, Q-893; branch feedback61).
+  const same = claiming && k === "src" && el.tagName !== "IMG" && el.getAttribute(k) === s;
+  if (same && !el.__w) el.__kept = true;
+  else if (same || (old !== v && !claiming) || el.getAttribute(k) !== s) el.setAttribute(k, s);
 }
 
 // A select shows the option its value names; a list (`<select multiple>`) each option it names;
@@ -7254,6 +7258,7 @@ function listen(el, t, f) {
     if (!delegating) { delegating = true; document.addEventListener("click", delegated); }
     return;
   }
+  if (claiming && el.__kept) { el.__kept = false; el.setAttribute("src", el.getAttribute("src")); }
   const cur = el.__w || (el.__w = {});
   cur[t] = f;
   const listening = el.__wl || (el.__wl = {});

@@ -2208,7 +2208,9 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   gives null while the server renders the component, and runs again in the browser
   once the component is on the page, which sets the state from what it gives. An
   image's `@load` that came before the code is sent to the image once the code runs
-  (its `e.target` is the image), and runs once.
+  (its `e.target` is the image), and runs once. A frame or a player with `src={...}` is
+  asked for once, unless it has a listener other than a click: that one starts over when
+  the code runs, so that it hears its `@load` (FEEDBACK61.md, Q-893).
 - A name the page does not have (a library's `<script>` left out) gives an error value,
   `js: L.map is not defined on this page`, so a component can say so instead of stopping.
 - On the server, `@mount` does nothing and `js` gives null.

@@ -1,0 +1,20 @@
+// A frame that finished before the page was taken up, with a listener for its load, written after
+// `src` and before it: not writing `src` again must not lose the event (FEEDBACK61.md, Q-893;
+// branch feedback61).
+
+component Heard() {
+    state after = 0
+    state before = 0
+    let one = "/inner/one"
+    let two = "/inner/two"
+    <div>
+        <iframe src={one} @load={() => { after = 1 }}></iframe>
+        <iframe @load={() => { before = 1 }} src={two}></iframe>
+        <p id="after">{after}</p>
+        <p id="before">{before}</p>
+    </div>
+}
+
+route GET /inner/one = <p>one</p>
+route GET /inner/two = <p>two</p>
+route GET / = <html><body><Heard/></body></html>
