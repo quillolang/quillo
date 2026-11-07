@@ -5712,8 +5712,9 @@ fn markdown_takes_time_in_proportion_to_the_text() {
     for (f, p) in [("page", "*a_"), ("md", "*a_"), ("md", "**a_"), ("md", " *_"), ("md", "_a*"), ("md", "*a**"), ("md", "[a]("), ("md", "`a"), ("md", "<a"), ("md", "~~a*"), ("md", "> *a_\n"), ("md", "- *a_\n")] {
         let [t1, t2, t4] = [1usize, 2, 4].map(|k| markdown_takes(&mut it, f, &p.repeat((k << 18) / p.len())));
         assert!(t4 < 2.0 * DEBUG_SLOWER, "{} {:?}: 1 MB took {:.3} s", f, p, t4);
-        // Four times the text against at most six times the time (0.12 was sixteen).
-        assert!(t4 < 6.0 * t1 + 0.03, "{} {:?}: {:.4} s, {:.4} s, {:.4} s", f, p, t1, t2, t4);
+        // Four times the text against at most eight times the time (0.12 was sixteen; a CI
+        // runner took 6.1 once).
+        assert!(t4 < 8.0 * t1 + 0.03, "{} {:?}: {:.4} s, {:.4} s, {:.4} s", f, p, t1, t2, t4);
     }
     // Ordinary Markdown, as it was: emphasis, links, code, lists, tables, a task.
     let mut md = |t: &str| it.call(&quillo::value::lookup(&it.globals, "md").unwrap(), vec![quillo::value::Value::str(t)], 0).unwrap_or_else(|_| panic!("{}", t)).display();
