@@ -6,3 +6,4 @@
 
 # Libraries built from .qwer files (quillo build)
 .quillo/
+.DS_Store
