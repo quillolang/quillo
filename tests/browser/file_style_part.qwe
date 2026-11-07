@@ -1,0 +1,17 @@
+// Components of a file with a style, which file_style_late.qwe shows only after a click.
+
+style css`
+  .badge { color: rgb(1, 2, 3) }
+  .own { color: rgb(4, 5, 6) }
+`
+
+public component Badge() {
+    <b.badge id="badge">new</b>
+}
+
+public component Own() {
+    style css`
+      .mine { color: rgb(7, 8, 9) }
+    `
+    <p><span.own id="own">a</span><span.mine id="mine">b</span></p>
+}

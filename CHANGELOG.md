@@ -9,6 +9,9 @@
 - A frame, picture or player with `src={...}` in a component is asked for once when the page
   loads, not twice: taking up the server's page no longer writes the same text again
   (FEEDBACK61.md, Q-893).
+- A component of a file with a top-level `style` gets that style when it is first shown in the
+  browser, from a file nothing on the server's page came from. It had no CSS at all from the
+  file (FEEDBACK37.md, Q-457).
 
 ## 0.8.0 (2026-11-07)
 

@@ -1,0 +1,15 @@
+// A file's style reaches a component first shown in the browser, from a file nothing on the
+// server's page came from, with no style of its own or with one (FEEDBACK37.md, Q-457; branch
+// feedback61).
+
+import file_style_part.qwe use Badge, Own
+
+component Home() {
+    state open = false
+    <div>
+        <button id="go" onclick={() => { open = true }}>go</button>
+        {open ? <div><Badge/><Own/></div> : null}
+    </div>
+}
+
+route GET / = <html><body><Home/></body></html>

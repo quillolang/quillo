@@ -169,17 +169,31 @@ fn components_of(it: &Interp, c: &Compiler) -> Vec<String> {
 /// The styles of the components and views a compile made (FEEDBACK8.md,
 /// Q-068; branch feedback8-fixes): a page can come to show them.
 fn styles_of(it: &Interp, c: &Compiler) -> Vec<String> {
-    let mut out: Vec<String> = c
-        .globals
-        .keys()
-        .filter_map(|k| match lookup(&it.globals, k) {
-            Some(Value::Func(f)) if matches!(&f.def.body, Expr::Block(ss) if ss.iter().any(|s| style_of(s).is_some())) => {
-                Some(style_id(f.def.file.as_deref(), &f.def.name))
+    // A component of a file with a style carries the file's mark. First shown in the browser, from
+    // a file nothing on the server's page came from, only this list brings the file's sheet
+    // (FEEDBACK37.md, Q-457; branch feedback61).
+    let of_files: HashSet<String> = scope_vars(&it.globals)
+        .into_iter()
+        .filter_map(|(_, v)| match v {
+            Value::Func(f) if f.def.name.starts_with(crate::parser::FILE_STYLE) => {
+                Some(style_id(f.def.file.as_deref(), crate::parser::FILE_STYLE))
             }
             _ => None,
         })
         .collect();
+    let mut out: Vec<String> = Vec::new();
+    for k in c.globals.keys() {
+        let Some(Value::Func(f)) = lookup(&it.globals, k) else { continue };
+        if matches!(&f.def.body, Expr::Block(ss) if ss.iter().any(|s| style_of(s).is_some())) {
+            out.push(style_id(f.def.file.as_deref(), &f.def.name));
+        }
+        let of_file = style_id(f.def.file.as_deref(), crate::parser::FILE_STYLE);
+        if f.def.component && of_files.contains(&of_file) {
+            out.push(of_file);
+        }
+    }
     out.sort();
+    out.dedup();
     out
 }
 

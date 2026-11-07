@@ -806,6 +806,20 @@ fn the_server_and_the_browser_agree() {
 /// Where Quillo meets the page: what compares, what waits, what a handler set by hand, and
 /// the rows and timers around it (FEEDBACK28.md; branch feedback29-fixes).
 #[test]
+fn a_files_style_reaches_a_component_first_shown_in_the_browser() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("file_style_late.qwe"), free_port(), Some(&dir.join("file_style_late.js")));
+    assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
+    assert_eq!(r["badge"], "rgb(1, 2, 3)", "no style of its own: {}", r);
+    assert_eq!(r["own"], "rgb(4, 5, 6)", "the file's, beside its own: {}", r);
+    assert_eq!(r["mine"], "rgb(7, 8, 9)", "its own: {}", r);
+}
+
+#[test]
 fn a_src_the_page_already_says_is_not_asked_for_again() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {
         eprintln!("skipping: needs Chrome and Node 22 or later");
