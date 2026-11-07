@@ -247,7 +247,17 @@ fn quillo_new_says_what_stops_it() {
         std::fs::create_dir_all(d.join("debug")).unwrap();
         let copy = d.join("debug/quillo");
         std::fs::copy(env!("CARGO_BIN_EXE_quillo"), &copy).unwrap();
-        let o = Command::new(&copy).args(["new", "b", "--minimal", "--binary"]).current_dir(&d).output().unwrap();
+        // Another test's fork can hold the new file open for a moment, and Linux then will not
+        // run it (ETXTBSY, 26), as a CI runner showed.
+        let o = (0..100)
+            .find_map(|_| match Command::new(&copy).args(["new", "b", "--minimal", "--binary"]).current_dir(&d).output() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    None
+                }
+                o => Some(o.unwrap()),
+            })
+            .unwrap();
         assert!(said(&o).contains("the copy is a debug build"), "{}", said(&o));
     }
 }
