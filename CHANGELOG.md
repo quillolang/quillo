@@ -9,6 +9,19 @@ are exact or an error, what runs at the same time, a program's files and Rust mo
 plurals, dates, numbers and images, and the command line: Q-700 to Q-852, and Q-875, found
 while fixing (a map's order in the browser).
 
+### Security
+
+- **One viewer's `live` answer could reach another, for up to two seconds, in 0.7.0 and
+  before: upgrade.** A `live` run is shared between viewers unless its code read the request.
+  `session()` gave its kept copy without saying so, so the second loader of a page, or a
+  loader after a route that read the session, went to the next viewer: their page showed the
+  first viewer's data. `t()` and `locale()` did the same with the language. Both mark the run
+  as the viewer's now; a loader reading nothing of the viewer's stays shared (Q-876).
+- **`quillo check` warns of a `redirect` or `respond` nothing takes.** In
+  `if no_user { redirect("/login") }` with more after it, the redirect is made and left, and
+  the route goes on: the visitor is shown the page. Write `reply 303 redirect("/login")`.
+  Look for this in your code: two of the sample apps had it (Q-877).
+
 ### What to change in your code
 
 Databases (each driver hides its database's quirks, so a value means the same on all three;

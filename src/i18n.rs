@@ -320,6 +320,8 @@ impl Interp {
     /// `translations`.
     pub fn locale(&mut self) -> Option<Arc<str>> {
         if let Some(l) = &self.locale {
+            // The viewer's, as `session()`'s kept copy is (FEEDBACK55.md, Q-876; branch feedback55).
+            self.read_request = true;
             return Some(l.clone());
         }
         let i18n = self.site.i18n.clone()?;

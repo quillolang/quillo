@@ -64,6 +64,7 @@ export async function launch({ width = 1440, height = 1000, mismatches = false }
     if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); return; }
     handlers.get(msg.sessionId)?.(msg);
   });
+  const allPages = [];
   const send = (method, params = {}, sessionId) => new Promise((r) => {
     const id = ++nextId;
     pending.set(id, r);
@@ -83,6 +84,7 @@ export async function launch({ width = 1440, height = 1000, mismatches = false }
     handlers.set(sessionId, async (msg) => {
       const p = msg.params;
       if (msg.method === "Page.loadEventFired") loadWaiters.splice(0).forEach((w) => w());
+      if (msg.method === "Page.javascriptDialogOpening") s("Page.handleJavaScriptDialog", { accept: true, promptText: "ok" });
       if (msg.method === "Runtime.exceptionThrown") problems.push("exception: " + (p.exceptionDetails.exception?.description || p.exceptionDetails.text));
       if (msg.method === "Runtime.consoleAPICalled" && (p.type === "error" || p.type === "warning")) problems.push(`console.${p.type}: ` + p.args.map((a) => a.value ?? a.description).join(" "));
       if (msg.method === "Log.entryAdded" && p.entry.level === "error" && !/favicon\.ico/.test(p.entry.url || "")) problems.push("log: " + p.entry.text + (p.entry.url ? " " + p.entry.url : ""));
@@ -107,6 +109,7 @@ export async function launch({ width = 1440, height = 1000, mismatches = false }
     await s("Runtime.enable");
     await s("Page.enable");
     await s("Log.enable");
+    await s("Page.addScriptToEvaluateOnNewDocument", { source: "window.__quilloErrors = [];" });
     if (phone) await s("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 2, mobile: true });
     if (mismatches) {
       await s("Debugger.enable");
@@ -132,7 +135,7 @@ export async function launch({ width = 1440, height = 1000, mismatches = false }
       // Waits until Quillo's components are running (or `ms` pass).
       async booted(ms = 5000) {
         for (let t = 0; t < ms; t += 50) {
-          if (await api.ev(`return !!window.__quillo_booted`)) return true;
+          if (await api.ev(`return !!(window[Symbol.for("quillo")] || {}).booted`)) return true;
           await sleep(50);
         }
         return false;
@@ -140,7 +143,7 @@ export async function launch({ width = 1440, height = 1000, mismatches = false }
       // What Quillo itself counted: components taken up as the server sent
       // them, made again, and errors it caught.
       async quillo() {
-        return api.ev(`return { resumed: window.__quilloResumed || 0, remade: window.__quilloRemade || 0, errors: (window.__quilloErrors || []).map(String) }`);
+        return api.ev(`const q = window[Symbol.for("quillo")] || {}; return { booted: !!q.booted, resumed: q.resumed || 0, remade: q.remade || 0, errors: (window.__quilloErrors || []).map(String) }`);
       },
       async shot(path, { full = false, width: w, height: h, dark } = {}) {
         if (w) await s("Emulation.setDeviceMetricsOverride", { width: w, height: h || height, deviceScaleFactor: 1, mobile: w < 600 });
@@ -205,12 +208,14 @@ export async function launch({ width = 1440, height = 1000, mismatches = false }
         return r;
       },
     };
+    allPages.push(api);
     if (url !== "about:blank") await api.go(url);
     return api;
   }
 
   return {
     page,
+    allPages,
     async close() { chrome.kill(); },
   };
 }

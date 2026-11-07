@@ -166,7 +166,7 @@ component Game(room: str) {
 
 route GET /room/:room {
     if !contains(ROOMS, room) { reply 404 "no such room" }
-    if session().name == null { redirect("/") }
+    if session().name == null { reply 303 redirect("/") }
     <Page title={room}>
         <p><a href="/">← Lobby</a></p>
         <Game room={room}/>

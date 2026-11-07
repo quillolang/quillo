@@ -112,7 +112,7 @@ route GET /messages {
 route GET /messages/:name {
     let u = signed_in(`/messages/${name}`)
     let other = profile(name) ?? reply 404 <NotFoundPage me={u} what="Nobody here goes by that name."/>
-    if other.id == u.id { redirect("/messages") }
+    if other.id == u.id { reply 303 redirect("/messages") }
     <ConversationPage me={u} name={other.name}/>
 }
 

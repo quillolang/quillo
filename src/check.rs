@@ -4674,6 +4674,7 @@ impl Checker {
                     if i + 1 < stmts.len() {
                         self.answer_dropped(s);
                         self.op_dropped(s);
+                        self.redirect_dropped(s);
                     }
                     let st = self.stmt(s, i + 1 == stmts.len());
                     if i + 1 < stmts.len() {
@@ -4887,6 +4888,36 @@ impl Checker {
         let derived = |n: &str| prefix == "@" && (word == format!("{}d", n) || word == format!("{}ed", n) || word == format!("{}n", n) || ["un", "before", "after", "pre", "post"].iter().any(|p| word == format!("{}{}", p, n)));
         if let Some(near) = closest(word, list.iter().copied()).filter(|n| !derived(n)) {
             self.warn(format!("`{prefix}{word}` is no {} the browser knows: did you mean `{prefix}{near}`?", if prefix.is_empty() { "attribute" } else { "event" }));
+        }
+    }
+
+    /// `if no_user { redirect("/login") }` with more after it: the answer is made, nothing takes
+    /// it, and the code goes on past a check written to stop it, as two of app/'s did
+    /// (FEEDBACK55.md, Q-877; branch feedback55). `reply 303 redirect(...)` leaves.
+    fn redirect_dropped(&mut self, s: &Stmt) {
+        fn answers(e: &Expr) -> Vec<(&str, u32)> {
+            match e {
+                Expr::Call(f, _, line) => match &**f {
+                    Expr::Ident(n, _) if n == "redirect" || n == "respond" => vec![(n.as_str(), *line)],
+                    _ => Vec::new(),
+                },
+                Expr::Block(stmts) => match stmts.last() {
+                    Some(Stmt::Expr(e)) => answers(e),
+                    _ => Vec::new(),
+                },
+                Expr::If(_, a, b) => answers(a).into_iter().chain(b.iter().flat_map(|b| answers(b))).collect(),
+                Expr::Match(_, arms, _) => arms.iter().flat_map(|a| answers(&a.body)).collect(),
+                _ => Vec::new(),
+            }
+        }
+        let Stmt::Expr(e) = s else { return };
+        for (name, line) in answers(e) {
+            if self.is_local(name) || !self.globals.get(name).is_some_and(|v| &*v.file == "<builtin>") {
+                continue;
+            }
+            self.line = line;
+            let leave = if name == "redirect" { "reply 303 redirect(...)" } else { "return respond(...)" };
+            self.warn(format!("this `{name}(...)` is an answer nothing takes, and the code goes on past it: to leave here, write `{leave}`"));
         }
     }
 

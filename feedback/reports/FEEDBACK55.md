@@ -1945,6 +1945,48 @@ A component listing a map of ids, years or prices by key shows another order onc
 
 **Suggestion:** the browser keeps a map's keys in the order they were set, as the server does (a `Map`, or an object with its key order beside it), in every builtin that reads or builds a map; measure it, since maps are on every hot path of a page.
 
+## Found aligning the apps
+
+Added on 2026-11-07, while `app/` was aligned with the coming 0.8.0, on branch feedback55. The numbers are the next free ones after Q-875.
+
+### Q-876. One viewer's `live` answer reaches another, for up to two seconds
+
+**Kind:** silent, security. **Where:** `session()` in [session.rs](../../src/session.rs) and `Interp::locale` in [i18n.rs](../../src/i18n.rs). In 0.7.0 too.
+
+```quillo
+server fn load_a() = { who: session().who }
+server fn load_b() = { who: session().who }
+component A() {
+    state a = live(load_a)
+    <p>{a.who}</p>
+}
+component B() {
+    state b = live(load_b)
+    <p>{b.who}</p>
+}
+route GET /as/:who(int) { set_session({ who }); "ok" }
+route GET / = <html><body><A/><B/></body></html>
+```
+
+Visitor 1's page shows `1 1`. Visitor 2's, within two seconds, shows `2 1`: visitor 1's value. A `live` run is shared unless its code read the request, and `session()` said so only on its way to the cookie: its kept copy said nothing. So the second loader of a page, or a loader after a route that read the session, was a run of nobody's and went to the next viewer. Seen in app/: bank `/` and `/messages`, coop `/me`, stays `/trips`, shifts `/me`, the forum's inbox; it is what failed `bank/tests/transfers.mjs`. `t()` and `locale()` did the same with the kept locale: a loader's words were the first viewer's language.
+
+**Fixed:** both mark the request read wherever they answer from. A loader reading nothing of the viewer's stays one run for everyone, on a page whose route read the session too.
+
+### Q-877. A `redirect` nothing takes: the route goes on past its check
+
+**Kind:** silent, security. **Where:** `quillo check`, [check.rs](../../src/check.rs).
+
+```quillo
+route GET / {
+    if session().name == null { redirect("/") }
+    "the page"
+}
+```
+
+`redirect(...)` makes an answer; it does not leave. Here nothing takes it, and the visitor with no name is shown the page, with a 200 and no word from `quillo check`. app/arena and app/forum both had this, arena's on a session check.
+
+**Fixed:** `quillo check` warns of a `redirect` or `respond` that is not the code's answer, in an `if`, an `else`, a `match` arm or alone, and says to write `reply 303 redirect(...)` or `return respond(...)`.
+
 ## What behaves well
 
 Counts are cases. Most of the sweep is here: about 6,900 of its 7,500 cases gave the right answer.

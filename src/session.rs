@@ -432,6 +432,10 @@ pub(crate) fn send_cookie(it: &mut Interp, value: &str, age: Option<u64>, line: 
 /// `session()`: the map `set_session` stored, or `{}`.
 fn session(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
     it.visitor_read = true;
+    // Marked here, not only on the way to the cookie: a second `live` loader of a page, or one
+    // after a route that read the session, takes the kept copy, and its run went to every
+    // viewer as nobody's (FEEDBACK55.md, Q-876; branch feedback55).
+    it.read_request = true;
     if let Some(s) = &it.session {
         return Ok(s.clone());
     }

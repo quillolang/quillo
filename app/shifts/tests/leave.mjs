@@ -1,12 +1,14 @@
 // A leave request from start to end, in three browsers at once: an operator
-// (E0001, line L01, crew A) asks for next week off, the supervisor of L01
+// (E0004, line L01, crew A) asks for next week off, the supervisor of L01
 // (S01) sees it arrive and approves it, and the manager (M01) watches next
 // week's manpower drop. The operator's calendar is checked against the
 // rotation worked out here.
 //
 //   BASE=http://127.0.0.1:8080 node feedback/tools/drive.mjs app/shifts/tests/leave.mjs
 //
-// Needs a freshly seeded database (lib/seed.qwe).
+// Needs a freshly seeded database (lib/seed.qwe). E0004 is the first of crew A the seed
+// neither gives leave (E0001, two days from now) nor moves to crew B (E0001 to E0003), so
+// the test passes on any day.
 
 export default async ({ browser, sleep }) => {
   const base = process.env.BASE;
@@ -47,7 +49,7 @@ export default async ({ browser, sleep }) => {
   const waiting = () => sup.ev(`return document.querySelectorAll("li.request").length`);
   const waitingBefore = await waiting();
 
-  const op = await signIn("E0001");
+  const op = await signIn("E0004");
   check("the operator lands on their roster", await op.ev(`return location.pathname`) == "/me", await op.ev(`return location.pathname`));
   const month = today.slice(0, 7);
   const cal = await op.ev(`return [...document.querySelectorAll(".cal .day")].map((d) => [d.dataset.day, d.querySelector(".s").textContent])`);
@@ -59,6 +61,8 @@ export default async ({ browser, sleep }) => {
 
   await op.ev(`document.querySelector('[aria-label="Next month"]').click(); return true`);
   check("next month shows", await until(op, `return document.querySelector(".cal .day").dataset.day.slice(0, 7) == "${addDays(month + "-28", 7).slice(0, 7)}"`));
+  // Back, when next week is still this month: the request will show there.
+  if (monday.slice(0, 7) == month) await op.ev(`document.querySelector('[aria-label="Previous month"]').click(); return true`);
 
   // Ask for next week.
   const set = (sel, v) => op.ev(`const i = document.querySelector('${sel}'); i.value = ${JSON.stringify(v)}; i.dispatchEvent(new Event("input", { bubbles: true })); i.dispatchEvent(new Event("change", { bubbles: true })); return true`);
@@ -76,7 +80,7 @@ export default async ({ browser, sleep }) => {
   check("the manager sees it asked for", await until(mgr, `return [...document.querySelectorAll('tr[data-line="L01"] td sup')].length > 0`, 8000), await cell("L01"));
 
   // Approve it.
-  const id = await sup.ev(`return [...document.querySelectorAll("li.request")].find((li) => li.innerText.includes("E0001"))?.dataset.id`);
+  const id = await sup.ev(`return [...document.querySelectorAll("li.request")].find((li) => li.innerText.includes("E0004"))?.dataset.id`);
   await sup.ev(`
     const li = document.querySelector('li.request[data-id="${id}"]');
     const box = li.querySelector('input[type=checkbox]');

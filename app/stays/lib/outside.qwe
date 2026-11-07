@@ -25,7 +25,7 @@ let OVERPASS = env("STAYS_OVERPASS", "https://overpass-api.de/api/interpreter")
 
 let KEEP = { geocode: 30 * 86400000, weather: 30 * 60000, places: 86400000 }
 
-fn round_to(x: float, digits: int) -> float = round(x * pow(10, digits)) / pow(10, digits)
+fn round_to(x: float, digits: int) -> float = float(round(x * pow(10, digits))) / pow(10, digits)
 
 // ---- the cache and the log -------------------------------------------------------
 
