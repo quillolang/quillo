@@ -806,6 +806,35 @@ fn the_server_and_the_browser_agree() {
 /// Where Quillo meets the page: what compares, what waits, what a handler set by hand, and
 /// the rows and timers around it (FEEDBACK28.md; branch feedback29-fixes).
 #[test]
+fn a_200_that_is_no_answer_is_an_error_not_null() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("rpc_no_answer.qwe"), free_port(), Some(&dir.join("rpc_no_answer.js")));
+    assert_eq!(r["first"], "value: real", "{}", r);
+    let no = "err: server fn `question` answered something that is not its answer";
+    for (k, tail) in [
+        ("html", "(text/html; charset=utf-8, 20 characters)"),
+        ("empty", "(no type, 0 characters)"),
+        ("cut", "(application/json, 10 characters)"),
+        ("json_null", "(application/json, 4 characters)"),
+        ("list", "(application/json, 3 characters)"),
+        ("number", "(application/json, 2 characters)"),
+        ("other", "(application/json, 7 characters)"),
+    ] {
+        assert_eq!(r["seen"][k], format!("{} {}", no, tail), "{}: {}", k, r);
+    }
+    // An answer of `null` is one, and what worked still works.
+    assert_eq!(r["seen"]["ok_null"], "value: null", "{}", r);
+    assert_eq!(r["seen"]["ok_text"], "value: x", "{}", r);
+    assert_eq!(r["real"], "value: real", "{}", r);
+    assert_eq!(r["nothing"], "value: null", "{}", r);
+    assert_eq!(r["refused"], "err: no", "{}", r);
+}
+
+#[test]
 fn a_files_style_reaches_a_component_first_shown_in_the_browser() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {
         eprintln!("skipping: needs Chrome and Node 22 or later");

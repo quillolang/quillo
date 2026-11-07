@@ -1,0 +1,23 @@
+// What a server fn's call gives when what comes back is not its answer, and when it is
+// (FEEDBACK49.md, Q-598; branch feedback61).
+
+server fn question() = "real"
+server fn nothing() = null
+server fn refused() = err("no")
+
+component Ask() {
+    state n = 0
+    state said = "-"
+    let tell = (r) => {
+        n += 1
+        said = is_err(r) ? `${n} err: ${r.error}` : `${n} value: ${r ?? "null"}`
+    }
+    <div>
+        <button id="ask" onclick={() => { tell(question()) }}>ask</button>
+        <button id="nothing" onclick={() => { tell(nothing()) }}>nothing</button>
+        <button id="refused" onclick={() => { tell(refused()) }}>refused</button>
+        <p id="said">{said}</p>
+    </div>
+}
+
+route GET / = <html><body><Ask/></body></html>
