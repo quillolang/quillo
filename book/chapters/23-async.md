@@ -106,8 +106,13 @@ fn add_twice(text: str) {
 **The latest call wins.** A handler can run again before its last call has answered (a
 letter typed in a search field, a second click), and the answers then come back in any
 order. An older answer never replaces a newer value: every set of a state claims it,
-whether written plainly, through `bind:` or from a call, and a handler that waits keeps
-only the sets it makes while no newer set has claimed that state.
+whether written plainly, through `bind:` or from a call. A set that carries an answer the
+function waited for gives way when another run has set or claimed that state since. It
+carries the answer if its value holds it, or if the answer decides it: it sits under an
+`if`, `match`, `while` or `for` on the answer, or after a guard that leaves on it. A run
+is one handler, effect, timer or frame callback, with the functions it calls. Every other
+set is made: a plain one like `saving = false` after the wait, and a set that reads the
+state it sets (`n += 1`), on what the state holds after the wait.
 
 ```quillo
 server fn search(q: str) -> str = `results for ${q}`

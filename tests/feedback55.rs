@@ -1508,8 +1508,9 @@ fn an_attribute_that_differs_makes_the_component_again() {
 component Box() {
     <main><Card label="kept"/><Card label="title"/><Card label="removed"/><Card label="added"/><Card label="typed"/><Card label="classed"/></main>
 }
-// What a script of the page's does before the page is taken up.
-let change = "const c = [...document.querySelectorAll('.card')], s = (i) => c[i].querySelector('span'); s(1).setAttribute('title', 'changed'); s(2).removeAttribute('data-n'); s(3).setAttribute('hidden', ''); c[4].querySelector('input').value = 'typed'; s(5).classList.add('extra'); s(5).setAttribute('data-extra', '1'); window.__before = c.map((x) => x.querySelector('span'));"
+// What a script of the page's does before the page is taken up. It listens to the console first:
+// the runtime can warn before a script run from outside gets in.
+let change = "window.__warned = []; const w = console.warn; console.warn = (...a) => (window.__warned.push(a.join(' ')), w.apply(console, a)); const c = [...document.querySelectorAll('.card')], s = (i) => c[i].querySelector('span'); s(1).setAttribute('title', 'changed'); s(2).removeAttribute('data-n'); s(3).setAttribute('hidden', ''); c[4].querySelector('input').value = 'typed'; s(5).classList.add('extra'); s(5).setAttribute('data-extra', '1'); window.__before = c.map((x) => x.querySelector('span'));"
 route GET / = <html><head><title>t</title></head><body><Box/><script>{raw(change)}</script></body></html>
 "##;
     let body = r#"const before = window.__before;
@@ -1524,12 +1525,13 @@ route GET / = <html><head><title>t</title></head><body><Box/><script>{raw(change
       hidden: now.map((c) => c.querySelector("span").hasAttribute("hidden")),
       typed: now[4].querySelector("input").value,
       cls: now[5].querySelector("span").className + " " + now[5].querySelector("span").getAttribute("data-extra"),
+      early: window.__warned.filter((w) => w.startsWith("quillo:")),
     };"#;
     let Some((r, _)) = in_page_with("q774p", src, &[], "/", body) else { return };
     let want = serde_json::json!({
         "same": [true, true, true, true, true, true], "titles": ["kept", "title", "removed", "added", "typed", "classed"],
         "n": ["1", "1", "1", "1", "1", "1"], "hidden": [false, false, false, false, false, false], "typed": "typed", "cls": "extra 1",
-        "remade": 0, "errors": [], "warned": [],
+        "remade": 0, "errors": [], "warned": [], "early": [],
     });
     assert_eq!(r, want);
     let Some((r, _)) = in_page_with("q774", src, &["--watch"], "/", body) else { return };
@@ -1538,7 +1540,7 @@ route GET / = <html><head><title>t</title></head><body><Box/><script>{raw(change
     assert_eq!(r["n"], serde_json::json!(["1", "1", "1", "1", "1", "1"]), "{}", r);
     assert_eq!(r["hidden"], serde_json::json!([false, false, false, false, false, false]), "{}", r);
     assert_eq!((r["typed"].as_str(), r["cls"].as_str(), r["remade"].as_i64()), (Some("typed"), Some("extra 1"), Some(3)), "{}", r);
-    let warned = r["warned"].as_array().unwrap();
+    let warned = r["early"].as_array().unwrap();
     for w in [r#"where it wrote title="changed", the browser makes title="title""#, r#"where it wrote no data-n, the browser makes data-n="0""#, r#"where it wrote hidden="", the browser makes no hidden"#] {
         assert!(warned.iter().any(|x| x.as_str().unwrap().contains(w)), "{} in {:?}", w, warned);
     }
@@ -11826,3 +11828,1257 @@ fn round_to_tens_is_exact_at_every_place() {
 }
 
 // ---- end of slice 10's third round ----
+
+// ---- Q-800's runs ----
+
+// Found in the UI kit (Q-800): every set after a wait gave way to any set made since, the function's
+// own callee's among them, so `reset(); msg = "done"` lost `msg` to `reset`'s own set, and a helper
+// that only might set a state took it from its caller on the way that did not. date_picker,
+// compass_dial, photo_capture, receipt_share, swipe_viewer and water_tracker stopped working. A set
+// gives way only if its value carries an answer the function waited for and another run has claimed
+// the state since. The edges: a callee that waits or does not, that sets before or after its wait,
+// that returns without a wait, one not waited for, and a set with an answer behind such a callee.
+#[test]
+fn what_a_function_sets_after_calling_its_own_helper_is_made() {
+    let src = r##"server fn save(n: int) -> int {
+    sleep(60)
+    n
+}
+server fn search(q: str) -> str {
+    sleep(max([0, 400 - q.len * 80]))
+    `results for ${q}`
+}
+fn call_it(f) {
+    f()
+}
+component Reset(on_done = null) {
+    state msg = "start"
+    let reset = () => {
+        msg = ""
+        on_done && on_done()
+    }
+    <div><button #r1 @click={() => { reset(); msg = "set after the call" }}>go</button><p #o1>[{msg}]</p></div>
+}
+component Maybe(on_done = null) {
+    state msg = "start"
+    let tick = () => { on_done && on_done() }
+    let maybe = (wipe: bool) => {
+        tick()
+        if wipe { msg = "" }
+    }
+    <div>
+        <button #r2 @click={() => { maybe(false); msg = "not wiped" }}>go</button>
+        <button #r3 @click={() => { maybe(true); msg = "wiped, then set" }}>go</button>
+        <button #r4 @click={() => { maybe(true) }}>go</button>
+        <p #o2>[{msg}]</p>
+    </div>
+}
+component Shapes() {
+    state msg = "start"
+    let clear = () => {
+        msg = ""
+        save(1)
+    }
+    let load = () => {
+        msg = "busy"
+        let r = save(2)
+        msg = `got ${r}`
+    }
+    let none = (wait: bool) => {
+        if wait { save(1) }
+        msg = "from the callee"
+    }
+    let wipe = () => { msg = "" }
+    let fetched = () => {
+        msg = "busy"
+        let r = save(3)
+        msg = `in ${r}`
+        `out ${r}`
+    }
+    let later = () => {
+        msg = "detached"
+        save(4)
+    }
+    <div>
+        <button #s1 @click={() => { clear(); msg = "after a setter" }}>go</button>
+        <button #s2 @click={() => { load(); msg = "after a loader" }}>go</button>
+        <button #s3 @click={() => { none(false); msg = "after no wait" }}>go</button>
+        <button #s4 @click={() => { let r = search("abcd"); clear(); msg = r }}>go</button>
+        <button #s5 @click={() => { let r = search("abcd"); wipe(); msg = r }}>go</button>
+        <button #s6 @click={() => { msg = fetched() }}>go</button>
+        <button #s7 @click={() => { let r = search("abcd"); call_it(later); msg = "plain"; msg = r }}>go</button>
+        <p #o3>[{msg}]</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Reset/><Maybe/><Shapes/></body></html>
+"##;
+    let body = format!(
+        r#"const real = window.fetch;
+    let busy = 0;
+    window.fetch = (...a) => {{ busy++; return real(...a).finally(() => {{ busy--; }}); }};
+    const until = async (f) => {{ for (let i = 0; i < 500 && !f(); i++) await tick(20); return f(); }};
+    // Every call answered, and what comes after each has run.
+    const quiet = async () => {{ for (let k = 0; k < 3; k++) {{ await tick(30); await until(() => busy === 0); }} }};
+    const go = async (id, at) => {{ $(id).click(); await quiet(); return $(at).textContent; }};
+    const out = {{}};
+    out.reset = await go("r1", "o1");
+    out.not_wiped = await go("r2", "o2");
+    out.wiped_then_set = await go("r3", "o2");
+    out.callee_alone = await go("r4", "o2");
+    out.after_a_setter = await go("s1", "o3");
+    out.after_a_loader = await go("s2", "o3");
+    out.after_no_wait = await go("s3", "o3");
+    out.answer_after_a_setter = await go("s4", "o3");
+    out.answer_after_a_plain_helper = await go("s5", "o3");
+    out.answer_of_a_setter = await go("s6", "o3");
+    out.answer_after_one_not_waited_for = await go("s7", "o3");
+    return out;"#
+    );
+    let Some(r) = s7_in_page("q800-own", src, "/", &body) else { return };
+    let want = serde_json::json!({
+        "reset": "[set after the call]", "not_wiped": "[not wiped]", "wiped_then_set": "[wiped, then set]", "callee_alone": "[]",
+        "after_a_setter": "[after a setter]", "after_a_loader": "[after a loader]", "after_no_wait": "[after no wait]",
+        "answer_after_a_setter": "[results for abcd]", "answer_after_a_plain_helper": "[results for abcd]",
+        "answer_of_a_setter": "[out 3]", "answer_after_one_not_waited_for": "[results for abcd]",
+        "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Found in the UI kit (Q-800): infinite_feed's `more` waits on its load; a frame's `measure`, another
+// run, sets `tops` meanwhile; `more`'s `tops = f(heights)` was dropped and its `heights` kept, and the
+// two ended out of step. That set reads a state, not the answer, and is made. On the other side: an
+// answer gives way to another run's set (a timer's, a plain one that came after the call), a plain
+// set is made over a timer's, and a claim starts at the wait the answer comes from: a wait before
+// that call claims nothing, so another run's answer still lands when this one never gets to its
+// call, and one after it keeps the claim, so an older call that came back late does not take the
+// state from the newer one.
+#[test]
+fn a_set_gives_way_only_with_an_answer_and_to_another_run() {
+    let src = r##"server fn save(n: int) -> int {
+    sleep(150)
+    n
+}
+server fn search(q: str) -> str {
+    sleep(max([0, 400 - q.len * 80]))
+    `results for ${q}`
+}
+server fn polish(s: str) -> str {
+    sleep(100)
+    `polished ${s}`
+}
+component Feed() {
+    state heights = [1]
+    state tops = [2]
+    state loaded = 0
+    let tops_of = (hs) => hs | map((h) => h * 2)
+    let more = () => {
+        let rows = save(5)
+        heights = heights + [rows]
+        tops = tops_of(heights)
+        loaded += 1
+    }
+    let measure = () => {
+        heights = heights | map((h) => h + 1)
+        tops = tops_of(heights)
+    }
+    <div>
+        <button #more @click={() => more()}>more</button>
+        <button #raf @click={() => { js("requestAnimationFrame", (_t = null) => { measure() }) }}>frame</button>
+        <button #timer @click={() => { run_after(5, () => { measure() }) }}>timer</button>
+        <p #h>{str(heights)}</p><p #t>{str(tops)}</p><p #n>{loaded}</p>
+    </div>
+}
+component Race() {
+    state shown = "none"
+    state q = ""
+    let wipe = () => {
+        shown = ""
+        save(1)
+    }
+    let two = (x: str) => {
+        let r = search(x)
+        let s = polish(r)
+        shown = s
+    }
+    let only_if = (c: bool) => {
+        save(1)
+        if c {
+            let r = search("abcd")
+            shown = r
+        }
+    }
+    let skip = (c: bool) => {
+        let r = "plain"
+        if c { r = search("abcd") }
+        let s = polish(r)
+        shown = s
+    }
+    <div>
+        <button #answer @click={() => { let r = search("abcd"); shown = r }}>answer</button>
+        <button #plain @click={() => { save(1); shown = "plain" }}>plain</button>
+        <button #slow @click={() => { shown = search("a") }}>slow</button>
+        <button #timer2 @click={() => { run_after(5, () => { shown = "timer" }) }}>timer</button>
+        <button #now @click={() => { shown = "now" }}>now</button>
+        <button #first @click={() => { save(1); let r = search("abcd"); shown = r }}>wait first</button>
+        <button #skip @click={() => skip(false)}>skip</button>
+        <button #onlyif @click={() => only_if(false)}>only if</button>
+        <input #own oninput={(e) => { let r = search(e.target.value); wipe(); shown = r }}/>
+        <input #two oninput={(e) => two(e.target.value)}/>
+        <p #s>{shown}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Feed/><Race/></body></html>
+"##;
+    let body = format!(
+        r#"{TYPE_IN}
+    const real = window.fetch;
+    let busy = 0;
+    window.fetch = (...a) => {{ busy++; return real(...a).finally(() => {{ busy--; }}); }};
+    const until = async (f) => {{ for (let i = 0; i < 500 && !f(); i++) await tick(20); return f(); }};
+    // Every call answered, and what comes after each has run.
+    const quiet = async () => {{ for (let k = 0; k < 3; k++) {{ await tick(30); await until(() => busy === 0); }} }};
+    const list = (id) => JSON.parse($(id).textContent);
+    const inStep = () => {{ const h = list("h"), t = list("t"); return h.length === t.length && h.every((x, i) => t[i] === x * 2); }};
+    const out = {{}};
+    $("more").click(); $("raf").click();
+    await until(() => $("n").textContent === "1"); await quiet();
+    out.frame = [list("h").length, inStep()];
+    $("more").click(); $("timer").click();
+    await until(() => $("n").textContent === "2"); await quiet();
+    out.timer = [list("h").length, inStep()];
+    const race = async (...ids) => {{ for (const id of ids) $(id).click(); await tick(30); await quiet(); await tick(350); await quiet(); return $("s").textContent; }};
+    out.answer_then_timer = await race("answer", "timer2");
+    out.plain_then_timer = await race("plain", "timer2");
+    out.old_answer_then_plain = await race("slow", "plain");
+    out.set_before_the_call = await race("first", "now");
+    out.claim_on_a_later_wait = await race("skip");
+    out.a_wait_on_the_way_claims_nothing = await race("slow", "onlyif");
+    await typeIn("two", "abcd");
+    await until(() => $("s").textContent === "polished results for abcd");
+    await tick(30); await quiet(); await tick(350); await quiet();
+    out.two_waits = $("s").textContent;
+    await typeIn("own", "abcd");
+    await until(() => $("s").textContent === "results for abcd");
+    await tick(30); await quiet(); await tick(450); await quiet();
+    out.own_helper_typed = $("s").textContent;
+    return out;"#
+    );
+    let Some(r) = s7_in_page("q800-others", src, "/", &body) else { return };
+    let want = serde_json::json!({
+        "frame": [2, true], "timer": [3, true],
+        "answer_then_timer": "timer", "plain_then_timer": "plain", "old_answer_then_plain": "plain",
+        "set_before_the_call": "results for abcd", "claim_on_a_later_wait": "polished plain", "a_wait_on_the_way_claims_nothing": "results for a",
+        "two_waits": "polished results for abcd", "own_helper_typed": "results for abcd", "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Q-800: what carries an answer, worked out by the compiler: the call itself or an expression around
+// it, a variable bound from it by any pattern, through other variables, in a loop or a `match`, an
+// assignment, a closure reading it. Each shows its answer alone, and gives way to a set made by
+// another run while it waited; the two clicks are in one task, so there is no race in the test.
+// So does a literal under `if r.len > 0`, which the answer decides. What carries none is made either
+// way: a name bound again, a state read, a fold, and a function's own parameter of the answer's name.
+#[test]
+fn what_carries_an_answer_is_read_from_the_program() {
+    let src = r##"server fn search(q: str) -> str {
+    sleep(120)
+    `results for ${q}`
+}
+server fn pair() -> list {
+    sleep(120)
+    ["left", "right"]
+}
+server fn some() -> list {
+    sleep(120)
+    ["only"]
+}
+server fn thing() -> map {
+    sleep(120)
+    { name: "a thing", n: 3 }
+}
+component Forms() {
+    state shown = "none"
+    state other = "none"
+    <div>
+        <button #set @click={() => { shown = "newer" }}>set</button>
+        <button #call @click={() => { shown = search("x") }}>call</button>
+        <button #expr @click={() => { shown = search("x") + "!" }}>expr</button>
+        <button #field @click={() => { shown = thing().name }}>field</button>
+        <button #bound @click={() => { let r = search("x"); shown = r }}>bound</button>
+        <button #through @click={() => { let r = search("x"); let n = r.len; let t = `${n} long`; shown = t }}>through</button>
+        <button #list @click={() => { let [a, b] = pair(); shown = a + b }}>list</button>
+        <button #rec @click={() => { let { name, n } = thing(); shown = name }}>record</button>
+        <button #loop @click={() => { for x in some() { shown = x } }}>for</button>
+        <button #arm @click={() => { match search("x") { "no" => null, x => { shown = x } } }}>match</button>
+        <button #local @click={() => { let t = "plain"; t = search("x"); shown = t }}>local</button>
+        <button #add @click={() => { let t = "at "; t += search("x"); shown = t }}>add</button>
+        <button #closure @click={() => { let r = search("x"); shown = ["a"] | map((x) => x + r) | join("") }}>closure</button>
+        <button #again @click={() => { let r = search("x"); let r = "bound again"; shown = r }}>again</button>
+        <button #lit @click={() => { let r = search("x"); if r.len > 0 { shown = "literal" } }}>literal</button>
+        <button #state @click={() => { let r = search("x"); other = "o"; shown = other }}>state</button>
+        <button #fold @click={() => { let r = search("x"); shown = shown + r }}>fold</button>
+        <button #shadow @click={() => { let r = search("x"); shown = ["a"] | map((r) => r + "!") | join("") }}>shadow</button>
+        <button #shadow2 @click={() => { let r = search("x"); shown = ["a"] | map((r) => ["b"] | map((y) => y + r) | join("")) | join("") }}>shadow2</button>
+        <p #s>{shown}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Forms/></body></html>
+"##;
+    let body = format!(
+        r#"const real = window.fetch;
+    let busy = 0;
+    window.fetch = (...a) => {{ busy++; return real(...a).finally(() => {{ busy--; }}); }};
+    const until = async (f) => {{ for (let i = 0; i < 500 && !f(); i++) await tick(20); return f(); }};
+    // Every call answered, and what comes after each has run.
+    const quiet = async () => {{ for (let k = 0; k < 3; k++) {{ await tick(30); await until(() => busy === 0); }} }};
+    const forms = ["call", "expr", "field", "bound", "through", "list", "rec", "loop", "arm", "local", "add", "closure", "lit", "again", "state", "fold", "shadow", "shadow2"];
+    const out = {{ alone: {{}}, raced: {{}} }};
+    for (const id of forms) {{
+      $(id).click(); await quiet();
+      out.alone[id] = $("s").textContent;
+      $(id).click(); $("set").click(); await quiet();
+      out.raced[id] = $("s").textContent;
+    }}
+    return out;"#
+    );
+    let Some(r) = s7_in_page("q800-forms", src, "/", &body) else { return };
+    let found = "results for x";
+    // The fold builds on what `state`, the form before it, left.
+    let alone = serde_json::json!({
+        "call": found, "expr": "results for x!", "field": "a thing", "bound": found, "through": "13 long", "list": "leftright", "rec": "a thing",
+        "loop": "only", "arm": found, "local": found, "add": "at results for x", "closure": "aresults for x",
+        "lit": "literal", "again": "bound again", "state": "o", "fold": "oresults for x", "shadow": "a!", "shadow2": "ba",
+    });
+    let raced = serde_json::json!({
+        "call": "newer", "expr": "newer", "field": "newer", "bound": "newer", "through": "newer", "list": "newer", "rec": "newer",
+        "loop": "newer", "arm": "newer", "local": "newer", "add": "newer", "closure": "newer",
+        "lit": "newer", "again": "bound again", "state": "o", "fold": "newerresults for x", "shadow": "a!", "shadow2": "ba",
+    });
+    assert_eq!(r, serde_json::json!({ "alone": alone, "raced": raced, "remade": 0, "errors": [] }));
+}
+
+// Q-800: a run goes on through what a function waits for in a block of its own (`if`, `while`), a
+// `return` from one, a checked function, and a wait that failed and was caught by `??`: a helper called
+// after each is the same run, and the set with the answer is made. The edge: a parameter's default
+// that waits, whose mark went to the page as it was, so the page's whole script did not parse.
+#[test]
+fn a_run_goes_on_through_blocks_failures_and_defaults() {
+    let src = r##"server fn save(n: int) -> int {
+    sleep(40)
+    n
+}
+component Blocks() {
+    state msg = "start"
+    state done = false
+    state nine = 0
+    let wipe = () => { msg = "" }
+    let stops = (xs: list) => {
+        save(1)
+        let [a] = xs
+        a
+    }
+    let early = (c: bool) => {
+        if c {
+            let r = save(1)
+            msg = `early ${r}`
+            return r
+        }
+        msg = "not early"
+        0
+    }
+    fn checked(n: int) -> str {
+        let r = save(n)
+        msg = `checked ${r}`
+        `${r}`
+    }
+    let with_default = (x = save(9)) => { nine = x }
+    <div>
+        <button #guard @click={() => { let a = save(5); let b = stops([1, 2]) ?? 6; wipe(); msg = `${a} ${b}` }}>guard</button>
+        <button #early @click={() => { let r = early(true); wipe(); msg = `${r} back` }}>early</button>
+        <button #notearly @click={() => { let r = early(false); msg = `${r} back` }}>not early</button>
+        <button #checked @click={() => { let r = checked(2); wipe(); msg = r }}>checked</button>
+        <button #loop @click={() => { let n = 0; while n < 2 { n += save(1); wipe(); msg = `${n}` } }}>while</button>
+        <button #dflt @click={() => with_default()}>default</button>
+        <p #o>[{msg}]</p><p #nine>{nine}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Blocks/></body></html>
+"##;
+    let body = format!(
+        r#"const real = window.fetch;
+    let busy = 0;
+    window.fetch = (...a) => {{ busy++; return real(...a).finally(() => {{ busy--; }}); }};
+    const until = async (f) => {{ for (let i = 0; i < 500 && !f(); i++) await tick(20); return f(); }};
+    // Every call answered, and what comes after each has run.
+    const quiet = async () => {{ for (let k = 0; k < 3; k++) {{ await tick(30); await until(() => busy === 0); }} }};
+    const go = async (id, at) => {{ $(id).click(); await quiet(); return $(at).textContent; }};
+    const out = {{}};
+    for (const id of ["guard", "early", "notearly", "checked", "loop"]) out[id] = await go(id, "o");
+    out.dflt = await go("dflt", "nine");
+    return out;"#
+    );
+    let Some(r) = s7_in_page("q800-blocks", src, "/", &body) else { return };
+    let want = serde_json::json!({ "guard": "[5 6]", "early": "[1 back]", "notearly": "[0 back]", "checked": "[2]", "loop": "[2]", "dflt": "9", "remade": 0, "errors": [] });
+    assert_eq!(r, want);
+}
+
+// Q-800: an effect is a run of its own, also when what wakes it was set in a run that goes on waiting:
+// its set of the state takes it from that run, whose answer then gives way. The edge: the set that
+// wakes it is the last thing a block with a wait does, as the function goes on after the block;
+// `page_updated`, which runs the effect inside the run that asked; and a callback the block's last
+// step queued, which comes between the block's end and the function going on, with no run going.
+#[test]
+fn an_effect_is_a_run_of_its_own() {
+    let src = r##"server fn save(n: int) -> int {
+    sleep(40)
+    n
+}
+component Effects() {
+    state n = 0
+    state m = 0
+    state shown = "none"
+    state seen = "none"
+    state k = 0
+    state told = "none"
+    state late = "none"
+    if n > 0 { shown = `effect ${n}` }
+    if m > 0 { seen = `effect ${m}` }
+    if k > 0 { told = `effect ${k}` }
+    let in_block = () => {
+        let r = save(1)
+        if r > 0 {
+            let s = save(2)
+            m += s
+        }
+        save(3)
+        seen = `answer ${r}`
+    }
+    let queued = () => {
+        let r = save(1)
+        if r > 0 {
+            let s = save(2)
+            js("queueMicrotask", () => { late = `callback ${s}` })
+        }
+        save(3)
+        late = `answer ${r}`
+    }
+    <div>
+        <button #plain @click={() => { let r = save(1); n += 1; save(2); shown = `answer ${r}` }}>plain</button>
+        <button #block @click={() => in_block()}>block</button>
+        <button #now @click={() => { let r = save(1); k += 1; page_updated(); told = `answer ${r}` }}>now</button>
+        <button #queued @click={() => queued()}>queued</button>
+        <p #s>{shown}</p><p #b>{seen}</p><p #t>{told}</p><p #l>{late}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Effects/></body></html>
+"##;
+    let body = format!(
+        r#"const real = window.fetch;
+    let busy = 0;
+    window.fetch = (...a) => {{ busy++; return real(...a).finally(() => {{ busy--; }}); }};
+    const until = async (f) => {{ for (let i = 0; i < 500 && !f(); i++) await tick(20); return f(); }};
+    // Every call answered, and what comes after each has run.
+    const quiet = async () => {{ for (let k = 0; k < 3; k++) {{ await tick(30); await until(() => busy === 0); }} }};
+    const out = {{}};
+    $("plain").click(); await quiet();
+    out.plain = $("s").textContent;
+    $("block").click(); await quiet();
+    out.block = $("b").textContent;
+    $("now").click(); await quiet();
+    out.now = $("t").textContent;
+    $("queued").click(); await quiet();
+    out.queued = $("l").textContent;
+    return out;"#
+    );
+    let Some(r) = s7_in_page("q800-effects", src, "/", &body) else { return };
+    assert_eq!(r, serde_json::json!({ "plain": "effect 1", "block": "effect 2", "now": "effect 1", "queued": "callback 2", "remade": 0, "errors": [] }));
+}
+
+/// What the tests of Q-800's runs do in the page: every call answered, and what comes after each run.
+const Q800_PAGE: &str = "const real = window.fetch;\n    let busy = 0;\n    window.fetch = (...a) => { busy++; return real(...a).finally(() => { busy--; }); };\n    const until = async (f) => { for (let i = 0; i < 500 && !f(); i++) await tick(20); return f(); };\n    const quiet = async () => { for (let k = 0; k < 3; k++) { await tick(30); await until(() => busy === 0); } };\n    const go = async (id, at) => { $(id).click(); await quiet(); return $(at).textContent; };";
+
+// Found in review of Q-800 (the Decided line: an older call's answer never stands over a newer call):
+// a set decided by an answer counts as carrying it, or the older answer decides, with a plain
+// literal: typing "abcd" ended "taken", and an older empty answer "nothing" over the newer "found".
+// Every set under an `if`, `match` (its guards too), `while` or `for` an answer decides, and every
+// set after a guard that leaves on one (`return`, `?`). The edges: nested branches, a local set in a
+// branch and read after it, one alone (made), a plain set outside any branch (made over another
+// run's). And the one that must not change: a set under such a branch keeping a state in step with
+// one the function folded, as infinite_feed's `tops` beside `heights`, is made as the fold is; one
+// that also reads the answer (a `for`'s item, a `match` arm's name) carries it, and gives way.
+#[test]
+fn a_set_an_answer_decides_carries_it() {
+    let src = r##"server fn lag(k: str, ms: int) -> str {
+    sleep(ms)
+    k
+}
+server fn rows(k: str, ms: int) -> list {
+    sleep(ms)
+    k == "" ? [] : [k]
+}
+server fn taken(q: str) -> bool {
+    sleep(max([0, 400 - q.len * 80]))
+    q.len < 3
+}
+server fn result(ok: bool, ms: int) -> map {
+    sleep(ms)
+    { ok: ok }
+}
+server fn maybe(ok: bool, ms: int) -> int {
+    sleep(ms)
+    ok ? 1 : error("no")
+}
+component Decided() {
+    state hint = "none"
+    state v = "none"
+    state saved = "none"
+    state plain = "none"
+    state heights = [1]
+    state tops = [2]
+    state loaded = 0
+    state hs = []
+    let for_follows = (k: str, ms: int) => {
+        for x in rows(k, ms) {
+            hs = hs + [x]
+            v = `${x} of ${len(hs)}`
+        }
+    }
+    let match_follows = (k: str, ms: int) => {
+        match lag(k, ms) {
+            "never" => null
+            x => {
+                hs = hs + [x]
+                v = `${x} of ${len(hs)}`
+            }
+        }
+    }
+    let empty_or = (q: str, ms: int) => {
+        let r = lag(q, ms)
+        if r == "" { v = "nothing" } else { v = r }
+    }
+    let by_if = (k: str, ms: int) => { if lag(k, ms) == "a" { v = "A" } else { v = "B" } }
+    let by_var = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        if r == "a" { v = "A" } else { v = "B" }
+    }
+    let by_match = (k: str, ms: int) => { match lag(k, ms) { "a" => { v = "A" }, _ => { v = "B" } } }
+    let by_guard = (k: str, ms: int) => {
+        match k {
+            x if lag(x, ms) == "a" => { v = "A" }
+            _ => { v = "B" }
+        }
+    }
+    let by_while = (k: str, ms: int) => {
+        let go = true
+        while go && lag(k, ms) == "a" {
+            v = "A"
+            go = false
+        }
+    }
+    let by_for = (k: str, ms: int) => { for _x in rows(k, ms) { v = "A" } }
+    let nested = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        if r == "a" {
+            if ms > 0 { v = "A" }
+        } else {
+            v = "B"
+        }
+    }
+    let local_decided = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        let t = ""
+        if r == "a" { t = "A" } else { t = "B" }
+        v = t
+    }
+    let leaves = (ok: bool, ms: int) => {
+        let r = result(ok, ms)
+        if !r.ok { return }
+        saved = "yes"
+    }
+    let leaves_in_match = (ok: bool, ms: int) => {
+        let r = result(ok, ms)
+        match r.ok {
+            false => { return }
+            _ => null
+        }
+        saved = "yes"
+    }
+    let leaves_by_try = (ok: bool, ms: int) => {
+        let _r = maybe(ok, ms)?
+        saved = "yes"
+    }
+    let stays_plain = (ms: int) => {
+        let r = lag("x", ms)
+        if r == "never" { v = "no" }
+        plain = "after"
+    }
+    let more = () => {
+        let page = result(true, 150)
+        if page.ok {
+            heights = heights + [5]
+            tops = heights | map((h) => h * 2)
+            loaded += 1
+        }
+    }
+    let measure = () => {
+        heights = heights | map((h) => h + 1)
+        tops = heights | map((h) => h * 2)
+    }
+    <div>
+        <input #q oninput={(e) => { if taken(e.target.value) { hint = "taken" } else { hint = "free" } }}/>
+        <button #o_if @click={() => by_if("a", 250)}>o</button><button #n_if @click={() => by_if("b", 20)}>n</button>
+        <button #o_var @click={() => by_var("a", 250)}>o</button><button #n_var @click={() => by_var("b", 20)}>n</button>
+        <button #o_match @click={() => by_match("a", 250)}>o</button><button #n_match @click={() => by_match("b", 20)}>n</button>
+        <button #o_guard @click={() => by_guard("a", 250)}>o</button><button #n_guard @click={() => by_guard("b", 20)}>n</button>
+        <button #o_nested @click={() => nested("a", 250)}>o</button><button #n_nested @click={() => nested("b", 20)}>n</button>
+        <button #o_local @click={() => local_decided("a", 250)}>o</button><button #n_local @click={() => local_decided("b", 20)}>n</button>
+        <button #o_while @click={() => by_while("a", 250)}>o</button><button #n_while @click={() => by_while("b", 20)}>n</button>
+        <button #o_for @click={() => by_for("a", 250)}>o</button><button #n_for @click={() => by_for("", 20)}>n</button>
+        <button #o_ff @click={() => for_follows("a", 250)}>o</button><button #n_ff @click={() => for_follows("b", 20)}>n</button>
+        <button #o_mf @click={() => match_follows("a", 250)}>o</button><button #n_mf @click={() => match_follows("b", 20)}>n</button>
+        <button #o_empty @click={() => empty_or("", 100)}>o</button><button #n_empty @click={() => empty_or("found", 300)}>n</button>
+        <button #o_leaves @click={() => leaves(true, 250)}>o</button><button #n_leaves @click={() => leaves(false, 20)}>n</button>
+        <button #o_lm @click={() => leaves_in_match(true, 250)}>o</button><button #n_lm @click={() => leaves_in_match(false, 20)}>n</button>
+        <button #o_try @click={() => leaves_by_try(true, 250)}>o</button><button #n_try @click={() => leaves_by_try(false, 20)}>n</button>
+        <button #ok @click={() => leaves(true, 10)}>ok</button>
+        <button #plain @click={() => stays_plain(150)}>plain</button>
+        <button #other @click={() => { plain = "other" }}>other</button>
+        <button #reset @click={() => { v = "none"; saved = "none" }}>reset</button>
+        <button #more @click={() => more()}>more</button>
+        <button #timer @click={() => { run_after(5, () => { measure() }) }}>timer</button>
+        <p #hint>{hint}</p><p #v>{v}</p><p #saved>{saved}</p><p #pl>{plain}</p>
+        <p #h>{str(heights)}</p><p #t>{str(tops)}</p><p #n>{loaded}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Decided/></body></html>
+"##;
+    let body = format!("{TYPE_IN}\n    {Q800_PAGE}\n{}", r#"const out = {};
+await typeIn("q", "abcd"); await tick(30); await quiet(); await tick(450); await quiet();
+out.typed = $("hint").textContent;
+const race = async (f, at) => { $("reset").click(); $("o_" + f).click(); await tick(30); $("n_" + f).click(); await tick(30); await quiet(); await tick(320); await quiet(); return $(at).textContent; };
+for (const f of ["if", "var", "match", "guard", "nested", "local", "while", "for", "empty", "ff", "mf"]) out[f] = await race(f, "v");
+for (const f of ["leaves", "lm", "try"]) out[f] = await race(f, "saved");
+$("reset").click(); $("ok").click(); await tick(30); await quiet();
+out.alone = $("saved").textContent;
+$("plain").click(); $("other").click(); await tick(30); await quiet();
+out.plain = $("pl").textContent;
+$("more").click(); $("timer").click();
+await until(() => $("n").textContent === "1"); await quiet();
+const h = JSON.parse($("h").textContent), t = JSON.parse($("t").textContent);
+out.in_step = [h.length, h.length === t.length && h.every((x, i) => t[i] === x * 2)];
+return out;"#);
+    let Some(r) = s7_in_page("q800-decided", src, "/", &body) else { return };
+    let want = serde_json::json!({
+        "typed": "free", "if": "B", "var": "B", "match": "B", "guard": "B", "nested": "B", "local": "B", "while": "none", "for": "none", "empty": "found", "ff": "b of 1", "mf": "b of 3",
+        "leaves": "none", "lm": "none", "try": "none", "alone": "yes", "plain": "after", "in_step": [2, true], "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Found in review of Q-800: an answer reached a set through a function, and was not seen, so the
+// older one stood: a function reading it, a function giving it to a variable of the function around
+// it, or of the component. The edges: a read before the function has run, a variable given no answer,
+// a function's own parameter of that name (made either way).
+#[test]
+fn an_answer_through_a_closure_is_seen() {
+    let src = r##"server fn lag(k: str, ms: int) -> str {
+    sleep(ms)
+    k
+}
+component Closures() {
+    state v = "none"
+    let held = ""
+    let fill = (k: str, ms: int) => { held = lag(k, ms) }
+    let by_fn = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        fn g() { r }
+        v = g()
+    }
+    let by_lambda = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        let g = () => r
+        v = g()
+    }
+    let by_inner = (k: str, ms: int) => {
+        let r = ""
+        let f = () => { r = lag(k, ms) }
+        f()
+        v = r
+    }
+    let by_sibling = (k: str, ms: int) => {
+        fill(k, ms)
+        v = held
+    }
+    let before_it = (k: str, ms: int) => {
+        lag("earlier", ms)
+        let r = "before"
+        let f = () => { r = lag(k, ms) }
+        v = r
+        f()
+    }
+    let inner_plain = (k: str, ms: int) => {
+        let r = ""
+        let f = () => { r = "plain" }
+        f()
+        lag(k, ms)
+        v = r
+    }
+    let own_param = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        fn g(r: str) { r }
+        v = g("param")
+    }
+    <div>
+        <button #o_fn @click={() => by_fn("a", 250)}>o</button><button #n_fn @click={() => by_fn("b", 20)}>n</button>
+        <button #o_lam @click={() => by_lambda("a", 250)}>o</button><button #n_lam @click={() => by_lambda("b", 20)}>n</button>
+        <button #o_inner @click={() => by_inner("a", 250)}>o</button><button #n_inner @click={() => by_inner("b", 20)}>n</button>
+        <button #o_sib @click={() => by_sibling("a", 250)}>o</button><button #n_sib @click={() => by_sibling("b", 20)}>n</button>
+        <button #before @click={() => before_it("a", 100)}>x</button>
+        <button #plain @click={() => inner_plain("a", 100)}>x</button>
+        <button #param @click={() => own_param("a", 100)}>x</button>
+        <button #set @click={() => { v = "newer" }}>s</button>
+        <button #reset @click={() => { v = "none" }}>r</button>
+        <p #v>{v}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Closures/></body></html>
+"##;
+    let body = format!("{Q800_PAGE}\n{}", r#"const out = {};
+const race = async (f) => { $("reset").click(); $("o_" + f).click(); await tick(30); $("n_" + f).click(); await tick(30); await quiet(); await tick(320); await quiet(); return $("v").textContent; };
+for (const f of ["fn", "lam", "inner", "sib"]) out[f] = await race(f);
+const raced = async (id) => { $("reset").click(); $(id).click(); $("set").click(); await tick(30); await quiet(); await tick(150); await quiet(); return $("v").textContent; };
+for (const id of ["before", "plain", "param"]) out[id] = await raced(id);
+return out;"#);
+    let Some(r) = s7_in_page("q800-closures", src, "/", &body) else { return };
+    let want = serde_json::json!({ "fn": "b", "lam": "b", "inner": "b", "sib": "b", "before": "before", "plain": "plain", "param": "param", "remade": 0, "errors": [] });
+    assert_eq!(r, want);
+}
+
+// Found in review of Q-800: `el.click()` inside a run made the nested handler part of that run, so
+// the answer overwrote what it set; and `parallel`'s functions were one run, so the older call stood
+// over the newer. A handler is a run of its own wherever it is dispatched, and so is each function
+// of `parallel`, under the run that called it: a helper in one leaves the caller's claim alone. The
+// edges: a handler that waits, the run going on after the nested handler (a helper of its own is
+// still its own), `parallel` given a list, its answers, refused (the run goes on), and called with
+// no run going, which leaves none going: two later timers are two runs.
+#[test]
+fn a_handler_and_a_parallel_function_are_runs_of_their_own() {
+    let src = r##"server fn lag(k: str, ms: int) -> str {
+    sleep(ms)
+    k
+}
+fn pair(a, b) {
+    parallel([a, b])
+}
+fn call_it(f, a, b) {
+    f(a, b)
+}
+component Runs() {
+    state v = "none"
+    state w = "none"
+    let wipe = () => { v = "" }
+    let h_wait = () => {
+        lag("h", 10)
+        wipe()
+    }
+    let reenter = (id: str) => {
+        let r = lag("r", 30)
+        let el = js("document.getElementById", id)
+        el.click()
+        v = r
+    }
+    <div>
+        <button #nest @click={() => { v = "nested" }}>x</button>
+        <button #nestw @click={() => { w = "nested"; lag("n", 5) }}>x</button>
+        <button #sync @click={() => reenter("nest")}>x</button>
+        <button #waits @click={() => { let r = lag("r", 30); let el = js("document.getElementById", "nestw"); el.click(); w = r }}>x</button>
+        <button #own @click={() => { let r = lag("r", 30); wipe(); v = r }}>x</button>
+        <button #elsewhere @click={() => { w = "elsewhere" }}>x</button>
+        <button #goes_on @click={() => { let r = lag("r2", 30); let el = js("document.getElementById", "elsewhere"); el.click(); wipe(); v = r }}>x</button>
+        <button #par @click={() => { parallel(() => { v = lag("a", 100) }, () => { v = lag("b", 10) }) }}>x</button>
+        <button #parlist @click={() => { pair(() => { v = lag("c", 100) }, () => { v = lag("d", 10) }) }}>x</button>
+        <button #parhelp @click={() => { let r = lag("r", 20); parallel(() => h_wait(), () => h_wait()); v = r }}>x</button>
+        <button #paranswer @click={() => { let [a, b] = parallel(() => lag("a", 50), () => lag("b", 10)); wipe(); v = a + b }}>x</button>
+        <button #parbad @click={() => { let r = lag("r", 10); let x = parallel(5, 6) ?? ["none"]; wipe(); v = r + x[0] }}>x</button>
+        <button #stale @click={() => {
+            run_after(0, () => { call_it(parallel, () => 1, () => 2) })
+            run_after(10, () => { v = lag("older", 100) })
+            run_after(20, () => { v = lag("newer", 10) })
+        }}>x</button>
+        <p #v>{v}</p><p #w>{w}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Runs/></body></html>
+"##;
+    let body = format!("{Q800_PAGE}\n{}", r#"const out = {};
+for (const id of ["sync", "own", "goes_on", "par", "parlist", "parhelp", "paranswer", "parbad", "stale"]) { $(id).click(); await tick(60); await quiet(); await tick(130); await quiet(); out[id] = $("v").textContent; }
+$("waits").click(); await tick(30); await quiet(); out.waits = $("w").textContent;
+return out;"#);
+    let Some(r) = s7_in_page("q800-runs", src, "/", &body) else { return };
+    let want = serde_json::json!({ "sync": "nested", "own": "r", "goes_on": "r2", "par": "b", "parlist": "d", "parhelp": "r", "paranswer": "ab", "parbad": "rnone", "stale": "newer", "waits": "nested", "remade": 0, "errors": [] });
+    assert_eq!(r, want);
+}
+
+// Found in review of Q-800: a function's temporaries were declared after its parameters' defaults,
+// so a default that used one threw "Cannot access '$t0' before initialization". The edges: a default
+// from the page, one that sets a state and waits, a checked function's, one given (not worked out),
+// a checked function with no default.
+#[test]
+fn a_default_can_use_what_the_function_declares() {
+    let src = r##"server fn lag(k: str, ms: int) -> str {
+    sleep(ms)
+    k
+}
+component Defaults() {
+    state v = "none"
+    state w = "none"
+    let page = (x = js("Math.max", 1, 2)) => { v = str(x) }
+    let sets = (x = { w = lag("d2", 1); 1 }) => { v = `d2 ${x}` }
+    fn checked(x: str = lag("d3", 1)) -> str {
+        v = x
+        x
+    }
+    fn typed(k: str) -> str {
+        let r = lag(k, 1)
+        v = r
+        r
+    }
+    let given = (x = js("Math.max", 1, 2)) => { v = str(x) }
+    <div>
+        <button #page @click={() => page()}>x</button>
+        <button #sets @click={() => sets()}>x</button>
+        <button #checked @click={() => checked()}>x</button>
+        <button #typed @click={() => typed("t")}>x</button>
+        <button #given @click={() => given(7)}>x</button>
+        <p #v>{v}</p><p #w>{w}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Defaults/></body></html>
+"##;
+    let body = format!("{Q800_PAGE}\n{}", r#"const out = {};
+for (const id of ["page", "sets", "checked", "typed", "given"]) out[id] = await go(id, "v");
+out.w = $("w").textContent;
+return out;"#);
+    let Some(r) = s7_in_page("q800-defaults", src, "/", &body) else { return };
+    let want = serde_json::json!({ "page": "2", "sets": "d2 1", "checked": "d3", "typed": "t", "given": "7", "w": "d2", "remade": 0, "errors": [] });
+    assert_eq!(r, want);
+}
+
+// Found in review of Q-800: `let r = search(q); wipe(); shown = r` typed quickly ended empty: an older
+// run's `wipe()` took the state from the newest call, whose answer was then dropped too. A plain set
+// from a run that held the state and lost it is made and takes nothing back; once the newest answer
+// is in, it would blank it, and is dropped. The edges: alone, the run still holds it; an older run's
+// plain set while the newest waits, made; a person, and a run with no claim, still beat an old answer;
+// a run that only ever makes plain sets has had no call out, and goes on being made after an answer.
+#[test]
+fn an_older_runs_plain_set_leaves_the_newest_call_alone() {
+    let src = r##"server fn search(q: str) -> str {
+    sleep(max([0, 400 - q.len * 80]))
+    `results for ${q}`
+}
+server fn lag(k: str, ms: int) -> str {
+    sleep(ms)
+    k
+}
+component Lost() {
+    state shown = "none"
+    state v = "none"
+    state p = "none"
+    let wipe = () => {
+        shown = ""
+        lag("z", 1)
+    }
+    let ticker = () => {
+        let i = 0
+        while i < 3 {
+            p = `tick ${i}`
+            lag("z", 60)
+            i += 1
+        }
+    }
+    let older_first = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        v = `wiped ${k}`
+        lag("z", 40)
+        v = r
+    }
+    <div>
+        <input #own oninput={(e) => { let r = search(e.target.value); wipe(); shown = r }}/>
+        <button #o @click={() => older_first("a", 60)}>x</button>
+        <button #n @click={() => older_first("b", 400)}>x</button>
+        <button #kept @click={() => { let r = search("abcd"); wipe(); shown = r }}>x</button>
+        <button #slow @click={() => { shown = search("a") }}>x</button>
+        <button #clear @click={() => { shown = "" }}>x</button>
+        <button #clearw @click={() => { lag("z", 20); shown = "cleared" }}>x</button>
+        <button #ticker @click={() => ticker()}>x</button>
+        <button #answer @click={() => { p = lag("answer", 10) }}>x</button>
+        <p #s>[{shown}]</p><p #v>{v}</p><p #p>{p}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Lost/></body></html>
+"##;
+    let body = format!("{TYPE_IN}\n    {Q800_PAGE}\n{}", r#"const out = {};
+await typeIn("own", "abcd"); await tick(30); await quiet(); await tick(450); await quiet();
+out.typed = $("s").textContent;
+$("kept").click(); await tick(30); await quiet(); await tick(100); await quiet();
+out.kept = $("s").textContent;
+$("o").click(); await tick(20); $("n").click();
+await until(() => $("v").textContent === "wiped a"); out.seen = $("v").textContent;
+await until(() => $("v").textContent === "b"); await quiet(); await tick(100); await quiet();
+out.older_first = $("v").textContent;
+$("slow").click(); await tick(20); $("clear").click(); await tick(450); await quiet();
+out.person_clears = $("s").textContent;
+$("slow").click(); await tick(20); $("clearw").click(); await tick(450); await quiet();
+out.a_run_clears = $("s").textContent;
+$("ticker").click(); await tick(20); $("answer").click();
+await until(() => $("p").textContent === "answer");
+await until(() => $("p").textContent === "tick 2"); await quiet();
+out.plain_only_run = $("p").textContent;
+return out;"#);
+    let Some(r) = s7_in_page("q800-lost", src, "/", &body) else { return };
+    let want = serde_json::json!({ "typed": "[results for abcd]", "kept": "[results for abcd]", "seen": "wiped a", "older_first": "b", "person_clears": "[]", "a_run_clears": "[cleared]", "plain_only_run": "tick 2", "remade": 0, "errors": [] });
+    assert_eq!(r, want);
+}
+
+// Found in review of Q-800: a fold read its state before its wait, so three quick `n += one()` read 0
+// each and counted 1, and what another run added meanwhile was lost. What waits comes first, then the
+// state is read: `+=`, `-=`, `m = m + one()`, two waits, a template, a list, a record. The edges:
+// another run's set during the wait stays, in a list and in a record's other field.
+#[test]
+fn a_fold_reads_its_state_after_its_wait() {
+    let src = r##"server fn one(ms: int) -> int {
+    sleep(ms)
+    1
+}
+server fn lag(k: str, ms: int) -> str {
+    sleep(ms)
+    k
+}
+component Folds() {
+    state n = 0
+    state m = 0
+    state d = 10
+    state two = 0
+    state text = ""
+    state list = ["x"]
+    state vw = { res: "", other: 1 }
+    <div>
+        <button #incr @click={() => { n += one(50) }}>x</button>
+        <button #incr2 @click={() => { m = m + one(50) }}>x</button>
+        <button #decr @click={() => { d -= one(50) }}>x</button>
+        <button #both @click={() => { two = two + one(20) + one(30) }}>x</button>
+        <button #tpl @click={() => { text = `${text}${lag("t", 50)}` }}>x</button>
+        <button #app @click={() => { list = list + [lag("row", 100)] }}>x</button>
+        <button #touch @click={() => { list = list + ["touched"] }}>x</button>
+        <button #rec @click={() => { vw = { ...vw, res: lag("c", 100) } }}>x</button>
+        <button #other @click={() => { vw = { ...vw, other: 2 } }}>x</button>
+        <p #n>{n}</p><p #m>{m}</p><p #d>{d}</p><p #two>{two}</p><p #text>{text}</p><p #l>{str(list)}</p><p #vw>{str(vw)}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Folds/></body></html>
+"##;
+    let body = format!("{Q800_PAGE}\n{}", r#"const out = {};
+for (const id of ["incr", "incr2", "decr", "both", "tpl"]) for (let i = 0; i < 3; i++) $(id).click();
+await tick(30); await quiet(); await tick(100); await quiet();
+out.counts = [$("n").textContent, $("m").textContent, $("d").textContent, $("two").textContent, $("text").textContent];
+$("app").click(); await tick(20); $("touch").click(); await tick(30); await quiet();
+out.list = $("l").textContent;
+$("rec").click(); await tick(20); $("other").click(); await tick(30); await quiet();
+out.record = $("vw").textContent;
+return out;"#);
+    let Some(r) = s7_in_page("q800-hoist", src, "/", &body) else { return };
+    let want = serde_json::json!({ "counts": ["3", "3", "7", "6", "ttt"], "list": "[\"x\", \"touched\", \"row\"]", "record": "{ res: \"c\", other: 2 }", "remade": 0, "errors": [] });
+    assert_eq!(r, want);
+}
+
+// Found in review of Q-800: a wait in markup, in a function that waits, went into a hole, a function
+// the page runs, where `await` is no JavaScript: the page's whole script did not parse, and nothing
+// said so. What waits comes first, and the markup is made with its value: in a child, an attribute, a
+// class, the `.c-{x} #i-{x}` shorthand, a `for`'s list and rows, a prop, nested elements, `?:`, `&&`,
+// a loop (each making its own), a state's initializer. The edges: a hole that does not wait still follows what it reads, beside one
+// that does; markup with no wait in it, as before.
+#[test]
+fn markup_in_a_function_that_waits_is_made_with_its_answers() {
+    let src = r##"server fn lag(k: str, ms: int) -> str {
+    sleep(ms)
+    k
+}
+component Tag(p = "") {
+    <i>{p}</i>
+}
+component Later() {
+    state el = <u>{lag("from the state", 1)}</u>
+    <div #later>{el}</div>
+}
+component Mk(c = true, on_x = null) {
+    state v = "none"
+    state w = null
+    state n = 0
+    state open = false
+    let child = () => {
+        let el = <b>{lag("child", 1)}</b>
+        w = el
+        v = "child"
+    }
+    let attr = () => {
+        w = <b title={lag("attr", 1)}>x</b>
+        v = "attr"
+    }
+    let cls = () => {
+        w = <b class={lag("cls", 1)}>x</b>
+        v = "cls"
+    }
+    let short = () => {
+        w = <b.c-{lag("cls", 1)} #i-{lag("id", 1)}>x</b>
+        v = "short"
+    }
+    let iter = () => {
+        w = <ul>{for x in [lag("row", 1)] => <li>{x}</li>}</ul>
+        v = "iter"
+    }
+    let row = () => {
+        w = <ul>{for x in ["a", "b"] => <li>{lag(x, 1)}</li>}</ul>
+        v = "row"
+    }
+    let prop = () => {
+        w = <Tag p={lag("prop", 1)}/>
+        v = "prop"
+    }
+    let inner = () => {
+        w = <div><p><b>{lag("inner", 1)}</b></p>{<i>{lag("after", 1)}</i>}</div>
+        v = "inner"
+    }
+    let either = () => {
+        w = <b>{c ? lag("yes", 1) : "no"}</b>
+        v = "either"
+    }
+    let either_and = () => {
+        w = <b>{c && lag("and", 1)}</b>
+        v = "and"
+    }
+    let in_loop = () => {
+        let out = []
+        for k in ["a", "b"] { out = out + [<b>{lag(k, 1)}</b>] }
+        w = <div>{out}</div>
+        v = "loop"
+    }
+    let follows = () => {
+        w = <b data-n={n}>{lag("still follows", 1)}</b>
+        v = "follows"
+    }
+    let no_wait = () => {
+        lag("z", 1)
+        w = <b data-n={n}>{n}</b>
+        v = "no wait"
+    }
+    <div>
+        <button #child @click={() => child()}>x</button><button #attr @click={() => attr()}>x</button><button #cls @click={() => cls()}>x</button><button #short @click={() => short()}>x</button>
+        <button #iter @click={() => iter()}>x</button><button #row @click={() => row()}>x</button><button #prop @click={() => prop()}>x</button>
+        <button #inner @click={() => inner()}>x</button><button #either @click={() => either()}>x</button><button #and @click={() => either_and()}>x</button>
+        <button #loop @click={() => in_loop()}>x</button><button #follows @click={() => follows()}>x</button><button #nowait @click={() => no_wait()}>x</button>
+        <button #bump @click={() => { n += 1 }}>x</button><button #open @click={() => { open = true }}>x</button>
+        {open ? <Later/> : null}
+        <p #v>{v}</p><div #w>{w}</div>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Mk/></body></html>
+"##;
+    let body = format!("{Q800_PAGE}\n{}", r#"const out = {};
+for (const id of ["child", "attr", "cls", "short", "iter", "row", "prop", "inner", "either", "and", "loop", "follows"]) { out[id] = [await go(id, "v"), $("w").innerHTML.replace(/ style="[^"]*"/g, "").replace(/ data-c="[^"]*"/g, "")]; }
+$("bump").click(); await tick(30);
+out.follows_after = $("w").innerHTML;
+await go("nowait", "v"); $("bump").click(); await tick(30);
+out.no_wait = $("w").innerHTML;
+$("open").click(); await until(() => $("later") && $("later").textContent !== ""); await quiet();
+out.state = $("later").innerHTML;
+return out;"#);
+    let Some(r) = s7_in_page("q800-markup", src, "/", &body) else { return };
+    let want = serde_json::json!({
+        "child": ["child", "<b>child</b>"], "attr": ["attr", "<b title=\"attr\">x</b>"], "cls": ["cls", "<b class=\"cls\">x</b>"],
+        "short": ["short", "<b id=\"i-id\" class=\"c-cls\">x</b>"],
+        "iter": ["iter", "<ul><li>row</li></ul>"], "row": ["row", "<ul><li>a</li><li>b</li></ul>"], "prop": ["prop", "<quillo-island><i>prop</i></quillo-island>"],
+        "inner": ["inner", "<div><p><b>inner</b></p><i>after</i></div>"], "either": ["either", "<b>yes</b>"], "and": ["and", "<b>and</b>"],
+        "loop": ["loop", "<div><b>a</b><b>b</b></div>"], "follows": ["follows", "<b data-n=\"0\">still follows</b>"],
+        "follows_after": "<b data-n=\"1\">still follows</b>", "no_wait": "<b data-n=\"2\">2</b>", "state": "<u>from the state</u>", "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Decided by the user (Q-800): `every` skips a tick while that timer's last run is still waiting. A
+// poll slower than its timer had each answer come after a newer call, so nothing showed while it
+// polled, and its calls piled up. At most one run per timer: the poll shows its answers, with never
+// two calls in flight (counted on the server), at gaps of 50, 1 and 0 ms. The edges: a callback that
+// does not wait, or could and does not, counts every tick; a failed run frees the timer and is
+// reported; a run that never answers is given up on after 30 seconds, not before, and its late answer
+// frees nothing; stopping while a run waits stops it, and the late answer starts nothing; a timer
+// held leaves another alone. The clock is moved in the page, for the 30 seconds.
+#[test]
+fn an_every_waits_for_its_last_run() {
+    let src = r##"let in_flight = 0
+let most = 0
+let calls = 0
+server fn lag(k: str, ms: int) -> str {
+    in_flight += 1
+    calls += 1
+    if in_flight > most { most = in_flight }
+    sleep(ms)
+    in_flight -= 1
+    k
+}
+route GET /peak = {
+    let seen = { most: most, calls: calls, in_flight: in_flight }
+    most = 0
+    calls = 0
+    seen
+}
+component Poll(gap: int) {
+    state polled = "none"
+    state ticks = 0
+    every(gap, () => {
+        let r = lag("poll", 130)
+        polled = r
+        ticks += 1
+    })
+    <div><p #polled>{polled}</p><p #ticks>{ticks}</p></div>
+}
+component Plain() {
+    state n = 0
+    state m = 0
+    state never = false
+    every(5, () => { n += 1 })
+    every(5, () => {
+        if never { lag("x", 1) }
+        m += 1
+    })
+    <div><p #n>{n}</p><p #m>{m}</p></div>
+}
+component Stops(bad: list) {
+    state tries = 0
+    every(10, () => {
+        tries += 1
+        lag("x", 1)
+        let [a] = bad
+        a
+    })
+    <p #tries>{tries}</p>
+}
+component Held() {
+    state got = "none"
+    state other = 0
+    let hold = () => {
+        let r = js("__hold")
+        got = str(r)
+    }
+    every(10, hold)
+    every(10, () => { other += 1 })
+    <div><p #got>{got}</p><p #other>{other}</p></div>
+}
+component Two() {
+    state a = 0
+    state b = 0
+    let one = () => {
+        js("__hold")
+        a += 1
+    }
+    let two = () => {
+        js("__hold2")
+        b += 1
+    }
+    every(10, one)
+    every(10, two)
+    <div><p #a>{a}</p><p #b>{b}</p></div>
+}
+component Page() {
+    state on = ""
+    state gap = 50
+    <div>
+        <button #p50 @click={() => { gap = 50; on = "poll" }}>x</button>
+        <button #p1 @click={() => { gap = 1; on = "poll" }}>x</button>
+        <button #p0 @click={() => { gap = 0; on = "poll" }}>x</button>
+        <button #plain @click={() => { on = "plain" }}>x</button>
+        <button #stops @click={() => { on = "stops" }}>x</button>
+        <button #held @click={() => { on = "held" }}>x</button>
+        <button #two @click={() => { on = "two" }}>x</button>
+        <button #off @click={() => { on = "" }}>x</button>
+        {on == "poll" ? <Poll gap={gap}/> : null}
+        {on == "plain" ? <Plain/> : null}
+        {on == "stops" ? <Stops bad={[1, 2]}/> : null}
+        {on == "held" ? <Held/> : null}
+        {on == "two" ? <Two/> : null}
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Page/></body></html>
+"##;
+    let body = format!("{Q800_PAGE}\n{}", r#"const out = {};
+const peak = async () => (await (await real("/peak")).json());
+const ticks = { n: 0 };
+const setI = window.setInterval;
+window.setInterval = (f, ms) => setI(() => { ticks.n++; f(); }, ms);
+const skew = { ms: 0 };
+const now = performance.now.bind(performance);
+performance.now = () => now() + skew.ms;
+const holds = [], holds2 = [];
+window.__hold = () => new Promise((r) => holds.push(r));
+window.__hold2 = () => new Promise((r) => holds2.push(r));
+// The poll: answers show while it polls, one call at a time, at each gap.
+for (const id of ["p50", "p1", "p0"]) {
+  await peak();
+  $(id).click();
+  await until(() => $("polled") && $("polled").textContent === "poll" && Number($("ticks").textContent) >= 2);
+  out[id] = [$("polled") && $("polled").textContent, Number($("ticks") && $("ticks").textContent) >= 2];
+  $("off").click(); await tick(30); await quiet(); await tick(160);
+  const p = await peak();
+  out[id].push(p.most, p.in_flight);
+}
+// A callback that does not wait: every tick, and one that could wait but does not.
+$("plain").click(); await until(() => $("n")); ticks.n = 0; const n0 = Number($("n").textContent), m0 = Number($("m").textContent);
+await tick(200);
+const fired = ticks.n, n1 = Number($("n").textContent), m1 = Number($("m").textContent);
+$("off").click();
+out.plain = [fired > 10, fired === (n1 - n0) + (m1 - m0), Math.abs((n1 - n0) - (m1 - m0)) <= 1];
+await tick(30);
+// A failed run frees the timer, and is reported.
+const before = window.__quilloErrors.length;
+$("stops").click(); await until(() => $("tries") && Number($("tries").textContent) >= 3);
+out.stops = [Number($("tries").textContent) >= 3, window.__quilloErrors.length > before, String(window.__quilloErrors.at(-1)).includes("pattern does not match")];
+$("off").click(); await tick(30); await quiet();
+window.__quilloErrors.length = before;
+// One call at a time, the next tick after the answer; another timer goes on meanwhile.
+$("held").click(); await until(() => holds.length === 1 && $("other") && Number($("other").textContent) >= 3); await tick(60);
+out.held = [holds.length, Number($("other").textContent) >= 3];
+holds[0]("one"); await until(() => holds.length === 2);
+out.next = [holds.length, $("got").textContent];
+// A run that never answers is given up on after 30 seconds.
+skew.ms += 29000; await tick(60);
+out.not_yet = holds.length;
+skew.ms += 1500; await until(() => holds.length === 3); await tick(60);
+out.given_up = holds.length;
+// Its answer, late, frees nothing: the newer run still holds the timer.
+holds[1]("late"); await tick(60);
+out.late_answer = holds.length;
+holds[2]("three"); await until(() => holds.length === 4);
+out.after = [holds.length, $("got").textContent];
+// Stopped while waiting: no more, and the late answer starts nothing.
+$("off").click(); await tick(60);
+holds[3]("after the end"); await tick(80);
+out.stopped = holds.length;
+// Two timers: one held does not hold the other.
+holds.length = 0;
+$("two").click(); await until(() => holds.length === 1 && holds2.length === 1);
+holds2[0](1); await until(() => holds2.length === 2); await tick(40);
+out.two = [holds.length, holds2.length];
+$("off").click(); await tick(30);
+return out;
+"#);
+    let Some(r) = s7_in_page("q800-every", src, "/", &body) else { return };
+    let want = serde_json::json!({
+        "p50": ["poll", true, 1, 0], "p1": ["poll", true, 1, 0], "p0": ["poll", true, 1, 0], "plain": [true, true, true], "stops": [true, true, true],
+        "held": [1, true], "next": [2, "one"], "not_yet": 2, "given_up": 3, "late_answer": 3, "after": [4, "three"], "stopped": 4, "two": [1, 2],
+        "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// ---- end of Q-800's runs ----

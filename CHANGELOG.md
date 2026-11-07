@@ -318,9 +318,23 @@ What runs at the same time comes out as if done one after another (Q-796 to Q-80
   second add that happens (Q-803).
 - **A state set after a wait gives way to a newer set of it** (the user's decision, "the
   latest call only"): every set of a state claims it (plain, `bind:`, from a call), and a
-  handler that waited keeps only the sets it makes while no newer set claimed the state, so
-  a search box ends on the answer for what was typed last. A set that reads the state it
-  sets is a fold (`n += 1`, `xs = xs + [x]`, `s = f(s)`) and is always made (Q-800).
+  set carrying an answer the function waited for (in its value, or decided by it: under an
+  `if`, `match`, `while` or `for` on the answer, or after a guard that leaves on it) gives
+  way when another run (a handler, effect, timer or frame, with the functions it calls) has
+  set or claimed that state since, so a search box ends on the answer for what was typed
+  last. Plain sets after a wait are made and still claim, and a function's own helpers are
+  its run, so their waits take nothing from it; a plain set from a run that lost the state
+  takes nothing, and cannot blank the newest answer. A set that reads the state it sets is
+  a fold (`n += 1`, `xs = xs + [x]`, `s = f(s)`), always made, and reads the state after
+  any wait on its right, so `n += count()` three times in one tick counts three (Q-800).
+- **`every` in the browser waits for its last run**: a tick that finds it still waiting
+  does nothing, so a poll slower than its timer shows each answer, where every answer was
+  dropped for a newer call and calls piled up on a slow server. A run with no answer after
+  30 seconds (or two gaps, if longer) is given up on (Q-800).
+- **A hole of markup in a function that waits may wait** (`let el = <b>{load()}</b>`): it
+  emitted `await` in a function that could not hold it, so the page's script did not parse,
+  `quillo check` said ok and nothing reported it. It is worked out once, before the markup
+  is made (Q-800's review).
 - **A topic is 1 to 256 bytes**, any characters, a comma too; an empty or longer one stops
   `watch` and `publish` with an error, where its page never heard of it. A trailing `:*` is
   a wildcard, as before, now in the guide: a topic built from a visitor's text must not end

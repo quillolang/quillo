@@ -1053,9 +1053,12 @@ pub fn test_script(it: &Interp, name: &str) -> Result<String, QuilloError> {
 }
 
 /// `code` with each wait's mark made the claims taken before it: on each state the function sets
-/// after that wait, as written. Taken there, on the way that waits, not as the function begins:
-/// a scroll handler that only loads now and then took the load's states from the one loading, and
-/// the feed stopped (found in review of FEEDBACK55.md, Q-800; branch feedback55).
+/// after that wait, as written, with an answer. Taken there, on the way that waits, not as the
+/// function begins: a scroll handler that only loads now and then took the load's states from the
+/// one loading, and the feed stopped (found in review of FEEDBACK55.md, Q-800; branch feedback55).
+/// A claim starts at the wait whose answer the set carries: an earlier wait is no call for that
+/// state, and a later one goes on with the claim it has, or an older call that came back late took
+/// the state again from the newer one (`let r = search(q); let s = polish(r); shown = s`).
 fn claimed(ctx: &FnCtx, code: String) -> String {
     if !code.contains('\u{1}') {
         return code;
@@ -1063,19 +1066,43 @@ fn claimed(ctx: &FnCtx, code: String) -> String {
     let mut out = code;
     for (i, m) in ctx.marks.iter().enumerate() {
         let Mark::Wait(n) = m else { continue };
-        let mut states: Vec<usize> = Vec::new();
+        let mut states: Vec<(usize, bool)> = Vec::new();
         for later in &ctx.marks[i + 1..] {
-            if let Mark::Set(at) = later {
-                if !states.contains(at) {
-                    states.push(*at);
-                }
+            let Mark::Set(at, from) = later else { continue };
+            if *from > i {
+                continue;
+            }
+            match states.iter_mut().find(|s| s.0 == *at) {
+                Some(s) => s.1 &= *from == i,
+                None => states.push((*at, *from == i)),
             }
         }
-        let claims: String = states.iter().map(|&at| format!("{} = W.claim({}), ", ctx.claims[at].1, ctx.claims[at].0)).collect();
+        let claims: String = states
+            .iter()
+            .map(|&(at, first)| {
+                let (state, c) = &ctx.claims[at];
+                if first {
+                    format!("{c} = W.claim({state}), ")
+                } else {
+                    format!("{c} = W.again({state}, {c}), ")
+                }
+            })
+            .collect();
         out = out.replace(&wait_mark(*n), &claims);
     }
     out
 }
+
+/// What is run in an arrow of its own in a function that waits, waited for: the arrow gives the run
+/// back as it ends, as the function does (FEEDBACK55.md, Q-800; branch feedback55).
+fn waited_arrow(body: &str) -> String {
+    format!("W.on($run, await W.off($run, (async () => {{\ntry {{\n{}}} finally {{ W.off($run); }}\n}})()))", body)
+}
+
+/// The start and end of a function that waits, whose run is `$run`: the one going on when it was
+/// called, or a new one (see `W.run`; FEEDBACK55.md, Q-800; branch feedback55).
+const RUN_OPEN: &str = "const $run = W.run();\ntry {\n";
+const RUN_CLOSE: &str = "} finally { W.off($run); }\n";
 
 /// The parts of the runtime `program` needs, then the program, minified.
 fn assemble(open: &str, program: &str, close: &str) -> String {
@@ -1432,17 +1459,61 @@ struct FnCtx {
     /// The function written in an `@event` or `@mount` attribute itself, not
     /// one inside it: a Promise its `js(...)` gives is waited for here.
     waits_js: bool,
-    /// In a function that waits: the states it sets, each with the temp holding the claim it takes
-    /// on that state, and its waits and sets in the order written (see `Stmt::Assign` and
-    /// `claimed`; FEEDBACK55.md, Q-800; branch feedback55).
+    /// In a function that waits: the states it sets with an answer, each with the temp holding the
+    /// claim it takes on that state, and its waits and those sets in the order written (see
+    /// `Stmt::Assign` and `claimed`; FEEDBACK55.md, Q-800; branch feedback55).
     claims: Vec<(String, String)>,
     marks: Vec<Mark>,
+    answers: Answers,
 }
 
-/// A wait (its number) or a set of a state (its claim's temp), in a function that waits.
+/// What a function that waits knows of the answers it waited for (see `answer_in`; FEEDBACK55.md,
+/// Q-800; branch feedback55).
+#[derive(Default)]
+struct Answers {
+    /// The variables (by their JS names) holding an answer, each with the first wait it came from.
+    held: HashMap<String, usize>,
+    /// This function's variables a function inside it gives an answer to, each with the marks there
+    /// were when that function was written: the answer is in once a wait after that is over.
+    by_closure: HashMap<String, usize>,
+    /// The first wait whose answer decides the branch being compiled.
+    decided: Option<usize>,
+    /// The first wait whose answer may have left the function, for all that comes after.
+    left: Option<usize>,
+    /// The states it has folded after a wait.
+    folded: Vec<String>,
+    /// Compiling markup whose waits have been worked out first (see `html`).
+    in_html: bool,
+}
+
+/// The earlier of two waits, either or both perhaps none.
+fn first_of(a: Option<usize>, b: Option<usize>) -> Option<usize> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, y) => x.or(y),
+    }
+}
+
+/// Whether `e` can leave its function by itself (`return`, or `?`), not counting functions in it.
+fn may_leave(e: &Expr) -> bool {
+    let mut found = false;
+    each_expr_in(
+        e,
+        &mut |x| match x {
+            Expr::Try(_) => found = true,
+            Expr::Block(ss) if ss.iter().any(|s| matches!(s, Stmt::Return(..))) => found = true,
+            _ => {}
+        },
+        false,
+    );
+    found
+}
+
+/// In a function that waits: a wait (its number, its place among the marks), or a set of a state
+/// with an answer (its claim, and the first wait whose answer it carries).
 enum Mark {
     Wait(usize),
-    Set(usize),
+    Set(usize, usize),
 }
 
 /// Whether `name = e` (or `+=`, `-=`) folds the state into its new value: reads it.
@@ -1489,6 +1560,9 @@ struct Compiler<'a> {
     /// Compiling what `.then`, `.catch` or `.finally` is called on: a Promise
     /// is wanted there, not what it gives.
     keep_promise: bool,
+    /// Expressions already worked out, by what holds their value: a wait taken out of a fold or of
+    /// markup, to come first (see `waits_in`; FEEDBACK55.md, Q-800; branch feedback55).
+    hoisted: HashMap<*const Expr, String>,
     /// `let` functions that wait for what `js(...)` gives, as a handler
     /// does: a component's own (unless its markup calls them, which cannot
     /// wait) and those written inside a handler (FEEDBACK18.md, Q-102;
@@ -2103,6 +2177,7 @@ impl<'a> Compiler<'a> {
             globals: HashMap::new(),
             handler: None,
             keep_promise: false,
+            hoisted: HashMap::new(),
             waiting: HashSet::new(),
             sync_calls: Vec::new(),
             ctxs: Vec::new(),
@@ -2495,7 +2570,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn new_ctx(&mut self, component: Option<String>, is_async: bool) {
-        self.ctxs.push(FnCtx { scopes: vec![HashMap::new()], temps: 0, is_async, needs_async: false, component, view: false, hoisted: false, state_init: false, waits_js: false, claims: Vec::new(), marks: Vec::new() });
+        self.ctxs.push(FnCtx { scopes: vec![HashMap::new()], temps: 0, is_async, needs_async: false, component, view: false, hoisted: false, state_init: false, waits_js: false, claims: Vec::new(), marks: Vec::new(), answers: Answers::default() });
     }
 
     fn temps_decl(n: usize) -> String {
@@ -2600,17 +2675,22 @@ impl<'a> Compiler<'a> {
             self.need_types_in(t)?;
         }
         let body = claimed(&ctx, body);
+        // A parameter's default may wait too: its mark is one to make as well, or it went to the
+        // page as it is, and the page's whole script did not parse (FEEDBACK55.md, Q-800; branch
+        // feedback55).
+        let pre = claimed(&ctx, pre);
+        // Declared before a parameter's default that uses one: after it, it threw "Cannot access
+        // '$t0' before initialization" (FEEDBACK55.md, Q-800; branch feedback55). Only then: a
+        // checked function's body is a function of its own, where its temps stay its own.
+        let temps = Self::temps_decl(ctx.temps);
+        let (head, temps) = if pre.contains("$t") { (temps, String::new()) } else { (String::new(), temps) };
         let run = if leaves_early(&def.body) {
-            format!(
-                "{}try {{\n{}}} catch ($e) {{ if ($e instanceof W.Ret) return $e.v; throw $e; }}\n",
-                Self::temps_decl(ctx.temps),
-                body
-            )
+            format!("{}try {{\n{}}} catch ($e) {{ if ($e instanceof W.Ret) return $e.v; throw $e; }}\n", temps, body)
         } else {
-            format!("{}{}", Self::temps_decl(ctx.temps), body)
+            format!("{}{}", temps, body)
         };
         let inner = if checked {
-            let call = if is_async { format!("await (async () => {{\n{}}})()", run) } else { format!("(() => {{\n{}}})()", run) };
+            let call = if is_async { waited_arrow(&run) } else { format!("(() => {{\n{}}})()", run) };
             format!(
                 "return W.retty({}, {}, {}, {});\n",
                 call,
@@ -2624,7 +2704,11 @@ impl<'a> Compiler<'a> {
         } else {
             run
         };
-        let func = format!("{}function ({}) {{\n{}{}}}", if is_async { "async " } else { "" }, names.join(", "), pre, inner);
+        let func = if is_async {
+            format!("async function ({}) {{\n{RUN_OPEN}{head}{}{}{RUN_CLOSE}}}", names.join(", "), pre, inner)
+        } else {
+            format!("function ({}) {{\n{head}{}{}}}", names.join(", "), pre, inner)
+        };
         // Only named functions need their name and parameters at hand (views
         // are called with props by name); a lambda, made again on each
         // render, goes without.
@@ -2900,7 +2984,9 @@ impl<'a> Compiler<'a> {
                         }
                     }
                     let func = if let (Pattern::Bind(_), Expr::Lambda(d)) = (p, e) { Some(self.lambda_is_async(d)?) } else { None };
+                    let before = self.ctx().marks.len();
                     let v = self.expr(e)?;
+                    let answer = self.answer_in(e, before);
                     if let Pattern::Bind(n) = p {
                         let js = self.declare(n, func);
                         decls.push(js.clone());
@@ -2931,6 +3017,7 @@ impl<'a> Compiler<'a> {
                             }
                         }
                     }
+                    self.bound_answer(p, answer);
                     if last {
                         body.push_str("return null;\n");
                     }
@@ -2951,7 +3038,22 @@ impl<'a> Compiler<'a> {
                 }
                 Stmt::Assign(name, op, e, line) => {
                     self.line = *line;
-                    let rhs = self.expr(e)?;
+                    let before = self.ctx().marks.len();
+                    // A fold reads the state after its wait, not before it: three quick `n +=
+                    // one()` read 0 each and counted 1 (FEEDBACK55.md, Q-800; branch feedback55).
+                    let mut first = Vec::new();
+                    if self.ctx().is_async && folds(*op, e, name) {
+                        self.waits_in(e, &mut first)?;
+                    }
+                    for (at, code) in &first {
+                        let t = self.temp();
+                        let _ = writeln!(body, "{} = {};", t, code);
+                        self.hoisted.insert(*at, t);
+                    }
+                    let rhs = self.expr(e);
+                    first.iter().for_each(|(at, _)| drop(self.hoisted.remove(at)));
+                    let rhs = rhs?;
+                    let answer = self.set_answer(e, before);
                     let target = self.resolve(name)?;
                     let cur = match &target {
                         Resolved::Local(js, _) => js.clone(),
@@ -2974,18 +3076,25 @@ impl<'a> Compiler<'a> {
                         AssignOp::Add => format!("W.add({}, {})", cur, rhs),
                         AssignOp::Sub => format!("W.sub({}, {})", cur, rhs),
                     };
-                    match target {
+                    let fold = folds(*op, e, name);
+                    if let (true, Resolved::State(js)) = (fold && !self.ctx().marks.is_empty(), &target) {
+                        self.ctx().answers.folded.push(js.clone());
+                    }
+                    match (target, answer.filter(|_| !fold)) {
                         // The latest set of a state wins: every set claims its state, and a
-                        // function that waits claims, before each wait, the states it sets after
-                        // it (see `claimed`), whose sets land only while no set made since
-                        // (another call's, a plain one) has claimed them. Answers were shown in
-                        // the order they came, so typing "abcd" ended on "a"'s, and clearing the
-                        // field showed the answer still on its way (FEEDBACK55.md, Q-800; branch
-                        // feedback55). A set that reads the state it sets (`n += 1`, `xs = xs +
-                        // [x]`, `s = f(s)`) is a fold, made on what the state holds, and always
-                        // made: dropped, three likes counted one and an upload's `uploading -= 1`
-                        // left the page busy for good (found in review).
-                        Resolved::State(js) if self.ctx().is_async && !folds(*op, e, name) => {
+                        // function that waits claims, before the wait, a state it sets after it
+                        // with that wait's answer (see `claimed`). That set lands only while no
+                        // other run (see `W.run`) has claimed the state since. Answers were shown
+                        // in the order they came, so typing "abcd" ended on "a"'s, and clearing
+                        // the field showed the answer still on its way (FEEDBACK55.md, Q-800; branch
+                        // feedback55). A set with no answer in it says what the program does now,
+                        // not what an old call said, and is always made: dropped, a handler's
+                        // `reset(); msg = "done"` lost its own set to `reset`'s. A set an answer
+                        // decides has one (see `set_answer`). So is a set that reads the state it
+                        // sets (`n += 1`, `xs = xs + [x]`, `s = f(s)`), a fold, made on what the
+                        // state holds: dropped, three likes counted one and an upload's `uploading
+                        // -= 1` left the page busy for good (found in review).
+                        (Resolved::State(js), Some(from)) => {
                             let at = match self.ctx().claims.iter().position(|(s, _)| *s == js) {
                                 Some(i) => i,
                                 None => {
@@ -2994,17 +3103,21 @@ impl<'a> Compiler<'a> {
                                     self.ctx().claims.len() - 1
                                 }
                             };
-                            self.ctx().marks.push(Mark::Set(at));
+                            self.ctx().marks.push(Mark::Set(at, from));
                             let c = self.ctx().claims[at].1.clone();
                             // Before any wait it is a set as any other; after one, its claim's.
                             // The claim is read after the value, which may take it.
                             let _ = writeln!(body, "W.to({js}, {v}, {c});");
                         }
-                        Resolved::State(js) => {
+                        (Resolved::State(js), None) => {
                             let _ = writeln!(body, "W.put({}, {});", js, v);
                         }
                         _ => {
                             let _ = writeln!(body, "{} = {};", cur, v);
+                            if let Some(from) = answer {
+                                self.holds_answer(&cur, from);
+                                self.closure_gave(name, &cur);
+                            }
                         }
                     }
                     if last {
@@ -3024,6 +3137,11 @@ impl<'a> Compiler<'a> {
                     decls.push(js.clone());
                     let (code, _) = self.function(def)?;
                     let _ = writeln!(body, "{} = {};", js, code);
+                    // A function reading an answer gives it (`fn g() { r }; v = g()`).
+                    let own: Vec<String> = def.params.iter().map(|p| p.name.to_string()).collect();
+                    if let Some(from) = self.answer_read(&def.body, &own) {
+                        self.holds_answer(&js, from);
+                    }
                     if last {
                         body.push_str("return null;\n");
                     }
@@ -3060,7 +3178,7 @@ impl<'a> Compiler<'a> {
                     let mut init_ctx = self.ctxs.pop().unwrap();
                     let mut init = first?;
                     if init_ctx.needs_async {
-                        self.ctxs.push(FnCtx { scopes: outer.clone(), temps: 0, is_async: true, needs_async: false, component: None, view: false, hoisted: false, state_init: true, waits_js: false, claims: Vec::new(), marks: Vec::new() });
+                        self.ctxs.push(FnCtx { scopes: outer.clone(), temps: 0, is_async: true, needs_async: false, component: None, view: false, hoisted: false, state_init: true, waits_js: false, claims: Vec::new(), marks: Vec::new(), answers: Answers::default() });
                         self.ctxs.last_mut().unwrap().scopes.push(HashMap::new());
                         let again = self.expr(e);
                         init_ctx = self.ctxs.pop().unwrap();
@@ -3073,9 +3191,10 @@ impl<'a> Compiler<'a> {
                     // Q-105; branch feedback18-fixes).
                     let page = ["B.js(", "B.js_new(", "B.js_value("].iter().any(|f| init.contains(f));
                     let init = claimed(&init_ctx, init);
+                    let (open, close) = if init_ctx.is_async { (RUN_OPEN, RUN_CLOSE) } else { ("", "") };
                     let _ = writeln!(
                         body,
-                        "const {} = $i.sig({}, {}() => {{ {}return {}; }}{});",
+                        "const {} = $i.sig({}, {}() => {{ {open}{}return {}; {close}}}{});",
                         sig,
                         js_str(name),
                         if init_ctx.is_async { "async " } else { "" },
@@ -3160,6 +3279,176 @@ impl<'a> Compiler<'a> {
         r
     }
 
+    /// The first wait whose answer `e`'s value carries, if any, `e` just compiled with `before`
+    /// marks made: a wait in it, or a variable it reads that holds an answer. Read by what is
+    /// written, not by what runs (FEEDBACK55.md, Q-800; branch feedback55).
+    fn answer_in(&self, e: &Expr, before: usize) -> Option<usize> {
+        let waited = self.ctxs.last()?.marks[before..].iter().find_map(|m| if let Mark::Wait(n) = m { Some(*n) } else { None });
+        first_of(waited, self.answer_read(e, &[]))
+    }
+
+    /// The first wait whose answer a set of `e` carries: `e`'s, or the one deciding that the set is
+    /// made at all, as in `if taken(q) { hint = "taken" } else { hint = "free" }` or after `if !r.ok
+    /// { return }`: else the older answer decides. But a set that keeps a state in step with one
+    /// this function folded is made as the fold is, or the two part: infinite_feed's `heights =
+    /// heights + more; tops = tops_of(heights)`, under `if page.ok`.
+    fn set_answer(&self, e: &Expr, before: usize) -> Option<usize> {
+        let value = self.answer_in(e, before);
+        let c = self.ctxs.last()?;
+        let decided = first_of(c.answers.decided, c.answers.left);
+        if value.is_some() || decided.is_none() {
+            return value;
+        }
+        let mut follows = false;
+        each_expr_in(e, &mut |x| follows |= self.state_of(x).is_some_and(|s| c.answers.folded.contains(&s)), false);
+        if follows {
+            None
+        } else {
+            decided
+        }
+    }
+
+    /// The first wait whose answer a variable read in `e` holds; `own` are names of a function
+    /// around it, its parameters, which hold none.
+    fn answer_read(&self, e: &Expr, own: &[String]) -> Option<usize> {
+        let mut from = None;
+        each_expr_in(
+            e,
+            &mut |x| match x {
+                Expr::Ident(n, _) if !own.iter().any(|o| o == n.as_str()) => from = first_of(from, self.answer_of(n)),
+                Expr::Lambda(d) => {
+                    let inner: Vec<String> = own.iter().cloned().chain(d.params.iter().map(|p| p.name.to_string())).collect();
+                    from = first_of(from, self.answer_read(&d.body, &inner));
+                }
+                _ => {}
+            },
+            false,
+        );
+        from
+    }
+
+    /// The first wait whose answer the variable `name` holds here.
+    fn answer_of(&self, name: &str) -> Option<usize> {
+        let c = self.ctxs.last()?;
+        let Some(Local::Var(js, _)) = self.ctxs.iter().rev().flat_map(|c| c.scopes.iter().rev()).find_map(|s| s.get(name)) else { return None };
+        if let Some(&w) = c.answers.held.get(js) {
+            return Some(w);
+        }
+        let last = self.ctxs.len() - 1;
+        self.ctxs.iter().enumerate().find_map(|(i, x)| {
+            let at = *x.answers.by_closure.get(js)?;
+            c.marks[if i == last { at } else { 0 }..].iter().find_map(|m| if let Mark::Wait(n) = m { Some(*n) } else { None })
+        })
+    }
+
+    /// A function has given the variable `name`, `js`, an answer: if it belongs to a function around
+    /// this one, that one reads an answer there after it has waited (`let f = () => { r = lag() };
+    /// f(); v = r`).
+    fn closure_gave(&mut self, name: &str, js: &str) {
+        let last = self.ctxs.len() - 1;
+        let owner = self.ctxs[..last].iter().rposition(|c| c.scopes.iter().any(|s| matches!(s.get(name), Some(Local::Var(j, _)) if j == js)));
+        if let Some(i) = owner {
+            let at = self.ctxs[i].marks.len();
+            self.ctxs[i].answers.by_closure.entry(js.to_string()).or_insert(at);
+        }
+    }
+
+    /// `f` compiling what the answer of wait `from` decides.
+    fn deciding<T>(&mut self, from: Option<usize>, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = self.ctx().answers.decided;
+        self.ctx().answers.decided = first_of(saved, from);
+        let r = f(self);
+        self.ctx().answers.decided = saved;
+        r
+    }
+
+    /// What `from` decided may have left the function: all that comes after is decided by it.
+    fn may_have_left(&mut self, from: Option<usize>, left: bool) {
+        if left {
+            let c = self.ctx();
+            c.answers.left = first_of(c.answers.left, from);
+        }
+    }
+
+    /// The waits to work out before `e`, each with its code: those in the parts of `e` that are
+    /// sure to run, for a fold to read its state after them (see `Stmt::Assign`). What may not run
+    /// (`c ? f() : 0`) stays where it is.
+    fn waits_in(&mut self, e: &Expr, out: &mut Vec<(*const Expr, String)>) -> Result<(), QuilloError> {
+        match e {
+            // `{ ...m, k: v }`, as the parser writes it.
+            Expr::Call(f, args, _) if matches!(&**f, Expr::Ident(n, _) if n == "__merge") => args.iter().try_for_each(|x| self.waits_in(x, out)),
+            Expr::Call(..) | Expr::Pipe(..) => self.wait_of(e, out),
+            Expr::Binary(op, a, b, _) if !matches!(op, BinOp::And | BinOp::Or) => {
+                self.waits_in(a, out)?;
+                self.waits_in(b, out)
+            }
+            Expr::Unary(_, x, _) | Expr::Field(x, _, _) => self.waits_in(x, out),
+            Expr::List(xs) => xs.iter().try_for_each(|x| self.waits_in(x, out)),
+            Expr::Map(es) => es.iter().try_for_each(|(_, x)| self.waits_in(x, out)),
+            Expr::Template(parts) => parts.iter().try_for_each(|p| if let TPart::Expr(x) = p { self.waits_in(x, out) } else { Ok(()) }),
+            _ => Ok(()),
+        }
+    }
+
+    /// `e` with its code in `out`, if it waits. Compiled again where it stands if not.
+    fn wait_of(&mut self, e: &Expr, out: &mut Vec<(*const Expr, String)>) -> Result<(), QuilloError> {
+        if matches!(e, Expr::Lit(_) | Expr::Ident(..) | Expr::Lambda(_)) {
+            return Ok(());
+        }
+        let before = self.ctx().marks.len();
+        let code = self.expr(e);
+        if self.ctx().marks[before..].iter().any(|m| matches!(m, Mark::Wait(_))) {
+            out.push((e as *const Expr, code?));
+        }
+        Ok(())
+    }
+
+    /// The waits in `el`'s holes, each a whole hole, which then shows a value worked out once: a
+    /// hole is a function the page runs, and cannot wait (see `html`).
+    fn waits_in_html(&mut self, el: &HtmlEl, out: &mut Vec<(*const Expr, String)>) -> Result<(), QuilloError> {
+        for x in el.id.iter().chain(el.classes.iter()) {
+            self.wait_of(x, out)?;
+        }
+        for (_, v) in &el.attrs {
+            if let AttrVal::Expr(x) | AttrVal::Spread(x) = v {
+                self.wait_of(x, out)?;
+            }
+        }
+        for c in &el.children {
+            match c {
+                HtmlChild::El(e) => self.waits_in_html(e, out)?,
+                HtmlChild::Expr(Expr::Html(e, _)) => self.waits_in_html(e, out)?,
+                HtmlChild::Expr(x) => self.wait_of(x, out)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// The variable `js` holds the answer of wait `from`, or of an earlier one it held already.
+    fn holds_answer(&mut self, js: &str, from: usize) {
+        let held = self.ctx().answers.held.entry(js.to_string()).or_insert(from);
+        *held = from.min(*held);
+    }
+
+    /// What `p` has just bound, in this scope, holds what `answer` says: a name bound again in its
+    /// own scope (`let r = search(q); let r = 1`) no longer holds what it held.
+    fn bound_answer(&mut self, p: &Pattern, answer: Option<usize>) {
+        if answer.is_none() && self.ctx().answers.held.is_empty() {
+            return;
+        }
+        let mut names = Vec::new();
+        pattern_names(p, &mut names);
+        for n in names {
+            let Some(Local::Var(js, _)) = self.ctx().scopes.last().and_then(|s| s.get(&n)).cloned() else { continue };
+            match answer {
+                Some(from) => self.holds_answer(&js, from),
+                None => {
+                    self.ctx().answers.held.remove(&js);
+                }
+            }
+        }
+    }
+
     /// `{ ... }` in expression position.
     fn block_expr(&mut self, stmts: &[Stmt]) -> Result<String, QuilloError> {
         let inner = self.stmts(stmts)?;
@@ -3171,13 +3460,16 @@ impl<'a> Compiler<'a> {
         // a block is one only when something in it waits (FEEDBACK28.md, Q-415; branch
         // feedback27-35-fixes).
         if self.ctx().is_async && body.contains("await") {
-            format!("(await (async () => {{\n{}}})())", body)
+            format!("({})", waited_arrow(body))
         } else {
             format!("(() => {{\n{}}})()", body)
         }
     }
 
     fn expr(&mut self, e: &Expr) -> Result<String, QuilloError> {
+        if let Some(h) = self.hoisted.get(&(e as *const Expr)) {
+            return Ok(h.clone());
+        }
         Ok(match e {
             // A whole float made once, beside the markup's blocks: `if s > 1000000000.0` made an Fl
             // each time round a loop (found in review of FEEDBACK55.md's Q-775; branch feedback55).
@@ -3374,19 +3666,33 @@ impl<'a> Compiler<'a> {
                 self.line = *line;
                 format!("W.index({}, {})", self.expr(obj)?, self.expr(idx)?)
             }
-            Expr::Try(x) => format!("W.tryv({})", self.expr(x)?),
+            Expr::Try(x) => {
+                let before = self.ctx().marks.len();
+                let v = self.expr(x)?;
+                let from = self.answer_in(x, before);
+                self.may_have_left(from, true);
+                format!("W.tryv({})", v)
+            }
             Expr::If(c, a, b) => {
+                let before = self.ctx().marks.len();
                 let cv = self.expr(c)?;
-                let av = self.branch(a)?;
-                let bv = match b {
-                    Some(b) => self.branch(b)?,
-                    None => "null".into(),
-                };
+                let from = self.answer_in(c, before);
+                let (av, bv) = self.deciding(from, |s| {
+                    let av = s.branch(a)?;
+                    let bv = match b {
+                        Some(b) => s.branch(b)?,
+                        None => "null".into(),
+                    };
+                    Ok::<_, QuilloError>((av, bv))
+                })?;
+                self.may_have_left(from, may_leave(a) || b.as_deref().is_some_and(may_leave));
                 format!("(W.truthy({}) ? {} : {})", cv, av, bv)
             }
             Expr::Match(subj, arms, line) => {
                 self.line = *line;
+                let before = self.ctx().marks.len();
                 let s = self.expr(subj)?;
+                let mut answer = self.answer_in(subj, before);
                 let mut body = format!("const $v = {};\nlet $b;\n", s);
                 for arm in arms {
                     let pat = self.pattern(&arm.pat)?;
@@ -3398,13 +3704,20 @@ impl<'a> Compiler<'a> {
                         let js = self.declare(n, None);
                         let _ = write!(binds, "const {} = $b[{}]; ", js, js_str(n));
                     }
+                    self.bound_answer(&arm.pat, answer);
+                    let before = self.ctx().marks.len();
                     let guard = match &arm.guard {
-                        Some(g) => Some(self.expr(g)?),
+                        Some(g) => {
+                            let v = self.expr(g)?;
+                            answer = first_of(answer, self.answer_in(g, before));
+                            Some(v)
+                        }
                         None => None,
                     };
-                    let b = self.expr(&arm.body);
+                    let b = self.deciding(answer, |s| s.expr(&arm.body));
                     self.pop_scope();
                     let b = b?;
+                    self.may_have_left(answer, may_leave(&arm.body));
                     match guard {
                         Some(g) => {
                             let _ = writeln!(body, "if (($b = W.match({}, $v)) !== null) {{ {}if (W.truthy({})) return {}; }}", pat, binds, g, b);
@@ -3420,9 +3733,14 @@ impl<'a> Compiler<'a> {
             Expr::For(pat, iter, body, line) => {
                 self.line = *line;
                 self.push_scope();
+                let before = self.ctx().marks.len();
                 let r = self.loop_head(pat, iter).and_then(|(head, pre, pat, elem)| {
+                    let answer = self.answer_in(iter, before);
                     let binds = self.bind_pattern(pat, &elem, "`for` pattern does not match ")?;
-                    Ok((head, pre + &binds, self.expr(body)?))
+                    self.bound_answer(pat, answer);
+                    let b = self.deciding(answer, |s| s.expr(body))?;
+                    self.may_have_left(answer, may_leave(body));
+                    Ok((head, pre + &binds, b))
                 });
                 self.pop_scope();
                 let (head, binds, b) = r?;
@@ -3431,8 +3749,11 @@ impl<'a> Compiler<'a> {
             }
             Expr::While(c, body, line) => {
                 self.line = *line;
+                let before = self.ctx().marks.len();
                 let cv = self.expr(c)?;
-                let b = self.expr(body)?;
+                let from = self.answer_in(c, before);
+                let b = self.deciding(from, |s| s.expr(body))?;
+                self.may_have_left(from, may_leave(body));
                 self.iife(&format!("while (W.truthy({})) {{ {}; }}\nreturn null;\n", cv, b))
             }
             Expr::Block(stmts) => self.block_expr(stmts)?,
@@ -3553,7 +3874,8 @@ impl<'a> Compiler<'a> {
             // The claims on what is set after this wait, taken before it (see `claimed`).
             let n = c.marks.len();
             c.marks.push(Mark::Wait(n));
-            format!("({}await {})", wait_mark(n), call)
+            // The run is given back as it waits, and taken up again after: see `W.run`.
+            format!("({}W.on($run, await W.off($run, {})))", wait_mark(n), call)
         } else {
             call
         }
@@ -4060,6 +4382,9 @@ impl<'a> Compiler<'a> {
     }
 
     fn markup_inner(&mut self, e: &Expr) -> Result<String, QuilloError> {
+        if let Some(h) = self.hoisted.get(&(e as *const Expr)) {
+            return Ok(h.clone());
+        }
         match e {
             Expr::Html(el, _) => self.html(el),
             Expr::For(pat, iter, body, line) => {
@@ -4222,6 +4547,34 @@ impl<'a> Compiler<'a> {
 
     /// An element or component; with a `key` that changes, made afresh.
     fn html(&mut self, el: &HtmlEl) -> Result<String, QuilloError> {
+        if !self.ctx().is_async || self.ctx().answers.in_html {
+            return self.html_made(el);
+        }
+        // In a function that waits, what waits in markup comes first, and the markup is made with
+        // its values: a hole is a function the page runs, where `await` is no JavaScript, and the
+        // page's whole script did not parse, with nothing said (FEEDBACK55.md, Q-800; branch
+        // feedback55). As parameters, each making of the markup has its own.
+        let mut first = Vec::new();
+        self.waits_in_html(el, &mut first)?;
+        let mut names = Vec::new();
+        for (at, _) in &first {
+            let h = self.fresh("h");
+            self.hoisted.insert(*at, h.clone());
+            names.push(h);
+        }
+        self.ctx().answers.in_html = true;
+        let made = self.html_made(el);
+        self.ctx().answers.in_html = false;
+        first.iter().for_each(|(at, _)| drop(self.hoisted.remove(at)));
+        let made = made?;
+        if names.is_empty() {
+            return Ok(made);
+        }
+        let values: Vec<&str> = first.iter().map(|(_, code)| code.as_str()).collect();
+        Ok(format!("(({}) => {})({})", names.join(", "), made, values.join(", ")))
+    }
+
+    fn html_made(&mut self, el: &HtmlEl) -> Result<String, QuilloError> {
         self.line = el.line;
         let key = el.attrs.iter().find_map(|(n, v)| match (n.as_str(), v) {
             ("key", AttrVal::Expr(k)) => Some(k),

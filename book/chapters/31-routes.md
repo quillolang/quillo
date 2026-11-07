@@ -698,6 +698,10 @@ fn touch() {
 | `events(f, { status, headers })` | Server-Sent Events, as `f` sends them |
 | a runtime error | 500 `text/plain`, `internal error` |
 
+- `redirect(...)` and `respond(...)` make an answer; they do not leave. A route answers with
+  its last value, or what `return` or `reply` gives, so `if no_user { redirect("/login") }`
+  with more after it goes on and shows the page. To leave, write
+  `reply 303 redirect("/login")`; `quillo check` warns of one nothing takes.
 - An error the program wrote, `err("That name is taken")`, is sent as it is. One a builtin
   made says `internal error` instead, wherever it would reach a visitor: as a route's
   value, inside a map or list, in markup, or from a `server fn`, and when it is turned

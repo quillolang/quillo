@@ -1492,6 +1492,10 @@ route GET / = <html><body><Counter start={5}/></body></html>
   from one of its event handlers or its `@mount`, where it runs until the component
   leaves the page (started after a handler's first wait, it belongs to no one, and is an
   error). A tab in the background is slowed by the browser to once a second at most.
+  A tick that finds that timer's last run still waiting does nothing, so a poll slower
+  than its timer runs one call at a time and shows each answer; a run with no answer
+  after 30 seconds (or two gaps, if that is longer) is given up on, and the next tick
+  starts anew.
 
   ```quillo
   component Stopwatch() {
@@ -2584,14 +2588,29 @@ either: set a state of your own around the call.
 **The latest call wins.** A handler can run again before its call has answered (a
 letter typed in a search box, a second click), and answers come back in any order. An
 older call's answer never replaces a newer value: every set of a state claims it (a
-plain `shown = "x"`, a field bound with `bind:`, a set from a call), and a handler that
-waited keeps only the sets it makes while no newer set has claimed that state. So
+plain `shown = "x"`, a field bound with `bind:`, a set from a call). A set that carries an
+answer the function waited for gives way when another run has set or claimed that state
+since. It carries the answer if its value holds the call or a variable bound from it, or
+if the answer decides it: it sits under an `if`, `match`, `while` or `for` on the answer,
+or after a guard that leaves on it (`return`, `?`). A run is one handler, effect, timer or
+frame callback, with the functions it calls; a handler fired by `el.click()` and each
+`parallel` function are runs of their own. So
 `oninput={(e) => { shown = search(e.value) }}` ends on the answer for what was typed
-last, however late the first one comes. A set that reads the state it sets is a fold
-(`n += 1`, `busy -= 1`, `xs = xs + [x]`, `s = s | push(x)`, `s = f(s)`) and is always
-made, on what the state holds then: three quick likes that each call `save()` and then
-`likes += 1` count three, and two uploads that each do `busy += 1`, wait, and `busy -= 1`
-end at 0.
+last, however late the first one comes.
+
+Every other set is made: a plain one, like `saving = false` after the wait, a fold, and a
+set keeping a state in step with one the function folded. A set that reads the state it
+sets is a fold (`n += 1`, `busy -= 1`, `xs = xs + [x]`, `s = s | push(x)`, `s = f(s)`),
+made on what the state holds then, after any wait on its right: three quick likes that
+each call `save()` and then `likes += 1` count three, `n += count()` adds to what `n`
+holds when the answer comes, and two uploads that each do `busy += 1`, wait, and
+`busy -= 1` end at 0. A plain set from a run whose call lost that state takes nothing, and
+once the newest answer shows it is dropped, so an older run cannot blank it. Write the set
+in the function that waited: an answer handed to a helper as an argument counts as plain
+there.
+
+In a function that waits, a hole of markup may wait too: `let el = <b>{load()}</b>`. It is
+worked out once, before the markup is made, and does not follow what it read.
 
 **Slow data: `defer`.** A `state` initializer runs while the server renders, so the
 page waits for its slowest one. `defer` lets a slow one follow the page instead:
@@ -3674,12 +3693,12 @@ fn touch() {
 | `events(f, { status, headers })` | Server-Sent Events, as `f` sends them |
 | a runtime error | 500 `text/plain`, `internal error` |
 
-- An error the program wrote, `err("That name is taken")`, is sent as it is. One a builtin
-  made says `internal error` instead, wherever it would reach a visitor: as a route's
 - `redirect(...)` and `respond(...)` make an answer; they do not leave. A route answers with
   its last value, or what `return` or `reply` gives, so `if no_user { redirect("/login") }`
   with more after it goes on and shows the page. To leave, write
   `reply 303 redirect("/login")`; `quillo check` warns of one nothing takes.
+- An error the program wrote, `err("That name is taken")`, is sent as it is. One a builtin
+  made says `internal error` instead, wherever it would reach a visitor: as a route's
   value, inside a map or list, in markup, or from a `server fn`, and when it is turned
   into text: a template string, `str`, `join`, `json.stringify`. A database's has the SQL
   and the tables, an `http` call's the address with its key, a file's its path, so that

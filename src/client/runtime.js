@@ -1770,6 +1770,8 @@ B.js_has = meta((name) => {
 // `cursor_index(s, n)`: a field's cursor counts UTF-16 units, and `slice` counts characters
 // (FEEDBACK28.md, Q-344; branch feedback29-fixes).
 B.cursor_index = meta((s, n) => Array.from(S(s, "cursor_index").slice(0, Math.max(IN(n, "cursor_index", 2), 0))).length, "cursor_index", null);
+// How long, in ms, `every` waits for a run that does not answer, at the least two gaps.
+const EVERY_STALLED = 30000;
 B.every = meta((ms, f) => {
   // In a component, or a handler or `@mount` of one, as `run_after` (FEEDBACK28.md, Q-349;
   // branch feedback29-fixes).
@@ -1778,10 +1780,22 @@ B.every = meta((ms, f) => {
   if (own.dead) return null;
   ms = N(ms, "every");
   F(f, "every", 2);
+  // A tick that finds the last run still waiting does nothing, and the next tries again: as it was,
+  // a poll slower than its timer had each answer come after a newer call, and showed none. A call
+  // that never answers would stop the timer for good: after EVERY_STALLED the run is given up on,
+  // and its answer, if it comes, frees nothing (FEEDBACK55.md, Q-800; branch feedback55).
+  const stalled = Math.max(EVERY_STALLED, ms * 2);
+  let waiting = null, since = 0;
   const id = setInterval(() => {
+    if (waiting !== null && performance.now() - since < stalled) return;
     try {
       const r = f();
-      if (r instanceof Promise) r.catch(report);
+      if (r instanceof Promise) {
+        waiting = r;
+        since = performance.now();
+        const done = () => { if (waiting === r) waiting = null; };
+        r.then(done, (e) => { done(); report(e); });
+      }
     } catch (e) {
       report(e);
     }
@@ -1794,7 +1808,17 @@ B.every = meta((ms, f) => {
 // results, in order.
 B.parallel = meta(async (...fs) => {
   if (fs.length === 1 && Array.isArray(fs[0])) fs = fs[0];
-  return Promise.all(fs.map((f, i) => F(f, "parallel", i + 1)()));
+  // Each function is a run of its own, so the last one called is the latest call of a state they
+  // both set; under the run that called them, whose claims they leave alone (see `takeClaim`;
+  // FEEDBACK55.md, Q-800; branch feedback55).
+  const run = Run;
+  let calls;
+  try {
+    calls = fs.map((f, i) => { Run = { held: null, shown: null, up: run || undefined }; return F(f, "parallel", i + 1)(); });
+  } finally {
+    Run = run;
+  }
+  return Promise.all(calls);
 }, "parallel", null);
 B.print = meta((...a) => { console.log(a.map(display).join(" ")); return null; }, "print", null);
 // HTML made from text (by raw or markdown) is that text, as on the server.
@@ -5914,8 +5938,9 @@ function onCleanup(f) {
 // its `src`]. Either side lets go in constant time. Small arrays are made
 // to size (a pushed-to array would keep room for a dozen more).
 class Sig {
-  // `n`: the claims made on it, the program's sets (see `W.claim`).
-  constructor(v) { this._v = v; this.obs = null; this.keys = null; this.n = 0; }
+  // `n`: the times it has been claimed by a run that did not hold it, `r` the one that does (see
+  // `W.claim`).
+  constructor(v) { this._v = v; this.obs = null; this.keys = null; this.n = 0; this.r = null; }
   get v() { if (Listener) link(Listener, this); return this._v; }
   set(v) {
     const was = this._v;
@@ -6076,6 +6101,10 @@ function runCalc(c) {
 
 function flush() {
   let rounds = 0, jumps = 0;
+  // An effect is a run of its own, also when `page_updated` brings this about inside one
+  // (FEEDBACK55.md, Q-800; branch feedback55).
+  const run = Run;
+  Run = null;
   while (effectQueue.length) {
     if (++rounds > 1000) {
       effectQueue = [];
@@ -6099,6 +6128,7 @@ function flush() {
       }
     }
   }
+  Run = run;
   flushing = false;
 }
 
@@ -7182,6 +7212,10 @@ function fire(el, type, ev) {
   if (t && t.value !== undefined) { ev.$value = t.value; ev.$checked = !!t.checked; }
   const was = Acting;
   Acting = el.__own || null;
+  // A handler is a run of its own, also when `el.click()` brings it about inside one
+  // (FEEDBACK55.md, Q-800; branch feedback55).
+  const run = Run;
+  Run = null;
   try {
     const r = f.length > 0 ? f(ev) : f();
     if (r instanceof Promise) r.catch(report);
@@ -7189,6 +7223,7 @@ function fire(el, type, ev) {
     report(e);
   } finally {
     Acting = was;
+    Run = run;
   }
   // An input shows the state's value even if the user typed something the
   // state did not take (once what the handler changed is shown).
@@ -8118,13 +8153,58 @@ W.settle = async (v) => {
   if (v === null || typeof v !== "object" || typeof v.then !== "function" || foreign(v) && !(v instanceof Promise)) return v;
   try { return fromPage(await v); } catch (e) { return new Err("js: " + (e && e.message || String(e)), true); }
 };
-// The latest set of a state wins (see `Stmt::Assign` in src/client.rs): a set claims its state,
-// and a function that waits claims each state it sets as it begins; what it sets once another set
-// has claimed the state since is dropped (FEEDBACK55.md, Q-800; branch feedback55).
-W.claim = (s) => ++s.n;
-W.latest = (s, n, v) => { if (s.n === n) s.set(v); return null; };
-W.put = (s, v) => { s.n++; return s.set(v); };
-// A set in a function that waits: a plain one until it took a claim on the state, then its claim's.
+// A run: what one entry from the runtime or the page does (an event's handler, an effect, a timer,
+// a frame, a state's initializer), with every function it calls, across their waits. `Run` is the
+// one going on, null outside any: code that does not wait has no run of its own, and each of its
+// sets counts as another's. A function that waits joins the run it was called in, or starts one,
+// and gives it back as it waits and as it ends, so `Run` is null again when nothing is left on the
+// stack and whatever the page calls next starts afresh, with nothing to mark at each way in; after a
+// wait it takes it up again. `w`: the run, what was going on when the function was called, and
+// whether it has been given back. A run: `held`, the states it has had a call out for; `shown`, those
+// showing its answer; `up`, the run that called it, for `parallel`'s (FEEDBACK55.md, Q-800; branch
+// feedback55).
+let Run = null;
+W.run = () => { const o = Run; return { r: (Run = o || { held: null, shown: null, up: undefined }), o, y: false }; };
+W.off = (w, x) => { if (!w.y) { w.y = true; Run = w.o; w.o = null; } return x; };
+W.on = (w, v) => { w.y = false; Run = w.r; return v; };
+// The latest set of a state wins (see `Stmt::Assign` in src/client.rs): a set claims its state, and
+// a function that waits claims, before the wait, a state it will set with the answer. That set is
+// dropped when another run has claimed the state since: `n` moves only when the claim changes
+// hands, so a run's own sets, a function it called among them, take nothing from it.
+function takeClaim(s) {
+  const r = Run;
+  if (r === null) { s.r = null; s.n++; }
+  else if (s.r !== r && s.r !== r.up) { s.r = r; s.n++; }
+  return s.n;
+}
+// For an answer to come: the state is one the run has a call out for, as a plain set does not make it.
+W.claim = (s) => {
+  if (Run !== null) (Run.held || (Run.held = new Set())).add(s);
+  return takeClaim(s);
+};
+// At a later wait with the same answer: the claim it has, lost or not.
+W.again = (s, n) => (n === undefined ? W.claim(s) : n);
+W.latest = (s, n, v) => {
+  if (s.n !== n) return null;
+  const r = s.r;
+  if (r !== null) (r.shown || (r.shown = new Set())).add(s);
+  return s.set(v);
+};
+// A plain set: made, and it claims the state, so an older answer gives way to it. From a run that
+// had a call out for the state and lost it, it is that older call's doing, and takes nothing from
+// the newest: as it was, `let r = search(q); wipe(); shown = r` typed quickly voided the last call
+// and ended empty. Once the newest answer is in, it would blank that answer, and is dropped.
+W.put = (s, v) => {
+  const r = Run;
+  if (r === null) { s.r = null; s.n++; return s.set(v); }
+  if (s.r !== r && s.r !== r.up && r.held !== null && r.held.has(s)) {
+    const now = s.r;
+    return now !== null && now.shown !== null && now.shown.has(s) ? null : s.set(v);
+  }
+  takeClaim(s);
+  return s.set(v);
+};
+// A set with an answer: its claim's, or a plain one on a way that did not wait for it.
 W.to = (s, v, n) => (n === undefined ? W.put(s, v) : W.latest(s, n, v));
 W.Dec = Dec;
 W.Fl = Fl;

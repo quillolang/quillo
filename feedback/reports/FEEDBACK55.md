@@ -1404,6 +1404,8 @@ Typing "abcd" in Chrome ends on "results for a" (3 of 3). Five quick clicks call
 
 **Decided (2026-11-05):** the latest call only. An older call's answer that arrives after a newer call was made is dropped for that state.
 
+**Narrowed (2026-11-07, branch feedback55):** the first version dropped any set after a wait once another set had claimed the state, and six kit components lost their own sets: a handler's helpers counted as someone else. Now a set gives way only if it carries an answer (in its value, or decided by it) and another run claimed the state. A poll slower than its timer showed nothing under this rule, so `every` waits for its last run (the user's decision).
+
 ### Q-801. Topic names are not checked
 
 **Kind:** silent.
