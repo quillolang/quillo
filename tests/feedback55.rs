@@ -3905,7 +3905,8 @@ fn a_large_file_saved_anew_while_sent_is_served() {
         })
     };
     // A file replaced at every try is busy, a 503 with Retry-After (the fifth review); every other
-    // answer is one whole file, never two mixed, and most are that.
+    // answer is one whole file, never two mixed. Here that is rare: none in 16,350 requests at a
+    // load over 40, so a few of 150 may be, and no more.
     let mut whole = 0;
     for i in 0..150 {
         let a = support::send(s.port, "GET", "/s/big.bin", &[], "");
@@ -3917,7 +3918,7 @@ fn a_large_file_saved_anew_while_sent_is_served() {
         assert!(a.body.bytes().all(|b| b == b'a') || a.body.bytes().all(|b| b == b'b'), "request {} mixed two files", i);
         whole += 1;
     }
-    assert!(whole >= 100, "only {} of 150 were served", whole);
+    assert!(whole >= 145, "only {} of 150 were served", whole);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     saver.join().unwrap();
 }
@@ -6566,17 +6567,6 @@ fn a_bit_value_keeps_its_length_on_postgresql() {
 // serde_json could not read fails only its own cell.
 #[test]
 fn json_numbers_past_an_int_are_decs_and_a_bad_value_fails_only_its_cell() {
-    // On a request's stack: a debug build's frames are larger, and reading 128 levels (1,000 before)
-    // overflowed the test thread's 2 MiB in CI (as feedback51's deep-JSON check does).
-    std::thread::Builder::new()
-        .stack_size(if cfg!(debug_assertions) { 64 << 20 } else { 16 << 20 })
-        .spawn(json_numbers_past_an_int_on_a_requests_stack)
-        .unwrap()
-        .join()
-        .unwrap();
-}
-
-fn json_numbers_past_an_int_on_a_requests_stack() {
     let Some((_pg, url)) = pg_db("jsonnum") else { return };
     let mut it = on_db(&url, "db.exec(\"create table r4 (id int, p jsonb, q json)\")\n");
     ev(&mut it, r#"db.exec("insert into r4 (id, p) values (1, '{\"n\": 18446744073709551615}'), (2, '{\"n\": 18446744073709551614}'), (3, '{\"n\": 9223372036854775807}'), (4, '{\"n\": 9223372036854775808}'), (5, '{\"n\": -9223372036854775808}'), (6, '{\"n\": -9223372036854775809}'), (7, '{\"n\": 0.1, \"é\": [true, null, \"ü\"]}')")"#);
