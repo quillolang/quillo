@@ -1,7 +1,7 @@
 //! The server's smaller parts, called as the server calls them: WebSocket
 //! frames, live patches, multipart bodies, the file cache and the view cache.
 
-use quillo::livecache::{apply, diff, Answer, LiveCache};
+use quillo::livecache::{apply, diff, Answer, LiveCache, EVERYONE};
 use quillo::server::HttpRequest;
 use quillo::statics;
 use quillo::upload;
@@ -221,30 +221,33 @@ fn a_map_in_another_order_goes_whole() {
 #[test]
 fn a_run_is_shared_with_the_pages_it_may_be_shown_to() {
     let mut c = LiveCache::default();
-    let key = |h: &str| ("loader".to_string(), b"[]".to_vec(), h.to_string());
+    let key = |h: &str| (String::new(), "loader".to_string(), b"[]".to_vec(), h.to_string());
     let answer = Arc::new(Answer::new(json!([1]), false));
-    assert!(c.shared(&key("a"), 1, |_, _| true).is_none());
-    c.share(key("a"), Some(7), 5, vec!["t".into()], answer.clone());
-    // Only for that viewer, and while what it read has not changed.
-    assert!(c.shared(&key("a"), 8, |_, _| true).is_none());
-    assert!(c.shared(&key("a"), 7, |_, _| false).is_none());
-    let (got, topics, seq) = c.shared(&key("a"), 7, |t, s| t == ["t".to_string()] && s == 5).unwrap();
+    assert!(c.shared(&key("a"), |_, _| true).is_none());
+    c.share(key("a"), 5, vec!["t".into()], answer.clone());
+    // While what it read has not changed. A run that read the visitor never comes here: it is
+    // shared with nobody (FEEDBACK55.md, Q-881; branch feedback55; tests/viewers.rs).
+    assert!(c.shared(&key("a"), |_, _| false).is_none());
+    let (got, topics, seq) = c.shared(&key("a"), |t, s| t == ["t".to_string()] && s == 5).unwrap();
     assert_eq!((&*got.text, topics, seq), ("[1]", vec!["t".to_string()], 5));
     assert!(!got.err);
     // A run for all viewers.
-    c.share(key("b"), None, 1, Vec::new(), answer.clone());
-    assert!(c.shared(&key("b"), 123, |_, _| true).is_some());
+    c.share(key("b"), 1, Vec::new(), answer.clone());
+    assert!(c.shared(&key("b"), |_, _| true).is_some());
     // Runs past the limit still count while they are new, and go in time.
     for i in 0..300 {
-        c.share(key(&i.to_string()), None, 1, Vec::new(), answer.clone());
+        c.share(key(&i.to_string()), 1, Vec::new(), answer.clone());
     }
-    assert!(c.shared(&key("0"), 1, |_, _| true).is_some());
+    assert!(c.shared(&key("0"), |_, _| true).is_some());
     std::thread::sleep(quillo::livecache::SHARED_FOR + Duration::from_millis(50));
-    assert!(c.shared(&key("0"), 1, |_, _| true).is_none());
-    c.share(key("new"), None, 1, Vec::new(), answer);
-    assert!(c.shared(&key("299"), 1, |_, _| true).is_none());
-    assert!(c.shared(&key("new"), 1, |_, _| true).is_some());
+    assert!(c.shared(&key("0"), |_, _| true).is_none());
+    c.share(key("new"), 1, Vec::new(), answer);
+    assert!(c.shared(&key("299"), |_, _| true).is_none());
+    assert!(c.shared(&key("new"), |_, _| true).is_some());
 }
+
+/// Whose values a page with no visitor of its own may be patched from.
+const OWNERS: [u64; 2] = [EVERYONE, EVERYONE];
 
 #[test]
 fn values_are_kept_for_patches_until_their_room_is_needed() {
@@ -253,35 +256,35 @@ fn values_are_kept_for_patches_until_their_room_is_needed() {
     let big = |n: i32| -> Arc<str> { format!("{{\"n\":{},\"pad\":\"{}\"}}", n, " ".repeat(8 << 20)).into() };
     let new = json!({ "n": 1000, "pad": 0 });
     // Not known: no patch, and the whole value goes.
-    assert!(c.patch(1, 2, &new).is_none());
-    assert_eq!(&*c.patch(5, 5, &new).unwrap(), "{\"$=\":1}");
-    c.keep(1, &v(1));
-    let p = c.patch(1, 2, &new).unwrap();
+    assert!(c.patch(1, 2, &new, OWNERS).is_none());
+    assert_eq!(&*c.patch(5, 5, &new, OWNERS).unwrap(), "{\"$=\":1}");
+    c.keep(1, &v(1), EVERYONE);
+    let p = c.patch(1, 2, &new, OWNERS).unwrap();
     assert_eq!(serde_json::from_str::<serde_json::Value>(&p).unwrap(), json!({ "$m": { "n": { "$v": 1000 } } }));
     // Once for all the pages that had it.
-    assert!(Arc::ptr_eq(&p, &c.patch(1, 2, &new).unwrap()));
+    assert!(Arc::ptr_eq(&p, &c.patch(1, 2, &new, OWNERS).unwrap()));
     // Keeping it again costs nothing.
-    c.keep(1, &v(1));
+    c.keep(1, &v(1), EVERYONE);
     // Too large to keep.
     let large: Arc<str> = " ".repeat(17 << 20).into();
-    c.keep(2, &large);
-    assert!(c.patch(2, 3, &new).is_none());
+    c.keep(2, &large, EVERYONE);
+    assert!(c.patch(2, 3, &new, OWNERS).is_none());
     // Past the room there is, values go. What many pages use is the last to.
     for _ in 0..50 {
-        c.keep(1, &v(1));
+        c.keep(1, &v(1), EVERYONE);
     }
     for h in 10..24 {
-        c.keep(h, &big(h as i32));
+        c.keep(h, &big(h as i32), EVERYONE);
     }
-    let left = (10..24).filter(|h| c.patch(*h, 3, &new).is_some()).count();
+    let left = (10..24).filter(|h| c.patch(*h, 3, &new, OWNERS).is_some()).count();
     assert!((1..=8).contains(&left), "{} left", left);
-    assert!(c.patch(1, 3, &new).is_some());
+    assert!(c.patch(1, 3, &new, OWNERS).is_some());
     // Patches are forgotten together, past their limit.
-    let first = c.patch(1, 3, &new).unwrap();
+    let first = c.patch(1, 3, &new, OWNERS).unwrap();
     for to in 100..400 {
-        c.patch(1, to, &new);
+        c.patch(1, to, &new, OWNERS);
     }
-    assert!(!Arc::ptr_eq(&first, &c.patch(1, 3, &new).unwrap()));
+    assert!(!Arc::ptr_eq(&first, &c.patch(1, 3, &new, OWNERS).unwrap()));
     assert_eq!(quillo::livecache::parse_hash(&quillo::livecache::hash_text(255)), Some(255));
     assert_eq!(quillo::livecache::parse_hash("not hex"), None);
 }
