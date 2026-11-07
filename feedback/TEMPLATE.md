@@ -33,6 +33,7 @@ Most severe first: silent before loud, loud before docs. One section each, with:
 - a repro of a few lines (also saved as feedback/repros/Q-NNN-name.qwe, see
   feedback/README.md), checked on the version above
 - what it cost: attempts, and how it was finally found
+- the four impact items, with "No change" where that is true
 - a fix or a suggestion
 -->
 
@@ -47,6 +48,13 @@ Most severe first: silent before loud, loud before docs. One section each, with:
 ```quillo
 <the repro>
 ```
+
+| Impact | |
+|---|---|
+| **Functionality** | <what the program does differently> |
+| **User** | <what a visitor or a developer sees> |
+| **Requests** | <what changes on the wire or the server> |
+| **Security** | <what an attacker gains, or "No change"> |
 
 **Suggestion:** <fix>
 
