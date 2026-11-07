@@ -19,7 +19,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
-  <img src="https://img.shields.io/badge/version-0.7.0-informational.svg" alt="Version 0.7.0">
+  <img src="https://img.shields.io/badge/version-0.8.0-informational.svg" alt="Version 0.8.0">
   <img src="https://img.shields.io/badge/written_in-Rust-orange.svg" alt="Written in Rust">
 </p>
 
@@ -314,14 +314,13 @@ for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; 
 
 ### Test coverage
 
-**Rust: 98.69% of lines** run under the tests (60,588 lines, 796 not run), **97.23% of
-regions** (145,910, 4,037 not run).
-**Browser runtime (`src/client/runtime.js`): 99.88% of lines** (5,781 lines, 7 not run).
-Both were measured together on 2026-11-07 on the FEEDBACK55 work (0.7.0-dev, fc95e09, on
-branch feedback55) on macOS, from 3,076 tests with Chrome, PostgreSQL and MariaDB included;
-none failed. Every line of runtime.js FEEDBACK55 changed runs in a test, and of the 8,169
-lines of Rust it added, all but 75 do: other systems' branches, failures the tests cannot
-cause and races. The Rust
+**Rust: 98.65% of lines** run under the tests (61,961 lines, 836 not run), **97.21% of
+regions** (149,621, 4,167 not run).
+**Browser runtime (`src/client/runtime.js`): 99.88% of lines** (5,817 lines, 7 not run).
+Both were measured together on 2026-11-07 on 0.8.0's code (c293883) on macOS, from 3,203
+tests with Chrome, PostgreSQL and MariaDB included; none failed. Every line of runtime.js
+changed since 0.7.0 runs in a test, and of the 9,782 lines of Rust added since, all but 120
+do: other systems' branches, failures the tests cannot cause and races. The Rust
 figures are the Lines and Regions columns of `cargo llvm-cov`'s total. A line counts as
 run when any part of it ran, so `let x = f()?;` is run though `f` never failed; regions
 count each part, which is why they are lower (FEEDBACK49.md). The runtime's is V8's own

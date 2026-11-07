@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 (2026-11-07)
+
+**Upgrade from 0.7.0: see Security below.** One visitor's data could reach another in 0.7.0,
+in twelve ways, one of them a worker reading a finished request after it was freed. A key of
+`idempotent` now runs at most once, whoever asks. Not in it, moved on: FEEDBACK43's database driver interface (Q-494 to Q-497), the
+apps planned for 0.8 (the live dashboard and the others), and the studies FEEDBACK52, 54 and
+56 to 59.
 
 The fixes of FEEDBACK55.md's sweep, all of it: what a program writes into markup, the
 files `files()` serves, HTTP's answers and cookies, highlighting and Markdown, the three
