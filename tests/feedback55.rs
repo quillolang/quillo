@@ -12297,6 +12297,7 @@ route GET / = <html><head><title>t</title></head><body><Effects/></body></html>
 }
 
 /// What the tests of Q-800's runs do in the page: every call answered, and what comes after each run.
+const Q800_CALLS: &str = "const inner = window.fetch;\n    window.__calls = [];\n    window.fetch = (...a) => { window.__calls.push(String(a[0]).replace(/.*\\//, \"\") + \" \" + String((a[1] && a[1].body) || \"\")); return inner(...a); };";
 const Q800_PAGE: &str = "const real = window.fetch;\n    let busy = 0;\n    window.fetch = (...a) => { busy++; return real(...a).finally(() => { busy--; }); };\n    const until = async (f) => { for (let i = 0; i < 500 && !f(); i++) await tick(20); return f(); };\n    const quiet = async () => { for (let k = 0; k < 3; k++) { await tick(30); await until(() => busy === 0); } };\n    const go = async (id, at) => { $(id).click(); await quiet(); return $(at).textContent; };";
 
 // Found in review of Q-800 (the Decided line: an older call's answer never stands over a newer call):
@@ -13079,6 +13080,425 @@ return out;
         "remade": 0, "errors": [],
     });
     assert_eq!(r, want);
+}
+
+// Found in the second review of Q-800: taking only the waits out of a fold reordered it: `n = n +
+// must("no")? + charge(1)` made the charge, which the program never reached, and `n = n + step() +
+// echo(seen)` gave 1, not 6. Every part of a fold runs where it is written; the one thing that moves
+// is the read of the state, last. The edges: nothing after a stop runs, for `?`, a function that
+// stops and `/ 0`, in `=` and `+=`, in `set`; what a `&&`, `?:` or `??` skips stays skipped; calls
+// happen once and in order, arguments read in order (`n + echo(n)` reads the argument in place and
+// the left operand last); every shape of a `+=`; a spread, a template, a pipe, `set`. What has
+// another shape stays as it is, in order: a state not at the head, a pipe of two, a local.
+#[test]
+fn a_folds_parts_run_in_the_order_written() {
+    let src = r##"server fn lag(k: str, ms: int) -> str {
+    sleep(ms)
+    k
+}
+server fn one(ms: int) -> int {
+    sleep(ms)
+    1
+}
+server fn echo(n: int) -> int {
+    sleep(5)
+    n
+}
+server fn charge(n: int) -> int {
+    sleep(5)
+    n
+}
+server fn pair() -> list {
+    sleep(50)
+    [1, 2]
+}
+fn must(x: str) {
+    x == "ok" ? 1 : err("no")
+}
+component H() {
+    state n = 0
+    state seen = 0
+    state list = ["x"]
+    state vw = { res: "", other: 1 }
+    state msg = ""
+    state c = true
+    state z = 0
+    state el = null
+    let step = () => {
+        seen = 5
+        1
+    }
+    let boom = () => {
+        let xs = split("a", ",")
+        let [a, b] = xs
+        1
+    }
+    <div>
+        <button #reset @click={() => { n = 0; seen = 0; list = ["x"]; vw = { res: "", other: 1 }; msg = ""; z = 0 }}>r</button>
+        <button #order @click={() => { n = n + step() + echo(seen) }}>x</button>
+        <button #orderl @click={() => { list = list + [step(), echo(seen)] }}>x</button>
+        <button #ordert @click={() => { msg = `${msg}${step()} ${echo(seen)}` }}>x</button>
+        <button #orderloc @click={() => { let t = 0; t = t + step() + echo(seen); n = t }}>x</button>
+        <button #skipq @click={() => { n = n + must("no")? + charge(1) }}>x</button>
+        <button #skipq2 @click={() => { n = n + echo(0)? + must("no")? + charge(2) }}>x</button>
+        <button #skipboom @click={() => { n = n + boom() + charge(3) }}>x</button>
+        <button #skipdiv @click={() => { n = n + 1 / z + charge(4) }}>x</button>
+        <button #pipe @click={() => { list = list | push(lag("row", 100)) }}>x</button>
+        <button #setf @click={() => { vw = set(vw, "res", lag("c", 100)) }}>x</button>
+        <button #touch @click={() => { list = list + ["touched"]; vw = { ...vw, other: 2 }; n += 10 }}>x</button>
+        <button #coal @click={() => { n += one(50) ?? 0 }}>x</button>
+        <button #tern @click={() => { n += c ? one(50) : 0 }}>x</button>
+        <button #try @click={() => { n += one(50)? }}>x</button>
+        <button #index @click={() => { n += pair()[0] }}>x</button>
+        <button #iff @click={() => { n = n + (if c { one(50) } else { 0 }) }}>x</button>
+        <button #block @click={() => { n = n + { one(50) } }}>x</button>
+        <button #andf @click={() => { n = n + (c && one(50)) }}>x</button>
+        <button #orf @click={() => { n = n + (false || one(50)) }}>x</button>
+        <button #sc1 @click={() => { n = n + (false && charge(6)) }}>x</button>
+        <button #sc2 @click={() => { n = n + (c ? 1 : charge(7)) }}>x</button>
+        <button #sc3 @click={() => { n = n + (1 ?? charge(8)) }}>x</button>
+        <button #twice @click={() => { n += charge(11); n = n + charge(12); n -= charge(13); list = list + [lag("charge14", 1)]; msg = `${msg}${lag("charge15", 1)}`; vw = { ...vw, res: lag("charge16", 1) }; n = n + -charge(17); n = n + { a: charge(18) }.a }}>x</button>
+        <button #two @click={() => { n = n + echo(1) + echo(2) }}>x</button>
+        <button #argfold @click={() => { n = n + echo(n) }}>x</button>
+        <button #headcall @click={() => { n = step() + echo(seen) + n }}>x</button>
+        <button #twicecompiled @click={() => { one(1); el = <div>{[1] | map((_x) => <button #counts @click={() => { n += one(1) }}>x</button>)}</div> }}>x</button>
+        <button #spread @click={() => { list = [...list, lag("row", 100)] }}>x</button>
+        <button #mergeorder @click={() => { vw = { first: step(), ...vw, res: echo(seen) } }}>x</button>
+        <button #pipes @click={() => { list = list | push(step()) | push(echo(seen)) }}>x</button>
+        <button #compoundstop @click={() => { n += must("no")? + charge(9) }}>x</button>
+        <button #compoundstop2 @click={() => { n += boom() + charge(10) }}>x</button>
+        <button #setstop @click={() => { vw = set(vw, "res", boom() + charge(19)) }}>x</button>
+        <button #setorder @click={() => { vw = set(vw, echo(seen) > 0 ? "res" : "other", step()) }}>x</button>
+        <button #argread @click={() => { n = 7; n = echo(n) + n + echo(n) }}>x</button>
+        <button #loop @click={() => { for x in [1, 2, 3] { n += echo(x) } }}>x</button>
+        <button #while @click={() => { while n < 3 { n += one(1) } }}>x</button>
+        <p #n>{n}</p><p #seen>{seen}</p><p #l>{str(list)}</p><p #vw>{str(vw)}</p><p #m>{msg}</p><div>{el}</div>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><H/></body></html>
+"##;
+    let body = format!("{Q800_PAGE}\n{Q800_CALLS}\n{}", r#"const out = {};
+const reset = async () => { $("reset").click(); await tick(5); };
+const txt = (id) => $(id).textContent;
+const one_ = async (id) => { await reset(); $(id).click(); await tick(40); await quiet(); };
+await one_("order"); out.order = txt("n");
+await one_("orderl"); out.orderl = txt("l");
+await one_("ordert"); out.ordert = txt("m");
+await one_("orderloc"); out.orderloc = txt("n");
+out.c0 = window.__calls.slice(-1);
+for (const [id, nm] of [["skipq", "[1]"], ["skipq2", "[2]"], ["skipboom", "[3]"], ["skipdiv", "[4]"]]) { const b = window.__calls.filter(c => c.includes("charge") && c.includes(nm)).length; await one_(id); out[id] = [window.__calls.filter(c => c.includes("charge") && c.includes(nm)).length - b, txt("n")]; }
+for (const id of ["pipe", "setf"]) { await reset(); $(id).click(); await tick(20); $("touch").click(); await tick(140); await quiet(); out[id] = [txt("l"), txt("vw")]; }
+for (const id of ["coal", "tern", "try", "index", "iff", "block", "andf", "orf"]) { await reset(); for (let i = 0; i < 3; i++) $(id).click(); await tick(100); await quiet(); out[id] = txt("n"); }
+for (const [id, nm] of [["sc1", "[6]"], ["sc2", "[7]"], ["sc3", "[8]"]]) { const b = window.__calls.filter(c => c.includes(nm)).length; await one_(id); out[id] = [window.__calls.filter(c => c.includes(nm)).length - b, txt("n")]; }
+{ const b = window.__calls.length; await one_("twice"); out.twice = window.__calls.slice(b).map(c => c.replace(/^\S+ /, "")); out.twice_n = txt("n"); }
+await one_("two"); out.two = txt("n");
+await one_("argread"); out.argread = txt("n");
+await one_("loop"); out.loop = txt("n");
+await one_("while"); out.while = txt("n");
+{ await reset(); $("argfold").click(); await tick(2); $("touch").click(); await tick(30); await quiet(); out.argfold = [txt("n"), window.__calls.at(-1)]; }
+{ await reset(); $("spread").click(); await tick(20); $("touch").click(); await tick(30); await quiet(); out.spread = txt("l"); }
+await one_("headcall"); out.headcall = [txt("n"), window.__calls.at(-1)];
+await one_("twicecompiled"); $("counts").click(); await tick(30); await quiet(); out.twicecompiled = txt("n");
+await one_("mergeorder"); out.mergeorder = [txt("vw"), window.__calls.at(-1)];
+await one_("pipes"); out.pipes = [txt("l"), window.__calls.at(-1)];
+for (const [id, nm] of [["compoundstop", "[9]"], ["compoundstop2", "[10]"], ["setstop", "[19]"]]) { const b = window.__calls.filter(c => c.includes(nm)).length; await one_(id); out[id] = [window.__calls.filter(c => c.includes(nm)).length - b, txt("n")]; }
+await one_("setorder"); out.setorder = [txt("vw"), window.__calls.at(-1)];
+out.reported = window.__quilloErrors.length > 0; window.__quilloErrors.length = 0;
+return out;
+"#);
+    let Some(r) = s7_in_page("q800-order", src, "/", &body) else { return };
+    let want = serde_json::json!({
+        "order": "6", "orderl": "[\"x\", 1, 5]", "ordert": "1 5", "orderloc": "6", "c0": ["echo [5]"],
+        "skipq": [0, "0"], "skipq2": [0, "0"], "skipboom": [0, "0"], "skipdiv": [0, "0"],
+        "pipe": ["[\"x\", \"touched\", \"row\"]", "{ res: \"\", other: 2 }"], "setf": ["[\"x\", \"touched\"]", "{ res: \"c\", other: 2 }"],
+        "coal": "3", "tern": "3", "try": "3", "index": "3", "iff": "3", "block": "3", "andf": "3", "orf": "3",
+        "sc1": [0, "0"], "sc2": [0, "1"], "sc3": [0, "1"],
+        "twice": ["[11]", "[12]", "[13]", "[\"charge14\",1]", "[\"charge15\",1]", "[\"charge16\",1]", "[17]", "[18]"], "twice_n": "11",
+        "two": "3", "argread": "21", "loop": "6", "while": "3", "argfold": ["10", "echo [0]"], "headcall": ["6", "echo [5]"], "twicecompiled": "1", "spread": "[\"x\", \"touched\", \"row\"]",
+        "mergeorder": ["{ first: 1, res: 5, other: 1 }", "echo [5]"], "pipes": ["[\"x\", 1, 5]", "echo [5]"],
+        "compoundstop": [0, "0"], "compoundstop2": [0, "0"], "setstop": [0, "0"], "setorder": ["{ res: \"\", other: 1 }", "echo [0]"],
+        "reported": true, "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Found in the second review of Q-800: `held` outlived its use. A claim ends when the set it was for
+// is made or gives way, so `status = a; lag("long", 250); status = "done"` ends "done" with another
+// run's answer landed meanwhile, where it was dropped; the drop covers only the window between the
+// wait and the set. A fold is never dropped, and in that window takes nothing from the newest call.
+// And what is decided by an answer gives way even if a fold came first: the exception for a set
+// keeping step with a fold holds only for a fold in the same branch, not before the `if` or guard.
+#[test]
+fn a_claim_ends_when_it_is_used_and_a_fold_always_counts() {
+    let src = r##"server fn lag(k: str, ms: int) -> str {
+    sleep(ms)
+    k
+}
+server fn flag(ms: int) -> bool {
+    sleep(ms)
+    true
+}
+component D() {
+    state n = 0
+    state tries = 0
+    state v = "none"
+    state w = "none"
+    state status = "idle"
+    state saving = false
+    state open = true
+    state note = ""
+    state items = ["x"]
+    state cnt = 0
+    state busy = false
+    let f1 = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        n += 1
+        if r == "a" { v = `${n} A` } else { v = `${n} B` }
+    }
+    let f2 = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        tries += 1
+        if r == "" { return null }
+        w = r == "a" ? "x" : "y"
+    }
+    let f3 = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        tries += 1
+        if r == "bad" { return null }
+        w = `reached with ${tries}`
+    }
+    let stuck = () => {
+        saving = true
+        let r = lag("saved", 200)
+        if r == "pending" { saving = r != "" }
+        saving = false
+    }
+    let refresh = () => { saving = flag(20) }
+    let steps = () => {
+        let a = lag("step1", 20)
+        status = a
+        lag("long", 250)
+        status = "finished"
+    }
+    let ping = () => { status = lag("pinged", 20) }
+    let foldlost = (ms: int) => {
+        let r = lag("row", ms)
+        if r == "reset" { cnt = 0 } else { cnt += 1 }
+    }
+    let answerset = () => {
+        let x = lag("x", 20)
+        cnt = 100
+        v = x
+    }
+    let close_it = () => {
+        let r = lag("ok", 200)
+        if r == "err" {
+            note = "failed"
+            return null
+        }
+        open = false
+        note = "saved"
+    }
+    let second = () => {
+        for k in ["x", "y"] {
+            let r = lag(k, 100)
+            v = r
+        }
+    }
+    let older_plain = () => {
+        let r = lag("a", 150)
+        v = "wiped"
+        lag("z", 300)
+        v = r
+    }
+    let bumps = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        note = note + "."
+        lag("z", 1)
+        note = r
+    }
+    let peek = () => {
+        let r = lag("peek", 20)
+        if r == "never" { open = false }
+    }
+    let loader = (k: str, ms: int) => {
+        busy = true
+        let r = lag(k, ms)
+        if r == "stale" { return null }
+        busy = false
+        note = r
+    }
+    <div>
+        <button #reset @click={() => { n = 0; tries = 0; v = "none"; w = "none"; status = "idle"; saving = false; open = true; note = ""; items = ["x"]; cnt = 0; busy = false }}>r</button>
+        <button #o1 @click={() => f1("a", 250)}>o</button><button #n1 @click={() => f1("b", 20)}>n</button>
+        <button #o2 @click={() => f2("a", 250)}>o</button><button #n2 @click={() => f2("b", 20)}>n</button>
+        <button #o3 @click={() => f3("a", 250)}>o</button><button #n3 @click={() => f3("bad", 20)}>n</button>
+        <button #stuck @click={() => stuck()}>x</button><button #refresh @click={() => refresh()}>x</button>
+        <button #steps @click={() => steps()}>x</button><button #ping @click={() => ping()}>x</button>
+        <button #fl @click={() => foldlost(200)}>x</button><button #as @click={() => { let r = lag("a", 20); cnt = r == "a" ? 50 : 0 }}>x</button>
+        <button #sec @click={() => second()}>x</button><button #olp @click={() => older_plain()}>x</button>
+        <button #fo @click={() => bumps("a", 60)}>x</button><button #fn @click={() => bumps("b", 200)}>x</button>
+        <button #close @click={() => close_it()}>x</button><button #peek @click={() => peek()}>x</button>
+        <button #lo @click={() => loader("old", 200)}>x</button><button #ln @click={() => loader("stale", 20)}>x</button>
+        <p #n>{n}</p><p #t>{tries}</p><p #v>{v}</p><p #w>{w}</p><p #st>{status}</p><p #sv>{str(saving)}</p><p #op>{str(open)}</p><p #no>{note}</p><p #c>{cnt}</p><p #b>{str(busy)}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><D/></body></html>
+"##;
+    let body = format!("{Q800_PAGE}\n{}", r#"const out = {};
+const txt = (id) => $(id).textContent;
+const race = async (a, b, ...at) => { $("reset").click(); await tick(5); $(a).click(); await tick(30); $(b).click(); await tick(320); await quiet(); return at.map(txt); };
+out.fold_exception_v = await race("o1", "n1", "v", "n");
+out.fold_exception_left = await race("o2", "n2", "w");
+out.fold_exception_left2 = await race("o3", "n3", "w");
+out.steps_finished = await race("steps", "ping", "st");
+out.fold_in_lost_run = await race("fl", "as", "c");
+out.fold_leaves_newest = await race("fo", "fn", "no");
+$("reset").click(); await tick(5); $("olp").click(); await tick(10); $("sec").click();
+out.while_the_newest_calls_again = [await until(() => txt("v") === "wiped"), await until(() => txt("v") === "y")];
+await tick(30); await quiet();
+return out;
+"#);
+    let Some(r) = s7_in_page("q800-claims", src, "/", &body) else { return };
+    let want = serde_json::json!({
+        "fold_exception_v": ["1 B", "2"], "fold_exception_left": ["y"], "fold_exception_left2": ["none"], "steps_finished": ["finished"],
+        "fold_in_lost_run": ["51"], "fold_leaves_newest": ["b"], "while_the_newest_calls_again": [true, true], "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Found in the second review of Q-800: a function of `parallel` took its caller's plain set for a
+// claim of the family, so `v = "loading"; parallel(a, b)` let the older call stand; `held` was not
+// read through `up`, so a lost run's function blanked the newest answer or voided it; and `up` was one
+// level, so a nested function took the outer claim. A call is a claim of its own, whoever held the
+// state; a plain set looks up the whole chain, for what is held and for what has a call out.
+#[test]
+fn a_call_in_parallel_is_a_claim_of_its_own() {
+    let src = r##"server fn lag(k: str, ms: int) -> str {
+    sleep(ms)
+    k
+}
+component P() {
+    state v = "none"
+    state w = "none"
+    let wipe = () => { w = "" }
+    <div>
+        <button #r @click={() => { v = "none"; w = "none" }}>r</button>
+        <button #p1 @click={() => { v = "loading"; parallel(() => { v = lag("a", 100) }, () => { v = lag("b", 10) }) }}>x</button>
+        <button #p2 @click={() => { let r = lag("r", 10); parallel(() => parallel(() => { v = "inner" }, () => 1), () => 1); v = r }}>x</button>
+        <button #p3 @click={() => { let r = lag("r", 10); parallel(() => { v = "child" }, () => 1); v = r }}>x</button>
+        <button #p4 @click={() => { parallel(() => { let x = lag("a", 100); w = x; wipe() }, () => { w = lag("b", 10) }) }}>x</button>
+        <button #p5 @click={() => { let r = lag("r", 100); v = r }}>x</button>
+        <button #p6 @click={() => { parallel(() => { v = "sibling" }, () => 1) }}>x</button>
+        <button #p7 @click={() => { parallel(() => { v = lag("a", 30); lag("z", 80) }, () => { lag("z", 60); v = "later" }) }}>x</button>
+        <button #q1 @click={() => { let r = lag("a", 200); parallel(() => { w = "" }, () => 1); w = r }}>x</button>
+        <button #q2 @click={() => { let r = lag("b", 300); parallel(() => { w = "" }, () => 1); w = r }}>x</button>
+        <button #q3 @click={() => { let r = lag("c", 20); w = r }}>x</button>
+        <p #v>{v}</p><p #w>{w}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><P/></body></html>
+"##;
+    let body = format!("{Q800_PAGE}\n{}", r#"const out = {};
+const r = async () => { $("r").click(); await tick(5); };
+const go2 = async (id) => { await r(); $(id).click(); await tick(150); await quiet(); return [$("v").textContent, $("w").textContent]; };
+for (const id of ["p1", "p2", "p3", "p4", "p7"]) out[id] = await go2(id);
+await r(); $("p5").click(); await tick(20); $("p6").click(); await tick(150); await quiet(); out.other_run_child = $("v").textContent;
+await r(); $("q1").click(); await tick(10); $("q3").click(); await tick(300); await quiet(); out.lost_run_child_wipes_landed = $("w").textContent;
+await r(); $("q1").click(); await tick(10); $("q2").click(); await tick(420); await quiet(); out.lost_run_child_voids_newest = $("w").textContent;
+return out;
+"#);
+    let Some(r) = s7_in_page("q800-par", src, "/", &body) else { return };
+    let want = serde_json::json!({
+        "p1": ["b", "none"], "p2": ["r", "none"], "p3": ["r", "none"], "p4": ["none", ""], "p7": ["later", "none"], "other_run_child": "sibling",
+        "lost_run_child_wipes_landed": "c", "lost_run_child_voids_newest": "b", "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
+// Found in the second review of Q-800: `&&`, `||` and `??` written as statements are the `if` they
+// are: what they run is decided by the answer on their left, and a `return` in one leaves on it. The
+// edges: through a variable, alone (made), and a left side that carries no answer (plain, made).
+#[test]
+fn and_or_and_coalesce_decide_as_an_if_does() {
+    let src = r##"server fn lag(k: str, ms: int) -> str {
+    sleep(ms)
+    k
+}
+server fn nothing(k: str, ms: int) -> str? {
+    sleep(ms)
+    k == "" ? null : k
+}
+component Logic() {
+    state v = "none"
+    state w = "none"
+    state plain = "none"
+    let by_and = (k: str, ms: int) => { lag(k, ms) == "a" && { v = "A" } }
+    let by_or = (k: str, ms: int) => { lag(k, ms) == "b" || { v = "A" } }
+    let by_coalesce = (k: str, ms: int) => { nothing(k, ms) ?? { v = "A" } }
+    let by_var = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        r == "a" && { v = "A" }
+    }
+    let leaves = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        r == "bad" && { return null }
+        w = "reached"
+    }
+    let leaves_or = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        r != "bad" || { return null }
+        w = "reached"
+    }
+    let no_answer = (ms: int) => {
+        lag("x", ms)
+        ms > 0 && { plain = "after" }
+    }
+    <div>
+        <button #o_and @click={() => by_and("a", 250)}>o</button><button #n_and @click={() => by_and("b", 20)}>n</button>
+        <button #o_or @click={() => by_or("a", 250)}>o</button><button #n_or @click={() => by_or("b", 20)}>n</button>
+        <button #o_co @click={() => by_coalesce("", 250)}>o</button><button #n_co @click={() => by_coalesce("b", 20)}>n</button>
+        <button #o_var @click={() => by_var("a", 250)}>o</button><button #n_var @click={() => by_var("b", 20)}>n</button>
+        <button #o_left @click={() => leaves("a", 250)}>o</button><button #n_left @click={() => leaves("bad", 20)}>n</button>
+        <button #o_lor @click={() => leaves_or("a", 250)}>o</button><button #n_lor @click={() => leaves_or("bad", 20)}>n</button>
+        <button #alone @click={() => by_and("a", 10)}>x</button>
+        <button #plain @click={() => no_answer(120)}>x</button>
+        <button #other @click={() => { plain = "other" }}>x</button>
+        <button #reset @click={() => { v = "none"; w = "none" }}>r</button>
+        <p #v>{v}</p><p #w>{w}</p><p #pl>{plain}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Logic/></body></html>
+"##;
+    let body = format!("{Q800_PAGE}\n{}", r#"const out = {};
+const race = async (f, at) => { $("reset").click(); await tick(5); $("o_" + f).click(); await tick(30); $("n_" + f).click(); await tick(30); await quiet(); await tick(320); await quiet(); return $(at).textContent; };
+for (const f of ["and", "or", "co", "var"]) out[f] = await race(f, "v");
+for (const f of ["left", "lor"]) out[f] = await race(f, "w");
+$("reset").click(); await tick(5); $("alone").click(); await tick(30); await quiet();
+out.alone = $("v").textContent;
+$("plain").click(); $("other").click(); await tick(30); await quiet();
+out.plain = $("pl").textContent;
+return out;
+"#);
+    let Some(r) = s7_in_page("q800-logic", src, "/", &body) else { return };
+    let want = serde_json::json!({ "and": "none", "or": "none", "co": "none", "var": "none", "left": "none", "lor": "none", "alone": "A", "plain": "after", "remade": 0, "errors": [] });
+    assert_eq!(r, want);
+}
+
+// Found in the second review of Q-800: any default naming `$text_7` or `$t1_7` looked as if it used a
+// temp, and moved the function's temps ahead of its defaults, so a function that waits on nothing was
+// no longer as it was. The temps come first only for a default that uses one.
+#[test]
+fn a_name_like_a_temp_leaves_a_function_as_it_was() {
+    let src = "component C() {\n    state v = \"\"\n    let f = (text = \"a\", t1 = \"b\") => {\n        v = text + (t1 ?? \"c\")\n    }\n    <button #b @click={() => f()}>{v}</button>\n}\nroute GET / = <html><body><C/></body></html>\n";
+    let d = s7_dir("q800-temp-name", src);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let page = support::send(s.port, "GET", "/", &[], "").body;
+    let at = page.find("/_quillo/b/").expect("the page names its bundle");
+    let path = page[at..].split('"').next().unwrap();
+    let js = support::send(s.port, "GET", path, &[], "").body;
+    let (default, temps) = (js.find("=== undefined").expect("a default"), js.find("let $t0").expect("a temp"));
+    assert!(default < temps, "{}", js);
 }
 
 // ---- end of Q-800's runs ----

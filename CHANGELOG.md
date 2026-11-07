@@ -325,8 +325,9 @@ What runs at the same time comes out as if done one after another (Q-796 to Q-80
   last. Plain sets after a wait are made and still claim, and a function's own helpers are
   its run, so their waits take nothing from it; a plain set from a run that lost the state
   takes nothing, and cannot blank the newest answer. A set that reads the state it sets is
-  a fold (`n += 1`, `xs = xs + [x]`, `s = f(s)`), always made, and reads the state after
-  any wait on its right, so `n += count()` three times in one tick counts three (Q-800).
+  a fold (`n += 1`, `xs = xs + [x]`, `s = f(s)`), always made. In one with a wait, every
+  part runs where it is written and only the read of the state moves after the waits, so
+  `n += count()` three times in one tick counts three (Q-800).
 - **`every` in the browser waits for its last run**: a tick that finds it still waiting
   does nothing, so a poll slower than its timer shows each answer, where every answer was
   dropped for a newer call and calls piled up on a slow server. A run with no answer after

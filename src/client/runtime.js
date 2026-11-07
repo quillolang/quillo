@@ -1809,8 +1809,8 @@ B.every = meta((ms, f) => {
 B.parallel = meta(async (...fs) => {
   if (fs.length === 1 && Array.isArray(fs[0])) fs = fs[0];
   // Each function is a run of its own, so the last one called is the latest call of a state they
-  // both set; under the run that called them, whose claims they leave alone (see `takeClaim`;
-  // FEEDBACK55.md, Q-800; branch feedback55).
+  // both set; under the run that called them, whose calls their plain sets leave alone (see
+  // `callOut`; FEEDBACK55.md, Q-800; branch feedback55).
   const run = Run;
   let calls;
   try {
@@ -8160,52 +8160,69 @@ W.settle = async (v) => {
 // and gives it back as it waits and as it ends, so `Run` is null again when nothing is left on the
 // stack and whatever the page calls next starts afresh, with nothing to mark at each way in; after a
 // wait it takes it up again. `w`: the run, what was going on when the function was called, and
-// whether it has been given back. A run: `held`, the states it has had a call out for; `shown`, those
-// showing its answer; `up`, the run that called it, for `parallel`'s (FEEDBACK55.md, Q-800; branch
-// feedback55).
+// whether it has been given back. A run: `held`, the states it has a call out for, until the set
+// that call was for is made or gives way; `shown`, those showing its answer (both weakly: a run kept
+// by a state of the page keeps no component that has gone); `up`, the run that called it, for
+// `parallel`'s (FEEDBACK55.md, Q-800; branch feedback55).
 let Run = null;
 W.run = () => { const o = Run; return { r: (Run = o || { held: null, shown: null, up: undefined }), o, y: false }; };
 W.off = (w, x) => { if (!w.y) { w.y = true; Run = w.o; w.o = null; } return x; };
 W.on = (w, v) => { w.y = false; Run = w.r; return v; };
+// Whether `r`, or a run that called it, has a call out for `s`.
+function callOut(s, r) {
+  for (; r; r = r.up) if (r.held !== null && r.held.has(s)) return true;
+  return false;
+}
 // The latest set of a state wins (see `Stmt::Assign` in src/client.rs): a set claims its state, and
 // a function that waits claims, before the wait, a state it will set with the answer. That set is
 // dropped when another run has claimed the state since: `n` moves only when the claim changes
-// hands, so a run's own sets, a function it called among them, take nothing from it.
-function takeClaim(s) {
-  const r = Run;
-  if (r === null) { s.r = null; s.n++; }
-  else if (s.r !== r && s.r !== r.up) { s.r = r; s.n++; }
-  return s.n;
-}
-// For an answer to come: the state is one the run has a call out for, as a plain set does not make it.
+// hands, so a run's own sets, a function it called among them, take nothing from it. A call is
+// always a claim of its own, whoever held the state: `v = "loading"; parallel(f, g)` has `f`'s and
+// `g`'s calls, and the later is the latest.
 W.claim = (s) => {
-  if (Run !== null) (Run.held || (Run.held = new Set())).add(s);
-  return takeClaim(s);
+  const r = Run;
+  if (r !== null) {
+    (r.held || (r.held = new WeakSet())).add(s);
+    if (r.shown !== null) r.shown.delete(s);
+  }
+  if (r === null || s.r !== r) { s.r = r; s.n++; }
+  return s.n;
 };
 // At a later wait with the same answer: the claim it has, lost or not.
 W.again = (s, n) => (n === undefined ? W.claim(s) : n);
 W.latest = (s, n, v) => {
   if (s.n !== n) return null;
   const r = s.r;
-  if (r !== null) (r.shown || (r.shown = new Set())).add(s);
+  if (r !== null) (r.shown || (r.shown = new WeakSet())).add(s);
   return s.set(v);
 };
-// A plain set: made, and it claims the state, so an older answer gives way to it. From a run that
-// had a call out for the state and lost it, it is that older call's doing, and takes nothing from
-// the newest: as it was, `let r = search(q); wipe(); shown = r` typed quickly voided the last call
-// and ended empty. Once the newest answer is in, it would blank that answer, and is dropped.
+// A plain set: made, and it claims the state, so an older answer gives way to it. From a run with a
+// call out for the state, which another has taken, it is that older call's doing, and takes nothing
+// from the newest: as it was, `let r = search(q); wipe(); shown = r` typed quickly voided the last
+// call and ended empty. Once the newest answer is in, it would blank that answer, and is dropped.
 W.put = (s, v) => {
   const r = Run;
   if (r === null) { s.r = null; s.n++; return s.set(v); }
-  if (s.r !== r && s.r !== r.up && r.held !== null && r.held.has(s)) {
-    const now = s.r;
-    return now !== null && now.shown !== null && now.shown.has(s) ? null : s.set(v);
+  if (s.r !== r) {
+    if (!callOut(s, r)) { s.r = r; s.n++; }
+    else if (s.r !== null && s.r.shown !== null && s.r.shown.has(s)) return null;
   }
-  takeClaim(s);
+  return s.set(v);
+};
+// A fold in a function that waits: as a plain set, but never dropped: it builds on what the state
+// holds, and a count must count.
+W.fold = (s, v) => {
+  const r = Run;
+  if (r === null || (s.r !== r && !callOut(s, r))) { s.r = r; s.n++; }
   return s.set(v);
 };
 // A set with an answer: its claim's, or a plain one on a way that did not wait for it.
-W.to = (s, v, n) => (n === undefined ? W.put(s, v) : W.latest(s, n, v));
+W.to = (s, v, n) => {
+  if (n === undefined) return W.put(s, v);
+  // The call is over, made or dropped: a plain set after this is the program's own again.
+  if (Run !== null && Run.held !== null) Run.held.delete(s);
+  return W.latest(s, n, v);
+};
 W.Dec = Dec;
 W.Fl = Fl;
 W.Ret = Ret;

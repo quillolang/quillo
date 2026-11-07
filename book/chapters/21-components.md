@@ -309,7 +309,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   A tick that finds that timer's last run still waiting does nothing, so a poll slower
   than its timer runs one call at a time and shows each answer; a run with no answer
   after 30 seconds (or two gaps, if that is longer) is given up on, and the next tick
-  starts anew.
+  starts anew. A clock's tick should not share an `every` with a call that waits: give
+  it its own.
 
   ```quillo
   component Stopwatch() {
@@ -1405,26 +1406,35 @@ older call's answer never replaces a newer value: every set of a state claims it
 plain `shown = "x"`, a field bound with `bind:`, a set from a call). A set that carries an
 answer the function waited for gives way when another run has set or claimed that state
 since. It carries the answer if its value holds the call or a variable bound from it, or
-if the answer decides it: it sits under an `if`, `match`, `while` or `for` on the answer,
-or after a guard that leaves on it (`return`, `?`). A run is one handler, effect, timer or
+if the answer decides it: it sits under an `if`, `match`, `while` or `for` on the answer
+(or `&&`, `||` or `??` used as one), or after a guard that leaves on it (`return`, `?`). A
+run is one handler, effect, timer or
 frame callback, with the functions it calls; a handler fired by `el.click()` and each
 `parallel` function are runs of their own. So
 `oninput={(e) => { shown = search(e.value) }}` ends on the answer for what was typed
 last, however late the first one comes.
 
 Every other set is made: a plain one, like `saving = false` after the wait, a fold, and a
-set keeping a state in step with one the function folded. A set that reads the state it
-sets is a fold (`n += 1`, `busy -= 1`, `xs = xs + [x]`, `s = s | push(x)`, `s = f(s)`),
-made on what the state holds then, after any wait on its right: three quick likes that
-each call `save()` and then `likes += 1` count three, `n += count()` adds to what `n`
-holds when the answer comes, and two uploads that each do `busy += 1`, wait, and
-`busy -= 1` end at 0. A plain set from a run whose call lost that state takes nothing, and
-once the newest answer shows it is dropped, so an older run cannot blank it. Write the set
-in the function that waited: an answer handed to a helper as an argument counts as plain
-there.
+set keeping a state in step with one folded earlier in that same branch. A set that reads
+the state it sets is a fold (`n += 1`, `busy -= 1`, `xs = xs + [x]`, `s = s | push(x)`,
+`s = f(s)`), made on what the state holds then: three quick likes that each call `save()`
+and then `likes += 1` count three, and two uploads that each do `busy += 1`, wait, and
+`busy -= 1` end at 0.
+
+In a fold with a wait in it, every part runs where it is written, and only the read of the
+state moves after the waits: `n += count()` adds to what `n` holds when the answer comes,
+and `n = n + check()? + charge(1)` makes no charge if `check()` stops. That is so for `+=`
+and `-=`, and for `=` forms headed by the state (`n + f()`, a template, `...state` in a
+list or map, `set` and `push`). Other shapes read the state first.
+
+Between the wait a run lost and the set that call was for, a plain set of that state takes
+nothing, and once the newest answer shows it is dropped, so an older run cannot blank it.
+Write the set in the function that waited: an answer handed to a helper as an argument
+counts as plain there, and a fold made by a plain helper inside that window can be dropped.
 
 In a function that waits, a hole of markup may wait too: `let el = <b>{load()}</b>`. It is
-worked out once, before the markup is made, and does not follow what it read.
+worked out first, before the markup is made and before the holes around it, once, and does
+not follow what it read.
 
 **Slow data: `defer`.** A `state` initializer runs while the server renders, so the
 page waits for its slowest one. `defer` lets a slow one follow the page instead:

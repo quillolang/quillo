@@ -1480,8 +1480,11 @@ struct Answers {
     decided: Option<usize>,
     /// The first wait whose answer may have left the function, for all that comes after.
     left: Option<usize>,
-    /// The states it has folded after a wait.
+    /// The states it has folded after a wait, in order, and how many of those came before the
+    /// branch being compiled, and before the last place an answer may have left the function.
     folded: Vec<String>,
+    folded_before: usize,
+    folded_before_left: usize,
     /// Compiling markup whose waits have been worked out first (see `html`).
     in_html: bool,
 }
@@ -1492,6 +1495,15 @@ fn first_of(a: Option<usize>, b: Option<usize>) -> Option<usize> {
         (Some(x), Some(y)) => Some(x.min(y)),
         (x, y) => x.or(y),
     }
+}
+
+/// Whether `code` uses a temp (`$t0`), not a name that starts as one (`$text_7`, `$t1_7`).
+fn uses_temp(code: &str) -> bool {
+    code.match_indices("$t").any(|(i, _)| {
+        let rest = &code[i + 2..];
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        digits > 0 && !rest[digits..].starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '$')
+    })
 }
 
 /// Whether `e` can leave its function by itself (`return`, or `?`), not counting functions in it.
@@ -1561,7 +1573,7 @@ struct Compiler<'a> {
     /// is wanted there, not what it gives.
     keep_promise: bool,
     /// Expressions already worked out, by what holds their value: a wait taken out of a fold or of
-    /// markup, to come first (see `waits_in`; FEEDBACK55.md, Q-800; branch feedback55).
+    /// markup, to come first (see `fold_parts` and `html`; FEEDBACK55.md, Q-800; branch feedback55).
     hoisted: HashMap<*const Expr, String>,
     /// `let` functions that wait for what `js(...)` gives, as a handler
     /// does: a component's own (unless its markup calls them, which cannot
@@ -2683,7 +2695,7 @@ impl<'a> Compiler<'a> {
         // '$t0' before initialization" (FEEDBACK55.md, Q-800; branch feedback55). Only then: a
         // checked function's body is a function of its own, where its temps stay its own.
         let temps = Self::temps_decl(ctx.temps);
-        let (head, temps) = if pre.contains("$t") { (temps, String::new()) } else { (String::new(), temps) };
+        let (head, temps) = if uses_temp(&pre) { (temps, String::new()) } else { (String::new(), temps) };
         let run = if leaves_early(&def.body) {
             format!("{}try {{\n{}}} catch ($e) {{ if ($e instanceof W.Ret) return $e.v; throw $e; }}\n", temps, body)
         } else {
@@ -3039,19 +3051,13 @@ impl<'a> Compiler<'a> {
                 Stmt::Assign(name, op, e, line) => {
                     self.line = *line;
                     let before = self.ctx().marks.len();
-                    // A fold reads the state after its wait, not before it: three quick `n +=
-                    // one()` read 0 each and counted 1 (FEEDBACK55.md, Q-800; branch feedback55).
-                    let mut first = Vec::new();
-                    if self.ctx().is_async && folds(*op, e, name) {
-                        self.waits_in(e, &mut first)?;
-                    }
-                    for (at, code) in &first {
-                        let t = self.temp();
-                        let _ = writeln!(body, "{} = {};", t, code);
-                        self.hoisted.insert(*at, t);
-                    }
+                    // A fold reads the state after its waits, not before them: three quick `n +=
+                    // one()` read 0 each and counted 1. Every part still runs where it is written,
+                    // so a stop in one leaves the next uncalled; only the read of the state moves
+                    // (FEEDBACK55.md, Q-800; branch feedback55).
+                    let first = self.fold_parts(*op, e, name, &mut *body)?;
                     let rhs = self.expr(e);
-                    first.iter().for_each(|(at, _)| drop(self.hoisted.remove(at)));
+                    first.iter().for_each(|at| drop(self.hoisted.remove(at)));
                     let rhs = rhs?;
                     let answer = self.set_answer(e, before);
                     let target = self.resolve(name)?;
@@ -3110,7 +3116,8 @@ impl<'a> Compiler<'a> {
                             let _ = writeln!(body, "W.to({js}, {v}, {c});");
                         }
                         (Resolved::State(js), None) => {
-                            let _ = writeln!(body, "W.put({}, {});", js, v);
+                            let set = if fold && self.ctx().is_async { "W.fold" } else { "W.put" };
+                            let _ = writeln!(body, "{}({}, {});", set, js, v);
                         }
                         _ => {
                             let _ = writeln!(body, "{} = {};", cur, v);
@@ -3290,8 +3297,9 @@ impl<'a> Compiler<'a> {
     /// The first wait whose answer a set of `e` carries: `e`'s, or the one deciding that the set is
     /// made at all, as in `if taken(q) { hint = "taken" } else { hint = "free" }` or after `if !r.ok
     /// { return }`: else the older answer decides. But a set that keeps a state in step with one
-    /// this function folded is made as the fold is, or the two part: infinite_feed's `heights =
-    /// heights + more; tops = tops_of(heights)`, under `if page.ok`.
+    /// folded in that same branch, before it, is made as the fold is, or the two part:
+    /// infinite_feed's `heights = heights + more; tops = tops_of(heights)`, under `if page.ok`. A
+    /// fold before the `if` is no such thing: there the answer decides what the set says.
     fn set_answer(&self, e: &Expr, before: usize) -> Option<usize> {
         let value = self.answer_in(e, before);
         let c = self.ctxs.last()?;
@@ -3299,8 +3307,9 @@ impl<'a> Compiler<'a> {
         if value.is_some() || decided.is_none() {
             return value;
         }
+        let here = &c.answers.folded[c.answers.folded_before.max(c.answers.folded_before_left)..];
         let mut follows = false;
-        each_expr_in(e, &mut |x| follows |= self.state_of(x).is_some_and(|s| c.answers.folded.contains(&s)), false);
+        each_expr_in(e, &mut |x| follows |= self.state_of(x).is_some_and(|s| here.contains(&s)), false);
         if follows {
             None
         } else {
@@ -3355,39 +3364,102 @@ impl<'a> Compiler<'a> {
 
     /// `f` compiling what the answer of wait `from` decides.
     fn deciding<T>(&mut self, from: Option<usize>, f: impl FnOnce(&mut Self) -> T) -> T {
-        let saved = self.ctx().answers.decided;
-        self.ctx().answers.decided = first_of(saved, from);
+        let a = &mut self.ctx().answers;
+        let saved = (a.decided, a.folded_before);
+        a.decided = first_of(saved.0, from);
+        if from.is_some() {
+            a.folded_before = a.folded.len();
+        }
         let r = f(self);
-        self.ctx().answers.decided = saved;
+        let a = &mut self.ctx().answers;
+        (a.decided, a.folded_before) = saved;
         r
     }
 
     /// What `from` decided may have left the function: all that comes after is decided by it.
     fn may_have_left(&mut self, from: Option<usize>, left: bool) {
-        if left {
-            let c = self.ctx();
-            c.answers.left = first_of(c.answers.left, from);
+        if left && from.is_some() {
+            let a = &mut self.ctx().answers;
+            a.left = first_of(a.left, from);
+            a.folded_before_left = a.folded.len();
         }
     }
 
-    /// The waits to work out before `e`, each with its code: those in the parts of `e` that are
-    /// sure to run, for a fold to read its state after them (see `Stmt::Assign`). What may not run
-    /// (`c ? f() : 0`) stays where it is.
-    fn waits_in(&mut self, e: &Expr, out: &mut Vec<(*const Expr, String)>) -> Result<(), QuilloError> {
-        match e {
-            // `{ ...m, k: v }`, as the parser writes it.
-            Expr::Call(f, args, _) if matches!(&**f, Expr::Ident(n, _) if n == "__merge") => args.iter().try_for_each(|x| self.waits_in(x, out)),
-            Expr::Call(..) | Expr::Pipe(..) => self.wait_of(e, out),
-            Expr::Binary(op, a, b, _) if !matches!(op, BinOp::And | BinOp::Or) => {
-                self.waits_in(a, out)?;
-                self.waits_in(b, out)
-            }
-            Expr::Unary(_, x, _) | Expr::Field(x, _, _) => self.waits_in(x, out),
-            Expr::List(xs) => xs.iter().try_for_each(|x| self.waits_in(x, out)),
-            Expr::Map(es) => es.iter().try_for_each(|(_, x)| self.waits_in(x, out)),
-            Expr::Template(parts) => parts.iter().try_for_each(|p| if let TPart::Expr(x) = p { self.waits_in(x, out) } else { Ok(()) }),
-            _ => Ok(()),
+    /// Worked out in `body`, in the order written, the parts of the fold `name op e` other than
+    /// the reads of `name` itself, if one of them waits: `n = n + a()? + b()` is `t1 = a()?`, `t2 =
+    /// b()`, and only then `n + t1 + t2`. What it gives is the parts to forget once `e` is compiled.
+    /// A shape where the parts cannot be told from the read stays as it is, and reads first.
+    fn fold_parts(&mut self, op: AssignOp, e: &Expr, name: &str, body: &mut String) -> Result<Vec<*const Expr>, QuilloError> {
+        let mut parts: Vec<&Expr> = Vec::new();
+        if !self.ctx().is_async || !self.is_state(name) || !folds(op, e, name) {
+            return Ok(Vec::new());
         }
+        if matches!(op, AssignOp::Set) {
+            self.parts_of_fold(e, name, &mut parts)?;
+        } else {
+            parts.push(e);
+        }
+        parts.retain(|p| !matches!(p, Expr::Lit(_)));
+        let before = self.ctx().marks.len();
+        let code = parts.iter().map(|p| self.expr(p)).collect::<Result<Vec<_>, _>>()?;
+        if !self.ctx().marks[before..].iter().any(|m| matches!(m, Mark::Wait(_))) {
+            return Ok(Vec::new());
+        }
+        let mut made = Vec::new();
+        for (p, c) in parts.into_iter().zip(code) {
+            let t = self.temp();
+            let _ = writeln!(body, "{} = {};", t, c);
+            self.hoisted.insert(p as *const Expr, t);
+            made.push(p as *const Expr);
+        }
+        Ok(made)
+    }
+
+    /// The parts of `e`, a fold of `name`, in the order written, or none where it has another shape:
+    /// a `+` or `-` chain headed by the state, a template or a spread (`{ ...s, k: v }`, `[...s, x]`)
+    /// reading it, and `set` or `push` of it, called or piped.
+    fn parts_of_fold<'e>(&mut self, e: &'e Expr, name: &str, out: &mut Vec<&'e Expr>) -> Result<(), QuilloError> {
+        let is = |x: &Expr| matches!(x, Expr::Ident(n, _) if n == name);
+        match e {
+            Expr::Binary(BinOp::Add | BinOp::Sub, ..) => {
+                let (mut head, mut rest) = (e, Vec::new());
+                while let Expr::Binary(BinOp::Add | BinOp::Sub, a, b, _) = head {
+                    rest.push(&**b);
+                    head = a;
+                }
+                if is(head) {
+                    out.extend(rest.into_iter().rev());
+                }
+            }
+            Expr::Template(ts) => {
+                let xs: Vec<&Expr> = ts.iter().filter_map(|p| if let TPart::Expr(x) = p { Some(x) } else { None }).collect();
+                if xs.iter().any(|x| is(x)) {
+                    out.extend(xs.into_iter().filter(|x| !is(x)));
+                }
+            }
+            // As the parser writes `{ ...s, k: v }` and `[...s, x]`.
+            Expr::Call(f, args, _) if matches!(&**f, Expr::Ident(n, _) if n == "__merge" || n == "__concat") => {
+                if args.iter().any(|x| is(x)) {
+                    out.extend(args.iter().filter(|x| !is(x)));
+                }
+            }
+            Expr::Call(f, args, _) if args.first().is_some_and(|x| is(x)) && self.is_builtin(f, &["B.set", "B.push"])? => out.extend(args[1..].iter()),
+            Expr::Pipe(head, f, _) if is(head) => {
+                if let Expr::Call(f, args, _) = &**f {
+                    if self.is_builtin(f, &["B.set", "B.push"])? {
+                        out.extend(args.iter());
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Whether `f` names one of these builtins here.
+    fn is_builtin(&mut self, f: &Expr, names: &[&str]) -> Result<bool, QuilloError> {
+        let Expr::Ident(n, _) = f else { return Ok(false) };
+        Ok(matches!(self.resolve(n)?, Resolved::Global(js, _) if names.contains(&js.as_str())))
     }
 
     /// `e` with its code in `out`, if it waits. Compiled again where it stands if not.
@@ -3561,8 +3633,13 @@ impl<'a> Compiler<'a> {
             }
             Expr::Binary(op, a, b, line) => {
                 self.line = *line;
+                let before = self.ctx().marks.len();
                 let x = self.expr(a)?;
-                let y = self.expr(b)?;
+                // `lag(k) == "a" && { v = "A" }`, the `if` it is (FEEDBACK55.md, Q-800; branch
+                // feedback55).
+                let from = if matches!(op, BinOp::And | BinOp::Or) { self.answer_in(a, before) } else { None };
+                let y = self.deciding(from, |s| s.expr(b))?;
+                self.may_have_left(from, from.is_some() && may_leave(b));
                 match op {
                     BinOp::And => {
                         let t = self.temp();
@@ -3588,8 +3665,11 @@ impl<'a> Compiler<'a> {
             }
             Expr::Coalesce(a, b) => {
                 let t = self.temp();
+                let before = self.ctx().marks.len();
                 let x = self.guarded_left(a)?;
-                let y = self.expr(b)?;
+                let from = self.answer_in(a, before);
+                let y = self.deciding(from, |s| s.expr(b))?;
+                self.may_have_left(from, from.is_some() && may_leave(b));
                 format!("((({t} = {x}) === null || {t} === undefined || {t} instanceof W.Err) ? {y} : {t})")
             }
             Expr::Pipe(lhs, rhs, line) => {
@@ -3685,7 +3765,7 @@ impl<'a> Compiler<'a> {
                     };
                     Ok::<_, QuilloError>((av, bv))
                 })?;
-                self.may_have_left(from, may_leave(a) || b.as_deref().is_some_and(may_leave));
+                self.may_have_left(from, from.is_some() && (may_leave(a) || b.as_deref().is_some_and(may_leave)));
                 format!("(W.truthy({}) ? {} : {})", cv, av, bv)
             }
             Expr::Match(subj, arms, line) => {
