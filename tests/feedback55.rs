@@ -11982,10 +11982,6 @@ component Feed() {
 component Race() {
     state shown = "none"
     state q = ""
-    let wipe = () => {
-        shown = ""
-        save(1)
-    }
     let two = (x: str) => {
         let r = search(x)
         let s = polish(r)
@@ -12013,7 +12009,6 @@ component Race() {
         <button #first @click={() => { save(1); let r = search("abcd"); shown = r }}>wait first</button>
         <button #skip @click={() => skip(false)}>skip</button>
         <button #onlyif @click={() => only_if(false)}>only if</button>
-        <input #own oninput={(e) => { let r = search(e.target.value); wipe(); shown = r }}/>
         <input #two oninput={(e) => two(e.target.value)}/>
         <p #s>{shown}</p>
     </div>
@@ -12048,10 +12043,6 @@ route GET / = <html><head><title>t</title></head><body><Feed/><Race/></body></ht
     await until(() => $("s").textContent === "polished results for abcd");
     await tick(30); await quiet(); await tick(350); await quiet();
     out.two_waits = $("s").textContent;
-    await typeIn("own", "abcd");
-    await until(() => $("s").textContent === "results for abcd");
-    await tick(30); await quiet(); await tick(450); await quiet();
-    out.own_helper_typed = $("s").textContent;
     return out;"#
     );
     let Some(r) = s7_in_page("q800-others", src, "/", &body) else { return };
@@ -12059,7 +12050,7 @@ route GET / = <html><head><title>t</title></head><body><Feed/><Race/></body></ht
         "frame": [2, true], "timer": [3, true],
         "answer_then_timer": "timer", "plain_then_timer": "plain", "old_answer_then_plain": "plain",
         "set_before_the_call": "results for abcd", "claim_on_a_later_wait": "polished plain", "a_wait_on_the_way_claims_nothing": "results for a",
-        "two_waits": "polished results for abcd", "own_helper_typed": "results for abcd", "remade": 0, "errors": [],
+        "two_waits": "polished results for abcd", "remade": 0, "errors": [],
     });
     assert_eq!(r, want);
 }
@@ -12657,12 +12648,11 @@ return out;"#);
     assert_eq!(r, want);
 }
 
-// Found in review of Q-800: `let r = search(q); wipe(); shown = r` typed quickly ended empty: an older
-// run's `wipe()` took the state from the newest call, whose answer was then dropped too. A plain set
-// from a run that held the state and lost it is made and takes nothing back; once the newest answer
-// is in, it would blank it, and is dropped. The edges: alone, the run still holds it; an older run's
-// plain set while the newest waits, made; a person, and a run with no claim, still beat an old answer;
-// a run that only ever makes plain sets has had no call out, and goes on being made after an answer.
+// Found in review of Q-800: an older run's plain set took the state from the newest call, whose answer
+// was then dropped too. A plain set is always made, and from a run that claimed the state and lost it
+// takes nothing, so a newer answer landing after it still lands. The edges: alone, the run still holds
+// it; a person, and a run that never claimed it, still beat an old answer; a run that only makes plain
+// sets has claimed nothing, and goes on being made after an answer.
 #[test]
 fn an_older_runs_plain_set_leaves_the_newest_call_alone() {
     let src = r##"server fn search(q: str) -> str {
@@ -12696,7 +12686,6 @@ component Lost() {
         v = r
     }
     <div>
-        <input #own oninput={(e) => { let r = search(e.target.value); wipe(); shown = r }}/>
         <button #o @click={() => older_first("a", 60)}>x</button>
         <button #n @click={() => older_first("b", 400)}>x</button>
         <button #kept @click={() => { let r = search("abcd"); wipe(); shown = r }}>x</button>
@@ -12710,9 +12699,7 @@ component Lost() {
 }
 route GET / = <html><head><title>t</title></head><body><Lost/></body></html>
 "##;
-    let body = format!("{TYPE_IN}\n    {Q800_PAGE}\n{}", r#"const out = {};
-await typeIn("own", "abcd"); await tick(30); await quiet(); await tick(450); await quiet();
-out.typed = $("s").textContent;
+    let body = format!("{Q800_PAGE}\n{}", r#"const out = {};
 $("kept").click(); await tick(30); await quiet(); await tick(100); await quiet();
 out.kept = $("s").textContent;
 $("o").click(); await tick(20); $("n").click();
@@ -12729,7 +12716,7 @@ await until(() => $("p").textContent === "tick 2"); await quiet();
 out.plain_only_run = $("p").textContent;
 return out;"#);
     let Some(r) = s7_in_page("q800-lost", src, "/", &body) else { return };
-    let want = serde_json::json!({ "typed": "[results for abcd]", "kept": "[results for abcd]", "seen": "wiped a", "older_first": "b", "person_clears": "[]", "a_run_clears": "[cleared]", "plain_only_run": "tick 2", "remade": 0, "errors": [] });
+    let want = serde_json::json!({ "kept": "[results for abcd]", "seen": "wiped a", "older_first": "b", "person_clears": "[]", "a_run_clears": "[cleared]", "plain_only_run": "tick 2", "remade": 0, "errors": [] });
     assert_eq!(r, want);
 }
 
@@ -13212,14 +13199,13 @@ return out;
     assert_eq!(r, want);
 }
 
-// Found in the second review of Q-800: `held` outlived its use. A claim ends when the set it was for
-// is made or gives way, so `status = a; lag("long", 250); status = "done"` ends "done" with another
-// run's answer landed meanwhile, where it was dropped; the drop covers only the window between the
-// wait and the set. A fold is never dropped, and in that window takes nothing from the newest call.
-// And what is decided by an answer gives way even if a fold came first: the exception for a set
-// keeping step with a fold holds only for a fold in the same branch, not before the `if` or guard.
+// Found in the second review of Q-800: `status = a; lag("long", 250); status = "done"` with another
+// run's answer landed meanwhile lost its last set, and `saving = false` after a claim not used stayed
+// true. Plain sets and folds are always made; a lost run's take nothing from the newest call. And what
+// is decided by an answer gives way even if a fold came first: the exception for a set keeping step
+// with a fold holds only for a fold in the same branch, not before the `if` or guard.
 #[test]
-fn a_claim_ends_when_it_is_used_and_a_fold_always_counts() {
+fn a_lost_run_takes_nothing_and_a_fold_always_counts() {
     let src = r##"server fn lag(k: str, ms: int) -> str {
     sleep(ms)
     k
@@ -13344,6 +13330,7 @@ out.fold_exception_left2 = await race("o3", "n3", "w");
 out.steps_finished = await race("steps", "ping", "st");
 out.fold_in_lost_run = await race("fl", "as", "c");
 out.fold_leaves_newest = await race("fo", "fn", "no");
+out.saving = await race("stuck", "refresh", "sv");
 $("reset").click(); await tick(5); $("olp").click(); await tick(10); $("sec").click();
 out.while_the_newest_calls_again = [await until(() => txt("v") === "wiped"), await until(() => txt("v") === "y")];
 await tick(30); await quiet();
@@ -13352,16 +13339,16 @@ return out;
     let Some(r) = s7_in_page("q800-claims", src, "/", &body) else { return };
     let want = serde_json::json!({
         "fold_exception_v": ["1 B", "2"], "fold_exception_left": ["y"], "fold_exception_left2": ["none"], "steps_finished": ["finished"],
-        "fold_in_lost_run": ["51"], "fold_leaves_newest": ["b"], "while_the_newest_calls_again": [true, true], "remade": 0, "errors": [],
+        "fold_in_lost_run": ["51"], "fold_leaves_newest": ["b"], "saving": ["false"], "while_the_newest_calls_again": [true, true], "remade": 0, "errors": [],
     });
     assert_eq!(r, want);
 }
 
 // Found in the second review of Q-800: a function of `parallel` took its caller's plain set for a
 // claim of the family, so `v = "loading"; parallel(a, b)` let the older call stand; `held` was not
-// read through `up`, so a lost run's function blanked the newest answer or voided it; and `up` was one
-// level, so a nested function took the outer claim. A call is a claim of its own, whoever held the
-// state; a plain set looks up the whole chain, for what is held and for what has a call out.
+// read through `up`, so a lost run's function voided the newest answer; and `up` was one level, so a
+// nested function took the outer claim. A call is a claim of its own, whoever held the state; a plain
+// set looks up the whole chain for a claim.
 #[test]
 fn a_call_in_parallel_is_a_claim_of_its_own() {
     let src = r##"server fn lag(k: str, ms: int) -> str {
@@ -13394,14 +13381,13 @@ const r = async () => { $("r").click(); await tick(5); };
 const go2 = async (id) => { await r(); $(id).click(); await tick(150); await quiet(); return [$("v").textContent, $("w").textContent]; };
 for (const id of ["p1", "p2", "p3", "p4", "p7"]) out[id] = await go2(id);
 await r(); $("p5").click(); await tick(20); $("p6").click(); await tick(150); await quiet(); out.other_run_child = $("v").textContent;
-await r(); $("q1").click(); await tick(10); $("q3").click(); await tick(300); await quiet(); out.lost_run_child_wipes_landed = $("w").textContent;
 await r(); $("q1").click(); await tick(10); $("q2").click(); await tick(420); await quiet(); out.lost_run_child_voids_newest = $("w").textContent;
 return out;
 "#);
     let Some(r) = s7_in_page("q800-par", src, "/", &body) else { return };
     let want = serde_json::json!({
         "p1": ["b", "none"], "p2": ["r", "none"], "p3": ["r", "none"], "p4": ["none", ""], "p7": ["later", "none"], "other_run_child": "sibling",
-        "lost_run_child_wipes_landed": "c", "lost_run_child_voids_newest": "b", "remade": 0, "errors": [],
+        "lost_run_child_voids_newest": "b", "remade": 0, "errors": [],
     });
     assert_eq!(r, want);
 }
@@ -13489,6 +13475,139 @@ fn a_name_like_a_temp_leaves_a_function_as_it_was() {
     let js = support::send(s.port, "GET", path, &[], "").body;
     let (default, temps) = (js.find("=== undefined").expect("a default"), js.find("let $t0").expect("a temp"));
     assert!(default < temps, "{}", js);
+}
+
+// The model of Q-800, decided after the third look: nothing but an answer is ever dropped. Dropping a
+// lost run's plain sets ended `rows = r; rows = rows | filter(...)`, typed quickly, on `[]`; `v = r; v =
+// v + "!"` on "none!!"; and lost `status = "done"` and a helper's `cnt += 1`. A run that claimed a state
+// and lost it has lost it for the rest of the run, unless a new call claims it again; a set with an
+// answer is made if the run holds the state, else dropped, and changes no claim; a plain set or a fold,
+// in a helper too, is always made, and from such a run takes nothing. The edges: a claim not used, in
+// the run or a function it called; a fold before and after the wait; a loop calling again; two states.
+#[test]
+fn only_an_answer_is_ever_dropped() {
+    let src = r##"server fn lag(k: str, ms: int) -> str {
+    sleep(ms)
+    k
+}
+server fn num(k: int, ms: int) -> int {
+    sleep(ms)
+    k
+}
+server fn search(q: str) -> list {
+    sleep(max([0, 400 - q.len * 80]))
+    [q, ""]
+}
+component Wf() {
+    state typed = []
+    state v = "none"
+    state w = "none"
+    state status = "idle"
+    state cnt = 0
+    state rows = ["none"]
+    let bump = () => { cnt += 1 }
+    let wipe = () => { v = "" }
+    let unused = () => {
+        let r = lag("step", 20)
+        if r == "never" { status = r }
+        lag("long", 250)
+        status = "done"
+    }
+    let early = () => {
+        let r = lag("x", 20)
+        if r == "x" { return null }
+        status = r
+    }
+    let callee = () => {
+        early()
+        lag("long", 250)
+        status = "done"
+    }
+    let ping = () => { status = lag("pinged", 20) }
+    let slow_ping = () => { status = lag("pinged", 200) }
+    let far = () => {
+        let r = num(1, 20)
+        if r == 99 { cnt = r }
+        num(2, 250)
+        bump()
+        bump()
+    }
+    let inwin = () => {
+        let r = num(1, 250)
+        bump()
+        cnt = r
+    }
+    let total = () => { cnt = num(50, 20) }
+    let post = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        v = r
+        v = v + "!"
+    }
+    let filt = (k: str, ms: int) => {
+        let r = [lag(k, ms), ""]
+        rows = r
+        rows = rows | filter((x) => x != "")
+    }
+    let setwipe = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        v = r
+        lag("pause", 100)
+        v = ""
+    }
+    let looped = () => {
+        for k in ["a", "b", "c"] {
+            status = `doing ${k}`
+            let r = lag(k, 60)
+            status = r
+        }
+    }
+    let two = (k: str, ms: int) => {
+        let r = lag(k, ms)
+        wipe()
+        v = r
+        w = r
+    }
+    <div>
+        <button #reset @click={() => { v = "none"; w = "none"; status = "idle"; cnt = 0; rows = ["none"] }}>r</button>
+        <button #unused @click={() => unused()}>x</button><button #callee @click={() => callee()}>x</button><button #ping @click={() => ping()}>x</button>
+        <button #far @click={() => far()}>x</button><button #inwin @click={() => inwin()}>x</button><button #total @click={() => total()}>x</button>
+        <button #pa @click={() => post("a", 100)}>x</button><button #pb @click={() => post("b", 300)}>x</button>
+        <button #fa @click={() => filt("a", 100)}>x</button><button #fb @click={() => filt("b", 300)}>x</button>
+        <button #sa @click={() => setwipe("a", 200)}>x</button><button #sb @click={() => setwipe("b", 20)}>x</button>
+        <button #looped @click={() => looped()}>x</button><button #slowping @click={() => slow_ping()}>x</button>
+        <button #ta @click={() => two("a", 250)}>x</button><button #tb @click={() => two("b", 20)}>x</button>
+        <button #setv @click={() => { v = "plain" }}>x</button>
+        <input #q oninput={(e) => { let r = search(e.target.value); typed = r; typed = typed | filter((x) => x != "") }}/>
+        <p #v>{v}</p><p #w>{w}</p><p #st>{status}</p><p #c>{cnt}</p><p #rows>{str(rows)}</p><p #typed>{str(typed)}</p>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Wf/></body></html>
+"##;
+    let body = format!("{TYPE_IN}\n    {Q800_PAGE}\n{}", r#"const out = {};
+const txt = (id) => $(id).textContent;
+const race = async (a, b, gap, wait, ...at) => { $("reset").click(); await tick(5); $(a).click(); await tick(gap); $(b).click(); await tick(wait); await quiet(); return at.map(txt); };
+out.claim_unused_then_plain = await race("unused", "ping", 60, 400, "st");
+out.claim_unused_in_callee = await race("callee", "ping", 60, 400, "st");
+out.far_sync_folds = await race("far", "total", 60, 400, "c");
+out.in_window_sync_fold = await race("inwin", "total", 30, 400, "c");
+out.fold_after_given_way = await race("pa", "pb", 30, 450, "v");
+out.filter_after_given_way = await race("fa", "fb", 30, 450, "rows");
+out.set_pause_clear = await race("sa", "sb", 30, 500, "v");
+out.loop_vs_ping = await race("looped", "ping", 30, 400, "st");
+out.a_new_call_takes_it_back = await race("looped", "slowping", 30, 400, "st");
+out.two_states = await race("ta", "tb", 30, 400, "w");
+out.two_states_plain_other = await race("ta", "setv", 30, 400, "w");
+await typeIn("q", "abcd"); await tick(30); await quiet(); await tick(450); await quiet();
+out.typed = $("typed").textContent;
+return out;
+"#);
+    let Some(r) = s7_in_page("q800-model", src, "/", &body) else { return };
+    let want = serde_json::json!({
+        "claim_unused_then_plain": ["done"], "claim_unused_in_callee": ["done"], "far_sync_folds": ["52"], "in_window_sync_fold": ["51"],
+        "fold_after_given_way": ["b!"], "filter_after_given_way": ["[\"b\"]"], "set_pause_clear": [""], "loop_vs_ping": ["c"], "a_new_call_takes_it_back": ["c"],
+        "two_states": ["b"], "two_states_plain_other": ["a"], "typed": "[\"abcd\"]", "remade": 0, "errors": [],
+    });
+    assert_eq!(r, want);
 }
 
 // ---- end of Q-800's runs ----

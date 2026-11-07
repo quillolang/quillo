@@ -359,7 +359,7 @@ What runs at the same time comes out as if done one after another (Q-796 to Q-80
   set or claimed that state since, so a search box ends on the answer for what was typed
   last. Plain sets after a wait are made and still claim, and a function's own helpers are
   its run, so their waits take nothing from it; a plain set from a run that lost the state
-  takes nothing, and cannot blank the newest answer. A set that reads the state it sets is
+  is made and takes nothing, so the newest answer still lands. A set that reads the state it sets is
   a fold (`n += 1`, `xs = xs + [x]`, `s = f(s)`), always made. In one with a wait, every
   part runs where it is written and only the read of the state moves after the waits, so
   `n += count()` three times in one tick counts three (Q-800).

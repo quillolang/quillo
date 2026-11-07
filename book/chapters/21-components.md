@@ -1430,10 +1430,11 @@ and `n = n + check()? + charge(1)` makes no charge if `check()` stops. That is s
 and `-=`, and for `=` forms headed by the state (`n + f()`, a template, `...state` in a
 list or map, `set` and `push`). Other shapes read the state first.
 
-Between the wait a run lost and the set that call was for, a plain set of that state takes
-nothing, and once the newest answer shows it is dropped, so an older run cannot blank it.
-Write the set in the function that waited: an answer handed to a helper as an argument
-counts as plain there, and a fold made by a plain helper inside that window can be dropped.
+Only a set with an answer is ever dropped. Plain sets and folds are always made; from a run
+that lost the state they take nothing, so the newest answer still lands. So clear a state
+before the wait, not after it: in `let r = search(q); wipe(); shown = r`, an older run's
+`wipe()` can blank what the newest answer showed. Write the set in the function that waited:
+an answer handed to a helper as an argument counts as plain there.
 
 In a function that waits, a hole of markup may wait too: `let el = <b>{load()}</b>`. It is
 worked out first, before the markup is made and before the holes around it, once, and does

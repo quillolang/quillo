@@ -3118,8 +3118,7 @@ impl<'a> Compiler<'a> {
                             let _ = writeln!(body, "W.to({js}, {v}, {c});");
                         }
                         (Resolved::State(js), None) => {
-                            let set = if fold && self.ctx().is_async { "W.fold" } else { "W.put" };
-                            let _ = writeln!(body, "{}({}, {});", set, js, v);
+                            let _ = writeln!(body, "W.put({}, {});", js, v);
                         }
                         _ => {
                             let _ = writeln!(body, "{} = {};", cur, v);
