@@ -9394,3 +9394,1047 @@ fn f_review_a_program_of_tools_alone_is_served() {
     drop(s);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ---- What was added since v0.8.0 and no test ran (FEEDBACK56.md; branch feedback56) ------------
+//
+// Each test reaches lines the coverage run at dea83a8 found unrun, the way a user, a client or a
+// service could, and holds what happens there.
+
+/// `quillo mcp <args>` in `d`, its stdin `stdin`: its status, stdout and stderr, under `WAIT`.
+fn mcp_run(d: &Path, args: &[&str], stdin: std::process::Stdio) -> (Option<i32>, String, String) {
+    use std::io::Read as _;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("mcp")
+        .args(args)
+        .current_dir(d)
+        .stdin(stdin)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (mut out, mut err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let mut g = support::Guard::new(child);
+    let deadline = Instant::now() + WAIT;
+    let code = loop {
+        if let Some(s) = g.0.try_wait().unwrap() {
+            break s.code();
+        }
+        assert!(Instant::now() < deadline, "quillo mcp {:?} did not end", args);
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (mut o, mut e) = (String::new(), String::new());
+    let _ = out.read_to_string(&mut o);
+    let _ = err.read_to_string(&mut e);
+    (code, o, e)
+}
+
+#[test]
+fn c1_coverage_quillo_mcp_says_why_it_does_not_start() {
+    let d = door_dir("cov-start");
+    std::fs::write(d.join("broken.qwe"), "/// Seven.\nfn mcp clock() -> int with time = 7 +\nlet x = (\n").unwrap();
+    std::fs::write(d.join("vars.env"), "GREETING=hi\n").unwrap();
+    for (args, code, said) in [
+        (&["main.qwe", "--policy"][..], 2, "quillo: `--policy` needs a value"),
+        (&["main.qwe", "--policy", "nothere.toml"][..], 2, "quillo: cannot read the policy nothere.toml"),
+        (&["main.qwe", "--env-file", "nothere.env"][..], 2, "quillo: cannot read nothere.env"),
+        // A program that does not parse: what it is, and which Quillo read it.
+        (&["broken.qwe"][..], 1, "\nnote: this is quillo "),
+    ] {
+        let (status, out, err) = mcp_run(&d, args, std::process::Stdio::null());
+        assert_eq!(status, Some(code), "{:?}: {}", args, err);
+        assert!(out.is_empty() && err.contains(said), "{:?}: {}{}", args, out, err);
+    }
+    // The settings file that is there: the door starts, reads stdin to its end, and ends.
+    let (status, out, err) = mcp_run(&d, &["main.qwe", "--env-file", "vars.env"], std::process::Stdio::null());
+    assert_eq!((status, out.as_str()), (Some(0), ""), "{}", err);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn d_coverage_quillo_docs_help_is_the_usage() {
+    let d = dir("d-cov-help", CLEAN);
+    for args in [&["docs", "--help"][..], &["docs", "main.qwe", "-h"][..]] {
+        let (ok, out, err) = quillo(&d, args);
+        assert!(ok && out.starts_with("Quillo — a small web language") && out.contains("quillo docs <file.qwe>") && err.is_empty(), "{:?}: {}{}", args, out, err);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c1_coverage_a_policys_max_body_is_said_in_bytes_where_it_is_no_whole_kib() {
+    let d = door_dir("cov-bytes");
+    let padded = |id: i64, len: usize| {
+        let m = request(json!(id), "tools/list", json!({}));
+        format!("{}{}", m, " ".repeat(len - m.len()))
+    };
+    // The limit and one past it, under 1 KiB, at it, and past it but no whole KiB.
+    for (max, said, most) in [("1000", "1000 bytes", 1000), ("\"1KB\"", "1 KiB", 1024), ("\"1500B\"", "1500 bytes", 1500)] {
+        std::fs::write(d.join("limits.toml"), format!("[limits]\nmax_body = {}\n", max)).unwrap();
+        let mut door = Stdio::start(&d, &["main.qwe", "--policy", "limits.toml"]);
+        assert_eq!(door.ask(&padded(1, most))["id"], json!(1), "{}", max);
+        assert_eq!(door.refusal(&padded(2, most + 1)), (None, -32600, format!("Invalid request: a message is at most {}", said)), "{}", max);
+        door.close();
+        assert_eq!(door.ended(), Some(0));
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c1_coverage_the_door_ends_when_its_client_stops_reading() {
+    // stdio: the server MAY end by closing its output. A client that closed its end of stdout ends
+    // the door at the next answer, its stdin still open.
+    let d = door_dir("cov-gone");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .args(["mcp", "main.qwe"])
+        .current_dir(&d)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    drop(child.stdout.take());
+    let mut g = support::Guard::new(child);
+    stdin.write_all(format!("{}\n", request(json!(1), "tools/list", json!({}))).as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    let deadline = Instant::now() + WAIT;
+    let status = loop {
+        if let Some(s) = g.0.try_wait().unwrap() {
+            break s.code();
+        }
+        assert!(Instant::now() < deadline, "the door went on with no one reading its answers");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status, Some(0));
+    drop(stdin);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(unix)]
+#[test]
+fn c1_coverage_a_stdin_that_cannot_be_read_ends_the_door_saying_why() {
+    // Started with a folder for its stdin (`quillo mcp main.qwe < folder`): said, status 1.
+    let d = door_dir("cov-stdin");
+    std::fs::create_dir_all(d.join("folder")).unwrap();
+    let folder = std::fs::File::open(d.join("folder")).unwrap();
+    let (status, out, err) = mcp_run(&d, &["main.qwe"], std::process::Stdio::from(folder));
+    assert_eq!(status, Some(1), "{}", err);
+    assert!(out.is_empty() && err.contains("quillo: cannot read stdin: "), "{}{}", out, err);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+const COV_RESULTS: &str = r#"let f = (x) => x
+
+/// A map with a function in it.
+fn mcp holds_fn() with time = { f: f }
+
+/// The same, typed, deeper.
+fn mcp holds_fn_typed() -> map with time = { inner: [1, f] }
+
+/// No function in it.
+fn mcp holds_none() -> map with time = { f: 1 }
+
+/// A question as long as asked.
+fn mcp long_question(n: int) -> bool with time = confirm(repeat("x", n))
+"#;
+
+#[test]
+fn c1_coverage_what_cannot_go_to_the_client_is_said_so() {
+    let d = dir("c1-cov-results", COV_RESULTS);
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    // A function has no JSON: `internal error`, and where it is in the log.
+    let r = door.call("holds_fn", json!({}));
+    assert_eq!((r["isError"].clone(), r["content"][0]["text"].clone()), (json!(true), json!("internal error")), "{}", r);
+    door.says("quillo: error in tool `holds_fn`: its result cannot be written as JSON: `f` is a function, which cannot be written as JSON");
+    let r = door.call("holds_fn_typed", json!({}));
+    assert_eq!((r["isError"].clone(), r["content"][0]["text"].clone()), (json!(true), json!("internal error")), "{}", r);
+    door.says("quillo: error in tool `holds_fn_typed`: its result cannot be written as JSON: `inner[1]` is a function, which cannot be written as JSON");
+    assert_eq!(door.call("holds_none", json!({}))["structuredContent"], json!({ "f": 1 }));
+    // A question longer than a client takes: said so, never cut; one a client takes is asked.
+    let a = door.ask(&e_call("long", "long_question", json!({ "n": 6_000_000 }), &caps(true), None, None));
+    assert_eq!(text_of(&a["result"]), (true, "the result is too large for the client: more than 10 MiB of JSON".into()), "{}", a["result"]["resultType"]);
+    door.says("quillo: error in tool `long_question`: its result is more than 10 MiB of JSON");
+    let a = door.ask(&e_call("short", "long_question", json!({ "n": 2000 }), &caps(true), None, None));
+    assert_eq!(asked_of(&a["result"]).1["params"]["message"], json!("x".repeat(2000)));
+    door.close();
+    assert_eq!(door.ended(), Some(0));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn b1_coverage_mcp_call_refuses_one_argument_too_many() {
+    // `mcp::call`, the door's call for a program that embeds Quillo: as many as the tool takes,
+    // one more, and one fewer.
+    let d = dir("b1-cov-args", "/// One.\nfn mcp one(a: int) -> int with time = a\n");
+    let tools = mcp::of_source(&d.join("main.qwe")).unwrap();
+    let mut it = Interp::new(&d);
+    it.load_file(&d.join("main.qwe")).unwrap();
+    let one = the(&tools, "one");
+    let said = |r: Result<Result<Q, String>, quillo::interp::Ctrl>| match r {
+        Ok(Ok(v)) => Ok(v.display()),
+        Ok(Err(why)) => Err(why),
+        Err(_) => Err("it failed".to_string()),
+    };
+    assert_eq!(said(mcp::call(&mut it, one, vec![Q::Int(1)], 0)), Ok("1".to_string()));
+    assert_eq!(said(mcp::call(&mut it, one, vec![Q::Int(1), Q::Int(2)], 0)), Err("`one` takes 1 arguments, got 2".to_string()));
+    assert_eq!(said(mcp::call(&mut it, one, vec![], 0)), Err("missing argument `a` for `one`".to_string()));
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+const COV_ASK: &str = r#"db.open(":memory:")
+db.exec("create table posts (id integer primary key, title text not null)")
+
+/// Deletes the posts, once the user says yes twice.
+fn mcp purge() -> bool with db {
+    let n = db.one("select count(*) as n from posts").n
+    if !confirm(`Delete ${n} posts?`) { return false }
+    confirm("Really?")
+}
+
+/// Adds a post: how many there are.
+fn mcp add_post() -> int with db {
+    db.exec("insert into posts (title) values ('p')")
+    db.one("select count(*) as n from posts").n
+}
+"#;
+
+#[test]
+fn e_coverage_a_question_answered_that_then_changed_is_asked_again() {
+    let d = dir("e-cov-changed", COV_ASK);
+    let mut door = EDoor::Stdio(Stdio::start(&d, &["main.qwe"]));
+    let message = |r: &Value| {
+        let (k, q) = asked_of(r);
+        (k, q["params"]["message"].as_str().unwrap_or_default().to_string())
+    };
+    let r = door.result("purge", json!({}), true, None, None);
+    assert_eq!(message(&r), ("q1".to_string(), "Delete 0 posts?".to_string()));
+    let r = door.result("purge", json!({}), true, r["requestState"].as_str(), Some(one("q1", yes())));
+    assert_eq!(message(&r), ("q2".to_string(), "Really?".to_string()));
+    let state = r["requestState"].as_str().unwrap().to_string();
+    // A post added meanwhile: the first question now says another number, so the yes given to it
+    // is not this one's, and it is asked again, first.
+    assert_eq!(f_structured(&door.result("add_post", json!({}), true, None, None))["result"], json!(1));
+    let r = door.result("purge", json!({}), true, Some(&state), Some(one("q2", yes())));
+    assert_eq!(message(&r), ("q1".to_string(), "Delete 1 posts?".to_string()), "{}", r);
+    assert_eq!(state_payload(r["requestState"].as_str().unwrap())["asked"], json!([]));
+    let r = door.result("purge", json!({}), true, r["requestState"].as_str(), Some(one("q1", yes())));
+    assert_eq!(message(&r), ("q2".to_string(), "Really?".to_string()));
+    let r = door.result("purge", json!({}), true, r["requestState"].as_str(), Some(one("q2", yes())));
+    assert_eq!(f_structured(&r)["result"], json!(true), "{}", r);
+    drop(door);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+const COV_LOCALE: &str = r#"db.open(":memory:")
+db.exec("create table w (v int)")
+translations({ en: { hi: "Hi" }, fr: { hi: "Salut" } })
+locale_from((request) => confirm("In French?") ? "fr" : "en")
+
+route POST /login ? { user: str } = set_session({ user: user })
+route GET /writes = str(db.one("select count(*) as n from w").n)
+
+/// Greets, and writes it down; or asks first, when told to.
+fn mcp greet(ask_first: bool) -> str with db {
+    if ask_first { return confirm("Greet?") ? "yes" : "no" }
+    let g = t("hi")
+    db.exec("insert into w (v) values (1)")
+    g
+}
+"#;
+
+#[test]
+fn e_coverage_nothing_runs_once_a_call_stopped_where_a_callback_took_the_stop() {
+    // The locale rule asks, in a tool's call that may ask; `t` takes no error from the rule, and
+    // goes on with the default locale. The call has stopped all the same: the write after it is
+    // never made, and the rule's question is the answer.
+    let d = dir("e-cov-locale", COV_LOCALE);
+    let s = Logged::start(&d.join("main.qwe"), &["--max-tool-calls", "100000"], &[]);
+    let mut door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
+    let writes = || support::send(s.port, "GET", "/writes", &[], "").body;
+    let r = door.result("greet", json!({ "ask_first": false }), true, None, None);
+    let (k, q) = asked_of(&r);
+    assert_eq!((k.as_str(), q["params"]["message"].clone()), ("q1", json!("In French?")), "{}", r);
+    assert_eq!(writes(), "0");
+    // Answered: the rule has its answer, and the call goes on to its end.
+    let r = door.result("greet", json!({ "ask_first": false }), true, r["requestState"].as_str(), Some(one("q1", yes())));
+    assert_eq!(f_structured(&r)["result"], json!("Salut"), "{}", r);
+    assert_eq!(writes(), "1");
+    // A client that cannot ask: closed, and nothing written.
+    let r = door.result("greet", json!({ "ask_first": false }), false, None, None);
+    assert_eq!(text_of(&r), (true, "this needs the user's yes, and this client cannot ask".to_string()), "{}", r);
+    assert_eq!(writes(), "1");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+const COV_UNREACHED: &str = r#"service mcp /billing = "billing.qwe" { retries: 0, timeout: "2s" }
+
+/// Reads billing's total where it can, then asks.
+fn mcp total_then_ask() -> str with http {
+    let b = billing
+    let said = error(b.total()) ?? "failed"
+    confirm("Go on?") ? said : "no"
+}
+"#;
+
+#[test]
+fn f_coverage_a_call_that_was_never_sent_is_no_change() {
+    // Billing cannot be reached: its call was not sent, so it changed nothing, and the question
+    // after it is asked (one that was sent and not answered is a change: `f_review_a_service_says_
+    // only_what_it_did_never_an_answer_to_the_apps_question`).
+    f_signing();
+    let d = dir("f-cov-unsent", COV_UNREACHED);
+    std::fs::write(d.join("billing.qwe"), F_BILLING).unwrap();
+    let nobody = format!("http://127.0.0.1:{}", support::free_port());
+    let mut door = EDoor::Stdio(Stdio::start_env(&d, &["main.qwe"], &[("QUILLO_SERVICE_BILLING", &nobody)]));
+    let r = door.result("total_then_ask", json!({}), true, None, None);
+    assert_eq!(asked_of(&r).1["params"]["message"], json!("Go on?"), "{}", r);
+    let r = door.result("total_then_ask", json!({}), true, r["requestState"].as_str(), Some(one("q1", yes())));
+    let said = f_structured(&r)["result"].as_str().unwrap_or_default().to_string();
+    assert!(said.contains("billing") && said != "failed", "{}", r);
+    drop(door);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+const COV_BILLING_APP: &str = r#"service mcp /billing = "billing.qwe"
+route POST /login ? { user: str } = set_session({ user: user })
+
+/// Asks first, then refunds through billing, which asks too.
+fn mcp first_refund(c: int) -> int with http {
+    if !confirm("First?") { return 0 }
+    billing.refund(c)
+}
+"#;
+
+#[test]
+fn f_coverage_billings_answers_come_back_through_the_apps_door() {
+    let d = dir("f-cov-said", COV_BILLING_APP);
+    std::fs::write(d.join("billing.qwe"), F_BILLING).unwrap();
+    let s = Logged::start(&d.join("main.qwe"), &["--max-tool-calls", "100000"], &[]);
+    let doors = vec![EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[]))), EDoor::Stdio(Stdio::start(&d, &["main.qwe"]))];
+    let charge = json!({ "cents": 5 });
+    for mut door in doors {
+        let asked = |door: &mut EDoor| door.result("billing.charge", charge.clone(), true, None, None)["requestState"].as_str().unwrap().to_string();
+        // Billing's question dismissed, declined: the call's error says which.
+        let state = asked(&mut door);
+        let r = door.result("billing.charge", charge.clone(), true, Some(&state), Some(one("q1", json!({ "action": "cancel" }))));
+        assert_eq!(text_of(&r), (true, "the user did not answer: How should it be paid?".to_string()), "{}", r);
+        let state = asked(&mut door);
+        let r = door.result("billing.charge", charge.clone(), true, Some(&state), Some(one("q1", no())));
+        assert_eq!(text_of(&r), (true, "the user declined to answer: How should it be paid?".to_string()), "{}", r);
+        // An answer billing's question does not take: refused as one to the app's own is.
+        let state = asked(&mut door);
+        let (_, code, message) = door.refused("billing.charge", charge.clone(), Some(&state), Some(one("q1", json!({ "action": "accept", "content": {} }))));
+        assert_eq!((code, message.as_str()), (-32602, "Invalid params: inputResponses.q1 accepts with no `choice` in its content"));
+        // The app's question, then billing's: billing's is the second, after the app's answer.
+        let (r, asked) = door.answered("first_refund", json!({ "c": 3 }), &|_| yes());
+        let messages: Vec<Value> = asked.iter().map(|q| q["params"]["message"].clone()).collect();
+        assert_eq!(messages, [json!("First?"), json!("Refund 3 cents?")], "{}", r);
+        assert_eq!(f_structured(&r)["result"], json!(3), "{}", r);
+    }
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn f_coverage_billing_reads_only_an_asking_of_the_shape_its_app_sends() {
+    let (d, mut it) = f_billing_here("f-cov-wire");
+    let refund = |asking: Value| json!({ "args": [2], "mcp": { "asking": asking } });
+    let with = |k: &str, v: Value| {
+        let mut a = f_asking(true, false);
+        a[k] = v;
+        a
+    };
+    // What the app's door never sends: refused, and nothing runs.
+    for (k, v) in [("wrote", json!(5)), ("answers", json!([5])), ("answers", json!([[5, true]])), ("pending", json!("x")), ("pending", json!([5, null]))] {
+        let (status, r) = f_signed(&mut it, "refund", "", &refund(with(k, v.clone())));
+        assert!(status == 400 && r["error"].as_str().unwrap_or_default().starts_with("a call that carries a tool's call"), "{} {}: {} {}", k, v, status, r);
+    }
+    // What it sends: an answer that is another's (null), billing's question then the call's
+    // second; the call's change (text), billing's question after it refused.
+    let mut a = with("answers", json!([null]));
+    a["reached"] = json!(1);
+    let (_, r) = f_signed(&mut it, "refund", "", &refund(a));
+    assert_eq!((r["stopped"].clone(), r["asking"]["reached"].clone(), r["asking"]["kept"].clone()), (json!(true), json!(2), json!(1)), "{}", r);
+    let (_, r) = f_signed(&mut it, "refund", "", &refund(with("wrote", json!("`db.exec`"))));
+    assert_eq!(r["asking"]["stop"], json!({ "failed": true }), "{}", r);
+    // An answer kept from a round before is the person's as sent, read again by its question:
+    // declined, the call stops there; a choice, it goes on to the next question.
+    let charge = |asking: Value| json!({ "tool": "charge", "arguments": { "cents": 5 }, "mcp": { "asking": asking, "session": {}, "owner": null, "client": null } });
+    let (_, r) = f_by_app(&mut it, "charge", "", &charge(f_asking(true, false)));
+    let d1 = r["asking"]["stop"]["ask"]["digest"].as_str().unwrap().to_string();
+    let (_, r) = f_by_app(&mut it, "charge", "", &charge(with("answers", json!([[d1, { "action": "decline" }]]))));
+    assert_eq!(r["asking"]["stop"], json!({ "said": { "declined": "How should it be paid?" } }), "{}", r);
+    let (_, r) = f_by_app(&mut it, "charge", "", &charge(with("answers", json!([[d1, { "action": "accept", "content": { "choice": "card" } }]]))));
+    assert_eq!((r["asking"]["reached"].clone(), r["asking"]["kept"].clone(), r["asking"]["stop"]["ask"]["question"]["text"].clone()), (json!(2), json!(1), json!("Charge 5 cents?")), "{}", r);
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// `FakeBilling::start` for an app of `main`'s source (`F_DANGER` there).
+fn fake_billing_of(name: &str, main: &str, env: &[(&str, &str)]) -> FakeBilling {
+    f_signing();
+    let mode = Arc::new(Mutex::new(String::from("clean")));
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let (m, b) = (mode.clone(), bodies.clone());
+    let fake = FakeService::start(Arc::new(move |_, body| {
+        b.lock().unwrap().push(body.to_string());
+        let mode = m.lock().unwrap().clone();
+        f_fake_answer(&mode, body)
+    }));
+    let d = dir(name, main);
+    std::fs::write(d.join("billing.qwe"), F_BILLING).unwrap();
+    let s = Logged::start(&d.join("main.qwe"), &["--service-url", &format!("billing=http://127.0.0.1:{}", fake.port), "--max-tool-calls", "100000"], env);
+    let door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
+    FakeBilling { mode, bodies, s, door, d, _fake: fake }
+}
+
+#[test]
+fn f_coverage_what_the_app_takes_of_billings_reply_and_question() {
+    let mut f = FakeBilling::start("f-cov-reply", &[]);
+    let reply = |change: &dyn Fn(&mut Value)| {
+        let mut r = f_clean_reply();
+        change(&mut r);
+        format!("reply:{}", r)
+    };
+    let stopped = |stop: Value| {
+        let mut r = f_clean_reply();
+        (r["reached"], r["stop"]) = (json!(1), stop);
+        format!("stopped:{}", r)
+    };
+    let question = |q: Value| stopped(json!({ "ask": { "digest": "ab".repeat(16), "question": q } }));
+    // Not what Quillo sends: the call stops, `internal error`, and the log says why. Each case is
+    // run, and all that came out otherwise are said together.
+    let cases: Vec<(&str, String)> = vec![
+        ("no kept", reply(&|r| drop(r.as_object_mut().unwrap().remove("kept")))),
+        ("a change that is no text", reply(&|r| r["wrote"] = json!(5))),
+        ("a default that is no text", reply(&|r| r["defaults"] = json!([["Which?", 5]]))),
+        ("a default that is no pair", reply(&|r| r["defaults"] = json!([5]))),
+        ("a stop that is no object", stopped(json!(5))),
+        ("an empty stop", stopped(json!({}))),
+        ("two stops", stopped(json!({ "failed": true, "refused": "x" }))),
+        ("said nothing", stopped(json!({ "said": {} }))),
+        ("cannot ask, to a client that can", stopped(json!({ "said": { "cannot": true } }))),
+        ("declined and dismissed", stopped(json!({ "said": { "declined": "a", "dismissed": "b" } }))),
+        ("a stop Quillo has not", stopped(json!({ "other": 1 }))),
+        ("a refusal that is no text", stopped(json!({ "refused": 5 }))),
+        ("a question with more", question(json!({ "text": "Pay?", "colour": "red" }))),
+        ("a choice that is no pair", question(json!({ "text": "Pay?", "choices": [["a"]] }))),
+        ("a default not among the choices", question(json!({ "text": "Pay?", "choices": [["a", "A"]], "default": "b" }))),
+        ("a default that is no text", question(json!({ "text": "Pay?", "choices": [["a", "A"]], "default": 5 }))),
+        ("no choices", question(json!({ "text": "Pay?", "choices": [] }))),
+        ("choices that are no list", question(json!({ "text": "Pay?", "choices": "a" }))),
+    ];
+    let mut wrong = Vec::new();
+    for (what, mode) in &cases {
+        f.set(mode);
+        let r = f.door.result("danger", json!({}), true, None, None);
+        if text_of(&r) != (true, "internal error".to_string()) {
+            wrong.push(format!("{}: {}", what, r));
+        }
+    }
+    assert!(wrong.is_empty(), "{:#?}", wrong);
+    f.s.says("quillo: service billing: what `total` gave back of the tool's call is not what Quillo sends, so the call stops");
+    // What Quillo sends: choices with no default, the form with none; billing's question dismissed;
+    // a refusal of the person's answer there, a protocol error with its reason, 500 characters at
+    // most.
+    f.set(&question(json!({ "text": "Pay how?", "choices": [["card", "By card"], ["cash", "In cash"]], "default": null })));
+    let r = f.door.result("danger", json!({}), true, None, None);
+    assert_eq!(asked_of(&r).1["params"]["requestedSchema"]["properties"]["choice"], json!({ "type": "string", "oneOf": [{ "const": "card", "title": "By card" }, { "const": "cash", "title": "In cash" }] }), "{}", r);
+    f.set(&stopped(json!({ "said": { "dismissed": "Pay now?" } })));
+    assert_eq!(text_of(&f.door.result("danger", json!({}), true, None, None)), (true, "the user did not answer: Pay now?".to_string()));
+    f.set(&stopped(json!({ "refused": "r".repeat(600) })));
+    let (_, code, message) = f.door.refused("danger", json!({}), None, None);
+    assert_eq!((code, message), (-32602, format!("Invalid params: {}...", "r".repeat(500))));
+}
+
+const COV_TWICE: &str = r#"db.open(":memory:")
+service mcp /billing = "billing.qwe"
+route POST /login ? { user: str } = set_session({ user: user })
+
+/// Reads billing's total, then asks twice.
+fn mcp twice_after() -> str with http {
+    billing.total()
+    if !confirm("One?") { return "no" }
+    confirm("Two?") ? "both" : "one"
+}
+"#;
+
+#[test]
+fn f_coverage_answers_billing_says_it_did_not_keep_are_asked_again() {
+    // Billing runs first in the call, and is sent the answers so far; one that says it kept fewer
+    // than it was sent (its run took another way) has the app ask its own questions again.
+    let mut f = fake_billing_of("f-cov-kept", COV_TWICE, &[]);
+    f.set("echo");
+    let r = f.door.result("twice_after", json!({}), true, None, None);
+    assert_eq!(asked_of(&r).1["params"]["message"], json!("One?"));
+    let r = f.door.result("twice_after", json!({}), true, r["requestState"].as_str(), Some(one("q1", yes())));
+    assert_eq!(asked_of(&r).1["params"]["message"], json!("Two?"));
+    let state = r["requestState"].as_str().unwrap().to_string();
+    f.set(&format!("reply:{}", f_clean_reply()));
+    let r = f.door.result("twice_after", json!({}), true, Some(&state), Some(one("q2", yes())));
+    let (k, q) = asked_of(&r);
+    assert_eq!((k.as_str(), q["params"]["message"].clone()), ("q1", json!("One?")), "{}", r);
+    assert_eq!(state_payload(r["requestState"].as_str().unwrap())["asked"], json!([]));
+    // Billing keeping them: the call goes on to its end.
+    f.set("echo");
+    let r = f.door.result("twice_after", json!({}), true, r["requestState"].as_str(), Some(one("q1", yes())));
+    let r = f.door.result("twice_after", json!({}), true, r["requestState"].as_str(), Some(one("q2", yes())));
+    assert_eq!(f_structured(&r)["result"], json!("both"), "{}", r);
+}
+
+#[test]
+fn f_coverage_a_tools_call_to_billing_needs_the_key_its_app_signs_with() {
+    // No key to sign billing's tools' calls with: refused before anything is sent, said why.
+    let mut f = FakeBilling::start("f-cov-nokey", &[]);
+    let r = f.door.result("billing.own_only", json!({}), true, None, None);
+    assert_eq!(text_of(&r), (true, "internal error".to_string()), "{}", r);
+    f.s.says("quillo: error in tool `billing.own_only`: service billing: QUILLO_APP_KEY_BILLING is not set, the key its tools' calls are signed with (`quillo run --split` sets it)");
+    assert!(f.bodies.lock().unwrap().is_empty());
+    // Its server fns are called all the same, signed with the services' secret.
+    f.set("clean");
+    assert_eq!(f_structured(&f.door.result("older", json!({}), false, None, None))["result"], json!("no error"));
+    assert_eq!(f.bodies.lock().unwrap().len(), 1);
+}
+
+const COV_SERVICE: &str = r#"db.open(":memory:")
+db.exec("create table s (id integer primary key)")
+let hidden = { w: () => db.exec("insert into s default values") }
+
+/// Writes, then asks, where the checker cannot see the write.
+fn mcp late_ask() -> bool with db {
+    hidden.w()
+    confirm("Then?")
+}
+
+/// Asks only when told to.
+fn mcp maybe(b: bool) -> str with time = b ? (confirm("Sure?") ? "yes" : "no") : "skipped"
+
+/// Wakes the pages watching the news.
+fn mcp announce() -> int {
+    publish("news")
+    1
+}
+"#;
+
+#[test]
+fn f_coverage_billings_answer_where_its_app_sent_no_asking_and_what_it_published() {
+    f_signing();
+    let d = support::temp_dir("feedback56-f-cov-settled");
+    std::fs::write(d.join("billing.qwe"), COV_SERVICE).unwrap();
+    let mut it = Interp::new(&d);
+    it.is_service = true;
+    it.load_file(&d.join("billing.qwe")).unwrap();
+    mcp::open_door(&mut it, &d.join("billing.qwe"), None);
+    let tool = |name: &str, args: Value| json!({ "tool": name, "arguments": args, "mcp": { "asking": null, "session": {}, "owner": null, "client": null } });
+    // A question refused as it runs, after a change: the call's error, and no asking to take back.
+    let (status, r) = f_by_app(&mut it, "late_ask", "", &tool("late_ask", json!({})));
+    assert_eq!((status, r["tool"].clone(), r["asking"].clone()), (200, json!({ "content": [{ "type": "text", "text": "internal error" }], "isError": true }), Value::Null), "{}", r);
+    // One that asks nothing this time, and one that would.
+    let (_, quiet) = f_by_app(&mut it, "maybe", "", &tool("maybe", json!({ "b": false })));
+    assert_eq!(quiet["tool"]["structuredContent"], json!({ "result": "skipped" }), "{}", quiet);
+    let (_, r) = f_by_app(&mut it, "maybe", "", &tool("maybe", json!({ "b": true })));
+    assert_eq!(r["tool"]["content"][0]["text"], json!("this needs the user's yes, and this client cannot ask"), "{}", r);
+    // What it published goes back with its answer, for its app's pages; nothing when it published
+    // nothing.
+    let (_, r) = f_by_app(&mut it, "announce", "", &tool("announce", json!({})));
+    assert_eq!((r["tool"]["structuredContent"].clone(), r["published"].clone()), (json!({ "result": 1 }), json!(["news"])), "{}", r);
+    assert!(quiet.get("published").is_none(), "{}", quiet);
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn f_coverage_a_copy_that_joins_with_its_apps_key_is_sent_its_tools_calls() {
+    // `quillo run billing.qwe --as-service --join ...` holding its app's key proves it as it joins,
+    // and from then on billing's tools run there.
+    f_signing();
+    let d = dir("f-cov-join", "service mcp /billing = \"billing.qwe\" { timeout: \"5s\" }\nroute POST /login ? { user: str } = set_session({ user: user })\n");
+    std::fs::write(d.join("billing.qwe"), "/// Where billing runs.\nfn mcp place() -> str with env = env(\"BILLING_PLACE\", \"in the app\")\n").unwrap();
+    let app = Logged::start(&d.join("main.qwe"), &[], &[("QUILLO_APP_KEY_BILLING", F_APP_KEY)]);
+    let mut door = EDoor::Http(app.port, http_door::As::Cookie(http_door::login(app.port, "ana", &[])));
+    assert_eq!(f_structured(&door.result("billing.place", json!({}), true, None, None))["result"], json!("in the app"));
+    let join = format!("http://127.0.0.1:{}", app.port);
+    let copy = Logged::start(&d.join("billing.qwe"), &["--as-service", "--service-name", "billing", "--join", &join], &[("QUILLO_APP_KEY", F_APP_KEY), ("BILLING_PLACE", "in the copy")]);
+    app.says(&format!("quillo: service billing: http://127.0.0.1:{} joined", copy.port));
+    assert_eq!(f_structured(&door.result("billing.place", json!({}), true, None, None))["result"], json!("in the copy"));
+    drop((copy, app));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn f_coverage_a_join_proof_its_app_cannot_check_proves_nothing() {
+    // The app has no key of billing's, or one too short: a copy's proof of the key is no proof, the
+    // join is taken as one with the secret alone, and the copy is sent no tool's call.
+    f_signing();
+    let short = "k".repeat(31);
+    for (why, env) in [("no key", vec![]), ("a key too short", vec![("QUILLO_APP_KEY_BILLING", short.as_str())])] {
+        let d = dir(&format!("f-cov-proof-{}", env.len()), "service mcp /billing = \"billing.qwe\" { timeout: \"1s\", retries: 0 }\nroute POST /login ? { user: str } = set_session({ user: user })\n");
+        std::fs::write(d.join("billing.qwe"), F_BILLING).unwrap();
+        let s = Logged::start(&d.join("main.qwe"), &[], &env);
+        let mut door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = asked.clone();
+        let copy = FakeService::start(Arc::new(move |_, _| {
+            a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }));
+        assert_eq!(f_join(s.port, copy.port, Some(F_APP_KEY)).status, 200, "{}", why);
+        s.says(&format!("quillo: service billing: http://127.0.0.1:{} joined", copy.port));
+        let r = door.result("billing.own_only", json!({}), true, None, None);
+        assert_eq!(f_structured(&r)["result"], json!("billing's own"), "{}: {}", why, r);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0, "{}", why);
+        drop((copy, s));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[test]
+fn f_coverage_a_tools_call_sent_again_to_another_copy_is_answered_as_it_was() {
+    // Two copies of billing behind one app share a database: a tool's call one answered, sent
+    // again to the other, is answered from there as it was, signed back with the app's key, and
+    // never run again.
+    f_signing();
+    let d = support::temp_dir("feedback56-f-cov-copies");
+    std::fs::write(d.join("billing.qwe"), "db.open(\"calls.db\")\ndb.exec(\"create table if not exists s (id integer primary key)\")\n/// Stamps once.\nfn mcp stamp() -> int with db {\n    db.exec(\"insert into s default values\")\n    db.one(\"select count(*) as n from s\").n\n}\n").unwrap();
+    let service = ["--as-service", "--service-name", "billing"];
+    let a = Logged::start(&d.join("billing.qwe"), &service, &[]);
+    let b = Logged::start(&d.join("billing.qwe"), &service, &[]);
+    let body = json!({ "tool": "stamp", "arguments": {}, "mcp": { "asking": null, "session": {}, "owner": null, "client": null } }).to_string();
+    let signed = |call: &str| -> Vec<(String, String)> {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let sig = quillo::service::signature(F_SECRET, t, "billing", "stamp", "", call, body.as_bytes());
+        let app = quillo::service::sign_app(F_APP_KEY, t, "billing", "stamp", "", call, "", "", "\n", body.as_bytes());
+        vec![("x-quillo-service".into(), format!("t={},sig={}", t, sig)), ("x-quillo-to".into(), "billing".into()), ("x-quillo-call".into(), call.into()), ("x-quillo-app".into(), format!("t={},sig={}", t, app))]
+    };
+    let send = |port: u16, h: &[(String, String)]| {
+        let refs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        support::send(port, "POST", "/_quillo/service/stamp", &refs, &body)
+    };
+    let stamped = |x: &support::Answer| serde_json::from_str::<Value>(&x.body).unwrap_or_default()["tool"]["structuredContent"]["result"].clone();
+    let call = format!("covcopies1x{}", std::process::id());
+    let first = signed(&call);
+    let at_a = send(a.port, &first);
+    assert_eq!((at_a.status, stamped(&at_a)), (200, json!(1)), "{}", at_a.body);
+    let at_b = send(b.port, &first);
+    assert_eq!((at_b.status, at_b.body.as_str()), (200, at_a.body.as_str()));
+    assert_eq!(at_b.header("x-quillo-app-answer"), Some(format!("sig={}", quillo::svcauth::sign_answer(F_APP_KEY, &call, 200, at_b.body.as_bytes()))).as_deref());
+    // A new call there runs, once more.
+    let at_b = send(b.port, &signed(&format!("covcopies2x{}", std::process::id())));
+    assert_eq!((at_b.status, stamped(&at_b)), (200, json!(2)), "{}", at_b.body);
+    drop((a, b));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn f_coverage_service_mcp_with_a_key_starts_and_with_oauth_or_a_certificate_alone_does_not() {
+    // As it runs, as `quillo check` says it (`f_review_service_mcp_needs_calls_signed_both_ways`,
+    // which runs the bearer token). Another service's name: `auth` is kept for the process.
+    let said = |how: &str| format!("`service mcp`: a call of ledger's tools is signed, and its answer too, with the shared secret or `auth: {{ key }}`; `auth: {{ {} }}` signs neither: give it a key, or make it a plain `service`, which offers no tools", how);
+    let checked = |opts: &str| -> Vec<String> { f_said("cov-auth", &[("main.qwe", &format!("service mcp /ledger = \"ledger.qwe\" {}\n", opts)), ("ledger.qwe", F_BILLING)]).into_iter().filter(|l| l.contains(" error: ")).collect() };
+    // A way given as null is no way: the shared secret signs, as with none.
+    assert_eq!(checked("{ auth: { bearer: null } }"), Vec::<String>::new());
+    for (i, (opts, refused)) in [
+        ("{ auth: { oauth: { token_url: \"https://id.example.com\", client_id: \"a\", client_secret: \"b\" } } }", Some("oauth")),
+        ("{ auth: { mtls: { cert: \"c.pem\", key: \"k.pem\" } } }", Some("mtls")),
+        ("{ auth: { key: \"the key ledger's calls are signed with, long enough\" } }", None),
+        ("{ auth: { bearer: null } }", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let d = dir(&format!("f-cov-auth-{}", i), &format!("service mcp /ledger = \"ledger.qwe\" {}\n", opts));
+        std::fs::write(d.join("ledger.qwe"), F_BILLING).unwrap();
+        let mut it = Interp::new(&d);
+        let loaded = it.load_file(&d.join("main.qwe"));
+        match refused {
+            Some(how) => {
+                let Err(e) = loaded else { panic!("it started with {}", opts) };
+                assert_eq!((e.line, e.msg.as_str()), (1, said(how).as_str()));
+            }
+            None => assert!(loaded.is_ok(), "{}: {:?}", opts, loaded.err().map(|e| e.msg)),
+        }
+        drop(it);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[test]
+fn f_coverage_quillo_check_reads_services_that_call_back_and_a_call_made_later() {
+    // Billing calls tax, which calls billing back: billing is not read again up the stack, and
+    // what it does is not all seen.
+    let files = [
+        ("main.qwe", "service billing = \"billing.qwe\"\n/// Calls billing, which calls tax, which calls billing back.\nfn mcp back_and_forth() -> int with http = billing.x()\n"),
+        ("billing.qwe", "service tax = \"tax.qwe\"\nserver fn x() -> int with http = tax.y()\nserver fn z() -> int = 1\n"),
+        ("tax.qwe", "service billing = \"billing.qwe\"\nserver fn y() -> int with http = billing.z()\n"),
+    ];
+    let facts = facts_in("f-cov-cycle", &files);
+    assert_eq!(fact(&facts, "back_and_forth").uncertain.as_deref(), Some("calls `billing.x`, whose code the checker cannot see whole"));
+    let tools = tools_in("f-cov-cycle-tools", &files);
+    let t = the(&tools, "back_and_forth");
+    assert_eq!((hints_of(t), t.may_ask), ((None, None), true));
+    // A call made later of a function that asks nothing: a change all the same, before which no
+    // question comes.
+    let main = "service mcp /billing = \"billing.qwe\"\n/// Writes later, then asks.\nfn mcp later_then() -> bool with http {\n    billing.later.write(1)\n    confirm(\"Then?\")\n}\n";
+    let errors: Vec<String> = f_said("cov-later", &[("main.qwe", main), ("billing.qwe", F_BILLING)]).into_iter().filter(|l| l.contains(" error: ")).collect();
+    assert_eq!(errors, ["main.qwe:5: error: `confirm` comes after `write`, a call of another program: ask before changing anything: the call runs again with the answer"]);
+}
+
+#[test]
+fn b3_coverage_what_a_tools_types_patterns_and_streams_reach() {
+    let src = "db.open(\":memory:\")\n\
+fn stamp() -> int {\n    db.exec(\"insert into t default values\")\n    1\n}\n\
+type Kind = \"a\" | \"b\"\n\
+type Ticket = { title: str, at: int = stamp() }\n\
+type Box = { n: int }\n\
+/// A kind.\nfn mcp kind(k: Kind) -> str with time = k\n\
+/// A ticket in a list, or a box or a ticket.\nfn mcp shapes(v: any) -> int with db = match v {\n    [Ticket as t] => len(t.title),\n    Box | Ticket as b => 2,\n    _ => 3,\n}\n\
+/// The same, of plain shapes.\nfn mcp plain(v: any) -> int with db = match v {\n    [x] => 1,\n    _ => 3,\n}\n\
+/// Reads a stream.\nfn mcp streams() with http = receive(\"https://feed.example.com/s\", (chunk) => 1)\n";
+    let tools = tools_of("b3-cov-reach", src);
+    // A type that is no record has no defaults to run.
+    assert_eq!(hints_of(the(&tools, "kind")), (Some(true), Some(false)));
+    // A record a pattern makes runs its defaults, in a list or among others: the write in one is
+    // the tool's.
+    assert_eq!(hints_of(the(&tools, "shapes")).0, None);
+    assert_eq!(hints_of(the(&tools, "plain")).0, Some(true));
+    let facts = facts_in("b3-cov-reach-facts", &[("main.qwe", src)]);
+    let shapes = fact(&facts, "shapes");
+    assert!(shapes.writes.as_deref().is_some_and(|w| w.contains("db.exec")), "{:?}", shapes.writes);
+    // `receive` sends a request: it reaches outside the program.
+    let s = fact(&facts, "streams");
+    assert_eq!((s.open.as_deref(), s.effects & quillo::ast::effect_bit("http") != 0), (Some("`receive`"), true));
+    assert_eq!(hints_of(the(&tools, "streams")), (None, None));
+}
+
+#[test]
+fn e_coverage_quillo_check_reads_the_order_through_more_of_the_code() {
+    let errors = |code: &str| -> Vec<String> {
+        let src = format!("db.open(\":memory:\")\nfn save(n: int) = db.exec(\"insert into t (v) values (?)\", n)\nfn helper(x: int = save(1).changes) -> int = x\ntype Item = {{ n: int = 1 }}\n/// T.\nfn mcp go(b: bool) -> any with db {{\n{}\n}}\n", code);
+        f_said("cov-order", &[("main.qwe", &src)]).into_iter().filter(|l| l.contains(" error: ")).map(|l| l.split_once(": error: ").unwrap().1.to_string()).collect()
+    };
+    let after = |what: &str| format!("`confirm` comes after {}: ask before changing anything: the call runs again with the answer", what);
+    let save = "`save`, which changes something (`db.exec`)";
+    // A change before a question: in a default of the function called, in a match's guard, in an
+    // element's attribute or child, before a reply's body, in a function written and called at
+    // once, in a field set (which a tool may not do, said too).
+    assert_eq!(errors("    helper()\n    confirm(\"Go?\")"), [after("`helper`, which changes something (`save`, which changes something (`db.exec`))")]);
+    assert_eq!(errors("    match 1 {\n        k if save(k).changes > 0 => confirm(\"Go?\"),\n        _ => false,\n    }"), [after(save)]);
+    assert_eq!(errors("    let p = <p title={save(1).changes}>{save(2).changes}</p>\n    confirm(\"Go?\") ? 1 : 0"), [after(save)]);
+    assert_eq!(errors("    save(1)\n    reply 200 { ok: confirm(\"Go?\") }"), [after(save)]);
+    assert_eq!(errors("    ((n) => save(n))(4)\n    confirm(\"Go?\")"), [after(save)]);
+    let set = errors("    let o = { n: 1 }\n    o.n = save(2).changes\n    confirm(\"Go?\")");
+    assert!(set.contains(&after(save)) && set.len() == 2, "{:?}", set);
+    // None: a local function of a program function's name, called and as a method; a return with
+    // no value; a record made.
+    assert_eq!(errors("    fn save(n: int) = n\n    save(3)\n    3.save()\n    confirm(\"Go?\")"), Vec::<String>::new());
+    assert_eq!(errors("    if b { return }\n    confirm(\"Go?\")"), Vec::<String>::new());
+    assert_eq!(errors("    let i = Item({})\n    confirm(\"Go?\") ? i.n : 0"), Vec::<String>::new());
+    // The tool's own default is worked out before its code.
+    let own = f_said("cov-order-own", &[("main.qwe", "db.open(\":memory:\")\nfn save(n: int) = db.exec(\"insert into t (v) values (?)\", n)\n/// T.\nfn mcp go(x: int = save(1).changes) -> bool with db = confirm(\"Go?\")\n")]);
+    assert_eq!(own.into_iter().filter(|l| l.contains(" error: ")).collect::<Vec<_>>(), [format!("main.qwe:4: error: {}", after(save))]);
+}
+
+#[test]
+fn b2_coverage_negative_defaults_and_bodies_that_may_both_be_null() {
+    let tools = tools_of("b2-cov-neg", "/// Moves.\nfn mcp shift(x: float = -1.5, y: int = -(1 + 1), z: int = -3) -> float with time = x\n");
+    let p = &the(&tools, "shift").input_schema["properties"];
+    // A negative number is said; a default worked out is not.
+    assert_eq!((p["x"].clone(), p["y"].clone(), p["z"].clone()), (json!({ "type": "number", "default": -1.5 }), json!({ "type": "integer" }), json!({ "type": "integer", "default": -3 })));
+    // Two routes' bodies that may each be null: a null fits both, so `anyOf`; with no null,
+    // `oneOf`.
+    let doc = doc_of("b2-cov-null", "route POST /n { json: int | null } = 1\nroute POST /n { json: str | null } = 2\nroute POST /m { json: int } = 1\nroute POST /m { json: str } = 2\n");
+    let body = |p: &str| doc["paths"][p]["post"]["requestBody"]["content"]["application/json"]["schema"].clone();
+    assert_eq!(body("/n"), json!({ "anyOf": [{ "type": "integer", "nullable": true }, { "type": "string", "nullable": true }] }));
+    assert_eq!(body("/m"), json!({ "oneOf": [{ "type": "integer" }, { "type": "string" }] }));
+}
+
+#[test]
+fn e_coverage_a_pages_ask_with_choices_fails_as_it_runs() {
+    // What `quillo check` refuses (`e_quillo_check_holds_asks_written_arguments_and_the_page`),
+    // run anyway: the page's code refuses the call when it runs, the page's own `ask` as before.
+    let mut it = Interp::new(".");
+    it.load_source(
+        "component C() {\n    <button onclick={() => { ask(\"Sure?\", { a: \"A\" }, \"a\") }}>x</button>\n}\ncomponent D() {\n    <button onclick={() => { ask(\"Sure?\", { title: \"T\" }) }}>x</button>\n}\n",
+        "page.qwe",
+    )
+    .unwrap();
+    let js = quillo::client::bundle(&it).unwrap();
+    assert!(js.contains("W.fail(") && js.contains("is a tool's question to its user, asked by the AI client"), "{}", js);
+    assert_eq!(js.matches("asked by the AI client").count(), 1, "{}", js);
+    assert!(js.contains("B.ask("), "{}", js);
+}
+
+#[cfg(unix)]
+#[test]
+fn c3_coverage_under_watch_on_a_socket_no_token_is_printed() {
+    // The developer's token is printed only for a server on this machine's 127.0.0.1.
+    let d = dir("c3-cov-socket", CLEAN);
+    let sock = std::env::temp_dir().join(format!("q56-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .args(["run", "main.qwe", "--watch", "--listen"])
+        .arg(format!("unix:{}", sock.display()))
+        .current_dir(&d)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let err = child.stderr.take().unwrap();
+    let g = support::Guard::new(child);
+    let log = Arc::new(Mutex::new(String::new()));
+    let l = log.clone();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+            let mut l = l.lock().unwrap();
+            l.push_str(&line);
+            l.push('\n');
+        }
+    });
+    let deadline = Instant::now() + WAIT;
+    while !log.lock().unwrap().contains("quillo: watching for changes") {
+        assert!(Instant::now() < deadline, "{}", log.lock().unwrap());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let said = log.lock().unwrap().clone();
+    assert!(sock.exists(), "{}", said);
+    assert!(!said.contains("MCP door for AI clients") && !said.contains("Authorization: Bearer"), "{}", said);
+    drop(g);
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+const COV_TOKENS: &str = r#"route POST /login ? { user: str } = set_session({ user: user })
+route POST /token_for ? { user: str } = mcp_token({ user: user })
+route POST /mint = { set_session({ user: "zed" }); mcp_token() }
+route POST /mint_and_leave = { set_session({ user: "zed" }); let t = mcp_token(); end_session(); t }
+
+/// Who is calling.
+server fn mcp whoami() -> map with time = { user: session().user }
+"#;
+
+#[test]
+fn c3_coverage_a_token_needs_a_session_and_ends_with_the_one_it_was_made_in() {
+    let d = dir("c3-cov-tie", COV_TOKENS);
+    let s = Logged::start(&d.join("main.qwe"), &[], &[]);
+    let listed = |token: &str| http_door::post(s.port, &http_door::As::Token(token.to_string()), &http_door::mirrored("tools/list", None), &http_door::msg(json!(1), "tools/list", json!({}))).status;
+    // Who it is for named, but no session at all: refused, said why.
+    let a = support::send(s.port, "POST", "/token_for?user=zed", &[], "");
+    assert_eq!(a.status, 500, "{}", a.body);
+    s.says("`mcp_token`: there is no session to tie the token to: `set_session` first");
+    // A session made in the request: the token is tied to it, and ends when it ends there.
+    let kept = support::send(s.port, "POST", "/mint", &[], "").body;
+    assert_eq!(listed(&kept), 200);
+    let gone = support::send(s.port, "POST", "/mint_and_leave", &[], "").body;
+    assert!(gone.starts_with("qmcp_"), "{}", gone);
+    assert_eq!(listed(&gone), 401);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c3_coverage_a_logout_of_a_program_with_no_door_does_not_wait_on_its_system_database() {
+    // No tools, so no tokens to end: a system database that cannot be reached is not asked, and
+    // the logout goes through (with a door it fails: `c3_second_review_a_database_that_will_not_
+    // open_is_no_memory`).
+    let d = dir("c3-cov-nodoor", "route POST /login ? { user: str } = set_session({ user: user })\nroute POST /logout = end_session()\n");
+    let s = Logged::start(&d.join("main.qwe"), &[], &[("QUILLO_SYSTEM_DB", "postgres://nobody@127.0.0.1:9/none")]);
+    let ana = http_door::login(s.port, "ana", &[]);
+    let a = http_door::route(s.port, "POST", "/logout", &ana, &[]);
+    assert_eq!(a.status, 204, "{}", a.body);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// `quillo run main.qwe` in `d`, its working folder, with `env`: the server, its port and its log.
+fn run_in(d: &Path, env: &[(&str, &str)]) -> (support::Guard, u16, Arc<Mutex<String>>) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .args(["run", "main.qwe", "--port", "0", "--workers", "8"])
+        .envs(env.iter().copied())
+        .env("QUILLO_SECRET", "test secret for the tests")
+        .current_dir(d)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let err = child.stderr.take().unwrap();
+    let g = support::Guard::new(child);
+    let log = Arc::new(Mutex::new(String::new()));
+    let l = log.clone();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+            let mut l = l.lock().unwrap();
+            l.push_str(&line);
+            l.push('\n');
+        }
+    });
+    let deadline = Instant::now() + WAIT;
+    let port = loop {
+        let text = log.lock().unwrap().clone();
+        if let Some(p) = text.split("listening on http://127.0.0.1:").nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()).and_then(|p| p.parse().ok()) {
+            break p;
+        }
+        assert!(Instant::now() < deadline, "did not start: {}", text);
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    (g, port, log)
+}
+
+const COV_STORE: &str = r#"tenant_from((request) => request.headers["x-tenant"])
+route POST /login ? { user: str } = set_session({ user: user })
+route POST /token = mcp_token()
+route GET /tokens = mcp_tokens()
+
+/// Who is calling.
+server fn mcp whoami() -> map with time = { user: session().user }
+"#;
+
+#[test]
+fn c3_coverage_tokens_are_kept_in_the_database_the_program_is_given() {
+    let d = dir("c3-cov-store", COV_STORE);
+    let listed = |port: u16, token: &str, tenant: &str| {
+        let mut h = http_door::mirrored("tools/list", None);
+        if !tenant.is_empty() {
+            h.push(("x-tenant".into(), tenant.into()));
+        }
+        http_door::post(port, &http_door::As::Token(token.to_string()), &h, &http_door::msg(json!(1), "tools/list", json!({}))).status
+    };
+    fn tenant(t: &str) -> Vec<(&'static str, &str)> {
+        if t.is_empty() { vec![] } else { vec![("x-tenant", t)] }
+    }
+    let system = d.join("system.db").display().to_string();
+    let per_tenant = d.join("t-{tenant}.db").display().to_string();
+    let app = d.join("app.db").display().to_string();
+    // The tenant's own database is there: a request's host names no tenant that is not.
+    std::fs::write(d.join("t-acme.db"), "").unwrap();
+    // The system database, not made until a token is; the program's own ($QUILLO_DB); one per
+    // tenant, the tokens then in quillo-system.db beside the program.
+    for (env, t, file) in [(("QUILLO_SYSTEM_DB", system.as_str()), "", "system.db"), (("QUILLO_DB", app.as_str()), "", "app.db"), (("QUILLO_DB", per_tenant.as_str()), "acme", "quillo-system.db")] {
+        let (g, port, log) = run_in(&d, &[env]);
+        assert_eq!(listed(port, "qmcp_nothing_kept_yet_nothing_kept_yet_nothing", t), 401, "{:?}", env);
+        let ana = http_door::login(port, "ana", &tenant(t));
+        assert_eq!(http_door::route(port, "GET", "/tokens", &ana, &tenant(t)).body, "[]", "{:?}", env);
+        if env.0 == "QUILLO_SYSTEM_DB" {
+            assert!(!d.join(file).exists(), "made before a token was");
+        }
+        let token = http_door::token(port, &ana, &tenant(t));
+        assert_eq!(listed(port, &token, t), 200, "{:?}", env);
+        assert!(d.join(file).exists(), "{:?}: {} not made", env, file);
+        assert!(!log.lock().unwrap().contains("kept in memory"), "{}", log.lock().unwrap());
+        drop(g);
+        // Kept there: good when the program starts again.
+        let (g, port, _) = run_in(&d, &[env]);
+        assert_eq!(listed(port, &token, t), 200, "{:?}", env);
+        drop(g);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn e_coverage_a_state_whose_use_a_read_only_database_cannot_keep_is_refused() {
+    // `_quillo_calls` cannot be made where the program's database refuses writes: the state is
+    // refused, closed, and the log says why (where the table is there and of another shape:
+    // `e_review_a_use_the_database_cannot_keep_refuses_the_state`).
+    let src = "db.open(\":memory:\")\nroute POST /login ? { user: str } = set_session({ user: user })\nroute POST /lock = db.exec(\"pragma query_only = 1\")\n/// Yes or no.\nfn mcp sure() -> bool with time = confirm(\"Sure?\")\n";
+    let d = dir("e-cov-locked", src);
+    let s = Logged::start(&d.join("main.qwe"), &[], &[]);
+    let mut door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
+    let r = door.result("sure", json!({}), true, None, None);
+    let state = r["requestState"].as_str().unwrap().to_string();
+    assert_eq!(support::send(s.port, "POST", "/lock", &[], "").status, 200);
+    let (_, code, message) = door.refused("sure", json!({}), Some(&state), Some(one("q1", yes())));
+    assert_eq!((code, message.as_str()), (-32602, "Invalid params: this requestState could not be kept as used, so it is refused (the server's log says why); call the tool again without one to start over"));
+    s.says("the MCP door could not keep a requestState's use, so it refused it: the table _quillo_calls could not be made");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c2_coverage_mcp_name_in_base64_with_a_plus_and_a_name_that_is_no_text() {
+    let (d, s) = http_door::door("cov-names", &[]);
+    let ana = http_door::As::Cookie(http_door::login(s.port, "ana", &[]));
+    // `=?base64?Pj4+?=` is `>>>`, base64's `+` read as base64's: another name than the body's.
+    let call = http_door::msg(json!("w"), "tools/call", json!({ "name": "whoami" }));
+    let a = http_door::post(s.port, &ana, &http_door::mirrored("tools/call", Some("=?base64?Pj4+?=")), &call);
+    assert_eq!(http_door::refusal(&a), (400, json!("w"), -32020, "Header mismatch: Mcp-Name header value '=?base64?Pj4+?=' does not match body value 'whoami'".to_string()));
+    // A name that is no text, the header given: refused as a malformed call.
+    let bad = http_door::msg(json!("n"), "tools/call", json!({ "name": 5 }));
+    let a = http_door::post(s.port, &ana, &http_door::mirrored("tools/call", Some("5")), &bad);
+    assert_eq!(http_door::refusal(&a), (400, json!("n"), -32602, "Invalid params: `name` is the tool's name, a string".to_string()));
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c4_coverage_a_call_leaves_the_minute_sixty_seconds_on() {
+    // Two calls a minute: the third is refused until the first is a minute old; then the caller,
+    // heard from within the minute, is kept, its first call let go.
+    let (d, s) = http_door::door("cov-minute", &["--max-tool-calls", "2"]);
+    let ana = http_door::As::Cookie(http_door::login(s.port, "ana", &[]));
+    let call = || http_door::ask(s.port, &ana, json!(1), "tools/call", json!({ "name": "whoami", "arguments": {} }));
+    let first = Instant::now();
+    assert_eq!(call().status, 200);
+    std::thread::sleep(Duration::from_secs(30));
+    assert_eq!(call().status, 200);
+    let refused = call();
+    assert_eq!(refused.status, 429, "{}", refused.body);
+    let wait: u64 = refused.header("retry-after").unwrap_or_default().parse().unwrap_or(0);
+    assert!((29..=31).contains(&wait), "{}", wait);
+    std::thread::sleep((first + Duration::from_millis(60_500)).saturating_duration_since(Instant::now()));
+    assert_eq!(call().status, 200);
+    assert_eq!(call().status, 429);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn d_coverage_a_mongolian_vowel_separator_in_the_block_is_named() {
+    let said = mcp::unseen_in_block("//! Notes for X\u{180e}Y.\n/// Seven.\nfn mcp clock() -> int with time = 7\n");
+    assert_eq!(said, Some((1, "column 16: the `//!` block at the top is what AI clients are told, and this holds U+180E (Mongolian vowel separator), which a reader of the file does not see: take it out".to_string())));
+    // The joiners stay: an emoji sequence and a Persian word need them.
+    assert_eq!(mcp::unseen_in_block("//! 👩\u{200d}👩 می\u{200c}خواهم\n"), None);
+}
+
+#[test]
+fn c2_coverage_unchecked_a_program_whose_tools_cannot_be_read_keeps_its_door_closed() {
+    // `--no-check`: the tools are read as the program loads, and where they cannot be, the door
+    // stays closed and says why; the routes are served. Run as a service, its tools are not
+    // offered to its app.
+    let d = dir("c2-cov-unchecked", "route GET /hi = \"hi\"\n\n/// Wrong.\nfn mcp wrong() -> int with time = \"x\"\n");
+    let s = Logged::start(&d.join("main.qwe"), &["--no-check"], &[]);
+    s.says("quillo: the MCP door stays closed: the program's tools could not be read:");
+    s.says("`wrong` must return int, but this returns str");
+    assert_eq!(support::send(s.port, "GET", "/hi", &[], "").body, "hi");
+    assert_eq!(http_door::ask(s.port, &http_door::As::Nobody, json!(1), "tools/list", json!({})).status, 404);
+    drop(s);
+    let s = Logged::start(&d.join("main.qwe"), &["--no-check", "--as-service", "--service-name", "unchecked"], &[]);
+    s.says("quillo: this service's tools are not offered to its app: they could not be read:");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c3_coverage_on_postgres_a_database_gone_closes_the_door() {
+    let Some(pg) = support::postgres("c3covgone") else {
+        eprintln!("skipped: c3_coverage_on_postgres_a_database_gone_closes_the_door, as PostgreSQL's initdb and pg_ctl were not found");
+        return;
+    };
+    let url = pg.database("covgone");
+    let d = dir("c3-cov-gone", &format!("db.open({:?})\n{}", url, COV_STORE));
+    let s = Logged::start(&d.join("main.qwe"), &[], &[]);
+    let ana = http_door::login(s.port, "ana", &[]);
+    let token = http_door::token(s.port, &ana, &[]);
+    let listed = || http_door::post(s.port, &http_door::As::Token(token.clone()), &http_door::mirrored("tools/list", None), &http_door::msg(json!(1), "tools/list", json!({})));
+    assert_eq!(listed().status, 200);
+    // The database stops: a token cannot be looked up, and is never let in.
+    drop(pg);
+    let a = listed();
+    assert_eq!((a.status, a.body.as_str()), (503, "the MCP door cannot check tokens now\n"));
+    s.says("the MCP door cannot read its tokens: ");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
