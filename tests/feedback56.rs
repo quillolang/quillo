@@ -3544,7 +3544,7 @@ fn atomic_panics_on(it: &mut Interp, d: &Path, a: &str, b: &str) {
     for (what, dbs, f, at, stands) in [
         ("its function", "three", Q::Builtin("boom", boom), 0, false),
         ("a call in its function", "three", Q::Builtin("boom_in_a_call", boom_in_a_call), 0, false),
-        ("a part's begin, SQLite's begun", "local_first", moved.clone(), 2, false),
+        ("a part's begin, SQLite's listed first (begun last)", "local_first", moved.clone(), 2, false),
         ("the second part's prepare", "three", moved.clone(), 6, false),
         ("SQLite's commit, the decision recorded", "three", moved.clone(), 7, false),
         ("the last part's commit, the decision standing", "three", moved.clone(), 9, true),
@@ -3854,5 +3854,150 @@ fn c1_review_a_message_begun_before_sigterm_is_answered() {
     let a = door.next().expect("the message begun was not answered");
     assert_eq!(a["result"]["content"][0]["text"], json!("hi Ana!"), "{}", a);
     assert_eq!(door.ended(), Some(0));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ---- Slice 3, second panic review: a transaction's begin, db.atomic's wait, a request's state --
+
+/// A panic as a transaction begins, just after its begin (the first call after arming), before
+/// its body: an outermost read-only one, an outermost one, a nested one. The begin was outside
+/// the catch around the body: the connection stayed pinned (SQLite's savepoint open), and every
+/// later transaction nested in it, the next read-only one refused (found in review).
+fn begin_panics_on(it: &mut Interp, what: &str) {
+    let (count_fn, write) = (global(it, "count"), global(it, "write"));
+    let all = free(it);
+    for (case, deep, read_only) in [("read-only", false, true), ("db.transaction's", false, false), ("nested", true, false)] {
+        let what = format!("{}, {}", what, case);
+        let before = count(it);
+        panics(it, &what, |it| {
+            let opts = quillo::txn::Options { read_only, ..Default::default() };
+            let _ = if deep {
+                tx(it, &mut |it| {
+                    quillo::db::panic_at_db_call(1);
+                    tx(it, &mut |it| it.call(&write, vec![Q::str("lost")], 0))
+                })
+            } else {
+                quillo::db::panic_at_db_call(1);
+                quillo::txn::run(it, None, &opts, 0, &mut |it| it.call(&write, vec![Q::str("lost")], 0))
+            };
+        });
+        nothing_left(it, all, &what);
+        // Outermost again: a read-only one runs, and an isolation level is taken.
+        assert!(matches!(ok(mcp::reading_only(it, 0, &mut |it| it.call(&count_fn, vec![], 0))), Q::Int(_)), "{}: the next read-only one", what);
+        let serializable = quillo::txn::Options { isolation: Some(quillo::txn::Isolation::Serializable), ..Default::default() };
+        assert_eq!(ok(quillo::txn::run(it, None, &serializable, 0, &mut |it| it.call(&write, vec![Q::str("kept")], 0))).display(), "wrote", "{}", what);
+        assert_eq!(count(it), before + 1, "{}", what);
+    }
+}
+
+#[test]
+fn q858_review_a_panic_as_a_transaction_begins_leaves_nothing_open() {
+    let d = support::temp_dir("feedback56-begin-panic");
+    let (mut it, _) = run_on(&d, &d.join("app.db").display().to_string(), &["create table notes (id integer primary key, text text)"], RO_TOOLS);
+    begin_panics_on(&mut it, "SQLite");
+    drop(it);
+    match support::postgres("feedback56-begin-pg") {
+        Some(pg) => {
+            let (mut it, _) = run_on(&d, &pg.database("beginpanic"), &["create table notes (id serial primary key, text text)"], RO_TOOLS);
+            begin_panics_on(&mut it, "PostgreSQL");
+        }
+        None => eprintln!("skipped on PostgreSQL: q858_review_a_panic_as_a_transaction_begins_leaves_nothing_open, as initdb and pg_ctl were not found"),
+    }
+    match support::mariadb("feedback56-begin-my") {
+        Some(my) => {
+            let (mut it, _) = run_on(&d, &my.url("beginpanic"), &["create table notes (id int auto_increment primary key, text text)"], RO_TOOLS);
+            begin_panics_on(&mut it, "MariaDB");
+        }
+        None => eprintln!("skipped on MariaDB: q858_review_a_panic_as_a_transaction_begins_leaves_nothing_open, as mariadbd was not found"),
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn q858_review_db_atomic_lets_no_other_request_write_into_its_sqlite_part() {
+    let Some(pg) = support::postgres("feedback56-atomic-wait") else {
+        eprintln!("skipped: q858_review_db_atomic_lets_no_other_request_write_into_its_sqlite_part, as PostgreSQL's initdb and pg_ctl were not found");
+        return;
+    };
+    let url = pg.database("atomicwait");
+    let d = support::temp_dir("feedback56-atomic-wait");
+    let src = format!(
+        "db.open(\"app.db\")\ndb.exec(\"create table if not exists notes (id integer primary key, text text)\")\n\
+         let other = db.connect(\"{url}?pool_size=1\")\nother.exec(\"create table if not exists t (n int)\")\n\
+         route POST /hold = other.transaction(() => other.exec(\"select pg_sleep(1.5)\").changes)\n\
+         fn moved(ms) = error(db.atomic([db, other], () => {{\n    db.exec(\"insert into notes (text) values ('atomic')\")\n    other.exec(\"insert into t values (1)\")\n    sleep(ms)\n    err(\"undone\")\n}}))\n\
+         route POST /atomic = moved(0)\n\
+         route POST /slow = moved(800)\n\
+         route POST /write {{\n    db.exec(\"insert into notes (text) values ('other')\")\n    \"wrote\"\n}}\n\
+         route GET /notes = json.stringify(db.query(\"select text from notes order by id\") | map((r) => r.text))\n"
+    );
+    std::fs::write(d.join("main.qwe"), &src).unwrap();
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let port = s.port;
+    let started = Instant::now();
+    let at = move |path: &'static str, after: u64| {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(after));
+            let a = support::send(port, "POST", path, &[], "");
+            (a.status, a.body, started.elapsed())
+        })
+    };
+    // The only connection to the other database held for 1.5 s: `db.atomic` waits for one, then
+    // begins. Its SQLite part begins after the server parts have theirs, so a write made while it
+    // waits is the other request's own, committed, where it went into the savepoint and was
+    // rolled back with it.
+    let (hold, atomic, write) = (at("/hold", 0), at("/atomic", 200), at("/write", 500));
+    let write = write.join().unwrap();
+    let atomic = atomic.join().unwrap();
+    assert_eq!(hold.join().unwrap().0, 200);
+    assert_eq!((write.0, write.1.as_str()), (200, "wrote"));
+    assert!(atomic.1.contains("undone"), "it waited for its connection and ran: {}", atomic.1);
+    assert!(write.2 < atomic.2, "the write ran while the atomic waited: {:?} {:?}", write.2, atomic.2);
+    assert_eq!(support::send(port, "GET", "/notes", &[], "").body, r#"["other"]"#);
+    // Once SQLite's part has begun no other request runs until it ends, as in `db.transaction`:
+    // the write waits, then is committed on its own.
+    let (slow, write) = (at("/slow", 0), at("/write", 300));
+    let (slow, write) = (slow.join().unwrap(), write.join().unwrap());
+    assert!(slow.1.contains("undone"), "{}", slow.1);
+    assert_eq!(write.0, 200);
+    assert!(write.2 >= Duration::from_millis(750), "the write ran inside the atomic: {:?} {:?}", write.2, slow.2);
+    assert_eq!(support::send(port, "GET", "/notes", &[], "").body, r#"["other","other"]"#);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A function of the program's whose call panics, as a bug of Quillo's in it would.
+fn boom_in_a_request(_: &mut Interp, _: Vec<Q>, _: u32) -> Result<Q, quillo::interp::Ctrl> {
+    panic!("a panic in a request, on purpose")
+}
+
+#[test]
+fn q858_review_after_a_request_panics_the_next_has_its_effects() {
+    // A request whose `with db` function panics answers 500, and the next, needing `time`, is
+    // not run under that `with`: the server goes on with a fresh interpreter, not one left as
+    // the call that panicked had narrowed it (found in review).
+    let d = support::temp_dir("feedback56-request-panic");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "fn boomy() with db = boom()\nroute GET /boom = boomy()\nfn stamp() with time = type_of(now())\nroute GET /now = stamp()\n").unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (file, dir) = (f.clone(), d.clone());
+    std::thread::Builder::new()
+        .stack_size(quillo::server::WORKER_STACK)
+        .spawn(move || {
+            let mut it = Interp::new(&dir);
+            quillo::value::define(&it.globals, "boom", Q::Builtin("boom", boom_in_a_request));
+            let shared = it.shared.clone();
+            it.load_file(&file).unwrap();
+            let app = quillo::server::App::new(quillo::server::Loaded::Ready(it), shared, &file, &dir, false);
+            quillo::server::serve_with(app, "127.0.0.1:0", 2, move |a| tx.send(a.port()).unwrap()).unwrap();
+        })
+        .unwrap();
+    let port = rx.recv_timeout(Duration::from_secs(10)).expect("the server did not start");
+    assert_eq!(support::send(port, "GET", "/now", &[], "").body, "int");
+    for _ in 0..3 {
+        assert_eq!(support::send(port, "GET", "/boom", &[], "").status, 500);
+        let now = support::send(port, "GET", "/now", &[], "");
+        assert_eq!((now.status, now.body.as_str()), (200, "int"));
+    }
     let _ = std::fs::remove_dir_all(&d);
 }

@@ -1265,11 +1265,11 @@ thread_local! {
 }
 
 /// For tests: the `n`th call holding a server database's connection made on this thread from now
-/// on (counted from 1; 0 for none), or `db.atomic`'s commit of its SQLite part, panics as a bug of
-/// Quillo's there would; gives how many were made since the last time this was called. No query a
-/// program can make panics in the driver, and the blocking client called inside an async runtime,
-/// which does, panics again as its connection is dropped, which aborts (FEEDBACK56.md, found in
-/// review; branch feedback56).
+/// on (counted from 1; 0 for none), a SQLite transaction's begin (just after it), or `db.atomic`'s
+/// commit of its SQLite part, panics as a bug of Quillo's there would; gives how many were made
+/// since the last time this was called. No query a program can make panics in the driver, and the
+/// blocking client called inside an async runtime, which does, panics again as its connection is
+/// dropped, which aborts (FEEDBACK56.md, found in review; branch feedback56).
 #[doc(hidden)]
 pub fn panic_at_db_call(n: usize) -> usize {
     FAULT.with(|f| f.replace((0, n)).0)
@@ -2930,17 +2930,27 @@ pub(crate) fn attempt(
             // Nothing else runs on it meanwhile (a transaction holds it, see `IN_TX`). What it
             // was is put back as the body ends, whatever ended it, a panic too (FEEDBACK56.md,
             // Q-858, found in review; branch feedback56).
-            let query_only = if opts.read_only {
-                let was = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_row("pragma query_only", [], |row| row.get::<_, i64>(0));
-                match was.and_then(|was| run("pragma query_only = on").map(|()| was)) {
-                    Ok(was) => Some(QueryOnly { conn: m, was }),
-                    Err(e) => {
-                        let _ = run(if immediate { "rollback" } else { "rollback to quillo_tx; release quillo_tx" });
-                        return (Ok(db_err(&e)), false);
-                    }
+            // A panic as it begins, before the body's below, rolls it back as that one does: the
+            // savepoint was left open, and every later transaction nested in it, a read-only one
+            // refused (FEEDBACK56.md, found in review; branch feedback56).
+            let begun = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                faulted(fault());
+                if !opts.read_only {
+                    return Ok(None);
                 }
-            } else {
-                None
+                let was = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_row("pragma query_only", [], |row| row.get::<_, i64>(0));
+                was.and_then(|was| run("pragma query_only = on").map(|()| Some(QueryOnly { conn: m, was })))
+            }));
+            let query_only = match begun {
+                Ok(Ok(q)) => q,
+                Ok(Err(e)) => {
+                    let _ = run(if immediate { "rollback" } else { "rollback to quillo_tx; release quillo_tx" });
+                    return (Ok(db_err(&e)), false);
+                }
+                Err(panic) => {
+                    let _ = run(if immediate { "rollback" } else { "rollback to quillo_tx; release quillo_tx" });
+                    std::panic::resume_unwind(panic);
+                }
             };
             let mark = tx_begin(it);
             it.sqlite_tx += 1;
@@ -3036,78 +3046,87 @@ pub(crate) fn attempt(
                 tx.depth
             };
             let begin = if depth == 1 { crate::txn::begin_sql(b.is_mysql(), opts.isolation, opts.read_only) } else { format!("savepoint quillo_tx_{}", depth) };
-            let mut started = { let begin = begin.clone(); pooled_run(it, &b, move |c| c.batch(&begin)) };
-            // A pooled connection the server ended while it sat idle (a restart, a failover)
-            // fails its first statement: nothing has run, so another is taken and the
-            // transaction begun on it, where the program was given "internal error"
-            // (FEEDBACK49.md, Q-601; branch main).
-            // As many as the pool holds, each perhaps ended, and two more: three gave up while
-            // dead idle ones were left, and with eight the first two transactions failed (found
-            // in review).
-            let most = match &*b {
-                Backend::Postgres(p) => p.size() + 2,
-                _ => 3,
-            };
-            let mut tries = 0;
-            while depth == 1 && tries < most && started.as_ref().err().is_some_and(|e| kind_of(e) == Some("connection")) {
-                tries += 1;
-                let dead = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().find(|t| Arc::ptr_eq(&t.backend, &b)).and_then(|t| t.conn.take());
-                if let Some(d) = dead {
-                    b.discard(d);
-                }
-                match checkout_for_tx(it, &b) {
-                    Ok(mut c) => {
-                        c.watch_conflicts(true);
-                        if let Some(t) = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().find(|t| Arc::ptr_eq(&t.backend, &b)) {
-                            t.conn = Some(c);
+            // A panic as it begins or in the body: the transaction is rolled back and its
+            // connection let go, not left pinned to this program with a transaction open
+            // (FEEDBACK56.md, Q-858, found in review; branch feedback56). The begin was outside
+            // the catch: one that panicked left the connection pinned, and every later
+            // transaction on it nested, a read-only one refused (found in review).
+            let mut mark = None;
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut started = { let begin = begin.clone(); pooled_run(it, &b, move |c| c.batch(&begin)) };
+                // A pooled connection the server ended while it sat idle (a restart, a failover)
+                // fails its first statement: nothing has run, so another is taken and the
+                // transaction begun on it, where the program was given "internal error"
+                // (FEEDBACK49.md, Q-601; branch main).
+                // As many as the pool holds, each perhaps ended, and two more: three gave up while
+                // dead idle ones were left, and with eight the first two transactions failed (found
+                // in review).
+                let most = match &*b {
+                    Backend::Postgres(p) => p.size() + 2,
+                    _ => 3,
+                };
+                let mut tries = 0;
+                while depth == 1 && tries < most && started.as_ref().err().is_some_and(|e| kind_of(e) == Some("connection")) {
+                    tries += 1;
+                    let dead = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().find(|t| Arc::ptr_eq(&t.backend, &b)).and_then(|t| t.conn.take());
+                    if let Some(d) = dead {
+                        b.discard(d);
+                    }
+                    match checkout_for_tx(it, &b) {
+                        Ok(mut c) => {
+                            c.watch_conflicts(true);
+                            if let Some(t) = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().find(|t| Arc::ptr_eq(&t.backend, &b)) {
+                                t.conn = Some(c);
+                            }
+                        }
+                        Err(e) => {
+                            started = Err(e);
+                            break;
                         }
                     }
-                    Err(e) => {
-                        started = Err(e);
-                        break;
-                    }
+                    let begin = begin.clone();
+                    started = pooled_run(it, &b, move |c| c.batch(&begin));
                 }
-                let begin = begin.clone();
-                started = pooled_run(it, &b, move |c| c.batch(&begin));
-            }
-            let mark = tx_begin(it);
-            let r = match started {
-                // A panic in the body: the transaction is rolled back and its connection let go,
-                // not left pinned to this program with a transaction open (FEEDBACK56.md, Q-858,
-                // found in review; branch feedback56).
-                Ok(()) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| caught(it, body))) {
-                    Ok(r) => r,
-                    Err(panic) => {
-                        // Lowered first, so that a panic in the rollback leaves nothing raised; and
-                        // rolled back only on a connection the transaction still has: a call that
-                        // panicked closed its own (`Taken`), and its transaction with it, where one
-                        // was checked out to roll back nothing, waiting up to 30 s for it
-                        // (FEEDBACK56.md, found in review; branch feedback56).
+                mark = Some(tx_begin(it));
+                match started {
+                    Ok(()) => caught(it, body),
+                    Err(e) => Ok(db_err(e)),
+                }
+            }));
+            let r = match ran {
+                Ok(r) => r,
+                Err(panic) => {
+                    // Lowered first, so that a panic in the rollback leaves nothing raised; and
+                    // rolled back only on a connection the transaction still has: a call that
+                    // panicked closed its own (`Taken`), and its transaction with it, where one
+                    // was checked out to roll back nothing, waiting up to 30 s for it
+                    // (FEEDBACK56.md, found in review; branch feedback56).
+                    if let Some(mark) = mark {
                         tx_end(it, mark, false);
-                        let (done, held) = {
-                            let mut g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                            match g.iter().position(|t| Arc::ptr_eq(&t.backend, &b)) {
-                                Some(i) => {
-                                    g[i].depth -= 1;
-                                    let held = g[i].conn.is_some();
-                                    ((g[i].depth == 0).then(|| g.remove(i)), held)
-                                }
-                                None => (None, false),
-                            }
-                        };
-                        match done {
-                            Some(TxConn { conn: Some(c), .. }) => close_after(it, Taken { b: pool, conn: Some(c) }, vec!["rollback".into()]),
-                            None if held => {
-                                let end = format!("rollback to savepoint quillo_tx_{d}; release savepoint quillo_tx_{d}", d = depth);
-                                let _ = pooled_run(it, &b, move |c| c.batch(&end));
-                            }
-                            _ => {}
-                        }
-                        std::panic::resume_unwind(panic);
                     }
-                },
-                Err(e) => Ok(db_err(e)),
+                    let (done, held) = {
+                        let mut g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match g.iter().position(|t| Arc::ptr_eq(&t.backend, &b)) {
+                            Some(i) => {
+                                g[i].depth -= 1;
+                                let held = g[i].conn.is_some();
+                                ((g[i].depth == 0).then(|| g.remove(i)), held)
+                            }
+                            None => (None, false),
+                        }
+                    };
+                    match done {
+                        Some(TxConn { conn: Some(c), .. }) => close_after(it, Taken { b: pool, conn: Some(c) }, vec!["rollback".into()]),
+                        None if held => {
+                            let end = format!("rollback to savepoint quillo_tx_{d}; release savepoint quillo_tx_{d}", d = depth);
+                            let _ = pooled_run(it, &b, move |c| c.batch(&end));
+                        }
+                        _ => {}
+                    }
+                    std::panic::resume_unwind(panic);
+                }
             };
+            let mark = mark.expect("begun");
             let conflicted = |it: &Interp| {
                 let g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 g.iter().find(|t| Arc::ptr_eq(&t.backend, &b)).and_then(|t| t.conn.as_ref()).map_or(false, |c| c.conflicted())
@@ -3431,9 +3450,14 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let mut begun: Vec<usize> = Vec::new();
     let (mut raised, mut decided, mut mark) = (false, false, None);
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Each part begins.
+        // Each part begins, SQLite's last. A server part may wait for a connection of its own
+        // (`checkout_for_tx`), and its begin is made, with other requests run meanwhile: after
+        // SQLite's savepoint, their SQLite writes landed in it, committed or rolled back with this
+        // transaction (FEEDBACK56.md, found in review; branch feedback56).
         let mut failed = None;
-        for (k, p) in parts.iter().enumerate() {
+        let order: Vec<usize> = (0..parts.len()).filter(|k| parts[*k].kind != Kind::Sqlite).chain((0..parts.len()).filter(|k| parts[*k].kind == Kind::Sqlite)).collect();
+        for k in order {
+            let p = &parts[k];
             let r = match p.kind {
                 Kind::Sqlite => match &*p.b {
                     Backend::Sqlite(m) => m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute_batch("savepoint quillo_tx").map_err(|e| e.to_string()),
@@ -3457,11 +3481,13 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                     break;
                 }
             }
-        }
-        if parts.iter().enumerate().any(|(k, p)| p.kind == Kind::Sqlite && begun.contains(&k)) {
-            it.sqlite_tx += 1;
-            crate::httpd::hold_in_place(true);
-            raised = true;
+            // Held from SQLite's begin, as in `db.transaction`: no other request runs until it ends
+            // (FEEDBACK56.md, found in review; branch feedback56).
+            if p.kind == Kind::Sqlite && !raised {
+                it.sqlite_tx += 1;
+                crate::httpd::hold_in_place(true);
+                raised = true;
+            }
         }
         mark = Some(tx_begin(it));
         it.wrote_req = Some(crate::httpd::request_number());

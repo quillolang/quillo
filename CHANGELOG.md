@@ -5,8 +5,12 @@
 - A panic inside a transaction rolls it back and frees the connection on every database; on
   SQLite it had left the savepoint open, so later writes went uncommitted. `db.atomic`'s too:
   its parts end as decided, committed where the decision stands, rolled back otherwise. A panic
-  in a PostgreSQL call no longer loses the connection's place in the pool (FEEDBACK56.md, found
-  in review).
+  in a PostgreSQL call no longer loses the connection's place in the pool, and a panic as a
+  transaction begins leaves nothing open (FEEDBACK56.md, found in review).
+- Another request's SQLite write no longer lands in `db.atomic`'s SQLite part while the atomic
+  waits for a server database's connection: SQLite's part begins last. Before, the other
+  request could roll the atomic's savepoint back, and the atomic's own SQLite write was then
+  committed although it ended in an error (FEEDBACK56.md, found in review).
 - `fn mcp name(...)` and `server fn mcp name(...)` declare tools for AI clients, and
   `service mcp /path = "file.qwe"` a service whose tools are the program's. `quillo check` holds
   them to MCP's names and to data answers, and warns of a tool with no `///`, an untyped

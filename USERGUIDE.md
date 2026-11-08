@@ -7182,6 +7182,9 @@ db.atomic([db, ledger], () => {
   database per tenant. At most one SQLite database may take part (naming two is a
   runtime error).
 - PostgreSQL needs `max_prepared_transactions` set above 0 (it is 0 by default).
+- A SQLite database taking part begins last, once every server database's part has begun;
+  from then until the end no other request runs, as in a SQLite `db.transaction`, so no other
+  request's write lands in it (FEEDBACK56.md, found in review).
 - `db.transaction` inside it nests as usual; `db.atomic` cannot begin inside a
   transaction on one of its databases.
 
