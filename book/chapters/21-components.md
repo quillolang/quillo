@@ -1648,12 +1648,17 @@ headers against the message). Who may call:
   `max_age`, else 30 days (`mcp_token({ max_age: 7 * 24 * 3600 })` says otherwise, up to a
   year; `mcp_token({ user })` for a program that names its caller another way). Quillo keeps
   only its signature under the session key (`QUILLO_SECRET`), in `_quillo_mcp_tokens` (or in
-  memory for a program with no database), and seals each row as it seals a cookie: a row
+  memory for a program with no database: at most 100 a user and 10,000 in all, `mcp_token()`
+  refused past either), and seals each row as it seals a cookie: a row
   changed in the database is no token. The first `mcp_token()` makes that table, and fails
-  saying so where the database user may not create one. `mcp_tokens()` lists the tokens made
-  in this session or for its `user`, also after its cookie has gone or on a new sign-in, and
-  `revoke_mcp_token(id)` ends one (`{ user }` reaches all of that user's); `end_session()` ends
-  the tokens made in that session, whether the door is open or not.
+  saying so where the database user may not create one. A database the program has that will
+  not open is an error, never memory: `mcp_token`, `mcp_tokens` and `revoke_mcp_token` fail, a
+  call with a token is a `503`, and `end_session()` fails while the door is open.
+  `mcp_tokens()` lists the tokens made in this session for its `user`, or for its `user`, also
+  after its cookie has gone or on a new sign-in, and `revoke_mcp_token(id)` ends one
+  (`{ user }` reaches all of that user's, as a token a session made for someone else is reached);
+  `end_session()` ends the tokens made in that session for its user, whether the door is open
+  or not.
 - Neither is a `401` with `WWW-Authenticate: Bearer`.
 
 In a tool, `session()` and `tenant()` are the caller's: a token's are those of the session it
@@ -1668,6 +1673,12 @@ per session or token) ([`--max-tool-calls`](#options-of-quillo-run), and a polic
 `http://127.0.0.1:PORT/_quillo/mcp` (without `--base`), and the line that adds it to Claude
 Code, when it starts or once the first version that loads has tools (FEEDBACK56.md, Q-853,
 Q-859, Q-860).
+
+Limits: the count of tool calls is kept by each server process, so under `--instances` or on
+several machines each counts its own; and a program with no database keeps its tokens in that
+process's memory (100 a user, 10,000 in all), lost at a restart and unknown to the others, so
+run such a program as one process. A session cookie made before this version does not say it
+was given a `max_age`, so a token made from it lasts 30 days.
 
 ### What the browser can reach
 

@@ -653,12 +653,23 @@ fn set_session(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// its door now (a reload without tools): a logout that could not end them fails, rather than
 /// leave them good; one with no table of them never makes one, and never fails for it
 /// (FEEDBACK56.md, Q-859, found in review; branch feedback56).
+/// The tokens it ends are those made in it for its user, the session the request came with and
+/// the one it has now each with its own: its id alone is no one's, as it stays from no user to a
+/// user (FEEDBACK56.md, Q-859, second review; branch feedback56).
 fn end_session(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
-    let mut owners: Vec<String> = arrived_owner(it).into_iter().collect();
-    if let Some(o) = current_owner(it).filter(|o| !owners.contains(o)) {
-        owners.push(o);
+    let user_in = |d: &Value| match d {
+        Value::Map(m) => m.get("user").filter(|u| !matches!(u, Value::Nil)).cloned(),
+        _ => None,
+    };
+    let came = arrived(it);
+    let mut sessions: Vec<(String, Option<Value>)> = came.as_ref().and_then(|(d, id)| owner_in(id.as_deref(), d).map(|o| (o, user_in(d)))).into_iter().collect();
+    if let Some(o) = current_owner(it) {
+        let user = it.session.as_ref().or(came.as_ref().map(|(d, _)| d)).and_then(user_in);
+        if !sessions.iter().any(|(k, u)| *k == o && u.as_ref().map(crate::interp::island_json) == user.as_ref().map(crate::interp::island_json)) {
+            sessions.push((o, user));
+        }
     }
-    if let Err(why) = crate::mcp::end_tokens(it, &owners) {
+    if let Err(why) = crate::mcp::end_tokens(it, &sessions) {
         // A program with no door now, whose database cannot be asked: nothing says it has any, and
         // its logouts do not wait on that database.
         if it.mcp.is_some() {

@@ -4856,9 +4856,14 @@ fn mcp minting() -> str with time = mcp_token()
 
     /// `quillo run main.qwe` with `args` in `d`, its stderr read as it comes.
     fn logged(d: &Path, args: &[&str]) -> (support::Guard, Arc<Mutex<String>>) {
+        logged_env(d, args, &[])
+    }
+
+    fn logged_env(d: &Path, args: &[&str], env: &[(&str, &str)]) -> (support::Guard, Arc<Mutex<String>>) {
         let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
             .args(["run", "main.qwe", "--workers", "8"])
             .args(args)
+            .envs(env.iter().copied())
             .current_dir(d)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -5067,7 +5072,13 @@ server fn mcp whoami() -> map with time = { user: session().user, tenant: tenant
             assert_eq!(call(p, &As::Token(t.clone()), "whoami", json!({}))["structuredContent"]["user"], json!("ana"));
             let changed = route(p, "POST", &format!("/tamper?id={}&column={}&value={}", id, column, enc(&value)), &ana, &[]);
             assert_eq!(changed.body, "1", "{}: {}", column, changed.body);
-            let a = post(p, &As::Token(t), &mirrored("tools/call", Some("whoami")), &msg(json!(1), "tools/call", json!({ "name": "whoami" })));
+            // Called where the row now says it is good, so that the seal alone refuses it (found
+            // in the second review: from no tenant, the place refused it first).
+            let mut h = mirrored("tools/call", Some("whoami"));
+            if column == "place" {
+                h.push(("x-tenant".into(), "acme".into()));
+            }
+            let a = post(p, &As::Token(t), &h, &msg(json!(1), "tools/call", json!({ "name": "whoami" })));
             assert_eq!((a.status, a.header("www-authenticate")), (401, Some("Bearer error=\"invalid_token\"")), "{}: {}", column, a.body);
             assert!(!route(p, "GET", "/tokens_of?user=admin", &ana, &[]).body.contains(&id), "{}", column);
             assert!(!route(p, "GET", "/tokens", &ana, &[]).body.contains(&id), "{}", column);
@@ -5269,10 +5280,9 @@ server fn mcp whoami() -> map with time = { user: session().user, tenant: tenant
         assert_eq!(users("/tokens_of?user=ANA", &ana), ["ANA"]);
         assert_eq!(users("/tokens_of?user=zoe", &ana), Vec::<String>::new());
         assert_eq!(users("/tokens_of?user=Ana", &ana), Vec::<String>::new());
-        // The session's own: made in it (zoë's too) or for its user, not for `ANA`.
-        let mut own = users("/tokens", &ana);
-        own.sort();
-        assert_eq!(own, ["ana", "zoë"]);
+        // The session's own: made in it for its user, or for its user; not zoë's, made in it for
+        // another (decided in the second review), nor `ANA`'s.
+        assert_eq!(users("/tokens", &ana), ["ana"]);
         assert_eq!(users("/tokens", &upper), ["ANA"]);
         let zoe_id = listed(p, "/tokens_of?user=zo%C3%AB", &ana)[0]["id"].as_str().unwrap().to_string();
         assert_eq!(route(p, "POST", &format!("/revoke_of?id={}&user=zoe", zoe_id), &ana, &[]).body, "false");
@@ -5314,6 +5324,201 @@ server fn mcp whoami() -> map with time = { user: session().user, tenant: tenant
         assert_eq!(url, format!("http://127.0.0.1:{}/_quillo/mcp", p));
         assert_eq!(call(p, &As::Token(t), "seven", json!({}))["structuredContent"], json!({ "result": 7 }));
         drop(g);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- Slice 5, second review (FEEDBACK56.md, Q-859, Q-887; branch feedback56) ----------------
+
+    const SWAP_ROUTES: &str = "route POST /anon = set_session({ cart: [1] })\n\
+        route POST /signin ? { user: str } = set_session({ cart: session().cart, user: user })\n\
+        route POST /signout = set_session({ cart: session().cart })\n";
+
+    /// The session cookie an answer sets, else the one sent.
+    fn next_cookie(a: &support::Answer, was: &str) -> String {
+        a.headers.iter().filter(|(k, _)| k == "set-cookie").map(|(_, v)| v.split(';').next().unwrap_or("").to_string()).find(|c| c.contains("quillo_session=")).unwrap_or_else(|| was.to_string())
+    }
+
+    #[test]
+    fn c3_second_review_a_session_id_kept_from_no_user_is_not_who_made_a_token() {
+        // Alice signs in on a visitor's session (its id stays, Q-887), makes a token, and is signed
+        // out without `end_session`; Bob signs in on that browser, with the same id. Her token is
+        // not his to list, revoke or end.
+        let d = review_dir("same-id", "db.open(\":memory:\")", SWAP_ROUTES);
+        let s = support::serve_with(&d.join("main.qwe"), &[]);
+        let p = s.port;
+        let mut c = session_cookie(&support::send(p, "POST", "/anon", &[], ""));
+        c = next_cookie(&route(p, "POST", "/signin?user=alice", &c, &[]), &c);
+        let alice = As::Token(token(p, &c, &[]));
+        let alice_id = listed(p, "/tokens", &c)[0]["id"].as_str().unwrap().to_string();
+        c = next_cookie(&route(p, "POST", "/signout", &c, &[]), &c);
+        c = next_cookie(&route(p, "POST", "/signin?user=bob", &c, &[]), &c);
+        assert_eq!(route(p, "GET", "/tokens", &c, &[]).body, "[]");
+        assert_eq!(route(p, "POST", &format!("/revoke?id={}", alice_id), &c, &[]).body, "false");
+        let bob = As::Token(token(p, &c, &[]));
+        assert_eq!(listed(p, "/tokens", &c).len(), 1);
+        assert_eq!(route(p, "POST", "/logout", &c, &[]).status, 204);
+        assert_eq!(list_status(p, &bob), 401);
+        assert_eq!(call(p, &alice, "whoami", json!({}))["structuredContent"]["user"], json!("alice"));
+        assert_eq!(listed(p, "/tokens_of?user=alice", "").len(), 1);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn c3_second_review_a_database_that_will_not_open_is_no_memory() {
+        // The program's database ($QUILLO_DB) and a system database that will not open: each is an
+        // error, never tokens kept in memory as if there were no database.
+        let d = review_dir("unopened", "", "");
+        let bad = review_dir("unopened-system", "db.open(\"data/{tenant}.db\")", "");
+        for (dir, env) in [(&d, ("QUILLO_DB", "postgres://nobody@127.0.0.1:9/none")), (&bad, ("QUILLO_SYSTEM_DB", "postgres://nobody@127.0.0.1:9/none"))] {
+            let (g, said) = logged_env(dir, &["--watch", "--port", &support::free_port().to_string()][..], &[env]);
+            let port: u16 = {
+                let deadline = Instant::now() + WAIT;
+                loop {
+                    let text = said.lock().unwrap().clone();
+                    if let Some(p) = text.split("listening on http://127.0.0.1:").nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()).and_then(|p| p.parse().ok()) {
+                        break p;
+                    }
+                    assert!(Instant::now() < deadline, "did not start: {}", text);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            };
+            let ana = login(port, "ana", &[]);
+            let a = route(port, "POST", "/token", &ana, &[]);
+            assert_eq!(a.status, 500, "{:?}: {}", env, a.body);
+            assert!(a.body.contains("cannot be opened"), "{:?}: {}", env, a.body);
+            assert_eq!(list_status(port, &As::Token("qmcp_x".into())), 503, "{:?}", env);
+            for path in ["/revoke?id=x", "/logout"] {
+                let a = route(port, "POST", path, &ana, &[]);
+                assert!(a.status == 500 && a.body.contains("cannot be opened"), "{:?} {}: {}", env, path, a.body);
+            }
+            assert!(route(port, "GET", "/tokens", &ana, &[]).body.contains("cannot be opened"));
+            assert!(!said.lock().unwrap().contains("kept in memory"), "{}", said.lock().unwrap());
+            drop(g);
+        }
+        for x in [d, bad] {
+            let _ = std::fs::remove_dir_all(&x);
+        }
+    }
+
+    #[test]
+    fn c3_second_review_memory_holds_100_a_user_and_10000_in_all() {
+        let d = review_dir("memory-bounds", "", "route POST /many/:n(int) = len(for i in 0..n => mcp_token())\n");
+        let (g, p, _) = watched(&d, &["--watch"]);
+        // A stranger's token, before and after 10,000 are kept: one look-up each, not a copy of
+        // them all.
+        let stranger = || list_status(p, &As::Token("qmcp_strangerstrangerstrangerstrangerstrange".into()));
+        let before = median_us(40, || assert_eq!(stranger(), 401));
+        let many = |cookie: &str, n: usize| route(p, "POST", &format!("/many/{}", n), cookie, &[]);
+        // A user's 100, the limit and one past it; one revoked makes room.
+        let ana = login(p, "ana", &[]);
+        assert_eq!(many(&ana, 99).body, "99");
+        assert_eq!(many(&ana, 1).body, "1");
+        let a = many(&ana, 1);
+        assert!(a.status == 500 && a.body.contains("this user has 100 already, the most kept in memory for one user"), "{}", a.body);
+        let first = listed(p, "/tokens", &ana)[0]["id"].as_str().unwrap().to_string();
+        assert_eq!(route(p, "POST", &format!("/revoke?id={}", first), &ana, &[]).body, "true");
+        assert_eq!(many(&ana, 1).body, "1");
+        // 10,000 in all, then none more, for anyone.
+        for u in 1..100 {
+            let c = login(p, &format!("u{}", u), &[]);
+            assert_eq!(many(&c, 100).body, "100", "u{}", u);
+        }
+        let late = login(p, "late", &[]);
+        let a = many(&late, 1);
+        assert!(a.status == 500 && a.body.contains("10000 are kept already, the most kept in memory"), "{}", a.body);
+        let after = median_us(40, || assert_eq!(stranger(), 401));
+        eprintln!("a stranger's token with no tokens kept: {:.0} µs; with 10,000 in memory: {:.0} µs", before, after);
+        assert!(after < before * 3.0 + 300.0, "{:.0} µs, then {:.0} µs", before, after);
+        drop(g);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn c3_second_review_a_revoke_under_another_key_stays_when_the_key_comes_back() {
+        // QUILLO_SECRET from A to B: A's tokens are no good under B, and one revoked there stays
+        // revoked when A comes back.
+        let d = review_dir("rotated", "db.open(\"data.db\")", "");
+        let start = |key: &str| {
+            let port = support::free_port();
+            let (g, said) = logged_env(&d, &["--port", &port.to_string()][..], &[("QUILLO_SECRET", key)]);
+            let deadline = Instant::now() + WAIT;
+            while !support::listening(port) {
+                assert!(Instant::now() < deadline, "did not start: {}", said.lock().unwrap());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            (g, port)
+        };
+        let (a, b) = ("key A for the tests, long enough to sign with", "key B for the tests, long enough to sign with");
+        let (g, p) = start(a);
+        let ana = login(p, "ana", &[]);
+        let kept = As::Token(token(p, &ana, &[]));
+        let first: Vec<Value> = listed(p, "/tokens", &ana);
+        let gone = As::Token(token(p, &ana, &[]));
+        let gone_id = listed(p, "/tokens", &ana).iter().map(|t| t["id"].as_str().unwrap().to_string()).find(|id| !first.iter().any(|f| f["id"] == json!(id))).unwrap();
+        drop(g);
+        // Under B, neither is good nor listed; the one revoked there is taken away all the same.
+        let (g, p) = start(b);
+        assert_eq!(list_status(p, &gone), 401);
+        assert_eq!(list_status(p, &kept), 401);
+        let ana = login(p, "ana", &[]);
+        assert_eq!(route(p, "GET", "/tokens", &ana, &[]).body, "[]");
+        assert_eq!(route(p, "POST", &format!("/revoke?id={}", gone_id), &ana, &[]).body, "true");
+        drop(g);
+        // Back to A: the one left is good again, as its key is; the revoked one stays revoked.
+        let (g, p) = start(a);
+        assert_eq!(list_status(p, &kept), 200);
+        assert_eq!(list_status(p, &gone), 401);
+        drop(g);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn c3_second_review_end_session_fails_while_the_door_is_open_and_tokens_cannot_go() {
+        let more = "route POST /lock = db.exec(\"pragma query_only = 1\")\nroute POST /unlock = db.exec(\"pragma query_only = 0\")\n";
+        let d = review_dir("cannot-delete", "db.open(\"data.db\")", more);
+        let (g, p, _) = watched(&d, &["--watch"]);
+        let ana = login(p, "ana", &[]);
+        let t = As::Token(token(p, &ana, &[]));
+        assert_eq!(route(p, "POST", "/lock", "", &[]).status, 200);
+        let a = route(p, "POST", "/logout", &ana, &[]);
+        assert!(a.status == 500 && a.body.contains("`end_session`: the session's MCP tokens could not be ended, so it was not"), "{}", a.body);
+        assert!(!a.headers.iter().any(|(k, v)| k == "set-cookie" && v.contains("quillo_session=")), "{:?}", a.headers);
+        assert_eq!(list_status(p, &t), 200);
+        assert_eq!(route(p, "POST", "/unlock", "", &[]).status, 200);
+        assert_eq!(route(p, "POST", "/logout", &ana, &[]).status, 204);
+        assert_eq!(list_status(p, &t), 401);
+        drop(g);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn c3_second_review_on_postgres_the_first_tokens_at_once_in_transactions() {
+        // Two first `mcp_token()`s inside the program's transactions at once: the table is made
+        // apart, the second takes the first's, and neither transaction is given up.
+        let Some(pg) = support::postgres("c3race") else { return };
+        let more = "route POST /token_slow = db.transaction(() => {\n    let t = mcp_token()\n    sleep(500)\n    t\n})\n";
+        let d = review_dir("pg-race", &format!("db.open({:?})", pg.database("c3race")), more);
+        let s = support::serve_with(&d.join("main.qwe"), &[]);
+        let p = s.port;
+        let cookies = [login(p, "ana", &[]), login(p, "bob", &[])];
+        let made: Vec<_> = cookies
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let c = c.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(150 * i as u64));
+                    route(p, "POST", "/token_slow", &c, &[])
+                })
+            })
+            .collect();
+        for (i, h) in made.into_iter().enumerate() {
+            let a = h.join().unwrap();
+            assert_eq!(a.status, 200, "{}: {}", i, a.body);
+            assert_eq!(list_status(p, &As::Token(a.body.clone())), 200);
+        }
+        drop(s);
         let _ = std::fs::remove_dir_all(&d);
     }
 

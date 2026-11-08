@@ -1189,11 +1189,17 @@ impl Kept {
     }
 }
 
-/// The tokens of a program with no database for Quillo's own tables.
-static MEMORY: std::sync::Mutex<Vec<Kept>> = std::sync::Mutex::new(Vec::new());
+/// The tokens of a program with no database for Quillo's own tables, by their hash: a request is
+/// one look-up, never a copy of them all (second review).
+static MEMORY: std::sync::Mutex<Option<HashMap<String, Kept>>> = std::sync::Mutex::new(None);
 
-fn memory() -> std::sync::MutexGuard<'static, Vec<Kept>> {
-    MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+/// The most tokens kept in memory for one user, and in all (second review).
+const MEMORY_PER_USER: usize = 100;
+const MEMORY_IN_ALL: usize = 10_000;
+
+fn with_memory<T>(f: impl FnOnce(&mut HashMap<String, Kept>) -> T) -> T {
+    let mut m = MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(m.get_or_insert_with(HashMap::new))
 }
 
 fn now_ms() -> i64 {
@@ -1246,10 +1252,12 @@ enum Store {
     Db(Option<usize>),
 }
 
+/// A database the program has that cannot be opened is that error, never memory (second review).
 fn kept_on(it: &mut Interp) -> Result<Store, String> {
-    match crate::db::system_on(it, false) {
-        None => Ok(Store::Memory),
-        Some(on) => Ok(if crate::db::own_table_there(it, on, TOKENS)? { Store::Db(on) } else { Store::NoTable }),
+    match crate::db::system_store(it, false)? {
+        crate::db::OwnStore::Nowhere => Ok(Store::Memory),
+        crate::db::OwnStore::NotYet => Ok(Store::NoTable),
+        crate::db::OwnStore::On(on) => Ok(if crate::db::own_table_there(it, on, TOKENS)? { Store::Db(on) } else { Store::NoTable }),
     }
 }
 
@@ -1258,21 +1266,36 @@ fn kept_on(it: &mut Interp) -> Result<Store, String> {
 fn keep(it: &mut Interp, mut k: Kept) -> Result<(), String> {
     let now = now_ms();
     k.seal = k.sealed_as();
-    match crate::db::system_on(it, true) {
+    let on = match crate::db::system_store(it, true)? {
+        crate::db::OwnStore::On(on) => Some(on),
+        crate::db::OwnStore::Nowhere => None,
+        crate::db::OwnStore::NotYet => return Err("the system database could not be made".into()),
+    };
+    match on {
         None => {
+            // Bounded: a program with no database keeps at most so many, a user's and in all.
+            with_memory(|m| {
+                m.retain(|_, x| x.expires > now);
+                let theirs = m.values().filter(|x| x.who == k.who && x.place == k.place).count();
+                if theirs >= MEMORY_PER_USER {
+                    return Err(format!("this user has {} already, the most kept in memory for one user, as the program has no database: revoke one, or give the program a database (db.open, db.system)", MEMORY_PER_USER));
+                }
+                if m.len() >= MEMORY_IN_ALL {
+                    return Err(format!("{} are kept already, the most kept in memory, as the program has no database: give the program a database (db.open, db.system)", MEMORY_IN_ALL));
+                }
+                m.insert(k.hash.clone(), k);
+                Ok(())
+            })?;
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("quillo: MCP tokens are kept in memory, as the program has no database: they end when the server stops (db.system(...) keeps them)");
             }
-            let mut m = memory();
-            m.retain(|x| x.expires > now);
-            m.push(k);
             Ok(())
         }
         Some(on) => {
             if !crate::db::own_table_there(it, on, TOKENS)? {
                 let mysql = crate::db::kind_on(it, on);
-                crate::db::own_table_make(it, on, &make_tokens(mysql)).map_err(|e| {
+                crate::db::own_table_make(it, on, TOKENS, &make_tokens(mysql)).map_err(|e| {
                     format!("its table, {}, could not be made ({}): the program's database user needs the right to create a table there, once", TOKENS, e)
                 })?;
             }
@@ -1297,66 +1320,77 @@ fn keep(it: &mut Interp, mut k: Kept) -> Result<(), String> {
 
 /// The token of `hash`, sound and kept here; None where there is none, or no table of them.
 fn kept_by_hash(it: &mut Interp, hash: &str) -> Result<Option<Kept>, String> {
-    let found = match kept_on(it)? {
-        Store::Memory => memory().clone(),
+    let found: Vec<Kept> = match kept_on(it)? {
+        Store::Memory => with_memory(|m| m.get(hash).cloned()).into_iter().collect(),
         Store::NoTable => return Ok(None),
         Store::Db(on) => rows(&sql(it, on, true, vec![Value::str(format!("{} where hash = ?", TOKEN_COLUMNS)), Value::str(hash)])?),
     };
     Ok(found.into_iter().find(|k| crate::crypto::same(k.hash.as_bytes(), hash.as_bytes()) && k.sound()))
 }
 
-/// Which tokens a call names, in this place, still good: a session's (by its owner, or the user
-/// it is signed in as, so that they are found after its cookie has gone or the user signs in
-/// again), `{ user }`'s, or (`end_session`) a session's own alone.
+/// Which tokens a call names, in this place, still good: a session's (made in it for the user it
+/// is signed in as, or made for that user, so that they are found after its cookie has gone or
+/// the user signs in again), `{ user }`'s, or (`end_session`) those made in it for its user alone.
+/// A session keeps its id from no user to a user (Q-887), so its id alone is not who it is: Bob,
+/// signing in on the browser Alice left without `end_session`, has her session's id, and her
+/// tokens are not his (second review).
 enum Whose {
     Session { owner: Option<String>, user: Option<String> },
     User(String),
-    Owner(String),
+    Made { owner: String, user: Option<String> },
 }
 
 impl Whose {
     fn names(&self, k: &Kept) -> bool {
+        let made_in = |owner: &str, user: &Option<String>| owner == k.owner && user.as_deref() == Some(k.who.as_str());
         match self {
-            Whose::Session { owner, user } => owner.as_deref() == Some(k.owner.as_str()) || user.as_deref() == Some(k.who.as_str()),
+            Whose::Session { owner, user } => owner.as_deref().is_some_and(|o| made_in(o, user)) || user.as_deref() == Some(k.who.as_str()),
             Whose::User(u) => *u == k.who,
-            Whose::Owner(o) => *o == k.owner,
+            Whose::Made { owner, user } => made_in(owner, user),
+        }
+    }
+
+    /// What a database is asked for first, compared exactly afterwards (`names`).
+    fn prefilter(&self) -> (&'static str, Vec<&str>) {
+        match self {
+            Whose::Session { owner, user } => ("(owner = ? or who = ?)", vec![owner.as_deref().unwrap_or(""), user.as_deref().unwrap_or("")]),
+            Whose::User(u) => ("who = ?", vec![u.as_str()]),
+            Whose::Made { owner, .. } => ("owner = ?", vec![owner.as_str()]),
         }
     }
 }
 
-/// The tokens `whose` names in `place`, sound and still good, oldest first: compared exactly here,
-/// whatever the database's collation took for the same.
-fn kept_of(it: &mut Interp, whose: &Whose, place: &str) -> Result<Vec<Kept>, String> {
+/// The tokens `whose` names in `place`, still good, oldest first: compared exactly here, whatever
+/// the database's collation took for the same. `sound`: only those whose seal holds, for using and
+/// listing; taking away takes those sealed under another key too, so that a token a logout or a
+/// revoke ended stays ended when the key is put back (second review).
+fn kept_of(it: &mut Interp, whose: &Whose, place: &str, sound: bool) -> Result<Vec<Kept>, String> {
     let now = now_ms();
-    let candidates = match kept_on(it)? {
-        Store::Memory => memory().clone(),
+    let fits = |k: &Kept| k.place == place && k.expires > now && whose.names(k) && (!sound || k.sound());
+    let mut found: Vec<Kept> = match kept_on(it)? {
+        Store::Memory => with_memory(|m| m.values().filter(|k| fits(k)).cloned().collect()),
         Store::NoTable => return Ok(Vec::new()),
         Store::Db(on) => {
-            let (cond, keys): (&str, Vec<&str>) = match whose {
-                Whose::Session { owner, user } => ("(owner = ? or who = ?)", vec![owner.as_deref().unwrap_or(""), user.as_deref().unwrap_or("")]),
-                Whose::User(u) => ("who = ?", vec![u.as_str()]),
-                Whose::Owner(o) => ("owner = ?", vec![o.as_str()]),
-            };
+            let (cond, keys) = whose.prefilter();
             let mut args = vec![Value::str(format!("{} where {} and place = ? and expires > ?", TOKEN_COLUMNS, cond))];
             args.extend(keys.into_iter().map(Value::str));
             args.push(Value::str(place));
             args.push(Value::Int(now));
-            rows(&sql(it, on, true, args)?)
+            rows(&sql(it, on, true, args)?).into_iter().filter(|k| fits(k)).collect()
         }
     };
-    let mut found: Vec<Kept> = candidates.into_iter().filter(|k| k.place == place && k.expires > now && whose.names(k) && k.sound()).collect();
     found.sort_by(|a, b| (a.made, &a.id).cmp(&(b.made, &b.id)));
     Ok(found)
 }
 
 /// Takes away the tokens `whose` names in `place`, all of them or the one of `id`: how many.
 fn take_away(it: &mut Interp, whose: &Whose, place: &str, id: Option<&str>) -> Result<i64, String> {
-    let doomed: Vec<String> = kept_of(it, whose, place)?.into_iter().filter(|k| id.map_or(true, |id| k.id == id)).map(|k| k.hash).collect();
+    let doomed: Vec<String> = kept_of(it, whose, place, false)?.into_iter().filter(|k| id.map_or(true, |id| k.id == id)).map(|k| k.hash).collect();
     if doomed.is_empty() {
         return Ok(0);
     }
     match kept_on(it)? {
-        Store::Memory => memory().retain(|k| !doomed.contains(&k.hash)),
+        Store::Memory => with_memory(|m| doomed.iter().for_each(|h| drop(m.remove(h)))),
         Store::NoTable => return Ok(0),
         Store::Db(on) => {
             for h in &doomed {
@@ -1367,15 +1401,16 @@ fn take_away(it: &mut Interp, whose: &Whose, place: &str, id: Option<&str>) -> R
     Ok(doomed.len() as i64)
 }
 
-/// `end_session()`'s part: the tokens of each of `owners` (the session the request came with,
-/// and the one it has now) end in this place.
-pub(crate) fn end_tokens(it: &mut Interp, owners: &[String]) -> Result<(), String> {
-    if owners.is_empty() {
+/// `end_session()`'s part: the tokens made in each of `sessions` (the one the request came with,
+/// and the one it has now: its owner and its user) for its user end in this place.
+pub(crate) fn end_tokens(it: &mut Interp, sessions: &[(String, Option<Value>)]) -> Result<(), String> {
+    if sessions.is_empty() {
         return Ok(());
     }
     let place = crate::session::place(it);
-    for o in owners {
-        take_away(it, &Whose::Owner(o.clone()), &place, None)?;
+    for (owner, user) in sessions {
+        let user = user.as_ref().map(|u| crate::interp::island_json(u).to_string());
+        take_away(it, &Whose::Made { owner: owner.clone(), user }, &place, None)?;
     }
     Ok(())
 }
@@ -1505,7 +1540,7 @@ fn mcp_tokens(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctr
     let o = options_of(args.first(), "mcp_tokens", &["user"], line)?;
     let Some(w) = whose(it, o) else { return Ok(Value::list(Vec::new())) };
     let place = crate::session::place(it);
-    let found = match kept_of(it, &w, &place) {
+    let found = match kept_of(it, &w, &place, true) {
         Ok(f) => f,
         Err(why) => return crate::interp::fail(line, format!("`mcp_tokens`: the tokens could not be read: {}", why)),
     };

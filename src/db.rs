@@ -2154,6 +2154,52 @@ pub(crate) fn system_on_for(it: &mut Interp, make: bool, always: bool) -> Option
     Some(Some(conns.len() - 1))
 }
 
+/// Where Quillo's own tables are, as `system_store` tells it.
+pub(crate) enum OwnStore {
+    /// The program has no database at all.
+    Nowhere,
+    /// Its system database is a file not made yet (and not to be made now): nothing is in it.
+    NotYet,
+    /// The connection, as `exec_on` takes it.
+    On(Option<usize>),
+}
+
+/// `system_on`, for what must not be kept elsewhere when the database is there but will not open
+/// (MCP tokens): `Nowhere` only where the program has no database at all; a database it has
+/// (`$QUILLO_DB`, the system database) that cannot be opened is that error, where `system_on`
+/// says None for each (FEEDBACK56.md, Q-859, second review; branch feedback56).
+pub(crate) fn system_store(it: &mut Interp, make: bool) -> Result<OwnStore, String> {
+    if let Some(i) = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().position(|(l, _)| l == SYSTEM) {
+        return Ok(OwnStore::On(Some(i)));
+    }
+    let slot = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    match slot {
+        Some(DbSlot::One(_)) => return Ok(OwnStore::On(None)),
+        Some(_) => {}
+        None => {
+            if std::env::var("QUILLO_DB").map_or(true, |v| v.is_empty()) {
+                let given = std::env::var("QUILLO_SYSTEM_DB").map_or(false, |v| !v.is_empty());
+                if !given && !it.base_dir.join("quillo-system.db").exists() {
+                    return Ok(OwnStore::Nowhere);
+                }
+            } else {
+                backend(it).map_err(|e| format!("the program's database ($QUILLO_DB) cannot be opened: {}", e))?;
+                if matches!(&*it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner), Some(DbSlot::One(_))) {
+                    return Ok(OwnStore::On(None));
+                }
+            }
+        }
+    }
+    let target = std::env::var("QUILLO_SYSTEM_DB").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "quillo-system.db".into());
+    if !make && !is_server_url(&target) && !it.base_dir.join(&target).exists() {
+        return Ok(OwnStore::NotYet);
+    }
+    let b = open_backend(it, &target).map_err(|e| format!("the system database {} cannot be opened: {}", target, e))?;
+    let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    conns.push((SYSTEM.to_string(), DbSlot::One(Arc::new(b))));
+    Ok(OwnStore::On(Some(conns.len() - 1)))
+}
+
 /// Whether a program uses `db.atomic` (then transactions it left prepared
 /// are looked after: see `recover`).
 pub fn uses_atomic(it: &Interp) -> bool {
@@ -2371,20 +2417,29 @@ pub(crate) fn own_table_there(it: &mut Interp, on: Option<usize>, table: &str) -
     }
 }
 
-/// Makes one of Quillo's own tables with `sql`: on MySQL and MariaDB on a connection of its own,
-/// as they commit a program's open transaction before a `create table` (see `later_table`); on
-/// the others in place, where it is part of the transaction (FEEDBACK56.md, Q-859; branch
-/// feedback56).
-pub(crate) fn own_table_make(it: &mut Interp, on: Option<usize>, sql: &str) -> Result<(), String> {
+/// Makes one of Quillo's own tables `table` with `sql`. On a server's database on a connection of
+/// its own, outside a program's transaction: MySQL and MariaDB commit an open one before a `create
+/// table` (see `later_table`), and on PostgreSQL a `create table` that fails, for a role that may
+/// not or for another maker at the same moment, gives up on it (second review). SQLite has one
+/// connection, and makes it in place. One another maker made meanwhile is made (FEEDBACK56.md,
+/// Q-859; branch feedback56).
+pub(crate) fn own_table_make(it: &mut Interp, on: Option<usize>, table: &str, sql: &str) -> Result<(), String> {
     let b = backend_on(it, on)?;
-    if b.is_mysql() {
-        return apart(it, &b, sql.into(), Vec::new()).map(|_| ());
-    }
-    match exec_on(it, on, vec![Value::str(sql)]) {
-        Ok(Value::Err(e, _, _)) => Err(e.display()),
-        Ok(_) => Ok(()),
-        Err(Ctrl::Error(e)) => Err(e.msg.clone()),
-        Err(_) => Err("the statement was stopped".into()),
+    let made = match &*b {
+        Backend::Sqlite(_) => match exec_on(it, on, vec![Value::str(sql)]) {
+            Ok(Value::Err(e, _, _)) => Err(e.display()),
+            Ok(_) => Ok(()),
+            Err(Ctrl::Error(e)) => Err(e.msg.clone()),
+            Err(_) => Err("the statement was stopped".into()),
+        },
+        _ => apart(it, &b, sql.into(), Vec::new()).map(|_| ()),
+    };
+    match made {
+        Err(e) if own_table_there(it, on, table).unwrap_or(false) => {
+            let _ = e;
+            Ok(())
+        }
+        other => other,
     }
 }
 
