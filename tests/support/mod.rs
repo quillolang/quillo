@@ -152,14 +152,38 @@ pub fn mariadb(name: &str) -> Option<Maria> {
     let dir = std::env::temp_dir().join(format!("quillo-my-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).ok()?;
-    let ok = Command::new(bin.join("mariadb-install-db"))
+    // Each server, and the one that makes its tables, keeps its temporary files in a folder of
+    // its own: in the system's shared one, servers of other tests removed them, and the tables
+    // were not made ("Could not remove temporary table ... Unknown table 'mysql.tmp_user_sys'"),
+    // now and then under the full test run, in CI too. No option file is read, and what the
+    // making says is kept for its failure (FEEDBACK56.md, found in CI; branch feedback56).
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(&tmp).ok()?;
+    let installed = Command::new(bin.join("mariadb-install-db"))
+        .arg("--no-defaults")
         .arg(format!("--datadir={}", dir.join("data").display()))
+        .arg(format!("--tmpdir={}", tmp.display()))
         .args(["--auth-root-authentication-method=normal", "--skip-test-db"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stdin(Stdio::null())
+        .output()
         .ok()?;
-    assert!(ok.success(), "mariadb-install-db failed");
+    if !installed.status.success() {
+        // What the server said as it made the tables is in the data folder's logs.
+        let mut logs = String::new();
+        for e in std::fs::read_dir(dir.join("data")).into_iter().flatten().flatten() {
+            let p = e.path();
+            if matches!(p.extension().and_then(|x| x.to_str()), Some("err" | "log")) {
+                logs += &format!("\n--- {}\n{}", p.display(), std::fs::read_to_string(&p).unwrap_or_default());
+            }
+        }
+        panic!(
+            "mariadb-install-db failed ({}): {}{}{}",
+            installed.status,
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr),
+            logs
+        );
+    }
     let child = Command::new(bin.join("mariadbd"))
         .arg("--no-defaults")
         .arg(format!("--datadir={}", dir.join("data").display()))
@@ -168,6 +192,7 @@ pub fn mariadb(name: &str) -> Option<Maria> {
         .arg(format!("--socket={}", dir.join("s").display()))
         .arg(format!("--pid-file={}", dir.join("pid").display()))
         .arg(format!("--log-error={}", dir.join("err.log").display()))
+        .arg(format!("--tmpdir={}", tmp.display()))
         .arg("--skip-grant-tables")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
