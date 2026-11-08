@@ -40,7 +40,10 @@ usage:
                                     does not work
   quillo fix <file.qwe>             write the `import`s a program's files need
   quillo docs <file.qwe>            the program's API as OpenAPI 3: its routes,
-                                    and its server fns' contracts
+              [--mcp]               and its server fns' contracts; --mcp: what an
+              [--policy FILE]       AI client is told of its tools instead, as
+              [--service-name N]    the MCP doors answer: server/discover on
+                                    stdio and over HTTP (under N), and tools/list
   quillo build <file.qwe>           build the Rust (.qwer files) a program uses,
                                     into .quillo/native/ next to them, so it
                                     runs where Rust is not installed
@@ -469,16 +472,9 @@ fn real_main(args: Vec<String>) -> i32 {
         }
         // The program's API as OpenAPI, from its source (FEEDBACK10.md, Q-077;
         // branch feedback10-fixes).
-        Some("docs") => with_one_program(&args, &[], |f, _| match quillo::describe::of_source(Path::new(f)) {
-            Ok(doc) => {
-                println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
-                0
-            }
-            Err(e) => {
-                eprintln!("quillo: {}", e);
-                1
-            }
-        }),
+        // `--mcp`: what an AI client is told of the program's tools, as its doors answer
+        // (FEEDBACK56.md, Part D; branch feedback56).
+        Some("docs") => docs(&args),
         Some("build") => with_one_program(&args, &[], |f, _| match quillo::native::build_all(Path::new(f)) {
                 Ok(libs) => {
                     for l in &libs {
@@ -609,6 +605,72 @@ fn real_main(args: Vec<String>) -> i32 {
     }
 }
 
+/// The options of `quillo docs`: `--mcp`, and with it the policy and the name the doors run under.
+const DOCS_OPTIONS: &[&str] = &["--mcp", "--policy", "--service-name"];
+
+/// `quillo docs main.qwe`: the program's API as OpenAPI, from its source. With `--mcp`, what an AI
+/// client is told of its tools, as its doors answer (`mcp::served`): under the policy they run
+/// under, the files beside it and `--policy`'s, as `quillo check` reads them, so that it prints
+/// nothing for a program they would refuse; and over HTTP under `--service-name`'s name, as
+/// `quillo run --service-name` serves it (FEEDBACK56.md, Part D, found in review; branch
+/// feedback56).
+fn docs(args: &[String]) -> i32 {
+    if args[2..].iter().any(|a| a == "-h" || a == "--help") {
+        println!("{}", USAGE);
+        return 0;
+    }
+    with_program(&args[2..], |f, flags| {
+        let (mut mcp, mut policies, mut name) = (false, Vec::new(), None);
+        let mut i = 0;
+        while i < flags.len() {
+            let a = flags[i].as_str();
+            match (a, flags.get(i + 1)) {
+                ("--mcp", _) => mcp = true,
+                ("--policy", Some(v)) => policies.push(PathBuf::from(v)),
+                ("--service-name", Some(v)) => name = Some(v.clone()),
+                ("--policy" | "--service-name", None) => {
+                    eprintln!("quillo: `{}` needs a value", a);
+                    return 2;
+                }
+                _ if a.starts_with('-') => {
+                    eprintln!("quillo: unknown option `{}` for `docs`{}", a, nearest(a, DOCS_OPTIONS.iter()));
+                    return 2;
+                }
+                _ => {
+                    eprintln!("quillo: unknown argument `{}`: `docs` takes one program", a);
+                    return 2;
+                }
+            }
+            i += if a == "--mcp" { 1 } else { 2 };
+        }
+        if !mcp && (!policies.is_empty() || name.is_some()) {
+            eprintln!("quillo: `--policy` and `--service-name` are for `quillo docs --mcp`: the OpenAPI document is the program's as written");
+            return 2;
+        }
+        let doc = if mcp {
+            if let Err(code) = with_policy(Path::new(f), &policies, !policies.is_empty()) {
+                return code;
+            }
+            if let Some(n) = &name {
+                quillo::service::serve_as(n);
+            }
+            quillo::mcp::served(Path::new(f))
+        } else {
+            quillo::describe::of_source(Path::new(f)).map_err(|e| e.to_string())
+        };
+        match doc {
+            Ok(doc) => {
+                println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+                0
+            }
+            Err(e) => {
+                eprintln!("quillo: {}", e);
+                1
+            }
+        }
+    })
+}
+
 /// The commands, for the nearest to a misspelt one (FEEDBACK31.md, Q-389; `serve`, `classes` and
 /// `fcgi` too: FEEDBACK55.md, Q-852; branch feedback55; `mcp`: FEEDBACK56.md, C.1; branch
 /// feedback56).
@@ -696,7 +758,9 @@ fn mcp(file: &str, flags: &[String]) -> i32 {
     }
     // What a builtin's error says is hidden from the client, as from a visitor, and logged.
     quillo::value::HIDING.store(true, std::sync::atomic::Ordering::Relaxed);
-    let mut door = quillo::mcp::Door::new(stem, tools);
+    // Its `//!` block too, told to the client after Quillo's lines (FEEDBACK56.md, Part D; branch
+    // feedback56).
+    let mut door = quillo::mcp::Door::of_program(path, stem, tools, false);
     if let Some(b) = policy.max_body {
         door.most = door.most.min(b);
     }

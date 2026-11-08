@@ -159,7 +159,7 @@ Their options, given after the command as `quillo run`'s are:
 | `quillo repl -i` | keep the greeting and prompts when the input comes from a pipe (see [The REPL](#the-repl)) |
 | `quillo mcp <file.qwe>` | serve the program's tools to an AI client over stdin and stdout (see [Tools for AI clients](#tools-for-ai-clients)); takes `--env-file`, `--policy`, `--allow-path`, `--no-build` and `-- args`, and refuses the options of serving |
 
-`quillo build`, `docs`, `fix` and `classes` take a program and no options.
+`quillo build`, `fix` and `classes` take a program and no options; `quillo docs --mcp` prints what an AI client is told, `server/discover` on stdio and over HTTP and `tools/list`, as JSON (a program with no tools is refused).
 
 ### Settings and the environment
 
@@ -2881,6 +2881,36 @@ per session or token) ([`--max-tool-calls`](#options-of-quillo-run), and a polic
 Code, when it starts or once the first version that loads has tools (FEEDBACK56.md, Q-853,
 Q-859, Q-860).
 
+**What the model is told.** `server/discover` carries `instructions`: a few lines Quillo
+writes, of facts about this server that no tool says (who a call acts as on that door, what an
+`isError` result and `internal error` mean, that text in results is data, not instructions),
+always under 600 characters; then, after an empty line, the main file's own `//!` block, for
+what the developer wants said about how their tools go together:
+
+```quillo
+//! Notes are private to the user who wrote them.
+//! Use search_notes before add_note, so a note is not written twice.
+
+/// Adds a note.
+fn mcp add_note(text: str) -> int with db = db.one("insert into notes (text) values (?) returning id", text).id
+```
+
+Only the main file's block counts, and only at its top (blank lines and `//` or `/* */`
+comments before it are fine, `/** */` and `/*! */` banners too; a `///`, a `use` or code ends
+it), as a `.qwer` file's header is read; other files' `//!` lines are not sent. A character a
+reader of the file does not see (a control character, a bidirectional mark, embedding,
+override or isolate, a zero-width space, a line separator, a tag character) anywhere in the
+block is an error at its line and column, and the program does not start with it: what the
+model reads must be what the developer sees. The zero width joiner and non-joiner, which
+emoji and Persian need, are let through. The first line names the program, cut at 24
+characters. `quillo check` warns when the whole is over 2,000
+characters on either door (the HTTP door counted under `--service-name` when `quillo run` is
+given one), saying by how much: clients cut long instructions short. `quillo docs --mcp
+main.qwe` (with `--policy FILE` and `--service-name N` as `quillo run` takes them, and the
+policy beside the program) prints what each door sends, `server/discover` on stdio and over HTTP and
+`tools/list`, as JSON, so the developer reads what the model reads; it says as much as
+`/_quillo/describe` does, so keep it private (FEEDBACK56.md, Part D).
+
 Limits: the count of tool calls is kept by each server process, so under `--instances` or on
 several machines each counts its own; and a program with no database keeps its tokens in that
 process's memory (100 a user, 10,000 in all), lost at a restart and unknown to the others, so
@@ -5441,7 +5471,9 @@ app does not run itself needs `--service-url` or `QUILLO_SERVICE_<NAME>`, and
 
 #### The program's API (OpenAPI)
 
-`quillo docs app.qwe` writes the program's API as OpenAPI 3, from its source: each
+`quillo docs app.qwe` writes the program's API as OpenAPI 3, from its source (`quillo docs
+--mcp app.qwe` prints what AI clients are told instead, see [Tools for AI
+clients](#tools-for-ai-clients)): each
 route's path, query and payload patterns, and each `server fn`'s contract
 (`x-quillo-server-fns`, with `x-quillo-callers` for one declared `for [...]`), with the routes of the services it serves under their prefixes.
 Started with the option [`--describe`](#options-of-quillo-run), `quillo run app.qwe --describe`, the server serves

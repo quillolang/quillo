@@ -17,6 +17,14 @@
   parameter, or an effect its body uses that its `with` does not say; highlighting, hover, completion and the outline know the tag.
   `mcp` stays an ordinary name everywhere else. The door is not built yet (FEEDBACK56.md,
   Q-853).
+- `server/discover` carries `instructions`: a few lines Quillo writes (under 600 characters),
+  then the main file's top `//!` block, in which a character a reader does not see (a
+  bidirectional override, a zero-width space) is an error; `quillo check` warns past 2,000
+  characters, and `quillo docs --mcp app.qwe` (`--policy`, `--service-name`) prints exactly
+  what each door sends (FEEDBACK56.md, Part D).
+- A `.qwer` file's `//!` header after a `/*! ... */` banner, or after `/* a */ /* b` on one line,
+  is read as Rust reads it: the banner no longer ends it, and an open comment hides what is in
+  it (FEEDBACK56.md, found in review).
 - `/_quillo/mcp` serves a program's tools over HTTP from `quillo run`, to a signed-in session or
   a token (`mcp_token()`, `mcp_tokens()`, `revoke_mcp_token(id)`; `end_session()` ends them),
   never to a page on another site; 60 tool calls a minute per user (`--max-tool-calls`,

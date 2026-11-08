@@ -1648,7 +1648,19 @@ fn check_source_with(src: &str, file: &str, base_dir: &Path, overrides: HashMap<
     }
     // A mounted program's types are its own.
     let outer_records = RECORDS.with(|r| std::mem::take(&mut *r.borrow_mut()));
-    let a = check_source_in(src, file, base_dir, overrides, opts);
+    let mut a = check_source_in(src, file, base_dir, overrides, opts);
+    // What AI clients are told of the program, its main file's `//!` block among it, past what a
+    // client may keep (FEEDBACK56.md, Part D; branch feedback56).
+    // A character in the block that a reader of the file does not see is an error, so the program
+    // does not start with it (found in review).
+    if outermost {
+        if let Some((line, message)) = crate::mcp::unseen_in_block(src) {
+            a.diagnostics.push(Diagnostic { file: file.to_string(), line, severity: Severity::Error, message });
+        }
+        if let Some((line, message)) = crate::mcp::instructions_warning(file, src, a.tools.len()) {
+            a.diagnostics.push(Diagnostic { file: file.to_string(), line, severity: Severity::Warning, message });
+        }
+    }
     RECORDS.with(|r| *r.borrow_mut() = outer_records);
     DEPTH.with(|d| d.set(d.get() - 1));
     a

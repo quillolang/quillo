@@ -2259,7 +2259,9 @@ app does not run itself needs `--service-url` or `QUILLO_SERVICE_<NAME>`, and
 
 ### The program's API (OpenAPI)
 
-`quillo docs app.qwe` writes the program's API as OpenAPI 3, from its source: each
+`quillo docs app.qwe` writes the program's API as OpenAPI 3, from its source (`quillo docs
+--mcp app.qwe` prints what AI clients are told instead, see [Tools for AI
+clients](#tools-for-ai-clients)): each
 route's path, query and payload patterns, and each `server fn`'s contract
 (`x-quillo-server-fns`, with `x-quillo-callers` for one declared `for [...]`), with the routes of the services it serves under their prefixes.
 Started with the option [`--describe`](#options-of-quillo-run), `quillo run app.qwe --describe`, the server serves

@@ -154,7 +154,7 @@ Their options, given after the command as `quillo run`'s are:
 | `quillo repl -i` | keep the greeting and prompts when the input comes from a pipe (see [The REPL](#the-repl)) |
 | `quillo mcp <file.qwe>` | serve the program's tools to an AI client over stdin and stdout (see [Tools for AI clients](#tools-for-ai-clients)); takes `--env-file`, `--policy`, `--allow-path`, `--no-build` and `-- args`, and refuses the options of serving |
 
-`quillo build`, `docs`, `fix` and `classes` take a program and no options.
+`quillo build`, `fix` and `classes` take a program and no options; `quillo docs --mcp` prints what an AI client is told, `server/discover` on stdio and over HTTP and `tools/list`, as JSON (a program with no tools is refused).
 
 ## Settings and the environment
 

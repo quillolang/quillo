@@ -88,38 +88,97 @@ pub struct Parsed {
     pub effects: Option<u8>,
 }
 
+/// The `//!` lines at the top of a file: each one's line (from 0) and its text after `//!` and one
+/// space. Blank lines, plain `//` comments and block comments before and between them are passed
+/// over, and in Rust (`rust`) `#![...]` and `/*! ... */` too; anything else ends them, a `///` line
+/// among it, which is the first item's, and in Rust a `/** ... */`. Block comments are read as the
+/// file's own lexer reads them, several on a line too: Rust's nest; Quillo's end at the first `*/`,
+/// and `/**` and `/*!` are plain ones (src/lexer.rs, `skip_inline_ws`). A `.qwer` file's header,
+/// and a main `.qwe` file's text for AI clients (`mcp::own_block`; FEEDBACK56.md, Part D; branch
+/// feedback56; the block comments as the lexer reads them found in review, for `.qwer` files too,
+/// where `/* a */ /* b` on one line left the second open unseen and `/*!` ended the header).
+pub fn header_lines(src: &str, rust: bool) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    // How deep in block comments a line starts (Quillo's: at most 1), and in an attribute.
+    let (mut depth, mut attribute) = (0usize, false);
+    for (n, line) in src.lines().enumerate() {
+        // A licence line, a blank one or `#![allow(...)]` before it is no end of the header: Rust
+        // takes `//!` lines after them, and the header was missed (FEEDBACK55.md, Q-814; branch
+        // feedback55). A `///` line is the first item's.
+        if attribute {
+            attribute = !line.contains(']');
+            continue;
+        }
+        let mut rest = line;
+        loop {
+            if depth > 0 {
+                match comment_end(rest, &mut depth, rust) {
+                    Some(after) => rest = after,
+                    None => break,
+                }
+            }
+            let t = rest.trim_start();
+            if t.is_empty() {
+                break;
+            }
+            if let Some(text) = t.strip_prefix("//") {
+                if let Some(text) = text.strip_prefix('!') {
+                    out.push((n, text.strip_prefix(' ').unwrap_or(text)));
+                } else if text.starts_with('/') && !text.starts_with("//") {
+                    return out;
+                }
+                break;
+            }
+            if let Some(after) = t.strip_prefix("/*") {
+                // Rust's `/**` (not `/**/` or `/***`) is the first item's doc comment.
+                if rust && after.starts_with('*') && !after.starts_with("*/") && !after.starts_with("**") {
+                    return out;
+                }
+                depth = 1;
+                rest = after;
+                continue;
+            }
+            if rust && t.starts_with("#![") {
+                attribute = !t[3..].contains(']');
+                break;
+            }
+            return out;
+        }
+    }
+    out
+}
+
+/// What of `s` follows the end of the block comment it is `depth` deep in, None when it does not
+/// end there (`depth` then as deep as it is at the end of `s`). Rust's nest; Quillo's end at the
+/// first `*/`.
+fn comment_end<'a>(s: &'a str, depth: &mut usize, rust: bool) -> Option<&'a str> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i + 1 < b.len() {
+        match (b[i], b[i + 1]) {
+            (b'*', b'/') => {
+                *depth -= 1;
+                i += 2;
+                if *depth == 0 {
+                    return Some(&s[i..]);
+                }
+            }
+            (b'/', b'*') if rust => {
+                *depth += 1;
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// Reads a `.qwer` file's header and its top-level `pub fn`s.
 pub fn parse(src: &str) -> Parsed {
     let mut out = Parsed::default();
     // The header: `//!` lines at the top, from `[dependencies]` on.
     let mut in_deps = false;
-    let mut skipping: Option<&str> = None;
-    for (n, line) in src.lines().enumerate() {
-        // A licence line, a blank one or `#![allow(...)]` before it is no end of the header: Rust
-        // takes `//!` lines after them, and the header was missed (FEEDBACK55.md, Q-814; branch
-        // feedback55). A `///` line is the first item's.
-        let t = line.trim();
-        // A block comment, or an attribute, on several lines: to its end.
-        if let Some(close) = skipping {
-            if t.contains(close) {
-                skipping = None;
-            }
-            continue;
-        }
-        let block = t.starts_with("/*") && !t.starts_with("/*!") && !t.starts_with("/**");
-        if block || t.starts_with("#![") {
-            let (open, close) = if block { ("/*", "*/") } else { ("#![", "]") };
-            if !t[open.len()..].contains(close) {
-                skipping = Some(close);
-            }
-            continue;
-        }
-        let doc = t.starts_with("///") && !t.starts_with("////");
-        if t.is_empty() || (t.starts_with("//") && !t.starts_with("//!") && !doc) {
-            continue;
-        }
-        let Some(rest) = line.trim_start().strip_prefix("//!") else { break };
-        let rest = rest.strip_prefix(' ').unwrap_or(rest);
+    for (n, rest) in header_lines(src, true) {
         if let Some(list) = rest.trim().strip_prefix("effects:") {
             let mut mask = 0;
             for e in list.split(',').map(str::trim).filter(|e| !e.is_empty() && *e != "none") {
