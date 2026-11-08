@@ -26,8 +26,8 @@ https://github.com/quillolang/quillo/blob/v0.6.0/USERGUIDE.md.
 
 ### Options of `quillo run`
 
-`quillo run` checks the program, executes its top level and, if it declared routes or
-`server fn`s, serves them; a program with neither ends when its top level has run
+`quillo run` checks the program, executes its top level and, if it declared routes,
+`server fn`s or tools (`fn mcp`), serves them; a program with none of them ends when its top level has run
 (under `--watch` it is served all the same). The program is the first argument that is
 not an option, wherever it stands (`quillo run --watch main.qwe` works); left out, or
 given a folder, it is that folder's `main.qwe`, so `quillo run` in a program's folder
@@ -2877,16 +2877,17 @@ headers against the message). Who may call:
 - **A token**: `Authorization: Bearer ...`. `mcp_token()`, called in a route where someone is
   signed in, makes one tied to that session and gives it once, for them to paste into their
   AI client. It lasts as long as the session has left when the program gave the session a
-  `max_age`, else 30 days (`mcp_token({ max_age: 7 * 24 * 3600 })` says otherwise, up to a
-  year; `mcp_token({ user })` for a program that names its caller another way). Quillo keeps
+  `max_age`, else 30 days (`mcp_token({ max_age: 7 * 24 * 3600 })` says otherwise; a longer
+  one than 366 days is cut to 366; `mcp_token({ user })` for a program that names its caller another way). Quillo keeps
   only its signature under the session key (`QUILLO_SECRET`), in `_quillo_mcp_tokens` (or in
   memory for a program with no database: at most 100 a user and 10,000 in all, `mcp_token()`
   refused past either), and seals each row as it seals a cookie: a row
   changed in the database is no token. The first `mcp_token()` makes that table, and fails
   saying so where the database user may not create one. A database the program has that will
   not open is an error, never memory: `mcp_token`, `mcp_tokens` and `revoke_mcp_token` fail, a
-  call with a token is a `503`, and `end_session()` fails while the door is open.
-  `mcp_tokens()` lists the tokens made in this session for its `user`, or for its `user`, also
+  call with a token is a `503`, and `end_session()` fails while the door is open (the program
+  has tools and is serving them).
+  `mcp_tokens()` lists the tokens made in this session, or for its `user`, also
   after its cookie has gone or on a new sign-in, and `revoke_mcp_token(id)` ends one
   (`{ user }` reaches all of that user's, as a token a session made for someone else is reached);
   `end_session()` ends the tokens made in that session for its user, whether the door is open
@@ -2897,11 +2898,13 @@ In a tool, `session()` and `tenant()` are the caller's: a token's are those of t
 was made in, as they were then (a session is a signed cookie, kept nowhere else), so check
 what can change, a role, in the database on each call. Cookies a tool sets go back to a
 cookie caller and are dropped for a token's. `request.mcp` is `{ client, version }` from
-what the client says of itself, and null on any other request. Each user may make 60 tool
+what the client says of itself, and null on any other request; it is read where `request` is,
+in a `server fn mcp` (a plain `fn mcp` has no `request`). Each user may make 60 tool
 calls a minute, the cookie and their tokens together, per tenant (a caller with no `user`:
 per session or token) ([`--max-tool-calls`](#options-of-quillo-run), and a policy's
 `[limits] max_tool_calls` can lower it); one more is a `429` with `Retry-After`. Under
-`--watch` on 127.0.0.1, `quillo run` prints a token for the door, at
+`--watch` on 127.0.0.1, `quillo run` prints a token for the door (one with no one signed in:
+`session().user` is null in a call made with it), at
 `http://127.0.0.1:PORT/_quillo/mcp` (without `--base`), and the line that adds it to Claude
 Code, when it starts or once the first version that loads has tools (FEEDBACK56.md, Q-853,
 Q-859, Q-860).
@@ -2936,7 +2939,8 @@ fn mcp publish_post(title: str, body: str) -> int with db {
 - The answers come back in a state Quillo signs: good for 10 minutes, once, for the same
   caller, tool and arguments; anything else is refused (`-32602`), used up, and the call starts
   over. A state whose use cannot be recorded is refused too. A person who declines or dismisses
-  a question ends the call (an `isError` saying so).
+  an `ask` ends the call (an `isError` saying so); a `confirm` declined, dismissed or sent back
+  unticked is a no.
 - A client that cannot ask: `ask` takes its default, and the result says so (`the user was not
   asked "Who can see it?": the default "Only me, as a draft" was taken`), so the model can tell
   the person; `confirm` refuses (`isError`: this needs the user's yes, and this client cannot

@@ -15,8 +15,7 @@
   `service mcp /path = "file.qwe"` a service whose tools are the program's. `quillo check` holds
   them to MCP's names and to data answers, and warns of a tool with no `///`, an untyped
   parameter, or an effect its body uses that its `with` does not say; highlighting, hover, completion and the outline know the tag.
-  `mcp` stays an ordinary name everywhere else. The door is not built yet (FEEDBACK56.md,
-  Q-853).
+  `mcp` stays an ordinary name everywhere else (FEEDBACK56.md, Q-853).
 - `service mcp /billing = "billing.qwe"` offers billing's own tools as `billing.<name>`, run in
   billing in one process or over the signed call under `--split` (signed with the app's key too,
   so only the app's door runs them), with the caller's session and tenant; a service function's `confirm` and `ask` ask the person through the program's door

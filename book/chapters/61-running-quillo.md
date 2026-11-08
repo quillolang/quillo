@@ -21,8 +21,8 @@ https://github.com/quillolang/quillo/blob/v0.6.0/USERGUIDE.md.
 
 ## Options of `quillo run`
 
-`quillo run` checks the program, executes its top level and, if it declared routes or
-`server fn`s, serves them; a program with neither ends when its top level has run
+`quillo run` checks the program, executes its top level and, if it declared routes,
+`server fn`s or tools (`fn mcp`), serves them; a program with none of them ends when its top level has run
 (under `--watch` it is served all the same). The program is the first argument that is
 not an option, wherever it stands (`quillo run --watch main.qwe` works); left out, or
 given a folder, it is that folder's `main.qwe`, so `quillo run` in a program's folder

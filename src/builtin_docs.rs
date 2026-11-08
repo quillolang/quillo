@@ -125,7 +125,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("delete_cookie", "name, options", "Removes a cookie; `options` gives the `path` and `domain` it was set with."),
     ("session", "", "The session as a map, `{}` when there is none."),
     ("set_session", "data, options", "Replaces the session, for 30 days unless `max_age` says; null ends it. The browser can read it."),
-    ("end_session", "", "Forgets the session and removes its cookie; a copy someone kept stays valid until it expires."),
+    ("end_session", "", "Forgets the session, removes its cookie and ends its MCP tokens; a copy of the cookie someone kept stays valid till it expires."),
     // The MCP door's tokens (FEEDBACK56.md, Q-859; branch feedback56)
     ("mcp_token", "options", "A token for `/_quillo/mcp`, tied to this session and given once; `user` and `max_age` (30 days) as options."),
     ("mcp_tokens", "options", "The session's MCP tokens, or `{ user }`'s: `{ id, user, made, expires }` each, never the token."),
@@ -189,7 +189,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("db.one", "sql, params", "The first row as a map, or null, or an error value."),
     ("db.transaction", "options, f", "Runs `f` all or nothing; an error value rolls it back. `options` may be left out."),
     ("db.sql_name", "name", "A name quoted for this database: on a connection (`shop.sql_name(col)`), for that one, as MySQL reads \"x\" as text."),
-    ("db.error_kind", "e", "What failed: `unique`, `foreign_key`, `not_null`, `check` or `conflict`, else null."),
+    ("db.error_kind", "e", "What failed: `unique`, `foreign_key`, `not_null`, `check`, `conflict`, `connection` or `read_only`, else null."),
     ("db.migrate", "dir", "Runs the `.sql` files of `dir` (`migrations` unless given) not yet run, in name order; gives their names."),
     ("db.tenants", "", "The names of the tenants that have a database; it needs a `{tenant}` target, not a function."),
     ("db.tenant_exists", "name", "Whether tenant `name` has a database, without making one; it needs a database per tenant."),
