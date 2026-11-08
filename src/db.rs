@@ -3807,8 +3807,27 @@ fn atomic_panicked(it: &mut Interp, parts: &[Part], begun: &[usize], raised: boo
             close_after(it, c, sqls);
         } else if p.prepared {
             for sql in sqls {
-                let _ = apart(it, &p.b, sql, Vec::new());
+                end_let_go(it, &p.b, p.kind, sql);
             }
+        }
+    }
+}
+
+/// A prepared part ended on another connection, the panic having closed its own. MySQL and
+/// MariaDB let another session end an XA transaction only once the one it was prepared on is
+/// gone, and the server sees a closed socket in its own time: before then the other session is
+/// told `XAER_NOTA: Unknown XID`, which was taken as done, and under load the part waited a minute
+/// for recovery with its rows held. Tried again for 5 s, the interpreter let go meanwhile; then
+/// recovery ends it as before (FEEDBACK56.md, found under load in the coverage run; branch
+/// feedback56). PostgreSQL's prepared transaction belongs to no session.
+fn end_let_go(it: &mut Interp, b: &Arc<Backend>, kind: Kind, sql: String) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match apart(it, b, sql.clone(), Vec::new()) {
+            Err(e) if kind == Kind::My && e.contains("XAER_NOTA") && std::time::Instant::now() < until => {
+                it.unlocked(|| std::thread::sleep(std::time::Duration::from_millis(20)));
+            }
+            _ => return,
         }
     }
 }
