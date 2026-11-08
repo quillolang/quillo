@@ -1109,7 +1109,10 @@ is, the same for SQLite, PostgreSQL and MySQL, whose words for it differ: `"uniq
 or unique column has the value already), `"foreign_key"`, `"not_null"`, `"check"`,
 `"conflict"` (another transaction: the database busy, a deadlock, a serialization
 failure), `"connection"` (the server ended the connection, or it could not be made:
-`57P01` and class `08`) *(since 0.7)*, or null for any other failure and for anything else.
+`57P01` and class `08`) *(since 0.7)*, `"read_only"` (a write the database refused because
+the transaction only reads, as a tool's that only reads is: `25006`, SQLite's "attempt to
+write a readonly database", MySQL's 1792; FEEDBACK56.md, Q-858), or null for any other
+failure and for anything else.
 A transaction whose first statement finds that the server ended its pooled connection
 while it sat idle, as after a restart or a failover, is begun again on another one: nothing
 had run. It needs no effect.

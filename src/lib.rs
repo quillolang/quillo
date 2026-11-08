@@ -77,6 +77,7 @@ pub mod money;
 #[cfg(feature = "mysql")]
 pub mod my;
 pub mod lsp;
+pub mod mcp;
 pub mod parser;
 pub mod script;
 pub mod pg;

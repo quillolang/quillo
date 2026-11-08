@@ -611,6 +611,8 @@ fn kind_of(msg: &str) -> Option<&'static str> {
             "23502" => return Some("not_null"),
             "23514" => return Some("check"),
             "40001" | "40p01" | "55p03" => return Some("conflict"),
+            // A write in a read-only transaction (FEEDBACK56.md, Q-858; branch feedback56).
+            "25006" => return Some("read_only"),
             // The server ended the connection (a restart, a failover, an administrator), or
             // it could not be made (FEEDBACK49.md, Q-601; branch main).
             "57p01" | "57p02" | "57p03" => return Some("connection"),
@@ -640,9 +642,31 @@ fn kind_of(msg: &str) -> Option<&'static str> {
         Some("check")
     } else if has(&["database is locked", "database is busy", "could not serialize access", "deadlock detected", "deadlock found", "lock wait timeout", "(1213)", "(1205)"]) {
         Some("conflict")
+    // A write the database refused: SQLite's `query_only` or a file it cannot write, by its own
+    // words at the start, and MySQL's read-only transaction by its code in the head of its
+    // message, where no value is: the same kind on each, after the others, as a value in a
+    // message ("duplicate entry '(1792)'") is no code (FEEDBACK56.md, Q-858, found in review;
+    // branch feedback56).
+    } else if m.starts_with("attempt to write a readonly database") || mysql_codes(&m).is_some_and(|(a, b)| a == "1792" || b == "1792") {
+        Some("read_only")
     } else {
         None
     }
+}
+
+/// The two codes in the head of a MySQL server's message, `Server error: \`ERROR 1792 (25006):
+/// ...`, in lower case (FEEDBACK56.md, Q-858, found in review; branch feedback56).
+fn mysql_codes(m: &str) -> Option<(&str, &str)> {
+    let rest = m.strip_prefix("server error: `error ")?;
+    let (a, rest) = rest.split_once(" (")?;
+    let (b, _) = rest.split_once("):")?;
+    Some((a, b))
+}
+
+/// Whether the program has a database: opened, or named by `$QUILLO_DB` for the first use to open
+/// (FEEDBACK56.md, Q-858, found in review; branch feedback56).
+pub(crate) fn has_database(it: &Interp) -> bool {
+    slot_on(it, None).is_some() || std::env::var_os("QUILLO_DB").is_some()
 }
 
 fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
@@ -2771,6 +2795,20 @@ fn tx_gone(b: &Arc<Backend>, c: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// SQLite's `query_only` while a read-only transaction runs, put back as it was when dropped
+/// (FEEDBACK56.md, Q-858, found in review; branch feedback56).
+struct QueryOnly<'a> {
+    conn: &'a Mutex<Connection>,
+    was: i64,
+}
+
+impl Drop for QueryOnly<'_> {
+    fn drop(&mut self) {
+        let c = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = c.execute_batch(&format!("pragma query_only = {}", if self.was != 0 { 1 } else { 0 }));
+    }
+}
+
 /// One try of a transaction on connection `on`: what `body` gave (or the
 /// error that ended it), and whether the database gave up on it because of
 /// another transaction (then it is worth another try; told only for the
@@ -2788,11 +2826,17 @@ pub(crate) fn attempt(
     };
     let ok = |r: &R| matches!(r, Ok(v) if !matches!(v, Value::Err(..)));
     let nested_isolation = || fail(line, "a transaction inside another cannot change its isolation: give it to the outermost one");
+    // A read-only transaction is the outermost: one inside another would end with it, and leave
+    // the rest of that one able to write, or not (FEEDBACK56.md, Q-858; branch feedback56).
+    let nested_read_only = || fail(line, "a read-only transaction cannot be inside another");
     match &*b {
         Backend::Sqlite(m) => {
             let outermost = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_autocommit();
             if !outermost && opts.isolation.is_some() {
                 return (nested_isolation(), false);
+            }
+            if !outermost && opts.read_only {
+                return (nested_read_only(), false);
             }
             // With options, the outermost takes the write lock at once.
             let immediate = outermost && opts.given;
@@ -2801,6 +2845,22 @@ pub(crate) fn attempt(
             if let Err(e) = run(if immediate { "begin immediate" } else { "savepoint quillo_tx" }) {
                 return (Ok(db_err(&e)), immediate && busy(&e));
             }
+            // SQLite's read-only transaction: the connection refuses every change while it runs.
+            // Nothing else runs on it meanwhile (a transaction holds it, see `IN_TX`). What it
+            // was is put back as the body ends, whatever ended it, a panic too (FEEDBACK56.md,
+            // Q-858, found in review; branch feedback56).
+            let query_only = if opts.read_only {
+                let was = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_row("pragma query_only", [], |row| row.get::<_, i64>(0));
+                match was.and_then(|was| run("pragma query_only = on").map(|()| was)) {
+                    Ok(was) => Some(QueryOnly { conn: m, was }),
+                    Err(e) => {
+                        let _ = run(if immediate { "rollback" } else { "rollback to quillo_tx; release quillo_tx" });
+                        return (Ok(db_err(&e)), false);
+                    }
+                }
+            } else {
+                None
+            };
             let mark = tx_begin(it);
             it.sqlite_tx += 1;
             let mine = Arc::as_ptr(&b) as usize;
@@ -2808,6 +2868,7 @@ pub(crate) fn attempt(
             crate::httpd::hold_in_place(true);
             let r = caught(it, body);
             crate::httpd::hold_in_place(false);
+            drop(query_only);
             IN_TX.with(|t| {
                 let mut t = t.borrow_mut();
                 if let Some(i) = t.iter().rposition(|p| *p == mine) {
@@ -2856,6 +2917,9 @@ pub(crate) fn attempt(
             if pinned && opts.isolation.is_some() {
                 return (nested_isolation(), false);
             }
+            if pinned && opts.read_only {
+                return (nested_read_only(), false);
+            }
             if !pinned {
                 let mut c = match checkout_for_tx(it, &b) {
                     Ok(c) => c,
@@ -2870,7 +2934,7 @@ pub(crate) fn attempt(
                 tx.depth += 1;
                 tx.depth
             };
-            let begin = if depth == 1 { crate::txn::begin_sql(b.is_mysql(), opts.isolation) } else { format!("savepoint quillo_tx_{}", depth) };
+            let begin = if depth == 1 { crate::txn::begin_sql(b.is_mysql(), opts.isolation, opts.read_only) } else { format!("savepoint quillo_tx_{}", depth) };
             let mut started = { let begin = begin.clone(); pooled_run(it, &b, move |c| c.batch(&begin)) };
             // A pooled connection the server ended while it sat idle (a restart, a failover)
             // fails its first statement: nothing has run, so another is taken and the

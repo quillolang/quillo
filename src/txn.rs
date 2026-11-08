@@ -63,6 +63,10 @@ pub struct Options {
     pub retries: u32,
     /// Options were given at all (SQLite then begins `immediate`).
     pub given: bool,
+    /// The database refuses every write in it: how the MCP door runs a tool found to only read,
+    /// so a statement misjudged fails instead of writing. Not an option a program writes
+    /// (FEEDBACK56.md, Q-858; branch feedback56).
+    pub read_only: bool,
 }
 
 /// The most `retries` may be: past that, something else is wrong.
@@ -110,13 +114,21 @@ pub fn options(v: &Value, f: &str, line: u32) -> Result<Options, Ctrl> {
     Ok(o)
 }
 
-/// The statement that begins the outermost transaction.
-pub(crate) fn begin_sql(mysql: bool, isolation: Option<Isolation>) -> String {
+/// The statement that begins the outermost transaction. Read-only, PostgreSQL's `begin read
+/// only` and MySQL's and MariaDB's `start transaction read only`, whose `begin` takes no mode
+/// (FEEDBACK56.md, Q-858; branch feedback56).
+pub(crate) fn begin_sql(mysql: bool, isolation: Option<Isolation>, read_only: bool) -> String {
+    let begin = match (mysql, read_only) {
+        (_, false) => "begin",
+        (false, true) => "begin read only",
+        (true, true) => "start transaction read only",
+    };
     match (isolation, mysql) {
-        (None, _) => "begin".into(),
+        (None, _) => begin.into(),
+        (Some(i), false) if read_only => format!("begin isolation level {}, read only", i.sql()),
         (Some(i), false) => format!("begin isolation level {}", i.sql()),
         // For the next transaction only.
-        (Some(i), true) => format!("set transaction isolation level {}; begin", i.sql()),
+        (Some(i), true) => format!("set transaction isolation level {}; {}", i.sql(), begin),
     }
 }
 

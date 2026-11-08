@@ -1263,3 +1263,957 @@ fn q853_review_a_tools_parameters_are_no_call_of_it() {
     drop(e);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ---- slice 3: a tool's schemas in JSON Schema 2020-12 (Part B.2), its hints (B.3), and what
+// only reads (Q-858) --------------------------------------------------------------------------
+
+use quillo::mcp::{self, Tool};
+use quillo::value::Value as Q;
+
+/// The tools of a program of several files, as the door lists them.
+fn tools_in(name: &str, files: &[(&str, &str)]) -> Vec<Tool> {
+    let d = support::temp_dir(&format!("feedback56-{}", name));
+    for (f, src) in files {
+        std::fs::write(d.join(f), src).unwrap();
+    }
+    let t = mcp::of_source(&d.join("main.qwe"));
+    let _ = std::fs::remove_dir_all(&d);
+    t.unwrap_or_else(|e| panic!("{}", e))
+}
+
+fn tools_of(name: &str, src: &str) -> Vec<Tool> {
+    tools_in(name, &[("main.qwe", src)])
+}
+
+fn the<'a>(tools: &'a [Tool], name: &str) -> &'a Tool {
+    tools.iter().find(|t| t.name == name).unwrap_or_else(|| panic!("no tool {} in {:?}", name, tools.iter().map(|t| &t.name).collect::<Vec<_>>()))
+}
+
+/// What the checker found each tool's code to do.
+fn facts_in(name: &str, files: &[(&str, &str)]) -> Vec<quillo::check::ToolFacts> {
+    let d = support::temp_dir(&format!("feedback56-{}", name));
+    for (f, src) in files {
+        std::fs::write(d.join(f), src).unwrap();
+    }
+    let a = quillo::check::check_file(&d.join("main.qwe"));
+    let _ = std::fs::remove_dir_all(&d);
+    let errors: Vec<String> = a.errors().map(|x| x.to_string()).collect();
+    assert!(errors.is_empty(), "{:#?}", errors);
+    a.tools
+}
+
+fn fact<'a>(facts: &'a [quillo::check::ToolFacts], name: &str) -> &'a quillo::check::ToolFacts {
+    facts.iter().find(|f| f.def.name == name).unwrap_or_else(|| panic!("no tool {}", name))
+}
+
+/// Every `$ref` of a schema points into its own `$defs`, and each of those is there.
+fn refs_local(schema: &Value) {
+    let mut found = Vec::new();
+    refs(schema, &mut found);
+    for r in found {
+        let key = r.strip_prefix("#/$defs/").unwrap_or_else(|| panic!("a $ref not to $defs: {} in {}", r, schema));
+        assert!(schema["$defs"].get(key).is_some(), "{} is not under $defs: {}", key, schema);
+    }
+}
+
+/// Ajv's JSON Schema 2020-12 validator, run by npx (no global install): each case's schema
+/// compiled in strict mode with the standard formats checked (ajv-formats), as a client may, then
+/// its `valid` values each passed and its `invalid` ones each refused. None when npx or the package cannot be had here: the callers check the documents'
+/// shapes themselves then, and say so.
+fn ajv(cases: &[Value]) -> Option<Vec<Value>> {
+    // A folder of each call's own: tests run at once.
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let d = support::temp_dir(&format!("feedback56-ajv-{}", CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let script = r#"const Ajv = require("ajv/dist/2020");
+const formats = require("ajv-formats");
+const cases = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8"));
+console.log(JSON.stringify(cases.map((c) => {
+  const ajv = new Ajv({ strict: true, allowUnionTypes: true, validateFormats: true });
+  formats(ajv);
+  let v;
+  try { v = ajv.compile(c.schema); } catch (e) { return { compile: String(e.message) }; }
+  return { valid: c.valid.map((x) => (v(x) ? null : ajv.errorsText(v.errors))), invalid: c.invalid.map((x) => !v(x)) };
+})));
+"#;
+    std::fs::write(d.join("check.js"), script).unwrap();
+    std::fs::write(d.join("cases.json"), Value::Array(cases.to_vec()).to_string()).unwrap();
+    let run = Command::new("sh")
+        .arg("-c")
+        .arg(r#"npx --yes -p ajv-cli@5.0.0 -p ajv-formats@3.0.1 -c 'NODE_PATH="$(dirname "$(dirname "$(command -v ajv)")")" node check.js cases.json'"#)
+        .current_dir(&d)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut child) = run else {
+        let _ = std::fs::remove_dir_all(&d);
+        return None;
+    };
+    let deadline = Instant::now() + Duration::from_secs(240);
+    while child.try_wait().ok().flatten().is_none() {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&d);
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().ok()?;
+    let _ = std::fs::remove_dir_all(&d);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().last()?;
+    serde_json::from_str::<Vec<Value>>(line).ok()
+}
+
+/// Each case against the validator: `(what, schema, valid, invalid)`.
+fn validated(cases: &[(String, Value, Vec<Value>, Vec<Value>)]) {
+    let mut docs: Vec<Value> = cases.iter().map(|(_, s, v, i)| json!({ "schema": s, "valid": v, "invalid": i })).collect();
+    // The validator is a strict one: a type 2020-12 does not have does not compile, nor a format
+    // it does not know.
+    docs.push(json!({ "schema": { "type": "strin" }, "valid": [], "invalid": [] }));
+    docs.push(json!({ "schema": { "type": "string", "format": "decimal" }, "valid": [], "invalid": [] }));
+    let Some(mut results) = ajv(&docs) else {
+        eprintln!("skipped: the 2020-12 validator (npx could not run ajv-cli@5.0.0 with ajv-formats@3.0.1 here: no npx, or no network); the schemas' shapes are checked alone");
+        return;
+    };
+    assert!(results.pop().is_some_and(|r| r.get("compile").is_some()), "the validator took a format it does not know");
+    assert!(results.pop().is_some_and(|r| r.get("compile").is_some()), "the validator took a type 2020-12 does not have");
+    assert_eq!(results.len(), cases.len());
+    for ((what, schema, valid, invalid), r) in cases.iter().zip(&results) {
+        assert!(r.get("compile").is_none(), "{}: the schema does not compile as 2020-12: {} in {}", what, r["compile"], schema);
+        for (v, why) in valid.iter().zip(r["valid"].as_array().unwrap()) {
+            assert!(why.is_null(), "{}: {} should pass {}: {}", what, v, schema, why);
+        }
+        for (v, refused) in invalid.iter().zip(r["invalid"].as_array().unwrap()) {
+            assert_eq!(refused, &json!(true), "{}: {} should be refused by {}", what, v, schema);
+        }
+    }
+}
+
+/// The guide's types (Variables, functions, views; Records), each as a parameter and as a result,
+/// with what they are written as, what fits and what does not.
+fn guide_types() -> Vec<(&'static str, Value, Vec<Value>, Vec<Value>)> {
+    let dec = json!({ "type": "string", "pattern": "^[+-]?([0-9]+[.]?[0-9]*|[.][0-9]+)([eE][+-]?[0-9]{1,6})?$", "description": "a decimal number, as text: \"12.50\"" });
+    let money = json!({
+        "type": "object",
+        "required": ["amount", "currency"],
+        "properties": { "amount": dec, "currency": { "type": "string", "pattern": "^[A-Za-z]{3}$" } }
+    });
+    vec![
+        ("int", json!({ "type": "integer" }), vec![json!(1), json!(-5), json!(0)], vec![json!(1.5), json!("1"), json!(null)]),
+        ("float", json!({ "type": "number" }), vec![json!(1.5), json!(2)], vec![json!("x"), json!(null)]),
+        ("num", json!({ "type": "number" }), vec![json!(1), json!(2.5)], vec![json!("1")]),
+        // Text `dec` reads: a sign, a point, an exponent; not a comma, nor words.
+        ("dec", dec.clone(), vec![json!("12.50"), json!("-3"), json!("+.5"), json!("1e-6"), json!("7.")], vec![json!(true), json!("12,5"), json!("abc"), json!(""), json!("1e1234567")]),
+        ("str", json!({ "type": "string" }), vec![json!(""), json!("é ✓")], vec![json!(1), json!(null)]),
+        ("date", json!({ "type": "string", "format": "date" }), vec![json!("2026-11-08")], vec![json!(5), json!("2026-13-40")]),
+        ("bool", json!({ "type": "boolean" }), vec![json!(true), json!(false)], vec![json!(0), json!("true")]),
+        ("list", json!({ "type": "array" }), vec![json!([]), json!([1, "a"])], vec![json!({})]),
+        ("map", json!({ "type": "object" }), vec![json!({}), json!({ "a": 1 })], vec![json!([])]),
+        ("any", json!({}), vec![json!(1), json!(null), json!("x"), json!([]), json!({})], vec![]),
+        ("money", money.clone(), vec![json!({ "amount": "1.00", "currency": "USD" })], vec![json!({ "amount": "1.00" }), json!({ "amount": "1", "currency": "US" }), json!({ "amount": "one", "currency": "USD" })]),
+        ("str?", json!({ "type": ["string", "null"] }), vec![json!("a"), json!(null)], vec![json!(1)]),
+        ("int | str", json!({ "type": ["integer", "string"] }), vec![json!(1), json!("a")], vec![json!(1.5), json!(null)]),
+        ("int | null", json!({ "type": ["integer", "null"] }), vec![json!(1), json!(null)], vec![json!("a")]),
+        ("int | str | null", json!({ "type": ["integer", "string", "null"] }), vec![json!(1), json!("a"), json!(null)], vec![json!(true)]),
+        ("int | int", json!({ "type": "integer" }), vec![json!(1)], vec![json!("a")]),
+        ("list<int>", json!({ "type": "array", "items": { "type": "integer" } }), vec![json!([]), json!([1, 2])], vec![json!(["a"]), json!([1.5])]),
+        ("list<str>?", json!({ "type": ["array", "null"], "items": { "type": "string" } }), vec![json!(null), json!(["a"])], vec![json!([1])]),
+        ("list<list<int>>", json!({ "type": "array", "items": { "type": "array", "items": { "type": "integer" } } }), vec![json!([[1], []])], vec![json!([1])]),
+        ("money?", json!({ "type": ["object", "null"], "required": ["amount", "currency"], "properties": money["properties"].clone() }), vec![json!(null)], vec![json!({})]),
+        ("\"admin\" | \"member\"", json!({ "type": "string", "enum": ["admin", "member"] }), vec![json!("admin")], vec![json!("owner"), json!(null)]),
+        ("\"admin\" | \"member\" | null", json!({ "type": ["string", "null"], "enum": ["admin", "member", null] }), vec![json!("member"), json!(null)], vec![json!("x")]),
+        ("\"auto\" | int", json!({ "anyOf": [{ "type": "string", "enum": ["auto"] }, { "type": "integer" }] }), vec![json!("auto"), json!(3)], vec![json!("x"), json!(1.5)]),
+        ("\"ü\" | \"日本\"", json!({ "type": "string", "enum": ["ü", "日本"] }), vec![json!("日本")], vec![json!("u")]),
+        // `null` alone is read as `any?`, any value.
+        ("null", json!({}), vec![json!(null), json!(0)], vec![]),
+        ("any?", json!({}), vec![json!(null), json!(1)], vec![]),
+        // What cannot come as JSON is any value in a result, in 2020-12's words alone.
+        ("fn", json!({}), vec![json!(1)], vec![]),
+    ]
+}
+
+#[test]
+fn b2_each_type_of_the_guide_as_a_parameter_and_a_result() {
+    let mut src = String::new();
+    for (i, (ty, _, _, _)) in guide_types().iter().enumerate() {
+        // A function is no parameter of a tool's (`quillo check` says so): a result only.
+        let param = if *ty == "fn" { "any" } else { ty };
+        src.push_str(&format!("/// {}.\nfn mcp t{}(x: {}) -> {} with time = x\n", ty, i, param, ty));
+    }
+    let tools = tools_of("b2-types", &src);
+    let mut cases = Vec::new();
+    for (i, (ty, want, good, bad)) in guide_types().into_iter().enumerate() {
+        let t = the(&tools, &format!("t{}", i));
+        let input = &t.input_schema;
+        assert_eq!(input["properties"]["x"], if ty == "fn" { json!({}) } else { want.clone() }, "{} as a parameter", ty);
+        assert_eq!(input["required"], json!(["x"]), "{}", ty);
+        assert_eq!(input["additionalProperties"], json!(false), "{}", ty);
+        assert!(input.get("$defs").is_none(), "{}: {}", ty, input);
+        // A result's root is an object (MCP 2025-11-25, and the SDKs): one that is not is held as
+        // `result`, in `structuredContent` too.
+        let object = want.get("type") == Some(&json!("object"));
+        let out = if object { want.clone() } else { json!({ "type": "object", "properties": { "result": want }, "required": ["result"] }) };
+        assert_eq!(t.output_schema.as_ref(), Some(&out), "{} as a result", ty);
+        assert_eq!(t.wrapped, !object, "{}", ty);
+        assert_eq!(t.structured(json!(1)), if object { json!(1) } else { json!({ "result": 1 }) });
+        assert_eq!(t.description.as_deref(), Some(&*format!("{}.", ty)));
+        // Each value that fits is an argument object the door takes; one more key, or none, it
+        // does not.
+        let mut refused: Vec<Value> = bad.iter().map(|b| json!({ "x": b })).collect();
+        refused.push(json!({}));
+        refused.push(json!({ "x": good[0], "y": 1 }));
+        cases.push((format!("{} in", ty), input.clone(), good.iter().map(|g| json!({ "x": g })).collect(), refused));
+        let (good, bad) = if object { (good, bad) } else { (good.into_iter().map(|g| json!({ "result": g })).collect(), bad.into_iter().map(|b| json!({ "result": b })).chain([json!(1), json!({})]).collect()) };
+        cases.push((format!("{} out", ty), out, good, bad));
+    }
+    validated(&cases);
+}
+
+#[test]
+fn b2_parameters_their_defaults_and_none_at_all() {
+    let src = "/// Now.\nfn mcp now_ms() -> int with time = now()\n\
+               fn mcp nothing() with time = now()\n\
+               /// Notes.\nfn mcp page(q, limit: int = 20, tags: list<str> = [\"a\"], order: \"new\" | \"old\" = \"new\", from: int = -1, at = now()) with time = q\n";
+    let tools = tools_of("b2-params", src);
+    // No parameters: an empty object, as MCP recommends; no result type, no output schema; no
+    // `///`, no description.
+    let now = the(&tools, "now_ms");
+    assert_eq!(now.input_schema, json!({ "type": "object", "additionalProperties": false }));
+    assert_eq!(now.output_schema, Some(json!({ "type": "object", "properties": { "result": { "type": "integer" } }, "required": ["result"] })));
+    let nothing = the(&tools, "nothing");
+    assert_eq!(nothing.output_schema, None);
+    assert_eq!(nothing.description, None);
+    assert!(nothing.to_json().get("description").is_none() && nothing.to_json().get("outputSchema").is_none(), "{}", nothing.to_json());
+    // A parameter without a type is any value; one with a default is not required, and its
+    // default is said when it is written as a value, not when it is worked out (`now()`).
+    let page = the(&tools, "page");
+    assert_eq!(
+        page.input_schema,
+        json!({
+            "type": "object",
+            "properties": {
+                "q": {},
+                "limit": { "type": "integer", "default": 20 },
+                "tags": { "type": "array", "items": { "type": "string" }, "default": ["a"] },
+                "order": { "type": "string", "enum": ["new", "old"], "default": "new" },
+                "from": { "type": "integer", "default": -1 },
+                "at": {}
+            },
+            "required": ["q"],
+            "additionalProperties": false
+        })
+    );
+    // Source order, which the door lists them in.
+    assert_eq!(tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["now_ms", "nothing", "page"]);
+    validated(&[
+        ("none".into(), now.input_schema.clone(), vec![json!({})], vec![json!({ "a": 1 }), json!([])]),
+        ("defaults".into(), page.input_schema.clone(), vec![json!({ "q": 1 }), json!({ "q": null, "order": "old", "at": 5 })], vec![json!({ "limit": 1 }), json!({ "q": 1, "order": "mid" })]),
+    ]);
+}
+
+#[test]
+fn b2_records_nested_and_recursive_once_under_defs() {
+    let src = "type Tag = { name: str }\n\
+               type Note = { id: int, text: str, role: \"admin\" | \"member\" = \"member\", tags: list<Tag> = [], note: str? }\n\
+               type Tree = { value: int, children: list<Tree> = [] }\n\
+               type Left = { right: Right? }\n\
+               type Right = { left: Left? }\n\
+               type Id = int | str\n\
+               type Person = { name: str, age: int? }\n\
+               /// Saves.\nfn mcp save(note: Note, also: list<Note>) -> Note with time = note\n\
+               /// Grows.\nfn mcp grow(t: Tree) -> Tree with time = t\n\
+               /// Pairs.\nfn mcp pair(a: Left) -> Right? with time = null\n\
+               /// Ids.\nfn mcp ids(id: Id, more: Id?) -> list<Id> with time = [id]\n\
+               /// People.\nfn mcp people(p: Person, q: { name: str, age: int? }) -> Person with time = p\n";
+    let tools = tools_of("b2-records", src);
+    let note = json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "integer" },
+            "text": { "type": "string" },
+            "role": { "type": "string", "enum": ["admin", "member"], "default": "member" },
+            "tags": { "type": "array", "items": { "$ref": "#/$defs/Tag" }, "default": [] },
+            "note": { "type": ["string", "null"] }
+        },
+        "required": ["id", "text"],
+        "additionalProperties": false
+    });
+    let tag = json!({ "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"], "additionalProperties": false });
+    let save = the(&tools, "save");
+    assert_eq!(save.input_schema["properties"]["note"], json!({ "$ref": "#/$defs/Note" }));
+    assert_eq!(save.input_schema["properties"]["also"], json!({ "type": "array", "items": { "$ref": "#/$defs/Note" } }));
+    // Once each, the one a record names too; none the tool does not name.
+    assert_eq!(save.input_schema["$defs"], json!({ "Note": note, "Tag": tag }));
+    refs_local(&save.input_schema);
+    // A result's record is said as it is, an object at the root: a record is made field by field,
+    // so its fields are required, but nothing checks or drops other keys, so none are refused.
+    let out = save.output_schema.clone().unwrap();
+    let open = |mut r: Value| {
+        r.as_object_mut().unwrap().remove("additionalProperties");
+        r
+    };
+    assert_eq!(out, json!({ "$ref": "#/$defs/Note", "type": "object", "$defs": { "Note": open(note.clone()), "Tag": open(tag.clone()) } }));
+    assert!(!save.wrapped);
+    assert_eq!(save.structured(json!({ "id": 1 })), json!({ "id": 1 }));
+    refs_local(&out);
+    // A record that names itself is a `$ref` to itself, and the walk ends.
+    let grow = the(&tools, "grow");
+    let tree = json!({
+        "type": "object",
+        "properties": { "value": { "type": "integer" }, "children": { "type": "array", "items": { "$ref": "#/$defs/Tree" }, "default": [] } },
+        "required": ["value"],
+        "additionalProperties": false
+    });
+    assert_eq!(grow.input_schema["$defs"], json!({ "Tree": tree }));
+    refs_local(&grow.input_schema);
+    // Two that name each other, each nullable by `?`.
+    let lp = the(&tools, "pair");
+    assert_eq!(lp.input_schema["$defs"]["Left"]["properties"]["right"], json!({ "anyOf": [{ "$ref": "#/$defs/Right" }, { "type": "null" }] }));
+    assert_eq!(lp.input_schema["$defs"]["Right"]["properties"]["left"], json!({ "anyOf": [{ "$ref": "#/$defs/Left" }, { "type": "null" }] }));
+    assert_eq!(lp.output_schema.as_ref().unwrap()["properties"]["result"]["anyOf"], json!([{ "$ref": "#/$defs/Right" }, { "type": "null" }]));
+    assert!(lp.wrapped);
+    refs_local(&lp.input_schema);
+    refs_local(lp.output_schema.as_ref().unwrap());
+    // Another name for a type is under `$defs` too, a nullable one by `anyOf`.
+    let ids = the(&tools, "ids");
+    assert_eq!(ids.input_schema["$defs"], json!({ "Id": { "type": ["integer", "string"] } }));
+    assert_eq!(ids.input_schema["properties"]["more"], json!({ "anyOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] }));
+    assert_eq!(
+        ids.output_schema,
+        Some(json!({
+            "type": "object",
+            "properties": { "result": { "type": "array", "items": { "$ref": "#/$defs/Id" } } },
+            "required": ["result"],
+            "$defs": { "Id": { "type": ["integer", "string"] } }
+        }))
+    );
+    let deep = json!({ "value": 1, "children": [{ "value": 2, "children": [{ "value": 3 }] }] });
+    validated(&[
+        (
+            "a record".into(),
+            save.input_schema.clone(),
+            vec![json!({ "note": { "id": 1, "text": "é" }, "also": [] }), json!({ "note": { "id": 1, "text": "a", "role": "admin", "tags": [{ "name": "x" }], "note": null }, "also": [{ "id": 2, "text": "b" }] })],
+            vec![
+                json!({ "note": { "id": 1 }, "also": [] }),
+                json!({ "note": { "id": 1, "text": "a", "role": "owner" }, "also": [] }),
+                json!({ "note": { "id": 1, "text": "a", "tags": [{}] }, "also": [] }),
+                json!({ "note": { "id": 1, "text": "a", "extra": 1 }, "also": [] }),
+                json!({ "note": null, "also": [] }),
+            ],
+        ),
+        ("a record's result".into(), out, vec![json!({ "id": 1, "text": "a" }), json!({ "id": 1, "text": "a", "kept": true })], vec![json!({ "id": 1 }), json!(null)]),
+        ("a recursive record".into(), grow.input_schema.clone(), vec![json!({ "t": deep })], vec![json!({ "t": { "value": 1, "children": [{ "children": [] }] } }), json!({ "t": { "value": 1, "children": [{ "value": "2" }] } })]),
+        ("two that name each other".into(), lp.input_schema.clone(), vec![json!({ "a": {} }), json!({ "a": { "right": { "left": { "right": null } } } })], vec![json!({ "a": { "right": { "left": 1 } } })]),
+        ("an alias".into(), ids.input_schema.clone(), vec![json!({ "id": 1, "more": null }), json!({ "id": "a", "more": 2 })], vec![json!({ "id": 1.5, "more": 1 }), json!({ "id": 1 })]),
+        ("a result that names a record that names itself".into(), lp.output_schema.clone().unwrap(), vec![json!({ "result": null }), json!({ "result": { "left": { "right": null } } })], vec![json!(null), json!({}), json!({ "result": 1 })]),
+    ]);
+    // A record says it has no other fields, as one drops them from what a client sends (B.2,
+    // Smaller notes); a map type says which it requires, and nothing of others.
+    let people = the(&tools, "people");
+    assert_eq!(people.input_schema["$defs"]["Person"]["additionalProperties"], json!(false));
+    assert_eq!(
+        people.input_schema["properties"]["q"],
+        json!({ "type": "object", "properties": { "name": { "type": "string" }, "age": { "type": ["integer", "null"] } }, "required": ["name"] })
+    );
+}
+
+#[test]
+fn b2_nullable_refs_and_unions_of_records() {
+    let src = "type Cat = { kind: \"cat\", lives: int }\ntype Dog = { kind: \"dog\" }\n\
+               /// Pets.\nfn mcp pets(one: Cat?, two: Cat | Dog, three: Cat | Dog | null, four: list<Cat?>, five: Cat | null) -> Cat | Dog with time = two\n";
+    let tools = tools_of("b2-nullable", src);
+    let p = &the(&tools, "pets").input_schema;
+    let (cat, dog, nul) = (json!({ "$ref": "#/$defs/Cat" }), json!({ "$ref": "#/$defs/Dog" }), json!({ "type": "null" }));
+    assert_eq!(p["properties"]["one"], json!({ "anyOf": [cat, nul] }));
+    assert_eq!(p["properties"]["two"], json!({ "anyOf": [cat, dog] }));
+    assert_eq!(p["properties"]["three"], json!({ "anyOf": [cat, dog, nul] }));
+    assert_eq!(p["properties"]["four"], json!({ "type": "array", "items": { "anyOf": [cat, nul] } }));
+    assert_eq!(p["properties"]["five"], p["properties"]["one"]);
+    refs_local(p);
+    // Nothing of OpenAPI's: no `nullable`, no `allOf` around a `$ref`, no `oneOf`.
+    let text = p.to_string();
+    assert!(!text.contains("nullable") && !text.contains("allOf") && !text.contains("oneOf") && !text.contains("x-quillo"), "{}", text);
+    validated(&[(
+        "nullable refs".into(),
+        p.clone(),
+        vec![json!({ "one": null, "two": { "kind": "dog" }, "three": null, "four": [null, { "kind": "cat", "lives": 9 }], "five": { "kind": "cat", "lives": 1 } })],
+        vec![
+            json!({ "one": { "kind": "cat" }, "two": { "kind": "dog" }, "three": null, "four": [], "five": null }),
+            json!({ "one": null, "two": null, "three": null, "four": [], "five": null }),
+            json!({ "one": null, "two": { "kind": "fish" }, "three": null, "four": [], "five": null }),
+        ],
+    )]);
+}
+
+#[test]
+fn b2_the_openapi_document_is_as_before() {
+    // The 2020-12 writer is the tools' own: `quillo docs` still writes OpenAPI 3.0's words.
+    let doc = doc_of("b2-openapi", "type Note = { id: int, note: str? }\nserver fn mcp keep(n: Note?, s: str?) -> int | str with time = 1\n");
+    let f = &doc["x-quillo-server-fns"]["keep"];
+    assert_eq!(f["params"][1]["schema"], json!({ "type": "string", "nullable": true }));
+    assert_eq!(f["params"][0]["schema"], json!({ "allOf": [{ "$ref": "#/components/schemas/Note" }], "type": "object", "nullable": true }));
+    assert_eq!(f["returns"], json!({ "oneOf": [{ "type": "integer" }, { "type": "string" }] }));
+    assert_eq!(doc["components"]["schemas"]["Note"]["properties"]["note"], json!({ "type": "string", "nullable": true }));
+}
+
+/// The hints of a tool, as the door gives them: `(readOnlyHint, openWorldHint)` where set.
+fn hints_of(t: &Tool) -> (Option<bool>, Option<bool>) {
+    (t.annotations.get("readOnlyHint").and_then(Value::as_bool), t.annotations.get("openWorldHint").and_then(Value::as_bool))
+}
+
+const HINTS: &str = "service billing = \"billing.qwe\"\n\
+service pay = \"pay.qwe\"\n\
+service far = \"far.qwe\"\n\
+use \"pure.qwer\"\n\
+site shop = \"https://shop.example.com\"\n\
+let LIMIT = 20\n\
+let handlers = { go: () => 1 }\n\
+/// r\nfn mcp reads() -> list with db = db.query(\"select * from notes limit ?\", LIMIT)\n\
+/// w\nfn mcp writes(t: str) with db = db.exec(\"insert into notes (text) values (?)\", t)\n\
+/// f\nfn mcp files() with fs = read_file(\"a.txt\")\n\
+/// c\nfn mcp clock() -> int with time = now()\n\
+/// d\nfn mcp dice() -> int with time, random = random_int(1, 6)\n\
+/// e\nfn mcp setting() with env = env(\"HOME\")\n\
+/// h\nfn mcp fetches() with http = http.get(\"https://example.com\")\n\
+/// b\nfn mcp bills(n: int) with http = billing.charge(n)\n\
+/// l\nfn mcp bills_later(n: int) with http = billing.later.charge(n)\n\
+/// s\nfn mcp shops() with http = shop.notes()\n\
+/// n\nfn mcp sends() with net = udp.send(\"127.0.0.1\", 9, \"x\")\n\
+/// bt\nfn mcp both() -> list with db, time = db.query(\"select * from notes\")\n\
+/// m\nfn mcp mixed() with db, fs = db.query(\"select 1\")\n\
+/// a\nfn mcp all_of() with db, http, net, fs, env, time, random = 1\n\
+/// p\nfn mcp pure(a: int, b: int) -> int = a + b\n\
+/// i\nfn mcp impure() -> int = now()\n\
+/// u\nfn mcp blind(xs: list) = xs | map(handlers.go)\n\
+/// ut\nfn mcp blind_time(xs: list) with time = xs | map(handlers.go)\n\
+/// uh\nfn mcp blind_http(xs: list) with http = xs | map(handlers.go)\n\
+/// ss\nfn mcp logout() with time = end_session()\n\
+/// sp\nfn mcp logout_pure() = end_session()\n\
+/// id\nfn mcp idle() with db = 1\n\
+/// py\nfn mcp pays(n: int) with http = pay.charge(n)\n\
+/// pl\nfn mcp pays_later(n: int) with http = pay.later.charge(n)\n\
+/// fr\nfn mcp fars(n: int) with http = far.charge(n)\n\
+/// nt\nfn mcp native_time() with time = double(2)\n\
+/// np\nfn mcp native_pure() = double(2)\n";
+
+/// A service whose function reaches outside: the app's tool calling it does too.
+const PAY: &str = "server fn charge(n: int) -> int with http {\n    http.get(\"https://payments.example.com\")\n    n\n}\n";
+const PURE_QWER: &str = "//! effects: none\npub fn double(n: i64) -> i64 {\n    n * 2\n}\n";
+
+const BILLING: &str = "server fn charge(n: int) -> int = n\n";
+
+#[test]
+fn b3_the_hints_of_each_with() {
+    let tools = tools_in("b3-hints", &[("main.qwe", HINTS), ("billing.qwe", BILLING), ("pay.qwe", PAY), ("pure.qwer", PURE_QWER)]);
+    let want: &[(&str, Option<bool>, Option<bool>, bool)] = &[
+        // name, readOnlyHint, openWorldHint, run in a read-only transaction
+        ("reads", Some(true), Some(false), true),
+        ("writes", None, Some(false), false),
+        ("files", None, Some(false), false),
+        // Said to only read, and its `with` holds the database away: no transaction.
+        ("clock", Some(true), Some(false), false),
+        ("dice", Some(true), Some(false), false),
+        ("setting", Some(true), Some(false), false),
+        ("fetches", None, None, false),
+        // The program's own service, whose code is read and stays inside: inside the program, and
+        // it may write.
+        ("bills", None, Some(false), false),
+        ("bills_later", None, Some(false), false),
+        // One whose code reaches outside, now or later, or is not here to read: outside.
+        ("pays", None, None, false),
+        ("pays_later", None, None, false),
+        ("fars", None, None, false),
+        // A site is another program on the web.
+        ("shops", None, None, false),
+        ("sends", None, None, false),
+        ("both", Some(true), Some(false), true),
+        ("mixed", None, Some(false), false),
+        ("all_of", None, None, false),
+        // No `with`, and nothing it does: certain. Run in a read-only transaction where the
+        // program has a database, as nothing holds the database away from it.
+        ("pure", Some(true), Some(false), true),
+        // No `with`, and an effect, or code the checker cannot see: MCP's defaults.
+        ("impure", None, None, false),
+        ("blind", None, None, false),
+        // A `with` holds what it names at run time, but not what code the checker cannot see
+        // writes that no effect names, nor what a native plugin's Rust reaches, whatever its
+        // file says.
+        ("blind_time", None, None, false),
+        ("blind_http", None, None, false),
+        ("native_time", None, None, false),
+        ("native_pure", None, None, false),
+        // A session ended is a change, with a `with` or without.
+        ("logout", None, Some(false), false),
+        ("logout_pure", None, None, false),
+        // `with db` and no database call seen: it only reads, and is still run in the
+        // transaction, which is for the call the checker did not see.
+        ("idle", Some(true), Some(false), true),
+    ];
+    for (name, ro, open, tx) in want {
+        let t = the(&tools, name);
+        assert_eq!(hints_of(t), (*ro, *open), "{}: {}", name, t.to_json());
+        assert_eq!(t.reads_only, *tx, "{}", name);
+        // Never the other two, which stay MCP's defaults, and never a default said.
+        assert!(t.annotations.keys().all(|k| k == "readOnlyHint" || k == "openWorldHint"), "{:?}", t.annotations);
+        assert!(t.annotations.get("readOnlyHint").map_or(true, |v| *v == json!(true)) && t.annotations.get("openWorldHint").map_or(true, |v| *v == json!(false)), "{:?}", t.annotations);
+        assert_eq!(t.to_json().get("annotations").is_some(), ro.is_some() || open.is_some(), "{}", name);
+    }
+    assert_eq!(tools.len(), want.len());
+}
+
+/// What one tool `t`'s code was found to do, among other functions.
+fn facts_of_t(name: &str, src: &str) -> quillo::check::ToolFacts {
+    let facts = facts_in(name, &[("main.qwe", src), ("billing.qwe", BILLING)]);
+    fact(&facts, "t").clone()
+}
+
+#[test]
+fn q858_a_select_written_in_the_program_reads() {
+    let reads = [
+        "db.query(\"select * from notes\")",
+        "db.one(\"select text from notes where id = ?\", id)",
+        "db.one(\"SELECT text FROM notes WHERE id = :id\", { id })",
+        // A template with nothing put in it is written in the program too.
+        "db.query(`select * from notes`)",
+        "\"select 1 as one\" | db.query()",
+        "db.query(\"-- the newest first\\nselect * from notes order by id desc\")",
+        "db.query(\"select * from notes where text = 'insert into x'\")",
+        "db.query(\"select 'é ✓ 日本' as t\")",
+        // Reads through helpers, one that calls itself, and one given as a value.
+        "first(id)",
+        "deep(3)",
+        "[1, 2] | map(one_of)",
+        // What does not touch the database at all.
+        "db.error_kind(err(\"x\"))",
+    ];
+    for body in reads {
+        let src = format!(
+            "fn first(id) = db.one(\"select * from notes where id = ?\", id)\nfn deep(n) = if n == 0 {{ db.query(\"select 1\") }} else {{ deep(n - 1) }}\nfn one_of(i) = db.one(\"select ? as i\", i)\n/// T.\nfn mcp t(id: int) with db = {}\n",
+            body
+        );
+        let f = facts_of_t("q858-reads", &src);
+        assert_eq!(f.writes, None, "{}", body);
+        assert_eq!(f.uncertain, None, "{}", body);
+    }
+}
+
+#[test]
+fn q858_anything_else_counts_as_a_write() {
+    let writes = [
+        ("db.exec(\"insert into notes (text) values ('a')\")", "`db.exec`"),
+        ("db.exec(\"select 1\")", "`db.exec`"),
+        ("db.exec_many(\"insert into notes (text) values (?)\", [[\"a\"]])", "`db.exec_many`"),
+        // The guide's own `billing.invoice`: a `db.one` that writes.
+        ("db.one(\"insert into notes (text) values (?) returning id\", \"a\")", "is not a `select`"),
+        ("db.query(\"update notes set text = 'b' returning id\")", "is not a `select`"),
+        ("db.query(\"delete from notes\")", "is not a `select`"),
+        // A `select` that writes or locks, as each database reads it.
+        ("db.query(\"select * from notes for update\")", "is not a `select`"),
+        ("db.query(\"select nextval('s')\")", "is not a `select`"),
+        ("db.query(\"select * into copy from notes\")", "is not a `select`"),
+        ("db.query(\"select 1; delete from notes\")", "is not a `select`"),
+        // A `with` before it: counted as a write, though this one only reads.
+        ("db.query(\"with x as (select 1) select * from x\")", "is not a `select`"),
+        ("db.query(\"with x as (delete from notes returning *) select * from x\")", "is not a `select`"),
+        ("db.query(\"\")", "is not a `select`"),
+        // A statement built as the program runs, or kept in a variable.
+        ("db.query(\"select * from \" + name)", "not written in the program"),
+        ("db.query(`select * from ${name}`)", "not written in the program"),
+        ("db.query(SQL)", "not written in the program"),
+        ("db.query(sql_name(name))", "not written in the program"),
+        ("[\"select 1\"] | map(db.query)", "not written in the program"),
+        // Writes through a helper, two deep, and one given as a value.
+        ("save(name)", "`db.exec`"),
+        ("outer(name)", "`db.exec`"),
+        ("[name] | map(save)", "`db.exec`"),
+        ("db.transaction(() => db.query(\"select 1\"))", "`db.transaction`"),
+        ("db.migrate()", "`db.migrate`"),
+        ("db.connect(\"other.db\")", "`db.connect`"),
+        ("idempotent(() => 1)", "`idempotent`"),
+        ("with_tenant(\"a\", () => db.query(\"select 1\"))", "`with_tenant`"),
+        // What the server keeps without the database.
+        ("set_session({ user: 1 })", "`set_session`"),
+        ("publish(\"notes\")", "`publish`"),
+        ("bump()", "assigns the program's variable `hits`"),
+        // A view a tool's code shows runs too.
+        ("len(str(<Leak/>))", "`db.exec`"),
+        // A local `fn` of the name in another block is no reason to pass over the program's.
+        ("{\n    let f = () => {\n        fn wipe() = 0\n        wipe()\n    }\n    wipe()\n}", "`db.exec`"),
+        // What the view cache says changes something, a builtin no effect names.
+        ("media.close(\"cam\")", "`media.close` changes something"),
+        // PostgreSQL's dblink writes over a connection of its own, outside the transaction.
+        ("db.query(\"select * from dblink('dbname=x', 'delete from notes') as t(a int)\")", "is not a `select`"),
+        ("db.query(\"select dblink_exec('dbname=x', 'delete from notes')\")", "is not a `select`"),
+    ];
+    for (body, why) in writes {
+        let src = format!(
+            "let SQL = \"select 1\"\nlet hits = 0\nfn wipe() = db.exec(\"delete from notes\")\nview Leak() = <b>{{db.exec(\"delete from notes\").changes}}</b>\nfn save(t) = db.exec(\"insert into notes (text) values (?)\", t)\nfn outer(t) = save(t)\nfn bump() {{\n    hits += 1\n    hits\n}}\n/// T.\nfn mcp t(name: str) with db = {}\n",
+            body
+        );
+        let f = facts_of_t("q858-writes", &src);
+        let w = f.writes.as_deref().unwrap_or_else(|| panic!("{} was not found to write", body));
+        assert!(w.contains(why), "{}: {}", body, w);
+    }
+}
+
+#[test]
+fn q858_review_a_records_defaults_run_as_one_is_made() {
+    // Taken, given back, in a list, inside another record, made by name, by a helper's parameter,
+    // by a pattern, by a lambda's parameter: each runs the defaults, the door's arguments
+    // too, before the tool's code.
+    let src = "let n = 0\nfn next_no() {\n    n += 1\n    n\n}\n\
+               type Ticket = { title: str, no: int = next_no() }\ntype Holder = { t: Ticket? }\n\
+               type Row = { id: int = db.one(\"insert into ids default values returning id\").id }\n\
+               type Plain = { title: str, at: int = 1 }\n\
+               fn h(t: Ticket) = t.title\n\
+               /// T.\nfn mcp takes(t: Ticket) with time = t.title\n\
+               /// T.\nfn mcp many(ts: list<Ticket>) with time = len(ts)\n\
+               /// T.\nfn mcp nested(x: Holder) with time = 1\n\
+               /// T.\nfn mcp gives() -> Ticket? with time = null\n\
+               /// T.\nfn mcp makes() with time = Ticket({ title: \"a\" }).title\n\
+               /// T.\nfn mcp via(x: any) with time = h(x)\n\
+               /// T.\nfn mcp matches(x: map) with time = match x {\n    Ticket as t => 1\n    _ => 0\n}\n\
+               /// T.\nfn mcp lambda(xs: list) with time = xs | map((t: Ticket) => t.no)\n\
+               /// T.\nfn mcp row(r: Row) with db = r.id\n\
+               /// T.\nfn mcp plain(p: Plain) with time = p.title\n";
+    let facts = facts_in("q858-defaults", &[("main.qwe", src)]);
+    for name in ["takes", "many", "nested", "gives", "makes", "via", "matches", "lambda"] {
+        assert_eq!(fact(&facts, name).writes.as_deref(), Some("assigns the program's variable `n`"), "{}", name);
+    }
+    assert!(fact(&facts, "row").writes.as_deref().is_some_and(|w| w.contains("is not a `select`")), "{:?}", fact(&facts, "row").writes);
+    assert_eq!(fact(&facts, "plain").writes, None);
+    let tools = tools_of("q858-defaults-hints", src);
+    // `n`, assigned elsewhere, may hold anything by then: the rest is unseen too.
+    assert_eq!(hints_of(the(&tools, "takes")), (None, None));
+    assert!(!the(&tools, "takes").reads_only);
+    assert_eq!(hints_of(the(&tools, "plain")), (Some(true), Some(false)));
+}
+
+#[test]
+fn q858_what_the_checker_cannot_see() {
+    let unseen = [
+        ("f()", "calls a parameter or a variable"),
+        ("{\n    let g = () => 1\n    g()\n}", "calls a parameter or a variable"),
+        ("apply(() => 1)", "calls a parameter or a variable"),
+        ("js(\"Chart\")", "`js` runs code"),
+        ("run_script(\"1 + 1\")", "`run_script` runs code"),
+        ("handlers.go()", "`.go(...)` calls a function a value holds"),
+        ("[1] | map(handlers.go)", "may hold a function"),
+        ("{\n    let d = db\n    d.exec(\"delete from notes\")\n}", "the module `db` is passed as a value"),
+        ("pass(billing)", "`billing` is passed as a value"),
+        ("[1] | map(billing.charge)", "`billing.charge` is passed as a value"),
+        ("{ go: 1 }.go()", "`.go(...)` calls a function a value holds"),
+        ("make()()", "calls a function an expression gives"),
+        ("double(2)", "native plugin"),
+    ];
+    for (body, why) in unseen {
+        let src = format!(
+            "use \"pure.qwer\"\nservice billing = \"billing.qwe\"\nlet handlers = {{ go: () => 1 }}\nfn apply(h) = h()\nfn pass(x) = x\nfn make() = () => 1\n/// T.\nfn mcp t(f: any) with time = {}\n",
+            body
+        );
+        let facts = facts_in("q858-unseen", &[("main.qwe", &src), ("billing.qwe", BILLING), ("pure.qwer", "//! effects: none\npub fn double(n: i64) -> i64 {\n    n * 2\n}\n")]);
+        let f = fact(&facts, "t");
+        let u = f.uncertain.as_deref().unwrap_or_else(|| panic!("{}: seen as certain", body));
+        assert!(u.contains(why), "{}: {}", body, u);
+    }
+    // What it sees: its own `fn`s, lambdas, functions given by name, the program's values
+    // written as data, a record made, a method that is a builtin's.
+    let seen = [
+        "{\n    fn inner(x) = x + 1\n    inner(1)\n}",
+        "[1, 2] | map((x) => x * LIMIT)",
+        "[1, 2] | map(twice)",
+        "Note({ id: 1 })",
+        "\"a\".upper()",
+        "NAMES | map((n) => n.len())",
+        "((x) => x)(1)",
+        "CONFIG.size + len(f)",
+        "math.pi * 2",
+        "len(str(<Badge n={1}/>))",
+    ];
+    for body in seen {
+        let src = format!(
+            "type Note = {{ id: int }}\nview Badge(n) = <b>{{n}}</b>\nlet LIMIT = 20\nlet NAMES = [\"a\", \"b\"]\nlet CONFIG = {{ size: 3, name: \"x\" }}\nfn twice(x) = x * 2\n/// T.\nfn mcp t(f: any) with time = {}\n",
+            body
+        );
+        let f = fact(&facts_in("q858-seen", &[("main.qwe", &src)]), "t").clone();
+        assert_eq!(f.uncertain, None, "{}", body);
+        assert_eq!(f.writes, None, "{}", body);
+    }
+}
+
+#[test]
+fn q858_the_tools_list_in_order_across_files() {
+    let tools = tools_in(
+        "q858-files",
+        &[("main.qwe", "/// A.\nfn mcp a() -> int = 1\nuse \"lib.qwe\"\n/// C.\nserver fn mcp c() -> int = 3\nfn mcp(x) = x\n"), ("lib.qwe", "/// B.\nfn mcp b() -> int = 2\n")],
+    );
+    let list = mcp::list(&tools);
+    let names: Vec<&str> = list.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["a", "b", "c"]);
+    assert_eq!(
+        list[0],
+        json!({
+            "name": "a",
+            "description": "A.",
+            "inputSchema": { "type": "object", "additionalProperties": false },
+            "outputSchema": { "type": "object", "properties": { "result": { "type": "integer" } }, "required": ["result"] },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false }
+        })
+    );
+    // A program with errors gives them, as `quillo check` says them.
+    let d = dir("q858-errors", "/// X.\nfn mcp x(f: fn) = 1\n");
+    let e = mcp::of_source(&d.join("main.qwe")).unwrap_err();
+    let _ = std::fs::remove_dir_all(&d);
+    assert!(e.contains("cannot come as JSON"), "{}", e);
+    // None at all.
+    assert!(tools_of("q858-none", "fn plain() = 1\n").is_empty());
+}
+
+// ---- the read-only transaction ---------------------------------------------------------------
+
+/// A program on a database, run, and its tools.
+fn run_on(d: &Path, db: &str, setup: &[&str], tools: &str) -> (Interp, Vec<Tool>) {
+    let mut src = format!("db.open({:?})\n", db);
+    for s in setup {
+        src.push_str(&format!("db.exec({:?})\n", s));
+    }
+    src.push_str(tools);
+    std::fs::write(d.join("main.qwe"), &src).unwrap();
+    let list = mcp::of_source(&d.join("main.qwe")).unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    let mut it = Interp::new(d);
+    it.load_file(&d.join("main.qwe")).unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    (it, list)
+}
+
+fn global(it: &Interp, name: &str) -> Q {
+    quillo::value::lookup(&it.globals, name).unwrap_or_else(|| panic!("no {}", name))
+}
+
+/// A call's value, or its failure said.
+fn shown(r: Result<Q, quillo::interp::Ctrl>) -> Result<Q, String> {
+    match r {
+        Ok(v) => Ok(v),
+        Err(quillo::interp::Ctrl::Error(e)) => Err(e.msg.clone()),
+        Err(_) => Err("a return or a reply".into()),
+    }
+}
+
+fn ok(r: Result<Q, quillo::interp::Ctrl>) -> Q {
+    shown(r).unwrap_or_else(|e| panic!("{}", e))
+}
+
+/// A tool's answer through `mcp::call`, its arguments taken.
+fn answer(r: Result<Result<Q, String>, quillo::interp::Ctrl>) -> Q {
+    match r {
+        Ok(Ok(v)) => v,
+        Ok(Err(why)) => panic!("refused: {}", why),
+        Err(e) => panic!("{}", shown(Err(e)).err().unwrap_or_default()),
+    }
+}
+
+fn count(it: &mut Interp) -> i64 {
+    let f = global(it, "count");
+    match shown(it.call(&f, vec![], 0)) {
+        Ok(Q::Int(n)) => n,
+        other => panic!("count: {:?}", other.map(|v| v.display())),
+    }
+}
+
+/// The tools every database is tried with: one that reads, one the checker misjudges (a
+/// function of the database's own that writes, called in a `select`), and the program's
+/// helpers.
+const RO_TOOLS: &str = "/// The notes.\nfn mcp notes() -> list with db = db.query(\"select text from notes order by id\")\n\
+/// Looks.\nfn mcp sneaky() with db = db.query(\"select add_note() as id\")\n\
+fn count() -> int = db.one(\"select count(*) as n from notes\").n\n\
+fn kind(e) = [db.error_kind(e), error(e)]\n\
+fn write(t: str) {\n    let r = db.exec(\"insert into notes (text) values (?)\", t)\n    db.error_kind(r) ?? \"wrote\"\n}\n\
+fn fails() = unwrap(err(\"no\"))\n\
+/// Adds.\nfn mcp adds(t: str) with db = write(t)\n\
+type Ticket = { title: str, no: int? = db.one(\"select add_note() as id\").id }\n\
+/// Tickets.\nfn mcp ticket(t: Ticket) with db = t.title\n\
+fn arg() = { title: \"x\" }\n\
+fn make() = Ticket({ title: \"y\" }).title\n\
+fn kinds() = [\n    db.error_kind(err(\"db: Server error: `ERROR 1062 (23000): Duplicate entry 'x(1792)' for key 'v''\")),\n    db.error_kind(err(\"db: Server error: `ERROR 1792 (25006): Cannot execute statement in a READ ONLY transaction'\")),\n    db.error_kind(err(\"db: no such table: error 1792 (x\")),\n    db.error_kind(err(\"db: attempt to write a readonly database\")),\n]\n";
+
+/// What each database is checked for: the tool that reads gives its rows in the transaction;
+/// the one misjudged is refused by the database, as `read_only`, and writes nothing, where run
+/// as a plain call it writes; a write in the transaction is refused, and one after it is not, a
+/// transaction that failed too; and a read-only transaction inside another is an error.
+fn read_only_on(it: &mut Interp, tools: &[Tool], misjudged: bool) {
+    let notes = the(tools, "notes");
+    assert!(notes.reads_only);
+    let rows = answer(mcp::call(it, notes, vec![], 0));
+    assert_eq!(rows.display(), "[{ text: \"a\" }]");
+    if misjudged {
+        let sneaky = the(tools, "sneaky");
+        assert!(sneaky.reads_only, "the checker reads `select add_note()` as a read");
+        let r = answer(mcp::call(it, sneaky, vec![], 0));
+        assert!(matches!(r, Q::Err(..)), "{}", r.display());
+        let kind = global(it, "kind");
+        let k = ok(it.call(&kind, vec![r], 0)).display();
+        assert!(k.starts_with("[\"read_only\", \"db: "), "{}", k);
+        assert_eq!(count(it), 1);
+        // As a plain call, it writes: the transaction is what refused it.
+        let f = global(it, "sneaky");
+        let wrote = ok(it.call(&f, vec![], 0));
+        assert!(!matches!(wrote, Q::Err(..)), "{}", wrote.display());
+        assert_eq!(count(it), 2);
+        // A record's default runs as the door makes the argument: inside the transaction, so
+        // the write it was not expected to make is refused there too, and the argument with it.
+        let ticket = the(tools, "ticket");
+        assert!(ticket.reads_only);
+        let arg = ok(it.call(&global(it, "arg"), vec![], 0));
+        let made = mcp::call(it, ticket, vec![arg], 0);
+        assert!(matches!(made, Ok(Err(_))), "{:?}", made.map(|r| r.map(|v| v.display())).ok());
+        assert_eq!(count(it), 2);
+        // Made outside it, the record writes.
+        let make = global(it, "make");
+        assert_eq!(ok(it.call(&make, vec![], 0)).display(), "y");
+        assert_eq!(count(it), 3);
+    }
+    let before = count(it);
+    let write = global(it, "write");
+    let refused = ok(mcp::reading_only(it, 0, &mut |it| it.call(&write, vec![Q::str("é ✓")], 0)));
+    assert_eq!(refused.display(), "read_only");
+    assert_eq!(count(it), before);
+    // A transaction that failed ends as one that worked: read-only no more.
+    let fails = global(it, "fails");
+    let failed = shown(mcp::reading_only(it, 0, &mut |it| it.call(&fails, vec![], 0)));
+    assert!(failed.is_err() || matches!(failed, Ok(Q::Err(..))), "{:?}", failed.map(|v| v.display()));
+    assert_eq!(ok(it.call(&write, vec![Q::str("b")], 0)).display(), "wrote");
+    assert_eq!(count(it), before + 1);
+    // One inside another, read-only or not, is refused, and the outer one goes on.
+    let inner = mcp::reading_only(it, 0, &mut |it| match shown(mcp::reading_only(it, 0, &mut |_| Ok(Q::Nil))) {
+        Err(e) => Ok(Q::str(e)),
+        Ok(v) => panic!("{}", v.display()),
+    });
+    assert_eq!(ok(inner).display(), "a read-only transaction cannot be inside another");
+    let begin = global(it, "begin_then");
+    let nested = ok(it.call(&begin, vec![], 0));
+    assert!(!matches!(nested, Q::Err(..)), "{}", nested.display());
+    // With an isolation level too: still refused, and a read still answers.
+    let serializable = quillo::txn::Options { isolation: Some(quillo::txn::Isolation::Serializable), read_only: true, ..Default::default() };
+    let n = count(it);
+    assert_eq!(ok(quillo::txn::run(it, None, &serializable, 0, &mut |it| it.call(&write, vec![Q::str("c")], 0))).display(), "read_only");
+    let notes_fn = global(it, "notes");
+    assert!(matches!(ok(quillo::txn::run(it, None, &serializable, 0, &mut |it| it.call(&notes_fn, vec![], 0))), Q::List(_)));
+    assert_eq!(count(it), n);
+    // A tool that writes is called as it is, with no transaction; one the program does not have
+    // is said.
+    let adds = the(tools, "adds");
+    assert!(!adds.reads_only);
+    assert_eq!(answer(mcp::call(it, adds, vec![Q::str("d")], 0)).display(), "wrote");
+    assert_eq!(count(it), n + 1);
+    let mut gone = adds.clone();
+    gone.name = "gone".into();
+    assert_eq!(shown(mcp::call(it, &gone, vec![], 0).map(|_| Q::Nil)).err().as_deref(), Some("the program has no tool `gone`"));
+    // An argument the door refuses is said, the tool not run.
+    assert!(matches!(mcp::call(it, adds, vec![Q::Int(1)], 0), Ok(Err(why)) if why.contains("argument `t` of `adds` must be str")));
+    assert_eq!(count(it), n + 1);
+    // A tool said to only read that has no `with`, in a program with a database: run in the
+    // transaction, as nothing else holds the database away from it.
+    let Q::Func(c) = global(it, "write") else { panic!("write") };
+    let mut bare = adds.clone();
+    bare.name = "write".into();
+    bare.def = c.def.clone();
+    bare.reads_only = true;
+    assert_eq!(answer(mcp::call(it, &bare, vec![Q::str("e")], 0)).display(), "read_only");
+    bare.reads_only = false;
+    assert_eq!(answer(mcp::call(it, &bare, vec![Q::str("e")], 0)).display(), "wrote");
+    assert_eq!(count(it), n + 2);
+}
+
+#[test]
+fn q858_the_read_only_transaction_on_sqlite() {
+    let d = support::temp_dir("feedback56-q858-sqlite");
+    let tools = format!("{}{}", RO_TOOLS, SQLITE_EXTRA);
+    let (mut it, list) = run_on(&d, &d.join("app.db").display().to_string(), &["create table notes (id integer primary key, text text)", "insert into notes (text) values ('a')"], &tools);
+    // SQLite has no functions of the program's to misjudge: the write is the program's own.
+    read_only_on(&mut it, &list, false);
+    // `query_only` is put back as it was, on as well as off.
+    ok(it.call(&global(&it, "lock"), vec![], 0));
+    let write = global(&it, "write");
+    assert_eq!(ok(mcp::reading_only(&mut it, 0, &mut |it| it.call(&write, vec![Q::str("z")], 0))).display(), "read_only");
+    assert_eq!(ok(it.call(&global(&it, "query_only"), vec![], 0)).display(), "1");
+    ok(it.call(&global(&it, "unlock"), vec![], 0));
+    assert_eq!(ok(it.call(&global(&it, "query_only"), vec![], 0)).display(), "0");
+    // The kind is told by a database's code or its own words at the start, not by a value in
+    // its message.
+    assert_eq!(ok(it.call(&global(&it, "kinds"), vec![], 0)).display(), "[\"unique\", \"read_only\", null, \"read_only\"]");
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+const SQLITE_EXTRA: &str = "fn begin_then() = db.transaction(() => db.query(\"select 1\"))\n\
+fn query_only() = db.one(\"pragma query_only\").query_only\n\
+fn lock() = db.exec(\"pragma query_only = 1\")\n\
+fn unlock() = db.exec(\"pragma query_only = 0\")\n";
+
+#[test]
+fn q858_review_a_panic_puts_sqlite_back_as_it_was() {
+    let d = support::temp_dir("feedback56-q858-panic");
+    let tools = format!("{}{}", RO_TOOLS, SQLITE_EXTRA);
+    let (mut it, _) = run_on(&d, &d.join("app.db").display().to_string(), &["create table notes (id integer primary key, text text)"], &tools);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = mcp::reading_only(&mut it, 0, &mut |_| panic!("a panic in the body, on purpose"));
+    }));
+    assert!(caught.is_err());
+    // The shared connection is not left refusing every write.
+    assert_eq!(ok(it.call(&global(&it, "query_only"), vec![], 0)).display(), "0");
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn q858_the_read_only_transaction_on_postgres() {
+    let Some(pg) = support::postgres("feedback56-q858") else {
+        eprintln!("skipped: q858_the_read_only_transaction_on_postgres, as PostgreSQL's initdb and pg_ctl were not found");
+        return;
+    };
+    let url = pg.database("ro");
+    let d = support::temp_dir("feedback56-q858-pg");
+    let tools = format!("{}fn begin_then() = db.transaction(() => db.query(\"select 1\"))\n", RO_TOOLS);
+    let (mut it, list) = run_on(
+        &d,
+        &url,
+        &[
+            "create table notes (id serial primary key, text text)",
+            "insert into notes (text) values ('a')",
+            "create function add_note() returns int language sql as $$ insert into notes (text) values ('x') returning id $$",
+        ],
+        &tools,
+    );
+    read_only_on(&mut it, &list, true);
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn q858_the_read_only_transaction_on_mariadb() {
+    let Some(my) = support::mariadb("feedback56-q858") else {
+        eprintln!("skipped: q858_the_read_only_transaction_on_mariadb, as MariaDB's mariadbd and mariadb-install-db were not found");
+        return;
+    };
+    let url = my.url("ro");
+    let d = support::temp_dir("feedback56-q858-my");
+    let tools = format!("{}fn begin_then() = db.transaction(() => db.query(\"select 1\"))\n", RO_TOOLS);
+    let (mut it, list) = run_on(
+        &d,
+        &url,
+        &[
+            "create table notes (id int auto_increment primary key, text text)",
+            "insert into notes (text) values ('a')",
+            "create function add_note() returns int modifies sql data begin insert into notes (text) values ('x'); return 1; end",
+            "create table u (v varchar(20) unique)",
+        ],
+        &format!("{}fn dup() = db.error_kind(db.exec(\"insert into u (v) values ('x(1792)')\"))\n", tools),
+    );
+    read_only_on(&mut it, &list, true);
+    // A duplicate whose value holds `(1792)` is a duplicate.
+    let dup = global(&it, "dup");
+    assert_eq!(ok(it.call(&dup, vec![], 0)).display(), "null");
+    assert_eq!(ok(it.call(&dup, vec![], 0)).display(), "unique");
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}

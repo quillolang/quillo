@@ -380,8 +380,9 @@ impl Parts {
 /// fields, the ones required, their `enum`s and defaults (FEEDBACK56.md, Q-855 and Q-856; branch
 /// feedback56). A record that names itself, or one that names it, is a `$ref` there too, so the
 /// walk ends. The walk of a `Ty` and the lookup of a name are the same for JSON Schema 2020-12,
-/// whose `$ref`s point elsewhere (`refs`).
-struct Schemas<'a> {
+/// whose `$ref`s point elsewhere (`refs`), and an MCP tool's schemas are written in it
+/// (`for_tools`; FEEDBACK56.md, Q-853, Part B.2; branch feedback56).
+pub(crate) struct Schemas<'a> {
     types: &'a std::collections::HashMap<String, Types>,
     /// The prefix whose types a name is looked up in: the program's own (""), a mount's or a
     /// service's.
@@ -397,7 +398,16 @@ struct Schemas<'a> {
     /// parameter and a record, but not in a result or an error, which are held to the names of
     /// their types only, nor in an alias, which a result may name (FEEDBACK56.md, Q-856, found
     /// in review; branch feedback56).
-    held: bool,
+    pub(crate) held: bool,
+    /// JSON Schema 2020-12, as MCP takes a tool's schemas, where OpenAPI 3.0 is the default: null
+    /// is a type (`["string", "null"]`, a `$ref` `anyOf` it and `{ "type": "null" }`), keywords
+    /// stand beside a `$ref`, a union of plain types is a list of types and any other an `anyOf`,
+    /// and a record says it has no other fields, as one dropped them from what a client sends
+    /// (FEEDBACK56.md, Q-853, Part B.2; branch feedback56).
+    json_schema: bool,
+    /// A tool's arguments, where a record's other fields are dropped, so it says it has none; a
+    /// result's record may hold more, which nothing checks or drops (found in review).
+    input: bool,
 }
 
 impl<'a> Schemas<'a> {
@@ -425,7 +435,17 @@ impl<'a> Schemas<'a> {
             }
             keys.insert((prefix.clone(), n.clone()), key);
         }
-        Schemas { types, prefix: String::new(), refs, keys, named: Vec::new(), held: true }
+        Schemas { types, prefix: String::new(), refs, keys, named: Vec::new(), held: true, json_schema: false, input: false }
+    }
+
+    /// For one schema of a tool, its arguments' (`input`) or its result's, JSON Schema 2020-12,
+    /// its types under its own `$defs` (FEEDBACK56.md, Q-853, Part B.2; branch feedback56).
+    pub(crate) fn for_tools(types: &'a std::collections::HashMap<String, Types>, input: bool) -> Self {
+        let mut s = Schemas::new(types, "#/$defs/");
+        s.json_schema = true;
+        s.input = input;
+        s.held = input;
+        s
     }
 
     /// `{ "$ref": ... }` for one of the program's types.
@@ -447,7 +467,8 @@ impl<'a> Schemas<'a> {
     /// A `$ref` that something is said beside: OpenAPI 3.0 reads nothing next to a `$ref`, so
     /// it goes in an `allOf`, an object's said to be one.
     fn beside_ref(&self, s: J) -> J {
-        if s.get("$ref").is_none() {
+        // 2020-12 reads what is beside a `$ref` (FEEDBACK56.md, Q-853, Part B.2; branch feedback56).
+        if s.get("$ref").is_none() || self.json_schema {
             return s;
         }
         let record = self.is_record_ref(&s);
@@ -459,6 +480,9 @@ impl<'a> Schemas<'a> {
     }
 
     fn nullable(&self, s: J) -> J {
+        if self.json_schema {
+            return or_null(s);
+        }
         let mut s = self.beside_ref(s);
         s["nullable"] = json!(true);
         s
@@ -500,13 +524,34 @@ impl<'a> Schemas<'a> {
     /// since the value passes as the first it fits. A route's alternatives and several routes'
     /// bodies are said the same way (FEEDBACK56.md, Q-855, found in review; branch feedback56).
     fn either(&self, alts: Vec<J>) -> J {
+        // A list of types where each is a type alone (`int | str`), else `anyOf`: the value
+        // passes as the first it fits, and composition keywords are kept few, as MCP asks
+        // (FEEDBACK56.md, Q-853, Part B.2; branch feedback56).
+        if self.json_schema {
+            let types: Option<Vec<J>> = alts
+                .iter()
+                .map(|a| a.as_object().filter(|o| o.len() == 1).and_then(|o| o.get("type")).cloned())
+                .collect::<Option<Vec<J>>>()
+                .map(|ts| ts.into_iter().flat_map(|t| if let J::Array(a) = t { a } else { vec![t] }).collect());
+            return match types {
+                Some(mut ts) => {
+                    let mut seen = Vec::new();
+                    ts.retain(|t| !seen.contains(t) && {
+                        seen.push(t.clone());
+                        true
+                    });
+                    json!({ "type": if ts.len() == 1 { ts.remove(0) } else { J::Array(ts) } })
+                }
+                None => json!({ "anyOf": alts }),
+            };
+        }
         let overlap = alts.iter().enumerate().any(|(i, a)| alts[i + 1..].iter().any(|b| !self.disjoint(a, b)));
         json!({ if overlap { "anyOf" } else { "oneOf" }: alts })
     }
 
     /// A type: a list's items, a map's fields, one of the program's types by `$ref`, a union of
     /// texts one `enum`.
-    fn ty(&mut self, t: &Ty) -> J {
+    pub(crate) fn ty(&mut self, t: &Ty) -> J {
         let mut alts: Vec<J> = Vec::new();
         let mut texts: Vec<J> = Vec::new();
         let mut texts_at = None;
@@ -560,11 +605,30 @@ impl<'a> Schemas<'a> {
 
     /// A type's name: Quillo's own, or the program's by `$ref`; another as it is named.
     fn name(&mut self, n: &str) -> J {
-        self.refer(n).unwrap_or_else(|| name_schema(n))
+        match self.refer(n) {
+            Some(r) => r,
+            // A name Quillo has no schema for is any value, in 2020-12's words alone
+            // (FEEDBACK56.md, Q-853, Part B.2; branch feedback56).
+            None if self.json_schema => match n {
+                // A decimal's text, by a pattern: `format: "decimal"` is no format 2020-12 has,
+                // and a validator that checks formats refuses the schema (found in review).
+                "dec" => decimal_text(),
+                "money" => json!({
+                    "type": "object",
+                    "required": ["amount", "currency"],
+                    "properties": { "amount": decimal_text(), "currency": { "type": "string", "pattern": "^[A-Za-z]{3}$" } }
+                }),
+                _ => match name_schema(n) {
+                    s if s.get("x-quillo-type").is_some() => json!({}),
+                    s => s,
+                },
+            },
+            None => name_schema(n),
+        }
     }
 
     /// The named types referred to, each written once, by key: one written may refer to more.
-    fn written(&mut self) -> Map<String, J> {
+    pub(crate) fn written(&mut self) -> Map<String, J> {
         let mut out = std::collections::BTreeMap::new();
         let mut i = 0;
         while i < self.named.len() {
@@ -574,9 +638,20 @@ impl<'a> Schemas<'a> {
             let outer = std::mem::replace(&mut self.prefix, prefix);
             // A record is checked field by field wherever it is named; an alias as the place
             // that names it is.
-            let held = std::mem::replace(&mut self.held, td.is_record());
+            // A tool's schemas are each their own, so an alias in its parameters is held as they
+            // are (FEEDBACK56.md, Q-853, Part B.2; branch feedback56).
+            let hold = td.is_record() || (self.json_schema && self.held);
+            let held = std::mem::replace(&mut self.held, hold);
             let mut s = match (&td.ty.fields, td.is_record()) {
-                (Some(fs), true) => self.fields(fs, &td.defaults),
+                (Some(fs), true) => {
+                    let mut s = self.fields(fs, &td.defaults);
+                    // What a client sends that a record does not have is dropped: said
+                    // (FEEDBACK56.md, Smaller notes; branch feedback56).
+                    if self.json_schema && self.input {
+                        s["additionalProperties"] = json!(false);
+                    }
+                    s
+                }
                 _ => self.ty(&td.ty),
             };
             self.held = held;
@@ -657,9 +732,47 @@ fn may_be_null(t: &Ty) -> bool {
     t.optional || t.names.iter().any(|n| n == "null")
 }
 
+/// A decimal as text, as `dec` takes it: a sign, digits with a point, an exponent
+/// (FEEDBACK56.md, Q-853, Part B.2, found in review; branch feedback56).
+fn decimal_text() -> J {
+    json!({ "type": "string", "pattern": "^[+-]?([0-9]+[.]?[0-9]*|[.][0-9]+)([eE][+-]?[0-9]{1,6})?$", "description": "a decimal number, as text: \"12.50\"" })
+}
+
+/// `s`, or null (JSON Schema 2020-12): `null` among its types, and in its `enum`; a `$ref` or an
+/// `anyOf` an alternative more; `{}` takes null already (FEEDBACK56.md, Q-853, Part B.2; branch
+/// feedback56).
+fn or_null(mut s: J) -> J {
+    let null = J::String("null".into());
+    match s.get("type").cloned() {
+        Some(J::String(t)) => s["type"] = J::Array(vec![J::String(t), null]),
+        Some(J::Array(mut ts)) => {
+            if !ts.contains(&null) {
+                ts.push(null);
+            }
+            s["type"] = J::Array(ts);
+        }
+        _ if s.as_object().is_some_and(|o| o.is_empty()) => return s,
+        _ => {
+            if let Some(J::Array(alts)) = s.get_mut("anyOf") {
+                if !alts.iter().any(|a| a == &json!({ "type": "null" })) {
+                    alts.push(json!({ "type": "null" }));
+                }
+                return s;
+            }
+            return json!({ "anyOf": [s, { "type": "null" }] });
+        }
+    }
+    if let Some(J::Array(e)) = s.get_mut("enum") {
+        if !e.contains(&J::Null) {
+            e.push(J::Null);
+        }
+    }
+    s
+}
+
 /// A default written as a value (`"member"`, `[]`, `{ a: 1 }`), as JSON; one worked out when a
 /// record is made (`now()`) is not known here.
-fn literal(e: &Expr) -> Option<J> {
+pub(crate) fn literal(e: &Expr) -> Option<J> {
     match e {
         Expr::Lit(Lit::Bool(b)) => Some(json!(b)),
         Expr::Lit(Lit::Int(n)) => Some(json!(n)),

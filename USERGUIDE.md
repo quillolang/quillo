@@ -2774,6 +2774,30 @@ fn mcp orders_today(limit: int = 20) -> list with db {
   tools will be the program's, named `billing.<name>`. The named form, `service mcp crm =
   "https://..."`, for calling another MCP server, is refused for now.
 - The API document marks a `server fn mcp` with `x-quillo-mcp: true`.
+- What a client is told: each tool's arguments and result as JSON Schema 2020-12, the dialect
+  MCP requires (`str?` is `["string", "null"]`, a record once under `$defs` by a local `$ref`,
+  `int | str` a list of types, `dec` and money's amount a text with a `pattern`). The
+  arguments and the records they hold refuse other fields (`additionalProperties: false`); a
+  result says no such thing, since the server does not check it. A result is always an
+  object: one that is not (`-> int`, `-> list`) is held as `result`, in the schema and in what
+  the client gets (`{ "result": 3 }`), as clients of MCP's earlier revisions require.
+- Two hints. `readOnlyHint` is true when Quillo can see the whole of what the tool may run (no
+  function held in a variable or a parameter, no `js`, `run_script` or native plugin), it
+  writes nothing (no `db` write, no `dblink`, no builtin that changes something, such as a
+  session, a cookie, `publish` or `media.close`, no file, no top-level `let` it changes, and
+  none in the defaults of a record it takes, gives or makes) and its `with` has none of `fs`,
+  `net` and `http`. `openWorldHint` is false when it reaches no other site: no `net`, `http`
+  only to the program's own services whose code is in the program and stays inside, and all
+  of it seen. Otherwise each is MCP's cautious default. A client may skip asking the person
+  before a read-only tool, so Quillo says so only when it is true.
+- "Only reads" is worked out, with no word to write: every `db.query` and `db.one` the tool
+  may reach has a statement written in the program that starts with `select` and only reads
+  (a `with ... insert`, `insert ... returning`, `select ... for update`, `dblink` or a
+  statement built at run time counts as a write). Every read-only tool whose `with` names
+  `db`, or that has no `with`, runs inside a read-only transaction where the program has a
+  database, its arguments made inside it too, so a write Quillo did not see, as a database
+  function a `select` calls, is refused by the database (`db.error_kind` gives `"read_only"`)
+  (FEEDBACK56.md, Q-858).
 
 The door itself, `/_quillo/mcp` and `quillo mcp app.qwe` over stdio, is not built yet
 (FEEDBACK56.md, Q-853).
@@ -6680,7 +6704,10 @@ is, the same for SQLite, PostgreSQL and MySQL, whose words for it differ: `"uniq
 or unique column has the value already), `"foreign_key"`, `"not_null"`, `"check"`,
 `"conflict"` (another transaction: the database busy, a deadlock, a serialization
 failure), `"connection"` (the server ended the connection, or it could not be made:
-`57P01` and class `08`) *(since 0.7)*, or null for any other failure and for anything else.
+`57P01` and class `08`) *(since 0.7)*, `"read_only"` (a write the database refused because
+the transaction only reads, as a tool's that only reads is: `25006`, SQLite's "attempt to
+write a readonly database", MySQL's 1792; FEEDBACK56.md, Q-858), or null for any other
+failure and for anything else.
 A transaction whose first statement finds that the server ended its pooled connection
 while it sat idle, as after a restart or a failover, is begun again on another one: nothing
 had run. It needs no effect.

@@ -8,6 +8,12 @@
   parameter, or an effect its body uses that its `with` does not say; highlighting, hover, completion and the outline know the tag.
   `mcp` stays an ordinary name everywhere else. The door is not built yet (FEEDBACK56.md,
   Q-853).
+- A tool's arguments and result are written as JSON Schema 2020-12, with `readOnlyHint` and
+  `openWorldHint` said only when Quillo can see they are true. "Only reads" is worked out
+  from the program and enforced: such a tool runs in a read-only transaction on SQLite,
+  PostgreSQL and MySQL, and `db.error_kind` gives `"read_only"` for a write it refused. A
+  result that is not an object is held as `result`, as MCP's earlier clients require
+  (FEEDBACK56.md, Q-858).
 - A function's `///` comment is kept by the program: `quillo docs` and `/_quillo/describe` write it
   as the `server fn`'s description, and MCP tools will use it (FEEDBACK56.md, Q-854).
 - The API document writes each named type once under `components/schemas` and refers to it
