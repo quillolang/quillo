@@ -145,7 +145,10 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("url", "", "`{ path, query, hash }` of the request, or of the address bar in the browser, where it is followed."),
     ("navigate", "path", "Goes to `path` from a page's code; on the server it does nothing, and `redirect` is the way."),
     ("every", "ms, f, options", "Calls `f` every `ms` milliseconds: on the server at a program's top, in the browser in a component."),
-    ("ask", "question, choices, default", "In a tool, the user's pick of `choices` (key: text), asked by the AI client, else `default`; `ask(message, options)` is a page's dialog."),
+    ("ask", "message, options", "Asks in a dialog on the page and waits for true or false; an error on the server, where a tool asks with `about` or `confirm`."),
+    // Once `ask` with three arguments (FEEDBACK56.md, the user's decision 2026-11-09; branch
+    // feedback56).
+    ("about", "question, choices, default", "In a tool, the user's pick of `choices` (key: text), asked by the AI client, else `default`."),
     ("confirm", "question", "In a tool, the user's yes or no, asked by the AI client; an error where it cannot ask. Outside a tool's call, true."),
     ("notify", "message, options", "Shows a note on the page that goes by itself; an error on the server."),
     ("js", "name, args", "Calls a function of the page's scripts by its dotted `name`, written in the code; null on the server."),

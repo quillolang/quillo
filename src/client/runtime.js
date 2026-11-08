@@ -1142,8 +1142,10 @@ function most(f, name, n, shape) {
   if (f.$m === undefined) { f.$m = n; f.$mn = name; f.$ms = shape; }
   return f;
 }
-// What the server's `check::too_many_args` says.
-const tooMany = (f, got) => `\`${f.$mn}\` takes ${f.$m} argument${f.$m === 1 ? "" : "s"}, got ${got}: ${f.$ms}${f.$mn === "sort" ? "; to sort by a key, `sort_by(xs, (x) => key)`, and `reverse` of it for the other way" : ""}`;
+// What the server's `check::too_many_args` says: `ask` given a third argument is told of `about`,
+// a tool's question (`mcp::ASK_OF_THREE`; FEEDBACK56.md, the user's decision 2026-11-09; branch
+// feedback56).
+const tooMany = (f, got) => f.$mn === "ask" ? "`ask(message, options)` is the page's dialog; a question with choices for the person at an AI client is `about(question, choices, default)`" : `\`${f.$mn}\` takes ${f.$m} argument${f.$m === 1 ? "" : "s"}, got ${got}: ${f.$ms}${f.$mn === "sort" ? "; to sort by a key, `sort_by(xs, (x) => key)`, and `reverse` of it for the other way" : ""}`;
 
 // `floor(a / b)` (`ceil`, `round`, `math.floor`, `math.ceil`, `math.trunc`: `f`; `g` the function)
 // of two ints, in ints, as on the server's `int_div_rounded`: through the float `a / b` it was off

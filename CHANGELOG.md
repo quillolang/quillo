@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- After a panic part way through `db.atomic` on MySQL or MariaDB, a part prepared on the
+  connection the panic closed is ended at once on another, as the server allows once it has
+  seen the close; before, the server's "unknown XID" was taken as done and the part waited a
+  minute for recovery with its rows held (FEEDBACK56.md, found under load).
 - A panic inside a transaction rolls it back and frees the connection on every database; on
   SQLite it had left the savepoint open, so later writes went uncommitted. `db.atomic`'s too:
   its parts end as decided, committed where the decision stands, rolled back otherwise. A panic
@@ -18,14 +22,17 @@
   `mcp` stays an ordinary name everywhere else (FEEDBACK56.md, Q-853).
 - `service mcp /billing = "billing.qwe"` offers billing's own tools as `billing.<name>`, run in
   billing in one process or over the signed call under `--split` (signed with the app's key too,
-  so only the app's door runs them), with the caller's session and tenant; a service function's `confirm` and `ask` ask the person through the program's door
+  so only the app's door runs them), with the caller's session and tenant; a service function's `confirm` and `about` ask the person through the program's door
   (FEEDBACK56.md, Part F).
-- `confirm(question)` and `ask(question, choices, default)` let a tool ask the person at the AI
+- `confirm(question)` and `about(question, choices, default)` let a tool ask the person at the AI
   client before it acts: the call stops, the client asks, and the call runs again from the top
   with the answer, in a state Quillo signs (10 minutes, once, same caller, tool and arguments).
-  `quillo check` refuses a change before a question; as it runs, a question after any change is
-  refused and the call stops (the change stands). Outside a tool's
-  call, `ask` gives its default and `confirm` true (FEEDBACK56.md, Part E).
+  `quillo check` refuses a change before a question (a change on a way that returns or replies
+  first is none); as it runs, a question after any change is refused and the call stops (the
+  change stands), and so is a question the checker does not see the tool ask, as in a
+  `locale_from` rule, in the tool or a service it calls. Outside a tool's call, `about` gives its
+  default and `confirm` true. `ask(message, options)` stays the page's dialog; `ask` with three
+  arguments is an error naming `about` (FEEDBACK56.md, Part E; `about` is the user's choice).
 - `server/discover` carries `instructions`: a few lines Quillo writes (under 600 characters),
   then the main file's top `//!` block, in which a character a reader does not see (a
   bidirectional override, a zero-width space) is an error; `quillo check` warns past 2,000

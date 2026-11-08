@@ -216,8 +216,9 @@ const READS: &[&str] = &[
     // Who asks, and for whom.
     "session", "cookie", "url", "navigate", "tenant", "with_tenant", "with_locale", "live", "__answer", "mcp_tokens",
     // A tool's user's answer, which changes nothing: a tool that asks and reads only reads
-    // (FEEDBACK56.md, Part E; branch feedback56).
-    "ask", "confirm",
+    // (FEEDBACK56.md, Part E; branch feedback56). `about` was `ask` with three arguments (the
+    // user's decision 2026-11-09).
+    "ask", "about", "confirm",
     // The clock, the system, files; and a line in the log, which changes nothing a page sees.
     "print", "now", "date.now", "date.today", "sleep", "env", "args", "platform", "file", "files", "read_file", "read_upload", "image.info", "check_program",
     // The database and the network, which say what they changed by themselves when it is a table

@@ -840,9 +840,11 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("run_script", "str, map | null=", "any"),
     ("sql_name", "str | list", "str"),
     ("sql_param", "str | list", "str"),
-    // `ask(message, options)` on a page, `ask(question, choices, default)` in a tool
-    // (FEEDBACK56.md, Part E; branch feedback56).
-    ("ask", "str, map | null=, str | null=", "bool | str | null"),
+    // `ask(message, options)` on a page, `about(question, choices, default)` in a tool, once
+    // `ask` with three arguments (FEEDBACK56.md, Part E, and the user's decision 2026-11-09;
+    // branch feedback56).
+    ("ask", "str, map | null=", "bool"),
+    ("about", "str, map, str | null", "str | null"),
     ("confirm", "str", "bool"),
     ("notify", "str, map | null=", "null"),
     ("translations", "str | map, map | null=", "null"),
@@ -1123,6 +1125,11 @@ pub fn most_args(name: &str) -> Option<usize> {
 /// in the browser: how many it takes, and its call as the docs write it, `sort(xs)`. `sort` given
 /// a function to compare with, as in JavaScript, is told how to sort by a key.
 pub fn too_many_args(name: &str, got: usize) -> String {
+    // `ask` with choices and a default: the page's dialog, and a tool's question is `about`
+    // (FEEDBACK56.md, the user's decision 2026-11-09; branch feedback56).
+    if name == "ask" {
+        return crate::mcp::ASK_OF_THREE.to_string();
+    }
     let most = most_args(name).unwrap_or(0);
     let hint = if name == "sort" { "; to sort by a key, `sort_by(xs, (x) => key)`, and `reverse` of it for the other way" } else { "" };
     format!("`{}` takes {} argument{}, got {}: {}{}", name, most, if most == 1 { "" } else { "s" }, got, call_shape(name), hint)
@@ -1145,11 +1152,12 @@ pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", 
 /// What the modules hold that is not a function.
 const MODULE_VALUES: &[&str] = &["math.pi", "math.e", "math.tau", "math.inf", "math.nan"];
 
-/// Builtins the browser has (see client.rs).
+/// Builtins the browser has (see client.rs). `about`, a tool's question, as `confirm`
+/// (FEEDBACK56.md, the user's decision 2026-11-09; branch feedback56).
 const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "unwatched", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
-      "delete_cookie", "session", "cookie", "set_session", "end_session", "mcp_token", "mcp_tokens", "revoke_mcp_token", "confirm", "translations", "locale_from", "with_locale",
+      "delete_cookie", "session", "cookie", "set_session", "end_session", "mcp_token", "mcp_tokens", "revoke_mcp_token", "confirm", "about", "translations", "locale_from", "with_locale",
       "schedule", "stream", "events", "image.info", "image.convert", "later.status", "args", "stdin", "read_line", "exit", "allow_cross_site", "site_headers", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform", "markdown_page", "files", "classes", "accept_calls"];
 
 fn parse_t(s: &str) -> T {
@@ -1497,7 +1505,7 @@ pub struct ToolFacts {
     /// It calls `db`: the database may be reached, and a tool that only reads is run in a
     /// read-only transaction (FEEDBACK56.md, Q-858, found in review; branch feedback56).
     pub db: bool,
-    /// It calls `confirm` or `ask`: it asks the user itself (FEEDBACK56.md, Part E; branch
+    /// It calls `confirm` or `about`: it asks the user itself (FEEDBACK56.md, Part E; branch
     /// feedback56).
     pub asks: bool,
 }
@@ -1523,7 +1531,7 @@ fn unsigned_auth_written(opts: Option<&Expr>) -> Option<&'static str> {
 struct ServiceFn {
     /// It stays inside the program: seen whole, reaching no other site.
     inside: bool,
-    /// It asks the user (`confirm`, `ask`), through the door of the tool's call it is in.
+    /// It asks the user (`confirm`, `about`), through the door of the tool's call it is in.
     asks: bool,
     /// It writes, or may.
     writes: bool,
@@ -3076,21 +3084,23 @@ impl Checker {
         }
     }
 
-    /// `ask`'s question, choices and default, where they are written: a question with no text, no
-    /// choice, a choice that is not text, a default that is not one of the choices.
-    fn ask_written(&mut self, args: &[Expr]) {
+    /// `about`'s question, choices and default, where they are written: a question with no text,
+    /// no choice, a choice that is not text, a default that is not one of the choices. It was
+    /// `ask`'s, with three arguments (FEEDBACK56.md, the user's decision 2026-11-09; branch
+    /// feedback56).
+    fn about_written(&mut self, args: &[Expr]) {
         if matches!(&args[0], Expr::Lit(Lit::Str(q)) if q.trim().is_empty()) {
-            self.error("`ask`'s question is empty: say what the user is asked");
+            self.error("`about`'s question is empty: say what the user is asked");
         }
         let Expr::Map(entries) = &args[1] else { return };
         if entries.is_empty() {
-            self.error("`ask` has no choices: give one at least, as in { public: \"Everyone\", draft: \"Only me\" }");
+            self.error("`about` has no choices: give one at least, as in { public: \"Everyone\", draft: \"Only me\" }");
             return;
         }
         for (k, v) in entries {
             if let Expr::Lit(l) = v {
                 if !matches!(l, Lit::Str(_)) {
-                    self.error(format!("`ask`'s choice `{}` is not text: each choice is the text the user reads, under the key `ask` gives", k));
+                    self.error(format!("`about`'s choice `{}` is not text: each choice is the text the user reads, under the key `about` gives", k));
                 }
             }
         }
@@ -3101,7 +3111,7 @@ impl Checker {
         if let Expr::Lit(Lit::Str(d)) = &args[2] {
             if !entries.iter().any(|(k, _)| k.as_str() == &**d) {
                 let keys: Vec<String> = entries.iter().map(|(k, _)| format!("`{}`", k)).collect();
-                self.error(format!("`ask`'s default {:?} is not one of its choices: {}", &**d, keys.join(", ")));
+                self.error(format!("`about`'s default {:?} is not one of its choices: {}", &**d, keys.join(", ")));
             }
         }
     }
@@ -3273,8 +3283,10 @@ impl Checker {
         if matches!(name, "db.connect" | "db.shards") {
             note(&mut r.open, format!("`{}` reaches another database", name));
         }
-        // It asks the user: a read, of the user (FEEDBACK56.md, Part E; branch feedback56).
-        if matches!(name, "ask" | "confirm") {
+        // It asks the user: a read, of the user (FEEDBACK56.md, Part E; branch feedback56). `about`
+        // is a tool's question, once `ask`'s with three arguments; `ask`, the page's, is refused in
+        // a tool's call, which runs with its asking to stop there (the user's decision 2026-11-09).
+        if matches!(name, "ask" | "about" | "confirm") {
             r.asks = true;
         }
         match name {
@@ -3519,9 +3531,10 @@ impl Checker {
             w.changed = w.changed.take().or(w.left.take());
             (w.ended, w.left) = (ended, left);
         }
-        // `ask` of the page's form, fewer than three arguments, in a tool's code: refused, as the
-        // call is when it runs (second review). A piped value and a method's receiver are its
-        // first.
+        // `ask`, the page's dialog, in a tool's code: refused, as the call is when it runs (second
+        // review), pointing at `about` and `confirm`; with a third argument it is refused anywhere
+        // (`Checker::apply`; FEEDBACK56.md, the user's decision 2026-11-09; branch feedback56). A
+        // piped value and a method's receiver are its first.
         let piped = first.is_some() && first.map(|f| f as *const Expr) != args.first().map(|a| a as *const Expr);
         let builtin_ask = || self.globals.get("ask").is_some_and(|g| &*g.file == "<builtin>");
         let given = match callee {
@@ -3529,8 +3542,8 @@ impl Checker {
             Expr::Field(obj, n, _) if n == "ask" && !module(obj) && builtin_ask() => Some(args.len() + 1 + piped as usize),
             _ => None,
         };
-        if let Some(n) = given.filter(|n| *n < 3) {
-            w.late.push((w.file.clone(), line, crate::mcp::ask_too_few(n)));
+        if given.is_some_and(|n| n < 3) {
+            w.late.push((w.file.clone(), line, crate::mcp::ASK_IN_A_TOOL.to_string()));
         }
         // A call made later of a service's function that asks: no one will be there to answer
         // (FEEDBACK56.md, Part F; branch feedback56).
@@ -3558,7 +3571,9 @@ impl Checker {
     /// What a call does in itself: whether it asks the user, and what it changes, each said.
     fn call_does(&self, callee: &Expr, first: Option<&Expr>, w: &OrderWalk) -> (Option<String>, Option<String>) {
         let builtin = |name: &str| -> (Option<String>, Option<String>) {
-            if matches!(name, "ask" | "confirm") {
+            // `about`, once `ask` with three arguments (FEEDBACK56.md, the user's decision
+            // 2026-11-09; branch feedback56).
+            if matches!(name, "ask" | "about" | "confirm") {
                 return (Some(format!("`{}`", name)), None);
             }
             let acts = crate::viewcache::kind(name) == crate::viewcache::Kind::Acts && builtin_effect(name) != crate::ast::effect_bit("random");
@@ -6387,10 +6402,10 @@ impl Checker {
                     None => {}
                 }
             }
-            // `ask(question, choices, default)` with its choices written: what it refuses as it
-            // runs (FEEDBACK56.md, Part E; branch feedback56).
-            if n == "ask" && args.len() == 3 && !self.is_local(n) && self.globals.get(n.as_str()).map_or(false, |v| &*v.file == "<builtin>") {
-                self.ask_written(args);
+            // `about(question, choices, default)` with its choices written: what it refuses as it
+            // runs (FEEDBACK56.md, Part E, and the user's decision 2026-11-09; branch feedback56).
+            if n == "about" && args.len() == 3 && !self.is_local(n) && self.globals.get(n.as_str()).map_or(false, |v| &*v.file == "<builtin>") {
+                self.about_written(args);
             }
         }
         // `x.f(args)`: a function stored in map x, or `f(x, args)`.
@@ -7430,8 +7445,15 @@ impl Checker {
                 self.error(format!("`{}` takes one list: put the items in it, `{}([...])`", name, name));
                 return sig.ret.unwrap_or(T::ANY);
             }
-            let shown = if sig.builtin { format!(": {}", shape()) } else { String::new() };
-            self.error(format!("`{}` takes {} argument{}, got {}{}{}", name, n, if n == 1 { "" } else { "s" }, args.len(), shown, hides(&sig, name)));
+            if sig.builtin && sig.name == "ask" {
+                // A page's dialog takes no default: a tool's question with choices is `about`,
+                // here as in a page and as it runs (FEEDBACK56.md, the user's decision 2026-11-09;
+                // branch feedback56).
+                self.error(crate::mcp::ASK_OF_THREE);
+            } else {
+                let shown = if sig.builtin { format!(": {}", shape()) } else { String::new() };
+                self.error(format!("`{}` takes {} argument{}, got {}{}{}", name, n, if n == 1 { "" } else { "s" }, args.len(), shown, hides(&sig, name)));
+            }
         }
         for (i, p) in sig.params.iter().enumerate() {
             let what = || if sig.builtin { format!("argument {}", i + 1) } else { format!("argument `{}`", p.name) };
@@ -7602,10 +7624,6 @@ impl Checker {
             if sig.builtin && BROWSER_ONLY_SERVER.contains(&sig.name.as_str()) && !public {
                 let hint = if sig.name == "env" { " (or name the variable PUBLIC_..., which says the browser may see it)" } else { "" };
                 self.error(format!("`{}` is not available in the browser, where <{}> also runs; use a `server fn`{}", sig.name, c, hint));
-            }
-            // A tool's question is not the page's (FEEDBACK56.md, Part E; branch feedback56).
-            if sig.builtin && sig.name == "ask" && arg_exprs.len() >= 3 {
-                self.error(format!("{} in <{}>", crate::client::ASK_IN_A_PAGE, c));
             }
             if let Some(f) = &sig.native {
                 let f = f.rsplit('/').next().unwrap_or(f).to_string();

@@ -348,8 +348,8 @@ pub struct Interp {
     /// service: its tools as the checker read them, shared by its forks (FEEDBACK56.md, C.2;
     /// branch feedback56).
     pub(crate) mcp: Option<Arc<crate::mcp::Door>>,
-    /// A tool's call at the MCP door that may ask its user (`confirm`, `ask`), while it runs: what
-    /// was answered, and what it changed, so that a question after a change is refused
+    /// A tool's call at the MCP door that may ask its user (`confirm`, `about`), while it runs:
+    /// what was answered, and what it changed, so that a question after a change is refused
     /// (FEEDBACK56.md, Part E; branch feedback56). None everywhere else.
     pub(crate) asking: Option<Box<crate::mcp::Asking>>,
     /// A tool's call runs (`mcp::answer_tool`), here or in a fork of it. With no `asking`, a
@@ -4204,6 +4204,13 @@ impl Interp {
                 // were dropped, and `xs.sort((a, b) => b - a)` sorted up (FEEDBACK55.md, Q-786;
                 // branch feedback55).
                 if args.len() > crate::builtins::most_args(name) {
+                    // `ask` given choices and a default in a tool's call, where `quillo check`
+                    // could not see it: told of `about`, and the call stops there, as at the
+                    // page's `ask` (FEEDBACK56.md, the user's decision 2026-11-09; branch
+                    // feedback56).
+                    if *name == "ask" && self.asking.is_some() {
+                        return crate::mcp::ask_in_a_tool(self, args.len(), line);
+                    }
                     return fail(line, crate::check::too_many_args(name, args.len()));
                 }
                 // The quotient a pipe made of two ints, given by the pipe alone to `floor` or its

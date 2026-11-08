@@ -6287,7 +6287,7 @@ fn grouped(n: usize) -> String {
     s.chars().enumerate().flat_map(|(i, c)| (i > 0 && (s.len() - i) % 3 == 0).then_some(',').into_iter().chain([c])).collect()
 }
 
-// ---- Slice 7: `confirm` and `ask` (FEEDBACK56.md, Part E; branch feedback56) -----------------
+// ---- Slice 7: `confirm` and `about` (FEEDBACK56.md, Part E; branch feedback56) ---------------
 //
 // A tool that asks answers `input_required` with a form and a signed `requestState`; the client
 // asks the user and calls again, with a new id, the answers and the state as it was (MCP
@@ -6318,7 +6318,7 @@ route GET /direct = `${sure()} ${loose() ?? "none"} ${pick(1)}`
 
 /// Shares a post: who can see it, and whether now.
 server fn mcp share(title: str) -> map with db {
-    let who = ask("Who can see it?", { public: "Everyone", draft: "Only me, as a draft" }, "draft")
+    let who = about("Who can see it?", { public: "Everyone", draft: "Only me, as a draft" }, "draft")
     if !confirm(`Publish "${title}" now?`) { return err("not published: the user said no") }
     db.one("insert into posts (title, draft) values (?, ?) returning id, draft", title, who == "draft" ? 1 : 0)
 }
@@ -6326,14 +6326,14 @@ server fn mcp share(title: str) -> map with db {
 /// Asks, and only reads.
 fn mcp pick(n: int) with db {
     let c = db.one("select count(*) as n from posts").n
-    ask(`Welches von ${n}? (${c} Beiträge) 日本語 ✓`, { "ä": "Äpfel, erste", "日本": "日本語 ✓", "😀": "👩‍💻 Smile" }, "日本")
+    about(`Welches von ${n}? (${c} Beiträge) 日本語 ✓`, { "ä": "Äpfel, erste", "日本": "日本語 ✓", "😀": "👩‍💻 Smile" }, "日本")
 }
 
 /// Yes or no.
 fn mcp sure() -> bool with time = confirm("Sure?")
 
 /// No default.
-fn mcp loose() with time = ask("Which?", { x: "X", y: "Y" }, null)
+fn mcp loose() with time = about("Which?", { x: "X", y: "Y" }, null)
 
 /// Two arguments.
 fn mcp pair(a: int, b: map) -> bool with time = confirm(`${a} and ${len(b)}?`)
@@ -6368,7 +6368,7 @@ fn mcp late(t: str) -> bool with db {
 /// Inserts with a query, then asks.
 fn mcp inserts() with db {
     hidden.i()
-    ask("Then?", { a: "A" }, "a")
+    about("Then?", { a: "A" }, "a")
 }
 
 /// Writes, sets a cookie, then asks: refused, and both stand.
@@ -6394,10 +6394,10 @@ fn mcp guard_late() with db {
     "went on"
 }
 
-/// The same, with `ask`.
+/// The same, with `about`.
 fn mcp guard_ask() with time {
     hidden.c()
-    ask("Which one?", { a: "A", b: "B" }, "a") ?? "b"
+    about("Which one?", { a: "A", b: "B" }, "a") ?? "b"
 }
 
 /// A question with no text, under `??`.
@@ -6611,7 +6611,7 @@ fn state_payload(state: &str) -> Value {
 fn e_two_questions_in_one_call_on_each_door() {
     let (d, doors, s) = e_doors("two");
     for mut door in doors {
-        // The first run stops at `ask`: one choice, the keys as values and the texts as labels,
+        // The first run stops at `about`: one choice, the keys as values and the texts as labels,
         // its default the form's; the second at `confirm`, a box titled with the question,
         // unticked to start, required; the third ends.
         let (r, asked) = door.answered("share", json!({ "title": "Hi" }), &|req| if req["params"]["requestedSchema"]["properties"]["choice"].is_object() { choose("public") } else { yes() });
@@ -6794,7 +6794,7 @@ fn e_an_expired_state_and_one_changed_and_signed_again() {
 
 #[test]
 fn e_a_client_that_cannot_ask() {
-    // No `elicitation`, or only `url` mode: `ask` gives its default, `confirm` refuses, closed as
+    // No `elicitation`, or only `url` mode: `about` gives its default, `confirm` refuses, closed as
     // the door is, and the tool changes nothing. `elicitation: {}` is form mode, as is `form`.
     let (d, doors, s) = e_doors("cannot");
     for mut door in doors {
@@ -6857,7 +6857,7 @@ fn e_a_question_after_a_change_is_refused_as_it_runs() {
             let at = |what: &str| E_SRC.lines().position(|l| l.contains(what)).unwrap() + 1;
             for said in [
                 format!("error in tool `late`: main.qwe:{}: `confirm` comes after `db.exec`: {}", at("Too late?"), first),
-                format!("error in tool `inserts`: main.qwe:{}: `ask` comes after a database statement that writes: {}", at("Then?"), first),
+                format!("error in tool `inserts`: main.qwe:{}: `about` comes after a database statement that writes: {}", at("Then?"), first),
                 format!("error in tool `cookied`: main.qwe:{}: `confirm` comes after `db.exec`: {}", at("Cookie?"), first),
                 format!("error in tool `counts`: main.qwe:{}: `confirm` comes after assigning the program's variable `hits`: {}", at("Count?"), first),
             ] {
@@ -6873,6 +6873,13 @@ fn e_a_question_after_a_change_is_refused_as_it_runs() {
 }
 
 const ASK_FIRST_TEXT: &str = "ask before changing anything: the call runs again with the answer";
+
+/// What `ask` with a third argument is told, anywhere: a tool's question with choices is `about`
+/// (FEEDBACK56.md, the user's decision 2026-11-09; branch feedback56).
+const ASK_OF_THREE_TEXT: &str = "`ask(message, options)` is the page's dialog; a question with choices for the person at an AI client is `about(question, choices, default)`";
+
+/// What a tool is told of `ask`, the page's dialog, with fewer.
+const ASK_IN_A_TOOL_TEXT: &str = "in a tool, `ask` is the page's dialog, which no tool can show: a question with choices is about(question, choices, default); a yes or a no is confirm(question)";
 
 /// A tool's code, its question after a change marked `// refused`, each with what `quillo check`
 /// says of it, an error (found in review).
@@ -6908,7 +6915,7 @@ fn mcp looped(n: int) -> int with db {
 fn mcp waited(n: int) -> int with db {
     let i = 0
     while i < n {
-        if ask(`Row ${i}?`, { y: "Yes" }, "y") == "y" { save(i) } // refused: `ask` comes after `save`, which changes something (`db.exec`)
+        if about(`Row ${i}?`, { y: "Yes" }, "y") == "y" { save(i) } // refused: `about` comes after `save`, which changes something (`db.exec`)
         i = i + 1
     }
     n
@@ -6938,7 +6945,7 @@ fn mcp global() -> bool with time {
 /// A statement written that writes.
 fn mcp statement() with db {
     db.one("insert into t (v) values (5) returning id")
-    ask("Then?", { a: "A" }, "a") // refused: `ask` comes after `db.one`
+    about("Then?", { a: "A" }, "a") // refused: `about` comes after `db.one`
 }
 
 /// A lambda given to a call runs in it.
@@ -7015,22 +7022,22 @@ fn e_quillo_check_holds_asks_written_arguments_and_the_page() {
         err.lines().filter(|l| l.contains(": error: ")).map(|l| l.split_once(": error: ").unwrap().1.to_string()).collect()
     };
     let tool = |body: &str| format!("/// T.\nfn mcp t() with time = {}\n", body);
-    assert_eq!(refused(&tool("ask(\"\", { a: \"A\" }, \"a\")")), ["`ask`'s question is empty: say what the user is asked"]);
-    assert_eq!(refused(&tool("ask(\"  \", { a: \"A\" }, \"a\")")), ["`ask`'s question is empty: say what the user is asked"]);
-    assert_eq!(refused(&tool("ask(\"Q?\", {}, null)")), ["`ask` has no choices: give one at least, as in { public: \"Everyone\", draft: \"Only me\" }"]);
-    assert_eq!(refused(&tool("ask(\"Q?\", { a: 1 }, \"a\")")), ["`ask`'s choice `a` is not text: each choice is the text the user reads, under the key `ask` gives"]);
-    assert_eq!(refused(&tool("ask(\"Q?\", { a: \"A\", b: \"B\" }, \"c\")")), ["`ask`'s default \"c\" is not one of its choices: `a`, `b`"]);
+    assert_eq!(refused(&tool("about(\"\", { a: \"A\" }, \"a\")")), ["`about`'s question is empty: say what the user is asked"]);
+    assert_eq!(refused(&tool("about(\"  \", { a: \"A\" }, \"a\")")), ["`about`'s question is empty: say what the user is asked"]);
+    assert_eq!(refused(&tool("about(\"Q?\", {}, null)")), ["`about` has no choices: give one at least, as in { public: \"Everyone\", draft: \"Only me\" }"]);
+    assert_eq!(refused(&tool("about(\"Q?\", { a: 1 }, \"a\")")), ["`about`'s choice `a` is not text: each choice is the text the user reads, under the key `about` gives"]);
+    assert_eq!(refused(&tool("about(\"Q?\", { a: \"A\", b: \"B\" }, \"c\")")), ["`about`'s default \"c\" is not one of its choices: `a`, `b`"]);
     // One choice, a null default, a default among them, a spread that may add the default, a
     // choice that is not written: fine.
-    for body in ["ask(\"Q?\", { a: \"A\" }, \"a\")", "ask(\"Q?\", { a: \"A\" }, null)", "ask(\"Q?\", { ...more(), a: \"A\" }, \"z\")", "ask(\"Q?\", { a: label() }, \"a\")", "confirm(\"Q?\")"] {
+    for body in ["about(\"Q?\", { a: \"A\" }, \"a\")", "about(\"Q?\", { a: \"A\" }, null)", "about(\"Q?\", { ...more(), a: \"A\" }, \"z\")", "about(\"Q?\", { a: label() }, \"a\")", "confirm(\"Q?\")"] {
         assert_eq!(refused(&format!("{}fn more() = {{ z: \"Z\" }}\nfn label() = \"A\"\n", tool(body))), Vec::<String>::new(), "{}", body);
     }
     assert_eq!(refused(&tool("confirm()")).len(), 1);
-    // In a page: `confirm` is the server's, and `ask` with choices a tool's; the page's own
-    // `ask(message, options)` as before.
+    // In a page: `confirm` is the server's, and `ask` with choices refused, a tool's question being
+    // `about`; the page's own `ask(message, options)` as before.
     let page = |handler: &str| format!("component C() {{\n    <button onclick={{() => {{ {} }}}}>x</button>\n}}\nroute GET / = <C/>\n", handler);
     assert_eq!(refused(&page("confirm(\"Sure?\")")), ["`confirm` is not available in the browser, where <C> also runs; use a `server fn`"]);
-    assert_eq!(refused(&page("ask(\"Sure?\", { a: \"A\" }, \"a\")")), ["`ask(question, choices, default)` is a tool's question to its user, asked by the AI client (`fn mcp`); a page asks yes or no with `ask(message, options)` in <C>"]);
+    assert_eq!(refused(&page("ask(\"Sure?\", { a: \"A\" }, \"a\")")), [ASK_OF_THREE_TEXT]);
     assert_eq!(refused(&page("if ask(\"Sure?\", { title: \"T\", tone: \"danger\" }) { notify(\"ok\") }")), Vec::<String>::new());
 }
 
@@ -7038,7 +7045,7 @@ fn e_quillo_check_holds_asks_written_arguments_and_the_page() {
 fn e_outside_a_tools_call_ask_gives_its_default_and_confirm_true() {
     // The program's own code: at the top level, in a route, and a page calling a `server fn mcp`
     // through /_quillo/rpc (decided 2026-11-08, question 4).
-    let src = format!("{}\nlet top = [ask(\"Top?\", {{ a: \"A\", b: \"B\" }}, \"b\"), ask(\"None?\", {{ a: \"A\" }}, null), confirm(\"Top?\"), guard_empty()]\n", E_SRC);
+    let src = format!("{}\nlet top = [about(\"Top?\", {{ a: \"A\", b: \"B\" }}, \"b\"), about(\"None?\", {{ a: \"A\" }}, null), confirm(\"Top?\"), guard_empty()]\n", E_SRC);
     let d = dir("e-outside", &src);
     let mut it = Interp::new(&d);
     it.load_file(&d.join("main.qwe")).unwrap();
@@ -7046,12 +7053,12 @@ fn e_outside_a_tools_call_ask_gives_its_default_and_confirm_true() {
     assert_eq!(global(&it, "top").repr(), "[\"b\", null, true, true]");
     // What it refuses it refuses there too.
     for (code, said) in [
-        ("ask(\"\", { a: \"A\" }, \"a\")", "`ask`'s question is empty: say what the user is asked"),
-        ("ask(\"Q?\", {}, \"a\")", "`ask` has no choices"),
-        ("ask(\"Q?\", { a: \"A\" }, \"b\")", "`ask`'s default is one of its choices' keys (`a`) or null, got \"b\""),
-        ("ask(\"Q?\", { a: 1 }, \"a\")", "`ask`'s choice `a` is int"),
-        ("ask(\"Q?\", [1], \"a\")", "`ask`'s choices are a map"),
-        ("ask(5, { a: \"A\" }, \"a\")", "`ask`'s question is text the user reads, got int"),
+        ("about(\"\", { a: \"A\" }, \"a\")", "`about`'s question is empty: say what the user is asked"),
+        ("about(\"Q?\", {}, \"a\")", "`about` has no choices"),
+        ("about(\"Q?\", { a: \"A\" }, \"b\")", "`about`'s default is one of its choices' keys (`a`) or null, got \"b\""),
+        ("about(\"Q?\", { a: 1 }, \"a\")", "`about`'s choice `a` is int"),
+        ("about(\"Q?\", [1], \"a\")", "`about`'s choices are a map"),
+        ("about(5, { a: \"A\" }, \"a\")", "`about`'s question is text the user reads, got int"),
         ("confirm(\" \")", "`confirm`'s question is empty"),
         ("confirm(null)", "`confirm`'s question is text the user reads, got null"),
         ("ask(\"Q?\")", "`ask` and `notify` speak to someone in the browser"),
@@ -7092,7 +7099,7 @@ fn e_an_answer_the_question_does_not_take() {
             let state = state_of(&mut door, "share", hi.clone());
             assert_eq!(door.refused("share", hi.clone(), Some(&state), Some(one("q1", sent.clone()))), (status, -32602, said), "{}", sent);
         }
-        // The user declines or dismisses an `ask`: the call ends, saying so.
+        // The user declines or dismisses an `about`: the call ends, saying so.
         let state = state_of(&mut door, "share", hi.clone());
         assert_eq!(text_of(&door.result("share", hi.clone(), true, Some(&state), Some(one("q1", no())))), (true, "the user declined to answer: Who can see it?".into()));
         let state = state_of(&mut door, "share", hi.clone());
@@ -7426,7 +7433,7 @@ const { StdioClientTransport } = require("@modelcontextprotocol/client/stdio");
 
 #[test]
 fn e_review_a_refused_question_under_a_guard_stops_the_call() {
-    // `??` takes no refusal of `confirm` or `ask` for null: the call stops there, nothing after
+    // `??` takes no refusal of `confirm` or `about` for null: the call stops there, nothing after
     // it runs, and what it wrote is rolled back.
     let (d, doors, s) = e_doors("guard");
     for (i, mut door) in doors.into_iter().enumerate() {
@@ -7444,7 +7451,7 @@ fn e_review_a_refused_question_under_a_guard_stops_the_call() {
             for said in ["error in tool `guard_late`: ", "error in tool `guard_ask`: ", "error in tool `guard_empty`: "] {
                 assert!(err.contains(said), "{}\n{}", said, err);
             }
-            assert!(err.contains("`confirm` comes after `set_cookie`") && err.contains("`ask` comes after `set_cookie`") && err.contains("`confirm`'s question is empty"), "{}", err);
+            assert!(err.contains("`confirm` comes after `set_cookie`") && err.contains("`about` comes after `set_cookie`") && err.contains("`confirm`'s question is empty"), "{}", err);
         }
     }
     drop(s);
@@ -7743,8 +7750,9 @@ fn e_review_second_a_tools_own_transactions_work_after_its_question() {
 
 #[test]
 fn e_review_second_the_pages_ask_in_a_tool_is_refused() {
-    // `ask` with fewer than three arguments, the page's form: in a tool's code (and what it
-    // reaches), a `quillo check` error; as it runs, a stop no `??` takes.
+    // `ask`, the page's form: in a tool's code (and what it reaches), a `quillo check` error; as it
+    // runs, a stop no `??` takes. A tool's question with choices is `about` (the user's decision
+    // 2026-11-09), piped and as a method too.
     let src = r#"fn helper() = ask("Q?", { a: "A" })
 /// T.
 fn mcp t1() with time = ask("Q?", { a: "A" })
@@ -7753,23 +7761,22 @@ fn mcp t2() with time = ask("Q?")
 /// T.
 fn mcp t3() with time = "Q?" | ask({ a: "A" })
 /// T.
-fn mcp t4() with time = "Q?" | ask({ a: "A" }, "a")
+fn mcp t4() with time = "Q?" | about({ a: "A" }, "a")
 /// T.
 fn mcp t5() with time = helper()
 /// T.
-fn mcp t6() with time = "Q?".ask({ a: "A" }, "a")
+fn mcp t6() with time = "Q?".about({ a: "A" }, "a")
 /// T.
-fn mcp t7() with time = ask("Q?", { a: "A" }, "a")
+fn mcp t7() with time = about("Q?", { a: "A" }, "a")
 server fn for_a_page() = 1
 "#;
     let d = dir("e-short", src);
     let (ok, _, err) = quillo(&d, &["check", "main.qwe"]);
     let _ = std::fs::remove_dir_all(&d);
     assert!(!ok, "{}", err);
-    let two = "in a tool, `ask` takes the choices' default as its third argument: ask(question, choices, default)";
-    let one_arg = "in a tool, `ask` takes choices and their default: ask(question, choices, default); a yes or a no is confirm(question)";
+    let said = ASK_IN_A_TOOL_TEXT;
     let got: Vec<&str> = err.lines().filter(|l| l.contains(": error: ")).collect();
-    assert_eq!(got, [format!("main.qwe:1: error: {}", two), format!("main.qwe:3: error: {}", two), format!("main.qwe:5: error: {}", one_arg), format!("main.qwe:7: error: {}", two)], "{}", err);
+    assert_eq!(got, [format!("main.qwe:1: error: {}", said), format!("main.qwe:3: error: {}", said), format!("main.qwe:5: error: {}", said), format!("main.qwe:7: error: {}", said)], "{}", err);
     // As it runs, out of the checker's sight: refused, under `??` too.
     let (d, doors, s) = e_doors("short");
     for (i, mut door) in doors.into_iter().enumerate() {
@@ -7777,7 +7784,7 @@ server fn for_a_page() = 1
         if i == 0 {
             // The log line may come a moment after the answer: wait for it (found in CI).
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while !door.stderr().contains(two) {
+            while !door.stderr().contains(said) {
                 assert!(std::time::Instant::now() < deadline, "{}", door.stderr());
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -7787,12 +7794,253 @@ server fn for_a_page() = 1
     let _ = std::fs::remove_dir_all(&d);
 }
 
+// ---- `about`, once `ask` with three arguments (FEEDBACK56.md, the user's decision 2026-11-09;
+// branch feedback56) ---------------------------------------------------------------------------
+//
+// A tool's question with choices is `about(question, choices, default)`, as `ask` with three
+// arguments was, everywhere; `ask` is the page's dialog, and a third argument given to it is
+// refused, by `quillo check` and as it runs, a tool's call stopping there. A program's own `about`
+// is warned of and used, as any builtin's name taken is.
+
+const ABOUT_SRC: &str = r#"fn call1(f, a) = f(a)
+fn call2(f, a, b) = f(a, b)
+fn call3(f, a, b, c) = f(a, b, c)
+
+route POST /login ? { user: str } = set_session({ user: user })
+route GET /outside = `${about("Here?", { y: "Yes", n: "No" }, "n")} ${about("None?", { y: "Yes" }, null) ?? "none"} ${single()} ${call3(ask, "Q?", { a: "A" }, "a") ?? "refused"}`
+
+/// One choice, its key and its text in other scripts.
+fn mcp single() -> str with time = about("Только одно?", { "ключ": "Да ✓" }, "ключ")
+
+/// Piped, as a method, and written out: three questions.
+fn mcp forms() -> list with time = ["First?" | about({ a: "A", b: "B" }, "a"), "Second?".about({ c: "C" }, null), about("Third?", { d: "D", e: "E" }, "e")]
+
+/// `ask` given choices and a default, where the checker cannot see it, under `??`.
+fn mcp three() with time = call3(ask, "Which?", { a: "A" }, "a") ?? "taken"
+
+/// The page's `ask` of one argument, where the checker cannot see it, under `??`.
+fn mcp one() with time = call1(ask, "Which?") ?? "taken"
+
+/// `about` with no default, where the checker cannot see it, under `??`.
+fn mcp pair() with time = call2(about, "Which?", { a: "A" }) ?? "taken"
+"#;
+
+/// What `about` given two arguments as it runs is told.
+const ABOUT_NO_DEFAULT: &str = "`about` takes its default as its third argument, one of its choices' keys (`a`) or null: about(question, choices, default)";
+
+#[test]
+fn about_asks_in_a_tool_and_gives_the_key_on_each_door() {
+    let d = dir("about-doors", ABOUT_SRC);
+    let tools = tools_of("about-doors-t", ABOUT_SRC);
+    assert!(the(&tools, "single").asks && the(&tools, "forms").asks, "the instructions say they ask");
+    for t in ["three", "one", "pair"] {
+        assert!(the(&tools, t).may_ask, "{}: runs with its asking, to stop at the refusal", t);
+    }
+    let s = Logged::start(&d.join("main.qwe"), &["--max-tool-calls", "100000"], &[]);
+    let cookie = http_door::login(s.port, "ana", &[]);
+    let doors = vec![EDoor::Stdio(Stdio::start(&d, &["main.qwe"])), EDoor::Http(s.port, http_door::As::Cookie(cookie))];
+    for mut door in doors {
+        // One choice: a form of one, its default the form's, and its key back.
+        let (r, asked) = door.answered("single", json!({}), &|_| choose("ключ"));
+        assert_eq!(asked, [json!({ "method": "elicitation/create", "params": { "mode": "form", "message": "Только одно?", "requestedSchema": {
+            "type": "object",
+            "properties": { "choice": { "type": "string", "oneOf": [{ "const": "ключ", "title": "Да ✓" }], "default": "ключ" } },
+            "required": ["choice"],
+        } } })]);
+        assert_eq!(text_of(&r), (false, "ключ".into()), "{}", r);
+        // Piped, as a method and written: each asked in turn, each key back.
+        let (r, asked) = door.answered("forms", json!({}), &|req| match req["params"]["message"].as_str() {
+            Some("First?") => choose("b"),
+            Some("Second?") => choose("c"),
+            _ => choose("d"),
+        });
+        let messages: Vec<&str> = asked.iter().map(|q| q["params"]["message"].as_str().unwrap()).collect();
+        assert_eq!(messages, ["First?", "Second?", "Third?"]);
+        assert_eq!(asked[1]["params"]["requestedSchema"]["properties"]["choice"]["oneOf"], json!([{ "const": "c", "title": "C" }]));
+        assert_eq!(r["structuredContent"]["result"], json!(["b", "c", "d"]), "{}", r);
+        // A question of the wrong form, where the checker cannot see it: refused, the call stopped,
+        // `??` taking nothing, the reason in the log.
+        for name in ["three", "one", "pair"] {
+            assert_eq!(text_of(&door.result(name, json!({}), true, None, None)), (true, "internal error".into()), "{}", name);
+        }
+        for (name, said) in [("three", ASK_OF_THREE_TEXT), ("one", ASK_IN_A_TOOL_TEXT), ("pair", ABOUT_NO_DEFAULT)] {
+            let line = format!("error in tool `{}`: ", name);
+            match &door {
+                EDoor::Stdio(io) => {
+                    io.says(said);
+                    let err = io.stderr();
+                    assert!(err.lines().any(|l| l.contains(&line) && l.contains(said)), "{}: {}", name, err);
+                }
+                _ => {
+                    let log = s.says(said);
+                    assert!(log.lines().any(|l| l.contains(&line) && l.contains(said)), "{}: {}", name, log);
+                }
+            }
+        }
+    }
+    // Outside a tool's call: the default, null as the default, the tool's own default, and `ask`
+    // with choices an error `??` takes, as outside any tool's call.
+    assert_eq!(support::send(s.port, "GET", "/outside", &[], "").body, "n none ключ refused");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn about_outside_a_tools_call_and_ask_given_three_as_it_runs() {
+    let d = dir("about-outside", ABOUT_SRC);
+    // What each refuses, where the checker cannot see it: `ask` with three arguments, or four,
+    // through a function value; `about` with two.
+    for (code, said) in [
+        ("call3(ask, \"Q?\", { a: \"A\" }, \"a\")", ASK_OF_THREE_TEXT),
+        ("call3(ask, \"Q?\", { title: \"T\" }, null)", ASK_OF_THREE_TEXT),
+        ("[ask][0](\"Q?\", { a: \"A\" }, \"a\", 4)", ASK_OF_THREE_TEXT),
+        ("call2(about, \"Q?\", { a: \"A\" })", ABOUT_NO_DEFAULT),
+        ("call1(ask, \"Sure?\")", "`ask` and `notify` speak to someone in the browser"),
+    ] {
+        let mut it = Interp::new(&d);
+        std::fs::write(d.join("bad.qwe"), format!("fn call1(f, a) = f(a)\nfn call2(f, a, b) = f(a, b)\nfn call3(f, a, b, c) = f(a, b, c)\nlet x = {}\n", code)).unwrap();
+        let e = it.load_file(&d.join("bad.qwe")).err().unwrap_or_else(|| panic!("{} ran", code));
+        assert!(e.to_string().contains(said), "{}: {}", code, e);
+    }
+    // `about` outside: its default, null, unicode; a choice of one.
+    std::fs::write(d.join("good.qwe"), "let x = [about(\"Q?\", { a: \"A\" }, \"a\"), about(\"Q?\", { a: \"A\" }, null), about(\"Wähle 日本?\", { \"日本\": \"日本語 ✓\", \"ä\": \"Ä\" }, \"日本\"), \"Q?\" | about({ b: \"B\" }, \"b\")]\n").unwrap();
+    let mut good = Interp::new(&d);
+    good.load_file(&d.join("good.qwe")).unwrap();
+    assert_eq!(global(&good, "x").repr(), "[\"a\", null, \"日本\", \"b\"]");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn about_ask_given_three_says_the_same_in_the_browser() {
+    if Command::new("node").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
+        return;
+    }
+    // A call written out (the page's code made refuses it), and through a function value (the
+    // runtime refuses it), as on the server.
+    for body in ["ask(\"Q?\", { a: \"A\" }, \"a\")", "call3(ask, \"Q?\", { a: \"A\" }, \"a\")"] {
+        let src = format!("fn call3(f, a, b, c) = f(a, b, c)\nfn __t() {{\n{}\n}}\n", body);
+        let mut it = Interp::new(".");
+        it.load_source(&src, "case.qwe").unwrap();
+        let t = quillo::value::lookup(&it.globals, "__t").unwrap();
+        match it.call(&t, vec![], 0) {
+            Err(quillo::interp::Ctrl::Error(e)) => assert_eq!(e.msg, ASK_OF_THREE_TEXT, "{}", body),
+            Ok(v) => panic!("{}: {}", body, v.repr()),
+            Err(_) => panic!("{}: not an error", body),
+        }
+        let js = quillo::client::test_script(&it, "__t").unwrap();
+        let file = std::env::temp_dir().join(format!("feedback56-about-{}-{}.cjs", std::process::id(), fastrand::u32(..)));
+        std::fs::write(&file, js).unwrap();
+        let mut child = Command::new("node").arg(&file).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let deadline = Instant::now() + WAIT;
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("node did not end");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let out = child.wait_with_output().unwrap();
+        let _ = std::fs::remove_file(&file);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), format!("ERROR: {}", ASK_OF_THREE_TEXT), "{}", body);
+    }
+}
+
+#[test]
+fn about_quillo_check_refuses_ask_given_three_and_holds_about() {
+    let said = |src: &str| -> (bool, Vec<String>) {
+        let d = dir("about-check", src);
+        let (ok, _, err) = quillo(&d, &["check", "main.qwe"]);
+        let _ = std::fs::remove_dir_all(&d);
+        (ok, err.lines().filter(|l| l.contains(": error: ") || l.contains(": warning: ")).map(String::from).collect())
+    };
+    // `ask` given a third argument, or a fourth: in a tool, piped, as a method, at the top level,
+    // in a plain function and in a component, each the one error.
+    let src = r#"/// T.
+fn mcp t1() with time = ask("Q?", { a: "A" }, "a")
+/// T.
+fn mcp t2() with time = "Q?" | ask({ a: "A" }, "a")
+/// T.
+fn mcp t3() with time = "Q?".ask({ a: "A" }, null)
+let top = ask("Top?", { a: "A" }, "a")
+fn plain() = ask("Q?", {}, null, 4)
+component C() {
+    <button onclick={() => { ask("Sure?", { title: "T" }, "x") }}>x</button>
+}
+route GET / = <C/>
+"#;
+    let (ok, got) = said(src);
+    assert!(!ok);
+    let want: Vec<String> = [2, 4, 6, 7, 8, 10].iter().map(|n| format!("main.qwe:{}: error: {}", n, ASK_OF_THREE_TEXT)).collect();
+    assert_eq!(got, want);
+    // `about`: refused in a component, as `confirm` is; its default is written; three at most;
+    // what it holds of written arguments; a local of its name is the local's.
+    let src = r#"/// T.
+fn mcp t1() with time = about("Q?", { a: "A" })
+/// T.
+fn mcp t2() with time = about("Q?", { a: "A" }, "a", 4)
+/// T.
+fn mcp t3() with time = about("", { a: "A" }, "b")
+/// T.
+fn mcp t4() with time {
+    let about = (q, c, d) => q
+    about("", {}, "z")
+}
+component C() {
+    <button onclick={() => { about("Sure?", { a: "A" }, "a") }}>x</button>
+}
+route GET / = <C/>
+"#;
+    let (ok, got) = said(src);
+    assert!(!ok);
+    assert_eq!(got, [
+        "main.qwe:2: error: missing argument `default` in call to `about`: about(question, choices, default)",
+        "main.qwe:4: error: `about` takes 3 arguments, got 4: about(question, choices, default)",
+        "main.qwe:6: error: `about`'s question is empty: say what the user is asked",
+        "main.qwe:6: error: `about`'s default \"b\" is not one of its choices: `a`",
+        "main.qwe:13: error: `about` is not available in the browser, where <C> also runs; use a `server fn`",
+    ]);
+    // The page's own `ask` and a tool's `about`, each where it belongs: nothing said.
+    let src = "/// T.\nfn mcp pick() with time = about(\"Q?\", { a: \"A\" }, null)\ncomponent C() {\n    <button onclick={() => { ask(\"Sure?\", { title: \"T\", tone: \"danger\" }) }}>x</button>\n}\nroute GET / = <C/>\n";
+    assert_eq!(said(src), (true, Vec::<String>::new()));
+}
+
+/// A program's own `about`, as quillolang.org's docs.qwe has: warned of, and used everywhere.
+const OWN_ABOUT: &str = r#"route GET /about = about(["// The page", "//   quillo run x.qwe"])
+
+// The comment a file starts with, as markdown.
+fn about(header: list) =
+    header | map((l) => starts_with(l, "// ") ? slice(l, 3) : slice(l, 2)) | join("\n")
+
+/// The header of a file, as markdown.
+fn mcp header(lines: list) -> str with time = about(lines)
+"#;
+
+#[test]
+fn about_a_programs_own_is_warned_of_and_used() {
+    let d = dir("about-own", OWN_ABOUT);
+    let (ok, _, err) = quillo(&d, &["check", "main.qwe"]);
+    let said: Vec<&str> = err.lines().filter(|l| l.contains(": error: ") || l.contains(": warning: ")).collect();
+    assert!(ok, "{}", err);
+    assert_eq!(said, ["main.qwe:4: warning: `about` hides the builtin `about`: the program's own is used everywhere, so pick another name"], "{}", err);
+    // Its tool asks nothing: the program's `about` is called.
+    let tools = tools_of("about-own-t", OWN_ABOUT);
+    assert!(!the(&tools, "header").asks && !the(&tools, "header").may_ask);
+    let mut io = EDoor::Stdio(Stdio::start(&d, &["main.qwe"]));
+    let r = io.result("header", json!({ "lines": ["// One", "//Twö ✓"] }), true, None, None);
+    assert_eq!(text_of(&r), (false, "One\nTwö ✓".into()), "{}", r);
+    let s = support::serve_with(&d.join("main.qwe"), &[]);
+    assert_eq!(support::send(s.port, "GET", "/about", &[], "").body, "The page\n  quillo run x.qwe");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 // ---- Slice 8: services (FEEDBACK56.md, Part F; branch feedback56) ------------------------------
 //
 // `service mcp /billing = "billing.qwe"`: billing's own tools are the app's, as `billing.<name>`,
 // with billing's own schemas and hints; their calls go to billing, in the app's process or over
 // the signed service call under `--split`, with the caller's session and tenant, and the call's
-// asking carried there and back, so that billing's `confirm` and `ask` ask the person through the
+// asking carried there and back, so that billing's `confirm` and `about` ask the person through the
 // app's door, in one state the app signs. Driven against real servers and `quillo mcp`, each read
 // under its deadline, killing only what the test started.
 
@@ -7806,7 +8054,7 @@ server fn mcp whoami() -> map with time, env = { user: session().user, tenant: t
 
 /// Charges the caller, once they say how, and yes.
 fn mcp charge(cents: int) -> map with db {
-    let how = ask("How should it be paid?", { card: "By card", invoice: "On invoice" }, "invoice")
+    let how = about("How should it be paid?", { card: "By card", invoice: "On invoice" }, "invoice")
     if !confirm(`Charge ${cents} cents?`) { return err("not charged: the user said no") }
     db.one("insert into invoices (how, cents) values (?, ?) returning id, how, cents", how, cents)
 }
@@ -8092,7 +8340,7 @@ fn f_calls(port: u16, doors: Vec<EDoor>, apart: bool) {
             assert_eq!(who["mcp"]["client"], json!("quillo-test"), "{}", who);
         }
         let before = f_count(&mut door);
-        // Billing's `ask` and `confirm`, asked through the app's door: a choice, then a yes.
+        // Billing's `about` and `confirm`, asked through the app's door: a choice, then a yes.
         let (r, asked) = door.answered("billing.charge", json!({ "cents": 250 }), &|req| if req["params"]["requestedSchema"]["properties"]["choice"].is_object() { choose("card") } else { yes() });
         let messages: Vec<&str> = asked.iter().map(|q| q["params"]["message"].as_str().unwrap()).collect();
         assert_eq!(messages, ["How should it be paid?", "Charge 250 cents?"]);
@@ -8107,7 +8355,7 @@ fn f_calls(port: u16, doors: Vec<EDoor>, apart: bool) {
         assert_eq!(text_of(&r), (true, "the user declined to answer: How should it be paid?".into()), "{}", r);
         assert_eq!(f_count(&mut door), before + 1);
         // The state is the app's: for the tool by its joined name, refused for another tool, used
-        // once; and a client that cannot ask is refused billing's yes, its `ask` taking its default.
+        // once; and a client that cannot ask is refused billing's yes, its `about` taking its default.
         let first = door.result("billing.charge", json!({ "cents": 3 }), true, None, None);
         let state = first["requestState"].as_str().unwrap().to_string();
         assert_eq!(state_payload(&state)["tool"], json!("billing.charge"));
@@ -8511,7 +8759,7 @@ fn f_billing_offers_its_tools_to_its_apps_door_alone_over_the_signed_call() {
     let (_, r) = f_by_app(&mut it, "whoami", "acme", &tool("whoami", json!({}), json!({ "asking": null, "session": { "user": "Zoë 日本" }, "owner": "id 0123", "client": { "client": "c", "version": "1" } })));
     assert_eq!(r["tool"]["structuredContent"], json!({ "user": "Zoë 日本", "tenant": "acme", "mcp": { "client": "c", "version": "1" }, "apart": false }), "{}", r);
     // A tool that asks, called with no asking: as for a client that cannot ask, never as outside
-    // a tool's call where `confirm` is true; its `ask` takes its default, said so; nothing charged.
+    // a tool's call where `confirm` is true; its `about` takes its default, said so; nothing charged.
     let (_, before) = f_by_app(&mut it, "how_many", "", &tool("how_many", json!({}), nobody_signed.clone()));
     let (status, r) = f_by_app(&mut it, "charge", "", &tool("charge", json!({ "cents": 5 }), nobody_signed.clone()));
     assert_eq!((status, r["tool"]["isError"].clone(), r["tool"]["content"][0]["text"].clone()), (200, json!(true), json!("this needs the user's yes, and this client cannot ask")), "{}", r);
@@ -10153,7 +10401,8 @@ fn b2_coverage_negative_defaults_and_bodies_that_may_both_be_null() {
 #[test]
 fn e_coverage_a_pages_ask_with_choices_fails_as_it_runs() {
     // What `quillo check` refuses (`e_quillo_check_holds_asks_written_arguments_and_the_page`),
-    // run anyway: the page's code refuses the call when it runs, the page's own `ask` as before.
+    // run anyway: the page's code refuses the call when it runs, told of `about` (the user's
+    // decision 2026-11-09), the page's own `ask` as before.
     let mut it = Interp::new(".");
     it.load_source(
         "component C() {\n    <button onclick={() => { ask(\"Sure?\", { a: \"A\" }, \"a\") }}>x</button>\n}\ncomponent D() {\n    <button onclick={() => { ask(\"Sure?\", { title: \"T\" }) }}>x</button>\n}\n",
@@ -10161,8 +10410,8 @@ fn e_coverage_a_pages_ask_with_choices_fails_as_it_runs() {
     )
     .unwrap();
     let js = quillo::client::bundle(&it).unwrap();
-    assert!(js.contains("W.fail(") && js.contains("is a tool's question to its user, asked by the AI client"), "{}", js);
-    assert_eq!(js.matches("asked by the AI client").count(), 1, "{}", js);
+    assert!(js.contains("W.fail(") && js.contains("a question with choices for the person at an AI client is `about(question, choices, default)`"), "{}", js);
+    assert_eq!(js.matches("for the person at an AI client").count(), 1, "{}", js);
     assert!(js.contains("B.ask("), "{}", js);
 }
 
@@ -10462,14 +10711,14 @@ fn mcp greet() -> str with db {
 /// What the log says of such a question.
 const UNSEEN_SAID: &str = "this tool's call reached a question `quillo check` does not see it ask";
 
-/// A `confirm` (or `ask`) reached through the locale rule, in a tool `quillo check` sees ask
+/// A `confirm` (or `about`) reached through the locale rule, in a tool `quillo check` sees ask
 /// nothing: refused and the call stopped, nothing written after it, over HTTP (stdio has no
-/// request, so no locale rule). Before, it was answered as outside any tool's call: `confirm` true, `ask` its default, a yes nobody
+/// request, so no locale rule). Before, it was answered as outside any tool's call: `confirm` true, `about` its default, a yes nobody
 /// gave, and the row written. `?? true` takes no refusal. A page's request is outside any tool's
 /// call: its `confirm` is true, as decided.
 #[test]
 fn unseen_a_question_a_tool_reaches_through_a_rule_is_refused_not_answered_by_nobody() {
-    for (k, rule) in [r#"confirm("In French?")"#, r#"(confirm("In French?") ?? true)"#, r#"ask("Which?", { fr: "French", en: "English" }, "fr") == "fr""#].iter().enumerate() {
+    for (k, rule) in [r#"confirm("In French?")"#, r#"(confirm("In French?") ?? true)"#, r#"about("Which?", { fr: "French", en: "English" }, "fr") == "fr""#].iter().enumerate() {
         let d = dir(&format!("unseen-{}", k), &UNSEEN.replace("RULE", rule));
         assert!(!the(&tools_of(&format!("unseen-t{}", k), &UNSEEN.replace("RULE", rule)), "greet").may_ask, "{}: the checker sees no question", rule);
         let s = Logged::start(&d.join("main.qwe"), &["--max-tool-calls", "100000"], &[]);
@@ -10482,7 +10731,7 @@ fn unseen_a_question_a_tool_reaches_through_a_rule_is_refused_not_answered_by_no
         let r = door.result("greet", json!({}), false, None, None);
         assert_eq!(text_of(&r), (true, "internal error".to_string()), "{}: {}", rule, r);
         assert_eq!(support::send(s.port, "GET", "/writes", &[], "").body, "0", "{}", rule);
-        // The page, outside any tool's call: the rule's `confirm` true, `ask` its default.
+        // The page, outside any tool's call: the rule's `confirm` true, `about` its default.
         assert_eq!(support::send(s.port, "GET", "/hi", &[], "").body, "Salut", "{}", rule);
         drop(s);
         // Over stdio there is no request, so no locale rule runs: the default locale, no question.

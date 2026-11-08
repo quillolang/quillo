@@ -3580,12 +3580,11 @@ fn highlight(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 /// `ask` and `notify` are the browser's (a dialog, a note on the page): on
-/// the server there is no one to ask. `ask(question, choices, default)`, three arguments, is a
-/// tool's question to its user, asked by the AI client (FEEDBACK56.md, Part E; branch feedback56).
+/// the server there is no one to ask. A tool's question to its user, asked by the AI client, is
+/// `about(question, choices, default)` (`mcp::about`), which was `ask` with three arguments: `ask`
+/// takes two, and a third is refused before it is called (`Interp::call`; FEEDBACK56.md, the
+/// user's decision 2026-11-09; branch feedback56).
 fn ask(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    if args.len() >= 3 {
-        return crate::mcp::ask(it, args, line);
-    }
     // In a tool's call, the page's form is a mistake the call stops at, which no `??` takes
     // (FEEDBACK56.md, Part E, second review; branch feedback56).
     if it.asking.is_some() {
