@@ -20,8 +20,8 @@
 - `confirm(question)` and `ask(question, choices, default)` let a tool ask the person at the AI
   client before it acts: the call stops, the client asks, and the call runs again from the top
   with the answer, in a state Quillo signs (10 minutes, once, same caller, tool and arguments).
-  `quillo check` refuses a change before a question; as it runs, a call's database writes are
-  rolled back at each question, and any other change before one is refused. Outside a tool's
+  `quillo check` refuses a change before a question; as it runs, a question after any change is
+  refused and the call stops (the change stands). Outside a tool's
   call, `ask` gives its default and `confirm` true (FEEDBACK56.md, Part E).
 - `server/discover` carries `instructions`: a few lines Quillo writes (under 600 characters),
   then the main file's top `//!` block, in which a character a reader does not see (a

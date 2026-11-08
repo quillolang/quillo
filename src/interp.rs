@@ -3111,13 +3111,24 @@ impl Interp {
                 let f = self.get_field(recv, name, env, *l)?;
                 self.db_on = db_on;
                 self.exact_div = pending;
+                self.piped_site(rhs);
                 self.call(&f, vec![v], line)
             }
             other => {
                 let f = self.eval(other, env)?;
                 self.exact_div = pending;
+                self.piped_site(rhs);
                 self.call(&f, vec![v], line)
             }
+        }
+    }
+
+    /// `x | confirm`: where a tool's question is, this pipe's right side, as a call's is its
+    /// callee (`eval_call`; FEEDBACK56.md, Part E, second review; branch feedback56).
+    #[inline]
+    fn piped_site(&mut self, rhs: &Expr) {
+        if let Some(a) = self.asking.as_mut() {
+            a.site = rhs as *const Expr as usize;
         }
     }
 

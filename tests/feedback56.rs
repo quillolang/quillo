@@ -6302,6 +6302,7 @@ let hidden = {
     g: () => { hits = hits + 1 },
     q: () => confirm("Hidden?"),
     e: () => "",
+    a2: () => ask("Two?", { a: "A" }),
 }
 
 route POST /login ? { user: str } = set_session({ user: user })
@@ -6352,7 +6353,7 @@ fn mcp counted() -> bool with db = confirm(`Delete ${db.one("select count(*) as 
 /// A question under `??`.
 fn mcp guarded() with time = confirm("Guarded?") ?? "taken"
 
-/// Writes, then asks: what it wrote is rolled back where the call stops.
+/// Writes, then asks: refused, and the write stands.
 fn mcp late(t: str) -> bool with db {
     hidden.w(t)
     confirm("Too late?")
@@ -6364,7 +6365,7 @@ fn mcp inserts() with db {
     ask("Then?", { a: "A" }, "a")
 }
 
-/// Writes, sets a cookie, then asks: refused, and the write rolled back.
+/// Writes, sets a cookie, then asks: refused, and both stand.
 fn mcp cookied() -> bool with db {
     hidden.w("cookie")
     hidden.c()
@@ -6428,6 +6429,21 @@ fn mcp branches() -> str with db {
 /// And on one line.
 fn mcp one_line() -> str with db = if posts() > 0 { confirm("Are you sure?") ? "some" : "no" } else { confirm("Are you sure?") ? "none" : "no" }
 
+/// The same, piped, on one line.
+fn mcp piped() -> str with db = if posts() > 0 { ("Are you sure?" | confirm) ? "some" : "no" } else { ("Are you sure?" | confirm) ? "none" : "no" }
+
+/// The page's form of `ask`, which the checker does not see, under `??`.
+fn mcp short_ask() with time = hidden.a2() ?? "taken"
+
+/// Asks, then uses its own transactions, as anywhere.
+fn mcp own_tx() -> int with db {
+    if !confirm("Go?") { return 0 }
+    idempotent(() => db.exec("insert into posts (title, draft) values ('idem', 0)"))?
+    db.atomic([db], () => db.exec("insert into posts (title, draft) values ('atomic', 0)"))?
+    db.transaction({ isolation: "serializable", retries: 3 }, () => db.exec("insert into posts (title, draft) values ('tx', 0)"))?
+    db.one("select count(*) as n from posts").n
+}
+
 /// A question that changes each time the call runs.
 fn mcp ticking() -> bool with random = confirm(`Roll ${random()}: go?`)
 
@@ -6440,7 +6456,7 @@ fn mcp posts() -> int with db = db.one("select count(*) as n from posts").n
 
 /// The tools of E_SRC that ask the user, in the order it declares them.
 const E_ASKING: &[&str] = &[
-    "share", "pick", "sure", "loose", "pair", "named", "many", "both", "counted", "guarded", "late", "inserts", "cookied", "counts", "guard_late", "guard_ask", "guard_empty", "guard_global", "guard_many", "branches", "one_line", "ticking", "lucky",
+    "share", "pick", "sure", "loose", "pair", "named", "many", "both", "counted", "guarded", "late", "inserts", "cookied", "counts", "guard_late", "guard_ask", "guard_empty", "guard_global", "guard_many", "branches", "one_line", "piped", "own_tx", "ticking", "lucky",
 ];
 
 /// What a client says it can do: `{ elicitation: {} }` (form mode) where it can show a form.
@@ -6810,47 +6826,33 @@ fn e_a_client_that_cannot_ask() {
 
 #[test]
 fn e_a_question_after_a_change_is_refused_as_it_runs() {
-    // What the checker cannot see (a function a value holds): at run time a write to the
-    // program's database before a question is rolled back where the call stops, so it stands
-    // only once, in the round that ends; anything else that changes something before a question
-    // is refused, and what the call wrote with it rolled back (found in review).
+    // What the checker cannot see (a function a value holds): at run time a question after a
+    // change is refused and the call stops there, the model told `internal error` and the reason
+    // in the log; the change stands, as the door runs a call in no transaction of its own (second
+    // review). A question first, then the change, is the way.
     let (d, doors, s) = e_doors("late");
     let first = ASK_FIRST_TEXT;
     for (i, mut door) in doors.into_iter().enumerate() {
         let count = |door: &mut EDoor| text_of(&door.result("posts", json!({}), true, None, None)).1.parse::<i64>().unwrap();
-        let before = count(&mut door);
-        // The first round wrote, then stopped: nothing stands.
-        let r = door.result("late", json!({ "t": "x" }), true, None, None);
-        assert_eq!(asked_of(&r).1["params"]["message"], json!("Too late?"));
-        assert_eq!(count(&mut door), before);
-        // Asked again with no answer: still nothing.
-        let r = door.result("late", json!({ "t": "x" }), true, r["requestState"].as_str(), None);
-        assert_eq!(count(&mut door), before);
-        // Answered: the round that ends keeps its write, once.
-        let r = door.result("late", json!({ "t": "x" }), true, r["requestState"].as_str(), Some(one("q1", yes())));
-        assert_eq!(text_of(&r), (false, "true".into()), "{}", r);
-        assert_eq!(count(&mut door), before + 1);
-        // A no: the function's own answer, and its write stands, as one in no call does.
-        let r = door.result("late", json!({ "t": "y" }), true, None, None);
-        let r = door.result("late", json!({ "t": "y" }), true, r["requestState"].as_str(), Some(one("q1", no())));
-        assert_eq!(text_of(&r), (false, "false".into()), "{}", r);
-        assert_eq!(count(&mut door), before + 2);
-        // A statement that writes through `db.query`, the same.
-        let r = door.result("inserts", json!({}), true, None, None);
-        assert_eq!(asked_of(&r).1["params"]["message"], json!("Then?"));
-        assert_eq!(count(&mut door), before + 2);
-        // What no rollback undoes: refused, the model told `internal error`, the reason in the
-        // log, and the write before it rolled back.
-        for name in ["cookied", "counts"] {
-            let r = door.result(name, json!({}), true, None, None);
+        let hits = |door: &mut EDoor| text_of(&door.result("hits_now", json!({}), true, None, None)).1;
+        let mut expected = count(&mut door);
+        for name in ["late", "inserts", "cookied"] {
+            let args = if name == "late" { json!({ "t": "x" }) } else { json!({}) };
+            let r = door.result(name, args, true, None, None);
             assert_eq!(text_of(&r), (true, "internal error".into()), "{}: {}", name, r);
+            expected += 1;
+            assert_eq!(count(&mut door), expected, "{}: its write stands", name);
         }
-        assert_eq!(count(&mut door), before + 2);
+        let h = hits(&mut door);
+        assert_eq!(text_of(&door.result("counts", json!({}), true, None, None)), (true, "internal error".into()));
+        assert_eq!(hits(&mut door).parse::<i64>().unwrap(), h.parse::<i64>().unwrap() + 1, "the assignment stands");
         if i == 0 {
             let err = door.stderr();
             let at = |what: &str| E_SRC.lines().position(|l| l.contains(what)).unwrap() + 1;
             for said in [
-                format!("error in tool `cookied`: main.qwe:{}: `confirm` comes after `set_cookie`: {}", at("Cookie?"), first),
+                format!("error in tool `late`: main.qwe:{}: `confirm` comes after `db.exec`: {}", at("Too late?"), first),
+                format!("error in tool `inserts`: main.qwe:{}: `ask` comes after a database statement that writes: {}", at("Then?"), first),
+                format!("error in tool `cookied`: main.qwe:{}: `confirm` comes after `db.exec`: {}", at("Cookie?"), first),
                 format!("error in tool `counts`: main.qwe:{}: `confirm` comes after assigning the program's variable `hits`: {}", at("Count?"), first),
             ] {
                 assert!(err.contains(&said), "{}\n{}", said, err);
@@ -7486,9 +7488,10 @@ fn e_review_a_question_the_checker_does_not_see_is_followed() {
 
 #[test]
 fn e_review_the_same_question_in_two_places_is_two_questions() {
-    // `confirm("Are you sure?")` on two ways of an `if`, on two lines and on one: a yes to one is
-    // no yes to the other when the call takes the other way the next round.
-    for name in ["branches", "one_line"] {
+    // `confirm("Are you sure?")` on two ways of an `if`, on two lines and on one, and piped
+    // (`"Are you sure?" | confirm`, its own place as a call's is; second review): a yes to one
+    // is no yes to the other when the call takes the other way the next round.
+    for name in ["branches", "one_line", "piped"] {
         let (d, mut it, door) = e_here(&format!("places-{}", name));
         let call = |it: &mut Interp, name: &str, args: Value, state: Option<&str>, answers: Option<Value>| here(it, &door, e_call("p", name, args, &caps(true), state, answers))["result"].clone();
         // Asked on the way taken with no posts; a post written meanwhile; the yes sent back is
@@ -7497,9 +7500,10 @@ fn e_review_the_same_question_in_two_places_is_two_questions() {
         assert_eq!(asked_of(&r).1["params"]["message"], json!("Are you sure?"));
         let state = r["requestState"].as_str().unwrap().to_string();
         assert_eq!(text_of(&call(&mut it, "posts", json!({}), None, None)).1, "0");
-        let w = call(&mut it, "late", json!({ "t": "p" }), None, None);
-        let w = call(&mut it, "late", json!({ "t": "p" }), w["requestState"].as_str(), Some(one("q1", yes())));
-        assert_eq!(text_of(&w), (false, "true".into()), "{}", w);
+        let w = call(&mut it, "share", json!({ "title": "p" }), None, None);
+        let w = call(&mut it, "share", json!({ "title": "p" }), w["requestState"].as_str(), Some(one("q1", choose("public"))));
+        let w = call(&mut it, "share", json!({ "title": "p" }), w["requestState"].as_str(), Some(one("q2", yes())));
+        assert_eq!(text_of(&w).0, false, "{}", w);
         let r = call(&mut it, name, json!({}), Some(&state), Some(one("q1", yes())));
         let (k, req) = asked_of(&r);
         assert_eq!((k.as_str(), req["params"]["message"].as_str()), ("q1", Some("Are you sure?")), "{}: {}", name, r);
@@ -7611,8 +7615,10 @@ fn e_review_a_use_the_database_cannot_keep_refuses_the_state() {
 #[test]
 fn e_review_a_calls_later_rounds_are_not_counted_by_the_limit() {
     // The default limit, 60 tool calls a minute for each caller, counts a call at its first
-    // round; its later rounds, carrying the state the door gave this caller, are that call's. A
-    // state used already, or not the door's, is counted.
+    // round; its later rounds, carrying the state the door gave this caller and the answer to the
+    // question it waits on, are that call's. A round with no answer (the same question again, a
+    // new state each time, which would run the tool's code a hundred times for one call), a state
+    // used already, or not the door's, is counted (second review).
     let d = dir("e-limit", E_SRC);
     let s = support::serve_with(&d.join("main.qwe"), &[]);
     let cookie = http_door::login(s.port, "ana", &[]);
@@ -7629,7 +7635,12 @@ fn e_review_a_calls_later_rounds_are_not_counted_by_the_limit() {
     let r = door.result("sure", json!({}), true, None, None);
     let state = r["requestState"].as_str().unwrap().to_string();
     assert_eq!(status(&e_call("x", "sure", json!({}), &caps(true), None, None), "sure"), 429);
-    // At the limit, the 60th's second round goes through.
+    // At the limit, its state with no answer, or the answer under another key: counted, refused
+    // before the door reads the state, which stays good.
+    assert_eq!(status(&e_call("x", "sure", json!({}), &caps(true), Some(&state), None), "sure"), 429);
+    assert_eq!(status(&e_call("x", "sure", json!({}), &caps(true), Some(&state), Some(one("q2", yes()))), "sure"), 429);
+    assert_eq!(status(&e_call("x", "sure", json!({}), &caps(true), Some(&state), Some(one("q1", json!({ "content": {} })))), "sure"), 429);
+    // With the answer, the 60th's second round goes through.
     assert_eq!(text_of(&door.result("sure", json!({}), true, Some(&state), Some(one("q1", yes())))), (false, "true".into()));
     // Its state again, used, and one that is not the door's: counted, so refused.
     assert_eq!(status(&e_call("x", "sure", json!({}), &caps(true), Some(&state), Some(one("q1", yes()))), "sure"), 429);
@@ -7639,12 +7650,15 @@ fn e_review_a_calls_later_rounds_are_not_counted_by_the_limit() {
 }
 
 #[test]
-fn e_review_on_postgres_a_write_hidden_in_a_select_is_rolled_back_or_refused() {
-    // A function the program made (`select archive_old()`): on the program's database, in the
-    // call's transaction, what it wrote is rolled back where the call stops; on another
-    // connection, it stands, and the question after it is refused.
+fn e_review_on_postgres_a_write_hidden_in_a_select_is_a_change() {
+    // A function the program made (`select archive_old()`), on the program's database or another
+    // connection: a change, so the question after it is refused, and the write stands. A tool's
+    // own transactions after its question work as anywhere: isolation and retries, `idempotent`,
+    // and an error it takes with `??`, which no transaction of the door's turns into a rollback
+    // reported as success (second review). (`db.atomic` here needs prepared transactions, which
+    // this server has not; the SQLite test has it.)
     let Some(pg) = support::postgres("feedback56-e") else {
-        eprintln!("skipped: e_review_on_postgres_a_write_hidden_in_a_select_is_rolled_back_or_refused, as PostgreSQL's initdb and pg_ctl were not found");
+        eprintln!("skipped: e_review_on_postgres_a_write_hidden_in_a_select_is_a_change, as PostgreSQL's initdb and pg_ctl were not found");
         return;
     };
     let url = pg.database("ask");
@@ -7668,6 +7682,15 @@ fn mcp elsewhere() -> bool with db {{
     confirm("Elsewhere?")
 }}
 
+/// Asks, then its own transactions, and an error it takes.
+fn mcp own() -> int with db {{
+    if !confirm("Go?") {{ return 0 }}
+    let zero = db.one("select 1 / 0 as n") ?? 0
+    db.transaction({{ isolation: "serializable", retries: 3 }}, () => db.exec("insert into posts (title) values ('tx')"))?
+    idempotent(() => db.exec("insert into posts (title) values ('idem')"))?
+    db.one("select count(*) as n from posts").n + zero
+}}
+
 /// How many posts.
 fn mcp total() -> int with db = db.one("select count(*) as n from posts").n
 "#,
@@ -7680,16 +7703,75 @@ fn mcp total() -> int with db = db.one("select count(*) as n from posts").n
     let door = mcp::Door::new("main", tools);
     let free_before = free(&it);
     let total = |it: &mut Interp| text_of(&here(it, &door, e_call("t", "total", json!({}), &caps(true), None, None))["result"]).1;
-    let r = here(&mut it, &door, e_call("a", "archive", json!({}), &caps(true), None, None))["result"].clone();
-    assert_eq!(asked_of(&r).1["params"]["message"], json!("Archived?"));
-    assert_eq!(total(&mut it), "0");
-    let r = here(&mut it, &door, e_call("a", "archive", json!({}), &caps(true), r["requestState"].as_str(), Some(one("q1", yes()))))["result"].clone();
-    assert_eq!(text_of(&r), (false, "true".into()), "{}", r);
-    assert_eq!(total(&mut it), "1");
-    let r = here(&mut it, &door, e_call("e", "elsewhere", json!({}), &caps(true), None, None))["result"].clone();
-    assert_eq!(text_of(&r), (true, "internal error".into()), "{}", r);
-    assert_eq!(total(&mut it), "2");
+    for (name, n) in [("archive", "1"), ("elsewhere", "2")] {
+        let r = here(&mut it, &door, e_call("a", name, json!({}), &caps(true), None, None))["result"].clone();
+        assert_eq!(text_of(&r), (true, "internal error".into()), "{}: {}", name, r);
+        assert_eq!(total(&mut it), n, "{}: the write stands", name);
+    }
+    let r = here(&mut it, &door, e_call("o", "own", json!({}), &caps(true), None, None))["result"].clone();
+    let r = here(&mut it, &door, e_call("o", "own", json!({}), &caps(true), r["requestState"].as_str(), Some(one("q1", yes()))))["result"].clone();
+    assert_eq!(text_of(&r), (false, "4".into()), "{}", r);
+    assert_eq!(total(&mut it), "4");
     nothing_left(&it, free_before, "the calls that asked");
     drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ---- Slice 7, second review: no transaction of the door's around a call ----------------------
+
+#[test]
+fn e_review_second_a_tools_own_transactions_work_after_its_question() {
+    // With no transaction of the door's around the rounds, a tool that asks uses `idempotent`,
+    // `db.atomic` and `db.transaction` with isolation and retries as any code does.
+    let (d, doors, s) = e_doors("own-tx");
+    for mut door in doors {
+        let before = text_of(&door.result("posts", json!({}), true, None, None)).1.parse::<i64>().unwrap();
+        let r = door.result("own_tx", json!({}), true, None, None);
+        assert_eq!(asked_of(&r).1["params"]["message"], json!("Go?"));
+        let r = door.result("own_tx", json!({}), true, r["requestState"].as_str(), Some(one("q1", yes())));
+        assert_eq!(text_of(&r), (false, (before + 3).to_string()), "{}", r);
+    }
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn e_review_second_the_pages_ask_in_a_tool_is_refused() {
+    // `ask` with fewer than three arguments, the page's form: in a tool's code (and what it
+    // reaches), a `quillo check` error; as it runs, a stop no `??` takes.
+    let src = r#"fn helper() = ask("Q?", { a: "A" })
+/// T.
+fn mcp t1() with time = ask("Q?", { a: "A" })
+/// T.
+fn mcp t2() with time = ask("Q?")
+/// T.
+fn mcp t3() with time = "Q?" | ask({ a: "A" })
+/// T.
+fn mcp t4() with time = "Q?" | ask({ a: "A" }, "a")
+/// T.
+fn mcp t5() with time = helper()
+/// T.
+fn mcp t6() with time = "Q?".ask({ a: "A" }, "a")
+/// T.
+fn mcp t7() with time = ask("Q?", { a: "A" }, "a")
+server fn for_a_page() = 1
+"#;
+    let d = dir("e-short", src);
+    let (ok, _, err) = quillo(&d, &["check", "main.qwe"]);
+    let _ = std::fs::remove_dir_all(&d);
+    assert!(!ok, "{}", err);
+    let two = "in a tool, `ask` takes the choices' default as its third argument: ask(question, choices, default)";
+    let one_arg = "in a tool, `ask` takes choices and their default: ask(question, choices, default); a yes or a no is confirm(question)";
+    let got: Vec<&str> = err.lines().filter(|l| l.contains(": error: ")).collect();
+    assert_eq!(got, [format!("main.qwe:1: error: {}", two), format!("main.qwe:3: error: {}", two), format!("main.qwe:5: error: {}", one_arg), format!("main.qwe:7: error: {}", two)], "{}", err);
+    // As it runs, out of the checker's sight: refused, under `??` too.
+    let (d, doors, s) = e_doors("short");
+    for (i, mut door) in doors.into_iter().enumerate() {
+        assert_eq!(text_of(&door.result("short_ask", json!({}), true, None, None)), (true, "internal error".into()));
+        if i == 0 {
+            door.stderr().contains(two).then_some(()).unwrap_or_else(|| panic!("{}", door.stderr()));
+        }
+    }
+    drop(s);
     let _ = std::fs::remove_dir_all(&d);
 }

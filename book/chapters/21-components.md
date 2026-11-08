@@ -1696,12 +1696,13 @@ fn mcp publish_post(title: str, body: str) -> int with db {
   a new one each round, and ends the call there). The same text asked in two places in the code
   is two questions. A `confirm` is a box to tick: sent back unticked, it is a no.
 - So a tool asks before it changes anything. `quillo check` refuses a tool that it sees change
-  something before a question. As it runs, what a call writes to the program's database is held
-  in a transaction, rolled back at each question and kept when the call ends, so nothing a
-  round wrote stands while the person is asked; any other change before a question (a file, a
-  request out, a cookie or the session, the program's variables, another database, a plugin, a
-  service) is refused (the model is told `internal error`, the message is in the log). `??`
-  does not turn these refusals into a value: the call stops.
+  something before a question. As it runs, a question after any change (a database write, a
+  file, a request out, a cookie or the session, the program's variables, another database, a
+  plugin, a service) is refused and the call stops (the model is told `internal error`, the
+  message is in the log); the change stands, so this is for code the checker cannot see whole.
+  `??` does not turn these refusals into a value. A tool's own `db.transaction`, `idempotent`
+  and `db.atomic` work as anywhere; in a call that may ask, `parallel` runs its functions one
+  after another, so that a question is never answered by nobody.
 - The answers come back in a state Quillo signs: good for 10 minutes, once, for the same
   caller, tool and arguments; anything else is refused (`-32602`), used up, and the call starts
   over. A state whose use cannot be recorded is refused too. A person who declines or dismisses
@@ -1714,10 +1715,12 @@ fn mcp publish_post(title: str, body: str) -> int with db {
   gives its default and `confirm` gives true: the page asks in its own way. A service a tool
   calls is outside it too, for now: its `confirm` gives true.
 - Neither asks for free text, as MCP forbids asking for passwords, keys or payment details in a
-  form. A tool that asks and only reads stays read-only. A call's later rounds do not count
-  toward the 60 tool calls a minute. `ask` with two arguments is the page's dialog (see
-  [Components](#components)); with three it is a tool's question, and a component cannot use
-  that form.
+  form. A tool that asks and only reads stays read-only. A round that carries the answer to the
+  question its state waits on does not count toward the 60 tool calls a minute; any other round
+  does. `ask` with two arguments is the page's dialog (see [Components](#components)); with
+  three it is a tool's question, and a component cannot use that form. In a tool's code, an
+  `ask` with fewer than three arguments is a `quillo check` error, and stops the call as it
+  runs.
 
 The instructions then say which tools ask the person themselves, so the model does not ask
 again (FEEDBACK56.md, Part E).

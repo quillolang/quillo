@@ -57,10 +57,6 @@ pub struct Tool {
     /// It may ask: it was seen to, or the checker cannot see all it runs. The door follows a call
     /// of one (`Asking`); a call of any other cannot reach `confirm` or `ask`.
     pub may_ask: bool,
-    /// It may reach the database: its `with` names `db`, or it has none and its code was seen to
-    /// call `db` or is not all seen. A call of one that may ask runs its rounds in a transaction
-    /// there, rolled back where it stops (`asking_in_tx`; found in review).
-    pub reaches_db: bool,
     pub def: Arc<FnDef>,
 }
 
@@ -190,7 +186,6 @@ fn tool(f: &ToolFacts, types: &HashMap<String, Types>) -> Tool {
         wrapped,
         asks: f.asks,
         may_ask: f.asks || f.uncertain.is_some(),
-        reaches_db: declared.map_or(f.db || f.uncertain.is_some(), |m| m & effect_bit("db") != 0),
         def: d.clone(),
     }
 }
@@ -267,18 +262,12 @@ pub fn call_given(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>, line: 
             Err((_, failed)) => Err(failed),
         }
     };
-    // A call that may ask: its transaction is on the database where a stop undoes what it wrote
-    // (FEEDBACK56.md, Part E, found in review; branch feedback56).
-    let answer = if tool.reads_only {
-        reading_only(it, line, &mut |it| {
-            note_tx(it);
-            run(it)
-        })?
-    } else if tool.reaches_db && it.asking.is_some() {
-        asking_in_tx(it, line, &mut run)?
-    } else {
-        run(it)?
-    };
+    // A call that may ask runs in no transaction of the door's: one around its rounds held
+    // SQLite through every wait, refused `idempotent`, `db.atomic` and a transaction's isolation,
+    // and on PostgreSQL turned a swallowed error into a rollback reported as success; a change
+    // before a question is refused instead, and stands (FEEDBACK56.md, Part E, second review;
+    // branch feedback56).
+    let answer = if tool.reads_only { reading_only(it, line, &mut run)? } else { run(it)? };
     Ok(match refused {
         Some(why) => Err(why),
         None => Ok(answer),
@@ -669,7 +658,7 @@ impl Door {
             // The answer to the question asked last, under its key; inputResponses' other keys
             // are not the door's, and are let be (mrtr, Error Handling).
             let pending = pending.map(|d| (d, responses.and_then(|r| r.get(&key_of(answers.len()))).cloned()));
-            Box::new(Asking { can_ask, who, tool: tool.name.clone(), args: given, answers, pending, reached: 0, rounds, tx: 0, site: 0, places: HashMap::new(), notes: Vec::new(), wrote: None, stop: None })
+            Box::new(Asking { can_ask, who, tool: tool.name.clone(), args: given, answers, pending, reached: 0, rounds, site: 0, places: HashMap::new(), notes: Vec::new(), wrote: None, stop: None })
         });
         run(it, tool, args, self.over_http, asking)
     }
@@ -1154,16 +1143,13 @@ pub(crate) struct Asking {
     /// How many rounds the call stopped to ask before this one: a question that changes each time
     /// it runs (it holds the time) would be asked for ever (found in review).
     rounds: usize,
-    /// The database the call's rounds run in a transaction on (`asking_in_tx`), by its address:
-    /// a write there is rolled back where the call stops; 0 for none.
-    pub(crate) tx: usize,
     /// The call the interpreter is making, by its callee's address (`Interp::eval_call`): where
     /// a question is, and the places found for them this run (`place_of`).
     pub(crate) site: usize,
     places: HashMap<usize, String>,
     /// What the result says beside the tool's answer: an `ask` the user was not asked.
     notes: Vec<String>,
-    /// The first change this call made that a stop does not undo, as the refusal says it.
+    /// The first change this call made, as the refusal of a question after it says it.
     pub(crate) wrote: Option<String>,
     stop: Option<Stopped>,
 }
@@ -1290,21 +1276,28 @@ fn read_state(it: &mut Interp, text: &str, who: &str, tool: &str, args: &str, sh
 /// of the program share (`db::state_claim`), where there is one. A use the database cannot keep
 /// is an error, and the state refused: closed (found in review). Over HTTP with no database, each
 /// process knows only its own.
-static USED: std::sync::Mutex<Option<HashMap<String, i64>>> = std::sync::Mutex::new(None);
-const USED_MOST: usize = 100_000;
+/// Swept of the ids whose state has ended at most once a minute, not as each one is put in once
+/// there are many (second review).
+struct Used {
+    ids: HashMap<String, i64>,
+    swept: i64,
+}
+
+static USED: std::sync::Mutex<Option<Used>> = std::sync::Mutex::new(None);
 
 fn used_once(it: &mut Interp, id: &str, ends: i64, shared: bool) -> Result<bool, String> {
     let now = now_ms();
     {
         let mut m = USED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let m = m.get_or_insert_with(HashMap::new);
-        if m.contains_key(id) {
+        let m = m.get_or_insert_with(|| Used { ids: HashMap::new(), swept: now });
+        if m.ids.contains_key(id) {
             return Ok(false);
         }
-        if m.len() >= USED_MOST {
-            m.retain(|_, e| *e > now);
+        if now - m.swept >= 60_000 {
+            m.ids.retain(|_, e| *e > now);
+            m.swept = now;
         }
-        m.insert(id.to_string(), ends);
+        m.ids.insert(id.to_string(), ends);
     }
     if shared {
         // An hour back: past any state's end and any signed call's memory, so neither forgets
@@ -1319,40 +1312,48 @@ fn used_once(it: &mut Interp, id: &str, ends: i64, shared: bool) -> Result<bool,
     Ok(true)
 }
 
-/// Whether `msg`, a `tools/call`, carries a state the door gave `caller`, still good and not used
-/// here: a later round of a call the limit counted at its first, let through (C.4; found in
-/// review). Only looked at: the call checks it again and uses it up.
+/// Whether `msg`, a `tools/call`, is a later round of a call the limit counted at its first, let
+/// through (C.4; found in review): it carries a state the door gave `caller`, still good and not
+/// used here, and the user's answer to the question that state waits on. A round with no answer
+/// (the same question asked again, a new state each time) counts as a call, or one counted call
+/// could run the tool's code a hundred times (second review). Only looked at: the call checks it
+/// again and uses it up.
 fn later_round(msg: &Map<String, J>, caller: &str) -> bool {
-    let Some(text) = msg.get("params").and_then(|p| p.get("requestState")).and_then(J::as_str) else { return false };
+    let params = msg.get("params");
+    let Some(text) = params.and_then(|p| p.get("requestState")).and_then(J::as_str) else { return false };
     let Some(s) = crate::session::unseal(STATE_PURPOSE, text).and_then(|p| serde_json::from_str::<J>(&p).ok()) else { return false };
-    let (Some(id), Some(by), Some(ends)) = (s.get("id").and_then(J::as_str), s.get("who").and_then(J::as_str), s.get("ends").and_then(J::as_i64)) else { return false };
+    let (Some(id), Some(by), Some(ends), Some(asked)) = (s.get("id").and_then(J::as_str), s.get("who").and_then(J::as_str), s.get("ends").and_then(J::as_i64), s.get("asked").and_then(J::as_array)) else { return false };
+    if s.get("pending").and_then(J::as_str).is_none() {
+        return false;
+    }
+    let answered = params.and_then(|p| p.get("inputResponses")).and_then(|r| r.get(key_of(asked.len()))).and_then(|a| a.get("action")).and_then(J::as_str).is_some_and(|a| matches!(a, "accept" | "decline" | "cancel"));
     let who = crate::session::digest(CALLER_PURPOSE, caller);
-    let used = USED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().is_some_and(|m| m.contains_key(id));
-    crate::crypto::same(by.as_bytes(), who.as_bytes()) && ends > now_ms() && !used
+    let used = USED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().is_some_and(|m| m.ids.contains_key(id));
+    answered && crate::crypto::same(by.as_bytes(), who.as_bytes()) && ends > now_ms() && !used
 }
 
 /// A builtin called while a tool that may ask runs (`Interp::call`): once it stopped, nothing
 /// more runs, even where something took the stop for a value; one that changes something
-/// (viewcache's `Acts`, but a random number) is noted, for a question after it. A statement of
-/// `db.exec` and `db.exec_many` is noted where it runs (`wrote_on`), by the database it is on.
+/// (viewcache's `Acts`, but a random number) is noted, for a question after it; a statement
+/// `db.query` runs that writes is noted where it runs (`wrote_db`).
 pub(crate) fn noted(it: &mut Interp, name: &'static str, line: u32) -> Result<(), Ctrl> {
     let Some(a) = it.asking.as_mut() else { return Ok(()) };
     if a.stop.is_some() {
         return crate::interp::fail(line, ASKING);
     }
-    if a.wrote.is_none() && !matches!(name, "db.exec" | "db.exec_many") && crate::viewcache::kind_of(name) == crate::viewcache::Kind::Acts && crate::ast::builtin_effect(name) != effect_bit("random") {
+    if a.wrote.is_none() && crate::viewcache::kind_of(name) == crate::viewcache::Kind::Acts && crate::ast::builtin_effect(name) != effect_bit("random") {
         a.wrote = Some(format!("`{}`", crate::native::display_name(name)));
     }
     Ok(())
 }
 
-/// A statement that writes, or may (one calling a function its database does not ship), on the
-/// database at `backend` while a tool that may ask runs (`db.rs`): in the call's transaction, it
-/// is rolled back where the call stops; anywhere else it stands, and a question after it is
-/// refused (found in review).
-pub(crate) fn wrote_on(it: &mut Interp, backend: usize) {
-    if let Some(a) = it.asking.as_mut().filter(|a| a.wrote.is_none() && a.tx != backend) {
-        a.wrote = Some(if a.tx == 0 { "a database statement that writes".into() } else { "a database statement outside the call's transaction".into() });
+/// A statement that writes, or may (one calling a function its database does not ship, which
+/// `db.query` runs as it runs a `select`), while a tool that may ask runs (`db::select_in`): a
+/// change, before which a question is refused (found in review). `db.exec` and the builtins that
+/// act are noted as they are called (`noted`).
+pub(crate) fn wrote_db(it: &mut Interp) {
+    if let Some(a) = it.asking.as_mut().filter(|a| a.wrote.is_none()) {
+        a.wrote = Some("a database statement that writes".into());
     }
 }
 
@@ -1360,46 +1361,6 @@ pub(crate) fn wrote_on(it: &mut Interp, backend: usize) {
 pub(crate) fn assigned(it: &mut Interp, name: &str) {
     if let Some(a) = it.asking.as_mut().filter(|a| a.wrote.is_none()) {
         a.wrote = Some(format!("assigning the program's variable `{}`", name));
-    }
-}
-
-/// The rounds of a call that may ask and may reach the database, in a transaction on it: rolled
-/// back where the call stops (at a question, or refused), so that what a round wrote before its
-/// question does not stand; committed where it ends, whatever it gave (its own error too, as a
-/// call in none keeps what it wrote). With no database to begin one on, it runs as it is, and a
-/// write in it is one that stands (FEEDBACK56.md, Part E, found in review; branch feedback56).
-fn asking_in_tx(it: &mut Interp, line: u32, body: &mut dyn FnMut(&mut Interp) -> Result<Value, Ctrl>) -> Result<Value, Ctrl> {
-    if crate::db::backend_key(it, None).is_none() {
-        return body(it);
-    }
-    let mut kept = None;
-    let r = crate::txn::run(it, None, &crate::txn::Options::default(), line, &mut |it| {
-        note_tx(it);
-        let r = body(it);
-        if it.asking.as_ref().is_some_and(|a| a.stopped()) {
-            // Rolled back, even where something took the stop for a value.
-            return match r {
-                Err(e) => Err(e),
-                Ok(_) => crate::interp::fail(line, ASKING),
-            };
-        }
-        kept = Some(r);
-        Ok(Value::Nil)
-    });
-    match (r, kept) {
-        (Ok(Value::Nil), Some(kept)) => kept,
-        (r, _) => r,
-    }
-}
-
-/// The transaction the call runs in is on the program's database, now open: what is written
-/// there is undone by a stop.
-fn note_tx(it: &mut Interp) {
-    if it.asking.is_some() {
-        let at = crate::db::backend_key(it, None).unwrap_or(0);
-        if let Some(a) = it.asking.as_mut() {
-            a.tx = at;
-        }
     }
 }
 
@@ -1429,14 +1390,19 @@ fn place_of(it: &mut Interp, line: u32) -> String {
     if let Some(p) = it.asking.as_ref().and_then(|a| a.places.get(&at)) {
         return p.clone();
     }
+    // A call is known by its callee, and `x | confirm` by the pipe's right side (`Interp::
+    // piped_site`; second review).
     let (mut k, mut nth) = (0, None);
     let mut look = |x: &crate::ast::Expr| {
-        if let crate::ast::Expr::Call(c, _, l) = x {
-            if *l == line {
-                k += 1;
-                if &**c as *const crate::ast::Expr as usize == at {
-                    nth.get_or_insert(k);
-                }
+        let (l, here) = match x {
+            crate::ast::Expr::Call(c, _, l) => (*l, &**c as *const crate::ast::Expr as usize),
+            crate::ast::Expr::Pipe(_, rhs, l) if !matches!(&**rhs, crate::ast::Expr::Call(..)) => (*l, &**rhs as *const crate::ast::Expr as usize),
+            _ => return,
+        };
+        if l == line {
+            k += 1;
+            if here == at {
+                nth.get_or_insert(k);
             }
         }
     };
@@ -1539,6 +1505,20 @@ fn stops_on_error(it: &mut Interp, f: impl FnOnce(&mut Interp) -> Result<Value, 
         a.stop.get_or_insert(Stopped::Failed);
     }
     r
+}
+
+/// What a tool is told of `ask` with `given` arguments, fewer than its three: the page's form,
+/// which no tool can show (second review).
+pub fn ask_too_few(given: usize) -> String {
+    match given {
+        2 => "in a tool, `ask` takes the choices' default as its third argument: ask(question, choices, default)".into(),
+        _ => "in a tool, `ask` takes choices and their default: ask(question, choices, default); a yes or a no is confirm(question)".into(),
+    }
+}
+
+/// `ask` with fewer than three arguments in a tool's call: refused, and the call stops there.
+pub(crate) fn ask_in_a_tool(it: &mut Interp, given: usize, line: u32) -> Result<Value, Ctrl> {
+    stops_on_error(it, |_| crate::interp::fail(line, ask_too_few(given)))
 }
 
 /// An `ElicitResult` (client/elicitation, Response Actions): its action, and its content.
@@ -2650,4 +2630,33 @@ pub fn open_door(it: &mut Interp, path: &Path, tools: Option<Vec<Tool>>) {
     }
     it.mcp = Some(Arc::new(Door::of_program(path, served_name(path), tools, true)));
     say_dev_door(it);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ids of used states are let go once their state ends, swept at most once a minute, not
+    /// looked through as each one is put in once there are many (FEEDBACK56.md, Part E, second
+    /// review; branch feedback56).
+    #[test]
+    fn used_ids_are_swept_once_a_minute() {
+        let mut it = Interp::new(".");
+        let now = now_ms();
+        let started = std::time::Instant::now();
+        for i in 0..150_000 {
+            assert_eq!(used_once(&mut it, &format!("sweep-{}", i), now + 600_000, false), Ok(true));
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+        assert_eq!(used_once(&mut it, "sweep-7", now + 600_000, false), Ok(false));
+        // One whose state ended stays until the next sweep, a minute after the last.
+        assert_eq!(used_once(&mut it, "sweep-ended", now - 1, false), Ok(true));
+        assert_eq!(used_once(&mut it, "sweep-ended", now - 1, false), Ok(false));
+        USED.lock().unwrap().as_mut().unwrap().swept = now - 60_000;
+        assert_eq!(used_once(&mut it, "sweep-next", now + 600_000, false), Ok(true));
+        let mut m = USED.lock().unwrap();
+        let m = m.as_mut().unwrap();
+        assert!(!m.ids.contains_key("sweep-ended") && m.ids.contains_key("sweep-7") && m.ids.contains_key("sweep-next"));
+        m.ids.retain(|k, _| !k.starts_with("sweep-"));
+    }
 }

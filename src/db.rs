@@ -2013,11 +2013,6 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
     }
     no_tx_control(&scan, "db.exec", line)?;
     it.wrote_req = Some(crate::httpd::request_number());
-    // A write in a tool's call that may ask: undone by a stop only in the call's transaction
-    // (FEEDBACK56.md, Part E, found in review; branch feedback56).
-    if it.asking.is_some() {
-        crate::mcp::wrote_on(it, Arc::as_ptr(&b) as usize);
-    }
     let params = match given_values(&scan, args[1..].to_vec()) {
         Ok(p) => p,
         Err(e) => return Ok(db_err(e)),
@@ -2266,10 +2261,6 @@ fn exec_many(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Ok(b) => b,
         Err(e) => return Ok(db_err(e)),
     };
-    // (FEEDBACK56.md, Part E, found in review; branch feedback56.)
-    if it.asking.is_some() {
-        crate::mcp::wrote_on(it, Arc::as_ptr(&b) as usize);
-    }
     let server = !matches!(&*b, Backend::Sqlite(_));
     // Its rows are all or none, in a transaction of its own (FEEDBACK55.md, Q-728).
     if b.is_mysql() {
@@ -2786,13 +2777,6 @@ pub(crate) fn state_claim(it: &mut Interp, id: &str, now_ms: i64, forget_before:
     }
 }
 
-/// The address of the database `on` names (None: the program's, the request's tenant's), where
-/// one opens: how the MCP door tells its transaction's database from another (FEEDBACK56.md, Part
-/// E, found in review; branch feedback56).
-pub(crate) fn backend_key(it: &mut Interp, on: Option<usize>) -> Option<usize> {
-    backend_on(it, on).ok().map(|b| Arc::as_ptr(&b) as usize)
-}
-
 /// The answer to a call this copy claimed; one that did not finish is let
 /// go, to be sent again (FEEDBACK23.md, Q-184; branch feedback23-fixes).
 pub(crate) fn call_done(it: &mut Interp, id: &str, status: u16, answer: &str) {
@@ -2825,12 +2809,12 @@ fn select_in(
         return Err(crate::interp::PREFETCH_REFUSED.into());
     }
     // In a tool's call that may ask: a statement that writes, or calls a function its database
-    // does not ship (`select archive_old()`, which may write), is a change, undone by a stop only
-    // in the call's transaction; and it goes to the primary (FEEDBACK56.md, Part E, found in
-    // review; branch feedback56).
+    // does not ship (`select archive_old()`, which may write), is a change a question after it is
+    // refused for; and it goes to the primary (FEEDBACK56.md, Part E, found in review; branch
+    // feedback56).
     if it.asking.is_some() && (!only_reads(scan) || crate::sql::foreign_call(&sql).is_some()) {
         it.wrote_req = Some(crate::httpd::request_number());
-        crate::mcp::wrote_on(it, Arc::as_ptr(&b) as usize);
+        crate::mcp::wrote_db(it);
     }
     let params = given_values(scan, params)?;
     // Refused before a replica would take it (found in review).

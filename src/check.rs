@@ -3384,6 +3384,19 @@ impl Checker {
         if let Expr::Lambda(d) = callee {
             self.order_expr(&d.body, w);
         }
+        // `ask` of the page's form, fewer than three arguments, in a tool's code: refused, as the
+        // call is when it runs (second review). A piped value and a method's receiver are its
+        // first.
+        let piped = first.is_some() && first.map(|f| f as *const Expr) != args.first().map(|a| a as *const Expr);
+        let builtin_ask = || self.globals.get("ask").is_some_and(|g| &*g.file == "<builtin>");
+        let given = match callee {
+            Expr::Ident(n, _) if n == "ask" && !w.locals.contains("ask") && builtin_ask() => Some(args.len() + piped as usize),
+            Expr::Field(obj, n, _) if n == "ask" && !module(obj) && builtin_ask() => Some(args.len() + 1 + piped as usize),
+            _ => None,
+        };
+        if let Some(n) = given.filter(|n| *n < 3) {
+            w.late.push((w.file.clone(), line, crate::mcp::ask_too_few(n)));
+        }
         let (asks, changes) = self.call_does(callee, first, w);
         if let Some(a) = asks {
             if let Some(c) = &w.changed {
