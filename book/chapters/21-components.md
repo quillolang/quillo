@@ -1600,8 +1600,32 @@ fn mcp orders_today(limit: int = 20) -> list with db {
   record's default that needs an effect the `with` lacks fails as the body would
   (FEEDBACK56.md, Q-858).
 
-The door itself, `/_quillo/mcp` and `quillo mcp app.qwe` over stdio, is not built yet
-(FEEDBACK56.md, Q-853).
+**`quillo mcp app.qwe`** serves the tools to a client on the same machine, which starts it:
+
+```json
+{ "mcpServers": { "notes": { "command": "quillo", "args": ["mcp", "/home/ana/notes/main.qwe"] } } }
+```
+
+It checks the program (one that does not check does not start), runs its top level
+(`db.open`, tables), then answers MCP on stdin and stdout, one JSON message a line. Routes are
+not served. Only MCP's messages reach stdout: `print` goes to stderr under `quillo mcp`, and on
+Unix whatever else the program or a plugin writes to stdout goes there too. `stdin`, `read_line`
+and `exit` are errors. It ends when stdin closes, and on SIGTERM. There are no tokens on
+stdio: the person who starts it is the caller.
+
+Quillo speaks MCP's revision 2026-07-28 only. A client of the earlier revision, which opens with
+`initialize` (Claude Code before 2.1.319, for one), is told the version is not supported. What a
+client gets from a call:
+
+- A typed result: `structuredContent` (held as `result` when it is not an object) and the same
+  as JSON in a text block. An untyped one: the text block alone.
+- `isError: true`, with text, for a tool's `err(v)`, an argument the door refuses (with the
+  message `/_quillo/rpc` gives), a `reply` or a `respond` (with its text, or its status such as
+  `404 Not Found`), a page, and `internal error` when the tool failed (the real message on
+  stderr).
+- The protocol's own errors for an unknown tool, a malformed message and the wrong version.
+
+The door over HTTP, `/_quillo/mcp`, is not built yet (FEEDBACK56.md, Q-853).
 
 ### What the browser can reach
 

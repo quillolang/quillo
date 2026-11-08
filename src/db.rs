@@ -418,14 +418,17 @@ fn isolated(it: &mut Interp, b: &Arc<Backend>, scan: &crate::sql::Scan) -> bool 
 /// `f` on a connection of the pool's own, reset before it goes back, or closed when that
 /// fails (see `isolated`).
 fn isolated_run<T: Send>(it: &mut Interp, b: &Arc<Backend>, f: impl FnOnce(&mut Pinned) -> Result<T, String> + Send) -> Result<T, String> {
-    let mut c = checkout_for_tx(it, b)?;
+    let c = checkout_for_tx(it, b)?;
     let b = b.clone();
+    let boom = fault();
     it.unlocked(move || {
-        let r = f(&mut c);
-        if reset_session(&mut c) {
-            b.give_back(c);
-        } else {
-            b.discard(c);
+        // Closed if `f` panics, as `pooled_run`'s are (FEEDBACK56.md, found in review; branch
+        // feedback56); and when its session cannot be reset.
+        let mut c = Taken { b: &b, conn: Some(c) };
+        faulted(boom);
+        let r = f(c.conn());
+        if reset_session(c.conn()) {
+            b.give_back(c.keep());
         }
         r
     })
@@ -1182,11 +1185,14 @@ pub(crate) fn pooled_run<T: Send>(
 ) -> Result<T, String> {
     let pool = &**b;
     let pinned = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().find(|tx| Arc::ptr_eq(&tx.backend, b)).and_then(|tx| tx.conn.take());
+    let boom = fault();
     match pinned {
-        Some(mut c) => {
+        Some(c) => {
             let (c, r) = it.unlocked(move || {
-                let r = f(&mut c);
-                (c, r)
+                let mut c = Taken { b: pool, conn: Some(c) };
+                faulted(boom);
+                let r = f(c.conn());
+                (c.keep(), r)
             });
             if let Some(tx) = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().find(|tx| Arc::ptr_eq(&tx.backend, b)) {
                 tx.conn = Some(c);
@@ -1196,16 +1202,93 @@ pub(crate) fn pooled_run<T: Send>(
         None => {
             let held = crate::httpd::held();
             it.unlocked(move || {
-                let mut c = match (held, pool) {
+                let c = match (held, pool) {
                     // As above: in a SQLite transaction, one free now or none.
                     (true, Backend::Postgres(p)) => Pinned::Pg(p.try_checkout()?.ok_or_else(held_none_free)?),
                     _ => pool.checkout()?,
                 };
-                let r = f(&mut c);
-                pool.give_back(c);
+                let mut c = Taken { b: pool, conn: Some(c) };
+                faulted(boom);
+                let r = f(c.conn());
+                pool.give_back(c.keep());
                 r
             })
         }
+    }
+}
+
+/// A server database's connection a call holds, closed if the call panics (a bug of Quillo's,
+/// which the server answers 500 and lives on). Dropped, PostgreSQL's place in its pool was never
+/// given back: one lost for each such panic, and with all `pool_size` gone every checkout waited
+/// 30 s and failed (FEEDBACK56.md, found in review; branch feedback56). MySQL's goes back to its
+/// pool, which resets it, as it did.
+struct Taken<'a> {
+    b: &'a Backend,
+    conn: Option<Pinned>,
+}
+
+impl Taken<'_> {
+    fn conn(&mut self) -> &mut Pinned {
+        self.conn.as_mut().expect("held")
+    }
+
+    /// The connection, kept: the call is over.
+    fn keep(mut self) -> Pinned {
+        self.conn.take().expect("held")
+    }
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        if let Some(c) = self.conn.take() {
+            self.b.discard(c);
+        }
+    }
+}
+
+/// Runs each statement on a connection a panic took out of its transaction, whatever they give,
+/// and closes it (FEEDBACK56.md, found in review; branch feedback56).
+fn close_after(it: &mut Interp, mut c: Taken<'_>, sqls: Vec<String>) {
+    let boom = fault();
+    it.unlocked(move || {
+        faulted(boom);
+        for sql in &sqls {
+            let _ = c.conn().batch(sql);
+        }
+    });
+}
+
+thread_local! {
+    /// For tests (`panic_at_db_call`): the calls holding a server database's connection made on
+    /// this thread, and the one of them that panics (0: none).
+    static FAULT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// For tests: the `n`th call holding a server database's connection made on this thread from now
+/// on (counted from 1; 0 for none), or `db.atomic`'s commit of its SQLite part, panics as a bug of
+/// Quillo's there would; gives how many were made since the last time this was called. No query a
+/// program can make panics in the driver, and the blocking client called inside an async runtime,
+/// which does, panics again as its connection is dropped, which aborts (FEEDBACK56.md, found in
+/// review; branch feedback56).
+#[doc(hidden)]
+pub fn panic_at_db_call(n: usize) -> usize {
+    FAULT.with(|f| f.replace((0, n)).0)
+}
+
+/// Counts a call `panic_at_db_call` counts: whether it is the one to panic.
+fn fault() -> bool {
+    FAULT
+        .try_with(|f| {
+            let (made, at) = f.get();
+            f.set((made + 1, at));
+            made + 1 == at
+        })
+        .unwrap_or(false)
+}
+
+fn faulted(boom: bool) {
+    if boom {
+        panic!("a panic in a database call, on purpose (db::panic_at_db_call)");
     }
 }
 
@@ -2760,9 +2843,12 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn caught(it: &mut Interp, body: &mut dyn FnMut(&mut Interp) -> R) -> R {
     let outer = it.dropped.take();
     it.catching_drops += 1;
-    let r = body(it);
+    // Both put back after a panic in the body too, which the transaction re-raises: they had
+    // stayed raised, and the outer failure lost (FEEDBACK56.md, found in review; branch feedback56).
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(it)));
     it.catching_drops -= 1;
     let dropped = std::mem::replace(&mut it.dropped, outer);
+    let r = r.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     match (r, dropped) {
         (Ok(v), Some(e)) if !matches!(v, Value::Err(..)) => Ok(e),
         (r, _) => r,
@@ -2992,22 +3078,30 @@ pub(crate) fn attempt(
                 Ok(()) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| caught(it, body))) {
                     Ok(r) => r,
                     Err(panic) => {
-                        let end = if depth == 1 { "rollback".to_string() } else { format!("rollback to savepoint quillo_tx_{d}; release savepoint quillo_tx_{d}", d = depth) };
-                        let _ = pooled_run(it, &b, move |c| c.batch(&end));
+                        // Lowered first, so that a panic in the rollback leaves nothing raised; and
+                        // rolled back only on a connection the transaction still has: a call that
+                        // panicked closed its own (`Taken`), and its transaction with it, where one
+                        // was checked out to roll back nothing, waiting up to 30 s for it
+                        // (FEEDBACK56.md, found in review; branch feedback56).
                         tx_end(it, mark, false);
-                        let done = {
+                        let (done, held) = {
                             let mut g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             match g.iter().position(|t| Arc::ptr_eq(&t.backend, &b)) {
                                 Some(i) => {
                                     g[i].depth -= 1;
-                                    (g[i].depth == 0).then(|| g.remove(i))
+                                    let held = g[i].conn.is_some();
+                                    ((g[i].depth == 0).then(|| g.remove(i)), held)
                                 }
-                                None => None,
+                                None => (None, false),
                             }
                         };
-                        if let Some(TxConn { conn: Some(mut c), .. }) = done {
-                            c.watch_conflicts(false);
-                            pool.discard(c);
+                        match done {
+                            Some(TxConn { conn: Some(c), .. }) => close_after(it, Taken { b: pool, conn: Some(c) }, vec!["rollback".into()]),
+                            None if held => {
+                                let end = format!("rollback to savepoint quillo_tx_{d}; release savepoint quillo_tx_{d}", d = depth);
+                                let _ = pooled_run(it, &b, move |c| c.batch(&end));
+                            }
+                            _ => {}
                         }
                         std::panic::resume_unwind(panic);
                     }
@@ -3328,51 +3422,69 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     for (k, p) in parts.iter_mut().enumerate() {
         p.gid = format!("{}_{}", gid, k);
     }
-    // Each part begins.
+    // A panic part way, as a part begins, in the function, or as the parts commit or roll back (a
+    // bug of Quillo's, which the server answers 500 and lives on): what was raised is lowered and
+    // what was held let go, as `attempt` does, and the parts end as decided (`atomic_panicked`).
+    // SQLite's part had kept its savepoint open on the shared connection, and the thread held, so
+    // every later write there stayed uncommitted and every later transaction was nested
+    // (FEEDBACK56.md, found in review; branch feedback56).
     let mut begun: Vec<usize> = Vec::new();
-    let mut failed = None;
-    for (k, p) in parts.iter().enumerate() {
-        let r = match p.kind {
-            Kind::Sqlite => match &*p.b {
-                Backend::Sqlite(m) => m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute_batch("savepoint quillo_tx").map_err(|e| e.to_string()),
-                _ => unreachable!(),
-            },
-            _ => {
-                match checkout_for_tx(it, &p.b) {
-                    Ok(c) => {
-                        it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(TxConn { backend: p.b.clone(), conn: Some(c), depth: 1 });
-                        let begin = if p.kind == Kind::Pg { "begin".to_string() } else { format!("xa start '{}'", p.gid) };
-                        pooled_run(it, &p.b, move |c| c.batch(&begin))
+    let (mut raised, mut decided, mut mark) = (false, false, None);
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Each part begins.
+        let mut failed = None;
+        for (k, p) in parts.iter().enumerate() {
+            let r = match p.kind {
+                Kind::Sqlite => match &*p.b {
+                    Backend::Sqlite(m) => m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute_batch("savepoint quillo_tx").map_err(|e| e.to_string()),
+                    _ => unreachable!(),
+                },
+                _ => {
+                    match checkout_for_tx(it, &p.b) {
+                        Ok(c) => {
+                            it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(TxConn { backend: p.b.clone(), conn: Some(c), depth: 1 });
+                            let begin = if p.kind == Kind::Pg { "begin".to_string() } else { format!("xa start '{}'", p.gid) };
+                            pooled_run(it, &p.b, move |c| c.batch(&begin))
+                        }
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(e),
+                }
+            };
+            match r {
+                Ok(()) => begun.push(k),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
                 }
             }
-        };
-        match r {
-            Ok(()) => begun.push(k),
-            Err(e) => {
-                failed = Some(e);
-                break;
-            }
         }
-    }
-    let sqlite = parts.iter().enumerate().any(|(k, p)| p.kind == Kind::Sqlite && begun.contains(&k));
-    if sqlite {
-        it.sqlite_tx += 1;
-        crate::httpd::hold_in_place(true);
-    }
-    let mark = tx_begin(it);
-    it.wrote_req = Some(crate::httpd::request_number());
-    let r = match &failed {
-        None => it.call(&f, Vec::new(), line),
-        Some(e) => Ok(db_err(e)),
+        if parts.iter().enumerate().any(|(k, p)| p.kind == Kind::Sqlite && begun.contains(&k)) {
+            it.sqlite_tx += 1;
+            crate::httpd::hold_in_place(true);
+            raised = true;
+        }
+        mark = Some(tx_begin(it));
+        it.wrote_req = Some(crate::httpd::request_number());
+        let r = match &failed {
+            None => it.call(&f, Vec::new(), line),
+            Some(e) => Ok(db_err(e)),
+        };
+        let ok = failed.is_none() && matches!(&r, Ok(v) if !matches!(v, Value::Err(..)));
+        let outcome = if ok { commit_parts(it, &mut parts, &sys, &gid, &mut decided) } else { Err(String::new()) };
+        if outcome.is_err() {
+            abort_parts(it, &mut parts, &begun);
+        }
+        (r, ok, outcome)
+    }));
+    let (r, ok, outcome) = match ran {
+        Ok(ran) => ran,
+        Err(panic) => {
+            atomic_panicked(it, &parts, &begun, raised, decided, mark, &sys, &gid);
+            std::panic::resume_unwind(panic);
+        }
     };
-    let ok = failed.is_none() && matches!(&r, Ok(v) if !matches!(v, Value::Err(..)));
-    let outcome = if ok { commit_parts(it, &mut parts, &sys, &gid) } else { Err(String::new()) };
-    if outcome.is_err() {
-        abort_parts(it, &mut parts, &begun);
-    }
-    if sqlite {
+    let mark = mark.expect("begun");
+    if raised {
         crate::httpd::hold_in_place(false);
         it.sqlite_tx -= 1;
     }
@@ -3398,7 +3510,8 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
 }
 
-fn commit_parts(it: &mut Interp, parts: &mut [Part], sys: &Arc<Backend>, gid: &str) -> Result<(), String> {
+/// `decided`: whether the decision to commit is recorded, for a panic part way (`atomic_panicked`).
+fn commit_parts(it: &mut Interp, parts: &mut [Part], sys: &Arc<Backend>, gid: &str, decided: &mut bool) -> Result<(), String> {
     // 1. Every server database prepares its part.
     for k in 0..parts.len() {
         let (kind, b, pgid) = (parts[k].kind, parts[k].b.clone(), parts[k].gid.clone());
@@ -3423,13 +3536,16 @@ fn commit_parts(it: &mut Interp, parts: &mut [Part], sys: &Arc<Backend>, gid: &s
     // database taking part, it is kept with that part, when it commits.
     let sys_is_part = parts.iter().any(|p| p.kind == Kind::Sqlite && Arc::ptr_eq(&p.b, sys));
     decide(it, sys, gid, "commit").map_err(|e| format!("the decision could not be recorded: {}", e))?;
+    *decided = true;
     // 3. SQLite, last: then the decision stands.
     for p in parts.iter() {
         if let (Kind::Sqlite, Backend::Sqlite(m)) = (p.kind, &*p.b) {
+            faulted(fault());
             if let Err(e) = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute_batch("release quillo_tx") {
                 if !sys_is_part {
                     let _ = apart(it, sys, "delete from _quillo_atomic where gid = ?".into(), vec![Value::str(gid)]);
                 }
+                *decided = false;
                 return Err(e.to_string());
             }
         }
@@ -3477,6 +3593,67 @@ fn abort_parts(it: &mut Interp, parts: &mut [Part], begun: &[usize]) {
                 });
             }
             _ => {}
+        }
+    }
+}
+
+/// What a panic part way through `db.atomic` leaves (see `atomic`). SQLite's part first, while
+/// the thread still holds its connection: rolled back unless it is committed already, and the
+/// decision with it, as `commit_parts` does when that part cannot commit. Then nothing stays
+/// raised, and each server part's connection is taken out of the transaction and closed, the part
+/// committed on it where the commit stands (decided, SQLite's part committed) and rolled back
+/// otherwise, as recovery would end it, but now, not a minute later with its rows held meanwhile.
+/// A prepared part whose connection the panic closed is ended on another (FEEDBACK56.md, found in
+/// review; branch feedback56).
+#[allow(clippy::too_many_arguments)]
+fn atomic_panicked(it: &mut Interp, parts: &[Part], begun: &[usize], raised: bool, decided: bool, mark: Option<usize>, sys: &Arc<Backend>, gid: &str) {
+    // Out of the transaction first: whatever happens below, none stays pinned, nor its place lost.
+    let held: Vec<Taken<'_>> = parts
+        .iter()
+        .map(|p| {
+            let mut g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let conn = g.iter().position(|t| Arc::ptr_eq(&t.backend, &p.b)).and_then(|i| g.remove(i).conn);
+            Taken { b: &p.b, conn }
+        })
+        .collect();
+    let mut undone = false;
+    for (k, p) in parts.iter().enumerate() {
+        if let (Kind::Sqlite, Backend::Sqlite(m), true) = (p.kind, &*p.b, begun.contains(&k)) {
+            let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !c.is_autocommit() {
+                let _ = c.execute_batch("rollback to quillo_tx; release quillo_tx");
+                undone = true;
+            }
+        }
+    }
+    let stands = decided && !undone;
+    if raised {
+        crate::httpd::hold_in_place(false);
+        it.sqlite_tx -= 1;
+    }
+    if let Some(mark) = mark {
+        tx_end(it, mark, stands);
+    }
+    if decided && undone && !parts.iter().any(|p| p.kind == Kind::Sqlite && Arc::ptr_eq(&p.b, sys)) {
+        let _ = apart(it, sys, "delete from _quillo_atomic where gid = ?".into(), vec![Value::str(gid)]);
+    }
+    for (p, c) in parts.iter().zip(held) {
+        let g = &p.gid;
+        let sqls = match (p.kind, p.prepared, stands) {
+            (Kind::Sqlite, ..) => continue,
+            (Kind::Pg, true, true) => vec![format!("commit prepared '{}'", g)],
+            (Kind::My, true, true) => vec![format!("xa commit '{}'", g)],
+            (Kind::Pg, true, false) => vec![format!("rollback prepared '{}'", g)],
+            (Kind::My, true, false) => vec![format!("xa rollback '{}'", g)],
+            (Kind::Pg, false, _) => vec!["rollback".to_string()],
+            (Kind::My, false, _) => vec![format!("xa end '{}'", g), format!("xa rollback '{}'", g)],
+        };
+        if c.conn.is_some() {
+            close_after(it, c, sqls);
+        } else if p.prepared {
+            for sql in sqls {
+                let _ = apart(it, &p.b, sql, Vec::new());
+            }
         }
     }
 }

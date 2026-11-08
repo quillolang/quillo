@@ -3,7 +3,9 @@
 ## Unreleased
 
 - A panic inside a transaction rolls it back and frees the connection on every database; on
-  SQLite it had left the savepoint open, so later writes went uncommitted (FEEDBACK56.md, found
+  SQLite it had left the savepoint open, so later writes went uncommitted. `db.atomic`'s too:
+  its parts end as decided, committed where the decision stands, rolled back otherwise. A panic
+  in a PostgreSQL call no longer loses the connection's place in the pool (FEEDBACK56.md, found
   in review).
 - `fn mcp name(...)` and `server fn mcp name(...)` declare tools for AI clients, and
   `service mcp /path = "file.qwe"` a service whose tools are the program's. `quillo check` holds
@@ -11,6 +13,10 @@
   parameter, or an effect its body uses that its `with` does not say; highlighting, hover, completion and the outline know the tag.
   `mcp` stays an ordinary name everywhere else. The door is not built yet (FEEDBACK56.md,
   Q-853).
+- `quillo mcp app.qwe` serves a program's tools to an AI client over stdin and stdout, in MCP's
+  revision 2026-07-28: `server/discover`, `tools/list` and `tools/call`, with only MCP's
+  messages on stdout (`print` goes to stderr there). A client of the earlier revision is told
+  the version is not supported (FEEDBACK56.md, C.1).
 - A tool's arguments and result are written as JSON Schema 2020-12, with `readOnlyHint` and
   `openWorldHint` said only when Quillo can see they are true. "Only reads" is worked out
   from the program and enforced: such a tool that may reach the database runs in a read-only transaction on SQLite,

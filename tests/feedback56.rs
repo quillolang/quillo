@@ -2214,6 +2214,7 @@ fn panics_on(it: &mut Interp, d: &Path, db: &str) {
     let plain = quillo::txn::Options::default();
     for (what, outer) in [("read-only", true), ("db.transaction's", false), ("nested", false)] {
         let before = count(it);
+        let free_before = free(it);
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let body = &mut |_: &mut Interp| -> Result<Q, quillo::interp::Ctrl> { panic!("a panic in the body, on purpose") };
             let _ = match (outer, what) {
@@ -2225,6 +2226,10 @@ fn panics_on(it: &mut Interp, d: &Path, db: &str) {
         assert!(caught.is_err(), "{}", what);
         assert_eq!(it.sqlite_tx, 0, "{}", what);
         assert!(!quillo::httpd::held(), "{}", what);
+        // Nothing pinned: the nested case passed when the inner transaction never lowered its
+        // depth, the outer leaving the connection pinned and the write after it autocommitted
+        // on it (found in review).
+        nothing_left(it, free_before, what);
         assert_eq!(ok(it.call(&write, vec![Q::str("after")], 0)).display(), "wrote", "{}", what);
         assert_eq!(count(it), before + 1, "{}", what);
         assert_eq!(seen_elsewhere(d), before + 1, "{}: the write after it is not committed", what);
@@ -3170,4 +3175,404 @@ const { StdioClientTransport } = require("@modelcontextprotocol/client/stdio");
     assert_eq!(pin["unknown"], json!(-32602));
     // A client of 2025-11-25, the SDK's default: refused at `initialize` with the version error.
     assert_eq!(said["legacy"]["failed"]["code"], json!(-32022), "{}", said);
+}
+
+// ---- Slice 3, review: a panic in any transaction, db.atomic's too ----------------------------
+//
+// A panic is a bug of Quillo's, which the server answers 500 and lives on: what a transaction
+// raised is lowered, what it held let go, and nothing of a database is left for the requests
+// after it (found in review). `quillo::db::panic_at_db_call(n)` makes the `n`th call holding a
+// server database's connection panic, as no query a program can make does.
+
+/// How many of the program's PostgreSQL connections can be had now (0 on another database): as
+/// many after a panic as before it, when it lost none.
+fn free(it: &Interp) -> usize {
+    let slot = it.db.lock().unwrap().clone();
+    let Some(quillo::db::DbSlot::One(b)) = slot else { return 0 };
+    let quillo::db::Backend::Postgres(p) = &*b else { return 0 };
+    let mut got = Vec::new();
+    while let Some(c) = p.try_checkout().unwrap() {
+        got.push(c);
+    }
+    let n = got.len();
+    for c in got {
+        p.give_back(c);
+    }
+    n
+}
+
+/// Whether the program's database is outside any transaction, as SQLite says.
+fn autocommit(it: &Interp) -> bool {
+    let slot = it.db.lock().unwrap().clone();
+    let Some(quillo::db::DbSlot::One(b)) = slot else { return true };
+    let quillo::db::Backend::Sqlite(m) = &*b else { return true };
+    let open = !m.lock().unwrap().is_autocommit();
+    !open
+}
+
+/// Nothing a panic left raised or held: no transaction pinned, every connection to be had, the
+/// thread let go, SQLite outside a transaction, the interpreter's counts down.
+fn nothing_left(it: &Interp, free_before: usize, what: &str) {
+    assert!(it.pg_tx.lock().unwrap().is_empty(), "{}: a transaction's connection is left pinned", what);
+    assert_eq!(free(it), free_before, "{}: a connection's place in the pool is lost", what);
+    assert_eq!(it.sqlite_tx, 0, "{}", what);
+    assert!(!quillo::httpd::held(), "{}: the thread is left held", what);
+    assert!(autocommit(it), "{}: SQLite is left in a transaction", what);
+    assert_eq!(it.tx_depth, 0, "{}", what);
+    assert_eq!(it.catching_drops, 0, "{}", what);
+}
+
+/// `f`, which panics: the panic goes on up to here.
+fn panics(it: &mut Interp, what: &str, f: impl FnOnce(&mut Interp)) {
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(it)));
+    quillo::db::panic_at_db_call(0);
+    assert!(caught.is_err(), "{}: it did not panic", what);
+}
+
+/// A function given to a transaction that panics, as a bug of Quillo's in it would.
+fn boom(_: &mut Interp, _: Vec<Q>, _: u32) -> Result<Q, quillo::interp::Ctrl> {
+    panic!("a panic in the function, on purpose")
+}
+
+/// One that fails, as a function does.
+fn fails(_: &mut Interp, _: Vec<Q>, _: u32) -> Result<Q, quillo::interp::Ctrl> {
+    Ok(Q::err(Q::str("no")))
+}
+
+/// One whose statement panics in its call, the connection held.
+fn boom_in_a_call(it: &mut Interp, _: Vec<Q>, _: u32) -> Result<Q, quillo::interp::Ctrl> {
+    quillo::db::panic_at_db_call(1);
+    let write = global(it, "write");
+    it.call(&write, vec![Q::str("lost")], 0)
+}
+
+const PANIC_HELPERS: &str = "fn write(t: str) {\n    let r = db.exec(\"insert into notes (text) values (?)\", t)\n    db.error_kind(r) ?? \"wrote\"\n}\n\
+fn count() -> int = db.one(\"select count(*) as n from notes\").n\n\
+fn run_atomic(dbs, f) = db.atomic(dbs, f)\n";
+
+/// A transaction of `db.transaction`'s around `body`, and one inside it.
+fn tx(it: &mut Interp, body: &mut dyn FnMut(&mut Interp) -> Result<Q, quillo::interp::Ctrl>) -> Result<Q, quillo::interp::Ctrl> {
+    quillo::txn::run(it, None, &quillo::txn::Options::default(), 0, body)
+}
+
+fn nested(it: &mut Interp, body: &mut dyn FnMut(&mut Interp) -> Result<Q, quillo::interp::Ctrl>) -> Result<Q, quillo::interp::Ctrl> {
+    tx(it, &mut |it| tx(it, &mut *body))
+}
+
+/// A PostgreSQL program with a function of its own, its pool of two.
+fn pg_program(d: &Path, url: &str) -> Interp {
+    let src = format!(
+        "db.open(\"{}?pool_size=2\")\ndb.exec(\"create table notes (id serial primary key, text text)\")\n\
+         db.exec(\"create function add_note() returns int language sql as $$ insert into notes (text) values ('x') returning id $$\")\n\
+         fn own() = db.query(\"select add_note() as id\")\n{}",
+        url, PANIC_HELPERS
+    );
+    let mut it = Interp::new(d);
+    it.load_source(&src, "main.qwe").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    it
+}
+
+/// What another program sees in `url`'s notes: what was committed.
+fn committed_in(d: &Path, url: &str) -> String {
+    let mut other = Interp::new(d);
+    other.load_source(&format!("db.open({:?})\ndb.one(\"select count(*) as n from notes\").n\n", url), "other.qwe").unwrap().display()
+}
+
+#[test]
+fn q858_review_a_panic_in_a_call_on_postgres_loses_no_connection() {
+    let Some(pg) = support::postgres("feedback56-call-panic") else {
+        eprintln!("skipped: q858_review_a_panic_in_a_call_on_postgres_loses_no_connection, as PostgreSQL's initdb and pg_ctl were not found");
+        return;
+    };
+    let url = pg.database("calls");
+    let d = support::temp_dir("feedback56-call-panic");
+    let mut it = pg_program(&d, &url);
+    let write = global(&it, "write");
+    let own = global(&it, "own");
+    let all = free(&it);
+    assert_eq!(all, 2);
+    // Outside a transaction, a statement and one calling a function of the program's (on a
+    // connection of its own); inside one, outermost and nested: each panicking call's connection
+    // is closed and its place freed, where one was lost each time.
+    for (what, f, args) in [("a statement", &write, vec![Q::str("lost")]), ("a function of its own", &own, vec![])] {
+        panics(&mut it, what, |it| {
+            quillo::db::panic_at_db_call(1);
+            let _ = it.call(f, args, 0);
+        });
+        nothing_left(&it, all, what);
+    }
+    for (what, deep) in [("in a transaction", false), ("in a nested one", true)] {
+        panics(&mut it, what, |it| {
+            let body = &mut |it: &mut Interp| {
+                quillo::db::panic_at_db_call(1);
+                it.call(&write, vec![Q::str("lost")], 0)
+            };
+            let _ = if deep { nested(it, body) } else { tx(it, body) };
+        });
+        nothing_left(&it, all, what);
+    }
+    // More panics than the pool holds, then a transaction: it gets a connection at once.
+    for _ in 0..3 {
+        panics(&mut it, "again", |it| {
+            let _ = tx(it, &mut |it| {
+                quillo::db::panic_at_db_call(1);
+                it.call(&write, vec![Q::str("lost")], 0)
+            });
+        });
+    }
+    let started = Instant::now();
+    assert_eq!(ok(tx(&mut it, &mut |it| it.call(&write, vec![Q::str("kept")], 0))).display(), "wrote");
+    assert!(started.elapsed() < Duration::from_secs(5), "waited {:?} for a connection", started.elapsed());
+    nothing_left(&it, all, "after");
+    assert_eq!(committed_in(&d, &url), "1");
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn q858_review_after_a_call_panicked_nothing_is_rolled_back_on_another_connection() {
+    let Some(pg) = support::postgres("feedback56-no-rollback") else {
+        eprintln!("skipped: q858_review_after_a_call_panicked_nothing_is_rolled_back_on_another_connection, as PostgreSQL's initdb and pg_ctl were not found");
+        return;
+    };
+    let url = pg.database("norollback");
+    let d = support::temp_dir("feedback56-no-rollback");
+    let mut it = pg_program(&d, &url);
+    let write = global(&it, "write");
+    let all = free(&it);
+    // The call that panicked closed its connection, and its transaction with it: no other call is
+    // made, where a connection was checked out (waiting up to 30 s for one) to roll back nothing,
+    // in each transaction it was in.
+    for (what, deep) in [("outermost", false), ("nested", true)] {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let body = &mut |it: &mut Interp| {
+                quillo::db::panic_at_db_call(1);
+                it.call(&write, vec![Q::str("lost")], 0)
+            };
+            let _ = if deep { nested(&mut it, body) } else { tx(&mut it, body) };
+        }));
+        assert!(caught.is_err(), "{}", what);
+        // The calls since the body armed it: the one that panicked.
+        assert_eq!(quillo::db::panic_at_db_call(0), 1, "{}: a call after the one that panicked", what);
+        nothing_left(&it, all, what);
+    }
+    assert_eq!(committed_in(&d, &url), "0");
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn q858_review_a_panic_in_the_rollback_leaves_nothing_raised_on_postgres() {
+    let Some(pg) = support::postgres("feedback56-rb-panic") else {
+        eprintln!("skipped: q858_review_a_panic_in_the_rollback_leaves_nothing_raised_on_postgres, as PostgreSQL's initdb and pg_ctl were not found");
+        return;
+    };
+    let url = pg.database("rollbackpanic");
+    let d = support::temp_dir("feedback56-rollback-panic");
+    let mut it = pg_program(&d, &url);
+    let write = global(&it, "write");
+    let all = free(&it);
+    // The body panics, then so does the rollback (of the transaction, or of the nested one's
+    // savepoint): the depth and the announcements were lowered after the rollback, so they were
+    // left raised, the connection pinned.
+    for (what, deep) in [("outermost", false), ("nested", true)] {
+        panics(&mut it, what, |it| {
+            let body = &mut |it: &mut Interp| -> Result<Q, quillo::interp::Ctrl> {
+                assert_eq!(ok(it.call(&write, vec![Q::str("lost")], 0)).display(), "wrote");
+                quillo::db::panic_at_db_call(1);
+                panic!("a panic in the body, on purpose")
+            };
+            let _ = if deep { nested(it, body) } else { tx(it, body) };
+        });
+        nothing_left(&it, all, what);
+        assert_eq!(committed_in(&d, &url), "0", "{}", what);
+    }
+    assert_eq!(ok(it.call(&write, vec![Q::str("kept")], 0)).display(), "wrote");
+    assert_eq!(committed_in(&d, &url), "1");
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn q858_review_a_panic_puts_back_what_a_transaction_catches() {
+    // What a statement dropped in the body is caught for the transaction, the outer one's kept
+    // aside: both were left as the body had them after a panic, the catching raised for good.
+    let d = support::temp_dir("feedback56-caught");
+    let mut it = Interp::new(&d);
+    it.load_source(&format!("db.open(\"app.db\")\ndb.exec(\"create table notes (id integer primary key, text text)\")\n{}", PANIC_HELPERS), "main.qwe").unwrap();
+    it.dropped = Some(Q::str("the outer one's"));
+    for (what, deep) in [("outermost", false), ("nested", true)] {
+        panics(&mut it, what, |it| {
+            let _ = if deep { nested(it, &mut |_| panic!("a panic in the body, on purpose")) } else { tx(it, &mut |_| panic!("a panic in the body, on purpose")) };
+        });
+        assert_eq!(it.dropped.as_ref().map(|v| v.display()).as_deref(), Some("the outer one's"), "{}", what);
+        nothing_left(&it, 0, what);
+    }
+    it.dropped = None;
+    assert_eq!(ok(it.call(&global(&it, "write"), vec![Q::str("kept")], 0)).display(), "wrote");
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn q858_review_a_panic_in_db_atomic_on_sqlite() {
+    let d = support::temp_dir("feedback56-atomic-sqlite");
+    let src = format!(
+        "db.open(\"app.db\")\ndb.exec(\"create table notes (id integer primary key, text text)\")\n{}\
+         fn moved() {{\n    db.exec(\"insert into notes (text) values ('in')\")\n    1\n}}\n\
+         fn mine() = [db]\n\
+         fn decisions() -> int = db.one(\"select count(*) as n from _quillo_atomic\").n\n\
+         fn serializable() = db.transaction({{ isolation: \"serializable\" }}, () => db.exec(\"insert into notes (text) values ('s')\").changes)\n",
+        PANIC_HELPERS
+    );
+    let mut it = Interp::new(&d);
+    it.load_source(&src, "main.qwe").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    let (run, mine, moved) = (global(&it, "run_atomic"), global(&it, "mine"), global(&it, "moved"));
+    let db = ok(it.call(&mine, vec![], 0));
+    // The function panics; then SQLite's part commits, its decision kept with it (the one call
+    // holding a connection here, so the first): the savepoint was left open on the shared
+    // connection, the thread held, and each later write landed in it, uncommitted.
+    for (what, f, at) in [("its function", Q::Builtin("boom", boom), 0), ("its commit", moved.clone(), 1)] {
+        panics(&mut it, what, |it| {
+            quillo::db::panic_at_db_call(at);
+            let _ = it.call(&run, vec![db.clone(), f], 0);
+        });
+        nothing_left(&it, 0, what);
+        assert_eq!(committed_in(&d, "app.db"), "0", "{}", what);
+    }
+    assert_eq!(ok(it.call(&global(&it, "decisions"), vec![], 0)).display(), "0");
+    // Not inside another: the isolation is taken; and a write after it is committed.
+    assert_eq!(ok(it.call(&global(&it, "serializable"), vec![], 0)).display(), "1");
+    assert_eq!(ok(it.call(&global(&it, "write"), vec![Q::str("kept")], 0)).display(), "wrote");
+    assert_eq!(committed_in(&d, "app.db"), "2");
+    // And `db.atomic` as ever.
+    assert_eq!(ok(it.call(&run, vec![db, moved], 0)).display(), "1");
+    assert_eq!(committed_in(&d, "app.db"), "3");
+    nothing_left(&it, 0, "after");
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A program on server database `a` with connections to `b` and to SQLite, for `db.atomic`;
+/// `serial` its kind of key, `prepared` what lists its prepared transactions.
+fn atomic_program(d: &Path, a: &str, b: &str, serial: &str, prepared: &str) -> Interp {
+    let src = format!(
+        "db.open({a:?})\nlet other = db.connect({b:?})\nlet local = db.connect(\"local.db\")\n\
+         db.exec(\"create table notes (id {serial} primary key, text text)\")\n\
+         other.exec(\"create table notes (id {serial} primary key, text text)\")\n\
+         local.exec(\"create table notes (id integer primary key, text text)\")\n{helpers}\
+         fn moved() {{\n    db.exec(\"insert into notes (text) values ('in')\")\n    other.exec(\"insert into notes (text) values ('in')\")\n    local.exec(\"insert into notes (text) values ('in')\")\n    1\n}}\n\
+         fn three() = [db, other, local]\n\
+         fn local_first() = [local, db, other]\n\
+         fn prepared() -> int = len(db.query({prepared:?}))\n\
+         fn decisions() -> int = db.one(\"select count(*) as n from _quillo_atomic\").n\n",
+        helpers = PANIC_HELPERS
+    );
+    let mut it = Interp::new(d);
+    it.load_source(&src, "main.qwe").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    it
+}
+
+/// What another program sees in each of `db.atomic`'s three databases: what was committed.
+fn committed_in_three(d: &Path, a: &str, b: &str) -> String {
+    let mut other = Interp::new(d);
+    let src = format!(
+        "db.open({:?})\nlet other = db.connect({:?})\nlet local = db.connect(\"local.db\")\n\
+         [db.one(\"select count(*) as n from notes\").n, other.one(\"select count(*) as n from notes\").n, local.one(\"select count(*) as n from notes\").n]\n",
+        a, b
+    );
+    other.load_source(&src, "other.qwe").unwrap().display()
+}
+
+/// `db.atomic` on a server database `a`, another `b` and SQLite, panicking at each step. The
+/// calls holding a connection, for `moved` over the three: 1 and 2 begin the server parts, 3 and
+/// 4 are the function's statements, 5 and 6 prepare, 7 commits SQLite's part, 8 and 9 commit the
+/// prepared ones.
+fn atomic_panics_on(it: &mut Interp, d: &Path, a: &str, b: &str) {
+    let (run, moved) = (global(it, "run_atomic"), global(it, "moved"));
+    let all = free(it);
+    let call = |it: &mut Interp, name: &str| ok(it.call(&global(it, name), vec![], 0));
+    let (mut seen, mut first) = (0, true);
+    for (what, dbs, f, at, stands) in [
+        ("its function", "three", Q::Builtin("boom", boom), 0, false),
+        ("a call in its function", "three", Q::Builtin("boom_in_a_call", boom_in_a_call), 0, false),
+        ("a part's begin, SQLite's begun", "local_first", moved.clone(), 2, false),
+        ("the second part's prepare", "three", moved.clone(), 6, false),
+        ("SQLite's commit, the decision recorded", "three", moved.clone(), 7, false),
+        ("the last part's commit, the decision standing", "three", moved.clone(), 9, true),
+    ] {
+        let dbs = call(it, dbs);
+        // Its table is made by the first `db.atomic`.
+        let decided = if first { "0".into() } else { call(it, "decisions").display() };
+        first = false;
+        panics(it, what, |it| {
+            quillo::db::panic_at_db_call(at);
+            let _ = it.call(&run, vec![dbs, f], 0);
+        });
+        nothing_left(it, all, what);
+        seen += stands as i64;
+        assert_eq!(committed_in_three(d, a, b), format!("[{s}, {s}, {s}]", s = seen), "{}", what);
+        assert_eq!(call(it, "prepared").display(), "0", "{}: a part is left prepared", what);
+        if !stands {
+            assert_eq!(call(it, "decisions").display(), decided, "{}: a decision to commit is left", what);
+        }
+    }
+    // And `db.atomic` as ever, all of it or none of it.
+    let three = call(it, "three");
+    assert_eq!(ok(it.call(&run, vec![three.clone(), moved], 0)).display(), "1");
+    assert_eq!(committed_in_three(d, a, b), format!("[{s}, {s}, {s}]", s = seen + 1));
+    assert!(matches!(ok(it.call(&run, vec![three, Q::Builtin("fails", fails)], 0)), Q::Err(..)));
+    assert_eq!(committed_in_three(d, a, b), format!("[{s}, {s}, {s}]", s = seen + 1));
+    nothing_left(it, all, "after");
+}
+
+#[test]
+fn q858_review_a_panic_in_db_atomic_on_postgres() {
+    let Some(pg) = support::postgres("feedback56-atomic-pg") else {
+        eprintln!("skipped: q858_review_a_panic_in_db_atomic_on_postgres, as PostgreSQL's initdb and pg_ctl were not found");
+        return;
+    };
+    // Prepared transactions, as `db.atomic` needs.
+    let out = Command::new(pg.bin.join("psql")).args([pg.url.as_str(), "-q", "-c", "alter system set max_prepared_transactions = 10"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let data = std::env::temp_dir().join(format!("quillo-pg-feedback56-atomic-pg-{}", std::process::id()));
+    let out = Command::new(pg.bin.join("pg_ctl")).arg("-D").arg(&data).arg("-l").arg(data.join("log")).args(["-w", "restart"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let (a, b) = (format!("{}?pool_size=2", pg.database("atomic_a")), pg.database("atomic_b"));
+    let d = support::temp_dir("feedback56-atomic-pg");
+    let mut it = atomic_program(&d, &a, &b, "serial", "select gid from pg_prepared_xacts");
+    atomic_panics_on(&mut it, &d, &a, &b);
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn q858_review_a_panic_in_db_atomic_and_a_call_on_mariadb() {
+    let Some(my) = support::mariadb("feedback56-atomic-my") else {
+        eprintln!("skipped: q858_review_a_panic_in_db_atomic_and_a_call_on_mariadb, as MariaDB's mariadbd and mariadb-install-db were not found");
+        return;
+    };
+    let (a, b) = (my.url("atomic_a"), my.url("atomic_b"));
+    let d = support::temp_dir("feedback56-atomic-my");
+    let mut it = atomic_program(&d, &a, &b, "int auto_increment", "xa recover");
+    atomic_panics_on(&mut it, &d, &a, &b);
+    // A call that panics in a transaction: its connection goes back to MariaDB's pool, which
+    // resets it, and nothing stays pinned.
+    let write = global(&it, "write");
+    let before = committed_in_three(&d, &a, &b);
+    for (what, deep) in [("in a transaction", false), ("in a nested one", true)] {
+        panics(&mut it, what, |it| {
+            let body = &mut |it: &mut Interp| {
+                quillo::db::panic_at_db_call(1);
+                it.call(&write, vec![Q::str("lost")], 0)
+            };
+            let _ = if deep { nested(it, body) } else { tx(it, body) };
+        });
+        nothing_left(&it, 0, what);
+        assert_eq!(committed_in_three(&d, &a, &b), before, "{}", what);
+    }
+    assert_eq!(ok(it.call(&write, vec![Q::str("kept")], 0)).display(), "wrote");
+    assert_ne!(committed_in_three(&d, &a, &b), before);
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
 }
