@@ -3587,7 +3587,7 @@ fn highlight(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn ask(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // In a tool's call, the page's form is a mistake the call stops at, which no `??` takes
     // (FEEDBACK56.md, Part E, second review; branch feedback56).
-    if it.asking.is_some() {
+    if it.asking.is_some() || it.in_tool {
         return crate::mcp::ask_in_a_tool(it, args.len(), line);
     }
     fail(line, "`ask` and `notify` speak to someone in the browser: call them from a component (an event handler)")

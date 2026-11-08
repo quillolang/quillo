@@ -567,6 +567,10 @@ struct Back {
     /// database (FEEDBACK55.md, Q-796, found in review; branch feedback55).
     published: Option<Vec<String>>,
     wrote_req: Option<usize>,
+    /// A question refused in a tool's call with no asking (`Interp::in_tool`): the call stops,
+    /// though the function that reached it went on (FEEDBACK56.md, the coverage review's security
+    /// review; branch feedback56).
+    refused: Option<Box<crate::mcp::Asking>>,
 }
 
 /// A text shorter than this is looked at each time it is read by index, not kept.
@@ -2217,10 +2221,14 @@ impl Interp {
             acted: self.acted,
             published: self.published.take(),
             wrote_req: self.wrote_req,
+            refused: self.asking.take(),
         }
     }
 
     fn take_back(&mut self, b: Back) {
+        if self.asking.is_none() {
+            self.asking = b.refused;
+        }
         self.visitor_read |= b.visitor_read;
         self.locale_read |= b.locale_read;
         self.read_request |= b.read_request;
@@ -4208,7 +4216,7 @@ impl Interp {
                     // could not see it: told of `about`, and the call stops there, as at the
                     // page's `ask` (FEEDBACK56.md, the user's decision 2026-11-09; branch
                     // feedback56).
-                    if *name == "ask" && self.asking.is_some() {
+                    if *name == "ask" && (self.asking.is_some() || self.in_tool) {
                         return crate::mcp::ask_in_a_tool(self, args.len(), line);
                     }
                     return fail(line, crate::check::too_many_args(name, args.len()));

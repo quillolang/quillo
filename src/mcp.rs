@@ -1207,9 +1207,8 @@ pub(crate) struct Asking {
     /// A call made later from a tool's call (`billing.later.f(...)`): there is no one to ask, and
     /// a question is refused, never answered by nobody (FEEDBACK56.md, Part F; branch feedback56).
     nobody: bool,
-    /// A tool's call `quillo check` saw ask nothing, crossing to a service: a question there is
-    /// refused, never answered as outside any tool's call (`UNSEEN`; FEEDBACK56.md, found in the
-    /// coverage review; branch feedback56).
+    /// Made where a tool's call with no asking (`Interp::in_tool`) reached a question, which it
+    /// refused (`UNSEEN`; FEEDBACK56.md, found in the coverage review; branch feedback56).
     unseen: bool,
     /// The first refusal of a question in the call (`stops_on_error`): its message, and as the log
     /// says it, with its file.
@@ -1436,12 +1435,17 @@ impl Asking {
         Asking::empty(false, true)
     }
 
-    /// What a tool's call with no asking (`Interp::in_tool`) gives a service it calls, and takes
-    /// itself once a question is reached: one refused, the call stopped (`UNSEEN`).
+    /// What a tool's call with no asking (`Interp::in_tool`) takes once it reaches a question:
+    /// one refused, the call stopped (`UNSEEN`).
     pub(crate) fn unseen() -> Box<Asking> {
         let mut a = Asking::empty(false, false);
         a.unseen = true;
         a
+    }
+
+    /// Why, where this is such a call's refusal (`unseen`): its first refusal as the log says it.
+    pub(crate) fn unseen_why(&self) -> Option<String> {
+        self.unseen.then(|| self.why.as_ref().map_or_else(|| UNSEEN.to_string(), |(_, w)| w.clone()))
     }
 
     /// What a service's tool that may ask runs with when its app's door sent no asking: a client
@@ -1497,7 +1501,6 @@ impl Asking {
         json!({
             "can_ask": self.can_ask,
             "nobody": self.nobody,
-            "unseen": self.unseen,
             "rounds": self.rounds,
             "reached": self.reached,
             "wrote": self.wrote,
@@ -1511,12 +1514,6 @@ impl Asking {
     pub(crate) fn from_wire(j: &J) -> Option<Box<Asking>> {
         let o = j.as_object()?;
         let mut a = Asking::empty(o.get("can_ask")?.as_bool()?, o.get("nobody")?.as_bool()?);
-        // Left out by an app of a Quillo before it, whose calls have none (found in the coverage
-        // review).
-        a.unseen = match o.get("unseen") {
-            None => false,
-            Some(u) => u.as_bool()?,
-        };
         a.rounds = o.get("rounds")?.as_u64()? as usize;
         a.reached = o.get("reached")?.as_u64()? as usize;
         a.wrote = match o.get("wrote")? {
@@ -1948,15 +1945,6 @@ fn question(it: &mut Interp, line: u32, what: &str, digest: String, request: &dy
     if a.nobody {
         return crate::interp::fail(line, format!("`{}`: {}", what, NOBODY));
     }
-    if a.unseen {
-        // Said in this service's log now: the call's error is its app's, and a function given to a
-        // builtin here (a locale rule's, under `t`) may take this one.
-        let refused = crate::interp::fail(line, format!("`{}`: {}", what, UNSEEN));
-        if let Err(Ctrl::Error(e)) = &refused {
-            eprintln!("quillo: error in a tool's call: {:#}", e);
-        }
-        return refused;
-    }
     if let Some(w) = &a.wrote {
         return crate::interp::fail(line, format!("`{}` comes after {}: {}", what, w, ASK_FIRST));
     }
@@ -2023,17 +2011,16 @@ fn question(it: &mut Interp, line: u32, what: &str, digest: String, request: &dy
     crate::interp::fail(line, ASKING)
 }
 
-/// After a service ran a call made in a tool's call that has no asking, given `Asking::unseen`
-/// (`reply`, what it gave back of it): where it reached a question, which it refused, this call
-/// stops too, as at a refused question of its own (FEEDBACK56.md, found in the coverage review;
-/// branch feedback56).
-pub(crate) fn unseen_stopped(it: &mut Interp, reply: Option<&J>, service: &str) -> bool {
-    if it.asking.is_some() || !it.in_tool || !reply.and_then(|r| r.get("stop")).is_some_and(|s| !s.is_null()) {
+/// A service a tool's call with no asking reached refused a question there (`why`, as it says):
+/// this call stops too, as at a refused question of its own, the reason in its log
+/// (FEEDBACK56.md, found in the coverage review; branch feedback56). False outside a tool's call.
+pub(crate) fn refused_there(it: &mut Interp, service: &str, why: &str) -> bool {
+    if it.asking.is_some() || !it.in_tool {
         return false;
     }
     let mut a = Asking::unseen();
     a.stop = Some(Stopped::Failed);
-    a.why = Some((String::new(), format!("service {} refused a question this call reached where `quillo check` sees none, as its log says", service)));
+    a.why = Some((String::new(), format!("service {}: {}", service, why)));
     it.asking = Some(a);
     true
 }
@@ -2043,6 +2030,11 @@ pub(crate) fn unseen_stopped(it: &mut Interp, reply: Option<&J>, service: &str) 
 fn stops_on_error(it: &mut Interp, f: impl FnOnce(&mut Interp) -> Result<Value, Ctrl>) -> Result<Value, Ctrl> {
     let r = f(it);
     let file = it.cur_file.clone();
+    // In a tool's call with no asking, a question's error stops the call all the same, its own
+    // arguments refused too (`confirm(null) ?? true`; the coverage review's security review).
+    if matches!(r, Err(Ctrl::Error(_))) && it.asking.is_none() && it.in_tool {
+        it.asking = Some(Asking::unseen());
+    }
     if let (Err(Ctrl::Error(e)), Some(a)) = (&r, it.asking.as_mut()) {
         a.stop.get_or_insert(Stopped::Failed);
         if matches!(a.stop, Some(Stopped::Failed)) && a.why.is_none() {
@@ -2428,8 +2420,17 @@ pub fn serve_http(it: &mut Interp, req: &crate::server::HttpRequest, path: &str)
 
 fn answer_http(it: &mut Interp, door: &Door, req: &crate::server::HttpRequest) -> crate::server::HttpResponse {
     use crate::server::HttpResponse;
-    // Who it is first: a stranger learns nothing of the door, not even what it would refuse.
-    let caller = match caller(it, req) {
+    // Who it is first: a stranger learns nothing of the door, not even what it would refuse. The
+    // tenant is worked out here, its rule run as part of the call: a question there is refused,
+    // and the request with it (the coverage review's security review).
+    let was = std::mem::replace(&mut it.in_tool, true);
+    let caller = caller(it, req);
+    it.in_tool = was;
+    if let Some(why) = it.asking.take().and_then(|a| a.unseen_why()) {
+        eprintln!("quillo: error at the MCP door: {}", why);
+        return json_answer(500, error_message(None, fault(INTERNAL_ERROR, "Internal error")));
+    }
+    let caller = match caller {
         Ok(c) => c,
         Err(refused) => return refused,
     };

@@ -10781,10 +10781,146 @@ fn unseen_a_call_made_later_from_a_tool_that_asks_nothing_has_no_one_to_ask() {
     let mut door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
     let r = door.result("send_later", json!({}), true, None, None);
     let id = f_structured(&r)["result"].as_str().unwrap_or_else(|| panic!("{}", r)).to_string();
-    assert!(id.starts_with('t') && id.len() == 24, "{}", id);
+    // A tool's call with no asking: `u`, the call then sent as any other, so that a service of a
+    // Quillo before tools takes it (security review).
+    assert!(id.starts_with('u') && id.len() == 24, "{}", id);
     let nobody = "it stopped at a question: a call made later from a tool's call has no one to ask, so its question is refused: ask in the tool, before making the call";
     assert_eq!(f_later_ended(s.port, &id), json!({ "state": "failed", "result": null, "why": nobody }));
     drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ---- the security review of the above -----------------------------------------------------------
+
+/// `UNSEEN`'s program with `greet`'s body `BODY` and a `bump` the rule may call.
+fn unseen_with(name: &str, rule: &str, body: &str) -> PathBuf {
+    let src = UNSEEN.replace("RULE", rule).replace(
+        "fn mcp greet() -> str with db {\n    let g = t(\"hi\")\n    db.exec(\"insert into w (v) values (1)\")\n    g\n}",
+        &format!("let hits = 0\nfn bump() -> bool {{\n    hits = hits + 1\n    true\n}}\nroute GET /hits = str(hits)\n\n/// Greets, and writes it down.\nfn mcp greet() -> str with db {{\n{}\n}}", body),
+    );
+    assert!(src.contains("fn bump"), "{}", src);
+    dir(name, &src)
+}
+
+/// Each way a question reaches a tool's call with no asking: refused, the call stopped (internal
+/// error), what the tool would write after it not written, and the reason logged, over HTTP on a
+/// single worker; then a page on that worker is outside any tool's call again, its rule's
+/// `confirm` true. Under `parallel` (a copy of the handle had dropped the refusal), with the
+/// question's own argument refused under `??` (`confirm(null) ?? true` had been a yes), the
+/// page's `ask` reached through a function value, and `??` taking no refusal (`bump` never runs).
+#[test]
+fn unseen_review_every_way_a_question_reaches_a_call_with_no_asking() {
+    let write_then = "    let p = parallel(() => t(\"hi\"), () => 1)\n    db.exec(\"insert into w (v) values (1)\")\n    p[0]";
+    let plain = "    let g = t(\"hi\")\n    db.exec(\"insert into w (v) values (1)\")\n    g";
+    for (k, (rule, body, said)) in [
+        (r#"confirm("In French?")"#, write_then, UNSEEN_SAID),
+        (r#"(confirm(request.query["q"]) ?? true)"#, plain, "`confirm`"),
+        (r#"([ask][0]("In French?", {}) ?? true)"#, plain, "a question with choices is about(question, choices, default)"),
+        (r#"(confirm("In French?") ?? bump())"#, plain, UNSEEN_SAID),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let d = unseen_with(&format!("unseen-r{}", k), rule, body);
+        let s = Logged::start(&d.join("main.qwe"), &["--max-tool-calls", "100000", "--workers", "1"], &[]);
+        let mut door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
+        let r = door.result("greet", json!({}), true, None, None);
+        assert_eq!(text_of(&r), (true, "internal error".to_string()), "{}: {}", rule, r);
+        assert_eq!(support::send(s.port, "GET", "/writes", &[], "").body, "0", "{}: written after the refusal", rule);
+        assert_eq!(support::send(s.port, "GET", "/hits", &[], "").body, "0", "{}: `??` took the refusal", rule);
+        s.says(said);
+        if k == 0 {
+            // The same worker, outside any tool's call: nothing of the refused call is left on it.
+            assert_eq!(support::send(s.port, "GET", "/hi", &[], "").body, "Salut");
+        }
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A write before the question stands (a tool that may not ask runs in no transaction of its
+/// own), and the call is an error, the model told not to call again on its own.
+#[test]
+fn unseen_review_a_write_before_the_question_stands_and_the_call_fails() {
+    let d = unseen_with("unseen-before", r#"confirm("In French?")"#, "    db.exec(\"insert into w (v) values (1)\")\n    t(\"hi\")");
+    let s = Logged::start(&d.join("main.qwe"), &["--max-tool-calls", "100000"], &[]);
+    let mut door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
+    assert_eq!(text_of(&door.result("greet", json!({}), true, None, None)), (true, "internal error".to_string()));
+    assert_eq!(support::send(s.port, "GET", "/writes", &[], "").body, "1");
+    s.says(UNSEEN_SAID);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The question in a service's own rule, through each way a tool's call reaches it, in one process
+/// and under `--split`: billing's own tool (`service mcp`), `about` in its rule, and billing calling
+/// tax, whose rule asks. Each refused there, the app's call stopped, the reason in the log.
+#[test]
+fn unseen_review_a_services_question_by_every_way_here_and_apart() {
+    let rule = |q: &str| format!("translations({{ en: {{ hi: \"Hi\" }}, fr: {{ hi: \"Salut\" }} }})\nlocale_from((request) => {} ? \"fr\" : \"en\")\n", q);
+    for apart in [false, true] {
+        let d = dir(&format!("unseen-ways-{}", apart), "service mcp /billing = \"billing.qwe\"\nroute POST /login ? { user: str } = set_session({ user: user })\n\n/// Greets through billing, which asks tax.\nfn mcp relayed() -> str with http = billing.relay()\n\n/// Greets in billing's words, with about.\nfn mcp picked() -> str with http = billing.picked()\n");
+        std::fs::write(d.join("billing.qwe"), format!("{}service tax = \"tax.qwe\"\n\n/// Billing's own greeting.\nfn mcp hello() -> str with db = t(\"hi\")\n\nserver fn relay() -> str = tax.greet()\nserver fn picked() -> str = t(\"hi\")\n", rule(r#"about("Which?", { fr: "French", en: "English" }, "fr") == "fr""#))).unwrap();
+        std::fs::write(d.join("tax.qwe"), format!("{}server fn greet() -> str = t(\"hi\")\n", rule(r#"confirm("In French?")"#))).unwrap();
+        let s = Logged::start(&d.join("main.qwe"), if apart { &["--split", "--max-tool-calls", "100000"] } else { &["--max-tool-calls", "100000"] }, &[]);
+        let mut door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
+        for tool in ["billing.hello", "picked", "relayed"] {
+            let r = door.result(tool, json!({}), true, None, None);
+            assert_eq!(text_of(&r), (true, "internal error".to_string()), "apart {}: {}: {}", apart, tool, r);
+        }
+        s.says(UNSEEN_SAID);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// What a service is sent from a tool's call with no asking: a list of arguments, as any call, and
+/// an id that says so (`u`), so that a service of a Quillo before tools, which takes no object for
+/// a body, runs it as before. Before, it was sent an object and refused it (400).
+#[test]
+fn unseen_review_an_older_service_is_sent_a_call_it_takes() {
+    f_signing();
+    let stub = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = stub.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let keep = seen.clone();
+    std::thread::spawn(move || {
+        for conn in stub.incoming().flatten().take(4) {
+            let mut c = conn;
+            c.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut buf = vec![0u8; 65536];
+            let mut got = Vec::new();
+            while let Ok(n) = std::io::Read::read(&mut c, &mut buf) {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&got).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let len = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                    if body.len() >= len {
+                        break;
+                    }
+                }
+            }
+            keep.lock().unwrap().push(String::from_utf8_lossy(&got).to_string());
+            let _ = std::io::Write::write_all(&mut c, b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+        }
+    });
+    let d = dir("unseen-older", "service billing = \"billing.qwe\" { retries: 0, timeout: \"2s\" }\n\n/// Billing's total.\nfn mcp total() -> str with http = str(billing.total())\n");
+    std::fs::write(d.join("billing.qwe"), "server fn total() -> int = 3\n").unwrap();
+    let mut door = EDoor::Stdio(Stdio::start_env(&d, &["main.qwe"], &[("QUILLO_SERVICE_BILLING", &format!("http://127.0.0.1:{}", port))]));
+    let _ = door.result("total", json!({}), true, None, None);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while seen.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "billing was never called");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let req = seen.lock().unwrap()[0].clone();
+    let (head, body) = req.split_once("\r\n\r\n").unwrap();
+    assert_eq!(body, "[]", "{}", req);
+    let call = head.lines().find_map(|l| l.strip_prefix("x-quillo-call: ").or_else(|| l.strip_prefix("X-Quillo-Call: "))).unwrap_or_else(|| panic!("{}", head));
+    assert!(call.starts_with('u') && call.len() == 16 && call.bytes().all(|b| b.is_ascii_alphanumeric()), "{}", call);
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -10887,4 +11023,20 @@ fn e_coverage_review_a_way_that_leaves_changes_nothing_after_it() {
     assert_eq!(text_of(&io.result("archive", json!({ "id": 0 }), true, None, None)), (false, "false".to_string()));
     let _ = std::fs::remove_dir_all(&d);
     let _ = std::fs::remove_dir_all(&d2);
+}
+
+/// The door works out the tenant before the tool runs: a question in the `tenant_from` rule is
+/// part of the call, refused, and the request with it (500, the reason logged). Before, it was
+/// answered as outside any tool's call, `confirm` true. A page's request is outside: true.
+#[test]
+fn unseen_review_a_question_in_the_tenant_rule_refuses_the_doors_request() {
+    let d = dir("unseen-tenant", "db.open(\":memory:\")\ntenant_from((request) => confirm(\"Tenant a?\") ? \"a\" : null)\nroute POST /login ? { user: str } = set_session({ user: user })\nroute GET /which = str(tenant())\n\n/// The tenant.\nfn mcp which() -> str with time = str(tenant())\n");
+    let s = Logged::start(&d.join("main.qwe"), &["--max-tool-calls", "100000"], &[]);
+    let mut door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
+    let (status, a) = door.send(&e_call("t1", "which", json!({}), &caps(true), None, None), "which");
+    assert_eq!((status, a["error"]["code"].clone()), (500, json!(-32603)), "{}", a);
+    s.says(UNSEEN_SAID);
+    assert_eq!(support::send(s.port, "GET", "/which", &[], "").body, "a");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
 }
