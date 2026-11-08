@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- A panic inside a transaction rolls it back and frees the connection on every database; on
+  SQLite it had left the savepoint open, so later writes went uncommitted (FEEDBACK56.md, found
+  in review).
 - `fn mcp name(...)` and `server fn mcp name(...)` declare tools for AI clients, and
   `service mcp /path = "file.qwe"` a service whose tools are the program's. `quillo check` holds
   them to MCP's names and to data answers, and warns of a tool with no `///`, an untyped
@@ -10,7 +13,7 @@
   Q-853).
 - A tool's arguments and result are written as JSON Schema 2020-12, with `readOnlyHint` and
   `openWorldHint` said only when Quillo can see they are true. "Only reads" is worked out
-  from the program and enforced: such a tool runs in a read-only transaction on SQLite,
+  from the program and enforced: such a tool that may reach the database runs in a read-only transaction on SQLite,
   PostgreSQL and MySQL, and `db.error_kind` gives `"read_only"` for a write it refused. A
   result that is not an object is held as `result`, as MCP's earlier clients require
   (FEEDBACK56.md, Q-858).

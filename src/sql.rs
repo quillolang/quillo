@@ -1652,6 +1652,62 @@ impl Scan {
     }
 }
 
+/// The functions SQLite, PostgreSQL and MySQL/MariaDB ship that compute and change nothing, nor
+/// reach anywhere: aggregates and window functions, text, numbers, dates, JSON, the conditional
+/// ones, and the words a reading takes for one before a `(`. A call of any other (`sync()`,
+/// `pg_notify(...)`, `dblink(...)`, an extension's, the program's own) may write, on a connection
+/// of its own too, or reach outside: what the MCP door says of a tool counts it so
+/// (`foreign_call`; FEEDBACK56.md, Q-858, found in review; branch feedback56).
+pub const SHIPPED_FNS: &[&str] = &[
+    // Aggregates and windows.
+    "count", "sum", "avg", "min", "max", "total", "group_concat", "string_agg", "array_agg", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg",
+    "json_group_array", "json_group_object", "json_arrayagg", "json_objectagg", "bool_and", "bool_or", "every", "bit_and", "bit_or", "bit_xor", "stddev",
+    "stddev_pop", "stddev_samp", "variance", "var_pop", "var_samp", "median", "percentile_cont", "percentile_disc", "mode", "row_number", "rank",
+    "dense_rank", "percent_rank", "cume_dist", "ntile", "lag", "lead", "first_value", "last_value", "nth_value",
+    // Text.
+    "lower", "upper", "lcase", "ucase", "length", "char_length", "character_length", "octet_length", "bit_length", "substr", "substring", "mid", "trim",
+    "ltrim", "rtrim", "btrim", "replace", "concat", "concat_ws", "instr", "locate", "position", "strpos", "left", "right", "lpad", "rpad", "reverse", "repeat",
+    "split_part", "format", "printf", "quote", "quote_ident", "quote_literal", "hex", "unhex", "initcap", "translate", "regexp_replace", "regexp_match",
+    "regexp_matches", "regexp_like", "regexp_substr", "regexp_instr", "regexp_split_to_array", "string_to_array", "array_to_string", "ascii", "chr", "char",
+    "unicode", "soundex", "space", "insert", "field", "find_in_set", "elt", "md5", "sha1", "sha2", "encode", "decode", "to_hex", "starts_with", "glob",
+    // Numbers.
+    "abs", "round", "ceil", "ceiling", "floor", "trunc", "truncate", "mod", "power", "pow", "sqrt", "cbrt", "exp", "ln", "log", "log2", "log10", "sign",
+    "pi", "degrees", "radians", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "cot", "random", "rand", "greatest", "least", "div", "width_bucket",
+    // Dates.
+    "date", "time", "datetime", "julianday", "strftime", "unixepoch", "timediff", "now", "date_trunc", "date_part", "extract", "age", "to_char", "to_date",
+    "to_timestamp", "to_number", "make_date", "make_time", "make_timestamp", "make_interval", "date_add", "date_sub", "adddate", "subdate", "datediff",
+    "timestampdiff", "timestampadd", "curdate", "curtime", "sysdate", "clock_timestamp", "statement_timestamp", "transaction_timestamp", "timeofday",
+    "timezone", "date_format", "str_to_date", "from_unixtime", "unix_timestamp", "year", "month", "day", "dayofmonth", "dayofweek", "dayofyear", "hour",
+    "minute", "second", "week", "weekday", "quarter", "last_day", "isfinite", "justify_days", "justify_hours", "convert_tz",
+    // JSON and arrays.
+    "json", "jsonb", "json_extract", "json_object", "json_array", "json_type", "json_valid", "json_each", "json_tree", "json_quote", "json_insert",
+    "json_replace", "json_set", "json_remove", "json_patch", "json_array_length", "json_build_object", "json_build_array", "jsonb_build_object",
+    "jsonb_build_array", "to_json", "to_jsonb", "row_to_json", "array_to_json", "jsonb_set", "jsonb_insert", "jsonb_extract_path", "jsonb_extract_path_text",
+    "json_extract_path", "json_extract_path_text", "jsonb_array_elements", "json_array_elements", "jsonb_array_elements_text", "json_array_elements_text",
+    "jsonb_array_length", "jsonb_each", "jsonb_each_text", "json_each_text", "jsonb_object_keys", "json_object_keys", "jsonb_typeof", "json_typeof",
+    "jsonb_strip_nulls", "json_strip_nulls", "jsonb_pretty", "jsonb_path_query", "jsonb_path_exists", "json_unquote", "json_contains", "json_keys",
+    "json_length", "json_search", "json_merge_patch", "json_value", "json_query", "json_table", "unnest", "array_length", "cardinality", "array_position",
+    "array_append", "array_prepend", "array_cat", "array_remove", "generate_series",
+    // Conditionals, types and the rest that only compute.
+    "coalesce", "nullif", "ifnull", "iif", "if", "nvl", "typeof", "pg_typeof", "zeroblob", "randomblob", "gen_random_uuid", "uuid", "likelihood", "unlikely",
+    "likely", "convert", "binary", "collate",
+    // Words a reading takes for a call before a `(`.
+    "having", "limit", "offset", "distinct", "union", "intersect", "except", "fetch", "nulls", "only", "interval", "timestamp", "numeric", "decimal", "varchar",
+];
+
+/// The first function a statement calls that its databases do not ship as one that only
+/// computes (`SHIPPED_FNS`), as PostgreSQL and MySQL read it, in lower case.
+pub fn foreign_call(sql: &str) -> Option<String> {
+    [Dialect::Postgres, Dialect::Mysql].iter().find_map(|d| {
+        scan(*d, sql)
+            .calls
+            .iter()
+            .map(|c| c.to_ascii_lowercase())
+            .map(|c| c.strip_prefix("pg_catalog.").map(str::to_string).unwrap_or(c))
+            .find(|c| !SHIPPED_FNS.contains(&c.as_str()))
+    })
+}
+
 /// A statement's first word when it reads rows and changes none.
 pub fn reading_word(w: &str) -> bool {
     ["select", "values", "table", "show"].iter().any(|x| w.eq_ignore_ascii_case(x))

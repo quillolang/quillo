@@ -42,10 +42,11 @@ pub struct Tool {
     /// (B.3). `destructiveHint` and `idempotentHint` are left to the defaults: nothing in Quillo
     /// says whether a write destroys, and a call sent again is a second call.
     pub annotations: Map<String, J>,
-    /// Said to only read (`readOnlyHint`), and its `with` names `db` or it has none: the door
-    /// runs it in a read-only transaction (`call`) where the program has a database, so a
-    /// statement or a call the checker misjudged is refused by the database (Q-858, found in
-    /// review).
+    /// Said to only read (`readOnlyHint`), and it may reach the database: its `with` names `db`,
+    /// or it has none and its code was seen to call `db`. The door runs it, its arguments made
+    /// too, in a read-only transaction (`call`), so a statement or a call the checker misjudged
+    /// is refused by the database. A tool that reaches no database runs with none, so it works
+    /// with no tenant and no database to be had (Q-858, found in review).
     pub reads_only: bool,
     /// Its result is not an object, so `outputSchema` and `structuredContent` hold it as
     /// `{ "result": ... }` (`structured`; found in review).
@@ -55,12 +56,13 @@ pub struct Tool {
 
 impl Tool {
     /// A result as `structuredContent`: the value, or `{ "result": value }` where it is not an
-    /// object, as `outputSchema` says (found in review).
-    pub fn structured(&self, value: J) -> J {
-        if self.wrapped {
-            json!({ "result": value })
-        } else {
-            value
+    /// object, as `outputSchema` says. None for a tool with no result type, whose answer is sent
+    /// as text alone, and never a bare value that is not an object (found in review).
+    pub fn structured(&self, value: J) -> Option<J> {
+        match (&self.output_schema, self.wrapped) {
+            (None, _) => None,
+            (Some(_), true) => Some(json!({ "result": value })),
+            (Some(_), false) => value.is_object().then_some(value),
         }
     }
 
@@ -171,9 +173,10 @@ fn tool(f: &ToolFacts, types: &HashMap<String, Types>) -> Tool {
         input_schema,
         output_schema,
         annotations,
-        // Whatever the walk found it to reach: a call it misjudged is what the transaction is
-        // for. A `with` without `db` is held at run time (found in review).
-        reads_only: read_only && declared.map_or(true, |m| m & effect_bit("db") != 0),
+        // A `with` that names `db` may reach it whatever the walk found: a call it misjudged is
+        // what the transaction is for. One without `db` is held at run time; none, as the walk
+        // saw it (found in review).
+        reads_only: read_only && declared.map_or(f.db, |m| m & effect_bit("db") != 0),
         wrapped,
         def: d.clone(),
     }
@@ -210,27 +213,41 @@ fn hints(declared: Option<u8>, f: &ToolFacts) -> (bool, bool) {
 }
 
 /// Calls the tool as the door does, with its arguments in order as they came: each made to its
-/// type (`server::take_args`, which runs a record's defaults), then the call, both in a
-/// read-only transaction for a tool said to only read where the program has a database (Q-858).
-/// `Ok(Err(why))` is an argument refused, with the door's message; an error value in `Ok(Ok(..))`
-/// is the tool's own error.
+/// type (`server::make_args`, which runs a record's defaults) under the tool's `with`, as its
+/// body is, then the call, both in the read-only transaction of a tool said to only read that may
+/// reach the database (`Tool::reads_only`; Q-858). `Ok(Err(why))` is an argument refused, with
+/// the door's message; an error value in `Ok(Ok(..))` is the tool's own error; a default that
+/// fails, an effect its `with` does not allow among them, fails the call as the body would.
 pub fn call(it: &mut Interp, tool: &Tool, args: Vec<Value>, line: u32) -> Result<Result<Value, String>, Ctrl> {
     let f = match crate::value::lookup(&it.globals, tool.name.as_str()) {
         Some(f @ Value::Func(_)) => f,
         _ => return crate::interp::fail(line, format!("the program has no tool `{}`", tool.name)),
     };
     let def = tool.def.clone();
-    let with_db = def.effects.as_deref().is_some_and(|e| effect_mask(e) & effect_bit("db") != 0);
     let mut refused = None;
     let mut args = Some(args);
-    let mut run = |it: &mut Interp| match crate::server::take_args(it, &def, args.take().unwrap_or_default()) {
-        Ok(made) => it.call(&f, made, line),
-        Err(why) => {
-            refused = Some(why);
-            Ok(Value::Nil)
+    let mut run = |it: &mut Interp| {
+        // What the `with` allows, as the call narrows it (`Interp::call_def`), while the
+        // arguments are made (found in review).
+        let narrowed = def.effects.as_deref().map(|e| {
+            let mask = effect_mask(e) & it.allowed;
+            (std::mem::replace(&mut it.allowed, mask), std::mem::replace(&mut it.restrictor, Some(def.clone())))
+        });
+        let made = crate::server::make_args(it, &def, args.take().unwrap_or_default());
+        if let Some((allowed, who)) = narrowed {
+            it.allowed = allowed;
+            it.restrictor = who;
+        }
+        match made {
+            Ok(Ok(made)) => it.call(&f, made, line),
+            Ok(Err(why)) => {
+                refused = Some(why);
+                Ok(Value::Nil)
+            }
+            Err((_, failed)) => Err(failed),
         }
     };
-    let answer = if tool.reads_only && (with_db || crate::db::has_database(it)) { reading_only(it, line, &mut run)? } else { run(it)? };
+    let answer = if tool.reads_only { reading_only(it, line, &mut run)? } else { run(it)? };
     Ok(match refused {
         Some(why) => Err(why),
         None => Ok(answer),

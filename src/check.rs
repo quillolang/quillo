@@ -156,6 +156,7 @@ thread_local! {
 
 /// What the walk of a tool's code is to read next: a function, or a type whose records' defaults
 /// run when one is made (FEEDBACK56.md, Q-858, found in review; branch feedback56).
+#[derive(Clone)]
 enum Next {
     Fn(Arc<FnDef>),
     Type(String),
@@ -1443,6 +1444,9 @@ pub struct Analysis {
     /// tool calling one is said to stay inside the program only when it does (FEEDBACK56.md,
     /// Q-853, B.3, found in review; branch feedback56).
     pub server_fns: Vec<ToolFacts>,
+    /// How many functions' and records' code the walk of what tools do read, each once, the
+    /// services' a tool calls included: what it costs (found in review).
+    pub walked: usize,
 }
 
 /// What a tool's code was found to do: the code it runs, which is its body and its parameters'
@@ -1463,9 +1467,43 @@ pub struct ToolFacts {
     /// program, a builtin that changes what the server keeps (a session, a cookie, a tenant,
     /// what pages watch, the program's settings), or the program's variable assigned.
     pub writes: Option<String>,
-    /// A request that goes outside the program: `http.*`, a `site`'s functions, the net effect.
-    /// A call of one of the program's own services is not one.
+    /// A request that goes outside the program: `http.*`, a `site`'s functions, the net effect,
+    /// another database (`db.connect`), a function a statement calls that its database does not
+    /// ship. A call of one of the program's own services is not one when its code stays inside.
     pub open: Option<String>,
+    /// It calls `db`: the database may be reached, and a tool that only reads is run in a
+    /// read-only transaction (FEEDBACK56.md, Q-858, found in review; branch feedback56).
+    pub db: bool,
+}
+
+/// What some code was found to do (`ToolFacts`' findings, without whose they are).
+#[derive(Debug, Clone, Default)]
+struct Seen {
+    effects: u8,
+    uncertain: Option<String>,
+    writes: Option<String>,
+    open: Option<String>,
+    db: bool,
+}
+
+impl Seen {
+    /// What `o` found too, the first reason of each kind kept.
+    fn join(&mut self, o: &Seen) {
+        self.effects |= o.effects;
+        self.db |= o.db;
+        for (mine, theirs) in [(&mut self.uncertain, &o.uncertain), (&mut self.writes, &o.writes), (&mut self.open, &o.open)] {
+            if mine.is_none() {
+                mine.clone_from(theirs);
+            }
+        }
+    }
+}
+
+/// One function's own code, or one record's defaults, as read once a check: what it was found to
+/// do, and what it names, to read next (FEEDBACK56.md, Q-858, found in review; branch feedback56).
+struct Reached {
+    seen: Seen,
+    next: Vec<Next>,
 }
 
 /// A name a file uses from another, which it does not `use` (branch feedback19-fixes).
@@ -1848,9 +1886,17 @@ struct Checker {
     services: HashMap<String, HashMap<String, Arc<Sig>>>,
     /// Services whose file is not here: their calls are taken as they are written.
     services_elsewhere: HashSet<String>,
-    /// Of the services' functions, by service and name, whether one stays inside the program,
-    /// its code read (FEEDBACK56.md, Q-853, B.3, found in review; branch feedback56).
-    service_closed: HashMap<(String, String), bool>,
+    /// The services' files, by name, where they are here to read.
+    service_files: HashMap<String, PathBuf>,
+    /// Of each service a tool calls, read once when one does: whether each of its functions stays
+    /// inside the program; None where its code could not be read (FEEDBACK56.md, Q-853, B.3,
+    /// found in review; branch feedback56).
+    service_closed: std::cell::RefCell<HashMap<String, Option<HashMap<String, bool>>>>,
+    /// What each function's own code and each record's defaults were found to do, read once a
+    /// check however many tools reach them, and how many were read (found in review).
+    reached_fns: std::cell::RefCell<HashMap<usize, Arc<Reached>>>,
+    reached_types: std::cell::RefCell<HashMap<String, Arc<Reached>>>,
+    walked: std::cell::Cell<usize>,
     /// The parameters' types of the lambda about to be checked, from the
     /// list a builtin gives it: `xs | map((x) => ...)`.
     hint: Option<Vec<T>>,
@@ -2001,7 +2047,11 @@ impl Checker {
             live_ok: false,
             services: HashMap::new(),
             services_elsewhere: HashSet::new(),
-            service_closed: HashMap::new(),
+            service_files: HashMap::new(),
+            service_closed: Default::default(),
+            reached_fns: Default::default(),
+            reached_types: Default::default(),
+            walked: Default::default(),
             hint: None,
             strict_null: false,
             letting: Vec::new(),
@@ -2217,18 +2267,11 @@ impl Checker {
                         // A program of its own: checked alone (once, as services may use each other).
                         let key = full.canonicalize().unwrap_or_else(|_| full.clone());
                         let first = SERVICE_CHECKS.with(|c| c.borrow_mut().insert(key.clone()));
+                        // Read again only when a tool calls it (`service_stays_inside`).
+                        self.service_files.insert(name.clone(), full.clone());
                         if first {
-                            let asked = SERVER_FN_FACTS.with(|f| f.replace(true));
                             let sub = check_file_opts(&full, HashMap::new(), self.options());
-                            SERVER_FN_FACTS.with(|f| f.set(asked));
                             SERVICE_CHECKS.with(|c| c.borrow_mut().remove(&key));
-                            // Which of its functions stay inside the program, as far as its own
-                            // code is read (FEEDBACK56.md, Q-853, B.3, found in review; branch
-                            // feedback56).
-                            for f in &sub.server_fns {
-                                let closed = f.uncertain.is_none() && f.open.is_none() && f.effects & crate::ast::effect_bit("net") == 0;
-                                self.service_closed.insert((name.clone(), f.def.name.clone()), closed);
-                            }
                             self.out.diagnostics.extend(sub.diagnostics);
                             if let Some(prefix) = prefix {
                                 self.out.symbols.extend(sub.symbols.into_iter().filter(|s| s.kind == SymbolKind::Route).map(|mut s| {
@@ -2731,43 +2774,67 @@ impl Checker {
                 }
             }
         }
+        self.out.walked = self.walked.get();
     }
 
     // ---- what a tool does (FEEDBACK56.md, Q-858 and B.3; branch feedback56) --------------
 
     /// What a tool's code does: each function it names is read once, however many times and
     /// however deep it is reached, a recursive one too, and the defaults of each record it takes,
-    /// gives or makes, which run as one is made, the door's arguments too (found in review).
+    /// gives or makes, which run as one is made, the door's arguments too. What each one's own
+    /// code does is kept for the check, so a function many tools reach is read once (found in
+    /// review).
     fn tool_facts(&self, d: &Arc<FnDef>, file: &Arc<str>, top_lets: &HashSet<String>) -> ToolFacts {
-        let mut r = ToolFacts { def: d.clone(), file: file.to_string(), effects: 0, uncertain: None, writes: None, open: None };
+        let mut r = Seen::default();
         let mut todo = vec![Next::Fn(d.clone())];
         let (mut seen, mut types) = (HashSet::new(), HashSet::new());
         while let Some(next) = todo.pop() {
-            match next {
-                Next::Fn(f) => {
-                    if seen.insert(def_key(&f)) {
-                        self.reach_def(&f, top_lets, &mut r, &mut todo);
-                    }
-                }
-                Next::Type(n) => {
-                    if !types.insert(n.clone()) {
-                        continue;
-                    }
-                    let Some(td) = record(&n) else { continue };
-                    let mut names = Vec::new();
-                    ty_names(&td.ty, &mut names);
-                    todo.extend(names.into_iter().map(Next::Type));
-                    let defaults: Vec<&Expr> = td.defaults.iter().map(|(_, e)| e).collect();
-                    self.reach_code(&defaults, top_lets, &mut r, &mut todo);
-                }
-            }
+            let local = match next {
+                Next::Fn(f) if seen.insert(def_key(&f)) => self.local_fn(&f, top_lets),
+                Next::Type(n) if types.insert(n.clone()) => self.local_type(&n, top_lets),
+                _ => continue,
+            };
+            r.join(&local.seen);
+            todo.extend(local.next.iter().cloned());
         }
-        r
+        ToolFacts { def: d.clone(), file: file.to_string(), effects: r.effects, uncertain: r.uncertain, writes: r.writes, open: r.open, db: r.db }
+    }
+
+    /// One function's own code, read once a check.
+    fn local_fn(&self, f: &Arc<FnDef>, top_lets: &HashSet<String>) -> Arc<Reached> {
+        if let Some(l) = self.reached_fns.borrow().get(&def_key(f)) {
+            return l.clone();
+        }
+        let (mut seen, mut next) = (Seen::default(), Vec::new());
+        self.reach_def(f, top_lets, &mut seen, &mut next);
+        self.walked.set(self.walked.get() + 1);
+        let l = Arc::new(Reached { seen, next });
+        self.reached_fns.borrow_mut().insert(def_key(f), l.clone());
+        l
+    }
+
+    /// One type: a record's defaults, and the types its fields name; read once a check.
+    fn local_type(&self, n: &str, top_lets: &HashSet<String>) -> Arc<Reached> {
+        if let Some(l) = self.reached_types.borrow().get(n) {
+            return l.clone();
+        }
+        let (mut seen, mut next) = (Seen::default(), Vec::new());
+        if let Some(td) = record(n) {
+            let mut names = Vec::new();
+            ty_names(&td.ty, &mut names);
+            next.extend(names.into_iter().map(Next::Type));
+            let defaults: Vec<&Expr> = td.defaults.iter().map(|(_, e)| e).collect();
+            self.reach_code(&defaults, top_lets, &mut seen, &mut next);
+            self.walked.set(self.walked.get() + 1);
+        }
+        let l = Arc::new(Reached { seen, next });
+        self.reached_types.borrow_mut().insert(n.to_string(), l.clone());
+        l
     }
 
     /// One function: the types of its parameters and its result, which a call makes, and its
     /// code.
-    fn reach_def(&self, d: &FnDef, top_lets: &HashSet<String>, r: &mut ToolFacts, todo: &mut Vec<Next>) {
+    fn reach_def(&self, d: &FnDef, top_lets: &HashSet<String>, r: &mut Seen, todo: &mut Vec<Next>) {
         let mut names = Vec::new();
         d.params.iter().filter_map(|p| p.ty.as_ref()).chain(d.ret.iter()).for_each(|t| ty_names(t, &mut names));
         todo.extend(names.into_iter().map(Next::Type));
@@ -2777,7 +2844,7 @@ impl Checker {
 
     /// Code: what it calls and names, the program's variables it assigns, the types its lambdas
     /// and patterns make.
-    fn reach_code(&self, code: &[&Expr], top_lets: &HashSet<String>, r: &mut ToolFacts, todo: &mut Vec<Next>) {
+    fn reach_code(&self, code: &[&Expr], top_lets: &HashSet<String>, r: &mut Seen, todo: &mut Vec<Next>) {
         // Its own `fn`s inside it: a call of one is a call of code read here. One named as a
         // function of the program's is taken for that one too (found in review).
         let mut local_fns = HashSet::new();
@@ -2867,7 +2934,7 @@ impl Checker {
     /// A call: of a name, of a module's function, of a service or a site, a method, or a
     /// lambda written there; anything else gives a function the checker cannot see.
     #[allow(clippy::too_many_arguments)]
-    fn reach_call(&self, callee: &Expr, first: Option<&Expr>, local_fns: &HashSet<String>, called: &mut HashSet<*const Expr>, r: &mut ToolFacts, todo: &mut Vec<Next>) {
+    fn reach_call(&self, callee: &Expr, first: Option<&Expr>, local_fns: &HashSet<String>, called: &mut HashSet<*const Expr>, r: &mut Seen, todo: &mut Vec<Next>) {
         let http = crate::ast::effect_bit("http");
         // A callee named is not a value read; a call that gives the function is read as a call.
         if matches!(callee, Expr::Ident(..) | Expr::Field(..)) {
@@ -2914,16 +2981,42 @@ impl Checker {
 
     /// A call of the service `s`'s `f`: outside the program unless its code was read and stays
     /// inside (FEEDBACK56.md, Q-853, B.3, found in review; branch feedback56).
-    fn reach_service(&self, s: &str, f: &str, r: &mut ToolFacts) {
-        if !self.service_closed.get(&(s.to_string(), f.to_string())).copied().unwrap_or(false) {
+    fn reach_service(&self, s: &str, f: &str, r: &mut Seen) {
+        if !self.service_stays_inside(s, f) {
             note(&mut r.open, format!("calls `{}.{}`, whose code reaches outside the program or is not read here", s, f));
         }
+    }
+
+    /// Whether the service `s`'s function `f` stays inside the program: the service read as a
+    /// program of its own, its server fns walked, once, when a tool first calls it, not for every
+    /// program that has services (found in review).
+    fn service_stays_inside(&self, s: &str, f: &str) -> bool {
+        if let Some(read) = self.service_closed.borrow().get(s) {
+            return read.as_ref().and_then(|m| m.get(f)).copied().unwrap_or(false);
+        }
+        let read = self.service_files.get(s).and_then(|full| {
+            let key = full.canonicalize().unwrap_or_else(|_| full.clone());
+            // One being read up the stack, calling back: not read again.
+            if !SERVICE_CHECKS.with(|c| c.borrow_mut().insert(key.clone())) {
+                return None;
+            }
+            let asked = SERVER_FN_FACTS.with(|x| x.replace(true));
+            let sub = check_file_opts(full, HashMap::new(), self.options());
+            SERVER_FN_FACTS.with(|x| x.set(asked));
+            SERVICE_CHECKS.with(|c| c.borrow_mut().remove(&key));
+            self.walked.set(self.walked.get() + sub.walked);
+            let net = crate::ast::effect_bit("net");
+            Some(sub.server_fns.iter().map(|x| (x.def.name.clone(), x.uncertain.is_none() && x.open.is_none() && x.effects & net == 0)).collect::<HashMap<_, _>>())
+        });
+        let inside = read.as_ref().and_then(|m| m.get(f)).copied().unwrap_or(false);
+        self.service_closed.borrow_mut().insert(s.to_string(), read);
+        inside
     }
 
     /// A name called (`called`) or read as a value: the program's function is read too, a
     /// builtin's effects taken, and a variable that may hold a function makes the rest unseen.
     #[allow(clippy::too_many_arguments)]
-    fn reach_name(&self, n: &str, first: Option<&Expr>, called: bool, local_fns: &HashSet<String>, r: &mut ToolFacts, todo: &mut Vec<Next>) {
+    fn reach_name(&self, n: &str, first: Option<&Expr>, called: bool, local_fns: &HashSet<String>, r: &mut Seen, todo: &mut Vec<Next>) {
         // A local `fn` is read where it is written; the program's of that name is read too, as
         // the local one may be in another block (found in review).
         if local_fns.contains(n) && !self.globals.contains_key(n) {
@@ -2959,17 +3052,32 @@ impl Checker {
     /// A builtin reached: called with `first` as its first argument, or given as a value. What
     /// changes something is what the view cache says acts (`viewcache::kind`), one list for
     /// every builtin there is, a random number apart (found in review).
-    fn reach_builtin(&self, name: &str, first: Option<&Expr>, called: bool, r: &mut ToolFacts) {
+    fn reach_builtin(&self, name: &str, first: Option<&Expr>, called: bool, r: &mut Seen) {
         let effect = builtin_effect(name);
         r.effects |= effect;
         let acts = crate::viewcache::kind(name) == crate::viewcache::Kind::Acts && effect != crate::ast::effect_bit("random");
+        // It reaches the database (found in review).
+        if (name.starts_with("db.") && !matches!(name, "db.error_kind" | "db.sql_name")) || matches!(name, "idempotent" | "later.status" | "with_tenant" | "new_tenant") {
+            r.db = true;
+        }
+        // Another database is another place (found in review).
+        if matches!(name, "db.connect" | "db.shards") {
+            note(&mut r.open, format!("`{}` reaches another database", name));
+        }
         match name {
             "js" | "js_new" | "run_script" => note(&mut r.uncertain, format!("`{}` runs code the checker cannot read", name)),
             // A `select` written in the program reads, as every database reads it; a statement
-            // built as the program runs, or given elsewhere, may write.
+            // built as the program runs, or given elsewhere, may write. One that calls a function
+            // its database does not ship may write too, and reach outside (found in review).
             "db.query" | "db.one" => match first.filter(|_| called).map(sql_written) {
-                Some(Some(sql)) if reads_written(&sql) => {}
-                Some(Some(sql)) => note(&mut r.writes, format!("`{}(\"{}\")` is not a `select` that only reads", name, sql.trim())),
+                Some(Some(sql)) if !reads_written(&sql) => note(&mut r.writes, format!("`{}(\"{}\")` is not a `select` that only reads", name, sql.trim())),
+                Some(Some(sql)) => {
+                    if let Some(f) = crate::sql::foreign_call(&sql) {
+                        let why = format!("`{}(\"{}\")` calls `{}`, which its database does not ship as a function that only computes", name, sql.trim(), f);
+                        note(&mut r.writes, why.clone());
+                        note(&mut r.open, why);
+                    }
+                }
                 _ => note(&mut r.writes, format!("`{}` of a statement not written in the program", name)),
             },
             "db.error_kind" | "db.sql_name" => {}
@@ -7667,14 +7775,11 @@ fn sql_written(e: &Expr) -> Option<String> {
 /// it (`sql::Scan::reads_only`): no `for update`, `into`, `nextval(...)` or other function of the
 /// database's that writes. A `with` before it counts as a write (FEEDBACK56.md, Q-858; branch
 /// feedback56).
-/// PostgreSQL's `dblink(...)` and its kin run SQL over a connection of their own, outside the
-/// transaction: a write (found in review).
+/// The functions it calls are looked at apart (`sql::foreign_call`).
 fn reads_written(sql: &str) -> bool {
     crate::sql::Dialect::ALL.iter().all(|d| {
         let scan = crate::sql::scan(*d, sql);
-        scan.reads_only()
-            && scan.first_words().is_some_and(|(w, _)| w.eq_ignore_ascii_case("select"))
-            && !scan.calls.iter().any(|c| c.to_ascii_lowercase().starts_with("dblink"))
+        scan.reads_only() && scan.first_words().is_some_and(|(w, _)| w.eq_ignore_ascii_case("select"))
     })
 }
 

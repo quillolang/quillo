@@ -663,11 +663,6 @@ fn mysql_codes(m: &str) -> Option<(&str, &str)> {
     Some((a, b))
 }
 
-/// Whether the program has a database: opened, or named by `$QUILLO_DB` for the first use to open
-/// (FEEDBACK56.md, Q-858, found in review; branch feedback56).
-pub(crate) fn has_database(it: &Interp) -> bool {
-    slot_on(it, None).is_some() || std::env::var_os("QUILLO_DB").is_some()
-}
 
 fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
     // A new file is its owner's alone, and so its `-wal` and `-shm`, which SQLite makes with
@@ -2866,7 +2861,27 @@ pub(crate) fn attempt(
             let mine = Arc::as_ptr(&b) as usize;
             IN_TX.with(|t| t.borrow_mut().push(mine));
             crate::httpd::hold_in_place(true);
-            let r = caught(it, body);
+            // A panic in the body (a bug of Quillo's, which the server answers 500 and lives on):
+            // what the transaction raised is lowered and what it held rolled back, so the shared
+            // connection is not left in a savepoint every later write lands in, uncommitted, nor
+            // refusing writes (FEEDBACK56.md, Q-858, found in review; branch feedback56).
+            let r = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| caught(it, body))) {
+                Ok(r) => r,
+                Err(panic) => {
+                    crate::httpd::hold_in_place(false);
+                    drop(query_only);
+                    IN_TX.with(|t| {
+                        let mut t = t.borrow_mut();
+                        if let Some(i) = t.iter().rposition(|p| *p == mine) {
+                            t.remove(i);
+                        }
+                    });
+                    it.sqlite_tx -= 1;
+                    let _ = run(if immediate { "rollback" } else { "rollback to quillo_tx; release quillo_tx" });
+                    tx_end(it, mark, false);
+                    std::panic::resume_unwind(panic);
+                }
+            };
             crate::httpd::hold_in_place(false);
             drop(query_only);
             IN_TX.with(|t| {
@@ -2971,7 +2986,32 @@ pub(crate) fn attempt(
             }
             let mark = tx_begin(it);
             let r = match started {
-                Ok(()) => caught(it, body),
+                // A panic in the body: the transaction is rolled back and its connection let go,
+                // not left pinned to this program with a transaction open (FEEDBACK56.md, Q-858,
+                // found in review; branch feedback56).
+                Ok(()) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| caught(it, body))) {
+                    Ok(r) => r,
+                    Err(panic) => {
+                        let end = if depth == 1 { "rollback".to_string() } else { format!("rollback to savepoint quillo_tx_{d}; release savepoint quillo_tx_{d}", d = depth) };
+                        let _ = pooled_run(it, &b, move |c| c.batch(&end));
+                        tx_end(it, mark, false);
+                        let done = {
+                            let mut g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            match g.iter().position(|t| Arc::ptr_eq(&t.backend, &b)) {
+                                Some(i) => {
+                                    g[i].depth -= 1;
+                                    (g[i].depth == 0).then(|| g.remove(i))
+                                }
+                                None => None,
+                            }
+                        };
+                        if let Some(TxConn { conn: Some(mut c), .. }) = done {
+                            c.watch_conflicts(false);
+                            pool.discard(c);
+                        }
+                        std::panic::resume_unwind(panic);
+                    }
+                },
                 Err(e) => Ok(db_err(e)),
             };
             let conflicted = |it: &Interp| {

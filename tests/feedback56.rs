@@ -1456,7 +1456,9 @@ fn b2_each_type_of_the_guide_as_a_parameter_and_a_result() {
         let out = if object { want.clone() } else { json!({ "type": "object", "properties": { "result": want }, "required": ["result"] }) };
         assert_eq!(t.output_schema.as_ref(), Some(&out), "{} as a result", ty);
         assert_eq!(t.wrapped, !object, "{}", ty);
-        assert_eq!(t.structured(json!(1)), if object { json!(1) } else { json!({ "result": 1 }) });
+        // Never a bare value that is not an object.
+        assert_eq!(t.structured(json!(1)), if object { None } else { Some(json!({ "result": 1 })) });
+        assert_eq!(t.structured(json!({ "a": 1 })), Some(if object { json!({ "a": 1 }) } else { json!({ "result": { "a": 1 } }) }));
         assert_eq!(t.description.as_deref(), Some(&*format!("{}.", ty)));
         // Each value that fits is an argument object the door takes; one more key, or none, it
         // does not.
@@ -1485,6 +1487,8 @@ fn b2_parameters_their_defaults_and_none_at_all() {
     assert_eq!(nothing.output_schema, None);
     assert_eq!(nothing.description, None);
     assert!(nothing.to_json().get("description").is_none() && nothing.to_json().get("outputSchema").is_none(), "{}", nothing.to_json());
+    // No result type: its answer goes as text alone, no structured content, an object or not.
+    assert_eq!((nothing.structured(json!(1)), nothing.structured(json!({ "a": 1 })), nothing.structured(json!(null))), (None, None, None));
     // A parameter without a type is any value; one with a default is not required, and its
     // default is said when it is written as a value, not when it is worked out (`now()`).
     let page = the(&tools, "page");
@@ -1555,7 +1559,8 @@ fn b2_records_nested_and_recursive_once_under_defs() {
     };
     assert_eq!(out, json!({ "$ref": "#/$defs/Note", "type": "object", "$defs": { "Note": open(note.clone()), "Tag": open(tag.clone()) } }));
     assert!(!save.wrapped);
-    assert_eq!(save.structured(json!({ "id": 1 })), json!({ "id": 1 }));
+    assert_eq!(save.structured(json!({ "id": 1 })), Some(json!({ "id": 1 })));
+    assert_eq!(save.structured(json!([1])), None);
     refs_local(&out);
     // A record that names itself is a `$ref` to itself, and the walk ends.
     let grow = the(&tools, "grow");
@@ -1695,7 +1700,10 @@ let handlers = { go: () => 1 }\n\
 /// pl\nfn mcp pays_later(n: int) with http = pay.later.charge(n)\n\
 /// fr\nfn mcp fars(n: int) with http = far.charge(n)\n\
 /// nt\nfn mcp native_time() with time = double(2)\n\
-/// np\nfn mcp native_pure() = double(2)\n";
+/// np\nfn mcp native_pure() = double(2)\n\
+/// ko\nfn mcp kinds_only() = db.error_kind(err(\"x\"))\n\
+/// cn\nfn mcp connects() with db = db.connect(\"other.db\")\n\
+/// sy\nfn mcp syncs() -> list with db = db.query(\"select sync()\")\n";
 
 /// A service whose function reaches outside: the app's tool calling it does too.
 const PAY: &str = "server fn charge(n: int) -> int with http {\n    http.get(\"https://payments.example.com\")\n    n\n}\n";
@@ -1730,9 +1738,15 @@ fn b3_the_hints_of_each_with() {
         ("both", Some(true), Some(false), true),
         ("mixed", None, Some(false), false),
         ("all_of", None, None, false),
-        // No `with`, and nothing it does: certain. Run in a read-only transaction where the
-        // program has a database, as nothing holds the database away from it.
-        ("pure", Some(true), Some(false), true),
+        // No `with`, and nothing it does: certain. It reaches no database, so it runs with no
+        // transaction, and works where none can be had.
+        ("pure", Some(true), Some(false), false),
+        ("kinds_only", Some(true), Some(false), false),
+        // Another database is another place.
+        ("connects", None, None, false),
+        // A function its database does not ship, called in a `select`: it may write and reach
+        // anywhere.
+        ("syncs", None, None, false),
         // No `with`, and an effect, or code the checker cannot see: MCP's defaults.
         ("impure", None, None, false),
         ("blind", None, None, false),
@@ -1780,6 +1794,11 @@ fn q858_a_select_written_in_the_program_reads() {
         "db.query(\"-- the newest first\\nselect * from notes order by id desc\")",
         "db.query(\"select * from notes where text = 'insert into x'\")",
         "db.query(\"select 'é ✓ 日本' as t\")",
+        // What each database ships, which only computes.
+        "db.one(\"select count(*) as n, coalesce(max(id), 0) as m from notes\")",
+        "db.query(\"select lower(text), date('now'), now(), json_extract(meta, '$.a') from notes\")",
+        "db.query(\"select cast(id as varchar(10)), round(avg(id), 2), strftime('%Y', at) from notes group by at having count(*) > 1\")",
+        "db.query(\"select * from notes where id in (select id from notes) and exists (select 1)\")",
         // Reads through helpers, one that calls itself, and one given as a value.
         "first(id)",
         "deep(3)",
@@ -1843,7 +1862,13 @@ fn q858_anything_else_counts_as_a_write() {
         // What the view cache says changes something, a builtin no effect names.
         ("media.close(\"cam\")", "`media.close` changes something"),
         // PostgreSQL's dblink writes over a connection of its own, outside the transaction.
-        ("db.query(\"select * from dblink('dbname=x', 'delete from notes') as t(a int)\")", "is not a `select`"),
+        ("db.query(\"select * from dblink('dbname=x', 'delete from notes') as t(a int)\")", "calls `dblink`"),
+        // A function its database does not ship: it may write, on a connection of its own too.
+        ("db.query(\"select sync()\")", "calls `sync`"),
+        // One the reader knows writes is said so.
+        ("db.one(\"select pg_notify('notes', 'x') as n\")", "is not a `select`"),
+        ("db.query(\"select count(*), lower(text), my_audit(id) from notes\")", "calls `my_audit`"),
+        ("db.query(\"select public.archive_old()\")", "calls `"),
         ("db.query(\"select dblink_exec('dbname=x', 'delete from notes')\")", "is not a `select`"),
     ];
     for (body, why) in writes {
@@ -2033,6 +2058,11 @@ fn fails() = unwrap(err(\"no\"))\n\
 type Ticket = { title: str, no: int? = db.one(\"select add_note() as id\").id }\n\
 /// Tickets.\nfn mcp ticket(t: Ticket) with db = t.title\n\
 fn arg() = { title: \"x\" }\n\
+type Stamp = { n: int = db.exec(\"insert into notes (text) values ('stamp')\").changes }\n\
+/// Recent.\nfn mcp recent(q: Stamp) -> int with time = q.n\n\
+type Archive = { n: int = db.one(\"select add_note() as n\").n }\n\
+/// Recent.\nfn mcp recent_db(q: Archive) -> int with time = q.n\n\
+fn empty() = {}\n\
 fn make() = Ticket({ title: \"y\" }).title\n\
 fn kinds() = [\n    db.error_kind(err(\"db: Server error: `ERROR 1062 (23000): Duplicate entry 'x(1792)' for key 'v''\")),\n    db.error_kind(err(\"db: Server error: `ERROR 1792 (25006): Cannot execute statement in a READ ONLY transaction'\")),\n    db.error_kind(err(\"db: no such table: error 1792 (x\")),\n    db.error_kind(err(\"db: attempt to write a readonly database\")),\n]\n";
 
@@ -2045,32 +2075,53 @@ fn read_only_on(it: &mut Interp, tools: &[Tool], misjudged: bool) {
     assert!(notes.reads_only);
     let rows = answer(mcp::call(it, notes, vec![], 0));
     assert_eq!(rows.display(), "[{ text: \"a\" }]");
+    // A record's default that writes, in a tool whose `with` has no `db`: made under that
+    // `with`, it fails as the body would, and writes nothing (found in review).
+    let recent = the(tools, "recent");
+    assert_eq!(hints_of(recent), (None, Some(false)));
+    let empty = ok(it.call(&global(it, "empty"), vec![], 0));
+    let n = count(it);
+    let failed = mcp::call(it, recent, vec![empty.clone()], 0);
+    assert!(matches!(&failed, Err(quillo::interp::Ctrl::Error(e)) if e.msg.contains("needs the db effect, but `recent` is declared `with time`")), "{:?}", shown(failed.map(|_| Q::Nil)).map(|v| v.display()));
+    assert_eq!(count(it), n);
     if misjudged {
+        // A function its database does not ship, in a `select`: no longer taken for a read, nor
+        // for staying inside.
         let sneaky = the(tools, "sneaky");
-        assert!(sneaky.reads_only, "the checker reads `select add_note()` as a read");
-        let r = answer(mcp::call(it, sneaky, vec![], 0));
+        assert!(!sneaky.reads_only);
+        assert_eq!(hints_of(sneaky), (None, None));
+        // Were it misjudged, the transaction refuses its write, as `read_only`.
+        let f = global(it, "sneaky");
+        let r = ok(mcp::reading_only(it, 0, &mut |it| it.call(&f, vec![], 0)));
         assert!(matches!(r, Q::Err(..)), "{}", r.display());
         let kind = global(it, "kind");
         let k = ok(it.call(&kind, vec![r], 0)).display();
         assert!(k.starts_with("[\"read_only\", \"db: "), "{}", k);
-        assert_eq!(count(it), 1);
+        assert_eq!(count(it), n);
         // As a plain call, it writes: the transaction is what refused it.
-        let f = global(it, "sneaky");
         let wrote = ok(it.call(&f, vec![], 0));
         assert!(!matches!(wrote, Q::Err(..)), "{}", wrote.display());
-        assert_eq!(count(it), 2);
+        assert_eq!(count(it), n + 1);
         // A record's default runs as the door makes the argument: inside the transaction, so
-        // the write it was not expected to make is refused there too, and the argument with it.
+        // the write is refused there too, the call with it.
         let ticket = the(tools, "ticket");
-        assert!(ticket.reads_only);
+        assert!(!ticket.reads_only);
+        let mut misjudged_ticket = ticket.clone();
+        misjudged_ticket.reads_only = true;
         let arg = ok(it.call(&global(it, "arg"), vec![], 0));
-        let made = mcp::call(it, ticket, vec![arg], 0);
-        assert!(matches!(made, Ok(Err(_))), "{:?}", made.map(|r| r.map(|v| v.display())).ok());
-        assert_eq!(count(it), 2);
+        let made = mcp::call(it, &misjudged_ticket, vec![arg], 0);
+        assert!(!matches!(made, Ok(Ok(_))), "{:?}", made.ok().map(|r| r.map(|v| v.display())));
+        assert_eq!(count(it), n + 1);
         // Made outside it, the record writes.
         let make = global(it, "make");
         assert_eq!(ok(it.call(&make, vec![], 0)).display(), "y");
-        assert_eq!(count(it), 3);
+        assert_eq!(count(it), n + 2);
+        // The review's own case: a `select` of a function that writes, in a default of a tool
+        // `with time`: neither hint, and the call fails before the write.
+        let recent_db = the(tools, "recent_db");
+        assert_eq!(hints_of(recent_db), (None, None));
+        assert!(mcp::call(it, recent_db, vec![empty], 0).is_err());
+        assert_eq!(count(it), n + 2);
     }
     let before = count(it);
     let write = global(it, "write");
@@ -2150,17 +2201,104 @@ fn query_only() = db.one(\"pragma query_only\").query_only\n\
 fn lock() = db.exec(\"pragma query_only = 1\")\n\
 fn unlock() = db.exec(\"pragma query_only = 0\")\n";
 
+/// A panic in a transaction's body, a read-only one and one of `db.transaction`'s, a nested one
+/// too: what it raised is lowered and what it held rolled back, so a write after it is committed,
+/// as another connection to the database sees (found in review).
+fn panics_on(it: &mut Interp, d: &Path, db: &str) {
+    let seen_elsewhere = |d: &Path| {
+        let mut other = Interp::new(d);
+        other.load_source(&format!("db.open({:?})\nfn count() -> int = db.one(\"select count(*) as n from notes\").n\n", db), "other.qwe").unwrap();
+        count(&mut other)
+    };
+    let write = global(it, "write");
+    let plain = quillo::txn::Options::default();
+    for (what, outer) in [("read-only", true), ("db.transaction's", false), ("nested", false)] {
+        let before = count(it);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let body = &mut |_: &mut Interp| -> Result<Q, quillo::interp::Ctrl> { panic!("a panic in the body, on purpose") };
+            let _ = match (outer, what) {
+                (true, _) => mcp::reading_only(it, 0, body),
+                (false, "nested") => quillo::txn::run(it, None, &plain, 0, &mut |it| quillo::txn::run(it, None, &plain, 0, &mut |_| panic!("a panic in the body, on purpose"))),
+                _ => quillo::txn::run(it, None, &plain, 0, body),
+            };
+        }));
+        assert!(caught.is_err(), "{}", what);
+        assert_eq!(it.sqlite_tx, 0, "{}", what);
+        assert!(!quillo::httpd::held(), "{}", what);
+        assert_eq!(ok(it.call(&write, vec![Q::str("after")], 0)).display(), "wrote", "{}", what);
+        assert_eq!(count(it), before + 1, "{}", what);
+        assert_eq!(seen_elsewhere(d), before + 1, "{}: the write after it is not committed", what);
+    }
+}
+
+#[test]
+fn q858_review_a_tool_that_reaches_no_database_runs_with_none() {
+    // A database per tenant, and no tenant (as over stdio): a tool that reaches no database is
+    // not stopped by one it cannot have; one `with db` is run in the transaction and says why.
+    let d = support::temp_dir("feedback56-q858-tenantless");
+    let src = format!(
+        "db.open({:?})\n/// Adds.\nfn mcp add(a: int, b: int) -> int = a + b\n/// Idle.\nfn mcp idle() with db = 1\n",
+        d.join("t_{tenant}.db").display().to_string()
+    );
+    std::fs::write(d.join("main.qwe"), &src).unwrap();
+    let tools = mcp::of_source(&d.join("main.qwe")).unwrap();
+    let mut it = Interp::new(&d);
+    it.load_file(&d.join("main.qwe")).unwrap();
+    let add = the(&tools, "add");
+    assert!(!add.reads_only);
+    assert_eq!(answer(mcp::call(&mut it, add, vec![Q::Int(1), Q::Int(2)], 0)).display(), "3");
+    let idle = the(&tools, "idle");
+    assert!(idle.reads_only);
+    let r = answer(mcp::call(&mut it, idle, vec![], 0));
+    assert!(matches!(r, Q::Err(..)), "{}", r.display());
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn q858_review_each_function_is_read_once_and_services_only_for_a_tool() {
+    // Thirty tools, each calling the first of thirty helpers that call the next: each function's
+    // code is read once, not once for each tool that reaches it.
+    let mut src = String::new();
+    for i in 0..30 {
+        src.push_str(&format!("fn h{}(x) = {}\n", i, if i == 29 { "x".to_string() } else { format!("h{}(x) + 1", i + 1) }));
+    }
+    for i in 0..30 {
+        src.push_str(&format!("/// T.\nfn mcp t{}(x: int) with time = h0(x)\n", i));
+    }
+    let d = dir("q858-once", &src);
+    let a = quillo::check::check_file(&d.join("main.qwe"));
+    let _ = std::fs::remove_dir_all(&d);
+    assert_eq!(a.tools.len(), 30);
+    assert_eq!(a.walked, 60);
+    // A service is walked only when a tool calls it: not for a program without tools, nor for a
+    // tool that does not call it.
+    let walked = |main: &str| {
+        let d = dir("q858-services", main);
+        std::fs::write(d.join("billing.qwe"), "server fn charge(n: int) -> int = n\nserver fn refund(n: int) -> int = n\n").unwrap();
+        let a = quillo::check::check_file(&d.join("main.qwe"));
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(a.errors().next().is_none(), "{:?}", a.diagnostics);
+        a.walked
+    };
+    assert_eq!(walked("service billing = \"billing.qwe\"\nserver fn pay() with http = billing.charge(1)\n"), 0);
+    assert_eq!(walked("service billing = \"billing.qwe\"\n/// T.\nfn mcp t() with time = 1\n"), 1);
+    assert_eq!(walked("service billing = \"billing.qwe\"\n/// T.\nfn mcp t() with http = billing.charge(1)\n/// U.\nfn mcp u() with http = billing.refund(1)\n"), 4);
+}
+
 #[test]
 fn q858_review_a_panic_puts_sqlite_back_as_it_was() {
     let d = support::temp_dir("feedback56-q858-panic");
     let tools = format!("{}{}", RO_TOOLS, SQLITE_EXTRA);
-    let (mut it, _) = run_on(&d, &d.join("app.db").display().to_string(), &["create table notes (id integer primary key, text text)"], &tools);
+    let db = d.join("app.db").display().to_string();
+    let (mut it, _) = run_on(&d, &db, &["create table notes (id integer primary key, text text)"], &tools);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = mcp::reading_only(&mut it, 0, &mut |_| panic!("a panic in the body, on purpose"));
     }));
     assert!(caught.is_err());
-    // The shared connection is not left refusing every write.
+    // The shared connection is not left refusing every write, nor in a savepoint.
     assert_eq!(ok(it.call(&global(&it, "query_only"), vec![], 0)).display(), "0");
+    panics_on(&mut it, &d, &db);
     drop(it);
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -2185,6 +2323,7 @@ fn q858_the_read_only_transaction_on_postgres() {
         &tools,
     );
     read_only_on(&mut it, &list, true);
+    panics_on(&mut it, &d, &url);
     drop(it);
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -2214,6 +2353,7 @@ fn q858_the_read_only_transaction_on_mariadb() {
     let dup = global(&it, "dup");
     assert_eq!(ok(it.call(&dup, vec![], 0)).display(), "null");
     assert_eq!(ok(it.call(&dup, vec![], 0)).display(), "unique");
+    panics_on(&mut it, &d, &url);
     drop(it);
     let _ = std::fs::remove_dir_all(&d);
 }

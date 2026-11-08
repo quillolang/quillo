@@ -2155,11 +2155,22 @@ fn serve_channels(req: HttpRequest) -> Answer {
 /// A `dec` (a parameter or a record's field) takes a decimal, an int, a
 /// number or numeric text ("12.50"), as a `dec` pattern takes it.
 pub(crate) fn take_args(it: &mut Interp, def: &crate::ast::FnDef, args: Vec<Value>) -> Result<Vec<Value>, String> {
+    make_args(it, def, args).unwrap_or_else(|(p, e)| match e {
+        Ctrl::Error(e) => Err(format!("argument `{}` of `{}`: {}", p, def.name, e)),
+        _ => Err(format!("argument `{}` of `{}` could not be made", p, def.name)),
+    })
+}
+
+/// `take_args`, with a failure while an argument is made (a record's default that failed) kept
+/// as the failure it is, with the parameter's name: the MCP door makes a tool's arguments as its
+/// body runs, and such a failure is the body's (FEEDBACK56.md, Q-858, found in review; branch
+/// feedback56).
+pub(crate) fn make_args(it: &mut Interp, def: &crate::ast::FnDef, args: Vec<Value>) -> Result<Result<Vec<Value>, String>, (String, Ctrl)> {
     if args.len() > def.params.len() {
-        return Err(format!("`{}` takes {} arguments, got {}", def.name, def.params.len(), args.len()));
+        return Ok(Err(format!("`{}` takes {} arguments, got {}", def.name, def.params.len(), args.len())));
     }
     if let Some(p) = def.params.get(args.len()..).and_then(|rest| rest.iter().find(|p| p.default.is_none())) {
-        return Err(format!("missing argument `{}` for `{}`", p.name, def.name));
+        return Ok(Err(format!("missing argument `{}` for `{}`", p.name, def.name)));
     }
     let mut out = Vec::with_capacity(args.len());
     for (v, p) in args.into_iter().zip(&def.params) {
@@ -2169,12 +2180,11 @@ pub(crate) fn take_args(it: &mut Interp, def: &crate::ast::FnDef, args: Vec<Valu
         };
         match crate::record::make(it, ty, &v, false) {
             Ok(Ok(x)) => out.push(x),
-            Ok(Err(why)) => return Err(format!("argument `{}` of `{}` must be {}, got {}{}", p.name, def.name, ty.text(), v.type_name(), crate::interp::because(&why))),
-            Err(Ctrl::Error(e)) => return Err(format!("argument `{}` of `{}`: {}", p.name, def.name, e)),
-            Err(_) => return Err(format!("argument `{}` of `{}` could not be made", p.name, def.name)),
+            Ok(Err(why)) => return Ok(Err(format!("argument `{}` of `{}` must be {}, got {}{}", p.name, def.name, ty.text(), v.type_name(), crate::interp::because(&why)))),
+            Err(e) => return Err((p.name.to_string(), e)),
         }
     }
-    Ok(out)
+    Ok(Ok(out))
 }
 
 fn json_response(status: u16, j: serde_json::Value) -> HttpResponse {

@@ -2778,25 +2778,31 @@ fn mcp orders_today(limit: int = 20) -> list with db {
   MCP requires (`str?` is `["string", "null"]`, a record once under `$defs` by a local `$ref`,
   `int | str` a list of types, `dec` and money's amount a text with a `pattern`). The
   arguments and the records they hold refuse other fields (`additionalProperties: false`); a
-  result says no such thing, since the server does not check it. A result is always an
+  result says no such thing, since the server does not check it. A typed result is always an
   object: one that is not (`-> int`, `-> list`) is held as `result`, in the schema and in what
-  the client gets (`{ "result": 3 }`), as clients of MCP's earlier revisions require.
+  the client gets (`{ "result": 3 }`). A tool with no `->` type has no result schema, and its
+  answer goes as text alone.
 - Two hints. `readOnlyHint` is true when Quillo can see the whole of what the tool may run (no
   function held in a variable or a parameter, no `js`, `run_script` or native plugin), it
-  writes nothing (no `db` write, no `dblink`, no builtin that changes something, such as a
-  session, a cookie, `publish` or `media.close`, no file, no top-level `let` it changes, and
-  none in the defaults of a record it takes, gives or makes) and its `with` has none of `fs`,
-  `net` and `http`. `openWorldHint` is false when it reaches no other site: no `net`, `http`
-  only to the program's own services whose code is in the program and stays inside, and all
-  of it seen. Otherwise each is MCP's cautious default. A client may skip asking the person
-  before a read-only tool, so Quillo says so only when it is true.
+  writes nothing (no `db` write, no builtin that changes something, such as a session, a
+  cookie, `publish` or `media.close`, no file, no top-level `let` it changes, none in the
+  defaults of a record it takes, gives or makes, and no function a statement calls that its
+  database does not ship, as `select sync()`) and its `with` has none of `fs`, `net` and
+  `http`. `openWorldHint` is false when it reaches no other site: no `net`, no `db.connect` or
+  `db.shards`, no such function, `http` only to the program's own services whose code is in the
+  program and stays inside, and all of it seen. Otherwise each is MCP's cautious default. A
+  client may skip asking the person before a read-only tool, so Quillo says so only when it is
+  true.
 - "Only reads" is worked out, with no word to write: every `db.query` and `db.one` the tool
-  may reach has a statement written in the program that starts with `select` and only reads
-  (a `with ... insert`, `insert ... returning`, `select ... for update`, `dblink` or a
-  statement built at run time counts as a write). Every read-only tool whose `with` names
-  `db`, or that has no `with`, runs inside a read-only transaction where the program has a
-  database, its arguments made inside it too, so a write Quillo did not see, as a database
-  function a `select` calls, is refused by the database (`db.error_kind` gives `"read_only"`)
+  may reach has a statement written in the program that starts with `select`, only reads, and
+  calls only the functions its database ships (aggregates, text, numbers, dates, JSON,
+  conditionals). A `with ... insert`, `insert ... returning`, `select ... for update`, a call
+  of any other function (`dblink`, `sync()`) or a statement built at run time counts as a
+  write. A read-only tool that may reach the database (its `with` names `db`, or it has none
+  and calls `db`) runs inside a read-only transaction, so a write Quillo did not see is
+  refused by the database (`db.error_kind` gives `"read_only"`); one that reaches none runs
+  with none. Its arguments are made inside that transaction and under its `with`, so a
+  record's default that needs an effect the `with` lacks fails as the body would
   (FEEDBACK56.md, Q-858).
 
 The door itself, `/_quillo/mcp` and `quillo mcp app.qwe` over stdio, is not built yet
