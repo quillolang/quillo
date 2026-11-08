@@ -2830,6 +2830,14 @@ client gets from a call:
   `404 Not Found`), a page, and `internal error` when the tool failed (the real message on
   stderr).
 - The protocol's own errors for an unknown tool, a malformed message and the wrong version.
+- An answer past what the door takes in (10 MiB of JSON, or 128 levels deep) is an `isError`
+  saying so, never a cut or empty answer; a tool that crashes answers `internal error` and the
+  door goes on serving.
+
+A policy's `max_compute` and `max_body` hold `quillo mcp` as they hold `quillo run`. On
+Windows, `print` goes to stderr, but other writes to stdout (a `.qwer` plugin's own output) are
+not moved there, and break the session; it stops on Ctrl-C, Ctrl-Break or the console
+closing, as on SIGTERM elsewhere.
 
 The door over HTTP, `/_quillo/mcp`, is not built yet (FEEDBACK56.md, Q-853).
 

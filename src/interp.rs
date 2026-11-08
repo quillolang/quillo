@@ -19,6 +19,17 @@ pub enum Ctrl {
     Reply(Arc<Response>),
 }
 
+/// What a call changes as it starts, kept to be put back after one that panicked
+/// (`Interp::entered`).
+pub(crate) struct Entered {
+    depth: usize,
+    cur_file: Option<Arc<str>>,
+    caller_file: Option<Arc<str>>,
+    in_component: bool,
+    allowed: u8,
+    restrictor: Option<Arc<FnDef>>,
+}
+
 impl From<QuilloError> for Ctrl {
     fn from(e: QuilloError) -> Self {
         Ctrl::Error(Box::new(e))
@@ -4384,6 +4395,30 @@ impl Interp {
             self.restrictor = who;
         }
         r
+    }
+
+    /// What `enter_call` changes on the way in and puts back on the way out, as it is now: a call
+    /// that panics never comes back to put it back, and the MCP door, which answers the next
+    /// message after one, puts it back itself (`put_back`; FEEDBACK56.md, C.1, found in review;
+    /// branch feedback56). Left as it was, a `with db` narrowed every tool after it.
+    pub(crate) fn entered(&self) -> Entered {
+        Entered {
+            depth: self.depth,
+            cur_file: self.cur_file.clone(),
+            caller_file: self.caller_file.clone(),
+            in_component: self.in_component,
+            allowed: self.allowed,
+            restrictor: self.restrictor.clone(),
+        }
+    }
+
+    pub(crate) fn put_back(&mut self, e: Entered) {
+        self.depth = e.depth;
+        self.cur_file = e.cur_file;
+        self.caller_file = e.caller_file;
+        self.in_component = e.in_component;
+        self.allowed = e.allowed;
+        self.restrictor = e.restrictor;
     }
 
     /// "`http.get` needs the http effect, but `load` is declared `with db`".

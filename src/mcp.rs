@@ -330,6 +330,7 @@ pub const INVALID_REQUEST: i64 = -32600;
 pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INVALID_PARAMS: i64 = -32602;
 pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+pub const INTERNAL_ERROR: i64 = -32603;
 
 /// How long a client may keep `server/discover`'s and `tools/list`'s answers. A program's tools
 /// are read when the door starts and change only when it is started again, so an hour; and they
@@ -344,6 +345,9 @@ pub struct Door {
     pub tools: Vec<Tool>,
     /// `serverInfo`'s name: the program's, as `quillo docs` titles it (its file's name).
     pub name: String,
+    /// The longest message taken, in bytes: `MOST`, or less where a policy's `max_body` says so,
+    /// as it holds `quillo run`'s request bodies (found in review).
+    pub most: usize,
 }
 
 /// An error answered in place of a result.
@@ -384,18 +388,72 @@ fn tool_error(text: impl Into<String>) -> J {
     json!({ "content": [{ "type": "text", "text": text.into() }], "isError": true })
 }
 
+/// The most a tool's answer is, as the door takes a message in: `MOST` bytes of JSON, and
+/// `JSON_NESTING` levels (`value::json_value`). Past them, a client that reads as the door does
+/// could not take it, and the answer says so in its place (found in review: one 128 deep went
+/// out as a silent `null`, read back by serde's own limit).
+#[derive(Debug, PartialEq)]
+enum Unsent {
+    Large,
+    Deep,
+    /// It cannot be written as JSON: a function in it, said as `json_into_within` says it.
+    Not(String),
+}
+
+/// `v`'s JSON, held to what the door takes (`Unsent`); its depth too where `deep`, as an error's
+/// payload and a reply's body go out as text alone.
+fn held(v: &Value, deep: bool) -> Result<Vec<u8>, Unsent> {
+    if let Value::Str(s) = v {
+        // Its JSON is longer than it is, by its quotes at least.
+        if s.len() + 2 > MOST {
+            return Err(Unsent::Large);
+        }
+    }
+    let mut out = Vec::new();
+    let written = v.json_into_within(&mut out, MOST, if deep { crate::value::JSON_NESTING } else { crate::builtins::JSON_DEEPEST });
+    if out.len() > MOST {
+        return Err(Unsent::Large);
+    }
+    if deep && crate::value::json_depth(&out) > crate::value::JSON_NESTING {
+        return Err(Unsent::Deep);
+    }
+    written.map_err(Unsent::Not)?;
+    Ok(out)
+}
+
+/// What the model is told in place of an answer it could not take, the reason in the log.
+fn unsent(tool: &str, why: Unsent) -> J {
+    let (told, logged) = match why {
+        Unsent::Large => (format!("the result is too large for the client: more than {} of JSON", size_text(MOST)), format!("its result is more than {} of JSON", size_text(MOST))),
+        Unsent::Deep => (format!("the result is too deep for the client: it nests more than {} deep", crate::value::JSON_NESTING), format!("its result nests more than {} deep", crate::value::JSON_NESTING)),
+        Unsent::Not(why) => ("internal error".to_string(), format!("its result cannot be written as JSON: {}", why)),
+    };
+    eprintln!("quillo: error in tool `{}`: {}", tool, logged);
+    tool_error(told)
+}
+
+/// A size as the door says it: `10 MiB`, `512 KiB`, `1000 bytes`.
+fn size_text(n: usize) -> String {
+    match n {
+        n if n >= 1 << 20 && n % (1 << 20) == 0 => format!("{} MiB", n >> 20),
+        n if n >= 1 << 10 && n % (1 << 10) == 0 => format!("{} KiB", n >> 10),
+        n => format!("{} bytes", n),
+    }
+}
+
 /// What an error value or a reply's body says to the model: text as it is, any other value as
-/// its JSON.
-fn text_of(v: &Value) -> String {
+/// its JSON; held to `MOST` bytes, as a result is.
+fn text_of(tool: &str, v: &Value) -> Result<String, J> {
     match v {
-        Value::Str(s) => s.to_string(),
-        other => other.json_text(),
+        Value::Str(s) if s.len() <= MOST => Ok(s.to_string()),
+        Value::Str(_) => Err(unsent(tool, Unsent::Large)),
+        other => held(other, false).map(|b| String::from_utf8(b).unwrap_or_default()).map_err(|why| unsent(tool, why)),
     }
 }
 
 impl Door {
     pub fn new(name: impl Into<String>, tools: Vec<Tool>) -> Door {
-        Door { tools, name: name.into() }
+        Door { tools, name: name.into(), most: MOST }
     }
 
     /// The answer to one message, as it came: None for a notification and for a client's
@@ -416,10 +474,10 @@ impl Door {
             // A response: the door asks the client nothing, so there is none to wait for.
             None | Some(_) if !msg.contains_key("method") && (msg.contains_key("result") || msg.contains_key("error")) => return None,
             None => return Some(error_message(None, fault(INVALID_REQUEST, "Invalid request: `method` is a string"))),
-            // A string or an integer; never null (basic/index).
-            Some(id @ J::String(_)) => id,
-            Some(id @ J::Number(n)) if n.is_i64() || n.is_u64() => id,
-            Some(_) => return Some(error_message(None, fault(INVALID_REQUEST, "Invalid request: an id is a string or an integer"))),
+            // A string or a number, as `RequestId` says (schema.ts), and given back as it came;
+            // never null (basic/index).
+            Some(id @ (J::String(_) | J::Number(_))) => id,
+            Some(_) => return Some(error_message(None, fault(INVALID_REQUEST, "Invalid request: an id is a string or a number"))),
         };
         Some(match self.request(it, &msg) {
             // Every result says it is complete (MCP 2026-07-28 requires `resultType`), and who
@@ -528,7 +586,10 @@ impl Door {
 
 /// A tool run for a client, as a request is for a visitor: nothing of the call before it (no
 /// session, cookie or tenant: on stdio there is no request, and the user who started the door
-/// is the caller), and a transaction it left open rolled back.
+/// is the caller), and a transaction it left open rolled back. A panic in it, a bug of Quillo's,
+/// is that call's `internal error`, as a request's is a 500, and the door goes on with what calls
+/// change put back as it was (`Interp::put_back`); a transaction it was in has let go of what it
+/// held, and raised it again for this (found in review).
 fn run(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>) -> J {
     it.tenant = None;
     it.tenant_named = false;
@@ -537,14 +598,23 @@ fn run(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>) -> J {
     it.session = None;
     it.session_id = None;
     it.answering = true;
-    let r = call_given(it, tool, args, 0);
+    let before = it.entered();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call_given(it, tool, args, 0)));
     it.answering = false;
     it.set_cookies.clear();
+    let r = match r {
+        Ok(r) => r,
+        Err(panic) => {
+            it.put_back(before);
+            eprintln!("quillo: error in tool `{}`: a panic, a bug of Quillo's: {}", tool.name, panic_text(&*panic));
+            return tool_error("internal error");
+        }
+    };
     crate::db::left_open(it, &format!("tool `{}`", tool.name));
     match r {
         Ok(Err(why)) => tool_error(why),
         Ok(Ok(v)) | Err(Ctrl::Return(v)) => result_of(tool, v),
-        Err(Ctrl::Reply(r)) => replied(&r),
+        Err(Ctrl::Reply(r)) => replied(&tool.name, &r),
         Err(Ctrl::Error(e)) => {
             eprintln!("quillo: error in tool `{}`: {:#}", tool.name, e);
             tool_error("internal error")
@@ -556,28 +626,35 @@ fn run(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>) -> J {
 /// error`, its text in the log (`server::for_visitor`, as `/_quillo/rpc` hides it); the tool's
 /// own `err(v)` is said. A value is its JSON: `structuredContent` and the same JSON as text where
 /// the tool says its result's type, text alone where it does not (a text as it is).
+/// It is held to what the door takes in (`held`): past that, an error that says so, never a part
+/// of it.
 fn result_of(tool: &Tool, v: Value) -> J {
     let v = crate::server::for_visitor(v);
     match &v {
-        Value::Err(e, _, _) => return tool_error(text_of(e)),
-        Value::Response(r) => return replied(r),
+        Value::Err(e, _, _) => return text_of(&tool.name, e).map_or_else(|e| e, tool_error),
+        Value::Response(r) => return replied(&tool.name, r),
         Value::Html(_) => return tool_error(NOT_A_PAGE),
+        Value::Str(s) if tool.output_schema.is_none() => {
+            return match s.len() <= MOST {
+                true => json!({ "content": [{ "type": "text", "text": &**s }] }),
+                false => unsent(&tool.name, Unsent::Large),
+            }
+        }
         _ => {}
     }
-    let mut out = Vec::new();
-    if let Err(why) = v.json_into_within(&mut out, crate::builtins::JSON_MOST, crate::builtins::JSON_DEEPEST) {
-        eprintln!("quillo: error in tool `{}`: its result cannot be written as JSON: {}", tool.name, why);
-        return tool_error("internal error");
-    }
-    let text = String::from_utf8(out).unwrap_or_default();
+    let out = match held(&v, true) {
+        Ok(out) => out,
+        Err(why) => return unsent(&tool.name, why),
+    };
     if tool.output_schema.is_none() {
-        let text = match &v {
-            Value::Str(s) => s.to_string(),
-            _ => text,
-        };
-        return json!({ "content": [{ "type": "text", "text": text }] });
+        return json!({ "content": [{ "type": "text", "text": String::from_utf8(out).unwrap_or_default() }] });
     }
-    let value: J = serde_json::from_str(&text).unwrap_or(J::Null);
+    // Read back as deep as it was written: serde's own limit is 127 levels.
+    let value = match crate::value::json_value(&out) {
+        Ok(value) => value,
+        Err(why) => return unsent(&tool.name, Unsent::Not(why)),
+    };
+    let text = String::from_utf8(out).unwrap_or_default();
     match tool.structured(value) {
         Some(s) => json!({ "content": [{ "type": "text", "text": s.to_string() }], "structuredContent": s }),
         None => json!({ "content": [{ "type": "text", "text": text }] }),
@@ -587,14 +664,19 @@ fn result_of(tool: &Tool, v: Value) -> J {
 /// A `reply`, or a response a tool gave back: a page (a redirect, markup, bytes, a stream) is
 /// none of a tool's answers; anything else is an error with its text, `session().user ?? reply
 /// 401 "Log in first"` telling the model `Log in first` (A.1).
-fn replied(r: &crate::value::Response) -> J {
+fn replied(tool: &str, r: &crate::value::Response) -> J {
     use crate::value::Body;
     match &r.body {
         _ if (300..400).contains(&r.status) => tool_error(NOT_A_PAGE),
         Body::Value(Value::Html(_)) | Body::Bytes(_) | Body::Stream { .. } => tool_error(NOT_A_PAGE),
         Body::Value(Value::Nil) => tool_error(format!("{} {}", r.status, crate::httpd::reason(r.status)).trim_end().to_string()),
-        Body::Value(v) => tool_error(text_of(&crate::server::for_visitor(v.clone()))),
+        Body::Value(v) => text_of(tool, &crate::server::for_visitor(v.clone())).map_or_else(|e| e, tool_error),
     }
+}
+
+/// What a panic said, for the log.
+fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "a panic".into())
 }
 
 // ---- stdio: `quillo mcp file.qwe` (C.1) ---------------------------------------------------------
@@ -653,7 +735,9 @@ pub fn stop_asked() {
 }
 
 /// One line of stdin, at most `most` bytes kept: None at the end. A line past it is read to its
-/// end and given as `Err(())`, so the next one is read whole.
+/// end and given as `Err(())`, so the next one is read whole. The door is busy from its first
+/// byte: a stop asked for while it is read waits for its answer, where it ended the process
+/// between reading it and answering (found in review).
 fn read_message(input: &mut dyn std::io::BufRead, most: usize) -> std::io::Result<Option<Result<Vec<u8>, ()>>> {
     let (mut line, mut over, mut any) = (Vec::new(), false, false);
     loop {
@@ -664,6 +748,9 @@ fn read_message(input: &mut dyn std::io::BufRead, most: usize) -> std::io::Resul
         };
         if chunk.is_empty() {
             break;
+        }
+        if !any {
+            BUSY.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         any = true;
         let (take, end) = match chunk.iter().position(|b| *b == b'\n') {
@@ -688,11 +775,15 @@ fn read_message(input: &mut dyn std::io::BufRead, most: usize) -> std::io::Resul
 /// Reads newline-delimited JSON-RPC from `input` and answers each request on `out`, a line
 /// each, until `input` ends (stdio: the server SHOULD exit when its stdin closes), `out` cannot be
 /// written, or a stop is asked for. The exit status.
+/// Each message is held to `--max-compute` or the policy's `max_compute`, as a request is
+/// (`httpd::watched`), and one that panics outside a tool, in the door's own code, is answered
+/// `-32603` and the next read (found in review).
 pub fn serve_stdio(door: &Door, it: &mut Interp, input: &mut dyn std::io::BufRead, out: &mut dyn std::io::Write) -> i32 {
     use std::sync::atomic::Ordering::SeqCst;
     READING.store(true, SeqCst);
+    let watch = crate::httpd::compute_limited().then(crate::httpd::watched);
     loop {
-        let line = match read_message(input, MOST) {
+        let line = match read_message(input, door.most) {
             Ok(Some(line)) => line,
             Ok(None) => return 0,
             Err(e) => {
@@ -700,12 +791,28 @@ pub fn serve_stdio(door: &Door, it: &mut Interp, input: &mut dyn std::io::BufRea
                 return 1;
             }
         };
-        BUSY.store(true, SeqCst);
+        if let Some(w) = &watch {
+            w.begin();
+        }
         let answer = match &line {
             Ok(text) if text.iter().all(u8::is_ascii_whitespace) => None,
-            Ok(text) => door.answer(it, text),
-            Err(()) => Some(error_message(None, fault(INVALID_REQUEST, format!("Invalid request: a message is at most {} MiB", MOST >> 20)))),
+            Ok(text) => {
+                let before = it.entered();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| door.answer(it, text))).unwrap_or_else(|panic| {
+                    it.put_back(before);
+                    eprintln!("quillo: error in the MCP door: a panic, a bug of Quillo's: {}", panic_text(&*panic));
+                    let id = match crate::value::json_value(text) {
+                        Ok(J::Object(m)) => m.get("id").filter(|id| id.is_string() || id.is_number()).cloned(),
+                        _ => None,
+                    };
+                    Some(error_message(id.as_ref(), fault(INTERNAL_ERROR, "Internal error")))
+                })
+            }
+            Err(()) => Some(error_message(None, fault(INVALID_REQUEST, format!("Invalid request: a message is at most {}", size_text(door.most))))),
         };
+        if let Some(w) = &watch {
+            w.end();
+        }
         if let Some(a) = answer {
             let mut text = a.to_string().into_bytes();
             text.push(b'\n');

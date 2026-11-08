@@ -646,6 +646,18 @@ fn mcp(file: &str, flags: &[String]) -> i32 {
     if let Err(code) = with_policy(Path::new(file), &o.policies, true) {
         return code;
     }
+    // The policy's limits, held as `run_program` holds them: how long a call may compute, and
+    // how long a message may be (found in review: they were not read here).
+    let policy = quillo::policy::get();
+    if let Some(c) = policy.max_compute {
+        let (now, c) = (quillo::httpd::compute_limit_ms(), c.as_millis().max(1) as u64);
+        if now == 0 || now > c {
+            quillo::httpd::limit_compute(c);
+            if let Some(f) = &policy.max_compute_from {
+                quillo::httpd::compute_limit_from(f);
+            }
+        }
+    }
     if let Err(code) = before_the_program(file, &o) {
         return code;
     }
@@ -682,7 +694,10 @@ fn mcp(file: &str, flags: &[String]) -> i32 {
     }
     // What a builtin's error says is hidden from the client, as from a visitor, and logged.
     quillo::value::HIDING.store(true, std::sync::atomic::Ordering::Relaxed);
-    let door = quillo::mcp::Door::new(stem, tools);
+    let mut door = quillo::mcp::Door::new(stem, tools);
+    if let Some(b) = policy.max_body {
+        door.most = door.most.min(b);
+    }
     let stdin = io::stdin();
     let mut input = stdin.lock();
     quillo::mcp::serve_stdio(&door, &mut interp, &mut input, &mut *out)

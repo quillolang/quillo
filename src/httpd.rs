@@ -274,6 +274,35 @@ fn watch_loops() {
     }
 }
 
+/// This thread, which runs no event loop, held to `--max-compute` and a policy's `max_compute`
+/// as a loop's requests are, by the same watchdog: the MCP door's, over stdio, `begin` as a
+/// message is answered and `end` once it is (FEEDBACK56.md, C.1, found in review; branch
+/// feedback56).
+pub struct Watched(Arc<Busy>);
+
+pub fn watched() -> Watched {
+    let busy = Arc::new(Busy::default());
+    OWN_BUSY.with(|b| *b.borrow_mut() = Some(busy.clone()));
+    lock(&LOOPS_BUSY).push(busy.clone());
+    static WATCHING: std::sync::Once = std::sync::Once::new();
+    WATCHING.call_once(|| {
+        let _ = std::thread::Builder::new().name("quillo-watch".into()).spawn(watch_loops);
+    });
+    Watched(busy)
+}
+
+impl Watched {
+    pub fn begin(&self) {
+        self.0.over.store(false, SeqCst);
+        self.0.since.store(clock(), SeqCst);
+    }
+
+    pub fn end(&self) {
+        self.0.since.store(0, SeqCst);
+        self.0.over.store(false, SeqCst);
+    }
+}
+
 /// With several instances, connections are taken on a thread that runs no program, so a
 /// request computing cannot hold them up, and each goes to the next instance that is not
 /// computing, or to the next in turn if all are (FEEDBACK20.md, Q-162; branch feedback20-fixes).

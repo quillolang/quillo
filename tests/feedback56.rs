@@ -2403,9 +2403,14 @@ struct Stdio {
 
 impl Stdio {
     fn start(d: &Path, args: &[&str]) -> Stdio {
+        Stdio::start_env(d, args, &[])
+    }
+
+    fn start_env(d: &Path, args: &[&str], env: &[(&str, &str)]) -> Stdio {
         let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
             .arg("mcp")
             .args(args)
+            .envs(env.iter().copied())
             .current_dir(d)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -2436,21 +2441,28 @@ impl Stdio {
         Stdio { guard: support::Guard::new(child), stdin, out, err, err_reader: Some(err_reader) }
     }
 
-    /// Writes `text` as it is: a message's line ends with `\n`.
+    /// Writes `text` as it is: a message's line ends with `\n`. A door that has ended already (one
+    /// that refuses to start may, before the test writes) closed its stdin: what it would have
+    /// answered is missed by `next`, which says so (found running the file at once).
     fn write(&mut self, text: &[u8]) {
         let s = self.stdin.as_mut().expect("stdin was closed");
-        s.write_all(text).unwrap();
-        s.flush().unwrap();
+        if let Err(e) = s.write_all(text).and_then(|_| s.flush()) {
+            assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{}", e);
+        }
     }
 
     fn send(&mut self, line: &str) {
         self.write(format!("{}\n", line).as_bytes());
     }
 
-    /// The next line of stdout, which must be JSON: None once stdout ends, or when nothing came
-    /// in time.
+    /// The next line of stdout, which must be JSON (read as deep as it goes: an answer may be
+    /// deeper than serde's own limit): None once stdout ends, or when nothing came in time.
     fn next_within(&self, wait: Duration) -> Option<Value> {
-        self.out.recv_timeout(wait).ok().map(|l| serde_json::from_str(&l).unwrap_or_else(|e| panic!("not JSON on stdout ({}): {:?}", e, l)))
+        self.out.recv_timeout(wait).ok().map(|l| {
+            let mut de = serde_json::Deserializer::from_str(&l);
+            de.disable_recursion_limit();
+            <Value as serde::Deserialize>::deserialize(&mut de).unwrap_or_else(|e| panic!("not JSON on stdout ({}): {:?}", e, l.get(..300).unwrap_or(&l)))
+        })
     }
 
     fn next(&self) -> Option<Value> {
@@ -2796,10 +2808,9 @@ fn c1_protocol_errors_have_their_codes() {
         ("5", invalid_request, "Invalid request: a message is a JSON object"),
         ("\"tools/list\"", invalid_request, "Invalid request: a message is a JSON object"),
         ("null", invalid_request, "Invalid request: a message is a JSON object"),
-        (r#"{"jsonrpc":"2.0","id":null,"method":"tools/list"}"#, invalid_request, "Invalid request: an id is a string or an integer"),
-        (r#"{"jsonrpc":"2.0","id":1.5,"method":"tools/list"}"#, invalid_request, "Invalid request: an id is a string or an integer"),
-        (r#"{"jsonrpc":"2.0","id":{},"method":"tools/list"}"#, invalid_request, "Invalid request: an id is a string or an integer"),
-        (r#"{"jsonrpc":"2.0","id":true,"method":"tools/list"}"#, invalid_request, "Invalid request: an id is a string or an integer"),
+        (r#"{"jsonrpc":"2.0","id":null,"method":"tools/list"}"#, invalid_request, "Invalid request: an id is a string or a number"),
+        (r#"{"jsonrpc":"2.0","id":{},"method":"tools/list"}"#, invalid_request, "Invalid request: an id is a string or a number"),
+        (r#"{"jsonrpc":"2.0","id":true,"method":"tools/list"}"#, invalid_request, "Invalid request: an id is a string or a number"),
         (r#"{"jsonrpc":"2.0","method":5}"#, invalid_request, "Invalid request: `method` is a string"),
         (r#"{"jsonrpc":"2.0"}"#, invalid_request, "Invalid request: `method` is a string"),
     ] {
@@ -2816,7 +2827,8 @@ fn c1_protocol_errors_have_their_codes() {
     assert_eq!(door.refusal(r#"{"jsonrpc":"2.0","id":12,"method":["tools/list"]}"#), (Some(json!(12)), invalid_request, "Invalid request: `method` is a string".into()));
     assert_eq!(door.refusal(r#"{"jsonrpc":"2.0","id":12}"#), (Some(json!(12)), invalid_request, "Invalid request: `method` is a string".into()));
     // Ids come back as they were sent.
-    for id in [json!("s é"), json!(""), json!(0), json!(-1), json!(i64::MIN), json!(u64::MAX)] {
+    // Any number, as `RequestId` is `string | number` (found in review: 1.5 was refused).
+    for id in [json!("s é"), json!(""), json!(0), json!(-1), json!(i64::MIN), json!(u64::MAX), json!(1.5), json!(-0.25), json!(1e300)] {
         assert_eq!(door.ask(&request(id.clone(), "server/discover", json!({})))["id"], id);
     }
     // Never answered: a notification, known or not; a client's response; a line of nothing.
@@ -3106,10 +3118,47 @@ fn c1_a_message_at_the_limit_and_past_it() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// A command in `d` under a deadline, its stdout and stderr read while it runs, so that one that
+/// says much cannot fill a pipe and wait for ever: Err when it did not end in time (killed then).
+fn run_for(d: &Path, cmd: &str, secs: u64) -> Result<std::process::Output, String> {
+    use std::io::Read as _;
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(d)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let read = |mut r: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = r.read_to_end(&mut b);
+            b
+        })
+    };
+    let out = read(Box::new(child.stdout.take().unwrap()));
+    let err = read(Box::new(child.stderr.take().unwrap()));
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return Ok(std::process::Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() });
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("`{}` did not end in {} s", cmd, secs));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// MCP's own TypeScript client (`@modelcontextprotocol/client` 2.4.0, the SDK's v2, which speaks
 /// 2026-07-28), installed with npm into the test's folder, as a client would drive the door:
-/// pinned to 2026-07-28, and as a client of 2025-11-25 that opens with `initialize`. Skipped when
-/// npm or the package cannot be had here.
+/// pinned to 2026-07-28, and as a client of 2025-11-25 that opens with `initialize`. Skipped only
+/// where npm is not found or the package cannot be installed; a client that does not end in time,
+/// or a call of it that fails, fails the test (found in review: any of them was a skip).
 #[test]
 fn c1_the_official_typescript_client_drives_it() {
     let d = door_dir("sdk");
@@ -3142,27 +3191,26 @@ const { StdioClientTransport } = require("@modelcontextprotocol/client/stdio");
 "#;
     std::fs::write(d.join("client.cjs"), script).unwrap();
     std::fs::write(d.join("package.json"), r#"{"name":"quillo-c1-sdk","private":true}"#).unwrap();
-    let run = |cmd: &str| -> Option<std::process::Output> {
-        let mut child = Command::new("sh").arg("-c").arg(cmd).current_dir(&d).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().ok()?;
-        let deadline = Instant::now() + Duration::from_secs(240);
-        while child.try_wait().ok().flatten().is_none() {
-            if Instant::now() > deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        child.wait_with_output().ok()
-    };
-    let installed = run("npm install --no-audit --no-fund --ignore-scripts --silent @modelcontextprotocol/client@2.4.0").is_some_and(|o| o.status.success());
-    let out = installed.then(|| run(&format!("node client.cjs {:?} {:?}", env!("CARGO_BIN_EXE_quillo"), d.display().to_string()))).flatten();
-    let said = out.as_ref().and_then(|o| String::from_utf8_lossy(&o.stdout).lines().last().and_then(|l| serde_json::from_str::<Value>(l).ok()));
-    let _ = std::fs::remove_dir_all(&d);
-    let Some(said) = said else {
-        eprintln!("skipped: c1_the_official_typescript_client_drives_it (npm could not install @modelcontextprotocol/client@2.4.0 here, or node could not run it)");
+    if Command::new("npm").arg("--version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_err() {
+        let _ = std::fs::remove_dir_all(&d);
+        eprintln!("skipped: c1_the_official_typescript_client_drives_it, as npm was not found");
         return;
-    };
+    }
+    match run_for(&d, "npm install --no-audit --no-fund --ignore-scripts @modelcontextprotocol/client@2.4.0", 240) {
+        Ok(o) if o.status.success() => {}
+        failed => {
+            let _ = std::fs::remove_dir_all(&d);
+            let why = failed.map_or_else(|e| e, |o| String::from_utf8_lossy(&o.stderr).into_owned());
+            eprintln!("skipped: c1_the_official_typescript_client_drives_it, as npm could not install @modelcontextprotocol/client@2.4.0: {}", why);
+            return;
+        }
+    }
+    let ran = run_for(&d, &format!("node client.cjs {:?} {:?}", env!("CARGO_BIN_EXE_quillo"), d.display().to_string()), 120);
+    let _ = std::fs::remove_dir_all(&d);
+    let o = ran.unwrap_or_else(|e| panic!("the client: {}", e));
+    let (stdout, stderr) = (String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned());
+    assert!(o.status.success(), "the client failed: {}\n{}", stdout, stderr);
+    let said: Value = stdout.lines().last().and_then(|l| serde_json::from_str(l).ok()).unwrap_or_else(|| panic!("the client said no JSON: {}\n{}", stdout, stderr));
     let pin = &said["pin"];
     assert!(pin.get("failed").is_none(), "{}", said);
     assert_eq!(pin["protocol"], json!("2026-07-28"));
@@ -3574,5 +3622,237 @@ fn q858_review_a_panic_in_db_atomic_and_a_call_on_mariadb() {
     assert_eq!(ok(it.call(&write, vec![Q::str("kept")], 0)).display(), "wrote");
     assert_ne!(committed_in_three(&d, &a, &b), before);
     drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ---- Slice 4, review ----------------------------------------------------------------------------
+
+/// The tools whose answers reach the door's limits: 10 MiB of JSON, and 128 levels.
+const LIMITS_SRC: &str = r#"fn nest(n: int) -> list = if n <= 1 { [] } else { [nest(n - 1)] }
+
+type Box = { inside: any }
+
+/// A list `n` deep.
+fn mcp deep(n: int) -> list with time = nest(n)
+
+/// A record whose field is a list `n` deep.
+fn mcp boxed(n: int) -> Box with time = Box({ inside: nest(n) })
+
+/// The list, untyped.
+fn mcp loose(n: int) with time = nest(n)
+
+/// A text of `n` characters.
+fn mcp long(n: int) -> str with time = repeat("x", n)
+
+/// The text, untyped.
+fn mcp text(n: int) with time = repeat("x", n)
+
+/// An error of `n` characters.
+fn mcp fails(n: int) -> int ! str with time = err(repeat("x", n))
+
+/// An error that is a map.
+fn mcp fails_map(n: int) -> int ! { why: str } with time = err({ why: repeat("x", n) })
+
+/// A reply of `n` characters.
+fn mcp replies(n: int) with time {
+    reply 400 repeat("x", n)
+}
+"#;
+
+/// `n` lists, one in another.
+fn nest_json(n: usize) -> Value {
+    let mut v = json!([]);
+    for _ in 1..n {
+        v = json!([v]);
+    }
+    v
+}
+
+#[test]
+fn c1_review_an_answer_past_the_doors_limits_is_said_never_cut() {
+    let d = dir("c1-limits", LIMITS_SRC);
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    let most = 10 << 20;
+    let too_deep = "the result is too deep for the client: it nests more than 128 deep";
+    let too_large = "the result is too large for the client: more than 10 MiB of JSON";
+    let error = |r: &Value| {
+        assert_eq!(r["isError"], json!(true), "{}", r.to_string().get(..300).unwrap_or_default());
+        assert!(r.get("structuredContent").is_none());
+        r["content"][0]["text"].as_str().unwrap().to_string()
+    };
+    // 128 levels, the most the door takes in, and one past: it was a silent `{"result": null}`.
+    assert_eq!(door.call("deep", json!({ "n": 128 }))["structuredContent"], json!({ "result": nest_json(128) }));
+    assert_eq!(door.call("deep", json!({ "n": 127 }))["structuredContent"], json!({ "result": nest_json(127) }));
+    assert_eq!(error(&door.call("deep", json!({ "n": 129 }))), too_deep);
+    door.says("quillo: error in tool `deep`: its result nests more than 128 deep");
+    // A record is not held as `result`: its own 128 levels, where it lost its structuredContent.
+    let r = door.call("boxed", json!({ "n": 127 }));
+    assert_eq!(r["structuredContent"], json!({ "inside": nest_json(127) }));
+    assert_eq!(r["content"][0]["text"], json!(r["structuredContent"].to_string()));
+    assert_eq!(error(&door.call("boxed", json!({ "n": 128 }))), too_deep);
+    // Untyped, held the same.
+    assert_eq!(door.call("loose", json!({ "n": 128 }))["content"][0]["text"], json!(nest_json(128).to_string()));
+    assert_eq!(error(&door.call("loose", json!({ "n": 129 }))), too_deep);
+    // 10 MiB of JSON, the most a message is, and one past: a text's JSON has its quotes.
+    let r = door.call("long", json!({ "n": most - 2 }));
+    assert_eq!(r["structuredContent"]["result"].as_str().map(str::len), Some(most - 2));
+    assert_eq!(error(&door.call("long", json!({ "n": most - 1 }))), too_large);
+    door.says("quillo: error in tool `long`: its result is more than 10 MiB of JSON");
+    // Untyped text goes as it is: 10 MiB of it.
+    assert_eq!(door.call("text", json!({ "n": most }))["content"][0]["text"].as_str().map(str::len), Some(most));
+    assert_eq!(error(&door.call("text", json!({ "n": most + 1 }))), too_large);
+    // An error's payload and a reply's body, as text: held to the same size.
+    assert_eq!(error(&door.call("fails", json!({ "n": most }))).len(), most);
+    assert_eq!(error(&door.call("fails", json!({ "n": most + 1 }))), too_large);
+    assert_eq!(error(&door.call("fails_map", json!({ "n": most - 10 }))).len(), most);
+    assert_eq!(error(&door.call("fails_map", json!({ "n": most - 9 }))), too_large);
+    assert_eq!(error(&door.call("replies", json!({ "n": most }))).len(), most);
+    assert_eq!(error(&door.call("replies", json!({ "n": most + 1 }))), too_large);
+    door.close();
+    assert_eq!(door.ended(), Some(0));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// `lines` through `mcp::serve_stdio` in this process, as stdin and stdout would carry them:
+/// what it answered, a line each.
+fn door_here(it: &mut Interp, door: &mcp::Door, lines: &[String]) -> Vec<Value> {
+    let mut input = std::io::Cursor::new(lines.iter().map(|l| format!("{}\n", l)).collect::<String>().into_bytes());
+    let mut out = Vec::new();
+    assert_eq!(mcp::serve_stdio(door, it, &mut input, &mut out), 0);
+    String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+/// An answer's result as `Stdio::call` gives it: an error's text, or its structured content.
+fn said_in(a: &Value) -> Value {
+    let r = &a["result"];
+    match r["isError"] == json!(true) {
+        true => r["content"][0]["text"].clone(),
+        false => r["structuredContent"].clone(),
+    }
+}
+
+#[test]
+fn c1_review_a_panic_in_a_tool_is_that_calls_internal_error() {
+    // A panic, a bug of Quillo's, in a tool that runs in the read-only transaction: the
+    // transaction lets go of what it held and raises it again; the door answers that call
+    // `internal error` and goes on, a tool `with time` after a `with db` one as it would.
+    let d = support::temp_dir("feedback56-c1-panic");
+    let db = d.join("app.db").display().to_string();
+    let src = "let hook = () => 1\n/// Peeks.\nfn mcp peek() with db = hook()\n\
+/// Counts.\nfn mcp total() -> int with db = db.one(\"select count(*) as n from notes\").n\n\
+/// Adds.\nfn mcp add(t: str) -> int with db = db.exec(\"insert into notes (text) values (?)\", t).changes\n\
+/// A time.\nfn mcp stamp() -> int with time = 7\n";
+    let (mut it, mut list) = run_on(&d, &db, &["create table notes (id integer primary key, text text)"], src);
+    quillo::value::define(&it.globals, "hook", Q::Builtin("boom", boom));
+    list.iter_mut().find(|t| t.name == "peek").unwrap().reads_only = true;
+    let door = mcp::Door::new("main", list);
+    let calls: Vec<String> = [("peek", json!({})), ("stamp", json!({})), ("add", json!({ "t": "a" })), ("total", json!({})), ("peek", json!({})), ("peek", json!({})), ("stamp", json!({})), ("total", json!({}))]
+        .iter()
+        .map(|(n, a)| call_line(n, a.clone()))
+        .collect();
+    let answers = door_here(&mut it, &door, &calls);
+    let said: Vec<Value> = answers.iter().map(said_in).collect();
+    assert_eq!(said, [json!("internal error"), json!({ "result": 7 }), json!({ "result": 1 }), json!({ "result": 1 }), json!("internal error"), json!("internal error"), json!({ "result": 7 }), json!({ "result": 1 })], "{:?}", answers);
+    nothing_left(&it, 0, "the door after a panic");
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c1_review_on_postgres_a_panic_in_a_database_call_is_that_calls_internal_error() {
+    let Some(pg) = support::postgres("feedback56-c1-panic") else {
+        eprintln!("skipped: c1_review_on_postgres_a_panic_in_a_database_call_is_that_calls_internal_error, as PostgreSQL's initdb and pg_ctl were not found");
+        return;
+    };
+    let url = pg.database("cpanic");
+    let d = support::temp_dir("feedback56-c1-pgpanic");
+    let src = "/// Counts.\nfn mcp total() -> int with db = db.one(\"select count(*) as n from notes\").n\n\
+/// Adds.\nfn mcp add(t: str) -> int with db = db.exec(\"insert into notes (text) values (?)\", t).changes\n\
+/// A time.\nfn mcp stamp() -> int with time = 7\n";
+    let (mut it, list) = run_on(&d, &url, &["create table notes (id serial primary key, text text)"], src);
+    assert!(the(&list, "total").reads_only);
+    let door = mcp::Door::new("main", list);
+    let before = free(&it);
+    // The second call that holds a connection panics in it: the statement inside the read-only
+    // transaction (the first is its `begin`), which rolls back and raises the panic again.
+    quillo::db::panic_at_db_call(2);
+    let calls: Vec<String> = [("total", json!({})), ("stamp", json!({})), ("add", json!({ "t": "é" })), ("total", json!({}))].iter().map(|(n, a)| call_line(n, a.clone())).collect();
+    let answers = door_here(&mut it, &door, &calls);
+    quillo::db::panic_at_db_call(0);
+    let said: Vec<Value> = answers.iter().map(said_in).collect();
+    assert_eq!(said, [json!("internal error"), json!({ "result": 7 }), json!({ "result": 1 }), json!({ "result": 1 })], "{:?}", answers);
+    nothing_left(&it, before, "the door after a panic on PostgreSQL");
+    drop(it);
+    drop(pg);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c1_review_what_a_plugin_writes_to_stdout_goes_to_stderr() {
+    // Rust in a `.qwer` writes to descriptor 1 itself, past `print`: under `quillo mcp` that is
+    // stderr, and stdout carries the answer alone. Built as tests/native.rs builds plugins.
+    let d = dir("c1-plugin", "use \"loud.qwer\"\n\n/// Writes to stdout past `print`.\nfn mcp loud(text: str) -> int with time = shout(text)\n");
+    std::fs::write(
+        d.join("loud.qwer"),
+        "//! effects: none\n\n/// Writes `text` to stdout as Rust code does, in two writes.\npub fn shout(text: &str) -> i64 {\n    use std::io::Write;\n    let mut out = std::io::stdout();\n    let _ = write!(out, \"{} \", text);\n    let _ = out.flush();\n    let _ = writeln!(out, \"(from Rust)\");\n    let _ = out.flush();\n    1\n}\n",
+    )
+    .unwrap();
+    let cache = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("native-cache");
+    let mut door = Stdio::start_env(&d, &["main.qwe"], &[("QUILLO_NATIVE_CACHE", cache.to_str().unwrap())]);
+    door.send(&call_line("loud", json!({ "text": "on descriptor 1" })));
+    // The first build of the cache's dependencies takes a while.
+    let a = door.next_within(Duration::from_secs(300)).unwrap_or_else(|| panic!("no answer: {}", door.stderr()));
+    assert_eq!(a["result"]["structuredContent"], json!({ "result": 1 }), "{}", a);
+    door.close();
+    assert_eq!(door.ended(), Some(0));
+    assert!(door.next_within(Duration::from_millis(200)).is_none());
+    assert!(door.stderr().contains("on descriptor 1 (from Rust)\n"), "{}", door.stderr());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c1_review_the_policys_limits_hold_the_door() {
+    let d = dir("c1-policy", "/// Spins.\nfn mcp spin() -> int with time {\n    let i = 0\n    while i >= 0 { i = i + 1 }\n    i\n}\n\n/// Seven.\nfn mcp clock() -> int with time = 7\n");
+    std::fs::write(d.join("limits.toml"), "[limits]\nmax_body = \"2KB\"\nmax_compute = \"300ms\"\n").unwrap();
+    let mut door = Stdio::start(&d, &["main.qwe", "--policy", "limits.toml"]);
+    // `max_compute`: a call computing past it ends, as a request does, and the door goes on.
+    let began = Instant::now();
+    let r = door.call("spin", json!({}));
+    assert_eq!((r["isError"].clone(), r["content"][0]["text"].clone()), (json!(true), json!("internal error")), "{}", r);
+    assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
+    door.says("this request computed for longer than the policy limits.toml allows (max_compute)");
+    assert_eq!(door.call("clock", json!({}))["structuredContent"], json!({ "result": 7 }));
+    // `max_body`: the longest message, the limit and one either side.
+    let padded = |id: i64, len: usize| {
+        let m = request(json!(id), "tools/list", json!({}));
+        format!("{}{}", m, " ".repeat(len - m.len()))
+    };
+    assert_eq!(door.ask(&padded(1, 2047))["id"], json!(1));
+    assert_eq!(door.ask(&padded(2, 2048))["id"], json!(2));
+    assert_eq!(door.refusal(&padded(3, 2049)), (None, -32600, "Invalid request: a message is at most 2 KiB".into()));
+    assert_eq!(door.ask(&request(json!(4), "tools/list", json!({})))["id"], json!(4));
+    door.close();
+    assert_eq!(door.ended(), Some(0));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(unix)]
+#[test]
+fn c1_review_a_message_begun_before_sigterm_is_answered() {
+    // The door is busy from a message's first byte: a stop while the rest is on its way waits for
+    // its answer, where it ended the process with the message read and unanswered.
+    let d = door_dir("half");
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    assert_eq!(door.call("clock", json!({}))["structuredContent"], json!({ "result": 7 }));
+    let m = call_line("hello", json!({ "name": "Ana" }));
+    let (first, rest) = m.split_at(m.len() / 2);
+    door.write(first.as_bytes());
+    std::thread::sleep(Duration::from_millis(300));
+    unsafe { libc::kill(door.pid() as i32, libc::SIGTERM) };
+    door.says("stopping once the call in progress is answered");
+    door.write(format!("{}\n", rest).as_bytes());
+    let a = door.next().expect("the message begun was not answered");
+    assert_eq!(a["result"]["content"][0]["text"], json!("hi Ana!"), "{}", a);
+    assert_eq!(door.ended(), Some(0));
     let _ = std::fs::remove_dir_all(&d);
 }
