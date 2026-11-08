@@ -2784,11 +2784,18 @@ fn mcp orders_today(limit: int = 20) -> list with db {
   `set_session` set there go nowhere), and they count toward the caller's 60 a minute. Apart,
   a call of billing's tools and its answer are also signed with the app's key, which only
   billing and its app hold (`QUILLO_APP_KEY` where billing runs, `QUILLO_APP_KEY_BILLING` where
-  the app runs, the same secret; `--split` sets both): only the app's door runs billing's
-  tools, never a plain call from code, another service, a token or a certificate. A `service
+  the app runs, the same secret of at least 32 bytes, refused shorter; `--split` makes one of
+  64 and sets both; `..._PREVIOUS` of each is accepted while keys change, never to sign). The
+  signature covers the call, its caller, deadline and contract, so a call sent again is the
+  same call, answered as before; only the app's door runs billing's tools, never a plain call
+  from code, another service, a token or a certificate. Tool calls go only to copies of billing
+  that proved its app's key when they joined (a copy with `QUILLO_APP_KEY` set signs its join
+  with it; a wrong proof is a `401`). A `service
   mcp` whose auth signs nothing (`auth: { bearer }`, OAuth or mTLS without a key) is refused by
   `quillo check`. A tool's call that a joined copy did not answer is not run again here: it
-  fails, as it may have run. Services must run this Quillo or later, so upgrade them before the
+  fails, as it may have run; and inside a tool's call that may ask, so does a plain call of a
+  service's function that a copy did not answer, which counts as a change. A service that
+  offers only tools is served under `--split`. Services must run this Quillo or later, so upgrade them before the
   app: an older one refuses a tool's call, and the app says so.
   The named form, `service mcp crm = "https://..."`, for calling another MCP server, is refused
   for now.

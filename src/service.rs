@@ -137,21 +137,40 @@ const JOINED_FOR: Duration = Duration::from_secs(15);
 /// How often a copy says it is still there.
 const HEARTBEAT: Duration = Duration::from_secs(5);
 
-/// The copies of each service that joined this process, and when each was
-/// last heard from (FEEDBACK10.md, Q-074; branch feedback10-fixes).
-fn joined() -> &'static Mutex<HashMap<String, HashMap<String, Instant>>> {
-    static J: OnceLock<Mutex<HashMap<String, HashMap<String, Instant>>>> = OnceLock::new();
+/// The copies of each service that joined this process, when each was
+/// last heard from (FEEDBACK10.md, Q-074; branch feedback10-fixes), and
+/// whether it proved, as it joined, that it holds the service's app key
+/// (FEEDBACK56.md, Part F, second review).
+type Copies = HashMap<String, HashMap<String, (Instant, bool)>>;
+
+fn joined() -> &'static Mutex<Copies> {
+    static J: OnceLock<Mutex<Copies>> = OnceLock::new();
     J.get_or_init(Default::default)
 }
 
 /// The copies of service `name` that joined and are still heard from.
 pub fn joined_urls(name: &str) -> Vec<String> {
+    joined_where(name, false)
+}
+
+/// Those of them that proved they hold its app's key: the only ones a tool's call is sent to, as
+/// it carries the person's session and arguments, and only billing may run billing's tools.
+pub fn joined_proved_urls(name: &str) -> Vec<String> {
+    joined_where(name, true)
+}
+
+fn joined_where(name: &str, proved: bool) -> Vec<String> {
     let mut j = joined().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(copies) = j.get_mut(name) else { return Vec::new() };
-    copies.retain(|_, at| at.elapsed() < JOINED_FOR);
-    let mut urls: Vec<String> = copies.keys().cloned().collect();
+    copies.retain(|_, (at, _)| at.elapsed() < JOINED_FOR);
+    let mut urls: Vec<String> = copies.iter().filter(|(_, (_, p))| *p || !proved).map(|(u, _)| u.clone()).collect();
     urls.sort();
     urls
+}
+
+/// What a copy signs its join with to prove it holds its service's app key (`x-quillo-app`).
+fn sign_join(key: &str, t: u64, service: &str, nonce: &str, body: &[u8]) -> String {
+    sign_app(key, t, service, "_join", "", nonce, "", "", "", body)
 }
 
 /// `POST /_quillo/join` on the app: a copy of one of its services joining
@@ -228,13 +247,23 @@ pub fn join_here(it: &Interp, req: &HttpRequest) -> HttpResponse {
             v4 => format!("http://{}:{}", v4, port),
         },
     };
+    // It proves it holds the service's app key, and is sent its tools' calls; a join that says it
+    // does and is not signed with it is refused (FEEDBACK56.md, Part F, second review).
+    let proved = match req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-quillo-app")).map(|(_, v)| v.as_str()) {
+        None => false,
+        Some(given) => match app_keys(&service) {
+            Ok(Some(keys)) if signed_by_any(given, &keys, &|k, t| sign_join(k, t, &service, nonce, &req.body)) => true,
+            Ok(Some(_)) => return refused(401, &format!("this copy's join is not signed with `{}`'s app key ({})", service, app_key_env(&service))),
+            Ok(None) | Err(_) => false,
+        },
+    };
     let mut j = joined().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let copies = j.entry(service.clone()).or_default();
     if body["leave"].as_bool() == Some(true) {
         if copies.remove(&url).is_some() {
             eprintln!("quillo: service {}: {} left", service, url);
         }
-    } else if copies.insert(url.clone(), Instant::now()).is_none() {
+    } else if copies.insert(url.clone(), (Instant::now(), proved)).is_none() {
         eprintln!("quillo: service {}: {} joined", service, url);
     }
     json(200, serde_json::json!({ "service": service, "at": url }))
@@ -303,13 +332,18 @@ impl Joining {
                 format!("t={},sig={}", t, signature(&secret, t, "_join", &self.service, "", &nonce, body.as_bytes()))
             }
         };
-        let r = agent()
+        let mut r = agent()
             .post(&format!("{}/_quillo/join", self.app))
             .timeout(Duration::from_secs(3))
             .set("content-type", "application/json")
             .set("x-quillo-service", &header)
-            .set("x-quillo-call", &nonce)
-            .send_string(&body);
+            .set("x-quillo-call", &nonce);
+        // Holding its app's key, it proves it, and is sent its tools' calls (FEEDBACK56.md, Part F,
+        // second review).
+        if let Ok(Some((k, _))) = app_keys_in(APP_KEY, &|v| std::env::var(v).ok()) {
+            r = r.set("x-quillo-app", &format!("t={},sig={}", t, sign_join(&k, t, &self.service, &nonce, body.as_bytes())));
+        }
+        let r = r.send_string(&body);
         match r {
             Ok(_) => Ok(()),
             Err(ureq::Error::Status(code, resp)) => Err(format!("{} {}", code, resp.into_string().unwrap_or_default().trim())),
@@ -806,7 +840,12 @@ fn make(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<A
             return local(it, name, f, args, tenant, rid, call.unwrap_or_else(|| new_id(16)), line);
         }
         let id = call.unwrap_or_else(|| new_id(16));
-        return match remote(it, &joined, name, f, args.clone(), tenant.clone(), rid.clone(), id.clone()) {
+        let mut sent = false;
+        return match remote_hop(it, &joined, name, f, args.clone(), tenant.clone(), rid.clone(), id.clone(), None, &mut sent) {
+            // In a tool's call that may ask, one sent and not answered may have run there: it is
+            // not run again here, where one yes would be used twice, and it is a change
+            // (`remote_hop`; FEEDBACK56.md, Part F, second review). Outside one, as before.
+            Outcome::Missed(why) if sent && it.asking.is_some() => Outcome::Missed(format!("the call to {} got no answer: it may have run ({})", name, why)),
             Outcome::Missed(_) => local(it, name, f, args, tenant, rid, id, line),
             ran => ran,
         };
@@ -907,7 +946,7 @@ fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<
     svc.current_request = Some(step_request(rid.as_deref(), &call));
     svc.request_id = rid;
     let err = |msg: String| Outcome::Refused(500, msg);
-    let carried = carry_in(it, &mut svc, name);
+    let Some(carried) = carry_in(it, &mut svc, name) else { return Outcome::Stopped };
     let r = svc.call_closure(&c, args.into_iter().map(Some).collect(), line);
     let label = format!("{}.{}", name, f);
     match (carry_back(it, &mut svc, carried, name, &label), r) {
@@ -961,16 +1000,18 @@ enum Back {
 /// The asking of the tool's call `it` makes, given to the handle on the service `name`, `svc`, for
 /// its call: what the signed call sends (`Asking::for_service`), so that the service runs the same
 /// in this process as apart, and reads only the answers to its own questions.
-fn carry_in(it: &mut Interp, svc: &mut Interp, name: &str) -> Carried {
-    let Some(a) = it.asking.as_ref() else { return Carried(false) };
+/// None where it could not be given: the call stops, and the service is not run with none
+/// (second review).
+fn carry_in(it: &mut Interp, svc: &mut Interp, name: &str) -> Option<Carried> {
+    let Some(a) = it.asking.as_ref() else { return Some(Carried(false)) };
     svc.asking = crate::mcp::Asking::from_wire(&a.for_service(name));
     if svc.asking.is_none() {
-        // Never, as the door made it: closed all the same.
         if let Some(a) = it.asking.as_mut() {
             a.fail();
         }
+        return None;
     }
-    Carried(true)
+    Some(Carried(true))
 }
 
 /// What `svc`'s call of `label` (`billing.charge`) of the service `name` did with the asking, taken
@@ -1003,7 +1044,8 @@ fn carry_back(it: &mut Interp, svc: &mut Interp, carried: Carried, name: &str, l
 /// `remote_hop` carry it. A service out of reach is `internal error`, the reason in the log.
 pub(crate) fn call_tool(it: &mut Interp, name: &str, tool: &crate::mcp::Tool, args: Vec<Option<Value>>, given: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
     let configured = configured_urls(&it.shared, name);
-    let joined = joined_urls(name);
+    // Only the copies that proved they hold billing's app key (second review).
+    let joined = joined_proved_urls(name);
     let out = if configured.is_empty() && joined.is_empty() {
         return local_tool(it, name, tool, args);
     } else {
@@ -1082,7 +1124,7 @@ fn local_tool(it: &mut Interp, name: &str, tool: &crate::mcp::Tool, args: Vec<Op
     let owner = crate::session::current_owner(it);
     crate::session::take_on(&mut svc, session, owner.as_deref().unwrap_or(""));
     svc.answering = true;
-    let carried = carry_in(it, &mut svc, name);
+    let Some(carried) = carry_in(it, &mut svc, name) else { return crate::mcp::tool_error("internal error") };
     let r = crate::mcp::answer_tool(&mut svc, tool, args);
     carry_back(it, &mut svc, carried, name, &tool.name);
     r
@@ -1284,10 +1326,84 @@ pub const APP_KEY: &str = "QUILLO_APP_KEY";
 
 /// The signature of a tool's call by its app's door, under the app's key: the time, the service,
 /// the tool, the tenant, the call's id and the body.
-pub fn sign_app(key: &str, t: u64, to: &str, f: &str, tenant: &str, call: &str, body: &[u8]) -> String {
-    let mut msg = format!("quillo-app-1\n{}\n{}\n{}\n{}\n{}\n", t, to, f, tenant, call).into_bytes();
+/// Everything that decides what runs or whom it is for is signed: the caller's name, the deadline,
+/// and the contract and the visitor's headers passed on (`covered`, as a version 3 signature
+/// covers them), so that whoever holds the services' shared secret can neither re-send it under
+/// another caller's name nor change any of it (FEEDBACK56.md, Part F, second review).
+#[allow(clippy::too_many_arguments)]
+pub fn sign_app(key: &str, t: u64, to: &str, f: &str, tenant: &str, call: &str, caller: &str, deadline: &str, covered: &str, body: &[u8]) -> String {
+    let mut msg = format!("quillo-app-2\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n", t, to, f, tenant, call, caller, deadline, covered).into_bytes();
     msg.extend_from_slice(body);
     crate::crypto::hex(&crate::crypto::hmac_sha256(key.as_bytes(), &msg))
+}
+
+/// The fewest bytes an app's key has: a secret as long as `--split` makes one (32 random bytes,
+/// written as 64 hex digits), so that it cannot be guessed (second review).
+pub const APP_KEY_LEAST: usize = 32;
+
+/// An app's key in `var`, and the one before it in `var_PREVIOUS`, taken while keys are changed
+/// machine by machine and never signing (second review): None where `var` is not set; an error
+/// where either is shorter than `APP_KEY_LEAST`.
+fn app_keys_in(var: &str, read: &dyn Fn(&str) -> Option<String>) -> Result<Option<(String, Option<String>)>, String> {
+    let get = |v: &str| read(v).filter(|k| !k.is_empty());
+    let Some(key) = get(var) else { return Ok(None) };
+    let previous_var = format!("{}_PREVIOUS", var);
+    let previous = get(&previous_var);
+    for (v, k) in [(var, Some(&key)), (previous_var.as_str(), previous.as_ref())] {
+        if let Some(k) = k.filter(|k| k.len() < APP_KEY_LEAST) {
+            return Err(format!("{} is {} bytes: an app's key is a secret of at least {} bytes (`quillo run --split` makes one of 64)", v, k.len(), APP_KEY_LEAST));
+        }
+    }
+    Ok(Some((key, previous)))
+}
+
+/// The app's keys for its service `name`: `QUILLO_APP_KEY_BILLING`, and its `_PREVIOUS`.
+fn app_keys(name: &str) -> Result<Option<(String, Option<String>)>, String> {
+    app_keys_in(&app_key_env(name), &|v| std::env::var(v).ok())
+}
+
+/// This service's keys of its app's: `QUILLO_APP_KEY`, and its `_PREVIOUS`, from its environment or
+/// its `.env`.
+fn own_app_keys(it: &Interp) -> Result<Option<(String, Option<String>)>, String> {
+    app_keys_in(APP_KEY, &|v| crate::dotenv::var(&it.env_file, v))
+}
+
+/// Whether `given` (`t=...,sig=...`) signs `sign(key, t)` with one of `keys`, lately.
+fn signed_by_any(given: &str, keys: &(String, Option<String>), sign: &dyn Fn(&str, u64) -> String) -> bool {
+    let g = crate::svcauth::signed(given);
+    !g.sig.is_empty() && now_secs().abs_diff(g.t) <= WINDOW && [Some(&keys.0), keys.1.as_ref()].into_iter().flatten().any(|k| crate::crypto::same(sign(k, g.t).as_bytes(), g.sig.as_bytes()))
+}
+
+/// Whether a call's body is a tool's call by the app's door (`ToolHop`).
+fn tool_call_body(body: &[u8]) -> bool {
+    body.first() == Some(&b'{') && matches!(crate::value::json_value(body), Ok(serde_json::Value::Object(m)) if m.contains_key("tool") && m.contains_key("mcp"))
+}
+
+/// A tool's call, checked before anything is answered, a remembered answer too: signed with this
+/// service's app's key, all that decides it covered (`sign_app`), lately. The key its answer is
+/// signed back with; else the refusal.
+fn from_its_app(it: &Interp, req: &HttpRequest, f: &str, tenant: &str) -> Result<String, HttpResponse> {
+    let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+    let to = header("x-quillo-to").unwrap_or("");
+    let keys = match own_app_keys(it) {
+        Ok(Some(k)) => k,
+        Ok(None) => return Err(refused(403, &no_app_key(to))),
+        Err(why) => return Err(refused(403, &why)),
+    };
+    let (call, caller, deadline) = (header("x-quillo-call").unwrap_or(""), header("x-quillo-caller").unwrap_or(""), header("x-quillo-deadline").unwrap_or(""));
+    let covered = format!("{}\n{}", header("x-quillo-contract").unwrap_or(""), crate::svcauth::forwarded_text(req.headers.iter().map(|(k, v)| (k.as_str(), v.as_str()))));
+    if !signed_by_any(header("x-quillo-app").unwrap_or(""), &keys, &|k, t| sign_app(k, t, to, f, tenant, call, caller, deadline, &covered, &req.body)) {
+        return Err(refused(401, "a tool's call is taken from this service's app alone, signed with its key (QUILLO_APP_KEY): this one is not, or is too old"));
+    }
+    Ok(keys.0)
+}
+
+/// `r`, a tool's answer, signed back with the app's key `key` for the call `call`.
+fn app_signed(mut r: HttpResponse, key: &str, call: &str) -> HttpResponse {
+    r.headers.retain(|(h, _)| h != "x-quillo-app-answer");
+    let sig = crate::svcauth::sign_answer(key, call, r.status, &r.body);
+    r.headers.push(("x-quillo-app-answer".into(), format!("sig={}", sig)));
+    r
 }
 
 /// What a call of a service's tool is refused with where the service has no key of its app's.
@@ -1326,9 +1442,10 @@ fn remote_tries(
     // A tool's call is signed with its app's key too, and its answer signed back with it: only
     // the app's door runs a service's tools (FEEDBACK56.md, Part F, security review).
     let app_key = match tool {
-        Some(_) => match std::env::var(app_key_env(name)).ok().filter(|k| !k.is_empty()) {
-            Some(k) => Some(k),
-            None => return Outcome::Refused(403, format!("service {}: {} is not set, the key its tools' calls are signed with (`quillo run --split` sets it)", name, app_key_env(name))),
+        Some(_) => match app_keys(name) {
+            Ok(Some(k)) => Some(k),
+            Ok(None) => return Outcome::Refused(403, format!("service {}: {} is not set, the key its tools' calls are signed with (`quillo run --split` sets it)", name, app_key_env(name))),
+            Err(why) => return Outcome::Refused(403, format!("service {}: {}", name, why)),
         },
         None => None,
     };
@@ -1406,7 +1523,7 @@ fn remote_tries(
         let mine = contracts().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(name.to_string(), f.to_string())).cloned().unwrap_or_default();
         let covered = format!("{}\n{}", mine, crate::svcauth::forwarded_text(passed.iter().map(|(k, v)| (k.as_str(), v.as_str()))));
         let sig = sign_key.as_ref().map(|k| format!("v=3,kid={},t={},sig={}", kid, t, crate::svcauth::sign3(k, t, name, f, &tenant, &call, &kid, &caller, &deadline, &covered, &body)));
-        let app_sig = app_key.as_ref().map(|k| format!("t={},sig={}", t, sign_app(k, t, name, f, &tenant, &call, &body)));
+        let app_sig = app_key.as_ref().map(|(k, _)| format!("t={},sig={}", t, sign_app(k, t, name, f, &tenant, &call, &caller, &deadline, &covered, &body)));
         let endpoint = format!("{}/_quillo/service/{}", url, f);
         let (b, tn, r, c, cl, to, app) = (body.clone(), tenant.clone(), rid.clone(), call.clone(), caller.clone(), name.to_string(), app_sig.clone());
         let (ag, oauth, bearer, passed) = (agent.clone(), a.oauth.clone(), bearer.clone(), passed.clone());
@@ -1517,8 +1634,8 @@ fn remote_tries(
                 }
                 // A tool's answer, signed back with the app's key too (FEEDBACK56.md, Part F,
                 // security review).
-                if let Some(k) = &app_key {
-                    let good = sig_of(&by_app, k) == Some(true);
+                if let Some((k, previous)) = &app_key {
+                    let good = [Some(k), previous.as_ref()].into_iter().flatten().any(|k| sig_of(&by_app, k) == Some(true));
                     if !good && status == 200 {
                         return Outcome::Refused(502, format!("service {}: the answer from {} is not signed with the app's key ({})", name, url, app_key_env(name)));
                     }
@@ -1738,7 +1855,22 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     // given the first one's answer (FEEDBACK51.md, Q-664; branch feedback51-fixes).
     let Value::Map(caller_map) = &caller else { unreachable!("a caller is a map: `caller_value`'s, or `check`'s") };
     let who = caller_map.get("name").map(|n| n.display()).unwrap_or_default();
-    let key = call_key(c, &who, f, tenant, &req.body);
+    // A tool's call by the app's door: its signature with the app's key checked first, before a
+    // remembered answer is given, and the call known by its signed id alone, so that one sent
+    // again under any caller's name is the same call, answered as it was and never run again
+    // (FEEDBACK56.md, Part F, second review).
+    let app = match tool_call_body(&req.body) {
+        true => match from_its_app(it, req, f, tenant) {
+            Ok(k) => Some(k),
+            Err(r) => return r,
+        },
+        false => None,
+    };
+    let call_id = c.to_string();
+    let key = match &app {
+        Some(_) => crate::idempotency::sha256_hex(&[b"quillo tool call\n", c.as_bytes()]),
+        None => call_key(c, &who, f, tenant, &req.body),
+    };
     let c = key.as_str();
     {
         let mut seen = seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1763,6 +1895,10 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     match shared {
         Some(crate::db::Claim::Done(status, body)) => {
             let r = HttpResponse { status, headers: vec![("content-type".into(), "application/json".into())], body: body.into_bytes() };
+            let r = match &app {
+                Some(k) => app_signed(r, k, &call_id),
+                None => r,
+            };
             seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(c.to_string(), (Instant::now(), Some(r.clone())));
             return signed_back(r);
         }
@@ -1953,15 +2089,13 @@ fn set_called(it: &mut Interp, tenant: &str, req: &HttpRequest, caller: Value) {
 /// reply (`Asking::reply`).
 fn run_tool_hop(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, caller: Value, m: &serde_json::Map<String, serde_json::Value>) -> HttpResponse {
     let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
-    let Some(key) = crate::dotenv::var(&it.env_file, APP_KEY).filter(|k| !k.is_empty()) else {
-        return refused(403, &no_app_key(header("x-quillo-to").unwrap_or("")));
+    // Its signature with the app's key was checked as it came (`answer`, `from_its_app`).
+    let key = match own_app_keys(it) {
+        Ok(Some((k, _))) => k,
+        Ok(None) => return refused(403, &no_app_key(header("x-quillo-to").unwrap_or(""))),
+        Err(why) => return refused(403, &why),
     };
     let call = header("x-quillo-call").unwrap_or("");
-    let given = crate::svcauth::signed(header("x-quillo-app").unwrap_or(""));
-    let want = sign_app(&key, given.t, header("x-quillo-to").unwrap_or(""), f, tenant, call, &req.body);
-    if given.sig.is_empty() || now_secs().abs_diff(given.t) > WINDOW || !crate::crypto::same(want.as_bytes(), given.sig.as_bytes()) {
-        return refused(401, "a tool's call is taken from this service's app alone, signed with its key (QUILLO_APP_KEY): this one is not, or is too old");
-    }
     let Some(tool) = it.offered_tools.as_ref().and_then(|t| t.iter().find(|t| t.name == f)).cloned() else {
         return refused(404, &format!("no tool `{}`", f));
     };
@@ -2005,10 +2139,7 @@ fn run_tool_hop(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, calle
     if !published.is_empty() {
         j["published"] = serde_json::json!(published);
     }
-    let mut r = json(200, j);
-    let signed = crate::svcauth::sign_answer(&key, call, r.status, &r.body);
-    r.headers.push(("x-quillo-app-answer".into(), format!("sig={}", signed)));
-    r
+    app_signed(json(200, j), &key, call)
 }
 
 /// Quillo's own addresses that are not passed on to a service under its

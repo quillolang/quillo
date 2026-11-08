@@ -8448,7 +8448,7 @@ fn f_signed_by(it: &mut Interp, f: &str, tenant: &str, body: &Value, app: Option
     }
     let id = headers[4].1.clone();
     if let Some(k) = app {
-        headers.push(("X-Quillo-App".to_string(), format!("t={},sig={}", t, quillo::service::sign_app(k, t, "billing", f, tenant, &id, body.as_bytes()))));
+        headers.push(("X-Quillo-App".to_string(), format!("t={},sig={}", t, quillo::service::sign_app(k, t, "billing", f, tenant, &id, "", "", "\n", body.as_bytes()))));
     }
     let r = it.handle(&quillo::server::HttpRequest { method: "POST".into(), url: format!("/_quillo/service/{}", f), headers, body: body.into_bytes(), remote: "127.0.0.1".into() });
     let text = String::from_utf8_lossy(&r.body).into_owned();
@@ -8458,7 +8458,7 @@ fn f_signed_by(it: &mut Interp, f: &str, tenant: &str, body: &Value, app: Option
 
 /// An asking as the app's door sends one: nothing answered yet.
 fn f_asking(can_ask: bool, nobody: bool) -> Value {
-    json!({ "can_ask": can_ask, "nobody": nobody, "answers": [], "pending": null, "reached": 0, "rounds": 0 })
+    json!({ "can_ask": can_ask, "nobody": nobody, "answers": [], "pending": null, "reached": 0, "rounds": 0, "wrote": null })
 }
 
 /// A tool's call by billing's app: signed with the app's key too, its answer signed back with it.
@@ -8594,7 +8594,9 @@ impl Drop for FakeService {
     }
 }
 
-type FakeAnswer = dyn Fn(&str, &str) -> Option<(u16, String, bool)> + Send + Sync;
+/// A stand-in's answer: its status and body, and whether it is signed back with the services'
+/// shared secret, and with billing's app key (`F_APP_KEY`).
+type FakeAnswer = dyn Fn(&str, &str) -> Option<(u16, String, bool, bool)> + Send + Sync;
 
 impl FakeService {
     fn start(answer: Arc<FakeAnswer>) -> FakeService {
@@ -8638,9 +8640,12 @@ impl FakeService {
                     let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
                     match answer(&path, &String::from_utf8_lossy(&body)) {
                         None => std::thread::sleep(Duration::from_secs(3)),
-                        Some((status, text, sign)) => {
+                        Some((status, text, sign, app)) => {
                             let call = header("x-quillo-call").unwrap_or_default();
-                            let sig = if sign { format!("x-quillo-answer: sig={}\r\n", quillo::svcauth::sign_answer(F_SECRET, &call, status, text.as_bytes())) } else { String::new() };
+                            let mut sig = if sign { format!("x-quillo-answer: sig={}\r\n", quillo::svcauth::sign_answer(F_SECRET, &call, status, text.as_bytes())) } else { String::new() };
+                            if app {
+                                sig.push_str(&format!("x-quillo-app-answer: sig={}\r\n", quillo::svcauth::sign_answer(F_APP_KEY, &call, status, text.as_bytes())));
+                            }
                             let out = format!("HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}", status, text.len(), sig, text);
                             let _ = c.write_all(out.as_bytes());
                         }
@@ -8668,6 +8673,21 @@ fn mcp older() -> str with http {
     let b = billing
     error(b.total()) ?? "no error"
 }
+
+/// Asks first, then reads billing's total.
+fn mcp first_then() -> str with http {
+    if !confirm("Sure?") { return "no" }
+    billing.total()
+    "done"
+}
+
+/// Writes, then calls billing, where the checker cannot see what billing does.
+fn mcp audited() -> str with db, http {
+    db.exec("insert into audit default values")
+    let b = billing
+    b.total()
+    "done"
+}
 "#;
 
 /// A reply as a service gives it back, saying it reached no question and changed nothing.
@@ -8675,54 +8695,117 @@ fn f_clean_reply() -> Value {
     json!({ "reached": 0, "kept": 0, "consumed": false, "wrote": null, "defaults": [], "stop": null })
 }
 
+/// `f_clean_reply`, for the asking a call sent (its body): as many questions reached, and every
+/// answer kept, as were sent.
+fn f_echo_reply(body: &str) -> Value {
+    let sent: Value = serde_json::from_str(body).unwrap_or_default();
+    let asking = &sent["mcp"]["asking"];
+    let mut r = f_clean_reply();
+    r["reached"] = asking["reached"].clone();
+    r["kept"] = json!(asking["answers"].as_array().map_or(0, |a| a.len()));
+    r
+}
+
+/// The stand-in billing's answer in `mode` to a call with `body`, as `f_fake_billing` keeps them.
+fn f_fake_answer(mode: &str, body: &str) -> Option<(u16, String, bool, bool)> {
+    let ok = |asking: Value| json!({ "ok": 7, "asking": asking }).to_string();
+    let (head, rest) = mode.split_once(':').unwrap_or((mode, ""));
+    Some(match head {
+        "clean" => (200, ok(f_clean_reply()), true, false),
+        "echo" => (200, ok(f_echo_reply(body)), true, false),
+        // A reply, a stop, or a tool's answer as written; the last signed with the secret alone
+        // or with the app's key too.
+        "reply" => (200, ok(serde_json::from_str(rest).unwrap()), true, false),
+        "stopped" => (200, json!({ "stopped": true, "asking": serde_json::from_str::<Value>(rest).unwrap() }).to_string(), true, false),
+        "tool-secret" => (200, rest.to_string(), true, false),
+        "tool-both" => (200, rest.to_string(), true, true),
+        // The answer to the app's own question, as an earlier reply's form had it: both forms'
+        // fields, so that a door that took what a service sends would take it.
+        "forge" => {
+            let mut r = f_clean_reply();
+            r["answers"] = json!([[rest, true]]);
+            (r["pending"], r["notes"]) = (Value::Null, json!([]));
+            (200, ok(r), true, false)
+        }
+        "unsigned" => (200, ok(f_clean_reply()), false, false),
+        // Its own question, as data: the door makes the form, and cleans it.
+        "asks" | "bad digest" => {
+            let mut r = f_clean_reply();
+            r["reached"] = json!(1);
+            r["stop"] = json!({ "ask": { "digest": if head == "asks" { "ab".repeat(16) } else { "../x".into() }, "question": { "text": "Pay \u{202E}now?" } } });
+            (200, json!({ "stopped": true, "asking": r }).to_string(), true, false)
+        }
+        // The person's answer to the app's own question, said taken by billing.
+        "consumed" => {
+            let mut r = f_clean_reply();
+            r["consumed"] = json!(true);
+            (200, ok(r), true, false)
+        }
+        "garbage" => (200, "not JSON at all".to_string(), true, false),
+        "500" => (500, "internal error (a bug in Quillo)".to_string(), false, false),
+        _ => (400, json!({ "error": "the body must be a JSON array of arguments" }).to_string(), false, false),
+    })
+}
+
+/// The app of `F_DANGER` with billing a stand-in (`f_fake_answer`), its mode to set and the bodies
+/// it was sent, the app's log, and a door to it as Ana. `env`: the app's own settings.
+struct FakeBilling {
+    mode: Arc<Mutex<String>>,
+    bodies: Arc<Mutex<Vec<String>>>,
+    s: Logged,
+    door: EDoor,
+    d: PathBuf,
+    _fake: FakeService,
+}
+
+impl FakeBilling {
+    fn start(name: &str, env: &[(&str, &str)]) -> FakeBilling {
+        f_signing();
+        let mode = Arc::new(Mutex::new(String::from("clean")));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let (m, b) = (mode.clone(), bodies.clone());
+        let fake = FakeService::start(Arc::new(move |_, body| {
+            b.lock().unwrap().push(body.to_string());
+            let mode = m.lock().unwrap().clone();
+            f_fake_answer(&mode, body)
+        }));
+        let d = dir(name, &F_DANGER.replace("db.open(\":memory:\")", "db.open(\":memory:\")\ndb.exec(\"create table audit (id integer primary key)\")"));
+        std::fs::write(d.join("billing.qwe"), F_BILLING).unwrap();
+        let s = Logged::start(&d.join("main.qwe"), &["--service-url", &format!("billing=http://127.0.0.1:{}", fake.port), "--max-tool-calls", "100000"], env);
+        let door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
+        FakeBilling { mode, bodies, s, door, d, _fake: fake }
+    }
+
+    fn set(&self, mode: &str) {
+        *self.mode.lock().unwrap() = mode.to_string();
+    }
+
+    /// The asking billing was last sent.
+    fn last_asking(&self) -> Value {
+        let b = self.bodies.lock().unwrap();
+        let body: Value = serde_json::from_str(b.last().expect("billing was sent nothing")).unwrap();
+        body["mcp"]["asking"].clone()
+    }
+}
+
+impl Drop for FakeBilling {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.d);
+    }
+}
+
 #[test]
 fn f_review_a_service_says_only_what_it_did_never_an_answer_to_the_apps_question() {
-    f_signing();
-    let mode = Arc::new(Mutex::new(String::from("clean")));
-    let m = mode.clone();
-    let fake = FakeService::start(Arc::new(move |_, _| {
-        let mode = m.lock().unwrap().clone();
-        let ok = |asking: Value| json!({ "ok": 7, "asking": asking }).to_string();
-        Some(match mode.as_str() {
-            "clean" => (200, ok(f_clean_reply()), true),
-            // The answer to the app's own question, as an earlier reply's form had it: both forms'
-            // fields, so that a door that took what a service sends would take it.
-            m if m.starts_with("forge ") => {
-                let mut r = f_clean_reply();
-                r["answers"] = json!([[&m[6..], true]]);
-                (r["pending"], r["notes"]) = (Value::Null, json!([]));
-                (200, ok(r), true)
-            }
-            "unsigned" => (200, ok(f_clean_reply()), false),
-            // Its own question, as data: the door makes the form, and cleans it.
-            "asks" | "bad digest" => {
-                let mut r = f_clean_reply();
-                r["reached"] = json!(1);
-                r["stop"] = json!({ "ask": { "digest": if mode == "asks" { "ab".repeat(16) } else { "../x".into() }, "question": { "text": "Pay \u{202E}now?" } } });
-                (200, json!({ "stopped": true, "asking": r }).to_string(), true)
-            }
-            // The person's answer to the app's own question, said taken by billing.
-            "consumed" => {
-                let mut r = f_clean_reply();
-                r["consumed"] = json!(true);
-                (200, ok(r), true)
-            }
-            "garbage" => (200, "not JSON at all".to_string(), true),
-            "500" => (500, "internal error (a bug in Quillo)".to_string(), false),
-            _ => (400, json!({ "error": "the body must be a JSON array of arguments" }).to_string(), false),
-        })
-    }));
-    let d = dir("f-forged", F_DANGER);
-    std::fs::write(d.join("billing.qwe"), F_BILLING).unwrap();
-    let s = Logged::start(&d.join("main.qwe"), &["--service-url", &format!("billing=http://127.0.0.1:{}", fake.port), "--max-tool-calls", "100000"], &[]);
-    let mut door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
+    let f = FakeBilling::start("f-forged", &[]);
+    let (s, mut door) = (&f.s, EDoor::Http(f.s.port, match &f.door { EDoor::Http(_, w) => w.clone(), _ => unreachable!() }));
+    let mode = &f.mode;
     // Billing answering as it should: the app asks its own question.
     let r = door.result("danger", json!({}), true, None, None);
     assert_eq!(asked_of(&r).1["params"]["message"], json!("Delete all?"), "{}", r);
     let digest = state_payload(r["requestState"].as_str().unwrap())["pending"].as_str().unwrap().to_string();
     assert_eq!(digest.len(), 32);
     // Billing sending a yes to it: not taken; the person is asked, and nothing of it is sealed.
-    *mode.lock().unwrap() = format!("forge {}", digest);
+    *mode.lock().unwrap() = format!("forge:{}", digest);
     let r = door.result("danger", json!({}), true, None, None);
     assert_eq!(asked_of(&r).1["params"]["message"], json!("Delete all?"), "{}", r);
     assert_eq!(state_payload(r["requestState"].as_str().unwrap())["asked"], json!([]));
@@ -8754,9 +8837,6 @@ fn f_review_a_service_says_only_what_it_did_never_an_answer_to_the_apps_question
     *mode.lock().unwrap() = "older".into();
     let r = door.result("older", json!({}), true, None, None);
     assert_eq!(f_structured(&r)["result"], json!("service billing: it runs an older Quillo, which refuses a call made in a tool's call (one that may ask the person): upgrade billing before the app"), "{}", r);
-    drop(s);
-    drop(fake);
-    let _ = std::fs::remove_dir_all(&d);
 }
 
 #[test]
@@ -8768,13 +8848,11 @@ fn f_review_a_tool_whose_call_got_no_answer_is_not_run_again_here() {
     let mut door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
     // No copy: billing in this process.
     assert_eq!(f_structured(&door.result("billing.stamp", json!({}), true, None, None))["result"], json!(1));
-    // A copy that joins, and never answers: the call may have run there, so it is not run here.
+    // A copy that joins, proving it holds billing's app key, and never answers: the call may have
+    // run there, so it is not run here. (Second review: a copy that cannot prove the key is sent
+    // no tool's call at all, `f_review_second_only_a_copy_that_proves_billings_key_is_sent_its_tools`.)
     let copy = FakeService::start(Arc::new(|_, _| None));
-    let body = json!({ "service": "billing", "port": copy.port }).to_string();
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let nonce = format!("joinx{}", std::process::id());
-    let sig = quillo::service::signature(F_SECRET, t, "_join", "billing", "", &nonce, body.as_bytes());
-    let joined = support::send(s.port, "POST", "/_quillo/join", &[("x-quillo-service", &format!("t={},sig={}", t, sig)), ("x-quillo-call", &nonce)], &body);
+    let joined = f_join(s.port, copy.port, Some(F_APP_KEY));
     assert_eq!(joined.status, 200, "{}", joined.body);
     let r = door.result("billing.stamp", json!({}), true, None, None);
     assert_eq!(text_of(&r), (true, "internal error".into()), "{}", r);
@@ -8793,7 +8871,7 @@ fn f_review_billing_runs_its_tools_only_with_its_apps_key() {
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let call = format!("hop{}x{}", fastrand::u32(..), std::process::id());
         let sig = quillo::service::signature(F_SECRET, t, "billing", "own_only", "", &call, body.as_bytes());
-        let app = quillo::service::sign_app(key, t, "billing", "own_only", "", &call, body.as_bytes());
+        let app = quillo::service::sign_app(key, t, "billing", "own_only", "", &call, "", "", "\n", body.as_bytes());
         let h = [("x-quillo-service", format!("t={},sig={}", t, sig)), ("x-quillo-to", "billing".into()), ("x-quillo-call", call.clone()), ("x-quillo-app", format!("t={},sig={}", t, app))];
         let refs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
         (support::send(port, "POST", "/_quillo/service/own_only", &refs, &body), call)
@@ -8850,4 +8928,439 @@ fn f_review_quillo_check_counts_a_services_own_calls_as_changes() {
     assert_eq!(errors("far"), [after("far")]);
     // A service's call seen whole to write nothing is none.
     assert_eq!(errors("relay"), Vec::<String>::new());
+}
+
+// ---- Slice 8, second security review (FEEDBACK56.md, Part F) ----------------------------------
+
+const F_PAY: &str = r#"db.open(":memory:")
+db.exec("create table audit (id integer primary key)")
+service mcp /billing = "billing.qwe"
+
+route POST /login ? { user: str } = set_session({ user: user })
+route GET /audits = str(db.one("select count(*) as n from audit").n)
+
+/// Pays back, after an audit row, where the checker cannot see billing's question.
+fn mcp pay(c: int) -> int with db, http {
+    db.exec("insert into audit default values")
+    let b = billing
+    b.refund(c)
+}
+
+/// Writes in billing, then billing asks, where the checker cannot see either.
+fn mcp twice(c: int) -> int with http {
+    let b = billing
+    b.write(c)
+    b.refund(c)
+}
+"#;
+
+/// A change the app made before billing's question refuses it, as the app refuses its own: run
+/// once, the question never asked; in one process (stdio and HTTP) and under `--split`.
+#[test]
+fn f_review_second_a_change_in_the_app_refuses_billings_question() {
+    for apart in [false, true] {
+        let d = dir(&format!("f-pay-{}", apart), F_PAY);
+        std::fs::write(d.join("billing.qwe"), F_BILLING).unwrap();
+        let opts: &[&str] = if apart { &["--split", "--max-tool-calls", "100000"] } else { &["--max-tool-calls", "100000"] };
+        let s = Logged::start(&d.join("main.qwe"), opts, &[]);
+        let mut doors = vec![EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])))];
+        if !apart {
+            doors.push(EDoor::Stdio(Stdio::start(&d, &["main.qwe"])));
+        }
+        for (i, mut door) in doors.into_iter().enumerate() {
+            let before = f_count(&mut door);
+            for _ in 0..2 {
+                let r = door.result("pay", json!({ "c": 3 }), true, None, None);
+                assert_eq!(text_of(&r), (true, "internal error".into()), "{}", r);
+                let r = door.result("twice", json!({ "c": 4 }), true, None, None);
+                assert_eq!(text_of(&r), (true, "internal error".into()), "{}", r);
+            }
+            // Each call ran once: billing's write stands, its refund was never asked.
+            assert_eq!(f_count(&mut door), before + 2);
+            if i == 0 {
+                assert_eq!(support::send(s.port, "GET", "/audits", &[], "").body, "2");
+                let by = if apart { "[billing] quillo: error in server fn `refund` (called by a service)" } else { "quillo: service billing: error in `refund`" };
+                let log = s.says("`confirm` comes after `db.exec`: ask before changing anything");
+                assert!(log.lines().any(|l| l.starts_with(by) || log.contains(by)), "{}", log);
+                s.says("`confirm` comes after `db.exec` (in `billing.write`): ask before changing anything");
+            } else {
+                let err = door.stderr();
+                assert!(err.contains("error in `refund`") && err.contains("`confirm` comes after `db.exec` (in `billing.write`)"), "{}", err);
+            }
+        }
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// What billing is sent: no answer the person gave the app, no question the app asked last, and
+/// the app's change, where it made one.
+#[test]
+fn f_review_second_billing_is_sent_only_its_own() {
+    let mut f = FakeBilling::start("f-sent", &[]);
+    f.set("echo");
+    // Billing first, the app's question after it: the app's question asked last is not sent.
+    let r = f.door.result("danger", json!({}), true, None, None);
+    let state = r["requestState"].as_str().unwrap().to_string();
+    let r = f.door.result("danger", json!({}), true, Some(&state), Some(one("q1", yes())));
+    assert_eq!(f_structured(&r)["result"], json!("deleted"), "{}", r);
+    let sent = f.last_asking();
+    assert_eq!((sent["answers"].clone(), sent["pending"].clone(), sent["wrote"].clone()), (json!([]), Value::Null, Value::Null), "{}", sent);
+    // The app's question answered first: its answer is none of billing's.
+    let r = f.door.result("first_then", json!({}), true, None, None);
+    let state = r["requestState"].as_str().unwrap().to_string();
+    let r = f.door.result("first_then", json!({}), true, Some(&state), Some(one("q1", yes())));
+    assert_eq!(f_structured(&r)["result"], json!("done"), "{}", r);
+    let sent = f.last_asking();
+    assert_eq!((sent["answers"].clone(), sent["pending"].clone(), sent["reached"].clone()), (json!([null]), Value::Null, json!(1)), "{}", sent);
+    // The app's change, said to billing.
+    let r = f.door.result("audited", json!({}), true, None, None);
+    assert_eq!(f_structured(&r)["result"], json!("done"), "{}", r);
+    assert_eq!(f.last_asking()["wrote"], json!("`db.exec`"));
+}
+
+/// What the app takes of a service's reply, each refusal on its own (every case is run, and all
+/// that came out otherwise are said together).
+#[test]
+fn f_review_second_the_bounds_of_what_a_reply_says() {
+    let mut f = FakeBilling::start("f-bounds", &[]);
+    let mut wrong = Vec::new();
+    let mut echo_with = |change: &dyn Fn(&mut Value)| -> String {
+        // `first_then`: the app's question answered (one reached, one answer), then billing.
+        let r = f.door.result("first_then", json!({}), true, None, None);
+        let state = r["requestState"].as_str().unwrap().to_string();
+        let mut reply = f_clean_reply();
+        (reply["reached"], reply["kept"]) = (json!(1), json!(1));
+        change(&mut reply);
+        f.set(&format!("reply:{}", reply));
+        let r = f.door.result("first_then", json!({}), true, Some(&state), Some(one("q1", yes())));
+        let (e, t) = text_of(&r);
+        if e { t } else { f_structured(&r)["result"].as_str().unwrap_or_default().to_string() }
+    };
+    let cases: Vec<(&str, Box<dyn Fn(&mut Value)>, &str)> = vec![
+        ("as sent", Box::new(|_| {}), "done"),
+        ("reached fewer than the call had", Box::new(|r| r["reached"] = json!(0)), "internal error"),
+        ("reached more than a call asks", Box::new(|r| r["reached"] = json!(101)), "internal error"),
+        ("reached as many as a call asks", Box::new(|r| r["reached"] = json!(100)), "done"),
+        ("kept more than it was sent", Box::new(|r| r["kept"] = json!(2)), "internal error"),
+        ("kept fewer than the call had reached", Box::new(|r| r["kept"] = json!(0)), "internal error"),
+        ("took an answer that was not its own", Box::new(|r| r["consumed"] = json!(true)), "internal error"),
+    ];
+    for (what, change, want) in &cases {
+        let got = echo_with(&**change);
+        if got != *want {
+            wrong.push(format!("{}: {:?}, not {:?}", what, got, want));
+        }
+    }
+    // Its own question, for a client that cannot ask, or after the app's change: refused.
+    f.set("asks");
+    let r = f.door.result("danger", json!({}), false, None, None);
+    if text_of(&r) != (true, "internal error".into()) {
+        wrong.push(format!("asked of a client that cannot ask: {}", r));
+    }
+    let r = f.door.result("audited", json!({}), true, None, None);
+    if text_of(&r) != (true, "internal error".into()) {
+        wrong.push(format!("asked after the app's change: {}", r));
+    }
+    // What it says the person declined, or was not asked: 1,000 characters at most.
+    let long = "x".repeat(5000);
+    let mut stop = f_clean_reply();
+    (stop["reached"], stop["stop"]) = (json!(1), json!({ "said": { "declined": long } }));
+    f.set(&format!("stopped:{}", stop));
+    let r = f.door.result("danger", json!({}), true, None, None);
+    let said = format!("the user declined to answer: {}...", "x".repeat(1000));
+    if text_of(&r) != (true, said.clone()) {
+        wrong.push(format!("declined: {} characters", text_of(&r).1.len()));
+    }
+    let mut notes = f_clean_reply();
+    (notes["reached"], notes["defaults"]) = (json!(1), json!([[long, long]]));
+    f.set(&format!("reply:{}", notes));
+    let r = f.door.result("older", json!({}), false, None, None);
+    let note = r["content"][1]["text"].as_str().unwrap_or_default().to_string();
+    if note != format!("the user was not asked \"{0}...\": the default \"{0}...\" was taken", "x".repeat(1000)) {
+        wrong.push(format!("not asked: {} characters ({})", note.len(), r));
+    }
+    assert!(wrong.is_empty(), "{:#?}", wrong);
+}
+
+/// A tool's answer is signed back with the app's key, the one before it taken while keys change,
+/// and a key too short refused, said so.
+#[test]
+fn f_review_second_the_apps_key_signs_a_tools_answer() {
+    let answer = json!({ "tool": { "content": [{ "type": "text", "text": "\"from the stand-in\"" }], "structuredContent": { "result": "from the stand-in" } }, "asking": null });
+    let mut f = FakeBilling::start("f-app-answer", &[("QUILLO_APP_KEY_BILLING", F_APP_KEY)]);
+    f.set(&format!("tool-secret:{}", answer));
+    assert_eq!(text_of(&f.door.result("billing.own_only", json!({}), true, None, None)), (true, "internal error".into()));
+    f.s.says("is not signed with the app's key (QUILLO_APP_KEY_BILLING)");
+    f.set(&format!("tool-both:{}", answer));
+    assert_eq!(f_structured(&f.door.result("billing.own_only", json!({}), true, None, None))["result"], json!("from the stand-in"));
+    drop(f);
+    // A new key, the old one before it: an answer signed with the old one is taken.
+    let new = "feedback56-f-the-apps-next-key-for-billing!";
+    let mut f = FakeBilling::start("f-app-previous", &[("QUILLO_APP_KEY_BILLING", new), ("QUILLO_APP_KEY_BILLING_PREVIOUS", F_APP_KEY)]);
+    f.set(&format!("tool-both:{}", answer));
+    assert_eq!(f_structured(&f.door.result("billing.own_only", json!({}), true, None, None))["result"], json!("from the stand-in"));
+    drop(f);
+    // 31 bytes: refused; 32: taken (the stand-in signs with its own key, so refused for that).
+    for (key, said) in [("k".repeat(31), "QUILLO_APP_KEY_BILLING is 31 bytes: an app's key is a secret of at least 32 bytes"), ("k".repeat(32), "is not signed with the app's key")] {
+        let mut f = FakeBilling::start("f-app-short", &[("QUILLO_APP_KEY_BILLING", &key)]);
+        f.set(&format!("tool-both:{}", answer));
+        assert_eq!(text_of(&f.door.result("billing.own_only", json!({}), true, None, None)), (true, "internal error".into()));
+        f.s.says(said);
+    }
+}
+
+/// A tool's call, as the app's door makes one, sent to billing in this process: what the app
+/// signed (its caller and the visitor's headers) and what is sent may differ, as a relay that
+/// holds the services' shared secret would make them.
+struct ToolCall {
+    f: String,
+    body: String,
+    call: String,
+    t: u64,
+    app_t: u64,
+    /// The key the app's signature is made with.
+    key: String,
+    signed: (String, Vec<(String, String)>),
+    sent: (String, Vec<(String, String)>),
+}
+
+impl ToolCall {
+    fn new(f: &str, body: Value) -> ToolCall {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let call = format!("tc{}x{}", N.fetch_add(1, std::sync::atomic::Ordering::SeqCst), std::process::id());
+        ToolCall { f: f.into(), body: body.to_string(), call, t, app_t: t, key: F_APP_KEY.into(), signed: ("main".into(), Vec::new()), sent: ("main".into(), Vec::new()) }
+    }
+
+    fn covered(forwarded: &[(String, String)]) -> String {
+        format!("\n{}", quillo::svcauth::forwarded_text(forwarded.iter().map(|(k, v)| (k.as_str(), v.as_str()))))
+    }
+
+    /// Its status and JSON, and whether its answer is signed back with the app's key.
+    fn send(&self, it: &mut Interp) -> (u16, Value, bool) {
+        let (caller, forwarded) = &self.sent;
+        let sig = quillo::svcauth::sign3(F_SECRET, self.t, "billing", &self.f, "", &self.call, "", caller, "", &ToolCall::covered(forwarded), self.body.as_bytes());
+        let app = quillo::service::sign_app(&self.key, self.app_t, "billing", &self.f, "", &self.call, &self.signed.0, "", &ToolCall::covered(&self.signed.1), self.body.as_bytes());
+        let mut headers = vec![
+            ("Host".to_string(), "localhost".to_string()),
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("X-Quillo-Service".to_string(), format!("v=3,t={},sig={}", self.t, sig)),
+            ("X-Quillo-To".to_string(), "billing".to_string()),
+            ("X-Quillo-Call".to_string(), self.call.clone()),
+            ("X-Quillo-Caller".to_string(), caller.clone()),
+            ("X-Quillo-App".to_string(), format!("t={},sig={}", self.app_t, app)),
+        ];
+        headers.extend(forwarded.iter().cloned());
+        let r = it.handle(&quillo::server::HttpRequest { method: "POST".into(), url: format!("/_quillo/service/{}", self.f), headers, body: self.body.clone().into_bytes(), remote: "127.0.0.1".into() });
+        let text = String::from_utf8_lossy(&r.body).into_owned();
+        let back = r.headers.iter().any(|(h, v)| h == "x-quillo-app-answer" && *v == format!("sig={}", quillo::svcauth::sign_answer(F_APP_KEY, &self.call, r.status, &r.body)));
+        (r.status, serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {}", e, text)), back)
+    }
+}
+
+/// Billing in this process, run as a service, its tools offered.
+fn f_billing_here(name: &str) -> (PathBuf, Interp) {
+    f_signing();
+    let d = f_dir(name);
+    let mut it = Interp::new(&d);
+    it.is_service = true;
+    it.load_file(&d.join("billing.qwe")).unwrap();
+    mcp::open_door(&mut it, &d.join("billing.qwe"), None);
+    (d, it)
+}
+
+/// A tool's call sent again is the same call, whatever caller's name it carries: answered as it
+/// was, never run again; one whose caller or visitor's headers were changed on the way is refused.
+#[test]
+fn f_review_second_a_tool_call_is_one_call_whatever_the_callers_name() {
+    let (d, mut it) = f_billing_here("f-replay");
+    let mcp_of = |asking: Value| json!({ "asking": asking, "session": {}, "owner": null, "client": null });
+    let charge = |asking: Value| json!({ "tool": "charge", "arguments": { "cents": 9 }, "mcp": mcp_of(asking) });
+    let count = |it: &mut Interp| ToolCall::new("how_many", json!({ "tool": "how_many", "arguments": {}, "mcp": mcp_of(Value::Null) })).send(it).1["tool"]["structuredContent"]["result"].as_i64().unwrap();
+    // The person's answers to billing's two questions, as the app's door sends them.
+    let (_, r, _) = ToolCall::new("charge", charge(f_asking(true, false))).send(&mut it);
+    let d1 = r["asking"]["stop"]["ask"]["digest"].as_str().unwrap().to_string();
+    let mut a = f_asking(true, false);
+    a["pending"] = json!([d1, { "action": "accept", "content": { "choice": "card" } }]);
+    let (_, r, _) = ToolCall::new("charge", charge(a)).send(&mut it);
+    let d2 = r["asking"]["stop"]["ask"]["digest"].as_str().unwrap().to_string();
+    let mut a = f_asking(true, false);
+    a["answers"] = json!([[d1, { "action": "accept", "content": { "choice": "card" } }]]);
+    a["pending"] = json!([d2, { "action": "accept", "content": { "confirm": true } }]);
+    let before = count(&mut it);
+    let call = ToolCall::new("charge", charge(a));
+    let (status, first, signed_back) = call.send(&mut it);
+    assert_eq!((status, signed_back, first["tool"]["structuredContent"]["how"].clone()), (200, true, json!("card")), "{}", first);
+    // The same, again: answered as it was.
+    assert_eq!(call.send(&mut it), (200, first.clone(), true));
+    // Under another caller's name, or with a visitor's header added, re-signed with the shared
+    // secret: the app's signature does not hold. Nor does one with another key, which no answer
+    // remembered is given to.
+    let refused = (401, json!({ "error": "a tool's call is taken from this service's app alone, signed with its key (QUILLO_APP_KEY): this one is not, or is too old" }), false);
+    let forged = ToolCall { key: "feedback56-f-a-key-that-is-not-the-apps".into(), ..ToolCall { f: call.f.clone(), body: call.body.clone(), call: call.call.clone(), key: String::new(), signed: call.signed.clone(), sent: call.sent.clone(), ..call } };
+    assert_eq!(forged.send(&mut it), refused);
+    let mut other = ToolCall { sent: ("reports".into(), Vec::new()), ..call };
+    assert_eq!(other.send(&mut it), refused);
+    other.sent = ("main".into(), vec![("x-quillo-forward-authorization".into(), "Bearer someone-else".into())]);
+    assert_eq!(other.send(&mut it), refused);
+    assert_eq!(count(&mut it), before + 1);
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The app's signature of a tool's call is good for 300 seconds either way, as a service call's is.
+#[test]
+fn f_review_second_the_apps_signature_is_good_for_five_minutes() {
+    let (d, mut it) = f_billing_here("f-window");
+    let body = json!({ "tool": "own_only", "arguments": {}, "mcp": { "asking": null, "session": {}, "owner": null, "client": null } });
+    for (ago, want) in [(299i64, 200u16), (300, 200), (301, 401), (-301, 401)] {
+        let mut c = ToolCall::new("own_only", body.clone());
+        c.app_t = (c.t as i64 - ago) as u64;
+        assert_eq!(c.send(&mut it).0, want, "{} s ago", ago);
+    }
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A join, signed as `f_review_a_tool_whose_call_got_no_answer_is_not_run_again_here`'s is, with a
+/// proof of billing's app key when `proof` is given.
+fn f_join(port: u16, copy: u16, proof: Option<&str>) -> support::Answer {
+    let body = json!({ "service": "billing", "port": copy }).to_string();
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let nonce = format!("join{}x{}", fastrand::u32(..), std::process::id());
+    let sig = quillo::service::signature(F_SECRET, t, "_join", "billing", "", &nonce, body.as_bytes());
+    let mut h = vec![("x-quillo-service".to_string(), format!("t={},sig={}", t, sig)), ("x-quillo-call".to_string(), nonce.clone())];
+    if let Some(k) = proof {
+        h.push(("x-quillo-app".into(), format!("t={},sig={}", t, quillo::service::sign_app(k, t, "billing", "_join", "", &nonce, "", "", "", body.as_bytes()))));
+    }
+    let refs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    support::send(port, "POST", "/_quillo/join", &refs, &body)
+}
+
+/// A copy that joined with the services' shared secret alone is sent no tool's call, which
+/// carries the person's session and arguments: only one that proved it holds billing's app key.
+#[test]
+fn f_review_second_only_a_copy_that_proves_billings_key_is_sent_its_tools() {
+    f_signing();
+    let d = dir("f-proof", "service mcp /billing = \"billing.qwe\" { timeout: \"1s\", retries: 0 }\nroute POST /login ? { user: str } = set_session({ user: user })\n");
+    std::fs::write(d.join("billing.qwe"), F_BILLING).unwrap();
+    let s = Logged::start(&d.join("main.qwe"), &[], &[("QUILLO_APP_KEY_BILLING", F_APP_KEY)]);
+    let mut door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let a = asked.clone();
+    let posing = FakeService::start(Arc::new(move |_, _| {
+        a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        None
+    }));
+    assert_eq!(f_join(s.port, posing.port, None).status, 200);
+    let r = door.result("billing.own_only", json!({}), true, None, None);
+    assert_eq!(f_structured(&r)["result"], json!("billing's own"), "{}", r);
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // A proof with another key: refused; with billing's: it is sent them.
+    let answer = json!({ "tool": { "content": [{ "type": "text", "text": "\"from the copy\"" }], "structuredContent": { "result": "from the copy" } }, "asking": null }).to_string();
+    let copy = FakeService::start(Arc::new(move |_, _| Some((200, answer.clone(), true, true))));
+    assert_eq!(f_join(s.port, copy.port, Some("feedback56-f-not-billings-app-key-at-all")).status, 401);
+    assert_eq!(f_join(s.port, copy.port, Some(F_APP_KEY)).status, 200);
+    let r = door.result("billing.own_only", json!({}), true, None, None);
+    assert_eq!(f_structured(&r)["result"], json!("from the copy"), "{}", r);
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop((copy, posing, s));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// In a tool's call that may ask, a server fn's call that a joined copy did not answer is not run
+/// again here, where one yes would be used twice; a page's is, as before.
+#[test]
+fn f_review_second_in_a_tool_a_lost_server_fn_call_is_not_run_again_here() {
+    f_signing();
+    let main = "service mcp /billing = \"billing.qwe\" { timeout: \"500ms\", retries: 0 }\nroute POST /login ? { user: str } = set_session({ user: user })\nroute POST /page = str(billing.stamp())\n/// Calls billing's stamp, where the checker cannot see it.\nfn mcp plain_call() -> str with http {\n    let b = billing\n    let r = b.stamp()\n    error(r) ?? str(r)\n}\n";
+    let d = dir("f-lost-plain", main);
+    std::fs::write(d.join("billing.qwe"), "db.open(\":memory:\")\ndb.exec(\"create table s (id integer primary key)\")\n/// T.\nfn mcp none() -> int with time = 1\nserver fn stamp() -> int with db {\n    db.exec(\"insert into s default values\")\n    db.one(\"select count(*) as n from s\").n\n}\n").unwrap();
+    let s = Logged::start(&d.join("main.qwe"), &[], &[]);
+    let mut door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
+    let copy = FakeService::start(Arc::new(|_, _| None));
+    assert_eq!(f_join(s.port, copy.port, None).status, 200);
+    let r = door.result("plain_call", json!({}), true, None, None);
+    let said = f_structured(&r)["result"].as_str().unwrap_or_default().to_string();
+    assert!(said.starts_with("the call to billing got no answer: it may have run"), "{}", r);
+    assert_eq!(support::send(s.port, "POST", "/page", &[], "").body, "1");
+    drop((copy, s));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A nested service's two questions, through billing: each asked once, in order, its answer kept;
+/// in one process (stdio and HTTP) and under `--split`.
+#[test]
+fn f_review_second_a_nested_service_asks_twice() {
+    for apart in [false, true] {
+        let d = dir(&format!("f-nested-{}", apart), "service mcp /billing = \"billing.qwe\"\nroute POST /login ? { user: str } = set_session({ user: user })\n");
+        std::fs::write(d.join("billing.qwe"), "service tax = \"tax.qwe\"\n/// Asks twice, through tax.\nfn mcp nested() -> int with http = tax.twice()\n").unwrap();
+        std::fs::write(d.join("tax.qwe"), "server fn twice() -> int {\n    if !confirm(\"First?\") { return 0 }\n    if !confirm(\"Second?\") { return 1 }\n    2\n}\n").unwrap();
+        let s = Logged::start(&d.join("main.qwe"), if apart { &["--split"] } else { &[] }, &[]);
+        let mut doors = vec![EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])))];
+        if !apart {
+            doors.push(EDoor::Stdio(Stdio::start(&d, &["main.qwe"])));
+        }
+        for mut door in doors {
+            let (r, asked) = door.answered("billing.nested", json!({}), &|_| yes());
+            let messages: Vec<Value> = asked.iter().map(|q| q["params"]["message"].clone()).collect();
+            assert_eq!(messages, [json!("First?"), json!("Second?")], "{}", r);
+            assert_eq!(f_structured(&r)["result"], json!(2), "{}", r);
+            let (r, asked) = door.answered("billing.nested", json!({}), &|q| if q["params"]["message"] == json!("First?") { yes() } else { no() });
+            assert_eq!((asked.len(), f_structured(&r)["result"].clone()), (2, json!(1)), "{}", r);
+        }
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Under `--split` each service has its own app key, and no other's.
+#[test]
+fn f_review_second_each_service_holds_only_its_own_app_key() {
+    let d = dir("f-own-keys", "service mcp /billing = \"billing.qwe\"\nservice /plain = \"plain.qwe\"\nroute POST /login ? { user: str } = set_session({ user: user })\n");
+    std::fs::write(d.join("billing.qwe"), "/// Which app keys billing holds.\nfn mcp held_keys() -> map with env = { own: env(\"QUILLO_APP_KEY\", \"\") != \"\", plain: env(\"QUILLO_APP_KEY_PLAIN\", \"\") != \"\", billing: env(\"QUILLO_APP_KEY_BILLING\", \"\") != \"\" }\n").unwrap();
+    std::fs::write(d.join("plain.qwe"), F_PLAIN).unwrap();
+    let s = Logged::start(&d.join("main.qwe"), &["--split"], &[]);
+    let mut door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
+    assert_eq!(f_structured(&door.result("billing.held_keys", json!({}), true, None, None)), json!({ "own": true, "plain": false, "billing": false }));
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Billing run with an app key too short refuses its tools' calls, said so; with a new key and the
+/// one before it, takes the app's call signed with either, its answer signed with the new one.
+#[test]
+fn f_review_second_billings_app_key_is_long_and_can_be_changed() {
+    f_signing();
+    let d = f_dir("f-rotate");
+    let hop = |port: u16, key: &str| {
+        let body = json!({ "tool": "own_only", "arguments": {}, "mcp": { "asking": null, "session": {}, "owner": null, "client": null } }).to_string();
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let call = format!("rot{}x{}", fastrand::u32(..), std::process::id());
+        let sig = quillo::service::signature(F_SECRET, t, "billing", "own_only", "", &call, body.as_bytes());
+        let app = quillo::service::sign_app(key, t, "billing", "own_only", "", &call, "", "", "\n", body.as_bytes());
+        let h = [("x-quillo-service", format!("t={},sig={}", t, sig)), ("x-quillo-to", "billing".into()), ("x-quillo-call", call.clone()), ("x-quillo-app", format!("t={},sig={}", t, app))];
+        let refs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        (support::send(port, "POST", "/_quillo/service/own_only", &refs, &body), call)
+    };
+    let service = ["--as-service", "--service-name", "billing"];
+    for (key, status) in [("k".repeat(31), 403), ("k".repeat(32), 200)] {
+        let s = Logged::start(&d.join("billing.qwe"), &service, &[("QUILLO_APP_KEY", &key)]);
+        let (a, _) = hop(s.port, &key);
+        assert_eq!(a.status, status, "{}", a.body);
+        if status == 403 {
+            assert_eq!(a.body, json!({ "error": "QUILLO_APP_KEY is 31 bytes: an app's key is a secret of at least 32 bytes (`quillo run --split` makes one of 64)" }).to_string());
+        }
+    }
+    let new = "feedback56-f-the-apps-next-key-for-billing!";
+    let s = Logged::start(&d.join("billing.qwe"), &service, &[("QUILLO_APP_KEY", new), ("QUILLO_APP_KEY_PREVIOUS", F_APP_KEY)]);
+    for key in [F_APP_KEY, new] {
+        let (a, call) = hop(s.port, key);
+        assert_eq!(a.status, 200, "{}", a.body);
+        assert_eq!(a.header("x-quillo-app-answer"), Some(format!("sig={}", quillo::svcauth::sign_answer(new, &call, 200, a.body.as_bytes()))).as_deref());
+    }
+    assert_eq!(hop(s.port, "feedback56-f-an-old-key-no-longer-taken").0.status, 401);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
 }

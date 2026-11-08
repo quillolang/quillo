@@ -1350,6 +1350,10 @@ fn service_digest(d: &str) -> bool {
         && parts.len() < 16
 }
 
+/// The most characters of a question's text a service's reply says the person declined, dismissed
+/// or was not asked (FEEDBACK56.md, Part F, second review).
+const SAID_MOST: usize = 1000;
+
 /// Text a service sent back that the door logs or says (a change, a refusal's reason): held to
 /// `most` characters, without one no reader sees.
 fn cleaned(text: &str, most: usize) -> String {
@@ -1444,7 +1448,9 @@ impl Asking {
     /// many questions the call has reached, the rounds, and of the answers only the service's own
     /// (`service/...`), each the person's as the client sent it; another's is none to it, so that
     /// a service reads no answer the person gave the program or another service. The question
-    /// asked last, with the person's answer, only where it is the service's (security review).
+    /// asked last, with the person's answer, only where it is the service's (security review). And
+    /// the call's first change, so that the service refuses a question after it as the door
+    /// refuses its own (second review).
     pub(crate) fn for_service(&self, service: &str) -> J {
         let prefix = format!("{}/", service);
         json!({
@@ -1452,6 +1458,7 @@ impl Asking {
             "nobody": self.nobody,
             "rounds": self.rounds,
             "reached": self.reached,
+            "wrote": self.wrote,
             "answers": self.answers.iter().map(|(d, a)| d.strip_prefix(&prefix).map_or(J::Null, |own| json!([own, a]))).collect::<Vec<_>>(),
             "pending": self.pending.as_ref().and_then(|(d, a)| d.strip_prefix(&prefix).map(|own| json!([own, a]))),
         })
@@ -1464,6 +1471,11 @@ impl Asking {
         let mut a = Asking::empty(o.get("can_ask")?.as_bool()?, o.get("nobody")?.as_bool()?);
         a.rounds = o.get("rounds")?.as_u64()? as usize;
         a.reached = o.get("reached")?.as_u64()? as usize;
+        a.wrote = match o.get("wrote")? {
+            J::Null => None,
+            J::String(w) => Some(cleaned(w, 200)),
+            _ => return None,
+        };
         let answers = o.get("answers")?.as_array()?;
         if a.reached > MOST_QUESTIONS || a.rounds > MOST_QUESTIONS || answers.len() > MOST_QUESTIONS {
             return None;
@@ -1509,9 +1521,13 @@ impl Asking {
     /// and a stop at its own question, under its name, the form made here. Nothing else: an answer
     /// it sends is not read, and one to a question not its own cannot be given (FEEDBACK56.md,
     /// Part F, security review). False for a reply that is not one of these, which stops the call.
+    /// A question it reached after a change the call made before it is refused, as one of the
+    /// door's own is (second review). What it kept and took is this handle's too, so that a
+    /// service relaying another's reply says it on (second review).
     pub(crate) fn take_reply(&mut self, service: &str, label: &str, j: &J) -> bool {
         let start = self.reached;
         let sent = self.answers.len();
+        let changed_before = self.wrote.is_some();
         let Some(o) = j.as_object() else { return false };
         let (Some(reached), Some(kept), Some(consumed), Some(wrote), Some(defaults), Some(stop)) = (
             o.get("reached").and_then(J::as_u64).map(|n| n as usize),
@@ -1528,8 +1544,12 @@ impl Asking {
         if kept > sent || kept < start.min(sent) || reached < start || reached > MOST_QUESTIONS || defaults.len() > MOST_QUESTIONS {
             return false;
         }
+        if changed_before && reached > start {
+            return false;
+        }
         if kept < sent {
             self.answers.truncate(kept);
+            self.kept = self.kept.min(kept);
             self.pending = None;
         }
         if consumed {
@@ -1538,6 +1558,7 @@ impl Asking {
                 Some((d, Some(answer))) if kept == sent && d.starts_with(&prefix) => self.answers.push((d, answer)),
                 _ => return false,
             }
+            self.consumed = true;
         }
         self.reached = reached;
         match wrote {
@@ -1549,10 +1570,12 @@ impl Asking {
             }
             _ => return false,
         }
+        // What it says the person was not asked, or declined, held to `SAID_MOST` characters
+        // (second review).
         for d in defaults {
             match d.as_array().map(Vec::as_slice) {
-                Some([J::String(q), J::Null]) => self.notes.push((q.clone(), None)),
-                Some([J::String(q), J::String(l)]) => self.notes.push((q.clone(), Some(l.clone()))),
+                Some([J::String(q), J::Null]) => self.notes.push((cleaned(q, SAID_MOST), None)),
+                Some([J::String(q), J::String(l)]) => self.notes.push((cleaned(q, SAID_MOST), Some(cleaned(l, SAID_MOST)))),
                 _ => return false,
             }
         }
@@ -1573,8 +1596,8 @@ impl Asking {
             }
             Some((k, v)) if k == "said" => match (v.get("cannot"), v.get("declined").and_then(J::as_str), v.get("dismissed").and_then(J::as_str)) {
                 (Some(J::Bool(true)), None, None) if !self.can_ask => Stopped::Said(Said::CannotAsk),
-                (None, Some(q), None) => Stopped::Said(Said::Declined(q.to_string())),
-                (None, None, Some(q)) => Stopped::Said(Said::Dismissed(q.to_string())),
+                (None, Some(q), None) => Stopped::Said(Said::Declined(cleaned(q, SAID_MOST))),
+                (None, None, Some(q)) => Stopped::Said(Said::Dismissed(cleaned(q, SAID_MOST))),
                 _ => return false,
             },
             Some((k, J::String(why))) if k == "refused" => Stopped::Refused(cleaned(&why, 500)),
@@ -3075,6 +3098,14 @@ pub fn open_door(it: &mut Interp, path: &Path, tools: Option<Vec<Tool>>) {
     }
     it.mcp = Some(Arc::new(Door::of_program(path, served_name(path), tools, true)));
     say_dev_door(it);
+}
+
+impl Interp {
+    /// Run as a service, it offers tools to its app's door: something to serve, routes or none
+    /// (FEEDBACK56.md, Part F, second review; branch feedback56).
+    pub fn offers_tools(&self) -> bool {
+        self.offered_tools.is_some()
+    }
 }
 
 #[cfg(test)]
