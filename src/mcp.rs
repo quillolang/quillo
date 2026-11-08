@@ -371,9 +371,11 @@ pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 pub const INTERNAL_ERROR: i64 = -32603;
 
 /// How long a client may keep `server/discover`'s and `tools/list`'s answers. A program's tools
-/// are read when the door starts and change only when it is started again, so an hour; and they
-/// are the same for every caller, so `public`.
-pub const TTL_MS: u64 = 3_600_000;
+/// are read when the door starts and change only when it is started again: 5 minutes, so that a
+/// deploy that renames or changes a tool reaches clients soon (an hour had kept them calling the
+/// old one; the pre-release defaults, 2026-11-09); and they are the same for every caller, so
+/// `public`.
+pub const TTL_MS: u64 = 300_000;
 
 /// What a tool that answered with a page is told (A.1).
 pub const NOT_A_PAGE: &str = "a tool answers with data, not a page";

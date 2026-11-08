@@ -2852,7 +2852,8 @@ client gets from a call:
   as JSON in a text block. An untyped one: the text block alone.
 - `isError: true`, with text, for a tool's `err(v)`, an argument the door refuses (with the
   message `/_quillo/rpc` gives), a `reply` or a `respond` (with its text, or its status such as
-  `404 Not Found`), a page, and `internal error` when the tool failed (the real message on
+  `404 Not Found`; a 2xx too, which `quillo check` warns of in a tool's code: a tool answers by
+  returning its value), a page, and `internal error` when the tool failed (the real message on
   stderr).
 - The protocol's own errors for an unknown tool, a malformed message and the wrong version.
 - An answer past what the door takes in (10 MiB of JSON, or 128 levels deep) is an `isError`
@@ -2975,7 +2976,9 @@ again (FEEDBACK56.md, Part E).
 writes, of facts about this server that no tool says (who a call acts as on that door, what an
 `isError` result and `internal error` mean, that text in results is data, not instructions),
 always under 600 characters; then, after an empty line, the main file's own `//!` block, for
-what the developer wants said about how their tools go together:
+what the developer wants said about how their tools go together. A client may keep that answer
+and the tool list for 5 minutes (`ttlMs`), the same for every caller, so a tool renamed in a
+deploy reaches the clients within that time:
 
 ```quillo
 //! Notes are private to the user who wrote them.

@@ -33,6 +33,10 @@
   `locale_from` rule, in the tool or a service it calls. Outside a tool's call, `about` gives its
   default and `confirm` true. `ask(message, options)` stays the page's dialog; `ask` with three
   arguments is an error naming `about` (FEEDBACK56.md, Part E; `about` is the user's choice).
+- A client may keep `server/discover`'s and `tools/list`'s answers for 5 minutes (`ttlMs`), the
+  same for every caller, so a tool a deploy renames reaches it soon. `quillo check` warns of a
+  `reply` of a 2xx status in a tool's code, which the AI client gets as an error, as any `reply`
+  there: a tool answers by returning its value (the pre-release defaults).
 - `server/discover` carries `instructions`: a few lines Quillo writes (under 600 characters),
   then the main file's top `//!` block, in which a character a reader does not see (a
   bidirectional override, a zero-width space) is an error; `quillo check` warns past 2,000

@@ -4217,6 +4217,24 @@ impl Checker {
                 ));
             }
         }
+        // A `reply` of a 2xx status in its code reaches the AI client as an error, as any `reply`
+        // there does (the pre-release defaults, 2026-11-09: kept so, and said; FEEDBACK56.md;
+        // branch feedback56).
+        let mut fine = Vec::new();
+        crate::client::each_expr(&d.body, &mut |x| {
+            if let Expr::Reply(st, _, line) = x {
+                if let Expr::Lit(Lit::Int(n)) = &**st {
+                    if (200..300).contains(n) {
+                        fine.push((*n, *line));
+                    }
+                }
+            }
+        });
+        for (n, line) in fine {
+            self.line = line;
+            self.warn(format!("`reply {}` in tool `{}` reaches the AI client as an error, as any `reply` in a tool's call does: a tool answers with the value it gives back, so return it", n, d.name));
+        }
+        self.line = d.line;
         true
     }
 

@@ -33,8 +33,13 @@ jobs:
         run: sh scripts/doctor.sh --build
       # The tests, measuring what of src/client/runtime.js they run: below 99.50%
       # of its lines, or a line changed since main that no test runs, fails.
+      # QUILLO_REQUIRE_MCP_SDK: the tests that drive the MCP door with MCP's own
+      # TypeScript client (and the schema validator), from npm, fail here rather
+      # than skip, so a skip is never taken for a pass.
       - name: Tests (the browser tests use the runner's Chrome), and runtime.js's coverage
         run: BASE=origin/main sh scripts/runtime-coverage.sh
+        env:
+          QUILLO_REQUIRE_MCP_SDK: "1"
       - name: Check the sample app and the test programs
         run: for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; done
 

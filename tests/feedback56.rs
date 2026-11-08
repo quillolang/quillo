@@ -45,6 +45,16 @@ fn doc_of_fn(src: &str, name: &str) -> Option<String> {
 }
 
 /// What the parser says of a program it refuses, and on which line.
+/// A test that needs MCP's own TypeScript client or a validator from npm, which cannot be had here:
+/// skipped, saying why, or a failure where `QUILLO_REQUIRE_MCP_SDK=1` (CI sets it), so that a
+/// skip there is never taken for a pass (the pre-release defaults, 2026-11-09).
+fn sdk_skipped(test: &str, why: &str) {
+    if std::env::var("QUILLO_REQUIRE_MCP_SDK").is_ok_and(|v| v == "1") {
+        panic!("{}: {}, and QUILLO_REQUIRE_MCP_SDK=1 says it must run", test, why);
+    }
+    eprintln!("skipped: {}, as {}", test, why);
+}
+
 fn refused(src: &str) -> (u32, String) {
     match quillo::parser::Parser::new(src).parse_program() {
         Ok(_) => panic!("parsed: {}", src),
@@ -1373,7 +1383,7 @@ fn validated(cases: &[(String, Value, Vec<Value>, Vec<Value>)]) {
     docs.push(json!({ "schema": { "type": "strin" }, "valid": [], "invalid": [] }));
     docs.push(json!({ "schema": { "type": "string", "format": "decimal" }, "valid": [], "invalid": [] }));
     let Some(mut results) = ajv(&docs) else {
-        eprintln!("skipped: the 2020-12 validator (npx could not run ajv-cli@5.0.0 with ajv-formats@3.0.1 here: no npx, or no network); the schemas' shapes are checked alone");
+        sdk_skipped("the 2020-12 validator", "npx could not run ajv-cli@5.0.0 with ajv-formats@3.0.1 here: no npx, or no network; the schemas' shapes are checked alone");
         return;
     };
     assert!(results.pop().is_some_and(|r| r.get("compile").is_some()), "the validator took a format it does not know");
@@ -2650,7 +2660,7 @@ fn c1_discover_list_and_call() {
     assert_eq!(r["resultType"], json!("complete"));
     assert_eq!(r["supportedVersions"], json!(["2026-07-28"]));
     assert_eq!(r["capabilities"], json!({ "tools": {} }));
-    assert_eq!((r["ttlMs"].clone(), r["cacheScope"].clone()), (json!(3_600_000), json!("public")));
+    assert_eq!((r["ttlMs"].clone(), r["cacheScope"].clone()), (json!(300_000), json!("public")));
     let who = &r["_meta"]["io.modelcontextprotocol/serverInfo"];
     assert_eq!(who["name"], json!("main"));
     assert!(who["version"].as_str().is_some_and(|v| v.starts_with(env!("CARGO_PKG_VERSION"))), "{}", who);
@@ -2663,7 +2673,7 @@ fn c1_discover_list_and_call() {
     assert_eq!(r["tools"], mcp::list(&mcp::of_source(&d.join("main.qwe")).unwrap()));
     let names: Vec<&str> = r["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names, ["add_note", "hello", "lookup", "mine", "gone", "taken", "page", "boom", "crash", "leave", "piped", "line", "clock", "moved", "echo", "given", "locked", "unlocked", "wait"]);
-    assert_eq!((r["resultType"].clone(), r["ttlMs"].clone(), r["cacheScope"].clone()), (json!("complete"), json!(3_600_000), json!("public")));
+    assert_eq!((r["resultType"].clone(), r["ttlMs"].clone(), r["cacheScope"].clone()), (json!("complete"), json!(300_000), json!("public")));
     assert!(r.get("nextCursor").is_none());
     // A typed result: `structuredContent`, and the same JSON as its text. Unicode both ways.
     let r = door.call("add_note", json!({ "text": "é ✓ 日本" }));
@@ -3194,7 +3204,7 @@ const { StdioClientTransport } = require("@modelcontextprotocol/client/stdio");
     std::fs::write(d.join("package.json"), r#"{"name":"quillo-c1-sdk","private":true}"#).unwrap();
     if Command::new("npm").arg("--version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_err() {
         let _ = std::fs::remove_dir_all(&d);
-        eprintln!("skipped: c1_the_official_typescript_client_drives_it, as npm was not found");
+        sdk_skipped("c1_the_official_typescript_client_drives_it", "npm was not found");
         return;
     }
     match run_for(&d, "npm install --no-audit --no-fund --ignore-scripts @modelcontextprotocol/client@2.4.0", 240) {
@@ -3202,7 +3212,7 @@ const { StdioClientTransport } = require("@modelcontextprotocol/client/stdio");
         failed => {
             let _ = std::fs::remove_dir_all(&d);
             let why = failed.map_or_else(|e| e, |o| String::from_utf8_lossy(&o.stderr).into_owned());
-            eprintln!("skipped: c1_the_official_typescript_client_drives_it, as npm could not install @modelcontextprotocol/client@2.4.0: {}", why);
+            sdk_skipped("c1_the_official_typescript_client_drives_it", &format!("npm could not install @modelcontextprotocol/client@2.4.0: {}", why));
             return;
         }
     }
@@ -5564,7 +5574,7 @@ server fn mcp whoami() -> map with time = { user: session().user, tenant: tenant
         std::fs::write(d.join("package.json"), r#"{"name":"quillo-c2-sdk","private":true}"#).unwrap();
         if Command::new("npm").arg("--version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_err() {
             let _ = std::fs::remove_dir_all(&d);
-            eprintln!("skipped: c2_the_official_typescript_client_drives_it_over_http, as npm was not found");
+            sdk_skipped("c2_the_official_typescript_client_drives_it_over_http", "npm was not found");
             return;
         }
         match run_for(&d, "npm install --no-audit --no-fund --ignore-scripts @modelcontextprotocol/client@2.4.0", 240) {
@@ -5572,7 +5582,7 @@ server fn mcp whoami() -> map with time = { user: session().user, tenant: tenant
             failed => {
                 let _ = std::fs::remove_dir_all(&d);
                 let why = failed.map_or_else(|e| e, |o| String::from_utf8_lossy(&o.stderr).into_owned());
-                eprintln!("skipped: c2_the_official_typescript_client_drives_it_over_http, as npm could not install @modelcontextprotocol/client@2.4.0: {}", why);
+                sdk_skipped("c2_the_official_typescript_client_drives_it_over_http", &format!("npm could not install @modelcontextprotocol/client@2.4.0: {}", why));
                 return;
             }
         }
@@ -6006,7 +6016,7 @@ const { StdioClientTransport } = require("@modelcontextprotocol/client/stdio");
     std::fs::write(d.join("package.json"), r#"{"name":"quillo-d-sdk","private":true}"#).unwrap();
     if Command::new("npm").arg("--version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_err() {
         let _ = std::fs::remove_dir_all(&d);
-        eprintln!("skipped: d_the_official_typescript_client_reads_the_instructions_on_each_door, as npm was not found");
+        sdk_skipped("d_the_official_typescript_client_reads_the_instructions_on_each_door", "npm was not found");
         return;
     }
     match run_for(&d, "npm install --no-audit --no-fund --ignore-scripts @modelcontextprotocol/client@2.4.0", 240) {
@@ -6014,7 +6024,7 @@ const { StdioClientTransport } = require("@modelcontextprotocol/client/stdio");
         failed => {
             let _ = std::fs::remove_dir_all(&d);
             let why = failed.map_or_else(|e| e, |o| String::from_utf8_lossy(&o.stderr).into_owned());
-            eprintln!("skipped: d_the_official_typescript_client_reads_the_instructions_on_each_door, as npm could not install @modelcontextprotocol/client@2.4.0: {}", why);
+            sdk_skipped("d_the_official_typescript_client_reads_the_instructions_on_each_door", &format!("npm could not install @modelcontextprotocol/client@2.4.0: {}", why));
             return;
         }
     }
@@ -7389,7 +7399,7 @@ const { StdioClientTransport } = require("@modelcontextprotocol/client/stdio");
     std::fs::write(d.join("package.json"), r#"{"name":"quillo-e-sdk","private":true}"#).unwrap();
     if Command::new("npm").arg("--version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_err() {
         let _ = std::fs::remove_dir_all(&d);
-        eprintln!("skipped: e_the_official_typescript_client_answers_the_questions_on_each_door, as npm was not found");
+        sdk_skipped("e_the_official_typescript_client_answers_the_questions_on_each_door", "npm was not found");
         return;
     }
     match run_for(&d, "npm install --no-audit --no-fund --ignore-scripts @modelcontextprotocol/client@2.4.0", 240) {
@@ -7397,7 +7407,7 @@ const { StdioClientTransport } = require("@modelcontextprotocol/client/stdio");
         failed => {
             let _ = std::fs::remove_dir_all(&d);
             let why = failed.map_or_else(|e| e, |o| String::from_utf8_lossy(&o.stderr).into_owned());
-            eprintln!("skipped: e_the_official_typescript_client_answers_the_questions_on_each_door, as npm could not install @modelcontextprotocol/client@2.4.0: {}", why);
+            sdk_skipped("e_the_official_typescript_client_answers_the_questions_on_each_door", &format!("npm could not install @modelcontextprotocol/client@2.4.0: {}", why));
             return;
         }
     }
@@ -8634,7 +8644,7 @@ const { StdioClientTransport } = require("@modelcontextprotocol/client/stdio");
     std::fs::write(d.join("package.json"), r#"{"name":"quillo-f-sdk","private":true}"#).unwrap();
     if Command::new("npm").arg("--version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_err() {
         let _ = std::fs::remove_dir_all(&d);
-        eprintln!("skipped: f_the_official_typescript_client_answers_a_services_questions, as npm was not found");
+        sdk_skipped("f_the_official_typescript_client_answers_a_services_questions", "npm was not found");
         return;
     }
     match run_for(&d, "npm install --no-audit --no-fund --ignore-scripts @modelcontextprotocol/client@2.4.0", 240) {
@@ -8642,7 +8652,7 @@ const { StdioClientTransport } = require("@modelcontextprotocol/client/stdio");
         failed => {
             let _ = std::fs::remove_dir_all(&d);
             let why = failed.map_or_else(|e| e, |o| String::from_utf8_lossy(&o.stderr).into_owned());
-            eprintln!("skipped: f_the_official_typescript_client_answers_a_services_questions, as npm could not install @modelcontextprotocol/client@2.4.0: {}", why);
+            sdk_skipped("f_the_official_typescript_client_answers_a_services_questions", &format!("npm could not install @modelcontextprotocol/client@2.4.0: {}", why));
             return;
         }
     }
@@ -11038,5 +11048,22 @@ fn unseen_review_a_question_in_the_tenant_rule_refuses_the_doors_request() {
     s.says(UNSEEN_SAID);
     assert_eq!(support::send(s.port, "GET", "/which", &[], "").body, "a");
     drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A `reply` of a 2xx status in a tool's code is warned of: the AI client gets it as an error, as
+/// any `reply` in a tool's call (kept so, the pre-release defaults, 2026-11-09). 200, 204 and 299
+/// are; 300, 401 and 404 are not (below 200 is no status at all); a plain function's is not; one in a lambda in the tool is; the
+/// call still answers as before (`isError`, its text).
+#[test]
+fn reply_of_a_2xx_in_a_tool_is_warned_of() {
+    let src = "/// Saves.\nfn mcp saved(n: int) -> str with time {\n    if n == 0 { reply 200 \"Saved\" }\n    if n == 1 { reply 204 \"\" }\n    if n == 2 { reply 299 \"x\" }\n    if n == 3 { reply 404 \"x\" }\n    if n == 4 { reply 300 \"x\" }\n    if n == 5 { reply 401 \"Log in first\" }\n    let _l = [1].map((x) => { reply 201 \"made\" })\n    \"done\"\n}\n\nfn plain() = reply 200 \"fine\"\nroute GET /p = plain()\n";
+    let warned = |n: u32, line: u32| format!("{} warning: `reply {}` in tool `saved` reaches the AI client as an error, as any `reply` in a tool's call does: a tool answers with the value it gives back, so return it", line, n);
+    says(src, &[&warned(200, 3), &warned(204, 4), &warned(299, 5), &warned(201, 9)]);
+    let d = dir("reply-2xx", src);
+    let mut io = EDoor::Stdio(Stdio::start(&d, &["main.qwe"]));
+    assert_eq!(text_of(&io.result("saved", json!({ "n": 0 }), true, None, None)), (true, "Saved".to_string()));
+    assert_eq!(text_of(&io.result("saved", json!({ "n": 5 }), true, None, None)), (true, "Log in first".to_string()));
+    assert_eq!(text_of(&io.result("saved", json!({ "n": 9 }), true, None, None)), (true, "made".to_string()));
     let _ = std::fs::remove_dir_all(&d);
 }
