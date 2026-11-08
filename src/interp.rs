@@ -352,6 +352,10 @@ pub struct Interp {
     /// was answered, and what it changed, so that a question after a change is refused
     /// (FEEDBACK56.md, Part E; branch feedback56). None everywhere else.
     pub(crate) asking: Option<Box<crate::mcp::Asking>>,
+    /// Run as a service (`--as-service`): its tools, which its app's door lists as its own and
+    /// passes the calls of on to it, signed (FEEDBACK56.md, Part F; branch feedback56). None
+    /// everywhere else, and for a service with none.
+    pub(crate) offered_tools: Option<Arc<Vec<crate::mcp::Tool>>>,
     pub ready_checks: Arc<Vec<(String, Value)>>,
     /// The command components' styles go through (`style_with`; FEEDBACK11.md,
     /// Q-079; branch feedback11-fixes).
@@ -1698,6 +1702,7 @@ impl Interp {
             fn_callers: Default::default(),
             mcp: None,
             asking: None,
+            offered_tools: None,
             ready_checks: Default::default(),
             style_with: None,
             style_with_fn: None,
@@ -1820,6 +1825,7 @@ impl Interp {
             fn_callers: self.fn_callers.clone(),
             mcp: self.mcp.clone(),
             asking: None,
+            offered_tools: self.offered_tools.clone(),
             ready_checks: self.ready_checks.clone(),
             style_with: self.style_with.clone(),
             style_with_fn: self.style_with_fn.clone(),
@@ -2613,7 +2619,12 @@ impl Interp {
                     Some(e) => Some(self.eval(e, env)?),
                     None => None,
                 };
-                crate::service::declare(self, name, prefix.as_deref(), file, options.as_ref(), *line)
+                crate::service::declare(self, name, prefix.as_deref(), file, options.as_ref(), *line)?;
+                // Its tools' calls are signed both ways (FEEDBACK56.md, Part F, security review).
+                if let Some(how) = mcp.then(|| crate::service::unsigned_auth(name)).flatten() {
+                    return fail(*line, &crate::service::tools_unsigned(name, how));
+                }
+                Ok(Value::Nil)
             }
             Stmt::Mount(prefix, file, line) => {
                 if !Arc::ptr_eq(env, &self.globals) {

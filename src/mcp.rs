@@ -58,9 +58,18 @@ pub struct Tool {
     /// of one (`Asking`); a call of any other cannot reach `confirm` or `ask`.
     pub may_ask: bool,
     pub def: Arc<FnDef>,
+    /// A service's tool, offered here by `service mcp /billing = "billing.qwe"`: the service's
+    /// name and the tool's own name there, `name` being `billing.<its name>` (B.1). Its call goes
+    /// to the service, here or where it runs (FEEDBACK56.md, Part F; branch feedback56).
+    pub service: Option<(String, String)>,
 }
 
 impl Tool {
+    /// The name of its function: its own, in its service for a service's tool.
+    pub fn own_name(&self) -> &str {
+        self.service.as_ref().map_or(self.name.as_str(), |(_, own)| own.as_str())
+    }
+
     /// A result as `structuredContent`: the value, or `{ "result": value }` where it is not an
     /// object, as `outputSchema` says. None for a tool with no result type, whose answer is sent
     /// as text alone, and never a bare value that is not an object (found in review).
@@ -90,10 +99,25 @@ impl Tool {
     }
 }
 
-/// The tools of a program as the checker read it, in the order the program declares them.
+/// The tools of a program as the checker read it, in the order the program declares them; then
+/// the tools of each service it offers with `service mcp /billing = "billing.qwe"`, in the order
+/// of those lines, as `billing.<name>`, each with the schemas, the hints and the facts its
+/// service's own check gave it, its types its service's (FEEDBACK56.md, Part F, B.1 and B.3;
+/// branch feedback56). Only a function the service marked `fn mcp`: neither the app nor the
+/// service can make a tool of the other's function.
 pub fn tools(a: &Analysis) -> Vec<Tool> {
     let types: HashMap<String, Types> = HashMap::from([(String::new(), a.types.clone())]);
-    a.tools.iter().map(|f| tool(f, &types)).collect()
+    let mut out: Vec<Tool> = a.tools.iter().map(|f| tool(f, &types)).collect();
+    for s in &a.service_tools {
+        let types: HashMap<String, Types> = HashMap::from([(String::new(), s.types.clone())]);
+        for f in &s.tools {
+            let mut t = tool(f, &types);
+            t.service = Some((s.name.clone(), t.name.clone()));
+            t.name = format!("{}.{}", s.name, t.name);
+            out.push(t);
+        }
+    }
+    out
 }
 
 /// The tools of the program in `path`, read without running it; its errors, as `quillo check`
@@ -187,6 +211,7 @@ fn tool(f: &ToolFacts, types: &HashMap<String, Types>) -> Tool {
         asks: f.asks,
         may_ask: f.asks || f.uncertain.is_some(),
         def: d.clone(),
+        service: None,
     }
 }
 
@@ -234,9 +259,9 @@ pub fn call(it: &mut Interp, tool: &Tool, args: Vec<Value>, line: u32) -> Result
 /// MCP's arguments come by name and may leave out one before another (`by_name`; FEEDBACK56.md,
 /// C.1; branch feedback56).
 pub fn call_given(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>, line: u32) -> Result<Result<Value, String>, Ctrl> {
-    let c = match crate::value::lookup(&it.globals, tool.name.as_str()) {
+    let c = match crate::value::lookup(&it.globals, tool.own_name()) {
         Some(Value::Func(c)) => c,
-        _ => return crate::interp::fail(line, format!("the program has no tool `{}`", tool.name)),
+        _ => return crate::interp::fail(line, format!("the program has no tool `{}`", tool.own_name())),
     };
     let def = tool.def.clone();
     let mut refused = None;
@@ -417,7 +442,7 @@ fn unsupported(requested: &str) -> Fault {
 
 /// A tool's answer that is an error the model reads: its own `err(v)`, an argument refused, a
 /// `reply`, a page, a failure said as `internal error` (B.1).
-fn tool_error(text: impl Into<String>) -> J {
+pub(crate) fn tool_error(text: impl Into<String>) -> J {
     json!({ "content": [{ "type": "text", "text": text.into() }], "isError": true })
 }
 
@@ -649,6 +674,7 @@ impl Door {
             Some(s) => Some(read_state(it, s, &who, &tool.name, &given, self.over_http).map_err(|why| fault(INVALID_PARAMS, format!("Invalid params: this requestState {}; call the tool again without one to start over", why)))?),
             None => None,
         };
+        let raw = args;
         let args = match by_name(tool, args) {
             Ok(args) => args,
             Err(why) => return Ok(tool_error(why)),
@@ -658,9 +684,11 @@ impl Door {
             // The answer to the question asked last, under its key; inputResponses' other keys
             // are not the door's, and are let be (mrtr, Error Handling).
             let pending = pending.map(|d| (d, responses.and_then(|r| r.get(&key_of(answers.len()))).cloned()));
-            Box::new(Asking { can_ask, who, tool: tool.name.clone(), args: given, answers, pending, reached: 0, rounds, site: 0, places: HashMap::new(), notes: Vec::new(), wrote: None, stop: None })
+            let mut a = Asking::empty(can_ask, false);
+            (a.who, a.tool, a.args, a.answers, a.pending, a.rounds) = (who, tool.name.clone(), given, answers, pending, rounds);
+            a
         });
-        run(it, tool, args, self.over_http, asking)
+        run(it, tool, args, raw, self.over_http, asking)
     }
 }
 
@@ -894,7 +922,11 @@ fn stem(path: &Path) -> String {
 /// is known (`quillo run --service-name`; `served_name`), as the doors name it. Only for a program
 /// with tools: `quillo mcp` serves one with none, saying so, but no client is meant to use it;
 /// and without a `//!` block Quillo's lines alone are under `QUILLOS_MOST`.
-pub fn instructions_warning(file: &str, src: &str, facts: &[ToolFacts]) -> Option<(u32, String)> {
+pub fn instructions_warning(file: &str, src: &str, a: &Analysis) -> Option<(u32, String)> {
+    // A service's tools are counted too, under the names the door gives them (FEEDBACK56.md, Part
+    // F; branch feedback56).
+    let mut facts: Vec<(String, bool)> = a.tools.iter().map(|f| (f.def.name.clone(), f.asks)).collect();
+    facts.extend(a.service_tools.iter().flat_map(|s| s.tools.iter().map(move |f| (format!("{}.{}", s.name, f.def.name), f.asks))));
     let tools = facts.len();
     if tools == 0 {
         return None;
@@ -902,7 +934,7 @@ pub fn instructions_warning(file: &str, src: &str, facts: &[ToolFacts]) -> Optio
     let (line, own) = own_block(src)?;
     let path = Path::new(file);
     // The line of the tools that ask is counted too (FEEDBACK56.md, Part E; branch feedback56).
-    let asking: Vec<&str> = facts.iter().filter(|f| f.asks).map(|f| f.def.name.as_str()).collect();
+    let asking: Vec<&str> = facts.iter().filter(|f| f.1).map(|f| f.0.as_str()).collect();
     let whole = [(stem(path), false), (served_name(path), true)].into_iter().map(|(name, http)| instructions(&name, tools, http, &asking, Some(&own)).chars().count()).max().unwrap_or(0);
     (whole > INSTRUCTIONS_MOST).then(|| {
         let over = whole - INSTRUCTIONS_MOST;
@@ -966,11 +998,15 @@ pub fn served(path: &Path) -> Result<J, String> {
 /// A tool that may ask runs with `asking` (Part E): what it changes is noted from its start; where
 /// it stopped to ask, or `confirm` or `ask` refused, that is the answer, whatever the run gave;
 /// and where it ended, an `ask` it could not ask is said beside its answer.
-fn run(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>, over_http: bool, asking: Option<Box<Asking>>) -> Result<J, Fault> {
+/// A service's tool runs in its service, here or where it runs (`service::call_tool`), the call's
+/// asking carried there and back, so that its questions are asked through this door as the
+/// program's own are (FEEDBACK56.md, Part F; branch feedback56). `given` is its arguments as they
+/// came, for a service that runs elsewhere.
+fn run(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>, given: &Map<String, J>, over_http: bool, asking: Option<Box<Asking>>) -> Result<J, Fault> {
     it.asking = asking;
     // Taken back whatever happens: a panic past the tool's own (`run_tool` catches that one)
     // would leave the next message's code asking for this call.
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_tool(it, tool, args, over_http)));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_tool(it, tool, args, given, over_http)));
     let asking = it.asking.take();
     let mut r = r.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     let Some(mut a) = asking else { return Ok(r) };
@@ -978,12 +1014,12 @@ fn run(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>, over_http: bool, 
         return (*a).answer(stop, &tool.name);
     }
     if let Some(content) = r.get_mut("content").and_then(J::as_array_mut) {
-        content.extend(a.notes.drain(..).map(|n| json!({ "type": "text", "text": n })));
+        content.extend(a.notes.drain(..).map(|(q, l)| json!({ "type": "text", "text": note_text(&q, l.as_deref()) })));
     }
     Ok(r)
 }
 
-fn run_tool(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>, over_http: bool) -> J {
+fn run_tool(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>, given: &Map<String, J>, over_http: bool) -> J {
     if !over_http {
         it.tenant = None;
         it.tenant_named = false;
@@ -994,12 +1030,24 @@ fn run_tool(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>, over_http: b
         it.session_ends = None;
         it.answering = true;
     }
-    let before = it.entered();
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call_given(it, tool, args, 0)));
+    let r = match &tool.service {
+        Some((service, _)) => crate::service::call_tool(it, service, tool, args, given),
+        None => answer_tool(it, tool, args),
+    };
     if !over_http {
         it.answering = false;
         it.set_cookies.clear();
     }
+    r
+}
+
+/// The call of `tool` in `it`, the program it is a tool of, as `tools/call`'s result: a panic in
+/// it is that call's `internal error`, a transaction it left open is rolled back. A service runs
+/// its own tool with this, called from its app's door, in one process or as it answers the app's
+/// signed call (FEEDBACK56.md, Part F; branch feedback56).
+pub(crate) fn answer_tool(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>) -> J {
+    let before = it.entered();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call_given(it, tool, args, 0)));
     let r = match r {
         Ok(r) => r,
         Err(panic) => {
@@ -1114,6 +1162,9 @@ pub const ASKING: &str = "stopped: the tool asks its user, and is called again w
 pub const ASK_FIRST: &str = "ask before changing anything: the call runs again with the answer";
 /// `confirm` where the client cannot ask: closed, as the door is.
 pub const CANNOT_ASK: &str = "this needs the user's yes, and this client cannot ask";
+/// A question in a call made later (`billing.later.f(...)`) from a tool's call: refused, as no one
+/// is there to answer it (FEEDBACK56.md, Part F; branch feedback56).
+pub const NOBODY: &str = "a call made later from a tool's call has no one to ask, so its question is refused: ask in the tool, before making the call";
 /// The most questions one call asks, and the most rounds it stops to ask: each one answered goes
 /// in the state, and back each time.
 pub const MOST_QUESTIONS: usize = 100;
@@ -1129,12 +1180,17 @@ const STDIO_CALLER: &str = "stdio";
 pub(crate) struct Asking {
     /// The client can show a form (`elicitation`, form mode).
     can_ask: bool,
+    /// A call made later from a tool's call (`billing.later.f(...)`): there is no one to ask, and
+    /// a question is refused, never answered by nobody (FEEDBACK56.md, Part F; branch feedback56).
+    nobody: bool,
     /// Who the state is given to, signed (`CALLER_PURPOSE`); the tool; its arguments' digest.
     who: String,
     tool: String,
     args: String,
     /// The questions answered before, in the order a run reaches them: each one's digest and
-    /// its answer, a choice's key or `confirm`'s true or false.
+    /// its answer, a choice's key or `confirm`'s true or false. A service's question's digest is
+    /// its own under the service's name (`billing/...`), and its answer the person's as the
+    /// client sent it, which only the service reads (FEEDBACK56.md, Part F, security review).
     answers: Vec<(String, J)>,
     /// The question asked last, and the client's answer to it, where it sent one.
     pending: Option<(String, Option<J>)>,
@@ -1147,20 +1203,118 @@ pub(crate) struct Asking {
     /// a question is, and the places found for them this run (`place_of`).
     pub(crate) site: usize,
     places: HashMap<usize, String>,
-    /// What the result says beside the tool's answer: an `ask` the user was not asked.
-    notes: Vec<String>,
+    /// What the result says beside the tool's answer: each `ask` the user was not asked, its
+    /// question and the default's text.
+    notes: Vec<(String, Option<String>)>,
     /// The first change this call made, as the refusal of a question after it says it.
     pub(crate) wrote: Option<String>,
     stop: Option<Stopped>,
+    /// A service's run of a tool's call (`from_wire`): every answer is the person's as the client
+    /// sent it, read by the question it answers; how many of those it was sent it kept, and
+    /// whether it took the one the question asked last waits on (`reply`).
+    raw: bool,
+    kept: usize,
+    consumed: bool,
+}
+
+/// A question as a run asks it: its text, and `ask`'s choices (each key and the text the person
+/// reads) and default; none for `confirm`. The form the person is shown is made from it by the
+/// door that asks (`form`), for the program's own questions and a service's alike, so that what a
+/// service sends back is data, never a form (FEEDBACK56.md, Part F, security review).
+#[derive(Debug, Clone)]
+struct Question {
+    text: String,
+    choices: Option<(Vec<(String, String)>, Option<String>)>,
+}
+
+impl Question {
+    /// The `elicitation/create` request the client is sent: `confirm`'s a box to tick, unticked;
+    /// `ask`'s one choice, the keys as values, the texts as labels, its default the form's. Every
+    /// text without a character no reader sees (`shown`).
+    fn form(&self) -> J {
+        let message = shown(&self.text);
+        let (key, field) = match &self.choices {
+            None => ("confirm", json!({ "type": "boolean", "title": message, "default": false })),
+            Some((pairs, default)) => {
+                let one_of: Vec<J> = pairs.iter().map(|(k, t)| json!({ "const": k, "title": shown(t) })).collect();
+                let mut choice = json!({ "type": "string", "oneOf": one_of });
+                if let Some(d) = default {
+                    choice["default"] = json!(d);
+                }
+                ("choice", choice)
+            }
+        };
+        let mut properties = Map::new();
+        properties.insert(key.into(), field);
+        json!({ "method": "elicitation/create", "params": { "mode": "form", "message": message, "requestedSchema": { "type": "object", "properties": properties, "required": [key] } } })
+    }
+
+    fn to_wire(&self) -> J {
+        match &self.choices {
+            None => json!({ "text": self.text }),
+            Some((pairs, default)) => json!({ "text": self.text, "choices": pairs, "default": default }),
+        }
+    }
+
+    /// A question a service sent back: text, and choices whose keys are text, at least one, the
+    /// default one of them or null; None for anything else.
+    fn from_wire(j: &J) -> Option<Question> {
+        let o = j.as_object()?;
+        if o.keys().any(|k| !matches!(k.as_str(), "text" | "choices" | "default")) {
+            return None;
+        }
+        let text = o.get("text")?.as_str().filter(|t| !t.trim().is_empty() && t.len() <= MOST)?.to_string();
+        let choices = match o.get("choices") {
+            None => None,
+            Some(J::Array(a)) if !a.is_empty() && a.len() <= MOST_QUESTIONS * 10 => {
+                let pairs = a
+                    .iter()
+                    .map(|p| match p.as_array().map(Vec::as_slice) {
+                        Some([J::String(k), J::String(t)]) => Some((k.clone(), t.clone())),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                let default = match o.get("default") {
+                    None | Some(J::Null) => None,
+                    Some(J::String(d)) if pairs.iter().any(|(k, _)| k == d) => Some(d.clone()),
+                    _ => return None,
+                };
+                Some((pairs, default))
+            }
+            _ => return None,
+        };
+        Some(Question { text, choices })
+    }
+}
+
+/// Why a question's call ended with an error the model reads (`isError`).
+#[derive(Debug, Clone)]
+enum Said {
+    /// `confirm` where the client cannot ask.
+    CannotAsk,
+    /// The person declined the question, or dismissed it.
+    Declined(String),
+    Dismissed(String),
+}
+
+impl Said {
+    fn text(&self) -> String {
+        match self {
+            Said::CannotAsk => CANNOT_ASK.into(),
+            Said::Declined(q) => format!("the user declined to answer: {}", shown(q)),
+            Said::Dismissed(q) => format!("the user did not answer: {}", shown(q)),
+        }
+    }
 }
 
 /// Why a run stopped at a question.
+#[derive(Debug)]
 enum Stopped {
-    /// To ask: the question's key, the request for the client, and the question's digest.
-    Ask(String, J, String),
+    /// To ask: the question's key, the question, and its digest.
+    Ask(String, Question, String),
     /// The call's answer is this error (`isError`): `confirm` where the client cannot ask, an
     /// `ask` the user would not answer.
-    Said(String),
+    Said(Said),
     /// What the client sent is not an answer the question takes: a protocol error (mrtr, Error
     /// Handling).
     Refused(String),
@@ -1170,23 +1324,278 @@ enum Stopped {
     Failed,
 }
 
+impl Stopped {
+    /// How a service's run stopped, as it crosses back to the door (`Asking::reply`): a question
+    /// as data, and its digest, whose key the door gives it.
+    fn to_wire(&self) -> J {
+        match self {
+            Stopped::Ask(_, q, digest) => json!({ "ask": { "digest": digest, "question": q.to_wire() } }),
+            Stopped::Said(Said::CannotAsk) => json!({ "said": { "cannot": true } }),
+            Stopped::Said(Said::Declined(q)) => json!({ "said": { "declined": q } }),
+            Stopped::Said(Said::Dismissed(q)) => json!({ "said": { "dismissed": q } }),
+            Stopped::Refused(why) => json!({ "refused": why }),
+            Stopped::Failed => json!({ "failed": true }),
+        }
+    }
+}
+
+/// A question's digest as a service gives it back: its own (32 hex digits), under the names of the
+/// services it came through (`tax/...`). Never one of the door's own, which have no `/`.
+fn service_digest(d: &str) -> bool {
+    let mut parts: Vec<&str> = d.split('/').collect();
+    let Some(own) = parts.pop() else { return false };
+    own.len() == 32
+        && own.bytes().all(|b| b.is_ascii_hexdigit())
+        && parts.iter().all(|p| !p.is_empty() && p.len() <= 64 && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        && parts.len() < 16
+}
+
+/// Text a service sent back that the door logs or says (a change, a refusal's reason): held to
+/// `most` characters, without one no reader sees.
+fn cleaned(text: &str, most: usize) -> String {
+    let mut s: String = shown(text).chars().take(most).collect();
+    if text.chars().nth(most).is_some() {
+        s.push_str("...");
+    }
+    s
+}
+
+/// What the result says of an `ask` the user was not asked.
+fn note_text(q: &str, label: Option<&str>) -> String {
+    let taken = label.map_or_else(|| "null".to_string(), |t| format!("\"{}\"", shown(t)));
+    format!("the user was not asked \"{}\": the default {} was taken", shown(q), taken)
+}
+
 impl Asking {
     /// The call stopped: at a question, or with a refusal.
     pub(crate) fn stopped(&self) -> bool {
         self.stop.is_some()
     }
 
+    fn empty(can_ask: bool, nobody: bool) -> Box<Asking> {
+        Box::new(Asking {
+            can_ask,
+            nobody,
+            who: String::new(),
+            tool: String::new(),
+            args: String::new(),
+            answers: Vec::new(),
+            pending: None,
+            reached: 0,
+            rounds: 0,
+            site: 0,
+            places: HashMap::new(),
+            notes: Vec::new(),
+            wrote: None,
+            stop: None,
+            raw: false,
+            kept: 0,
+            consumed: false,
+        })
+    }
+
+    /// What a call made later from a tool's call runs with: no one to ask (`NOBODY`).
+    pub(crate) fn nobody() -> Box<Asking> {
+        Asking::empty(false, true)
+    }
+
+    /// What a service's tool that may ask runs with when its app's door sent no asking: a client
+    /// that cannot ask, `confirm` refused and `ask` its default, said so; never a call outside any
+    /// tool's, where `confirm` is true (FEEDBACK56.md, Part F, security review).
+    pub(crate) fn cannot_ask() -> Box<Asking> {
+        let mut a = Asking::empty(false, false);
+        a.raw = true;
+        a
+    }
+
+    /// The call stopped at a refusal: a question refused, or `confirm` or `ask` refusing itself.
+    pub(crate) fn failed(&self) -> bool {
+        matches!(self.stop, Some(Stopped::Failed))
+    }
+
+    /// The call stops, as at a refusal of `confirm` or `ask`: closed.
+    pub(crate) fn fail(&mut self) {
+        self.stop.get_or_insert(Stopped::Failed);
+    }
+
+    /// A change made where the door cannot see it, before any it saw: `what`, as a question after
+    /// it says it.
+    pub(crate) fn changed(&mut self, what: String) {
+        self.wrote.get_or_insert(what);
+    }
+
+    /// Where a service's run of a tool's call that stopped leaves its answer, when no door takes
+    /// its asking back (`asking: null` from the app's door): the error the model reads, or none
+    /// for a question it could not have asked; and the notes beside it.
+    pub(crate) fn settled(&mut self, result: &mut J) {
+        if let Some(stop) = self.stop.take() {
+            *result = match stop {
+                Stopped::Said(s) => tool_error(s.text()),
+                _ => tool_error("internal error"),
+            };
+        }
+        if let Some(content) = result.get_mut("content").and_then(J::as_array_mut) {
+            content.extend(self.notes.drain(..).map(|(q, l)| json!({ "type": "text", "text": note_text(&q, l.as_deref()) })));
+        }
+    }
+
+    /// What crosses to the service `service` that a tool's call reaches, over the signed call or in
+    /// this process (FEEDBACK56.md, Part F; branch feedback56): whether the client can ask, how
+    /// many questions the call has reached, the rounds, and of the answers only the service's own
+    /// (`service/...`), each the person's as the client sent it; another's is none to it, so that
+    /// a service reads no answer the person gave the program or another service. The question
+    /// asked last, with the person's answer, only where it is the service's (security review).
+    pub(crate) fn for_service(&self, service: &str) -> J {
+        let prefix = format!("{}/", service);
+        json!({
+            "can_ask": self.can_ask,
+            "nobody": self.nobody,
+            "rounds": self.rounds,
+            "reached": self.reached,
+            "answers": self.answers.iter().map(|(d, a)| d.strip_prefix(&prefix).map_or(J::Null, |own| json!([own, a]))).collect::<Vec<_>>(),
+            "pending": self.pending.as_ref().and_then(|(d, a)| d.strip_prefix(&prefix).map(|own| json!([own, a]))),
+        })
+    }
+
+    /// A service's asking, made of what its app's door sent (`for_service`); None for anything not
+    /// of that shape. Each answer is the person's as sent, read by its question (`raw`).
+    pub(crate) fn from_wire(j: &J) -> Option<Box<Asking>> {
+        let o = j.as_object()?;
+        let mut a = Asking::empty(o.get("can_ask")?.as_bool()?, o.get("nobody")?.as_bool()?);
+        a.rounds = o.get("rounds")?.as_u64()? as usize;
+        a.reached = o.get("reached")?.as_u64()? as usize;
+        let answers = o.get("answers")?.as_array()?;
+        if a.reached > MOST_QUESTIONS || a.rounds > MOST_QUESTIONS || answers.len() > MOST_QUESTIONS {
+            return None;
+        }
+        for x in answers {
+            a.answers.push(match x.as_array().map(Vec::as_slice) {
+                Some([J::String(d), v]) => (d.clone(), v.clone()),
+                None if x.is_null() => ("-".to_string(), J::Null),
+                _ => return None,
+            });
+        }
+        a.pending = match o.get("pending")? {
+            J::Null => None,
+            p => match p.as_array().map(Vec::as_slice) {
+                Some([J::String(d), J::Null]) => Some((d.clone(), None)),
+                Some([J::String(d), v]) => Some((d.clone(), Some(v.clone()))),
+                _ => return None,
+            },
+        };
+        a.raw = true;
+        a.kept = a.answers.len();
+        Some(a)
+    }
+
+    /// What a service's run did with the asking it was sent, for its app's door (`take_reply`):
+    /// how many questions it reached, how many of the answers it kept, whether it took the person's
+    /// answer to the question asked last, its first change, the `ask`s it could not ask, and how it
+    /// stopped. Never an answer: those come from the person, through the door's signed state.
+    pub(crate) fn reply(&self) -> J {
+        json!({
+            "reached": self.reached,
+            "kept": self.kept,
+            "consumed": self.consumed,
+            "wrote": self.wrote,
+            "defaults": self.notes.iter().map(|(q, l)| json!([q, l])).collect::<Vec<_>>(),
+            "stop": self.stop.as_ref().map(Stopped::to_wire),
+        })
+    }
+
+    /// The reply of the service `service`'s run of `label` (`billing.charge`), taken by this door:
+    /// the answers it kept, the person's answer to its question asked last where it took it (the
+    /// door's own copy), the questions reached, its first change said as made there, its notes,
+    /// and a stop at its own question, under its name, the form made here. Nothing else: an answer
+    /// it sends is not read, and one to a question not its own cannot be given (FEEDBACK56.md,
+    /// Part F, security review). False for a reply that is not one of these, which stops the call.
+    pub(crate) fn take_reply(&mut self, service: &str, label: &str, j: &J) -> bool {
+        let start = self.reached;
+        let sent = self.answers.len();
+        let Some(o) = j.as_object() else { return false };
+        let (Some(reached), Some(kept), Some(consumed), Some(wrote), Some(defaults), Some(stop)) = (
+            o.get("reached").and_then(J::as_u64).map(|n| n as usize),
+            o.get("kept").and_then(J::as_u64).map(|n| n as usize),
+            o.get("consumed").and_then(J::as_bool),
+            o.get("wrote"),
+            o.get("defaults").and_then(J::as_array),
+            o.get("stop"),
+        ) else {
+            return false;
+        };
+        // It kept what it was sent up to a question it reached, and reached no fewer than it
+        // was sent, nor more than a call asks.
+        if kept > sent || kept < start.min(sent) || reached < start || reached > MOST_QUESTIONS || defaults.len() > MOST_QUESTIONS {
+            return false;
+        }
+        if kept < sent {
+            self.answers.truncate(kept);
+            self.pending = None;
+        }
+        if consumed {
+            let prefix = format!("{}/", service);
+            match self.pending.take() {
+                Some((d, Some(answer))) if kept == sent && d.starts_with(&prefix) => self.answers.push((d, answer)),
+                _ => return false,
+            }
+        }
+        self.reached = reached;
+        match wrote {
+            J::Null => {}
+            J::String(w) => {
+                if self.wrote.is_none() {
+                    self.wrote = Some(format!("{} (in `{}`)", cleaned(w, 200), label));
+                }
+            }
+            _ => return false,
+        }
+        for d in defaults {
+            match d.as_array().map(Vec::as_slice) {
+                Some([J::String(q), J::Null]) => self.notes.push((q.clone(), None)),
+                Some([J::String(q), J::String(l)]) => self.notes.push((q.clone(), Some(l.clone()))),
+                _ => return false,
+            }
+        }
+        let stop = match stop {
+            J::Null => return true,
+            J::Object(s) if s.len() == 1 => s.iter().next().map(|(k, v)| (k.clone(), v.clone())),
+            _ => return false,
+        };
+        let stopped = match stop {
+            Some((k, v)) if k == "ask" => {
+                let (Some(J::String(digest)), Some(q)) = (v.get("digest"), v.get("question").and_then(Question::from_wire)) else { return false };
+                // Asked only of a client that can be, at the question it reached last, the
+                // answers kept those before it.
+                if !service_digest(digest) || !self.can_ask || self.nobody || reached == 0 || self.answers.len() > reached - 1 {
+                    return false;
+                }
+                Stopped::Ask(key_of(reached - 1), q, format!("{}/{}", service, digest))
+            }
+            Some((k, v)) if k == "said" => match (v.get("cannot"), v.get("declined").and_then(J::as_str), v.get("dismissed").and_then(J::as_str)) {
+                (Some(J::Bool(true)), None, None) if !self.can_ask => Stopped::Said(Said::CannotAsk),
+                (None, Some(q), None) => Stopped::Said(Said::Declined(q.to_string())),
+                (None, None, Some(q)) => Stopped::Said(Said::Dismissed(q.to_string())),
+                _ => return false,
+            },
+            Some((k, J::String(why))) if k == "refused" => Stopped::Refused(cleaned(&why, 500)),
+            Some((k, J::Bool(true))) if k == "failed" => Stopped::Failed,
+            _ => return false,
+        };
+        self.stop.get_or_insert(stopped);
+        true
+    }
+
     /// The answer of a call that stopped: the form and the next state, or the error.
     fn answer(self, stop: Stopped, tool: &str) -> Result<J, Fault> {
         match stop {
-            Stopped::Said(text) => Ok(tool_error(text)),
+            Stopped::Said(s) => Ok(tool_error(s.text())),
             Stopped::Refused(why) => Err(fault(INVALID_PARAMS, format!("Invalid params: {}", why))),
             Stopped::Failed => Ok(tool_error("internal error")),
-            Stopped::Ask(key, request, digest) => {
+            Stopped::Ask(key, question, digest) => {
                 let asked: Vec<J> = self.answers.iter().map(|(d, a)| json!([d, a])).collect();
                 let state = json!({ "v": 1, "id": crate::service::new_id(16), "who": self.who, "tool": self.tool, "args": self.args, "asked": asked, "pending": digest, "rounds": self.rounds + 1, "ends": now_ms() + STATE_LIFE_MS });
                 let mut requests = Map::new();
-                requests.insert(key, request);
+                requests.insert(key, question.form());
                 let r = json!({ "resultType": "input_required", "inputRequests": requests, "requestState": crate::session::seal(STATE_PURPOSE, &state.to_string()) });
                 // Held as a result is: a question longer than a client takes is said so.
                 if r.to_string().len() > MOST {
@@ -1341,6 +1750,12 @@ pub(crate) fn noted(it: &mut Interp, name: &'static str, line: u32) -> Result<()
     if a.stop.is_some() {
         return crate::interp::fail(line, ASKING);
     }
+    // A call of a service's function carries the call's asking there and back: what it changes
+    // is noted there, and a question it asks is asked (`service::call`; FEEDBACK56.md, Part F;
+    // branch feedback56). A call made later is a change.
+    if name == "__service" {
+        return Ok(());
+    }
     if a.wrote.is_none() && crate::viewcache::kind_of(name) == crate::viewcache::Kind::Acts && crate::ast::builtin_effect(name) != effect_bit("random") {
         a.wrote = Some(format!("`{}`", crate::native::display_name(name)));
     }
@@ -1436,12 +1851,20 @@ enum Asked {
 /// The question `digest` (`what`, at `line`) in the call being made: its answer, or the run stops
 /// with the form `form` gives (`request`) or with the reason the answer sent is refused (`take`
 /// reads the client's answer: a choice's key or a yes, or why it is no answer).
-fn question(it: &mut Interp, line: u32, what: &str, digest: String, request: &dyn Fn() -> J, take: &dyn Fn(&J) -> Result<J, Stopped>) -> Result<Asked, Ctrl> {
+/// In a service's run of a tool's call (`Asking::raw`) every answer is the person's as the client
+/// sent it, read here by `take` as the question asked last's is, and kept so; what the run keeps
+/// and takes is counted for the door (`Asking::reply`; FEEDBACK56.md, Part F, security review).
+fn question(it: &mut Interp, line: u32, what: &str, digest: String, request: &dyn Fn() -> Question, take: &dyn Fn(&J) -> Result<J, Stopped>) -> Result<Asked, Ctrl> {
     // In `parallel`'s functions the questions would be asked in no order: a call that may ask
     // runs them one after another (`Interp::run_parallel`), so this is the call's own handle.
     let Some(a) = it.asking.as_mut() else { return Ok(Asked::Outside) };
     if a.stop.is_some() {
         return crate::interp::fail(line, ASKING);
+    }
+    // A call made later from a tool's call: no one is there to ask (FEEDBACK56.md, Part F; branch
+    // feedback56).
+    if a.nobody {
+        return crate::interp::fail(line, format!("`{}`: {}", what, NOBODY));
     }
     if let Some(w) = &a.wrote {
         return crate::interp::fail(line, format!("`{}` comes after {}: {}", what, w, ASK_FIRST));
@@ -1454,11 +1877,21 @@ fn question(it: &mut Interp, line: u32, what: &str, digest: String, request: &dy
     // Answered in a round before, the same question at the same place.
     if let Some((d, answer)) = a.answers.get(n) {
         if *d == digest {
-            return Ok(Asked::Answer(answer.clone()));
+            if !a.raw {
+                return Ok(Asked::Answer(answer.clone()));
+            }
+            return match take(answer) {
+                Ok(answer) => Ok(Asked::Answer(answer)),
+                Err(stop) => {
+                    a.stop = Some(stop);
+                    crate::interp::fail(line, ASKING)
+                }
+            };
         }
         // The run took another way, or the question changed (its text says another number, say):
         // what was answered from here on is not this one's, and it is asked again.
         a.answers.truncate(n);
+        a.kept = a.kept.min(n);
         a.pending = None;
     }
     // The question asked last, the user's answer to it now.
@@ -1468,7 +1901,8 @@ fn question(it: &mut Interp, line: u32, what: &str, digest: String, request: &dy
                 if let Some(sent) = sent {
                     match take(&sent) {
                         Ok(answer) => {
-                            a.answers.push((digest, answer.clone()));
+                            a.answers.push((digest, if a.raw { sent } else { answer.clone() }));
+                            a.consumed = true;
                             return Ok(Asked::Answer(answer));
                         }
                         Err(stop) => {
@@ -1493,6 +1927,7 @@ fn question(it: &mut Interp, line: u32, what: &str, digest: String, request: &dy
         );
     }
     a.answers.truncate(n);
+    a.kept = a.kept.min(n);
     a.stop = Some(Stopped::Ask(key_of(n), request(), digest));
     crate::interp::fail(line, ASKING)
 }
@@ -1569,14 +2004,7 @@ fn ask_here(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctrl>
     };
     let place = place_of(it, line);
     let digest = question_digest(&json!(["ask", place, q, pairs, default]));
-    let request = || {
-        let one_of: Vec<J> = pairs.iter().map(|(k, t)| json!({ "const": k, "title": shown(t) })).collect();
-        let mut choice = json!({ "type": "string", "oneOf": one_of });
-        if let Some(d) = &default {
-            choice["default"] = json!(d);
-        }
-        json!({ "method": "elicitation/create", "params": { "mode": "form", "message": shown(&q), "requestedSchema": { "type": "object", "properties": { "choice": choice }, "required": ["choice"] } } })
-    };
+    let request = || Question { text: q.clone(), choices: Some((pairs.clone(), default.clone())) };
     let key = it.asking.as_ref().map(|a| key_of(a.reached)).unwrap_or_default();
     let take = |sent: &J| -> Result<J, Stopped> {
         let (action, content) = elicited(sent, &key)?;
@@ -1586,8 +2014,8 @@ fn ask_here(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctrl>
                 Some(v) => Err(Stopped::Refused(format!("the answer to \"{}\" is {}, which is not one of its choices: {}", shown(&q), v, keys()))),
                 None => Err(Stopped::Refused(format!("inputResponses.{} accepts with no `choice` in its content", key))),
             },
-            "decline" => Err(Stopped::Said(format!("the user declined to answer: {}", shown(&q)))),
-            _ => Err(Stopped::Said(format!("the user did not answer: {}", shown(&q)))),
+            "decline" => Err(Stopped::Said(Said::Declined(q.clone()))),
+            _ => Err(Stopped::Said(Said::Dismissed(q.clone()))),
         }
     };
     match question(it, line, "ask", digest, &request, &take)? {
@@ -1595,9 +2023,9 @@ fn ask_here(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctrl>
         // The default, as decided, and the result says so: the instructions told the model the
         // tool asks the user, and it did not (found in review).
         Asked::CannotAsk => {
-            let taken = default.as_ref().and_then(|d| pairs.iter().find(|(k, _)| k == d)).map_or_else(|| "null".to_string(), |(_, t)| format!("\"{}\"", shown(t)));
+            let taken = default.as_ref().and_then(|d| pairs.iter().find(|(k, _)| k == d)).map(|(_, t)| t.clone());
             if let Some(a) = it.asking.as_mut() {
-                a.notes.push(format!("the user was not asked \"{}\": the default {} was taken", shown(&q), taken));
+                a.notes.push((q.clone(), taken));
             }
             Ok(default.map_or(Value::Nil, Value::str))
         }
@@ -1620,10 +2048,7 @@ fn confirm_here(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, C
     let q = question_of(&args, "confirm", line)?;
     let place = place_of(it, line);
     let digest = question_digest(&json!(["confirm", place, q]));
-    let request = || {
-        let field = json!({ "type": "boolean", "title": shown(&q), "default": false });
-        json!({ "method": "elicitation/create", "params": { "mode": "form", "message": shown(&q), "requestedSchema": { "type": "object", "properties": { "confirm": field }, "required": ["confirm"] } } })
-    };
+    let request = || Question { text: q.clone(), choices: None };
     let key = it.asking.as_ref().map(|a| key_of(a.reached)).unwrap_or_default();
     let take = |sent: &J| -> Result<J, Stopped> {
         let (action, content) = elicited(sent, &key)?;
@@ -1639,7 +2064,7 @@ fn confirm_here(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, C
     match question(it, line, "confirm", digest, &request, &take)? {
         Asked::CannotAsk => {
             if let Some(a) = it.asking.as_mut() {
-                a.stop = Some(Stopped::Said(CANNOT_ASK.into()));
+                a.stop = Some(Stopped::Said(Said::CannotAsk));
             }
             crate::interp::fail(line, ASKING)
         }
@@ -2610,10 +3035,30 @@ fn say_dev_door(it: &Interp) {
 /// read now when it declares any. None for a program with no tools, or one run as a service.
 pub fn open_door(it: &mut Interp, path: &Path, tools: Option<Vec<Tool>>) {
     it.mcp = None;
+    it.offered_tools = None;
+    // A tool of its own, or a service's it offers (FEEDBACK56.md, Part F; branch feedback56).
+    let declares = || it.program.iter().any(|stmts| stmts.iter().any(|s| matches!(s, crate::ast::Stmt::Fn(d) if d.mcp) || matches!(s, crate::ast::Stmt::Service(_, Some(_), _, _, _, true))));
+    // Run as a service: no door, and its own tools for its app's, which passes their calls on
+    // (`service::answer`; FEEDBACK56.md, Part F; branch feedback56). Only its own: those of
+    // services it offers in turn are for a door of its own, not its app's.
     if it.is_service {
+        let own = match tools {
+            Some(t) => t,
+            None if declares() => match of_source(path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("quillo: this service's tools are not offered to its app: they could not be read:\n{}", e);
+                    return;
+                }
+            },
+            None => return,
+        };
+        let own: Vec<Tool> = own.into_iter().filter(|t| t.service.is_none()).collect();
+        if !own.is_empty() {
+            it.offered_tools = Some(Arc::new(own));
+        }
         return;
     }
-    let declares = || it.program.iter().any(|stmts| stmts.iter().any(|s| matches!(s, crate::ast::Stmt::Fn(d) if d.mcp)));
     let tools = match tools {
         Some(t) => t,
         None if declares() => match of_source(path) {

@@ -1567,9 +1567,24 @@ fn mcp orders_today(limit: int = 20) -> list with db {
   and reach anywhere. A tool that uses none is fine as it is. A parameter that cannot come as JSON (`fn`, `html`, `response`) is an
   error, and so is an answer that can only be a page (`redirect`, `html`, `respond`): a tool
   answers with data. One that only may be a page is a warning.
-- `service mcp /billing = "billing.qwe"` serves billing as `service /billing` does, and its
-  tools will be the program's, named `billing.<name>`. The named form, `service mcp crm =
-  "https://..."`, for calling another MCP server, is refused for now.
+- `service mcp /billing = "billing.qwe"` serves billing as `service /billing` does, and offers
+  billing's own tools as the program's, named `billing.<name>` (at most 128 characters), after
+  the program's own, with billing's schemas and hints. Both authors agree to it: billing says
+  which functions are tools (`fn mcp`), the app whether they are offered here (`service mcp`).
+  A plain `service`, a service's own services, and a service whose file is not here offer none.
+  Their calls run in billing, in the same process or over the signed service call under
+  `--split`; there `session()`, `tenant()` and `request.mcp` are the caller's (cookies and
+  `set_session` set there go nowhere), and they count toward the caller's 60 a minute. Apart,
+  a call of billing's tools and its answer are also signed with the app's key, which only
+  billing and its app hold (`QUILLO_APP_KEY` where billing runs, `QUILLO_APP_KEY_BILLING` where
+  the app runs, the same secret; `--split` sets both): only the app's door runs billing's
+  tools, never a plain call from code, another service, a token or a certificate. A `service
+  mcp` whose auth signs nothing (`auth: { bearer }`, OAuth or mTLS without a key) is refused by
+  `quillo check`. A tool's call that a joined copy did not answer is not run again here: it
+  fails, as it may have run. Services must run this Quillo or later, so upgrade them before the
+  app: an older one refuses a tool's call, and the app says so.
+  The named form, `service mcp crm = "https://..."`, for calling another MCP server, is refused
+  for now.
 - The API document marks a `server fn mcp` with `x-quillo-mcp: true`.
 - What a client is told: each tool's arguments and result as JSON Schema 2020-12, the dialect
   MCP requires (`str?` is `["string", "null"]`, a record once under `$defs` by a local `$ref`,
@@ -1712,8 +1727,13 @@ fn mcp publish_post(title: str, body: str) -> int with db {
   the person; `confirm` refuses (`isError`: this needs the user's yes, and this client cannot
   ask).
 - Outside a tool's call (the program's own code, or a page calling a `server fn mcp`), `ask`
-  gives its default and `confirm` gives true: the page asks in its own way. A service a tool
-  calls is outside it too, for now: its `confirm` gives true.
+  gives its default and `confirm` gives true: the page asks in its own way. A service function
+  a tool's call reaches asks through the program's door, in the same state, in one process or
+  across `--split`; a change in either refuses a later question, and so does a call to a
+  service whose answer is not one Quillo can verify (refused, unsigned, unreadable, a 500, none
+  in time). The person's answers reach billing only through the app's signed state, and the
+  form shown to them is the app's own. `billing.later.f(...)` from a tool has no one to ask:
+  its question is refused and the job fails (`quillo check` refuses it where it sees it).
 - Neither asks for free text, as MCP forbids asking for passwords, keys or payment details in a
   form. A tool that asks and only reads stays read-only. A round that carries the answer to the
   question its state waits on does not count toward the 60 tool calls a minute; any other round

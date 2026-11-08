@@ -555,6 +555,7 @@ fn functions_of(it: &mut Interp, name: &str, urls: &[String]) -> Result<(Vec<Arc
         Outcome::Ran(Value::List(l)) => l,
         Outcome::Ran(other) => return Err(format!("its answer is not a list of functions: {}", short(&other))),
         Outcome::Missed(why) | Outcome::Refused(_, why) => return Err(why),
+        Outcome::Stopped | Outcome::Tool(_) => return Err("its answer is not a list of functions".into()),
     };
     let mut defs = Vec::new();
     let mut contracts = Vec::new();
@@ -741,7 +742,12 @@ pub fn call(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (name, f, sent) = call_args(&args, "__service", line)?;
     let tenant = it.tenant();
     let rid = it.request_id.clone();
-    Ok(make(it, &name, &f, sent, tenant, rid, None, line).value())
+    match make(it, &name, &f, sent, tenant, rid, None, line) {
+        // A tool's call stopped in the service, to ask its user or at a question refused there:
+        // it stops here too, as at a question of its own (FEEDBACK56.md, Part F; branch feedback56).
+        Outcome::Stopped => fail(line, crate::mcp::ASKING),
+        done => Ok(done.value()),
+    }
 }
 
 /// The service, the function and the arguments to send, from `__service`'s.
@@ -768,6 +774,11 @@ enum Outcome {
     Missed(String),
     /// The service answered, with no value: a status, and why.
     Refused(u16, String),
+    /// A call that carried a tool's call's asking stopped there: to ask the user, or at a question
+    /// refused, as the asking it gave back says (FEEDBACK56.md, Part F; branch feedback56).
+    Stopped,
+    /// A service's tool answered its app's door: `tools/call`'s result, as it made it.
+    Tool(serde_json::Value),
 }
 
 impl Outcome {
@@ -775,6 +786,8 @@ impl Outcome {
         match self {
             Outcome::Ran(v) => v,
             Outcome::Missed(why) | Outcome::Refused(_, why) => Value::err(Value::str(why)),
+            Outcome::Stopped => Value::err(Value::str(crate::mcp::ASKING)),
+            Outcome::Tool(_) => Value::Nil,
         }
     }
 }
@@ -869,14 +882,14 @@ pub(crate) fn from_answer(j: &serde_json::Value) -> Value {
     }
 }
 
+/// A call of the service `name`'s `f` in this process.
+/// A tool's call that may ask its user carries its asking into the service's handle, and takes it
+/// back: a question there is asked through the tool's door, in the same state, its place in the
+/// service's file; what it changes is the call's, so that a question after it is refused; and
+/// where it stopped, the call stops (`Outcome::Stopped`). Before, the service's handle had none,
+/// and its `confirm` gave true with nobody asked (FEEDBACK56.md, Part F; branch feedback56).
 #[allow(clippy::too_many_arguments)]
 fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: String, line: u32) -> Outcome {
-    // NOT YET (FEEDBACK56.md, Part F, slice 8; branch feedback56): the service's fork has no
-    // `asking` (`Interp::fork`), so a `confirm` in its function, called from an app's tool, gives
-    // true as outside a tool's call, and an `ask` its default, with nobody asked. The call is
-    // noted as a change in the tool (`__service` acts), so a question after it is refused; one
-    // in the service is not asked. Part F carries the call's asking across, here and over the
-    // signed call; until then a service's question in a tool's call is a yes nobody gave.
     let found = it.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).map(|(_, s)| s.fork());
     let Some(mut svc) = found else {
         return Outcome::Missed(format!("service {}: not running here, and no address for it ({} or --service-url)", name, env_name(name)));
@@ -894,19 +907,185 @@ fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<
     svc.current_request = Some(step_request(rid.as_deref(), &call));
     svc.request_id = rid;
     let err = |msg: String| Outcome::Refused(500, msg);
-    match svc.call_closure(&c, args.into_iter().map(Some).collect(), line) {
-        Ok(v) | Err(Ctrl::Return(v)) => match v {
+    let carried = carry_in(it, &mut svc, name);
+    let r = svc.call_closure(&c, args.into_iter().map(Some).collect(), line);
+    let label = format!("{}.{}", name, f);
+    match (carry_back(it, &mut svc, carried, name, &label), r) {
+        // Stopped to ask, or at a question refused there, said in its log as a builtin's error is.
+        (Back::Stopped { failed }, r) => {
+            if let (true, Err(Ctrl::Error(e))) = (failed, &r) {
+                eprintln!("quillo: service {}: error in `{}`: {:#}", name, f, e);
+            }
+            Outcome::Stopped
+        }
+        (_, Ok(v) | Err(Ctrl::Return(v))) => match v {
             Value::Response(_) => err(format!("service {}: `{}` answered with a page, not a value", name, f)),
             // Whether the program wrote it goes along, as it does over the wire.
             Value::Err(e, true, _) => Outcome::Ran(Value::own_err(crossed(&e))),
             v => Outcome::Ran(crossed(&v)),
         },
-        Err(Ctrl::Reply(_)) => err(format!("service {}: `{}` replied with a page, not a value", name, f)),
-        Err(Ctrl::Error(e)) => {
+        (_, Err(Ctrl::Reply(_))) => err(format!("service {}: `{}` replied with a page, not a value", name, f)),
+        (_, Err(Ctrl::Error(e))) => {
             eprintln!("quillo: service {}: error in `{}`: {:#}", name, f, e);
             err(format!("service {}: internal error in `{}`", name, f))
         }
     }
+}
+
+/// `f` run in `it` with the asking of a tool's call, `asking`, which is taken back whatever
+/// happens, a panic too: the handle answers other requests after, which must not run as that
+/// call's (FEEDBACK56.md, Part F; branch feedback56).
+fn with_asking<T>(it: &mut Interp, asking: Option<Box<crate::mcp::Asking>>, f: impl FnOnce(&mut Interp) -> T) -> (T, Option<Box<crate::mcp::Asking>>) {
+    let was = std::mem::replace(&mut it.asking, asking);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(it)));
+    let back = std::mem::replace(&mut it.asking, was);
+    match r {
+        Ok(v) => (v, back),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// Whether a call carried the asking of the tool's call it is made in (FEEDBACK56.md, Part F;
+/// branch feedback56).
+struct Carried(bool);
+
+/// How a call that carried an asking came back.
+enum Back {
+    /// It carried none.
+    None,
+    Ran,
+    /// It stopped there; `failed`: at a question refused, or a refusal of its own.
+    Stopped { failed: bool },
+}
+
+/// The asking of the tool's call `it` makes, given to the handle on the service `name`, `svc`, for
+/// its call: what the signed call sends (`Asking::for_service`), so that the service runs the same
+/// in this process as apart, and reads only the answers to its own questions.
+fn carry_in(it: &mut Interp, svc: &mut Interp, name: &str) -> Carried {
+    let Some(a) = it.asking.as_ref() else { return Carried(false) };
+    svc.asking = crate::mcp::Asking::from_wire(&a.for_service(name));
+    if svc.asking.is_none() {
+        // Never, as the door made it: closed all the same.
+        if let Some(a) = it.asking.as_mut() {
+            a.fail();
+        }
+    }
+    Carried(true)
+}
+
+/// What `svc`'s call of `label` (`billing.charge`) of the service `name` did with the asking, taken
+/// back by `it` as a signed call's reply is (`Asking::take_reply`): only what the service may say.
+fn carry_back(it: &mut Interp, svc: &mut Interp, carried: Carried, name: &str, label: &str) -> Back {
+    if !carried.0 {
+        return Back::None;
+    }
+    let reply = svc.asking.take().map(|a| a.reply());
+    let Some(a) = it.asking.as_mut() else { return Back::None };
+    if !reply.is_some_and(|r| a.take_reply(name, label, &r)) {
+        a.fail();
+    }
+    if a.stopped() {
+        Back::Stopped { failed: a.failed() }
+    } else {
+        Back::Ran
+    }
+}
+
+// ---- a service's tools, at its app's door (FEEDBACK56.md, Part F; branch feedback56) ----------
+
+/// The tool `tool` of the service `name`, called at its app's door with `args` (each made to its
+/// type there, or left out for its default) and `given`, the same as the client sent them: its
+/// answer, `tools/call`'s result. In one process the call goes straight to the service; where it
+/// runs elsewhere, over the signed service call, which offers the service's tools to its app's
+/// door alone (`answer`): no plain call reaches a `fn mcp` that is not a `server fn`. Either way
+/// the call is the caller's, its tenant, its request's id, `request.mcp` and its session (the
+/// token or the cookie checked once, here), and runs with the call's asking, as `local` and
+/// `remote_hop` carry it. A service out of reach is `internal error`, the reason in the log.
+pub(crate) fn call_tool(it: &mut Interp, name: &str, tool: &crate::mcp::Tool, args: Vec<Option<Value>>, given: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    let configured = configured_urls(&it.shared, name);
+    let joined = joined_urls(name);
+    let out = if configured.is_empty() && joined.is_empty() {
+        return local_tool(it, name, tool, args);
+    } else {
+        let mut urls = configured;
+        let only_joined = urls.is_empty();
+        urls.extend(joined.into_iter().filter(|u| !urls.contains(u)).collect::<Vec<_>>());
+        let session = crate::session::current(it);
+        let hop = ToolHop {
+            arguments: given.clone(),
+            session: to_wire(&session),
+            owner: crate::session::current_owner(it),
+            client: to_wire(&mcp_client(it)),
+        };
+        let tenant = it.tenant();
+        let rid = it.request_id.clone();
+        let mut sent = false;
+        match remote_hop(it, &urls, name, tool.own_name(), Vec::new(), tenant, rid, new_id(16), Some(&hop), &mut sent) {
+            // The copies that joined first, and this process when none could be reached (`make`).
+            // One sent that got no answer may have run there: never run again here, where it
+            // would charge twice (FEEDBACK56.md, Part F, security review).
+            Outcome::Missed(_) if only_joined && !sent => return local_tool(it, name, tool, args),
+            Outcome::Missed(why) if sent => Outcome::Missed(format!("the call to {} got no answer: it may have run ({})", name, why)),
+            out => out,
+        }
+    };
+    match out {
+        Outcome::Tool(r) => r,
+        // Its answer is the question, or the refusal, the asking it gave back holds (`mcp::run`).
+        Outcome::Stopped => crate::mcp::tool_error("internal error"),
+        Outcome::Missed(why) | Outcome::Refused(_, why) => {
+            eprintln!("quillo: error in tool `{}`: {}", tool.name, why);
+            crate::mcp::tool_error("internal error")
+        }
+        Outcome::Ran(_) => {
+            eprintln!("quillo: error in tool `{}`: service {} answered a tool's call as a server fn's", tool.name, name);
+            crate::mcp::tool_error("internal error")
+        }
+    }
+}
+
+/// `request.mcp` of the request being answered: who the client says it is, or null.
+fn mcp_client(it: &mut Interp) -> Value {
+    match it.request_value() {
+        Some(Value::Map(m)) => m.get("mcp").cloned().unwrap_or(Value::Nil),
+        _ => Value::Nil,
+    }
+}
+
+/// `request` in a service's tool: as a service call's (`step_request`), and `mcp`, who the client
+/// says it is, as at its app's door.
+fn tool_request(rid: Option<&str>, call: &str, client: Value) -> Value {
+    let mut m = match step_request(rid, call) {
+        Value::Map(m) => (*m).clone(),
+        _ => Map::new(),
+    };
+    m.insert("mcp".into(), client);
+    Value::map(m)
+}
+
+/// `call_tool` in this process: the tool run in a handle on the service, as its own door runs one
+/// (`mcp::answer_tool`), the call's asking carried in and back. What it sets in a cookie or the
+/// session goes nowhere: the caller's cookies are its app's.
+fn local_tool(it: &mut Interp, name: &str, tool: &crate::mcp::Tool, args: Vec<Option<Value>>) -> serde_json::Value {
+    let found = it.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).map(|(_, s)| s.fork());
+    let Some(mut svc) = found else {
+        eprintln!("quillo: error in tool `{}`: service {}: not running here, and no address for it ({} or --service-url)", tool.name, name, env_name(name));
+        return crate::mcp::tool_error("internal error");
+    };
+    let tenant = it.tenant();
+    svc.tenant_named = tenant.is_some();
+    svc.tenant = Some(tenant);
+    let rid = it.request_id.clone();
+    svc.current_request = Some(tool_request(rid.as_deref(), &new_id(16), mcp_client(it)));
+    svc.request_id = rid;
+    let session = crate::session::current(it);
+    let owner = crate::session::current_owner(it);
+    crate::session::take_on(&mut svc, session, owner.as_deref().unwrap_or(""));
+    svc.answering = true;
+    let carried = carry_in(it, &mut svc, name);
+    let r = crate::mcp::answer_tool(&mut svc, tool, args);
+    carry_back(it, &mut svc, carried, name, &tool.name);
+    r
 }
 
 /// The functions of each service that are safe to call twice, as its file says: they use
@@ -1013,8 +1192,9 @@ pub fn app_url() -> Option<&'static str> {
 
 /// How one try went.
 enum Try {
-    /// The status, the body, and the answer's signature, if it has one.
-    Answer(u16, String, Option<String>),
+    /// The status, the body, and the answer's signature, if it has one, and its signature with
+    /// the app's key, for a tool's call (FEEDBACK56.md, Part F).
+    Answer(u16, String, Option<String>, Option<String>),
     /// No connection: the call was not sent.
     NotSent(String),
     /// Sent, but no answer (in time): it may have run.
@@ -1047,7 +1227,111 @@ fn forwarded(it: &mut Interp, names: &[String]) -> Vec<(String, String)> {
 /// the declaration's `auth` says (src/svcauth.rs).
 #[allow(clippy::too_many_arguments)]
 fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: String) -> Outcome {
+    remote_hop(it, urls, name, f, args, tenant, rid, call, None, &mut false)
+}
+
+/// A call of a service's tool, made by its app's door (FEEDBACK56.md, Part F; branch feedback56):
+/// its arguments as the client sent them, by name, and who the call is made by, the session's
+/// data and its owner, and the client, so that the token or the cookie is checked once, at the
+/// app, and `session()` and `request.mcp` in the tool are the caller's.
+pub(crate) struct ToolHop {
+    arguments: serde_json::Map<String, serde_json::Value>,
+    session: serde_json::Value,
+    owner: Option<String>,
+    client: serde_json::Value,
+}
+
+/// `remote`, of a tool (`tool`) or of a server fn, with the asking of the tool's call it is made
+/// in, where there is one, sent along in the signed body (the service's part of it,
+/// `Asking::for_service`) and its reply taken back from the signed answer, whatever the service
+/// answered (FEEDBACK56.md, Part F; branch feedback56): a question there is asked through the
+/// tool's door, and a change there is the call's. Only an answer signed back, carrying the reply,
+/// says what it did; any other answer from a call that was sent (refused, unsigned, not JSON, a
+/// 500, none in time) may have come after it ran, and is a change, so that no question comes
+/// after it (security review). `sent`: some try of it was sent.
+#[allow(clippy::too_many_arguments)]
+fn remote_hop(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: String, tool: Option<&ToolHop>, sent: &mut bool) -> Outcome {
+    let carried = it.asking.as_ref().map(|a| a.for_service(name));
+    let mut back = None;
+    let out = remote_tries(it, urls, name, f, args, tenant, rid, call, tool, carried.as_ref(), &mut back, sent);
+    let (Some(_), Some(a)) = (carried, it.asking.as_mut()) else { return out };
+    let label = format!("{}.{}", name, f);
+    match back {
+        Some(j) => {
+            if !a.take_reply(name, &label, &j) {
+                eprintln!("quillo: service {}: what `{}` gave back of the tool's call is not what Quillo sends, so the call stops", name, f);
+                a.fail();
+            }
+        }
+        None if *sent => a.changed(format!("a call of `{}` whose answer does not say what it did, which may have run", label)),
+        None => {}
+    }
+    if a.stopped() {
+        return Outcome::Stopped;
+    }
+    out
+}
+
+/// What a service's app keeps the key its tools' calls are signed with in, for the service
+/// `name`: `QUILLO_APP_KEY_BILLING`, the service keeping the same as `QUILLO_APP_KEY` (`--split`
+/// sets both; FEEDBACK56.md, Part F, security review).
+pub fn app_key_env(name: &str) -> String {
+    format!("QUILLO_APP_KEY_{}", name.to_ascii_uppercase())
+}
+
+/// What a service keeps its app's key in (`app_key_env`).
+pub const APP_KEY: &str = "QUILLO_APP_KEY";
+
+/// The signature of a tool's call by its app's door, under the app's key: the time, the service,
+/// the tool, the tenant, the call's id and the body.
+pub fn sign_app(key: &str, t: u64, to: &str, f: &str, tenant: &str, call: &str, body: &[u8]) -> String {
+    let mut msg = format!("quillo-app-1\n{}\n{}\n{}\n{}\n{}\n", t, to, f, tenant, call).into_bytes();
+    msg.extend_from_slice(body);
+    crate::crypto::hex(&crate::crypto::hmac_sha256(key.as_bytes(), &msg))
+}
+
+/// What a call of a service's tool is refused with where the service has no key of its app's.
+pub fn no_app_key(name: &str) -> String {
+    format!(
+        "this service runs its tools only for its app's door, whose calls of them are signed with the app's key: set {} here and {} where the app runs, to the same secret (`quillo run --split` sets both)",
+        APP_KEY,
+        app_key_env(name)
+    )
+}
+
+/// What the app is told of a service that runs a Quillo before this one: it refuses a call made in
+/// a tool's call, which it cannot read (FEEDBACK56.md, Part F, security review).
+pub fn older_quillo(name: &str) -> String {
+    format!("service {}: it runs an older Quillo, which refuses a call made in a tool's call (one that may ask the person): upgrade {} before the app", name, name)
+}
+
+/// `remote_hop`'s tries: what it sends, the reply a verified answer gave back (`back`), and
+/// whether a try was sent (`sent`).
+#[allow(clippy::too_many_arguments)]
+fn remote_tries(
+    it: &mut Interp,
+    urls: &[String],
+    name: &str,
+    f: &str,
+    args: Vec<Value>,
+    tenant: Option<Arc<str>>,
+    rid: Option<Arc<str>>,
+    call: String,
+    tool: Option<&ToolHop>,
+    carried: Option<&serde_json::Value>,
+    back: &mut Option<serde_json::Value>,
+    sent: &mut bool,
+) -> Outcome {
     let a = crate::svcauth::auth_of(name);
+    // A tool's call is signed with its app's key too, and its answer signed back with it: only
+    // the app's door runs a service's tools (FEEDBACK56.md, Part F, security review).
+    let app_key = match tool {
+        Some(_) => match std::env::var(app_key_env(name)).ok().filter(|k| !k.is_empty()) {
+            Some(k) => Some(k),
+            None => return Outcome::Refused(403, format!("service {}: {} is not set, the key its tools' calls are signed with (`quillo run --split` sets it)", name, app_key_env(name))),
+        },
+        None => None,
+    };
     let shared = secret();
     // What signs the call: its own key, else the shared secret (FEEDBACK38.md, Q-458; branch
     // feedback36-39). A token or a certificate alone proves it too.
@@ -1079,7 +1363,16 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
     };
     let passed = forwarded(it, &a.forward);
     let o = opts(name);
-    let body = serde_json::Value::Array(args.iter().map(to_wire).collect()).to_string().into_bytes();
+    // A call that carries a tool's call sends an object, which a service of a Quillo before this
+    // one refuses rather than runs without it (FEEDBACK56.md, Part F; branch feedback56).
+    let listed = serde_json::Value::Array(args.iter().map(to_wire).collect());
+    let body = match (tool, carried) {
+        (Some(t), _) => serde_json::json!({ "tool": f, "arguments": t.arguments, "mcp": { "asking": carried, "session": t.session, "owner": t.owner, "client": t.client } }),
+        (None, Some(asking)) => serde_json::json!({ "args": listed, "mcp": { "asking": asking } }),
+        (None, None) => listed,
+    }
+    .to_string()
+    .into_bytes();
     let tenant = tenant.map(|t| t.to_string()).unwrap_or_default();
     let rid = rid.map(|r| r.to_string()).unwrap_or_default();
     let caller = caller_name(&a);
@@ -1113,8 +1406,9 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
         let mine = contracts().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(name.to_string(), f.to_string())).cloned().unwrap_or_default();
         let covered = format!("{}\n{}", mine, crate::svcauth::forwarded_text(passed.iter().map(|(k, v)| (k.as_str(), v.as_str()))));
         let sig = sign_key.as_ref().map(|k| format!("v=3,kid={},t={},sig={}", kid, t, crate::svcauth::sign3(k, t, name, f, &tenant, &call, &kid, &caller, &deadline, &covered, &body)));
+        let app_sig = app_key.as_ref().map(|k| format!("t={},sig={}", t, sign_app(k, t, name, f, &tenant, &call, &body)));
         let endpoint = format!("{}/_quillo/service/{}", url, f);
-        let (b, tn, r, c, cl, to) = (body.clone(), tenant.clone(), rid.clone(), call.clone(), caller.clone(), name.to_string());
+        let (b, tn, r, c, cl, to, app) = (body.clone(), tenant.clone(), rid.clone(), call.clone(), caller.clone(), name.to_string(), app_sig.clone());
         let (ag, oauth, bearer, passed) = (agent.clone(), a.oauth.clone(), bearer.clone(), passed.clone());
         let got = it.unlocked(move || -> Try {
             let send = |token: Option<&str>| -> Try {
@@ -1128,6 +1422,9 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
                     .set("x-quillo-deadline", &deadline);
                 if let Some(s) = &sig {
                     rq = rq.set("x-quillo-service", s);
+                }
+                if let Some(s) = &app {
+                    rq = rq.set("x-quillo-app", s);
                 }
                 if let Some(tk) = token {
                     rq = rq.set("authorization", &format!("Bearer {}", tk));
@@ -1151,9 +1448,10 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
                 };
                 let status = resp.status();
                 let signed = resp.header("x-quillo-answer").map(str::to_string);
+                let by_app = resp.header("x-quillo-app-answer").map(str::to_string);
                 let mut text = String::new();
                 match resp.into_reader().take(64 << 20).read_to_string(&mut text) {
-                    Ok(_) => Try::Answer(status, text, signed),
+                    Ok(_) => Try::Answer(status, text, signed, by_app),
                     Err(e) => Try::NoAnswer(e.to_string()),
                 }
             };
@@ -1177,8 +1475,9 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
             }
         });
         match got {
-            Try::Answer(status @ (502..=504), text, _) => {
+            Try::Answer(status @ (502..=504), text, ..) => {
                 went_wrong(&url, &o);
+                *sent = true;
                 why = format!("service {}: {} at {} ({})", name, status, url, reason(&text));
                 // A proxy's 502 or 504 may come after the copy behind it ran the call: only a
                 // function that is safe to run twice goes to another copy, where it ran on both
@@ -1196,23 +1495,42 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
                     same = None;
                 }
             }
-            Try::Answer(status, text, signed) => {
+            Try::Answer(status, text, signed, by_app) => {
                 went_well(&url);
+                *sent = true;
                 log_call(name, f, &url, status, start, attempt + 1, &rid);
                 // The answer is the service's: signed back with the key the call was signed
                 // with. A call with a key of its own takes no answer without it (Q-459), nor one
                 // under the shared secret, where an unsigned answer from whatever was at the
                 // service's address was taken (FEEDBACK49.md, Q-596; branch main).
-                if let Some(k) = &sign_key {
+                let sig_of = |given: &Option<String>, k: &str| {
                     let want = crate::svcauth::sign_answer(k, &call, status, text.as_bytes());
-                    let good = signed.as_deref().map(|s| s.strip_prefix("sig=").unwrap_or(s)).map(|s| crate::crypto::same(s.as_bytes(), want.as_bytes()));
+                    given.as_deref().map(|s| s.strip_prefix("sig=").unwrap_or(s)).map(|s| crate::crypto::same(s.as_bytes(), want.as_bytes()))
+                };
+                let mut verified = false;
+                if let Some(k) = &sign_key {
+                    let good = sig_of(&signed, k);
                     if good == Some(false) || (good.is_none() && status == 200) {
                         return Outcome::Refused(502, format!("service {}: the answer from {} is not signed by the service", name, url));
                     }
+                    verified = good == Some(true);
+                }
+                // A tool's answer, signed back with the app's key too (FEEDBACK56.md, Part F,
+                // security review).
+                if let Some(k) = &app_key {
+                    let good = sig_of(&by_app, k) == Some(true);
+                    if !good && status == 200 {
+                        return Outcome::Refused(502, format!("service {}: the answer from {} is not signed with the app's key ({})", name, url, app_key_env(name)));
+                    }
+                    verified &= good;
                 }
                 // As deep as every reader takes (FEEDBACK55.md, Q-875's second review; branch
                 // feedback55), as the bodies below.
-                let answer = crate::value::json_value(text.as_bytes()).ok().filter(|_| status == 200);
+                let read = crate::value::json_value(text.as_bytes()).ok();
+                // The tool's call's asking, as the service's verified answer gave it back, whatever
+                // its status: from no other is it taken (FEEDBACK56.md, Part F, security review).
+                *back = read.as_ref().filter(|_| carried.is_some() && verified).and_then(|j| j.get("asking")).filter(|a| a.is_object()).cloned();
+                let answer = read.filter(|_| status == 200);
                 // What the call published there is announced here too, for
                 // pages of this program watching it (FEEDBACK4.md, Q-038;
                 // branch bank-fixes).
@@ -1223,8 +1541,13 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
                     }
                 }
                 return match (status, answer) {
+                    (200, Some(j)) if tool.is_some() && j.get("tool").is_some_and(|t| t.is_object()) => Outcome::Tool(j["tool"].clone()),
+                    (200, Some(j)) if carried.is_some() && verified && j.get("stopped") == Some(&serde_json::json!(true)) => Outcome::Stopped,
                     (200, Some(j)) if j.get("ok").is_some() || j.get("err").is_some() => Outcome::Ran(from_answer(&j)),
                     (200, _) => Outcome::Refused(200, format!("service {}: an answer that is not one", name)),
+                    // An older Quillo takes no object for a body (FEEDBACK56.md, Part F, security
+                    // review): said so, not as a refusal of the arguments.
+                    (400, _) if (tool.is_some() || carried.is_some()) && reason(&text) == "the body must be a JSON array of arguments" => Outcome::Refused(400, older_quillo(name)),
                     _ => Outcome::Refused(status, format!("service {}: {} {}", name, status, reason(&text))),
                 };
             }
@@ -1235,6 +1558,7 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
             }
             Try::NoAnswer(e) => {
                 went_wrong(&url, &o);
+                *sent = true;
                 why = if e.contains("timed out") {
                     let secs = timeout.as_secs_f64();
                     format!("service {}: took more than {} s ({}), at {}", name, (secs * 1000.0).round() / 1000.0, if theirs { "the time its caller had left" } else { "its timeout" }, url)
@@ -1491,6 +1815,18 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, caller: V
         };
         return json(200, contract_list(it, &who));
     }
+    // A call that carries a tool's call is an object: a tool of this service's, called at its
+    // app's door, or a server fn with the call's asking (FEEDBACK56.md, Part F; branch
+    // feedback56).
+    // An object that does not carry one is no call's, said as before.
+    let read = crate::value::json_value(&req.body);
+    let hop = match &read {
+        Ok(serde_json::Value::Object(m)) if m.contains_key("mcp") => Some(m),
+        _ => None,
+    };
+    if let Some(m) = hop.filter(|m| m.contains_key("tool")) {
+        return run_tool_hop(it, f, tenant, req, caller, m);
+    }
     let Some(Value::Func(c)) = lookup(&it.globals, f).filter(|_| it.server_fns.iter().any(|n| n == f)) else {
         return refused(404, &format!("no server fn `{}`", f));
     };
@@ -1512,14 +1848,71 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, caller: V
     if let Some(theirs) = theirs.filter(|t| *t != ours) {
         return refused(409, &format!("`{}` here is `{}`; the caller's copy of this service says `{}`", f, ours, theirs));
     }
-    let args = match crate::value::json_value(&req.body) {
-        Ok(serde_json::Value::Array(a)) => a.iter().map(from_wire).collect::<Vec<_>>(),
+    let (args, asking) = match (&read, hop) {
+        (Ok(serde_json::Value::Array(a)), _) => (a.iter().map(from_wire).collect::<Vec<_>>(), None),
+        (_, Some(m)) => match (m.get("args"), m.get("mcp").and_then(|x| x.get("asking")).map(crate::mcp::Asking::from_wire)) {
+            (Some(serde_json::Value::Array(a)), Some(Some(asking))) => (a.iter().map(from_wire).collect::<Vec<_>>(), Some(asking)),
+            _ => return refused(400, "a call that carries a tool's call is { args: [...], mcp: { asking } }, as Quillo sends it"),
+        },
         _ => return refused(400, "the body must be a JSON array of arguments"),
     };
     let args = match crate::server::take_args(it, &c.def, args) {
         Ok(a) => a,
         Err(msg) => return refused(400, &msg),
     };
+    set_called(it, tenant, req, caller);
+    let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+    // The topics this call publishes go back with the answer, so the
+    // caller's pages that watch them follow, as they do in one process
+    // (FEEDBACK4.md, Q-038; branch bank-fixes).
+    it.published = Some(Vec::new());
+    // How long the caller waits for it: what this call's own calls to
+    // services may wait in turn (FEEDBACK6.md, Q-056; branch feedback6-fixes).
+    it.deadline = header("x-quillo-deadline").and_then(|ms| ms.parse::<u64>().ok()).map(|ms| Instant::now() + Duration::from_millis(ms.min(3_600_000)));
+    // The tool's call's asking, for its run here, and given back with its answer, whatever it is
+    // (FEEDBACK56.md, Part F; branch feedback56).
+    let carried = asking.is_some();
+    let (result, back) = with_asking(it, asking, |it| it.call_closure(&c, args.into_iter().map(Some).collect(), 0));
+    it.deadline = None;
+    let published = it.published.take().unwrap_or_default();
+    // The asking goes back with any answer of a call that carried one; an error's is as before.
+    let with_asking = |mut j: serde_json::Value| {
+        if carried {
+            j["asking"] = back.as_ref().map_or(serde_json::Value::Null, |a| a.reply());
+        }
+        j
+    };
+    let refused_with = |status: u16, msg: String| json(status, with_asking(serde_json::json!({ "error": msg })));
+    // Sent only when there are some: an answer without any is as before.
+    let with_published = |mut j: serde_json::Value| {
+        if !published.is_empty() {
+            j["published"] = serde_json::json!(published);
+        }
+        with_asking(j)
+    };
+    if back.as_ref().is_some_and(|a| a.stopped()) {
+        if let (true, Err(Ctrl::Error(e))) = (back.as_ref().is_some_and(|a| a.failed()), &result) {
+            eprintln!("quillo: error in server fn `{}` (called by a service): {:#}", f, e);
+        }
+        return json(200, with_published(serde_json::json!({ "stopped": true })));
+    }
+    match result {
+        Ok(v) | Err(Ctrl::Return(v)) => match v {
+            Value::Response(_) => refused_with(500, format!("`{}` answered with a page, not a value", f)),
+            v => json(200, with_published(wire_answer(&v))),
+        },
+        Err(Ctrl::Reply(_)) => refused_with(500, format!("`{}` replied with a page, not a value", f)),
+        Err(Ctrl::Error(e)) => {
+            eprintln!("quillo: error in server fn `{}` (called by a service): {:#}", f, e);
+            refused_with(500, format!("internal error in `{}`", f))
+        }
+    }
+}
+
+/// What a call from another service runs in: the tenant it names, and `request`, the request it
+/// came from as far as it goes with the call (its id), the call's own id, who called, and the
+/// visitor's headers it passed on.
+fn set_called(it: &mut Interp, tenant: &str, req: &HttpRequest, caller: Value) {
     it.tenant = Some(if tenant.is_empty() { None } else { Some(Arc::from(tenant)) });
     it.tenant_named = !tenant.is_empty();
     // Called by another service: `request` is the request it came from, as
@@ -1546,34 +1939,76 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, caller: V
     }
     step.insert("forwarded".into(), Value::map(passed));
     it.current_request = Some(Value::map(step));
-    // The topics this call publishes go back with the answer, so the
-    // caller's pages that watch them follow, as they do in one process
-    // (FEEDBACK4.md, Q-038; branch bank-fixes).
-    it.published = Some(Vec::new());
-    // How long the caller waits for it: what this call's own calls to
-    // services may wait in turn (FEEDBACK6.md, Q-056; branch feedback6-fixes).
-    it.deadline = header("x-quillo-deadline").and_then(|ms| ms.parse::<u64>().ok()).map(|ms| Instant::now() + Duration::from_millis(ms.min(3_600_000)));
-    let result = it.call_closure(&c, args.into_iter().map(Some).collect(), 0);
-    it.deadline = None;
-    let published = it.published.take().unwrap_or_default();
-    // Sent only when there are some: an answer without any is as before.
-    let with_published = |mut j: serde_json::Value| {
-        if !published.is_empty() {
-            j["published"] = serde_json::json!(published);
-        }
-        j
+}
+
+/// A call of this service's tool `f` by its app's door (`call_tool`): offered to that door alone.
+/// Signed as any service call is and taken as `accept_calls` says, it is signed with the key of
+/// this service's app too (`QUILLO_APP_KEY`, which the app that started it gave it), which no other
+/// service, page or token has; without that key here, no tool's call is taken; and its answer is
+/// signed back with it (FEEDBACK56.md, Part F, security review). A `fn mcp` that is not a `server
+/// fn` is no plain call's. Its arguments are made here as the client sent them, by name, as this
+/// program's own door would; it runs in the caller's tenant and session, as the app's door found
+/// them, with the call's asking; a tool that may ask sent none runs as for a client that cannot
+/// ask, never as outside a tool's call. Its answer is `tools/call`'s result, and the asking's
+/// reply (`Asking::reply`).
+fn run_tool_hop(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, caller: Value, m: &serde_json::Map<String, serde_json::Value>) -> HttpResponse {
+    let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+    let Some(key) = crate::dotenv::var(&it.env_file, APP_KEY).filter(|k| !k.is_empty()) else {
+        return refused(403, &no_app_key(header("x-quillo-to").unwrap_or("")));
     };
-    match result {
-        Ok(v) | Err(Ctrl::Return(v)) => match v {
-            Value::Response(_) => refused(500, &format!("`{}` answered with a page, not a value", f)),
-            v => json(200, with_published(wire_answer(&v))),
-        },
-        Err(Ctrl::Reply(_)) => refused(500, &format!("`{}` replied with a page, not a value", f)),
-        Err(Ctrl::Error(e)) => {
-            eprintln!("quillo: error in server fn `{}` (called by a service): {:#}", f, e);
-            refused(500, &format!("internal error in `{}`", f))
-        }
+    let call = header("x-quillo-call").unwrap_or("");
+    let given = crate::svcauth::signed(header("x-quillo-app").unwrap_or(""));
+    let want = sign_app(&key, given.t, header("x-quillo-to").unwrap_or(""), f, tenant, call, &req.body);
+    if given.sig.is_empty() || now_secs().abs_diff(given.t) > WINDOW || !crate::crypto::same(want.as_bytes(), given.sig.as_bytes()) {
+        return refused(401, "a tool's call is taken from this service's app alone, signed with its key (QUILLO_APP_KEY): this one is not, or is too old");
     }
+    let Some(tool) = it.offered_tools.as_ref().and_then(|t| t.iter().find(|t| t.name == f)).cloned() else {
+        return refused(404, &format!("no tool `{}`", f));
+    };
+    let mcp = m.get("mcp").and_then(serde_json::Value::as_object);
+    let (Some(serde_json::Value::Object(args)), Some(mcp)) = (m.get("arguments"), mcp) else {
+        return refused(400, "a tool's call is { tool, arguments: { ... }, mcp: { ... } }, as Quillo sends it");
+    };
+    let sent_none = matches!(mcp.get("asking"), None | Some(serde_json::Value::Null));
+    let asking = match mcp.get("asking") {
+        None | Some(serde_json::Value::Null) => tool.may_ask.then(crate::mcp::Asking::cannot_ask),
+        Some(a) => match crate::mcp::Asking::from_wire(a) {
+            Some(a) => Some(a),
+            None => return refused(400, "this tool's call carries an asking that is not one Quillo sends"),
+        },
+    };
+    set_called(it, tenant, req, caller);
+    if let Some(Value::Map(r)) = &mut it.current_request {
+        Arc::make_mut(r).insert("mcp".into(), mcp.get("client").map_or(Value::Nil, from_wire));
+    }
+    let session = mcp.get("session").map_or_else(|| Value::map(Map::new()), from_wire);
+    crate::session::take_on(it, session, mcp.get("owner").and_then(serde_json::Value::as_str).unwrap_or(""));
+    it.published = Some(Vec::new());
+    it.deadline = header("x-quillo-deadline").and_then(|ms| ms.parse::<u64>().ok()).map(|ms| Instant::now() + Duration::from_millis(ms.min(3_600_000)));
+    it.answering = true;
+    let (mut result, mut back) = with_asking(it, asking, |it| match crate::mcp::by_name(&tool, args) {
+        Ok(a) => crate::mcp::answer_tool(it, &tool, a),
+        Err(why) => crate::mcp::tool_error(why),
+    });
+    it.answering = false;
+    it.deadline = None;
+    it.set_cookies.clear();
+    // No door takes the asking back: its answer is here, refused where it would have asked.
+    if sent_none {
+        if let Some(a) = back.as_mut() {
+            a.settled(&mut result);
+        }
+        back = None;
+    }
+    let mut j = serde_json::json!({ "tool": result, "asking": back.as_ref().map(|a| a.reply()) });
+    let published = it.published.take().unwrap_or_default();
+    if !published.is_empty() {
+        j["published"] = serde_json::json!(published);
+    }
+    let mut r = json(200, j);
+    let signed = crate::svcauth::sign_answer(&key, call, r.status, &r.body);
+    r.headers.push(("x-quillo-app-answer".into(), format!("sig={}", signed)));
+    r
 }
 
 /// Quillo's own addresses that are not passed on to a service under its
@@ -1635,6 +2070,29 @@ pub fn mcp_calls_later(name: &str) -> String {
     format!(
         "`service mcp {}` would call another MCP server, which Quillo does not do yet: `service mcp /{} = \"{}.qwe\"` offers a Quillo file's tools here, and `service {} = \"{}.qwe\"` calls its server fns",
         name, name, name, name, name
+    )
+}
+
+/// `service mcp /billing = "billing.qwe" { auth: ... }`: the calls of billing's tools are signed
+/// both ways, with the shared secret or a key of the caller's; a bearer token, OAuth or a
+/// certificate alone signs neither the call nor its answer, so none of them offers the tools
+/// (FEEDBACK56.md, Part F, security review). The way it would prove itself that cannot, if any.
+pub fn unsigned_auth(name: &str) -> Option<&'static str> {
+    let a = crate::svcauth::auth_of(name);
+    match (&a.key, &a.bearer, &a.oauth, &a.mtls) {
+        (Some(_), ..) => None,
+        (None, Some(_), ..) => Some("bearer"),
+        (None, None, Some(_), _) => Some("oauth"),
+        (None, None, None, Some(_)) => Some("mtls"),
+        _ => None,
+    }
+}
+
+/// What `quillo check` and the start say of it (`unsigned_auth`).
+pub fn tools_unsigned(name: &str, how: &str) -> String {
+    format!(
+        "`service mcp`: a call of {}'s tools is signed, and its answer too, with the shared secret or `auth: {{ key }}`; `auth: {{ {} }}` signs neither: give it a key, or make it a plain `service`, which offers no tools",
+        name, how
     )
 }
 
@@ -1782,12 +2240,15 @@ fn now_ms() -> i64 {
 /// otherwise) and made in the background, again and again until it gets
 /// through; its id is the result. The service remembers the id, so the
 /// function runs once.
+///
+/// Made in a tool's call that may ask its user, it is made later, when no one is there to ask:
+/// its id says so (`FROM_A_TOOL`), kept with it wherever it waits, and a question in it is
+/// refused, the call failing for good, never answered by nobody (FEEDBACK56.md, Part F; branch
+/// feedback56). Before, its `confirm` gave true.
 pub fn later(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    // NOT YET (FEEDBACK56.md, Part F, slice 8; branch feedback56): made later, outside the tool's
-    // call, its function's `confirm` gives true with nobody asked (see `local`).
     let (service, f, sent) = call_args(&args, "__service_later", line)?;
     let call = Later {
-        id: new_id(24),
+        id: if it.asking.is_some() { format!("{}{}", FROM_A_TOOL, new_id(23)) } else { new_id(24) },
         service,
         f,
         args: serde_json::Value::Array(sent.iter().map(to_wire).collect()).to_string(),
@@ -1804,6 +2265,10 @@ pub fn later(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     Ok(Value::str(id))
 }
+
+/// The first character of the id of a call made later in a tool's call that may ask its user
+/// (`later`): not a hex digit, so no other call's id starts with it.
+const FROM_A_TOOL: char = 't';
 
 /// How long until a call that did not get through is tried again: a second,
 /// then twice as long each time, up to five minutes.
@@ -1952,7 +2417,13 @@ fn make_later(it: &mut Interp, c: &Later) -> Tried {
     };
     let tenant = (!c.tenant.is_empty()).then(|| Arc::from(c.tenant.as_str()));
     let rid = (!c.rid.is_empty()).then(|| Arc::from(c.rid.as_str()));
-    match make(it, &c.service, &c.f, args, tenant, rid, Some(c.id.clone()), 0) {
+    // Made in a tool's call: run with no one to ask, here and where the service runs.
+    let made = match c.id.starts_with(FROM_A_TOOL) {
+        true => with_asking(it, Some(crate::mcp::Asking::nobody()), |it| make(it, &c.service, &c.f, args, tenant, rid, Some(c.id.clone()), 0)).0,
+        false => make(it, &c.service, &c.f, args, tenant, rid, Some(c.id.clone()), 0),
+    };
+    match made {
+        Outcome::Stopped | Outcome::Tool(_) => Tried::Never(format!("it stopped at a question: {}", crate::mcp::NOBODY)),
         Outcome::Ran(v) => {
             if let Value::Err(e, _, _) = &v {
                 eprintln!("quillo: {}.{} (made later, {}) gave an error: {}", c.service, c.f, c.id, short(e));
@@ -2078,6 +2549,15 @@ fn start_service(exe: &Path, args: &[String], name: &str) -> Result<std::process
     if let Some(u) = APP_URL.get() {
         command.env("QUILLO_APP_URL", u);
     }
+    // The key its app signs its tools' calls with, its own and no other service's: a service
+    // started apart runs its app's tools only (FEEDBACK56.md, Part F, security review).
+    for (k, _) in std::env::vars().filter(|(k, _)| k.starts_with("QUILLO_APP_KEY_")) {
+        command.env_remove(k);
+    }
+    match std::env::var(app_key_env(name)) {
+        Ok(k) => command.env(APP_KEY, k),
+        Err(_) => command.env_remove(APP_KEY),
+    };
     // Its stdin is a pipe the app holds, which closes however the app's process ends: the
     // service stops then. A service whose app was killed served on, its port taken, for ever
     // (found in review of FEEDBACK55.md's Q-807; branch feedback55).
@@ -2172,6 +2652,11 @@ pub fn split(path: &Path, watch: bool, reload: bool, static_check: bool, checked
             copies.push((name.clone(), prefix.clone(), file.clone(), port));
         }
         std::env::set_var(env_name(name), urls.join(","));
+        // The key the app signs a call of the service's tools with, which only it and the service
+        // have (FEEDBACK56.md, Part F, security review).
+        if std::env::var(app_key_env(name)).map_or(true, |k| k.is_empty()) {
+            std::env::set_var(app_key_env(name), crate::crypto::hex(&crate::crypto::secret_bytes(32)));
+        }
     }
     // A service's channels, when it runs apart: the pages connect to the app's
     // process, which asks the services which channels are theirs and hands

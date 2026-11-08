@@ -1457,6 +1457,19 @@ pub struct Analysis {
     /// How many functions' and records' code the walk of what tools do read, each once, the
     /// services' a tool calls included: what it costs (found in review).
     pub walked: usize,
+    /// The services the program offers the tools of, `service mcp /billing = "billing.qwe"`, in
+    /// the order of those lines: each one's own tools and types, as its own check read them, for
+    /// the program's door to list as `billing.<name>` (FEEDBACK56.md, Part F; branch feedback56).
+    pub service_tools: Vec<ServiceTools>,
+}
+
+/// A service's tools, offered by the program checked (`Analysis::service_tools`).
+#[derive(Debug, Clone)]
+pub struct ServiceTools {
+    /// The service's name, which its tools' names start with.
+    pub name: String,
+    pub tools: Vec<ToolFacts>,
+    pub types: crate::record::Types,
 }
 
 /// What a tool's code was found to do: the code it runs, which is its body and its parameters'
@@ -1487,6 +1500,35 @@ pub struct ToolFacts {
     /// It calls `confirm` or `ask`: it asks the user itself (FEEDBACK56.md, Part E; branch
     /// feedback56).
     pub asks: bool,
+}
+
+/// How `auth` written in a service's options proves who calls without signing: `bearer`, `oauth`,
+/// or `mtls` with no `key` (`service::unsigned_auth`, as it runs).
+fn unsigned_auth_written(opts: Option<&Expr>) -> Option<&'static str> {
+    let Some(Expr::Map(entries)) = opts else { return None };
+    let Some((_, Expr::Map(auth))) = entries.iter().find(|(k, _)| k.as_str() == "auth") else { return None };
+    let has = |k: &str| auth.iter().any(|(n, v)| n.as_str() == k && !matches!(v, Expr::Lit(Lit::Nil)));
+    match (has("key"), has("bearer"), has("oauth"), has("mtls")) {
+        (true, ..) => None,
+        (_, true, ..) => Some("bearer"),
+        (_, _, true, _) => Some("oauth"),
+        (_, _, _, true) => Some("mtls"),
+        _ => None,
+    }
+}
+
+/// What a service's function was found to do, for a tool of the program that calls it
+/// (`Checker::service_fn`; FEEDBACK56.md, B.3 and Part F; branch feedback56).
+#[derive(Debug, Clone, Copy)]
+struct ServiceFn {
+    /// It stays inside the program: seen whole, reaching no other site.
+    inside: bool,
+    /// It asks the user (`confirm`, `ask`), through the door of the tool's call it is in.
+    asks: bool,
+    /// It writes, or may.
+    writes: bool,
+    /// The checker sees all it may run.
+    sure: bool,
 }
 
 /// What some code was found to do (`ToolFacts`' findings, without whose they are).
@@ -1691,7 +1733,7 @@ fn check_source_with(src: &str, file: &str, base_dir: &Path, overrides: HashMap<
         if let Some((line, message)) = crate::mcp::unseen_in_block(src) {
             a.diagnostics.push(Diagnostic { file: file.to_string(), line, severity: Severity::Error, message });
         }
-        if let Some((line, message)) = crate::mcp::instructions_warning(file, src, &a.tools) {
+        if let Some((line, message)) = crate::mcp::instructions_warning(file, src, &a) {
             a.diagnostics.push(Diagnostic { file: file.to_string(), line, severity: Severity::Warning, message });
         }
     }
@@ -1941,10 +1983,10 @@ struct Checker {
     services_elsewhere: HashSet<String>,
     /// The services' files, by name, where they are here to read.
     service_files: HashMap<String, PathBuf>,
-    /// Of each service a tool calls, read once when one does: whether each of its functions stays
-    /// inside the program; None where its code could not be read (FEEDBACK56.md, Q-853, B.3,
-    /// found in review; branch feedback56).
-    service_closed: std::cell::RefCell<HashMap<String, Option<HashMap<String, bool>>>>,
+    /// Of each service a tool calls, read once when one does: what each of its functions does;
+    /// None where its code could not be read (FEEDBACK56.md, Q-853, B.3, found in review; Part F;
+    /// branch feedback56).
+    service_closed: std::cell::RefCell<HashMap<String, Option<HashMap<String, ServiceFn>>>>,
     /// What each function's own code and each record's defaults were found to do, read once a
     /// check however many tools reach them, and how many were read (found in review).
     reached_fns: std::cell::RefCell<HashMap<usize, Arc<Reached>>>,
@@ -2284,7 +2326,7 @@ impl Checker {
                 order.push(Item { stmt: s.clone(), file: file.clone() });
                 break;
             }
-            if let Stmt::Service(name, prefix, path, _, line, mcp) = s {
+            if let Stmt::Service(name, prefix, path, opts, line, mcp) = s {
                 self.everywhere.insert(name.clone());
                 // `service mcp crm = "https://..."`: kept for later, its calls not checked
                 // (FEEDBACK56.md, Q-853; branch feedback56).
@@ -2294,6 +2336,12 @@ impl Checker {
                     self.services.entry(name.clone()).or_default();
                     order.push(Item { stmt: s.clone(), file: file.clone() });
                     continue;
+                }
+                // `service mcp /billing`: its tools' calls are signed both ways, which a bearer
+                // token, OAuth or a certificate alone does not do (FEEDBACK56.md, Part F, security
+                // review).
+                if let (true, Some(how)) = (*mcp, unsigned_auth_written(opts.as_ref())) {
+                    self.diag_at(file.clone(), *line, Severity::Error, crate::service::tools_unsigned(name, how));
                 }
                 let Some(full) = self.file_at(base, path, &file, *line, false) else { continue };
                 match crate::service::offered(&full) {
@@ -2330,6 +2378,27 @@ impl Checker {
                         if first {
                             let sub = check_file_opts(&full, HashMap::new(), self.options());
                             SERVICE_CHECKS.with(|c| c.borrow_mut().remove(&key));
+                            // `service mcp /billing`: billing's own tools are this program's too,
+                            // as `billing.<name>`, a name MCP allows (FEEDBACK56.md, Part F, B.1;
+                            // branch feedback56). Not those of a service billing offers in turn.
+                            if *mcp && !self.out.service_tools.iter().any(|s| s.name == *name) {
+                                if sub.tools.is_empty() {
+                                    self.diag_at(file.clone(), *line, Severity::Warning, format!(
+                                        "`service mcp`: {} has no tools (`fn mcp name(...)`), so none of it is offered to AI clients here; `service {}` serves it as this does",
+                                        path, prefix.as_deref().unwrap_or("")
+                                    ));
+                                }
+                                for t in &sub.tools {
+                                    let joined = format!("{}.{}", name, t.def.name);
+                                    if joined.chars().count() > 128 {
+                                        self.diag_at(file.clone(), *line, Severity::Error, format!(
+                                            "a tool's name is 1 to 128 of A-Z, a-z, 0-9, `_`, `-` and `.`, as MCP allows: {}'s tool `{}` is offered here as `{}`, {} characters",
+                                            name, t.def.name, joined, joined.chars().count()
+                                        ));
+                                    }
+                                }
+                                self.out.service_tools.push(ServiceTools { name: name.clone(), tools: sub.tools.clone(), types: sub.types.clone() });
+                            }
                             self.out.diagnostics.extend(sub.diagnostics);
                             if let Some(prefix) = prefix {
                                 self.out.symbols.extend(sub.symbols.into_iter().filter(|s| s.kind == SymbolKind::Route).map(|mut s| {
@@ -3056,6 +3125,11 @@ impl Checker {
                     called.insert(&**obj as *const Expr);
                     r.effects |= http;
                     self.reach_service(m, f, r);
+                    // A change unless it is seen whole to write nothing, as a tool's question
+                    // after it is held to (FEEDBACK56.md, Part F, security review).
+                    if !self.service_fn(m, f).is_some_and(|x| x.sure && !x.writes) {
+                        note(&mut r.writes, format!("calls `{}.{}`, a call of another program", m, f));
+                    }
                 }
                 Expr::Field(inner, later, _) if later == "later" && matches!(&**inner, Expr::Ident(s, _) if self.services.contains_key(s.as_str())) => {
                     called.insert(&**obj as *const Expr);
@@ -3063,12 +3137,14 @@ impl Checker {
                     r.effects |= http;
                     if let Expr::Ident(m, _) = &**inner {
                         self.reach_service(m, f, r);
+                        note(&mut r.writes, format!("`{}.later.{}` makes a call later", m, f));
                     }
                 }
                 Expr::Ident(m, _) if self.sites.contains(m.as_str()) => {
                     called.insert(&**obj as *const Expr);
                     r.effects |= http;
                     note(&mut r.open, format!("calls the site `{}`", m));
+                    note(&mut r.writes, format!("calls the site `{}`, which may change anything", m));
                 }
                 // `xs.map(f)` is `map(xs, f)`, unless the value is a map that holds a function of
                 // that name, which came from code read here or from a value said unseen.
@@ -3083,19 +3159,33 @@ impl Checker {
     }
 
     /// A call of the service `s`'s `f`: outside the program unless its code was read and stays
-    /// inside (FEEDBACK56.md, Q-853, B.3, found in review; branch feedback56).
+    /// inside (FEEDBACK56.md, Q-853, B.3, found in review; branch feedback56). The tool asks the
+    /// user when `f` does, through its door, as it runs with the call's asking; and one whose code
+    /// is not read, or not all seen, may (FEEDBACK56.md, Part F; branch feedback56). A call made
+    /// later of one that asks is followed too, so that its order is read: its question would be
+    /// refused as it runs, and `order_call` says so.
     fn reach_service(&self, s: &str, f: &str, r: &mut Seen) {
         if !self.service_stays_inside(s, f) {
             note(&mut r.open, format!("calls `{}.{}`, whose code reaches outside the program or is not read here", s, f));
         }
+        match self.service_fn(s, f) {
+            Some(x) if x.sure => r.asks |= x.asks,
+            Some(_) => note(&mut r.uncertain, format!("calls `{}.{}`, whose code the checker cannot see whole", s, f)),
+            None => note(&mut r.uncertain, format!("calls `{}.{}`, whose code is not read here", s, f)),
+        }
     }
 
-    /// Whether the service `s`'s function `f` stays inside the program: the service read as a
-    /// program of its own, its server fns walked, once, when a tool first calls it, not for every
-    /// program that has services (found in review).
+    /// Whether the service `s`'s function `f` stays inside the program (`service_fn`).
     fn service_stays_inside(&self, s: &str, f: &str) -> bool {
+        self.service_fn(s, f).is_some_and(|x| x.inside)
+    }
+
+    /// What the service `s`'s function `f` does: the service read as a program of its own, its
+    /// server fns walked, once, when a tool first calls it, not for every program that has
+    /// services (found in review). None where it was not read.
+    fn service_fn(&self, s: &str, f: &str) -> Option<ServiceFn> {
         if let Some(read) = self.service_closed.borrow().get(s) {
-            return read.as_ref().and_then(|m| m.get(f)).copied().unwrap_or(false);
+            return read.as_ref().and_then(|m| m.get(f)).copied();
         }
         let read = self.service_files.get(s).and_then(|full| {
             let key = full.canonicalize().unwrap_or_else(|_| full.clone());
@@ -3109,11 +3199,19 @@ impl Checker {
             SERVICE_CHECKS.with(|c| c.borrow_mut().remove(&key));
             self.walked.set(self.walked.get() + sub.walked);
             let net = crate::ast::effect_bit("net");
-            Some(sub.server_fns.iter().map(|x| (x.def.name.clone(), x.uncertain.is_none() && x.open.is_none() && x.effects & net == 0)).collect::<HashMap<_, _>>())
+            Some(
+                sub.server_fns
+                    .iter()
+                    .map(|x| {
+                        let sure = x.uncertain.is_none();
+                        (x.def.name.clone(), ServiceFn { inside: sure && x.open.is_none() && x.effects & net == 0, asks: x.asks, writes: x.writes.is_some(), sure })
+                    })
+                    .collect::<HashMap<_, _>>(),
+            )
         });
-        let inside = read.as_ref().and_then(|m| m.get(f)).copied().unwrap_or(false);
+        let found = read.as_ref().and_then(|m| m.get(f)).copied();
         self.service_closed.borrow_mut().insert(s.to_string(), read);
-        inside
+        found
     }
 
     /// A name called (`called`) or read as a value: the program's function is read too, a
@@ -3397,6 +3495,17 @@ impl Checker {
         if let Some(n) = given.filter(|n| *n < 3) {
             w.late.push((w.file.clone(), line, crate::mcp::ask_too_few(n)));
         }
+        // A call made later of a service's function that asks: no one will be there to answer
+        // (FEEDBACK56.md, Part F; branch feedback56).
+        if let Expr::Field(obj, f, _) = callee {
+            if let Expr::Field(inner, later, _) = &**obj {
+                if let (true, Expr::Ident(m, _)) = (later == "later", &**inner) {
+                    if self.services.contains_key(m.as_str()) && self.service_fn(m, f).is_some_and(|x| x.asks) {
+                        w.late.push((w.file.clone(), line, format!("`{}.later.{}` asks the user: {}", m, f, crate::mcp::NOBODY)));
+                    }
+                }
+            }
+        }
         let (asks, changes) = self.call_does(callee, first, w);
         if let Some(a) = asks {
             if let Some(c) = &w.changed {
@@ -3437,6 +3546,14 @@ impl Checker {
             Expr::Ident(n, _) => program(n),
             Expr::Field(obj, f, _) => match &**obj {
                 Expr::Ident(m, _) if self.module_named(m) => builtin(&format!("{}.{}", m, f)),
+                // A service's function runs with the call's asking: it asks the user when it does,
+                // and changes something unless it is seen whole to write nothing (FEEDBACK56.md,
+                // Part F; branch feedback56).
+                Expr::Ident(m, _) if self.services.contains_key(m.as_str()) && !self.sites.contains(m.as_str()) => {
+                    let x = self.service_fn(m, f);
+                    let asks = x.filter(|x| x.sure && x.asks).map(|_| format!("`{}.{}`, which asks the user,", m, f));
+                    (asks, (!x.is_some_and(|x| x.sure && !x.writes)).then(|| format!("`{}.{}`, a call of another program", m, f)))
+                }
                 Expr::Ident(m, _) if self.services.contains_key(m.as_str()) || self.sites.contains(m.as_str()) => (None, Some(format!("`{}.{}`, a call of another program", m, f))),
                 Expr::Field(inner, later, _) if later == "later" && matches!(&**inner, Expr::Ident(m, _) if self.services.contains_key(m.as_str())) => (None, Some(format!("`{}`, a call of another program", f))),
                 _ if !w.locals.contains(f.as_str()) => program(f),
