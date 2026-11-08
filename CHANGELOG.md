@@ -17,6 +17,10 @@
   parameter, or an effect its body uses that its `with` does not say; highlighting, hover, completion and the outline know the tag.
   `mcp` stays an ordinary name everywhere else. The door is not built yet (FEEDBACK56.md,
   Q-853).
+- `/_quillo/mcp` serves a program's tools over HTTP from `quillo run`, to a signed-in session or
+  a token (`mcp_token()`, `mcp_tokens()`, `revoke_mcp_token(id)`; `end_session()` ends them),
+  never to a page on another site; 60 tool calls a minute per user (`--max-tool-calls`,
+  `[limits] max_tool_calls`); `request.mcp` says the client (FEEDBACK56.md, Q-859, Q-860).
 - `quillo mcp app.qwe` serves a program's tools to an AI client over stdin and stdout, in MCP's
   revision 2026-07-28: `server/discover`, `tools/list` and `tools/call`, with only MCP's
   messages on stdout (`print` goes to stderr there). A client of the earlier revision is told

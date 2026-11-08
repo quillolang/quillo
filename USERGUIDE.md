@@ -59,6 +59,7 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | `--no-check` | when the program is known to check (a deploy that ran `quillo check` already) and starting must be quick: skip the static checks |
 | `--max-body N` | when visitors send larger files or bodies than 10MB: the largest request body to accept, a size such as `50MB` (`KB`, `MB` and `GB`, in any case, are 1024-based) or bytes; default 10MB; a larger body gets 413 (see [Uploads](#uploads)) |
 | `--max-compute 2s` *(since 0.7)* | when a request that computes for long must not hold up the others: end one that computes this long without letting go, as a 500 (see [Concurrency](#concurrency-and-reloading)) |
+| `--max-tool-calls 60` | how many tool calls a minute each user of the MCP door may make (60 by default); one more is a `429` with `Retry-After` (see [Tools for AI clients](#tools-for-ai-clients)) |
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64). Give fewer where an account limits its threads (shared hosting), more for many slow calls at once |
 | `--instances N` | to use N cores on one machine: run the program N times over, one event loop each, each with its own variables (see [Concurrency](#concurrency-and-reloading)); not with `--watch`, `--register` or `--split`; more than the machine's cores is warned of |
 | `--trust-proxy 10.0.0.0/8` *(since 0.7)* | when a proxy (limer, nginx, Apache) is in front: believe `X-Forwarded-For` from these addresses, so `request.ip` and the limits per client are the visitor's (see [Live data](#live-data)) |
@@ -2839,7 +2840,41 @@ Windows, `print` goes to stderr, but other writes to stdout (a `.qwer` plugin's 
 not moved there, and break the session; it stops on Ctrl-C, Ctrl-Break or the console
 closing, as on SIGTERM elsewhere.
 
-The door over HTTP, `/_quillo/mcp`, is not built yet (FEEDBACK56.md, Q-853).
+**`/_quillo/mcp`** is the same door over HTTP, served by `quillo run` when the program has a
+tool (under `--base /shop`, at `/shop/_quillo/mcp`; a program run `--as-service` has none: its
+tools are its app's). It takes `POST` only, one JSON answer a request, and checks each one as
+MCP 2026-07-28 says (the version, the `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name`
+headers against the message). Who may call:
+
+- **A signed-in session**: the program's session cookie, with a `user` in it. Another site's
+  `Origin` or `Sec-Fetch-Site` is refused (`403`), and the door sends no CORS headers, so a page
+  on another site cannot drive it from a visitor's browser.
+- **A token**: `Authorization: Bearer ...`. `mcp_token()`, called in a route where someone is
+  signed in, makes one tied to that session and gives it once, for them to paste into their
+  AI client. It lasts as long as the session has left when the program gave the session a
+  `max_age`, else 30 days (`mcp_token({ max_age: 7 * 24 * 3600 })` says otherwise, up to a
+  year; `mcp_token({ user })` for a program that names its caller another way). Quillo keeps
+  only its signature under the session key (`QUILLO_SECRET`), in `_quillo_mcp_tokens` (or in
+  memory for a program with no database), and seals each row as it seals a cookie: a row
+  changed in the database is no token. The first `mcp_token()` makes that table, and fails
+  saying so where the database user may not create one. `mcp_tokens()` lists the tokens made
+  in this session or for its `user`, also after its cookie has gone or on a new sign-in, and
+  `revoke_mcp_token(id)` ends one (`{ user }` reaches all of that user's); `end_session()` ends
+  the tokens made in that session, whether the door is open or not.
+- Neither is a `401` with `WWW-Authenticate: Bearer`.
+
+In a tool, `session()` and `tenant()` are the caller's: a token's are those of the session it
+was made in, as they were then (a session is a signed cookie, kept nowhere else), so check
+what can change, a role, in the database on each call. Cookies a tool sets go back to a
+cookie caller and are dropped for a token's. `request.mcp` is `{ client, version }` from
+what the client says of itself, and null on any other request. Each user may make 60 tool
+calls a minute, the cookie and their tokens together, per tenant (a caller with no `user`:
+per session or token) ([`--max-tool-calls`](#options-of-quillo-run), and a policy's
+`[limits] max_tool_calls` can lower it); one more is a `429` with `Retry-After`. Under
+`--watch` on 127.0.0.1, `quillo run` prints a token for the door, at
+`http://127.0.0.1:PORT/_quillo/mcp` (without `--base`), and the line that adds it to Claude
+Code, when it starts or once the first version that loads has tools (FEEDBACK56.md, Q-853,
+Q-859, Q-860).
 
 #### What the browser can reach
 
@@ -3750,7 +3785,8 @@ fn touch() {
   added is lost. Twenty adds to a cart kept in the session, sent at once, each
   `set_session({ ...s, cart: (s.cart ?? []) + [item] })`, kept one item. Keep what must
   not be lost (a cart, a draft) in a table, keyed by an id in the session.
-- `end_session()` removes the cookie from the browser, but a copy someone kept stays
+- `end_session()` removes the cookie from the browser, and ends the session's MCP tokens
+  (see [Tools for AI clients](#tools-for-ai-clients)), but a copy of the cookie someone kept stays
   valid until it expires. To end sessions on the server (log out everywhere, a stolen
   laptop), keep an id in the session and check it against the database.
 - The session cookie is `__Host-quillo_session` when it is `Secure` and for the whole
@@ -8123,6 +8159,7 @@ hosts = ["api.stripe.com", "*.mapbox.com"]
 | `[http] private` | `false`: `http.*` reaches nothing on this machine or its networks (loopback, private, link-local and the cloud's metadata at `169.254.169.254`, carrier-grade NAT, IPv6's unique-local), as the name resolves when it connects |
 | `[env] names` | the variables `env()` may read; any other reads as not set, so `env("HOME") ?? "none"` gives `"none"` |
 | `[limits] workers`, `max_compute`, `max_body` | the most [`--workers`](#options-of-quillo-run), [`--max-compute`](#options-of-quillo-run) and [`--max-body`](#options-of-quillo-run) may be: a smaller value given on the command line stays (`"10s"`, `"500ms"`, `"2m"`; `"10MB"`, `"512KB"` or bytes). Each takes what the option takes: 0 is refused (`p.toml:2: `max_body` is a size larger than 0`), as the option refuses it |
+| `[limits] max_tool_calls` | the most tool calls a minute each user of the MCP door may make: it can lower `--max-tool-calls`, not raise it |
 
 Under the two files above, with `APP_NAME=Shop`:
 

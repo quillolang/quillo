@@ -95,6 +95,8 @@ options for `run`:
   --live-per-client N  pages one client may have waiting for live data (default 256)
                  (separate variables, as N processes would have; the
                  database and `publish` changes reach them all)
+  --max-tool-calls N  tool calls a minute each user (a token's, a session's;
+                 else the session) may make at /_quillo/mcp, then 429 (default 60)
   --workers N    requests that can wait (for a database, the network) at
                  once, each on a thread of its own (default 64)
   --watch, -w    reload when the program's files change, and refresh open pages
@@ -222,7 +224,7 @@ fn main() {
 /// value, not the program.
 const VALUE_OPTIONS: &[&str] = &[
     "--host", "--port", "--listen", "--socket-mode", "--policy", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
-    "--max-body", "--max-compute", "--allow-path", "--trust-proxy", "--live-per-client", "--max-connections", "--connections-per-client", "--allowed-hosts", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
+    "--max-body", "--max-compute", "--max-tool-calls", "--allow-path", "--trust-proxy", "--live-per-client", "--max-connections", "--connections-per-client", "--allowed-hosts", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
     "--scale", "--join", "--with", "--allow-join", "--join-as",
 ];
 
@@ -776,6 +778,9 @@ struct RunOptions {
     join: Option<String>,
     /// Commands run beside the program and stopped with it (`--with`).
     with: Vec<String>,
+    /// The program's tools, when `--split` checked it before its services started (FEEDBACK56.md,
+    /// C.2; branch feedback56).
+    tools: Option<Vec<quillo::mcp::Tool>>,
 }
 
 fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
@@ -803,6 +808,7 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         scale: Vec::new(),
         join: None,
         with: Vec::new(),
+        tools: None,
     };
     let mut tls: (Option<PathBuf>, Option<PathBuf>) = (None, None);
     let mut i = 0;
@@ -1021,6 +1027,15 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                     return Err(2);
                 }
             }
+            // Tool calls a minute each caller may make at the MCP door (FEEDBACK56.md, C.4, Q-860; branch
+            // feedback56).
+            ("--max-tool-calls", Some(v)) => match v.parse::<usize>() {
+                Ok(n) if n > 0 => quillo::mcp::MAX_TOOL_CALLS.store(n, std::sync::atomic::Ordering::Relaxed),
+                _ => {
+                    eprintln!("quillo: --max-tool-calls needs a positive number: the tool calls a minute each caller may make at /_quillo/mcp");
+                    return Err(2);
+                }
+            },
             ("--live-per-client", Some(v)) => match v.parse::<usize>() {
                 Ok(n) if n > 0 => quillo::server::LIVE_PER_CLIENT.store(n, std::sync::atomic::Ordering::Relaxed),
                 _ => {
@@ -1144,7 +1159,7 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     quillo::service::serve_as(o.service_name.as_deref().unwrap_or(&stem));
     // The files read or tried, watched under --watch while the program does not load
     // (FEEDBACK55.md, Q-836; branch feedback55).
-    let (checked, mut tried) = quillo::error::noting_reads(|| if o.static_check && !o.checked { static_errors(path) } else { Ok(()) });
+    let (checked, mut tried) = quillo::error::noting_reads(|| if o.static_check && !o.checked { static_errors(path).map(Some) } else { Ok(o.tools.clone()) });
     if let (Err(_), false) = (&checked, o.watch) {
         return Err(1);
     }
@@ -1159,13 +1174,15 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     shared.service_urls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(o.service_urls.iter().cloned());
     interp.base = o.base.clone().unwrap_or_default();
     interp.is_service = o.as_service;
-    let loaded = match checked.and_then(|()| {
+    let loaded = match checked.and_then(|tools| {
         let (r, read) = quillo::error::noting_reads(|| interp.load_file(path).map_err(|e| format!("{:#}", e)));
         tried.extend(read);
-        r
+        r.map(|_| tools)
     }) {
-        Ok(_) => {
+        Ok(tools) => {
             tried.clear();
+            // Its MCP door, when it has tools (FEEDBACK56.md, C.2; branch feedback56).
+            quillo::mcp::open_door(&mut interp, path, tools);
             Loaded::Ready(interp)
         }
         Err(e) => {
@@ -1475,6 +1492,10 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
         if let Some(b) = p.max_body {
             o.max_body = o.max_body.min(b);
         }
+        // The policy narrows the option, as for the others (FEEDBACK56.md, C.4; branch feedback56).
+        if let Some(n) = p.max_tool_calls {
+            quillo::mcp::MAX_TOOL_CALLS.fetch_min(n, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(c) = p.max_compute {
             let (now, c) = (quillo::httpd::compute_limit_ms(), c.as_millis().max(1) as u64);
             if now == 0 || now > c {
@@ -1555,7 +1576,13 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
         if o.static_check && path.exists() {
             // Under --watch an error does not stop it: the app then checks again as it loads, to
             // show the error on its pages.
-            o.checked = static_errors(path).is_ok();
+            match static_errors(path) {
+                Ok(tools) => {
+                    o.checked = true;
+                    o.tools = Some(tools);
+                }
+                Err(_) => o.checked = false,
+            }
             if !o.checked && !o.watch {
                 return 1;
             }
@@ -1656,7 +1683,8 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
 
 /// Prints the checker's findings; `Err` when there are errors. The error
 /// text is empty because everything has been printed already.
-fn static_errors(path: &Path) -> Result<(), String> {
+/// Its tools as the checker read them, for the MCP door (FEEDBACK56.md, C.2; branch feedback56).
+fn static_errors(path: &Path) -> Result<Vec<quillo::mcp::Tool>, String> {
     let analysis = quillo::check::check_file(path);
     for d in &analysis.diagnostics {
         eprintln!("{}", d);
@@ -1667,7 +1695,7 @@ fn static_errors(path: &Path) -> Result<(), String> {
         }
         return Err(String::new());
     }
-    Ok(())
+    Ok(quillo::mcp::tools(&analysis))
 }
 
 

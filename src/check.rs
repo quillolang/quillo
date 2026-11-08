@@ -327,6 +327,9 @@ fn request_t() -> T {
         (Arc::from("caller"), T::ANY),
         (Arc::from("user"), T::ANY),
         (Arc::from("forwarded"), T::ANY),
+        // At the MCP door, `{ client, version }` as the client says it; null on any other
+        // request (FEEDBACK56.md, Q-859; branch feedback56).
+        (Arc::from("mcp"), T::ANY),
     ])
 }
 
@@ -906,6 +909,10 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("session", "", "map"),
     ("set_session", "map | null, map | null=", "null"),
     ("end_session", "", "null"),
+    // The MCP door's tokens (FEEDBACK56.md, Q-859; branch feedback56).
+    ("mcp_token", "map | null=", "str"),
+    ("mcp_tokens", "map | null=", "list"),
+    ("revoke_mcp_token", "str, map | null=", "bool"),
     ("image.info", "str", "map | error(str)"),
     ("image.convert", "str, str, map | null=", "map | error(str)"),
     ("crypto.sha256", "str", "str"),
@@ -1139,7 +1146,7 @@ const MODULE_VALUES: &[&str] = &["math.pi", "math.e", "math.tau", "math.inf", "m
 const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "unwatched", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
-      "delete_cookie", "session", "cookie", "set_session", "end_session", "translations", "locale_from", "with_locale",
+      "delete_cookie", "session", "cookie", "set_session", "end_session", "mcp_token", "mcp_tokens", "revoke_mcp_token", "translations", "locale_from", "with_locale",
       "schedule", "stream", "events", "image.info", "image.convert", "later.status", "args", "stdin", "read_line", "exit", "allow_cross_site", "site_headers", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform", "markdown_page", "files", "classes", "accept_calls"];
 
 fn parse_t(s: &str) -> T {

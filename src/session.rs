@@ -93,31 +93,48 @@ fn sign(ctx: &str, payload: &str) -> String {
     b64url(&hmac_sha256(key(), &msg))
 }
 
-/// The session in a cookie value, and its hidden id, if it is signed for here and current.
-fn open(ctx: &str, cookie: &str) -> Option<(Value, Option<String>)> {
+/// The session in a cookie value, and its hidden id, if it is signed for here and current; and
+/// when it ends, where the program gave it a `max_age` (FEEDBACK56.md, Q-859; branch feedback56).
+fn open(ctx: &str, cookie: &str) -> Option<(Value, Option<String>, Option<u64>)> {
     let (payload, sig) = cookie.split_once('.')?;
     if !crate::crypto::same(sign(ctx, payload).as_bytes(), sig.as_bytes()) {
         return None;
     }
     // At most as deep as every reader takes (FEEDBACK55.md, Q-875's second review; branch feedback55).
     let j: serde_json::Value = crate::value::json_value(&unb64url(payload)?).ok()?;
-    if j.get("e")?.as_u64()? <= now() {
+    let ends = j.get("e")?.as_u64()?;
+    if ends <= now() {
         return None;
     }
     // Decimals and ints past 2^53 come back as they went, as an island's do, not as text
     // that `+` would join (FEEDBACK30.md, Q-374; branch feedback27-35-fixes).
-    Some((crate::interp::from_island_json(j.get("d")?), j.get("i").and_then(|i| i.as_str()).map(str::to_string)))
+    Some((crate::interp::from_island_json(j.get("d")?), j.get("i").and_then(|i| i.as_str()).map(str::to_string), j.get("a").is_some().then_some(ends)))
 }
 
 /// The session the request came with, and its hidden id. One valid among others is the session;
 /// two are none, since one of them was planted (by a sibling subdomain, say).
 fn arrived(it: &mut Interp) -> Option<(Value, Option<String>)> {
+    arrived_whole(it).map(|(d, id, _)| (d, id))
+}
+
+/// `arrived`, with when the session ends where the program gave it a `max_age`.
+fn arrived_whole(it: &mut Interp) -> Option<(Value, Option<String>, Option<u64>)> {
     let ctx = context(it);
-    let mut valid: Vec<(Value, Option<String>)> = cookies(it).iter().filter_map(|v| open(&ctx, v)).collect();
+    let mut valid: Vec<(Value, Option<String>, Option<u64>)> = cookies(it).iter().filter_map(|v| open(&ctx, v)).collect();
     if valid.len() == 1 {
         valid.pop()
     } else {
         None
+    }
+}
+
+/// When the session ends, in seconds since 1970, where the program gave it a `max_age`: one set
+/// in this request, or the one the request came with. None for a session of the default 30 days
+/// or none at all (FEEDBACK56.md, Q-859, found in review; branch feedback56).
+pub(crate) fn given_life(it: &mut Interp) -> Option<u64> {
+    match it.session_ends {
+        Some(ends) => ends,
+        None => arrived_whole(it).and_then(|(_, _, ends)| ends),
     }
 }
 
@@ -191,6 +208,43 @@ pub fn unseal(purpose: &str, token: &str) -> Option<String> {
         return None;
     }
     String::from_utf8(unb64url(body)?).ok()
+}
+
+/// `text` signed with the session key for `purpose`, alone: what an MCP token is kept as, so that
+/// no one who reads the table can use what is in it, and a token is good for as long as the key
+/// that signs sessions is the same: without `QUILLO_SECRET`, until the server stops, as a session
+/// is (FEEDBACK56.md, Q-859; branch feedback56).
+pub(crate) fn digest(purpose: &str, text: &str) -> String {
+    sign(purpose, text)
+}
+
+/// Where a session is good, as its signature binds it (`context`): the mount point and the
+/// tenant, as JSON text, for what is kept of a session elsewhere (an MCP token; FEEDBACK56.md,
+/// Q-859; branch feedback56).
+pub(crate) fn place(it: &mut Interp) -> String {
+    let tenant = it.tenant();
+    serde_json::json!([it.base, tenant.as_deref()]).to_string()
+}
+
+/// The session the request came with, when someone is signed in to it (its `user` is set, as
+/// a program names its caller), with who it is as `current_owner` says it (FEEDBACK56.md, Q-859;
+/// branch feedback56).
+pub(crate) fn signed_in(it: &mut Interp) -> Option<(Value, String)> {
+    let (data, id) = arrived(it)?;
+    let Value::Map(m) = &data else { return None };
+    if matches!(m.get("user"), None | Some(Value::Nil)) {
+        return None;
+    }
+    let owner = owner_in(id.as_deref(), &data)?;
+    Some((data, owner))
+}
+
+/// The session a call is made in when it did not come with a cookie (an MCP token's): `data`,
+/// and its hidden id when `owner` names one, so that `session()`, `set_session` and the owners
+/// of an `Idempotency-Key` go by it (FEEDBACK56.md, Q-859; branch feedback56).
+pub(crate) fn take_on(it: &mut Interp, data: Value, owner: &str) {
+    it.session = Some(data);
+    it.session_id = Some(owner.strip_prefix("id ").map(Arc::from));
 }
 
 /// The request's session, as `session()` gives it.
@@ -535,14 +589,20 @@ fn set_session(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         other => return fail(line, format!("`set_session` expects a map, got {}", other.map_or("nothing", |v| v.type_name()))),
     };
     let o = opts(&args, 1, "set_session", line)?;
-    let age = match o.as_ref().and_then(|m| m.get("max_age")) {
-        None | Some(Value::Nil) => DEFAULT_AGE,
+    let given = o.as_ref().and_then(|m| m.get("max_age")).filter(|v| !matches!(v, Value::Nil));
+    let age = match given {
+        None => DEFAULT_AGE,
         Some(v) => match crate::builtins::duration_seconds(v) {
             Some(n) if n > 0 => n,
             _ => return fail(line, format!("`set_session`'s max_age is seconds or a duration like \"30d\", got {}", v.repr())),
         },
     };
     let mut stored = serde_json::json!({ "e": now() + age, "d": crate::interp::island_json(&data) });
+    // The program said how long it lasts: an MCP token made from it lasts as long (FEEDBACK56.md,
+    // Q-859, found in review; branch feedback56).
+    if given.is_some() {
+        stored["a"] = serde_json::json!(1);
+    }
     // Read back as JSON at most `JSON_NESTING` deep: one deeper was stored, and the next request
     // had no session (FEEDBACK55.md, Q-875's second review; branch feedback55).
     if crate::value::json_value_depth(&stored) > crate::value::JSON_NESTING {
@@ -584,13 +644,30 @@ fn set_session(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     send_cookie(it, &value, Some(age), line)?;
     it.session = Some(data);
+    it.session_ends = Some(given.map(|_| now() + age));
     Ok(Value::Nil)
 }
 
 /// `end_session()`: forgets the session (logging out).
+/// Its MCP tokens end with it, first, whenever there are any kept, whether or not the program has
+/// its door now (a reload without tools): a logout that could not end them fails, rather than
+/// leave them good; one with no table of them never makes one, and never fails for it
+/// (FEEDBACK56.md, Q-859, found in review; branch feedback56).
 fn end_session(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
+    let mut owners: Vec<String> = arrived_owner(it).into_iter().collect();
+    if let Some(o) = current_owner(it).filter(|o| !owners.contains(o)) {
+        owners.push(o);
+    }
+    if let Err(why) = crate::mcp::end_tokens(it, &owners) {
+        // A program with no door now, whose database cannot be asked: nothing says it has any, and
+        // its logouts do not wait on that database.
+        if it.mcp.is_some() {
+            return fail(line, format!("`end_session`: the session's MCP tokens could not be ended, so it was not: {}", why));
+        }
+    }
     send_cookie(it, "", Some(0), line)?;
     it.session = Some(Value::map(Map::new()));
+    it.session_ends = Some(None);
     it.session_id = Some(None);
     Ok(Value::Nil)
 }

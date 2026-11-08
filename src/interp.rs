@@ -55,6 +55,9 @@ pub(crate) const CHANGES: &[&str] = &[
     "delete_cookie",
     "set_session",
     "end_session",
+    // A token kept, or taken away (FEEDBACK56.md, Q-859; branch feedback56).
+    "mcp_token",
+    "revoke_mcp_token",
     "write_file",
     "delete_file",
     "save_upload",
@@ -181,6 +184,9 @@ pub struct Interp {
     pub session: Option<Value>,
     /// Its hidden id, once read or made; `Some(None)` once it ended (see `session::session_id`).
     pub(crate) session_id: Option<Option<Arc<str>>>,
+    /// When the session set in this request ends, where the program gave it a `max_age`; None
+    /// until one is set here (see `session::given_life`; FEEDBACK56.md, Q-859; branch feedback56).
+    pub(crate) session_ends: Option<Option<u64>>,
     /// The answer read who the visitor is, from a cookie: one visitor's, for caches to keep
     /// apart (FEEDBACK31.md, Q-391; branch feedback27-35-fixes).
     pub visitor_read: bool,
@@ -338,6 +344,10 @@ pub struct Interp {
     /// `server fn ... for [...]` takes (FEEDBACK38.md, Q-458 and Q-460; branch feedback36-39).
     pub accept: Option<crate::svcauth::Shared>,
     pub fn_callers: Arc<std::collections::HashMap<String, Vec<String>>>,
+    /// The program's MCP door over HTTP, `/_quillo/mcp`, when it has tools and is not run as a
+    /// service: its tools as the checker read them, shared by its forks (FEEDBACK56.md, C.2;
+    /// branch feedback56).
+    pub(crate) mcp: Option<Arc<crate::mcp::Door>>,
     pub ready_checks: Arc<Vec<(String, Value)>>,
     /// The command components' styles go through (`style_with`; FEEDBACK11.md,
     /// Q-079; branch feedback11-fixes).
@@ -1617,6 +1627,7 @@ impl Interp {
             set_cookies: Vec::new(),
             session: None,
             session_id: None,
+            session_ends: None,
             visitor_read: false,
             locale_read: false,
             answering: false,
@@ -1679,6 +1690,7 @@ impl Interp {
             declared_services: Default::default(),
             accept: None,
             fn_callers: Default::default(),
+            mcp: None,
             ready_checks: Default::default(),
             style_with: None,
             style_with_fn: None,
@@ -1736,6 +1748,7 @@ impl Interp {
             set_cookies: Vec::new(),
             session: None,
             session_id: None,
+            session_ends: None,
             visitor_read: false,
             locale_read: false,
             answering: false,
@@ -1798,6 +1811,7 @@ impl Interp {
             declared_services: self.declared_services.clone(),
             accept: self.accept.clone(),
             fn_callers: self.fn_callers.clone(),
+            mcp: self.mcp.clone(),
             ready_checks: self.ready_checks.clone(),
             style_with: self.style_with.clone(),
             style_with_fn: self.style_with_fn.clone(),

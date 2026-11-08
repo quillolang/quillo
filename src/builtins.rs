@@ -150,7 +150,7 @@ pub fn install(env: &Env) {
         ("watch", watch),
         ("unwatched", unwatched),
     ];
-    for (name, f) in fns.iter().chain(crate::session::BUILTINS).chain(crate::i18n::BUILTINS).chain(crate::jobs::BUILTINS).chain(crate::stream::BUILTINS).chain(crate::idempotency::BUILTINS) {
+    for (name, f) in fns.iter().chain(crate::session::BUILTINS).chain(crate::i18n::BUILTINS).chain(crate::jobs::BUILTINS).chain(crate::stream::BUILTINS).chain(crate::idempotency::BUILTINS).chain(crate::mcp::BUILTINS) {
         define(env, name, Value::Builtin(name, *f));
     }
     let mut re = Map::new();

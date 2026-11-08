@@ -614,7 +614,8 @@ fn touch() {
   added is lost. Twenty adds to a cart kept in the session, sent at once, each
   `set_session({ ...s, cart: (s.cart ?? []) + [item] })`, kept one item. Keep what must
   not be lost (a cart, a draft) in a table, keyed by an id in the session.
-- `end_session()` removes the cookie from the browser, but a copy someone kept stays
+- `end_session()` removes the cookie from the browser, and ends the session's MCP tokens
+  (see [Tools for AI clients](#tools-for-ai-clients)), but a copy of the cookie someone kept stays
   valid until it expires. To end sessions on the server (log out everywhere, a stolen
   laptop), keep an id in the session and check it against the database.
 - The session cookie is `__Host-quillo_session` when it is `Secure` and for the whole

@@ -214,7 +214,7 @@ const PURE: &[&str] = &[
 
 const READS: &[&str] = &[
     // Who asks, and for whom.
-    "session", "cookie", "url", "navigate", "tenant", "with_tenant", "with_locale", "live", "__answer",
+    "session", "cookie", "url", "navigate", "tenant", "with_tenant", "with_locale", "live", "__answer", "mcp_tokens",
     // The clock, the system, files; and a line in the log, which changes nothing a page sees.
     "print", "now", "date.now", "date.today", "sleep", "env", "args", "platform", "file", "files", "read_file", "read_upload", "image.info", "check_program",
     // The database and the network, which say what they changed by themselves when it is a table
@@ -229,7 +229,7 @@ const READS: &[&str] = &[
 const ACTS: &[&str] = &[
     "exit", "stdin", "read_line", "ask", "notify", "random", "random_int", "uuid", "crypto.token", "crypto.hash_password", "write_file", "delete_file", "save_upload",
     "image.convert", "run_script", "publish", "redirect", "respond", "stream", "events", "listen", "set_cookie", "delete_cookie", "set_session", "end_session", "idempotent",
-    "http.post", "http.put", "http.patch", "http.delete", "http.request", "http.stream", "db.exec", "db.exec_many", "db.migrate", "db.open", "db.atomic", "new_tenant",
+    "mcp_token", "revoke_mcp_token", "http.post", "http.put", "http.patch", "http.delete", "http.request", "http.stream", "db.exec", "db.exec_many", "db.migrate", "db.open", "db.atomic", "new_tenant",
     "__service", "__service_later", "__site_call", "__site", "__built", "__callers", "schedule", "translations", "locale_from", "tenant_from", "allow_cross_site", "site_headers",
     "accept_calls", "style_with", "ready", "channel.on", "channel.send", "channel.broadcast", "channel.open", "receive", "media.rtp", "media.close", "media.on", "udp.listen",
     "udp.send", "udp.reply",

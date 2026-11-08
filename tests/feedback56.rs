@@ -4001,3 +4001,1396 @@ fn q858_review_after_a_request_panics_the_next_has_its_effects() {
     }
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ---- Slice 5: the HTTP door, `/_quillo/mcp` (C.2 to C.4, Q-859, Q-860) --------------------------
+//
+// Driven against a real `quillo run` on a port the system picks (`support::serve_with`), each
+// request under `support::send`'s 30 s read deadline, the server killed when the test is done
+// with it (`support::Server`, `support::Guard`). The messages and headers are MCP 2026-07-28's
+// (basic/transports/streamable-http, basic/authorization, server/tools).
+mod http_door {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// The program the door is driven with. `tenant_from` names a tenant only for a request that
+    /// says one (`x-tenant`), so the others have none.
+    pub(super) const SRC: &str = r#"db.open(":memory:")
+db.exec("create table notes (id integer primary key, text text not null)")
+tenant_from((request) => request.headers["x-tenant"])
+
+let bad = [{ colour: 1 }, { max_age: "0s" }, { max_age: "soon" }, 5]
+
+route POST /login ? { user: str } = set_session({ user: user })
+route POST /anon = set_session({ cart: [1] })
+route POST /token = mcp_token()
+route POST /token_for ? { user: str, age: str = "30d" } = mcp_token({ user: user, max_age: age })
+route POST /token_bad/:how(int) = mcp_token(bad[how])
+route GET /tokens = mcp_tokens()
+route GET /tokens_of ? { user: str } = mcp_tokens({ user: user })
+route POST /revoke ? { id: str } = str(revoke_mcp_token(id))
+route POST /revoke_of ? { id: str, user: str } = str(revoke_mcp_token(id, { user: user }))
+route POST /revoke_bad = revoke_mcp_token(json.parse("5"))
+route POST /logout = end_session()
+route GET /here = str(request.mcp)
+route GET /count = str(db.one("select count(*) as n from notes").n)
+
+/// Who is calling: the session's user, the client, the tenant.
+server fn mcp whoami() -> map with time = { user: session().user, mcp: request.mcp, tenant: tenant() }
+
+/// Adds a note: how many there are.
+fn mcp add(text: str) -> int with db {
+    db.exec("insert into notes (text) values (?)", text)
+    db.one("select count(*) as n from notes").n
+}
+
+/// Needs a login.
+fn mcp mine() -> str with time {
+    session().user ?? reply 401 "Log in first"
+}
+
+/// Sets a cookie.
+fn mcp sets() -> str with time {
+    set_cookie("seen", "1")
+    "set"
+}
+
+/// Gives back what it is given.
+server fn mcp echo(v: any) with time = v
+
+/// Spins.
+fn mcp spin() -> int with time {
+    let i = 0
+    while i >= 0 { i = i + 1 }
+    i
+}
+
+/// A plain server fn.
+server fn plain_one() -> int = 1
+"#;
+
+    pub(super) const V: &str = "2026-07-28";
+
+    /// A request of 2026-07-28 as a client sends one: `_meta` with the version, the client's
+    /// capabilities and who the client is.
+    pub(super) fn msg(id: Value, method: &str, mut params: Value) -> String {
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": V,
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": { "name": "quillo-test", "version": "1.2.3" },
+        });
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string()
+    }
+
+    /// Who a test calls as.
+    #[derive(Clone, Debug)]
+    pub(super) enum As {
+        Nobody,
+        Cookie(String),
+        Token(String),
+    }
+
+    /// The headers MCP's transport mirrors from a message: the version, the method, and on
+    /// `tools/call` the tool's name.
+    pub(super) fn mirrored(method: &str, name: Option<&str>) -> Vec<(String, String)> {
+        let mut h = vec![("MCP-Protocol-Version".to_string(), V.to_string()), ("Mcp-Method".to_string(), method.to_string())];
+        if let Some(n) = name {
+            h.push(("Mcp-Name".into(), n.into()));
+        }
+        h
+    }
+
+    /// A POST to the door as `who`, with `headers` as given (none added but who it is).
+    pub(super) fn post(port: u16, who: &As, headers: &[(String, String)], body: &str) -> support::Answer {
+        let mut h: Vec<(String, String)> = headers.to_vec();
+        match who {
+            As::Cookie(c) => h.push(("Cookie".into(), c.clone())),
+            As::Token(t) => h.push(("Authorization".into(), format!("Bearer {}", t))),
+            As::Nobody => {}
+        }
+        let refs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        support::send(port, "POST", "/_quillo/mcp", &refs, body)
+    }
+
+    pub(super) fn json_of(a: &support::Answer) -> Value {
+        serde_json::from_str(&a.body).unwrap_or_else(|e| panic!("not JSON ({}): {} {:?}", e, a.status, a.body))
+    }
+
+    /// A message sent as a client sends it, its headers mirrored: the answer.
+    pub(super) fn ask(port: u16, who: &As, id: Value, method: &str, params: Value) -> support::Answer {
+        let name = params.get("name").and_then(Value::as_str).map(str::to_string);
+        post(port, who, &mirrored(method, name.as_deref()), &msg(id, method, params))
+    }
+
+    /// A tool's call, answered 200 with a result: the result, `_meta` and `resultType` checked
+    /// and taken out.
+    pub(super) fn call(port: u16, who: &As, name: &str, args: Value) -> Value {
+        let a = ask(port, who, json!(name), "tools/call", json!({ "name": name, "arguments": args }));
+        assert_eq!(a.status, 200, "{} {}", name, a.body);
+        assert_eq!(a.header("content-type"), Some("application/json"));
+        assert_eq!(a.header("cache-control"), Some("no-store"));
+        let v = json_of(&a);
+        assert_eq!(v["id"], json!(name), "{}", v);
+        let mut r = v["result"].clone();
+        assert_eq!(r["resultType"], json!("complete"), "{}", v);
+        assert_eq!(r["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], json!("main"), "{}", v);
+        r.as_object_mut().unwrap().remove("_meta");
+        r.as_object_mut().unwrap().remove("resultType");
+        r
+    }
+
+    /// The session cookie an answer sets, as `name=value`.
+    pub(super) fn session_cookie(a: &support::Answer) -> String {
+        a.headers
+            .iter()
+            .filter(|(k, _)| k == "set-cookie")
+            .map(|(_, v)| v.split(';').next().unwrap_or("").to_string())
+            .find(|c| c.contains("quillo_session="))
+            .unwrap_or_else(|| panic!("no session cookie: {:?}", a.headers))
+    }
+
+    pub(super) fn login(port: u16, user: &str, extra: &[(&str, &str)]) -> String {
+        let a = support::send(port, "POST", &format!("/login?user={}", user), extra, "");
+        assert_eq!(a.status, 204, "{}", a.body);
+        session_cookie(&a)
+    }
+
+    /// A route's answer as `who` (a cookie), with `extra` headers.
+    pub(super) fn route(port: u16, method: &str, path: &str, cookie: &str, extra: &[(&str, &str)]) -> support::Answer {
+        let mut h = vec![("Cookie", cookie)];
+        h.extend_from_slice(extra);
+        support::send(port, method, path, &h, "")
+    }
+
+    pub(super) fn token(port: u16, cookie: &str, extra: &[(&str, &str)]) -> String {
+        let a = route(port, "POST", "/token", cookie, extra);
+        assert_eq!(a.status, 200, "{}", a.body);
+        assert!(a.body.starts_with("qmcp_") && a.body.len() == 48, "{}", a.body);
+        a.body
+    }
+
+    /// The JSON-RPC error of a refusal: its status, id, code and message.
+    pub(super) fn refusal(a: &support::Answer) -> (u16, Value, i64, String) {
+        let v = json_of(a);
+        assert!(v.get("result").is_none(), "{}", v);
+        assert_eq!(v["jsonrpc"], json!("2.0"));
+        (a.status, v.get("id").cloned().unwrap_or(Value::Null), v["error"]["code"].as_i64().unwrap_or_else(|| panic!("{}", v)), v["error"]["message"].as_str().unwrap_or_default().to_string())
+    }
+
+    pub(super) fn door(name: &str, opts: &[&str]) -> (PathBuf, support::Server) {
+        let d = dir(&format!("c2-{}", name), SRC);
+        let s = support::serve_with(&d.join("main.qwe"), opts);
+        (d, s)
+    }
+
+    /// Nothing in an answer lets another site's page read it or send a call.
+    pub(super) fn grants_nothing(a: &support::Answer) {
+        assert!(!a.headers.iter().any(|(k, _)| k.starts_with("access-control-")), "{:?}", a.headers);
+    }
+
+    #[test]
+    fn c2_every_refusal_has_its_code_and_status() {
+        let (d, s) = door("refusals", &[]);
+        let p = s.port;
+        let ana = As::Cookie(login(p, "ana", &[]));
+        let list = msg(json!(1), "tools/list", json!({}));
+        let h = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+        let said = |a: &support::Answer| refusal(a);
+        // The form that must keep working: the headers in any case, a request answered.
+        let ok = post(p, &ana, &h(&[("mcp-protocol-version", V), ("MCP-METHOD", "tools/list")]), &list);
+        assert_eq!(ok.status, 200, "{}", ok.body);
+        assert_eq!(json_of(&ok)["result"]["tools"].as_array().map(Vec::len), Some(6));
+        // HeaderMismatch, -32020 and 400: the version header missing, other than the body's, given
+        // twice with two values, holding what no header may; the method's the same; the values in
+        // their case.
+        for (headers, why) in [
+            (h(&[("Mcp-Method", "tools/list")]), "the MCP-Protocol-Version header is missing"),
+            (h(&[("MCP-Protocol-Version", "2026-07-29"), ("Mcp-Method", "tools/list")]), "MCP-Protocol-Version header value '2026-07-29' does not match body value '2026-07-28'"),
+            (h(&[("MCP-Protocol-Version", V), ("MCP-Protocol-Version", "2025-11-25"), ("Mcp-Method", "tools/list")]), "the MCP-Protocol-Version header is given twice, with two values"),
+            (h(&[("MCP-Protocol-Version", V)]), "the Mcp-Method header is missing"),
+            (h(&[("MCP-Protocol-Version", V), ("Mcp-Method", "tools/call")]), "Mcp-Method header value 'tools/call' does not match body value 'tools/list'"),
+            (h(&[("MCP-Protocol-Version", V), ("Mcp-Method", "Tools/List")]), "Mcp-Method header value 'Tools/List' does not match body value 'tools/list'"),
+            (h(&[("MCP-Protocol-Version", V), ("Mcp-Method", "tools/listé")]), "the Mcp-Method header holds a character a header may not"),
+        ] {
+            let (status, id, code, message) = said(&post(p, &ana, &headers, &list));
+            assert_eq!((status, id, code), (400, json!(1), -32020), "{:?}", headers);
+            assert!(message.starts_with("Header mismatch: ") && message.contains(why), "{:?}: {}", headers, message);
+        }
+        // The same header twice with one value is one value.
+        let twice = h(&[("MCP-Protocol-Version", V), ("MCP-Protocol-Version", V), ("Mcp-Method", "tools/list")]);
+        assert_eq!(post(p, &ana, &twice, &list).status, 200);
+        // `Mcp-Name` on `tools/call`: missing, another tool's, base64 of the name (padded and not),
+        // base64 of something else, not base64, another alphabet's.
+        let call = msg(json!("w"), "tools/call", json!({ "name": "whoami" }));
+        let named = |n: Option<&str>| mirrored("tools/call", n);
+        for (name, why) in [
+            (None, "the Mcp-Name header is missing".to_string()),
+            (Some("echo"), "Mcp-Name header value 'echo' does not match body value 'whoami'".into()),
+            (Some("=?base64?ZWNobw==?="), "Mcp-Name header value '=?base64?ZWNobw==?=' does not match body value 'whoami'".into()),
+            (Some("=?base64?not base64!?="), "the Mcp-Name header's =?base64? value is not base64 of UTF-8 text".into()),
+            (Some("=?base64?_-8?="), "the Mcp-Name header's =?base64? value is not base64 of UTF-8 text".into()),
+            (Some("=?base64?/w==?="), "the Mcp-Name header's =?base64? value is not base64 of UTF-8 text".into()),
+            (Some("WhoAmI"), "Mcp-Name header value 'WhoAmI' does not match body value 'whoami'".into()),
+        ] {
+            let (status, id, code, message) = said(&post(p, &ana, &named(name), &call));
+            assert_eq!((status, id, code), (400, json!("w"), -32020), "{:?}", name);
+            assert!(message.contains(&why), "{:?}: {}", name, message);
+        }
+        for name in ["=?base64?d2hvYW1p?=", "=?base64?d2hvYW1p==?=", "whoami"] {
+            let a = post(p, &ana, &named(Some(name)), &call);
+            assert_eq!(a.status, 200, "{}: {}", name, a.body);
+            assert_eq!(json_of(&a)["result"]["structuredContent"]["user"], json!("ana"), "{}", name);
+        }
+        // `_meta` without what every request carries: -32602, 400 (basic/index).
+        let bare = |meta: Value| json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": { "_meta": meta } }).to_string();
+        for meta in [json!({ "io.modelcontextprotocol/protocolVersion": V }), json!({ "io.modelcontextprotocol/protocolVersion": V, "io.modelcontextprotocol/clientCapabilities": 5 })] {
+            let (status, id, code, _) = said(&post(p, &ana, &mirrored("tools/list", None), &bare(meta)));
+            assert_eq!((status, id, code), (400, json!(2), -32602));
+        }
+        // A version the door does not speak, in the body and the header alike, or (a client of an
+        // earlier revision) in the header alone: -32022, 400, with the versions it does.
+        let old = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": "2025-11-25", "io.modelcontextprotocol/clientCapabilities": {} } } }).to_string();
+        let olds = h(&[("MCP-Protocol-Version", "2025-11-25"), ("Mcp-Method", "tools/list")]);
+        let bare_old = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }).to_string();
+        for body in [old, bare_old] {
+            let a = post(p, &ana, &olds, &body);
+            let (status, id, code, _) = said(&a);
+            assert_eq!((status, id, code), (400, json!(3), -32022), "{}", a.body);
+            assert_eq!(json_of(&a)["error"]["data"], json!({ "supported": [V], "requested": "2025-11-25" }));
+        }
+        // `initialize`, which a client of 2025-11-25 sends with none of the headers: the version
+        // error, not a missing header (decided 2026-11-08).
+        let init = json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": { "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": { "name": "old", "version": "1" } } }).to_string();
+        let a = post(p, &ana, &[], &init);
+        let (status, id, code, _) = said(&a);
+        assert_eq!((status, id, code), (400, json!(0), -32022), "{}", a.body);
+        assert_eq!(json_of(&a)["error"]["data"]["requested"], json!("2025-11-25"));
+        // A method the door does not have: -32601, 404; a tool it does not have: -32602, 400.
+        let (status, _, code, message) = said(&ask(p, &ana, json!(4), "prompts/list", json!({})));
+        assert_eq!((status, code, message.as_str()), (404, -32601, "Method not found: prompts/list"));
+        let (status, _, code, message) = said(&ask(p, &ana, json!(5), "tools/call", json!({ "name": "nope" })));
+        assert_eq!((status, code, message.as_str()), (400, -32602, "Unknown tool: nope"));
+        // What is no request: not JSON (-32700), a batch, not an object, an id that is null (all
+        // -32600), a response a client may not send; each 400, with no id where none was read.
+        let mut list_h = mirrored("tools/list", None);
+        list_h.push(("Content-Type".into(), "application/json".into()));
+        for (body, code) in [("{", -32700), ("", -32700), ("[1]", -32600), ("\"x\"", -32600), (r#"{"jsonrpc":"2.0","id":null,"method":"tools/list"}"#, -32600), (r#"{"jsonrpc":"2.0","id":7,"result":{}}"#, -32600), (r#"{"jsonrpc":"2.0","error":{"code":1,"message":"x"}}"#, -32600)] {
+            let a = post(p, &ana, &list_h, body);
+            let (status, id, c, _) = said(&a);
+            assert_eq!((status, c), (400, code), "{}: {}", body, a.body);
+            assert!(id.is_null() || id == json!(7), "{}: {}", body, a.body);
+        }
+        // A notification is taken and not answered: 202, no body, whatever its headers.
+        for headers in [list_h.clone(), Vec::new()] {
+            let a = post(p, &ana, &headers, r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#);
+            assert_eq!((a.status, a.body.as_str()), (202, ""), "{:?}", headers);
+        }
+        // POST only: GET (2025-11-25's stream), DELETE (its end of a session), PUT, HEAD 405 with
+        // `Allow`.
+        for method in ["GET", "DELETE", "PUT", "HEAD", "PATCH"] {
+            let a = support::send(p, method, "/_quillo/mcp", &[("Cookie", match &ana { As::Cookie(c) => c, _ => unreachable!() })], "");
+            assert_eq!((a.status, a.header("allow")), (405, Some("POST")), "{}", method);
+        }
+        // JSON only: plain text, a form, none said; 415 before anything is read.
+        let list_h = mirrored("tools/list", None);
+        for ctype in ["text/plain", "application/x-www-form-urlencoded", "application/jsonx", ""] {
+            let mut headers = list_h.clone();
+            headers.push(("Content-Type".into(), ctype.into()));
+            let a = post(p, &ana, &headers, if ctype.is_empty() { "" } else { &list });
+            assert_eq!(a.status, 415, "{:?}: {}", ctype, a.body);
+        }
+        // With its parameters, in any case, JSON is JSON.
+        let mut headers = list_h.clone();
+        headers.push(("Content-Type".into(), "Application/JSON; charset=utf-8".into()));
+        assert_eq!(post(p, &ana, &headers, &list).status, 200);
+        // 2025-11-25's session header is not read, and none is made.
+        let mut headers = list_h.clone();
+        headers.push(("Mcp-Session-Id".into(), "abc".into()));
+        let a = post(p, &ana, &headers, &list);
+        assert_eq!(a.status, 200);
+        assert!(a.header("mcp-session-id").is_none(), "{:?}", a.headers);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn c3_with_no_caller_the_door_is_closed() {
+        let (d, s) = door("nobody", &[]);
+        let p = s.port;
+        let list = msg(json!(1), "tools/list", json!({}));
+        let mut h = mirrored("tools/list", None);
+        h.push(("Content-Type".into(), "application/json".into()));
+        // No cookie, no token: 401 with the challenge, even for what the door would refuse anyway:
+        // a stranger learns nothing of it.
+        for body in [list.as_str(), "{", ""] {
+            let a = post(p, &As::Nobody, &h, body);
+            assert_eq!((a.status, a.header("www-authenticate")), (401, Some("Bearer")), "{}", body);
+            assert!(a.body.contains("mcp_token()"), "{}", a.body);
+        }
+        // A session no one is signed in to (a visitor's cart), a cookie changed, an unknown name: 401.
+        let anon = session_cookie(&support::send(p, "POST", "/anon", &[], ""));
+        let ana = login(p, "ana", &[]);
+        let (name, value) = ana.split_once('=').unwrap();
+        let changed = format!("{}={}x", name, value);
+        for c in [anon.clone(), changed, format!("other_session={}", value)] {
+            let a = post(p, &As::Cookie(c.clone()), &h, &list);
+            assert_eq!((a.status, a.header("www-authenticate")), (401, Some("Bearer")), "{}", c);
+        }
+        // Another scheme is no token: refused alone, and with a signed-in cookie the cookie is read.
+        let mut basic = h.clone();
+        basic.push(("Authorization".into(), "Basic YTpi".into()));
+        assert_eq!(post(p, &As::Nobody, &basic, &list).status, 401);
+        assert_eq!(post(p, &As::Cookie(ana.clone()), &basic, &list).status, 200);
+        // A token the door does not have, an empty one, one in any case of `Bearer`: 401 with
+        // `invalid_token`; a good one, with `bearer`, is let in.
+        let good = token(p, &ana, &[]);
+        for t in ["qmcp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "", "x", "é"] {
+            let mut with = h.clone();
+            with.push(("Authorization".into(), format!("Bearer {}", t)));
+            let a = post(p, &As::Nobody, &with, &list);
+            assert_eq!((a.status, a.header("www-authenticate")), (401, Some("Bearer error=\"invalid_token\"")), "{:?}", t);
+            // A bad token is no session's even with a good cookie beside it.
+            assert_eq!(post(p, &As::Cookie(ana.clone()), &with, &list).status, 401, "{:?}", t);
+        }
+        let mut lower = h.clone();
+        lower.push(("Authorization".into(), format!("bearer {}", good)));
+        assert_eq!(post(p, &As::Nobody, &lower, &list).status, 200);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A token's life on `db_line`'s store: made, used, listed, revoked, ended with its session.
+    fn tokens_on(name: &str, db_line: &str) {
+        let src = format!("{}\n{}", db_line, LIFE_SRC);
+        let d = dir(&format!("c3-life-{}", name), &src);
+        let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+        let p = s.port;
+        let ana = login(p, "ana", &[]);
+        let cookie = As::Cookie(ana.clone());
+        // The cookie: `session()` is the visitor's, and a cookie a tool sets goes back.
+        assert_eq!(call(p, &cookie, "whoami", json!({}))["structuredContent"]["user"], json!("ana"));
+        let a = ask(p, &cookie, json!(1), "tools/call", json!({ "name": "sets" }));
+        assert!(a.headers.iter().any(|(k, v)| k == "set-cookie" && v.starts_with("seen=1")), "{:?}", a.headers);
+        // A token: given once, and the session is its own in a tool; a cookie set there has no
+        // browser to go back to.
+        let one = token(p, &ana, &[]);
+        let two = token(p, &ana, &[]);
+        assert_ne!(one, two);
+        let t1 = As::Token(one.clone());
+        assert_eq!(call(p, &t1, "whoami", json!({}))["structuredContent"]["user"], json!("ana"));
+        assert_eq!(call(p, &t1, "mine", json!({}))["structuredContent"], json!({ "result": "ana" }));
+        let a = ask(p, &t1, json!(1), "tools/call", json!({ "name": "sets" }));
+        assert_eq!(a.status, 200);
+        assert!(!a.headers.iter().any(|(k, _)| k == "set-cookie"), "{:?}", a.headers);
+        // Listed oldest first, by id and never by token; for the user too.
+        let listed: Value = serde_json::from_str(&route(p, "GET", "/tokens", &ana, &[]).body).unwrap();
+        let ids: Vec<String> = listed.as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap().to_string()).collect();
+        assert_eq!(ids.len(), 2, "{}", listed);
+        for t in listed.as_array().unwrap() {
+            let keys: Vec<&String> = t.as_object().unwrap().keys().collect();
+            assert_eq!(keys, ["id", "user", "made", "expires"], "{}", t);
+            assert_eq!(t["user"], json!("ana"));
+            let (made, ends) = (t["made"].as_i64().unwrap(), t["expires"].as_i64().unwrap());
+            assert_eq!(ends - made, 30 * 86_400 * 1000);
+        }
+        assert!(!listed.to_string().contains(&one[5..]) && !listed.to_string().contains(&two[5..]));
+        // Another session of Ana's finds them by her user, as a sign-in again does after a cookie
+        // has gone (decided in review); by the user, all of them; another user's, none.
+        let ana2 = login(p, "ana", &[]);
+        let again: Value = serde_json::from_str(&route(p, "GET", "/tokens", &ana2, &[]).body).unwrap();
+        assert_eq!(again, listed);
+        let bob0 = login(p, "bob", &[]);
+        assert_eq!(route(p, "GET", "/tokens", &bob0, &[]).body, "[]");
+        assert_eq!(route(p, "POST", &format!("/revoke?id={}", ids[0]), &bob0, &[]).body, "false");
+        let three = token(p, &ana2, &[]);
+        let of_ana: Value = serde_json::from_str(&route(p, "GET", "/tokens_of?user=ana", &ana2, &[]).body).unwrap();
+        assert_eq!(of_ana.as_array().map(Vec::len), Some(3), "{}", of_ana);
+        assert_eq!(route(p, "GET", "/tokens_of?user=bob", &ana2, &[]).body, "[]");
+        // Revoked: that one is no good, the other is; revoking it again says there was none. (Two
+        // made in the same millisecond are listed by their ids: which of the two it was is seen.)
+        assert_eq!(route(p, "POST", &format!("/revoke?id={}", ids[0]), &ana, &[]).body, "true");
+        let status = |t: &str| post(p, &As::Token(t.to_string()), &mirrored("tools/list", None), &msg(json!(1), "tools/list", json!({}))).status;
+        let (gone, kept) = match (status(&one), status(&two)) {
+            (401, 200) => (one.clone(), two.clone()),
+            (200, 401) => (two.clone(), one.clone()),
+            other => panic!("one revoked, the other good: {:?}", other),
+        };
+        assert_eq!(status(&gone), 401);
+        assert_eq!(call(p, &As::Token(kept.clone()), "whoami", json!({}))["structuredContent"]["user"], json!("ana"));
+        assert_eq!(route(p, "POST", &format!("/revoke?id={}", ids[0]), &ana, &[]).body, "false");
+        assert_eq!(route(p, "POST", "/revoke?id=", &ana, &[]).body, "false");
+        // By the user, from another session.
+        let third: Value = serde_json::from_str(&route(p, "GET", "/tokens", &ana2, &[]).body).unwrap();
+        let third_id = third.as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap().to_string()).find(|id| !ids.contains(id)).unwrap();
+        assert_eq!(route(p, "POST", &format!("/revoke_of?id={}&user=bob", third_id), &ana, &[]).body, "false");
+        assert_eq!(route(p, "POST", &format!("/revoke_of?id={}&user=ana", third_id), &ana, &[]).body, "true");
+        assert_eq!(post(p, &As::Token(three), &mirrored("tools/list", None), &msg(json!(1), "tools/list", json!({}))).status, 401);
+        // `end_session()`: its tokens end with it, and the list is empty.
+        let four = token(p, &ana, &[]);
+        assert_eq!(route(p, "POST", "/logout", &ana, &[]).status, 204);
+        for t in [kept, four] {
+            let a = post(p, &As::Token(t), &mirrored("tools/list", None), &msg(json!(1), "tools/list", json!({})));
+            assert_eq!((a.status, a.header("www-authenticate")), (401, Some("Bearer error=\"invalid_token\"")));
+        }
+        assert_eq!(route(p, "GET", "/tokens_of?user=ana", &ana2, &[]).body, "[]");
+        // A token for someone the program names otherwise (`{ user }`), on a session with no
+        // user, and its `max_age`: one second, and it ends.
+        let anon = session_cookie(&support::send(p, "POST", "/anon", &[], ""));
+        let a = route(p, "POST", "/token_for?user=zo%C3%AB&age=1s", &anon, &[]);
+        assert_eq!(a.status, 200, "{}", a.body);
+        let short = As::Token(a.body.clone());
+        let r = call(p, &short, "whoami", json!({}));
+        assert_eq!(r["structuredContent"]["user"], Value::Null, "{}", r);
+        assert_eq!(call(p, &short, "mine", json!({}))["content"][0]["text"], json!("Log in first"));
+        let listed: Value = serde_json::from_str(&route(p, "GET", "/tokens_of?user=zo%C3%AB", &anon, &[]).body).unwrap();
+        assert_eq!((listed[0]["user"].clone(), listed[0]["expires"].as_i64().unwrap() - listed[0]["made"].as_i64().unwrap()), (json!("zoë"), 1000));
+        std::thread::sleep(Duration::from_millis(1300));
+        assert_eq!(post(p, &short, &mirrored("tools/list", None), &msg(json!(1), "tools/list", json!({}))).status, 401);
+        assert_eq!(route(p, "GET", "/tokens_of?user=zo%C3%AB", &anon, &[]).body, "[]");
+        // What `mcp_token` refuses, said (under --watch, on the page).
+        let said = |path: &str, cookie: &str| {
+            let a = route(p, "POST", path, cookie, &[]);
+            assert_eq!(a.status, 500, "{}: {}", path, a.body);
+            a.body
+        };
+        assert!(said("/token", "").contains("`mcp_token`: no one is signed in (`session().user` is null)"));
+        assert!(said("/token", &anon).contains("no one is signed in"));
+        let bob = login(p, "bob", &[]);
+        assert!(said("/token_bad/0", &bob).contains("`mcp_token` has no option `colour`: it takes `user` and `max_age`"));
+        assert!(said("/token_bad/1", &bob).contains("`mcp_token`'s max_age is seconds or a duration like \"30d\", got \"0s\""));
+        assert!(said("/token_bad/2", &bob).contains("got \"soon\""));
+        assert!(said("/token_bad/3", &bob).contains("`mcp_token` expects options as a map, got int"));
+        assert!(said("/revoke_bad", &bob).contains("`revoke_mcp_token` takes a token's id, as `mcp_tokens()` gives it, got int"));
+        // A tool cannot make one: a token is made where the user signs in.
+        let r = call(p, &As::Cookie(bob.clone()), "minting", json!({}));
+        assert_eq!(r["isError"], json!(true), "{}", r);
+        // Outside a session there are none to list.
+        assert_eq!(route(p, "GET", "/tokens", "", &[]).body, "[]");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    const LIFE_SRC: &str = r#"
+let bad = [{ colour: 1 }, { max_age: "0s" }, { max_age: "soon" }, 5]
+
+route POST /login ? { user: str } = set_session({ user: user })
+route POST /anon = set_session({ cart: [1] })
+route POST /token = mcp_token()
+route POST /token_for ? { user: str, age: str = "30d" } = mcp_token({ user: user, max_age: age })
+route POST /token_bad/:how(int) = mcp_token(bad[how])
+route GET /tokens = mcp_tokens()
+route GET /tokens_of ? { user: str } = mcp_tokens({ user: user })
+route POST /revoke ? { id: str } = str(revoke_mcp_token(id))
+route POST /revoke_of ? { id: str, user: str } = str(revoke_mcp_token(id, { user: user }))
+route POST /revoke_bad = revoke_mcp_token(json.parse("5"))
+route POST /logout = end_session()
+
+/// Who is calling.
+server fn mcp whoami() -> map with time = { user: session().user, mcp: request.mcp }
+
+/// Needs a login.
+fn mcp mine() -> str with time {
+    session().user ?? reply 401 "Log in first"
+}
+
+/// Sets a cookie.
+fn mcp sets() -> str with time {
+    set_cookie("seen", "1")
+    "set"
+}
+
+/// Tries to make a token.
+fn mcp minting() -> str with time = mcp_token()
+"#;
+
+    #[test]
+    fn c3_a_token_kept_in_the_programs_database() {
+        tokens_on("sqlite", "db.open(\":memory:\")");
+    }
+
+    #[test]
+    fn c3_a_token_kept_in_memory_without_a_database() {
+        tokens_on("memory", "");
+    }
+
+    #[test]
+    fn c3_a_token_kept_in_a_sqlite_file_lasts_a_restart_with_quillo_secret() {
+        // As a session does: the same key, the same store, the same token.
+        let d = dir("c3-restart", &format!("db.open(\"data.db\")\n{}", LIFE_SRC));
+        let mut s = support::serve_with(&d.join("main.qwe"), &[]);
+        let ana = login(s.port, "ana", &[]);
+        let t = As::Token(token(s.port, &ana, &[]));
+        assert_eq!(call(s.port, &t, "whoami", json!({}))["structuredContent"]["user"], json!("ana"));
+        s.kill();
+        let s = support::serve_with(&d.join("main.qwe"), &[]);
+        assert_eq!(call(s.port, &t, "whoami", json!({}))["structuredContent"]["user"], json!("ana"));
+        // What is kept is not the token: it is in no row.
+        drop(s);
+        let As::Token(text) = &t else { unreachable!() };
+        let files: Vec<PathBuf> = std::fs::read_dir(&d).unwrap().filter_map(|e| e.ok().map(|e| e.path())).filter(|f| f.file_name().is_some_and(|n| n.to_string_lossy().starts_with("data.db"))).collect();
+        assert!(!files.is_empty(), "no data.db in {}", d.display());
+        for f in files {
+            let kept = std::fs::read(&f).unwrap();
+            assert!(!kept.windows(20).any(|w| w == &text.as_bytes()[5..25]), "{} holds the token", f.display());
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn c3_a_token_kept_on_postgres() {
+        let Some(pg) = support::postgres("c3tokens") else { return };
+        tokens_on("postgres", &format!("db.open({:?})", pg.database("c3tokens")));
+    }
+
+    #[test]
+    fn c3_a_token_kept_on_mariadb() {
+        let Some(m) = support::mariadb("c3tokens") else { return };
+        tokens_on("mariadb", &format!("db.open({:?})", m.url("c3tokens")));
+    }
+
+    #[test]
+    fn c3_session_and_tenant_inside_a_tool_and_a_token_only_where_it_was_made() {
+        let (d, s) = door("tenant", &[]);
+        let p = s.port;
+        let acme = [("x-tenant", "acme")];
+        let ana = login(p, "ana", &acme);
+        let t = As::Token(token(p, &ana, &acme));
+        // In its tenant, by cookie and by token: the session's user and the tenant are the tool's.
+        let with = |who: &As, tenant: Option<&str>| {
+            let mut h = mirrored("tools/call", Some("whoami"));
+            if let Some(t) = tenant {
+                h.push(("x-tenant".into(), t.into()));
+            }
+            post(p, who, &h, &msg(json!(1), "tools/call", json!({ "name": "whoami" })))
+        };
+        for who in [As::Cookie(ana.clone()), t.clone()] {
+            let a = with(&who, Some("acme"));
+            assert_eq!(a.status, 200, "{}", a.body);
+            assert_eq!(json_of(&a)["result"]["structuredContent"], json!({ "user": "ana", "mcp": { "client": "quillo-test", "version": "1.2.3" }, "tenant": "acme" }));
+        }
+        // Another tenant, or none: neither the cookie nor the token is good there.
+        for tenant in [Some("globex"), None, Some("Acme")] {
+            assert_eq!(with(&As::Cookie(ana.clone()), tenant).status, 401, "{:?}", tenant);
+            let a = with(&t, tenant);
+            assert_eq!((a.status, a.header("www-authenticate")), (401, Some("Bearer error=\"invalid_token\"")), "{:?}", tenant);
+        }
+        // Nor are its tokens listed there.
+        let listed = |tenant: &[(&str, &str)]| route(p, "GET", "/tokens_of?user=ana", &ana, tenant).body;
+        assert_eq!(serde_json::from_str::<Value>(&listed(&acme)).unwrap().as_array().map(Vec::len), Some(1));
+        assert_eq!(listed(&[("x-tenant", "globex")]), "[]");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn c3_request_mcp_is_the_clients_and_null_elsewhere() {
+        let (d, s) = door("request-mcp", &[]);
+        let p = s.port;
+        let ana = login(p, "ana", &[]);
+        let who = As::Cookie(ana.clone());
+        let as_said = |info: Option<Value>| {
+            let mut m = json!({ "io.modelcontextprotocol/protocolVersion": V, "io.modelcontextprotocol/clientCapabilities": {} });
+            if let Some(i) = info {
+                m["io.modelcontextprotocol/clientInfo"] = i;
+            }
+            let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "whoami", "_meta": m } }).to_string();
+            let a = post(p, &who, &mirrored("tools/call", Some("whoami")), &body);
+            assert_eq!(a.status, 200, "{}", a.body);
+            json_of(&a)["result"]["structuredContent"]["mcp"].clone()
+        };
+        assert_eq!(as_said(Some(json!({ "name": "Claude Code", "version": "2.1.319" }))), json!({ "client": "Claude Code", "version": "2.1.319" }));
+        assert_eq!(as_said(Some(json!({ "name": "日本 ✓", "version": "" }))), json!({ "client": "日本 ✓", "version": "" }));
+        // Said as it was or not at all: null where it is not text.
+        assert_eq!(as_said(None), json!({ "client": null, "version": null }));
+        assert_eq!(as_said(Some(json!({ "name": 5, "version": ["1"] }))), json!({ "client": null, "version": null }));
+        assert_eq!(as_said(Some(json!("x"))), json!({ "client": null, "version": null }));
+        // The same function at /_quillo/rpc, and a route: null.
+        let rpc = support::send(p, "POST", "/_quillo/rpc/whoami", &[("Cookie", &ana)], "[]");
+        assert_eq!(rpc.status, 200, "{}", rpc.body);
+        assert_eq!(serde_json::from_str::<Value>(&rpc.body).unwrap()["ok"], json!({ "user": "ana", "mcp": null, "tenant": null }));
+        assert_eq!(support::send(p, "GET", "/here", &[], "").body, "null");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a2_a_server_fn_mcp_is_called_at_both_doors() {
+        let (d, s) = door("both", &[]);
+        let p = s.port;
+        let ana = login(p, "ana", &[]);
+        let who = As::Cookie(ana.clone());
+        for v in [json!(1), json!("é ✓"), json!([1, { "a": null }]), json!(null)] {
+            let rpc = support::send(p, "POST", "/_quillo/rpc/echo", &[("Cookie", &ana)], &json!([v]).to_string());
+            assert_eq!(serde_json::from_str::<Value>(&rpc.body).unwrap()["ok"], v, "{}", rpc.body);
+            let r = call(p, &who, "echo", json!({ "v": v }));
+            assert_eq!(r["content"][0]["text"].as_str().map(str::to_string), Some(if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() }), "{}", r);
+        }
+        // A plain `fn mcp` is the door's alone; a plain `server fn` the page's alone.
+        assert_eq!(support::send(p, "POST", "/_quillo/rpc/add", &[("Cookie", &ana)], "[\"x\"]").status, 404);
+        let (status, _, code, _) = refusal(&ask(p, &who, json!(1), "tools/call", json!({ "name": "plain_one" })));
+        assert_eq!((status, code), (400, -32602));
+        assert_eq!(support::send(p, "POST", "/_quillo/rpc/plain_one", &[], "[]").body, r#"{"ok":1}"#);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn c2_another_sites_page_cannot_drive_it() {
+        let (d, s) = door("cross-site", &[]);
+        let p = s.port;
+        let ana = login(p, "ana", &[]);
+        let who = As::Cookie(ana.clone());
+        let add = msg(json!(1), "tools/call", json!({ "name": "add", "arguments": { "text": "x" } }));
+        let count = || support::send(p, "GET", "/count", &[], "").body;
+        assert_eq!(count(), "0");
+        let with = |extra: &[(&str, &str)]| {
+            let mut h = mirrored("tools/call", Some("add"));
+            h.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            post(p, &who, &h, &add)
+        };
+        // Another site's `Origin`, or the browser saying so: 403, and nothing ran.
+        for extra in [&[("Origin", "https://evil.example")][..], &[("Origin", "http://localhost.evil.example")], &[("Origin", "null")], &[("Sec-Fetch-Site", "cross-site")], &[("Sec-Fetch-Site", "same-site")], &[("Sec-Fetch-Site", "cross-site"), ("Origin", "http://localhost")]] {
+            let a = with(extra);
+            assert_eq!(a.status, 403, "{:?}: {}", extra, a.body);
+            grants_nothing(&a);
+        }
+        assert_eq!(count(), "0");
+        // The preflight a page on another site has to make for these headers: refused, and nothing
+        // in it lets the browser go on. The same without an Origin (a client that is no browser):
+        // what the path takes, and still no grant.
+        let preflight = [("Origin", "https://evil.example"), ("Access-Control-Request-Method", "POST"), ("Access-Control-Request-Headers", "content-type, mcp-protocol-version, mcp-method, mcp-name, authorization")];
+        let a = support::send(p, "OPTIONS", "/_quillo/mcp", &preflight, "");
+        assert_eq!(a.status, 403, "{}", a.body);
+        grants_nothing(&a);
+        let a = support::send(p, "OPTIONS", "/_quillo/mcp", &preflight[1..], "");
+        assert_eq!((a.status, a.header("allow")), (204, Some("POST")));
+        grants_nothing(&a);
+        // What such a page can send without a preflight, a form or plain text with the cookie and
+        // none of the headers, runs nothing: 415; JSON without the headers, 400 HeaderMismatch.
+        for ctype in ["text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x"] {
+            let a = support::send(p, "POST", "/_quillo/mcp", &[("Cookie", &ana), ("Content-Type", ctype)], &add);
+            assert_eq!(a.status, 415, "{}", ctype);
+            grants_nothing(&a);
+        }
+        let a = support::send(p, "POST", "/_quillo/mcp", &[("Cookie", &ana)], &add);
+        assert_eq!(refusal(&a).2, -32020);
+        assert_eq!(count(), "0");
+        // The program's own page, and a client that is no browser: let in.
+        for extra in [&[("Origin", "http://localhost")][..], &[("Sec-Fetch-Site", "same-origin")], &[("Sec-Fetch-Site", "none")], &[]] {
+            let a = with(extra);
+            assert_eq!(a.status, 200, "{:?}: {}", extra, a.body);
+            grants_nothing(&a);
+        }
+        assert_eq!(count(), "4");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn c2_under_base_and_not_as_a_service_nor_without_tools() {
+        // `--base /shop`: the proxy in front takes `/shop` off, so the door is at `/_quillo/mcp`
+        // here; the session's cookie is the base's (`quillo_session`, `Path=/shop`), and a token is
+        // tied to it.
+        let (d, s) = door("base", &["--base", "/shop"]);
+        let p = s.port;
+        let a = support::send(p, "POST", "/login?user=ana", &[], "");
+        let line = a.headers.iter().find(|(k, v)| k == "set-cookie" && v.starts_with("quillo_session=")).map(|(_, v)| v.clone()).unwrap_or_else(|| panic!("{:?}", a.headers));
+        assert!(line.contains("Path=/shop"), "{}", line);
+        let ana = session_cookie(&a);
+        assert_eq!(call(p, &As::Cookie(ana.clone()), "whoami", json!({}))["structuredContent"]["user"], json!("ana"));
+        let t = As::Token(token(p, &ana, &[]));
+        assert_eq!(call(p, &t, "whoami", json!({}))["structuredContent"]["user"], json!("ana"));
+        // The prefixed path is the proxy's, as for every path under --base.
+        assert_eq!(support::send(p, "POST", "/shop/_quillo/mcp", &[("Cookie", &ana)], "{}").status, 404);
+        // A root server's cookie, signed with the same key, is no session under the base.
+        let (d2, root) = door("base-root", &[]);
+        let root_cookie = login(root.port, "ana", &[]);
+        let value = root_cookie.split_once('=').unwrap().1;
+        let a = post(p, &As::Cookie(format!("quillo_session={}", value)), &mirrored("tools/list", None), &msg(json!(1), "tools/list", json!({})));
+        assert_eq!(a.status, 401);
+        drop((s, root));
+        // `--as-service`: a service's tools are its app's; there is no door, as there is no rpc.
+        let s = support::serve_with(&d.join("main.qwe"), &["--as-service"]);
+        let a = post(s.port, &As::Nobody, &mirrored("tools/list", None), &msg(json!(1), "tools/list", json!({})));
+        assert_eq!(a.status, 404, "{}", a.body);
+        assert_eq!(support::send(s.port, "GET", "/_quillo/mcp", &[], "").status, 404);
+        drop(s);
+        // A program with no tools has no door either; its server fns are as they were.
+        let plain = dir("c2-no-tools", "server fn one() -> int = 1\nroute GET / = \"hi\"\n");
+        let s = support::serve_with(&plain.join("main.qwe"), &[]);
+        assert_eq!(post(s.port, &As::Nobody, &mirrored("tools/list", None), &msg(json!(1), "tools/list", json!({}))).status, 404);
+        assert_eq!(support::send(s.port, "POST", "/_quillo/rpc/one", &[], "[]").body, r#"{"ok":1}"#);
+        drop(s);
+        // Under --no-check the tools are read for the door all the same.
+        let s = support::serve_unchecked(&d.join("main.qwe"));
+        let ana = login(s.port, "ana", &[]);
+        let a = ask(s.port, &As::Cookie(ana), json!(1), "tools/list", json!({}));
+        assert_eq!(json_of(&a)["result"]["tools"].as_array().map(Vec::len), Some(6), "{}", a.body);
+        drop(s);
+        for x in [d, d2, plain] {
+            let _ = std::fs::remove_dir_all(&x);
+        }
+    }
+
+    /// `n` tool calls by `who`: how many were answered, and the last refusal's `Retry-After`.
+    fn calls(p: u16, who: &As, n: usize) -> (usize, Option<u64>) {
+        let (mut ok, mut wait) = (0, None);
+        for i in 0..n {
+            let a = ask(p, who, json!(i), "tools/call", json!({ "name": "echo", "arguments": { "v": i } }));
+            match a.status {
+                200 => ok += 1,
+                429 => {
+                    assert!(a.body.contains("too many tool calls: at most"), "{}", a.body);
+                    wait = a.header("retry-after").and_then(|w| w.parse().ok());
+                }
+                other => panic!("{}: {}", other, a.body),
+            }
+        }
+        (ok, wait)
+    }
+
+    #[test]
+    fn c4_tool_calls_are_limited_per_caller_with_retry_after() {
+        // The default: 60 a minute, the 61st refused, `Retry-After` the seconds until one leaves
+        // the minute.
+        let (d, s) = door("limit", &[]);
+        let p = s.port;
+        let ana = login(p, "ana", &[]);
+        let cookie = As::Cookie(ana.clone());
+        let (ok, wait) = calls(p, &cookie, 61);
+        assert_eq!(ok, 60);
+        assert!(wait.is_some_and(|w| (1..=60).contains(&w)), "{:?}", wait);
+        // Lists are no calls. A token of the same user, or a new sign-in, shares her minute (decided
+        // in review: it counted by the token and the session, each a fresh 60); another user has
+        // her own.
+        for i in 0..5 {
+            assert_eq!(ask(p, &cookie, json!(i), "tools/list", json!({})).status, 200);
+        }
+        let t = As::Token(token(p, &ana, &[]));
+        assert_eq!(calls(p, &t, 3).0, 0);
+        assert_eq!(calls(p, &As::Cookie(login(p, "ana", &[])), 3).0, 0);
+        let bob = login(p, "bob", &[]);
+        assert_eq!(calls(p, &As::Cookie(bob.clone()), 3), (3, None));
+        assert_eq!(calls(p, &As::Token(token(p, &bob, &[])), 3), (3, None));
+        // And the same user in another tenant is another user.
+        let acme = login(p, "ana", &[("x-tenant", "acme")]);
+        let mut h = mirrored("tools/call", Some("echo"));
+        h.push(("x-tenant".into(), "acme".into()));
+        let a = post(p, &As::Cookie(acme), &h, &msg(json!(1), "tools/call", json!({ "name": "echo", "arguments": { "v": 1 } })));
+        assert_eq!(a.status, 200, "{}", a.body);
+        drop(s);
+        // `--max-tool-calls`: the limit and one either side.
+        let s = support::serve_with(&d.join("main.qwe"), &["--max-tool-calls", "3"]);
+        let cookie = As::Cookie(login(s.port, "ana", &[]));
+        let (ok, wait) = calls(s.port, &cookie, 4);
+        assert_eq!(ok, 3);
+        assert!(wait.is_some_and(|w| (59..=60).contains(&w)), "{:?}", wait);
+        // A call refused is not counted, and the next is refused too.
+        let (ok, again) = calls(s.port, &cookie, 1);
+        assert_eq!(ok, 0);
+        assert!(again.is_some_and(|w| w <= wait.unwrap()), "{:?} after {:?}", again, wait);
+        drop(s);
+        let s = support::serve_with(&d.join("main.qwe"), &["--max-tool-calls", "1"]);
+        let cookie = As::Cookie(login(s.port, "ana", &[]));
+        assert_eq!(calls(s.port, &cookie, 2).0, 1);
+        drop(s);
+        // A policy narrows it, never widens.
+        let limits = d.join("limits.toml");
+        let limits = limits.to_str().unwrap();
+        std::fs::write(limits, "[limits]\nmax_tool_calls = 2\n").unwrap();
+        let s = support::serve_with(&d.join("main.qwe"), &["--max-tool-calls", "5", "--policy", limits]);
+        let cookie = As::Cookie(login(s.port, "ana", &[]));
+        assert_eq!(calls(s.port, &cookie, 4).0, 2);
+        drop(s);
+        std::fs::write(limits, "[limits]\nmax_tool_calls = 200\n").unwrap();
+        let s = support::serve_with(&d.join("main.qwe"), &["--max-tool-calls", "2", "--policy", limits]);
+        let cookie = As::Cookie(login(s.port, "ana", &[]));
+        assert_eq!(calls(s.port, &cookie, 3).0, 2);
+        drop(s);
+        // What is no limit is said.
+        for v in ["0", "-1", "x", ""] {
+            let (ok, _, err) = quillo(&d, &["run", "main.qwe", "--max-tool-calls", v]);
+            assert!(!ok && err.contains("--max-tool-calls needs a positive number"), "{:?}: {}", v, err);
+        }
+        for v in ["0", "-3", "\"60\""] {
+            std::fs::write(d.join("bad.toml"), format!("[limits]\nmax_tool_calls = {}\n", v)).unwrap();
+            let (ok, _, err) = quillo(&d, &["run", "main.qwe", "--policy", "bad.toml"]);
+            assert!(!ok && err.contains("max_tool_calls"), "{}: {}", v, err);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn c4_max_compute_holds_a_tool_call() {
+        let (d, s) = door("compute", &["--max-compute", "300ms"]);
+        let p = s.port;
+        let who = As::Cookie(login(p, "ana", &[]));
+        let began = Instant::now();
+        let r = call(p, &who, "spin", json!({}));
+        assert_eq!((r["isError"].clone(), r["content"][0]["text"].clone()), (json!(true), json!("internal error")), "{}", r);
+        assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
+        // The door goes on.
+        assert_eq!(call(p, &who, "whoami", json!({}))["structuredContent"]["user"], json!("ana"));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `quillo run` with `args` in `d`, its stderr read as it comes: the server, its port, and
+    /// what it has said so far.
+    fn watched(d: &Path, args: &[&str]) -> (support::Guard, u16, Arc<Mutex<String>>) {
+        let (guard, said) = logged(d, &[&["--port", "0"][..], args].concat());
+        let deadline = Instant::now() + WAIT;
+        let port = loop {
+            let text = said.lock().unwrap().clone();
+            if let Some(p) = text.split("listening on http://127.0.0.1:").nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()).and_then(|p| p.parse().ok()) {
+                break p;
+            }
+            assert!(Instant::now() < deadline, "did not start: {}", text);
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        while !support::listening(port) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (guard, port, said)
+    }
+
+    /// `quillo run main.qwe` with `args` in `d`, its stderr read as it comes.
+    fn logged(d: &Path, args: &[&str]) -> (support::Guard, Arc<Mutex<String>>) {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+            .args(["run", "main.qwe", "--workers", "8"])
+            .args(args)
+            .current_dir(d)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let err = child.stderr.take().unwrap();
+        let said = Arc::new(Mutex::new(String::new()));
+        let s = said.clone();
+        std::thread::spawn(move || {
+            for l in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                let mut s = s.lock().unwrap();
+                s.push_str(&l);
+                s.push('\n');
+            }
+        });
+        (support::Guard::new(child), said)
+    }
+
+    /// The token the door's line names, once it is said.
+    fn printed_token(said: &Arc<Mutex<String>>) -> (String, String) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let text = said.lock().unwrap().clone();
+            if let Some(line) = text.lines().find(|l| l.starts_with("quillo: MCP door for AI clients at ")) {
+                let url = line.split(" at ").nth(1).unwrap().split(',').next().unwrap().to_string();
+                let token = line.split("Bearer ").nth(1).unwrap().split(' ').next().unwrap().to_string();
+                assert!(text.contains(&format!("claude mcp add --transport http main {} --header \"Authorization: Bearer {}\"", url, token)), "{}", text);
+                return (url, token);
+            }
+            assert!(Instant::now() < deadline, "no token said: {}", text);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn c3_under_watch_on_127_0_0_1_a_token_is_printed() {
+        let d = dir("c3-watch", SRC);
+        let (g, port, said) = watched(&d, &["--watch"]);
+        let (url, t) = printed_token(&said);
+        assert_eq!(url, format!("http://127.0.0.1:{}/_quillo/mcp", port));
+        // It is a caller with no session: the program's own checks hold for it.
+        let dev = As::Token(t.clone());
+        assert_eq!(call(port, &dev, "whoami", json!({}))["structuredContent"]["user"], Value::Null);
+        assert_eq!(call(port, &dev, "mine", json!({}))["content"][0]["text"], json!("Log in first"));
+        assert_eq!(said.lock().unwrap().matches("quillo: MCP door for AI clients").count(), 1);
+        // Good while this runs, here alone: another server does not take it.
+        let d2 = dir("c3-watch-other", SRC);
+        let (g2, port2, said2) = watched(&d2, &["--watch", "--base", "/shop"]);
+        let (url2, t2) = printed_token(&said2);
+        // Under --base, the address this server answers at (its proxy takes /shop off), called.
+        assert_eq!(url2, format!("http://127.0.0.1:{}/_quillo/mcp", port2));
+        let path = url2.split_once(&format!("{}", port2)).unwrap().1;
+        let refs = mirrored("tools/call", Some("whoami"));
+        let mut h: Vec<(&str, &str)> = refs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let bearer = format!("Bearer {}", t2);
+        h.push(("Authorization", &bearer));
+        let a = support::send(port2, "POST", path, &h, &msg(json!(1), "tools/call", json!({ "name": "whoami" })));
+        assert_eq!(a.status, 200, "{}: {}", path, a.body);
+        assert_ne!(t, t2);
+        assert_eq!(post(port2, &dev, &mirrored("tools/list", None), &msg(json!(1), "tools/list", json!({}))).status, 401);
+        drop((g, g2));
+        // Not without --watch; nor with --watch for a program with no tools, until it has one.
+        let (g, _, said) = watched(&d, &[]);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!said.lock().unwrap().contains("MCP door"), "{}", said.lock().unwrap());
+        drop(g);
+        let routes = "route POST /login ? { user: str } = set_session({ user: user })\nroute POST /token = mcp_token()\n";
+        let none = dir("c3-watch-none", routes);
+        let (g, port, said) = watched(&none, &["--watch"]);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!said.lock().unwrap().contains("MCP door"));
+        // No tools, no door to make a token for.
+        let ana = login(port, "ana", &[]);
+        let a = route(port, "POST", "/token", &ana, &[]);
+        assert!(a.status == 500 && a.body.contains("`mcp_token`: this program has no tools (`fn mcp name(...)`)"), "{}", a.body);
+        std::fs::write(none.join("main.qwe"), format!("{}\n/// Seven.\nfn mcp seven() -> int with time = 7\n", routes)).unwrap();
+        let (url, t) = printed_token(&said);
+        assert_eq!(url, format!("http://127.0.0.1:{}/_quillo/mcp", port));
+        assert_eq!(call(port, &As::Token(t), "seven", json!({}))["structuredContent"], json!({ "result": 7 }));
+        // The reloaded program has its door: a token is made, and is good.
+        let made = token(port, &ana, &[]);
+        assert_eq!(call(port, &As::Token(made), "seven", json!({}))["structuredContent"], json!({ "result": 7 }));
+        drop(g);
+        // Outside a request (the top level), there is no session to stand for.
+        std::fs::write(none.join("top.qwe"), "/// Seven.\nfn mcp seven() -> int with time = 7\nmcp_token()\n").unwrap();
+        let (ok, _, err) = quillo(&none, &["run", "top.qwe", "--port", "0"]);
+        assert!(!ok && err.contains("`mcp_token` is made while a request is answered"), "{}", err);
+        for x in [d, d2, none] {
+            let _ = std::fs::remove_dir_all(&x);
+        }
+    }
+
+    /// The median of `f`'s time over `n` runs, in microseconds.
+    fn median_us(n: usize, mut f: impl FnMut()) -> f64 {
+        let mut t: Vec<f64> = (0..n)
+            .map(|_| {
+                let at = Instant::now();
+                f();
+                at.elapsed().as_secs_f64() * 1e6
+            })
+            .collect();
+        t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        t[n / 2]
+    }
+
+    #[test]
+    fn c2_a_tool_call_costs_about_what_an_rpc_call_costs() {
+        let (d, s) = door("cost", &["--max-tool-calls", "100000"]);
+        let p = s.port;
+        let ana = login(p, "ana", &[]);
+        let (cookie, t) = (As::Cookie(ana.clone()), As::Token(token(p, &ana, &[])));
+        let body = json!([{ "a": [1, 2, 3], "b": "é ✓" }]).to_string();
+        let rpc = || assert_eq!(support::send(p, "POST", "/_quillo/rpc/echo", &[("Cookie", &ana)], &body).status, 200);
+        let tool = |who: &As| assert_eq!(ask(p, who, json!(1), "tools/call", json!({ "name": "echo", "arguments": { "v": { "a": [1, 2, 3], "b": "é ✓" } } })).status, 200);
+        // Warm, then in turns, so that the machine's load falls on each alike.
+        for _ in 0..20 {
+            rpc();
+            tool(&cookie);
+            tool(&t);
+        }
+        let (mut r, mut c, mut k) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..5 {
+            r.push(median_us(60, rpc));
+            c.push(median_us(60, || tool(&cookie)));
+            k.push(median_us(60, || tool(&t)));
+        }
+        let mid = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let (r, c, k) = (mid(&mut r), mid(&mut c), mid(&mut k));
+        eprintln!("a call of `echo`, each a new connection, median of medians: /_quillo/rpc {:.0} µs, /_quillo/mcp with the cookie {:.0} µs, with a token {:.0} µs", r, c, k);
+        assert!(c < r * 2.0 + 1000.0 && k < r * 2.0 + 1000.0, "rpc {:.0} µs, door {:.0} µs (cookie) and {:.0} µs (token)", r, c, k);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- Slice 5, review (FEEDBACK56.md, Q-859 and Q-860, found in review; branch feedback56) ----
+
+    /// A program whose own routes can write the table of tokens, as SQL injection elsewhere, a
+    /// shared database role or a restored backup could; and say whether it is there.
+    const REVIEW_SRC: &str = r#"
+route POST /login ? { user: str } = set_session({ user: user })
+route POST /login_for ? { user: str, age: str } = set_session({ user: user }, { max_age: age })
+route POST /login_and_token ? { user: str, age: str } {
+    set_session({ user: user }, { max_age: age })
+    mcp_token()
+}
+route POST /token = mcp_token()
+route POST /token_for ? { user: str, age: str = "30d" } = mcp_token({ user: user, max_age: age })
+route GET /tokens = mcp_tokens()
+route GET /tokens_of ? { user: str } = mcp_tokens({ user: user })
+route POST /revoke ? { id: str } = str(revoke_mcp_token(id))
+route POST /revoke_of ? { id: str, user: str } = str(revoke_mcp_token(id, { user: user }))
+route POST /logout = end_session()
+route POST /forget = set_session(null)
+route POST /tamper ? { id: str, column: str, value: str } = str(db.exec(`update _quillo_mcp_tokens set ${column} = ? where id = ?`, value, id).changes)
+
+/// Who is calling.
+server fn mcp whoami() -> map with time = { user: session().user, tenant: tenant() }
+"#;
+
+    fn review_dir(name: &str, db_line: &str, more: &str) -> PathBuf {
+        dir(&format!("c3-review-{}", name), &format!("{}\ntenant_from((request) => request.headers[\"x-tenant\"])\n{}{}", db_line, REVIEW_SRC, more))
+    }
+
+    /// `s` percent-encoded for a query string.
+    fn enc(s: &str) -> String {
+        s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
+    }
+
+    fn listed(p: u16, path: &str, cookie: &str) -> Vec<Value> {
+        let a = route(p, "GET", path, cookie, &[]);
+        assert_eq!(a.status, 200, "{}", a.body);
+        serde_json::from_str::<Value>(&a.body).unwrap().as_array().unwrap().clone()
+    }
+
+    fn list_status(p: u16, who: &As) -> u16 {
+        post(p, who, &mirrored("tools/list", None), &msg(json!(1), "tools/list", json!({}))).status
+    }
+
+    #[test]
+    fn c3_review_a_tokens_row_is_sealed_as_a_cookie_is() {
+        let d = review_dir("sealed", "db.open(\":memory:\")", "");
+        let s = support::serve_with(&d.join("main.qwe"), &[]);
+        let p = s.port;
+        let ana = login(p, "ana", &[]);
+        let bob = login(p, "bob", &[]);
+        let bob_t = token(p, &bob, &[]);
+        let bob_row = listed(p, "/tokens", &bob)[0].clone();
+        // Each thing a row decides, changed by whoever can write the table: the token is no good,
+        // and is listed nowhere. Without the seal, the first made Ana's token Bob's admin.
+        for (column, value) in [
+            ("session", r#"{"user":"admin"}"#.to_string()),
+            ("who", "\"admin\"".to_string()),
+            ("expires", "99999999999999".to_string()),
+            ("made", "1".to_string()),
+            ("place", "[\"\",\"acme\"]".to_string()),
+            ("owner", "id 00000000000000000000000000000000".to_string()),
+            ("id", bob_row["id"].as_str().unwrap().to_string()),
+            ("seal", "x".to_string()),
+        ] {
+            let t = token(p, &ana, &[]);
+            let id = listed(p, "/tokens", &ana).last().unwrap()["id"].as_str().unwrap().to_string();
+            assert_eq!(call(p, &As::Token(t.clone()), "whoami", json!({}))["structuredContent"]["user"], json!("ana"));
+            let changed = route(p, "POST", &format!("/tamper?id={}&column={}&value={}", id, column, enc(&value)), &ana, &[]);
+            assert_eq!(changed.body, "1", "{}: {}", column, changed.body);
+            let a = post(p, &As::Token(t), &mirrored("tools/call", Some("whoami")), &msg(json!(1), "tools/call", json!({ "name": "whoami" })));
+            assert_eq!((a.status, a.header("www-authenticate")), (401, Some("Bearer error=\"invalid_token\"")), "{}: {}", column, a.body);
+            assert!(!route(p, "GET", "/tokens_of?user=admin", &ana, &[]).body.contains(&id), "{}", column);
+            assert!(!route(p, "GET", "/tokens", &ana, &[]).body.contains(&id), "{}", column);
+        }
+        // A row left as it was is good, Bob's among them.
+        assert_eq!(call(p, &As::Token(bob_t), "whoami", json!({}))["structuredContent"]["user"], json!("bob"));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Whether the table of tokens is there, by a route that asks SQLite.
+    const TABLE_ROUTE: &str = "route GET /table = str(len(db.query(\"select name from sqlite_master where name = '_quillo_mcp_tokens'\")))\n";
+
+    #[test]
+    fn c3_review_logout_and_strangers_never_make_the_table() {
+        let d = review_dir("no-table", "db.open(\"data.db\")", TABLE_ROUTE);
+        let (g, p, said) = watched(&d, &[]);
+        let table = || support::send(p, "GET", "/table", &[], "").body;
+        let ana = login(p, "ana", &[]);
+        // A stranger's token, again and again: 401, nothing made, nothing logged but the request.
+        for _ in 0..3 {
+            assert_eq!(list_status(p, &As::Token("qmcp_strangerstrangerstrangerstrangerstrange".into())), 401);
+        }
+        assert_eq!(table(), "0");
+        // Listing, revoking, logging out, a session set to null: no tokens, nothing made.
+        assert_eq!(route(p, "GET", "/tokens", &ana, &[]).body, "[]");
+        assert_eq!(route(p, "GET", "/tokens_of?user=ana", &ana, &[]).body, "[]");
+        assert_eq!(route(p, "POST", "/revoke?id=x", &ana, &[]).body, "false");
+        assert_eq!(route(p, "POST", "/logout", &ana, &[]).status, 204);
+        let bob = login(p, "bob", &[]);
+        assert_eq!(route(p, "POST", "/forget", &bob, &[]).status, 204);
+        assert_eq!(table(), "0");
+        // `mcp_token()` makes it, once.
+        let ana = login(p, "ana", &[]);
+        let t = As::Token(token(p, &ana, &[]));
+        assert_eq!(table(), "1");
+        assert_eq!(list_status(p, &t), 200);
+        let text = said.lock().unwrap().clone();
+        assert!(!text.contains("cannot read its tokens") && !text.contains("error"), "{}", text);
+        drop(g);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn c3_review_a_database_that_cannot_make_the_table_fails_mcp_token_alone() {
+        // A SQLite database that takes no writes: `mcp_token()` says why, and a logout and a
+        // stranger's token are as without the table.
+        let d = review_dir("read-only", "db.open(\"ro.db\")\ndb.exec(\"pragma query_only = 1\")", "");
+        let (g, p, said) = watched(&d, &["--watch"]);
+        let ana = login(p, "ana", &[]);
+        let a = route(p, "POST", "/token", &ana, &[]);
+        assert_eq!(a.status, 500, "{}", a.body);
+        assert!(a.body.contains("`mcp_token`: the token could not be kept: its table, _quillo_mcp_tokens, could not be made") && a.body.contains("needs the right to create a table there"), "{}", a.body);
+        assert_eq!(list_status(p, &As::Token("qmcp_x".into())), 401);
+        assert_eq!(route(p, "POST", "/logout", &ana, &[]).status, 204);
+        assert!(!said.lock().unwrap().contains("cannot read its tokens"));
+        drop(g);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn c3_review_on_postgres_a_logout_in_a_transaction_and_a_role_that_cannot_create() {
+        let Some(pg) = support::postgres("c3review") else { return };
+        let url = pg.database("c3review");
+        // A logout inside the program's transaction, with no table of tokens: the transaction goes
+        // on and commits (an error would have aborted it on PostgreSQL).
+        let more = "db.exec(\"create table if not exists notes (text text)\")\n\
+                    route POST /logout_in_tx = db.transaction(() => {\n    end_session()\n    db.exec(\"insert into notes (text) values ('kept')\")\n})\n\
+                    route GET /notes = str(db.one(\"select count(*) as n from notes\").n)\n\
+                    route GET /table = str(db.one(\"select count(*) as n from information_schema.tables where table_name = '_quillo_mcp_tokens'\").n)\n\
+                    route POST /role = db.exec(\"create role reader login\")\n";
+        let d = review_dir("pg", &format!("db.open({:?})", url), more);
+        let s = support::serve_with(&d.join("main.qwe"), &[]);
+        let p = s.port;
+        let ana = login(p, "ana", &[]);
+        let a = route(p, "POST", "/logout_in_tx", &ana, &[]);
+        assert_eq!(a.status, 200, "{}", a.body);
+        assert_eq!(support::send(p, "GET", "/notes", &[], "").body, "1");
+        assert_eq!(support::send(p, "GET", "/table", &[], "").body, "0");
+        // With the table there, inside a transaction too: the tokens end.
+        let ana = login(p, "ana", &[]);
+        let t = As::Token(token(p, &ana, &[]));
+        assert_eq!(route(p, "POST", "/logout_in_tx", &ana, &[]).status, 200);
+        assert_eq!(list_status(p, &t), 401);
+        assert_eq!(support::send(p, "GET", "/notes", &[], "").body, "2");
+        assert_eq!(route(p, "POST", "/role", "", &[]).status, 200);
+        drop(s);
+        // A role that may not create a table in the schema: `mcp_token()` fails, saying so; a
+        // stranger's token is 401, with no line in the log, and a logout works.
+        let reader = pg.database("c3reader").replace("quillo@", "reader@");
+        let d2 = review_dir("pg-reader", &format!("db.open({:?})", reader), "");
+        let (g, p, said) = watched(&d2, &["--watch"]);
+        let ana = login(p, "ana", &[]);
+        let a = route(p, "POST", "/token", &ana, &[]);
+        assert_eq!(a.status, 500, "{}", a.body);
+        assert!(a.body.contains("its table, _quillo_mcp_tokens, could not be made") && a.body.contains("permission denied"), "{}", a.body);
+        for _ in 0..3 {
+            assert_eq!(list_status(p, &As::Token("qmcp_x".into())), 401);
+        }
+        assert_eq!(route(p, "POST", "/logout", &ana, &[]).status, 204);
+        assert!(!said.lock().unwrap().contains("cannot read its tokens"), "{}", said.lock().unwrap());
+        drop(g);
+        for x in [d, d2] {
+            let _ = std::fs::remove_dir_all(&x);
+        }
+    }
+
+    #[test]
+    fn c3_review_end_session_ends_tokens_while_the_door_is_closed() {
+        // Under --watch a version without tools has no door; a logout there still ends the
+        // session's tokens, and they stay ended when the tools come back.
+        let with_tools = format!("db.open(\"data.db\")\n{}", LIFE_SRC);
+        let d = dir("c3-review-closed", &with_tools);
+        let (g, p, said) = watched(&d, &["--watch"]);
+        let reloads = |n: usize| {
+            let deadline = Instant::now() + WAIT;
+            while said.lock().unwrap().matches("quillo: reloaded").count() < n {
+                assert!(Instant::now() < deadline, "no reload: {}", said.lock().unwrap());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let ana = login(p, "ana", &[]);
+        let t = As::Token(token(p, &ana, &[]));
+        assert_eq!(list_status(p, &t), 200);
+        let without: String = with_tools.lines().filter(|l| !l.contains("fn mcp") && !l.starts_with("    ") && !l.starts_with('}') && !l.starts_with("///")).map(|l| format!("{}\n", l)).collect();
+        std::fs::write(d.join("main.qwe"), &without).unwrap();
+        reloads(1);
+        assert_eq!(list_status(p, &t), 404);
+        assert_eq!(route(p, "POST", "/logout", &ana, &[]).status, 204);
+        std::fs::write(d.join("main.qwe"), &with_tools).unwrap();
+        reloads(2);
+        assert_eq!(list_status(p, &t), 401);
+        drop(g);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn c3_review_a_token_lasts_as_its_session_and_is_found_after_the_cookie() {
+        let d = review_dir("life", "db.open(\":memory:\")", "");
+        let s = support::serve_with(&d.join("main.qwe"), &[]);
+        let p = s.port;
+        let life = |cookie: &str| {
+            let t = listed(p, "/tokens", cookie);
+            let last = t.last().unwrap();
+            last["expires"].as_i64().unwrap() - last["made"].as_i64().unwrap()
+        };
+        let near = |got: i64, want: i64| assert!((want - 5_000..=want).contains(&got), "{} ms, not about {} ms", got, want);
+        // A session of the default 30 days: a token of 30 days from now.
+        let ana = login(p, "ana", &[]);
+        token(p, &ana, &[]);
+        assert_eq!(life(&ana), 30 * 86_400 * 1000);
+        // A session the program gave a `max_age`: as long as it has left, from its cookie or set
+        // in the same request; `mcp_token`'s own `max_age` wins; at most 366 days.
+        let bob = session_cookie(&support::send(p, "POST", "/login_for?user=bob&age=1h", &[], ""));
+        token(p, &bob, &[]);
+        near(life(&bob), 3_600_000);
+        let a = support::send(p, "POST", "/login_and_token?user=cy&age=10m", &[], "");
+        assert_eq!(a.status, 200, "{}", a.body);
+        near(life(&session_cookie(&a)), 600_000);
+        assert_eq!(route(p, "POST", "/token_for?user=bob&age=2h", &bob, &[]).status, 200);
+        // (Two made in the same millisecond are listed by their ids: the new one is looked for.)
+        let lives: Vec<i64> = listed(p, "/tokens", &bob).iter().map(|t| t["expires"].as_i64().unwrap() - t["made"].as_i64().unwrap()).collect();
+        assert_eq!(lives.len(), 2);
+        assert!(lives.contains(&7_200_000), "{:?}", lives);
+        let dee = session_cookie(&support::send(p, "POST", "/login_for?user=dee&age=800d", &[], ""));
+        token(p, &dee, &[]);
+        assert_eq!(life(&dee), 366 * 86_400 * 1000);
+        // Its cookie gone (a second), the user signs in again: her token is listed and revoked
+        // from the new session, and its id is no other user's to take.
+        let eve = session_cookie(&support::send(p, "POST", "/login_for?user=eve&age=1s", &[], ""));
+        let a = route(p, "POST", "/token_for?user=eve&age=1h", &eve, &[]);
+        let t = As::Token(a.body.clone());
+        let id = listed(p, "/tokens", &eve)[0]["id"].as_str().unwrap().to_string();
+        std::thread::sleep(Duration::from_millis(1300));
+        assert_eq!(route(p, "GET", "/tokens", &eve, &[]).body, "[]");
+        let eve2 = login(p, "eve", &[]);
+        assert_eq!(listed(p, "/tokens", &eve2).len(), 1);
+        assert_eq!(route(p, "POST", &format!("/revoke?id={}", id), &ana, &[]).body, "false");
+        assert_eq!(list_status(p, &t), 200);
+        assert_eq!(route(p, "POST", &format!("/revoke?id={}", id), &eve2, &[]).body, "true");
+        assert_eq!(list_status(p, &t), 401);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Users told apart exactly on `db_line`'s database, whatever its collation takes for the same.
+    fn exact_on(name: &str, db_line: &str) {
+        let d = review_dir(name, db_line, "");
+        let s = support::serve_with(&d.join("main.qwe"), &[]);
+        let p = s.port;
+        let ana = login(p, "ana", &[]);
+        let upper = login(p, "ANA", &[]);
+        token(p, &ana, &[]);
+        token(p, &upper, &[]);
+        let zoe = route(p, "POST", "/token_for?user=zo%C3%AB", &ana, &[]);
+        assert_eq!(zoe.status, 200, "{}", zoe.body);
+        let users = |path: &str, cookie: &str| listed(p, path, cookie).iter().map(|t| t["user"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(users("/tokens_of?user=ana", &ana), ["ana"]);
+        assert_eq!(users("/tokens_of?user=ANA", &ana), ["ANA"]);
+        assert_eq!(users("/tokens_of?user=zoe", &ana), Vec::<String>::new());
+        assert_eq!(users("/tokens_of?user=Ana", &ana), Vec::<String>::new());
+        // The session's own: made in it (zoë's too) or for its user, not for `ANA`.
+        let mut own = users("/tokens", &ana);
+        own.sort();
+        assert_eq!(own, ["ana", "zoë"]);
+        assert_eq!(users("/tokens", &upper), ["ANA"]);
+        let zoe_id = listed(p, "/tokens_of?user=zo%C3%AB", &ana)[0]["id"].as_str().unwrap().to_string();
+        assert_eq!(route(p, "POST", &format!("/revoke_of?id={}&user=zoe", zoe_id), &ana, &[]).body, "false");
+        assert_eq!(route(p, "POST", &format!("/revoke?id={}", zoe_id), &upper, &[]).body, "false");
+        assert_eq!(route(p, "POST", &format!("/revoke_of?id={}&user=zo%C3%AB", zoe_id), &ana, &[]).body, "true");
+        // A logout ends its own session's alone.
+        assert_eq!(route(p, "POST", "/logout", &ana, &[]).status, 204);
+        assert_eq!(users("/tokens_of?user=ANA", &upper), ["ANA"]);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn c3_review_users_are_told_apart_exactly_on_sqlite() {
+        exact_on("exact-sqlite", "db.open(\":memory:\")");
+    }
+
+    #[test]
+    fn c3_review_users_are_told_apart_exactly_on_mariadb() {
+        let Some(m) = support::mariadb("c3exact") else { return };
+        exact_on("exact-mariadb", &format!("db.open({:?})", m.url("c3exact")));
+    }
+
+    #[test]
+    fn c3_review_under_watch_the_token_is_said_once_a_failed_first_load_is_fixed() {
+        // A first load that fails says no address (as before this slice): the port is named here.
+        let d = dir("c3-review-late", "route GET / = \"hi\"\n/// Seven.\nfn mcp seven() -> int with time = 7 +\n");
+        let p = support::free_port();
+        let (g, said) = logged(&d, &["--watch", "--port", &p.to_string()]);
+        let deadline = Instant::now() + WAIT;
+        while !support::listening(p) {
+            assert!(Instant::now() < deadline, "did not start: {}", said.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!said.lock().unwrap().contains("MCP door"));
+        std::fs::write(d.join("main.qwe"), "route GET / = \"hi\"\n/// Seven.\nfn mcp seven() -> int with time = 7\n").unwrap();
+        let (url, t) = printed_token(&said);
+        assert_eq!(url, format!("http://127.0.0.1:{}/_quillo/mcp", p));
+        assert_eq!(call(p, &As::Token(t), "seven", json!({}))["structuredContent"], json!({ "result": 7 }));
+        drop(g);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// MCP's own TypeScript client (`@modelcontextprotocol/client` 2.4.0, the SDK's v2) over
+    /// HTTP, installed into the test's folder: pinned to 2026-07-28 and negotiating, with a
+    /// token; as a client of 2025-11-25; and with no token. Skipped only where npm is not found
+    /// or the package cannot be installed; a client that does not end in time fails the test.
+    #[test]
+    fn c2_the_official_typescript_client_drives_it_over_http() {
+        let (d, s) = door("sdk", &[]);
+        let p = s.port;
+        let ana = login(p, "ana", &[]);
+        let t = token(p, &ana, &[]);
+        let script = r#"const { Client, StreamableHTTPClientTransport } = require("@modelcontextprotocol/client");
+(async () => {
+  const [url, token] = process.argv.slice(2);
+  const out = {};
+  for (const mode of ["pin", "auto", "legacy", "none"]) {
+    const opts = mode === "legacy" ? {} : { versionNegotiation: { mode: mode === "auto" ? "auto" : { pin: "2026-07-28" } } };
+    const client = new Client({ name: "quillo-test", version: "1.0.0" }, opts);
+    const headers = mode === "none" ? {} : { Authorization: `Bearer ${token}` };
+    const transport = new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers } });
+    const r = {};
+    try {
+      await client.connect(transport);
+      r.protocol = client.getNegotiatedProtocolVersion();
+      r.tools = (await client.listTools()).tools.map((t) => t.name);
+      r.who = await client.callTool({ name: "whoami", arguments: {} });
+      r.add = await client.callTool({ name: "add", arguments: { text: "é ✓" } });
+      r.mine = await client.callTool({ name: "mine", arguments: {} });
+      try { await client.callTool({ name: "nope", arguments: {} }); } catch (e) { r.unknown = e.code; }
+    } catch (e) {
+      r.failed = { code: e.code, message: String(e.message) };
+    }
+    try { await client.close(); } catch (e) {}
+    out[mode] = r;
+  }
+  console.log(JSON.stringify(out));
+})();
+"#;
+        std::fs::write(d.join("client.cjs"), script).unwrap();
+        std::fs::write(d.join("package.json"), r#"{"name":"quillo-c2-sdk","private":true}"#).unwrap();
+        if Command::new("npm").arg("--version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_err() {
+            let _ = std::fs::remove_dir_all(&d);
+            eprintln!("skipped: c2_the_official_typescript_client_drives_it_over_http, as npm was not found");
+            return;
+        }
+        match run_for(&d, "npm install --no-audit --no-fund --ignore-scripts @modelcontextprotocol/client@2.4.0", 240) {
+            Ok(o) if o.status.success() => {}
+            failed => {
+                let _ = std::fs::remove_dir_all(&d);
+                let why = failed.map_or_else(|e| e, |o| String::from_utf8_lossy(&o.stderr).into_owned());
+                eprintln!("skipped: c2_the_official_typescript_client_drives_it_over_http, as npm could not install @modelcontextprotocol/client@2.4.0: {}", why);
+                return;
+            }
+        }
+        let ran = run_for(&d, &format!("node client.cjs http://127.0.0.1:{}/_quillo/mcp {}", p, t), 120);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+        let o = ran.unwrap_or_else(|e| panic!("the client: {}", e));
+        let (stdout, stderr) = (String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned());
+        assert!(o.status.success(), "the client failed: {}\n{}", stdout, stderr);
+        let said: Value = stdout.lines().last().and_then(|l| serde_json::from_str(l).ok()).unwrap_or_else(|| panic!("the client said no JSON: {}\n{}", stdout, stderr));
+        for (mode, count) in [("pin", 1), ("auto", 2)] {
+            let r = &said[mode];
+            assert!(r.get("failed").is_none(), "{}: {}", mode, said);
+            assert_eq!(r["protocol"], json!(V));
+            assert_eq!(r["tools"], json!(["whoami", "add", "mine", "sets", "echo", "spin"]));
+            // The client checks each `structuredContent` against the tool's `outputSchema`.
+            assert_eq!(r["who"]["structuredContent"], json!({ "user": "ana", "mcp": { "client": "quillo-test", "version": "1.0.0" }, "tenant": null }), "{}", r);
+            assert_eq!(r["add"]["structuredContent"], json!({ "result": count }), "{}", r);
+            assert_eq!(r["mine"]["structuredContent"], json!({ "result": "ana" }));
+            assert_eq!(r["unknown"], json!(-32602));
+        }
+        // A client of 2025-11-25, the SDK's default: refused at `initialize` with the version
+        // error; with no token, told the door needs one.
+        assert!(said["legacy"]["failed"]["message"].as_str().is_some_and(|m| m.contains("-32022")), "{}", said);
+        assert!(said["none"]["failed"]["message"].as_str().is_some_and(|m| m.contains("401")), "{}", said);
+    }
+}

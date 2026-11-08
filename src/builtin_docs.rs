@@ -126,6 +126,10 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("session", "", "The session as a map, `{}` when there is none."),
     ("set_session", "data, options", "Replaces the session, for 30 days unless `max_age` says; null ends it. The browser can read it."),
     ("end_session", "", "Forgets the session and removes its cookie; a copy someone kept stays valid until it expires."),
+    // The MCP door's tokens (FEEDBACK56.md, Q-859; branch feedback56)
+    ("mcp_token", "options", "A token for `/_quillo/mcp`, tied to this session and given once; `user` and `max_age` (30 days) as options."),
+    ("mcp_tokens", "options", "The session's MCP tokens, or `{ user }`'s: `{ id, user, made, expires }` each, never the token."),
+    ("revoke_mcp_token", "id, options", "Ends the session's MCP token of that id, or one made for `{ user }`; whether there was one."),
     // Translations
     ("translations", "dir, options", "Loads `<dir>/<locale>.json`, or takes a map of locales; `{ default }` names the default."),
     ("locale_from", "f", "Sets how a request's locale is found: `f` gets the request, and null means the usual way."),

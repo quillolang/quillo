@@ -178,7 +178,7 @@ fn match_path(def: &[Seg], segs: &[String]) -> Option<Vec<(String, Value)>> {
 
 /// The media type of a content-type header, without its parameters:
 /// "Application/JSON; charset=utf-8" is "application/json".
-fn essence(ctype: &str) -> String {
+pub(crate) fn essence(ctype: &str) -> String {
     ctype.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
 }
 
@@ -191,7 +191,7 @@ fn is_json_type(ctype: &str) -> bool {
 /// Whether a request was sent by a page on another site. Browsers say so in
 /// `Sec-Fetch-Site`; older ones only send `Origin`, which then has to name
 /// the host the request was sent to.
-fn cross_site(req: &HttpRequest) -> bool {
+pub(crate) fn cross_site(req: &HttpRequest) -> bool {
     let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim());
     if let Some(site) = header("sec-fetch-site") {
         return !matches!(site.to_ascii_lowercase().as_str(), "same-origin" | "none");
@@ -303,7 +303,7 @@ pub(crate) fn cookie_pair(part: &str) -> Option<(&str, &str)> {
     Some((k.trim(), v))
 }
 
-fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map {
+pub(crate) fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map {
     let header = |name: &str| {
         req.headers.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()).unwrap_or("")
     };
@@ -421,6 +421,7 @@ impl Interp {
         self.set_cookies.clear();
         self.session = None;
         self.session_id = None;
+        self.session_ends = None;
         self.visitor_read = false;
         self.locale_read = false;
         self.locale = None;
@@ -1416,6 +1417,10 @@ impl Interp {
                 Err(Ctrl::Error(e)) => rpc_error(400, &e.msg),
                 Err(_) => rpc_error(500, "markdown failed"),
             };
+        }
+        // The program's tools for AI clients, MCP over HTTP (FEEDBACK56.md, C.2; branch feedback56).
+        if rest == "mcp" {
+            return crate::mcp::serve_http(self, req, path);
         }
         let Some(name) = rest.strip_prefix("rpc/") else {
             return plain(404, "not found\n");
@@ -2580,6 +2585,9 @@ impl App {
     /// has just loaded and said (FEEDBACK55.md, Q-841; branch feedback55).
     fn reload_saying(&self, say: bool) -> bool {
         let mut problems = String::new();
+        // The program's tools, as the checker read them, for its MCP door (FEEDBACK56.md, C.2;
+        // branch feedback56).
+        let mut tools = None;
         let (_, mut tried) = crate::error::noting_reads(|| {
             if self.static_check {
                 let analysis = crate::check::check_file(&self.main_file);
@@ -2587,6 +2595,7 @@ impl App {
                     eprintln!("{}", d);
                 }
                 problems = analysis.errors().map(|d| d.to_string()).collect::<Vec<_>>().join("\n");
+                tools = Some(crate::mcp::tools(&analysis));
             }
         });
         // Said once: the checker's lines above are the errors (FEEDBACK55.md, Q-852; branch
@@ -2632,6 +2641,7 @@ impl App {
                 if let Loaded::Ready(old) = &*slot.1 {
                     retire(old);
                 }
+                crate::mcp::open_door(&mut it, &self.main_file, tools);
                 let loaded = Arc::new(Loaded::Ready(it));
                 warm_client(&loaded);
                 *slot = (slot.0 + 1, loaded);
@@ -3663,6 +3673,15 @@ fn serve_from(
     }
     if app.watch {
         eprintln!("quillo: watching for changes");
+        // The MCP door's token, on this machine alone (FEEDBACK56.md, C.3; branch feedback56).
+        // Where this server answers, also when the first load failed (found in review).
+        if let Some(a) = bound.filter(|a| a.ip() == std::net::Ipv4Addr::LOCALHOST && a.port() != 0) {
+            let current = app.current().1;
+            crate::mcp::dev_door(format!("http://127.0.0.1:{}", a.port()), match &*current {
+                Loaded::Ready(it) => Some(it),
+                Loaded::Failed(_) => None,
+            });
+        }
     }
     SHOW_ERRORS.store(app.watch, std::sync::atomic::Ordering::Relaxed);
     crate::value::HIDING.store(!app.watch, std::sync::atomic::Ordering::Relaxed);

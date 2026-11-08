@@ -2350,6 +2350,44 @@ fn later_table(it: &mut Interp, on: Option<usize>) -> bool {
     matches!(exec_on(it, on, vec![Value::str(sql)]), Ok(Value::Map(_)))
 }
 
+/// Whether Quillo's own table `table` is there on connection `on`, asked of the database's
+/// catalog: a question that cannot fail for the table's not being there, so a program's
+/// transaction on PostgreSQL, which gives up at any error, goes on; and nothing is made
+/// (FEEDBACK56.md, Q-859, found in review; branch feedback56). PostgreSQL resolves the name as an
+/// unqualified statement would, by its search path.
+pub(crate) fn own_table_there(it: &mut Interp, on: Option<usize>, table: &str) -> Result<bool, String> {
+    let b = backend_on(it, on)?;
+    let q = match b.dialect() {
+        crate::sql::Dialect::Sqlite => "select 1 as n from sqlite_master where type = 'table' and name = ?",
+        crate::sql::Dialect::Postgres => "select 1 as n where to_regclass(?) is not null",
+        crate::sql::Dialect::Mysql => "select 1 as n from information_schema.tables where table_schema = database() and table_name = ?",
+    };
+    match query_on(it, on, vec![Value::str(q), Value::str(table)]) {
+        Ok(Value::List(l)) => Ok(!l.is_empty()),
+        Ok(Value::Err(e, _, _)) => Err(e.display()),
+        Ok(_) => Ok(false),
+        Err(Ctrl::Error(e)) => Err(e.msg.clone()),
+        Err(_) => Err("the question was stopped".into()),
+    }
+}
+
+/// Makes one of Quillo's own tables with `sql`: on MySQL and MariaDB on a connection of its own,
+/// as they commit a program's open transaction before a `create table` (see `later_table`); on
+/// the others in place, where it is part of the transaction (FEEDBACK56.md, Q-859; branch
+/// feedback56).
+pub(crate) fn own_table_make(it: &mut Interp, on: Option<usize>, sql: &str) -> Result<(), String> {
+    let b = backend_on(it, on)?;
+    if b.is_mysql() {
+        return apart(it, &b, sql.into(), Vec::new()).map(|_| ());
+    }
+    match exec_on(it, on, vec![Value::str(sql)]) {
+        Ok(Value::Err(e, _, _)) => Err(e.display()),
+        Ok(_) => Ok(()),
+        Err(Ctrl::Error(e)) => Err(e.msg.clone()),
+        Err(_) => Err("the statement was stopped".into()),
+    }
+}
+
 /// A statement on one of Quillo's tables, made the first time it is missing.
 /// Not for a program's transaction: PostgreSQL gives up on one at the error.
 fn on_own_table(it: &mut Interp, on: Option<usize>, table: &str, make: &str, args: Vec<Value>) -> bool {

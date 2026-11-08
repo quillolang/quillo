@@ -348,6 +348,10 @@ pub struct Door {
     /// The longest message taken, in bytes: `MOST`, or less where a policy's `max_body` says so,
     /// as it holds `quillo run`'s request bodies (found in review).
     pub most: usize,
+    /// The door at `/_quillo/mcp`: a tool runs in the request the door made for its caller, its
+    /// session, tenant and `request` that one's, where on stdio it runs for no one (FEEDBACK56.md,
+    /// C.2 and Q-859; branch feedback56).
+    pub over_http: bool,
 }
 
 /// An error answered in place of a result.
@@ -370,6 +374,18 @@ fn error_message(id: Option<&J>, f: Fault) -> J {
     match id {
         Some(id) => json!({ "jsonrpc": "2.0", "id": id, "error": e }),
         None => json!({ "jsonrpc": "2.0", "error": e }),
+    }
+}
+
+/// A message as the door reads one, as deep as every reader of JSON takes it
+/// (`value::json_value`): an object, else the error to answer with. `one` says how many a
+/// message carries: JSON-RPC's batches left MCP in 2025-06-18.
+fn message_of(text: &[u8], one: &str) -> Result<Map<String, J>, J> {
+    match crate::value::json_value(text) {
+        Ok(J::Object(m)) => Ok(m),
+        Ok(J::Array(_)) => Err(error_message(None, fault(INVALID_REQUEST, format!("Invalid request: {}, not a batch", one)))),
+        Ok(_) => Err(error_message(None, fault(INVALID_REQUEST, "Invalid request: a message is a JSON object"))),
+        Err(e) => Err(error_message(None, fault(PARSE_ERROR, format!("Parse error: {}", e)))),
     }
 }
 
@@ -453,20 +469,20 @@ fn text_of(tool: &str, v: &Value) -> Result<String, J> {
 
 impl Door {
     pub fn new(name: impl Into<String>, tools: Vec<Tool>) -> Door {
-        Door { tools, name: name.into(), most: MOST }
+        Door { tools, name: name.into(), most: MOST, over_http: false }
     }
 
     /// The answer to one message, as it came: None for a notification and for a client's
     /// response, which are never answered.
     pub fn answer(&self, it: &mut Interp, text: &[u8]) -> Option<J> {
-        // As deep as every reader of JSON takes it (`value::json_value`).
-        let msg = match crate::value::json_value(text) {
-            Ok(J::Object(m)) => m,
-            // One message a line: JSON-RPC's batches left MCP in 2025-06-18.
-            Ok(J::Array(_)) => return Some(error_message(None, fault(INVALID_REQUEST, "Invalid request: one message a line, not a batch"))),
-            Ok(_) => return Some(error_message(None, fault(INVALID_REQUEST, "Invalid request: a message is a JSON object"))),
-            Err(e) => return Some(error_message(None, fault(PARSE_ERROR, format!("Parse error: {}", e)))),
-        };
+        match message_of(text, "one message a line") {
+            Ok(msg) => self.answer_message(it, &msg),
+            Err(refused) => Some(refused),
+        }
+    }
+
+    /// `answer`, of a message read already (the HTTP door reads it to check its headers first).
+    pub fn answer_message(&self, it: &mut Interp, msg: &Map<String, J>) -> Option<J> {
         let id = match msg.get("id") {
             // A notification, the client's to send and never answered; `notifications/cancelled`
             // among them, for a call that is answered before the next line is read.
@@ -479,7 +495,7 @@ impl Door {
             Some(id @ (J::String(_) | J::Number(_))) => id,
             Some(_) => return Some(error_message(None, fault(INVALID_REQUEST, "Invalid request: an id is a string or a number"))),
         };
-        Some(match self.request(it, &msg) {
+        Some(match self.request(it, msg) {
             // Every result says it is complete (MCP 2026-07-28 requires `resultType`), and who
             // answered it (servers SHOULD say `serverInfo` in every result).
             Ok(result) => {
@@ -578,7 +594,7 @@ impl Door {
             Some(_) => return Err(fault(INVALID_PARAMS, "Invalid params: `arguments` is an object, each argument by its name")),
         };
         Ok(match by_name(tool, args) {
-            Ok(args) => run(it, tool, args),
+            Ok(args) => run(it, tool, args, self.over_http),
             Err(why) => tool_error(why),
         })
     }
@@ -590,18 +606,26 @@ impl Door {
 /// is that call's `internal error`, as a request's is a 500, and the door goes on with what calls
 /// change put back as it was (`Interp::put_back`); a transaction it was in has let go of what it
 /// held, and raised it again for this (found in review).
-fn run(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>) -> J {
-    it.tenant = None;
-    it.tenant_named = false;
-    it.no_such_tenant = false;
-    it.set_cookies.clear();
-    it.session = None;
-    it.session_id = None;
-    it.answering = true;
+/// Over HTTP (`over_http`) the request is the caller's, made by `serve_http`: its session, its
+/// tenant and its `request` are the tool's, and its cookies go back as the request's do
+/// (FEEDBACK56.md, Q-859; branch feedback56).
+fn run(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>, over_http: bool) -> J {
+    if !over_http {
+        it.tenant = None;
+        it.tenant_named = false;
+        it.no_such_tenant = false;
+        it.set_cookies.clear();
+        it.session = None;
+        it.session_id = None;
+        it.session_ends = None;
+        it.answering = true;
+    }
     let before = it.entered();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call_given(it, tool, args, 0)));
-    it.answering = false;
-    it.set_cookies.clear();
+    if !over_http {
+        it.answering = false;
+        it.set_cookies.clear();
+    }
     let r = match r {
         Ok(r) => r,
         Err(panic) => {
@@ -826,4 +850,797 @@ pub fn serve_stdio(door: &Door, it: &mut Interp, input: &mut dyn std::io::BufRea
             return 0;
         }
     }
+}
+
+// ---- HTTP: `/_quillo/mcp` (FEEDBACK56.md, C.2 to C.4, Q-859, Q-860; branch feedback56) -------
+//
+// MCP's Streamable HTTP transport of revision 2026-07-28 (basic/transports/streamable-http): each
+// message a POST of its own, each request answered with one JSON object (no SSE, which only
+// progress would need), a notification with 202, nothing kept between requests. A call comes with
+// the program's session cookie, someone signed in to it, or with a token `mcp_token()` made, as
+// `Authorization: Bearer` (basic/authorization lets a server use its own authentication; OAuth
+// is Part G); with neither it is refused, 401 with `WWW-Authenticate: Bearer` (decided
+// 2026-11-08).
+//
+// Another site's page cannot drive it from a visitor's browser, whose cookie would let it in:
+// its `Origin` (or `Sec-Fetch-Site`) is another site's, 403, as `cross_site` reads it for server
+// fns; and every call carries `Content-Type: application/json`, `MCP-Protocol-Version` and
+// `Mcp-Method`, which such a page can send only after a preflight, and nothing here grants one:
+// no `Access-Control-Allow-*` is ever sent.
+
+/// The keys `_meta` carries the version and the client under (basic/index, `_meta`).
+const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+const CLIENT_KEY: &str = "io.modelcontextprotocol/clientInfo";
+
+/// MCP's code for headers that do not match the body, or are missing (streamable-http, Server
+/// Validation).
+pub const HEADER_MISMATCH: i64 = -32020;
+
+/// Who a call over HTTP is made by.
+struct Caller {
+    /// What the limit counts by: the user, a token's or the session's, in this place; else the
+    /// session, or the developer's token (C.4).
+    key: String,
+    /// It came with a token: what it sets in a cookie has no browser to go back to.
+    token: bool,
+}
+
+/// `/_quillo/mcp` (under `--base /shop`, `/shop/_quillo/mcp` to the proxy that takes the prefix
+/// off): the program's tools for an AI client over HTTP. None for a program with no tools, or run
+/// `--as-service`, whose tools are its app's (Part F): 404, as for any address not there.
+pub fn serve_http(it: &mut Interp, req: &crate::server::HttpRequest, path: &str) -> crate::server::HttpResponse {
+    use crate::server::{plain, HttpResponse};
+    let door = match &it.mcp {
+        Some(d) if !it.is_service => d.clone(),
+        _ => return plain(404, "not found\n"),
+    };
+    // Servers MUST validate `Origin`, and answer another's 403 (streamable-http, Security). A
+    // client that is no browser sends none, and goes on to who it is.
+    if crate::server::cross_site(req) {
+        return plain(403, "the MCP door takes no calls from another site's pages\n");
+    }
+    match req.method.as_str() {
+        "POST" => {}
+        // What the path takes, as Quillo answers OPTIONS elsewhere, and nothing that lets another
+        // site's page send a call: no `Access-Control-Allow-*`.
+        "OPTIONS" => return HttpResponse { status: 204, headers: vec![("allow".into(), "POST".into())], body: Vec::new() },
+        // GET was 2025-11-25's stream, DELETE its end of a session: 405 (streamable-http,
+        // Earlier Streamable HTTP Revisions).
+        _ => {
+            let mut r = plain(405, "the MCP door takes POST: one JSON-RPC message a request, as MCP 2026-07-28 sends them\n");
+            r.headers.push(("allow".into(), "POST".into()));
+            return r;
+        }
+    }
+    if crate::server::essence(header(req, "content-type").unwrap_or("")) != "application/json" {
+        return plain(415, "send the message as JSON (content-type: application/json)\n");
+    }
+    // The request a tool runs in: its session, tenant and `request` come from it.
+    let qs = req.url.split_once('?').map_or("", |(_, q)| q);
+    let mut reqmap = crate::server::build_request(req, path, &Value::map(crate::server::parse_urlencoded(qs)));
+    if let Some(id) = &it.request_id {
+        reqmap.insert("id".into(), Value::str(&**id));
+    }
+    it.current_request = Some(Value::map(reqmap));
+    let resp = answer_http(it, &door, req);
+    it.current_request = None;
+    resp
+}
+
+fn answer_http(it: &mut Interp, door: &Door, req: &crate::server::HttpRequest) -> crate::server::HttpResponse {
+    use crate::server::HttpResponse;
+    // Who it is first: a stranger learns nothing of the door, not even what it would refuse.
+    let caller = match caller(it, req) {
+        Ok(c) => c,
+        Err(refused) => return refused,
+    };
+    let msg = match message_of(&req.body, "one message a request") {
+        Ok(m) => m,
+        Err(refused) => return json_answer(400, refused),
+    };
+    let method = msg.get("method").and_then(J::as_str);
+    // A notification is taken, 202 and no body; this revision defines none a client sends over
+    // HTTP (streamable-http, Sending Messages).
+    if !msg.contains_key("id") && method.is_some() {
+        return HttpResponse { status: 202, headers: vec![("cache-control".into(), "no-store".into())], body: Vec::new() };
+    }
+    // A response, with its id or not: the client MUST NOT send one, where stdio lets it go by.
+    if !msg.contains_key("method") && (msg.contains_key("result") || msg.contains_key("error")) {
+        let id = msg.get("id").filter(|id| id.is_string() || id.is_number());
+        return json_answer(400, error_message(id, fault(INVALID_REQUEST, "Invalid request: a client sends requests and notifications, not responses")));
+    }
+    // `initialize`, a client of 2025-11-25's first message, carries none of the headers: it is
+    // told the version to speak (decided 2026-11-08), not that a header is missing.
+    if method != Some("initialize") {
+        if let Err(f) = mirrored(req, &msg) {
+            let id = msg.get("id").filter(|id| id.is_string() || id.is_number());
+            return json_answer(400, error_message(id, f));
+        }
+    }
+    // Tool calls are limited (C.4, Q-860), not the lists, which run nothing of the program's.
+    if method == Some("tools/call") {
+        if let Err(wait) = one_more(&caller.key) {
+            let most = MAX_TOOL_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let mut r = crate::server::plain(429, &format!("too many tool calls: at most {} a minute for each caller; try again in {} s\n", most, wait));
+            r.headers.push(("retry-after".into(), wait.to_string()));
+            return r;
+        }
+    }
+    // `request.mcp`: who the client says it is, so that a program can say what an assistant
+    // wrote. Self-reported (basic/index: for display and logs, not for security).
+    let meta = msg.get("params").and_then(J::as_object).and_then(|p| p.get("_meta")).and_then(J::as_object);
+    let info = meta.and_then(|m| m.get(CLIENT_KEY)).and_then(J::as_object);
+    let said = |k: &str| info.and_then(|i| i.get(k)).and_then(J::as_str).map_or(Value::Nil, Value::str);
+    let mut client = crate::value::Map::new();
+    client.insert("client".into(), said("name"));
+    client.insert("version".into(), said("version"));
+    if let Some(Value::Map(m)) = &mut it.current_request {
+        Arc::make_mut(m).insert("mcp".into(), Value::map(client));
+    }
+    let answer = door.answer_message(it, &msg);
+    if caller.token {
+        it.set_cookies.clear();
+    }
+    match answer {
+        None => HttpResponse { status: 202, headers: vec![("cache-control".into(), "no-store".into())], body: Vec::new() },
+        Some(a) => json_answer(status_of(&a), a),
+    }
+}
+
+/// An answer's HTTP status: 200 for a result, a tool's own error among them; the protocol's
+/// errors as the transport says (streamable-http: a method not found 404, the version, the
+/// headers and a malformed request 400), and the door's own failure 500.
+fn status_of(a: &J) -> u16 {
+    match a.get("error").and_then(|e| e.get("code")).and_then(J::as_i64) {
+        None => 200,
+        Some(METHOD_NOT_FOUND) => 404,
+        Some(INTERNAL_ERROR) => 500,
+        Some(_) => 400,
+    }
+}
+
+fn json_answer(status: u16, j: J) -> crate::server::HttpResponse {
+    crate::server::HttpResponse {
+        status,
+        headers: vec![("content-type".into(), "application/json".into()), ("cache-control".into(), "no-store".into())],
+        body: j.to_string().into_bytes(),
+    }
+}
+
+/// A request header's value, the first of its name (names in any case, RFC 9110).
+fn header<'a>(req: &'a crate::server::HttpRequest, name: &str) -> Option<&'a str> {
+    req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+}
+
+/// A mirrored header's value: missing, held twice with two values (a proxy could route by one and
+/// the door read the other), or holding what no header may, it is a mismatch.
+fn given<'a>(req: &'a crate::server::HttpRequest, name: &str) -> Result<&'a str, Fault> {
+    let mut values = req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim());
+    let Some(v) = values.next() else {
+        return Err(fault(HEADER_MISMATCH, format!("Header mismatch: the {} header is missing", name)));
+    };
+    if values.any(|o| o != v) {
+        return Err(fault(HEADER_MISMATCH, format!("Header mismatch: the {} header is given twice, with two values", name)));
+    }
+    if !v.bytes().all(|b| b == b'\t' || (0x20..0x7f).contains(&b)) {
+        return Err(fault(HEADER_MISMATCH, format!("Header mismatch: the {} header holds a character a header may not (send such a value as =?base64?...?=)", name)));
+    }
+    Ok(v)
+}
+
+/// A value in the form a client sends what a header cannot hold, `=?base64?<base64 of UTF-8>?=`,
+/// read; any other as it is (streamable-http, Value Encoding). None when it is not base64 text.
+fn sentinel(v: &str) -> Option<String> {
+    let Some(inner) = v.strip_prefix("=?base64?").and_then(|r| r.strip_suffix("?=")) else { return Some(v.to_string()) };
+    // Base64's own alphabet, padded or not: `-` and `_` are another's.
+    if inner.contains(['-', '_']) {
+        return None;
+    }
+    let url: String = inner.trim_end_matches('=').chars().map(|c| match c {
+        '+' => '-',
+        '/' => '_',
+        c => c,
+    }).collect();
+    String::from_utf8(crate::crypto::unb64url(&url)?).ok()
+}
+
+/// The headers the transport mirrors from the body, each checked against it (streamable-http,
+/// Request Metadata and Server Validation): `MCP-Protocol-Version` as `_meta`'s version,
+/// `Mcp-Method` as the method, and on `tools/call` `Mcp-Name` as the tool's name. Header values
+/// are compared as they are, in their case. A client of an earlier revision that says its version
+/// in the header alone is told the one to speak.
+fn mirrored(req: &crate::server::HttpRequest, msg: &Map<String, J>) -> Result<(), Fault> {
+    let mismatch = |m: String| Err(fault(HEADER_MISMATCH, format!("Header mismatch: {}", m)));
+    let params = msg.get("params").and_then(J::as_object);
+    let in_body = params.and_then(|p| p.get("_meta")).and_then(J::as_object).and_then(|m| m.get(VERSION_KEY)).and_then(J::as_str);
+    let version = given(req, "MCP-Protocol-Version")?;
+    match in_body {
+        Some(b) if b != version => return mismatch(format!("MCP-Protocol-Version header value '{}' does not match body value '{}'", version, b)),
+        None if version != PROTOCOL => return Err(unsupported(version)),
+        _ => {}
+    }
+    // Without a method the door says what is wrong with the message.
+    let Some(method) = msg.get("method").and_then(J::as_str) else { return Ok(()) };
+    let m = given(req, "Mcp-Method")?;
+    if m != method {
+        return mismatch(format!("Mcp-Method header value '{}' does not match body value '{}'", m, method));
+    }
+    if method == "tools/call" {
+        let raw = given(req, "Mcp-Name")?;
+        let Some(name) = sentinel(raw) else {
+            return mismatch("the Mcp-Name header's =?base64? value is not base64 of UTF-8 text".into());
+        };
+        // A name that is no string is the door's to refuse, as a malformed call.
+        if let Some(b) = params.and_then(|p| p.get("name")).and_then(J::as_str) {
+            if name != b {
+                return mismatch(format!("Mcp-Name header value '{}' does not match body value '{}'", raw, b));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Who the call is made by: a token, when it comes as `Authorization: Bearer` (another scheme, a
+/// staging site's Basic say, is no token here, and the cookie is read); else the session the
+/// cookie carries, someone signed in to it. Neither: 401, the door closed as middleware fails
+/// closed. A token the door cannot look up for its store failing: 503, never let in.
+fn caller(it: &mut Interp, req: &crate::server::HttpRequest) -> Result<Caller, crate::server::HttpResponse> {
+    let bearer = req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("authorization")).find_map(|(_, v)| {
+        let v = v.trim();
+        let (scheme, rest) = v.split_once(' ').unwrap_or((v, ""));
+        scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
+    });
+    if let Some(token) = bearer {
+        return match token_caller(it, token) {
+            Ok(Some(c)) => Ok(c),
+            Ok(None) => Err(unauthorized(true)),
+            Err(why) => {
+                crate::httpd::error_line(&format!("the MCP door cannot read its tokens: {}", why));
+                Err(crate::server::plain(503, "the MCP door cannot check tokens now\n"))
+            }
+        };
+    }
+    match crate::session::signed_in(it) {
+        Some((data, owner)) => {
+            // The limit counts by the user, as a token's does: a new sign-in is no new minute
+            // (C.4, found in review).
+            let key = match user_of(&data) {
+                Some(u) => format!("user {} {}", crate::session::place(it), u),
+                None => format!("session {}", owner),
+            };
+            it.session = Some(data);
+            Ok(Caller { key, token: false })
+        }
+        None => Err(unauthorized(false)),
+    }
+}
+
+/// 401, with the challenge RFC 6750 gives: `Bearer` for no credentials, `invalid_token` for a
+/// token that is not good (basic/authorization: invalid or expired tokens MUST receive 401).
+fn unauthorized(bad_token: bool) -> crate::server::HttpResponse {
+    let (challenge, text) = if bad_token {
+        ("Bearer error=\"invalid_token\"", "this token is not good here: it was revoked, its session ended, it expired, or it is for another site or tenant\n")
+    } else {
+        ("Bearer", "the MCP door takes a call from someone signed in: the program's session cookie, or a token mcp_token() made, as Authorization: Bearer <token>\n")
+    };
+    let mut r = crate::server::plain(401, text);
+    r.headers.push(("www-authenticate".into(), challenge.into()));
+    r
+}
+
+// ---- Who is calling: tokens (Q-859) -------------------------------------------------------------
+//
+// `mcp_token()`, where someone is signed in, makes a token tied to that session and gives it
+// once. Sessions are signed cookies, kept nowhere on the server; a token has to be, to be taken
+// back. What is kept is the token signed with the session key (`session::digest`), never the
+// token, beside the session it stands for (its data and its hidden id, the owner `end_session`
+// ends it by), the place it is good in (the mount point and the tenant, as a session's signature
+// binds them), whom it was made for, and when it ends. It is kept where Quillo keeps its own
+// tables (`db::system_on`): the program's database, or its system database; a program with
+// neither keeps its tokens in memory, so that they end when the server stops, as its sessions do
+// without `QUILLO_SECRET`.
+//
+// Found in review: a row is sealed as a cookie is, everything it decides signed with the session
+// key, so that whoever can write the table cannot make one good token another user's, tenant's or
+// time's; the table is made by `mcp_token()` alone, and everything else asks whether it is there
+// first, of the catalog, so that a logout never depends on it; and rows are matched in Rust, as
+// MySQL's and MariaDB's usual collations take `ANA` for `ana` and `zoe` for `zoë`.
+
+const TOKEN_PURPOSE: &str = "quillo mcp token";
+/// What a token's row is sealed for.
+const ROW_PURPOSE: &str = "quillo mcp token row";
+const TOKENS: &str = "_quillo_mcp_tokens";
+/// How long a token is good unless `max_age` or the session's own says: a session's 30 days.
+const TOKEN_AGE: u64 = 30 * 86_400;
+const TOKEN_COLUMNS: &str = "select hash, id, owner, place, who, session, made, expires, seal from _quillo_mcp_tokens";
+
+/// The statement that makes the table: its text compared as bytes on MySQL and MariaDB too.
+fn make_tokens(mysql: bool) -> String {
+    format!(
+        "create table if not exists _quillo_mcp_tokens (hash varchar(64) primary key, id varchar(32) not null, owner text not null, \
+         place text not null, who text not null, session text not null, made bigint not null, expires bigint not null, seal varchar(64) not null){}",
+        if mysql { " character set utf8mb4 collate utf8mb4_bin" } else { "" }
+    )
+}
+
+/// A token as it is kept: all but the token.
+#[derive(Debug, Clone)]
+struct Kept {
+    hash: String,
+    id: String,
+    owner: String,
+    place: String,
+    who: String,
+    session: String,
+    made: i64,
+    expires: i64,
+    seal: String,
+}
+
+impl Kept {
+    /// Everything the row decides, signed with the session key.
+    fn sealed_as(&self) -> String {
+        crate::session::digest(ROW_PURPOSE, &json!([self.hash, self.id, self.owner, self.place, self.who, self.session, self.made, self.expires]).to_string())
+    }
+
+    /// Kept as it was made: its seal holds.
+    fn sound(&self) -> bool {
+        crate::crypto::same(self.sealed_as().as_bytes(), self.seal.as_bytes())
+    }
+}
+
+/// The tokens of a program with no database for Quillo's own tables.
+static MEMORY: std::sync::Mutex<Vec<Kept>> = std::sync::Mutex::new(Vec::new());
+
+fn memory() -> std::sync::MutexGuard<'static, Vec<Kept>> {
+    MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+/// A statement on Quillo's own tables there: its value, or the database's error.
+fn sql(it: &mut Interp, on: Option<usize>, query: bool, args: Vec<Value>) -> Result<Value, String> {
+    let r = if query { crate::db::query_on(it, on, args) } else { crate::db::exec_on(it, on, args) };
+    match r {
+        Ok(Value::Err(e, _, _)) => Err(e.display()),
+        Ok(v) => Ok(v),
+        Err(Ctrl::Error(e)) => Err(e.msg.clone()),
+        Err(_) => Err("the statement was stopped".into()),
+    }
+}
+
+fn rows(v: &Value) -> Vec<Kept> {
+    let Value::List(l) = v else { return Vec::new() };
+    l.iter()
+        .filter_map(|r| {
+            let Value::Map(m) = r else { return None };
+            let text = |k: &str| m.get(k).map(|v| v.display()).unwrap_or_default();
+            let int = |k: &str| match m.get(k) {
+                Some(Value::Int(n)) => *n,
+                Some(v) => v.display().parse().unwrap_or(0),
+                None => 0,
+            };
+            Some(Kept {
+                hash: text("hash"),
+                id: text("id"),
+                owner: text("owner"),
+                place: text("place"),
+                who: text("who"),
+                session: text("session"),
+                made: int("made"),
+                expires: int("expires"),
+                seal: text("seal"),
+            })
+        })
+        .collect()
+}
+
+/// Where the tokens are, to read or take away.
+enum Store {
+    Memory,
+    /// A database whose table was never made: there are none.
+    NoTable,
+    /// The database, as `db::exec_on` names it.
+    Db(Option<usize>),
+}
+
+fn kept_on(it: &mut Interp) -> Result<Store, String> {
+    match crate::db::system_on(it, false) {
+        None => Ok(Store::Memory),
+        Some(on) => Ok(if crate::db::own_table_there(it, on, TOKENS)? { Store::Db(on) } else { Store::NoTable }),
+    }
+}
+
+/// Keeps a token's row, sealed, the rows of tokens that ended taken away. The one place the table
+/// is made.
+fn keep(it: &mut Interp, mut k: Kept) -> Result<(), String> {
+    let now = now_ms();
+    k.seal = k.sealed_as();
+    match crate::db::system_on(it, true) {
+        None => {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("quillo: MCP tokens are kept in memory, as the program has no database: they end when the server stops (db.system(...) keeps them)");
+            }
+            let mut m = memory();
+            m.retain(|x| x.expires > now);
+            m.push(k);
+            Ok(())
+        }
+        Some(on) => {
+            if !crate::db::own_table_there(it, on, TOKENS)? {
+                let mysql = crate::db::kind_on(it, on);
+                crate::db::own_table_make(it, on, &make_tokens(mysql)).map_err(|e| {
+                    format!("its table, {}, could not be made ({}): the program's database user needs the right to create a table there, once", TOKENS, e)
+                })?;
+            }
+            sql(it, on, false, vec![Value::str("delete from _quillo_mcp_tokens where expires <= ?"), Value::Int(now)])?;
+            let insert = "insert into _quillo_mcp_tokens (hash, id, owner, place, who, session, made, expires, seal) values (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            let args = vec![
+                Value::str(insert),
+                Value::str(&k.hash),
+                Value::str(&k.id),
+                Value::str(&k.owner),
+                Value::str(&k.place),
+                Value::str(&k.who),
+                Value::str(&k.session),
+                Value::Int(k.made),
+                Value::Int(k.expires),
+                Value::str(&k.seal),
+            ];
+            sql(it, on, false, args).map(|_| ())
+        }
+    }
+}
+
+/// The token of `hash`, sound and kept here; None where there is none, or no table of them.
+fn kept_by_hash(it: &mut Interp, hash: &str) -> Result<Option<Kept>, String> {
+    let found = match kept_on(it)? {
+        Store::Memory => memory().clone(),
+        Store::NoTable => return Ok(None),
+        Store::Db(on) => rows(&sql(it, on, true, vec![Value::str(format!("{} where hash = ?", TOKEN_COLUMNS)), Value::str(hash)])?),
+    };
+    Ok(found.into_iter().find(|k| crate::crypto::same(k.hash.as_bytes(), hash.as_bytes()) && k.sound()))
+}
+
+/// Which tokens a call names, in this place, still good: a session's (by its owner, or the user
+/// it is signed in as, so that they are found after its cookie has gone or the user signs in
+/// again), `{ user }`'s, or (`end_session`) a session's own alone.
+enum Whose {
+    Session { owner: Option<String>, user: Option<String> },
+    User(String),
+    Owner(String),
+}
+
+impl Whose {
+    fn names(&self, k: &Kept) -> bool {
+        match self {
+            Whose::Session { owner, user } => owner.as_deref() == Some(k.owner.as_str()) || user.as_deref() == Some(k.who.as_str()),
+            Whose::User(u) => *u == k.who,
+            Whose::Owner(o) => *o == k.owner,
+        }
+    }
+}
+
+/// The tokens `whose` names in `place`, sound and still good, oldest first: compared exactly here,
+/// whatever the database's collation took for the same.
+fn kept_of(it: &mut Interp, whose: &Whose, place: &str) -> Result<Vec<Kept>, String> {
+    let now = now_ms();
+    let candidates = match kept_on(it)? {
+        Store::Memory => memory().clone(),
+        Store::NoTable => return Ok(Vec::new()),
+        Store::Db(on) => {
+            let (cond, keys): (&str, Vec<&str>) = match whose {
+                Whose::Session { owner, user } => ("(owner = ? or who = ?)", vec![owner.as_deref().unwrap_or(""), user.as_deref().unwrap_or("")]),
+                Whose::User(u) => ("who = ?", vec![u.as_str()]),
+                Whose::Owner(o) => ("owner = ?", vec![o.as_str()]),
+            };
+            let mut args = vec![Value::str(format!("{} where {} and place = ? and expires > ?", TOKEN_COLUMNS, cond))];
+            args.extend(keys.into_iter().map(Value::str));
+            args.push(Value::str(place));
+            args.push(Value::Int(now));
+            rows(&sql(it, on, true, args)?)
+        }
+    };
+    let mut found: Vec<Kept> = candidates.into_iter().filter(|k| k.place == place && k.expires > now && whose.names(k) && k.sound()).collect();
+    found.sort_by(|a, b| (a.made, &a.id).cmp(&(b.made, &b.id)));
+    Ok(found)
+}
+
+/// Takes away the tokens `whose` names in `place`, all of them or the one of `id`: how many.
+fn take_away(it: &mut Interp, whose: &Whose, place: &str, id: Option<&str>) -> Result<i64, String> {
+    let doomed: Vec<String> = kept_of(it, whose, place)?.into_iter().filter(|k| id.map_or(true, |id| k.id == id)).map(|k| k.hash).collect();
+    if doomed.is_empty() {
+        return Ok(0);
+    }
+    match kept_on(it)? {
+        Store::Memory => memory().retain(|k| !doomed.contains(&k.hash)),
+        Store::NoTable => return Ok(0),
+        Store::Db(on) => {
+            for h in &doomed {
+                sql(it, on, false, vec![Value::str("delete from _quillo_mcp_tokens where hash = ?"), Value::str(h)])?;
+            }
+        }
+    }
+    Ok(doomed.len() as i64)
+}
+
+/// `end_session()`'s part: the tokens of each of `owners` (the session the request came with,
+/// and the one it has now) end in this place.
+pub(crate) fn end_tokens(it: &mut Interp, owners: &[String]) -> Result<(), String> {
+    if owners.is_empty() {
+        return Ok(());
+    }
+    let place = crate::session::place(it);
+    for o in owners {
+        take_away(it, &Whose::Owner(o.clone()), &place, None)?;
+    }
+    Ok(())
+}
+
+/// The caller a token names, the session it stands for made the call's; None when it is no
+/// token kept here, its row is not as it was made, it ended, or it is for another place. The
+/// limit counts by its user, as a cookie caller's (C.4).
+fn token_caller(it: &mut Interp, token: &str) -> Result<Option<Caller>, String> {
+    let hash = crate::session::digest(TOKEN_PURPOSE, token);
+    if DEV_HASH.get().is_some_and(|h| crate::crypto::same(h.as_bytes(), hash.as_bytes())) {
+        // The developer's, under `--watch`: no session, the program's own checks as for anyone.
+        crate::session::take_on(it, Value::map(crate::value::Map::new()), "");
+        return Ok(Some(Caller { key: "token dev".into(), token: true }));
+    }
+    let Some(k) = kept_by_hash(it, &hash)? else { return Ok(None) };
+    let place = crate::session::place(it);
+    if k.expires <= now_ms() || k.place != place {
+        return Ok(None);
+    }
+    let data = crate::value::json_value(k.session.as_bytes()).map(|j| crate::interp::from_island_json(&j)).unwrap_or_else(|_| Value::map(crate::value::Map::new()));
+    crate::session::take_on(it, data, &k.owner);
+    Ok(Some(Caller { key: format!("user {} {}", place, k.who), token: true }))
+}
+
+pub const BUILTINS: &[(&str, crate::value::BuiltinFn)] = &[("mcp_token", mcp_token), ("mcp_tokens", mcp_tokens), ("revoke_mcp_token", revoke_mcp_token)];
+
+/// A builtin's options: none, or a map of the keys it takes.
+fn options_of<'a>(v: Option<&'a Value>, f: &str, takes: &[&str], line: u32) -> Result<Option<&'a crate::value::Map>, Ctrl> {
+    match v {
+        None | Some(Value::Nil) => Ok(None),
+        Some(Value::Map(m)) => match m.keys().find(|k| !takes.contains(&&***k)) {
+            Some(k) => crate::interp::fail(line, format!("`{}` has no option `{}`: it takes {}", f, &**k, takes.iter().map(|t| format!("`{}`", t)).collect::<Vec<_>>().join(" and "))),
+            None => Ok(Some(m)),
+        },
+        Some(v) => crate::interp::fail(line, format!("`{}` expects options as a map, got {}", f, v.type_name())),
+    }
+}
+
+/// The session's user, as a token's `who` holds one: None when it has none.
+fn user_of(session: &Value) -> Option<String> {
+    match session {
+        Value::Map(m) => m.get("user").filter(|u| !matches!(u, Value::Nil)).map(|u| crate::interp::island_json(u).to_string()),
+        _ => None,
+    }
+}
+
+/// Which tokens `mcp_tokens` and `revoke_mcp_token` name: `{ user }`'s, or the session's (by its
+/// owner or its user); None when there is neither.
+fn whose(it: &mut Interp, o: Option<&crate::value::Map>) -> Option<Whose> {
+    if let Some(u) = o.and_then(|m| m.get("user")).filter(|u| !matches!(u, Value::Nil)) {
+        return Some(Whose::User(crate::interp::island_json(u).to_string()));
+    }
+    let owner = crate::session::current_owner(it);
+    let user = user_of(&crate::session::current(it));
+    (owner.is_some() || user.is_some()).then_some(Whose::Session { owner, user })
+}
+
+/// Whether the request being answered is a call at the MCP door.
+fn at_the_door(it: &mut Interp) -> bool {
+    matches!(it.request_value(), Some(Value::Map(m)) if matches!(m.get("mcp"), Some(Value::Map(_))))
+}
+
+/// `mcp_token({ user, max_age })`: a token for the door, tied to the session of the request it is
+/// made in, given once. Someone is signed in: `session().user`, or `user` where the program names
+/// its caller otherwise. Good for `max_age`; else for as long as the session, where the program
+/// gave the session a `max_age`; else 30 days; and until `end_session()` or `revoke_mcp_token`.
+fn mcp_token(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
+    use crate::interp::fail;
+    let o = options_of(args.first(), "mcp_token", &["user", "max_age"], line)?;
+    if !it.answering || it.request_value().is_none() {
+        return fail(line, "`mcp_token` is made while a request is answered, where someone is signed in: the token stands for that session");
+    }
+    if it.mcp.is_none() {
+        return fail(line, "`mcp_token`: this program has no tools (`fn mcp name(...)`), so there is no door to make a token for");
+    }
+    if at_the_door(it) {
+        return fail(line, "`mcp_token` is not for a tool: a token is made where the user is signed in, on a page of the program's, and pasted into the AI client");
+    }
+    let session = crate::session::current(it);
+    let user = match o.and_then(|m| m.get("user")) {
+        Some(u) => u.clone(),
+        None => match &session {
+            Value::Map(m) => m.get("user").cloned().unwrap_or(Value::Nil),
+            _ => Value::Nil,
+        },
+    };
+    if matches!(user, Value::Nil) {
+        return fail(line, "`mcp_token`: no one is signed in (`session().user` is null): sign in first, or say who it is for with `{ user: ... }`");
+    }
+    let Some(owner) = crate::session::current_owner(it) else {
+        return fail(line, "`mcp_token`: there is no session to tie the token to: `set_session` first");
+    };
+    let made = now_ms();
+    let age_ms = match o.and_then(|m| m.get("max_age")).filter(|v| !matches!(v, Value::Nil)) {
+        Some(v) => match crate::builtins::duration_seconds(v) {
+            Some(n) if n > 0 => n.min(366 * 86_400) as i64 * 1000,
+            _ => return fail(line, format!("`mcp_token`'s max_age is seconds or a duration like \"30d\", got {}", v.repr())),
+        },
+        // As long as the session has left, where the program said how long it lasts.
+        None => match crate::session::given_life(it) {
+            Some(ends) => (ends as i64 * 1000).saturating_sub(made).clamp(1000, 366 * 86_400 * 1000),
+            None => TOKEN_AGE as i64 * 1000,
+        },
+    };
+    let token = format!("qmcp_{}", crate::crypto::b64url(&crate::crypto::secret_bytes(32)));
+    let k = Kept {
+        hash: crate::session::digest(TOKEN_PURPOSE, &token),
+        id: crate::service::new_id(16),
+        owner,
+        place: crate::session::place(it),
+        who: crate::interp::island_json(&user).to_string(),
+        session: crate::interp::island_json(&session).to_string(),
+        made,
+        expires: made.saturating_add(age_ms),
+        seal: String::new(),
+    };
+    if let Err(why) = keep(it, k) {
+        return fail(line, format!("`mcp_token`: the token could not be kept: {}", why));
+    }
+    Ok(Value::str(token))
+}
+
+/// `mcp_tokens({ user })`: the session's tokens (made in it, or for the user it is signed in as),
+/// or all made for `user`, still good, oldest first: `{ id, user, made, expires }` each, the times
+/// in milliseconds as `now()` gives them. Never the token itself, which only its holder has.
+fn mcp_tokens(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
+    let o = options_of(args.first(), "mcp_tokens", &["user"], line)?;
+    let Some(w) = whose(it, o) else { return Ok(Value::list(Vec::new())) };
+    let place = crate::session::place(it);
+    let found = match kept_of(it, &w, &place) {
+        Ok(f) => f,
+        Err(why) => return crate::interp::fail(line, format!("`mcp_tokens`: the tokens could not be read: {}", why)),
+    };
+    Ok(Value::list(
+        found
+            .into_iter()
+            .map(|k| {
+                let mut m = crate::value::Map::new();
+                m.insert("id".into(), Value::str(&k.id));
+                m.insert("user".into(), crate::value::json_value(k.who.as_bytes()).map(|j| crate::interp::from_island_json(&j)).unwrap_or(Value::Nil));
+                m.insert("made".into(), Value::Int(k.made));
+                m.insert("expires".into(), Value::Int(k.expires));
+                Value::map(m)
+            })
+            .collect(),
+    ))
+}
+
+/// `revoke_mcp_token(id, { user })`: the token of that id among the session's (as `mcp_tokens()`
+/// finds them) or `user`'s ends: whether there was one.
+fn revoke_mcp_token(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
+    let id = match args.first() {
+        Some(Value::Str(s)) => s.to_string(),
+        other => return crate::interp::fail(line, format!("`revoke_mcp_token` takes a token's id, as `mcp_tokens()` gives it, got {}", other.map_or("nothing", |v| v.type_name()))),
+    };
+    let o = options_of(args.get(1), "revoke_mcp_token", &["user"], line)?;
+    let Some(w) = whose(it, o) else { return Ok(Value::Bool(false)) };
+    let place = crate::session::place(it);
+    match take_away(it, &w, &place, Some(&id)) {
+        Ok(n) => Ok(Value::Bool(n > 0)),
+        Err(why) => crate::interp::fail(line, format!("`revoke_mcp_token`: the token could not be taken away: {}", why)),
+    }
+}
+
+// ---- Limits (C.4, Q-860) ------------------------------------------------------------------------
+
+/// Tool calls each caller (a user, a token, a session) may make a minute at the door, as the spec
+/// says servers MUST rate limit tool calls (server/tools, Security): `--max-tool-calls`, or less
+/// where a policy's `max_tool_calls` says.
+pub static MAX_TOOL_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(60);
+
+/// The times of each caller's calls in the last minute, oldest first, and when callers not heard
+/// from in a minute were last let go.
+struct Calls {
+    by: HashMap<String, std::collections::VecDeque<std::time::Instant>>,
+    swept: std::time::Instant,
+}
+
+static CALLS: std::sync::Mutex<Option<Calls>> = std::sync::Mutex::new(None);
+
+/// One more call by `key` now, or how many seconds until one leaves the minute (`Retry-After`).
+/// A call refused is not counted.
+fn one_more(key: &str) -> Result<(), u64> {
+    const MINUTE: std::time::Duration = std::time::Duration::from_secs(60);
+    let most = MAX_TOOL_CALLS.load(std::sync::atomic::Ordering::Relaxed).max(1);
+    let now = std::time::Instant::now();
+    let mut all = CALLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let calls = all.get_or_insert_with(|| Calls { by: HashMap::new(), swept: now });
+    // Callers not heard from in a minute are let go, at most once a minute, not at each call once
+    // there are many (found in review).
+    if now.duration_since(calls.swept) >= MINUTE {
+        calls.by.retain(|_, t| t.back().is_some_and(|b| now.duration_since(*b) < MINUTE));
+        calls.swept = now;
+    }
+    let times = calls.by.entry(key.to_string()).or_default();
+    while times.front().is_some_and(|t| now.duration_since(*t) >= MINUTE) {
+        times.pop_front();
+    }
+    if times.len() >= most {
+        let left = MINUTE.saturating_sub(times.front().map_or(MINUTE, |t| now.duration_since(*t)));
+        return Err(left.as_millis().div_ceil(1000).max(1) as u64);
+    }
+    times.push_back(now);
+    Ok(())
+}
+
+// ---- The program's door, and the developer's token under `--watch` ------------------------------
+
+/// Under `--watch` on 127.0.0.1: the door's address, once the server listens, and the token
+/// printed for it, as Jupyter prints one, so a developer connects their editor's AI without a
+/// route of their own first (C.3). Only its hash is kept, as a token's is.
+static DEV_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static DEV_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The server listens at `url` (http://127.0.0.1:PORT) under `--watch`: the door's token is said
+/// once the program has tools, now (`it`, the program as it loaded) or after a reload, a first
+/// load that failed among them. The address is where this server answers, `/_quillo/mcp` under
+/// `--base` too, whose proxy takes the base off (found in review).
+pub fn dev_door(url: String, it: Option<&Interp>) {
+    let _ = DEV_URL.set(url);
+    if let Some(it) = it {
+        say_dev_door(it);
+    }
+}
+
+fn say_dev_door(it: &Interp) {
+    let (Some(url), Some(door)) = (DEV_URL.get(), it.mcp.as_ref()) else { return };
+    if door.tools.is_empty() || DEV_HASH.get().is_some() {
+        return;
+    }
+    let token = format!("qmcp_{}", crate::crypto::b64url(&crate::crypto::secret_bytes(32)));
+    if DEV_HASH.set(crate::session::digest(TOKEN_PURPOSE, &token)).is_err() {
+        return;
+    }
+    let at = format!("{}/_quillo/mcp", url);
+    eprintln!("quillo: MCP door for AI clients at {}, with the header Authorization: Bearer {} (good while this runs)", at, token);
+    eprintln!("quillo:   claude mcp add --transport http {} {} --header \"Authorization: Bearer {}\"", door.name, at, token);
+}
+
+/// The program's door over HTTP, `it.mcp`: its tools as the checker read them (`tools`), or,
+/// where the program was not checked as it loaded (`--no-check`, `--split`'s app checked before),
+/// read now when it declares any. None for a program with no tools, or one run as a service.
+pub fn open_door(it: &mut Interp, path: &Path, tools: Option<Vec<Tool>>) {
+    it.mcp = None;
+    if it.is_service {
+        return;
+    }
+    let declares = || it.program.iter().any(|stmts| stmts.iter().any(|s| matches!(s, crate::ast::Stmt::Fn(d) if d.mcp)));
+    let tools = match tools {
+        Some(t) => t,
+        None if declares() => match of_source(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("quillo: the MCP door stays closed: the program's tools could not be read:\n{}", e);
+                return;
+            }
+        },
+        None => return,
+    };
+    if tools.is_empty() {
+        return;
+    }
+    let name = crate::service::served_as().filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+    let mut door = Door::new(name, tools);
+    door.over_http = true;
+    it.mcp = Some(Arc::new(door));
+    say_dev_door(it);
 }

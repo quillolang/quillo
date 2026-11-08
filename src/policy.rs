@@ -20,6 +20,7 @@
 //! workers = 8
 //! max_compute = "10s"
 //! max_body = "10MB"
+//! max_tool_calls = 60            # a minute, for each caller of /_quillo/mcp
 //! ```
 //!
 //! The host's file comes first, then any `--policy FILE`, then `quillo.policy` beside the
@@ -60,6 +61,9 @@ pub struct Policy {
     pub workers: Option<usize>,
     pub max_compute: Option<Duration>,
     pub max_body: Option<usize>,
+    /// Tool calls a minute each caller may make at the MCP door, as `--max-tool-calls` says it
+    /// (FEEDBACK56.md, C.4, Q-860; branch feedback56).
+    pub max_tool_calls: Option<usize>,
     /// The file each limit came from, for the messages that hold a program to it (FEEDBACK55.md,
     /// Q-849; branch feedback55).
     pub max_compute_from: Option<PathBuf>,
@@ -81,6 +85,7 @@ impl Default for Policy {
             workers: None,
             max_compute: None,
             max_body: None,
+            max_tool_calls: None,
             max_compute_from: None,
         }
     }
@@ -309,8 +314,10 @@ impl Policy {
                     }
                     self.max_body = Some(self.max_body.map_or(b, |m| m.min(b)));
                 }
+                ("limits", "max_tool_calls", V::Int(n)) if *n > 0 => self.max_tool_calls = Some(self.max_tool_calls.map_or(*n as usize, |m| m.min(*n as usize))),
+                ("limits", "max_tool_calls", V::Int(_)) => return Err(at(line, "`max_tool_calls` is a positive number, the calls a minute, as `--max-tool-calls` takes".into())),
                 (s, k, _) => {
-                    let known = ["plugins.build", "plugins.allow", "effects.allow", "http.private", "http.hosts", "env.names", "limits.workers", "limits.max_compute", "limits.max_body"];
+                    let known = ["plugins.build", "plugins.allow", "effects.allow", "http.private", "http.hosts", "env.names", "limits.workers", "limits.max_compute", "limits.max_body", "limits.max_tool_calls"];
                     let name = format!("{}.{}", s, k);
                     return Err(at(line, if known.contains(&name.as_str()) { format!("`{}` has the wrong kind of value", name) } else { format!("`{}` is not something a policy says (it says {})", name, known.join(", ")) }));
                 }
@@ -402,6 +409,9 @@ impl Policy {
         }
         if let Some(b) = self.max_body {
             out.push(format!("max_body {} byte{}", b, if b == 1 { "" } else { "s" }));
+        }
+        if let Some(n) = self.max_tool_calls {
+            out.push(format!("max_tool_calls {} a minute", n));
         }
         format!("policy {}{}", self.files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(" + "), if out.is_empty() { String::new() } else { format!(" ({})", out.join("; ")) })
     }
