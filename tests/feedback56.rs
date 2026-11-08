@@ -7775,7 +7775,12 @@ server fn for_a_page() = 1
     for (i, mut door) in doors.into_iter().enumerate() {
         assert_eq!(text_of(&door.result("short_ask", json!({}), true, None, None)), (true, "internal error".into()));
         if i == 0 {
-            door.stderr().contains(two).then_some(()).unwrap_or_else(|| panic!("{}", door.stderr()));
+            // The log line may come a moment after the answer: wait for it (found in CI).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !door.stderr().contains(two) {
+                assert!(std::time::Instant::now() < deadline, "{}", door.stderr());
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
     }
     drop(s);
