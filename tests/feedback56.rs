@@ -10438,3 +10438,103 @@ fn c3_coverage_on_postgres_a_database_gone_closes_the_door() {
     drop(s);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ---- A question a tool reaches where `quillo check` sees none (found in the coverage review) ---
+
+/// A program whose locale rule asks (`RULE`), and a tool that asks nothing in its own code.
+const UNSEEN: &str = r#"db.open(":memory:")
+db.exec("create table w (v int)")
+translations({ en: { hi: "Hi" }, fr: { hi: "Salut" } })
+locale_from((request) => RULE ? "fr" : "en")
+
+route POST /login ? { user: str } = set_session({ user: user })
+route GET /writes = str(db.one("select count(*) as n from w").n)
+route GET /hi = t("hi")
+
+/// Greets, and writes it down.
+fn mcp greet() -> str with db {
+    let g = t("hi")
+    db.exec("insert into w (v) values (1)")
+    g
+}
+"#;
+
+/// What the log says of such a question.
+const UNSEEN_SAID: &str = "this tool's call reached a question `quillo check` does not see it ask";
+
+/// A `confirm` (or `ask`) reached through the locale rule, in a tool `quillo check` sees ask
+/// nothing: refused and the call stopped, nothing written after it, over HTTP (stdio has no
+/// request, so no locale rule). Before, it was answered as outside any tool's call: `confirm` true, `ask` its default, a yes nobody
+/// gave, and the row written. `?? true` takes no refusal. A page's request is outside any tool's
+/// call: its `confirm` is true, as decided.
+#[test]
+fn unseen_a_question_a_tool_reaches_through_a_rule_is_refused_not_answered_by_nobody() {
+    for (k, rule) in [r#"confirm("In French?")"#, r#"(confirm("In French?") ?? true)"#, r#"ask("Which?", { fr: "French", en: "English" }, "fr") == "fr""#].iter().enumerate() {
+        let d = dir(&format!("unseen-{}", k), &UNSEEN.replace("RULE", rule));
+        assert!(!the(&tools_of(&format!("unseen-t{}", k), &UNSEEN.replace("RULE", rule)), "greet").may_ask, "{}: the checker sees no question", rule);
+        let s = Logged::start(&d.join("main.qwe"), &["--max-tool-calls", "100000"], &[]);
+        let mut door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
+        let r = door.result("greet", json!({}), true, None, None);
+        assert_eq!(text_of(&r), (true, "internal error".to_string()), "{}: {}", rule, r);
+        assert_eq!(support::send(s.port, "GET", "/writes", &[], "").body, "0", "{}: written after a yes nobody gave", rule);
+        s.says(UNSEEN_SAID);
+        // A client that cannot ask: the same.
+        let r = door.result("greet", json!({}), false, None, None);
+        assert_eq!(text_of(&r), (true, "internal error".to_string()), "{}: {}", rule, r);
+        assert_eq!(support::send(s.port, "GET", "/writes", &[], "").body, "0", "{}", rule);
+        // The page, outside any tool's call: the rule's `confirm` true, `ask` its default.
+        assert_eq!(support::send(s.port, "GET", "/hi", &[], "").body, "Salut", "{}", rule);
+        drop(s);
+        // Over stdio there is no request, so no locale rule runs: the default locale, no question.
+        let mut io = EDoor::Stdio(Stdio::start(&d, &["main.qwe"]));
+        assert_eq!(text_of(&io.result("greet", json!({}), true, None, None)), (false, "Hi".to_string()), "{}", rule);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// The same question in a service a tool calls, through billing's own locale rule: refused there,
+/// and the tool's call stopped, in one process (stdio and HTTP) and under `--split`, where the
+/// call carries an asking that refuses any question. Before, billing's `confirm` was true. A
+/// page's call of billing is outside any tool's call, its `confirm` true.
+#[test]
+fn unseen_a_services_question_in_a_tools_call_is_refused_here_and_apart() {
+    for apart in [false, true] {
+        let d = dir(&format!("unseen-svc-{}", apart), "service /billing = \"billing.qwe\"\nroute POST /login ? { user: str } = set_session({ user: user })\nroute GET /hi = billing.greet()\n\n/// Greets, in billing's words.\nfn mcp greet() -> str with http = billing.greet()\n");
+        std::fs::write(d.join("billing.qwe"), "translations({ en: { hi: \"Hi\" }, fr: { hi: \"Salut\" } })\nlocale_from((request) => confirm(\"In French?\") ? \"fr\" : \"en\")\n\nserver fn greet() -> str = t(\"hi\")\n").unwrap();
+        let s = Logged::start(&d.join("main.qwe"), if apart { &["--split", "--max-tool-calls", "100000"] } else { &["--max-tool-calls", "100000"] }, &[]);
+        let mut doors = vec![EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])))];
+        if !apart {
+            doors.push(EDoor::Stdio(Stdio::start(&d, &["main.qwe"])));
+        }
+        for mut door in doors {
+            let r = door.result("greet", json!({}), true, None, None);
+            assert_eq!(text_of(&r), (true, "internal error".to_string()), "apart {}: {}", apart, r);
+        }
+        s.says(UNSEEN_SAID);
+        assert_eq!(support::send(s.port, "GET", "/hi", &[], "").body, "Salut", "apart {}", apart);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A call made later from a tool `quillo check` sees ask nothing is a tool's too: its id says so,
+/// and a question in it is refused when it runs (`f_later` for one that may ask). Before, its id
+/// was a page's and its `confirm` true.
+#[test]
+fn unseen_a_call_made_later_from_a_tool_that_asks_nothing_has_no_one_to_ask() {
+    let main = "db.open(\":memory:\")\nservice /billing = \"billing.qwe\"\nroute POST /login ? { user: str } = set_session({ user: user })\nroute GET /later/:id = later_state(id)\n\nfn later_state(id: str) -> map {\n    let s = later.status(id) ?? { state: \"none\" }\n    { state: s.state, result: s.state == \"done\" ? s.result : null, why: s.state == \"failed\" ? error(s.error) : null }\n}\n\n/// Sends a note later.\nfn mcp send_later() -> str with http = billing.later.note()\n";
+    let d = dir("unseen-later", main);
+    // Billing's question is in its locale rule, which `quillo check` does not follow.
+    let billing = "translations({ en: { hi: \"Hi\" }, fr: { hi: \"Salut\" } })\nlocale_from((request) => confirm(\"In French?\") ? \"fr\" : \"en\")\n\nserver fn note() -> str = t(\"hi\")\n";
+    std::fs::write(d.join("billing.qwe"), billing).unwrap();
+    let s = Logged::start(&d.join("main.qwe"), &["--max-tool-calls", "100000"], &[]);
+    assert!(!the(&tools_in("unseen-later-t", &[("main.qwe", main), ("billing.qwe", billing)]), "send_later").may_ask, "the checker sees no question");
+    let mut door = EDoor::Http(s.port, http_door::As::Cookie(http_door::login(s.port, "ana", &[])));
+    let r = door.result("send_later", json!({}), true, None, None);
+    let id = f_structured(&r)["result"].as_str().unwrap_or_else(|| panic!("{}", r)).to_string();
+    assert!(id.starts_with('t') && id.len() == 24, "{}", id);
+    let nobody = "it stopped at a question: a call made later from a tool's call has no one to ask, so its question is refused: ask in the tool, before making the call";
+    assert_eq!(f_later_ended(s.port, &id), json!({ "state": "failed", "result": null, "why": nobody }));
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}

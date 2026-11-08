@@ -1046,6 +1046,15 @@ fn run_tool(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>, given: &Map<
 /// its own tool with this, called from its app's door, in one process or as it answers the app's
 /// signed call (FEEDBACK56.md, Part F; branch feedback56).
 pub(crate) fn answer_tool(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>) -> J {
+    // Whatever asking it has, or none, the call is a tool's: a question reached with none is
+    // refused (`Interp::in_tool`; FEEDBACK56.md, found in the coverage review; branch feedback56).
+    let was = std::mem::replace(&mut it.in_tool, true);
+    let r = answer_tool_here(it, tool, args);
+    it.in_tool = was;
+    r
+}
+
+fn answer_tool_here(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>) -> J {
     let before = it.entered();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call_given(it, tool, args, 0)));
     let r = match r {
@@ -1057,15 +1066,28 @@ pub(crate) fn answer_tool(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>
         }
     };
     crate::db::left_open(it, &format!("tool `{}`", tool.name));
+    // The first refusal of a question, where the call stopped at one: what the log says, though a
+    // function given to a builtin took it (a locale rule's, under `t`) and the call stopped later,
+    // or ended (FEEDBACK56.md, found in the coverage review; branch feedback56).
+    let refused = it.asking.as_ref().filter(|a| matches!(a.stop, Some(Stopped::Failed))).map(|a| a.why.clone());
     match r {
+        Ok(_) | Err(Ctrl::Return(_)) | Err(Ctrl::Reply(_)) if refused.is_some() => {
+            if let Some(Some((_, why))) = refused {
+                eprintln!("quillo: error in tool `{}`: {}", tool.name, why);
+            }
+            tool_error("internal error")
+        }
         Ok(Err(why)) => tool_error(why),
         Ok(Ok(v)) | Err(Ctrl::Return(v)) => result_of(tool, v),
         Err(Ctrl::Reply(r)) => replied(&tool.name, &r),
         // A tool that stopped to ask did not fail; one whose question refused itself did, and its
         // reason is logged (Part E).
         Err(Ctrl::Error(e)) if it.asking.as_ref().is_some_and(|a| a.stopped()) => {
-            if it.asking.as_ref().is_some_and(|a| matches!(a.stop, Some(Stopped::Failed))) {
-                eprintln!("quillo: error in tool `{}`: {:#}", tool.name, e);
+            if let Some(why) = refused {
+                // The refusal itself, with the calls it went up through; another error the call
+                // stopped at after a function took the refusal, the refusal's own text.
+                let said = why.filter(|(msg, _)| *msg != e.msg).map_or_else(|| format!("{:#}", e), |(_, said)| said);
+                eprintln!("quillo: error in tool `{}`: {}", tool.name, said);
             }
             tool_error("internal error")
         }
@@ -1165,6 +1187,8 @@ pub const CANNOT_ASK: &str = "this needs the user's yes, and this client cannot 
 /// A question in a call made later (`billing.later.f(...)`) from a tool's call: refused, as no one
 /// is there to answer it (FEEDBACK56.md, Part F; branch feedback56).
 pub const NOBODY: &str = "a call made later from a tool's call has no one to ask, so its question is refused: ask in the tool, before making the call";
+/// A question a tool's call reaches where `quillo check` saw none (`Interp::in_tool`).
+pub const UNSEEN: &str = "this tool's call reached a question `quillo check` does not see it ask (in a function given to a builtin or a rule, such as locale_from's), so it is refused and no one is asked: ask in the tool's own code, before it changes anything";
 /// The most questions one call asks, and the most rounds it stops to ask: each one answered goes
 /// in the state, and back each time.
 pub const MOST_QUESTIONS: usize = 100;
@@ -1183,6 +1207,13 @@ pub(crate) struct Asking {
     /// A call made later from a tool's call (`billing.later.f(...)`): there is no one to ask, and
     /// a question is refused, never answered by nobody (FEEDBACK56.md, Part F; branch feedback56).
     nobody: bool,
+    /// A tool's call `quillo check` saw ask nothing, crossing to a service: a question there is
+    /// refused, never answered as outside any tool's call (`UNSEEN`; FEEDBACK56.md, found in the
+    /// coverage review; branch feedback56).
+    unseen: bool,
+    /// The first refusal of a question in the call (`stops_on_error`): its message, and as the log
+    /// says it, with its file.
+    why: Option<(String, String)>,
     /// Who the state is given to, signed (`CALLER_PURPOSE`); the tool; its arguments' digest.
     who: String,
     tool: String,
@@ -1380,6 +1411,8 @@ impl Asking {
         Box::new(Asking {
             can_ask,
             nobody,
+            unseen: false,
+            why: None,
             who: String::new(),
             tool: String::new(),
             args: String::new(),
@@ -1401,6 +1434,14 @@ impl Asking {
     /// What a call made later from a tool's call runs with: no one to ask (`NOBODY`).
     pub(crate) fn nobody() -> Box<Asking> {
         Asking::empty(false, true)
+    }
+
+    /// What a tool's call with no asking (`Interp::in_tool`) gives a service it calls, and takes
+    /// itself once a question is reached: one refused, the call stopped (`UNSEEN`).
+    pub(crate) fn unseen() -> Box<Asking> {
+        let mut a = Asking::empty(false, false);
+        a.unseen = true;
+        a
     }
 
     /// What a service's tool that may ask runs with when its app's door sent no asking: a client
@@ -1456,6 +1497,7 @@ impl Asking {
         json!({
             "can_ask": self.can_ask,
             "nobody": self.nobody,
+            "unseen": self.unseen,
             "rounds": self.rounds,
             "reached": self.reached,
             "wrote": self.wrote,
@@ -1469,6 +1511,12 @@ impl Asking {
     pub(crate) fn from_wire(j: &J) -> Option<Box<Asking>> {
         let o = j.as_object()?;
         let mut a = Asking::empty(o.get("can_ask")?.as_bool()?, o.get("nobody")?.as_bool()?);
+        // Left out by an app of a Quillo before it, whose calls have none (found in the coverage
+        // review).
+        a.unseen = match o.get("unseen") {
+            None => false,
+            Some(u) => u.as_bool()?,
+        };
         a.rounds = o.get("rounds")?.as_u64()? as usize;
         a.reached = o.get("reached")?.as_u64()? as usize;
         a.wrote = match o.get("wrote")? {
@@ -1880,7 +1928,18 @@ enum Asked {
 fn question(it: &mut Interp, line: u32, what: &str, digest: String, request: &dyn Fn() -> Question, take: &dyn Fn(&J) -> Result<J, Stopped>) -> Result<Asked, Ctrl> {
     // In `parallel`'s functions the questions would be asked in no order: a call that may ask
     // runs them one after another (`Interp::run_parallel`), so this is the call's own handle.
-    let Some(a) = it.asking.as_mut() else { return Ok(Asked::Outside) };
+    let Some(a) = it.asking.as_mut() else {
+        // In a tool's call that has no asking, `quillo check` having seen no question: refused
+        // and the call stopped, as at any refused question, so that no `??` takes it (FEEDBACK56.md,
+        // found in the coverage review; branch feedback56).
+        if it.in_tool {
+            let mut a = Asking::unseen();
+            a.stop = Some(Stopped::Failed);
+            it.asking = Some(a);
+            return crate::interp::fail(line, format!("`{}`: {}", what, UNSEEN));
+        }
+        return Ok(Asked::Outside);
+    };
     if a.stop.is_some() {
         return crate::interp::fail(line, ASKING);
     }
@@ -1888,6 +1947,15 @@ fn question(it: &mut Interp, line: u32, what: &str, digest: String, request: &dy
     // feedback56).
     if a.nobody {
         return crate::interp::fail(line, format!("`{}`: {}", what, NOBODY));
+    }
+    if a.unseen {
+        // Said in this service's log now: the call's error is its app's, and a function given to a
+        // builtin here (a locale rule's, under `t`) may take this one.
+        let refused = crate::interp::fail(line, format!("`{}`: {}", what, UNSEEN));
+        if let Err(Ctrl::Error(e)) = &refused {
+            eprintln!("quillo: error in a tool's call: {:#}", e);
+        }
+        return refused;
     }
     if let Some(w) = &a.wrote {
         return crate::interp::fail(line, format!("`{}` comes after {}: {}", what, w, ASK_FIRST));
@@ -1955,12 +2023,35 @@ fn question(it: &mut Interp, line: u32, what: &str, digest: String, request: &dy
     crate::interp::fail(line, ASKING)
 }
 
+/// After a service ran a call made in a tool's call that has no asking, given `Asking::unseen`
+/// (`reply`, what it gave back of it): where it reached a question, which it refused, this call
+/// stops too, as at a refused question of its own (FEEDBACK56.md, found in the coverage review;
+/// branch feedback56).
+pub(crate) fn unseen_stopped(it: &mut Interp, reply: Option<&J>, service: &str) -> bool {
+    if it.asking.is_some() || !it.in_tool || !reply.and_then(|r| r.get("stop")).is_some_and(|s| !s.is_null()) {
+        return false;
+    }
+    let mut a = Asking::unseen();
+    a.stop = Some(Stopped::Failed);
+    a.why = Some((String::new(), format!("service {} refused a question this call reached where `quillo check` sees none, as its log says", service)));
+    it.asking = Some(a);
+    true
+}
+
 /// `f`, `ask` or `confirm`: an error it gives in a tool's call stops the call, so that no `??`
 /// takes it and nothing after it runs (found in review).
 fn stops_on_error(it: &mut Interp, f: impl FnOnce(&mut Interp) -> Result<Value, Ctrl>) -> Result<Value, Ctrl> {
     let r = f(it);
-    if let (Err(Ctrl::Error(_)), Some(a)) = (&r, it.asking.as_mut()) {
+    let file = it.cur_file.clone();
+    if let (Err(Ctrl::Error(e)), Some(a)) = (&r, it.asking.as_mut()) {
         a.stop.get_or_insert(Stopped::Failed);
+        if matches!(a.stop, Some(Stopped::Failed)) && a.why.is_none() {
+            let mut said = (**e).clone();
+            if said.file.is_none() {
+                said.file = file.map(|f| Box::from(&*f));
+            }
+            a.why = Some((e.msg.clone(), format!("{:#}", said)));
+        }
     }
     r
 }

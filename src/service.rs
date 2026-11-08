@@ -1003,7 +1003,16 @@ enum Back {
 /// None where it could not be given: the call stops, and the service is not run with none
 /// (second review).
 fn carry_in(it: &mut Interp, svc: &mut Interp, name: &str) -> Option<Carried> {
-    let Some(a) = it.asking.as_ref() else { return Some(Carried(false)) };
+    let Some(a) = it.asking.as_ref() else {
+        // A tool's call `quillo check` saw ask nothing: the service refuses any question, where it
+        // had answered as outside any tool's call, `confirm` true (`Asking::unseen`; FEEDBACK56.md,
+        // found in the coverage review; branch feedback56).
+        if !it.in_tool {
+            return Some(Carried(false));
+        }
+        svc.asking = crate::mcp::Asking::from_wire(&crate::mcp::Asking::unseen().for_service(name));
+        return Some(Carried(true));
+    };
     svc.asking = crate::mcp::Asking::from_wire(&a.for_service(name));
     if svc.asking.is_none() {
         if let Some(a) = it.asking.as_mut() {
@@ -1021,7 +1030,13 @@ fn carry_back(it: &mut Interp, svc: &mut Interp, carried: Carried, name: &str, l
         return Back::None;
     }
     let reply = svc.asking.take().map(|a| a.reply());
-    let Some(a) = it.asking.as_mut() else { return Back::None };
+    let Some(a) = it.asking.as_mut() else {
+        // Given an unseen asking: a question it refused stops this call too.
+        return match crate::mcp::unseen_stopped(it, reply.as_ref(), name) {
+            true => Back::Stopped { failed: true },
+            false => Back::None,
+        };
+    };
     if !reply.is_some_and(|r| a.take_reply(name, label, &r)) {
         a.fail();
     }
@@ -1293,9 +1308,16 @@ pub(crate) struct ToolHop {
 /// after it (security review). `sent`: some try of it was sent.
 #[allow(clippy::too_many_arguments)]
 fn remote_hop(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: String, tool: Option<&ToolHop>, sent: &mut bool) -> Outcome {
-    let carried = it.asking.as_ref().map(|a| a.for_service(name));
+    // A tool's call with no asking sends one that refuses any question (`carry_in`).
+    let carried = it.asking.as_ref().map(|a| a.for_service(name)).or_else(|| it.in_tool.then(|| crate::mcp::Asking::unseen().for_service(name)));
     let mut back = None;
     let out = remote_tries(it, urls, name, f, args, tenant, rid, call, tool, carried.as_ref(), &mut back, sent);
+    if it.asking.is_none() {
+        return match carried.is_some() && crate::mcp::unseen_stopped(it, back.as_ref(), name) {
+            true => Outcome::Stopped,
+            false => out,
+        };
+    }
     let (Some(_), Some(a)) = (carried, it.asking.as_mut()) else { return out };
     let label = format!("{}.{}", name, f);
     match back {
@@ -2379,7 +2401,8 @@ fn now_ms() -> i64 {
 pub fn later(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (service, f, sent) = call_args(&args, "__service_later", line)?;
     let call = Later {
-        id: if it.asking.is_some() { format!("{}{}", FROM_A_TOOL, new_id(23)) } else { new_id(24) },
+        // Any tool's call, one with no asking too (found in the coverage review).
+        id: if it.asking.is_some() || it.in_tool { format!("{}{}", FROM_A_TOOL, new_id(23)) } else { new_id(24) },
         service,
         f,
         args: serde_json::Value::Array(sent.iter().map(to_wire).collect()).to_string(),

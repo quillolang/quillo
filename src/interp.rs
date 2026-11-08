@@ -352,6 +352,11 @@ pub struct Interp {
     /// was answered, and what it changed, so that a question after a change is refused
     /// (FEEDBACK56.md, Part E; branch feedback56). None everywhere else.
     pub(crate) asking: Option<Box<crate::mcp::Asking>>,
+    /// A tool's call runs (`mcp::answer_tool`), here or in a fork of it. With no `asking`, a
+    /// question its code reaches anyway, through a function `quillo check` cannot follow (a
+    /// `locale_from` rule), is refused: it had been answered as outside any tool's call, `confirm`
+    /// true, a yes nobody gave (FEEDBACK56.md, found in the coverage review; branch feedback56).
+    pub(crate) in_tool: bool,
     /// Run as a service (`--as-service`): its tools, which its app's door lists as its own and
     /// passes the calls of on to it, signed (FEEDBACK56.md, Part F; branch feedback56). None
     /// everywhere else, and for a service with none.
@@ -1702,6 +1707,7 @@ impl Interp {
             fn_callers: Default::default(),
             mcp: None,
             asking: None,
+            in_tool: false,
             offered_tools: None,
             ready_checks: Default::default(),
             style_with: None,
@@ -1825,6 +1831,7 @@ impl Interp {
             fn_callers: self.fn_callers.clone(),
             mcp: self.mcp.clone(),
             asking: None,
+            in_tool: self.in_tool,
             offered_tools: self.offered_tools.clone(),
             ready_checks: self.ready_checks.clone(),
             style_with: self.style_with.clone(),
