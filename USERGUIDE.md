@@ -545,7 +545,23 @@ list<str>, note: str? }` a map's fields; `quillo check` holds the program to the
 call with a map missing `title`, a list of strings for `list<int>`), and at run time
 they are `list` and `map`. A capitalised name in an annotation is a record's (below); one
 that no `type` declares is not reported by `quillo check`, and fails at the first call.
-A function with a capital first letter (`fn Card()`) is taken for a view.
+A function with a capital first letter (`fn Card()`) is taken for a view. A list's item
+type goes in `<>` in a map's or a record's fields too: `quillo check` says so for
+`tags: list[str]?`, with the fix `` `tags: list<str>?` `` (FEEDBACK56.md, Q-861).
+
+`///` lines right above a function, a `server fn` or a component are its description: the
+editor shows them on hover, and the program keeps them, so `quillo docs` writes them as the
+function's `description` ([The program's API](#the-programs-api-openapi)). A `//` line is a
+comment only, `////` is not a description, a `//` line among `///` lines is skipped, and a
+blank line ends one (FEEDBACK56.md, Q-854).
+
+```quillo
+/// Adds a note and gives back all notes.
+server fn add_note(text: str) -> list with db {
+    db.exec("insert into notes (text) values (?)", text)
+    db.query("select text from notes")
+}
+```
 
 ```
 fn titles(posts: list<{ id: int, title: str }>) = posts | map((p) => p.title)
@@ -5299,6 +5315,23 @@ What the document holds:
   the description "the rest of the path, slashes included": an OpenAPI template matches one
   segment, so a gateway routes the rest itself.
 - Each operation has one response, 200, with no content schema.
+- A named type (`type Note = { ... }`, or an alias such as `type Id = int | str`) is
+  written once under `components/schemas` and used with a local `$ref`; a mount's or a
+  service's is named `shop.Item`, with its own name as `title`. Only the types the document
+  uses are there. A record's fields carry `required` (those without `?` and without a
+  default, which a call is refused without), a union of texts is an `enum`, and a written
+  default is its `default`. A union that one value could fit twice (two records,
+  `int | float`) is an `anyOf`, others a `oneOf`. A nullable or defaulted `$ref` is wrapped in
+  `allOf`, since OpenAPI 3.0 ignores what stands beside a `$ref` (FEEDBACK56.md, Q-855).
+- A map type's fields are `required` the same way, in what a call sends. A result's or an
+  error's map type lists none, since the server does not check those fields of what a function
+  gives back; a record does, as it is checked (FEEDBACK56.md, Q-856).
+- A mount's or a service's routes and `server fn`s include those of a file it shares with the
+  program (a `use`d models file), as the running server has them.
+- A `server fn`'s entry has its `///` as `description`, and says what it may do: its
+  `contract` ends with its `with` (`add_note(text: str) -> list ! str with db`) and
+  `x-quillo-effects` lists the same, in Quillo's order. Services compare contracts without the
+  `with`, so one built against an older document still matches (FEEDBACK56.md, Q-854, Q-857).
 
 `/_quillo/describe`, when on, is public: it lists every route, those no page links to as
 well, each `server fn`'s signature, the file and line of every route, and the version of

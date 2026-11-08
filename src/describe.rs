@@ -8,11 +8,14 @@
 //! `/_quillo/describe` under `quillo run --describe`, and written by
 //! `quillo docs app.qwe` from the source alone. The routes of services
 //! mounted in this process are in it under their prefixes, so the front
-//! door describes what is behind it.
+//! door describes what is behind it. Each of the program's types an operation names is
+//! written once under `components/schemas`, and a server fn's `///` comment and `with` are
+//! said (FEEDBACK56.md, Q-854 to Q-857; branch feedback56).
 
 use crate::ast::*;
 use crate::error::QuilloError;
 use crate::interp::Interp;
+use crate::record::Types;
 use crate::value::{scope_vars, Value};
 use serde_json::{json, Map, Value as J};
 use std::path::Path;
@@ -72,6 +75,19 @@ struct Parts {
     /// The callers each server fn takes (`for [...]`), for a gateway to enforce too
     /// (FEEDBACK38.md, Q-458; branch feedback36-39).
     callers: std::collections::HashMap<String, Vec<String>>,
+    /// The program's named types under each prefix: a mount's and a service's are their own
+    /// (FEEDBACK56.md, Q-855; branch feedback56).
+    types: std::collections::HashMap<String, Types>,
+}
+
+impl Parts {
+    /// A service's routes, and the types they name (FEEDBACK56.md, Q-855; branch feedback56).
+    fn take_routes(&mut self, inner: Parts) {
+        self.routes.extend(inner.routes);
+        for (prefix, types) in inner.types {
+            self.types.entry(prefix).or_default().extend(types);
+        }
+    }
 }
 
 fn collect_interp(it: &Interp, prefix: &str, parts: &mut Parts) {
@@ -82,6 +98,7 @@ fn collect_interp(it: &Interp, prefix: &str, parts: &mut Parts) {
     for (f, who) in it.fn_callers.iter() {
         parts.callers.insert(format!("{}{}", prefix, f), who.clone());
     }
+    parts.types.entry(prefix.to_string()).or_default().extend(it.types.iter().map(|(n, td)| (n.clone(), td.clone())));
     let mut fns: Vec<Arc<FnDef>> = scope_vars(&it.globals)
         .into_iter()
         .filter_map(|(n, v)| match v {
@@ -98,7 +115,7 @@ fn collect_interp(it: &Interp, prefix: &str, parts: &mut Parts) {
         if sub.is_service {
             let mut inner = Parts::default();
             collect_interp(sub, &format!("{}{}", prefix, p), &mut inner);
-            parts.routes.extend(inner.routes);
+            parts.take_routes(inner);
         } else {
             collect_interp(sub, &format!("{}{}", prefix, p), parts);
         }
@@ -111,13 +128,25 @@ fn collect_interp(it: &Interp, prefix: &str, parts: &mut Parts) {
         let mut inner = Parts::default();
         let mut seen = Vec::new();
         if collect_file(file, &dir, &format!("{}{}", prefix, p), &mut inner, &mut seen, 1).is_ok() {
-            parts.routes.extend(inner.routes);
+            parts.take_routes(inner);
         }
     }
 }
 
-fn collect_file(path: &Path, base: &Path, prefix: &str, parts: &mut Parts, seen: &mut Vec<std::path::PathBuf>, depth: u32) -> Result<(), QuilloError> {
-    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+/// The files read, each under the prefix of the program that read it: a file the program and a
+/// mount both `use` is read for each, its types the mount's too, as the running server loads it in
+/// each (FEEDBACK56.md, Q-855, found in review; branch feedback56).
+type Seen = Vec<(String, std::path::PathBuf)>;
+
+/// Whether `file` is being read by the program under `prefix` or one it is mounted in: mounting
+/// it again would never end.
+fn read_above(seen: &Seen, prefix: &str, file: &Path) -> bool {
+    let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    seen.iter().any(|(q, f)| *f == file && (q.is_empty() || q == prefix || prefix.starts_with(&format!("{}/", q))))
+}
+
+fn collect_file(path: &Path, base: &Path, prefix: &str, parts: &mut Parts, seen: &mut Seen, depth: u32) -> Result<(), QuilloError> {
+    let key = (prefix.to_string(), path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
     if seen.contains(&key) || depth > 64 {
         return Ok(());
     }
@@ -129,6 +158,10 @@ fn collect_file(path: &Path, base: &Path, prefix: &str, parts: &mut Parts, seen:
         match s {
             Stmt::Route(r) if r.method != crate::ast::GUARD_METHOD => parts.routes.push((prefix.to_string(), r)),
             Stmt::Fn(d) if d.server => parts.fns.push((prefix.to_string(), d)),
+            // For `components/schemas` (FEEDBACK56.md, Q-855; branch feedback56).
+            Stmt::Type(td) => {
+                parts.types.entry(prefix.to_string()).or_default().insert(td.name.clone(), td);
+            }
             Stmt::Expr(crate::ast::Expr::Call(f, args, _)) if matches!(&*f, crate::ast::Expr::Ident(n, _) if n == "__callers") => {
                 if let [crate::ast::Expr::Lit(crate::ast::Lit::Str(name)), crate::ast::Expr::List(l)] = args.as_slice() {
                     let who = l.iter().filter_map(|e| if let crate::ast::Expr::Lit(crate::ast::Lit::Str(s)) = e { Some(s.to_string()) } else { None }).collect();
@@ -137,14 +170,14 @@ fn collect_file(path: &Path, base: &Path, prefix: &str, parts: &mut Parts, seen:
             }
             Stmt::Use(p, _, _, o) if !crate::ast::is_script(&p) => collect_file(&base.join(crate::modules::resolve_use(base, path, &p, o.implied)), base, prefix, parts, seen, depth + 1)?,
             // A service with a prefix: its routes are served here.
-            Stmt::Service(_, Some(p), file, _, _) => {
+            Stmt::Service(_, Some(p), file, _, _) if !read_above(seen, prefix, &base.join(&file)) => {
                 let full = base.join(&file);
                 let dir = full.parent().unwrap_or(base).to_path_buf();
                 let mut inner = Parts::default();
                 collect_file(&full, &dir, &format!("{}{}", prefix, p), &mut inner, seen, depth + 1)?;
-                parts.routes.extend(inner.routes);
+                parts.take_routes(inner);
             }
-            Stmt::Mount(p, file, _) => {
+            Stmt::Mount(p, file, _) if !read_above(seen, prefix, &base.join(&file)) => {
                 let full = base.join(&file);
                 let dir = full.parent().unwrap_or(base).to_path_buf();
                 collect_file(&full, &dir, &format!("{}{}", prefix, p), parts, seen, depth + 1)?;
@@ -182,6 +215,7 @@ impl Parts {
             }
         }
         let mut paths = Map::new();
+        let mut schemas = Schemas::new(&self.types, "#/components/schemas/");
         // One template for a shape, whatever the method: `GET /u/:a` and `POST /u/:b` were the
         // two paths `/u/{a}` and `/u/{b}`, which OpenAPI does not allow; the later takes the
         // first's names, in order (found in review of FEEDBACK53.md, Q-683).
@@ -216,10 +250,11 @@ impl Parts {
                 }
             }
             let mut query: Vec<(String, J, usize, usize)> = Vec::new();
-            for (_, r) in routes.iter() {
+            for (prefix, r) in routes.iter() {
+                schemas.prefix = prefix.clone();
                 if let Some(Pattern::Record(fields)) = &r.query {
                     for f in fields {
-                        let (schema, required) = field_schema(f);
+                        let (schema, required) = schemas.field(f);
                         let name = f.path.join(".");
                         match query.iter_mut().find(|(n, _, _, _)| *n == name) {
                             Some(q) => {
@@ -239,20 +274,29 @@ impl Parts {
             if !params.is_empty() {
                 op.insert("parameters".into(), J::Array(params));
             }
-            let bodies: Vec<J> = routes.iter().filter_map(|(_, r)| request_body(r.body_pat.as_ref())).collect();
+            let bodies: Vec<J> = routes
+                .iter()
+                .filter_map(|(prefix, r)| {
+                    schemas.prefix = prefix.clone();
+                    schemas.request_body(r.body_pat.as_ref())
+                })
+                .collect();
             match bodies.len() {
                 0 => {}
                 1 => {
                     op.insert("requestBody".into(), bodies.into_iter().next().unwrap_or_default());
                 }
                 _ => {
-                    let mut content = Map::new();
+                    // The bodies of each kind, `anyOf` where one body could match two routes: the
+                    // first route takes it (FEEDBACK56.md, Q-855, found in review; branch feedback56).
+                    let mut kinds: Vec<(String, Vec<J>)> = Vec::new();
                     for (kind, v) in bodies.iter().filter_map(|b| b["content"].as_object()).flatten() {
-                        let entry = content.entry(kind.clone()).or_insert_with(|| json!({ "schema": { "oneOf": [] } }));
-                        if let J::Array(a) = &mut entry["schema"]["oneOf"] {
-                            a.push(v["schema"].clone());
+                        match kinds.iter_mut().find(|(k, _)| k == kind) {
+                            Some((_, alts)) => alts.push(v["schema"].clone()),
+                            None => kinds.push((kind.clone(), vec![v["schema"].clone()])),
                         }
                     }
+                    let content: Map<String, J> = kinds.into_iter().map(|(k, alts)| (k, json!({ "schema": schemas.either(alts) }))).collect();
                     op.insert("requestBody".into(), json!({ "required": true, "content": content }));
                 }
             }
@@ -272,32 +316,360 @@ impl Parts {
         }
         let mut fns = Map::new();
         for (prefix, d) in &self.fns {
+            schemas.prefix = prefix.clone();
             let params: Vec<J> = d
                 .params
                 .iter()
-                .map(|p| json!({ "name": p.name.as_str(), "schema": p.ty.as_ref().map_or(json!({}), ty_schema), "required": p.default.is_none() }))
+                .map(|p| json!({ "name": p.name.as_str(), "schema": p.ty.as_ref().map_or(json!({}), |t| schemas.ty(t)), "required": p.default.is_none() }))
                 .collect();
+            // What it may do, as its `with` says: at the end of its contract, and as a list. The
+            // contract services compare (`contract`) stays without it, so that a caller's copy
+            // made before is not refused (FEEDBACK56.md, Q-857; branch feedback56).
+            let effects = d.effects.as_deref().map(|e| effect_names(effect_mask(e)));
             let mut f = Map::new();
-            f.insert("contract".into(), json!(contract(d)));
+            f.insert("contract".into(), json!(match &effects {
+                Some(e) => format!("{} with {}", contract(d), e.join(", ")),
+                None => contract(d),
+            }));
+            // Its `///` comment (FEEDBACK56.md, Q-854; branch feedback56).
+            if let Some(doc) = &d.doc {
+                f.insert("description".into(), json!(doc));
+            }
             f.insert("params".into(), J::Array(params));
+            // A result and an error are held to their types' names, not to a map type's fields
+            // (`record::fits`, not deep): none is said to be required (FEEDBACK56.md, Q-856, found
+            // in review; branch feedback56).
+            schemas.held = false;
             if let Some(r) = &d.ret {
-                f.insert("returns".into(), ty_schema(r));
+                f.insert("returns".into(), schemas.ty(r));
             }
             if let Some(e) = &d.err {
-                f.insert("error".into(), ty_schema(e));
+                f.insert("error".into(), schemas.ty(e));
             }
+            schemas.held = true;
             f.insert("call".into(), json!(format!("POST {}/_quillo/rpc/{}", prefix, d.name)));
             if let Some(who) = self.callers.get(&format!("{}{}", prefix, d.name)) {
                 f.insert("x-quillo-callers".into(), json!(who));
             }
+            if let Some(e) = effects {
+                f.insert("x-quillo-effects".into(), json!(e));
+            }
             fns.insert(format!("{}{}", if prefix.is_empty() { String::new() } else { format!("{} ", prefix) }, d.name), J::Object(f));
         }
-        json!({
+        let mut doc = json!({
             "openapi": "3.0.3",
             "info": { "title": title, "version": crate::version() },
             "paths": paths,
             "x-quillo-server-fns": fns,
-        })
+        });
+        let written = schemas.written();
+        if !written.is_empty() {
+            doc["components"] = json!({ "schemas": written });
+        }
+        doc
+    }
+}
+
+/// The schemas of a document: the program's named types under each prefix, and the ones its
+/// operations name, each written once and referred to with a local `$ref`, a record with its
+/// fields, the ones required, their `enum`s and defaults (FEEDBACK56.md, Q-855 and Q-856; branch
+/// feedback56). A record that names itself, or one that names it, is a `$ref` there too, so the
+/// walk ends. The walk of a `Ty` and the lookup of a name are the same for JSON Schema 2020-12,
+/// whose `$ref`s point elsewhere (`refs`).
+struct Schemas<'a> {
+    types: &'a std::collections::HashMap<String, Types>,
+    /// The prefix whose types a name is looked up in: the program's own (""), a mount's or a
+    /// service's.
+    prefix: String,
+    /// Where a `$ref` points: `#/components/schemas/`.
+    refs: &'static str,
+    /// The key of each of the program's types, by prefix and name.
+    keys: std::collections::HashMap<(String, String), String>,
+    /// Each named type referred to so far: its prefix, its name, its key and whether it is a
+    /// record.
+    named: Vec<(String, String, String, bool)>,
+    /// Whether the fields of a map type written here are checked, so that one is required: in a
+    /// parameter and a record, but not in a result or an error, which are held to the names of
+    /// their types only, nor in an alias, which a result may name (FEEDBACK56.md, Q-856, found
+    /// in review; branch feedback56).
+    held: bool,
+}
+
+impl<'a> Schemas<'a> {
+    /// Each type's key is its name, after its prefix for a mount's or a service's (`shop.Item`),
+    /// in the characters a key may have; two that come out the same are told apart in the order
+    /// of their names, so a key does not depend on which function names its type first, nor on
+    /// the order the functions are listed in (FEEDBACK56.md, Q-855, found in review; branch
+    /// feedback56).
+    fn new(types: &'a std::collections::HashMap<String, Types>, refs: &'static str) -> Self {
+        let mut all: Vec<(&String, &String)> = types.iter().flat_map(|(p, ts)| ts.keys().map(move |n| (p, n))).collect();
+        all.sort();
+        let mut keys = std::collections::HashMap::new();
+        let mut taken = std::collections::HashSet::new();
+        for (prefix, n) in all {
+            let place = prefix.trim_matches('/').replace('/', ".");
+            let base: String = if place.is_empty() { n.to_string() } else { format!("{}.{}", place, n) }
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+                .collect();
+            let mut key = base.clone();
+            let mut i = 1;
+            while !taken.insert(key.clone()) {
+                i += 1;
+                key = format!("{}-{}", base, i);
+            }
+            keys.insert((prefix.clone(), n.clone()), key);
+        }
+        Schemas { types, prefix: String::new(), refs, keys, named: Vec::new(), held: true }
+    }
+
+    /// `{ "$ref": ... }` for one of the program's types.
+    fn refer(&mut self, n: &str) -> Option<J> {
+        let td = self.types.get(&self.prefix)?.get(n)?;
+        let key = self.keys.get(&(self.prefix.clone(), n.to_string()))?.clone();
+        if !self.named.iter().any(|(_, _, k, _)| *k == key) {
+            self.named.push((self.prefix.clone(), n.to_string(), key.clone(), td.is_record()));
+        }
+        Some(json!({ "$ref": format!("{}{}", self.refs, key) }))
+    }
+
+    /// Whether a schema is a `$ref` to a record.
+    fn is_record_ref(&self, s: &J) -> bool {
+        let key = s.get("$ref").and_then(J::as_str).and_then(|r| r.strip_prefix(self.refs));
+        key.is_some_and(|k| self.named.iter().any(|(_, _, m, record)| m == k && *record))
+    }
+
+    /// A `$ref` that something is said beside: OpenAPI 3.0 reads nothing next to a `$ref`, so
+    /// it goes in an `allOf`, an object's said to be one.
+    fn beside_ref(&self, s: J) -> J {
+        if s.get("$ref").is_none() {
+            return s;
+        }
+        let record = self.is_record_ref(&s);
+        let mut w = json!({ "allOf": [s] });
+        if record {
+            w["type"] = json!("object");
+        }
+        w
+    }
+
+    fn nullable(&self, s: J) -> J {
+        let mut s = self.beside_ref(s);
+        s["nullable"] = json!(true);
+        s
+    }
+
+    /// A schema's JSON type, a whole number's a number's; a record's `$ref` an object's.
+    fn kind<'j>(&self, s: &'j J) -> Option<&'j str> {
+        match s.get("type").and_then(J::as_str) {
+            Some("integer") => Some("number"),
+            Some(t) => Some(t),
+            None if self.is_record_ref(s) => Some("object"),
+            None => None,
+        }
+    }
+
+    /// Whether no value fits both: their JSON types differ (a whole number is a number too),
+    /// their `enum`s have no value in common, or both are objects that require a field no value
+    /// of which fits both (`kind: "refund"` and `kind: "new"`). A record's `$ref` is an object
+    /// whose fields are not looked into.
+    fn disjoint(&self, a: &J, b: &J) -> bool {
+        let null = |s: &J| s.get("nullable") == Some(&json!(true));
+        if null(a) && null(b) {
+            return false;
+        }
+        let (Some(ka), Some(kb)) = (self.kind(a), self.kind(b)) else { return false };
+        if ka != kb {
+            return true;
+        }
+        if let (Some(ea), Some(eb)) = (a.get("enum").and_then(J::as_array), b.get("enum").and_then(J::as_array)) {
+            return !ea.iter().any(|v| eb.contains(v));
+        }
+        let required = |s: &J| s.get("required").and_then(J::as_array).cloned().unwrap_or_default();
+        let theirs = required(b);
+        required(a).iter().filter(|k| theirs.contains(k)).filter_map(J::as_str).any(|k| self.disjoint(&a["properties"][k], &b["properties"][k]))
+    }
+
+    /// One of several schemas: `oneOf` when no value can be two of them (an int and a text,
+    /// `"cat"` and `"dog"`), `anyOf` when one can (two records, `int | float`, a type not known),
+    /// since the value passes as the first it fits. A route's alternatives and several routes'
+    /// bodies are said the same way (FEEDBACK56.md, Q-855, found in review; branch feedback56).
+    fn either(&self, alts: Vec<J>) -> J {
+        let overlap = alts.iter().enumerate().any(|(i, a)| alts[i + 1..].iter().any(|b| !self.disjoint(a, b)));
+        json!({ if overlap { "anyOf" } else { "oneOf" }: alts })
+    }
+
+    /// A type: a list's items, a map's fields, one of the program's types by `$ref`, a union of
+    /// texts one `enum`.
+    fn ty(&mut self, t: &Ty) -> J {
+        let mut alts: Vec<J> = Vec::new();
+        let mut texts: Vec<J> = Vec::new();
+        let mut texts_at = None;
+        for n in t.names.iter().filter(|n| *n != "null") {
+            if n.starts_with('"') {
+                texts_at.get_or_insert(alts.len());
+                texts.push(json!(serde_json::from_str::<String>(n).unwrap_or_default()));
+                continue;
+            }
+            alts.push(match (n.as_str(), &t.elem, &t.fields) {
+                ("list", Some(e), _) => json!({ "type": "array", "items": self.ty(e) }),
+                ("map", _, Some(fs)) => self.fields(fs, &[]),
+                (n, _, _) => self.name(n),
+            });
+        }
+        if let Some(i) = texts_at {
+            alts.insert(i, json!({ "type": "string", "enum": texts }));
+        }
+        let s = if alts.len() == 1 { alts.remove(0) } else { self.either(alts) };
+        if may_be_null(t) {
+            self.nullable(s)
+        } else {
+            s
+        }
+    }
+
+    /// A map's or a record's fields: each one without `?` and without a default is required,
+    /// as a call is refused without it, where they are checked (`held`), and a default is said
+    /// when it is written as a value.
+    fn fields(&mut self, fs: &[(String, Ty)], defaults: &[(String, Expr)]) -> J {
+        let mut props = Map::new();
+        let mut required = Vec::new();
+        for (k, t) in fs {
+            let mut s = self.ty(t);
+            let default = defaults.iter().find(|(d, _)| d == k);
+            if let Some(v) = default.and_then(|(_, e)| literal(e)) {
+                s = self.beside_ref(s);
+                s["default"] = v;
+            }
+            if self.held && default.is_none() && !may_be_null(t) {
+                required.push(json!(k));
+            }
+            props.insert(k.clone(), s);
+        }
+        let mut s = json!({ "type": "object", "properties": props });
+        if !required.is_empty() {
+            s["required"] = J::Array(required);
+        }
+        s
+    }
+
+    /// A type's name: Quillo's own, or the program's by `$ref`; another as it is named.
+    fn name(&mut self, n: &str) -> J {
+        self.refer(n).unwrap_or_else(|| name_schema(n))
+    }
+
+    /// The named types referred to, each written once, by key: one written may refer to more.
+    fn written(&mut self) -> Map<String, J> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut i = 0;
+        while i < self.named.len() {
+            let (prefix, name, key, _) = self.named[i].clone();
+            let types = self.types;
+            let Some(td) = types.get(&prefix).and_then(|t| t.get(&name)) else { break };
+            let outer = std::mem::replace(&mut self.prefix, prefix);
+            // A record is checked field by field wherever it is named; an alias as the place
+            // that names it is.
+            let held = std::mem::replace(&mut self.held, td.is_record());
+            let mut s = match (&td.ty.fields, td.is_record()) {
+                (Some(fs), true) => self.fields(fs, &td.defaults),
+                _ => self.ty(&td.ty),
+            };
+            self.held = held;
+            self.prefix = outer;
+            if key != name {
+                s = self.beside_ref(s);
+                s["title"] = json!(name);
+            }
+            out.insert(key, s);
+            i += 1;
+        }
+        out.into_iter().collect()
+    }
+
+    /// A route's payload pattern: `{ form: {...} }`, `{ json: {...} }`.
+    fn request_body(&mut self, p: Option<&Pattern>) -> Option<J> {
+        let Some(Pattern::Record(fields)) = p else { return None };
+        let mut content = Map::new();
+        for f in fields {
+            let kind = match f.path.first().map(String::as_str) {
+                Some("form") => "application/x-www-form-urlencoded",
+                Some("json") => "application/json",
+                _ => continue,
+            };
+            content.insert(kind.into(), json!({ "schema": self.pattern(&f.pat) }));
+        }
+        (!content.is_empty()).then(|| json!({ "required": true, "content": content }))
+    }
+
+    fn field(&mut self, f: &RecField) -> (J, bool) {
+        let optional = f.default.is_some() || matches!(&f.pat, Pattern::Alt(ps) if ps.iter().any(|p| matches!(p, Pattern::Lit(Lit::Nil))));
+        (self.pattern(&f.pat), !optional)
+    }
+
+    fn pattern(&mut self, p: &Pattern) -> J {
+        match p {
+            // A route's `{ json: Note }` by `$ref` too (FEEDBACK56.md, Q-855; branch feedback56).
+            Pattern::Type(t) => self.name(t),
+            Pattern::Lit(Lit::Str(s)) => json!({ "type": "string", "enum": [s.to_string()] }),
+            Pattern::Lit(Lit::Int(n)) => json!({ "type": "integer", "enum": [n] }),
+            Pattern::Lit(Lit::Bool(b)) => json!({ "type": "boolean", "enum": [b] }),
+            Pattern::Alt(ps) => {
+                let some: Vec<J> = ps.iter().filter(|p| !matches!(p, Pattern::Lit(Lit::Nil))).map(|p| self.pattern(p)).collect();
+                let nullable = some.len() < ps.len();
+                let s = if some.len() == 1 { some.into_iter().next().unwrap() } else { self.either(some) };
+                if nullable {
+                    self.nullable(s)
+                } else {
+                    s
+                }
+            }
+            Pattern::As(q, _) => self.pattern(q),
+            Pattern::List(items, _) => json!({ "type": "array", "items": items.first().map_or(json!({}), |p| self.pattern(p)) }),
+            Pattern::Record(fields) => {
+                let mut props = Map::new();
+                let mut required = Vec::new();
+                for f in fields {
+                    let (schema, req) = self.field(f);
+                    let name = f.path.join(".");
+                    if req {
+                        required.push(json!(name));
+                    }
+                    props.insert(name, schema);
+                }
+                let mut s = json!({ "type": "object", "properties": props });
+                if !required.is_empty() {
+                    s["required"] = J::Array(required);
+                }
+                s
+            }
+            _ => json!({}),
+        }
+    }
+}
+
+/// Whether a value of the type may be null, or left out of a map or a record.
+fn may_be_null(t: &Ty) -> bool {
+    t.optional || t.names.iter().any(|n| n == "null")
+}
+
+/// A default written as a value (`"member"`, `[]`, `{ a: 1 }`), as JSON; one worked out when a
+/// record is made (`now()`) is not known here.
+fn literal(e: &Expr) -> Option<J> {
+    match e {
+        Expr::Lit(Lit::Bool(b)) => Some(json!(b)),
+        Expr::Lit(Lit::Int(n)) => Some(json!(n)),
+        Expr::Lit(Lit::Float(f)) => serde_json::Number::from_f64(*f).map(J::Number),
+        Expr::Lit(Lit::Dec(d)) => Some(json!(d.to_string())),
+        Expr::Lit(Lit::Str(s)) => Some(json!(&**s)),
+        Expr::Template(parts) => parts.iter().map(|p| if let TPart::Lit(s) = p { Some(s.as_str()) } else { None }).collect::<Option<String>>().map(J::String),
+        Expr::Unary(UnOp::Neg, x, _) => match &**x {
+            Expr::Lit(Lit::Int(n)) => n.checked_neg().map(|n| json!(n)),
+            Expr::Lit(Lit::Float(f)) => serde_json::Number::from_f64(-*f).map(J::Number),
+            _ => None,
+        },
+        Expr::List(items) => items.iter().map(literal).collect::<Option<Vec<J>>>().map(J::Array),
+        Expr::Map(entries) => entries.iter().map(|(k, v)| Some((k.clone(), literal(v)?))).collect::<Option<Map<String, J>>>().map(J::Object),
+        _ => None,
     }
 }
 
@@ -326,86 +698,6 @@ fn openapi_path(prefix: &str, segs: &[Seg]) -> (String, Vec<J>) {
         path.push('/');
     }
     (path, params)
-}
-
-/// A route's payload pattern: `{ form: {...} }`, `{ json: {...} }`.
-fn request_body(p: Option<&Pattern>) -> Option<J> {
-    let Some(Pattern::Record(fields)) = p else { return None };
-    let mut content = Map::new();
-    for f in fields {
-        let kind = match f.path.first().map(String::as_str) {
-            Some("form") => "application/x-www-form-urlencoded",
-            Some("json") => "application/json",
-            _ => continue,
-        };
-        content.insert(kind.into(), json!({ "schema": pattern_schema(&f.pat) }));
-    }
-    (!content.is_empty()).then(|| json!({ "required": true, "content": content }))
-}
-
-fn field_schema(f: &RecField) -> (J, bool) {
-    let optional = f.default.is_some() || matches!(&f.pat, Pattern::Alt(ps) if ps.iter().any(|p| matches!(p, Pattern::Lit(Lit::Nil))));
-    (pattern_schema(&f.pat), !optional)
-}
-
-fn pattern_schema(p: &Pattern) -> J {
-    match p {
-        Pattern::Type(t) => name_schema(t),
-        Pattern::Lit(Lit::Str(s)) => json!({ "type": "string", "enum": [s.to_string()] }),
-        Pattern::Lit(Lit::Int(n)) => json!({ "type": "integer", "enum": [n] }),
-        Pattern::Lit(Lit::Bool(b)) => json!({ "type": "boolean", "enum": [b] }),
-        Pattern::Alt(ps) => {
-            let some: Vec<J> = ps.iter().filter(|p| !matches!(p, Pattern::Lit(Lit::Nil))).map(pattern_schema).collect();
-            let nullable = some.len() < ps.len();
-            let mut s = if some.len() == 1 { some.into_iter().next().unwrap() } else { json!({ "oneOf": some }) };
-            if nullable {
-                s["nullable"] = json!(true);
-            }
-            s
-        }
-        Pattern::As(q, _) => pattern_schema(q),
-        Pattern::List(items, _) => json!({ "type": "array", "items": items.first().map_or(json!({}), pattern_schema) }),
-        Pattern::Record(fields) => {
-            let mut props = Map::new();
-            let mut required = Vec::new();
-            for f in fields {
-                let (schema, req) = field_schema(f);
-                let name = f.path.join(".");
-                if req {
-                    required.push(json!(name));
-                }
-                props.insert(name, schema);
-            }
-            let mut s = json!({ "type": "object", "properties": props });
-            if !required.is_empty() {
-                s["required"] = J::Array(required);
-            }
-            s
-        }
-        _ => json!({}),
-    }
-}
-
-fn ty_schema(t: &Ty) -> J {
-    let mut alts: Vec<J> = t
-        .names
-        .iter()
-        .filter(|n| *n != "null")
-        .map(|n| match (n.as_str(), &t.elem, &t.fields) {
-            ("list", Some(e), _) => json!({ "type": "array", "items": ty_schema(e) }),
-            ("map", _, Some(fs)) => {
-                let props: Map<String, J> = fs.iter().map(|(k, v)| (k.clone(), ty_schema(v))).collect();
-                json!({ "type": "object", "properties": props })
-            }
-            (n, _, _) => name_schema(n),
-        })
-        .collect();
-    let nullable = t.optional || t.names.iter().any(|n| n == "null");
-    let mut s = if alts.len() == 1 { alts.remove(0) } else { json!({ "oneOf": alts }) };
-    if nullable {
-        s["nullable"] = json!(true);
-    }
-    s
 }
 
 /// A Quillo type's name as JSON Schema.

@@ -2556,6 +2556,7 @@ impl Interp {
                     ),
                     nesting: 0,
                     file: None,
+                    doc: None,
                     hot: Default::default(),
                     request_use: Default::default(),
                 });

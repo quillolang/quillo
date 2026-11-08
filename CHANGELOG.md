@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- A function's `///` comment is kept by the program: `quillo docs` and `/_quillo/describe` write it
+  as the `server fn`'s description, and MCP tools will use it (FEEDBACK56.md, Q-854).
+- The API document writes each named type once under `components/schemas` and refers to it
+  with `$ref`, where it gave a bare name a validator takes as anything; records and map types
+  say which fields are `required` (FEEDBACK56.md, Q-855, Q-856).
+- A `server fn`'s entry says what it may do: its `with` ends its `contract`, and
+  `x-quillo-effects` lists the same (FEEDBACK56.md, Q-857).
+- `list[str]` in a map's or a record's field gives the fix, `list<str>`, as a parameter's does
+  (FEEDBACK56.md, Q-861).
 - `quillo check` no longer calls a class unused when `class={{ active: on }}`, a map in a list or
   choice inside `class={...}`, or `class:active={on}` writes it, and `classes()` and
   `quillo classes` now list a map's keys, so a CSS engine makes rules for them. A map held in a

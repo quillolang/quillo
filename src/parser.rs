@@ -1442,7 +1442,9 @@ impl Parser {
         let ours = std::mem::replace(&mut self.styling, outer);
         let (mut body, nesting) = body?;
         name_unmarked_styles(&mut body, ours);
-        Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line, nesting, file: self.file.clone(), hot: Default::default(), request_use: Default::default() })
+        // Its `///` comment (FEEDBACK56.md, Q-854; branch feedback56).
+        let doc = self.lx.doc_above(line);
+        Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line, nesting, file: self.file.clone(), doc, hot: Default::default(), request_use: Default::default() })
     }
 
     /// `style <css>` at a file's top level: the CSS of the components the file declares, and no
@@ -1474,7 +1476,7 @@ impl Parser {
             args[1] = Expr::Lit(Lit::Nil);
         }
         let body = Expr::Block(vec![Stmt::Expr(Expr::Call(Box::new(Expr::Ident("__style".into(), line)), args, line))]);
-        Ok(Stmt::Fn(Arc::new(FnDef { name, params: Vec::new(), ret: None, err: None, effects: None, server: false, component: false, body, line, nesting: 1, file: self.file.clone(), hot: Default::default(), request_use: Default::default() })))
+        Ok(Stmt::Fn(Arc::new(FnDef { name, params: Vec::new(), ret: None, err: None, effects: None, server: false, component: false, body, line, nesting: 1, file: self.file.clone(), doc: None, hot: Default::default(), request_use: Default::default() })))
     }
 
     /// `style <css>` in a component's or view's body: the call of `__style`,
@@ -1562,7 +1564,8 @@ impl Parser {
         let ours = std::mem::replace(&mut self.styling, outer);
         let (mut body, nesting) = body?;
         name_unmarked_styles(&mut body, ours);
-        let def = FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line, nesting, file: self.file.clone(), hot: Default::default(), request_use: Default::default() };
+        let doc = self.lx.doc_above(line);
+        let def = FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line, nesting, file: self.file.clone(), doc, hot: Default::default(), request_use: Default::default() };
         key_not_a_param(&def)?;
         Ok(def)
     }
@@ -1763,6 +1766,11 @@ impl Parser {
                 }
                 Err(e) => return Err(e),
             };
+            // `tags: list[str]?`: as a parameter's (FEEDBACK56.md, Q-861; branch feedback56).
+            if self.at(&Tok::LBracket)? {
+                let msg = self.list_hint(&key, &ty);
+                return self.err_at(msg);
+            }
             if let Some(ds) = defaults.as_deref_mut() {
                 if self.eat(&Tok::Assign)? {
                     let e = self.parse_expr()?;
@@ -1975,11 +1983,29 @@ impl Parser {
             Err(e) => return Err(e),
         };
         if self.at(&Tok::LBracket)? {
-            let elem = ty.names.first().cloned().unwrap_or_default();
-            let elem = if elem == "list" { "int".to_string() } else { elem };
-            return self.err_at(format!("a list's item type goes in `<>`: `{}: list<{}>`", pname, elem));
+            let msg = self.list_hint(pname, &ty);
+            return self.err_at(msg);
         }
         Ok(Some(ty))
+    }
+
+    /// At a `[` after the type `ty` of `name`: `list[str]` or `str[]`, as TypeScript, Python and
+    /// most of what an AI has read write a list's type. Where the item type goes, with the one
+    /// written and a `?` after the `]`: `tags: list<str>?`, for a parameter and a map's or a
+    /// record's field alike (FEEDBACK56.md, Q-861; branch feedback56).
+    fn list_hint(&mut self, name: &str, ty: &Ty) -> String {
+        let saved = self.save();
+        let _ = self.next();
+        let inner = if self.at(&Tok::RBracket).unwrap_or(true) { None } else { self.parse_type().ok() };
+        let optional = self.eat(&Tok::RBracket).unwrap_or(false) && self.at(&Tok::Question).unwrap_or(false);
+        self.restore(saved);
+        let item = match inner {
+            Some(t) => t.text(),
+            // `list[]`: no item type was written.
+            None if ty.names == ["list"] && ty.elem.is_none() => "int".to_string(),
+            None => ty.text(),
+        };
+        format!("a list's item type goes in `<>`: `{}: list<{}>{}`", name, item, if optional { "?" } else { "" })
     }
 
     /// `{id}` or `{id:int}` just after a path's `/`: its name and type. Not a request pattern
@@ -4015,6 +4041,7 @@ fn arrow(params: Vec<Param>, ret: Option<Ty>, (body, nesting): (Expr, u32), line
         body,
         nesting,
         file,
+        doc: None,
         hot: Default::default(),
         request_use: Default::default(),
     }))

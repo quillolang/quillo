@@ -107,7 +107,11 @@ fn a_json_body_says_its_fields_and_other_keys_are_not_a_body() {
 fn a_record_type_in_a_body_is_named_and_an_any_is_open() {
     let doc = doc_of("named", "type User = { name: str }\nroute POST /u { json: User } = 1\nroute POST /v { json: { a: any, b: list, c: map, d: [] } } = 2\n");
     let content = &doc["paths"]["/u"]["post"]["requestBody"]["content"]["application/json"]["schema"];
-    assert_eq!(content, &json!({ "x-quillo-type": "User" }));
+    // Named, and its fields said once under components/schemas: it was the bare name
+    // `{ "x-quillo-type": "User" }`, which a validator takes as anything (FEEDBACK56.md, Q-855;
+    // branch feedback56).
+    assert_eq!(content, &json!({ "$ref": "#/components/schemas/User" }));
+    assert_eq!(doc["components"]["schemas"]["User"], json!({ "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] }));
     let v = &doc["paths"]["/v"]["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"];
     assert_eq!(v["a"], json!({}));
     assert_eq!(v["b"], json!({ "type": "array" }));
@@ -127,7 +131,8 @@ fn a_server_fn_is_a_contract_and_a_plain_fn_is_not_there() {
     let full = &fns["full"];
     assert_eq!(full["contract"], "full(ids: list<int>, who: { name: str, age: int }, n?: int | str, note?: str?) -> list<str> ! str");
     assert_eq!(full["params"][0]["schema"], json!({ "type": "array", "items": { "type": "integer" } }));
-    assert_eq!(full["params"][1]["schema"], json!({ "type": "object", "properties": { "name": { "type": "string" }, "age": { "type": "integer" } } }));
+    // With the fields a call is refused without (FEEDBACK56.md, Q-856; branch feedback56).
+    assert_eq!(full["params"][1]["schema"], json!({ "type": "object", "properties": { "name": { "type": "string" }, "age": { "type": "integer" } }, "required": ["name", "age"] }));
     assert_eq!(full["params"][2], json!({ "name": "n", "schema": { "oneOf": [{ "type": "integer" }, { "type": "string" }] }, "required": false }));
     assert_eq!(full["params"][3]["schema"], json!({ "type": "string", "nullable": true }));
     assert_eq!(full["returns"], json!({ "type": "array", "items": { "type": "string" } }));

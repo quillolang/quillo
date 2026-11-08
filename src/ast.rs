@@ -189,6 +189,9 @@ pub struct FnDef {
     /// The file it was written in (an absolute path), when the parser was
     /// told: for the debugger's stack frames and breakpoints.
     pub file: Option<Arc<str>>,
+    /// The `///` lines right above it, one line of text each, which `quillo docs` writes as
+    /// what it does; a `//` line is not one (FEEDBACK56.md, Q-854; branch feedback56).
+    pub doc: Option<String>,
     /// How often it was called, for compiling it (src/jit.rs); `u32::MAX`
     /// once it is known that it cannot be.
     pub hot: std::sync::atomic::AtomicU32,
@@ -340,6 +343,7 @@ impl RouteDef {
                 line: self.line,
                 nesting: 1,
                 file: self.file.clone(),
+                doc: None,
                 hot: Default::default(),
                 request_use: Default::default(),
             })

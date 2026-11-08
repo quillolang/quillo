@@ -2242,6 +2242,7 @@ impl<'a> Compiler<'a> {
                             body: e.clone(),
                             nesting: 0,
                             file: None,
+                            doc: None,
                             hot: Default::default(),
                             request_use: Default::default(),
                         };
@@ -2579,6 +2580,7 @@ impl<'a> Compiler<'a> {
             body: e,
             nesting: 0,
             file: None,
+            doc: None,
             hot: Default::default(),
             request_use: Default::default(),
         };

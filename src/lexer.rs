@@ -141,6 +141,10 @@ pub struct Lexer {
     /// is text meant, and not noted (FEEDBACK45.md, Q-510; branch feedback40-43). Shared, not
     /// copied, by the lexer's clones, which a parser makes to look ahead.
     pub plain_dollars: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
+    /// Each line a `//` comment starts (after its indentation), and a `///` one's text: what a
+    /// function declared under them says it does (see `doc_above`; FEEDBACK56.md, Q-854; branch
+    /// feedback56). Shared by the lexer's clones, as `plain_dollars` is.
+    comments: Arc<std::sync::Mutex<std::collections::HashMap<u32, Option<String>>>>,
 }
 
 impl Lexer {
@@ -169,7 +173,44 @@ impl Lexer {
             // Q-529; branch feedback40-43).
             chars.push(if c == '\r' { '\n' } else { c });
         }
-        Lexer { chars: Arc::new(chars), pos: 0, line, stack: Vec::new(), last: None, comment_newline: None, unclosed: None, plain_dollars: Default::default() }
+        Lexer { chars: Arc::new(chars), pos: 0, line, stack: Vec::new(), last: None, comment_newline: None, unclosed: None, plain_dollars: Default::default(), comments: Default::default() }
+    }
+
+    /// A `//` comment just read, from `start` to here on `line`: noted when it starts its line
+    /// (see `comments`), with its text after `///` and one space when it is a `///` one. `////`
+    /// is a line of slashes, as in Rust (FEEDBACK56.md, Q-854; branch feedback56).
+    fn note_comment(&self, start: usize, line: u32) {
+        if !self.chars[..start].iter().rev().take_while(|c| **c != '\n').all(|c| matches!(c, ' ' | '\t')) {
+            return;
+        }
+        let text = &self.chars[start..self.pos];
+        let doc = (text.get(2) == Some(&'/') && text.get(3) != Some(&'/')).then(|| {
+            let t: String = text[3..].iter().collect();
+            t.strip_prefix(' ').unwrap_or(&t).trim_end().to_string()
+        });
+        self.comments.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(line, doc);
+    }
+
+    /// What the `///` lines right above `line` say, one line each, a `//` line among them
+    /// passed over: a function's doc comment, which the program keeps (FEEDBACK56.md, Q-854;
+    /// branch feedback56). A blank line or code above ends it; empty `///` lines at either end
+    /// are left out.
+    pub fn doc_above(&self, line: u32) -> Option<String> {
+        let comments = self.comments.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut lines = Vec::new();
+        let mut l = line;
+        while l > 1 {
+            l -= 1;
+            match comments.get(&l) {
+                Some(Some(t)) => lines.push(t.as_str()),
+                Some(None) => {}
+                None => break,
+            }
+        }
+        lines.reverse();
+        let first = lines.iter().position(|t| !t.is_empty())?;
+        let last = lines.iter().rposition(|t| !t.is_empty())?;
+        Some(lines[first..=last].join("\n"))
     }
 
     pub fn peek_char(&self) -> Option<char> {
@@ -208,12 +249,14 @@ impl Lexer {
                     self.bump();
                 }
                 Some('/') if self.peek_char_at(1) == Some('/') => {
+                    let (start, line) = (self.pos, self.line);
                     while let Some(c) = self.peek_char() {
                         if c == '\n' {
                             break;
                         }
                         self.bump();
                     }
+                    self.note_comment(start, line);
                 }
                 Some('/') if self.peek_char_at(1) == Some('*') => {
                     let line = self.line;
