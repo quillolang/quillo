@@ -6,7 +6,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-quillolang
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,7 +54,7 @@ jobs:
 
   # Known vulnerabilities, licences and sources of dependencies (deny.toml).
   deny:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-quillolang
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2

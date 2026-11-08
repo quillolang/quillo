@@ -26,7 +26,7 @@ permissions:
 jobs:
   release:
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-quillolang
     steps:
       - uses: actions/checkout@v4
       - name: The release, with the CHANGELOG's section for it as its notes
