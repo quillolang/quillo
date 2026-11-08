@@ -9576,7 +9576,7 @@ fn b1_coverage_mcp_call_refuses_one_argument_too_many() {
         Err(_) => Err("it failed".to_string()),
     };
     assert_eq!(said(mcp::call(&mut it, one, vec![Q::Int(1)], 0)), Ok("1".to_string()));
-    assert_eq!(said(mcp::call(&mut it, one, vec![Q::Int(1), Q::Int(2)], 0)), Err("`one` takes 1 arguments, got 2".to_string()));
+    assert_eq!(said(mcp::call(&mut it, one, vec![Q::Int(1), Q::Int(2)], 0)), Err("`one` takes 1 argument, got 2".to_string()));
     assert_eq!(said(mcp::call(&mut it, one, vec![], 0)), Err("missing argument `a` for `one`".to_string()));
     drop(it);
     let _ = std::fs::remove_dir_all(&d);
@@ -10537,4 +10537,105 @@ fn unseen_a_call_made_later_from_a_tool_that_asks_nothing_has_no_one_to_ask() {
     assert_eq!(f_later_ended(s.port, &id), json!({ "state": "failed", "result": null, "why": nobody }));
     drop(s);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+// ---- quillo check: a way that leaves the function (found in the coverage review) -------------
+
+/// Ways that leave the function (`return`, `reply`) before a question: what they changed is no
+/// change before it, though still their function's for its callers and a lambda's for its call.
+/// The question marked `// refused` is refused, with what `quillo check` says; no other line is.
+const LEFT_SRC: &str = r#"db.open(":memory:")
+db.exec("create table t (id integer primary key, v int)")
+
+fn save(v: int) = db.exec("insert into t (v) values (?)", v)
+fn save_or(x: int) -> int {
+    if x == 0 { save(0); return 1 }
+    2
+}
+
+/// The change is on a way that returned: the question is after none.
+fn mcp returned(id: int) -> bool with db {
+    if id == 0 { save(0); return false }
+    confirm("Archive?")
+}
+
+/// A reply leaves too.
+fn mcp replied_first(id: int) -> bool with db {
+    if id == 0 { save(0); reply 400 "no" }
+    confirm("Archive?")
+}
+
+/// A match arm that returns.
+fn mcp arm(id: int) -> bool with db {
+    match id {
+        0 => { save(0); return false },
+        _ => 1,
+    }
+    confirm("Archive?")
+}
+
+/// A loop's turn that returns: past the loop, no change on the way that goes on.
+fn mcp looped_out(n: int) -> int with db {
+    for i in range(0, n) {
+        if i == 3 { save(i); return i }
+    }
+    confirm("Archive?") ? 1 : 0
+}
+
+/// Both ways return: what follows is never reached.
+fn mcp both(id: int) -> bool with db {
+    if id == 0 { save(0); return false } else { save(1); return true }
+    confirm("Never?")
+}
+
+/// No return on the way: the change is before the question, as ever.
+fn mcp stays(id: int) -> bool with db {
+    if id == 0 { save(0) }
+    confirm("Archive?") // refused: `confirm` comes after `save`, which changes something (`db.exec`)
+}
+
+/// A question on the way that returns, after its change.
+fn mcp inside(id: int) -> bool with db {
+    if id == 0 { save(0); confirm("Inside?"); return false } // refused: `confirm` comes after `save`, which changes something (`db.exec`)
+    true
+}
+
+/// A function that changes, then returns: its change is the caller's.
+fn mcp through_fn() -> bool with db {
+    save_or(0)
+    confirm("After it?") // refused: `confirm` comes after `save_or`, which changes something (`save`, which changes something (`db.exec`))
+}
+
+/// A lambda that changes, then returns: its change is made once the call is.
+fn mcp through_lambda() -> bool with db {
+    let _n = [1].map((x) => {
+        if x == 1 { save(x); return 1 }
+        2
+    })
+    confirm("After it?") // refused: `confirm` comes after `save`, which changes something (`db.exec`)
+}
+"#;
+
+#[test]
+fn e_coverage_review_a_way_that_leaves_changes_nothing_after_it() {
+    let d = dir("e-left", LEFT_SRC);
+    let (_, _, err) = quillo(&d, &["check", "main.qwe"]);
+    let mut want = Vec::new();
+    for (n, line) in LEFT_SRC.lines().enumerate() {
+        if let Some((_, said)) = line.split_once("// refused: ") {
+            want.push(format!("main.qwe:{}: error: {}: {}", n + 1, said, ASK_FIRST_TEXT));
+        }
+    }
+    let got: Vec<&str> = err.lines().filter(|l| l.contains(": error: ")).collect();
+    assert_eq!(got, want, "{}", err);
+    // The one the review found, alone: it checks, and its door starts.
+    let lone = "db.open(\":memory:\")\nfn save(v: int) = db.exec(\"select ?\", v)\n\n/// Archives, unless it is the first.\nfn mcp archive(id: int) -> bool with db {\n    if id == 0 { save(0); return false }\n    confirm(\"Archive?\")\n}\n";
+    let d2 = dir("e-left-lone", lone);
+    let (ok, _, err) = quillo(&d2, &["check", "main.qwe"]);
+    assert!(ok && !err.contains(": error: "), "{}", err);
+    let mut io = EDoor::Stdio(Stdio::start(&d2, &["main.qwe"]));
+    assert_eq!(io.result("archive", json!({ "id": 1 }), true, None, None)["resultType"], json!("input_required"));
+    assert_eq!(text_of(&io.result("archive", json!({ "id": 0 }), true, None, None)), (false, "false".to_string()));
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&d2);
 }

@@ -1587,6 +1587,14 @@ struct OrderWalk<'a> {
     /// How many loops deep: a loop's body is walked twice, its second turn after its first's
     /// changes, three deep at most.
     loops: u32,
+    /// The way the walk is on has left the function (a `return`, a `reply`): what follows on it is
+    /// never reached, and a change on it is none after the `if` or `match` it is a way of. It had
+    /// been: `if id == 0 { save(0); return false }` then `confirm(...)` was refused, and the
+    /// program could not start (FEEDBACK56.md, found in the coverage review; branch feedback56).
+    ended: bool,
+    /// The first change on a way that left: the function's change all the same, for its callers,
+    /// and a lambda's for the call it is given to.
+    left: Option<String>,
 }
 
 /// A name a file uses from another, which it does not `use` (branch feedback19-fixes).
@@ -3321,14 +3329,14 @@ impl Checker {
         self.ordered.borrow_mut().insert(def_key(d), Arc::new(Ordered::default()));
         let file = d.file.clone().unwrap_or_else(|| file.clone());
         let locals = d.params.iter().map(|p| p.name.to_string()).collect();
-        let mut w = OrderWalk { top_lets, file, locals, changed: None, asks: None, late: Vec::new(), loops: 0 };
+        let mut w = OrderWalk { top_lets, file, locals, changed: None, asks: None, late: Vec::new(), loops: 0, ended: false, left: None };
         for p in &d.params {
             if let Some(e) = &p.default {
                 self.order_expr(e, &mut w);
             }
         }
         self.order_expr(&d.body, &mut w);
-        let o = Arc::new(Ordered { changes: w.changed, asks: w.asks, late: w.late });
+        let o = Arc::new(Ordered { changes: w.changed.or(w.left), asks: w.asks, late: w.late });
         self.ordered.borrow_mut().insert(def_key(d), o.clone());
         o
     }
@@ -3361,21 +3369,29 @@ impl Checker {
             Expr::If(c, a, b) => {
                 self.order_expr(c, w);
                 let ways: Vec<&Expr> = std::iter::once(&**a).chain(b.as_deref()).collect();
-                self.order_ways(&ways, w);
+                self.order_ways(&ways, b.is_some(), w);
             }
+            // A value no arm takes is an error: the arms are all its ways.
             Expr::Match(s, arms, _) => {
                 self.order_expr(s, w);
                 let before = w.changed.clone();
-                let mut after = None;
+                let (mut after, mut all_end) = (None, !arms.is_empty());
                 for a in arms {
                     w.changed = before.clone();
+                    w.ended = false;
                     if let Some(g) = &a.guard {
                         self.order_expr(g, w);
                     }
                     self.order_expr(&a.body, w);
-                    after = after.or(w.changed.take());
+                    if w.ended {
+                        w.left = w.left.take().or(w.changed.take());
+                    } else {
+                        after = after.or(w.changed.take());
+                    }
+                    all_end &= w.ended;
                 }
                 w.changed = before.or(after);
+                w.ended = all_end;
             }
             Expr::For(_, items, body, _) => {
                 self.order_expr(items, w);
@@ -3384,6 +3400,9 @@ impl Checker {
             Expr::While(c, body, _) => self.order_loop(&[c], body, w),
             Expr::Block(stmts) => {
                 for st in stmts {
+                    if w.ended {
+                        break;
+                    }
                     match st {
                         Stmt::Let(p, x, _) => {
                             self.order_expr(x, w);
@@ -3401,7 +3420,13 @@ impl Checker {
                             self.order_expr(o, w);
                             self.order_expr(x, w)
                         }
-                        Stmt::Expr(x) | Stmt::State(_, x, _) | Stmt::Return(Some(x), _) => self.order_expr(x, w),
+                        Stmt::Expr(x) | Stmt::State(_, x, _) => self.order_expr(x, w),
+                        Stmt::Return(x, _) => {
+                            if let Some(x) = x {
+                                self.order_expr(x, w);
+                            }
+                            w.ended = true;
+                        }
                         Stmt::Fn(f) => {
                             w.locals.insert(f.name.clone());
                         }
@@ -3414,6 +3439,7 @@ impl Checker {
                 if let Some(b) = b {
                     self.order_expr(b, w)
                 }
+                w.ended = true;
             }
             Expr::Html(el, _) => {
                 let mut parts = Vec::new();
@@ -3437,16 +3463,24 @@ impl Checker {
     }
 
     /// Ways one of which is taken: each from the change before them, and after them the change of
-    /// any.
-    fn order_ways(&self, ways: &[&Expr], w: &mut OrderWalk) {
+    /// any that goes on (`OrderWalk::ended`). `all`: they are all the ways, an `if` with its `else`;
+    /// without one, the way past it goes on.
+    fn order_ways(&self, ways: &[&Expr], all: bool, w: &mut OrderWalk) {
         let before = w.changed.clone();
-        let mut after = None;
+        let (mut after, mut all_end) = (None, all);
         for x in ways {
             w.changed = before.clone();
+            w.ended = false;
             self.order_expr(x, w);
-            after = after.or(w.changed.take());
+            if w.ended {
+                w.left = w.left.take().or(w.changed.take());
+            } else {
+                after = after.or(w.changed.take());
+            }
+            all_end &= w.ended;
         }
         w.changed = before.or(after);
+        w.ended = all_end;
     }
 
     /// A loop: its test and body, then again, as a second turn comes after the first's changes.
@@ -3456,6 +3490,8 @@ impl Checker {
         for _ in 0..turns {
             test.iter().for_each(|t| self.order_expr(t, w));
             self.order_expr(body, w);
+            // A turn that left ends no other, and the loop may run none: the way goes on after it.
+            w.ended = false;
         }
         w.loops -= 1;
     }
@@ -3474,13 +3510,14 @@ impl Checker {
         for a in args.iter().filter(|a| !matches!(a, Expr::Lambda(_))) {
             self.order_expr(a, w);
         }
-        for a in args {
-            if let Expr::Lambda(d) = a {
-                self.order_expr(&d.body, w);
-            }
-        }
-        if let Expr::Lambda(d) = callee {
+        // A lambda's `return` or `reply` ends it, not the way the call is on: what it changed on
+        // any of its ways is changed once the call is made.
+        let lambdas = args.iter().chain(std::iter::once(callee)).filter_map(|a| if let Expr::Lambda(d) = a { Some(d) } else { None });
+        for d in lambdas {
+            let (ended, left) = (w.ended, w.left.take());
             self.order_expr(&d.body, w);
+            w.changed = w.changed.take().or(w.left.take());
+            (w.ended, w.left) = (ended, left);
         }
         // `ask` of the page's form, fewer than three arguments, in a tool's code: refused, as the
         // call is when it runs (second review). A piped value and a method's receiver are its

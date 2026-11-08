@@ -313,7 +313,7 @@ pub fn reading_only(it: &mut Interp, line: u32, body: &mut dyn FnMut(&mut Interp
 /// by `server::make_arg`, and one left out kept None for its default.
 fn made_args(it: &mut Interp, def: &FnDef, args: Vec<Option<Value>>) -> Result<Result<Vec<Option<Value>>, String>, (String, Ctrl)> {
     if args.len() > def.params.len() {
-        return Ok(Err(format!("`{}` takes {} arguments, got {}", def.name, def.params.len(), args.len())));
+        return Ok(Err(format!("`{}` takes {} argument{}, got {}", def.name, def.params.len(), if def.params.len() == 1 { "" } else { "s" }, args.len())));
     }
     if let Some(p) = def.params.iter().enumerate().find(|(i, p)| p.default.is_none() && !matches!(args.get(*i), Some(Some(_)))).map(|(_, p)| p) {
         return Ok(Err(format!("missing argument `{}` for `{}`", p.name, def.name)));

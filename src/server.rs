@@ -2172,7 +2172,7 @@ pub(crate) fn take_args(it: &mut Interp, def: &crate::ast::FnDef, args: Vec<Valu
 /// feedback56).
 pub(crate) fn make_args(it: &mut Interp, def: &crate::ast::FnDef, args: Vec<Value>) -> Result<Result<Vec<Value>, String>, (String, Ctrl)> {
     if args.len() > def.params.len() {
-        return Ok(Err(format!("`{}` takes {} arguments, got {}", def.name, def.params.len(), args.len())));
+        return Ok(Err(format!("`{}` takes {} argument{}, got {}", def.name, def.params.len(), if def.params.len() == 1 { "" } else { "s" }, args.len())));
     }
     if let Some(p) = def.params.get(args.len()..).and_then(|rest| rest.iter().find(|p| p.default.is_none())) {
         return Ok(Err(format!("missing argument `{}` for `{}`", p.name, def.name)));
