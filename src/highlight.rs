@@ -366,6 +366,37 @@ fn regex_may_start(s: &[char], i: usize) -> bool {
         && ["return", "typeof", "instanceof", "case", "do", "else", "in", "of", "new", "delete", "void", "throw", "yield", "await"].contains(&word.as_str())
 }
 
+/// Whether the `mcp` from `i` to `j` is the tag of a tool, as the parser reads it: after `fn`,
+/// `view` or `component` with a name after it, or after `service` with a name or a `/` after it,
+/// on its line. `fn mcp(x)` names a function `mcp`, and `mcp` is a name everywhere else
+/// (FEEDBACK56.md, Q-853; branch feedback56).
+#[inline(never)]
+pub(crate) fn mcp_tag(s: &[char], i: usize, j: usize) -> bool {
+    let space = |c: &char| matches!(c, ' ' | '\t');
+    let mut b = i;
+    while b > 0 && space(&s[b - 1]) {
+        b -= 1;
+    }
+    let end = b;
+    while b > 0 && ident_char(s[b - 1], false) {
+        b -= 1;
+    }
+    let before: String = s[b..end].iter().collect();
+    let at = s[j..].iter().position(|c| !space(c)).map(|k| j + k);
+    let after = at.map(|k| s[k]);
+    // A `/` that starts a comment starts no path (FEEDBACK56.md, Q-853, found in review; branch
+    // feedback56).
+    let path = after == Some('/') && !at.is_some_and(|k| matches!(s.get(k + 1), Some('/' | '*')));
+    end < i
+        && j < s.len()
+        && space(&s[j])
+        && match before.as_str() {
+            "fn" | "view" | "component" => after.is_some_and(|c| c.is_alphabetic() || c == '_'),
+            "service" => path || after.is_some_and(|c| c.is_alphabetic() || c == '_'),
+            _ => false,
+        }
+}
+
 fn ident_start(c: char) -> bool {
     c.is_alphabetic() || c == '_' || c == '$'
 }
@@ -623,7 +654,7 @@ fn colour(code: &str, lang: &str, timed: bool) -> Option<String> {
                 } else {
                     None
                 }
-            } else if l.keywords.contains(&probe.as_str()) {
+            } else if l.keywords.contains(&probe.as_str()) || (qwe && probe == "mcp" && mcp_tag(&s, i, j)) {
                 Some("hl-k")
             } else if l.consts.contains(&probe.as_str()) {
                 Some("hl-n")

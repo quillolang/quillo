@@ -2547,6 +2547,7 @@ impl Interp {
                     err: None,
                     effects: None,
                     server: false,
+                    mcp: false,
                     component: false,
                     line,
                     body: Expr::Call(
@@ -2563,9 +2564,15 @@ impl Interp {
                 define(env, &td.name, Value::Func(Arc::new(Closure { def, env: env.clone() })));
                 Ok(Value::Nil)
             }
-            Stmt::Service(name, prefix, file, options, line) => {
+            Stmt::Service(name, prefix, file, options, line, mcp) => {
                 if !Arc::ptr_eq(env, &self.globals) {
                     return fail(*line, "`service` must be at the top level");
+                }
+                // `service mcp crm = "https://..."`: kept for later, said as `quillo check` says it
+                // (FEEDBACK56.md, Q-853; branch feedback56). `service mcp /billing` runs as
+                // `service /billing` does.
+                if *mcp && prefix.is_none() {
+                    return fail(*line, &crate::service::mcp_calls_later(name));
                 }
                 let options = match options {
                     Some(e) => Some(self.eval(e, env)?),

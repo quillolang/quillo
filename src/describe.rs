@@ -170,7 +170,7 @@ fn collect_file(path: &Path, base: &Path, prefix: &str, parts: &mut Parts, seen:
             }
             Stmt::Use(p, _, _, o) if !crate::ast::is_script(&p) => collect_file(&base.join(crate::modules::resolve_use(base, path, &p, o.implied)), base, prefix, parts, seen, depth + 1)?,
             // A service with a prefix: its routes are served here.
-            Stmt::Service(_, Some(p), file, _, _) if !read_above(seen, prefix, &base.join(&file)) => {
+            Stmt::Service(_, Some(p), file, _, _, _) if !read_above(seen, prefix, &base.join(&file)) => {
                 let full = base.join(&file);
                 let dir = full.parent().unwrap_or(base).to_path_buf();
                 let mut inner = Parts::default();
@@ -353,6 +353,11 @@ impl Parts {
             }
             if let Some(e) = effects {
                 f.insert("x-quillo-effects".into(), json!(e));
+            }
+            // `server fn mcp`: a tool too; a plain `fn mcp`, not a page's to call, is not here
+            // (FEEDBACK56.md, Q-853; branch feedback56).
+            if d.mcp {
+                f.insert("x-quillo-mcp".into(), json!(true));
             }
             fns.insert(format!("{}{}", if prefix.is_empty() { String::new() } else { format!("{} ", prefix) }, d.name), J::Object(f));
         }

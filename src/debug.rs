@@ -709,7 +709,7 @@ fn stops_in(src: &str) -> (Vec<u32>, Vec<u32>) {
             Stmt::Fn(d) => d.line,
             Stmt::Route(r) => r.line,
             Stmt::Type(t) => t.line,
-            Stmt::Mount(_, _, l) | Stmt::Service(_, _, _, _, l) => *l,
+            Stmt::Mount(_, _, l) | Stmt::Service(_, _, _, _, l, _) => *l,
             s => stmt_line(s).unwrap_or(0),
         };
         if start > 0 {
@@ -735,7 +735,7 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<u32>) {
         }
         Stmt::Fn(d) => walk_body(&d.body, out),
         Stmt::Route(r) => walk_body(&r.body, out),
-        Stmt::Service(_, _, _, Some(e), _) => walk(e, out),
+        Stmt::Service(_, _, _, Some(e), _, _) => walk(e, out),
         _ => {}
     }
 }

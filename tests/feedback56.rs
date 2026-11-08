@@ -636,3 +636,630 @@ fn q861_quillo_check_says_it() {
     assert!(format!("{}{}", out, err).contains("main.qwe:1: error: a list's item type goes in `<>`: `tags: list<str>?`"), "{}{}", out, err);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ---- Q-853, slice 2: the words `fn mcp`, `server fn mcp`, `service mcp` (Part A) ------------------
+
+/// Each top-level function of a program as parsed: its name, whether it is a server fn, and
+/// whether it is a tool.
+fn fns(src: &str) -> Vec<(String, bool, bool)> {
+    let stmts = quillo::parser::Parser::new(src).parse_program().unwrap_or_else(|e| panic!("{}: {}\n{}", e.line, e.msg, src));
+    stmts
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Fn(d) => Some((d.name.clone(), d.server, d.mcp)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool(name: &str) -> (String, bool, bool) {
+    (name.to_string(), false, true)
+}
+
+/// Each service a program declares, as parsed: its name, its path, its file, and its tag.
+fn services(src: &str) -> Vec<(String, Option<String>, String, bool)> {
+    let stmts = quillo::parser::Parser::new(src).parse_program().unwrap_or_else(|e| panic!("{}: {}\n{}", e.line, e.msg, src));
+    stmts
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Service(n, p, f, _, _, mcp) => Some((n.clone(), p.clone(), f.clone(), *mcp)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What `quillo check` says of a program, a line each: `3 error: ...`, `3 warning: ...`.
+fn said(src: &str) -> Vec<String> {
+    quillo::check::check_source(src, "t.qwe", Path::new("."))
+        .diagnostics
+        .iter()
+        .map(|d| format!("{} {}: {}", d.line, if d.severity == quillo::check::Severity::Error { "error" } else { "warning" }, d.message))
+        .collect()
+}
+
+#[track_caller]
+fn says(src: &str, want: &[&str]) {
+    assert_eq!(said(src), want, "\n--- source ---\n{}", src);
+}
+
+/// A tool with nothing to say of it, for the rules below: its `///`, a type, a `with`.
+const CLEAN: &str = "/// The time now.\nfn mcp clock() with time = now()\n";
+
+const NAME_RULE: &str = "a tool's name is 1 to 128 of A-Z, a-z, 0-9, `_`, `-` and `.`, as MCP allows";
+
+#[test]
+fn q853_the_tag_is_read_after_fn_and_server_fn() {
+    assert_eq!(fns("fn mcp total() = 1\n"), [tool("total")]);
+    assert_eq!(fns("server fn mcp add_note(text: str) -> list ! str with db = []\n"), [("add_note".to_string(), true, true)]);
+    // `public` before it, as before any declaration; a tab; a body in braces; its `///` kept.
+    assert_eq!(fns("public fn mcp a() = 1\npublic server fn mcp b() = 1\n"), [tool("a"), ("b".to_string(), true, true)]);
+    assert_eq!(fns("fn mcp\tt() = 1\nfn  mcp  u() {\n    1\n}\n"), [tool("t"), tool("u")]);
+    assert_eq!(doc_of_fn("/// What it does.\nfn mcp t() = 1\n", "t").as_deref(), Some("What it does."));
+    // A tool named `mcp`, in both kinds.
+    assert_eq!(fns("fn mcp mcp() = 1\n"), [tool("mcp")]);
+    assert_eq!(fns("server fn mcp mcp(x: int) = x\n"), [("mcp".to_string(), true, true)]);
+    // Any name the parser takes, which `quillo check` holds to MCP's (below).
+    assert_eq!(fns("fn mcp café() = 1\nfn mcp _x() = 1\n"), [tool("café"), tool("_x")]);
+    // `server fn for` stays a server fn's: `for [...]` after the tag's name.
+    assert_eq!(fns("server fn mcp t() for [\"shop\"] = 1\n"), [("t".to_string(), true, true)]);
+    // Not a keyword after the tag: said as a name is.
+    assert_eq!(refused("fn mcp if() = 1\n"), (1, "expected a function name, found `if`, which is a keyword: pick another name".to_string()));
+}
+
+#[test]
+fn q853_mcp_stays_a_name_everywhere_else() {
+    // A function named `mcp`: `(` after it, with or without a space, and with no parameters.
+    let plain = |n: &str, server: bool| (n.to_string(), server, false);
+    assert_eq!(fns("fn mcp(x) = x + 1\n"), [plain("mcp", false)]);
+    assert_eq!(fns("fn mcp (x) = x\nfn mcp() = 1\n"), [plain("mcp", false), plain("mcp", false)]);
+    assert_eq!(fns("server fn mcp(x: int) = x\n"), [plain("mcp", true)]);
+    // A private one, renamed as private names are.
+    let private = fns("private fn mcp(x) = x\n");
+    assert!(private.len() == 1 && private[0].0.starts_with("mcp__") && !private[0].1 && !private[0].2, "{:?}", private);
+    // The report's probe runs as it did: `mcp(1)` is 2.
+    let mut it = Interp::new(".");
+    it.load_source("fn mcp(x) = x + 1\nlet mcp_of = { mcp: 3 }\nfn f(mcp) = mcp * 2\nlet mcp2 = mcp(1) + mcp_of.mcp + f(5)\n", "case.qwe").unwrap();
+    assert_eq!(quillo::value::lookup(&it.globals, "mcp2").unwrap().repr(), "15");
+    // A variable, a parameter, a key, a service named `mcp`, a name on the next line.
+    assert!(fns("let mcp = 1\nfn f(mcp) = mcp\nlet m = { mcp: 1 }\nprint(m.mcp + mcp)\n").iter().all(|f| !f.2));
+    assert_eq!(services("service mcp = \"mcp.qwe\"\n"), [("mcp".to_string(), None, "mcp.qwe".to_string(), false)]);
+    assert!(refused("fn mcp\ntotal() = 1\n").1.contains("expected `(`"), "{:?}", refused("fn mcp\ntotal() = 1\n"));
+    // A tool's own code calls it as any function.
+    let mut it = Interp::new(".");
+    it.load_source("/// Doubles.\nfn mcp double(n: int) -> int = n * 2\nlet four = double(2)\n", "case.qwe").unwrap();
+    assert_eq!(quillo::value::lookup(&it.globals, "four").unwrap().repr(), "4");
+}
+
+#[test]
+fn q853_service_mcp_is_read_with_a_path_or_a_name() {
+    let s = |n: &str, p: Option<&str>, f: &str, mcp: bool| (n.to_string(), p.map(String::from), f.to_string(), mcp);
+    assert_eq!(services("service mcp /billing = \"billing.qwe\"\n"), [s("billing", Some("/billing"), "billing.qwe", true)]);
+    assert_eq!(services("service mcp crm = \"https://crm.example.com/mcp\"\n"), [s("crm", None, "https://crm.example.com/mcp", true)]);
+    // A service named `mcp`, with the tag and without; the forms of today.
+    assert_eq!(services("service mcp mcp = \"tools.qwe\"\n"), [s("mcp", None, "tools.qwe", true)]);
+    assert_eq!(services("service /billing = \"billing.qwe\"\nservice billing2 = \"b.qwe\"\n"), [s("billing", Some("/billing"), "billing.qwe", false), s("billing2", None, "b.qwe", false)]);
+    assert_eq!(services("service mcp\t/a/b = \"sub/b.qwe\"\n"), [s("b", Some("/a/b"), "sub/b.qwe", true)]);
+    // How it is called, kept after the file, as for any service.
+    let stmts = quillo::parser::Parser::new("service mcp /billing = \"billing.qwe\" { timeout: \"2s\" }\n").parse_program().unwrap();
+    assert!(matches!(&stmts[0], Stmt::Service(_, _, _, Some(_), 1, true)));
+    // A comment after it starts no path: a service named `mcp`, as before (found in review).
+    assert_eq!(services("service mcp /* note */ = \"mcp.qwe\"\n"), [s("mcp", None, "mcp.qwe", false)]);
+    assert_eq!(services("service mcp /b = \"b.qwe\"\nservice mcp /x/y = \"y.qwe\"\n"), [s("b", Some("/b"), "b.qwe", true), s("y", Some("/x/y"), "y.qwe", true)]);
+    // `service` and `mcp` as names.
+    assert!(services("let service = 1\nlet mcp = service + 1\n").is_empty());
+}
+
+#[test]
+fn q853_a_tool_cannot_be_private() {
+    let msg = "a `fn mcp` cannot be private: it is a tool, an address that anyone the door lets in can call; keep the work in a private `fn` it calls";
+    assert_eq!(refused("private fn mcp t() = 1\n"), (1, msg.to_string()));
+    assert_eq!(refused("let a = 1\n\nprivate fn mcp t() {\n    a\n}\n"), (3, msg.to_string()));
+    // `private server fn mcp`: a server fn's own words, as before.
+    assert_eq!(refused("private server fn mcp t() = 1\n").1, "a `server fn` cannot be private: it is an address on the server that anyone can call; keep the work in a private `fn` it calls");
+    // A private function named `mcp`, and a public tool, are fine.
+    assert!(quillo::parser::Parser::new("private fn mcp(x) = x\npublic fn mcp t() = 1\n").parse_program().is_ok());
+}
+
+#[test]
+fn q853_a_tool_is_declared_at_the_top_level() {
+    let msg = "error: `fn mcp` must be declared at the top level, as `server fn` is: a tool is an address of the program's";
+    says("fn outer() {\n    fn mcp inner() = 1\n    inner()\n}\nprint(outer())\n", &[&format!("2 {}", msg)]);
+    // In a component, a branch, a loop; two levels down.
+    says("component C() {\n    fn mcp inner() = 1\n    <p>{inner()}</p>\n}\n", &[&format!("2 {}", msg)]);
+    says("if true {\n    fn mcp t() = 1\n}\n", &[&format!("2 {}", msg)]);
+    says("fn a() {\n    fn b() {\n        fn mcp c() = 1\n        c()\n    }\n    b()\n}\nprint(a())\n", &[&format!("3 {}", msg)]);
+    // A nested `server fn mcp` is a nested server fn, said once.
+    says("fn outer() {\n    server fn mcp inner() = 1\n    inner()\n}\nprint(outer())\n", &["2 error: `server fn` and `component` must be declared at the top level"]);
+    // A function named `mcp` inside one is fine; so is the tool at the top level.
+    says("fn outer() {\n    fn mcp(x) = x\n    mcp(1)\n}\nprint(outer())\n", &[]);
+    says(CLEAN, &[]);
+}
+
+#[test]
+fn q853_a_view_or_a_component_is_no_tool() {
+    let not = |what: &str| format!("error: a {} is not a tool: `fn mcp` is for a function that answers with data, not a page", what);
+    says("view mcp Card() = <p>x</p>\n", &[&format!("1 {}", not("view"))]);
+    // A view whatever its name: `view mcp card()` passed (found in review); `view mcp(x)` is a
+    // view named `mcp`.
+    let view = "a view is not a tool: `fn mcp` is for a function that answers with data, not a page".to_string();
+    assert_eq!(refused("view mcp card() = \"x\"\n"), (1, view.clone()));
+    assert_eq!(refused("let a = 1\nview mcp card_2(n: int) {\n    \"x\"\n}\n"), (2, view));
+    says("view mcp card() = \"x\"\n", &[&format!("1 {}", not("view"))]);
+    assert!(quillo::parser::Parser::new("view mcp(x) = <p>{x}</p>\nview card() = \"x\"\n").parse_program().is_ok());
+    says("/// A card.\nfn mcp Card() with time = <p>x</p>\n", &[&format!("2 {}", not("view"))]);
+    says("component mcp Box() {\n    <p>x</p>\n}\n", &[&format!("1 {}", not("component"))]);
+    // As before: a view and a component named so, and `component mcp(...)`'s own error.
+    says("view Card() = <p>x</p>\ncomponent Box() {\n    <p>x</p>\n}\n", &[]);
+    assert_eq!(refused("component mcp(x) {\n    <p/>\n}\n").1, "component names start with a capital letter: `mcp`");
+}
+
+#[test]
+fn q853_a_tools_name_is_one_mcp_allows() {
+    let t = |name: &str| format!("/// It.\nfn mcp {}() with time = now()\n", name);
+    says(&t("café"), &[&format!("2 error: {}: `café` has `é`", NAME_RULE)]);
+    says(&t("日本"), &[&format!("2 error: {}: `日本` has `日`", NAME_RULE)]);
+    says(&t("naïve_ok"), &[&format!("2 error: {}: `naïve_ok` has `ï`", NAME_RULE)]);
+    // 128 characters is the most; one more is refused; one is the least, and the shortest name.
+    let long = |n: usize| format!("a{}", "b".repeat(n - 1));
+    says(&t(&long(128)), &[]);
+    says(&t(&long(127)), &[]);
+    says(&t(&long(129)), &[&format!("2 error: {}: this one has 129 characters", NAME_RULE)]);
+    says(&t("a"), &[]);
+    says(&t("_"), &[]);
+    says(&t("Get_2_items"), &[&format!("2 error: a view is not a tool: `fn mcp` is for a function that answers with data, not a page")]);
+    says(&t("get_2_items"), &[]);
+    // A plain function keeps any name Quillo takes.
+    says("fn café() = 1\nprint(café())\n", &[]);
+}
+
+#[test]
+fn q853_each_parameter_comes_as_json() {
+    let json = |p: &str, t: &str| format!("2 error: parameter `{}` of tool `probe` is {}, which cannot come as JSON", p, t);
+    says("/// It.\nfn mcp probe(f: fn) with time = now()\n", &[&json("f", "fn")]);
+    says("/// It.\nfn mcp probe(a: int, page: html, r: response) with time = now()\n", &[&json("page", "html"), &json("r", "response")]);
+    // A `server fn mcp`'s is said of the tool, once.
+    says("/// It.\nserver fn mcp probe(f: fn) with time = now()\n", &[&json("f", "fn")]);
+    // As before for a server fn; and what JSON carries.
+    says("server fn s(f: fn) = 1\n", &["1 error: parameter `f` of server fn `s` is fn, which the browser cannot send"]);
+    says("type Note = { text: str }\n/// It.\nfn mcp probe(a: int, b: str?, c: list<int>, d: { x: int }, e: Note, f: \"a\" | \"b\", g: any = 1) with time = now()\n", &[]);
+}
+
+#[test]
+fn q853_check_warns_of_what_the_client_would_not_be_told() {
+    let w = |s: &str| format!("2 warning: {}", s);
+    // No `///`: a `//` line is not one.
+    says("// Not a doc.\nfn mcp probe() with time = now()\n", &[&w("tool `probe` has no `///` comment: an AI client sees only its name and its parameters; say what it does on a `///` line above it")]);
+    // A parameter with no type, a default too; one with a type.
+    says("/// It.\nfn mcp probe(a, b = 2, c: int) with time = now()\n", &[
+        &w("parameter `a` of tool `probe` has no type: its schema is `{}`, and the model guesses what to send"),
+        &w("parameter `b` of tool `probe` has no type: its schema is `{}`, and the model guesses what to send"),
+    ]);
+    // No `with`: what it is seen to use, or none.
+    says("/// It.\nfn mcp probe() = now()\n", &[&w("tool `probe` has no `with`, so an AI client is told it may change anything and reach anywhere; it uses time: `with time`")]);
+    says("/// It.\nfn mcp probe() = [random(), now()]\n", &[&w("tool `probe` has no `with`, so an AI client is told it may change anything and reach anywhere; it uses time and random: `with time, random`")]);
+    // Seen to do nothing, it is fine as written: `with` takes one effect at least, and a hint of
+    // one it does not use would tell the client it may (decided in review: it warned, and said
+    // `with db`). Through a helper, seen as well; a tool that uses nothing passes untold.
+    says("/// Adds.\nfn mcp add(a: int, b: int) -> int = a + b\n", &[]);
+    says("fn twice(n) = n * 2\n/// It.\nfn mcp probe(a: int) -> int = twice(a) + len(str(a))\n", &[]);
+    says("fn stamp() = now()\n/// It.\nfn mcp probe(a: int) = [a, stamp()]\n", &["3 warning: tool `probe` has no `with`, so an AI client is told it may change anything and reach anywhere; it uses time: `with time`"]);
+    // A server fn mcp the same; a plain fn and a plain server fn are told nothing.
+    says("/// It.\nserver fn mcp probe(a) with time = now()\n", &[&w("parameter `a` of tool `probe` has no type: its schema is `{}`, and the model guesses what to send")]);
+    says("fn f(a) = a\nserver fn s(a) = a\nprint(f(1))\n", &[]);
+}
+
+#[test]
+fn q853_a_tool_answers_with_data_not_a_page() {
+    let page = |what: &str| format!("2 error: a tool answers with data, not a page: `probe` answers with {}", what);
+    says("/// It.\nfn mcp probe() with time = <p>{now()}</p>\n", &[&page("html")]);
+    says("/// It.\nfn mcp probe() with time = redirect(\"/login\")\n", &[&page("a response, as `redirect(...)` makes")]);
+    says("/// It.\nfn mcp probe() -> html with time = markdown(str(now()))\n", &[&page("html")]);
+    says("/// It.\nserver fn mcp probe() with time = respond(200, str(now()))\n", &[&page("a response, as `redirect(...)` makes")]);
+    // An early `return` of one, and an answer that may be one.
+    says("/// It.\nfn mcp probe(x: bool) with time {\n    if x {\n        return redirect(\"/\")\n    }\n    <p>{now()}</p>\n}\n", &[&page("html")]);
+    says("/// It.\nfn mcp probe(x: bool) with time = if x { <p/> } else { str(now()) }\n", &["2 warning: a tool answers with data, not a page: `probe` may answer with html"]);
+    // Data, null, an error, a `reply`: none is a page; nor what the checker cannot see.
+    says("/// It.\nfn mcp probe(x: int) -> map ! str with time {\n    if x < 0 {\n        reply 400 \"no\"\n    }\n    if x == 0 {\n        return err(\"zero\")\n    }\n    { at: now(), html: \"<p/>\" }\n}\n", &[]);
+    says("/// It.\nfn mcp probe(f: any) with time = now()\n", &[]);
+    // A view that answers html stays a view; a plain fn may answer with a page.
+    says("fn page() = <p>x</p>\nprint(page())\n", &[]);
+}
+
+#[test]
+fn q853_service_mcp_with_a_name_is_for_later() {
+    let later = "`service mcp crm` would call another MCP server, which Quillo does not do yet: `service mcp /crm = \"crm.qwe\"` offers a Quillo file's tools here, and `service crm = \"crm.qwe\"` calls its server fns";
+    // Said once, with its line; its calls not said again as unknown.
+    says("let a = 1\nservice mcp crm = \"https://crm.example.com/mcp\"\nfn find_one() with http = crm.find_customer(\"x\")\nprint(a)\n", &[&format!("2 error: {}", later)]);
+    // Run anyway, the program says it at its line.
+    let mut it = Interp::new(".");
+    let Err(e) = it.load_source("let a = 1\nservice mcp crm = \"https://crm.example.com/mcp\"\n", "case.qwe") else { panic!("it ran") };
+    assert_eq!((e.line, e.msg.as_str()), (2, later));
+}
+
+#[test]
+fn q853_service_mcp_with_a_path_is_a_service_as_today() {
+    let d = dir("q853-service", "service mcp /billing = \"billing.qwe\"\n\nroute GET / = str(billing.total())\n");
+    std::fs::write(d.join("billing.qwe"), "/// The total.\nfn mcp invoice() with time = 1\n\nserver fn total() = 41 + 1\n\nroute GET /status = \"up\"\n").unwrap();
+    let (ok, out, err) = quillo(&d, &["check", "main.qwe"]);
+    assert!(ok, "{}{}", out, err);
+    assert!(out.contains("main.qwe: ok") && !err.contains("warning"), "{}{}", out, err);
+    {
+        let s = support::serve(&d.join("main.qwe"), &[]);
+        assert_eq!(support::send(s.port, "GET", "/", &[], "").body, "42");
+        assert_eq!(support::send(s.port, "GET", "/billing/status", &[], "").body, "up");
+    }
+    // Not under --split: the named form is no service to start, so it starts none.
+    assert_eq!(quillo::service::declared(&d.join("main.qwe")).unwrap().len(), 1);
+    std::fs::write(d.join("main.qwe"), "service mcp /billing = \"billing.qwe\"\nservice mcp crm = \"https://crm.example.com/mcp\"\n").unwrap();
+    assert_eq!(quillo::service::declared(&d.join("main.qwe")).unwrap().iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>(), ["billing"]);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn q853_a_tools_name_is_the_programs_in_every_file() {
+    // Two files' tools of one name are one address: "defined twice", as two server fns' are.
+    let d = dir("q853-files", "use lib.qwe\n\n/// Mine.\nfn mcp total() with time = 2\n\nroute GET / = str(total())\n");
+    std::fs::write(d.join("lib.qwe"), "/// Theirs.\nfn mcp total() with time = 1\n").unwrap();
+    let (ok, out, err) = quillo(&d, &["check", "main.qwe"]);
+    assert!(!ok && err.contains("main.qwe:4: error: `total` is defined twice, at lib.qwe:2 and main.qwe:4"), "{}{}", out, err);
+    // Two plain functions of one name are each their file's, as before.
+    std::fs::write(d.join("main.qwe"), "use lib.qwe\n\nfn total() = 2\n\nroute GET / = str(total())\n").unwrap();
+    std::fs::write(d.join("lib.qwe"), "fn total() = 1\n").unwrap();
+    let (ok, out, err) = quillo(&d, &["check", "main.qwe"]);
+    assert!(ok, "{}{}", out, err);
+    // A tool in a file the program uses is taken as any function, by `use` and by `import`.
+    std::fs::write(d.join("lib.qwe"), "/// Theirs.\nfn mcp total() with time = 1\n").unwrap();
+    std::fs::write(d.join("main.qwe"), "import lib.qwe use total\n\nroute GET / = str(total())\n").unwrap();
+    let (ok, out, err) = quillo(&d, &["check", "main.qwe"]);
+    assert!(ok, "{}{}", out, err);
+    // `quillo fix` writes the import, and leaves the tags as they are.
+    std::fs::write(d.join("main.qwe"), "use total from \"lib.qwe\"\n\n/// Mine.\nfn mcp mine() with time = total()\n\nroute GET / = str(mine())\n").unwrap();
+    let (ok, out, err) = quillo(&d, &["fix", "main.qwe"]);
+    assert!(ok, "{}{}", out, err);
+    assert_eq!(std::fs::read_to_string(d.join("main.qwe")).unwrap(), "import lib.qwe use total\n\n/// Mine.\nfn mcp mine() with time = total()\n\nroute GET / = str(mine())\n");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn q853_quillo_check_says_each_with_its_line() {
+    let d = dir(
+        "q853-check",
+        "/// Fine.\nserver fn mcp add(a: int, b: int) -> int with time = a + b\n\nprivate fn helper() = now()\n\nfn mcp untold(x) = [helper(), x]\n\nfn outer() {\n    fn mcp inner() = 1\n    inner()\n}\n\nroute GET / = str(outer())\n",
+    );
+    let (ok, out, err) = quillo(&d, &["check", "main.qwe"]);
+    assert!(!ok, "{}{}", out, err);
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines, [
+        "main.qwe:6: warning: parameter `x` of tool `untold` has no type: its schema is `{}`, and the model guesses what to send",
+        "main.qwe:6: warning: tool `untold` has no `///` comment: an AI client sees only its name and its parameters; say what it does on a `///` line above it",
+        "main.qwe:6: warning: tool `untold` has no `with`, so an AI client is told it may change anything and reach anywhere; it uses time: `with time`",
+        "main.qwe:9: error: `fn mcp` must be declared at the top level, as `server fn` is: a tool is an address of the program's",
+        "quillo: 1 error, 3 warnings",
+    ], "{}", err);
+    // A private tool stops the parse, as a private server fn does; `quillo run` refuses both.
+    std::fs::write(d.join("main.qwe"), "private fn mcp t() = 1\n").unwrap();
+    let (ok, _, err) = quillo(&d, &["check", "main.qwe"]);
+    assert!(!ok && err.contains("main.qwe:1: error: a `fn mcp` cannot be private"), "{}", err);
+    // Clean, a tool counts as a function.
+    std::fs::write(d.join("main.qwe"), format!("{}\n/// Adds.\nserver fn mcp add(a: int, b: int) -> int with time = a + b\n", CLEAN)).unwrap();
+    let (ok, out, err) = quillo(&d, &["check", "main.qwe"]);
+    assert!(ok && out.trim() == "main.qwe: ok (0 routes, 2 functions, 0 components)", "{}{}", out, err);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn q853_a_server_fn_mcp_answers_at_rpc_and_a_plain_fn_mcp_does_not() {
+    let d = dir("q853-rpc", "/// Adds.\nserver fn mcp add(a: int, b: int) -> int with time = a + b\n\n/// Seven.\nfn mcp seven() -> int with time = 7\n\nserver fn mcp(x: int) -> int = x + 1\n\nroute GET / = str(seven() + add(1, 2))\n");
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let a = support::send(s.port, "POST", "/_quillo/rpc/add", &[], "[2, 3]");
+    assert_eq!((a.status, a.body.as_str()), (200, "{\"ok\":5}"));
+    // Its checks, as a server fn's.
+    let a = support::send(s.port, "POST", "/_quillo/rpc/add", &[], "[\"2\", 3]");
+    assert_eq!(a.status, 400, "{}", a.body);
+    // A plain `fn mcp` is no page's to call, as any plain function: 404.
+    let b = support::send(s.port, "POST", "/_quillo/rpc/seven", &[], "[]");
+    assert_eq!(b.status, 404, "{}", b.body);
+    // A server fn named `mcp` answers as before; the program calls the tool as a function.
+    assert_eq!(support::send(s.port, "POST", "/_quillo/rpc/mcp", &[], "[1]").body, "{\"ok\":2}");
+    assert_eq!(support::send(s.port, "GET", "/", &[], "").body, "10");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn q853_the_document_marks_a_server_fn_mcp_and_only_it() {
+    let doc = doc_of("q853-doc", "/// Adds.\nserver fn mcp add(a: int) -> int with time = a\n\n/// Seven.\nfn mcp seven() with time = 7\n\nserver fn plain() = 1\n");
+    let fns = doc["x-quillo-server-fns"].as_object().unwrap();
+    assert_eq!(fns.keys().collect::<Vec<_>>(), ["add", "plain"]);
+    assert_eq!(fns["add"]["x-quillo-mcp"], json!(true));
+    assert_eq!(fns["add"]["description"], json!("Adds."));
+    assert!(fns["plain"].get("x-quillo-mcp").is_none());
+    // `/_quillo/describe`, from the running program, says the same.
+    let mut it = Interp::new(".");
+    it.load_source("/// Adds.\nserver fn mcp add(a: int) -> int with time = a\n\n/// Seven.\nfn mcp seven() with time = 7\n\nserver fn plain() = 1\n", "main.qwe").unwrap();
+    assert_eq!(of_interp(&it, "main")["x-quillo-server-fns"], doc["x-quillo-server-fns"]);
+    // Its contract is a server fn's, so a service's copy of it is not refused.
+    assert_eq!(fns["add"]["contract"], json!("add(a: int) -> int with time"));
+    let stmts = quillo::parser::Parser::new("server fn mcp add(a: int) -> int with time = a\n").parse_program().unwrap();
+    let Stmt::Fn(d) = &stmts[0] else { panic!() };
+    assert_eq!(contract(d), "add(a: int) -> int");
+}
+
+// The highlighter, on the server (highlight.rs) and in the browser (runtime.js), token for token.
+
+/// A Quillo string literal of `s`.
+fn lit(s: &str) -> String {
+    let mut o = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '\\' | '"' | '$' | '{' | '}' => {
+                o.push('\\');
+                o.push(c);
+            }
+            '\n' => o.push_str("\\n"),
+            '\t' => o.push_str("\\t"),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+/// `highlight(code, "quillo")` of each, as the server makes it, once the browser's runtime (in
+/// Node) has made the same.
+fn highlighted(codes: &[&str]) -> Vec<String> {
+    let calls: Vec<String> = codes.iter().map(|c| format!("str(highlight({}, \"quillo\"))", lit(c))).collect();
+    let src = format!("fn __t() = [{}]\n", calls.join(", "));
+    let mut it = Interp::new(".");
+    it.load_source(&src, "case.qwe").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    let v = match it.call(&quillo::value::lookup(&it.globals, "__t").unwrap(), vec![], 0) {
+        Ok(v) => v,
+        Err(_) => panic!("no value"),
+    };
+    if Command::new("node").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+        let js = quillo::client::test_script(&it, "__t").unwrap_or_else(|e| panic!("{}", e));
+        let out = support::node(&js).expect("node");
+        assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), v.repr(), "the browser differs");
+    } else {
+        eprintln!("skipping the browser half: no Node");
+    }
+    let quillo::value::Value::List(l) = v else { panic!("not a list") };
+    l.iter().map(|x| x.display()).collect()
+}
+
+#[test]
+fn q853_the_tag_is_coloured_only_where_it_is_one() {
+    let k = |w: &str| format!("<span class=\"hl-k\">{}</span>", w);
+    let f = |w: &str| format!("<span class=\"hl-f\">{}</span>", w);
+    let cases: Vec<(&str, String)> = vec![
+        ("fn mcp total() = 1", format!("{} {} {}() = <span class=\"hl-n\">1</span>", k("fn"), k("mcp"), f("total"))),
+        ("server fn mcp add()", format!("{} {} {} {}()", k("server"), k("fn"), k("mcp"), f("add"))),
+        ("fn mcp mcp()", format!("{} {} {}()", k("fn"), k("mcp"), f("mcp"))),
+        ("fn\tmcp\tcafé()", format!("{}\t{}\t{}()", k("fn"), k("mcp"), f("café"))),
+        ("view mcp Card()", format!("{} {} {}()", k("view"), k("mcp"), f("Card"))),
+        ("component mcp Box()", format!("{} {} {}()", k("component"), k("mcp"), f("Box"))),
+        ("service mcp /billing = 1", "service <span class=\"hl-k\">mcp</span> /billing = <span class=\"hl-n\">1</span>".to_string()),
+        ("service mcp crm = 1", format!("service {} crm = <span class=\"hl-n\">1</span>", k("mcp"))),
+        // A name: a function named `mcp`, a service named `mcp`, a variable, a key, a call.
+        ("fn mcp(x) = x", format!("{} {}(x) = x", k("fn"), f("mcp"))),
+        ("fn mcp (x)", format!("{} {} (x)", k("fn"), f("mcp"))),
+        ("service mcp = 1", "service mcp = <span class=\"hl-n\">1</span>".to_string()),
+        ("let mcp = mcp + m.mcp", format!("{} mcp = mcp + m.mcp", k("let"))),
+        ("xfn mcp total", "xfn mcp total".to_string()),
+        ("fn mcp", format!("{} mcp", k("fn"))),
+        ("fn mcp\ntotal", format!("{} mcp\ntotal", k("fn"))),
+        ("fn mcp 1", format!("{} mcp <span class=\"hl-n\">1</span>", k("fn"))),
+        ("fnmcp total", "fnmcp total".to_string()),
+        ("service mcp\n/a", "service mcp\n/a".to_string()),
+        ("service mcp /* note */ = 1", "service mcp <span class=\"hl-c\">/* note */</span> = <span class=\"hl-n\">1</span>".to_string()),
+        ("service mcp // note", "service mcp <span class=\"hl-c\">// note</span>".to_string()),
+        ("service mcp /", format!("service {} /", k("mcp"))),
+        ("// fn mcp t()", "<span class=\"hl-c\">// fn mcp t()</span>".to_string()),
+        ("let s = \"fn mcp t\"", format!("{} s = <span class=\"hl-s\">&quot;fn mcp t&quot;</span>", k("let"))),
+    ];
+    let got = highlighted(&cases.iter().map(|(c, _)| *c).collect::<Vec<_>>());
+    for ((code, want), g) in cases.iter().zip(got) {
+        assert_eq!(&g, want, "{:?}", code);
+    }
+    assert_eq!(quillo::highlight::highlight("fn mcp t()", "rust"), "<span class=\"hl-k\">fn</span> mcp <span class=\"hl-f\">t</span>()");
+}
+
+// The language server.
+
+/// An editor talking to `quillo lsp`, killed when dropped or after a minute.
+struct Editor {
+    child: std::process::Child,
+    out: std::io::BufReader<std::process::ChildStdout>,
+    next: u64,
+    notes: Vec<Value>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Editor {
+    fn start(cwd: &Path) -> Editor {
+        use std::process::Stdio;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_quillo")).arg("lsp").current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let out = std::io::BufReader::new(child.stdout.take().unwrap());
+        // The deadline: this test's own process, stopped if it has not ended.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (pid, flag) = (child.id() as i32, done.clone());
+        std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < until {
+                if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                // SAFETY: a signal to the process this test started, which has not been reaped.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        });
+        let mut e = Editor { child, out, next: 1, notes: Vec::new(), done };
+        e.request("initialize", json!({ "capabilities": {} }));
+        e.notify("initialized", json!({}));
+        e
+    }
+
+    fn send(&mut self, msg: Value) {
+        use std::io::Write;
+        let body = msg.to_string();
+        let stdin = self.child.stdin.as_mut().unwrap();
+        write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
+        stdin.flush().unwrap();
+    }
+
+    fn recv(&mut self) -> Value {
+        use std::io::{BufRead, Read};
+        let mut len = 0;
+        loop {
+            let mut line = String::new();
+            assert!(self.out.read_line(&mut line).unwrap() > 0, "the language server ended");
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            if let Some(v) = line.strip_prefix("Content-Length:") {
+                len = v.trim().parse().unwrap();
+            }
+        }
+        let mut buf = vec![0; len];
+        self.out.read_exact(&mut buf).unwrap();
+        serde_json::from_slice(&buf).unwrap()
+    }
+
+    fn notify(&mut self, method: &str, params: Value) {
+        self.send(json!({ "jsonrpc": "2.0", "method": method, "params": params }));
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next;
+        self.next += 1;
+        self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+        loop {
+            let m = self.recv();
+            if m.get("id") == Some(&json!(id)) {
+                return m["result"].clone();
+            }
+            self.notes.push(m);
+        }
+    }
+
+    /// Opens `text` and waits for its diagnostics: it is read once they come.
+    fn open(&mut self, uri: &str, text: &str) {
+        self.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": text } }));
+        while !self.notes.iter().any(|m| m["method"] == "textDocument/publishDiagnostics" && m["params"]["uri"] == uri) {
+            let m = self.recv();
+            self.notes.push(m);
+        }
+    }
+
+    fn at(&mut self, method: &str, uri: &str, line: usize, character: usize) -> Value {
+        self.request(method, json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } }))
+    }
+
+    fn hover(&mut self, uri: &str, line: usize, character: usize) -> String {
+        self.at("textDocument/hover", uri, line, character)["contents"]["value"].as_str().unwrap_or("").to_string()
+    }
+
+    /// Whether completion here offers the tag, and first.
+    fn offers_tag(&mut self, uri: &str, line: usize, character: usize) -> bool {
+        let items = self.at("textDocument/completion", uri, line, character);
+        let tag = items.as_array().unwrap().iter().position(|i| i["label"] == "mcp" && i["kind"] == 14);
+        assert!(tag.map_or(true, |t| t == 0), "the tag is not first: {}", items);
+        tag.is_some()
+    }
+}
+
+impl Drop for Editor {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn q853_the_editor_hovers_completes_and_outlines_tools() {
+    let d = support::temp_dir("feedback56-q853-lsp").canonicalize().unwrap();
+    let main = "/// Today's total.\nfn mcp total() with time = now()\nfn mcp(x) = x\nservice mcp /billing = \"billing.qwe\"\nlet y = mcp(1) + total()\n";
+    let named = "/// Named so.\nfn mcp mcp() with time = 1\n";
+    let typing = "fn \nserver fn m\nservice \nlet \nfn mcpx\npublic fn \nprivate fn \nfn x\n";
+    for (f, t) in [("main.qwe", main), ("named.qwe", named), ("typing.qwe", typing), ("billing.qwe", "server fn t() = 1\n")] {
+        std::fs::write(d.join(f), t).unwrap();
+    }
+    let uri = |f: &str| format!("file://{}", d.join(f).display());
+    let (a, b, c) = (uri("main.qwe"), uri("named.qwe"), uri("typing.qwe"));
+    let mut e = Editor::start(&d);
+    e.open(&a, main);
+    e.open(&b, named);
+    e.open(&c, typing);
+    // On the tag: what a tool is, after `fn` and after `service`.
+    let tag = e.hover(&a, 1, 4);
+    assert!(tag.contains("A tool, for AI clients that speak MCP"), "{}", tag);
+    assert_eq!(e.hover(&a, 3, 9), tag);
+    assert_eq!(e.hover(&b, 1, 3), tag);
+    // On the name: the tool, as written, a tool named `mcp` too.
+    assert!(e.hover(&a, 1, 9).contains("fn mcp total() with time"), "{}", e.hover(&a, 1, 9));
+    assert!(e.hover(&b, 1, 8).contains("fn mcp mcp() with time"), "{}", e.hover(&b, 1, 8));
+    // `mcp` as a name: the function's, not the tag's.
+    for (line, col) in [(2, 4), (4, 9)] {
+        let h = e.hover(&a, line, col);
+        assert!(h.contains("fn mcp(x)") && !h.contains("A tool"), "{}:{}: {}", line, col, h);
+    }
+    // Completion: after `fn `, `server fn m`, `service `, `public fn `; not after `let `, in a
+    // name, after `private fn ` (refused), nor after a name's first letter.
+    for (line, col, want) in [(0, 3, true), (1, 11, true), (2, 8, true), (5, 10, true), (3, 4, false), (4, 7, false), (6, 11, false), (0, 2, false), (7, 4, false)] {
+        assert_eq!(e.offers_tag(&c, line, col), want, "line {} column {}", line, col);
+    }
+    // The outline: each tool says it is one, its name where it is written, after the tag.
+    let symbols = |e: &mut Editor, u: &str| e.request("textDocument/documentSymbol", json!({ "textDocument": { "uri": u } }));
+    let (sa, sb) = (symbols(&mut e, &a), symbols(&mut e, &b));
+    let of = |all: &Value, name: &str, line: u64| all.as_array().unwrap().iter().find(|s| s["name"] == name && s["range"]["start"]["line"] == line).cloned().unwrap_or_else(|| panic!("no {} in {}", name, all));
+    let at = |line: u64, from: u64, to: u64| json!({ "start": { "line": line, "character": from }, "end": { "line": line, "character": to } });
+    assert_eq!(of(&sa, "total", 1)["detail"], "fn mcp total() with time");
+    assert_eq!(of(&sa, "total", 1)["selectionRange"], at(1, 7, 12));
+    assert_eq!(of(&sa, "mcp", 2)["detail"], "fn mcp(x)");
+    assert_eq!(of(&sa, "mcp", 2)["selectionRange"], at(2, 3, 6));
+    assert_eq!(of(&sb, "mcp", 1)["detail"], "fn mcp mcp() with time");
+    assert_eq!(of(&sb, "mcp", 1)["selectionRange"], at(1, 7, 10));
+    // Go to the definition: of `mcp(1)`, the function named so; of the tool named `mcp`, its name.
+    assert_eq!(e.at("textDocument/definition", &a, 4, 9)["range"], at(2, 3, 6));
+    assert_eq!(e.at("textDocument/definition", &b, 1, 8)["range"], at(1, 7, 10));
+    drop(e);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn q853_review_a_file_that_fails_to_parse_defines_its_tools_names() {
+    // Its names are read from its text, so their uses are not said again as unknown: the tag was
+    // read as the name, and `total` was unknown (found in review).
+    let d = dir("q853-unparsed", "use lib.qwe\n\nroute GET / = str(total() + mcp(1) + plain())\n");
+    std::fs::write(d.join("lib.qwe"), "/// T.\nfn mcp total() with time = 1\nfn mcp(x) = x\nserver fn plain() = 1\nlet broken = (\n").unwrap();
+    let a = quillo::check::check_file(&d.join("main.qwe"));
+    let said: Vec<String> = a.diagnostics.iter().map(|x| format!("{}:{} {}", x.file.rsplit('/').next().unwrap_or(""), x.line, x.message)).collect();
+    assert_eq!(said.len(), 1, "{:#?}", said);
+    assert!(said[0].starts_with("lib.qwe:"), "{:#?}", said);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn q853_review_a_tools_parameters_are_no_call_of_it() {
+    let d = support::temp_dir("feedback56-q853-signature").canonicalize().unwrap();
+    let text = "/// Adds.\nfn mcp total(a: int, b: int) with time = a + b\nserver fn mcp twice(n: int) with time = n * 2\nlet y = total(1, 2)\n";
+    std::fs::write(d.join("main.qwe"), text).unwrap();
+    let uri = format!("file://{}", d.join("main.qwe").display());
+    let mut e = Editor::start(&d);
+    e.open(&uri, text);
+    // Typing a tool's parameters: no signature of the tool itself, as for any definition.
+    assert_eq!(e.at("textDocument/signatureHelp", &uri, 1, 21), Value::Null);
+    assert_eq!(e.at("textDocument/signatureHelp", &uri, 2, 24), Value::Null);
+    // A call of it has one.
+    let call = e.at("textDocument/signatureHelp", &uri, 3, 17);
+    assert_eq!(call["activeParameter"], 1, "{}", call);
+    assert!(call["signatures"][0]["label"].as_str().unwrap_or("").contains("total(a: int, b: int)"), "{}", call);
+    drop(e);
+    let _ = std::fs::remove_dir_all(&d);
+}

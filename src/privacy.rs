@@ -207,7 +207,7 @@ impl Renamer<'_> {
                 self.name(n);
                 self.expr(e)
             }
-            Stmt::Service(_, _, _, Some(e), _) => self.expr(e),
+            Stmt::Service(_, _, _, Some(e), _, _) => self.expr(e),
             Stmt::Type(td) if self.types => {
                 if let Some(td) = Arc::get_mut(td) {
                     self.ty(&mut td.ty);

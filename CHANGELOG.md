@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `fn mcp name(...)` and `server fn mcp name(...)` declare tools for AI clients, and
+  `service mcp /path = "file.qwe"` a service whose tools are the program's. `quillo check` holds
+  them to MCP's names and to data answers, and warns of a tool with no `///`, an untyped
+  parameter, or an effect its body uses that its `with` does not say; highlighting, hover, completion and the outline know the tag.
+  `mcp` stays an ordinary name everywhere else. The door is not built yet (FEEDBACK56.md,
+  Q-853).
 - A function's `///` comment is kept by the program: `quillo docs` and `/_quillo/describe` write it
   as the `server fn`'s description, and MCP tools will use it (FEEDBACK56.md, Q-854).
 - The API document writes each named type once under `components/schemas` and refers to it

@@ -202,7 +202,9 @@ fn defined(stmts: &[Stmt]) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     for s in stmts {
         match s {
-            Stmt::Fn(d) => out.push((d.name.clone(), d.server)),
+            // A tool's name is its address too, as a server fn's is: not renamed, so one name
+            // in two files is "defined twice" (FEEDBACK56.md, Q-853; branch feedback56).
+            Stmt::Fn(d) => out.push((d.name.clone(), d.server || d.mcp)),
             Stmt::Type(td) => out.push((td.name.clone(), true)),
             Stmt::Service(name, ..) => out.push((name.clone(), true)),
             Stmt::Let(p, ..) => {

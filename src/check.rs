@@ -1280,12 +1280,13 @@ impl Sig {
 
 /// Source-like text for a definition: `fn add(a: int, b: int = 10) -> int`.
 pub fn def_text(d: &FnDef) -> String {
-    let kw = if d.component {
-        "component"
-    } else if d.server {
-        "server fn"
-    } else {
-        "fn"
+    // A tool says so, in the editor's hover and outline (FEEDBACK56.md, Q-853; branch feedback56).
+    let kw = match (d.component, d.server, d.mcp) {
+        (true, ..) => "component",
+        (_, true, true) => "server fn mcp",
+        (_, true, false) => "server fn",
+        (_, false, true) => "fn mcp",
+        _ => "fn",
     };
     let ps: Vec<String> = d
         .params
@@ -2121,8 +2122,17 @@ impl Checker {
                 order.push(Item { stmt: s.clone(), file: file.clone() });
                 break;
             }
-            if let Stmt::Service(name, prefix, path, _, line) = s {
+            if let Stmt::Service(name, prefix, path, _, line, mcp) = s {
                 self.everywhere.insert(name.clone());
+                // `service mcp crm = "https://..."`: kept for later, its calls not checked
+                // (FEEDBACK56.md, Q-853; branch feedback56).
+                if *mcp && prefix.is_none() {
+                    self.diag_at(file.clone(), *line, Severity::Error, crate::service::mcp_calls_later(name));
+                    self.services_elsewhere.insert(name.clone());
+                    self.services.entry(name.clone()).or_default();
+                    order.push(Item { stmt: s.clone(), file: file.clone() });
+                    continue;
+                }
                 let Some(full) = self.file_at(base, path, &file, *line, false) else { continue };
                 match crate::service::offered(&full) {
                     // A service that runs elsewhere need not be here: its calls are checked when
@@ -2470,7 +2480,7 @@ impl Checker {
             }
             match &it.stmt {
                 Stmt::Fn(d) => self.defines(&d.name, &it.file, d.line, false),
-                Stmt::Service(name, _, _, _, line) => self.defines(name, &it.file, *line, false),
+                Stmt::Service(name, _, _, _, line, _) => self.defines(name, &it.file, *line, false),
                 Stmt::Type(td) => self.defines(&td.name, &it.file, td.line, false),
                 Stmt::Let(p, _, line) => {
                     let mut names = Vec::new();
@@ -2489,7 +2499,7 @@ impl Checker {
                         Var { t: T::of(FN), sig: Some(sig), file: it.file.clone(), line: d.line, kind: Kind::Global, used: false, ready: false },
                     );
                 }
-                Stmt::Service(name, _, _, _, line) => {
+                Stmt::Service(name, _, _, _, line, _) => {
                     self.globals.insert(
                         name.clone(),
                         Var { t: T::of(MAP), sig: None, file: it.file.clone(), line: *line, kind: Kind::Global, used: true, ready: false },
@@ -2544,7 +2554,7 @@ impl Checker {
                     };
                     self.out.symbols.push(Symbol { name: d.name.clone(), kind, file: it.file.to_string(), line: d.line, detail: def_text(d) });
                 }
-                Stmt::Service(name, _, _, _, _) => {
+                Stmt::Service(name, _, _, _, _, _) => {
                     if let Some(g) = self.globals.get_mut(name) {
                         g.ready = true;
                     }
@@ -3145,7 +3155,10 @@ impl Checker {
     fn fn_body(&mut self, d: &Arc<FnDef>) {
         self.line = d.line;
         let effects = d.effects.as_ref().map(|e| effect_mask(e));
-        if d.server {
+        let tool = d.mcp && self.tool_rules(d);
+        // A tool's parameters are said of the tool, whose JSON the browser sends too (FEEDBACK56.md,
+        // Q-853; branch feedback56).
+        if d.server && !tool {
             for p in &d.params {
                 if let Some(t) = &p.ty {
                     if ty_bits(t) & (FN | HTML | RESP) != 0 && ty_bits(t) != ANY {
@@ -3175,9 +3188,81 @@ impl Checker {
         if d.component {
             self.run_once_assignments(d);
         }
+        if tool {
+            let answer = t.union(self.fns.last().map_or(T::NEVER, |f| f.exits));
+            self.tool_answer(d, answer);
+        }
         self.pop();
         self.fns.pop();
         self.fn_ended();
+    }
+
+    /// The rules of a tool, `fn mcp name(...)` or `server fn mcp name(...)` at a file's top level
+    /// (FEEDBACK56.md, Q-853, Part A.1; branch feedback56): its name is the tool's, as MCP allows
+    /// one; each parameter comes as JSON, and says its type; a `///` comment says what it does,
+    /// and a `with` what it may do, which the door tells the AI client. False for a view or a
+    /// component, which is no tool at all.
+    fn tool_rules(&mut self, d: &Arc<FnDef>) -> bool {
+        const NAME: &str = "a tool's name is 1 to 128 of A-Z, a-z, 0-9, `_`, `-` and `.`, as MCP allows";
+        self.line = d.line;
+        if d.component || is_view(d) {
+            let what = if d.component { "component" } else { "view" };
+            self.error(format!("a {} is not a tool: `fn mcp` is for a function that answers with data, not a page", what));
+            return false;
+        }
+        let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
+        if let Some(c) = d.name.chars().find(|c| !allowed(*c)) {
+            self.error(format!("{}: `{}` has `{}`", NAME, d.name, c));
+        } else if d.name.chars().count() > 128 {
+            self.error(format!("{}: this one has {} characters", NAME, d.name.chars().count()));
+        }
+        for p in &d.params {
+            match &p.ty {
+                Some(t) if ty_bits(t) & (FN | HTML | RESP) != 0 && ty_bits(t) != ANY => {
+                    self.error(format!("parameter `{}` of tool `{}` is {}, which cannot come as JSON", p.name, d.name, t.text()))
+                }
+                Some(_) => {}
+                None => self.warn(format!("parameter `{}` of tool `{}` has no type: its schema is `{{}}`, and the model guesses what to send", p.name, d.name)),
+            }
+        }
+        if d.doc.is_none() {
+            self.warn(format!("tool `{}` has no `///` comment: an AI client sees only its name and its parameters; say what it does on a `///` line above it", d.name));
+        }
+        // What it is seen to do (`fn_effects`), to write: a tool seen to do nothing is fine as
+        // written, as `with` takes one effect at least, and no effect it does not use is
+        // suggested, which would tell the client it may (FEEDBACK56.md, Q-853, found in review;
+        // branch feedback56).
+        if d.effects.is_none() {
+            let seen = effect_names(self.fn_effects(&Sig::of_def(d)));
+            if !seen.is_empty() {
+                self.warn(format!(
+                    "tool `{}` has no `with`, so an AI client is told it may change anything and reach anywhere; it uses {}: `with {}`",
+                    d.name,
+                    seen.join(" and "),
+                    seen.join(", ")
+                ));
+            }
+        }
+        true
+    }
+
+    /// A tool's answer, where the checker sees it: html, or a response as `redirect(...)` makes,
+    /// is a page, which the door gives the AI client as an error (FEEDBACK56.md, Q-853, Part
+    /// A.1; branch feedback56). Its declared result, else what its body gives.
+    fn tool_answer(&mut self, d: &FnDef, body: T) {
+        const PAGE: u16 = HTML | RESP;
+        let t = d.ret.as_ref().map(ty_t).filter(|r| !r.vague()).unwrap_or(body);
+        let vals = t.bits & !(ERR | NIL);
+        if t.vague() || vals & PAGE == 0 {
+            return;
+        }
+        let what = if vals & HTML != 0 { "html" } else { "a response, as `redirect(...)` makes" };
+        self.line = d.line;
+        if vals & !PAGE == 0 {
+            self.error(format!("a tool answers with data, not a page: `{}` answers with {}", d.name, what));
+        } else {
+            self.warn(format!("a tool answers with data, not a page: `{}` may answer with {}", d.name, what));
+        }
     }
 
     /// `count = len(items)` in a component's body runs once, as it starts, on the server and in
@@ -3656,6 +3741,9 @@ impl Checker {
                 if !self.scopes.is_empty() {
                     if d.server || d.component {
                         self.error("`server fn` and `component` must be declared at the top level");
+                    } else if d.mcp {
+                        // (FEEDBACK56.md, Q-853; branch feedback56)
+                        self.error("`fn mcp` must be declared at the top level, as `server fn` is: a tool is an address of the program's");
                     }
                     self.twice(&d.name, Kind::Fn);
                     let sig = Arc::new(Sig::of_def(d));
@@ -3685,7 +3773,7 @@ impl Checker {
                 }
                 T::of(NIL)
             }
-            Stmt::Service(name, _, _, opts, line) => {
+            Stmt::Service(name, _, _, opts, line, _) => {
                 self.line = *line;
                 if !self.scopes.is_empty() {
                     self.error("`service` must be at the top level");
@@ -7153,7 +7241,7 @@ fn top_line(s: &Stmt) -> Option<u32> {
         Stmt::Fn(d) => d.line,
         Stmt::Route(r) => r.line,
         Stmt::Type(t) => t.line,
-        Stmt::Return(_, l) | Stmt::Mount(_, _, l) | Stmt::Service(_, _, _, _, l) => *l,
+        Stmt::Return(_, l) | Stmt::Mount(_, _, l) | Stmt::Service(_, _, _, _, l, _) => *l,
         s => crate::debug::stmt_line(s).unwrap_or(0),
     };
     (l > 0).then_some(l)
@@ -7495,7 +7583,7 @@ fn unused_classes(order: &[Item], base: &Path, unparsed: &[String]) -> Vec<(Arc<
     }
     // What the app's services send it is theirs to say: their text counts.
     for it in order {
-        if let Stmt::Service(_, _, path, _, _) = &it.stmt {
+        if let Stmt::Service(_, _, path, _, _, _) = &it.stmt {
             if let Ok(src) = std::fs::read_to_string(base.join(path)) {
                 words(&src, &mut written);
             }
@@ -7650,8 +7738,8 @@ fn walk_stmts(stmts: &[Stmt], f: &mut dyn FnMut(&Expr)) {
                 r.query.iter().chain(r.body_pat.iter()).chain(r.guards.iter()).for_each(|p| walk_pattern(p, f));
                 walk_expr(&r.body, f)
             }
-            Stmt::Service(_, _, _, Some(e), _) => walk_expr(e, f),
-            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(_, _, _, None, _) | Stmt::Return(None, _) => {}
+            Stmt::Service(_, _, _, Some(e), _, _) => walk_expr(e, f),
+            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(_, _, _, None, _, _) | Stmt::Return(None, _) => {}
             Stmt::Type(td) => td.defaults.iter().for_each(|(_, e)| walk_expr(e, f)),
         }
     }
@@ -7974,7 +8062,17 @@ fn names_in_text(src: &str) -> Vec<String> {
         if !matches!(first, Some("fn" | "view" | "component" | "let" | "type")) {
             continue;
         }
-        if let Some(name) = words.next() {
+        let mut name = words.next();
+        // `fn mcp total()`: the tag, then the name; `fn mcp(x)` is named `mcp` (FEEDBACK56.md,
+        // Q-853, found in review; branch feedback56).
+        if name == Some("mcp") && matches!(first, Some("fn" | "view" | "component")) {
+            let chars: Vec<char> = line.chars().collect();
+            let at = (0..chars.len().saturating_sub(2)).find(|&i| chars[i..i + 3] == ['m', 'c', 'p'] && (i == 0 || !chars[i - 1].is_alphanumeric()));
+            if at.is_some_and(|i| crate::highlight::mcp_tag(&chars, i, i + 3)) {
+                name = words.next();
+            }
+        }
+        if let Some(name) = name {
             if name.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_')
                 && name.chars().all(|c| c.is_alphanumeric() || c == '_')
             {

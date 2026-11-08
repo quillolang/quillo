@@ -424,6 +424,18 @@ fn find_word(line: &str, word: &str) -> Option<(usize, usize)> {
     None
 }
 
+/// Where `name` is written on the line that defines it: past the tag of `fn mcp mcp()`, a tool
+/// named `mcp` (FEEDBACK56.md, Q-853; branch feedback56).
+fn find_name(line: &str, name: &str) -> Option<(usize, usize)> {
+    let (a, b) = find_word(line, name)?;
+    let chars: Vec<char> = line.chars().collect();
+    if name == "mcp" && crate::highlight::mcp_tag(&chars, a, b) {
+        let rest: String = chars[b..].iter().collect();
+        return Some(find_word(&rest, name).map_or((a, b), |(x, y)| (b + x, b + y)));
+    }
+    Some((a, b))
+}
+
 /// The range a diagnostic underlines: the first `name` in backticks that
 /// appears on the line, else the line's text.
 fn diag_range(text: &str, line: u32, msg: &str) -> J {
@@ -901,6 +913,9 @@ impl Server {
         if let Some(h) = self.class_hover(params) {
             return h;
         }
+        if self.on_mcp_tag(params) {
+            return json!({ "contents": { "kind": "markdown", "value": MCP_DOC } });
+        }
         if let Some((_, r)) = self.reference_at(params) {
             let mut text = format!("```quillo\n{}\n```", private_detail(&r.name, &r.detail));
             if let (None, Some(d)) = (&r.def, builtin_doc(&r.name)) {
@@ -915,6 +930,16 @@ impl Server {
             }
         }
         J::Null
+    }
+
+    /// Whether the cursor is on the tag of a tool, `fn mcp total()`, and not on a name `mcp`
+    /// (FEEDBACK56.md, Q-853; branch feedback56).
+    fn on_mcp_tag(&self, params: &J) -> bool {
+        let (uri, line, col) = Self::position(params);
+        let Some(src) = self.docs.get(&uri).and_then(|d| d.text.lines().nth(line)) else { return false };
+        let Some((w, a)) = word_at(src, 0, col) else { return false };
+        let chars: Vec<char> = src.chars().collect();
+        w == "mcp" && crate::highlight::mcp_tag(&chars, a, a + 3)
     }
 
     /// What the cursor is on in a `use` line: the file it names (no name),
@@ -1267,7 +1292,7 @@ impl Server {
             let at = src.find("fn ")? + 3;
             find_word(src, &src[at..].chars().take_while(|c| is_word(*c)).collect::<String>())
         };
-        let (a, b) = find_word(src, crate::privacy::private_name(&r.name).unwrap_or(&r.name)).or_else(own).unwrap_or((0, 0));
+        let (a, b) = find_name(src, crate::privacy::private_name(&r.name).unwrap_or(&r.name)).or_else(own).unwrap_or((0, 0));
         json!({
             "uri": path_to_uri(&file),
             "range": {
@@ -1545,6 +1570,15 @@ impl Server {
                 return json!(items);
             }
         }
+        // `fn `, `server fn `, `service `: the tag of a tool, there only, as `mcp` is a name
+        // elsewhere (FEEDBACK56.md, Q-853; branch feedback56).
+        let head = before.trim_start();
+        let head = head.strip_prefix("public ").map_or(head, str::trim_start);
+        let lead = head.trim_end_matches(is_word);
+        let words: Vec<&str> = lead.split_whitespace().collect();
+        if lead.ends_with([' ', '\t']) && matches!(words[..], ["fn"] | ["server", "fn"] | ["service"]) && "mcp".starts_with(&head[lead.len()..]) {
+            items.push(json!({ "label": "mcp", "kind": 14, "detail": "a tool, for AI clients (MCP)", "documentation": MCP_DOC, "sortText": "0" }));
+        }
         let file = uri_to_path(&uri).display().to_string();
         let mut seen = std::collections::HashSet::new();
         // What is in scope here (parameters, `let`s, state), nearest first and
@@ -1762,7 +1796,7 @@ impl Server {
             .map(|s| {
                 let l = s.line.saturating_sub(1) as usize;
                 let src = lines.get(l).copied().unwrap_or("");
-                let (a, b) = find_word(src, crate::privacy::private_name(&s.name).unwrap_or(&s.name)).unwrap_or((0, src.chars().count()));
+                let (a, b) = find_name(src, crate::privacy::private_name(&s.name).unwrap_or(&s.name)).unwrap_or((0, src.chars().count()));
                 let full = json!({ "start": { "line": l, "character": 0 }, "end": { "line": l, "character": utf16_col(src, src.chars().count()) } });
                 let sel = json!({ "start": { "line": l, "character": utf16_col(src, a) }, "end": { "line": l, "character": utf16_col(src, b) } });
                 json!({ "name": s.name, "detail": private_detail(&s.name, &s.detail), "kind": symbol_kind(s.kind), "range": full, "selectionRange": sel })
@@ -1872,7 +1906,10 @@ fn read_open(text: &str) -> (Vec<Open>, Vec<(usize, usize)>) {
                 }
                 let before: String = c[w..b].iter().collect();
                 let name: String = c[a..i].iter().collect();
-                let call = !name.is_empty() && !KEYWORDS.contains(&name.as_str()) && !matches!(before.as_str(), "fn" | "view" | "component");
+                // `fn mcp total(`: a definition's parameters too, past the tag (FEEDBACK56.md,
+                // Q-853, found in review; branch feedback56).
+                let tag = before == "mcp" && crate::highlight::mcp_tag(&c, w, b);
+                let call = !name.is_empty() && !KEYWORDS.contains(&name.as_str()) && !matches!(before.as_str(), "fn" | "view" | "component") && !tag;
                 open.push(Open::Call(call.then_some(name), piped as usize));
             }
             ')' if matches!(open.last(), Some(Open::Call(..))) => drop(open.pop()),
@@ -1974,6 +2011,9 @@ fn comment_above(text: &str, line: u32) -> String {
     above.reverse();
     above.join(" ")
 }
+
+/// The hover of a tool's tag (FEEDBACK56.md, Q-853; branch feedback56).
+const MCP_DOC: &str = "`fn mcp name(params) with db = ...`, `server fn mcp name(params) = ...`\n\nA tool, for AI clients that speak MCP: they are told its name, its `///` comment, its parameters' types and its `with`. To the program it is a function as any other; `server fn mcp` is also a page's to call.\n\n`service mcp /billing = \"billing.qwe\"` offers billing's tools here, as `billing.<name>`.";
 
 fn keyword_doc(w: &str) -> Option<String> {
     let text = match w {

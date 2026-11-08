@@ -179,6 +179,9 @@ pub struct FnDef {
     pub effects: Option<Vec<String>>,
     /// `server fn`: callable from the browser.
     pub server: bool,
+    /// `fn mcp name(...)`, `server fn mcp name(...)`: a tool, for AI clients; to the program a
+    /// function as any other (FEEDBACK56.md, Q-853; branch feedback56).
+    pub mcp: bool,
     /// `component`: a view with `state` that also runs in the browser.
     pub component: bool,
     pub line: u32,
@@ -338,6 +341,7 @@ impl RouteDef {
                 err: None,
                 effects: Some(e.clone()),
                 server: false,
+                mcp: false,
                 component: false,
                 body: Expr::Lit(Lit::Nil),
                 line: self.line,
@@ -590,7 +594,10 @@ pub enum Stmt {
     /// named after the file, and its routes served under /shop): a part
     /// that runs in this process or as a server of its own (src/service.rs).
     /// After the file, a map of how it is called: `{ timeout: "2s", retries: 2 }`.
-    Service(String, Option<String>, String, Option<Expr>, u32),
+    /// Last, whether it is `service mcp /billing = ...` (its tools offered here) or `service mcp
+    /// crm = "https://..."` (another MCP server, for later) (FEEDBACK56.md, Q-853; branch
+    /// feedback56).
+    Service(String, Option<String>, String, Option<Expr>, u32, bool),
     /// `type User = { name: str, role: "admin" | "member" = "member" }`: a
     /// record (src/record.rs), or another name for a type.
     Type(Arc<TypeDef>),

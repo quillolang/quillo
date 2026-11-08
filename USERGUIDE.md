@@ -264,7 +264,8 @@ Rust functions, show their signatures (under the name after `as`) and complete t
 file's functions. Inside a call, as `(` and `,` are typed and with Ctrl+Space, it shows the
 parameters, the current one marked, and a line about the function: a builtin's own, a `.qwer`
 function's `///` comment, or the `//` comment above your function. Completion offers the
-variables in scope at the cursor first. It runs the `quillo` it finds (its `quillo.path`
+variables in scope at the cursor first, and `mcp` after `fn `, `server fn ` and `service `;
+hover on that tag says what a tool is, and the outline shows tools. It runs the `quillo` it finds (its `quillo.path`
 setting, the workspace's `target/release`, then the `PATH`), so stale errors on code the
 build accepts come from an old binary: `quillo --version` names the commit, and
 `scripts/doctor.sh` points out an old one. Other editors can run `quillo lsp` (hover,
@@ -2738,6 +2739,44 @@ call with the same arguments shares its answer and sends nothing, and a call tha
 answer keeps its key, so sending it again is safe. Any answer ends it, so the next
 payment, even of the same amount, is a new one. A call with other arguments is another
 call.
+
+#### Tools for AI clients
+
+`fn mcp name(...)` is a tool: a function an AI client (Claude, an editor's assistant) can call
+through the program's MCP door, with its `///` as the description the model reads and its
+types as the schema. `server fn mcp name(...)` is a server fn the program's pages call too. To
+the program both are plain functions: a call from Quillo code is a plain call, with no checks
+and no limits.
+
+```quillo
+/// The orders placed today, newest first.
+fn mcp orders_today(limit: int = 20) -> list with db {
+    db.query("select id, total from orders order by id desc limit ?", limit)
+}
+```
+
+- The tag is `mcp` after `fn` (or `server fn`) and before the name, and `mcp` stays an
+  ordinary name everywhere else: `fn mcp(x)` is a function named `mcp`, and `fn mcp mcp()` a
+  tool named `mcp`.
+- A tool is an address: `private fn mcp` is an error, as `private server fn` is. It is
+  declared at the top level, and a `view` or a `component` is not a tool.
+- Its name is the tool's: `A-Z a-z 0-9 _ - .`, 1 to 128 characters. A tool's name is the
+  program's in every file, so two files cannot both declare `total`.
+- A plain `fn mcp` is not a page's to call: `/_quillo/rpc/<name>` answers 404, as for any
+  plain function.
+- `quillo check` warns of a tool with no `///`, and of a parameter with no type (the model
+  guesses). A tool whose body uses an effect it does not declare is warned too, the warning
+  naming what it uses (`with time`): without a `with`, a client is told it may change anything
+  and reach anywhere. A tool that uses none is fine as it is. A parameter that cannot come as JSON (`fn`, `html`, `response`) is an
+  error, and so is an answer that can only be a page (`redirect`, `html`, `respond`): a tool
+  answers with data. One that only may be a page is a warning.
+- `service mcp /billing = "billing.qwe"` serves billing as `service /billing` does, and its
+  tools will be the program's, named `billing.<name>`. The named form, `service mcp crm =
+  "https://..."`, for calling another MCP server, is refused for now.
+- The API document marks a `server fn mcp` with `x-quillo-mcp: true`.
+
+The door itself, `/_quillo/mcp` and `quillo mcp app.qwe` over stdio, is not built yet
+(FEEDBACK56.md, Q-853).
 
 #### What the browser can reach
 

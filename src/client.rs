@@ -2237,6 +2237,7 @@ impl<'a> Compiler<'a> {
                             err: None,
                             effects: None,
                             server: false,
+                            mcp: false,
                             component: false,
                             line: td.line,
                             body: e.clone(),
@@ -2575,6 +2576,7 @@ impl<'a> Compiler<'a> {
             err: None,
             effects: None,
             server: false,
+            mcp: false,
             component: false,
             line,
             body: e,
@@ -3250,7 +3252,7 @@ impl<'a> Compiler<'a> {
                     self.line = *line;
                     return self.err("`mount` must be at the top level");
                 }
-                Stmt::Service(_, _, _, _, line) => {
+                Stmt::Service(_, _, _, _, line, _) => {
                     self.line = *line;
                     return self.err("`service` must be at the top level");
                 }

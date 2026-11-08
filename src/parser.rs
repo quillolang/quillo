@@ -460,6 +460,48 @@ impl Parser {
         }
     }
 
+    /// `mcp` with a name after it on its line, after `fn`, `server fn`, `view` or `component`:
+    /// the tag of a tool, taken. `fn mcp(x)` is a function named `mcp`, `fn mcp mcp()` a tool
+    /// named `mcp`, and `mcp` is a name everywhere else, as `server` is (FEEDBACK56.md, Q-853;
+    /// branch feedback56).
+    fn mcp_tag(&mut self) -> PResult<bool> {
+        if !self.at_kw("mcp")? {
+            return Ok(false);
+        }
+        let (saved, line) = (self.save(), self.line()?);
+        self.next()?;
+        if matches!(self.peek()?, Tok::Ident(_)) && self.line()? == line {
+            return Ok(true);
+        }
+        self.restore(saved);
+        Ok(false)
+    }
+
+    /// After `service`, at the lexer: `mcp` with a name or a `/` after it on its line, the tag
+    /// of `service mcp /billing = "billing.qwe"` and `service mcp crm = "https://..."`, taken;
+    /// `service mcp = "mcp.qwe"` is a service named `mcp` (FEEDBACK56.md, Q-853; branch
+    /// feedback56).
+    fn service_mcp_tag(&mut self) -> PResult<bool> {
+        let text = self.lx.text();
+        let at = self.lx.pos;
+        let word: String = text.get(at..).unwrap_or_default().iter().take_while(|c| c.is_alphanumeric() || **c == '_').collect();
+        if word != "mcp" {
+            return Ok(false);
+        }
+        let mut after = text.get(at + 3..).unwrap_or_default().iter().skip_while(|c| matches!(c, ' ' | '\t'));
+        let (next, then) = (after.next().copied(), after.next().copied());
+        let spaced = matches!(text.get(at + 3), Some(' ' | '\t'));
+        // A `/` that starts a comment, `service mcp /* note */ = ...`, starts no path (FEEDBACK56.md,
+        // Q-853, found in review; branch feedback56).
+        let path = next == Some('/') && !matches!(then, Some('/' | '*'));
+        if !spaced || !(path || next.is_some_and(|c| c.is_alphabetic() || c == '_')) {
+            return Ok(false);
+        }
+        self.next()?;
+        self.lx.skip_spaces();
+        Ok(true)
+    }
+
     fn expect_ident(&mut self, what: &str) -> PResult<String> {
         let t = self.next()?;
         match t.tok {
@@ -904,6 +946,10 @@ impl Parser {
                         }
                         self.top = true;
                         let stmt = self.parse_stmt()?;
+                        // A tool is an address too (FEEDBACK56.md, Q-853; branch feedback56).
+                        if private && what == "fn" && matches!(&stmt, Stmt::Fn(def) if def.mcp) {
+                            return Err(QuilloError::new("a `fn mcp` cannot be private: it is a tool, an address that anyone the door lets in can call; keep the work in a private `fn` it calls", line));
+                        }
                         if private {
                             match &stmt {
                                 Stmt::Fn(def) => {
@@ -953,9 +999,19 @@ impl Parser {
                     let saved = self.save();
                     self.next()?;
                     if let Tok::Ident(_) = self.peek()? {
+                        // `fn mcp total()`: a tool; `view mcp Card()` is taken for
+                        // `quillo check` to refuse (FEEDBACK56.md, Q-853; branch feedback56).
+                        let mcp = self.mcp_tag()?;
+                        // `view mcp card()`: a view whatever its name, which `FnDef` does not keep,
+                        // so refused here, in `quillo check`'s words (FEEDBACK56.md, Q-853, found in
+                        // review; branch feedback56).
+                        if view && mcp {
+                            return Err(QuilloError::new("a view is not a tool: `fn mcp` is for a function that answers with data, not a page", line));
+                        }
                         let name = self.expect_ident("a function name")?;
                         self.view_next = view || name.starts_with(|c: char| c.is_uppercase());
-                        let def = self.parse_fn_rest(name, line)?;
+                        let mut def = self.parse_fn_rest(name, line)?;
+                        def.mcp = mcp;
                         if view || def.name.starts_with(|c: char| c.is_uppercase()) {
                             key_not_a_param(&def)?;
                         }
@@ -968,12 +1024,16 @@ impl Parser {
                     let saved = self.save();
                     self.next()?;
                     if self.eat_kw("fn")? {
+                        // `server fn mcp add_note()`: both doors (FEEDBACK56.md, Q-853; branch
+                        // feedback56).
+                        let mcp = self.mcp_tag()?;
                         let name = self.expect_ident("a function name after `server fn`")?;
                         self.callers_ok = true;
                         let def = self.parse_fn_rest(name, line);
                         self.callers_ok = false;
                         let mut def = def?;
                         def.server = true;
+                        def.mcp = mcp;
                         // `for ["shop"]`: the services it takes calls from (FEEDBACK38.md, Q-458;
                         // branch feedback36-39), noted as the program loads.
                         if let Some(names) = self.callers.take() {
@@ -1145,6 +1205,7 @@ impl Parser {
                     self.next()?;
                     if self.peeked.is_none() {
                         self.lx.skip_spaces();
+                        let mcp = self.service_mcp_tag()?;
                         let prefix = if self.lx.peek_char() == Some('/') {
                             let mut p = String::new();
                             while let Some(c) = self.lx.peek_char() {
@@ -1198,7 +1259,7 @@ impl Parser {
                                     } else {
                                         None
                                     };
-                                    return Ok(Stmt::Service(name, prefix, file, options, line));
+                                    return Ok(Stmt::Service(name, prefix, file, options, line, mcp));
                                 }
                             }
                             return Err(QuilloError::new("`service` expects a file: service billing = \"billing.qwe\"", line));
@@ -1444,7 +1505,7 @@ impl Parser {
         name_unmarked_styles(&mut body, ours);
         // Its `///` comment (FEEDBACK56.md, Q-854; branch feedback56).
         let doc = self.lx.doc_above(line);
-        Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line, nesting, file: self.file.clone(), doc, hot: Default::default(), request_use: Default::default() })
+        Ok(FnDef { name, params, ret, err, effects, server: false, mcp: false, component: false, body, line, nesting, file: self.file.clone(), doc, hot: Default::default(), request_use: Default::default() })
     }
 
     /// `style <css>` at a file's top level: the CSS of the components the file declares, and no
@@ -1476,7 +1537,7 @@ impl Parser {
             args[1] = Expr::Lit(Lit::Nil);
         }
         let body = Expr::Block(vec![Stmt::Expr(Expr::Call(Box::new(Expr::Ident("__style".into(), line)), args, line))]);
-        Ok(Stmt::Fn(Arc::new(FnDef { name, params: Vec::new(), ret: None, err: None, effects: None, server: false, component: false, body, line, nesting: 1, file: self.file.clone(), doc: None, hot: Default::default(), request_use: Default::default() })))
+        Ok(Stmt::Fn(Arc::new(FnDef { name, params: Vec::new(), ret: None, err: None, effects: None, server: false, mcp: false, component: false, body, line, nesting: 1, file: self.file.clone(), doc: None, hot: Default::default(), request_use: Default::default() })))
     }
 
     /// `style <css>` in a component's or view's body: the call of `__style`,
@@ -1536,6 +1597,9 @@ impl Parser {
     /// `component Name(params) { state x = init ... <html/> }`. `state` statements
     /// may only appear directly in the body.
     fn parse_component(&mut self, line: u32) -> PResult<FnDef> {
+        // `component mcp Card()`, which `quillo check` refuses: no component is a tool
+        // (FEEDBACK56.md, Q-853; branch feedback56).
+        let mcp = self.mcp_tag()?;
         let name = self.expect_ident("a component name")?;
         if !name.chars().next().map_or(false, |c| c.is_uppercase()) {
             return Err(QuilloError::new(format!("component names start with a capital letter: `{}`", name), line));
@@ -1565,7 +1629,7 @@ impl Parser {
         let (mut body, nesting) = body?;
         name_unmarked_styles(&mut body, ours);
         let doc = self.lx.doc_above(line);
-        let def = FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line, nesting, file: self.file.clone(), doc, hot: Default::default(), request_use: Default::default() };
+        let def = FnDef { name, params, ret: None, err: None, effects: None, server: false, mcp, component: true, body, line, nesting, file: self.file.clone(), doc, hot: Default::default(), request_use: Default::default() };
         key_not_a_param(&def)?;
         Ok(def)
     }
@@ -4036,6 +4100,7 @@ fn arrow(params: Vec<Param>, ret: Option<Ty>, (body, nesting): (Expr, u32), line
         err: None,
         effects: None,
         server: false,
+        mcp: false,
         component: false,
         line,
         body,

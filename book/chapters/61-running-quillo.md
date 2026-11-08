@@ -259,7 +259,8 @@ Rust functions, show their signatures (under the name after `as`) and complete t
 file's functions. Inside a call, as `(` and `,` are typed and with Ctrl+Space, it shows the
 parameters, the current one marked, and a line about the function: a builtin's own, a `.qwer`
 function's `///` comment, or the `//` comment above your function. Completion offers the
-variables in scope at the cursor first. It runs the `quillo` it finds (its `quillo.path`
+variables in scope at the cursor first, and `mcp` after `fn `, `server fn ` and `service `;
+hover on that tag says what a tool is, and the outline shows tools. It runs the `quillo` it finds (its `quillo.path`
 setting, the workspace's `target/release`, then the `PATH`), so stale errors on code the
 build accepts come from an old binary: `quillo --version` names the commit, and
 `scripts/doctor.sh` points out an old one. Other editors can run `quillo lsp` (hover,

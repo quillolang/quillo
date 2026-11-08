@@ -685,7 +685,12 @@ pub fn declared(path: &Path) -> Result<Vec<(String, Option<String>, PathBuf)>, S
         statements(&p, p.parent().unwrap_or(Path::new(".")), &mut HashSet::new(), &mut stmts)?;
         let dir = p.parent().unwrap_or(Path::new(".")).to_path_buf();
         for s in stmts {
-            if let Stmt::Service(name, prefix, file, _, _) = s {
+            if let Stmt::Service(name, prefix, file, _, _, mcp) = s {
+                // `service mcp crm = "https://..."` is no Quillo service to start (FEEDBACK56.md,
+                // Q-853; branch feedback56).
+                if mcp && prefix.is_none() {
+                    continue;
+                }
                 let full = dir.join(&file);
                 match found.iter_mut().find(|(n, _, _)| *n == name) {
                     Some((_, pre, _)) => {
@@ -1615,6 +1620,17 @@ pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest) -> H
 }
 
 // ---- loading -------------------------------------------------------------------------------
+
+/// What `quillo check` and the run say of `service mcp crm = "https://..."`: calling another MCP
+/// server is for later (FEEDBACK56.md, Part G), and the form is kept for it; the path form,
+/// `service mcp /billing = "billing.qwe"`, is the one there now (FEEDBACK56.md, Q-853; branch
+/// feedback56).
+pub fn mcp_calls_later(name: &str) -> String {
+    format!(
+        "`service mcp {}` would call another MCP server, which Quillo does not do yet: `service mcp /{} = \"{}.qwe\"` offers a Quillo file's tools here, and `service {} = \"{}.qwe\"` calls its server fns",
+        name, name, name, name, name
+    )
+}
 
 /// `service name [/prefix] = "file.qwe"`, run by the program declaring it:
 /// the name stands for the service's functions; the service is loaded here

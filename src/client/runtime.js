@@ -2217,6 +2217,19 @@ const HL = (() => {
     return (b === 0 || !identChar(s[b - 1], false))
       && ["return", "typeof", "instanceof", "case", "do", "else", "in", "of", "new", "delete", "void", "throw", "yield", "await"].includes(s.slice(b, k).join(""));
   };
+  // Whether the `mcp` from `i` to `j` is a tool's tag, as highlight.rs mcp_tag: after `fn`, `view` or
+  // `component` with a name after it, or after `service` with a name or a `/` (FEEDBACK56.md, Q-853;
+  // branch feedback56).
+  const mcpTag = (s, i, j) => {
+    const space = (c) => c === " " || c === "\t";
+    let b = i; while (b > 0 && space(s[b - 1])) b--;
+    const end = b; while (b > 0 && identChar(s[b - 1], false)) b--;
+    const before = s.slice(b, end).join("");
+    let k = j; while (k < s.length && space(s[k])) k++;
+    // A `/` that starts a comment starts no path (FEEDBACK56.md, Q-853, found in review; branch feedback56).
+    const after = s[k], name = alpha(after) || after === "_", path = after === "/" && s[k + 1] !== "/" && s[k + 1] !== "*";
+    return end < i && space(s[j]) && ((["fn", "view", "component"].includes(before) && name) || (before === "service" && (name || path)));
+  };
   return (code, name) => {
     // A language of its own: `constructor` or `__proto__` found the object's, and threw
     // (FEEDBACK55.md, Q-711; branch feedback55).
@@ -2321,7 +2334,7 @@ const HL = (() => {
         let k = j; while (k < n && (s[k] === " " || s[k] === "\t")) k++;
         const next = s[k] === undefined ? " " : s[k];
         const cls = l.css ? (depth > 0 && next === ":" ? "hl-a" : depth === 0 ? "hl-t" : null)
-          : l.keywords.includes(probe) ? "hl-k" : l.consts.includes(probe) ? "hl-n" : next === "(" ? "hl-f"
+          : l.keywords.includes(probe) || (l === qwe && probe === "mcp" && mcpTag(s, i, j)) ? "hl-k" : l.consts.includes(probe) ? "hl-n" : next === "(" ? "hl-f"
           : l.types && c !== c.toLowerCase() && c === c.toUpperCase() ? "hl-t" : null;
         if (cls) span(i, j, cls);
         i = j; continue;
