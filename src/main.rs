@@ -62,6 +62,10 @@ usage:
   quillo fcgi <file.qwe> [options]  run it behind FastCGI (mod_fcgid starts it with
                                     its socket on file descriptor 0; or --listen
                                     unix:PATH, or --port, for nginx's fastcgi_pass)
+  quillo mcp <file.qwe> [options]   serve the program's tools (`fn mcp`) to an AI
+                                    client that starts it, over stdio (MCP
+                                    2026-07-28): checked, its top level run, then
+                                    messages on stdin and stdout; no routes
   quillo <file.qwe>                 same as `quillo run`
 
 The program is the first argument that is not an option, wherever the options
@@ -157,7 +161,12 @@ options for `run`:
 
 `app` takes the options of `run` except --host, --register and --service; its
 port, by default one the system picks, answers only the window. `--open PATH`
-is the page the window opens on (default /).";
+is the page the window opens on (default /).
+
+`mcp` takes --env-file, --policy, --allow-path, --no-build and `-- a b`. Its
+stdout carries MCP's messages alone: `print` and the log go to stderr, and
+`stdin`, `read_line` and `exit` are refused. It ends when stdin closes, or on
+SIGTERM once the call in progress is answered.";
 
 // See quillo::alloc.
 #[global_allocator]
@@ -167,13 +176,14 @@ fn main() {
     let mut args: Vec<String> = std::env::args().collect();
     // `quillo run tool.qwe -- a b`: what follows is the program's, for `args()`
     // (FEEDBACK26.md, Q-202; branch feedback26-fixes).
-    if args.get(1).is_some_and(|c| c == "run" || c.ends_with(".qwe")) {
+    // `quillo mcp tool.qwe -- a b` too (FEEDBACK56.md, C.1; branch feedback56).
+    if args.get(1).is_some_and(|c| c == "run" || c == "mcp" || c.ends_with(".qwe")) {
         if let Some(at) = args.iter().position(|a| a == "--") {
             let mut theirs = args.split_off(at + 1);
             args.pop();
             // `quillo run -- a.qwe x`: a `--` before the program ends the options, and the
             // program is the word after it (FEEDBACK31.md, Q-381; branch feedback27-35-fixes).
-            let from = if args[1] == "run" { 2 } else { 1 };
+            let from = if args[1] == "run" || args[1] == "mcp" { 2 } else { 1 };
             let named = program_and_flags(&args[from..]).ok().is_some_and(|_| has_program(&args[from..]));
             if !named && !theirs.is_empty() {
                 args.push(theirs.remove(0));
@@ -423,6 +433,8 @@ fn real_main(args: Vec<String>) -> i32 {
         }),
         // A debug adapter for editors, on stdin and stdout (src/debug.rs).
         Some("dap") => quillo::debug::serve(|l| run(&l.program, &l.args)),
+        // The program's tools for an AI client, over stdio (FEEDBACK56.md, C.1; branch feedback56).
+        Some("mcp") => with_program(&args[2..], mcp),
         Some("check") => {
             // `--policy FILE`: what the program would be refused under it, said before a deploy
             // (FEEDBACK41.md, Q-478; branch feedback40-43).
@@ -596,8 +608,85 @@ fn real_main(args: Vec<String>) -> i32 {
 }
 
 /// The commands, for the nearest to a misspelt one (FEEDBACK31.md, Q-389; `serve`, `classes` and
-/// `fcgi` too: FEEDBACK55.md, Q-852; branch feedback55).
-const COMMANDS: &[&str] = &["run", "check", "docs", "build", "fix", "install", "repl", "lsp", "dap", "app", "new", "serve", "classes", "fcgi", "version", "help"];
+/// `fcgi` too: FEEDBACK55.md, Q-852; branch feedback55; `mcp`: FEEDBACK56.md, C.1; branch
+/// feedback56).
+const COMMANDS: &[&str] = &["run", "check", "docs", "build", "fix", "install", "repl", "lsp", "dap", "app", "new", "serve", "classes", "fcgi", "mcp", "version", "help"];
+
+/// The options of `run` that `quillo mcp` takes: those about the program, not about serving it.
+const MCP_OPTIONS: &[&str] = &["--env-file", "--policy", "--allow-path", "--no-build"];
+
+/// `quillo mcp main.qwe`: the program's tools (`fn mcp`, `server fn mcp`) for an AI client on this
+/// machine, which starts it, over stdio (FEEDBACK56.md, C.1; branch feedback56). Checked first and
+/// its top level run, as `quillo run` does it; then MCP's messages are read on stdin and answered
+/// on stdout, which carries nothing else. No routes are served, and there are no tokens: the user
+/// who starts it is the caller.
+fn mcp(file: &str, flags: &[String]) -> i32 {
+    let mut i = 0;
+    while i < flags.len() {
+        let f = flags[i].as_str();
+        if !MCP_OPTIONS.contains(&f) {
+            if VALUE_OPTIONS.contains(&f) || FLAG_OPTIONS.contains(&f) || f == "-w" {
+                eprintln!("quillo: `{}` is not for `quillo mcp`, which serves no routes: it takes --env-file, --policy, --allow-path and --no-build", f);
+            } else if f.starts_with('-') {
+                eprintln!("quillo: unknown option `{}` for `mcp`{}", f, nearest(f, MCP_OPTIONS.iter()));
+            } else {
+                eprintln!("quillo: unknown argument `{}`: `mcp` takes one program; its own arguments go after `--`", f);
+            }
+            return 2;
+        }
+        i += if VALUE_OPTIONS.contains(&f) { 2 } else { 1 };
+    }
+    // First: from here on nothing but MCP's messages reaches the client's stdout.
+    let mut out = quillo::mcp::take_stdout();
+    let _ = ctrlc::set_handler(quillo::mcp::stop_asked);
+    let o = match run_options(flags) {
+        Ok(o) => o,
+        Err(code) => return code,
+    };
+    if let Err(code) = with_policy(Path::new(file), &o.policies, true) {
+        return code;
+    }
+    if let Err(code) = before_the_program(file, &o) {
+        return code;
+    }
+    if let Ok(files) = quillo::native::rust_files(Path::new(file)) {
+        quillo::native::prebuild(&files);
+    }
+    let path = Path::new(file);
+    // Checked as `quillo run` checks it, and a program with errors does not start the door. The
+    // tools are the checker's reading of it (src/mcp.rs).
+    let analysis = quillo::check::check_file(path);
+    for d in &analysis.diagnostics {
+        eprintln!("{}", d);
+    }
+    if analysis.errors().next().is_some() {
+        if !analysis.syntax_errors.is_empty() {
+            eprintln!("note: {}", quillo::error::which_quillo());
+        }
+        return 1;
+    }
+    let tools = quillo::mcp::tools(&analysis);
+    if tools.is_empty() {
+        eprintln!("quillo: {} has no tools: a function is one when it is declared `fn mcp name(...)`", file);
+    }
+    let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    quillo::service::serve_as(&stem);
+    // stdin is the client's from the start: `stdin`, `read_line` and `exit` are refused as in any
+    // program that serves, at the top level too, where one would take the client's first message.
+    quillo::value::SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut interp = Interp::new(base);
+    if let Err(e) = interp.load_file(path) {
+        eprintln!("quillo: {:#}", e);
+        return 1;
+    }
+    // What a builtin's error says is hidden from the client, as from a visitor, and logged.
+    quillo::value::HIDING.store(true, std::sync::atomic::Ordering::Relaxed);
+    let door = quillo::mcp::Door::new(stem, tools);
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    quillo::mcp::serve_stdio(&door, &mut interp, &mut input, &mut *out)
+}
 
 /// `-h` or `--help` after a command (or a program's file), wherever it stands: the command's usage,
 /// on stdout, read before anything else, so that `run -h` needs no main.qwe and `lsp --help` starts

@@ -2357,3 +2357,817 @@ fn q858_the_read_only_transaction_on_mariadb() {
     drop(it);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ---- Slice 4: the stdio door, `quillo mcp file.qwe` (C.1) ------------------------------------
+//
+// Driven as an AI client drives it: `quillo mcp` a child process, newline-delimited JSON-RPC
+// written to its stdin and read from its stdout, every read and every wait under a deadline, and
+// the process killed when the test is done with it (`support::Guard`). The messages are those of
+// MCP's revision 2026-07-28 (schema/2026-07-28/schema.ts).
+
+use std::io::{BufRead as _, Write as _};
+use std::sync::{Arc, Mutex};
+
+/// How long a test waits for a line, or for the door to end.
+const WAIT: Duration = Duration::from_secs(30);
+
+/// The `_meta` every request of revision 2026-07-28 carries.
+fn meta() -> Value {
+    json!({ "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {} })
+}
+
+/// A request of 2026-07-28, its `_meta` put in its `params`.
+fn request(id: Value, method: &str, mut params: Value) -> String {
+    params["_meta"] = meta();
+    json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string()
+}
+
+/// A tool's call, its id the tool's name.
+fn call_line(name: &str, args: Value) -> String {
+    request(json!(name), "tools/call", json!({ "name": name, "arguments": args }))
+}
+
+/// `quillo mcp` started as a client starts it, its pipes held.
+struct Stdio {
+    guard: support::Guard,
+    stdin: Option<std::process::ChildStdin>,
+    out: std::sync::mpsc::Receiver<String>,
+    err: Arc<Mutex<String>>,
+    err_reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Stdio {
+    fn start(d: &Path, args: &[&str]) -> Stdio {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+            .arg("mcp")
+            .args(args)
+            .current_dir(d)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (tx, out) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for l in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(l).is_err() {
+                    break;
+                }
+            }
+        });
+        let err = Arc::new(Mutex::new(String::new()));
+        let e = err.clone();
+        let err_reader = std::thread::spawn(move || {
+            let mut r = std::io::BufReader::new(stderr);
+            let mut line = String::new();
+            while r.read_line(&mut line).is_ok_and(|n| n > 0) {
+                e.lock().unwrap().push_str(&line);
+                line.clear();
+            }
+        });
+        Stdio { guard: support::Guard::new(child), stdin, out, err, err_reader: Some(err_reader) }
+    }
+
+    /// Writes `text` as it is: a message's line ends with `\n`.
+    fn write(&mut self, text: &[u8]) {
+        let s = self.stdin.as_mut().expect("stdin was closed");
+        s.write_all(text).unwrap();
+        s.flush().unwrap();
+    }
+
+    fn send(&mut self, line: &str) {
+        self.write(format!("{}\n", line).as_bytes());
+    }
+
+    /// The next line of stdout, which must be JSON: None once stdout ends, or when nothing came
+    /// in time.
+    fn next_within(&self, wait: Duration) -> Option<Value> {
+        self.out.recv_timeout(wait).ok().map(|l| serde_json::from_str(&l).unwrap_or_else(|e| panic!("not JSON on stdout ({}): {:?}", e, l)))
+    }
+
+    fn next(&self) -> Option<Value> {
+        self.next_within(WAIT)
+    }
+
+    /// The answer to `line`.
+    fn ask(&mut self, line: &str) -> Value {
+        self.send(line);
+        self.next().unwrap_or_else(|| panic!("no answer to {}\nstderr: {}", line, self.stderr()))
+    }
+
+    /// A tool's result: its `result`, the call's id checked and `_meta` taken out.
+    fn call(&mut self, name: &str, args: Value) -> Value {
+        let a = self.ask(&call_line(name, args));
+        assert_eq!(a["id"], json!(name), "{}", a);
+        let mut r = a["result"].clone();
+        assert!(r.is_object(), "not a result: {}", a);
+        assert_eq!(r["resultType"], json!("complete"), "{}", a);
+        assert_eq!(r["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], json!("main"), "{}", a);
+        r.as_object_mut().unwrap().remove("_meta");
+        r.as_object_mut().unwrap().remove("resultType");
+        r
+    }
+
+    /// A protocol error's id (None when it has none), code and message.
+    fn refusal(&mut self, line: &str) -> (Option<Value>, i64, String) {
+        let a = self.ask(line);
+        assert!(a.get("result").is_none(), "answered {} with a result: {}", line, a);
+        assert_eq!(a["jsonrpc"], json!("2.0"));
+        (a.get("id").cloned(), a["error"]["code"].as_i64().unwrap_or_else(|| panic!("{}", a)), a["error"]["message"].as_str().unwrap_or_default().to_string())
+    }
+
+    fn stderr(&self) -> String {
+        self.err.lock().unwrap().clone()
+    }
+
+    /// Waits until stderr says `what`.
+    fn says(&self, what: &str) {
+        let deadline = Instant::now() + WAIT;
+        while !self.stderr().contains(what) {
+            assert!(Instant::now() < deadline, "stderr never said {:?}: {}", what, self.stderr());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn close(&mut self) {
+        self.stdin = None;
+    }
+
+    fn pid(&self) -> u32 {
+        self.guard.0.id()
+    }
+
+    /// Waits for it to end, under the deadline: its status, None when it did not end (it is
+    /// killed when dropped). Its stderr is all read then.
+    fn ended(&mut self) -> Option<i32> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(s) = self.guard.0.try_wait().unwrap() {
+                if let Some(r) = self.err_reader.take() {
+                    let _ = r.join();
+                }
+                return s.code();
+            }
+            if Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// `quillo mcp <args>` in `d` with its stdin closed: its status, stdout and stderr.
+fn mcp_exits(d: &Path, args: &[&str]) -> (Option<i32>, Vec<Value>, String) {
+    let mut s = Stdio::start(d, args);
+    s.close();
+    let code = s.ended();
+    let mut out = Vec::new();
+    while let Some(v) = s.next_within(Duration::from_millis(200)) {
+        out.push(v);
+    }
+    (code, out, s.stderr())
+}
+
+/// The program the door is driven with: a tool of each kind of answer.
+const DOOR_SRC: &str = r#"db.open(":memory:")
+db.exec("create table notes (id integer primary key, text text not null)")
+print("top level, to stderr")
+print(`{"jsonrpc":"2.0","id":99,"result":{}}`)
+print("two\nlines")
+
+/// Adds a note and gives back all notes.
+fn mcp add_note(text: str) -> list ! str with db {
+    print(`adding ${text}`)
+    if trim(text) == "" { return err("empty note") }
+    db.exec("insert into notes (text) values (?)", text)?
+    db.query("select id, text from notes order by id")
+}
+
+/// A greeting.
+fn mcp hello(name: str, greeting: str = "hi", end: str = "!") with time = `${greeting} ${name}${end}`
+
+/// A note by its number.
+fn mcp lookup(id: int) -> str ! { code: int, why: str } with time = err({ code: 3, why: `no note ${id}` })
+
+/// Needs a login.
+fn mcp mine() -> str with time {
+    session().user ?? reply 401 "Log in first"
+}
+
+/// Gone.
+fn mcp gone() with time {
+    reply 404
+}
+
+/// Taken.
+fn mcp taken() with time {
+    reply 409 { why: "taken" }
+}
+
+let pages = [(u) => redirect(u), () => <p>hi</p>]
+
+/// A page, which the checker cannot see.
+fn mcp page(which: int) with time = if which == 0 { pages[0]("/x") } else { pages[1]() }
+
+/// Breaks in a builtin.
+fn mcp boom(n: int) -> int with time = int("x" + str(n))?
+
+/// Fails.
+fn mcp crash() with time = unwrap(err("on purpose"))
+
+/// A script's.
+fn mcp leave() with env = exit(3)
+
+/// A script's.
+fn mcp piped() with env = stdin()
+
+/// A script's.
+fn mcp line() with env = read_line()
+
+/// Nothing to take.
+fn mcp clock() -> int with time = 7
+
+type Point = { x: int, y: int = 0 }
+
+/// Moves.
+fn mcp moved(p: Point, by: int = 1) -> Point with time = Point({ x: p.x + by, y: p.y + by })
+
+/// Echo, untyped.
+fn mcp echo(v: any) with time = v
+
+/// Its arguments.
+fn mcp given() with env = args()
+
+/// Whether writes are refused now.
+fn mcp locked() -> int with db = db.one("select query_only as q from pragma_query_only").q
+
+/// Whether writes are refused while it writes.
+fn mcp unlocked(t: str) -> int with db {
+    db.exec("insert into notes (text) values (?)", t)
+    db.one("select query_only as q from pragma_query_only").q
+}
+
+/// Waits.
+fn mcp wait(ms: int) -> int with time {
+    print("waiting")
+    sleep(ms)
+    ms
+}
+"#;
+
+fn door_dir(name: &str) -> PathBuf {
+    dir(&format!("c1-{}", name), DOOR_SRC)
+}
+
+#[test]
+fn c1_discover_list_and_call() {
+    let d = door_dir("door");
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    // `server/discover`: the one version, the one capability, how long both hold, who answers.
+    let found = door.ask(&request(json!(1), "server/discover", json!({})));
+    assert_eq!(found["id"], json!(1));
+    let r = &found["result"];
+    assert_eq!(r["resultType"], json!("complete"));
+    assert_eq!(r["supportedVersions"], json!(["2026-07-28"]));
+    assert_eq!(r["capabilities"], json!({ "tools": {} }));
+    assert_eq!((r["ttlMs"].clone(), r["cacheScope"].clone()), (json!(3_600_000), json!("public")));
+    let who = &r["_meta"]["io.modelcontextprotocol/serverInfo"];
+    assert_eq!(who["name"], json!("main"));
+    assert!(who["version"].as_str().is_some_and(|v| v.starts_with(env!("CARGO_PKG_VERSION"))), "{}", who);
+    // Part D's instructions are slice 6's.
+    assert!(r.get("instructions").is_none(), "{}", r);
+    // `tools/list`: slice 3's tools as `mcp::list` writes them, in source order, in one page.
+    let listed = door.ask(&request(json!("list"), "tools/list", json!({})));
+    let r = &listed["result"];
+    assert_eq!(r["tools"], mcp::list(&mcp::of_source(&d.join("main.qwe")).unwrap()));
+    let names: Vec<&str> = r["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["add_note", "hello", "lookup", "mine", "gone", "taken", "page", "boom", "crash", "leave", "piped", "line", "clock", "moved", "echo", "given", "locked", "unlocked", "wait"]);
+    assert_eq!((r["resultType"].clone(), r["ttlMs"].clone(), r["cacheScope"].clone()), (json!("complete"), json!(3_600_000), json!("public")));
+    assert!(r.get("nextCursor").is_none());
+    // A typed result: `structuredContent`, and the same JSON as its text. Unicode both ways.
+    let r = door.call("add_note", json!({ "text": "é ✓ 日本" }));
+    assert_eq!(r["structuredContent"], json!({ "result": [{ "id": 1, "text": "é ✓ 日本" }] }));
+    assert_eq!(r["content"], json!([{ "type": "text", "text": r["structuredContent"].to_string() }]));
+    assert!(r.get("isError").is_none(), "{}", r);
+    let r = door.call("add_note", json!({ "text": "b" }));
+    assert_eq!(r["structuredContent"]["result"].as_array().map(Vec::len), Some(2));
+    // A record is the object itself; a field it does not have is dropped, as records drop it.
+    assert_eq!(door.call("moved", json!({ "p": { "x": 1 } }))["structuredContent"], json!({ "x": 2, "y": 1 }));
+    assert_eq!(door.call("moved", json!({ "p": { "x": 1, "z": 2 }, "by": 3 }))["structuredContent"], json!({ "x": 4, "y": 3 }));
+    // No parameters: no `arguments`, or an empty object.
+    assert_eq!(door.call("clock", json!({}))["structuredContent"], json!({ "result": 7 }));
+    let a = door.ask(&request(json!("bare"), "tools/call", json!({ "name": "clock" })));
+    assert_eq!(a["result"]["structuredContent"], json!({ "result": 7 }), "{}", a);
+    // An untyped result: text alone, a text as it is. Arguments by name, one before another left
+    // out for its default, all left out, an empty one given.
+    let text = |r: &Value| {
+        assert!(r.get("structuredContent").is_none() && r.get("isError").is_none(), "{}", r);
+        r["content"][0]["text"].as_str().unwrap().to_string()
+    };
+    assert_eq!(text(&door.call("hello", json!({ "name": "Ana", "end": "?" }))), "hi Ana?");
+    assert_eq!(text(&door.call("hello", json!({ "name": "Ana" }))), "hi Ana!");
+    assert_eq!(text(&door.call("hello", json!({ "end": "", "greeting": "oi", "name": "Zoë" }))), "oi Zoë");
+    // Any other value its JSON, as sent: Quillo's own wire (`$dec`) is not read into it.
+    assert_eq!(text(&door.call("echo", json!({ "v": { "$dec": "1.5" } }))), r#"{"$dec":"1.5"}"#);
+    assert_eq!(text(&door.call("echo", json!({ "v": [1, [2, { "a": "é" }], null] }))), r#"[1,[2,{"a":"é"}],null]"#);
+    assert_eq!(text(&door.call("echo", json!({ "v": null }))), "null");
+    assert_eq!(text(&door.call("echo", json!({ "v": "" }))), "");
+    assert_eq!(text(&door.call("given", json!({}))), "[]");
+    door.close();
+    assert_eq!(door.ended(), Some(0));
+    assert!(door.stderr().contains("adding é ✓ 日本"), "{}", door.stderr());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c1_what_a_tool_says_is_a_result() {
+    let d = door_dir("results");
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    let error = |r: Value| {
+        assert_eq!(r["isError"], json!(true), "{}", r);
+        assert!(r.get("structuredContent").is_none(), "{}", r);
+        assert_eq!(r["content"].as_array().map(Vec::len), Some(1), "{}", r);
+        assert_eq!(r["content"][0]["type"], json!("text"));
+        r["content"][0]["text"].as_str().unwrap().to_string()
+    };
+    // The tool's own `err(v)`: a text as it is, any other value as its JSON.
+    assert_eq!(error(door.call("add_note", json!({ "text": " " }))), "empty note");
+    assert_eq!(error(door.call("lookup", json!({ "id": 5 }))), r#"{"code":3,"why":"no note 5"}"#);
+    // An argument the door refuses, with the words `/_quillo/rpc` says it in.
+    assert_eq!(error(door.call("add_note", json!({ "text": 5 }))), "argument `text` of `add_note` must be str, got int");
+    assert_eq!(error(door.call("add_note", json!({}))), "missing argument `text` for `add_note`");
+    assert_eq!(error(door.call("hello", json!({ "greeting": "yo" }))), "missing argument `name` for `hello`");
+    assert_eq!(error(door.call("hello", json!({ "name": null }))), "argument `name` of `hello` must be str, got null");
+    assert_eq!(error(door.call("add_note", json!({ "txt": "x" }))), "`add_note` has no argument `txt`: it takes `text`");
+    assert_eq!(error(door.call("hello", json!({ "name": "a", "Name": "b" }))), "`hello` has no argument `Name`: it takes `name`, `greeting`, `end`");
+    assert_eq!(error(door.call("clock", json!({ "x": 1 }))), "`clock` takes no arguments, got `x`");
+    assert!(error(door.call("moved", json!({ "p": { "y": 1 } }))).starts_with("argument `p` of `moved` must be Point, got map"));
+    // A `reply`: its text; with no body, its status's words.
+    assert_eq!(error(door.call("mine", json!({}))), "Log in first");
+    assert_eq!(error(door.call("gone", json!({}))), "404 Not Found");
+    assert_eq!(error(door.call("taken", json!({}))), r#"{"why":"taken"}"#);
+    // A page, a redirect or markup, is none of a tool's answers.
+    assert_eq!(error(door.call("page", json!({ "which": 0 }))), "a tool answers with data, not a page");
+    assert_eq!(error(door.call("page", json!({ "which": 1 }))), "a tool answers with data, not a page");
+    // A builtin's error and a failure: `internal error`, the real one on stderr.
+    assert_eq!(error(door.call("boom", json!({ "n": 1 }))), "internal error");
+    door.says("not an int: \"x1\"");
+    assert_eq!(error(door.call("crash", json!({}))), "internal error");
+    door.says("error in tool `crash`");
+    door.says("unwrap of an error: on purpose");
+    // A script's builtins, refused as in any program that serves: stdin is the client's.
+    for (tool, builtin) in [("leave", "exit"), ("piped", "stdin"), ("line", "read_line")] {
+        assert_eq!(error(door.call(tool, json!({}))), "internal error");
+        door.says(&format!("`{}` is for a script", builtin));
+    }
+    // And the door goes on.
+    assert_eq!(door.call("clock", json!({}))["structuredContent"], json!({ "result": 7 }));
+    door.close();
+    assert_eq!(door.ended(), Some(0));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c1_protocol_errors_have_their_codes() {
+    let d = door_dir("protocol");
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    let (parse, invalid_request, no_method, invalid_params, version) = (-32700, -32600, -32601, -32602, -32022);
+    // `tools/call` of no tool, or not of its shape: invalid params, the id said.
+    for (params, said) in [
+        (json!({ "name": "nope" }), "Unknown tool: nope"),
+        (json!({ "name": "café ✓" }), "Unknown tool: café ✓"),
+        (json!({ "name": "" }), "Unknown tool: "),
+        (json!({}), "Invalid params: `name` is the tool's name, a string"),
+        (json!({ "name": 5 }), "Invalid params: `name` is the tool's name, a string"),
+        (json!({ "name": "clock", "arguments": [1] }), "Invalid params: `arguments` is an object, each argument by its name"),
+        (json!({ "name": "clock", "arguments": "x" }), "Invalid params: `arguments` is an object, each argument by its name"),
+        (json!({ "name": "clock", "arguments": null }), "Invalid params: `arguments` is an object, each argument by its name"),
+    ] {
+        assert_eq!(door.refusal(&request(json!(7), "tools/call", params.clone())), (Some(json!(7)), invalid_params, said.to_string()), "{}", params);
+    }
+    // `tools/list` has one page: a cursor is one the door never gave.
+    for cursor in [json!("next"), json!("")] {
+        assert_eq!(door.refusal(&request(json!(8), "tools/list", json!({ "cursor": cursor }))), (Some(json!(8)), invalid_params, "Invalid cursor".into()));
+    }
+    // `_meta`'s version and capabilities, on every request.
+    let meta_said = "Invalid params: `_meta` carries io.modelcontextprotocol/protocolVersion and io.modelcontextprotocol/clientCapabilities";
+    for line in [
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/list"}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":[]}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":5,"io.modelcontextprotocol/clientCapabilities":{}}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":9,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{}}}}"#.to_string(),
+    ] {
+        assert_eq!(door.refusal(&line), (Some(json!(9)), invalid_params, meta_said.to_string()), "{}", line);
+    }
+    assert_eq!(door.refusal(r#"{"jsonrpc":"2.0","id":9,"method":"tools/list","params":[]}"#), (Some(json!(9)), invalid_params, "Invalid params: `params` is an object".into()));
+    // A version it does not speak: the version error, with what it speaks; before what else is
+    // missing.
+    for (v, caps) in [("2025-06-18", true), ("2025-11-25", false), ("2026-07-29", true), ("", true)] {
+        let mut m = json!({ "io.modelcontextprotocol/protocolVersion": v });
+        if caps {
+            m["io.modelcontextprotocol/clientCapabilities"] = json!({});
+        }
+        let a = door.ask(&json!({ "jsonrpc": "2.0", "id": 10, "method": "tools/list", "params": { "_meta": m } }).to_string());
+        assert_eq!(a["error"]["code"], json!(version), "{}", a);
+        assert_eq!(a["error"]["data"], json!({ "supported": ["2026-07-28"], "requested": v }), "{}", a);
+        assert_eq!(a["id"], json!(10));
+    }
+    // A method it does not have, those of capabilities it does not say among them.
+    for m in ["ping", "resources/list", "prompts/list", "subscriptions/listen", "completion/complete", "Tools/List", "notifications/initialized"] {
+        assert_eq!(door.refusal(&request(json!(11), m, json!({}))), (Some(json!(11)), no_method, format!("Method not found: {}", m)));
+    }
+    // Not a request: no id where it cannot be read, MCP's ids never being null.
+    for (line, code, said) in [
+        ("not json", parse, "Parse error: expected ident at line 1 column 2"),
+        ("{", parse, "Parse error: EOF while parsing an object at line 1 column 1"),
+        (r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"} {}"#, parse, "Parse error: trailing characters at line 1 column 48"),
+        ("[]", invalid_request, "Invalid request: one message a line, not a batch"),
+        (r#"[{"jsonrpc":"2.0","id":1,"method":"tools/list"}]"#, invalid_request, "Invalid request: one message a line, not a batch"),
+        ("5", invalid_request, "Invalid request: a message is a JSON object"),
+        ("\"tools/list\"", invalid_request, "Invalid request: a message is a JSON object"),
+        ("null", invalid_request, "Invalid request: a message is a JSON object"),
+        (r#"{"jsonrpc":"2.0","id":null,"method":"tools/list"}"#, invalid_request, "Invalid request: an id is a string or an integer"),
+        (r#"{"jsonrpc":"2.0","id":1.5,"method":"tools/list"}"#, invalid_request, "Invalid request: an id is a string or an integer"),
+        (r#"{"jsonrpc":"2.0","id":{},"method":"tools/list"}"#, invalid_request, "Invalid request: an id is a string or an integer"),
+        (r#"{"jsonrpc":"2.0","id":true,"method":"tools/list"}"#, invalid_request, "Invalid request: an id is a string or an integer"),
+        (r#"{"jsonrpc":"2.0","method":5}"#, invalid_request, "Invalid request: `method` is a string"),
+        (r#"{"jsonrpc":"2.0"}"#, invalid_request, "Invalid request: `method` is a string"),
+    ] {
+        assert_eq!(door.refusal(line), (None, code, said.to_string()), "{}", line);
+    }
+    // Bytes that are not UTF-8: not JSON.
+    door.write(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/\xff\"}\n");
+    let a = door.next().unwrap();
+    assert!(a.get("id").is_none() && a["error"]["code"] == json!(parse), "{}", a);
+    assert!(a["error"]["message"].as_str().is_some_and(|m| m.starts_with("Parse error: ")), "{}", a);
+    // With an id that can be read, it is said.
+    assert_eq!(door.refusal(&request(json!(12), "tools/list", json!({})).replace("\"2.0\"", "\"1.0\"")), (Some(json!(12)), invalid_request, "Invalid request: `jsonrpc` is \"2.0\"".into()));
+    assert_eq!(door.refusal(r#"{"id":12,"method":"tools/list"}"#), (Some(json!(12)), invalid_request, "Invalid request: `jsonrpc` is \"2.0\"".into()));
+    assert_eq!(door.refusal(r#"{"jsonrpc":"2.0","id":12,"method":["tools/list"]}"#), (Some(json!(12)), invalid_request, "Invalid request: `method` is a string".into()));
+    assert_eq!(door.refusal(r#"{"jsonrpc":"2.0","id":12}"#), (Some(json!(12)), invalid_request, "Invalid request: `method` is a string".into()));
+    // Ids come back as they were sent.
+    for id in [json!("s é"), json!(""), json!(0), json!(-1), json!(i64::MIN), json!(u64::MAX)] {
+        assert_eq!(door.ask(&request(id.clone(), "server/discover", json!({})))["id"], id);
+    }
+    // Never answered: a notification, known or not; a client's response; a line of nothing.
+    // Each is followed by a request, whose answer is the next line.
+    for (n, quiet) in [
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"x","reason":"late"}}"#,
+        r#"{"jsonrpc":"2.0","method":"tools/list","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"anything"}"#,
+        r#"{"jsonrpc":"2.0","id":5,"result":{}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"error":{"code":-1,"message":"no"}}"#,
+        r#"{"jsonrpc":"2.0","result":{}}"#,
+        "",
+        "   \t",
+    ]
+    .iter()
+    .enumerate()
+    {
+        door.send(quiet);
+        assert_eq!(door.ask(&request(json!(100 + n), "server/discover", json!({})))["id"], json!(100 + n), "{:?} was answered", quiet);
+    }
+    // A line that ends `\r\n`.
+    door.write(format!("{}\r\n", request(json!(13), "server/discover", json!({}))).as_bytes());
+    assert_eq!(door.next().unwrap()["id"], json!(13));
+    door.close();
+    assert_eq!(door.ended(), Some(0));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c1_initialize_is_told_the_version_to_speak() {
+    let d = door_dir("initialize");
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    // As a client of 2025-11-25 opens (Claude Code 2.1.270's own message): the version error,
+    // which names the version the door speaks, and no fallback (decided 2026-11-08).
+    let a = door.ask(r#"{"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{"listChanged":true},"elicitation":{}},"clientInfo":{"name":"claude-code","version":"2.1.270"}},"jsonrpc":"2.0","id":0}"#);
+    assert_eq!(a, json!({ "jsonrpc": "2.0", "id": 0, "error": { "code": -32022, "message": "Unsupported protocol version: this server speaks MCP 2026-07-28 only", "data": { "supported": ["2026-07-28"], "requested": "2025-11-25" } } }));
+    // Whatever it says of its version, or nothing.
+    for (params, requested) in [(json!({ "protocolVersion": "2024-11-05" }), "2024-11-05"), (json!({}), ""), (json!({ "protocolVersion": 3 }), "")] {
+        let a = door.ask(&json!({ "jsonrpc": "2.0", "id": "i", "method": "initialize", "params": params }).to_string());
+        assert_eq!((a["error"]["code"].clone(), a["error"]["data"]["requested"].clone()), (json!(-32022), json!(requested)), "{}", a);
+    }
+    assert_eq!(door.ask(r#"{"jsonrpc":"2.0","id":"i","method":"initialize"}"#)["error"]["code"], json!(-32022));
+    // Sent with 2026-07-28's `_meta`, `initialize` is a method it does not have, not a version
+    // to try again with.
+    assert_eq!(door.refusal(&request(json!(1), "initialize", json!({}))), (Some(json!(1)), -32601, "Method not found: initialize".into()));
+    // Nothing was kept: `notifications/initialized` is ignored, and a request of 2026-07-28 is
+    // answered as the first would be.
+    door.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    assert_eq!(door.call("clock", json!({}))["structuredContent"], json!({ "result": 7 }));
+    door.close();
+    assert_eq!(door.ended(), Some(0));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c1_stdout_carries_only_messages_while_the_program_prints() {
+    let d = door_dir("stdout");
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    let sent = ["a", "b\nc", "{\"jsonrpc\":\"2.0\",\"id\":98}"];
+    for (i, t) in sent.iter().enumerate() {
+        door.send(&request(json!(i), "tools/call", json!({ "name": "add_note", "arguments": { "text": t } })));
+    }
+    door.send(&call_line("wait", json!({ "ms": 1 })));
+    door.close();
+    assert_eq!(door.ended(), Some(0));
+    // Each line of stdout is the answer to a request sent, in order, and nothing else is there.
+    let mut lines = Vec::new();
+    while let Some(v) = door.next_within(Duration::from_millis(200)) {
+        lines.push(v);
+    }
+    let ids: Vec<Value> = lines.iter().map(|l| l["id"].clone()).collect();
+    assert_eq!(ids, [json!(0), json!(1), json!(2), json!("wait")], "{:?}", lines);
+    assert!(lines.iter().all(|l| l["jsonrpc"] == json!("2.0") && l["result"]["resultType"] == json!("complete")), "{:?}", lines);
+    // What the program printed, at the top level and in its tools, went to stderr.
+    let err = door.stderr();
+    for p in ["top level, to stderr\n", "{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n", "two\nlines\n", "adding a\n", "adding b\nc\n", "adding {\"jsonrpc\":\"2.0\",\"id\":98}\n", "waiting\n"] {
+        assert!(err.contains(p), "{:?} not on stderr: {}", p, err);
+    }
+    // A script's `print` is on stdout, as before.
+    std::fs::write(d.join("script.qwe"), "print(\"to stdout\")\n").unwrap();
+    assert_eq!(quillo(&d, &["run", "script.qwe"]), (true, "to stdout\n".to_string(), String::new()));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(unix)]
+#[test]
+fn c1_the_end_of_stdin_and_sigterm_end_it() {
+    let d = door_dir("end");
+    // Stdin closed at once, and after a last line with no `\n`, which is answered.
+    assert_eq!(mcp_exits(&d, &["main.qwe"]).0, Some(0));
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    door.write(request(json!("last"), "server/discover", json!({})).as_bytes());
+    door.close();
+    assert_eq!(door.next().map(|a| a["id"].clone()), Some(json!("last")));
+    assert_eq!(door.ended(), Some(0));
+    let term = |door: &Stdio| unsafe { libc::kill(door.pid() as i32, libc::SIGTERM) };
+    // SIGTERM while it waits for a message: it ends.
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    assert_eq!(door.call("clock", json!({}))["structuredContent"], json!({ "result": 7 }));
+    term(&door);
+    assert_eq!(door.ended(), Some(0));
+    // While a call is answered: once its answer is out.
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    door.send(&call_line("wait", json!({ "ms": 1500 })));
+    door.says("waiting");
+    let at = Instant::now();
+    term(&door);
+    let a = door.next().expect("the call in progress was not answered");
+    assert_eq!(a["result"]["structuredContent"], json!({ "result": 1500 }), "{}", a);
+    assert_eq!(door.ended(), Some(0));
+    assert!(at.elapsed() < Duration::from_secs(10), "{:?}", at.elapsed());
+    assert!(door.stderr().contains("quillo: stopping once the call in progress is answered (again to stop now)"), "{}", door.stderr());
+    // A second SIGTERM: at once, the call left unanswered.
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    door.send(&call_line("wait", json!({ "ms": 20000 })));
+    door.says("waiting");
+    term(&door);
+    door.says("stopping once");
+    let at = Instant::now();
+    term(&door);
+    assert_eq!(door.ended(), Some(130));
+    assert!(at.elapsed() < Duration::from_secs(10), "{:?}", at.elapsed());
+    assert!(door.next_within(Duration::from_millis(200)).is_none());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c1_a_program_that_does_not_check_does_not_start() {
+    // An error `quillo check` finds: the door does not start, and stdout is empty.
+    let d = dir("c1-unchecked", "/// T.\nfn mcp café() = 1\n");
+    let (code, out, err) = mcp_exits(&d, &["main.qwe"]);
+    assert_eq!((code, out.len()), (Some(1), 0), "{}", err);
+    assert!(err.contains(NAME_RULE), "{}", err);
+    // A syntax error, said as `quillo run` says it.
+    std::fs::write(d.join("main.qwe"), "/// T.\nfn mcp tick( = 1\n").unwrap();
+    let (code, out, err) = mcp_exits(&d, &["main.qwe"]);
+    assert_eq!((code, out, err), (Some(1), vec![], "main.qwe:2: error: expected a parameter name, found `=`\n".to_string()));
+    // A top level that fails, and one that reads stdin, which is the client's.
+    std::fs::write(d.join("main.qwe"), "let x = unwrap(err(\"at the top\"))\n/// T.\nfn mcp tick() = 1\n").unwrap();
+    let (code, out, err) = mcp_exits(&d, &["main.qwe"]);
+    assert_eq!((code, out.len()), (Some(1), 0), "{}", err);
+    assert!(err.contains("at the top"), "{}", err);
+    std::fs::write(d.join("main.qwe"), "let first = read_line()\n/// T.\nfn mcp tick() = 1\n").unwrap();
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    door.send(&request(json!(1), "server/discover", json!({})));
+    assert_eq!(door.ended(), Some(1));
+    assert!(door.stderr().contains("`read_line` is for a script"), "{}", door.stderr());
+    assert!(door.next_within(Duration::from_millis(200)).is_none());
+    // No program there.
+    let (code, out, err) = mcp_exits(&d, &["gone.qwe"]);
+    assert_eq!((code, out.len()), (Some(1), 0), "{}", err);
+    // A program with no tools starts, and says so; its list is empty.
+    std::fs::write(d.join("main.qwe"), "fn plain() = 1\n").unwrap();
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    assert_eq!(door.ask(&request(json!(1), "tools/list", json!({})))["result"]["tools"], json!([]));
+    assert_eq!(door.ask(&request(json!(2), "server/discover", json!({})))["result"]["capabilities"], json!({ "tools": {} }));
+    door.close();
+    assert_eq!(door.ended(), Some(0));
+    assert!(door.stderr().contains("quillo: main.qwe has no tools: a function is one when it is declared `fn mcp name(...)`"), "{}", door.stderr());
+    // `run`'s options about serving are not `mcp`'s.
+    for (args, said) in [
+        (&["main.qwe", "--port", "1"][..], "quillo: `--port` is not for `quillo mcp`, which serves no routes: it takes --env-file, --policy, --allow-path and --no-build\n"),
+        (&["--watch", "main.qwe"], "quillo: `--watch` is not for `quillo mcp`, which serves no routes: it takes --env-file, --policy, --allow-path and --no-build\n"),
+        (&["main.qwe", "--bogus"], "quillo: unknown option `--bogus` for `mcp`\n"),
+        (&["main.qwe", "--env-fil", "x"], "quillo: unknown option `--env-fil` for `mcp` (did you mean `--env-file`?)\n"),
+        (&["main.qwe", "other.qwe"], "quillo: unknown argument `other.qwe`: `mcp` takes one program; its own arguments go after `--`\n"),
+    ] {
+        assert_eq!(mcp_exits(&d, args), (Some(2), vec![], said.to_string()), "{:?}", args);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c1_the_settings_and_the_programs_arguments() {
+    let d = dir("c1-settings", "/// A setting.\nfn mcp setting(k: str) with env = env(k)\n/// Its arguments.\nfn mcp given() with env = args()\n");
+    std::fs::write(d.join(".env"), "COLOUR=teal\n").unwrap();
+    std::fs::write(d.join("other.env"), "COLOUR=ochre\n").unwrap();
+    let text = |door: &mut Stdio, name: &str, args: Value| door.call(name, args)["content"][0]["text"].as_str().unwrap().to_string();
+    // The `.env` beside the program, as `quillo run` reads it, or `--env-file`'s.
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    assert_eq!(text(&mut door, "setting", json!({ "k": "COLOUR" })), "teal");
+    assert_eq!(text(&mut door, "given", json!({})), "[]");
+    drop(door);
+    // A program's own arguments after `--`, `--help` among them.
+    let mut door = Stdio::start(&d, &["main.qwe", "--env-file", "other.env", "--", "a", "b c", "--help"]);
+    assert_eq!(text(&mut door, "setting", json!({ "k": "COLOUR" })), "ochre");
+    assert_eq!(text(&mut door, "given", json!({})), r#"["a","b c","--help"]"#);
+    drop(door);
+    // Its folder, as `quillo run .` takes it.
+    let mut door = Stdio::start(&d, &[]);
+    assert_eq!(text(&mut door, "setting", json!({ "k": "COLOUR" })), "teal");
+    drop(door);
+    // `help` lists it; a misspelling is told it; `-h` is the usage, on stdout.
+    let (ok, out, _) = quillo(&d, &["help"]);
+    assert!(ok && out.contains("\n  quillo mcp <file.qwe> [options]   serve the program's tools (`fn mcp`) to an AI\n"), "{}", out);
+    assert!(out.contains("\n`mcp` takes --env-file, --policy, --allow-path, --no-build and `-- a b`."), "{}", out);
+    let (ok, _, err) = quillo(&d, &["mcps", "main.qwe"]);
+    assert!(!ok && err.contains("unknown command `mcps` (did you mean `mcp`?)"), "{}", err);
+    let (ok, out, err) = quillo(&d, &["mcp", "-h"]);
+    assert!(ok && out.starts_with("Quillo — a small web language\n") && err.is_empty(), "{}{}", out, err);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c1_a_tool_that_only_reads_runs_in_the_read_only_transaction() {
+    let d = door_dir("read-only");
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    let listed = door.ask(&request(json!(1), "tools/list", json!({})));
+    let tools = listed["result"]["tools"].as_array().unwrap().clone();
+    let hints = |name: &str| tools.iter().find(|t| t["name"] == json!(name)).unwrap()["annotations"].clone();
+    assert_eq!(hints("locked"), json!({ "readOnlyHint": true, "openWorldHint": false }));
+    assert_eq!(hints("unlocked"), json!({ "openWorldHint": false }));
+    // Through the door, SQLite refuses writes while the tool that only reads runs, and not while
+    // the one that writes does.
+    assert_eq!(door.call("locked", json!({}))["structuredContent"], json!({ "result": 1 }));
+    assert_eq!(door.call("unlocked", json!({ "t": "a" }))["structuredContent"], json!({ "result": 0 }));
+    assert_eq!(door.call("locked", json!({}))["structuredContent"], json!({ "result": 1 }));
+    assert_eq!(door.call("add_note", json!({ "text": "b" }))["structuredContent"]["result"].as_array().map(Vec::len), Some(2));
+    door.close();
+    assert_eq!(door.ended(), Some(0));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c1_on_postgres_a_write_the_checker_could_not_see_is_refused() {
+    let Some(pg) = support::postgres("feedback56-c1") else {
+        eprintln!("skipped: c1_on_postgres_a_write_the_checker_could_not_see_is_refused, as PostgreSQL's initdb and pg_ctl were not found");
+        return;
+    };
+    let url = pg.database("cdoor");
+    // A view whose `select` calls a function of the program's that writes: to the checker, a
+    // `select` of a table, so the tool is said to only read; the database refuses the write.
+    let src = format!(
+        "db.open({:?})\n\
+         db.exec(\"create table if not exists notes (id serial primary key, text text)\")\n\
+         db.exec(\"create or replace function add_note() returns int language sql as $$ insert into notes (text) values ('sneaked') returning id $$\")\n\
+         db.exec(\"create or replace view sneaky as select add_note() as id\")\n\
+         /// Peeks.\nfn mcp peek() -> list with db = db.query(\"select id from sneaky\")\n\
+         /// Counts.\nfn mcp total() -> int with db = db.one(\"select count(*) as n from notes\").n\n\
+         /// Adds.\nfn mcp add(t: str) -> int with db = db.exec(\"insert into notes (text) values (?)\", t).changes\n",
+        url
+    );
+    let d = dir("c1-pg", &src);
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    let listed = door.ask(&request(json!(1), "tools/list", json!({})));
+    assert_eq!(listed["result"]["tools"][0]["annotations"], json!({ "readOnlyHint": true, "openWorldHint": false }), "{}", listed);
+    let r = door.call("peek", json!({}));
+    assert_eq!((r["isError"].clone(), r["content"][0]["text"].clone()), (json!(true), json!("internal error")), "{}", r);
+    door.says("read-only transaction");
+    assert_eq!(door.call("total", json!({}))["structuredContent"], json!({ "result": 0 }));
+    // A tool that writes is not held to it.
+    assert_eq!(door.call("add", json!({ "t": "é" }))["structuredContent"], json!({ "result": 1 }));
+    assert_eq!(door.call("total", json!({}))["structuredContent"], json!({ "result": 1 }));
+    door.close();
+    assert_eq!(door.ended(), Some(0));
+    drop(pg);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn c1_a_message_at_the_limit_and_past_it() {
+    let d = door_dir("limit");
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    let most = 10 << 20;
+    // A message of exactly the limit, one under and one over, its JSON padded with spaces.
+    let padded = |id: i64, len: usize| {
+        let m = request(json!(id), "tools/list", json!({}));
+        format!("{}{}", m, " ".repeat(len - m.len()))
+    };
+    assert_eq!(door.ask(&padded(1, most))["id"], json!(1));
+    assert_eq!(door.ask(&padded(2, most - 1))["id"], json!(2));
+    assert_eq!(door.refusal(&padded(3, most + 1)), (None, -32600, "Invalid request: a message is at most 10 MiB".into()));
+    // And the next line is read whole.
+    assert_eq!(door.ask(&request(json!(4), "tools/list", json!({})))["id"], json!(4));
+    // As deep as every reader takes JSON, 128 levels, and one past.
+    let nested = |levels: usize| format!("{}{}", "[".repeat(levels), "]".repeat(levels));
+    let deep = |levels: usize| {
+        let m = call_line("echo", json!({ "v": "HOLE" }));
+        m.replace("\"HOLE\"", &nested(levels))
+    };
+    let r = door.ask(&deep(125));
+    assert_eq!(r["result"]["content"][0]["text"], json!(nested(125)), "{}", r);
+    assert_eq!(door.refusal(&deep(126)), (None, -32700, "Parse error: it nests more than 128 deep".into()));
+    door.close();
+    assert_eq!(door.ended(), Some(0));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// MCP's own TypeScript client (`@modelcontextprotocol/client` 2.4.0, the SDK's v2, which speaks
+/// 2026-07-28), installed with npm into the test's folder, as a client would drive the door:
+/// pinned to 2026-07-28, and as a client of 2025-11-25 that opens with `initialize`. Skipped when
+/// npm or the package cannot be had here.
+#[test]
+fn c1_the_official_typescript_client_drives_it() {
+    let d = door_dir("sdk");
+    let script = r#"const { Client } = require("@modelcontextprotocol/client");
+const { StdioClientTransport } = require("@modelcontextprotocol/client/stdio");
+(async () => {
+  const [quillo, dir] = process.argv.slice(2);
+  const out = {};
+  for (const mode of ["pin", "legacy"]) {
+    const client = new Client({ name: "quillo-test", version: "1.0.0" }, mode === "pin" ? { versionNegotiation: { mode: { pin: "2026-07-28" } } } : {});
+    const transport = new StdioClientTransport({ command: quillo, args: ["mcp", "main.qwe"], cwd: dir, stderr: "pipe" });
+    const r = {};
+    try {
+      await client.connect(transport);
+      r.protocol = client.getNegotiatedProtocolVersion();
+      r.tools = (await client.listTools()).tools.map((t) => t.name);
+      r.add = await client.callTool({ name: "add_note", arguments: { text: "é ✓" } });
+      r.moved = await client.callTool({ name: "moved", arguments: { p: { x: 1 } } });
+      r.hello = await client.callTool({ name: "hello", arguments: { name: "Ana" } });
+      r.empty = await client.callTool({ name: "add_note", arguments: { text: " " } });
+      try { await client.callTool({ name: "nope", arguments: {} }); } catch (e) { r.unknown = e.code; }
+    } catch (e) {
+      r.failed = { code: e.code, message: String(e.message) };
+    }
+    try { await client.close(); } catch (e) {}
+    out[mode] = r;
+  }
+  console.log(JSON.stringify(out));
+})();
+"#;
+    std::fs::write(d.join("client.cjs"), script).unwrap();
+    std::fs::write(d.join("package.json"), r#"{"name":"quillo-c1-sdk","private":true}"#).unwrap();
+    let run = |cmd: &str| -> Option<std::process::Output> {
+        let mut child = Command::new("sh").arg("-c").arg(cmd).current_dir(&d).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().ok()?;
+        let deadline = Instant::now() + Duration::from_secs(240);
+        while child.try_wait().ok().flatten().is_none() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        child.wait_with_output().ok()
+    };
+    let installed = run("npm install --no-audit --no-fund --ignore-scripts --silent @modelcontextprotocol/client@2.4.0").is_some_and(|o| o.status.success());
+    let out = installed.then(|| run(&format!("node client.cjs {:?} {:?}", env!("CARGO_BIN_EXE_quillo"), d.display().to_string()))).flatten();
+    let said = out.as_ref().and_then(|o| String::from_utf8_lossy(&o.stdout).lines().last().and_then(|l| serde_json::from_str::<Value>(l).ok()));
+    let _ = std::fs::remove_dir_all(&d);
+    let Some(said) = said else {
+        eprintln!("skipped: c1_the_official_typescript_client_drives_it (npm could not install @modelcontextprotocol/client@2.4.0 here, or node could not run it)");
+        return;
+    };
+    let pin = &said["pin"];
+    assert!(pin.get("failed").is_none(), "{}", said);
+    assert_eq!(pin["protocol"], json!("2026-07-28"));
+    assert_eq!(pin["tools"].as_array().map(Vec::len), Some(19), "{}", pin);
+    // The client checks each `structuredContent` against the tool's `outputSchema`.
+    assert_eq!(pin["add"]["structuredContent"], json!({ "result": [{ "id": 1, "text": "é ✓" }] }), "{}", pin);
+    assert_eq!(pin["moved"]["structuredContent"], json!({ "x": 2, "y": 1 }), "{}", pin);
+    assert_eq!(pin["hello"]["content"], json!([{ "type": "text", "text": "hi Ana!" }]), "{}", pin);
+    assert_eq!((pin["empty"]["isError"].clone(), pin["empty"]["content"][0]["text"].clone()), (json!(true), json!("empty note")), "{}", pin);
+    assert_eq!(pin["unknown"], json!(-32602));
+    // A client of 2025-11-25, the SDK's default: refused at `initialize` with the version error.
+    assert_eq!(said["legacy"]["failed"]["code"], json!(-32022), "{}", said);
+}

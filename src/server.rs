@@ -2174,17 +2174,24 @@ pub(crate) fn make_args(it: &mut Interp, def: &crate::ast::FnDef, args: Vec<Valu
     }
     let mut out = Vec::with_capacity(args.len());
     for (v, p) in args.into_iter().zip(&def.params) {
-        let Some(ty) = &p.ty else {
-            out.push(v);
-            continue;
-        };
-        match crate::record::make(it, ty, &v, false) {
-            Ok(Ok(x)) => out.push(x),
-            Ok(Err(why)) => return Ok(Err(format!("argument `{}` of `{}` must be {}, got {}{}", p.name, def.name, ty.text(), v.type_name(), crate::interp::because(&why)))),
-            Err(e) => return Err((p.name.to_string(), e)),
+        match make_arg(it, def, p, v)? {
+            Ok(x) => out.push(x),
+            Err(why) => return Ok(Err(why)),
         }
     }
     Ok(Ok(out))
+}
+
+/// One argument of `def` made to its parameter's type, as `make_args` makes each: the MCP door,
+/// which takes them by name and may leave one out before another, makes each with it, so that
+/// both doors say the same (FEEDBACK56.md, C.1; branch feedback56).
+pub(crate) fn make_arg(it: &mut Interp, def: &crate::ast::FnDef, p: &crate::ast::Param, v: Value) -> Result<Result<Value, String>, (String, Ctrl)> {
+    let Some(ty) = &p.ty else { return Ok(Ok(v)) };
+    match crate::record::make(it, ty, &v, false) {
+        Ok(Ok(x)) => Ok(Ok(x)),
+        Ok(Err(why)) => Ok(Err(format!("argument `{}` of `{}` must be {}, got {}{}", p.name, def.name, ty.text(), v.type_name(), crate::interp::because(&why)))),
+        Err(e) => Err((p.name.to_string(), e)),
+    }
 }
 
 fn json_response(status: u16, j: serde_json::Value) -> HttpResponse {

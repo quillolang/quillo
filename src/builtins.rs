@@ -373,8 +373,16 @@ fn error_of(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
 /// (FEEDBACK31.md, Q-379; branch feedback27-35-fixes).
 static STDOUT_GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `print` writes to stderr: under `quillo mcp`, stdout carries MCP's messages and nothing else
+/// (FEEDBACK56.md, C.1; branch feedback56). A script's `print` goes to stdout as before.
+pub static PRINT_TO_STDERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn print_line(line: &str) {
     use std::io::Write;
+    if PRINT_TO_STDERR.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = writeln!(std::io::stderr().lock(), "{}", line);
+        return;
+    }
     if STDOUT_GONE.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }

@@ -2373,7 +2373,9 @@ pub(crate) fn http_date(secs: u64) -> String {
     format!("{}, {:02} {} {} {:02}:{:02}:{:02} GMT", weekday, day, months[(month - 1) as usize], year, h, m, s)
 }
 
-fn reason(status: u16) -> &'static str {
+/// A status's words, as the status line says them; the MCP door says them for a `reply` with no
+/// body (FEEDBACK56.md, A.1; branch feedback56).
+pub(crate) fn reason(status: u16) -> &'static str {
     match status {
         100 => "Continue",
         101 => "Switching Protocols",
