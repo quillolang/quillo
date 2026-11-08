@@ -6242,16 +6242,22 @@ fn d_review_the_warning_shows_when_quillo_run_starts_and_in_the_editor() {
     assert_eq!(longest(n), 2_000);
     let (ok, _, err) = quillo(&d, &["check", "main.qwe"]);
     assert!(ok && !err.contains("what AI clients are told"), "{}", err);
-    let (ok, _, err) = quillo(&d, &["run", "main.qwe"]);
-    assert!(ok && !err.contains("what AI clients are told"), "{}", err);
+    // A program of tools alone is served (FEEDBACK56.md, C.2, found after slice 8; branch
+    // feedback56): what it says as it starts, read once it listens, where it ended at once.
+    let s = Logged::start(&d.join("main.qwe"), &[], &[]);
+    let err = s.log.lock().unwrap().clone();
+    assert!(!err.contains("what AI clients are told"), "{}", err);
+    drop(s);
     // Served under a longer name, the HTTP door's whole is past it: `quillo run` says so as it
     // starts, by what `quillo docs --mcp` with the same name prints.
     let (ok, out, _) = quillo(&d, &["docs", "--mcp", "--service-name", "main_and_more", "main.qwe"]);
     let whole = told_on(&serde_json::from_str(&out).unwrap(), "http").chars().count();
     assert!(ok && whole > 2_000, "{}", whole);
-    let (ok, _, err) = quillo(&d, &["run", "--service-name", "main_and_more", "main.qwe"]);
+    let s = Logged::start(&d.join("main.qwe"), &["--service-name", "main_and_more"], &[]);
     let said = format!("main.qwe:1: warning: what AI clients are told of this program (Quillo's lines, then this `//!` block) is {} characters, {} over 2,000", grouped(whole), whole - 2_000);
-    assert!(ok && err.contains(&said), "{}\n{}", said, err);
+    let err = s.says("what AI clients are told");
+    assert!(err.contains(&said), "{}\n{}", said, err);
+    drop(s);
     // In the editor: the warning on the block's line; an unseen character, an error at its line.
     std::fs::write(d.join("main.qwe"), src(n + 5)).unwrap();
     let uri = format!("file://{}", d.join("main.qwe").display());
@@ -9361,6 +9367,25 @@ fn f_review_second_billings_app_key_is_long_and_can_be_changed() {
         assert_eq!(a.header("x-quillo-app-answer"), Some(format!("sig={}", quillo::svcauth::sign_answer(new, &call, 200, a.body.as_bytes()))).as_deref());
     }
     assert_eq!(hop(s.port, "feedback56-f-an-old-key-no-longer-taken").0.status, 401);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A program of tools alone, no route and no server fn, is served by `quillo run`: its door at
+/// `/_quillo/mcp`, closed without a session or a token, and under `--watch` the token it prints
+/// (FEEDBACK56.md, C.2; branch feedback56). It ended at once, with nothing to serve.
+#[test]
+fn f_review_a_program_of_tools_alone_is_served() {
+    let d = dir("f-tools-alone", "/// Says hello.\nfn mcp hello(name: str) -> str with time = `hi ${name}`\n");
+    let s = Logged::start(&d.join("main.qwe"), &[], &[]);
+    let a = http_door::ask(s.port, &http_door::As::Nobody, json!(1), "tools/list", json!({}));
+    assert_eq!(a.status, 401, "{}", a.body);
+    drop(s);
+    let s = Logged::start(&d.join("main.qwe"), &["--watch"], &[]);
+    let log = s.says("with the header Authorization: Bearer ");
+    let token = log.split("Authorization: Bearer ").nth(1).and_then(|t| t.split_whitespace().next()).unwrap().to_string();
+    let r = http_door::call(s.port, &http_door::As::Token(token), "hello", json!({ "name": "Ana" }));
+    assert_eq!(r["structuredContent"], json!({ "result": "hi Ana" }), "{}", r);
     drop(s);
     let _ = std::fs::remove_dir_all(&d);
 }

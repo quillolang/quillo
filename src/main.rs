@@ -1265,10 +1265,11 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
         // that only listens, ticks or runs jobs (FEEDBACK12.md, Q-088; branch
         // feedback12-fixes).
         let site = &it.site;
-        // And a service whose only offer is its tools, which its app's door calls (FEEDBACK56.md,
-        // Part F, second review; branch feedback56).
+        // And a service whose only offer is its tools, which its app's door calls, and a program
+        // whose only offer is its tools, at its MCP door (FEEDBACK56.md, Part F, second review, and
+        // C.2; branch feedback56).
         let serves = !it.routes.is_empty() || !it.server_fns.is_empty() || !it.mounts.is_empty() || !it.remote_mounts.is_empty()
-            || !site.channels.is_empty() || !site.udp.is_empty() || !site.jobs.is_empty() || !site.ticks.is_empty() || it.offers_tools();
+            || !site.channels.is_empty() || !site.udp.is_empty() || !site.jobs.is_empty() || !site.ticks.is_empty() || it.offers_tools() || it.has_door();
         if !serves && !o.watch {
             return Ok(None);
         }

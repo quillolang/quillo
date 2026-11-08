@@ -3106,6 +3106,13 @@ impl Interp {
     pub fn offers_tools(&self) -> bool {
         self.offered_tools.is_some()
     }
+
+    /// It has tools, and so its door at `/_quillo/mcp`: something to serve, routes or none, as a
+    /// program of tools alone is what an AI client is given (FEEDBACK56.md, C.2; branch
+    /// feedback56).
+    pub fn has_door(&self) -> bool {
+        self.mcp.is_some()
+    }
 }
 
 #[cfg(test)]

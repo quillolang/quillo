@@ -2865,7 +2865,8 @@ not moved there, and break the session; it stops on Ctrl-C, Ctrl-Break or the co
 closing, as on SIGTERM elsewhere.
 
 **`/_quillo/mcp`** is the same door over HTTP, served by `quillo run` when the program has a
-tool (under `--base /shop`, at `/shop/_quillo/mcp`; a program run `--as-service` has none: its
+tool (a program needs no route to be served: one of tools alone is served, its door and, under
+`--watch`, its token; under `--base /shop`, at `/shop/_quillo/mcp`; a program run `--as-service` has none: its
 tools are its app's). It takes `POST` only, one JSON answer a request, and checks each one as
 MCP 2026-07-28 says (the version, the `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name`
 headers against the message). Who may call:
