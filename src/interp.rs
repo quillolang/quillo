@@ -348,6 +348,10 @@ pub struct Interp {
     /// service: its tools as the checker read them, shared by its forks (FEEDBACK56.md, C.2;
     /// branch feedback56).
     pub(crate) mcp: Option<Arc<crate::mcp::Door>>,
+    /// A tool's call at the MCP door that may ask its user (`confirm`, `ask`), while it runs: what
+    /// was answered, and what it changed, so that a question after a change is refused
+    /// (FEEDBACK56.md, Part E; branch feedback56). None everywhere else.
+    pub(crate) asking: Option<Box<crate::mcp::Asking>>,
     pub ready_checks: Arc<Vec<(String, Value)>>,
     /// The command components' styles go through (`style_with`; FEEDBACK11.md,
     /// Q-079; branch feedback11-fixes).
@@ -536,7 +540,9 @@ pub fn as_dec(v: &Value) -> Option<Dec> {
 /// Whether `??` may take a stop: not one that means the request must end, the compute limit's
 /// whether `--max-compute` or a policy set it (FEEDBACK55.md, Q-849; branch feedback55).
 fn guardable(msg: &str) -> bool {
-    !msg.contains(PREFETCH_REFUSED) && !crate::httpd::is_compute_stop(msg) && !msg.contains("the script ") && msg != PARALLEL_STOPPED
+    // Nor a tool's stop to ask its user, which `x ?? y` would take for null and go on
+    // (FEEDBACK56.md, Part E; branch feedback56).
+    !msg.contains(PREFETCH_REFUSED) && !crate::httpd::is_compute_stop(msg) && !msg.contains("the script ") && msg != PARALLEL_STOPPED && msg != crate::mcp::ASKING
 }
 
 /// What a `parallel` function did to the answer being made (see `Interp::back`).
@@ -1691,6 +1697,7 @@ impl Interp {
             accept: None,
             fn_callers: Default::default(),
             mcp: None,
+            asking: None,
             ready_checks: Default::default(),
             style_with: None,
             style_with_fn: None,
@@ -1812,6 +1819,7 @@ impl Interp {
             accept: self.accept.clone(),
             fn_callers: self.fn_callers.clone(),
             mcp: self.mcp.clone(),
+            asking: None,
             ready_checks: self.ready_checks.clone(),
             style_with: self.style_with.clone(),
             style_with_fn: self.style_with_fn.clone(),
@@ -2073,7 +2081,9 @@ impl Interp {
         let in_tx = self.tx_depth > 0
             || self.sqlite_tx > 0
             || !self.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty();
-        if fs.len() < 2 || in_tx || self.reads.is_some() || !self.tracks.is_empty() || !self.islands.is_empty() {
+        // And in a tool's call that may ask its user: its questions come in the order its code
+        // asks them, on this handle (FEEDBACK56.md, Part E; branch feedback56).
+        if fs.len() < 2 || in_tx || self.reads.is_some() || !self.tracks.is_empty() || !self.islands.is_empty() || self.asking.is_some() {
             let mut out = Vec::with_capacity(fs.len());
             for f in &fs {
                 out.push(self.call(f, Vec::new(), line)?);
@@ -2858,6 +2868,11 @@ impl Interp {
             ),
             Some(global) => {
                 if global {
+                    // A change a tool's question must come before (FEEDBACK56.md, Part E; branch
+                    // feedback56).
+                    if self.asking.is_some() {
+                        crate::mcp::assigned(self, name.as_str());
+                    }
                     let mut topics = vec![format!("var:{}", name)];
                     topics.extend(fields.into_iter().map(|k| format!("var:{}.{}", name, k)));
                     self.publish(topics);
@@ -2920,8 +2935,11 @@ impl Interp {
                 // What the left side could not work out is a value to guard against
                 // too: bad input stops a decimal's `/`, `date.of` or a pattern, and
                 // there is no `try` (FEEDBACK25.md, Q-318; branch feedback26-fixes).
+                // Nor any error once a tool's call stopped at a question or refused one: what
+                // follows the `??` would act on a yes nobody gave (FEEDBACK56.md, Part E, found in
+                // review; branch feedback56).
                 let v = match self.eval(a, env) {
-                    Err(Ctrl::Error(e)) if guardable(&e.msg) => Value::Nil,
+                    Err(Ctrl::Error(e)) if guardable(&e.msg) && !self.asking.as_ref().is_some_and(|a| a.stopped()) => Value::Nil,
                     other => other?,
                 };
                 if matches!(v, Value::Nil | Value::Err(..)) {
@@ -4030,6 +4048,11 @@ impl Interp {
         if let (Some(p), true) = (piped, args.is_empty()) {
             self.exact_div = Some(p);
         }
+        // Where a tool's question is: this call, by its callee (FEEDBACK56.md, Part E, found in
+        // review; branch feedback56).
+        if let Some(a) = self.asking.as_mut() {
+            a.site = callee as *const Expr as usize;
+        }
         self.call(&f, argv, line)
     }
 
@@ -4174,6 +4197,11 @@ impl Interp {
                 }
                 if self.in_run || !self.tracks.is_empty() {
                     self.note_builtin(name);
+                }
+                // A tool's call that may ask its user: what changes something is noted, and
+                // nothing runs once it stopped to ask (FEEDBACK56.md, Part E; branch feedback56).
+                if self.asking.is_some() {
+                    crate::mcp::noted(self, name, line)?;
                 }
                 if name.starts_with("native:") {
                     return crate::native::call(self, name, args, line);

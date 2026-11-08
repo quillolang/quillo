@@ -6280,3 +6280,1416 @@ fn grouped(n: usize) -> String {
     let s = n.to_string();
     s.chars().enumerate().flat_map(|(i, c)| (i > 0 && (s.len() - i) % 3 == 0).then_some(',').into_iter().chain([c])).collect()
 }
+
+// ---- Slice 7: `confirm` and `ask` (FEEDBACK56.md, Part E; branch feedback56) -----------------
+//
+// A tool that asks answers `input_required` with a form and a signed `requestState`; the client
+// asks the user and calls again, with a new id, the answers and the state as it was (MCP
+// 2026-07-28, basic/patterns/mrtr and client/elicitation). Driven over both doors with real
+// JSON-RPC: `quillo mcp` on stdio, and `/_quillo/mcp` of `quillo run` as a signed-in user, with a
+// cookie or a token.
+
+const E_SRC: &str = r#"db.open(":memory:")
+db.exec("create table posts (id integer primary key, title text not null, draft int not null)")
+
+let hits = 0
+
+// What a tool does that the checker cannot see: functions a value holds.
+let hidden = {
+    w: (t) => db.exec("insert into posts (title, draft) values (?, 0)", t),
+    i: () => db.query("insert into posts (title, draft) values ('q', 0) returning id"),
+    c: () => set_cookie("seen", "1"),
+    g: () => { hits = hits + 1 },
+    q: () => confirm("Hidden?"),
+    e: () => "",
+}
+
+route POST /login ? { user: str } = set_session({ user: user })
+route POST /token = mcp_token()
+route GET /posts = str(db.one("select count(*) as n from posts").n)
+route GET /direct = `${sure()} ${loose() ?? "none"} ${pick(1)}`
+
+/// Shares a post: who can see it, and whether now.
+server fn mcp share(title: str) -> map with db {
+    let who = ask("Who can see it?", { public: "Everyone", draft: "Only me, as a draft" }, "draft")
+    if !confirm(`Publish "${title}" now?`) { return err("not published: the user said no") }
+    db.one("insert into posts (title, draft) values (?, ?) returning id, draft", title, who == "draft" ? 1 : 0)
+}
+
+/// Asks, and only reads.
+fn mcp pick(n: int) with db {
+    let c = db.one("select count(*) as n from posts").n
+    ask(`Welches von ${n}? (${c} Beiträge) 日本語 ✓`, { "ä": "Äpfel, erste", "日本": "日本語 ✓", "😀": "👩‍💻 Smile" }, "日本")
+}
+
+/// Yes or no.
+fn mcp sure() -> bool with time = confirm("Sure?")
+
+/// No default.
+fn mcp loose() with time = ask("Which?", { x: "X", y: "Y" }, null)
+
+/// Two arguments.
+fn mcp pair(a: int, b: map) -> bool with time = confirm(`${a} and ${len(b)}?`)
+
+/// What the model sent, in the question.
+fn mcp named(t: str) -> bool with time = confirm(`Delete ${t}?`)
+
+/// As many questions as `n`.
+fn mcp many(n: int) -> int with time {
+    let yes = 0
+    for i in range(0, n) {
+        if confirm(`Number ${i}?`) { yes = yes + 1 }
+    }
+    yes
+}
+
+/// Both at once.
+fn mcp both() with time = parallel(() => confirm("One?"), () => confirm("Two?"))
+
+/// The count, in the question.
+fn mcp counted() -> bool with db = confirm(`Delete ${db.one("select count(*) as n from posts").n} posts?`)
+
+/// A question under `??`.
+fn mcp guarded() with time = confirm("Guarded?") ?? "taken"
+
+/// Writes, then asks: what it wrote is rolled back where the call stops.
+fn mcp late(t: str) -> bool with db {
+    hidden.w(t)
+    confirm("Too late?")
+}
+
+/// Inserts with a query, then asks.
+fn mcp inserts() with db {
+    hidden.i()
+    ask("Then?", { a: "A" }, "a")
+}
+
+/// Writes, sets a cookie, then asks: refused, and the write rolled back.
+fn mcp cookied() -> bool with db {
+    hidden.w("cookie")
+    hidden.c()
+    confirm("Cookie?")
+}
+
+/// Counts, then asks.
+fn mcp counts() -> bool with time {
+    hidden.g()
+    confirm("Count?")
+}
+
+/// A question the checker does not see.
+fn mcp hidden_ask() with time = hidden.q()
+
+/// A change, then a question that is refused, under `??`.
+fn mcp guard_late() with db {
+    hidden.c()
+    if confirm("Delete all?") ?? true { hidden.w("deleted") }
+    "went on"
+}
+
+/// The same, with `ask`.
+fn mcp guard_ask() with time {
+    hidden.c()
+    ask("Which one?", { a: "A", b: "B" }, "a") ?? "b"
+}
+
+/// A question with no text, under `??`.
+fn mcp guard_empty() with time = confirm(hidden.e()) ?? true
+
+/// A refused question under `??`, then the program's variable assigned, which calls no builtin.
+fn mcp guard_global() with time {
+    hidden.c()
+    if confirm("Count it?") ?? true { hidden.g() }
+    hits
+}
+
+/// The program's variable.
+fn mcp hits_now() -> int with time = hits
+
+/// Past the most questions, under `??`, then a write.
+fn mcp guard_many(n: int) -> int with db {
+    let yes = 0
+    for i in range(0, n) {
+        if confirm(`Number ${i}?`) ?? true { yes = yes + 1 }
+    }
+    hidden.w("after")
+    yes
+}
+
+/// The same question on two ways.
+fn mcp branches() -> str with db {
+    if posts() > 0 {
+        if confirm("Are you sure?") { "some" } else { "no" }
+    } else {
+        if confirm("Are you sure?") { "none" } else { "no" }
+    }
+}
+
+/// And on one line.
+fn mcp one_line() -> str with db = if posts() > 0 { confirm("Are you sure?") ? "some" : "no" } else { confirm("Are you sure?") ? "none" : "no" }
+
+/// A question that changes each time the call runs.
+fn mcp ticking() -> bool with random = confirm(`Roll ${random()}: go?`)
+
+/// A random number first, which changes nothing.
+fn mcp lucky() -> bool with random = random() >= 0 && confirm("Lucky?")
+
+/// How many posts.
+fn mcp posts() -> int with db = db.one("select count(*) as n from posts").n
+"#;
+
+/// The tools of E_SRC that ask the user, in the order it declares them.
+const E_ASKING: &[&str] = &[
+    "share", "pick", "sure", "loose", "pair", "named", "many", "both", "counted", "guarded", "late", "inserts", "cookied", "counts", "guard_late", "guard_ask", "guard_empty", "guard_global", "guard_many", "branches", "one_line", "ticking", "lucky",
+];
+
+/// What a client says it can do: `{ elicitation: {} }` (form mode) where it can show a form.
+fn caps(form: bool) -> Value {
+    if form {
+        json!({ "elicitation": {} })
+    } else {
+        json!({})
+    }
+}
+
+/// A `tools/call` of 2026-07-28 with these capabilities, and a call again's state and answers.
+fn e_call(id: &str, name: &str, args: Value, caps: &Value, state: Option<&str>, answers: Option<Value>) -> String {
+    let mut params = json!({ "name": name, "arguments": args, "_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": caps,
+        "io.modelcontextprotocol/clientInfo": { "name": "quillo-test", "version": "1.0.0" },
+    } });
+    if let Some(s) = state {
+        params["requestState"] = json!(s);
+    }
+    if let Some(a) = answers {
+        params["inputResponses"] = a;
+    }
+    json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": params }).to_string()
+}
+
+/// `{ key: answer }`.
+fn one(key: &str, answer: Value) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert(key.to_string(), answer);
+    Value::Object(m)
+}
+
+/// The form's answers a user gives: a choice, a yes, a no, a dismissal.
+fn choose(k: &str) -> Value {
+    json!({ "action": "accept", "content": { "choice": k } })
+}
+fn yes() -> Value {
+    json!({ "action": "accept", "content": { "confirm": true } })
+}
+fn no() -> Value {
+    json!({ "action": "decline" })
+}
+
+/// A door to drive: `quillo mcp` on stdio, or `/_quillo/mcp` as `who`.
+enum EDoor {
+    Stdio(Stdio),
+    Http(u16, http_door::As),
+}
+
+impl EDoor {
+    /// The answer to `line`, a call of `name`, and its HTTP status (200 on stdio).
+    fn send(&mut self, line: &str, name: &str) -> (u16, Value) {
+        match self {
+            EDoor::Stdio(s) => (200, s.ask(line)),
+            EDoor::Http(port, who) => {
+                let a = http_door::post(*port, who, &http_door::mirrored("tools/call", Some(name)), line);
+                (a.status, http_door::json_of(&a))
+            }
+        }
+    }
+
+    /// A call's result, as the client can ask the user or not.
+    fn result(&mut self, name: &str, args: Value, form: bool, state: Option<&str>, answers: Option<Value>) -> Value {
+        let (status, a) = self.send(&e_call(&format!("{}-{}", name, fastrand::u32(..)), name, args, &caps(form), state, answers), name);
+        assert_eq!(status, 200, "{}", a);
+        assert!(a.get("error").is_none(), "{}", a);
+        a["result"].clone()
+    }
+
+    /// A protocol error: its status, code and message.
+    fn refused(&mut self, name: &str, args: Value, state: Option<&str>, answers: Option<Value>) -> (u16, i64, String) {
+        let (status, a) = self.send(&e_call("r", name, args, &caps(true), state, answers), name);
+        assert!(a.get("result").is_none(), "{}", a);
+        assert_eq!(a["id"], json!("r"), "{}", a);
+        (status, a["error"]["code"].as_i64().unwrap(), a["error"]["message"].as_str().unwrap().to_string())
+    }
+
+    /// Calls `name`, each question answered by `answer` from its request: the result, and the
+    /// requests asked, in order.
+    fn answered(&mut self, name: &str, args: Value, answer: &dyn Fn(&Value) -> Value) -> (Value, Vec<Value>) {
+        let (mut asked, mut state, mut answers) = (Vec::new(), None::<String>, None);
+        for _ in 0..200 {
+            let r = self.result(name, args.clone(), true, state.as_deref(), answers.take());
+            if r["resultType"] == json!("complete") {
+                return (r, asked);
+            }
+            let (k, req) = asked_of(&r);
+            assert_eq!(k, format!("q{}", asked.len() + 1), "{}", r);
+            answers = Some(one(&k, answer(&req)));
+            asked.push(req);
+            state = Some(r["requestState"].as_str().unwrap().to_string());
+        }
+        panic!("{} never ended", name);
+    }
+
+    fn stderr(&self) -> String {
+        match self {
+            EDoor::Stdio(s) => s.stderr(),
+            EDoor::Http(..) => String::new(),
+        }
+    }
+}
+
+/// An `input_required` result's one request: its key, and the request.
+fn asked_of(r: &Value) -> (String, Value) {
+    assert_eq!(r["resultType"], json!("input_required"), "{}", r);
+    let reqs = r["inputRequests"].as_object().unwrap_or_else(|| panic!("{}", r));
+    assert_eq!(reqs.len(), 1, "{}", r);
+    assert!(r["requestState"].is_string(), "{}", r);
+    let (k, v) = reqs.iter().next().unwrap();
+    (k.clone(), v.clone())
+}
+
+/// Whether a tool's answer is an error, and its text: a typed tool's `result` as text, one with
+/// no type its text as sent.
+fn text_of(r: &Value) -> (bool, String) {
+    let err = r["isError"] == json!(true);
+    match r["structuredContent"].get("result") {
+        Some(Value::String(s)) if !err => (false, s.clone()),
+        Some(v) if !err => (false, v.to_string()),
+        _ => (err, r["content"][0]["text"].as_str().unwrap_or_default().to_string()),
+    }
+}
+
+/// The program in a folder of its own, and each door to it: stdio, and HTTP as Ana with a cookie
+/// and with a token, the server held by the second.
+fn e_doors(name: &str) -> (PathBuf, Vec<EDoor>, support::Server) {
+    let d = dir(&format!("e-{}", name), E_SRC);
+    // More calls a minute than the limit's 60: each test asks as one user many times.
+    let s = support::serve_with(&d.join("main.qwe"), &["--max-tool-calls", "100000"]);
+    let cookie = http_door::login(s.port, "ana", &[]);
+    let token = http_door::token(s.port, &cookie, &[]);
+    let doors = vec![EDoor::Stdio(Stdio::start(&d, &["main.qwe"])), EDoor::Http(s.port, http_door::As::Cookie(cookie)), EDoor::Http(s.port, http_door::As::Token(token))];
+    (d, doors, s)
+}
+
+/// What a state says, read as a client could (it is signed, not hidden).
+fn state_payload(state: &str) -> Value {
+    let body = state.split('.').next().unwrap();
+    serde_json::from_slice(&quillo::crypto::unb64url(body).unwrap()).unwrap()
+}
+
+#[test]
+fn e_two_questions_in_one_call_on_each_door() {
+    let (d, doors, s) = e_doors("two");
+    for mut door in doors {
+        // The first run stops at `ask`: one choice, the keys as values and the texts as labels,
+        // its default the form's; the second at `confirm`, a box titled with the question,
+        // unticked to start, required; the third ends.
+        let (r, asked) = door.answered("share", json!({ "title": "Hi" }), &|req| if req["params"]["requestedSchema"]["properties"]["choice"].is_object() { choose("public") } else { yes() });
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[0], json!({ "method": "elicitation/create", "params": { "mode": "form", "message": "Who can see it?", "requestedSchema": {
+            "type": "object",
+            "properties": { "choice": { "type": "string", "oneOf": [{ "const": "public", "title": "Everyone" }, { "const": "draft", "title": "Only me, as a draft" }], "default": "draft" } },
+            "required": ["choice"],
+        } } }));
+        assert_eq!(asked[1], json!({ "method": "elicitation/create", "params": { "mode": "form", "message": "Publish \"Hi\" now?", "requestedSchema": {
+            "type": "object",
+            "properties": { "confirm": { "type": "boolean", "title": "Publish \"Hi\" now?", "default": false } },
+            "required": ["confirm"],
+        } } }));
+        assert_eq!(r["structuredContent"]["draft"], json!(0), "{}", r);
+        let first = r["structuredContent"]["id"].as_i64().unwrap();
+        // The user's no to the second question: the function's own error, and nothing written.
+        let (r, _) = door.answered("share", json!({ "title": "No" }), &|req| if req["params"]["requestedSchema"]["properties"]["choice"].is_object() { choose("draft") } else { no() });
+        assert_eq!(text_of(&r), (true, "not published: the user said no".into()), "{}", r);
+        // The default kept, then yes: a draft, the next row.
+        let (r, _) = door.answered("share", json!({ "title": "Draft" }), &|req| if req["params"]["requestedSchema"]["properties"]["choice"].is_object() { choose("draft") } else { yes() });
+        assert_eq!(r["structuredContent"], json!({ "id": first + 1, "draft": 1 }), "{}", r);
+        // A state is signed, not hidden: it names no user, and holds no question's text or answer
+        // but as a digest, and the key of a choice.
+        let r = door.result("share", json!({ "title": "Hi" }), true, None, None);
+        let state = r["requestState"].as_str().unwrap();
+        let p = state_payload(state);
+        assert_eq!(p["tool"], json!("share"));
+        assert_eq!((p["asked"].clone(), p["rounds"].clone()), (json!([]), json!(1)));
+        assert!(!state.contains("ana") && !p.to_string().contains("ana") && !p.to_string().contains("Who can"), "{}", p);
+        let ends = p["ends"].as_i64().unwrap() - std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        assert!((590_000..=600_000).contains(&ends), "{}", ends);
+        let r = door.result("share", json!({ "title": "Hi" }), true, Some(state), Some(one("q1", choose("public"))));
+        let p = state_payload(r["requestState"].as_str().unwrap());
+        assert_eq!((p["asked"].as_array().map(|a| a.len()), p["rounds"].clone()), (Some(1), json!(2)));
+        assert_eq!(p["asked"][0][1], json!("public"), "{}", p);
+        assert!(!p.to_string().contains("ana"), "{}", p);
+    }
+    // Each door wrote to its own database: the server's has the HTTP doors' rows.
+    assert_eq!(support::send(s.port, "GET", "/posts", &[], "").body, "4");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn e_a_state_is_good_once_for_its_caller_tool_and_arguments() {
+    let (d, mut doors, s) = e_doors("once");
+    let bob = http_door::As::Cookie(http_door::login(s.port, "bob", &[]));
+    let stdio_state = {
+        let r = doors[0].result("sure", json!({}), true, None, None);
+        r["requestState"].as_str().unwrap().to_string()
+    };
+    for (i, door) in doors.iter_mut().enumerate() {
+        let status = if i == 0 { 200 } else { 400 };
+        let bad = |why: &str| format!("Invalid params: this requestState {}; call the tool again without one to start over", why);
+        // Used once: the call again ends, and the same state again is refused.
+        let r = door.result("sure", json!({}), true, None, None);
+        let state = r["requestState"].as_str().unwrap().to_string();
+        assert_eq!(text_of(&door.result("sure", json!({}), true, Some(&state), Some(one("q1", yes())))), (false, "true".into()));
+        assert_eq!(door.refused("sure", json!({}), Some(&state), Some(one("q1", yes()))), (status, -32602, bad("was used already: each is good for one call")));
+        // Another argument, an old state: refused, and used up as it was read, so that it is not
+        // good with the right one either (decided in review).
+        let r = door.result("share", json!({ "title": "Hi" }), true, None, None);
+        let state = r["requestState"].as_str().unwrap().to_string();
+        assert_eq!(door.refused("share", json!({ "title": "Bye" }), Some(&state), Some(one("q1", choose("public")))), (status, -32602, bad("was given for other arguments")));
+        assert_eq!(door.refused("share", json!({ "title": "Hi" }), Some(&state), Some(one("q1", choose("public")))), (status, -32602, bad("was used already: each is good for one call")));
+        // Another tool's state.
+        let r = door.result("share", json!({ "title": "Hi" }), true, None, None);
+        let state = r["requestState"].as_str().unwrap().to_string();
+        assert_eq!(door.refused("sure", json!({}), Some(&state), Some(one("q1", yes()))), (status, -32602, bad("is for another tool")));
+        // The same arguments in another order, at any depth, are the same; one changed is not.
+        let args = json!({ "b": { "y": 1, "x": [{ "q": 1, "p": 2 }] }, "a": 1 });
+        let again = json!({ "a": 1, "b": { "x": [{ "p": 2, "q": 1 }], "y": 1 } });
+        let r = door.result("pair", args.clone(), true, None, None);
+        let state = r["requestState"].as_str().unwrap().to_string();
+        assert_eq!(text_of(&door.result("pair", again, true, Some(&state), Some(one("q1", yes())))), (false, "true".into()));
+        let r = door.result("pair", args, true, None, None);
+        let state = r["requestState"].as_str().unwrap().to_string();
+        assert_eq!(door.refused("pair", json!({ "a": 1, "b": { "x": [{ "p": 2, "q": 2 }], "y": 1 } }), Some(&state), None).2, bad("was given for other arguments"));
+        // A state changed by one character, and one this process did not make (another key).
+        let r = door.result("sure", json!({}), true, None, None);
+        let state = r["requestState"].as_str().unwrap().to_string();
+        let mut changed = state.clone().into_bytes();
+        let at = changed.len() / 3;
+        changed[at] = if changed[at] == b'A' { b'B' } else { b'A' };
+        let changed = String::from_utf8(changed).unwrap();
+        assert_eq!(door.refused("sure", json!({}), Some(&changed), None).2, bad("is not one this server gave, or was changed"));
+        if i > 0 {
+            assert_eq!(door.refused("sure", json!({}), Some(&stdio_state), None).2, bad("is not one this server gave, or was changed"));
+        }
+        for junk in ["", ".", "x.y", "e30.", &"A".repeat(100_000)] {
+            assert_eq!(door.refused("sure", json!({}), Some(junk), None).2, bad("is not one this server gave, or was changed"), "{:?}", junk.get(..10));
+        }
+        // Not text, or answers not an object: the request is malformed.
+        let (st, a) = door.send(&e_call("r", "sure", json!({}), &caps(true), None, None).replace("\"name\":\"sure\"", "\"name\":\"sure\",\"requestState\":5"), "sure");
+        assert_eq!((st, a["error"]["code"].clone(), a["error"]["message"].clone()), (status, json!(-32602), json!("Invalid params: `requestState` is the text the server gave, sent back as it was")), "{}", a);
+        let (st, a) = door.send(&e_call("r", "sure", json!({}), &caps(true), None, Some(json!([yes()]))), "sure");
+        assert_eq!((st, a["error"]["message"].clone()), (status, json!("Invalid params: `inputResponses` is an object, each answer under its request's key")), "{}", a);
+        // Answers with no state are no one's: the question is asked.
+        assert_eq!(door.result("sure", json!({}), true, None, Some(one("q1", yes())))["resultType"], json!("input_required"));
+    }
+    // Another caller: Ana's state, sent by Bob, is refused; by Ana with her token (the same user),
+    // taken.
+    let EDoor::Http(port, ana) = &doors[1] else { unreachable!() };
+    let (port, ana) = (*port, ana.clone());
+    let token = match &doors[2] {
+        EDoor::Http(_, t) => t.clone(),
+        _ => unreachable!(),
+    };
+    let mut as_ana = EDoor::Http(port, ana);
+    let mut as_bob = EDoor::Http(port, bob);
+    let mut by_token = EDoor::Http(port, token);
+    let r = as_ana.result("sure", json!({}), true, None, None);
+    let state = r["requestState"].as_str().unwrap().to_string();
+    assert_eq!(as_bob.refused("sure", json!({}), Some(&state), Some(one("q1", yes()))).2, "Invalid params: this requestState was given to another caller; call the tool again without one to start over");
+    let r = as_ana.result("sure", json!({}), true, None, None);
+    let state = r["requestState"].as_str().unwrap().to_string();
+    assert_eq!(text_of(&by_token.result("sure", json!({}), true, Some(&state), Some(one("q1", yes())))), (false, "true".into()));
+    drop(doors);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// E_SRC in this process, and its door on stdio, as `quillo mcp` makes them.
+fn e_here(name: &str) -> (PathBuf, Interp, mcp::Door) {
+    let d = dir(&format!("e-here-{}", name), E_SRC);
+    let tools = mcp::of_source(&d.join("main.qwe")).unwrap();
+    let mut it = Interp::new(&d);
+    it.load_file(&d.join("main.qwe")).unwrap();
+    (d, it, mcp::Door::new("main", tools))
+}
+
+/// One message through the door in this process: its answer.
+fn here(it: &mut Interp, door: &mcp::Door, line: String) -> Value {
+    door_here(it, door, &[line]).pop().unwrap()
+}
+
+#[test]
+fn e_an_expired_state_and_one_changed_and_signed_again() {
+    // Signed again with this process's session key, as only the server could: what the door
+    // checks after the signature, each field in turn.
+    let (d, mut it, door) = e_here("expired");
+    let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let first = here(&mut it, &door, e_call("1", "sure", json!({}), &caps(true), None, None));
+    let p = state_payload(first["result"]["requestState"].as_str().unwrap());
+    let resealed = |f: &dyn Fn(&mut Value)| {
+        let mut q = p.clone();
+        q["id"] = json!(format!("{:016x}", fastrand::u64(..)));
+        f(&mut q);
+        quillo::session::seal("quillo mcp request state", &q.to_string())
+    };
+    let again = |it: &mut Interp, state: String| here(it, &door, e_call("2", "sure", json!({}), &caps(true), Some(&state), Some(one("q1", yes()))));
+    let refused = |a: &Value| a["error"]["message"].as_str().map(|m| m.trim_start_matches("Invalid params: this requestState ").trim_end_matches("; call the tool again without one to start over").to_string());
+    // Its end, and a millisecond either side.
+    let a = again(&mut it, resealed(&|q| q["ends"] = json!(now() - 1)));
+    assert_eq!(refused(&a).as_deref(), Some("expired: a question is answered within 10 minutes"), "{}", a);
+    let a = again(&mut it, resealed(&|q| q["ends"] = json!(now())));
+    assert_eq!(refused(&a).as_deref(), Some("expired: a question is answered within 10 minutes"), "{}", a);
+    let a = again(&mut it, resealed(&|q| q["ends"] = json!(now() + 60_000)));
+    assert_eq!(text_of(&a["result"]), (false, "true".into()), "{}", a);
+    // Another tool, another caller, as the server would have signed them.
+    let a = again(&mut it, resealed(&|q| q["tool"] = json!("named")));
+    assert_eq!(refused(&a).as_deref(), Some("is for another tool"), "{}", a);
+    let a = again(&mut it, resealed(&|q| q["who"] = json!("someone else")));
+    assert_eq!(refused(&a).as_deref(), Some("was given to another caller"), "{}", a);
+    // Refused for its time, its tool or its caller, a state is used up all the same.
+    let expired = resealed(&|q| q["ends"] = json!(now() - 1));
+    assert_eq!(refused(&again(&mut it, expired.clone())).as_deref(), Some("expired: a question is answered within 10 minutes"));
+    assert_eq!(refused(&again(&mut it, expired)).as_deref(), Some("was used already: each is good for one call"));
+    // A form the door never writes: another version, no list of answers, an answer not a pair.
+    for f in [&(|q: &mut Value| q["v"] = json!(2)) as &dyn Fn(&mut Value), &|q| drop(q.as_object_mut().unwrap().remove("asked")), &|q| q["asked"] = json!([["d"]]), &|q| q["ends"] = json!("soon"), &|q| drop(q.as_object_mut().unwrap().remove("id")), &|q| drop(q.as_object_mut().unwrap().remove("rounds")), &|q| q["rounds"] = json!(-1)] {
+        let a = again(&mut it, resealed(f));
+        assert_eq!(refused(&a).as_deref(), Some("is not one this server gave, or was changed"), "{}", a);
+    }
+    // Signed for another purpose (a session's, a channel's): not a state.
+    let a = again(&mut it, quillo::session::seal("quillo session", &p.to_string()));
+    assert_eq!(refused(&a).as_deref(), Some("is not one this server gave, or was changed"), "{}", a);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn e_a_client_that_cannot_ask() {
+    // No `elicitation`, or only `url` mode: `ask` gives its default, `confirm` refuses, closed as
+    // the door is, and the tool changes nothing. `elicitation: {}` is form mode, as is `form`.
+    let (d, doors, s) = e_doors("cannot");
+    for mut door in doors {
+        for caps in [json!({}), json!({ "elicitation": { "url": {} } }), json!({ "elicitation": true }), json!({ "sampling": {} })] {
+            let call = |door: &mut EDoor, name: &str, args: Value| {
+                let (st, a) = door.send(&e_call("c", name, args, &caps, None, None), name);
+                assert_eq!(st, 200, "{}", a);
+                text_of(&a["result"])
+            };
+            assert_eq!(call(&mut door, "sure", json!({})), (true, "this needs the user's yes, and this client cannot ask".into()));
+            assert_eq!(call(&mut door, "pick", json!({ "n": 1 })), (false, "日本".into()));
+            assert_eq!(call(&mut door, "loose", json!({})), (false, "null".into()));
+            // The default, and the result says the user was not asked, beside the answer (found
+            // in review): the instructions said the tool asks.
+            for (name, args, note) in [
+                ("pick", json!({ "n": 1 }), "the user was not asked \"Welches von 1? (0 Beiträge) 日本語 ✓\": the default \"日本語 ✓\" was taken"),
+                ("loose", json!({}), "the user was not asked \"Which?\": the default null was taken"),
+            ] {
+                let (_, a) = door.send(&e_call("c", name, args, &caps, None, None), name);
+                assert_eq!(a["result"]["content"].as_array().map(|c| c.len()), Some(2), "{}", a);
+                assert_eq!(a["result"]["content"][1], json!({ "type": "text", "text": note }), "{}", a);
+                assert!(a["result"].get("isError").is_none(), "{}", a);
+            }
+            assert_eq!(call(&mut door, "share", json!({ "title": "Hi" })), (true, "this needs the user's yes, and this client cannot ask".into()));
+            assert_eq!(call(&mut door, "posts", json!({})), (false, "0".into()));
+        }
+        for caps in [json!({ "elicitation": {} }), json!({ "elicitation": { "form": {} } }), json!({ "elicitation": { "form": {}, "url": {} } })] {
+            let (_, a) = door.send(&e_call("c", "sure", json!({}), &caps, None, None), "sure");
+            assert_eq!(a["result"]["resultType"], json!("input_required"), "{}", a);
+        }
+    }
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn e_a_question_after_a_change_is_refused_as_it_runs() {
+    // What the checker cannot see (a function a value holds): at run time a write to the
+    // program's database before a question is rolled back where the call stops, so it stands
+    // only once, in the round that ends; anything else that changes something before a question
+    // is refused, and what the call wrote with it rolled back (found in review).
+    let (d, doors, s) = e_doors("late");
+    let first = ASK_FIRST_TEXT;
+    for (i, mut door) in doors.into_iter().enumerate() {
+        let count = |door: &mut EDoor| text_of(&door.result("posts", json!({}), true, None, None)).1.parse::<i64>().unwrap();
+        let before = count(&mut door);
+        // The first round wrote, then stopped: nothing stands.
+        let r = door.result("late", json!({ "t": "x" }), true, None, None);
+        assert_eq!(asked_of(&r).1["params"]["message"], json!("Too late?"));
+        assert_eq!(count(&mut door), before);
+        // Asked again with no answer: still nothing.
+        let r = door.result("late", json!({ "t": "x" }), true, r["requestState"].as_str(), None);
+        assert_eq!(count(&mut door), before);
+        // Answered: the round that ends keeps its write, once.
+        let r = door.result("late", json!({ "t": "x" }), true, r["requestState"].as_str(), Some(one("q1", yes())));
+        assert_eq!(text_of(&r), (false, "true".into()), "{}", r);
+        assert_eq!(count(&mut door), before + 1);
+        // A no: the function's own answer, and its write stands, as one in no call does.
+        let r = door.result("late", json!({ "t": "y" }), true, None, None);
+        let r = door.result("late", json!({ "t": "y" }), true, r["requestState"].as_str(), Some(one("q1", no())));
+        assert_eq!(text_of(&r), (false, "false".into()), "{}", r);
+        assert_eq!(count(&mut door), before + 2);
+        // A statement that writes through `db.query`, the same.
+        let r = door.result("inserts", json!({}), true, None, None);
+        assert_eq!(asked_of(&r).1["params"]["message"], json!("Then?"));
+        assert_eq!(count(&mut door), before + 2);
+        // What no rollback undoes: refused, the model told `internal error`, the reason in the
+        // log, and the write before it rolled back.
+        for name in ["cookied", "counts"] {
+            let r = door.result(name, json!({}), true, None, None);
+            assert_eq!(text_of(&r), (true, "internal error".into()), "{}: {}", name, r);
+        }
+        assert_eq!(count(&mut door), before + 2);
+        if i == 0 {
+            let err = door.stderr();
+            let at = |what: &str| E_SRC.lines().position(|l| l.contains(what)).unwrap() + 1;
+            for said in [
+                format!("error in tool `cookied`: main.qwe:{}: `confirm` comes after `set_cookie`: {}", at("Cookie?"), first),
+                format!("error in tool `counts`: main.qwe:{}: `confirm` comes after assigning the program's variable `hits`: {}", at("Count?"), first),
+            ] {
+                assert!(err.contains(&said), "{}\n{}", said, err);
+            }
+        }
+        // What changes nothing comes before a question as it likes: a select, a random number.
+        assert_eq!(door.result("lucky", json!({}), true, None, None)["resultType"], json!("input_required"));
+        assert_eq!(door.result("counted", json!({}), true, None, None)["resultType"], json!("input_required"));
+    }
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+const ASK_FIRST_TEXT: &str = "ask before changing anything: the call runs again with the answer";
+
+/// A tool's code, its question after a change marked `// refused`, each with what `quillo check`
+/// says of it, an error (found in review).
+const W_SRC: &str = r#"db.open(":memory:")
+db.exec("create table t (id integer primary key, v int)")
+let total = 0
+
+fn save(v: int) = db.exec("insert into t (v) values (?)", v)
+fn asks_first() -> bool = confirm("First?")
+fn quiet_helper() -> int = db.one("select count(*) as n from t").n
+
+/// A helper writes, then the tool asks.
+fn mcp helper_first() -> bool with db {
+    save(1)
+    confirm("After the helper?") // refused: `confirm` comes after `save`, which changes something (`db.exec`)
+}
+
+/// A helper asks after the tool wrote.
+fn mcp asks_in_helper() -> bool with db {
+    db.exec("insert into t (v) values (2)")
+    asks_first() // refused: `asks_first`, which asks the user (`confirm`), comes after `db.exec`
+}
+
+/// The second turn of a loop asks after the first's write.
+fn mcp looped(n: int) -> int with db {
+    for i in range(0, n) {
+        if confirm(`Row ${i}?`) { db.exec("insert into t (v) values (?)", i) } // refused: `confirm` comes after `db.exec`
+    }
+    n
+}
+
+/// A while loop, the same.
+fn mcp waited(n: int) -> int with db {
+    let i = 0
+    while i < n {
+        if ask(`Row ${i}?`, { y: "Yes" }, "y") == "y" { save(i) } // refused: `ask` comes after `save`, which changes something (`db.exec`)
+        i = i + 1
+    }
+    n
+}
+
+/// A write on one way, the question after both.
+fn mcp branch(b: bool) -> bool with db {
+    if b { db.exec("insert into t (v) values (3)") }
+    confirm("After the branch?") // refused: `confirm` comes after `db.exec`
+}
+
+/// A match: the same.
+fn mcp matched(n: int) -> bool with db {
+    match n {
+        1 => save(1),
+        _ => 0,
+    }
+    confirm("After the match?") // refused: `confirm` comes after `save`, which changes something (`db.exec`)
+}
+
+/// The program's variable, a cookie, a service-like call of the program's own.
+fn mcp global() -> bool with time {
+    total = total + 1
+    confirm("Global?") // refused: `confirm` comes after assigning the program's variable `total`
+}
+
+/// A statement written that writes.
+fn mcp statement() with db {
+    db.one("insert into t (v) values (5) returning id")
+    ask("Then?", { a: "A" }, "a") // refused: `ask` comes after `db.one`
+}
+
+/// A lambda given to a call runs in it.
+fn mcp in_lambda(xs: list) -> bool with db {
+    xs | map((x) => save(x))
+    confirm("After the map?") // refused: `confirm` comes after `save`, which changes something (`db.exec`)
+}
+
+/// A `select` that calls a function its database does not ship, which may write (slice 3's rule).
+fn mcp archived() with db {
+    db.query("select archive_old() as n")
+    confirm("Archived?") // refused: `confirm` comes after `db.query`
+}
+
+/// A write on one way, the question on the other: no warning.
+fn mcp ways(b: bool) -> bool with db {
+    if b { db.exec("insert into t (v) values (4)")
+        true } else { confirm("Only here?") }
+}
+
+/// Reads, a transaction that reads, a random number, a local of the variable's name, a helper
+/// that reads: no warning.
+fn mcp quiet() -> bool with db, random {
+    let n = db.one("select count(*) as n from t").n
+    let m = db.transaction(() => db.query("select v from t"))
+    let total = 1
+    total = total + int(random() * 2)
+    confirm(`${n} ${len(m)} ${total} ${quiet_helper()}?`)
+}
+
+/// An argument is worked out before the call: the question, then the write.
+fn mcp argument_first() with db = db.exec("insert into t (v) values (?)", confirm("Insert?") ? 1 : 0)
+
+/// Asks first, then writes: as it should be.
+fn mcp first_then() -> bool with db {
+    if !confirm("Write?") { return false }
+    db.exec("insert into t (v) values (6)")
+    true
+}
+
+/// A plain function that writes then asks, which no tool reaches: not this check's.
+fn unreached() -> bool {
+    save(9)
+    confirm("Never asked?")
+}
+"#;
+
+#[test]
+fn e_quillo_check_refuses_a_question_after_a_change_where_it_sees_the_order() {
+    let d = dir("e-check", W_SRC);
+    let (ok, _, err) = quillo(&d, &["check", "main.qwe"]);
+    assert!(!ok, "{}", err);
+    let mut want = Vec::new();
+    for (n, line) in W_SRC.lines().enumerate() {
+        if let Some((_, said)) = line.split_once("// refused: ") {
+            want.push(format!("main.qwe:{}: error: {}: {}", n + 1, said, ASK_FIRST_TEXT));
+        }
+    }
+    let got: Vec<&str> = err.lines().filter(|l| l.contains(ASK_FIRST_TEXT)).collect();
+    assert_eq!(got, want, "{}", err);
+    // Errors only of these: the program does not start with them, and nothing else is refused.
+    assert_eq!(err.lines().filter(|l| l.contains(": error: ")).count(), want.len(), "{}", err);
+    let (ok, _, err) = quillo(&d, &["mcp", "main.qwe"]);
+    assert!(!ok && err.contains(ASK_FIRST_TEXT), "{}", err);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn e_quillo_check_holds_asks_written_arguments_and_the_page() {
+    let refused = |code: &str| -> Vec<String> {
+        let d = dir("e-written", code);
+        let (_, _, err) = quillo(&d, &["check", "main.qwe"]);
+        let _ = std::fs::remove_dir_all(&d);
+        err.lines().filter(|l| l.contains(": error: ")).map(|l| l.split_once(": error: ").unwrap().1.to_string()).collect()
+    };
+    let tool = |body: &str| format!("/// T.\nfn mcp t() with time = {}\n", body);
+    assert_eq!(refused(&tool("ask(\"\", { a: \"A\" }, \"a\")")), ["`ask`'s question is empty: say what the user is asked"]);
+    assert_eq!(refused(&tool("ask(\"  \", { a: \"A\" }, \"a\")")), ["`ask`'s question is empty: say what the user is asked"]);
+    assert_eq!(refused(&tool("ask(\"Q?\", {}, null)")), ["`ask` has no choices: give one at least, as in { public: \"Everyone\", draft: \"Only me\" }"]);
+    assert_eq!(refused(&tool("ask(\"Q?\", { a: 1 }, \"a\")")), ["`ask`'s choice `a` is not text: each choice is the text the user reads, under the key `ask` gives"]);
+    assert_eq!(refused(&tool("ask(\"Q?\", { a: \"A\", b: \"B\" }, \"c\")")), ["`ask`'s default \"c\" is not one of its choices: `a`, `b`"]);
+    // One choice, a null default, a default among them, a spread that may add the default, a
+    // choice that is not written: fine.
+    for body in ["ask(\"Q?\", { a: \"A\" }, \"a\")", "ask(\"Q?\", { a: \"A\" }, null)", "ask(\"Q?\", { ...more(), a: \"A\" }, \"z\")", "ask(\"Q?\", { a: label() }, \"a\")", "confirm(\"Q?\")"] {
+        assert_eq!(refused(&format!("{}fn more() = {{ z: \"Z\" }}\nfn label() = \"A\"\n", tool(body))), Vec::<String>::new(), "{}", body);
+    }
+    assert_eq!(refused(&tool("confirm()")).len(), 1);
+    // In a page: `confirm` is the server's, and `ask` with choices a tool's; the page's own
+    // `ask(message, options)` as before.
+    let page = |handler: &str| format!("component C() {{\n    <button onclick={{() => {{ {} }}}}>x</button>\n}}\nroute GET / = <C/>\n", handler);
+    assert_eq!(refused(&page("confirm(\"Sure?\")")), ["`confirm` is not available in the browser, where <C> also runs; use a `server fn`"]);
+    assert_eq!(refused(&page("ask(\"Sure?\", { a: \"A\" }, \"a\")")), ["`ask(question, choices, default)` is a tool's question to its user, asked by the AI client (`fn mcp`); a page asks yes or no with `ask(message, options)` in <C>"]);
+    assert_eq!(refused(&page("if ask(\"Sure?\", { title: \"T\", tone: \"danger\" }) { notify(\"ok\") }")), Vec::<String>::new());
+}
+
+#[test]
+fn e_outside_a_tools_call_ask_gives_its_default_and_confirm_true() {
+    // The program's own code: at the top level, in a route, and a page calling a `server fn mcp`
+    // through /_quillo/rpc (decided 2026-11-08, question 4).
+    let src = format!("{}\nlet top = [ask(\"Top?\", {{ a: \"A\", b: \"B\" }}, \"b\"), ask(\"None?\", {{ a: \"A\" }}, null), confirm(\"Top?\"), guard_empty()]\n", E_SRC);
+    let d = dir("e-outside", &src);
+    let mut it = Interp::new(&d);
+    it.load_file(&d.join("main.qwe")).unwrap();
+    // Outside a call, `??` takes an error as ever: `confirm` of no text under it is true.
+    assert_eq!(global(&it, "top").repr(), "[\"b\", null, true, true]");
+    // What it refuses it refuses there too.
+    for (code, said) in [
+        ("ask(\"\", { a: \"A\" }, \"a\")", "`ask`'s question is empty: say what the user is asked"),
+        ("ask(\"Q?\", {}, \"a\")", "`ask` has no choices"),
+        ("ask(\"Q?\", { a: \"A\" }, \"b\")", "`ask`'s default is one of its choices' keys (`a`) or null, got \"b\""),
+        ("ask(\"Q?\", { a: 1 }, \"a\")", "`ask`'s choice `a` is int"),
+        ("ask(\"Q?\", [1], \"a\")", "`ask`'s choices are a map"),
+        ("ask(5, { a: \"A\" }, \"a\")", "`ask`'s question is text the user reads, got int"),
+        ("confirm(\" \")", "`confirm`'s question is empty"),
+        ("confirm(null)", "`confirm`'s question is text the user reads, got null"),
+        ("ask(\"Q?\")", "`ask` and `notify` speak to someone in the browser"),
+    ] {
+        let mut it = Interp::new(&d);
+        std::fs::write(d.join("bad.qwe"), format!("let x = {}\n", code)).unwrap();
+        let e = it.load_file(&d.join("bad.qwe")).err().unwrap_or_else(|| panic!("{} ran", code));
+        assert!(e.to_string().contains(said), "{}: {}", code, e);
+    }
+    std::fs::remove_file(d.join("bad.qwe")).unwrap();
+    let s = support::serve_with(&d.join("main.qwe"), &[]);
+    assert_eq!(support::send(s.port, "GET", "/direct", &[], "").body, "true none 日本");
+    let json = [("content-type", "application/json")];
+    let a = support::send(s.port, "POST", "/_quillo/rpc/share", &json, "[\"From a page\"]");
+    assert_eq!((a.status, serde_json::from_str::<Value>(&a.body).unwrap()), (200, json!({ "ok": { "id": 1, "draft": 1 } })), "{}", a.body);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn e_an_answer_the_question_does_not_take() {
+    let (d, doors, s) = e_doors("answers");
+    for (i, mut door) in doors.into_iter().enumerate() {
+        let status = if i == 0 { 200 } else { 400 };
+        let state_of = |door: &mut EDoor, name: &str, args: Value| door.result(name, args, true, None, None)["requestState"].as_str().unwrap().to_string();
+        let hi = json!({ "title": "Hi" });
+        // A value not among the choices, one that is no text, none: a protocol error.
+        for (sent, said) in [
+            (choose("everyone"), "Invalid params: the answer to \"Who can see it?\" is \"everyone\", which is not one of its choices: `public`, `draft`".to_string()),
+            (choose("Public"), "Invalid params: the answer to \"Who can see it?\" is \"Public\", which is not one of its choices: `public`, `draft`".to_string()),
+            (json!({ "action": "accept", "content": { "choice": 1 } }), "Invalid params: the answer to \"Who can see it?\" is 1, which is not one of its choices: `public`, `draft`".to_string()),
+            (json!({ "action": "accept" }), "Invalid params: inputResponses.q1 accepts with no `choice` in its content".to_string()),
+            (json!({ "action": "accept", "content": {} }), "Invalid params: inputResponses.q1 accepts with no `choice` in its content".to_string()),
+            (json!({ "action": "maybe" }), "Invalid params: inputResponses.q1 is the user's answer, { \"action\": \"accept\" | \"decline\" | \"cancel\", \"content\": { ... } }".to_string()),
+            (json!({ "action": "accept", "content": "public" }), "Invalid params: inputResponses.q1 is the user's answer, { \"action\": \"accept\" | \"decline\" | \"cancel\", \"content\": { ... } }".to_string()),
+            (json!("public"), "Invalid params: inputResponses.q1 is the user's answer, { \"action\": \"accept\" | \"decline\" | \"cancel\", \"content\": { ... } }".to_string()),
+        ] {
+            let state = state_of(&mut door, "share", hi.clone());
+            assert_eq!(door.refused("share", hi.clone(), Some(&state), Some(one("q1", sent.clone()))), (status, -32602, said), "{}", sent);
+        }
+        // The user declines or dismisses an `ask`: the call ends, saying so.
+        let state = state_of(&mut door, "share", hi.clone());
+        assert_eq!(text_of(&door.result("share", hi.clone(), true, Some(&state), Some(one("q1", no())))), (true, "the user declined to answer: Who can see it?".into()));
+        let state = state_of(&mut door, "share", hi.clone());
+        assert_eq!(text_of(&door.result("share", hi.clone(), true, Some(&state), Some(one("q1", json!({ "action": "cancel" }))))), (true, "the user did not answer: Who can see it?".into()));
+        // `confirm` declined or dismissed is a no, and so is its box sent back unticked: a client
+        // that sends a form as it is says no (found in review).
+        for answer in [no(), json!({ "action": "cancel" }), json!({ "action": "decline", "content": { "confirm": true } }), json!({ "action": "accept", "content": { "confirm": false } })] {
+            let state = state_of(&mut door, "sure", json!({}));
+            assert_eq!(text_of(&door.result("sure", json!({}), true, Some(&state), Some(one("q1", answer.clone())))), (false, "false".into()), "{}", answer);
+        }
+        // Accepted with no box, or one that is not true or false: refused, never a yes.
+        for (sent, said) in [
+            (json!({ "action": "accept" }), "Invalid params: inputResponses.q1 accepts with no `confirm` in its content".to_string()),
+            (json!({ "action": "accept", "content": {} }), "Invalid params: inputResponses.q1 accepts with no `confirm` in its content".to_string()),
+            (json!({ "action": "accept", "content": { "yes": true } }), "Invalid params: inputResponses.q1 accepts with no `confirm` in its content".to_string()),
+            (json!({ "action": "accept", "content": { "confirm": "true" } }), "Invalid params: the answer to \"Sure?\" is \"true\", which is neither true nor false".to_string()),
+            (json!({ "action": "accept", "content": { "confirm": 1 } }), "Invalid params: the answer to \"Sure?\" is 1, which is neither true nor false".to_string()),
+        ] {
+            let state = state_of(&mut door, "sure", json!({}));
+            assert_eq!(door.refused("sure", json!({}), Some(&state), Some(one("q1", sent.clone()))), (status, -32602, said), "{}", sent);
+        }
+        // No answer to the question asked, or one under another key: it is asked again, with a
+        // new state; the answers it does not ask for are let be.
+        for answers in [None, Some(json!({})), Some(one("q2", yes())), Some(one("Q1", yes()))] {
+            let state = state_of(&mut door, "sure", json!({}));
+            let r = door.result("sure", json!({}), true, Some(&state), answers);
+            let (k, req) = asked_of(&r);
+            assert_eq!((k.as_str(), req["params"]["message"].as_str()), ("q1", Some("Sure?")));
+            assert_ne!(r["requestState"].as_str(), Some(state.as_str()));
+        }
+        let state = state_of(&mut door, "sure", json!({}));
+        let mut extra = one("q1", yes());
+        extra["other"] = json!({ "anything": [1] });
+        assert_eq!(text_of(&door.result("sure", json!({}), true, Some(&state), Some(extra))), (false, "true".into()));
+    }
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn e_unicode_questions_and_choices() {
+    let (d, doors, s) = e_doors("unicode");
+    for mut door in doors {
+        let r = door.result("pick", json!({ "n": 3 }), true, None, None);
+        let (_, req) = asked_of(&r);
+        assert_eq!(req["params"]["message"], json!("Welches von 3? (0 Beiträge) 日本語 ✓"));
+        assert_eq!(req["params"]["requestedSchema"]["properties"]["choice"], json!({ "type": "string", "oneOf": [
+            { "const": "ä", "title": "Äpfel, erste" }, { "const": "日本", "title": "日本語 ✓" }, { "const": "😀", "title": "👩‍💻 Smile" },
+        ], "default": "日本" }));
+        let state = r["requestState"].as_str().unwrap().to_string();
+        assert_eq!(text_of(&door.result("pick", json!({ "n": 3 }), true, Some(&state), Some(one("q1", choose("😀"))))), (false, "😀".into()));
+        // A key compared as written: "ä" composed is not "a" with its mark.
+        let r = door.result("pick", json!({ "n": 3 }), true, None, None);
+        let state = r["requestState"].as_str().unwrap().to_string();
+        assert_eq!(door.refused("pick", json!({ "n": 3 }), Some(&state), Some(one("q1", choose("a\u{308}")))).1, -32602);
+        // What the model sent, shown as it is, but a character no reader sees, which could make
+        // the question read as another: replaced. A joiner, a Persian word and a line kept.
+        for (t, shown) in [
+            ("a\u{202E}won ton", "Delete a\u{FFFD}won ton?"),
+            ("x\u{200B}y\u{2066}z\u{E0041}", "Delete x\u{FFFD}y\u{FFFD}z\u{FFFD}?"),
+            ("👩‍💻 می‌خواهم", "Delete 👩‍💻 می‌خواهم?"),
+            ("two\nlines\ttab", "Delete two\nlines\ttab?"),
+            ("\u{1}", "Delete \u{FFFD}?"),
+        ] {
+            let r = door.result("named", json!({ "t": t }), true, None, None);
+            assert_eq!(asked_of(&r).1["params"]["message"], json!(shown), "{:?}", t);
+        }
+    }
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn e_the_instructions_say_which_tools_ask_the_user_themselves() {
+    let base = |http: bool| mcp::quillos_lines("notes", 3, http);
+    let with = |asking: &[&str]| mcp::quillos_lines_asking("notes", 3, false, asking);
+    // None, one, two, three: said as such, after Quillo's three lines.
+    assert_eq!(with(&[]), base(false));
+    assert_eq!(with(&["add_note"]), format!("{}\nadd_note asks the user itself before it runs: do not ask again.", base(false)));
+    assert_eq!(with(&["a", "b"]), format!("{}\na and b ask the user themselves before they run: do not ask again.", base(false)));
+    assert_eq!(with(&["a", "b", "c"]), format!("{}\na, b and c ask the user themselves before they run: do not ask again.", base(false)));
+    // A name cut at 24 characters, 24 kept whole.
+    let n24 = "n".repeat(24);
+    let n25 = "n".repeat(25);
+    assert!(with(&[&n24]).ends_with(&format!("\n{} asks the user itself before it runs: do not ask again.", n24)));
+    assert!(with(&[&n25]).ends_with(&format!("\n{}... asks the user itself before it runs: do not ask again.", n24)));
+    // Many: as many as fit, then how many more, and the whole under 600.
+    let names: Vec<String> = (0..300).map(|i| format!("tool_{:x<123}", i)).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let t = with(&refs);
+    let last = t.lines().last().unwrap();
+    assert!(last.starts_with(&format!("{}..., ", &refs[0][..24])) && last.ends_with(" more ask the user themselves before they run: do not ask again."), "{}", last);
+    let said = last.matches("...").count();
+    assert!(said >= 3 && last.contains(&format!(" and {} more ask", 300 - said)), "{}", last);
+    assert!(t.chars().count() < mcp::QUILLOS_MOST && t.len() < mcp::QUILLOS_MOST, "{}", t.chars().count());
+    // The worst case of slice 6, a name past 24 characters of four bytes and the most tools a
+    // count says, with each list of asking tools: under 600 in characters and in bytes, on each
+    // door, the names said or else counted.
+    let long = "x".repeat(128);
+    let lists: Vec<Vec<&str>> = vec![vec!["a"], vec![long.as_str()], vec![long.as_str(); 2], vec![long.as_str(); 3], refs.clone(), vec!["a"; 10_000]];
+    for name in ["😀".repeat(25), "n".repeat(10_000), "notes".into(), String::new()] {
+        for http in [false, true] {
+            for (i, list) in lists.iter().enumerate() {
+                let t = mcp::quillos_lines_asking(&name, usize::MAX, http, list);
+                assert!(t.chars().count() < mcp::QUILLOS_MOST && t.len() < mcp::QUILLOS_MOST, "{} chars, {} bytes: {}", t.chars().count(), t.len(), t);
+                assert_eq!(t.lines().count(), 4, "{:?}", t);
+                let last = t.lines().last().unwrap();
+                assert!(last.ends_with("do not ask again."), "{} {}", i, last);
+            }
+        }
+    }
+    // The worst of all, on stdio: 95 bytes left, one long name fits, two are counted; over HTTP,
+    // whose caller's line is shorter, two fit.
+    let worst = |http: bool, list: &[&str]| mcp::quillos_lines_asking(&"😀".repeat(25), usize::MAX, http, list).lines().last().unwrap().to_string();
+    let named = format!("{}... asks the user itself before it runs: do not ask again.", &long[..24]);
+    assert_eq!(worst(false, &[long.as_str()]), named);
+    assert_eq!(worst(false, &[long.as_str(), long.as_str()]), "2 tools ask the user themselves before they run: do not ask again.");
+    assert_eq!(worst(true, &[long.as_str(), long.as_str()]), format!("{}... and 1 more ask the user themselves before they run: do not ask again.", &long[..24]));
+    // Over HTTP, 98 bytes: a long name and "99 more" fit to the byte, "100 more" do not.
+    assert_eq!(worst(true, &[long.as_str(); 100]), format!("{}... and 99 more ask the user themselves before they run: do not ask again.", &long[..24]));
+    assert_eq!(worst(true, &[long.as_str(); 100]).len(), 98);
+    assert_eq!(worst(true, &[long.as_str(); 101]), "101 tools ask the user themselves before they run: do not ask again.");
+    assert_eq!(mcp::QUILLOS_MOST - 2 - mcp::quillos_lines(&"😀".repeat(25), usize::MAX, false).len(), 95);
+    // A name with what would end the line or hide: spaces, as the program's name is said.
+    assert!(with(&["a\nb\u{202E}c"]).ends_with("\na b c asks the user itself before it runs: do not ask again."));
+    // The door says it, on each door, by the program's tools; `quillo docs --mcp` prints it.
+    let d = dir("e-told", E_SRC);
+    let v = docs_mcp(&d, "main.qwe");
+    let count = v["tools/list"]["tools"].as_array().unwrap().len();
+    for (door, http) in [("stdio", false), ("http", true)] {
+        assert_eq!(told_on(&v, door), mcp::quillos_lines_asking("main", count, http, E_ASKING), "{}", door);
+    }
+    let line = told_on(&v, "stdio").lines().last().unwrap().to_string();
+    // The tools seen to ask, in order, as many as fit; not one whose question the checker does
+    // not see, nor one that does not ask.
+    assert!(line.starts_with("share, pick, sure, loose, pair, named, many, both, counted, guarded, late, ") && line.ends_with(" more ask the user themselves before they run: do not ask again."), "{}", line);
+    assert!(!line.contains("hidden_ask") && !line.contains("posts"), "{}", line);
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    let r = door.ask(&request(json!(1), "server/discover", json!({})))["result"].clone();
+    assert_eq!(r["instructions"].as_str(), Some(told_on(&v, "stdio")));
+    drop(door);
+    // `quillo check`'s 2,000 counts the line: a block that makes the whole 2,000 with it is
+    // quiet, one character more warns.
+    let whole = |src: &str| {
+        std::fs::write(d.join("main.qwe"), src).unwrap();
+        let v = docs_mcp(&d, "main.qwe");
+        told_on(&v, "stdio").chars().count().max(told_on(&v, "http").chars().count())
+    };
+    let with_own = |n: usize| format!("//! {}\n{}", "é".repeat(n), E_SRC);
+    let base_len = whole(&with_own(1)) - 1;
+    let n = 2_000 - base_len;
+    assert_eq!(whole(&with_own(n)), 2_000);
+    let (ok, _, err) = quillo(&d, &["check", "main.qwe"]);
+    assert!(ok && !err.contains("what AI clients are told"), "{}", err);
+    std::fs::write(d.join("main.qwe"), with_own(n + 1)).unwrap();
+    let (ok, _, err) = quillo(&d, &["check", "main.qwe"]);
+    assert!(ok && err.contains("main.qwe:1: warning: what AI clients are told of this program (Quillo's lines, then this `//!` block) is 2,001 characters, 1 over 2,000"), "{}", err);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn e_review_the_limit_parallel_a_changed_question_and_the_read_only_transaction() {
+    let (d, mut it, door) = e_here("edges");
+    let call = |it: &mut Interp, name: &str, args: Value, state: Option<&str>, answers: Option<Value>| here(it, &door, e_call("e", name, args, &caps(true), state, answers))["result"].clone();
+    // As many questions as one call asks, one fewer, and one more: each round the run starts
+    // from the top, the answers before given back from the state.
+    let rounds = |it: &mut Interp, n: i64| -> (usize, Value) {
+        let (mut k, mut state, mut answers) = (0, None::<String>, None);
+        loop {
+            let r = call(it, "many", json!({ "n": n }), state.as_deref(), answers.take());
+            if r["resultType"] == json!("complete") {
+                return (k, r);
+            }
+            let (key, req) = asked_of(&r);
+            assert_eq!(req["params"]["message"], json!(format!("Number {}?", k)));
+            k += 1;
+            // Yes to the even ones.
+            answers = Some(one(&key, if k % 2 == 1 { yes() } else { no() }));
+            state = r["requestState"].as_str().map(str::to_string);
+        }
+    };
+    for n in [0, 1, 99, 100] {
+        let (asked, r) = rounds(&mut it, n);
+        assert_eq!((asked as i64, text_of(&r)), (n, (false, ((n + 1) / 2).to_string())), "{}", n);
+    }
+    let (asked, r) = rounds(&mut it, 101);
+    assert_eq!((asked, text_of(&r)), (100, (true, "internal error".into())));
+    assert_eq!(mcp::MOST_QUESTIONS, 100);
+    // `parallel`'s functions in a call that may ask: one after another, each question in turn.
+    let r = call(&mut it, "both", json!({}), None, None);
+    let (_, req) = asked_of(&r);
+    assert_eq!(req["params"]["message"], json!("One?"));
+    let r = call(&mut it, "both", json!({}), r["requestState"].as_str(), Some(one("q1", yes())));
+    let (k, req) = asked_of(&r);
+    assert_eq!((k.as_str(), req["params"]["message"].as_str()), ("q2", Some("Two?")));
+    let r = call(&mut it, "both", json!({}), r["requestState"].as_str(), Some(one("q2", no())));
+    assert_eq!(r["content"][0]["text"], json!("[true,false]"), "{}", r);
+    // `??` does not take the stop for null: the question is asked.
+    let r = call(&mut it, "guarded", json!({}), None, None);
+    assert_eq!(asked_of(&r).1["params"]["message"], json!("Guarded?"));
+    let r = call(&mut it, "guarded", json!({}), r["requestState"].as_str(), Some(one("q1", yes())));
+    assert_eq!(r["content"][0]["text"], json!("true"), "{}", r);
+    // The question changed between the rounds (the count it says): asked again, as it is now.
+    let r = call(&mut it, "counted", json!({}), None, None);
+    assert_eq!(asked_of(&r).1["params"]["message"], json!("Delete 0 posts?"));
+    let state = r["requestState"].as_str().unwrap().to_string();
+    let r2 = call(&mut it, "share", json!({ "title": "x" }), None, None);
+    let s2 = r2["requestState"].as_str().unwrap().to_string();
+    let r2 = call(&mut it, "share", json!({ "title": "x" }), Some(&s2), Some(one("q1", choose("public"))));
+    let s2 = r2["requestState"].as_str().unwrap().to_string();
+    assert_eq!(text_of(&call(&mut it, "share", json!({ "title": "x" }), Some(&s2), Some(one("q2", yes())))).0, false);
+    let r = call(&mut it, "counted", json!({}), Some(&state), Some(one("q1", yes())));
+    assert_eq!(asked_of(&r).1["params"]["message"], json!("Delete 1 posts?"));
+    let r = call(&mut it, "counted", json!({}), r["requestState"].as_str(), Some(one("q1", yes())));
+    assert_eq!(text_of(&r), (false, "true".into()));
+    // A tool that asks and reads is said to only read, and runs in the read-only transaction: a
+    // stop there leaves nothing open, and a write after it is the next tool's to make.
+    let tools = mcp::of_source(&d.join("main.qwe")).unwrap();
+    let pick = tools.iter().find(|t| t.name == "pick").unwrap();
+    assert_eq!((pick.annotations.get("readOnlyHint"), pick.reads_only, pick.asks), (Some(&json!(true)), true, true));
+    let sure = tools.iter().find(|t| t.name == "sure").unwrap();
+    assert_eq!((sure.annotations.get("readOnlyHint"), sure.asks, sure.may_ask), (Some(&json!(true)), true, true));
+    let share = tools.iter().find(|t| t.name == "share").unwrap();
+    assert_eq!((share.annotations.get("readOnlyHint"), share.asks), (None, true));
+    let posts = tools.iter().find(|t| t.name == "posts").unwrap();
+    assert_eq!((posts.asks, posts.may_ask), (false, false));
+    let r = call(&mut it, "pick", json!({ "n": 1 }), None, None);
+    assert_eq!(r["resultType"], json!("input_required"));
+    let before = text_of(&call(&mut it, "posts", json!({}), None, None)).1;
+    let r = call(&mut it, "share", json!({ "title": "after" }), None, None);
+    let r = call(&mut it, "share", json!({ "title": "after" }), r["requestState"].as_str(), Some(one("q1", choose("draft"))));
+    let r = call(&mut it, "share", json!({ "title": "after" }), r["requestState"].as_str(), Some(one("q2", yes())));
+    assert_eq!(text_of(&r).0, false, "{}", r);
+    assert_eq!(text_of(&call(&mut it, "posts", json!({}), None, None)).1, (before.parse::<i64>().unwrap() + 1).to_string());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// MCP's own TypeScript client (`@modelcontextprotocol/client` 2.4.0) answers `input_required`
+/// by itself, with the handler a client registers for `elicitation/create`, and calls again with
+/// the answers and the state (its multi-round-trip driver): two questions in one call, a no, and
+/// a client with no `elicitation`, on each door. Skipped only where npm is not found or the
+/// package cannot be installed, as `c1_the_official_typescript_client_drives_it` is.
+#[test]
+fn e_the_official_typescript_client_answers_the_questions_on_each_door() {
+    let d = dir("e-sdk", E_SRC);
+    let s = support::serve_with(&d.join("main.qwe"), &[]);
+    let cookie = http_door::login(s.port, "ana", &[]);
+    let token = http_door::token(s.port, &cookie, &[]);
+    let script = r#"const { Client, StreamableHTTPClientTransport } = require("@modelcontextprotocol/client");
+const { StdioClientTransport } = require("@modelcontextprotocol/client/stdio");
+(async () => {
+  const [quillo, dir, url, token] = process.argv.slice(2);
+  const out = {};
+  for (const door of ["stdio", "http"]) {
+    for (const mode of ["yes", "no", "cannot"]) {
+      const asked = [];
+      const options = { versionNegotiation: { mode: { pin: "2026-07-28" } } };
+      if (mode !== "cannot") options.capabilities = { elicitation: { form: {} } };
+      const client = new Client({ name: "quillo-test", version: "1.0.0" }, options);
+      if (mode !== "cannot") {
+        client.setRequestHandler("elicitation/create", async (req) => {
+          asked.push(req.params);
+          const choice = req.params.requestedSchema.properties.choice;
+          if (choice) return { action: "accept", content: { choice: choice.oneOf[0].const } };
+          return mode === "yes" ? { action: "accept", content: { confirm: true } } : { action: "decline" };
+        });
+      }
+      const transport = door === "stdio"
+        ? new StdioClientTransport({ command: quillo, args: ["mcp", "main.qwe"], cwd: dir, stderr: "pipe" })
+        : new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { Authorization: `Bearer ${token}` } } });
+      const r = { asked };
+      try {
+        await client.connect(transport);
+        r.share = await client.callTool({ name: "share", arguments: { title: "From the SDK é" } });
+        r.pick = await client.callTool({ name: "pick", arguments: { n: 2 } });
+      } catch (e) {
+        r.failed = { code: e.code, message: String(e.message) };
+      }
+      try { await client.close(); } catch (e) {}
+      out[`${door} ${mode}`] = r;
+    }
+  }
+  console.log(JSON.stringify(out));
+})();
+"#;
+    std::fs::write(d.join("client.cjs"), script).unwrap();
+    std::fs::write(d.join("package.json"), r#"{"name":"quillo-e-sdk","private":true}"#).unwrap();
+    if Command::new("npm").arg("--version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_err() {
+        let _ = std::fs::remove_dir_all(&d);
+        eprintln!("skipped: e_the_official_typescript_client_answers_the_questions_on_each_door, as npm was not found");
+        return;
+    }
+    match run_for(&d, "npm install --no-audit --no-fund --ignore-scripts @modelcontextprotocol/client@2.4.0", 240) {
+        Ok(o) if o.status.success() => {}
+        failed => {
+            let _ = std::fs::remove_dir_all(&d);
+            let why = failed.map_or_else(|e| e, |o| String::from_utf8_lossy(&o.stderr).into_owned());
+            eprintln!("skipped: e_the_official_typescript_client_answers_the_questions_on_each_door, as npm could not install @modelcontextprotocol/client@2.4.0: {}", why);
+            return;
+        }
+    }
+    let url = format!("http://127.0.0.1:{}/_quillo/mcp", s.port);
+    let ran = run_for(&d, &format!("node client.cjs {:?} {:?} {} {}", env!("CARGO_BIN_EXE_quillo"), d.display().to_string(), url, token), 180);
+    let posts = support::send(s.port, "GET", "/posts", &[], "").body;
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+    let o = ran.unwrap_or_else(|e| panic!("the client: {}", e));
+    let (stdout, stderr) = (String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned());
+    assert!(o.status.success(), "the client failed: {}\n{}", stdout, stderr);
+    let said: Value = stdout.lines().last().and_then(|l| serde_json::from_str(l).ok()).unwrap_or_else(|| panic!("the client said no JSON: {}\n{}", stdout, stderr));
+    for door in ["stdio", "http"] {
+        let yes = &said[format!("{} yes", door)];
+        assert!(yes.get("failed").is_none(), "{}: {}", door, said);
+        let messages: Vec<&str> = yes["asked"].as_array().unwrap().iter().map(|p| p["message"].as_str().unwrap()).collect();
+        assert_eq!(messages, ["Who can see it?", "Publish \"From the SDK é\" now?", "Welches von 2? (1 Beiträge) 日本語 ✓"], "{}", yes);
+        assert_eq!(yes["share"]["structuredContent"], json!({ "id": 1, "draft": 0 }), "{}", yes);
+        assert_eq!(yes["pick"]["content"][0]["text"], json!("ä"), "{}", yes);
+        let no = &said[format!("{} no", door)];
+        assert!(no.get("failed").is_none(), "{}: {}", door, said);
+        assert_eq!((no["share"]["isError"].clone(), no["share"]["content"][0]["text"].clone()), (json!(true), json!("not published: the user said no")), "{}", no);
+        let cannot = &said[format!("{} cannot", door)];
+        assert!(cannot.get("failed").is_none(), "{}: {}", door, said);
+        assert_eq!(cannot["asked"], json!([]));
+        assert_eq!((cannot["share"]["isError"].clone(), cannot["share"]["content"][0]["text"].clone()), (json!(true), json!("this needs the user's yes, and this client cannot ask")), "{}", cannot);
+        assert_eq!(cannot["pick"]["content"][0]["text"], json!("日本"), "{}", cannot);
+    }
+    assert_eq!(posts, "1");
+}
+
+// ---- Slice 7, security review: a tool must not act on a yes nobody gave -----------------------
+
+#[test]
+fn e_review_a_refused_question_under_a_guard_stops_the_call() {
+    // `??` takes no refusal of `confirm` or `ask` for null: the call stops there, nothing after
+    // it runs, and what it wrote is rolled back.
+    let (d, doors, s) = e_doors("guard");
+    for (i, mut door) in doors.into_iter().enumerate() {
+        let count = |door: &mut EDoor| text_of(&door.result("posts", json!({}), true, None, None)).1.parse::<i64>().unwrap();
+        let before = count(&mut door);
+        let hits = text_of(&door.result("hits_now", json!({}), true, None, None)).1;
+        for name in ["guard_late", "guard_ask", "guard_empty", "guard_global"] {
+            let r = door.result(name, json!({}), true, None, None);
+            assert_eq!(text_of(&r), (true, "internal error".into()), "{}: {}", name, r);
+        }
+        assert_eq!(count(&mut door), before, "the write after `?? true` ran");
+        assert_eq!(text_of(&door.result("hits_now", json!({}), true, None, None)).1, hits, "the assignment after `?? true` ran");
+        if i == 0 {
+            let err = door.stderr();
+            for said in ["error in tool `guard_late`: ", "error in tool `guard_ask`: ", "error in tool `guard_empty`: "] {
+                assert!(err.contains(said), "{}\n{}", said, err);
+            }
+            assert!(err.contains("`confirm` comes after `set_cookie`") && err.contains("`ask` comes after `set_cookie`") && err.contains("`confirm`'s question is empty"), "{}", err);
+        }
+    }
+    drop(s);
+    // Past the most questions, under `??`: refused, and the write after the loop rolled back.
+    let (d2, mut it, door) = e_here("guard-many");
+    let call = |it: &mut Interp, args: Value, state: Option<&str>, answers: Option<Value>| here(it, &door, e_call("g", "guard_many", args, &caps(true), state, answers))["result"].clone();
+    let (mut state, mut answers, mut rounds) = (None::<String>, None, 0);
+    let r = loop {
+        let r = call(&mut it, json!({ "n": 101 }), state.as_deref(), answers.take());
+        if r["resultType"] == json!("complete") {
+            break r;
+        }
+        let (k, _) = asked_of(&r);
+        rounds += 1;
+        assert!(rounds <= 101, "asked for ever");
+        answers = Some(one(&k, yes()));
+        state = r["requestState"].as_str().map(str::to_string);
+    };
+    assert_eq!((rounds, text_of(&r)), (100, (true, "internal error".into())));
+    let posts = here(&mut it, &door, e_call("p", "posts", json!({}), &caps(true), None, None));
+    assert_eq!(text_of(&posts["result"]).1, "0");
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&d2);
+}
+
+#[test]
+fn e_review_a_question_the_checker_does_not_see_is_followed() {
+    // A tool whose question the checker cannot see (a function a value holds) is not said to ask,
+    // but is followed as one that may: its question is asked, never answered true by itself.
+    let d = dir("e-unseen", E_SRC);
+    let tools = mcp::of_source(&d.join("main.qwe")).unwrap();
+    let t = tools.iter().find(|t| t.name == "hidden_ask").unwrap();
+    assert_eq!((t.asks, t.may_ask), (false, true));
+    let _ = std::fs::remove_dir_all(&d);
+    let (d, doors, s) = e_doors("unseen");
+    for mut door in doors {
+        let r = door.result("hidden_ask", json!({}), true, None, None);
+        assert_eq!(asked_of(&r).1["params"]["message"], json!("Hidden?"), "{}", r);
+        let r = door.result("hidden_ask", json!({}), true, r["requestState"].as_str(), Some(one("q1", yes())));
+        assert_eq!(text_of(&r), (false, "true".into()), "{}", r);
+        // A client that cannot ask: refused, not a yes.
+        assert_eq!(text_of(&door.result("hidden_ask", json!({}), false, None, None)), (true, "this needs the user's yes, and this client cannot ask".into()));
+    }
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn e_review_the_same_question_in_two_places_is_two_questions() {
+    // `confirm("Are you sure?")` on two ways of an `if`, on two lines and on one: a yes to one is
+    // no yes to the other when the call takes the other way the next round.
+    for name in ["branches", "one_line"] {
+        let (d, mut it, door) = e_here(&format!("places-{}", name));
+        let call = |it: &mut Interp, name: &str, args: Value, state: Option<&str>, answers: Option<Value>| here(it, &door, e_call("p", name, args, &caps(true), state, answers))["result"].clone();
+        // Asked on the way taken with no posts; a post written meanwhile; the yes sent back is
+        // the other way's: asked again there.
+        let r = call(&mut it, name, json!({}), None, None);
+        assert_eq!(asked_of(&r).1["params"]["message"], json!("Are you sure?"));
+        let state = r["requestState"].as_str().unwrap().to_string();
+        assert_eq!(text_of(&call(&mut it, "posts", json!({}), None, None)).1, "0");
+        let w = call(&mut it, "late", json!({ "t": "p" }), None, None);
+        let w = call(&mut it, "late", json!({ "t": "p" }), w["requestState"].as_str(), Some(one("q1", yes())));
+        assert_eq!(text_of(&w), (false, "true".into()), "{}", w);
+        let r = call(&mut it, name, json!({}), Some(&state), Some(one("q1", yes())));
+        let (k, req) = asked_of(&r);
+        assert_eq!((k.as_str(), req["params"]["message"].as_str()), ("q1", Some("Are you sure?")), "{}: {}", name, r);
+        let r = call(&mut it, name, json!({}), r["requestState"].as_str(), Some(one("q1", yes())));
+        assert_eq!(text_of(&r), (false, "some".into()), "{}", name);
+        // The same way twice: the yes is its own.
+        let r = call(&mut it, name, json!({}), None, None);
+        let r = call(&mut it, name, json!({}), r["requestState"].as_str(), Some(one("q1", yes())));
+        assert_eq!(text_of(&r), (false, "some".into()), "{}", name);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[test]
+fn e_review_a_question_that_changes_each_round_ends_the_call() {
+    // A question with a random number in it is new each time the call runs again: never its own
+    // answer's. Counted in the state, the rounds end at 100, as the questions do.
+    let (d, mut it, door) = e_here("ticking");
+    let (mut state, mut answers, mut rounds) = (None::<String>, None, 0);
+    let r = loop {
+        let r = here(&mut it, &door, e_call("t", "ticking", json!({}), &caps(true), state.as_deref(), answers.take()))["result"].clone();
+        if r["resultType"] == json!("complete") {
+            break r;
+        }
+        let (k, _) = asked_of(&r);
+        assert_eq!(k, "q1");
+        rounds += 1;
+        assert!(rounds <= 101, "asked for ever");
+        assert_eq!(state_payload(r["requestState"].as_str().unwrap())["rounds"], json!(rounds));
+        answers = Some(one(&k, yes()));
+        state = r["requestState"].as_str().map(str::to_string);
+    };
+    assert_eq!((rounds, text_of(&r)), (100, (true, "internal error".into())));
+    // A question that keeps its text is answered in the second round.
+    let r = here(&mut it, &door, e_call("s", "sure", json!({}), &caps(true), None, None))["result"].clone();
+    let r = here(&mut it, &door, e_call("s", "sure", json!({}), &caps(true), r["requestState"].as_str(), Some(one("q1", yes()))))["result"].clone();
+    assert_eq!(text_of(&r), (false, "true".into()));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A secret two servers share, so that each takes the other's sessions and states.
+const SHARED_SECRET: &str = "feedback56-e-shared-secret-of-thirty-two+";
+
+#[test]
+fn e_review_a_state_used_in_one_process_is_refused_by_another_sharing_its_database() {
+    // Two servers of the program, one database file and one QUILLO_SECRET: a state is good once
+    // across them, its use kept in the database (`_quillo_calls`).
+    let src = E_SRC.replace("db.open(\":memory:\")", "db.open(\"shared.db\")").replace("create table posts", "create table if not exists posts");
+    let d = dir("e-shared", &src);
+    let env = [("QUILLO_SECRET", SHARED_SECRET)];
+    let a = support::serve(&d.join("main.qwe"), &env);
+    let b = support::serve(&d.join("main.qwe"), &env);
+    let cookie = http_door::login(a.port, "ana", &[]);
+    let mut doors = [EDoor::Http(a.port, http_door::As::Cookie(cookie.clone())), EDoor::Http(b.port, http_door::As::Cookie(cookie))];
+    let used = "Invalid params: this requestState was used already: each is good for one call; call the tool again without one to start over";
+    // Given by the first; used at one, then refused at the other, each way round.
+    for (first, then) in [(0, 1), (1, 0)] {
+        let r = doors[0].result("sure", json!({}), true, None, None);
+        let state = r["requestState"].as_str().unwrap().to_string();
+        assert_eq!(text_of(&doors[first].result("sure", json!({}), true, Some(&state), Some(one("q1", yes())))), (false, "true".into()));
+        assert_eq!(doors[then].refused("sure", json!({}), Some(&state), Some(one("q1", yes()))), (400, -32602, used.to_string()));
+    }
+    drop((a, b));
+    let _ = std::fs::remove_dir_all(&d);
+    // The limit the guide states: a program with no database keeps each process's uses in its own
+    // memory, so the same caller can use a state once more in another process sharing the secret,
+    // until its 10 minutes end.
+    let d = dir("e-unshared", "route POST /login ? { user: str } = set_session({ user: user })\n/// Yes or no.\nfn mcp sure() -> bool with time = confirm(\"Sure?\")\n");
+    let a = support::serve(&d.join("main.qwe"), &env);
+    let b = support::serve(&d.join("main.qwe"), &env);
+    let cookie = http_door::login(a.port, "ana", &[]);
+    let mut at_a = EDoor::Http(a.port, http_door::As::Cookie(cookie.clone()));
+    let mut at_b = EDoor::Http(b.port, http_door::As::Cookie(cookie));
+    let r = at_a.result("sure", json!({}), true, None, None);
+    let state = r["requestState"].as_str().unwrap().to_string();
+    assert_eq!(text_of(&at_a.result("sure", json!({}), true, Some(&state), Some(one("q1", yes())))), (false, "true".into()));
+    assert_eq!(at_a.refused("sure", json!({}), Some(&state), Some(one("q1", yes()))).2, used);
+    assert_eq!(text_of(&at_b.result("sure", json!({}), true, Some(&state), Some(one("q1", yes())))), (false, "true".into()));
+    assert_eq!(at_b.refused("sure", json!({}), Some(&state), Some(one("q1", yes()))).2, used);
+    drop((a, b));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn e_review_a_use_the_database_cannot_keep_refuses_the_state() {
+    // Over HTTP a state's use is kept in `_quillo_calls`; where it cannot be (here a table of that
+    // name and another shape), the state is refused: closed. Stdio keeps its uses in memory.
+    let src = format!("{}\ndb.exec(\"create table _quillo_calls (x int)\")\n", E_SRC);
+    let d = dir("e-unkept", &src);
+    let s = support::serve_with(&d.join("main.qwe"), &[]);
+    let cookie = http_door::login(s.port, "ana", &[]);
+    let mut door = EDoor::Http(s.port, http_door::As::Cookie(cookie));
+    let r = door.result("sure", json!({}), true, None, None);
+    let state = r["requestState"].as_str().unwrap().to_string();
+    assert_eq!(
+        door.refused("sure", json!({}), Some(&state), Some(one("q1", yes()))),
+        (400, -32602, "Invalid params: this requestState could not be kept as used, so it is refused (the server's log says why); call the tool again without one to start over".to_string())
+    );
+    // Refused again in this process, as one used.
+    assert_eq!(door.refused("sure", json!({}), Some(&state), Some(one("q1", yes()))).2, "Invalid params: this requestState was used already: each is good for one call; call the tool again without one to start over");
+    drop(s);
+    let mut stdio = EDoor::Stdio(Stdio::start(&d, &["main.qwe"]));
+    let r = stdio.result("sure", json!({}), true, None, None);
+    assert_eq!(text_of(&stdio.result("sure", json!({}), true, r["requestState"].as_str(), Some(one("q1", yes())))), (false, "true".into()));
+    drop(stdio);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn e_review_a_calls_later_rounds_are_not_counted_by_the_limit() {
+    // The default limit, 60 tool calls a minute for each caller, counts a call at its first
+    // round; its later rounds, carrying the state the door gave this caller, are that call's. A
+    // state used already, or not the door's, is counted.
+    let d = dir("e-limit", E_SRC);
+    let s = support::serve_with(&d.join("main.qwe"), &[]);
+    let cookie = http_door::login(s.port, "ana", &[]);
+    let who = http_door::As::Cookie(cookie);
+    let mut door = EDoor::Http(s.port, who.clone());
+    let status = |line: &str, name: &str| http_door::post(s.port, &who, &http_door::mirrored("tools/call", Some(name)), line).status;
+    for _ in 0..58 {
+        assert_eq!(door.result("sure", json!({}), true, None, None)["resultType"], json!("input_required"));
+    }
+    // The 59th call, in three rounds.
+    let (r, asked) = door.answered("share", json!({ "title": "Hi" }), &|req| if req["params"]["requestedSchema"]["properties"]["choice"].is_object() { choose("public") } else { yes() });
+    assert_eq!((asked.len(), text_of(&r).0), (2, false), "{}", r);
+    // The 60th, and the 61st refused.
+    let r = door.result("sure", json!({}), true, None, None);
+    let state = r["requestState"].as_str().unwrap().to_string();
+    assert_eq!(status(&e_call("x", "sure", json!({}), &caps(true), None, None), "sure"), 429);
+    // At the limit, the 60th's second round goes through.
+    assert_eq!(text_of(&door.result("sure", json!({}), true, Some(&state), Some(one("q1", yes())))), (false, "true".into()));
+    // Its state again, used, and one that is not the door's: counted, so refused.
+    assert_eq!(status(&e_call("x", "sure", json!({}), &caps(true), Some(&state), Some(one("q1", yes()))), "sure"), 429);
+    assert_eq!(status(&e_call("x", "sure", json!({}), &caps(true), Some("e30.x"), None), "sure"), 429);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn e_review_on_postgres_a_write_hidden_in_a_select_is_rolled_back_or_refused() {
+    // A function the program made (`select archive_old()`): on the program's database, in the
+    // call's transaction, what it wrote is rolled back where the call stops; on another
+    // connection, it stands, and the question after it is refused.
+    let Some(pg) = support::postgres("feedback56-e") else {
+        eprintln!("skipped: e_review_on_postgres_a_write_hidden_in_a_select_is_rolled_back_or_refused, as PostgreSQL's initdb and pg_ctl were not found");
+        return;
+    };
+    let url = pg.database("ask");
+    let d = support::temp_dir("feedback56-e-pg");
+    let src = format!(
+        r#"db.open({url:?})
+db.exec("create table posts (id serial primary key, title text not null)")
+db.exec("create function archive_old() returns int language sql as $$ insert into posts (title) values ('archived') returning id $$")
+let other = db.connect({url:?})
+let hidden = {{ a: () => db.query("select archive_old() as n"), o: () => other.query("select archive_old() as n") }}
+
+/// Archives, then asks.
+fn mcp archive() -> bool with db {{
+    hidden.a()
+    confirm("Archived?")
+}}
+
+/// Archives on another connection, then asks.
+fn mcp elsewhere() -> bool with db {{
+    hidden.o()
+    confirm("Elsewhere?")
+}}
+
+/// How many posts.
+fn mcp total() -> int with db = db.one("select count(*) as n from posts").n
+"#,
+        url = url
+    );
+    std::fs::write(d.join("main.qwe"), &src).unwrap();
+    let tools = mcp::of_source(&d.join("main.qwe")).unwrap_or_else(|e| panic!("{}", e));
+    let mut it = Interp::new(&d);
+    it.load_file(&d.join("main.qwe")).unwrap();
+    let door = mcp::Door::new("main", tools);
+    let free_before = free(&it);
+    let total = |it: &mut Interp| text_of(&here(it, &door, e_call("t", "total", json!({}), &caps(true), None, None))["result"]).1;
+    let r = here(&mut it, &door, e_call("a", "archive", json!({}), &caps(true), None, None))["result"].clone();
+    assert_eq!(asked_of(&r).1["params"]["message"], json!("Archived?"));
+    assert_eq!(total(&mut it), "0");
+    let r = here(&mut it, &door, e_call("a", "archive", json!({}), &caps(true), r["requestState"].as_str(), Some(one("q1", yes()))))["result"].clone();
+    assert_eq!(text_of(&r), (false, "true".into()), "{}", r);
+    assert_eq!(total(&mut it), "1");
+    let r = here(&mut it, &door, e_call("e", "elsewhere", json!({}), &caps(true), None, None))["result"].clone();
+    assert_eq!(text_of(&r), (true, "internal error".into()), "{}", r);
+    assert_eq!(total(&mut it), "2");
+    nothing_left(&it, free_before, "the calls that asked");
+    drop(it);
+    let _ = std::fs::remove_dir_all(&d);
+}

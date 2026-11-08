@@ -840,7 +840,10 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("run_script", "str, map | null=", "any"),
     ("sql_name", "str | list", "str"),
     ("sql_param", "str | list", "str"),
-    ("ask", "str, map | null=", "bool"),
+    // `ask(message, options)` on a page, `ask(question, choices, default)` in a tool
+    // (FEEDBACK56.md, Part E; branch feedback56).
+    ("ask", "str, map | null=, str | null=", "bool | str | null"),
+    ("confirm", "str", "bool"),
     ("notify", "str, map | null=", "null"),
     ("translations", "str | map, map | null=", "null"),
     ("locale_from", "fn", "null"),
@@ -1146,7 +1149,7 @@ const MODULE_VALUES: &[&str] = &["math.pi", "math.e", "math.tau", "math.inf", "m
 const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "unwatched", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
-      "delete_cookie", "session", "cookie", "set_session", "end_session", "mcp_token", "mcp_tokens", "revoke_mcp_token", "translations", "locale_from", "with_locale",
+      "delete_cookie", "session", "cookie", "set_session", "end_session", "mcp_token", "mcp_tokens", "revoke_mcp_token", "confirm", "translations", "locale_from", "with_locale",
       "schedule", "stream", "events", "image.info", "image.convert", "later.status", "args", "stdin", "read_line", "exit", "allow_cross_site", "site_headers", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform", "markdown_page", "files", "classes", "accept_calls"];
 
 fn parse_t(s: &str) -> T {
@@ -1481,6 +1484,9 @@ pub struct ToolFacts {
     /// It calls `db`: the database may be reached, and a tool that only reads is run in a
     /// read-only transaction (FEEDBACK56.md, Q-858, found in review; branch feedback56).
     pub db: bool,
+    /// It calls `confirm` or `ask`: it asks the user itself (FEEDBACK56.md, Part E; branch
+    /// feedback56).
+    pub asks: bool,
 }
 
 /// What some code was found to do (`ToolFacts`' findings, without whose they are).
@@ -1491,6 +1497,7 @@ struct Seen {
     writes: Option<String>,
     open: Option<String>,
     db: bool,
+    asks: bool,
 }
 
 impl Seen {
@@ -1498,6 +1505,7 @@ impl Seen {
     fn join(&mut self, o: &Seen) {
         self.effects |= o.effects;
         self.db |= o.db;
+        self.asks |= o.asks;
         for (mine, theirs) in [(&mut self.uncertain, &o.uncertain), (&mut self.writes, &o.writes), (&mut self.open, &o.open)] {
             if mine.is_none() {
                 mine.clone_from(theirs);
@@ -1511,6 +1519,32 @@ impl Seen {
 struct Reached {
     seen: Seen,
     next: Vec<Next>,
+}
+
+/// A function's code, in the order it runs (`Checker::ordered_fn`): the first change it makes and
+/// the first question it asks, as `quillo check` says them, and the questions it asks after a
+/// change, each at its line (FEEDBACK56.md, Part E; branch feedback56).
+#[derive(Default)]
+struct Ordered {
+    changes: Option<String>,
+    asks: Option<String>,
+    late: Vec<(Arc<str>, u32, String)>,
+}
+
+/// The walk of one function's code in the order it runs.
+struct OrderWalk<'a> {
+    top_lets: &'a HashSet<String>,
+    file: Arc<str>,
+    /// Its parameters and what it binds: a name assigned that is one of these is no program's
+    /// variable.
+    locals: HashSet<String>,
+    /// The first change made so far on the way the walk is on.
+    changed: Option<String>,
+    asks: Option<String>,
+    late: Vec<(Arc<str>, u32, String)>,
+    /// How many loops deep: a loop's body is walked twice, its second turn after its first's
+    /// changes, three deep at most.
+    loops: u32,
 }
 
 /// A name a file uses from another, which it does not `use` (branch feedback19-fixes).
@@ -1657,7 +1691,7 @@ fn check_source_with(src: &str, file: &str, base_dir: &Path, overrides: HashMap<
         if let Some((line, message)) = crate::mcp::unseen_in_block(src) {
             a.diagnostics.push(Diagnostic { file: file.to_string(), line, severity: Severity::Error, message });
         }
-        if let Some((line, message)) = crate::mcp::instructions_warning(file, src, a.tools.len()) {
+        if let Some((line, message)) = crate::mcp::instructions_warning(file, src, &a.tools) {
             a.diagnostics.push(Diagnostic { file: file.to_string(), line, severity: Severity::Warning, message });
         }
     }
@@ -1915,6 +1949,10 @@ struct Checker {
     /// check however many tools reach them, and how many were read (found in review).
     reached_fns: std::cell::RefCell<HashMap<usize, Arc<Reached>>>,
     reached_types: std::cell::RefCell<HashMap<String, Arc<Reached>>>,
+    /// Of each function a tool that asks reaches, in the order its code runs: what it changes
+    /// and asks first, and the questions it asks after a change (FEEDBACK56.md, Part E; branch
+    /// feedback56).
+    ordered: std::cell::RefCell<HashMap<usize, Arc<Ordered>>>,
     walked: std::cell::Cell<usize>,
     /// The parameters' types of the lambda about to be checked, from the
     /// list a builtin gives it: `xs | map((x) => ...)`.
@@ -2069,6 +2107,7 @@ impl Checker {
             service_files: HashMap::new(),
             service_closed: Default::default(),
             reached_fns: Default::default(),
+            ordered: Default::default(),
             reached_types: Default::default(),
             walked: Default::default(),
             hint: None,
@@ -2779,10 +2818,16 @@ impl Checker {
             })
             .flatten()
             .collect();
+        let mut late = Vec::new();
         for it in &order {
             if let Stmt::Fn(d) = &it.stmt {
                 if d.mcp && !d.component && !is_view(d) {
                     let facts = self.tool_facts(d, &it.file, &top_lets);
+                    // A question after a change, in the code of a tool that asks (FEEDBACK56.md,
+                    // Part E; branch feedback56).
+                    if facts.asks {
+                        self.ordered_fn(d, &it.file, &top_lets);
+                    }
                     self.out.tools.push(facts);
                 }
                 // Checked as a service: its server fns too, for the program calling them
@@ -2792,6 +2837,15 @@ impl Checker {
                     self.out.server_fns.push(facts);
                 }
             }
+        }
+        for o in self.ordered.borrow().values() {
+            late.extend(o.late.iter().cloned());
+        }
+        late.sort();
+        // An error: the program does not start with a tool that would act on a yes asked after
+        // the change it made (FEEDBACK56.md, Part E, found in review; branch feedback56).
+        for (file, line, msg) in late {
+            self.diag_at(file, line, Severity::Error, msg);
         }
         self.out.walked = self.walked.get();
     }
@@ -2816,7 +2870,7 @@ impl Checker {
             r.join(&local.seen);
             todo.extend(local.next.iter().cloned());
         }
-        ToolFacts { def: d.clone(), file: file.to_string(), effects: r.effects, uncertain: r.uncertain, writes: r.writes, open: r.open, db: r.db }
+        ToolFacts { def: d.clone(), file: file.to_string(), effects: r.effects, uncertain: r.uncertain, writes: r.writes, open: r.open, db: r.db, asks: r.asks }
     }
 
     /// One function's own code, read once a check.
@@ -2942,6 +2996,36 @@ impl Checker {
                     _ => {}
                 }
             });
+        }
+    }
+
+    /// `ask`'s question, choices and default, where they are written: a question with no text, no
+    /// choice, a choice that is not text, a default that is not one of the choices.
+    fn ask_written(&mut self, args: &[Expr]) {
+        if matches!(&args[0], Expr::Lit(Lit::Str(q)) if q.trim().is_empty()) {
+            self.error("`ask`'s question is empty: say what the user is asked");
+        }
+        let Expr::Map(entries) = &args[1] else { return };
+        if entries.is_empty() {
+            self.error("`ask` has no choices: give one at least, as in { public: \"Everyone\", draft: \"Only me\" }");
+            return;
+        }
+        for (k, v) in entries {
+            if let Expr::Lit(l) = v {
+                if !matches!(l, Lit::Str(_)) {
+                    self.error(format!("`ask`'s choice `{}` is not text: each choice is the text the user reads, under the key `ask` gives", k));
+                }
+            }
+        }
+        // Keys a spread may add are not known.
+        if entries.iter().any(|(k, _)| k.starts_with("...")) {
+            return;
+        }
+        if let Expr::Lit(Lit::Str(d)) = &args[2] {
+            if !entries.iter().any(|(k, _)| k.as_str() == &**d) {
+                let keys: Vec<String> = entries.iter().map(|(k, _)| format!("`{}`", k)).collect();
+                self.error(format!("`ask`'s default {:?} is not one of its choices: {}", &**d, keys.join(", ")));
+            }
         }
     }
 
@@ -3083,6 +3167,10 @@ impl Checker {
         if matches!(name, "db.connect" | "db.shards") {
             note(&mut r.open, format!("`{}` reaches another database", name));
         }
+        // It asks the user: a read, of the user (FEEDBACK56.md, Part E; branch feedback56).
+        if matches!(name, "ask" | "confirm") {
+            r.asks = true;
+        }
         match name {
             "js" | "js_new" | "run_script" => note(&mut r.uncertain, format!("`{}` runs code the checker cannot read", name)),
             // A `select` written in the program reads, as every database reads it; a statement
@@ -3112,6 +3200,236 @@ impl Checker {
         }
         if name.starts_with("http.") || matches!(name, "receive" | "listen") || effect & crate::ast::effect_bit("net") != 0 {
             note(&mut r.open, format!("`{}`", name));
+        }
+    }
+
+    // ---- a tool asks before it changes anything (FEEDBACK56.md, Part E; branch feedback56) ----
+    //
+    // A tool's call that stops to ask runs again from the top with the answer, so what it changed
+    // before the question is changed twice, or acted on before the yes: here an error where the
+    // order can be seen (found in review), and at run time the rounds' database writes are rolled
+    // back at a stop and any other change before a question refused. A change is what viewcache
+    // says acts (but a random number), a statement written in the program that is not a `select`
+    // or calls a function its database does not ship (slice 3's rule), a call of a service or a
+    // site, the program's variable assigned, or a call of the program's function that does one;
+    // code in a lambda given to a call is taken to run during it.
+
+    /// What `d`'s code does in the order it runs, read once a check; a function reached again
+    /// while it is read (recursion) is taken to do nothing more.
+    fn ordered_fn(&self, d: &Arc<FnDef>, file: &Arc<str>, top_lets: &HashSet<String>) -> Arc<Ordered> {
+        if let Some(o) = self.ordered.borrow().get(&def_key(d)) {
+            return o.clone();
+        }
+        self.ordered.borrow_mut().insert(def_key(d), Arc::new(Ordered::default()));
+        let file = d.file.clone().unwrap_or_else(|| file.clone());
+        let locals = d.params.iter().map(|p| p.name.to_string()).collect();
+        let mut w = OrderWalk { top_lets, file, locals, changed: None, asks: None, late: Vec::new(), loops: 0 };
+        for p in &d.params {
+            if let Some(e) = &p.default {
+                self.order_expr(e, &mut w);
+            }
+        }
+        self.order_expr(&d.body, &mut w);
+        let o = Arc::new(Ordered { changes: w.changed, asks: w.asks, late: w.late });
+        self.ordered.borrow_mut().insert(def_key(d), o.clone());
+        o
+    }
+
+    fn order_expr(&self, e: &Expr, w: &mut OrderWalk) {
+        match e {
+            Expr::Lit(_) | Expr::Ident(..) | Expr::Lambda(_) => {}
+            Expr::Template(parts) => parts.iter().for_each(|p| {
+                if let TPart::Expr(x) = p {
+                    self.order_expr(x, w)
+                }
+            }),
+            Expr::List(xs) => xs.iter().for_each(|x| self.order_expr(x, w)),
+            Expr::Map(es) => es.iter().for_each(|(_, x)| self.order_expr(x, w)),
+            Expr::Unary(_, x, _) | Expr::Try(x) | Expr::Field(x, _, _) => self.order_expr(x, w),
+            Expr::Binary(_, a, b, _) | Expr::Coalesce(a, b) | Expr::Index(a, b, _) => {
+                self.order_expr(a, w);
+                self.order_expr(b, w)
+            }
+            // `a | f(b)` is `f(a, b)`, `a` worked out first.
+            Expr::Pipe(a, rhs, line) => {
+                self.order_expr(a, w);
+                match &**rhs {
+                    Expr::Call(c, args, l) => self.order_call(c, Some(a), args, *l, w),
+                    other => self.order_call(other, Some(a), &[], *line, w),
+                }
+            }
+            Expr::Call(c, args, line) => self.order_call(c, args.first(), args, *line, w),
+            // Either way may be the one taken: after it, the change of either.
+            Expr::If(c, a, b) => {
+                self.order_expr(c, w);
+                let ways: Vec<&Expr> = std::iter::once(&**a).chain(b.as_deref()).collect();
+                self.order_ways(&ways, w);
+            }
+            Expr::Match(s, arms, _) => {
+                self.order_expr(s, w);
+                let before = w.changed.clone();
+                let mut after = None;
+                for a in arms {
+                    w.changed = before.clone();
+                    if let Some(g) = &a.guard {
+                        self.order_expr(g, w);
+                    }
+                    self.order_expr(&a.body, w);
+                    after = after.or(w.changed.take());
+                }
+                w.changed = before.or(after);
+            }
+            Expr::For(_, items, body, _) => {
+                self.order_expr(items, w);
+                self.order_loop(&[], body, w);
+            }
+            Expr::While(c, body, _) => self.order_loop(&[c], body, w),
+            Expr::Block(stmts) => {
+                for st in stmts {
+                    match st {
+                        Stmt::Let(p, x, _) => {
+                            self.order_expr(x, w);
+                            let mut names = Vec::new();
+                            pattern_names(p, &mut names);
+                            w.locals.extend(names);
+                        }
+                        Stmt::Assign(n, _, x, _) => {
+                            self.order_expr(x, w);
+                            if w.top_lets.contains(n.as_str()) && !w.locals.contains(n.as_str()) && w.changed.is_none() {
+                                w.changed = Some(format!("assigning the program's variable `{}`", n));
+                            }
+                        }
+                        Stmt::SetField(o, _, _, x, _) => {
+                            self.order_expr(o, w);
+                            self.order_expr(x, w)
+                        }
+                        Stmt::Expr(x) | Stmt::State(_, x, _) | Stmt::Return(Some(x), _) => self.order_expr(x, w),
+                        Stmt::Fn(f) => {
+                            w.locals.insert(f.name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Expr::Reply(st, b, _) => {
+                self.order_expr(st, w);
+                if let Some(b) = b {
+                    self.order_expr(b, w)
+                }
+            }
+            Expr::Html(el, _) => {
+                let mut parts = Vec::new();
+                walk_html_els(el, &mut |e| {
+                    parts.extend(e.id.iter().cloned());
+                    parts.extend(e.classes.iter().cloned());
+                    for (_, v) in &e.attrs {
+                        if let AttrVal::Expr(x) | AttrVal::Spread(x) = v {
+                            parts.push(x.clone());
+                        }
+                    }
+                    for c in &e.children {
+                        if let HtmlChild::Expr(x) = c {
+                            parts.push(x.clone());
+                        }
+                    }
+                });
+                parts.iter().for_each(|x| self.order_expr(x, w));
+            }
+        }
+    }
+
+    /// Ways one of which is taken: each from the change before them, and after them the change of
+    /// any.
+    fn order_ways(&self, ways: &[&Expr], w: &mut OrderWalk) {
+        let before = w.changed.clone();
+        let mut after = None;
+        for x in ways {
+            w.changed = before.clone();
+            self.order_expr(x, w);
+            after = after.or(w.changed.take());
+        }
+        w.changed = before.or(after);
+    }
+
+    /// A loop: its test and body, then again, as a second turn comes after the first's changes.
+    fn order_loop(&self, test: &[&Expr], body: &Expr, w: &mut OrderWalk) {
+        let turns = if w.loops < 3 { 2 } else { 1 };
+        w.loops += 1;
+        for _ in 0..turns {
+            test.iter().for_each(|t| self.order_expr(t, w));
+            self.order_expr(body, w);
+        }
+        w.loops -= 1;
+    }
+
+    /// A call: the receiver, the arguments in order, the lambdas given (taken to run during it),
+    /// then what the call itself does.
+    fn order_call(&self, callee: &Expr, first: Option<&Expr>, args: &[Expr], line: u32, w: &mut OrderWalk) {
+        let module = |o: &Expr| matches!(o, Expr::Ident(m, _) if self.module_named(m) || self.services.contains_key(m.as_str()) || self.sites.contains(m.as_str()));
+        match callee {
+            Expr::Ident(..) => {}
+            Expr::Field(obj, _, _) if module(obj) || matches!(&**obj, Expr::Field(inner, l, _) if l == "later" && module(inner)) => {}
+            Expr::Field(obj, _, _) => self.order_expr(obj, w),
+            Expr::Lambda(_) => {}
+            other => self.order_expr(other, w),
+        }
+        for a in args.iter().filter(|a| !matches!(a, Expr::Lambda(_))) {
+            self.order_expr(a, w);
+        }
+        for a in args {
+            if let Expr::Lambda(d) = a {
+                self.order_expr(&d.body, w);
+            }
+        }
+        if let Expr::Lambda(d) = callee {
+            self.order_expr(&d.body, w);
+        }
+        let (asks, changes) = self.call_does(callee, first, w);
+        if let Some(a) = asks {
+            if let Some(c) = &w.changed {
+                w.late.push((w.file.clone(), line, format!("{} comes after {}: {}", a, c, crate::mcp::ASK_FIRST)));
+            }
+            w.asks.get_or_insert(a);
+        }
+        if let Some(c) = changes {
+            w.changed.get_or_insert(c);
+        }
+    }
+
+    /// What a call does in itself: whether it asks the user, and what it changes, each said.
+    fn call_does(&self, callee: &Expr, first: Option<&Expr>, w: &OrderWalk) -> (Option<String>, Option<String>) {
+        let builtin = |name: &str| -> (Option<String>, Option<String>) {
+            if matches!(name, "ask" | "confirm") {
+                return (Some(format!("`{}`", name)), None);
+            }
+            let acts = crate::viewcache::kind(name) == crate::viewcache::Kind::Acts && builtin_effect(name) != crate::ast::effect_bit("random");
+            let statement = matches!(name, "db.query" | "db.one" | "db.all") && first.and_then(sql_written).is_some_and(|sql| !reads_written(&sql) || crate::sql::foreign_call(&sql).is_some());
+            (None, (acts || statement).then(|| format!("`{}`", crate::native::display_name(name))))
+        };
+        let program = |f: &str| -> (Option<String>, Option<String>) {
+            match self.globals.get(f).and_then(|g| g.sig.as_ref()) {
+                Some(s) if s.builtin || s.native.is_some() => builtin(if s.native.is_some() { s.name.as_str() } else { f }),
+                Some(s) => match &s.def {
+                    Some(d) => {
+                        let o = self.ordered_fn(d, &w.file, w.top_lets);
+                        (o.asks.as_ref().map(|a| format!("`{}`, which asks the user ({}),", f, a)), o.changes.as_ref().map(|c| format!("`{}`, which changes something ({})", f, c)))
+                    }
+                    None => (None, None),
+                },
+                None => (None, None),
+            }
+        };
+        match callee {
+            Expr::Ident(n, _) if w.locals.contains(n.as_str()) => (None, None),
+            Expr::Ident(n, _) => program(n),
+            Expr::Field(obj, f, _) => match &**obj {
+                Expr::Ident(m, _) if self.module_named(m) => builtin(&format!("{}.{}", m, f)),
+                Expr::Ident(m, _) if self.services.contains_key(m.as_str()) || self.sites.contains(m.as_str()) => (None, Some(format!("`{}.{}`, a call of another program", m, f))),
+                Expr::Field(inner, later, _) if later == "later" && matches!(&**inner, Expr::Ident(m, _) if self.services.contains_key(m.as_str())) => (None, Some(format!("`{}`, a call of another program", f))),
+                _ if !w.locals.contains(f.as_str()) => program(f),
+                _ => (None, None),
+            },
+            _ => (None, None),
         }
     }
 
@@ -5902,6 +6220,11 @@ impl Checker {
                     None => {}
                 }
             }
+            // `ask(question, choices, default)` with its choices written: what it refuses as it
+            // runs (FEEDBACK56.md, Part E; branch feedback56).
+            if n == "ask" && args.len() == 3 && !self.is_local(n) && self.globals.get(n.as_str()).map_or(false, |v| &*v.file == "<builtin>") {
+                self.ask_written(args);
+            }
         }
         // `x.f(args)`: a function stored in map x, or `f(x, args)`.
         if let Expr::Field(obj, name, _) = callee {
@@ -7112,6 +7435,10 @@ impl Checker {
             if sig.builtin && BROWSER_ONLY_SERVER.contains(&sig.name.as_str()) && !public {
                 let hint = if sig.name == "env" { " (or name the variable PUBLIC_..., which says the browser may see it)" } else { "" };
                 self.error(format!("`{}` is not available in the browser, where <{}> also runs; use a `server fn`{}", sig.name, c, hint));
+            }
+            // A tool's question is not the page's (FEEDBACK56.md, Part E; branch feedback56).
+            if sig.builtin && sig.name == "ask" && arg_exprs.len() >= 3 {
+                self.error(format!("{} in <{}>", crate::client::ASK_IN_A_PAGE, c));
             }
             if let Some(f) = &sig.native {
                 let f = f.rsplit('/').next().unwrap_or(f).to_string();

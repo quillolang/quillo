@@ -2013,6 +2013,11 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
     }
     no_tx_control(&scan, "db.exec", line)?;
     it.wrote_req = Some(crate::httpd::request_number());
+    // A write in a tool's call that may ask: undone by a stop only in the call's transaction
+    // (FEEDBACK56.md, Part E, found in review; branch feedback56).
+    if it.asking.is_some() {
+        crate::mcp::wrote_on(it, Arc::as_ptr(&b) as usize);
+    }
     let params = match given_values(&scan, args[1..].to_vec()) {
         Ok(p) => p,
         Err(e) => return Ok(db_err(e)),
@@ -2261,6 +2266,10 @@ fn exec_many(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Ok(b) => b,
         Err(e) => return Ok(db_err(e)),
     };
+    // (FEEDBACK56.md, Part E, found in review; branch feedback56.)
+    if it.asking.is_some() {
+        crate::mcp::wrote_on(it, Arc::as_ptr(&b) as usize);
+    }
     let server = !matches!(&*b, Backend::Sqlite(_));
     // Its rows are all or none, in a transaction of its own (FEEDBACK55.md, Q-728).
     if b.is_mysql() {
@@ -2749,6 +2758,41 @@ pub(crate) fn call_claim(it: &mut Interp, id: &str, now_ms: i64, forget_before: 
     }
 }
 
+/// An MCP `requestState`'s id taken for its one use, in the table copies of a service share
+/// (`_quillo_calls`): `Some(Ok(true))` taken now, `Some(Ok(false))` taken before, by this process
+/// or another sharing the database; `Some(Err)` where its use cannot be kept (the table cannot be
+/// made, the insert fails and finds no row), which the door takes as a refusal: closed, where
+/// `call_claim` lets a call run. None without a database (FEEDBACK56.md, Part E, found in review;
+/// branch feedback56).
+pub(crate) fn state_claim(it: &mut Interp, id: &str, now_ms: i64, forget_before: i64) -> Option<Result<bool, String>> {
+    let on = system_on(it, false)?;
+    if !calls_table(it, on) {
+        return Some(Err("the table _quillo_calls could not be made".into()));
+    }
+    if fastrand::u8(..) == 0 {
+        let _ = exec_on(it, on, vec![Value::str("delete from _quillo_calls where at < ?"), Value::Int(forget_before)]);
+    }
+    let sql = "insert into _quillo_calls (id, at, status, answer) values (?, ?, 0, '')";
+    let why = match exec_on(it, on, vec![Value::str(sql), Value::str(id), Value::Int(now_ms)]) {
+        Ok(Value::Map(_)) => return Some(Ok(true)),
+        Ok(Value::Err(e, _, _)) => e.display(),
+        Ok(other) => other.repr(),
+        Err(Ctrl::Error(e)) => e.msg.clone(),
+        Err(_) => "the statement was stopped".into(),
+    };
+    match query_on(it, on, vec![Value::str("select status from _quillo_calls where id = ?"), Value::str(id)]) {
+        Ok(Value::List(rows)) if !rows.is_empty() => Some(Ok(false)),
+        _ => Some(Err(format!("its id could not be kept in _quillo_calls: {}", why))),
+    }
+}
+
+/// The address of the database `on` names (None: the program's, the request's tenant's), where
+/// one opens: how the MCP door tells its transaction's database from another (FEEDBACK56.md, Part
+/// E, found in review; branch feedback56).
+pub(crate) fn backend_key(it: &mut Interp, on: Option<usize>) -> Option<usize> {
+    backend_on(it, on).ok().map(|b| Arc::as_ptr(&b) as usize)
+}
+
 /// The answer to a call this copy claimed; one that did not finish is let
 /// go, to be sent again (FEEDBACK23.md, Q-184; branch feedback23-fixes).
 pub(crate) fn call_done(it: &mut Interp, id: &str, status: u16, answer: &str) {
@@ -2779,6 +2823,14 @@ fn select_in(
 ) -> Result<Vec<Value>, String> {
     if it.writes_noted() && !only_reads(scan) && it.no_writes("SQL that writes", 0).is_err() {
         return Err(crate::interp::PREFETCH_REFUSED.into());
+    }
+    // In a tool's call that may ask: a statement that writes, or calls a function its database
+    // does not ship (`select archive_old()`, which may write), is a change, undone by a stop only
+    // in the call's transaction; and it goes to the primary (FEEDBACK56.md, Part E, found in
+    // review; branch feedback56).
+    if it.asking.is_some() && (!only_reads(scan) || crate::sql::foreign_call(&sql).is_some()) {
+        it.wrote_req = Some(crate::httpd::request_number());
+        crate::mcp::wrote_on(it, Arc::as_ptr(&b) as usize);
     }
     let params = given_values(scan, params)?;
     // Refused before a replica would take it (found in review).

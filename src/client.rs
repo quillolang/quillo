@@ -43,6 +43,10 @@ fn version_line() -> String {
 /// named after the `.qwe` file it is in, with a source map to its lines.
 pub static DEV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `ask` with three arguments in a page's code: a tool's question, asked by an AI client, is not
+/// the page's dialog (FEEDBACK56.md, Part E; branch feedback56).
+pub const ASK_IN_A_PAGE: &str = "`ask(question, choices, default)` is a tool's question to its user, asked by the AI client (`fn mcp`); a page asks yes or no with `ask(message, options)`";
+
 /// Builtins that also exist in the browser.
 const CLIENT_BUILTINS: &[&str] = &[
     "print", "str", "int", "float", "dec", "len", "type_of", "upper", "lower", "normalize", "local_path", "trim", "filled", "split", "join", "contains",
@@ -4242,6 +4246,11 @@ impl<'a> Compiler<'a> {
         // call refused, as on the server.
         if let Some(msg) = f.strip_prefix("B.").and_then(|b| too_many(b, argv.len())) {
             return Ok(format!("W.fail({}, {})", js_str(&msg), argv.join(", ")));
+        }
+        // A tool's question, refused as it runs, where the dialog would have answered yes or no
+        // to it (FEEDBACK56.md, Part E; branch feedback56).
+        if f == "B.ask" && argv.len() >= 3 {
+            return Ok(format!("W.fail({}, {})", js_str(ASK_IN_A_PAGE), argv.join(", ")));
         }
         let call = if f.starts_with("B.") || f.starts_with("G[") {
             format!("{}({})", f, argv.join(", "))

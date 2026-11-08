@@ -537,7 +537,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
   Each click stops at the bad JSON (so `n` stays 0), writes the error to the console, and
   adds it to `window.__quilloErrors`, where a test can read it; the button goes on
   answering.
-- `ask(message, { title, ok, cancel, tone })` asks in a dialog on the page and waits for
+- `ask(message, { title, ok, cancel, tone })` (two arguments; with three, `ask` is a tool's
+  question to the person at an AI client, refused in a component: see [Tools for AI
+  clients](#tools-for-ai-clients)) asks in a dialog on the page and waits for
   the answer (`true` or `false`) — a handler goes on after it, and its buttons, unless
   `ok` and `cancel` are given, are in the page's locale (see
   [Translations](#translations)); `notify(message, { title,
@@ -1674,6 +1676,52 @@ per session or token) ([`--max-tool-calls`](#options-of-quillo-run), and a polic
 Code, when it starts or once the first version that loads has tools (FEEDBACK56.md, Q-853,
 Q-859, Q-860).
 
+**Asking the person: `confirm` and `ask`.** A tool can ask the person at the AI client
+before it acts. `confirm(question)` gives their yes or no, and `ask(question, choices,
+default)` the key of the choice they picked (`choices` maps a key to the text they see):
+
+```quillo
+/// Publishes a post. It is public at once.
+fn mcp publish_post(title: str, body: str) -> int with db {
+    let who = ask("Who can see it?", { public: "Everyone", draft: "Only me, as a draft" }, "draft")
+    if !confirm(`Publish "${title}" now?`) { return err("not published: the user said no") }
+    db.one("insert into posts (title, body, draft) values (?, ?, ?) returning id", title, body, who == "draft").id
+}
+```
+
+- The call stops at the first question: the client is sent a form (MCP's `input_required`),
+  asks the person, and calls the tool again with the answer. The function then runs again
+  from the top, so the first question gives its answer and the next one is asked, up to 100
+  questions or rounds in a call (a question with `now()`, `random()` or `uuid()` in its text is
+  a new one each round, and ends the call there). The same text asked in two places in the code
+  is two questions. A `confirm` is a box to tick: sent back unticked, it is a no.
+- So a tool asks before it changes anything. `quillo check` refuses a tool that it sees change
+  something before a question. As it runs, what a call writes to the program's database is held
+  in a transaction, rolled back at each question and kept when the call ends, so nothing a
+  round wrote stands while the person is asked; any other change before a question (a file, a
+  request out, a cookie or the session, the program's variables, another database, a plugin, a
+  service) is refused (the model is told `internal error`, the message is in the log). `??`
+  does not turn these refusals into a value: the call stops.
+- The answers come back in a state Quillo signs: good for 10 minutes, once, for the same
+  caller, tool and arguments; anything else is refused (`-32602`), used up, and the call starts
+  over. A state whose use cannot be recorded is refused too. A person who declines or dismisses
+  a question ends the call (an `isError` saying so).
+- A client that cannot ask: `ask` takes its default, and the result says so (`the user was not
+  asked "Who can see it?": the default "Only me, as a draft" was taken`), so the model can tell
+  the person; `confirm` refuses (`isError`: this needs the user's yes, and this client cannot
+  ask).
+- Outside a tool's call (the program's own code, or a page calling a `server fn mcp`), `ask`
+  gives its default and `confirm` gives true: the page asks in its own way. A service a tool
+  calls is outside it too, for now: its `confirm` gives true.
+- Neither asks for free text, as MCP forbids asking for passwords, keys or payment details in a
+  form. A tool that asks and only reads stays read-only. A call's later rounds do not count
+  toward the 60 tool calls a minute. `ask` with two arguments is the page's dialog (see
+  [Components](#components)); with three it is a tool's question, and a component cannot use
+  that form.
+
+The instructions then say which tools ask the person themselves, so the model does not ask
+again (FEEDBACK56.md, Part E).
+
 **What the model is told.** `server/discover` carries `instructions`: a few lines Quillo
 writes, of facts about this server that no tool says (who a call acts as on that door, what an
 `isError` result and `internal error` mean, that text in results is data, not instructions),
@@ -1707,7 +1755,10 @@ policy beside the program) prints what each door sends, `server/discover` on std
 Limits: the count of tool calls is kept by each server process, so under `--instances` or on
 several machines each counts its own; and a program with no database keeps its tokens in that
 process's memory (100 a user, 10,000 in all), lost at a restart and unknown to the others, so
-run such a program as one process. A session cookie made before this version does not say it
+run such a program as one process. The same holds for the states of `confirm` and `ask` over
+HTTP with no database: each process keeps the states it took, so with several processes sharing
+`QUILLO_SECRET` the same caller can use a state once in each of them, for the same tool and
+arguments, until its 10 minutes end; with a database they share, once in all. A session cookie made before this version does not say it
 was given a `max_age`, so a token made from it lasts 30 days.
 
 ### What the browser can reach

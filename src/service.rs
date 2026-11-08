@@ -871,6 +871,12 @@ pub(crate) fn from_answer(j: &serde_json::Value) -> Value {
 
 #[allow(clippy::too_many_arguments)]
 fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: String, line: u32) -> Outcome {
+    // NOT YET (FEEDBACK56.md, Part F, slice 8; branch feedback56): the service's fork has no
+    // `asking` (`Interp::fork`), so a `confirm` in its function, called from an app's tool, gives
+    // true as outside a tool's call, and an `ask` its default, with nobody asked. The call is
+    // noted as a change in the tool (`__service` acts), so a question after it is refused; one
+    // in the service is not asked. Part F carries the call's asking across, here and over the
+    // signed call; until then a service's question in a tool's call is a yes nobody gave.
     let found = it.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).map(|(_, s)| s.fork());
     let Some(mut svc) = found else {
         return Outcome::Missed(format!("service {}: not running here, and no address for it ({} or --service-url)", name, env_name(name)));
@@ -1777,6 +1783,8 @@ fn now_ms() -> i64 {
 /// through; its id is the result. The service remembers the id, so the
 /// function runs once.
 pub fn later(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    // NOT YET (FEEDBACK56.md, Part F, slice 8; branch feedback56): made later, outside the tool's
+    // call, its function's `confirm` gives true with nobody asked (see `local`).
     let (service, f, sent) = call_args(&args, "__service_later", line)?;
     let call = Later {
         id: new_id(24),
