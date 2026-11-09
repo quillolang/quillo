@@ -264,7 +264,9 @@ fn nothing_here() = db.query("select * from none").a.b
     let call = |it: &mut Interp, name: &str, key: &str| request(it, &format!("/_quillo/rpc/{}", name), &[("Content-Type", "application/json"), ("Idempotency-Key", key)], b"[]");
     says(call(&mut it, "pay", "a"), 200, r#"{"ok":"paid"}"#);
     says(call(&mut it, "refuses", "b"), 200, r#"{"err":"#);
-    says(call(&mut it, "fails", "c"), 500, "internal error in `fails`");
+    // Under `--watch` (as here) it says why, through `idempotent` too (FEEDBACK64.md, Q-933; branch
+    // feedback64: it had said only "internal error in `fails`" here too).
+    says(call(&mut it, "fails", "c"), 500, "error has no field `a`\\n  in nothing_here, called at ");
     says(call(&mut it, "answers", "d"), 201, "made");
     says(call(&mut it, "replies", "e"), 202, "early");
     // Each is given again.

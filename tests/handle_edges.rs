@@ -353,11 +353,13 @@ server fn gives_err() -> int ! str = err("no")
     );
     says(call(&mut it, "made", "[]"), 201, "made");
     says(call(&mut it, "early", "[]"), 202, "early");
-    says(call(&mut it, "fails", "[]"), 500, "internal error in `fails`");
+    // Under `--watch` (as here) it says why, as a route's page does (FEEDBACK64.md, Q-933; branch
+    // feedback64: it had said only "internal error in `fails`" here too).
+    says(call(&mut it, "fails", "[]"), 500, "division by zero\\n  in fails");
     says(call(&mut it, "gives_err", "[]"), 200, r#"{"err":"#);
     says(live(&mut it, "made", "[]", &[]), 201, "made");
     says(live(&mut it, "early", "[]", &[]), 202, "early");
-    says(live(&mut it, "fails", "[]", &[]), 500, "internal error in `fails`");
+    says(live(&mut it, "fails", "[]", &[]), 500, "division by zero\\n  in fails");
     says(live(&mut it, "gives_err", "[]", &[]), 200, r#""err":"#);
 }
 
