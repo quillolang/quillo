@@ -69,6 +69,8 @@ fn two_statements_with_values_are_refused_as_elsewhere() {
     refused(&mut it, "db.query(\"select 1 as a; select 2 as b\")");
     refused(&mut it, "db.exec(\"insert into kids (parent, name, age) values (?, 'x', 7); delete from kids\", 1)");
     refused(&mut it, "db.one(\"select 1 as a; select * from nowhere\")");
+    // Said so, as the other databases do.
+    assert_eq!(eval(&mut it, "db.query(\"select 1 as a; select 2 as b\").error"), "\"db: the SQL has more than one statement: a query, or db.exec given values, runs one (db.exec of the text alone, without values, runs them all)\"");
     // Nothing of a refused one ran.
     assert_eq!(eval(&mut it, "db.one(\"select count(*) as n from kids where name = 'x'\").n"), "0");
     // One statement, however it ends.

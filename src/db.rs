@@ -1432,11 +1432,24 @@ fn bind(stmt: &mut rusqlite::Statement, params: &[Value]) -> Result<(), String> 
     Ok(())
 }
 
+/// What SQLite's statement could not be made for, said: SQL of more than one statement, for a
+/// query or a `db.exec` given values, as PostgreSQL and MySQL refuse it too (rusqlite 0.41; it
+/// had run the first and dropped the rest without a word, 2026-11-09).
+fn prepare_error(e: rusqlite::Error) -> String {
+    match e {
+        rusqlite::Error::MultipleStatement => MORE_THAN_ONE.to_string(),
+        e => e.to_string(),
+    }
+}
+
+/// See `prepare_error`.
+pub(crate) const MORE_THAN_ONE: &str = "the SQL has more than one statement: a query, or db.exec given values, runs one (db.exec of the text alone, without values, runs them all)";
+
 pub(crate) fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
     // Compiled once and kept, as a statement made again and again is (a row read by its key per
     // request, an insert in a loop): faster than Python's sqlite3 there too (branch
     // feedback40-43).
-    let mut stmt = conn.prepare_cached(sql).map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare_cached(sql).map_err(prepare_error)?;
     bind(&mut stmt, params)?;
     let mut rows = stmt.raw_query();
     let mut out = Vec::new();
@@ -1997,7 +2010,7 @@ fn sqlite_exec(c: &Connection, scan: &crate::sql::Scan, sql: &str, params: &[Val
             run(&mut stmt)?;
         }
     } else {
-        let mut stmt = c.prepare_cached(sql).map_err(|e| e.to_string())?;
+        let mut stmt = c.prepare_cached(sql).map_err(prepare_error)?;
         bind(&mut stmt, params)?;
         run(&mut stmt)?;
     }

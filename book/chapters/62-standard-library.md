@@ -1065,8 +1065,9 @@ updated, an `update`. PostgreSQL has no such id, so it is always `null` there: w
 statement in it (`""`, only spaces or comments) is an error value, on all three, from
 `db.exec`, `db.query` and `db.one` alike.
 
-**One statement, or several.** With values, `db.exec` runs one statement: on SQLite what
-follows the first `;` is ignored, on PostgreSQL it is an error. Without values the whole
+**One statement, or several.** A query (`db.query`, `db.one`), and `db.exec` given values,
+run one statement: SQL with more after its first `;` is an error, on all three databases
+(SQLite had run the first and ignored the rest until 0.8.1). Without values the whole
 text runs, statement by statement (a seed file: `db.exec(read_file("seed.sql"))`), and
 `changes` is the last one's. The text is split where the database would split it: a
 function's, procedure's or trigger's body (`$$ ... $$`, `begin ... end`), a `do` block and
