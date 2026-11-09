@@ -68,12 +68,18 @@ impl Logged {
 }
 
 fn serve(d: &Path, wait: u64) -> Logged {
+    serve_with(d, wait, &[])
+}
+
+/// `serve` with options of `quillo run`'s.
+fn serve_with(d: &Path, wait: u64, opts: &[&str]) -> Logged {
     let port = support::free_port();
     let log = d.join("server.log");
     let child = quillo()
         .arg("run")
         .arg(d.join("main.qwe"))
         .args(["--port", &port.to_string(), "--no-check"])
+        .args(opts)
         .env("QUILLO_SECRET", "test secret for the tests")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -372,7 +378,9 @@ fn a_stop_during_a_plugins_call_is_not_called_a_bug() {
         return;
     }
     let d = dir("slow", &[("main.qwe", PLUGIN_USER), ("edges.qwer", PLUGIN)]);
-    let s = serve(&d, 600);
+    // `--drain`: without a time, a stop waits for the call (the user's graceful stop, 2026-11-09;
+    // branch feedback56). Before, 10 s was the default.
+    let s = serve_with(&d, 600, &["--drain", "10s"]);
     let port = s.port;
     let asked = std::thread::spawn(move || send(port, "GET", "/slow?ms=14000", &[], ""));
     std::thread::sleep(Duration::from_millis(1500));

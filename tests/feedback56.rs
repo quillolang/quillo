@@ -2967,6 +2967,38 @@ fn c1_the_end_of_stdin_and_sigterm_end_it() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// A stop waits for the call in progress however long it takes, saying so every 5 s, unless
+/// `--drain` gives it a time (the user's graceful stop, 2026-11-09; branch feedback56). Before, the
+/// call was cut off at 10 s.
+#[cfg(unix)]
+#[test]
+fn c1_a_stop_waits_for_a_call_past_ten_seconds_unless_drain_gives_a_time() {
+    let d = door_dir("drain");
+    let term = |door: &Stdio| unsafe { libc::kill(door.pid() as i32, libc::SIGTERM) };
+    let mut door = Stdio::start(&d, &["main.qwe"]);
+    door.send(&call_line("wait", json!({ "ms": 11000 })));
+    door.says("waiting");
+    term(&door);
+    door.says("quillo: still answering the call in progress (again to stop now)");
+    let a = door.next_within(Duration::from_secs(20)).expect("the call in progress was not answered");
+    assert_eq!(a["result"]["structuredContent"], json!({ "result": 11000 }), "{}", a);
+    assert_eq!(door.ended(), Some(0));
+    assert!(!door.stderr().contains("stopping with a call in progress"), "{}", door.stderr());
+    // With a time: cut off then.
+    let mut door = Stdio::start(&d, &["main.qwe", "--drain", "1s"]);
+    door.send(&call_line("wait", json!({ "ms": 6000 })));
+    door.says("waiting");
+    let at = Instant::now();
+    term(&door);
+    assert_eq!(door.ended(), Some(0));
+    assert!(at.elapsed() < Duration::from_secs(3), "{:?}", at.elapsed());
+    assert!(door.stderr().contains("quillo: stopping with a call in progress"), "{}", door.stderr());
+    assert!(door.next_within(Duration::from_millis(200)).is_none());
+    // A time it cannot read: not started.
+    assert_eq!(mcp_exits(&d, &["main.qwe", "--drain", "soon"]).0, Some(2));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 #[test]
 fn c1_a_program_that_does_not_check_does_not_start() {
     // An error `quillo check` finds: the door does not start, and stdout is empty.
@@ -3000,10 +3032,11 @@ fn c1_a_program_that_does_not_check_does_not_start() {
     door.close();
     assert_eq!(door.ended(), Some(0));
     assert!(door.stderr().contains("quillo: main.qwe has no tools: a function is one when it is declared `fn mcp name(...)`"), "{}", door.stderr());
-    // `run`'s options about serving are not `mcp`'s.
+    // `run`'s options about serving are not `mcp`'s (`--drain` is: the user's graceful stop,
+    // 2026-11-09; branch feedback56).
     for (args, said) in [
-        (&["main.qwe", "--port", "1"][..], "quillo: `--port` is not for `quillo mcp`, which serves no routes: it takes --env-file, --policy, --allow-path and --no-build\n"),
-        (&["--watch", "main.qwe"], "quillo: `--watch` is not for `quillo mcp`, which serves no routes: it takes --env-file, --policy, --allow-path and --no-build\n"),
+        (&["main.qwe", "--port", "1"][..], "quillo: `--port` is not for `quillo mcp`, which serves no routes: it takes --env-file, --policy, --allow-path, --no-build and --drain\n"),
+        (&["--watch", "main.qwe"], "quillo: `--watch` is not for `quillo mcp`, which serves no routes: it takes --env-file, --policy, --allow-path, --no-build and --drain\n"),
         (&["main.qwe", "--bogus"], "quillo: unknown option `--bogus` for `mcp`\n"),
         (&["main.qwe", "--env-fil", "x"], "quillo: unknown option `--env-fil` for `mcp` (did you mean `--env-file`?)\n"),
         (&["main.qwe", "other.qwe"], "quillo: unknown argument `other.qwe`: `mcp` takes one program; its own arguments go after `--`\n"),
@@ -3036,7 +3069,8 @@ fn c1_the_settings_and_the_programs_arguments() {
     // `help` lists it; a misspelling is told it; `-h` is the usage, on stdout.
     let (ok, out, _) = quillo(&d, &["help"]);
     assert!(ok && out.contains("\n  quillo mcp <file.qwe> [options]   serve the program's tools (`fn mcp`) to an AI\n"), "{}", out);
-    assert!(out.contains("\n`mcp` takes --env-file, --policy, --allow-path, --no-build and `-- a b`."), "{}", out);
+    // `--drain` too (the user's graceful stop, 2026-11-09; branch feedback56).
+    assert!(out.contains("\n`mcp` takes --env-file, --policy, --allow-path, --no-build, --drain and `-- a b`."), "{}", out);
     let (ok, _, err) = quillo(&d, &["mcps", "main.qwe"]);
     assert!(!ok && err.contains("unknown command `mcps` (did you mean `mcp`?)"), "{}", err);
     let (ok, out, err) = quillo(&d, &["mcp", "-h"]);

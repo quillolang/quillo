@@ -93,6 +93,15 @@ pub(crate) fn take_made() -> Option<Pending> {
 /// What `send` says when the client is gone, ending the function.
 const GONE: &str = "the client went away";
 
+/// A stream's `sleep` ended by a stop: the stream ends there as at its next `send`, quietly, as a
+/// client gone does, so that a stream sending now and then does not hold a stop until it wakes
+/// (the user's graceful stop, 2026-11-09; branch feedback56). None outside a stream.
+pub(crate) fn ended_by_stop(it: &mut crate::interp::Interp, line: u32) -> Option<R> {
+    let out = it.stream_out.as_mut()?;
+    out.gone = true;
+    Some(fail(line, GONE))
+}
+
 fn response(args: &[Value], name: &str, events: bool, line: u32) -> R {
     let f = match args.first() {
         Some(f @ (Value::Func(_) | Value::Builtin(..))) => f.clone(),

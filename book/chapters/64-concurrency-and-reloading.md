@@ -113,9 +113,11 @@ What a reload keeps, and what it starts afresh:
   `.quillo/native/` builds, and sessions signed with `QUILLO_SECRET`. Globals, the
   memory of calls a service answered, the live cache and channels start empty.
 - There is no handing a port from one process to the next: a new `quillo` binary means
-  a stop (requests in progress finish, up to 10 s) and a start, during which the port
-  answers nothing. For no gap, run two servers behind limer ([`--register`](#options-of-quillo-run); `/_quillo/health`
-  says 503 as soon as one starts stopping) and restart them one at a time. Two programs
+  a stop (requests in progress finish, however long they take unless [`--drain`](#options-of-quillo-run) gives a
+  time) and a start, during which the port
+  answers nothing. For no gap, run two servers behind limer ([`--register`](#options-of-quillo-run); one that starts
+  stopping leaves the pool, and its port refuses connections, which a health check sees as
+  down) and restart them one at a time. Two programs
   cannot share a port: `mount` or `service /prefix` them in one. A new binary whose Rust
   glue changed builds the program's Rust files again: run `quillo build` with it as part
   of the deploy, before the restart (see [Rust](#rust)). While an old and a new copy
@@ -124,17 +126,36 @@ What a reload keeps, and what it starts afresh:
 
 ## Stopping and health
 
-The first Ctrl-C or `SIGTERM` stops the server gracefully: it takes no new connections,
-closes idle ones, answers the requests in progress (for up to 10 seconds) and exits with
-status 0. A server that joined a pool with [`--register`](#options-of-quillo-run) (see [Several
-servers](#several-servers)) leaves it first, so limer stops
-sending it requests. A second Ctrl-C stops it at once. It stops the same when its stderr
+The first Ctrl-C or `SIGTERM` (`kill <pid>`) stops the server gracefully: it takes no new
+connections (its port refuses them at once, even while a request holds the server
+computing), closes idle ones, answers every request in progress, however long it takes, so
+that a transaction under way commits whole, finishes sending the large files being sent
+(a download), and exits with status 0. An answer given
+meanwhile closes its connection and says so (`connection: close`), so the client sends its
+next request elsewhere. Every 5 s it says what it still waits for:
+
+```
+quillo: stopping once the requests in progress are answered (again to stop now)
+quillo: still answering GET /pay (rid 01HF3K...), 1 file being sent (again to stop now)
+```
+
+[`--drain 30s`](#options-of-quillo-run) gives the stop a time: what still runs then is cut off, its
+transaction rolled back, and said: `quillo: stopped with GET /pay still running`, or, for a
+request that holds its instance then (computing, or waiting inside a SQLite transaction),
+`quillo: stopping with requests in progress: GET /pay (rid 01HF3K...)`. Without
+it, a request that never ends holds the stop until a second Ctrl-C, or until whatever runs
+the server gives up on its own: systemd sends SIGKILL after 90 s (`TimeoutStopSec`), Docker
+after 10 s (`docker stop -t`), Kubernetes after 30 s (`terminationGracePeriodSeconds`), so
+give `--drain` a little less than that time to have the cut said. A server that joined a
+pool with [`--register`](#options-of-quillo-run) (see [Several servers](#several-servers)), or a copy that joined its app with
+[`--join`](#options-of-quillo-run), leaves it first, so it is sent no more requests. A second Ctrl-C stops it at once. It stops the same when its stderr
 goes into a pipe that has closed (a `tee` or a log shipper that ended): Quillo's own
 messages are then dropped, and never keep it from stopping.
 
 `GET /_quillo/health` answers `200` (`ok`) while the server is ready for requests, and
-`503` (`unavailable`) while it is stopping or its program failed to load: give it to a
-load balancer's health check (limer's `health_uri`). `GET /_quillo/ready` also says
+`503` (`unavailable`) while its program failed to load, or, asked on a connection open
+before a stop, while it is stopping (a new connection is refused then): give it to a load
+balancer's health check (limer's `health_uri`). `GET /_quillo/ready` also says
 whether what the program needs is there: `{ "ready": true, "checks": { "database":
 "ready", "service billing": "ready", "ledger": "not ready" } }`, 200 or 503, its
 database (`select 1`), each service it declares (see [Services](#services)) and the
@@ -178,8 +199,12 @@ Without the switch, the address says how to turn it on: `"how": "off: run with
 token"`.
 
 A second Ctrl-C, or a second `SIGTERM`, exits at once with status 130. Stopping also
-stops the commands run with [`--with`](#options-of-quillo-run), and a stream's `send` fails once the server is
-stopping, so a long stream ends.
+stops the commands run with [`--with`](#options-of-quillo-run), and a stream's `send` fails, and its `sleep`
+ends, once the server is stopping (but in a transaction, which finishes), so a long stream ends
+as when its client goes away. Pages waiting for live data stay connected while the stop
+waits, are let go as the server exits, and connect to the next server. Scheduled jobs and calls
+made later start no more: one running finishes (its `sleep` ends it), and calls made later
+not yet run wait in the database for the next start.
 
 ## Scheduled jobs
 
@@ -252,8 +277,8 @@ waiting for 03:00, give it `"10s"` while you work on it.
   alternatives, and say nothing. Nobody outside the server can start one.
 - A job that runs for ever (a loop with `sleep` in it) is told to end when the server
   stops, and when [`--watch`](#options-of-quillo-run) (`quillo run main.qwe --watch`) loads the program again: its `sleep` ends the job, so a
-  new version never runs beside the old one (a tick's too; a request's `sleep` is waited
-  out, since requests in progress are answered). A job still running when it is due again
+  new version never runs beside the old one (a tick's too, and at a stop a stream's; a
+  request's `sleep` is waited out, since requests in progress are answered). A job still running when it is due again
   is said once in the log, not each time.
 - A service's jobs run with the app's when the service shares its process
   (`POST /_quillo/job/game~end_round` in the log), and in the service's own process

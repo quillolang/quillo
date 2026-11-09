@@ -85,6 +85,7 @@ options for `run`:
   --no-build     load the .qwer libraries .quillo holds, as plugins.lock names them; never run cargo
   --instances N  run the program N times over, each on a core of its own
   --max-compute 2s  end a request that computes this long without letting go, as a 500
+  --drain 30s    on a stop, cut off what is still running after this long (default: wait for it all)
   --trust-proxy A,B believe X-Forwarded-For from these addresses or networks
   -- a b         what follows is the program's, for args()
   --allow-path DIR  read_file and write_file may use DIR too, for a script
@@ -164,14 +165,14 @@ options for `run`:
                  $LIMER_ADMIN_SECRET
   --service S    the pool's name (default: the file's name, without .qwe)
 
-`app` takes the options of `run` except --host, --register and --service; its
+`app` takes the options of `run` except --host, --register, --service and --drain; its
 port, by default one the system picks, answers only the window. `--open PATH`
 is the page the window opens on (default /).
 
-`mcp` takes --env-file, --policy, --allow-path, --no-build and `-- a b`. Its
-stdout carries MCP's messages alone: `print` and the log go to stderr, and
+`mcp` takes --env-file, --policy, --allow-path, --no-build, --drain and `-- a b`.
+Its stdout carries MCP's messages alone: `print` and the log go to stderr, and
 `stdin`, `read_line` and `exit` are refused. It ends when stdin closes, or on
-SIGTERM once the call in progress is answered.";
+SIGTERM once the call in progress is answered (with --drain, at most that long).";
 
 // See quillo::alloc.
 #[global_allocator]
@@ -227,7 +228,7 @@ fn main() {
 /// value, not the program.
 const VALUE_OPTIONS: &[&str] = &[
     "--host", "--port", "--listen", "--socket-mode", "--policy", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
-    "--max-body", "--max-compute", "--max-tool-calls", "--allow-path", "--trust-proxy", "--live-per-client", "--max-connections", "--connections-per-client", "--allowed-hosts", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
+    "--max-body", "--max-compute", "--drain", "--max-tool-calls", "--allow-path", "--trust-proxy", "--live-per-client", "--max-connections", "--connections-per-client", "--allowed-hosts", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
     "--scale", "--join", "--with", "--allow-join", "--join-as",
 ];
 
@@ -677,7 +678,7 @@ fn docs(args: &[String]) -> i32 {
 const COMMANDS: &[&str] = &["run", "check", "docs", "build", "fix", "install", "repl", "lsp", "dap", "app", "new", "serve", "classes", "fcgi", "mcp", "version", "help"];
 
 /// The options of `run` that `quillo mcp` takes: those about the program, not about serving it.
-const MCP_OPTIONS: &[&str] = &["--env-file", "--policy", "--allow-path", "--no-build"];
+const MCP_OPTIONS: &[&str] = &["--env-file", "--policy", "--allow-path", "--no-build", "--drain"];
 
 /// `quillo mcp main.qwe`: the program's tools (`fn mcp`, `server fn mcp`) for an AI client on this
 /// machine, which starts it, over stdio (FEEDBACK56.md, C.1; branch feedback56). Checked first and
@@ -690,7 +691,7 @@ fn mcp(file: &str, flags: &[String]) -> i32 {
         let f = flags[i].as_str();
         if !MCP_OPTIONS.contains(&f) {
             if VALUE_OPTIONS.contains(&f) || FLAG_OPTIONS.contains(&f) || f == "-w" {
-                eprintln!("quillo: `{}` is not for `quillo mcp`, which serves no routes: it takes --env-file, --policy, --allow-path and --no-build", f);
+                eprintln!("quillo: `{}` is not for `quillo mcp`, which serves no routes: it takes --env-file, --policy, --allow-path, --no-build and --drain", f);
             } else if f.starts_with('-') {
                 eprintln!("quillo: unknown option `{}` for `mcp`{}", f, nearest(f, MCP_OPTIONS.iter()));
             } else {
@@ -1065,6 +1066,15 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                     return Err(2);
                 }
             },
+            // How long a stop waits for what is in progress; without it, for as long as that
+            // takes (the user's graceful stop, 2026-11-09; branch feedback56).
+            ("--drain", Some(v)) => match compute_limit(v) {
+                Some(ms) => quillo::httpd::limit_drain(ms),
+                None => {
+                    eprintln!("quillo: --drain needs a length of time: 500ms, 30s or 2m");
+                    return Err(2);
+                }
+            },
             // Which copies may join, and where a copy is called (FEEDBACK38.md, Q-459; branch
             // feedback36-39).
             ("--no-join", _) => {
@@ -1364,7 +1374,7 @@ mod with {
     }
 }
 
-/// A length of time for `--max-compute`, in ms.
+/// A length of time for `--max-compute` and `--drain`, in ms.
 fn compute_limit(v: &str) -> Option<u64> {
     let (n, unit) = v.find(|c: char| !c.is_ascii_digit()).map_or((v, ""), |at| v.split_at(at));
     let n: u64 = n.parse().ok().filter(|n| *n > 0)?;
@@ -1473,17 +1483,52 @@ fn install_stop() {
 /// Whether a stop was asked for already: the next one exits at once.
 static STOP_AGAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// A service `--split` started, whose app holds its input (`stop_with_app`).
+static WITH_APP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Its app is gone, or has told it to stop: its input closed.
+static APP_GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Such a service was asked to stop while its app ran: it stops with its app.
+static WAITS_FOR_APP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// A stop asked for: by Ctrl-C or SIGTERM, or for a service `--split` started, by its app
 /// ending (`stop_with_app`).
 fn stop_asked() {
+    use std::sync::atomic::Ordering::SeqCst;
+    // A service `--split` started, signalled while its app runs (systemd signals each process of a
+    // unit at once), stops when its app tells it to, once the app's requests in progress are
+    // answered: they may still call it. Before, it stopped taking calls at once, and those
+    // requests failed (the user's graceful stop, 2026-11-09; branch feedback56).
+    if WITH_APP.load(SeqCst) && !APP_GONE.load(SeqCst) && !quillo::httpd::stopping() {
+        if WAITS_FOR_APP.swap(true, SeqCst) {
+            with::stop_all();
+            std::process::exit(130);
+        }
+        eprintln!("quillo: stopping when the app stops: its requests in progress may still call this service (again to stop now)");
+        return;
+    }
+    // One signal waited for the app already: this is the second.
+    let again = STOP_AGAIN.swap(true, SeqCst) || WAITS_FOR_APP.load(SeqCst);
+    begin_stop(again);
+}
+
+/// A stop begun: at once when `again` (a second signal) or while the program loads; else once the
+/// requests in progress are answered. The app closing a service's input begins it as no signal:
+/// the service's own first signal after it is a first one, which a service with a call in
+/// progress had taken for a second, and ended there (found in review).
+fn begin_stop(again: bool) {
     let stop = STOP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if STOP_AGAIN.swap(true, std::sync::atomic::Ordering::SeqCst) || !stop.serving {
+    if again || !stop.serving {
+        // The services first: `--with`'s commands are waited for (found in review).
+        quillo::service::kill_split_now();
         with::stop_all();
         std::process::exit(130);
     }
     // A message that cannot be written no longer panics (the `eprintln!` above), so the
     // handler goes on to stop the server (FEEDBACK37.md, Q-452; branch feedback36-39).
     eprintln!("quillo: stopping once the requests in progress are answered (again to stop now)");
+    if quillo::httpd::stopping() {
+        return;
+    }
     if let Some(m) = &stop.member {
         m.leave();
     }
@@ -1493,23 +1538,46 @@ fn stop_asked() {
     with::stop_all();
     quillo::httpd::stop();
     // A request computing never comes back to its loop, so the time is kept from here
-    // (FEEDBACK20.md, Q-164; branch feedback20-fixes).
+    // (FEEDBACK20.md, Q-164; branch feedback20-fixes). The stop waits for every request in
+    // progress, saying every 5 s which are still running, unless `--drain` gives it a time
+    // (the user's graceful stop, 2026-11-09; branch feedback56; before, 10 s, then cut off).
     std::thread::spawn(|| {
-        std::thread::sleep(quillo::httpd::DRAIN + std::time::Duration::from_millis(500));
-        eprintln!("quillo: stopping with requests in progress: {}", quillo::httpd::in_progress().join(", "));
-        std::process::exit(0);
+        let began = std::time::Instant::now();
+        let limit = quillo::httpd::drain().map(|d| d + std::time::Duration::from_millis(500));
+        loop {
+            let every = std::time::Duration::from_secs(5);
+            std::thread::sleep(limit.map_or(every, |l| every.min(l.saturating_sub(began.elapsed()))));
+            let mut running = quillo::httpd::in_progress();
+            // The large files being sent from disk too (found in review).
+            match quillo::statics::sending() {
+                0 => {}
+                1 => running.push("1 file being sent".into()),
+                n => running.push(format!("{} files being sent", n)),
+            }
+            if limit.is_some_and(|l| began.elapsed() >= l) {
+                eprintln!("quillo: stopping with requests in progress: {}", running.join(", "));
+                quillo::service::kill_split_now();
+                std::process::exit(0);
+            }
+            if !running.is_empty() {
+                eprintln!("quillo: still answering {} (again to stop now)", running.join(", "));
+            }
+        }
     });
 }
 
 /// A service `--split` started stops when its app ends, whatever way it ends (SIGKILL and a
 /// crash included): the app holds the other end of the service's stdin, which closes then. A
 /// stop under way already goes on as it was asked (found in review of FEEDBACK55.md's Q-807;
-/// branch feedback55).
+/// branch feedback55). The app closes it too once its own requests in progress are answered,
+/// to stop the service as a first SIGTERM does (the user's graceful stop, 2026-11-09; branch
+/// feedback56).
 fn stop_with_app() {
     if std::env::var_os(quillo::service::STOP_WITH_APP).is_none() {
         return;
     }
     std::env::remove_var(quillo::service::STOP_WITH_APP);
+    WITH_APP.store(true, std::sync::atomic::Ordering::SeqCst);
     std::thread::spawn(|| {
         use std::io::Read;
         let mut stdin = std::io::stdin().lock();
@@ -1522,8 +1590,9 @@ fn stop_with_app() {
                 Err(_) => break,
             }
         }
+        APP_GONE.store(true, std::sync::atomic::Ordering::SeqCst);
         if !quillo::httpd::stopping() {
-            stop_asked();
+            begin_stop(false);
         }
     });
 }

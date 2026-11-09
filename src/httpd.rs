@@ -49,12 +49,29 @@ const STACK: usize = 16 << 20;
 const SPARE_STACKS: usize = 256;
 
 /// Set to stop the server gracefully: no new connections, requests being
-/// answered are finished (for up to `DRAIN`), then the loops end.
+/// answered are finished (for up to `--drain`, when it is given), then the loops end.
 static STOPPING: AtomicBool = AtomicBool::new(false);
 /// Every event loop's waker, to tell them when `STOPPING` is set.
 static LOOPS: Mutex<Vec<Arc<Waker>>> = Mutex::new(Vec::new());
-/// How long requests in progress get to finish when the server stops.
-pub const DRAIN: Duration = Duration::from_secs(10);
+/// How long requests in progress get to finish when the server stops, in ms (`--drain`); 0 for
+/// as long as they take, the default: a stop finishes every request and transaction in progress
+/// (the user's graceful stop, 2026-11-09; branch feedback56). Before, 10 s, and what ran longer
+/// was cut off.
+static DRAIN_MS: AtomicU64 = AtomicU64::new(0);
+
+/// `--drain`: how long requests in progress get to finish when the server stops.
+pub fn limit_drain(ms: u64) {
+    DRAIN_MS.store(ms, SeqCst);
+}
+
+/// How long requests in progress get to finish when the server stops: None for as long as they
+/// take.
+pub fn drain() -> Option<Duration> {
+    match DRAIN_MS.load(SeqCst) {
+        0 => None,
+        ms => Some(Duration::from_millis(ms)),
+    }
+}
 
 /// What an event loop is running: when it last resumed a request (ms, 0 when it is waiting).
 /// A watchdog reads these, so that a loop computing is seen from outside it (FEEDBACK20.md,
@@ -408,12 +425,79 @@ pub fn local_as_tcp(s: std::os::unix::net::UnixStream) -> std::net::TcpStream {
     unsafe { std::net::TcpStream::from_raw_fd(s.into_raw_fd()) }
 }
 
-/// Stops the server gracefully (see `STOPPING`).
+/// The descriptor of each event loop's own listener, while it has one (`Listed`).
+#[cfg(unix)]
+static LISTENING: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// A loop's listener, in `LISTENING` until it is closed: dropped before it, so that a descriptor
+/// closed, and then free for another file, is never touched by `stop`.
+struct Listed(#[cfg(unix)] Option<i32>);
+
+impl Listed {
+    fn of(listener: &Option<TcpListener>) -> Listed {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = listener.as_ref().map(|l| l.as_raw_fd());
+            if let Some(fd) = fd {
+                lock(&LISTENING).push(fd);
+            }
+            Listed(fd)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = listener;
+            Listed()
+        }
+    }
+}
+
+impl Drop for Listed {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(fd) = self.0 {
+            lock(&LISTENING).retain(|f| *f != fd);
+        }
+    }
+}
+
+/// Stops the server gracefully (see `STOPPING`). The port takes no new connection from now: an
+/// event loop busy with a request (computing, or waiting in a SQLite transaction) closed its
+/// listener only once it let go, and connections queued meanwhile were reset then, not refused
+/// (the user's graceful stop, 2026-11-09; branch feedback56). In its place is a socket that
+/// listens on nothing, closed with the loop's listener.
 pub fn stop() {
+    // Set under the lock: a loop that sees it closes its listener only once the lock is free,
+    // and takes the stand-in's failing `accept` for the stop it is.
+    #[cfg(unix)]
+    let mut listening = lock(&LISTENING);
     STOPPING.store(true, SeqCst);
+    #[cfg(unix)]
+    for fd in std::mem::take(&mut *listening) {
+        // SAFETY: `fd` is a listener's, open while it is in `LISTENING` (`Listed`), and stays
+        // open, as the new socket: the loop closes it with its listener, as before.
+        unsafe {
+            let none = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            if none >= 0 {
+                libc::dup2(none, fd);
+                libc::close(none);
+            }
+        }
+    }
+    #[cfg(unix)]
+    drop(listening);
+    stop_notice().notify_waiters();
     for w in lock(&LOOPS).iter() {
         let _ = w.wake();
     }
+}
+
+/// Told when the server starts stopping: a wait that a stop ends (a stream's `sleep`) waits on it
+/// too, rather than looking every 50 ms (the user's graceful stop, 2026-11-09; branch feedback56,
+/// found in review). Register (`enable`) before reading `stopping`, so that no stop is missed.
+pub fn stop_notice() -> &'static tokio::sync::Notify {
+    static N: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    N.get_or_init(tokio::sync::Notify::new)
 }
 
 /// Whether the server is stopping.
@@ -869,6 +953,12 @@ pub fn serve_on(apps: Vec<Arc<App>>, listener: Listener, max_waiting: usize) -> 
     for t in others {
         let _ = t.join();
     }
+    // And the large files being sent from disk, each on a thread of its own: a download had been
+    // cut off as the loops ended (the user's graceful stop, 2026-11-09; branch feedback56, found in
+    // review). `--drain`'s time holds here too (main.rs's `stop_asked`).
+    while STOPPING.load(SeqCst) && crate::statics::sending() > 0 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     r
 }
 
@@ -896,6 +986,7 @@ fn run_loop(
         sleeping: AtomicBool::new(false),
         out: AtomicUsize::new(0),
     });
+    let listed = Listed::of(&listener);
     let mut l = Loop {
         app,
         poll,
@@ -917,7 +1008,10 @@ fn run_loop(
         now: Instant::now(),
         chunk: vec![0u8; 16 << 10].into_boxed_slice(),
     };
-    l.run()
+    let r = l.run();
+    drop(listed);
+    drop(l);
+    r
 }
 
 struct Loop {
@@ -1041,9 +1135,14 @@ impl Loop {
                 let since = *draining.get_or_insert(self.now);
                 if let Some(mut l) = self.listener.take() {
                     let _ = self.poll.registry().deregister(&mut l);
+                    #[cfg(unix)]
+                    {
+                        use std::os::fd::AsRawFd;
+                        lock(&LISTENING).retain(|f| *f != l.as_raw_fd());
+                    }
                 }
                 self.close_idle();
-                if self.quiet() || self.now.duration_since(since) >= DRAIN {
+                if self.quiet() || drain().is_some_and(|d| self.now.duration_since(since) >= d) {
                     flush_log();
                     gil.release();
                     return Ok(());
@@ -1082,6 +1181,8 @@ impl Loop {
                 Ok((stream, peer)) => self.adopt(stream, peer),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                // The stand-in `stop` put there listens on nothing.
+                Err(_) if STOPPING.load(SeqCst) => return,
                 Err(e) => {
                     // Out of file descriptors, for one: try again when the
                     // next connection arrives.
@@ -1668,7 +1769,14 @@ fn answer(app: &Arc<App>, worker: &mut Worker, c: &mut Conn, items: Vec<Item>) -
             Item::Request { req, keep_alive, http10 } => {
                 let head = req.method == "HEAD";
                 c.http10 = http10;
-                match worker.answer(app, req, Some(&mut ConnSink(c))) {
+                let answer = worker.answer(app, req, Some(&mut ConnSink(c)));
+                // An answer given while the server stops closes its connection, and says so: the
+                // client kept it, and its next request there was cut off when the drain closed it
+                // a moment later, a reset with no answer (the user's graceful stop, 2026-11-09;
+                // branch feedback56). One sent after it on the connection is not answered, which
+                // `connection: close` tells the client.
+                let keep_alive = keep_alive && !STOPPING.load(SeqCst);
+                match answer {
                     Answer::Streamed { close } => {
                         if close || !keep_alive {
                             c.closing = true;

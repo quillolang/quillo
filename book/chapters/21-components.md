@@ -1634,8 +1634,10 @@ It checks the program (one that does not check does not start), runs its top lev
 (`db.open`, tables), then answers MCP on stdin and stdout, one JSON message a line. Routes are
 not served. Only MCP's messages reach stdout: `print` goes to stderr under `quillo mcp`, and on
 Unix whatever else the program or a plugin writes to stdout goes there too. `stdin`, `read_line`
-and `exit` are errors. It ends when stdin closes, and on SIGTERM. There are no tokens on
-stdio: the person who starts it is the caller.
+and `exit` are errors. It ends when stdin closes, and on SIGTERM: at once while it waits for a
+message, and once the call in progress is answered while it answers one, however long that
+takes, saying so every 5 s (`--drain 30s` cuts the call off after that long; a second SIGTERM
+ends it at once). There are no tokens on stdio: the person who starts it is the caller.
 
 Quillo speaks MCP's revision 2026-07-28 only. A client of the earlier revision, which opens with
 `initialize` (Claude Code before 2.1.319, for one), is told the version is not supported. What a

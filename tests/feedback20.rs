@@ -394,7 +394,9 @@ fn the_limit_needs_a_length_of_time() {
 #[cfg(unix)]
 #[test]
 fn a_stuck_instance_stops_nothing_and_a_signal_ends_it_in_time() {
-    let (mut c, port, log) = started("instances", &["--instances", "2"]);
+    // `--drain`: a stop waits for every request in progress, a stuck one too, unless given a time
+    // (the user's graceful stop, 2026-11-09; branch feedback56). Before, 10 s was the default.
+    let (mut c, port, log) = started("instances", &["--instances", "2", "--drain", "10s"]);
     std::thread::spawn(move || {
         let _ = std::panic::catch_unwind(|| send(port, "GET", "/forever", &[], ""));
     });

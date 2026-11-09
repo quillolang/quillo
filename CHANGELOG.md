@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- A stop (`kill <pid>`, SIGTERM, Ctrl-C) waits for every request and transaction in progress,
+  however long it takes, a large file being sent too, saying every 5 s what it still waits for;
+  `--drain 30s` gives it a time, after which what still runs is cut off (`quillo run` and
+  `quillo mcp`; `quillo app`, which stops with its window, refuses it).
+  Before, 10 s, then cut off. The port refuses new connections at once, even while a request
+  holds the server computing (it had queued them, and reset them later); an answer given while
+  stopping closes its connection and says so (`connection: close`), where the client's next
+  request on it had been reset; a stream's `sleep` ends at a stop as its `send` does, unless it is
+in a transaction. Services
+  `--split` started are no longer killed when the app has answered its own requests: each
+  finishes what it is doing (a call, a call made later, a job) under the app's `--drain`, and
+  the app waits for it. They run in a process group of their own, so a Ctrl-C in the terminal
+  reaches the app alone, and one signalled while its app runs (systemd signals every process of
+  a unit) serves the app until it stops: they had stopped taking calls while the app answered
+  requests that needed them. A second stop ends them with the app, at once (the user's graceful
+  stop, 2026-11-09).
+- `quillo check` warns where an `idempotent` run in its transaction reaches a service's or a
+  site's function that may change data, directly, through the program's functions, or through a
+  service that calls another: that change is outside the transaction, so when its answer is lost
+  the key is given up and the client's retry makes the change again, under a new call id. The
+  warning names `{ transaction: false }` and keying the change by an id the request sends
+  (the user's decision, 2026-11-09: lost answers between services are lived with, and said
+  where they matter).
 - After a panic part way through `db.atomic` on MySQL or MariaDB, a part prepared on the
   connection the panic closed is ended at once on another, as the server allows once it has
   seen the close; before, the server's "unknown XID" was taken as done and the part waited a

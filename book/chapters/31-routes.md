@@ -1031,6 +1031,18 @@ commits: the work and its answer are kept together, or neither is.
   leaves the key running: it is not known whether the work happened, so requests with
   the key get 409 until it expires. Give the provider the same key, if it takes one,
   so that it too makes the payment once.
+- A [service](#services)'s function that changes data is such work too: it commits in the
+  service, not in this transaction. When its answer is lost (the service stopped part way,
+  the network dropped it), the call fails, the transaction rolls back and gives the key up,
+  and the client's retry with it calls the service again, under a new call id, so the
+  service changes its data twice. `quillo check` warns where an `idempotent` run in its
+  transaction reaches such a function, a site's too, directly or through the program's
+  functions, and through a service that calls another: ``main.qwe:6: warning: `idempotent`
+  reaches `billing.charge`, which may change data in another program, outside its
+  transaction: ...``. Give it `{ transaction: false }`, or send an id the service's change
+  is keyed by (`insert ... on conflict do nothing` on an order's id), so that a second run
+  changes nothing. A call made later (`billing.later.charge(...)`) waits in this
+  transaction's database, and is not warned of.
 
 ## Prefetching {#routes-prefetching}
 
@@ -1838,10 +1850,16 @@ answers the same, with billing in a process of its own.
   same again when it is restarted), its log lines marked with its name, all signed with
   one secret (32 random bytes from the system, unless `QUILLO_SERVICE_SECRET` is set,
   so a copy started by hand elsewhere cannot join a split app unless the secret is
-  set); they stop with it (killed, not drained), and when the app's process ends any
-  other way (killed with SIGKILL, a crash), each stops as a first SIGTERM stops it, as
-  the pipe the app holds on its input closes, so none is left serving with its port
-  taken. A service started on its own, by hand or by systemd, serves on. Before any service starts, the app
+  set); they stop with it, after it: once the app has answered its requests in progress,
+  which may still call them, each is told to stop (the pipe the app holds on its input
+  closes) and finishes what it is doing as a first SIGTERM has it (a call, a call made
+  later, a job), under the app's [`--drain`](#options-of-quillo-run), and the app waits for
+  it. They run in a process group of their own, so a Ctrl-C in the terminal reaches the app
+  alone; a service signalled itself while its app runs (systemd stops a unit by signalling
+  each of its processes) says `stopping when the app stops` and serves the app until then.
+  A second Ctrl-C ends them with the app, at once. When the app's process ends any other
+  way (killed with SIGKILL, a crash), each stops as a first SIGTERM stops it, as the pipe
+  on its input closes, so none is left serving with its port taken. A service started on its own, by hand or by systemd, serves on. Before any service starts, the app
   checks the whole tree once, its own files and every service's, and says each warning
   once; an error anywhere stops it there, before anything waits. Each is then started as
   `quillo run <file> --port P --as-service --service-name NAME`, with `--base`, [`--watch`](#options-of-quillo-run),

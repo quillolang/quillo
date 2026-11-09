@@ -517,6 +517,13 @@ impl SendPlace {
     }
 }
 
+/// Large files being sent from disk now, on threads of their own: a stop waits for them, as for
+/// any request in progress (the user's graceful stop, 2026-11-09; branch feedback56, found in
+/// review).
+pub fn sending() -> usize {
+    lock(&SENDING).as_ref().map_or(0, |m| m.values().sum())
+}
+
 impl Drop for SendPlace {
     fn drop(&mut self) {
         if let Some(m) = lock(&SENDING).as_mut() {

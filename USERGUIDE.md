@@ -59,6 +59,7 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | `--no-check` | when the program is known to check (a deploy that ran `quillo check` already) and starting must be quick: skip the static checks |
 | `--max-body N` | when visitors send larger files or bodies than 10MB: the largest request body to accept, a size such as `50MB` (`KB`, `MB` and `GB`, in any case, are 1024-based) or bytes; default 10MB; a larger body gets 413 (see [Uploads](#uploads)) |
 | `--max-compute 2s` *(since 0.7)* | when a request that computes for long must not hold up the others: end one that computes this long without letting go, as a 500 (see [Concurrency](#concurrency-and-reloading)) |
+| `--drain 30s` | when a stop must not wait for ever: cut off what is still running this long after the stop is asked for (500ms, 30s, 2m). Without it, a stop waits for every request in progress, a large file being sent too, however long it takes (see [Stopping and health](#stopping-and-health)); for `run` and `mcp` |
 | `--max-tool-calls 60` | how many tool calls a minute each user of the MCP door may make (60 by default); one more is a `429` with `Retry-After` (see [Tools for AI clients](#tools-for-ai-clients)) |
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64). Give fewer where an account limits its threads (shared hosting), more for many slow calls at once |
 | `--instances N` | to use N cores on one machine: run the program N times over, one event loop each, each with its own variables (see [Concurrency](#concurrency-and-reloading)); not with `--watch`, `--register` or `--split`; more than the machine's cores is warned of |
@@ -152,12 +153,12 @@ Their options, given after the command as `quillo run`'s are:
 | `quillo check --strict-null` | to find where a value may be null and null does not work (see [Checking](#checking)); `check` only, not `run` |
 | `quillo check --policy FILE` *(since 0.7)* | before a deploy to a server with a policy: check the program as it would run under it (see [The policy](#the-policy)) |
 | `quillo new --minimal`, `--binary` | three files instead of the to-do app; a copy of this `quillo` in the new folder, for a machine that has none |
-| `quillo app --open PATH` | the page the window opens on (`/` by default); `app` takes `run`'s options but `--host`, `--register`, `--service`, `--port` and `--listen`: its window asks the program directly, with no socket (see [Desktop apps](#desktop-apps)) |
+| `quillo app --open PATH` | the page the window opens on (`/` by default); `app` takes `run`'s options but `--host`, `--register`, `--service`, `--port` and `--listen`: its window asks the program directly, with no socket (see [Desktop apps](#desktop-apps)); nor `--drain`: it stops with its window |
 | `quillo serve <folder>` | `run`'s options, such as `--port` (see [Static files](#static-files)) |
 | `quillo fcgi <file.qwe>` | `run`'s options but `--split`, `--instances`, `--register` and `--join`; `--listen unix:PATH` or `--port` when no FastCGI manager hands it a socket (see [Quillo on a shared server](#quillo-on-a-shared-server-cpanel)) |
 | `quillo install --example`, `--update`, `--list [word]`, `--force`, `--dir DIR`, `--registry URL` | a plugin's example program too; the plugins here the catalog has newer; what the catalog has; replace a file changed by hand; install elsewhere; another catalog (see [Plugins from the catalog](#plugins-from-the-catalog)) |
 | `quillo repl -i` | keep the greeting and prompts when the input comes from a pipe (see [The REPL](#the-repl)) |
-| `quillo mcp <file.qwe>` | serve the program's tools to an AI client over stdin and stdout (see [Tools for AI clients](#tools-for-ai-clients)); takes `--env-file`, `--policy`, `--allow-path`, `--no-build` and `-- args`, and refuses the options of serving |
+| `quillo mcp <file.qwe>` | serve the program's tools to an AI client over stdin and stdout (see [Tools for AI clients](#tools-for-ai-clients)); takes `--env-file`, `--policy`, `--allow-path`, `--no-build`, `--drain` and `-- args`, and refuses the options of serving |
 
 `quillo build`, `fix` and `classes` take a program and no options; `quillo docs --mcp` prints what an AI client is told, `server/discover` on stdio and over HTTP and `tools/list`, as JSON (a program with no tools is refused).
 
@@ -2841,8 +2842,10 @@ It checks the program (one that does not check does not start), runs its top lev
 (`db.open`, tables), then answers MCP on stdin and stdout, one JSON message a line. Routes are
 not served. Only MCP's messages reach stdout: `print` goes to stderr under `quillo mcp`, and on
 Unix whatever else the program or a plugin writes to stdout goes there too. `stdin`, `read_line`
-and `exit` are errors. It ends when stdin closes, and on SIGTERM. There are no tokens on
-stdio: the person who starts it is the caller.
+and `exit` are errors. It ends when stdin closes, and on SIGTERM: at once while it waits for a
+message, and once the call in progress is answered while it answers one, however long that
+takes, saying so every 5 s (`--drain 30s` cuts the call off after that long; a second SIGTERM
+ends it at once). There are no tokens on stdio: the person who starts it is the caller.
 
 Quillo speaks MCP's revision 2026-07-28 only. A client of the earlier revision, which opens with
 `initialize` (Claude Code before 2.1.319, for one), is told the version is not supported. What a
@@ -4339,6 +4342,18 @@ commits: the work and its answer are kept together, or neither is.
   leaves the key running: it is not known whether the work happened, so requests with
   the key get 409 until it expires. Give the provider the same key, if it takes one,
   so that it too makes the payment once.
+- A [service](#services)'s function that changes data is such work too: it commits in the
+  service, not in this transaction. When its answer is lost (the service stopped part way,
+  the network dropped it), the call fails, the transaction rolls back and gives the key up,
+  and the client's retry with it calls the service again, under a new call id, so the
+  service changes its data twice. `quillo check` warns where an `idempotent` run in its
+  transaction reaches such a function, a site's too, directly or through the program's
+  functions, and through a service that calls another: ``main.qwe:6: warning: `idempotent`
+  reaches `billing.charge`, which may change data in another program, outside its
+  transaction: ...``. Give it `{ transaction: false }`, or send an id the service's change
+  is keyed by (`insert ... on conflict do nothing` on an order's id), so that a second run
+  changes nothing. A call made later (`billing.later.charge(...)`) waits in this
+  transaction's database, and is not warned of.
 
 ### Prefetching
 
@@ -5146,10 +5161,16 @@ answers the same, with billing in a process of its own.
   same again when it is restarted), its log lines marked with its name, all signed with
   one secret (32 random bytes from the system, unless `QUILLO_SERVICE_SECRET` is set,
   so a copy started by hand elsewhere cannot join a split app unless the secret is
-  set); they stop with it (killed, not drained), and when the app's process ends any
-  other way (killed with SIGKILL, a crash), each stops as a first SIGTERM stops it, as
-  the pipe the app holds on its input closes, so none is left serving with its port
-  taken. A service started on its own, by hand or by systemd, serves on. Before any service starts, the app
+  set); they stop with it, after it: once the app has answered its requests in progress,
+  which may still call them, each is told to stop (the pipe the app holds on its input
+  closes) and finishes what it is doing as a first SIGTERM has it (a call, a call made
+  later, a job), under the app's [`--drain`](#options-of-quillo-run), and the app waits for
+  it. They run in a process group of their own, so a Ctrl-C in the terminal reaches the app
+  alone; a service signalled itself while its app runs (systemd stops a unit by signalling
+  each of its processes) says `stopping when the app stops` and serves the app until then.
+  A second Ctrl-C ends them with the app, at once. When the app's process ends any other
+  way (killed with SIGKILL, a crash), each stops as a first SIGTERM stops it, as the pipe
+  on its input closes, so none is left serving with its port taken. A service started on its own, by hand or by systemd, serves on. Before any service starts, the app
   checks the whole tree once, its own files and every service's, and says each warning
   once; an error anywhere stops it there, before anything waits. Each is then started as
   `quillo run <file> --port P --as-service --service-name NAME`, with `--base`, [`--watch`](#options-of-quillo-run),
@@ -5949,7 +5970,7 @@ What each does at its edges, where the answer is not what another language would
 | `pow(2, 10)` | an int, exact, or an overflow as `*` gives (`pow(2, 63)`, and `pow(2, 4294967296)`: a power of 2^32 or more is exact for a base of -1, 0 or 1, and an overflow for any other); a float on either side, or a negative power, gives a float; a decimal to an int's power, a decimal (see [Decimals](#decimals)) |
 | `print(a, b)` | the values as text, a space between, on stdout (the console in a page) |
 | `now()` | milliseconds since 1970, an int |
-| `sleep(ms)` | no maximum; other requests run meanwhile, and a request's sleep of 5 ms or more holds no thread (a timer wakes it), so a hundred streams sleeping in their loops hold up nothing; in a scheduled job or a tick, ends it (status 503) when the server stops or the program is loaded again, so a loop that runs for ever stops; a request waits it out (it is answered at a stop, up to 10 s, and finishes on its version at a reload) |
+| `sleep(ms)` | no maximum; other requests run meanwhile, and a request's sleep of 5 ms or more holds no thread (a timer wakes it), so a hundred streams sleeping in their loops hold up nothing; in a scheduled job or a tick, ends it (status 503) when the server stops or the program is loaded again, so a loop that runs for ever stops; in a stream (`stream`, `events`), a stop ends it as its next `send` would, as a client gone (not in a transaction, which finishes); a request waits it out (it is answered at a stop, however long it takes unless [`--drain`](#options-of-quillo-run) gives a time, and finishes on its version at a reload) |
 | `random_int(lo, hi)` | both ends included |
 | `uuid()` | a version 4 UUID |
 | `read_file(path)` | text: bytes that are not UTF-8 are replaced; a missing file is an error value |
@@ -7781,9 +7802,11 @@ What a reload keeps, and what it starts afresh:
   `.quillo/native/` builds, and sessions signed with `QUILLO_SECRET`. Globals, the
   memory of calls a service answered, the live cache and channels start empty.
 - There is no handing a port from one process to the next: a new `quillo` binary means
-  a stop (requests in progress finish, up to 10 s) and a start, during which the port
-  answers nothing. For no gap, run two servers behind limer ([`--register`](#options-of-quillo-run); `/_quillo/health`
-  says 503 as soon as one starts stopping) and restart them one at a time. Two programs
+  a stop (requests in progress finish, however long they take unless [`--drain`](#options-of-quillo-run) gives a
+  time) and a start, during which the port
+  answers nothing. For no gap, run two servers behind limer ([`--register`](#options-of-quillo-run); one that starts
+  stopping leaves the pool, and its port refuses connections, which a health check sees as
+  down) and restart them one at a time. Two programs
   cannot share a port: `mount` or `service /prefix` them in one. A new binary whose Rust
   glue changed builds the program's Rust files again: run `quillo build` with it as part
   of the deploy, before the restart (see [Rust](#rust)). While an old and a new copy
@@ -7792,17 +7815,36 @@ What a reload keeps, and what it starts afresh:
 
 ### Stopping and health
 
-The first Ctrl-C or `SIGTERM` stops the server gracefully: it takes no new connections,
-closes idle ones, answers the requests in progress (for up to 10 seconds) and exits with
-status 0. A server that joined a pool with [`--register`](#options-of-quillo-run) (see [Several
-servers](#several-servers)) leaves it first, so limer stops
-sending it requests. A second Ctrl-C stops it at once. It stops the same when its stderr
+The first Ctrl-C or `SIGTERM` (`kill <pid>`) stops the server gracefully: it takes no new
+connections (its port refuses them at once, even while a request holds the server
+computing), closes idle ones, answers every request in progress, however long it takes, so
+that a transaction under way commits whole, finishes sending the large files being sent
+(a download), and exits with status 0. An answer given
+meanwhile closes its connection and says so (`connection: close`), so the client sends its
+next request elsewhere. Every 5 s it says what it still waits for:
+
+```
+quillo: stopping once the requests in progress are answered (again to stop now)
+quillo: still answering GET /pay (rid 01HF3K...), 1 file being sent (again to stop now)
+```
+
+[`--drain 30s`](#options-of-quillo-run) gives the stop a time: what still runs then is cut off, its
+transaction rolled back, and said: `quillo: stopped with GET /pay still running`, or, for a
+request that holds its instance then (computing, or waiting inside a SQLite transaction),
+`quillo: stopping with requests in progress: GET /pay (rid 01HF3K...)`. Without
+it, a request that never ends holds the stop until a second Ctrl-C, or until whatever runs
+the server gives up on its own: systemd sends SIGKILL after 90 s (`TimeoutStopSec`), Docker
+after 10 s (`docker stop -t`), Kubernetes after 30 s (`terminationGracePeriodSeconds`), so
+give `--drain` a little less than that time to have the cut said. A server that joined a
+pool with [`--register`](#options-of-quillo-run) (see [Several servers](#several-servers)), or a copy that joined its app with
+[`--join`](#options-of-quillo-run), leaves it first, so it is sent no more requests. A second Ctrl-C stops it at once. It stops the same when its stderr
 goes into a pipe that has closed (a `tee` or a log shipper that ended): Quillo's own
 messages are then dropped, and never keep it from stopping.
 
 `GET /_quillo/health` answers `200` (`ok`) while the server is ready for requests, and
-`503` (`unavailable`) while it is stopping or its program failed to load: give it to a
-load balancer's health check (limer's `health_uri`). `GET /_quillo/ready` also says
+`503` (`unavailable`) while its program failed to load, or, asked on a connection open
+before a stop, while it is stopping (a new connection is refused then): give it to a load
+balancer's health check (limer's `health_uri`). `GET /_quillo/ready` also says
 whether what the program needs is there: `{ "ready": true, "checks": { "database":
 "ready", "service billing": "ready", "ledger": "not ready" } }`, 200 or 503, its
 database (`select 1`), each service it declares (see [Services](#services)) and the
@@ -7846,8 +7888,12 @@ Without the switch, the address says how to turn it on: `"how": "off: run with
 token"`.
 
 A second Ctrl-C, or a second `SIGTERM`, exits at once with status 130. Stopping also
-stops the commands run with [`--with`](#options-of-quillo-run), and a stream's `send` fails once the server is
-stopping, so a long stream ends.
+stops the commands run with [`--with`](#options-of-quillo-run), and a stream's `send` fails, and its `sleep`
+ends, once the server is stopping (but in a transaction, which finishes), so a long stream ends
+as when its client goes away. Pages waiting for live data stay connected while the stop
+waits, are let go as the server exits, and connect to the next server. Scheduled jobs and calls
+made later start no more: one running finishes (its `sleep` ends it), and calls made later
+not yet run wait in the database for the next start.
 
 ### Scheduled jobs
 
@@ -7920,8 +7966,8 @@ waiting for 03:00, give it `"10s"` while you work on it.
   alternatives, and say nothing. Nobody outside the server can start one.
 - A job that runs for ever (a loop with `sleep` in it) is told to end when the server
   stops, and when [`--watch`](#options-of-quillo-run) (`quillo run main.qwe --watch`) loads the program again: its `sleep` ends the job, so a
-  new version never runs beside the old one (a tick's too; a request's `sleep` is waited
-  out, since requests in progress are answered). A job still running when it is due again
+  new version never runs beside the old one (a tick's too, and at a stop a stream's; a
+  request's `sleep` is waited out, since requests in progress are answered). A job still running when it is due again
   is said once in the log, not each time.
 - A service's jobs run with the app's when the service shares its process
   (`POST /_quillo/job/game~end_round` in the log), and in the service's own process
@@ -8704,9 +8750,9 @@ How it runs:
 - A panic is a runtime error in the request that called the function (not an error
   value: `??` does not catch it), and the server goes on. `std::process::exit`, an
   abort, or a stack overflow ends the whole server. Arguments of the wrong type are
-  refused before the function runs. A stop (`SIGTERM`) while a request is in a call is
-  logged as a stop, `quillo: stopped with GET /slow?ms=14000 still running`, not as a bug
-  in Quillo.
+  refused before the function runs. A stop (`SIGTERM`) waits for a request in a call; one
+  that [`--drain`](#options-of-quillo-run)'s time cuts off is logged as a stop, `quillo: stopped with GET
+  /slow?ms=14000 still running`, not as a bug in Quillo.
 - When the program is started with [`--watch`](#options-of-quillo-run) or [`--reload`](#options-of-quillo-run)
   (`quillo run main.qwe --watch`), a Rust file that changes is built again and the
   program reloaded with it. A build that fails prints the compiler's errors, and the

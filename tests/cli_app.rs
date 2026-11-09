@@ -80,6 +80,15 @@ mod with_windows {
         assert_eq!(err, "quillo: unknown option `--prot` (did you mean `--port`?)\n");
     }
 
+    /// The window's program stops with the window: `--drain`, a stop's time, is not for it (the
+    /// user's graceful stop, 2026-11-09; branch feedback56, found in review).
+    #[test]
+    fn drain_is_refused_as_the_app_stops_with_its_window() {
+        let d = folder("drain", &[("app.qwe", APP)]);
+        let (code, _, err) = no_window(&d, &["app.qwe", "--drain", "5s"], &[]);
+        assert_eq!((code, err.as_str()), (2, "quillo: `app` stops with its window; --drain is for `run` and `mcp`\n"));
+    }
+
     #[test]
     fn help_is_run_s_and_opens_nothing() {
         let d = folder("help", &[("app.qwe", APP)]);

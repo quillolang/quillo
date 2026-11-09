@@ -1548,6 +1548,9 @@ struct Seen {
     open: Option<String>,
     db: bool,
     asks: bool,
+    /// The functions of another program (a service's, a site's) it calls that may change data,
+    /// `billing.charge`, in the order found (`idempotent_reaches_outside`).
+    elsewhere: Vec<String>,
 }
 
 impl Seen {
@@ -1556,6 +1559,11 @@ impl Seen {
         self.effects |= o.effects;
         self.db |= o.db;
         self.asks |= o.asks;
+        for c in &o.elsewhere {
+            if !self.elsewhere.contains(c) {
+                self.elsewhere.push(c.clone());
+            }
+        }
         for (mine, theirs) in [(&mut self.uncertain, &o.uncertain), (&mut self.writes, &o.writes), (&mut self.open, &o.open)] {
             if mine.is_none() {
                 mine.clone_from(theirs);
@@ -2011,6 +2019,9 @@ struct Checker {
     /// and asks first, and the questions it asks after a change (FEEDBACK56.md, Part E; branch
     /// feedback56).
     ordered: std::cell::RefCell<HashMap<usize, Arc<Ordered>>>,
+    /// Each `idempotent(f)` that runs `f` in its transaction: where, and `f`, read once every
+    /// body is known (`idempotent_reaches_outside`).
+    idempotent_at: Vec<(Arc<str>, u32, Arc<FnDef>)>,
     walked: std::cell::Cell<usize>,
     /// The parameters' types of the lambda about to be checked, from the
     /// list a builtin gives it: `xs | map((x) => ...)`.
@@ -2166,6 +2177,7 @@ impl Checker {
             service_closed: Default::default(),
             reached_fns: Default::default(),
             ordered: Default::default(),
+            idempotent_at: Vec::new(),
             reached_types: Default::default(),
             walked: Default::default(),
             hint: None,
@@ -2903,6 +2915,7 @@ impl Checker {
             })
             .flatten()
             .collect();
+        self.idempotent_reaches_outside(&top_lets);
         let mut late = Vec::new();
         for it in &order {
             if let Stmt::Fn(d) = &it.stmt {
@@ -2943,6 +2956,12 @@ impl Checker {
     /// code does is kept for the check, so a function many tools reach is read once (found in
     /// review).
     fn tool_facts(&self, d: &Arc<FnDef>, file: &Arc<str>, top_lets: &HashSet<String>) -> ToolFacts {
+        let r = self.reach_all(d, top_lets);
+        ToolFacts { def: d.clone(), file: file.to_string(), effects: r.effects, uncertain: r.uncertain, writes: r.writes, open: r.open, db: r.db, asks: r.asks }
+    }
+
+    /// What `d`'s code does, with every function it names, each read once (`tool_facts`).
+    fn reach_all(&self, d: &Arc<FnDef>, top_lets: &HashSet<String>) -> Seen {
         let mut r = Seen::default();
         let mut todo = vec![Next::Fn(d.clone())];
         let (mut seen, mut types) = (HashSet::new(), HashSet::new());
@@ -2955,7 +2974,7 @@ impl Checker {
             r.join(&local.seen);
             todo.extend(local.next.iter().cloned());
         }
-        ToolFacts { def: d.clone(), file: file.to_string(), effects: r.effects, uncertain: r.uncertain, writes: r.writes, open: r.open, db: r.db, asks: r.asks }
+        r
     }
 
     /// One function's own code, read once a check.
@@ -3147,6 +3166,7 @@ impl Checker {
                     // after it is held to (FEEDBACK56.md, Part F, security review).
                     if !self.service_fn(m, f).is_some_and(|x| x.sure && !x.writes) {
                         note(&mut r.writes, format!("calls `{}.{}`, a call of another program", m, f));
+                        r.elsewhere.push(format!("{}.{}", m, f));
                     }
                 }
                 Expr::Field(inner, later, _) if later == "later" && matches!(&**inner, Expr::Ident(s, _) if self.services.contains_key(s.as_str())) => {
@@ -3163,6 +3183,7 @@ impl Checker {
                     r.effects |= http;
                     note(&mut r.open, format!("calls the site `{}`", m));
                     note(&mut r.writes, format!("calls the site `{}`, which may change anything", m));
+                    r.elsewhere.push(format!("{}.{}", m, f));
                 }
                 // `xs.map(f)` is `map(xs, f)`, unless the value is a map that holds a function of
                 // that name, which came from code read here or from a value said unseen.
@@ -5057,6 +5078,57 @@ impl Checker {
                 name,
                 effect_names(used).join(" and ")
             ));
+        }
+    }
+
+    /// `idempotent(f)`, `f` run in its transaction (no `transaction: false`): kept for the end of
+    /// the check, when every function `f` may call is known (`idempotent_reaches_outside`).
+    fn idempotent_site(&mut self, args: &[Expr]) {
+        // A body walked quietly, for a callee's type, is checked where it is written: kept from
+        // there it was said twice, the second time at another file's line (found in review).
+        if self.quiet > 0 {
+            return;
+        }
+        let f = match args {
+            [f] => f,
+            [Expr::Map(opts), f, ..] if !opts.iter().any(|(k, v)| k == "transaction" && !matches!(v, Expr::Lit(Lit::Bool(true)))) => f,
+            _ => return,
+        };
+        let def = match f {
+            Expr::Lambda(d) => d.clone(),
+            Expr::Ident(n, _) => match self.globals.get(n.as_str()).and_then(|g| g.sig.as_ref()).and_then(|s| s.def.clone()) {
+                Some(d) => d,
+                None => return,
+            },
+            _ => return,
+        };
+        self.idempotent_at.push((self.file.clone(), self.line, def));
+    }
+
+    /// An `idempotent` whose function changes data in another program (a service's function that
+    /// writes or may, a site's): that change is outside its transaction, so when the call's answer
+    /// is lost the claim is given up, and a retry with the key runs it there again, under a new
+    /// call id. Warned of, with the way out the guide gives: lost answers are what a program of
+    /// services lives with, so the program says where they matter (the user's decision,
+    /// 2026-11-09; branch feedback56).
+    fn idempotent_reaches_outside(&mut self, top_lets: &HashSet<String>) {
+        for (file, line, def) in std::mem::take(&mut self.idempotent_at) {
+            let r = self.reach_all(&def, top_lets);
+            let Some(first) = r.elsewhere.first() else { continue };
+            let more = match r.elsewhere.len() - 1 {
+                0 => String::new(),
+                1 => " (and 1 more such call)".to_string(),
+                n => format!(" (and {} more such calls)", n),
+            };
+            self.diag_at(
+                file,
+                line,
+                Severity::Warning,
+                format!(
+                    "`idempotent` reaches `{}`, which may change data in another program, outside its transaction{}: when that call's answer is lost, the key is given up and a retry with it runs the call there again, under a new call id. Give `idempotent` `{{ transaction: false }}`, which keeps every answer, failures too, or send an id the other program's change is keyed by, so that a second run changes nothing",
+                    first, more
+                ),
+            );
         }
     }
 
@@ -7584,6 +7656,9 @@ impl Checker {
         }
         if sig.builtin && matches!(sig.name.as_str(), "db.transaction" | "idempotent") {
             self.retried_effects(name, arg_exprs);
+            if sig.name == "idempotent" {
+                self.idempotent_site(arg_exprs);
+            }
             // What a key's `user` cannot be, where it shows (FEEDBACK55.md, Q-887; branch feedback55).
             if sig.name == "idempotent" {
                 if let [Expr::Map(opts), _, ..] = arg_exprs {

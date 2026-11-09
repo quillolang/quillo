@@ -2234,7 +2234,8 @@ pub fn take_stdout() -> Box<dyn std::io::Write + Send> {
 
 /// SIGTERM or Ctrl-C (`ctrlc`'s handler): before the door reads, and the second time, the process
 /// ends at once, as `quillo run`'s does; while it waits for a message, it ends; while a call is
-/// answered, it ends once the answer is out, or after `httpd::DRAIN` (C.1).
+/// answered, it ends once the answer is out, however long that takes, or after `--drain` when it is
+/// given (C.1; the user's graceful stop, 2026-11-09; branch feedback56: before, after 10 s).
 pub fn stop_asked() {
     use std::sync::atomic::Ordering::SeqCst;
     if STOP.swap(true, SeqCst) || !READING.load(SeqCst) {
@@ -2245,9 +2246,17 @@ pub fn stop_asked() {
     }
     eprintln!("quillo: stopping once the call in progress is answered (again to stop now)");
     std::thread::spawn(|| {
-        std::thread::sleep(crate::httpd::DRAIN + std::time::Duration::from_millis(500));
-        eprintln!("quillo: stopping with a call in progress");
-        std::process::exit(0);
+        let began = std::time::Instant::now();
+        let limit = crate::httpd::drain().map(|d| d + std::time::Duration::from_millis(500));
+        loop {
+            let every = std::time::Duration::from_secs(5);
+            std::thread::sleep(limit.map_or(every, |l| every.min(l.saturating_sub(began.elapsed()))));
+            if limit.is_some_and(|l| began.elapsed() >= l) {
+                eprintln!("quillo: stopping with a call in progress");
+                std::process::exit(0);
+            }
+            eprintln!("quillo: still answering the call in progress (again to stop now)");
+        }
     });
 }
 

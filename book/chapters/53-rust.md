@@ -169,9 +169,9 @@ How it runs:
 - A panic is a runtime error in the request that called the function (not an error
   value: `??` does not catch it), and the server goes on. `std::process::exit`, an
   abort, or a stack overflow ends the whole server. Arguments of the wrong type are
-  refused before the function runs. A stop (`SIGTERM`) while a request is in a call is
-  logged as a stop, `quillo: stopped with GET /slow?ms=14000 still running`, not as a bug
-  in Quillo.
+  refused before the function runs. A stop (`SIGTERM`) waits for a request in a call; one
+  that [`--drain`](#options-of-quillo-run)'s time cuts off is logged as a stop, `quillo: stopped with GET
+  /slow?ms=14000 still running`, not as a bug in Quillo.
 - When the program is started with [`--watch`](#options-of-quillo-run) or [`--reload`](#options-of-quillo-run)
   (`quillo run main.qwe --watch`), a Rust file that changes is built again and the
   program reloaded with it. A build that fails prints the compiler's errors, and the

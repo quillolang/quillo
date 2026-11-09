@@ -2721,12 +2721,48 @@ struct Running {
     again_at: Option<Instant>,
 }
 
+/// The process of each service `--split` started that has not been waited for: a second stop
+/// ends them at once (`kill_split_now`). A process is taken off when it is waited for, under this
+/// lock, so that its number, free then for another process, is never signalled.
+fn split_pids() -> std::sync::MutexGuard<'static, Vec<u32>> {
+    static PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    PIDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether `child` has ended, taken off `split_pids` when it has.
+fn ended(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+    let mut pids = split_pids();
+    let status = child.try_wait().ok().flatten()?;
+    pids.retain(|p| *p != child.id());
+    Some(status)
+}
+
+/// A second stop, or `--drain`'s time over: the services `--split` started end now, as the app
+/// does (the user's graceful stop, 2026-11-09; branch feedback56).
+pub fn kill_split_now() {
+    #[cfg(unix)]
+    for pid in split_pids().iter() {
+        // SAFETY: a plain signal, to a process of ours not waited for yet (`split_pids`).
+        unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+    }
+}
+
 impl Drop for Split {
+    /// Once the app's requests in progress are answered: each service is told to stop, by the
+    /// pipe on its input closing, and finishes what it is doing (a call made later, a job, a call
+    /// from elsewhere) as a first SIGTERM has it, under the app's `--drain`, and the app waits for
+    /// it. Before, each was killed, and what it was doing cut off (the user's graceful stop,
+    /// 2026-11-09; branch feedback56).
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        for r in self.services.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut() {
-            let _ = r.child.kill();
-            let _ = r.child.wait();
+        let mut services = std::mem::take(&mut *self.services.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        for r in services.iter_mut() {
+            drop(r.child.stdin.take());
+        }
+        for r in services.iter_mut() {
+            while ended(&mut r.child).is_none() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
     }
 }
@@ -2760,12 +2796,24 @@ fn start_service(exe: &Path, args: &[String], name: &str) -> Result<std::process
     // service stops then. A service whose app was killed served on, its port taken, for ever
     // (found in review of FEEDBACK55.md's Q-807; branch feedback55).
     command.env(STOP_WITH_APP, "1").stdin(std::process::Stdio::piped());
+    // In a process group of its own, so that a Ctrl-C in the terminal reaches the app alone, and
+    // the app stops it once its own requests in progress are answered: they may still call it.
+    // Reached by the terminal's signal too, it stopped taking calls while the app answered
+    // requests that needed it (the user's graceful stop, 2026-11-09; branch feedback56).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut pids = split_pids();
     let mut child = command
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot start service {}: {}", name, e))?;
+    pids.push(child.id());
+    drop(pids);
     for out in [child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>)].into_iter().flatten() {
         let tag = name.to_string();
         std::thread::spawn(move || {
@@ -2794,7 +2842,7 @@ fn supervise(services: Arc<Mutex<Vec<Running>>>, stop: Arc<std::sync::atomic::At
         for r in services.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut() {
             match r.again_at {
                 None => {
-                    if let Ok(Some(status)) = r.child.try_wait() {
+                    if let Some(status) = ended(&mut r.child) {
                         if now.duration_since(r.started) >= Duration::from_secs(60) {
                             r.wait = Duration::from_secs(1);
                         }
@@ -2879,6 +2927,11 @@ pub fn split(path: &Path, watch: bool, reload: bool, static_check: bool, checked
         if crate::native::NO_BUILD.load(std::sync::atomic::Ordering::Relaxed) {
             args.push("--no-build".into());
         }
+        // The app's time for a stop is its services' too (the user's graceful stop, 2026-11-09;
+        // branch feedback56).
+        if let Some(d) = crate::httpd::drain() {
+            args.extend(["--drain".to_string(), format!("{}ms", d.as_millis())]);
+        }
         // The app's policy is its services' too (the host's they read themselves).
         for f in crate::policy::get().files.iter().filter(|f| f.as_path() != Path::new(crate::policy::HOST_FILE)) {
             args.extend(["--policy".to_string(), f.display().to_string()]);
@@ -2911,8 +2964,10 @@ pub fn split(path: &Path, watch: bool, reload: bool, static_check: bool, checked
             }
             // One that has ended is not waited for: said at once (FEEDBACK40.md, Q-474; branch
             // feedback40-43).
-            let ended = split.services.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[i].child.try_wait().ok().flatten();
-            if let Some(status) = ended {
+            // Waited for as `ended` does, so that its number leaves `split_pids` then (found in
+            // review).
+            let gone = ended(&mut split.services.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[i].child);
+            if let Some(status) = gone {
                 std::thread::sleep(Duration::from_millis(100));
                 return Err(format!("service {} stopped at start ({}; see its lines above)", name, status));
             }

@@ -1045,12 +1045,16 @@ fn sleep(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
     let retired = it.retired.clone();
     let in_job = it.in_job;
+    // A stream's too: what it sends next fails at a stop anyway, and the drain has no limit
+    // unless `--drain` gives one (the user's graceful stop, 2026-11-09; branch feedback56). Not in
+    // a transaction, which a stop lets finish (found in review).
+    let streaming = it.stream_out.is_some() && it.tx_depth == 0 && it.sqlite_tx == 0;
     // A `parallel` function ends its sleep once another has failed (FEEDBACK55.md, Q-804; branch
     // feedback55).
     let stop = it.stop.clone();
     let slice = std::time::Duration::from_millis(if stop.is_some() { 20 } else { 50 });
     let why = move || {
-        if in_job && crate::httpd::stopping() {
+        if (in_job || streaming) && crate::httpd::stopping() {
             return Some("the server is stopping");
         }
         if in_job && retired.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1075,10 +1079,22 @@ fn sleep(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 if left.is_zero() {
                     return None;
                 }
+                let nap = if sliced { left.min(slice) } else { left };
+                if streaming {
+                    // Woken by the stop, not every 50 ms: ten thousand streams asleep cost nothing
+                    // (found in review).
+                    let mut stop = std::pin::pin!(crate::httpd::stop_notice().notified());
+                    stop.as_mut().enable();
+                    if let Some(w) = why() {
+                        return Some(w);
+                    }
+                    let _ = tokio::time::timeout(nap, stop).await;
+                    continue;
+                }
                 if let Some(w) = why() {
                     return Some(w);
                 }
-                tokio::time::sleep(if sliced { left.min(slice) } else { left }).await;
+                tokio::time::sleep(nap).await;
             }
         }))
     } else {
@@ -1100,6 +1116,7 @@ fn sleep(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match ended {
         None => Ok(Value::Nil),
         Some(why) if why == crate::interp::PARALLEL_STOPPED => fail(line, why),
+        Some(why) if streaming && crate::httpd::stopping() => crate::stream::ended_by_stop(it, line).unwrap_or_else(|| fail(line, why)),
         Some(why) => Err(Ctrl::Reply(Arc::new(Response {
             status: 503,
             headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
