@@ -82,6 +82,10 @@ struct Busy {
     request: AtomicUsize,
     told: AtomicBool,
     over: AtomicBool,
+    /// What each request in progress on this loop is, by its number, for the log: the loop's
+    /// own, which only it changes, so taking it never waits (branch speed-bun, 2026-11-09: one map
+    /// for all of them, behind one lock and hashed, was a request's 1%).
+    running: Mutex<Vec<(usize, String)>>,
 }
 
 /// Each event loop's `Busy`.
@@ -90,7 +94,8 @@ static LOOPS_BUSY: Mutex<Vec<Arc<Busy>>> = Mutex::new(Vec::new());
 static MAX_COMPUTE: AtomicU64 = AtomicU64::new(0);
 /// Whether a request somewhere has passed it: read at each step of a loop, so it stays one load.
 pub static OVER_TIME: AtomicBool = AtomicBool::new(false);
-/// What each request in progress is, for the log.
+/// What each request in progress is, for the log, where a thread has no `Busy` of its own (each
+/// event loop has, and keeps its requests' there).
 static RUNNING: Mutex<Option<HashMap<(usize, usize), String>>> = Mutex::new(None);
 /// An instance computing for this long is logged.
 const STUCK: Duration = Duration::from_secs(5);
@@ -173,21 +178,48 @@ pub fn over_time() -> bool {
     over
 }
 
-/// A request's number is its event loop's, so the two say which it is.
-fn own_request() -> (usize, usize) {
-    (OWN_BUSY.with(|b| b.borrow().as_ref().map_or(0, |b| Arc::as_ptr(b) as usize)), request_number())
-}
-
-/// Remembers what this request is, until `request_done`.
-pub fn request_began(what: String) {
-    lock(&RUNNING).get_or_insert_with(HashMap::new).insert(own_request(), what);
+/// Remembers what this request is, until `request_done`: `GET /path (rid 1a2b...)`. Made of
+/// its parts here, not by `format!`, and kept with its loop (branch speed-bun, 2026-11-09, the
+/// server benchmark: the two had been 4% of a JSON request).
+pub fn request_began(method: &str, url: &str, rid: &str) {
+    let mut what = String::with_capacity(method.len() + url.len() + rid.len() + 8);
+    for part in [method, " ", url, " (rid ", rid, ")"] {
+        what.push_str(part);
+    }
+    let n = request_number();
+    OWN_BUSY.with(|b| match b.borrow().as_ref() {
+        Some(b) => lock(&b.running).push((n, what)),
+        None => {
+            lock(&RUNNING).get_or_insert_with(HashMap::new).insert((0, n), what);
+        }
+    });
 }
 
 /// See `request_began`.
 pub fn request_done() {
-    if let Some(m) = lock(&RUNNING).as_mut() {
-        m.remove(&own_request());
-    }
+    let n = request_number();
+    OWN_BUSY.with(|b| match b.borrow().as_ref() {
+        Some(b) => {
+            let mut running = lock(&b.running);
+            if let Some(i) = running.iter().position(|(m, _)| *m == n) {
+                running.swap_remove(i);
+            }
+        }
+        None => {
+            if let Some(m) = lock(&RUNNING).as_mut() {
+                m.remove(&(0, n));
+            }
+        }
+    });
+}
+
+/// What the request running here is, if `request_began` said.
+fn own_running() -> Option<String> {
+    let n = request_number();
+    OWN_BUSY.with(|b| match b.borrow().as_ref() {
+        Some(b) => lock(&b.running).iter().find(|(m, _)| *m == n).map(|(_, w)| w.clone()),
+        None => lock(&RUNNING).as_ref().and_then(|m| m.get(&(0, n)).cloned()),
+    })
 }
 
 /// A line of the log for an error: with the request it belongs to, so that an id a visitor
@@ -204,8 +236,7 @@ pub fn error_line(text: &str) {
 /// A line of the log for what is no error of the program's but wants a look: a request no
 /// route's pattern took, and why (FEEDBACK47.md, Q-544; branch feedback40-43).
 pub fn warning_line(text: &str) {
-    let key = own_request();
-    let what = lock(&RUNNING).as_ref().and_then(|m| m.get(&key).cloned());
+    let what = own_running();
     if crate::metrics::LOG.load(SeqCst) == crate::metrics::JSON {
         eprintln!("{}", serde_json::json!({ "time": iso_now(), "level": "warning", "request": what, "warning": text }));
         return;
@@ -217,8 +248,7 @@ pub fn warning_line(text: &str) {
 }
 
 pub fn error_line_with(text: &str, calls: &[String]) {
-    let key = own_request();
-    let what = lock(&RUNNING).as_ref().and_then(|m| m.get(&key).cloned());
+    let what = own_running();
     if crate::metrics::LOG.load(SeqCst) == crate::metrics::JSON {
         // The calls it came through, as a field and not in the text (FEEDBACK21.md, Q-174; branch
         // feedback20-fixes).
@@ -256,7 +286,9 @@ pub fn log_safe(s: &str) -> std::borrow::Cow<'_, str> {
 
 /// What is in progress, for a line in the log.
 pub fn in_progress() -> Vec<String> {
-    lock(&RUNNING).as_ref().map_or_else(Vec::new, |m| m.values().cloned().collect())
+    let mut all: Vec<String> = lock(&LOOPS_BUSY).iter().flat_map(|b| lock(&b.running).iter().map(|(_, w)| w.clone()).collect::<Vec<_>>()).collect();
+    all.extend(lock(&RUNNING).as_ref().map_or_else(Vec::new, |m| m.values().cloned().collect()));
+    all
 }
 
 /// Looks at the event loops from outside: says when one has been computing for a while,
@@ -278,8 +310,8 @@ fn watch_loops() {
             }
             let for_ms = now.saturating_sub(since);
             if for_ms >= STUCK.as_millis() as u64 && !b.told.swap(true, SeqCst) {
-                let key = (Arc::as_ptr(b) as usize, b.request.load(SeqCst));
-                let what = lock(&RUNNING).as_ref().and_then(|m| m.get(&key).cloned());
+                let n = b.request.load(SeqCst);
+                let what = lock(&b.running).iter().find(|(m, _)| *m == n).map(|(_, w)| w.clone());
                 // Not `log`: that waits for its loop, and this one is not coming back.
                 eprintln!("quillo: an instance has been computing for {} s without letting go: {}", for_ms / 1000, what.as_deref().unwrap_or("a request"));
             }
@@ -2631,6 +2663,54 @@ mod tests {
         crate::metrics::CONNECTIONS.fetch_sub(1, SeqCst);
         super::MAX_CONNECTIONS.store(most, SeqCst);
         drop((b, v6));
+    }
+
+    /// What a request is, kept with its loop (branch speed-bun, 2026-11-09): read back by the
+    /// request itself and by `in_progress`, two of one loop told apart by their numbers, gone when
+    /// done, and on a thread with no loop as before.
+    #[test]
+    fn a_request_in_progress_is_known_by_its_loop() {
+        use super::{in_progress, own_running, request_began, request_done, REQUEST};
+        let set = |n: usize| REQUEST.with(|c| c.set(n));
+        let mine = |w: &str| in_progress().iter().filter(|x| x.as_str() == w).count();
+        std::thread::spawn(move || {
+            let _w = super::watched();
+            set(7);
+            request_began("GET", "/one?x=1", "rid-ka-1");
+            set(8);
+            request_began("POST", "/two", "rid-ka-2");
+            assert_eq!(own_running().as_deref(), Some("POST /two (rid rid-ka-2)"));
+            set(7);
+            assert_eq!(own_running().as_deref(), Some("GET /one?x=1 (rid rid-ka-1)"));
+            assert_eq!((mine("GET /one?x=1 (rid rid-ka-1)"), mine("POST /two (rid rid-ka-2)")), (1, 1));
+            request_done();
+            assert_eq!(own_running(), None);
+            assert_eq!((mine("GET /one?x=1 (rid rid-ka-1)"), mine("POST /two (rid rid-ka-2)")), (0, 1));
+            // Done again, or for a number never begun: nothing.
+            request_done();
+            set(9);
+            request_done();
+            set(8);
+            request_done();
+            assert_eq!(mine("POST /two (rid rid-ka-2)"), 0);
+        })
+        .join()
+        .unwrap();
+        // A thread with no loop.
+        std::thread::spawn(move || {
+            set(3);
+            request_began("GET", "/", "rid-ka-3");
+            assert_eq!(own_running().as_deref(), Some("GET / (rid rid-ka-3)"));
+            assert_eq!(mine("GET / (rid rid-ka-3)"), 1);
+            request_done();
+            assert_eq!((own_running(), mine("GET / (rid rid-ka-3)")), (None, 0));
+            // Empty parts.
+            request_began("", "", "");
+            assert_eq!(own_running().as_deref(), Some("  (rid )"));
+            request_done();
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

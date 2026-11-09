@@ -50,6 +50,12 @@ pub fn plain(status: u16, msg: &str) -> HttpResponse {
 
 pub fn percent_decode(s: &str, plus_is_space: bool) -> String {
     let b = s.as_bytes();
+    // Nothing to decode, as in most paths and queries: the text as it is, which is what the loop
+    // gives it then, without going byte by byte and through `from_utf8_lossy` (branch speed-bun,
+    // 2026-11-09, the server benchmark).
+    if memchr::memchr2(b'%', if plus_is_space { b'+' } else { b'%' }, b).is_none() {
+        return s.to_string();
+    }
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
@@ -275,6 +281,13 @@ impl Interp {
 /// and `/%61dmin/users` are `/admin/users`, which a route under `/admin` answers, so what is
 /// said about `/admin` must hold for them too (FEEDBACK47.md, Q-537; branch feedback40-43).
 pub fn route_path(path: &str) -> String {
+    // Already in the form this gives, as nearly every path is: `/` and pieces, none empty, no
+    // `%` to decode. The same text, without splitting, joining and `format!` (branch speed-bun,
+    // 2026-11-09, the server benchmark).
+    let b = path.as_bytes();
+    if b.first() == Some(&b'/') && (b.len() == 1 || b[b.len() - 1] != b'/') && memchr::memchr(b'%', b).is_none() && memchr::memmem::find(b, b"//").is_none() {
+        return path.to_string();
+    }
     // A `%2F` stays inside its piece, as routes keep it: `/payments%2Freturn` is one piece, not
     // `/payments/return`, which a rule of that path would then cover (found in review).
     let pieces: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(|s| percent_decode(s, false).replace('/', "%2F")).collect();
@@ -536,9 +549,8 @@ impl Interp {
         }
         // A page that plays a stream loads the player.
         if html && req.method != "HEAD" {
-            let has = rfind_tag;
-            if has(&resp.body, b"<quillo-media").is_some() && !script_tag_for(&resp.body, b"/_quillo/media.js") {
-                let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
+            if has_media(&resp.body) && !script_tag_for(&resp.body, b"/_quillo/media.js") {
+                let at = rfind_tag(&resp.body, b"</body>").unwrap_or(resp.body.len());
                 insert_at(&mut resp.body, at, format!("<script src=\"{}/_quillo/media.js\" defer></script>", self.base).as_bytes());
             }
         }
@@ -2244,16 +2256,22 @@ fn finder(needle: &[u8]) -> std::borrow::Cow<'static, memchr::memmem::Finder<'st
 }
 
 /// Where the last `needle` is in `body`, for the page's own tags, whose searchers are made once:
-/// `</body>` and `<quillo-media` (2026-11-09, the server benchmark: each search had made its
-/// own).
+/// `</body>` (2026-11-09, the server benchmark: each search had made its own).
 fn rfind_tag(body: &[u8], needle: &[u8]) -> Option<usize> {
     static BODY: std::sync::LazyLock<memchr::memmem::FinderRev<'static>> = std::sync::LazyLock::new(|| memchr::memmem::FinderRev::new(b"</body>"));
-    static MEDIA: std::sync::LazyLock<memchr::memmem::FinderRev<'static>> = std::sync::LazyLock::new(|| memchr::memmem::FinderRev::new(b"<quillo-media"));
     match needle {
         b"</body>" => BODY.rfind(body),
-        b"<quillo-media" => MEDIA.rfind(body),
         _ => memchr::memmem::rfind(body, needle),
     }
+}
+
+/// Whether a page has a `<quillo-media` in it, searched for from the start: memchr's search
+/// forwards has a SIMD prefilter and its search backwards none, so going back from the end through
+/// a page with no player, as most are, was 3% of a page's CPU (branch speed-bun, 2026-11-09, the
+/// Fortunes benchmark). Only whether there is one is asked, not where.
+fn has_media(body: &[u8]) -> bool {
+    static MEDIA: std::sync::LazyLock<memchr::memmem::Finder<'static>> = std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"<quillo-media"));
+    MEDIA.find(body).is_some()
 }
 
 /// Where `needle` (lower case, starting with a byte that has no case, as `<` does) first is in
@@ -3346,7 +3364,7 @@ impl Worker {
         }
         // The request's id: given (another service calling, a proxy), or made.
         let rid = crate::service::request_id(req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-request-id")).map(|(_, v)| v.as_str()));
-        crate::httpd::request_began(format!("{} {} (rid {})", req.method, log_url(&req.url), rid));
+        crate::httpd::request_began(&req.method, &log_url(&req.url), &rid);
         let prefetch = is_prefetch(&req);
         let mut resp = if app.watch && req.url == "/_quillo/dev" {
             plain(200, &self.generation.to_string())
@@ -4177,6 +4195,74 @@ mod tests {
         assert!(!script_tag_for(b"/_quillo/quillo.js\"", b"/_quillo/quillo.js"));
         // A second mention after one that is text.
         assert!(script_tag_for(b"<p>/_quillo/quillo.js\"</p><script src=\"/_quillo/quillo.js\">", b"/_quillo/quillo.js"));
+    }
+
+    /// A player is asked for wherever the page has one, searched for forwards (branch speed-bun,
+    /// 2026-11-09): what the search backwards found.
+    #[test]
+    fn has_media_finds_what_the_search_backwards_did() {
+        for body in [&b""[..], b"<quillo-media", b"<body><quillo-media stream=\"cam\"></body>", b"<p>x</p><quillo-media>", b"<quillo-medi", b"<QUILLO-MEDIA>", b"quillo-media", b"<quillo-media><quillo-media>", b"<<quillo-media"] {
+            assert_eq!(has_media(body), memchr::memmem::rfind(body, b"<quillo-media").is_some(), "{:?}", String::from_utf8_lossy(body));
+        }
+        // Past the searcher's first block, at the very end of a long page.
+        let mut long = vec![b'a'; 5000];
+        long.extend_from_slice(b"<quillo-media");
+        assert!(has_media(&long));
+        assert!(!has_media(&long[..long.len() - 1]));
+    }
+
+    /// The text as it was, decoded byte by byte as before the shortcut (branch speed-bun).
+    fn percent_decode_slowly(s: &str, plus_is_space: bool) -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+        while i < b.len() {
+            match b[i] {
+                b'+' if plus_is_space => out.push(b' '),
+                b'%' if i + 2 < b.len() => match (hex(b[i + 1]), hex(b[i + 2])) {
+                    (Some(h), Some(l)) => {
+                        out.push(h * 16 + l);
+                        i += 2;
+                    }
+                    _ => out.push(b'%'),
+                },
+                c => out.push(c),
+            }
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Text with nothing to decode is given as it is, the rest decoded as it was (branch
+    /// speed-bun, 2026-11-09).
+    #[test]
+    fn percent_decode_with_nothing_to_decode_gives_what_it_did() {
+        let cases = ["", "a", "abc", "a+b", "+", "++", "%", "%4", "%41", "a%41b", "%zz", "%%41", "a%2Fb", "é", "%C3%A9", "%FF", "%c3", "a b", "x=1&y=2", "%2", "100%", "+%41+", "\u{1F600}", "%F0%9F%98%80"];
+        for c in cases {
+            for plus in [false, true] {
+                assert_eq!(percent_decode(c, plus), percent_decode_slowly(c, plus), "{:?} plus {}", c, plus);
+            }
+        }
+        // A `+` stays one where it is no space, and is one where it is.
+        assert_eq!(percent_decode("a+b", false), "a+b");
+        assert_eq!(percent_decode("a+b", true), "a b");
+    }
+
+    /// A path already in its form is given as it is; any other is made into it as it was (branch
+    /// speed-bun, 2026-11-09).
+    #[test]
+    fn route_path_in_its_form_already_gives_what_it_did() {
+        let slowly = |path: &str| {
+            let pieces: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(|s| percent_decode_slowly(s, false).replace('/', "%2F")).collect();
+            format!("/{}", pieces.join("/"))
+        };
+        let cases = ["", "/", "//", "///", "/a", "/a/", "/a//b", "a", "a/b", "/a/b/c", "/a%2Fb", "/a/%2F", "/%41", "/é", "/a+b", "/payments%2Freturn", "/a/b/", "//a", "/a/./b", "/%", "/a%", "/a/%zz"];
+        for c in cases {
+            assert_eq!(route_path(c), slowly(c), "{:?}", c);
+        }
+        assert_eq!(route_path("/a//b/"), "/a/b");
+        assert_eq!(route_path("/x/y"), "/x/y");
     }
 
     #[test]

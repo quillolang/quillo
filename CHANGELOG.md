@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Requests are answered with less work: what each request is (for the log and a stop's
+  progress line) is kept by its event loop and made without `format!`, not in one map for all
+  of them behind one lock; a path or query with nothing to decode is not decoded byte by byte;
+  a route's path already in its form is not split and joined again; and a page is searched for
+  a `<quillo-media>` player forwards, which memchr does with SIMD, not back from the end. Nothing
+  a page or the log says changed.
+
 ## 0.8.1 (2026-11-09)
 
 - SQLite 3.54.1 (rusqlite 0.41, libsqlite3-sys 0.39.1), for RUSTSEC-2026-0459 (CVE-2026-119375):
