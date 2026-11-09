@@ -478,10 +478,6 @@ pub struct ElFacts {
     pub pieces: std::sync::OnceLock<Vec<Piece>>,
     /// The length of its HTML last time, to make room for it at once.
     pub last_len: std::sync::atomic::AtomicUsize,
-    /// Whether that HTML was a whole page (`<!DOCTYPE` or `<html` first): room is made for what
-    /// the server adds to a page (interp.rs's `PAGE_ROOM`), and only then, as an element made
-    /// in a loop keeps its room for as long as it is kept.
-    pub last_page: std::sync::atomic::AtomicBool,
     /// A `<select value={...}>`: its value is shown as `selected` on its options, rendered each
     /// time (FEEDBACK55.md, Q-758; branch feedback55).
     pub select_value: bool,
@@ -535,7 +531,6 @@ impl ElFacts {
             tags_fixed,
             pieces: std::sync::OnceLock::new(),
             last_len: std::sync::atomic::AtomicUsize::new(0),
-            last_page: std::sync::atomic::AtomicBool::new(false),
             select_value,
             svg: match tag {
                 "svg" => Some(true),
@@ -552,7 +547,6 @@ impl Clone for ElFacts {
             html_once: self.html_once.clone(),
             pieces: self.pieces.clone(),
             last_len: std::sync::atomic::AtomicUsize::new(self.last_len.load(std::sync::atomic::Ordering::Relaxed)),
-            last_page: std::sync::atomic::AtomicBool::new(self.last_page.load(std::sync::atomic::Ordering::Relaxed)),
             ..*self
         }
     }

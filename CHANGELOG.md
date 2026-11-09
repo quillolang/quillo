@@ -2,10 +2,26 @@
 
 ## 0.8.1 (2026-11-09)
 
-- A file the program serves that is written in place while it is read is not sent from the start
-  unless its first bytes read the same twice: a read could give them torn, a database's header
-  begun with the old file after it, which no check of the whole header saw, and a part of 5 bytes
-  sent `SQLit` (a 503 to come back to for a large file, as when it is replaced; found by CI).
+- SQLite 3.54.1 (rusqlite 0.41, libsqlite3-sys 0.39.1), for RUSTSEC-2026-0459 (CVE-2026-119375):
+  SQLite before 3.54.0 could give uninitialized page-cache memory for a database opened with a
+  `-wal` file of another page size, which only a database someone less trusted could write
+  exposes. It was 3.46 (libsqlite3-sys 0.30.1).
+- Pages are served faster: a page's server side searched the finished HTML byte by byte, put the
+  prefetch script and the bundle's tags in a byte at a time (the script made anew for each page),
+  and made a system call for each request's id; small lists and maps were freed on another
+  thread, mimalloc's slow way. memchr's search, a move and a copy, the script made once, ids from
+  a pool of the system's random bytes kept by each thread, and what holds fewer than 256 items
+  (two levels down) freed in place: about twice the requests a second on the Fortunes and SQLite
+  pages of the server benchmark, ahead of Node and Bun with six processes. Nothing a page says
+  changed.
+- SQL of two statements given to `db.query` or `db.one`, or to `db.exec` with values, is an
+  error on SQLite, as on PostgreSQL and MySQL: SQLite's had run the first and dropped the rest
+  without a word, a write lost. `db.exec` of statements without values runs them all, as before.
+- A file the program serves whose first bytes begin as a SQLite header could, written in place
+  while it is read, is not sent from the start unless those bytes read the same twice: a read
+  could give them torn, a database's header begun with the old file after it, which no check of
+  the whole header saw, and a part of 5 bytes sent `SQLit` (a 503 to come back to for a large
+  file, as when it is replaced; found by CI). Any other file written in place is served as it is.
 - A stop (`kill <pid>`, SIGTERM, Ctrl-C) waits for every request and transaction in progress,
   however long it takes, a large file being sent too, saying every 5 s what it still waits for;
   `--drain 30s` gives it a time, after which what still runs is cut off (`quillo run` and

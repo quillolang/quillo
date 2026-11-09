@@ -1278,8 +1278,9 @@ fn file_once(it: &mut Interp, args: &[Value], line: u32, hosted: Option<&Path>, 
                     if crate::db::sqlite_bytes(&b) {
                         return Err(Judged::Refused);
                     }
-                    // Being written as it was read: looked at again (`statics::steady_head`).
-                    if !crate::statics::steady_head(&f, &b) {
+                    // Begun as a database's header could be, and changed as it was read: looked at
+                    // again (`statics::steady_head`).
+                    if crate::db::sqlite_lead(&b) && !crate::statics::steady_head(&f, &b) {
                         return Err(Judged::Replaced);
                     }
                     if b.len() as u64 == looked.len && f.metadata().is_ok_and(|m| crate::statics::same(&looked, &at, &m) && !crate::statics::racy(&m, now)) {
@@ -1467,7 +1468,7 @@ fn file_once(it: &mut Interp, args: &[Value], line: u32, hosted: Option<&Path>, 
                             // least; the file's start else (FEEDBACK55.md, Q-702; branch
                             // feedback55).
                             let mut part = crate::statics::read_at(&f, start, if start == 0 { n.max(16) } else { n })?;
-                            if if start == 0 { crate::db::sqlite_bytes(&part) || !crate::statics::steady_head(&f, &part) } else { sqlite_head(&f) } {
+                            if if start == 0 { crate::db::sqlite_bytes(&part) || crate::db::sqlite_lead(&part) && !crate::statics::steady_head(&f, &part) } else { sqlite_head(&f) } {
                                 return Err(std::io::ErrorKind::NotFound.into());
                             }
                             part.truncate(n as usize);

@@ -653,8 +653,9 @@ pub fn send(mut stream: std::net::TcpStream, resp: &crate::server::HttpResponse,
         if crate::db::sqlite_bytes(&buf[..first]) {
             return not_found(&mut stream, &mut out);
         }
-        // Being written as it was read: come back (see `steady_head`).
-        if !steady_head(&f, &buf[..first]) {
+        // Begun as a database's header could be, and changed as it was read: come back (see
+        // `steady_head`).
+        if crate::db::sqlite_lead(&buf[..first]) && !steady_head(&f, &buf[..first]) {
             return busy(&mut stream, &mut out);
         }
     }

@@ -30,7 +30,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
 tokio-postgres = "0.7"
 indexmap = "2"
 stacker = "0.1"
-rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
+rusqlite = { version = "0.41", features = ["bundled", "column_decltype"] }
 ureq = "2"
 # Reading what ureq leaves: a `br` answer, and a `Location` against its URL (FEEDBACK36.md,
 # Q-437 and Q-438).

@@ -110,9 +110,6 @@ pub enum Mode {
     Request,
 }
 
-/// What a page's render leaves room for at its end, for what the server adds to it (`render_el`).
-const PAGE_ROOM: usize = 4096;
-
 pub struct Interp {
     pub globals: Env,
     // Set while the program loads, then only read: shared by every handle
@@ -5169,16 +5166,11 @@ impl Interp {
     }
 
     fn render_el(&mut self, el: &HtmlEl, env: &Env) -> Result<String, Ctrl> {
-        // Room for what it made last time, at once, and for what the server adds to a page (the
-        // prefetch script, the bundle's tags, the sheet's link): the room had been exact, so each
-        // page was copied whole to take them (2026-11-09, the server benchmark).
+        // Room for what it made last time, at once.
         use std::sync::atomic::Ordering::Relaxed;
-        let room = if el.facts.last_page.load(Relaxed) { PAGE_ROOM } else { 0 };
-        let mut out = String::with_capacity(el.facts.last_len.load(Relaxed) + room);
+        let mut out = String::with_capacity(el.facts.last_len.load(Relaxed));
         self.render_el_into(el, env, &mut out)?;
         el.facts.last_len.store(out.len(), Relaxed);
-        let page = out.get(..9).is_some_and(|h| h.eq_ignore_ascii_case("<!doctype")) || out.get(..5).is_some_and(|h| h.eq_ignore_ascii_case("<html"));
-        el.facts.last_page.store(page, Relaxed);
         Ok(out)
     }
 

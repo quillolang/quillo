@@ -1517,15 +1517,44 @@ pub fn defer_drops() {
     LATER.with(|l| *l.borrow_mut() = Some(Vec::new()));
 }
 
+/// How many items make a list or a map large enough to be freed on another thread (`drop_value`).
+const DEFER_AT: usize = 256;
+
+/// How many items `items` hold, theirs and their items' to `depth` 2, counted no further than
+/// `DEFER_AT` (`drop_value`).
+fn weight<'a>(items: impl Iterator<Item = &'a Value>, depth: u8) -> usize {
+    let mut n = 0;
+    for v in items {
+        n += 1;
+        if depth < 2 {
+            n += match v {
+                Value::List(l) => weight(l.iter(), depth + 1),
+                Value::Map(m) => weight(m.values(), depth + 1),
+                _ => 0,
+            };
+        }
+        if n >= DEFER_AT {
+            return n;
+        }
+    }
+    n
+}
+
 /// The values kept since the last call, to be dropped elsewhere.
 pub fn deferred_drops() -> Vec<Value> {
     LATER.with(|l| l.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default())
 }
 
 fn drop_value(v: Value) {
+    // Large: freed elsewhere it takes the loop no time. A small one is freed here: sent to another
+    // thread, its blocks were freed there as another thread's, mimalloc's slow way, and a page
+    // of 13 rows from SQLite (made on this thread) paid that each request (2026-11-09, the server
+    // benchmark; it had been 8 items for a list and 16 for a map). Counted with what its items
+    // hold, two levels down, so that a map of 30 days of 1,000 rows each is large still (found
+    // in review).
     let large = match &v {
-        Value::List(l) => l.len() >= 8 && Arc::strong_count(l) == 1,
-        Value::Map(m) => m.len() >= 16 && Arc::strong_count(m) == 1,
+        Value::List(l) => Arc::strong_count(l) == 1 && weight(l.iter(), 0) >= DEFER_AT,
+        Value::Map(m) => Arc::strong_count(m) == 1 && weight(m.values(), 0) >= DEFER_AT,
         _ => false,
     };
     if large {
@@ -2161,6 +2190,26 @@ pub fn assign_local(env: &Env, name: Sym, v: Value) -> Result<(), Value> {
 
 #[cfg(test)]
 mod tests {
+
+    /// What is large enough to be freed on another thread: its items and theirs, two levels down
+    /// (2026-11-09; found in review): a page of rows is not, a few days of many rows are.
+    #[test]
+    fn weight_counts_what_items_hold() {
+        let row = || Value::map([("id".into(), Value::Int(1)), ("message".into(), Value::str("m"))].into_iter().collect());
+        let rows = |n: usize| (0..n).map(|_| row()).collect::<Vec<_>>();
+        assert!(weight(rows(13).iter(), 0) < DEFER_AT);
+        assert!(weight([].iter(), 0) == 0);
+        assert!(weight(rows(90).iter(), 0) >= DEFER_AT);
+        let days: Vec<Value> = (0..30).map(|_| Value::list(rows(1000))).collect();
+        assert!(weight(days.iter(), 0) >= DEFER_AT);
+        assert!(weight((0..300).map(|i| Value::Int(i)).collect::<Vec<_>>().iter(), 0) >= DEFER_AT);
+        assert!(weight((0..255).map(|i| Value::Int(i)).collect::<Vec<_>>().iter(), 0) == 255);
+        // Counted no further than it needs.
+        let huge: Vec<Value> = vec![Value::list((0..1_000_000).map(Value::Int).collect())];
+        let w = weight(huge.iter(), 0);
+        assert!((DEFER_AT..=DEFER_AT + 1).contains(&w), "{}", w);
+    }
+
     use super::*;
 
     /// `append_text` adds where the text is when nothing else holds it, of any length and in

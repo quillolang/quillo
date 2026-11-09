@@ -801,6 +801,15 @@ pub(crate) fn sqlite_bytes(head: &[u8]) -> bool {
     head.starts_with(b"SQLite format 3\0") || head.starts_with(&[0x37, 0x7f, 0x06, 0x82]) || head.starts_with(&[0x37, 0x7f, 0x06, 0x83]) || head.starts_with(&[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7])
 }
 
+/// Whether bytes begin as a SQLite database's header, its log's or its journal's could: by the
+/// first byte of each (`S`, 0x37, 0xd9). Bytes read torn, as a file written in place while it is
+/// read gives them, can be a header's start with the old file after it, which `sqlite_bytes`
+/// does not see; only such bytes are read again before they are sent (statics::steady_head), so
+/// a file written in place is otherwise served as it is, never refused (Q-701; 2026-11-09).
+pub(crate) fn sqlite_lead(head: &[u8]) -> bool {
+    matches!(head.first(), Some(b'S' | 0x37 | 0xd9))
+}
+
 /// Whether the file at `p` is a SQLite database, by its first bytes (FEEDBACK55.md, Q-702;
 /// branch feedback55).
 pub(crate) fn sqlite_file(p: &Path) -> bool {
@@ -1377,7 +1386,11 @@ fn from_sql(v: ValueRef, kind: Col) -> Value {
         ValueRef::Integer(n) => Value::Int(n),
         // -0 as 0.0, as every database is given (FEEDBACK55.md, Q-735; branch feedback55).
         ValueRef::Real(f) => Value::Float(f + 0.0),
-        ValueRef::Text(t) => Value::str(String::from_utf8_lossy(t)),
+        // Checked as UTF-8 first: what is valid needs no copy by the lossy way (2026-11-09).
+        ValueRef::Text(t) => match std::str::from_utf8(t) {
+            Ok(s) => Value::str(s),
+            Err(_) => Value::str(String::from_utf8_lossy(t)),
+        },
         ValueRef::Blob(b) => Value::str(String::from_utf8_lossy(b)),
     }
 }
@@ -1429,15 +1442,16 @@ pub(crate) fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option
     let mut out = Vec::new();
     // Its columns as of its first row: a statement kept from before the table changed is made
     // again by SQLite as it runs, and its columns before that are the old table's.
-    let mut cols: Option<Vec<(String, Col)>> = None;
+    // The keys made once, and each row's map made at its size (2026-11-09, the server benchmark).
+    let mut cols: Option<Vec<(Key, Col)>> = None;
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let cols = cols.get_or_insert_with(|| {
             let st: &rusqlite::Statement = row.as_ref();
-            st.columns().iter().map(|c| (c.name().to_string(), col_kind(c.decl_type()))).collect()
+            st.columns().map(|c| (Key::new(c.name()), col_kind(c.decl_type()))).collect()
         });
-        let mut m = Map::new();
+        let mut m = Map::with_capacity_and_hasher(cols.len(), Default::default());
         for (i, (c, kind)) in cols.iter().enumerate() {
-            m.insert(c.into(), from_sql(row.get_ref(i).map_err(|e| e.to_string())?, *kind));
+            m.insert(c.clone(), from_sql(row.get_ref(i).map_err(|e| e.to_string())?, *kind));
         }
         out.push(Value::map(m));
         if limit.map_or(false, |l| out.len() >= l) {
@@ -1979,7 +1993,7 @@ fn sqlite_exec(c: &Connection, scan: &crate::sql::Scan, sql: &str, params: &[Val
     };
     if params.is_empty() {
         let mut batch = rusqlite::Batch::new(c, sql);
-        while let Some(mut stmt) = batch.next().map_err(|e| e.to_string())? {
+        while let Some(mut stmt) = rusqlite::fallible_iterator::FallibleIterator::next(&mut batch).map_err(|e| e.to_string())? {
             run(&mut stmt)?;
         }
     } else {
@@ -3897,6 +3911,19 @@ pub fn recover(it: &mut Interp) {
 
 #[cfg(test)]
 mod tests {
+
+    /// What is read again before it is sent: bytes that begin as a database's, its log's or its
+    /// journal's header could, torn or whole; nothing else (2026-11-09).
+    #[test]
+    fn sqlite_lead_is_the_headers_first_byte() {
+        for lead in [&b"SQLite format 3\0"[..], b"SQLit", b"S", b"Some text", &[0x37, 0x7f, 0x06, 0x82], &[0x37], &[0xd9, 0xd5, 0x05, 0xf9]] {
+            assert!(super::sqlite_lead(lead), "{:?}", lead);
+        }
+        for other in [&b""[..], b"sqlite format 3\0", b"plain text, 16 b", b"aaaa", b"<html>", &[0x36], &[0xd8]] {
+            assert!(!super::sqlite_lead(other), "{:?}", other);
+        }
+    }
+
     use super::kind_of;
 
     fn values_tuple(sql: &str, width: usize) -> Option<String> {

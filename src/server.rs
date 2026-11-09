@@ -531,7 +531,7 @@ impl Interp {
         if html && req.method != "HEAD" && PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
             let has = rfind_tag;
             if let (Some(at), false) = (has(&resp.body, b"</body>"), script_with(&resp.body, &PREFETCH_JS.as_bytes()[..40])) {
-                resp.body.splice(at..at, format!("<script>{}</script>{}", PREFETCH_JS, used_script(&self.base)).into_bytes());
+                insert_at(&mut resp.body, at, &prefetch_tags(&self.base));
             }
         }
         // A page that plays a stream loads the player.
@@ -539,7 +539,7 @@ impl Interp {
             let has = rfind_tag;
             if has(&resp.body, b"<quillo-media").is_some() && !script_tag_for(&resp.body, b"/_quillo/media.js") {
                 let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
-                resp.body.splice(at..at, format!("<script src=\"{}/_quillo/media.js\" defer></script>", self.base).into_bytes());
+                insert_at(&mut resp.body, at, format!("<script src=\"{}/_quillo/media.js\" defer></script>", self.base).as_bytes());
             }
         }
         // The styles of what the page's bundle can show, or all of them for
@@ -599,7 +599,7 @@ impl Interp {
                 }
             }
             let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
-            resp.body.splice(at..at, tags.into_bytes());
+            insert_at(&mut resp.body, at, tags.as_bytes());
         }
         // The page's sheet: the styles of the components and views on it,
         // and of those its bundle can show, at an address that changes when
@@ -623,7 +623,7 @@ impl Interp {
                     (None, Some(b)) => resp.body[b..].iter().position(|&c| c == b'>').map_or(0, |e| b + e + 1),
                     (None, None) => 0,
                 };
-                resp.body.splice(at..at, link.into_bytes());
+                insert_at(&mut resp.body, at, link.as_bytes());
             }
         }
         // Waiting components (src/defer.rs; branch defer): the page now, each of them
@@ -2215,7 +2215,32 @@ fn rpc_error(status: u16, msg: &str) -> HttpResponse {
 /// code starts with `code`: one put in already, as a mounted program's page
 /// has it, not text that quotes it, which is escaped.
 fn script_with(body: &[u8], code: &[u8]) -> bool {
-    memchr::memmem::find_iter(body, code).any(|i| body[..i].ends_with(b"<script>"))
+    finder(code).find_iter(body).any(|i| body[..i].ends_with(b"<script>"))
+}
+
+/// `bytes` put into `body` at `at`: a move and a copy. `Vec::splice` put them in a byte at a
+/// time, the prefetch script's 1,300 on each page (2026-11-09, the server benchmark).
+fn insert_at(body: &mut Vec<u8>, at: usize, bytes: &[u8]) {
+    let len = body.len();
+    body.resize(len + bytes.len(), 0);
+    body.copy_within(at..len, at + bytes.len());
+    body[at..at + bytes.len()].copy_from_slice(bytes);
+}
+
+/// The searcher for one of the needles the page's checks look for, made once each: the
+/// prefetch script's start and the two scripts' paths, the most a page asks for (2026-11-09, the
+/// server benchmark: each search had made its own). Any other is made for the call.
+fn finder(needle: &[u8]) -> std::borrow::Cow<'static, memchr::memmem::Finder<'static>> {
+    use std::sync::LazyLock;
+    static PREFETCH: LazyLock<memchr::memmem::Finder<'static>> = LazyLock::new(|| memchr::memmem::Finder::new(&PREFETCH_JS.as_bytes()[..40]));
+    static MEDIA: LazyLock<memchr::memmem::Finder<'static>> = LazyLock::new(|| memchr::memmem::Finder::new(b"/_quillo/media.js"));
+    static BUNDLE: LazyLock<memchr::memmem::Finder<'static>> = LazyLock::new(|| memchr::memmem::Finder::new(b"/_quillo/quillo.js"));
+    for f in [&*PREFETCH, &*MEDIA, &*BUNDLE] {
+        if f.needle() == needle {
+            return std::borrow::Cow::Borrowed(f);
+        }
+    }
+    std::borrow::Cow::Owned(memchr::memmem::Finder::new(needle).into_owned())
 }
 
 /// Where the last `needle` is in `body`, for the page's own tags, whose searchers are made once:
@@ -2246,7 +2271,7 @@ fn find_ascii_ci(body: &[u8], needle: &[u8]) -> Option<usize> {
 /// can `markdown` (whose `<img src=...>` could name the same path), so a
 /// comment saying `/_quillo/quillo.js` does not stop the page loading it.
 fn script_tag_for(body: &[u8], path: &[u8]) -> bool {
-    for i in memchr::memmem::find_iter(body, path) {
+    for i in finder(path).find_iter(body) {
         let from = i + path.len();
         if !matches!(body.get(from), Some(b'"' | b'\'' | b'?' | b'#')) {
             continue;
@@ -2364,6 +2389,24 @@ pub const PREFETCH_JS: &str = concat!(
     "d.addEventListener(\"pointerover\",(e)=>{const a=link(e);clearTimeout(t);if(a)t=setTimeout(()=>go(a),65)},o);",
     "for(const v of[\"pointerdown\",\"touchstart\",\"focusin\"])d.addEventListener(v,(e)=>go(link(e)),o)})()"
 );
+
+/// What the prefetch puts before a page's `</body>`, made once for a program's base and kept by
+/// each thread: it had been made, 1,300 bytes, for each page (2026-11-09, the server benchmark).
+fn prefetch_tags(base: &str) -> std::rc::Rc<[u8]> {
+    thread_local! {
+        static MADE: std::cell::RefCell<Option<(String, bool, std::rc::Rc<[u8]>)>> = const { std::cell::RefCell::new(None) };
+    }
+    let counted = crate::metrics::ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    MADE.with(|m| {
+        let mut m = m.borrow_mut();
+        if let Some((_, _, tags)) = m.as_ref().filter(|(b, c, _)| b == base && *c == counted) {
+            return tags.clone();
+        }
+        let tags: std::rc::Rc<[u8]> = format!("<script>{}</script>{}", PREFETCH_JS, used_script(base)).into_bytes().into();
+        *m = Some((base.to_string(), counted, tags.clone()));
+        tags
+    })
+}
 
 /// With metrics on: a page landed on from a prefetch says so, as only it can tell. The page
 /// that asked for it is told nothing, and a click answered from a prefetch never reaches the
@@ -3073,10 +3116,21 @@ pub const MARKDOWN_BODY: usize = 1 << 20;
 pub const DROPPED: &str = "\0";
 
 pub fn valid_header(name: &str, value: &str) -> bool {
-    let token = |c: u8| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c);
-    !name.is_empty()
-        && name.bytes().all(token)
-        && value.bytes().all(|c| c == b'\t' || (c >= 0x20 && c != 0x7f))
+    // By table, a byte a look: each byte of a name had been looked for in a list of 15 (2026-11-09,
+    // the server benchmark).
+    const fn tables() -> ([bool; 256], [bool; 256]) {
+        let (mut token, mut text) = ([false; 256], [false; 256]);
+        let mut c = 0;
+        while c < 256 {
+            let b = c as u8;
+            token[c] = b.is_ascii_alphanumeric() || matches!(b, b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~');
+            text[c] = b == b'\t' || (b >= 0x20 && b != 0x7f);
+            c += 1;
+        }
+        (token, text)
+    }
+    static TABLES: ([bool; 256], [bool; 256]) = tables();
+    !name.is_empty() && name.bytes().all(|c| TABLES.0[c as usize]) && value.bytes().all(|c| TABLES.1[c as usize])
 }
 
 /// Whether the request is a multipart form of more parts than are read (FEEDBACK55.md, Q-716;
@@ -3278,7 +3332,8 @@ impl Worker {
             let ready = matches!(&*app.current().1, Loaded::Ready(_)) && !crate::httpd::stopping();
             return Answer::Respond(if ready { plain(200, "ok\n") } else { plain(503, "unavailable\n") });
         }
-        let start = Instant::now();
+        // Timed for the metrics and the log, when either is on (2026-11-09, the server benchmark).
+        let start = (crate::metrics::ENABLED.load(std::sync::atomic::Ordering::Relaxed) || crate::metrics::LOG.load(std::sync::atomic::Ordering::Relaxed) != crate::metrics::OFF).then(Instant::now);
         let _busy = crate::metrics::ENABLED.load(std::sync::atomic::Ordering::Relaxed).then(crate::metrics::InProgress::new);
         let (g, current) = app.current();
         if g != self.generation {
@@ -3382,7 +3437,7 @@ impl Worker {
         // Nor the scheduler's own call each second, asking that calls made
         // `later` be sent (only it has the token: others get a 404, logged)
         // (FEEDBACK4.md, Q-043; branch bank-fixes).
-        let took = start.elapsed().as_secs_f64();
+        let took = start.map_or(0.0, |s| s.elapsed().as_secs_f64());
         // Nor ticks, which may come 60 times a second: one that fails is
         // logged (FEEDBACK12.md, Q-080; branch feedback12-fixes).
         let delivery = req.url.starts_with("/_quillo/udp/") || req.url.starts_with("/_quillo/channel/")
@@ -4045,6 +4100,50 @@ fn island_loader(srcs: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Header names and values by table, as by the list (2026-11-09): every byte, both ways.
+    #[test]
+    fn valid_header_by_table_is_as_by_list() {
+        for c in 0u8..=255 {
+            let token = c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c);
+            let text = c == b'\t' || (c >= 0x20 && c != 0x7f);
+            let one = [c];
+            let as_str = std::str::from_utf8(&one).unwrap_or("\u{80}");
+            if c < 0x80 {
+                assert_eq!(valid_header(as_str, "v"), token, "name byte {:#x}", c);
+                assert_eq!(valid_header("x", as_str), text, "value byte {:#x}", c);
+            }
+        }
+        assert!(!valid_header("", "v"));
+        assert!(valid_header("x", ""));
+        assert!(valid_header("x", "caf\u{e9}"));
+        assert!(!valid_header("caf\u{e9}", "v"));
+        assert!(!valid_header("a b", "v"));
+        assert!(!valid_header("x", "a\r\nb: c"));
+        // The prefetch's tags, made once for a base, are what was made each time.
+        assert_eq!(&*prefetch_tags("/b"), format!("<script>{}</script>{}", PREFETCH_JS, used_script("/b")).as_bytes());
+        assert_eq!(&*prefetch_tags(""), format!("<script>{}</script>{}", PREFETCH_JS, used_script("")).as_bytes());
+    }
+
+    /// What is put into a page goes where splice put it (2026-11-09).
+    #[test]
+    fn insert_at_puts_bytes_where_splice_did() {
+        for (body, at, bytes) in [(&b"<body></body>"[..], 6, &b"<script>x</script>"[..]), (b"abc", 0, b"xy"), (b"abc", 3, b"xy"), (b"", 0, b"xy"), (b"abc", 1, b""), (b"abc", 2, b"0123456789abcdef0123456789")] {
+            let mut want = body.to_vec();
+            want.splice(at..at, bytes.iter().copied());
+            let mut got = body.to_vec();
+            insert_at(&mut got, at, bytes);
+            assert_eq!(got, want, "{:?} at {}", String::from_utf8_lossy(body), at);
+        }
+        // With room already made, and without.
+        let mut room = Vec::with_capacity(64);
+        room.extend_from_slice(b"<html></html>");
+        insert_at(&mut room, 6, b"<head></head>");
+        assert_eq!(room, b"<html><head></head></html>");
+        // A needle of the page's own, and any other, are found alike.
+        assert_eq!(finder(b"/_quillo/quillo.js").find(b"x/_quillo/quillo.js"), Some(1));
+        assert_eq!(finder(b"/other.js").find(b"/other.js"), Some(0));
+    }
 
     /// The page's scans by memchr find what the byte-by-byte ones did (2026-11-09, the server
     /// benchmark), at the edges too.

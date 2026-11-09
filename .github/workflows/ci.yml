@@ -18,6 +18,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      # The build and the test binaries take most of the runner's disk, and once took it all
+      # ("No space left on device", 2026-11-09): what this job never uses goes first.
+      - name: Room on the disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
       # tests/postgres.rs and tests/mysql.rs start servers of their own from these
       # binaries, and skip without them.
       - name: PostgreSQL and MariaDB for the tests

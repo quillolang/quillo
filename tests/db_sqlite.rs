@@ -54,6 +54,32 @@ db.exec("insert into kids (parent, name, age) values (1, 'ana', 5)")
 
 // ---- what failed ------------------------------------------------------------------------------
 
+/// SQL of two statements given with a query's values, or as a query, is an error, as on
+/// PostgreSQL and MySQL: SQLite's had run the first and dropped the rest without a word, a write
+/// lost (rusqlite 0.41, 2026-11-09). `db.exec` of statements and no values runs them all, as
+/// before; a statement that ends with `;`, spaces or a comment is one.
+#[test]
+fn two_statements_with_values_are_refused_as_elsewhere() {
+    let d = dir("two-statements");
+    let mut it = load(&d, SCHEMA);
+    let refused = |it: &mut Interp, e: &str| {
+        let got = eval(it, &format!("str(is_err({}))", e));
+        assert_eq!(got, "\"true\"", "{}", e);
+    };
+    refused(&mut it, "db.query(\"select 1 as a; select 2 as b\")");
+    refused(&mut it, "db.exec(\"insert into kids (parent, name, age) values (?, 'x', 7); delete from kids\", 1)");
+    refused(&mut it, "db.one(\"select 1 as a; select * from nowhere\")");
+    // Nothing of a refused one ran.
+    assert_eq!(eval(&mut it, "db.one(\"select count(*) as n from kids where name = 'x'\").n"), "0");
+    // One statement, however it ends.
+    assert_eq!(eval(&mut it, "db.one(\"select 7 as a;\").a"), "7");
+    assert_eq!(eval(&mut it, "db.one(\"select 8 as a ;  \").a"), "8");
+    assert_eq!(eval(&mut it, "db.one(\"select 9 as a; -- done\").a"), "9");
+    // Statements with no values: all of them, as before.
+    assert_eq!(eval(&mut it, "is_err(db.exec(\"create table two_a (x int); create table two_b (y int)\"))"), "false");
+    assert_eq!(eval(&mut it, "len(db.query(\"select name from sqlite_master where name in ('two_a', 'two_b')\"))"), "2");
+}
+
 #[test]
 fn a_failure_says_what_kind_it_is() {
     let d = dir("kinds");

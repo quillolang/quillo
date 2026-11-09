@@ -519,22 +519,24 @@ fn a_long_variable_name_and_many_variables_work_like_any_others() {
 
 #[test]
 fn a_scope_used_again_starts_empty() {
-    // More than the first few variables, with lists large enough to free apart.
+    // More than the first few variables, with lists large enough to free apart: 301 items, as
+    // what is freed apart is 256 items or more since 2026-11-09 (the server benchmark: it had been
+    // 8, and the lists here 9).
     let src = "fn f(n) {
- let a = [1, 2, 3, 4, 5, 6, 7, 8, n]
- let b = [1, 2, 3, 4, 5, 6, 7, 8, n]
- let c = [1, 2, 3, 4, 5, 6, 7, 8, n]
- let d = [1, 2, 3, 4, 5, 6, 7, 8, n]
- let e = [1, 2, 3, 4, 5, 6, 7, 8, n]
- let g = [1, 2, 3, 4, 5, 6, 7, 8, n]
- len(a) + len(b) + len(c) + len(d) + len(e) + len(g) + g[8]
+ let a = range(0, 300) + [n]
+ let b = range(0, 300) + [n]
+ let c = range(0, 300) + [n]
+ let d = range(0, 300) + [n]
+ let e = range(0, 300) + [n]
+ let g = range(0, 300) + [n]
+ len(a) + len(b) + len(c) + len(d) + len(e) + len(g) + g[300]
 }
 [f(1), f(2)]";
     value::defer_drops();
-    assert_eq!(ev(src), "[55, 56]");
+    assert_eq!(ev(src), "[1807, 1808]");
     let kept = value::deferred_drops();
     assert!(!kept.is_empty(), "large lists wait to be freed elsewhere");
-    assert!(kept.iter().all(|v| matches!(v, Value::List(l) if l.len() == 9)), "{}", kept.len());
+    assert!(kept.iter().all(|v| matches!(v, Value::List(l) if l.len() == 301)), "{}", kept.len());
 }
 
 #[test]
