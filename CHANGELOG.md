@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.1 (2026-11-09)
 
 - A stop (`kill <pid>`, SIGTERM, Ctrl-C) waits for every request and transaction in progress,
   however long it takes, a large file being sent too, saying every 5 s what it still waits for;

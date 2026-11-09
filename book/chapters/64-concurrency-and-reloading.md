@@ -136,7 +136,7 @@ next request elsewhere. Every 5 s it says what it still waits for:
 
 ```
 quillo: stopping once the requests in progress are answered (again to stop now)
-quillo: still answering GET /pay (rid 01HF3K...), 1 file being sent (again to stop now)
+quillo: still waiting for GET /pay (rid 01HF3K...), 1 file being sent (again to stop now)
 ```
 
 [`--drain 30s`](#options-of-quillo-run) gives the stop a time: what still runs then is cut off, its

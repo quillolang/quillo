@@ -19,7 +19,7 @@ cargo build --release
 cargo test
 ```
 
-This guide is for Quillo 0.8.0, and [CHANGELOG.md](CHANGELOG.md) says what it changed.
+This guide is for Quillo 0.8.1, and [CHANGELOG.md](CHANGELOG.md) says what it changed.
 Features marked *(since 0.7)* came in 0.7.0. On an older release, read that release's guide:
 https://github.com/quillolang/quillo/blob/v0.7.0/USERGUIDE.md or
 https://github.com/quillolang/quillo/blob/v0.6.0/USERGUIDE.md.
@@ -7825,7 +7825,7 @@ next request elsewhere. Every 5 s it says what it still waits for:
 
 ```
 quillo: stopping once the requests in progress are answered (again to stop now)
-quillo: still answering GET /pay (rid 01HF3K...), 1 file being sent (again to stop now)
+quillo: still waiting for GET /pay (rid 01HF3K...), 1 file being sent (again to stop now)
 ```
 
 [`--drain 30s`](#options-of-quillo-run) gives the stop a time: what still runs then is cut off, its

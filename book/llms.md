@@ -5,7 +5,7 @@
 > built-in SQLite. There is no package file, no build step and no JavaScript to write.
 > `quillo run` serves the program; `quillo check` checks it without running it.
 
-This is for Quillo 0.8.0. Features marked *(since 0.7)* came in 0.7.0. On an older release,
+This is for Quillo 0.8.1. Features marked *(since 0.7)* came in 0.7.0. On an older release,
 read its own: https://quillolang.org/v0.7.0/llms.txt or https://quillolang.org/v0.6.0/llms.txt.
 
 This file is for AI coding assistants. Quillo is new, so what you know from other

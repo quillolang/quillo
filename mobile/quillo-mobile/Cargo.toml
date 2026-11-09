@@ -2,7 +2,7 @@
 # library, Android the shared one. See ../README.md.
 [package]
 name = "quillo-mobile"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 publish = false
 license = "MIT"

@@ -196,10 +196,10 @@ After=network.target
 [Service]
 User=quillo
 WorkingDirectory=/srv/app
-ExecStart=/usr/local/bin/quillo run main.qwe --port 8080 --log json
+ExecStart=/usr/local/bin/quillo run main.qwe --port 8080 --log json --drain 60s
 EnvironmentFile=/etc/quillo/app.env
 Restart=on-failure
-TimeoutStopSec=15
+TimeoutStopSec=75
 
 [Install]
 WantedBy=multi-user.target
@@ -210,8 +210,13 @@ WantedBy=multi-user.target
 `journalctl -u app -f` follows its log.
 
 On `SIGTERM` (what `systemctl stop` and `docker stop` send), Quillo stops taking
-connections, answers the requests in progress for up to 10 seconds, and exits with status
-0; give the service manager a little longer than that, as `TimeoutStopSec=15` does.
+connections, answers every request in progress however long it takes, so a transaction
+under way commits whole, and exits with status 0. The service manager gives up on its own
+after its time (systemd's `TimeoutStopSec`, 90 s unless set) and kills the process without a
+word, so give Quillo a little less: with `--drain 60s` a request still running at 60 s is
+cut off and said in the log, before `TimeoutStopSec=75` would. Services started with
+`--split` stop after the app, once its requests are answered, though systemd signals every
+process of the unit.
 
 ## In a container
 
@@ -232,13 +237,13 @@ USER quillo
 VOLUME /app/data
 EXPOSE 8080
 CMD ["quillo", "run", "main.qwe", "--host", "0.0.0.0", \
-     "--port", "8080", "--log", "json"]
+     "--port", "8080", "--log", "json", "--drain", "60s"]
 ```
 
 ```sh
 docker build -t my-app .
 docker run -d --name my-app -p 127.0.0.1:8080:8080 -v my-app-data:/app/data \
-    -e QUILLO_SECRET=... --stop-timeout 15 my-app
+    -e QUILLO_SECRET=... --stop-timeout 75 my-app
 ```
 
 The program opens its database at `data/app.db`, on the volume, so it outlasts the

@@ -203,7 +203,7 @@ fn a_stop_waits_for_a_transaction_longer_than_ten_seconds_and_takes_no_new_reque
         std::thread::sleep(Duration::from_millis(20));
     }
     // Every 5 s it says what it still waits for; before, the request was cut off at 10 s.
-    s.says("quillo: still answering GET /pay", Duration::from_secs(8));
+    s.says("quillo: still waiting for GET /pay", Duration::from_secs(8));
     let answer = paying.join().unwrap();
     assert!(answer.starts_with("HTTP/1.1 200"), "{}", answer);
     assert!(answer.ends_with("paid"), "{}", answer);
@@ -318,22 +318,31 @@ fn a_stop_finishes_sending_a_large_file() {
     let big: Vec<u8> = (0..24u32 << 20).map(|i| (i % 251) as u8).collect();
     std::fs::write(d.join("big.bin"), &big).unwrap();
     let mut s = Run::start(&d, "main.qwe", &[]);
-    let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
-    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-    c.write_all(b"GET /big HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
-    let mut first = [0u8; 4096];
-    let n = c.read(&mut first).unwrap();
-    // The download is under way, and waits for the reader: the stop is asked for then.
+    // Two downloads under way, each waiting for its reader: the stop is asked for then.
+    let begun = |port: u16| {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        c.write_all(b"GET /big HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        let mut first = vec![0u8; 4096];
+        let n = c.read(&mut first).unwrap();
+        first.truncate(n);
+        (c, first)
+    };
+    let whole = |(mut c, mut got): (TcpStream, Vec<u8>)| {
+        let _ = c.read_to_end(&mut got);
+        got.windows(4).position(|w| w == b"\r\n\r\n").map(|at| got[at + 4..].to_vec()).unwrap_or_default()
+    };
+    let (one, two) = (begun(s.port), begun(s.port));
     std::thread::sleep(Duration::from_millis(500));
     s.signal(libc::SIGTERM);
-    std::thread::sleep(Duration::from_millis(1500));
-    let mut rest = Vec::new();
-    let _ = c.read_to_end(&mut rest);
-    let mut got = first[..n].to_vec();
-    got.extend(rest);
-    let body = got.windows(4).position(|w| w == b"\r\n\r\n").map(|at| got[at + 4..].to_vec()).unwrap_or_default();
+    // Said every 5 s, as the requests are.
+    s.says("quillo: still waiting for 2 files being sent (again to stop now)", Duration::from_secs(8));
+    let body = whole(one);
     assert_eq!(body.len(), big.len(), "the download was cut off\n{}", s.log());
     assert!(body == big);
+    s.says("quillo: still waiting for 1 file being sent (again to stop now)", Duration::from_secs(8));
+    let body = whole(two);
+    assert_eq!(body.len(), big.len(), "the second download was cut off\n{}", s.log());
     assert_eq!(s.ends(Duration::from_secs(5)).0, Some(0), "{}", s.log());
 }
 
@@ -389,6 +398,20 @@ fn a_split_services_first_signal_after_its_app_told_it_to_stop_is_a_first() {
     assert_eq!(s.ends(Duration::from_secs(10)).0, Some(0), "{}", s.log());
     assert!(gone_within(services[0], Duration::from_secs(2)));
     assert_eq!(rows(&d, "billing.db", "select n from done"), "[{ n: 3000 }]", "{}", s.log());
+}
+
+#[test]
+fn a_split_service_signalled_twice_while_its_app_runs_stops_at_once() {
+    let d = dir("split-twice", &[("main.qwe", SPLIT_APP), ("billing.qwe", BILLING)]);
+    let s = Run::start(&d, "main.qwe", &["--split"]);
+    let services = s.children();
+    unsafe { libc::kill(services[0], libc::SIGTERM) };
+    s.says("[billing] quillo: stopping when the app stops", Duration::from_secs(5));
+    unsafe { libc::kill(services[0], libc::SIGTERM) };
+    // The app, still running, sees it end at once, and starts it again.
+    let log = s.says("quillo: service billing stopped", Duration::from_secs(5));
+    assert!(log.contains("130"), "{}", log);
+    assert!(gone_within(services[0], Duration::from_secs(2)));
 }
 
 #[test]
@@ -484,6 +507,17 @@ route POST /i = idempotent({ max_age: 60 }, () => billing.relay())
 route POST /j = idempotent({ transaction: true }, () => billing.charge("j", 1))
 route POST /o = order()
 fn order() = idempotent(() => billing.charge("o", 1))
+let handler = () => billing.charge("v", 1)
+route POST /v = idempotent(handler)
+fn make() = () => billing.charge("m", 1)
+route POST /m = idempotent(make())
+route POST /t = idempotent(() => {
+    billing.charge("t", 1)
+    billing.refund("t")
+    shop.order("t")
+})
+fn wrap(f) = idempotent(f)
+route POST /w = wrap(() => billing.charge("w", 1))
 "#;
 
 const IDEMPOTENT_BILLING: &str = r#"db.open("billing.db")
@@ -525,12 +559,16 @@ fn check_warns_where_idempotent_changes_data_in_another_program() {
     // site's; a function named, not written there; a service's that changes data in another
     // service; `transaction: true` written out. Not: a function that only reads, one run without
     // the transaction, and one made later, which waits in the transaction's own database.
-    let want: Vec<(u32, String)> = [(6, "billing.charge"), (7, "billing.charge"), (10, "billing.charge"), (14, "shop.order"), (16, "billing.charge"), (17, "billing.relay"), (18, "billing.charge"), (20, "billing.charge")]
+    let want: Vec<(u32, String)> = [(6, "billing.charge"), (7, "billing.charge"), (10, "billing.charge"), (14, "shop.order"), (16, "billing.charge"), (17, "billing.relay"), (18, "billing.charge"), (20, "billing.charge"), (22, "billing.charge"), (25, "billing.charge")]
         .iter()
         .map(|(l, c)| (*l, c.to_string()))
         .collect();
     assert_eq!(said, want, "{}", err);
     let line = err.lines().find(|l| l.contains("main.qwe:10: warning:")).unwrap();
+    // A variable that holds a function is read (22); a function a call gives (24) and a
+    // parameter (30) are not: not warned of. Three: the first named, the two others counted.
+    let three = err.lines().find(|l| l.contains("main.qwe:25: warning:")).unwrap();
+    assert!(three.contains("outside its transaction (and 2 more such calls): when"), "{}", three);
     assert!(line.contains("`idempotent` reaches `billing.charge`, which may change data in another program, outside its transaction (and 1 more such call): when that call's answer is lost, the key is given up and a retry with it runs the call there again, under a new call id. Give `idempotent` `{ transaction: false }`, which keeps every answer, failures too, or send an id the other program's change is keyed by, so that a second run changes nothing"), "{}", line);
     // A warning: the program still starts.
     assert!(o.status.success(), "{}", err);

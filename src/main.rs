@@ -1560,7 +1560,7 @@ fn begin_stop(again: bool) {
                 std::process::exit(0);
             }
             if !running.is_empty() {
-                eprintln!("quillo: still answering {} (again to stop now)", running.join(", "));
+                eprintln!("quillo: still waiting for {} (again to stop now)", running.join(", "));
             }
         }
     });
