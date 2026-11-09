@@ -28,7 +28,7 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: The release, with the CHANGELOG's section for it as its notes
         env:
           GH_TOKEN: ${{ github.token }}
@@ -64,7 +64,7 @@ jobs:
       TAG: ${{ inputs.tag || github.ref_name }}
       GO: ${{ inputs.target == '' || inputs.target == matrix.target }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: env.GO == 'true'
         with:
           ref: ${{ env.TAG }}
