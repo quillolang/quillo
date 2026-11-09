@@ -453,7 +453,7 @@ fn render(rpc: Option<&str>, r: R) -> Result<HttpResponse, Ctrl> {
         Err(Ctrl::Reply(x)) => crate::server::finish(Err(Ctrl::Reply(x))),
         Err(Ctrl::Error(e)) => {
             eprintln!("quillo: error in server fn `{}`: {:#}", name, e);
-            json(500, serde_json::json!({ "error": format!("internal error in `{}`", name) }))
+            json(500, serde_json::json!({ "error": crate::server::rpc_failure(name, &e) }))
         }
     })
 }

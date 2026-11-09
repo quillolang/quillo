@@ -5679,6 +5679,9 @@ async function rpcSend(name, args, live, idem) {
   let body = null, text = "", cut = false;
   try { text = await r.text(); } catch (_) { cut = true; }
   try { body = readJSON(text); if (!body || !hasOwn(body, "patch")) body = untagDeep(body); } catch (_) {}
+  // In development the server says why, and the console says it too, with its place, as an
+  // error in the page does (FEEDBACK64.md, Q-933; branch feedback64).
+  if (DEV && r.status === 500 && body && body.error) report(`server fn \`${name}\` failed: ${body.error}`); // dev
   if (!r.ok) return { ...failed(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`), unanswered: RETRIED.includes(r.status) };
   // A 2xx that is no answer, a sign-in page a redirect led to, nothing, a body cut short, gave
   // `null` as if the call had worked. The server marks what it sends, since `respond` and `reply`

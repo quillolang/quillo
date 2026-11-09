@@ -1,0 +1,12 @@
+// A server fn that fails as it runs (FEEDBACK64.md, Q-933): what the page's value and the
+// console say, under --watch and without.
+server fn down(val: int) -> int = val / (val - val)
+
+component Counter() {
+    state val = 1
+    <div><span id="v">{val}</span>
+        <button id="down" @click={() => { val = down(val) }}>Down</button>
+    </div>
+}
+
+route GET / = <html><body><Counter/></body></html>

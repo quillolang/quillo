@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- `quillo check` warns when a call of the program's own function that changes nothing is
+  dropped, in a handler or a function's code: `onclick={() => down(val)}` did nothing and nothing
+  said so. It says what to write (`val = down(val)`), and for a `server fn` that its arguments
+  are copies; the fix is an assignment only where what it gives fits the variable. A call is left
+  alone when the function assigns one of the program's variables or one it did not declare, sets a
+  page object's field, calls a method on what may be a page object or a map of functions, prints,
+  waits (`sleep`, `page_updated`), schedules (`run_after`, `every`), publishes, reaches the
+  database, the network or files, hands a function it was given to a builtin that calls it, can
+  give an error (that warning says so), or calls what the checker cannot read; and at the top
+  level of a program (FEEDBACK64.md, Q-931).
+- `set(xs, [0], v)` and `set(xs, "a", v)` on a list are refused by `quillo check`: a list's index
+  is an int. They had passed, and failed every time they ran. On what may be null, a key is taken,
+  as `set` makes a map of null (Q-932).
+- `xs[0] = 5`, `xs[0] += 1`, `m["k"] = 5` and `m.k = 5` are refused with what to write:
+  `xs = set(xs, 0, 5)`, `m = { ...m, k: 5 }`, and for a page object `el.value = x` (Q-934).
+- Under `--watch`, a `server fn` that fails says why in its 500, with its file, line and the calls
+  it came through, so the page's error value reads
+  ``server fn `down` failed (500): main.qwe:9: division by zero``, and
+  the browser's console says it too; a visitor still sees only `internal error in down` (Q-933).
+- llms.txt says what a top-level `let` is: one value for every visitor, reset at a restart and
+  on each save under `--watch`, one per instance (Q-935).
 - Requests are answered with less work: what each request is (for the log and a stop's
   progress line) is kept by its event loop and made without `format!`, not in one map for all
   of them behind one lock; a path or query with nothing to decode is not decoded byte by byte;

@@ -432,7 +432,8 @@ route they become a 500 response, and the server logs them.
 
 A runtime error says where it happened and how it got there, in the terminal, the log and,
 under [`--watch`](#options-of-quillo-run) (the option you start a program with while working on it,
-`quillo run main.qwe --watch`), on the page. A visitor sees only `internal error`:
+`quillo run main.qwe --watch`), on the page: a route's page, and the error value a page's call of a
+`server fn` gives, which the browser's console shows too. A visitor sees only `internal error`:
 
 ```
 quillo: price.qwe:2: division by zero

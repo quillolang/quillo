@@ -1964,6 +1964,13 @@ struct Checker {
     ret_cache: HashMap<usize, T>,
     in_progress: HashSet<usize>,
     effect_cache: HashMap<usize, u8>,
+    /// Whether a call of the program's function can change anything, by its definition
+    /// (`changes_anything`; FEEDBACK64.md, Q-931; branch feedback64).
+    changes_cache: HashMap<usize, Result<bool, usize>>,
+    /// How deep `changes_anything` is, and the least depth of a function still being read that it
+    /// reached.
+    changes_depth: usize,
+    changes_low: usize,
     /// Functions of `.qwer` files the program uses, with their files.
     natives: Vec<(Arc<str>, crate::native::Export)>,
     /// Names browser libraries give (`client "...js" use Chart`): each with its
@@ -2155,6 +2162,9 @@ impl Checker {
             ret_cache: HashMap::new(),
             in_progress: HashSet::new(),
             effect_cache: HashMap::new(),
+            changes_cache: HashMap::new(),
+            changes_depth: 0,
+            changes_low: usize::MAX,
             natives: Vec::new(),
             js_libs: Vec::new(),
             links: Default::default(),
@@ -2879,7 +2889,7 @@ impl Checker {
                 other => {
                     self.scopes.clear();
                     // `xs.push(2)`, `i + 1` alone at the top level (FEEDBACK45.md, Q-505).
-                    self.answer_dropped(other);
+                    self.answer_dropped(other, false);
                     self.op_dropped(other);
                     self.stmt(other, false);
                 }
@@ -4646,7 +4656,7 @@ impl Checker {
             }
             // `el.value = x`: a field of one of the page's objects, which only
             // a component has; a map's fields are made anew, not set.
-            Stmt::SetField(o, name, _, e, line) => {
+            Stmt::SetField(o, name, op, e, line) => {
                 self.line = *line;
                 let t = self.expr(o);
                 self.expr(e);
@@ -4659,14 +4669,14 @@ impl Checker {
                     // In a route nothing here is about a page (FEEDBACK26.md, Q-201;
                     // branch feedback26-fixes).
                     self.error(format!("cannot set `{}` on `session`: use `set_session({{ {}: ... }})`", name, name));
+                } else if !t.vague() && t.bits & MAP != 0 {
+                    // `m.k = 5`: a map is a value, made anew; what to write, with what was written
+                    // (FEEDBACK64.md, Q-934; branch feedback64).
+                    self.error(map_field_advice(o, name, *op, e));
                 } else if self.in_component().is_none() && !helper {
                     self.error(format!("cannot set `{}`: only the page's objects (an element, an event) have fields that are set, in a component", name));
                 } else if !t.vague() {
-                    if t.bits & MAP != 0 {
-                        self.error(format!("a map's fields are not set in place: write `m = set(m, \"{}\", …)`", name));
-                    } else {
-                        self.error(format!("{} has no field `{}` to set: only the page's objects (an element, an event) do", t_text(t), name));
-                    }
+                    self.error(format!("{} has no field `{}` to set: only the page's objects (an element, an event) do", t_text(t), name));
                 }
                 T::of(NIL)
             }
@@ -5824,7 +5834,7 @@ impl Checker {
                 let mut never = false;
                 for (i, s) in stmts.iter().enumerate() {
                     if i + 1 < stmts.len() {
-                        self.answer_dropped(s);
+                        self.answer_dropped(s, true);
                         self.op_dropped(s);
                         self.redirect_dropped(s);
                     }
@@ -6088,8 +6098,13 @@ impl Checker {
         }
     }
 
-    fn answer_dropped(&mut self, s: &Stmt) {
+    /// `own`: the program's own functions too (Q-931), in a function's, a route's or a handler's
+    /// code; not at the top level, where a call alone is a script's or a probe's.
+    fn answer_dropped(&mut self, s: &Stmt, own: bool) {
         let Stmt::Expr(e) = s else { return };
+        if own && self.own_answer_dropped(e) {
+            return;
+        }
         // What it was given, by name if it was a name: `xs` of `xs.push(2)`, `push(xs, 2)` and
         // `xs | push(2)`, for the message.
         let (name, on, given, line) = match e {
@@ -6132,9 +6147,300 @@ impl Checker {
             if !t.is_some_and(|t| t.bits != ANY && t.bits & (LIST | MAP) != 0 && t.bits & !(LIST | MAP | NIL) == 0) {
                 return;
             }
+            // `cache.set(k, v)` on a map with a field `set`: its own function, called (found in
+            // review of FEEDBACK64.md's Q-931; branch feedback64).
+            if t.and_then(|t| t.fields()).is_some_and(|fs| fs.iter().any(|(k, _)| &**k == name)) {
+                return;
+            }
         }
         let x = given.unwrap_or_else(|| "x".to_string());
         self.warn(format!("`{}` gives a new value and changes nothing, and it is dropped here: write `{} = {} | {}(...)`", name, x, x, name));
+    }
+
+    /// `down(val)` alone, `down` the program's own function, one that changes nothing: what it
+    /// gives is all it does, and it is dropped. A `server fn`'s arguments are copies too, which a
+    /// newcomer reads as the page's own: the button did nothing, and nothing said so
+    /// (FEEDBACK64.md, Q-931; branch feedback64). Whether it warned.
+    fn own_answer_dropped(&mut self, e: &Expr) -> bool {
+        let (name, args, piped, line) = match e {
+            Expr::Call(f, args, line) => match &**f {
+                Expr::Ident(n, _) => (n.to_string(), args.as_slice(), None, *line),
+                _ => return false,
+            },
+            Expr::Pipe(l, r, line) => match &**r {
+                Expr::Call(f, args, _) => match &**f {
+                    Expr::Ident(n, _) => (n.to_string(), args.as_slice(), Some(&**l), *line),
+                    _ => return false,
+                },
+                Expr::Ident(n, _) => (n.to_string(), &[][..], Some(&**l), *line),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        if self.is_local(&name) {
+            return false;
+        }
+        let Some(sig) = self.globals.get(&name).and_then(|v| v.sig.clone()) else { return false };
+        // A function declared, under its name: not a variable holding one (`let hook = (x) => x`),
+        // which the walk below takes as one that may hold any.
+        let Some(d) = sig.def.clone().filter(|d| !sig.builtin && sig.native.is_none() && !sig.component && d.name == name) else { return false };
+        // A call the checker refuses already (an argument missing, one too many): that is said.
+        let given = args.len() + usize::from(piped.is_some());
+        if given < d.params.iter().filter(|p| p.default.is_none()).count() || given > d.params.len() {
+            return false;
+        }
+        // A function given to it changes something only if it is called, and the walk below takes a
+        // parameter called, or given to a builtin that calls functions (`run_after(ms, done)`), as a
+        // change: `flash(2000, () => { saved = false })` (found in review).
+        let held = |c: &Self, n: &str| c.scopes.iter().rev().find_map(|s| s.get(n)).or_else(|| c.globals.get(n)).map(|v| v.t);
+        // One that may give an error is run for it as well (`check_age(a)?`): the check of a
+        // dropped error says that, by the same signs, its type, `! T`, or an error made or passed
+        // on in its body (`error_dropped`; found in review).
+        let ret = sig.ret.unwrap_or_else(|| self.fn_ret(&sig));
+        let mut fails = d.err.is_some() || sig.err.is_some() || (ret.bits != ANY && ret.bits & ERR != 0);
+        walk_expr(&d.body, &mut |e| {
+            fails |= matches!(e, Expr::Try(_)) || matches!(e, Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(n, _) if n == "err"));
+        });
+        if fails {
+            return false;
+        }
+        if self.changes_anything(&d) {
+            return false;
+        }
+        self.line = line;
+        let first = piped.or(args.first());
+        let given = match first {
+            Some(Expr::Ident(n, _)) => Some(n.to_string()),
+            _ => None,
+        };
+        // `x = f(x)` only where what it gives can be held by `x`: `cart = total_of(cart)` would make
+        // a list an int (found in review).
+        // What the variable holds: its type, or, not known, the type of the parameter it is given
+        // to, which it passed (`down(val: int)`).
+        let had = given.as_ref().and_then(|x| held(self, x)).filter(|h| !h.vague()).or_else(|| d.params.first().and_then(|p| p.ty.as_ref()).map(ty_t));
+        let fits = had.is_some_and(|h| !h.vague() && !ret.vague() && ret.bits != 0 && ret.bits & !h.bits == 0);
+        let call = match (piped, args.len()) {
+            (Some(_), 0) => format!("{} | {}", given.as_deref().unwrap_or("x"), name),
+            (Some(_), _) => format!("{} | {}(...)", given.as_deref().unwrap_or("x"), name),
+            (None, 1) => format!("{}({})", name, given.as_deref().unwrap_or("...")),
+            (None, 0) => format!("{}()", name),
+            (None, _) => format!("{}({}, ...)", name, given.as_deref().unwrap_or("...")),
+        };
+        let fix = match &given {
+            Some(x) if fits => format!(": write `{} = {}`", x, call),
+            _ => ": use what it gives, or leave the call out".to_string(),
+        };
+        let copies = match (&given, sig.server || d.server) {
+            (Some(x), true) => format!("; a `server fn`'s arguments are copies, so the server cannot change `{}`", x),
+            _ => String::new(),
+        };
+        self.warn(format!("`{}` changes nothing, and what it gives is dropped here{}{}", name, fix, copies));
+        true
+    }
+
+    /// Whether a call of `d` can change anything: assign a name of the program's or one it did
+    /// not declare, set a page object's field, call a builtin that acts or reaches the database,
+    /// the network or files, ask the user, call what the checker cannot read (a function held in a
+    /// variable, a native plugin's, a service's, a component), hand a function of its own to a
+    /// builtin that calls functions, or call a method on what may be a page object or a map of
+    /// functions. Its own functions are read through; one read again while it is read (recursion)
+    /// adds nothing (FEEDBACK64.md, Q-931; branch feedback64).
+    fn changes_anything(&mut self, d: &Arc<FnDef>) -> bool {
+        let key = Arc::as_ptr(d) as usize;
+        match self.changes_cache.get(&key) {
+            Some(Ok(c)) => return *c,
+            Some(Err(depth)) => {
+                self.changes_low = self.changes_low.min(*depth);
+                return false;
+            }
+            None => {}
+        }
+        let depth = self.changes_depth;
+        self.changes_depth += 1;
+        self.changes_cache.insert(key, Err(depth));
+        let saved = std::mem::replace(&mut self.changes_low, usize::MAX);
+        let c = self.changes_in(d);
+        let low = self.changes_low;
+        self.changes_depth -= 1;
+        self.changes_low = saved.min(low);
+        // "Nothing" is kept once what it reached is done: one that reached a function still being
+        // read above it (`b`, called by `a`, calling `a`) is read again later; one that reached
+        // only itself is done (found in review: kept for none, a chain over a recursive function
+        // took exponential time).
+        if c || low >= depth {
+            self.changes_cache.insert(key, Ok(c));
+        } else {
+            self.changes_cache.remove(&key);
+        }
+        c
+    }
+
+    fn changes_in(&mut self, d: &FnDef) -> bool {
+        #[derive(PartialEq, Eq, Hash)]
+        enum Recv {
+            Literal,
+            Name(String),
+            Other,
+        }
+        #[derive(PartialEq, Eq, Hash)]
+        enum Found {
+            Changes,
+            Assigns(String),
+            Calls(String),
+            Names(String),
+            Method(Recv, String),
+            /// A name of its own given to the builtin `.0` as argument `.1`.
+            Passed(String, usize, String),
+        }
+        if d.component || d.effects.as_ref().is_some_and(|e| !e.is_empty()) {
+            return true;
+        }
+        let params: HashMap<String, Option<T>> = d.params.iter().map(|p| (p.name.to_string(), p.ty.as_ref().map(ty_t))).collect();
+        // What it declares anywhere in it (a `let`, a loop's, a match's, a lambda's), and its own
+        // functions, whose code is read here.
+        let mut declared: HashSet<String> = HashSet::new();
+        let mut fns: HashSet<String> = HashSet::new();
+        let mut found: HashSet<Found> = HashSet::new();
+        let mut names = Vec::new();
+        let recv = |o: &Expr| match o {
+            Expr::Lit(_) | Expr::List(_) | Expr::Map(_) | Expr::Template(_) => Recv::Literal,
+            Expr::Ident(n, _) => Recv::Name(n.to_string()),
+            _ => Recv::Other,
+        };
+        let passed = |callee: &str, args: &[Expr], from: usize, found: &mut HashSet<Found>| {
+            for (i, a) in args.iter().enumerate() {
+                if let Expr::Ident(n, _) = a {
+                    found.insert(Found::Passed(callee.to_string(), i + from, n.to_string()));
+                }
+            }
+        };
+        walk_fn(d, &mut |x| match x {
+            Expr::Block(stmts) => {
+                for s in stmts {
+                    match s {
+                        Stmt::Let(p, _, _) => pattern_names(p, &mut names),
+                        Stmt::Fn(f) => {
+                            fns.insert(f.name.to_string());
+                        }
+                        Stmt::Assign(n, ..) => {
+                            found.insert(Found::Assigns(n.to_string()));
+                        }
+                        Stmt::SetField(..) | Stmt::State(..) | Stmt::Route(..) | Stmt::Service(..) | Stmt::Mount(..) | Stmt::Use(..) | Stmt::Type(..) => {
+                            found.insert(Found::Changes);
+                        }
+                        Stmt::Expr(_) | Stmt::Return(..) => {}
+                    }
+                }
+            }
+            Expr::For(p, ..) => pattern_names(p, &mut names),
+            Expr::Match(_, arms, _) => arms.iter().for_each(|a| pattern_names(&a.pat, &mut names)),
+            Expr::Lambda(l) => names.extend(l.params.iter().map(|p| p.name.to_string())),
+            Expr::Call(c, args, _) => match &**c {
+                Expr::Ident(n, _) => {
+                    found.insert(Found::Calls(n.to_string()));
+                    passed(n, args, 0, &mut found);
+                }
+                Expr::Field(o, m, _) => {
+                    found.insert(Found::Method(recv(o), m.clone()));
+                    passed(m, args, 1, &mut found);
+                }
+                _ => {
+                    found.insert(Found::Changes);
+                }
+            },
+            Expr::Pipe(_, r, _) => match &**r {
+                Expr::Call(c, args, _) => {
+                    if let Expr::Ident(n, _) = &**c {
+                        passed(n, args, 1, &mut found);
+                    }
+                }
+                Expr::Ident(n, _) => {
+                    found.insert(Found::Calls(n.to_string()));
+                }
+                _ => {
+                    found.insert(Found::Changes);
+                }
+            },
+            Expr::Ident(n, _) => {
+                found.insert(Found::Names(n.to_string()));
+            }
+            Expr::Reply(..) => {
+                found.insert(Found::Changes);
+            }
+            Expr::Html(el, _) if el.tag.starts_with(|c: char| c.is_ascii_uppercase()) => {
+                found.insert(Found::Calls(el.tag.to_string()));
+            }
+            _ => {}
+        });
+        declared.extend(names);
+        let own = |n: &str| params.contains_key(n) || declared.contains(n);
+        for f in found {
+            let changes = match f {
+                Found::Changes => true,
+                // A name of the program's, assigned, whatever local of that name is declared
+                // somewhere in it; any other not its own (found in review: a lambda's `total` hid
+                // the global's).
+                Found::Assigns(n) => !params.contains_key(&n) && (self.globals.get(&n).is_some_and(|v| v.sig.is_none() && &*v.file != "<builtin>") || !declared.contains(&n)),
+                Found::Calls(n) | Found::Names(n) if fns.contains(&n) => false,
+                // A value of its own, called: it may run anything.
+                Found::Calls(n) if own(&n) => true,
+                Found::Names(n) if own(&n) => false,
+                Found::Calls(n) => self.name_changes(&n, true),
+                Found::Names(n) => self.name_changes(&n, false),
+                // Its own value given where a builtin takes a function: `map(xs, f)`,
+                // `run_after(ms, done)` call it (found in review).
+                Found::Passed(callee, at, n) => {
+                    own(&n) && !fns.contains(&n) && self.globals.get(&callee).and_then(|v| v.sig.clone()).filter(|s| s.builtin).is_some_and(|s| {
+                        s.params.get(at).or(if s.variadic { s.params.last() } else { None }).is_some_and(|p| p.ty & FN != 0)
+                    })
+                }
+                Found::Method(Recv::Literal, m) => !self.globals.get(&m).is_some_and(|v| &*v.file == "<builtin>") || builtin_changes(&m),
+                Found::Method(Recv::Name(o), m) => {
+                    if fns.contains(&o) {
+                        true
+                    } else if own(&o) {
+                        // A builtin called as a method only on what it is declared to be, a list, a
+                        // text or a number: anything else may be a page object (`el.remove()`) or a
+                        // map holding functions (`cache.set(k, v)`) (found in review).
+                        let t = params.get(&o).copied().flatten();
+                        !t.is_some_and(|t| !t.vague() && t.bits & !(LIST | STR | NUM | BOOL | NIL) == 0) || !self.globals.get(&m).is_some_and(|v| &*v.file == "<builtin>") || builtin_changes(&m)
+                    } else if self.globals.get(&format!("{}.{}", o, m)).is_some_and(|v| &*v.file == "<builtin>") {
+                        builtin_changes(&format!("{}.{}", o, m))
+                    } else if self.services.contains_key(&o) || self.sites.contains(&o) {
+                        true
+                    } else {
+                        let t = self.globals.get(&o).map(|v| v.t);
+                        !t.is_some_and(|t| !t.vague() && t.bits & !(LIST | STR | NUM | BOOL | NIL) == 0) || !self.globals.get(&m).is_some_and(|v| &*v.file == "<builtin>") || builtin_changes(&m)
+                    }
+                }
+                Found::Method(Recv::Other, _) => true,
+            };
+            if changes {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether calling `n`, or naming it (a function named may be called later), a name not
+    /// `d`'s own, can change anything.
+    fn name_changes(&mut self, n: &str, called: bool) -> bool {
+        let Some(v) = self.globals.get(n) else { return called };
+        if &*v.file == "<builtin>" {
+            return builtin_changes(n);
+        }
+        // A variable, called: it may hold any function by then, whatever it was given first. A
+        // function declared is the one its signature was made of, under its name.
+        if !v.sig.as_ref().and_then(|s| s.def.as_ref()).is_some_and(|d| d.name == n) {
+            return called;
+        }
+        match v.sig.clone() {
+            Some(sig) if sig.native.is_none() && !sig.component => match sig.def.clone() {
+                Some(d) => self.changes_anything(&d),
+                None => true,
+            },
+            _ => true,
+        }
     }
 
     /// `save_upload(f, f.filename)`, or a path ending in the visitor's name with no folder of the
@@ -7545,6 +7851,17 @@ impl Checker {
                 self.error(format!("`{}` takes {} argument{}, got {}{}{}", name, n, if n == 1 { "" } else { "s" }, args.len(), shown, hides(&sig, name)));
             }
         }
+        // `set(xs, [0], v)`: on a list the index is the item's place, an int, as it runs; a map
+        // takes any key (an int as text, Q-019). Argument 2's type follows argument 1's, which the
+        // one type a parameter has cannot say (FEEDBACK64.md, Q-932; branch feedback64).
+        if sig.builtin && name == "set" {
+            if let (Some(on), Some(at)) = (args.first(), args.get(1)) {
+                // A list only: on null `set` makes a map, which takes the key (found in review).
+                if on.bits == LIST && at.bits != 0 && at.bits & INT == 0 {
+                    self.error(format!("argument 2 of `set` on a list must be int, got {}: the item's place, `xs = set(xs, 0, v)`", bits_text(at.bits)));
+                }
+            }
+        }
         for (i, p) in sig.params.iter().enumerate() {
             let what = || if sig.builtin { format!("argument {}", i + 1) } else { format!("argument `{}`", p.name) };
             match args.get(i) {
@@ -8001,7 +8318,7 @@ impl Checker {
                         e => Some(Stmt::Expr(e.clone())),
                     };
                     if let Some(last) = last {
-                        self.answer_dropped(&last);
+                        self.answer_dropped(&last, true);
                         self.op_dropped(&last);
                     }
                 }
@@ -9101,6 +9418,40 @@ fn osa_distance(a: &str, b: &str) -> usize {
         }
     }
     d[a.len()][b.len()]
+}
+
+/// What `m.k = v` (or `+=`, `-=`) on a map is written as: a new map, assigned to the variable
+/// (FEEDBACK64.md, Q-934; branch feedback64).
+fn map_field_advice(o: &Expr, name: &str, op: AssignOp, e: &Expr) -> String {
+    let Expr::Ident(m, _) = o else {
+        return format!("a map does not change in place: make the new one, `m = set(m, \"{}\", v)`, and assign it to its variable", name);
+    };
+    let v = written(e);
+    let value = match op {
+        AssignOp::Set => v,
+        AssignOp::Add => format!("{}.{} + {}", m, name, v),
+        AssignOp::Sub => format!("{}.{} - {}", m, name, v),
+    };
+    format!("a map does not change in place: `{m} = {{ ...{m}, {}: {value} }}` or `{m} = set({m}, \"{name}\", {value})`", key_written(name).unwrap_or_else(|| name.to_string()))
+}
+
+/// Whether a builtin can change anything, or reach outside: what the view cache says acts (a
+/// random number apart), the database, the network, files, or code the checker cannot read, or
+/// asking the user (FEEDBACK64.md, Q-931; branch feedback64).
+fn builtin_changes(n: &str) -> bool {
+    let effect = crate::ast::builtin_effect(n);
+    let outside = ["db", "http", "fs", "net"].iter().fold(0, |m, e| m | crate::ast::effect_bit(e));
+    (crate::viewcache::kind(n) == crate::viewcache::Kind::Acts && effect != crate::ast::effect_bit("random"))
+        || effect & outside != 0
+        || n.starts_with("db.")
+        || n.starts_with("http.")
+        || matches!(n, "js" | "js_new" | "run_script" | "ask" | "about" | "confirm")
+        // What the view cache takes for reads, as no page shows them, but a call does for its own
+        // sake: a line in the log, a wait, the page moved, a function run for a tenant or a locale.
+        || matches!(n, "print" | "sleep" | "navigate" | "live" | "with_tenant" | "with_locale" | "notify" | "exit")
+        // A browser's, which the view cache takes for nothing as they do nothing on the server
+        // (found in review).
+        || matches!(n, "every" | "run_after" | "page_updated")
 }
 
 fn assigned_in(e: &Expr, out: &mut HashSet<String>) {

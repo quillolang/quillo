@@ -519,9 +519,11 @@ fn a_name_defined_twice_is_an_error() {
 fn fields_of_the_pages_objects_are_set_in_components() {
     clean("component Picker() {\n    <input type=\"file\" @change={(e) => { e.target.value = \"\" }}/>\n}");
     clean("component Box() {\n    <div @mount={(el) => { el.scrollTop += 10 }}></div>\n}");
-    one("component C() {\n    state m = { a: 1 }\n    <button @click={() => { m.a = 2 }}>x</button>\n}", "a map's fields are not set in place: write `m = set(m, \"a\", …)`");
-    one("fn f(m: map) {\n    m.a = 2\n}", "cannot set `a`: only the page's objects (an element, an event) have fields that are set, in a component");
-    one("fn f(xs: list) {\n    xs[0] = 1\n}", "only variables, and the fields of the page's objects (`el.value = x`), can be assigned to");
+    // A map's field, and a list's item, are refused with what to write, the value written in it
+    // (FEEDBACK64.md, Q-934; branch feedback64: they had said only what is not allowed).
+    one("component C() {\n    state m = { a: 1 }\n    <button @click={() => { m.a = 2 }}>x</button>\n}", "a map does not change in place: `m = { ...m, a: 2 }` or `m = set(m, \"a\", 2)`");
+    one("fn f(m: map) {\n    m.a = 2\n}", "a map does not change in place: `m = { ...m, a: 2 }` or `m = set(m, \"a\", 2)`");
+    one("fn f(xs: list) {\n    xs[0] = 1\n}", "a list does not change in place: `xs = set(xs, 0, 1)`");
 }
 
 #[test]

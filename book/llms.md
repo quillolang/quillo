@@ -208,6 +208,15 @@ route GET /assets/*path = files("public", path)
   change: keep a cart or a draft in a table, keyed by an id in the session.
 - `schedule("0 3 * * *", job)` and `every(50, tick)` go at the top level of the program;
   called in a route they are an error.
+- A top-level `let` is one value for the whole server: every request and visitor sees it, a
+  `live` loader that reads it runs again when it is assigned, and it starts afresh at a
+  restart and on each save under `--watch`. Each `--instances` copy has its own. One handler
+  runs at a time between waits, so `hits += 1` loses nothing, but a value read before a
+  `db.*` or `http.*` call may have changed after it. Keep what must last, or belongs to one
+  visitor, in the database or the session.
+- Lists and maps do not change in place: `xs = set(xs, 0, v)`, `m = { ...m, k: v }`. A
+  `server fn`'s arguments are copies, so a page changes its state with what the call gives:
+  `val = down(val)`.
 
 ## HTML, views and components
 

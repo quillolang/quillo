@@ -1541,7 +1541,7 @@ impl Interp {
                 Err(Ctrl::Reply(r)) => render_response(&r),
                 Err(Ctrl::Error(e)) => {
                     eprintln!("quillo: error in server fn `{}`: {:#}", name, e);
-                    rpc_error(500, &format!("internal error in `{}`", name))
+                    rpc_error(500, &rpc_failure(name, &e))
                 }
             };
         }
@@ -1590,7 +1590,7 @@ impl Interp {
                     Err(Ctrl::Reply(r)) => return render_response(&r),
                     Err(Ctrl::Error(e)) => {
                         eprintln!("quillo: error in server fn `{}`: {:#}", name, e);
-                        return rpc_error(500, &format!("internal error in `{}`", name));
+                        return rpc_error(500, &rpc_failure(name, &e));
                     }
                 });
                 // Neither one that read the viewer nor one that acted (see `viewcache::Kind`) can be
@@ -2221,6 +2221,19 @@ fn json_response(status: u16, j: serde_json::Value) -> HttpResponse {
 
 fn rpc_error(status: u16, msg: &str) -> HttpResponse {
     json_response(status, serde_json::json!({ "error": msg }))
+}
+
+/// What a `server fn` that failed says to the page: under `--watch` the error, its place and the
+/// calls it came through, as a route's page does, so the page's error value and the console say
+/// what the log does; else only that it failed, the message being for the program's author
+/// (FEEDBACK64.md, Q-933; branch feedback64: it had said "internal error in `down`" under `--watch`
+/// too).
+pub(crate) fn rpc_failure(name: &str, e: &crate::error::QuilloError) -> String {
+    if SHOW_ERRORS.load(std::sync::atomic::Ordering::Relaxed) {
+        format!("{:#}", e)
+    } else {
+        format!("internal error in `{}`", name)
+    }
 }
 
 /// Whether a page has a `<script>` element whose

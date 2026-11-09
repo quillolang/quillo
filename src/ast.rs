@@ -131,6 +131,44 @@ pub fn effect_names(mask: u8) -> Vec<&'static str> {
     EFFECTS.iter().enumerate().filter(|(i, _)| mask & (1 << i) != 0).map(|(_, e)| *e).collect()
 }
 
+/// A short expression as it is written, for a message that says what to write instead: a name,
+/// a number, a text, `a.b`, `a[0]`; anything longer is `...` (FEEDBACK64.md, Q-934; branch
+/// feedback64).
+pub fn written(e: &Expr) -> String {
+    match e {
+        Expr::Ident(n, _) => n.to_string(),
+        Expr::Lit(Lit::Int(n)) => n.to_string(),
+        // `2.0` stays a float: `2` would be an int (found in review).
+        Expr::Lit(Lit::Float(f)) if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e15 => format!("{:.1}", f),
+        Expr::Lit(Lit::Float(f)) => f.to_string(),
+        Expr::Lit(Lit::Bool(b)) => b.to_string(),
+        Expr::Lit(Lit::Nil) => "null".to_string(),
+        Expr::Lit(Lit::Str(s)) if s.len() <= 40 && !s.contains(['"', '\\', '\n']) => format!("\"{}\"", s),
+        Expr::Unary(UnOp::Neg, x, _) if matches!(&**x, Expr::Lit(Lit::Int(_) | Lit::Float(_))) => format!("-{}", written(x)),
+        Expr::Field(o, f, _) if matches!(&**o, Expr::Ident(..)) => format!("{}.{}", written(o), f),
+        Expr::Index(o, i, _) if matches!(&**o, Expr::Ident(..)) && !matches!(written(i).as_str(), "...") => format!("{}[{}]", written(o), written(i)),
+        _ => "...".to_string(),
+    }
+}
+
+/// A map key as a literal map writes it: `k` when it is a name, else in quotes; none when quotes
+/// alone cannot hold it (a quote, a backslash, a line break: found in review).
+pub fn key_written(k: &str) -> Option<String> {
+    let name = k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if name {
+        Some(k.to_string())
+    } else if k.chars().any(|c| c == '"' || c == '\\' || c.is_control()) {
+        None
+    } else {
+        Some(format!("\"{}\"", k))
+    }
+}
+
+/// Whether a map key is a name, as `m.k` and `el.value` write it.
+pub fn key_is_name(k: &str) -> bool {
+    key_written(k).is_some_and(|w| w == k)
+}
+
 /// The effect a builtin needs, by its name; 0 for pure builtins.
 pub fn builtin_effect(name: &str) -> u8 {
     // Reads an error value it is given; asks the database nothing.

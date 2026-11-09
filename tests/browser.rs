@@ -1465,6 +1465,28 @@ fn an_error_in_a_page_names_its_place_in_development_only() {
     assert_eq!(r["said"], serde_json::json!(["quillo: division by zero"]));
 }
 
+/// A `server fn` that fails as it runs: under `--watch` the page's error value and the console say
+/// why and where, as a route's page does; for a visitor, only that it failed (FEEDBACK64.md,
+/// Q-933; branch feedback64).
+#[test]
+fn a_failed_server_fn_says_why_in_development_only() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let (app, script) = (dir.join("rpc_failed.qwe"), dir.join("rpc_failed.js"));
+    let r = run_page_args(&chrome, &app, free_port(), "/", Some(&script), &["--watch"]);
+    let value = r["value"].as_str().unwrap_or_else(|| panic!("{}", r));
+    assert!(value.starts_with("err(\"server fn `down` failed (500): ") && value.contains("rpc_failed.qwe:3: division by zero"), "{}", r);
+    let said = r["said"].as_array().unwrap_or_else(|| panic!("{}", r));
+    assert!(said.len() == 1 && said[0].as_str().is_some_and(|s| s.starts_with("quillo: server fn `down` failed: ") && s.contains("rpc_failed.qwe:3: division by zero")), "{}", r);
+    let r = run_page_args(&chrome, &app, free_port(), "/", Some(&script), &[]);
+    let value = r["value"].as_str().unwrap_or_else(|| panic!("{}", r));
+    assert!(!value.contains("division") && !value.contains("rpc_failed.qwe") && value.starts_with("err("), "{}", r);
+    assert_eq!(r["said"], serde_json::json!([]), "{}", r);
+}
+
 /// What a developer tool hears, as `quillo:devtools` events, once the page asks with
 /// `<html data-quillo-devtools="1">`, and what it may ask; nothing at all on a page that does
 /// not ask (FEEDBACK42.md, Part C; branch feedback40-43). Also: a component inside another

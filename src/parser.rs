@@ -1429,6 +1429,13 @@ impl Parser {
                     return Ok(Stmt::SetField(*obj, name, op, rhs, line));
                 }
                 Expr::List(_) => return Err(QuilloError::new("several names are not assigned at once: `let [c, d] = [b, a + b]`, then assign each", line)),
+                // `xs[0] = 5`, `m["k"] += 1`: a list or a map is a value, which no assignment
+                // changes in place; what to write instead, with what was written (FEEDBACK64.md,
+                // Q-934; branch feedback64).
+                Expr::Index(obj, at, _) => {
+                    let rhs = self.parse_expr()?;
+                    return Err(QuilloError::new(index_assign_advice(&obj, &at, op, &rhs), line));
+                }
                 _ => return Err(QuilloError::new("only variables, and the fields of the page's objects (`el.value = x`), can be assigned to", line)),
             };
             let rhs = self.parse_expr()?;
@@ -4453,6 +4460,37 @@ fn push_text(children: &mut Vec<HtmlChild>, text: &mut String) {
 /// Whether `e` mentions `request` anywhere (closures included).
 pub(crate) fn names_request(e: &Expr) -> bool {
     request_use(|f| crate::check::walk_expr(e, f)).0
+}
+
+/// What `xs[i] = v` (or `+=`, `-=`) is written as: a new list or map, assigned to the variable;
+/// on a page object (an element, an event), its field set (FEEDBACK64.md, Q-934; branch
+/// feedback64).
+fn index_assign_advice(obj: &Expr, at: &Expr, op: AssignOp, rhs: &Expr) -> String {
+    let Expr::Ident(o, _) = obj else {
+        return "a list or a map does not change in place: make the new one with `set`, and assign it to its variable (`xs = set(xs, 0, v)`); a page object's field is set as `el.value = x`".to_string();
+    };
+    let (k, v) = (crate::ast::written(at), crate::ast::written(rhs));
+    let value = match op {
+        AssignOp::Set => v.clone(),
+        AssignOp::Add => format!("{}[{}] + {}", o, k, v),
+        AssignOp::Sub => format!("{}[{}] - {}", o, k, v),
+    };
+    match at {
+        Expr::Lit(Lit::Str(key)) => {
+            let field = |op: &str| if crate::ast::key_is_name(key) { format!("; on a page object (an element, an event), `{}.{} {} {}`", o, key, op, v) } else { String::new() };
+            let op = match op {
+                AssignOp::Set => "=",
+                AssignOp::Add => "+=",
+                AssignOp::Sub => "-=",
+            };
+            match crate::ast::key_written(key).filter(|_| k != "...") {
+                Some(kw) => format!("a map does not change in place: `{o} = {{ ...{o}, {kw}: {value} }}` or `{o} = set({o}, {k}, {value})`{}", field(op)),
+                None => format!("a map does not change in place: `{o} = set({o}, key, {value})`, the key as you wrote it"),
+            }
+        }
+        Expr::Lit(Lit::Int(_)) | Expr::Unary(UnOp::Neg, ..) => format!("a list does not change in place: `{o} = set({o}, {k}, {value})`"),
+        _ => format!("a list or a map does not change in place: `{o} = set({o}, {k}, {value})`"),
+    }
 }
 
 fn pattern_names_request(p: &Pattern) -> bool {
