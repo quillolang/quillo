@@ -137,6 +137,34 @@ pub fn secret_problems(var: impl Fn(&str) -> Option<String>) -> Vec<String> {
     warnings
 }
 
+/// Random bytes for an id (a request's, a call's): the operating system's, as `random_bytes`
+/// gives, taken 4 KiB at a time and kept by each thread, so that a request makes no system call
+/// for its id; each byte is given once and wiped. Not for a secret: that is `secret_bytes`
+/// (2026-11-09, the server benchmark: `getentropy` was 4% of a page's time). Quillo forks no
+/// process that does not exec, which would give one id twice.
+pub fn id_bytes(n: usize) -> Option<Vec<u8>> {
+    const POOL: usize = 4096;
+    thread_local! {
+        static KEPT: std::cell::RefCell<(Vec<u8>, usize)> = const { std::cell::RefCell::new((Vec::new(), 0)) };
+    }
+    if n > POOL / 16 {
+        return random_bytes(n);
+    }
+    KEPT.with(|k| {
+        let mut k = k.borrow_mut();
+        if k.1 + n > k.0.len() {
+            let mut fresh = vec![0u8; POOL];
+            getrandom::getrandom(&mut fresh).ok()?;
+            *k = (fresh, 0);
+        }
+        let at = k.1;
+        let out = k.0[at..at + n].to_vec();
+        k.0[at..at + n].fill(0);
+        k.1 += n;
+        Some(out)
+    })
+}
+
 pub fn random_bytes(n: usize) -> Option<Vec<u8>> {
     let mut b = vec![0u8; n];
     getrandom::getrandom(&mut b).ok()?;
@@ -289,6 +317,26 @@ fn equal(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 #[cfg(test)]
 mod tests {
+
+    /// Ids' bytes from the kept pool: as many as asked, never the same twice, past the pool's
+    /// end too, and the large ask from the system itself (2026-11-09).
+    #[test]
+    fn id_bytes_are_given_once() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..2000 {
+            let b = id_bytes(8).unwrap();
+            assert_eq!(b.len(), 8);
+            assert!(seen.insert(b));
+        }
+        assert_eq!(id_bytes(0).unwrap().len(), 0);
+        assert_eq!(id_bytes(256).unwrap().len(), 256);
+        assert_eq!(id_bytes(257).unwrap().len(), 257);
+        assert_eq!(id_bytes(4000).unwrap().len(), 4000);
+        // Threads have pools of their own.
+        let other = std::thread::spawn(|| id_bytes(8).unwrap()).join().unwrap();
+        assert!(!seen.contains(&other));
+    }
+
     use super::*;
 
     #[test]

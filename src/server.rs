@@ -529,14 +529,14 @@ impl Interp {
         // feedback36-39).
         let html = html && !as_written(&resp);
         if html && req.method != "HEAD" && PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
-            let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
+            let has = rfind_tag;
             if let (Some(at), false) = (has(&resp.body, b"</body>"), script_with(&resp.body, &PREFETCH_JS.as_bytes()[..40])) {
                 resp.body.splice(at..at, format!("<script>{}</script>{}", PREFETCH_JS, used_script(&self.base)).into_bytes());
             }
         }
         // A page that plays a stream loads the player.
         if html && req.method != "HEAD" {
-            let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
+            let has = rfind_tag;
             if has(&resp.body, b"<quillo-media").is_some() && !script_tag_for(&resp.body, b"/_quillo/media.js") {
                 let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
                 resp.body.splice(at..at, format!("<script src=\"{}/_quillo/media.js\" defer></script>", self.base).into_bytes());
@@ -547,7 +547,7 @@ impl Interp {
         let mut bundle_styles: Vec<String> = Vec::new();
         let mut hints = String::new();
         if html && req.method != "HEAD" && std::mem::take(&mut self.rendered_island) {
-            let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
+            let has = rfind_tag;
             let mut tags = String::new();
             // Components translate in the browser too: the page carries its
             // locale's text, read when the (deferred) bundle runs.
@@ -617,7 +617,7 @@ impl Interp {
                 link.push_str(&format!("<link rel=\"stylesheet\" href=\"{}/_quillo/s/{}.css\">", self.base, hash));
             }
             if !link.is_empty() {
-                let find = |needle: &[u8]| resp.body.windows(needle.len()).position(|w| w.eq_ignore_ascii_case(needle));
+                let find = |needle: &[u8]| find_ascii_ci(&resp.body, needle);
                 let at = match (find(b"</head>"), find(b"<body")) {
                     (Some(h), _) => h,
                     (None, Some(b)) => resp.body[b..].iter().position(|&c| c == b'>').map_or(0, |e| b + e + 1),
@@ -2215,15 +2215,29 @@ fn rpc_error(status: u16, msg: &str) -> HttpResponse {
 /// code starts with `code`: one put in already, as a mounted program's page
 /// has it, not text that quotes it, which is escaped.
 fn script_with(body: &[u8], code: &[u8]) -> bool {
-    let mut from = 0;
-    while let Some(i) = body[from..].windows(code.len()).position(|w| w == code).map(|i| i + from) {
-        from = i + code.len();
-        let before = &body[..i];
-        if before.ends_with(b"<script>") {
-            return true;
-        }
+    memchr::memmem::find_iter(body, code).any(|i| body[..i].ends_with(b"<script>"))
+}
+
+/// Where the last `needle` is in `body`, for the page's own tags, whose searchers are made once:
+/// `</body>` and `<quillo-media` (2026-11-09, the server benchmark: each search had made its
+/// own).
+fn rfind_tag(body: &[u8], needle: &[u8]) -> Option<usize> {
+    static BODY: std::sync::LazyLock<memchr::memmem::FinderRev<'static>> = std::sync::LazyLock::new(|| memchr::memmem::FinderRev::new(b"</body>"));
+    static MEDIA: std::sync::LazyLock<memchr::memmem::FinderRev<'static>> = std::sync::LazyLock::new(|| memchr::memmem::FinderRev::new(b"<quillo-media"));
+    match needle {
+        b"</body>" => BODY.rfind(body),
+        b"<quillo-media" => MEDIA.rfind(body),
+        _ => memchr::memmem::rfind(body, needle),
     }
-    false
+}
+
+/// Where `needle` (lower case, starting with a byte that has no case, as `<` does) first is in
+/// `body`, its letters in either case: `</HEAD>` is `</head>`. By the first byte's places, which
+/// memchr finds, not byte by byte: the page's scans had been a third of a page's time
+/// (2026-11-09, the server benchmark).
+fn find_ascii_ci(body: &[u8], needle: &[u8]) -> Option<usize> {
+    let (&first, _) = needle.split_first()?;
+    memchr::memchr_iter(first, body).find(|&i| body.len() - i >= needle.len() && body[i..i + needle.len()].eq_ignore_ascii_case(needle))
 }
 
 /// Whether a page has a `<script>` element whose `src` ends with `path`
@@ -2232,13 +2246,12 @@ fn script_with(body: &[u8], code: &[u8]) -> bool {
 /// can `markdown` (whose `<img src=...>` could name the same path), so a
 /// comment saying `/_quillo/quillo.js` does not stop the page loading it.
 fn script_tag_for(body: &[u8], path: &[u8]) -> bool {
-    let mut from = 0;
-    while let Some(i) = body[from..].windows(path.len()).position(|w| w == path).map(|i| i + from) {
-        from = i + path.len();
+    for i in memchr::memmem::find_iter(body, path) {
+        let from = i + path.len();
         if !matches!(body.get(from), Some(b'"' | b'\'' | b'?' | b'#')) {
             continue;
         }
-        let Some(lt) = body[..i].iter().rposition(|b| *b == b'<') else { continue };
+        let Some(lt) = memchr::memrchr(b'<', &body[..i]) else { continue };
         let tag = &body[lt..i];
         if tag.len() > 7 && tag[..7].eq_ignore_ascii_case(b"<script") && matches!(tag[7], b' ' | b'\t' | b'\n' | b'/') && !tag.contains(&b'>') {
             return true;
@@ -4032,6 +4045,40 @@ fn island_loader(srcs: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The page's scans by memchr find what the byte-by-byte ones did (2026-11-09, the server
+    /// benchmark), at the edges too.
+    #[test]
+    fn the_pages_scans_find_what_they_did() {
+        let ci = |b: &[u8], n: &[u8]| find_ascii_ci(b, n);
+        assert_eq!(ci(b"<head></head><body>", b"</head>"), Some(6));
+        assert_eq!(ci(b"<HEAD></HEAD>", b"</head>"), Some(6));
+        assert_eq!(ci(b"</HeAd>", b"</head>"), Some(0));
+        assert_eq!(ci(b"x</head", b"</head>"), None);
+        assert_eq!(ci(b"</hea", b"</head>"), None);
+        assert_eq!(ci(b"", b"</head>"), None);
+        assert_eq!(ci(b"a < b </head>", b"</head>"), Some(6));
+        assert_eq!(ci(b"<<body", b"<body"), Some(1));
+        assert_eq!(ci(b"x", b""), None);
+        // The first of two.
+        assert_eq!(ci(b"</head></head>", b"</head>"), Some(0));
+        // A script's own code, only in a <script> of its own.
+        assert!(script_with(b"<body><script>abc</script>", b"abc"));
+        assert!(!script_with(b"<body>abc<script>x</script>", b"abc"));
+        assert!(script_with(b"abc <script>abc", b"abc"));
+        assert!(!script_with(b"", b"abc"));
+        assert!(!script_with(b"<script>ab", b"abc"));
+        // A tag that loads the path, not text that names it.
+        assert!(script_tag_for(b"<script src=\"/_quillo/quillo.js\" defer>", b"/_quillo/quillo.js"));
+        assert!(script_tag_for(b"<p>x</p><SCRIPT\nsrc='/b/_quillo/quillo.js?v=1'>", b"/_quillo/quillo.js"));
+        assert!(!script_tag_for(b"<p>/_quillo/quillo.js\"</p>", b"/_quillo/quillo.js"));
+        assert!(!script_tag_for(b"<script>x</script> /_quillo/quillo.js\"", b"/_quillo/quillo.js"));
+        assert!(!script_tag_for(b"<scripts src=\"/_quillo/quillo.js\">", b"/_quillo/quillo.js"));
+        assert!(!script_tag_for(b"<script src=\"/_quillo/quillo.jsx\">", b"/_quillo/quillo.js"));
+        assert!(!script_tag_for(b"/_quillo/quillo.js\"", b"/_quillo/quillo.js"));
+        // A second mention after one that is text.
+        assert!(script_tag_for(b"<p>/_quillo/quillo.js\"</p><script src=\"/_quillo/quillo.js\">", b"/_quillo/quillo.js"));
+    }
 
     #[test]
     fn one_client_cannot_take_every_waiting_place() {

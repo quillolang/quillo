@@ -312,17 +312,16 @@ fn unique<'a>(styles: impl Iterator<Item = &'a str>) -> String {
 pub fn ids_in(html: &[u8]) -> Vec<String> {
     const MARK: &[u8] = b"data-q-";
     let mut out: Vec<String> = Vec::new();
-    let mut i = 0;
-    while let Some(at) = html[i..].windows(MARK.len()).position(|w| w == MARK) {
-        let start = i + at + MARK.len();
-        let id: Vec<u8> = html[start..].iter().take(8).copied().collect();
-        if id.len() == 8 && id.iter().all(u8::is_ascii_hexdigit) {
-            let id = String::from_utf8(id).unwrap_or_default();
-            if !out.contains(&id) {
-                out.push(id);
-            }
+    // memchr's search, not byte by byte, its searcher made once (2026-11-09, the server
+    // benchmark).
+    static FINDER: std::sync::LazyLock<memchr::memmem::Finder<'static>> = std::sync::LazyLock::new(|| memchr::memmem::Finder::new(MARK));
+    for at in FINDER.find_iter(html) {
+        let start = at + MARK.len();
+        let Some(id) = html.get(start..start + 8).filter(|id| id.iter().all(u8::is_ascii_hexdigit)) else { continue };
+        let id = String::from_utf8_lossy(id).into_owned();
+        if !out.contains(&id) {
+            out.push(id);
         }
-        i = start;
     }
     out
 }
@@ -671,5 +670,12 @@ mod tests {
     #[test]
     fn a_page_says_which_styles_it_shows() {
         assert_eq!(ids_in(b"<p data-q-ab12cd34 class=x><b data-q-ab12cd34 data-q-00ff00ff>"), vec!["ab12cd34", "00ff00ff"]);
+        // By memchr's search (2026-11-09): an id cut short at the end, one that is not hex, the
+        // mark alone, nothing, and one right at the end.
+        assert_eq!(ids_in(b"<p data-q-ab12cd"), Vec::<String>::new());
+        assert_eq!(ids_in(b"<p data-q-zz12cd34 data-q-"), Vec::<String>::new());
+        assert_eq!(ids_in(b""), Vec::<String>::new());
+        assert_eq!(ids_in(b"data-q-0123abcd"), vec!["0123abcd"]);
+        assert_eq!(ids_in(b"data-q-data-q-0123abcd"), vec!["0123abcd"]);
     }
 }

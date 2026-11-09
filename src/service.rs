@@ -875,7 +875,7 @@ fn call_id(it: &Interp) -> String {
 /// A random id of `n` hex digits. Call ids are the nonces of signed calls,
 /// so they come from the system's random bytes when it gives them.
 pub fn new_id(n: usize) -> String {
-    match crate::crypto::random_bytes(n.div_ceil(2)) {
+    match crate::crypto::id_bytes(n.div_ceil(2)) {
         Some(b) => crate::crypto::hex(&b)[..n].to_string(),
         None => (0..n).map(|_| char::from_digit(fastrand::u32(..16), 16).unwrap()).collect(),
     }
