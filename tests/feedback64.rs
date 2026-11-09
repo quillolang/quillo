@@ -493,3 +493,99 @@ fn the_advice_writes_values_and_keys_as_they_are() {
         ["2 a list or a map does not change in place: make the new one with `set`, and assign it to its variable (`xs = set(xs, 0, v)`); a page object's field is set as `el.value = x`"]
     );
 }
+
+// ---- Q-931, found in a second review ----
+
+#[test]
+fn a_cycle_of_functions_is_read_once() {
+    // Each calls the next two, round: a cycle's members had been read again on every path (16
+    // functions 3.9 s, 20 over three minutes).
+    let n = 24;
+    let mut src = String::new();
+    for i in 0..n {
+        src.push_str(&format!("fn f{i}(x: int) -> int = if x <= 0 {{ 0 }} else {{ f{}(x - 1) + f{}(x - 2) }}\n", (i + 1) % n, (i + 2) % n));
+    }
+    src.push_str("route GET / {\n    f0(3)\n    \"ok\"\n}\n");
+    let t = std::time::Instant::now();
+    assert_eq!(dropped(&src).len(), 1);
+    assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+    // A cycle in which one of them changes something: none is said, whichever is dropped.
+    let src = r#"let seen = 0
+fn ping(n: int) -> int = if n > 0 { pong(n - 1) } else { 0 }
+fn pong(n: int) -> int {
+    if n > 0 { ping(n - 1) }
+    seen += 1
+    n
+}
+route GET / {
+    ping(2)
+    pong(2)
+    ping(1)
+    "ok"
+}
+"#;
+    assert_eq!(dropped(src), Vec::<String>::new());
+}
+
+#[test]
+fn a_function_given_by_another_name_or_place_is_taken_as_called() {
+    let d = support::temp_dir("f64-given");
+    std::fs::write(d.join("billing.qwe"), "let charged = 0\nserver fn charge(x: int) -> int {\n    charged += x\n    x\n}\n").unwrap();
+    let src = r#"service billing = "billing.qwe"
+let seen = 0
+let bump = (x: int) => { seen = seen + x }
+fn each_bump(xs: list) -> list = xs | map(bump)
+fn save_all(xs: list, store: map) -> list = map(xs, store.save)
+fn charge_all(xs: list) -> list = map(xs, billing.charge)
+fn both(f: fn, g: fn) -> list = parallel([f, g])
+fn quiet(f: fn) = f | unwatched
+fn follow() -> int {
+    watch("cart")
+    1
+}
+fn must(r: any) = unwrap(r)
+fn refuse(n: int) {
+    if n < 0 { return error("negative") }
+    n
+}
+route GET / {
+    must(1)
+    refuse(1)
+    each_bump([1])
+    save_all([1], {})
+    charge_all([1])
+    both(() => db.exec("delete from t"), () => 1)
+    quiet(() => db.exec("delete from t"))
+    follow()
+    "ok"
+}
+"#;
+    let said: Vec<String> = check_source(src, "main.qwe", &d)
+        .diagnostics
+        .iter()
+        .filter(|x| x.message.contains("changes nothing, and what it gives"))
+        .map(|x| format!("{} {}", x.line, x.message))
+        .collect();
+    assert_eq!(said, Vec::<String>::new());
+}
+
+#[test]
+fn the_advice_keeps_items_and_fields_and_what_a_component_can_assign() {
+    let src = r#"let count = 0
+fn labels(xs: list<int>) -> list<str> = xs | map((x) => str(x))
+fn summary(u: { name: str, age: int }) -> { total: int } = { total: u.age }
+fn minus_one(v: int) -> int = v - 1
+component C() {
+    state items = [1, 2]
+    state user = { name: "a", age: 1 }
+    <div>
+        <button onclick={() => { labels(items) }}>a</button>
+        <button onclick={() => { summary(user) }}>b</button>
+        <button onclick={() => { minus_one(count) }}>c</button>
+    </div>
+}
+route GET / = <C/>
+"#;
+    let generic = |line: u32, f: &str| format!("{} warning: `{}` changes nothing, and what it gives is dropped here: use what it gives, or leave the call out", line, f);
+    assert_eq!(dropped(src), [generic(9, "labels"), generic(10, "summary"), generic(11, "minus_one")]);
+}

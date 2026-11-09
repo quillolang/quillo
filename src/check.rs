@@ -1971,6 +1971,8 @@ struct Checker {
     /// reached.
     changes_depth: usize,
     changes_low: usize,
+    /// Functions read in a cycle whose first function is still being read: they take its answer.
+    changes_pending: Vec<usize>,
     /// Functions of `.qwer` files the program uses, with their files.
     natives: Vec<(Arc<str>, crate::native::Export)>,
     /// Names browser libraries give (`client "...js" use Chart`): each with its
@@ -2165,6 +2167,7 @@ impl Checker {
             changes_cache: HashMap::new(),
             changes_depth: 0,
             changes_low: usize::MAX,
+            changes_pending: Vec::new(),
             natives: Vec::new(),
             js_libs: Vec::new(),
             links: Default::default(),
@@ -6199,7 +6202,7 @@ impl Checker {
         let ret = sig.ret.unwrap_or_else(|| self.fn_ret(&sig));
         let mut fails = d.err.is_some() || sig.err.is_some() || (ret.bits != ANY && ret.bits & ERR != 0);
         walk_expr(&d.body, &mut |e| {
-            fails |= matches!(e, Expr::Try(_)) || matches!(e, Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(n, _) if n == "err"));
+            fails |= matches!(e, Expr::Try(_)) || matches!(e, Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(n, _) if n == "err" || n == "error"));
         });
         if fails {
             return false;
@@ -6218,7 +6221,10 @@ impl Checker {
         // What the variable holds: its type, or, not known, the type of the parameter it is given
         // to, which it passed (`down(val: int)`).
         let had = given.as_ref().and_then(|x| held(self, x)).filter(|h| !h.vague()).or_else(|| d.params.first().and_then(|p| p.ty.as_ref()).map(ty_t));
-        let fits = had.is_some_and(|h| !h.vague() && !ret.vague() && ret.bits != 0 && ret.bits & !h.bits == 0);
+        // Whole, its items and fields too (found in review: `list<int>` given `list<str>`); and not
+        // a server variable in a component, which the browser cannot assign.
+        let server_var = given.as_ref().is_some_and(|x| !self.is_local(x) && self.globals.contains_key(x)) && self.in_component().is_some();
+        let fits = !server_var && had.is_some_and(|h| !h.vague() && !ret.vague() && ret.bits != 0 && ret.bits & !h.bits == 0 && mismatch(ret, h).is_none());
         let call = match (piped, args.len()) {
             (Some(_), 0) => format!("{} | {}", given.as_deref().unwrap_or("x"), name),
             (Some(_), _) => format!("{} | {}(...)", given.as_deref().unwrap_or("x"), name),
@@ -6258,19 +6264,27 @@ impl Checker {
         let depth = self.changes_depth;
         self.changes_depth += 1;
         self.changes_cache.insert(key, Err(depth));
+        let mark = self.changes_pending.len();
         let saved = std::mem::replace(&mut self.changes_low, usize::MAX);
         let c = self.changes_in(d);
         let low = self.changes_low;
         self.changes_depth -= 1;
         self.changes_low = saved.min(low);
-        // "Nothing" is kept once what it reached is done: one that reached a function still being
-        // read above it (`b`, called by `a`, calling `a`) is read again later; one that reached
-        // only itself is done (found in review: kept for none, a chain over a recursive function
-        // took exponential time).
-        if c || low >= depth {
+        // As Tarjan's strongly connected components: one that reached no function still being read
+        // above it is done, and so is every function of its cycle read meanwhile, each reaching
+        // all the others; one that did waits, kept as part of that cycle so it is not read again
+        // on another path (found in review: a cycle's members were read once a path, exponential
+        // in the paths).
+        if low >= depth {
+            for k in self.changes_pending.drain(mark..) {
+                self.changes_cache.insert(k, Ok(c));
+            }
             self.changes_cache.insert(key, Ok(c));
+        } else if c {
+            self.changes_cache.insert(key, Ok(true));
         } else {
-            self.changes_cache.remove(&key);
+            self.changes_cache.insert(key, Err(low));
+            self.changes_pending.push(key);
         }
         c
     }
@@ -6289,8 +6303,8 @@ impl Checker {
             Calls(String),
             Names(String),
             Method(Recv, String),
-            /// A name of its own given to the builtin `.0` as argument `.1`.
-            Passed(String, usize, String),
+            /// What is given to the builtin `.0` as argument `.1`: a name, or another expression.
+            Passed(String, usize, Option<String>),
         }
         if d.component || d.effects.as_ref().is_some_and(|e| !e.is_empty()) {
             return true;
@@ -6307,11 +6321,23 @@ impl Checker {
             Expr::Ident(n, _) => Recv::Name(n.to_string()),
             _ => Recv::Other,
         };
+        // What a call is given, by position, a list's items at the list's (`parallel([f, g])`):
+        // a lambda is code read here, a literal no function (found in review).
+        fn given(callee: &str, at: usize, a: &Expr, found: &mut HashSet<Found>) {
+            match a {
+                Expr::Lambda(_) | Expr::Lit(_) | Expr::Template(_) | Expr::Map(_) | Expr::Binary(..) | Expr::Unary(..) => {}
+                Expr::List(items) => items.iter().for_each(|x| given(callee, at, x, found)),
+                Expr::Ident(n, _) => {
+                    found.insert(Found::Passed(callee.to_string(), at, Some(n.to_string())));
+                }
+                _ => {
+                    found.insert(Found::Passed(callee.to_string(), at, None));
+                }
+            }
+        }
         let passed = |callee: &str, args: &[Expr], from: usize, found: &mut HashSet<Found>| {
             for (i, a) in args.iter().enumerate() {
-                if let Expr::Ident(n, _) = a {
-                    found.insert(Found::Passed(callee.to_string(), i + from, n.to_string()));
-                }
+                given(callee, i + from, a, found);
             }
         };
         walk_fn(d, &mut |x| match x {
@@ -6348,14 +6374,17 @@ impl Checker {
                     found.insert(Found::Changes);
                 }
             },
-            Expr::Pipe(_, r, _) => match &**r {
+            // `a | f(b)` gives `a` as argument 1 (found in review: `f | unwatched`).
+            Expr::Pipe(l, r, _) => match &**r {
                 Expr::Call(c, args, _) => {
                     if let Expr::Ident(n, _) = &**c {
                         passed(n, args, 1, &mut found);
+                        passed(n, std::slice::from_ref(&**l), 0, &mut found);
                     }
                 }
                 Expr::Ident(n, _) => {
                     found.insert(Found::Calls(n.to_string()));
+                    passed(n, std::slice::from_ref(&**l), 0, &mut found);
                 }
                 _ => {
                     found.insert(Found::Changes);
@@ -6387,12 +6416,23 @@ impl Checker {
                 Found::Names(n) if own(&n) => false,
                 Found::Calls(n) => self.name_changes(&n, true),
                 Found::Names(n) => self.name_changes(&n, false),
-                // Its own value given where a builtin takes a function: `map(xs, f)`,
-                // `run_after(ms, done)` call it (found in review).
+                // What is given where a builtin takes a function: `map(xs, f)`, `run_after(ms, done)`
+                // call it. Its own function is code read here; any other is taken as called
+                // (found in review: a variable holding a lambda, a map's field, a service's).
                 Found::Passed(callee, at, n) => {
-                    own(&n) && !fns.contains(&n) && self.globals.get(&callee).and_then(|v| v.sig.clone()).filter(|s| s.builtin).is_some_and(|s| {
-                        s.params.get(at).or(if s.variadic { s.params.last() } else { None }).is_some_and(|p| p.ty & FN != 0)
-                    })
+                    // A parameter typed a function, not `any` (`str(x)` takes anything and calls
+                    // nothing); `parallel` and `defer` run what they are given, typed `any`.
+                    let takes_fn = matches!(callee.as_str(), "parallel" | "defer")
+                        || self.globals.get(&callee).and_then(|v| v.sig.clone()).filter(|s| s.builtin).is_some_and(|s| {
+                            s.params.get(at).or(if s.variadic { s.params.last() } else { None }).is_some_and(|p| p.ty & FN != 0 && p.ty | NIL | ERR != ANY)
+                        });
+                    takes_fn
+                        && match n {
+                            Some(n) if fns.contains(&n) => false,
+                            Some(n) if own(&n) => true,
+                            Some(n) => self.name_changes(&n, true),
+                            None => true,
+                        }
                 }
                 Found::Method(Recv::Literal, m) => !self.globals.get(&m).is_some_and(|v| &*v.file == "<builtin>") || builtin_changes(&m),
                 Found::Method(Recv::Name(o), m) => {
@@ -6425,14 +6465,19 @@ impl Checker {
     /// Whether calling `n`, or naming it (a function named may be called later), a name not
     /// `d`'s own, can change anything.
     fn name_changes(&mut self, n: &str, called: bool) -> bool {
-        let Some(v) = self.globals.get(n) else { return called };
+        // A builtin the checker keeps apart from its names (`str`, `int`), as the others.
+        let Some(v) = self.globals.get(n) else { return if BUILTINS.iter().any(|(b, _, _)| *b == n) { builtin_changes(n) } else { called } };
         if &*v.file == "<builtin>" {
             return builtin_changes(n);
         }
-        // A variable, called: it may hold any function by then, whatever it was given first. A
-        // function declared is the one its signature was made of, under its name.
+        if v.sig.as_ref().is_some_and(|s| s.native.is_some() || s.component) {
+            return true;
+        }
+        // A variable, called: it may hold any function by then, whatever it was given first; named,
+        // when it may hold one, as it may be called later (found in review). A function declared
+        // is the one its signature was made of, under its name.
         if !v.sig.as_ref().and_then(|s| s.def.as_ref()).is_some_and(|d| d.name == n) {
-            return called;
+            return called || v.t.bits & FN != 0;
         }
         match v.sig.clone() {
             Some(sig) if sig.native.is_none() && !sig.component => match sig.def.clone() {
@@ -9452,6 +9497,10 @@ fn builtin_changes(n: &str) -> bool {
         // A browser's, which the view cache takes for nothing as they do nothing on the server
         // (found in review).
         || matches!(n, "every" | "run_after" | "page_updated")
+        // A `live` loader's run follows the topic (found in review); `unwrap` of an error stops
+        // the request, which a call may be for.
+        || n == "watch"
+        || n == "unwrap"
 }
 
 fn assigned_in(e: &Expr, out: &mut HashSet<String>) {
