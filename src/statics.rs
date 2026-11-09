@@ -336,6 +336,19 @@ pub fn real_dir(dir: &Path) -> Option<PathBuf> {
 
 /// Up to `len` bytes of the file from `start`, read where they are: never more, whatever the file
 /// has grown to (FEEDBACK55.md, Q-701; branch feedback55).
+/// Whether the first bytes of `f` are still `seen`'s, its place in the file kept: a file written
+/// in place while it was read can give them torn (a database's header begun, what was there
+/// after it), which no check of the whole header sees, so the start of what is sent is read
+/// twice alike (2026-11-09; branch feedback56, found by CI's
+/// a_database_header_written_in_place_is_never_sent).
+pub(crate) fn steady_head(f: &std::fs::File, seen: &[u8]) -> bool {
+    let mut g = f;
+    let Ok(at) = g.stream_position() else { return false };
+    let k = seen.len().min(16);
+    let same = read_at(f, 0, k as u64).is_ok_and(|again| again[..] == seen[..k]);
+    g.seek(SeekFrom::Start(at)).is_ok() && same
+}
+
 pub fn read_at(f: &std::fs::File, start: u64, len: u64) -> std::io::Result<Vec<u8>> {
     let mut f = f;
     f.seek(SeekFrom::Start(start))?;
@@ -639,6 +652,10 @@ pub fn send(mut stream: std::net::TcpStream, resp: &crate::server::HttpResponse,
         }
         if crate::db::sqlite_bytes(&buf[..first]) {
             return not_found(&mut stream, &mut out);
+        }
+        // Being written as it was read: come back (see `steady_head`).
+        if !steady_head(&f, &buf[..first]) {
+            return busy(&mut stream, &mut out);
         }
     }
     // In u64: a length of 4 GiB or more is no `usize` on 32 bits (FEEDBACK55.md, Q-701; branch

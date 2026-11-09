@@ -2,6 +2,10 @@
 
 ## 0.8.1 (2026-11-09)
 
+- A file the program serves that is written in place while it is read is not sent from the start
+  unless its first bytes read the same twice: a read could give them torn, a database's header
+  begun with the old file after it, which no check of the whole header saw, and a part of 5 bytes
+  sent `SQLit` (a 503 to come back to for a large file, as when it is replaced; found by CI).
 - A stop (`kill <pid>`, SIGTERM, Ctrl-C) waits for every request and transaction in progress,
   however long it takes, a large file being sent too, saying every 5 s what it still waits for;
   `--drain 30s` gives it a time, after which what still runs is cut off (`quillo run` and

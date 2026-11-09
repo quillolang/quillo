@@ -5,6 +5,8 @@
   const click = async (id, ms = 60) => { $(id).click(); await sleep(ms); };
   const out = {};
   await sleep(100);
+  // Its @mount sets it: on a loaded machine later than 100 ms (it read "" on CI, 2026-11-09).
+  for (let i = 0; i < 100 && !$("same").textContent; i++) await sleep(50);
   out.same = $("same").textContent;
   await click("prop", 200);
   await click("prop-plain", 60);
