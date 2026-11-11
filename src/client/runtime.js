@@ -6348,7 +6348,7 @@ function nodesOf(list, out = []) {
 // What a record of nodes keeps of `got`, the nodes just made (a row's, a part's): not those of a
 // part among them, which the part answers for and can replace, but its marker, which `nodesOf` and
 // `firstOf` read them from as they are now. A row kept the nodes it was made with: once a branch
-// at its root had replaced its element, a move brought the old one back, alive, and the place
+// at its root had swapped in a new element, a move brought the old one back, alive, and the place
 // after it was a node no longer on the page (FEEDBACK61.md, Q-889; branch feedback61). `made`:
 // `partsMade` before they were made; when no part was made since, none of them is a marker.
 function own(got, made) {
