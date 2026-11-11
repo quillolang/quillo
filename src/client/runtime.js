@@ -6345,6 +6345,28 @@ function nodesOf(list, out = []) {
   return out;
 }
 
+// What a record of nodes keeps of `got`, the nodes just made (a row's, a part's): not those of a
+// part among them, which the part answers for and can replace, but its marker, which `nodesOf` and
+// `firstOf` read them from as they are now. A row kept the nodes it was made with: once a branch
+// at its root had replaced its element, a move brought the old one back, alive, and the place
+// after it was a node no longer on the page (FEEDBACK61.md, Q-889; branch feedback61). `made`:
+// `partsMade` before they were made; when no part was made since, none of them is a marker.
+function own(got, made) {
+  if (partsMade === made) return got;
+  const len = got.length;
+  // Most often the last part made made all the others, and put its marker last (a branch at a
+  // row's root, its element in a part of its own): the marker alone.
+  if (partLast.end === got[len - 1] && partSize === len - 1) return len === 1 ? got : [got[len - 1]];
+  let i = 0;
+  while (i < len && !got[i].__part) i++;
+  if (i === len) return got;
+  const theirs = new Set();
+  for (; i < len; i++) if (got[i].__part) for (const n of nodesOf(got[i].__part.nodes)) theirs.add(n);
+  return got.filter((n) => !theirs.has(n));
+}
+// How many parts were made, the last one, and how many nodes it put out before its marker.
+let partsMade = 0, partLast = null, partSize = 0;
+
 // A <textarea>'s text is only its first value: once someone types, the box
 // stops showing it. When the text between its tags changes, the box shows
 // the new text; when it does not, what was typed stays.
@@ -6366,11 +6388,14 @@ function dyn(get, c, out) {
 function dynApply(x) {
   const r = this.el, c = r.c;
   if (r.end === null) {
-    const got = [];
+    const got = [], made = partsMade;
     put(x, c, got);
-    r.nodes = got;
+    r.nodes = own(got, made);
     r.end = document.createTextNode("");
     r.end.__part = r;
+    partsMade++;
+    partLast = r;
+    partSize = got.length;
     if (c.claim) c.p.insertBefore(r.end, c.n);
     for (const n of got) r.out.push(n);
     r.out.push(r.end);
@@ -6387,7 +6412,7 @@ function dynApply(x) {
     }
     return;
   }
-  const got = [];
+  const got = [], made = partsMade;
   put(x, c, got);
   // Markup a function made again, as `{tick(on)}` is, with the same elements as on the page and
   // nothing in it that follows anything itself: the page's elements take the new one's
@@ -6400,7 +6425,7 @@ function dynApply(x) {
   removeNodes(r.nodes);
   const p = r.end.parentNode;
   if (p) for (const n of got) p.insertBefore(n, r.end);
-  r.nodes = got;
+  r.nodes = own(got, made);
   textareaFollows(p);
   // Options shown or hidden: their select shows its value again (FEEDBACK55.md, Q-758; branch
   // feedback55).
@@ -7376,16 +7401,23 @@ function each(list, key, row) {
     const svg = c.svg;
     let first = true;
     // Rows are their own scopes, not their owner's: they come and go
-    // without it, and go with it.
-    onCleanup(() => { for (const r of st.rows) dispose(r.scope); st.rows = []; });
+    // without it, and go with it. Their nodes stay the list's: what holds it (a branch, as it
+    // switches away from it) goes on to take them off the page, and finds them by its marker (see
+    // `own`). Emptied here, a list that had grown since it was made left the new rows behind
+    // (FEEDBACK61.md, Q-889; branch feedback61).
+    onCleanup(() => { for (const r of st.rows) dispose(r.scope); });
     effect(() => {
       const items = iter(list());
       untrack(() => {
         if (!first) { reconcile(st, items, key, row, svg); return; }
         first = false;
+        const at = out.length;
         st.rows = items.map((x, i) => newRow(x, key ? key(x) : i, row, c, out));
         st.end = document.createTextNode("");
         st.end.__part = st;
+        partsMade++;
+        partLast = st;
+        partSize = out.length - at;
         if (c.claim) c.p.insertBefore(st.end, c.n);
         out.push(st.end);
       });
@@ -7460,10 +7492,10 @@ function newRow(x, k, row, c, out) {
   const sc = new Scope();
   const r = { key: k, item: new Item(x, sc), scope: sc, nodes: null };
   Owner = r.scope;
-  const got = [];
+  const got = [], made = partsMade;
   try { put(part(row(r.item)), c, got); } finally { Owner = o; Listener = l; }
-  r.nodes = got.slice();
-  for (const n of r.nodes) out.push(n);
+  for (const n of got) out.push(n);
+  r.nodes = own(got, made);
   return r;
 }
 
@@ -7494,8 +7526,10 @@ function clearRows(st, p) {
     range.setEndBefore(end);
     range.deleteContents();
   } else {
-    // A row that changed its element after it was made names the one it began with:
+    // A row that changed its element after it was made named the one it began with:
     // each is taken out by its own record (FEEDBACK28.md, Q-342; branch feedback29-fixes).
+    // Records name a row's nodes as they are now (see `own`), so this is for a first node
+    // that something else took away (FEEDBACK61.md, Q-889; branch feedback61).
     for (const r of old) removeNodes(r.nodes);
   }
   for (const r of old) dispose(r.scope);
@@ -7557,8 +7591,12 @@ function reconcile(st, items, key, row, svg) {
   // Without `moveBefore` (Safari), an element moved loses the focus: given back (FEEDBACK55.md,
   // Q-766; branch feedback55).
   const back = moved ? focusBack(p) : null;
+  const scrolls = moved && !p.moveBefore && scrolled.length ? scrollBack(p, old, from, stay) : null;
   const rows = new Array(n);
-  let after = end, pend = null;
+  // `after`, what a row goes in front of: the first node of the rows after it. It is asked of the
+  // row (`ahead`) only when a row moves or new ones go in, as a row whose root is a branch answers
+  // through its branch (FEEDBACK61.md, Q-889; branch feedback61).
+  let after = end, ahead = null, pend = null;
   for (let i = n - 1; i >= 0; i--) {
     const j = w ? from[i] : -1;
     let r;
@@ -7568,23 +7606,37 @@ function reconcile(st, items, key, row, svg) {
       if (!pend) pend = document.createDocumentFragment();
       for (let k = got.length - 1; k >= 0; k--) pend.insertBefore(got[k], pend.firstChild);
     } else {
-      if (pend) { const f = pend.firstChild; p.insertBefore(pend, after); if (f) after = f; pend = null; }
+      if (pend) {
+        if (ahead) { after = firstOf(ahead.nodes); ahead = null; }
+        const f = pend.firstChild;
+        p.insertBefore(pend, after);
+        if (f) after = f;
+        pend = null;
+      }
       r = old[j];
       r.key = keys[i];
       if (r.item._v !== items[i]) r.item.set(items[i]);
       if (moved && !stay[i]) {
+        if (ahead) { after = firstOf(ahead.nodes); ahead = null; }
         const ns = nodesOf(r.nodes);
+        // A row of several nodes moves a node at a time, as one of one node does: through a
+        // fragment, they left the page, and lost their scroll and reloaded their frames
+        // (FEEDBACK61.md, Q-894; branch feedback61).
         if (ns.length === 1) moveNode(p, ns[0], after);
-        else { const f = document.createDocumentFragment(); for (const x of ns) f.appendChild(x); p.insertBefore(f, after); }
+        else for (const x of ns) moveNode(p, x, after);
       }
-      const f = firstOf(r.nodes);
-      if (f) after = f;
+      // A row of no nodes has no first: the one after it stays `after`.
+      if (r.nodes.length) ahead = r;
     }
     rows[i] = r;
   }
-  if (pend) p.insertBefore(pend, after);
+  if (pend) {
+    if (ahead) after = firstOf(ahead.nodes);
+    p.insertBefore(pend, after);
+  }
   st.rows = rows;
   if (back) back();
+  if (scrolls) scrolls();
   if (came) selFollow(p);
 }
 
@@ -7599,6 +7651,58 @@ function focusBack(p) {
     a.focus({ preventScroll: true });
     if (sel) a.setSelectionRange(sel[0], sel[1], sel[2]);
   };
+}
+
+// Elements scrolled on the page, where the browser has no `moveBefore` (Safari): there an element
+// that moves is scrolled back to its start, and `scrollBack` puts back what a move of rows took
+// (FEEDBACK61.md, Q-894; branch feedback61). Heard as they scroll, so a move costs nothing more
+// where nothing was scrolled, and held weakly: one that leaves the page goes as it would without
+// them (they were held, and up to 63 of them stayed alive with all they held: found in review).
+// (The listener is in this declaration's lines, so that it comes with the lists that use it.)
+const scrolled = [], scrollKnown = new WeakSet();
+if (typeof document !== "undefined" && typeof WeakRef === "function" && !Element.prototype.moveBefore) document.addEventListener("scroll", scrollSeen, { capture: true, passive: true });
+let scrollKept = 0;
+function scrollSeen(e) {
+  const t = e.target;
+  if (t.nodeType !== 1 || scrollKnown.has(t)) return;
+  scrollKnown.add(t);
+  scrolled.push(new WeakRef(t));
+  // Those gone or off the page leave the list each time it has doubled.
+  if (scrolled.length > 2 * scrollKept + 16) {
+    let k = 0;
+    for (const w of scrolled) {
+      const x = w.deref();
+      if (x && x.isConnected) scrolled[k++] = w;
+      else if (x) scrollKnown.delete(x);
+    }
+    scrolled.length = k;
+    scrollKept = k;
+  }
+}
+
+// Where the scrolled elements in the rows of `p` that move (`old[from[i]]` where `stay[i]` is not
+// set) are scrolled to, and what scrolls them there again. Not `p`'s own scroll, nor a staying
+// row's, which a move leaves alone: reading them laid the page out before and after every move
+// of a list in a scrolled box (found in review).
+function scrollBack(p, old, from, stay) {
+  let moving = null, saved = null;
+  for (const w of scrolled) {
+    const e = w.deref();
+    if (!e || e === p || !p.contains(e)) continue;
+    if (!moving) {
+      moving = new Set();
+      for (let i = 0; i < from.length; i++) if (from[i] >= 0 && !stay[i]) for (const n of nodesOf(old[from[i]].nodes)) moving.add(n);
+    }
+    let top = e;
+    while (top.parentNode !== p) top = top.parentNode;
+    if (moving.has(top) && (e.scrollTop || e.scrollLeft)) (saved || (saved = [])).push(e, e.scrollTop, e.scrollLeft);
+  }
+  return saved && (() => {
+    for (let i = 0; i < saved.length; i += 3) {
+      saved[i].scrollTop = saved[i + 1];
+      saved[i].scrollLeft = saved[i + 2];
+    }
+  });
 }
 
 // The positions of a longest increasing run of `a`'s values (skipping -1).
@@ -7631,7 +7735,7 @@ function comp(def, props, kids, spreads) {
   if (spreads) p = withSpreads(props, ps, def, spreads);
   if (ps.includes("children") && !hasOwn(p, "children")) p.children = kids;
   return new Html((c, out) => {
-    if (def.$comp) { out.push(island(def, p, takeHydration(def.$name), c)); return; }
+    if (def.$comp) { island(def, p, takeHydration(def.$name), c, out); return; }
     if (def.$view) {
       const s = new Scope();
       within(s, () => put(part(def.$view(p)), c, out));
@@ -7781,8 +7885,8 @@ function remade(name) {
   if (TOOLS) toolsSay("remade", Object.assign({ name }, toolsWanted()));
 }
 
-// A component in its <quillo-island>: made, or taking up the page's.
-function island(def, props, h, c) {
+// A component in its <quillo-island>: made, or taking up the page's; its nodes into `out`.
+function island(def, props, h, c, out) {
   let inst = new Inst(def, props, h && h.s, h && h.l);
   let el;
   if (c.claim) {
@@ -7796,14 +7900,16 @@ function island(def, props, h, c) {
   if (!c.claim) {
     run(inst, el, false, c.svg);
     if (TOOLS) toolsMade(inst);
-    return asOwnRoot(el, inst, c.svg);
+    out.push(asOwnRoot(el, inst, c.svg));
+    return;
   }
   // One inside another that cannot be taken up is made again by itself, and
   // said so, as one at the top is; before, its outer one reported a bare
   // "quillo: text" (FEEDBACK2.md, Q-014; branch feedback6-fixes). A table's
   // row is its own root, which only its outer one can make again.
+  let got;
   try {
-    run(inst, el, true);
+    got = run(inst, el, true);
   } catch (e) {
     if (!(e instanceof Mismatch) || ownRoot(el)) throw e;
     remade(def.$name);
@@ -7814,13 +7920,14 @@ function island(def, props, h, c) {
     run(inst, el, false);
   }
   if (TOOLS) toolsMade(inst);
-  return el;
+  if (got) for (const n of got) out.push(n);
+  else out.push(el);
 }
 
 // The component's code, once; then its markup put in its island (in <svg>
 // when `svg`, as SVG's).
 function run(inst, el, claim, svg) {
-  within(inst, () => {
+  return within(inst, () => {
     let view;
     try {
       view = part(inst.def(inst, inst.props));
@@ -7831,11 +7938,16 @@ function run(inst, el, claim, svg) {
     if (claim && ownRoot(el)) {
       // The island is the markup's root: taken up from where it stands, in <svg> as SVG's
       // (FEEDBACK55.md, Q-763; branch feedback55).
+      // What it took up are its nodes, not the element alone: a branch at its root replaces that
+      // element later, and a row of a list held on to the old one, which a move brought back
+      // (FEEDBACK61.md, Q-889; branch feedback61).
       const after = el.nextSibling;
       const c = { p: el.parentNode, n: el, claim: true, svg: inSvg(el.parentNode) };
-      put(view, c, []);
+      const got = [];
+      put(view, c, got);
       if (DEV) wanted = [c.n, "nothing"]; // dev
       if (c.n !== after) throw new Mismatch("extra");
+      return got;
     } else if (claim) {
       const c = { p: el, n: el.firstChild, claim: true, svg: false };
       put(view, c, []);
