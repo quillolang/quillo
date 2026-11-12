@@ -2351,6 +2351,18 @@ impl<'a> Compiler<'a> {
         self.ctx().scopes.last_mut().unwrap().insert(name.to_string(), local);
     }
 
+    /// Whether `name` here is a component's or a view's parameter, asked without reading it.
+    fn is_prop(&self, name: &str) -> bool {
+        for ctx in self.ctxs.iter().rev() {
+            for scope in ctx.scopes.iter().rev() {
+                if let Some(l) = scope.get(name) {
+                    return matches!(l, Local::Prop(_));
+                }
+            }
+        }
+        false
+    }
+
     /// Whether `name` here is a component's state, asked without reading it.
     fn is_state(&self, name: &str) -> bool {
         for ctx in self.ctxs.iter().rev() {
@@ -4806,11 +4818,6 @@ impl<'a> Compiler<'a> {
                 AttrVal::Bool => props.push(format!("{}: true", js_str(name))),
                 AttrVal::Expr(e) => {
                     let (v, r) = self.reactive_expr(e)?;
-                    // A function written here for the other component is this one's code: run as
-                    // that one's handler (`@click={on_save}`), what it starts is this one's, as a
-                    // handler's is (see `W.hand` in src/client/runtime.js; FEEDBACK61.md, Q-901's
-                    // recheck of f7a2187; branch feedback61).
-                    let v = if matches!(e, Expr::Lambda(_)) { self.stamped(v) } else { v };
                     if r {
                         props.push(format!("get {}() {{ return {}; }}", js_str(name), v));
                     } else {
@@ -5017,9 +5024,18 @@ impl<'a> Compiler<'a> {
                     AttrVal::Expr(e) => {
                         let (f, r) = self.reactive_expr(e)?;
                         if r {
-                            // The handler it reads when the event comes, run as its writer's code (see
-                            // `W.hand`).
-                            format!("($e) => W.hand({}, $e)", f)
+                            // The handler it reads when the event comes. One of the component's own
+                            // props (`@click={on_save}`) is the code of the component that wrote its
+                            // tag, which its instance knows: `$i` goes with it (see `W.hand` in
+                            // src/client/runtime.js). Each function given as a prop was stamped
+                            // instead, a field on every such closure (FEEDBACK61.md, Q-901's recheck
+                            // of 0355b09; branch feedback61).
+                            let prop = matches!(e, Expr::Ident(n, _) if self.is_prop(&n.to_string()));
+                            if prop && self.ctxs.iter().any(|c| c.component.is_some() && !c.view) {
+                                format!("($e) => W.hand({}, $e, $i)", f)
+                            } else {
+                                format!("($e) => W.hand({}, $e)", f)
+                            }
                         } else {
                             f
                         }

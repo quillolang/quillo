@@ -8436,6 +8436,10 @@ function withDefaults(p, defaults) {
 class Inst extends Scope {
   constructor(def, props, state, liveInfo) {
     super();
+    // The component whose code wrote its tag, as `Scope` found it (see `Writer`): a function it
+    // was given as a prop and uses as a handler is that one's code (see `W.hand`; FEEDBACK61.md,
+    // Q-901's recheck of 0355b09; branch feedback61).
+    this.writer = this.comp;
     this.comp = this;
     this.def = def;
     this.props = heldProps(props, this);
@@ -9232,14 +9236,15 @@ W.t = tmpl;
 // The compiler's stamp: markup a component's code makes is that component's (see `Writer`;
 // FEEDBACK61.md, Q-901's recheck of d39aa4e; branch feedback61).
 W.by = (i, h) => { h.by = i; return h; };
-// A handler read as its event comes (`@click={on_save}`): run as the code of the component that
-// wrote the function, as its stamp says, where another's element hears the event. A Modal's save
-// that closed the Modal gave a helper's timer to the Modal, gone by then (FEEDBACK61.md, Q-901's
-// recheck of f7a2187; branch feedback61).
-W.hand = (f, e) => {
+// A handler read as its event comes. One of the component's props (`@click={on_save}`, `i` the
+// component) runs as the code of the component that wrote its tag, which gave it the function: a
+// Modal's save that closed the Modal gave a helper's timer to the Modal, gone by then (FEEDBACK61.md,
+// Q-901's recheck of f7a2187 and of 0355b09; branch feedback61). A prop passed on through a middle
+// component is that one's.
+W.hand = (f, e, i) => {
   if (typeof f !== "function") return undefined;
-  const b = f.by;
-  if (b === undefined) return f.length > 0 ? f(e) : f();
+  const b = i !== undefined ? i.writer : null;
+  if (b === null) return f.length > 0 ? f(e) : f();
   const was = By;
   By = b;
   try { return f.length > 0 ? f(e) : f(); } finally { By = was; }
