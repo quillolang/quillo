@@ -3596,3 +3596,111 @@ route GET /b = <html><head><title>t</title></head><body><Host now={false}/></bod
         assert_eq!(r, &want, "at {}", path);
     }
 }
+
+// Q-901, the review of 8911ac4 (N1): markup passed to another component as `children` is made inside
+// that one, so an `@mount` timer of a row in it, or of a branch in it, was given to the component
+// that wrote the markup as a parent's code is, and piled up as rows came and went. Each part says
+// whose code made it now: a list of rows, a branch, and a list passed on two deep keep one interval
+// each, as main. A handler in passed markup is its writer's, as the user decided: its timer goes on
+// once the component it was passed to goes, and ends with the writer.
+const SLOTS: &str = r###"component Box(children) {
+    <div class="box">{children}</div>
+}
+component Outer(children) {
+    <section><Box>{children}</Box></section>
+}
+component Feed(note) {
+    state rows = [1, 2, 3, 4, 5]
+    state open = true
+    state boxed = true
+    <div>
+        <Box><ul>{for x in rows => <li key={x} @mount={(el) => { every(200, () => { note("row") }) }}>{x}</li>}</ul></Box>
+        <Box>{open ? <p @mount={(el) => { every(200, () => { note("branch") }) }}>open</p> : null}</Box>
+        <Outer><ol>{for x in rows => <li key={x} @mount={(el) => { every(200, () => { note("deep") }) }}>{x}</li>}</ol></Outer>
+        {boxed ? <Box><button #slotted @click={() => { every(40, () => { note("h") }) }}>start</button></Box> : null}
+        <button #regen @click={() => { rows = rows | map((x) => x + 10) }}>regen</button>
+        <button #flip @click={() => { open = !open }}>flip</button>
+        <button #unbox @click={() => { boxed = false }}>unbox</button>
+    </div>
+}
+component Host(now: bool) {
+    state on = now
+    state log = []
+    let note = (s) => { log = log + [s] }
+    <div><button #show @click={() => { on = true }}>show</button><button #off @click={() => { on = false }}>off</button>{on ? <Feed {note}/> : null}<p #log>{join(log, ",")}</p></div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn an_mount_timer_in_markup_passed_on_ends_with_its_part() {
+    let body = r##"const n = (s) => $("log").textContent.split(",").filter((t) => t === s).length;
+    const until = async (f, ms) => { const t0 = performance.now(); while (!f() && performance.now() - t0 < ms) await tick(10); return f(); };
+    const si = window.setInterval, ci = window.clearInterval, mine = new Set();
+    window.setInterval = (f, ms, ...a) => { const id = si(f, ms, ...a); mine.add(id); return id; };
+    window.clearInterval = (id) => { mine.delete(id); return ci(id); };
+    const out = {};
+    // Ten rows (five, and five two deep) made again eight times, and the branch shown four times.
+    for (let k = 0; k < 8; k++) { await click("regen", "flip"); await tick(30); }
+    await tick(300);
+    out.intervals = mine.size;
+    // The handler in markup passed to a Box: its `every` goes on once that Box goes, and ends with Feed.
+    await click("slotted"); await until(() => n("h") > 2, 2000); await click("unbox"); await tick(40);
+    { const a = n("h"); await tick(300); out.afterBox = n("h") > a + 2; }
+    await click("off"); await tick(60); { const a = n("h"); await tick(300); out.afterFeed = n("h") === a; }
+    return out;"##;
+    let Some(rs) = in_pages("q901-slots", SLOTS, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        // The five rows, the five two deep, and the branch, shown again after an even number of flips.
+        let want = serde_json::json!({ "intervals": 11, "afterBox": true, "afterFeed": true, "remade": 0, "errors": [] });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Q-901, the review of 8911ac4 (N2): code whose part went while it waited (an `@mount` of a branch,
+// or of a row in a list that went, or the callback of a timer a branch's own `if` started, turned
+// off meanwhile) started its `every` after the wait all the same, for the whole component, where
+// main refused it. The part says it has gone, and whose it was, so nothing starts: after one wait
+// or two.
+const WAITS: &str = r###"server fn slow(ms: int) -> str { sleep(ms); "x" }
+component Waits(note) {
+    state shown = false
+    state polling = false
+    if polling { run_after(10, () => { slow(150); every(40, () => { note("cb1") }) }) }
+    if polling { run_after(10, () => { slow(80); slow(80); every(40, () => { note("cb2") }) }) }
+    <div>
+        {shown ? <div @mount={(el) => { slow(150); every(40, () => { note("m1") }) }}>a</div> : null}
+        {shown ? <div @mount={(el) => { slow(80); slow(80); every(40, () => { note("m2") }) }}>b</div> : null}
+        {shown ? <ul>{for x in [1] => <li key={x} @mount={(el) => { slow(150); every(40, () => { note("r1") }) }}>{x}</li>}</ul> : null}
+        <button #open @click={() => { shown = true }}>open</button>
+        <button #hide @click={() => { shown = false }}>hide</button>
+        <button #poll @click={() => { polling = true }}>poll</button>
+        <button #stop @click={() => { polling = false }}>stop</button>
+    </div>
+}
+component Host(now: bool) {
+    state on = now
+    state log = []
+    let note = (s) => { log = log + [s] }
+    <div><button #show @click={() => { on = true }}>show</button>{on ? <Waits {note}/> : null}<p #log>{join(log, ",")}</p></div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn what_a_part_starts_after_a_wait_it_did_not_outlast_is_refused() {
+    let body = r##"const n = (s) => $("log").textContent.split(",").filter((t) => t === s).length;
+    const out = {};
+    await click("open"); await tick(20); await click("hide"); await tick(600);
+    out.mounts = [n("m1"), n("m2"), n("r1")];
+    await click("poll"); await tick(60); await click("stop"); await tick(600);
+    out.callbacks = [n("cb1"), n("cb2")];
+    return out;"##;
+    let Some(rs) = in_pages("q901-waits", WAITS, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({ "mounts": [0, 0, 0], "callbacks": [0, 0], "remade": 0, "errors": [] });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}

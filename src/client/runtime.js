@@ -6161,17 +6161,15 @@ let Handling = false;
 // element, as before this slice; given to the component, an `@mount`'s timers piled up as rows came
 // and went, and its streams filled the browser's connections (FEEDBACK61.md, Q-901's review of
 // e2eb410; branch feedback61). Code with no component of its own (a plain `fn`) belongs to `ctx`.
+// Whose code made a part is what the part says (`comp`), not the component it sits in: markup a
+// component passes to another as `children` is made inside that one, and an `@mount` of a row in
+// it went to the writer, as a parent's code does; and a part that has gone says it still, so what
+// its code starts after a wait is refused, where it went to the component (Q-901's review of
+// 8911ac4).
 function ownerOf(inst) {
   const ctx = Owner || Acting;
   if (!inst || !ctx) return ctx || inst || null;
-  return Handling || compOf(ctx) !== inst ? inst : ctx;
-}
-
-// The component the scope `s` (a part of the page, a row) is in: a row's scope is no part of its
-// list's (see `newRow`), and names the list's as `host`.
-function compOf(s) {
-  while (s && !(s instanceof Inst)) s = s.up || s.host;
-  return s || null;
+  return Handling || ctx.comp !== inst ? inst : ctx;
 }
 let effectQueue = [];
 let flushing = false;
@@ -6184,6 +6182,9 @@ class Scope {
     this.clean = null;
     this.dead = false;
     this.up = Owner;
+    // The component whose code made it, its owner's (see `ownerOf`, `slotOf`; FEEDBACK61.md, Q-901's
+    // review of 8911ac4; branch feedback61).
+    this.comp = Owner ? Owner.comp : null;
     // Made to size while small (an array pushed to from empty keeps room
     // for a dozen and more; a row's scope owns one or two).
     if (Owner) Owner.owned = Owner.owned ? (Owner.owned.length < 8 ? Owner.owned.concat([this]) : (Owner.owned.push(this), Owner.owned)) : [this];
@@ -6253,6 +6254,9 @@ class Calc extends Scope {
     this.obs = null;
     this._v = undefined;
     this.id = ++calcIds;
+    // How many times it has run: code that waited is told its effect ran again meanwhile (see
+    // `W.on`; FEEDBACK61.md, Q-901's review of 8911ac4; branch feedback61).
+    this.runs = 0;
     // An effect on the page: `apply(value)` (as a method, untracked) puts
     // what `fn` gave on `el`; `name` and `old` are its to use.
     this.apply = null;
@@ -6344,6 +6348,7 @@ function fresh(c) {
 
 function runCalc(c) {
   disposeKids(c);
+  c.runs++;
   c.at = 0;
   const l = Listener, o = Owner;
   Listener = c;
@@ -7895,8 +7900,9 @@ function newRow(x, k, row, c, out) {
   Owner = null;
   Listener = null;
   const sc = new Scope();
-  // Its list's scope, for `compOf` (FEEDBACK61.md, Q-901's review of e2eb410; branch feedback61).
-  sc.host = o;
+  // Its list's component (see `ownerOf`; FEEDBACK61.md, Q-901's review of 8911ac4; branch
+  // feedback61).
+  sc.comp = o ? o.comp : null;
   const r = { key: k, item: new Item(x, sc), scope: sc, nodes: null };
   Owner = r.scope;
   const got = [], made = partsMade;
@@ -8146,7 +8152,9 @@ function comp(def, props, kids, spreads) {
   for (const k of Object.keys(props)) if (!ps.includes(k)) fail(`<${def.$name}> has no parameter \`${k}\``);
   let p = props;
   if (spreads) p = withSpreads(props, ps, def, spreads);
-  if (ps.includes("children") && !hasOwn(p, "children")) p.children = kids;
+  // Markup passed as children is made where the other puts it, but is the code of the one writing
+  // it (see `slotOf`).
+  if (ps.includes("children") && !hasOwn(p, "children")) p.children = kids && Owner && Owner.comp ? slotOf(kids, Owner.comp) : kids;
   return new Html((c, out) => {
     if (def.$comp) { island(def, p, takeHydration(def.$name), c, out); return; }
     if (def.$view) {
@@ -8155,6 +8163,18 @@ function comp(def, props, kids, spreads) {
       return;
     }
     dyn(() => def(...ps.map((k) => p[k])), c, out);
+  });
+}
+
+// Markup that the component `writer` passes to another as `children`, made inside that other: its
+// parts say they are `writer`'s, whose code they are (see `ownerOf`): an `@mount` timer of a row
+// in it went to the writer, and piled up as rows came and went (FEEDBACK61.md, Q-901's review of
+// 8911ac4; branch feedback61).
+function slotOf(kids, writer) {
+  return new Html((c, out) => {
+    const s = new Scope();
+    s.comp = writer;
+    within(s, () => kids.make(c, out));
   });
 }
 
@@ -8196,6 +8216,7 @@ function withDefaults(p, defaults) {
 class Inst extends Scope {
   constructor(def, props, state, liveInfo) {
     super();
+    this.comp = this;
     this.def = def;
     this.props = heldProps(props, this);
     this.s0 = state || {};
@@ -8845,9 +8866,12 @@ let Run = null;
 // were before, put back as the code waits again or ends. After a wait the code had none: `every`
 // refused to start, and a `run_after` outlived its component (FEEDBACK61.md, Q-901; branch
 // feedback61). It is the call's, not the run's, which a state of the page keeps. A run's `nav`: when it began, among the page's moves (see `B.navigate`; Q-902).
-W.run = () => { const o = Run; return { r: (Run = o || { held: null, up: undefined, nav: ++Nav.runs }), o, y: false, a: Owner || Acting, h: Handling, p: undefined, q: false }; };
+// `w.n`: how many times `w.a`, if an effect, had run; one that has run again since is a part that
+// has gone, and what its code starts after the wait is refused (see `ownerOf`; Q-901's review of
+// 8911ac4).
+W.run = () => { const o = Run, a = Owner || Acting; return { r: (Run = o || { held: null, up: undefined, nav: ++Nav.runs }), o, y: false, a, n: a !== null ? a.runs : undefined, h: Handling, p: undefined, q: false }; };
 W.off = (w, x) => { if (!w.y) { w.y = true; Run = w.o; w.o = null; if (w.p !== undefined) { Acting = w.p; Handling = w.q; w.p = undefined; } } return x; };
-W.on = (w, v) => { w.y = false; Run = w.r; w.p = Acting; w.q = Handling; Acting = w.a; Handling = w.h; return v; };
+W.on = (w, v) => { w.y = false; Run = w.r; w.p = Acting; w.q = Handling; Acting = w.a !== null && w.a.runs !== w.n ? { dead: true, comp: w.a.comp } : w.a; Handling = w.h; return v; };
 // Whether `r`, or a run that called it, has claimed `s` for a call.
 function claimedBy(s, r) {
   for (; r; r = r.up) if (r.held !== null && r.held.has(s)) return true;
