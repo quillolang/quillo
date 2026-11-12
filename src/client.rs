@@ -4806,6 +4806,11 @@ impl<'a> Compiler<'a> {
                 AttrVal::Bool => props.push(format!("{}: true", js_str(name))),
                 AttrVal::Expr(e) => {
                     let (v, r) = self.reactive_expr(e)?;
+                    // A function written here for the other component is this one's code: run as
+                    // that one's handler (`@click={on_save}`), what it starts is this one's, as a
+                    // handler's is (see `W.hand` in src/client/runtime.js; FEEDBACK61.md, Q-901's
+                    // recheck of f7a2187; branch feedback61).
+                    let v = if matches!(e, Expr::Lambda(_)) { self.stamped(v) } else { v };
                     if r {
                         props.push(format!("get {}() {{ return {}; }}", js_str(name), v));
                     } else {
@@ -5012,8 +5017,9 @@ impl<'a> Compiler<'a> {
                     AttrVal::Expr(e) => {
                         let (f, r) = self.reactive_expr(e)?;
                         if r {
-                            // The handler it reads when the event comes.
-                            format!("($e) => {{ const $f = {}; if (typeof $f === \"function\") return $f.length > 0 ? $f($e) : $f(); }}", f)
+                            // The handler it reads when the event comes, run as its writer's code (see
+                            // `W.hand`).
+                            format!("($e) => W.hand({}, $e)", f)
                         } else {
                             f
                         }

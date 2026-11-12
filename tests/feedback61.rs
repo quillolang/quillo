@@ -4425,3 +4425,254 @@ route GET /h = <html><head><title>t</title></head><body><Pick/></body></html>
     });
     assert_eq!(rs[0], want);
 }
+
+// ---- Slice 2g: the recheck of f7a2187 (Q-901) ------------------------------------------------------
+
+// M1, the coordinator's decision for the user to confirm: a handler in markup whose writer has gone
+// but which is still shown (a toast a Product put in the Host's state, the person having left the
+// Product) gave its timers to the dead writer, and they were refused, where main ran them: Undo did
+// nothing, Pulse never ticked, a helper's timer never fired. They go to the live part that shows
+// the markup now, and end with it. A handler whose toast goes too while it waits is still refused;
+// one whose writer is still there keeps its timer, as a handler's does.
+const GONE_WRITER: &str = r###"server fn slow(ms: int) -> str { sleep(ms); "x" }
+fn soon(f) { run_after(20, f) }
+component Product(announce, dismiss, note) {
+    <div><button #add @click={() => { announce(<div class="toast">Added<button #undo @click={() => { run_after(60, () => { note("undo"); dismiss() }) }}>undo</button><button #pulse @click={() => { every(40, () => { note("pulse") }) }}>pulse</button><button #helper @click={() => { soon(() => { note("helper") }) }}>helper</button><button #waits @click={() => { slow(150); run_after(20, () => { note("late") }) }}>waits</button></div>) }}>add</button></div>
+}
+component Host(now: bool) {
+    state on = now
+    state log = []
+    state product = true
+    state toast = null
+    let note = (s) => { log = log + [s] }
+    let announce = (m) => { toast = m }
+    let dismiss = () => { toast = null }
+    <div>
+        <button #show @click={() => { on = true }}>show</button>
+        {on ? <div>
+            {product ? <Product {announce} {dismiss} {note}/> : null}
+            <button #leave @click={() => { product = false }}>leave</button>
+            <button #back @click={() => { product = true }}>back</button>
+            <button #drop @click={() => { toast = null }}>drop</button>
+            <div #toasts>{toast}</div>
+        </div> : null}
+        <p #log>{join(log, ",")}</p>
+    </div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn a_handler_in_markup_whose_writer_has_gone_gives_its_timers_to_the_part_showing_it() {
+    let body = r##"const n = (s) => $("log").textContent.split(",").filter((t) => t === s).length;
+    const toast = () => !!document.querySelector(".toast");
+    const out = {};
+    // Undo, once the Product that wrote the toast has gone.
+    await click("add", "leave", "undo"); await tick(250); out.undo = [n("undo"), toast()];
+    // Pulse ticks, and stops once the toast goes.
+    await click("back", "add", "leave", "pulse"); await tick(250);
+    { out.pulse = n("pulse") > 2; await click("drop"); await tick(40); const b = n("pulse"); await tick(250); out.pulseStops = n("pulse") === b; }
+    // A helper's timer.
+    await click("back", "add", "leave", "helper"); await tick(200); out.helper = n("helper");
+    // A handler whose toast goes while it waits, its writer gone too: refused.
+    await click("back", "add", "leave", "waits"); await tick(20); await click("drop"); await tick(400); out.late = n("late");
+    // The writer still there: its.
+    await click("back", "add", "waits"); await tick(20); await click("drop"); await tick(400); out.lateWriter = n("late");
+    return out;"##;
+    let Some(rs) = in_pages("q901-gone-writer", GONE_WRITER, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({ "undo": [1, false], "pulse": true, "pulseStops": true, "helper": 1, "late": 0, "lateWriter": 1, "remade": 0, "errors": [] });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// L1: the stamp on markup (`W.by`) keeps its writer, and a writer that had gone kept its page with it
+// (`Inst.el`), so markup a removed component of 2,000 rows had handed its parent kept every row
+// element alive. A component lets go of its page and its state as it goes.
+const KEPT_MARKUP: &str = r###"component Big(keep_html, n: int) {
+    state rows = range(n)
+    <div class="big">
+        <button #keep @click={() => { keep_html(<b class="kept">static</b>) }}>keep</button>
+        <ul>{for x in rows => <li key={x} class="row" @click={() => { rows = [] }}>{x}</li>}</ul>
+    </div>
+}
+component Host(now: bool) {
+    state on = now
+    state big = true
+    state kept = null
+    let keep_html = (h) => { kept = h }
+    <div>
+        <button #show @click={() => { on = true }}>show</button>
+        <button #off @click={() => { big = false }}>off</button>
+        {on && big ? <Big {keep_html} n={2000}/> : null}
+        <p #k>{kept}</p>
+    </div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn markup_kept_from_a_removed_component_does_not_keep_its_page() {
+    let body = r##"const out = {};
+    await click("keep"); await tick(30);
+    const w = { big: new WeakRef(document.querySelector(".big")), row: new WeakRef(document.querySelectorAll(".row")[7]) };
+    await click("off"); await tick(100);
+    for (let k = 0; k < 4; k++) { gc(); await tick(50); }
+    out.kept = $("k").textContent; out.big = !!w.big.deref(); out.row = !!w.row.deref();
+    return out;"##;
+    let Some(rs) = in_pages("q901-kept-markup", KEPT_MARKUP, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        assert_eq!(r, &serde_json::json!({ "kept": "static", "big": false, "row": false, "remade": 0, "errors": [] }), "at {}", path);
+    }
+}
+
+// L2: code run while a part is made, when another component wrote it (a render prop's own code,
+// called in a child's hole or as the child's row, or a function a child's branch shows), started
+// timers for its writer, which piled up as rows came and went: 124 intervals where main has 11.
+// They are the part's now, as a row's or a branch's own code is; markup made as text (`${...}`)
+// keeps none.
+const MADE_BY_ANOTHER: &str = r###"component List(items, row) {
+    <ul>{for x in items => <li key={x}>{row(x)}</li>}</ul>
+}
+component Rows(items, row) {
+    <ol>{for x in items => row(x)}</ol>
+}
+component Show(on: bool, body) {
+    <div>{on ? body() : null}</div>
+}
+component TextList(items, row, k: int) {
+    <p #lt>{`${k} ${<ul>{for x in items => <li key={x}>{row(x)}</li>}</ul>}`}</p>
+}
+component Page(note) {
+    state rows = [1, 2, 3, 4, 5]
+    state on = true
+    state k = 0
+    <div>
+        <List items={rows} row={(x) => { every(200, () => { note("hole") }); <span>{x}</span> }}/>
+        <Rows items={rows} row={(x) => { every(200, () => { note("row") }); <li key={x}>{x}</li> }}/>
+        <Show {on} body={() => { every(200, () => { note("branch") }); <i>b</i> }}/>
+        <TextList {k} items={rows} row={(x) => { every(200, () => { note("text") }); <i>{x}</i> }}/>
+        <button #regen @click={() => { k += 1; rows = rows | map((x) => x + 10) }}>regen</button>
+        <button #flip @click={() => { on = !on }}>flip</button>
+    </div>
+}
+component Host(now: bool) {
+    state on = now
+    state log = []
+    let note = (s) => { log = log + [s] }
+    <div><button #show @click={() => { on = true }}>show</button><button #off @click={() => { on = false }}>off</button>{on ? <Page {note}/> : null}<p #log>{join(log, ",")}</p></div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn a_render_props_own_code_is_the_part_it_is_called_for() {
+    let body = r##"const si = window.setInterval, ci = window.clearInterval, mine = new Set();
+    window.setInterval = (f, ms, ...a) => { const id = si(f, ms, ...a); mine.add(id); return id; };
+    window.clearInterval = (id) => { mine.delete(id); return ci(id); };
+    const out = {};
+    for (let k = 0; k < 8; k++) { await click("regen", "flip"); await tick(30); }
+    await tick(300); out.intervals = mine.size;
+    await click("off"); await tick(100); out.afterOff = mine.size;
+    return out;"##;
+    let Some(rs) = in_pages("q901-made", MADE_BY_ANOTHER, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        // Five a list's holes, five a list's rows, one branch shown, none made as text.
+        assert_eq!(r, &serde_json::json!({ "intervals": 11, "afterOff": 0, "remade": 0, "errors": [] }), "at {}", path);
+    }
+}
+
+// The review's INFO: a function handed to the page and called by it later (a listener a row's
+// `@mount` adds to `document`) ran as no part's code: what it started was its whole component's, so
+// 45 intervals stayed for 5 rows, a branch's `every` started once the branch had gone, and a plain
+// `fn`'s timer, from a handler, failed ("`every` works in a component"). It runs as the code that
+// handed it over now, as after a wait.
+const HANDED_TO_THE_PAGE: &str = r###"fn tick_on(f) { every(40, f) }
+component Page(note) {
+    state rows = [1, 2, 3, 4, 5]
+    state shown = true
+    <div>
+        <ul>{for x in rows => <li key={x} @mount={(el) => { js("document.addEventListener", "pokeall", () => { every(200, () => { note("row") }) }) }}>{x}</li>}</ul>
+        {shown ? <p @mount={(el) => { js("document.addEventListener", "pokeq", () => { every(40, () => { note("late") }) }) }}>p</p> : null}
+        {shown ? <div><button #hand @click={() => { js("document.addEventListener", "pokeh", () => { tick_on(() => { note("hand") }) }) }}>hand</button></div> : null}
+        <button #regen @click={() => { rows = rows | map((x) => x + 10) }}>regen</button>
+        <button #hide @click={() => { shown = false }}>hide</button>
+    </div>
+}
+component Host(now: bool) {
+    state on = now
+    state log = []
+    let note = (s) => { log = log + [s] }
+    <div><button #show @click={() => { on = true }}>show</button><button #off @click={() => { on = false }}>off</button>{on ? <Page {note}/> : null}<p #log>{join(log, ",")}</p></div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn what_the_page_calls_back_runs_as_the_code_that_handed_it_over() {
+    let body = r##"const n = (s) => $("log").textContent.split(",").filter((t) => t === s).length;
+    const si = window.setInterval, ci = window.clearInterval, mine = new Set();
+    window.setInterval = (f, ms, ...a) => { const id = si(f, ms, ...a); mine.add(id); return id; };
+    window.clearInterval = (id) => { mine.delete(id); return ci(id); };
+    const out = {};
+    for (let k = 0; k < 8; k++) { await click("regen"); await tick(30); }
+    await tick(100); const before = mine.size;
+    document.dispatchEvent(new Event("pokeall")); await tick(100); out.rows = mine.size - before;
+    await click("hand"); document.dispatchEvent(new Event("pokeh")); await tick(250); out.hand = n("hand") > 2;
+    await click("hide"); await tick(40); document.dispatchEvent(new Event("pokeq")); await tick(300); out.late = n("late");
+    { const a = n("hand"); await tick(250); out.handAfterHide = n("hand") > a + 2; }
+    return out;"##;
+    let Some(rs) = in_pages("q901-handed", HANDED_TO_THE_PAGE, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        assert_eq!(r, &serde_json::json!({ "rows": 5, "hand": true, "late": 0, "handAfterHide": true, "remade": 0, "errors": [] }), "at {}", path);
+    }
+}
+
+// L3: a function a parent writes for a child to use as its handler (`@click={on_save}`) ran as the
+// child's code, so a helper's timer in it went to the child, gone by then, and never fired. Such a
+// function is stamped with its writer, and runs as its code when the child's element hears the
+// event: a Modal's save that closes it, and a Button whose click waits while the Button goes.
+const PROP_HANDLERS: &str = r###"server fn slow(ms: int) -> str { sleep(ms); "x" }
+fn soon(f) { run_after(20, f) }
+component Modal(on_save) {
+    <div class="modal"><button #msave @click={on_save}>save</button></div>
+}
+component Button(on_click, label: str) {
+    <button #btn @click={on_click}>{label}</button>
+}
+component Page(note) {
+    state open = true
+    state shown = true
+    <div>
+        {open ? <Modal on_save={() => { open = false; run_after(20, () => { note("own") }); soon(() => { note("helper") }) }}/> : null}
+        <button #reopen @click={() => { open = true }}>reopen</button>
+        {shown ? <Button label="go" on_click={() => { slow(100); soon(() => { note("bhelper") }); run_after(20, () => { note("bown") }) }}/> : null}
+        <button #unshow @click={() => { shown = false }}>unshow</button>
+    </div>
+}
+component Host(now: bool) {
+    state on = now
+    state log = []
+    let note = (s) => { log = log + [s] }
+    <div><button #show @click={() => { on = true }}>show</button>{on ? <Page {note}/> : null}<p #log>{join(log, ",")}</p></div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn a_parents_function_run_as_a_childs_handler_is_the_parents_code() {
+    let body = r##"const n = (s) => $("log").textContent.split(",").filter((t) => t === s).length;
+    const out = {};
+    await click("msave"); await tick(200); out.modal = [n("own"), n("helper")];
+    await click("btn"); await tick(20); await click("unshow"); await tick(400); out.button = [n("bown"), n("bhelper")];
+    return out;"##;
+    let Some(rs) = in_pages("q901-prop-handlers", PROP_HANDLERS, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        assert_eq!(r, &serde_json::json!({ "modal": [1, 1], "button": [1, 1], "remade": 0, "errors": [] }), "at {}", path);
+    }
+}

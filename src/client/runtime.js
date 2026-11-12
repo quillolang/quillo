@@ -519,11 +519,29 @@ function lenient(v, depth) {
       w = function (...a) {
         const b = a.slice(0, f.length);
         for (let i = 0; i < b.length; i++) if (b[i] === undefined) b[i] = null;
-        const r = f.apply(this, b);
+        // As the code that handed it over, as after a wait (see `W.on`): a library calling it later
+        // ran it as no part's, so what it started was its whole component's, piling up as rows
+        // came and went and starting once its part had gone (FEEDBACK61.md, Q-901's recheck of
+        // f7a2187; branch feedback61).
+        // (The stand-in's `comp` is set, not written in it: a bundle takes in the names its
+        // runtime writes, and this code is in most.)
+        const k = w.k, was = Acting, wasH = Handling, wasBy = By;
+        if (k !== null && Owner === null) {
+          let a = k.a;
+          if (a.runs !== k.n) { const d = { dead: true }; d.comp = a.comp; a = d; }
+          Acting = a;
+          Handling = k.h;
+          By = k.b;
+        }
+        let r;
+        try { r = f.apply(this, b); } finally { Acting = was; Handling = wasH; By = wasBy; }
         return r instanceof Promise ? r.then((x) => forPage(x, 0)) : forPage(r, 0);
       };
       lenientFns.set(v, w);
     }
+    // The code handing it over now (the latest, for one handed over again).
+    const at = Owner || Acting;
+    w.k = at === null ? null : { a: at, n: at.runs, h: Handling, b: byNow() };
     return w;
   }
   // A number to the page, and a map that keeps its order a plain copy (see `forPage`).
@@ -6193,16 +6211,27 @@ let By = null;
 // (Q-901's review of 8911ac4 and its recheck). A part that has gone says it still, so what its code
 // starts after a wait is refused. A plain `fn`'s timer from a handler is the handler's component's,
 // as the handler's own is; it was the part's, refused once the part had run again during a wait
-// (the recheck's R4).
+// (the recheck's R4). A handler in markup whose writer has gone but which is still shown (a toast a
+// page put in the app's state) gives its timers to the live part showing it: they were refused,
+// where main ran them; one whose part went too, during its wait, is still refused. Code run while
+// a part is made, a row's or a branch's, is that part's even when another component wrote it (a
+// render prop's own code, called in a child's row): its timers piled up as rows came and went
+// (FEEDBACK61.md, Q-901's recheck of f7a2187; branch feedback61).
 function ownerOf(inst) {
   const ctx = Owner || Acting;
-  if (!inst) {
-    if (!Handling || ctx === null) return ctx;
-    const b = byNow();
-    return b !== null ? b : ctx;
+  if (ctx === null) return inst || null;
+  if (Handling) {
+    const o = inst || byNow();
+    return o === null || (o.dead && !ctx.dead) ? ctx : o;
   }
-  if (ctx === null || Handling) return inst;
-  return byNow() !== inst ? inst : ctx;
+  if (!inst) return ctx;
+  return byNow() === inst || (Owner !== null && making(Owner)) ? ctx : inst;
+}
+
+// Whether `s` is a part being made: a row's or a view's scope, or a place on the page (a hole, a
+// branch, a binding); not a component, nor an effect of its code (an `if`, a statement).
+function making(s) {
+  return s.apply !== undefined ? s.apply !== null : s.comp !== s;
 }
 
 // Whose code runs now (see `By`).
@@ -6250,7 +6279,14 @@ function dispose(s) {
   s.up = null;
   disposeKids(s);
   if (s.src) unlinkFrom(s, 0);
+  // A component that has gone lets go of its page and its state: markup it wrote, still shown
+  // elsewhere, keeps it by its stamp (`W.by`), and kept a removed writer of 2,000 rows alive with
+  // all its elements (FEEDBACK61.md, Q-901's recheck of f7a2187; branch feedback61).
+  if (s.comp === s) { s.el = null; s.sigs = null; s.s0 = GONE_STATE; s.liveInfo = null; }
 }
+
+// A gone component's server state: none.
+const GONE_STATE = Object.freeze({});
 
 // Runs `f` when the current scope goes (or its computation runs again).
 function onCleanup(f) {
@@ -6555,7 +6591,9 @@ function htmlText(h) {
   hydrating = null;
   claiming = 0;
   marking = true;
-  try { within(sc, () => h.make({ p: box, n: null, claim: false, svg: false }, out)); } finally { hydrating = was; claiming = cl; marking = false; dispose(sc); }
+  // Through `put`, as the code of the component whose stamp it bears (see `Writer`; FEEDBACK61.md,
+  // Q-901's recheck of f7a2187; branch feedback61).
+  try { within(sc, () => put(h, { p: box, n: null, claim: false, svg: false }, out)); } finally { hydrating = was; claiming = cl; marking = false; dispose(sc); }
   return out.map(nodeHtml).join("");
 }
 // While `htmlText` makes markup: each element made from a template is marked with it (`markTpl`),
@@ -9166,6 +9204,18 @@ W.t = tmpl;
 // The compiler's stamp: markup a component's code makes is that component's (see `Writer`;
 // FEEDBACK61.md, Q-901's recheck of d39aa4e; branch feedback61).
 W.by = (i, h) => { h.by = i; return h; };
+// A handler read as its event comes (`@click={on_save}`): run as the code of the component that
+// wrote the function, as its stamp says, where another's element hears the event. A Modal's save
+// that closed the Modal gave a helper's timer to the Modal, gone by then (FEEDBACK61.md, Q-901's
+// recheck of f7a2187; branch feedback61).
+W.hand = (f, e) => {
+  if (typeof f !== "function") return undefined;
+  const b = f.by;
+  if (b === undefined) return f.length > 0 ? f(e) : f();
+  const was = By;
+  By = b;
+  try { return f.length > 0 ? f(e) : f(); } finally { By = was; }
+};
 W.frag = frag;
 W.each = each;
 // The key of a row that shows nothing (see `row_key` in src/client.rs): one no program can give,
