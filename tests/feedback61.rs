@@ -268,6 +268,12 @@ fn in_pages_given(name: &str, src: &str, paths: &[&str], body: &str, focus: bool
         } else {
             node.env_remove("QUILLO_PAGE_FOCUS");
         }
+        // A page script that asks run.js for DevTools commands (`data-cdp` there).
+        if body.contains("data-cdp") {
+            node.env("QUILLO_PAGE_CDP", "1");
+        } else {
+            node.env_remove("QUILLO_PAGE_CDP");
+        }
         let out = node
             .arg(&run)
             .arg(&chrome)
@@ -3379,5 +3385,214 @@ route GET / = <html><head><title>t</title></head><body><div><Wrap/></div></body>
     let Some(rs) = in_pages("q892-otherwise", src, &paths, body) else { return };
     for (r, path) in rs.iter().zip(paths) {
         assert_eq!(r, &serde_json::json!({ "rows": "s1,s2", "marked": 0, "islands": 0, "remade": 1, "errors": [] }), "at {}", path);
+    }
+}
+
+// ---- Slice 3's review (16dfab4) ------------------------------------------------------------------
+
+// Q-890's review: with function markup no longer written over, a branch switched for another of
+// the same shape (`? :`, `if`, `match`) was the old branch's elements given the new attributes,
+// so the next step's fields held what was typed, ticked, picked or opened in the last, and a
+// password went into the other form's field. A branch is made anew again, as the guide says. The
+// edges: switched back (afresh again), a field bound to a state in both (it shows the state).
+#[test]
+fn a_branch_switched_for_one_of_the_same_shape_starts_afresh() {
+    let src = r###"component Wizard() {
+    state step = 1
+    state mode = "in"
+    state kept = ""
+    <div>
+        {step == 1 ? <input #a name="user"/> : <input #b name="code"/>}
+        {step == 1 ? <input #ka type="checkbox" name="news"/> : <input #kb type="checkbox" name="terms"/>}
+        {if step == 1 { <details #da><summary>s</summary>a</details> } else { <details #db><summary>s</summary>b</details> }}
+        {if step == 1 { <select #sa><option>a1</option><option>a2</option></select> } else { <select #sb><option>b1</option><option>b2</option></select> }}
+        {match step { 1 => <textarea #ta></textarea>, _ => <textarea #tb></textarea> }}
+        {step == 1 ? <input #ba value={kept}/> : <input #bb value={kept}/>}
+        {mode == "in" ? <form #fi action="/in"><input #pi name="password" type="password"/></form> : <form #fu action="/up"><input #pu name="new_password" type="password"/></form>}
+        <button #next @click={() => { step = step == 1 ? 2 : 1 }}>next</button>
+        <button #mode @click={() => { mode = mode == "in" ? "up" : "in" }}>mode</button>
+    </div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Wizard/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"const typeIn = (id, text) => { const el = $(id); el.focus(); el.select(); document.execCommand("insertText", false, text); };
+    typeIn("a", "alice"); $("ka").click(); $("da").open = true;
+    $("sa").value = "a2"; $("sa").dispatchEvent(new Event("change", { bubbles: true }));
+    typeIn("ta", "secret note"); typeIn("ba", "bound"); typeIn("pi", "hunter2");
+    await tick(30);
+    await click("next", "mode");
+    const out = {};
+    out.next = [$("b").value, $("kb").checked, $("db").open, $("sb").value, $("tb").value, $("bb").value].join("|");
+    out.form = new URLSearchParams(new FormData($("fu"))).toString() + "@" + $("fu").getAttribute("action");
+    await click("next", "mode");
+    out.back = [$("a").value, $("ka").checked, $("da").open, $("sa").value, $("ta").value, $("ba").value].join("|");
+    out.formBack = new URLSearchParams(new FormData($("fi"))).toString();
+    return out;"##;
+    let Some(rs) = in_pages("q890-branches", src, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            "next": "|false|false|b1||bound", "form": "new_password=@/up", "back": "|false|false|a1||bound", "formBack": "password=",
+            "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Q-890's review: a select in function markup whose options and value changed in one update was
+// given its value before its options, and showed another option. It shows its value once its
+// options are as the markup says. The edges: back again; one with no value keeps the person's
+// pick through it and through a change elsewhere.
+#[test]
+fn a_select_in_function_markup_shows_its_new_value_among_new_options() {
+    let src = r###"fn sel(v, o) = <select #s value={v}><option>{o[0]}</option><option>{o[1]}</option><option>{o[2]}</option></select>
+fn same(o) = <select #t><option>{o[0]}</option><option>{o[1]}</option><option>{o[2]}</option></select>
+component Sel() {
+    state v = "q"
+    state opts = ["p", "q", "r"]
+    state n = 0
+    <div>{sel(v, opts)}{same(opts)}<span>{n}</span>
+        <button #swap @click={() => { opts = ["x", "y", "z"]; v = "y" }}>swap</button>
+        <button #back @click={() => { opts = ["p", "q", "r"]; v = "r" }}>back</button>
+        <button #inc @click={() => { n += 1 }}>inc</button>
+    </div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Sel/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"const out = { first: [$("s").value, $("t").value].join("|") };
+    $("t").value = "r"; $("t").dispatchEvent(new Event("change", { bubbles: true }));
+    await click("swap");
+    out.swap = [$("s").value, [...$("s").options].map((o) => o.text).join(","), $("t").value].join("|");
+    await click("inc");
+    out.inc = [$("s").value, $("t").value].join("|");
+    await click("back");
+    out.back = [$("s").value, $("t").value].join("|");
+    return out;"##;
+    let Some(rs) = in_pages("q890-select", src, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({ "first": "q|p", "swap": "y|x,y,z|z", "inc": "y|z", "back": "r|r", "remade": 0, "errors": [] });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Q-891's review: the caret kept its distance from the end, which is wrong when the write changes
+// the text after it (ß in capitals is SS; a card number's groups move). It stays where it was in
+// what the old and new text begin with, as far from the end in what they end with, and after the
+// new text where they differ. Typed at the start, the middle and the end: capitals with ß, a card
+// number in fours, a phone number, a trim. And the `select` the browser sends for the caret put
+// back is not the program's (a handler had run on every key typed in the middle).
+#[test]
+fn the_caret_stays_where_it_was_in_the_text_both_have() {
+    let src = r###"fn card(s) {
+    let d = slice(re.replace(s, "[^0-9]", ""), 0, 16)
+    join(range(0, floor((len(d) + 3) / 4)) | map((i) => slice(d, i * 4, i * 4 + 4)), " ")
+}
+fn phone(s) {
+    let d = slice(re.replace(s, "[^0-9]", ""), 0, 10)
+    len(d) <= 3 ? d : len(d) <= 6 ? `(${slice(d, 0, 3)}) ${slice(d, 3)}` : `(${slice(d, 0, 3)}) ${slice(d, 3, 6)}-${slice(d, 6)}`
+}
+component Caret() {
+    state big = "aßb"
+    state cc = "1234 5678"
+    state ph = "(555) 123-4567"
+    state up = "AB"
+    state tr = "ab"
+    state sel = 0
+    <div>
+        <input #big value={big} @input={(e) => { big = upper(e.value) }}/>
+        <input #cc value={cc} @input={(e) => { cc = card(e.value) }}/>
+        <input #ph value={ph} @input={(e) => { ph = phone(e.value) }}/>
+        <input #up value={up} @input={(e) => { up = upper(e.value) }} @select={() => { sel += 1 }}/>
+        <input #tr value={tr} @input={(e) => { tr = trim(e.value) }}/>
+        <p #sel>{sel}</p>
+    </div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Caret/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"const typeAt = async (id, at, keys) => { const el = $(id); el.focus(); el.setSelectionRange(at, at); for (const k of keys) { document.execCommand("insertText", false, k); await tick(20); } return `${el.value}@${el.selectionStart}`; };
+    const end = (id) => $(id).value.length;
+    const out = {};
+    out.ss = await typeAt("big", 1, ["x", "y"]);
+    out.ssEnd = await typeAt("big", end("big"), ["q"]);
+    out.ssStart = await typeAt("big", 0, ["w"]);
+    out.card = await typeAt("cc", 2, ["9", "8"]);
+    out.cardEnd = await typeAt("cc", end("cc"), ["1"]);
+    out.cardStart = await typeAt("cc", 0, ["0"]);
+    out.phone = await typeAt("ph", 3, ["9"]);
+    out.phoneEnd = await typeAt("ph", end("ph"), ["8"]);
+    out.up = await typeAt("up", 1, ["x", "y", "z"]);
+    out.trimStart = await typeAt("tr", 0, [" "]);
+    out.trimMid = await typeAt("tr", 1, [" "]);
+    out.trimEnd = await typeAt("tr", end("tr"), [" "]);
+    await tick(50);
+    out.selects = $("sel").textContent;
+    return out;"##;
+    let Some(rs) = in_pages("q891-caret", src, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            "ss": "AXYSSB@3", "ssEnd": "AXYSSBQ@7", "ssStart": "WAXYSSBQ@1",
+            "card": "1298 3456 78@4", "cardEnd": "1298 3456 781@13", "cardStart": "0129 8345 6781@1",
+            "phone": "(559) 512-3456@4", "phoneEnd": "(559) 512-3456@14",
+            "up": "AXYZB@4", "trimStart": "ab@0", "trimMid": "a b@2", "trimEnd": "a b@3",
+            "selects": "1", "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Q-939: a field the program writes as it is typed in (capitals here) was written while a person
+// composed text with an input method, which ended the composition and put what was composed in
+// twice (AKBKAか for AかB). It is not written while composing; the program's value is written when
+// the composition ends. With Chrome's own input method (DevTools' Input.imeSetComposition).
+#[test]
+fn a_field_being_composed_in_is_written_once_the_composition_ends() {
+    let src = r###"component Ime() {
+    state code = "AB"
+    <div><input #code value={code} @input={(e) => { code = upper(e.value) }}/><p #said>{code}</p></div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Ime/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"const el = $("code"); el.focus(); el.setSelectionRange(1, 1);
+    const cdp = async (cmds) => { document.body.setAttribute("data-cdp", JSON.stringify(cmds)); for (let i = 0; i < 250 && document.body.hasAttribute("data-cdp"); i++) await tick(20); await tick(80); };
+    const out = {};
+    await cdp([["Input.imeSetComposition", { text: "k", selectionStart: 1, selectionEnd: 1 }]]);
+    out.k = el.value;
+    await cdp([["Input.imeSetComposition", { text: "ka", selectionStart: 2, selectionEnd: 2 }]]);
+    out.ka = el.value;
+    await cdp([["Input.insertText", { text: "か" }]]);
+    await tick(100);
+    out.done = `${el.value}@${el.selectionStart}|${$("said").textContent}`;
+    el.setSelectionRange(2, 2);
+    await cdp([["Input.imeSetComposition", { text: "e", selectionStart: 1, selectionEnd: 1 }]]);
+    out.e = el.value;
+    await cdp([["Input.insertText", { text: "é" }]]);
+    await tick(100);
+    out.accent = `${el.value}@${el.selectionStart}|${$("said").textContent}`;
+    return out;"##;
+    let Some(rs) = in_pages_with("q939", src, BOTH, body, true) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            "k": "AkB", "ka": "AkaB", "done": "AかB@2|AかB", "e": "AかeB", "accent": "AかÉB@3|AかÉB", "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
     }
 }

@@ -113,11 +113,23 @@ async function main() {
         const where = r.result && r.result.result && r.result.result.value;
         throw new Error("the page did not finish its test in time: " + where);
       }
+      // DevTools commands a page asks for, with QUILLO_PAGE_CDP: a JSON list of [method, params] in
+      // `data-cdp`, sent in turn, then the attribute taken away, so the page knows (an input
+      // method's text, which a page cannot make itself; FEEDBACK61.md, Q-939; branch feedback61).
+      if (process.env.QUILLO_PAGE_CDP) {
+        const q = await send("Runtime.evaluate", { expression: "document.body && document.body.getAttribute('data-cdp')", returnByValue: true });
+        const asked = q.result && q.result.result && q.result.result.value;
+        if (asked) {
+          for (const [method, params] of JSON.parse(asked)) await send(method, params);
+          await send("Runtime.evaluate", { expression: "document.body.removeAttribute('data-cdp')" });
+          continue;
+        }
+      }
       const r = await send("Runtime.evaluate", { expression: "document.body && document.body.getAttribute('data-result')", returnByValue: true });
       const v = r.result && r.result.result && r.result.result.value;
       await takeCoverage();
       if (v) { process.stdout.write(v); break; }
-      await sleep(100);
+      await sleep(process.env.QUILLO_PAGE_CDP ? 20 : 100);
     }
     if (coverDir) rtcover.record(coverDir, "chrome", covered);
     ws.close();

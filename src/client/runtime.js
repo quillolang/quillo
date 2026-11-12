@@ -6630,6 +6630,34 @@ function own(got, made) {
 // put out before its marker (`size`).
 let partsMade = 0;
 
+// Where a caret at `at` in a field's text `was` goes once `now` is written over it: in what both
+// begin with (`p` long), where it was; in what both end with (`q` long), as far from the end; in
+// what changed, after the new text. A letter in another case counts as the same (FEEDBACK61.md,
+// Q-891's review; branch feedback61).
+function caretSpan(was, now) {
+  const same = (x, y) => x === y || x.toLowerCase() === y.toLowerCase();
+  const n = Math.min(was.length, now.length);
+  let p = 0, q = 0;
+  while (p < n && same(was[p], now[p])) p++;
+  while (q < n - p && same(was[was.length - 1 - q], now[now.length - 1 - q])) q++;
+  return [p, q];
+}
+const caretIn = (was, now, at, p, q) => (at <= p ? at : at >= was.length - q ? now.length - (was.length - at) : now.length - q);
+
+// Fields being composed in (see `setProp`), heard on the page from the start (a field taken up
+// from the server's page has not been written yet when one is composed in): one is written with the
+// program's value once that ends, after the input the end may bring (Firefox sends it after).
+const imeHeard = typeof document !== "undefined" && imeHear();
+function imeHear() {
+  document.addEventListener("compositionstart", (e) => { e.target.__ime = true; }, true);
+  document.addEventListener("compositionend", (e) => {
+    const el = e.target;
+    el.__ime = false;
+    setTimeout(() => { if (!el.__ime && el.__want !== undefined) setProp(el, "value", el.__want, undefined); }, 0);
+  }, true);
+  return true;
+}
+
 // A <textarea>'s text is only its first value: once someone types, the box
 // stops showing it. When the text between its tags changes, the box shows
 // the new text; when it does not, what was typed stays.
@@ -6726,7 +6754,8 @@ function morph(old, now) {
   // (`__want`, `__set`: see `setProp`), and says otherwise than before, is written. The new
   // element's own values, the defaults where it said nothing, had been copied over them, and
   // an `open` it did not write taken away (FEEDBACK61.md, Q-890; branch feedback61).
-  if (now.__want !== undefined && !eq(now.__want, old.__want)) setProp(old, "value", now.__want, old.__want);
+  const wrote = now.__want !== undefined && !eq(now.__want, old.__want);
+  if (wrote) setProp(old, "value", now.__want, old.__want);
   const set = now.__set;
   if (set) for (const k in set) if (!old.__set || old.__set[k] !== set[k]) setProp(old, k, set[k], old.__set ? old.__set[k] : undefined);
   old.__click = now.__click;
@@ -6742,6 +6771,10 @@ function morph(old, now) {
   if (now.__click && !delegating) { delegating = true; document.addEventListener("click", delegated); }
   const oc = old.childNodes, nc = now.childNodes;
   for (let i = 0; i < nc.length; i++) morph(oc[i], nc[i]);
+  // A select given a new value shows it once its options are as the markup says too: written
+  // before them, it named an option that was not there yet (FEEDBACK61.md, Q-890's review; branch
+  // feedback61).
+  if (wrote && old.localName === "select") selectShow(old, old.__want);
 }
 
 // An element's only content, following `get`: its children, without markers.
@@ -7102,10 +7135,13 @@ function keyed(key, make) {
 }
 
 // `cond ? <a/> : <b/>` and the like: `which` says which branch shows, and
-// a branch is made again only when that changes.
+// a branch is made again only when that changes. Made again, not the old branch's elements given
+// the new one's attributes (see `dynApply`): a branch that goes takes what was typed, ticked or
+// picked in it along, which went into the next step's fields, a password into another form's
+// (FEEDBACK61.md, Q-890's review; branch feedback61).
 function choose(which, branches) {
   const w = memo(which);
-  return frag([() => { const i = w.v; return i < 0 || i >= branches.length ? null : part(untrack(branches[i])); }]);
+  return new Html((c, out) => dyn(() => { const i = w.v; return i < 0 || i >= branches.length ? null : part(untrack(branches[i])); }, c, out, true));
 }
 
 // What a branch or a row gives: a function is a part that follows it.
@@ -7485,20 +7521,25 @@ function setProp(el, k, v, old) {
     const typed = el.localName === "input" || el.localName === "textarea";
     if (typed && (isNil(v) ? el.value.trim() === "" : (typeof v === "number" || v instanceof Fl) && el.value.trim() !== "" && Number(el.value) === numOf(v))) return;
     const nv = isNil(v) ? "" : display(v);
+    // While a person composes text with an input method, the field is not written: that ended the
+    // composition, and what was composed went in twice. The program's value is written once the
+    // composition ends (FEEDBACK61.md, Q-939; branch feedback61).
+    if (typed && imeHeard && el.__ime) return;
     if (el.value !== nv) {
-      // The field being typed in keeps its caret as far from the end of its text as it was:
-      // after what was typed, when the program writes it in capitals or leaves a key out. A
-      // write put it at the end, and the next key went there (FEEDBACK61.md, Q-891; branch
-      // feedback61).
-      // At the end, where the write puts it, nothing more is done.
-      let a = 0, b = 0, dir;
-      if (typed && el === document.activeElement && typeof el.selectionStart === "number") {
-        a = el.value.length - el.selectionStart;
-        b = el.value.length - el.selectionEnd;
-        if (a || b) dir = el.selectionDirection;
-      }
+      // The field being typed in keeps its caret in its text, after what was typed, when the
+      // program writes it in capitals, leaves a key out or groups it (see `caretIn`). A write put
+      // it at the end, and the next key went there (FEEDBACK61.md, Q-891 and its review; branch
+      // feedback61). At the end, where the write puts it, nothing more is done.
+      const keep = typed && el === document.activeElement && typeof el.selectionStart === "number";
+      const was = el.value, at = keep ? el.selectionStart : 0, to = keep ? el.selectionEnd : 0, dir = keep ? el.selectionDirection : undefined;
       el.value = nv;
-      if (a || b) el.setSelectionRange(Math.max(0, nv.length - a), Math.max(0, nv.length - b), dir);
+      if (keep) {
+        const [p, q] = caretSpan(was, nv), a = caretIn(was, nv, at, p, q), b = caretIn(was, nv, to, p, q);
+        if (a !== nv.length || b !== nv.length) {
+          el.__selSet = [a, b];
+          el.setSelectionRange(a, b, dir);
+        }
+      }
     }
     if (el.localName === "option") selFollow(el.parentNode);
     // Made here, its first value is its default too, as the server writes it, so that a form's
@@ -7604,6 +7645,14 @@ function fire(el, type, ev) {
   // Q-896; branch feedback61). What comes later still reaches a removed element's handlers (a
   // card's `dragend`, after the drop that took it to another list), and one that moves keeps them.
   if (removing) return;
+  // The `select` the browser sends for Quillo's own caret, put back after a write (see `setProp`),
+  // is not the person's: a handler had run on every key typed in the middle (FEEDBACK61.md,
+  // Q-891's review; branch feedback61).
+  if (type === "select" && el.__selSet) {
+    const q = el.__selSet;
+    el.__selSet = null;
+    if (el.selectionStart === q[0] && el.selectionEnd === q[1]) return;
+  }
   const f = type === "click" ? el.__click : el.__w && el.__w[type];
   if (typeof f !== "function") return;
   if (type === "submit") ev.preventDefault();
@@ -8286,13 +8335,15 @@ function markedEnd(open) {
 // The islands in `el`, in the page's order, as elements: those marked by comments too when
 // `marked` (its island says it holds some: `data-qm`).
 function islandsIn(el, marked) {
-  const found = [...el.querySelectorAll(ISLANDS)];
-  if (!marked) return found;
-  const w = document.createTreeWalker(el, NodeFilter.SHOW_COMMENT);
-  let more = null;
-  for (let n = w.nextNode(); n; n = w.nextNode()) if (isMarked(n)) (more || (more = [])).push(n);
-  if (!more) return found;
-  return found.concat(more).sort((a, b) => (a.compareDocumentPosition(b) & 4 ? -1 : 1)).map((n) => (n.nodeType === 8 ? markedData(n) : n));
+  if (!marked) return [...el.querySelectorAll(ISLANDS)];
+  // One walk, in the page's order: sorted by comparing their places, taking up 3,000 of them
+  // took longer than making the page again (found in review).
+  const found = [], w = document.createTreeWalker(el, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT);
+  for (let n = w.nextNode(); n; n = w.nextNode()) {
+    if (n.nodeType === 8) { if (isMarked(n)) found.push(markedData(n)); }
+    else if (n.localName === "quillo-island" || n.hasAttribute("data-qi")) found.push(n);
+  }
+  return found;
 }
 
 // A component made again because the server's HTML was not what it makes:
@@ -8636,16 +8687,17 @@ function resume(el) {
   el.__q = true;
   const def = C[el.dataset.c];
   if (!def) { report(`unknown component <${el.dataset.c}>`); return; }
-  // Those inside it the server marked by comments too (FEEDBACK61.md, Q-892; branch feedback61).
-  const marked = el.hasAttribute("data-qm");
+  // Those inside it the server marked by comments too, found once (FEEDBACK61.md, Q-892; branch
+  // feedback61).
+  const inside = islandsIn(el, el.hasAttribute("data-qm"));
   const queue = () => {
     const q = {};
-    for (const inner of islandsIn(el, marked)) {
+    for (const inner of inside) {
       (q[inner.dataset.c] = q[inner.dataset.c] || []).push({ s: islandJSON(inner.dataset.s, {}), l: islandJSON(inner.dataset.l, null) });
     }
     return q;
   };
-  for (const inner of islandsIn(el, marked)) liveSeen(...(inner.dataset.v || "").split(":"));
+  for (const inner of inside) liveSeen(...(inner.dataset.v || "").split(":"));
   liveSeen(...(el.dataset.v || "").split(":"));
   const props = islandJSON(el.dataset.p, {});
   // A top island's children come as the HTML the server made of them.
