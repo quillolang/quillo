@@ -6595,8 +6595,8 @@ let removing = 0;
 // A part of the page that follows `get`: its nodes, then a marker (an
 // empty text node) that later nodes go in front of. A text that becomes
 // another text is changed in place.
-function dyn(get, c, out) {
-  bound(get, dynApply, { nodes: [], end: null, c, out, made: 0, size: 0 }, null, undefined);
+function dyn(get, c, out, anew) {
+  bound(get, dynApply, { nodes: [], end: null, c, out, made: 0, size: 0, anew: !!anew }, null, undefined);
 }
 
 function dynApply(x) {
@@ -6627,12 +6627,14 @@ function dynApply(x) {
     return;
   }
   const got = [], made = partsMade;
+  // Where its nodes go (see `bareIn`).
+  c.p = r.end.parentNode;
   put(x, c, got);
   // Markup a function made again, as `{tick(on)}` is, with the same elements as on the page and
   // nothing in it that follows anything itself: the page's elements take the new one's
   // attributes, text and handlers, and stay, so focus and what was typed stay (FEEDBACK25.md,
   // Q-306; branch feedback27-35-fixes).
-  if (!this.owned && !this.clean && sameShape(r.nodes, got)) {
+  if (!r.anew && !this.owned && !this.clean && sameShape(r.nodes, got)) {
     for (let i = 0; i < got.length; i++) morph(r.nodes[i], got[i]);
     return;
   }
@@ -6664,12 +6666,17 @@ function sameShape(a, b) {
 // `old` made to say what `now` says: attributes, the values a person changes, text, handlers.
 function morph(old, now) {
   if (old.nodeType === 3) { if (old.data !== now.data) old.data = now.data; return; }
-  for (const a of Array.from(old.attributes)) if (!now.hasAttribute(a.name)) old.removeAttribute(a.name);
-  for (const a of Array.from(now.attributes)) if (old.getAttribute(a.name) !== a.value) old.setAttribute(a.name, a.value);
-  for (const k of ["value", "checked", "selected", "muted", "indeterminate"]) if (k in now && old[k] !== now[k]) old[k] = now[k];
+  for (const a of Array.from(old.attributes)) if (a.name !== "open" && !now.hasAttribute(a.name)) old.removeAttribute(a.name);
+  for (const a of Array.from(now.attributes)) if (a.name !== "open" && old.getAttribute(a.name) !== a.value) old.setAttribute(a.name, a.value);
+  // What a person typed, ticked, picked or opened stays: only what the markup itself says
+  // (`__want`, `__set`: see `setProp`), and says otherwise than before, is written. The new
+  // element's own values, the defaults where it said nothing, had been copied over them, and
+  // an `open` it did not write taken away (FEEDBACK61.md, Q-890; branch feedback61).
+  if (now.__want !== undefined && !eq(now.__want, old.__want)) setProp(old, "value", now.__want, old.__want);
+  const set = now.__set;
+  if (set) for (const k in set) if (!old.__set || old.__set[k] !== set[k]) setProp(old, k, set[k], old.__set ? old.__set[k] : undefined);
   old.__click = now.__click;
   old.__own = now.__own;
-  if (now.__want !== undefined) old.__want = now.__want;
   if (now.__w) {
     const cur = old.__w || (old.__w = {}), listening = old.__wl || (old.__wl = {});
     for (const t of Object.keys(cur)) if (!(t in now.__w)) delete cur[t];
@@ -6712,7 +6719,7 @@ function dynAllApply(x) {
     return;
   }
   const got = [];
-  put(x, { claim: false, svg }, got);
+  put(x, { claim: false, svg, p: el }, got);
   if (isText(x) && got.length === 0) got.push(document.createTextNode(""));
   // The children it replaces hear nothing as they go (see `removing`; FEEDBACK61.md, Q-896; branch
   // feedback61).
@@ -6899,14 +6906,14 @@ function classApply(x) {
 function showAt(p, at, v, svg, i) {
   if (typeof v !== "function") {
     const got = [];
-    put(v, { claim: false, svg }, got);
+    put(v, { claim: false, svg, p }, got);
     for (const n of got) p.insertBefore(n, at);
     p.removeChild(at);
     return;
   }
   const got = [];
-  if (byRow(i)) rowHole(rowNow, v, dynApply, { nodes: [], end: null, c: { claim: false, svg }, out: got }, null, undefined, true);
-  else dyn(v, { claim: false, svg }, got);
+  if (byRow(i)) rowHole(rowNow, v, dynApply, { nodes: [], end: null, c: { claim: false, svg, p }, out: got }, null, undefined, true);
+  else dyn(v, { claim: false, svg, p }, got);
   for (const n of got) p.insertBefore(n, at);
   p.removeChild(at);
 }
@@ -6934,7 +6941,7 @@ function showIn(el, v, claim, svg, i) {
     return;
   }
   const got = [];
-  put(v, { claim: false, svg }, got);
+  put(v, { claim: false, svg, p: el }, got);
   if (isText(v)) { el.firstChild.data = shown(v); return; }
   el.replaceChildren(...got);
 }
@@ -7032,10 +7039,12 @@ function frag(items) {
 }
 
 // A part made again only when `key` changes (an element or component with
-// a `key`, outside a loop: a new key starts it afresh).
+// a `key`, outside a loop: a new key starts it afresh). Afresh: not the same elements given the
+// new ones' attributes (see `dynApply`), which kept what was typed in them once that was no
+// longer written over (FEEDBACK61.md, Q-890; branch feedback61).
 function keyed(key, make) {
   const k = memo(key);
-  return frag([() => { k.v; return untrack(make); }]);
+  return new Html((c, out) => dyn(() => { k.v; return untrack(make); }, c, out, true));
 }
 
 // `cond ? <a/> : <b/>` and the like: `which` says which branch shows, and
@@ -7180,7 +7189,9 @@ function aheadFor(u) {
   aheadDrop();
   if (!doc || !fresh) return null;
   const here = new Set([...document.querySelectorAll(ISLANDS)].map((i) => i.dataset.c)), q = {};
-  for (const i of doc.querySelectorAll(ISLANDS)) {
+  // Those marked by comments too, in their place in the line (FEEDBACK61.md, Q-892; branch
+  // feedback61).
+  for (const i of islandsIn(doc.documentElement, doc.querySelector("[data-qm]") !== null)) {
     if (here.has(i.dataset.c) || i.hasAttribute("data-qd")) continue;
     liveSeen(...(i.dataset.v || "").split(":"));
     (q[i.dataset.c] = q[i.dataset.c] || []).push({ s: islandJSON(i.dataset.s, {}), l: islandJSON(i.dataset.l, null) });
@@ -7300,7 +7311,8 @@ function spreadAttrOk(k) {
 // JSON made any element a component of its choosing (FEEDBACK55.md, Q-700; branch feedback55).
 // The island's own, as the server writes them (`island_attr` in src/interp.rs), `data-qt` on what
 // is swapped in for a waiting one (src/defer.rs).
-const ISLAND_ATTRS = new Set(["data-qi", "data-qd", "data-qt", "data-c", "data-p", "data-s", "data-l", "data-v", "data-e"]);
+// `data-qm`: an island holding some marked by comments (FEEDBACK61.md, Q-892; branch feedback61).
+const ISLAND_ATTRS = new Set(["data-qi", "data-qd", "data-qt", "data-c", "data-p", "data-s", "data-l", "data-v", "data-e", "data-qm"]);
 const runtimeAttr = (n) => ISLAND_ATTRS.has(n) || n.startsWith("data-q-") || n.startsWith("data-quillo-");
 
 const sandboxed = (el) => el.hasAttribute("sandbox") && !/allow-same-origin/i.test(el.getAttribute("sandbox"));
@@ -7419,7 +7431,21 @@ function setProp(el, k, v, old) {
     const typed = el.localName === "input" || el.localName === "textarea";
     if (typed && (isNil(v) ? el.value.trim() === "" : (typeof v === "number" || v instanceof Fl) && el.value.trim() !== "" && Number(el.value) === numOf(v))) return;
     const nv = isNil(v) ? "" : display(v);
-    if (el.value !== nv) el.value = nv;
+    if (el.value !== nv) {
+      // The field being typed in keeps its caret as far from the end of its text as it was:
+      // after what was typed, when the program writes it in capitals or leaves a key out. A
+      // write put it at the end, and the next key went there (FEEDBACK61.md, Q-891; branch
+      // feedback61).
+      // At the end, where the write puts it, nothing more is done.
+      let a = 0, b = 0, dir;
+      if (typed && el === document.activeElement && typeof el.selectionStart === "number") {
+        a = el.value.length - el.selectionStart;
+        b = el.value.length - el.selectionEnd;
+        if (a || b) dir = el.selectionDirection;
+      }
+      el.value = nv;
+      if (a || b) el.setSelectionRange(Math.max(0, nv.length - a), Math.max(0, nv.length - b), dir);
+    }
     if (el.localName === "option") selFollow(el.parentNode);
     // Made here, its first value is its default too, as the server writes it, so that a form's
     // reset brings it back (FEEDBACK55.md, Q-768; branch feedback55).
@@ -7427,8 +7453,10 @@ function setProp(el, k, v, old) {
     return;
   }
   if (k === "checked" || k === "selected" || k === "muted") {
-    if (claiming) return;
     const nv = truthy(v);
+    // What the markup says, for `morph` (FEEDBACK61.md, Q-890; branch feedback61).
+    (el.__set || (el.__set = {}))[k] = nv;
+    if (claiming) return;
     if (el[k] !== nv) el[k] = nv;
     if (nv) el.setAttribute(k, ""); else el.removeAttribute(k);
     if (marking && nv) (el.__bare || (el.__bare = new Set())).add(k);
@@ -7438,7 +7466,7 @@ function setProp(el, k, v, old) {
   // server's HTML cannot say them, so they are set when the page is taken up too, unless the
   // person has changed them already; a value out of range is brought into it, and one that is
   // no number is left out, as the browser would throw (branch feedback40-43).
-  if (k === "indeterminate") { el.indeterminate = truthy(v); return; }
+  if (k === "indeterminate") { (el.__set || (el.__set = {}))[k] = el.indeterminate = truthy(v); return; }
   if (k === "volume" || k === "currentTime" || k === "playbackRate") {
     let n = Number(v);
     if (isNil(v) || !Number.isFinite(n) || (claiming && el[k] !== (k === "currentTime" ? 0 : 1))) return;
@@ -7450,7 +7478,10 @@ function setProp(el, k, v, old) {
     return;
   }
   // What a person opened or closed stays until the value itself changes.
-  if (k === "open" && old !== undefined && truthy(old) === truthy(v)) return;
+  if (k === "open") {
+    (el.__set || (el.__set = {})).open = truthy(v);
+    if (old !== undefined && truthy(old) === truthy(v)) return;
+  }
   if ((k === "style" || k === "class") && typeof v === "string" && (typeof old === "string" || isNil(old) || old === false) && old !== undefined) {
     (k === "style" ? styleApply : classTokens)(el, typeof old === "string" ? old : "", v);
     return;
@@ -7663,8 +7694,10 @@ function each(list, key, row) {
     // without it, and go with it. Their nodes stay the list's: what holds it (a branch, as it
     // switches away from it) goes on to take them off the page, and finds them by its marker (see
     // `own`). Emptied here, a list that had grown since it was made left the new rows behind
-    // (FEEDBACK61.md, Q-889; branch feedback61).
-    onCleanup(() => { for (const r of st.rows) dispose(r.scope); });
+    // (FEEDBACK61.md, Q-889; branch feedback61). Emptied once that is done, in the same task:
+    // kept, one row element a script held kept every row's record through its list's marker
+    // (found in review of 0851ec8; FEEDBACK61.md, Q-889; branch feedback61).
+    onCleanup(() => { for (const r of st.rows) dispose(r.scope); rowsGone(st); });
     effect(() => {
       const items = iter(list());
       untrack(() => {
@@ -7682,6 +7715,16 @@ function each(list, key, row) {
       });
     });
   });
+}
+
+// Lists whose rows have gone: their records are let go after the task that took them away.
+let goneLists = null;
+function rowsGone(st) {
+  if (!goneLists) {
+    goneLists = [];
+    queueMicrotask(() => { for (const s of goneLists) s.rows = []; goneLists = null; });
+  }
+  goneLists.push(st);
 }
 
 // A row's item: a signal that also runs what follows only it (`rowDirect`).
@@ -7869,7 +7912,7 @@ function reconcile(st, items, key, row, svg) {
     let r;
     if (j < 0) {
       const got = [];
-      r = newRow(items[i], keys[i], row, { claim: false, svg }, got);
+      r = newRow(items[i], keys[i], row, { claim: false, svg, p }, got);
       if (!pend) pend = document.createDocumentFragment();
       for (let k = got.length - 1; k >= 0; k--) pend.insertBefore(got[k], pend.firstChild);
     } else {
@@ -8133,14 +8176,69 @@ function wrapper(name) {
 function asOwnRoot(w, inst, svg) {
   const r = w.firstChild;
   if (!r || r !== w.lastChild || !(TABLE_PART.test(r.localName) || svg && r.nodeType === 1)) return w;
+  islandRoot(r, w.dataset.c, inst);
+  return r;
+}
+// Element `r` as the island of a component `name` whose root it is.
+function islandRoot(r, name, inst) {
   // Its markup's own island attributes left out, as the server leaves them out (FEEDBACK55.md,
   // Q-700; branch feedback55).
   for (const a of ISLAND_ATTRS) r.removeAttribute(a);
   r.setAttribute("data-qi", "");
-  r.dataset.c = w.dataset.c;
+  r.dataset.c = name;
   r.__q = true;
   inst.el = r;
-  return r;
+}
+
+// Where a <quillo-island> cannot stand, a component's nodes stand by themselves: among a
+// table's or a select's parts, as the HTML parser keeps only those there, and in <svg>, which
+// draws only its own elements. In one there, a row was no row of its table (`tbody.rows`), a
+// select did not follow its options again once one was made anew, and SVG drew nothing; as the
+// server's page has it, where a branch at a table row's root is that row (FEEDBACK61.md, Q-937
+// and Q-938, and the coordinator's decision of 2026-11-12, for the user to confirm; branch
+// feedback61). `c.p`: the element its nodes go in.
+const NO_WRAP = /^(table|thead|tbody|tfoot|tr|colgroup|select|optgroup|datalist)$/;
+const bareIn = (c) => c.svg || (c.p != null && NO_WRAP.test(c.p.localName));
+// A component standing by itself: its one element, if it has one, is its island, as the server
+// writes it; else its first, for the tools to show.
+function bareRoot(got, inst, name) {
+  let one = null, n = 0;
+  for (const x of got) if (x.nodeType === 1 && n++ === 0) one = x;
+  if (n === 1) islandRoot(one, name, inst);
+  else inst.el = one;
+}
+
+// A comment the server marks a component with where no element can stand (see `island_wrap` in
+// src/interp.rs): `q` and the island's attributes, read as an element's (FEEDBACK61.md, Q-892
+// and Q-936; branch feedback61). `/q` ends it.
+const isMarked = (n) => n != null && n.nodeType === 8 && n.data.charCodeAt(0) === 113 && n.data.charCodeAt(1) === 32;
+function markedData(n) {
+  if (!n.__qd) {
+    const t = document.createElement("template");
+    t.innerHTML = "<i" + n.data.slice(1) + ">";
+    n.__qd = t.content.firstChild;
+  }
+  return n.__qd;
+}
+// The comment that ends the one `open` began, past those of components inside it.
+function markedEnd(open) {
+  let depth = 0, n = open.nextSibling;
+  for (; n; n = n.nextSibling) {
+    if (isMarked(n)) depth++;
+    else if (n.nodeType === 8 && n.data === "/q" && depth-- === 0) break;
+  }
+  return n;
+}
+// The islands in `el`, in the page's order, as elements: those marked by comments too when
+// `marked` (its island says it holds some: `data-qm`).
+function islandsIn(el, marked) {
+  const found = [...el.querySelectorAll(ISLANDS)];
+  if (!marked) return found;
+  const w = document.createTreeWalker(el, NodeFilter.SHOW_COMMENT);
+  let more = null;
+  for (let n = w.nextNode(); n; n = w.nextNode()) if (isMarked(n)) (more || (more = [])).push(n);
+  if (!more) return found;
+  return found.concat(more).sort((a, b) => (a.compareDocumentPosition(b) & 4 ? -1 : 1)).map((n) => (n.nodeType === 8 ? markedData(n) : n));
 }
 
 // A component made again because the server's HTML was not what it makes:
@@ -8154,7 +8252,15 @@ function remade(name) {
 
 // A component in its <quillo-island>: made, or taking up the page's; its nodes into `out`.
 function island(def, props, h, c, out) {
+  if (c.claim && isMarked(c.n)) { islandMarked(def, props, h, c, out); return; }
   let inst = new Inst(def, props, h && h.s, h && h.l);
+  if (!c.claim && bareIn(c)) {
+    const got = run(inst, null, false, c.svg, c.p) || [];
+    bareRoot(got, inst, def.$name);
+    if (TOOLS) toolsMade(inst);
+    for (const n of got) out.push(n);
+    return;
+  }
   let el;
   if (c.claim) {
     el = c.n;
@@ -8194,9 +8300,37 @@ function island(def, props, h, c, out) {
   else out.push(el);
 }
 
+// A component the server marked by comments, as no <quillo-island> can stand where it is:
+// taken up between them, which then go; it stands by itself there, as the browser makes it
+// (see `bareIn`), or, where a wrapper can stand after all (it showed nothing), in one
+// (FEEDBACK61.md, Q-892 and Q-936; branch feedback61).
+function islandMarked(def, props, h, c, out) {
+  const open = c.n, end = markedEnd(open);
+  if (DEV) wanted = [open, `<${def.$name}>`]; // dev
+  if (!end || markedData(open).dataset.c !== def.$name) throw new Mismatch("component");
+  const inst = new Inst(def, props, h && h.s, h && h.l);
+  let got = run(inst, open, true);
+  if (!got) { got = []; for (let n = open.nextSibling; n !== end; n = n.nextSibling) got.push(n); }
+  c.n = end.nextSibling;
+  const p = open.parentNode;
+  open.remove();
+  end.remove();
+  if (bareIn({ svg: c.svg, p })) bareRoot(got, inst, def.$name);
+  else {
+    const w = wrapper(def.$name);
+    p.insertBefore(w, c.n);
+    w.append(...got);
+    inst.el = w;
+    got = [w];
+  }
+  if (TOOLS) toolsMade(inst);
+  for (const n of got) out.push(n);
+}
+
 // The component's code, once; then its markup put in its island (in <svg>
-// when `svg`, as SVG's).
-function run(inst, el, claim, svg) {
+// when `svg`, as SVG's): of one with no island element (`el` null, see `bareIn`), its nodes,
+// which go in `p`.
+function run(inst, el, claim, svg, p) {
   return within(inst, () => {
     let view;
     try {
@@ -8205,7 +8339,15 @@ function run(inst, el, claim, svg) {
       if (e instanceof Ret) view = e.v;
       else { report(e); return; }
     }
-    if (claim && ownRoot(el)) {
+    if (claim && el.nodeType === 8) {
+      // Between the comments the server marked it with (see `islandMarked`).
+      const c = { p: el.parentNode, n: el.nextSibling, claim: true, svg: inSvg(el.parentNode) };
+      const got = [];
+      put(view, c, got);
+      if (DEV) wanted = [c.n, "nothing"]; // dev
+      if (c.n !== markedEnd(el)) throw new Mismatch("extra");
+      return got;
+    } else if (claim && ownRoot(el)) {
       // The island is the markup's root: taken up from where it stands, in <svg> as SVG's
       // (FEEDBACK55.md, Q-763; branch feedback55).
       // What it took up are its nodes, not the element alone: a branch at its root replaces that
@@ -8224,7 +8366,8 @@ function run(inst, el, claim, svg) {
       rest(el, c.n);
     } else {
       const got = [];
-      put(view, { claim: false, svg: !!svg }, got);
+      put(view, { claim: false, svg: !!svg, p: p || el }, got);
+      if (!el) return got;
       el.append(...got);
     }
   });
@@ -8439,14 +8582,16 @@ function resume(el) {
   el.__q = true;
   const def = C[el.dataset.c];
   if (!def) { report(`unknown component <${el.dataset.c}>`); return; }
+  // Those inside it the server marked by comments too (FEEDBACK61.md, Q-892; branch feedback61).
+  const marked = el.hasAttribute("data-qm");
   const queue = () => {
     const q = {};
-    for (const inner of el.querySelectorAll(ISLANDS)) {
+    for (const inner of islandsIn(el, marked)) {
       (q[inner.dataset.c] = q[inner.dataset.c] || []).push({ s: islandJSON(inner.dataset.s, {}), l: islandJSON(inner.dataset.l, null) });
     }
     return q;
   };
-  for (const inner of el.querySelectorAll(ISLANDS)) liveSeen(...(inner.dataset.v || "").split(":"));
+  for (const inner of islandsIn(el, marked)) liveSeen(...(inner.dataset.v || "").split(":"));
   liveSeen(...(el.dataset.v || "").split(":"));
   const props = islandJSON(el.dataset.p, {});
   // A top island's children come as the HTML the server made of them.

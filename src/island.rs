@@ -42,6 +42,55 @@ pub fn own_root_in(html: &str, svg: bool) -> Option<usize> {
     None
 }
 
+/// Whether `html`, a component's whole HTML, is nothing but parts of a table or a select (rows,
+/// cells, options, ...) and space, or nothing at all: where such a component stands, inside a
+/// table or a select, the browser's parser moves a `<quillo-island>` out, so when it is not one
+/// element (`own_root`) it is marked by comments instead (FEEDBACK61.md, Q-892 and Q-936; branch
+/// feedback61). Comments a component inside it was marked with may come between.
+pub fn parts_only(html: &str) -> bool {
+    let b = html.as_bytes();
+    let (mut i, mut depth) = (0usize, 0usize);
+    while i < b.len() {
+        if b[i] != b'<' {
+            if depth == 0 && !b[i].is_ascii_whitespace() {
+                return false;
+            }
+            i += 1;
+            continue;
+        }
+        let at = &html[i + 1..];
+        if let Some(c) = at.strip_prefix("!--") {
+            let Some(end) = c.find("-->") else { return false };
+            i += 4 + end + 3;
+            continue;
+        }
+        let close = at.starts_with('/');
+        let name_at = if close { &at[1..] } else { at };
+        let n = name_at.find(|c: char| !c.is_ascii_alphanumeric()).unwrap_or(name_at.len());
+        let name = name_at[..n].to_ascii_lowercase();
+        let Some(end) = at.find('>') else { return false };
+        let self_closing = at[..end].ends_with('/');
+        if close {
+            depth = match depth.checked_sub(1) {
+                Some(d) => d,
+                None => return false,
+            };
+        } else {
+            if depth == 0 && name != "col" && !TABLE_PARTS.contains(&name.as_str()) {
+                return false;
+            }
+            if !self_closing && !VOID.contains(&name.as_str()) {
+                depth += 1;
+            }
+        }
+        i += 1 + end + 1;
+    }
+    depth == 0
+}
+
+/// Elements with no end tag.
+const VOID: &[&str] = &["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"];
+
 /// A component's own root element from just after its tag name (see `own_root`), written to `out`
 /// without the attributes of an island its markup gave it (`data-c={x}`, `data-e`; a spread's are
 /// dropped already): the server's, written before them, are the island's, and one the server did
@@ -137,6 +186,17 @@ fn el_runs_by_itself(el: &HtmlEl) -> bool {
 #[cfg(test)]
 mod tests {
     use super::own_root;
+
+    #[test]
+    fn parts_of_a_table_or_a_select_alone_are_marked_by_comments() {
+        use super::parts_only;
+        for yes in ["", "  \n", "<tr><td>a</td></tr><tr><td>b</td></tr>", "<option value=\"1\">1</option><option>2</option>", "<td>a</td>", "<!--q data-c=\"X\"--><tr><td>x</td></tr><!--/q--><tr></tr>", "<col><col span=\"2\">", "<tr><td><div>in <b>a</b></div></td></tr>", "<td><br></td>"] {
+            assert!(parts_only(yes), "{:?}", yes);
+        }
+        for no in ["text", "<div></div>", "<tr></tr>text", "<tr></tr><div></div>", "<tr>", "</tr>", "<!--", "<tr><td>a</td></tr> b", "<span>a</span><tr></tr>"] {
+            assert!(!parts_only(no), "{:?}", no);
+        }
+    }
 
     #[test]
     fn a_table_part_is_its_own_island_when_it_is_one_element() {

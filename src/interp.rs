@@ -233,6 +233,9 @@ pub struct Interp {
     /// Rendering inside `<svg>` (and not in a `<foreignObject>` there): a component's root is its
     /// own island (see `island_wrap`; FEEDBACK55.md, Q-763; branch feedback55).
     in_svg: bool,
+    /// Components marked by comments so far (see `island_wrap`), and those of them that run by
+    /// themselves: what an island around them says (FEEDBACK61.md, Q-892; branch feedback61).
+    marked: (usize, usize),
     state_again: Option<(usize, Map)>,
     /// While the server renders a component: its code also runs in the
     /// browser, where `http.*` calls are made (see src/fetch.rs). A
@@ -903,7 +906,8 @@ fn runtime_attr(key: &str) -> bool {
 /// island: its mark, `data-qd` while it waits and `data-qt` on what is swapped in for it
 /// (src/defer.rs), its component, props, state, live data and whether it starts by itself.
 pub(crate) fn island_attr(key: &str) -> bool {
-    matches!(key, "data-qi" | "data-qd" | "data-qt" | "data-c" | "data-p" | "data-s" | "data-l" | "data-v" | "data-e")
+    // `data-qm`: an island holding some marked by comments (FEEDBACK61.md, Q-892; branch feedback61).
+    matches!(key, "data-qi" | "data-qd" | "data-qt" | "data-c" | "data-p" | "data-s" | "data-l" | "data-v" | "data-e" | "data-qm")
 }
 
 /// A list's or map's JSON as an attribute's value: a builtin's error in it says `internal error`
@@ -1667,6 +1671,7 @@ impl Interp {
             island_scopes: Vec::new(),
             island_scopes_at: Vec::new(),
             in_svg: false,
+            marked: (0, 0),
             state_again: None,
             in_component: false,
             pg_tx: std::sync::Mutex::new(Vec::new()),
@@ -1791,6 +1796,7 @@ impl Interp {
             island_scopes: Vec::new(),
             island_scopes_at: Vec::new(),
             in_svg: false,
+            marked: (0, 0),
             state_again: None,
             in_component: false,
             pg_tx: std::sync::Mutex::new(Vec::new()),
@@ -5788,6 +5794,7 @@ impl Interp {
         let twice = self.state_again.is_none().then(|| (args.clone(), self.select_want.clone()));
         let mut body = String::new();
         let was = std::mem::replace(&mut self.in_component, true);
+        let marked = self.marked;
         let r = crate::value::js_numbers(true, || self.render_call_into(&c, args, line, &mut body));
         self.in_component = was;
         let (mut state, mut live) = self.islands.pop().unwrap_or_default();
@@ -5840,8 +5847,20 @@ impl Interp {
             });
             extra = format!(" data-qd=\"{}\"", id);
         }
-        let eager = crate::island::runs_by_itself(&c.def.body);
-        self.island_wrap(&el.tag, props, state, live, eager, &extra, &body, self.in_svg, out);
+        // One marked by comments inside it is found only where this one says so (`data-qm`), and
+        // one of those that runs by itself starts this one with the page (FEEDBACK61.md, Q-892;
+        // branch feedback61).
+        if self.marked.0 > marked.0 {
+            extra.push_str(" data-qm");
+        }
+        let eager = crate::island::runs_by_itself(&c.def.body) || self.marked.1 > marked.1;
+        let by_itself = eager || !live.is_empty();
+        if self.island_wrap(&el.tag, props, state, live, eager, &extra, &body, self.in_svg, nested, out) {
+            self.marked.0 += 1;
+            if by_itself {
+                self.marked.1 += 1;
+            }
+        }
         Ok(())
     }
 
@@ -5902,9 +5921,10 @@ impl Interp {
     }
 
     /// A component's island: its HTML in a `<quillo-island>` carrying its props and
-    /// state (or, inside a table or a select, its own root element carrying them).
+    /// state (or, inside a table or a select, its own root element carrying them, or comments
+    /// around it). Whether it was marked by comments.
     #[allow(clippy::too_many_arguments)]
-    fn island_wrap(&self, tag: &str, props: Map, mut state: Map, live: Map, eager: bool, extra: &str, body: &str, svg: bool, out: &mut String) {
+    fn island_wrap(&self, tag: &str, props: Map, mut state: Map, live: Map, eager: bool, extra: &str, body: &str, svg: bool, nested: bool, out: &mut String) -> bool {
         // A state that still holds its very prop, as `state items = initial` does, is written as
         // a reference to it, not as a second copy of the list (FEEDBACK30.md, Q-371; branch
         // feedback27-35-fixes).
@@ -5962,13 +5982,27 @@ impl Interp {
             out.push_str(" data-qi");
             out.push_str(&data);
             crate::island::root_without_island_attrs(&body[at..], out);
-            return;
+            return false;
+        }
+        // Not one element, inside another component: in an `<svg>`, or of a table's or a select's
+        // parts only (or nothing, which may stand there), between two comments carrying what the
+        // island would, which the parser leaves where they are, and which the browser takes up and
+        // takes away. In a `<quillo-island>` there, the parser moved it out of the table, and the
+        // browser made the whole page again (FEEDBACK61.md, Q-892 and Q-936; branch feedback61).
+        if nested && (svg || crate::island::parts_only(body)) {
+            out.push_str("<!--q");
+            out.push_str(&data);
+            out.push_str("-->");
+            out.push_str(body);
+            out.push_str("<!--/q-->");
+            return true;
         }
         out.push_str("<quillo-island style=\"display:contents\"");
         out.push_str(&data);
         out.push('>');
         out.push_str(body);
         out.push_str("</quillo-island>");
+        false
     }
 
     /// A waiting component rendered again (src/defer.rs; branch defer): the states it
@@ -5981,6 +6015,7 @@ impl Interp {
         let was = std::mem::replace(&mut self.in_component, true);
         // Where it stands, in an `<svg>` or not (see `in_svg`).
         let outer = std::mem::replace(&mut self.in_svg, d.svg);
+        let marked = self.marked;
         let r = crate::value::js_numbers(true, || self.render_call_into(&d.c, d.args.clone(), d.line, &mut body));
         self.in_component = was;
         let (state, mut live) = self.islands.pop().unwrap_or_default();
@@ -6000,7 +6035,11 @@ impl Interp {
             }
         }
         let mut out = String::new();
-        self.island_wrap(&d.tag, d.props.clone(), state, live, crate::island::runs_by_itself(&d.c.def.body), "", &body, d.svg, &mut out);
+        // As a component placed in the page says it (see `render_component_into`; FEEDBACK61.md, Q-892;
+        // branch feedback61).
+        let extra = if self.marked.0 > marked.0 { " data-qm" } else { "" };
+        let eager = crate::island::runs_by_itself(&d.c.def.body) || self.marked.1 > marked.1;
+        self.island_wrap(&d.tag, d.props.clone(), state, live, eager, extra, &body, d.svg, false, &mut out);
         Ok(out)
     }
 }

@@ -216,6 +216,11 @@ fn in_pages(name: &str, src: &str, paths: &[&str], body: &str) -> Option<Vec<ser
 /// The same; with `focus`, the page has the focus, as in a window, and hears `blur` and `focusout`
 /// (QUILLO_PAGE_FOCUS in tests/browser/run.js).
 fn in_pages_with(name: &str, src: &str, paths: &[&str], body: &str, focus: bool) -> Option<Vec<serde_json::Value>> {
+    in_pages_args(name, src, paths, body, focus, &[])
+}
+
+/// The same, with options for the server (`--watch`, for development bundles).
+fn in_pages_args(name: &str, src: &str, paths: &[&str], body: &str, focus: bool, args: &[&str]) -> Option<Vec<serde_json::Value>> {
     let app = App::new(name, src);
     checked(&app.0);
     let Some(chrome) = chrome() else {
@@ -231,6 +236,7 @@ fn in_pages_with(name: &str, src: &str, paths: &[&str], body: &str, focus: bool)
             .arg("run")
             .arg(app.0.join("main.qwe"))
             .args(["--port", &port.to_string()])
+            .args(args)
             .current_dir(&app.0)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2802,4 +2808,485 @@ fn a_programs_own_500_is_tried_again_and_the_servers_is_not() {
         "remade": 0, "errors": [busy, busy, own, own],
     });
     assert_eq!(rs[0], want);
+}
+
+// ---- Slice 3: fields and roots (Q-890, Q-891, Q-892, Q-936, Q-937, Q-938) ------------------------
+
+// Q-890: a function's markup made again (an unrelated state changed) copied the new elements'
+// values over the page's: the defaults, where the markup said nothing. What was typed, ticked,
+// picked or opened went, the focus staying. Only what the markup itself says, and says otherwise
+// than before, is written now. The edges: a field the markup does say follows it when that
+// changes, and keeps what the person did while it does not; unicode text; twice in a row.
+#[test]
+fn a_functions_markup_keeps_what_a_person_typed_ticked_picked_or_opened() {
+    let src = r###"fn form(n) = <div><input #f/><input #ck type="checkbox"/><details #d><summary>s</summary>b</details><select #s><option>a</option><option>b</option></select><textarea #ta></textarea><span #n>{n}</span></div>
+fn ctl(n, on, txt, v) = <div><input #c1 value={txt}/><input #c2 type="checkbox" checked={on}/><details #c3 open={on}><summary>s</summary>b</details><select #c4 value={v}><option>a</option><option>b</option><option>c</option></select><span>{n}</span></div>
+component Fields() {
+    state n = 0
+    state on = false
+    state txt = "one"
+    state v = "a"
+    <div>
+        {form(n)}
+        {ctl(n, on, txt, v)}
+        <button #inc @click={() => { n += 1 }}>inc</button>
+        <button #flip @click={() => { on = !on; txt = txt == "one" ? "two" : "one"; v = v == "a" ? "c" : "a" }}>flip</button>
+    </div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Fields/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"const typeIn = (id, text) => { const el = $(id); el.focus(); el.select(); document.execCommand("insertText", false, text); };
+    const pick = (id, v) => { $(id).value = v; $(id).dispatchEvent(new Event("change", { bubbles: true })); };
+    typeIn("f", "héllo 日本");
+    $("ck").click();
+    $("d").open = true;
+    pick("s", "b");
+    typeIn("ta", "note");
+    const f0 = $("f");
+    const fields = () => [$("f").value, $("ck").checked, $("d").open, $("s").value, $("ta").value, document.activeElement.id].join("|");
+    const ctl = () => [$("c1").value, $("c2").checked, $("c3").open, $("c4").value].join("|");
+    const out = { before: fields() };
+    await click("inc");
+    out.after = fields();
+    out.same = $("f") === f0;
+    await click("inc");
+    out.twice = fields() + "|" + $("n").textContent;
+    out.ctl0 = ctl();
+    await click("flip");
+    out.ctl1 = ctl();
+    typeIn("c1", "mine");
+    $("c2").click();
+    $("c3").open = false;
+    pick("c4", "b");
+    await click("inc");
+    out.ctlKept = ctl();
+    await click("flip");
+    out.ctl2 = ctl();
+    return out;"##;
+    let Some(rs) = in_pages("q890", src, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            "before": "héllo 日本|true|true|b|note|ta", "after": "héllo 日本|true|true|b|note|ta", "same": true, "twice": "héllo 日本|true|true|b|note|ta|2",
+            "ctl0": "one|false|false|a", "ctl1": "two|true|true|c", "ctlKept": "mine|false|false|b", "ctl2": "one|false|false|a",
+            "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Q-891: a field its handler rewrites (in capitals, digits only) took its new text with the
+// caret at the end, so a correction in the middle came out scrambled (AXBYZ for AXYZB, 1239 for
+// 1923). The caret keeps its distance from the end of the text now. The edges: at the end and at
+// the start, a selection typed over, a capital that is two letters (ß, SS), a textarea, a field
+// that is not focused (written, nothing else), a plain field (as before).
+#[test]
+fn rewriting_a_field_as_it_is_typed_keeps_the_caret() {
+    let src = r###"component Caret() {
+    state code = "AB"
+    state digits = "123"
+    state plain = "ab"
+    state big = "aßb"
+    state other = "xy"
+    <div>
+        <input #code value={code} @input={(e) => { code = upper(e.value) }}/>
+        <input #digits value={digits} @input={(e) => { digits = re.replace(e.value, "[^0-9]", "") }}/>
+        <input #plain value={plain}/>
+        <input #big value={big} @input={(e) => { big = upper(e.value) }}/>
+        <textarea #area value={code} @input={(e) => { code = upper(e.value) }}></textarea>
+        <input #other value={other}/>
+        <button #set @click={() => { other = "set from a click" }}>set</button>
+    </div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Caret/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"const typeAt = async (id, at, keys) => { const el = $(id); el.focus(); el.setSelectionRange(at, at); for (const k of keys) { document.execCommand("insertText", false, k); await tick(20); } return `${el.value}@${el.selectionStart}`; };
+    const out = {};
+    out.code = await typeAt("code", 1, ["x", "y", "z"]);
+    out.digits = await typeAt("digits", 1, ["z", "9"]);
+    out.plain = await typeAt("plain", 1, ["x", "y", "z"]);
+    out.end = await typeAt("code", $("code").value.length, ["q"]);
+    out.start = await typeAt("code", 0, ["w"]);
+    const c = $("code");
+    c.focus(); c.setSelectionRange(1, 3); document.execCommand("insertText", false, "k"); await tick(20);
+    out.over = `${c.value}@${c.selectionStart}-${c.selectionEnd}`;
+    out.twoLetters = await typeAt("big", 2, ["ß"]);
+    out.area = await typeAt("area", 2, ["e"]);
+    out.codeFollows = $("code").value;
+    await click("set");
+    out.other = $("other").value;
+    return out;"##;
+    let Some(rs) = in_pages("q891", src, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            "code": "AXYZB@4", "digits": "1923@2", "plain": "axyzb@4", "end": "AXYZBQ@6", "start": "WAXYZBQ@1", "over": "WKYZBQ@2-2",
+            "twoLetters": "ASSSSB@5", "area": "WKEYZBQ@3", "codeFollows": "WKEYZBQ", "other": "set from a click",
+            "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Q-892 and Q-936: a component of a table's or a select's parts that is not one element (no
+// row, two rows, a list of rows, a hidden branch, a cell in a row) was written in a
+// <quillo-island>, which the HTML parser moves out of the table, so the browser made the whole
+// page again on load (what was typed before went). Inside another component it is written
+// between comments now, which the parser leaves, and taken up. The edges: one row (its own root,
+// as before), a component in such a component, one that runs by itself (its timer runs with no
+// one touching the page), options in a select (none and two), an empty one outside a table (it
+// gets a wrapper, as one made in the browser does), unicode text; rows added, reversed, shown.
+#[test]
+fn table_parts_that_are_not_one_element_are_taken_up_not_made_again() {
+    let src = r###"component Rows(xs: list) { {for x in xs => <tr key={x} class="r"><td>{x}</td></tr>} }
+component Two(a: str) { [<tr class="t"><td>{a}1</td></tr>, <tr class="t"><td>{a}2</td></tr>] }
+component Maybe(on: bool) { on ? <tr class="m"><td>shown</td></tr> : null }
+component Cell(on: bool) { on ? <td class="c">cell</td> : null }
+component Opts(xs: list) { {for x in xs => <option key={x} value={x}>{x}</option>} }
+component Inner(xs: list) { <Rows xs={xs}/> }
+component Ticker() {
+    state n = 0
+    every(30, () => { n += 1 })
+    [<tr class="k"><td>{n}</td></tr>, <tr class="k"><td>{n}</td></tr>]
+}
+component Page() {
+    state xs = ["a", "b"]
+    state on = false
+    state v = "q"
+    <div>
+        <input #early/>
+        <table><tbody #tb><Rows xs={xs}/><Rows xs={[]}/><Rows xs={["one"]}/><Two a="t"/><Maybe on={on}/><Inner xs={["n1", "ünï"]}/><tr #row><td>x</td><Cell on={on}/></tr></tbody></table>
+        <table><tbody #tk><Ticker/></tbody></table>
+        <select #sel value={v}><option value="p">p</option><Opts xs={["q", "r"]}/><Opts xs={[]}/></select>
+        <div #empty><Maybe on={on}/></div>
+        <button #add @click={() => { xs = xs + ["c"] }}>add</button>
+        <button #rev @click={() => { xs = reverse(xs) }}>rev</button>
+        <button #on @click={() => { on = !on }}>on</button>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Page/></body></html>
+"###;
+    let body = r##"const rows = (id) => [...$(id).rows].map((r) => r.textContent).join(",");
+    const bare = (id) => [...$(id).childNodes].filter((n) => n.nodeType === 8 || n.localName === "quillo-island").length;
+    const out = { remadeAtLoad: QW.remade ?? 0 };
+    out.load = [rows("tb"), bare("tb"), $("row").cells.length, bare("row")];
+    out.select = [[...$("sel").options].map((o) => o.value).join(","), $("sel").value, bare("sel")];
+    out.empty = $("empty").querySelectorAll(":scope > quillo-island").length;
+    const k0 = $("tk").rows[0].textContent;
+    await tick(200);
+    out.ticks = Number($("tk").rows[0].textContent) > Number(k0) && $("tk").rows.length === 2;
+    await click("add", "rev", "on");
+    out.after = [rows("tb"), bare("tb"), $("row").cells.length, $("empty").textContent];
+    return out;"##;
+    let Some(rs) = in_pages("q892", src, &["/"], body) else { return };
+    let want = serde_json::json!({
+        "remadeAtLoad": 0,
+        "load": ["a,b,one,t1,t2,n1,ünï,x", 0, 1, 0],
+        "select": ["p,q,r", "q", 0],
+        "empty": 1,
+        "ticks": true,
+        "after": ["c,b,a,one,t1,t2,shown,n1,ünï,xcell", 0, 2, "shown"],
+        "remade": 0, "errors": [],
+    });
+    assert_eq!(rs[0], want);
+}
+
+// Q-892 under `--watch`: development bundles take up what the server marked by comments the same
+// way (and say nothing of a component made again, as none is).
+#[test]
+fn table_parts_marked_by_comments_are_taken_up_under_watch() {
+    let src = r###"component Rows(xs: list) { {for x in xs => <tr key={x} class="r"><td>{x}</td></tr>} }
+component Two(a: str) { [<tr class="t"><td>{a}1</td></tr>, <tr class="t"><td>{a}2</td></tr>] }
+component Maybe(on: bool) { on ? <tr class="m"><td>shown</td></tr> : null }
+component Cell(on: bool) { on ? <td class="c">cell</td> : null }
+component Opts(xs: list) { {for x in xs => <option key={x} value={x}>{x}</option>} }
+component Inner(xs: list) { <Rows xs={xs}/> }
+component Ticker() {
+    state n = 0
+    every(30, () => { n += 1 })
+    [<tr class="k"><td>{n}</td></tr>, <tr class="k"><td>{n}</td></tr>]
+}
+component Page() {
+    state xs = ["a", "b"]
+    state on = false
+    state v = "q"
+    <div>
+        <input #early/>
+        <table><tbody #tb><Rows xs={xs}/><Rows xs={[]}/><Rows xs={["one"]}/><Two a="t"/><Maybe on={on}/><Inner xs={["n1", "ünï"]}/><tr #row><td>x</td><Cell on={on}/></tr></tbody></table>
+        <table><tbody #tk><Ticker/></tbody></table>
+        <select #sel value={v}><option value="p">p</option><Opts xs={["q", "r"]}/><Opts xs={[]}/></select>
+        <div #empty><Maybe on={on}/></div>
+        <button #add @click={() => { xs = xs + ["c"] }}>add</button>
+        <button #rev @click={() => { xs = reverse(xs) }}>rev</button>
+        <button #on @click={() => { on = !on }}>on</button>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Page/></body></html>
+"###;
+    let body = r##"const rows = (id) => [...$(id).rows].map((r) => r.textContent).join(",");
+    const bare = (id) => [...$(id).childNodes].filter((n) => n.nodeType === 8 || n.localName === "quillo-island").length;
+    const out = { remadeAtLoad: QW.remade ?? 0 };
+    out.load = [rows("tb"), bare("tb"), $("row").cells.length, bare("row")];
+    out.select = [[...$("sel").options].map((o) => o.value).join(","), $("sel").value, bare("sel")];
+    out.empty = $("empty").querySelectorAll(":scope > quillo-island").length;
+    const k0 = $("tk").rows[0].textContent;
+    await tick(200);
+    out.ticks = Number($("tk").rows[0].textContent) > Number(k0) && $("tk").rows.length === 2;
+    await click("add", "rev", "on");
+    out.after = [rows("tb"), bare("tb"), $("row").cells.length, $("empty").textContent];
+    return out;"##;
+    let Some(rs) = in_pages_args("q892-watch", src, &["/"], body, false, &["--watch"]) else { return };
+    let want = serde_json::json!({
+        "remadeAtLoad": 0,
+        "load": ["a,b,one,t1,t2,n1,ünï,x", 0, 1, 0],
+        "select": ["p,q,r", "q", 0],
+        "empty": 1,
+        "ticks": true,
+        "after": ["c,b,a,one,t1,t2,shown,n1,ünï,xcell", 0, 2, "shown"],
+        "remade": 0, "errors": [],
+    });
+    assert_eq!(rs[0], want);
+}
+
+// Q-937: a component in <svg> whose root is a branch, made in the browser, stood in a
+// <quillo-island>, which SVG does not draw: nothing showed. It stands by itself there now, as
+// one taken up from the server's page does. The edges: two elements, one that shows nothing at
+// first and later something, the branch flipped and back.
+#[test]
+fn a_branched_svg_component_made_in_the_browser_is_drawn() {
+    let src = r###"component Dot(on: bool) { on ? <circle class="dot" cx="5" cy="5" r="4"/> : <rect class="dot" width="8" height="8"/> }
+component Pair() { [<rect class="p1" width="3" height="3"/>, <rect class="p2" x="4" width="3" height="3"/>] }
+component Later(on: bool) { on ? <rect class="later" width="6" height="6"/> : null }
+component Pic() {
+    state on = false
+    <div><svg #sv width="20" height="20"><Dot on={on}/><Pair/><Later on={on}/></svg><button #on @click={() => { on = !on }}>on</button></div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Pic/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"const drawn = (sel) => { const e = document.querySelector("#sv " + sel); return !e ? "none" : e.getBBox ? `${e.localName}:${e.getBBox().width}` : `${e.localName}:no SVG element`; };
+    const look = () => [drawn(".dot"), drawn(".p1"), drawn(".p2"), drawn(".later"), $("sv").querySelectorAll("quillo-island").length].join("|");
+    const out = { first: look() };
+    await click("on"); out.on = look();
+    await click("on"); out.back = look();
+    return out;"##;
+    let Some(rs) = in_pages("q937", src, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            "first": "rect:8|rect:3|rect:3|none|0", "on": "circle:8|rect:3|rect:3|rect:6|0", "back": "rect:8|rect:3|rect:3|none|0",
+            "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Q-938: an option made anew by its component's branch, made in the browser, was in a
+// <quillo-island>, whose select did not hear of it: it went on showing another option. The
+// component's option stands in the select now. The edges: in an optgroup, a select of that one
+// option, a value set after.
+#[test]
+fn a_select_keeps_its_value_when_an_option_component_is_made_anew() {
+    let src = r###"component Opt(o: str, big: bool) { big ? <option value={o}>{o}!</option> : <option value={o}>{o}</option> }
+component Pick() {
+    state v = "b"
+    state big = false
+    <div>
+        <select #s value={v}>{for o in ["a", "b", "c"] => <Opt key={o} o={o} big={big && o == "b"}/>}</select>
+        <select #g value={v}><optgroup label="g">{for o in ["a", "b", "c"] => <Opt key={o} o={o} big={big && o == "b"}/>}</optgroup></select>
+        <select #one value={v}><Opt o="b" big={big}/></select>
+        <button #big @click={() => { big = !big }}>big</button>
+        <button #pick @click={() => { v = "c" }}>pick</button>
+    </div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Pick/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"const sel = (id) => `${$(id).value}:${$(id).selectedIndex}:${$(id).options.length}:${$(id).querySelectorAll("quillo-island").length}`;
+    const look = () => [sel("s"), sel("g"), sel("one"), $("s").options[$("s").selectedIndex].text].join("|");
+    const out = { first: look() };
+    await click("big"); out.big = look();
+    await click("big"); out.back = look();
+    await click("pick", "big"); out.picked = look();
+    return out;"##;
+    let Some(rs) = in_pages("q938", src, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            "first": "b:1:3:0|b:1:3:0|b:0:1:0|b", "big": "b:1:3:0|b:1:3:0|b:0:1:0|b!", "back": "b:1:3:0|b:1:3:0|b:0:1:0|b",
+            "picked": "c:2:3:0|c:2:3:0|b:0:1:0|c",
+            "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Decided by the coordinator (2026-11-12, for the user to confirm): a table-row component whose
+// root is a branch is a row of its table in the browser too, as on the server's page, not one in
+// a <quillo-island> inside <tbody> (where `tbody.rows` and `tbody > tr` missed it).
+#[test]
+fn a_table_row_component_whose_root_is_a_branch_is_a_row_in_the_browser_too() {
+    let src = r###"fn start() = [{ id: 1, done: false }, { id: 2, done: false }, { id: 3, done: false }]
+component Tr(t) {
+    t.done ? <tr class="d"><td>done {t.id}</td></tr> : <tr><td>todo {t.id}</td></tr>
+}
+component Tbl() {
+    state xs = start()
+    <div>
+        <table><tbody #tb>{for x in xs => <Tr key={x.id} t={x}/>}</tbody></table>
+        <button #mark @click={() => { xs = xs | map((i) => i.id == 2 ? merge(i, { done: !i.done }) : i) }}>mark</button>
+        <button #rev @click={() => { xs = reverse(xs) }}>rev</button>
+        <button #del @click={() => { xs = xs | filter((i) => i.id != 2) }}>del</button>
+        <button #pre @click={() => { xs = [{ id: 8, done: true }] + xs }}>pre</button>
+    </div>
+}
+component Host(now: bool) {
+    state on = now
+    <div><button #show @click={() => { on = true }}>show</button>{on ? <Tbl/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"const rows = () => [...$("tb").rows].map((e) => e.textContent).join(",") + "|" + $("tb").querySelectorAll("quillo-island").length + "|" + $("tb").querySelectorAll(":scope > tr").length;
+    const out = { first: rows() };
+    await click("mark", "rev"); out.markRev = rows();
+    await click("del", "pre"); out.delPre = rows();
+    return out;"##;
+    let Some(rs) = in_pages("q889-tr-root", src, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            "first": "todo 1,todo 2,todo 3|0|3", "markRev": "todo 3,done 2,todo 1|0|3", "delPre": "done 8,todo 3,todo 1|0|3",
+            "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Q-889, found in review of 0851ec8 (8911ac4's recheck): a list's record stayed whole once the
+// list had gone, so one row element a script kept held every row's record and item through its
+// list's marker (1.2 MB, against main's 0.33). It is let go after the task that took the rows
+// away. Each row's item here has 400 bytes only the list holds: kept, 2,000 of them would be
+// some 1,100 KB more than with nothing kept; let go, the kept row and its own list, some 60 to
+// 140 KB.
+#[test]
+fn a_row_element_a_script_keeps_keeps_no_removed_list_alive() {
+    let src = r###"fn make(n) = range(0, n) | map((i) => { id: i, t: `row ${i}`, pad: repeat("x", 400) + str(i) })
+component Held() {
+    state on = false
+    <div>
+        <button #tog @click={() => { on = !on }}>tog</button>
+        {on ? <ul #l>{for x in make(2000) => <li key={x.id}>{x.t}</li>}</ul> : <p>gone</p>}
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Held/></body></html>
+"###;
+    let body = r##"const heap = async () => { for (let k = 0; k < 3; k++) { await tick(50); gc(); } await tick(50); return performance.memory.usedJSHeapSize; };
+    const base = await heap();
+    await click("tog", "tog");
+    const unheld = (await heap()) - base;
+    await click("tog");
+    let keep = [document.querySelectorAll("#l li")[700]];
+    await click("tog");
+    const held = (await heap()) - base;
+    const out = { kept: keep[0].textContent, more: held - unheld < 600 * 1024 ? "under 600 KB" : `${Math.round((held - unheld) / 1024)} KB` };
+    keep = null;
+    return out;"##;
+    let Some(rs) = in_pages("q889-held", src, &["/"], body) else { return };
+    assert_eq!(rs[0], serde_json::json!({ "kept": "row 700", "more": "under 600 KB", "remade": 0, "errors": [] }));
+}
+
+// Q-892's edges: a component placed in the page that defers (src/defer.rs) is swapped in later,
+// and those inside it marked by comments are found only if it says it holds some (`data-qm`), as
+// a component written at once does: else the state of one (a random number the browser could not
+// make again) was not found, and the component was made again.
+#[test]
+fn a_deferred_component_takes_up_the_table_parts_marked_inside_it() {
+    let src = r###"server fn load() -> list {
+    sleep(100)
+    ["a", "b"]
+}
+component Rows(xs: list) {
+    state r = random_int(1, 1000000000)
+    {for x in xs => <tr key={x} class="r"><td>{x} {r}</td></tr>}
+}
+component Slow() {
+    state rows = defer(load())
+    <div><table><tbody #tb><Rows xs={rows ?? []}/></tbody></table><p #n>{len(rows ?? [])}</p></div>
+}
+route GET / = <html><head><title>t</title></head><body><Slow/></body></html>
+"###;
+    let body = r##"for (let i = 0; i < 100 && $("n").textContent !== "2"; i++) await tick(30);
+    await tick(100);
+    const out = { n: $("n").textContent, rows: $("tb").rows.length, marked: [...$("tb").childNodes].filter((x) => x.nodeType === 8).length, remadeAtLoad: QW.remade ?? 0 };
+    const cell = $("tb").rows[0].cells[0];
+    out.same = /^a \d+$/.test(cell.textContent) && cell.textContent.split(" ")[1] === $("tb").rows[1].cells[0].textContent.split(" ")[1];
+    return out;"##;
+    let Some(rs) = in_pages("q892-defer", src, &["/"], body) else { return };
+    assert_eq!(rs[0], serde_json::json!({ "n": "2", "rows": 2, "marked": 0, "remadeAtLoad": 0, "same": true, "remade": 0, "errors": [] }));
+}
+
+// Q-892's edges: a component of table parts marked by comments whose code fails in the browser
+// (`js` throws there, gives null on the server) keeps what the server wrote, as one in its own
+// <quillo-island> does, and the page around it is taken up: the error is told, nothing made again.
+#[test]
+fn a_marked_component_whose_code_fails_keeps_the_servers_rows() {
+    let src = r###"component Fails() {
+    let _bad = js("JSON.parse", "{not json")
+    [<tr class="f"><td>a</td></tr>, <tr class="f"><td>b</td></tr>]
+}
+component Page() {
+    state n = 0
+    <div><table><tbody #tb><Fails/><tr><td #n>{n}</td></tr></tbody></table><button #inc @click={() => { n += 1 }}>inc</button></div>
+}
+route GET / = <html><head><title>t</title></head><body><Page/></body></html>
+"###;
+    let body = r##"const out = { rows: [...$("tb").rows].map((r) => r.textContent).join(","), marked: [...$("tb").childNodes].filter((x) => x.nodeType === 8).length };
+    await click("inc");
+    out.n = $("n").textContent;
+    out.told = (window.__quilloErrors || []).length > 0;
+    window.__quilloErrors = [];
+    return out;"##;
+    let Some(rs) = in_pages("q892-fails", src, &["/"], body) else { return };
+    assert_eq!(rs[0], serde_json::json!({ "rows": "a,b,0", "marked": 0, "n": "1", "told": true, "remade": 0, "errors": [] }));
+}
+
+// Q-892's edges: what the server marked by comments is not what the browser makes there (another
+// component named, its closing comment gone, a row more: changed before anyone reached for the
+// component, which is when it is taken up). The component around it is made again, as when one in
+// its own <quillo-island> differs, and shows the browser's rows, with no comment or wrapper left.
+#[test]
+fn marked_comments_that_are_not_what_the_browser_makes_make_their_page_again() {
+    let src = r###"component Two(a: str) { [<tr class="t"><td>{a}1</td></tr>, <tr class="t"><td>{a}2</td></tr>] }
+component Wrap() { <div><table><tbody #tb><Two a="s"/></tbody></table><button #b>b</button></div> }
+route GET / = <html><head><title>t</title></head><body><div><Wrap/></div></body></html>
+"###;
+    let body = r##"const marks = () => [...$("tb").childNodes].filter((x) => x.nodeType === 8);
+    const [open, close] = marks();
+    const at = location.search.slice(1);
+    if (at === "name") open.data = open.data.replace('data-c="Two"', 'data-c="Nope"');
+    else if (at === "end") close.remove();
+    else { const tr = document.createElement("tr"); tr.innerHTML = "<td>more</td>"; close.before(tr); }
+    $("b").dispatchEvent(new PointerEvent("pointerover", { bubbles: true }));
+    for (let i = 0; i < 100 && !(QW.remade > 0); i++) await tick(20);
+    await tick(50);
+    return { rows: [...$("tb").rows].map((r) => r.textContent).join(","), marked: marks().length, islands: $("tb").querySelectorAll("quillo-island").length };"##;
+    let paths = ["/?name", "/?end", "/?extra"];
+    let Some(rs) = in_pages("q892-otherwise", src, &paths, body) else { return };
+    for (r, path) in rs.iter().zip(paths) {
+        assert_eq!(r, &serde_json::json!({ "rows": "s1,s2", "marked": 0, "islands": 0, "remade": 1, "errors": [] }), "at {}", path);
+    }
 }
