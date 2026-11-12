@@ -3948,3 +3948,139 @@ route GET /b = <html><head><title>t</title></head><body><Host now={false}/></bod
         assert_eq!(r, &serde_json::json!({ "first": "y🨀b@3", "then": "y🨀zb@4", "lone": false, "remade": 0, "errors": [] }), "at {}", path);
     }
 }
+
+// ---- Whose markup a part is (Q-901, the recheck of d39aa4e) ------------------------------------
+
+// The recheck's R1 and R2: a part said whose code it was by where its markup was made, so a parent's
+// markup that a child puts (through a function prop, inside a `<Box>` there, as a markup prop other
+// than children) or that a handler made had its `@mount` timers given to the parent as a parent's
+// code, and they piled up as rows came and went, or as the part was shown again. The compiler stamps
+// a component's markup with that component now, and a part, or an `@mount`, is the code of the
+// component its stamp names: each keeps one interval while it is on the page, as on main.
+const STAMPS: &str = r###"route GET /ticks/:n = events((send) => {
+    for i in range(100000) {
+        send(i)
+        sleep(100)
+    }
+})
+server fn slow(ms: int) -> str { sleep(ms); "x" }
+component List(items, row) {
+    <ul>{for x in items => <li key={x}>{row(x)}</li>}</ul>
+}
+component Box(children) {
+    <div class="box">{children}</div>
+}
+component Card(header, children) {
+    state open = true
+    <div>{open ? header : null}<button #cardtog @click={() => { open = !open }}>t</button>{children}</div>
+}
+component Page(note) {
+    state rows = [1, 2, 3, 4, 5]
+    state panel = null
+    state show = true
+    state k = 0
+    <div>
+        <List items={rows} row={(x) => <span @mount={(el) => { every(200, () => { note("fn") }) }}>{x}</span>}/>
+        <List items={rows} row={(x) => <Box><i @mount={(el) => { every(200, () => { note("box") }) }}>{x}</i></Box>}/>
+        <List items={rows} row={(x) => <b @mount={(el) => { run_after(10, () => { every(200, () => { note("later") }) }); slow(30); every(200, () => { note("waited") }) }}>{x}</b>}/>
+        <List items={rows} row={(x) => <s @mount={(el) => { listen(`/ticks/${x}`, (n) => { note("msg") }) }}>{x}</s>}/>
+        <div #panel>{panel}</div>
+        {show ? <Card header={<h1 @mount={(el) => { every(200, () => { note("header") }) }}>Title</h1>}>body</Card> : null}
+        <button #regen @click={() => { rows = rows | map((x) => x + 10) }}>regen</button>
+        <button #made @click={() => { k += 1; panel = <Box><ul>{for x in range(k * 10, k * 10 + 5) => <li key={x} @mount={(el) => { every(200, () => { note("made") }) }}>{x}</li>}</ul></Box> }}>made</button>
+        <button #toggle @click={() => { show = !show }}>toggle</button>
+    </div>
+}
+component Host(now: bool) {
+    state on = now
+    state log = []
+    let note = (s) => { log = log + [s] }
+    <div><button #show @click={() => { on = true }}>show</button>{on ? <Page {note}/> : null}<p #log>{join(log, ",")}</p></div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn a_parts_writer_is_the_component_whose_code_wrote_its_markup() {
+    let body = r##"const si = window.setInterval, ci = window.clearInterval, mine = new Set();
+    window.setInterval = (f, ms, ...a) => { const id = si(f, ms, ...a); mine.add(id); return id; };
+    window.clearInterval = (id) => { mine.delete(id); return ci(id); };
+    const real = window.fetch.bind(window); let open = 0;
+    window.fetch = (u, init) => { if (String(u).includes("/ticks/")) { open++; if (init && init.signal) init.signal.addEventListener("abort", () => open--); } return real(u, init); };
+    const out = {};
+    // Rows through a function prop, through one with a Box in it, one whose `@mount` starts its
+    // `every` in a timer's callback and after a wait, and one that listens: made again eight times.
+    for (let k = 0; k < 8; k++) { await click("regen"); await tick(30); }
+    await tick(200); out.rows = mine.size; out.streams = open;
+    // Markup a handler made and put in state, eight times.
+    for (let k = 0; k < 8; k++) { await click("made"); await tick(30); }
+    await tick(200); out.made = mine.size - out.rows;
+    // A Card's header shown eight times, then opened and closed inside the Card eight times.
+    for (let k = 0; k < 8; k++) { await click("toggle"); await tick(30); }
+    for (let k = 0; k < 8; k++) { await click("cardtog"); await tick(30); }
+    await tick(200); out.header = mine.size - out.rows - out.made;
+    return out;"##;
+    let Some(rs) = in_pages("q901-stamps", STAMPS, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        // Fifteen rows with intervals, five a list, two each in the third; five streams; the
+        // handler's five rows; the header, shown again.
+        let want = serde_json::json!({ "rows": 20, "streams": 5, "made": 5, "header": 1, "remade": 0, "errors": [] });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// The recheck's R4: a plain `fn`'s timer, called from a handler after a wait during which the
+// button's branch ran again, was refused, where main fired it; the handler's own fired. It is the
+// handler's component's now, as the handler's own timer is, with a wait or without: a stopwatch a
+// helper starts ticks on once its button's branch goes, or the Box its button was passed to, as one
+// the handler starts does.
+const HELPER_AFTER_WAIT: &str = r###"server fn slow(ms: int) -> str { sleep(ms); "x" }
+fn soon(f) { run_after(20, f) }
+fn tick_on(f) { every(40, f) }
+component Box(children) {
+    <div class="box">{children}</div>
+}
+component Saver(note) {
+    state mode = 0
+    state boxed = true
+    <div>
+        {boxed ? <Box><button #boxsw @click={() => { tick_on(() => { note("bsw") }) }}>b</button></Box> : null}
+        <button #unbox @click={() => { boxed = false }}>unbox</button>
+        {mode == 0 ? <div><button #save @click={() => { slow(150); run_after(20, () => { note("own") }); soon(() => { note("helper") }) }}>save</button><button #sw @click={() => { tick_on(() => { note("sw") }) }}>sw</button></div> : <p>other</p>}
+        <button #one @click={() => { mode = 1 }}>one</button>
+        <button #zero @click={() => { mode = 0 }}>zero</button>
+    </div>
+}
+component Host(now: bool) {
+    state on = now
+    state log = []
+    let note = (s) => { log = log + [s] }
+    <div><button #show @click={() => { on = true }}>show</button>{on ? <Saver {note}/> : null}<p #log>{join(log, ",")}</p></div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn a_helpers_timer_from_a_handler_is_the_handlers_components() {
+    let body = r##"const n = (s) => $("log").textContent.split(",").filter((t) => t === s).length;
+    const out = {};
+    // The branch runs again during the wait, back to where it was.
+    await click("save"); await tick(20); await click("one", "zero"); await tick(400); out.back = [n("own"), n("helper")];
+    // The branch goes during the wait.
+    await click("save"); await tick(20); await click("one"); await tick(400); out.gone = [n("own"), n("helper")];
+    // Without a wait: a stopwatch a helper starts ticks on once its button's branch goes.
+    const until = async (f, ms) => { const t0 = performance.now(); while (!f() && performance.now() - t0 < ms) await tick(10); return f(); };
+    await click("zero"); await click("sw"); await until(() => n("sw") > 2, 2000); await click("one"); await tick(40);
+    { const a = n("sw"); await tick(300); out.stopwatch = n("sw") > a + 2; }
+    // And one in markup passed to a Box, once the Box goes.
+    await click("boxsw"); await until(() => n("bsw") > 2, 2000); await click("unbox"); await tick(40);
+    { const a = n("bsw"); await tick(300); out.boxed = n("bsw") > a + 2; }
+    return out;"##;
+    let Some(rs) = in_pages("q901-helper", HELPER_AFTER_WAIT, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({ "back": [1, 1], "gone": [2, 2], "stopwatch": true, "boxed": true, "remade": 0, "errors": [] });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}

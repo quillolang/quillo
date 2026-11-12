@@ -1553,8 +1553,9 @@ const B = {};
 // (JSON, parsed) and its name, a line of JSON, or a piece of text.
 // `at`: where an event stream's last id and retry are kept, for `listen` to connect again from
 // (FEEDBACK36.md, Q-444; branch feedback36-39).
-// `own`: what `f`'s calls belong to, for what they start (see `run_after`).
-async function readStream(res, f, who, signal, at, own) {
+// `own`: what `f`'s calls belong to, for what they start (see `run_after`); `by`, whose code they
+// run as (see `By`).
+async function readStream(res, f, who, signal, at, own, by) {
   const type = (res.headers.get("content-type") || "").toLowerCase();
   const kind = type.startsWith("text/event-stream") ? "events" : /ndjson|jsonl|json-seq/.test(type) ? "lines" : "text";
   // Numbers as the server reads them, floats and ints past 2^53 too (found in review).
@@ -1563,10 +1564,10 @@ async function readStream(res, f, who, signal, at, own) {
   const parse = (t) => { try { return readJSON(t, true); } catch (_) { return t; } };
   const give = async (args) => {
     const n = Array.isArray(f.$p) ? f.$p.length : f.length;
-    const was = Acting;
-    if (own) Acting = own;
+    const was = Acting, wasBy = By;
+    if (own) { Acting = own; By = by; }
     let r;
-    try { r = f(...args.slice(0, Math.max(n, 1))); } finally { Acting = was; }
+    try { r = f(...args.slice(0, Math.max(n, 1))); } finally { Acting = was; By = wasBy; }
     return r instanceof Promise ? await r : r;
   };
   const reader = res.body.getReader();
@@ -1718,6 +1719,7 @@ B.listen = meta((url, f, inst) => {
   F(f, "listen", 2);
   const ctl = new AbortController();
   (own.clean || (own.clean = [])).push(() => ctl.abort());
+  const by = inst || byNow();
   (async () => {
     let wait = 1000;
     // The last event id and the server's `retry`: connecting again, the stream goes on from
@@ -1731,7 +1733,7 @@ B.listen = meta((url, f, inst) => {
         const res = await wireFetch(withBase(url), { signal: ctl.signal, headers });
         if (!res.ok) throw new Error(`${res.status}`);
         wait = 1000;
-        await readStream(res, f, "listen", ctl.signal, at, own);
+        await readStream(res, f, "listen", ctl.signal, at, own, by);
         return;
       } catch (e) {
         if (ctl.signal.aborted) return;
@@ -1776,10 +1778,13 @@ B.run_after = meta((ms, f, inst) => {
       });
     }
   }
+  // Its callback runs as the code that started it (see `By`).
+  const by = inst || byNow();
   const id = setTimeout(() => {
     if (ids) ids.delete(id);
-    const was = Acting;
+    const was = Acting, wasBy = By;
     Acting = own;
+    By = by;
     try {
       const r = f();
       if (r instanceof Promise) r.catch(report);
@@ -1787,6 +1792,7 @@ B.run_after = meta((ms, f, inst) => {
       report(e);
     } finally {
       Acting = was;
+      By = wasBy;
     }
   }, Math.max(ms, 0));
   if (ids) ids.add(id);
@@ -1826,11 +1832,13 @@ B.every = meta((ms, f, _opts, inst) => {
   // and its answer, if it comes, frees nothing (FEEDBACK55.md, Q-800; branch feedback55).
   const stalled = Math.max(EVERY_STALLED, ms * 2);
   let waiting = null, since = 0;
+  const by = inst || byNow();
   const id = setInterval(() => {
     if (waiting !== null && performance.now() - since < stalled) return;
     // What a tick starts belongs to the timer's own (see `run_after`).
-    const was = Acting;
+    const was = Acting, wasBy = By;
     Acting = own;
+    By = by;
     try {
       const r = f();
       if (r instanceof Promise) {
@@ -1843,6 +1851,7 @@ B.every = meta((ms, f, _opts, inst) => {
       report(e);
     } finally {
       Acting = was;
+      By = wasBy;
     }
   }, Math.max(ms, 1));
   (own.clean || (own.clean = [])).push(() => clearInterval(id));
@@ -6159,6 +6168,13 @@ let Owner = null;
 let Acting = null;
 // Whether the code running now is an event handler's, after its waits too (see `ownerOf`).
 let Handling = false;
+// The component whose code the markup being made now is, by its stamp (`W.by`), while it is made
+// (see `put`); a part made then is that component's code (`comp`).
+let Writer = null;
+// The component whose code runs now for `Acting`'s part, where the part's own `comp` may not say:
+// an `@mount`'s or a handler's, as its element's markup says (see `listen`), or the code that
+// started a timer or a stream (see `ownerOf`).
+let By = null;
 
 // What a timer or a stream that code starts now belongs to (`run_after`, `every`, `listen`), as
 // the user decided (2026-11-12, "Component keeps it"): `inst` is the component whose code it is
@@ -6170,15 +6186,28 @@ let Handling = false;
 // element, as before this slice; given to the component, an `@mount`'s timers piled up as rows came
 // and went, and its streams filled the browser's connections (FEEDBACK61.md, Q-901's review of
 // e2eb410; branch feedback61). Code with no component of its own (a plain `fn`) belongs to `ctx`.
-// Whose code made a part is what the part says (`comp`), not the component it sits in: markup a
-// component passes to another as `children` is made inside that one, and an `@mount` of a row in
-// it went to the writer, as a parent's code does; and a part that has gone says it still, so what
-// its code starts after a wait is refused, where it went to the component (Q-901's review of
-// 8911ac4).
+// Whose code a part, or an `@mount`, is comes from the component whose code wrote its markup, which
+// the compiler stamps on it (`W.by`), not from where the markup is made: a parent's markup that a
+// child puts through a function prop, as children or another prop, or that a handler made, had its
+// `@mount` timers given to the parent as a parent's code, and they piled up as rows came and went
+// (Q-901's review of 8911ac4 and its recheck). A part that has gone says it still, so what its code
+// starts after a wait is refused. A plain `fn`'s timer from a handler is the handler's component's,
+// as the handler's own is; it was the part's, refused once the part had run again during a wait
+// (the recheck's R4).
 function ownerOf(inst) {
   const ctx = Owner || Acting;
-  if (!inst || !ctx) return ctx || inst || null;
-  return Handling || ctx.comp !== inst ? inst : ctx;
+  if (!inst) {
+    if (!Handling || ctx === null) return ctx;
+    const b = byNow();
+    return b !== null ? b : ctx;
+  }
+  if (ctx === null || Handling) return inst;
+  return byNow() !== inst ? inst : ctx;
+}
+
+// Whose code runs now (see `By`).
+function byNow() {
+  return Owner !== null ? Owner.comp : By !== null ? By : Acting !== null ? Acting.comp : null;
 }
 let effectQueue = [];
 let flushing = false;
@@ -6191,9 +6220,9 @@ class Scope {
     this.clean = null;
     this.dead = false;
     this.up = Owner;
-    // The component whose code made it, its owner's (see `ownerOf`, `slotOf`; FEEDBACK61.md, Q-901's
-    // review of 8911ac4; branch feedback61).
-    this.comp = Owner ? Owner.comp : null;
+    // The component whose code made it: the markup's being made, or its owner's (see `ownerOf`,
+    // `Writer`; FEEDBACK61.md, Q-901's review of 8911ac4 and its recheck; branch feedback61).
+    this.comp = Writer !== null ? Writer : Owner ? Owner.comp : null;
     // Made to size while small (an array pushed to from empty keeps room
     // for a dozen and more; a row's scope owns one or two).
     if (Owner) Owner.owned = Owner.owned ? (Owner.owned.length < 8 ? Owner.owned.concat([this]) : (Owner.owned.push(this), Owner.owned)) : [this];
@@ -6402,10 +6431,11 @@ function flush() {
   let rounds = 0, jumps = 0;
   // An effect is a run of its own, also when `page_updated` brings this about inside one
   // (FEEDBACK55.md, Q-800; branch feedback55).
-  const run = Run, wasH = Handling;
+  const run = Run, wasH = Handling, wasW = Writer;
   Run = null;
-  // No effect is a handler's (see `ownerOf`).
+  // No effect is a handler's (see `ownerOf`), nor the code of markup being made (see `Writer`).
   Handling = false;
+  Writer = null;
   while (effectQueue.length) {
     if (++rounds > 1000) {
       effectQueue = [];
@@ -6431,6 +6461,7 @@ function flush() {
   }
   Run = run;
   Handling = wasH;
+  Writer = wasW;
   flushing = false;
 }
 
@@ -6502,7 +6533,8 @@ keyStale = (key) => {
 // twice). `c` says where: a parent and, while the server's page is taken
 // up (`c.claim`), the page's node to take up next, which taking up moves past.
 
-class Html { constructor(make) { if (make) this.make = make; } }
+// `by`: the component whose code it is (see `W.by`), or null.
+class Html { constructor(make) { if (make) this.make = make; this.by = null; } }
 
 // An HTML value's text is its markup, as the server writes it: it was "<html>", and empty in JSON
 // (FEEDBACK55.md, Q-779; branch feedback55). What `raw`, `markdown` and `highlight` made has its
@@ -6599,7 +6631,15 @@ function put(v, c, out) {
   // function too (FEEDBACK48.md, Q-564 and Q-571; branch main).
   if (isNil(v) || typeof v === "boolean" || typeof v === "function") return;
   if (Array.isArray(v)) { for (const x of v) put(x, c, out); return; }
-  if (v instanceof Html) { v.make(c, out); return; }
+  if (v instanceof Html) {
+    // Made as the code of the component whose stamp it bears (see `Writer`).
+    const by = v.by;
+    if (by === null || by === Writer) { v.make(c, out); return; }
+    const w = Writer;
+    Writer = by;
+    try { v.make(c, out); } finally { Writer = w; }
+    return;
+  }
   const t = shown(v);
   out.push(c.claim ? claimText(c, t) : document.createTextNode(t));
 }
@@ -6780,6 +6820,7 @@ function morph(old, now) {
   if (set) for (const k in set) if (!old.__set || old.__set[k] !== set[k]) setProp(old, k, set[k], old.__set ? old.__set[k] : undefined);
   old.__click = now.__click;
   old.__own = now.__own;
+  if (now.__by !== undefined || old.__by !== undefined) old.__by = now.__by;
   if (now.__w) {
     const cur = old.__w || (old.__w = {}), listening = old.__wl || (old.__wl = {});
     for (const t of Object.keys(cur)) if (!(t in now.__w)) delete cur[t];
@@ -7718,9 +7759,11 @@ function fire(el, type, ev) {
   // again, and `e.value` would read that (FEEDBACK25.md, Q-304; branch feedback26-fixes).
   const t = ev.target;
   if (t && t.value !== undefined) { ev.$value = t.value; ev.$checked = !!t.checked; }
-  const was = Acting, wasH = Handling;
+  const was = Acting, wasH = Handling, wasBy = By;
   Acting = el.__own || null;
   Handling = true;
+  // Whose code it is, where its part does not say (see `listen`).
+  By = el.__by || null;
   // A handler is a run of its own, also when `el.click()` brings it about inside one
   // (FEEDBACK55.md, Q-800; branch feedback55).
   const run = Run;
@@ -7733,6 +7776,7 @@ function fire(el, type, ev) {
   } finally {
     Acting = was;
     Handling = wasH;
+    By = wasBy;
     Run = run;
   }
   // An input shows the state's value even if the user typed something the
@@ -7757,6 +7801,9 @@ function listen(el, t, f) {
     queueMicrotask(() => { const ev = new Event(t); ev.__quilloReplay = true; el.dispatchEvent(ev); });
   }
   el.__own = Owner;
+  // Markup another component's code wrote, put here: its handlers are that one's code (see `By`,
+  // `fire`; FEEDBACK61.md, Q-901's recheck of d39aa4e; branch feedback61).
+  if (Writer !== null && (Owner === null || Owner.comp !== Writer)) el.__by = Writer;
   if (t === "click") {
     el.__click = f;
     if (!delegating) { delegating = true; document.addEventListener("click", delegated); }
@@ -7793,11 +7840,13 @@ function $mount(el, f) {
   if (el.__mounted) return;
   el.__mounted = true;
   if ($mount.q.length === 0) queueMicrotask(() => {
-    for (const [el, f, owner] of $mount.q.splice(0)) {
+    for (const [el, f, owner, by] of $mount.q.splice(0)) {
       if (!el.isConnected || (owner && owner.dead)) continue;
       const keep = (g) => { if (typeof g === "function" && owner) (owner.clean || (owner.clean = [])).push(() => unhook(g)); };
-      const was = Acting;
+      const was = Acting, wasBy = By;
       Acting = owner;
+      // Its element's writer, whose code it is (see `By`).
+      By = by;
       try {
         const r = f.length > 0 ? f(el) : f();
         if (r instanceof Promise) r.then(keep, report); else keep(r);
@@ -7805,10 +7854,11 @@ function $mount(el, f) {
         report(e);
       } finally {
         Acting = was;
+        By = wasBy;
       }
     }
   });
-  $mount.q.push([el, f, Owner]);
+  $mount.q.push([el, f, Owner, Writer]);
 }
 $mount.q = [];
 mountHook = $mount;
@@ -8212,9 +8262,7 @@ function comp(def, props, kids, spreads) {
   for (const k of Object.keys(props)) if (!ps.includes(k)) fail(`<${def.$name}> has no parameter \`${k}\``);
   let p = props;
   if (spreads) p = withSpreads(props, ps, def, spreads);
-  // Markup passed as children is made where the other puts it, but is the code of the one writing
-  // it (see `slotOf`).
-  if (ps.includes("children") && !hasOwn(p, "children")) p.children = kids && Owner && Owner.comp ? slotOf(kids, Owner.comp) : kids;
+  if (ps.includes("children") && !hasOwn(p, "children")) p.children = kids;
   return new Html((c, out) => {
     if (def.$comp) { island(def, p, takeHydration(def.$name), c, out); return; }
     if (def.$view) {
@@ -8223,18 +8271,6 @@ function comp(def, props, kids, spreads) {
       return;
     }
     dyn(() => def(...ps.map((k) => p[k])), c, out);
-  });
-}
-
-// Markup that the component `writer` passes to another as `children`, made inside that other: its
-// parts say they are `writer`'s, whose code they are (see `ownerOf`): an `@mount` timer of a row
-// in it went to the writer, and piled up as rows came and went (FEEDBACK61.md, Q-901's review of
-// 8911ac4; branch feedback61).
-function slotOf(kids, writer) {
-  return new Html((c, out) => {
-    const s = new Scope();
-    s.comp = writer;
-    within(s, () => kids.make(c, out));
   });
 }
 
@@ -8518,6 +8554,14 @@ function islandMarked(def, props, h, c, out) {
 // when `svg`, as SVG's): of one with no island element (`el` null, see `bareIn`), its nodes,
 // which go in `p`.
 function run(inst, el, claim, svg, p) {
+  // Its own code, not the markup's around it (see `Writer`; FEEDBACK61.md, Q-901's recheck of
+  // d39aa4e; branch feedback61).
+  const w = Writer;
+  Writer = null;
+  try { return runOwn(inst, el, claim, svg, p); } finally { Writer = w; }
+}
+
+function runOwn(inst, el, claim, svg, p) {
   return within(inst, () => {
     let view;
     try {
@@ -8929,10 +8973,10 @@ let Run = null;
 // feedback61). It is the call's, not the run's, which a state of the page keeps. A run's `nav`: when it began, among the page's moves (see `B.navigate`; Q-902).
 // `w.n`: how many times `w.a`, if an effect, had run; one that has run again since is a part that
 // has gone, and what its code starts after the wait is refused (see `ownerOf`; Q-901's review of
-// 8911ac4).
-W.run = () => { const o = Run, a = Owner || Acting; return { r: (Run = o || { held: null, up: undefined, nav: ++Nav.runs }), o, y: false, a, n: a !== null ? a.runs : undefined, h: Handling, p: undefined, q: false }; };
-W.off = (w, x) => { if (!w.y) { w.y = true; Run = w.o; w.o = null; if (w.p !== undefined) { Acting = w.p; Handling = w.q; w.p = undefined; } } return x; };
-W.on = (w, v) => { w.y = false; Run = w.r; w.p = Acting; w.q = Handling; Acting = w.a !== null && w.a.runs !== w.n ? { dead: true, comp: w.a.comp } : w.a; Handling = w.h; return v; };
+// 8911ac4). `w.b`: whose code it runs as (see `By`), and `w.e` what `By` was before.
+W.run = () => { const o = Run, a = Owner || Acting; return { r: (Run = o || { held: null, up: undefined, nav: ++Nav.runs }), o, y: false, a, n: a !== null ? a.runs : undefined, h: Handling, b: byNow(), p: undefined, q: false, e: null }; };
+W.off = (w, x) => { if (!w.y) { w.y = true; Run = w.o; w.o = null; if (w.p !== undefined) { Acting = w.p; Handling = w.q; By = w.e; w.p = undefined; } } return x; };
+W.on = (w, v) => { w.y = false; Run = w.r; w.p = Acting; w.q = Handling; w.e = By; Acting = w.a !== null && w.a.runs !== w.n ? { dead: true, comp: w.a.comp } : w.a; Handling = w.h; By = w.b; return v; };
 // Whether `r`, or a run that called it, has claimed `s` for a call.
 function claimedBy(s, r) {
   for (; r; r = r.up) if (r.held !== null && r.held.has(s)) return true;
@@ -9046,6 +9090,9 @@ W.retty = retty;
 W.meta = meta;
 W.block = block;
 W.t = tmpl;
+// The compiler's stamp: markup a component's code makes is that component's (see `Writer`;
+// FEEDBACK61.md, Q-901's recheck of d39aa4e; branch feedback61).
+W.by = (i, h) => { h.by = i; return h; };
 W.frag = frag;
 W.each = each;
 W.choose = choose;

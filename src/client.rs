@@ -4510,11 +4510,11 @@ impl<'a> Compiler<'a> {
                     Some(b) => self.markup(b)?,
                     None => "null".into(),
                 };
-                Ok(if r {
+                Ok(self.stamped(if r {
                     format!("W.choose(() => (W.truthy({}) ? 0 : 1), [() => {}, () => {}])", cv, av, bv)
                 } else {
                     format!("W.frag([W.truthy({}) ? {} : {}])", cv, av, bv)
-                })
+                }))
             }
             Expr::Match(subj, arms, line) if has_markup(e) => self.choose_match(subj, arms, *line),
             Expr::Block(ss) if has_markup(e) => {
@@ -4605,7 +4605,8 @@ impl<'a> Compiler<'a> {
         };
         self.row = None;
         self.pop_scope();
-        Ok(format!("W.each(() => ({}), {}, ({}) => {{ {}return {}; }}{})", list, key_js, x, binds, row?, if key_reads { ", true" } else { "" }))
+        let each = format!("W.each(() => ({}), {}, ({}) => {{ {}return {}; }}{})", list, key_js, x, binds, row?, if key_reads { ", true" } else { "" });
+        Ok(self.stamped(each))
     }
 
     /// `match` in markup: the arm is chosen by the subject (a memo), and
@@ -4652,13 +4653,13 @@ impl<'a> Compiler<'a> {
             branches.push(format!("() => {{ {}return {}; }}", pre, body?));
         }
         which.push_str("W.fail(\"no `match` arm matches \" + W.short($v));\n");
-        Ok(format!(
+        Ok(self.stamped(format!(
             "(() => {{ const {} = W.memo(() => ({})); return W.choose(() => {{\n{}}}, [{}]); }})()",
             v,
             s,
             which,
             branches.join(", ")
-        ))
+        )))
     }
 
     /// An element or component; with a `key` that changes, made afresh.
@@ -4699,7 +4700,7 @@ impl<'a> Compiler<'a> {
         let Some(key) = key else { return self.html_unkeyed(el) };
         let (k, r) = self.reactive_expr(key)?;
         let made = self.html_unkeyed(el)?;
-        Ok(if r { format!("W.keyed(() => ({}), () => {})", k, made) } else { made })
+        Ok(if r { self.stamped(format!("W.keyed(() => ({}), () => {})", k, made)) } else { made })
     }
 
     fn html_unkeyed(&mut self, el: &HtmlEl) -> Result<String, QuilloError> {
@@ -4721,10 +4722,24 @@ impl<'a> Compiler<'a> {
         let tpl = tpl?;
         let name = format!("$b{}", self.blocks.len());
         self.blocks.push(format!("const {} = W.block({});", name, tpl));
-        Ok(match row {
+        let t = match row {
             Some(row) if mask != 0 => format!("W.t({}, [{}], {}, {})", name, vals.join(", "), row, mask),
             _ => format!("W.t({}, [{}])", name, vals.join(", ")),
-        })
+        };
+        Ok(self.stamped(t))
+    }
+
+    /// `js`, markup a component's code makes, stamped with that component (`$i`): its parts, and the
+    /// `@mount`s in it, are that component's code wherever the markup is made, through a function
+    /// prop, as children or another prop, or in a handler (see `W.by` in src/client/runtime.js;
+    /// FEEDBACK61.md, Q-901's recheck of d39aa4e; branch feedback61). A view's or a plain function's
+    /// markup is its caller's.
+    fn stamped(&self, js: String) -> String {
+        if self.ctxs.iter().any(|c| c.component.is_some() && !c.view) {
+            format!("W.by($i, {})", js)
+        } else {
+            js
+        }
     }
 
     /// A hole's value in the template being compiled (see `dyn_value`),
@@ -4807,10 +4822,10 @@ impl<'a> Compiler<'a> {
                     HtmlChild::Expr(x) => self.markup(x)?,
                 });
             }
-            format!("W.frag([{}])", ks.join(", "))
+            self.stamped(format!("W.frag([{}])", ks.join(", ")))
         };
         let spreads = if spreads.is_empty() { String::new() } else { format!(", () => [{}]", spreads.join(", ")) };
-        Ok(format!("W.c({}, {{{}}}, {}{})", f, props.join(", "), kids, spreads))
+        Ok(self.stamped(format!("W.c({}, {{{}}}, {}{})", f, props.join(", "), kids, spreads)))
     }
 
     /// The form of view `name` for `<Name .../>`: its code once, with its
