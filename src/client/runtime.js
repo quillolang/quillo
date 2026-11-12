@@ -1553,7 +1553,8 @@ const B = {};
 // (JSON, parsed) and its name, a line of JSON, or a piece of text.
 // `at`: where an event stream's last id and retry are kept, for `listen` to connect again from
 // (FEEDBACK36.md, Q-444; branch feedback36-39).
-async function readStream(res, f, who, signal, at) {
+// `own`: what `f`'s calls belong to, for what they start (see `run_after`).
+async function readStream(res, f, who, signal, at, own) {
   const type = (res.headers.get("content-type") || "").toLowerCase();
   const kind = type.startsWith("text/event-stream") ? "events" : /ndjson|jsonl|json-seq/.test(type) ? "lines" : "text";
   // Numbers as the server reads them, floats and ints past 2^53 too (found in review).
@@ -1562,7 +1563,10 @@ async function readStream(res, f, who, signal, at) {
   const parse = (t) => { try { return readJSON(t, true); } catch (_) { return t; } };
   const give = async (args) => {
     const n = Array.isArray(f.$p) ? f.$p.length : f.length;
-    const r = f(...args.slice(0, Math.max(n, 1)));
+    const was = Acting;
+    if (own) Acting = own;
+    let r;
+    try { r = f(...args.slice(0, Math.max(n, 1))); } finally { Acting = was; }
     return r instanceof Promise ? await r : r;
   };
   const reader = res.body.getReader();
@@ -1727,7 +1731,7 @@ B.listen = meta((url, f) => {
         const res = await wireFetch(withBase(url), { signal: ctl.signal, headers });
         if (!res.ok) throw new Error(`${res.status}`);
         wait = 1000;
-        await readStream(res, f, "listen", ctl.signal, at);
+        await readStream(res, f, "listen", ctl.signal, at, own);
         return;
       } catch (e) {
         if (ctl.signal.aborted) return;
@@ -1751,12 +1755,19 @@ B.run_after = meta((ms, f) => {
   F(f, "run_after", 2);
   const own = Owner || Acting;
   if (own && own.dead) return null;
+  // What `f` starts (a `run_after`, an `every`, a `listen`) belongs to the component too, as what
+  // `every`'s ticks and `listen`'s messages start does: it belonged to no one, and outlived the
+  // component (FEEDBACK61.md, Q-901; branch feedback61).
   const id = setTimeout(() => {
+    const was = Acting;
+    Acting = own;
     try {
       const r = f();
       if (r instanceof Promise) r.catch(report);
     } catch (e) {
       report(e);
+    } finally {
+      Acting = was;
     }
   }, Math.max(ms, 0));
   if (own) (own.clean || (own.clean = [])).push(() => clearTimeout(id));
@@ -1795,6 +1806,9 @@ B.every = meta((ms, f) => {
   let waiting = null, since = 0;
   const id = setInterval(() => {
     if (waiting !== null && performance.now() - since < stalled) return;
+    // What a tick starts belongs to the timer's own (see `run_after`).
+    const was = Acting;
+    Acting = own;
     try {
       const r = f();
       if (r instanceof Promise) {
@@ -1805,6 +1819,8 @@ B.every = meta((ms, f) => {
       }
     } catch (e) {
       report(e);
+    } finally {
+      Acting = was;
     }
   }, Math.max(ms, 1));
   (own.clean || (own.clean = [])).push(() => clearInterval(id));
@@ -1821,7 +1837,7 @@ B.parallel = meta(async (...fs) => {
   const run = Run;
   let calls;
   try {
-    calls = fs.map((f, i) => { Run = { held: null, up: run || undefined, nav: Nav.n }; return F(f, "parallel", i + 1)(); });
+    calls = fs.map((f, i) => { Run = { held: null, up: run || undefined, nav: run ? run.nav : ++Nav.runs }; return F(f, "parallel", i + 1)(); });
   } finally {
     Run = run;
   }
@@ -2805,18 +2821,26 @@ B.css = meta((s) => S(s, "css"), "css", null);
 // And `&` as `\26 `, as on the server, for a sheet in <svg> or <math> (FEEDBACK55.md, Q-707; branch feedback55).
 B.__css_value = meta((v) => cssValue(display(v)).replace(/&/g, "\\26 "), "__css_value", null);
 B.sql = meta((s) => S(s, "sql"), "sql", null);
-// A run that the page changed under does not move it again: once the person followed a link, went
-// Back or Forward, or another run moved the page, a `navigate` after a wait does nothing. A save
-// that ended after the person had left took them on to where it led. A change of the hash alone
-// keeps the page, and the run's own moves are its own (FEEDBACK61.md, Q-902; branch feedback61).
+// A run the page moved under does not move it again: once the person went to another page (a link,
+// Back or Forward, a link or a form the browser follows itself) or a run that began after it moved
+// the page, its `navigate` does nothing. A save that ended after the person had left took them on
+// to where it led. As for a state, the latest call wins: a run that began before it moving the page
+// does not stop it, and its own moves are its own; a change of the hash alone keeps the page, and
+// code that does not wait is a run that begins as it moves (FEEDBACK61.md, Q-902; branch
+// feedback61).
 B.navigate = meta((to) => {
   to = S(to, "navigate");
   let r = Run;
-  if (r !== null) { while (r.up) r = r.up; if (r.nav !== Nav.n) return null; }
-  navigate(to);
-  if (r !== null) r.nav = Nav.n;
+  if (r !== null) while (r.up) r = r.up;
+  const at = r !== null ? r.nav : ++Nav.runs;
+  if (Nav.last > at) return null;
+  Nav.by = at;
+  try { navigate(to); } finally { Nav.by = 0; }
   return null;
 }, "navigate", null);
+// The person leaving the page by a link or a form that the browser follows itself, which takes a
+// while: a `navigate` that comes meanwhile would take them elsewhere.
+if (typeof window !== "undefined") { window.addEventListener("click", leaving); window.addEventListener("submit", leaving); }
 // `waiting(state)` is compiled to W.waiting(signal); given any other way, it
 // knows of no load (FEEDBACK13.md, Q-091; branch feedback13-fixes).
 B.waiting = meta(() => false, "waiting", null);
@@ -5686,7 +5710,7 @@ async function rpcSend(name, args, live, idem) {
       });
     } catch (e) {
       r = null;
-      if (--tries <= 0) return { ...failed(`server fn \`${name}\` could not be reached: ${e.message}`), unanswered: true };
+      if (--tries <= 0) return { ...failed(`server fn \`${name}\` could not be reached: ${e.message}`), unanswered: true, status: 0 };
     }
     if (r && !(idem && RETRIED.includes(r.status) && --tries > 0)) break;
     // 0.25 s, 0.5 s, 1 s, give or take a quarter.
@@ -5698,7 +5722,9 @@ async function rpcSend(name, args, live, idem) {
   // In development the server says why, and the console says it too, with its place, as an
   // error in the page does (FEEDBACK64.md, Q-933; branch feedback64).
   if (DEV && r.status === 500 && body && body.error) report(`server fn \`${name}\` failed: ${body.error}`); // dev
-  if (!r.ok) return { ...failed(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`), unanswered: RETRIED.includes(r.status) };
+  // `status` (0: no connection, or a body cut short) and `after` (its Retry-After) tell a live load
+  // whether, and when, to try again (FEEDBACK61.md, Q-899; branch feedback61).
+  if (!r.ok) return { ...failed(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`), unanswered: RETRIED.includes(r.status), status: r.status, after: r.headers && r.headers.get("retry-after") };
   // A 2xx that is no answer, a sign-in page a redirect led to, nothing, a body cut short, gave
   // `null` as if the call had worked. The server marks what it sends, since `respond` and `reply`
   // hold what they like; a proxy may drop the mark, so an answer's own shape counts too. It may
@@ -5706,7 +5732,7 @@ async function rpcSend(name, args, live, idem) {
   // branch feedback61).
   const shaped = body && ["ok", "err", "patch"].some((k) => hasOwn(body, k));
   if (cut || (!shaped && !(r.headers && r.headers.get("x-quillo-answer")))) {
-    return { ...failed(`server fn \`${name}\` answered something that is not its answer (${(r.headers && r.headers.get("content-type")) || "no type"}, ${text.length} characters)`), unanswered: true };
+    return { ...failed(`server fn \`${name}\` answered something that is not its answer (${(r.headers && r.headers.get("content-type")) || "no type"}, ${text.length} characters)`), unanswered: true, status: cut ? 0 : undefined };
   }
   let value = null;
   if (body && hasOwn(body, "patch")) {
@@ -5898,20 +5924,33 @@ async function liveRefresh(sub, newArgs) {
   clearTimeout(sub.retry);
   if (newArgs) waitSig(sub.sig).set(true);
   try {
-    const { value, topics, seq, server, failed, h } = await rpcRaw(sub.fname, sub.args, sub);
+    const res = await rpcRaw(sub.fname, sub.args, sub);
+    const { value, topics, seq, server, failed, h } = res;
     if (n !== sub.loads) return;
     sub.loading = false;
-    // A load that failed (no answer, or a status that is no success) keeps the last good data and
+    // A load that failed for a while (no connection, 408, 429, a 5xx) keeps the last good data and
     // tries again, after a second, then two, doubling up to 30 s and spread out as `liveLoop`
-    // waits, until one comes; `waiting()` is true meanwhile, so the page can say it is behind. It
-    // gave up: the page showed old data until the next change, which a quiet table may never make,
-    // and a change heard while it was on its way was forgotten (FEEDBACK61.md, Q-899; branch
-    // feedback61).
+    // waits, or after the Retry-After the server gave (up to 5 minutes), until one comes. It gave
+    // up: the page showed old data until the next change, which a quiet table may never make, and a
+    // change heard while it was on its way was forgotten. The console says so at the first failure
+    // of a run of them. A refresh in the background does not make `waiting()` true, as it never
+    // did, so a page that shows a spinner while waiting keeps its data through a server's restart;
+    // one for new arguments keeps it true until they are loaded. Another failure (a 401, a 403, a
+    // 404, a page that is no answer) is not tried again, as before; one of a component that has gone
+    // is let be, where its tries went on for good (FEEDBACK61.md, Q-899; branch feedback61).
     if (failed) {
-      // Said at the first failure of a run of them.
-      if (sub.fails++ === 0) report(value.error);
-      waitSig(sub.sig).set(true);
-      sub.retry = setTimeout(() => liveRefresh(sub), Math.min(500 * 2 ** sub.fails, 30000) * (0.5 + Math.random()));
+      if (sub.inst.dead) return;
+      const st = res.status;
+      const again = st !== undefined && (st === 0 || st === 408 || st === 429 || st >= 500);
+      if (sub.fails === 0 || !again) report(value.error);
+      if (!again) {
+        sub.fails = 0;
+        if (sub.sig.$wait) sub.sig.$wait.set(false);
+        return;
+      }
+      sub.fails++;
+      const wait = Math.max(Math.min(500 * 2 ** sub.fails, 30000) * (0.5 + Math.random()), Math.min(retryAfter(res.after), 300000));
+      sub.retry = setTimeout(() => { if (!sub.inst.dead) liveRefresh(sub, newArgs); }, wait);
       return;
     }
     sub.fails = 0;
@@ -5929,6 +5968,14 @@ async function liveRefresh(sub, newArgs) {
     if (n === sub.loads) { sub.loading = false; if (sub.sig.$wait) sub.sig.$wait.set(false); }
     report(e);
   }
+}
+
+// A Retry-After, in seconds or as a date, in ms (0 without one).
+function retryAfter(v) {
+  if (!v) return 0;
+  const s = Number(v);
+  const ms = Number.isFinite(s) ? s * 1000 : Date.parse(v) - Date.now();
+  return ms > 0 ? ms : 0;
 }
 
 // ---- reactivity ----------------------------------------------------------
@@ -6914,15 +6961,41 @@ function setClass(el, v, svg) {
 // clicks on same-site links inside components change the URL without a
 // reload (not with a modifier key, target, download or data-reload).
 
-// `page`: the address's path and query, and `n`, how many times they changed, for a run to tell
-// that the page changed under it (see `B.navigate`; FEEDBACK61.md, Q-902; branch feedback61).
-const Nav = { at: new Sig(""), on: false, page: "", n: 0 };
+// For a run to tell whether the page moved under it (see `B.navigate`; FEEDBACK61.md, Q-902; branch
+// feedback61): `page`, the address's path and query; `runs`, the runs begun, which numbers them;
+// `last`, the number of the latest of those that moved the page, or one past all those begun
+// when the person moved it; `by`, the run moving it now.
+const Nav = { at: new Sig(""), on: false, page: "", runs: 0, last: 0, by: 0 };
 
 // What reads url() follows it.
 function navChanged() {
   const page = location.pathname + location.search;
-  if (page !== Nav.page) { Nav.page = page; Nav.n++; }
+  if (page !== Nav.page) { Nav.page = page; Nav.last = Math.max(Nav.last, Nav.by || ++Nav.runs); }
   Nav.at.set(location.href);
+}
+
+// A click on a link, or a form sent, that the browser goes on to follow, to another page: the person
+// moves the page (see `B.navigate`).
+function leaving(e) {
+  if (e.defaultPrevented) return;
+  let to;
+  if (e.type === "submit") {
+    const f = e.target, by = e.submitter;
+    const method = ((by && by.getAttribute("formmethod")) || f.getAttribute("method") || "").toLowerCase();
+    const target = (by && by.getAttribute("formtarget")) || f.getAttribute("target") || "";
+    if (method === "dialog" || (target && target !== "_self")) return;
+    to = (by && by.getAttribute("formaction")) || f.action || location.href;
+  } else {
+    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    const a = e.target.closest && e.target.closest("a[href], area[href]");
+    if (!a || (a.target && a.target !== "_self") || a.hasAttribute("download")) return;
+    to = a.href;
+  }
+  const u = new URL(to, location.href);
+  if (u.protocol !== "http:" && u.protocol !== "https:") return;
+  // A spot on this page.
+  if (e.type === "click" && u.origin === location.origin && u.pathname === location.pathname && u.search === location.search && u.href.includes("#")) return;
+  Nav.last = ++Nav.runs;
 }
 
 // A link in a component is followed here, so a page fetched ahead would be thrown away, and
@@ -7018,6 +7091,9 @@ function navigate(to) {
   const full = withBase(to);
   // Nothing on the page follows url(): load the page there.
   if (!Nav.on) {
+    // A run's move, for one begun before it (see `B.navigate`; FEEDBACK61.md, Q-902; branch
+    // feedback61).
+    if (Nav.by) Nav.last = Math.max(Nav.last, Nav.by);
     location.assign(full);
     return null;
   }
@@ -8384,8 +8460,8 @@ let Run = null;
 // with it; `w.p`, what it was before, put back as the code waits again or ends. After a wait the
 // code had none: `every` refused to start, and a `run_after` outlived its component
 // (FEEDBACK61.md, Q-901; branch feedback61). It is the call's, not the run's, which a state of the
-// page keeps. A run's `nav`: the page changes it has seen (see `B.navigate`; Q-902).
-W.run = () => { const o = Run; return { r: (Run = o || { held: null, up: undefined, nav: Nav.n }), o, y: false, a: Owner || Acting, p: undefined }; };
+// page keeps. A run's `nav`: when it began, among the page's moves (see `B.navigate`; Q-902).
+W.run = () => { const o = Run; return { r: (Run = o || { held: null, up: undefined, nav: ++Nav.runs }), o, y: false, a: Owner || Acting, p: undefined }; };
 W.off = (w, x) => { if (!w.y) { w.y = true; Run = w.o; w.o = null; if (w.p !== undefined) { Acting = w.p; w.p = undefined; } } return x; };
 W.on = (w, v) => { w.y = false; Run = w.r; w.p = Acting; Acting = w.a; return v; };
 // Whether `r`, or a run that called it, has claimed `s` for a call.

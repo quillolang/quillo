@@ -917,16 +917,18 @@ route GET /hs = page(true)
 
 // Q-899: a `live` state's load that failed while the socket stayed up gave up, and the page showed
 // old data until the next change; one made in the browser whose first load failed followed nothing
-// at all, as it never learned what to follow. Now it tries again, after a second, then two, doubling
-// up to 30 s, until a load comes, with `waiting()` true meanwhile and the console told once a run of
-// failures. The page's fetch is wrapped here to fail the loads the test says: no connection, a 503,
-// two in a row, one slow to fail with a change heard meanwhile, all of them for a while; then an
-// error value from the loader, which is an answer and is not asked again, and a failure after which
-// the component goes, which ends the tries.
+// at all, as it never learned what to follow. A failure that passes (no connection, a 503, a 429) is
+// tried again now, after a second, then two, doubling up to 30 s, or after the server's Retry-After,
+// until a load comes, and the console is told once a run of failures. A refresh in the background
+// keeps `waiting()` false meanwhile, as it always was, and its data on the page; a load for new
+// arguments, or a first one, keeps it true until it comes. The page's fetch is wrapped here to fail
+// the loads the test says: no connection, a 503, two in a row, one slow to fail with a change heard
+// meanwhile, all of them for a while; a 403 and a page that is no answer (a sign-in page) are not
+// tried again, as before, nor is an error value from the loader, which is an answer.
 const LIVE_FAILS: &str = r###"db.open("live.db")
 db.exec("create table if not exists t (id integer primary key, v int not null)")
 db.exec("delete from t")
-db.exec("insert into t (id, v) values (1, 0)")
+db.exec("insert into t (id, v) values (1, 0), (2, 200)")
 // 99 is an error value: the state takes it, as a loader's answer.
 server fn load_v(id: int) {
     let r = db.query("select v from t where id = ?", id)
@@ -938,10 +940,12 @@ component V(id: int) {
 }
 component Host(now: bool) {
     state on = now
+    state id = 1
     <div>
         <button #show @click={() => { on = true }}>show</button>
         <button #off @click={() => { on = false }}>off</button>
-        {on ? <V id={1}/> : <p #gone>gone</p>}
+        <button #two @click={() => { id = 2 }}>two</button>
+        {on ? <V {id}/> : <p #gone>gone</p>}
     </div>
 }
 route POST /t/set/:v(int) { db.exec("update t set v = ? where id = 1", v); "ok" }
@@ -949,74 +953,102 @@ route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body
 route GET /f = <html><head><title>t</title></head><body><Host now={false}/></body></html>
 "###;
 
-#[test]
-fn a_failed_live_load_tries_again_until_one_comes() {
-    let body = r##"const real = window.fetch.bind(window);
-    // Loads of `load_v` that fail: `fail` more of them, by `mode` (no connection, or a 503), each
-    // after `delay` ms; while `down`, all of them.
-    const f = { fail: 0, mode: "net", delay: 0, down: false, calls: 0 };
+/// The page script's wrapper of `fetch`, for loads of `load_v` that fail: `fail` more of them, by
+/// `mode` (no connection, a status, or a sign-in page), each after `delay` ms; while `down`, all of
+/// them with a 503. `times` notes when each call began.
+const FAILING_FETCH: &str = r##"const real = window.fetch.bind(window);
+    const f = { fail: 0, mode: "net", delay: 0, down: false, calls: 0, times: [] };
     window.fetch = async (u, init) => {
       if (String(u).includes("/_quillo/rpc/load_v")) {
-        f.calls++;
+        f.calls++; f.times.push(performance.now());
         if (f.down || f.fail > 0) {
           if (!f.down) f.fail--;
           if (f.delay) await tick(f.delay);
           if (f.down || f.mode === "503") return new Response("busy", { status: 503 });
+          if (f.mode === "403") return new Response("no", { status: 403 });
+          if (f.mode === "429") return new Response("slow down", { status: 429, headers: { "retry-after": "2" } });
+          if (f.mode === "page") return new Response("<html>sign in</html>", { status: 200, headers: { "content-type": "text/html" } });
           throw new TypeError("Failed to fetch");
         }
       }
       return real(u, init);
     };
     const set = (v) => real(`/t/set/${v}`, { method: "POST" });
+    const failed = async (n) => { for (let i = 0; i < 200 && f.calls < n; i++) await tick(10); await tick(60); };"##;
+
+#[test]
+fn a_failed_live_load_tries_again_until_one_comes() {
+    let body = format!(
+        r##"{FAILING_FETCH}
     const shown = () => ($("v") ? $("v").textContent : null);
     const behind = () => $("v").classList.contains("behind");
-    const until = async (want, ms) => { const t0 = performance.now(); while (performance.now() - t0 < ms) { if (shown() === String(want)) return Math.round(performance.now() - t0); await tick(20); } return null; };
-    const failed = async (n) => { for (let i = 0; i < 200 && f.calls < n; i++) await tick(10); await tick(60); };
-    const out = {};
-    if (location.pathname === "/f") {
-      // Made in the browser: its first load fails.
+    const until = async (want, ms) => {{ const t0 = performance.now(); while (performance.now() - t0 < ms) {{ if (shown() === String(want)) return Math.round(performance.now() - t0); await tick(20); }} return null; }};
+    const out = {{}};
+    if (location.pathname === "/f") {{
+      // Made in the browser: its first load fails, and it waits for it.
       await set(0); f.fail = 1;
       await click("show"); await failed(1);
       out.first = [shown(), behind()];
       out.firstCaughtUp = (await until(0, 4000)) !== null && !behind();
       if (!out.firstCaughtUp) return out;
-    }
+    }}
     // (Each case that does not catch up ends the test: the rest would wait out their time.)
     // A change, no failure: as it was.
     await set(1); out.plain = (await until(1, 3000)) !== null;
     if (!out.plain) return out;
-    // One load that cannot connect, then one answered 503: the page is behind, says so, and catches up,
-    // after a wait.
-    for (const [v, mode] of [[2, "net"], [3, "503"]]) {
+    // One load that cannot connect, then one answered 503: the page keeps its data, not waiting,
+    // and catches up after a wait.
+    for (const [v, mode] of [[2, "net"], [3, "503"]]) {{
       f.mode = mode; f.fail = 1; const c = f.calls;
       await set(v); await failed(c + 1);
       out[mode] = [shown(), behind()];
       const t = await until(v, 4000);
       out[mode + "CaughtUp"] = t !== null && !behind() && t >= 300;
       if (!out[mode + "CaughtUp"]) return out;
-    }
+    }}
     // Two failures in a row.
-    { f.mode = "net"; f.fail = 2; const c = f.calls; await set(4); await failed(c + 2); out.twice = [shown(), behind(), f.calls - c]; out.twiceCaughtUp = (await until(4, 7000)) !== null; if (!out.twiceCaughtUp) return out; }
+    {{ f.mode = "net"; f.fail = 2; const c = f.calls; await set(4); await failed(c + 2); out.twice = [shown(), behind(), f.calls - c]; out.twiceCaughtUp = (await until(4, 7000)) !== null; if (!out.twiceCaughtUp) return out; }}
     // A change heard while the load that then fails is on its way.
-    { f.mode = "net"; f.fail = 1; f.delay = 300; const c = f.calls; await set(5); await tick(120); await set(6); await failed(c + 1); f.delay = 0; out.during = (await until(6, 5000)) !== null; if (!out.during) return out; }
-    // Every load refused for a while, then answered again; nothing changes meanwhile.
-    { f.down = true; const c = f.calls; await set(7); await failed(c + 1); await tick(1600); out.down = [shown(), behind(), f.calls - c >= 2]; f.down = false; out.back = (await until(7, 8000)) !== null && !behind(); }
+    {{ f.mode = "net"; f.fail = 1; f.delay = 300; const c = f.calls; await set(5); await tick(120); await set(6); await failed(c + 1); f.delay = 0; out.during = (await until(6, 5000)) !== null; if (!out.during) return out; }}
+    // Every load refused for a while, then answered again; nothing changes meanwhile, and the page
+    // is never waiting.
+    {{ f.down = true; const c = f.calls; let ever = false; await set(7); await failed(c + 1);
+      for (let i = 0; i < 80; i++) {{ ever = ever || behind(); await tick(20); }}
+      out.down = [shown(), ever, f.calls - c >= 2]; f.down = false; out.back = (await until(7, 8000)) !== null && !behind(); }}
+    // A 429 with Retry-After: 2 is tried again after two seconds at least.
+    {{ f.mode = "429"; f.fail = 1; const c = f.calls; await set(70); await failed(c + 1); const ok = (await until(70, 6000)) !== null;
+      const gap = f.times[c + 1] - f.times[c]; out.retryAfter = [ok, gap >= 1900, gap < 4500]; }}
+    // A 403, and a sign-in page: not tried again, the data kept; the next change loads as before.
+    for (const [v, mode] of [[71, "403"], [72, "page"]]) {{
+      f.mode = mode; f.fail = 1; const c = f.calls;
+      await set(v); await failed(c + 1); await tick(2500);
+      out[mode] = [shown(), behind(), f.calls - c];
+      await set(v + 10); out[mode + "Next"] = (await until(v + 10, 3000)) !== null;
+    }}
     // An error value is an answer: shown, and not asked again.
-    { const c = f.calls; await set(99); const ok = (await until("ninety-nine", 3000)) !== null; await tick(1500); out.errValue = [ok, behind(), f.calls - c]; await set(9); out.after = (await until(9, 3000)) !== null; }
+    {{ const c = f.calls; await set(99); const ok = (await until("ninety-nine", 3000)) !== null; await tick(1500); out.errValue = [ok, behind(), f.calls - c]; await set(9); out.after = (await until(9, 3000)) !== null; }}
+    // New arguments whose load fails: waiting until they are loaded, the old data shown meanwhile.
+    {{ f.mode = "503"; f.fail = 1; const c = f.calls; await click("two"); await failed(c + 1); out.newArgs = [shown(), behind()];
+      out.newArgsLoaded = [(await until(200, 4000)) !== null, behind()]; }}
     // A failure, then the component goes: no more tries.
-    { f.mode = "net"; f.fail = 1; const c = f.calls; await set(8); await failed(c + 1); await click("off"); const n = f.calls; await tick(2500); out.gone = [shown(), f.calls - n]; }
-    return out;"##;
+    {{ f.mode = "net"; f.fail = 1; const c = f.calls; await set(8); await failed(c + 1); await click("off"); const n = f.calls; await tick(2500); out.gone = [shown(), f.calls - n]; }}
+    return out;"##
+    );
     let paths = ["/h", "/f"];
-    let Some(rs) = in_pages("q899", LIVE_FAILS, &paths, body) else { return };
+    let Some(rs) = in_pages("q899", LIVE_FAILS, &paths, &body) else { return };
     let net = "server fn `load_v` could not be reached: Failed to fetch";
     let busy = "server fn `load_v` failed (503)";
     for (r, path) in rs.iter().zip(paths) {
         let mut want = serde_json::json!({
-            "plain": true, "net": ["1", true], "netCaughtUp": true, "503": ["2", true], "503CaughtUp": true,
-            "twice": ["3", true, 2], "twiceCaughtUp": true, "during": true, "down": ["6", true, true], "back": true,
-            "errValue": [true, false, 1], "after": true, "gone": [null, 0], "remade": 0,
+            "plain": true, "net": ["1", false], "netCaughtUp": true, "503": ["2", false], "503CaughtUp": true,
+            "twice": ["3", false, 2], "twiceCaughtUp": true, "during": true, "down": ["6", false, true], "back": true,
+            "retryAfter": [true, true, true],
+            "403": ["70", false, 1], "403Next": true, "page": ["81", false, 1], "pageNext": true,
+            "errValue": [true, false, 1], "after": true,
+            "newArgs": ["9", true], "newArgsLoaded": [true, false], "gone": [null, 0], "remade": 0,
             // Once a run of failures: the two in a row, and all of those while it was down, are one.
-            "errors": [net, busy, net, net, busy, net],
+            "errors": [net, busy, net, net, busy, "server fn `load_v` failed (429)", "server fn `load_v` failed (403)",
+                "server fn `load_v` answered something that is not its answer (text/html, 20 characters)", busy, net],
         });
         if path == "/f" {
             want["first"] = serde_json::json!(["none", true]);
@@ -1025,6 +1057,65 @@ fn a_failed_live_load_tries_again_until_one_comes() {
         }
         assert_eq!(r, &want, "at {}", path);
     }
+}
+
+// Q-899's review: a load of a component that went while the load was on its way, and failed, armed a
+// try after the component's cleanup had run, and the tries went on for good. The component goes
+// here while a failing load is on its way: by the button, and by the person moving to another page
+// during an outage, with a try on its way. No load is asked for after either.
+const LIVE_GONE: &str = r###"db.open("gone.db")
+db.exec("create table if not exists t (id integer primary key, v int not null)")
+db.exec("delete from t")
+db.exec("insert into t (id, v) values (1, 0)")
+server fn load_v(id: int) -> list = db.query("select v from t where id = ?", id)
+component V() {
+    state r = live(load_v, 1)
+    <p #v>{r == null ? "none" : r[0].v}</p>
+}
+component App() {
+    let path = url().path
+    state on = true
+    <div>
+        <a #away href="/g/away">away</a>
+        <button #off @click={() => { on = false }}>off</button>
+        {path == "/g" && on ? <V/> : <p #none>none</p>}
+    </div>
+}
+route POST /t/set/:v(int) { db.exec("update t set v = ? where id = 1", v); "ok" }
+route GET /g = <html><head><title>t</title></head><body><App/></body></html>
+route GET /g/:x = <html><head><title>t</title></head><body><App/></body></html>
+"###;
+
+#[test]
+fn a_failed_load_of_a_component_that_went_is_not_tried_again() {
+    let body = format!(
+        r##"{FAILING_FETCH}
+    const shown = () => ($("v") ? $("v").textContent : null);
+    const until = async (want, ms) => {{ const t0 = performance.now(); while (performance.now() - t0 < ms) {{ if (shown() === String(want)) return true; await tick(20); }} return false; }};
+    const out = {{}};
+    // The socket is up once a change shows.
+    await set(1); out.up = await until(1, 3000);
+    // Gone by the button 150 ms into a load that fails after 600.
+    {{ f.down = true; f.delay = 600; const c = f.calls; await set(2); await failed(c + 1); await tick(90); await click("off");
+      await tick(4000); out.button = [!!$("v"), f.calls - c]; }}
+    return out;"##
+    );
+    let away = format!(
+        r##"{FAILING_FETCH}
+    const shown = () => ($("v") ? $("v").textContent : null);
+    const until = async (want, ms) => {{ const t0 = performance.now(); while (performance.now() - t0 < ms) {{ if (shown() === String(want)) return true; await tick(20); }} return false; }};
+    const out = {{}};
+    await set(1); out.up = await until(1, 3000);
+    // An outage whose loads fail after 400 ms: the person leaves with the second try on its way.
+    {{ f.down = true; f.delay = 400; const c = f.calls; await set(2); for (let i = 0; i < 400 && f.calls < c + 2; i++) await tick(10);
+      await tick(50); await click("away"); const n = f.calls; await tick(4000); out.away = [location.pathname, !!$("v"), f.calls - n]; }}
+    return out;"##
+    );
+    let Some(rs) = in_pages("q899-gone", LIVE_GONE, &["/g"], &body) else { return };
+    // The failure that comes once the component has gone says nothing.
+    assert_eq!(rs[0], serde_json::json!({ "up": true, "button": [false, 1], "remade": 0, "errors": [] }));
+    let Some(rs) = in_pages("q899-away", LIVE_GONE, &["/g"], &away) else { return };
+    assert_eq!(rs[0], serde_json::json!({ "up": true, "away": ["/g/away", false, 0], "remade": 0, "errors": ["server fn `load_v` failed (503)"] }));
 }
 
 // Q-901: after a handler's first wait, what it started belonged to no one: `every` refused ("works in
@@ -1133,15 +1224,83 @@ fn timers_and_streams_started_after_a_wait_last_as_long_as_their_component() {
     }
 }
 
+// Q-901's review: code in a timer's or a stream's callback belonged to no one, so what it started
+// outlived the component: a `run_after` started by an `every` tick, by another `run_after` or by a
+// `listen` message fired after the component had gone, as did one started by the ticks of an
+// `every` in the component's own code. They belong to the component now, and go with it; one in a
+// component that stays fires, once.
+const NESTED_TIMERS: &str = r###"route GET /ticks = events((send) => {
+    for i in range(100000) {
+        send(i)
+        sleep(40)
+    }
+})
+component Alive(tick) {
+    <div>
+        <button #evra @click={() => { every(50, () => { run_after(300, () => { tick("evra") }) }) }}>evra</button>
+        <button #rara @click={() => { run_after(50, () => { run_after(300, () => { tick("rara") }) }) }}>rara</button>
+        <button #lsra @click={() => { listen("/ticks", (n) => { run_after(300, () => { tick("lsra") }) }) }}>lsra</button>
+        <button #stays @click={() => { run_after(50, () => { run_after(100, () => { tick("stays") }) }) }}>stays</button>
+    </div>
+}
+component Ticking(tick) {
+    every(50, () => { run_after(300, () => { tick("code") }) })
+    <p>ticking</p>
+}
+component Host(now: bool) {
+    state on = now
+    state shown = true
+    state ticking = false
+    state log = []
+    let tick = (s) => { log = log + [s] }
+    <div>
+        <button #show @click={() => { on = true }}>show</button>
+        <button #hide @click={() => { shown = false }}>hide</button>
+        <button #again @click={() => { shown = true }}>again</button>
+        <button #tick @click={() => { ticking = !ticking }}>ticking</button>
+        <button #clear @click={() => { log = [] }}>clear</button>
+        {on && shown ? <Alive {tick}/> : null}
+        {on && ticking ? <Ticking {tick}/> : null}
+        <p #log>{join(log, ",")}</p>
+    </div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn what_a_timer_or_a_stream_starts_goes_with_its_component() {
+    let body = r##"const n = (s) => $("log").textContent.split(",").filter((t) => t === s).length;
+    const until = async (f, ms) => { const t0 = performance.now(); while (!f() && performance.now() - t0 < ms) await tick(10); return f(); };
+    const out = {};
+    // Each hidden before the first `run_after` it started would fire (the stream's first message
+    // comes at once).
+    for (const [id, ms] of [["evra", 110], ["rara", 150], ["lsra", 150]]) {
+      await click(id); await tick(ms); await click("hide"); await tick(700); out[id] = n(id);
+      await click("again", "clear");
+    }
+    await click("stays"); await until(() => n("stays") > 0, 3000); await tick(300); out.stays = n("stays");
+    await click("clear", "tick"); await tick(120); await click("tick"); await tick(700); out.code = n("code");
+    return out;"##;
+    let Some(rs) = in_pages("q901-nested", NESTED_TIMERS, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        assert_eq!(r, &serde_json::json!({ "evra": 0, "rara": 0, "lsra": 0, "stays": 1, "code": 0, "remade": 0, "errors": [] }), "at {}", path);
+    }
+}
+
 // Q-902: a save that ended after the person had followed a link elsewhere took them on to where it
-// led. A `navigate` after a wait does nothing now when the page changed meanwhile by anything but
-// the run itself: a link, Back, another run's `navigate`, also between two waits. Whether the
-// clicked component is still there does not matter: a modal that its Save closes, a panel a sibling
-// state takes away, a row or a branch in a branch gone, all move as they did; so do a navigate
-// before any wait, one after a wait or two with nothing else moving the page, the run's own move
-// followed by a wait and another move (two calls of one `parallel` too), and a change of the hash
-// alone, which keeps the page.
+// led. A `navigate` after a wait does nothing now when, since its run began, the person went to
+// another page (a link, Back, also between two waits) or a run begun after it moved the page (a
+// click that navigates at once). As for a state, the latest call wins: of two searches that each
+// show their answer and then go to its page, the later one's page is where the person ends, whichever
+// answers first (it was the earlier's, once that had moved the page first). Whether the clicked
+// component is still there does not matter: a modal that its Save closes, a panel a sibling state
+// takes away, a row or a branch in a branch gone, all move as they did; so do a navigate before any
+// wait, one after a wait or two with nothing else moving the page, the run's own move followed by a
+// wait and another move (two calls of one `parallel` too), and a change of the hash alone, which
+// keeps the page.
 const NAVIGATES: &str = r###"server fn slow(ms: int) -> str { sleep(ms); "x" }
+server fn search(ms: int, q: str) -> str { sleep(ms); `results for ${q}` }
 component Modal(on_close) {
     <div class="modal"><button #msave @click={() => { on_close(); slow(200); navigate("/q/item") }}>save</button></div>
 }
@@ -1171,9 +1330,15 @@ component Saver() {
 }
 component App() {
     let path = url().path
+    state shown = ""
     <div>
         <a #other href="/q/other">other</a>
         <a #home href="/q">home</a>
+        <button #a1 @click={() => { shown = search(300, "a"); navigate("/q/s-a") }}>a</button>
+        <button #b1 @click={() => { shown = search(300, "b"); navigate("/q/s-b") }}>b</button>
+        <button #a2 @click={() => { shown = search(500, "a"); navigate("/q/s-a") }}>a, slow</button>
+        <button #b2 @click={() => { shown = search(100, "b"); navigate("/q/s-b") }}>b, quick</button>
+        <p #shown>{shown}</p>
         <p #where>{path}</p>
         {path == "/q" ? <Saver/> : <p #else>{path}</p>}
     </div>
@@ -1209,16 +1374,72 @@ fn a_late_navigate_is_dropped_only_if_the_page_moved_meanwhile() {
     await click("save"); await tick(20); history.back(); await tick(600); out.back = at(); await home();
     await click("save"); await tick(20); await click("now"); await tick(600); out.otherRun = at(); await home();
     // The hash alone changes: the same page.
-    await click("save"); await tick(20); await click("tospot"); await moved(); out.hash = [at(), location.hash];
+    await click("save"); await tick(20); await click("tospot"); await moved(); out.hash = [at(), location.hash]; await home();
+    // Two searches, the second clicked 80 ms after the first: the first answers first, or last.
+    for (const [a, b] of [["a1", "b1"], ["a2", "b2"]]) {
+      await click(a); await tick(80); await click(b);
+      await until(() => $("shown").textContent === "results for b", 4000); await tick(700);
+      out[a + b] = [at(), $("shown").textContent]; await home();
+    }
     return out;"##;
     let Some(rs) = in_pages("q902", NAVIGATES, &["/q"], body) else { return };
     let want = serde_json::json!({
         "now": ["/q/now", "/q/now"], "save": "/q/done", "twice": "/q/twice", "row": "/q/row", "deep": "/q/deep",
         "modal": [true, "/q/item"], "panel": [true, "/q/sib"], "own": ["/q/step", "/q/after"], "par": ["/q/p1", "/q/p2"],
         "left": ["/q/other", "/q/other"], "leftBetween": "/q/other", "back": "/q/other", "otherRun": "/q/now",
-        "hash": ["/q/done", ""], "remade": 0, "errors": [],
+        "hash": ["/q/done", ""], "a1b1": ["/q/s-b", "results for b"], "a2b2": ["/q/s-b", "results for b"],
+        "remade": 0, "errors": [],
     });
     assert_eq!(rs[0], want);
+}
+
+// Q-902 on a page where nothing reads url(): `navigate` loads the page there, and a link or a form
+// the person used meanwhile, whose page takes a while, was cancelled by it. The person's leaving is
+// heard as they click or send; the runtime's own load of the page is not. A link to a spot on the
+// same page keeps it, and with nothing done meanwhile the save goes where it says. Each page this
+// lands on writes where it is as the result, as the page the test began on has gone. A link or a
+// form whose answer keeps the page (a 204) counts all the same, as the click is all the page sees:
+// the save stays where the person is.
+const PLAIN_NAVIGATES: &str = r###"server fn slow(ms: int) -> str { sleep(ms); "x" }
+component Saver() {
+    <div>
+        <button #save @click={() => { slow(300); navigate("/done") }}>save</button>
+        <a #slow href="/slow">slow</a>
+        <form #f action="/slow" method="get"><button #send>send</button></form>
+        <a #spot href="#spot">spot</a>
+        <a #nothing href="/nothing">nothing</a>
+        <form #f2 action="/nothing" method="get"><button #send2>send</button></form>
+    </div>
+}
+fn landed(name: str) = <html><head><title>t</title></head><body><p>{name}</p><script>{raw("document.body.dataset.result = JSON.stringify({ at: location.pathname })")}</script></body></html>
+fn start() = <html><head><title>t</title></head><body><Saver/></body></html>
+route GET /p/link = start()
+route GET /p/none = start()
+route GET /p/form = start()
+route GET /p/spot = start()
+route GET /p/stay = start()
+route GET /p/stayform = start()
+route GET /nothing = null
+route GET /slow { sleep(1500); landed("slow") }
+route GET /done = landed("done")
+"###;
+
+#[test]
+fn a_late_navigate_does_not_cancel_a_page_the_person_asked_for() {
+    let body = r#"await click("save");
+    const p = location.pathname;
+    if (p === "/p/link") $("slow").click();
+    if (p === "/p/form") $("f").requestSubmit();
+    if (p === "/p/spot") $("spot").click();
+    if (p === "/p/stay") $("nothing").click();
+    if (p === "/p/stayform") $("f2").requestSubmit();
+    if (p === "/p/stay" || p === "/p/stayform") { await tick(700); return { at: location.pathname }; }
+    // The page this lands on says where it is.
+    await new Promise(() => {});"#;
+    let paths = ["/p/link", "/p/none", "/p/form", "/p/spot", "/p/stay", "/p/stayform"];
+    let Some(rs) = in_pages("q902-plain", PLAIN_NAVIGATES, &paths, body) else { return };
+    let got: Vec<&str> = rs.iter().map(|r| r["at"].as_str().unwrap_or("")).collect();
+    assert_eq!(got, ["/slow", "/done", "/slow", "/done", "/p/stay", "/p/stayform"]);
 }
 
 // ---- What Quillo takes off the page (Q-896) ----------------------------------------------------
