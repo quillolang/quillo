@@ -6383,10 +6383,12 @@ function nodesOf(list, out = []) {
 // `partsMade` before they were made; when no part was made since, none of them is a marker.
 function own(got, made) {
   if (partsMade === made) return got;
-  const len = got.length;
+  const len = got.length, last = len ? got[len - 1].__part : null;
   // Most often the last part made made all the others, and put its marker last (a branch at a
-  // row's root, its element in a part of its own): the marker alone.
-  if (partLast.end === got[len - 1] && partSize === len - 1) return len === 1 ? got : [got[len - 1]];
+  // row's root, its element in a part of its own): the marker alone. Each part notes its own
+  // count and size: a page-wide note of the last part held it, and a part that left the page
+  // stayed alive with all around it until another was made (found in the second review).
+  if (last && last.made === partsMade && last.size === len - 1) return len === 1 ? got : [got[len - 1]];
   let i = 0;
   while (i < len && !got[i].__part) i++;
   if (i === len) return got;
@@ -6394,8 +6396,9 @@ function own(got, made) {
   for (; i < len; i++) if (got[i].__part) for (const n of nodesOf(got[i].__part.nodes)) theirs.add(n);
   return got.filter((n) => !theirs.has(n));
 }
-// How many parts were made, the last one, and how many nodes it put out before its marker.
-let partsMade = 0, partLast = null, partSize = 0;
+// How many parts were made. A part notes its number in that count (`made`), and how many nodes it
+// put out before its marker (`size`).
+let partsMade = 0;
 
 // A <textarea>'s text is only its first value: once someone types, the box
 // stops showing it. When the text between its tags changes, the box shows
@@ -6417,7 +6420,7 @@ let removing = 0;
 // empty text node) that later nodes go in front of. A text that becomes
 // another text is changed in place.
 function dyn(get, c, out) {
-  bound(get, dynApply, { nodes: [], end: null, c, out }, null, undefined);
+  bound(get, dynApply, { nodes: [], end: null, c, out, made: 0, size: 0 }, null, undefined);
 }
 
 function dynApply(x) {
@@ -6429,8 +6432,8 @@ function dynApply(x) {
     r.end = document.createTextNode("");
     r.end.__part = r;
     partsMade++;
-    partLast = r;
-    partSize = got.length;
+    r.made = partsMade;
+    r.size = got.length;
     if (c.claim) c.p.insertBefore(r.end, c.n);
     for (const n of got) r.out.push(n);
     r.out.push(r.end);
@@ -7446,7 +7449,7 @@ function delegated(ev) {
 
 function each(list, key, row) {
   return new Html((c, out) => {
-    const st = { rows: [], end: null, get nodes() { const a = []; for (const r of this.rows) for (const n of r.nodes) a.push(n); return a; } };
+    const st = { rows: [], end: null, made: 0, size: 0, get nodes() { const a = []; for (const r of this.rows) for (const n of r.nodes) a.push(n); return a; } };
     const svg = c.svg;
     let first = true;
     // Rows are their own scopes, not their owner's: they come and go
@@ -7465,8 +7468,8 @@ function each(list, key, row) {
         st.end = document.createTextNode("");
         st.end.__part = st;
         partsMade++;
-        partLast = st;
-        partSize = out.length - at;
+        st.made = partsMade;
+        st.size = out.length - at;
         if (c.claim) c.p.insertBefore(st.end, c.n);
         out.push(st.end);
       });

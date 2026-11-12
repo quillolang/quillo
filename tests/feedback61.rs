@@ -600,6 +600,48 @@ route GET /b = <html><head><title>t</title></head><body><Host now={false}/></bod
     }
 }
 
+// Q-889's shortcut, found in the second review: the page kept a note of the last part made, so a
+// part that left the page stayed alive, with the panel around it and its 2,000 rows, until another
+// part was made anywhere; changes of text alone make none. Each part keeps its own note now: a
+// panel made in the browser and hidden goes at once, as on main, as it does after a part is made.
+#[test]
+fn a_part_that_leaves_the_page_is_let_go() {
+    let src = r###"component Panel() {
+    state on = true
+    state other = false
+    state n = 0
+    let xs = range(0, 2000)
+    <div>
+        <button #tog @click={() => { on = !on }}>tog</button>
+        <button #text @click={() => { n += 1 }}>text</button>
+        <button #other @click={() => { other = !other }}>other</button>
+        <p #n>{n}</p>
+        {on ? <div class="panel"><ul>{for x in xs => <li key={x}>{x}</li>}</ul></div> : null}
+        {other ? <ol>{for x in [1, 2] => <li key={x}>{x}</li>}</ol> : null}
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Panel/></body></html>
+"###;
+    let body = r#"const collect = async () => { for (let k = 0; k < 3; k++) { await tick(50); gc(); } };
+    const out = {};
+    await click("tog", "tog");
+    let ref = new WeakRef(document.querySelector(".panel"));
+    await click("tog", "text", "text", "text", "text", "text");
+    await collect();
+    out.textOnly = ref.deref() !== undefined;
+    out.n = $("n").textContent;
+    await click("tog");
+    ref = new WeakRef(document.querySelector(".panel"));
+    out.rows = document.querySelectorAll(".panel li").length;
+    await click("tog", "other");
+    await collect();
+    out.afterAPart = ref.deref() !== undefined;
+    return out;"#;
+    let Some(rs) = in_pages("q889-gone", src, &["/"], body) else { return };
+    let want = serde_json::json!({ "textOnly": false, "n": "5", "rows": 2000, "afterAPart": false, "remade": 0, "errors": [] });
+    assert_eq!(rs[0], want);
+}
+
 // Q-889: the seeded walk that found its shapes, kept as its test, bounded and the same each run.
 // Every shape of row whose root can change is on the page at once, over the same items: `? :`
 // (`#a`), `if`/`else` (`#i`), a view (`#v`) and a plain function (`#f`) with a branch at the root,
