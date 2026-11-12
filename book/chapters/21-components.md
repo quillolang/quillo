@@ -47,6 +47,25 @@ route GET / = <html><body><Counter start={5}/></body></html>
 
   Each row is `<tr data-qi="" data-c="Row" ...>` in the page, with no island around it,
   so `tbody > tr` finds both.
+
+  A component inside another whose root is not one element (several rows, a list of them,
+  a branch, nothing), where only table or select parts may stand or inside an `<svg>`, is
+  written between two comments, which the HTML parser leaves in place: `<!--q
+  data-c="Rows" ...-->` and `<!--/q-->`, the component around it saying `data-qm`. The
+  browser takes it up as written and removes the comments, so what was typed before the
+  code came stays (FEEDBACK61.md, Q-892). Placed straight in a route's page, such a
+  component is taken up only when its root is one element; otherwise the browser makes it
+  again as the page loads. In the browser, a component made inside a table part, a
+  `<select>`, an `<optgroup>`, a `<datalist>` or an `<svg>` has no island element either:
+  one root element is its own island and several go in as they are, so a row component
+  whose root is a branch is a row, and a branched `<svg>` component is drawn.
+
+  Rows written straight into a `<table>`, with no `<tbody>`, are taken up too, and so are a
+  `<thead>` before them, a `<tfoot>` after them, bare `<col>`s and a component that wraps a
+  row component (Q-940). The HTML parser puts such rows in a `<tbody>` of its own, which
+  the page keeps; a table the browser makes has none, so write the `<tbody>` when a
+  selector must find it either way. A list whose items mix `<tbody>` or `<thead>` items
+  with `<tr>` rows is made again, with its component, as the page loads.
 - `state count = start` declares state, set once (`~count = start` is the short form).
   After that it is just `count`, and assigning to it (`count += 1`) updates what reads
   it, and nothing else. A component's code runs once. A `let` that reads state or props
@@ -75,11 +94,19 @@ route GET / = <html><body><Counter start={5}/></body></html>
   `key` is the list's, not passed to the view or component, so neither may take a
   parameter named `key` (a load-time error); an attribute written twice on one element
   is an error too.
-  A row that is a choice (`? :`, `if`/`else`, `match`) of elements that each have a `key`
-  is keyed by it; with one branch that has none, the rows are kept by place.
+  A row that is a choice (`? :`, `if`/`else`, `match`) is keyed by its branches' `key`s.
+  A branch that shows nothing needs none (an `if` with no `else`, `null`, `false`, `true`,
+  `{ }`, `cond && <li key=...>`), and the row is keyed by the others, so an `if` that
+  filters the list (`for x in xs { if x.on { <li key={x.id}>...</li> } }`) keeps each row's
+  typing and focus through a reorder (Q-897). With a branch that shows something and has
+  no `key`, the rows are kept by place. A `key` that reads other state
+  (`` key={`${ver}:${x.id}`} ``) makes its rows again when that state changes, as a `key`
+  outside a loop does (Q-895).
   A row whose item changed is updated where it shows what changed, and moved rows keep
-  their DOM, focus and the selection in a field (in browsers without
-  `Element.moveBefore`, Safari, the focus and selection are put back after the move).
+  their DOM, focus, the selection in a field and the scroll of what scrolls in them, a
+  row of several elements too (in browsers without `Element.moveBefore`, Safari, the
+  focus, selection and scroll are put back after the move, and a frame in a moved row
+  loads again) (Q-894).
   `if`, `? :`, `match` and `cond && <markup>` in markup make a
   branch again only when another one is chosen: an input in one keeps its focus and
   what was typed while the page updates. Nested components keep their own state.
@@ -106,6 +133,10 @@ route GET / = <html><body><Counter start={5}/></body></html>
   (`@clik`) is silent. Clicks are handled once, at the document, innermost first, so
   `e.stopPropagation()` stops outer handlers, and a library that stops a click before
   it reaches the document hides it from Quillo; other events listen on their element.
+  An element Quillo takes off the page runs no handler as it goes: an input that its own
+  Enter handler hides hears no `blur` from leaving (Chrome sent one, and an inline edit
+  saved twice), while what comes later, such as a dropped card's `dragend`, still reaches
+  its handler (Q-896).
   The function may take the event `e` (it gets it only if it declares a parameter):
   - `e.value` and `e.checked` of the input (`null` and `false` when it has none), `e.key`
     of a key press, `e.type`;
@@ -201,7 +232,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   first; the select itself gets no `value` attribute, which HTML does not have. In the
   browser the value is set once its options are in, and again when they change, so
   options made from a list that arrives later still show the one `x` names; what a person
-  picked is kept while the page updates, unless options are added or taken away.
+  picked is kept while the page updates, unless options are added or taken away. Options
+  that are components count the same: one made anew sets the select back to `x`.
 
   `quillo check` warns of an input whose value is a parameter (a view's, or a component's
   prop) or a state's field (`value={form.name}`) when nothing on it takes what is typed: no
@@ -233,6 +265,15 @@ route GET / = <html><body><Counter start={5}/></body></html>
 
   The handler takes four characters; a fifth is typed, not taken, and undone, so the
   input still shows `1234`.
+
+  A field that its handler rewrites as it is typed (capitals, a refused key, a card or
+  phone mask, a trim) keeps the caret in the text that did not change: in what comes
+  before the change it keeps its place, in what comes after it keeps its distance from
+  the end, and in the part that changed it goes after the new text (Q-891). While a
+  person composes with an input method (Japanese, Chinese, an accent from a dead key),
+  the field is not written: the program's value goes in when the composition ends, and a
+  field the program did not set meanwhile keeps what was composed. A field that loses the
+  focus is written at once (Q-939).
 - `style={...}` takes text or a map of properties *(since 0.7)*: `style={{ color: tone, font_size:
   "2rem", marginTop: "3px", "--gap": "4px" }}`, where `_` and camelCase are written as
   `-` (`font-size`, `margin-top`), a custom property is kept as it is, and a `null` or
@@ -302,10 +343,11 @@ route GET / = <html><body><Counter start={5}/></body></html>
   for as long as the code that called it stands: `if running { every(100, step) }`
   runs a game while `running` is true, starts again with the new speed when that changes,
   and stops when `running` is false or the component leaves the page. On the server it
-  does nothing. It is called from the component's code (or a `let` or `if` there), or
-  from one of its event handlers or its `@mount`, where it runs until the component
-  leaves the page (started after a handler's first wait, it belongs to no one, and is an
-  error). A tab in the background is slowed by the browser to once a second at most.
+  does nothing. It is called from the component's code (or a `let` or `if` there), from an
+  `@mount`, or from one of its event handlers, before or after a wait: one a handler
+  starts runs until the component leaves the page, even once the row or branch that held
+  the button has gone (see [Whose a timer is](#whose-a-timer-is)). A tab in the background
+  is slowed by the browser to once a second at most.
   A tick that finds that timer's last run still waiting does nothing, so a poll slower
   than its timer runs one call at a time and shows each answer; a run with no answer
   after 30 seconds (or two gaps, if that is longer) is given up on, and the next tick
@@ -323,8 +365,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
 
   Start counts in tenths of a second; Stop ends the `every`, as the `if` that called it no
   longer stands.
-- `run_after(ms, f)` *(since 0.7)* calls `f` once, `ms` milliseconds on, unless its component has gone
-  first: from a handler, `@mount` or the component's code alike. There is no
+- `run_after(ms, f)` *(since 0.7)* calls `f` once, `ms` milliseconds on, unless what it
+  belongs to has gone first: from a handler, its component; otherwise the component, row
+  or branch whose code started it (see [Whose a timer is](#whose-a-timer-is)). There is no
   `setTimeout`; a debounce or a throttle is an `every` under a state flag that the tick
   turns off. `page_updated()` *(since 0.7)* in a handler waits until the page shows what the handler
   has set so far, to read or focus what that made appear (FEEDBACK28.md, Q-349).
@@ -700,7 +743,12 @@ component Dashboard() {
 - A function called in markup with a state, `{tick(on)}`, is called again at each change.
   When its markup comes out the same shape and nothing in it follows state itself, the
   page's elements are kept and take the new attributes, text and handlers, so an input in
-  it keeps its focus and what was typed. A function whose markup changes shape is made
+  it keeps its focus and what was typed. What a person changes (a field's `value`, a box's
+  `checked` or `indeterminate`, an option's `selected`, `open`, a player's `muted`) is
+  written only when the markup writes it and says something new: a field with
+  `value={v}` follows `v`, and one without keeps what was typed, ticked, picked or opened
+  (Q-890). To start the markup afresh, give its root a `key` that changes. A function
+  whose markup changes shape is made
   anew, and its input loses the focus: there, use a `view`, whose props are live.
 - A plain function used as a tag (`<Row item={x}/>` where `Row` is neither a view nor a
   component) is called again as a whole when what it is given changes.
@@ -955,7 +1003,9 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   browser itself focuses only what the page had as it loaded.
 - A Quillo function handed to the page's JavaScript (an event listener, a callback) is
   called with as many arguments as it declares, so `marker.on("click", () => ...)`
-  works, and `off` finds what `on` was given.
+  works, and `off` finds what `on` was given. It runs as the code that handed it over: a
+  timer it starts ends with that part of the page, and none starts once that part has
+  gone (see [Whose a timer is](#whose-a-timer-is)).
 - `js("path.to.fn", args...)` calls a function of the page's scripts, found by its dotted
   name from the page's globals (`js("L.map", el)`, `js("analytics.track", "signup")`),
   and gives its result; `js_new("Chart", ...)` makes an object of a class. A library's
@@ -1050,6 +1100,15 @@ once the new page shows it, and stays at the top if it never does. A `javascript
 `vbscript:` URL, however it is written (`  JaVaScRiPt:`), is an error, in the browser
 and on the server, as it is for `redirect`: `navigate(next)` after a sign-in, with
 `?next=javascript:...`, would have run as the page *(since 0.7)*.
+
+A `navigate` that comes after a wait (a Save that calls the server, then goes to what it
+saved) is dropped if the page moved meanwhile by anything but that same run: the person
+followed a link, pressed Back or Forward, or a run that started later navigated (of two
+searches, the page ends on the second's). Otherwise it goes, even when the component that
+asked has gone, as a modal does whose Save closes it. A change of the hash alone is no
+move. A link or a form the browser follows itself counts as one, so the page the person
+asked for is not taken from them, even when the page stays: an answer of 204, or a file
+sent as a download (FEEDBACK61.md, Q-902).
 
 ```quillo
 component App() {
@@ -1178,9 +1237,21 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
   topic under it (`room:7`, `room:lobby`), and `publish("db:*")` every table's. So a
   topic built from a visitor's text must not end in `:*`: write `` `room:${id}` `` with
   an `id` the program checked (an int), not one taken as it came.
-- A loader that gives an error value makes the state that error value, sent whole; one
-  that fails with a runtime error, or `reply`s a status that is not a success, leaves
-  the page's state as it was (the console says so), and the next change tries again.
+- A loader that gives an error value makes the state that error value, sent whole. A load
+  that fails leaves the page's state as it was, and the console says so once
+  (FEEDBACK61.md, Q-899):
+  - for want of a connection, or with a 408, a 429 or any 5xx (the program's own `reply
+    500 {...}`, a proxy's 502, 503 or 504), it is tried again after a second, then two,
+    doubling up to 30 s and spread out, and never before the server's `Retry-After` (up to
+    5 minutes), until one comes back; a change heard meanwhile is not lost. A newer load,
+    or the component leaving the page, ends the tries. They leave `waiting()` false, so a
+    page written `waiting(r) ? spinner : list` keeps its list through a server's restart;
+    a first load, or one for new arguments, stays waiting until it comes;
+  - when the loader's own code fails (a runtime error, or a run past
+    [`--max-compute`](#options-of-quillo-run)), with another 4xx, or with an answer that
+    is not the server's (a sign-in page a proxy sent), it is not tried again: the next
+    change tries. A component the browser made whose first load fails in the loader's own
+    code follows nothing until it is made again.
 - A page may follow at most 256 topics; past that, the rest hear nothing. A list too
   long for an address goes after it, so long topics are heard too.
 - Inside `db.transaction`, a table's announcement waits for the commit, and is dropped
@@ -1251,12 +1322,25 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
   every change in between: changes made while a page was disconnected are caught up on
   when it comes back. A WebSocket, because browsers
   allow only six HTTP/1.1 connections to a host across all tabs: requests left
-  waiting would hold them, and server calls would queue behind them. Where a
-  WebSocket cannot open, the page asks the same URL as a plain request instead,
-  answered at the first change or after 25 s, and asked again at once. A connection
+  waiting would hold them, and server calls would queue behind them. When the page's
+  topics change, as when it moves to another page of a single-page app, it keeps its
+  socket and sends the new topics down it, which the server follows at once; a page's
+  close is answered at once too, so the browser opens the next socket without waiting
+  (FEEDBACK61.md, Q-900).
+  A socket that has not opened within 3 s goes on trying while the page asks the same
+  URL as plain requests, each answered at the first change or after 25 s; when the socket
+  opens it takes over, no change missed or shown twice. Where no socket can be had, the
+  plain requests carry the changes and a socket is tried again later each time, after 1
+  to 3 s, doubling up to half a minute. A connection
   that drops is opened again after a second or so, spread out, and after a restart pages
   ask for their data over a second, so that they do not all come at once; when the
-  server cannot be reached, the page waits longer each time, up to half a minute. A tab
+  server cannot be reached, the page waits longer each time, up to half a minute, and
+  never before a `Retry-After` it was given. A page that falls behind says so once in the
+  console (`live updates are not reaching this page`): at the third failure in a row, or
+  at once when it is told to wait or refused (a 4xx other than 408 and 429, or an answer
+  that is not the server's, not asked again until the next socket fails). On Windows the
+  server answers a close at its next 5 s check, and a page whose topics change opens a new
+  socket for them, as before. A tab
   in the background keeps its connection and runs its loaders as a visible one does. A
   page on another site cannot open it (403).
 - A server keeps at most 4096 such connections open (live data, [`--watch`](#options-of-quillo-run) reloads,

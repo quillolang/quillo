@@ -39,7 +39,7 @@ list is not touched. The page shows the new total once the keystroke's handler i
 | an assignment alone in the body (`count = len(items)`, `n += 1`) | a step as it starts | never: it runs once, and `quillo check` warns when it reads a prop or another state (write `let`) |
 | `{expr}` in markup, an attribute's or a class's `{...}` | a place on the page | when what it read changed; text that comes out the same is not written |
 | `cond ? <a/> : <b/>`, `if`, `match`, `cond && <x/>` in markup | a branch | made again only when another branch is chosen |
-| `for x in xs => <row/>` | a row for each item | rows are kept by `key` (else by place) and given their new item |
+| `for x in xs => <row/>` | a row for each item | rows are kept by `key` (else by place) and given their new item; a `key` that reads other state makes its rows again when that changes |
 | `<Child prop={x}/>` | props passed live | the child's own reads of `prop` follow `x`; neither component runs again |
 | `key={k}` on an element or component outside a loop | a part made afresh | when `k` changes |
 | `@event={...}`, `@mount`, a function given to a library | a handler | when it is called; what it reads is read then, not followed |
@@ -98,9 +98,64 @@ component Clock() {
 }
 ```
 
-A handler may start one too, which then lasts as long as its component, or set the state
-that the statement reads. For once, later, `run_after(ms, f)`. There is no `setTimeout`; a
-debounce or a throttle is an `every` under a state flag that its tick turns off.
+A handler may start one too, which then lasts as long as its component, after the
+handler's waits too, or set the state that the statement reads. For once, later,
+`run_after(ms, f)`. There is no `setTimeout`; a debounce or a throttle is an `every` under
+a state flag that its tick turns off.
+
+## Whose a timer is
+
+A timer or a stream (`every`, `run_after`, `listen`) belongs to a part of the page, and
+stops when that part leaves it. Which part depends on the code that starts it
+(FEEDBACK61.md, Q-901):
+
+- **An event handler's** belongs to the handler's component, before and after the
+  handler's waits. It outlives the row or the `if` branch that held the button, so a
+  row's Delete can still clear its notice once the row has gone (below). A stopwatch
+  whose Start button sits in a branch keeps ticking after the branch hides; to end it
+  with the branch, make the stopwatch a component of its own.
+- **A part's own code** gives it to that part, its row or branch, or the component: a
+  statement (`if running { every(...) }`), an `@mount`, a timer's tick, a stream's message.
+- **A parent's function that a child calls** (a modal's Save, a countdown's end, an
+  `on_done()` that a child's `if` calls) is the parent's code, so what it starts
+  outlives the child.
+- **A plain `fn`** gives it to what called it: from a handler, even after a wait, the
+  handler's component; from an `@mount`, a callback or a component's own code, that part.
+  A plain `fn`'s timer in a parent's function that a child uses as its handler
+  (`@click={on_save}`, where `on_save` is the parent's) is the parent's. When the child
+  calls that function from its own code (`@click={() => { on_save() }}`), or reaches it
+  through a variable, a list or a map, the timer is the child's, and ends with the child.
+- **Markup is the code of the component that wrote it**, wherever it is shown: passed as
+  `children` or another prop, given back by a function prop, or made in a handler and
+  kept in state. Its `@mount`, and what that starts, end with the part showing it; its
+  handlers' timers are the writer's. Markup still shown after its writer has gone (a
+  toast a page put in the app's state) works on, its handlers' timers given to the part
+  showing it.
+- **A function that a child calls while it makes a row or a branch** (a render prop,
+  `row={(x) => ...}`) is part of that row or branch.
+- **A function handed to the page** (a library's callback, a listener) runs as the code
+  that handed it over.
+
+A part that has gone starts nothing: what its code asks for after a wait it did not
+outlast is not started.
+
+```quillo
+component Inbox() {
+    state mails = [{ id: 1, subject: "Hello" }, { id: 2, subject: "Lunch?" }]
+    state notice = ""
+    <div>
+        {for m in mails => <p key={m.id}>{m.subject} <button onclick={() => {
+            mails = mails | filter((x) => x.id != m.id)
+            notice = `Deleted ${m.subject}`
+            run_after(2000, () => { notice = "" })
+        }}>Delete</button></p>}
+        <p>{notice}</p>
+    </div>
+}
+```
+
+Delete takes the row away and shows the notice; the `run_after` is `Inbox`'s, not the
+row's, so the notice goes two seconds later.
 
 ## Lists and rows
 
@@ -119,6 +174,9 @@ debounce or a throttle is an `every` under a state flag that its tick turns off.
   through a function (`is_selected(r)`), every row asks again.
 - A key that is a list or a map never matches the row it had, so the row is made again
   each time: key rows by an id.
+- A key whose code fails (`key={100 / x.n}` on an item whose `n` is 0) is said in the
+  console, once while it goes on failing, and its row is given a key of its own: that
+  row is made again at each change, and the rest of the list keeps up.
 
 ## Branches
 
@@ -126,7 +184,11 @@ debounce or a throttle is an `every` under a state flag that its tick turns off.
 when another is chosen. While one stays, what is inside it follows its values like
 anything else: an input in it keeps its focus and what was typed. A branch that goes
 takes everything it made with it: its state of nested components, its timers. Keep what
-must outlive a branch in the component's own `state`. `key={k}` on an element or a
+must outlive a branch in the component's own `state`. The branch chosen next is made
+anew, its fields too, even one written the same in both (the password of a sign-in form
+and of a sign-up form): it has neither the focus nor what was typed. To keep one field
+through a switch, write it once and switch what differs
+(`placeholder={joining ? "New password" : "Password"}`). `key={k}` on an element or a
 component makes it afresh whenever `k` changes, which is how a page for a new product
 starts clean (`<Product key={id} id={id}/>`).
 

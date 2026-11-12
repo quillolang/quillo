@@ -280,7 +280,10 @@ component Tasks() {
   always made.
 - A statement in a component body that reads state runs again when that state changes;
   what it starts (`every(ms, f)`, a listener) stops when it no longer runs. There is no
-  `useEffect`, no dependency list and no `useMemo`: `let` is already derived.
+  `useEffect`, no dependency list and no `useMemo`: `let` is already derived. A timer or
+  stream an event handler starts (`run_after`, `every`, `listen`), after its waits too,
+  lasts as long as the handler's component, not the row or `if` branch that held the
+  button: a ticker meant to end with a branch is a component of its own.
 - An assignment alone in a component body (`count = len(items)`) runs once, as the
   component starts, and follows nothing: write `let count = len(items)` for a value that
   follows; `quillo check` warns.

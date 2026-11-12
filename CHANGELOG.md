@@ -30,6 +30,122 @@
   a `<quillo-media>` player forwards, which memchr does with SIMD, not back from the end. Nothing
   a page or the log says changed.
 
+### Pages that change a lot, and live data (FEEDBACK61.md)
+
+From a three-pane console, a one-page tracker with live data and two visitors, and lists
+four deep, on Chromium, Firefox and WebKit: Q-889 to Q-902 and Q-936 to Q-940 (Q-893 and
+Q-898 came in 0.8.1).
+
+Lists and rows:
+
+- **A row whose root changes after it is made moves as it is now**: a `? :` or `if` at its
+  root, a view or function with a branch at its root, a table-row component whose root is a
+  branch. The row kept the elements it was made with, so its next move brought an old
+  element back with its old handlers, lost real rows, or stopped the update. A branch that
+  showed a list takes all its rows with it, those added later too (Q-889).
+- A row of several elements keeps its scroll when it moves, and its frames do not load
+  again; in Safari, which cannot move a frame, they still do (Q-894).
+- A `for` row's `key` that reads other state (`` key={`${ver}:${x.id}`} ``) makes its rows
+  again when that state changes; it waited for the list's next change (Q-895).
+- A row whose other branch shows nothing (`if` with no `else`, `null`, `false`, `true`,
+  `{ }`, `&&`) is keyed by the branch that has a key, so an `if` that filters a list keeps
+  each row's typing and focus through a reorder. It was kept by place, and made again on
+  every reorder (Q-897).
+- A row's `key` whose code fails is said in the console, once while it goes on failing, and
+  the row is given a key of its own, so the list shows and keeps up; the error stopped the
+  whole list.
+- A `run_after` that has fired leaves nothing behind: a poll that starts the next one as it
+  ends kept a little more of the page's memory at every tick (10 polls of 400 ticks: 464 KB).
+
+What a person typed:
+
+- **A function's markup made again keeps what a person typed, ticked, picked or opened.**
+  `value`, `checked`, `selected`, `muted`, `indeterminate` and `open` are written only when
+  the markup writes them and says something new. The focus stayed and the text went
+  (Q-890).
+- **A field rewritten as it is typed keeps its caret** in the text that did not change:
+  capitals, a refused key, a card or phone mask, a trim. It went to the end, so the next
+  letters landed after it (`AXYZB` became `AXBYZ`) (Q-891).
+- A field is not written while a person composes in it with an input method; the program's
+  value goes in when the composition ends, and a field the program did not set keeps what
+  was composed. Rewriting it broke the composition (on main too, Q-939).
+- No handler runs while Quillo takes elements off the page, so in Chrome a field that its
+  Enter handler hides no longer saves a second time on its `blur`, as Firefox and Safari
+  did not; a dropped card's `dragend`, which comes after, still runs (Q-896).
+
+Tables, selects and SVG taken up from the server's page:
+
+- **A component of table or select parts that is not one element** (several rows, a list,
+  a branch, nothing) is marked with comments, which the HTML parser leaves in the table,
+  and taken up as written: it was written as a `<quillo-island>` that the parser moved out
+  of the table, so the browser made the whole page again as it loaded, erasing what was
+  typed before the code came. Placed straight in a route's page, it is still made again
+  unless its root is one element (Q-892, Q-936).
+- **Rows written straight into a `<table>`** with no `<tbody>` are taken up, with a `<thead>`
+  before them or a `<tfoot>` after, bare `<col>`s, and a component that wraps a row
+  component; the page keeps the `<tbody>` the parser made. Their component was made again
+  on every load (on main too, Q-940). A list whose items mix `<tbody>` or `<thead>` items with
+  `<tr>` rows is still made again.
+- In the browser, a component made inside a table part, a `<select>` or an `<svg>` has no
+  `<quillo-island>`: a branched SVG component is drawn, where it was not; a `<select>`
+  keeps its value when an option component is made anew; and a table-row component whose
+  root is a branch is a row, as on the server's page (Q-937, Q-938).
+
+Timers and streams, and whose they are:
+
+- **A timer or stream that an event handler starts is its component's**, after the
+  handler's waits too, so it outlives the row or branch that held the button (the user's
+  decision). After a wait, `every` refused to start (`` `every` works in a component ``) and
+  `run_after` outlived its component; `listen` refused in any handler; a parent's function
+  that a child calls and then closes (a modal's Save) lost its timer with the child (Q-901).
+- One that a part's own code starts (a statement, an `@mount`) ends with that part, its row
+  or branch, as before, and so does what a timer's tick or a stream's message starts, which
+  outlived the component. Markup is its writer's code wherever it is shown (passed as
+  `children` or another prop, given back by a function prop, kept in state), so its
+  handlers' timers are the writer's; markup still shown after its writer has gone gives
+  them to the part showing it. A function handed to the page (a library's callback, a
+  listener) runs as the code that handed it over (Q-901).
+
+Live data:
+
+- **A `live` load that fails is tried again** after a second, then two, doubling up to 30 s,
+  until one comes back, and the page keeps its data meanwhile. It had given up until the
+  next change, which a quiet table may never make. Only a failed connection, a 408, a 429
+  and a 5xx are tried again, never before their `Retry-After`; another 4xx, a page that is
+  not the server's answer (a sign-in page) and the loader's own failure (its error, or a
+  run past `--max-compute`) are said and not tried again. The tries leave `waiting()` false,
+  so a page that shows a spinner while waiting keeps its data; a load for new arguments
+  stays waiting until it comes (Q-899).
+- Quillo's own answer that a `server fn` failed is marked `x-quillo-answer: failed`, so a
+  program's `reply 500 {...}` or `respond(500, ...)` is tried again and the loader's own
+  error is not (Q-899).
+- **The server answers a page's socket close at once**, with the page's code. It read
+  nothing a waiting page sent, so a close waited for the next 5 s check, and Firefox then
+  held new sockets back for 10 to 45 s and more: a visitor moving between pages at an
+  ordinary pace heard no change meanwhile (Q-900).
+- A page keeps its socket as its topics change (moving between the pages of a single-page
+  app) and sends the new topics down it; it closed it and opened another for each page. A
+  server that does not take topics this way, an older one during a deploy or one on
+  Windows, gets a new socket as before (Q-900).
+- A socket that has not opened within 3 s goes on trying while plain requests carry the
+  changes, and takes over when it opens, with no change missed or shown twice. With no
+  socket to be had, sockets are tried again later each time, up to every 30 s; the plain
+  requests back off, wait for a `Retry-After`, and stop at a 4xx other than 408 and 429; a
+  page that falls behind says so once in the console, at the third failure, or at once when
+  it is refused (Q-900).
+- A write tells many waiting pages sooner, and idle pages cost less: 1,000 pages on one topic
+  are all told within 9 to 14 ms, where they took 16 to 31, and 1,000 idle pages use 0.12 s
+  of the server's CPU a minute, where they used 0.50 (Q-900).
+
+Navigation:
+
+- **A `navigate` after a wait is dropped if the page moved meanwhile**, by a link, Back or
+  Forward, or a run that started later (the user's decision): a save that answered after
+  the person had gone to another page moved them anyway. It still goes when only the
+  component that asked has gone, as a modal does whose Save closes it. On a page that never
+  reads `url()`, a link or form the browser follows counts as moving, so a late `navigate`
+  no longer cancels the page the person asked for (Q-902).
+
 ## 0.8.1 (2026-11-09)
 
 - SQLite 3.54.1 (rusqlite 0.41, libsqlite3-sys 0.39.1), for RUSTSEC-2026-0459 (CVE-2026-119375):
