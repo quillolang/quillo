@@ -7970,7 +7970,7 @@ function delegated(ev) {
 // `follows`: the key reads state, and the rows follow it (see below).
 function each(list, key, row, follows) {
   return new Html((c, out) => {
-    const st = { rows: [], end: null, made: 0, size: 0, get nodes() { const a = []; for (const r of this.rows) for (const n of r.nodes) a.push(n); return a; } };
+    const st = { rows: [], end: null, made: 0, size: 0, failing: false, failed: false, get nodes() { const a = []; for (const r of this.rows) for (const n of r.nodes) a.push(n); return a; } };
     const svg = c.svg;
     let first = true;
     // Rows are their own scopes, not their owner's: they come and go
@@ -7982,17 +7982,20 @@ function each(list, key, row, follows) {
     // (found in review of 0851ec8; FEEDBACK61.md, Q-889; branch feedback61).
     onCleanup(() => { for (const r of st.rows) dispose(r.scope); rowsGone(st); });
     effect(() => {
+      // Whether the run before had a key that failed (see `keyOf`).
+      st.failed = st.failing;
+      st.failing = false;
       const items = iter(list());
       // A key that reads other state (`${ver}:${x}`) is read as the list is, and makes its rows
       // again when that changes, as a `key` outside a list does. Read where nothing is heard, it
       // waited for the list's next change (FEEDBACK61.md, Q-895; branch feedback61). Others are
       // read as before, where nothing is heard.
-      const ks = follows ? items.map(first ? (x) => keyOf(key, x) : key) : null;
+      const ks = follows ? keysOf(st, items, key) : null;
       untrack(() => {
         if (!first) { reconcile(st, items, key, ks, row, svg); return; }
         first = false;
         const at = out.length, inTable = c.claim && (c.p.localName === "table" || c.p.__qb);
-        st.rows = items.map((x, i) => newRow(x, ks ? ks[i] : key ? keyOf(key, x) : i, row, c, out));
+        st.rows = items.map((x, i) => newRow(x, ks ? ks[i] : key ? keyOf(st, key, x) : i, row, c, out));
         st.end = document.createTextNode("");
         st.end.__part = st;
         partsMade++;
@@ -8009,9 +8012,23 @@ function each(list, key, row, follows) {
 // A row's key as the list is first made: one that fails is said, and the row has a key no other
 // has, so the list is made whole and its next run makes that row again. The list was left empty
 // for good, a later run making its rows where nothing showed them (FEEDBACK61.md, Q-895's review of
-// 06cda99; branch feedback61). A key that fails later leaves the list as it was, as before.
-function keyOf(key, x) {
-  try { return key(x); } catch (e) { report(e); return {}; }
+// 06cda99; branch feedback61). So on every run, not only the first: a key that failed then left the
+// list as it was, so an item whose key always fails held it still, rows added or taken away showing
+// only once that item went. It is said once in a run of runs that fail, and only its row is made
+// again each time (FEEDBACK61.md, Q-895's recheck of 19727f3, the coordinator's decision, for the
+// user to confirm; branch feedback61).
+function keyOf(st, key, x) {
+  try {
+    return key(x);
+  } catch (e) {
+    if (!st.failed && !st.failing) report(e);
+    st.failing = true;
+    return {};
+  }
+}
+// The keys of all `items`: read as they were, each through `keyOf` only once one fails.
+function keysOf(st, items, key) {
+  try { return items.map(key); } catch (e) { return items.map((x) => keyOf(st, key, x)); }
 }
 
 // A list taken up in a table, its nodes all in the parser's <tbody> once one of its rows is: the
@@ -8026,6 +8043,17 @@ function inOneBody(out, at) {
   if (i > j) return;
   const b = out[i].parentNode;
   while (out[j].parentNode !== b) j--;
+  // An element out of it too: a list of rows and <tbody>s (or <thead>s), which the parser split
+  // among several. Its markers went into the first, and its rows were added, emptied and moved
+  // there alone (`1,11,G2,3,4`, a <tbody> in a <tbody>): it is made again, as before, so that its
+  // rows stand in one parent (FEEDBACK61.md, Q-940's recheck of 19727f3; branch feedback61).
+  let el = null;
+  for (let k = at; k < i && !el; k++) if (out[k].nodeType === 1) el = out[k];
+  for (let k = j + 1; k < out.length && !el; k++) if (out[k].nodeType === 1) el = out[k];
+  if (el) {
+    if (DEV) wanted = [el, "rows in one <tbody>"]; // dev
+    throw new Mismatch("element");
+  }
   for (let k = at; k < i; k++) if (out[k].nodeType !== 1) b.insertBefore(out[k], out[i]);
   for (let k = out.length - 1; k > j; k--) if (out[k].nodeType !== 1) b.insertBefore(out[k], out[j].nextSibling);
 }
@@ -8178,7 +8206,7 @@ function reconcile(st, items, key, ks, row, svg) {
   const keys = ks || new Array(n);
   let same = n === w;
   for (let i = 0; i < n; i++) {
-    const k = ks ? ks[i] : key ? key(items[i]) : i;
+    const k = ks ? ks[i] : key ? keyOf(st, key, items[i]) : i;
     if (!ks) keys[i] = k;
     if (same && old[i].key !== k) same = false;
   }

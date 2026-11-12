@@ -4335,6 +4335,10 @@ route GET /b = <html><head><title>t</title></head><body><Host now={false}/></bod
 // good, a later run making its rows where nothing showed them. It is said, the list is made whole,
 // and the next run makes that row again; a key that fails later leaves the list as it was, as
 // before. A key that reads state, and one that does not.
+// Changed in the recheck of 19727f3 (the coordinator's refined L2 decision, for the user to
+// confirm): a key that fails later no longer leaves the list as it was, it is keyed as at the first
+// run, so `bad` shows `5,0` where it kept `3,4` (see
+// an_item_whose_key_always_fails_leaves_its_list_live).
 #[test]
 fn a_key_that_fails_as_the_list_is_first_made_is_said_and_the_list_is_whole() {
     let src = r###"component Throw(start: list) {
@@ -4363,7 +4367,7 @@ route GET /b = <html><head><title>t</title></head><body><Host now={false}/></bod
     for (r, path) in rs.iter().zip(BOTH) {
         let zero = "division by zero";
         let want = serde_json::json!({
-            "start": "1,0|1,0", "saidFirst": 2, "fix": "3,4|3,4", "bad": "3,4|3,4", "remade": 0, "errors": [zero, zero, zero, zero],
+            "start": "1,0|1,0", "saidFirst": 2, "fix": "3,4|3,4", "bad": "5,0|5,0", "remade": 0, "errors": [zero, zero, zero, zero],
         });
         assert_eq!(r, &want, "at {}", path);
     }
@@ -4674,5 +4678,120 @@ fn a_parents_function_run_as_a_childs_handler_is_the_parents_code() {
     let Some(rs) = in_pages("q901-prop-handlers", PROP_HANDLERS, BOTH, body) else { return };
     for (r, path) in rs.iter().zip(BOTH) {
         assert_eq!(r, &serde_json::json!({ "modal": [1, 1], "button": [1, 1], "remade": 0, "errors": [] }), "at {}", path);
+    }
+}
+
+// ---- Slice 4b's recheck (19727f3) ------------------------------------------------------------------
+
+// A list taken up in a table whose items are rows and <tbody>s (or <thead>s): the parser puts the
+// rows on either side of such an item in <tbody>s of its own, and 19727f3 moved the list's later
+// markers and its end into the first, where it then added, emptied and moved alone (`1,11,G2,3,4`,
+// `G2,3,4` left, a <tbody> in a <tbody>; with the item first, insertBefore failed). Such a list is
+// made again, as before, as main does; a list of rows beside it in another component is still
+// taken up, typing kept. The item in the middle, first and last; under --watch too (what it says).
+const MIXED: &str = r###"component Mixed(start: list) {
+    state xs = start
+    state added = 0
+    <div>
+        <table #g>{for x in xs => x.g ? <tbody class="g" key={x.id}><tr><td>G{x.id}</td></tr></tbody> : <tr key={x.id}><td>{x.id}</td></tr>}</table>
+        <table #t>{for x in xs => x.g ? <thead key={x.id}><tr><td>H{x.id}</td></tr></thead> : <tr key={x.id}><td>{x.id}</td></tr>}</table>
+        <button #back @click={() => { added += 1; xs = xs + [{ id: 10 + added, g: false }] }}>back</button>
+        <button #rev @click={() => { xs = reverse(xs) }}>rev</button>
+        <button #clear @click={() => { xs = [] }}>clear</button>
+    </div>
+}
+component Plain() {
+    state ys = [{ id: 1, on: false }, { id: 2, on: true }, { id: 3, on: true }]
+    <div><table #p>{for y in ys => y.on ? <tr key={y.id}><td><input/>{y.id}</td></tr> : null}</table>
+    <button #prev @click={() => { ys = reverse(ys) }}>prev</button></div>
+}
+fn items(gs: list) = [1, 2, 3, 4] | map((i) => { id: i, g: contains(gs, i) })
+component Host(now: bool, gs: list) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Mixed start={items(gs)}/> : null}<Plain/></div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true} gs={[2]}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false} gs={[2]}/></body></html>
+route GET /hf = <html><head><title>t</title></head><body><Host now={true} gs={[1]}/></body></html>
+route GET /hl = <html><head><title>t</title></head><body><Host now={true} gs={[4]}/></body></html>
+"###;
+
+#[test]
+fn a_taken_up_list_of_rows_and_tbodies_is_made_again_whole() {
+    let body = r##"    const rows = (id) => [...$(id).querySelectorAll("tr")].map((r) => r.textContent).join(",") + ($(id).querySelector("tbody tbody, tbody thead") ? " NESTED" : "");
+    const both = () => rows("g") + " | " + rows("t");
+    for (const i of $("p").querySelectorAll("input")) i.value = "t" + i.parentNode.textContent;
+    const out = { remadeAtLoad: QW.remade ?? 0, load: both() };
+    await click("back"); out.back = both();
+    await click("rev"); out.rev = both();
+    await click("clear"); out.clear = both();
+    await click("prev"); out.plain = [...$("p").rows].map((r) => r.textContent + "=" + r.querySelector("input").value).join(",");
+    return out;"##;
+    let want = |made: u32, load: &str, back: &str, rev: &str| {
+        let two = |s: &str| format!("{} | {}", s, s.replace('G', "H"));
+        serde_json::json!({
+            "remadeAtLoad": made, "load": two(load), "back": two(back), "rev": two(rev), "clear": " | ", "plain": "3=t3,2=t2",
+            "remade": made, "errors": [],
+        })
+    };
+    let paths = ["/h", "/b", "/hf", "/hl"];
+    let wants = [
+        want(1, "1,G2,3,4", "1,G2,3,4,11", "11,4,3,G2,1"),
+        want(0, "1,G2,3,4", "1,G2,3,4,11", "11,4,3,G2,1"),
+        want(1, "G1,2,3,4", "G1,2,3,4,11", "11,4,3,2,G1"),
+        want(1, "1,2,3,G4", "1,2,3,G4,11", "11,G4,3,2,1"),
+    ];
+    let Some(rs) = in_pages("mixed-table-list", MIXED, &paths, body) else { return };
+    for ((r, path), w) in rs.iter().zip(paths).zip(&wants) {
+        assert_eq!(r, w, "at {}", path);
+    }
+    let Some(rs) = in_pages_args("mixed-table-list-watch", MIXED, &["/h"], body, false, &["--watch"]) else { return };
+    assert_eq!(rs[0], wants[0], "under --watch");
+}
+
+// The refined L2 decision (the coordinator's, for the user to confirm): an item whose key always
+// fails held its list still after its first change, rows added or dropped showing only once that
+// item went. Keys are read so on every run: the failure is said once in a run of runs that fail
+// (again once a run with none has come between), only that row is made again each time, and the
+// list stays live. A key that reads state, and one that does not.
+#[test]
+fn an_item_whose_key_always_fails_leaves_its_list_live() {
+    let src = r###"component Bad() {
+    state xs = [1, 0, 2]
+    state ver = 1
+    <div>
+        <ul #p>{for x in xs => <li key={10 / x}><input/>{x}</li>}</ul>
+        <ul #f>{for x in xs => <li key={`${ver}:${10 / x}`}><input/>{x}</li>}</ul>
+        <button #add @click={() => { xs = xs + [len(xs) + 2] }}>add</button>
+        <button #drop @click={() => { xs = drop(xs, 1) }}>drop</button>
+        <button #fix @click={() => { xs = xs | filter((x) => x != 0) }}>fix</button>
+        <button #zero @click={() => { xs = xs + [0] }}>zero</button>
+    </div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Bad/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"    const rows = () => ["p", "f"].map((id) => [...$(id).querySelectorAll("li")].map((l) => l.textContent + "=" + l.querySelector("input").value).join(",")).join(" | ");
+    document.querySelectorAll("input").forEach((f) => (f.value = "t"));
+    const said = () => window.__quilloErrors.length;
+    const out = { load: rows(), e0: said() };
+    await click("add"); out.add = rows(); out.e1 = said();
+    await click("drop"); out.drop = rows();
+    await click("fix"); out.fix = rows(); out.e2 = said();
+    await click("zero"); out.zero = rows(); out.e3 = said();
+    return out;"##;
+    let Some(rs) = in_pages("key-always-fails", src, BOTH, body) else { return };
+    let two = |s: &str| format!("{} | {}", s, s);
+    let zero = "division by zero";
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            "load": two("1=t,0=t,2=t"), "e0": 2, "add": two("1=t,0=,2=t,5="), "e1": 2, "drop": two("0=,2=t,5="), "fix": two("2=t,5="), "e2": 2,
+            "zero": two("2=t,5=,0="), "e3": 4, "remade": 0, "errors": [zero, zero, zero, zero],
+        });
+        assert_eq!(r, &want, "at {}", path);
     }
 }
