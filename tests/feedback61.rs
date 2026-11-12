@@ -2650,3 +2650,156 @@ fn a_plain_request_that_fails_while_a_socket_connects_is_tried_again() {
     let Some(rs) = in_pages("q900-retry", PAGES_MOVED, &["/never/a"], &body) else { return };
     assert_eq!(rs[0], serde_json::json!({ "seen": true, "asks": true, "apart": true, "made": 1, "remade": 0, "errors": [] }));
 }
+
+// ---- Who a timer belongs to (Q-901, the review of e2eb410; the user's decision of 2026-11-12) ----
+
+// The user's decision ("Component keeps it"): a timer, an `every` or a `listen` that an event
+// handler starts belongs to the component whose code the handler is, so it outlives the row or the
+// branch holding the button: a stopwatch whose Start is in a branch ticks on once the branch hides.
+// One started by an `@mount`, by a timer's own callback, or by a branch's own code ends with its
+// element, as before e2eb410, where they had gone to the component: an `every` in each row's `@mount`
+// piled up as rows came and went (an interval for every row ever shown), a `listen` in each filled
+// the browser's six connections to the site so a `server fn` went unanswered, a toast's `@mount`
+// timer hid the next toast of the same name early, and what a branch's timer started outlived the
+// branch. A parent's callback that a child's own `if` calls keeps its timer, as one a child's
+// handler calls does.
+const OWNERS: &str = r###"route GET /ticks/:n = events((send) => {
+    for i in range(100000) {
+        send(i)
+        sleep(100)
+    }
+})
+server fn ping() -> str { "pong" }
+component Counting(on_done) {
+    state left = 2
+    every(30, () => { left -= 1 })
+    if left == 0 { on_done() }
+    <p>{left}</p>
+}
+component Board(note) {
+    state gen = 0
+    state rows = [1, 2, 3, 4, 5]
+    state toasts = []
+    state polling = false
+    state panel = true
+    state counting = false
+    state notice = ""
+    state answer = ""
+    if polling { run_after(60, () => { note("c1"); run_after(150, () => { note("c2") }) }) }
+    <div>
+        <ul #rows>{for x in rows => <li key={x} @mount={(el) => { every(200, () => { note("tick") }) }}>{x}</li>}</ul>
+        <ul #streams>{for x in [gen] => <li key={x} @mount={(el) => { listen(`/ticks/${x}`, (n) => { note("msg") }) }}>s{x}</li>}</ul>
+        <button #regen @click={() => { gen += 1; rows = rows | map((x) => x + 10) }}>regen</button>
+        <button #ping @click={() => { answer = ping() }}>ping</button><p #answer>{answer}</p>
+        <ul #toasts>{for t in toasts => <li key={t} class="toast" @mount={(el) => { run_after(600, () => { toasts = toasts | filter((x) => x != t) }) }}>{t}<button class="dismiss" @click={() => { toasts = toasts | filter((x) => x != t) }}>x</button></li>}</ul>
+        <button #save @click={() => { toasts = toasts + ["Saved"] }}>save</button>
+        <button #poll @click={() => { polling = true }}>poll</button><button #stop @click={() => { polling = false }}>stop</button>
+        {panel ? <div><button #start @click={() => { every(40, () => { note("sw") }) }}>start</button></div> : null}
+        <button #hide @click={() => { panel = false }}>hide</button>
+        {counting ? <Counting on_done={() => { counting = false; notice = "done"; run_after(150, () => { notice = "" }) }}/> : null}
+        <button #count @click={() => { counting = true }}>count</button>
+        <p #notice>{notice}</p>
+    </div>
+}
+component Host(now: bool) {
+    state on = now
+    state log = []
+    let note = (s) => { log = log + [s] }
+    <div><button #show @click={() => { on = true }}>show</button><button #off @click={() => { on = false }}>off</button>{on ? <Board {note}/> : null}<p #log>{join(log, ",")}</p></div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn a_timer_is_its_handlers_component_and_otherwise_its_parts() {
+    let body = r##"const n = (s) => $("log").textContent.split(",").filter((t) => t === s).length;
+    const until = async (f, ms) => { const t0 = performance.now(); while (!f() && performance.now() - t0 < ms) await tick(10); return f(); };
+    // Intervals and streams alive, from here on.
+    const si = window.setInterval, ci = window.clearInterval, mine = new Set();
+    window.setInterval = (f, ms, ...a) => { const id = si(f, ms, ...a); mine.add(id); return id; };
+    window.clearInterval = (id) => { mine.delete(id); return ci(id); };
+    const real = window.fetch.bind(window); let open = 0;
+    window.fetch = (u, init) => { if (String(u).includes("/ticks/")) { open++; if (init && init.signal) init.signal.addEventListener("abort", () => open--); } return real(u, init); };
+    const out = {};
+    // Rows whose `@mount` starts an `every`, and a `listen`, made again eight times.
+    for (let k = 0; k < 8; k++) { await click("regen"); await tick(40); }
+    await tick(300);
+    out.intervals = mine.size; out.streams = open;
+    { const t0 = performance.now(); await click("ping"); out.ping = (await until(() => $("answer").textContent === "pong", 4000)) && performance.now() - t0 < 4000; }
+    // A toast hides itself 600 ms after it shows; dismissed and shown again, the new one stays 600 ms.
+    await click("save"); await tick(200); document.querySelector(".dismiss").click(); await tick(30); await click("save");
+    { const t0 = performance.now(); await until(() => !document.querySelector(".toast"), 3000); out.toastMs = Math.round(performance.now() - t0) >= 500; }
+    // What a branch's timer starts goes with the branch.
+    await click("poll"); await until(() => n("c1") > 0, 2000); await click("stop"); await tick(400); out.branchTimer = [n("c1"), n("c2")];
+    // The decision: a stopwatch whose Start is in a branch ticks on once the branch hides.
+    await click("start"); await until(() => n("sw") > 2, 2000); await click("hide"); await tick(40); { const a = n("sw"); await tick(300); out.stopwatch = n("sw") > a + 2; }
+    // A parent's callback that a child's own `if` calls, and closes the child with: its notice clears.
+    await click("count"); await until(() => $("notice").textContent === "done", 3000); out.childIf = [$("notice").textContent, await until(() => $("notice").textContent === "", 1500)];
+    return out;"##;
+    let Some(rs) = in_pages("q901-owners", OWNERS, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            // Five rows' `every`, and the stopwatch's is not started yet.
+            "intervals": 5, "streams": 1, "ping": true, "toastMs": true, "branchTimer": [1, 0], "stopwatch": true,
+            "childIf": ["done", true], "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Q-899, the review of e2eb410: a program's own `reply 500 { error }`, or `respond(500, ...)`, was the
+// server's failure answer byte for byte, so a `live` load that got one was not tried again, where
+// q900 had tried it. The server marks its own now (`x-quillo-answer: failed`): the loader's own
+// error is shown once, and a 500 the program answers is tried again, as one whose mark a proxy
+// dropped is.
+const LIVE_500: &str = r###"let mode = 0
+server fn load_p() {
+    if mode == 1 {
+        let z = mode - 1
+        print(1 / z)
+    }
+    if mode == 5 { reply 500 { error: "upstream busy" } }
+    mode == 6 ? respond(500, { error: "upstream busy" }) : [mode]
+}
+component P() {
+    state r = live(load_p)
+    <p #p class={{ behind: waiting(r) }}>{r == null ? "none" : r[0]}</p>
+}
+route POST /t/mode/:m(int) { mode = m; "ok" }
+route GET /h = <html><head><title>t</title></head><body><P/></body></html>
+"###;
+
+#[test]
+fn a_programs_own_500_is_tried_again_and_the_servers_is_not() {
+    let body = r##"const real = window.fetch.bind(window);
+    let calls = 0, strip = false;
+    window.fetch = async (u, init) => {
+      if (!String(u).includes("/_quillo/rpc/load_p")) return real(u, init);
+      calls++;
+      const r = await real(u, init);
+      if (!strip) return r;
+      const h = new Headers(r.headers); h.delete("x-quillo-answer");
+      return new Response(await r.text(), { status: r.status, headers: h });
+    };
+    const set = (m) => real(`/t/mode/${m}`, { method: "POST" });
+    const shown = () => $("p").textContent;
+    const until = async (f, ms) => { const t0 = performance.now(); while (!f() && performance.now() - t0 < ms) await tick(20); return f(); };
+    const failing = async (m) => { const c = calls; await set(m); await until(() => calls > c, 3000); await tick(3000); const got = [shown(), $("p").classList.contains("behind"), calls - c]; await set(0); await until(() => shown() === "0", 8000); return got; };
+    const out = {};
+    await set(0); out.up = await until(() => shown() === "0", 3000);
+    out.reply500 = await failing(5);
+    out.respond500 = await failing(6);
+    out.own = await failing(1);
+    strip = true; out.stripped = await failing(1); strip = false;
+    out.reply500[2] = out.reply500[2] >= 2; out.respond500[2] = out.respond500[2] >= 2; out.stripped[2] = out.stripped[2] >= 2;
+    return out;"##;
+    let Some(rs) = in_pages("q899-500", LIVE_500, &["/h"], body) else { return };
+    let busy = "server fn `load_p` failed (500): upstream busy";
+    let own = "server fn `load_p` failed (500): internal error in `load_p`";
+    let want = serde_json::json!({
+        "up": true, "reply500": ["0", false, true], "respond500": ["0", false, true], "own": ["0", false, 1], "stripped": ["0", false, true],
+        "remade": 0, "errors": [busy, busy, own, own],
+    });
+    assert_eq!(rs[0], want);
+}

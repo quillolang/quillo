@@ -663,7 +663,7 @@ impl Interp {
             // Says this came from the server fn's own server, whatever it holds: `respond` and
             // `reply` answer as they like, and the page has to tell them from a sign-in page or a
             // proxy's (FEEDBACK49.md, Q-598; branch feedback61).
-            if rest.starts_with("rpc/") {
+            if rest.starts_with("rpc/") && !resp.headers.iter().any(|(k, _)| k == "x-quillo-answer") {
                 resp.headers.push(("x-quillo-answer".into(), "1".into()));
             }
             return resp;
@@ -1541,7 +1541,7 @@ impl Interp {
                 Err(Ctrl::Reply(r)) => render_response(&r),
                 Err(Ctrl::Error(e)) => {
                     eprintln!("quillo: error in server fn `{}`: {:#}", name, e);
-                    rpc_error(500, &rpc_failure(name, &e))
+                    rpc_failed(name, &e)
                 }
             };
         }
@@ -1590,7 +1590,7 @@ impl Interp {
                     Err(Ctrl::Reply(r)) => return render_response(&r),
                     Err(Ctrl::Error(e)) => {
                         eprintln!("quillo: error in server fn `{}`: {:#}", name, e);
-                        return rpc_error(500, &rpc_failure(name, &e));
+                        return rpc_failed(name, &e);
                     }
                 });
                 // Neither one that read the viewer nor one that acted (see `viewcache::Kind`) can be
@@ -2355,6 +2355,17 @@ fn rpc_error(status: u16, msg: &str) -> HttpResponse {
 /// what the log does; else only that it failed, the message being for the program's author
 /// (FEEDBACK64.md, Q-933; branch feedback64: it had said "internal error in `down`" under `--watch`
 /// too).
+/// A `server fn` that failed (its error, or a run past `--max-compute`), answered so: its words
+/// (see `rpc_failure`), with `x-quillo-answer: failed`, the server's own mark, which a page's `live`
+/// does not try again. A program's `reply 500 { error }` or `respond(500, ...)` is the same answer
+/// otherwise, and is the program's to mean: it had been taken for this, and not tried again
+/// (FEEDBACK61.md, Q-899's second review; branch feedback61).
+fn rpc_failed(name: &str, e: &crate::error::QuilloError) -> HttpResponse {
+    let mut r = rpc_error(500, &rpc_failure(name, e));
+    r.headers.push(("x-quillo-answer".into(), "failed".into()));
+    r
+}
+
 pub(crate) fn rpc_failure(name: &str, e: &crate::error::QuilloError) -> String {
     if SHOW_ERRORS.load(std::sync::atomic::Ordering::Relaxed) {
         format!("{:#}", e)

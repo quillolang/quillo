@@ -1710,8 +1710,8 @@ B.receive = meta(async (url, f, opts) => {
 B.listen = meta((url, f, inst) => {
   // In a component's code, or a handler or `@mount` of one, before or after a wait, where it lasts
   // as long as the component, as `every` does: it checked `Owner` alone, which a handler never has
-  // (FEEDBACK61.md, Q-901; branch feedback61). `inst` as `run_after`'s (Q-901's second review).
-  const own = Owner || inst || Acting;
+  // (FEEDBACK61.md, Q-901; branch feedback61). Whose it is: see `ownerOf`.
+  const own = ownerOf(inst);
   if (!own) fail("`listen` works in a component");
   if (own.dead) return null;
   S(url, "listen");
@@ -1751,14 +1751,12 @@ B.listen = meta((url, f, inst) => {
 // `run_after(ms, f)`: once, gone with the component (FEEDBACK28.md, Q-349; branch
 // feedback29-fixes).
 // `inst`: the component whose code calls it, which the compiler gives (see `call` in
-// src/client.rs): a parent's handler run from a child that it closes, a modal's Save, a row's
-// remove, keeps its timer, where the timer had belonged to the child and went with it
-// (FEEDBACK61.md, Q-901's second review; branch feedback61). The component's own code (`if running
-// { every(...) }`) keeps its timer to the code that called it.
+// src/client.rs), for whose the timer is (see `ownerOf`; FEEDBACK61.md, Q-901's second review;
+// branch feedback61).
 B.run_after = meta((ms, f, inst) => {
   ms = N(ms, "run_after");
   F(f, "run_after", 2);
-  const own = Owner || inst || Acting;
+  const own = ownerOf(inst);
   if (own && own.dead) return null;
   // What `f` starts (a `run_after`, an `every`, a `listen`) belongs to the component too, as what
   // `every`'s ticks and `listen`'s messages start does: it belonged to no one, and outlived the
@@ -1815,9 +1813,9 @@ B.cursor_index = meta((s, n) => Array.from(S(s, "cursor_index").slice(0, Math.ma
 const EVERY_STALLED = 30000;
 B.every = meta((ms, f, _opts, inst) => {
   // In a component, or a handler or `@mount` of one, as `run_after` (FEEDBACK28.md, Q-349;
-  // branch feedback29-fixes); `inst` as `run_after`'s (FEEDBACK61.md, Q-901's second review; branch
-  // feedback61).
-  const own = Owner || inst || Acting;
+  // branch feedback29-fixes); whose it is: see `ownerOf` (FEEDBACK61.md, Q-901's second review;
+  // branch feedback61).
+  const own = ownerOf(inst);
   if (!own) fail("`every` works in a component");
   if (own.dead) return null;
   ms = N(ms, "every");
@@ -5749,8 +5747,9 @@ async function rpcSend(name, args, live, idem) {
   // `status` (0: no connection, or a body cut short) and `after` (its Retry-After) tell a live load
   // whether, and when, to try again (FEEDBACK61.md, Q-899; branch feedback61).
   // `own`: the server's own answer that the function failed (its error, or its limit on computing),
-  // which trying again gives again (FEEDBACK61.md, Q-899's second review; branch feedback61).
-  const own = r.status === 500 && !!(r.headers && r.headers.get("x-quillo-answer")) && !!body && typeof body.error === "string";
+  // which trying again gives again, by the server's mark: a program's `reply 500 { error }` is the
+  // same answer but for it (FEEDBACK61.md, Q-899's second review; branch feedback61).
+  const own = r.status === 500 && !!r.headers && r.headers.get("x-quillo-answer") === "failed";
   if (!r.ok) return { ...failed(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`), unanswered: RETRIED.includes(r.status), status: r.status, after: r.headers && r.headers.get("retry-after"), own };
   // A 2xx that is no answer, a sign-in page a redirect led to, nothing, a body cut short, gave
   // `null` as if the call had worked. The server marks what it sends, since `respond` and `reply`
@@ -6095,6 +6094,31 @@ let Owner = null;
 // The component (or row) a handler or `@mount` running now belongs to, for what it
 // starts to end with it: `run_after` and `every`.
 let Acting = null;
+// Whether the code running now is an event handler's, after its waits too (see `ownerOf`).
+let Handling = false;
+
+// What a timer or a stream that code starts now belongs to (`run_after`, `every`, `listen`), as
+// the user decided (2026-11-12, "Component keeps it"): `inst` is the component whose code it is
+// (the compiler gives it), `ctx` the part of the page the code runs for. A parent's code run by a
+// child (a modal's Save, a countdown's end, a parent's callback a child's own `if` calls): the
+// parent's. An event handler's, after its waits too: its component's, so a row deleted, or a
+// branch hidden, by the handler that then clears a notice keeps that timer. Otherwise (`@mount`, a
+// timer's or a stream's own callback, a branch's or a row's own code): the part's, ending with its
+// element, as before this slice; given to the component, an `@mount`'s timers piled up as rows came
+// and went, and its streams filled the browser's connections (FEEDBACK61.md, Q-901's review of
+// e2eb410; branch feedback61). Code with no component of its own (a plain `fn`) belongs to `ctx`.
+function ownerOf(inst) {
+  const ctx = Owner || Acting;
+  if (!inst || !ctx) return ctx || inst || null;
+  return Handling || compOf(ctx) !== inst ? inst : ctx;
+}
+
+// The component the scope `s` (a part of the page, a row) is in: a row's scope is no part of its
+// list's (see `newRow`), and names the list's as `host`.
+function compOf(s) {
+  while (s && !(s instanceof Inst)) s = s.up || s.host;
+  return s || null;
+}
 let effectQueue = [];
 let flushing = false;
 let calcIds = 0;
@@ -6310,8 +6334,10 @@ function flush() {
   let rounds = 0, jumps = 0;
   // An effect is a run of its own, also when `page_updated` brings this about inside one
   // (FEEDBACK55.md, Q-800; branch feedback55).
-  const run = Run;
+  const run = Run, wasH = Handling;
   Run = null;
+  // No effect is a handler's (see `ownerOf`).
+  Handling = false;
   while (effectQueue.length) {
     if (++rounds > 1000) {
       effectQueue = [];
@@ -6336,6 +6362,7 @@ function flush() {
     }
   }
   Run = run;
+  Handling = wasH;
   flushing = false;
 }
 
@@ -7499,8 +7526,9 @@ function fire(el, type, ev) {
   // again, and `e.value` would read that (FEEDBACK25.md, Q-304; branch feedback26-fixes).
   const t = ev.target;
   if (t && t.value !== undefined) { ev.$value = t.value; ev.$checked = !!t.checked; }
-  const was = Acting;
+  const was = Acting, wasH = Handling;
   Acting = el.__own || null;
+  Handling = true;
   // A handler is a run of its own, also when `el.click()` brings it about inside one
   // (FEEDBACK55.md, Q-800; branch feedback55).
   const run = Run;
@@ -7512,6 +7540,7 @@ function fire(el, type, ev) {
     report(e);
   } finally {
     Acting = was;
+    Handling = wasH;
     Run = run;
   }
   // An input shows the state's value even if the user typed something the
@@ -7720,6 +7749,8 @@ function newRow(x, k, row, c, out) {
   Owner = null;
   Listener = null;
   const sc = new Scope();
+  // Its list's scope, for `compOf` (FEEDBACK61.md, Q-901's review of e2eb410; branch feedback61).
+  sc.host = o;
   const r = { key: k, item: new Item(x, sc), scope: sc, nodes: null };
   Owner = r.scope;
   const got = [], made = partsMade;
@@ -8559,13 +8590,13 @@ W.settle = async (v) => {
 let Run = null;
 // What the code belongs to is taken up after a wait too: `w.a`, the part of the page it belongs to
 // (`Owner`, or a handler's `Acting`), for what `every`, `run_after` and `listen` start then to end
-// with it; `w.p`, what it was before, put back as the code waits again or ends. After a wait the
-// code had none: `every` refused to start, and a `run_after` outlived its component
-// (FEEDBACK61.md, Q-901; branch feedback61). It is the call's, not the run's, which a state of the
-// page keeps. A run's `nav`: when it began, among the page's moves (see `B.navigate`; Q-902).
-W.run = () => { const o = Run; return { r: (Run = o || { held: null, up: undefined, nav: ++Nav.runs }), o, y: false, a: Owner || Acting, p: undefined }; };
-W.off = (w, x) => { if (!w.y) { w.y = true; Run = w.o; w.o = null; if (w.p !== undefined) { Acting = w.p; w.p = undefined; } } return x; };
-W.on = (w, v) => { w.y = false; Run = w.r; w.p = Acting; Acting = w.a; return v; };
+// with it, and `w.h`, whether it is an event handler's (see `ownerOf`); `w.p` and `w.q`, what they
+// were before, put back as the code waits again or ends. After a wait the code had none: `every`
+// refused to start, and a `run_after` outlived its component (FEEDBACK61.md, Q-901; branch
+// feedback61). It is the call's, not the run's, which a state of the page keeps. A run's `nav`: when it began, among the page's moves (see `B.navigate`; Q-902).
+W.run = () => { const o = Run; return { r: (Run = o || { held: null, up: undefined, nav: ++Nav.runs }), o, y: false, a: Owner || Acting, h: Handling, p: undefined, q: false }; };
+W.off = (w, x) => { if (!w.y) { w.y = true; Run = w.o; w.o = null; if (w.p !== undefined) { Acting = w.p; Handling = w.q; w.p = undefined; } } return x; };
+W.on = (w, v) => { w.y = false; Run = w.r; w.p = Acting; w.q = Handling; Acting = w.a; Handling = w.h; return v; };
 // Whether `r`, or a run that called it, has claimed `s` for a call.
 function claimedBy(s, r) {
   for (; r; r = r.up) if (r.held !== null && r.held.has(s)) return true;
