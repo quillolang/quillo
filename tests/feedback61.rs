@@ -219,8 +219,17 @@ fn in_pages_with(name: &str, src: &str, paths: &[&str], body: &str, focus: bool)
     in_pages_args(name, src, paths, body, focus, &[])
 }
 
+/// The same, each page given `ms` (60 s otherwise), for one that waits out an outage.
+fn in_pages_for(name: &str, src: &str, paths: &[&str], body: &str, focus: bool, ms: u64) -> Option<Vec<serde_json::Value>> {
+    in_pages_given(name, src, paths, body, focus, &[], ms)
+}
+
 /// The same, with options for the server (`--watch`, for development bundles).
 fn in_pages_args(name: &str, src: &str, paths: &[&str], body: &str, focus: bool, args: &[&str]) -> Option<Vec<serde_json::Value>> {
+    in_pages_given(name, src, paths, body, focus, args, 60_000)
+}
+
+fn in_pages_given(name: &str, src: &str, paths: &[&str], body: &str, focus: bool, args: &[&str], ms: u64) -> Option<Vec<serde_json::Value>> {
     let app = App::new(name, src);
     checked(&app.0);
     let Some(chrome) = chrome() else {
@@ -264,7 +273,7 @@ fn in_pages_args(name: &str, src: &str, paths: &[&str], body: &str, focus: bool,
             .arg(&chrome)
             .arg(format!("http://127.0.0.1:{}{}", port, path))
             .arg(app.0.join("profile"))
-            .arg("60000")
+            .arg(ms.to_string())
             .arg(app.0.join("t.js"))
             .output()
             .expect("node");
@@ -1996,8 +2005,10 @@ fn a_clients_places_come_back_as_its_pages_close() {
 
 /// Two pages following different tables, moved between by links (the page reads `url()`). A script in
 /// the head counts the page's sockets; at `/never` they never open, at `/late` each opens 5 s after it
-/// is made (as a browser holding sockets back lets one through), at `/fails` the first never opens
-/// and fails at 4 s (as a browser's own limit ends one), and at `/old` the server's word
+/// is made (as a browser holding sockets back lets one through), at `/fails` the first two never open
+/// and fail at 4 s (as a browser's own limit ends one, or a network refusing sockets slowly), at
+/// `/outage` sockets and plain requests fail after `?d=` ms once the page sets `__down` (a proxy
+/// whose upstream is down answers 504 after its connect timeout), and at `/old` the server's word
 /// that a socket takes topics is taken out of its messages, as from a server that does not say it
 /// (an older one, or one that cannot watch its sockets).
 const PAGES_MOVED: &str = r###"db.open("moves.db")
@@ -2028,7 +2039,8 @@ component App() {
 }
 let count = "window.__made = 0; window.__heard = 0; { const Real = WebSocket; window.WebSocket = class extends Real { constructor(...a) { super(...a); window.__made++; this.addEventListener('message', () => { window.__heard++; }); } }; }"
 let never = "window.__made = 0; window.WebSocket = class { constructor() { window.__made++; this.readyState = 0; } send() {} close() { this.readyState = 3; } };"
-let fails = "window.__made = 0; window.__failed = 0; { const Real = WebSocket; window.WebSocket = class { constructor(u) { window.__made++; if (window.__made > 1) return new Real(u); this.readyState = 0; setTimeout(() => { if (this.readyState === 3) return; window.__failed = performance.now(); this.readyState = 3; if (this.onclose) this.onclose({ code: 1006 }); }, 4000); } send() {} close() { this.readyState = 3; } }; }"
+let fails = "window.__made = 0; window.__failed = []; window.__madeAt = []; { const Real = WebSocket; window.WebSocket = class { constructor(u) { window.__made++; window.__madeAt.push(performance.now()); if (window.__made > 2) return new Real(u); this.readyState = 0; setTimeout(() => { if (this.readyState === 3) return; window.__failed.push(performance.now()); this.readyState = 3; if (this.onclose) this.onclose({ code: 1006 }); }, 4000); } send() {} close() { this.readyState = 3; } }; }"
+let outage = "window.__made = 0; window.__asks = []; window.__down = false; window.__socks = []; { const d = +new URLSearchParams(location.search).get('d') || 0; const Real = WebSocket, realFetch = window.fetch.bind(window); window.WebSocket = class { constructor(u) { window.__made++; if (!window.__down) { const r = new Real(u); window.__socks.push(r); return r; } this.readyState = 0; setTimeout(() => { if (this.readyState === 3) return; this.readyState = 3; if (this.onclose) this.onclose({ code: 1006 }); }, d); } send() {} close() { this.readyState = 3; } }; window.fetch = (u, init) => { if (window.__down && String(u).includes('/_quillo/live?')) { window.__asks.push(performance.now()); return new Promise((ok) => setTimeout(() => ok(new Response('down', { status: 504 })), d)); } return realFetch(u, init); }; }"
 let late = "window.__made = 0; window.__opened = 0; { const Real = WebSocket; window.WebSocket = class { constructor(u) { window.__made++; this.readyState = 0; setTimeout(() => { if (this.readyState === 3) return; const r = this.r = new Real(u); r.onopen = (e) => { this.readyState = 1; window.__opened = performance.now(); if (this.onopen) this.onopen(e); }; r.onmessage = (e) => { if (this.onmessage) this.onmessage(e); }; r.onclose = (e) => { this.readyState = 3; if (this.onclose) this.onclose(e); }; }, 5000); } send(d) { if (this.r) this.r.send(d); } close() { this.readyState = 3; if (this.r) this.r.close(); } }; }"
 let old = "window.__made = 0; { const Real = WebSocket; window.WebSocket = class extends Real { constructor(...a) { super(...a); window.__made++; } set onmessage(f) { super.onmessage = (m) => f({ data: String(m.data).replace(',\"takes\":\"topics\"', '') }); } }; }"
 fn page(head: str) = <html><head><title>t</title><script>{raw(head)}</script></head><body><App/></body></html>
@@ -2038,6 +2050,7 @@ route GET /m/:x = page(count)
 route GET /never/:x = page(never)
 route GET /late/:x = page(late)
 route GET /fails/:x = page(fails)
+route GET /outage/:x = page(outage)
 route GET /old/:x = page(old)
 "###;
 
@@ -2616,21 +2629,99 @@ fn a_change_wakes_the_pages_parked_on_it_and_a_busy_one_finds_it_next() {
 
 // Found while fixing the review's F2: a socket that failed without opening, after plain requests had
 // begun to carry the changes, was followed by one more plain request before the next socket, which
-// waited up to 25 s with no change, so a page whose held socket timed out stayed off sockets for 29 s
-// once the network was back. The next socket is made at once now.
+// waited up to 25 s with no change. The second review: made again at once, it ended the request that
+// carried the changes, and the page heard nothing for the next socket's first 3 s. The plain requests
+// go on now across the failed socket, and the next socket is made after a while, longer each time
+// (decided by the coordinator after that review).
 #[test]
-fn a_socket_that_fails_while_plain_requests_carry_the_changes_is_made_again_at_once() {
+fn a_socket_that_fails_while_plain_requests_carry_the_changes_leaves_them_carrying() {
     let body = format!(
         r##"{MOVES_JS}
-    for (let i = 0; i < 400 && window.__made < 2; i++) await tick(20);
-    const again = window.__made < 2 ? null : Math.round(performance.now() - window.__failed);
-    await tick(500);
+    for (let i = 0; i < 400 && window.__failed.length < 1; i++) await tick(10);
+    if (!window.__failed.length) return {{ failed: false }};
+    // Right after the socket failed: told by the request that goes on.
     await write("a", 3);
-    const seen = await until("a", 3, 3000);
-    return {{ madeAgainAtOnce: again !== null && again < 1000, seen: seen !== null, made: window.__made }};"##
+    const first = await until("a", 3, 6000);
+    for (let i = 0; i < 1000 && window.__made < 3; i++) await tick(20);
+    // Each next socket after a while, longer each time; the third opens and takes over.
+    const gaps = [window.__madeAt[1] - window.__failed[0], window.__madeAt[2] - window.__failed[1]].map(Math.round);
+    for (let i = 0; i < 100 && !(window.__made >= 3); i++) await tick(20);
+    await tick(1000);
+    await write("a", 4);
+    const second = await until("a", 4, 3000);
+    return {{ toldAtOnce: first !== null && first < 1500, firstWait: gaps[0] >= 400 && gaps[0] <= 3500, secondWait: gaps[1] >= 900 && gaps[1] <= 6500, bySocket: second !== null && second < 1000, made: window.__made }};"##
     );
     let Some(rs) = in_pages("q900-fails", PAGES_MOVED, &["/fails/a"], &body) else { return };
-    assert_eq!(rs[0], serde_json::json!({ "madeAgainAtOnce": true, "seen": true, "made": 2, "remade": 0, "errors": [] }));
+    assert_eq!(rs[0], serde_json::json!({ "toldAtOnce": true, "firstWait": true, "secondWait": true, "bySocket": true, "made": 3, "remade": 0, "errors": [] }));
+}
+
+// Found in the second review of Q-900: when sockets and plain requests both failed, slowly (a proxy
+// whose upstream is down answers 504 after its connect timeout, 5 s here), each socket was made again
+// at once, every 5 s for good, and the page never said it was behind. Now the sockets come later each
+// time, the requests too, and the page says so once; as it did when they failed at once (`d=0`, the
+// control). Afterwards the page catches up, and the first plain request answered ends the wait for the
+// next socket, which opens.
+#[test]
+fn an_outage_whose_requests_fail_slowly_is_waited_out_and_said() {
+    let body = format!(
+        r##"{MOVES_JS}
+    const span = location.search.includes("d=0") ? 15000 : 32000;
+    window.__down = true;
+    const m0 = window.__made;
+    for (const s of window.__socks) s.close();
+    await tick(span);
+    const sockets = window.__made - m0, asks = window.__asks.length;
+    const said = (window.__quilloErrors || []).filter((e) => /not reaching this page/.test(e)).length;
+    window.__down = false;
+    await write("a", 9);
+    const back = await until("a", 9, 50000);
+    // The plain request answered again ends the wait for the next socket.
+    const open = () => window.__socks.some((s) => s.readyState === 1);
+    for (let i = 0; i < 500 && !open(); i++) await tick(20);
+    return {{ sockets, asks, said, back: back !== null, socketBack: open() }};"##
+    );
+    let Some(rs) = in_pages_for("q900-outage", PAGES_MOVED, &["/outage/a?d=5000", "/outage/a?d=0"], &body, false, 120_000) else { return };
+    for (r, (most, path)) in rs.iter().zip([(4, "slow"), (6, "at once")]) {
+        let (sockets, asks) = (r["sockets"].as_u64().unwrap(), r["asks"].as_u64().unwrap());
+        assert!((2..=most).contains(&sockets) && (2..=most).contains(&asks), "{}: {}", path, r);
+        assert_eq!((&r["said"], &r["back"], &r["socketBack"], &r["remade"]), (&serde_json::json!(1), &serde_json::json!(true), &serde_json::json!(true), &serde_json::json!(0)), "{}: {}", path, r);
+    }
+}
+
+// The plain requests made while there is no socket follow the live loop's rules: a refusal waits for
+// its Retry-After and is said at once, and a 4xx, or an answer that is no answer (a sign-in page), is
+// said at once and not asked again (found in the second review of Q-900).
+#[test]
+fn plain_requests_while_a_socket_connects_take_retry_after_and_drop_a_4xx() {
+    let body = format!(
+        r##"{MOVES_JS}
+    const real = window.fetch.bind(window), asks = [];
+    const mode = location.search.slice(3);
+    window.fetch = (u, init) => {{
+      if (String(u).includes("/_quillo/live?")) {{
+        asks.push(performance.now());
+        if (asks.length === 1 && mode === "busy") return Promise.resolve(new Response("busy", {{ status: 503, headers: {{ "retry-after": "4" }} }}));
+        if (mode === "403") return Promise.resolve(new Response("no", {{ status: 403 }}));
+        if (mode === "page") return Promise.resolve(new Response("<html>sign in</html>", {{ status: 200, headers: {{ "content-type": "text/html" }} }}));
+      }}
+      return real(u, init);
+    }};
+    // The pages share the server's table: each writes one more than it shows.
+    const before = $("va").textContent, next = +before + 1;
+    await write("a", next);
+    if (mode === "busy") {{
+      const seen = await until("a", next, 12000);
+      return {{ seen: seen !== null, waited: asks.length >= 2 && asks[1] - asks[0] >= 3900 }};
+    }}
+    await tick(9000);
+    return {{ asks: asks.length, told: $("va").textContent !== before }};"##
+    );
+    let paths = ["/never/a?m=busy", "/never/a?m=403", "/never/a?m=page"];
+    let Some(rs) = in_pages("q900-refused", PAGES_MOVED, &paths, &body) else { return };
+    let said = "live updates are not reaching this page: the server is not taking them";
+    assert_eq!(rs[0], serde_json::json!({ "seen": true, "waited": true, "remade": 0, "errors": [said] }));
+    assert_eq!(rs[1], serde_json::json!({ "asks": 1, "told": false, "remade": 0, "errors": [said] }));
+    assert_eq!(rs[2], serde_json::json!({ "asks": 1, "told": false, "remade": 0, "errors": [said] }));
 }
 
 // While a socket connects, a plain request that fails (a 503, or no connection) is tried again after a

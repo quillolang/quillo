@@ -5870,14 +5870,18 @@ function liveTell(key) {
 }
 
 async function liveLoop() {
-  // Tries in a row that came to nothing, and whether the page was told.
-  let fails = 0;
+  // Tries in a row that came to nothing, and whether the page was told (see `liveFailed`).
+  const st = { fails: 0, said: false, back: null };
+  // The plain requests carrying the changes while there is no socket (`liveCarrier`), and the sockets
+  // in a row that did not open meanwhile.
+  let carrier = null, socks = 0;
   for (;;) {
     const topics = liveTopics();
     // Topics too long for an address go after it, in the socket's first message or a POST's
     // body, where the server refused the address and the page never heard of a change
     // (FEEDBACK55.md, Q-801; branch feedback55).
     Live.key = liveKey(topics);
+    if (carrier && carrier.key !== Live.key) { carrier.stop(); carrier = null; }
     if (!topics.length) { Live.running = false; return; }
     const ctrl = (Live.ctrl = new AbortController());
     const t = encodeURIComponent(Live.key), later = t.length > LIVE_IN_URL, key = Live.key;
@@ -5886,82 +5890,132 @@ async function liveLoop() {
     // the last told it.
     const url = () => BASE + "/_quillo/live?since=" + Live.seq + "&s=" + Live.server + "&tk=1" + (later ? "&tm=1" : "&t=" + t);
     const plain = (signal) => wireFetch(url(), later ? { method: "POST", body: key, signal, cache: "no-store" } : { signal, cache: "no-store" });
-    // What a refusal asks for: a server that is full says when to try again.
-    let after = 0;
+    const carry = { start: () => { if (!carrier || carrier.stopped) carrier = liveCarrier(key, plain, st); }, stop: () => { if (carrier) carrier.stop(); carrier = null; } };
+    let wait;
     try {
-      const got = await liveSocket(url(), ctrl.signal, later ? key : null, plain);
-      // One that closed while plain requests carried the changes is made again at once: another
-      // plain request first held the next socket back for as long as it waited, 25 s with no change.
-      if (got === null) { fails = 0; continue; }
-      if (got) fails = 0;
-      else if (!ctrl.signal.aborted) {
-        const r = await plain(ctrl.signal);
-        if (r.ok) { liveChanged(readJSON(await r.text())); fails = 0; continue; }
-        after = (Number(r.headers.get("retry-after")) || 0) * 1000;
-        fails++;
+      if (await liveSocket(url(), ctrl.signal, later ? key : null, carry)) {
+        if (ctrl.signal.aborted) continue;
+        // It opened, and has closed: a server that restarts must not have every page at once, so
+        // each waits a second or so, spread out (FEEDBACK24.md, Q-194; branch feedback24-fixes).
+        st.fails = socks = 0;
+        st.said = false;
+        wait = 1000;
+      } else {
+        if (ctrl.signal.aborted) continue;
+        // It did not open. The plain requests carry the changes, and go on while the next socket
+        // is made, later each time, up to half a minute: they wait by their own rules, a refusal's
+        // Retry-After and longer after each failure, and say once that the page is behind. A socket
+        // that failed after 3 s or more was made again at once, and an outage whose requests failed
+        // slowly (a proxy's 504 after its connect timeout) was asked again every 5 s for good,
+        // never said; one that a slow refusal of sockets ended took the request that carried the
+        // changes with it (found in review of FEEDBACK61.md, Q-900; branch feedback61).
+        carry.start();
+        socks++;
+        wait = Math.min(1000 * 2 ** socks, 30000);
       }
     } catch (e) {
-      fails++;
+      liveFailed(st, false);
+      wait = Math.min(1000 * 2 ** st.fails, 30000);
     }
-    if (ctrl.signal.aborted) continue;
-    // A page that stays behind has to be seen (FEEDBACK24.md, Q-189), once. A
-    // refusal is plain at once; a failed try may be a moment's.
-    if (fails === (after ? 1 : 3)) report("live updates are not reaching this page: the server is not taking them");
-    // All at once after a restart is what a restart must not be: each page waits
-    // a second or so, spread out, and longer each time it fails
-    // (FEEDBACK24.md, Q-194; branch feedback24-fixes).
-    const wait = Math.max(after, Math.min(1000 * 2 ** fails, 30000));
-    await new Promise((r) => setTimeout(r, wait * (0.5 + Math.random())));
+    // A plain request that is answered again after failures ends the wait: the server is back.
+    if (await liveWait(Math.max(carrier ? carrier.after : 0, wait * (0.5 + Math.random())), ctrl.signal, st)) socks = 0;
   }
+}
+
+// Counts a try that came to nothing, and says so once a run of them: a refusal (`plainly`: one with a
+// Retry-After, or one not asked again) at once, a failure that may be a moment's at the third
+// (FEEDBACK24.md, Q-189). The run ends with a try that comes to something.
+function liveFailed(st, plainly) {
+  st.fails++;
+  if (st.said || !(plainly || st.fails >= 3)) return;
+  st.said = true;
+  report("live updates are not reaching this page: the server is not taking them");
+}
+
+// Waits `ms`, or until `signal` ends it (the page's topics changed), or `st.back` (see
+// `liveCarrier`), which makes it resolve true.
+function liveWait(ms, signal, st) {
+  return new Promise((r) => {
+    const back = () => end(true);
+    const end = (v) => { clearTimeout(t); if (st && st.back === back) st.back = null; r(v); };
+    const t = setTimeout(() => end(false), ms);
+    if (signal) signal.addEventListener("abort", () => end(false));
+    if (st) st.back = back;
+  });
+}
+
+// The plain requests that carry the changes while the page has no socket, one after another, from
+// what the last told it, by the live loop's rules: a failure waits a second or so, longer each time up
+// to half a minute, spread out, and a refusal at least its Retry-After; both are counted and said as
+// the loop says them (`st`); and a 4xx other than 408 and 429, or an answer that is not one (a sign-in
+// page), is said at once and not asked again: what carries the changes then is the next socket. They end when a socket opens, when
+// the topics change, or with `stop` (FEEDBACK61.md, Q-900; branch feedback61).
+function liveCarrier(key, plain, st) {
+  const c = { key, stopped: false, after: 0, ctrl: null };
+  c.stop = () => { c.stopped = true; if (c.ctrl) c.ctrl.abort(); };
+  (async () => {
+    for (let fails = 0; !c.stopped; ) {
+      c.ctrl = new AbortController();
+      let refused = false;
+      try {
+        const r = await plain(c.ctrl.signal);
+        if (r.ok) {
+          const j = readJSON(await r.text());
+          if (c.stopped) return;
+          liveChanged(j);
+          // Answered after failures: the server is back, and the next socket need wait no more.
+          const back = st.fails > 0 && st.back;
+          fails = st.fails = c.after = 0;
+          st.said = false;
+          if (back) back();
+          continue;
+        }
+        if (c.stopped) return;
+        c.after = (Number(r.headers.get("retry-after")) || 0) * 1000;
+        refused = r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429;
+      } catch (e) {
+        if (c.stopped) return;
+        // An answer that is not one (a sign-in page) is not asked again; no connection is.
+        refused = e instanceof SyntaxError;
+      }
+      fails++;
+      liveFailed(st, c.after > 0 || refused);
+      if (refused) { c.stopped = true; return; }
+      await liveWait(Math.max(c.after, Math.min(1000 * 2 ** fails, 30000) * (0.5 + Math.random())), null);
+    }
+  })();
+  return c;
 }
 
 // The longest a live request's topics are in its address (see `liveLoop`).
 const LIVE_IN_URL = 6000;
 
-// Resolves when the socket closes: true if it had opened, null if it had not but plain requests
-// had begun. `first`: the topics, sent once it has.
-// While one has not opened, from 3 s on, the plain request (`plain`) carries the changes, one after
-// another, and the socket goes on connecting; once it opens, the request on its way is ended and the
-// socket takes over. What it says first is from what the page knew as it was made, so a change the
-// requests told is not missed across the switch, and is not loaded again by a page whose loads are
-// newer (see `liveChanged`). A socket the browser held back left the page with nothing for as long as
-// the browser held it (FEEDBACK61.md, Q-900; branch feedback61); one closed at 3 s, still connecting,
-// had Firefox hold back the next as long again, and eight tabs whose sockets were cut at once were
-// off them for 25 to 55 s (found in review).
-function liveSocket(url, signal, first, plain) {
+// Resolves when the socket closes: true if it had opened. `first`: the topics, sent once it has.
+// While one has not opened, from 3 s on, plain requests carry the changes (`carry`, see
+// `liveCarrier`), and the socket goes on connecting; once it opens, the request on its way is ended
+// and the socket takes over. What it says first is from what the page knew as it was made, so a change
+// the requests told is not missed across the switch, and is not loaded again by a page whose loads
+// are newer (see `liveChanged`). A socket the browser held back left the page with nothing for as
+// long as the browser held it (FEEDBACK61.md, Q-900; branch feedback61); one closed at 3 s, still
+// connecting, had Firefox hold back the next as long again, and eight tabs whose sockets were cut at
+// once were off them for 25 to 55 s (found in review).
+function liveSocket(url, signal, first, carry) {
   return new Promise((resolve) => {
     if (typeof WebSocket !== "function" && !(WIRE && WIRE.socket)) return resolve(false);
     const ws = openSocket(url);
-    let opened = false, over = false, asking = null, asked = false;
+    let opened = false, over = false;
     const done = (v) => {
       over = true;
       clearTimeout(late);
-      if (asking) asking.abort();
       if (Live.ws === ws) Live.ws = null;
       resolve(v);
     };
-    const late = setTimeout(async () => {
-      for (let fails = 0; !opened && !over; ) {
-        asking = new AbortController();
-        asked = true;
-        try {
-          const r = await plain(asking.signal);
-          const j = r.ok ? readJSON(await r.text()) : null;
-          if (opened || over) return;
-          if (j) { liveChanged(j); fails = 0; continue; }
-        } catch (e) {
-          if (opened || over) return;
-        }
-        // Refused, or no connection: again in a while, longer each time, as `liveLoop` waits.
-        fails++;
-        await new Promise((r) => setTimeout(r, Math.min(1000 * 2 ** fails, 30000) * (0.5 + Math.random())));
-      }
-    }, 3000);
+    const late = setTimeout(() => carry.start(), 3000);
     ws.onopen = () => {
       if (over) return;
       opened = true;
       clearTimeout(late);
-      if (asking) asking.abort();
+      carry.stop();
       if (first !== null) ws.send(first);
     };
     ws.onmessage = (m) => {
@@ -5971,7 +6025,7 @@ function liveSocket(url, signal, first, plain) {
       if (j.takes === "topics") Live.ws = ws;
       liveChanged(j);
     };
-    ws.onclose = () => done(opened || (asked ? null : false));
+    ws.onclose = () => done(opened);
     // Carry on at once: a closing socket finishes closing in its own time
     // (the browser waits for the server's answer), and says nothing more.
     signal.addEventListener("abort", () => {
