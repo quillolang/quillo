@@ -1891,7 +1891,10 @@ const MAX_TOPICS_HEAD: usize = 128;
 /// What a waiting page sent, read now that it rang: a page that moves to a page following other
 /// topics sends them down the socket it has, as a line `since=N&s=S` and the topics as its address
 /// would give them, where it opened a socket for each page (FEEDBACK61.md, Q-900; branch
-/// feedback61). Another text message is passed over, as before; the last set sent counts. Not
+/// feedback61). Another text message is passed over, as before; the last set sent counts. A message
+/// longer than the most a page follows ends the socket, as a first message does (`ws::Heard::Gone`),
+/// so its page opens another and is told there, where it was passed over and the page, taking its
+/// topics for followed, heard nothing of them (found in review). Not
 /// inlined into the waiting thread's frame, which would hold its reader's buffers (see
 /// `ws::Socket::heard`).
 #[inline(never)]

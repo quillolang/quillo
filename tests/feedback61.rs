@@ -1797,6 +1797,9 @@ fn a_close_is_answered_at_once_with_its_code() {
         ("no code", vec![], vec![]),
         ("1005, never sent", code(1005), code(1002)),
         ("one byte", vec![3], code(1002)),
+        // Longer than a control frame may be (RFC 6455 §5.5): failed with 1002, where it went
+        // unanswered (found in review).
+        ("126 bytes", { let mut c = code(1000); c.resize(126, b'r'); c }, code(1002)),
     ];
     for (name, theirs, ours) in cases {
         let mut p = live_ws(s.port, &q).unwrap();
@@ -1903,7 +1906,9 @@ fn topics_sent_down_the_open_socket_are_followed() {
     s.bump("f");
     assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!(["f"]));
     // Past the address's limit, up to the most a page follows (as `tm=1` takes them), the line
-    // before them counted: taken. One byte more: passed over, the topics as they were.
+    // before them counted: taken. One byte more: the socket is let go, as a first message that long
+    // is (decided by the coordinator after review), with a close of 1009 when it is read before the
+    // connection ends, so that its page opens another and is told there.
     const MOST: usize = 128 + 256 * (448 * 3 + 1);
     let longest = ",".repeat(448);
     let mut topics = vec!["q900:t"];
@@ -1912,14 +1917,15 @@ fn topics_sent_down_the_open_socket_are_followed() {
     let key = live_key(&topics);
     let at_limit = format!("{}{}{}", line, key, ",".repeat(MOST - line.len() - key.len()));
     assert_eq!(at_limit.len(), MOST);
-    p.text(&format!("{},", at_limit));
-    assert_eq!(p.told(Duration::from_secs(1)), None, "one byte more");
-    s.bump("f");
-    assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!(["f"]));
     p.text(&at_limit);
     assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!([]));
     s.bump("q900:t");
     assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!(["q900:t"]));
+    p.text(&format!("{},", at_limit));
+    if let Some(f) = p.frame(Duration::from_secs(2)) {
+        assert_eq!(f, (0x8, 1009u16.to_be_bytes().to_vec()), "one byte more");
+    }
+    assert!(p.ended(Duration::from_secs(2)), "one byte more: the socket stays");
     // The form that worked: topics as the first message of a socket opened with `tm=1`.
     let mut later = live_ws(s.port, &format!("since={}&s=&tm=1", s.seq())).unwrap();
     later.text("g");
@@ -1983,7 +1989,9 @@ fn a_clients_places_come_back_as_its_pages_close() {
 }
 
 /// Two pages following different tables, moved between by links (the page reads `url()`). A script in
-/// the head counts the page's sockets; at `/never` they never open, and at `/old` the server's word
+/// the head counts the page's sockets; at `/never` they never open, at `/late` each opens 5 s after it
+/// is made (as a browser holding sockets back lets one through), at `/fails` the first never opens
+/// and fails at 4 s (as a browser's own limit ends one), and at `/old` the server's word
 /// that a socket takes topics is taken out of its messages, as from a server that does not say it
 /// (an older one, or one that cannot watch its sockets).
 const PAGES_MOVED: &str = r###"db.open("moves.db")
@@ -2014,12 +2022,16 @@ component App() {
 }
 let count = "window.__made = 0; window.__heard = 0; { const Real = WebSocket; window.WebSocket = class extends Real { constructor(...a) { super(...a); window.__made++; this.addEventListener('message', () => { window.__heard++; }); } }; }"
 let never = "window.__made = 0; window.WebSocket = class { constructor() { window.__made++; this.readyState = 0; } send() {} close() { this.readyState = 3; } };"
+let fails = "window.__made = 0; window.__failed = 0; { const Real = WebSocket; window.WebSocket = class { constructor(u) { window.__made++; if (window.__made > 1) return new Real(u); this.readyState = 0; setTimeout(() => { if (this.readyState === 3) return; window.__failed = performance.now(); this.readyState = 3; if (this.onclose) this.onclose({ code: 1006 }); }, 4000); } send() {} close() { this.readyState = 3; } }; }"
+let late = "window.__made = 0; window.__opened = 0; { const Real = WebSocket; window.WebSocket = class { constructor(u) { window.__made++; this.readyState = 0; setTimeout(() => { if (this.readyState === 3) return; const r = this.r = new Real(u); r.onopen = (e) => { this.readyState = 1; window.__opened = performance.now(); if (this.onopen) this.onopen(e); }; r.onmessage = (e) => { if (this.onmessage) this.onmessage(e); }; r.onclose = (e) => { this.readyState = 3; if (this.onclose) this.onclose(e); }; }, 5000); } send(d) { if (this.r) this.r.send(d); } close() { this.readyState = 3; if (this.r) this.r.close(); } }; }"
 let old = "window.__made = 0; { const Real = WebSocket; window.WebSocket = class extends Real { constructor(...a) { super(...a); window.__made++; } set onmessage(f) { super.onmessage = (m) => f({ data: String(m.data).replace(',\"takes\":\"topics\"', '') }); } }; }"
 fn page(head: str) = <html><head><title>t</title><script>{raw(head)}</script></head><body><App/></body></html>
 route POST /t/a/:v(int) { db.exec("update a set v = ? where id = 1", v); "ok" }
 route POST /t/b/:v(int) { db.exec("update b set v = ? where id = 1", v); "ok" }
 route GET /m/:x = page(count)
 route GET /never/:x = page(never)
+route GET /late/:x = page(late)
+route GET /fails/:x = page(fails)
 route GET /old/:x = page(old)
 "###;
 
@@ -2059,12 +2071,52 @@ fn a_socket_that_never_opens_gives_way_to_the_plain_request() {
     const first = await until("a", 5, 8000);
     if (first === null) return {{ first, made: window.__made }};
     const at = Math.round(performance.now() - t0);
+    // The next change comes down the plain request already waiting, not after another socket's 3 s.
     await write("a", 6);
     const second = await until("a", 6, 8000);
-    return {{ firstAfter3s: at >= 2000 && at <= 6000, second: second !== null, made: window.__made >= 2 }};"##
+    return {{ firstAfter3s: at >= 2000 && at <= 6000, secondSoon: second !== null && second < 1500, made: window.__made }};"##
     );
     let Some(rs) = in_pages("q900-never", PAGES_MOVED, &["/never/a"], &body) else { return };
-    assert_eq!(rs[0], serde_json::json!({ "firstAfter3s": true, "second": true, "made": true, "remade": 0, "errors": [] }));
+    // The socket is never given up: it goes on connecting, as the browser has it.
+    assert_eq!(rs[0], serde_json::json!({ "firstAfter3s": true, "secondSoon": true, "made": 1, "remade": 0, "errors": [] }));
+}
+
+// Found in review of Q-900: a socket that had not opened in 3 s was closed, still connecting, and
+// Firefox, holding a host's sockets back after others failed, held the next as long again; eight tabs
+// whose sockets were cut at once stayed off them for 25 to 55 s. It is kept connecting now, the plain
+// request carrying the changes meanwhile, and takes over when it opens: the request on its way ends,
+// none is made after, and a change the requests told is neither missed nor loaded twice.
+#[test]
+fn a_socket_that_opens_late_takes_over_from_the_plain_request() {
+    let body = format!(
+        r##"{MOVES_JS}
+    const real = window.fetch.bind(window), asks = [], loads = [];
+    window.fetch = (u, init) => {{
+      const s = String(u);
+      if (s.includes("/_quillo/live?")) {{ const a = {{ at: performance.now(), ended: null }}; asks.push(a); const p = real(u, init); p.then(() => {{}}, () => {{ a.ended = "aborted"; }}); return p; }}
+      if (s.includes("/_quillo/rpc/load_a")) loads.push(performance.now());
+      return real(u, init);
+    }};
+    await write("a", 1);
+    const first = await until("a", 1, 8000);
+    for (let i = 0; i < 300 && !window.__opened; i++) await tick(20);
+    if (!window.__opened) return {{ first, opened: false, made: window.__made }};
+    await tick(1000);
+    await write("a", 2);
+    const second = await until("a", 2, 3000);
+    await tick(500);
+    return {{
+      byRequest: first !== null && asks.length > 0 && asks[0].at < window.__opened,
+      endedAsItOpened: asks.some((a) => a.ended === "aborted"),
+      requestsAfter: asks.filter((a) => a.at > window.__opened).length,
+      bySocket: second !== null && second < 1000,
+      loads: loads.length,
+      made: window.__made,
+    }};"##
+    );
+    let Some(rs) = in_pages("q900-late", PAGES_MOVED, &["/late/a"], &body) else { return };
+    let want = serde_json::json!({ "byRequest": true, "endedAsItOpened": true, "requestsAfter": 0, "bySocket": true, "loads": 2, "made": 1, "remade": 0, "errors": [] });
+    assert_eq!(rs[0], want);
 }
 
 #[test]
@@ -2082,9 +2134,11 @@ fn a_page_whose_server_does_not_take_topics_opens_a_socket_for_them() {
 
 // What a waiting page sends, read on a socket made here (`ws::Socket::heard`): a ping answered with
 // its pong and a pong dropped, between a message's parts too; a text message given as it comes, and
-// one passed over when it is longer than asked for, not masked, or has reserved bits set, or a new
-// message begins before it ends; a binary message, a stray part, and a control frame too long to be
-// one, passed over; a frame cut short for longer than it may take, and a page that hung up, gone.
+// one passed over when it is not masked, or has reserved bits set, or a new message begins before it
+// ends; a binary message and a stray part passed over; a frame cut short for longer than it may take,
+// and a page that hung up, gone. Since the review: a text message longer than asked for ends the
+// socket with 1009, and a control frame longer than one may be (a pong, a close) with 1002, where
+// both were passed over and a close of 126 bytes went unanswered.
 #[test]
 fn what_a_waiting_page_sends_is_read_as_it_comes() {
     use quillo::server::HttpRequest;
@@ -2141,15 +2195,25 @@ fn what_a_waiting_page_sends_is_read_as_it_comes() {
     c.read_exact(&mut pongs).unwrap();
     assert_eq!(pongs, [0x8a, 1, b'p', 0x8a, 1, b'q']);
     assert!(s.send("still writable"), "the socket is blocking again");
-    // At the limit, and one byte over it, in parts: the second passed over, then the next taken.
+    // At the limit, in parts too, and one byte over it, in parts: the socket ends with 1009, and
+    // what came after is not read.
     let mut w = ws_frame(0x1, true, &[b'x'; 16]);
+    w.extend(ws_frame(0x1, false, &[b'x'; 9]));
+    w.extend(ws_frame(0x0, true, &[b'x'; 7]));
     w.extend(ws_frame(0x1, false, &[b'y'; 10]));
     w.extend(ws_frame(0x0, true, &[b'y'; 7]));
     w.extend(ws_frame(0x1, true, b"next"));
-    let (_c, mut s) = page(&w);
+    let (mut c, mut s) = page(&w);
     assert_eq!(heard(&mut s), (Heard::Text(true), "x".repeat(16)));
-    assert_eq!(heard(&mut s).0, Heard::Text(false));
-    assert_eq!(heard(&mut s), (Heard::Text(true), "next".into()));
+    assert_eq!(heard(&mut s), (Heard::Text(true), "x".repeat(16)));
+    assert_eq!(heard(&mut s).0, Heard::Gone);
+    let ended = |c: &mut std::net::TcpStream| -> Vec<u8> {
+        c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut got = Vec::new();
+        let _ = c.read_to_end(&mut got);
+        got
+    };
+    assert_eq!(ended(&mut c), [0x88, 2, 0x03, 0xf1]);
     // Not masked, reserved bits set, or a new message before the last ended: passed over.
     let mut odd = ws_frame(0x1, true, b"rsv");
     odd[0] |= 0x40;
@@ -2163,12 +2227,22 @@ fn what_a_waiting_page_sends_is_read_as_it_comes() {
     assert_eq!(heard(&mut s).0, Heard::Text(false));
     assert_eq!(heard(&mut s).0, Heard::Text(false));
     assert_eq!(heard(&mut s), (Heard::Text(true), "ok".into()));
-    // A binary message, a stray part and a pong too long to be one: passed over, nothing told.
+    // A binary message and a stray part: passed over, nothing told.
     let mut w = ws_frame(0x2, true, b"bin");
     w.extend(ws_frame(0x0, true, b"stray"));
-    w.extend(ws_frame(0xA, true, &[b'z'; 200]));
     let (_c, mut s) = page(&w);
     assert_eq!(heard(&mut s), (Heard::Nothing, String::new()));
+    // A pong or a close of 126 bytes, one more than a control frame may have: the socket ends with
+    // 1002 (a protocol error). One of 125 is a close as any other, answered with its code.
+    for (op, len, want) in [(0xA, 126, 1002u16), (0x8, 126, 1002), (0x8, 125, 1000)] {
+        let mut data = 1000u16.to_be_bytes().to_vec();
+        data.resize(len, b'r');
+        let (mut c, mut s) = page(&ws_frame(op, true, &data));
+        assert_eq!(heard(&mut s).0, Heard::Gone, "{:x} of {}", op, len);
+        let mut close = vec![0x88, 2];
+        close.extend(want.to_be_bytes());
+        assert_eq!(ended(&mut c), close, "{:x} of {}", op, len);
+    }
     // A frame cut short, for longer than it may take: gone, and the connection shut.
     let full = ws_frame(0x1, true, b"cut short");
     let (mut c, mut s) = page(&full[..8]);
@@ -2457,4 +2531,122 @@ fn an_error_in_a_timers_callback_is_said_and_the_rest_goes_on() {
     let r = &rs[0];
     assert_eq!((&r["again"], &r["ticks"], &r["errors2"]), (&serde_json::json!(true), &serde_json::json!(true), &serde_json::json!(3)), "{}", r);
     assert!(r["errors"].as_array().unwrap().iter().all(|e| e.as_str().unwrap().contains("division by zero")), "{}", r);
+}
+
+// A page's thread waits on its own bell (src/shared.rs): a ring ends its wait at once, a change wakes
+// the pages parked on it, one page or several (handed to the thread that rings them), and a page busy
+// when the change came, not parked, is not rung but finds the change at its next wait. Found in review
+// of Q-900: each change handed its pages to that thread, though none was parked during sustained
+// writes, and the server spent 40% more; only parked pages are rung now.
+#[test]
+fn a_change_wakes_the_pages_parked_on_it_and_a_busy_one_finds_it_next() {
+    use quillo::shared::{Bell, Shared};
+    use std::sync::Arc;
+    let s = Arc::new(Shared::new());
+    let t = |n: &str| vec![n.to_string()];
+    s.publish(&t("x"));
+    let since = s.live_seq();
+    // Rung: the wait ends at once, with nothing changed, and the bell says so once.
+    let bell = Bell::new();
+    bell.bind();
+    let me = s.follow(t("x"), &bell);
+    let ringer = {
+        let b = bell.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            b.ring();
+        })
+    };
+    let began = Instant::now();
+    assert_eq!(me.wait(since, None, Duration::from_secs(10)), (since, Vec::new()));
+    assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+    ringer.join().unwrap();
+    assert!(bell.take() && !bell.take());
+    // Parked pages, one and then three: each woken by the change.
+    for n in [1usize, 3] {
+        let since = s.live_seq();
+        let pages: Vec<_> = (0..n)
+            .map(|_| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    let bell = Bell::new();
+                    bell.bind();
+                    let f = s.follow(vec!["y".to_string()], &bell);
+                    let began = Instant::now();
+                    let got = f.wait(since, None, Duration::from_secs(10));
+                    (got, began.elapsed())
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(200));
+        let made = s.publish(&t("y"));
+        for p in pages {
+            let ((seq, changed), took) = p.join().unwrap();
+            assert_eq!((seq, changed), (made, t("y")), "{} pages", n);
+            assert!(took < Duration::from_secs(5), "{} pages: {:?}", n, took);
+        }
+    }
+    // A page not parked when the change comes is not rung, and its next wait returns at once.
+    let since = s.live_seq();
+    let busy = s.follow(t("z"), &bell);
+    let other = Bell::new();
+    let parked = std::thread::spawn({
+        let s = s.clone();
+        let other = other.clone();
+        move || {
+            other.bind();
+            let f = s.follow(vec!["z".to_string()], &other);
+            f.wait(since, None, Duration::from_secs(10))
+        }
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let made = s.publish(&t("z"));
+    assert_eq!(parked.join().unwrap(), (made, t("z")));
+    let began = Instant::now();
+    assert_eq!(busy.wait(since, None, Duration::from_secs(10)), (made, t("z")));
+    assert!(began.elapsed() < Duration::from_millis(500), "{:?}", began.elapsed());
+    drop(me);
+}
+
+// Found while fixing the review's F2: a socket that failed without opening, after plain requests had
+// begun to carry the changes, was followed by one more plain request before the next socket, which
+// waited up to 25 s with no change, so a page whose held socket timed out stayed off sockets for 29 s
+// once the network was back. The next socket is made at once now.
+#[test]
+fn a_socket_that_fails_while_plain_requests_carry_the_changes_is_made_again_at_once() {
+    let body = format!(
+        r##"{MOVES_JS}
+    for (let i = 0; i < 400 && window.__made < 2; i++) await tick(20);
+    const again = window.__made < 2 ? null : Math.round(performance.now() - window.__failed);
+    await tick(500);
+    await write("a", 3);
+    const seen = await until("a", 3, 3000);
+    return {{ madeAgainAtOnce: again !== null && again < 1000, seen: seen !== null, made: window.__made }};"##
+    );
+    let Some(rs) = in_pages("q900-fails", PAGES_MOVED, &["/fails/a"], &body) else { return };
+    assert_eq!(rs[0], serde_json::json!({ "madeAgainAtOnce": true, "seen": true, "made": 2, "remade": 0, "errors": [] }));
+}
+
+// While a socket connects, a plain request that fails (a 503, or no connection) is tried again after a
+// while, longer each time, as the live loop waits, and the change comes with the next.
+#[test]
+fn a_plain_request_that_fails_while_a_socket_connects_is_tried_again() {
+    let body = format!(
+        r##"{MOVES_JS}
+    const real = window.fetch.bind(window), asks = [];
+    let refuse = 2;
+    window.fetch = (u, init) => {{
+      if (String(u).includes("/_quillo/live?")) {{
+        asks.push(performance.now());
+        if (refuse === 2) {{ refuse--; return Promise.resolve(new Response("busy", {{ status: 503 }})); }}
+        if (refuse === 1) {{ refuse--; return Promise.reject(new TypeError("Failed to fetch")); }}
+      }}
+      return real(u, init);
+    }};
+    await write("a", 4);
+    const seen = await until("a", 4, 15000);
+    return {{ seen: seen !== null, asks: asks.length >= 3, apart: asks.length >= 3 && asks[1] - asks[0] >= 400 && asks[2] - asks[1] >= 900, made: window.__made }};"##
+    );
+    let Some(rs) = in_pages("q900-retry", PAGES_MOVED, &["/never/a"], &body) else { return };
+    assert_eq!(rs[0], serde_json::json!({ "seen": true, "asks": true, "apart": true, "made": 1, "remade": 0, "errors": [] }));
 }

@@ -38,11 +38,14 @@ impl Drop for Socket {
 pub enum Heard {
     /// Nothing more has come.
     Nothing,
-    /// A text message, its parts given as they were read; false when it was passed over (longer
-    /// than asked for, or not masked as a page masks it), and what was given of it is to be dropped.
+    /// A text message, its parts given as they were read; false when it was passed over (not masked
+    /// as a page masks it, or a new message began before it ended), and what was given of it is to
+    /// be dropped.
     Text(bool),
     /// The page has gone: it closed (answered with a close of its code, and the connection shut),
-    /// hung up, or stopped in the middle of a frame for longer than it was given.
+    /// hung up, or stopped in the middle of a frame for longer than it was given; or it was let go,
+    /// with a close of 1009 for a text message longer than asked for, or of 1002 for a control frame
+    /// longer than one may be.
     Gone,
 }
 
@@ -87,8 +90,9 @@ impl Socket {
 
     /// What the page sent, read now: a ping is answered, a pong dropped, a close answered with a
     /// close of its code (RFC 6455 §5.5.1) and the connection shut, and a text message's parts are
-    /// given to `f` as they are read, never held whole, up to `max` bytes; a binary message, and
-    /// a frame of no message, are passed over, as a waiting page's frames always were. Once a frame
+    /// given to `f` as they are read, never held whole, up to `max` bytes (a longer one, or a control
+    /// frame longer than one may be, fails the connection); a binary message, and a frame of no
+    /// message, are passed over, as a waiting page's frames always were. Once a frame
     /// has begun, the rest of it may take `wait`. A page waiting for changes sends only pongs, its
     /// close and its topics, and a close the server took only at its next look, every 5 s, ended as
     /// 1006, a failed connection, after which Firefox held back the page's next socket for 10 to 45
@@ -162,8 +166,13 @@ impl Socket {
         let (mut taken, mut total, mut fin, mut mask, mut len) = (true, 0u64, fin, mask, len);
         loop {
             total = total.saturating_add(len);
+            // Longer than it may be: the connection is failed with 1009 (message too big), unread,
+            // as a first message too long is, where it was passed over and its page, which took it
+            // for followed, never heard of its topics (found in review of FEEDBACK61.md, Q-900;
+            // branch feedback61).
             if taken && total > max as u64 {
-                taken = false;
+                self.ending(Some(1009));
+                return Ok(Some(Heard::Gone));
             }
             match (taken, mask) {
                 (true, Some(m)) => self.unmasked(len, m, f)?,
@@ -226,9 +235,12 @@ impl Socket {
     /// A control frame: a ping answered, a pong (or one the page may not send) dropped, a close
     /// answered. True if the page has gone.
     fn control(&mut self, op: u8, mask: Option<[u8; 4]>, len: u64) -> std::io::Result<bool> {
+        // Longer than a control frame may be (RFC 6455 §5.5): the connection is failed with 1002,
+        // where it was passed over and a close of 126 bytes went unanswered (found in review of
+        // FEEDBACK61.md, Q-900; branch feedback61).
         if len > 125 {
-            self.skip(len)?;
-            return Ok(false);
+            self.ending(Some(1002));
+            return Ok(true);
         }
         let mut data = [0u8; 125];
         let data = &mut data[..len as usize];
@@ -254,6 +266,11 @@ impl Socket {
             [a, b, ..] => Some(u16::from_be_bytes([*a, *b])).filter(|c| matches!(c, 1000..=1003 | 1007..=1014 | 3000..=4999)).or(Some(1002)),
             [_] => Some(1002),
         };
+        self.ending(code);
+    }
+
+    /// A close of `code` (none: a close with no code), then the connection shut.
+    fn ending(&mut self, code: Option<u16>) {
         self.write_timeout(std::time::Duration::from_secs(2));
         match code {
             Some(c) => self.frame(0x8, &c.to_be_bytes()),

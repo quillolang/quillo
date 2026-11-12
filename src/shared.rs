@@ -189,6 +189,9 @@ pub struct Group {
     topics: Vec<String>,
     /// Their threads' bells, each rung by a change to the topics, outside the `live` lock.
     bells: Mutex<Vec<Arc<Bell>>>,
+    /// How many of them are parked, counted under the `live` lock before they park: a change wakes
+    /// a group only if some are (see `wake`).
+    parked: AtomicUsize,
 }
 
 impl Group {
@@ -204,8 +207,15 @@ impl Group {
 /// them all, as it did when one call woke a group, where a call a page took it 0.8 ms more for 200
 /// pages, and 0.05 ms for 8; one, here, which saves it the step to that thread (FEEDBACK61.md,
 /// Q-900; branch feedback61).
+///
+/// A group none of whose pages is parked is not rung at all: they are busy (telling their page, or
+/// gathering what follows a change) and look at the topics before they park again. Sustained writes
+/// to a topic two pages or more followed cost the server 40% more otherwise, a hand-off to that
+/// thread for each, where a group's one call cost nothing with no thread waiting on it (found in
+/// review).
 fn wake(groups: Vec<Arc<Group>>, pages: usize) {
     static RINGER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Vec<Arc<Group>>>>> = std::sync::OnceLock::new();
+    let groups: Vec<Arc<Group>> = groups.into_iter().filter(|g| g.parked.load(SeqCst) > 0).collect();
     if groups.is_empty() {
         return;
     }
@@ -539,7 +549,7 @@ impl Shared {
             g.bells.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(bell.clone());
             return Follower { shared: self.clone(), group: g.clone(), bell: bell.clone() };
         }
-        let group = Arc::new(Group { key: key.clone(), topics, bells: Mutex::new(vec![bell.clone()]) });
+        let group = Arc::new(Group { key: key.clone(), topics, bells: Mutex::new(vec![bell.clone()]), parked: AtomicUsize::new(0) });
         for t in &group.topics {
             live.by_topic.entry(t.clone()).or_default().push(group.clone());
         }
@@ -582,8 +592,11 @@ impl Follower {
             if left.is_zero() {
                 return (live.seq, now);
             }
+            // Counted before the lock is let go, so a change made after it rings this group.
+            g.parked.fetch_add(1, SeqCst);
             drop(live);
             std::thread::park_timeout(left);
+            g.parked.fetch_sub(1, SeqCst);
             live = self.shared.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
