@@ -4561,12 +4561,16 @@ impl<'a> Compiler<'a> {
             _ => None,
         };
         let key = row_key(body);
+        // Whether the key reads state (`${ver}:${x}`): then the list follows it (FEEDBACK61.md,
+        // Q-895; branch feedback61).
+        let mut key_reads = false;
         let key_js = match &key {
             Some(k) => {
                 self.push_scope();
-                let k = self.bind_pattern(pat, "$x", "`for` pattern does not match ").and_then(|binds| Ok((binds, self.reactive_expr(k)?.0)));
+                let k = self.bind_pattern(pat, "$x", "`for` pattern does not match ").and_then(|binds| Ok((binds, self.reactive_expr(k)?)));
                 self.pop_scope();
-                let (binds, k) = k?;
+                let (binds, (k, reads)) = k?;
+                key_reads = reads;
                 format!("($x) => {{ {}return {}; }}", binds, k)
             }
             None => "null".into(),
@@ -4601,7 +4605,7 @@ impl<'a> Compiler<'a> {
         };
         self.row = None;
         self.pop_scope();
-        Ok(format!("W.each(() => ({}), {}, ({}) => {{ {}return {}; }})", list, key_js, x, binds, row?))
+        Ok(format!("W.each(() => ({}), {}, ({}) => {{ {}return {}; }}{})", list, key_js, x, binds, row?, if key_reads { ", true" } else { "" }))
     }
 
     /// `match` in markup: the arm is chosen by the subject (a memo), and
@@ -5155,8 +5159,40 @@ impl<'a> Compiler<'a> {
 /// The key of a `for` row: its element's `key`; in a block, the block's statements, then that
 /// (they run in the key's function too, so the key may use them); in a choice (`? :`, `if`,
 /// `match`) of elements that each have a `key`, the same choice of their keys, as React keys them
-/// (FEEDBACK55.md, Q-759; branch feedback55).
+/// (FEEDBACK55.md, Q-759; branch feedback55). A branch that shows nothing (`if` with no `else`,
+/// `null`, `cond && ...`) needs no key, and has none (null), when another branch has one: the row
+/// is keyed by that. It was kept by place, and made again on every reorder, though its element had
+/// a key (FEEDBACK61.md, Q-897; branch feedback61).
 fn row_key(e: &Expr) -> Option<Expr> {
+    let nil = || Expr::Lit(Lit::Nil);
+    let nothing = |e: &Expr| matches!(e, Expr::Lit(Lit::Nil | Lit::Bool(false)));
+    let either = |a: &Expr, b: Option<&Expr>| -> Option<(Expr, Expr)> {
+        let b_nothing = b.is_none_or(nothing);
+        if nothing(a) && b_nothing {
+            return None;
+        }
+        let ka = if nothing(a) { nil() } else { row_key(a)? };
+        let kb = match b {
+            Some(b) if !nothing(b) => row_key(b)?,
+            _ => nil(),
+        };
+        Some((ka, kb))
+    };
+    match e {
+        Expr::If(c, a, b) => {
+            let (ka, kb) = either(a, b.as_deref())?;
+            return Some(Expr::If(c.clone(), Box::new(ka), Some(Box::new(kb))));
+        }
+        Expr::Binary(BinOp::And, c, a, _) => {
+            let (ka, kb) = either(a, None)?;
+            return Some(Expr::If(c.clone(), Box::new(ka), Some(Box::new(kb))));
+        }
+        Expr::Match(subj, arms, line) if arms.iter().any(|a| !nothing(&a.body)) => {
+            let arms = arms.iter().map(|a| Some(Arm { body: if nothing(&a.body) { nil() } else { row_key(&a.body)? }, ..a.clone() })).collect::<Option<Vec<_>>>()?;
+            return Some(Expr::Match(subj.clone(), arms, *line));
+        }
+        _ => {}
+    }
     match e {
         Expr::Html(el, _) => el.attrs.iter().find_map(|(n, v)| match (n.as_str(), v) {
             ("key", AttrVal::Expr(k)) => Some(k.clone()),
@@ -5167,11 +5203,6 @@ fn row_key(e: &Expr) -> Option<Expr> {
             Some((Stmt::Expr(x), before)) => Some(Expr::Block(before.iter().cloned().chain(std::iter::once(Stmt::Expr(row_key(x)?))).collect())),
             _ => None,
         },
-        Expr::If(c, a, Some(b)) => Some(Expr::If(c.clone(), Box::new(row_key(a)?), Some(Box::new(row_key(b)?)))),
-        Expr::Match(subj, arms, line) => {
-            let arms = arms.iter().map(|a| Some(Arm { body: row_key(&a.body)?, ..a.clone() })).collect::<Option<Vec<_>>>()?;
-            Some(Expr::Match(subj.clone(), arms, *line))
-        }
         _ => None,
     }
 }

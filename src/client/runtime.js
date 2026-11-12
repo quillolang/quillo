@@ -6653,7 +6653,11 @@ function caretSpan(was, now) {
   const n = Math.min(was.length, now.length);
   let p = 0, q = 0;
   while (p < n && same(was[p], now[p])) p++;
+  // Not between the halves of one character (an emoji): a pair is in or out whole (FEEDBACK61.md,
+  // Q-891's review; branch feedback61).
+  if (p > 0 && p < was.length && (was.charCodeAt(p - 1) & 0xfc00) === 0xd800) p--;
   while (q < n - p && same(was[was.length - 1 - q], now[now.length - 1 - q])) q++;
+  if (q > 0 && q < was.length && (was.charCodeAt(was.length - q) & 0xfc00) === 0xdc00) q--;
   return [p, q];
 }
 const caretIn = (was, now, at, p, q) => (at <= p ? at : at >= was.length - q ? now.length - (was.length - at) : now.length - q);
@@ -6663,7 +6667,9 @@ const caretIn = (was, now, at, p, q) => (at <= p ? at : at >= was.length - q ? n
 // program's value once that ends, after the input the end may bring (Firefox sends it after).
 const imeHeard = typeof document !== "undefined" && imeHear();
 function imeHear() {
-  document.addEventListener("compositionstart", (e) => { e.target.__ime = true; }, true);
+  // A start only from the browser itself: a page's own, which nothing ends, held the field. An end
+  // from anywhere (Chrome's for a commit is not marked trusted, and it only lets the field go).
+  document.addEventListener("compositionstart", (e) => { if (e.isTrusted) e.target.__ime = true; }, true);
   document.addEventListener("compositionend", (e) => {
     const el = e.target;
     el.__ime = false;
@@ -6899,6 +6905,7 @@ class Tmpl extends Html {
     maskNow = this.mask;
     try {
       if (c.claim) {
+        if (def.tpl[0] === "tr") intoBody(c);
         const el = c.n;
         claimEl(def.tpl, el, this.vals, svg);
         c.n = el.nextSibling;
@@ -6966,9 +6973,38 @@ function claimEl(tp, el, vals, svg) {
   for (const k of kids) {
     if (typeof k === "string") claimText(c, k);
     else if (typeof k === "number") showClaim(c, vals[k], k);
-    else { const n = c.n; claimEl(k, n, vals, sv); c.n = n.nextSibling; }
+    else {
+      if (k[0] === "tr") intoBody(c);
+      else outOfBody(c, box);
+      const n = c.n;
+      claimEl(k, n, vals, sv);
+      c.n = n.nextSibling;
+    }
   }
+  outOfBody(c, box);
   rest(box, c.n);
+}
+
+// Rows written straight into a <table>, as the server writes them: the HTML parser put them in a
+// <tbody> of its own, which no markup made, so the component was made again on each load, and
+// what was typed before the page was ready went. Taking them up steps into that <tbody>
+// (`intoBody`), and out of it where the table's markup goes on (`outOfBody`); the page keeps it
+// (FEEDBACK61.md, Q-940; branch feedback61). The served HTML is as it was.
+function intoBody(c) {
+  const n = c.n;
+  if (!n || c.p.localName !== "table") return;
+  // A comment the server marked a component with stays in the table; the rows after it went in.
+  const b = isMarked(n) && !markedEnd(n) ? n.nextSibling : n;
+  if (!b || b.localName !== "tbody" || b.attributes.length || b.__q) return;
+  if (b !== n) b.insertBefore(n, b.firstChild);
+  c.p = b;
+  c.n = b.firstChild;
+}
+function outOfBody(c, box) {
+  if (c.p !== box && c.n === null && c.p.parentNode === box) {
+    c.n = c.p.nextSibling;
+    c.p = box;
+  }
 }
 
 const live = (name) => name === "value" || name === "checked" || name === "selected";
@@ -7538,7 +7574,11 @@ function setProp(el, k, v, old) {
     // While a person composes text with an input method, the field is not written: that ended the
     // composition, and what was composed went in twice. The program's value is written once the
     // composition ends (FEEDBACK61.md, Q-939; branch feedback61).
-    if (typed && imeHeard && el.__ime) return;
+    // A field no longer focused is not being composed in (its end got lost, or was a page's own).
+    if (typed && imeHeard && el.__ime) {
+      if (el === document.activeElement) return;
+      el.__ime = false;
+    }
     if (el.value !== nv) {
       // The field being typed in keeps its caret in its text, after what was typed, when the
       // program writes it in capitals, leaves a key out or groups it (see `caretIn`). A write put
@@ -7659,6 +7699,10 @@ function fire(el, type, ev) {
   // Q-896; branch feedback61). What comes later still reaches a removed element's handlers (a
   // card's `dragend`, after the drop that took it to another list), and one that moves keeps them.
   if (removing) return;
+  // An input that says it is part of a composition marks its field as being composed in, one begun
+  // before this runtime came too, which no compositionstart told (FEEDBACK61.md, Q-939's review;
+  // branch feedback61).
+  if (type === "input" && ev.isComposing !== undefined && ev.target) ev.target.__ime = ev.isComposing;
   // The `select` the browser sends for Quillo's own caret, put back after a write (see `setProp`),
   // is not the person's: a handler had run on every key typed in the middle (FEEDBACK61.md,
   // Q-891's review; branch feedback61).
@@ -7802,7 +7846,8 @@ function delegated(ev) {
 // changed. Rows that must move are moved: the fewest that leave the others
 // in order, so a swap moves two and a removal none.
 
-function each(list, key, row) {
+// `follows`: the key reads state, and the rows follow it (see below).
+function each(list, key, row, follows) {
   return new Html((c, out) => {
     const st = { rows: [], end: null, made: 0, size: 0, get nodes() { const a = []; for (const r of this.rows) for (const n of r.nodes) a.push(n); return a; } };
     const svg = c.svg;
@@ -7817,11 +7862,16 @@ function each(list, key, row) {
     onCleanup(() => { for (const r of st.rows) dispose(r.scope); rowsGone(st); });
     effect(() => {
       const items = iter(list());
+      // A key that reads other state (`${ver}:${x}`) is read as the list is, and makes its rows
+      // again when that changes, as a `key` outside a list does. Read where nothing is heard, it
+      // waited for the list's next change (FEEDBACK61.md, Q-895; branch feedback61). Others are
+      // read as before, where nothing is heard.
+      const ks = follows ? items.map(key) : null;
       untrack(() => {
-        if (!first) { reconcile(st, items, key, row, svg); return; }
+        if (!first) { reconcile(st, items, key, ks, row, svg); return; }
         first = false;
         const at = out.length;
-        st.rows = items.map((x, i) => newRow(x, key ? key(x) : i, row, c, out));
+        st.rows = items.map((x, i) => newRow(x, ks ? ks[i] : key ? key(x) : i, row, c, out));
         st.end = document.createTextNode("");
         st.end.__part = st;
         partsMade++;
@@ -7973,16 +8023,17 @@ function moveNode(p, n, before) {
   p.insertBefore(n, before);
 }
 
-function reconcile(st, items, key, row, svg) {
+// `ks`: the items' keys, when `each` read them already.
+function reconcile(st, items, key, ks, row, svg) {
   const end = st.end, p = end.parentNode, n = items.length;
   if (!p) return;
   if (n === 0) { clearRows(st, p); return; }
   let old = st.rows, w = old.length;
-  const keys = new Array(n);
+  const keys = ks || new Array(n);
   let same = n === w;
   for (let i = 0; i < n; i++) {
-    const k = key ? key(items[i]) : i;
-    keys[i] = k;
+    const k = ks ? ks[i] : key ? key(items[i]) : i;
+    if (!ks) keys[i] = k;
     if (same && old[i].key !== k) same = false;
   }
   // Every row where it was (some items changed): nothing moves.
@@ -8387,6 +8438,7 @@ function remade(name) {
 
 // A component in its <quillo-island>: made, or taking up the page's; its nodes into `out`.
 function island(def, props, h, c, out) {
+  if (c.claim) intoBody(c);
   if (c.claim && isMarked(c.n)) { islandMarked(def, props, h, c, out); return; }
   let inst = new Inst(def, props, h && h.s, h && h.l);
   if (!c.claim && bareIn(c)) {

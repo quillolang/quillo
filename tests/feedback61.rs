@@ -3711,3 +3711,205 @@ fn what_a_part_starts_after_a_wait_it_did_not_outlast_is_refused() {
         assert_eq!(r, &want, "at {}", path);
     }
 }
+
+// ---- Slice 4: keys and tables (Q-895, Q-897, Q-940) ---------------------------------------------
+
+// Q-895: a `for` row's key that reads other state (`${ver}:${x}`) was worked out where nothing is
+// heard, so a new `ver` remade nothing, and an unrelated change of the list later remade every
+// row. The rows follow their key now, as a `key` outside a list does. The edges: a key of two
+// states, one row, no row, a unicode key, a key of the item alone (kept), the list touched after.
+#[test]
+fn a_row_key_that_reads_other_state_makes_its_rows_again_when_it_changes() {
+    let src = r###"component Ver() {
+    state ver = 1
+    state other = 0
+    state xs = [1, 2]
+    <div>
+        <ul #l>{for x in xs => <li key={`${ver}:${x}`}><input/>{x}</li>}</ul>
+        <ul #two>{for x in xs => <li key={`${ver}-${other}-${x}`}><input/>{x}</li>}</ul>
+        <ul #plain>{for x in xs => <li key={x}><input/>{x}</li>}</ul>
+        <ul #one>{for x in take(xs, 1) => <li key={`${ver}é${x}`}><input/>{x}</li>}</ul>
+        <ul #none>{for x in drop(xs, 9) => <li key={`${ver}${x}`}><input/>{x}</li>}</ul>
+        <div key={ver}><input #single/></div>
+        <button #ver @click={() => { ver += 1 }}>v</button>
+        <button #other @click={() => { other += 1 }}>o</button>
+        <button #touch @click={() => { xs = xs + [] }}>t</button>
+    </div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Ver/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"    const ins = (id) => [...$(id).querySelectorAll("input")];
+    const all = () => ["l", "two", "plain", "one", "none"].map((id) => ins(id).map((x) => x.value).join(",")).join("|") + "|" + $("single").value;
+    const fill = (v) => { for (const x of document.querySelectorAll("input")) x.value = v; };
+    fill("old");
+    await click("ver"); const out = { ver: all() };
+    fill("o2");
+    await click("touch"); out.touch = all();
+    await click("other"); out.other = all();
+    return out;"##;
+    let Some(rs) = in_pages("q895", src, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            "ver": ",|,|old,old|||", "touch": "o2,o2|o2,o2|o2,o2|o2||o2", "other": "o2,o2|,|o2,o2|o2||o2", "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Q-897: a row that is an `if` with no `else` (or `? :` with `null`, `cond && ...`, a `match` arm of
+// `null`) was kept by place, though its element had a key: every row was made again on a reorder,
+// what was typed and the focus gone. A branch that shows nothing needs no key, and the row is keyed
+// by the other. The edges: a row hidden and shown again (made afresh), and a choice whose other
+// branch has no key (by place, as before).
+#[test]
+fn a_row_that_shows_nothing_in_one_branch_is_keyed_by_the_other() {
+    let src = r###"component Filtered() {
+    state xs = [{ id: 1, on: true }, { id: 2, on: true }, { id: 3, on: false }]
+    <div>
+        <ul #a>{for x in xs { if x.on { <li key={x.id}><input/>{x.id}</li> } }}</ul>
+        <ul #b>{for x in xs => x.on ? <li key={x.id}><input/>{x.id}</li> : null}</ul>
+        <ul #c>{for x in xs => x.on && <li key={x.id}><input/>{x.id}</li>}</ul>
+        <ul #d>{for x in xs => match x.on { true => <li key={x.id}><input/>{x.id}</li>, _ => null }}</ul>
+        <ul #e>{for x in xs => x.on ? <li key={x.id}><input/>{x.id}</li> : <li><input/>{x.id}</li>}</ul>
+        <button #rev @click={() => { xs = reverse(xs) }}>rev</button>
+        <button #hide @click={() => { xs = xs | map((x) => x.id == 1 ? merge(x, { on: false }) : x) }}>hide</button>
+        <button #all @click={() => { xs = xs | map((x) => merge(x, { on: true })) }}>all</button>
+    </div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Filtered/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"    const rows = (id) => [...$(id).querySelectorAll("li")].map((li) => li.textContent + "=" + li.querySelector("input").value).join(",");
+    for (const id of ["a", "b", "c", "d", "e"]) { const f = $(id).querySelector("input"); f.value = "t" + id; }
+    const f = $("a").querySelector("input"); f.focus();
+    await click("rev");
+    const out = { rev: ["a", "b", "c", "d", "e"].map(rows).join("|"), focus: document.activeElement === f };
+    await click("hide", "all");
+    out.hideAll = ["a", "b", "c", "d"].map(rows).join("|");
+    return out;"##;
+    let Some(rs) = in_pages("q897", src, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            "rev": "2=,1=ta|2=,1=tb|2=,1=tc|2=,1=td|3=,2=,1=", "focus": true, "hideAll": "3=,2=,1=|3=,2=,1=|3=,2=,1=|3=,2=,1=",
+            "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Q-940: rows written straight into a <table> (no <tbody>, or after a <caption>) went into a <tbody>
+// the HTML parser makes, which no markup made, so the component was made again on every load. The
+// browser steps into that <tbody> as it takes them up, and out of it where the table goes on. The
+// edges: plain rows, one row's component, two rows', a list, rows then a <tfoot>, rows on both
+// sides of a <thead> (two such <tbody>s), no row, unicode; rows added after.
+#[test]
+fn rows_written_straight_into_a_table_are_taken_up() {
+    let src = r###"component Two(a: str) { [<tr class="t"><td>{a}1</td></tr>, <tr class="t"><td>{a}2</td></tr>] }
+component One(a: str) { <tr class="o"><td>{a}</td></tr> }
+component Rows(xs: list) { {for x in xs => <tr key={x}><td>{x}</td></tr>} }
+component Page() {
+    state n = 0
+    state xs = ["r1", "r2"]
+    <div>
+        <table #t1><Two a="x"/></table>
+        <table #t2><caption>c</caption><Two a="cap"/></table>
+        <table #t3><tr><td>{n}</td></tr><tr><td>b</td></tr></table>
+        <table #t4><One a="ünï"/></table>
+        <table #t5>{for x in xs => <tr key={x}><td>{x}</td></tr>}</table>
+        <table #t6><tr><td>top</td></tr><tfoot><tr><td>foot</td></tr></tfoot></table>
+        <table #t7><tr><td>a</td></tr><thead><tr><td>h</td></tr></thead><tr><td>z</td></tr></table>
+        <table #t8><Rows {xs}/></table>
+        <table #t9><Rows xs={[]}/></table>
+        <button #inc @click={() => { n += 1; xs = xs + [`r${n + 2}`] }}>inc</button>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Page/></body></html>
+"###;
+    let body = r##"    const rows = (id) => [...$(id).rows].map((r) => r.textContent).join(",");
+    const ids = ["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9"];
+    const out = { remadeAtLoad: QW.remade ?? 0, load: ids.map(rows).join("|") };
+    await click("inc");
+    out.inc = ids.map(rows).join("|");
+    return out;"##;
+    let Some(rs) = in_pages("q940", src, &["/"], body) else { return };
+    let want = serde_json::json!({
+        "remadeAtLoad": 0,
+        "load": "x1,x2|cap1,cap2|0,b|ünï|r1,r2|top,foot|h,a,z|r1,r2|",
+        "inc": "x1,x2|cap1,cap2|1,b|ünï|r1,r2,r3|top,foot|h,a,z|r1,r2,r3|",
+        "remade": 0, "errors": [],
+    });
+    assert_eq!(rs[0], want);
+}
+
+// Q-939's review: a composition the page made itself (untrusted) held the field for good, and one
+// begun before the runtime came was not known. Only the browser's own composition events count, an
+// input that says it is composing marks its field too, and a field that lost the focus is written.
+#[test]
+fn a_field_is_held_only_while_the_browser_composes_in_it() {
+    let src = r###"component Ime() {
+    state v = "ab"
+    <div><input #f value={v} @input={(e) => { v = upper(e.value) }}/><input #other/>
+    <button #set @click={() => { v = "SET" }}>set</button><button #set2 @click={() => { v = "X" }}>set2</button></div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Ime/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"    const f = $("f"); f.focus();
+    f.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    await click("set");
+    const out = { untrusted: f.value };
+    f.focus(); f.value = "SkET"; f.setSelectionRange(2, 2);
+    f.dispatchEvent(new InputEvent("input", { bubbles: true, isComposing: true, data: "k", inputType: "insertCompositionText" }));
+    await tick(30);
+    out.composing = f.value;
+    $("other").focus();
+    await click("set2");
+    out.blurred = f.value;
+    return out;"##;
+    let Some(rs) = in_pages("q939-flag", src, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        assert_eq!(r, &serde_json::json!({ "untrusted": "SET", "composing": "SkET", "blurred": "X", "remade": 0, "errors": [] }), "at {}", path);
+    }
+}
+
+// Q-891's review: a rewrite that swaps an emoji for another sharing its second half (😀 for 🨀) put
+// the caret between the two halves of the new one. The text both have stops at a whole character.
+#[test]
+fn the_caret_never_lands_between_the_halves_of_an_emoji() {
+    let src = r###"component Emo() {
+    state v = "😀b"
+    <div><input #f value={v} @input={(e) => { v = re.replace(re.replace(e.value, "x", "y"), "😀", "🨀") }}/></div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Emo/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"    const f = $("f"); f.focus(); f.setSelectionRange(0, 0);
+    document.execCommand("insertText", false, "x"); await tick(30);
+    const lone = (v) => /[\ud800-\udbff](?![\udc00-\udfff])|(^|[^\ud800-\udbff])[\udc00-\udfff]/.test(v);
+    const out = { first: `${f.value}@${f.selectionStart}` };
+    document.execCommand("insertText", false, "z"); await tick(30);
+    out.then = `${f.value}@${f.selectionStart}`;
+    out.lone = lone(f.value);
+    return out;"##;
+    let Some(rs) = in_pages("q891-pairs", src, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        assert_eq!(r, &serde_json::json!({ "first": "y🨀b@3", "then": "y🨀zb@4", "lone": false, "remade": 0, "errors": [] }), "at {}", path);
+    }
+}
