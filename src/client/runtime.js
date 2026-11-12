@@ -1704,11 +1704,16 @@ B.receive = meta(async (url, f, opts) => {
 // leaving the page, stops it). Dropped connections are opened again
 // (after a second, then longer); a stream that ends is not.
 B.listen = meta((url, f) => {
-  if (!Owner) fail("`listen` works in a component");
+  // In a component's code, or a handler or `@mount` of one, before or after a wait, where it lasts
+  // as long as the component, as `every` does: it checked `Owner` alone, which a handler never has
+  // (FEEDBACK61.md, Q-901; branch feedback61).
+  const own = Owner || Acting;
+  if (!own) fail("`listen` works in a component");
+  if (own.dead) return null;
   S(url, "listen");
   F(f, "listen", 2);
   const ctl = new AbortController();
-  onCleanup(() => ctl.abort());
+  (own.clean || (own.clean = [])).push(() => ctl.abort());
   (async () => {
     let wait = 1000;
     // The last event id and the server's `retry`: connecting again, the stream goes on from
@@ -1816,7 +1821,7 @@ B.parallel = meta(async (...fs) => {
   const run = Run;
   let calls;
   try {
-    calls = fs.map((f, i) => { Run = { held: null, up: run || undefined }; return F(f, "parallel", i + 1)(); });
+    calls = fs.map((f, i) => { Run = { held: null, up: run || undefined, nav: Nav.n }; return F(f, "parallel", i + 1)(); });
   } finally {
     Run = run;
   }
@@ -2800,7 +2805,18 @@ B.css = meta((s) => S(s, "css"), "css", null);
 // And `&` as `\26 `, as on the server, for a sheet in <svg> or <math> (FEEDBACK55.md, Q-707; branch feedback55).
 B.__css_value = meta((v) => cssValue(display(v)).replace(/&/g, "\\26 "), "__css_value", null);
 B.sql = meta((s) => S(s, "sql"), "sql", null);
-B.navigate = meta((to) => navigate(S(to, "navigate")), "navigate", null);
+// A run that the page changed under does not move it again: once the person followed a link, went
+// Back or Forward, or another run moved the page, a `navigate` after a wait does nothing. A save
+// that ended after the person had left took them on to where it led. A change of the hash alone
+// keeps the page, and the run's own moves are its own (FEEDBACK61.md, Q-902; branch feedback61).
+B.navigate = meta((to) => {
+  to = S(to, "navigate");
+  let r = Run;
+  if (r !== null) { while (r.up) r = r.up; if (r.nav !== Nav.n) return null; }
+  navigate(to);
+  if (r !== null) r.nav = Nav.n;
+  return null;
+}, "navigate", null);
 // `waiting(state)` is compiled to W.waiting(signal); given any other way, it
 // knows of no load (FEEDBACK13.md, Q-091; branch feedback13-fixes).
 B.waiting = meta(() => false, "waiting", null);
@@ -5878,14 +5894,28 @@ async function liveRefresh(sub, newArgs) {
   sub.loading = true;
   sub.last = Date.now();
   sub.wanted = 0;
+  // This load is the one a failed load's next try waited for (see below).
+  clearTimeout(sub.retry);
   if (newArgs) waitSig(sub.sig).set(true);
   try {
     const { value, topics, seq, server, failed, h } = await rpcRaw(sub.fname, sub.args, sub);
     if (n !== sub.loads) return;
     sub.loading = false;
+    // A load that failed (no answer, or a status that is no success) keeps the last good data and
+    // tries again, after a second, then two, doubling up to 30 s and spread out as `liveLoop`
+    // waits, until one comes; `waiting()` is true meanwhile, so the page can say it is behind. It
+    // gave up: the page showed old data until the next change, which a quiet table may never make,
+    // and a change heard while it was on its way was forgotten (FEEDBACK61.md, Q-899; branch
+    // feedback61).
+    if (failed) {
+      // Said at the first failure of a run of them.
+      if (sub.fails++ === 0) report(value.error);
+      waitSig(sub.sig).set(true);
+      sub.retry = setTimeout(() => liveRefresh(sub), Math.min(500 * 2 ** sub.fails, 30000) * (0.5 + Math.random()));
+      return;
+    }
+    sub.fails = 0;
     if (sub.sig.$wait) sub.sig.$wait.set(false);
-    // Keep showing the last good data; the next change tries again.
-    if (failed) { report(value.error); return; }
     liveSeen(seq, server);
     sub.seen = seq;
     sub.seenOn = server;
@@ -6374,9 +6404,14 @@ function textareaFollows(el) {
   if (el && el.localName === "textarea" && el.value !== el.textContent) el.value = el.textContent;
 }
 
+// With no handler hearing it (see `removing`).
 function removeNodes(list) {
-  for (const n of nodesOf(list)) if (n.parentNode) n.parentNode.removeChild(n);
+  removing++;
+  try { for (const n of nodesOf(list)) if (n.parentNode) n.parentNode.removeChild(n); } finally { removing--; }
 }
+// Above 0 while Quillo takes elements off the page, during which no handler runs (see `fire`;
+// FEEDBACK61.md, Q-896; branch feedback61).
+let removing = 0;
 
 // A part of the page that follows `get`: its nodes, then a marker (an
 // empty text node) that later nodes go in front of. A text that becomes
@@ -6500,7 +6535,10 @@ function dynAllApply(x) {
   const got = [];
   put(x, { claim: false, svg }, got);
   if (isText(x) && got.length === 0) got.push(document.createTextNode(""));
-  el.replaceChildren(...got);
+  // The children it replaces hear nothing as they go (see `removing`; FEEDBACK61.md, Q-896; branch
+  // feedback61).
+  removing++;
+  try { el.replaceChildren(...got); } finally { removing--; }
   textareaFollows(el);
   selFollow(el);
 }
@@ -6873,10 +6911,14 @@ function setClass(el, v, svg) {
 // clicks on same-site links inside components change the URL without a
 // reload (not with a modifier key, target, download or data-reload).
 
-const Nav = { at: new Sig(""), on: false };
+// `page`: the address's path and query, and `n`, how many times they changed, for a run to tell
+// that the page changed under it (see `B.navigate`; FEEDBACK61.md, Q-902; branch feedback61).
+const Nav = { at: new Sig(""), on: false, page: "", n: 0 };
 
 // What reads url() follows it.
 function navChanged() {
+  const page = location.pathname + location.search;
+  if (page !== Nav.page) { Nav.page = page; Nav.n++; }
   Nav.at.set(location.href);
 }
 
@@ -6944,6 +6986,7 @@ function aheadFor(u) {
 function navStart() {
   if (Nav.on || typeof window === "undefined") return;
   Nav.on = true;
+  Nav.page = location.pathname + location.search;
   // Links in components are followed here: not prefetched as pages.
   QW.nav = true;
   window.addEventListener("popstate", navChanged);
@@ -7262,6 +7305,12 @@ function selFollow(p) {
 }
 
 function fire(el, type, ev) {
+  // No handler runs while Quillo takes elements off the page: Chrome sends a focused field `blur`
+  // and `focusout` as it goes (to the parts it leaves too), where Firefox and Safari send none, and
+  // an inline edit that saves on Enter and on leaving the field saved twice there (FEEDBACK61.md,
+  // Q-896; branch feedback61). What comes later still reaches a removed element's handlers (a
+  // card's `dragend`, after the drop that took it to another list), and one that moves keeps them.
+  if (removing) return;
   const f = type === "click" ? el.__click : el.__w && el.__w[type];
   if (typeof f !== "function") return;
   if (type === "submit") ev.preventDefault();
@@ -7517,20 +7566,26 @@ function dropRow(r) {
 function clearRows(st, p) {
   const old = st.rows, end = st.end;
   const first = old.length ? firstOf(old[0].nodes) : null;
-  if (first && p.firstChild === first && p.lastChild === end) {
-    p.textContent = "";
-    p.appendChild(end);
-  } else if (first && first.parentNode === p) {
-    const range = document.createRange();
-    range.setStartBefore(first);
-    range.setEndBefore(end);
-    range.deleteContents();
-  } else {
-    // A row that changed its element after it was made named the one it began with:
-    // each is taken out by its own record (FEEDBACK28.md, Q-342; branch feedback29-fixes).
-    // Records name a row's nodes as they are now (see `own`), so this is for a first node
-    // that something else took away (FEEDBACK61.md, Q-889; branch feedback61).
-    for (const r of old) removeNodes(r.nodes);
+  // Taken off with no handler hearing it (see `fire`; FEEDBACK61.md, Q-896; branch feedback61).
+  removing++;
+  try {
+    if (first && p.firstChild === first && p.lastChild === end) {
+      p.textContent = "";
+      p.appendChild(end);
+    } else if (first && first.parentNode === p) {
+      const range = document.createRange();
+      range.setStartBefore(first);
+      range.setEndBefore(end);
+      range.deleteContents();
+    } else {
+      // A row that changed its element after it was made named the one it began with:
+      // each is taken out by its own record (FEEDBACK28.md, Q-342; branch feedback29-fixes).
+      // Records name a row's nodes as they are now (see `own`), so this is for a first node
+      // that something else took away (FEEDBACK61.md, Q-889; branch feedback61).
+      for (const r of old) removeNodes(r.nodes);
+    }
+  } finally {
+    removing--;
   }
   for (const r of old) dispose(r.scope);
   st.rows = [];
@@ -7914,7 +7969,10 @@ function island(def, props, h, c, out) {
     if (!(e instanceof Mismatch) || ownRoot(el)) throw e;
     remade(def.$name);
     dispose(inst);
-    el.replaceChildren();
+    // What it took up goes, heard by no handler it was given meanwhile (see `removing`;
+    // FEEDBACK61.md, Q-896; branch feedback61).
+    removing++;
+    try { el.replaceChildren(); } finally { removing--; }
     inst = new Inst(def, props, h && h.s, h && h.l);
     inst.el = el;
     run(inst, el, false);
@@ -8200,11 +8258,18 @@ function resume(el) {
   if (!ok) {
     dispose(inst);
     hydrating = queue();
-    if (ownRoot(el)) {
-      const w = wrapper(el.dataset.c);
-      el.replaceWith(w);
-      el = w;
-    } else el.replaceChildren();
+    // What it took up goes, heard by no handler it was given meanwhile (see `removing`;
+    // FEEDBACK61.md, Q-896; branch feedback61).
+    removing++;
+    try {
+      if (ownRoot(el)) {
+        const w = wrapper(el.dataset.c);
+        el.replaceWith(w);
+        el = w;
+      } else el.replaceChildren();
+    } finally {
+      removing--;
+    }
     inst = new Inst(def, props, state, liveInfo);
     inst.el = el;
     const svg = inSvg(el.parentNode || el);
@@ -8311,9 +8376,15 @@ W.settle = async (v) => {
 // kept by a state of the page keeps no component that has gone); `up`, the run that called it, for
 // `parallel`'s (FEEDBACK55.md, Q-800; branch feedback55).
 let Run = null;
-W.run = () => { const o = Run; return { r: (Run = o || { held: null, up: undefined }), o, y: false }; };
-W.off = (w, x) => { if (!w.y) { w.y = true; Run = w.o; w.o = null; } return x; };
-W.on = (w, v) => { w.y = false; Run = w.r; return v; };
+// What the code belongs to is taken up after a wait too: `w.a`, the part of the page it belongs to
+// (`Owner`, or a handler's `Acting`), for what `every`, `run_after` and `listen` start then to end
+// with it; `w.p`, what it was before, put back as the code waits again or ends. After a wait the
+// code had none: `every` refused to start, and a `run_after` outlived its component
+// (FEEDBACK61.md, Q-901; branch feedback61). It is the call's, not the run's, which a state of the
+// page keeps. A run's `nav`: the page changes it has seen (see `B.navigate`; Q-902).
+W.run = () => { const o = Run; return { r: (Run = o || { held: null, up: undefined, nav: Nav.n }), o, y: false, a: Owner || Acting, p: undefined }; };
+W.off = (w, x) => { if (!w.y) { w.y = true; Run = w.o; w.o = null; if (w.p !== undefined) { Acting = w.p; w.p = undefined; } } return x; };
+W.on = (w, v) => { w.y = false; Run = w.r; w.p = Acting; Acting = w.a; return v; };
 // Whether `r`, or a run that called it, has claimed `s` for a call.
 function claimedBy(s, r) {
   for (; r; r = r.up) if (r.held !== null && r.held.has(s)) return true;
@@ -8487,9 +8558,10 @@ function liveSig(inst, name, fname, args, every) {
   const info = inst.liveInfo && inst.liveInfo[name];
   const had = hasOwn(inst.s0, name);
   const sig = new Sig(had ? inst.s0[name] : null);
-  const sub = { inst, sig, name, fname, every: every || 0, last: 0, args: null, topics: info ? info.t : [], h: had && info && info.h || "", base: had ? inst.s0[name] : undefined };
+  // `fails`: loads that failed in a row; `retry`: the timer of the next try (see `liveRefresh`).
+  const sub = { inst, sig, name, fname, every: every || 0, last: 0, args: null, topics: info ? info.t : [], h: had && info && info.h || "", base: had ? inst.s0[name] : undefined, fails: 0, retry: 0 };
   Live.subs.add(sub);
-  onCleanup(() => { Live.subs.delete(sub); liveRestart(); });
+  onCleanup(() => { Live.subs.delete(sub); clearTimeout(sub.retry); liveRestart(); });
   let first = true;
   effect(() => {
     const a = args();

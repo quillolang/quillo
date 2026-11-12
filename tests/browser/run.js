@@ -86,6 +86,10 @@ async function main() {
       await send("Profiler.enable");
       await send("Profiler.startPreciseCoverage", { callCount: true, detailed: true });
     }
+    // A page with the focus, for a test that asks for it with QUILLO_PAGE_FOCUS: without a window,
+    // Chrome gives the page none, and sends no `blur` or `focusout` (FEEDBACK61.md, Q-896; branch
+    // feedback61).
+    if (process.env.QUILLO_PAGE_FOCUS) await send("Emulation.setFocusEmulationEnabled", { enabled: true });
     await send("Page.navigate", { url });
     if (scriptFile) {
       for (;;) {

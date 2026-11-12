@@ -210,6 +210,12 @@ fn script(body: &str) -> String {
 
 /// `src` served, and `body` run at each of `paths`: what each gave back. None without Chrome.
 fn in_pages(name: &str, src: &str, paths: &[&str], body: &str) -> Option<Vec<serde_json::Value>> {
+    in_pages_with(name, src, paths, body, false)
+}
+
+/// The same; with `focus`, the page has the focus, as in a window, and hears `blur` and `focusout`
+/// (QUILLO_PAGE_FOCUS in tests/browser/run.js).
+fn in_pages_with(name: &str, src: &str, paths: &[&str], body: &str, focus: bool) -> Option<Vec<serde_json::Value>> {
     let app = App::new(name, src);
     checked(&app.0);
     let Some(chrome) = chrome() else {
@@ -241,7 +247,13 @@ fn in_pages(name: &str, src: &str, paths: &[&str], body: &str) -> Option<Vec<ser
     let mut got = Vec::new();
     for path in paths {
         // run.js ends itself 10 s after its own deadline, whatever Chrome does.
-        let out = Command::new("node")
+        let mut node = Command::new("node");
+        if focus {
+            node.env("QUILLO_PAGE_FOCUS", "1");
+        } else {
+            node.env_remove("QUILLO_PAGE_FOCUS");
+        }
+        let out = node
             .arg(&run)
             .arg(&chrome)
             .arg(format!("http://127.0.0.1:{}{}", port, path))
@@ -857,4 +869,460 @@ route GET /hs = page(true)
     assert!(rs[0]["alive"].as_u64().unwrap() <= 1, "with moveBefore: {}", rs[0]);
     assert_eq!(rs[1]["alive"], rs[0]["alive"], "without moveBefore: {} (with it: {})", rs[1], rs[0]);
     assert_eq!((&rs[1]["errors"], &rs[1]["remade"]), (&serde_json::json!([]), &serde_json::json!(0)), "{}", rs[1]);
+}
+
+// ---- Across a wait (Q-899, Q-901, Q-902) -------------------------------------------------------
+
+// Q-899: a `live` state's load that failed while the socket stayed up gave up, and the page showed
+// old data until the next change; one made in the browser whose first load failed followed nothing
+// at all, as it never learned what to follow. Now it tries again, after a second, then two, doubling
+// up to 30 s, until a load comes, with `waiting()` true meanwhile and the console told once a run of
+// failures. The page's fetch is wrapped here to fail the loads the test says: no connection, a 503,
+// two in a row, one slow to fail with a change heard meanwhile, all of them for a while; then an
+// error value from the loader, which is an answer and is not asked again, and a failure after which
+// the component goes, which ends the tries.
+const LIVE_FAILS: &str = r###"db.open("live.db")
+db.exec("create table if not exists t (id integer primary key, v int not null)")
+db.exec("delete from t")
+db.exec("insert into t (id, v) values (1, 0)")
+// 99 is an error value: the state takes it, as a loader's answer.
+server fn load_v(id: int) {
+    let r = db.query("select v from t where id = ?", id)
+    r[0].v == 99 ? err("ninety-nine") : r
+}
+component V(id: int) {
+    state r = live(load_v, id)
+    <p #v class={{ behind: waiting(r) }}>{r == null ? "none" : is_err(r) ? error(r) : r[0].v}</p>
+}
+component Host(now: bool) {
+    state on = now
+    <div>
+        <button #show @click={() => { on = true }}>show</button>
+        <button #off @click={() => { on = false }}>off</button>
+        {on ? <V id={1}/> : <p #gone>gone</p>}
+    </div>
+}
+route POST /t/set/:v(int) { db.exec("update t set v = ? where id = 1", v); "ok" }
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /f = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn a_failed_live_load_tries_again_until_one_comes() {
+    let body = r##"const real = window.fetch.bind(window);
+    // Loads of `load_v` that fail: `fail` more of them, by `mode` (no connection, or a 503), each
+    // after `delay` ms; while `down`, all of them.
+    const f = { fail: 0, mode: "net", delay: 0, down: false, calls: 0 };
+    window.fetch = async (u, init) => {
+      if (String(u).includes("/_quillo/rpc/load_v")) {
+        f.calls++;
+        if (f.down || f.fail > 0) {
+          if (!f.down) f.fail--;
+          if (f.delay) await tick(f.delay);
+          if (f.down || f.mode === "503") return new Response("busy", { status: 503 });
+          throw new TypeError("Failed to fetch");
+        }
+      }
+      return real(u, init);
+    };
+    const set = (v) => real(`/t/set/${v}`, { method: "POST" });
+    const shown = () => ($("v") ? $("v").textContent : null);
+    const behind = () => $("v").classList.contains("behind");
+    const until = async (want, ms) => { const t0 = performance.now(); while (performance.now() - t0 < ms) { if (shown() === String(want)) return Math.round(performance.now() - t0); await tick(20); } return null; };
+    const failed = async (n) => { for (let i = 0; i < 200 && f.calls < n; i++) await tick(10); await tick(60); };
+    const out = {};
+    if (location.pathname === "/f") {
+      // Made in the browser: its first load fails.
+      await set(0); f.fail = 1;
+      await click("show"); await failed(1);
+      out.first = [shown(), behind()];
+      out.firstCaughtUp = (await until(0, 4000)) !== null && !behind();
+      if (!out.firstCaughtUp) return out;
+    }
+    // (Each case that does not catch up ends the test: the rest would wait out their time.)
+    // A change, no failure: as it was.
+    await set(1); out.plain = (await until(1, 3000)) !== null;
+    if (!out.plain) return out;
+    // One load that cannot connect, then one answered 503: the page is behind, says so, and catches up,
+    // after a wait.
+    for (const [v, mode] of [[2, "net"], [3, "503"]]) {
+      f.mode = mode; f.fail = 1; const c = f.calls;
+      await set(v); await failed(c + 1);
+      out[mode] = [shown(), behind()];
+      const t = await until(v, 4000);
+      out[mode + "CaughtUp"] = t !== null && !behind() && t >= 300;
+      if (!out[mode + "CaughtUp"]) return out;
+    }
+    // Two failures in a row.
+    { f.mode = "net"; f.fail = 2; const c = f.calls; await set(4); await failed(c + 2); out.twice = [shown(), behind(), f.calls - c]; out.twiceCaughtUp = (await until(4, 7000)) !== null; if (!out.twiceCaughtUp) return out; }
+    // A change heard while the load that then fails is on its way.
+    { f.mode = "net"; f.fail = 1; f.delay = 300; const c = f.calls; await set(5); await tick(120); await set(6); await failed(c + 1); f.delay = 0; out.during = (await until(6, 5000)) !== null; if (!out.during) return out; }
+    // Every load refused for a while, then answered again; nothing changes meanwhile.
+    { f.down = true; const c = f.calls; await set(7); await failed(c + 1); await tick(1600); out.down = [shown(), behind(), f.calls - c >= 2]; f.down = false; out.back = (await until(7, 8000)) !== null && !behind(); }
+    // An error value is an answer: shown, and not asked again.
+    { const c = f.calls; await set(99); const ok = (await until("ninety-nine", 3000)) !== null; await tick(1500); out.errValue = [ok, behind(), f.calls - c]; await set(9); out.after = (await until(9, 3000)) !== null; }
+    // A failure, then the component goes: no more tries.
+    { f.mode = "net"; f.fail = 1; const c = f.calls; await set(8); await failed(c + 1); await click("off"); const n = f.calls; await tick(2500); out.gone = [shown(), f.calls - n]; }
+    return out;"##;
+    let paths = ["/h", "/f"];
+    let Some(rs) = in_pages("q899", LIVE_FAILS, &paths, body) else { return };
+    let net = "server fn `load_v` could not be reached: Failed to fetch";
+    let busy = "server fn `load_v` failed (503)";
+    for (r, path) in rs.iter().zip(paths) {
+        let mut want = serde_json::json!({
+            "plain": true, "net": ["1", true], "netCaughtUp": true, "503": ["2", true], "503CaughtUp": true,
+            "twice": ["3", true, 2], "twiceCaughtUp": true, "during": true, "down": ["6", true, true], "back": true,
+            "errValue": [true, false, 1], "after": true, "gone": [null, 0], "remade": 0,
+            // Once a run of failures: the two in a row, and all of those while it was down, are one.
+            "errors": [net, busy, net, net, busy, net],
+        });
+        if path == "/f" {
+            want["first"] = serde_json::json!(["none", true]);
+            want["firstCaughtUp"] = serde_json::json!(true);
+            want["errors"].as_array_mut().unwrap().insert(0, serde_json::json!(net));
+        }
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Q-901: after a handler's first wait, what it started belonged to no one: `every` refused ("works in
+// a component"), and a `run_after` fired after its component had gone. The handler's part of the page
+// is taken up with it after each wait, so both, and `listen`, last as long as it does: they run while
+// the component is on the page, stop as it goes, and start nothing once it has gone during the wait.
+// `listen` checked `Owner` alone, so it failed in any handler, with a wait or without; it works there
+// now as `every` does. Nested components: the inner one's timer goes with it, the outer one's stays.
+const TIMERS: &str = r###"server fn slow(ms: int) -> str { sleep(ms); "x" }
+route GET /ticks = events((send) => {
+    for i in range(100000) {
+        send(i)
+        sleep(40)
+    }
+})
+component Alive(tick) {
+    <div>
+        <button #ev @click={() => { slow(30); every(20, () => { tick("ev") }) }}>ev</button>
+        <button #ra @click={() => { slow(30); run_after(150, () => { tick("ra") }) }}>ra</button>
+        <button #r0 @click={() => { run_after(150, () => { tick("r0") }) }}>r0</button>
+        <button #two @click={() => { slow(20); slow(20); every(20, () => { tick("two") }) }}>two</button>
+        <button #ls @click={() => { slow(30); listen("/ticks", (n) => { tick("ls") }) }}>ls</button>
+        <button #l0 @click={() => { listen("/ticks", (n) => { tick("l0") }) }}>l0</button>
+        <button #late @click={() => { slow(250); run_after(10, () => { tick("late-ra") }); every(20, () => { tick("late") }); listen("/ticks", (n) => { tick("late-ls") }) }}>late</button>
+    </div>
+}
+component Inner(tick) {
+    <button #in @click={() => { slow(30); every(20, () => { tick("in") }) }}>in</button>
+}
+component Outer(tick) {
+    state inner = true
+    <div>
+        <button #out @click={() => { slow(30); every(20, () => { tick("out") }) }}>out</button>
+        <button #inoff @click={() => { inner = false }}>inner off</button>
+        {inner ? <Inner {tick}/> : null}
+    </div>
+}
+component Host(now: bool) {
+    state on = now
+    state shown = true
+    state outer = true
+    state log = []
+    let tick = (s) => { log = log + [s] }
+    <div>
+        <button #show @click={() => { on = true }}>show</button>
+        <button #hide @click={() => { shown = false }}>hide</button>
+        <button #again @click={() => { shown = true }}>again</button>
+        <button #outoff @click={() => { outer = false }}>outer off</button>
+        <button #clear @click={() => { log = [] }}>clear</button>
+        {on && shown ? <Alive {tick}/> : null}
+        {on && outer ? <Outer {tick}/> : null}
+        <p #log>{join(log, ",")}</p>
+    </div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn timers_and_streams_started_after_a_wait_last_as_long_as_their_component() {
+    let body = r##"const n = (s) => $("log").textContent.split(",").filter((t) => t === s).length;
+    const until = async (f, ms) => { const t0 = performance.now(); while (!f() && performance.now() - t0 < ms) await tick(10); return f(); };
+    // Runs (three times), and stops as its component goes.
+    const runsThenStops = async (id, off) => {
+      const ran = await until(() => n(id) > 2, 4000);
+      await click(off); await tick(40);
+      const b = n(id); await tick(250);
+      return [ran, n(id) === b];
+    };
+    const out = {};
+    await click("ev"); out.every = await runsThenStops("ev", "hide");
+    await click("again", "clear");
+    // `run_after` after a wait: the component goes first, and it never fires; it stays, and it fires once.
+    await click("ra"); await tick(80); await click("hide"); await tick(400); out.runAfterGone = n("ra");
+    await click("again", "clear");
+    await click("ra"); await until(() => n("ra") > 0, 4000); await tick(300); out.runAfterStays = n("ra");
+    await click("clear");
+    // With no wait, as it was.
+    await click("r0"); await tick(40); await click("hide"); await tick(400); out.runAfterNoWait = n("r0");
+    await click("again", "clear");
+    // A handler that waits twice.
+    await click("two"); out.twice = await runsThenStops("two", "hide");
+    await click("again", "clear");
+    // `listen` after a wait, and with none.
+    for (const id of ["ls", "l0"]) {
+      await click(id); out[id] = await runsThenStops(id, "hide");
+      await click("again", "clear");
+    }
+    // The component goes during the wait: nothing starts after it.
+    await click("late"); await tick(60); await click("hide"); await tick(800); out.late = [n("late-ra"), n("late"), n("late-ls")];
+    await click("again", "clear");
+    // Nested: the inner component's `every` goes with it while the outer one's goes on, then that goes with its own.
+    await click("out", "in");
+    out.nested = await runsThenStops("in", "inoff");
+    { const o = n("out"); await tick(100); out.nested.push(n("out") > o); }
+    out.outer = await runsThenStops("out", "outoff");
+    return out;"##;
+    let Some(rs) = in_pages("q901", TIMERS, &["/h", "/b"], body) else { return };
+    for (r, path) in rs.iter().zip(["/h", "/b"]) {
+        let want = serde_json::json!({
+            "every": [true, true], "runAfterGone": 0, "runAfterStays": 1, "runAfterNoWait": 0, "twice": [true, true],
+            "ls": [true, true], "l0": [true, true], "late": [0, 0, 0], "nested": [true, true, true], "outer": [true, true],
+            "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Q-902: a save that ended after the person had followed a link elsewhere took them on to where it
+// led. A `navigate` after a wait does nothing now when the page changed meanwhile by anything but
+// the run itself: a link, Back, another run's `navigate`, also between two waits. Whether the
+// clicked component is still there does not matter: a modal that its Save closes, a panel a sibling
+// state takes away, a row or a branch in a branch gone, all move as they did; so do a navigate
+// before any wait, one after a wait or two with nothing else moving the page, the run's own move
+// followed by a wait and another move (two calls of one `parallel` too), and a change of the hash
+// alone, which keeps the page.
+const NAVIGATES: &str = r###"server fn slow(ms: int) -> str { sleep(ms); "x" }
+component Modal(on_close) {
+    <div class="modal"><button #msave @click={() => { on_close(); slow(200); navigate("/q/item") }}>save</button></div>
+}
+component Panel() {
+    <button #psave @click={() => { slow(200); navigate("/q/sib") }}>panel save</button>
+}
+component Saver() {
+    state rows = ["r"]
+    state open = true
+    state deep = true
+    state modal = true
+    state panel = true
+    <div>
+        <button #now @click={() => { navigate("/q/now") }}>now</button>
+        <button #save @click={() => { slow(200); navigate("/q/done") }}>save</button>
+        <button #twice @click={() => { slow(100); slow(100); navigate("/q/twice") }}>twice</button>
+        <button #own @click={() => { navigate("/q/step"); slow(200); navigate("/q/after") }}>own</button>
+        <button #par @click={() => { parallel(() => { slow(50); navigate("/q/p1") }, () => { slow(250); navigate("/q/p2") }) }}>par</button>
+        <button #pclose @click={() => { panel = false }}>close the panel</button>
+        <a #tospot href="#spot">spot</a>
+        <ul>{for r in rows => <li key={r}><button #row @click={() => { rows = []; slow(200); navigate("/q/row") }}>row</button></li>}</ul>
+        {open ? <div>{deep ? <button #deep @click={() => { open = false; slow(200); navigate("/q/deep") }}>deep</button> : null}</div> : null}
+        {modal ? <Modal on_close={() => { modal = false }}/> : null}
+        {panel ? <Panel/> : null}
+        <p #spot>spot</p>
+    </div>
+}
+component App() {
+    let path = url().path
+    <div>
+        <a #other href="/q/other">other</a>
+        <a #home href="/q">home</a>
+        <p #where>{path}</p>
+        {path == "/q" ? <Saver/> : <p #else>{path}</p>}
+    </div>
+}
+route GET /q = <html><head><title>t</title></head><body><App/></body></html>
+route GET /q/:x = <html><head><title>t</title></head><body><App/></body></html>
+"###;
+
+#[test]
+fn a_late_navigate_is_dropped_only_if_the_page_moved_meanwhile() {
+    let body = r##"const at = () => location.pathname;
+    const until = async (f, ms) => { const t0 = performance.now(); while (!f() && performance.now() - t0 < ms) await tick(10); return f(); };
+    const moved = () => until(() => at() !== "/q", 4000);
+    const home = async () => { await click("home"); await until(() => $("save"), 3000); };
+    const out = {};
+    // Before any wait; after a wait, or two, with nothing else moving the page.
+    await click("now"); out.now = [at(), $("where").textContent]; await home();
+    await click("save"); await moved(); out.save = at(); await home();
+    await click("twice"); await moved(); out.twice = at(); await home();
+    // What the button was in gone by the program's own doing: a row, a branch in a branch, the
+    // modal its Save closes, a panel a sibling state takes away.
+    await click("row"); await moved(); out.row = at(); await home();
+    await click("deep"); await moved(); out.deep = at(); await home();
+    await click("msave"); { const gone = !$("msave"); await moved(); out.modal = [gone, at()]; } await home();
+    await click("psave", "pclose"); { const gone = !$("psave"); await moved(); out.panel = [gone, at()]; } await home();
+    // The run's own move, a wait, and another: both; so the two calls of one `parallel`.
+    await click("own"); out.own = [at()]; await until(() => at() === "/q/after", 4000); out.own.push(at()); await home();
+    await click("par"); await until(() => at() === "/q/p1", 4000); out.par = [at()]; await until(() => at() === "/q/p2", 4000); out.par.push(at()); await home();
+    // The page moved during the wait: a link, a link between two waits, Back, another run.
+    await click("save"); await tick(20); await click("other"); await tick(600); out.left = [at(), $("where").textContent]; await home();
+    await click("twice"); await tick(150); await click("other"); await tick(600); out.leftBetween = at(); await home();
+    await click("other"); await home();
+    await click("save"); await tick(20); history.back(); await tick(600); out.back = at(); await home();
+    await click("save"); await tick(20); await click("now"); await tick(600); out.otherRun = at(); await home();
+    // The hash alone changes: the same page.
+    await click("save"); await tick(20); await click("tospot"); await moved(); out.hash = [at(), location.hash];
+    return out;"##;
+    let Some(rs) = in_pages("q902", NAVIGATES, &["/q"], body) else { return };
+    let want = serde_json::json!({
+        "now": ["/q/now", "/q/now"], "save": "/q/done", "twice": "/q/twice", "row": "/q/row", "deep": "/q/deep",
+        "modal": [true, "/q/item"], "panel": [true, "/q/sib"], "own": ["/q/step", "/q/after"], "par": ["/q/p1", "/q/p2"],
+        "left": ["/q/other", "/q/other"], "leftBetween": "/q/other", "back": "/q/other", "otherRun": "/q/now",
+        "hash": ["/q/done", ""], "remade": 0, "errors": [],
+    });
+    assert_eq!(rs[0], want);
+}
+
+// ---- What Quillo takes off the page (Q-896) ----------------------------------------------------
+
+// Q-896: Chrome sends a focused field `blur` and `focusout` as it is taken off the page, which
+// Firefox and Safari do not, so the report's inline edit saved on Enter and again on the blur of the
+// field that was going. No handler runs while Quillo takes elements off the page, wherever they go
+// from: a branch (and the part around it that stays hears no `focusout` either), a select its own
+// change takes away, an element's only content, a component, a row, all the rows, the page left.
+// A field that loses the focus while still there runs its handlers, one in a row that moves keeps
+// them, and what is sent to an element after it has gone still reaches them (the select's change
+// and blur sent after it went). The page has the focus here, as in a window.
+const GOES: &str = r###"component Edit(save) {
+    state editing = true
+    {editing
+        ? <input #ed @keydown={(e) => { if e.key == "Enter" { save("enter"); editing = false } }} @blur={() => { save("blur"); editing = false }} @focusout={() => { save("out") }}/>
+        : <button #edit @click={() => { editing = true }}>saved</button>}
+}
+component Field(say) {
+    <input #fi @keydown={(e) => { if e.key == "Escape" { say("esc") } }} @blur={() => { say("fi-blur") }}/>
+}
+component Parts(say) {
+    state open = true
+    state picking = true
+    state only = true
+    state comp = true
+    state xs = [1, 2, 3]
+    <div>
+        <div #keep @focusout={() => { say("keep-out") }}>
+            {open ? <div #box @focusout={() => { say("box-out") }}><input #in2 @keydown={(e) => { if e.key == "Escape" { open = false } }} @blur={() => { say("in2-blur") }}/></div> : null}
+        </div>
+        {picking ? <select #sel @change={(e) => { say(`change:${e.value}`); picking = false }} @blur={() => { say("sel-blur") }}><option>a</option><option>b</option></select> : null}
+        <p #only>{only ? <input #da @keydown={(e) => { if e.key == "Escape" { only = false } }} @blur={() => { say("da-blur") }}/> : "text"}</p>
+        {comp ? <Field say={(s) => { say(s); if s == "esc" { comp = false } }}/> : null}
+        <ul #rows>{for x in xs => <li key={x}><input class="r" data-x={x} @keydown={(e) => {
+            if e.key == "Delete" { xs = xs | filter((i) => i != x) }
+            if e.key == "Backspace" { xs = [] }
+            if e.key == "r" { xs = reverse(xs) }
+        }} @input={() => { say(`in:${x}`) }} @blur={() => { say(`blur:${x}`) }}/></li>}</ul>
+        <input #elsewhere/>
+        <button #refill @click={() => { xs = [1, 2, 3]; open = true; picking = true; only = true; comp = true }}>refill</button>
+    </div>
+}
+component Host(now: bool, say) {
+    state on = now
+    <div>
+        <button #show @click={() => { on = true }}>show</button>
+        {on ? <div><Edit save={say}/><Parts {say}/></div> : null}
+        <input #nav @keydown={(e) => { if e.key == "Enter" { navigate("/away") } }} @blur={() => { say("nav-blur") }}/>
+    </div>
+}
+component Page() {
+    let path = url().path
+    state log = []
+    let say = (s) => { log = log + [s] }
+    <div>
+        <button #clear @click={() => { log = [] }}>clear</button>
+        {path == "/away" ? <p #there>away</p> : <Host now={path == "/h"} {say}/>}
+        <p #log>{join(log, ",")}</p>
+    </div>
+}
+route GET /h = <html><head><title>t</title></head><body><Page/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Page/></body></html>
+route GET /away = <html><head><title>t</title></head><body><Page/></body></html>
+"###;
+
+#[test]
+fn handlers_of_what_quillo_takes_off_the_page_run_no_more() {
+    let body = r##"const log = () => $("log").textContent;
+    const key = (el, k) => el.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true }));
+    const row = (x) => document.querySelector(`.r[data-x="${x}"]`);
+    const out = { focused: document.hasFocus() };
+    // The report's inline edit: Enter saves, once.
+    $("ed").focus(); key($("ed"), "Enter"); await tick(60); out.enter = log(); await click("clear");
+    // A real blur still runs: the focus goes to another field, then the field goes.
+    await click("edit"); $("ed").focus(); $("elsewhere").focus(); await tick(60); out.blur = log(); await click("clear");
+    // A branch holding the focused field goes.
+    $("in2").focus(); key($("in2"), "Escape"); await tick(60); out.branch = [log(), !!$("in2")]; await click("clear");
+    // A select that its change takes away; then a change and a blur sent to it, which it hears.
+    { const s = $("sel"); s.focus(); s.value = "b"; s.dispatchEvent(new Event("change", { bubbles: true })); await tick(60);
+      s.dispatchEvent(new Event("change", { bubbles: true })); s.dispatchEvent(new FocusEvent("blur")); await tick(60); out.select = [log(), !!$("sel")]; await click("clear"); }
+    // An element's only content, replaced.
+    $("da").focus(); key($("da"), "Escape"); await tick(60); out.only = [log(), $("only").textContent]; await click("clear");
+    // A component.
+    $("fi").focus(); key($("fi"), "Escape"); await tick(60); out.comp = [log(), !!$("fi")]; await click("clear");
+    // A row, then all of them.
+    row(2).focus(); key(row(2), "Delete"); await tick(60); out.rowGone = [log(), document.querySelectorAll(".r").length]; await click("clear");
+    row(1).focus(); key(row(1), "Backspace"); await tick(60); out.rowsCleared = [log(), document.querySelectorAll(".r").length]; await click("clear");
+    // A row that moves keeps the focus and its handlers.
+    await click("refill");
+    { const r1 = row(1); r1.focus(); key(r1, "r"); await tick(60);
+      out.moved = [document.activeElement === r1, [...document.querySelectorAll(".r")].map((e) => e.dataset.x).join("")];
+      r1.dispatchEvent(new Event("input", { bubbles: true })); $("elsewhere").focus(); await tick(60); out.movedHears = log(); await click("clear"); }
+    // The page left.
+    $("nav").focus(); key($("nav"), "Enter"); await tick(150); out.away = [location.pathname, log(), !!$("there")];
+    return out;"##;
+    let Some(rs) = in_pages_with("q896", GOES, BOTH, body, true) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            "focused": true, "enter": "enter", "blur": "blur,out", "branch": ["", false], "select": ["change:b,change:b,sel-blur", false],
+            "only": ["", "text"], "comp": ["esc", false], "rowGone": ["", 2], "rowsCleared": ["", 0], "moved": [true, "321"],
+            "movedHears": "in:1,blur:1", "away": ["/away", "", true], "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Q-896's edge: only what comes while Quillo takes elements off the page is held back. A card
+// dragged into another list, where the drop moves it in state, is taken off the first list and made
+// in the second; the browser then sends `dragend` to the card it began with, off the page by now,
+// and its handler runs, once, so the drag's state is cleared.
+const DRAG: &str = r###"component Board() {
+    state a = [1, 2]
+    state b = [3]
+    state dragging = 0
+    state log = []
+    let start = (x) => { dragging = x; log = log + [`start:${x}`] }
+    let end = () => { log = log + [`end:${dragging}`]; dragging = 0 }
+    <div>
+        <ul #a>{for x in a => <li key={x} class="card" data-x={x} draggable="true" @dragstart={() => { start(x) }} @dragend={() => { end() }}>{x}</li>}</ul>
+        <ul #b @dragover={(e) => { e.preventDefault() }} @drop={(e) => { e.preventDefault(); a = a | filter((x) => x != dragging); b = b + [dragging]; log = log + [`drop:${dragging}`] }}>{for x in b => <li key={x} class="card" data-x={x} draggable="true" @dragstart={() => { start(x) }} @dragend={() => { end() }}>{x}</li>}</ul>
+        <p #log>{join(log, ",")}</p><p #dragging>{dragging}</p>
+    </div>
+}
+component Host(now: bool) {
+    state on = now
+    <div><button #show @click={() => { on = true }}>show</button>{on ? <Board/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn a_card_dropped_into_another_list_hears_its_dragend() {
+    let body = r##"const list = (id) => [...$(id).querySelectorAll(".card")].map((c) => c.dataset.x).join(",");
+    const card = document.querySelector('#a .card[data-x="1"]');
+    const dt = new DataTransfer();
+    card.dispatchEvent(new DragEvent("dragstart", { bubbles: true, dataTransfer: dt })); await tick(30);
+    $("b").dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: dt }));
+    $("b").dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: dt })); await tick(30);
+    const gone = !card.isConnected;
+    card.dispatchEvent(new DragEvent("dragend", { bubbles: true, dataTransfer: dt })); await tick(30);
+    return { gone, log: $("log").textContent, dragging: $("dragging").textContent, a: list("a"), b: list("b") };"##;
+    let Some(rs) = in_pages("q896-drag", DRAG, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({ "gone": true, "log": "start:1,drop:1,end:1", "dragging": "0", "a": "2", "b": "3,1", "remade": 0, "errors": [] });
+        assert_eq!(r, &want, "at {}", path);
+    }
 }
