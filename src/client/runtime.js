@@ -6710,10 +6710,14 @@ function imeHear() {
   // A start only from the browser itself: a page's own, which nothing ends, held the field. An end
   // from anywhere (Chrome's for a commit is not marked trusted, and it only lets the field go).
   document.addEventListener("compositionstart", (e) => { if (e.isTrusted) e.target.__ime = true; }, true);
+  // Only a write held meanwhile is made at the end (`__held`): the program's value written at every
+  // end wiped what was composed in a field the program does not write as it is typed (`value={prop}`,
+  // or one written on `change`), and a page's own end wiped what was typed (FEEDBACK61.md, Q-939's
+  // review of 06cda99; branch feedback61).
   document.addEventListener("compositionend", (e) => {
     const el = e.target;
     el.__ime = false;
-    setTimeout(() => { if (!el.__ime && el.__want !== undefined) setProp(el, "value", el.__want, undefined); }, 0);
+    if (el.__held) setTimeout(() => { if (!el.__ime && el.__held) setProp(el, "value", el.__want, undefined); }, 0);
   }, true);
   return true;
 }
@@ -6752,7 +6756,13 @@ function dynApply(x) {
     partsMade++;
     r.made = partsMade;
     r.size = got.length;
-    if (c.claim) c.p.insertBefore(r.end, c.n);
+    if (c.claim) {
+      // Showing nothing where the parser's <tbody> has ended: after it, where what it shows later
+      // (a <tfoot>) goes (see `intoBody`; FEEDBACK61.md, Q-940's review of 06cda99; branch
+      // feedback61). A list's rows stay with its others (see `inOneBody`).
+      if (!got.length) outOfBody(c);
+      c.p.insertBefore(r.end, c.n);
+    }
     for (const n of got) r.out.push(n);
     r.out.push(r.end);
     r.c = { claim: false, svg: c.svg };
@@ -6946,7 +6956,7 @@ class Tmpl extends Html {
     maskNow = this.mask;
     try {
       if (c.claim) {
-        if (def.tpl[0] === "tr") intoBody(c);
+        tablePart(c, def.tpl[0]);
         const el = c.n;
         claimEl(def.tpl, el, this.vals, svg);
         c.n = el.nextSibling;
@@ -7015,14 +7025,13 @@ function claimEl(tp, el, vals, svg) {
     if (typeof k === "string") claimText(c, k);
     else if (typeof k === "number") showClaim(c, vals[k], k);
     else {
-      if (k[0] === "tr") intoBody(c);
-      else outOfBody(c, box);
+      tablePart(c, k[0]);
       const n = c.n;
       claimEl(k, n, vals, sv);
       c.n = n.nextSibling;
     }
   }
-  outOfBody(c, box);
+  outOfBody(c);
   rest(box, c.n);
 }
 
@@ -7031,21 +7040,40 @@ function claimEl(tp, el, vals, svg) {
 // what was typed before the page was ready went. Taking them up steps into that <tbody>
 // (`intoBody`), and out of it where the table's markup goes on (`outOfBody`); the page keeps it
 // (FEEDBACK61.md, Q-940; branch feedback61). The served HTML is as it was.
-function intoBody(c) {
+// Bare <col>s too, which it put in a <colgroup> of its own; and the way out is taken before anything
+// that comes after the rows, a hole's or a component's too, not only an element written there
+// (FEEDBACK61.md, Q-940's review of 06cda99; branch feedback61).
+// `w`: what it steps into, "tbody" or "colgroup"; either, for a component, which may be rows or cols.
+function intoBody(c, w) {
   const n = c.n;
   if (!n || c.p.localName !== "table") return;
-  // A comment the server marked a component with stays in the table; the rows after it went in.
-  const b = isMarked(n) && !markedEnd(n) ? n.nextSibling : n;
-  if (!b || b.localName !== "tbody" || b.attributes.length || b.__q) return;
-  if (b !== n) b.insertBefore(n, b.firstChild);
+  // Comments the server marked components with stay in the table, ahead of what the parser put in
+  // (those of a component inside another too); their ends went in with the rows (see `markedEnd`).
+  let b = n;
+  while (isMarked(b) && !markedEnd(b, true)) b = b.nextSibling;
+  if (!b || b.nodeType !== 1 || (w ? b.localName !== w : b.localName !== "tbody" && b.localName !== "colgroup") || b.attributes.length || b.__q) return;
+  if (b !== n) {
+    const lead = [];
+    for (let m = n; m !== b; m = m.nextSibling) lead.push(m);
+    b.prepend(...lead);
+  }
+  // The parser's, as no markup's is: what `outOfBody` and a list (see `inOneBody`) know it by.
+  b.__qb = true;
   c.p = b;
   c.n = b.firstChild;
 }
-function outOfBody(c, box) {
-  if (c.p !== box && c.n === null && c.p.parentNode === box) {
+function outOfBody(c) {
+  if (c.n === null && c.p.__qb) {
     c.n = c.p.nextSibling;
-    c.p = box;
+    c.p = c.p.parentNode;
   }
+}
+// Before an element is taken up: out of the parser's <tbody> or <colgroup> where that has ended, and
+// into one for a row or a col.
+function tablePart(c, tag) {
+  outOfBody(c);
+  if (tag === "tr") intoBody(c, "tbody");
+  else if (tag === "col") intoBody(c, "colgroup");
 }
 
 const live = (name) => name === "value" || name === "checked" || name === "selected";
@@ -7617,9 +7645,13 @@ function setProp(el, k, v, old) {
     // composition ends (FEEDBACK61.md, Q-939; branch feedback61).
     // A field no longer focused is not being composed in (its end got lost, or was a page's own).
     if (typed && imeHeard && el.__ime) {
-      if (el === document.activeElement) return;
+      if (el === document.activeElement) {
+        el.__held = true;
+        return;
+      }
       el.__ime = false;
     }
+    if (el.__held) el.__held = false;
     if (el.value !== nv) {
       // The field being typed in keeps its caret in its text, after what was typed, when the
       // program writes it in capitals, leaves a key out or groups it (see `caretIn`). A write put
@@ -7742,8 +7774,9 @@ function fire(el, type, ev) {
   if (removing) return;
   // An input that says it is part of a composition marks its field as being composed in, one begun
   // before this runtime came too, which no compositionstart told (FEEDBACK61.md, Q-939's review;
-  // branch feedback61).
-  if (type === "input" && ev.isComposing !== undefined && ev.target) ev.target.__ime = ev.isComposing;
+  // branch feedback61). The browser's own input only: a page's held the field, and what was
+  // written meanwhile went (FEEDBACK61.md, Q-939's review of 06cda99; branch feedback61).
+  if (type === "input" && ev.isTrusted && ev.isComposing !== undefined && ev.target) ev.target.__ime = ev.isComposing;
   // The `select` the browser sends for Quillo's own caret, put back after a write (see `setProp`),
   // is not the person's: a handler had run on every key typed in the middle (FEEDBACK61.md,
   // Q-891's review; branch feedback61).
@@ -7916,12 +7949,12 @@ function each(list, key, row, follows) {
       // again when that changes, as a `key` outside a list does. Read where nothing is heard, it
       // waited for the list's next change (FEEDBACK61.md, Q-895; branch feedback61). Others are
       // read as before, where nothing is heard.
-      const ks = follows ? items.map(key) : null;
+      const ks = follows ? items.map(first ? (x) => keyOf(key, x) : key) : null;
       untrack(() => {
         if (!first) { reconcile(st, items, key, ks, row, svg); return; }
         first = false;
-        const at = out.length;
-        st.rows = items.map((x, i) => newRow(x, ks ? ks[i] : key ? key(x) : i, row, c, out));
+        const at = out.length, inTable = c.claim && (c.p.localName === "table" || c.p.__qb);
+        st.rows = items.map((x, i) => newRow(x, ks ? ks[i] : key ? keyOf(key, x) : i, row, c, out));
         st.end = document.createTextNode("");
         st.end.__part = st;
         partsMade++;
@@ -7929,9 +7962,34 @@ function each(list, key, row, follows) {
         st.size = out.length - at;
         if (c.claim) c.p.insertBefore(st.end, c.n);
         out.push(st.end);
+        if (inTable) inOneBody(out, at);
       });
     });
   });
+}
+
+// A row's key as the list is first made: one that fails is said, and the row has a key no other
+// has, so the list is made whole and its next run makes that row again. The list was left empty
+// for good, a later run making its rows where nothing showed them (FEEDBACK61.md, Q-895's review of
+// 06cda99; branch feedback61). A key that fails later leaves the list as it was, as before.
+function keyOf(key, x) {
+  try { return key(x); } catch (e) { report(e); return {}; }
+}
+
+// A list taken up in a table, its nodes all in the parser's <tbody> once one of its rows is: the
+// marker of a row that showed nothing stayed in the <table> ahead of it (or after it, see
+// `dynApply`), and a row put in front of that one, or moved there, was put where it is not
+// (`insertBefore`: not a child), and nothing more changed (FEEDBACK61.md, Q-940's review of
+// 06cda99; branch feedback61). Only markers move; elements are where the parser put them. Those
+// left out are at either end, as the parser's <tbody> holds every row between.
+function inOneBody(out, at) {
+  let i = at, j = out.length - 1;
+  while (i <= j && !(out[i].parentNode && out[i].parentNode.__qb)) i++;
+  if (i > j) return;
+  const b = out[i].parentNode;
+  while (out[j].parentNode !== b) j--;
+  for (let k = at; k < i; k++) if (out[k].nodeType !== 1) b.insertBefore(out[k], out[i]);
+  for (let k = out.length - 1; k > j; k--) if (out[k].nodeType !== 1) b.insertBefore(out[k], out[j].nextSibling);
 }
 
 // Lists whose rows have gone: their records are let go after the task that took them away.
@@ -8440,14 +8498,20 @@ function markedData(n) {
   }
   return n.__qd;
 }
-// The comment that ends the one `open` began, past those of components inside it.
-function markedEnd(open) {
+// The comment that ends the one `open` began, past those of components inside it. In a table, the
+// HTML parser put the rows after `open`, and the comments after them, in a <tbody> of its own (cols
+// in a <colgroup>): the end is looked for in there too, as for a component of a <thead> then rows
+// (FEEDBACK61.md, Q-940's review of 06cda99; branch feedback61). `here`: among its own siblings only.
+function markedEnd(open, here) {
+  const p = open.parentNode, into = !here && p.localName === "table";
   let depth = 0, n = open.nextSibling;
-  for (; n; n = n.nextSibling) {
+  while (n) {
     if (isMarked(n)) depth++;
-    else if (n.nodeType === 8 && n.data === "/q" && depth-- === 0) break;
+    else if (n.nodeType === 8 && n.data === "/q") { if (depth-- === 0) return n; }
+    else if (into && n.parentNode === p && (n.localName === "tbody" || n.localName === "colgroup") && n.firstChild && !n.attributes.length) { n = n.firstChild; continue; }
+    n = n.nextSibling || (into && n.parentNode !== p ? n.parentNode.nextSibling : null);
   }
-  return n;
+  return null;
 }
 // The islands in `el`, in the page's order, as elements: those marked by comments too when
 // `marked` (its island says it holds some: `data-qm`).
@@ -8474,7 +8538,10 @@ function remade(name) {
 
 // A component in its <quillo-island>: made, or taking up the page's; its nodes into `out`.
 function island(def, props, h, c, out) {
-  if (c.claim) intoBody(c);
+  if (c.claim) {
+    outOfBody(c);
+    intoBody(c, null);
+  }
   if (c.claim && isMarked(c.n)) { islandMarked(def, props, h, c, out); return; }
   let inst = new Inst(def, props, h && h.s, h && h.l);
   if (!c.claim && bareIn(c)) {
@@ -8488,7 +8555,11 @@ function island(def, props, h, c, out) {
   if (c.claim) {
     el = c.n;
     if (DEV) wanted = [el, `<${def.$name}>`]; // dev
-    if (!el || el.nodeType !== 1 || !el.matches(ISLANDS) || el.dataset.c !== def.$name) throw new Mismatch("component");
+    // One whose markup is another's own root (a row component's row, in a component that is only
+    // that) has that element too, which the server marks with the outer one's name, as the browser
+    // does (see `bareRoot`); it was made again (FEEDBACK61.md, Q-940's review of 06cda99; branch
+    // feedback61).
+    if (!el || el.nodeType !== 1 || !el.matches(ISLANDS) || el.dataset.c !== def.$name && !(el.__q && ownRoot(el))) throw new Mismatch("component");
     el.__q = true;
     c.n = el.nextSibling;
   } else el = wrapper(def.$name);
@@ -8533,7 +8604,9 @@ function islandMarked(def, props, h, c, out) {
   if (!end || markedData(open).dataset.c !== def.$name) throw new Mismatch("component");
   const inst = new Inst(def, props, h && h.s, h && h.l);
   let got = run(inst, open, true);
-  if (!got) { got = []; for (let n = open.nextSibling; n !== end; n = n.nextSibling) got.push(n); }
+  if (!got) { got = []; for (let n = open.nextSibling; n && n !== end; n = n.nextSibling) got.push(n); }
+  // Where its end is: in the parser's <tbody>, for one whose rows went in (see `markedEnd`).
+  c.p = end.parentNode;
   c.n = end.nextSibling;
   const p = open.parentNode;
   open.remove();
@@ -9095,6 +9168,10 @@ W.t = tmpl;
 W.by = (i, h) => { h.by = i; return h; };
 W.frag = frag;
 W.each = each;
+// The key of a row that shows nothing (see `row_key` in src/client.rs): one no program can give,
+// as `null` was, a row keyed `null` taking a hidden row's place (FEEDBACK61.md, Q-897's review of
+// 06cda99; branch feedback61).
+W.hidden = Object.freeze({});
 W.choose = choose;
 W.keyed = keyed;
 W.c = comp;

@@ -3888,6 +3888,9 @@ route GET / = <html><head><title>t</title></head><body><Page/></body></html>
 // Q-939's review: a composition the page made itself (untrusted) held the field for good, and one
 // begun before the runtime came was not known. Only the browser's own composition events count, an
 // input that says it is composing marks its field too, and a field that lost the focus is written.
+// Changed in the review of 06cda99 (L3, decided by the coordinator): a page's own input that says it
+// is composing no longer holds the field either, so `composing` is the program's `SKET`; the
+// browser's own is in composing_keeps_what_was_composed_in_a_field_the_program_does_not_write.
 #[test]
 fn a_field_is_held_only_while_the_browser_composes_in_it() {
     let src = r###"component Ime() {
@@ -3916,7 +3919,7 @@ route GET /b = <html><head><title>t</title></head><body><Host now={false}/></bod
     return out;"##;
     let Some(rs) = in_pages("q939-flag", src, BOTH, body) else { return };
     for (r, path) in rs.iter().zip(BOTH) {
-        assert_eq!(r, &serde_json::json!({ "untrusted": "SET", "composing": "SkET", "blurred": "X", "remade": 0, "errors": [] }), "at {}", path);
+        assert_eq!(r, &serde_json::json!({ "untrusted": "SET", "composing": "SKET", "blurred": "X", "remade": 0, "errors": [] }), "at {}", path);
     }
 }
 
@@ -4083,4 +4086,342 @@ fn a_helpers_timer_from_a_handler_is_the_handlers_components() {
         let want = serde_json::json!({ "back": [1, 1], "gone": [2, 2], "stopwatch": true, "boxed": true, "remade": 0, "errors": [] });
         assert_eq!(r, &want, "at {}", path);
     }
+}
+
+// ---- Slice 4's review (06cda99): tables, keys and composing ------------------------------------
+
+// H1: rows taken up in a table, the first of which showed nothing: its marker stayed in the <table>
+// while the rows after it went into the parser's <tbody>, so a row put in front of it, or moved
+// there, threw (insertBefore: not a child) and nothing more changed. Rows hidden first, in the
+// middle, last and all, through `? : null`, `&&` and a component, and with a <thead> and a row
+// after; every row of a table under one parent, and what was typed kept.
+const HIDDEN_ROWS: &str = r###"component Row(x: map) { x.on ? <tr><td>{x.id}</td></tr> : null }
+component Grid(start: list) {
+    state xs = start
+    state added = 0
+    <div>
+        <table #k>{for x in xs => x.on ? <tr key={x.id}><td><input/>{x.id}</td></tr> : null}</table>
+        <table #a>{for x in xs => x.on && <tr key={x.id}><td>{x.id}</td></tr>}</table>
+        <table #c>{for x in xs => <Row key={x.id} x={x}/>}</table>
+        <table #s><thead><tr><th>h</th></tr></thead>{for x in xs => x.on ? <tr key={x.id}><td>{x.id}</td></tr> : null}<tr><td>end</td></tr></table>
+        <button #front @click={() => { added += 1; xs = [{ id: 10 + added, on: true }] + xs }}>front</button>
+        <button #rev @click={() => { xs = reverse(xs) }}>rev</button>
+        <button #all @click={() => { xs = xs | map((x) => merge(x, { on: true })) }}>all</button>
+        <button #none @click={() => { xs = xs | map((x) => merge(x, { on: false })) }}>none</button>
+    </div>
+}
+fn rows(off: list) = [1, 2, 3] | map((i) => { id: i, on: !contains(off, i) })
+component Host(now: bool, off: list) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Grid start={rows(off)}/> : null}</div>
+}
+route GET /h1 = <html><head><title>t</title></head><body><Host now={true} off={[1]}/></body></html>
+route GET /b1 = <html><head><title>t</title></head><body><Host now={false} off={[1]}/></body></html>
+route GET /h2 = <html><head><title>t</title></head><body><Host now={true} off={[2]}/></body></html>
+route GET /b2 = <html><head><title>t</title></head><body><Host now={false} off={[2]}/></body></html>
+route GET /h3 = <html><head><title>t</title></head><body><Host now={true} off={[3]}/></body></html>
+route GET /b3 = <html><head><title>t</title></head><body><Host now={false} off={[3]}/></body></html>
+route GET /h0 = <html><head><title>t</title></head><body><Host now={true} off={[1, 2, 3]}/></body></html>
+route GET /b0 = <html><head><title>t</title></head><body><Host now={false} off={[1, 2, 3]}/></body></html>
+"###;
+
+#[test]
+fn a_table_whose_rows_show_nothing_takes_rows_put_in_front_and_moved() {
+    let body = r##"    const ids = ["k", "a", "c", "s"];
+    const rows = () => ids.map((id) => [...$(id).rows].map((r) => r.textContent).join(",")).join("|");
+    const split = () => ids.filter((id) => new Set([...$(id).rows].filter((r) => !/^(h|end)$/.test(r.textContent)).map((r) => r.parentNode)).size > 1).join(",");
+    for (const i of $("k").querySelectorAll("input")) i.value = "t" + i.parentNode.textContent;
+    const typed = () => [...$("k").rows].map((r) => r.textContent + "=" + r.querySelector("input").value).join(",");
+    const out = { load: rows() };
+    await click("front"); out.front = rows();
+    await click("rev"); out.rev = rows(); out.typed = typed();
+    await click("all"); out.all = rows();
+    await click("none"); out.none = rows();
+    await click("all"); out.again = rows();
+    out.split = split();
+    return out;"##;
+    let paths = ["/h1", "/b1", "/h2", "/b2", "/h3", "/b3", "/h0", "/b0"];
+    let Some(rs) = in_pages("h1-hidden-rows", HIDDEN_ROWS, &paths, body) else { return };
+    let t = |x: &str| format!("{x}|{x}|{x}|h,{}end", if x.is_empty() { String::new() } else { format!("{x},") });
+    let want = |load: &str, front: &str, rev: &str, typed: &str| {
+        serde_json::json!({
+            "load": t(load), "front": t(front), "rev": t(rev), "typed": typed, "all": t("3,2,1,11"), "none": t(""), "again": t("3,2,1,11"),
+            "split": "", "remade": 0, "errors": [],
+        })
+    };
+    let wants = [
+        want("2,3", "11,2,3", "3,2,11", "3=t3,2=t2,11="),
+        want("1,3", "11,1,3", "3,1,11", "3=t3,1=t1,11="),
+        want("1,2", "11,1,2", "2,1,11", "2=t2,1=t1,11="),
+        want("", "11", "11", "11="),
+    ];
+    for (i, (r, path)) in rs.iter().zip(paths).enumerate() {
+        assert_eq!(r, &wants[i / 2], "at {}", path);
+    }
+}
+
+// M2: what Q-940's first fix left out, each a table made again on load (early typing lost), on main
+// too: a component wrapping a row component (two comments ahead of the rows, and a row's own root
+// marked with the outer one's name), one of a <thead> then rows (its end in the parser's <tbody>),
+// rows then a <tfoot> in one component, a list then a hole giving a <tfoot> (shown at load, and
+// later: in the <table>, not the <tbody>), rows then <Foot/>, and bare <col>s, whose <colgroup> the
+// parser adds, written straight in or by a component. An explicit <colgroup> keeps working.
+#[test]
+fn table_parts_around_rows_written_straight_in_are_taken_up() {
+    let src = r###"component Two(a: str) { [<tr class="t"><td>{a}1</td></tr>, <tr class="t"><td>{a}2</td></tr>] }
+component One(a: str) { <tr class="o"><td><input/>{a}</td></tr> }
+component WrapTwo(a: str) { <Two a={a}/> }
+component WrapOne(a: str) { <One a={a}/> }
+component Parts(n: int) { [<thead><tr><th>h{n}</th></tr></thead>, <tr><td>b{n}</td></tr>] }
+component RowsFoot(n: int) { [<tr><td>r{n}</td></tr>, <tfoot><tr><td>f</td></tr></tfoot>] }
+component Foot(n: int) { <tfoot><tr><td>foot{n}</td></tr></tfoot> }
+component Cols() { [<col/>, <col/>] }
+component Page() {
+    state n = 0
+    state xs = ["r1", "r2"]
+    state foot = true
+    state foot2 = false
+    <div #root>
+        <table #wt><WrapTwo a="w"/></table>
+        <table #wo><WrapOne a="ŵ"/></table>
+        <table #pa><Parts n={n}/></table>
+        <table #rf><RowsFoot n={n}/></table>
+        <table #tf>{for x in xs => <tr><td>{x}</td></tr>}{foot ? <tfoot><tr><td>tf</td></tr></tfoot> : null}</table>
+        <table #tg>{for x in xs => <tr><td>{x}</td></tr>}{foot2 ? <tfoot><tr><td>tg</td></tr></tfoot> : null}</table>
+        <table #cf><tr><td>a</td></tr><Foot n={n}/></table>
+        <table #lf>{for x in xs => <tr><td>{x}</td></tr>}<Foot n={n}/></table>
+        <table #co><col/><tr><td>{n}</td></tr></table>
+        <table #c2><col/><col/><tr><td>{n}</td></tr></table>
+        <table #cc><Cols/><tr><td>{n}</td></tr></table>
+        <table #cg><colgroup><col/></colgroup><tr><td>{n}</td></tr></table>
+        <button #inc @click={() => { n += 1; xs = xs + [`r${n + 2}`]; foot2 = true }}>inc</button>
+    </div>
+}
+route GET / = <html><head><title>t</title></head><body><Page/></body></html>
+"###;
+    let body = r##"    const shape = (t) => [...t.children].map((c) => c.localName + (/^(tbody|thead|tfoot)$/.test(c.localName) ? "(" + [...c.rows].map((r) => r.textContent).join(",") + ")" : c.localName === "tr" ? "[" + c.textContent + "]" : c.localName === "colgroup" ? "(" + c.children.length + ")" : "")).join(" ");
+    const all = () => [...$("root").querySelectorAll("table")].map((t) => t.id + ":" + shape(t)).join(" ");
+    $("wo").querySelector("input").value = "typed";
+    const out = { remadeAtLoad: QW.remade ?? 0, load: all() };
+    await click("inc");
+    out.inc = all();
+    out.typed = $("wo").querySelector("input").value;
+    return out;"##;
+    let Some(rs) = in_pages("m2-table-parts", src, &["/"], body) else { return };
+    let shapes = |n: u32, rows: &str, tg: &str| {
+        format!(
+            "wt:tbody(w1,w2) wo:tbody(ŵ) pa:thead(h{n}) tbody(b{n}) rf:tbody(r{n}) tfoot(f) tf:tbody({rows}) tfoot(tf) tg:tbody({rows}){tg} cf:tbody(a) tfoot(foot{n}) lf:tbody({rows}) tfoot(foot{n}) co:colgroup(1) tbody({n}) c2:colgroup(2) tbody({n}) cc:colgroup(2) tbody({n}) cg:colgroup(1) tbody({n})"
+        )
+    };
+    let want = serde_json::json!({
+        "remadeAtLoad": 0, "load": shapes(0, "r1,r2", ""), "inc": shapes(1, "r1,r2,r3", " tfoot(tg)"), "typed": "typed", "remade": 0, "errors": [],
+    });
+    assert_eq!(rs[0], want);
+}
+
+// H2, from 81be797: every compositionend wrote the program's value, so composing in a field the
+// program does not write as it is typed (`value={prop}`, or one written on `change`) wiped what was
+// composed, and a page's own compositionend wiped what was typed. Only a write held meanwhile is made
+// at the end. What keeps working: a field written as it is typed (in capitals) composed in the
+// middle, a write held then the commit, a blur while composing, and an input the browser marks as
+// composing for a composition whose start was not heard (as one begun before the runtime came).
+#[test]
+fn composing_keeps_what_was_composed_in_a_field_the_program_does_not_write() {
+    let src = r###"component Ime(init: str) {
+    state w = "ab"
+    state w2 = "ab"
+    state u = "ab"
+    state u2 = "ab"
+    <div>
+        <input #oneway value={init}/>
+        <input #chg value={w} @change={(e) => { w = e.value }}/>
+        <input #chg2 value={w2} @change={(e) => { w2 = e.value }}/>
+        <input #up value={u} @input={(e) => { u = upper(e.value) }}/>
+        <input #up2 value={u2} @input={(e) => { u2 = upper(e.value) }}/>
+        <input #other/>
+        <span #echo>{w}|{w2}|{u}|{u2}</span>
+        <button #setu @click={() => { u = "SET" }}>u</button>
+        <button #set2 @click={() => { u2 = "SET" }}>u2</button>
+    </div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Ime init="ab"/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"    const cdp = async (cmds) => { document.body.setAttribute("data-cdp", JSON.stringify(cmds)); for (let i = 0; i < 250 && document.body.hasAttribute("data-cdp"); i++) await tick(20); await tick(80); };
+    const at = (id, i) => { const f = $(id); f.focus(); f.setSelectionRange(i, i); };
+    const val = (id) => `${$(id).value}@${$(id).selectionStart}`;
+    const compose = async (...texts) => { for (const t of texts) await cdp([["Input.imeSetComposition", { text: t, selectionStart: t.length, selectionEnd: t.length }]]); };
+    const commit = async (t) => { await cdp([["Input.insertText", { text: t }]]); await tick(60); };
+    const out = {};
+    at("oneway", 2); await cdp([["Input.insertText", { text: "z" }]]); await compose("k", "か"); await commit("か");
+    out.prop = val("oneway");
+    at("chg", 2); await compose("k", "か"); await commit("か");
+    out.change = val("chg"); $("other").focus(); await tick(40); out.changed = $("echo").textContent;
+    at("chg2", 2); await cdp([["Input.insertText", { text: "xyz" }]]);
+    $("chg2").dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "" })); await tick(40);
+    out.pageEnd = val("chg2");
+    at("up", 1); await compose("k", "か"); await commit("か");
+    out.upper = val("up");
+    at("up2", 2); await compose("k"); await click("set2"); out.held = val("up2");
+    await commit("か"); out.afterHeld = val("up2");
+    at("up", 3); await compose("q"); $("other").focus(); await tick(60); out.blurred = $("up").value; await click("setu"); out.written = $("up").value;
+    at("up2", 0); await compose("m"); $("up2").__ime = false; await compose("mo"); await click("set2"); out.unheard = $("up2").value;
+    return out;"##;
+    let Some(rs) = in_pages_with("h2-composing", src, BOTH, body, true) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        assert_eq!(r["prop"], "abzか@4", "at {}: {}", path, r);
+        assert_eq!(r["change"], "abか@3", "at {}: {}", path, r);
+        assert_eq!(r["changed"], "abか|ab|ab|ab", "at {}: {}", path, r);
+        assert_eq!(r["pageEnd"], "abxyz@5", "at {}: {}", path, r);
+        assert_eq!(r["upper"], "AかB@2", "at {}: {}", path, r);
+        assert_eq!(r["held"], "abk@3", "at {}: {}", path, r);
+        assert_eq!(r["afterHeld"], "ABか@3", "at {}: {}", path, r);
+        assert_eq!(r["written"], "SET", "at {}: {}", path, r);
+        assert_eq!(r["unheard"], "moABか", "at {}: {}", path, r);
+        assert_eq!((&r["remade"], &r["errors"]), (&serde_json::json!(0), &serde_json::json!([])), "at {}", path);
+    }
+}
+
+// L1 and L4: rows still kept by place, so a reverse lost what was typed and the focus: a branch that
+// is a block of nothing (`else { null }`, an else-if's `{ null }`, an empty `else { }`) or `true`,
+// which shows nothing too. And a row keyed `null` took a hidden row's place, whose key was `null`
+// too: a swap lost its typing. Hidden rows' keys are now no key a program can give.
+#[test]
+fn a_row_whose_other_branch_is_a_block_of_nothing_or_true_is_keyed() {
+    let src = r###"component Shapes() {
+    state xs = [{ id: 1, on: true, k: "a" }, { id: 2, on: false, k: "b" }, { id: 3, on: true, k: "c" }]
+    state ns = [{ id: null, on: true, t: "n" }, { id: 1, on: false, t: "h" }, { id: 2, on: true, t: "b" }]
+    <div>
+        <ul #elsenull>{for x in xs { if x.on { <li key={x.id}><input/>{x.id}</li> } else { null } }}</ul>
+        <ul #elifnull>{for x in xs { if x.k == "a" { <li key={x.id}><input/>{x.id}</li> } else if x.k == "b" { null } else { <li key={x.id}><input/>{x.id}</li> } }}</ul>
+        <ul #empty>{for x in xs { if x.on { <li key={x.id}><input/>{x.id}</li> } else { } }}</ul>
+        <ul #truth>{for x in xs => x.on ? <li key={x.id}><input/>{x.id}</li> : true}</ul>
+        <ul #nul>{for x in ns => x.on ? <li key={x.id}><input/>{x.t}</li> : null}</ul>
+        <button #rev @click={() => { xs = reverse(xs) }}>rev</button>
+        <button #swap @click={() => { ns = [ns[1], ns[0], ns[2]] }}>swap</button>
+    </div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Shapes/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"    const ids = ["elsenull", "elifnull", "empty", "truth", "nul"];
+    for (const id of ids) for (const i of $(id).querySelectorAll("input")) i.value = "t" + i.parentNode.textContent;
+    const rows = (id) => [...$(id).children].map((li) => li.textContent + "=" + li.querySelector("input").value).join(",");
+    const f = $("elsenull").querySelector("input"); f.focus();
+    await click("rev", "swap");
+    const out = {};
+    for (const id of ids) out[id] = rows(id);
+    out.focusKept = document.activeElement === f;
+    return out;"##;
+    let Some(rs) = in_pages("l1-nothing-keys", src, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            "elsenull": "3=t3,1=t1", "elifnull": "3=t3,1=t1", "empty": "3=t3,1=t1", "truth": "3=t3,1=t1", "nul": "n=tn,b=tb",
+            "focusKept": true, "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// L2: a key that failed as the list was first made (here a division by zero) left the list empty for
+// good, a later run making its rows where nothing showed them. It is said, the list is made whole,
+// and the next run makes that row again; a key that fails later leaves the list as it was, as
+// before. A key that reads state, and one that does not.
+#[test]
+fn a_key_that_fails_as_the_list_is_first_made_is_said_and_the_list_is_whole() {
+    let src = r###"component Throw(start: list) {
+    state ver = 1
+    state xs = start
+    <div>
+        <ul #a>{for x in xs => <li key={`${ver}:${10 / x}`}>{x}</li>}</ul>
+        <ul #p>{for x in xs => <li key={10 / x}>{x}</li>}</ul>
+        <button #bad @click={() => { xs = [5, 0] }}>bad</button>
+        <button #fix @click={() => { xs = [3, 4] }}>fix</button>
+    </div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Throw start={[1, 0]}/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+    let body = r##"    const rows = () => ["a", "p"].map((id) => [...$(id).children].map((li) => li.textContent).join(",")).join("|");
+    const out = { start: rows(), saidFirst: window.__quilloErrors.length };
+    await click("fix"); out.fix = rows();
+    await click("bad"); out.bad = rows();
+    return out;"##;
+    let Some(rs) = in_pages("l2-key-fails", src, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let zero = "division by zero";
+        let want = serde_json::json!({
+            "start": "1,0|1,0", "saidFirst": 2, "fix": "3,4|3,4", "bad": "3,4|3,4", "remade": 0, "errors": [zero, zero, zero, zero],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// M1: a choice whose branches all have the same key (`x == sel ? <li key={x} class="s"/> : <li
+// key={x}/>`, or a match of them) is keyed by that alone: what the choice reads made the list follow
+// it, every row's key read again at each pick (5,000 rows: 0.14 ms a pick became 0.47). The bundle's
+// lists: only those whose key reads state follow it (`${gen}-${x}`, and a filter's, whose hidden
+// rows have another key). Arms whose patterns give the key's name keep their choice, and rows stay
+// keyed: after a pick and a reverse, the row whose branch stayed keeps what was typed (the two that
+// switched start afresh, as a switched branch does).
+#[test]
+fn a_choice_whose_branches_have_one_key_is_keyed_by_it_alone() {
+    let src = r###"component Pick() {
+    state xs = [1, 2, 3]
+    state ms = [{ id: 1, n: 0 }, { id: 2, n: 1 }, { id: 3, n: 0 }]
+    state sel = 1
+    state gen = 1
+    state lo = 0
+    <div>
+        <ul #pick>{for x in xs => x == sel ? <li key={x} class="s"><input/>{x}</li> : <li key={x}><input/>{x}</li>}</ul>
+        <ul #pickm>{for x in xs => match x == sel { true => <li key={x} class="s"><input/>{x}</li>, _ => <li key={x}><input/>{x}</li> }}</ul>
+        <ul #bound>{for x in ms => match x { { id, n: 0 } => <li key={id}><input/>{id}</li>, { id } => <li key={id} class="k"><input/>{id}</li> }}</ul>
+        <ul #gen>{for x in xs => <li key={`${gen}-${x}`}><input/>{x}</li>}</ul>
+        <ul #filt>{for x in xs => x >= lo ? <li key={x}><input/>{x}</li> : null}</ul>
+        <button #sel @click={() => { sel += 1 }}>sel</button>
+        <button #rev @click={() => { xs = reverse(xs); ms = reverse(ms) }}>rev</button>
+    </div>
+}
+route GET /h = <html><head><title>t</title></head><body><Pick/></body></html>
+"###;
+    let body = r##"    const src = [...document.scripts].map((s) => s.src).find((s) => s.includes("/_quillo/b/"));
+    const js = await (await fetch(src)).text();
+    // Each list's call, to its closing parenthesis.
+    const calls = [];
+    for (let at = js.indexOf("W.each("); at >= 0; at = js.indexOf("W.each(", at + 1)) {
+      let d = 0, i = at + 6, q = null;
+      for (; i < js.length; i++) {
+        const ch = js[i];
+        if (q) { if (ch === "\\") i++; else if (ch === q) q = null; }
+        else if (ch === '"' || ch === "'" || ch === "`") q = ch;
+        else if (ch === "(") d++;
+        else if (ch === ")" && --d === 0) break;
+      }
+      calls.push(js.slice(at, i + 1));
+    }
+    const ids = ["pick", "pickm", "bound", "gen", "filt"];
+    for (const id of ids) for (const i of $(id).querySelectorAll("input")) i.value = "t" + i.parentNode.textContent;
+    const rows = (id) => [...$(id).children].map((li) => li.textContent + "=" + li.querySelector("input").value).join(",");
+    await click("sel", "rev");
+    const out = { follows: calls.map((c) => c.endsWith(", true)")) };
+    for (const id of ids.slice(0, 3)) out[id] = rows(id);
+    return out;"##;
+    let Some(rs) = in_pages("m1-one-key", src, &["/h"], body) else { return };
+    let want = serde_json::json!({
+        "follows": [false, false, false, true, true], "pick": "3=t3,2=,1=", "pickm": "3=t3,2=,1=", "bound": "3=t3,2=t2,1=t1",
+        "remade": 0, "errors": [],
+    });
+    assert_eq!(rs[0], want);
 }

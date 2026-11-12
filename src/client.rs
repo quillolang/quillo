@@ -4567,6 +4567,9 @@ impl<'a> Compiler<'a> {
         let key_js = match &key {
             Some(k) => {
                 self.push_scope();
+                // A hidden row's key (see `row_key`; FEEDBACK61.md, Q-897's review of 06cda99; branch
+                // feedback61).
+                self.declare_as(HIDDEN, Local::Var("W.hidden".into(), None));
                 let k = self.bind_pattern(pat, "$x", "`for` pattern does not match ").and_then(|binds| Ok((binds, self.reactive_expr(k)?)));
                 self.pop_scope();
                 let (binds, (k, reads)) = k?;
@@ -5175,27 +5178,47 @@ impl<'a> Compiler<'a> {
 /// (they run in the key's function too, so the key may use them); in a choice (`? :`, `if`,
 /// `match`) of elements that each have a `key`, the same choice of their keys, as React keys them
 /// (FEEDBACK55.md, Q-759; branch feedback55). A branch that shows nothing (`if` with no `else`,
-/// `null`, `cond && ...`) needs no key, and has none (null), when another branch has one: the row
+/// `null`, `cond && ...`) needs no key, and has none (see below), when another branch has one: the row
 /// is keyed by that. It was kept by place, and made again on every reorder, though its element had
 /// a key (FEEDBACK61.md, Q-897; branch feedback61).
+///
+/// Found in review of 06cda99 (FEEDBACK61.md, Q-895 and Q-897; branch feedback61): what shows
+/// nothing is also `true` (as on the server) and a block of only that (`else { null }`); its key is
+/// one no program can give (`HIDDEN`, `W.hidden` in the browser), where `null` was a real `null`
+/// key's too; and a choice whose branches all have the same key is keyed by that alone, so that
+/// what the choice reads (`x == sel ? <li key={x} class="s"/> : <li key={x}/>`) does not make the
+/// list follow it (see `each`).
 fn row_key(e: &Expr) -> Option<Expr> {
-    let nil = || Expr::Lit(Lit::Nil);
-    let nothing = |e: &Expr| matches!(e, Expr::Lit(Lit::Nil | Lit::Bool(false)));
+    fn nothing(e: &Expr) -> bool {
+        match e {
+            Expr::Lit(Lit::Nil | Lit::Bool(_)) => true,
+            Expr::Block(stmts) => match stmts.as_slice() {
+                [] => true,
+                [Stmt::Expr(x)] => nothing(x),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+    let hidden = || Expr::Ident(Sym::new(HIDDEN), 0);
     let either = |a: &Expr, b: Option<&Expr>| -> Option<(Expr, Expr)> {
         let b_nothing = b.is_none_or(nothing);
         if nothing(a) && b_nothing {
             return None;
         }
-        let ka = if nothing(a) { nil() } else { row_key(a)? };
+        let ka = if nothing(a) { hidden() } else { row_key(a)? };
         let kb = match b {
             Some(b) if !nothing(b) => row_key(b)?,
-            _ => nil(),
+            _ => hidden(),
         };
         Some((ka, kb))
     };
     match e {
         Expr::If(c, a, b) => {
             let (ka, kb) = either(a, b.as_deref())?;
+            if same_expr(&ka, &kb) {
+                return Some(ka);
+            }
             return Some(Expr::If(c.clone(), Box::new(ka), Some(Box::new(kb))));
         }
         Expr::Binary(BinOp::And, c, a, _) => {
@@ -5203,7 +5226,16 @@ fn row_key(e: &Expr) -> Option<Expr> {
             return Some(Expr::If(c.clone(), Box::new(ka), Some(Box::new(kb))));
         }
         Expr::Match(subj, arms, line) if arms.iter().any(|a| !nothing(&a.body)) => {
-            let arms = arms.iter().map(|a| Some(Arm { body: if nothing(&a.body) { nil() } else { row_key(&a.body)? }, ..a.clone() })).collect::<Option<Vec<_>>>()?;
+            let arms = arms.iter().map(|a| Some(Arm { body: if nothing(&a.body) { hidden() } else { row_key(&a.body)? }, ..a.clone() })).collect::<Option<Vec<_>>>()?;
+            // The same key in every arm, and no name an arm's pattern gives that it could read.
+            let binds = arms.iter().any(|a| {
+                let mut names = Vec::new();
+                pattern_names(&a.pat, &mut names);
+                !names.is_empty()
+            });
+            if !binds && arms.iter().all(|a| same_expr(&a.body, &arms[0].body)) {
+                return Some(arms[0].body.clone());
+            }
             return Some(Expr::Match(subj.clone(), arms, *line));
         }
         _ => {}
@@ -5219,6 +5251,34 @@ fn row_key(e: &Expr) -> Option<Expr> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// The name a hidden row's key is read by (see `row_key`): no name a program can write, as names
+/// do not begin with `$`. `each` makes it `W.hidden`.
+const HIDDEN: &str = "$hidden";
+
+/// Whether two keys are the same expression as written, on whatever lines: names, fields,
+/// indexes, operators, calls, text with holes and literals (see `row_key`). Anything else is not.
+fn same_expr(a: &Expr, b: &Expr) -> bool {
+    let all = |xs: &[Expr], ys: &[Expr]| xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| same_expr(x, y));
+    match (a, b) {
+        (Expr::Lit(x), Expr::Lit(y)) => format!("{:?}", x) == format!("{:?}", y),
+        (Expr::Ident(x, _), Expr::Ident(y, _)) => x == y,
+        (Expr::Field(x, f, _), Expr::Field(y, g, _)) => f == g && same_expr(x, y),
+        (Expr::Index(x, i, _), Expr::Index(y, j, _)) => same_expr(x, y) && same_expr(i, j),
+        (Expr::Unary(o, x, _), Expr::Unary(p, y, _)) => format!("{:?}", o) == format!("{:?}", p) && same_expr(x, y),
+        (Expr::Binary(o, x, u, _), Expr::Binary(p, y, v, _)) => o == p && same_expr(x, y) && same_expr(u, v),
+        (Expr::Call(f, xs, _), Expr::Call(g, ys, _)) => same_expr(f, g) && all(xs, ys),
+        (Expr::Template(xs), Expr::Template(ys)) => {
+            xs.len() == ys.len()
+                && xs.iter().zip(ys).all(|p| match p {
+                    (TPart::Lit(s), TPart::Lit(t)) => s == t,
+                    (TPart::Expr(s), TPart::Expr(t)) => same_expr(s, t),
+                    _ => false,
+                })
+        }
+        _ => false,
     }
 }
 
