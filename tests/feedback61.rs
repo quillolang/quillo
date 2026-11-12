@@ -4795,3 +4795,566 @@ route GET /b = <html><head><title>t</title></head><body><Host now={false}/></bod
         assert_eq!(r, &want, "at {}", path);
     }
 }
+
+// ---- What the coverage run of 0802f42 found unrun ---------------------------------------------------
+
+/// The arguments of a JavaScript call whose `(` is just before `s`, up to its `)`: split at the commas
+/// outside brackets and strings.
+fn js_args(s: &str) -> Vec<&str> {
+    let b = s.as_bytes();
+    let (mut depth, mut quote, mut from, mut out) = (0usize, None::<u8>, 0usize, Vec::new());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if let Some(q) = quote {
+            if c == b'\\' {
+                i += 1;
+            } else if c == q {
+                quote = None;
+            }
+        } else {
+            match c {
+                b'"' | b'\'' | b'`' => quote = Some(c),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' if depth == 0 => {
+                    out.push(s[from..i].trim());
+                    return out;
+                }
+                b')' | b']' | b'}' => depth -= 1,
+                b',' if depth == 0 => {
+                    out.push(s[from..i].trim());
+                    from = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    panic!("a call with no end: {}", &s[..s.len().min(200)]);
+}
+
+/// The lists of a program's bundle (`client::bundle`), in the order they are written: each one's key
+/// function as compiled (`null` for a list kept by place), and whether the list follows what its key
+/// reads (`W.each(..., true)`). The program passes `quillo check` first.
+fn lists_of(name: &str, src: &str) -> Vec<(String, bool)> {
+    let app = App::new(name, src);
+    checked(&app.0);
+    let file = app.0.join("main.qwe");
+    let mut it = quillo::Interp::new(app.0.to_str().unwrap());
+    it.load_source(src, file.to_str().unwrap()).unwrap_or_else(|e| panic!("{}", e));
+    let js = quillo::client::bundle(&it).unwrap_or_else(|e| panic!("{}", e));
+    let mut out = Vec::new();
+    for (at, _) in js.match_indices("W.each(() =>") {
+        let args = js_args(&js[at + "W.each(".len()..]);
+        assert!(args.len() == 3 || args.len() == 4, "{:?}", args);
+        out.push((args[1].to_string(), args.get(3) == Some(&"true")));
+    }
+    out
+}
+
+// row_key's `&&` arm. The parser makes `cond && <li key/>` in markup an `if` (`and_as_if`, which looks
+// into `for` bodies), so rows written so were keyed by the `if` arm, and the `&&` arm never ran. It is
+// what keys a `&&` whose right side is markup the parser does not count as such: a `match`, or a
+// block ending in an element. Such rows are keyed by their element's key, hidden while the condition
+// is false. A branch that is a block of statements and then an element (`else { let n = ...; <li
+// key={n}/> }`) is no branch of nothing: keyed by its element's key, the statements run in the key.
+// Rows that show nothing either way (`if c { null } else { null }`, `c && null`, `c ? null : true`, an
+// `if` with no `else`, an empty block) have no key, and are kept by place, as a list of nothing may be.
+const AND_ROWS: &str = r###"component Rows() {
+    state xs = [{ id: 1, on: true, k: "a" }, { id: 2, on: true, k: "b" }, { id: 3, on: false, k: "a" }, { id: 4, on: true, k: "é" }]
+    <div>
+        <ul #am>{for x in xs => x.on && match x.k { "a" => <li key={x.id} class="a"><input/>{x.id}</li>, _ => <li key={x.id}><input/>{x.id}</li> }}</ul>
+        <ul #ab>{for x in xs => x.on && { let n = x.id; <li key={n}><input/>{n}</li> }}</ul>
+        <ul #el>{for x in xs { if x.on { <li key={x.id}><input/>{x.id}</li> } else { let n = x.id * 10; <li key={n}><input/>{n}</li> } }}</ul>
+        <ul #nn>{for x in xs { if x.on { null } else { null } }}</ul>
+        <ul #an>{for x in xs => x.on && null}</ul>
+        <ul #nt>{for x in xs => x.on ? null : true}</ul>
+        <ul #ni>{for x in xs { if x.on { null } }}</ul>
+        <ul #ne>{for x in xs { if x.on { } else { true } }}</ul>
+        <ul #ai>{for x in xs => x.on && <li key={x.id}><input/>{x.id}</li>}</ul>
+        <button #rev @click={() => { xs = reverse(xs) }}>rev</button>
+        <button #flip @click={() => { xs = xs | map((x) => x.id == 2 ? merge(x, { on: !x.on }) : x) }}>flip</button>
+        <button #none @click={() => { xs = [] }}>none</button>
+        <button #one @click={() => { xs = [{ id: 5, on: true, k: "a" }] }}>one</button>
+    </div>
+}
+component Host(now: bool) {
+    state shown = now
+    <div><button #show @click={() => { shown = true }}>show</button>{shown ? <Rows/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn rows_shown_by_and_with_a_match_or_a_block_are_keyed_and_rows_of_nothing_are_not() {
+    let lists = lists_of("and-row-keys-js", AND_ROWS);
+    let keyed = |k: &str, hidden: bool, block: bool| k.starts_with("($x) =>") && k.contains("W.hidden") == hidden && k.contains("$n_") == block;
+    let (am, ab, el, ai) = (&lists[0].0, &lists[1].0, &lists[2].0, &lists[8].0);
+    assert!(keyed(am, true, false), "{}", am);
+    assert!(keyed(ab, true, true), "{}", ab);
+    assert!(keyed(el, false, true), "{}", el);
+    assert!(keyed(ai, true, false), "{}", ai);
+    let place: Vec<&str> = lists[3..8].iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(place, ["null"; 5]);
+    // No key reads state: no list follows.
+    assert!(lists.iter().all(|(_, follows)| !follows), "{:?}", lists);
+    assert_eq!(lists.len(), 9);
+    // In the page: what was typed and the focus go with their rows through a reverse; a row hidden
+    // and shown again starts afresh; an empty list, then one row. The lists of nothing show nothing.
+    let body = r##"    const ids = ["am", "ab", "el", "ai"];
+    const nothing = ["nn", "an", "nt", "ni", "ne"];
+    for (const id of ids) for (const i of $(id).querySelectorAll("input")) i.value = "t" + i.parentNode.textContent;
+    const rows = (id) => [...$(id).children].map((li) => li.textContent + (li.className ? "." + li.className : "") + "=" + li.querySelector("input").value).join(",");
+    const all = () => { const o = {}; for (const id of ids) o[id] = rows(id); o.nothing = nothing.map((id) => $(id).children.length + $(id).textContent).join(""); return o; };
+    const f = $("am").querySelector("input"); f.focus();
+    const out = { load: all() };
+    await click("rev"); out.rev = all(); out.focusKept = document.activeElement === f;
+    await click("flip"); out.off = all();
+    await click("flip"); out.on = all();
+    await click("none"); out.none = all();
+    await click("one"); out.one = all();
+    return out;"##;
+    let Some(rs) = in_pages("and-row-keys", AND_ROWS, BOTH, body) else { return };
+    let o = |am: &str, ab: &str, el: &str, ai: &str| serde_json::json!({ "am": am, "ab": ab, "el": el, "ai": ai, "nothing": "00000" });
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            "load": o("1.a=t1,2=t2,4=t4", "1=t1,2=t2,4=t4", "1=t1,2=t2,30=t30,4=t4", "1=t1,2=t2,4=t4"),
+            "rev": o("4=t4,2=t2,1.a=t1", "4=t4,2=t2,1=t1", "4=t4,30=t30,2=t2,1=t1", "4=t4,2=t2,1=t1"),
+            "focusKept": true,
+            "off": o("4=t4,1.a=t1", "4=t4,1=t1", "4=t4,30=t30,20=,1=t1", "4=t4,1=t1"),
+            "on": o("4=t4,2=,1.a=t1", "4=t4,2=,1=t1", "4=t4,30=t30,2=,1=t1", "4=t4,2=,1=t1"),
+            "none": o("", "", "", ""),
+            "one": o("5.a=", "5=", "5=", "5="),
+            "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// same_expr's arms: a choice whose branches have the same key, written as a literal in an operation, an
+// index, a unary operator, a call or text with holes, is keyed by it alone, and its list does not
+// follow what the choice reads (`sel`, `pick`); only names and fields were tried. Keys that differ
+// only a little are not the same: a literal, an index, the operator, its operand, the function, an
+// argument, how many there are, a part of the text, the order of its parts, how many. Unicode in the
+// text and in the arguments.
+#[test]
+fn the_same_key_in_each_branch_is_found_in_every_form_it_takes() {
+    let cases: &[(&str, &str, &str, bool)] = &[
+        ("x", "x * 10 + 1", "x * 10 + 1", true),
+        ("x", "x * 10 + 1", "x * 10 + 2", false),
+        ("x", "x * 10 + 1", "x * 10 + 1.0", false),
+        ("p", "p[0]", "p[0]", true),
+        ("p", "p[0]", "p[1]", false),
+        ("x", "-x", "-x", true),
+        ("x", "-x", "x", false),
+        ("x", "-x", "-(x + 1)", false),
+        ("x", "!(x == 2)", "-x", false),
+        ("x", "x + 1", "x - 1", false),
+        ("w", "lower(w)", "lower(w)", true),
+        ("w", "replace(w, \"b\", \"ß\")", "replace(w, \"b\", \"ß\")", true),
+        ("w", "lower(w)", "upper(w)", false),
+        ("w", "split(w, \"b\")", "split(w, \"c\")", false),
+        ("w", "round(1.5)", "round(1.5, 1)", false),
+        ("x", "`é-${x}`", "`é-${x}`", true),
+        ("x", "`${x}`", "`${x}`", true),
+        ("x", "`${-x}:${x * 2 + 1}:${lower(str(x))}`", "`${-x}:${x * 2 + 1}:${lower(str(x))}`", true),
+        ("x", "`é-${x}`", "`e-${x}`", false),
+        ("x", "`${x}a`", "`a${x}`", false),
+        ("x", "`r${x}`", "`r${x}${x}`", false),
+        ("x", "`r${x}`", "`r${x + 0}`", false),
+    ];
+    let mut src = String::from("component Keys() {\n    state xs = [1, 2, 3]\n    state ps = [[1, \"a\"], [2, \"b\"]]\n    state ws = [\"Ab\", \"é\"]\n    state sel = 1\n    state pick = \"é\"\n    <div>\n");
+    for (i, (v, a, b, _)) in cases.iter().enumerate() {
+        let (list, cond) = match *v {
+            "x" => ("xs", "x == sel"),
+            "p" => ("ps", "p[0] == sel"),
+            _ => ("ws", "w == pick"),
+        };
+        src += &format!("        <ul #c{i}>{{for {v} in {list} => {cond} ? <li key={{{a}}} class=\"s\">{i}</li> : <li key={{{b}}}>{i}</li>}}</ul>\n");
+    }
+    src += "        <button #sel @click={() => { sel += 1; pick = \"Ab\" }}>sel</button>\n    </div>\n}\nroute GET / = <html><head><title>t</title></head><body><Keys/></body></html>\n";
+    let lists = lists_of("same-key-forms", &src);
+    assert_eq!(lists.len(), cases.len());
+    for ((key, follows), (_, a, b, same)) in lists.iter().zip(cases) {
+        let reads_choice = key.contains("$sel_") || key.contains("$pick_");
+        assert_eq!((*follows, reads_choice), (!same, !same), "{} and {}: {}", a, b, key);
+    }
+}
+
+/// A frame as a page may not send it: not masked.
+fn bare_frame(op: u8, fin: bool, data: &[u8]) -> Vec<u8> {
+    let mut f = vec![if fin { 0x80 } else { 0 } | op];
+    if data.len() < 126 {
+        f.push(data.len() as u8);
+    } else if data.len() <= 0xffff {
+        f.push(126);
+        f.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    } else {
+        f.push(127);
+        f.extend_from_slice(&(data.len() as u64).to_be_bytes());
+    }
+    f.extend_from_slice(data);
+    f
+}
+
+/// The request a page's socket opens with.
+fn ws_upgrade() -> quillo::server::HttpRequest {
+    quillo::server::HttpRequest {
+        method: "GET".into(),
+        url: "/_quillo/live".into(),
+        headers: [("Host", "x"), ("Upgrade", "websocket"), ("Connection", "Upgrade"), ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="), ("Sec-WebSocket-Version", "13")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        body: Vec::new(),
+        remote: "127.0.0.1".into(),
+    }
+}
+
+/// A page's socket made here (`ws::Socket::accept`), the page having sent `frames` once it was
+/// answered: the page's end and the server's.
+fn ws_pair(frames: &[u8]) -> (std::net::TcpStream, quillo::ws::Socket) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    let socket = quillo::ws::Socket::accept(&ws_upgrade(), server).expect("upgraded");
+    client.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut head = Vec::new();
+    let mut b = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        client.read_exact(&mut b).unwrap();
+        head.push(b[0]);
+    }
+    client.write_all(frames).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    (client, socket)
+}
+
+/// What the page's end reads until the server shuts the connection (2 s at most).
+fn ws_rest(c: &mut std::net::TcpStream) -> Vec<u8> {
+    use std::io::Read;
+    c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut got = Vec::new();
+    let _ = c.read_to_end(&mut got);
+    got
+}
+
+// The frame reader's paths no test took: a message one of whose later parts is not masked is passed
+// over whole, its masked parts after that too (`taken = false`), whatever its length, the limit being
+// for what is taken: at the limit and one byte past it, and under it; an empty part; a character split
+// between parts, taken whole when masked. A close between a message's parts ends the socket with a
+// close of its code, a message passed over or not. Each time, what follows is read as it should be.
+#[test]
+fn a_message_whose_later_part_is_not_masked_is_passed_over_and_a_close_between_parts_ends_it() {
+    use quillo::ws::Heard;
+    let heard = |s: &mut quillo::ws::Socket| -> (Heard, String) {
+        let mut got = Vec::new();
+        let h = s.heard(16, Duration::from_millis(300), |p| got.extend_from_slice(p));
+        (h, String::from_utf8_lossy(&got).into_owned())
+    };
+    let mut w = ws_frame(0x1, false, b"ab");
+    w.extend(bare_frame(0x0, true, b"cd"));
+    w.extend(ws_frame(0x1, false, b"a"));
+    w.extend(bare_frame(0x0, false, b"b"));
+    w.extend(ws_frame(0x0, true, b"c"));
+    w.extend(ws_frame(0x1, false, b"x"));
+    w.extend(bare_frame(0x0, true, b""));
+    w.extend(ws_frame(0x1, false, &[0xc3]));
+    w.extend(bare_frame(0x0, true, &[0xa9]));
+    w.extend(ws_frame(0x1, false, &[0xc3]));
+    w.extend(ws_frame(0x0, true, &[0xa9]));
+    w.extend(ws_frame(0x1, false, b""));
+    w.extend(ws_frame(0x0, true, b""));
+    w.extend(ws_frame(0x1, true, b"ok"));
+    let (_c, mut s) = ws_pair(&w);
+    assert_eq!(heard(&mut s).0, Heard::Text(false), "a bare last part");
+    assert_eq!(heard(&mut s).0, Heard::Text(false), "a masked part after a bare one");
+    assert_eq!(heard(&mut s).0, Heard::Text(false), "an empty bare part");
+    assert_eq!(heard(&mut s).0, Heard::Text(false), "é split, its second byte bare");
+    assert_eq!(heard(&mut s), (Heard::Text(true), "é".into()), "é split, masked");
+    assert_eq!(heard(&mut s), (Heard::Text(true), String::new()), "two empty parts");
+    assert_eq!(heard(&mut s), (Heard::Text(true), "ok".into()));
+    assert_eq!(heard(&mut s), (Heard::Nothing, String::new()));
+    // The limit (16 here): 8 and 8 masked is taken; 16 masked and 1 bare, 17 in all, and 15 and 1, are
+    // passed over, not refused, and the socket stays; 16 and 1 masked are refused with 1009.
+    let mut w = ws_frame(0x1, false, &[b'x'; 8]);
+    w.extend(ws_frame(0x0, true, &[b'x'; 8]));
+    w.extend(ws_frame(0x1, false, &[b'y'; 16]));
+    w.extend(bare_frame(0x0, true, b"y"));
+    w.extend(ws_frame(0x1, false, &[b'z'; 15]));
+    w.extend(bare_frame(0x0, true, b"z"));
+    w.extend(ws_frame(0x1, false, &[b'v'; 4]));
+    w.extend(bare_frame(0x0, true, &[b'v'; 300]));
+    w.extend(ws_frame(0x1, true, b"ok"));
+    let (mut c2, mut s2) = ws_pair(&w);
+    assert_eq!(heard(&mut s2), (Heard::Text(true), "x".repeat(16)));
+    assert_eq!(heard(&mut s2).0, Heard::Text(false), "16 and 1 bare");
+    assert_eq!(heard(&mut s2).0, Heard::Text(false), "15 and 1 bare");
+    assert_eq!(heard(&mut s2).0, Heard::Text(false), "4 and 300 bare");
+    assert_eq!(heard(&mut s2), (Heard::Text(true), "ok".into()));
+    assert!(s2.send("still"), "the socket stays");
+    let mut frame = [0u8; 7];
+    use std::io::Read;
+    c2.read_exact(&mut frame).unwrap();
+    assert_eq!(&frame, b"\x81\x05still", "no close came before it");
+    let mut w = ws_frame(0x1, false, &[b'y'; 16]);
+    w.extend(ws_frame(0x0, true, b"y"));
+    let (mut c3, mut s3) = ws_pair(&w);
+    assert_eq!(heard(&mut s3).0, Heard::Gone);
+    assert_eq!(ws_rest(&mut c3), [0x88, 2, 0x03, 0xf1]);
+    // A close between parts: of a message being taken, with a code and with none, and of one passed
+    // over; the socket ends with a close of its code, and what came after is not read.
+    let between = |code: &[u8], bare_part: bool| {
+        let mut w = ws_frame(0x1, false, b"ab");
+        if bare_part {
+            w.extend(bare_frame(0x0, false, b"cd"));
+        }
+        w.extend(ws_frame(0x8, true, code));
+        w.extend(ws_frame(0x1, true, b"after"));
+        w
+    };
+    for (code, bare_part, want) in [(&[0x03, 0xe8][..], false, vec![0x88, 2, 0x03, 0xe8]), (&[][..], false, vec![0x88, 0]), (&[0x03, 0xe9][..], true, vec![0x88, 2, 0x03, 0xe9])] {
+        let (mut c, mut s) = ws_pair(&between(code, bare_part));
+        assert_eq!(heard(&mut s).0, Heard::Gone, "{:?}", code);
+        assert_eq!(ws_rest(&mut c), want, "{:?}", code);
+    }
+}
+
+// server.rs's page_said: a message of topics passed over (a later part not masked, reserved bits, a new
+// message before it ended) changes nothing: the topics followed stay, and none is answered. One
+// longer than the most a page follows, passed over, does not end the socket. A message after them is
+// followed. A close between the parts of a message of topics is answered at once with its code, and
+// the page's thread ends.
+#[test]
+fn topics_passed_over_leave_the_topics_followed_and_a_close_between_parts_is_answered() {
+    use std::io::Write;
+    let s = served("q900-passed-over", LIVE_SOCKET);
+    let seq = s.seq();
+    let mut p = live_ws(s.port, &format!("since={}&s=&t=a", seq)).unwrap();
+    let head = |since: u64| format!("since={}&s=\n", since);
+    let quiet = Duration::from_millis(400);
+    let soon = Duration::from_secs(2);
+    let mut w = ws_frame(0x1, false, head(seq).as_bytes());
+    w.extend(bare_frame(0x0, true, b"b"));
+    let mut odd = ws_frame(0x1, true, format!("{}c", head(seq)).as_bytes());
+    odd[0] |= 0x40;
+    w.extend(odd);
+    w.extend(ws_frame(0x1, false, format!("{}d", head(seq)).as_bytes()));
+    w.extend(ws_frame(0x1, true, format!("{}e", head(seq)).as_bytes()));
+    // The most a page follows (see topics_sent_down_the_open_socket_are_followed), and one byte more.
+    const MOST: usize = 128 + 256 * (448 * 3 + 1);
+    let first = format!("{}g", head(seq));
+    w.extend(ws_frame(0x1, false, first.as_bytes()));
+    w.extend(bare_frame(0x0, true, ",".repeat(MOST + 1 - first.len()).as_bytes()));
+    p.0.write_all(&w).unwrap();
+    assert_eq!(p.told(quiet), None, "a message passed over was answered");
+    for t in ["b", "c", "d", "e", "g"] {
+        s.bump(t);
+    }
+    assert_eq!(p.told(quiet), None, "a topic passed over is followed");
+    s.bump("a");
+    assert_eq!(p.told(soon).expect("a, still followed")["changed"], serde_json::json!(["a"]));
+    p.text(&format!("{}f", head(s.seq())));
+    assert_eq!(p.told(soon).expect("answered")["changed"], serde_json::json!([]));
+    s.bump("a");
+    assert_eq!(p.told(quiet), None);
+    s.bump("f");
+    assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!(["f"]));
+    // A close between the parts.
+    p.send(0x1, false, head(s.seq()).as_bytes());
+    let t0 = Instant::now();
+    p.send(0x8, true, &1000u16.to_be_bytes());
+    assert_eq!(p.frame(Duration::from_secs(2)), Some((0x8, 1000u16.to_be_bytes().to_vec())));
+    assert!(t0.elapsed() < Duration::from_secs(1), "answered after {:?}", t0.elapsed());
+    assert!(p.ended(Duration::from_secs(2)), "the connection stays");
+    assert!(s.within(1000, |s| s.metric("quillo_live_pages") == 0), "{} pages", s.metric("quillo_live_pages"));
+}
+
+/// The thread of this process named `name`, to signal (`signal_thread`).
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn thread_named(name: &str) -> Option<libc::pthread_t> {
+    extern "C" {
+        fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> libc::kern_return_t;
+    }
+    // SAFETY: the task's own list of threads, each looked up by libpthread (which says so of one that
+    // has ended), every port and the list given back.
+    unsafe {
+        let me = libc::mach_task_self();
+        let (mut list, mut n): (libc::thread_act_array_t, libc::mach_msg_type_number_t) = (std::ptr::null_mut(), 0);
+        if libc::task_threads(me, &mut list, &mut n) != 0 {
+            return None;
+        }
+        let mut found = None;
+        for i in 0..n as usize {
+            let port = *list.add(i);
+            let t = libc::pthread_from_mach_thread_np(port);
+            let mut buf = [0 as libc::c_char; 64];
+            if t != 0 && libc::pthread_getname_np(t, buf.as_mut_ptr(), buf.len()) == 0 && std::ffi::CStr::from_ptr(buf.as_ptr()).to_bytes() == name.as_bytes() {
+                found = Some(t);
+            }
+            mach_port_deallocate(me, port);
+        }
+        libc::vm_deallocate(me, list as libc::vm_address_t, n as libc::vm_size_t * std::mem::size_of::<libc::thread_act_t>() as libc::vm_size_t);
+        found
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn thread_named(name: &str) -> Option<libc::pid_t> {
+    std::fs::read_dir("/proc/self/task").ok()?.flatten().find_map(|e| {
+        let comm = std::fs::read_to_string(e.path().join("comm")).ok()?;
+        if comm.trim_end() != name {
+            return None;
+        }
+        e.file_name().to_str()?.parse().ok()
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn signal_thread(t: libc::pthread_t, sig: libc::c_int) {
+    // SAFETY: a thread of this process that never ends (the watcher's).
+    assert_eq!(unsafe { libc::pthread_kill(t, sig) }, 0);
+}
+
+#[cfg(target_os = "linux")]
+fn signal_thread(t: libc::pid_t, sig: libc::c_int) {
+    // SAFETY: tgkill, to a thread of this process.
+    assert_eq!(unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), t, sig) }, 0);
+}
+
+// The watcher's wait (`ws::watch::unix::watching`) interrupted by a signal, as a profiler's or a
+// library's interrupts a thread: it waits again, and what pages send is still told at once, to the
+// sockets watched before and to one watched after. Here SIGUSR1, with a handler that does nothing and
+// no SA_RESTART, sent to the watcher's thread alone; the handler stays, as a signal still on its way
+// would end the tests under the default one.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_watcher_goes_on_after_a_signal_interrupts_its_wait() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::Arc;
+    extern "C" fn nothing(_: libc::c_int) {}
+    // SAFETY: a handler that does nothing, for a signal nothing else in these tests sends.
+    unsafe {
+        let mut a: libc::sigaction = std::mem::zeroed();
+        a.sa_sigaction = nothing as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        libc::sigemptyset(&mut a.sa_mask);
+        a.sa_flags = 0;
+        assert_eq!(libc::sigaction(libc::SIGUSR1, &a, std::ptr::null_mut()), 0);
+    }
+    let counter = || {
+        let n = Arc::new(AtomicUsize::new(0));
+        let m = n.clone();
+        (n, Arc::new(move || {
+            m.fetch_add(1, SeqCst);
+        }) as Arc<dyn Fn() + Send + Sync>)
+    };
+    let until = |n: &AtomicUsize, more_than: usize| {
+        let t0 = Instant::now();
+        while n.load(SeqCst) <= more_than {
+            assert!(t0.elapsed() < Duration::from_secs(5), "not told");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let (mut c, mut s) = ws_pair(b"");
+    let (told, f) = counter();
+    assert!(s.watch(f));
+    let watcher = thread_named("quillo-ws-watch").expect("the watcher's thread");
+    let interrupt = || {
+        for _ in 0..40 {
+            signal_thread(watcher, libc::SIGUSR1);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    interrupt();
+    let before = told.load(SeqCst);
+    c.write_all(&ws_frame(0x9, true, b"p")).unwrap();
+    until(&told, before);
+    assert_eq!(s.heard(16, Duration::from_millis(300), |_| {}), quillo::ws::Heard::Nothing);
+    let mut pong = [0u8; 3];
+    c.read_exact(&mut pong).unwrap();
+    assert_eq!(pong, [0x8a, 1, b'p']);
+    // Interrupted again: a socket watched now is told, and so is the first, of a close.
+    interrupt();
+    let (mut c2, mut s2) = ws_pair(b"");
+    let (told2, f2) = counter();
+    assert!(s2.watch(f2));
+    interrupt();
+    c2.write_all(&ws_frame(0x9, true, b"")).unwrap();
+    until(&told2, 0);
+    let before = told.load(SeqCst);
+    c.write_all(&ws_frame(0x8, true, &1000u16.to_be_bytes())).unwrap();
+    until(&told, before);
+    assert_eq!(s.heard(16, Duration::from_millis(300), |_| {}), quillo::ws::Heard::Gone);
+    assert_eq!(ws_rest(&mut c), [0x88, 2, 0x03, 0xe8]);
+}
+
+// A socket the system will not watch (`ws::watch::unix::Watching::new`, its registration refused):
+// `watch` says so, so that it is looked at now and then instead, and the descriptor, which the watch
+// only borrows, is given back open. The system refuses a real socket only when short of memory or,
+// on Linux, of epoll watches; here the socket's descriptor is made /dev/null in place (`dup2`, the
+// number never free), which neither kqueue nor epoll takes, then made the connection again: the
+// socket writes, and is watched and told, and the refused watch was told nothing.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_socket_the_system_will_not_watch_says_so_and_keeps_its_descriptor() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::Arc;
+    let counter = || {
+        let n = Arc::new(AtomicUsize::new(0));
+        let m = n.clone();
+        (n, Arc::new(move || {
+            m.fetch_add(1, SeqCst);
+        }) as Arc<dyn Fn() + Send + Sync>)
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut c = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    let fd = server.as_raw_fd();
+    let mut s = quillo::ws::Socket::accept(&ws_upgrade(), server).expect("upgraded");
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut head = Vec::new();
+    let mut b = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        c.read_exact(&mut b).unwrap();
+        head.push(b[0]);
+    }
+    let null = std::fs::OpenOptions::new().read(true).write(true).open("/dev/null").unwrap();
+    // SAFETY: descriptors of this test's own: a copy of the connection's, and its number made
+    // /dev/null's and then the connection's again, never closed in between.
+    let real = unsafe { libc::dup(fd) };
+    assert!(real >= 0);
+    assert_eq!(unsafe { libc::dup2(null.as_raw_fd(), fd) }, fd);
+    let (refused, f) = counter();
+    assert!(!s.watch(f), "watched");
+    // SAFETY: a stat of the descriptor, into a struct made for it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0, "the descriptor was closed");
+    assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFCHR, "the descriptor is not /dev/null's");
+    assert_eq!(unsafe { libc::dup2(real, fd) }, fd);
+    assert_eq!(unsafe { libc::close(real) }, 0);
+    assert!(s.send("still written"));
+    let mut frame = [0u8; 15];
+    c.read_exact(&mut frame).unwrap();
+    assert_eq!(&frame, b"\x81\x0dstill written");
+    let (told, f) = counter();
+    assert!(s.watch(f), "watched once it is a socket again");
+    c.write_all(&ws_frame(0x9, true, "é".as_bytes())).unwrap();
+    let t0 = Instant::now();
+    while told.load(SeqCst) == 0 {
+        assert!(t0.elapsed() < Duration::from_secs(5), "not told");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(s.heard(16, Duration::from_millis(300), |_| {}), quillo::ws::Heard::Nothing);
+    let mut pong = [0u8; 4];
+    c.read_exact(&mut pong).unwrap();
+    assert_eq!(pong, [0x8a, 2, 0xc3, 0xa9]);
+    assert_eq!(refused.load(SeqCst), 0);
+    drop(s);
+    assert!(ws_rest(&mut c).is_empty(), "the connection ends with the socket");
+}
