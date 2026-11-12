@@ -5871,7 +5871,7 @@ function liveTell(key) {
 
 async function liveLoop() {
   // Tries in a row that came to nothing, and whether the page was told (see `liveFailed`).
-  const st = { fails: 0, said: false, back: null };
+  const st = { fails: 0, said: false, back: null, revived: false };
   // The plain requests carrying the changes while there is no socket (`liveCarrier`), and the sockets
   // in a row that did not open meanwhile.
   let carrier = null, socks = 0;
@@ -5898,7 +5898,7 @@ async function liveLoop() {
         // It opened, and has closed: a server that restarts must not have every page at once, so
         // each waits a second or so, spread out (FEEDBACK24.md, Q-194; branch feedback24-fixes).
         st.fails = socks = 0;
-        st.said = false;
+        st.said = st.revived = false;
         wait = 1000;
       } else {
         if (ctrl.signal.aborted) continue;
@@ -5933,8 +5933,13 @@ function liveFailed(st, plainly) {
 }
 
 // Waits `ms`, or until `signal` ends it (the page's topics changed), or `st.back` (see
-// `liveCarrier`), which makes it resolve true.
+// `liveCarrier`), which makes it resolve true, as it does at once if the server came back before the
+// wait began (`st.revived`).
 function liveWait(ms, signal, st) {
+  if (st && st.revived) {
+    st.revived = false;
+    return Promise.resolve(true);
+  }
   return new Promise((r) => {
     const back = () => end(true);
     const end = (v) => { clearTimeout(t); if (st && st.back === back) st.back = null; r(v); };
@@ -5963,11 +5968,15 @@ function liveCarrier(key, plain, st) {
           const j = readJSON(await r.text());
           if (c.stopped) return;
           liveChanged(j);
-          // Answered after failures: the server is back, and the next socket need wait no more.
-          const back = st.fails > 0 && st.back;
+          // Answered after failures: the server is back, and the next socket need wait no more,
+          // the loop's wait ended now, or the next one when the socket it is trying ends: answered
+          // while that socket was still trying, the next wait was the whole half minute, and the
+          // page stayed off sockets that long (found by CI, a 4-core runner under coverage).
+          const back = st.fails > 0;
           fails = st.fails = c.after = 0;
           st.said = false;
-          if (back) back();
+          if (back && st.back) st.back();
+          else if (back) st.revived = true;
           continue;
         }
         if (c.stopped) return;

@@ -2679,12 +2679,19 @@ fn an_outage_whose_requests_fail_slowly_is_waited_out_and_said() {
     const sockets = window.__made - m0, asks = window.__asks.length;
     const said = (window.__quilloErrors || []).filter((e) => /not reaching this page/.test(e)).length;
     window.__down = false;
-    await write("a", 9);
-    const back = await until("a", 9, 50000);
-    // The plain request answered again ends the wait for the next socket.
+    // One more than it shows: the pages share the server's table, and the first wrote already.
+    const next = +$("va").textContent + 1;
+    await write("a", next);
+    const back = await until("a", next, 50000);
+    // The plain request answered again ends the wait for the next socket at once, or, while a socket
+    // is still trying (it fails after `d`), the wait after it: a socket is open within `d` and the
+    // time to open one, given 8 s here for a slow machine under coverage.
+    const d = +new URLSearchParams(location.search).get("d") || 0;
     const open = () => window.__socks.some((s) => s.readyState === 1);
-    for (let i = 0; i < 500 && !open(); i++) await tick(20);
-    return {{ sockets, asks, said, back: back !== null, socketBack: open() }};"##
+    const t1 = performance.now();
+    for (let i = 0; i < 1000 && !open(); i++) await tick(20);
+    const socketAfter = Math.round(performance.now() - t1);
+    return {{ sockets, asks, said, back: back !== null, socketBack: open() && socketAfter <= d + 8000, socketAfter }};"##
     );
     let Some(rs) = in_pages_for("q900-outage", PAGES_MOVED, &["/outage/a?d=5000", "/outage/a?d=0"], &body, false, 120_000) else { return };
     for (r, (most, path)) in rs.iter().zip([(4, "slow"), (6, "at once")]) {
