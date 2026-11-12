@@ -5785,7 +5785,7 @@ async function rpc(name, args, idem) {
 // server decides; asked with another server's number, it answers that all
 // the topics changed, and the page loads them again once.
 
-const Live = { seq: 0, server: "", subs: new Set(), ctrl: null, running: false, key: "" };
+const Live = { seq: 0, server: "", subs: new Set(), ctrl: null, running: false, key: "", ws: null };
 
 // Also takes data-v="<seq>:<server>" from a server-rendered island, split.
 function liveSeen(seq, server = "") {
@@ -5811,16 +5811,36 @@ function liveTopics() {
 // it reads.
 const liveKey = (topics) => topics.filter((t) => t.length <= 448).slice(0, 256).map((t) => t.replace(/%/g, "%25").replace(/,/g, "%2C")).join(",");
 
-// Starts waiting, or starts again when the set of topics changed.
+// Starts waiting, or starts again when the set of topics changed. An open socket takes the new
+// topics instead: a page that moved closed its socket and opened another for each page, every close
+// was left unanswered by the server for up to 5 s, and Firefox then held back the next socket, for
+// 10 to 45 s and more, the page hearing no change meanwhile (FEEDBACK61.md, Q-900; branch
+// feedback61).
 function liveRestart() {
   queueMicrotask(() => {
     if (!Live.running) {
       Live.running = true;
       liveLoop();
-    } else if (liveKey(liveTopics()) !== Live.key && Live.ctrl) {
-      Live.ctrl.abort();
+      return;
     }
+    const key = liveKey(liveTopics());
+    if (key === Live.key || !Live.ctrl) return;
+    // None, while a new page's states load and learn theirs: the socket is kept for them.
+    if (!key && [...Live.subs].some((s) => s.loading)) return;
+    if (!key || !liveTell(key)) Live.ctrl.abort();
   });
+}
+
+// Sends the topics down the open socket, after a line with the sequence number and server the page
+// knows, as its address gives them on opening; the server answers at once with where they stand.
+// Only down a socket whose server said it takes them (`Live.ws`): one that does not (an older one,
+// or one that cannot watch its sockets) has a socket opened for them, as before.
+function liveTell(key) {
+  const ws = Live.ws;
+  if (!ws || ws.readyState !== 1) return false;
+  Live.key = key;
+  ws.send("since=" + Live.seq + "&s=" + Live.server + "\n" + key);
+  return true;
 }
 
 async function liveLoop() {
@@ -5835,7 +5855,8 @@ async function liveLoop() {
     if (!topics.length) { Live.running = false; return; }
     const ctrl = (Live.ctrl = new AbortController());
     const t = encodeURIComponent(Live.key), later = t.length > LIVE_IN_URL;
-    const url = BASE + "/_quillo/live?since=" + Live.seq + "&s=" + Live.server + (later ? "&tm=1" : "&t=" + t);
+    // `tk=1`: the server says at once whether the socket takes new topics (see `liveTell`).
+    const url = BASE + "/_quillo/live?since=" + Live.seq + "&s=" + Live.server + "&tk=1" + (later ? "&tm=1" : "&t=" + t);
     // What a refusal asks for: a server that is full says when to try again.
     let after = 0;
     try {
@@ -5865,19 +5886,40 @@ async function liveLoop() {
 const LIVE_IN_URL = 6000;
 
 // Resolves when the socket closes: true if it had opened. `first`: the topics, sent once it has.
+// One that has not opened within 3 s is given up for the plain request, which waits for the same
+// changes: a socket the browser held back left the page with nothing, no request and no retry, for as
+// long as the browser held it (FEEDBACK61.md, Q-900; branch feedback61).
 function liveSocket(url, signal, first) {
   return new Promise((resolve) => {
     if (typeof WebSocket !== "function" && !(WIRE && WIRE.socket)) return resolve(false);
     const ws = openSocket(url);
-    let opened = false;
-    ws.onopen = () => { opened = true; if (first !== null) ws.send(first); };
-    ws.onmessage = (m) => { if (!signal.aborted) liveChanged(readJSON(m.data)); };
-    ws.onclose = () => resolve(opened);
+    let opened = false, over = false;
+    const done = (v) => {
+      over = true;
+      clearTimeout(late);
+      if (Live.ws === ws) Live.ws = null;
+      resolve(v);
+    };
+    const late = setTimeout(() => { ws.onclose = null; ws.close(); done(false); }, 3000);
+    ws.onopen = () => {
+      if (over) return;
+      opened = true;
+      clearTimeout(late);
+      if (first !== null) ws.send(first);
+    };
+    ws.onmessage = (m) => {
+      if (signal.aborted) return;
+      const j = readJSON(m.data);
+      // The server takes new topics down this socket (see `liveTell`).
+      if (j.takes === "topics") Live.ws = ws;
+      liveChanged(j);
+    };
+    ws.onclose = () => done(opened);
     // Carry on at once: a closing socket finishes closing in its own time
     // (the browser waits for the server's answer), and says nothing more.
     signal.addEventListener("abort", () => {
       ws.close();
-      resolve(true);
+      done(true);
     });
   });
 }

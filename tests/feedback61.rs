@@ -1589,3 +1589,594 @@ fn a_card_dropped_into_another_list_hears_its_dragend() {
         assert_eq!(r, &want, "at {}", path);
     }
 }
+
+// ---- A live page's socket (Q-900) --------------------------------------------------------------
+// A page that moved to a page following other topics closed its socket and opened another, and the
+// server took a close only at its next look, every 5 s, then dropped the connection unanswered: every
+// close ended as 1006, a failed connection, after which Firefox held back the page's next socket and
+// the page heard nothing for 10 to 45 s and more. A close is answered now at once, with its code, and
+// the page's thread and place are let go; a page sends its new topics down the socket it has, as a
+// line `since=N&s=S` and the topics, answered at once with where they stand, once its server has said
+// the socket takes them (`takes`); and a socket that has not opened in 3 s gives way to the plain
+// request. The server's side is tried with a
+// plain client, the page's in Chrome.
+
+const LIVE_SOCKET: &str = "route POST /bump/*t {\n    publish(t)\n    \"ok\"\n}\nroute GET / = \"ok\"\n";
+
+/// A server for one program, of the quillo `quillo()` gives, with its metrics.
+struct Served {
+    _server: support::Guard,
+    _app: App,
+    port: u16,
+}
+
+fn served(name: &str, src: &str) -> Served {
+    let app = App::new(name, src);
+    checked(&app.0);
+    let port = support::free_port();
+    let server = support::Guard::new(
+        Command::new(quillo())
+            .arg("run")
+            .arg(app.0.join("main.qwe"))
+            .args(["--port", &port.to_string(), "--metrics"])
+            .current_dir(&app.0)
+            .env("QUILLO_SECRET", "a test secret for live data, long enough to use")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !support::listening(port) {
+        assert!(Instant::now() < deadline, "server did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Served { _server: server, _app: app, port }
+}
+
+impl Served {
+    fn metric(&self, name: &str) -> i64 {
+        let text = support::send(self.port, "GET", "/_quillo/metrics", &[], "").body;
+        text.lines().find_map(|l| l.strip_prefix(name).and_then(|r| r.trim().parse().ok())).unwrap_or_else(|| panic!("no {} in\n{}", name, text))
+    }
+
+    /// The live data's number now.
+    fn seq(&self) -> u64 {
+        let a = support::send(self.port, "GET", "/_quillo/live?since=0&t=none", &[], "");
+        serde_json::from_str::<serde_json::Value>(&a.body).unwrap_or_else(|e| panic!("{}: {}", e, a.body))["seq"].as_u64().unwrap()
+    }
+
+    /// A change to topic `t` (written as a path).
+    fn bump(&self, t: &str) {
+        assert_eq!(support::send(self.port, "POST", &format!("/bump/{}", t), &[], "").body, "ok");
+    }
+
+    /// Whether `f` holds within `ms`.
+    fn within(&self, ms: u64, f: impl Fn(&Served) -> bool) -> bool {
+        let until = Instant::now() + Duration::from_millis(ms);
+        loop {
+            if f(self) {
+                return true;
+            }
+            if Instant::now() > until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// A page's live socket, by hand.
+struct LiveWs(std::net::TcpStream);
+
+/// `/_quillo/live?` and `query` as a socket; the status line if it is refused.
+fn live_ws(port: u16, query: &str) -> Result<LiveWs, String> {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(s, "GET /_quillo/live?{} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", query).unwrap();
+    let mut head = Vec::new();
+    let mut b = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if s.read_exact(&mut b).is_err() {
+            break;
+        }
+        head.push(b[0]);
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    if head.starts_with("HTTP/1.1 101") {
+        Ok(LiveWs(s))
+    } else {
+        Err(head.lines().next().unwrap_or("").to_string())
+    }
+}
+
+impl LiveWs {
+    /// A frame as a page sends it: masked.
+    fn send(&mut self, op: u8, fin: bool, data: &[u8]) {
+        use std::io::Write;
+        let _ = self.0.write_all(&ws_frame(op, fin, data));
+    }
+
+    fn text(&mut self, t: &str) {
+        self.send(0x1, true, t.as_bytes());
+    }
+
+    /// The server's next frame within `wait`, its opcode and payload; none if none came.
+    fn frame(&mut self, wait: Duration) -> Option<(u8, Vec<u8>)> {
+        use std::io::Read;
+        self.0.set_read_timeout(Some(wait)).ok()?;
+        let mut h = [0u8; 2];
+        self.0.read_exact(&mut h).ok()?;
+        let mut n = (h[1] & 0x7f) as u64;
+        if n == 126 {
+            let mut l = [0u8; 2];
+            self.0.read_exact(&mut l).ok()?;
+            n = u16::from_be_bytes(l) as u64;
+        } else if n == 127 {
+            let mut l = [0u8; 8];
+            self.0.read_exact(&mut l).ok()?;
+            n = u64::from_be_bytes(l);
+        }
+        let mut data = vec![0u8; n as usize];
+        self.0.read_exact(&mut data).ok()?;
+        Some((h[0] & 0x0f, data))
+    }
+
+    /// The next message the server sends within `wait`, pings passed over; none if none came, or a
+    /// close did.
+    fn told(&mut self, wait: Duration) -> Option<serde_json::Value> {
+        let until = Instant::now() + wait;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            let (op, data) = self.frame(left.max(Duration::from_millis(1)))?;
+            match op {
+                0x1 => return Some(serde_json::from_slice(&data).unwrap()),
+                0x9 => continue,
+                _ => return None,
+            }
+        }
+    }
+
+    /// Whether the server ends the connection within `wait`.
+    fn ended(&mut self, wait: Duration) -> bool {
+        use std::io::Read;
+        if self.0.set_read_timeout(Some(wait)).is_err() {
+            return true;
+        }
+        let mut b = [0u8; 64];
+        loop {
+            match self.0.read(&mut b) {
+                Ok(0) => return true,
+                Ok(_) => continue,
+                Err(e) => return matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe),
+            }
+        }
+    }
+}
+
+fn ws_frame(op: u8, fin: bool, data: &[u8]) -> Vec<u8> {
+    let mut f = vec![if fin { 0x80 } else { 0 } | op];
+    if data.len() < 126 {
+        f.push(0x80 | data.len() as u8);
+    } else if data.len() <= 0xffff {
+        f.push(0x80 | 126);
+        f.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    } else {
+        f.push(0x80 | 127);
+        f.extend_from_slice(&(data.len() as u64).to_be_bytes());
+    }
+    let mask = [7, 1, 3, 9];
+    f.extend_from_slice(&mask);
+    f.extend(data.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+    f
+}
+
+/// Topics as a page writes them (`liveKey`): each `%` and `,` in them written out.
+fn live_key(topics: &[&str]) -> String {
+    topics.iter().map(|t| t.replace('%', "%25").replace(',', "%2C")).collect::<Vec<_>>().join(",")
+}
+
+#[test]
+fn a_close_is_answered_at_once_with_its_code() {
+    let s = served("q900-close", LIVE_SOCKET);
+    let q = format!("since={}&s=&t=a", s.seq());
+    let code = |c: u16| c.to_be_bytes().to_vec();
+    let mut reason = code(1001);
+    reason.extend_from_slice("bye ✓".as_bytes());
+    // What the page sends, and the close it is answered with: its own code, none for none, and 1002
+    // (a protocol error) for a code a page may not send or a payload of one byte.
+    let cases: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
+        ("1000", code(1000), code(1000)),
+        ("1001 with a reason", reason, code(1001)),
+        ("4000, a program's own", code(4000), code(4000)),
+        ("no code", vec![], vec![]),
+        ("1005, never sent", code(1005), code(1002)),
+        ("one byte", vec![3], code(1002)),
+    ];
+    for (name, theirs, ours) in cases {
+        let mut p = live_ws(s.port, &q).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let t0 = Instant::now();
+        p.send(0x8, true, &theirs);
+        let got = p.frame(Duration::from_secs(10));
+        let took = t0.elapsed();
+        assert_eq!(got, Some((0x8, ours)), "{}", name);
+        assert!(took < Duration::from_secs(1), "{}: answered after {:?}", name, took);
+        assert!(p.ended(Duration::from_secs(2)), "{}: the connection stays", name);
+    }
+    // A pong, then a close, in one write; and a close after a message of topics.
+    let mut p = live_ws(s.port, &q).unwrap();
+    let mut both = ws_frame(0xA, true, b"");
+    both.extend(ws_frame(0x8, true, &code(1000)));
+    use std::io::Write;
+    p.0.write_all(&both).unwrap();
+    assert_eq!(p.frame(Duration::from_secs(1)), Some((0x8, code(1000))));
+    let mut p = live_ws(s.port, &q).unwrap();
+    let mut both = ws_frame(0x1, true, b"since=1&s=\nb");
+    both.extend(ws_frame(0x8, true, &code(1000)));
+    p.0.write_all(&both).unwrap();
+    assert_eq!(p.frame(Duration::from_secs(1)).map(|f| f.0), Some(0x8));
+    // Every page's thread has ended, at once.
+    assert!(s.within(1000, |s| s.metric("quillo_live_pages") == 0), "{} pages", s.metric("quillo_live_pages"));
+    // Pages that hang up with no close, cleanly or not, are let go at once too.
+    let pages: Vec<LiveWs> = (0..3).map(|_| live_ws(s.port, &q).unwrap()).collect();
+    assert!(s.within(1000, |s| s.metric("quillo_live_pages") == 3));
+    let mut pages = pages.into_iter();
+    let first = pages.next().unwrap();
+    first.0.shutdown(std::net::Shutdown::Write).unwrap();
+    drop(pages);
+    assert!(s.within(1000, |s| s.metric("quillo_live_pages") == 0), "{} pages", s.metric("quillo_live_pages"));
+    drop(first);
+}
+
+#[test]
+fn topics_sent_down_the_open_socket_are_followed() {
+    let s = served("q900-topics", LIVE_SOCKET);
+    let seq = s.seq();
+    let mut p = live_ws(s.port, &format!("since={}&s=&t=a", seq)).unwrap();
+    let head = |since: u64, server: &str| format!("since={}&s={}\n", since, server);
+    let quiet = Duration::from_millis(400);
+    let soon = Duration::from_secs(2);
+    // New topics: answered at once, nothing having changed, in the socket's first message, which
+    // says it takes them.
+    let t0 = Instant::now();
+    p.text(&format!("{}b", head(seq, "")));
+    let j = p.told(soon).expect("answered");
+    assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    assert_eq!((&j["changed"], &j["takes"], j["seq"].as_u64()), (&serde_json::json!([]), &serde_json::json!("topics"), Some(seq)));
+    // The old topic is followed no more, the new one is; no later message says so again.
+    s.bump("a");
+    assert_eq!(p.told(quiet), None);
+    s.bump("b");
+    let j = p.told(soon).expect("told of b");
+    assert_eq!(j["changed"], serde_json::json!(["b"]));
+    assert!(j.get("takes").is_none(), "{}", j);
+    // A change made after what the page knows and before the server has its topics (in flight): in
+    // the answer.
+    let knows = j["seq"].as_u64().unwrap();
+    s.bump("c");
+    p.text(&format!("{}c,b", head(knows, "")));
+    assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!(["c"]));
+    // None at all: answered, and nothing told; then one topic again.
+    p.text(&head(s.seq(), ""));
+    assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!([]));
+    s.bump("c");
+    assert_eq!(p.told(quiet), None);
+    p.text(&format!("{}d", head(s.seq(), "")));
+    assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!([]));
+    s.bump("d");
+    assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!(["d"]));
+    // Unicode, a comma inside a topic, and the message in two frames.
+    p.send(0x1, false, head(s.seq(), "").as_bytes());
+    p.send(0x0, true, live_key(&["猫", "é,x"]).as_bytes());
+    assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!([]));
+    s.bump("%C3%A9%2Cx");
+    assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!(["é,x"]));
+    s.bump("%E7%8C%AB");
+    assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!(["猫"]));
+    // A number from another server, or from before a restart: every topic counts as changed.
+    p.text("since=5&s=another\nx,y");
+    assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!(["x", "y"]));
+    // What is no message of topics is passed over, and the topics stay: text without the line, a
+    // binary message, a line too long.
+    p.text("zzz");
+    p.send(0x2, true, b"since=1&s=\nq");
+    p.text(&format!("since=1&s={}\nq", "s".repeat(200)));
+    assert_eq!(p.told(quiet), None);
+    s.bump("y");
+    assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!(["y"]));
+    // Two sets in one write: the last is followed.
+    let mut two = ws_frame(0x1, true, format!("{}e", head(s.seq(), "")).as_bytes());
+    two.extend(ws_frame(0x1, true, format!("{}f", head(s.seq(), "")).as_bytes()));
+    use std::io::Write;
+    p.0.write_all(&two).unwrap();
+    while let Some(j) = p.told(quiet) {
+        assert_eq!(j["changed"], serde_json::json!([]), "{}", j);
+    }
+    s.bump("e");
+    assert_eq!(p.told(quiet), None);
+    s.bump("f");
+    assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!(["f"]));
+    // Past the address's limit, up to the most a page follows (as `tm=1` takes them), the line
+    // before them counted: taken. One byte more: passed over, the topics as they were.
+    const MOST: usize = 128 + 256 * (448 * 3 + 1);
+    let longest = ",".repeat(448);
+    let mut topics = vec!["q900:t"];
+    topics.extend((0..255).map(|_| longest.as_str()));
+    let line = head(s.seq(), "");
+    let key = live_key(&topics);
+    let at_limit = format!("{}{}{}", line, key, ",".repeat(MOST - line.len() - key.len()));
+    assert_eq!(at_limit.len(), MOST);
+    p.text(&format!("{},", at_limit));
+    assert_eq!(p.told(Duration::from_secs(1)), None, "one byte more");
+    s.bump("f");
+    assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!(["f"]));
+    p.text(&at_limit);
+    assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!([]));
+    s.bump("q900:t");
+    assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!(["q900:t"]));
+    // The form that worked: topics as the first message of a socket opened with `tm=1`.
+    let mut later = live_ws(s.port, &format!("since={}&s=&tm=1", s.seq())).unwrap();
+    later.text("g");
+    s.bump("g");
+    let j = later.told(soon).unwrap();
+    assert_eq!((&j["changed"], &j["takes"]), (&serde_json::json!(["g"]), &serde_json::json!("topics")));
+    later.text(&format!("{}h", head(s.seq(), "")));
+    assert_eq!(later.told(soon).unwrap()["changed"], serde_json::json!([]));
+    s.bump("h");
+    assert_eq!(later.told(soon).unwrap()["changed"], serde_json::json!(["h"]));
+    // A page that asks (`tk=1`, as the runtime does) is told at once, where a socket whose page knows
+    // where things stand hears nothing until a change.
+    let t0 = Instant::now();
+    let mut asks = live_ws(s.port, &format!("since={}&s=&tk=1&t=i", s.seq())).unwrap();
+    let j = asks.told(soon).expect("told at once");
+    assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    assert_eq!((&j["changed"], &j["takes"]), (&serde_json::json!([]), &serde_json::json!("topics")));
+    s.bump("i");
+    let j = asks.told(soon).unwrap();
+    assert_eq!((&j["changed"], j.get("takes")), (&serde_json::json!(["i"]), None));
+}
+
+#[test]
+fn a_clients_places_come_back_as_its_pages_close() {
+    let s = served("q900-places", LIVE_SOCKET);
+    let seq = s.seq();
+    let q = format!("since={}&s=&t=a", seq);
+    let mut held: Vec<LiveWs> = (0..256).map(|i| live_ws(s.port, &q).unwrap_or_else(|e| panic!("page {}: {}", i + 1, e))).collect();
+    assert!(live_ws(s.port, &q).err().is_some_and(|e| e.contains("503")), "page 257");
+    // A page that closes gives its place back at once, and so does one that hangs up.
+    let free = |s: &Served| -> Option<LiveWs> {
+        let until = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(p) = live_ws(s.port, &q) {
+                return Some(p);
+            }
+            if Instant::now() > until {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let mut one = held.pop().unwrap();
+    one.send(0x8, true, &1000u16.to_be_bytes());
+    assert_eq!(one.frame(Duration::from_secs(2)).map(|f| f.0), Some(0x8));
+    held.push(free(&s).expect("the closed page's place"));
+    drop(held.pop());
+    held.push(free(&s).expect("the place of the page that hung up"));
+    assert!(live_ws(s.port, &q).is_err(), "page 257, again");
+    // New topics down every socket take no place more, and each of the 256 hears its own.
+    for p in &mut held {
+        p.text(&format!("since={}&s=\nb", seq));
+    }
+    for p in &mut held {
+        assert_eq!(p.told(Duration::from_secs(5)).expect("answered")["changed"], serde_json::json!([]));
+    }
+    assert!(live_ws(s.port, &q).is_err(), "still 256");
+    s.bump("b");
+    let told = held.iter_mut().map(|p| p.told(Duration::from_secs(5))).filter(|j| j.as_ref().is_some_and(|j| j["changed"] == serde_json::json!(["b"]))).count();
+    assert_eq!(told, 256);
+}
+
+/// Two pages following different tables, moved between by links (the page reads `url()`). A script in
+/// the head counts the page's sockets; at `/never` they never open, and at `/old` the server's word
+/// that a socket takes topics is taken out of its messages, as from a server that does not say it
+/// (an older one, or one that cannot watch its sockets).
+const PAGES_MOVED: &str = r###"db.open("moves.db")
+db.exec("create table if not exists a (id integer primary key, v int not null)")
+db.exec("create table if not exists b (id integer primary key, v int not null)")
+db.exec("delete from a")
+db.exec("delete from b")
+db.exec("insert into a (id, v) values (1, 0)")
+db.exec("insert into b (id, v) values (1, 0)")
+server fn load_a() = db.query("select v from a where id = 1")[0].v
+server fn load_b() = db.query("select v from b where id = 1")[0].v
+component A() {
+    state v = live(load_a)
+    <p #va>{v}</p>
+}
+component B() {
+    state v = live(load_b)
+    <p #vb>{v}</p>
+}
+component App() {
+    let path = url().path
+    let base = split(path, "/")[1]
+    <div>
+        <a #toa href={`/${base}/a`}>a</a>
+        <a #tob href={`/${base}/b`}>b</a>
+        {ends_with(path, "/a") ? <A/> : <B/>}
+    </div>
+}
+let count = "window.__made = 0; window.__heard = 0; { const Real = WebSocket; window.WebSocket = class extends Real { constructor(...a) { super(...a); window.__made++; this.addEventListener('message', () => { window.__heard++; }); } }; }"
+let never = "window.__made = 0; window.WebSocket = class { constructor() { window.__made++; this.readyState = 0; } send() {} close() { this.readyState = 3; } };"
+let old = "window.__made = 0; { const Real = WebSocket; window.WebSocket = class extends Real { constructor(...a) { super(...a); window.__made++; } set onmessage(f) { super.onmessage = (m) => f({ data: String(m.data).replace(',\"takes\":\"topics\"', '') }); } }; }"
+fn page(head: str) = <html><head><title>t</title><script>{raw(head)}</script></head><body><App/></body></html>
+route POST /t/a/:v(int) { db.exec("update a set v = ? where id = 1", v); "ok" }
+route POST /t/b/:v(int) { db.exec("update b set v = ? where id = 1", v); "ok" }
+route GET /m/:x = page(count)
+route GET /never/:x = page(never)
+route GET /old/:x = page(old)
+"###;
+
+/// The page script's helpers: what `#va` or `#vb` shows, how long until it shows a value, a write.
+const MOVES_JS: &str = r##"const shown = (t) => ($("v" + t) ? $("v" + t).textContent : null);
+    const until = async (t, want, ms) => { const t0 = performance.now(); while (performance.now() - t0 < ms) { if (shown(t) === String(want)) return Math.round(performance.now() - t0); await tick(20); } return null; };
+    const write = (t, v) => fetch(`/t/${t}/${v}`, { method: "POST" });"##;
+
+#[test]
+fn a_page_that_moves_keeps_its_socket_and_hears_each_pages_changes() {
+    let body = format!(
+        r##"{MOVES_JS}
+    const wrote = {{ a: 0, b: 0 }}, seen = [];
+    // Once the socket has said it takes topics, in its first message.
+    for (let i = 0; i < 100 && !window.__heard; i++) await tick(20);
+    for (let i = 1; i <= 8; i++) {{
+      const t = i % 2 ? "b" : "a";
+      $("to" + t).click();
+      if ((await until(t, wrote[t], 3000)) === null) return {{ lost: i }};
+      wrote[t] = i * 10;
+      await write(t, wrote[t]);
+      seen.push((await until(t, wrote[t], 3000)) !== null);
+    }}
+    return {{ seen, made: window.__made }};"##
+    );
+    let Some(rs) = in_pages("q900-moves", PAGES_MOVED, &["/m/a"], &body) else { return };
+    // One socket for all eight pages, where there was one a page.
+    assert_eq!(rs[0], serde_json::json!({ "seen": [true, true, true, true, true, true, true, true], "made": 1, "remade": 0, "errors": [] }));
+}
+
+#[test]
+fn a_socket_that_never_opens_gives_way_to_the_plain_request() {
+    let body = format!(
+        r##"{MOVES_JS}
+    const t0 = performance.now();
+    await write("a", 5);
+    const first = await until("a", 5, 8000);
+    if (first === null) return {{ first, made: window.__made }};
+    const at = Math.round(performance.now() - t0);
+    await write("a", 6);
+    const second = await until("a", 6, 8000);
+    return {{ firstAfter3s: at >= 2000 && at <= 6000, second: second !== null, made: window.__made >= 2 }};"##
+    );
+    let Some(rs) = in_pages("q900-never", PAGES_MOVED, &["/never/a"], &body) else { return };
+    assert_eq!(rs[0], serde_json::json!({ "firstAfter3s": true, "second": true, "made": true, "remade": 0, "errors": [] }));
+}
+
+#[test]
+fn a_page_whose_server_does_not_take_topics_opens_a_socket_for_them() {
+    let body = format!(
+        r##"{MOVES_JS}
+    $("tob").click();
+    if ((await until("b", 0, 3000)) === null) return {{ lost: true }};
+    await write("b", 7);
+    return {{ seen: (await until("b", 7, 3000)) !== null, made: window.__made }};"##
+    );
+    let Some(rs) = in_pages("q900-old", PAGES_MOVED, &["/old/a"], &body) else { return };
+    assert_eq!(rs[0], serde_json::json!({ "seen": true, "made": 2, "remade": 0, "errors": [] }));
+}
+
+// What a waiting page sends, read on a socket made here (`ws::Socket::heard`): a ping answered with
+// its pong and a pong dropped, between a message's parts too; a text message given as it comes, and
+// one passed over when it is longer than asked for, not masked, or has reserved bits set, or a new
+// message begins before it ends; a binary message, a stray part, and a control frame too long to be
+// one, passed over; a frame cut short for longer than it may take, and a page that hung up, gone.
+#[test]
+fn what_a_waiting_page_sends_is_read_as_it_comes() {
+    use quillo::server::HttpRequest;
+    use quillo::ws::{Heard, Socket};
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let req = HttpRequest {
+        method: "GET".into(),
+        url: "/_quillo/live".into(),
+        headers: [("Host", "x"), ("Upgrade", "websocket"), ("Connection", "Upgrade"), ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="), ("Sec-WebSocket-Version", "13")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        body: Vec::new(),
+        remote: "127.0.0.1".into(),
+    };
+    let page = |frames: &[u8]| -> (std::net::TcpStream, Socket) {
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let socket = Socket::accept(&req, server).expect("upgraded");
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            client.read_exact(&mut b).unwrap();
+            head.push(b[0]);
+        }
+        client.write_all(frames).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        (client, socket)
+    };
+    let heard = |s: &mut Socket| -> (Heard, String) {
+        let mut got = Vec::new();
+        let h = s.heard(16, Duration::from_millis(300), |p| got.extend_from_slice(p));
+        (h, String::from_utf8_lossy(&got).into_owned())
+    };
+    let plain = |op: u8, data: &[u8]| -> Vec<u8> {
+        let mut f = vec![0x80 | op, data.len() as u8];
+        f.extend_from_slice(data);
+        f
+    };
+    // Nothing yet.
+    let (_c, mut s) = page(b"");
+    assert_eq!(heard(&mut s), (Heard::Nothing, String::new()));
+    // A ping, a pong, then text in two parts with a ping between them.
+    let mut w = ws_frame(0x9, true, b"p");
+    w.extend(ws_frame(0xA, true, b""));
+    w.extend(ws_frame(0x1, false, "ab".as_bytes()));
+    w.extend(ws_frame(0x9, true, b"q"));
+    w.extend(ws_frame(0x0, true, "é".as_bytes()));
+    let (mut c, mut s) = page(&w);
+    assert_eq!(heard(&mut s), (Heard::Text(true), "abé".into()));
+    assert_eq!(heard(&mut s), (Heard::Nothing, String::new()));
+    let mut pongs = [0u8; 6];
+    c.read_exact(&mut pongs).unwrap();
+    assert_eq!(pongs, [0x8a, 1, b'p', 0x8a, 1, b'q']);
+    assert!(s.send("still writable"), "the socket is blocking again");
+    // At the limit, and one byte over it, in parts: the second passed over, then the next taken.
+    let mut w = ws_frame(0x1, true, &[b'x'; 16]);
+    w.extend(ws_frame(0x1, false, &[b'y'; 10]));
+    w.extend(ws_frame(0x0, true, &[b'y'; 7]));
+    w.extend(ws_frame(0x1, true, b"next"));
+    let (_c, mut s) = page(&w);
+    assert_eq!(heard(&mut s), (Heard::Text(true), "x".repeat(16)));
+    assert_eq!(heard(&mut s).0, Heard::Text(false));
+    assert_eq!(heard(&mut s), (Heard::Text(true), "next".into()));
+    // Not masked, reserved bits set, or a new message before the last ended: passed over.
+    let mut odd = ws_frame(0x1, true, b"rsv");
+    odd[0] |= 0x40;
+    let mut w = plain(0x1, b"bare");
+    w.extend(odd);
+    w.extend(ws_frame(0x1, false, b"one"));
+    w.extend(ws_frame(0x1, true, b"two"));
+    w.extend(ws_frame(0x1, true, b"ok"));
+    let (_c, mut s) = page(&w);
+    assert_eq!(heard(&mut s).0, Heard::Text(false));
+    assert_eq!(heard(&mut s).0, Heard::Text(false));
+    assert_eq!(heard(&mut s).0, Heard::Text(false));
+    assert_eq!(heard(&mut s), (Heard::Text(true), "ok".into()));
+    // A binary message, a stray part and a pong too long to be one: passed over, nothing told.
+    let mut w = ws_frame(0x2, true, b"bin");
+    w.extend(ws_frame(0x0, true, b"stray"));
+    w.extend(ws_frame(0xA, true, &[b'z'; 200]));
+    let (_c, mut s) = page(&w);
+    assert_eq!(heard(&mut s), (Heard::Nothing, String::new()));
+    // A frame cut short, for longer than it may take: gone, and the connection shut.
+    let full = ws_frame(0x1, true, b"cut short");
+    let (mut c, mut s) = page(&full[..8]);
+    let t0 = Instant::now();
+    assert_eq!(heard(&mut s).0, Heard::Gone);
+    assert!(t0.elapsed() >= Duration::from_millis(250), "{:?}", t0.elapsed());
+    c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut rest = Vec::new();
+    assert!(c.read_to_end(&mut rest).is_ok() && rest.is_empty(), "{:?}", rest);
+    // Hung up, with no close.
+    let (c, mut s) = page(b"");
+    drop(c);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(heard(&mut s).0, Heard::Gone);
+}

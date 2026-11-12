@@ -140,9 +140,10 @@ pub struct Live {
     /// A topic forgotten changed no later than this (see `forget`).
     floor: u64,
     /// The pages waiting, by the topics they follow: pages of one kind follow
-    /// the same ones, so a change takes one call to wake them all, and none to
-    /// wake those following something else (FEEDBACK24.md, Q-192; branch
-    /// feedback24-fixes).
+    /// the same ones, so a change finds them all at once, and wakes none of
+    /// those following something else (FEEDBACK24.md, Q-192; branch
+    /// feedback24-fixes); each is woken by its own bell (FEEDBACK61.md, Q-900;
+    /// branch feedback61).
     groups: HashMap<String, (Arc<Group>, usize)>,
     by_topic: HashMap<String, Vec<Arc<Group>>>,
     /// Topics ending in `:*` published lately (`db:*`, a switched database), with when.
@@ -186,7 +187,101 @@ pub fn under(pattern: &str, topic: &str) -> bool {
 pub struct Group {
     key: String,
     topics: Vec<String>,
-    changed: Condvar,
+    /// Their threads' bells, each rung by a change to the topics, outside the `live` lock.
+    bells: Mutex<Vec<Arc<Bell>>>,
+}
+
+impl Group {
+    fn wake(&self) {
+        for b in self.bells.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
+            b.wake();
+        }
+    }
+}
+
+/// Wakes the `pages` of the groups a change woke, each by its own bell. More than one, on a thread
+/// of its own: the request that made the change, which holds the interpreter, makes one call for
+/// them all, as it did when one call woke a group, where a call a page took it 0.8 ms more for 200
+/// pages, and 0.05 ms for 8; one, here, which saves it the step to that thread (FEEDBACK61.md,
+/// Q-900; branch feedback61).
+fn wake(groups: Vec<Arc<Group>>, pages: usize) {
+    static RINGER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Vec<Arc<Group>>>>> = std::sync::OnceLock::new();
+    if groups.is_empty() {
+        return;
+    }
+    if pages <= 1 {
+        for g in &groups {
+            g.wake();
+        }
+        return;
+    }
+    let ringer = RINGER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<Arc<Group>>>();
+        std::thread::Builder::new()
+            .name("quillo-live-wake".into())
+            .stack_size(64 << 10)
+            .spawn(move || {
+                for groups in rx {
+                    for g in &groups {
+                        g.wake();
+                    }
+                }
+            })
+            .ok()?;
+        Some(tx)
+    });
+    // Here, if that thread could not be had.
+    let groups = match ringer {
+        Some(tx) => match tx.send(groups) {
+            Ok(()) => return,
+            Err(e) => e.0,
+        },
+        None => groups,
+    };
+    for g in &groups {
+        g.wake();
+    }
+}
+
+/// What wakes the thread of a page that waits (`Follower::wait`): a change to what it follows, or
+/// `ring`, for something of its own, such as what its socket heard. Each page's thread is woken by
+/// itself, where one call woke a group: a page that closed its socket, or sent new topics down it,
+/// would have woken every page following the same topics, so a socket was looked at only every 5 s,
+/// and a close was answered by nothing, which Firefox took for a failed connection (FEEDBACK61.md,
+/// Q-900; branch feedback61).
+pub struct Bell {
+    thread: std::sync::OnceLock<std::thread::Thread>,
+    rung: AtomicBool,
+}
+
+impl Bell {
+    /// A bell, for the thread that will wait to `bind` it: made where the request is answered, so
+    /// that a waiting thread allocates no more of its own than it did.
+    pub fn new() -> Arc<Bell> {
+        Arc::new(Bell { thread: std::sync::OnceLock::new(), rung: AtomicBool::new(false) })
+    }
+
+    /// The bell is this thread's, the one that waits.
+    pub fn bind(&self) {
+        let _ = self.thread.set(std::thread::current());
+    }
+
+    fn wake(&self) {
+        if let Some(t) = self.thread.get() {
+            t.unpark();
+        }
+    }
+
+    /// Wakes the thread, with something of its own to see to.
+    pub fn ring(&self) {
+        self.rung.store(true, SeqCst);
+        self.wake();
+    }
+
+    /// Whether it was rung since this was last asked.
+    pub fn take(&self) -> bool {
+        self.rung.load(SeqCst) && self.rung.swap(false, SeqCst)
+    }
 }
 
 /// Most topics remembered before those no page follows are forgotten: a topic
@@ -219,8 +314,8 @@ impl Live {
         }
     }
 
-    /// The groups following `topics`, to wake once the lock is let go.
-    fn following(&self, topics: &[&String]) -> Vec<Arc<Group>> {
+    /// The groups following `topics`, to wake once the lock is let go, and how many pages they are.
+    fn following(&self, topics: &[&String]) -> (Vec<Arc<Group>>, usize) {
         let mut woken: Vec<Arc<Group>> = Vec::new();
         for t in topics {
             for g in self.by_topic.get(*t).into_iter().flatten() {
@@ -231,7 +326,7 @@ impl Live {
         }
         let pages: usize = woken.iter().map(|g| self.groups.get(&g.key).map_or(0, |(_, n)| *n)).sum();
         crate::metrics::live_woke(pages as u64);
-        woken
+        (woken, pages)
     }
 
     /// With many topics, drops those no page follows, which counts them all as
@@ -362,11 +457,9 @@ impl Shared {
         };
         waking.extend(under.iter());
         live.forget();
-        let woken = live.following(&waking);
+        let (woken, pages) = live.following(&waking);
         drop(live);
-        for g in woken {
-            g.changed.notify_all();
-        }
+        wake(woken, pages);
         seq
     }
 
@@ -403,11 +496,9 @@ impl Shared {
                 *v = seq;
             }
         }
-        let woken = live.following(&known);
+        let (woken, pages) = live.following(&known);
         drop(live);
-        for g in woken {
-            g.changed.notify_all();
-        }
+        wake(woken, pages);
     }
 
     /// Whether none of `topics` changed after `seq`.
@@ -437,21 +528,23 @@ impl Shared {
         (live.seq, changed)
     }
 
-    /// A page that will wait for changes to `topics`, for as long as this lives.
-    pub fn follow(self: &Arc<Self>, topics: Vec<String>) -> Follower {
+    /// A page that will wait for changes to `topics`, for as long as this lives, on the thread
+    /// whose `bell` it is.
+    pub fn follow(self: &Arc<Self>, topics: Vec<String>, bell: &Arc<Bell>) -> Follower {
         let key = topics.join("\n");
         let mut live = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let live = &mut *live;
         if let Some((g, n)) = live.groups.get_mut(&key) {
             *n += 1;
-            return Follower { shared: self.clone(), group: g.clone() };
+            g.bells.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(bell.clone());
+            return Follower { shared: self.clone(), group: g.clone(), bell: bell.clone() };
         }
-        let group = Arc::new(Group { key: key.clone(), topics, changed: Condvar::new() });
+        let group = Arc::new(Group { key: key.clone(), topics, bells: Mutex::new(vec![bell.clone()]) });
         for t in &group.topics {
             live.by_topic.entry(t.clone()).or_default().push(group.clone());
         }
         live.groups.insert(key, (group.clone(), 1));
-        Follower { shared: self.clone(), group }
+        Follower { shared: self.clone(), group, bell: bell.clone() }
     }
 }
 
@@ -459,25 +552,40 @@ impl Shared {
 pub struct Follower {
     shared: Arc<Shared>,
     group: Arc<Group>,
+    bell: Arc<Bell>,
 }
 
 impl Follower {
-    /// `Shared::live_now`, waiting up to `timeout` for a topic to change. `server`
-    /// is the server `since` came from (`None`: this one); a number from another
+    /// `Shared::live_now`, waiting up to `timeout` for a topic to change, or for the bell to be
+    /// rung. `server` is the server `since` came from (`None`: this one); a number from another
     /// server (or from before a restart) says nothing about this one, so all the
     /// topics count as changed.
     pub fn wait(&self, since: u64, server: Option<&str>, timeout: std::time::Duration) -> (u64, Vec<String>) {
         let g = &self.group;
         let changed = |live: &Live| -> Vec<String> { g.topics.iter().filter(|t| live.changed_after(t, since)).cloned().collect() };
-        let live = self.shared.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut live = self.shared.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if since > 0 && server.map_or(false, |s| s != self.shared.id) {
             return (live.seq, g.topics.clone());
         }
         if since == 0 || since > live.seq {
             return (live.seq, Vec::new());
         }
-        let (live, _) = g.changed.wait_timeout_while(live, timeout, |l| changed(l).is_empty()).unwrap_or_else(std::sync::PoisonError::into_inner);
-        (live.seq, changed(&live))
+        // The bell's thread parks; what woke it is looked at here, as a wake may be for nothing.
+        debug_assert!(self.bell.thread.get().is_some_and(|t| t.id() == std::thread::current().id()), "a bell waited on by its own thread");
+        let until = Instant::now() + timeout;
+        loop {
+            let now = changed(&live);
+            if !now.is_empty() || self.bell.rung.load(SeqCst) {
+                return (live.seq, now);
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return (live.seq, now);
+            }
+            drop(live);
+            std::thread::park_timeout(left);
+            live = self.shared.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 }
 
@@ -487,6 +595,12 @@ impl Drop for Follower {
         let live = &mut *live;
         let g = &self.group;
         let Some((_, n)) = live.groups.get_mut(&g.key) else { return };
+        {
+            let mut bells = g.bells.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(i) = bells.iter().position(|b| Arc::ptr_eq(b, &self.bell)) {
+                bells.swap_remove(i);
+            }
+        }
         *n -= 1;
         if *n > 0 {
             return;
