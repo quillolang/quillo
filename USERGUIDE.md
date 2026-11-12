@@ -3316,10 +3316,12 @@ stops when that part leaves it. Which part depends on the code that starts it
   outlives the child.
 - **A plain `fn`** gives it to what called it: from a handler, even after a wait, the
   handler's component; from an `@mount`, a callback or a component's own code, that part.
-  A plain `fn`'s timer in a parent's function that a child uses as its handler
-  (`@click={on_save}`, where `on_save` is the parent's) is the parent's. When the child
-  calls that function from its own code (`@click={() => { on_save() }}`), or reaches it
-  through a variable, a list or a map, the timer is the child's, and ends with the child.
+  A parent's function that a child uses as its handler (`@click={on_save}`, `on_save`
+  being a prop) is the code of the component that wrote the child's tag: the parent, or,
+  when the function was passed on through another component (`<Modal>` handing it to its
+  `<Button>`), that one. When the child calls it from its own code
+  (`@click={() => { on_save() }}`), or keeps it in a variable, a list or a map, it is the
+  child's. A plain `fn`'s timer in it ends with that component.
 - **Markup is the code of the component that wrote it**, wherever it is shown: passed as
   `children` or another prop, given back by a function prop, or made in a handler and
   kept in state. Its `@mount`, and what that starts, end with the part showing it; its
