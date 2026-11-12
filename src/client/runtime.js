@@ -1707,11 +1707,11 @@ B.receive = meta(async (url, f, opts) => {
 // asking (an effect that runs again without asking, or the component
 // leaving the page, stops it). Dropped connections are opened again
 // (after a second, then longer); a stream that ends is not.
-B.listen = meta((url, f) => {
+B.listen = meta((url, f, inst) => {
   // In a component's code, or a handler or `@mount` of one, before or after a wait, where it lasts
   // as long as the component, as `every` does: it checked `Owner` alone, which a handler never has
-  // (FEEDBACK61.md, Q-901; branch feedback61).
-  const own = Owner || Acting;
+  // (FEEDBACK61.md, Q-901; branch feedback61). `inst` as `run_after`'s (Q-901's second review).
+  const own = Owner || inst || Acting;
   if (!own) fail("`listen` works in a component");
   if (own.dead) return null;
   S(url, "listen");
@@ -1750,15 +1750,36 @@ B.listen = meta((url, f) => {
 // component leaving the page stops it too.
 // `run_after(ms, f)`: once, gone with the component (FEEDBACK28.md, Q-349; branch
 // feedback29-fixes).
-B.run_after = meta((ms, f) => {
+// `inst`: the component whose code calls it, which the compiler gives (see `call` in
+// src/client.rs): a parent's handler run from a child that it closes, a modal's Save, a row's
+// remove, keeps its timer, where the timer had belonged to the child and went with it
+// (FEEDBACK61.md, Q-901's second review; branch feedback61). The component's own code (`if running
+// { every(...) }`) keeps its timer to the code that called it.
+B.run_after = meta((ms, f, inst) => {
   ms = N(ms, "run_after");
   F(f, "run_after", 2);
-  const own = Owner || Acting;
+  const own = Owner || inst || Acting;
   if (own && own.dead) return null;
   // What `f` starts (a `run_after`, an `every`, a `listen`) belongs to the component too, as what
   // `every`'s ticks and `listen`'s messages start does: it belonged to no one, and outlived the
-  // component (FEEDBACK61.md, Q-901; branch feedback61).
+  // component (FEEDBACK61.md, Q-901; branch feedback61). The timers of an owner that have not fired
+  // are one set, which one cleanup of its clears, and a timer leaves it as it fires: a cleanup for
+  // each stayed after it had fired, and a poll that starts the next as it ends grew its component's
+  // list by one a tick (Q-901's second review).
+  let ids;
+  if (own) {
+    ids = AfterTimers.get(own);
+    if (!ids) {
+      const mine = (ids = new Set());
+      AfterTimers.set(own, mine);
+      (own.clean || (own.clean = [])).push(() => {
+        if (AfterTimers.get(own) === mine) AfterTimers.delete(own);
+        for (const t of mine) clearTimeout(t);
+      });
+    }
+  }
   const id = setTimeout(() => {
+    if (ids) ids.delete(id);
     const was = Acting;
     Acting = own;
     try {
@@ -1770,9 +1791,11 @@ B.run_after = meta((ms, f) => {
       Acting = was;
     }
   }, Math.max(ms, 0));
-  if (own) (own.clean || (own.clean = [])).push(() => clearTimeout(id));
+  if (ids) ids.add(id);
   return null;
 }, "run_after", null);
+// What `run_after` started for each owner and has not fired (see `run_after`).
+const AfterTimers = new WeakMap();
 // `page_updated()`: waits until the page shows what was just set.
 B.page_updated = meta(() => new Promise((done) => { if (flushing && effectQueue.length) flush(); queueMicrotask(() => done(null)); }), "page_updated", null);
 // `js_has("a.b")`: whether the page has it, without calling it (FEEDBACK28.md, Q-341; branch
@@ -1790,10 +1813,11 @@ B.js_has = meta((name) => {
 B.cursor_index = meta((s, n) => Array.from(S(s, "cursor_index").slice(0, Math.max(IN(n, "cursor_index", 2), 0))).length, "cursor_index", null);
 // How long, in ms, `every` waits for a run that does not answer, at the least two gaps.
 const EVERY_STALLED = 30000;
-B.every = meta((ms, f) => {
+B.every = meta((ms, f, _opts, inst) => {
   // In a component, or a handler or `@mount` of one, as `run_after` (FEEDBACK28.md, Q-349;
-  // branch feedback29-fixes).
-  const own = Owner || Acting;
+  // branch feedback29-fixes); `inst` as `run_after`'s (FEEDBACK61.md, Q-901's second review; branch
+  // feedback61).
+  const own = Owner || inst || Acting;
   if (!own) fail("`every` works in a component");
   if (own.dead) return null;
   ms = N(ms, "every");
@@ -5724,7 +5748,10 @@ async function rpcSend(name, args, live, idem) {
   if (DEV && r.status === 500 && body && body.error) report(`server fn \`${name}\` failed: ${body.error}`); // dev
   // `status` (0: no connection, or a body cut short) and `after` (its Retry-After) tell a live load
   // whether, and when, to try again (FEEDBACK61.md, Q-899; branch feedback61).
-  if (!r.ok) return { ...failed(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`), unanswered: RETRIED.includes(r.status), status: r.status, after: r.headers && r.headers.get("retry-after") };
+  // `own`: the server's own answer that the function failed (its error, or its limit on computing),
+  // which trying again gives again (FEEDBACK61.md, Q-899's second review; branch feedback61).
+  const own = r.status === 500 && !!(r.headers && r.headers.get("x-quillo-answer")) && !!body && typeof body.error === "string";
+  if (!r.ok) return { ...failed(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`), unanswered: RETRIED.includes(r.status), status: r.status, after: r.headers && r.headers.get("retry-after"), own };
   // A 2xx that is no answer, a sign-in page a redirect led to, nothing, a body cut short, gave
   // `null` as if the call had worked. The server marks what it sends, since `respond` and `reply`
   // hold what they like; a proxy may drop the mark, so an answer's own shape counts too. It may
@@ -5972,7 +5999,9 @@ async function liveRefresh(sub, newArgs) {
     sub.loading = false;
     // A load that failed for a while (no connection, 408, 429, a 5xx) keeps the last good data and
     // tries again, after a second, then two, doubling up to 30 s and spread out as `liveLoop`
-    // waits, or after the Retry-After the server gave (up to 5 minutes), until one comes. It gave
+    // waits, or after the Retry-After the server gave (up to 5 minutes), until one comes; not the
+    // server's own answer that the loader failed (its error, its limit on computing), which comes
+    // again, and showed a page waiting for it for good (Q-899's second review). It gave
     // up: the page showed old data until the next change, which a quiet table may never make, and a
     // change heard while it was on its way was forgotten. The console says so at the first failure
     // of a run of them. A refresh in the background does not make `waiting()` true, as it never
@@ -5983,7 +6012,7 @@ async function liveRefresh(sub, newArgs) {
     if (failed) {
       if (sub.inst.dead) return;
       const st = res.status;
-      const again = st !== undefined && (st === 0 || st === 408 || st === 429 || st >= 500);
+      const again = st !== undefined && (st === 0 || st === 408 || st === 429 || st >= 500) && !res.own;
       if (sub.fails === 0 || !again) report(value.error);
       if (!again) {
         sub.fails = 0;

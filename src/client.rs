@@ -4245,6 +4245,17 @@ impl<'a> Compiler<'a> {
         if let Some(msg) = f.strip_prefix("B.").and_then(|b| too_many(b, argv.len())) {
             return Ok(format!("W.fail({}, {})", js_str(&msg), argv.join(", ")));
         }
+        // A timer or a stream started in a component's code, its handlers and callbacks too, is the
+        // component's, given after the arguments it takes: a parent's handler that a child calls
+        // and closes (a modal's Save, a row's remove) kept its timer to the child, and lost it with
+        // the child (FEEDBACK61.md, Q-901's second review; branch feedback61).
+        if matches!(f.as_str(), "B.run_after" | "B.every" | "B.listen") && self.ctxs.iter().any(|c| c.component.is_some() && !c.view) {
+            let most = crate::check::most_args(&f[2..]).unwrap_or(argv.len());
+            while argv.len() < most {
+                argv.push("undefined".into());
+            }
+            argv.push("$i".into());
+        }
         let call = if f.starts_with("B.") || f.starts_with("G[") {
             format!("{}({})", f, argv.join(", "))
         } else {

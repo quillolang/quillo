@@ -1399,11 +1399,14 @@ fn a_late_navigate_is_dropped_only_if_the_page_moved_meanwhile() {
 // same page keeps it, and with nothing done meanwhile the save goes where it says. Each page this
 // lands on writes where it is as the result, as the page the test began on has gone. A link or a
 // form whose answer keeps the page (a 204) counts all the same, as the click is all the page sees:
-// the save stays where the person is.
+// the save stays where the person is. A save whose own move is to an address answered 204 leaves the
+// page as it is, and its run's move is noted for runs begun before it (CI's coverage: a move that
+// loads another page took its record with it).
 const PLAIN_NAVIGATES: &str = r###"server fn slow(ms: int) -> str { sleep(ms); "x" }
 component Saver() {
     <div>
         <button #save @click={() => { slow(300); navigate("/done") }}>save</button>
+        <button #save204 @click={() => { slow(300); navigate("/nothing") }}>save to nothing</button>
         <a #slow href="/slow">slow</a>
         <form #f action="/slow" method="get"><button #send>send</button></form>
         <a #spot href="#spot">spot</a>
@@ -1419,6 +1422,7 @@ route GET /p/form = start()
 route GET /p/spot = start()
 route GET /p/stay = start()
 route GET /p/stayform = start()
+route GET /p/to204 = start()
 route GET /nothing = null
 route GET /slow { sleep(1500); landed("slow") }
 route GET /done = landed("done")
@@ -1426,20 +1430,20 @@ route GET /done = landed("done")
 
 #[test]
 fn a_late_navigate_does_not_cancel_a_page_the_person_asked_for() {
-    let body = r#"await click("save");
-    const p = location.pathname;
+    let body = r#"const p = location.pathname;
+    await click(p === "/p/to204" ? "save204" : "save");
     if (p === "/p/link") $("slow").click();
     if (p === "/p/form") $("f").requestSubmit();
     if (p === "/p/spot") $("spot").click();
     if (p === "/p/stay") $("nothing").click();
     if (p === "/p/stayform") $("f2").requestSubmit();
-    if (p === "/p/stay" || p === "/p/stayform") { await tick(700); return { at: location.pathname }; }
+    if (p === "/p/stay" || p === "/p/stayform" || p === "/p/to204") { await tick(700); return { at: location.pathname }; }
     // The page this lands on says where it is.
     await new Promise(() => {});"#;
-    let paths = ["/p/link", "/p/none", "/p/form", "/p/spot", "/p/stay", "/p/stayform"];
+    let paths = ["/p/link", "/p/none", "/p/form", "/p/spot", "/p/stay", "/p/stayform", "/p/to204"];
     let Some(rs) = in_pages("q902-plain", PLAIN_NAVIGATES, &paths, body) else { return };
     let got: Vec<&str> = rs.iter().map(|r| r["at"].as_str().unwrap_or("")).collect();
-    assert_eq!(got, ["/slow", "/done", "/slow", "/done", "/p/stay", "/p/stayform"]);
+    assert_eq!(got, ["/slow", "/done", "/slow", "/done", "/p/stay", "/p/stayform", "/p/to204"]);
 }
 
 // ---- What Quillo takes off the page (Q-896) ----------------------------------------------------
@@ -2179,4 +2183,278 @@ fn what_a_waiting_page_sends_is_read_as_it_comes() {
     drop(c);
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(heard(&mut s).0, Heard::Gone);
+}
+
+// ---- Second review of slice 2 (Q-899, Q-901) ---------------------------------------------------
+
+// Q-901's second review: a `run_after`, an `every` or a `listen` started by a parent's handler that a
+// child calls belonged to the child that was clicked, and went with it: a modal's Save that closes
+// the modal and clears its notice a moment later never cleared it, nor did a row's remove, nor a
+// countdown's end (called from the countdown's own `every`). Each belongs to the component whose
+// code calls it now, the page here: the notice clears, and what the Save started goes on until the
+// page goes. A child's own timer still goes with the child.
+const PARENTS_TIMERS: &str = r###"route GET /ticks = events((send) => {
+    for i in range(100000) {
+        send(i)
+        sleep(40)
+    }
+})
+component Modal(on_save, note) {
+    <div>
+        <button #msave @click={() => { on_save() }}>save</button>
+        <button #mtimer @click={() => { run_after(150, () => { note("modal") }) }}>timer</button>
+    </div>
+}
+component Countdown(on_end) {
+    state left = 2
+    every(30, () => { left -= 1; if left == 0 { on_end() } })
+    <p>{left}</p>
+}
+component Page(note) {
+    state open = true
+    state notice = ""
+    state rows = [1, 2]
+    state counting = false
+    <div>
+        {open ? <Modal {note} on_save={() => { open = false; notice = "saved"; run_after(150, () => { notice = "" }); every(30, () => { note("pulse") }); listen("/ticks", (n) => { note("heard") }) }}/> : null}
+        <button #close @click={() => { open = false }}>close</button>
+        <button #reopen @click={() => { open = true }}>reopen</button>
+        <ul>{for x in rows => <li key={x}><button class="rm" data-x={x} @click={() => { rows = rows | filter((i) => i != x); notice = `removed ${x}`; run_after(150, () => { notice = "" }) }}>remove</button></li>}</ul>
+        {counting ? <Countdown on_end={() => { counting = false; notice = "ended"; run_after(150, () => { notice = "" }) }}/> : null}
+        <button #count @click={() => { counting = true }}>count</button>
+        <p #notice>{notice}</p>
+    </div>
+}
+component Host(now: bool) {
+    state on = now
+    state log = []
+    let note = (s) => { log = log + [s] }
+    <div>
+        <button #show @click={() => { on = true }}>show</button>
+        <button #off @click={() => { on = false }}>off</button>
+        {on ? <Page {note}/> : null}
+        <p #log>{join(log, ",")}</p>
+    </div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn a_parents_timer_started_from_a_child_it_closes_is_the_parents() {
+    let body = r##"const n = (s) => $("log").textContent.split(",").filter((t) => t === s).length;
+    const until = async (f, ms) => { const t0 = performance.now(); while (!f() && performance.now() - t0 < ms) await tick(10); return f(); };
+    const notice = () => $("notice").textContent;
+    const out = {};
+    await click("msave");
+    out.modal = [!$("msave"), notice(), await until(() => notice() === "", 1500)];
+    out.started = [await until(() => n("pulse") > 2, 3000), await until(() => n("heard") > 2, 3000)];
+    document.querySelector('.rm[data-x="1"]').click(); await tick(30);
+    out.row = [document.querySelectorAll(".rm").length, notice(), await until(() => notice() === "", 1500)];
+    await click("count"); await until(() => notice() === "ended", 3000);
+    out.countdown = [notice(), await until(() => notice() === "", 1500)];
+    // The modal's own timer goes with the modal.
+    await click("reopen", "mtimer"); await click("close"); await tick(300); out.modalOwn = n("modal");
+    // What the page started goes with the page.
+    await click("off"); await tick(60); { const p = n("pulse"), h = n("heard"); await tick(300); out.pageGone = [n("pulse") === p, n("heard") === h]; }
+    return out;"##;
+    let Some(rs) = in_pages("q901-parent", PARENTS_TIMERS, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            "modal": [true, "saved", true], "started": [true, true], "row": [1, "removed 1", true], "countdown": ["ended", true],
+            "modalOwn": 0, "pageGone": [true, true], "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Q-901's second review: each `run_after` left its cleanup in its component's list after it had
+// fired, so a poll that starts the next as it ends grew the list by one a tick, for as long as the
+// component lived. Ten polls of 400 ticks each leave the heap as it was.
+const POLLS: &str = r###"fn step(k: int, done) {
+    if k > 0 { run_after(0, () => { step(k - 1, done) }) } else { done() }
+}
+component Poll() {
+    state ended = 0
+    <div><button #go @click={() => { for i in range(10) { step(400, () => { ended += 1 }) } }}>go</button><p #ended>{ended}</p></div>
+}
+route GET /h = <html><head><title>t</title></head><body><Poll/></body></html>
+"###;
+
+#[test]
+fn a_poll_of_run_afters_leaves_nothing_behind() {
+    let body = r##"const until = async (f, ms) => { const t0 = performance.now(); while (!f() && performance.now() - t0 < ms) await tick(20); return f(); };
+    const heap = async () => { for (let k = 0; k < 3; k++) { gc(); await tick(50); } return performance.memory.usedJSHeapSize; };
+    // A first round, so that what the code makes once is made.
+    await click("go"); await until(() => $("ended").textContent === "10", 20000);
+    const before = await heap();
+    await click("go"); await until(() => $("ended").textContent === "20", 20000);
+    const after = await heap();
+    return { ended: $("ended").textContent, grewKB: Math.round((after - before) / 1024) };"##;
+    let Some(rs) = in_pages("q901-poll", POLLS, &["/h"], body) else { return };
+    assert_eq!(rs[0]["ended"], "20", "{}", rs[0]);
+    assert!(rs[0]["grewKB"].as_i64().unwrap() < 60, "4,000 ticks grew the heap by {} KB: {}", rs[0]["grewKB"], rs[0]);
+    assert_eq!((&rs[0]["errors"], &rs[0]["remade"]), (&serde_json::json!([]), &serde_json::json!(0)), "{}", rs[0]);
+}
+
+// Q-899's second review: a loader whose own code failed (Quillo's 500 with its error, as for a
+// computation past --max-compute) was tried again for good, behind a first load's spinner, where
+// main showed the error once and nothing. It is not tried again now, as on main: the state stays as
+// it was (nothing, for a first load, which then follows nothing until it is made again, as on main),
+// and the console says so; a later failure of the same kind keeps the data shown, and the next
+// change loads. A 503 that the program `reply`s is no such answer, and is tried again.
+const LIVE_OWN_ERROR: &str = r###"let mode = 0
+server fn load_e() {
+    if mode == 1 {
+        let z = mode - 1
+        print(1 / z)
+    }
+    if mode == 2 { reply 503 "busy" }
+    [mode]
+}
+component E() {
+    state r = live(load_e)
+    <p #e class={{ behind: waiting(r) }}>{r == null ? "none" : r[0]}</p>
+}
+component Host(now: bool) {
+    state on = now
+    state k = 0
+    <div><button #show @click={() => { on = true }}>show</button><button #again @click={() => { k += 1 }}>again</button>{on ? <E key={k}/> : null}</div>
+}
+route POST /t/mode/:m(int) { mode = m; "ok" }
+route GET /f = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn a_loader_whose_code_fails_is_shown_once_not_tried_for_good() {
+    let body = r##"const real = window.fetch.bind(window);
+    let calls = 0;
+    window.fetch = (u, init) => { if (String(u).includes("/_quillo/rpc/load_e")) calls++; return real(u, init); };
+    const set = (m) => real(`/t/mode/${m}`, { method: "POST" });
+    const shown = () => ($("e") ? $("e").textContent : null);
+    const until = async (f, ms) => { const t0 = performance.now(); while (!f() && performance.now() - t0 < ms) await tick(20); return f(); };
+    const out = {};
+    // Made in the browser, its first load fails in its own code: once, and nothing is waited for.
+    await set(1); await click("show"); await until(() => calls > 0, 3000); await tick(2500);
+    out.first = [shown(), $("e").classList.contains("behind"), calls];
+    // Made again, it loads.
+    await set(0); await click("again"); out.loaded = await until(() => shown() === "0", 3000);
+    // Its code fails on a change: the data stays, not waiting, once; the next change loads.
+    { const c = calls; await set(1); await until(() => calls > c, 3000); await tick(2500); out.later = [shown(), $("e").classList.contains("behind"), calls - c]; }
+    await set(4); out.next = await until(() => shown() === "4", 3000);
+    // A 503 the program replies is tried again; then a change brings the answer.
+    { const c = calls; await set(2); await until(() => calls > c + 1, 4000); out.reply503 = [shown(), calls - c >= 2]; }
+    await set(3); out.back = await until(() => shown() === "3", 8000);
+    return out;"##;
+    let Some(rs) = in_pages("q899-own", LIVE_OWN_ERROR, &["/f"], body) else { return };
+    let want = serde_json::json!({
+        "first": ["none", false, 1], "loaded": true, "later": ["0", false, 1], "next": true, "reply503": ["4", true], "back": true,
+        "remade": 0,
+        "errors": ["server fn `load_e` failed (500): internal error in `load_e`", "server fn `load_e` failed (500): internal error in `load_e`", "server fn `load_e` failed (503)"],
+    });
+    assert_eq!(rs[0], want);
+}
+
+// Q-896's edge, where Quillo makes a component again: the server's HTML of a component inside
+// another, of one at the top and of a table row that is its own root, was changed by a script before
+// they were taken up, so each is made again when the person reaches it, by focusing a field in it.
+// The field the take-up gave a handler to goes as it is made again, focused: its `blur` reaches no
+// handler. The page has the focus here.
+const MADE_AGAIN: &str = r###"let blurs = 0
+server fn blurred() { blurs += 1 }
+component Field() {
+    <span class="f"><input class="in" @blur={() => { blurred() }}/><b class="tag">tag</b></span>
+}
+component Outer() {
+    state n = 0
+    <div id="outer"><Field/><button #more @click={() => { n += 1 }}>{n}</button></div>
+}
+component Top() {
+    <div class="top"><input class="tin" @blur={() => { blurred() }}/><b class="ttag">tag</b></div>
+}
+component Line() {
+    <tr class="line"><td><input class="lin" @blur={() => { blurred() }}/></td><td><b class="ltag">tag</b></td></tr>
+}
+route GET /t/blurs = str(blurs)
+route GET /h = <html><head><title>t</title></head><body><main><Outer/><Top/><table><tbody><Line/></tbody></table></main></body></html>
+"###;
+
+#[test]
+fn a_component_made_again_hears_nothing_from_what_it_took_up() {
+    let body = r##"const swap = (sel) => { const b = document.querySelector(sel); const em = document.createElement("em"); em.textContent = b.textContent; b.replaceWith(em); };
+    swap(".tag"); swap(".ttag"); swap(".ltag");
+    const before = QW.remade ?? 0;
+    document.querySelector(".in").focus(); await tick(200);
+    document.querySelector(".tin").focus(); await tick(200);
+    document.querySelector(".lin").focus(); await tick(200);
+    $("more").click(); await tick(300);
+    const blurs = await (await fetch("/t/blurs")).text();
+    return { made: (QW.remade ?? 0) - before, blurs, inputs: document.querySelectorAll("input").length, taken: !!document.querySelector(".tag") && !!document.querySelector(".ttag") && !!document.querySelector(".ltag") };"##;
+    let Some(rs) = in_pages_with("q896-remade", MADE_AGAIN, &["/h"], body, true) else { return };
+    let r = &rs[0];
+    assert_eq!((&r["made"], &r["blurs"], &r["inputs"], &r["taken"]), (&serde_json::json!(3), &serde_json::json!("0"), &serde_json::json!(3), &serde_json::json!(true)), "{}", r);
+}
+
+// Q-889's edge: a row of two branches, whose record keeps the two markers, through flips and moves.
+const BRANCH_THEN_ELEMENT: &str = r###"view Pair(x) = [x.on ? <b>{`b${x.id}`}</b> : <i>{`i${x.id}`}</i>, x.id > 1 ? <em>{`e${x.id}`}</em> : <u>{`u${x.id}`}</u>]
+component Rows() {
+    state xs = [{ id: 1, on: true }, { id: 2, on: false }, { id: 3, on: true }]
+    <div>
+        <div #l>{for x in xs => <Pair key={x.id} {x}/>}</div>
+        <button #flip @click={() => { xs = xs | map((x) => x.id == 2 ? merge(x, { on: !x.on }) : x) }}>flip</button>
+        <button #rev @click={() => { xs = reverse(xs) }}>rev</button>
+        <button #drop @click={() => { xs = xs | filter((x) => x.id != 1) }}>drop</button>
+    </div>
+}
+component Host(now: bool) {
+    state on = now
+    <div><button #show @click={() => { on = true }}>show</button>{on ? <Rows/> : null}</div>
+}
+route GET /h = <html><head><title>t</title></head><body><Host now={true}/></body></html>
+route GET /b = <html><head><title>t</title></head><body><Host now={false}/></body></html>
+"###;
+
+#[test]
+fn rows_of_two_branches_move_as_they_are() {
+    let body = r##"const seen = () => [...$("l").children].map((e) => e.textContent).join(" ");
+    const out = { start: seen() };
+    await click("flip", "rev"); out.flipRev = seen();
+    await click("flip", "rev"); out.back = seen();
+    await click("drop", "rev"); out.dropRev = seen();
+    return out;"##;
+    let Some(rs) = in_pages("q889-branch-element", BRANCH_THEN_ELEMENT, BOTH, body) else { return };
+    for (r, path) in rs.iter().zip(BOTH) {
+        let want = serde_json::json!({
+            "start": "b1 u1 i2 e2 b3 e3", "flipRev": "b3 e3 b2 e2 b1 u1", "back": "b1 u1 i2 e2 b3 e3", "dropRev": "b3 e3 i2 e2",
+            "remade": 0, "errors": [],
+        });
+        assert_eq!(r, &want, "at {}", path);
+    }
+}
+
+// Q-901's edge: an error in a `run_after`'s callback, or in one tick of an `every`, is said, and
+// what comes after runs as it did: the timer's next tick, and a handler's next timer.
+const FAILING_TIMERS: &str = r###"component T() {
+    state n = 0
+    state m = 0
+    <div>
+        <button #ra @click={() => { run_after(10, () => { n += 1; let z = n - n; print(1 / z) }) }}>ra</button>
+        <button #ev @click={() => { every(20, () => { m += 1; if m == 2 { let z = m - m; print(1 / z) } }) }}>ev</button>
+        <p #n>{n}</p><p #m>{m}</p>
+    </div>
+}
+route GET /h = <html><head><title>t</title></head><body><T/></body></html>
+"###;
+
+#[test]
+fn an_error_in_a_timers_callback_is_said_and_the_rest_goes_on() {
+    let body = r##"const until = async (f, ms) => { const t0 = performance.now(); while (!f() && performance.now() - t0 < ms) await tick(10); return f(); };
+    await click("ra"); await until(() => $("n").textContent === "1", 2000);
+    await click("ra"); const again = await until(() => $("n").textContent === "2", 2000);
+    await click("ev"); const ticks = await until(() => Number($("m").textContent) > 4, 3000);
+    return { again, ticks, errors2: window.__quilloErrors.length };"##;
+    let Some(rs) = in_pages("q901-throws", FAILING_TIMERS, &["/h"], body) else { return };
+    let r = &rs[0];
+    assert_eq!((&r["again"], &r["ticks"], &r["errors2"]), (&serde_json::json!(true), &serde_json::json!(true), &serde_json::json!(3)), "{}", r);
+    assert!(r["errors"].as_array().unwrap().iter().all(|e| e.as_str().unwrap().contains("division by zero")), "{}", r);
 }
