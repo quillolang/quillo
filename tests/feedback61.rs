@@ -2013,7 +2013,9 @@ fn a_clients_places_come_back_as_its_pages_close() {
 /// the head counts the page's sockets; at `/never` they never open, at `/late` each opens 5 s after it
 /// is made (as a browser holding sockets back lets one through), at `/fails` the first two never open
 /// and fail at 4 s (as a browser's own limit ends one, or a network refusing sockets slowly), at
-/// `/outage` sockets and plain requests fail after `?d=` ms once the page sets `__down` (a proxy
+/// `/revive` the first socket keeps trying until the page calls `__fail1()`, its first plain request
+/// fails at once and the rest pass, and `/outage` sockets and plain requests fail after `?d=` ms once
+/// the page sets `__down` (a proxy
 /// whose upstream is down answers 504 after its connect timeout), and at `/old` the server's word
 /// that a socket takes topics is taken out of its messages, as from a server that does not say it
 /// (an older one, or one that cannot watch its sockets).
@@ -2046,6 +2048,7 @@ component App() {
 let count = "window.__made = 0; window.__heard = 0; { const Real = WebSocket; window.WebSocket = class extends Real { constructor(...a) { super(...a); window.__made++; this.addEventListener('message', () => { window.__heard++; }); } }; }"
 let never = "window.__made = 0; window.WebSocket = class { constructor() { window.__made++; this.readyState = 0; } send() {} close() { this.readyState = 3; } };"
 let fails = "window.__made = 0; window.__failed = []; window.__madeAt = []; { const Real = WebSocket; window.WebSocket = class { constructor(u) { window.__made++; window.__madeAt.push(performance.now()); if (window.__made > 2) return new Real(u); this.readyState = 0; setTimeout(() => { if (this.readyState === 3) return; window.__failed.push(performance.now()); this.readyState = 3; if (this.onclose) this.onclose({ code: 1006 }); }, 4000); } send() {} close() { this.readyState = 3; } }; }"
+let revive = "window.__made = 0; window.__madeAt = []; window.__asks = 0; window.__failedAt = 0; { const Real = WebSocket, realFetch = window.fetch.bind(window); window.WebSocket = class { constructor(u) { window.__made++; window.__madeAt.push(performance.now()); if (window.__made > 1) return new Real(u); this.readyState = 0; window.__fail1 = () => { if (this.readyState === 3) return; this.readyState = 3; window.__failedAt = performance.now(); if (this.onclose) this.onclose({ code: 1006 }); }; } send() {} close() { this.readyState = 3; } }; window.fetch = (u, init) => { if (String(u).includes('/_quillo/live?') && window.__asks++ === 0) return Promise.reject(new TypeError('Failed to fetch')); return realFetch(u, init); }; }"
 let outage = "window.__made = 0; window.__asks = []; window.__down = false; window.__socks = []; { const d = +new URLSearchParams(location.search).get('d') || 0; const Real = WebSocket, realFetch = window.fetch.bind(window); window.WebSocket = class { constructor(u) { window.__made++; if (!window.__down) { const r = new Real(u); window.__socks.push(r); return r; } this.readyState = 0; setTimeout(() => { if (this.readyState === 3) return; this.readyState = 3; if (this.onclose) this.onclose({ code: 1006 }); }, d); } send() {} close() { this.readyState = 3; } }; window.fetch = (u, init) => { if (window.__down && String(u).includes('/_quillo/live?')) { window.__asks.push(performance.now()); return new Promise((ok) => setTimeout(() => ok(new Response('down', { status: 504 })), d)); } return realFetch(u, init); }; }"
 let late = "window.__made = 0; window.__opened = 0; { const Real = WebSocket; window.WebSocket = class { constructor(u) { window.__made++; this.readyState = 0; setTimeout(() => { if (this.readyState === 3) return; const r = this.r = new Real(u); r.onopen = (e) => { this.readyState = 1; window.__opened = performance.now(); if (this.onopen) this.onopen(e); }; r.onmessage = (e) => { if (this.onmessage) this.onmessage(e); }; r.onclose = (e) => { this.readyState = 3; if (this.onclose) this.onclose(e); }; }, 5000); } send(d) { if (this.r) this.r.send(d); } close() { this.readyState = 3; if (this.r) this.r.close(); } }; }"
 let old = "window.__made = 0; { const Real = WebSocket; window.WebSocket = class extends Real { constructor(...a) { super(...a); window.__made++; } set onmessage(f) { super.onmessage = (m) => f({ data: String(m.data).replace(',\"takes\":\"topics\"', '') }); } }; }"
@@ -2057,6 +2060,7 @@ route GET /never/:x = page(never)
 route GET /late/:x = page(late)
 route GET /fails/:x = page(fails)
 route GET /outage/:x = page(outage)
+route GET /revive/:x = page(revive)
 route GET /old/:x = page(old)
 "###;
 
@@ -2699,6 +2703,37 @@ fn an_outage_whose_requests_fail_slowly_is_waited_out_and_said() {
         assert!((2..=most).contains(&sockets) && (2..=most).contains(&asks), "{}: {}", path, r);
         assert_eq!((&r["said"], &r["back"], &r["socketBack"], &r["remade"]), (&serde_json::json!(1), &serde_json::json!(true), &serde_json::json!(true), &serde_json::json!(0)), "{}: {}", path, r);
     }
+}
+
+// The race behind 89e34a6, made certain (CI's coverage gate found that the outage test went through
+// it only by chance): a plain request answered again, after failures, while a socket is still trying,
+// so the loop is in no wait to end. It marks the server as back (`st.revived`), and when that socket
+// fails the next is made at once, where it waited its 1 to 3 s and more (at least 1,000 ms). Here the
+// first socket neither opens nor fails until the page says so; from 3 s on, the first plain request
+// fails, the second, after its wait, is answered with a change; then the socket fails.
+#[test]
+fn a_socket_that_fails_after_the_server_came_back_is_made_again_at_once() {
+    let body = format!(
+        r##"{MOVES_JS}
+    for (let i = 0; i < 400 && window.__asks < 1; i++) await tick(20);
+    if (window.__asks < 1) return {{ asked: false }};
+    const next = +$("va").textContent + 1;
+    await write("a", next);
+    const told = await until("a", next, 8000);
+    if (told === null || window.__made !== 1) return {{ told: told !== null, made: window.__made }};
+    await tick(200);
+    window.__fail1();
+    for (let i = 0; i < 300 && window.__made < 2; i++) await tick(10);
+    const again = window.__made < 2 ? null : Math.round(window.__madeAt[1] - window.__failedAt);
+    await tick(500);
+    await write("a", next + 1);
+    const bySocket = await until("a", next + 1, 3000);
+    return {{ told: true, atOnce: again !== null && again >= 0 && again < 500, again, bySocket: bySocket !== null, made: window.__made }};"##
+    );
+    let Some(rs) = in_pages("q900-revive", PAGES_MOVED, &["/revive/a"], &body) else { return };
+    eprintln!("q900 revive: {}", rs[0]);
+    let r = &rs[0];
+    assert_eq!((&r["told"], &r["atOnce"], &r["bySocket"], &r["made"], &r["errors"]), (&serde_json::json!(true), &serde_json::json!(true), &serde_json::json!(true), &serde_json::json!(2), &serde_json::json!([])), "{}", r);
 }
 
 // The plain requests made while there is no socket follow the live loop's rules: a refusal waits for
