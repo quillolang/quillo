@@ -17,7 +17,7 @@
 
 use crate::ast::*;
 use crate::interp::{Ctrl, MAX_DEPTH};
-use crate::value::{lookup, Closure, Env, Value};
+use crate::value::{lookup, lookup_global, Closure, Env, Value};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{types, AbiParam, Block, InstBuilder, MemFlagsData, Type, UserFuncName, Value as V};
 use cranelift_codegen::settings::{self, Configurable};
@@ -87,8 +87,17 @@ type Key = (usize, Vec<T>);
 const NEVER: u32 = u32::MAX;
 
 /// `FnDef::hot` from this up, after a call of the function too deep for machine code (`run`):
-/// this plus the depth of the last call of it the interpreter has followed down since.
+/// this plus the depth of that call (`DEPTHS`), and above it the calls of the function under
+/// it still left to the interpreter (`FOLLOWED` at first).
 const DEEPER: u32 = 2;
+const DEPTH_BITS: u32 = 14;
+const DEPTHS: u32 = (1 << DEPTH_BITS) - 1;
+/// A recursion past the limit makes this many calls of its function under the call that went
+/// too deep, four at each level, before machine code is tried again: a shape making more pays
+/// for one more descent in machine code each time, a small part of the interpreter's time, and a
+/// call made after the recursion from deeper than it is compiled again after this many.
+const FOLLOWED: u32 = 4 * MAX_DEPTH as u32;
+const _: () = assert!(MAX_DEPTH <= DEPTHS as usize && (FOLLOWED as u64) << DEPTH_BITS < NEVER as u64 - DEPTHS as u64 - DEEPER as u64);
 
 struct Jit {
     module: JITModule,
@@ -219,16 +228,18 @@ pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Option<Result<Valu
     if let Some(q) = LAST.get().filter(|q| q.def == at && q.code == code) {
         return run(q.entry, q.ret, &raw, depth);
     }
-    // Under a call of it that went too deep for machine code, the interpreter follows this
-    // function down, level by level; at a call of it no deeper than the last it followed, it is
-    // back above it. Only here, not before the last function, which `run` forgets then
-    // (FEEDBACK52.md, Q-677 review; branch feedback52). Kept for each function: kept for the
-    // thread, a call of another one at the same depth (`r(d - 1, h(x))`), or a recursion of its
-    // own under it, took it back above at each level (Q-677 review 2).
+    // Under a call of it that went too deep for machine code, this function is the
+    // interpreter's: every call of it deeper than that call, until `FOLLOWED` of them; a call of
+    // it no deeper is after it. Only here, not before the last function, which `run` forgets
+    // then (FEEDBACK52.md, Q-677 review; branch feedback52). Kept for each function: kept for
+    // the thread, a call of another one at the same depth (`r(d - 1, h(x))`) took it back to
+    // machine code (Q-677 review 2); and the depth of the last call followed, not of the one
+    // that went too deep, was taken back by one of its own at the same depth (`r(d - 1, r(0, x)
+    // + 1)`), so each level went down to the limit in machine code again (Q-677 review 3).
     if hot >= DEEPER {
-        let at = depth as u32 + DEEPER;
-        if at > hot {
-            def.hot.store(at, Relaxed);
+        let (under, left) = ((hot - DEEPER) & DEPTHS, (hot - DEEPER) >> DEPTH_BITS);
+        if depth > under as usize && left > 0 {
+            def.hot.store(DEEPER + ((left - 1) << DEPTH_BITS | under), Relaxed);
             return None;
         }
         def.hot.store(1, Relaxed);
@@ -254,12 +265,10 @@ pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Option<Result<Valu
     if compiled.deps.is_empty() {
         LAST.set(Some(Quick { def: at, code, entry: compiled.entry, ret: compiled.ret }));
     }
-    // What it calls is still what it was compiled with, and a builtin it reads (`range`, at 0)
-    // still that builtin.
+    // What it calls is still what it was compiled with.
     for (name, at) in &compiled.deps {
         match lookup(&c.env, name) {
             Some(Value::Func(f)) if Arc::as_ptr(&f.def) as usize == *at => {}
-            Some(Value::Builtin(b, _)) if *at == 0 && b == name.as_str() => {}
             _ => return None,
         }
     }
@@ -268,7 +277,7 @@ pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Option<Result<Valu
     // the last function's call goes to as well: it calls nothing (no deps), so it never goes
     // too deep, and is not slowed by it.
     if r.is_none() && TOO_DEEP.replace(false) {
-        def.hot.store(depth as u32 + DEEPER, Relaxed);
+        def.hot.store(DEEPER + (FOLLOWED << DEPTH_BITS | depth as u32), Relaxed);
     }
     r
 }
@@ -385,13 +394,34 @@ struct Plan<'a> {
     open: HashMap<Key, (T, bool, usize)>,
     deps: Vec<(String, usize)>,
     done: &'a HashMap<Key, Option<Arc<Compiled>>>,
-    /// Planned functions that read a guess still being made: the place in `lows` of the
-    /// outermost function guessed. Only these are taken back when a guess does not come out
-    /// (FEEDBACK52.md, Q-677 review 2; branch feedback52).
-    stands_on: HashMap<Key, usize>,
-    /// For each function being planned, the outermost place in it whose guess its plan read
-    /// (`usize::MAX` for none).
-    lows: Vec<usize>,
+    /// Planned functions that read guesses still being made: the places in `reads` of the
+    /// functions guessed, in order. Only these are taken back when one of those guesses does not
+    /// come out (FEEDBACK52.md, Q-677 review 2; branch feedback52), and only for that one: the
+    /// outermost alone took back, at each guess of a function, the plans that read only the
+    /// first function's, and a chain each calling the first was as slow as before (Q-677 review 3).
+    stands_on: HashMap<Key, Vec<usize>>,
+    /// For each function being planned, the places of the guesses its plan read, in order.
+    reads: Vec<Vec<usize>>,
+    /// Guesses tried, against `PLAN_STEPS` for each function planned (`seen`): a plan whose
+    /// guesses each stand on the last (a chain each calling its caller) is still exponential, and
+    /// past that its compile is refused and the interpreter runs it, as on main (Q-677 review 3).
+    steps: usize,
+    seen: std::collections::HashSet<usize>,
+    /// It reads the builtin `range` (`range_of`).
+    range: bool,
+}
+
+/// Guesses `Plan` tries for each function it plans, at most: a chain of 40 functions each
+/// calling the first, bool results, takes 9 a function.
+const PLAN_STEPS: usize = 64;
+
+/// Adds the places `more` to `to`, both in order.
+fn stand_on(to: &mut Vec<usize>, more: &[usize]) {
+    for &m in more {
+        if let Err(i) = to.binary_search(&m) {
+            to.insert(i, m);
+        }
+    }
 }
 
 impl<'a> Plan<'a> {
@@ -399,8 +429,9 @@ impl<'a> Plan<'a> {
         let key = (Arc::as_ptr(def) as usize, args.to_vec());
         if let Some(t) = self.types.get(&key) {
             let t = *t;
-            if let Some(&on) = self.stands_on.get(&key) {
-                self.read(on);
+            if let Some(on) = self.stands_on.get(&key) {
+                let on = on.clone();
+                self.read(&on);
             }
             return Some(t);
         }
@@ -417,7 +448,7 @@ impl<'a> Plan<'a> {
         if let Some((t, used, at)) = self.open.get_mut(&key) {
             *used = true;
             let (t, at) = (*t, *at);
-            self.read(at);
+            self.read(&[at]);
             return Some(t);
         }
         if !shape_ok(def) || def.params.len() != args.len() || !def.params.iter().zip(args).all(|(p, t)| ty_takes(&p.ty, *t)) {
@@ -425,16 +456,23 @@ impl<'a> Plan<'a> {
         }
         // A recursive function's calls of itself: its result type is
         // guessed, and the guess must come out.
-        let me = self.lows.len();
+        self.seen.insert(key.0);
+        let me = self.reads.len();
         for guess in [T::I, T::F, T::B] {
+            self.steps += 1;
+            if self.steps > PLAN_STEPS * self.seen.len() {
+                return None;
+            }
             self.open.insert(key.clone(), (guess, false, me));
-            self.lows.push(usize::MAX);
+            self.reads.push(Vec::new());
             let planned = self.order.len();
             let mut sc = Scopes { stack: vec![def.params.iter().map(|p| p.name.to_string()).zip(args.iter().copied()).collect()] };
             let mut ret = None;
             let got = self.tail(&def.body, &mut sc, &mut ret);
             let (_, used, _) = self.open.remove(&key).unwrap();
-            let low = self.lows.pop().unwrap();
+            // The guesses this plan read but its own.
+            let mut on = self.reads.pop().unwrap();
+            on.retain(|&at| at != me);
             let t = match (got, ret) {
                 (Some(Some(a)), Some(b)) if a != b => None,
                 (Some(Some(a)), _) => Some(a),
@@ -447,23 +485,23 @@ impl<'a> Plan<'a> {
             };
             match t {
                 Some(t) if (!used || t == guess) && ty_takes(&def.ret, t) => {
-                    // What read this guess now stands on what this plan reads: an outer guess,
+                    // What read this guess now stands on what this plan reads: outer guesses,
                     // or none.
-                    let on = (low < me).then_some(low);
                     if !self.stands_on.is_empty() {
                         for (d, a) in &self.order[planned..] {
                             let k = (Arc::as_ptr(d) as usize, a.clone());
-                            if self.stands_on.get(&k) == Some(&me) {
-                                match on {
-                                    Some(on) => self.stands_on.insert(k, on),
-                                    None => self.stands_on.remove(&k),
-                                };
+                            let Some(read) = self.stands_on.get_mut(&k) else { continue };
+                            let Ok(i) = read.binary_search(&me) else { continue };
+                            read.remove(i);
+                            stand_on(read, &on);
+                            if read.is_empty() {
+                                self.stands_on.remove(&k);
                             }
                         }
                     }
-                    if let Some(on) = on {
+                    if !on.is_empty() {
+                        self.read(&on);
                         self.stands_on.insert(key.clone(), on);
-                        self.read(on);
                     }
                     self.types.insert(key, t);
                     self.order.push((def.clone(), args.to_vec()));
@@ -484,7 +522,8 @@ impl<'a> Plan<'a> {
                 let tail: Vec<_> = self.order.drain(planned..).collect();
                 for (d, a) in tail {
                     let k = (Arc::as_ptr(&d) as usize, a);
-                    if self.stands_on.remove(&k).is_some() {
+                    if self.stands_on.get(&k).is_some_and(|read| read.binary_search(&me).is_ok()) {
+                        self.stands_on.remove(&k);
                         self.types.remove(&k);
                     } else {
                         self.order.push((d, k.1));
@@ -498,11 +537,11 @@ impl<'a> Plan<'a> {
         None
     }
 
-    /// The function being planned read a plan, or a guess, standing on the guess at `at` in
-    /// `lows`.
-    fn read(&mut self, at: usize) {
-        if let Some(l) = self.lows.last_mut() {
-            *l = (*l).min(at);
+    /// The function being planned read a plan, or a guess, standing on the guesses at `on` in
+    /// `reads`.
+    fn read(&mut self, on: &[usize]) {
+        if let Some(read) = self.reads.last_mut() {
+            stand_on(read, on);
         }
     }
 
@@ -643,14 +682,16 @@ impl<'a> Plan<'a> {
             }
             Expr::For(pat, iter, body, _) => {
                 let (a, b) = range_of(iter, self.env)?;
-                // `range(n)`, read as the builtin: where `range` is something else when the code
-                // is called again (a nested function's other scope, or `range = ...`), it is not
-                // run. It gave the builtin's sum where the interpreter said "cannot loop over
-                // int" (FEEDBACK52.md, Q-677 review 2; branch feedback52).
-                // A builtin's dep has no function: 0.
-                let dep = ("range".to_string(), 0);
-                if matches!(&**iter, Expr::Call(..)) && !self.deps.contains(&dep) {
-                    self.deps.push(dep);
+                // `range(n)` is the builtin's only where no parameter or variable of the function
+                // is named `range` (`fn g(range, n)`, `let range = n`): there it gave the
+                // builtin's sum, where the interpreter says "cannot call int" (FEEDBACK52.md, Q-677
+                // review 3; branch feedback52). That the program's own `range` is the builtin is
+                // decided here, for the code made (`range_of`), and kept by `range_rebound`.
+                if matches!(&**iter, Expr::Call(..)) {
+                    if sc.get("range").is_some() {
+                        return None;
+                    }
+                    self.range = true;
                 }
                 if let Some(a) = a {
                     if self.value(a, sc, ret)? != T::I {
@@ -687,7 +728,12 @@ fn range_of<'e>(iter: &'e Expr, env: &Env) -> Option<(Option<&'e Expr>, &'e Expr
     match iter {
         Expr::Binary(BinOp::Range, a, b, _) => Some((Some(a), b)),
         Expr::Call(f, args, _) if matches!(&**f, Expr::Ident(n, _) if n == "range") => {
-            if !matches!(lookup(env, "range"), Some(Value::Builtin("range", _))) {
+            // The builtin itself, the global: a scope around the function that names something
+            // `range` (one function in two scopes, the builtin in one) is the interpreter's. Its
+            // code was reused in the other, and checking the name at each call instead kept the
+            // function from the last function's quick call: 3 times the instructions mapping it
+            // over a list (FEEDBACK52.md, Q-677 review 3; branch feedback52).
+            if !matches!(lookup_global(env, "range"), Some((Value::Builtin("range", _), true))) {
                 return None;
             }
             match args.as_slice() {
@@ -786,9 +832,9 @@ pub(crate) fn swapped(op: BinOp) -> BinOp {
 // ---- making the code ---------------------------------------------------
 
 fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
-    let mut plan = Plan { env: &c.env, types: HashMap::new(), order: Vec::new(), open: HashMap::new(), deps: Vec::new(), done: &jit.done, stands_on: HashMap::new(), lows: Vec::new() };
+    let mut plan = Plan { env: &c.env, types: HashMap::new(), order: Vec::new(), open: HashMap::new(), deps: Vec::new(), done: &jit.done, stands_on: HashMap::new(), reads: Vec::new(), steps: 0, seen: Default::default(), range: false };
     let ret = plan.func(&c.def, sig)?;
-    let (types, order, deps) = (plan.types, plan.order, plan.deps);
+    let (types, order, deps, range) = (plan.types, plan.order, plan.deps, plan.range);
     // Each function to make, declared first (they may call each other).
     let mut ids: HashMap<Key, FuncId> = HashMap::new();
     for (def, args) in &order {
@@ -897,6 +943,7 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
     jit.module.define_function(entry_id, &mut ctx).ok()?;
     jit.module.clear_context(&mut ctx);
     jit.module.finalize_definitions().ok()?;
+    let kept = jit.keep.len();
     for (def, args) in order {
         let key = (Arc::as_ptr(&def) as usize, args);
         jit.keep.push(def);
@@ -906,7 +953,25 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
     let code = jit.module.get_finalized_function(entry_id);
     // SAFETY: the entry was made with exactly this signature.
     let entry = unsafe { std::mem::transmute::<*const u8, Entry>(code) };
+    if range {
+        READS_RANGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(jit.keep[kept..].iter().cloned());
+    }
     Some(Compiled { entry, ret, deps, id: target })
+}
+
+/// Functions compiled reading the builtin `range` (`range_of`).
+static READS_RANGE: std::sync::Mutex<Vec<Arc<FnDef>>> = std::sync::Mutex::new(Vec::new());
+
+/// The builtin `range` was made something else by `let` (which `quillo check` warns of): the
+/// functions compiled reading it are the interpreter's from now on, through `hot`, which a call
+/// reads first, so that the quick call pays nothing for it (FEEDBACK52.md, Q-677 review 3;
+/// branch feedback52). `range = ...`, which `quillo check` refuses, is not followed (`rebinding`
+/// in src/value.rs).
+#[cold]
+pub(crate) fn range_rebound() {
+    for def in READS_RANGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain(..) {
+        def.hot.store(NEVER, Relaxed);
+    }
 }
 
 /// Code for `id` that only gives up, as the function would have at its first step.

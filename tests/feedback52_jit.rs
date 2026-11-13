@@ -902,8 +902,11 @@ print(kb[0](4))
 ";
     let got = both_ways(nested);
     assert!(got.starts_with("6\n6\n10\nFAILED") && got.contains("cannot loop over int"), "{}", got);
-    // `range` given another value at the top (which `quillo check` refuses): 10, not 6.
-    let top = "fn f(n) {\n    let s = 0\n    for i in range(n) {\n        s += i\n    }\n    s\n}\nprint(f(4))\nprint(f(4))\nrange = (n) => [10]\nprint(f(4))\n";
+    // `range` made something else at the top (which `quillo check` warns of): 10, not 6.
+    // Changed in Q-677 review 3 from `range = ...`, which `quillo check` refuses and compiled
+    // code no longer follows: decided when compiling, as on main, as following it cost every
+    // assignment at a program's top level.
+    let top = "fn f(n) {\n    let s = 0\n    for i in range(n) {\n        s += i\n    }\n    s\n}\nprint(f(4))\nprint(f(4))\nlet range = (n) => [10]\nprint(f(4))\n";
     assert_eq!(both_ways(top), "6\n6\n10");
     // Another builtin, `abs`, the program's in one scope and the builtin in the other: the call
     // of it is a dep already, and stays one.
@@ -949,4 +952,109 @@ fn v(n) = n <= 0 ? 1.5 : w(n - 1)
 fn w(n) = n <= 0 ? 2.5 : u(n - 1)";
     let calls = [("p(0)", "float 0.5"), ("p(3)", "float 12.5"), ("q(2)", "float 8.5"), ("u(0)", "float 0.5"), ("u(1)", "float 1.5"), ("u(2)", "float 2.5"), ("u(5)", "float 2.5"), ("v(3)", "float 1.5")];
     check(defs, &calls, 4);
+}
+
+// ---- the third review (FEEDBACK52.md, Q-677 review 3; branch feedback52) --------------------
+
+/// `n` recursive functions, each calling the next before itself, and each (but the first)
+/// calling the first (`root`) or its caller (`caller`) too.
+fn chain_back(n: usize, end: &str, root: bool, caller: bool) -> String {
+    let mut src = String::new();
+    for i in 1..=n {
+        let mut parts = Vec::new();
+        if root && i > 1 {
+            parts.push("let _b = f1(0)".to_string());
+        }
+        if caller && i > 1 {
+            parts.push(format!("let _c = f{}(0)", i - 1));
+        }
+        if i < n {
+            parts.push(format!("let _a = f{}(0)", i + 1));
+        }
+        parts.push(format!("f{}(n - 1)", i));
+        src.push_str(&format!("fn f{i}(n) {{\n    if n <= 0 {{\n        {end}\n    }} else {{\n        {}\n    }}\n}}\n", parts.join("\n        ")));
+    }
+    src
+}
+
+#[test]
+fn a_guess_that_does_not_come_out_takes_back_only_the_plans_that_read_it() {
+    // Each function also calls the first: a plan stood on the outermost guess it read alone, so
+    // each function's failed guess took back the plans that read only the first function's,
+    // 10.2 s for 24 functions on quillo-B5. 24 and 40, float and bool, compiled; a chain each
+    // calling its caller (each plan reads the one before's guess, so planning it stays
+    // exponential) stops at the plan budget and is interpreted. Each under 0.8 s (8 s for this
+    // build's debug binary), and equal to the interpreter.
+    let limit = Duration::from_millis(if std::env::var_os("QUILLO_TEST_BIN").is_none() && cfg!(debug_assertions) { 8000 } else { 800 });
+    for (n, end, root, caller) in [(24, "0.5", true, false), (40, "0.5", true, false), (24, "true", true, false), (40, "true", true, false), (12, "true", false, true), (24, "true", false, true), (24, "0.5", true, true)] {
+        let src = format!("{}print(f1(2))\nprint(f1(2))\nprint(f2(3))\n", chain_back(n, end, root, caller));
+        let want = format!("{}\n{}\n{}", end, end, end);
+        let t = Instant::now();
+        assert_eq!(both_ways(&src), want, "{} functions ending in {}, root {}, caller {}", n, end, root, caller);
+        assert!(t.elapsed() < limit * 2, "{} functions ending in {}, root {}, caller {}: {:?} (both runs)", n, end, root, caller, t.elapsed());
+    }
+}
+
+#[test]
+fn a_chain_reading_only_the_first_guess_is_compiled_and_one_past_the_budget_is_not() {
+    let calls = [("f1(2)", "bool true"), ("f2(3)", "bool true")];
+    // f1, with all the others, and f2, with those after it.
+    check(&chain_back(24, "true", true, false), &calls, 2);
+    // Each reading its caller's guess: past the budget (64 guesses for each function planned),
+    // refused, the interpreter's, as on main.
+    check(&chain_back(24, "true", false, true), &calls, 0);
+}
+
+#[test]
+fn a_call_too_deep_is_followed_down_past_its_own_calls_at_its_depth() {
+    // `r(0, x)`, at the depth of the next call, took the depth followed there, and the next call
+    // went back into machine code to the limit at each level (quillo-B5 0.31 s, the interpreter
+    // 0.01 s). Also with two calls of its own at each level, and with a helper calling it from
+    // deeper than its own next call.
+    let shapes = [
+        ("", "r(d - 1, r(0, x) + 1)", "4\n4"),
+        ("", "r(d - 1, r(0, x) + r(0, x + 1))", "15\n15"),
+        ("fn g(x) = r(0, x) + 1\n", "r(d - 1, g(x) % 7)", "4\n4"),
+    ];
+    for (helper, call, first) in shapes {
+        let src = format!("{}fn r(d, x) {{\n    if d <= 0 {{\n        return x\n    }}\n    return {}\n}}\nprint(r(3, 1))\nprint(r(3, 1))\nfor k in 0..4 {{\n    print(r(100000, 1) ?? \"E\")\n}}\n", helper, call);
+        assert_eq!(both_ways(&src), format!("{}\nE\nE\nE\nE", first), "{}", src);
+        let (fast, _) = fastest(&src, &[], 3);
+        let (slow, _) = fastest(&src, &[("QUILLO_JIT", "0")], 2);
+        assert!(fast < slow * 2, "compiled {:?}, interpreted {:?}\n{}", fast, slow, src);
+    }
+}
+
+#[test]
+fn a_function_looping_over_range_keeps_the_quick_call() {
+    // Checking `range` at each call kept it from the last function's quick call: mapped over
+    // 3 million numbers, quillo-B5 took 3 times the instructions of quillo-B4 (about 30% of
+    // the interpreter's time, against 6% here). A sixth leaves room for a loaded machine.
+    let src = "fn f(n) {\n    let s = 0\n    for i in range(3) {\n        s += i * n\n    }\n    s\n}\nprint(range(0, 3000000) | map(f) | sum())\n";
+    let (fast, out) = fastest(src, &[], 3);
+    let (slow, plain) = fastest(src, &[("QUILLO_JIT", "0")], 2);
+    assert_eq!((out.as_str(), plain.as_str()), ("13499995500000", "13499995500000"));
+    let part = if std::env::var_os("QUILLO_TEST_BIN").is_none() && cfg!(debug_assertions) { 2 } else { 6 };
+    assert!(fast * part < slow, "compiled {:?}, interpreted {:?}", fast, slow);
+}
+
+#[test]
+fn range_named_by_the_function_itself_is_not_the_builtin() {
+    // A parameter or a variable named `range`: compiled, it was read as the builtin (6), where
+    // the interpreter says "cannot call int" (main and quillo-B5).
+    for src in [
+        "fn g(range, n) {\n    let s = 0\n    for i in range(n) {\n        s += i\n    }\n    s\n}\nprint(g(2, 4))\nprint(g(2, 4))\n",
+        "fn g(n) {\n    let range = n\n    let s = 0\n    for i in range(n) {\n        s += i\n    }\n    s\n}\nprint(g(4))\nprint(g(4))\n",
+        "fn g(n) {\n    let s = 0\n    for range in [1] {\n        for i in range(n) {\n            s += i\n        }\n    }\n    s\n}\nprint(g(4))\nprint(g(4))\n",
+    ] {
+        let got = both_ways(src);
+        assert!(got.trim_start().starts_with("FAILED") && got.contains("cannot call int"), "{}\n{}", got, src);
+    }
+    // A function of its own given as `range`: the interpreter's, called.
+    assert_eq!(both_ways("fn g(range, n) {\n    let s = 0\n    for i in range(n) {\n        s += i\n    }\n    s\n}\nprint(g((n) => [5, 6], 4))\nprint(g((n) => [5, 6], 4))\n"), "11\n11");
+    // The other builtins Plan reads by name are calls, which a parameter already keeps from
+    // being read as the program's function: `abs` given as a parameter, a function or an int.
+    assert_eq!(both_ways("fn g(abs, n) = abs(n) * 2\nprint(g((x) => x + 1, 4))\nprint(g((x) => x + 1, 4))\n"), "10\n10");
+    let got = both_ways("fn g(abs, n) = abs(n) * 2\nprint(g(3, 4))\nprint(g(3, 4))\n");
+    assert!(got.trim_start().starts_with("FAILED") && got.contains("cannot call int"), "{}", got);
 }
