@@ -632,6 +632,8 @@ struct Conn {
     http10: bool,
     /// `100 Continue` was sent for the request now arriving.
     continued: bool,
+    /// Its `100 Continue` waits for the answers to the requests ahead of it (see `take_requests`).
+    continue_due: bool,
     /// Close once `output` is written.
     closing: bool,
     /// An answer ended since `sweep` last looked (see there).
@@ -1266,6 +1268,7 @@ impl Loop {
             _place: place,
             http10: false,
             continued: false,
+            continue_due: false,
             closing: false,
             answered: false,
             lingering: false,
@@ -1595,6 +1598,15 @@ impl Loop {
                                 conn.body_from = Some((now, conn.got));
                             }
                         }
+                        // Its `100 Continue` goes after their answers, once none waits to be
+                        // made; not when the connection ends with them (FEEDBACK65.md, Q-948;
+                        // branch feedback65).
+                        if conn.continue_due && conn.pending.is_empty() {
+                            conn.continue_due = false;
+                            if !conn.closing && matches!(done.fate, Fate::Keep) {
+                                conn.output.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+                            }
+                        }
                         self.finish(slot, conn, done.fate);
                     }
                     (_, Owner::Parent(parent)) => {
@@ -1698,7 +1710,14 @@ fn take_requests(c: &mut Conn, max_body: usize, now: Instant) -> Vec<Item> {
                 }
                 if expects_continue && !c.continued {
                     c.continued = true;
-                    c.output.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+                    // Behind requests read with it, after their answers (`Loop::step`): written at
+                    // once, it came before them, and a client took it for the first one's
+                    // (FEEDBACK65.md, Q-948; branch feedback65).
+                    if items.is_empty() {
+                        c.output.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+                    } else {
+                        c.continue_due = true;
+                    }
                 }
                 break;
             }
@@ -1711,6 +1730,7 @@ fn take_requests(c: &mut Conn, max_body: usize, now: Instant) -> Vec<Item> {
                 c.body_of = None;
                 c.body_from = None;
                 c.continued = false;
+                c.continue_due = false;
                 items.push(item);
             }
         }

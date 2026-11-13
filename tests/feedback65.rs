@@ -175,9 +175,13 @@ impl Conn {
         Some((head.get(9..12).and_then(|s| s.parse().ok()).unwrap_or(0), head))
     }
 
-    /// The next answer; None when the server closed the connection before any of it.
+    /// The next answer, a `100 Continue` too; None when the server closed the connection before
+    /// any of it.
     fn answer(&mut self) -> Option<Got> {
         let (status, head) = self.head()?;
+        if status == 100 {
+            return Some(Got { status, head, body: String::new() });
+        }
         let field = |name: &str| head.lines().find_map(|l| l.strip_prefix(name).map(|v| v.trim().to_string()));
         let mut body = Vec::new();
         if let Some(len) = field("content-length:").and_then(|v| v.parse::<usize>().ok()) {
@@ -555,5 +559,77 @@ fn a_request_that_does_not_come_whole_still_gets_its_408_after_slow() {
     assert!(String::from_utf8_lossy(&got[..n]).starts_with("HTTP/1.1 408") && took >= Duration::from_secs(29) && took < late, "trickling: {:?} after {:?}", String::from_utf8_lossy(&got[..n]), took);
     head.join().unwrap();
     body.join().unwrap();
+}
+
+// ---- Q-948: a pipelined request's `100 Continue` comes after the answers ahead of it ---------
+// A request with `Expect: 100-continue`, its head read with a request before it, had its
+// `100 Continue` written at once, ahead of that request's answer, which the client then took it
+// for.
+
+/// The statuses and bodies of the next `n` answers on `c`, a `100 Continue` among them.
+fn next(c: &mut Conn, n: usize) -> Vec<(u16, String)> {
+    (0..n).map(|_| c.answer().map(|a| (a.status, a.body)).expect("an answer")).collect()
+}
+
+fn pair(status: u16, body: &str) -> (u16, String) {
+    (status, body.to_string())
+}
+
+const EXPECTING: &str = "POST /plain HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n";
+
+#[test]
+fn a_pipelined_requests_100_continue_comes_after_the_answers_ahead_of_it() {
+    let s = served("continue", Some(IDLE_MS));
+    // Behind a short answer, a stream, and a 2 s answer.
+    for first in ["/", "/stream/3/500", "/slow/2000"] {
+        let mut c = Conn::to(s.port);
+        c.send(&format!("GET {} HTTP/1.1\r\nHost: x\r\n\r\n{}", first, EXPECTING));
+        let got = next(&mut c, 2);
+        assert!(got[0].0 == 200 && got[1] == pair(100, ""), "Q-948: behind {}: {:?}", first, got);
+        c.send("abc");
+        assert_eq!(next(&mut c, 1), [pair(200, "abc")]);
+    }
+    // Two in a row: the first's 100 at once, the second's after the first's answer.
+    let mut c = Conn::to(s.port);
+    c.send(EXPECTING);
+    assert_eq!(next(&mut c, 1), [pair(100, "")]);
+    c.send(&format!("abc{}", EXPECTING));
+    assert_eq!(next(&mut c, 2), [pair(200, "abc"), pair(100, "")], "Q-948: the second's 100 before the first's answer");
+    c.send("dé");
+    assert_eq!(next(&mut c, 1), [pair(200, "dé")]);
+    // Part of the body with it, the rest at once without waiting: in order, a 100 at most between,
+    // after the first answer.
+    let mut c = Conn::to(s.port);
+    c.send(&format!("GET / HTTP/1.1\r\nHost: x\r\n\r\n{}a", EXPECTING));
+    c.send("bc");
+    let mut got = next(&mut c, 2);
+    if got[1].0 == 100 {
+        got.extend(next(&mut c, 1));
+        got.remove(1);
+    }
+    assert_eq!(got, [pair(200, "home"), pair(200, "abc")], "Q-948");
+    // Behind an answer that ends the connection: no 100, and closed.
+    let mut c = Conn::to(s.port);
+    c.send(&format!("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n{}", EXPECTING));
+    assert_eq!(next(&mut c, 1), [pair(200, "home")], "Q-948");
+    assert!(c.answer().is_none(), "Q-948: a 100 after connection: close");
+}
+
+// What must keep working: not pipelined, the 100 at once; a body sent with its head, alone or
+// pipelined, owes none.
+#[test]
+fn a_100_continue_not_pipelined_comes_at_once_and_none_is_owed_for_a_body_sent_with_its_head() {
+    let s = served("continue-kept", Some(IDLE_MS));
+    let mut c = Conn::to(s.port);
+    let t = Instant::now();
+    c.send(EXPECTING);
+    assert_eq!(next(&mut c, 1), [pair(100, "")]);
+    assert!(t.elapsed() < Duration::from_secs(2) * slower(), "{:?}", t.elapsed());
+    c.send("abc");
+    assert_eq!(next(&mut c, 1), [pair(200, "abc")]);
+    // The body with the head, alone and pipelined: no 100 is owed.
+    let mut c = Conn::to(s.port);
+    c.send(&format!("{}abcGET / HTTP/1.1\r\nHost: x\r\n\r\n{}abc", EXPECTING, EXPECTING));
+    assert_eq!(next(&mut c, 3), [pair(200, "abc"), pair(200, "home"), pair(200, "abc")]);
 }
 
