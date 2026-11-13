@@ -120,6 +120,21 @@ Most expressions read as they would in JavaScript. The differences:
   this where nothing defines it): `return` leaves the function, from a loop too, and
   from a `for … =>` that makes a list; to skip items, `filter` first. `return` is
   also an expression, like `reply`: `let m = find(xs) ?? return null`, `"a" => return 1`.
+- `quillo check` warns of three mistakes `return` makes easy (FEEDBACK52.md, Q-678 to
+  Q-680). The first is a `return` in a value that is kept, given to a `let`, an argument
+  or an operator. In a block or a `for` body it is always said: `let ys = for x in xs {
+  return x }` leaves in the first round and makes no list. In an `if` or a `match` it is
+  said when every way leaves: in `let x = if c {
+  return 1 } else { return 2 }`, `x` is never given a value (to give it, write `1`; to
+  leave, write the `if` as a statement). A guard is not said: `let r = if b == 0 { return
+  0 } else { a / b }`. The second is code after a `return`, a `reply`, or an `if` or
+  `match` whose every way leaves: it never runs. The third is a function that returns a
+  value on one path and gives null at its end (see [Variables, functions,
+  views](#variables-functions-views)).
+- A `return` at the end of a line takes no value from the next one: it gives null, as a
+  line break ends the statement, and the line after it never runs. `quillo check` says
+  so: `` this never runs: a `return` at the end of a line gives null, so the one on line 2
+  leaves `f` before this ``. Write the value on the line of the `return`.
 - Arguments are worked out eagerly, left to right, before the call; only `&&`, `||`,
   `??`, `? :`, `if` and `match` skip what they do not need. A lambda sees the variables
   around it as they are now, not as they were when it was made, and may assign them
@@ -187,6 +202,27 @@ that no `type` declares is not reported by `quillo check`, and fails at the firs
 A function with a capital first letter (`fn Card()`) is taken for a view. A list's item
 type goes in `<>` in a map's or a record's fields too: `quillo check` says so for
 `tags: list[str]?`, with the fix `` `tags: list<str>?` `` (FEEDBACK56.md, Q-861).
+
+A function that returns a value on one path and reaches its end on another gives null
+there, and `quillo check` warns (FEEDBACK52.md, Q-679):
+
+```quillo
+fn sign(n) {
+    if n > 0 {
+        return 1
+    }
+}
+```
+
+`` `sign` returns a value on line 3 but gives null when it reaches its end: end it with a
+value too, or `null` if null is meant ``. A last `for` whose rounds give nothing (`for x in
+xs { let y = x * 2 }`) gives a list of nulls there, and is said too. So is a last `if` with
+no `else` whose way is a value, with a `return` or not (`if n > 10 { "big" }`). An `else {
+null }`, or `null` as the last line, says null is meant. Not said: a function with a
+return type (`quillo check` holds it to that type), a view, a component, an arrow, a
+function handed to other code (a middleware, a callback), a helper whose `return`s give
+markup (null shows nothing), and a last `for` whose rounds end in a call (`for x in xs {
+print(x) }`: a call may give a value).
 
 `///` lines right above a function, a `server fn` or a component are its description: the
 editor shows them on hover, and the program keeps them, so `quillo docs` writes them as the

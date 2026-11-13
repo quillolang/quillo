@@ -4,7 +4,10 @@ A top-level function that only does arithmetic on ints, floats and bools is comp
 machine code (with [Cranelift](https://cranelift.dev)) the second time it is called, or the
 first if it has a loop of its own, for the types of the arguments it gets: `let`,
 assignment, `if`, `&&`, `||`, `return`, `for` over `range(...)` or `a..b`, `while`, and
-calls of other such functions, itself included. So is a lambda of that kind given a
+calls of other such functions, itself included. `return` may give the result at the end,
+early, in both arms of an `if` (`c ? x : return -1` too), from inside a loop, or in a
+recursive function, and a function that calls one is compiled too, also when the one it
+calls was compiled first (FEEDBACK52.md, Q-677). So is a lambda of that kind given a
 number, as `map` and `filter` give one: `xs | filter((x) => x % 3 == 0)`.
 It then runs as it would have, only faster: `fib(32)` takes 11 ms (Node 11, Bun 21),
 and a loop of ten million steps 29 ms (Node and Bun take about 280 ms for the same
@@ -14,11 +17,15 @@ loop, on doubles).
   ints by zero is an error, ordering NaN (`<`, `>`) is an error while `NaN == NaN` is
   false, and the 10,000-call limit holds. Where the interpreter would fail, the
   machine code gives up and the call is run again by the interpreter, which fails as
-  always (the function changed nothing, so running it twice is running it once).
+  always (the function changed nothing, so running it twice is running it once). A
+  recursion that goes past the limit gives up once: the calls below the one that gave up
+  run in the interpreter, so it fails in no more time than the interpreter takes.
 - What it does not take runs in the interpreter as before: strings, lists, maps,
   decimals, builtins, globals that are not functions, functions inside functions, a variable that
-  changes type, and `/` of two ints, whose answer is an int or a float depending on the
-  numbers (`6 / 3` is 2, `7 / 2` is 3.5).
+  changes type, a function that gives an int on one path and a float on another (`return
+  1` on one, `2.5` at its end), `null`, a `return` with no value, `match`, and `/` of two
+  ints, whose answer is an int or a float depending on the numbers (`6 / 3` is 2, `7 / 2`
+  is 3.5).
 - A function it calls that is assigned something else is not called by the old code.
 - Not with a fuel limit (scripts given a budget of steps), and not in builds without
   the `jit` feature (`cargo build --no-default-features --features mysql`).

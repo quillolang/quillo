@@ -485,6 +485,21 @@ Most expressions read as they would in JavaScript. The differences:
   this where nothing defines it): `return` leaves the function, from a loop too, and
   from a `for … =>` that makes a list; to skip items, `filter` first. `return` is
   also an expression, like `reply`: `let m = find(xs) ?? return null`, `"a" => return 1`.
+- `quillo check` warns of three mistakes `return` makes easy (FEEDBACK52.md, Q-678 to
+  Q-680). The first is a `return` in a value that is kept, given to a `let`, an argument
+  or an operator. In a block or a `for` body it is always said: `let ys = for x in xs {
+  return x }` leaves in the first round and makes no list. In an `if` or a `match` it is
+  said when every way leaves: in `let x = if c {
+  return 1 } else { return 2 }`, `x` is never given a value (to give it, write `1`; to
+  leave, write the `if` as a statement). A guard is not said: `let r = if b == 0 { return
+  0 } else { a / b }`. The second is code after a `return`, a `reply`, or an `if` or
+  `match` whose every way leaves: it never runs. The third is a function that returns a
+  value on one path and gives null at its end (see [Variables, functions,
+  views](#variables-functions-views)).
+- A `return` at the end of a line takes no value from the next one: it gives null, as a
+  line break ends the statement, and the line after it never runs. `quillo check` says
+  so: `` this never runs: a `return` at the end of a line gives null, so the one on line 2
+  leaves `f` before this ``. Write the value on the line of the `return`.
 - Arguments are worked out eagerly, left to right, before the call; only `&&`, `||`,
   `??`, `? :`, `if` and `match` skip what they do not need. A lambda sees the variables
   around it as they are now, not as they were when it was made, and may assign them
@@ -552,6 +567,27 @@ that no `type` declares is not reported by `quillo check`, and fails at the firs
 A function with a capital first letter (`fn Card()`) is taken for a view. A list's item
 type goes in `<>` in a map's or a record's fields too: `quillo check` says so for
 `tags: list[str]?`, with the fix `` `tags: list<str>?` `` (FEEDBACK56.md, Q-861).
+
+A function that returns a value on one path and reaches its end on another gives null
+there, and `quillo check` warns (FEEDBACK52.md, Q-679):
+
+```quillo
+fn sign(n) {
+    if n > 0 {
+        return 1
+    }
+}
+```
+
+`` `sign` returns a value on line 3 but gives null when it reaches its end: end it with a
+value too, or `null` if null is meant ``. A last `for` whose rounds give nothing (`for x in
+xs { let y = x * 2 }`) gives a list of nulls there, and is said too. So is a last `if` with
+no `else` whose way is a value, with a `return` or not (`if n > 10 { "big" }`). An `else {
+null }`, or `null` as the last line, says null is meant. Not said: a function with a
+return type (`quillo check` holds it to that type), a view, a component, an arrow, a
+function handed to other code (a middleware, a callback), a helper whose `return`s give
+markup (null shows nothing), and a last `for` whose rounds end in a call (`for x in xs {
+print(x) }`: a call may give a value).
 
 `///` lines right above a function, a `server fn` or a component are its description: the
 editor shows them on hover, and the program keeps them, so `quillo docs` writes them as the
@@ -3732,6 +3768,12 @@ routes /reports | signed_in with db {               // what its routes may do, a
   *(since 0.7: these let the route run, null and maps too)*. A middleware that only logs
   ends with `r`. So a check is written `(r) => ok(r) ? r : reply 403 "..."`, not as a
   predicate, and `quillo check` says so when a middleware can only be a `bool` or text.
+  It does not warn of a guard's null end (`if root { return r }`), as it does for other
+  functions that return a value on one path (see [Variables, functions,
+  views](#variables-functions-views)): it sees the function handed to `routes`. It sees
+  that only in the file that hands it over, so a guard in a file of its own, checked
+  alone (`quillo check lib/guards.qwe`), is warned of when only the file importing it
+  hands it to `routes`. Check from the main file.
   What it gives does not reach the route: a route that needs the user reads it again
   (`session()`, `me()`). It is given the request as sent, whatever the route's patterns
   bind: a JSON field named `request` is the route's, not the middleware's *(since 0.7)*.
@@ -7778,7 +7820,11 @@ seconds write `sleep(200)` ``); `c.query(...)` on an untyped parameter in a `wit
 function without `db`; a service whose file is not here; a name in a pattern that takes
 any value and goes unused, or reads like a type (`intt =>`); an arm that never runs
 after one that takes any value, or with a value an arm before it has; `xs.push(2)`,
-`sort(xs)` or `i + 1` alone, which make a value and drop it; a `while` whose condition
+`sort(xs)` or `i + 1` alone, which make a value and drop it; a `return` that leaves the
+function from a value that is kept (a block, a `for` body, an `if` or `match` every way
+of which leaves); code after a `return` or a `reply`, which never runs; a function
+that returns a value on one path and gives null at its end (see [Coming from
+JavaScript](#coming-from-javascript)); a `while` whose condition
 nothing in it changes; `"Hello ${name}"` in a plain string; `index_of(...) == -1`, a
 function used as a condition (`if ready {`), and a path's untyped parameter added to a
 number; a misspelt attribute or event (`clas`, `@clik`), `className`, and `<card>` for a
@@ -8235,8 +8281,9 @@ exit(total > 0m ? 0 : 3)
 ```
 
 Written the way each is usually written, a script is faster than Python's: `bench/vs-python/run.py`
-times eighteen everyday programs in both, process start included, and Quillo is ahead in all of
-them. Against Python 3.9 on a 10-core Mac, the best of 21 runs each:
+times twenty everyday programs in both, process start included, and Quillo is ahead in all of
+them. Against Python 3.9 on a 10-core Mac, the best of 21 runs each (of 11 for the two
+`return` cases):
 
 | | Python | Quillo |
 |---|---:|---:|
@@ -8255,6 +8302,8 @@ them. Against Python 3.9 on a 10-core Mac, the best of 21 runs each:
 | `s += "x"` a million times | 0.04 s | 0.01 s |
 | `s[i]` over 300,000 characters | 0.02 s | 0.01 s |
 | a `while` over 200,000 characters | 0.02 s | 0.01 s |
+| 5 million calls of a function ending in `return` | 0.72 s | 0.02 s |
+| 5 million calls of a function with an early `return` | 0.82 s | 0.02 s |
 
 The closest are a map of lists (0.85 of Python's time), 300,000 JSON rows grouped (0.81) and
 the sieve (0.79); loops over numbers, lists of them, texts and counts run in machine code (see
@@ -8685,7 +8734,10 @@ A top-level function that only does arithmetic on ints, floats and bools is comp
 machine code (with [Cranelift](https://cranelift.dev)) the second time it is called, or the
 first if it has a loop of its own, for the types of the arguments it gets: `let`,
 assignment, `if`, `&&`, `||`, `return`, `for` over `range(...)` or `a..b`, `while`, and
-calls of other such functions, itself included. So is a lambda of that kind given a
+calls of other such functions, itself included. `return` may give the result at the end,
+early, in both arms of an `if` (`c ? x : return -1` too), from inside a loop, or in a
+recursive function, and a function that calls one is compiled too, also when the one it
+calls was compiled first (FEEDBACK52.md, Q-677). So is a lambda of that kind given a
 number, as `map` and `filter` give one: `xs | filter((x) => x % 3 == 0)`.
 It then runs as it would have, only faster: `fib(32)` takes 11 ms (Node 11, Bun 21),
 and a loop of ten million steps 29 ms (Node and Bun take about 280 ms for the same
@@ -8695,11 +8747,15 @@ loop, on doubles).
   ints by zero is an error, ordering NaN (`<`, `>`) is an error while `NaN == NaN` is
   false, and the 10,000-call limit holds. Where the interpreter would fail, the
   machine code gives up and the call is run again by the interpreter, which fails as
-  always (the function changed nothing, so running it twice is running it once).
+  always (the function changed nothing, so running it twice is running it once). A
+  recursion that goes past the limit gives up once: the calls below the one that gave up
+  run in the interpreter, so it fails in no more time than the interpreter takes.
 - What it does not take runs in the interpreter as before: strings, lists, maps,
   decimals, builtins, globals that are not functions, functions inside functions, a variable that
-  changes type, and `/` of two ints, whose answer is an int or a float depending on the
-  numbers (`6 / 3` is 2, `7 / 2` is 3.5).
+  changes type, a function that gives an int on one path and a float on another (`return
+  1` on one, `2.5` at its end), `null`, a `return` with no value, `match`, and `/` of two
+  ints, whose answer is an int or a float depending on the numbers (`6 / 3` is 2, `7 / 2`
+  is 3.5).
 - A function it calls that is assigned something else is not called by the old code.
 - Not with a fuel limit (scripts given a budget of steps), and not in builds without
   the `jit` feature (`cargo build --no-default-features --features mysql`).

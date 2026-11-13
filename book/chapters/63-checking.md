@@ -39,7 +39,11 @@ seconds write `sleep(200)` ``); `c.query(...)` on an untyped parameter in a `wit
 function without `db`; a service whose file is not here; a name in a pattern that takes
 any value and goes unused, or reads like a type (`intt =>`); an arm that never runs
 after one that takes any value, or with a value an arm before it has; `xs.push(2)`,
-`sort(xs)` or `i + 1` alone, which make a value and drop it; a `while` whose condition
+`sort(xs)` or `i + 1` alone, which make a value and drop it; a `return` that leaves the
+function from a value that is kept (a block, a `for` body, an `if` or `match` every way
+of which leaves); code after a `return` or a `reply`, which never runs; a function
+that returns a value on one path and gives null at its end (see [Coming from
+JavaScript](#coming-from-javascript)); a `while` whose condition
 nothing in it changes; `"Hello ${name}"` in a plain string; `index_of(...) == -1`, a
 function used as a condition (`if ready {`), and a path's untyped parameter added to a
 number; a misspelt attribute or event (`clas`, `@clik`), `className`, and `<card>` for a

@@ -146,6 +146,57 @@ Navigation:
   reads `url()`, a link or form the browser follows counts as moving, so a late `navigate`
   no longer cancels the page the person asked for (Q-902).
 
+### `return` (FEEDBACK52.md)
+
+Added, as warnings of `quillo check` (no program runs differently):
+
+- **A `return` that leaves the function from a value that is kept.** In a block or a `for`
+  body it is always said: `let ys = for x in xs { return x }` leaves in the first round and
+  makes no list. In an `if` or a `match` it is said when every way leaves: ``every way of
+  this `if` leaves `pick`, so the value it is used for is never given: to give it, write
+  `1`; to leave, write the `if` as a statement``. A guard is not said:
+  `let r = if b == 0 { return 0 } else { a / b }`, `?? return null`, `"a" => return 1`
+  (Q-678).
+- **A function that returns a value on one path and gives null at its end**:
+  `` `sign` returns a value on line 3 but gives null when it reaches its end: end it with
+  a value too, or `null` if null is meant ``. So is a last `if` with no `else` whose way
+  is a value, and a last `for` whose rounds give nothing, which gives a list of nulls.
+  `else { null }` or a last `null` says null is meant. Not said: a function with a return
+  type, a view, a component, an arrow, a function handed to other code (a middleware, a
+  callback), a markup helper, and a last `for` whose rounds end in a call. `quillo check
+  lib.qwe` alone may warn of a middleware that only its importer hands to `routes`: check
+  from the main file (Q-679).
+- **Code that never runs**, after a `return`, a `reply`, or an `if` or `match` whose every
+  way leaves: `` this never runs: the `return` on line 2 always leaves `g` ``. After a
+  `return` at the end of a line, which takes no value from the next one, it says why:
+  `` a `return` at the end of a line gives null, so the one on line 2 leaves `f` before
+  this `` (Q-680).
+- Over 5,139 programs (app/, the website and its plugins, quillo-components, the examples,
+  the repros, the guide's and llms.md's blocks, the tests' programs), the only new
+  warnings are four true ones, in tests that put code after a `return` on purpose.
+  `quillo check` takes 0.4% to 0.5% more instructions on the largest programs.
+
+Fixed, in compiled numbers:
+
+- **A function that gives its result with `return` is compiled**, at its end, early, or in
+  both arms of an `if` (`c ? x : return -1` too), and so is every function calling it. A
+  block ending in `return` had no type, so the function and its callers ran in the
+  interpreter: 5 million calls of a function ending in `return`, or with an early one,
+  took 1.1 to 1.4 s, and now 0.02 s (Python: 0.64 to 0.73 s). `bench/vs-python` has a
+  `return` and an early-`return` case (Q-677).
+- A block in a numeric function that declares one of the function's names with another
+  type (`let y = { let x = 2.5; ... }` where the function's `x` is an int) stopped the
+  process with a Cranelift panic (0.8.1 too).
+- A recursive numeric function could stop the process the same way: what was planned
+  under a guess of its type that did not come out was kept (0.8.1 too).
+- After a compile refused part way, the next compile stopped the process ("anonymous
+  symbol must be defined locally"): two functions calling each other and a helper compiled
+  before them were enough (0.8.1 too).
+- A recursion past the 10,000-call limit took up to 30 times the interpreter's time, as
+  the machine code was run again at each level (1.35 s where the interpreter takes
+  0.06 s): the calls below the one that gave up run in the interpreter now (0.02 s).
+- A function calling one already compiled on its own was not compiled (0.8.1 too).
+
 ## 0.8.1 (2026-11-09)
 
 - SQLite 3.54.1 (rusqlite 0.41, libsqlite3-sys 0.39.1), for RUSTSEC-2026-0459 (CVE-2026-119375):

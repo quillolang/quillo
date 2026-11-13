@@ -271,6 +271,12 @@ routes /reports | signed_in with db {               // what its routes may do, a
   *(since 0.7: these let the route run, null and maps too)*. A middleware that only logs
   ends with `r`. So a check is written `(r) => ok(r) ? r : reply 403 "..."`, not as a
   predicate, and `quillo check` says so when a middleware can only be a `bool` or text.
+  It does not warn of a guard's null end (`if root { return r }`), as it does for other
+  functions that return a value on one path (see [Variables, functions,
+  views](#variables-functions-views)): it sees the function handed to `routes`. It sees
+  that only in the file that hands it over, so a guard in a file of its own, checked
+  alone (`quillo check lib/guards.qwe`), is warned of when only the file importing it
+  hands it to `routes`. Check from the main file.
   What it gives does not reach the route: a route that needs the user reads it again
   (`session()`, `me()`). It is given the request as sent, whatever the route's patterns
   bind: a JSON field named `request` is the route's, not the middleware's *(since 0.7)*.

@@ -395,8 +395,9 @@ exit(total > 0m ? 0 : 3)
 ```
 
 Written the way each is usually written, a script is faster than Python's: `bench/vs-python/run.py`
-times eighteen everyday programs in both, process start included, and Quillo is ahead in all of
-them. Against Python 3.9 on a 10-core Mac, the best of 21 runs each:
+times twenty everyday programs in both, process start included, and Quillo is ahead in all of
+them. Against Python 3.9 on a 10-core Mac, the best of 21 runs each (of 11 for the two
+`return` cases):
 
 | | Python | Quillo |
 |---|---:|---:|
@@ -415,6 +416,8 @@ them. Against Python 3.9 on a 10-core Mac, the best of 21 runs each:
 | `s += "x"` a million times | 0.04 s | 0.01 s |
 | `s[i]` over 300,000 characters | 0.02 s | 0.01 s |
 | a `while` over 200,000 characters | 0.02 s | 0.01 s |
+| 5 million calls of a function ending in `return` | 0.72 s | 0.02 s |
+| 5 million calls of a function with an early `return` | 0.82 s | 0.02 s |
 
 The closest are a map of lists (0.85 of Python's time), 300,000 JSON rows grouped (0.81) and
 the sieve (0.79); loops over numbers, lists of them, texts and counts run in machine code (see
