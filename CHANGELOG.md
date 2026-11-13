@@ -198,6 +198,11 @@ Fixed, in compiled numbers:
   0.06 s; with 1,000 calls of itself a level, 114 s): the calls below the one that gave
   up run in the interpreter now, in about its time (0.93 s), a runaway recursion in a
   function with `return` such as `fact(-1)` too (Q-945).
+- A recursive numeric function keeping many values across its own call could stop the
+  program ("stack overflow"), or a server (SIGBUS), when it went deep on a small stack,
+  such as in a `parallel` child: with 57 floats kept, `parallel(() => big(9000, 1.5), ...)`
+  crashed where the interpreter gives its value. Compiled code now counts each function's
+  own frame, not 512 bytes a call (Q-947, 0.8.1 too).
 - A function calling one already compiled on its own was not compiled (0.8.1 too).
 - Compiled code looped over the builtin `range` where `range` was something else: a
   parameter or a variable named `range` (`fn g(range, n)`), or a function compiled in one
