@@ -801,3 +801,114 @@ fn deep_ifs_are_read_once_and_said_once() {
     assert_eq!(s.len(), 16, "{:?}", &s[..s.len().min(3)]);
     assert!(s.iter().all(|m| m.contains("this never runs: each way of the `if` on line")), "{:?}", &s[..3]);
 }
+
+// ---- the second review (FEEDBACK52.md, Q-678 to Q-680; branch feedback52) ---------------------
+
+/// MEDIUM 3: an `if` or `match` in a way of a kept one, or on the right of `??`, counts toward
+/// whether that way leaves, and only the outermost decides. Each of these is a guard, and the
+/// advice ("write `1`") changed what it gives: `ratio(4, 0)` gave 100. A plain block there too.
+#[test]
+fn an_if_or_match_in_a_guards_way_is_not_said_and_the_outermost_decides() {
+    let src = r#"fn ratio(a, b) {
+    let d = if b != 0 { a / b } else { if a > 0 { return 1 } else { return -1 } }
+    d * 100
+}
+fn arm(k, s) {
+    let n = match k { 1 => 10, _ => if s { return -1 } else { return 0 } }
+    n + 1
+}
+fn inner_match(x, y) {
+    let n = if x { 1 } else { match y { 1 => return 1, _ => return 2 } }
+    n + 1
+}
+fn rounds(xs, s) {
+    let ys = for x in xs => { if x > 0 { x } else { if s { return -1 } else { return 0 } } }
+    len(ys)
+}
+fn either(x, s) {
+    let m = x ?? if s { return 1 } else { return 2 }
+    m + 1
+}
+fn both_sides(x, s) {
+    let m = x || match s { 1 => return 1, _ => return 2 }
+    m
+}
+fn blocks(c) {
+    let d = if c { 1 } else { { return 2 } }
+    d + 1
+}
+fn still(c, a) {
+    let d = if c { return 1 } else { if a { return 2 } else { return 3 } }
+    d
+}
+fn deeper(c, a, b) {
+    let d = if c { if a { return 2 } else { return 3 } } else { match b { 1 => return 4, _ => return 5 } }
+    d
+}
+fn each_round(xs) {
+    let ys = for x in xs => { if x > 0 { return x } else { return 0 } }
+    ys
+}
+print([ratio(4, 0), arm(2, true), inner_match(false, 1), rounds([1], true), either(null, true), both_sides(false, 1), blocks(false), still(true, true), deeper(true, true, 1), each_round([1])])
+"#;
+    assert_eq!(
+        said(src),
+        [
+            // Said once, at the outermost, of its first `return` as written.
+            every(30, "if", "`still`", "write `1`"),
+            every(34, "if", "`deeper`", "write `2`"),
+            // A kept `for`'s body is a value of its own: each round leaves.
+            every(38, "if", "`each_round`", "write `x`"),
+        ]
+    );
+}
+
+/// LOW 4: a `return` with a statement after it on its own line takes no value from a next line:
+/// the plain message. One at the end of its line keeps the other.
+#[test]
+fn a_bare_return_mid_line_gets_the_plain_message() {
+    let src = r#"fn mid_line() {
+    print("a"); return; print("b")
+}
+fn end_of_line(x) {
+    print("a"); return
+    x
+}
+fn literal_next() {
+    return; "b"
+}
+print([mid_line(), end_of_line(1), literal_next()])
+"#;
+    assert_eq!(
+        said(src),
+        [
+            "2 warning: this never runs: the `return` on line 2 always leaves `mid_line`".to_string(),
+            "6 warning: this never runs: a `return` at the end of a line gives null, so the one on line 5 leaves `end_of_line` before this".to_string(),
+            "9 warning: what follows never runs: the `return` on line 9 always leaves `literal_next`".to_string(),
+        ]
+    );
+}
+
+/// LOW 5: an `else if` chain with no `else` at its end whose ways all leave is, as a `for`'s
+/// body, an `if` with no `else`: each round gives null or leaves, and the loop finds.
+#[test]
+fn a_finding_loop_with_an_else_if_is_said() {
+    let src = r#"fn finds(xs) {
+    for x in xs { if x > 10 { return x } else if x < -10 { return -x } }
+}
+fn three(xs) {
+    for x in xs {
+        if x > 10 { return x } else if x < -10 { return -x } else if x == 0 { return 0 }
+    }
+}
+fn gives(xs) {
+    for x in xs { if x > 10 { return x } else if x < -10 { x } }
+}
+fn closed(xs) {
+    for x in xs { if x > 10 { return x } else if x < -10 { return -x } else { x } }
+}
+print([finds([1]), three([1]), gives([1]), closed([1])])
+"#;
+    let list = |line: u32, f: &str, at: u32| format!("{line} warning: `{f}` returns a value on line {at} but, when it reaches its end, gives the list of nulls its `for` makes: end it with the value it should give, or `null`");
+    assert_eq!(said(src), [list(2, "finds", 2), list(5, "three", 6)]);
+}
