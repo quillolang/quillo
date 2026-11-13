@@ -33,8 +33,21 @@ const WAKER: Token = Token(usize::MAX - 1);
 /// Largest request line and headers.
 const MAX_HEAD: usize = 64 << 10;
 const MAX_HEADERS: usize = 100;
-/// A kept-alive connection with nothing to do is closed after this long.
+/// A kept-alive connection with nothing to do is closed after this long, counted from the end of
+/// its last answer.
 const IDLE: Duration = Duration::from_secs(60);
+
+/// `IDLE`, or the shorter time QUILLO_IDLE_MS_FOR_TESTS gives, so that the tests of idleness wait
+/// seconds rather than minutes (FEEDBACK65.md, Q-942; branch feedback65). Only ever shorter: it
+/// cannot keep a connection longer. Nor under a second, taken as not given: with 0 a connection
+/// was closed before its first request was read, `adopt`'s stamp and a sweep coming in one pass.
+fn idle() -> Duration {
+    static IDLE_FOR_TESTS: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *IDLE_FOR_TESTS.get_or_init(|| {
+        let ms = std::env::var("QUILLO_IDLE_MS_FOR_TESTS").ok().and_then(|v| v.parse::<u64>().ok());
+        ms.map(Duration::from_millis).filter(|d| *d >= Duration::from_secs(1) && *d < IDLE).unwrap_or(IDLE)
+    })
+}
 /// A request head still arriving after this long, or a body that sends nothing for this
 /// long, is given up on.
 const SLOW: Duration = Duration::from_secs(30);
@@ -621,6 +634,8 @@ struct Conn {
     continued: bool,
     /// Close once `output` is written.
     closing: bool,
+    /// An answer ended since `sweep` last looked (see there).
+    answered: bool,
     /// Written and shut for writing: what still arrives is thrown away
     /// until the client closes (see `linger`).
     lingering: bool,
@@ -1252,6 +1267,7 @@ impl Loop {
             http10: false,
             continued: false,
             closing: false,
+            answered: false,
             lingering: false,
             pending: Vec::new(),
             stalled: None,
@@ -1271,8 +1287,9 @@ impl Loop {
         let app = self.app.clone();
         self.workers.retain(|w| !w.outdated(&app));
         let now = Instant::now();
+        let idle = idle();
         for i in 0..self.slots.len() {
-            let Slot::Idle(c) = &self.slots[i] else { continue };
+            let Slot::Idle(c) = &mut self.slots[i] else { continue };
             let stale = match c.receiving {
                 _ if c.lingering => now.duration_since(c.active) > LINGER,
                 // A head must come whole in time; a body may take as long as it keeps coming,
@@ -1284,7 +1301,20 @@ impl Loop {
                 // would hold the connection and the answer forever.
                 None => match c.stalled {
                     Some(since) if !c.output.is_empty() => now.duration_since(since) > SLOW,
-                    _ => c.output.is_empty() && now.duration_since(c.active) > IDLE,
+                    // Idle from the end of its last answer, as nginx's `keepalive_timeout` counts:
+                    // stamped only when its request began, a connection whose answer took longer
+                    // than `IDLE` (a stream, a long wait) was closed within a second of the
+                    // answer's end, which had kept it alive, and the client's next request there
+                    // was cut off (FEEDBACK65.md, Q-942; branch feedback65). Stamped at the first
+                    // look after the answer, within two seconds of its end: the clock read as each
+                    // answer ends cost a request 0.3% more instructions, and `self.now` there is
+                    // from before an answer that computed all along. Not while a request arrives,
+                    // whose own times are above.
+                    _ if std::mem::take(&mut c.answered) => {
+                        c.active = now;
+                        false
+                    }
+                    _ => c.output.is_empty() && now.duration_since(c.active) > idle,
                 },
             };
             if stale {
@@ -1550,7 +1580,22 @@ impl Loop {
                             self.stacks.push(r.task.into_stack());
                         }
                         self.workers.push(done.worker);
-                        self.finish(slot, done.conn, done.fate);
+                        let mut conn = done.conn;
+                        // A request that had partly arrived before these answers, and waited
+                        // unread while they were made, is timed from their end, as its idleness
+                        // is: timed from before them, a pipelined request behind an answer of over
+                        // 30 s was answered 408 as that answer ended, though its rest came at once
+                        // (FEEDBACK65.md, Q-942; branch feedback65). One still arriving after that
+                        // keeps the times it began with.
+                        if conn.receiving.is_some() {
+                            let now = Instant::now();
+                            conn.receiving = Some(now);
+                            conn.active = now;
+                            if conn.body_from.is_some() {
+                                conn.body_from = Some((now, conn.got));
+                            }
+                        }
+                        self.finish(slot, conn, done.fate);
                     }
                     (_, Owner::Parent(parent)) => {
                         if self.child_stacks.len() < SPARE_CHILD_STACKS {
@@ -1608,6 +1653,8 @@ impl Loop {
                 // Requests that arrived whole while it was answered, or
                 // input left unread when there was no room for it.
                 let more = !c.input.is_empty() && c.receiving.is_none() || !c.pending.is_empty() || c.full;
+                // Idle from the end of its answer, which `sweep` stamps (Q-942).
+                c.answered = true;
                 self.slots[i] = Slot::Idle(c);
                 if again || more {
                     self.ready.push_back(i);
@@ -1801,13 +1848,15 @@ fn answer(app: &Arc<App>, worker: &mut Worker, c: &mut Conn, items: Vec<Item>) -
             Item::Request { req, keep_alive, http10 } => {
                 let head = req.method == "HEAD";
                 c.http10 = http10;
-                let answer = worker.answer(app, req, Some(&mut ConnSink(c)));
+                let mut sink = ConnSink(c, keep_alive);
+                let answer = worker.answer(app, req, Some(&mut sink));
                 // An answer given while the server stops closes its connection, and says so: the
                 // client kept it, and its next request there was cut off when the drain closed it
                 // a moment later, a reset with no answer (the user's graceful stop, 2026-11-09;
                 // branch feedback56). One sent after it on the connection is not answered, which
-                // `connection: close` tells the client.
-                let keep_alive = keep_alive && !STOPPING.load(SeqCst);
+                // `connection: close` tells the client. So does a streamed head that said it
+                // (FEEDBACK65.md, Q-942; branch feedback65).
+                let keep_alive = sink.1 && !STOPPING.load(SeqCst);
                 match answer {
                     Answer::Streamed { close } => {
                         if close || !keep_alive {
@@ -1841,11 +1890,28 @@ fn answer(app: &Arc<App>, worker: &mut Worker, c: &mut Conn, items: Vec<Item>) -
 /// A streamed answer's way onto the connection (src/stream.rs): what is
 /// sent goes out at once; when the client reads slower than that, the
 /// request waits (on a pool thread, as for the database) until it takes more.
-struct ConnSink<'a>(&'a mut Conn);
+/// With whether the connection is kept after the answer: as the request asked, until a streamed
+/// head says otherwise.
+struct ConnSink<'a>(&'a mut Conn, bool);
 
 impl crate::stream::Sink for ConnSink<'_> {
     fn chunked(&self) -> bool {
         !self.0.http10
+    }
+
+    /// The head says `connection: close` when the connection ends with this answer, as a whole
+    /// answer's does: the client asked for that, the server is stopping, or the program's own
+    /// `connection: close`, which is kept to. A chunked one never said it, though its connection
+    /// was closed after it, a client that kept the connection through a stop had its next request
+    /// there cut off, and the program's was dropped with the connection kept (FEEDBACK65.md,
+    /// Q-942; branch feedback65).
+    fn start(&mut self, resp: &HttpResponse, chunked: bool) -> bool {
+        let mut head = Vec::new();
+        let asked = resp.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
+        let close = !chunked || !self.1 || asked || STOPPING.load(SeqCst);
+        self.1 = !close;
+        write_head_as(&mut head, resp, if chunked { None } else { Some(u64::MAX) }, close);
+        self.write(&head)
     }
 
     fn write(&mut self, data: &[u8]) -> bool {
