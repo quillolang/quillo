@@ -769,16 +769,13 @@ for n in [9990, 9995, 9996, 9997, 9998, 9999, 10000, 100000] {
 
 #[test]
 fn a_call_too_deep_for_machine_code_is_followed_down_by_the_interpreter() {
-    // Each level of a recursion past the limit went back into machine code and down to the
-    // limit again: quillo-A 1.35 s, main 0.91 s (`bare`), the interpreter 0.06 s. Now the levels
-    // under it are the interpreter's, and the calls within the limit are compiled: faster than
-    // the interpreter alone.
+    // The interpreter goes on where machine code gave up, with the interpreter's values and
+    // errors. Each level of a recursion past the limit still goes back into machine code and down
+    // to the limit again (quillo-A 1.35 s, main 0.91 s for `bare`, the interpreter 0.06 s): the
+    // floor that kept the levels under it the interpreter's was dropped, as on main, and its
+    // speed assertion with it (filed as Q-945).
     let want = "9990 0 0 0\n9995 0 0 1\n9996 0 0 0\n9997 0 0 1\n9998 0 0 0\n9999 0 0 1\n10000 E E E\n100000 E E E";
     assert_eq!(both_ways(DEEPS), want);
-    let (fast, out) = fastest(DEEPS, &[], 3);
-    let (slow, _) = fastest(DEEPS, &[("QUILLO_JIT", "0")], 2);
-    assert_eq!(out, want);
-    assert!(fast < slow, "compiled {:?}, interpreted {:?}", fast, slow);
     // Not caught, its error and where it was are the interpreter's.
     let failed = both_ways("fn r(d, x) {\n    if d <= 0 {\n        return 0\n    }\n    return r(d - 1, x + 1)\n}\nprint(r(1, 1))\nprint(r(100000, 1))\n");
     assert!(failed.starts_with("0\nFAILED") && failed.contains("too much recursion"), "{}", failed);
@@ -862,17 +859,14 @@ fn a_guess_that_does_not_come_out_keeps_what_never_read_it_and_compiles_the_chai
 
 #[test]
 fn a_call_too_deep_is_followed_down_past_another_function_called_at_its_depth() {
-    // `h` is compiled, and called at the depth of `r`'s next call: the depth kept for the thread
-    // was taken back there, and each level went into machine code to the limit again
-    // (quillo-B4 0.24 s a call, the interpreter 0.01 s). The same when `h` recurses itself.
+    // `h` is compiled, and called at the depth of `r`'s next call; the same when `h` recurses
+    // itself. The values and errors are the interpreter's. Its speed assertion (compiled faster
+    // than twice the interpreter, against quillo-B4's 0.24 s a call) went with the floor, dropped
+    // as on main (filed as Q-945).
     for h in ["fn h(x) {\n    x + 1\n}\n", "fn h(x) {\n    return x <= 0 ? 1 : h(x - 1) + 1\n}\n"] {
         let src = format!("{}fn r(d, x) {{\n    if d <= 0 {{\n        return x\n    }}\n    return r(d - 1, h(x % 3))\n}}\nprint(h(1))\nprint(h(2))\nfor k in 0..4 {{\n    print(r(100000, 1) ?? \"E\")\n}}\nprint(r(10, 1))\n", h);
         let want = "2\n3\nE\nE\nE\nE\n2";
         assert_eq!(both_ways(&src), want);
-        let (fast, out) = fastest(&src, &[], 3);
-        let (slow, _) = fastest(&src, &[("QUILLO_JIT", "0")], 2);
-        assert_eq!(out, want);
-        assert!(fast < slow * 2, "compiled {:?}, interpreted {:?}\n{}", fast, slow, src);
     }
 }
 
@@ -902,12 +896,15 @@ print(kb[0](4))
 ";
     let got = both_ways(nested);
     assert!(got.starts_with("6\n6\n10\nFAILED") && got.contains("cannot loop over int"), "{}", got);
-    // `range` made something else at the top (which `quillo check` warns of): 10, not 6.
-    // Changed in Q-677 review 3 from `range = ...`, which `quillo check` refuses and compiled
-    // code no longer follows: decided when compiling, as on main, as following it cost every
-    // assignment at a program's top level.
+    // `range` made something else at the top (which `quillo check` warns of) after `f` is
+    // compiled: the interpreter gives 10, and compiled code, which decided `range` when it was
+    // made, gives 6, as on main. Following it was a hook on every `let` of a name made again,
+    // which cost loops at a program's top level; it was dropped, and this asks only that the
+    // program runs, with no panic (filed as Q-944).
     let top = "fn f(n) {\n    let s = 0\n    for i in range(n) {\n        s += i\n    }\n    s\n}\nprint(f(4))\nprint(f(4))\nlet range = (n) => [10]\nprint(f(4))\n";
-    assert_eq!(both_ways(top), "6\n6\n10");
+    assert_eq!(quillo_run(top, &[("QUILLO_JIT", "0")]), "6\n6\n10");
+    let got = quillo_run(top, &[]);
+    assert!(got.starts_with("6\n6\n") && got.lines().count() == 3 && !got.contains("FAILED"), "{}", got);
     // Another builtin, `abs`, the program's in one scope and the builtin in the other: the call
     // of it is a dep already, and stays one.
     let other = "fn mk(shadow) {
@@ -1000,17 +997,17 @@ fn a_chain_reading_only_the_first_guess_is_compiled_and_one_past_the_budget_is_n
     let calls = [("f1(2)", "bool true"), ("f2(3)", "bool true")];
     // f1, with all the others, and f2, with those after it.
     check(&chain_back(24, "true", true, false), &calls, 2);
-    // Each reading its caller's guess: past the budget (64 guesses for each function planned),
-    // refused, the interpreter's, as on main.
+    // Each reading its caller's guess: past the budget (8,192 guesses and 64 for each function
+    // planned), refused, the interpreter's.
     check(&chain_back(24, "true", false, true), &calls, 0);
 }
 
 #[test]
 fn a_call_too_deep_is_followed_down_past_its_own_calls_at_its_depth() {
-    // `r(0, x)`, at the depth of the next call, took the depth followed there, and the next call
-    // went back into machine code to the limit at each level (quillo-B5 0.31 s, the interpreter
-    // 0.01 s). Also with two calls of its own at each level, and with a helper calling it from
-    // deeper than its own next call.
+    // `r(0, x)` at the depth of the next call, two calls of its own at each level, and a helper
+    // calling it from deeper than its own next call: the interpreter's values and errors. Its
+    // speed assertion (compiled faster than twice the interpreter, against quillo-B5's 0.31 s)
+    // went with the floor, dropped as on main (filed as Q-945).
     let shapes = [
         ("", "r(d - 1, r(0, x) + 1)", "4\n4"),
         ("", "r(d - 1, r(0, x) + r(0, x + 1))", "15\n15"),
@@ -1019,9 +1016,6 @@ fn a_call_too_deep_is_followed_down_past_its_own_calls_at_its_depth() {
     for (helper, call, first) in shapes {
         let src = format!("{}fn r(d, x) {{\n    if d <= 0 {{\n        return x\n    }}\n    return {}\n}}\nprint(r(3, 1))\nprint(r(3, 1))\nfor k in 0..4 {{\n    print(r(100000, 1) ?? \"E\")\n}}\n", helper, call);
         assert_eq!(both_ways(&src), format!("{}\nE\nE\nE\nE", first), "{}", src);
-        let (fast, _) = fastest(&src, &[], 3);
-        let (slow, _) = fastest(&src, &[("QUILLO_JIT", "0")], 2);
-        assert!(fast < slow * 2, "compiled {:?}, interpreted {:?}\n{}", fast, slow, src);
     }
 }
 
@@ -1057,4 +1051,70 @@ fn range_named_by_the_function_itself_is_not_the_builtin() {
     assert_eq!(both_ways("fn g(abs, n) = abs(n) * 2\nprint(g((x) => x + 1, 4))\nprint(g((x) => x + 1, 4))\n"), "10\n10");
     let got = both_ways("fn g(abs, n) = abs(n) * 2\nprint(g(3, 4))\nprint(g(3, 4))\n");
     assert!(got.trim_start().starts_with("FAILED") && got.contains("cannot call int"), "{}", got);
+}
+
+// ---- the fourth review (FEEDBACK52.md, Q-677 review 4; branch feedback52) --------------------
+
+#[test]
+fn a_chain_each_calling_its_caller_is_compiled_up_to_the_budget() {
+    // 5 bool functions each calling its caller and the next (363 guesses) and 10 float ones
+    // (2,046), which main compiles, were refused by quillo-A5's budget of 64 guesses a function.
+    // The limit and one either side: 7 bools (3,279) and 12 floats (8,190) compiled, f1 with the
+    // rest and f2 with those after it; 8 bools (9,840) and 13 floats (16,382) past 8,192 and 64 a
+    // function, refused.
+    let calls = |end: &str| [("f1(2)", if end == "true" { "bool true" } else { "float 0.5" }), ("f2(3)", if end == "true" { "bool true" } else { "float 0.5" })];
+    for (n, end, compiled) in [(5, "true", 2), (7, "true", 2), (8, "true", 0), (10, "0.5", 2), (12, "0.5", 2), (13, "0.5", 0)] {
+        check(&chain_back(n, end, false, true), &calls(end), compiled);
+    }
+}
+
+#[test]
+fn a_chain_past_the_budget_is_planned_once_and_left_to_the_interpreter() {
+    // 24 bools each calling its caller and the next, and `f12` calling `sq` too. `f1`'s plan
+    // meets the budget; `f2`, `f24` and `f7`, each the first of its own compile, meet `f1` and
+    // are not planned again to the budget; each is the interpreter's (`hot` at u32::MAX, read
+    // first by each call, as for a function that can never compile), for floats too. `sq`,
+    // planned under `f1`'s and never refused, is compiled on its own.
+    let defs = chain_back(24, "true", false, true).replace("let _c = f11(0)", "let _s = sq(3)\n        let _c = f11(0)") + "fn sq(x) = x * x\n";
+    let calls = [("f1(2)", "bool true"), ("f2(3)", "bool true"), ("f24(1)", "bool true"), ("f7(2)", "bool true"), ("f1(2.5)", "bool true"), ("sq(4)", "int 16")];
+    check(&defs, &calls, 1);
+    let mut it = Interp::new(".");
+    it.load_source(&format!("{}{}", defs, SHOW), "case.qwe").unwrap();
+    let hot = |it: &Interp, name: &str| match quillo::value::lookup(&it.globals, name) {
+        Some(quillo::value::Value::Func(c)) => c.def.hot.load(Ordering::Relaxed),
+        _ => panic!("{}", name),
+    };
+    let call = |it: &mut Interp, name: &str, n: i64| {
+        let f = quillo::value::lookup(&it.globals, name).unwrap();
+        it.call(&f, vec![quillo::value::Value::Int(n)], 0).ok().map(|v| v.display())
+    };
+    let t = Instant::now();
+    for (name, n) in [("f1", 2), ("f1", 2), ("f1", 2), ("f24", 1), ("f24", 1), ("f7", 2), ("f7", 2)] {
+        assert_eq!(call(&mut it, name, n).as_deref(), Some("true"), "{}({})", name, n);
+    }
+    // Planned to the budget once: about 4 ms in a release build; 2 s leaves room for a debug
+    // build on a loaded machine. Planned again by each first function, it was 24 times that.
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    #[cfg(feature = "jit")]
+    for name in ["f1", "f2", "f7", "f24"] {
+        assert_eq!(hot(&it, name), u32::MAX, "{}", name);
+    }
+    // Planned under `f1`'s compile, never the first of one: not marked.
+    for name in ["f3", "f20", "sq"] {
+        assert_ne!(hot(&it, name), u32::MAX, "{}", name);
+    }
+    drop(it);
+}
+
+#[test]
+fn a_chain_each_calling_its_caller_runs_compiled_in_quillo_run() {
+    // 5 bool functions each calling its caller and the next, called 100,000 times from the top
+    // of the program, 41 calls each: compiled, as on main; quillo-A5 refused it (its budget) and
+    // took 1.3 times the interpreter's (2 million calls of `f1(2)`: 30,409 M instructions, the
+    // interpreter 22,891 M).
+    let src = format!("{}let c = 0\nfor i in 0..100000 {{\n    if f1(20) {{\n        c += 1\n    }}\n}}\nprint(c)\n", chain_back(5, "true", false, true));
+    let (fast, out) = fastest(&src, &[], 3);
+    let (slow, plain) = fastest(&src, &[("QUILLO_JIT", "0")], 2);
+    assert_eq!((out.as_str(), plain.as_str()), ("100000", "100000"));
+    assert!(fast * 2 < slow, "compiled {:?}, interpreted {:?}", fast, slow);
 }

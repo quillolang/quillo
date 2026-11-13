@@ -86,31 +86,19 @@ type Key = (usize, Vec<T>);
 /// `FnDef::hot` once a function is known not to compile.
 const NEVER: u32 = u32::MAX;
 
-/// `FnDef::hot` from this up, after a call of the function too deep for machine code (`run`):
-/// this plus the depth of that call (`DEPTHS`), and above it the calls of the function under
-/// it still left to the interpreter (`FOLLOWED` at first).
-const DEEPER: u32 = 2;
-const DEPTH_BITS: u32 = 14;
-const DEPTHS: u32 = (1 << DEPTH_BITS) - 1;
-/// A recursion past the limit makes this many calls of its function under the call that went
-/// too deep, four at each level, before machine code is tried again: a shape making more pays
-/// for one more descent in machine code each time, a small part of the interpreter's time, and a
-/// call made after the recursion from deeper than it is compiled again after this many.
-const FOLLOWED: u32 = 4 * MAX_DEPTH as u32;
-const _: () = assert!(MAX_DEPTH <= DEPTHS as usize && (FOLLOWED as u64) << DEPTH_BITS < NEVER as u64 - DEPTHS as u64 - DEEPER as u64);
-
 struct Jit {
     module: JITModule,
     done: HashMap<Key, Option<Arc<Compiled>>>,
     /// Functions whose code is made (so their addresses stay theirs).
     keep: Vec<Arc<FnDef>>,
+    /// Functions whose plan met the budget (`PLAN_BASE`), or met one that did: never planned
+    /// again (`compile`), and kept in `keep`.
+    over: std::collections::HashSet<usize>,
 }
 
 thread_local! {
     static JIT: RefCell<Option<Jit>> = const { RefCell::new(None) };
     static LAST: std::cell::Cell<Option<Quick>> = const { std::cell::Cell::new(None) };
-    /// The call `run` gave up on was too deep, for its caller to say so of its function.
-    static TOO_DEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The function called last, if what it calls cannot change under it.
@@ -158,7 +146,7 @@ fn new_jit() -> Option<Jit> {
     flags.set("is_pic", "false").ok()?;
     flags.set("opt_level", "speed").ok()?;
     let isa = cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?;
-    Some(Jit { module: JITModule::new(JITBuilder::with_isa(isa, default_libcall_names())), done: HashMap::new(), keep: Vec::new() })
+    Some(Jit { module: JITModule::new(JITBuilder::with_isa(isa, default_libcall_names())), done: HashMap::new(), keep: Vec::new(), over: Default::default() })
 }
 
 /// `c(args)` in machine code, when it can be: None to interpret it.
@@ -228,22 +216,6 @@ pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Option<Result<Valu
     if let Some(q) = LAST.get().filter(|q| q.def == at && q.code == code) {
         return run(q.entry, q.ret, &raw, depth);
     }
-    // Under a call of it that went too deep for machine code, this function is the
-    // interpreter's: every call of it deeper than that call, until `FOLLOWED` of them; a call of
-    // it no deeper is after it. Only here, not before the last function, which `run` forgets
-    // then (FEEDBACK52.md, Q-677 review; branch feedback52). Kept for each function: kept for
-    // the thread, a call of another one at the same depth (`r(d - 1, h(x))`) took it back to
-    // machine code (Q-677 review 2); and the depth of the last call followed, not of the one
-    // that went too deep, was taken back by one of its own at the same depth (`r(d - 1, r(0, x)
-    // + 1)`), so each level went down to the limit in machine code again (Q-677 review 3).
-    if hot >= DEEPER {
-        let (under, left) = ((hot - DEEPER) & DEPTHS, (hot - DEEPER) >> DEPTH_BITS);
-        if depth > under as usize && left > 0 {
-            def.hot.store(DEEPER + ((left - 1) << DEPTH_BITS | under), Relaxed);
-            return None;
-        }
-        def.hot.store(1, Relaxed);
-    }
     let compiled = JIT.with(|j| {
         let mut j = j.borrow_mut();
         if j.is_none() {
@@ -272,14 +244,7 @@ pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Option<Result<Valu
             _ => return None,
         }
     }
-    let r = run(compiled.entry, compiled.ret, &raw, depth);
-    // Too deep (`run`): from this call down, the interpreter's. Said here, not in `run`, which
-    // the last function's call goes to as well: it calls nothing (no deps), so it never goes
-    // too deep, and is not slowed by it.
-    if r.is_none() && TOO_DEEP.replace(false) {
-        def.hot.store(DEEPER + (FOLLOWED << DEPTH_BITS | depth as u32), Relaxed);
-    }
-    r
+    run(compiled.entry, compiled.ret, &raw, depth)
 }
 
 fn run(entry: Entry, ret: T, raw: &[u64; 16], depth: usize) -> Option<Result<Value, Ctrl>> {
@@ -291,16 +256,6 @@ fn run(entry: Entry, ret: T, raw: &[u64; 16], depth: usize) -> Option<Result<Val
     // `raw` in order; `ctx` outlives the call.
     let r = unsafe { entry(raw.as_ptr(), &mut ctx) };
     if ctx.bail != 0 {
-        // Too deep: no frame gave the depth back, and the one that could go no deeper left it at
-        // `max` (one that gave up otherwise at exactly `max` is taken as too deep too, which only
-        // costs time). The interpreter goes on with this call, and runs the calls under it itself
-        // (`call`): each level went back into machine code and down to the limit again, 5·10⁷
-        // calls for a recursion that fails at 10,000 levels, 30 times the interpreter's time
-        // (FEEDBACK52.md, Q-677 review; branch feedback52).
-        if ctx.depth == ctx.max {
-            TOO_DEEP.set(true);
-            LAST.set(None);
-        }
         return None;
     }
     Some(Ok(match ret {
@@ -402,18 +357,29 @@ struct Plan<'a> {
     stands_on: HashMap<Key, Vec<usize>>,
     /// For each function being planned, the places of the guesses its plan read, in order.
     reads: Vec<Vec<usize>>,
-    /// Guesses tried, against `PLAN_STEPS` for each function planned (`seen`): a plan whose
-    /// guesses each stand on the last (a chain each calling its caller) is still exponential, and
-    /// past that its compile is refused and the interpreter runs it, as on main (Q-677 review 3).
+    /// Guesses tried, against `PLAN_BASE` and `PLAN_STEPS` for each function planned (`seen`): a
+    /// plan whose guesses each stand on the last (a chain each calling its caller) is still
+    /// exponential, and past that its compile is refused and the interpreter runs it (Q-677
+    /// reviews 3 and 4).
     steps: usize,
     seen: std::collections::HashSet<usize>,
-    /// It reads the builtin `range` (`range_of`).
-    range: bool,
+    /// Functions whose plan met the budget before (`Jit::over`), and whether this one met it or
+    /// one of them.
+    over: &'a std::collections::HashSet<usize>,
+    met: bool,
 }
 
-/// Guesses `Plan` tries for each function it plans, at most: a chain of 40 functions each
-/// calling the first, bool results, takes 9 a function.
+/// Guesses `Plan` tries for each function it plans, at most, past `PLAN_BASE`: a chain of 40
+/// functions each calling the first, bool results, takes 9 a function.
 const PLAN_STEPS: usize = 64;
+/// Guesses `Plan` tries for a compile beyond `PLAN_STEPS` a function. A chain of n functions each
+/// calling its caller and the next takes 2^(n+1) - 2 guesses with float results and
+/// (3^(n+1) - 3) / 2 with bools, all compiled on main however long that took; with 64 a function
+/// alone, 5 bools (363) and 10 floats (2,046) were refused and interpreted (FEEDBACK52.md, Q-677
+/// review 4; branch feedback52). With this, up to 7 bools (3,279) and 12 floats (8,190) are
+/// compiled, and a chain that meets it is refused after about 4 ms of planning at 24 functions
+/// and 6 ms at 40 (half a microsecond a guess).
+const PLAN_BASE: usize = 8192;
 
 /// Adds the places `more` to `to`, both in order.
 fn stand_on(to: &mut Vec<usize>, more: &[usize]) {
@@ -445,6 +411,11 @@ impl<'a> Plan<'a> {
             }
             return Some(c.ret);
         }
+        // Its plan met the budget before (`compile`).
+        if self.over.contains(&key.0) {
+            self.met = true;
+            return None;
+        }
         if let Some((t, used, at)) = self.open.get_mut(&key) {
             *used = true;
             let (t, at) = (*t, *at);
@@ -460,7 +431,8 @@ impl<'a> Plan<'a> {
         let me = self.reads.len();
         for guess in [T::I, T::F, T::B] {
             self.steps += 1;
-            if self.steps > PLAN_STEPS * self.seen.len() {
+            if self.steps > PLAN_STEPS * self.seen.len() + PLAN_BASE {
+                self.met = true;
                 return None;
             }
             self.open.insert(key.clone(), (guess, false, me));
@@ -686,12 +658,11 @@ impl<'a> Plan<'a> {
                 // is named `range` (`fn g(range, n)`, `let range = n`): there it gave the
                 // builtin's sum, where the interpreter says "cannot call int" (FEEDBACK52.md, Q-677
                 // review 3; branch feedback52). That the program's own `range` is the builtin is
-                // decided here, for the code made (`range_of`), and kept by `range_rebound`.
-                if matches!(&**iter, Expr::Call(..)) {
-                    if sc.get("range").is_some() {
-                        return None;
-                    }
-                    self.range = true;
+                // decided here, for the code made (`range_of`), and only here: a `let range` or
+                // `range = ...` after the code is made is not followed, as on main (filed as
+                // Q-944).
+                if matches!(&**iter, Expr::Call(..)) && sc.get("range").is_some() {
+                    return None;
                 }
                 if let Some(a) = a {
                     if self.value(a, sc, ret)? != T::I {
@@ -832,9 +803,24 @@ pub(crate) fn swapped(op: BinOp) -> BinOp {
 // ---- making the code ---------------------------------------------------
 
 fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
-    let mut plan = Plan { env: &c.env, types: HashMap::new(), order: Vec::new(), open: HashMap::new(), deps: Vec::new(), done: &jit.done, stands_on: HashMap::new(), reads: Vec::new(), steps: 0, seen: Default::default(), range: false };
-    let ret = plan.func(&c.def, sig)?;
-    let (types, order, deps, range) = (plan.types, plan.order, plan.deps, plan.range);
+    let mut plan = Plan { env: &c.env, types: HashMap::new(), order: Vec::new(), open: HashMap::new(), deps: Vec::new(), done: &jit.done, stands_on: HashMap::new(), reads: Vec::new(), steps: 0, seen: Default::default(), over: &jit.over, met: false };
+    let Some(ret) = plan.func(&c.def, sig) else {
+        // Its plan met the budget, or a function whose plan did: it is not planned again, as
+        // the function called or as one calling it, and it is the interpreter's (`NEVER`), so
+        // that its calls cost no more than the interpreter's. Each function of a chain past the
+        // budget was planned again to the budget, as the first of its own compile, and every
+        // call of one looked for its code: 5 bool functions each calling its caller and the
+        // next took 30,409 M instructions, the interpreter 22,891 M (FEEDBACK52.md, Q-677 review
+        // 4; branch feedback52). Kept, so that its address is its own.
+        if plan.met {
+            let at = Arc::as_ptr(&c.def) as usize;
+            jit.over.insert(at);
+            jit.keep.push(c.def.clone());
+            c.def.hot.store(NEVER, Relaxed);
+        }
+        return None;
+    };
+    let (types, order, deps) = (plan.types, plan.order, plan.deps);
     // Each function to make, declared first (they may call each other).
     let mut ids: HashMap<Key, FuncId> = HashMap::new();
     for (def, args) in &order {
@@ -943,7 +929,6 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
     jit.module.define_function(entry_id, &mut ctx).ok()?;
     jit.module.clear_context(&mut ctx);
     jit.module.finalize_definitions().ok()?;
-    let kept = jit.keep.len();
     for (def, args) in order {
         let key = (Arc::as_ptr(&def) as usize, args);
         jit.keep.push(def);
@@ -953,25 +938,7 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
     let code = jit.module.get_finalized_function(entry_id);
     // SAFETY: the entry was made with exactly this signature.
     let entry = unsafe { std::mem::transmute::<*const u8, Entry>(code) };
-    if range {
-        READS_RANGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(jit.keep[kept..].iter().cloned());
-    }
     Some(Compiled { entry, ret, deps, id: target })
-}
-
-/// Functions compiled reading the builtin `range` (`range_of`).
-static READS_RANGE: std::sync::Mutex<Vec<Arc<FnDef>>> = std::sync::Mutex::new(Vec::new());
-
-/// The builtin `range` was made something else by `let` (which `quillo check` warns of): the
-/// functions compiled reading it are the interpreter's from now on, through `hot`, which a call
-/// reads first, so that the quick call pays nothing for it (FEEDBACK52.md, Q-677 review 3;
-/// branch feedback52). `range = ...`, which `quillo check` refuses, is not followed (`rebinding`
-/// in src/value.rs).
-#[cold]
-pub(crate) fn range_rebound() {
-    for def in READS_RANGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain(..) {
-        def.hot.store(NEVER, Relaxed);
-    }
 }
 
 /// Code for `id` that only gives up, as the function would have at its first step.

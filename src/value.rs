@@ -1689,7 +1689,6 @@ impl Vars {
     #[inline]
     fn insert(&mut self, name: Sym, value: Value) {
         if let Some(slot) = self.get_mut(name) {
-            rebinding(slot);
             *slot = value;
             return;
         }
@@ -1945,20 +1944,6 @@ pub fn lookup_global(env: &Env, name: impl Name) -> Option<(Value, bool)> {
         }
         cur = cur.parent.as_deref()?;
     }
-}
-
-/// A variable about to be made again by `let`: the builtin `range`, read by compiled code
-/// that decided it was the builtin when it was made (FEEDBACK52.md, Q-677 review 3; branch
-/// feedback52). Not on assignment, which a program's top level does at each round of a loop
-/// (`t += f(i)`), where it cost 0.3% to 0.6%: `range = ...` is refused by `quillo check`.
-#[inline(always)]
-fn rebinding(slot: &Value) {
-    #[cfg(feature = "jit")]
-    if matches!(slot, Value::Builtin("range", _)) {
-        crate::jit::range_rebound();
-    }
-    #[cfg(not(feature = "jit"))]
-    let _ = slot;
 }
 
 /// Like `assign`; `Some(true)` when the variable was a global.
