@@ -86,19 +86,27 @@ struct Compiled {
     /// Beyond `per` a call, what the functions on no cycle take more, each at most once on a
     /// chain (`compile`).
     excess: usize,
-    /// A call of it was given up for the stack left: run on `BIG` straight away when the stack
-    /// left would give it up again (`run`).
-    deep: std::sync::atomic::AtomicBool,
+    /// The stack kept beyond `per` a call (`run`), where a frame is counted at its own size, with
+    /// no room to spare as `LEVEL` has: `excess`, `RESERVE`, and one `per` more, for the call one
+    /// deeper than `max`, whose frame is made before it counts itself. A function keeping 8,000
+    /// floats, its frame counted exactly in `excess`, overflowed by its entry (Q-947 review 7);
+    /// without that `per`, a recursion keeping 1,600 floats across its own call overflowed by the
+    /// frame that gave up, where quillo-A9 and the interpreter give its value (FEEDBACK52.md, Q-947
+    /// review 8; branch feedback52). Made once: worked out at each call, with `deep`'s test, a call
+    /// cost 15 to 20 instructions more, 0.9% of a function mapped over a million numbers.
+    reserve: usize,
+    /// How many calls of it go on `BIG` straight away, when the stack left would give them up
+    /// (`run`): `AGAIN` after one was given up for the stack left, where that stack is kept (`KEEP`),
+/// one less with each.
+    deep: std::sync::atomic::AtomicUsize,
 }
 
-impl Compiled {
-    /// The stack kept beyond `per` a call: `excess`, and `RESERVE` where a frame is counted at its
-    /// own size, with no room to spare as `LEVEL` has. A function keeping 8,000 floats, its frame
-    /// counted exactly in `excess`, overflowed by its entry (Q-947 review 7).
-    fn reserve(&self) -> usize {
-        self.excess + if self.per > LEVEL || self.excess > 0 { RESERVE } else { 0 }
-    }
-}
+/// The calls of a function given up for the stack left that go on `BIG` straight away, without
+/// first going down to the stack's end (`Compiled::deep`), before one goes down again to see
+/// whether it still needs to. Kept for good, a shallow call after one deep call went to `BIG` each
+/// time, 333 instructions more, 9 to 18% (FEEDBACK52.md, Q-947 review 8; branch feedback52). One
+/// call in 1,025 going down first, 5,000 calls of `f(9000)` in `parallel` take 0.1% more.
+const AGAIN: usize = 1024;
 
 type Key = (usize, Vec<T>);
 
@@ -229,7 +237,7 @@ pub fn leave_floor_for_tests(depth: usize) {
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn gave_up(ctx: &Ctx, entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame: usize, reserve: usize, deep: Option<&std::sync::atomic::AtomicBool>) -> Ran {
+fn gave_up(ctx: &Ctx, entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame: usize, reserve: usize, deep: Option<&std::sync::atomic::AtomicUsize>) -> Ran {
     if ctx.depth != ctx.max {
         return Ran::Interpret;
     }
@@ -243,8 +251,11 @@ fn gave_up(ctx: &Ctx, entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame
     // stack it needs is `frame` a call (Q-947).
     let limit = MAX_DEPTH.saturating_sub(depth);
     if (ctx.max as usize) < limit && crate::stack::remaining().is_some() {
-        if let Some(deep) = deep {
-            deep.store(true, Relaxed);
+        // Only where that stack is kept: on a new one each time, 1,024 calls of a function keeping
+        // 200 floats after one given up cost 88,000 instructions each, mapping and touching it
+        // (Q-947 review 8). Windows keeps none.
+        if let Some(deep) = deep.filter(|_| !cfg!(windows) && limit * frame + reserve + crate::stack::MARGIN <= KEEP) {
+            deep.store(AGAIN, Relaxed);
         }
         return floor_unless_done(on_big(entry, ret, raw, depth, frame, reserve), depth);
     }
@@ -280,7 +291,7 @@ fn floor(depth: usize) -> Ran {
 /// and kept, so that a call given up for the stack at each call of a loop maps and touches no new
 /// stack each time. A new one each time, 5 MB for `f(9000)` in a `parallel` child, faulted 18
 /// pages a call: 90,895 page reclaims against main's 899, 2.5 times its instructions (Q-947 review
-/// 7). In use (a call under it, which no machine code makes), a new one.
+/// 7). In use (a call under it, which no machine code makes), a new one. Kept only up to `KEEP`.
 #[cold]
 #[inline(never)]
 fn on_big(entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame: usize, reserve: usize) -> Ran {
@@ -301,7 +312,9 @@ fn on_big(entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame: usize, res
             psm::on_stack(low as *mut u8, high - low, || out = Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(again))));
         }
         crate::stack::switch(outer);
-        BIG.with(|b| *b.borrow_mut() = Some(stack));
+        if need <= KEEP {
+            BIG.with(|b| *b.borrow_mut() = Some(stack));
+        }
         out.expect("ran").unwrap_or_else(|p| std::panic::resume_unwind(p))
     }
     // Windows grows a stack with fibers (`crate::stack`): a new one each time.
@@ -314,6 +327,13 @@ thread_local! {
     /// The stack `on_big` runs on, kept for the next.
     static BIG: RefCell<Option<corosensei::stack::DefaultStack>> = const { RefCell::new(None) };
 }
+
+/// The largest `BIG` kept for the next call: a worker thread's own stack (`server::WORKER_STACK`).
+/// Every page a call touches stays the thread's while its stack is kept: a recursion 3,000 deep
+/// keeping 6,000 floats took a server from 27 MB to 318 after one request, and keeping 3,000, 8
+/// requests took one with `--instances 4` to 670, where a stack not kept leaves 43 and 118
+/// (FEEDBACK52.md, Q-947 review 8; branch feedback52).
+const KEEP: usize = 16 << 20;
 
 /// What `call` did with a call.
 pub enum Ran {
@@ -358,7 +378,15 @@ struct Quick {
     code: u64,
     entry: Entry,
     ret: T,
+    /// `Compiled::reserve`, for a frame over `LEVEL` (`code` with `OVER`). Kept to the others, a
+    /// function calling nothing with 80 float `let`s mapped over a million numbers was 52% slower
+    /// than main, never the last function (FEEDBACK52.md, Q-947 review 8; branch feedback52).
+    reserve: usize,
 }
+
+/// In `Quick::code` for a function whose frame is over `LEVEL`, which no call's code has (2 bits
+/// an argument, 16 at most): the others' quick call reads no more than before.
+const OVER: u64 = 1 << 63;
 
 /// How many functions this thread has compiled (for tests).
 pub fn compiled() -> usize {
@@ -474,9 +502,15 @@ pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Ran {
     let at = Arc::as_ptr(def) as usize;
     // A function given to `map` or `filter` is called for each item: the last one
     // called is at hand, with no table to look in.
-    if let Some(q) = LAST.get().filter(|q| q.def == at && q.code == code) {
-        // It calls nothing, so one frame is all it takes.
-        return run(q.entry, q.ret, &raw, depth, LEVEL, 0, None);
+    if let Some(q) = LAST.get().filter(|q| q.def == at) {
+        // It calls nothing, so one frame is all it takes: on no cycle, counted at `LEVEL`, and
+        // what it has over that kept.
+        if q.code == code {
+            return run(q.entry, q.ret, &raw, depth, LEVEL, 0, None);
+        }
+        if q.code == code | OVER {
+            return run(q.entry, q.ret, &raw, depth, LEVEL, q.reserve, None);
+        }
     }
     let compiled = JIT.with(|j| {
         let mut j = j.borrow_mut();
@@ -497,11 +531,12 @@ pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Ran {
         made
     });
     let Some(compiled) = compiled else { return Ran::Interpret };
-    // The last function's quick call counts `LEVEL` and keeps nothing: only for one whose frame
-    // is no larger. One keeping 10,000 floats, called at each level of a 9,000-deep interpreted
-    // recursion, overflowed the stack, where the interpreter gives its value (Q-947 review 7).
-    if compiled.deps.is_empty() && compiled.excess == 0 {
-        LAST.set(Some(Quick { def: at, code, entry: compiled.entry, ret: compiled.ret }));
+    // The last function's quick call keeps its reserve: counted at `LEVEL` with none, one keeping
+    // 10,000 floats, called at each level of a 9,000-deep interpreted recursion, overflowed the
+    // stack, where the interpreter gives its value (Q-947 review 7).
+    if compiled.deps.is_empty() {
+        let code = if compiled.reserve == 0 { code } else { code | OVER };
+        LAST.set(Some(Quick { def: at, code, entry: compiled.entry, ret: compiled.ret, reserve: compiled.reserve }));
     }
     // What it calls is still what it was compiled with.
     for (name, at) in &compiled.deps {
@@ -510,25 +545,30 @@ pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Ran {
             _ => return Ran::Interpret,
         }
     }
-    run(compiled.entry, compiled.ret, &raw, depth, compiled.per, compiled.reserve(), Some(&compiled.deep))
+    run(compiled.entry, compiled.ret, &raw, depth, compiled.per, compiled.reserve, Some(&compiled.deep))
 }
 
-fn run(entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame: usize, reserve: usize, deep: Option<&std::sync::atomic::AtomicBool>) -> Ran {
+/// Made where it is called: with the second quick call (`OVER`) its own function, a call of it
+/// cost a function mapped over a million numbers 4.7%, and a call of an out-of-line one from
+/// `call` 9 instructions (FEEDBACK52.md, Q-947 review 8; branch feedback52).
+#[inline(always)]
+fn run(entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame: usize, reserve: usize, deep: Option<&std::sync::atomic::AtomicUsize>) -> Ran {
     // Calls as deep as the stack left allows (a recursion deeper than that
     // gives up, and the interpreter, which grows the stack, goes on), at
-    // `frame` bytes a call, with `reserve` kept.
-    let left = crate::stack::remaining().unwrap_or(64 << 10).saturating_sub(reserve);
-    let max = (MAX_DEPTH.saturating_sub(depth)).min(left / frame);
-    // A frame is made before the code counts the call: with no room for the first, and a frame
-    // over `LEVEL` (`reserve`), no machine code (Q-947 review 7).
-    if reserve != 0 && max == 0 {
-        return Ran::Interpret;
-    }
+    // `frame` bytes a call, with `reserve` kept; with less left than that, none, as the first
+    // frame is made before the code counts it (Q-947 review 7).
+    let Some(left) = crate::stack::remaining().unwrap_or(64 << 10).checked_sub(reserve) else { return Ran::Interpret };
+    let limit = MAX_DEPTH.saturating_sub(depth);
+    let max = limit.min(left / frame);
     // Given up for the stack before, and it would be again: on `BIG` at once, not after a descent
-    // to `max` and back (Q-947 review 7).
-    if let Some(deep) = deep {
-        if max < MAX_DEPTH.saturating_sub(depth) && deep.load(Relaxed) && crate::stack::remaining().is_some() {
-            return floor_unless_done(on_big(entry, ret, raw, depth, frame, reserve), depth);
+    // to `max` and back (Q-947 review 7), for `AGAIN` calls.
+    if max < limit {
+        if let Some(deep) = deep {
+            let n = deep.load(Relaxed);
+            if n != 0 && crate::stack::remaining().is_some() {
+                deep.store(n - 1, Relaxed);
+                return floor_unless_done(on_big(entry, ret, raw, depth, frame, reserve), depth);
+            }
         }
     }
     let mut ctx = Ctx { bail: 0, depth: 0, max: max as u64 };
@@ -1156,7 +1196,7 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
             // registers, outgoing arguments), and above it the frame pointer and the return
             // address (Q-947). 16 bytes more a call took 9,000 calls with 56 such lets in
             // `parallel` for the stack, and ran them again on a new one, 8.6% over main; what is
-            // not a call's (the entry, the call that gives up) is `RESERVE`.
+            // not a call's (the entry, the call that gives up) is `Compiled::reserve`.
             if let (Some(f), Some(made)) = (ctx.compiled_code().and_then(|code| code.buffer.frame_layout()), calls.last_mut()) {
                 made.2 = f.frame_to_fp_offset as usize + 16;
             }
@@ -1233,7 +1273,8 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
     let code = jit.module.get_finalized_function(entry_id);
     // SAFETY: the entry was made with exactly this signature.
     let entry = unsafe { std::mem::transmute::<*const u8, Entry>(code) };
-    Some(Compiled { entry, ret, deps, id: target, per, excess, deep: Default::default() })
+    let reserve = if per > LEVEL || excess > 0 { excess + RESERVE + per } else { 0 };
+    Some(Compiled { entry, ret, deps, id: target, per, excess, reserve, deep: Default::default() })
 }
 
 /// The stack counted for each call of a compile's code (`Compiled::per`) and kept beyond that

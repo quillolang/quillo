@@ -1617,3 +1617,123 @@ fn a_recursion_of_small_frames_in_a_parallel_child_keeps_main_s_depth() {
         assert!(t * 2 < base * (1 + slack()) + Duration::from_millis(4), "d({}) {:?}, d(870) {:?}", n, t, base);
     }
 }
+
+// ---- review 8 of Q-947 (FEEDBACK52.md, Q-947 review 8; branch feedback52) --------------------
+
+/// `r(n, a)`, keeping `k` chained floats across its own call, and summing them as a balanced tree.
+fn keeping(k: usize) -> String {
+    let lets: Vec<String> = std::iter::once("let v0 = a * 0.5".to_string()).chain((1..k).map(|i| format!("let v{} = v{} * 0.5 + a", i, i - 1))).collect();
+    let mut names: Vec<String> = (0..k).map(|i| format!("v{}", i)).collect();
+    while names.len() > 1 {
+        names = names.chunks(2).map(|c| if c.len() == 2 { format!("({} + {})", c[0], c[1]) } else { c[0].clone() }).collect();
+    }
+    format!("fn r(n, a) {{\n    if n <= 0 {{\n        a\n    }} else {{\n        {}\n        let x = r(n - 1, v{} * 0.25)\n        x + {}\n    }}\n}}\n", lets.join("\n        "), k - 1, names[0])
+}
+
+/// Whether the binary tested is a debug build's, whose Cranelift takes over a minute for a
+/// function of 8,000 values: these tests take smaller ones there, and the edges in a release
+/// build (QUILLO_TEST_BIN, the instrumented coverage run).
+fn debug_binary() -> bool {
+    std::env::var_os("QUILLO_TEST_BIN").is_none() && cfg!(debug_assertions)
+}
+
+/// Held by each of these tests, one at a time: compiling functions of thousands of values, four
+/// at once beside this file's timing tests made `/pfact`'s compiled time three times its
+/// interpreted one in two runs of five (`a_call_given_up_for_the_stack_left_keeps_the_calls_under_it_compiled`).
+static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn heavy() -> std::sync::MutexGuard<'static, ()> {
+    HEAVY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[test]
+fn a_recursion_keeping_thousands_of_floats_across_its_call_gives_its_value() {
+    let _one = heavy();
+    // Its frame past `RESERVE`, the call one deeper than the stack allowed made its frame before
+    // it counted itself, and the probes of a frame over 4 KB wrote into the guard page: "overflowed
+    // its stack" from 1,600 floats (quillo-A10), where quillo-A9 and the interpreter give 6k - 9;
+    // with 4,200 from a depth of 250 (Q-947 review 8). The interpreter's values, from QUILLO_JIT=0.
+    let cases: &[(usize, usize)] = if debug_binary() { &[(2200, 3000)] } else { &[(1600, 3000), (1900, 3000), (2200, 3000), (2700, 3000), (4200, 3000), (4200, 250), (6000, 3000)] };
+    for &(k, n) in cases {
+        let main = format!("{}print(r(2, 1.5))\nprint(r({}, 1.5) ?? \"E\")\n", keeping(k), n);
+        let first = format!("{}", 4.5 * k as f64 - 6.375);
+        assert_eq!(quillo_run(&main, &[]), format!("{}\n{}.0", first, 6 * k - 9), "{} floats, r({})", k, n);
+        // In a `parallel` child (8 MB).
+        let child = format!("{}print(r(2, 1.5))\nprint(parallel(() => r({}, 1.5) ?? \"E\", () => 1))\n", keeping(k), n);
+        assert_eq!(quillo_run(&child, &[]), format!("{}\n[{}.0, 1]", first, 6 * k - 9), "{} floats, r({}) in parallel", k, n);
+    }
+}
+
+#[test]
+fn a_route_keeping_thousands_of_floats_across_its_call_answers() {
+    let _one = heavy();
+    // The same in a request, and in its `parallel` child (512 KB): with 7,000 and 8,000 floats the
+    // server stopped (SIGBUS; quillo-A10 and main), where quillo-A9 answers (Q-947 review 8).
+    for k in if debug_binary() { vec![2200] } else { vec![7000, 8000] } {
+        let src = format!("{}route GET /warm = str(r(2, 1.5) + r(2, 1.5))\nroute GET /r = str(r(3000, 1.5) ?? \"E\")\nroute GET /rp = str(parallel(() => r(3000, 1.5) ?? \"E\", () => 1))\n", keeping(k));
+        let (_server, port) = served(&src, &[], &[]);
+        let _ = fastest_get(port, "/warm", 2);
+        for (path, want) in [("/r", format!("{}.0", 6 * k - 9)), ("/rp", format!("[{}.0, 1]", 6 * k - 9)), ("/r", format!("{}.0", 6 * k - 9))] {
+            let (_, status, body) = fastest_get(port, path, 1);
+            assert_eq!((status, body), (200, want), "{} floats, {}", k, path);
+        }
+    }
+}
+
+/// The resident memory of process `pid`, in KB.
+fn resident(pid: u32) -> u64 {
+    let out = Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
+#[test]
+fn a_server_gives_back_the_stack_a_deep_call_with_big_frames_took() {
+    let _one = heavy();
+    // `r(3000)` keeping 6,000 floats runs on a stack of its own, 144 MB of it touched: kept for the
+    // thread's next call, the server stayed at 318 MB after one request, 670 with `--instances 4`
+    // (quillo-A10); quillo-A9 43 (Q-947 review 8).
+    let k = if debug_binary() { 2200 } else { 6000 };
+    let src = format!("{}route GET /warm = str(r(2, 1.5) + r(2, 1.5))\nroute GET /r = str(r(3000, 1.5) ?? \"E\")\n", keeping(k));
+    let (server, port) = served(&src, &["--workers", "1"], &[]);
+    let _ = fastest_get(port, "/warm", 2);
+    let before = resident(server.0.id());
+    let (_, status, body) = fastest_get(port, "/r", 1);
+    assert_eq!((status, body), (200, format!("{}.0", 6 * k - 9)));
+    let after = resident(server.0.id());
+    // The request's own stack (16 MB), which the call fills before it is given up for the stack,
+    // and a few MB more; the stack it went on, `3000 * 8 * k` bytes (`k * 24` KB, 53 MB in a debug
+    // build), is given back.
+    assert!(after < before + (24 << 10), "{} KB before, {} KB after", before, after);
+}
+
+#[test]
+fn a_function_calling_nothing_with_a_large_frame_keeps_the_quick_call() {
+    let _one = heavy();
+    // `h` keeps 80 floats, summed in reverse, which Cranelift keeps in a frame over 512 bytes; the
+    // same sum in order needs no such frame. Mapped over a million numbers, the quick call of the
+    // last function (`Quick`) was only for the second: 1,849 M instructions against main's 1,215
+    // (quillo-A10), and 1,092 in order (Q-947 review 8).
+    let src = |reverse: bool| {
+        let lets: Vec<String> = std::iter::once("let v0 = a * 0.5".to_string()).chain((1..80).map(|i| format!("let v{} = v{} * 0.5 + a", i, i - 1))).collect();
+        let mut names: Vec<String> = (0..80).map(|i| format!("v{}", i)).collect();
+        if reverse {
+            names.reverse();
+        }
+        while names.len() > 1 {
+            names = names.chunks(2).map(|c| if c.len() == 2 { format!("({} + {})", c[0], c[1]) } else { c[0].clone() }).collect();
+        }
+        format!("fn h(a) {{\n    {}\n    {}\n}}\nprint(range(0, 1000000) | map((i) => i * 1.0) | map(h) | sum())\n", lets.join("\n    "), names[0])
+    };
+    // Taken in turn, so that a loaded machine slows both alike.
+    let (mut big, mut small) = (Duration::MAX, Duration::MAX);
+    for _ in 0..5 {
+        let (t, out) = fastest(&src(true), &[], 1);
+        big = big.min(t);
+        let (t, plain) = fastest(&src(false), &[], 1);
+        small = small.min(t);
+        assert_eq!((out.as_str(), plain.as_str()), ("78499921500000.0", "78499921500000.0"));
+    }
+    // 1.5 times at most: in instructions quillo-A10 1.70, this build 1.11, main 1.11; in time
+    // alone quillo-A10 1.97, this build 1.1.
+    assert!(big * 2 < small * 3, "in reverse {:?}, in order {:?}", big, small);
+}
