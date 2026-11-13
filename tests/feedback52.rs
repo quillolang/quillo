@@ -884,7 +884,8 @@ print([mid_line(), end_of_line(1), literal_next()])
         [
             "2 warning: this never runs: the `return` on line 2 always leaves `mid_line`".to_string(),
             "6 warning: this never runs: a `return` at the end of a line gives null, so the one on line 5 leaves `end_of_line` before this".to_string(),
-            "9 warning: what follows never runs: the `return` on line 9 always leaves `literal_next`".to_string(),
+            // A literal has no line: taken to be on the next, as B4 did (third review, LOW 5).
+            "9 warning: what follows never runs: a `return` at the end of a line gives null, so the one on line 9 leaves `literal_next` before this".to_string(),
         ]
     );
 }
@@ -911,4 +912,71 @@ print([finds([1]), three([1]), gives([1]), closed([1])])
 "#;
     let list = |line: u32, f: &str, at: u32| format!("{line} warning: `{f}` returns a value on line {at} but, when it reaches its end, gives the list of nulls its `for` makes: end it with the value it should give, or `null`");
     assert_eq!(said(src), [list(2, "finds", 2), list(5, "three", 6)]);
+}
+
+// ---- the third review (FEEDBACK52.md, Q-678 to Q-680; branch feedback52) ----------------------
+
+/// LOW 5: a literal has no line, so a `return` before one on the next line lost the reason the
+/// next line never runs. LOW 6: a way that leaves through a block of its own was not said, or
+/// named a later `return`: the first `return` a way leaves by is now worked out as the walk
+/// comes back up.
+#[test]
+fn a_return_before_a_literal_or_in_a_block_of_its_own_is_read_as_written() {
+    let src = r#"fn total(xs) {
+    return
+    0
+}
+fn none_text() {
+    return
+    "none"
+}
+fn pair() {
+    return
+    [0, 0]
+}
+fn called(x) {
+    return
+    print(x)
+}
+fn mid_line() {
+    print("a"); return; print("b")
+}
+fn nested_a(c) {
+    let d = if c { print("x"); { return 1 } } else { { return 2 } }
+    d
+}
+fn nested_b(c) {
+    let d = if c { { return 1 } } else { return 2 }
+    d
+}
+fn nested_m(k) {
+    let d = match k { 1 => { { return 1 } }, _ => return 2 }
+    d
+}
+fn guard_block(c) {
+    let d = if c { 1 } else { print("x"); { return 2 } }
+    d
+}
+fn stmt_first(c, a) {
+    let d = if c { if a { return 1 } else { return 2 }; return 3 } else { return 4 }
+    d
+}
+print([total([]), none_text(), pair(), called(1), mid_line(), nested_a(true), nested_b(true), nested_m(1), guard_block(true), stmt_first(true, true)])
+"#;
+    let bare = |at: u32, f: &str| format!("{at} warning: what follows never runs: a `return` at the end of a line gives null, so the one on line {at} leaves `{f}` before this");
+    assert_eq!(
+        said(src),
+        [
+            bare(2, "total"),
+            bare(6, "none_text"),
+            bare(10, "pair"),
+            "15 warning: this never runs: a `return` at the end of a line gives null, so the one on line 14 leaves `called` before this".to_string(),
+            "18 warning: this never runs: the `return` on line 18 always leaves `mid_line`".to_string(),
+            every(21, "if", "`nested_a`", "write `1`"),
+            every(25, "if", "`nested_b`", "write `1`"),
+            every(29, "match", "`nested_m`", "write `1`"),
+            "37 warning: this never runs: each way of the `if` on line 37 leaves `stmt_first`".to_string(),
+            every(37, "if", "`stmt_first`", "write `1`"),
+        ]
+    );
 }

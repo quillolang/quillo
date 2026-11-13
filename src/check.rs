@@ -8738,7 +8738,7 @@ fn ends_of(a: Option<End>, b: Option<End>, a_gives: bool) -> Option<End> {
 /// out again at each level, it took a time of the square of the depth (review of 1a1b3ae,
 /// LOW 2).
 #[derive(Clone, Copy, Default)]
-struct Flow {
+struct Flow<'a> {
     /// It always leaves.
     leaves: Option<Leaves>,
     /// It never lets the statement after it run: it leaves, or it is `while true`, which only
@@ -8751,11 +8751,15 @@ struct Flow {
     empty_rounds: bool,
     /// A `return` in it whose value is kept has been said: an `if` around it is not said again.
     said: bool,
+    /// When it always leaves, the first `return` it leaves by, as written: its value and its
+    /// line. Looked for afterwards in a way's own statements and the `if` it ended in, one in a
+    /// block of its own was missed (third review, LOW 6).
+    ret: Option<(Option<&'a Expr>, u32)>,
 }
 
 /// What an `else if` chain gives, from its last `if` back: whether every way leaves (an `else`
 /// at its end too), how it ends, whether a `return` in it was said, and how its first way leaves.
-struct Chain {
+struct Chain<'a> {
     all: bool,
     end: Option<End>,
     said: bool,
@@ -8763,6 +8767,8 @@ struct Chain {
     /// No `else` at its end, and each way leaves: as a `for`'s body, each round gives null or
     /// leaves, as an `if` with no `else` does (second review, LOW 5).
     open: bool,
+    /// The first `return`, as written, of the first way that leaves by one.
+    ret: Option<(Option<&'a Expr>, u32)>,
 }
 
 /// Of `names`, the functions the program hands to other code rather than calls: named where a
@@ -8894,17 +8900,19 @@ impl<'a> Returns<'a> {
         self.ends.push((msg.0, d.name.clone(), msg.1));
     }
 
-    fn stmts(&mut self, stmts: &'a [Stmt], goes: Goes) -> Flow {
+    fn stmts(&mut self, stmts: &'a [Stmt], goes: Goes) -> Flow<'a> {
         let n = stmts.len();
         // An empty block gives null.
         let mut out = Flow { empty_rounds: true, ..Flow::default() };
         let mut first: Option<(usize, Leaves)> = None;
+        let mut ret = None;
         let mut never = false;
         for (i, s) in stmts.iter().enumerate() {
             let last = i + 1 == n;
             let f = self.stmt(s, if last { goes } else { Goes::Dropped });
             if first.is_none() {
                 first = f.leaves.map(|l| (i, l));
+                ret = f.ret;
             }
             never |= f.never;
             if last {
@@ -8916,6 +8924,7 @@ impl<'a> Returns<'a> {
             }
         }
         out.leaves = first.map(|(_, l)| l);
+        out.ret = ret;
         out.never = never;
         if never {
             out.end = None;
@@ -8928,8 +8937,9 @@ impl<'a> Returns<'a> {
         let f = self.name();
         // `return` and the value meant for it on the next line (review of 1a1b3ae); one with a
         // statement after it on its own line, `print("a"); return; print("b")`, is a plain one
-        // (second review, LOW 4).
-        let next_line = top_line(&stmts[i + 1]).unwrap_or(0);
+        // (second review, LOW 4). A literal has no line, and is taken to be on the next, as is
+        // most likely: `return`, then `0` (third review, LOW 5).
+        let next_line = top_line(&stmts[i + 1]).unwrap_or(u32::MAX);
         let why = match how {
             Leaves::Return(l) => format!("the `return` on line {} always leaves {}", l, f),
             Leaves::Bare(l) if next_line > l => format!("a `return` at the end of a line gives null, so the one on line {} leaves {} before this", l, f),
@@ -8946,7 +8956,7 @@ impl<'a> Returns<'a> {
         out
     }
 
-    fn stmt(&mut self, s: &'a Stmt, goes: Goes) -> Flow {
+    fn stmt(&mut self, s: &'a Stmt, goes: Goes) -> Flow<'a> {
         match s {
             Stmt::Let(Pattern::Bind(n), Expr::Lambda(d), _) => self.function(d, Whose::Named(n.as_str()), false),
             Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::State(_, e, _) => {
@@ -8971,7 +8981,7 @@ impl<'a> Returns<'a> {
                     self.value(v, Goes::Out);
                 }
                 let how = if v.is_some() { Leaves::Return(*line) } else { Leaves::Bare(*line) };
-                return Flow { leaves: Some(how), never: true, ..Flow::default() };
+                return Flow { leaves: Some(how), never: true, ret: Some((v.as_ref(), *line)), ..Flow::default() };
             }
             Stmt::Fn(d) => self.function(d, Whose::Named(&d.name), true),
             Stmt::Route(r) => {
@@ -8995,7 +9005,7 @@ impl<'a> Returns<'a> {
 
     /// A way of an `if` or `match`, or a `for`'s body: its statements, where its value goes.
     /// What a `return` of its own means is said by what it is a way of.
-    fn way(&mut self, e: &'a Expr, goes: Goes) -> Flow {
+    fn way(&mut self, e: &'a Expr, goes: Goes) -> Flow<'a> {
         match e {
             Expr::Block(stmts) => self.stmts(stmts, goes),
             e => self.value(e, goes),
@@ -9023,18 +9033,18 @@ impl<'a> Returns<'a> {
     /// An `if` and the `else if`s after it, read as the ways of one `if` (review of 1a1b3ae,
     /// M2): read each as an `if` of its own, a way that leaves was hidden in the next, and one
     /// `let` was said once a level.
-    fn chain(&mut self, c: &'a Expr, a: &'a Expr, b: Option<&'a Expr>, goes: Goes) -> Chain {
+    fn chain(&mut self, c: &'a Expr, a: &'a Expr, b: Option<&'a Expr>, goes: Goes) -> Chain<'a> {
         self.value(c, Goes::Kept);
         let fa = self.way(a, goes);
         let gives = way_gives(a);
         let mut r = match b {
             Some(Expr::If(c2, a2, b2)) => {
                 let r = self.deep(|r| r.chain(c2, a2, b2.as_deref(), goes));
-                Chain { all: fa.leaves.is_some() && r.all, end: ends_of(fa.end, r.end, gives), said: r.said, first: None, open: fa.leaves.is_some() && r.open }
+                Chain { all: fa.leaves.is_some() && r.all, end: ends_of(fa.end, r.end, gives), said: r.said, first: None, open: fa.leaves.is_some() && r.open, ret: r.ret }
             }
             Some(b) => {
                 let fb = self.way(b, goes);
-                Chain { all: fa.leaves.is_some() && fb.leaves.is_some(), end: ends_of(fa.end, fb.end, gives), said: fb.said, first: None, open: false }
+                Chain { all: fa.leaves.is_some() && fb.leaves.is_some(), end: ends_of(fa.end, fb.end, gives), said: fb.said, first: None, open: false, ret: fb.ret }
             }
             None => Chain {
                 all: false,
@@ -9042,34 +9052,20 @@ impl<'a> Returns<'a> {
                 said: false,
                 first: None,
                 open: fa.leaves.is_some(),
+                ret: None,
             },
         };
         r.said |= fa.said;
         r.first = fa.leaves;
+        r.ret = fa.ret.or(r.ret);
         r
-    }
-
-    /// The first `return`, as written, by which a way that leaves does so: its own, else one of
-    /// the `if` or `match` it ends in (second review, MEDIUM 3: those are not said themselves).
-    fn way_return(&mut self, w: &'a Expr) -> Option<(Option<&'a Expr>, u32)> {
-        if let Some(r) = own_return(w) {
-            return Some(r);
-        }
-        match way_value(w)? {
-            Expr::If(_, a, b) => self.deep(|r| match r.way_return(a) {
-                Some(x) => Some(x),
-                None => b.as_deref().and_then(|b| r.way_return(b)),
-            }),
-            Expr::Match(_, arms, _) => self.deep(|r| arms.iter().find_map(|a| r.way_return(&a.body))),
-            _ => None,
-        }
     }
 
     /// On a new piece of stack when this one runs low, as `Checker::expr`: a program nested as
     /// deep as the parser lets it is read on a request's stack and less (tests/security.rs's
     /// small-stack test stopped the process in a debug build; FEEDBACK52.md, Q-678 to Q-680;
     /// branch feedback52).
-    fn value(&mut self, e: &'a Expr, goes: Goes) -> Flow {
+    fn value(&mut self, e: &'a Expr, goes: Goes) -> Flow<'a> {
         self.deep(|r| r.value_here(e, goes))
     }
 
@@ -9083,7 +9079,7 @@ impl<'a> Returns<'a> {
         r
     }
 
-    fn value_here(&mut self, e: &'a Expr, goes: Goes) -> Flow {
+    fn value_here(&mut self, e: &'a Expr, goes: Goes) -> Flow<'a> {
         const KEPT: Goes = Goes::Kept;
         match e {
             Expr::Lit(_) | Expr::Ident(..) => {}
@@ -9125,30 +9121,20 @@ impl<'a> Returns<'a> {
             Expr::If(c, a, b) => {
                 let r = self.chain(c, a, b.as_deref(), if goes == KEPT { Goes::Inner } else { goes });
                 let mut said = r.said;
-                if goes == KEPT && r.all && !said {
-                    let mut at = Some(e);
-                    while let Some(Expr::If(_, a, b)) = at {
-                        let found = match self.way_return(a) {
-                            Some(x) => Some(x),
-                            None => b.as_deref().filter(|b| !matches!(b, Expr::If(..))).and_then(|b| self.way_return(b)),
-                        };
-                        if let Some((v, line)) = found {
-                            self.kept_return(v, line, "if");
-                            said = true;
-                            break;
-                        }
-                        at = b.as_deref();
-                    }
+                if let (true, Some((v, line))) = (goes == KEPT && r.all && !said, r.ret) {
+                    self.kept_return(v, line, "if");
+                    said = true;
                 }
                 let leaves = r.all.then(|| match crate::debug::expr_line(c) {
                     0 => Leaves::If(r.first.map_or(0, Leaves::line)),
                     l => Leaves::If(l),
                 });
-                return Flow { leaves, never: false, end: r.end, empty_rounds: r.open, said };
+                let ret = if r.all { r.ret } else { None };
+                return Flow { leaves, never: false, end: r.end, empty_rounds: r.open, said, ret };
             }
             Expr::Match(s, arms, line) => {
                 self.value(s, KEPT);
-                let (mut all, mut end, mut said) = (!arms.is_empty(), None, false);
+                let (mut all, mut end, mut said, mut ret) = (!arms.is_empty(), None, false, None);
                 for a in arms {
                     if let Some(g) = &a.guard {
                         self.value(g, KEPT);
@@ -9157,15 +9143,14 @@ impl<'a> Returns<'a> {
                     all &= f.leaves.is_some();
                     end = end.or(f.end);
                     said |= f.said;
+                    ret = ret.or(f.ret);
                 }
-                if goes == KEPT && all && !said {
-                    if let Some((v, l)) = arms.iter().find_map(|a| self.way_return(&a.body)) {
-                        self.kept_return(v, l, "match");
-                        said = true;
-                    }
+                if let (true, Some((v, l))) = (goes == KEPT && all && !said, ret) {
+                    self.kept_return(v, l, "match");
+                    said = true;
                 }
                 // A `match` no arm of which fits fails, which leaves too.
-                return Flow { leaves: all.then_some(Leaves::Match(*line)), end, said, ..Flow::default() };
+                return Flow { leaves: all.then_some(Leaves::Match(*line)), end, said, ret: if all { ret } else { None }, ..Flow::default() };
             }
             Expr::For(_, items, body, line) => {
                 self.value(items, KEPT);
