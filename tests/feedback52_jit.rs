@@ -1383,3 +1383,121 @@ fn a_floor_left_behind_ends_at_the_next_call_no_deeper() {
     let src = "fn rd(d, x = 1) {\n    if d <= 0 {\n        return 0\n    }\n    return rd(d - 1) + x\n}\nprint(rd(5))\nprint(rd(5))\nprint(rd(100000) ?? \"E\")\n";
     assert_eq!(both_ways(src), "5\n5\nE");
 }
+
+// ---- review 6 of Q-945, and Q-947 (FEEDBACK52.md; branch feedback52) -------------------------
+
+/// `big(n, a)`, with `k` float `let`s still needed after its own call: its frame grows with `k`.
+/// Its base is `n == 0` when `runaway`, so that `big(-1, ...)` never reaches it.
+fn big(k: usize, runaway: bool) -> String {
+    let lets: Vec<String> = std::iter::once("let v0 = a * 0.5".to_string()).chain((1..k).map(|i| format!("let v{} = v{} * 0.5 + a", i, i - 1))).collect();
+    let total: Vec<String> = (0..k).map(|i| format!("v{}", i)).collect();
+    format!(
+        "fn big(n, a) {{\n    if {} {{\n        a\n    }} else {{\n        {}\n        let r = big(n - 1, v{} * 0.25)\n        r + {}\n    }}\n}}\n",
+        if runaway { "n == 0" } else { "n <= 0" },
+        lets.join("\n        "),
+        k - 1,
+        total.join(" + ")
+    )
+}
+
+#[test]
+fn a_frame_larger_than_512_bytes_does_not_overflow_the_stack() {
+    // `run` took 512 bytes as a compiled call's most: with 57 such lets, in `parallel`'s child,
+    // the frames overflowed its stack and stopped the process ("stack overflow", main and
+    // quillo-A8); with 56 they did not. The edge, one either side, and far past it: the
+    // interpreter's values (FEEDBACK52.md, Q-947; branch feedback52).
+    for k in [56, 57, 58, 120] {
+        let src = format!("{}print(big(3, 1.5))\nprint(big(3, 1.5))\nprint(parallel(() => big(9000, 1.5), () => 1))\n", big(k, false));
+        let got = both_ways(&src);
+        assert!(!got.contains("FAILED"), "k = {}: {}", k, got);
+    }
+}
+
+#[test]
+fn a_runaway_recursion_with_large_frames_is_a_quillo_error() {
+    // `big(-1, 1.5)` never ends: main stopped with "stack overflow" from 31 lets (30 ran), and
+    // quillo-A8's floor kept it a Quillo error up to 103, not from 104. Each edge and one either
+    // side (Q-947).
+    for k in [30, 31, 32, 103, 104, 105] {
+        let src = format!("{}print(big(3, 1.5))\nprint(big(3, 1.5))\nprint(big(-1, 1.5) ?? \"E\")\n", big(k, true));
+        assert_eq!(both_ways(&src).lines().last(), Some("E"), "k = {}", k);
+    }
+}
+
+#[test]
+fn a_route_whose_parallel_child_has_large_frames_keeps_the_server() {
+    // `big(2000, 1.5)` in a route's `parallel` child (512 KB): with 34 lets the server died of
+    // SIGBUS on main and quillo-A8, with 33 it answered. The edge and one either side: the
+    // interpreter's answer, twice, and the server still up (Q-947).
+    for k in [33, 34, 35] {
+        let src = format!("{}route GET /warm = str(big(3, 1.5) + big(3, 1.5))\nroute GET /big = str(parallel(() => big(2000, 1.5), () => 1))\n", big(k, false));
+        let want = {
+            let (_server, port) = served(&src, &[], &[("QUILLO_JIT", "0")]);
+            fastest_get(port, "/big", 1)
+        };
+        assert_eq!(want.1, 200, "k = {}: {}", k, want.2);
+        let (_server, port) = served(&src, &[], &[]);
+        let _ = fastest_get(port, "/warm", 2);
+        for _ in 0..2 {
+            let a = support::send(port, "GET", "/big", &[], "");
+            assert_eq!((a.status, a.body.as_str()), (200, want.2.as_str()), "k = {}", k);
+        }
+        assert!(support::listening(port), "k = {}: the server stopped", k);
+    }
+}
+
+#[test]
+fn a_call_given_up_for_the_stack_and_then_otherwise_is_interpreted_once() {
+    // Given up for the stack in a 512 KB `parallel` child, then on a stack with room for the
+    // limit for an overflow at the bottom (`3 * p(n - 1)`), or for an int against a float
+    // (`9007199254740993 < x`): with no floor the interpreter took one level, the next was given
+    // up for the stack again and run on a new stack, a rerun and an mmap a level. `/par92`:
+    // quillo-A8 372 ms, main 155, the interpreter 4.4; two children of `p(5000)` 190 against 120;
+    // `q` 188 against 121. With a floor, about the interpreter's time (Q-945 review 6).
+    let src = "fn p(n) { if n == 0 { 1 } else { 3 * p(n - 1) } }\nfn q(n, x) { if n == 0 { 9007199254740993 < x } else { q(n - 1, x) } }\nroute GET /warm = str([p(3), p(3)]) + str(q(2, 1.5)) + str(q(2, 1.5))\nroute GET /par92 = str(parallel(() => p(9000) ?? \"E\", () => 1))\nroute GET /p2 = str(parallel(() => p(5000) ?? \"E\", () => p(5000) ?? \"E\"))\nroute GET /q2 = str(parallel(() => q(5000, 9007199254740992.0), () => q(5000, 9007199254740992.0)))\n";
+    let paths = ["/par92", "/p2", "/q2"];
+    let times = |env: &[(&str, &str)]| {
+        let (_server, port) = served(src, &[], env);
+        let _ = fastest_get(port, "/warm", 2);
+        paths.map(|p| fastest_get(port, p, 3))
+    };
+    let (fast, slow) = (times(&[]), times(&[("QUILLO_JIT", "0")]));
+    for ((path, f), s) in paths.iter().zip(&fast).zip(&slow) {
+        assert_eq!((f.1, &f.2), (s.1, &s.2), "{}", path);
+        assert!(f.0 < s.0 * slack() + Duration::from_millis(10), "{}: compiled {:?}, interpreted {:?}", path, f.0, s.0);
+    }
+    assert_eq!([fast[0].2.as_str(), fast[1].2.as_str(), fast[2].2.as_str()], ["[\"E\", 1]", "[\"E\", \"E\"]", "[false, false]"]);
+}
+
+#[test]
+fn a_call_too_deep_through_each_way_in_ends_its_floor() {
+    // `call_closure` (a route's or a rendered function's way in) and `call1` (`map`'s) also take
+    // a too-deep call's floor away as it ends: `fib`, called after it under a `map` over texts,
+    // which reaches `jit::call` only through `fib` itself, is compiled, as fast as before it
+    // (Q-945 reviews 5 and 6).
+    let defs = "fn d(n) { if n <= 0 { 0 } else { d(n - 1) + 1 } }\nfn fib(n) { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }\nlet texts = [\"a\", \"b\", \"c\"]\nlet by_text = (s) => fib(22)\nlet deep = [3, 3, 100000]\n";
+    let mut it = Interp::new(".");
+    it.load_source(defs, "case.qwe").unwrap();
+    let get = |it: &Interp, name: &str| quillo::value::lookup(&it.globals, name).unwrap();
+    let (map, texts, by_text) = (get(&it, "map"), get(&it, "texts"), get(&it, "by_text"));
+    let timed = |it: &mut Interp| {
+        let t = Instant::now();
+        let v = it.call(&map, vec![texts.clone(), by_text.clone()], 0).ok().map(|v| v.display());
+        assert_eq!(v.as_deref(), Some("[17711, 17711, 17711]"));
+        t.elapsed()
+    };
+    let _ = (timed(&mut it), timed(&mut it));
+    let before = timed(&mut it).min(timed(&mut it));
+    // Through `call_closure`: `d(100000)`, after two calls that compile it.
+    let Some(quillo::value::Value::Func(d)) = quillo::value::lookup(&it.globals, "d") else { panic!() };
+    for n in [3, 3] {
+        assert_eq!(it.call_closure(&d, vec![Some(quillo::value::Value::Int(n))], 0).ok().map(|v| v.display()).as_deref(), Some("3"));
+    }
+    assert!(it.call_closure(&d, vec![Some(quillo::value::Value::Int(100000))], 0).is_err());
+    let after_closure = timed(&mut it).min(timed(&mut it));
+    // Through `call1`: `map(deep, d)`, its third call too deep, its error passed on.
+    assert!(it.call(&map, vec![get(&it, "deep"), get(&it, "d")], 0).is_err());
+    let after_map = timed(&mut it).min(timed(&mut it));
+    let kept = |after: Duration| after < before * 3 + Duration::from_millis(20);
+    assert!(kept(after_closure) && kept(after_map), "before {:?}, after call_closure {:?}, after call1 {:?}", before, after_closure, after_map);
+}

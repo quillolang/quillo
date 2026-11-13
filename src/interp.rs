@@ -4310,18 +4310,17 @@ impl Interp {
         if self.fuel != u64::MAX {
             self.burn(line)?;
         }
-        // Numbers in, a number out: in machine code once it is called again. Interpreted, a call
-        // whose machine code went too deep takes the floor it set away as it ends, by any way out
-        // (`jit::Floored`; FEEDBACK52.md, Q-945 review 5; branch feedback52).
+        // Numbers in, a number out: in machine code once it is called again. A call whose machine
+        // code went too deep is interpreted with the floor it set ending with it (`floored`;
+        // FEEDBACK52.md, Q-945 reviews 5 and 6; branch feedback52).
         #[cfg(feature = "jit")]
-        let _floored = if self.fuel == u64::MAX && self.depth < MAX_DEPTH && !crate::debug::on() && !crate::httpd::compute_limited() {
-            if let Some(r) = crate::jit::call(c, &args, self.depth) {
-                return in_file(r, &c.def.file);
+        if self.fuel == u64::MAX && self.depth < MAX_DEPTH && !crate::debug::on() && !crate::httpd::compute_limited() {
+            match crate::jit::call(c, &args, self.depth) {
+                crate::jit::Ran::Done(r) => return in_file(r, &c.def.file),
+                crate::jit::Ran::Floored => return self.floored(c, args, line),
+                crate::jit::Ran::Interpret => {}
             }
-            crate::jit::Floored::after(self.depth)
-        } else {
-            None
-        };
+        }
         // `(x) => x.name`, as given to `sort_by`, `map` and `filter`: the
         // field, without a scope for the call.
         if let (Some((field, at)), [Some(_)], u64::MAX) = (projection(&c.def), args.as_slice(), self.fuel) {
@@ -4339,14 +4338,13 @@ impl Interp {
             self.burn(line)?;
         }
         #[cfg(feature = "jit")]
-        let _floored = if self.fuel == u64::MAX && self.depth < MAX_DEPTH && !crate::debug::on() && !crate::httpd::compute_limited() {
-            if let Some(r) = crate::jit::call(c, &args, self.depth) {
-                return in_file(r, &c.def.file);
+        if self.fuel == u64::MAX && self.depth < MAX_DEPTH && !crate::debug::on() && !crate::httpd::compute_limited() {
+            match crate::jit::call(c, &args, self.depth) {
+                crate::jit::Ran::Done(r) => return in_file(r, &c.def.file),
+                crate::jit::Ran::Floored => return self.floored_given(c, args, line),
+                crate::jit::Ran::Interpret => {}
             }
-            crate::jit::Floored::after(self.depth)
-        } else {
-            None
-        };
+        }
         if let (Some((field, at)), 1, u64::MAX) = (projection(&c.def), args.len(), self.fuel) {
             let v = args.into_iter().next().unwrap_or(Value::Nil);
             return in_file(self.get_field(v, field, &c.env, at), &c.def.file);
@@ -4382,16 +4380,44 @@ impl Interp {
         // A number for a number, as most of these functions are (FEEDBACK29.md; branch
         // feedback29-fixes).
         #[cfg(feature = "jit")]
-        let _floored = if matches!(x, Value::Int(_) | Value::Float(_) | Value::Bool(_)) && self.fuel == u64::MAX && self.depth < MAX_DEPTH && !crate::debug::on() && !crate::httpd::compute_limited() {
-            if let Some(r) = crate::jit::call(c, std::slice::from_ref(&x), self.depth) {
-                return in_file(r, &c.def.file);
+        if matches!(x, Value::Int(_) | Value::Float(_) | Value::Bool(_)) && self.fuel == u64::MAX && self.depth < MAX_DEPTH && !crate::debug::on() && !crate::httpd::compute_limited() {
+            match crate::jit::call(c, std::slice::from_ref(&x), self.depth) {
+                crate::jit::Ran::Done(r) => return in_file(r, &c.def.file),
+                crate::jit::Ran::Floored => return self.floored_one(c, x, line),
+                crate::jit::Ran::Interpret => {}
             }
-            crate::jit::Floored::after(self.depth)
-        } else {
-            None
-        };
+        }
         let c = c.clone();
         self.call_closure_with(&c, std::iter::once(Some(x)), 1, line)
+    }
+
+    /// `call_closure_with` for a call whose machine code went too deep and set the floor
+    /// (`jit::Ran::Floored`): the floor ends with it, on every way out. Out of the way, as a
+    /// guard kept on every interpreted call cost it 10 to 12 instructions (FEEDBACK52.md, Q-945
+    /// review 6; branch feedback52).
+    #[cfg(feature = "jit")]
+    #[cold]
+    #[inline(never)]
+    fn floored(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32) -> Result<Value, Ctrl> {
+        let _floor = crate::jit::Floored::new(self.depth);
+        let n = args.len();
+        // Its own `call_closure_with` (of an `IntoIter`): one also made by a call above stopped
+        // being inlined there, 11 instructions a call.
+        self.call_closure_with(c, args.into_iter(), n, line)
+    }
+
+    #[cfg(feature = "jit")]
+    #[cold]
+    #[inline(never)]
+    fn floored_given(&mut self, c: &Closure, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
+        self.floored(c, args.into_iter().map(Some).collect(), line)
+    }
+
+    #[cfg(feature = "jit")]
+    #[cold]
+    #[inline(never)]
+    fn floored_one(&mut self, c: &Closure, x: Value, line: u32) -> Result<Value, Ctrl> {
+        self.floored(c, vec![Some(x)], line)
     }
 
     fn call_closure_with(&mut self, c: &Closure, args: impl IntoIterator<Item = Option<Value>>, nargs: usize, line: u32) -> Result<Value, Ctrl> {
