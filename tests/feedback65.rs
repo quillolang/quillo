@@ -46,6 +46,7 @@ route GET /closing = stream((send) => {
     send("b")
 }, { headers: { connection: "Close" } })
 route GET /closing-whole = respond(200, "ab", { connection: "close" })
+route GET /big/:n(int) = repeat("x", n)
 "#;
 
 /// `IDLE` as these tests make it.
@@ -560,6 +561,82 @@ fn a_request_that_does_not_come_whole_still_gets_its_408_after_slow() {
     head.join().unwrap();
     body.join().unwrap();
 }
+
+// ---- Q-949: a request's last bytes, come while the answers ahead are made, are read ---------
+// Requests ahead whose answers pass 256 KiB wait in `pending`. The event saying the last bytes of
+// a request behind them had come arrived while they were answered, and was used up starting the
+// next of them without a read: that request waited unread for its 408, 30 s later, and an
+// Expect one for its `100 Continue`.
+
+/// `ahead`, then `last` but for its final two bytes, those sent `late` later: what answers each,
+/// a `100 Continue` among them for an Expect `last`, whose body then goes. A stream's body is
+/// counted in events, a long one in bytes.
+fn last_bytes_late(port: u16, ahead: &[&str], last: &str, late: u64) -> Vec<(u16, String)> {
+    let mut c = Conn::to(port);
+    let mut out: String = ahead.iter().map(|p| format!("GET {} HTTP/1.1\r\nHost: x\r\n\r\n", p)).collect();
+    out.push_str(&last[..last.len() - 2]);
+    c.send(&out);
+    std::thread::sleep(Duration::from_millis(late));
+    c.send("\r\n");
+    let mut got = next(&mut c, ahead.len() + 1);
+    if got.last().is_some_and(|a| a.0 == 100) {
+        c.send("abc");
+        got.extend(next(&mut c, 1));
+    }
+    got.into_iter()
+        .map(|(status, body)| match body {
+            b if b.starts_with("data: ") => (status, format!("{} events", b.matches("data: ").count())),
+            b if b.len() > 1000 => (status, format!("{} bytes", b.len())),
+            b => (status, b),
+        })
+        .collect()
+}
+
+/// Each of `cases`, `ahead` with its `last`, 1, 10 and 50 ms late, side by side: the answers
+/// `want` gives.
+fn read_behind(name: &str, cases: Vec<(Vec<&'static str>, &'static str, Vec<(u16, &'static str)>)>) {
+    let s = served(name, Some(IDLE_MS));
+    let port = s.port;
+    let mut runs = Vec::new();
+    for (ahead, last, want) in cases {
+        for late in [1, 10, 50] {
+            let (ahead, want) = (ahead.clone(), want.clone());
+            runs.push(std::thread::spawn(move || {
+                let got = last_bytes_late(port, &ahead, last, late);
+                let want: Vec<(u16, String)> = want.iter().map(|(s, b)| pair(*s, b)).collect();
+                assert_eq!(got, want, "Q-949: behind {:?}, the last bytes {} ms late", ahead, late);
+            }));
+        }
+    }
+    for r in runs {
+        r.join().unwrap();
+    }
+}
+
+#[test]
+fn a_requests_last_bytes_come_while_answers_ahead_wait_in_pending_are_read() {
+    read_behind(
+        "pending-read",
+        vec![
+            (vec!["/stream/2/15", "/big/300000", "/stream/2/15"], AFTER, vec![(200, "2 events"), (200, "300000 bytes"), (200, "2 events"), (200, "after")]),
+            (vec!["/slow/40", "/big/300000", "/"], EXPECTING, vec![(200, "slow"), (200, "300000 bytes"), (200, "home"), (100, ""), (200, "abc")]),
+        ],
+    );
+}
+
+// What must keep working: the same with nothing in `pending`.
+#[test]
+fn a_requests_last_bytes_come_while_answers_ahead_are_made_are_read() {
+    read_behind(
+        "no-pending-read",
+        vec![
+            (vec!["/stream/2/15", "/", "/stream/2/15"], AFTER, vec![(200, "2 events"), (200, "home"), (200, "2 events"), (200, "after")]),
+            (vec!["/slow/40", "/", "/"], EXPECTING, vec![(200, "slow"), (200, "home"), (200, "home"), (100, ""), (200, "abc")]),
+        ],
+    );
+}
+
+const AFTER: &str = "GET /after HTTP/1.1\r\nHost: x\r\n\r\n";
 
 // ---- Q-948: a pipelined request's `100 Continue` comes after the answers ahead of it ---------
 // A request with `Expect: 100-continue`, its head read with a request before it, had its

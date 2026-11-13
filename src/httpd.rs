@@ -648,8 +648,9 @@ struct Conn {
     /// Output has waited to be written since then, the client taking none
     /// of it (`None`: nothing waits). See `sweep`.
     stalled: Option<Instant>,
-    /// Reading stopped at `input_cap` with more perhaps waiting: read
-    /// again without waiting for a new event.
+    /// Reading stopped at `input_cap`, or was passed over for the requests
+    /// in `pending`, with more perhaps waiting: read again without waiting
+    /// for a new event.
     full: bool,
     /// A chunked body being received: what is decoded so far (see `dechunk`).
     chunked: Option<Dechunk>,
@@ -1411,6 +1412,10 @@ impl Loop {
         }
         if !c.pending.is_empty() {
             let items = std::mem::take(&mut c.pending);
+            // What arrived meanwhile is read once they are answered: the event that said so is
+            // used up here, and the last bytes of a request behind them waited unread for its
+            // 408 (FEEDBACK65.md, Q-949; branch feedback65).
+            c.full = true;
             return self.start(i, c, items);
         }
         let mut ended = false;
