@@ -492,7 +492,9 @@ Most expressions read as they would in JavaScript. The differences:
   said when every way leaves: in `let x = if c {
   return 1 } else { return 2 }`, `x` is never given a value (to give it, write `1`; to
   leave, write the `if` as a statement). A guard is not said: `let r = if b == 0 { return
-  0 } else { a / b }`. The second is code after a `return`, a `reply`, or an `if` or
+  0 } else { a / b }`, nor an `if` or `match` in one of its ways whose every way leaves
+  (`else { if a > 0 { return 1 } else { return -1 } }`): only the outermost decides. The
+  second is code after a `return`, a `reply`, or an `if` or
   `match` whose every way leaves: it never runs. The third is a function that returns a
   value on one path and gives null at its end (see [Variables, functions,
   views](#variables-functions-views)).

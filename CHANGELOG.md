@@ -155,8 +155,9 @@ Added, as warnings of `quillo check` (no program runs differently):
   makes no list. In an `if` or a `match` it is said when every way leaves: ``every way of
   this `if` leaves `pick`, so the value it is used for is never given: to give it, write
   `1`; to leave, write the `if` as a statement``. A guard is not said:
-  `let r = if b == 0 { return 0 } else { a / b }`, `?? return null`, `"a" => return 1`
-  (Q-678).
+  `let r = if b == 0 { return 0 } else { a / b }`, `?? return null`, `"a" => return 1`,
+  nor an `if` or `match` in a way of one whose every way leaves: only the outermost
+  decides (Q-678).
 - **A function that returns a value on one path and gives null at its end**:
   `` `sign` returns a value on line 3 but gives null when it reaches its end: end it with
   a value too, or `null` if null is meant ``. So is a last `if` with no `else` whose way
@@ -196,6 +197,9 @@ Fixed, in compiled numbers:
   the machine code was run again at each level (1.35 s where the interpreter takes
   0.06 s): the calls below the one that gave up run in the interpreter now (0.02 s).
 - A function calling one already compiled on its own was not compiled (0.8.1 too).
+- A function compiled where `range` is the builtin ran the same code where `range` is
+  something else, looping over the builtin's numbers: it is compiled only while `range` is
+  the builtin.
 
 ## 0.8.1 (2026-11-09)
 
