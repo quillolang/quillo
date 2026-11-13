@@ -5,6 +5,8 @@
 //! functions that must not be compiled (a `return` of no value or of a text, an int on one path
 //! and a float on another) are not.
 
+mod support;
+
 use quillo::Interp;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1016,7 +1018,7 @@ fn a_chain_reading_only_the_first_guess_is_compiled_and_one_past_the_budget_is_n
     let calls = [("f1(2)", "bool true"), ("f2(3)", "bool true")];
     // f1, with all the others, and f2, with those after it.
     check(&chain_back(24, "true", true, false), &calls, 2);
-    // Each reading its caller's guess: past the budget (8,192 guesses and 64 for each function
+    // Each reading its caller's guess: past the budget (16,384 guesses and 64 for each function
     // planned), refused, the interpreter's.
     check(&chain_back(24, "true", false, true), &calls, 0);
 }
@@ -1082,11 +1084,12 @@ fn range_named_by_the_function_itself_is_not_the_builtin() {
 fn a_chain_each_calling_its_caller_is_compiled_up_to_the_budget() {
     // 5 bool functions each calling its caller and the next (363 guesses) and 10 float ones
     // (2,046), which main compiles, were refused by quillo-A5's budget of 64 guesses a function.
-    // The limit and one either side: 7 bools (3,279) and 12 floats (8,190) compiled, f1 with the
-    // rest and f2 with those after it; 8 bools (9,840) and 13 floats (16,382) past 8,192 and 64 a
-    // function, refused.
+    // The limit and one either side: 8 bools (9,840) and 13 floats (16,382) compiled, as on main,
+    // f1 with the rest and f2 with those after it; 9 bools (29,523) and 14 floats (32,766) past
+    // 16,384 and 64 a function, refused. Moved up one each with the budget's base (budget base
+    // raised: 8,192 refused 8 bools and 13 floats, which main compiles; Q-945 review 5).
     let calls = |end: &str| [("f1(2)", if end == "true" { "bool true" } else { "float 0.5" }), ("f2(3)", if end == "true" { "bool true" } else { "float 0.5" })];
-    for (n, end, compiled) in [(5, "true", 2), (7, "true", 2), (8, "true", 0), (10, "0.5", 2), (12, "0.5", 2), (13, "0.5", 0)] {
+    for (n, end, compiled) in [(5, "true", 2), (8, "true", 2), (9, "true", 0), (10, "0.5", 2), (13, "0.5", 2), (14, "0.5", 0)] {
         check(&chain_back(n, end, false, true), &calls(end), compiled);
     }
 }
@@ -1224,4 +1227,159 @@ fn a_thread_that_ends_under_a_floor_leaves_the_others_compiled() {
     check(defs, &[("r(5)", "int 0"), ("sq(3)", "int 9"), ("r(100000) ?? \"E\"", "str E"), ("sq(4)", "int 16")], 2);
     let defs = defs.to_string();
     std::thread::spawn(move || check(&defs, &[("sq(5)", "int 25"), ("r(7)", "int 0")], 2)).join().unwrap();
+}
+
+// ---- review 5 of Q-945 (FEEDBACK52.md, Q-945 review 5; branch feedback52) -------------------
+
+/// A recursion that goes too deep, a caller that passes its error on, both interpreted after, and
+/// what `map` and a component call: `fib`, compiled.
+const AFTER_DEEP: &str = "fn d(n) { if n <= 0 { 0 } else { d(n - 1) + 1 } }
+fn fib(n) { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }
+fn outer(k) {
+    let label = \"k\" + str(k)
+    d(k) + len(label)
+}
+component Row(n) {
+    <li>{fib(n)}</li>
+}
+";
+
+#[test]
+fn the_floor_ends_with_the_call_that_went_too_deep() {
+    // `map` calls its function through `jit::call` only for a number, and a component never
+    // does: after `d(100000) ?? "E"` the floor stayed, and `fib`, called under them, was
+    // interpreted (quillo-A7: the interpreter's time, 2,596 M instructions against 225 M). The
+    // floor ends with the call that set it, by its error; and by one passed on through `outer`.
+    for deep in ["d(100000) ?? \"E\"", "outer(100000) ?? \"E\""] {
+        let src = format!("{}print(d(10))\nprint({})\nlet xs = map([\"a\", \"b\", \"c\", \"d\", \"e\", \"f\"], (s) => fib(24))\nprint(xs[5])\nprint(len(str(<ul><Row n={{24}}/><Row n={{24}}/></ul>)))\n", AFTER_DEEP, deep);
+        let want = "10\nE\n46368\n255";
+        assert_eq!(both_ways(&src), want, "{}", src);
+        let (fast, out) = fastest(&src, &[], 3);
+        let (slow, _) = fastest(&src, &[("QUILLO_JIT", "0")], 2);
+        assert_eq!(out, want);
+        assert!(fast * 4 < slow, "compiled {:?}, interpreted {:?}\n{}", fast, slow, src);
+    }
+}
+
+/// `src` served by the quillo these tests run (QUILLO_TEST_BIN's, or this build's), with `extra`
+/// options and `env`: the server, stopped when dropped, and its port.
+fn served(src: &str, extra: &[&str], env: &[(&str, &str)]) -> (support::Guard, u16) {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let d = support::temp_dir(&format!("feedback52-jit-srv-{}", N.fetch_add(1, Ordering::Relaxed)));
+    std::fs::write(d.join("main.qwe"), src).unwrap();
+    for _ in 0..5 {
+        let port = support::free_port();
+        let child = Command::new(quillo())
+            .arg("run")
+            .arg(d.join("main.qwe"))
+            .args(["--port", &port.to_string()])
+            .args(extra)
+            .envs(env.iter().copied())
+            .env("QUILLO_SECRET", "a signing secret for these tests, long enough")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut server = support::Guard::new(child);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while server.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            if support::listening(port) {
+                return (server, port);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Another test's server took the port first: again, on another.
+    }
+    panic!("the server did not start\n{}", src);
+}
+
+/// The fastest of `n` GETs of `path`, with the status and body of the last.
+fn fastest_get(port: u16, path: &str, n: usize) -> (Duration, u16, String) {
+    let mut best = Duration::MAX;
+    let mut last = (0, String::new());
+    for _ in 0..n {
+        // A server just started, on a loaded machine, can refuse a first connection.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !support::listening(port) {
+            assert!(Instant::now() < deadline, "the server on {} stopped answering", port);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let t = Instant::now();
+        let a = support::send(port, "GET", path, &[], "");
+        best = best.min(t.elapsed());
+        last = (a.status, a.body);
+    }
+    (best, last.0, last.1)
+}
+
+#[test]
+fn a_route_after_one_whose_call_went_too_deep_is_compiled_again() {
+    // `/deep` takes `d(100000)`'s error with `??` and answers. Its second time, `d` compiled
+    // (the first call is interpreted), the floor stayed on its thread on quillo-A7, and `/map` (a
+    // function given to `map` for each row) and `/page` (a component) were interpreted there, 19
+    // and 17 ms against main's 1 ms. One worker, so that each request is on that thread.
+    let src = format!("{}let rows = [{{ n: 22 }}, {{ n: 22 }}, {{ n: 22 }}, {{ n: 22 }}]\nroute GET /deep = {{ \"v\": d(100000) ?? -1 }}\nroute GET /map = map(rows, (r) => fib(r.n))\nroute GET /page = <html><body><ul><Row n={{22}}/><Row n={{22}}/><Row n={{22}}/></ul></body></html>\n", AFTER_DEEP);
+    let (_server, port) = served(&src, &["--workers", "1"], &[]);
+    let (map0, ..) = fastest_get(port, "/map", 3);
+    let (page0, ..) = fastest_get(port, "/page", 3);
+    let (_, status, body) = fastest_get(port, "/deep", 2);
+    assert_eq!((status, body.as_str()), (200, "{\"v\":-1}"));
+    let (map1, s1, b1) = fastest_get(port, "/map", 3);
+    let (page1, s2, b2) = fastest_get(port, "/page", 3);
+    assert_eq!((s1, b1.as_str(), s2), (200, "[17711,17711,17711,17711]", 200));
+    assert!(b2.contains("<li>17711</li>"), "{}", b2);
+    let kept = |before: Duration, after: Duration| after < before * 3 + Duration::from_millis(10);
+    assert!(kept(map0, map1) && kept(page0, page1), "/map {:?} then {:?}, /page {:?} then {:?}", map0, map1, page0, page1);
+    // Under `--max-compute` the routes' calls are the interpreter's (no machine code is tried for
+    // a request that may be stopped), a function with a declared result rendered in markup too,
+    // with the same answers.
+    let src = format!("{}fn Cell(n) -> html = <b>{{fib(n)}}</b>\nroute GET /typed = <html><body><Cell n={{22}}/></body></html>\n", src);
+    let (_server, port) = served(&src, &["--workers", "1", "--max-compute", "10s"], &[]);
+    for path in ["/deep", "/deep", "/map"] {
+        let a = support::send(port, "GET", path, &[], "");
+        assert_eq!((a.status, a.body.as_str()), (200, if path == "/map" { "[17711,17711,17711,17711]" } else { "{\"v\":-1}" }), "{}", path);
+    }
+    let a = support::send(port, "GET", "/typed", &[], "");
+    assert!(a.status == 200 && a.body.contains("<b>17711</b>"), "{} {}", a.status, a.body);
+}
+
+#[test]
+fn a_call_given_up_for_the_stack_left_keeps_the_calls_under_it_compiled() {
+    // A request's `parallel` children have 512 KB stacks: `r(2000)` gave up there for the stack
+    // left, not the call limit, and was taken as too deep, so quillo-A7 interpreted it whole,
+    // 316-332 ms against main's 6-7 ms. It runs again on a stack with room for the limit, and
+    // ends in machine code. A runaway `fact(-1)` there gives up again at the limit and has its
+    // floor: left to the interpreter with none, as main, it went down in machine code at each
+    // level, 120 ms against the interpreter's 10-23 ms.
+    let src = "fn w(n) { if n < 2 { n } else { w(n - 1) + w(n - 2) } }\nfn r(k) { if k <= 0 { 0 } else { r(k - 1) + w(12) } }\nfn fact(n) { if n == 0 { 1 } else { n * fact(n - 1) } }\nroute GET /warm = str(fact(5) + fact(5))\nroute GET /par = str(parallel(() => r(2000), () => r(2000)))\nroute GET /pfact = str(parallel(() => fact(-1) ?? \"E\", () => fact(-1) ?? \"E\"))\n";
+    let times = |env: &[(&str, &str)]| {
+        let (_server, port) = served(src, &[], env);
+        let _ = fastest_get(port, "/warm", 2);
+        (fastest_get(port, "/par", 3), fastest_get(port, "/pfact", 3))
+    };
+    let ((par, s1, b1), (pfact, s2, b2)) = times(&[]);
+    let ((par0, s3, b3), (pfact0, s4, b4)) = times(&[("QUILLO_JIT", "0")]);
+    for (s, b, want) in [(s1, &b1, "[288000, 288000]"), (s3, &b3, "[288000, 288000]"), (s2, &b2, "[\"E\", \"E\"]"), (s4, &b4, "[\"E\", \"E\"]")] {
+        assert_eq!((s, b.as_str()), (200, want));
+    }
+    assert!(par * 3 < par0, "/par compiled {:?}, interpreted {:?}", par, par0);
+    assert!(pfact < pfact0 * slack() + Duration::from_millis(10), "/pfact compiled {:?}, interpreted {:?}", pfact, pfact0);
+}
+
+#[test]
+fn a_floor_left_behind_ends_at_the_next_call_no_deeper() {
+    // No program leaves a floor behind now (the call that set it takes it away as it ends), so
+    // `jit::leave_floor_for_tests` does: the next call at its depth, the first here, ends it, and
+    // the calls after it are compiled as before. A thread that ends with one takes itself out of
+    // the count every call reads first.
+    let defs = "fn sq(x) = x * x\nfn twice(x) = sq(x) + sq(x)";
+    quillo::jit::leave_floor_for_tests(0);
+    check(defs, &[("twice(3)", "int 18"), ("sq(4)", "int 16")], 2);
+    std::thread::spawn(|| quillo::jit::leave_floor_for_tests(7)).join().unwrap();
+    check(defs, &[("twice(5)", "int 50")], 2);
+    // A call given its default, past the limit, is the interpreter's: no machine code is tried
+    // there.
+    let src = "fn rd(d, x = 1) {\n    if d <= 0 {\n        return 0\n    }\n    return rd(d - 1) + x\n}\nprint(rd(5))\nprint(rd(5))\nprint(rd(100000) ?? \"E\")\n";
+    assert_eq!(both_ways(src), "5\n5\nE");
 }

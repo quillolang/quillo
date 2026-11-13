@@ -104,20 +104,25 @@ thread_local! {
     static FLOOR: Floor = const { Floor(std::cell::Cell::new(NO_FLOOR)) };
 }
 
-/// How many threads have a `FLOOR`, and `OFF_OR_UNREAD`: while it is 0, a call reads nothing
+/// How many threads have a `FLOOR`, and `UNREAD` and `OFF`: while it is 0, a call reads nothing
 /// more than this. A recursion past the call limit gave up in machine code at the limit, the
 /// interpreter went on with that call, and each call under it went back into machine code and
 /// down to the limit again: 5·10⁷ calls where the interpreter makes 10⁴, up to 47 times the
 /// interpreter's time (`fn fact(n) { if n == 0 { return 1 }; return n * fact(n - 1) }` and
 /// `fact(-1)`), where main interpreted a function with `return` (FEEDBACK52.md, Q-945; branch
 /// feedback52).
-static FLOORS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(OFF_OR_UNREAD);
+static FLOORS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(UNREAD);
 
-/// In `FLOORS` until the first call has read `QUILLO_JIT` (`enabled`), and for good when it is
-/// `0`: the call reads it in `under_floor`, so that `FLOORS` is the only thing it reads first,
-/// as before Q-945 `enabled` was (the floor's own test cost 4 instructions a call, 0.8% of a
-/// function mapped over a list).
-const OFF_OR_UNREAD: usize = 1 << (usize::BITS - 1);
+/// In `FLOORS` until the first call has read `QUILLO_JIT` (`enabled`), in `under_floor`, so that
+/// `FLOORS` is the only thing a call reads first, as before Q-945 `enabled` was (the floor's own
+/// test cost 4 instructions a call, 0.8% of a function mapped over a list).
+const UNREAD: usize = 1 << (usize::BITS - 1);
+/// In `FLOORS` for good when `QUILLO_JIT` is `0`: a call is the interpreter's at once. Read in
+/// `under_floor`, as `UNREAD` was, it cost each call of an interpreted program 34 instructions,
+/// 1.2% of 5 million calls (Q-945 review 5).
+const OFF: usize = 1 << (usize::BITS - 2);
+/// The count of threads with a floor, in `FLOORS`.
+const COUNT: usize = !(UNREAD | OFF);
 
 const NO_FLOOR: usize = usize::MAX;
 
@@ -133,17 +138,22 @@ impl Drop for Floor {
 }
 
 /// Whether a call at `depth` is under this thread's floor, and so the interpreter's; a call no
-/// deeper takes the floor away. Every call of a Quillo function comes here first (from
-/// `call_closure`, `call_closure_given` and `call1`), so the first one back at the level of the
-/// call that went too deep, or above it, ends it: the next call of a loop, or a helper.
+/// deeper takes the floor away. That is only a backup: the floor ends with the call that went too
+/// deep (`Floored`). `call1` comes here only for a number, and a component never does, so after
+/// `d(100000) ?? "E"`, `map(["a", ...], (s) => fib(27))` stayed interpreted, 479 ms against main's
+/// 8 ms, and in a server every such route until one called a function itself (FEEDBACK52.md,
+/// Q-945 review 5; branch feedback52).
 #[cold]
 #[inline(never)]
 fn under_floor(depth: usize) -> bool {
-    if FLOORS.load(Relaxed) & OFF_OR_UNREAD != 0 {
+    if FLOORS.load(Relaxed) & UNREAD != 0 {
         if !enabled() {
+            // OFF before UNREAD goes: `FLOORS` is never 0 with machine code off.
+            FLOORS.fetch_or(OFF, Relaxed);
+            FLOORS.fetch_and(!UNREAD, Relaxed);
             return true;
         }
-        FLOORS.fetch_and(!OFF_OR_UNREAD, Relaxed);
+        FLOORS.fetch_and(!UNREAD, Relaxed);
     }
     FLOOR
         .try_with(|f| {
@@ -161,6 +171,18 @@ fn under_floor(depth: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// For tests: this thread's floor at `depth`, as if a call there had gone too deep and its end had
+/// not taken the floor away (`Floored`), which no program does now: how a test reaches the backup,
+/// `under_floor`'s clearing, and a thread's end with a floor (`Floor`); read by no call
+/// (FEEDBACK52.md, Q-945 review 5; branch feedback52).
+pub fn leave_floor_for_tests(depth: usize) {
+    FLOOR.with(|f| {
+        if f.0.replace(depth) == NO_FLOOR {
+            FLOORS.fetch_add(1, Relaxed);
+        }
+    });
+}
+
 /// The machine code of a call at `depth` gave up (`run`). Too deep, when no frame gave the depth
 /// back and the one that could go no deeper left it at `max` (one that gave up otherwise at
 /// exactly `max` is taken as too deep too, which only costs time): the floor is that depth,
@@ -170,9 +192,21 @@ fn under_floor(depth: usize) -> bool {
 /// reviews 2 and 3).
 #[cold]
 #[inline(never)]
-fn gave_up(ctx: &Ctx, depth: usize) {
+fn gave_up(ctx: &Ctx, entry: Entry, ret: T, raw: &[u64; 16], depth: usize) -> Option<Result<Value, Ctrl>> {
     if ctx.depth != ctx.max {
-        return;
+        return None;
+    }
+    // The stack left, not the call limit, made `max` (`parallel`'s 512 KB children, or under a
+    // deep interpreted recursion): taken as too deep, `r(2000)` in `parallel` was interpreted
+    // whole, 268-332 ms against main's 5-7 ms; and left to the interpreter with no floor, as
+    // main, a runaway `fact(-1)` there went down in machine code again at each level, 120 ms
+    // against the interpreter's 10-23 ms (Q-945 review 5). So the call runs once more, on a stack
+    // with room for the call limit: it ends there, or gives up at the limit, and has its floor.
+    // Only where the stack left is known, as it is on the new stack, so that this runs once.
+    let limit = MAX_DEPTH.saturating_sub(depth);
+    if (ctx.max as usize) < limit && crate::stack::remaining().is_some() {
+        let need = limit * 512 + crate::stack::MARGIN;
+        return crate::stack::maybe_grow(need, need + (256 << 10), || run(entry, ret, raw, depth));
     }
     LAST.set(None);
     // A call that reached machine code was at the floor or above it, and took it away
@@ -182,6 +216,41 @@ fn gave_up(ctx: &Ctx, depth: usize) {
             FLOORS.fetch_add(1, Relaxed);
         }
     });
+    None
+}
+
+/// The call at `depth` the interpreter runs after machine code gave it back (`call` was None),
+/// while it lasts: when that call went too deep and set the floor, the floor ends with it, on
+/// every way out (its value, an error passed on, `?`), not at the next call `call` sees
+/// (`under_floor`), which may be long after or never (Q-945 review 5). Only when a thread has a
+/// floor (`FLOORS`): one load for each call the interpreter runs.
+pub struct Floored(usize);
+
+impl Floored {
+    #[inline(always)]
+    pub fn after(depth: usize) -> Option<Floored> {
+        if FLOORS.load(Relaxed) & COUNT == 0 {
+            return None;
+        }
+        floored(depth)
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn floored(depth: usize) -> Option<Floored> {
+    FLOOR.try_with(|f| f.0.get() == depth).unwrap_or(false).then_some(Floored(depth))
+}
+
+impl Drop for Floored {
+    fn drop(&mut self) {
+        let _ = FLOOR.try_with(|f| {
+            if f.0.get() == self.0 {
+                f.0.set(NO_FLOOR);
+                FLOORS.fetch_sub(1, Relaxed);
+            }
+        });
+    }
 }
 
 /// The function called last, if what it calls cannot change under it.
@@ -262,7 +331,8 @@ pub fn enabled() -> bool {
 pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Option<Result<Value, Ctrl>> {
     // Before anything else, for every function, those never compiled too (`FLOORS`); and
     // whether machine code is made at all.
-    if FLOORS.load(Relaxed) != 0 && under_floor(depth) {
+    let gate = FLOORS.load(Relaxed);
+    if gate != 0 && (gate & OFF != 0 || under_floor(depth)) {
         return None;
     }
     let def = &c.def;
@@ -344,8 +414,7 @@ fn run(entry: Entry, ret: T, raw: &[u64; 16], depth: usize) -> Option<Result<Val
     // `raw` in order; `ctx` outlives the call.
     let r = unsafe { entry(raw.as_ptr(), &mut ctx) };
     if ctx.bail != 0 {
-        gave_up(&ctx, depth);
-        return None;
+        return gave_up(&ctx, entry, ret, raw, depth);
     }
     Some(Ok(match ret {
         T::I => Value::Int(r as i64),
@@ -465,10 +534,11 @@ const PLAN_STEPS: usize = 64;
 /// calling its caller and the next takes 2^(n+1) - 2 guesses with float results and
 /// (3^(n+1) - 3) / 2 with bools, all compiled on main however long that took; with 64 a function
 /// alone, 5 bools (363) and 10 floats (2,046) were refused and interpreted (FEEDBACK52.md, Q-677
-/// review 4; branch feedback52). With this, up to 7 bools (3,279) and 12 floats (8,190) are
-/// compiled, and a chain that meets it is refused after about 4 ms of planning at 24 functions
-/// and 6 ms at 40 (half a microsecond a guess).
-const PLAN_BASE: usize = 8192;
+/// review 4; branch feedback52). With this, up to 8 bools (9,840) and 13 floats (16,382) are
+/// compiled, as on main (8,192 refused both: Q-945 review 5), and a chain that meets it is
+/// refused after about 8 ms of planning at 24 functions, 11 ms at 40 and 17 ms at 100 (half a
+/// microsecond a guess, more in a longer chain).
+const PLAN_BASE: usize = 16384;
 
 /// Adds the places `more` to `to`, both in order.
 fn stand_on(to: &mut Vec<usize>, more: &[usize]) {
