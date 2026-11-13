@@ -193,14 +193,17 @@ Fixed, in compiled numbers:
 - After a compile refused part way, the next compile stopped the process ("anonymous
   symbol must be defined locally"): two functions calling each other and a helper compiled
   before them were enough (0.8.1 too).
-- A recursion past the 10,000-call limit took up to 30 times the interpreter's time, as
+- A recursion past the 10,000-call limit took up to 80 times the interpreter's time, as
   the machine code was run again at each level (1.35 s where the interpreter takes
-  0.06 s): the calls below the one that gave up run in the interpreter now (0.02 s).
+  0.06 s; with 1,000 calls of itself a level, 114 s): the calls below the one that gave
+  up run in the interpreter now, in about its time (0.93 s), a runaway recursion in a
+  function with `return` such as `fact(-1)` too (Q-945).
 - A function calling one already compiled on its own was not compiled (0.8.1 too).
 - Compiled code looped over the builtin `range` where `range` was something else: a
   parameter or a variable named `range` (`fn g(range, n)`), or a function compiled in one
   scope and run in another where `range` is shadowed. `range` is now read from the
-  function's scope, and a `let` that makes it something else is followed.
+  function's scope when it is compiled. A `let` that makes `range` something else after
+  that is not followed yet (Q-944, as in 0.8.1).
 
 ## 0.8.1 (2026-11-09)
 

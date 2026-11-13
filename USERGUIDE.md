@@ -8751,7 +8751,7 @@ loop, on doubles).
   machine code gives up and the call is run again by the interpreter, which fails as
   always (the function changed nothing, so running it twice is running it once). A
   recursion that goes past the limit gives up once: the calls below the one that gave up
-  run in the interpreter, so it fails in no more time than the interpreter takes.
+  run in the interpreter, so it fails in about the interpreter's time.
 - What it does not take runs in the interpreter as before: strings, lists, maps,
   decimals, builtins, globals that are not functions, functions inside functions, a variable that
   changes type, a function that gives an int on one path and a float on another (`return
