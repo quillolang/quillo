@@ -54,17 +54,22 @@ fn diags(src: &str) -> Vec<String> {
 fn said(src: &str) -> Vec<String> {
     diags(src)
         .into_iter()
-        .filter(|d| ["this `return` leaves", "returns a value on line", "gives null when this `if`", "never runs: "].iter().any(|m| d.contains(m)))
+        .filter(|d| ["this `return` leaves", "every way of this `", "returns a value on line", "gives null when this `if`", "never runs: "].iter().any(|m| d.contains(m)))
         .collect()
 }
 
-const IF: &str = "an `if` gives its last expression";
+/// What Q-678 says of an `if` or a `match` each of whose ways leaves (review of 1a1b3ae, M1).
+fn every(line: u32, what: &str, f: &str, give: &str) -> String {
+    format!("{line} warning: every way of this `{what}` leaves {f}, so the value it is used for is never given: to give it, {give}; to leave, write the `{what}` as a statement")
+}
 
 // ---- Q-678: `return` in a block whose value is used ------------------------------------------
 
 #[test]
 fn a_return_where_the_value_of_a_for_an_if_or_a_match_is_kept_is_said() {
-    // The report's three, as P1 has them.
+    // The report's three, as P1 has them. `label` and `kind` have the shape of a guard, one way
+    // leaving and another giving a value, and are not said since the review of 1a1b3ae (M1):
+    // `label2` and `kind2`, each of whose ways leaves, are.
     let src = r#"fn doubled_for(xs) {
     let ys = for x in xs => { return x * 2 }
     return ys
@@ -80,14 +85,25 @@ fn kind(x) {
     }
     return `kind ${k}`
 }
-print([doubled_for([1, 2, 3]), label(1), kind(0)])
+fn label2(n) {
+    let l = if n == 1 { return "one" } else { return "many" }
+    return `${n} ${l}`
+}
+fn kind2(x) {
+    let k = match x {
+        0 => { return "zero" }
+        _ => { return "other" }
+    }
+    return `kind ${k}`
+}
+print([doubled_for([1, 2, 3]), label(1), kind(0), label2(1), kind2(0)])
 "#;
     assert_eq!(
         said(src),
         [
-            "2 warning: this `return` leaves `doubled_for` in the first round, so the `for` never makes its list: a `for` gives what its body gives each round, so write the value without `return`",
-            "6 warning: this `return` leaves `label`, not only the `if`: an `if` gives its last expression, so write `\"one\"`",
-            "11 warning: this `return` leaves `kind`, not only the `match`: an arm gives its last expression, so write `\"zero\"`",
+            "2 warning: this `return` leaves `doubled_for` in the first round, so the `for` never makes its list: a `for` gives what its body gives each round, so write the value without `return`".to_string(),
+            every(17, "if", "`label2`", "write `\"one\"`"),
+            every(22, "match", "`kind2`", "write `\"zero\"`"),
         ]
     );
 }
@@ -95,11 +111,11 @@ print([doubled_for([1, 2, 3]), label(1), kind(0)])
 #[test]
 fn a_return_in_an_argument_an_operand_or_a_block_kept_is_said() {
     let src = r#"fn arg(c) {
-    print(if c { return 1 } else { 2 })
+    print(if c { return 1 } else { return 2 })
     3
 }
 fn operand(c) {
-    let n = 1 + (if c { return 1 } else { 2 })
+    let n = 1 + (if c { return 1 } else { return 2 })
     n
 }
 fn block() {
@@ -120,26 +136,26 @@ fn no_value(c) {
     l
 }
 fn grüße(c) {
-    let l = if c { return "ünï" } else { "ß" }
+    let l = if c { return "ünï" } else { return "ß" }
     l
 }
 component Box(c) {
-    <div>{if c { return <p>a</p> } else { <p>b</p> }}</div>
+    <div>{if c { return <p>a</p> } else { return <p>b</p> }}</div>
 }
 "#;
     assert_eq!(
         said(src),
         [
-            format!("2 warning: this `return` leaves `arg`, not only the `if`: {IF}, so write `1`"),
-            format!("6 warning: this `return` leaves `operand`, not only the `if`: {IF}, so write `1`"),
-            "10 warning: this `return` leaves `block`, not only the block: a block gives its last expression, so write `5`".to_string(),
+            every(2, "if", "`arg`", "write `1`"),
+            every(6, "if", "`operand`", "write `1`"),
+            "10 warning: this `return` leaves `block`, so the block never gives the value it is used for: to give it, write `5`; to leave, write the `return` as a statement".to_string(),
             "14 warning: this `return` leaves `kept_for` in the first round, so the `for` never makes its list: a `for` gives what its body gives each round, so write `x`".to_string(),
             "17 warning: this `return` leaves `out_for` in the first round, so the `for` never makes its list: a `for` gives what its body gives each round, so write `x`".to_string(),
             // Every way leaves: the `if` never gives the value the `let` waits for. Said once.
-            format!("19 warning: this `return` leaves `both_leave`, not only the `if`: {IF}, so write `\"a\"`"),
-            format!("23 warning: this `return` leaves `no_value`, not only the `if`: {IF}, so write the value it should give"),
-            format!("27 warning: this `return` leaves `grüße`, not only the `if`: {IF}, so write `\"ünï\"`"),
-            format!("31 warning: this `return` leaves `Box`, not only the `if`: {IF}, so write the value without `return`"),
+            every(19, "if", "`both_leave`", "write `\"a\"`"),
+            every(23, "if", "`no_value`", "write the value"),
+            every(27, "if", "`grüße`", "write `\"ünï\"`"),
+            every(31, "if", "`Box`", "write the value without `return`"),
         ]
     );
 }
@@ -343,6 +359,7 @@ fn replies(c) {
 fn answered(c) {
     if c { return reply 404 "no" }
 }
+fn called(c, f) { if c { f && f() } }
 print([both2(false), explicit(false), validate(1), early_null(1), bare(1), effect(false), badge(0), Maybe(null), arrow(false), empty(), call_end(false), all_arms(0), loops(), each([])])
 "#;
     let d = diags(src);
@@ -512,8 +529,8 @@ print("b")
 
 // ---- every form the walk reads ---------------------------------------------------------------
 
-/// Each place a value goes, and each kind a way's value is written as: a `return` there is said
-/// where another way is of its kind, and not where the kinds cannot be told (`c + d`). A type's
+/// Each place a value goes: a `return` there is said where every way leaves. How the other way's
+/// value is written no longer matters (`kinds`, quiet since the review of 1a1b3ae, M1). A type's
 /// default, a service's options, a route's `= expr`, an `if true` with no line of its own.
 #[test]
 fn every_place_a_value_goes_and_every_kind_written_is_read() {
@@ -521,7 +538,7 @@ fn every_place_a_value_goes_and_every_kind_written_is_read() {
 service billing = "billing.qwe" { timeout: "2s" }
 service shop = "shop.qwe"
 mount /docs = "docs.qwe"
-let top = if true { return 1 } else { 2 }
+let top = if true { return 1 } else { return 2 }
 fn kinds(c, d = if c { 1 } else { 2 }) {
     let b = if c { return true } else { !c }
     let n = if c { return -1 } else { 2 % 3 }
@@ -535,19 +552,19 @@ fn kinds(c, d = if c { 1 } else { 2 }) {
     [b, n, s, t, q, l, m, e, g]
 }
 fn places(x, xs) {
-    let a = xs[if x { return 1 } else { 2 }]
-    let r = (if x { return 1 } else { 2 })?
-    let f = (if x { return { a: 1 } } else { { a: 2 } }).a
-    let p = xs | take(if x { return 1 } else { 2 })
+    let a = xs[if x { return 1 } else { return 2 }]
+    let r = (if x { return 1 } else { return 2 })?
+    let f = (if x { return { a: 1 } } else { return { a: 2 } }).a
+    let p = xs | take(if x { return 1 } else { return 2 })
     while x { x = false }
-    if x { reply 400 if x { return "a" } else { "b" } }
+    if x { reply 400 if x { return "a" } else { return "b" } }
     [a, r, f, p]
 }
 component Page(xs) {
     state on = false
     let el = js("document.body")
-    el.title = if on { return <p>a</p> } else { <p>b</p> }
-    <main#top.card class={if on { return "a" } else { "b" }} {...{ hidden: on }}>
+    el.title = if on { return <p>a</p> } else { return <p>b</p> }
+    <main#top.card class={if on { return "a" } else { return "b" }} {...{ hidden: on }}>
         <p>{xs}</p>
     </main>
 }
@@ -585,33 +602,23 @@ fn none_for(xs) {
 }
 route GET /a = if request.query.x == "1" { return "one" } else { "two" }
 route GET /b {
-    let v = if request.query.x == "1" { return "one" } else { "two" }
+    let v = if request.query.x == "1" { return "one" } else { return "two" }
     v
 }
 print([kinds(true), places(true, [1]), ends(true, true, 1), ends2(true, true), ends3(true, 1), ends4(true), ends5(true, true), lit_cond(), lit_both(), none_for([])])
 "#;
-    let w = |line: u32, f: &str, what: &str, fix: &str| format!("{line} warning: this `return` leaves {f}, not only {what}, so {fix}");
-    let ifs = "the `if`: an `if` gives its last expression";
     let plain = "write the value without `return`";
     assert_eq!(
         said(src),
         [
-            w(5, "the file", ifs, "write `1`"),
-            w(7, "`kinds`", ifs, "write `true`"),
-            w(8, "`kinds`", ifs, "write `-1`"),
-            w(9, "`kinds`", ifs, plain),
-            w(10, "`kinds`", ifs, plain),
-            w(12, "`kinds`", ifs, plain),
-            w(13, "`kinds`", ifs, plain),
-            w(14, "`kinds`", ifs, plain),
-            w(15, "`kinds`", "the `match`: an arm gives its last expression", "write `1`"),
-            w(19, "`places`", ifs, "write `1`"),
-            w(20, "`places`", ifs, "write `1`"),
-            w(21, "`places`", ifs, plain),
-            w(22, "`places`", ifs, "write `1`"),
-            w(24, "`places`", ifs, "write `\"a\"`"),
-            w(30, "`Page`", ifs, plain),
-            w(31, "`Page`", ifs, "write `\"a\"`"),
+            every(5, "if", "the file", "write `1`"),
+            every(19, "if", "`places`", "write `1`"),
+            every(20, "if", "`places`", "write `1`"),
+            every(21, "if", "`places`", plain),
+            every(22, "if", "`places`", "write `1`"),
+            every(24, "if", "`places`", "write `\"a\"`"),
+            every(30, "if", "`Page`", plain),
+            every(31, "if", "`Page`", "write `\"a\"`"),
             "37 warning: `ends` returns a value on line 36 but gives null when it reaches its end: end it with a value too, or `null` if null is meant".to_string(),
             "41 warning: `ends2` returns a value on line 40 but gives null when it reaches its end: end it with a value too, or `null` if null is meant".to_string(),
             "46 warning: `ends3` returns a value on line 44 but gives null when it reaches its end: end it with a value too, or `null` if null is meant".to_string(),
@@ -620,7 +627,177 @@ print([kinds(true), places(true, [1]), ends(true, true, 1), ends2(true, true), e
             "58 warning: `lit_cond` returns a value on line 58 but gives null when it reaches its end: end it with a value too, or `null` if null is meant".to_string(),
             "61 warning: this never runs: each way of the `if` on line 60 leaves `lit_both`".to_string(),
             "65 warning: `none_for` returns a value on line 64 but, when it reaches its end, gives the list of nulls its `for` makes: end it with the value it should give, or `null`".to_string(),
-            w(69, "the route", ifs, "write `\"one\"`"),
+            every(69, "if", "the route", "write `\"one\"`"),
         ]
     );
+}
+
+// ---- the review of 1a1b3ae (FEEDBACK52.md, Q-678 to Q-680; branch feedback52) ---------------
+
+/// M1: a guard whose early value is written as the other way's kind is a guard still: said by
+/// the "same written kind" rule, with a fix that changed what it gives. The guide's own `"a" =>
+/// return 1` (USERGUIDE.md, "Coming from JavaScript"), and the report's `label`, which has the
+/// same shape as `ratio`: only an `if` each of whose ways leaves is said now.
+#[test]
+fn a_guard_whose_early_value_is_written_as_the_other_ways_is_not_said() {
+    let src = r#"fn ratio(a, b) {
+    let d = if b == 0 { return 0 } else { a / b }
+    d * 100
+}
+fn half(n) {
+    let y = n > 0 ? n * 2 : return -1
+    y + 1
+}
+fn code(kind) {
+    let n = match kind { "a" => return 1, "b" => 2, _ => 3 }
+    n * 10
+}
+fn label(n) {
+    let l = if n == 1 { return "one" } else if n == 2 { "two" } else { "many" }
+    return `${n} ${l}`
+}
+fn flag(c) {
+    let b = if c { return true } else { false }
+    !b
+}
+component Items() {
+    state loading = true
+    let shown = if loading { return <p>Loading</p> } else { <ul></ul> }
+    <main>{shown}</main>
+}
+print([ratio(1, 2), half(2), code("b"), label(1), flag(false)])
+"#;
+    assert_eq!(said(src), Vec::<String>::new());
+}
+
+/// M2 and LOW 1: an `else if` chain is one `if` of many ways: each `else if` was an `if` of its
+/// own, and a `let` was said once a level, 31 times for 32 ways. Said once, of its first
+/// `return`, as is a kept `if` inside a kept `if`'s way.
+#[test]
+fn an_else_if_chain_is_one_if_and_a_let_is_said_once() {
+    let three = r#"fn pick(c, d) {
+    let l = if c { return 1 } else if d { return 2 } else { return 3 }
+    l
+}
+fn mid(c, d) {
+    let l = if c { return 1 } else if d { reply 400 "no" } else { return 3 }
+    l
+}
+fn nested(c, d) {
+    let l = if c { if d { return 1 } else { return 2 } } else { return 3 }
+    l
+}
+fn after(c, d) {
+    if c { return 1 } else if d { return 2 } else { return 3 }
+    print("never")
+}
+fn gives(c, d) {
+    let l = if c { return 1 } else if d { return 2 } else { 3 }
+    l
+}
+fn open(c, d) {
+    let l = if c { return 1 } else if d { return 2 }
+    l
+}
+"#;
+    assert_eq!(
+        said(three),
+        [
+            every(2, "if", "`pick`", "write `1`"),
+            every(6, "if", "`mid`", "write `1`"),
+            every(10, "if", "`nested`", "write `1`"),
+            "15 warning: this never runs: each way of the `if` on line 14 leaves `after`".to_string(),
+        ]
+    );
+    // 32 ways, and 32 `if`s each kept in the one before's way.
+    let mut chain = "fn many(n) {\n    let l = if n == 0 { return 0 }".to_string();
+    let mut deep = "fn deep(n) {\n    let l = ".to_string();
+    for i in 1..32 {
+        chain.push_str(&format!(" else if n == {i} {{ return {i} }}"));
+        deep.push_str(&format!("if n > {i} {{ "));
+    }
+    chain.push_str(" else { return 99 }\n    l\n}\n");
+    deep.push_str("return 0");
+    for i in (1..32).rev() {
+        deep.push_str(&format!(" }} else {{ return {i} }}"));
+    }
+    deep.push_str("\n    l\n}\n");
+    assert_eq!(said(&chain), [every(2, "if", "`many`", "write `0`")]);
+    assert_eq!(said(&deep).len(), 1, "{:?}", said(&deep));
+}
+
+/// M3: a markup helper's null end shows nothing, as a view's does. `FnDef` does not keep `view`,
+/// so `view card` is known by its markup: a markup `return` is no value. A text or a number
+/// returned beside it is.
+#[test]
+fn a_markup_helper_and_a_lowercase_view_are_not_said_for_a_null_end() {
+    let src = r#"fn badge(n) {
+    if n == 0 { return <i>none</i> }
+    if n > 9 { <b>9+</b> }
+}
+view card(x) {
+    if x { return <p>{x}</p> }
+}
+fn row(x) {
+    if x { return <tr></tr> }
+    let y = 1
+}
+fn mixed(n) {
+    if n == 0 { return 0 }
+    if n > 9 { <b>9+</b> }
+}
+route GET / = <main>{badge(1)}{card("a")}{row(true)}{mixed(1)}</main>
+"#;
+    assert_eq!(said(src), ["14 warning: `mixed` returns a value on line 13 but gives null when it reaches its end: end it with a value too, or `null` if null is meant"]);
+}
+
+/// INFO: a `return` at the end of a line takes no value from the next, which never runs: said so.
+#[test]
+fn a_bare_return_says_why_the_next_line_never_runs() {
+    let src = r#"fn f(x) {
+    return
+    x + 1
+}
+fn g(x) {
+    return
+    (x + 1)
+}
+fn h(x) {
+    return null
+    x + 1
+}
+print([f(1), g(1), h(1)])
+"#;
+    let bare = |line: u32, at: u32, f: &str| format!("{line} warning: this never runs: a `return` at the end of a line gives null, so the one on line {at} leaves `{f}` before this");
+    assert_eq!(said(src), [bare(3, 2, "f"), bare(7, 6, "g"), "11 warning: this never runs: the `return` on line 10 always leaves `h`".to_string()]);
+}
+
+/// LOW 2: what a way does is worked out once, on the walk's way back up. 16 functions with a kept
+/// `if` 250 deep, and statements nested 250 deep, each said once.
+#[test]
+fn deep_ifs_are_read_once_and_said_once() {
+    let mut kept = String::new();
+    let mut stmts = String::new();
+    for f in 0..16 {
+        kept.push_str(&format!("fn k{f}(x) {{\n    let v = "));
+        stmts.push_str(&format!("fn s{f}(x) {{\n"));
+        for i in 0..250 {
+            kept.push_str(&format!("if x > {i} {{ "));
+            stmts.push_str(&format!("if x > {i} {{\n"));
+        }
+        kept.push_str("return 0");
+        stmts.push_str("return 0\n");
+        for i in (0..250).rev() {
+            kept.push_str(&format!(" }} else {{ return {i} }}"));
+            stmts.push_str(&format!("}} else {{\nreturn {i}\n}}\n"));
+        }
+        kept.push_str("\n    v\n}\n");
+        stmts.push_str("print(x)\n}\n");
+    }
+    let k = said(&kept);
+    assert_eq!(k.len(), 16, "{:?}", &k[..k.len().min(3)]);
+    assert!(k.iter().all(|m| m.contains("every way of this `if` leaves `k")), "{:?}", &k[..3]);
+    let s = said(&stmts);
+    assert_eq!(s.len(), 16, "{:?}", &s[..s.len().min(3)]);
+    assert!(s.iter().all(|m| m.contains("this never runs: each way of the `if` on line")), "{:?}", &s[..3]);
 }
