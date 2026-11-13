@@ -46,6 +46,12 @@ CASES = [
      "def f(s):\n    c = 0\n    for i in range(len(s)):\n        if s[i] == 'x':\n            c += 1\n    return c\nprint(f('x' * 300000))\n"),
     ("while over a text", "fn f(s) {\n    let i = 0\n    let c = 0\n    while i < len(s) {\n        if s[i] == \"a\" {\n            c += 1\n        }\n        i += 1\n    }\n    c\n}\nprint(f(repeat(\"ab\", 100000)))\n",
      "def f(s):\n    i = 0\n    c = 0\n    while i < len(s):\n        if s[i] == 'a':\n            c += 1\n        i += 1\n    return c\nprint(f('ab' * 100000))\n"),
+    # A function's result given by `return`, at its end and early (FEEDBACK52.md, Q-677; branch
+    # feedback52): 5 million calls.
+    ("return", "fn f(x) {\n    return x % 7 + 1\n}\nfn g(n) {\n    let i = 0\n    let t = 0\n    while i < n {\n        t += f(i)\n        i += 1\n    }\n    return t\n}\nprint(g(5000000))\n",
+     "def f(x):\n    return x % 7 + 1\ndef g(n):\n    i = 0\n    t = 0\n    while i < n:\n        t += f(i)\n        i += 1\n    return t\nprint(g(5000000))\n"),
+    ("early return", "fn f(x) {\n    if x % 2 == 0 {\n        return 1\n    }\n    return x % 7 + 1\n}\nfn g(n) {\n    let i = 0\n    let t = 0\n    while i < n {\n        t += f(i)\n        i += 1\n    }\n    return t\n}\nprint(g(5000000))\n",
+     "def f(x):\n    if x % 2 == 0:\n        return 1\n    return x % 7 + 1\ndef g(n):\n    i = 0\n    t = 0\n    while i < n:\n        t += f(i)\n        i += 1\n    return t\nprint(g(5000000))\n"),
     ("empty program", "print(1)\n", "print(1)\n"),
 ]
 

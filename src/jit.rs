@@ -350,11 +350,16 @@ impl<'a> Plan<'a> {
             self.open.insert(key.clone(), (guess, false));
             let mut sc = Scopes { stack: vec![def.params.iter().map(|p| p.name.to_string()).zip(args.iter().copied()).collect()] };
             let mut ret = None;
-            let got = self.body(&def.body, &mut sc, &mut ret);
+            let got = self.tail(&def.body, &mut sc, &mut ret);
             let (_, used) = self.open.remove(&key).unwrap();
             let t = match (got, ret) {
-                (Some(a), Some(b)) if a != b => None,
-                (Some(a), _) => Some(a),
+                (Some(Some(a)), Some(b)) if a != b => None,
+                (Some(Some(a)), _) => Some(a),
+                // A body that always leaves by `return` (`{ return x % 7 + 1 }`, or an `if` whose
+                // arms both do) gives what `return` gives. It was taken as one that does not
+                // compile, and so was every function calling it (FEEDBACK52.md, Q-677; branch
+                // feedback52).
+                (Some(None), r) => r,
                 (None, _) => None,
             };
             match t {
@@ -370,8 +375,31 @@ impl<'a> Plan<'a> {
         None
     }
 
-    fn body(&mut self, e: &Expr, sc: &mut Scopes<T>, ret: &mut Option<T>) -> Option<T> {
-        self.value(e, sc, ret)
+    /// The type of `e` where its value is the function's, a block's last or an `if`'s arm's,
+    /// where a `return` may end it: None inside when it always leaves by `return`, and so has no
+    /// value. An arm that leaves gives the `if` the other arm's type (FEEDBACK52.md, Q-677;
+    /// branch feedback52).
+    fn tail(&mut self, e: &Expr, sc: &mut Scopes<T>, ret: &mut Option<T>) -> Option<Option<T>> {
+        match e {
+            Expr::If(c, a, Some(b)) => {
+                if self.value(c, sc, ret)? != T::B {
+                    return None;
+                }
+                let x = self.tail(a, sc, ret)?;
+                let y = self.tail(b, sc, ret)?;
+                match (x, y) {
+                    (Some(x), Some(y)) => (x == y).then_some(Some(x)),
+                    (x, None) | (None, x) => Some(x),
+                }
+            }
+            Expr::Block(ss) => {
+                sc.stack.push(Vec::new());
+                let t = self.block(ss, sc, ret, true);
+                sc.stack.pop();
+                t
+            }
+            e => self.value(e, sc, ret).map(Some),
+        }
     }
 
     /// The type of `e` where its value is used.
@@ -391,20 +419,9 @@ impl<'a> Plan<'a> {
                 let (x, y) = (self.value(a, sc, ret)?, self.value(b, sc, ret)?);
                 arith_type(*op, x, y)
             }
-            Expr::If(c, a, Some(b)) => {
-                if self.value(c, sc, ret)? != B {
-                    return None;
-                }
-                let x = self.value(a, sc, ret)?;
-                let y = self.value(b, sc, ret)?;
-                (x == y).then_some(x)
-            }
-            Expr::Block(ss) => {
-                sc.stack.push(Vec::new());
-                let t = self.block(ss, sc, ret, true);
-                sc.stack.pop();
-                t
-            }
+            // One that always leaves by `return` has no value to use here: `let y = { return 1 }`
+            // is the interpreter's (Q-677).
+            Expr::If(_, _, Some(_)) | Expr::Block(_) => self.tail(e, sc, ret)?,
             Expr::Call(f, args, _) => {
                 let Expr::Ident(name, _) = &**f else { return None };
                 if sc.get(name).is_some() {
@@ -430,14 +447,14 @@ impl<'a> Plan<'a> {
         }
     }
 
-    /// A block's statements; with `want`, the type of its value.
-    fn block(&mut self, ss: &[Stmt], sc: &mut Scopes<T>, ret: &mut Option<T>, want: bool) -> Option<T> {
+    /// A block's statements; with `want`, the type of its value, as `tail` gives it.
+    fn block(&mut self, ss: &[Stmt], sc: &mut Scopes<T>, ret: &mut Option<T>, want: bool) -> Option<Option<T>> {
         let mut last = None;
         for (i, s) in ss.iter().enumerate() {
             let is_last = i + 1 == ss.len();
             last = None;
             match s {
-                Stmt::Expr(e) if is_last && want => last = Some(self.value(e, sc, ret)?),
+                Stmt::Expr(e) if is_last && want => last = Some(self.tail(e, sc, ret)?),
                 Stmt::Expr(e) => self.stmt_expr(e, sc, ret)?,
                 Stmt::Let(Pattern::Bind(n), e, _) => {
                     let t = self.value(e, sc, ret)?;
@@ -461,6 +478,8 @@ impl<'a> Plan<'a> {
                         return None;
                     }
                     *ret = Some(t);
+                    // Last, the block leaves here and has no value (Q-677).
+                    last = Some(None);
                 }
                 _ => return None,
             }
@@ -468,7 +487,7 @@ impl<'a> Plan<'a> {
         if want {
             last
         } else {
-            Some(T::B)
+            Some(None)
         }
     }
 
@@ -878,15 +897,21 @@ impl Gen<'_, '_> {
                 let (yes, no, join) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
                 let out = self.b.append_block_param(join, t.ir());
                 self.b.ins().brif(cv, yes, &[], no, &[]);
+                let mut ends = true;
                 for (blk, arm) in [(yes, a), (no, b)] {
                     self.b.switch_to_block(blk);
                     let v = self.value(arm, ret)?;
                     if !self.ended {
                         self.b.ins().jump(join, &[v.into()]);
+                        ends = false;
                     }
                     self.ended = false;
                 }
                 self.b.switch_to_block(join);
+                // Both arms left by `return`: nothing reaches the join, and the `if` has no value
+                // to give, as the block ending in `return` has none (FEEDBACK52.md, Q-677; branch
+                // feedback52).
+                self.ended = ends;
                 out
             }
             Expr::Block(ss) => {
@@ -934,32 +959,25 @@ impl Gen<'_, '_> {
             Expr::Unary(UnOp::Neg, x, _) => self.type_of(x),
             Expr::Unary(UnOp::Not, _, _) => Some(B),
             Expr::Binary(op, a, b, _) => arith_type(*op, self.type_of(a)?, self.type_of(b)?),
+            // An arm that always leaves by `return` gives no value: the other arm's type is the
+            // `if`'s, and when both leave any will do, the function's own (Q-677).
+            Expr::If(_, a, Some(b)) if leaves(a) => if leaves(b) { Some(self.ret) } else { self.type_of(b) },
             Expr::If(_, a, _) => self.type_of(a),
-            Expr::Block(ss) => {
-                // Its last expression's type, with the block's own `let`s seen.
-                let mut sc = Scopes { stack: self.sc.stack.iter().map(|s| s.iter().map(|(n, (_, t))| (n.clone(), *t)).collect()).collect() };
-                sc.stack.push(Vec::new());
-                for s in ss {
-                    match s {
-                        Stmt::Let(Pattern::Bind(n), e, _) => {
-                            let t = type_in(e, &sc, self)?;
-                            sc.set(n, t);
-                        }
-                        Stmt::Expr(e) if std::ptr::eq(s, ss.last()?) => return type_in(e, &sc, self),
-                        _ => {}
-                    }
-                }
-                None
-            }
+            Expr::Block(ss) => block_type(ss, Scopes { stack: self.sc.stack.iter().map(|s| s.iter().map(|(n, (_, t))| (n.clone(), *t)).collect()).collect() }, self),
             Expr::Call(f, args, _) => {
-                let Expr::Ident(name, _) = &**f else { return None };
-                let Some(Value::Func(callee)) = lookup(self.env, name) else { return None };
                 let ts: Option<Vec<T>> = args.iter().map(|a| self.type_of(a)).collect();
-                let key = (Arc::as_ptr(&callee.def) as usize, ts?);
-                self.types.get(&key).copied().or_else(|| self.done.get(&key).and_then(|c| c.as_ref().map(|c| c.ret)))
+                self.call_type(f, ts?)
             }
             _ => None,
         }
+    }
+
+    /// The type `f(args)` gives, as planned, for arguments of the types `ts`.
+    fn call_type(&self, f: &Expr, ts: Vec<T>) -> Option<T> {
+        let Expr::Ident(name, _) = f else { return None };
+        let Some(Value::Func(callee)) = lookup(self.env, name) else { return None };
+        let key = (Arc::as_ptr(&callee.def) as usize, ts);
+        self.types.get(&key).copied().or_else(|| self.done.get(&key).and_then(|c| c.as_ref().map(|c| c.ret)))
     }
 
     fn binop(&mut self, op: BinOp, ta: T, tb: T, x: V, y: V) -> Option<V> {
@@ -1193,7 +1211,42 @@ fn type_in(e: &Expr, sc: &Scopes<T>, g: &Gen) -> Option<T> {
         Expr::Unary(UnOp::Neg, x, _) => type_in(x, sc, g),
         Expr::Unary(UnOp::Not, _, _) => Some(B),
         Expr::Binary(op, a, b, _) => arith_type(*op, type_in(a, sc, g)?, type_in(b, sc, g)?),
+        Expr::If(_, a, Some(b)) if leaves(a) => type_in(b, sc, g),
         Expr::If(_, a, _) => type_in(a, sc, g),
-        _ => g.type_of(e),
+        // A block or a call in a block is typed with that block's names, not the function's:
+        // `let y = { let x = 2.5; h(x) }`, where the function's `x` is an int, had `h(x)` taken
+        // as `h` of an int, the variable made for `y` did not take the float, and Cranelift
+        // stopped the process (found with FEEDBACK52.md, Q-677; branch feedback52).
+        Expr::Block(ss) => block_type(ss, Scopes { stack: sc.stack.clone() }, g),
+        _ => {
+            let Expr::Call(f, args, _) = e else { return None };
+            let ts: Option<Vec<T>> = args.iter().map(|a| type_in(a, sc, g)).collect();
+            g.call_type(f, ts?)
+        }
+    }
+}
+
+/// The type of a block's last expression, with the variables of `sc` and the block's own `let`s.
+fn block_type(ss: &[Stmt], mut sc: Scopes<T>, g: &Gen) -> Option<T> {
+    sc.stack.push(Vec::new());
+    let (last, before) = ss.split_last()?;
+    for s in before {
+        if let Stmt::Let(Pattern::Bind(n), e, _) = s {
+            let t = type_in(e, &sc, g)?;
+            sc.set(n, t);
+        }
+    }
+    let Stmt::Expr(e) = last else { return None };
+    type_in(e, &sc, g)
+}
+
+/// Whether `e`, where its value is wanted, always leaves its function by `return` instead: a
+/// block ending in `return` or in such an `if`, or an `if` whose arms both are. Planned, such an
+/// arm gives the `if` no type of its own (`Plan::tail`; FEEDBACK52.md, Q-677; branch feedback52).
+fn leaves(e: &Expr) -> bool {
+    match e {
+        Expr::Block(ss) => matches!(ss.last(), Some(Stmt::Return(..))) || matches!(ss.last(), Some(Stmt::Expr(e)) if leaves(e)),
+        Expr::If(_, a, Some(b)) => leaves(a) && leaves(b),
+        _ => false,
     }
 }
