@@ -99,6 +99,89 @@ struct Jit {
 thread_local! {
     static JIT: RefCell<Option<Jit>> = const { RefCell::new(None) };
     static LAST: std::cell::Cell<Option<Quick>> = const { std::cell::Cell::new(None) };
+    /// The depth of a call whose machine code went too deep (`run`): every call deeper than it is
+    /// the interpreter's, until a call no deeper (`under_floor`).
+    static FLOOR: Floor = const { Floor(std::cell::Cell::new(NO_FLOOR)) };
+}
+
+/// How many threads have a `FLOOR`, and `OFF_OR_UNREAD`: while it is 0, a call reads nothing
+/// more than this. A recursion past the call limit gave up in machine code at the limit, the
+/// interpreter went on with that call, and each call under it went back into machine code and
+/// down to the limit again: 5·10⁷ calls where the interpreter makes 10⁴, up to 47 times the
+/// interpreter's time (`fn fact(n) { if n == 0 { return 1 }; return n * fact(n - 1) }` and
+/// `fact(-1)`), where main interpreted a function with `return` (FEEDBACK52.md, Q-945; branch
+/// feedback52).
+static FLOORS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(OFF_OR_UNREAD);
+
+/// In `FLOORS` until the first call has read `QUILLO_JIT` (`enabled`), and for good when it is
+/// `0`: the call reads it in `under_floor`, so that `FLOORS` is the only thing it reads first,
+/// as before Q-945 `enabled` was (the floor's own test cost 4 instructions a call, 0.8% of a
+/// function mapped over a list).
+const OFF_OR_UNREAD: usize = 1 << (usize::BITS - 1);
+
+const NO_FLOOR: usize = usize::MAX;
+
+/// A thread's `FLOOR`: a thread that ends with one set takes itself out of `FLOORS`.
+struct Floor(std::cell::Cell<usize>);
+
+impl Drop for Floor {
+    fn drop(&mut self) {
+        if self.0.get() != NO_FLOOR {
+            FLOORS.fetch_sub(1, Relaxed);
+        }
+    }
+}
+
+/// Whether a call at `depth` is under this thread's floor, and so the interpreter's; a call no
+/// deeper takes the floor away. Every call of a Quillo function comes here first (from
+/// `call_closure`, `call_closure_given` and `call1`), so the first one back at the level of the
+/// call that went too deep, or above it, ends it: the next call of a loop, or a helper.
+#[cold]
+#[inline(never)]
+fn under_floor(depth: usize) -> bool {
+    if FLOORS.load(Relaxed) & OFF_OR_UNREAD != 0 {
+        if !enabled() {
+            return true;
+        }
+        FLOORS.fetch_and(!OFF_OR_UNREAD, Relaxed);
+    }
+    FLOOR
+        .try_with(|f| {
+            let at = f.0.get();
+            if at == NO_FLOOR {
+                return false;
+            }
+            if depth > at {
+                return true;
+            }
+            f.0.set(NO_FLOOR);
+            FLOORS.fetch_sub(1, Relaxed);
+            false
+        })
+        .unwrap_or(false)
+}
+
+/// The machine code of a call at `depth` gave up (`run`). Too deep, when no frame gave the depth
+/// back and the one that could go no deeper left it at `max` (one that gave up otherwise at
+/// exactly `max` is taken as too deep too, which only costs time): the floor is that depth,
+/// fixed, as the interpreter runs the call again, and every call under it is the interpreter's.
+/// Following the interpreter down instead, a call of another function at the same depth
+/// (`r(d - 1, h(x))`) or of the same one (`r(d - 1, r(0, x) + 1)`) took it back each time (Q-677
+/// reviews 2 and 3).
+#[cold]
+#[inline(never)]
+fn gave_up(ctx: &Ctx, depth: usize) {
+    if ctx.depth != ctx.max {
+        return;
+    }
+    LAST.set(None);
+    // A call that reached machine code was at the floor or above it, and took it away
+    // (`under_floor`): there is none to keep lower.
+    let _ = FLOOR.try_with(|f| {
+        if f.0.replace(depth) == NO_FLOOR {
+            FLOORS.fetch_add(1, Relaxed);
+        }
+    });
 }
 
 /// The function called last, if what it calls cannot change under it.
@@ -177,9 +260,14 @@ pub fn enabled() -> bool {
 }
 
 pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Option<Result<Value, Ctrl>> {
+    // Before anything else, for every function, those never compiled too (`FLOORS`); and
+    // whether machine code is made at all.
+    if FLOORS.load(Relaxed) != 0 && under_floor(depth) {
+        return None;
+    }
     let def = &c.def;
     let hot = def.hot.load(Relaxed);
-    if hot == NEVER || !enabled() {
+    if hot == NEVER {
         return None;
     }
     // Compiled on the second call, as one call alone is not worth it, unless that one
@@ -256,6 +344,7 @@ fn run(entry: Entry, ret: T, raw: &[u64; 16], depth: usize) -> Option<Result<Val
     // `raw` in order; `ctx` outlives the call.
     let r = unsafe { entry(raw.as_ptr(), &mut ctx) };
     if ctx.bail != 0 {
+        gave_up(&ctx, depth);
         return None;
     }
     Some(Ok(match ret {

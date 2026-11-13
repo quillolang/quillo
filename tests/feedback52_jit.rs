@@ -767,15 +767,29 @@ for n in [9990, 9995, 9996, 9997, 9998, 9999, 10000, 100000] {
 }
 ";
 
+/// How many times the interpreter's time a call past the limit may take compiled: twice, and three
+/// times for this build's debug binary, whose interpreter calls the floor's cold path slower.
+fn slack() -> u32 {
+    if std::env::var_os("QUILLO_TEST_BIN").is_none() && cfg!(debug_assertions) {
+        3
+    } else {
+        2
+    }
+}
+
 #[test]
 fn a_call_too_deep_for_machine_code_is_followed_down_by_the_interpreter() {
-    // The interpreter goes on where machine code gave up, with the interpreter's values and
-    // errors. Each level of a recursion past the limit still goes back into machine code and down
-    // to the limit again (quillo-A 1.35 s, main 0.91 s for `bare`, the interpreter 0.06 s): the
-    // floor that kept the levels under it the interpreter's was dropped, as on main, and its
-    // speed assertion with it (filed as Q-945).
+    // Each level of a recursion past the limit went back into machine code and down to the
+    // limit again: quillo-A 1.35 s, main 0.91 s (`bare`), the interpreter 0.06 s. The levels
+    // under it are the interpreter's (the floor), and the calls within the limit are compiled.
+    // Its speed bound, taken out with A6's floor, is back with Q-945's (FEEDBACK52.md, Q-945;
+    // branch feedback52): quillo-A6 fails it.
     let want = "9990 0 0 0\n9995 0 0 1\n9996 0 0 0\n9997 0 0 1\n9998 0 0 0\n9999 0 0 1\n10000 E E E\n100000 E E E";
     assert_eq!(both_ways(DEEPS), want);
+    let (fast, out) = fastest(DEEPS, &[], 3);
+    let (slow, _) = fastest(DEEPS, &[("QUILLO_JIT", "0")], 2);
+    assert_eq!(out, want);
+    assert!(fast < slow * slack(), "compiled {:?}, interpreted {:?}", fast, slow);
     // Not caught, its error and where it was are the interpreter's.
     let failed = both_ways("fn r(d, x) {\n    if d <= 0 {\n        return 0\n    }\n    return r(d - 1, x + 1)\n}\nprint(r(1, 1))\nprint(r(100000, 1))\n");
     assert!(failed.starts_with("0\nFAILED") && failed.contains("too much recursion"), "{}", failed);
@@ -859,14 +873,19 @@ fn a_guess_that_does_not_come_out_keeps_what_never_read_it_and_compiles_the_chai
 
 #[test]
 fn a_call_too_deep_is_followed_down_past_another_function_called_at_its_depth() {
-    // `h` is compiled, and called at the depth of `r`'s next call; the same when `h` recurses
-    // itself. The values and errors are the interpreter's. Its speed assertion (compiled faster
-    // than twice the interpreter, against quillo-B4's 0.24 s a call) went with the floor, dropped
-    // as on main (filed as Q-945).
+    // `h` is compiled, and called at the depth of `r`'s next call: a floor that followed the
+    // interpreter down was taken back there, and each level went into machine code to the limit
+    // again (quillo-B4 0.24 s a call, the interpreter 0.01 s). The same when `h` recurses itself.
+    // The floor stays at the call that went too deep (Q-945); quillo-A6, with none, fails the
+    // speed bound.
     for h in ["fn h(x) {\n    x + 1\n}\n", "fn h(x) {\n    return x <= 0 ? 1 : h(x - 1) + 1\n}\n"] {
         let src = format!("{}fn r(d, x) {{\n    if d <= 0 {{\n        return x\n    }}\n    return r(d - 1, h(x % 3))\n}}\nprint(h(1))\nprint(h(2))\nfor k in 0..4 {{\n    print(r(100000, 1) ?? \"E\")\n}}\nprint(r(10, 1))\n", h);
         let want = "2\n3\nE\nE\nE\nE\n2";
         assert_eq!(both_ways(&src), want);
+        let (fast, out) = fastest(&src, &[], 3);
+        let (slow, _) = fastest(&src, &[("QUILLO_JIT", "0")], 2);
+        assert_eq!(out, want);
+        assert!(fast < slow * slack(), "compiled {:?}, interpreted {:?}\n{}", fast, slow, src);
     }
 }
 
@@ -1004,10 +1023,11 @@ fn a_chain_reading_only_the_first_guess_is_compiled_and_one_past_the_budget_is_n
 
 #[test]
 fn a_call_too_deep_is_followed_down_past_its_own_calls_at_its_depth() {
-    // `r(0, x)` at the depth of the next call, two calls of its own at each level, and a helper
-    // calling it from deeper than its own next call: the interpreter's values and errors. Its
-    // speed assertion (compiled faster than twice the interpreter, against quillo-B5's 0.31 s)
-    // went with the floor, dropped as on main (filed as Q-945).
+    // `r(0, x)`, at the depth of the next call, took a floor that followed the interpreter down,
+    // and the next call went back into machine code to the limit at each level (quillo-B5 0.31 s,
+    // the interpreter 0.01 s). Also with two calls of its own at each level, and with a helper
+    // calling it from deeper than its own next call. The floor stays at the call that went too
+    // deep (Q-945); quillo-A6, with none, fails the speed bound.
     let shapes = [
         ("", "r(d - 1, r(0, x) + 1)", "4\n4"),
         ("", "r(d - 1, r(0, x) + r(0, x + 1))", "15\n15"),
@@ -1016,6 +1036,9 @@ fn a_call_too_deep_is_followed_down_past_its_own_calls_at_its_depth() {
     for (helper, call, first) in shapes {
         let src = format!("{}fn r(d, x) {{\n    if d <= 0 {{\n        return x\n    }}\n    return {}\n}}\nprint(r(3, 1))\nprint(r(3, 1))\nfor k in 0..4 {{\n    print(r(100000, 1) ?? \"E\")\n}}\n", helper, call);
         assert_eq!(both_ways(&src), format!("{}\nE\nE\nE\nE", first), "{}", src);
+        let (fast, _) = fastest(&src, &[], 3);
+        let (slow, _) = fastest(&src, &[("QUILLO_JIT", "0")], 2);
+        assert!(fast < slow * slack(), "compiled {:?}, interpreted {:?}\n{}", fast, slow, src);
     }
 }
 
@@ -1117,4 +1140,88 @@ fn a_chain_each_calling_its_caller_runs_compiled_in_quillo_run() {
     let (slow, plain) = fastest(&src, &[("QUILLO_JIT", "0")], 2);
     assert_eq!((out.as_str(), plain.as_str()), ("100000", "100000"));
     assert!(fast * 2 < slow, "compiled {:?}, interpreted {:?}", fast, slow);
+}
+
+// ---- Q-945: recursion past the call limit (FEEDBACK52.md, Q-945; branch feedback52) ----------
+
+/// `src` with `return` and without, the same values compiled and interpreted, and compiled in no
+/// more than `slack()` times the interpreter's time.
+fn past_the_limit(forms: [&str; 2], want: &str) {
+    for src in forms {
+        assert_eq!(both_ways(src), want, "{}", src);
+        let (fast, out) = fastest(src, &[], 2);
+        let (slow, _) = fastest(src, &[("QUILLO_JIT", "0")], 2);
+        assert_eq!(out, want);
+        assert!(fast < slow * slack(), "compiled {:?}, interpreted {:?}\n{}", fast, slow, src);
+    }
+}
+
+#[test]
+fn a_runaway_recursion_fails_in_the_interpreter_s_time() {
+    // fact(-1) never reaches its base. Compiled since Q-677 (with `return`), each level the
+    // interpreter ran went back into machine code and down to the limit: quillo-A6 0.3 s a call,
+    // where main interpreted it (0.004 s). Without `return`, main compiled it and was as slow.
+    let calls = "print(fact(5))\nprint(fact(5))\nfor k in 0..5 {\n    print(fact(-1) ?? \"E\")\n}\nprint(fact(10))\n";
+    past_the_limit(
+        [
+            &format!("fn fact(n) {{\n    if n == 0 {{\n        return 1\n    }}\n    return n * fact(n - 1)\n}}\n{}", calls),
+            &format!("fn fact(n) = n == 0 ? 1 : n * fact(n - 1)\n{}", calls),
+        ],
+        "120\n120\nE\nE\nE\nE\nE\n3628800",
+    );
+}
+
+#[test]
+fn many_calls_of_itself_at_each_level_past_the_limit_are_the_interpreter_s() {
+    // Review 4's LOW 5: each level sums 200 calls of itself at depth 0. Under the call that went
+    // too deep, each of them went into machine code again: quillo-A6 16.6 s against the
+    // interpreter's 0.26 s with `return`, and main 19.6 s without.
+    let ret = "fn r(d, x) {\n    if d <= 0 {\n        return x\n    }\n    let s = 0\n    for i in range(200) {\n        s += r(0, i)\n    }\n    return r(d - 1, s % 7)\n}\nprint(r(3, 1))\nprint(r(3, 1))\nprint(r(100000, 1) ?? \"E\")\n";
+    let bare = "fn r(d, x) {\n    if d <= 0 {\n        x\n    } else {\n        let s = 0\n        for i in range(200) {\n            s += r(0, i)\n        }\n        r(d - 1, s % 7)\n    }\n}\nprint(r(3, 1))\nprint(r(3, 1))\nprint(r(100000, 1) ?? \"E\")\n";
+    past_the_limit([ret, bare], "6\n6\nE");
+}
+
+#[test]
+fn calls_after_a_call_too_deep_are_compiled_again_in_quillo_run() {
+    // Review 4's MEDIUM 4: after `f(20000, 1)` went too deep, `h`, interpreted, calls `f(0, ..)`
+    // in a loop: compiled again, as the first call back at the top's level ends the floor. Four
+    // deep calls first: quillo-A6 took 0.23 s for each; a floor kept on would leave `h`'s calls
+    // interpreted, the interpreter's 0.1 s.
+    let h = "fn h(k) {\n    let t = 0\n    for j in 0..k {\n        t += f(0, 10000)\n    }\n    print(\"h\", t)\n}\nfor k in 0..4 {\n    print(f(20000, 1) ?? \"E\")\n}\nh(300)\n";
+    let lp = "        let s = 0\n        let i = 0\n        while i < n {\n            s += i % 3\n            i += 1\n        }\n";
+    for src in [
+        format!("fn f(d, n) {{\n    if d <= 0 {{\n{}        return s\n    }}\n    return f(d - 1, n)\n}}\n{}", lp, h),
+        format!("fn f(d, n) {{\n    if d <= 0 {{\n{}        s\n    }} else {{\n        f(d - 1, n)\n    }}\n}}\n{}", lp, h),
+    ] {
+        let want = "E\nE\nE\nE\nh 2999700";
+        assert_eq!(both_ways(&src), want, "{}", src);
+        let (fast, out) = fastest(&src, &[], 3);
+        let (slow, _) = fastest(&src, &[("QUILLO_JIT", "0")], 2);
+        assert_eq!(out, want);
+        assert!(fast * 2 < slow, "compiled {:?}, interpreted {:?}\n{}", fast, slow, src);
+    }
+}
+
+#[test]
+fn a_thread_that_ends_under_a_floor_leaves_the_others_compiled() {
+    // Each of four threads ends with a call too deep for machine code, its floor still set; the
+    // thread's end takes it out of the count every call reads first. Calls here, and in a thread
+    // after them, are compiled as before, with the interpreter's values.
+    let defs = "fn r(d) {\n    if d <= 0 {\n        return 0\n    }\n    return r(d - 1)\n}\nfn sq(x) = x * x";
+    for _ in 0..4 {
+        let src = format!("{}\n", defs);
+        std::thread::spawn(move || {
+            let mut it = Interp::new(".");
+            it.load_source(&src, "case.qwe").unwrap();
+            let f = quillo::value::lookup(&it.globals, "r").unwrap();
+            for d in [3, 3, 100000] {
+                let _ = it.call(&f, vec![quillo::value::Value::Int(d)], 0);
+            }
+        })
+        .join()
+        .unwrap();
+    }
+    check(defs, &[("r(5)", "int 0"), ("sq(3)", "int 9"), ("r(100000) ?? \"E\"", "str E"), ("sq(4)", "int 16")], 2);
+    let defs = defs.to_string();
+    std::thread::spawn(move || check(&defs, &[("sq(5)", "int 25"), ("r(7)", "int 0")], 2)).join().unwrap();
 }
