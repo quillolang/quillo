@@ -4523,7 +4523,14 @@ fn markup_kept_from_a_removed_component_does_not_keep_its_page() {
     await click("keep"); await tick(30);
     const w = { big: new WeakRef(document.querySelector(".big")), row: new WeakRef(document.querySelectorAll(".row")[7]) };
     await click("off"); await tick(100);
-    for (let k = 0; k < 4; k++) { gc(); await tick(50); }
+    // Four collections, then more while either is still there, up to forty: on a loaded runner
+    // four were not always enough (3fb0408's CI). A deref keeps its target to the end of the
+    // task, so each is looked at after a collection's wait and the next collection waits a task.
+    for (let k = 0; k < 40; k++) {
+        gc(); await tick(50);
+        if (k >= 3 && !w.big.deref() && !w.row.deref()) break;
+        await tick(0);
+    }
     out.kept = $("k").textContent; out.big = !!w.big.deref(); out.row = !!w.row.deref();
     return out;"##;
     let Some(rs) = in_pages("q901-kept-markup", KEPT_MARKUP, BOTH, body) else { return };
