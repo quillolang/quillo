@@ -2902,7 +2902,7 @@ impl Checker {
         // top-level exists.
         self.sequential = false;
         let mut ends: Vec<(Arc<str>, u32, String, String)> = Vec::new();
-        let mut r = Returns { said: Vec::new(), fns: Vec::new(), ends: Vec::new() };
+        let mut r = Returns { said: Vec::new(), fns: Vec::new(), ends: Vec::new(), depth: 0 };
         for it in &order {
             self.file = it.file.clone();
             self.scopes.clear();
@@ -8828,6 +8828,8 @@ struct Returns<'a> {
     fns: Vec<(Whose<'a>, Option<u32>)>,
     /// Null ends, by line, with the function's name: said once the whole program is read.
     ends: Vec<(u32, String, String)>,
+    /// How deep the walk is (`deep`).
+    depth: u32,
 }
 
 impl<'a> Returns<'a> {
@@ -9007,7 +9009,7 @@ impl<'a> Returns<'a> {
         let gives = way_gives(a);
         let mut r = match b {
             Some(Expr::If(c2, a2, b2)) => {
-                let r = self.chain(c2, a2, b2.as_deref(), goes);
+                let r = self.deep(|r| r.chain(c2, a2, b2.as_deref(), goes));
                 Chain { all: fa.leaves.is_some() && r.all, end: ends_of(fa.end, r.end, gives), said: r.said, first: None }
             }
             Some(b) => {
@@ -9021,7 +9023,25 @@ impl<'a> Returns<'a> {
         r
     }
 
+    /// On a new piece of stack when this one runs low, as `Checker::expr`: a program nested as
+    /// deep as the parser lets it is read on a request's stack and less (tests/security.rs's
+    /// small-stack test stopped the process in a debug build; FEEDBACK52.md, Q-678 to Q-680;
+    /// branch feedback52).
     fn value(&mut self, e: &'a Expr, goes: Goes) -> Flow {
+        self.deep(|r| r.value_here(e, goes))
+    }
+
+    /// `f` one level deeper, on a new piece of stack when this one runs low. Looked at every
+    /// eighth level only, so that a node costs no look at the stack's limit (a thread-local);
+    /// seven levels of the walk take far less than the 256 KB left.
+    fn deep<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.depth += 1;
+        let r = if self.depth % 8 == 0 { crate::stack::maybe_grow(256 << 10, 4 << 20, || f(self)) } else { f(self) };
+        self.depth -= 1;
+        r
+    }
+
+    fn value_here(&mut self, e: &'a Expr, goes: Goes) -> Flow {
         const KEPT: Goes = Goes::Kept;
         match e {
             Expr::Lit(_) | Expr::Ident(..) => {}
@@ -9161,7 +9181,7 @@ impl<'a> Returns<'a> {
         }
         for c in &el.children {
             match c {
-                HtmlChild::El(e) => self.html(e),
+                HtmlChild::El(e) => self.deep(|r| r.html(e)),
                 // `{ return ... }` as an element's child is said as pasted text (Q-448).
                 HtmlChild::Expr(x) => {
                     self.way(x, Goes::Kept);
