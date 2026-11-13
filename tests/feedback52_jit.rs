@@ -825,3 +825,128 @@ fn a_compile_refused_after_its_plan_gives_the_functions_it_did_not_make_code_tha
     check(defs, &calls, 4);
     check(floats, &float_calls, 3);
 }
+
+// ---- the second review (FEEDBACK52.md, Q-677 review 2; branch feedback52) -------------------
+
+/// `n` recursive functions each calling the next before itself: the first guess of each (an
+/// int) does not come out, as each gives a float (`0.5`) or a bool (`true`).
+fn chain(n: usize, end: &str) -> String {
+    let mut src = String::new();
+    for i in 1..=n {
+        let next = if i < n { format!("let _a = f{}(0)\n        ", i + 1) } else { String::new() };
+        src.push_str(&format!("fn f{i}(n) {{\n    if n <= 0 {{\n        {end}\n    }} else {{\n        {next}f{i}(n - 1)\n    }}\n}}\n"));
+    }
+    src + "print(f1(2))\nprint(f1(2))\nprint(f2(3))\n"
+}
+
+#[test]
+fn a_guess_that_does_not_come_out_keeps_what_never_read_it() {
+    // Each failed guess planned the rest of the chain again: quillo-B4 7.6 s for 24 float
+    // functions, 1.4 s for 14 bool ones (each function 2 and 3 times the one before), against
+    // 0.00 s here, the interpreter and main. 0.8 s leaves room for a loaded machine, and 10 times
+    // that for this build's own debug binary.
+    let limit = Duration::from_millis(if std::env::var_os("QUILLO_TEST_BIN").is_none() && cfg!(debug_assertions) { 8000 } else { 800 });
+    for (n, end, want) in [(24, "0.5", "0.5\n0.5\n0.5"), (14, "true", "true\ntrue\ntrue"), (40, "0.5", "0.5\n0.5\n0.5")] {
+        let src = chain(n, end);
+        let t = Instant::now();
+        assert_eq!(both_ways(&src), want, "{} functions ending in {}", n, end);
+        assert!(t.elapsed() < limit * 2, "{} functions ending in {}: {:?} (both runs)", n, end, t.elapsed());
+    }
+}
+
+#[test]
+fn a_guess_that_does_not_come_out_keeps_what_never_read_it_and_compiles_the_chain() {
+    // The chain is compiled, the first function's compile planning all the others once.
+    check(&chain(12, "0.5").replace("print(f1(2))\nprint(f1(2))\nprint(f2(3))\n", ""), &[("f1(2)", "float 0.5"), ("f2(3)", "float 0.5"), ("f12(1)", "float 0.5")], 3);
+}
+
+#[test]
+fn a_call_too_deep_is_followed_down_past_another_function_called_at_its_depth() {
+    // `h` is compiled, and called at the depth of `r`'s next call: the depth kept for the thread
+    // was taken back there, and each level went into machine code to the limit again
+    // (quillo-B4 0.24 s a call, the interpreter 0.01 s). The same when `h` recurses itself.
+    for h in ["fn h(x) {\n    x + 1\n}\n", "fn h(x) {\n    return x <= 0 ? 1 : h(x - 1) + 1\n}\n"] {
+        let src = format!("{}fn r(d, x) {{\n    if d <= 0 {{\n        return x\n    }}\n    return r(d - 1, h(x % 3))\n}}\nprint(h(1))\nprint(h(2))\nfor k in 0..4 {{\n    print(r(100000, 1) ?? \"E\")\n}}\nprint(r(10, 1))\n", h);
+        let want = "2\n3\nE\nE\nE\nE\n2";
+        assert_eq!(both_ways(&src), want);
+        let (fast, out) = fastest(&src, &[], 3);
+        let (slow, _) = fastest(&src, &[("QUILLO_JIT", "0")], 2);
+        assert_eq!(out, want);
+        assert!(fast < slow * 2, "compiled {:?}, interpreted {:?}\n{}", fast, slow, src);
+    }
+}
+
+#[test]
+fn a_builtin_compiled_code_reads_is_checked_where_it_is_called_again() {
+    // `inner` is one function in two scopes: in the second `range` is the program's `r2`, and
+    // compiled code made in the first gave the builtin's 6 where the interpreter says "cannot
+    // loop over int" (main and quillo-B4).
+    let nested = "fn mk(shadow) {
+    fn r2(n) { 2 }
+    let range = if shadow { r2 } else { range }
+    fn inner(n) {
+        let s = 0
+        for i in range(n) {
+            s += i
+        }
+        s
+    }
+    [inner]
+}
+let ka = mk(false)
+let kb = mk(true)
+print(ka[0](4))
+print(ka[0](4))
+print(ka[0](5))
+print(kb[0](4))
+";
+    let got = both_ways(nested);
+    assert!(got.starts_with("6\n6\n10\nFAILED") && got.contains("cannot loop over int"), "{}", got);
+    // `range` given another value at the top (which `quillo check` refuses): 10, not 6.
+    let top = "fn f(n) {\n    let s = 0\n    for i in range(n) {\n        s += i\n    }\n    s\n}\nprint(f(4))\nprint(f(4))\nrange = (n) => [10]\nprint(f(4))\n";
+    assert_eq!(both_ways(top), "6\n6\n10");
+    // Another builtin, `abs`, the program's in one scope and the builtin in the other: the call
+    // of it is a dep already, and stays one.
+    let other = "fn mk(shadow) {
+    fn my_abs(x) = x < 0 ? 0 - x + 100 : x + 100
+    let abs = if shadow { my_abs } else { abs }
+    fn inner(n) {
+        abs(n) * 2
+    }
+    [inner]
+}
+let ka = mk(true)
+let kb = mk(false)
+print(ka[0](-4))
+print(ka[0](-4))
+print(kb[0](-4))
+print(kb[0](-4))
+";
+    assert_eq!(both_ways(other), "208\n208\n8\n8");
+    // `range` the builtin everywhere, nested or not: compiled.
+    check("fn f(n) {\n    let s = 0\n    for i in range(n) {\n        s += i\n    }\n    s\n}", &[("f(4)", "int 6"), ("f(0)", "int 0"), ("f(1)", "int 0")], 1);
+}
+
+#[test]
+fn a_plan_standing_on_a_guess_stands_on_the_outermost_one_it_reads() {
+    // `h` reads `g`'s guess and `g` reads `f`'s: once `g` is planned, `h` stands on `f`'s guess,
+    // and `f` reads `g` again from the plan. `k`, planned under `f`'s first guess (an int, which
+    // does not come out), never read it, and is kept while `g` and `h` are planned again.
+    let defs = "fn k(x) = x * 2.0
+fn f(n) = n <= 0 ? 0.5 + k(1.0) : g(n - 1) + g(n - 2)
+fn g(n) = n <= 0 ? h(n) : f(n - 1)
+fn h(n) = n <= 0 ? 1.5 : g(n - 1)";
+    let calls = [("f(0)", "float 2.5"), ("f(1)", "float 3.0"), ("f(2)", "float 4.0"), ("f(5)", "float 9.5"), ("g(3)", "float 4.0"), ("h(4)", "float 4.0")];
+    check(defs, &calls, 3);
+    // `q`, planned on `p`'s first guess, and `k3`, which reads none, planned after it under that
+    // guess: `k3` is kept when the guess does not come out, `q` planned again. And `w`, which
+    // reads `u`'s guess, still stands on it once `v` is planned.
+    let defs = "fn k3(x) = x * 2.0
+fn p(n) = n <= 0 ? 0.5 : q(n - 1) + k3(2.0)
+fn q(n) = p(n)
+fn u(n) = n <= 0 ? 0.5 : v(n - 1)
+fn v(n) = n <= 0 ? 1.5 : w(n - 1)
+fn w(n) = n <= 0 ? 2.5 : u(n - 1)";
+    let calls = [("p(0)", "float 0.5"), ("p(3)", "float 12.5"), ("q(2)", "float 8.5"), ("u(0)", "float 0.5"), ("u(1)", "float 1.5"), ("u(2)", "float 2.5"), ("u(5)", "float 2.5"), ("v(3)", "float 1.5")];
+    check(defs, &calls, 4);
+}

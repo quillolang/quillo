@@ -86,6 +86,10 @@ type Key = (usize, Vec<T>);
 /// `FnDef::hot` once a function is known not to compile.
 const NEVER: u32 = u32::MAX;
 
+/// `FnDef::hot` from this up, after a call of the function too deep for machine code (`run`):
+/// this plus the depth of the last call of it the interpreter has followed down since.
+const DEEPER: u32 = 2;
+
 struct Jit {
     module: JITModule,
     done: HashMap<Key, Option<Arc<Compiled>>>,
@@ -96,8 +100,8 @@ struct Jit {
 thread_local! {
     static JIT: RefCell<Option<Jit>> = const { RefCell::new(None) };
     static LAST: std::cell::Cell<Option<Quick>> = const { std::cell::Cell::new(None) };
-    /// How deep the interpreter has followed a call that went too deep for machine code (`run`).
-    static DEEP: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    /// The call `run` gave up on was too deep, for its caller to say so of its function.
+    static TOO_DEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The function called last, if what it calls cannot change under it.
@@ -215,17 +219,19 @@ pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Option<Result<Valu
     if let Some(q) = LAST.get().filter(|q| q.def == at && q.code == code) {
         return run(q.entry, q.ret, &raw, depth);
     }
-    // Under a call that went too deep for machine code, the interpreter follows it down, level
-    // by level; at a call no deeper than the last it followed, it is back above it. Only here,
-    // not before the last function, which `run` forgets then (FEEDBACK52.md, Q-677 review;
-    // branch feedback52).
-    let deep = DEEP.get();
-    if depth > deep {
-        DEEP.set(depth);
-        return None;
-    }
-    if deep != usize::MAX {
-        DEEP.set(usize::MAX);
+    // Under a call of it that went too deep for machine code, the interpreter follows this
+    // function down, level by level; at a call of it no deeper than the last it followed, it is
+    // back above it. Only here, not before the last function, which `run` forgets then
+    // (FEEDBACK52.md, Q-677 review; branch feedback52). Kept for each function: kept for the
+    // thread, a call of another one at the same depth (`r(d - 1, h(x))`), or a recursion of its
+    // own under it, took it back above at each level (Q-677 review 2).
+    if hot >= DEEPER {
+        let at = depth as u32 + DEEPER;
+        if at > hot {
+            def.hot.store(at, Relaxed);
+            return None;
+        }
+        def.hot.store(1, Relaxed);
     }
     let compiled = JIT.with(|j| {
         let mut j = j.borrow_mut();
@@ -248,14 +254,23 @@ pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Option<Result<Valu
     if compiled.deps.is_empty() {
         LAST.set(Some(Quick { def: at, code, entry: compiled.entry, ret: compiled.ret }));
     }
-    // What it calls is still what it was compiled with.
+    // What it calls is still what it was compiled with, and a builtin it reads (`range`, at 0)
+    // still that builtin.
     for (name, at) in &compiled.deps {
         match lookup(&c.env, name) {
             Some(Value::Func(f)) if Arc::as_ptr(&f.def) as usize == *at => {}
+            Some(Value::Builtin(b, _)) if *at == 0 && b == name.as_str() => {}
             _ => return None,
         }
     }
-    run(compiled.entry, compiled.ret, &raw, depth)
+    let r = run(compiled.entry, compiled.ret, &raw, depth);
+    // Too deep (`run`): from this call down, the interpreter's. Said here, not in `run`, which
+    // the last function's call goes to as well: it calls nothing (no deps), so it never goes
+    // too deep, and is not slowed by it.
+    if r.is_none() && TOO_DEEP.replace(false) {
+        def.hot.store(depth as u32 + DEEPER, Relaxed);
+    }
+    r
 }
 
 fn run(entry: Entry, ret: T, raw: &[u64; 16], depth: usize) -> Option<Result<Value, Ctrl>> {
@@ -274,7 +289,7 @@ fn run(entry: Entry, ret: T, raw: &[u64; 16], depth: usize) -> Option<Result<Val
         // calls for a recursion that fails at 10,000 levels, 30 times the interpreter's time
         // (FEEDBACK52.md, Q-677 review; branch feedback52).
         if ctx.depth == ctx.max {
-            DEEP.set(depth);
+            TOO_DEEP.set(true);
             LAST.set(None);
         }
         return None;
@@ -365,17 +380,29 @@ struct Plan<'a> {
     /// Functions planned (and to compile): result type.
     types: HashMap<Key, T>,
     order: Vec<(Arc<FnDef>, Vec<T>)>,
-    /// Being planned, with the result type assumed for calls back into it.
-    open: HashMap<Key, (T, bool)>,
+    /// Being planned, with the result type assumed for calls back into it, whether one read it,
+    /// and its place in `lows`.
+    open: HashMap<Key, (T, bool, usize)>,
     deps: Vec<(String, usize)>,
     done: &'a HashMap<Key, Option<Arc<Compiled>>>,
+    /// Planned functions that read a guess still being made: the place in `lows` of the
+    /// outermost function guessed. Only these are taken back when a guess does not come out
+    /// (FEEDBACK52.md, Q-677 review 2; branch feedback52).
+    stands_on: HashMap<Key, usize>,
+    /// For each function being planned, the outermost place in it whose guess its plan read
+    /// (`usize::MAX` for none).
+    lows: Vec<usize>,
 }
 
 impl<'a> Plan<'a> {
     fn func(&mut self, def: &Arc<FnDef>, args: &[T]) -> Option<T> {
         let key = (Arc::as_ptr(def) as usize, args.to_vec());
         if let Some(t) = self.types.get(&key) {
-            return Some(*t);
+            let t = *t;
+            if let Some(&on) = self.stands_on.get(&key) {
+                self.read(on);
+            }
+            return Some(t);
         }
         if let Some(Some(c)) = self.done.get(&key) {
             // Its code is called as it is (`Compiled::id`), so what it calls is what this plan
@@ -387,22 +414,27 @@ impl<'a> Plan<'a> {
             }
             return Some(c.ret);
         }
-        if let Some((t, used)) = self.open.get_mut(&key) {
+        if let Some((t, used, at)) = self.open.get_mut(&key) {
             *used = true;
-            return Some(*t);
+            let (t, at) = (*t, *at);
+            self.read(at);
+            return Some(t);
         }
         if !shape_ok(def) || def.params.len() != args.len() || !def.params.iter().zip(args).all(|(p, t)| ty_takes(&p.ty, *t)) {
             return None;
         }
         // A recursive function's calls of itself: its result type is
         // guessed, and the guess must come out.
+        let me = self.lows.len();
         for guess in [T::I, T::F, T::B] {
-            self.open.insert(key.clone(), (guess, false));
-            let (planned, deps) = (self.order.len(), self.deps.len());
+            self.open.insert(key.clone(), (guess, false, me));
+            self.lows.push(usize::MAX);
+            let planned = self.order.len();
             let mut sc = Scopes { stack: vec![def.params.iter().map(|p| p.name.to_string()).zip(args.iter().copied()).collect()] };
             let mut ret = None;
             let got = self.tail(&def.body, &mut sc, &mut ret);
-            let (_, used) = self.open.remove(&key).unwrap();
+            let (_, used, _) = self.open.remove(&key).unwrap();
+            let low = self.lows.pop().unwrap();
             let t = match (got, ret) {
                 (Some(Some(a)), Some(b)) if a != b => None,
                 (Some(Some(a)), _) => Some(a),
@@ -415,26 +447,63 @@ impl<'a> Plan<'a> {
             };
             match t {
                 Some(t) if (!used || t == guess) && ty_takes(&def.ret, t) => {
+                    // What read this guess now stands on what this plan reads: an outer guess,
+                    // or none.
+                    let on = (low < me).then_some(low);
+                    if !self.stands_on.is_empty() {
+                        for (d, a) in &self.order[planned..] {
+                            let k = (Arc::as_ptr(d) as usize, a.clone());
+                            if self.stands_on.get(&k) == Some(&me) {
+                                match on {
+                                    Some(on) => self.stands_on.insert(k, on),
+                                    None => self.stands_on.remove(&k),
+                                };
+                            }
+                        }
+                    }
+                    if let Some(on) = on {
+                        self.stands_on.insert(key.clone(), on);
+                        self.read(on);
+                    }
                     self.types.insert(key, t);
                     self.order.push((def.clone(), args.to_vec()));
                     return Some(t);
                 }
                 _ => {}
             }
-            // A guess that did not come out takes back what was planned under it. A function
+            // A guess that did not come out takes back what was planned on it. A function
             // planned to call this one as `guess` stayed in `types`, the next guess found it there
             // without calling back into this one (so without `used`), and it was made with the
             // wrong type: Cranelift's def_var stopped the process (FEEDBACK52.md, Q-677 review;
-            // branch feedback52).
-            for (d, a) in self.order.drain(planned..) {
-                self.types.remove(&(Arc::as_ptr(&d) as usize, a));
+            // branch feedback52). Only those: taking back every function planned under the guess
+            // planned the ones that never read it again at each guess, and a chain of recursive
+            // functions each calling the next took 2 to 3 times as long for each function, 7 s
+            // for 24 (Q-677 review 2). `deps` keeps what they added: one too many is only looked
+            // at.
+            if !self.stands_on.is_empty() {
+                let tail: Vec<_> = self.order.drain(planned..).collect();
+                for (d, a) in tail {
+                    let k = (Arc::as_ptr(&d) as usize, a);
+                    if self.stands_on.remove(&k).is_some() {
+                        self.types.remove(&k);
+                    } else {
+                        self.order.push((d, k.1));
+                    }
+                }
             }
-            self.deps.truncate(deps);
             if !used {
                 return None;
             }
         }
         None
+    }
+
+    /// The function being planned read a plan, or a guess, standing on the guess at `at` in
+    /// `lows`.
+    fn read(&mut self, at: usize) {
+        if let Some(l) = self.lows.last_mut() {
+            *l = (*l).min(at);
+        }
     }
 
     /// The type of `e` where its value is the function's, a block's last or an `if`'s arm's,
@@ -574,6 +643,15 @@ impl<'a> Plan<'a> {
             }
             Expr::For(pat, iter, body, _) => {
                 let (a, b) = range_of(iter, self.env)?;
+                // `range(n)`, read as the builtin: where `range` is something else when the code
+                // is called again (a nested function's other scope, or `range = ...`), it is not
+                // run. It gave the builtin's sum where the interpreter said "cannot loop over
+                // int" (FEEDBACK52.md, Q-677 review 2; branch feedback52).
+                // A builtin's dep has no function: 0.
+                let dep = ("range".to_string(), 0);
+                if matches!(&**iter, Expr::Call(..)) && !self.deps.contains(&dep) {
+                    self.deps.push(dep);
+                }
                 if let Some(a) = a {
                     if self.value(a, sc, ret)? != T::I {
                         return None;
@@ -708,7 +786,7 @@ pub(crate) fn swapped(op: BinOp) -> BinOp {
 // ---- making the code ---------------------------------------------------
 
 fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
-    let mut plan = Plan { env: &c.env, types: HashMap::new(), order: Vec::new(), open: HashMap::new(), deps: Vec::new(), done: &jit.done };
+    let mut plan = Plan { env: &c.env, types: HashMap::new(), order: Vec::new(), open: HashMap::new(), deps: Vec::new(), done: &jit.done, stands_on: HashMap::new(), lows: Vec::new() };
     let ret = plan.func(&c.def, sig)?;
     let (types, order, deps) = (plan.types, plan.order, plan.deps);
     // Each function to make, declared first (they may call each other).
