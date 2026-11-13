@@ -2901,6 +2901,8 @@ impl Checker {
         // Function, component and route bodies run later, when everything
         // top-level exists.
         self.sequential = false;
+        let mut ends: Vec<(Arc<str>, u32, String, String)> = Vec::new();
+        let mut r = Returns { said: Vec::new(), fns: Vec::new(), ends: Vec::new() };
         for it in &order {
             self.file = it.file.clone();
             self.scopes.clear();
@@ -2911,6 +2913,30 @@ impl Checker {
                 Stmt::Route(r) if r.method == crate::ast::GUARD_METHOD => {}
                 Stmt::Route(r) => self.route(r),
                 _ => {}
+            }
+            // Where each `return` is, what follows one, and how each function ends: read from
+            // the code as written, in one walk of each top-level statement (FEEDBACK52.md, Q-678
+            // to Q-680; branch feedback52).
+            match &it.stmt {
+                Stmt::Fn(d) => r.function(d, Whose::Named(&d.name), true),
+                Stmt::Route(rd) if rd.method == crate::ast::GUARD_METHOD => {}
+                s => r.stmt(s, Goes::Dropped),
+            }
+            for (line, msg) in r.said.drain(..) {
+                self.diag_at(it.file.clone(), line, Severity::Warning, msg);
+            }
+            ends.extend(r.ends.drain(..).map(|(line, name, msg)| (it.file.clone(), line, name, msg)));
+        }
+        // A null end is said of a function the program calls. One it hands to other code (a
+        // group's middleware, a `check:`, a callback, a handler) gives what that code makes of
+        // null: no match for middleware (decided 2026-11-04), a refusal for `check`, false for
+        // `filter` (FEEDBACK52.md, Q-679; branch feedback52).
+        if !ends.is_empty() {
+            let handed: HashSet<String> = handed_over(&order, &ends.iter().map(|e| e.2.as_str()).collect()).into_iter().map(String::from).collect();
+            for (file, line, name, msg) in ends {
+                if !handed.contains(&name) {
+                    self.diag_at(file, line, Severity::Warning, msg);
+                }
             }
         }
         // What each tool's code does, once every body is known, in the order the tools are
@@ -8609,6 +8635,513 @@ fn exits(e: &Expr) -> bool {
             _ => false,
         },
         _ => false,
+    }
+}
+
+// ---- what a `return` does where it is written (FEEDBACK52.md, Q-678 to Q-680; branch feedback52) ----
+
+/// Where a value goes, for what a `return` in it does.
+#[derive(Clone, Copy, PartialEq)]
+enum Goes {
+    /// Nowhere: a statement, run for what it does.
+    Dropped,
+    /// To the end of the function: its last statement, which gives it, if it is a value. A
+    /// `for` there may be a loop run for what it does, whose list is given by the way.
+    End,
+    /// Out of the function: a `return`'s value, an `= expr` body. A `return` in it leaves with
+    /// what it would have given anyway.
+    Out,
+    /// To something else: a `let`, an argument, an operand.
+    Kept,
+}
+
+/// What a value is, as it is written, when that shows: two ways of an `if` written as the same
+/// kind are two values for the same thing.
+#[derive(Clone, Copy, PartialEq)]
+enum Written {
+    Str,
+    Num,
+    Bool,
+    List,
+    Map,
+    Html,
+}
+
+fn written_kind(e: &Expr) -> Option<Written> {
+    use Written::*;
+    match e {
+        Expr::Lit(Lit::Str(_)) | Expr::Template(_) => Some(Str),
+        Expr::Lit(Lit::Int(_) | Lit::Float(_) | Lit::Dec(_)) => Some(Num),
+        Expr::Lit(Lit::Bool(_)) | Expr::Unary(UnOp::Not, ..) => Some(Bool),
+        Expr::Unary(UnOp::Neg, x, _) => (written_kind(x) == Some(Num)).then_some(Num),
+        Expr::Binary(BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge, ..) => Some(Bool),
+        // `a + "s"` is text; `a - 1` a number. `a + b` could be either, and is not told.
+        Expr::Binary(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod), a, b, _) => {
+            let (x, y) = (written_kind(a), written_kind(b));
+            if *op == BinOp::Add && (x == Some(Str) || y == Some(Str)) {
+                Some(Str)
+            } else if *op != BinOp::Add || x == Some(Num) || y == Some(Num) {
+                Some(Num)
+            } else {
+                None
+            }
+        }
+        Expr::List(_) => Some(List),
+        Expr::Map(_) => Some(Map),
+        Expr::Html(..) => Some(Html),
+        _ => None,
+    }
+}
+
+/// The last expression of a way of an `if` or `match`: what it gives, as written.
+fn way_value(e: &Expr) -> Option<&Expr> {
+    match e {
+        Expr::Block(stmts) => match stmts.last() {
+            Some(Stmt::Expr(x)) => Some(x),
+            _ => None,
+        },
+        e => Some(e),
+    }
+}
+
+/// The first `return` of a block itself, not of a block in it: its value and its line.
+fn own_return(e: &Expr) -> Option<(Option<&Expr>, u32)> {
+    let Expr::Block(stmts) = e else { return None };
+    stmts.iter().find_map(|s| if let Stmt::Return(v, line) = s { Some((v.as_ref(), *line)) } else { None })
+}
+
+/// How a statement always leaves, so that what follows it never runs: by a `return`, a
+/// `reply`, or an `if` or `match` each of whose ways does.
+#[derive(Clone, Copy)]
+enum Leaves {
+    Return(u32),
+    Reply(u32),
+    If(u32),
+    Match(u32),
+}
+
+impl Leaves {
+    fn line(self) -> u32 {
+        match self {
+            Leaves::Return(l) | Leaves::Reply(l) | Leaves::If(l) | Leaves::Match(l) => l,
+        }
+    }
+}
+
+fn leaves_stmt(s: &Stmt) -> Option<Leaves> {
+    match s {
+        Stmt::Return(_, line) => Some(Leaves::Return(*line)),
+        Stmt::Expr(e) => leaves(e),
+        _ => None,
+    }
+}
+
+fn leaves(e: &Expr) -> Option<Leaves> {
+    match e {
+        Expr::Reply(_, _, line) => Some(Leaves::Reply(*line)),
+        Expr::Block(stmts) => stmts.iter().find_map(leaves_stmt),
+        Expr::If(c, a, Some(b)) => {
+            let first = leaves(a)?;
+            leaves(b)?;
+            // `if true { ... }` has no line of its own: its first way's.
+            Some(Leaves::If(match crate::debug::expr_line(c) {
+                0 => first.line(),
+                l => l,
+            }))
+        }
+        // A `match` no arm of which fits fails, which leaves too.
+        Expr::Match(_, arms, line) if !arms.is_empty() && arms.iter().all(|a| leaves(&a.body).is_some()) => Some(Leaves::Match(*line)),
+        _ => None,
+    }
+}
+
+/// Whether a statement never lets the code after it run: it leaves, or it is `while true`,
+/// which only a `return` ends.
+fn never_ends(s: &Stmt) -> bool {
+    leaves_stmt(s).is_some() || matches!(s, Stmt::Expr(Expr::While(c, ..)) if matches!(**c, Expr::Lit(Lit::Bool(true))))
+}
+
+/// How a function's end gives null without saying so, when it can be reached: a last
+/// statement that is no value, an `if` with no `else` (and whether a way of it gives a value
+/// written as one), or a `for`, which gives its list.
+enum End {
+    Null(u32),
+    NoElse(u32, bool),
+    List(u32),
+}
+
+fn block_end(stmts: &[Stmt]) -> Option<End> {
+    if stmts.iter().any(never_ends) {
+        return None;
+    }
+    // A `return` last has been seen to leave; any other statement gives null.
+    match stmts.last()? {
+        Stmt::Expr(e) => expr_end(e),
+        s => top_line(s).map(End::Null),
+    }
+}
+
+fn expr_end(e: &Expr) -> Option<End> {
+    let gives = |w: &Expr| way_value(w).and_then(written_kind).is_some_and(|k| k != Written::Html);
+    match e {
+        Expr::If(c, a, None) => expr_end(a).or(Some(End::NoElse(crate::debug::expr_line(c), gives(a)))),
+        Expr::If(_, a, Some(b)) => match (expr_end(a), expr_end(b)) {
+            (_, Some(End::NoElse(l, v))) => Some(End::NoElse(l, v || gives(a))),
+            (Some(x), _) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        },
+        Expr::Match(_, arms, _) => arms.iter().find_map(|a| expr_end(&a.body)),
+        Expr::Block(stmts) => block_end(stmts),
+        Expr::While(c, _, line) if !matches!(**c, Expr::Lit(Lit::Bool(true))) => Some(End::Null(*line)),
+        // A `for` whose rounds give nothing makes a list of nulls, which is never what is meant:
+        // a loop that finds, `for x in xs { if x == v { return x } }`. One whose rounds give a
+        // value makes the list that is meant (`return []` first, then `for x in xs => ...`).
+        Expr::For(_, _, body, line) if rounds_give_nothing(body) => Some(End::List(*line)),
+        _ => None,
+    }
+}
+
+/// Whether each round of a `for` gives null, or leaves: its body ends in no value (a `let`, an
+/// assignment, a `return`), or in an `if` with no `else` whose way leaves.
+fn rounds_give_nothing(body: &Expr) -> bool {
+    match way_value(body) {
+        None => true,
+        Some(Expr::If(_, a, None)) => leaves(a).is_some(),
+        Some(_) => false,
+    }
+}
+
+/// Of `names`, the functions the program hands to other code rather than calls: named where a
+/// value goes, as an argument, a field, an attribute, or a group's middleware.
+fn handed_over<'a>(order: &[Item], names: &HashSet<&'a str>) -> HashSet<&'a str> {
+    // Each name's times written, and times called: the walk sees a callee as a call and again
+    // as a name.
+    let mut uses: HashMap<&'a str, (u32, u32)> = HashMap::new();
+    let mut handed = HashSet::new();
+    let mut count = |e: &Expr, called: bool| {
+        if let Expr::Ident(n, _) = e {
+            if let Some(k) = names.get(n.as_str()) {
+                let u = uses.entry(*k).or_default();
+                if called {
+                    u.1 += 1;
+                } else {
+                    u.0 += 1;
+                }
+            }
+        }
+    };
+    for it in order {
+        walk_stmts(std::slice::from_ref(&it.stmt), &mut |x| match x {
+            Expr::Ident(..) => count(x, false),
+            Expr::Pipe(_, f, _) => count(f, true),
+            // `__answer(admins(__request), "admins")` starts each route of `routes /x | admins`.
+            Expr::Call(f, args, _) => match (&**f, args.first()) {
+                (Expr::Ident(a, _), Some(Expr::Call(m, _, _))) if a == "__answer" => {
+                    if let Expr::Ident(n, _) = &**m {
+                        if let Some(k) = names.get(n.as_str()) {
+                            handed.insert(*k);
+                        }
+                    }
+                }
+                _ => count(f, true),
+            },
+            _ => {}
+        });
+    }
+    handed.extend(uses.into_iter().filter(|(_, (all, called))| all > called).map(|(n, _)| n));
+    handed
+}
+
+/// A `return` that gives something: not null, an error (`return err(...)` says it failed, and
+/// its end that it did not) or a `reply`, which answers the request.
+fn gives_a_value(e: &Expr) -> bool {
+    !matches!(e, Expr::Lit(Lit::Nil) | Expr::Reply(..)) && !matches!(e, Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(n, _) if n == "err"))
+}
+
+/// Whose a `return` is, as a message names it.
+#[derive(Clone, Copy)]
+enum Whose<'a> {
+    Named(&'a str),
+    Arrow,
+    Route,
+    File,
+}
+
+impl Whose<'_> {
+    fn text(self) -> String {
+        match self {
+            Whose::Named(n) => format!("`{}`", n),
+            Whose::Arrow => "the function".to_string(),
+            Whose::Route => "the route".to_string(),
+            Whose::File => "the file".to_string(),
+        }
+    }
+}
+
+/// A walk of the program's top-level statements for these: where each `return` is, what
+/// follows it, and how each named function ends.
+struct Returns<'a> {
+    /// What to say, by line.
+    said: Vec<(u32, String)>,
+    /// The functions being read, the innermost last: whose, and the line of its first `return`
+    /// that gives a value.
+    fns: Vec<(Whose<'a>, Option<u32>)>,
+    /// Null ends, by line, with the function's name: said once the whole program is read.
+    ends: Vec<(u32, String, String)>,
+}
+
+impl<'a> Returns<'a> {
+    fn name(&self) -> String {
+        self.fns.last().map_or(Whose::File, |f| f.0).text()
+    }
+
+    fn function(&mut self, d: &'a FnDef, whose: Whose<'a>, named: bool) {
+        self.fns.push((whose, None));
+        for p in &d.params {
+            if let Some(e) = &p.default {
+                self.value(e, Goes::Kept);
+            }
+        }
+        match &d.body {
+            Expr::Block(stmts) => self.stmts(stmts, Goes::End),
+            e => self.value(e, Goes::Out),
+        }
+        let gave = self.fns.pop().and_then(|f| f.1);
+        // An untyped function's null end: a typed one is held to its type already (Q-679). A
+        // view or a component shows nothing for null, which is what such an end is for.
+        if !named || d.ret.is_some() || d.component || is_view(d) {
+            return;
+        }
+        // An `= expr` body that is a `for` gives its list as meant.
+        let end = match &d.body {
+            Expr::Block(stmts) => block_end(stmts),
+            e => expr_end(e).filter(|x| !matches!(x, End::List(_))),
+        };
+        // An `if` whose condition has no line (`if true`) is said on the function's.
+        let at_least = |l: u32| if l == 0 { d.line } else { l };
+        let msg = match (end, gave) {
+            (Some(End::Null(line) | End::NoElse(line, _)), Some(at)) => (
+                at_least(line),
+                format!("`{}` returns a value on line {} but gives null when it reaches its end: end it with a value too, or `null` if null is meant", d.name, at),
+            ),
+            (Some(End::List(line)), Some(at)) => (
+                line,
+                format!(
+                    "`{}` returns a value on line {} but, when it reaches its end, gives the list of nulls its `for` makes: end it with the value it should give, or `null`",
+                    d.name, at
+                ),
+            ),
+            (Some(End::NoElse(line, true)), None) => (
+                at_least(line),
+                format!("`{}` gives null when this `if` is false, as it has no `else`: write one, or `else {{ null }}` if null is meant", d.name),
+            ),
+            _ => return,
+        };
+        self.ends.push((msg.0, d.name.clone(), msg.1));
+    }
+
+    fn stmts(&mut self, stmts: &'a [Stmt], goes: Goes) {
+        let n = stmts.len();
+        for (i, s) in stmts.iter().enumerate() {
+            self.stmt(s, if i + 1 == n { goes } else { Goes::Dropped });
+        }
+        // What follows a statement that always leaves (Q-680).
+        let Some((i, how)) = stmts.iter().enumerate().find_map(|(i, s)| leaves_stmt(s).map(|l| (i, l))) else { return };
+        if i + 1 == n {
+            return;
+        }
+        let f = self.name();
+        let why = match how {
+            Leaves::Return(l) => format!("the `return` on line {} always leaves {}", l, f),
+            Leaves::Reply(l) => format!("the `reply` on line {} always ends the request", l),
+            Leaves::If(l) => format!("each way of the `if` on line {} leaves {}", l, f),
+            Leaves::Match(l) => format!("each arm of the `match` on line {} leaves {}", l, f),
+        };
+        // A statement with no line of its own (a literal) is said where the leaving is.
+        match stmts[i + 1..].iter().find_map(top_line) {
+            Some(line) => self.said.push((line, format!("this never runs: {}", why))),
+            None => self.said.push((how.line(), format!("what follows never runs: {}", why))),
+        }
+    }
+
+    fn stmt(&mut self, s: &'a Stmt, goes: Goes) {
+        match s {
+            Stmt::Let(Pattern::Bind(n), Expr::Lambda(d), _) => self.function(d, Whose::Named(n.as_str()), false),
+            Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::State(_, e, _) => self.value(e, Goes::Kept),
+            Stmt::SetField(o, _, _, e, _) => {
+                self.value(o, Goes::Kept);
+                self.value(e, Goes::Kept);
+            }
+            Stmt::Expr(e) => self.value(e, goes),
+            Stmt::Return(v, line) => {
+                if let Some(v) = v {
+                    if gives_a_value(v) {
+                        if let Some(f) = self.fns.last_mut() {
+                            f.1.get_or_insert(*line);
+                        }
+                    }
+                    self.value(v, Goes::Out);
+                }
+            }
+            Stmt::Fn(d) => self.function(d, Whose::Named(&d.name), true),
+            Stmt::Route(r) => {
+                self.fns.push((Whose::Route, None));
+                match &r.body {
+                    Expr::Block(stmts) => self.stmts(stmts, Goes::End),
+                    e => self.value(e, Goes::Out),
+                }
+                self.fns.pop();
+            }
+            Stmt::Service(_, _, _, Some(e), _, _) => self.value(e, Goes::Kept),
+            Stmt::Type(td) => td.defaults.iter().for_each(|(_, e)| self.value(e, Goes::Kept)),
+            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(_, _, _, None, _, _) => {}
+        }
+    }
+
+    /// A way of an `if` or `match`, or a `for`'s body: its statements, where its value goes.
+    /// What a `return` of its own means was said by what it is a way of.
+    fn way(&mut self, e: &'a Expr, goes: Goes) {
+        match e {
+            Expr::Block(stmts) => self.stmts(stmts, goes),
+            e => self.value(e, goes),
+        }
+    }
+
+    /// A `return` of a block whose value is used: it leaves the function (Q-678).
+    fn kept_return(&mut self, v: Option<&Expr>, line: u32, what: &str) {
+        let f = self.name();
+        let fix = match v.map(written) {
+            Some(w) if w != "..." => format!("write `{}`", w),
+            Some(_) => "write the value without `return`".to_string(),
+            None => "write the value it should give".to_string(),
+        };
+        let msg = match what {
+            "for" => format!("this `return` leaves {} in the first round, so the `for` never makes its list: a `for` gives what its body gives each round, so {}", f, fix),
+            "match" => format!("this `return` leaves {}, not only the `match`: an arm gives its last expression, so {}", f, fix),
+            "block" => format!("this `return` leaves {}, not only the block: a block gives its last expression, so {}", f, fix),
+            _ => format!("this `return` leaves {}, not only the `if`: an `if` gives its last expression, so {}", f, fix),
+        };
+        self.said.push((line, msg));
+    }
+
+    /// The ways of an `if` or a `match`. Where its value is used, a `return` of a way leaves
+    /// the function: said when every way leaves, so it never gives that value, or when another
+    /// way gives a value written as the same kind as the `return`'s, the two then being values
+    /// of the `if`. A `return` that gives null, an error or what a call gives is the early exit
+    /// of a guard, `let x = if bad { return null } else { ... }`, and is let be.
+    fn ways(&mut self, ways: &[&'a Expr], goes: Goes, what: &str, whole: bool) {
+        if goes == Goes::Kept {
+            let all = whole && ways.iter().all(|w| leaves(w).is_some());
+            for (i, w) in ways.iter().enumerate() {
+                let Some((v, line)) = own_return(w) else { continue };
+                let kind = v.and_then(written_kind);
+                let same = kind.is_some() && ways.iter().enumerate().any(|(j, o)| j != i && way_value(o).and_then(written_kind) == kind);
+                if all || same {
+                    self.kept_return(v, line, what);
+                    if all {
+                        break;
+                    }
+                }
+            }
+        }
+        for w in ways {
+            self.way(w, goes);
+        }
+    }
+
+    fn value(&mut self, e: &'a Expr, goes: Goes) {
+        const KEPT: Goes = Goes::Kept;
+        match e {
+            Expr::Lit(_) | Expr::Ident(..) => {}
+            Expr::Template(parts) => {
+                for p in parts {
+                    if let TPart::Expr(x) = p {
+                        self.value(x, KEPT);
+                    }
+                }
+            }
+            Expr::List(xs) => xs.iter().for_each(|x| self.value(x, KEPT)),
+            Expr::Map(es) => es.iter().for_each(|(_, x)| self.value(x, KEPT)),
+            Expr::Unary(_, x, _) | Expr::Try(x) | Expr::Field(x, _, _) => self.value(x, KEPT),
+            // `find(xs) ?? return null`, `ok || return false`: the right runs on one side only,
+            // the early exit the guide shows.
+            Expr::Coalesce(a, b) | Expr::Binary(BinOp::And | BinOp::Or, a, b, _) => {
+                self.value(a, KEPT);
+                self.way(b, KEPT);
+            }
+            Expr::Binary(_, a, b, _) | Expr::Pipe(a, b, _) | Expr::Index(a, b, _) => {
+                self.value(a, KEPT);
+                self.value(b, KEPT);
+            }
+            Expr::Call(c, args, _) => {
+                self.value(c, KEPT);
+                args.iter().for_each(|x| self.value(x, KEPT));
+            }
+            Expr::If(c, a, b) => {
+                self.value(c, KEPT);
+                match b {
+                    Some(b) => self.ways(&[&**a, &**b], goes, "if", true),
+                    None => self.ways(&[&**a], goes, "if", false),
+                }
+            }
+            Expr::Match(s, arms, _) => {
+                self.value(s, KEPT);
+                for a in arms {
+                    if let Some(g) = &a.guard {
+                        self.value(g, KEPT);
+                    }
+                }
+                let ways: Vec<&Expr> = arms.iter().map(|a| &a.body).collect();
+                self.ways(&ways, goes, "match", true);
+            }
+            Expr::For(_, items, body, _) => {
+                self.value(items, KEPT);
+                // Its list is kept: a `return` in its body leaves in the first round. Last in
+                // a function, it may be a loop that finds, `for x in xs { if ... { return x } }`.
+                let kept = matches!(goes, Goes::Kept | Goes::Out);
+                if let (true, Some((v, line))) = (kept, own_return(body)) {
+                    self.kept_return(v, line, "for");
+                }
+                self.way(body, if kept { KEPT } else { Goes::Dropped });
+            }
+            Expr::While(c, body, _) => {
+                self.value(c, KEPT);
+                self.way(body, Goes::Dropped);
+            }
+            Expr::Block(stmts) => {
+                if let (true, Some((v, line))) = (goes == KEPT, own_return(e)) {
+                    self.kept_return(v, line, "block");
+                }
+                self.stmts(stmts, goes);
+            }
+            Expr::Lambda(d) => self.function(d, Whose::Arrow, false),
+            Expr::Reply(s, b, _) => {
+                self.value(s, KEPT);
+                if let Some(b) = b {
+                    self.value(b, KEPT);
+                }
+            }
+            Expr::Html(el, _) => self.html(el),
+        }
+    }
+
+    fn html(&mut self, el: &'a HtmlEl) {
+        if let Some(id) = &el.id {
+            self.value(id, Goes::Kept);
+        }
+        el.classes.iter().for_each(|c| self.value(c, Goes::Kept));
+        for (_, v) in &el.attrs {
+            if let AttrVal::Expr(e) | AttrVal::Spread(e) = v {
+                self.value(e, Goes::Kept);
+            }
+        }
+        for c in &el.children {
+            match c {
+                HtmlChild::El(e) => self.html(e),
+                // `{ return ... }` as an element's child is said as pasted text (Q-448).
+                HtmlChild::Expr(x) => self.way(x, Goes::Kept),
+            }
+        }
     }
 }
 
