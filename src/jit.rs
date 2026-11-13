@@ -114,6 +114,20 @@ pub fn compiled() -> usize {
     JIT.with(|j| j.borrow().as_ref().map_or(0, |j| j.done.values().filter(|c| c.is_some()).count()))
 }
 
+thread_local! {
+    /// The function `refuse_for_tests` names, and whether Cranelift is the one to refuse it.
+    static REFUSE: RefCell<(String, bool)> = const { RefCell::new((String::new(), false)) };
+}
+
+/// For tests: this thread's compiles from now on refuse the function named `name` once it is
+/// planned, in Gen or, with `define`, in Cranelift (its returns made unlike its signature's);
+/// `""` for none. No program reaches what a compile refused part way then does (`give_up`), so
+/// this is how a test does; it is read once a compile, never by a call (FEEDBACK52.md, Q-677
+/// review; branch feedback52).
+pub fn refuse_for_tests(name: &str, define: bool) {
+    REFUSE.with(|r| *r.borrow_mut() = (name.to_string(), define));
+}
+
 /// `f` with this thread's module, made if it is the first: for loops' code (src/jitloop.rs).
 pub(crate) fn with_module<R>(f: impl FnOnce(&mut JITModule) -> Option<R>) -> Option<R> {
     JIT.with(|j| {
@@ -708,8 +722,10 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
     let mut ctx = jit.module.make_context();
     let tc = jit.module.target_config();
     let mut made = Vec::new();
+    let (refuse, in_cranelift) = REFUSE.with(|r| r.borrow().clone());
     let all = 'all: {
         for (def, args) in &order {
+            let refused = !refuse.is_empty() && def.name == refuse;
             let key = (Arc::as_ptr(def) as usize, args.clone());
             ctx.func.signature = signature(&jit.module, args, types[&key]);
             ctx.func.name = UserFuncName::user(0, ids[&key].as_u32());
@@ -728,11 +744,14 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
                     ret: types[&key],
                     ended: false,
                 };
-                if g.function(def, args).is_none() {
+                if (refused && !in_cranelift) || g.function(def, args).is_none() {
                     break 'all false;
                 }
                 g.b.seal_all_blocks();
                 g.b.finalize(tc);
+            }
+            if refused {
+                ctx.func.signature.returns.clear();
             }
             if jit.module.define_function(ids[&key], &mut ctx).is_err() {
                 break 'all false;

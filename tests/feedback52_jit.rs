@@ -799,3 +799,29 @@ fn sq(x) = x * x";
     let calls = [("r(5)", "int 0"), ("r(100000) ?? \"E\"", "str E"), ("fib(15)", "int 610"), ("r(100)", "int 0"), ("sq(3)", "int 9"), ("r(100000) ?? \"E\"", "str E"), ("sq(4)", "int 16")];
     check(defs, &calls, 3);
 }
+
+#[test]
+fn a_compile_refused_after_its_plan_gives_the_functions_it_did_not_make_code_that_gives_up() {
+    // No program reaches this now: `jit::refuse_for_tests` makes the compile of `f` refuse it
+    // once it is planned, in Gen, then in Cranelift. `g`, made before it in that compile, calls
+    // it; `k`'s compile after it finalizes `g`, and `f` has code that gives up, where main and
+    // quillo-A stopped (`a_compile_that_fails_leaves_no_function_half_made`). `f` and `g` are
+    // the interpreter's; `h` and `k` are compiled.
+    let defs = "fn h(x) = x + 1\nfn f(n) = n <= 0 ? h(n) : g(n - 1)\nfn g(n) = n <= 0 ? 0 : f(n - 1)\nfn k(x) = x * 2";
+    let calls = [("h(1)", "int 2"), ("f(6)", "int 1"), ("f(5)", "int 0"), ("k(1)", "int 2"), ("g(3)", "int 1"), ("k(2)", "int 4")];
+    // The same with `f` giving a float and a bool: code that gives up gives each type.
+    let floats = "fn f(n) = n <= 0 ? 0.5 : g(n - 1)\nfn g(n) = n <= 0 ? 1.5 : f(n - 1)\nfn k(x) = x * 2";
+    let float_calls = [("f(6)", "float 0.5"), ("f(5)", "float 1.5"), ("k(1)", "int 2"), ("g(3)", "float 0.5")];
+    let bools = "fn f(n) = n <= 0 ? true : g(n - 1)\nfn g(n) = n <= 0 ? false : f(n - 1)\nfn k(x) = x * 2";
+    let bool_calls = [("f(6)", "bool true"), ("f(5)", "bool false"), ("k(1)", "int 2"), ("g(3)", "bool true")];
+    for in_cranelift in [false, true] {
+        quillo::jit::refuse_for_tests("f", in_cranelift);
+        check(defs, &calls, 2);
+        check(floats, &float_calls, 1);
+        check(bools, &bool_calls, 1);
+    }
+    quillo::jit::refuse_for_tests("", false);
+    // Refusing nothing, as every program runs: `f` (with `g`) and `g` on its own compiled too.
+    check(defs, &calls, 4);
+    check(floats, &float_calls, 3);
+}
