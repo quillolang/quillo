@@ -74,6 +74,11 @@ struct Compiled {
     /// The global functions it calls (directly or not), by name: if one is
     /// assigned something else, it is compiled no more.
     deps: Vec<(String, usize)>,
+    /// Its own code, which a function compiled after it calls. Such a caller was planned with
+    /// its type and then refused, as its code was not in that compile's: a caller of a function
+    /// called on its own first was never compiled (FEEDBACK52.md, Q-677 review; branch
+    /// feedback52).
+    id: FuncId,
 }
 
 type Key = (usize, Vec<T>);
@@ -91,6 +96,8 @@ struct Jit {
 thread_local! {
     static JIT: RefCell<Option<Jit>> = const { RefCell::new(None) };
     static LAST: std::cell::Cell<Option<Quick>> = const { std::cell::Cell::new(None) };
+    /// How deep the interpreter has followed a call that went too deep for machine code (`run`).
+    static DEEP: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
 /// The function called last, if what it calls cannot change under it.
@@ -194,6 +201,18 @@ pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Option<Result<Valu
     if let Some(q) = LAST.get().filter(|q| q.def == at && q.code == code) {
         return run(q.entry, q.ret, &raw, depth);
     }
+    // Under a call that went too deep for machine code, the interpreter follows it down, level
+    // by level; at a call no deeper than the last it followed, it is back above it. Only here,
+    // not before the last function, which `run` forgets then (FEEDBACK52.md, Q-677 review;
+    // branch feedback52).
+    let deep = DEEP.get();
+    if depth > deep {
+        DEEP.set(depth);
+        return None;
+    }
+    if deep != usize::MAX {
+        DEEP.set(usize::MAX);
+    }
     let compiled = JIT.with(|j| {
         let mut j = j.borrow_mut();
         if j.is_none() {
@@ -234,6 +253,16 @@ fn run(entry: Entry, ret: T, raw: &[u64; 16], depth: usize) -> Option<Result<Val
     // `raw` in order; `ctx` outlives the call.
     let r = unsafe { entry(raw.as_ptr(), &mut ctx) };
     if ctx.bail != 0 {
+        // Too deep: no frame gave the depth back, and the one that could go no deeper left it at
+        // `max` (one that gave up otherwise at exactly `max` is taken as too deep too, which only
+        // costs time). The interpreter goes on with this call, and runs the calls under it itself
+        // (`call`): each level went back into machine code and down to the limit again, 5·10⁷
+        // calls for a recursion that fails at 10,000 levels, 30 times the interpreter's time
+        // (FEEDBACK52.md, Q-677 review; branch feedback52).
+        if ctx.depth == ctx.max {
+            DEEP.set(depth);
+            LAST.set(None);
+        }
         return None;
     }
     Some(Ok(match ret {
@@ -335,6 +364,13 @@ impl<'a> Plan<'a> {
             return Some(*t);
         }
         if let Some(Some(c)) = self.done.get(&key) {
+            // Its code is called as it is (`Compiled::id`), so what it calls is what this plan
+            // calls too.
+            for d in &c.deps {
+                if !self.deps.contains(d) {
+                    self.deps.push(d.clone());
+                }
+            }
             return Some(c.ret);
         }
         if let Some((t, used)) = self.open.get_mut(&key) {
@@ -348,6 +384,7 @@ impl<'a> Plan<'a> {
         // guessed, and the guess must come out.
         for guess in [T::I, T::F, T::B] {
             self.open.insert(key.clone(), (guess, false));
+            let (planned, deps) = (self.order.len(), self.deps.len());
             let mut sc = Scopes { stack: vec![def.params.iter().map(|p| p.name.to_string()).zip(args.iter().copied()).collect()] };
             let mut ret = None;
             let got = self.tail(&def.body, &mut sc, &mut ret);
@@ -368,8 +405,19 @@ impl<'a> Plan<'a> {
                     self.order.push((def.clone(), args.to_vec()));
                     return Some(t);
                 }
-                _ if !used => return None,
                 _ => {}
+            }
+            // A guess that did not come out takes back what was planned under it. A function
+            // planned to call this one as `guess` stayed in `types`, the next guess found it there
+            // without calling back into this one (so without `used`), and it was made with the
+            // wrong type: Cranelift's def_var stopped the process (FEEDBACK52.md, Q-677 review;
+            // branch feedback52).
+            for (d, a) in self.order.drain(planned..) {
+                self.types.remove(&(Arc::as_ptr(&d) as usize, a));
+            }
+            self.deps.truncate(deps);
+            if !used {
+                return None;
             }
         }
         None
@@ -659,31 +707,53 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
     let mut fctx = FunctionBuilderContext::new();
     let mut ctx = jit.module.make_context();
     let tc = jit.module.target_config();
-    for (def, args) in &order {
-        let key = (Arc::as_ptr(def) as usize, args.clone());
-        ctx.func.signature = signature(&jit.module, args, types[&key]);
-        ctx.func.name = UserFuncName::user(0, ids[&key].as_u32());
-        {
-            let mut g = Gen {
-                b: FunctionBuilder::new(&mut ctx.func, &mut fctx),
-                module: &mut jit.module,
-                env: &c.env,
-                types: &types,
-                ids: &ids,
-                done: &jit.done,
-                ctx: V::from_u32(0),
-                depth0: V::from_u32(0),
-                bail: Block::from_u32(0),
-                sc: Scopes { stack: vec![Vec::new()] },
-                ret: types[&key],
-                ended: false,
-            };
-            g.function(def, args)?;
-            g.b.seal_all_blocks();
-            g.b.finalize(tc);
+    let mut made = Vec::new();
+    let all = 'all: {
+        for (def, args) in &order {
+            let key = (Arc::as_ptr(def) as usize, args.clone());
+            ctx.func.signature = signature(&jit.module, args, types[&key]);
+            ctx.func.name = UserFuncName::user(0, ids[&key].as_u32());
+            {
+                let mut g = Gen {
+                    b: FunctionBuilder::new(&mut ctx.func, &mut fctx),
+                    module: &mut jit.module,
+                    env: &c.env,
+                    types: &types,
+                    ids: &ids,
+                    done: &jit.done,
+                    ctx: V::from_u32(0),
+                    depth0: V::from_u32(0),
+                    bail: Block::from_u32(0),
+                    sc: Scopes { stack: vec![Vec::new()] },
+                    ret: types[&key],
+                    ended: false,
+                };
+                if g.function(def, args).is_none() {
+                    break 'all false;
+                }
+                g.b.seal_all_blocks();
+                g.b.finalize(tc);
+            }
+            if jit.module.define_function(ids[&key], &mut ctx).is_err() {
+                break 'all false;
+            }
+            jit.module.clear_context(&mut ctx);
+            made.push(ids[&key]);
         }
-        jit.module.define_function(ids[&key], &mut ctx).ok()?;
-        jit.module.clear_context(&mut ctx);
+        true
+    };
+    if !all {
+        // A function made here calls the others, and the next finalize_definitions (another
+        // compile's, or a loop's) looks for each of them: one declared and not made stopped the
+        // process ("anonymous symbol must be defined locally"). Each not made is made to give up;
+        // none of this code runs, as its entry is not made (FEEDBACK52.md, Q-677 review; branch
+        // feedback52).
+        for (key, id) in &ids {
+            if !made.contains(id) {
+                give_up(&mut jit.module, *id, &key.1, types[key]);
+            }
+        }
+        return None;
     }
     // The entry: arguments from memory, the result as bits.
     let key = (Arc::as_ptr(&c.def) as usize, sig.to_vec());
@@ -739,7 +809,31 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
     let code = jit.module.get_finalized_function(entry_id);
     // SAFETY: the entry was made with exactly this signature.
     let entry = unsafe { std::mem::transmute::<*const u8, Entry>(code) };
-    Some(Compiled { entry, ret, deps })
+    Some(Compiled { entry, ret, deps, id: target })
+}
+
+/// Code for `id` that only gives up, as the function would have at its first step.
+fn give_up(m: &mut JITModule, id: FuncId, args: &[T], ret: T) {
+    let mut ctx = m.make_context();
+    ctx.func.signature = signature(m, args, ret);
+    ctx.func.name = UserFuncName::user(0, id.as_u32());
+    let mut fctx = FunctionBuilderContext::new();
+    let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+    let blk = b.create_block();
+    b.append_block_params_for_function_params(blk);
+    b.switch_to_block(blk);
+    let cx = b.block_params(blk)[args.len()];
+    let one = b.ins().iconst(types::I64, 1);
+    b.ins().store(MemFlagsData::trusted(), one, cx, BAIL);
+    let zero = match ret {
+        T::I => b.ins().iconst(types::I64, 0),
+        T::F => b.ins().f64const(0.0),
+        T::B => b.ins().iconst(types::I8, 0),
+    };
+    b.ins().return_(&[zero]);
+    b.seal_all_blocks();
+    b.finalize(m.target_config());
+    let _ = m.define_function(id, &mut ctx);
 }
 
 fn signature(m: &JITModule, args: &[T], ret: T) -> cranelift_codegen::ir::Signature {
@@ -784,7 +878,7 @@ impl Gen<'_, '_> {
         self.ctx = params[args.len()];
         for (i, (p, t)) in def.params.iter().zip(args).enumerate() {
             let var = self.b.declare_var(t.ir());
-            self.b.def_var(var, params[i]);
+            self.b.try_def_var(var, params[i]).ok()?;
             self.sc.set(&p.name, (var, *t));
         }
         // The bail-out: tell the caller, return anything.
@@ -930,10 +1024,8 @@ impl Gen<'_, '_> {
                     vs.push(self.value(a, ret)?);
                 }
                 let key = (Arc::as_ptr(&callee.def) as usize, ts.clone());
-                let id = match (self.ids.get(&key), self.done.get(&key)) {
-                    (Some(id), _) => *id,
-                    _ => return None,
-                };
+                // Made in this compile, or compiled on its own before (`Compiled::id`).
+                let id = self.ids.get(&key).copied().or_else(|| Some(self.done.get(&key)?.as_ref()?.id))?;
                 let _ = self.types;
                 vs.push(self.ctx);
                 let fr = self.module.declare_func_in_func(id, self.b.func);
@@ -1076,7 +1168,10 @@ impl Gen<'_, '_> {
                     let t = self.type_of(e)?;
                     let v = self.value(e, ret)?;
                     let var = self.b.declare_var(t.ir());
-                    self.b.def_var(var, v);
+                    // A value of another type than its variable's refuses the function, where
+                    // def_var stopped the process (here and below; FEEDBACK52.md, Q-677 review;
+                    // branch feedback52).
+                    self.b.try_def_var(var, v).ok()?;
                     self.sc.set(n, (var, t));
                 }
                 Stmt::Assign(n, op, e, _) => {
@@ -1091,7 +1186,7 @@ impl Gen<'_, '_> {
                             self.binop(bop, t, te, cur, v)?
                         }
                     };
-                    self.b.def_var(var, v);
+                    self.b.try_def_var(var, v).ok()?;
                 }
                 Stmt::Return(Some(e), _) => {
                     let v = self.value(e, ret)?;
@@ -1150,7 +1245,7 @@ impl Gen<'_, '_> {
                 };
                 let end = self.value(b, ret)?;
                 let k = self.b.declare_var(types::I64);
-                self.b.def_var(k, start);
+                self.b.try_def_var(k, start).ok()?;
                 let (head, step, exit) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
                 self.b.ins().jump(head, &[]);
                 self.b.switch_to_block(head);
@@ -1162,7 +1257,7 @@ impl Gen<'_, '_> {
                 if let Pattern::Bind(n) = pat {
                     // Each step's own variable, from the count.
                     let var = self.b.declare_var(types::I64);
-                    self.b.def_var(var, kv);
+                    self.b.try_def_var(var, kv).ok()?;
                     self.sc.set(n, (var, T::I));
                 }
                 let r = self.stmt_expr(body, ret);
@@ -1170,7 +1265,7 @@ impl Gen<'_, '_> {
                 r?;
                 if !self.ended {
                     let next = self.b.ins().iadd_imm_s(kv, 1);
-                    self.b.def_var(k, next);
+                    self.b.try_def_var(k, next).ok()?;
                     self.b.ins().jump(head, &[]);
                 }
                 self.ended = false;

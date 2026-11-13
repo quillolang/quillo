@@ -73,7 +73,10 @@ fn quillo_run(src: &str, env: &[(&str, &str)]) -> String {
     }
     let o = child.wait_with_output().unwrap();
     let _ = std::fs::remove_dir_all(&d);
-    let (out, err) = (String::from_utf8_lossy(&o.stdout).trim_end().to_string(), String::from_utf8_lossy(&o.stderr).trim_end().to_string());
+    // Errors say where: each run's folder is the same name here.
+    let name = d.file_name().unwrap().to_string_lossy().to_string();
+    let text = |b: &[u8]| String::from_utf8_lossy(b).trim_end().replace(&name, "D");
+    let (out, err) = (text(&o.stdout), text(&o.stderr));
     if o.status.success() && err.is_empty() {
         out
     } else {
@@ -627,4 +630,172 @@ fn the_report_s_forms_with_return_run_compiled_in_quillo_run() {
         assert_eq!((out.as_str(), plain.as_str()), (want, want), "{}", src);
         assert!(fast * 4 < slow, "compiled {:?}, interpreted {:?}\n{}", fast, slow, src);
     }
+}
+
+// ---- the review of 01767d5 (FEEDBACK52.md, Q-677 review; branch feedback52) ----------------
+
+/// `src` in `quillo run` with machine code and with `QUILLO_JIT=0`: the same output and errors.
+fn both_ways(src: &str) -> String {
+    let compiled = quillo_run(src, &[]);
+    assert_eq!(compiled, quillo_run(src, &[("QUILLO_JIT", "0")]), "compiled, then interpreted\n{}", src);
+    compiled
+}
+
+/// `f` guesses its result an int, then a float; `g`, planned under the first guess with `f` an
+/// int, was kept, and under the second its `t += f(n)` was made as an int plus a float into an
+/// int: Cranelift's def_var stopped the process (quillo-A). `m4` is main's own shape of it, with
+/// no `return`.
+const GUESSES: &str = "fn f(n) {
+    if n < 1 { return 0.5 }
+    let z = g(n - 1)
+    return 1.5
+}
+fn g(n) {
+    let t = 0
+    t += f(n)
+    return t
+}
+fn r0(d) = d <= 0 ? 3.0 : r0(d - 1)
+fn r1(d, x, y) {
+    let a1 = r2(d - 1, x, x)
+    a1 = (d / 3.0)
+    r1(d - 1, 0, y)
+}
+fn r2(d, x, y) {
+    let a2 = r0(d - 1)
+    let v3 = (a2 < 1.0) ? y : r1(d - 1, x, true)
+    5
+}
+fn fr(n) {
+    if n < 1 { return 0.5 }
+    let z = gr(n - 1)
+    return 1.5
+}
+fn gr(n) {
+    let t = 0.0
+    t += fr(n)
+    return t
+}
+";
+
+#[test]
+fn a_guess_that_does_not_come_out_takes_back_what_it_planned() {
+    // `f` is refused, as on main, where it did not stop; `fr`, whose `gr` takes a float, comes
+    // out on its second guess and is compiled, with `gr` planned again.
+    let calls = [("f(3)", "float 1.5"), ("f(0)", "float 0.5"), ("fr(3)", "float 1.5"), ("fr(0)", "float 0.5"), ("gr(2)", "float 1.5")];
+    check(GUESSES, &calls, 2);
+}
+
+#[test]
+fn a_guess_that_does_not_come_out_takes_back_what_it_planned_in_quillo_run() {
+    // Through the binary: on quillo-A (01767d5) `f` stops the process, on main `r2` does,
+    // which recurses to the interpreter's limit.
+    let src = format!("{}{}for k in 0..3 {{\n    print(show(f(3)), show(fr(3)))\n}}\nprint(r2(1, 0, 2))\n", GUESSES, SHOW);
+    let line = "float 1.5 float 1.5";
+    let got = both_ways(&src);
+    assert!(got.starts_with(&format!("{}\nFAILED", [line, line, line].join("\n"))) && got.contains("too much recursion"), "{}", got);
+}
+
+#[test]
+fn a_compile_that_fails_leaves_no_function_half_made() {
+    // `f` and `g` call each other and `h`, compiled before them. On main and quillo-A the
+    // compile of `f` made `g`, then refused `f` (its call of `h`, code of another compile), and
+    // the next compile (`k`'s) stopped the process looking for `f` ("anonymous symbol must be
+    // defined locally"). Now `f` calls `h`'s code; a compile refused part way gives each function
+    // it did not make code that gives up.
+    let src = "fn h(x) = x + 1
+fn f(n) = n <= 0 ? h(n) : g(n - 1)
+fn g(n) = n <= 0 ? 0 : f(n - 1)
+fn k(x) = x * 2
+print(h(1))
+print(h(1))
+print(f(6))
+print(f(6))
+print(k(1))
+print(k(1))
+print(k(1))
+";
+    assert_eq!(both_ways(src), "2\n2\n1\n1\n2\n2\n2");
+}
+
+#[test]
+fn a_caller_of_a_function_compiled_on_its_own_is_compiled() {
+    // `f` is compiled on its own first; `top`, which calls it, is compiled with a call of `f`'s
+    // code (on quillo-A, 1 compile: `top` was refused).
+    check("fn f(x) = x % 7 + 1\nfn top(x) = f(x) * 2", &[("f(3)", "int 4"), ("top(3)", "int 8"), ("top(10)", "int 8")], 2);
+    // What `f` calls is what `top` calls: `h` given another function, `top` follows it.
+    let defs = "fn h(x) = x + 1
+fn f(x) = h(x) * 2
+fn top(x) = f(x) + 1
+fn swap() {
+    h = (x) => x + 100
+    top(1)
+}";
+    // Compiled: `f`, `top`, and the lambda given to `h`.
+    check(defs, &[("f(1)", "int 4"), ("top(1)", "int 5"), ("swap()", "int 203"), ("top(1)", "int 203"), ("f(1)", "int 202")], 3);
+}
+
+#[test]
+fn a_caller_of_a_function_compiled_on_its_own_runs_compiled_in_quillo_run() {
+    // The report's loop, `f` called twice before it: on quillo-A `g` was never compiled
+    // (0.60 s, Python's 0.63 s), here 0.02 s.
+    let src = "fn f(x) {\n    if x % 2 == 0 {\n        return 1\n    }\n    return x % 7 + 1\n}\nfn g(n) {\n    let i = 0\n    let t = 0\n    while i < n {\n        t += f(i)\n        i += 1\n    }\n    return t\n}\nprint(f(3))\nprint(f(3))\nprint(g(1000000))\n";
+    let (fast, out) = fastest(src, &[], 3);
+    let (slow, plain) = fastest(src, &[("QUILLO_JIT", "0")], 2);
+    assert_eq!((out.as_str(), plain.as_str()), ("4\n4\n2499997", "4\n4\n2499997"));
+    assert!(fast * 4 < slow, "compiled {:?}, interpreted {:?}", fast, slow);
+}
+
+/// Recursions at the call limit and one either side, and past it, plainly recursive, ending in
+/// `return` or not, and two functions calling each other.
+const DEEPS: &str = "fn r(d, x) {
+    if d <= 0 {
+        return 0
+    }
+    return r(d - 1, x + 1)
+}
+fn bare(d, x) {
+    if d <= 0 {
+        return 0
+    }
+    bare(d - 1, x + 1)
+}
+fn ping(d) = d <= 0 ? 0 : pong(d - 1)
+fn pong(d) = d <= 0 ? 1 : ping(d - 1)
+for n in [9990, 9995, 9996, 9997, 9998, 9999, 10000, 100000] {
+    print(n, r(n, 1) ?? \"E\", bare(n, 1) ?? \"E\", ping(n) ?? \"E\")
+}
+";
+
+#[test]
+fn a_call_too_deep_for_machine_code_is_followed_down_by_the_interpreter() {
+    // Each level of a recursion past the limit went back into machine code and down to the
+    // limit again: quillo-A 1.35 s, main 0.91 s (`bare`), the interpreter 0.06 s. Now the levels
+    // under it are the interpreter's, and the calls within the limit are compiled: faster than
+    // the interpreter alone.
+    let want = "9990 0 0 0\n9995 0 0 1\n9996 0 0 0\n9997 0 0 1\n9998 0 0 0\n9999 0 0 1\n10000 E E E\n100000 E E E";
+    assert_eq!(both_ways(DEEPS), want);
+    let (fast, out) = fastest(DEEPS, &[], 3);
+    let (slow, _) = fastest(DEEPS, &[("QUILLO_JIT", "0")], 2);
+    assert_eq!(out, want);
+    assert!(fast < slow, "compiled {:?}, interpreted {:?}", fast, slow);
+    // Not caught, its error and where it was are the interpreter's.
+    let failed = both_ways("fn r(d, x) {\n    if d <= 0 {\n        return 0\n    }\n    return r(d - 1, x + 1)\n}\nprint(r(1, 1))\nprint(r(100000, 1))\n");
+    assert!(failed.starts_with("0\nFAILED") && failed.contains("too much recursion"), "{}", failed);
+}
+
+#[test]
+fn after_a_call_too_deep_calls_are_compiled_again() {
+    // The interpreter follows the call that went too deep down; back above it, `fib` and `sq`
+    // are compiled, and `r` runs compiled within the limit.
+    let defs = "fn r(d) {
+    if d <= 0 {
+        return 0
+    }
+    return r(d - 1)
+}
+fn fib(n) = n < 2 ? n : fib(n - 1) + fib(n - 2)
+fn sq(x) = x * x";
+    let calls = [("r(5)", "int 0"), ("r(100000) ?? \"E\"", "str E"), ("fib(15)", "int 610"), ("r(100)", "int 0"), ("sq(3)", "int 9"), ("r(100000) ?? \"E\"", "str E"), ("sq(4)", "int 16")];
+    check(defs, &calls, 3);
 }
