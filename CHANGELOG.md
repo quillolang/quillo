@@ -202,7 +202,10 @@ Fixed, in compiled numbers:
   program ("stack overflow"), or a server (SIGBUS), when it went deep on a small stack,
   such as in a `parallel` child: with 57 floats kept, `parallel(() => big(9000, 1.5), ...)`
   crashed where the interpreter gives its value. Compiled code now counts each function's
-  own frame, not 512 bytes a call (Q-947, 0.8.1 too).
+  own frame, not 512 bytes a call (Q-947, 0.8.1 too). A compiled function keeping
+  thousands of values across a call it makes, called at every level of a deep recursion,
+  could stop the program the same way: with 9,000 floats kept it crashed where the
+  interpreter gives its value (0.8.1 too).
 - A function calling one already compiled on its own was not compiled (0.8.1 too).
 - Compiled code looped over the builtin `range` where `range` was something else: a
   parameter or a variable named `range` (`fn g(range, n)`), or a function compiled in one

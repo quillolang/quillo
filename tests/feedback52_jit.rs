@@ -1267,31 +1267,40 @@ fn served(src: &str, extra: &[&str], env: &[(&str, &str)]) -> (support::Guard, u
     static N: AtomicUsize = AtomicUsize::new(0);
     let d = support::temp_dir(&format!("feedback52-jit-srv-{}", N.fetch_add(1, Ordering::Relaxed)));
     std::fs::write(d.join("main.qwe"), src).unwrap();
-    for _ in 0..5 {
-        let port = support::free_port();
-        let child = Command::new(quillo())
-            .arg("run")
-            .arg(d.join("main.qwe"))
-            .args(["--port", &port.to_string()])
-            .args(extra)
-            .envs(env.iter().copied())
-            .env("QUILLO_SECRET", "a signing secret for these tests, long enough")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut server = support::Guard::new(child);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while server.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
-            if support::listening(port) {
-                return (server, port);
+    // The port the system gives (`--port 0`), as the server says it: one picked here could be
+    // another process's by the time the server listens, and its requests went to that server
+    // (found running beside other sessions' server tests; Q-947 review 7).
+    let mut child = Command::new(quillo())
+        .arg("run")
+        .arg(d.join("main.qwe"))
+        .args(["--port", "0"])
+        .args(extra)
+        .envs(env.iter().copied())
+        .env("QUILLO_SECRET", "a signing secret for these tests, long enough")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let err = child.stderr.take().unwrap();
+    let server = support::Guard::new(child);
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Its lines read to the end, so that its pipe never fills.
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+            if let Some(port) = line.split("listening on ").nth(1).and_then(|url| url.rsplit(':').next()).and_then(|p| p.trim_end_matches('/').parse::<u16>().ok()) {
+                let _ = tx.send(port);
             }
-            std::thread::sleep(Duration::from_millis(20));
         }
-        // Another test's server took the port first: again, on another.
+    });
+    let port = rx.recv_timeout(Duration::from_secs(30)).unwrap_or_else(|_| panic!("the server did not start\n{}", src));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !support::listening(port) {
+        assert!(Instant::now() < deadline, "the server did not start\n{}", src);
+        std::thread::sleep(Duration::from_millis(5));
     }
-    panic!("the server did not start\n{}", src);
+    (server, port)
 }
 
 /// The fastest of `n` GETs of `path`, with the status and body of the last.
@@ -1500,4 +1509,111 @@ fn a_call_too_deep_through_each_way_in_ends_its_floor() {
     let after_map = timed(&mut it).min(timed(&mut it));
     let kept = |after: Duration| after < before * 3 + Duration::from_millis(20);
     assert!(kept(after_closure) && kept(after_map), "before {:?}, after call_closure {:?}, after call1 {:?}", before, after_closure, after_map);
+}
+
+// ---- review 7 of Q-947 (FEEDBACK52.md, Q-947 review 7; branch feedback52) --------------------
+
+/// `k` chained float lets from `a`, `v0` to `v{k - 1}`, and their sum.
+fn chained(k: usize) -> (String, String) {
+    let lets: Vec<String> = std::iter::once("let v0 = a * 0.5".to_string()).chain((1..k).map(|i| format!("let v{} = v{} * 0.5 + a", i, i - 1))).collect();
+    (lets.join("\n    "), (0..k).map(|i| format!("v{}", i)).collect::<Vec<_>>().join(" + "))
+}
+
+/// The compiled time of `src(60, ..)`, a function with 60 lets in it, against `src(2, ..)`'s: at
+/// most half again (once again for this build's debug binary); and both the interpreter's values.
+fn as_fast_as_with_small_frames(src: impl Fn(usize, usize) -> String) {
+    for k in [60, 2] {
+        let got = both_ways(&src(k, 3));
+        assert!(!got.contains("FAILED"), "{} lets: {}", k, got);
+    }
+    let (big, _) = fastest(&src(60, 1000), &[], 3);
+    let (small, _) = fastest(&src(2, 1000), &[], 3);
+    assert!(big * 2 < small * (1 + slack()), "60 lets {:?}, 2 lets {:?}", big, small);
+}
+
+#[test]
+fn a_big_frame_on_no_cycle_does_not_shrink_a_recursion_of_small_ones() {
+    // `top` keeps 60 floats and calls `d(9000, ..)` once: each call was counted at top's frame, so
+    // d's recursion in `parallel`'s child was given up for the stack and run again on a new one at
+    // each call, quillo-A9 3,940 M instructions against main's 1,576 M. `top` is on no cycle: it
+    // is on a chain once, and its frame is kept once (Q-947 review 7).
+    let src = |k: usize, n: usize| {
+        let (lets, total) = chained(k);
+        format!("fn d(n, x) {{ if n <= 0 {{ x }} else {{ d(n - 1, x) + 1.0 }} }}\nfn top(a) {{\n    {}\n    let r = d(9000, v{})\n    r + {}\n}}\nprint(top(1.5))\nprint(top(1.5))\nprint(parallel(() => sum(map(range(0, {}), (i) => top(1.5) > 0.0 ? 1 : 0)), () => 1))\n", lets, k - 1, total, n)
+    };
+    as_fast_as_with_small_frames(src);
+}
+
+#[test]
+fn a_big_frame_never_called_does_not_shrink_a_recursion_of_small_ones() {
+    // `f` recurses with a small frame and calls `g`, recursive with 60 floats, only below 0, which
+    // no call reaches: quillo-A9 3,968 M instructions against main's 1,630 M. Each call is still
+    // counted at g's frame, and the stack it needs is now kept for the next call, not made anew
+    // (Q-947 review 7).
+    let src = |k: usize, n: usize| {
+        let (lets, total) = chained(k);
+        format!("fn g(n, a) {{\n    if n <= 0 {{\n        a\n    }} else {{\n    {}\n    let r = g(n - 1, v{} * 0.25)\n    r + {}\n    }}\n}}\nfn f(n) {{ if n < 0 {{ g(1, 1.5) }} else if n == 0 {{ 0.0 }} else {{ f(n - 1) + 1.0 }} }}\nprint(f(3))\nprint(f(3))\nprint(parallel(() => sum(map(range(0, {}), (i) => f(9000))), () => 1))\n", lets, k - 1, total, n)
+    };
+    as_fast_as_with_small_frames(src);
+}
+
+#[test]
+fn a_route_calling_a_big_frame_never_called_answers_as_with_small_ones() {
+    // The same in a route's `parallel` child (512 KB), 2,000 calls of `f(600)`: quillo-A9 30 ms,
+    // main 6.6 (Q-947 review 7).
+    let route = |k: usize| {
+        let (lets, total) = chained(k);
+        format!("fn g(n, a) {{\n    if n <= 0 {{\n        a\n    }} else {{\n    {}\n    let r = g(n - 1, v{} * 0.25)\n    r + {}\n    }}\n}}\nfn f(n) {{ if n < 0 {{ g(1, 1.5) }} else if n == 0 {{ 0.0 }} else {{ f(n - 1) + 1.0 }} }}\nroute GET /warm = str(f(3) + f(3))\nroute GET /f = str(parallel(() => sum(map(range(0, 2000), (i) => f(600))), () => 1))\n", lets, k - 1, total)
+    };
+    let time = |k: usize| {
+        let (_server, port) = served(&route(k), &[], &[]);
+        let _ = fastest_get(port, "/warm", 2);
+        fastest_get(port, "/f", 5)
+    };
+    let (big, s1, b1) = time(60);
+    let (small, s2, b2) = time(2);
+    assert_eq!((s1, b1.as_str(), s2, b2.as_str()), (200, "[1200000.0, 1]", 200, "[1200000.0, 1]"));
+    assert!(big * 2 < small * (1 + slack()) + Duration::from_millis(4), "60 lets {:?}, 2 lets {:?}", big, small);
+}
+
+#[test]
+fn a_function_with_a_frame_over_512_bytes_called_again_keeps_its_stack() {
+    // `h` calls nothing and keeps `k` floats, called at each level of a 9,000-deep interpreted
+    // `walk`: the quick call of the last function counted 512 bytes for it and kept nothing, and
+    // with 9,000 or 10,000 the process stopped ("overflowed its stack", main and quillo-A9); with
+    // 8,000 it did not. The interpreter's values, taken from QUILLO_JIT=0 (its run takes 5 s).
+    // A debug build's Cranelift takes over a minute for a function of 8,000 values: there, 2,000
+    // (a 16 KB frame, also no quick call), and the edge in a release build (QUILLO_TEST_BIN, the
+    // instrumented coverage run).
+    let sizes: &[(usize, &str)] = if std::env::var_os("QUILLO_TEST_BIN").is_none() && cfg!(debug_assertions) {
+        &[(2000, "5995.5\n5995.5\n53959500.0")]
+    } else {
+        &[(8000, "23995.5\n23995.5\n215959500.0"), (9000, "26995.5\n26995.5\n242959500.0"), (10000, "29995.5\n29995.5\n269959500.0")]
+    };
+    for &(k, want) in sizes {
+        let lets: Vec<String> = std::iter::once("let v0 = a * 0.5".to_string()).chain((1..k).map(|i| format!("let v{} = v{} * 0.5 + a", i, i - 1))).collect();
+        let mut names: Vec<String> = (0..k).rev().map(|i| format!("v{}", i)).collect();
+        while names.len() > 1 {
+            names = names.chunks(2).map(|c| if c.len() == 2 { format!("({} + {})", c[0], c[1]) } else { c[0].clone() }).collect();
+        }
+        let src = format!("fn h(a) {{\n    {}\n    {}\n}}\nfn walk(n, s) {{ if n == 0 {{ 0.0 }} else {{ h(1.5) + walk(n - 1, s) }} }}\nprint(h(1.5))\nprint(h(1.5))\nprint(walk(9000, \"x\"))\n", lets.join("\n    "), names[0]);
+        assert_eq!(quillo_run(&src, &[]), want, "{} floats", k);
+    }
+}
+
+#[test]
+fn a_recursion_of_small_frames_in_a_parallel_child_keeps_main_s_depth() {
+    // `d(890)` 2,000 times in a route's `parallel` child: the reserve kept for frames counted at
+    // their own size was kept for 512-byte ones too, 32 calls less before the stack was given up,
+    // 31-34 ms against main's 8.9 from 880 to 900; at 910 every build gave up for the stack, main
+    // 744 ms, quillo-A9 40. The kept stack takes those too (Q-947 review 7).
+    let src = format!("fn d(n) {{ if n <= 0 {{ 0 }} else {{ d(n - 1) + 1 }} }}\nroute GET /warm = str(d(3) + d(3))\n{}", [870, 880, 890, 900, 910].map(|n| format!("route GET /w{} = str(parallel(() => sum(map(range(0, 2000), (i) => d({}))), () => 1))\n", n, n)).join(""));
+    let (_server, port) = served(&src, &[], &[]);
+    let _ = fastest_get(port, "/warm", 2);
+    let (base, ..) = fastest_get(port, "/w870", 5);
+    for n in [880, 890, 900, 910] {
+        let (t, status, body) = fastest_get(port, &format!("/w{}", n), 5);
+        assert_eq!((status, body), (200, format!("[{}, 1]", 2000 * n)));
+        assert!(t * 2 < base * (1 + slack()) + Duration::from_millis(4), "d({}) {:?}, d(870) {:?}", n, t, base);
+    }
 }

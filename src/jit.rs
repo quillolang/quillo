@@ -79,23 +79,42 @@ struct Compiled {
     /// called on its own first was never compiled (FEEDBACK52.md, Q-677 review; branch
     /// feedback52).
     id: FuncId,
-    /// The stack one call of it or of what it calls takes, at most (`LEVEL` or more).
-    frame: usize,
+    /// The stack counted for each call of it or of what it calls (`LEVEL` or more): the largest
+    /// frame among the functions on a cycle of calls, the only ones a chain of calls can hold
+    /// more than once.
+    per: usize,
+    /// Beyond `per` a call, what the functions on no cycle take more, each at most once on a
+    /// chain (`compile`).
+    excess: usize,
+    /// A call of it was given up for the stack left: run on `BIG` straight away when the stack
+    /// left would give it up again (`run`).
+    deep: std::sync::atomic::AtomicBool,
+}
+
+impl Compiled {
+    /// The stack kept beyond `per` a call: `excess`, and `RESERVE` where a frame is counted at its
+    /// own size, with no room to spare as `LEVEL` has. A function keeping 8,000 floats, its frame
+    /// counted exactly in `excess`, overflowed by its entry (Q-947 review 7).
+    fn reserve(&self) -> usize {
+        self.excess + if self.per > LEVEL || self.excess > 0 { RESERVE } else { 0 }
+    }
 }
 
 type Key = (usize, Vec<T>);
 
-/// The stack taken as a compiled call's at least, as all calls' before Q-947. A function with
+/// The stack counted for a compiled call at least, as for all calls before Q-947. A function with
 /// many float `let`s still needed after its own call takes more: with 57,
 /// `parallel(() => big(9000, 1.5), () => 1)` overflowed the child's stack and stopped the process,
 /// where the interpreter gives its value; with 34 a route's `parallel` child (512 KB) killed the
-/// server (SIGBUS); with 31 a runaway `big(-1, 1.5)` stopped it. Each function's own frame is now Cranelift's, and a call is taken to need the
-/// largest of those it can reach (FEEDBACK52.md, Q-947; branch feedback52).
+/// server (SIGBUS); with 31 a runaway `big(-1, 1.5)` stopped it. Each function's own frame is now
+/// Cranelift's (`Compiled::per`, `Compiled::excess`; FEEDBACK52.md, Q-947; branch feedback52).
 const LEVEL: usize = 512;
 
-/// Stack kept from a compiled call's own, beyond its calls' frames: the entry and the deepest call,
-/// which gives up there. With none, 8 of 600 recursions with large frames in `parallel` children
-/// overflowed by a few KB (Q-947).
+/// Stack kept beyond the calls' frames where they are counted at their own size: the entry, and
+/// the deepest call, which gives up there. With none, 8 of 600 recursions with large frames in
+/// `parallel` children overflowed by a few KB. Not for `LEVEL`, which leaves room enough: kept
+/// there too, a recursion of small frames in a 512 KB child was given up for the stack 32 calls
+/// sooner, 31-34 ms against main's 8.9 (Q-947 review 7).
 const RESERVE: usize = 16 << 10;
 
 /// `FnDef::hot` once a function is known not to compile.
@@ -209,7 +228,8 @@ pub fn leave_floor_for_tests(depth: usize) {
 /// reviews 2 and 3).
 #[cold]
 #[inline(never)]
-fn gave_up(ctx: &Ctx, entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame: usize, reserve: usize) -> Ran {
+#[allow(clippy::too_many_arguments)]
+fn gave_up(ctx: &Ctx, entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame: usize, reserve: usize, deep: Option<&std::sync::atomic::AtomicBool>) -> Ran {
     if ctx.depth != ctx.max {
         return Ran::Interpret;
     }
@@ -223,17 +243,28 @@ fn gave_up(ctx: &Ctx, entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame
     // stack it needs is `frame` a call (Q-947).
     let limit = MAX_DEPTH.saturating_sub(depth);
     if (ctx.max as usize) < limit && crate::stack::remaining().is_some() {
-        let need = limit * frame + reserve + crate::stack::MARGIN;
-        let again = crate::stack::maybe_grow(need, need + (256 << 10), || run(entry, ret, raw, depth, frame, reserve));
-        // Given up there other than at the limit (`3 * p(n - 1)` overflowing at the bottom): with
-        // no floor, the interpreter took one level, and the next was given up for the stack and
-        // run again on a new stack, a whole rerun and an mmap a level: `p(9000)` in `parallel`
-        // 372 ms, main 155, the interpreter 4.4 (Q-945 review 6). A floor for the call, as
-        // c10c0f1 kept for any give-up at `max`.
-        if !matches!(again, Ran::Interpret) {
-            return again;
+        if let Some(deep) = deep {
+            deep.store(true, Relaxed);
         }
+        return floor_unless_done(on_big(entry, ret, raw, depth, frame, reserve), depth);
     }
+    floor(depth)
+}
+
+/// `again`, a call at `depth` run on `BIG`; given up there other than at the limit (`3 * p(n - 1)`
+/// overflowing at the bottom), a floor for it. With none, the interpreter took one level, and the
+/// next was given up for the stack and run again on a new stack, a whole rerun and an mmap a
+/// level: `p(9000)` in `parallel` 372 ms, main 155, the interpreter 4.4 (Q-945 review 6). As
+/// c10c0f1 kept for any give-up at `max`.
+fn floor_unless_done(again: Ran, depth: usize) -> Ran {
+    match again {
+        Ran::Interpret => floor(depth),
+        again => again,
+    }
+}
+
+/// The floor at `depth`, for the interpreter running that call (`Ran::Floored`).
+fn floor(depth: usize) -> Ran {
     LAST.set(None);
     // A call that reached machine code was at the floor or above it, and took it away
     // (`under_floor`): there is none to keep lower.
@@ -243,6 +274,45 @@ fn gave_up(ctx: &Ctx, entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame
         }
     });
     Ran::Floored
+}
+
+/// `run` on a stack with room for the call limit at `frame` a call: this thread's `BIG`, made once
+/// and kept, so that a call given up for the stack at each call of a loop maps and touches no new
+/// stack each time. A new one each time, 5 MB for `f(9000)` in a `parallel` child, faulted 18
+/// pages a call: 90,895 page reclaims against main's 899, 2.5 times its instructions (Q-947 review
+/// 7). In use (a call under it, which no machine code makes), a new one.
+#[cold]
+#[inline(never)]
+fn on_big(entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame: usize, reserve: usize) -> Ran {
+    let need = MAX_DEPTH.saturating_sub(depth) * frame + reserve + crate::stack::MARGIN;
+    // The new stack's `max` is the limit's, so this does not come back here.
+    let again = || run(entry, ret, raw, depth, frame, reserve, None);
+    #[cfg(not(windows))]
+    {
+        use corosensei::stack::{DefaultStack, Stack};
+        let kept = BIG.with(|b| b.borrow_mut().take()).filter(|s| s.base().get() - crate::stack::limit_of(s) >= need);
+        // As `crate::stack` makes one.
+        let stack = kept.unwrap_or_else(|| DefaultStack::new(need + (256 << 10) + crate::stack::MARGIN).expect("cannot allocate a stack"));
+        let (low, high) = (crate::stack::limit_of(&stack), stack.base().get());
+        let outer = crate::stack::switch(low);
+        let mut out = None;
+        // SAFETY: `low..high` is memory of `stack`, which outlives the call.
+        unsafe {
+            psm::on_stack(low as *mut u8, high - low, || out = Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(again))));
+        }
+        crate::stack::switch(outer);
+        BIG.with(|b| *b.borrow_mut() = Some(stack));
+        out.expect("ran").unwrap_or_else(|p| std::panic::resume_unwind(p))
+    }
+    // Windows grows a stack with fibers (`crate::stack`): a new one each time.
+    #[cfg(windows)]
+    crate::stack::maybe_grow(need, need + (256 << 10), again)
+}
+
+#[cfg(not(windows))]
+thread_local! {
+    /// The stack `on_big` runs on, kept for the next.
+    static BIG: RefCell<Option<corosensei::stack::DefaultStack>> = const { RefCell::new(None) };
 }
 
 /// What `call` did with a call.
@@ -325,6 +395,10 @@ fn new_jit() -> Option<Jit> {
     flags.set("use_colocated_libcalls", "false").ok()?;
     flags.set("is_pic", "false").ok()?;
     flags.set("opt_level", "speed").ok()?;
+    // A frame over the 4 KB guard page touches each page as it is made, so that it cannot step
+    // past a thread's guard: inline, and none in a frame under 4 KB (Q-947 review 7).
+    flags.set("enable_probestack", "true").ok()?;
+    flags.set("probestack_strategy", "inline").ok()?;
     let isa = cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?;
     Some(Jit { module: JITModule::new(JITBuilder::with_isa(isa, default_libcall_names())), done: HashMap::new(), keep: Vec::new(), over: Default::default() })
 }
@@ -402,7 +476,7 @@ pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Ran {
     // called is at hand, with no table to look in.
     if let Some(q) = LAST.get().filter(|q| q.def == at && q.code == code) {
         // It calls nothing, so one frame is all it takes.
-        return run(q.entry, q.ret, &raw, depth, LEVEL, 0);
+        return run(q.entry, q.ret, &raw, depth, LEVEL, 0, None);
     }
     let compiled = JIT.with(|j| {
         let mut j = j.borrow_mut();
@@ -423,7 +497,10 @@ pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Ran {
         made
     });
     let Some(compiled) = compiled else { return Ran::Interpret };
-    if compiled.deps.is_empty() {
+    // The last function's quick call counts `LEVEL` and keeps nothing: only for one whose frame
+    // is no larger. One keeping 10,000 floats, called at each level of a 9,000-deep interpreted
+    // recursion, overflowed the stack, where the interpreter gives its value (Q-947 review 7).
+    if compiled.deps.is_empty() && compiled.excess == 0 {
         LAST.set(Some(Quick { def: at, code, entry: compiled.entry, ret: compiled.ret }));
     }
     // What it calls is still what it was compiled with.
@@ -433,20 +510,33 @@ pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Ran {
             _ => return Ran::Interpret,
         }
     }
-    run(compiled.entry, compiled.ret, &raw, depth, compiled.frame, RESERVE)
+    run(compiled.entry, compiled.ret, &raw, depth, compiled.per, compiled.reserve(), Some(&compiled.deep))
 }
 
-fn run(entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame: usize, reserve: usize) -> Ran {
+fn run(entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame: usize, reserve: usize, deep: Option<&std::sync::atomic::AtomicBool>) -> Ran {
     // Calls as deep as the stack left allows (a recursion deeper than that
     // gives up, and the interpreter, which grows the stack, goes on), at
     // `frame` bytes a call, with `reserve` kept.
     let left = crate::stack::remaining().unwrap_or(64 << 10).saturating_sub(reserve);
-    let mut ctx = Ctx { bail: 0, depth: 0, max: (MAX_DEPTH.saturating_sub(depth)).min(left / frame) as u64 };
+    let max = (MAX_DEPTH.saturating_sub(depth)).min(left / frame);
+    // A frame is made before the code counts the call: with no room for the first, and a frame
+    // over `LEVEL` (`reserve`), no machine code (Q-947 review 7).
+    if reserve != 0 && max == 0 {
+        return Ran::Interpret;
+    }
+    // Given up for the stack before, and it would be again: on `BIG` at once, not after a descent
+    // to `max` and back (Q-947 review 7).
+    if let Some(deep) = deep {
+        if max < MAX_DEPTH.saturating_sub(depth) && deep.load(Relaxed) && crate::stack::remaining().is_some() {
+            return floor_unless_done(on_big(entry, ret, raw, depth, frame, reserve), depth);
+        }
+    }
+    let mut ctx = Ctx { bail: 0, depth: 0, max: max as u64 };
     // SAFETY: `entry` was made for exactly these argument types, read from
     // `raw` in order; `ctx` outlives the call.
     let r = unsafe { entry(raw.as_ptr(), &mut ctx) };
     if ctx.bail != 0 {
-        return gave_up(&ctx, entry, ret, raw, depth, frame, reserve);
+        return gave_up(&ctx, entry, ret, raw, depth, frame, reserve, deep);
     }
     Ran::Done(Ok(match ret {
         T::I => Value::Int(r as i64),
@@ -557,8 +647,6 @@ struct Plan<'a> {
     /// one of them.
     over: &'a std::collections::HashSet<usize>,
     met: bool,
-    /// The largest `Compiled::frame` of the functions compiled before that this plan calls.
-    frame: usize,
 }
 
 /// Guesses `Plan` tries for each function it plans, at most, past `PLAN_BASE`: a chain of 40
@@ -596,8 +684,7 @@ impl<'a> Plan<'a> {
         }
         if let Some(Some(c)) = self.done.get(&key) {
             // Its code is called as it is (`Compiled::id`), so what it calls is what this plan
-            // calls too, and the stack its calls take (Q-947).
-            self.frame = self.frame.max(c.frame);
+            // calls too.
             for d in &c.deps {
                 if !self.deps.contains(d) {
                     self.deps.push(d.clone());
@@ -997,7 +1084,7 @@ pub(crate) fn swapped(op: BinOp) -> BinOp {
 // ---- making the code ---------------------------------------------------
 
 fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
-    let mut plan = Plan { env: &c.env, types: HashMap::new(), order: Vec::new(), open: HashMap::new(), deps: Vec::new(), done: &jit.done, stands_on: HashMap::new(), reads: Vec::new(), steps: 0, seen: Default::default(), over: &jit.over, met: false, frame: LEVEL };
+    let mut plan = Plan { env: &c.env, types: HashMap::new(), order: Vec::new(), open: HashMap::new(), deps: Vec::new(), done: &jit.done, stands_on: HashMap::new(), reads: Vec::new(), steps: 0, seen: Default::default(), over: &jit.over, met: false };
     let Some(ret) = plan.func(&c.def, sig) else {
         // Its plan met the budget, or a function whose plan did: it is not planned again, as
         // the function called or as one calling it, and it is the interpreter's (`NEVER`), so
@@ -1014,7 +1101,7 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
         }
         return None;
     };
-    let (types, order, deps, mut frame) = (plan.types, plan.order, plan.deps, plan.frame);
+    let (types, order, deps) = (plan.types, plan.order, plan.deps);
     // Each function to make, declared first (they may call each other).
     let mut ids: HashMap<Key, FuncId> = HashMap::new();
     for (def, args) in &order {
@@ -1026,6 +1113,7 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
     let mut ctx = jit.module.make_context();
     let tc = jit.module.target_config();
     let mut made = Vec::new();
+    let (mut calls, mut earlier) = (Vec::new(), (LEVEL, 0));
     let (refuse, in_cranelift) = REFUSE.with(|r| r.borrow().clone());
     let all = 'all: {
         for (def, args) in &order {
@@ -1047,12 +1135,16 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
                     sc: Scopes { stack: vec![Vec::new()] },
                     ret: types[&key],
                     ended: false,
+                    calls: Vec::new(),
+                    earlier: (LEVEL, 0),
                 };
                 if (refused && !in_cranelift) || g.function(def, args).is_none() {
                     break 'all false;
                 }
                 g.b.seal_all_blocks();
                 g.b.finalize(tc);
+                earlier = (earlier.0.max(g.earlier.0), earlier.1.max(g.earlier.1));
+                calls.push((ids[&key].as_u32(), std::mem::take(&mut g.calls), LEVEL));
             }
             if refused {
                 ctx.func.signature.returns.clear();
@@ -1065,8 +1157,8 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
             // address (Q-947). 16 bytes more a call took 9,000 calls with 56 such lets in
             // `parallel` for the stack, and ran them again on a new one, 8.6% over main; what is
             // not a call's (the entry, the call that gives up) is `RESERVE`.
-            if let Some(f) = ctx.compiled_code().and_then(|code| code.buffer.frame_layout()) {
-                frame = frame.max(f.frame_to_fp_offset as usize + 16);
+            if let (Some(f), Some(made)) = (ctx.compiled_code().and_then(|code| code.buffer.frame_layout()), calls.last_mut()) {
+                made.2 = f.frame_to_fp_offset as usize + 16;
             }
             jit.module.clear_context(&mut ctx);
             made.push(ids[&key]);
@@ -1086,6 +1178,7 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
         }
         return None;
     }
+    let (per, excess) = stack_counted(&calls, earlier);
     // The entry: arguments from memory, the result as bits.
     let key = (Arc::as_ptr(&c.def) as usize, sig.to_vec());
     let target = match ids.get(&key) {
@@ -1140,7 +1233,37 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
     let code = jit.module.get_finalized_function(entry_id);
     // SAFETY: the entry was made with exactly this signature.
     let entry = unsafe { std::mem::transmute::<*const u8, Entry>(code) };
-    Some(Compiled { entry, ret, deps, id: target, frame })
+    Some(Compiled { entry, ret, deps, id: target, per, excess, deep: Default::default() })
+}
+
+/// The stack counted for each call of a compile's code (`Compiled::per`) and kept beyond that
+/// (`Compiled::excess`), from the functions made (`calls`: each with those it calls and its frame)
+/// and those compiled before that they call (`earlier`). A function on a cycle of calls can be on
+/// a chain any number of times, so each call is counted at the largest of their frames; one on no
+/// cycle is there at most once, and what its frame has over that is kept once. Each call counted
+/// at the largest frame of the whole compile, a deep recursion of small frames below one big
+/// caller, or a big callee it never called, was given up for the stack and run again on a new one
+/// at each call: 3,976 M instructions against main's 1,574 M (Q-947 review 7).
+fn stack_counted(calls: &[(u32, Vec<u32>, usize)], earlier: (usize, usize)) -> (usize, usize) {
+    // On a cycle: it reaches itself. A compile makes few functions: plain lists, no tables.
+    let on_cycle = |start: usize| {
+        let mut seen = vec![false; calls.len()];
+        let mut todo: Vec<u32> = calls[start].1.clone();
+        while let Some(f) = todo.pop() {
+            if f == calls[start].0 {
+                return true;
+            }
+            if let Some(at) = calls.iter().position(|c| c.0 == f).filter(|&at| !seen[at]) {
+                seen[at] = true;
+                todo.extend_from_slice(&calls[at].1);
+            }
+        }
+        false
+    };
+    let cyclic: Vec<bool> = (0..calls.len()).map(on_cycle).collect();
+    let per = calls.iter().zip(&cyclic).filter(|(_, c)| **c).map(|(f, _)| f.2).fold(earlier.0, usize::max);
+    let excess = calls.iter().zip(&cyclic).filter(|(_, c)| !**c).map(|(f, _)| f.2.saturating_sub(per)).sum::<usize>() + earlier.1;
+    (per, excess)
 }
 
 /// Code for `id` that only gives up, as the function would have at its first step.
@@ -1194,6 +1317,10 @@ struct Gen<'a, 'f> {
     ret: T,
     /// The current block has ended (a `return`): code after it is unreachable.
     ended: bool,
+    /// The functions of this compile it calls, and the largest `per` and `excess` of those
+    /// compiled before it calls (Q-947).
+    calls: Vec<u32>,
+    earlier: (usize, usize),
 }
 
 const BAIL: i32 = 0;
@@ -1355,8 +1482,19 @@ impl Gen<'_, '_> {
                     vs.push(self.value(a, ret)?);
                 }
                 let key = (Arc::as_ptr(&callee.def) as usize, ts.clone());
-                // Made in this compile, or compiled on its own before (`Compiled::id`).
-                let id = self.ids.get(&key).copied().or_else(|| Some(self.done.get(&key)?.as_ref()?.id))?;
+                // Made in this compile, or compiled on its own before (`Compiled::id`), its own
+                // chains of calls counted (Q-947).
+                let id = match self.ids.get(&key) {
+                    Some(id) => {
+                        self.calls.push(id.as_u32());
+                        *id
+                    }
+                    None => {
+                        let c = self.done.get(&key)?.as_ref()?;
+                        self.earlier = (self.earlier.0.max(c.per), self.earlier.1.max(c.excess));
+                        c.id
+                    }
+                };
                 let _ = self.types;
                 vs.push(self.ctx);
                 let fr = self.module.declare_func_in_func(id, self.b.func);
