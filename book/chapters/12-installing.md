@@ -17,15 +17,15 @@ Each [release](https://github.com/quillolang/quillo/releases) has `quillo` built
 | macOS, Intel | `quillo-<version>-x86_64-apple-darwin.tar.gz` |
 | Windows | `quillo-<version>-x86_64-pc-windows-msvc.zip` |
 
-Unpack it and put `quillo` on your `PATH`. The Linux builds of 0.8.2 are linked against
+Unpack it and put `quillo` on your `PATH`. The Linux builds of 0.8.3 are linked against
 glibc 2.17, and start on CentOS 7, CloudLinux 7 and 8, AlmaLinux 8 and anything newer (see
 [Shared hosting](#shared-hosting)); 0.6.0's needed glibc 2.35 or later. They are built without `quillo app`
 (desktop windows): build from source with `--features app` for that. Beside each
 archive is a `.sha256` that checks the download:
 
 ```sh
-shasum -a 256 -c quillo-v0.8.2-aarch64-apple-darwin.tar.gz.sha256   # macOS
-sha256sum -c quillo-v0.8.2-x86_64-unknown-linux-gnu.tar.gz.sha256    # Linux
+shasum -a 256 -c quillo-v0.8.3-aarch64-apple-darwin.tar.gz.sha256   # macOS
+sha256sum -c quillo-v0.8.3-x86_64-unknown-linux-gnu.tar.gz.sha256    # Linux
 ```
 
 The rest of this chapter is for building it yourself.

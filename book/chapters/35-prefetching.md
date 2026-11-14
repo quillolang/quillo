@@ -2,7 +2,9 @@
 
 Every page Quillo serves asks for the pages it links to before they are clicked. Point
 at a link, and the page it leads to is fetched; by the time the click lands, the page is
-already there. There is nothing to write or set up: it is on for every page.
+already there. There is nothing to write or set up: it is on for every page that has
+something to follow: a link, a `<script>` (which may add links) or a component. A page with
+none, a table or a receipt, is sent as the route made it, without the script *(since 0.8.3)*.
 
 > **Try it on quillolang.org.** The site is a Quillo program, and its pages prefetch. Open DevTools
 > on the **Network** panel (filter: All) and clear it, then point at a page in the
@@ -132,4 +134,5 @@ max-age=30`, and may be up to 30 seconds old after a change. This site is now se
 
 HTML files served with `file()`, `files()` or `quillo serve` go out as they are on disk:
 the prefetch script is added only to pages a route makes, so a file's `ETag` and a
-`Range` of it are of its own bytes. Such pages do not prefetch.
+`Range` of it are of its own bytes. Such pages do not prefetch, nor does a page a route makes
+with no link, script or component in it.

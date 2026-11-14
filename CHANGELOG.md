@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.3 (2026-11-15)
 
 - A page with nothing to prefetch (no link, no `<script>`, no component) no longer carries
   the prefetch script: it is sent as the route made it, 1,334 bytes smaller. TechEmpower's
@@ -11,8 +11,8 @@
   64-bit ARM, SSE2 on x86-64), short pieces of a page and of the answer's head are copied
   without a call to the C library, a record's field is found without one, and the page's checks
   for links, scripts and a stream's player are one pass. TechEmpower's Fortunes takes 7.8% fewer
-  CPU cycles a request than 0.8.2 (24,259 against 26,318; Bun 27,380), from SQLite 8.5% fewer,
-  JSON 5.5%, text 2.6%. A page whose only script is written `<Script>` now gets prefetching too.
+  CPU cycles a request (24,259 against 26,318 for 0.8.2's code with the page as small; Bun
+  27,380), from SQLite 8.5% fewer, JSON 5.5%, text 2.6%. A page whose only script is written `<Script>` now gets prefetching too.
 
 ## 0.8.2 (2026-11-14)
 
