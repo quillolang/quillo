@@ -842,7 +842,8 @@ server's code:
   something that never comes holds its coroutine for good, and no one else. Also limited
   is the socket: a request head not whole after 30 s, or a body of which nothing has
   come for 30 s, is answered 408 and dropped (a body that keeps coming may take as long
-  as it takes), an idle keep-alive connection is closed after 60 s, and a client that
+  as it takes), a keep-alive connection is closed 60 s after its last answer ended (a pooling
+  proxy in front should keep connections idle for less), and a client that
   stops reading its answer is let go after 30 s.
 - **Rate limiting:** none for routes (a `rate_limit` builtin was removed). Count what
   matters in a table of your own: wrong PINs per account, uploads per hour. What is

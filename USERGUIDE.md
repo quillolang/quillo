@@ -558,6 +558,13 @@ let same = (x) => { x }                           // but `{ x }` alone is a bloc
 view Card(title: str, children) = <section.card><h2>{title}</h2>{children}</section>
 ```
 
+A lambda shares the variables around it (`let inc = () => { n = n + 1 }` changes `n`), and a
+lambda kept in a variable is freed with them: when its block, call, loop step, view or route
+ends, or once whatever it was given to lets it go. Kept, as in 0.8.1, are a scope whose
+lambdas form a ring of more than 8 functions, scopes or lists, a list past 128 items holding
+one, a list of lambdas also given out, a loop step's lambda that something outside holds, and
+a failing call's default-parameter lambda (FEEDBACK65.md, Q-941).
+
 Type annotations are checked when the function is called and when it returns, and
 `quillo check` checks them before the program runs: `int float dec num str date bool list map
 html fn response any` (`num` is `int | float`, not `dec`). Unions are written `int | str`; add `?` or `| null` to also allow null
@@ -4341,7 +4348,8 @@ server's code:
   something that never comes holds its coroutine for good, and no one else. Also limited
   is the socket: a request head not whole after 30 s, or a body of which nothing has
   come for 30 s, is answered 408 and dropped (a body that keeps coming may take as long
-  as it takes), an idle keep-alive connection is closed after 60 s, and a client that
+  as it takes), a keep-alive connection is closed 60 s after its last answer ended (a pooling
+  proxy in front should keep connections idle for less), and a client that
   stops reading its answer is let go after 30 s.
 - **Rate limiting:** none for routes (a `rate_limit` builtin was removed). Count what
   matters in a table of your own: wrong PINs per account, uploads per hour. What is

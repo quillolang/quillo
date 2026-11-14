@@ -30,6 +30,32 @@
   a `<quillo-media>` player forwards, which memchr does with SIMD, not back from the end. Nothing
   a page or the log says changed.
 
+### From a site in production: memory and connections (FEEDBACK65.md)
+
+From qwertime.com, live on 0.8.1 behind two servers and Limer. Fixed (0.8.1 too):
+
+- **A lambda kept in a variable no longer keeps its scope for ever.** `let f = (x) => ...` (or a
+  nested `fn`, or a record or list of them) held the scope it was made in, and the scope held
+  it, so neither was freed: every request leaked all the scope held, a page's rows or an
+  upload's bytes, until the server was killed for memory (qwertime: four times in five
+  minutes). The scope is freed when the block, call, loop step, `match` arm, view, component,
+  route or script ends, or once what held the lambda lets it go. Lambdas still share and assign
+  the variables around them. A function ending in `return`, a view or component body, a loop
+  or call left by an error, a match binding and a route parameter leaked the same way. Freeing
+  costs a function that keeps a lambda a few hundred instructions a call (Q-941).
+- **A kept-alive connection is idle from the end of its last answer**, as nginx counts it. A
+  connection whose answer took longer than 60 s (an `events()` stream, a long download) was
+  closed within a second of its end, without `connection: close`, so a proxy's next request on
+  it was cut off: through Limer, failures against the server and, with many streams ending
+  together, both servers out of the pool every two minutes. A streamed answer now says
+  `connection: close` whenever the connection will not be kept, a program's own included, and
+  a request that had partly come behind a long answer is timed from that answer's end, not
+  given a 408 right after it (Q-942).
+- A pipelined request's `100 Continue` comes after the answers to the requests ahead of it, not
+  before them (Q-948).
+- A pipelined request whose last bytes came while large answers ahead of it were made is read
+  and answered, not left for a 408 after 30 s (Q-949).
+
 ### Pages that change a lot, and live data (FEEDBACK61.md)
 
 From a three-pane console, a one-page tracker with live data and two visitors, and lists
