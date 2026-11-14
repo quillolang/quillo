@@ -19,6 +19,17 @@ pub enum Ctrl {
     Reply(Arc<Response>),
 }
 
+/// `e`, the scope it leaves (a call's, a loop's) ended first: a lambda kept in it held it for
+/// ever (FEEDBACK65.md, Q-941; branch feedback65). Apart, so that the way on pays nothing for it.
+#[cold]
+#[inline(never)]
+fn ended(scope: Option<Env>, e: Ctrl) -> Ctrl {
+    if let Some(s) = scope {
+        Scope::done(s);
+    }
+    e
+}
+
 /// What a call changes as it starts, kept to be put back after one that panicked
 /// (`Interp::entered`).
 pub(crate) struct Entered {
@@ -3044,56 +3055,75 @@ impl Interp {
             Expr::Index(obj, idx, line) => self.eval_index(obj, idx, env, *line),
             Expr::Match(subj, arms, line) => self.eval_match(subj, arms, env, *line),
             Expr::For(pat, iter, body, line) => self.eval_for(e, pat, iter, body, env, *line, true),
-            Expr::While(cond, body, line) => {
-                // A body that declares has one scope for all its rounds, unless one of them
-                // leaves something holding it, as a `for` has.
-                let stmts = match &**body {
-                    Expr::Block(stmts) if !stmts.iter().all(|s| matches!(s, Stmt::Expr(_) | Stmt::Assign(..) | Stmt::Return(..))) => Some(stmts),
-                    _ => None,
-                };
-                let mut scope: Option<Env> = None;
-                let mut rounds = 0u64;
-                loop {
-                    // A long loop goes on in machine code from here (src/jitloop.rs).
-                    #[cfg(feature = "jit")]
-                    if rounds == crate::jitloop::WARM && self.loops_compile() {
-                        if let Some(s) = scope.take() {
-                            Scope::done(s);
-                        }
-                        match crate::jitloop::run(self, e, env, None) {
-                            Some(crate::jitloop::Ran::Done) => break,
-                            Some(crate::jitloop::Ran::Failed(err)) => return Err(err),
-                            Some(crate::jitloop::Ran::Resume(_)) | None => {}
-                        }
-                    }
-                    rounds += 1;
-                    if !self.eval(cond, env)?.truthy() {
-                        break;
-                    }
-                    self.within_limit(*line)?;
-                    if self.fuel != u64::MAX {
-                        self.burn(*line)?;
-                    }
-                    match stmts {
-                        Some(stmts) => {
-                            if !scope.as_mut().map_or(false, Scope::reuse) {
-                                scope = Some(Scope::child(env));
-                            }
-                            self.block_in(stmts, scope.as_ref().expect("set above"), false)?;
-                        }
-                        None => {
-                            self.eval_unused(body, env)?;
-                        }
-                    }
-                }
-                if let Some(s) = scope {
-                    Scope::done(s);
-                }
-                Ok(Value::Nil)
-            }
+            // Apart, so that ending its scope on the way out costs `eval` nothing (FEEDBACK65.md,
+            // Q-941; branch feedback65).
+            Expr::While(cond, body, line) => self.eval_while(e, cond, body, env, *line),
             Expr::Reply(status, body, line) => self.eval_reply(status, body.as_deref(), env, *line),
             Expr::Html(el, _) => self.eval_html(el, env),
         }
+    }
+
+    /// `while`.
+    #[inline(never)]
+    fn eval_while(&mut self, e: &Expr, cond: &Expr, body: &Expr, env: &Env, line: u32) -> Result<Value, Ctrl> {
+        // A body that declares has one scope for all its rounds, unless one of them
+        // leaves something holding it, as a `for` has.
+        let stmts = match body {
+            Expr::Block(stmts) if !stmts.iter().all(|s| matches!(s, Stmt::Expr(_) | Stmt::Assign(..) | Stmt::Return(..))) => Some(stmts),
+            _ => None,
+        };
+        let mut scope: Option<Env> = None;
+        // A round's lambda held from outside: the later rounds are not looked at (FEEDBACK65.md,
+        // Q-941 review 2; branch feedback65).
+        let mut outside = false;
+        let mut rounds = 0u64;
+        loop {
+            // A long loop goes on in machine code from here (src/jitloop.rs).
+            #[cfg(feature = "jit")]
+            if rounds == crate::jitloop::WARM && self.loops_compile() {
+                if let Some(s) = scope.take() {
+                    Scope::done(s);
+                }
+                match crate::jitloop::run(self, e, env, None) {
+                    Some(crate::jitloop::Ran::Done) => break,
+                    Some(crate::jitloop::Ran::Failed(err)) => return Err(err),
+                    Some(crate::jitloop::Ran::Resume(_)) | None => {}
+                }
+            }
+            rounds += 1;
+            // Left by an error or `return`, its scope is ended first (FEEDBACK65.md,
+            // Q-941; branch feedback65).
+            match self.eval(cond, env) {
+                Ok(c) if c.truthy() => {}
+                Ok(_) => break,
+                Err(x) => return Err(ended(scope, x)),
+            }
+            if let Err(x) = self.within_limit(line) {
+                return Err(ended(scope, x));
+            }
+            if self.fuel != u64::MAX {
+                if let Err(x) = self.burn(line) {
+                    return Err(ended(scope, x));
+                }
+            }
+            match stmts {
+                Some(stmts) => {
+                    if !scope.as_mut().map_or(false, |s| Scope::reuse_step(s, &mut outside)) {
+                        scope = Some(Scope::child(env));
+                    }
+                    if let Err(x) = self.block_in(stmts, scope.as_ref().expect("set above"), false) {
+                        return Err(ended(scope, x));
+                    }
+                }
+                None => {
+                    self.eval_unused(body, env)?;
+                }
+            }
+        }
+        if let Some(s) = scope {
+            Scope::done(s);
+        }
+        Ok(Value::Nil)
     }
 
     #[inline(never)]
@@ -3182,7 +3212,12 @@ impl Interp {
             return self.block_in(stmts, env, keep);
         }
         let scope = Scope::child(env);
-        let last = self.block_in(stmts, &scope, keep)?;
+        // Ended however it is left, by `return` or an error too: a function's body ends so, and a
+        // lambda kept in it held it for ever (FEEDBACK65.md, Q-941; branch feedback65).
+        let last = match self.block_in(stmts, &scope, keep) {
+            Ok(v) => v,
+            Err(x) => return Err(ended(Some(scope), x)),
+        };
         Scope::done(scope);
         Ok(last)
     }
@@ -3779,12 +3814,21 @@ impl Interp {
             for (n, x) in binds {
                 define(&scope, &n, x);
             }
+            // The arm's scope ended however it is left: a lambda assigned to one of its names held
+            // it for ever (FEEDBACK65.md, Q-941 review 4; branch feedback65).
             if let Some(g) = &arm.guard {
-                if !self.eval(g, &scope)?.truthy() {
-                    continue;
+                match self.eval(g, &scope) {
+                    Ok(t) if t.truthy() => {}
+                    Ok(_) => {
+                        Scope::done(scope);
+                        continue;
+                    }
+                    Err(x) => return Err(ended(Some(scope), x)),
                 }
             }
-            return self.eval(&arm.body, &scope);
+            let r = self.eval(&arm.body, &scope);
+            Scope::done(scope);
+            return r;
         }
         fail(line, format!("no `match` arm matches {}", short(&v)))
     }
@@ -3796,6 +3840,9 @@ impl Interp {
     fn eval_for(&mut self, node: &Expr, pat: &Pattern, iter: &Expr, body: &Expr, env: &Env, line: u32, keep: bool) -> Result<Value, Ctrl> {
         let mut out = Vec::new();
         let mut scope = None;
+        // A step's lambda held from outside: the later steps are not looked at (FEEDBACK65.md,
+        // Q-941 review 2; branch feedback65).
+        let mut outside = false;
         // `range(a, b)` and `a..b`: counted, without making the list.
         if let Some((a, b, step)) = self.counted(iter, env, line, keep)? {
             if keep {
@@ -3823,7 +3870,12 @@ impl Interp {
                     }
                 }
                 rounds += 1;
-                let v = self.for_step(pat, Value::Int(i), body, env, &mut scope, line, keep)?;
+                // Left by an error or `return`, its scope is ended first (FEEDBACK65.md, Q-941;
+                // branch feedback65).
+                let v = match self.for_step(pat, Value::Int(i), body, env, &mut scope, &mut outside, line, keep) {
+                    Ok(v) => v,
+                    Err(x) => return Err(ended(scope, x)),
+                };
                 if keep {
                     out.push(v);
                 }
@@ -3851,7 +3903,10 @@ impl Interp {
                 out.reserve(items.len());
             }
             for item in items {
-                let v = self.for_step(pat, item.clone(), body, env, &mut scope, line, keep)?;
+                let v = match self.for_step(pat, item.clone(), body, env, &mut scope, &mut outside, line, keep) {
+                    Ok(v) => v,
+                    Err(x) => return Err(ended(scope, x)),
+                };
                 if keep {
                     out.push(v);
                 }
@@ -3870,7 +3925,7 @@ impl Interp {
     /// One step of a loop: `item` bound by `pat` in a scope of its own (the
     /// last step's again, when nothing kept it), and the body's value.
     #[allow(clippy::too_many_arguments)]
-    fn for_step(&mut self, pat: &Pattern, item: Value, body: &Expr, env: &Env, scope: &mut Option<Env>, line: u32, keep: bool) -> Result<Value, Ctrl> {
+    fn for_step(&mut self, pat: &Pattern, item: Value, body: &Expr, env: &Env, scope: &mut Option<Env>, outside: &mut bool, line: u32, keep: bool) -> Result<Value, Ctrl> {
         self.within_limit(line)?;
         if self.fuel != u64::MAX {
             self.burn(line)?;
@@ -3882,7 +3937,7 @@ impl Interp {
             _ => Err(item),
         };
         if let Err(item) = rebound {
-            if !scope.as_mut().map_or(false, Scope::reuse) {
+            if !scope.as_mut().map_or(false, |s| Scope::reuse_step(s, outside)) {
                 *scope = Some(Scope::child(env));
             }
             let sc = scope.as_ref().expect("set above");
@@ -4860,29 +4915,45 @@ impl Interp {
                     for (n, x) in binds {
                         define(&scope, &n, x);
                     }
+                    // Ended however it is left, as `eval_match`'s (FEEDBACK65.md, Q-941 review 4;
+                    // branch feedback65).
                     if let Some(g) = &arm.guard {
-                        if !self.eval(g, &scope)?.truthy() {
-                            continue;
+                        match self.eval(g, &scope) {
+                            Ok(t) if t.truthy() => {}
+                            Ok(_) => {
+                                Scope::done(scope);
+                                continue;
+                            }
+                            Err(x) => return Err(ended(Some(scope), x)),
                         }
                     }
-                    return self.render_expr_into(&arm.body, &scope, out);
+                    let r = self.render_expr_into(&arm.body, &scope, out);
+                    Scope::done(scope);
+                    return r;
                 }
                 fail(*line, format!("no `match` arm matches {}", short(&v)))
             }
             Expr::Block(stmts) => match stmts.split_last() {
                 Some((end @ Stmt::Expr(last), rest)) => {
                     let scope = Scope::child(env);
+                    // Ended however it is left: a view's body with a lambda kept in it was held
+                    // by it for ever (FEEDBACK65.md, Q-941; branch feedback65).
                     for s in rest {
-                        self.exec_stmt(s, &scope)?;
+                        if let Err(x) = self.exec_stmt(s, &scope) {
+                            return Err(ended(Some(scope), x));
+                        }
                     }
                     // A component's body that declared its states here: its markup starts.
                     if self.island_scopes.last().is_some_and(|(_, e, _)| Arc::ptr_eq(e, &scope)) {
                         self.markup_starts();
                     }
-                    if crate::debug::on() {
-                        return crate::debug::around(self, end, &scope, |it| it.render_expr_into(last, &scope, out));
-                    }
-                    self.render_expr_into(last, &scope, out)
+                    let r = if crate::debug::on() {
+                        crate::debug::around(self, end, &scope, |it| it.render_expr_into(last, &scope, out))
+                    } else {
+                        self.render_expr_into(last, &scope, out)
+                    };
+                    Scope::done(scope);
+                    r
                 }
                 _ => {
                     let v = self.eval_block(stmts, env, true)?;
@@ -5931,8 +6002,11 @@ impl Interp {
         let from = self.island_scopes_at.pop().unwrap_or(0).min(self.island_scopes.len());
         let mut now: Option<Map> = None;
         for (at, env, seen) in self.island_scopes.drain(from..) {
-            let (Some(was), Some((name, _))) = (seen, state.get_index(at)) else { continue };
-            let Some(v) = lookup(&env, name.as_str()) else { continue };
+            let found = if seen.is_some() { state.get_index(at).and_then(|(name, _)| Some((name, lookup(&env, name.as_str())?))) } else { None };
+            // Its hold on the component's scope ends that scope, the last one with a lambda kept in
+            // it too (FEEDBACK65.md, Q-941; branch feedback65).
+            Scope::done(env);
+            let (Some(was), Some((name, v))) = (seen, found) else { continue };
             let same = match (&was, &v) {
                 (Value::List(a), Value::List(b)) => Arc::ptr_eq(a, b) || crate::value::equal(&was, &v),
                 (Value::Map(a), Value::Map(b)) => Arc::ptr_eq(a, b) || crate::value::equal(&was, &v),

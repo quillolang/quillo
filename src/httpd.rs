@@ -1179,6 +1179,10 @@ impl Loop {
             }
             if swept.elapsed() >= Duration::from_secs(1) {
                 self.sweep();
+                // Scopes held from outside when they ended, looked at again a few at a time, so
+                // that a server gone quiet frees them too (FEEDBACK65.md, Q-941 review 1; branch
+                // feedback65).
+                crate::value::look_again();
                 swept = Instant::now();
             }
             if STOPPING.load(SeqCst) {

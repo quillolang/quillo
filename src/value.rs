@@ -1581,6 +1581,9 @@ pub struct Scope {
 /// feedback29-fixes).
 struct VarsCell {
     locked: std::sync::atomic::AtomicBool,
+    /// On a thread's list of scopes to look at again (`watch`), which holds it once more
+    /// (FEEDBACK65.md, Q-941; branch feedback65). In the room `locked` leaves, so no larger.
+    watched: std::sync::atomic::AtomicBool,
     vars: std::cell::UnsafeCell<Vars>,
 }
 
@@ -1592,7 +1595,7 @@ struct VarsGuard<'a>(&'a VarsCell, bool);
 
 impl VarsCell {
     fn new(vars: Vars) -> Self {
-        VarsCell { locked: std::sync::atomic::AtomicBool::new(false), vars: std::cell::UnsafeCell::new(vars) }
+        VarsCell { locked: std::sync::atomic::AtomicBool::new(false), watched: std::sync::atomic::AtomicBool::new(false), vars: std::cell::UnsafeCell::new(vars) }
     }
 
     fn lock(&self) -> VarsGuard<'_> {
@@ -1732,6 +1735,14 @@ impl Vars {
         }
     }
 
+    /// Calls `f` with each value while it says go on; whether it always did.
+    fn each_value(&self, mut f: impl FnMut(&Value) -> bool) -> bool {
+        match self {
+            Vars::Few(slots, more, _) => slots.iter().flatten().chain(more.iter()).all(|(_, v)| f(v)),
+            Vars::Many(m) => m.values().all(f),
+        }
+    }
+
     fn entries(&self) -> Vec<(String, Value)> {
         match self {
             Vars::Few(slots, more, _) => slots.iter().flatten().chain(more.iter()).map(|(k, x)| (k.to_string(), x.clone())).collect(),
@@ -1793,8 +1804,18 @@ impl Scope {
     /// Ends a scope made with `child`. If nothing else holds it (no
     /// function made in it is still around), it is emptied and kept for the
     /// next `child`, saving an allocation per call, block and loop step.
+    /// Held only by functions kept in its own variables (`let f = (x) => ...`), which
+    /// nothing else holds, it is too: they held each other for ever (FEEDBACK65.md, Q-941;
+    /// branch feedback65).
     pub fn done(mut e: Env) {
-        let Some(s) = Arc::get_mut(&mut e) else { return };
+        let Some(s) = Arc::get_mut(&mut e) else {
+            match quick(&e, true) {
+                Quick::Plain => {}
+                Quick::Outside => watch(e),
+                Quick::Look => Scope::done_held(e),
+            }
+            return;
+        };
         s.parent = None;
         s.vars.vars.get_mut().clear();
         SPARE.with(|sp| {
@@ -1825,12 +1846,88 @@ impl Scope {
     /// Empties a scope for another loop step, if nothing else holds it (a
     /// function made in the last step would): then it can be used again.
     pub fn reuse(e: &mut Env) -> bool {
+        Scope::reuse_step(e, &mut false)
+    }
+
+    /// `reuse` for a loop that remembers, in `outside`, a step whose lambda something outside
+    /// held (each kept in a list, say): its later steps are not looked at, at no cost, and are
+    /// left as they were (FEEDBACK65.md, Q-941 review 2; branch feedback65).
+    #[inline(always)]
+    pub fn reuse_step(e: &mut Env, outside: &mut bool) -> bool {
         // Nothing takes a weak hold of a scope, so one owner is enough to know it.
         if Arc::strong_count(e) != 1 {
-            return false;
+            if *outside {
+                return false;
+            }
+            return match quick(e, false) {
+                Quick::Plain => false,
+                Quick::Outside => {
+                    *outside = true;
+                    false
+                }
+                Quick::Look => Scope::reuse_held(e, outside),
+            };
         }
         e.vars().clear();
         true
+    }
+
+    /// `done` of a scope something else holds: if that is only functions kept in it, which
+    /// nothing else holds, they are let go of and it is kept as `done` keeps one; if something
+    /// outside holds them too (`return f`), it is looked at again later (FEEDBACK65.md, Q-941;
+    /// branch feedback65).
+    #[cold]
+    #[inline(never)]
+    fn done_held(mut e: Env) {
+        // A record or list of its own holding a lambda made in it that is held besides (`return
+        // acts.go`): listed at once, as `quick` lists `return f`, and the next look tells
+        // (FEEDBACK65.md, Q-941 review of S2c, 1; branch feedback65).
+        if boxed_outside(&e) {
+            return watch(e);
+        }
+        match own(&e, 1) {
+            Own::None => {}
+            Own::Closed => {
+                empty_own(&e);
+                Scope::done(e);
+            }
+            Own::Outside => watch(e),
+            Own::Look => match ring(&e, 1) {
+                Ring::Broken if Arc::get_mut(&mut e).is_some() => Scope::done(e),
+                Ring::Held(w) => watch_as(e, w),
+                _ => {}
+            },
+        }
+    }
+
+    /// `reuse` of a scope something else holds: as `done_held`, and then empty, it is used
+    /// again. One held from outside is left as it was, at no cost and never listed: a loop that
+    /// keeps each step's lambda in a list keeps them all (FEEDBACK65.md, Q-941 review 2; branch
+    /// feedback65).
+    #[cold]
+    #[inline(never)]
+    fn reuse_held(e: &mut Env, outside: &mut bool) -> bool {
+        // Held from outside, whatever told it: the loop's later steps are not looked at either
+        // (FEEDBACK65.md, Q-941 review of S2c, 2; branch feedback65).
+        match own(e, 1) {
+            Own::Closed => {
+                empty_own(e);
+                Arc::strong_count(e) == 1
+            }
+            Own::None => false,
+            Own::Outside => {
+                *outside = true;
+                false
+            }
+            Own::Look => match ring(e, 1) {
+                Ring::Broken => Arc::strong_count(e) == 1,
+                Ring::Held(_) => {
+                    *outside = true;
+                    false
+                }
+                Ring::None => false,
+            },
+        }
     }
 
     #[inline(always)]
@@ -1840,6 +1937,672 @@ impl Scope {
         } else {
             self.vars.lock()
         }
+    }
+}
+
+// ---- rings: a scope and the functions kept in it -------------------------------------------
+//
+// `let f = (x) => ...` keeps a function in a scope's variables, and the function holds the scope
+// (its `env`): each held the other, so neither was freed when the scope ended, and what the scope
+// held leaked on every call, a page's rows or an upload's bytes (FEEDBACK65.md, Q-941; branch
+// feedback65). A function shares the variables it reads (it may assign them), so they stay where
+// they are. When a scope ends still held, the holds are counted instead: if every hold on it, and
+// on the functions and scopes between, comes from one of them, nothing else can reach any of them,
+// and their variables are emptied, which no program can see.
+
+/// The most scopes, the most functions, and the most lists and maps a ring is looked for among:
+/// past them it is left as it was.
+const RING: usize = 8;
+/// The deepest inside a scope a function's own may be for it to be one of the scope's ring.
+const RING_DEEP: usize = 16;
+/// The most items of lists and maps looked through for a ring, all of them together; a list or
+/// map longer than what is left is passed over whole, so a scope's 20,000 rows cost a look at
+/// their length (FEEDBACK65.md, Q-941; branch feedback65). Under `DEFER_AT`, so that none of the
+/// ring's lists is given to another thread to free.
+const RING_ITEMS: usize = 128;
+
+enum Ring {
+    /// No function in its variables holds it.
+    None,
+    /// Some do, but something besides them holds it or one of them: what, to tell later.
+    Held(Witness),
+    /// Nothing besides them did: their variables are emptied.
+    Broken,
+}
+
+/// Whether function `c` holds scope `s`: it was made in `s` or in a scope inside it.
+#[inline]
+fn holds(c: &Closure, s: *const Scope) -> bool {
+    let mut y: &Scope = &c.env;
+    for _ in 0..RING_DEEP {
+        if std::ptr::eq(y, s) {
+            return true;
+        }
+        match y.parent.as_deref() {
+            Some(p) => y = p,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// What a first glance at a scope still held at its end tells, at the cost of a few instructions
+/// (FEEDBACK65.md, Q-941 review 2 and 3; branch feedback65).
+#[derive(PartialEq)]
+enum Quick {
+    /// No function, and no list or map only its variable holds: no ring can go through them,
+    /// the commonest (a call's that gives back a lambda).
+    Plain,
+    /// A function made in it, held besides: something outside holds its ring (`return f`, a
+    /// list outside), or the function is kept twice, which the later looks tell.
+    Outside,
+    /// Something to look at (`Scope::done_held`).
+    Look,
+}
+
+/// A glance at `e`'s variables, a few of them, which fill their places in order. Where a scope
+/// `ending` holds a list or map besides such a lambda, the lambda's other hold may be the list's:
+/// the scope is listed all the same, and the next look tells (FEEDBACK65.md, Q-941 review of S2c,
+/// 1; branch feedback65).
+#[inline(always)]
+fn quick(e: &Env, ending: bool) -> Quick {
+    // A scope `done` ends has a parent: no lock to take (`Scope::vars`).
+    if e.parent.is_none() {
+        return Quick::Look;
+    }
+    // A function made in it held besides; anything else to look at.
+    let (mut out, mut look) = (false, false);
+    match &*e.vars.inner() {
+        Vars::Few(slots, more, _) => {
+            for x in slots {
+                match x {
+                    None => break,
+                    // Held besides, and by no other of these variables (`let g = f`).
+                    Some((_, Value::Func(c)))
+                        if std::ptr::eq(Arc::as_ptr(&c.env), Arc::as_ptr(e))
+                            && Arc::strong_count(c) > 1
+                            && slots.iter().flatten().filter(|(_, v)| matches!(v, Value::Func(d) if Arc::ptr_eq(c, d))).nth(1).is_none() =>
+                    {
+                        out = true
+                    }
+                    Some((_, Value::Func(_))) => look = true,
+                    Some((_, v @ (Value::List(_) | Value::Map(_)))) => look |= !shared(v),
+                    _ => {}
+                }
+            }
+            if !more.is_empty() {
+                return Quick::Look;
+            }
+        }
+        Vars::Many(_) => return Quick::Look,
+    }
+    // Nothing else there could hold it: something outside does.
+    match (out, look) {
+        (true, false) => Quick::Outside,
+        (true, true) if ending => Quick::Outside,
+        (false, false) => Quick::Plain,
+        _ => Quick::Look,
+    }
+}
+
+/// Whether a list or map only one of `e`'s variables holds has, among its own items, a function
+/// made in `e` that something else holds too. A few variables and items are looked at.
+fn boxed_outside(e: &Env) -> bool {
+    let s = Arc::as_ptr(e);
+    let made = |x: &Value| matches!(x, Value::Func(c) if std::ptr::eq(Arc::as_ptr(&c.env), s) && Arc::strong_count(c) > 1);
+    !e.vars().each_value(|v| match v {
+        Value::Map(m) if Arc::strong_count(m) == 1 && m.len() <= RING => !m.values().any(made),
+        Value::List(l) if Arc::strong_count(l) == 1 && l.len() <= RING => !l.iter().any(made),
+        _ => true,
+    })
+}
+
+/// Whether `v` is a list or map something else holds too.
+#[inline]
+fn shared(v: &Value) -> bool {
+    match v {
+        Value::List(l) => Arc::strong_count(l) != 1,
+        Value::Map(m) => Arc::strong_count(m) != 1,
+        _ => false,
+    }
+}
+
+/// Whether a function in `e`'s own variables holds it, or one in a list or map only they hold
+/// (`let acts = { save: () => ... }`), within `RING_ITEMS`: most scopes still held at their end
+/// keep none. Apart, for that to cost little.
+#[inline(never)]
+fn keeps_own(e: &Env) -> bool {
+    let s = Arc::as_ptr(e);
+    let own = |v: &Value| matches!(v, Value::Func(c) if holds(c, s));
+    let direct = match &*e.vars() {
+        Vars::Few(slots, more, _) => slots.iter().flatten().any(|(_, v)| own(v)) || more.iter().any(|(_, v)| own(v)),
+        Vars::Many(m) => m.values().any(own),
+    };
+    let mut left = RING_ITEMS;
+    direct || !e.vars().each_value(|v| !boxes_own(v, s, &mut left))
+}
+
+/// What a first look at a scope still held at its end finds, in its own variables alone (`own`).
+enum Own {
+    /// No function in them holds it.
+    None,
+    /// Functions made in it, kept in them, and nothing else there that could hold one (no list
+    /// or map, no function made inside it): every hold on them and on it is theirs and the
+    /// caller's. Nothing outside can reach them.
+    Closed,
+    /// The same, but something besides holds it or one of them: a ring held from outside.
+    Outside,
+    /// More than that, for `ring` to count.
+    Look,
+}
+
+/// The commonest rings told at once, without `ring`'s walk: `let f = (x) => ...` in a body,
+/// returned or not (FEEDBACK65.md, Q-941 review 3; branch feedback65). Exactly what `ring`
+/// would find of such a scope, which holds no list, map or function made inside it.
+fn own(e: &Env, handles: usize) -> Own {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = Arc::as_ptr(e);
+    let mut fs: [(*const Arc<Closure>, usize); RING] = [(std::ptr::null(), 0); RING];
+    let (mut n, mut deep) = (0, false);
+    e.vars().each_value(|v| {
+        match v {
+            Value::Func(c) if std::ptr::eq(Arc::as_ptr(&c.env), s) => match fs[..n].iter_mut().find(|f| Arc::ptr_eq(unsafe { &*f.0 }, c)) {
+                Some(f) => f.1 += 1,
+                None if n == RING => deep = true,
+                None => {
+                    fs[n] = (c as *const Arc<Closure>, 1);
+                    n += 1;
+                }
+            },
+            Value::Func(c) => deep |= holds(c, s),
+            // One something else holds too cannot make its lambdas' other holds inside.
+            Value::List(_) | Value::Map(_) => deep |= !shared(v),
+            _ => {}
+        }
+        // On to the end, to know whether one made in it is there (no `keeps_own` then).
+        n < RING
+    });
+    if deep {
+        return if n > 0 || keeps_own(e) { Own::Look } else { Own::None };
+    }
+    if n == 0 {
+        return Own::None;
+    }
+    // SAFETY: the pointers are to handles in `e`'s variables, which nothing changes meanwhile.
+    let theirs = fs[..n].iter().all(|&(c, k)| {
+        let c = unsafe { &*c };
+        Arc::strong_count(c) == k && Arc::weak_count(c) == 0
+    });
+    let more = usize::from(e.vars.watched.load(Relaxed)) + handles;
+    if theirs && Arc::strong_count(e) == n + more && Arc::weak_count(e) == 0 {
+        Own::Closed
+    } else {
+        Own::Outside
+    }
+}
+
+/// Empties a scope `own` found `Closed`.
+fn empty_own(e: &Env) {
+    // What other threads did before letting go of their holds, seen before anything is dropped.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    e.vars().clear();
+}
+
+/// Whether `v`, a list or map held by its holder alone, holds a function that holds `s`, itself
+/// or in such a list or map inside it, among the `left` items still to look through.
+fn boxes_own(v: &Value, s: *const Scope, left: &mut usize) -> bool {
+    // Plain values passed over at a glance (FEEDBACK65.md, Q-941 review of S2c, 1; branch
+    // feedback65).
+    let look = |x: &Value, left: &mut usize| match x {
+        Value::Func(c) => holds(c, s),
+        Value::List(_) | Value::Map(_) => boxes_own(x, s, left),
+        _ => false,
+    };
+    match v {
+        Value::List(l) if Arc::strong_count(l) == 1 && l.len() <= *left => {
+            *left -= l.len();
+            l.iter().any(|x| look(x, left))
+        }
+        Value::Map(m) if Arc::strong_count(m) == 1 && m.len() <= *left => {
+            *left -= m.len();
+            m.values().any(|x| look(x, left))
+        }
+        _ => false,
+    }
+}
+
+/// The address and the strong count of list or map `v`.
+fn boxed(v: &Value) -> (*const u8, usize) {
+    match v {
+        Value::List(l) => (Arc::as_ptr(l) as *const u8, Arc::strong_count(l)),
+        Value::Map(m) => (Arc::as_ptr(m) as *const u8, Arc::strong_count(m)),
+        _ => (std::ptr::null(), 0),
+    }
+}
+
+/// A look for a ring through scope `s`: its scopes (`s` first), each with the holds on it from
+/// inside; its functions, each with the holds on it; and, when the look goes into them, the lists
+/// and maps that hold some of the functions, each with the holds on it. Pointers to the handles
+/// and values the ring's own scopes, functions and lists keep, which nothing changes while it
+/// looks (the interpreter lock).
+struct Walk {
+    s: *const Scope,
+    scopes: [(*const Env, usize); RING],
+    ns: usize,
+    funcs: [(*const Arc<Closure>, usize); RING],
+    nf: usize,
+    boxes: [(*const Value, usize); RING],
+    nb: usize,
+    /// Items of lists and maps still to look through.
+    left: usize,
+    /// False once the ring is larger than the arrays.
+    room: bool,
+    /// Into the lists and maps in lists and maps too (`ring`'s third walk), and whether one was
+    /// passed over for want of it.
+    nested: bool,
+    passed: bool,
+}
+
+impl Walk {
+    fn new(e: &Env) -> Walk {
+        let mut w = Walk {
+            s: Arc::as_ptr(e),
+            scopes: [(std::ptr::null(), 0); RING],
+            ns: 1,
+            funcs: [(std::ptr::null(), 0); RING],
+            nf: 0,
+            boxes: [(std::ptr::null(), 0); RING],
+            nb: 0,
+            left: RING_ITEMS,
+            room: true,
+            nested: false,
+            passed: false,
+        };
+        w.scopes[0].0 = e as *const Env;
+        w
+    }
+
+    /// The variables of each of the ring's scopes, those found on the way too; into lists and
+    /// maps if `deep`.
+    fn scan(&mut self, deep: bool) {
+        let mut i = 0;
+        while i < self.ns && self.room {
+            // SAFETY: as above, for this and each pointer read below.
+            let x: &Env = unsafe { &*self.scopes[i].0 };
+            x.vars().each_value(|v| {
+                self.visit(v, deep);
+                self.room
+            });
+            i += 1;
+        }
+    }
+
+    /// Whether `v` is or holds one of the ring's functions; each hold found counted.
+    fn visit(&mut self, v: &Value, deep: bool) -> bool {
+        match v {
+            Value::Func(c) => self.func(c),
+            Value::List(_) | Value::Map(_) if deep => self.boxing(v),
+            _ => false,
+        }
+    }
+
+    fn func(&mut self, c: &Arc<Closure>) -> bool {
+        if let Some(f) = self.funcs[..self.nf].iter_mut().find(|f| Arc::ptr_eq(unsafe { &*f.0 }, c)) {
+            f.1 += 1;
+            return true;
+        }
+        if !holds(c, self.s) {
+            return false;
+        }
+        if self.nf == RING {
+            self.room = false;
+            return false;
+        }
+        self.funcs[self.nf] = (c as *const Arc<Closure>, 1);
+        self.nf += 1;
+        // The scopes from the function's own out to `s`, those not in the ring yet.
+        let mut y: &Env = &c.env;
+        while !std::ptr::eq(Arc::as_ptr(y), self.s) && !self.scopes[..self.ns].iter().any(|z| Arc::ptr_eq(unsafe { &*z.0 }, y)) {
+            if self.ns == RING {
+                self.room = false;
+                return false;
+            }
+            self.scopes[self.ns] = (y as *const Env, 0);
+            self.ns += 1;
+            y = y.parent.as_ref().expect("a scope inside `s`");
+        }
+        true
+    }
+
+    /// List or map `v`: one of the ring's if it holds one of its functions, itself or in a list
+    /// or map inside it (FEEDBACK65.md, Q-941; branch feedback65).
+    fn boxing(&mut self, v: &Value) -> bool {
+        let (at, _) = boxed(v);
+        if let Some(b) = self.boxes[..self.nb].iter_mut().find(|b| boxed(unsafe { &*b.0 }).0 == at) {
+            b.1 += 1;
+            return true;
+        }
+        let len = match v {
+            Value::List(l) => l.len(),
+            Value::Map(m) => m.len(),
+            _ => return false,
+        };
+        if len > self.left {
+            return false;
+        }
+        if self.nb == RING {
+            self.room = false;
+            return false;
+        }
+        self.left -= len;
+        let k = self.nb;
+        self.boxes[k] = (v as *const Value, 1);
+        self.nb += 1;
+        let mut any = false;
+        // Plain values passed over at a glance (FEEDBACK65.md, Q-941 review of S2c, 1; branch
+        // feedback65).
+        let nested = self.nested;
+        let mut passed = false;
+        let mut each = |x: &Value| match x {
+            Value::Func(_) => any |= self.visit(x, true),
+            Value::List(_) | Value::Map(_) if nested => any |= self.visit(x, true),
+            Value::List(_) | Value::Map(_) => passed = true,
+            _ => {}
+        };
+        match v {
+            Value::List(l) => l.iter().for_each(&mut each),
+            Value::Map(m) => m.values().for_each(&mut each),
+            _ => {}
+        }
+        self.passed |= passed;
+        // None of the ring's in it: not one of it (nor any inside it, each let go of the same way).
+        if !any {
+            self.nb = k;
+        }
+        any && self.room
+    }
+
+    /// Whether every hold on the ring's functions, lists and scopes is from inside it, besides
+    /// `handles` of the caller's on `s` and the watch list's on each marked scope.
+    fn closed(&mut self, handles: usize) -> Result<(), Witness> {
+        use std::sync::atomic::Ordering::Relaxed;
+        fn held(scopes: &mut [(*const Env, usize)], y: &Env) {
+            if let Some(z) = scopes.iter_mut().find(|z| Arc::ptr_eq(unsafe { &*z.0 }, y)) {
+                z.1 += 1;
+            }
+        }
+        let ns = self.ns;
+        // Each function's on its scope, each scope's but `s`'s on the one around it.
+        for k in 0..self.nf {
+            let c: &Arc<Closure> = unsafe { &*self.funcs[k].0 };
+            held(&mut self.scopes[..ns], &c.env);
+        }
+        for k in 1..ns {
+            let y: &Env = unsafe { &*self.scopes[k].0 };
+            held(&mut self.scopes[..ns], y.parent.as_ref().expect("a scope inside `s`"));
+        }
+        // The first held besides is the witness: while its count stays, so does the verdict.
+        for &(c, n) in &self.funcs[..self.nf] {
+            let c = unsafe { &*c };
+            if Arc::strong_count(c) != n || Arc::weak_count(c) != 0 {
+                return Err(Witness::held(Value::Func(c.clone())));
+            }
+        }
+        for &(v, n) in &self.boxes[..self.nb] {
+            let v = unsafe { &*v };
+            let weak = match v {
+                Value::List(l) => Arc::weak_count(l),
+                Value::Map(m) => Arc::weak_count(m),
+                _ => 1,
+            };
+            if boxed(v).1 != n || weak != 0 {
+                return Err(Witness::held(v.clone()));
+            }
+        }
+        for (k, &(y, n)) in self.scopes[..ns].iter().enumerate() {
+            let y = unsafe { &*y };
+            let more = usize::from(y.vars.watched.load(Relaxed)) + if k == 0 { handles } else { 0 };
+            if Arc::strong_count(y) != n + more || Arc::weak_count(y) != 0 {
+                // The caller's hold on `s` goes to the list with it, so the count stays.
+                return Err(if k == 0 {
+                    Witness::Scope(Arc::strong_count(y))
+                } else {
+                    let y = y.clone();
+                    let n = Arc::strong_count(&y);
+                    Witness::Inner(y, n)
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Empties the ring's scopes, each where it is, those inside `e` held meanwhile: emptying one
+    /// drops functions and lists, and with them their holds on the others. (`e` the caller holds.)
+    fn empty(&self, e: &Env) {
+        // What other threads did before letting go of their holds, seen before anything is dropped.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        if self.ns == 1 {
+            e.vars().clear();
+            return;
+        }
+        let mut inside: [Option<Env>; RING] = [const { None }; RING];
+        for k in 1..self.ns {
+            inside[k] = Some(unsafe { &*self.scopes[k].0 }.clone());
+        }
+        e.vars().clear();
+        for y in inside.iter().flatten() {
+            y.vars().clear();
+        }
+    }
+}
+
+/// A ring through `e`, which `handles` of the caller's hold besides (the watch list's hold is
+/// counted by the mark), broken if nothing else holds any of it. Run under the interpreter lock,
+/// as all that runs Quillo code: off it values are only dropped, so a count seen equal to the
+/// holds from inside stays so. Lists and maps are looked into only when the plain count fails.
+#[cold]
+#[inline(never)]
+fn ring(e: &Env, handles: usize) -> Ring {
+    let mut w = Walk::new(e);
+    w.scan(false);
+    if w.room && w.nf > 0 && w.closed(handles).is_ok() {
+        w.empty(e);
+        return Ring::Broken;
+    }
+    // A list or map of the ring's may hold the holds not found (FEEDBACK65.md, Q-941; branch
+    // feedback65): the scope's own first, then those inside them, so that a record's long list of
+    // plain values beside its lambda is not read (review of S2c, 1).
+    for nested in [false, true] {
+        let mut w = Walk::new(e);
+        w.nested = nested;
+        w.scan(true);
+        if !w.room || w.nf == 0 {
+            if nested {
+                return Ring::None;
+            }
+            continue;
+        }
+        match w.closed(handles) {
+            Ok(()) => {
+                w.empty(e);
+                return Ring::Broken;
+            }
+            // Nothing passed over: the walk into them would see the same. Otherwise its witness
+            // goes before the next walk, which counts holds.
+            Err(found) if !w.passed || nested => return Ring::Held(found),
+            Err(_) => {}
+        }
+    }
+    Ring::None
+}
+
+/// What made a listed scope's last look find its ring held from outside, so that the next look
+/// can tell nothing changed without walking it again, lists and all: one of its functions, lists
+/// or inner scopes held, with its count (the witness's own hold in it), or the scope's own count
+/// (FEEDBACK65.md, Q-941 review of S2c, 1; branch feedback65).
+enum Witness {
+    None,
+    Scope(usize),
+    Value(Value, usize),
+    Inner(Env, usize),
+}
+
+impl Witness {
+    fn held(v: Value) -> Witness {
+        let n = Witness::count(&v);
+        Witness::Value(v, n)
+    }
+
+    fn count(v: &Value) -> usize {
+        match v {
+            Value::Func(c) => Arc::strong_count(c),
+            _ => boxed(v).1,
+        }
+    }
+
+    /// Whether what it saw is as it was: then so is the verdict.
+    fn same(&self, e: &Env) -> bool {
+        match self {
+            Witness::None => false,
+            Witness::Scope(n) => Arc::strong_count(e) == *n,
+            Witness::Value(v, n) => Witness::count(v) == *n,
+            Witness::Inner(y, n) => Arc::strong_count(y) == *n,
+        }
+    }
+}
+
+/// Scopes in a ring that something outside still held when they ended (`return f`, a stream's
+/// function), with a hold each, looked at again a few at a time, from where the last look
+/// stopped: `LOOK_EACH` each time one is listed, and `LOOK_TICK` a second from a server's event
+/// loop (`look_again`), so that a server gone quiet frees them too, and no call waits on a look
+/// over all of them (FEEDBACK65.md, Q-941 review 1 and 5; branch feedback65). Each is freed
+/// once nothing outside holds its ring.
+struct Watched {
+    /// Each with what its last look saw held, if it saw one (boxed: most have none, and the
+    /// list moves its items).
+    list: Vec<(Env, Option<Box<Witness>>)>,
+    /// Where the next look starts.
+    at: usize,
+}
+
+/// Scopes looked at again each time one is listed: more than come, so the list never holds more
+/// than those held from outside and a few.
+const LOOK_EACH: usize = 2;
+/// Scopes looked at again each second by an event loop, at most, and for at most `LOOK_TIME`:
+/// the rest wait for the next second (FEEDBACK65.md, Q-941 review of S2c, 3; branch feedback65).
+const LOOK_TICK: usize = 1024;
+const LOOK_TIME: std::time::Duration = std::time::Duration::from_micros(300);
+
+impl Drop for Watched {
+    /// At the thread's end its list is left, not dropped: there, off the interpreter lock, a hold
+    /// would go without its mark, and a ring looked at elsewhere would count it. Those rings stay,
+    /// as all did before.
+    fn drop(&mut self) {
+        for e in self.list.drain(..) {
+            std::mem::forget(e);
+        }
+    }
+}
+
+thread_local! {
+    static WATCHED: std::cell::RefCell<Watched> = const { std::cell::RefCell::new(Watched { list: Vec::new(), at: 0 }) };
+}
+
+/// Puts `e`, in a ring something outside holds, on this thread's list with its hold, unless on
+/// one, and looks again at a few.
+fn watch(e: Env) {
+    // Told by its first look, when it is still held then: most are not.
+    watch_as(e, Witness::None)
+}
+
+/// `watch`, with what its last look saw held.
+fn watch_as(e: Env, seen: Witness) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if e.vars.watched.load(Relaxed) {
+        return;
+    }
+    // The look first, so that it is not spent on this one, which something outside holds now.
+    look(LOOK_EACH, None);
+    e.vars.watched.store(true, Relaxed);
+    let seen = (!matches!(seen, Witness::None)).then(|| Box::new(seen));
+    WATCHED.with(|w| w.borrow_mut().list.push((e, seen)));
+}
+
+/// A second's look at this thread's listed scopes, from an event loop holding the interpreter
+/// lock between requests (FEEDBACK65.md, Q-941 review 1; branch feedback65).
+pub fn look_again() {
+    look(LOOK_TICK, Some(std::time::Instant::now() + LOOK_TIME));
+}
+
+/// Looks again at up to `n` listed scopes, from where the last look stopped: one still held
+/// from outside stays; one held by the list alone, no ring any more, or whose ring is now closed
+/// (emptied) is let go of, its mark first.
+fn look(n: usize, until: Option<std::time::Instant>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    for k in 0..n {
+        if k % 16 == 15 && until.is_some_and(|t| std::time::Instant::now() >= t) {
+            return;
+        }
+        // Taken out while it is looked at, with the list's hold.
+        let taken = WATCHED.with(|w| {
+            let mut w = w.borrow_mut();
+            if w.list.is_empty() {
+                return None;
+            }
+            if w.at >= w.list.len() {
+                w.at = 0;
+            }
+            let at = w.at;
+            Some(w.list.swap_remove(at))
+        });
+        let Some((e, seen)) = taken else { return };
+        // Kept (with what it saw held, if anything), or let go of.
+        let keep: Option<Option<Box<Witness>>> = if Arc::strong_count(&e) == 1 {
+            None
+        } else if seen.as_ref().is_some_and(|w| w.same(&e)) {
+            Some(seen)
+        } else {
+            // Let go of before the look, which counts holds.
+            drop(seen);
+            match own(&e, 0) {
+                Own::Outside => Some(None),
+                Own::Closed => {
+                    empty_own(&e);
+                    None
+                }
+                Own::None => None,
+                Own::Look => match ring(&e, 0) {
+                    Ring::Held(w) => Some(Some(Box::new(w))),
+                    _ => None,
+                },
+            }
+        };
+        if let Some(seen) = keep {
+            // Back where it was, and the look goes on after it.
+            WATCHED.with(|w| {
+                let mut w = w.borrow_mut();
+                w.list.push((e, seen));
+                let last = w.list.len() - 1;
+                let at = w.at.min(last);
+                w.list.swap(at, last);
+                w.at = at + 1;
+            });
+        } else {
+            e.vars.watched.store(false, Relaxed);
+            done_out(e);
+        }
+    }
+}
+
+/// A listed scope let go of: kept for the next scope as `done` keeps one, and the scope around it
+/// too when nothing else holds that now (the call's whose body it was), so that a function giving
+/// back its kept lambda costs the next call no allocation.
+fn done_out(mut e: Env) {
+    let Some(s) = Arc::get_mut(&mut e) else { return Scope::done(e) };
+    let around = s.parent.take();
+    Scope::done(e);
+    if let Some(p) = around.filter(|p| Arc::strong_count(p) == 1 && p.parent.is_some()) {
+        Scope::done(p);
     }
 }
 

@@ -780,6 +780,9 @@ impl Interp {
             // Kept for the request: a stream's function and deferred parts run after the body.
             self.route_limit = r.limit.clone();
             let ran = self.under_route(|it| if crate::debug::on() { it.debug_route(&r, &scope) } else { it.eval(&r.body, &scope) });
+            // Its parameters' scope ended as a block's: a lambda assigned to one held it for ever
+            // (FEEDBACK65.md, Q-941 review 4; branch feedback65).
+            Scope::done(scope);
             self.cur_file = file;
             // A middleware gave null: its group's routes do not match, and the next route is
             // tried (FEEDBACK51.md, Q-651).
@@ -973,6 +976,8 @@ impl Interp {
             let file = std::mem::replace(&mut self.cur_file, r.file.clone());
             self.route_limit = r.limit.clone();
             let answered = self.under_route(|it| it.eval(&r.body, &scope));
+            // As a route's (FEEDBACK65.md, Q-941 review 4; branch feedback65).
+            Scope::done(scope);
             self.cur_file = file;
             self.current_request = None;
             if let Some(group) = no_match_of(r, &answered) {

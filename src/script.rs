@@ -224,6 +224,9 @@ fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap
         }
         last
     });
+    // Its own variables let go of, a lambda it kept in one too, which held them for ever
+    // (FEEDBACK65.md, Q-941; branch feedback65).
+    Scope::done(env);
     it.fuel = saved;
     it.allowed = saved_allowed;
     it.restrictor = saved_restrictor;

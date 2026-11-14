@@ -710,3 +710,969 @@ fn a_100_continue_not_pipelined_comes_at_once_and_none_is_owed_for_a_body_sent_w
     assert_eq!(next(&mut c, 3), [pair(200, "abc"), pair(200, "home"), pair(200, "abc")]);
 }
 
+// ---- Q-941: a lambda kept in a `let` no longer keeps its scope for ever ---------------------
+// `let f = (x) => ...` put a function holding its scope into that scope's own variables: neither
+// was freed when the scope ended, and each request leaked all the scope held, 1.5 MB in the
+// report. The memory tests serve the report's routes and the other ways a scope ends (`return`,
+// a view, a loop, a failure, a match arm, a component, a script) and measure the server over 40
+// requests: on the branch's parent (QUILLO_TEST_BIN) each grows by about 75 MB. The others run
+// in this process and count the holds left on a list they pass in.
+mod q941 {
+    use super::support;
+    use quillo::value::{lookup, Value};
+    use quillo::Interp;
+    use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// The quillo that serves: this build's, or the one QUILLO_TEST_BIN names.
+    fn bin() -> PathBuf {
+        std::env::var_os("QUILLO_TEST_BIN").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_quillo")))
+    }
+
+    /// Each route makes 20,000 rows (about 1.5 MB) in a scope that keeps a lambda.
+    const ROUTES: &str = r#"fn rows() = range(20000) | map((i) => `row number ${i} with some text é😀`)
+route GET /plain = {
+    let big = rows()
+    `${len(big)}`
+}
+route GET /stored = {
+    let big = rows()
+    let keep = (r) => len(r) > 3
+    `${len(big | filter(keep))}`
+}
+route GET /stored-unused = {
+    let big = rows()
+    let one = (x) => x + 1
+    `${len(big)} ${one(1)}`
+}
+fn returned() {
+    let big = rows()
+    let one = (x) => x + 1
+    return `${len(big)} ${one(1)}`
+}
+route GET /return = returned()
+view Card(n) {
+    let big = rows()
+    let small = (x) => x + n
+    <p>{len(big)} {small(1)}</p>
+}
+route GET /view = <main><Card n={1}/></main>
+route GET /loop {
+    let t = 0
+    for i in range(2) {
+        let big = rows()
+        let f = (x) => x + i
+        t += f(len(big))
+    }
+    return `${t}`
+}
+fn boom(n) {
+    let big = rows()
+    let f = (x) => x + n
+    return f(len(big)) + unwrap(err("no"))
+}
+route GET /fails = boom(1)
+route GET /match/:n(int) = match n {
+    1 => {
+        let big = rows()
+        let f = (x) => x + 1
+        `${f(len(big))}`
+    }
+    _ => "other"
+}
+component Inner(data) {
+    let shown = (x) => `${x} rows`
+    <span>{shown(len(data))}</span>
+}
+component Outer() {
+    <div><Inner data={rows()}/></div>
+}
+route GET /component = <main><Outer/></main>
+route GET /script = run_script("let f = (x) => x + 1\nf(len(rows))", { rows: rows() })
+component Two() {
+    state a = 1
+    state b = 2
+    let bump = () => { a += 1 }
+    <button onclick={bump}>{a + b}</button>
+}
+route GET /two = <main><Two/></main>
+route GET /record = {
+    let big = rows()
+    let acts = { count: (r) => len(r), first: (r) => r[0] }
+    `${acts.count(big)}`
+}
+route GET /collected = {
+    let big = rows()
+    let fs = []
+    for i in range(3) {
+        fs = push(fs, () => len(big) + i)
+    }
+    `${fs[2]()}`
+}
+route GET /nested = {
+    let big = rows()
+    let menu = [{ name: "a", go: () => len(big) }, { name: "b", go: () => 1 }]
+    `${menu[0].go()}`
+}
+fn mk_list(big) {
+    let tags = [1, 2, 3]
+    let f = (x) => x + len(big) + len(tags)
+    return f
+}
+route GET /mk-list = `${mk_list(rows())(1)}`
+fn mk_record(big) {
+    let acts = { go: (x) => x + len(big), pad: range(120) }
+    return acts.go
+}
+route GET /mk-record = `${mk_record(rows())(1)}`
+route GET /for-list = {
+    let big = rows()
+    let fs = for i in range(3) => () => len(big) + i
+    `${fs[1]()}`
+}
+fn pick(v) {
+    return match v {
+        { data } => {
+            let n = len(data)
+            data = () => n
+            data()
+        }
+        _ => 0
+    }
+}
+route GET /match-bind = `${pick({ data: rows() })}`
+route GET /param/:n {
+    let big = rows()
+    n = () => len(big)
+    return `${len(big)}`
+}
+fn mkf(i) {
+    let f = (x) => x + i
+    return f
+}
+route GET /many = `${len(range(300) | map((i) => mkf(i)))}`
+route GET /stream = {
+    let big = rows()
+    let seen = (x) => x < len(big)
+    events((send) => {
+        send({ seen: seen(1) })
+    })
+}
+route GET /slow-stream = {
+    let big = rows()
+    let seen = (x) => x < len(big)
+    events((send) => {
+        sleep(400)
+        send({ seen: seen(1) })
+    })
+}
+route GET /slow-plain = {
+    let big = rows()
+    sleep(400)
+    `${len(big)}`
+}
+route GET /live = {
+    let seen = (x) => x > 1
+    events((send) => {
+        for i in range(4) {
+            if seen(i) {
+                send({ i, s: "é😀" })
+            }
+        }
+    })
+}
+"#;
+
+    /// A `quillo run` of `ROUTES` (no view cache, so that the view renders each time), killed
+    /// when dropped, its folder removed.
+    struct Served {
+        child: Child,
+        port: u16,
+        dir: PathBuf,
+    }
+
+    impl Drop for Served {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn served(name: &str) -> Served {
+        let dir = support::temp_dir(&format!("feedback65-q941-{}", name));
+        std::fs::write(dir.join("main.qwe"), ROUTES).unwrap();
+        let log = dir.join("server.log");
+        let child = Command::new(bin())
+            .arg("run")
+            .arg(dir.join("main.qwe"))
+            .args(["--port", "0", "--workers", "4", "--no-view-cache"])
+            .env("QUILLO_SECRET", "test secret for the tests")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        support::stop_with_tests(&child);
+        let mut s = Served { child, port: 0, dir };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            let port = text.split("listening on http://").nth(1).and_then(|r| r.split(['/', '\n']).next()).and_then(|h| h.rsplit(':').next()?.parse::<u16>().ok());
+            if let Some(p) = port {
+                s.port = p;
+                return s;
+            }
+            if let Ok(Some(st)) = s.child.try_wait() {
+                panic!("quillo run stopped: {}\n{}", st, text);
+            }
+            assert!(Instant::now() < deadline, "the server did not start:\n{}", text);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The server's memory in KiB: its footprint on macOS, which counts what the memory
+    /// compressor holds (its resident memory does not), and its resident memory elsewhere.
+    fn memory_kib(pid: u32) -> u64 {
+        if cfg!(target_os = "macos") {
+            let out = Command::new("footprint").args(["-p", &pid.to_string()]).output().expect("footprint");
+            let text = String::from_utf8_lossy(&out.stdout);
+            let at = text.split("Footprint: ").nth(1).unwrap_or_else(|| panic!("no footprint in {}", text));
+            let mut words = at.split_whitespace();
+            let n: f64 = words.next().and_then(|w| w.parse().ok()).expect("a number");
+            let unit = match words.next() {
+                Some("B") => 1.0 / 1024.0,
+                Some("KB") => 1.0,
+                Some("MB") => 1024.0,
+                Some("GB") => 1024.0 * 1024.0,
+                other => panic!("footprint's unit {:?}", other),
+            };
+            (n * unit) as u64
+        } else {
+            let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).unwrap();
+            let line = status.lines().find(|l| l.starts_with("VmRSS:")).unwrap().to_string();
+            line.split_whitespace().nth(1).unwrap().parse().unwrap()
+        }
+    }
+
+    /// `n` requests for `path`, four at a time; their statuses.
+    fn load(port: u16, path: &str, n: usize) -> Vec<u16> {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let statuses = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    while next.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < n {
+                        let a = support::send(port, "GET", path, &[], "");
+                        statuses.lock().unwrap().push(a.status);
+                    }
+                });
+            }
+        });
+        statuses.into_inner().unwrap()
+    }
+
+    /// How much the server grows over 40 requests for `path`, after 8 to warm it.
+    fn grows_kib(s: &Served, path: &str, status: u16) -> u64 {
+        assert!(load(s.port, path, 8).iter().all(|&c| c == status), "{}", path);
+        let before = memory_kib(s.child.id());
+        assert!(load(s.port, path, 40).iter().all(|&c| c == status), "{}", path);
+        memory_kib(s.child.id()).saturating_sub(before)
+    }
+
+    /// Of 40 requests' 60 MB: what a server keeps for its next requests, not a leak.
+    const GROWS_KIB: u64 = 30 << 10;
+
+    #[test]
+    fn the_reports_routes_keep_nothing_of_a_request() {
+        let s = served("report");
+        let grew: Vec<(&str, u64)> = ["/plain", "/stored", "/stored-unused"].into_iter().map(|p| (p, grows_kib(&s, p, 200))).collect();
+        assert!(grew.iter().all(|&(_, kib)| kib < GROWS_KIB), "Q-941: KiB grown over 40 requests: {:?}", grew);
+        assert_eq!(support::send(s.port, "GET", "/stored-unused", &[], "").body, "20000 2");
+    }
+
+    #[test]
+    fn a_lambda_kept_in_a_scope_goes_with_it_however_the_scope_ends() {
+        let s = served("ends");
+        let routes = [("/return", 200), ("/view", 200), ("/loop", 200), ("/fails", 500), ("/match/1", 200), ("/component", 200), ("/script", 200), ("/match-bind", 200), ("/param/3", 200)];
+        let grew: Vec<(&str, u64)> = routes.into_iter().map(|(p, status)| (p, grows_kib(&s, p, status))).collect();
+        assert!(grew.iter().all(|&(_, kib)| kib < GROWS_KIB), "Q-941: KiB grown over 40 requests: {:?}", grew);
+        let got = |p: &str| support::send(s.port, "GET", p, &[], "").body;
+        assert_eq!(got("/return"), "20000 2");
+        assert!(got("/view").contains("<p>20000 2</p>"));
+        assert_eq!(got("/loop"), "40001");
+        assert_eq!(got("/match/1"), "20001");
+        assert_eq!(got("/match/2"), "other");
+        assert!(got("/component").contains("<span>20000 rows</span>"));
+        assert_eq!(got("/script"), "20001");
+        // A lambda assigned to a `match` binding, and to a route's parameter (review 4).
+        assert_eq!([got("/match-bind"), got("/param/3")], ["20000", "20000"]);
+        // A component's states each hold its scope until its island is made, its handler too.
+        assert!(got("/two").contains("<button>3</button>"), "{}", got("/two"));
+        // A stream's function keeps the scope it was made in, and the lambda kept there, while it runs.
+        let live = got("/live");
+        assert!(live.contains(r#"{"i":2,"s":"é😀"}"#) && live.contains(r#"{"i":3,"s":"é😀"}"#) && !live.contains(r#""i":1"#), "{}", live);
+    }
+
+    #[test]
+    fn a_lambda_in_a_list_or_record_of_a_scope_goes_with_it() {
+        // A record of handlers, a list a loop fills, a list of records of lambdas, a list a
+        // `for` makes (FEEDBACK65.md, Q-941, S2b; branch feedback65).
+        let s = served("boxes");
+        let routes = ["/record", "/collected", "/nested", "/for-list", "/mk-list", "/mk-record"];
+        let grew: Vec<(&str, u64)> = routes.into_iter().map(|p| (p, grows_kib(&s, p, 200))).collect();
+        assert!(grew.iter().all(|&(_, kib)| kib < GROWS_KIB), "Q-941: KiB grown over 40 requests: {:?}", grew);
+        let got = |p: &str| support::send(s.port, "GET", p, &[], "").body;
+        assert_eq!([got("/record"), got("/collected"), got("/nested"), got("/for-list")], ["20000", "20002", "20000", "20001"]);
+        // A function giving back its kept lambda beside a list or a record it made (S2d).
+        assert_eq!([got("/mk-list"), got("/mk-record")], ["20004", "20001"]);
+    }
+
+    /// `n` requests for `path` all at once; their statuses.
+    fn at_once(port: u16, path: &str, n: usize) -> Vec<u16> {
+        std::thread::scope(|s| {
+            let all: Vec<_> = (0..n).map(|_| s.spawn(|| support::send(port, "GET", path, &[], "").status)).collect();
+            all.into_iter().map(|h| h.join().unwrap()).collect()
+        })
+    }
+
+    #[test]
+    fn scopes_held_by_streams_are_freed_as_requests_come_and_once_a_server_goes_quiet() {
+        // qwertime's live stream: a kept `seen` and 1.5 MB of rows, held by the `events` function
+        // until the stream ends (FEEDBACK65.md, Q-941 review 1). After a burst of 300 held rings
+        // (`/many`), 100 streams one after another: the fix 6 -> 11 MB, quillo-base 6 -> 191 MB.
+        let s = served("streams");
+        assert_eq!(support::send(s.port, "GET", "/many", &[], "").body, "300");
+        let before = memory_kib(s.child.id());
+        for _ in 0..100 {
+            assert!(support::send(s.port, "GET", "/stream", &[], "").body.contains(r#"{"seen":true}"#));
+        }
+        let grew = memory_kib(s.child.id()).saturating_sub(before);
+        assert!(grew < GROWS_KIB, "Q-941: 100 streams grew the server by {} KiB", grew);
+        // 30 streams at once, a quiet second or more, then 30 plain requests at once, which ask for
+        // no look: the streams' rows were freed meanwhile and are used again (the fix +19 MB,
+        // quillo-base and the fix without the event loop's look +56 MB).
+        assert!(at_once(s.port, "/slow-stream", 30).iter().all(|&c| c == 200));
+        let streamed = memory_kib(s.child.id());
+        std::thread::sleep(Duration::from_millis(3000));
+        assert!(at_once(s.port, "/slow-plain", 30).iter().all(|&c| c == 200));
+        let grew = memory_kib(s.child.id()).saturating_sub(streamed);
+        assert!(grew < 38 << 10, "Q-941: after a quiet second the server grew by {} KiB", grew);
+    }
+
+    // ---- in this process: the holds left on a list the calls were given ----
+
+    const FORMS: &str = r#"fn in_body(rows) {
+    let f = (x) => len(rows) + x
+    return f(1)
+}
+fn last_value(rows) {
+    let f = (x) => len(rows) + x
+    f(2)
+}
+fn in_block(rows) {
+    let t = {
+        let f = (x) => len(rows) + x
+        f(3)
+    }
+    return t
+}
+fn in_for(rows) {
+    let t = 0
+    for i in range(3) {
+        let f = (x) => len(rows) + x + i
+        t += f(0)
+    }
+    return t
+}
+fn in_while(rows) {
+    let i = 0
+    let t = 0
+    while i < 3 {
+        let f = (x) => len(rows) + x
+        t += f(i)
+        i += 1
+    }
+    return t
+}
+fn in_arm(rows, n) {
+    return match n {
+        1 => {
+            let f = (x) => len(rows) + x
+            f(n)
+        }
+        _ => 0
+    }
+}
+fn mutual(rows, k) {
+    let even = (n) => n == 0 ? len(rows) : odd(n - 1)
+    let odd = (n) => n == 0 ? -len(rows) : even(n - 1)
+    return even(k)
+}
+fn captures(rows) {
+    let a = (x) => x + len(rows)
+    let b = (y) => a(y) * 2
+    return b(1)
+}
+fn nested_fn(rows, k) {
+    fn go(i) {
+        return i == 0 ? len(rows) : 1 + go(i - 1)
+    }
+    return go(k)
+}
+fn factory(rows) {
+    let mk = () => (x) => x + len(rows)
+    let g = mk()
+    return g(1)
+}
+fn outer_var(rows) {
+    let pick = null
+    if len(rows) > 0 {
+        let lim = 0
+        pick = (x) => x > lim
+    }
+    return len([1, 2] | filter(pick))
+}
+fn fails(rows) {
+    let f = (x) => len(rows) + x
+    return f(1) + unwrap(err("no"))
+}
+fn loop_return(rows) {
+    for x in [1, 2, 3] {
+        let big = (y) => y + len(rows) > 2
+        if big(x) {
+            return x
+        }
+    }
+    return -1
+}
+fn default_lambda(rows, f = (x) => x + len(rows)) {
+    return f(1)
+}
+fn ñandú(rows) {
+    let ñ = (x) => `${x}é😀${len(rows)}`
+    return ñ("ü")
+}
+fn empty(rows) {
+    let n = len(rows)
+    let t = {
+        let f = () => null
+        f()
+    }
+    return [n, t]
+}
+fn par(rows) {
+    let a = () => len(rows)
+    let b = () => 2
+    return parallel(a, b)
+}
+fn shared(rows) {
+    let n = 0
+    let inc = () => { n = n + len(rows) }
+    inc()
+    inc()
+    return n
+}
+fn script_kept(rows) = run_script("let f = (x) => x + 1\nf(len(rows))", { rows })
+fn make(rows) {
+    let f = (x) => x + len(rows)
+    return f
+}
+fn use_once(rows) {
+    let g = make(rows)
+    return g(1)
+}
+let kept = {}
+fn keep(rows) {
+    let f = (x) => x + len(rows)
+    kept = set(kept, "f", f)
+    return kept.f(1)
+}
+fn forget() {
+    kept = {}
+    return 0
+}
+fn listed(rows) {
+    let add = (x) => x + len(rows)
+    return [add, { f: add }]
+}
+fn counter(rows) {
+    let n = 0
+    let inc = () => { n = n + 1 }
+    let get = () => n + len(rows)
+    return { inc, get }
+}
+fn same() {
+    fn h() {
+        return h
+    }
+    return h
+}
+fn same_kept() {
+    let s = same()
+    return s() == s
+}
+fn aliased(rows) {
+    let f = (x) => len(rows) + x
+    let g = f
+    let top = in_body
+    return g(1) + top([])
+}
+fn many_vars(rows) {
+    let v1 = 1
+    let v2 = 2
+    let v3 = 3
+    let v4 = 4
+    let v5 = 5
+    let v6 = 6
+    let v7 = 7
+    let v8 = 8
+    let v9 = 9
+    let v10 = 10
+    let v11 = 11
+    let v12 = 12
+    let v13 = 13
+    let v14 = 14
+    let v15 = 15
+    let v16 = 16
+    let v17 = 17
+    let f = (x) => x + len(rows) + v17
+    return f(v1) + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10 + v11 + v12 + v13 + v14 + v15 + v16 - 135
+}
+fn while_return(rows) {
+    let i = 0
+    while i < 5 {
+        let f = (x) => x + len(rows)
+        if f(i) > 4 {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+fn range_return(rows) {
+    for i in range(5) {
+        let f = (x) => x + len(rows)
+        if f(i) > 4 {
+            return i
+        }
+    }
+    return -1
+}
+fn cond_fails(rows) {
+    let i = 0
+    while i < len(rows) && unwrap(err("no")) {
+        i += 1
+    }
+    return i
+}
+fn escapes_each_step(rows) {
+    let fs = []
+    for i in range(3) {
+        let f = () => i + len(rows)
+        fs = push(fs, f)
+    }
+    return fs | map((f) => f())
+}
+fn inline_returned(rows) {
+    let f = (x) => x + len(rows)
+    return () => f(1)
+}
+fn record(rows) {
+    let acts = { count: (r) => len(r) + len(rows), first: (r) => r }
+    return acts.count([1])
+}
+fn loop_list(rows) {
+    let fs = []
+    for i in range(3) {
+        fs = push(fs, () => len(rows) + i)
+    }
+    return fs[2]()
+}
+fn for_list(rows) {
+    let fs = for i in range(3) => () => len(rows) + i
+    return fs[1]()
+}
+fn nested_boxes(rows) {
+    let menu = [{ name: "a", go: () => len(rows) }, { name: "b", go: () => 1 }]
+    return menu[0].go()
+}
+fn big_next_to_box(rows) {
+    let big = range(20000) | map((i) => i)
+    let acts = { go: () => len(rows) }
+    return acts.go() + len(big) - 20000
+}
+fn box_and_direct(rows) {
+    let f = (x) => x + len(rows)
+    let acts = [f, { again: f }]
+    return acts[0](1) + acts[1].again(0) - len(rows)
+}
+fn make_acts(rows) {
+    let acts = { go: (x) => x + len(rows) }
+    return acts
+}
+let cached = {}
+fn cache_acts(rows) {
+    let acts = { go: (x) => x + len(rows) }
+    cached = set(cached, "acts", acts)
+    return cached.acts.go(1)
+}
+fn match_bind(rows) {
+    return match { data: rows } {
+        { data } => {
+            let n = len(data)
+            data = () => n
+            data()
+        }
+        _ => 0
+    }
+}
+fn loop_push_kept(rows) {
+    let fs = []
+    for i in range(50) {
+        let f = (x) => x + i + len(rows)
+        fs = push(fs, f)
+    }
+    return fs[49](0)
+}
+fn loop_push_tags(rows) {
+    let fs = []
+    for i in range(50) {
+        let tags = [i, i + 1]
+        let f = (x) => x + i + len(tags) + len(rows)
+        fs = push(fs, f)
+    }
+    return fs[49](0)
+}
+fn mk_list(rows) {
+    let tags = range(100)
+    let f = (x) => x + len(rows) + len(tags)
+    return f
+}
+fn mk_record(rows) {
+    let acts = { go: (x) => x + len(rows), pad: range(120) }
+    return acts.go
+}
+let many = []
+fn mkr(rows, i) {
+    let f = () => i + len(rows)
+    return f
+}
+fn hold_many(rows, n) {
+    for i in range(n) {
+        many = push(many, mkr(rows, i))
+    }
+    return len(many)
+}
+fn let_go_of_many() {
+    many = []
+    return 0
+}
+"#;
+
+    fn app(src: &str) -> Interp {
+        let mut it = Interp::new(env!("CARGO_MANIFEST_DIR"));
+        if let Err(e) = it.load_source(src, "test.qwe") {
+            panic!("{}\n--- source ---\n{}", e, src);
+        }
+        it
+    }
+
+    /// `n` rows, unicode in them.
+    fn rows(n: usize) -> Arc<Vec<Value>> {
+        Arc::new((0..n).map(|i| Value::str(format!("row {} é😀", i))).collect())
+    }
+
+    fn call(it: &mut Interp, f: &Value, args: Vec<Value>) -> Result<Value, ()> {
+        it.call(f, args, 0).map_err(|_| ())
+    }
+
+    fn call_named(it: &mut Interp, name: &str, args: Vec<Value>) -> Result<Value, ()> {
+        let f = lookup(&it.globals, name).unwrap_or_else(|| panic!("no {}", name));
+        call(it, &f, args)
+    }
+
+    /// `name(rows, extra...)` called `times` times: what the last call gave, shown, and the holds
+    /// left on the rows besides this test's.
+    fn left(it: &mut Interp, name: &str, rows: &Arc<Vec<Value>>, extra: &[Value], times: usize) -> (String, usize) {
+        let f = lookup(&it.globals, name).unwrap_or_else(|| panic!("no {}", name));
+        let mut last = String::new();
+        for _ in 0..times {
+            let mut args = vec![Value::List(rows.clone())];
+            args.extend(extra.iter().cloned());
+            last = call(it, &f, args).map_or_else(|_| "failed".to_string(), |v| v.repr());
+        }
+        (last, Arc::strong_count(rows) - 1)
+    }
+
+    #[test]
+    fn a_lambda_kept_in_a_let_is_freed_with_its_scope_in_every_form() {
+        let mut it = app(FORMS);
+        let three = rows(3);
+        let int = Value::Int;
+        for (name, extra, want) in [
+            ("in_body", vec![], "4"),
+            ("last_value", vec![], "5"),
+            ("in_block", vec![], "6"),
+            ("in_for", vec![], "12"),
+            ("in_while", vec![], "12"),
+            ("in_arm", vec![int(1)], "4"),
+            ("in_arm", vec![int(2)], "0"),
+            ("mutual", vec![int(7)], "-3"),
+            ("captures", vec![], "8"),
+            ("nested_fn", vec![int(50)], "53"),
+            ("factory", vec![], "4"),
+            ("outer_var", vec![], "2"),
+            ("fails", vec![], "failed"),
+            ("loop_return", vec![], "1"),
+            ("default_lambda", vec![], "4"),
+            ("ñandú", vec![], "\"üé😀3\""),
+            ("empty", vec![], "[3, null]"),
+            ("par", vec![], "[3, 2]"),
+            ("shared", vec![], "6"),
+            ("script_kept", vec![], "4"),
+            // The same function in two variables, a top-level one among them; a scope of more
+            // than 16 variables; loops left by `return`; a loop whose condition fails.
+            ("aliased", vec![], "5"),
+            ("many_vars", vec![], "21"),
+            ("while_return", vec![], "2"),
+            ("range_return", vec![], "2"),
+            ("cond_fails", vec![], "failed"),
+            // In a list or map of the scope (S2b): a record, a list a loop fills, a `for`'s list,
+            // records in a list, next to 20,000 plain values, one kept both ways.
+            ("record", vec![], "4"),
+            ("loop_list", vec![], "5"),
+            ("for_list", vec![], "4"),
+            ("nested_boxes", vec![], "3"),
+            ("big_next_to_box", vec![], "3"),
+            // Assigned to a `match` binding (review 4); a loop keeping each step's lambda in a
+            // list, which keeps them all and works.
+            ("match_bind", vec![], "3"),
+        ] {
+            let (got, held) = left(&mut it, name, &three, &extra, 3);
+            assert_eq!(got, want, "{}", name);
+            assert_eq!(held, 0, "Q-941: {} left {} holds on what it was given", name, held);
+        }
+        // Kept both in a variable and in a list of the same scope: listed as its scope ends, since
+        // the list's hold and an outside one look alike there (S2d, review of S2c 1), and freed by
+        // the next look, which a listing makes.
+        let both = rows(3);
+        let (got, held) = left(&mut it, "box_and_direct", &both, &[], 3);
+        assert_eq!(got, "4");
+        assert!(held <= 1, "Q-941: box_and_direct left {} holds", held);
+        left(&mut it, "use_once", &rows(3), &[], 2);
+        assert_eq!(Arc::strong_count(&both) - 1, 0, "Q-941: box_and_direct not freed by the next look");
+        // One called 10,000 times; no rows, and one.
+        assert_eq!(left(&mut it, "in_body", &three, &[], 10_000), ("4".to_string(), 0));
+        assert_eq!(left(&mut it, "in_for", &rows(0), &[], 3), ("3".to_string(), 0));
+        assert_eq!(left(&mut it, "mutual", &rows(1), &[int(0)], 3), ("1".to_string(), 0));
+    }
+
+    #[test]
+    fn a_kept_lambda_that_escapes_keeps_its_scope_while_held_and_works() {
+        let mut it = app(FORMS);
+        let rows = rows(3);
+        let made = lookup(&it.globals, "make").unwrap();
+        // Returned: works, and holds what it was made with, as long as it is held.
+        let f = call(&mut it, &made, vec![Value::List(rows.clone())]).unwrap();
+        assert_eq!(call(&mut it, &f, vec![Value::Int(1)]).unwrap().repr(), "4");
+        // Calls that end scopes in rings (and look at those still held) leave it working.
+        assert_eq!(left(&mut it, "use_once", &rows, &[], 100).0, "4");
+        assert!(Arc::strong_count(&rows) > 1);
+        assert_eq!(call(&mut it, &f, vec![Value::Int(2)]).unwrap().repr(), "5");
+        // In a list and a record; a global map's; sharing a variable, from outside too.
+        let both = call_named(&mut it, "listed", vec![Value::List(rows.clone())]).unwrap();
+        let Value::List(l) = &both else { panic!("{}", both.repr()) };
+        assert_eq!(call(&mut it, &l[0], vec![Value::Int(1)]).unwrap().repr(), "4");
+        let (got, _) = left(&mut it, "keep", &rows, &[], 1);
+        assert_eq!(got, "4");
+        let c = call_named(&mut it, "counter", vec![Value::List(rows.clone())]).unwrap();
+        let Value::Map(m) = &c else { panic!("{}", c.repr()) };
+        let (inc, get) = (m.get("inc").unwrap().clone(), m.get("get").unwrap().clone());
+        call(&mut it, &inc, vec![]).unwrap();
+        call(&mut it, &inc, vec![]).unwrap();
+        assert_eq!(left(&mut it, "use_once", &rows, &[], 100).0, "4");
+        assert_eq!(call(&mut it, &get, vec![]).unwrap().repr(), "5");
+        assert_eq!(call_named(&mut it, "same_kept", vec![]).unwrap().repr(), "true");
+        // Kept in its scope, called by a lambda given back; kept in a loop's scope and put in a list
+        // each step.
+        let back = call_named(&mut it, "inline_returned", vec![Value::List(rows.clone())]).unwrap();
+        assert_eq!(call(&mut it, &back, vec![]).unwrap().repr(), "4");
+        drop(back);
+        assert_eq!(left(&mut it, "escapes_each_step", &rows, &[], 3).0, "[3, 4, 5]");
+        assert_eq!(left(&mut it, "loop_push_kept", &rows, &[], 3).0, "52");
+        assert_eq!(left(&mut it, "loop_push_tags", &rows, &[], 3).0, "54");
+        // A record of lambdas given back, and one put in a global map: they work while held.
+        let acts = call_named(&mut it, "make_acts", vec![Value::List(rows.clone())]).unwrap();
+        let Value::Map(a) = &acts else { panic!("{}", acts.repr()) };
+        assert_eq!(call(&mut it, a.get("go").unwrap(), vec![Value::Int(1)]).unwrap().repr(), "4");
+        assert_eq!(left(&mut it, "cache_acts", &rows, &[], 1).0, "4");
+        let Some(Value::Map(cached)) = lookup(&it.globals, "cached") else { panic!("no cached") };
+        assert_eq!(call(&mut it, cached.get("acts").and_then(|m| if let Value::Map(m) = m { m.get("go").cloned() } else { None }).as_ref().unwrap(), vec![Value::Int(2)]).unwrap().repr(), "5");
+        drop((a, cached));
+        let Some(Value::Map(kept)) = lookup(&it.globals, "kept") else { panic!("no kept") };
+        assert_eq!(call(&mut it, kept.get("f").unwrap(), vec![Value::Int(2)]).unwrap().repr(), "5");
+        drop(kept);
+        // Let go of, each is freed once the scopes in rings are looked at again (a list of them
+        // looked at when it doubles): 100 more calls leave at most the last look's few.
+        call_named(&mut it, "forget", vec![]).unwrap();
+        drop((f, both, c, inc, get, acts));
+        let (got, held) = left(&mut it, "use_once", &rows, &[], 100);
+        assert_eq!(got, "4");
+        assert!(held < 40, "Q-941: {} holds left after the lambdas were let go of", held);
+    }
+
+    #[test]
+    fn thousands_of_lambdas_held_outside_at_once_are_freed_once_let_go() {
+        let mut it = app(FORMS);
+        let rows = rows(1);
+        // Each call's scope keeps its lambda, which a global list holds: 3,000 rings held outside.
+        assert_eq!(left(&mut it, "hold_many", &rows, &[Value::Int(3000)], 1).0, "3000");
+        assert!(Arc::strong_count(&rows) > 1);
+        // The list let go of, the next looks free them: at most a look's few are left.
+        call_named(&mut it, "let_go_of_many", vec![]).unwrap();
+        let (got, held) = left(&mut it, "use_once", &rows, &[], 5000);
+        assert_eq!(got, "2");
+        assert!(held < 100, "Q-941: {} holds left of 3,000 rings let go of", held);
+    }
+
+    #[test]
+    fn no_call_waits_on_a_look_over_every_held_ring() {
+        // 200,000 rings held at once, then let go: each call looks at two at most, where a look
+        // over all of them had held one call up 38 ms with 300,000 (review 5). Measured twice, so
+        // that a machine pausing the test does not count.
+        let mut it = app(FORMS);
+        let rows = rows(1);
+        let made = lookup(&it.globals, "mkr").unwrap();
+        let used = lookup(&it.globals, "use_once").unwrap();
+        let mut worst = Vec::new();
+        for round in 0..2 {
+            let mut most = Duration::ZERO;
+            let n = if round == 0 { 200_000 } else { 20_000 };
+            let mut held = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                let t = Instant::now();
+                held.push(call(&mut it, &made, vec![Value::List(rows.clone()), Value::Int(i)]).unwrap());
+                most = most.max(t.elapsed());
+            }
+            drop(held);
+            for _ in 0..2_000 {
+                let t = Instant::now();
+                assert_eq!(call(&mut it, &used, vec![Value::List(rows.clone())]).unwrap().repr(), "2");
+                most = most.max(t.elapsed());
+            }
+            worst.push(most);
+        }
+        let least = worst.iter().min().unwrap();
+        assert!(*least < Duration::from_millis(10), "Q-941: a call took {:?} (each round's worst: {:?})", least, worst);
+    }
+
+    #[test]
+    fn a_seconds_look_stays_short_and_frees_lambdas_beside_lists_over_the_next_ones() {
+        // 20,000 lambdas each kept beside a list or a record of their scope's, held, then let go
+        // (S2d, review of S2c 3): each `look_again` (an event loop's second) takes well under a
+        // millisecond, the rest left for the next, and they free them all.
+        let mut it = app(FORMS);
+        let rows = rows(1);
+        let mut held = Vec::new();
+        for i in 0..20_000 {
+            let f = if i % 2 == 0 { "mk_list" } else { "mk_record" };
+            held.push(call_named(&mut it, f, vec![Value::List(rows.clone())]).unwrap());
+        }
+        assert_eq!(call(&mut it, &held[0], vec![Value::Int(1)]).unwrap().repr(), "102");
+        assert_eq!(call(&mut it, &held[1], vec![Value::Int(1)]).unwrap().repr(), "2");
+        drop(held);
+        let mut worst = Duration::ZERO;
+        let mut ticks = 0;
+        while Arc::strong_count(&rows) > 1 && ticks < 2_000 {
+            let t = Instant::now();
+            quillo::value::look_again();
+            worst = worst.max(t.elapsed());
+            ticks += 1;
+        }
+        assert_eq!(Arc::strong_count(&rows) - 1, 0, "Q-941: {} ticks left holds", ticks);
+        assert!(ticks > 1, "one look took them all");
+        assert!(worst < Duration::from_millis(5), "Q-941: a second's look took {:?}", worst);
+    }
+
+    #[test]
+    fn a_list_up_to_the_budget_of_items_is_looked_into() {
+        // `RING_ITEMS` is 128: a list of 127 or 128 items, a lambda among them, is freed with its
+        // scope; one of 129 is passed over, as it was, and works (FEEDBACK65.md, Q-941, S2b).
+        for n in [127, 128, 129] {
+            let src = format!("fn listed(rows) {{\n    let xs = [(x) => x + len(rows)] + range({})\n    return xs[0](1) + len(xs)\n}}\n", n - 1);
+            let mut it = app(&src);
+            let (got, held) = left(&mut it, "listed", &rows(3), &[], 3);
+            assert_eq!(got, (4 + n).to_string(), "{} items", n);
+            if n <= 128 {
+                assert_eq!(held, 0, "Q-941: a list of {} items left {} holds", n, held);
+            }
+        }
+    }
+
+    /// A function whose body keeps `n` lambdas, each calling the one before.
+    fn lambdas(n: usize) -> String {
+        let mut s = "fn many(rows) {\n    let f1 = (x) => x + len(rows)\n".to_string();
+        for i in 2..=n {
+            s.push_str(&format!("    let f{} = (x) => f{}(x) + 1\n", i, i - 1));
+        }
+        s.push_str(&format!("    return f{}(0)\n}}\n", n));
+        s
+    }
+
+    /// The same in a loop's body, two rounds.
+    fn looped(n: usize) -> String {
+        let mut s = "fn many(rows) {\n    let t = 0\n    for k in range(2) {\n        let f1 = (x) => x + len(rows) + k\n".to_string();
+        for i in 2..=n {
+            s.push_str(&format!("        let f{} = (x) => f{}(x) + 1\n", i, i - 1));
+        }
+        s.push_str(&format!("        t += f{}(0)\n    }}\n    return t\n}}\n", n));
+        s
+    }
+
+    /// A function keeping a lambda made `depth` blocks inside the scope it is kept in.
+    fn deep(depth: usize) -> String {
+        let mut s = "fn deep(rows) {\n    let pick = null\n".to_string();
+        for d in 1..=depth {
+            let t = if d == 1 { "t" } else { "_t" };
+            s.push_str(&format!("{}let {}{} = {{\n{}let a{} = {}\n", "    ".repeat(d), t, d, "    ".repeat(d + 1), d, d));
+        }
+        s.push_str(&format!("{}pick = (x) => x + len(rows)\n", "    ".repeat(depth + 1)));
+        for d in (1..=depth).rev() {
+            s.push_str(&format!("{}a{}\n{}}}\n", "    ".repeat(d + 1), d, "    ".repeat(d)));
+        }
+        s.push_str("    return pick(t1)\n}\n");
+        s
+    }
+
+    #[test]
+    fn rings_up_to_eight_lambdas_or_seven_blocks_deep_are_freed_and_larger_ones_still_work() {
+        for n in [1, 7, 8, 9] {
+            let mut it = app(&lambdas(n));
+            let (got, held) = left(&mut it, "many", &rows(3), &[], 3);
+            assert_eq!(got, (n + 2).to_string(), "{} lambdas", n);
+            // Past eight it is left as it was: working, its scope kept.
+            if n <= 8 {
+                assert_eq!(held, 0, "Q-941: {} lambdas left {} holds", n, held);
+            }
+        }
+        for n in [8, 9] {
+            let mut it = app(&looped(n));
+            let (got, held) = left(&mut it, "many", &rows(3), &[], 3);
+            assert_eq!(got, (2 * (n + 2) + 1).to_string(), "{} lambdas in a loop", n);
+            if n <= 8 {
+                assert_eq!(held, 0, "Q-941: {} lambdas in a loop left {} holds", n, held);
+            }
+        }
+        for depth in [1, 7, 8, 17] {
+            let mut it = app(&deep(depth));
+            let (got, held) = left(&mut it, "deep", &rows(3), &[], 3);
+            assert_eq!(got, "4", "{} deep", depth);
+            if depth <= 7 {
+                assert_eq!(held, 0, "Q-941: a lambda {} blocks deep left {} holds", depth, held);
+            }
+        }
+    }
+}
