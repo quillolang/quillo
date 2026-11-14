@@ -153,16 +153,20 @@ What is not in the standard library, and what to do instead:
 
 - **Bytes, base64, hex.** There is no bytes value: files, request bodies and HTTP
   answers are read as text (bytes that are not UTF-8 replaced), and only `file()`,
-  `save_upload` and `image.convert` move bytes as they are. Nothing decodes base64 or
-  hex (`crypto.token` and the hashes only make them). Binary work goes in Rust (see
-  [Rust](#rust)).
+  `save_upload` and `image.convert` move bytes as they are. `crypto.token` and the
+  hashes make base64url and hex; the catalog's `encoding` plugin (`quillo install
+  encoding`) reads base64, base64url and hex back to text, and turns hex into base64
+  and back byte for byte for bytes that are not text (`hex_to_base64`,
+  `base64_to_hex`, `hex_to_base64url`, `base64url_to_hex`). Other binary work goes in
+  Rust (see [Rust](#rust)).
 - **Formatting text.** No `sprintf` or padding: template strings, `repeat`, `slice`,
   `format_number`, `money.format` and `date.format`.
 - **CSV, XML, YAML.** No parsers built in: `split` and `re` for simple CSV, or the
   catalog's plugins `csv`, `xml`, `yaml`, `toml`, `gzip`, `tar` and `bignum` (`quillo
   install csv`, see [Plugins](#plugins-from-the-catalog)). JSON, Markdown and regular expressions are
   built in.
-- **`url_decode`.** Not there: query strings, forms and cookies arrive decoded.
+- **`url_decode`.** Not built in: query strings, forms and cookies arrive decoded (the
+  `encoding` plugin has `url_decode` and `form_decode` for other text).
 - **A seed for `random`.** None: runs are not repeatable.
 - **Other processes.** A program cannot run a command: `env`, files, and a command started
   beside it with the option [`--with`](#options-of-quillo-run) (`quillo run main.qwe --with "npx tailwindcss ..."`). A script reads its arguments with `args()` and its input with `stdin()` and
@@ -176,7 +180,9 @@ What is not in the standard library, and what to do instead:
   page (see [Streaming](#streaming)).
 - **Database:** `db.open db.exec db.query db.one db.transaction db.migrate db.connect
   db.tenants db.tenant_exists db.shards db.atomic db.system` (see [Database](#standard-library-database)).
-- **Crypto:** `crypto.sha256(text)` and `crypto.hmac(key, text)` (HMAC-SHA256, hex),
+- **Crypto:** `crypto.sha256(text)` and `crypto.hmac(key, text)` (HMAC-SHA256, hex; in
+  base64, as Shopify and WooCommerce sign webhooks, `hex_to_base64(crypto.hmac(key, body))`
+  with the `encoding` plugin, or the `webhooks` plugin checks the whole webhook),
   `crypto.token(bytes = 32)` (1 to 1,024 random bytes, base64url: 43 characters by
   default), `crypto.hash_password(pw)` (Argon2id, salted, so it needs the `random`
   effect) and

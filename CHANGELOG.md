@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.2 (2026-11-14)
 
 - `quillo check` warns when a call of the program's own function that changes nothing is
   dropped, in a handler or a function's code: `onclick={() => down(val)}` did nothing and nothing
@@ -55,6 +55,10 @@ From qwertime.com, live on 0.8.1 behind two servers and Limer. Fixed (0.8.1 too)
   before them (Q-948).
 - A pipelined request whose last bytes came while large answers ahead of it were made is read
   and answered, not left for a 408 after 30 s (Q-949).
+- A webhook signed in base64 (Shopify, WooCommerce) can be checked: the catalog's `encoding`
+  plugin 1.1.0 turns hex into base64 and back byte for byte, so
+  `hex_to_base64(crypto.hmac(key, request.body))` is the signature; the `webhooks` plugin
+  checks the whole webhook. No core change (Q-943).
 
 ### Pages that change a lot, and live data (FEEDBACK61.md)
 

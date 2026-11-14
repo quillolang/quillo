@@ -63,7 +63,8 @@ RewriteRule ^ app.fcgi [QSA,L]
 - **Jobs and the program's own calls** reach it through a socket only it can open, in a
   private folder under the system's temporary one.
 - **WebSockets do not pass through FastCGI.** Live data falls back to plain requests, each
-  held until a change or 25 s, so live pages still follow changes. Channels over a
+  held until a change or 25 s, so live pages still follow changes; the page tries a socket again now and then, up to
+  every 30 s. Channels over a
   WebSocket do not work, and WebTransport needs a UDP port of its own.
 - **A `stream` or `events` answer arrives whole** unless the host sets `mod_fcgid`'s output
   buffer to 0 (`FcgidOutputBufferSize 0`).

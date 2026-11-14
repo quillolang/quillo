@@ -195,7 +195,7 @@ view Card(title: str, children) = <section.card><h2>{title}</h2>{children}</sect
 
 A lambda shares the variables around it (`let inc = () => { n = n + 1 }` changes `n`), and a
 lambda kept in a variable is freed with them: when its block, call, loop step, view or route
-ends, or once whatever it was given to lets it go. Kept, as in 0.8.1, are a scope whose
+ends, or once whatever it was given to lets it go. Kept, as in 0.8.2, are a scope whose
 lambdas form a ring of more than 8 functions, scopes or lists, a list past 128 items holding
 one, a list of lambdas also given out, a loop step's lambda that something outside holds, and
 a failing call's default-parameter lambda (FEEDBACK65.md, Q-941).

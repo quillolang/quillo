@@ -80,7 +80,10 @@ which `quillo check` knows may be an error.
 A `server fn` can be called from a component in two places:
 
 - **In an event handler**, as above. The handler waits for the answer and goes on with
-  it, and the page stays responsive meanwhile.
+  it, and the page stays responsive meanwhile. What it starts after the wait (`run_after`,
+  `every`, `listen`) is its component's, as before it, and a `navigate` after it is dropped
+  if the person moved to another page meanwhile (see
+  [Single-page apps](#single-page-apps)).
 - **To set state**: `state notes = load_notes()`. The server runs it while it renders
   the page, so the page arrives with the data in its HTML; there is no loading spinner
   for the first view and no request after it.
@@ -157,7 +160,8 @@ server refused says its status: ``server fn `add_note` failed (403): ...``. A `r
 is plain text: return `err("Log in first")` for the page to show the words.
 
 There is no loading flag and nothing done for you on a failure (no retry, no redirect to
-a sign-in page): set a `state busy` around the call, and decide what an error shows. A
+a sign-in page; `live` state is the exception, its loads tried again after a lost connection
+or a 5xx: see [Live data](#live-data)): set a `state busy` around the call, and decide what an error shows. A
 state set by a `server fn` while the server renders arrives with the page; on a page
 reached by `navigate`, it is `null` until the answer comes.
 
@@ -213,7 +217,8 @@ each kind of wait may last.
 
 A stream is just as plain. `receive(url, f)` in a handler sends a request and calls `f`
 with each part of the answer as it arrives; `listen(url, f)` follows a stream for as
-long as the component's code that started it stands. No reader loop, no decoder, no
+long as the component's code that started it stands, or, from a handler, as its component
+does (see [Whose a timer is](#whose-a-timer-is)). No reader loop, no decoder, no
 `await` in a `while`. See [Streaming](#streaming).
 
 ## Under the hood

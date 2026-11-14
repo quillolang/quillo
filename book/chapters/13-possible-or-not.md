@@ -84,7 +84,7 @@ does not do it today; the way around it follows.
 | encrypt SQLite at rest? | No: the disk's encryption, or a server database |
 | do exact money arithmetic? | Yes: decimals and `money`. See [Decimals](#decimals) |
 | do data science? | Python's `math` and `statistics` and numpy's array operations, on every core; no data frames or plotting. See [Numbers and data](#numbers-and-data) |
-| read CSV, XML, YAML, TOML? | Not built in: the catalog's `csv`, `xml`, `yaml` and `toml` plugins, or `split` and `re`. No base64 yet. See [Plugins](#plugins-from-the-catalog) |
+| read CSV, XML, YAML, TOML? | Not built in: the catalog's `csv`, `xml`, `yaml` and `toml` plugins, or `split` and `re`. Base64: the `encoding` plugin. See [Plugins](#plugins-from-the-catalog) |
 | know the visitor's time zone on the server? | Not by itself: the page tells it with a cookie. See [Dates and times](#dates-and-times) |
 
 ## Services and scale

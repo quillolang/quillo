@@ -1309,7 +1309,7 @@ checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
 name = "quillo"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "argon2",
  "brotli-decompressor",
@@ -1351,7 +1351,7 @@ dependencies = [
 
 [[package]]
 name = "quillo-mobile"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "jni",
  "quillo",
