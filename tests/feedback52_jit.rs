@@ -10,6 +10,7 @@ mod support;
 use quillo::Interp;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// A value as these tests compare it: its type, then its text (`int 1` is not `float 1.0`).
@@ -1727,6 +1728,43 @@ fn a_function_calling_nothing_with_a_large_frame_keeps_the_quick_call() {
         }
         format!("fn h(a) {{\n    {}\n    {}\n}}\nprint(range(0, 1000000) | map((i) => i * 1.0) | map(h) | sum())\n", lets.join("\n    "), names[0])
     };
+    // Here, in this process, any build and any platform: after the two calls that compile `h`,
+    // the quick call is `h`'s, marked as over `LEVEL` in reverse and not in order, before and
+    // after 10,000 calls of it through `jit::call`, each one machine code's, and none on a grown
+    // stack. CI's debug build on x86-64 Linux took 5.6 times as long in reverse (4.29 s against
+    // 0.76) where a debug build for x86-64 on macOS takes 1.03 times, and arm64 0.8 (Q-947
+    // review 9): this says which part failed, where a time could not.
+    for reverse in [true, false] {
+        let mut it = Interp::new(".");
+        let defs = src(reverse);
+        let defs = &defs[..defs.find("print(").unwrap()];
+        it.load_source(defs, "case.qwe").unwrap();
+        let Some(quillo::value::Value::Func(h)) = quillo::value::lookup(&it.globals, "h") else { panic!("no h") };
+        let at = Arc::as_ptr(&h.def) as usize;
+        let one = [quillo::value::Value::Float(1.5)];
+        for _ in 0..2 {
+            let _ = quillo::jit::call(&h, &one, 0);
+        }
+        #[cfg(feature = "jit")]
+        {
+            let big = quillo::jit::big_runs_for_tests();
+            assert_eq!(quillo::jit::quick_for_tests(), Some((at, reverse)), "reverse {}: the quick call before", reverse);
+            for _ in 0..10_000 {
+                let quillo::jit::Ran::Done(Ok(quillo::value::Value::Float(v))) = quillo::jit::call(&h, &one, 0) else { panic!("reverse {}: not machine code's", reverse) };
+                assert_eq!(v, 235.5, "reverse {}", reverse);
+            }
+            assert_eq!(quillo::jit::quick_for_tests(), Some((at, reverse)), "reverse {}: the quick call after", reverse);
+            assert_eq!(quillo::jit::big_runs_for_tests(), big, "reverse {}: on a grown stack", reverse);
+        }
+        #[cfg(not(feature = "jit"))]
+        let _ = at;
+    }
+    // And in `quillo run`, timed, where a time means something: a release build (QUILLO_TEST_BIN,
+    // the instrumented coverage run). A debug build's calls cost several times a release one's in
+    // Rust outside the machine code, which no bound here holds across platforms.
+    if debug_binary() {
+        return;
+    }
     // Taken in turn, so that a loaded machine slows both alike.
     let (mut big, mut small) = (Duration::MAX, Duration::MAX);
     for _ in 0..5 {

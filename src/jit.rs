@@ -295,6 +295,7 @@ fn floor(depth: usize) -> Ran {
 #[cold]
 #[inline(never)]
 fn on_big(entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame: usize, reserve: usize) -> Ran {
+    BIG_RUNS.with(|n| n.set(n.get() + 1));
     let need = MAX_DEPTH.saturating_sub(depth) * frame + reserve + crate::stack::MARGIN;
     // The new stack's `max` is the limit's, so this does not come back here.
     let again = || run(entry, ret, raw, depth, frame, reserve, None);
@@ -412,6 +413,25 @@ struct Quick {
 /// In `Quick::code` for a function whose frame is over `LEVEL`, which no call's code has (2 bits
 /// an argument, 16 at most): the others' quick call reads no more than before.
 const OVER: u64 = 1 << 63;
+
+/// For tests: the function whose quick call this thread has (its `FnDef`'s address), and whether
+/// its frame is over `LEVEL` (`OVER`). Read by no call: a test sees that a function calling
+/// nothing with a large frame keeps the quick call without timing it, which a debug build on
+/// x86-64 Linux made 5.6 times slower in reverse (FEEDBACK52.md, Q-947 review 9; branch
+/// feedback52).
+pub fn quick_for_tests() -> Option<(usize, bool)> {
+    LAST.get().map(|q| (q.def, q.code & OVER != 0))
+}
+
+/// For tests: how many calls this thread has run on a grown stack (`on_big`). Counted there
+/// alone, off every other call's way (Q-947 review 9).
+pub fn big_runs_for_tests() -> usize {
+    BIG_RUNS.with(|n| n.get())
+}
+
+thread_local! {
+    static BIG_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// How many functions this thread has compiled (for tests).
 pub fn compiled() -> usize {
