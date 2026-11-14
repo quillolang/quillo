@@ -1326,6 +1326,7 @@ fn update_names() -> (Sym, Sym, Sym, Sym) {
 }
 
 /// `f(x, a)`, `x | f(a)` or `x.f(a)`: the function's name, `x`, the rest and the line.
+#[inline(always)]
 pub(crate) fn call_on(e: &Expr) -> Option<(Sym, &Expr, &[Expr], u32)> {
     match e {
         Expr::Call(f, args, line) => match (&**f, args.split_first()) {
@@ -2572,6 +2573,28 @@ impl Interp {
                 self.exec_assign(name, op, e, line, env, Some(rhs))
             }
             Stmt::Assign(name, op, e, line) => self.exec_assign(name, op, e, line, env, None),
+            Stmt::Return(e, _) => {
+                let v = match e {
+                    Some(e) => self.eval(e, env)?,
+                    None => Value::Nil,
+                };
+                Err(Ctrl::Return(v))
+            }
+            // Declarations, run once: out of line, so that their frames are not every statement's
+            // (`run_decl`).
+            _ => self.run_decl(s, env),
+        }
+    }
+
+    /// `run_stmt` for a declaration: a function, route, `use`, type, service, mount or state.
+    /// Out of line: in `run_stmt`, what their code needs set up made each statement's frame, and
+    /// as other code moved, LLVM inlined a table's `insert` there or not, and a loop of `t += x`
+    /// took 0.8% more instructions with one build than another (FEEDBACK52.md, Q-947 review 9;
+    /// branch feedback52).
+    #[cold]
+    #[inline(never)]
+    fn run_decl(&mut self, s: &Stmt, env: &Env) -> Result<Value, Ctrl> {
+        match s {
             Stmt::Fn(def) => {
                 define(env, &def.name, Value::Func(Arc::new(Closure { def: def.clone(), env: env.clone() })));
                 if def.server && !self.server_fns.contains(&def.name) {
@@ -2585,23 +2608,7 @@ impl Interp {
             }
             // A browser library: its names, for components' code; on the server
             // they give null, as `js(...)` does (branch js-libraries).
-            Stmt::Use(path, Some(names), line, options) if crate::ast::is_script(path) => {
-                for (global, name) in names {
-                    // A module's exports go by the program's name for them, in the
-                    // runtime (branch library-hints).
-                    let (page_name, export) = if options.module { (name.clone(), Some(global.clone())) } else { (global.clone(), None) };
-                    // One name from two scripts: refused, as `check` refuses it, where the last
-                    // was every file's (FEEDBACK55.md, Q-808; branch feedback55).
-                    if let Some(l) = self.js_libs.get(name).filter(|l| l.src != *path || l.global != page_name || l.export != export) {
-                        return fail(*line, format!("`{}` is taken from {} already, and here from {}: a page has one `{}`, so take one of them under another name (`use {} as ...`)", name, l.src, path, name, global));
-                    }
-                    let libs = Arc::make_mut(&mut self.js_libs);
-                    let order = libs.get(name).map_or(libs.len(), |l| l.order);
-                    libs.insert(name.clone(), crate::client::JsLib { global: page_name, src: path.clone(), order, hint: options.hint, export });
-                    define(env, name, Value::Builtin("__jslib", crate::builtins::js_lib));
-                }
-                Ok(Value::Nil)
-            }
+            Stmt::Use(path, Some(names), line, options) if crate::ast::is_script(path) => self.use_script(path, names, line, options, env),
             // Out of line: inlined, its lookups made every statement's frame save registers,
             // and a loop of `t += x` was 4% slower (found in review of FEEDBACK55.md, string
             // speed; branch feedback55).
@@ -2678,7 +2685,8 @@ impl Interp {
                 self.mounts.push((prefix.clone(), sub));
                 Ok(Value::Nil)
             }
-            Stmt::State(name, e, _) => {
+            _ => {
+                let Stmt::State(name, e, _) = s else { return Ok(Value::Nil) };
                 self.last_live = None;
                 // A component placed in the page (the only island rendering) defers
                 // `defer(...)`: null now, worked out after the page. Its second
@@ -2705,14 +2713,31 @@ impl Interp {
                 define(env, name, v);
                 Ok(Value::Nil)
             }
-            Stmt::Return(e, _) => {
-                let v = match e {
-                    Some(e) => self.eval(e, env)?,
-                    None => Value::Nil,
-                };
-                Err(Ctrl::Return(v))
-            }
         }
+    }
+
+    /// A browser library's `use` (`run_stmt`). Out of line, as `run_use` is: inlined, a call of
+    /// the table's `insert` it makes, once inlined and once not as other code moved, gave every
+    /// statement's frame 3 instructions more, a loop of `t += x` 0.8% (FEEDBACK52.md, Q-947
+    /// review 9; branch feedback52).
+    #[cold]
+    #[inline(never)]
+    fn use_script(&mut self, path: &str, names: &[(String, String)], line: &u32, options: &LibOptions, env: &Env) -> Result<Value, Ctrl> {
+        for (global, name) in names {
+            // A module's exports go by the program's name for them, in the
+            // runtime (branch library-hints).
+            let (page_name, export) = if options.module { (name.clone(), Some(global.clone())) } else { (global.clone(), None) };
+            // One name from two scripts: refused, as `check` refuses it, where the last
+            // was every file's (FEEDBACK55.md, Q-808; branch feedback55).
+            if let Some(l) = self.js_libs.get(name).filter(|l| l.src != *path || l.global != page_name || l.export != export) {
+                return fail(*line, format!("`{}` is taken from {} already, and here from {}: a page has one `{}`, so take one of them under another name (`use {} as ...`)", name, l.src, path, name, global));
+            }
+            let libs = Arc::make_mut(&mut self.js_libs);
+            let order = libs.get(name).map_or(libs.len(), |l| l.order);
+            libs.insert(name.clone(), crate::client::JsLib { global: page_name, src: path.to_string(), order, hint: options.hint, export });
+            define(env, name, Value::Builtin("__jslib", crate::builtins::js_lib));
+        }
+        Ok(Value::Nil)
     }
 
     /// `use`: a file's statements run, or a Rust file built and its functions defined, once

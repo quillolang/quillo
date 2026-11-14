@@ -1365,7 +1365,10 @@ fn a_call_given_up_for_the_stack_left_keeps_the_calls_under_it_compiled() {
     let times = |env: &[(&str, &str)]| {
         let (_server, port) = served(src, &[], env);
         let _ = fastest_get(port, "/warm", 2);
-        (fastest_get(port, "/par", 3), fastest_get(port, "/pfact", 3))
+        // The fastest of 7: of 3, beside this file's other tests, `/pfact`'s compiled time was
+        // three times its interpreted one in about one run in three, on quillo-A11 too, where
+        // alone it is 9-12 ms against 9-10 (Q-947 review 9).
+        (fastest_get(port, "/par", 3), fastest_get(port, "/pfact", 7))
     };
     let ((par, s1, b1), (pfact, s2, b2)) = times(&[]);
     let ((par0, s3, b3), (pfact0, s4, b4)) = times(&[("QUILLO_JIT", "0")]);
@@ -1736,4 +1739,58 @@ fn a_function_calling_nothing_with_a_large_frame_keeps_the_quick_call() {
     // 1.5 times at most: in instructions quillo-A10 1.70, this build 1.11, main 1.11; in time
     // alone quillo-A10 1.97, this build 1.1.
     assert!(big * 2 < small * 3, "in reverse {:?}, in order {:?}", big, small);
+}
+
+// ---- review 9 of Q-947 (FEEDBACK52.md, Q-947 review 9; branch feedback52) --------------------
+
+#[test]
+fn a_shallow_call_after_a_deep_one_needing_a_larger_stack_runs_on_its_own() {
+    // `g` keeps 130 floats; `g(6000)` at the end of a 3,000-deep interpreted walk is given up for
+    // the stack and runs on a kept one, and the next calls of `g` went straight there. `g(0)`
+    // there needs more than the kept stack (its call limit is 3,000 further off), so each made
+    // and dropped a new 20 MB one: 42,000 instructions and a page fault a call (quillo-A11),
+    // 4,000 before (Q-947 review 9).
+    let _one = heavy();
+    let src = |k: usize| format!("{}fn walk(n, s) {{ if n == 0 {{ g(6000, 1.5) ?? -1.0 }} else {{ walk(n - 1, s) }} }}\nfn many(k, s) {{\n    let t = 0.0\n    let i = 0\n    while i < k {{\n        t += g(0, 1.5)\n        i += 1\n    }}\n    t\n}}\nprint(g(2, 1.5))\nprint(g(2, 1.5))\nprint(parallel(() => [walk(3000, \"x\"), many({}, \"x\")], () => 1))\n", keeping(130).replace("fn r(", "fn g(").replace(" r(n - 1", " g(n - 1"), k);
+    // Page faults, which a new stack each call makes and wall time on a loaded machine hides:
+    // quillo-A11 about 1,030 more with the calls, this build and quillo-A9 a few.
+    let (with, out) = page_faults(&src(1024));
+    assert!(out.ends_with("[[771.0, 1536.0], 1]"), "{}", out);
+    let (without, out) = page_faults(&src(0));
+    assert!(out.ends_with("[[771.0, 0.0], 1]"), "{}", out);
+    assert!(with < without + 300, "with 1,024 calls {} page faults, without {}", with, without);
+}
+
+/// `src` in `quillo run`: the page faults its process took (its own, from `wait4`), and what it
+/// printed.
+fn page_faults(src: &str) -> (i64, String) {
+    let d = support::temp_dir("feedback52-jit-faults");
+    std::fs::write(d.join("main.qwe"), src).unwrap();
+    let mut child = Command::new(quillo()).arg("run").arg(d.join("main.qwe")).arg("--no-check").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let id = child.id() as i32;
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut out).unwrap();
+    let mut status = 0;
+    // SAFETY: an all-zero rusage is valid, and `wait4` fills it for this child alone.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::wait4(id, &mut status, 0, &mut usage) }, id);
+    (usage.ru_minflt as i64 + usage.ru_majflt as i64, out.trim_end().to_string())
+}
+
+#[test]
+fn a_server_keeps_no_deeply_touched_stack_after_frames_just_under_the_kept_size() {
+    // `r(9000)` keeping 100 floats needs 8.5 MB, under `KEEP`: kept for the thread's next call,
+    // its 7.6 MB of touched pages stayed, a server 6.1 → 21 MB over 32 requests, 70 with
+    // `--instances 4`, where quillo-A9 stays at 6.8 and 13 (Q-947 review 9).
+    let _one = heavy();
+    let src = format!("{}route GET /warm = str(r(2, 1.5) + r(2, 1.5))\nroute GET /p = str(parallel(() => r(9000, 1.5) ?? \"E\", () => 1))\n", keeping(100));
+    let (server, port) = served(&src, &[], &[]);
+    let _ = fastest_get(port, "/warm", 2);
+    let before = resident(server.0.id());
+    for _ in 0..16 {
+        let (_, status, body) = fastest_get(port, "/p", 1);
+        assert_eq!((status, body.as_str()), (200, "[591.0, 1]"));
+    }
+    let after = resident(server.0.id());
+    assert!(after < before + (6 << 10), "{} KB before, {} KB after", before, after);
 }

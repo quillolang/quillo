@@ -305,6 +305,17 @@ fn on_big(entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame: usize, res
         // As `crate::stack` makes one.
         let stack = kept.unwrap_or_else(|| DefaultStack::new(need + (256 << 10) + crate::stack::MARGIN).expect("cannot allocate a stack"));
         let (low, high) = (crate::stack::limit_of(&stack), stack.base().get());
+        // Words below `TOUCHED` from its top, over the largest frame (each frame writes its frame
+        // pointer at its top, and frames lie end to end): written over, the call went that deep.
+        // Not for frames counted at `LEVEL` (no `reserve`), which touch at most 5 MB and mostly a
+        // few hundred KB: marked too, 4,000 calls of `d(1500)` in a request's `parallel` children
+        // took 0.4% more instructions (Q-947 review 9).
+        let span = (reserve.saturating_sub(RESERVE)) / 8 + 2;
+        let marks = (reserve != 0 && high - low > TOUCHED + span * 8).then(|| (high - TOUCHED - span * 8) as *mut u64);
+        if let Some(at) = marks {
+            // SAFETY: `at..at + span` is in `low..high`, memory of `stack`, which no call uses now.
+            unsafe { std::slice::from_raw_parts_mut(at, span) }.fill(MARK);
+        }
         let outer = crate::stack::switch(low);
         let mut out = None;
         // SAFETY: `low..high` is memory of `stack`, which outlives the call.
@@ -312,7 +323,10 @@ fn on_big(entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame: usize, res
             psm::on_stack(low as *mut u8, high - low, || out = Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(again))));
         }
         crate::stack::switch(outer);
-        if need <= KEEP {
+        // SAFETY: as above; `stack` is not in use any more, and the call's writes were through
+        // code the compiler cannot see into (`psm::on_stack`).
+        let deep = marks.is_some_and(|at| unsafe { std::slice::from_raw_parts(at, span) }.iter().fold(0, |any, w| any | (w ^ MARK)) != 0);
+        if need <= KEEP && !deep {
             BIG.with(|b| *b.borrow_mut() = Some(stack));
         }
         out.expect("ran").unwrap_or_else(|p| std::panic::resume_unwind(p))
@@ -334,6 +348,17 @@ thread_local! {
 /// requests took one with `--instances 4` to 670, where a stack not kept leaves 43 and 118
 /// (FEEDBACK52.md, Q-947 review 8; branch feedback52).
 const KEEP: usize = 16 << 20;
+
+/// How much of `BIG` a call may have touched for it to be kept: one that went deeper, keeping 100
+/// floats 9,000 calls deep, left each thread 7.6 MB of pages, 70 MB with `--instances 4` where a
+/// stack not kept leaves 13. The stacks kept for many shallow calls, `f(9000)` counted at a large
+/// frame it never makes, touch some 300 KB (FEEDBACK52.md, Q-947 review 9; branch feedback52).
+#[cfg(not(windows))]
+const TOUCHED: usize = 1 << 20;
+
+/// What `on_big` writes where it tells whether a call went past `TOUCHED`.
+#[cfg(not(windows))]
+const MARK: u64 = 0x5155_494c_4c4f_4d4b;
 
 /// What `call` did with a call.
 pub enum Ran {
@@ -565,7 +590,10 @@ fn run(entry: Entry, ret: T, raw: &[u64; 16], depth: usize, frame: usize, reserv
     if max < limit {
         if let Some(deep) = deep {
             let n = deep.load(Relaxed);
-            if n != 0 && crate::stack::remaining().is_some() {
+            // That call's stack, for this call's depth: one shallower that needs more than `KEEP`
+            // made and dropped a new stack each time, 42,000 instructions and a page fault a call
+            // against 4,000 (FEEDBACK52.md, Q-947 review 9; branch feedback52).
+            if n != 0 && crate::stack::remaining().is_some() && limit * frame + reserve + crate::stack::MARGIN <= KEEP {
                 deep.store(n - 1, Relaxed);
                 return floor_unless_done(on_big(entry, ret, raw, depth, frame, reserve), depth);
             }
