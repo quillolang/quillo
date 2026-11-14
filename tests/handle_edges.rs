@@ -475,7 +475,8 @@ route GET /no-end = <Tag/> + raw("<body")
 #[test]
 fn a_page_that_has_the_prefetch_script_does_not_get_it_twice() {
     let code = quillo::server::PREFETCH_JS;
-    let src = format!("route GET /own = raw(\"<body><script>\" + read_file(\"prefetch.js\") + \"</script></body>\")\nroute GET /quoted = raw(\"<body><code>\" + read_file(\"prefetch.js\") + \"</code></body>\")\n");
+    // /quoted has a link: a page with none gets no script (branch page-size).
+    let src = format!("route GET /own = raw(\"<body><script>\" + read_file(\"prefetch.js\") + \"</script></body>\")\nroute GET /quoted = raw(\"<body><a href=/x>x</a><code>\" + read_file(\"prefetch.js\") + \"</code></body>\")\n");
     let (mut it, d) = files("prefetch", &[("app.qwe", &src), ("prefetch.js", code)]);
     assert_eq!(get(&mut it, "/own").text().matches("w.pf=1").count(), 1);
     // Text that quotes it is no script: the page still gets its own.

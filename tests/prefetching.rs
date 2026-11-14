@@ -237,3 +237,30 @@ fn a_page_says_it_came_from_a_prefetch_only_where_that_is_counted() {
     wait_for(port);
     assert!(send(port, "GET", "/", &[], "").body.contains("/_quillo/prefetch-used"));
 }
+
+/// A page with no link carries no prefetch script (branch page-size), but with `--metrics` it
+/// still says whether it was landed on from a prefetch: another page's link may lead to it.
+#[test]
+fn a_page_with_no_link_still_says_it_came_from_a_prefetch() {
+    let page = "route GET / = <html><body><table><tr><td>1</td></tr></table></body></html>\nroute GET /linked = <html><body><a href=\"/\">x</a></body></html>\n";
+    let (_d, f) = app("beacon-no-link", page);
+    let s = serve(&f, &[]);
+    let plain = send(s.port, "GET", "/", &[], "").body;
+    assert_eq!(plain, "<!doctype html><html><body><table><tr><td>1</td></tr></table></body></html>");
+    let (_d, f) = app("beacon-no-link-on", page);
+    let port = support::free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .args(["run", f.to_str().unwrap(), "--port", &port.to_string(), "--metrics"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _g = support::Guard::new(child);
+    wait_for(port);
+    let counted = send(port, "GET", "/", &[], "").body;
+    assert!(counted.contains("/_quillo/prefetch-used") && !counted.contains("w.pf=1"), "{}", counted);
+    assert!(counted.ends_with("</script></body></html>"), "{}", counted);
+    // A page with a link has both, once each.
+    let linked = send(port, "GET", "/linked", &[], "").body;
+    assert_eq!((linked.matches("w.pf=1").count(), linked.matches("/_quillo/prefetch-used").count()), (1, 1), "{}", linked);
+}

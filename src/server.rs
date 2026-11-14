@@ -541,10 +541,20 @@ impl Interp {
         // disk, whose ETag and byte ranges are of the file (FEEDBACK36.md, Q-447; branch
         // feedback36-39).
         let html = html && !as_written(&resp);
+        // Only a page with something to prefetch: a link, a script that may make one, or a
+        // component. One with none carried 1,300 bytes that never ran (the Fortunes page,
+        // 2,560 bytes against Bun's 1,226; branch page-size). With --metrics, such a page still
+        // says whether it was landed on from a prefetch.
         if html && req.method != "HEAD" && PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
             let has = rfind_tag;
-            if let (Some(at), false) = (has(&resp.body, b"</body>"), script_with(&resp.body, &PREFETCH_JS.as_bytes()[..40])) {
-                insert_at(&mut resp.body, at, &prefetch_tags(&self.base));
+            if let Some(at) = has(&resp.body, b"</body>") {
+                if self.rendered_island || may_follow(&resp.body) {
+                    if !script_with(&resp.body, &PREFETCH_JS.as_bytes()[..40]) {
+                        insert_at(&mut resp.body, at, &prefetch_tags(&self.base));
+                    }
+                } else if crate::metrics::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+                    insert_at(&mut resp.body, at, used_script(&self.base).as_bytes());
+                }
             }
         }
         // A page that plays a stream loads the player.
@@ -2384,6 +2394,20 @@ pub(crate) fn rpc_failure(name: &str, e: &crate::error::QuilloError) -> String {
 /// has it, not text that quotes it, which is escaped.
 fn script_with(body: &[u8], code: &[u8]) -> bool {
     finder(code).find_iter(body).any(|i| body[..i].ends_with(b"<script>"))
+}
+
+/// Whether a page may have a link to prefetch: an `<a>` tag, or a `<script>` that may make one
+/// (branch page-size). A `<` in the page's text is `&lt;`, so only markup is seen; one in a
+/// comment or an attribute only keeps the script. Four SIMD searches, made once each: one pass
+/// stopping at every `<` cost 430 ns on the Fortunes page, more than the insert it saves (about
+/// 300); these cost 90. Tags in lower or upper case, as markup and HTML are written; a page whose
+/// only link or script is in mixed case (`<Script>`) is sent without prefetching.
+fn may_follow(body: &[u8]) -> bool {
+    use memchr::memmem::Finder;
+    static TAGS: std::sync::LazyLock<[Finder<'static>; 4]> =
+        std::sync::LazyLock::new(|| [Finder::new(b"<a"), Finder::new(b"<A"), Finder::new(b"<script"), Finder::new(b"<SCRIPT")]);
+    let link = |i: usize| matches!(body.get(i + 2), Some(b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'>' | b'/'));
+    TAGS[0].find_iter(body).any(link) || TAGS[1].find_iter(body).any(link) || TAGS[2].find(body).is_some() || TAGS[3].find(body).is_some()
 }
 
 /// `bytes` put into `body` at `at`: a move and a copy. `Vec::splice` put them in a byte at a

@@ -1055,7 +1055,9 @@ commits: the work and its answer are kept together, or neither is.
 
 Every page a route makes asks for the pages it links to before they are clicked: a
 link of the same site pointed at (for 65 ms), pressed, touched or reached with Tab. By
-the time the click lands, the page is there. Browsers with speculation rules (Chrome,
+the time the click lands, the page is there. The few lines of script that do it go only
+on a page with something to follow: a link, a `<script>` (which may add links) or a
+component; a page with none (a table, a receipt) is sent as the route made it. Browsers with speculation rules (Chrome,
 Edge) keep the page for the navigation themselves; others get it in the background and
 keep it in their cache for 30 seconds, which the server allows for this, unless someone
 has logged in or out.

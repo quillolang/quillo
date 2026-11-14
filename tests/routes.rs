@@ -844,6 +844,54 @@ route GET /cached = respond(200, "mine", { "cache-control": "no-store" })
     assert_eq!(prefetch(&mut it, "/cached", ("X-Quillo-Prefetch", "1")).header("cache-control"), Some("no-store"));
 }
 
+/// The prefetch script goes only on a page with something to prefetch: a link, a script
+/// that may make one, or a component (branch page-size). TechEmpower's Fortunes page, a
+/// table and no link, was 2,560 bytes against Bun's 1,226, all of it the script.
+#[test]
+fn a_page_with_nothing_to_prefetch_does_not_carry_the_script() {
+    let mut it = app(r#"
+let rows = [{ id: 1, message: "<a href=/x>quoted</a>" }, { id: 2, message: "<script>no</script>" }]
+component Tick() {
+    ~n = 0
+    <button @click={() => { n += 1 }}>{n}</button>
+}
+route GET /table = <html><body><table>{for r in rows => <tr><td>{r.id}</td><td>{r.message}</td></tr>}</table></body></html>
+route GET /lookalikes = <html><body><abbr>a</abbr><address>b</address><aside>c</aside><audio></audio><article>d</article><map><area href="/m"></map><p>a &lt;a href=/x&gt; link</p></body></html>
+route GET /link = <html><body><a href="/x">x</a></body></html>
+route GET /link_upper = raw("<html><body><A HREF=/x>x</A></body></html>")
+route GET /link_newline = raw("<html><body><a\nhref=/x>x</a></body></html>")
+route GET /link_bare = raw("<html><body><a>x</a></body></html>")
+route GET /svg_link = <html><body><svg><a href="/x"><text>x</text></a></svg></body></html>
+route GET /script = raw("<html><body><script>document.body.append('hi')</script></body></html>")
+route GET /script_upper = raw("<html><body><SCRIPT src=/s.js></SCRIPT></body></html>")
+route GET /component = <html><body><Tick/></body></html>
+route GET /ends_open = raw("<html><body>x</body></html><a")
+route GET /ends_lt = raw("<html><body>x</body></html><")
+route GET /closing_only = raw("<html><body>x</a></body></html>")
+"#);
+    let page = |it: &mut Interp, url: &str| get(it, url).text();
+    // No link: the page is what the route made, to the byte.
+    let table = page(&mut it, "/table");
+    assert!(!table.contains("w.pf=1") && !table.contains("<script>w") && !table.contains("<script>(()"), "{}", table);
+    assert!(table.contains("&lt;a href=/x&gt;quoted&lt;/a&gt;") && table.contains("&lt;script&gt;no&lt;/script&gt;"), "{}", table);
+    assert_eq!(table, "<!doctype html><html><body><table><tr><td>1</td><td>&lt;a href=/x&gt;quoted&lt;/a&gt;</td></tr><tr><td>2</td><td>&lt;script&gt;no&lt;/script&gt;</td></tr></table></body></html>");
+    // Tags that start with an `a` and are no link, `<area>` among them (the script follows
+    // `<a href>` only), and a link written as text.
+    assert!(!page(&mut it, "/lookalikes").contains("w.pf=1"));
+    // A link in any case or spacing, with no `href` (one may be set later), or in SVG.
+    for url in ["/link", "/link_upper", "/link_newline", "/link_bare", "/svg_link"] {
+        assert_eq!(page(&mut it, url).matches("w.pf=1").count(), 1, "{}", url);
+    }
+    // A script may make links; so may a component.
+    for url in ["/script", "/script_upper", "/component"] {
+        assert_eq!(page(&mut it, url).matches("w.pf=1").count(), 1, "{}", url);
+    }
+    // A `<` or `<a` as the page's last bytes, and a closing `</a>` alone: no link.
+    for url in ["/ends_open", "/ends_lt", "/closing_only"] {
+        assert!(!page(&mut it, url).contains("w.pf=1"), "{}", url);
+    }
+}
+
 /// A run-time error names the file its line is in, as `quillo check` does:
 /// a program of several files has many a line 3.
 #[test]

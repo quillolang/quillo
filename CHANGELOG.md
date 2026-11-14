@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- A page with nothing to prefetch (no link, no `<script>`, no component) no longer carries
+  the prefetch script: it is sent as the route made it, 1,334 bytes smaller. TechEmpower's
+  Fortunes page is now 1,226 bytes, as Bun's and Node's are (it was 2,560). Pages with a
+  link are unchanged. With `--metrics`, such a page still reports being opened from a
+  prefetch.
+
 ## 0.8.2 (2026-11-14)
 
 - `quillo check` warns when a call of the program's own function that changes nothing is
