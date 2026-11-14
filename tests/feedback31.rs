@@ -377,7 +377,7 @@ fn local_path_lets_only_an_address_on_this_site_through() {
 fn a_page_made_for_one_visitor_is_private_and_no_site_frames_a_page() {
     let d = dir("headers", &[(
         "main.qwe",
-        b"site_headers({ \"content-security-policy\": \"default-src 'self'\", \"x-extra\": \"1\" })\nsite_headers(\"/embed\", { \"x-frame-options\": null, \"x-extra\": \"2\" })\nroute GET /me = <html><body>{session().user ?? \"nobody\"}</body></html>\nroute GET /c = <html><body>{cookie(\"theme\") ?? \"none\"}</body></html>\nroute GET /plain = <html><body>hi</body></html>\nroute GET /embed/x = <html><body>e</body></html>\nroute GET /own = respond(200, \"x\", { \"x-frame-options\": \"DENY\", \"cache-control\": \"no-store\", \"content-type\": \"text/html\", \"x-extra\": \"3\" })\nroute GET /api = { a: session().user }\nroute GET /missing = respond(404, <html><body>{session().user}</body></html>)\n",
+        b"site_headers({ \"content-security-policy\": \"default-src 'self'\", \"x-extra\": \"1\" })\nsite_headers(\"/embed\", { \"x-frame-options\": null, \"x-extra\": \"2\" })\nroute GET /me = <html><body>{session().user ?? \"nobody\"}</body></html>\nroute GET /c = <html><body>{cookie(\"theme\") ?? \"none\"}</body></html>\nroute GET /plain = <html><body><a href=\"/x\">hi</a></body></html>\nroute GET /embed/x = <html><body>e</body></html>\nroute GET /own = respond(200, \"x\", { \"x-frame-options\": \"DENY\", \"cache-control\": \"no-store\", \"content-type\": \"text/html\", \"x-extra\": \"3\" })\nroute GET /api = { a: session().user }\nroute GET /missing = respond(404, <html><body>{session().user}</body></html>)\n",
     )]);
     let s = serve(&d, "main.qwe", &[]);
     let h = |p: &str| send(s.port, "GET", p, &[], "");
@@ -386,7 +386,9 @@ fn a_page_made_for_one_visitor_is_private_and_no_site_frames_a_page() {
     assert_eq!(me.header("content-security-policy"), Some("default-src 'self'"));
     assert_eq!(h("/c").header("cache-control"), Some("private"));
     // Not `Vary: Cookie`; a page gzipped for a client that takes it varies by that, plain too
-    // (FEEDBACK55.md, Q-724; branch feedback55).
+    // (FEEDBACK55.md, Q-724; branch feedback55). It has a link, so it carries the prefetch script
+    // and is large enough to be gzipped (1,024 bytes): with none it gets no script (branch
+    // page-size), and a page too small to gzip does not vary.
     let plain = h("/plain");
     assert_eq!((plain.header("cache-control"), plain.header("vary"), plain.header("x-frame-options"), plain.header("x-extra")), (None, Some("accept-encoding"), Some("SAMEORIGIN"), Some("1")));
     let embed = h("/embed/x");
