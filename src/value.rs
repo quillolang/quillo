@@ -38,6 +38,34 @@ impl Key {
             KeyText::Long(s) => s,
         }
     }
+
+    /// Whether this is the key `name`: as `as_str() == name`, but for a short key without a call
+    /// to the C library's `memcmp`, which a field read paid for each lookup in a record's few
+    /// fields (branch speed-fortunes: 1.7% of the Fortunes page's time).
+    #[inline]
+    pub fn is(&self, name: &str) -> bool {
+        match &self.0 {
+            KeyText::Short(n, b) => *n as usize == name.len() && same_short(&b[..name.len()], name.as_bytes()),
+            KeyText::Long(s) => &**s == name,
+        }
+    }
+}
+
+/// Whether two byte strings of the same length, 22 at most, are equal: by two or three
+/// overlapping words, which cover every byte.
+#[inline(always)]
+fn same_short(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len();
+    debug_assert!(n == b.len() && n <= 22);
+    let w8 = |x: &[u8], i: usize| u64::from_ne_bytes(x[i..i + 8].try_into().unwrap());
+    let w4 = |x: &[u8], i: usize| u32::from_ne_bytes(x[i..i + 4].try_into().unwrap());
+    if n >= 8 {
+        w8(a, 0) == w8(b, 0) && w8(a, n - 8) == w8(b, n - 8) && (n <= 16 || w8(a, 8) == w8(b, 8))
+    } else if n >= 4 {
+        w4(a, 0) == w4(b, 0) && w4(a, n - 4) == w4(b, n - 4)
+    } else {
+        (0..n).all(|i| a[i] == b[i])
+    }
 }
 
 impl std::ops::Deref for Key {
@@ -2956,6 +2984,33 @@ mod tests {
 
     /// What is large enough to be freed on another thread: its items and theirs, two levels down
     /// (2026-11-09; found in review): a page of rows is not, a few days of many rows are.
+    #[test]
+    fn a_key_is_its_name_and_no_other() {
+        // Every length a short key has (to 22) and past it, with a byte changed at each place,
+        // a byte added or taken away, and multibyte text (branch speed-fortunes).
+        for n in 0..=30 {
+            let name: String = "abcdefghijklmnopqrstuvwxyz0123456789".chars().cycle().take(n).collect();
+            let k = Key::new(&name);
+            assert!(k.is(&name), "{}", name);
+            for i in 0..n {
+                let mut other = name.clone().into_bytes();
+                other[i] = b'_';
+                let other = String::from_utf8(other).unwrap();
+                assert!(!k.is(&other), "{} {}", name, other);
+            }
+            assert!(!k.is(&format!("{}x", name)));
+            if n > 0 {
+                assert!(!k.is(&name[..n - 1]));
+            }
+        }
+        for s in ["é", "message", "フレーム", "id", "a\0b", "\0", ""] {
+            assert!(Key::new(s).is(s));
+            assert!(!Key::new(s).is(&format!("{}\0", s)), "a padding byte is no part of it");
+        }
+        assert!(!Key::new("ab").is("ba"));
+        assert!(!Key::new("abcdefghij").is("abcdefghiJ"));
+    }
+
     #[test]
     fn weight_counts_what_items_hold() {
         let row = || Value::map([("id".into(), Value::Int(1)), ("message".into(), Value::str("m"))].into_iter().collect());

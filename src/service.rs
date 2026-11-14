@@ -886,8 +886,24 @@ pub fn new_id(n: usize) -> String {
 pub fn request_id(given: Option<&str>) -> Arc<str> {
     match given {
         Some(g) if !g.is_empty() && g.len() <= 64 && g.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b)) => Arc::from(g),
-        _ => Arc::from(new_id(16)),
+        _ => new_id16(),
     }
+}
+
+/// `new_id(16)` as the `Arc<str>` a request keeps: its bytes and hex on the stack, one
+/// allocation, not four (branch speed-fortunes: 1% of the Fortunes page's time).
+fn new_id16() -> Arc<str> {
+    const D: &[u8; 16] = b"0123456789abcdef";
+    let mut b = [0u8; 8];
+    if !crate::crypto::id_bytes_into(&mut b) {
+        return Arc::from(new_id(16));
+    }
+    let mut h = [0u8; 16];
+    for (i, x) in b.iter().enumerate() {
+        h[2 * i] = D[(x >> 4) as usize];
+        h[2 * i + 1] = D[(x & 15) as usize];
+    }
+    Arc::from(std::str::from_utf8(&h).expect("hex is ASCII"))
 }
 
 /// A copy of a value, as the other side of a network would have it (an

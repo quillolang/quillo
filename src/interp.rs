@@ -692,49 +692,125 @@ pub fn escape(s: &str) -> String {
 /// and the browser writes it (FEEDBACK55.md, Q-772; branch feedback55). In an attribute too, as
 /// Q-312 had it there (FEEDBACK25.md; branch feedback26-fixes).
 pub fn escape_into(s: &str, out: &mut String) {
-    fn entity(b: u8) -> Option<&'static str> {
-        Some(match b {
-            b'&' => "&amp;",
-            b'<' => "&lt;",
-            b'>' => "&gt;",
-            b'"' => "&quot;",
-            b'\'' => "&#39;",
-            b'\r' => "&#13;",
-            0 => "\u{FFFD}",
-            _ => return None,
-        })
-    }
-    // Eight bytes at a time: whether any is one of the five (a zero byte
-    // after xor with it, found without a branch per byte).
-    const LO: u64 = 0x0101_0101_0101_0101;
-    const HI: u64 = 0x8080_8080_8080_8080;
-    let has = |x: u64, c: u8| {
-        let y = x ^ (LO * c as u64);
-        y.wrapping_sub(LO) & !y & HI
-    };
     let b = s.as_bytes();
     let (mut done, mut i) = (0, 0);
-    while i + 8 <= b.len() {
-        let x = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        if has(x, b'&') | has(x, b'<') | has(x, b'>') | has(x, b'"') | has(x, b'\'') | has(x, b'\r') | has(x, 0) != 0 {
-            for j in i..i + 8 {
-                if let Some(e) = entity(b[j]) {
-                    out.push_str(&s[done..j]);
-                    out.push_str(e);
-                    done = j + 1;
-                }
+    loop {
+        i = next_special(b, i);
+        let Some(e) = b.get(i).and_then(|&c| entity(c)) else { break };
+        push_short(out, &s[done..i]);
+        push_short(out, e);
+        i += 1;
+        done = i;
+    }
+    push_short(out, &s[done..]);
+}
+
+/// What `escape_into` writes for a byte, if it is one it changes.
+#[inline]
+fn entity(b: u8) -> Option<&'static str> {
+    Some(match b {
+        b'&' => "&amp;",
+        b'<' => "&lt;",
+        b'>' => "&gt;",
+        b'"' => "&quot;",
+        b'\'' => "&#39;",
+        b'\r' => "&#13;",
+        0 => "\u{FFFD}",
+        _ => return None,
+    })
+}
+
+/// Where the next byte `escape_into` changes is in `b`, from `i`; `b.len()` if none. Sixteen bytes
+/// at a time where the processor compares sixteen at once (NEON on 64-bit ARM, SSE2 on x86-64,
+/// both always there): eight at a time with seven checks each had been 6.5% of the Fortunes
+/// page's time (branch speed-fortunes). The last bytes too: those of a text of 16 or more as the
+/// last sixteen, overlapping, and a shorter text's from a copy padded with a byte not looked
+/// for; a byte at a time, the texts of a page (most shorter than 80 bytes) spent there what the
+/// sixteen at a time saved. The bytes looked for are ASCII, so `i` is always on a character's
+/// start.
+#[inline]
+fn next_special(b: &[u8], i: usize) -> usize {
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    {
+        let n = b.len();
+        let mut i = i;
+        while i + 16 <= n {
+            // SAFETY: 16 bytes from `i` are inside `b`.
+            let bits = unsafe { specials16(b.as_ptr().add(i)) };
+            if bits != 0 {
+                return i + (bits.trailing_zeros() / STRIDE) as usize;
             }
+            i += 16;
         }
-        i += 8;
-    }
-    for j in i..b.len() {
-        if let Some(e) = entity(b[j]) {
-            out.push_str(&s[done..j]);
-            out.push_str(e);
-            done = j + 1;
+        if i >= n {
+            return n;
+        }
+        let rem = n - i;
+        let bits = if n >= 16 {
+            // The last sixteen, of which the first `16 - rem` were looked at already.
+            // SAFETY: `n >= 16`, so 16 bytes from `n - 16` are inside `b`.
+            (unsafe { specials16(b.as_ptr().add(n - 16)) }) >> (STRIDE as usize * (16 - rem))
+        } else {
+            let mut pad = [b'x'; 16];
+            pad[..rem].copy_from_slice(&b[i..]);
+            // SAFETY: `pad` is 16 bytes.
+            unsafe { specials16(pad.as_ptr()) }
+        };
+        if bits != 0 {
+            i + (bits.trailing_zeros() / STRIDE) as usize
+        } else {
+            n
         }
     }
-    out.push_str(&s[done..]);
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let mut i = i;
+        while i < b.len() && entity(b[i]).is_none() {
+            i += 1;
+        }
+        i
+    }
+}
+
+/// Bits of `specials16` a byte: NEON has no byte mask, so it gives four (`shrn`).
+#[cfg(target_arch = "aarch64")]
+const STRIDE: u32 = 4;
+#[cfg(target_arch = "x86_64")]
+const STRIDE: u32 = 1;
+
+/// `STRIDE` bits for each of the 16 bytes at `p`, set for those `escape_into` changes, the first
+/// byte's lowest.
+///
+/// # Safety
+/// `p` must be valid for reads of 16 bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn specials16(p: *const u8) -> u64 {
+    use std::arch::aarch64::*;
+    let v = vld1q_u8(p);
+    let m = vorrq_u8(
+        vorrq_u8(vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'&')), vceqq_u8(v, vdupq_n_u8(b'<'))), vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'>')), vceqq_u8(v, vdupq_n_u8(b'"')))),
+        vorrq_u8(vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'\'')), vceqq_u8(v, vdupq_n_u8(b'\r'))), vceqzq_u8(v)),
+    );
+    // Four bits a byte (0 or 0xF), in order.
+    vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(m))))
+}
+
+/// See the aarch64 `specials16`.
+///
+/// # Safety
+/// `p` must be valid for reads of 16 bytes.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn specials16(p: *const u8) -> u64 {
+    use std::arch::x86_64::*;
+    let v = _mm_loadu_si128(p.cast());
+    let c = |x: u8| _mm_set1_epi8(x as i8);
+    let m = _mm_or_si128(
+        _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, c(b'&')), _mm_cmpeq_epi8(v, c(b'<'))), _mm_or_si128(_mm_cmpeq_epi8(v, c(b'>')), _mm_cmpeq_epi8(v, c(b'"')))),
+        _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, c(b'\'')), _mm_cmpeq_epi8(v, c(b'\r'))), _mm_cmpeq_epi8(v, _mm_setzero_si128())),
+    );
+    _mm_movemask_epi8(m) as u32 as u64
 }
 
 /// Attributes whose value the browser may load or run as a URL.
@@ -846,6 +922,54 @@ pub fn script_scheme(url: &str) -> Option<&'static str> {
     }
 }
 
+/// `out.push_str(s)`, a short `s` copied in place by overlapping loads and stores rather than by a
+/// call to the C library's `memmove`: a page is made of many short pieces (a row's tags, a field's
+/// text, a number), and the calls had been 6% of the Fortunes page's time (branch speed-fortunes).
+#[inline(always)]
+pub(crate) fn push_short(out: &mut String, s: &str) {
+    // SAFETY: the bytes are a whole `str`, so `out` stays UTF-8.
+    push_short_bytes(unsafe { out.as_mut_vec() }, s.as_bytes());
+}
+
+/// `out.extend_from_slice(s)`, as `push_short` copies: up to 64 bytes in place, more by `memmove`.
+#[inline(always)]
+pub fn push_short_bytes(out: &mut Vec<u8>, s: &[u8]) {
+    let n = s.len();
+    if n > 64 {
+        out.extend_from_slice(s);
+        return;
+    }
+    out.reserve(n);
+    // SAFETY: `reserve` made room for `n` more bytes after `len`; each load reads inside `s` and
+    // each store writes inside that room: the loads and stores of a size overlap when `n` is under
+    // twice their size, and together cover all `n` bytes.
+    unsafe {
+        let len = out.len();
+        let (src, dst) = (s.as_ptr(), out.as_mut_ptr().add(len));
+        let w16 = |at: usize| dst.add(at).cast::<u128>().write_unaligned(src.add(at).cast::<u128>().read_unaligned());
+        if n >= 32 {
+            w16(0);
+            w16(16);
+            w16(n - 32);
+            w16(n - 16);
+        } else if n >= 16 {
+            w16(0);
+            w16(n - 16);
+        } else if n >= 8 {
+            dst.cast::<u64>().write_unaligned(src.cast::<u64>().read_unaligned());
+            dst.add(n - 8).cast::<u64>().write_unaligned(src.add(n - 8).cast::<u64>().read_unaligned());
+        } else if n >= 4 {
+            dst.cast::<u32>().write_unaligned(src.cast::<u32>().read_unaligned());
+            dst.add(n - 4).cast::<u32>().write_unaligned(src.add(n - 4).cast::<u32>().read_unaligned());
+        } else {
+            for i in 0..n {
+                *dst.add(i) = *src.add(i);
+            }
+        }
+        out.set_len(len + n);
+    }
+}
+
 /// An integer's digits, appended to `out` (without `fmt`'s machinery).
 fn push_int(out: &mut String, n: i64) {
     let mut buf = [0u8; 20];
@@ -863,7 +987,7 @@ fn push_int(out: &mut String, n: i64) {
         out.push('-');
     }
     // SAFETY: ASCII digits.
-    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+    push_short(out, unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
 }
 
 /// A value's text, escaped, appended to `out`.
@@ -3022,7 +3146,7 @@ impl Interp {
                 // A local map's field, without a copy of the map.
                 if let Expr::Ident(var, _) = &**obj {
                     let found = with_local(env, var, |v| match v {
-                        Value::Map(m) if m.len() <= 8 => m.iter().find(|(k, _)| k.as_str() == name).map(|(_, x)| x.clone()),
+                        Value::Map(m) if m.len() <= 8 => m.iter().find(|(k, _)| k.is(name)).map(|(_, x)| x.clone()),
                         Value::Map(m) => m.get(name.as_str()).cloned(),
                         _ => None,
                     });
@@ -4213,7 +4337,7 @@ impl Interp {
             Value::Builtin("__jslib", _) => return Ok(Value::Nil),
             Value::Map(m) => {
                 // A record's few fields are found faster in order than hashed.
-                let found = if m.len() <= 8 { m.iter().find(|(k, _)| k.as_str() == name).map(|(_, x)| x) } else { m.get(name) };
+                let found = if m.len() <= 8 { m.iter().find(|(k, _)| k.is(name)).map(|(_, x)| x) } else { m.get(name) };
                 if let Some(x) = found {
                     return Ok(x.clone());
                 }
@@ -5350,7 +5474,7 @@ impl Interp {
             let r = (|| {
                 for p in f.pieces.get().expect("set above") {
                     match p {
-                        Piece::Html(h) => out.push_str(h),
+                        Piece::Html(h) => push_short(out, h),
                         Piece::Expr(e) => self.render_expr_into(e, env, out)?,
                         Piece::El(e) => self.render_el_into(e, env, out)?,
                     }

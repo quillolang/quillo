@@ -143,26 +143,55 @@ pub fn secret_problems(var: impl Fn(&str) -> Option<String>) -> Vec<String> {
 /// (2026-11-09, the server benchmark: `getentropy` was 4% of a page's time). Quillo forks no
 /// process that does not exec, which would give one id twice.
 pub fn id_bytes(n: usize) -> Option<Vec<u8>> {
-    const POOL: usize = 4096;
+    if n > ID_POOL / 16 {
+        return random_bytes(n);
+    }
+    let mut out = vec![0u8; n];
+    id_bytes_into(&mut out).then_some(out)
+}
+
+const ID_POOL: usize = 4096;
+
+/// `id_bytes` into `out` (no more than 256 bytes), with no allocation: a request's id is made
+/// on the stack (branch speed-fortunes). False when the system gives no random bytes.
+pub fn id_bytes_into(out: &mut [u8]) -> bool {
     thread_local! {
         static KEPT: std::cell::RefCell<(Vec<u8>, usize)> = const { std::cell::RefCell::new((Vec::new(), 0)) };
     }
-    if n > POOL / 16 {
-        return random_bytes(n);
-    }
+    let n = out.len();
+    debug_assert!(n <= ID_POOL / 16);
     KEPT.with(|k| {
         let mut k = k.borrow_mut();
         if k.1 + n > k.0.len() {
-            let mut fresh = vec![0u8; POOL];
-            getrandom::getrandom(&mut fresh).ok()?;
+            let mut fresh = vec![0u8; ID_POOL];
+            if !pool_fill(&mut fresh) {
+                return false;
+            }
             *k = (fresh, 0);
         }
         let at = k.1;
-        let out = k.0[at..at + n].to_vec();
+        out.copy_from_slice(&k.0[at..at + n]);
         k.0[at..at + n].fill(0);
         k.1 += n;
-        Some(out)
+        true
     })
+}
+
+/// The id pool's random bytes. On Apple systems `arc4random_buf`, the system's own generator in
+/// the process (ChaCha20, seeded and reseeded by the kernel), at once: `getentropy`, which the
+/// getrandom crate calls there, gives 256 bytes a call, sixteen system calls a refill (branch
+/// speed-fortunes: 0.4% of the Fortunes page's time). Elsewhere the getrandom crate's one call.
+fn pool_fill(buf: &mut [u8]) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        // SAFETY: `buf` is valid for writes of its length.
+        unsafe { libc::arc4random_buf(buf.as_mut_ptr().cast(), buf.len()) };
+        true
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        getrandom::getrandom(buf).is_ok()
+    }
 }
 
 pub fn random_bytes(n: usize) -> Option<Vec<u8>> {

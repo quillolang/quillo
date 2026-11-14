@@ -1067,7 +1067,7 @@ fn answer_tool_here(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>) -> J
             return tool_error("internal error");
         }
     };
-    crate::db::left_open(it, &format!("tool `{}`", tool.name));
+    crate::db::left_open(it, || format!("tool `{}`", tool.name));
     // The first refusal of a question, where the call stopped at one: what the log says, though a
     // function given to a builtin took it (a locale rule's, under `t`) and the call stopped later,
     // or ended (FEEDBACK56.md, found in the coverage review; branch feedback56).

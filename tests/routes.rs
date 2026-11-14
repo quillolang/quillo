@@ -864,6 +864,7 @@ route GET /link_bare = raw("<html><body><a>x</a></body></html>")
 route GET /svg_link = <html><body><svg><a href="/x"><text>x</text></a></svg></body></html>
 route GET /script = raw("<html><body><script>document.body.append('hi')</script></body></html>")
 route GET /script_upper = raw("<html><body><SCRIPT src=/s.js></SCRIPT></body></html>")
+route GET /script_mixed = raw("<html><body><Script>document.title = 'x'</Script></body></html>")
 route GET /component = <html><body><Tick/></body></html>
 route GET /ends_open = raw("<html><body>x</body></html><a")
 route GET /ends_lt = raw("<html><body>x</body></html><")
@@ -883,7 +884,8 @@ route GET /closing_only = raw("<html><body>x</a></body></html>")
         assert_eq!(page(&mut it, url).matches("w.pf=1").count(), 1, "{}", url);
     }
     // A script may make links; so may a component.
-    for url in ["/script", "/script_upper", "/component"] {
+    // A script in any case, `<Script>` too (branch speed-fortunes: the one pass reads either case).
+    for url in ["/script", "/script_upper", "/script_mixed", "/component"] {
         assert_eq!(page(&mut it, url).matches("w.pf=1").count(), 1, "{}", url);
     }
     // A `<` or `<a` as the page's last bytes, and a closing `</a>` alone: no link.

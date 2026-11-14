@@ -1441,7 +1441,7 @@ impl Loop {
                 }
                 Ok(n) => {
                     c.got += n as u64;
-                    c.input.extend_from_slice(&chunk[..n]);
+                    crate::interp::push_short_bytes(&mut c.input, &chunk[..n]);
                     // Less than asked for: that was all there was. (What
                     // arrives later raises a new event, so there is no need
                     // for another read just to be told so, unless the client
@@ -2536,9 +2536,10 @@ fn write_head_as(out: &mut Vec<u8>, resp: &HttpResponse, len: Option<u64>, close
             log(format!("quillo: header `{}` not sent: its name or value has characters headers cannot have\n", k.escape_debug()));
             continue;
         }
-        out.extend_from_slice(k.as_bytes());
+        // Without a call to `memmove` for each (branch speed-fortunes).
+        crate::interp::push_short_bytes(out, k.as_bytes());
         out.extend_from_slice(b": ");
-        out.extend_from_slice(v.as_bytes());
+        crate::interp::push_short_bytes(out, v.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
     let bodyless = resp.status < 200 || resp.status == 204 || resp.status == 304;
@@ -2567,7 +2568,7 @@ fn write_head_as(out: &mut Vec<u8>, resp: &HttpResponse, len: Option<u64>, close
         if d.0 != now {
             *d = (now, http_date(now));
         }
-        out.extend_from_slice(d.1.as_bytes());
+        crate::interp::push_short_bytes(out, d.1.as_bytes());
     });
     out.extend_from_slice(b"\r\n");
     if close {

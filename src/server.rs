@@ -454,7 +454,7 @@ impl Interp {
         // (FEEDBACK55.md, Q-883; branch feedback55).
         let made = crate::stream::take_made();
         // A transaction begun by hand and left open (FEEDBACK44.md, Q-580).
-        crate::db::left_open(self, &format!("{} {}", req.method, path));
+        crate::db::left_open(self, || format!("{} {}", req.method, path));
         // A prefetch's deferred parts: worked out now, as part of the prefetch, which
         // may change nothing (branch defer).
         if prefetch.is_some() && !self.deferred.is_empty() {
@@ -545,10 +545,13 @@ impl Interp {
         // component. One with none carried 1,300 bytes that never ran (the Fortunes page,
         // 2,560 bytes against Bun's 1,226; branch page-size). With --metrics, such a page still
         // says whether it was landed on from a prefetch.
+        // What the page has that these look for: links and scripts, a stream's player; one pass
+        // for both (branch speed-fortunes).
+        let tags = if html && req.method != "HEAD" { page_tags(&resp.body) } else { PageTags::default() };
         if html && req.method != "HEAD" && PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
             let has = rfind_tag;
             if let Some(at) = has(&resp.body, b"</body>") {
-                if self.rendered_island || may_follow(&resp.body) {
+                if self.rendered_island || tags.follow {
                     if !script_with(&resp.body, &PREFETCH_JS.as_bytes()[..40]) {
                         insert_at(&mut resp.body, at, &prefetch_tags(&self.base));
                     }
@@ -559,7 +562,7 @@ impl Interp {
         }
         // A page that plays a stream loads the player.
         if html && req.method != "HEAD" {
-            if has_media(&resp.body) && !script_tag_for(&resp.body, b"/_quillo/media.js") {
+            if tags.media && !script_tag_for(&resp.body, b"/_quillo/media.js") {
                 let at = rfind_tag(&resp.body, b"</body>").unwrap_or(resp.body.len());
                 insert_at(&mut resp.body, at, format!("<script src=\"{}/_quillo/media.js\" defer></script>", self.base).as_bytes());
             }
@@ -2396,18 +2399,101 @@ fn script_with(body: &[u8], code: &[u8]) -> bool {
     finder(code).find_iter(body).any(|i| body[..i].ends_with(b"<script>"))
 }
 
-/// Whether a page may have a link to prefetch: an `<a>` tag, or a `<script>` that may make one
-/// (branch page-size). A `<` in the page's text is `&lt;`, so only markup is seen; one in a
-/// comment or an attribute only keeps the script. Four SIMD searches, made once each: one pass
-/// stopping at every `<` cost 430 ns on the Fortunes page, more than the insert it saves (about
-/// 300); these cost 90. Tags in lower or upper case, as markup and HTML are written; a page whose
-/// only link or script is in mixed case (`<Script>`) is sent without prefetching.
+/// What `page_tags` finds in a page.
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+struct PageTags {
+    /// A link to prefetch, or a script that may make one: an `<a>` tag (`<a` and a space, a `>` or a
+    /// `/`) or a `<script`, in any case (branch page-size). A `<` in the page's text is `&lt;`, so
+    /// only markup is seen; one in a comment or an attribute only keeps the prefetch script.
+    follow: bool,
+    /// A stream's player, `<quillo-media` (as `has_media` finds it).
+    media: bool,
+}
+
+/// `PageTags` of `body`, in one pass: a `<` and, after it, an `a`, `s` or `q` of either case, sixteen
+/// places at a time where the processor compares sixteen at once, then each such place looked at.
+/// Five searches had found these, one for each form (`<a`, `<A`, `<script`, `<SCRIPT`,
+/// `<quillo-media`), 2.4% of the Fortunes page's time together (branch speed-fortunes).
+fn page_tags(b: &[u8]) -> PageTags {
+    let mut t = PageTags::default();
+    let look = |p: usize, t: &mut PageTags| {
+        let rest = &b[p + 1..];
+        match rest.first().map(|c| c | 0x20) {
+            Some(b'a') => t.follow |= matches!(rest.get(1), Some(b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'>' | b'/')),
+            Some(b's') => t.follow |= rest.len() >= 6 && rest[..6].eq_ignore_ascii_case(b"script"),
+            Some(b'q') => t.media |= rest.starts_with(b"quillo-media"),
+            _ => {}
+        }
+    };
+    let n = b.len();
+    let mut i = 0;
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    while i + 17 <= n {
+        // SAFETY: 17 bytes from `i` are inside `b`.
+        let mut bits = unsafe { tag_starts16(b.as_ptr().add(i)) };
+        while bits != 0 {
+            look(i + (bits.trailing_zeros() / STRIDE) as usize, &mut t);
+            bits &= !(((1u64 << STRIDE) - 1) << (bits.trailing_zeros() / STRIDE * STRIDE));
+        }
+        // A link found: only the player is still asked about, by one search to the end, not by a
+        // look at each `<a` and `<s` after it (found in review).
+        if t.follow {
+            static MEDIA: std::sync::LazyLock<memchr::memmem::Finder<'static>> = std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"<quillo-media"));
+            t.media |= MEDIA.find(&b[i + 16..]).is_some();
+            return t;
+        }
+        i += 16;
+    }
+    while i + 1 < n {
+        if b[i] == b'<' && matches!(b[i + 1] | 0x20, b'a' | b's' | b'q') {
+            look(i, &mut t);
+        }
+        i += 1;
+    }
+    t
+}
+
+/// See `crate::interp`'s `STRIDE`: bits of a mask a byte.
+#[cfg(target_arch = "aarch64")]
+const STRIDE: u32 = 4;
+#[cfg(target_arch = "x86_64")]
+const STRIDE: u32 = 1;
+
+/// `STRIDE` bits for each of the 16 places from `p` where a `<` is followed by `a`, `s` or `q` in
+/// either case.
+///
+/// # Safety
+/// `p` must be valid for reads of 17 bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn tag_starts16(p: *const u8) -> u64 {
+    use std::arch::aarch64::*;
+    let (v0, v1) = (vld1q_u8(p), vorrq_u8(vld1q_u8(p.add(1)), vdupq_n_u8(0x20)));
+    let next = vorrq_u8(vorrq_u8(vceqq_u8(v1, vdupq_n_u8(b'a')), vceqq_u8(v1, vdupq_n_u8(b's'))), vceqq_u8(v1, vdupq_n_u8(b'q')));
+    let m = vandq_u8(vceqq_u8(v0, vdupq_n_u8(b'<')), next);
+    vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(m))))
+}
+
+/// See the aarch64 `tag_starts16`.
+///
+/// # Safety
+/// `p` must be valid for reads of 17 bytes.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn tag_starts16(p: *const u8) -> u64 {
+    use std::arch::x86_64::*;
+    let c = |x: u8| _mm_set1_epi8(x as i8);
+    let (v0, v1) = (_mm_loadu_si128(p.cast()), _mm_or_si128(_mm_loadu_si128(p.add(1).cast()), c(0x20)));
+    let next = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v1, c(b'a')), _mm_cmpeq_epi8(v1, c(b's'))), _mm_cmpeq_epi8(v1, c(b'q')));
+    _mm_movemask_epi8(_mm_and_si128(_mm_cmpeq_epi8(v0, c(b'<')), next)) as u32 as u64
+}
+
+/// What `page_tags` gives `follow` for, as it was found before it (for the tests): four searches.
+#[cfg(test)]
 fn may_follow(body: &[u8]) -> bool {
     use memchr::memmem::Finder;
-    static TAGS: std::sync::LazyLock<[Finder<'static>; 4]> =
-        std::sync::LazyLock::new(|| [Finder::new(b"<a"), Finder::new(b"<A"), Finder::new(b"<script"), Finder::new(b"<SCRIPT")]);
     let link = |i: usize| matches!(body.get(i + 2), Some(b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'>' | b'/'));
-    TAGS[0].find_iter(body).any(link) || TAGS[1].find_iter(body).any(link) || TAGS[2].find(body).is_some() || TAGS[3].find(body).is_some()
+    Finder::new(b"<a").find_iter(body).any(link) || Finder::new(b"<A").find_iter(body).any(link) || Finder::new(b"<script").find(body).is_some() || Finder::new(b"<SCRIPT").find(body).is_some()
 }
 
 /// `bytes` put into `body` at `at`: a move and a copy. `Vec::splice` put them in a byte at a
@@ -2449,6 +2535,7 @@ fn rfind_tag(body: &[u8], needle: &[u8]) -> Option<usize> {
 /// forwards has a SIMD prefilter and its search backwards none, so going back from the end through
 /// a page with no player, as most are, was 3% of a page's CPU (branch speed-bun, 2026-11-09, the
 /// Fortunes benchmark). Only whether there is one is asked, not where.
+#[cfg(test)]
 fn has_media(body: &[u8]) -> bool {
     static MEDIA: std::sync::LazyLock<memchr::memmem::Finder<'static>> = std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"<quillo-media"));
     MEDIA.find(body).is_some()
@@ -4379,6 +4466,59 @@ mod tests {
 
     /// A player is asked for wherever the page has one, searched for forwards (branch speed-bun,
     /// 2026-11-09): what the search backwards found.
+    /// `page_tags` against the rule a byte at a time, and never finding less than the five searches
+    /// it took the place of (branch speed-fortunes): pages made of pieces that are tags, nearly
+    /// tags and text, at every place against its sixteen.
+    #[test]
+    fn page_tags_finds_what_each_search_did() {
+        fn by_rule(b: &[u8]) -> PageTags {
+            let mut t = PageTags::default();
+            for i in 0..b.len() {
+                if b[i] != b'<' {
+                    continue;
+                }
+                let r = &b[i + 1..];
+                t.follow |= r.first().is_some_and(|c| c | 0x20 == b'a') && matches!(r.get(1), Some(b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'>' | b'/'));
+                t.follow |= r.len() >= 6 && r[..6].eq_ignore_ascii_case(b"script");
+                t.media |= r.starts_with(b"quillo-media");
+            }
+            t
+        }
+        let parts: [&[u8]; 24] = [
+            b"<a href=x>", b"<A HREF=x>", b"<a>", b"<a/>", b"<a\n", b"<abbr>", b"<area href=y>", b"<script>", b"<SCRIPT src=s>", b"<Script>",
+            b"<scrip", b"<quillo-media stream=c>", b"<QUILLO-MEDIA>", b"<quillo-medi", b"<q>", b"<s>", b"&lt;a href", b"<", b"<<", b"text ",
+            "é".as_bytes(), "フレーム".as_bytes(), b"<td>1</td>", b"</a>",
+        ];
+        let mut seed = 11u64;
+        for round in 0..20000 {
+            let mut page = Vec::new();
+            // Shifted by 0 to 16 bytes, so each piece falls at each place of a block of sixteen.
+            page.extend(std::iter::repeat(b'.').take(round % 17));
+            for _ in 0..(seed % 12) {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                page.extend_from_slice(parts[(seed >> 33) as usize % parts.len()]);
+            }
+            let got = page_tags(&page);
+            assert_eq!(got, by_rule(&page), "{:?}", String::from_utf8_lossy(&page));
+            assert_eq!(got.media, has_media(&page), "{:?}", String::from_utf8_lossy(&page));
+            assert!(got.follow || !may_follow(&page), "{:?}", String::from_utf8_lossy(&page));
+        }
+        // At the very end, and nothing but it.
+        for tail in [&b"<a"[..], b"<", b"<a ", b"<script", b"<scrip", b"<quillo-media", b"<quillo-medi", b""] {
+            for pad in 0..40 {
+                let mut page = vec![b'x'; pad];
+                page.extend_from_slice(tail);
+                assert_eq!(page_tags(&page), by_rule(&page), "{:?}", String::from_utf8_lossy(&page));
+            }
+        }
+        // A tag in every place of a long page's blocks, found once it is there.
+        for at in 0..64 {
+            let mut page = vec![b'y'; 100];
+            page[at..at + 3].copy_from_slice(b"<a>");
+            assert!(page_tags(&page).follow, "{}", at);
+        }
+    }
+
     #[test]
     fn has_media_finds_what_the_search_backwards_did() {
         for body in [&b""[..], b"<quillo-media", b"<body><quillo-media stream=\"cam\"></body>", b"<p>x</p><quillo-media>", b"<quillo-medi", b"<QUILLO-MEDIA>", b"quillo-media", b"<quillo-media><quillo-media>", b"<<quillo-media"] {

@@ -964,22 +964,37 @@ pub(crate) fn backend_on(it: &mut Interp, on: Option<usize>) -> Result<Arc<Backe
 /// rolled back, and the log says so. Every later request's writes went into it, and were lost
 /// when the server stopped (FEEDBACK44.md, Q-580). No other request runs while a transaction is
 /// open (Q-579), so one still open here is this request's.
-pub fn left_open(it: &Interp, what: &str) {
+/// `what` names the request in the error line, made only when there is one: it had been a
+/// `format!` on every request (branch speed-fortunes), as had the list of slots, now made only
+/// when there are connections besides the main one.
+pub fn left_open(it: &Interp, what: impl Fn() -> String) {
     if it.sqlite_tx > 0 || crate::httpd::held() {
         return;
     }
-    let mut slots: Vec<DbSlot> = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned().collect();
-    slots.extend(it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().map(|(_, s)| s.clone()));
-    for slot in slots {
+    let check = |slot: &DbSlot| {
         if let DbSlot::One(b) = slot {
-            if let Backend::Sqlite(m) = &*b {
+            if let Backend::Sqlite(m) = &**b {
                 let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if !c.is_autocommit() {
                     let _ = c.execute_batch("rollback");
-                    crate::httpd::error_line_with(&format!("{} left a transaction open on SQLite, so it was rolled back: write `db.transaction(() => ...)`", what), &[]);
+                    crate::httpd::error_line_with(&format!("{} left a transaction open on SQLite, so it was rolled back: write `db.transaction(() => ...)`", what()), &[]);
                 }
             }
         }
+    };
+    let main = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    if let Some(slot) = &main {
+        check(slot);
+    }
+    let others: Vec<DbSlot> = {
+        let conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if conns.is_empty() {
+            return;
+        }
+        conns.iter().map(|(_, s)| s.clone()).collect()
+    };
+    for slot in &others {
+        check(slot);
     }
 }
 

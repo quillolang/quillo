@@ -7,6 +7,12 @@
   Fortunes page is now 1,226 bytes, as Bun's and Node's are (it was 2,560). Pages with a
   link are unchanged. With `--metrics`, such a page still reports being opened from a
   prefetch.
+- Faster pages: HTML escaping looks for the characters it changes 16 bytes at a time (NEON on
+  64-bit ARM, SSE2 on x86-64), short pieces of a page and of the answer's head are copied
+  without a call to the C library, a record's field is found without one, and the page's checks
+  for links, scripts and a stream's player are one pass. TechEmpower's Fortunes takes 7.8% fewer
+  CPU cycles a request than 0.8.2 (24,259 against 26,318; Bun 27,380), from SQLite 8.5% fewer,
+  JSON 5.5%, text 2.6%. A page whose only script is written `<Script>` now gets prefetching too.
 
 ## 0.8.2 (2026-11-14)
 
