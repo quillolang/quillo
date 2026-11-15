@@ -366,3 +366,82 @@ fn a_pages_print_follows_its_html_and_watch_reload_turns_it_off() {
     assert_ne!(v(&before), v(&after), "the version moved");
     assert_eq!(print(s.port), before.split("const h='").nth(1).unwrap().split('\'').next().unwrap(), "the print did not");
 }
+
+const TASKS: &str = "let tasks = [\"first\"]\nserver fn list() = tasks\nroute POST /add {\n    tasks = tasks + [\"more\"]\n    publish(\"var:tasks\")\n    \"ok\"\n}\nroute GET /other = \"OTHER\"\ncomponent List() {\n    state items = live(list)\n    <ul id=\"l\">{for t in items => <li>{t}</li>}</ul>\n}\nroute GET / = <html><body><div><List/></div></body></html>\n";
+
+/// GET / as a page made with version `was` asks after a save: the response's print, and the
+/// print of what that version renders now.
+fn asked(port: u16, was: &str) -> (String, Option<String>) {
+    let a = support::send(port, "GET", "/", &[("x-quillo-hot", was)], "");
+    let print = a.body.split("const h='").nth(1).unwrap().split('\'').next().unwrap().to_string();
+    (print, a.header("x-quillo-was").map(String::from))
+}
+
+// Q-685, found by Quillo DevTools' tests: a page whose data changed since it was made (a live
+// list grown longer) was told its HTML changed at the next save, whatever the save, and reloaded.
+// The server keeps the version a save replaced and renders it too, by the same request, on the
+// data as it is now: the same print, unless the save changed the page. A page more than one save
+// behind compares its own, as before.
+#[test]
+fn a_save_is_judged_on_the_data_as_it_is_now() {
+    let d = dir("same-data", TASKS);
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+    let v1 = support::send(s.port, "GET", "/_quillo/events", &[], "").body;
+    support::send(s.port, "POST", "/add", &[], "");
+    std::fs::write(d.join("main.qwe"), TASKS.replace("\"OTHER\"", "\"OTHER 2\"")).unwrap();
+    let end = Instant::now() + Duration::from_secs(20);
+    while support::send(s.port, "GET", "/other", &[], "").body != "OTHER 2" {
+        assert!(Instant::now() < end, "the save was not loaded");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (now, was) = asked(s.port, &v1);
+    assert_eq!(was.as_deref(), Some(now.as_str()), "a save to a route the page does not call");
+    let v2 = support::send(s.port, "GET", "/_quillo/events", &[], "").body;
+    assert_ne!(v1, v2);
+    save(s.port, &d, &TASKS.replace("\"OTHER\"", "\"OTHER 2\"").replace("<li>{t}</li>", "<li>- {t}</li>"), "- first");
+    let (now, was) = asked(s.port, &v2);
+    assert!(was.is_some() && was.as_deref() != Some(now.as_str()), "the page's markup changed");
+    assert_eq!(asked(s.port, &v1).1, None, "two saves behind: no print of a version not kept");
+    assert_eq!(asked(s.port, "x").1, None);
+    drop(s);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    assert_eq!(support::send(s.port, "GET", "/", &[("x-quillo-hot", "1")], "").header("x-quillo-was"), None, "--watch only");
+}
+
+// The same in Chrome: the list followed the data (live), then a save to another route leaves the
+// page as it is.
+#[test]
+fn a_page_whose_data_changed_is_kept_at_a_save_it_does_not_use() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let src = format!("{}let ready = false\nroute GET /stage-ready {{\n    ready = true\n    \"ok\"\n}}\nroute GET /is-ready = ready\n", TASKS);
+    let d = dir("same-data-chrome", &src);
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+    let port = s.port;
+    let page = std::thread::spawn(move || {
+        let script = r##"(async () => {
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 300 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
+  const said = [];
+  document.addEventListener("quillo:hmr", (e) => { const d = JSON.parse(e.detail); said.push([d.what, d.why]); });
+  window.__kept = 1;
+  await fetch("/add", { method: "POST" });
+  for (let i = 0; i < 300 && document.querySelectorAll("#l li").length < 2; i++) await tick(30);
+  const items = document.querySelectorAll("#l li").length;
+  await fetch("/stage-ready");
+  for (let i = 0; i < 400 && !said.length; i++) await tick(30);
+  document.body.dataset.result = JSON.stringify({ items, said, kept: window.__kept === 1 });
+})();"##;
+        in_chrome(&chrome, &format!("http://127.0.0.1:{}/", port), script)
+    });
+    let end = Instant::now() + Duration::from_secs(30);
+    while support::send(s.port, "GET", "/is-ready", &[], "").body != "true" {
+        assert!(Instant::now() < end && !page.is_finished(), "the page did not follow the data");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    std::fs::write(d.join("main.qwe"), src.replace("\"OTHER\"", "\"OTHER 2\"")).unwrap();
+    let r = page.join().unwrap();
+    assert_eq!(r, serde_json::json!({ "items": 2, "said": [["kept", ""]], "kept": true }));
+}

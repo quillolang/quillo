@@ -2933,6 +2933,11 @@ pub struct App {
     /// one said (none once one loads), for the pages' `err:` messages (FEEDBACK54.md, Q-686;
     /// branch hmr).
     failed: Mutex<(u64, Option<String>)>,
+    /// Under --watch, the version a save replaced: a page made with it asks whether the save
+    /// changed it, and is answered by both versions' renders of what is there now, so that data
+    /// changed since the page was made is no change of the program's (FEEDBACK54.md, Q-685;
+    /// branch hmr).
+    replaced: Mutex<Option<(u64, Arc<Loaded>)>>,
     /// The files the last load that failed read or tried, watched with the version served
     /// until one loads (FEEDBACK55.md, Q-836; branch feedback55).
     tried: Mutex<Vec<PathBuf>>,
@@ -2966,6 +2971,7 @@ impl App {
             addr: Mutex::new(None),
             css: Mutex::new((0, Vec::new())),
             failed: Mutex::new((0, None)),
+            replaced: Mutex::new(None),
             tried: Mutex::new(Vec::new()),
         }
     }
@@ -3077,6 +3083,9 @@ impl App {
                 // at their next `sleep` (FEEDBACK12.md, Q-082; branch feedback12-fixes).
                 if let Loaded::Ready(old) = &*slot.1 {
                     retire(old);
+                }
+                if self.watch {
+                    *self.replaced.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(slot.clone());
                 }
                 crate::mcp::open_door(&mut it, &self.main_file, tools);
                 let loaded = Arc::new(Loaded::Ready(it));
@@ -3406,7 +3415,9 @@ fn watch(app: Arc<App>, others: Vec<Arc<App>>, mut files: Vec<PathBuf>, mut seen
 /// feedback11-fixes). `err:N:"..."` is a save that did not load.
 /// What a page's HTML is, the address of its bundle aside (which names its code, compared on
 /// its own): a page told of a new version asks for itself again, and is not reloaded when this
-/// and its code are as they were (FEEDBACK54.md, Q-685; branch hmr).
+/// and its code are as they were (FEEDBACK54.md, Q-685; branch hmr). Made with the version the
+/// save replaced, the server renders that version too and gives its print (`x-quillo-was`),
+/// which the page compares instead of its own: data changed since then changes both alike.
 /// Live data's version too (`data-v="<seq>:<server>"`, which any change of data moves, a reload's
 /// too): the page's live states follow it themselves (found by Quillo DevTools' tests).
 fn page_print(body: &str) -> String {
@@ -3443,7 +3454,7 @@ fn dev_script(version: u64, print: &str) -> String {
     // stays (FEEDBACK54.md, Q-686; branch hmr). What the page decided at a new version is told
     // to tools as a `quillo:hmr` event on the document: { what: "kept" | "reload", why: "html" |
     // "code" | "off" | "failed", version } (Quillo DevTools shows it).
-    const SCRIPT: &str = r#"<script>/*quillo-dev*/(()=>{let v='@V@';const h='@H@',HOT=@HOT@;let c=0,e=0,box=null;const css=j=>{const p=JSON.parse(j);for(const l of document.querySelectorAll('link[rel=stylesheet]')){const u=new URL(l.href,location.href);if(u.origin===location.origin&&p.includes(u.pathname)){u.searchParams.set('quillo',Date.now());const n=l.cloneNode();n.href=u.pathname+u.search;n.onload=()=>l.remove();l.after(n)}}};const said=m=>{if(m===null){if(box){box.remove();box=null}return}if(!box){box=document.createElement('quillo-error');const r=box.attachShadow({mode:'open'});r.innerHTML='<style>:host{all:initial;position:fixed;left:0;right:0;bottom:0;z-index:2147483647;font:13px/1.45 ui-monospace,Menlo,monospace}div{position:relative;margin:8px;padding:12px 44px 12px 14px;background:#fff1f0;color:#5c0000;border:2px solid #c62828;border-radius:6px;max-height:45vh;overflow:auto;box-shadow:0 4px 18px #0005}pre{margin:8px 0 0;white-space:pre-wrap;font:inherit}button{position:absolute;top:8px;right:10px;border:0;background:none;font-size:20px;line-height:1;cursor:pointer;color:inherit}</style><div role="alert"><b>This save did not load: the page shows the version before it.</b><pre></pre><button aria-label="Close">×</button></div>';r.querySelector('button').onclick=()=>{box.remove();box=null};document.documentElement.appendChild(box)}box.shadowRoot.querySelector('pre').textContent=m};const plain=()=>{const w=window[Symbol.for('quillo')]||{};return !HOT||w.hot===false||document.documentElement.hasAttribute('data-reload')};const ids=t=>{const m=/\.ids = (\{.*?\});/.exec(t);return m?JSON.parse(m[1]):null};const tell=(what,why,ver)=>{try{document.dispatchEvent(new CustomEvent('quillo:hmr',{detail:JSON.stringify({what,why,version:ver})}))}catch(_){}};const again=(why,ver)=>{tell('reload',why,ver);location.reload()};let busy=null;const hot=t=>busy||(busy=(async()=>{if(plain())return again('off',t);try{const r=await fetch(location.href,{cache:'no-store',credentials:'same-origin'});const p=await r.text();const m=/\/\*quillo-dev\*\/\(\(\)=>\{let v='(\d+)';const h='([0-9a-f]+)'/.exec(p)||[],v2=m[1],h2=m[2];if(!r.ok||!v2)return again('failed',t);if(h2!==h)return again('html',v2);const mine=(window[Symbol.for('quillo')]||{}).ids;if(mine){const b=(/\/_quillo\/b\/[0-9a-f]+\.js/.exec(p)||[])[0];const theirs=b?ids(await (await fetch(b,{cache:'no-store'})).text()):null;if(!theirs)return again('failed',v2);if(Object.keys(mine).some(k=>mine[k]!==theirs[k])||Object.keys(theirs).some(k=>!(k in mine)))return again('code',v2)}v=v2;said(null);tell('kept','',v2)}catch(x){again('failed',t)}})().finally(()=>{busy=null}));const seen=t=>{if(t.startsWith('css:')){const i=t.indexOf(':',4);c=+t.slice(4,i)||c;css(t.slice(i+1))}else if(t.startsWith('err:')){const i=t.indexOf(':',4);e=+t.slice(4,i)||e;said(JSON.parse(t.slice(i+1)))}else if(t!==v)return hot(t)};const u=()=>'/_quillo/events?v='+v+'&c='+c+'&e='+e,go=()=>{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u());s.onopen=()=>o=1;s.onmessage=e=>seen(e.data);s.onclose=()=>o?setTimeout(go,1000):fetch(u(),{cache:'no-store'}).then(r=>r.text()).then(async t=>{await seen(t);go()},()=>setTimeout(go,1000))};go()})()</script>"#;
+    const SCRIPT: &str = r#"<script>/*quillo-dev*/(()=>{let v='@V@';const h='@H@',HOT=@HOT@;let c=0,e=0,box=null;const css=j=>{const p=JSON.parse(j);for(const l of document.querySelectorAll('link[rel=stylesheet]')){const u=new URL(l.href,location.href);if(u.origin===location.origin&&p.includes(u.pathname)){u.searchParams.set('quillo',Date.now());const n=l.cloneNode();n.href=u.pathname+u.search;n.onload=()=>l.remove();l.after(n)}}};const said=m=>{if(m===null){if(box){box.remove();box=null}return}if(!box){box=document.createElement('quillo-error');const r=box.attachShadow({mode:'open'});r.innerHTML='<style>:host{all:initial;position:fixed;left:0;right:0;bottom:0;z-index:2147483647;font:13px/1.45 ui-monospace,Menlo,monospace}div{position:relative;margin:8px;padding:12px 44px 12px 14px;background:#fff1f0;color:#5c0000;border:2px solid #c62828;border-radius:6px;max-height:45vh;overflow:auto;box-shadow:0 4px 18px #0005}pre{margin:8px 0 0;white-space:pre-wrap;font:inherit}button{position:absolute;top:8px;right:10px;border:0;background:none;font-size:20px;line-height:1;cursor:pointer;color:inherit}</style><div role="alert"><b>This save did not load: the page shows the version before it.</b><pre></pre><button aria-label="Close">×</button></div>';r.querySelector('button').onclick=()=>{box.remove();box=null};document.documentElement.appendChild(box)}box.shadowRoot.querySelector('pre').textContent=m};const plain=()=>{const w=window[Symbol.for('quillo')]||{};return !HOT||w.hot===false||document.documentElement.hasAttribute('data-reload')};const ids=t=>{const m=/\.ids = (\{.*?\});/.exec(t);return m?JSON.parse(m[1]):null};const tell=(what,why,ver)=>{try{document.dispatchEvent(new CustomEvent('quillo:hmr',{detail:JSON.stringify({what,why,version:ver})}))}catch(_){}};const again=(why,ver)=>{tell('reload',why,ver);location.reload()};let busy=null;const hot=t=>busy||(busy=(async()=>{if(plain())return again('off',t);try{const r=await fetch(location.href,{cache:'no-store',credentials:'same-origin',headers:{'x-quillo-hot':v}});const p=await r.text();const was=r.headers.get('x-quillo-was');const m=/\/\*quillo-dev\*\/\(\(\)=>\{let v='(\d+)';const h='([0-9a-f]+)'/.exec(p)||[],v2=m[1],h2=m[2];if(!r.ok||!v2)return again('failed',t);if(was?was!==h2:h2!==h)return again('html',v2);const mine=(window[Symbol.for('quillo')]||{}).ids;if(mine){const b=(/\/_quillo\/b\/[0-9a-f]+\.js/.exec(p)||[])[0];const theirs=b?ids(await (await fetch(b,{cache:'no-store'})).text()):null;if(!theirs)return again('failed',v2);if(Object.keys(mine).some(k=>mine[k]!==theirs[k])||Object.keys(theirs).some(k=>!(k in mine)))return again('code',v2)}v=v2;said(null);tell('kept','',v2)}catch(x){again('failed',t)}})().finally(()=>{busy=null}));const seen=t=>{if(t.startsWith('css:')){const i=t.indexOf(':',4);c=+t.slice(4,i)||c;css(t.slice(i+1))}else if(t.startsWith('err:')){const i=t.indexOf(':',4);e=+t.slice(4,i)||e;said(JSON.parse(t.slice(i+1)))}else if(t!==v)return hot(t)};const u=()=>'/_quillo/events?v='+v+'&c='+c+'&e='+e,go=()=>{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u());s.onopen=()=>o=1;s.onmessage=e=>seen(e.data);s.onclose=()=>o?setTimeout(go,1000):fetch(u(),{cache:'no-store'}).then(r=>r.text()).then(async t=>{await seen(t);go()},()=>setTimeout(go,1000))};go()})()</script>"#;
     let hot = !PLAIN_RELOAD.load(std::sync::atomic::Ordering::Relaxed);
     SCRIPT.replace("@V@", &version.to_string()).replace("@H@", print).replace("@HOT@", if hot { "1" } else { "0" })
 }
@@ -3833,6 +3844,23 @@ impl Worker {
                 (None, Loaded::Ready(_)) => unreachable!(),
             }
         };
+        // A page asking whether the save changed it (`x-quillo-hot: <its version>`): what the
+        // version it was made with renders now, by the same request, as a print beside this one.
+        if app.watch && resp.header("content-type").is_some_and(|c| c.starts_with("text/html")) {
+            if let Some(was) = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-quillo-hot")).and_then(|(_, v)| v.parse::<u64>().ok()) {
+                let old = app.replaced.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                if let Some((v, loaded)) = old.filter(|(v, _)| *v == was) {
+                    if let Loaded::Ready(it) = &*loaded {
+                        let mut it = it.fork();
+                        it.request_id = Some(rid.clone());
+                        if let Some(r) = run_program(&mut it, &req) {
+                            resp.headers.push(("x-quillo-was".into(), page_print(&String::from_utf8_lossy(&r.body))));
+                        }
+                    }
+                    let _ = v;
+                }
+            }
+        }
         crate::httpd::request_done();
         if prefetch && crate::metrics::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
             crate::metrics::prefetched(resp.status);
