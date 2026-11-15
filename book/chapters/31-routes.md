@@ -632,7 +632,9 @@ fn touch() {
   session cookies that are both valid here has no session: one of them was planted.
 - Set `QUILLO_SECRET` to a long random string (`crypto.token()` makes one) and use the
   same one on every server. Without it, a random key is made at start: sessions end
-  when the server stops. The server warns when it starts if the secret is shorter than
+  when the server stops. Under `--watch` the key is kept in `.quillo/.quillo-secret`
+  beside the program instead (its owner's alone, and never served), so a restart keeps
+  you signed in *(since 0.8.4: a random key there too)*. The server warns when it starts if the secret is shorter than
   32 bytes, as it does for `QUILLO_SERVICE_SECRET` and `LIMER_ADMIN_SECRET`: a short one
   can be guessed offline from one signed cookie.
 - `set_cookie(name, value, { max_age, path, domain, http_only, secure, same_site })` and

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Under `--watch`, a save that does not load is said over the open pages, which keep what they
+  hold, until a save loads; it said nothing, and the pages showed the version before it as if
+  the save had worked (FEEDBACK54.md, Q-686).
+- Under `--watch`, a change a page does not use (a route it never calls) no longer refreshes it:
+  the page asks for itself again and stays when its HTML and code are as they were.
+  `--watch=reload`, or `<html data-reload>` on a page, refreshes at every change, as before
+  (FEEDBACK54.md, Q-685).
+- Under `--watch`, with no `QUILLO_SECRET`, sessions are signed with a key kept in
+  `.quillo/.quillo-secret`, so a restart no longer signs you out (FEEDBACK54.md, Q-689).
+- In development, a component's file and its address stay the same when another component is
+  edited, so the browser keeps what did not change (FEEDBACK54.md, Q-688).
+
 - A component's callback may answer on the channel it is the callback of: `let room =
   channel.open(name, (m) => room.send(...))` passed `quillo check`, and the server then did not
   start ("unknown name `room`", from the component's compile for the browser). A function in a
