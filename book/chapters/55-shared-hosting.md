@@ -195,14 +195,16 @@ system's (Unix users, CloudLinux's CageFS and LVE limits).
 
 ## Threads and ulimit -u
 
-A Quillo server may use `--workers` + 9 threads: 73 with the default of 64. On Linux,
+A Quillo server may use `--workers` + 10 threads: 74 with the default of 64, one of them
+shared by every page with live data or on a channel (before 0.8.4, each such page was a
+thread of its own, a channel's three). On Linux,
 the account's process limit counts threads, beside PHP, cron and SSH. Give
 `--workers 8` or so; a host's policy can cap it with `[limits] workers`.
 
 At start, a server says when `ulimit -u` is below what it may use:
 
 ```
-quillo: the process limit (ulimit -u) is 30, and this server may use 73 threads: requests may wait for a thread; raise it, or give --workers fewer
+quillo: the process limit (ulimit -u) is 30, and this server may use 74 threads: requests may wait for a thread; raise it, or give --workers fewer
 ```
 
 A thread the system refuses later is said once, and the requests wait for the threads

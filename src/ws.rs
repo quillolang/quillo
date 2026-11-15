@@ -188,20 +188,6 @@ impl Socket {
         let _ = self.0.set_write_timeout(Some(d));
     }
 
-    /// The first message the page sends, when it is text of at most `max` bytes that comes
-    /// within `wait`: what a live page follows, when that is too long for its address
-    /// (FEEDBACK55.md, Q-801; branch feedback55). Handed to `f` a part at a time as it is read,
-    /// never held whole: a message of 4 MiB held for each socket took 8 MiB a socket, 2 GiB for
-    /// one visitor's 256 (found in review). False if it is not such a message (or none came).
-    pub fn first_text_parts(&mut self, max: usize, wait: std::time::Duration, mut f: impl FnMut(&[u8])) -> bool {
-        if self.0.set_read_timeout(Some(wait)).is_err() {
-            return false;
-        }
-        let ok = now(first_text(&mut Blocking(self), max, &mut f)).unwrap_or(false);
-        let _ = self.0.set_read_timeout(None);
-        ok
-    }
-
     pub fn reader(&self, max: usize) -> std::io::Result<Reader<std::net::TcpStream>> {
         Ok(Reader::new(self.0.try_clone()?, max))
     }
@@ -530,7 +516,12 @@ async fn skip(c: &mut impl Conn, len: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The first message, when it is text of at most `max` bytes (see `Socket::first_text_parts`).
+/// The first message the page sends, when it is text of at most `max` bytes: what a live page
+/// follows, when that is too long for its address (FEEDBACK55.md, Q-801; branch feedback55). Handed
+/// to `f` a part at a time as it is read, never held whole: a message of 4 MiB held for each socket
+/// took 8 MiB a socket, 2 GiB for one visitor's 256 (found in review). False if it is not such a
+/// message. (A thread's socket read it as it blocks, `Socket::first_text_parts`, till a live page
+/// was a task: FEEDBACK66.md, Q-954.)
 async fn first_text(c: &mut impl Conn, max: usize, f: &mut impl FnMut(&[u8])) -> std::io::Result<bool> {
     let (mut total, mut first) = (0u64, true);
     loop {
@@ -571,7 +562,8 @@ async fn first_text(c: &mut impl Conn, max: usize, f: &mut impl FnMut(&[u8])) ->
 /// A waiting page's WebSocket, which a task reads and writes (a page with live data;
 /// FEEDBACK66.md, Q-954; branch q954): what `Socket` is to a thread. What it reads is read with
 /// `Socket`'s own reading (`Conn`); a frame written may take `WRITE_WAIT`.
-pub struct LiveSocket(tokio::net::TcpStream, Option<std::time::Duration>);
+/// The second field is how long each read may take, set by what reads.
+pub struct LiveSocket(tokio::net::TcpStream, std::time::Duration);
 
 /// How long one frame may take to write to a page that does not read (FEEDBACK49.md, Q-594).
 const WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -584,10 +576,7 @@ impl Conn for LiveSocket {
         let mut at = 0;
         while at < buf.len() {
             let read = tokio::io::AsyncReadExt::read(&mut self.0, &mut buf[at..]);
-            let n = match self.1 {
-                Some(wait) => tokio::time::timeout(wait, read).await.map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??,
-                None => read.await?,
-            };
+            let n = tokio::time::timeout(self.1, read).await.map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
             if n == 0 {
                 return Err(std::io::ErrorKind::UnexpectedEof.into());
             }
@@ -613,7 +602,7 @@ impl Conn for LiveSocket {
 impl LiveSocket {
     /// A connection whose handshake is done, on the runtime it is to run on.
     pub fn new(s: tokio::net::TcpStream) -> LiveSocket {
-        LiveSocket(s, None)
+        LiveSocket(s, std::time::Duration::from_secs(10))
     }
 
     /// Done when the page has sent something, or hung up.
@@ -671,9 +660,8 @@ impl LiveSocket {
                 Some(false) => break Heard::Nothing,
                 Some(true) => {}
             }
-            self.1 = Some(wait);
+            self.1 = wait;
             let read = Box::pin(frame_heard(self, max, &mut f)).await;
-            self.1 = None;
             match read {
                 Ok(Some(h)) => break h,
                 Ok(None) => {}
@@ -686,12 +674,11 @@ impl LiveSocket {
         got
     }
 
-    /// `Socket::first_text_parts`, in a task: each read may take `wait`.
+    /// The first message, if it is text of at most `max` bytes (see `first_text`): each read may
+    /// take `wait`.
     pub async fn first_text_parts(&mut self, max: usize, wait: std::time::Duration, mut f: impl FnMut(&[u8])) -> bool {
-        self.1 = Some(wait);
-        let ok = matches!(Box::pin(first_text(self, max, &mut f)).await, Ok(true));
-        self.1 = None;
-        ok
+        self.1 = wait;
+        matches!(Box::pin(first_text(self, max, &mut f)).await, Ok(true))
     }
 }
 
@@ -819,10 +806,8 @@ pub async fn send_all_async<const N: usize, W: tokio::io::AsyncWrite + Unpin>(w:
     }
     let mut rest = &mut slices.as_flattened_mut()[..2 * frames.len()];
     loop {
-        while rest.first().is_some_and(|s| s.is_empty()) {
-            rest = &mut rest[1..];
-        }
-        if rest.is_empty() {
+        // What is written is dropped by `advance_slices`, with the empty payloads after it (a ping's).
+        if rest.iter().all(|s| s.is_empty()) {
             return true;
         }
         match tokio::io::AsyncWriteExt::write_vectored(w, rest).await {
@@ -1111,6 +1096,49 @@ mod tests {
         f.extend_from_slice(&mask);
         f.extend(data.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
         f
+    }
+
+    /// A connection that takes `most` bytes a write (none: it takes nothing, as one that is gone).
+    struct Trickle {
+        out: Vec<u8>,
+        most: usize,
+    }
+
+    impl tokio::io::AsyncWrite for Trickle {
+        fn poll_write(mut self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+            let n = buf.len().min(self.most);
+            self.out.extend_from_slice(&buf[..n]);
+            std::task::Poll::Ready(Ok(n))
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    // A batch written a few bytes at a time comes out whole and in order, empty payloads (a ping's,
+    // a pong's) and lengths of each size of head among it; one more frame than it has room for is
+    // left out; a connection that takes nothing is gone (FEEDBACK66.md, Q-954; branch q954).
+    #[test]
+    fn a_batch_written_in_parts_comes_out_whole() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let big = vec![7u8; 70_000];
+        let frames: [(u8, &[u8]); 5] = [(0x9, b""), (0x1, b"hello"), (0xA, b""), (0x2, &[1u8; 300]), (0x2, &big)];
+        let mut want = Vec::new();
+        for (op, p) in &frames {
+            super::frame_into(&mut want, *op, p);
+        }
+        let mut t = Trickle { out: Vec::new(), most: 3 };
+        assert!(rt.block_on(super::send_all_async::<5, _>(&mut t, &frames)));
+        assert_eq!(t.out, want);
+        let mut t = Trickle { out: Vec::new(), most: 1 << 20 };
+        assert!(rt.block_on(super::send_all_async::<2, _>(&mut t, &frames)));
+        assert_eq!(t.out, want[..2 + 2 + 5]);
+        let mut gone = Trickle { out: Vec::new(), most: 0 };
+        assert!(!rt.block_on(super::send_all_async::<5, _>(&mut gone, &frames)));
+        assert!(rt.block_on(super::send_all_async::<5, _>(&mut gone, &[])));
     }
 
     #[test]

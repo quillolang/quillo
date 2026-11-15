@@ -367,7 +367,7 @@ fn a_process_limit_too_low_for_the_threads_is_said_at_start() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let said = std::fs::read_to_string(d.join("nproc.log")).unwrap();
-    assert!(said.contains("the process limit (ulimit -u) is 30, and this server may use 73 threads"), "{}", said);
+    assert!(said.contains("the process limit (ulimit -u) is 30, and this server may use 74 threads"), "{}", said);
     assert_eq!(send(port, "GET", "/", &[], "").body, "hi");
 }
 

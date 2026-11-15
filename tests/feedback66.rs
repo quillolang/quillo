@@ -496,3 +496,70 @@ fn changes_too_large_to_write_at_once_reach_a_page_whole() {
     }
     assert!(whole >= 5, "{} messages of 250 topics or more: {:?}", whole, lens);
 }
+
+// Q-954: a live page's ping is answered with its data, at once, and the page is kept.
+#[test]
+fn a_live_pages_ping_is_answered() {
+    let d = dir("live-pong", LIVE);
+    let s = support::serve_with(&d.join("main.qwe"), &[]);
+    let mut p = live_page(s.port, seq(s.port), "pong");
+    p.send(0x9, b"are you there");
+    assert_eq!(p.frame(), Some((0xA, b"are you there".to_vec())));
+    support::send(s.port, "GET", "/bump/pong", &[], "");
+    assert_eq!(changed(&p.text().unwrap()), serde_json::json!(["pong"]));
+}
+
+// Q-954: a live page that hangs up in the middle of a frame is let go, and its place given back:
+// with room for one page, the next one gets in and is told of a change.
+#[test]
+fn a_live_page_gone_in_the_middle_of_a_frame_gives_its_place_back() {
+    let d = dir("live-cut", LIVE);
+    let s = support::serve_with(&d.join("main.qwe"), &["--live-per-client", "1"]);
+    let at = seq(s.port);
+    let mut p = live_page(s.port, at, "cut");
+    // A text frame's head for 100 bytes, its mask, and 3 of them; then it hangs up.
+    p.0.write_all(&[0x81, 0x80 | 100, 1, 2, 3, 4, b'a', b'b', b'c']).unwrap();
+    p.0.shutdown(std::net::Shutdown::Write).unwrap();
+    assert!(until(10, || {
+        let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(c, "GET /_quillo/live?since={}&t=cut HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", at).unwrap();
+        head(&mut c).starts_with(b"HTTP/1.1 101")
+    }), "the place was not given back");
+}
+
+// Q-954: a long poll from a page whose number is ahead of the server's (from before a restart) is
+// told the server's number at once, with nothing changed, as a thread told it.
+#[test]
+fn a_long_poll_ahead_of_the_server_is_told_its_number_at_once() {
+    let d = dir("live-ahead", LIVE);
+    let s = support::serve_with(&d.join("main.qwe"), &[]);
+    let now = seq(s.port);
+    let t = Instant::now();
+    let a = support::send(s.port, "GET", "/_quillo/live?since=999999999&t=x", &[], "");
+    let j: serde_json::Value = serde_json::from_str(&a.body).unwrap();
+    assert_eq!((j["seq"].as_u64(), j["changed"].clone()), (Some(now), serde_json::json!([])));
+    assert!(t.elapsed() < Duration::from_secs(5), "after {:?}", t.elapsed());
+}
+
+// Q-954: the pages that wait for `--watch`'s reloads still have a thread each, within the same
+// places: past --live-per-client, one is told to try later.
+#[test]
+fn a_watch_page_past_its_places_is_told_to_try_later() {
+    let d = dir("watch-places", LIVE);
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch", "--live-per-client", "1"]);
+    let open = |v: &str| {
+        let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(c, "GET /_quillo/events?v={} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", v).unwrap();
+        (String::from_utf8_lossy(&head(&mut c)).into_owned(), c)
+    };
+    // A page with no version is told the program's and let go; one that has it is kept.
+    let (first, c) = open("0");
+    assert!(first.starts_with("HTTP/1.1 101"), "{}", first);
+    let version = Page(c).text().expect("the version");
+    let (kept, _kept) = open(&version);
+    assert!(kept.starts_with("HTTP/1.1 101"), "{}", kept);
+    let (second, _) = open(&version);
+    assert!(second.starts_with("HTTP/1.1 503") && second.contains("retry-after: 5"), "{}", second);
+}

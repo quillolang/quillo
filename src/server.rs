@@ -3920,8 +3920,10 @@ fn threads_allowed(workers: usize) {
     if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut r) } != 0 || r.rlim_cur == libc::RLIM_INFINITY {
         return;
     }
-    // Its event loop, the watch, accept and job threads, and a wait thread for each worker.
-    let needs = workers + 1 + 8;
+    // Its event loop, the watch, accept and job threads, a wait thread for each worker, and the one
+    // every page with live data or on a channel shares (FEEDBACK66.md, Q-954; branch q954), where
+    // each such page had a thread of its own, not counted here.
+    let needs = workers + 1 + 9;
     if (r.rlim_cur as usize) < needs {
         eprintln!(
             "quillo: the process limit (ulimit -u) is {}, and this server may use {} threads: requests may wait for a thread; raise it, or give --workers fewer",

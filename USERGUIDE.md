@@ -19,7 +19,7 @@ cargo build --release
 cargo test
 ```
 
-This guide is for Quillo 0.8.3, and [CHANGELOG.md](CHANGELOG.md) says what it changed.
+This guide is for Quillo 0.8.4, and [CHANGELOG.md](CHANGELOG.md) says what it changed.
 Features marked *(since 0.7)* came in 0.7.0. On an older release, read that release's guide:
 https://github.com/quillolang/quillo/blob/v0.7.0/USERGUIDE.md or
 https://github.com/quillolang/quillo/blob/v0.6.0/USERGUIDE.md.
@@ -7951,7 +7951,7 @@ How long a wait may last:
   threads there are`; with none at all, it tries again a few times within a tenth of a
   second (another process may have ended), at most once a second. At
   start, a server whose `ulimit -u` is below what it may use says so: `quillo: the process
-  limit (ulimit -u) is 30, and this server may use 73 threads: requests may wait for a
+  limit (ulimit -u) is 30, and this server may use 74 threads: requests may wait for a
   thread; raise it, or give --workers fewer`.
 - `http.*`: 10 s to connect, 60 s in all (300 s between the parts of a stream). A call to
   a `service` elsewhere: 5 s to connect, 10 s for a try, or its `timeout` (see
@@ -8302,30 +8302,30 @@ exit(total > 0m ? 0 : 3)
 
 Written the way each is usually written, a script is faster than Python's: `bench/vs-python/run.py`
 times twenty everyday programs in both, process start included, and Quillo is ahead in all of
-them. Against Python 3.9 on a 10-core Mac, the median of 3 runs each, on 0.8.3:
+them. Against Python 3.9 on a 10-core Mac, the median of 3 runs each, on 0.8.4:
 
 | | Python | Quillo |
 |---|---:|---:|
-| `fib(35)` | 1.12 s | 0.05 s |
-| a float loop of 50 million | 1.70 s | 0.04 s |
-| a `for` summing 5 million | 0.15 s | 0.10 s |
-| `filter`, `map`, `sum` over 3 million | 0.09 s | 0.08 s |
-| a million `xs = xs \| push(i)` | 0.04 s | 0.02 s |
-| a map of lists, 100,000 pushes | 0.03 s | 0.02 s |
+| `fib(35)` | 1.13 s | 0.05 s |
+| a float loop of 50 million | 1.66 s | 0.04 s |
+| a `for` summing 5 million | 0.13 s | 0.09 s |
+| `filter`, `map`, `sum` over 3 million | 0.09 s | 0.07 s |
+| a million `xs = xs \| push(i)` | 0.04 s | 0.01 s |
+| a map of lists, 100,000 pushes | 0.02 s | 0.02 s |
 | a grid of 1,000 by 1,000, 100,000 writes | 0.02 s | 0.02 s |
-| a field read a million times | 0.04 s | 0.02 s |
-| 300,000 JSON rows grouped | 0.20 s | 0.16 s |
-| word frequency over 1.2 million words | 0.24 s | 0.18 s |
+| a field read a million times | 0.03 s | 0.02 s |
+| 300,000 JSON rows grouped | 0.17 s | 0.15 s |
+| word frequency over 1.2 million words | 0.21 s | 0.15 s |
 | a million counts by an int key | 0.08 s | 0.03 s |
-| a sieve to 2 million | 0.12 s | 0.08 s |
+| a sieve to 2 million | 0.09 s | 0.07 s |
 | `s += "x"` a million times | 0.04 s | 0.01 s |
 | `s[i]` over 300,000 characters | 0.02 s | 0.01 s |
 | a `while` over 200,000 characters | 0.02 s | 0.01 s |
-| 5 million calls of a function ending in `return` | 0.33 s | 0.01 s |
-| 5 million calls of a function with an early `return` | 0.36 s | 0.01 s |
+| 5 million calls of a function ending in `return` | 0.31 s | 0.01 s |
+| 5 million calls of a function with an early `return` | 0.37 s | 0.01 s |
 
-The closest are a map of lists (0.92 of Python's time), `filter`, `map`, `sum` (0.82) and the
-grid's writes (0.80); loops over numbers, lists of them, texts and counts run in machine code
+The closest are a map of lists (0.93 of Python's time), the JSON rows grouped (0.84) and the
+sieve (0.82); loops over numbers, lists of them, texts and counts run in machine code
 (see [Compiled numbers](#compiled-numbers)).
 
 ### Debugging
@@ -8703,9 +8703,10 @@ which file was `built by an older Quillo`.
 policy](#the-policy)). `quillo check --policy policy.toml main.qwe`, run before
 uploading, says what would be refused.
 
-**Threads and `ulimit -u`.** A Quillo server may use [`--workers`](#options-of-quillo-run) + 9 threads (73 with the
-default 64), and on Linux the account's process limit counts them, beside PHP, cron and
-SSH. Give `--workers 8` or so (a host's policy can cap it with `[limits] workers`). At
+**Threads and `ulimit -u`.** A Quillo server may use [`--workers`](#options-of-quillo-run) + 10 threads (74 with the
+default 64), one of them shared by every page with live data or on a channel (before 0.8.4,
+each such page was a thread of its own, a channel's three), and on Linux the account's process
+limit counts them, beside PHP, cron and SSH. Give `--workers 8` or so (a host's policy can cap it with `[limits] workers`). At
 start a server says when `ulimit -u` is below what it may use, and a thread the system
 refuses is said once (see [Concurrency and reloading](#concurrency-and-reloading)).
 

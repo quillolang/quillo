@@ -19,7 +19,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
-  <img src="https://img.shields.io/badge/version-0.8.3-informational.svg" alt="Version 0.8.3">
+  <img src="https://img.shields.io/badge/version-0.8.4-informational.svg" alt="Version 0.8.4">
   <img src="https://img.shields.io/badge/written_in-Rust-orange.svg" alt="Written in Rust">
 </p>
 
@@ -314,17 +314,18 @@ for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; 
 
 ### Test coverage
 
-**Rust: 98.48% of lines** run under the tests (69,426 lines, 1,055 not run), **97.16% of
-regions** (167,193, 4,752 not run).
+**Rust: 98.36% of lines** run under the tests (69,684 lines, 1,142 not run), **97.06% of
+regions** (167,769, 4,932 not run).
 **Browser runtime (`src/client/runtime.js`): 99.89% of lines** (6,311 lines, 7 not run).
-Both were measured together on 2026-11-15 on 0.8.3's code (7d91e2c) on macOS, from 3,699
-tests with Chrome, PostgreSQL and MariaDB included; none failed (four that failed under the
-load passed run alone). runtime.js is as it was in 0.8.2, and of the 266 lines of Rust added
-since, all but 5 run in a test: two match arms the new code cannot reach (escaping stops only
-at the characters it changes; the page's one pass looks only after `<a`, `<s` and `<q`), two
-paths for a system that gives no random bytes, and the error line of a SQLite transaction
-left open, which `db.exec` already prevents. The Rust
-figures are the Lines and Regions columns of `cargo llvm-cov`'s total. A line counts as
+Both were measured together on 2026-11-15 on 0.8.4's code (5f5ac1a) on macOS, from 3,711
+tests with Chrome, PostgreSQL and MariaDB included; none failed (one that failed under the
+load, udp's full queue, passed run alone). runtime.js is as it was in 0.8.3. Of the 571 lines
+of Rust added since, 18 did not run in that run. Tests written since run eight of them (a
+`--watch` page past its places, a long poll ahead of the server, a live page's ping, one gone in
+the middle of a frame, a batch written in parts and to a connection that takes nothing), and four
+went with the code they were in; of the six left, four cannot be reached (a socket that cannot be
+made non-blocking, a blocking read left waiting, a close in a batch) and two are writes that fail
+to a page gone in between. The Rust figures are the Lines and Regions columns of `cargo llvm-cov`'s total. A line counts as
 run when any part of it ran, so `let x = f()?;` is run though `f` never failed; regions
 count each part, which is why they are lower (FEEDBACK49.md). The runtime's is V8's own
 coverage from headless Chrome and every Node a test starts, mapped back to runtime.js's

@@ -1,13 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.8.4 (2026-11-15)
 
 - A page on a channel no longer takes three threads on the server, nor a page with live data one,
   each with memory of its own: their sockets are read and written on one thread that every such
   page shares. 1,000 pages on a channel cost 12 MB, where they cost 562 MB and kept 350 MB after
   they closed; 1,000 with live data 8.5 MB, where they cost 240 MB and kept 206 MB; nothing is kept
   now. A burst to three pages on a channel costs half the CPU it did, one to 1,000 pages a
-  hundredth, and an answer to a page comes 5% sooner (FEEDBACK66.md, Q-954).
+  hundredth, and an answer to a page comes 5% sooner; a change followed by 1,000 pages with live
+  data costs 71% less. A change told to one page at a time, among many that are quiet, costs
+  about 6,000 cycles more (2 µs), the wake of the one shared thread (FEEDBACK66.md, Q-954).
+- The server counts that thread in the threads it says it may use when `ulimit -u` is low:
+  `--workers` + 10, 74 with the default 64.
 
 ## 0.8.3 (2026-11-15)
 
