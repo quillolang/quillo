@@ -51,5 +51,12 @@ let CHANGE = "<script>document.addEventListener('DOMContentLoaded', () => { docu
 // Listening from the start, as a tool's content script at document_start does.
 let HEAR = "<script>window.__heard = []; document.addEventListener('quillo:devtools', (e) => window.__heard.push(JSON.parse(e.detail)))</script>"
 
-route GET / = <html data-quillo-devtools="1"><head>{raw(HEAR)}{raw(CHANGE)}</head><body><Panel/></body></html>
+route GET / = <html data-quillo-devtools="1"><head>{raw(HEAR)}{raw(CHANGE)}</head><body><Panel/><Theme/></body></html>
 route GET /plain = <html><head>{raw(HEAR)}</head><body><Panel/></body></html>
+
+// The page's state, which a tool hears set and may set (FEEDBACK68.md; branch global-state).
+state theme = "light"
+
+component Theme() {
+    <button id="theme" @click={() => { theme = "dark" }}>{theme}</button>
+}

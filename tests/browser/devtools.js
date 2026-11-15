@@ -27,7 +27,11 @@
     await ask({ id: 6, op: "frob" });
     await ask("not json");
     await ask("null");
+    if ($("#theme")) { $("#theme").click(); await t(200); } // the page's state set (not on /plain)
+    await ask({ id: 7, op: "set", global: true, name: "theme", value: "blue" });
+    await ask({ id: 8, op: "set", global: true, name: "nothing", value: 1 });
     await ask({ op: "list" });
+    out.theme = $("#theme") && $("#theme").textContent;
     out.shown = $("#up").textContent;
     out.said = $(".said").textContent;
     out.heard = window.__heard.filter((m) => m.type !== "answer");

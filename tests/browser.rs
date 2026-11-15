@@ -1535,6 +1535,11 @@ fn a_developer_tool_hears_what_happens() {
         let answers = r["answers"].as_array().unwrap();
         let ok = |n: i64| answers.iter().find(|a| a["id"] == n).map(|a| a["ok"].clone()).unwrap_or_else(|| panic!("no answer {} in {}", n, r));
         assert_eq!((ok(1), ok(2), ok(3), ok(4), ok(5), ok(6)), (true.into(), true.into(), false.into(), dev.into(), false.into(), false.into()));
+        // The page's state: said when set, listed, set by the tool under --watch only (FEEDBACK68.md).
+        assert_eq!((ok(7), ok(8)), (dev.into(), false.into()));
+        assert!(of("global").iter().any(|m| m["name"] == "theme" && m["value"] == "dark"), "{}", r);
+        assert_eq!(of("global").last().map(|m| m["value"].clone()), Some(serde_json::json!(if dev { "blue" } else { "dark" })), "{}", r);
+        assert_eq!(r["theme"], if dev { "blue" } else { "dark" });
         assert_eq!((r["marked"].clone(), r["unmarked"].clone()), (true.into(), true.into()));
         assert_eq!(r["shown"], if dev { "41" } else { "2" });
         assert!(answers.iter().any(|a| a["id"].is_null() && a["ok"] == true), "{}", r);
