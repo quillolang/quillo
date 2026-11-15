@@ -1586,6 +1586,10 @@ impl Loop {
             Ok(CoroutineResult::Return(end)) => {
                 let r = self.tasks[id].take().expect("running");
                 self.free_tasks.push(id);
+                // Its page states go with it (FEEDBACK68.md; branch global-state).
+                if matches!(r.owner, Owner::Conn(_)) {
+                    crate::value::page_end(r.request);
+                }
                 match (end, r.owner) {
                     (End::Request(done), Owner::Conn(slot)) => {
                         if self.stacks.len() < SPARE_STACKS {
@@ -1632,6 +1636,9 @@ impl Loop {
                 // the child), keep serving.
                 let r = self.tasks[id].take().expect("running");
                 self.free_tasks.push(id);
+                if matches!(r.owner, Owner::Conn(_)) {
+                    crate::value::page_end(r.request);
+                }
                 eprintln!("quillo: internal error (a bug in Quillo) while answering a request");
                 match r.owner {
                     Owner::Conn(slot) => {

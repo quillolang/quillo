@@ -2698,36 +2698,68 @@ pub fn is_page_state(v: &Value) -> bool {
     matches!(v, Value::Builtin(n, _) if *n == PAGE_STATE)
 }
 
+/// A request's page states (none: a request for no page), and how many reads of one it has made:
+/// a view whose render read one is not cached, and a component whose render read one starts with
+/// the page.
+#[derive(Default)]
+struct PageRequest {
+    values: Option<HashMap<(usize, Sym), Value>>,
+    reads: u64,
+}
+
 thread_local! {
-    /// The running request's page states (none outside a request for a page), and how many
-    /// reads of one there have been on this thread: a view whose render read one is not cached,
-    /// and a component whose render read one starts with the page.
-    static PAGE: std::cell::RefCell<Option<HashMap<(usize, Sym), Value>>> = const { std::cell::RefCell::new(None) };
-    static PAGE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// By request (`httpd::request_number`): requests are tasks that share a thread, one running
+    /// while another waits (`sleep`, a password's hash, a fetch), and a value kept for the thread
+    /// went to the request that ran next (found in review: four visitors got one's name, and a
+    /// server fn's call made a waiting page's read fail). A `parallel` call's tasks are the
+    /// request's. Taken away when the request ends (`page_end`).
+    static PAGE: std::cell::RefCell<HashMap<usize, PageRequest>> = std::cell::RefCell::new(HashMap::new());
+}
+
+fn page_here<R>(f: impl FnOnce(&mut PageRequest) -> R) -> R {
+    let n = crate::httpd::request_number();
+    PAGE.with(|p| f(p.borrow_mut().entry(n).or_default()))
 }
 
 /// The request's value of a page state; outside a request for a page, the slot as it is (which
 /// `Interp::eval` says runs for no page).
 #[cold]
 fn page_value(root: &Scope, name: Sym, slot: &Value) -> Value {
-    PAGE_READS.with(|r| r.set(r.get() + 1));
-    PAGE.with(|p| p.borrow().as_ref().and_then(|m| m.get(&(root as *const Scope as usize, name)).cloned())).unwrap_or_else(|| slot.clone())
+    page_here(|r| {
+        r.reads += 1;
+        r.values.as_ref().and_then(|m| m.get(&(root as *const Scope as usize, name)).cloned())
+    })
+    .unwrap_or_else(|| slot.clone())
 }
 
-/// Starts a request's page states afresh (`Some`), or says this request is for no page (`None`).
+/// Starts the running request's page states afresh (`Some`), or says it is for no page (`None`).
 pub fn page_begin(values: Option<Vec<(Env, Sym, Value)>>) {
-    PAGE.with(|p| *p.borrow_mut() = values.map(|vs| vs.into_iter().map(|(g, n, v)| ((&*g as *const Scope as usize, n), v)).collect()));
+    let values = values.map(|vs| vs.into_iter().map(|(g, n, v)| ((&*g as *const Scope as usize, n), v)).collect());
+    page_here(|r| *r = PageRequest { values, reads: 0 });
 }
 
-/// The reads of page states on this thread so far.
+/// The request numbered `n` has ended: its page states go.
+pub fn page_end(n: usize) {
+    PAGE.with(|p| {
+        if let Ok(mut m) = p.try_borrow_mut() {
+            m.remove(&n);
+        }
+    });
+}
+
+/// The running request's reads of page states so far.
 pub fn page_reads() -> u64 {
-    PAGE_READS.with(|r| r.get())
+    let n = crate::httpd::request_number();
+    PAGE.with(|p| p.borrow().get(&n).map_or(0, |r| r.reads))
 }
 
-/// The request's page states of `globals`, by name, for the page to carry.
+/// The running request's page states of `globals`, by name, for the page to carry.
 pub fn page_values(globals: &Env) -> Vec<(Sym, Value)> {
     let root = &**globals as *const Scope as usize;
-    PAGE.with(|p| p.borrow().as_ref().map(|m| m.iter().filter(|((r, _), _)| *r == root).map(|((_, n), v)| (*n, v.clone())).collect()).unwrap_or_default())
+    let n = crate::httpd::request_number();
+    PAGE.with(|p| {
+        p.borrow().get(&n).and_then(|r| r.values.as_ref()).map(|m| m.iter().filter(|((r, _), _)| *r == root).map(|((_, n), v)| (*n, v.clone())).collect()).unwrap_or_default()
+    })
 }
 
 /// Sets the page state `name` of `globals` for this request, as its initializer gives it.
@@ -2737,13 +2769,15 @@ pub fn page_put(globals: &Env, name: Sym, v: Value) {
 
 /// Sets a page state's value for this request: false outside a request for a page.
 fn page_set(root: &Scope, name: Sym, v: Value) -> bool {
-    PAGE_READS.with(|r| r.set(r.get() + 1));
-    PAGE.with(|p| match p.borrow_mut().as_mut() {
-        Some(m) => {
-            m.insert((root as *const Scope as usize, name), v);
-            true
+    page_here(|r| {
+        r.reads += 1;
+        match r.values.as_mut() {
+            Some(m) => {
+                m.insert((root as *const Scope as usize, name), v);
+                true
+            }
+            None => false,
         }
-        None => false,
     })
 }
 

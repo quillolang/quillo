@@ -174,3 +174,66 @@ fn until(secs: u64, mut f: impl FnMut() -> bool) -> bool {
     }
     f()
 }
+
+// Found in review: page states were kept for the thread, and requests are tasks that share one,
+// one running while another waits. Four visitors whose routes wait (a password's hash, a sleep)
+// each got one visitor's name, on the page and in what it carried; a server fn's call while a
+// page waited made that page's read fail. Each request now has its own, a `parallel` call's
+// tasks their request's.
+const WAITS: &str = r#"state me = ""
+component Hello() = <span id="me">{me}</span>
+server fn ping() = "pong"
+route GET /login/:who {
+    me = who
+    let _h = crypto.hash_password("pw")
+    <html><body><div><Hello/></div></body></html>
+}
+route GET /slow/:who {
+    me = who
+    sleep(300)
+    <html><body><div><Hello/></div><p id="after">{me}</p></body></html>
+}
+route GET /both/:who {
+    me = who
+    let got = parallel(() => { sleep(50); return me }, () => me)
+    `${got[0]} ${got[1]}`
+}
+"#;
+
+#[test]
+fn requests_that_wait_keep_their_own_page_state() {
+    let d = dir("waits", WAITS);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let port = s.port;
+    for route in ["login", "slow"] {
+        let names = ["alice", "bob", "carol", "dave", "erin", "frank"];
+        let got: Vec<(String, String)> = names
+            .iter()
+            .map(|n| {
+                let path = format!("/{}/{}", route, n);
+                std::thread::spawn(move || (path.clone(), support::send(port, "GET", &path, &[], "").body))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        for ((path, body), n) in got.iter().zip(names) {
+            assert!(body.contains(&format!("<span id=\"me\">{}</span>", n)), "{}: {}", path, body);
+            assert!(body.contains(&format!("\\\"me\\\":\\\"{}\\\"", n)), "{}: the page carries another's: {}", path, body);
+        }
+    }
+    // A server fn's call, and live data's, while a page waits: the page still has its own.
+    let page = std::thread::spawn(move || support::send(port, "GET", "/slow/alice", &[], "").body);
+    std::thread::sleep(Duration::from_millis(80));
+    for _ in 0..3 {
+        let a = support::send(port, "POST", "/_quillo/rpc/ping", &[("content-type", "application/json"), ("origin", "http://localhost")], "[]");
+        assert_eq!(a.status, 200, "{}", a.body);
+    }
+    let body = page.join().unwrap();
+    assert!(body.contains("<p id=\"after\">alice</p>"), "{}", body);
+    // A `parallel` call's tasks read their request's.
+    let both: Vec<_> = ["x", "y", "z"].iter().map(|n| { let p = format!("/both/{}", n); std::thread::spawn(move || support::send(port, "GET", &p, &[], "").body) }).collect();
+    for (t, n) in both.into_iter().zip(["x", "y", "z"]) {
+        assert_eq!(t.join().unwrap(), format!("{} {}", n, n));
+    }
+}
