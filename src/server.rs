@@ -2280,16 +2280,18 @@ async fn live_page(shared: &Arc<Shared>, mut socket: crate::ws::LiveSocket, bell
     // Looked at too at each ping, in case a wake was lost.
     let mut ping_at = Instant::now() + LIVE_PING;
     let mut next = Instant::now();
-    // The page's one timer, till its next ping: set again once it is done, not each time the ping
-    // moves (each change moves it), which cost a page told of a change at a time more than its
-    // thread did; done before the ping, it is set again for it.
+    // The page's one timer, till its next ping, set again as that moves (each change moves it). Set
+    // only once it was done, its deadline passed before the runtime had fired it left the wait
+    // nothing to wait on, and the task went round with no pause till the ping, holding every page's
+    // thread (found in review); a wait that ends at the ping is now followed by a ping or a change
+    // told, either of which moves it.
     let timer = tokio::time::sleep_until(ping_at.into());
     tokio::pin!(timer);
     loop {
         let (mut seq, mut changed) = if asked {
             following.now(since, server.as_deref())
         } else {
-            if timer.is_elapsed() || timer.deadline() > ping_at.into() {
+            if timer.deadline() != ping_at.into() {
                 timer.as_mut().reset(ping_at.into());
             }
             let waited = tokio::select! {

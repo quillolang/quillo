@@ -571,14 +571,29 @@ async fn first_text(c: &mut impl Conn, max: usize, f: &mut impl FnMut(&[u8])) ->
 /// A waiting page's WebSocket, which a task reads and writes (a page with live data;
 /// FEEDBACK66.md, Q-954; branch q954): what `Socket` is to a thread. What it reads is read with
 /// `Socket`'s own reading (`Conn`); a frame written may take `WRITE_WAIT`.
-pub struct LiveSocket(tokio::net::TcpStream);
+pub struct LiveSocket(tokio::net::TcpStream, Option<std::time::Duration>);
 
 /// How long one frame may take to write to a page that does not read (FEEDBACK49.md, Q-594).
 const WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Conn for LiveSocket {
+    /// Each read may take the wait `heard` or `first_text_parts` was given, as a thread's socket's
+    /// reads each may, not the whole message: a page sending its topics slowly is followed, as it
+    /// was (found in review).
     async fn fill(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
-        tokio::io::AsyncReadExt::read_exact(&mut self.0, buf).await.map(|_| ())
+        let mut at = 0;
+        while at < buf.len() {
+            let read = tokio::io::AsyncReadExt::read(&mut self.0, &mut buf[at..]);
+            let n = match self.1 {
+                Some(wait) => tokio::time::timeout(wait, read).await.map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??,
+                None => read.await?,
+            };
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            at += n;
+        }
+        Ok(())
     }
 
     async fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> bool {
@@ -598,7 +613,7 @@ impl Conn for LiveSocket {
 impl LiveSocket {
     /// A connection whose handshake is done, on the runtime it is to run on.
     pub fn new(s: tokio::net::TcpStream) -> LiveSocket {
-        LiveSocket(s)
+        LiveSocket(s, None)
     }
 
     /// Done when the page has sent something, or hung up.
@@ -636,16 +651,19 @@ impl LiveSocket {
     /// the runtime, so that what it knows of the connection stays true.
     async fn pending(&mut self) -> Option<bool> {
         let mut b = [0u8; 1];
-        match tokio::time::timeout(std::time::Duration::ZERO, self.0.peek(&mut b)).await {
-            Err(_) => Some(false),
-            Ok(Ok(0)) | Ok(Err(_)) => None,
-            Ok(Ok(_)) => Some(true),
+        loop {
+            match tokio::time::timeout(std::time::Duration::ZERO, self.0.peek(&mut b)).await {
+                Err(_) => return Some(false),
+                // Asked again, as a thread's socket asks (found in review).
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Ok(Ok(0)) | Ok(Err(_)) => return None,
+                Ok(Ok(_)) => return Some(true),
+            }
         }
     }
 
-    /// `Socket::heard`, in a task: once a frame has begun, the rest of its message may take
-    /// `wait`. The reading's state (its buffers) is held only while it reads, not in the waiting
-    /// page's task.
+    /// `Socket::heard`, in a task: once a frame has begun, each read of the rest may take `wait`.
+    /// The reading's state (its buffers) is held only while it reads, not in the waiting page's task.
     pub async fn heard(&mut self, max: usize, wait: std::time::Duration, mut f: impl FnMut(&[u8])) -> Heard {
         let got = loop {
             match self.pending().await {
@@ -653,10 +671,13 @@ impl LiveSocket {
                 Some(false) => break Heard::Nothing,
                 Some(true) => {}
             }
-            match tokio::time::timeout(wait, Box::pin(frame_heard(self, max, &mut f))).await {
-                Ok(Ok(Some(h))) => break h,
-                Ok(Ok(None)) => {}
-                _ => break Heard::Gone,
+            self.1 = Some(wait);
+            let read = Box::pin(frame_heard(self, max, &mut f)).await;
+            self.1 = None;
+            match read {
+                Ok(Some(h)) => break h,
+                Ok(None) => {}
+                Err(_) => break Heard::Gone,
             }
         };
         if got == Heard::Gone {
@@ -665,9 +686,12 @@ impl LiveSocket {
         got
     }
 
-    /// `Socket::first_text_parts`, in a task.
+    /// `Socket::first_text_parts`, in a task: each read may take `wait`.
     pub async fn first_text_parts(&mut self, max: usize, wait: std::time::Duration, mut f: impl FnMut(&[u8])) -> bool {
-        matches!(tokio::time::timeout(wait, Box::pin(first_text(self, max, &mut f))).await, Ok(Ok(true)))
+        self.1 = Some(wait);
+        let ok = matches!(Box::pin(first_text(self, max, &mut f)).await, Ok(true));
+        self.1 = None;
+        ok
     }
 }
 
