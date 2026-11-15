@@ -9631,7 +9631,7 @@ fn unstyled_classes(order: &[Item], base: &Path, rules: &[(String, String, u32)]
 
 /// Each element of `el`, itself first, as far as its children go (not
 /// those inside `{...}`).
-/// The expressions in `e` that run later, not while `e` is worked out: an element's handlers, and
+/// The expressions in `e` that run later, not while `e` is worked out: an HTML element's handlers, and
 /// the callbacks of `channel.open`, `every`, `listen`, `run_after` and `receive`. A name a
 /// handler sends on is not shown, and a `js(...)` in a channel's callback is not where its handle
 /// comes from: both made `quillo check` say a page's value was shown, with a fix that did not
@@ -9661,7 +9661,12 @@ pub(crate) fn each_later(e: &Expr, f: &mut dyn FnMut(&Expr)) {
                 args.iter().filter(|a| matches!(a, Expr::Lambda(_))).for_each(&mut *f);
             }
         }
+        // An HTML element's: a view's or a component's `onShow` is a parameter, which it may
+        // call as it is made, on the server (found in review).
         Expr::Html(el, _) => walk_html_els(el, &mut |h| {
+            if !h.tag.starts_with(|c: char| c.is_ascii_lowercase()) {
+                return;
+            }
             for (name, v) in &h.attrs {
                 if let AttrVal::Expr(l @ Expr::Lambda(_)) = v {
                     if name.starts_with('@') || name.starts_with("on") {

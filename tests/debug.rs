@@ -412,3 +412,36 @@ route GET / = <html><body><Counter/></body></html>
     d.call("continue", json!({ "threadId": 1 }));
     assert!(page.join().unwrap().contains("<button>"), "the page was made");
 }
+
+// Q-951, found in review: a view's `on...` parameter is called as the view is made, on the
+// server, so a breakpoint in it stops; an HTML element's handler next to it does not.
+#[test]
+fn a_views_on_parameter_in_a_component_is_the_servers() {
+    let src = r#"view Row(onShow) = <p>{onShow()}</p>
+
+component C() {
+    state n = 0
+    <div>
+        <Row onShow={() => {
+            n + 1
+        }}/>
+        <button onclick={() => {
+            n += 1
+        }}>+</button>
+    </div>
+}
+
+route GET / = <html><body><C/></body></html>
+"#;
+    let dir = program("view-on", &[("main.qwe", src)]);
+    let port = free_port();
+    let (mut d, set) = launch(&dir, port, &[("main.qwe", vec![json!({ "line": 7 }), json!({ "line": 10 })])], json!({}));
+    let verified: Vec<(u64, bool)> = set.iter().map(|b| (b["line"].as_u64().unwrap(), b["verified"].as_bool().unwrap())).collect();
+    assert_eq!(verified, vec![(7, true), (10, false)]);
+    let page = get(port, "/");
+    let s = d.stopped();
+    assert_eq!((s["reason"].as_str(), d.stack()[0].1), (Some("breakpoint"), 7));
+    d.call("setBreakpoints", json!({ "source": { "path": dir.join("main.qwe") }, "breakpoints": [] }));
+    d.call("continue", json!({ "threadId": 1 }));
+    assert!(page.join().unwrap().contains("<p>1</p>"), "the page was made");
+}

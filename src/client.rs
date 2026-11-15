@@ -2361,6 +2361,13 @@ impl<'a> Compiler<'a> {
         js
     }
 
+    /// Whether `name` means something here already, asked without reading it: a local, or a
+    /// name of the program or the language (FEEDBACK66.md, Q-950, found in review; branch
+    /// feedback66).
+    fn known(&self, name: &str) -> bool {
+        self.ctxs.iter().any(|c| c.scopes.iter().any(|s| s.contains_key(name))) || self.globals.contains_key(name) || name == "request" || lookup(&self.it.globals, name).is_some()
+    }
+
     /// Declares `name` as `local` in the innermost scope.
     fn declare_as(&mut self, name: &str, local: Local) {
         self.ctx().scopes.last_mut().unwrap().insert(name.to_string(), local);
@@ -2923,9 +2930,12 @@ impl<'a> Compiler<'a> {
                     // A function in the initializer may use the name it is given, as on the server:
                     // it runs after (`let room = channel.open(..., (m) => room.send(...))`). The
                     // browser's compile said "unknown name" where `quillo check` passed, and the
-                    // server did not start (FEEDBACK66.md, Q-950; branch feedback66).
+                    // server did not start (FEEDBACK66.md, Q-950; branch feedback66). Only a name
+                    // that means nothing else here: one the function would read before the `let`
+                    // is set (`map`'s, called at once) is the one before, as on the server (found
+                    // in review).
                     let own = match p {
-                        Pattern::Bind(n) if named_in_own_fns(n, e) => {
+                        Pattern::Bind(n) if named_in_own_fns(n, e) && !self.known(n) => {
                             let m = self.fresh(n);
                             self.declare_as(n, Local::Reactive(m.clone()));
                             Some(m)
@@ -3058,7 +3068,7 @@ impl<'a> Compiler<'a> {
                     // Declared first when a function in it uses the name (FEEDBACK66.md, Q-950;
                     // branch feedback66).
                     let early = match p {
-                        Pattern::Bind(n) if named_in_own_fns(n, e) => Some(self.declare(n, None)),
+                        Pattern::Bind(n) if named_in_own_fns(n, e) && !self.known(n) => Some(self.declare(n, None)),
                         _ => None,
                     };
                     let before = self.ctx().marks.len();

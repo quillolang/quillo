@@ -866,3 +866,90 @@ fn a_component_on_a_channel_starts_by_itself() {
     assert!(r["h"].as_u64().unwrap() >= 3, "{}", r);
     assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
 }
+
+// Q-950, found in review: a function the initializer calls at once (`map`'s) reads the name as
+// it is before the `let`, an outer local, a parameter or a global, as on the server. Declaring
+// the name first had it read the new one, not yet set ("cannot add int and null", or "Cannot
+// access before initialization" in a component's memo). Only a name that means nothing else is
+// declared first.
+#[test]
+fn a_function_called_at_once_reads_the_name_before_the_let() {
+    let src = r#"let g = 10
+
+component C(p: int) {
+    state n = 0
+    let k = 3
+    let shown = if true {
+        let k = map([1], (x) => x + k)
+        let p = map([1], (x) => x + p)
+        let g = map([1], (x) => x + g)
+        `${k[0]} ${p[0]} ${g[0]}`
+    } else { "" }
+    <div>
+        <p id="k">{shown}</p>
+        <button id="go" onclick={() => {
+            let j = 3
+            if true {
+                let j = map([1], (x) => x + j)
+                let g = map([1], (x) => x + g)
+                n = j[0] + g[0]
+            }
+        }}>go</button>
+        <p id="n">{n}</p>
+    </div>
+}
+
+component D(p: int) {
+    state m = 0
+    let k = 3
+    let k = map([1], (x) => x + k)
+    let p = map([1], (x) => x + p + m)
+    <p id="d" onclick={() => { m = 1 }}>{k[0]} {p[0]}</p>
+}
+
+route GET / = <html><body><div><C p={5}/><D p={5}/></div></body></html>
+"#;
+    let d = dir("at-once", src);
+    let (ok, said) = check(&d);
+    assert!(ok, "{}", said);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let page = support::send(s.port, "GET", "/", &[], "").body;
+    assert!(page.contains(r#"<p id="k">4 6 11</p>"#) && page.contains(">4 6</p>"), "{}", page);
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping the browser half: no Chrome");
+        return;
+    };
+    let script = r#"(async () => {
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  document.getElementById("go").click();
+  document.getElementById("d").click();
+  for (let i = 0; i < 300 && (document.getElementById("n").textContent === "0" || document.getElementById("d").textContent === "4 6"); i++) await tick(30);
+  const QW = window[Symbol.for("quillo")] || {};
+  document.body.dataset.result = JSON.stringify({ k: document.getElementById("k").textContent, n: document.getElementById("n").textContent, d: document.getElementById("d").textContent, remade: QW.remade ?? 0, errors: window.__quilloErrors });
+})();"#;
+    let r = in_chrome(&chrome, &format!("http://127.0.0.1:{}/", s.port), script);
+    assert_eq!((r["k"].as_str(), r["n"].as_str(), r["remade"].as_u64(), &r["errors"]), (Some("4 6 11"), Some("15"), Some(0), &serde_json::json!([])), "{}", r);
+    // D's `p` follows its state: made again in the browser after the click, still the prop's.
+    assert_eq!(r["d"].as_str(), Some("4 7"), "{}", r);
+}
+
+// Q-952, found in review: a view's `on...` parameter is called as the view is made, on the
+// server, so a page value it gives is shown, and warned of; an HTML element's handler is not.
+#[test]
+fn a_views_on_parameter_is_shown_where_it_is_called() {
+    let src = r#"view Row(onShow) = <p>{onShow()}</p>
+
+component C() {
+    state open = true
+    let w = js("Math.abs", -2)
+    let h = js("Math.abs", -3)
+    <div>
+        {if open { <Row onShow={() => w}/> } else { null }}
+        {open && <button onclick={() => { open = h > 0 }}>t</button>}
+    </div>
+}
+
+route GET / = <html><body><C/></body></html>
+"#;
+    assert_eq!(page_value_warnings(src, "view-on"), vec!["w"]);
+}
