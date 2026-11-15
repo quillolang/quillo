@@ -107,7 +107,8 @@ fn what_a_visitor_sends_cannot_add_lines_to_the_log_or_reach_a_terminal() {
         send(s.port, "GET", "/crash/x%0Aquillo:%20error:%20GET%20%2Fadmin%20-%3E%20500", &[], "");
         send(s.port, "GET", "/crash/y%1b%5B2J", &[], "");
         raw(s.port, b"GE\x1b[2JT / HTTP/1.1\r\nHost: x\r\n\r\n");
-        let log = s.wait_for("400");
+        // The bad request's own line: "400" alone was in the port it listened on (24001, on CI).
+        let log = s.wait_for("-> 400");
         assert!(!log.contains('\x1b'), "{}: {:?}", mode, log);
         assert!(!log.lines().any(|l| l.starts_with("quillo: error: GET /admin")), "{}: {}", mode, log);
         if mode == "text" {
