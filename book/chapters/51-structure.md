@@ -336,7 +336,8 @@ The extension's README has Helix's settings, and `quillo dap` for debuggers in o
 editors.
 
 **While it runs**, `quillo run main.qwe --watch` reloads the program when it or any file
-it `use`s changes, and refreshes the pages you have open. Started, or reloaded, while a
+it `use`s changes, and puts the change into the pages you have open, keeping what they hold
+(see [What a save keeps](#what-a-save-keeps)). Started, or reloaded, while a
 file is broken or missing, it watches every file that load read or tried, and the
 folders of those not there, so fixing or making one loads the program; each error is
 said once.

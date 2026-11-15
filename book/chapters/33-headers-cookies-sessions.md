@@ -411,7 +411,9 @@ route POST /logout/everywhere with db {
 
 **The key.** Set `QUILLO_SECRET` to a long random string (`crypto.token()` makes one)
 and use the same one on every server behind a load balancer. Without it a random key is
-made at start, so sessions end when the server restarts. The server warns at start when
+made at start, so sessions end when the server restarts; under `--watch` the key is kept in
+`.quillo/.quillo-secret` beside the program, so a restart while you work keeps you signed in
+*(since 0.8.5)*. The server warns at start when
 the secret is shorter than 32 bytes: a short one can be guessed offline from one signed
 cookie.
 
