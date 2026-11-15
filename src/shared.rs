@@ -262,13 +262,17 @@ fn wake(groups: Vec<Arc<Group>>, pages: usize) {
 pub struct Bell {
     thread: std::sync::OnceLock<std::thread::Thread>,
     rung: AtomicBool,
+    /// What wakes a task that waits on it (`Follower::wait_async`), where no thread is bound: a
+    /// wake while the task is not waiting is kept for its next wait (FEEDBACK66.md, Q-954; branch
+    /// q954).
+    task: tokio::sync::Notify,
 }
 
 impl Bell {
-    /// A bell, for the thread that will wait to `bind` it: made where the request is answered, so
-    /// that a waiting thread allocates no more of its own than it did.
+    /// A bell, for the thread that will wait to `bind` it, or a task: made where the request is
+    /// answered, so that a waiting thread allocates no more of its own than it did.
     pub fn new() -> Arc<Bell> {
-        Arc::new(Bell { thread: std::sync::OnceLock::new(), rung: AtomicBool::new(false) })
+        Arc::new(Bell { thread: std::sync::OnceLock::new(), rung: AtomicBool::new(false), task: tokio::sync::Notify::new() })
     }
 
     /// The bell is this thread's, the one that waits.
@@ -277,8 +281,9 @@ impl Bell {
     }
 
     fn wake(&self) {
-        if let Some(t) = self.thread.get() {
-            t.unpark();
+        match self.thread.get() {
+            Some(t) => t.unpark(),
+            None => self.task.notify_one(),
         }
     }
 
@@ -598,6 +603,68 @@ impl Follower {
             std::thread::park_timeout(left);
             g.parked.fetch_sub(1, SeqCst);
             live = self.shared.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+impl Follower {
+    /// `wait` with no time to wait: where things stand now, for a task (whose bell no thread is
+    /// bound to) as for a thread.
+    pub fn now(&self, since: u64, server: Option<&str>) -> (u64, Vec<String>) {
+        let g = &self.group;
+        let live = self.shared.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if since > 0 && server.map_or(false, |s| s != self.shared.id) {
+            return (live.seq, g.topics.clone());
+        }
+        if since == 0 || since > live.seq {
+            return (live.seq, Vec::new());
+        }
+        (live.seq, g.topics.iter().filter(|t| live.changed_after(t, since)).cloned().collect())
+    }
+
+    /// `wait`, for a task, whose bell no thread is bound to: the same, but asleep on the bell's
+    /// `task` and a timer, not parked (FEEDBACK66.md, Q-954; branch q954).
+    pub async fn wait_async(&self, since: u64, server: Option<&str>, timeout: std::time::Duration) -> (u64, Vec<String>) {
+        let until = tokio::time::sleep(timeout);
+        tokio::pin!(until);
+        self.wait_until(since, server, until).await
+    }
+
+    /// `wait_async`, till `until` is done: a page's own timer, set again rather than made for each
+    /// wait, which cost a page told of a change at a time 10% more than its thread did. Dropped
+    /// while it waits (its task chose something else), it is no longer counted as parked.
+    pub async fn wait_until(&self, since: u64, server: Option<&str>, mut until: std::pin::Pin<&mut tokio::time::Sleep>) -> (u64, Vec<String>) {
+        /// Counted as parked while it lives.
+        struct Parked<'a>(&'a AtomicUsize);
+        impl Drop for Parked<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, SeqCst);
+            }
+        }
+        let g = &self.group;
+        loop {
+            let parked = {
+                let live = self.shared.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if since > 0 && server.map_or(false, |s| s != self.shared.id) {
+                    return (live.seq, g.topics.clone());
+                }
+                if since == 0 || since > live.seq {
+                    return (live.seq, Vec::new());
+                }
+                let now: Vec<String> = g.topics.iter().filter(|t| live.changed_after(t, since)).cloned().collect();
+                if !now.is_empty() || self.bell.rung.load(SeqCst) || until.is_elapsed() || tokio::time::Instant::now() >= until.deadline() {
+                    return (live.seq, now);
+                }
+                // Counted before the lock is let go, so a change made after it rings this group;
+                // a ring before the task waits is kept by `task` till it does.
+                g.parked.fetch_add(1, SeqCst);
+                Parked(&g.parked)
+            };
+            tokio::select! {
+                _ = self.bell.task.notified() => {}
+                _ = until.as_mut() => {}
+            }
+            drop(parked);
         }
     }
 }

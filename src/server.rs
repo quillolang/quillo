@@ -1915,23 +1915,20 @@ const MAX_TOPICS_HEAD: usize = 128;
 /// topics for followed, heard nothing of them (found in review). Not
 /// inlined into the waiting thread's frame, which would hold its reader's buffers (see
 /// `ws::Socket::heard`).
-#[inline(never)]
-fn page_said(socket: &mut crate::ws::Socket) -> PageSaid {
+/// Its reading's buffers are held only while it reads (see `ws::LiveSocket::heard`). The waiting
+/// pages share one thread now, whose memory is used again by the next page, so a large message
+/// no longer has its thread's memory given back after it (FEEDBACK66.md, Q-954; branch q954).
+async fn page_said(socket: &mut crate::ws::LiveSocket) -> PageSaid {
     let mut said = PageSaid::Nothing;
     loop {
         let mut m = NewTopics::default();
-        match socket.heard(MAX_TOPICS_HEAD + MAX_TOPICS_TEXT, Duration::from_secs(10), |part| m.take(part)) {
+        match socket.heard(MAX_TOPICS_HEAD + MAX_TOPICS_TEXT, Duration::from_secs(10), |part| m.take(part)).await {
             crate::ws::Heard::Nothing => return said,
             crate::ws::Heard::Gone => return PageSaid::Gone,
             crate::ws::Heard::Text(false) => {}
             crate::ws::Heard::Text(true) => {
-                let big = m.size > 1 << 16;
                 if let Some((since, server, topics)) = m.end() {
                     said = PageSaid::Topics(since, server, topics);
-                }
-                if big {
-                    // SAFETY: mimalloc's own call, for this thread's heap, as after the first message.
-                    unsafe { libmimalloc_sys::mi_collect(true) };
                 }
             }
         }
@@ -2017,9 +2014,10 @@ fn live_tenant(app: &App, req: &HttpRequest, path: &str) -> (bool, Option<String
     (true, it.tenant().map(|t| t.to_string()))
 }
 
-/// Most pages that can wait for changes at once (live data and `--watch`
-/// reloads). Each has a thread; beyond this, pages are told to try later
-/// rather than let anyone with a browser start threads without end.
+/// Most pages that can wait for changes at once (live data, channels and `--watch` reloads).
+/// Beyond this, pages are told to try later rather than let anyone with a browser hold
+/// connections without end: a page with live data or on a channel is a task now (FEEDBACK66.md,
+/// Q-954; branch q954), but each still holds a descriptor, and `--watch`'s pages a thread.
 pub const MAX_WAITERS: usize = 4096;
 
 /// Stack for the threads that wait for changes; they run no Quillo code.
@@ -2177,9 +2175,9 @@ fn live_json(shared: &Shared, seq: u64, changed: &[String], takes: bool) -> Stri
     serde_json::json!({ "seq": seq, "server": shared.id, "changed": changed }).to_string()
 }
 
-/// How often a waiting page's socket is looked at where it cannot be watched (see
-/// `ws::Socket::watch`), how often it is pinged, and how long after a change the next may go.
-const LIVE_LOOK: Duration = Duration::from_secs(5);
+/// How often a waiting page is pinged (and what it sent looked at, in case a wake was lost), and
+/// how long after a change the next may go. A socket is no longer looked at every 5 s where it
+/// cannot be watched: the pages' runtime watches every one (FEEDBACK66.md, Q-954; branch q954).
 const LIVE_PING: Duration = Duration::from_secs(20);
 const LIVE_GATHER: Duration = Duration::from_millis(100);
 
@@ -2189,7 +2187,7 @@ const LIVE_GATHER: Duration = Duration::from_millis(100);
 /// plain request, the answer is the first change, or none after a while.
 fn serve_live(shared: Arc<Shared>, req: HttpRequest, (tenants, tenant): (bool, Option<String>)) -> Answer {
     let qs = req.url.split_once('?').map_or("", |(_, q)| q);
-    let (mut since, server, topics, later) = live_query(qs);
+    let (since, server, topics, later) = live_query(qs);
     // `tk=1`: the page asks whether its socket takes topics, and is told at once (see `live_json`).
     let tk = parse_urlencoded(qs).get("tk").is_some_and(|v| v.display() == "1");
     // Topics too many or too long for an address come after it: the first message of the socket,
@@ -2203,105 +2201,149 @@ fn serve_live(shared: Arc<Shared>, req: HttpRequest, (tenants, tenant): (bool, O
     } else {
         topics
     };
-    // The waiting thread's bell, and what its socket rings it with: made here (see `Bell::new`).
+    // The page's bell, which a change to what it follows rings: made here (see `Bell::new`). A
+    // waiting page is a task on the pages' runtime, where it was a thread, 240 KB a page, most of
+    // it kept after the page closed (FEEDBACK66.md, Q-954; branch q954); the handshake's answer
+    // is made here, so that the task holds none of the request.
     let bell = crate::shared::Bell::new();
-    let ring: Arc<dyn Fn() + Send + Sync> = {
-        let bell = bell.clone();
-        Arc::new(move || bell.ring())
+    let answer = upgrade.then(|| crate::ws::handshake(&req));
+    let place = match waiting_place(&req.remote) {
+        Ok(p) => p,
+        Err(refused) => return refused,
     };
-    waiter("quillo-live", &req.remote.clone(), move |stream| {
-        let _page = crate::metrics::LivePage::new();
-        bell.bind();
-        if upgrade {
-            let Some(mut socket) = crate::ws::Socket::accept(&req, stream) else { return };
+    Answer::Detach(Box::new(move |stream, mut before| {
+        // With no runtime (none could be made), or a connection the runtime cannot take, the page
+        // is hung up on, and asks again.
+        let Some(rt) = crate::wt::pages() else { return };
+        if stream.set_nonblocking(true).is_err() {
+            return;
+        }
+        rt.spawn(async move {
+            let _place = place;
+            let _page = crate::metrics::LivePage::new();
+            let Ok(mut stream) = tokio::net::TcpStream::from_std(stream) else { return };
+            let own = |topics| own_topics(topics, tenants, tenant.as_deref());
+            let Some(answer) = answer else {
+                // A long poll: what changed within 25 s, after the answers before it on its
+                // connection, which go at once, not held for the 25 s (found by its test).
+                if !before.is_empty() {
+                    if !matches!(tokio::time::timeout(Duration::from_secs(30), tokio::io::AsyncWriteExt::write_all(&mut stream, &before)).await, Ok(Ok(()))) {
+                        return;
+                    }
+                    before.clear();
+                }
+                let following = shared.follow(own(topics), &bell);
+                let (seq, changed) = following.wait_async(since, server.as_deref(), Duration::from_secs(25)).await;
+                drop(following);
+                let mut resp = json_response(200, serde_json::from_str(&live_json(&shared, seq, &changed, false)).unwrap_or_default());
+                resp.headers.push(("cache-control".into(), "no-store".into()));
+                crate::httpd::write_response(&mut before, &resp, false, true);
+                let _ = tokio::time::timeout(Duration::from_secs(30), tokio::io::AsyncWriteExt::write_all(&mut stream, &before)).await;
+                return;
+            };
+            // Earlier answers on this connection, then the handshake's, or its refusal.
+            let upgraded = answer.is_ok();
+            before.extend_from_slice(answer.as_ref().map_or_else(|r| r.as_bytes(), |a| a.as_bytes()));
+            let wrote = tokio::time::timeout(Duration::from_secs(30), tokio::io::AsyncWriteExt::write_all(&mut stream, &before)).await;
+            if !upgraded || !matches!(wrote, Ok(Ok(()))) {
+                return;
+            }
+            drop(before);
+            let mut socket = crate::ws::LiveSocket::new(stream);
             let topics = if later {
                 let mut read = TopicReader::default();
-                if !socket.first_text_parts(MAX_TOPICS_TEXT, Duration::from_secs(10), |part| read.take(part)) {
+                if !socket.first_text_parts(MAX_TOPICS_TEXT, Duration::from_secs(10), |part| read.take(part)).await {
                     return;
                 }
                 read.end()
             } else {
                 topics
             };
-            // The bell is rung by a change to what the page follows and by its socket the
-            // moment the page sends something: a close is answered at once, and topics sent down
-            // the socket are followed at once, where a page that moved opened a socket for each
-            // page and closed the last, each close answered by nothing until the next look, 5 s
-            // on (FEEDBACK61.md, Q-900; branch feedback61).
-            let mut following = shared.follow(own_topics(topics, tenants, tenant.as_deref()), &bell);
-            if later {
-                // SAFETY: mimalloc's own call, for this thread's heap.
-                unsafe { libmimalloc_sys::mi_collect(true) };
+            live_page(&shared, socket, &bell, own(topics), (since, server, tk), &own).await;
+        });
+    }))
+}
+
+/// A page with live data, on its WebSocket, as a task: told of each change to what it follows, and
+/// of new topics it sends down the socket, at once. The socket is heard the moment the page sends
+/// something: a close is answered at once, and topics sent down it are followed at once, where a
+/// page that moved opened a socket for each page and closed the last, each close answered by
+/// nothing until the next look, 5 s on (FEEDBACK61.md, Q-900; branch feedback61). Every socket is
+/// watched now, as the runtime watches it, so the page is told at once that its socket takes topics.
+async fn live_page(shared: &Arc<Shared>, mut socket: crate::ws::LiveSocket, bell: &Arc<crate::shared::Bell>, topics: Vec<String>, (mut since, mut server, tk): (u64, Option<String>, bool), own: &impl Fn(Vec<String>) -> Vec<String>) {
+    let mut following = shared.follow(topics, bell);
+    // The page is yet to be told that its socket takes topics: at once if it asks (`tk=1`), in its
+    // first message otherwise.
+    let mut takes = true;
+    // The page sent topics, or asked whether it may, and is answered at once with where things stand.
+    let mut asked = tk;
+    // Looked at too at each ping, in case a wake was lost.
+    let mut ping_at = Instant::now() + LIVE_PING;
+    let mut next = Instant::now();
+    // The page's one timer, till its next ping: set again once it is done, not each time the ping
+    // moves (each change moves it), which cost a page told of a change at a time more than its
+    // thread did; done before the ping, it is set again for it.
+    let timer = tokio::time::sleep_until(ping_at.into());
+    tokio::pin!(timer);
+    loop {
+        let (mut seq, mut changed) = if asked {
+            following.now(since, server.as_deref())
+        } else {
+            if timer.is_elapsed() || timer.deadline() > ping_at.into() {
+                timer.as_mut().reset(ping_at.into());
             }
-            // A page that does not read is let go, not waited on for good (FEEDBACK49.md,
-            // Q-594; found in review).
-            socket.write_timeout(Duration::from_secs(30));
-            let watched = socket.watch(ring);
-            let mut server = server;
-            // The page is yet to be told that its socket takes topics: only where it is watched,
-            // where they are read at once; told at once if it asks (`tk=1`), in its first message
-            // otherwise.
-            let mut takes = watched;
-            // The page sent topics, or asked whether it may, and is answered at once with where
-            // things stand.
-            let mut asked = watched && tk;
-            // Looked at too now and then: every 5 s where it is not watched, and at each ping
-            // where it is, in case a wake was lost.
-            let look_every = if watched { LIVE_PING } else { LIVE_LOOK };
-            let mut ping_at = Instant::now() + LIVE_PING;
-            let mut look_at = Instant::now() + look_every;
-            let mut next = Instant::now();
-            loop {
-                let wait = if asked { Duration::ZERO } else { ping_at.min(look_at).saturating_duration_since(Instant::now()) };
-                let (mut seq, mut changed) = following.wait(since, server.as_deref(), wait);
-                if bell.take() || Instant::now() >= look_at {
-                    look_at = Instant::now() + look_every;
-                    match page_said(&mut socket) {
-                        PageSaid::Gone => return,
-                        PageSaid::Nothing => {}
-                        PageSaid::Topics(s, srv, topics) => {
-                            following = shared.follow(own_topics(topics, tenants, tenant.as_deref()), &bell);
-                            (since, server, asked) = (s, srv, true);
-                            continue;
-                        }
-                    }
+            let waited = tokio::select! {
+                r = following.wait_until(since, server.as_deref(), timer.as_mut()) => Some(r),
+                _ = socket.readable() => None,
+            };
+            match waited {
+                Some(r) => r,
+                None => {
+                    bell.ring();
+                    following.now(since, server.as_deref())
                 }
-                // A page that did not know the sequence number, or knew one
-                // from another server or from before a restart, is told the
-                // current one.
-                if !asked && changed.is_empty() && since != 0 && since <= seq && server.is_none() {
-                    if Instant::now() >= ping_at {
-                        if !socket.ping() {
-                            return;
-                        }
-                        ping_at = Instant::now() + LIVE_PING;
-                    }
-                } else {
-                    asked = false;
-                    // The first change goes at once; what follows it closely is
-                    // gathered into one frame, so a burst of writes is one
-                    // refresh (FEEDBACK24.md, Q-190; branch feedback24-fixes).
-                    let early = next.saturating_duration_since(Instant::now());
-                    if !early.is_zero() {
-                        std::thread::sleep(early);
-                        (seq, changed) = following.wait(since, server.as_deref(), Duration::ZERO);
-                    }
-                    if !socket.send(&live_json(&shared, seq, &changed, std::mem::take(&mut takes))) {
-                        return;
-                    }
-                    next = Instant::now() + LIVE_GATHER + Duration::from_millis(fastrand::u64(..50));
-                    ping_at = Instant::now() + LIVE_PING;
+            }
+        };
+        if bell.take() || Instant::now() >= ping_at {
+            match page_said(&mut socket).await {
+                PageSaid::Gone => return,
+                PageSaid::Nothing => {}
+                PageSaid::Topics(s, srv, topics) => {
+                    following = shared.follow(own(topics), bell);
+                    (since, server, asked) = (s, srv, true);
+                    continue;
                 }
-                since = seq;
-                server = None;
             }
         }
-        let following = shared.follow(own_topics(topics, tenants, tenant.as_deref()), &bell);
-        let (seq, changed) = following.wait(since, server.as_deref(), Duration::from_secs(25));
-        let mut resp = json_response(200, serde_json::from_str(&live_json(&shared, seq, &changed, false)).unwrap_or_default());
-        resp.headers.push(("cache-control".into(), "no-store".into()));
-        send_on(stream, resp);
-    })
+        // A page that did not know the sequence number, or knew one
+        // from another server or from before a restart, is told the
+        // current one.
+        if !asked && changed.is_empty() && since != 0 && since <= seq && server.is_none() {
+            if Instant::now() >= ping_at {
+                if !socket.ping().await {
+                    return;
+                }
+                ping_at = Instant::now() + LIVE_PING;
+            }
+        } else {
+            asked = false;
+            // The first change goes at once; what follows it closely is
+            // gathered into one frame, so a burst of writes is one
+            // refresh (FEEDBACK24.md, Q-190; branch feedback24-fixes).
+            let early = next.saturating_duration_since(Instant::now());
+            if !early.is_zero() {
+                tokio::time::sleep(early).await;
+                (seq, changed) = following.now(since, server.as_deref());
+            }
+            if !socket.send(&live_json(shared, seq, &changed, std::mem::take(&mut takes))).await {
+                return;
+            }
+            next = Instant::now() + LIVE_GATHER + Duration::from_millis(fastrand::u64(..50));
+            ping_at = Instant::now() + LIVE_PING;
+        }
+        since = seq;
+        server = None;
+    }
 }
 
 /// A page's channels over a WebSocket (where WebTransport cannot be had), as tasks on the pages'

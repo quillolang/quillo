@@ -66,18 +66,16 @@ stack; each request's coroutine reserves as much, and grows as it needs), up to
 reach 260 threads), one thread for PostgreSQL's pipelined connections (half the
 instances, at least two, with `--instances`), a pool of one less than the cores (at most
 31) for long lists, up to four for images, one for scheduled jobs, one for calls made
-later, one for [`--watch`](#options-of-quillo-run), one for the WebSockets of every page on a channel, and one for each channel and [`--with`](#options-of-quillo-run) command. Memory is not
+later, one for [`--watch`](#options-of-quillo-run), one for the sockets of every page with live data or on a channel, and one for each channel and [`--with`](#options-of-quillo-run) command. Memory is not
 limited by anything configurable: the allocator is mimalloc on the loops and the waiting
 threads, the system's elsewhere.
 
-Each page with live data is a thread with 256 KiB of stack reserved, of which it touches
-little, and two file descriptors, a socket and a connection. Quillo takes all the
-descriptors the system allows when it starts, and says so in the log if that is too few
-for 4096 pages; `ulimit -n`, or `LimitNOFILE=` under systemd, raises what is allowed.
-
-A page on a channel takes no thread of its own: its WebSocket is read and written on the one
-thread all those pages share, and costs a few kilobytes and one descriptor while it is open
-(1,000 pages, 12 MB in all), all given back when it closes. A page over WebTransport is the same.
+A page with live data, or on a channel, takes no thread of its own: its socket is read and
+written on the one thread all those pages share, and costs a few kilobytes and one file
+descriptor while it is open (1,000 pages with live data, 8.5 MB in all; 1,000 on a channel,
+12 MB), all given back when it closes. A page on a channel over WebTransport is the same. Quillo
+takes all the descriptors the system allows when it starts, and says so in the log if that is too
+few for 4096 pages; `ulimit -n`, or `LimitNOFILE=` under systemd, raises what is allowed.
 
 With [`--watch`](#options-of-quillo-run) (`quillo run main.qwe --watch`), a change to the program or a `use`d file reloads it (starting its
 state afresh) and refreshes open pages. [`--reload`](#options-of-quillo-run) reloads it the same way without

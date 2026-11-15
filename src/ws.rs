@@ -121,7 +121,7 @@ impl Socket {
                 }
                 timed = true;
             }
-            match self.frame_heard(max, &mut f) {
+            match now(frame_heard(&mut Blocking(self), max, &mut f)) {
                 Ok(Some(h)) => break h,
                 Ok(None) => {}
                 Err(_) => break Heard::Gone,
@@ -156,125 +156,6 @@ impl Socket {
         }
     }
 
-    /// One frame of the page's, and for a text message's first, the rest of the message; what
-    /// `heard` says of it, or `None` to read on.
-    #[inline(never)]
-    fn frame_heard(&mut self, max: usize, f: &mut impl FnMut(&[u8])) -> std::io::Result<Option<Heard>> {
-        let (fin, op, mask, len) = self.frame_head()?;
-        if op & 0x8 != 0 {
-            return self.control(op, mask, len).map(|gone| gone.then_some(Heard::Gone));
-        }
-        // A message's first frame, text and masked, is read; the rest is passed over.
-        if op != 0x1 || mask.is_none() {
-            self.skip(len)?;
-            return Ok((op == 0x1).then_some(Heard::Text(false)));
-        }
-        let (mut taken, mut total, mut fin, mut mask, mut len) = (true, 0u64, fin, mask, len);
-        loop {
-            total = total.saturating_add(len);
-            // Longer than it may be: the connection is failed with 1009 (message too big), unread,
-            // as a first message too long is, where it was passed over and its page, which took it
-            // for followed, never heard of its topics (found in review of FEEDBACK61.md, Q-900;
-            // branch feedback61).
-            if taken && total > max as u64 {
-                self.ending(Some(1009));
-                return Ok(Some(Heard::Gone));
-            }
-            match (taken, mask) {
-                (true, Some(m)) => self.unmasked(len, m, f)?,
-                _ => self.skip(len)?,
-            }
-            if fin {
-                return Ok(Some(Heard::Text(taken)));
-            }
-            // Its next part; control frames may come between the parts.
-            loop {
-                let (next_fin, op, next_mask, next_len) = self.frame_head()?;
-                if op & 0x8 != 0 {
-                    if self.control(op, next_mask, next_len)? {
-                        return Ok(Some(Heard::Gone));
-                    }
-                    continue;
-                }
-                if op != 0x0 {
-                    // A new message before this one ended: this one is passed over, and so is that.
-                    self.skip(next_len)?;
-                    return Ok(Some(Heard::Text(false)));
-                }
-                (fin, mask, len) = (next_fin, next_mask, next_len);
-                if mask.is_none() {
-                    taken = false;
-                }
-                break;
-            }
-        }
-    }
-
-    /// A frame's head: whether it ends its message, its opcode, its mask (none if not masked), and
-    /// its length. A frame with reserved bits set counts as not masked: it is passed over.
-    fn frame_head(&mut self) -> std::io::Result<(bool, u8, Option<[u8; 4]>, u64)> {
-        let mut r = &self.0;
-        let mut head = [0u8; 2];
-        r.read_exact(&mut head)?;
-        let len = match head[1] & 0x7f {
-            126 => {
-                let mut b = [0u8; 2];
-                r.read_exact(&mut b)?;
-                u16::from_be_bytes(b) as u64
-            }
-            127 => {
-                let mut b = [0u8; 8];
-                r.read_exact(&mut b)?;
-                u64::from_be_bytes(b)
-            }
-            n => n as u64,
-        };
-        let mut mask = None;
-        if head[1] & 0x80 != 0 {
-            let mut m = [0u8; 4];
-            r.read_exact(&mut m)?;
-            mask = Some(m);
-        }
-        Ok((head[0] & 0x80 != 0, head[0] & 0x0f, mask.filter(|_| head[0] & 0x70 == 0), len))
-    }
-
-    /// A control frame: a ping answered, a pong (or one the page may not send) dropped, a close
-    /// answered. True if the page has gone.
-    fn control(&mut self, op: u8, mask: Option<[u8; 4]>, len: u64) -> std::io::Result<bool> {
-        // Longer than a control frame may be (RFC 6455 §5.5): the connection is failed with 1002,
-        // where it was passed over and a close of 126 bytes went unanswered (found in review of
-        // FEEDBACK61.md, Q-900; branch feedback61).
-        if len > 125 {
-            self.ending(Some(1002));
-            return Ok(true);
-        }
-        let mut data = [0u8; 125];
-        let data = &mut data[..len as usize];
-        (&self.0).read_exact(data)?;
-        for (i, b) in data.iter_mut().enumerate() {
-            *b ^= mask.map_or(0, |m| m[i % 4]);
-        }
-        match op {
-            0x8 => {
-                self.closing(data);
-                Ok(true)
-            }
-            0x9 => Ok(!self.pong(data)),
-            _ => Ok(false),
-        }
-    }
-
-    /// The answer to the page's close: its code (none if it gave none), or 1002 for one a page may
-    /// not send; then the connection is shut.
-    fn closing(&mut self, theirs: &[u8]) {
-        let code = match theirs {
-            [] => None,
-            [a, b, ..] => Some(u16::from_be_bytes([*a, *b])).filter(|c| matches!(c, 1000..=1003 | 1007..=1014 | 3000..=4999)).or(Some(1002)),
-            [_] => Some(1002),
-        };
-        self.ending(code);
-    }
-
     /// A close of `code` (none: a close with no code), then the connection shut.
     fn ending(&mut self, code: Option<u16>) {
         self.write_timeout(std::time::Duration::from_secs(2));
@@ -283,35 +164,6 @@ impl Socket {
             None => self.frame(0x8, &[]),
         };
         let _ = self.0.shutdown(std::net::Shutdown::Both);
-    }
-
-    /// `len` bytes of a frame, unmasked and given to `f` a part at a time.
-    fn unmasked(&mut self, len: u64, mask: [u8; 4], f: &mut impl FnMut(&[u8])) -> std::io::Result<()> {
-        let mut buf = [0u8; 4096];
-        let (mut left, mut at) = (len, 0usize);
-        while left > 0 {
-            let n = (left as usize).min(buf.len());
-            (&self.0).read_exact(&mut buf[..n])?;
-            for (i, b) in buf[..n].iter_mut().enumerate() {
-                *b ^= mask[(at + i) % 4];
-            }
-            f(&buf[..n]);
-            left -= n as u64;
-            at += n;
-        }
-        Ok(())
-    }
-
-    /// `len` bytes of a frame, read and dropped.
-    fn skip(&mut self, len: u64) -> std::io::Result<()> {
-        let mut buf = [0u8; 1024];
-        let mut left = len;
-        while left > 0 {
-            let n = (left as usize).min(buf.len());
-            (&self.0).read_exact(&mut buf[..n])?;
-            left -= n as u64;
-        }
-        Ok(())
     }
 
     pub fn send(&mut self, text: &str) -> bool {
@@ -345,54 +197,7 @@ impl Socket {
         if self.0.set_read_timeout(Some(wait)).is_err() {
             return false;
         }
-        let ok = (|| -> std::io::Result<bool> {
-            let mut r = &self.0;
-            let (mut total, mut first) = (0u64, true);
-            loop {
-                let mut head = [0u8; 2];
-                r.read_exact(&mut head)?;
-                let (fin, opcode) = (head[0] & 0x80 != 0, head[0] & 0x0f);
-                // Text, then its continuations, masked, as a page sends them; nothing else first.
-                if head[0] & 0x70 != 0 || head[1] & 0x80 == 0 || opcode != if first { 0x1 } else { 0x0 } {
-                    return Ok(false);
-                }
-                first = false;
-                let len = match head[1] & 0x7f {
-                    126 => {
-                        let mut b = [0u8; 2];
-                        r.read_exact(&mut b)?;
-                        u16::from_be_bytes(b) as u64
-                    }
-                    127 => {
-                        let mut b = [0u8; 8];
-                        r.read_exact(&mut b)?;
-                        u64::from_be_bytes(b)
-                    }
-                    n => n as u64,
-                };
-                total = total.saturating_add(len);
-                if total > max as u64 {
-                    return Ok(false);
-                }
-                let mut mask = [0u8; 4];
-                r.read_exact(&mut mask)?;
-                let mut buf = [0u8; 4096];
-                let (mut left, mut at) = (len as usize, 0usize);
-                while left > 0 {
-                    let n = left.min(buf.len());
-                    r.read_exact(&mut buf[..n])?;
-                    for (i, b) in buf[..n].iter_mut().enumerate() {
-                        *b ^= mask[(at + i) % 4];
-                    }
-                    f(&buf[..n]);
-                    (left, at) = (left - n, at + n);
-                }
-                if fin {
-                    return Ok(true);
-                }
-            }
-        })()
-        .unwrap_or(false);
+        let ok = now(first_text(&mut Blocking(self), max, &mut f)).unwrap_or(false);
         let _ = self.0.set_read_timeout(None);
         ok
     }
@@ -541,6 +346,328 @@ impl Socket {
             let _ = self.0.set_write_timeout(Some(wait));
         }
         ok
+    }
+}
+
+/// A future whose every step is done when it is asked for (a reading that blocks), finished: the
+/// sync side of a reading written once for both (see `Conn`).
+fn now<T>(f: impl std::future::Future<Output = T>) -> T {
+    let mut f = std::pin::pin!(f);
+    match f.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+        std::task::Poll::Ready(t) => t,
+        std::task::Poll::Pending => unreachable!("a blocking read is never left waiting"),
+    }
+}
+
+/// Where a waiting page's frames are read and the answers to its control frames written: a socket
+/// a thread reads as it blocks (`Socket`, through `Blocking`), or one a task reads (`LiveSocket`).
+/// What the page's frames mean is written once, below, for both (FEEDBACK66.md, Q-954; branch q954).
+trait Conn {
+    /// As many bytes as `buf` holds.
+    fn fill(&mut self, buf: &mut [u8]) -> impl std::future::Future<Output = std::io::Result<()>>;
+    /// A frame of the server's, written whole within the connection's limit: false if not.
+    fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> impl std::future::Future<Output = bool>;
+    /// A close of `code` (none: a close with no code), written within 2 s, then the connection shut.
+    fn end_with(&mut self, code: Option<u16>) -> impl std::future::Future<Output = ()>;
+}
+
+/// A `Socket`, read and written as it blocks.
+struct Blocking<'a>(&'a mut Socket);
+
+impl Conn for Blocking<'_> {
+    async fn fill(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        (&self.0 .0).read_exact(buf)
+    }
+
+    async fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> bool {
+        self.0.frame(opcode, payload)
+    }
+
+    async fn end_with(&mut self, code: Option<u16>) {
+        self.0.ending(code)
+    }
+}
+
+/// One frame of the page's, and for a text message's first, the rest of the message; what
+/// `heard` says of it, or `None` to read on.
+async fn frame_heard(c: &mut impl Conn, max: usize, f: &mut impl FnMut(&[u8])) -> std::io::Result<Option<Heard>> {
+    let (fin, op, mask, len) = frame_head(c).await?;
+    if op & 0x8 != 0 {
+        return control(c, op, mask, len).await.map(|gone| gone.then_some(Heard::Gone));
+    }
+    // A message's first frame, text and masked, is read; the rest is passed over.
+    if op != 0x1 || mask.is_none() {
+        skip(c, len).await?;
+        return Ok((op == 0x1).then_some(Heard::Text(false)));
+    }
+    let (mut taken, mut total, mut fin, mut mask, mut len) = (true, 0u64, fin, mask, len);
+    loop {
+        total = total.saturating_add(len);
+        // Longer than it may be: the connection is failed with 1009 (message too big), unread,
+        // as a first message too long is, where it was passed over and its page, which took it
+        // for followed, never heard of its topics (found in review of FEEDBACK61.md, Q-900;
+        // branch feedback61).
+        if taken && total > max as u64 {
+            c.end_with(Some(1009)).await;
+            return Ok(Some(Heard::Gone));
+        }
+        match (taken, mask) {
+            (true, Some(m)) => unmasked(c, len, m, f).await?,
+            _ => skip(c, len).await?,
+        }
+        if fin {
+            return Ok(Some(Heard::Text(taken)));
+        }
+        // Its next part; control frames may come between the parts.
+        loop {
+            let (next_fin, op, next_mask, next_len) = frame_head(c).await?;
+            if op & 0x8 != 0 {
+                if control(c, op, next_mask, next_len).await? {
+                    return Ok(Some(Heard::Gone));
+                }
+                continue;
+            }
+            if op != 0x0 {
+                // A new message before this one ended: this one is passed over, and so is that.
+                skip(c, next_len).await?;
+                return Ok(Some(Heard::Text(false)));
+            }
+            (fin, mask, len) = (next_fin, next_mask, next_len);
+            if mask.is_none() {
+                taken = false;
+            }
+            break;
+        }
+    }
+}
+
+/// A frame's head: whether it ends its message, its opcode, its mask (none if not masked), and
+/// its length. A frame with reserved bits set counts as not masked: it is passed over.
+async fn frame_head(c: &mut impl Conn) -> std::io::Result<(bool, u8, Option<[u8; 4]>, u64)> {
+    let mut head = [0u8; 2];
+    c.fill(&mut head).await?;
+    let len = match head[1] & 0x7f {
+        126 => {
+            let mut b = [0u8; 2];
+            c.fill(&mut b).await?;
+            u16::from_be_bytes(b) as u64
+        }
+        127 => {
+            let mut b = [0u8; 8];
+            c.fill(&mut b).await?;
+            u64::from_be_bytes(b)
+        }
+        n => n as u64,
+    };
+    let mut mask = None;
+    if head[1] & 0x80 != 0 {
+        let mut m = [0u8; 4];
+        c.fill(&mut m).await?;
+        mask = Some(m);
+    }
+    Ok((head[0] & 0x80 != 0, head[0] & 0x0f, mask.filter(|_| head[0] & 0x70 == 0), len))
+}
+
+/// A control frame: a ping answered, a pong (or one the page may not send) dropped, a close
+/// answered. True if the page has gone.
+async fn control(c: &mut impl Conn, op: u8, mask: Option<[u8; 4]>, len: u64) -> std::io::Result<bool> {
+    // Longer than a control frame may be (RFC 6455 §5.5): the connection is failed with 1002,
+    // where it was passed over and a close of 126 bytes went unanswered (found in review of
+    // FEEDBACK61.md, Q-900; branch feedback61).
+    if len > 125 {
+        c.end_with(Some(1002)).await;
+        return Ok(true);
+    }
+    let mut data = [0u8; 125];
+    let data = &mut data[..len as usize];
+    c.fill(data).await?;
+    for (i, b) in data.iter_mut().enumerate() {
+        *b ^= mask.map_or(0, |m| m[i % 4]);
+    }
+    match op {
+        0x8 => {
+            // The answer to the page's close: its code (none if it gave none), or 1002 for one a
+            // page may not send; then the connection is shut.
+            let code = match &*data {
+                [] => None,
+                [a, b, ..] => Some(u16::from_be_bytes([*a, *b])).filter(|c| matches!(c, 1000..=1003 | 1007..=1014 | 3000..=4999)).or(Some(1002)),
+                [_] => Some(1002),
+            };
+            c.end_with(code).await;
+            Ok(true)
+        }
+        0x9 => Ok(!c.send_frame(0xA, data).await),
+        _ => Ok(false),
+    }
+}
+
+/// `len` bytes of a frame, unmasked and given to `f` a part at a time.
+async fn unmasked(c: &mut impl Conn, len: u64, mask: [u8; 4], f: &mut impl FnMut(&[u8])) -> std::io::Result<()> {
+    let mut buf = [0u8; 4096];
+    let (mut left, mut at) = (len, 0usize);
+    while left > 0 {
+        let n = (left as usize).min(buf.len());
+        c.fill(&mut buf[..n]).await?;
+        for (i, b) in buf[..n].iter_mut().enumerate() {
+            *b ^= mask[(at + i) % 4];
+        }
+        f(&buf[..n]);
+        left -= n as u64;
+        at += n;
+    }
+    Ok(())
+}
+
+/// `len` bytes of a frame, read and dropped.
+async fn skip(c: &mut impl Conn, len: u64) -> std::io::Result<()> {
+    let mut buf = [0u8; 1024];
+    let mut left = len;
+    while left > 0 {
+        let n = (left as usize).min(buf.len());
+        c.fill(&mut buf[..n]).await?;
+        left -= n as u64;
+    }
+    Ok(())
+}
+
+/// The first message, when it is text of at most `max` bytes (see `Socket::first_text_parts`).
+async fn first_text(c: &mut impl Conn, max: usize, f: &mut impl FnMut(&[u8])) -> std::io::Result<bool> {
+    let (mut total, mut first) = (0u64, true);
+    loop {
+        let mut head = [0u8; 2];
+        c.fill(&mut head).await?;
+        let (fin, opcode) = (head[0] & 0x80 != 0, head[0] & 0x0f);
+        // Text, then its continuations, masked, as a page sends them; nothing else first.
+        if head[0] & 0x70 != 0 || head[1] & 0x80 == 0 || opcode != if first { 0x1 } else { 0x0 } {
+            return Ok(false);
+        }
+        first = false;
+        let len = match head[1] & 0x7f {
+            126 => {
+                let mut b = [0u8; 2];
+                c.fill(&mut b).await?;
+                u16::from_be_bytes(b) as u64
+            }
+            127 => {
+                let mut b = [0u8; 8];
+                c.fill(&mut b).await?;
+                u64::from_be_bytes(b)
+            }
+            n => n as u64,
+        };
+        total = total.saturating_add(len);
+        if total > max as u64 {
+            return Ok(false);
+        }
+        let mut mask = [0u8; 4];
+        c.fill(&mut mask).await?;
+        unmasked(c, len, mask, f).await?;
+        if fin {
+            return Ok(true);
+        }
+    }
+}
+
+/// A waiting page's WebSocket, which a task reads and writes (a page with live data;
+/// FEEDBACK66.md, Q-954; branch q954): what `Socket` is to a thread. What it reads is read with
+/// `Socket`'s own reading (`Conn`); a frame written may take `WRITE_WAIT`.
+pub struct LiveSocket(tokio::net::TcpStream);
+
+/// How long one frame may take to write to a page that does not read (FEEDBACK49.md, Q-594).
+const WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl Conn for LiveSocket {
+    async fn fill(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        tokio::io::AsyncReadExt::read_exact(&mut self.0, buf).await.map(|_| ())
+    }
+
+    async fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> bool {
+        self.write(opcode, payload, WRITE_WAIT).await
+    }
+
+    async fn end_with(&mut self, code: Option<u16>) {
+        let two = std::time::Duration::from_secs(2);
+        match code {
+            Some(c) => self.write(0x8, &c.to_be_bytes(), two).await,
+            None => self.write(0x8, &[], two).await,
+        };
+        let _ = tokio::time::timeout(two, tokio::io::AsyncWriteExt::shutdown(&mut self.0)).await;
+    }
+}
+
+impl LiveSocket {
+    /// A connection whose handshake is done, on the runtime it is to run on.
+    pub fn new(s: tokio::net::TcpStream) -> LiveSocket {
+        LiveSocket(s)
+    }
+
+    /// Done when the page has sent something, or hung up.
+    pub async fn readable(&self) -> std::io::Result<()> {
+        self.0.readable().await
+    }
+
+    /// A frame written: at once, as almost every one is, with nothing made for it, where a buffer
+    /// and a timer made for each cost a page told of a change at a time more than its thread did;
+    /// what is left of it, within `wait`.
+    async fn write(&mut self, opcode: u8, payload: &[u8], wait: std::time::Duration) -> bool {
+        let mut head = [0u8; 10];
+        let n = head_into(&mut head, opcode, payload.len());
+        let wrote = match self.0.try_write_vectored(&[std::io::IoSlice::new(&head[..n]), std::io::IoSlice::new(payload)]) {
+            Ok(w) if w == n + payload.len() => return true,
+            Ok(w) => w,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Err(_) => return false,
+        };
+        let mut rest = Vec::with_capacity(n + payload.len() - wrote);
+        rest.extend_from_slice(head[..n].get(wrote..).unwrap_or(&[]));
+        rest.extend_from_slice(&payload[wrote.saturating_sub(n)..]);
+        matches!(tokio::time::timeout(wait, tokio::io::AsyncWriteExt::write_all(&mut self.0, &rest)).await, Ok(Ok(())))
+    }
+
+    pub async fn send(&mut self, text: &str) -> bool {
+        self.write(0x1, text.as_bytes(), WRITE_WAIT).await
+    }
+
+    pub async fn ping(&mut self) -> bool {
+        self.write(0x9, &[], WRITE_WAIT).await
+    }
+
+    /// Whether something has come from the page (`None`: it hung up), without waiting: asked of
+    /// the runtime, so that what it knows of the connection stays true.
+    async fn pending(&mut self) -> Option<bool> {
+        let mut b = [0u8; 1];
+        match tokio::time::timeout(std::time::Duration::ZERO, self.0.peek(&mut b)).await {
+            Err(_) => Some(false),
+            Ok(Ok(0)) | Ok(Err(_)) => None,
+            Ok(Ok(_)) => Some(true),
+        }
+    }
+
+    /// `Socket::heard`, in a task: once a frame has begun, the rest of its message may take
+    /// `wait`. The reading's state (its buffers) is held only while it reads, not in the waiting
+    /// page's task.
+    pub async fn heard(&mut self, max: usize, wait: std::time::Duration, mut f: impl FnMut(&[u8])) -> Heard {
+        let got = loop {
+            match self.pending().await {
+                None => break Heard::Gone,
+                Some(false) => break Heard::Nothing,
+                Some(true) => {}
+            }
+            match tokio::time::timeout(wait, Box::pin(frame_heard(self, max, &mut f))).await {
+                Ok(Ok(Some(h))) => break h,
+                Ok(Ok(None)) => {}
+                _ => break Heard::Gone,
+            }
+        };
+        if got == Heard::Gone {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tokio::io::AsyncWriteExt::shutdown(&mut self.0)).await;
+        }
+        got
+    }
+
+    /// `Socket::first_text_parts`, in a task.
+    pub async fn first_text_parts(&mut self, max: usize, wait: std::time::Duration, mut f: impl FnMut(&[u8])) -> bool {
+        matches!(tokio::time::timeout(wait, Box::pin(first_text(self, max, &mut f))).await, Ok(Ok(true)))
     }
 }
 
@@ -757,9 +884,9 @@ trait Source {
 }
 
 /// A connection read as it blocks: each read done when it is asked for.
-struct Blocking<'a, R>(&'a mut R);
+struct Reading<'a, R>(&'a mut R);
 
-impl<R: Read> Source for Blocking<'_, R> {
+impl<R: Read> Source for Reading<'_, R> {
     async fn fill(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
         self.0.read_exact(buf)
     }
@@ -784,13 +911,8 @@ impl<R: Read> Reader<R> {
     /// The next message; an error when the connection ends, a frame is not
     /// one a page may send, or a message is larger than `max`.
     pub fn next(&mut self) -> std::io::Result<Message> {
-        use std::future::Future;
-        let mut reading = std::pin::pin!(read_message(Blocking(&mut self.r), self.max, &mut self.partial));
         // Each read blocks till it is done, so the reading is done when first asked.
-        match reading.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
-            std::task::Poll::Ready(m) => m,
-            std::task::Poll::Pending => unreachable!("a blocking read is never left waiting"),
-        }
+        now(read_message(Reading(&mut self.r), self.max, &mut self.partial))
     }
 }
 

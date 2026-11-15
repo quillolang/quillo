@@ -69,9 +69,12 @@ impl Page {
         let mut f = vec![0x80 | op];
         if data.len() < 126 {
             f.push(0x80 | data.len() as u8);
-        } else {
+        } else if data.len() <= 0xffff {
             f.push(0x80 | 126);
             f.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        } else {
+            f.push(0x80 | 127);
+            f.extend_from_slice(&(data.len() as u64).to_be_bytes());
         }
         let mask = [3, 1, 4, 1];
         f.extend_from_slice(&mask);
@@ -280,4 +283,216 @@ fn a_page_that_closes_or_hangs_up_is_let_go_and_its_place_given_back() {
     c.join();
     e.join();
     assert_eq!(peers(s.port), 2);
+}
+
+// ---- pages with live data (Q-954's second part) ----
+
+const LIVE: &str = "route GET / = \"hi\"\nroute GET /bump/:t {\n    publish(t)\n    \"ok\"\n}\n";
+
+fn seq(port: u16) -> u64 {
+    let a = support::send(port, "GET", "/_quillo/live?since=0&t=x", &[], "");
+    let j: serde_json::Value = serde_json::from_str(&a.body).unwrap_or_else(|e| panic!("{}: {}", e, a.body));
+    j["seq"].as_u64().unwrap()
+}
+
+/// A page waiting for changes to `topic` on its socket.
+fn live_page(port: u16, since: u64, topic: &str) -> Page {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    write!(s, "GET /_quillo/live?since={}&t={} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", since, topic).unwrap();
+    let h = head(&mut s);
+    assert!(h.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&h));
+    Page(s)
+}
+
+fn changed(m: &str) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(m).unwrap()["changed"].clone()
+}
+
+// Q-954: 300 pages with live data start no thread each, where each was one, 240 KB a page, and cost
+// a few kilobytes each; when they close, they are let go.
+#[cfg(unix)]
+#[test]
+fn pages_with_live_data_take_no_thread_of_their_own_and_little_memory() {
+    let d = dir("live-memory", LIVE);
+    let s = support::serve_with(&d.join("main.qwe"), &["--live-per-client", "1000"]);
+    let at = seq(s.port);
+    // The pages' runtime is made by the first page: counted from there.
+    let _first = live_page(s.port, at, "first");
+    std::thread::sleep(Duration::from_millis(200));
+    let (threads_before, rss_before) = (threads(s.pid()), rss_kib(s.pid()));
+    let pages: Vec<Page> = (0..300).map(|i| live_page(s.port, at, &format!("t{}", i))).collect();
+    std::thread::sleep(Duration::from_millis(300));
+    let (t, rss) = (threads(s.pid()), rss_kib(s.pid()));
+    assert!(t <= threads_before + 2, "threads: {} before, {} with 300 pages more", threads_before, t);
+    assert!(rss < rss_before + 300 * 32, "memory: {} KiB before, {} KiB with 300 pages more", rss_before, rss);
+    drop(pages);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(threads(s.pid()) <= threads_before + 2);
+}
+
+// Q-954: a change reaches the pages that follow it and no other, each at once, many pages at once;
+// the first change goes at once and what follows closely is gathered into one message.
+#[test]
+fn a_change_reaches_the_pages_that_follow_it_and_no_other() {
+    let d = dir("live-reach", LIVE);
+    let s = support::serve_with(&d.join("main.qwe"), &["--live-per-client", "1000"]);
+    let at = seq(s.port);
+    let mut pages: Vec<Page> = (0..100).map(|i| live_page(s.port, at, &format!("t{}", i % 10))).collect();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(support::send(s.port, "GET", "/bump/t3", &[], "").body, "ok");
+    for (i, p) in pages.iter_mut().enumerate() {
+        if i % 10 == 3 {
+            assert_eq!(changed(&p.text().unwrap()), serde_json::json!(["t3"]), "page {}", i);
+        }
+    }
+    // The others heard nothing: a change of their own is the next they are told.
+    assert_eq!(support::send(s.port, "GET", "/bump/t4", &[], "").body, "ok");
+    for (i, p) in pages.iter_mut().enumerate() {
+        if i % 10 == 4 {
+            assert_eq!(changed(&p.text().unwrap()), serde_json::json!(["t4"]), "page {}", i);
+        }
+    }
+    // Two changes close together reach a page as one.
+    let mut p = live_page(s.port, seq(s.port), "a,b");
+    std::thread::sleep(Duration::from_millis(200));
+    support::send(s.port, "GET", "/bump/a", &[], "");
+    assert_eq!(changed(&p.text().unwrap()), serde_json::json!(["a"]));
+    support::send(s.port, "GET", "/bump/b", &[], "");
+    support::send(s.port, "GET", "/bump/a", &[], "");
+    let m = p.text().unwrap();
+    assert_eq!(changed(&m).as_array().map(|a| a.len()), Some(2), "{}", m);
+}
+
+// Q-954: a long poll waits as a task too: answered with the change within its 25 s, after the
+// answers before it on its connection, both asked at once.
+#[test]
+fn a_long_poll_is_answered_after_what_came_before_it_on_its_connection() {
+    let d = dir("live-poll", LIVE);
+    let s = support::serve_with(&d.join("main.qwe"), &[]);
+    let at = seq(s.port);
+    let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    write!(c, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\nGET /_quillo/live?since={}&t=poll HTTP/1.1\r\nHost: localhost\r\n\r\n", at).unwrap();
+    let asked = Instant::now();
+    let first = String::from_utf8_lossy(&head(&mut c)).into_owned();
+    assert!(first.starts_with("HTTP/1.1 200"), "{}", first);
+    assert!(asked.elapsed() < Duration::from_secs(5), "the first answer waited {:?} for the long poll", asked.elapsed());
+    let mut hi = [0u8; 2];
+    c.read_exact(&mut hi).unwrap();
+    assert_eq!(&hi, b"hi");
+    std::thread::sleep(Duration::from_millis(300));
+    let t = Instant::now();
+    assert_eq!(support::send(s.port, "GET", "/bump/poll", &[], "").body, "ok");
+    let h = String::from_utf8_lossy(&head(&mut c)).into_owned();
+    assert!(h.starts_with("HTTP/1.1 200") && h.contains("no-store"), "{}", h);
+    let len: usize = h.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length: ").map(|n| n.trim().parse().unwrap())).unwrap();
+    let mut body = vec![0u8; len];
+    c.read_exact(&mut body).unwrap();
+    assert_eq!(changed(&String::from_utf8(body).unwrap()), serde_json::json!(["poll"]));
+    assert!(t.elapsed() < Duration::from_secs(5), "answered after {:?}", t.elapsed());
+}
+
+// Q-954: a quiet page with live data is pinged every 20 s, as its thread pinged it, and one that
+// answers is kept and told of changes after.
+#[test]
+fn a_quiet_live_page_is_pinged_and_kept() {
+    let d = dir("live-ping", LIVE);
+    let s = support::serve_with(&d.join("main.qwe"), &[]);
+    let mut p = live_page(s.port, seq(s.port), "quiet");
+    let t = Instant::now();
+    assert_eq!(p.frame(), Some((0x9, Vec::new())), "after {:?}", t.elapsed());
+    assert!(t.elapsed() >= Duration::from_secs(15), "pinged after {:?}", t.elapsed());
+    p.send(0xA, b"");
+    support::send(s.port, "GET", "/bump/quiet", &[], "");
+    assert_eq!(changed(&p.text().unwrap()), serde_json::json!(["quiet"]));
+}
+
+// Q-954: an upgrade to a live socket the server cannot take is told why and gives its place back:
+// with room for one page, a refused one leaves room for it.
+#[test]
+fn a_refused_live_upgrade_gives_its_place_back() {
+    let d = dir("live-refused", LIVE);
+    let s = support::serve_with(&d.join("main.qwe"), &["--live-per-client", "1"]);
+    let at = seq(s.port);
+    let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(c, "GET /_quillo/live?since={}&t=x HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: k\r\nSec-WebSocket-Version: 12\r\n\r\n", at).unwrap();
+    assert!(head(&mut c).starts_with(b"HTTP/1.1 426"));
+    let mut b = [0u8; 1];
+    assert_eq!(c.read(&mut b).unwrap_or(0), 0);
+    let mut p = live_page(s.port, at, "x");
+    std::thread::sleep(Duration::from_millis(200));
+    support::send(s.port, "GET", "/bump/x", &[], "");
+    assert_eq!(changed(&p.text().unwrap()), serde_json::json!(["x"]));
+}
+
+/// A connection that takes 4 KiB unread at most, so that what the server writes to it stops part
+/// way when its page does not read.
+#[cfg(unix)]
+fn small_window(port: u16) -> TcpStream {
+    use std::os::fd::FromRawFd;
+    // SAFETY: a socket made, set and connected here, and handed whole to the TcpStream.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        assert!(fd >= 0);
+        let n: libc::c_int = 4096;
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &n as *const libc::c_int as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        let mut addr: libc::sockaddr_in = std::mem::zeroed();
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_port = port.to_be();
+        addr.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+        {
+            addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+        }
+        let r = libc::connect(fd, &addr as *const libc::sockaddr_in as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t);
+        assert_eq!(r, 0, "connect: {}", std::io::Error::last_os_error());
+        TcpStream::from_raw_fd(fd)
+    }
+}
+
+// Q-954: a change too large to be written at once, to a page that stops reading for a while, is
+// written as far as it goes and the rest after, each whole and in order once the page reads: twenty
+// of 63 KB each, to a connection that holds 4 KiB unread.
+#[cfg(unix)]
+#[test]
+fn changes_too_large_to_write_at_once_reach_a_page_whole() {
+    let src = "route GET /all {\n    for i in 0..256 {\n        publish(\"t\" + str(i) + \"-\" + \"x\".repeat(240))\n    }\n    \"ok\"\n}\n";
+    let d = dir("live-large", src);
+    let s = support::serve_with(&d.join("main.qwe"), &[]);
+    let topics: Vec<String> = (0..256).map(|i| format!("t{}-{}", i, "x".repeat(240))).collect();
+    let mut s2 = small_window(s.port);
+    s2.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let at: u64 = {
+        let a = support::send(s.port, "GET", "/_quillo/live?since=0&t=x", &[], "");
+        serde_json::from_str::<serde_json::Value>(&a.body).unwrap()["seq"].as_u64().unwrap()
+    };
+    write!(s2, "GET /_quillo/live?since={}&tm=1 HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", at).unwrap();
+    assert!(head(&mut s2).starts_with(b"HTTP/1.1 101"));
+    let mut p = Page(s2);
+    p.send(0x1, topics.join(",").as_bytes());
+    std::thread::sleep(Duration::from_millis(300));
+    // Twenty changes to every topic, a gathering apart, none read.
+    for _ in 0..20 {
+        assert_eq!(support::send(s.port, "GET", "/all", &[], "").body, "ok");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // Read now: every message whole, of the page's own topics, till the last change; the first
+    // change of each burst goes at once, and what follows it is gathered, the rest in a message
+    // (fewer of them while a write waits for the page to read).
+    let last = seq(s.port);
+    let (mut whole, mut at_last, mut lens) = (0, 0, Vec::new());
+    while at_last < last {
+        let m = p.text().expect("a change");
+        let j: serde_json::Value = serde_json::from_str(&m).unwrap_or_else(|e| panic!("{}: {}", e, &m[..m.len().min(200)]));
+        let c = j["changed"].as_array().unwrap();
+        assert!(c.iter().all(|t| topics.iter().any(|x| Some(x.as_str()) == t.as_str())), "{}", &m[..m.len().min(200)]);
+        if c.len() >= 250 {
+            whole += 1;
+        }
+        lens.push(c.len());
+        at_last = j["seq"].as_u64().unwrap();
+    }
+    assert!(whole >= 5, "{} messages of 250 topics or more: {:?}", whole, lens);
 }
