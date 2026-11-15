@@ -8979,6 +8979,76 @@ function toolsAsk(e) {
   answer(false, { error: "unknown op: " + q.op });
 }
 
+// ---- what a reload under --watch keeps (FEEDBACK54.md, A.6; branch hmr) ----------------------
+//
+// Where a save makes the page reload, --watch's page script asks `QW.keep()` first: each island's
+// states, by its place among the page's islands and its component's name; the fields a person
+// changed and the open <details>, by their path in the page; the scroll and the focus. The next
+// load of the same address reads it once: an island takes its kept states where the type is the
+// same (a null at the server's takes any), and the page what it held once it is up. In
+// production nothing of it runs: `DEV` is false.
+const KEEP = () => "quillo-keep:" + location.pathname + location.search;
+let PageKept;
+const keptKind = (v) => v === null || v === undefined ? "null" : Array.isArray(v) ? "list" : isMap(v) ? "map" : typeof v;
+function kept() {
+  if (PageKept !== undefined) return PageKept;
+  PageKept = null;
+  if (!DEV) return PageKept;
+  try {
+    const t = sessionStorage.getItem(KEEP());
+    if (t) { sessionStorage.removeItem(KEEP()); PageKept = readJSON(t); }
+  } catch (_) { PageKept = null; }
+  return PageKept;
+}
+const pathOf = (n) => { const p = []; for (; n && n !== document.body && n.parentElement; n = n.parentElement) p.unshift([...n.parentElement.children].indexOf(n)); return p; };
+const atPath = (p) => { let n = document.body; for (const i of p) { n = n && n.children[i]; } return n || null; };
+function keepPage() {
+  const islands = [...document.querySelectorAll(ISLANDS)].map((el) => el.__qi && el.__qi.sigs
+    ? { c: el.dataset.c, s: Object.fromEntries(Object.entries(el.__qi.sigs).map(([k, sig]) => [k, toolsWire(sig._v)])) } : null);
+  const fields = [];
+  for (const f of document.querySelectorAll("input,textarea,select")) {
+    const changed = f.type === "checkbox" || f.type === "radio" ? f.checked !== f.defaultChecked : f.tagName === "SELECT" ? [...f.options].some((o) => o.selected !== o.defaultSelected) : f.value !== f.defaultValue;
+    if (changed && f.type !== "password" && f.type !== "file") fields.push({ p: pathOf(f), t: f.tagName + ":" + f.type, v: f.type === "checkbox" || f.type === "radio" ? f.checked : f.value });
+  }
+  const open = [...document.querySelectorAll("details[open]")].map(pathOf);
+  const a = document.activeElement;
+  const focus = a && a !== document.body ? { p: pathOf(a), s: typeof a.selectionStart === "number" ? [a.selectionStart, a.selectionEnd] : null } : null;
+  try { sessionStorage.setItem(KEEP(), writeJSON({ islands, fields, open, focus, scroll: [scrollX, scrollY] })); } catch (_) {}
+}
+// The island `el`'s states as kept, where the server's state of that name has the same kind.
+function keptFor(el, state) {
+  const k = kept();
+  if (!k || !k.islands) return state;
+  const i = [...document.querySelectorAll(ISLANDS)].indexOf(el);
+  const was = k.islands[i];
+  if (!was || was.c !== el.dataset.c) return state;
+  const out = Object.assign({}, state);
+  for (const [name, v] of Object.entries(was.s)) {
+    const now = untagDeep(v);
+    if (hasOwn(state, name) && (state[name] === null || keptKind(state[name]) === keptKind(now))) out[name] = now;
+  }
+  el.__kept = true;
+  return out;
+}
+// Once the page is up: the islands that kept states taken up, then the fields, details, scroll
+// and focus.
+function keptPageBack() {
+  const k = kept();
+  if (!k) return;
+  const islands = [...document.querySelectorAll(ISLANDS)];
+  (k.islands || []).forEach((was, i) => { if (was && islands[i] && islands[i].dataset.c === was.c) resume(outerIsland(islands[i]) || islands[i]); });
+  for (const f of k.fields || []) {
+    const n = atPath(f.p);
+    if (!n || n.tagName + ":" + n.type !== f.t) continue;
+    if (typeof f.v === "boolean") n.checked = f.v; else n.value = f.v;
+    n.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+  for (const p of k.open || []) { const n = atPath(p); if (n && n.tagName === "DETAILS") n.open = true; }
+  if (k.scroll) scrollTo(k.scroll[0], k.scroll[1]);
+  const f = k.focus && atPath(k.focus.p);
+  if (f && f.focus) { f.focus(); if (k.focus.s && f.setSelectionRange) try { f.setSelectionRange(k.focus.s[0], k.focus.s[1]); } catch (_) {} }
+}
+
 // An island taken up: its component (and those inside it) resumed from
 // the state the server wrote, on the HTML it wrote.
 function resume(el) {
@@ -9003,16 +9073,19 @@ function resume(el) {
   const props = islandJSON(el.dataset.p, {});
   // A top island's children come as the HTML the server made of them.
   if (typeof props.children === "string") props.children = rawHtml(props.children);
-  const state = islandJSON(el.dataset.s, {}), liveInfo = islandJSON(el.dataset.l, null);
+  const given = islandJSON(el.dataset.s, {}), liveInfo = islandJSON(el.dataset.l, null);
+  const state = DEV ? keptFor(el, given) : given;
   hydrating = queue();
   let inst = new Inst(def, props, state, liveInfo);
   inst.el = el;
+  if (DEV) el.__qi = inst;
   let ok = true;
   try {
     run(inst, el, true);
     QW.resumed = (QW.resumed || 0) + 1;
   } catch (e) {
-    if (e instanceof Mismatch) remade(el.dataset.c);
+    // Made again from what a reload kept, which the server's HTML is not: as it should be.
+    if (e instanceof Mismatch) { if (!el.__kept) remade(el.dataset.c); }
     else {
       report(e);
       QW.remade = (QW.remade || 0) + 1;
@@ -9040,6 +9113,7 @@ function resume(el) {
     run(inst, el, false, svg);
     const r = asOwnRoot(el, inst, svg);
     if (r !== el) { el.replaceWith(r); el = r; }
+    if (DEV) el.__qi = inst;
   }
   hydrating = null;
   if (TOOLS) toolsMade(inst);
@@ -9103,6 +9177,7 @@ function boot() {
   // keys it had (branch early-events).
   const held = QW.q || [];
   const redo = QW.redo;
+  if (DEV) { QW.keep = keepPage; keptPageBack(); }
   QW.booted = true;
   for (const r of held.splice(0)) {
     const i = outerIsland(r.el);

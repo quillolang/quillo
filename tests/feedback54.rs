@@ -445,3 +445,58 @@ fn a_page_whose_data_changed_is_kept_at_a_save_it_does_not_use() {
     let r = page.join().unwrap();
     assert_eq!(r, serde_json::json!({ "items": 2, "said": [["kept", ""]], "kept": true }));
 }
+
+fn kept_program(n_init: &str, label: &str) -> String {
+    format!("let stage = 0\nroute GET /stage/:n(int) {{\n    stage = n\n    \"ok\"\n}}\nroute GET /stage = stage\nroute GET /after.js = file(\"after.js\")\ncomponent Count() {{\n    state n = {}\n    state note = \"\"\n    <div><button id=\"b\" onclick={{() => {{ n += 1; note = \"clicked\" }}}}>{}{{n}}</button><span id=\"note\">{{note}}</span></div>\n}}\nroute GET / = <html><body><div><Count/></div><input id=\"free\"/><details id=\"d\"><summary>more</summary>inside</details><script src=\"/after.js\"></script></body></html>\n", n_init, label)
+}
+
+const KEPT_AFTER: &str = "if (sessionStorage.f54k) { const t = (ms) => new Promise((r) => setTimeout(r, ms)); (async () => { for (let i = 0; i < 300 && !(window[Symbol.for(\"quillo\")] || {}).booted; i++) await t(30); await t(100); const QW = window[Symbol.for(\"quillo\")]; document.body.dataset.result = JSON.stringify({ b: document.getElementById(\"b\").textContent, note: document.getElementById(\"note\").textContent, free: document.getElementById(\"free\").value, open: document.getElementById(\"d\").open, remade: QW.remade ?? 0, left: Object.keys(sessionStorage).filter((k) => k.startsWith(\"quillo-keep:\")).length, errors: window.__quilloErrors }); })(); }\n";
+
+const KEPT_SCRIPT: &str = r#"(async () => {
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  document.getElementById("b").dispatchEvent(new Event("focusin", { bubbles: true }));
+  for (let i = 0; i < 300 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
+  const b = document.getElementById("b");
+  for (let i = 0; i < 3; i++) { b.click(); await tick(30); }
+  const free = document.getElementById("free");
+  free.value = "hello";
+  document.getElementById("d").open = true;
+  sessionStorage.f54k = "1";
+  await fetch("/stage/1");
+})();"#;
+
+// FEEDBACK54.md, A.6: where a save makes the page reload, it keeps what it held: an island's
+// states (while their type is the same), a field typed into that nothing follows, an open
+// <details>; read once, so nothing is left behind. A state whose type changed starts again.
+#[test]
+fn a_reload_keeps_what_the_page_held() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    for (to, want_b, want_note) in [(kept_program("0", "count "), "count 3", "clicked"), (kept_program("\"zero\"", "n="), "n=zero", "clicked")] {
+        let d = dir("kept", &kept_program("0", "n="));
+        std::fs::write(d.join("after.js"), KEPT_AFTER).unwrap();
+        let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+        let port = s.port;
+        let page = std::thread::spawn(move || in_chrome(&chrome_or_skip(), &format!("http://127.0.0.1:{}/", port), KEPT_SCRIPT));
+        let end = Instant::now() + Duration::from_secs(30);
+        while support::send(s.port, "GET", "/stage", &[], "").body != "1" {
+            assert!(Instant::now() < end && !page.is_finished(), "the page did not get ready");
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        std::fs::write(d.join("main.qwe"), &to).unwrap();
+        let r = page.join().unwrap();
+        assert_eq!(
+            r,
+            serde_json::json!({ "b": want_b, "note": want_note, "free": "hello", "open": true, "remade": 0, "left": 0, "errors": [] }),
+            "to {}",
+            to
+        );
+    }
+    let _ = chrome;
+}
+
+fn chrome_or_skip() -> PathBuf {
+    chrome().unwrap()
+}
