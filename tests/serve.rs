@@ -231,8 +231,9 @@ fn watch_injects_the_reload_script_into_pages() {
     let srv = start(&f, &["--watch"]);
     let page = get(srv.port, "/").1;
     // The page knows the version it was rendered from, so a change made
-    // before its first request is not missed.
-    assert!(page.contains("const v='1'") && page.contains("/_quillo/events?v=") && page.ends_with("</body></html>"), "{}", page);
+    // before its first request is not missed. (`let`: a page a change left alone takes the
+    // new version and stays, FEEDBACK54.md, Q-685; branch hmr.)
+    assert!(page.contains("let v='1'") && page.contains("/_quillo/events?v=") && page.ends_with("</body></html>"), "{}", page);
     assert_eq!(get(srv.port, "/t").1, "text");
 }
 

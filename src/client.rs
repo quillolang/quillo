@@ -708,6 +708,16 @@ mod dev {
         // base64-encoding that file hundreds of times over (FEEDBACK15.md,
         // Q-097; branch dev-maps-once).
         let mut embedded: HashSet<Arc<str>> = HashSet::new();
+        // What each file's code is, its lines and map aside: what a page compares after a save
+        // to tell whether its code changed (FEEDBACK54.md, Q-685; branch hmr).
+        let mut ids: Vec<(String, String)> = Vec::new();
+        let id_of = |code: &str| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            code.hash(&mut h);
+            format!("{:016x}", h.finish())
+        };
+        ids.push(("quillo.js".into(), id_of(&files["quillo.js"])));
         for mut p in pieces {
             if p.code.trim().is_empty() {
                 continue;
@@ -718,6 +728,7 @@ mod dev {
             if !own.is_empty() {
                 p.code = format!("{}\n{}", own.join("\n"), p.code);
             }
+            ids.push((p.path.clone(), id_of(&unmarked(&p.code))));
             let mapped = p.source.is_some();
             let text = match &p.source {
                 Some(src) => {
@@ -758,10 +769,13 @@ mod dev {
             }
         }
         let list: Vec<String> = named.iter().map(|(hash, f)| js_str(&format!("{}/{}", hash, f))).collect();
+        let ids: serde_json::Map<String, serde_json::Value> = ids.into_iter().map(|(p, i)| (p, i.into())).collect();
         format!(
             "// Quillo in development: the runtime, and each component, view and function in a file\n\
              // of its own, with a source map to the .qwe file it is in.\n\
              (function () {{\n\
+             const q = Symbol.for(\"quillo\");\n\
+             (window[q] || (window[q] = {{}})).ids = {};\n\
              const at = {};\n\
              for (const f of [{}]) {{\n\
              const s = document.createElement(\"script\");\n\
@@ -770,6 +784,7 @@ mod dev {
              document.head.appendChild(s);\n\
              }}\n\
              }})();\n",
+            serde_json::Value::Object(ids),
             js_str(&format!("{}/_quillo/src/", it.base)),
             list.join(", ")
         )

@@ -3390,12 +3390,33 @@ fn watch(app: Arc<App>, others: Vec<Arc<App>>, mut files: Vec<PathBuf>, mut seen
 /// that changed: the page swaps each `<link>` to it for one asked for
 /// afresh, keeping its state (FEEDBACK11.md, Q-078; branch
 /// feedback11-fixes). `err:N:"..."` is a save that did not load.
-fn dev_script(version: u64) -> String {
+/// What a page's HTML is, the address of its bundle aside (which names its code, compared on
+/// its own): a page told of a new version asks for itself again, and is not reloaded when this
+/// and its code are as they were (FEEDBACK54.md, Q-685; branch hmr).
+fn page_print(body: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut rest = body;
+    while let Some(i) = rest.find("/_quillo/b/") {
+        rest[..i].hash(&mut h);
+        rest = &rest[i + "/_quillo/b/".len()..];
+        rest = rest.trim_start_matches(|c: char| c.is_ascii_hexdigit());
+    }
+    rest.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// `--watch=reload`: every change reloads the open pages, as before HMR (FEEDBACK54.md, Q-685,
+/// the user's choice 2026-11-15; branch hmr).
+pub static PLAIN_RELOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn dev_script(version: u64, print: &str) -> String {
     // A save that did not load (`err:N:"..."`, `null` once one does) is said over the page, in
     // a shadow root the page's styles do not reach; the page is not reloaded, so what it holds
     // stays (FEEDBACK54.md, Q-686; branch hmr).
-    const SCRIPT: &str = r#"<script>(()=>{const v='@V@';let c=0,e=0,box=null;const css=j=>{const p=JSON.parse(j);for(const l of document.querySelectorAll('link[rel=stylesheet]')){const u=new URL(l.href,location.href);if(u.origin===location.origin&&p.includes(u.pathname)){u.searchParams.set('quillo',Date.now());const n=l.cloneNode();n.href=u.pathname+u.search;n.onload=()=>l.remove();l.after(n)}}};const said=m=>{if(m===null){if(box){box.remove();box=null}return}if(!box){box=document.createElement('quillo-error');const r=box.attachShadow({mode:'open'});r.innerHTML='<style>:host{all:initial;position:fixed;left:0;right:0;bottom:0;z-index:2147483647;font:13px/1.45 ui-monospace,Menlo,monospace}div{position:relative;margin:8px;padding:12px 44px 12px 14px;background:#fff1f0;color:#5c0000;border:2px solid #c62828;border-radius:6px;max-height:45vh;overflow:auto;box-shadow:0 4px 18px #0005}pre{margin:8px 0 0;white-space:pre-wrap;font:inherit}button{position:absolute;top:8px;right:10px;border:0;background:none;font-size:20px;line-height:1;cursor:pointer;color:inherit}</style><div role="alert"><b>This save did not load: the page shows the version before it.</b><pre></pre><button aria-label="Close">×</button></div>';r.querySelector('button').onclick=()=>{box.remove();box=null};document.documentElement.appendChild(box)}box.shadowRoot.querySelector('pre').textContent=m};const seen=t=>{if(t.startsWith('css:')){const i=t.indexOf(':',4);c=+t.slice(4,i)||c;css(t.slice(i+1))}else if(t.startsWith('err:')){const i=t.indexOf(':',4);e=+t.slice(4,i)||e;said(JSON.parse(t.slice(i+1)))}else if(t!==v)location.reload()};const u=()=>'/_quillo/events?v='+v+'&c='+c+'&e='+e,go=()=>{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u());s.onopen=()=>o=1;s.onmessage=e=>seen(e.data);s.onclose=()=>o?setTimeout(go,1000):fetch(u(),{cache:'no-store'}).then(r=>r.text()).then(t=>{seen(t);go()},()=>setTimeout(go,1000))};go()})()</script>"#;
-    SCRIPT.replace("@V@", &version.to_string())
+    const SCRIPT: &str = r#"<script>/*quillo-dev*/(()=>{let v='@V@';const h='@H@',HOT=@HOT@;let c=0,e=0,box=null;const css=j=>{const p=JSON.parse(j);for(const l of document.querySelectorAll('link[rel=stylesheet]')){const u=new URL(l.href,location.href);if(u.origin===location.origin&&p.includes(u.pathname)){u.searchParams.set('quillo',Date.now());const n=l.cloneNode();n.href=u.pathname+u.search;n.onload=()=>l.remove();l.after(n)}}};const said=m=>{if(m===null){if(box){box.remove();box=null}return}if(!box){box=document.createElement('quillo-error');const r=box.attachShadow({mode:'open'});r.innerHTML='<style>:host{all:initial;position:fixed;left:0;right:0;bottom:0;z-index:2147483647;font:13px/1.45 ui-monospace,Menlo,monospace}div{position:relative;margin:8px;padding:12px 44px 12px 14px;background:#fff1f0;color:#5c0000;border:2px solid #c62828;border-radius:6px;max-height:45vh;overflow:auto;box-shadow:0 4px 18px #0005}pre{margin:8px 0 0;white-space:pre-wrap;font:inherit}button{position:absolute;top:8px;right:10px;border:0;background:none;font-size:20px;line-height:1;cursor:pointer;color:inherit}</style><div role="alert"><b>This save did not load: the page shows the version before it.</b><pre></pre><button aria-label="Close">×</button></div>';r.querySelector('button').onclick=()=>{box.remove();box=null};document.documentElement.appendChild(box)}box.shadowRoot.querySelector('pre').textContent=m};const plain=()=>{const w=window[Symbol.for('quillo')]||{};return !HOT||w.hot===false||document.documentElement.hasAttribute('data-reload')};const ids=t=>{const m=/\.ids = (\{.*?\});/.exec(t);return m?JSON.parse(m[1]):null};let busy=null;const hot=t=>busy||(busy=(async()=>{if(plain())return location.reload();try{const r=await fetch(location.href,{cache:'no-store',credentials:'same-origin'});const p=await r.text();const m=/\/\*quillo-dev\*\/\(\(\)=>\{let v='(\d+)';const h='([0-9a-f]+)'/.exec(p)||[],v2=m[1],h2=m[2];if(!r.ok||h2!==h||!v2)return location.reload();const mine=(window[Symbol.for('quillo')]||{}).ids;if(mine){const b=(/\/_quillo\/b\/[0-9a-f]+\.js/.exec(p)||[])[0];const theirs=b?ids(await (await fetch(b,{cache:'no-store'})).text()):null;if(!theirs||Object.keys(mine).some(k=>mine[k]!==theirs[k])||Object.keys(theirs).some(k=>!(k in mine)))return location.reload()}v=v2}catch(x){location.reload()}})().finally(()=>{busy=null}));const seen=t=>{if(t.startsWith('css:')){const i=t.indexOf(':',4);c=+t.slice(4,i)||c;css(t.slice(i+1))}else if(t.startsWith('err:')){const i=t.indexOf(':',4);e=+t.slice(4,i)||e;said(JSON.parse(t.slice(i+1)))}else if(t!==v)return hot(t)};const u=()=>'/_quillo/events?v='+v+'&c='+c+'&e='+e,go=()=>{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u());s.onopen=()=>o=1;s.onmessage=e=>seen(e.data);s.onclose=()=>o?setTimeout(go,1000):fetch(u(),{cache:'no-store'}).then(r=>r.text()).then(async t=>{await seen(t);go()},()=>setTimeout(go,1000))};go()})()</script>"#;
+    let hot = !PLAIN_RELOAD.load(std::sync::atomic::Ordering::Relaxed);
+    SCRIPT.replace("@V@", &version.to_string()).replace("@H@", print).replace("@HOT@", if hot { "1" } else { "0" })
 }
 
 /// Answers `/_quillo/events[?v=N]` on a thread of its own, so pages waiting
@@ -3477,7 +3498,7 @@ fn inject_dev_script(resp: &mut HttpResponse, version: u64) {
         return;
     }
     let body = String::from_utf8_lossy(&resp.body).into_owned();
-    let script = dev_script(version);
+    let script = dev_script(version, &page_print(&body));
     resp.body = match body.rfind("</body>") {
         Some(i) => format!("{}{}{}", &body[..i], script, &body[i..]),
         None => format!("{}{}", body, script),
@@ -3799,7 +3820,10 @@ impl Worker {
                 (Some(sink), Some(mut p), Some(it)) => {
                     // A deferred page keeps the development script (branch defer).
                     if let (true, Some(page)) = (app.watch, p.page.as_mut()) {
-                        let script = dev_script(self.generation);
+                        // Streamed, its HTML is not known whole: one that never matches, so a
+                        // change reloads it, as before (FEEDBACK54.md, Q-685; branch hmr).
+                        let never = format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+                        let script = dev_script(self.generation, &never);
                         page.tail.splice(0..0, script.into_bytes());
                     }
                     // Unless the program sent its own, or none (FEEDBACK55.md, Q-710; branch

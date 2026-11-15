@@ -104,6 +104,8 @@ options for `run`:
   --workers N    requests that can wait (for a database, the network) at
                  once, each on a thread of its own (default 64)
   --watch, -w    reload when the program's files change, and refresh open pages
+                 (a page whose HTML and code a change left alone stays as it is;
+                 --watch=reload refreshes every page at every change)
   --reload       reload when the program's files change (in production: no
                  errors shown on pages, no page refreshes)
   --no-check     skip the static checks before running
@@ -234,7 +236,7 @@ const VALUE_OPTIONS: &[&str] = &[
 
 /// Options of `run`, `app` and `check` that take no value.
 const FLAG_OPTIONS: &[&str] = &[
-    "--watch", "--reload", "--no-check", "--split", "--as-service", "--no-wt", "--no-prefetch", "--no-view-cache",
+    "--watch", "--watch=reload", "--reload", "--no-check", "--split", "--as-service", "--no-wt", "--no-prefetch", "--no-view-cache",
     "--no-jobs", "--plain-http", "--metrics", "--query-stats", "--strict-null", "--describe", "--no-join", "--checked", "--no-build",
 ];
 
@@ -325,7 +327,7 @@ fn word_and_flags(args: &[String]) -> Result<(Option<String>, Vec<String>), Stri
         let a = &args[i];
         // `--port=8081` is `--port 8081`, for each option that takes a value
         // (FEEDBACK9.md, Q-070; branch feedback9-fixes).
-        if let Some((name, value)) = a.split_once('=').filter(|(n, _)| n.starts_with("--")) {
+        if let Some((name, value)) = a.split_once('=').filter(|(n, _)| n.starts_with("--") && !FLAG_OPTIONS.contains(&a.as_str())) {
             if VALUE_OPTIONS.contains(&name) {
                 flags.push(name.to_string());
                 flags.push(value.to_string());
@@ -882,6 +884,14 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         match (flags[i].as_str(), value) {
             ("--watch" | "-w", _) => {
                 o.watch = true;
+                i += 1;
+                continue;
+            }
+            // Every change reloads the open pages, as before a page kept what it could
+            // (FEEDBACK54.md, Q-685; branch hmr).
+            ("--watch=reload", _) => {
+                o.watch = true;
+                quillo::server::PLAIN_RELOAD.store(true, std::sync::atomic::Ordering::Relaxed);
                 i += 1;
                 continue;
             }
@@ -1452,7 +1462,10 @@ fn before_the_program(file: &str, o: &RunOptions) -> Result<(), i32> {
     // Under --watch, with no key given, sessions are signed with one kept beside the program, so
     // a restart does not sign the developer out; without --watch a server never uses a file it was
     // not told of (FEEDBACK54.md, Q-689; branch hmr).
-    if o.watch && std::env::var("QUILLO_SECRET").map_or(true, |s| s.is_empty()) {
+    // Not when --watch is refused below (with --instances): nothing is made for a run that does not
+    // start.
+    let refused = o.instances > 1;
+    if o.watch && !refused && std::env::var("QUILLO_SECRET").map_or(true, |s| s.is_empty()) {
         let kept = Path::new(file).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).join(".quillo");
         match quillo::embed::keep_secret(&kept) {
             Ok(()) => eprintln!("quillo: sessions are signed with .quillo/.quillo-secret (development only; set QUILLO_SECRET in production)"),

@@ -271,3 +271,82 @@ fn a_restart_under_watch_keeps_the_session() {
     let (_s, _) = bare(&d2, port, &[]);
     assert_eq!(visit(port, &cookie).0, "1");
 }
+
+/// What a reloaded page says, from its own script: the first page leaves what it saw in
+/// `sessionStorage`, and the page that replaces it writes it out.
+const AFTER: &str = "if (sessionStorage.f54) document.body.dataset.result = JSON.stringify({ reloaded: true, first: JSON.parse(sessionStorage.f54), n: document.getElementById(\"b\").textContent });\n";
+
+fn hot_program(other: &str, label: &str) -> String {
+    format!("let stage = 0\nroute GET /stage/:n(int) {{\n    stage = n\n    \"ok\"\n}}\nroute GET /stage = stage\nroute GET /other = \"{}\"\nroute GET /after.js = file(\"after.js\")\ncomponent Count() {{\n    state n = 0\n    <button id=\"b\" onclick={{() => {{ n += 1 }}}}>{}{{n}}</button>\n}}\nroute GET / = <html><body><div><Count/></div><script src=\"/after.js\"></script></body></html>\n", other, label)
+}
+
+fn stage(port: u16, n: u64, page: &std::thread::JoinHandle<serde_json::Value>) {
+    let end = Instant::now() + Duration::from_secs(30);
+    while support::send(port, "GET", "/stage", &[], "").body != n.to_string() {
+        assert!(Instant::now() < end && !page.is_finished(), "the page did not reach stage {}", n);
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+// Q-685, step 1: every save reloaded every open page, and the developer lost what it held. A
+// page told of a new version now asks for itself again: when its HTML and its code are as they
+// were (here a route it never calls changed), it stays as it is; when its code changed, it
+// reloads, as before. --watch=reload reloads it at every change.
+#[test]
+fn a_change_the_page_does_not_use_leaves_it_as_it_is() {
+    let d = dir("hot-unused", &hot_program("a", "n="));
+    std::fs::write(d.join("after.js"), AFTER).unwrap();
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+    let page = support::send(s.port, "GET", "/", &[], "").body;
+    assert!(page.contains("/*quillo-dev*/") && page.contains("HOT=1"), "{}", page);
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping the browser half: no Chrome");
+        return;
+    };
+    let port = s.port;
+    let page = std::thread::spawn(move || {
+        let script = r#"(async () => {
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 300 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
+  const b = document.getElementById("b");
+  for (let i = 0; i < 3; i++) { b.click(); await tick(30); }
+  window.__kept = 1;
+  await fetch("/stage/1");
+  // The save to /other lands; the page asks for itself and stays.
+  for (let i = 0; i < 300 && (await (await fetch("/other")).text()) !== "b"; i++) await tick(30);
+  await tick(1500);
+  sessionStorage.f54 = JSON.stringify({ kept: window.__kept === 1, n: b.textContent, errors: window.__quilloErrors });
+  await fetch("/stage/2");
+})();"#;
+        in_chrome(&chrome, &format!("http://127.0.0.1:{}/", port), script)
+    });
+    stage(s.port, 1, &page);
+    std::fs::write(d.join("main.qwe"), hot_program("b", "n=")).unwrap();
+    stage(s.port, 2, &page);
+    std::fs::write(d.join("main.qwe"), hot_program("b", "count ")).unwrap();
+    let r = page.join().unwrap();
+    assert_eq!(r["first"], serde_json::json!({ "kept": true, "n": "n=3", "errors": [] }), "{}", r);
+    assert_eq!((r["reloaded"].as_bool(), r["n"].as_str()), (Some(true), Some("count 0")), "{}", r);
+}
+
+// Q-685's edges, on the server's side: the page's print leaves out its bundle's address (which
+// moves with its code) and nothing else; --watch=reload turns the page's check off.
+#[test]
+fn a_pages_print_follows_its_html_and_watch_reload_turns_it_off() {
+    let d = dir("hot-print", &hot_program("a", "n="));
+    std::fs::write(d.join("after.js"), AFTER).unwrap();
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+    let print = |port: u16| {
+        let p = support::send(port, "GET", "/", &[], "").body;
+        p.split("const h='").nth(1).unwrap().split('\'').next().unwrap().to_string()
+    };
+    let first = print(s.port);
+    assert_eq!(print(s.port), first, "the same page, the same print");
+    save(s.port, &d, &hot_program("b", "n="), "n=");
+    assert_eq!(print(s.port), first, "a route the page does not call");
+    save(s.port, &d, &hot_program("b", "count "), "count ");
+    assert_ne!(print(s.port), first, "the page's own HTML changed");
+    drop(s);
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch=reload"]);
+    assert!(support::send(s.port, "GET", "/", &[], "").body.contains("HOT=0"));
+}
