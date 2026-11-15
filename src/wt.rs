@@ -1433,12 +1433,13 @@ mod quic {
 /// WebTransport use, whose one thread a burst to a thousand pages would hold from the database's
 /// answers. One thread: with four, each woke the others to look for work, and an answer to a page
 /// cost 16% more than with a thread a page, a burst to three pages twice what one thread costs; one
-/// writes a burst to a thousand pages as soon.
-/// Made when the first page connects; `None` when it cannot be made (no descriptor or thread was
-/// left for it), and made again for the next page, so that a server out of descriptors for a
-/// while hangs up on the pages meanwhile and takes those after.
-pub fn pages() -> Option<&'static tokio::runtime::Runtime> {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+/// writes a burst to a thousand pages as soon. Made when the first page connects, on a thread
+/// started here, so that a thread the system will not give is an answer, where tokio's own
+/// builder panicked (in the server's event loop) for want of one (found in review); `None` when
+/// it cannot be made (no descriptor or thread left for it), and made again for the next page, so
+/// that a server out of either for a while hangs up on the pages meanwhile and takes those after.
+pub fn pages() -> Option<&'static tokio::runtime::Handle> {
+    static RT: OnceLock<tokio::runtime::Handle> = OnceLock::new();
     static MAKING: Mutex<()> = Mutex::new(());
     if let Some(rt) = RT.get() {
         return Some(rt);
@@ -1447,8 +1448,10 @@ pub fn pages() -> Option<&'static tokio::runtime::Runtime> {
     if let Some(rt) = RT.get() {
         return Some(rt);
     }
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).thread_name("quillo-pages").enable_all().build().ok()?;
-    Some(RT.get_or_init(|| rt))
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
+    let handle = rt.handle().clone();
+    std::thread::Builder::new().name("quillo-pages".into()).spawn(move || rt.block_on(std::future::pending::<()>())).ok()?;
+    Some(RT.get_or_init(|| handle))
 }
 
 /// How often a page's WebSocket is pinged, so that a page that went away is noticed.
@@ -1509,8 +1512,10 @@ pub async fn over_websocket(stream: tokio::net::TcpStream, ticket: Ticket) {
                 clean = false;
                 break 'page;
             }
+            if close {
+                break 'page;
+            }
             match next.or_else(|| rx.try_recv().ok()) {
-                _ if close => break 'page,
                 Some(x) => o = x,
                 None => break,
             }

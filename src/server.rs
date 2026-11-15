@@ -2304,8 +2304,8 @@ fn serve_live(shared: Arc<Shared>, req: HttpRequest, (tenants, tenant): (bool, O
     })
 }
 
-/// A page's channels over a WebSocket (where WebTransport cannot be had),
-/// on a thread of its own for as long as the page stays.
+/// A page's channels over a WebSocket (where WebTransport cannot be had), as tasks on the pages'
+/// runtime for as long as the page stays (see `wt::pages`).
 fn serve_channels(req: HttpRequest) -> Answer {
     let Some(ticket) = crate::wt::ticket_of(req.url.split_once('?').map_or("", |(_, q)| q)) else {
         return Answer::Respond(plain(403, "no ticket, or an old one\n"));
