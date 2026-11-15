@@ -82,6 +82,23 @@ impl Page {
         self.0.write_all(&f).unwrap();
     }
 
+    /// `open`, once the server has a place for it: a page that was let go gives its place back
+    /// once its task has ended, which may be just after its connection closed.
+    fn open_when_free(port: u16) -> Page {
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            s.write_all(upgrade_request(&ticket(port), "13", "Upgrade").as_bytes()).unwrap();
+            let h = head(&mut s);
+            if h.starts_with(b"HTTP/1.1 101") {
+                return Page(s);
+            }
+            assert!(h.starts_with(b"HTTP/1.1 503") && Instant::now() < end, "{}", String::from_utf8_lossy(&h));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn join(&mut self) {
         self.send(0x1, b"[\"j\",\"c\"]");
         assert_eq!(self.text().as_deref(), Some("[\"j\",\"c\",true]"));
@@ -227,8 +244,8 @@ fn a_refused_upgrade_is_told_why_and_gives_its_place_back() {
     assert!(h.starts_with("HTTP/1.1 426") && h.contains("sec-websocket-version: 13"), "{}", h);
     assert!(refused("13", "keep-alive").starts_with("HTTP/1.1 400"));
     assert!(refused("8", "keep-alive, Upgrade").starts_with("HTTP/1.1 426"));
-    let mut a = Page::open(s.port);
-    let mut b = Page::open(s.port);
+    let mut a = Page::open_when_free(s.port);
+    let mut b = Page::open_when_free(s.port);
     a.join();
     b.join();
     // A third page is past the limit.
@@ -278,8 +295,8 @@ fn a_page_that_closes_or_hangs_up_is_let_go_and_its_place_given_back() {
     drop(b);
     assert!(until(10, || peers(s.port) == 0), "{} pages still in", peers(s.port));
     // Both places given back.
-    let mut c = Page::open(s.port);
-    let mut e = Page::open(s.port);
+    let mut c = Page::open_when_free(s.port);
+    let mut e = Page::open_when_free(s.port);
     c.join();
     e.join();
     assert_eq!(peers(s.port), 2);
@@ -421,7 +438,19 @@ fn a_refused_live_upgrade_gives_its_place_back() {
     assert!(head(&mut c).starts_with(b"HTTP/1.1 426"));
     let mut b = [0u8; 1];
     assert_eq!(c.read(&mut b).unwrap_or(0), 0);
-    let mut p = live_page(s.port, at, "x");
+    // Its place is given back once its task has ended, which may be just after the close.
+    let mut p = None;
+    assert!(until(10, || {
+        let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        write!(c, "GET /_quillo/live?since={}&t=x HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", at).unwrap();
+        let ok = head(&mut c).starts_with(b"HTTP/1.1 101");
+        if ok {
+            p = Some(Page(c));
+        }
+        ok
+    }), "the refused page's place was not given back");
+    let mut p = p.unwrap();
     std::thread::sleep(Duration::from_millis(200));
     support::send(s.port, "GET", "/bump/x", &[], "");
     assert_eq!(changed(&p.text().unwrap()), serde_json::json!(["x"]));
@@ -558,8 +587,16 @@ fn a_watch_page_past_its_places_is_told_to_try_later() {
     let (first, c) = open("0");
     assert!(first.starts_with("HTTP/1.1 101"), "{}", first);
     let version = Page(c).text().expect("the version");
-    let (kept, _kept) = open(&version);
-    assert!(kept.starts_with("HTTP/1.1 101"), "{}", kept);
+    // Its place is given back once its thread has closed it: asked again till then.
+    let mut kept = None;
+    assert!(until(10, || {
+        let (h, c) = open(&version);
+        let ok = h.starts_with("HTTP/1.1 101");
+        if ok {
+            kept = Some(c);
+        }
+        ok
+    }), "the first page's place was not given back");
     let (second, _) = open(&version);
     assert!(second.starts_with("HTTP/1.1 503") && second.contains("retry-after: 5"), "{}", second);
 }
