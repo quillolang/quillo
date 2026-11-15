@@ -762,3 +762,58 @@ fn the_pages_own_html_is_morphed_in_place() {
         serde_json::json!({ "first": { "h": "Two", "cls": "Two", "title": "Two", "b": "n= 3" }, "second": { "b": "clicks 3" }, "foot": "foot", "said": ["morphed", "morphed", "morphed"], "kept": true, "remade": 0, "errors": [] })
     );
 }
+
+// Q-689, found in review: the key file was made through a link planted where it goes, and a short
+// one there before was rewritten and kept its mode. A link is refused (the server says so and
+// signs with a random key), a short file is replaced by one its owner alone can read, and a key
+// others could read is made its owner's, said.
+#[cfg(unix)]
+#[test]
+fn the_session_key_file_is_made_safely() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = dir("key-safe", VISITS);
+    std::fs::create_dir_all(d.join(".quillo")).unwrap();
+    std::os::unix::fs::symlink(d.join("elsewhere.txt"), d.join(".quillo/.quillo-secret")).unwrap();
+    let port = support::free_port();
+    let (s, said) = bare(&d, port, &["--watch"]);
+    drop(s);
+    assert!(said.contains("is a link") && !d.join("elsewhere.txt").exists(), "{}", said);
+    std::fs::remove_file(d.join(".quillo/.quillo-secret")).unwrap();
+    std::fs::write(d.join(".quillo/.quillo-secret"), "short").unwrap();
+    std::fs::set_permissions(d.join(".quillo/.quillo-secret"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (s, _) = bare(&d, port, &["--watch"]);
+    drop(s);
+    let key = d.join(".quillo/.quillo-secret");
+    assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(std::fs::read_to_string(&key).unwrap().len() >= 32);
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (s, said) = bare(&d, port, &["--watch"]);
+    drop(s);
+    assert!(said.contains("could be read by others"), "{}", said);
+    assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+// Found in review: the version a save replaced rendered the page for real, so a GET that writes
+// wrote twice at each save, once for each open page. It renders as a prefetch does: one that
+// would change something gives no print (the page compares its own), and only a GET is rendered.
+#[test]
+fn the_old_versions_render_changes_nothing() {
+    let src = "let hits = 0\nroute GET / {\n    hits += 1\n    <html><body><p>{hits}</p></body></html>\n}\nroute GET /calm = <html><body><p>calm</p></body></html>\nroute GET /hits = hits\nroute GET /other = \"a\"\n";
+    let d = dir("old-render", src);
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+    let v1 = support::send(s.port, "GET", "/_quillo/events", &[], "").body;
+    std::fs::write(d.join("main.qwe"), src.replace("\"a\"", "\"b\"")).unwrap();
+    let end = Instant::now() + Duration::from_secs(20);
+    while support::send(s.port, "GET", "/other", &[], "").body != "b" {
+        assert!(Instant::now() < end);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The hits are the server's data, kept across the save (Part C): read them before and after.
+    let before: i64 = support::send(s.port, "GET", "/hits", &[], "").body.parse().unwrap();
+    let a = support::send(s.port, "GET", "/", &[("x-quillo-hot", &v1)], "");
+    assert_eq!(a.header("x-quillo-was"), None, "a render that writes gives no print");
+    let after: i64 = support::send(s.port, "GET", "/hits", &[], "").body.parse().unwrap();
+    assert_eq!(after, before + 1, "the old version wrote too");
+    assert!(support::send(s.port, "GET", "/calm", &[("x-quillo-hot", &v1)], "").header("x-quillo-was").is_some());
+    assert_eq!(support::send(s.port, "POST", "/calm", &[("x-quillo-hot", &v1)], "").header("x-quillo-was"), None);
+}

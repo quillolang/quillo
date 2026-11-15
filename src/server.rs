@@ -445,8 +445,9 @@ impl Interp {
                 self.upload_body = Some(Arc::from(req.body.as_slice()));
             }
         }
-        // A page asked for ahead of a click: made without changing anything.
-        let prefetch = is_prefetch(req).then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        // A page asked for ahead of a click: made without changing anything; and the old version's
+        // render of a page under --watch, a print to compare (FEEDBACK54.md, found in review).
+        let prefetch = (is_prefetch(req) || self.read_only).then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         self.prefetching = prefetch.clone();
         let changed = (req.method != "GET" && req.method != "HEAD").then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         self.changed = changed.clone();
@@ -3943,13 +3944,18 @@ impl Worker {
         // A page asking whether the save changed it (`x-quillo-hot: <its version>`): what the
         // version it was made with renders now, by the same request, as a print beside this one.
         if app.watch && resp.header("content-type").is_some_and(|c| c.starts_with("text/html")) {
-            if let Some(was) = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-quillo-hot")).and_then(|(_, v)| v.parse::<u64>().ok()) {
+            // A GET's only, run as a prefetch is, changing nothing: run for real, a route that writes
+            // wrote twice at every save, once for each open page (found in review).
+            let hot = (req.method == "GET").then(|| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-quillo-hot"))).flatten();
+            if let Some(was) = hot.and_then(|(_, v)| v.parse::<u64>().ok()) {
                 let old = app.replaced.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
                 if let Some((v, loaded)) = old.filter(|(v, _)| *v == was) {
                     if let Loaded::Ready(it) = &*loaded {
                         let mut it = it.fork();
                         it.request_id = Some(rid.clone());
-                        if let Some(r) = run_program(&mut it, &req) {
+                        it.read_only = true;
+                        // Refused (it would change something): none, and the page compares its own.
+                        if let Some(r) = run_program(&mut it, &req).filter(|r| r.status == 200) {
                             resp.headers.push(("x-quillo-was".into(), page_print(&String::from_utf8_lossy(&r.body))));
                         }
                     }

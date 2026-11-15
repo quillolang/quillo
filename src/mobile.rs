@@ -115,16 +115,46 @@ pub(crate) fn keep_secret(data: &Path) -> Result<(), String> {
         return Ok(());
     }
     let file = data.join(".quillo-secret");
-    let secret = match std::fs::read_to_string(&file) {
-        Ok(s) if s.trim().len() >= 32 => s.trim().to_string(),
-        _ => {
+    let at = |e: std::io::Error| format!("{}: {}", file.display(), e);
+    // Not through a link: one planted there would have the key written, or read, elsewhere
+    // (FEEDBACK54.md, Q-689, found in review; branch hmr).
+    let meta = std::fs::symlink_metadata(&file);
+    if meta.as_ref().is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!("{} is a link: remove it, and a key is made there", file.display()));
+    }
+    let kept = match meta {
+        Ok(m) if m.is_file() => std::fs::read_to_string(&file).ok().map(|s| s.trim().to_string()).filter(|s| s.len() >= 32),
+        _ => None,
+    };
+    let secret = match kept {
+        Some(s) => {
+            // Its owner's alone, as it was made: one that others could read is made so, and said.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&file).map_err(at)?.permissions().mode();
+                if mode & 0o077 != 0 {
+                    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).map_err(at)?;
+                    eprintln!("quillo: {} could be read by others; it is its owner's alone now", file.display());
+                }
+            }
+            s
+        }
+        None => {
             let s = crate::server::launch_token()?;
-            // Its owner's alone: it signs every session (FEEDBACK54.md, Q-689; branch hmr).
+            // Written whole to a file of its own, its owner's alone from the start, then put in
+            // place: a short one there before was rewritten and kept its looser mode.
+            let tmp = data.join(format!(".quillo-secret.{}", std::process::id()));
+            let _ = std::fs::remove_file(&tmp);
             let mut o = std::fs::OpenOptions::new();
-            o.write(true).create(true).truncate(true);
+            o.write(true).create_new(true);
             #[cfg(unix)]
             std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-            std::io::Write::write_all(&mut o.open(&file).map_err(|e| format!("{}: {}", file.display(), e))?, s.as_bytes()).map_err(|e| format!("{}: {}", file.display(), e))?;
+            let written = o.open(&tmp).and_then(|mut f| std::io::Write::write_all(&mut f, s.as_bytes()));
+            if let Err(e) = written.and_then(|_| std::fs::rename(&tmp, &file)) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(at(e));
+            }
             s
         }
     };

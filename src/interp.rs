@@ -346,6 +346,9 @@ pub struct Interp {
     /// set when the code tried to change something, which stopped it (see
     /// `no_writes`). Shared with what it runs in parallel.
     pub(crate) prefetching: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Its requests run as prefetches do, changing nothing: the version a save replaced, rendering
+    /// a page for the print it is compared by (FEEDBACK54.md, found in review; branch hmr).
+    pub(crate) read_only: bool,
     /// Set when a request that may change something does: the guard's own list of what
     /// changes things, so that a page kept for a click can be let go (FEEDBACK22.md, Q-177;
     /// branch feedback22-fixes).
@@ -1878,6 +1881,7 @@ impl Interp {
             db_on: None,
             wrote_req: None,
             prefetching: None,
+            read_only: false,
             changed: None,
             db_resolving: Vec::new(),
             db_loop: None,
@@ -2004,6 +2008,7 @@ impl Interp {
             db_on: None,
             wrote_req: None,
             prefetching: None,
+            read_only: false,
             changed: None,
             db_resolving: Vec::new(),
             db_loop: None,
