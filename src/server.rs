@@ -2915,6 +2915,10 @@ pub struct App {
     /// many times, and the paths they were asked for at the last time
     /// (FEEDBACK11.md, Q-078; branch feedback11-fixes).
     css: Mutex<(u64, Vec<String>)>,
+    /// Saves that did not load while a version that did is served: how many, and what the last
+    /// one said (none once one loads), for the pages' `err:` messages (FEEDBACK54.md, Q-686;
+    /// branch hmr).
+    failed: Mutex<(u64, Option<String>)>,
     /// The files the last load that failed read or tried, watched with the version served
     /// until one loads (FEEDBACK55.md, Q-836; branch feedback55).
     tried: Mutex<Vec<PathBuf>>,
@@ -2947,6 +2951,7 @@ impl App {
             reload: false,
             addr: Mutex::new(None),
             css: Mutex::new((0, Vec::new())),
+            failed: Mutex::new((0, None)),
             tried: Mutex::new(Vec::new()),
         }
     }
@@ -3063,6 +3068,10 @@ impl App {
                 let loaded = Arc::new(Loaded::Ready(it));
                 warm_client(&loaded);
                 *slot = (slot.0 + 1, loaded);
+                let mut f = self.failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if f.1.take().is_some() {
+                    f.0 += 1;
+                }
             }
             Err(e) => {
                 if !checked_out {
@@ -3072,6 +3081,10 @@ impl App {
                     *slot = (slot.0 + 1, Arc::new(Loaded::Failed(e.to_string())));
                 } else {
                     eprintln!("quillo: still serving the previous version");
+                    // The open pages say so, and keep what they hold (FEEDBACK54.md, Q-686;
+                    // branch hmr).
+                    let mut f = self.failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *f = (f.0 + 1, Some(e.to_string()));
                 }
             }
         }
@@ -3079,19 +3092,23 @@ impl App {
         loaded
     }
 
-    /// Waits up to `timeout` for a version newer than `seen`, or a
-    /// stylesheet changed after `css_seen`:
-    /// the version, and the stylesheets' paths when they changed.
-    fn wait_for_change_or_css(&self, seen: u64, css_seen: u64, timeout: Duration) -> (u64, Option<(u64, Vec<String>)>) {
+    /// Waits up to `timeout` for a version newer than `seen`, a stylesheet changed after
+    /// `css_seen`, or a save that failed (or one that loaded after it) since `failed_seen`: the
+    /// version, the stylesheets' paths when they changed, and the failure when it did (its
+    /// count, and what it said; none once a save loaded).
+    fn wait_for_change(&self, seen: u64, css_seen: u64, failed_seen: u64, timeout: Duration) -> (u64, Option<(u64, Vec<String>)>, Option<(u64, Option<String>)>) {
         let slot = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (slot, _) = self
             .changed
-            .wait_timeout_while(slot, timeout, |s| s.0 == seen && self.css.lock().map_or(true, |c| c.0 == css_seen))
+            .wait_timeout_while(slot, timeout, |s| {
+                s.0 == seen && self.css.lock().map_or(true, |c| c.0 == css_seen) && self.failed.lock().map_or(true, |f| f.0 == failed_seen)
+            })
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let v = slot.0;
         drop(slot);
         let css = self.css_seq();
-        (v, (css.0 != css_seen).then_some(css))
+        let failed = self.failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        (v, (css.0 != css_seen).then_some(css), (failed.0 != failed_seen).then_some(failed))
     }
 
     fn watched_files(&self) -> Vec<PathBuf> {
@@ -3372,12 +3389,13 @@ fn watch(app: Arc<App>, others: Vec<Arc<App>>, mut files: Vec<PathBuf>, mut seen
 /// A message `css:["/assets/app.css"]` is a stylesheet the program served
 /// that changed: the page swaps each `<link>` to it for one asked for
 /// afresh, keeping its state (FEEDBACK11.md, Q-078; branch
-/// feedback11-fixes).
+/// feedback11-fixes). `err:N:"..."` is a save that did not load.
 fn dev_script(version: u64) -> String {
-    format!(
-        "<script>(()=>{{const v='{}';let c=0;const css=j=>{{const p=JSON.parse(j);for(const l of document.querySelectorAll('link[rel=stylesheet]')){{const u=new URL(l.href,location.href);if(u.origin===location.origin&&p.includes(u.pathname)){{u.searchParams.set('quillo',Date.now());const n=l.cloneNode();n.href=u.pathname+u.search;n.onload=()=>l.remove();l.after(n)}}}}}};const seen=t=>{{if(t.startsWith('css:')){{const i=t.indexOf(':',4);c=+t.slice(4,i)||c;css(t.slice(i+1))}}else if(t!==v)location.reload()}};const u=()=>'/_quillo/events?v='+v+'&c='+c,go=()=>{{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u());s.onopen=()=>o=1;s.onmessage=e=>seen(e.data);s.onclose=()=>o?setTimeout(go,1000):fetch(u(),{{cache:'no-store'}}).then(r=>r.text()).then(t=>{{seen(t);go()}},()=>setTimeout(go,1000))}};go()}})()</script>",
-        version
-    )
+    // A save that did not load (`err:N:"..."`, `null` once one does) is said over the page, in
+    // a shadow root the page's styles do not reach; the page is not reloaded, so what it holds
+    // stays (FEEDBACK54.md, Q-686; branch hmr).
+    const SCRIPT: &str = r#"<script>(()=>{const v='@V@';let c=0,e=0,box=null;const css=j=>{const p=JSON.parse(j);for(const l of document.querySelectorAll('link[rel=stylesheet]')){const u=new URL(l.href,location.href);if(u.origin===location.origin&&p.includes(u.pathname)){u.searchParams.set('quillo',Date.now());const n=l.cloneNode();n.href=u.pathname+u.search;n.onload=()=>l.remove();l.after(n)}}};const said=m=>{if(m===null){if(box){box.remove();box=null}return}if(!box){box=document.createElement('quillo-error');const r=box.attachShadow({mode:'open'});r.innerHTML='<style>:host{all:initial;position:fixed;left:0;right:0;bottom:0;z-index:2147483647;font:13px/1.45 ui-monospace,Menlo,monospace}div{position:relative;margin:8px;padding:12px 44px 12px 14px;background:#fff1f0;color:#5c0000;border:2px solid #c62828;border-radius:6px;max-height:45vh;overflow:auto;box-shadow:0 4px 18px #0005}pre{margin:8px 0 0;white-space:pre-wrap;font:inherit}button{position:absolute;top:8px;right:10px;border:0;background:none;font-size:20px;line-height:1;cursor:pointer;color:inherit}</style><div role="alert"><b>This save did not load: the page shows the version before it.</b><pre></pre><button aria-label="Close">×</button></div>';r.querySelector('button').onclick=()=>{box.remove();box=null};document.documentElement.appendChild(box)}box.shadowRoot.querySelector('pre').textContent=m};const seen=t=>{if(t.startsWith('css:')){const i=t.indexOf(':',4);c=+t.slice(4,i)||c;css(t.slice(i+1))}else if(t.startsWith('err:')){const i=t.indexOf(':',4);e=+t.slice(4,i)||e;said(JSON.parse(t.slice(i+1)))}else if(t!==v)location.reload()};const u=()=>'/_quillo/events?v='+v+'&c='+c+'&e='+e,go=()=>{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u());s.onopen=()=>o=1;s.onmessage=e=>seen(e.data);s.onclose=()=>o?setTimeout(go,1000):fetch(u(),{cache:'no-store'}).then(r=>r.text()).then(t=>{seen(t);go()},()=>setTimeout(go,1000))};go()})()</script>"#;
+    SCRIPT.replace("@V@", &version.to_string())
 }
 
 /// Answers `/_quillo/events[?v=N]` on a thread of its own, so pages waiting
@@ -3388,7 +3406,15 @@ fn serve_events(app: Arc<App>, req: HttpRequest) -> Answer {
     // The stylesheet changes the page has taken (`css:N:[...]` messages);
     // none given: the ones so far.
     let css_seen = q.get("c").and_then(|v| v.display().parse::<u64>().ok()).filter(|c| *c > 0).unwrap_or_else(|| app.css_seq().0);
+    // The failed saves the page was told of (`err:N:...`); 0, a page just loaded: told of the one
+    // standing, if one does (FEEDBACK54.md, Q-686; branch hmr).
+    let failed_seen = q.get("e").and_then(|v| v.display().parse::<u64>().ok()).unwrap_or(0);
+    let failed_seen = {
+        let f = app.failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if failed_seen == 0 && f.1.is_none() { f.0 } else { failed_seen }
+    };
     let css_text = |(n, paths): (u64, Vec<String>)| format!("css:{}:{}", n, serde_json::json!(paths));
+    let failed_text = |(n, said): (u64, Option<String>)| format!("err:{}:{}", n, serde_json::json!(said));
     waiter("quillo-events", &req.remote.clone(), move |stream| {
         if crate::ws::is_upgrade(&req) {
             let Some(mut socket) = crate::ws::Socket::accept(&req, stream) else { return };
@@ -3396,9 +3422,9 @@ fn serve_events(app: Arc<App>, req: HttpRequest) -> Answer {
             // Q-594; found in review).
             socket.write_timeout(Duration::from_secs(30));
             let seen = seen.unwrap_or(0);
-            let mut css_seen = css_seen;
+            let (mut css_seen, mut failed_seen) = (css_seen, failed_seen);
             loop {
-                let (v, css) = app.wait_for_change_or_css(seen, css_seen, Duration::from_secs(20));
+                let (v, css, failed) = app.wait_for_change(seen, css_seen, failed_seen, Duration::from_secs(20));
                 if v != seen {
                     socket.send(&v.to_string());
                     return socket.close();
@@ -3410,17 +3436,25 @@ fn serve_events(app: Arc<App>, req: HttpRequest) -> Answer {
                     }
                     continue;
                 }
+                if let Some(f) = failed {
+                    failed_seen = f.0;
+                    if !socket.send(&failed_text(f)) {
+                        return;
+                    }
+                    continue;
+                }
                 if !socket.ping() {
                     return;
                 }
             }
         }
-        let (v, css) = match seen {
-            Some(seen) => app.wait_for_change_or_css(seen, css_seen, Duration::from_secs(25)),
-            None => (app.current().0, None),
+        let (v, css, failed) = match seen {
+            Some(seen) => app.wait_for_change(seen, css_seen, failed_seen, Duration::from_secs(25)),
+            None => (app.current().0, None, None),
         };
-        let text = match css {
-            Some(c) if Some(v) == seen => css_text(c),
+        let text = match (css, failed) {
+            (Some(c), _) if Some(v) == seen => css_text(c),
+            (_, Some(f)) if Some(v) == seen => failed_text(f),
             _ => v.to_string(),
         };
         let mut resp = plain(200, &text);

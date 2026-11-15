@@ -99,3 +99,87 @@ fn an_edit_on_its_own_lines_keeps_every_other_address() {
     assert_eq!(support::send(s.port, "GET", &first.replace("First.js", "Second.js"), &[], "").status, 404);
     assert_eq!(support::send(s.port, "GET", "/_quillo/src/0000000000000000/main.qwe/First.js", &[], "").status, 404);
 }
+
+fn chrome() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("QUILLO_CHROME") {
+        return Some(PathBuf::from(p));
+    }
+    ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Chromium.app/Contents/MacOS/Chromium", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists())
+}
+
+/// `url` in headless Chrome, with `script` run in the page: what it stored in `data-result`.
+fn in_chrome(chrome: &Path, url: &str, script: &str) -> serde_json::Value {
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let d = support::temp_dir(&format!("f54-chrome-{}", script.len()));
+    std::fs::write(d.join("t.js"), script).unwrap();
+    let out = std::process::Command::new("node").arg(root.join("browser/run.js")).arg(chrome).arg(url).arg(d.join("profile")).arg("30000").arg(d.join("t.js")).output().expect("node");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{}: {}", e, String::from_utf8_lossy(&out.stdout)))
+}
+
+const COUNTER: &str = "let clicked = false\nroute GET /clicked {\n    clicked = true\n    \"ok\"\n}\nroute GET /was-clicked = clicked\ncomponent Count() {\n    state n = 0\n    <button id=\"b\" onclick={() => { n += 1 }}>{n}</button>\n}\nroute GET / = <html><body><div><Count/></div></body></html>\n";
+
+// Q-686: a save that did not load said nothing on the page, which went on showing the version
+// before it. The open page now says so, over itself, and keeps what it holds (no reload); a page
+// opened while it stands says so too; the save that loads reloads them, as before.
+#[test]
+fn a_save_that_does_not_load_is_said_on_the_page_which_keeps_its_state() {
+    let d = dir("failed-save", COUNTER);
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+    let version = support::send(s.port, "GET", "/_quillo/events", &[], "").body;
+    // A plain request is told too, after the version it has.
+    let broken = COUNTER.replace("{n}</button>", "{nope}</button>");
+    let Some(chrome) = chrome() else {
+        std::fs::write(d.join("main.qwe"), &broken).unwrap();
+        let said = support::send(s.port, "GET", &format!("/_quillo/events?v={}&e=0", version), &[], "").body;
+        assert!(said.starts_with("err:1:") && said.contains("nope"), "{}", said);
+        eprintln!("skipping the browser half: no Chrome");
+        return;
+    };
+    let port = s.port;
+    let page = std::thread::spawn(move || {
+        let script = r#"(async () => {
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 300 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
+  const b = document.getElementById("b");
+  for (let i = 0; i < 3; i++) { b.click(); await tick(30); }
+  window.__kept = 1;
+  await fetch("/clicked");
+  let box = null;
+  for (let i = 0; i < 600 && !box; i++) { await tick(30); box = document.querySelector("quillo-error"); }
+  const text = box ? box.shadowRoot.querySelector("pre").textContent : null;
+  document.body.dataset.result = JSON.stringify({ text, n: document.getElementById("b").textContent, kept: window.__kept === 1, errors: window.__quilloErrors });
+})();"#;
+        in_chrome(&chrome, &format!("http://127.0.0.1:{}/", port), script)
+    });
+    let end = Instant::now() + Duration::from_secs(30);
+    while support::send(s.port, "GET", "/was-clicked", &[], "").body != "true" {
+        assert!(Instant::now() < end && !page.is_finished(), "the page did not click");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    std::fs::write(d.join("main.qwe"), &broken).unwrap();
+    let r = page.join().unwrap();
+    assert!(r["text"].as_str().is_some_and(|t| t.contains("nope")), "{}", r);
+    assert_eq!((r["n"].as_str(), r["kept"].as_bool()), (Some("3"), Some(true)), "the page was reloaded: {}", r);
+    assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
+    // Opened while the save stands: the version before, and the overlay.
+    let chrome = self::chrome().unwrap();
+    let script = r#"(async () => {
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  let box = null;
+  for (let i = 0; i < 300 && !box; i++) { await tick(30); box = document.querySelector("quillo-error"); }
+  document.body.dataset.result = JSON.stringify({ shown: !!box, n: document.getElementById("b").textContent });
+})();"#;
+    let r = in_chrome(&chrome, &format!("http://127.0.0.1:{}/", s.port), script);
+    assert_eq!((r["shown"].as_bool(), r["n"].as_str()), (Some(true), Some("0")), "{}", r);
+    // The save that loads: pages are told the new version (and reload).
+    std::fs::write(d.join("main.qwe"), COUNTER.replace("{n}</button>", "{n}!</button>")).unwrap();
+    let said = support::send(s.port, "GET", &format!("/_quillo/events?v={}&e=1", version), &[], "").body;
+    assert!(said.parse::<u64>().is_ok() && said != version, "{}", said);
+    assert!(support::send(s.port, "GET", "/", &[], "").body.contains("0!</button>"));
+}
