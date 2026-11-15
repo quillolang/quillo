@@ -4207,8 +4207,8 @@ impl Checker {
         if self.assigned_globals.contains(name) {
             let c = self.in_component().unwrap();
             self.error(format!(
-                "<{}> runs in the browser, but `{}` is a server variable that changes; pass it as a prop or read it with a `server fn`",
-                c, name
+                "<{}> runs in the browser, but `{}` is a server variable that changes; pass it as a prop or read it with a `server fn`, or, for one each page has of its own, write `state {} = ...` at the top",
+                c, name, name
             ));
         }
     }

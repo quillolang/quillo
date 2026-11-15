@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Page state**: `state cart = []` at the top of a program is the page's, shared by every
+  component on it. Components placed apart read and set it alike, one value for each page load,
+  for each visitor. The server makes the page with it (a route may set where it starts), and the
+  page carries it; a component that shows one starts with the page. A `server fn` reading one is
+  an error. Programs without one pay nothing measurable (FEEDBACK68.md, Q-961 to Q-963).
+
 - Under `--watch`, a save that does not load is said over the open pages, which keep what they
   hold, until a save loads; it said nothing, and the pages showed the version before it as if
   the save had worked (FEEDBACK54.md, Q-686).

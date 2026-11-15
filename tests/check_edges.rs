@@ -403,7 +403,7 @@ fn a_field_set_on_something_with_no_fields() {
 
 #[test]
 fn assigning_to_a_global_from_a_component() {
-    says("let g = 1\ncomponent C() {\n <button @click={() => { g = 2 }}>x</button>\n}", &["3 <C> runs in the browser, but `g` is a server variable that changes; pass it as a prop or read it with a `server fn`"]);
+    says("let g = 1\ncomponent C() {\n <button @click={() => { g = 2 }}>x</button>\n}", &["3 <C> runs in the browser, but `g` is a server variable that changes; pass it as a prop or read it with a `server fn`, or, for one each page has of its own, write `state g = ...` at the top"]); // the fix names a page state too (FEEDBACK68.md, Q-962: changed for it)
 }
 
 #[test]

@@ -54,7 +54,8 @@ fn a_component_s_function_may_return_early() {
 fn a_handler_cannot_change_a_server_variable_but_may_read_one() {
     assert_eq!(
         loads("component C() {\n  state n = 0\n  <p @click={() => { m = 1 }}>{n}</p>\n}\nlet m = 0\n"),
-        Err("3 <C> (compiled for the browser): `m` is a server variable that the program changes; pass it as a prop or read it with a `server fn`".into())
+        // The fix names a page state too (FEEDBACK68.md, Q-962: the message changed for it).
+        Err("3 <C> (compiled for the browser): `m` is a server variable that the program changes; pass it as a prop or read it with a `server fn`, or, for one each page has of its own, write `state m = ...` at the top".into())
     );
     bundled("component C() {\n  state n = 0\n  <p @click={() => { n = other + 1 }}>{n}</p>\n}\nlet other = 0\n");
     bundled("fn helper() = http.get(\"/x\")\ncomponent C() {\n  state n = 0\n  <p @click={() => { let r = helper()\n n = 1 }}>{n}</p>\n}\n");

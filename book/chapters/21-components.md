@@ -717,9 +717,10 @@ component Dashboard() {
   that ends in a page's Promise (`cb={() => js("Promise.resolve")}`) once it is done. A
   child that must know whether its caller finished has the caller give `true` when done,
   or calls a `done` function it is given. There is no
-  context or global store: state in the outermost component, passed down, is the store.
-  Components placed separately in a page share nothing in the browser; they share
-  through the server (`live`, channels).
+  context: what is narrower than the page goes down as props. What the whole page shares
+  is a [page state](#page-state), `state cart = []` at the top of the program, which
+  components placed separately in a page read and set alike *(since 0.8.4: none; they
+  shared through the server)*.
 - Props are passed live: a child shows its parent's new value without either running
   again. Each component keeps its own state; give components in a list a `key={...}`
   so each keeps its own (a new key makes it afresh). A key is text or a number: a list

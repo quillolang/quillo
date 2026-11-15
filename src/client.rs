@@ -2680,8 +2680,8 @@ impl<'a> Compiler<'a> {
             other => {
                 if self.assigned.contains(name) {
                     return self.err(format!(
-                        "`{}` is a server variable that the program changes; pass it as a prop or read it with a `server fn`",
-                        name
+                        "`{}` is a server variable that the program changes; pass it as a prop or read it with a `server fn`, or, for one each page has of its own, write `state {} = ...` at the top",
+                        name, name
                     ));
                 }
                 if self.private.contains(name) {

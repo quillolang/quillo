@@ -211,9 +211,9 @@ starts clean (`<Product key={id} id={id}/>`).
 - A view used as a tag runs once with its props live, as a component does; a plain
   function used as a tag (`<Row item={x}/>` where `Row` is neither) is called again as a
   whole when what it is given changes.
-- There is no context and no global store in the browser: state lives in components and
-  goes down as props. Components placed separately in a page share nothing; they share
-  through the server (below).
+- There is no context: state lives in components and goes down as props. What the whole
+  page shares is a [page state](#page-state) (below): components placed separately in a
+  page follow it and set it alike.
 
 ## What is not followed
 
@@ -225,7 +225,48 @@ starts clean (`<Product key={id} id={id}/>`).
   followed too (`live(load_thread, id)` loads again when `id` changes).
 - **Global variables.** A component uses the program's constants as they were when the
   program loaded; a global the server changes cannot be read in a component at all
-  (pass it as a prop, or load it with `live`).
+  (pass it as a prop, or load it with `live`). A page state is not one: it is the page's.
+
+## Page state
+
+`state` at the top of a program, outside any component, is the page's: every component on
+the page that reads it follows it, and any of them may set it, though they load apart.
+
+```quillo
+state cart = []
+
+component Add(item: map) {
+    <button onclick={() => { cart = cart + [item] }}>Add</button>
+}
+
+component Badge() {
+    <span>{len(cart)}</span>
+}
+
+route GET / {
+    cart = load_cart()              // where this page starts
+    <html><body>
+        <header><Badge/></header>
+        <main><Add item={{ id: 1 }}/></main>
+    </body></html>
+}
+```
+
+- **One for each page**, for each visitor: it starts again at every page load (a link
+  followed is one), and no visitor sees another's. A top-level `let` is the server's, one
+  for everyone, which is why a component may not set one.
+- **On the server**, each request for a page runs the initializers in the order written
+  (one may read another), before its route; the route may set it, and the page is made
+  with it. Views and components read it as any name. A view that read one is not cached,
+  since it is that page's.
+- **In the browser**, the page starts from the value its render left, which it carries; a
+  component that shows one starts with the page, so it follows a change made elsewhere
+  before anyone reaches for it (one that only sets it waits, as any component does).
+- **Not where no page is made**: a `server fn` reading one is an error (`quillo check`
+  says so; pass what it needs as an argument), and so is a job, a timer or a channel's
+  handler reading one when it runs. A request to Quillo's own addresses (a `server fn`'s
+  call, live data) has none.
+- `state cart` and a `let` or `fn` named `cart` cannot both be; two `state cart` neither.
 
 ## On the server
 
@@ -253,6 +294,7 @@ The server has two of its own, which follow the same idea of following what was 
 | `useRef` | `bind:this` | template ref | `onmount={(el) => { box = el }}` |
 | `value` with `onChange` | `bind:value` | `v-model` | `value={x}`: two-way by itself when `x` is state |
 | `useContext` | `setContext` | `provide` | none: props |
+| a store (Zustand, Redux) | `$state` in a module | a Pinia store | `state cart = []` at the top: the page's |
 | `key` | `{#each ... (key)}` | `:key` | `key={...}` |
 | `React.memo`, `useCallback` | | | not needed: nothing renders again |
 | a list of dependencies | | | none: what is read is followed |
