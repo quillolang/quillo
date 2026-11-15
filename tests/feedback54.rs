@@ -274,7 +274,7 @@ fn a_restart_under_watch_keeps_the_session() {
 
 /// What a reloaded page says, from its own script: the first page leaves what it saw in
 /// `sessionStorage`, and the page that replaces it writes it out.
-const AFTER: &str = "if (sessionStorage.f54) document.body.dataset.result = JSON.stringify({ reloaded: true, first: JSON.parse(sessionStorage.f54), n: document.getElementById(\"b\").textContent });\n";
+const AFTER: &str = "if (sessionStorage.f54) document.body.dataset.result = JSON.stringify({ reloaded: true, first: JSON.parse(sessionStorage.f54), n: document.getElementById(\"b\").textContent, hmr: JSON.parse(sessionStorage.f54hmr || \"[]\") });\n";
 
 fn hot_program(other: &str, label: &str) -> String {
     format!("let stage = 0\nroute GET /stage/:n(int) {{\n    stage = n\n    \"ok\"\n}}\nroute GET /stage = stage\nroute GET /other = \"{}\"\nroute GET /after.js = file(\"after.js\")\ncomponent Count() {{\n    state n = 0\n    <button id=\"b\" onclick={{() => {{ n += 1 }}}}>{}{{n}}</button>\n}}\nroute GET / = <html><body><div><Count/></div><script src=\"/after.js\"></script></body></html>\n", other, label)
@@ -311,6 +311,9 @@ fn a_change_the_page_does_not_use_leaves_it_as_it_is() {
   const b = document.getElementById("b");
   for (let i = 0; i < 3; i++) { b.click(); await tick(30); }
   window.__kept = 1;
+  // What the page decided, as tools hear it (`quillo:hmr`), kept across the reload.
+  const said = [];
+  document.addEventListener("quillo:hmr", (e) => { const d = JSON.parse(e.detail); said.push([d.what, d.why]); sessionStorage.f54hmr = JSON.stringify(said); });
   await fetch("/stage/1");
   // The save to /other lands; the page asks for itself and stays.
   for (let i = 0; i < 300 && (await (await fetch("/other")).text()) !== "b"; i++) await tick(30);
@@ -327,6 +330,7 @@ fn a_change_the_page_does_not_use_leaves_it_as_it_is() {
     let r = page.join().unwrap();
     assert_eq!(r["first"], serde_json::json!({ "kept": true, "n": "n=3", "errors": [] }), "{}", r);
     assert_eq!((r["reloaded"].as_bool(), r["n"].as_str()), (Some(true), Some("count 0")), "{}", r);
+    assert_eq!(r["hmr"], serde_json::json!([["kept", ""], ["reload", "html"]]), "{}", r);
 }
 
 // Q-685's edges, on the server's side: the page's print leaves out its bundle's address (which
@@ -349,4 +353,16 @@ fn a_pages_print_follows_its_html_and_watch_reload_turns_it_off() {
     drop(s);
     let s = support::serve_with(&d.join("main.qwe"), &["--watch=reload"]);
     assert!(support::send(s.port, "GET", "/", &[], "").body.contains("HOT=0"));
+    drop(s);
+    // Live data's version moves with any change of data (here a publish that changes nothing the
+    // page shows): the page's live states follow it, so its print does not.
+    let d = dir("hot-live", "server fn load() = 1\ncomponent C() {\n    state x = live(load)\n    <p>{x}</p>\n}\nroute GET /bump {\n    publish(\"elsewhere\")\n    \"ok\"\n}\nroute GET / = <html><body><div><C/></div></body></html>\n");
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+    let before = support::send(s.port, "GET", "/", &[], "").body;
+    assert!(before.contains(" data-v=\""), "{}", before);
+    support::send(s.port, "GET", "/bump", &[], "");
+    let after = support::send(s.port, "GET", "/", &[], "").body;
+    let v = |p: &str| p.split(" data-v=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    assert_ne!(v(&before), v(&after), "the version moved");
+    assert_eq!(print(s.port), before.split("const h='").nth(1).unwrap().split('\'').next().unwrap(), "the print did not");
 }

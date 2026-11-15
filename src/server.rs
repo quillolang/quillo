@@ -3407,14 +3407,27 @@ fn watch(app: Arc<App>, others: Vec<Arc<App>>, mut files: Vec<PathBuf>, mut seen
 /// What a page's HTML is, the address of its bundle aside (which names its code, compared on
 /// its own): a page told of a new version asks for itself again, and is not reloaded when this
 /// and its code are as they were (FEEDBACK54.md, Q-685; branch hmr).
+/// Live data's version too (`data-v="<seq>:<server>"`, which any change of data moves, a reload's
+/// too): the page's live states follow it themselves (found by Quillo DevTools' tests).
 fn page_print(body: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let mut rest = body;
-    while let Some(i) = rest.find("/_quillo/b/") {
-        rest[..i].hash(&mut h);
-        rest = &rest[i + "/_quillo/b/".len()..];
-        rest = rest.trim_start_matches(|c: char| c.is_ascii_hexdigit());
+    loop {
+        let bundle = rest.find("/_quillo/b/");
+        let live = rest.find(" data-v=\"");
+        match (bundle, live) {
+            (Some(i), l) if l.map_or(true, |l| i < l) => {
+                rest[..i].hash(&mut h);
+                rest = rest[i + "/_quillo/b/".len()..].trim_start_matches(|c: char| c.is_ascii_hexdigit());
+            }
+            (_, Some(l)) => {
+                rest[..l].hash(&mut h);
+                let after = &rest[l + " data-v=\"".len()..];
+                rest = after.find('"').map_or("", |e| &after[e + 1..]);
+            }
+            _ => break,
+        }
     }
     rest.hash(&mut h);
     format!("{:016x}", h.finish())
@@ -3427,8 +3440,10 @@ pub static PLAIN_RELOAD: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 fn dev_script(version: u64, print: &str) -> String {
     // A save that did not load (`err:N:"..."`, `null` once one does) is said over the page, in
     // a shadow root the page's styles do not reach; the page is not reloaded, so what it holds
-    // stays (FEEDBACK54.md, Q-686; branch hmr).
-    const SCRIPT: &str = r#"<script>/*quillo-dev*/(()=>{let v='@V@';const h='@H@',HOT=@HOT@;let c=0,e=0,box=null;const css=j=>{const p=JSON.parse(j);for(const l of document.querySelectorAll('link[rel=stylesheet]')){const u=new URL(l.href,location.href);if(u.origin===location.origin&&p.includes(u.pathname)){u.searchParams.set('quillo',Date.now());const n=l.cloneNode();n.href=u.pathname+u.search;n.onload=()=>l.remove();l.after(n)}}};const said=m=>{if(m===null){if(box){box.remove();box=null}return}if(!box){box=document.createElement('quillo-error');const r=box.attachShadow({mode:'open'});r.innerHTML='<style>:host{all:initial;position:fixed;left:0;right:0;bottom:0;z-index:2147483647;font:13px/1.45 ui-monospace,Menlo,monospace}div{position:relative;margin:8px;padding:12px 44px 12px 14px;background:#fff1f0;color:#5c0000;border:2px solid #c62828;border-radius:6px;max-height:45vh;overflow:auto;box-shadow:0 4px 18px #0005}pre{margin:8px 0 0;white-space:pre-wrap;font:inherit}button{position:absolute;top:8px;right:10px;border:0;background:none;font-size:20px;line-height:1;cursor:pointer;color:inherit}</style><div role="alert"><b>This save did not load: the page shows the version before it.</b><pre></pre><button aria-label="Close">×</button></div>';r.querySelector('button').onclick=()=>{box.remove();box=null};document.documentElement.appendChild(box)}box.shadowRoot.querySelector('pre').textContent=m};const plain=()=>{const w=window[Symbol.for('quillo')]||{};return !HOT||w.hot===false||document.documentElement.hasAttribute('data-reload')};const ids=t=>{const m=/\.ids = (\{.*?\});/.exec(t);return m?JSON.parse(m[1]):null};let busy=null;const hot=t=>busy||(busy=(async()=>{if(plain())return location.reload();try{const r=await fetch(location.href,{cache:'no-store',credentials:'same-origin'});const p=await r.text();const m=/\/\*quillo-dev\*\/\(\(\)=>\{let v='(\d+)';const h='([0-9a-f]+)'/.exec(p)||[],v2=m[1],h2=m[2];if(!r.ok||h2!==h||!v2)return location.reload();const mine=(window[Symbol.for('quillo')]||{}).ids;if(mine){const b=(/\/_quillo\/b\/[0-9a-f]+\.js/.exec(p)||[])[0];const theirs=b?ids(await (await fetch(b,{cache:'no-store'})).text()):null;if(!theirs||Object.keys(mine).some(k=>mine[k]!==theirs[k])||Object.keys(theirs).some(k=>!(k in mine)))return location.reload()}v=v2}catch(x){location.reload()}})().finally(()=>{busy=null}));const seen=t=>{if(t.startsWith('css:')){const i=t.indexOf(':',4);c=+t.slice(4,i)||c;css(t.slice(i+1))}else if(t.startsWith('err:')){const i=t.indexOf(':',4);e=+t.slice(4,i)||e;said(JSON.parse(t.slice(i+1)))}else if(t!==v)return hot(t)};const u=()=>'/_quillo/events?v='+v+'&c='+c+'&e='+e,go=()=>{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u());s.onopen=()=>o=1;s.onmessage=e=>seen(e.data);s.onclose=()=>o?setTimeout(go,1000):fetch(u(),{cache:'no-store'}).then(r=>r.text()).then(async t=>{await seen(t);go()},()=>setTimeout(go,1000))};go()})()</script>"#;
+    // stays (FEEDBACK54.md, Q-686; branch hmr). What the page decided at a new version is told
+    // to tools as a `quillo:hmr` event on the document: { what: "kept" | "reload", why: "html" |
+    // "code" | "off" | "failed", version } (Quillo DevTools shows it).
+    const SCRIPT: &str = r#"<script>/*quillo-dev*/(()=>{let v='@V@';const h='@H@',HOT=@HOT@;let c=0,e=0,box=null;const css=j=>{const p=JSON.parse(j);for(const l of document.querySelectorAll('link[rel=stylesheet]')){const u=new URL(l.href,location.href);if(u.origin===location.origin&&p.includes(u.pathname)){u.searchParams.set('quillo',Date.now());const n=l.cloneNode();n.href=u.pathname+u.search;n.onload=()=>l.remove();l.after(n)}}};const said=m=>{if(m===null){if(box){box.remove();box=null}return}if(!box){box=document.createElement('quillo-error');const r=box.attachShadow({mode:'open'});r.innerHTML='<style>:host{all:initial;position:fixed;left:0;right:0;bottom:0;z-index:2147483647;font:13px/1.45 ui-monospace,Menlo,monospace}div{position:relative;margin:8px;padding:12px 44px 12px 14px;background:#fff1f0;color:#5c0000;border:2px solid #c62828;border-radius:6px;max-height:45vh;overflow:auto;box-shadow:0 4px 18px #0005}pre{margin:8px 0 0;white-space:pre-wrap;font:inherit}button{position:absolute;top:8px;right:10px;border:0;background:none;font-size:20px;line-height:1;cursor:pointer;color:inherit}</style><div role="alert"><b>This save did not load: the page shows the version before it.</b><pre></pre><button aria-label="Close">×</button></div>';r.querySelector('button').onclick=()=>{box.remove();box=null};document.documentElement.appendChild(box)}box.shadowRoot.querySelector('pre').textContent=m};const plain=()=>{const w=window[Symbol.for('quillo')]||{};return !HOT||w.hot===false||document.documentElement.hasAttribute('data-reload')};const ids=t=>{const m=/\.ids = (\{.*?\});/.exec(t);return m?JSON.parse(m[1]):null};const tell=(what,why,ver)=>{try{document.dispatchEvent(new CustomEvent('quillo:hmr',{detail:JSON.stringify({what,why,version:ver})}))}catch(_){}};const again=(why,ver)=>{tell('reload',why,ver);location.reload()};let busy=null;const hot=t=>busy||(busy=(async()=>{if(plain())return again('off',t);try{const r=await fetch(location.href,{cache:'no-store',credentials:'same-origin'});const p=await r.text();const m=/\/\*quillo-dev\*\/\(\(\)=>\{let v='(\d+)';const h='([0-9a-f]+)'/.exec(p)||[],v2=m[1],h2=m[2];if(!r.ok||!v2)return again('failed',t);if(h2!==h)return again('html',v2);const mine=(window[Symbol.for('quillo')]||{}).ids;if(mine){const b=(/\/_quillo\/b\/[0-9a-f]+\.js/.exec(p)||[])[0];const theirs=b?ids(await (await fetch(b,{cache:'no-store'})).text()):null;if(!theirs)return again('failed',v2);if(Object.keys(mine).some(k=>mine[k]!==theirs[k])||Object.keys(theirs).some(k=>!(k in mine)))return again('code',v2)}v=v2;said(null);tell('kept','',v2)}catch(x){again('failed',t)}})().finally(()=>{busy=null}));const seen=t=>{if(t.startsWith('css:')){const i=t.indexOf(':',4);c=+t.slice(4,i)||c;css(t.slice(i+1))}else if(t.startsWith('err:')){const i=t.indexOf(':',4);e=+t.slice(4,i)||e;said(JSON.parse(t.slice(i+1)))}else if(t!==v)return hot(t)};const u=()=>'/_quillo/events?v='+v+'&c='+c+'&e='+e,go=()=>{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u());s.onopen=()=>o=1;s.onmessage=e=>seen(e.data);s.onclose=()=>o?setTimeout(go,1000):fetch(u(),{cache:'no-store'}).then(r=>r.text()).then(async t=>{await seen(t);go()},()=>setTimeout(go,1000))};go()})()</script>"#;
     let hot = !PLAIN_RELOAD.load(std::sync::atomic::Ordering::Relaxed);
     SCRIPT.replace("@V@", &version.to_string()).replace("@H@", print).replace("@HOT@", if hot { "1" } else { "0" })
 }
