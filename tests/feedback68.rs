@@ -288,3 +288,17 @@ fn a_live_loader_reading_a_page_state_is_each_visitors_own() {
     let a = support::send(port, "POST", "/_quillo/rpc/load_mine", &[("content-type", "application/json"), ("origin", "http://localhost"), ("x-quillo-live", "1")], "[]");
     assert!(!a.body.contains("alice") && !a.body.contains("dave") && !a.body.contains("erin"), "a call with no page got a visitor's: {}", a.body);
 }
+
+// The edges no test ran (the coverage run of 0.8.5): an initializer that fails starts its page
+// state as null and says so, and the page is still made; a page state called as a function is an
+// error the route answers; a field of one, and a method on one, read the request's value.
+#[test]
+fn a_failing_initializer_a_call_and_a_field_of_a_page_state() {
+    let src = "state broken = int(\"x\")?\nstate cart = { size: 2, items: [1, 2] }\nroute GET / = `${broken ?? \"null\"} ${cart.size} ${len(cart.items)} ${cart.items.len()}`\nroute GET /set {\n    cart = { size: 5, items: [1] }\n    `${cart.size} ${cart.items.len()}`\n}\nroute GET /call = cart()\n";
+    let d = dir("edges", src);
+    let s = support::serve_with(&d.join("main.qwe"), &["--no-check"]);
+    assert_eq!(get(s.port, "/"), "null 2 2 2");
+    assert_eq!(get(s.port, "/set"), "5 1");
+    assert_eq!(get(s.port, "/"), "null 2 2 2", "the next page starts again");
+    assert_eq!(support::send(s.port, "GET", "/call", &[], "").status, 500);
+}

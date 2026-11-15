@@ -470,7 +470,7 @@ fn kept_program(n_init: &str, label: &str) -> String {
     format!("let stage = 0\nroute GET /stage/:n(int) {{\n    stage = n\n    \"ok\"\n}}\nroute GET /stage = stage\nroute GET /after.js = file(\"after.js\")\ncomponent Count() {{\n    state n = {}\n    state note = \"\"\n    <div><button id=\"b\" onclick={{() => {{ n += 1; note = \"clicked\" }}}}>{}{{n}}</button><span id=\"note\">{{note}}</span></div>\n}}\nroute GET / = <html><body><div><Count/></div><input id=\"free\"/><details id=\"d\"><summary>more</summary>inside</details><script src=\"/after.js\"></script></body></html>\n", n_init, label)
 }
 
-const KEPT_AFTER: &str = "if (sessionStorage.f54k) { const t = (ms) => new Promise((r) => setTimeout(r, ms)); (async () => { for (let i = 0; i < 300 && !(window[Symbol.for(\"quillo\")] || {}).booted; i++) await t(30); await t(100); const QW = window[Symbol.for(\"quillo\")]; document.body.dataset.result = JSON.stringify({ b: document.getElementById(\"b\").textContent, note: document.getElementById(\"note\").textContent, free: document.getElementById(\"free\").value, open: document.getElementById(\"d\").open, remade: QW.remade ?? 0, left: Object.keys(sessionStorage).filter((k) => k.startsWith(\"quillo-keep:\")).length, errors: window.__quilloErrors }); })(); }\n";
+const KEPT_AFTER: &str = "if (sessionStorage.f54k) { const t = (ms) => new Promise((r) => setTimeout(r, ms)); (async () => { for (let i = 0; i < 300 && !(window[Symbol.for(\"quillo\")] || {}).booted; i++) await t(30); await t(100); const QW = window[Symbol.for(\"quillo\")]; document.body.dataset.result = JSON.stringify({ b: document.getElementById(\"b\").textContent, note: document.getElementById(\"note\").textContent, free: document.getElementById(\"free\").value, open: document.getElementById(\"d\").open, remade: QW.remade ?? 0, left: Object.keys(sessionStorage).filter((k) => k.startsWith(\"quillo-keep:\")).length, again: (() => { QW.keep(); const key = Object.keys(sessionStorage).find((k) => k.startsWith(\"quillo-keep:\")); const k = JSON.parse(sessionStorage.getItem(key)); sessionStorage.removeItem(key); return { islands: k.islands.filter(Boolean).length, fields: k.fields.length, open: k.open.length }; })(), errors: window.__quilloErrors }); })(); }\n";
 
 const KEPT_SCRIPT: &str = r#"(async () => {
   const tick = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -513,7 +513,9 @@ fn a_reload_keeps_what_the_page_held() {
         let r = page.join().unwrap();
         assert_eq!(
             r,
-            serde_json::json!({ "b": want_b, "note": want_note, "free": "hello", "open": true, "remade": 0, "left": 0, "errors": [] }),
+            // `again`: what the page as it came back would keep, asked of it here (what ran before a
+            // reload is lost to the runtime's coverage).
+            serde_json::json!({ "b": want_b, "note": want_note, "free": "hello", "open": true, "remade": 0, "left": 0, "again": { "islands": 1, "fields": 1, "open": 1 }, "errors": [] }),
             "to {}",
             to
         );
@@ -704,7 +706,9 @@ fn a_save_keeps_the_servers_data_and_says_so() {
 }
 
 fn morph_program(title: &str, label: &str, more: &str) -> String {
-    format!("let stage = 0\nroute GET /stage/:n(int) {{\n    stage = n\n    \"ok\"\n}}\nroute GET /stage = stage\ncomponent Count(label: str) {{\n    state n = 0\n    <button id=\"b\" onclick={{() => {{ n += 1 }}}}>{{label}} {{n}}</button>\n}}\nroute GET / = <html><head><title>{}</title></head><body><h1 id=\"h\" class=\"{}\">{}</h1><div><Count label=\"{}\"/></div>{}</body></html>\n", title, title, title, label, more)
+    // `Quiet`, never reached for, is not taken up: the page gives it its new HTML whole; the
+    // stylesheet follows the title, so the page's sheets are swapped.
+    format!("let stage = 0\nroute GET /stage/:n(int) {{\n    stage = n\n    \"ok\"\n}}\nroute GET /stage = stage\ncomponent Count(label: str) {{\n    state n = 0\n    <button id=\"b\" onclick={{() => {{ n += 1 }}}}>{{label}} {{n}}</button>\n}}\ncomponent Quiet(label: str) {{\n    state m = 0\n    <i id=\"q\" onclick={{() => {{ m += 1 }}}}>{{label}}</i>\n}}\nroute GET / = <html><head><title>{}</title><link rel=\"stylesheet\" href=\"/{}.css\"/></head><body><h1 id=\"h\" class=\"{}\">{}</h1><div><Count label=\"{}\"/></div><section><Quiet label=\"{}\"/></section>{}</body></html>\n", title, title.to_lowercase(), title, title, label, title, more)
 }
 
 const MORPH_SCRIPT: &str = r##"(async () => {
@@ -718,7 +722,7 @@ const MORPH_SCRIPT: &str = r##"(async () => {
   window.__kept = 1;
   await fetch("/stage/1");
   for (let i = 0; i < 400 && $("#h").textContent !== "Two"; i++) await tick(30);
-  const first = { h: $("#h").textContent, cls: $("#h").className, title: document.title, b: $("#b").textContent };
+  const first = { h: $("#h").textContent, cls: $("#h").className, title: document.title, b: $("#b").textContent, q: $("#q").textContent, sheet: [...document.querySelectorAll("link[rel=stylesheet]")].map((l) => l.getAttribute("href")) };
   await fetch("/stage/2");
   for (let i = 0; i < 400 && !$("#b").textContent.startsWith("clicks"); i++) await tick(30);
   const second = { b: $("#b").textContent };
@@ -759,7 +763,7 @@ fn the_pages_own_html_is_morphed_in_place() {
     let r = page.join().unwrap();
     assert_eq!(
         r,
-        serde_json::json!({ "first": { "h": "Two", "cls": "Two", "title": "Two", "b": "n= 3" }, "second": { "b": "clicks 3" }, "foot": "foot", "said": ["morphed", "morphed", "morphed"], "kept": true, "remade": 0, "errors": [] })
+        serde_json::json!({ "first": { "h": "Two", "cls": "Two", "title": "Two", "b": "n= 3", "q": "Two", "sheet": ["/two.css"] }, "second": { "b": "clicks 3" }, "foot": "foot", "said": ["morphed", "morphed", "morphed"], "kept": true, "remade": 0, "errors": [] })
     );
 }
 
