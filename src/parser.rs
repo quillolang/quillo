@@ -841,6 +841,19 @@ impl Parser {
                 return Ok(out);
             }
             self.top = true;
+            // `state cart = []` at the top: the page's state, shared by its components, one value
+            // for each page that is made (branch global-state). Only the word: a `~` there is
+            // the operator.
+            if matches!(self.peek()?, Tok::Ident(w) if w == "state") {
+                let l = self.line()?;
+                if let Some(n) = self.state_decl()? {
+                    self.expect(&Tok::Assign, "`=` after the state name")?;
+                    let e = self.parse_expr()?;
+                    out.push(Stmt::State(n, e, l));
+                    self.end_stmt()?;
+                    continue;
+                }
+            }
             out.push(self.parse_stmt()?);
             // A `routes` group's other routes, in order (branch route-groups).
             out.append(&mut self.more);

@@ -1837,6 +1837,9 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Global,
+    /// `state cart = []` at the top: the page's, one value for each page made (FEEDBACK68.md;
+    /// branch global-state).
+    PageState,
     Param,
     Let,
     State,
@@ -1899,6 +1902,9 @@ struct Gone {
 }
 
 struct FnCtx {
+    /// A `server fn`'s, or a function's inside one: it runs for no page, so it reads no page
+    /// state (FEEDBACK68.md; branch global-state).
+    server: bool,
     name: String,
     ret: Option<T>,
     err: Option<u16>,
@@ -2694,8 +2700,9 @@ impl Checker {
             self.diag_at(file.clone(), line, Severity::Warning, msg);
             return;
         }
-        // A top-level `let`'s variable, as yet unused and without a signature.
-        if is_let && g.sig.is_none() && !g.used && g.file == *file {
+        // A top-level `let`'s variable, as yet unused and without a signature. Not a page state's:
+        // `state n` and `let n`, or `state n` twice, are two (FEEDBACK68.md; branch global-state).
+        if is_let && g.sig.is_none() && !g.used && g.file == *file && g.kind != Kind::PageState {
             return;
         }
         let at = |f: &str, l: u32| self.shown_at(f, l);
@@ -2791,6 +2798,13 @@ impl Checker {
                             used: true,
                             ready: true,
                         },
+                    );
+                }
+                Stmt::State(n, _, line) => {
+                    self.defines(n, &it.file, *line, false);
+                    self.globals.insert(
+                        n.clone(),
+                        Var { t: T::ANY, sig: None, file: it.file.clone(), line: *line, kind: Kind::PageState, used: false, ready: false },
                     );
                 }
                 Stmt::Let(p, _, line) => {
@@ -3875,7 +3889,8 @@ impl Checker {
                 s.insert(name.to_string(), Var { used, ..v });
             }
             None => {
-                self.globals.insert(name.to_string(), Var { kind: Kind::Global, ..v });
+                let kind = if kind == Kind::State { Kind::PageState } else { Kind::Global };
+                self.globals.insert(name.to_string(), Var { kind, ..v });
             }
         }
     }
@@ -4049,6 +4064,9 @@ impl Checker {
                 if v.kind == Kind::Global && &*v.file != "<builtin>" {
                     self.browser_global(name, &v);
                 }
+                if v.kind == Kind::PageState {
+                    self.page_state_here(name);
+                }
                 if v.kind == Kind::Global && name == "db" && &*v.file == "<builtin>" {
                     self.browser_forbidden(&format!("`{}`", name));
                 }
@@ -4171,6 +4189,15 @@ impl Checker {
         }
     }
 
+    /// A page state is the page's: a `server fn` runs for no page, so it is passed what it needs
+    /// (FEEDBACK68.md, the user's choice of 2026-11-15; branch global-state).
+    fn page_state_here(&mut self, name: &str) {
+        if self.fns.last().is_some_and(|f| f.server) {
+            let f = self.fns.iter().find(|f| f.server).map_or(String::new(), |f| f.name.clone());
+            self.error(format!("`{}` is the page's state, and server fn `{}` runs for no page: pass it as an argument", name, f));
+        }
+    }
+
     fn browser_global(&mut self, name: &str, v: &Var) {
         if self.in_component().is_none() || v.sig.is_some() {
             return;
@@ -4204,6 +4231,7 @@ impl Checker {
             }
         }
         self.fns.push(FnCtx {
+            server: d.server,
             name: d.name.clone(),
             ret: d.ret.as_ref().map(ty_t),
             err: d.err.as_ref().map(ty_bits),
@@ -4466,6 +4494,7 @@ impl Checker {
             self.field_type_typos(p);
         }
         self.fns.push(FnCtx {
+            server: false,
             name: format!("{} {}", r.method, route_path(r)),
             ret: None,
             err: None,
@@ -4746,6 +4775,9 @@ impl Checker {
                         if v.kind == Kind::Global && self.in_component().is_some() && v.sig.is_none() {
                             self.browser_global(name, &v);
                         }
+                        if v.kind == Kind::PageState {
+                            self.page_state_here(name);
+                        }
                         // The one way found for a customer's data to reach another with no
                         // mistake in the SQL. A map keyed by `tenant()` is what the guide says
                         // to do (FEEDBACK20.md, Q-166; branch feedback20-fixes).
@@ -4976,6 +5008,7 @@ impl Checker {
             }
         }
         self.fns.push(FnCtx {
+            server: d.server || self.fns.last().is_some_and(|f| f.server),
             name: d.name.clone(),
             ret: d.ret.as_ref().map(ty_t),
             err: d.err.as_ref().map(ty_bits),
@@ -5027,6 +5060,7 @@ impl Checker {
         self.sequential = false;
         self.quiet += 1;
         self.fns.push(FnCtx {
+            server: d.server || self.fns.last().is_some_and(|f| f.server),
             name: d.name.clone(),
             ret: None,
             err: None,

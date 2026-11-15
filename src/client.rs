@@ -2494,8 +2494,66 @@ impl<'a> Compiler<'a> {
             return Ok(r);
         }
         self.last_here = false;
+        // The page's state: its signal, read and set as a component's state is (FEEDBACK68.md;
+        // branch global-state).
+        if let Some(js) = self.page_state(name)? {
+            self.reactive = true;
+            if let Some(log) = &mut self.read_log {
+                log.push(js.clone());
+            }
+            return Ok(Resolved::State(js));
+        }
         let (js, is_async) = self.global(name, self.line)?;
         Ok(Resolved::Global(js, is_async))
+    }
+
+    /// The signal of the page state `name`, if it is one; its initializer goes in the bundle once,
+    /// for a page the server did not make with it. One the browser cannot run starts as null
+    /// there: a page the server made carries every page state's value.
+    fn page_state(&mut self, name: &str) -> Result<Option<String>, QuilloError> {
+        // Its slot: compiled while a page is made, a read gives that page's value.
+        if !crate::value::page_state_named(&self.it.globals, name) {
+            return Ok(None);
+        }
+        let js = format!("W.gs({})", js_str(name));
+        if self.globals.contains_key(name) {
+            return Ok(Some(js));
+        }
+        self.globals.insert(name.to_string(), (js.clone(), false));
+        let init = self.it.page_states.iter().find(|(n, _)| n.as_str() == name).map(|(_, e)| e.clone());
+        let code = match init {
+            Some(e) => {
+                let def = FnDef {
+                    name: name.to_string(),
+                    params: Vec::new(),
+                    ret: None,
+                    err: None,
+                    effects: None,
+                    server: false,
+                    mcp: false,
+                    component: false,
+                    line: self.line,
+                    body: e,
+                    nesting: 0,
+                    file: None,
+                    doc: None,
+                    hot: Default::default(),
+                    request_use: Default::default(),
+                    runs_by_itself: Default::default(),
+                };
+                let saved = (std::mem::take(&mut self.ctxs), self.counter, self.reactive, self.read_log.take());
+                self.counter = 0;
+                let r = self.function(&def);
+                (self.ctxs, self.counter, self.reactive, self.read_log) = saved;
+                match r {
+                    Ok((code, false)) => code,
+                    _ => "() => null".to_string(),
+                }
+            }
+            None => "() => null".to_string(),
+        };
+        self.defs.push(format!("W.gi({}, {});", js_str(name), code));
+        Ok(Some(js))
     }
 
     /// A top-level name used by browser code: compiled once, on first use.

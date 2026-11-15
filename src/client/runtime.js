@@ -6297,6 +6297,25 @@ function onCleanup(f) {
 // [source, where c is in its `obs`], `s.obs` pairs [reader, where s is in
 // its `src`]. Either side lets go in constant time. Small arrays are made
 // to size (a pushed-to array would keep room for a dozen more).
+// The page's states (`state cart = []` at the top of the program): one signal each, for every
+// component on the page, from what the server's render left them (`QW.g`), else from the
+// initializer the bundle gives (`W.gi`) (FEEDBACK68.md; branch global-state).
+const PageStates = new Map(), PageInits = new Map();
+let PageGiven = null;
+function pageState(name) {
+  let s = PageStates.get(name);
+  if (s) return s;
+  if (PageGiven === null) {
+    const w = window[Symbol.for("quillo")];
+    PageGiven = w && typeof w.g === "string" ? islandJSON(w.g, {}) : {};
+  }
+  const init = PageInits.get(name);
+  s = new Sig(Object.prototype.hasOwnProperty.call(PageGiven, name) ? PageGiven[name] : init ? init() : null);
+  PageStates.set(name, s);
+  if (TOOLS) toolsPage(name, s);
+  return s;
+}
+
 class Sig {
   // `n`: the times it has been claimed by a run that did not hold it, `r` the one that does (see
   // `W.claim`).
@@ -8917,8 +8936,20 @@ function toolsSig(inst, name, s) {
   return s;
 }
 
-// `list`: every component now; `where`: marks one's element for the tool to find (the mark
-// moves with the next `where`); `set`: sets a state, under --watch only.
+// A page state that says when it is set, and is listed: `global`, by name (FEEDBACK68.md;
+// branch global-state).
+function toolsPage(name, s) {
+  s.set = function (v) {
+    const was = this._v;
+    Sig.prototype.set.call(this, v);
+    if (v !== was) toolsSay("global", { name, value: toolsWire(v) });
+    return null;
+  };
+}
+
+// `list`: every component now, and the page's states; `where`: marks one's element for the tool
+// to find (the mark moves with the next `where`); `set`: sets a state (a page's with `global`),
+// under --watch only.
 function toolsAsk(e) {
   let q;
   // A map set from the tool keeps the order the tool wrote (FEEDBACK55.md, Q-875; branch feedback55).
@@ -8928,6 +8959,7 @@ function toolsAsk(e) {
   const inst = TOOLS.all.get(q.target);
   if (q.op === "list") {
     for (const i of TOOLS.all.values()) toolsSay("component", toolsOf(i));
+    for (const [name, s] of PageStates) toolsSay("global", { name, value: toolsWire(s._v) });
     return answer(true);
   }
   if (q.op === "where") {
@@ -8939,7 +8971,7 @@ function toolsAsk(e) {
   }
   if (q.op === "set") {
     if (!DEV) return answer(false, { error: "states are set from a tool under --watch only" });
-    const sig = inst && inst.sigs && hasOwn(inst.sigs, q.name) ? inst.sigs[q.name] : null;
+    const sig = q.global ? PageStates.get(q.name) || null : inst && inst.sigs && hasOwn(inst.sigs, q.name) ? inst.sigs[q.name] : null;
     if (!sig) return answer(false, { error: "no such state" });
     sig.set(untagDeep(q.value));
     return answer(true);
@@ -9259,6 +9291,9 @@ W.choose = choose;
 W.keyed = keyed;
 W.c = comp;
 W.memo = memo;
+// The page's states (FEEDBACK68.md; branch global-state).
+W.gs = pageState;
+W.gi = (name, init) => { if (!PageInits.has(name)) PageInits.set(name, init); };
 W.effect = effect;
 W.props = withDefaults;
 W.spread = spreadAttrs;

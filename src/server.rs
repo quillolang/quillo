@@ -438,6 +438,7 @@ impl Interp {
         self.visitor_read = false;
         self.locale_read = false;
         self.locale = None;
+        self.page_start(&req);
         if !req.body.is_empty() {
             let ctype = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map_or("", |(_, v)| v.as_str());
             if crate::upload::boundary(ctype).is_some() {
@@ -574,6 +575,19 @@ impl Interp {
         if html && req.method != "HEAD" && std::mem::take(&mut self.rendered_island) {
             let has = rfind_tag;
             let mut tags = String::new();
+            // The page's states as its render left them, for its components to start from, before
+            // the code that reads them (FEEDBACK68.md; branch global-state).
+            let page = if self.page_states.is_empty() { Vec::new() } else { crate::value::page_values(&self.globals) };
+            if !page.is_empty() {
+                let mut m = crate::value::Map::new();
+                for (name, v) in page {
+                    m.insert(name.as_str().into(), v);
+                }
+                // As a component's `data-s` is: JSON, read by the runtime's `islandJSON`.
+                let json = crate::interp::island_json(&crate::server::for_visitor(Value::map(m))).to_string();
+                let text = serde_json::Value::String(json).to_string();
+                tags.push_str(&format!("<script>{}.g={}</script>", crate::client::HANDOFF_JS, text.replace("</", "<\\/").replace("<!--", "<\\!--")));
+            }
             // Components translate in the browser too: the page carries its
             // locale's text, read when the (deferred) bundle runs.
             let i18n = match (self.site.i18n.clone(), self.locale()) {

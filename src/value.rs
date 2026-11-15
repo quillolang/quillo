@@ -2650,10 +2650,101 @@ pub fn lookup(env: &Env, name: impl Name) -> Option<Value> {
     let mut cur: &Scope = env;
     loop {
         if let Some(v) = cur.vars().get(name) {
+            if is_page_state(v) {
+                return Some(page_value(cur, name, v));
+            }
             return Some(v.clone());
         }
         cur = cur.parent.as_deref()?;
     }
+}
+
+// ---- page states (FEEDBACK68.md; branch global-state) ----------------------------------------
+//
+// `state cart = []` at the top is the page's: one value for each request, never the globals'.
+// Its slot in the globals holds this builtin, and a read or a write of it goes to the request's
+// own values, kept by the thread that runs the request, by the globals they are of (a mounted
+// program's are its own) and the name.
+
+/// The builtin a page state's slot holds.
+pub const PAGE_STATE: &str = "__page_state";
+
+fn page_marker(_: &mut Interp, _: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
+    Err(Ctrl::Error(Box::new(crate::error::QuilloError::new("a page's state is not a function", line))))
+}
+
+/// What a page state's slot in the globals holds.
+pub fn page_state_marker() -> Value {
+    Value::Builtin(PAGE_STATE, page_marker)
+}
+
+/// Whether `name` in `env` is a page state, asked of its slot (a read gives the request's value).
+pub fn page_state_named(env: &Env, name: impl Name) -> bool {
+    let Some(name) = name.known() else { return false };
+    let mut cur: &Scope = env;
+    loop {
+        if let Some(v) = cur.vars().get(name) {
+            return is_page_state(v);
+        }
+        match cur.parent.as_deref() {
+            Some(p) => cur = p,
+            None => return false,
+        }
+    }
+}
+
+#[inline]
+pub fn is_page_state(v: &Value) -> bool {
+    matches!(v, Value::Builtin(n, _) if *n == PAGE_STATE)
+}
+
+thread_local! {
+    /// The running request's page states (none outside a request for a page), and how many
+    /// reads of one there have been on this thread: a view whose render read one is not cached,
+    /// and a component whose render read one starts with the page.
+    static PAGE: std::cell::RefCell<Option<HashMap<(usize, Sym), Value>>> = const { std::cell::RefCell::new(None) };
+    static PAGE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The request's value of a page state; outside a request for a page, the slot as it is (which
+/// `Interp::eval` says runs for no page).
+#[cold]
+fn page_value(root: &Scope, name: Sym, slot: &Value) -> Value {
+    PAGE_READS.with(|r| r.set(r.get() + 1));
+    PAGE.with(|p| p.borrow().as_ref().and_then(|m| m.get(&(root as *const Scope as usize, name)).cloned())).unwrap_or_else(|| slot.clone())
+}
+
+/// Starts a request's page states afresh (`Some`), or says this request is for no page (`None`).
+pub fn page_begin(values: Option<Vec<(Env, Sym, Value)>>) {
+    PAGE.with(|p| *p.borrow_mut() = values.map(|vs| vs.into_iter().map(|(g, n, v)| ((&*g as *const Scope as usize, n), v)).collect()));
+}
+
+/// The reads of page states on this thread so far.
+pub fn page_reads() -> u64 {
+    PAGE_READS.with(|r| r.get())
+}
+
+/// The request's page states of `globals`, by name, for the page to carry.
+pub fn page_values(globals: &Env) -> Vec<(Sym, Value)> {
+    let root = &**globals as *const Scope as usize;
+    PAGE.with(|p| p.borrow().as_ref().map(|m| m.iter().filter(|((r, _), _)| *r == root).map(|((_, n), v)| (*n, v.clone())).collect()).unwrap_or_default())
+}
+
+/// Sets the page state `name` of `globals` for this request, as its initializer gives it.
+pub fn page_put(globals: &Env, name: Sym, v: Value) {
+    page_set(globals, name, v);
+}
+
+/// Sets a page state's value for this request: false outside a request for a page.
+fn page_set(root: &Scope, name: Sym, v: Value) -> bool {
+    PAGE_READS.with(|r| r.set(r.get() + 1));
+    PAGE.with(|p| match p.borrow_mut().as_mut() {
+        Some(m) => {
+            m.insert((root as *const Scope as usize, name), v);
+            true
+        }
+        None => false,
+    })
 }
 
 /// Whether `env` is `root` or a scope inside it.
@@ -2689,6 +2780,9 @@ pub fn with_var<R>(env: &Env, name: Sym, f: impl FnOnce(&Value) -> R) -> Option<
     let mut cur: &Scope = env;
     loop {
         if let Some(v) = cur.vars().get(name) {
+            if is_page_state(v) {
+                return Some(f(&page_value(cur, name, v)));
+            }
             return Some(f(v));
         }
         cur = cur.parent.as_deref()?;
@@ -2731,6 +2825,10 @@ pub fn lookup_global(env: &Env, name: impl Name) -> Option<(Value, bool)> {
     let mut cur: &Scope = env;
     loop {
         if let Some(v) = cur.vars().get(name) {
+            // A page state is no global: one request's (FEEDBACK68.md).
+            if is_page_state(v) {
+                return Some((page_value(cur, name, v), false));
+            }
             return Some((v.clone(), cur.parent.is_none()));
         }
         cur = cur.parent.as_deref()?;
@@ -2743,6 +2841,11 @@ pub fn assign_global(env: &Env, name: impl Name, v: Value) -> Option<bool> {
     let mut cur: &Scope = env;
     loop {
         if let Some(slot) = cur.vars().get_mut(name) {
+            // A page state's value is the request's, and no global's: no topic, no reader told.
+            // Outside a request for a page, nothing is set (FEEDBACK68.md).
+            if is_page_state(slot) {
+                return page_set(cur, name, v).then_some(false);
+            }
             *slot = v;
             return Some(cur.parent.is_none());
         }

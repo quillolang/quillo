@@ -107,6 +107,41 @@ fn earlier((inner, at): &(Arc<Value>, Place)) -> String {
     format!("it failed before this call, {}", at.before(&text))
 }
 
+impl Interp {
+    /// A request's page states, each from its initializer, in order (one may read another): a
+    /// request to Quillo's own addresses (a `server fn`'s call, live data) is for no page and has
+    /// none. A program with none pays one test (FEEDBACK68.md; branch global-state).
+    pub(crate) fn page_start(&mut self, req: &crate::server::HttpRequest) {
+        if self.page_states.is_empty() {
+            return;
+        }
+        let path = req.url.split('?').next().unwrap_or("");
+        if path.strip_prefix(self.base.as_str()).unwrap_or(path).starts_with("/_quillo/") {
+            crate::value::page_begin(None);
+            return;
+        }
+        crate::value::page_begin(Some(Vec::new()));
+        let globals = self.globals.clone();
+        for (name, e) in self.page_states.clone().iter() {
+            let v = match self.eval(e, &globals) {
+                Ok(v) => v,
+                Err(Ctrl::Error(e)) => {
+                    eprintln!("quillo: the page's state `{}`: {}", name, e);
+                    Value::Nil
+                }
+                Err(_) => Value::Nil,
+            };
+            crate::value::page_put(&globals, *name, v);
+        }
+    }
+}
+
+/// A page state read or set where no page is being made: a job, a timer, a channel's handler, a
+/// `server fn` (FEEDBACK68.md; branch global-state).
+fn no_page(name: &str, line: u32) -> Ctrl {
+    Ctrl::Error(Box::new(QuilloError::new(format!("`{}` is the page's state, and this runs for no page: pass it as an argument", name), line)))
+}
+
 fn undefined(name: &str, line: u32) -> Ctrl {
     Ctrl::Error(Box::new(QuilloError::new(format!("unknown name `{}`{}", name, crate::error::removed_note(name)), line)))
 }
@@ -232,6 +267,9 @@ pub struct Interp {
     /// State of the components being rendered, innermost last, with the
     /// `live(...)` subscriptions of each.
     islands: Vec<(Map, Map)>,
+    /// The program's page states (`state cart = []` at the top) and their initializers, in
+    /// order: each request for a page starts with its own (FEEDBACK68.md; branch global-state).
+    pub(crate) page_states: Arc<Vec<(Sym, Expr)>>,
     /// The value of the `<select>` whose start tag is being written, then what its options are
     /// rendered against (see `render_option_into`; FEEDBACK55.md, Q-758; branch feedback55).
     select_pending: Option<Value>,
@@ -1802,6 +1840,7 @@ impl Interp {
             asked: None,
             who: None,
             islands: Vec::new(),
+            page_states: Default::default(),
             select_pending: None,
             select_want: None,
             island_scopes: Vec::new(),
@@ -1927,6 +1966,7 @@ impl Interp {
             asked: None,
             who: None,
             islands: Vec::new(),
+            page_states: self.page_states.clone(),
             select_pending: None,
             select_want: None,
             island_scopes: Vec::new(),
@@ -2811,6 +2851,15 @@ impl Interp {
             }
             _ => {
                 let Stmt::State(name, e, _) = s else { return Ok(Value::Nil) };
+                // At the top: the page's, never the globals' (FEEDBACK68.md; branch global-state).
+                if self.islands.is_empty() && Arc::ptr_eq(env, &self.globals) {
+                    let mut all = (*self.page_states).clone();
+                    all.retain(|(n, _)| n.as_str() != name.as_str());
+                    all.push((Sym::from(name.as_str()), e.clone()));
+                    self.page_states = Arc::new(all);
+                    define(env, name, crate::value::page_state_marker());
+                    return Ok(Value::Nil);
+                }
                 self.last_live = None;
                 // A component placed in the page (the only island rendering) defers
                 // `defer(...)`: null now, worked out after the page. Its second
@@ -3054,6 +3103,7 @@ impl Interp {
             _ => Vec::new(),
         };
         match assign_global(env, name, v) {
+            None if lookup(env, name).is_some_and(|v| crate::value::is_page_state(&v)) => Err(no_page(name.as_str(), *line)),
             None => fail(
                 *line,
                 format!("cannot assign to `{}`: it was never declared (use `let {} = …`)", name, name),
@@ -3091,7 +3141,11 @@ impl Interp {
                 if self.reads.is_some() || !self.tracks.is_empty() {
                     self.note_global_read(env, n);
                 }
-                lookup(env, *n).ok_or_else(|| undefined(n, *line))
+                let v = lookup(env, *n).ok_or_else(|| undefined(n, *line))?;
+                if crate::value::is_page_state(&v) {
+                    return Err(no_page(n, *line));
+                }
+                Ok(v)
             }
             // As in JavaScript: the operand that decided the result.
             Expr::Binary(BinOp::And, a, b, _) => {
@@ -4958,8 +5012,12 @@ impl Interp {
                 let seq = self.shared.live_seq();
                 self.tracks.push(Default::default());
                 let start = out.len();
+                let page_reads = crate::value::page_reads();
                 let r = self.render_call_plain(c, args.clone(), line, out);
-                let track = self.tracks.pop().unwrap_or_default();
+                let mut track = self.tracks.pop().unwrap_or_default();
+                // A page state is one visitor's page's: a view that read one is that page's alone
+                // (FEEDBACK68.md, Q-963; branch global-state).
+                track.impure |= crate::value::page_reads() != page_reads;
                 if let Some(outer) = self.tracks.last_mut() {
                     outer.deps.extend(track.deps.iter().cloned());
                     outer.impure |= track.impure;
@@ -6042,6 +6100,10 @@ impl Interp {
             self.island_names.push(el.tag.clone());
         }
         self.mark_impure();
+        // A component whose render reads a page state starts with the page, to follow it before
+        // anyone reaches for it (FEEDBACK68.md, the user's choice of 2026-11-15; branch
+        // global-state).
+        let page_reads = crate::value::page_reads();
         self.islands.push((Map::new(), Map::new()));
         self.island_scopes_at.push(self.island_scopes.len());
         // A component placed in the page may defer: what renders it again (branch defer).
@@ -6110,7 +6172,7 @@ impl Interp {
         if self.marked.0 > marked.0 {
             extra.push_str(" data-qm");
         }
-        let eager = c.def.runs_by_itself() || self.marked.1 > marked.1;
+        let eager = c.def.runs_by_itself() || self.marked.1 > marked.1 || crate::value::page_reads() != page_reads;
         let by_itself = eager || !live.is_empty();
         if self.island_wrap(&el.tag, props, state, live, eager, &extra, &body, self.in_svg, nested, out) {
             self.marked.0 += 1;
@@ -6269,6 +6331,7 @@ impl Interp {
     /// had as they were, its deferred ones worked out now.
     pub(crate) fn render_deferred(&mut self, d: &crate::defer::Deferred) -> Result<String, Ctrl> {
         self.state_preset = Some(d.state.clone());
+        let page_reads = crate::value::page_reads();
         self.islands.push((Map::new(), Map::new()));
         self.island_scopes_at.push(self.island_scopes.len());
         let mut body = String::new();
@@ -6298,7 +6361,7 @@ impl Interp {
         // As a component placed in the page says it (see `render_component_into`; FEEDBACK61.md, Q-892;
         // branch feedback61).
         let extra = if self.marked.0 > marked.0 { " data-qm" } else { "" };
-        let eager = d.c.def.runs_by_itself() || self.marked.1 > marked.1;
+        let eager = d.c.def.runs_by_itself() || self.marked.1 > marked.1 || crate::value::page_reads() != page_reads;
         self.island_wrap(&d.tag, d.props.clone(), state, live, eager, extra, &body, d.svg, false, &mut out);
         Ok(out)
     }
