@@ -3954,8 +3954,14 @@ impl Worker {
                         let mut it = it.fork();
                         it.request_id = Some(rid.clone());
                         it.read_only = true;
+                        // With page states of its own: its start replaced the request's, and the
+                        // new version's deferred parts, rendered after, found none (found in
+                        // review).
+                        let mine = crate::value::page_take();
+                        let old_render = run_program(&mut it, &req);
+                        crate::value::page_restore(mine);
                         // Refused (it would change something): none, and the page compares its own.
-                        if let Some(r) = run_program(&mut it, &req).filter(|r| r.status == 200) {
+                        if let Some(r) = old_render.filter(|r| r.status == 200) {
                             resp.headers.push(("x-quillo-was".into(), page_print(&String::from_utf8_lossy(&r.body))));
                         }
                     }

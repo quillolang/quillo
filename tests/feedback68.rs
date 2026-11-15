@@ -237,3 +237,54 @@ fn requests_that_wait_keep_their_own_page_state() {
         assert_eq!(t.join().unwrap(), format!("{} {}", n, n));
     }
 }
+
+// Found in review (Q-963 again, for live data): a live loader that read a page state through a
+// helper had its first run, on the page's render, shared with every visitor asking the same within
+// two seconds, and with a call that had no page. `quillo check` now follows a server fn's calls to
+// the page state; and a run that read one is the visitor's alone even when the check is skipped.
+const LIVE_MINE: &str = r#"state me = ""
+
+fn mine() {
+    return me
+}
+
+fn deeper() = mine()
+
+server fn load_mine() {
+    sleep(100)
+    return deeper()
+}
+
+server fn load_safe(me: str) = me
+server fn load_safer(me: str) = deeper2(me)
+fn deeper2(x: str) = x
+
+component Show() {
+    state v = live(load_mine)
+    <b id="v">{v}</b>
+}
+
+route GET /p/:who {
+    me = who
+    <html><body><div><Show/></div></body></html>
+}
+"#;
+
+#[test]
+fn a_live_loader_reading_a_page_state_is_each_visitors_own() {
+    let d = dir("live-mine", LIVE_MINE);
+    let (ok, said) = check(&d);
+    assert!(!ok && said.contains("`me` is the page's state, and server fn `load_mine` runs for no page (it reads it through `mine`)"), "{}", said);
+    assert!(!said.contains("load_safe"), "{}", said);
+    let s = support::serve_with(&d.join("main.qwe"), &["--no-check"]);
+    let port = s.port;
+    for round in [&["alice", "bob"][..], &["carol", "dave", "erin"][..]] {
+        let got: Vec<_> = round.iter().map(|n| { let p = format!("/p/{}", n); std::thread::spawn(move || support::send(port, "GET", &p, &[], "").body) }).collect();
+        for (t, n) in got.into_iter().zip(round.iter()) {
+            let body = t.join().unwrap();
+            assert!(body.contains(&format!("<b id=\"v\">{}</b>", n)), "{}: {}", n, body);
+        }
+    }
+    let a = support::send(port, "POST", "/_quillo/rpc/load_mine", &[("content-type", "application/json"), ("origin", "http://localhost"), ("x-quillo-live", "1")], "[]");
+    assert!(!a.body.contains("alice") && !a.body.contains("dave") && !a.body.contains("erin"), "a call with no page got a visitor's: {}", a.body);
+}

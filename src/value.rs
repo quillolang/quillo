@@ -2738,6 +2738,27 @@ pub fn page_begin(values: Option<Vec<(Env, Sym, Value)>>) {
     page_here(|r| *r = PageRequest { values, reads: 0 });
 }
 
+/// The running request's page states, taken out (none left), to be put back by `page_restore`:
+/// what runs in between (the version a save replaced, rendering for a print) has its own.
+pub struct PageSaved(Option<PageRequest>);
+
+pub fn page_take() -> PageSaved {
+    let n = crate::httpd::request_number();
+    PageSaved(PAGE.with(|p| p.borrow_mut().remove(&n)))
+}
+
+pub fn page_restore(saved: PageSaved) {
+    let n = crate::httpd::request_number();
+    PAGE.with(|p| match saved.0 {
+        Some(r) => {
+            p.borrow_mut().insert(n, r);
+        }
+        None => {
+            p.borrow_mut().remove(&n);
+        }
+    });
+}
+
 /// The request numbered `n` has ended: its page states go.
 pub fn page_end(n: usize) {
     PAGE.with(|p| {

@@ -3693,6 +3693,7 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             it.acted = false;
             let outer = it.reads.replace(std::collections::HashSet::new());
             let in_run = std::mem::replace(&mut it.in_run, true);
+            let page_reads = crate::value::page_reads();
             let r = it.call(&f, rest.clone(), line);
             it.in_run = in_run;
             let topics = std::mem::replace(&mut it.reads, outer).unwrap_or_default();
@@ -3701,7 +3702,11 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             }
             let mut topics: Vec<String> = topics.into_iter().collect();
             topics.sort();
-            let personal = it.read_request;
+            // A page state is one visitor's page's: a run that read one is theirs alone, as one
+            // that read the visitor is (FEEDBACK68.md, Q-963, found in review: a loader reading
+            // one through a helper gave the first visitor's to the next, and to a call with no
+            // page; branch global-state).
+            let personal = it.read_request || crate::value::page_reads() != page_reads;
             it.read_request |= read;
             // What it did is told to a run around it; one that read the viewer or acted is no one
             // else's, even the viewer's other tab (FEEDBACK55.md, Q-881 and Q-888; branch

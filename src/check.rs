@@ -2730,6 +2730,7 @@ impl Checker {
             self.sql_name_fns.extend(found);
         }
         self.check_nesting(&order);
+        self.page_states_through_calls(&order);
         for (file, e) in std::mem::take(&mut self.natives) {
             let sig = native_sig(&e, &file);
             let short = file.rsplit('/').next().unwrap_or(&file).to_string();
@@ -4186,6 +4187,63 @@ impl Checker {
     fn browser_forbidden(&mut self, what: &str) {
         if let Some(c) = self.in_component() {
             self.error(format!("{} is not available in the browser, where <{}> also runs; use a `server fn`", what, c));
+        }
+    }
+
+    /// A `server fn` that reads a page state through the program's functions (`return mine()`,
+    /// `fn mine() { return cart }`): it ran on the page's render, where there is one, and failed
+    /// at its next call or live refresh, where there is none (FEEDBACK68.md, found in review;
+    /// branch global-state). Each function's reads and calls, followed to the end. A name a
+    /// function takes as a parameter is its own.
+    fn page_states_through_calls(&mut self, order: &[Item]) {
+        let states: HashSet<String> = order.iter().filter_map(|it| if let Stmt::State(n, ..) = &it.stmt { Some(n.clone()) } else { None }).collect();
+        if states.is_empty() {
+            return;
+        }
+        let defs: Vec<(&Arc<str>, &Arc<FnDef>)> = order.iter().filter_map(|it| if let Stmt::Fn(d) = &it.stmt { Some((&it.file, d)) } else { None }).collect();
+        // Each function: the page states it reads itself, and the functions it calls.
+        let mut reads: HashMap<String, (Option<String>, Vec<String>)> = HashMap::new();
+        for (_, d) in &defs {
+            let params: HashSet<String> = d.params.iter().map(|p| p.name.to_string()).collect();
+            let mut own = None;
+            walk_fn(d, &mut |x| {
+                if let Expr::Ident(n, _) = x {
+                    if own.is_none() && states.contains(n.as_str()) && !params.contains(n.as_str()) {
+                        own = Some(n.to_string());
+                    }
+                }
+            });
+            let mut calls = Vec::new();
+            called_names(&d.body, &mut calls);
+            reads.insert(d.name.clone(), (own, calls));
+        }
+        // What each reaches: (the page state, through which function), followed until nothing new.
+        let mut reach: HashMap<String, (String, String)> = reads.iter().filter_map(|(f, (own, _))| own.clone().map(|s| (f.clone(), (s, f.clone())))).collect();
+        loop {
+            let mut more = Vec::new();
+            for (f, (_, calls)) in &reads {
+                if reach.contains_key(f) {
+                    continue;
+                }
+                if let Some(r) = calls.iter().find_map(|c| reach.get(c)) {
+                    more.push((f.clone(), r.clone()));
+                }
+            }
+            if more.is_empty() {
+                break;
+            }
+            reach.extend(more);
+        }
+        for (file, d) in defs {
+            if !d.server {
+                continue;
+            }
+            if let Some((state, through)) = reach.get(&d.name) {
+                if through != &d.name {
+                    let msg = format!("`{}` is the page's state, and server fn `{}` runs for no page (it reads it through `{}`): pass it as an argument", state, d.name, through);
+                    self.diag_at(file.clone(), d.line, Severity::Error, msg);
+                }
+            }
         }
     }
 

@@ -817,3 +817,22 @@ fn the_old_versions_render_changes_nothing() {
     assert!(support::send(s.port, "GET", "/calm", &[("x-quillo-hot", &v1)], "").header("x-quillo-was").is_some());
     assert_eq!(support::send(s.port, "POST", "/calm", &[("x-quillo-hot", &v1)], "").header("x-quillo-was"), None);
 }
+
+// Found in review: the old version's render (for the page's print) started its own page states
+// over the request's, and the new version's deferred parts, rendered after it, found none: the
+// page stayed on its placeholder, with an error in the log.
+#[test]
+fn the_old_render_leaves_the_requests_page_states_alone() {
+    let src = "state me = \"init\"\nfn mine() {\n    return me\n}\nserver fn slow() {\n    sleep(50)\n    return mine()\n}\ncomponent Page() {\n    state s = defer(slow())\n    <div>{s == null ? <p>still waiting</p> : <p id=\"d\">{s}</p>}</div>\n}\nroute GET /other = \"a\"\nroute GET /d/:who {\n    me = who\n    <html><body><Page/></body></html>\n}\n";
+    let d = dir("old-render-states", src);
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch", "--no-check"]);
+    let v1 = support::send(s.port, "GET", "/_quillo/events", &[], "").body;
+    std::fs::write(d.join("main.qwe"), src.replace("\"a\"", "\"b\"")).unwrap();
+    let end = Instant::now() + Duration::from_secs(20);
+    while support::send(s.port, "GET", "/other", &[], "").body != "b" {
+        assert!(Instant::now() < end);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let a = support::send(s.port, "GET", "/d/carol", &[("x-quillo-hot", &v1)], "");
+    assert!(a.body.contains("<p id=\"d\">carol</p>"), "{}", a.body);
+}
