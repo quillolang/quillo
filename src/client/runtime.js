@@ -9082,13 +9082,18 @@ function loadScript(url) {
 async function hotSwap(urls) {
   for (const u of urls) await loadScript(u);
   const outer = [...document.querySelectorAll(ISLANDS)].filter((i) => !(i.parentElement && i.parentElement.closest(ISLANDS)));
-  for (let el of outer) {
+  for (const el of outer) if (el.__qi && el.isConnected) remakeIsland(el, el.__qp || el.__qi.props);
+}
+
+// The island `el`, taken up, made again with the code there is now and `props`, its states and
+// those of the components inside it kept (see `Inst.made`, `takeHydration`).
+function remakeIsland(el, props) {
+  {
     const old = el.__qi;
-    if (!old || !el.isConnected) continue;
     const def = C[el.dataset.c];
     if (!def) throw new Error(`quillo: unknown component <${el.dataset.c}>`);
     const states = (i) => { const o = {}; for (const [k, sig] of Object.entries(i.sigs || {})) o[k] = sig._v; return o; };
-    const s0 = states(old), props = el.__qp || old.props;
+    const s0 = states(old);
     // Those inside it, in the page's order, by component: each made again takes the next of its
     // name's, as a page being taken up does (see `takeHydration`).
     const inner = {};
@@ -9113,6 +9118,88 @@ async function hotSwap(urls) {
     el.__qi = inst;
     el.__qp = props;
   }
+}
+
+// The page's own HTML, outside its components, as a save's version of it has it (FEEDBACK54.md,
+// A.3): `html` is the page asked for again. Planned first, done only if all of it can be: text
+// and attributes changed in place; a node added or taken away at the end of an element (none
+// holding a component or a script); an island of the same component kept, made again with its new
+// props when they changed (its states kept), its HTML and state the new page's when it was not
+// taken up; <title>, and the page's stylesheets swapped. Anything else (another element in a
+// place, a script of the program's that differs, <head>'s scripts): false, and the page reloads,
+// keeping what it holds (A.6). Quillo's own scripts (its loader, the page's states, the dev
+// script) are left as they are.
+function hotMorph(html) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const own = (n) => n.nodeType === 1 && n.localName === "script" && (/Symbol\.for\(["']quillo["']\)/.test(n.textContent) || n.textContent.startsWith("/*quillo-dev*/") || /\/_quillo\//.test(n.getAttribute("src") || ""));
+  const holds = (n) => n.nodeType === 1 && (n.matches(ISLANDS) || n.localName === "script" || !!n.querySelector(ISLANDS + ",script"));
+  const ops = [];
+  const attrs = (old, now) => {
+    const want = [...now.attributes].map((a) => [a.name, a.value]);
+    if (want.length === old.attributes.length && want.every(([k, v]) => old.getAttribute(k) === v)) return;
+    ops.push(() => {
+      for (const a of [...old.attributes]) if (!now.hasAttribute(a.name)) old.removeAttribute(a.name);
+      for (const [k, v] of want) if (old.getAttribute(k) !== v) old.setAttribute(k, v);
+    });
+  };
+  const plan = (old, now) => {
+    if (old.nodeType !== now.nodeType) return false;
+    if (old.nodeType === 3 || old.nodeType === 8) {
+      if (old.data !== now.data) ops.push(() => { old.data = now.data; });
+      return true;
+    }
+    if (old.nodeType !== 1) return true;
+    if (old.localName !== now.localName) return false;
+    if (old.matches(ISLANDS)) {
+      if (!now.matches(ISLANDS) || old.dataset.c !== now.dataset.c) return false;
+      if (old.__qi) {
+        if (old.dataset.p !== now.dataset.p) ops.push(() => {
+          old.dataset.p = now.dataset.p;
+          const props = islandJSON(now.dataset.p, {});
+          if (typeof props.children === "string") props.children = rawHtml(props.children);
+          remakeIsland(old, props);
+        });
+      } else if (old.outerHTML !== now.outerHTML) {
+        ops.push(() => {
+          for (const a of [...old.attributes]) if (!now.hasAttribute(a.name)) old.removeAttribute(a.name);
+          for (const a of [...now.attributes]) old.setAttribute(a.name, a.value);
+          old.innerHTML = now.innerHTML;
+        });
+      }
+      return true;
+    }
+    if (old.localName === "script") return old.textContent === now.textContent && old.getAttribute("src") === now.getAttribute("src");
+    attrs(old, now);
+    const oc = [...old.childNodes].filter((n) => !own(n)), nc = [...now.childNodes].filter((n) => !own(n));
+    const n = Math.min(oc.length, nc.length);
+    for (let i = 0; i < n; i++) if (!plan(oc[i], nc[i])) return false;
+    for (const extra of oc.slice(n)) { if (holds(extra)) return false; ops.push(() => extra.remove()); }
+    const added = nc.slice(n);
+    if (added.some(holds)) return false;
+    if (added.length) {
+      const after = n ? oc[n - 1] : null;
+      ops.push(() => {
+        let ref = after ? after.nextSibling : old.firstChild;
+        for (const a of added) old.insertBefore(document.importNode(a, true), ref);
+      });
+    }
+    return true;
+  };
+  // <head>: its scripts must be as they were; its title and stylesheets follow.
+  const heads = (d) => [...d.head.querySelectorAll("script")].filter((x) => !own(x)).map((x) => (x.getAttribute("src") || "") + "\n" + x.textContent).join("\0");
+  if (heads(document) !== heads(doc)) return false;
+  if (!plan(document.body, doc.body)) return false;
+  if (document.title !== doc.title) ops.push(() => { document.title = doc.title; });
+  const sheets = (d) => [...d.head.querySelectorAll("link[rel=stylesheet]")].map((l) => l.getAttribute("href"));
+  const was = sheets(document), now = sheets(doc);
+  if (was.join("\0") !== now.join("\0")) {
+    ops.push(() => {
+      for (const l of [...document.head.querySelectorAll("link[rel=stylesheet]")]) if (!now.includes(l.getAttribute("href"))) l.remove();
+      for (const href of now) if (!was.includes(href)) { const l = document.createElement("link"); l.rel = "stylesheet"; l.href = href; document.head.appendChild(l); }
+    });
+  }
+  for (const op of ops) op();
+  return true;
 }
 
 // An island taken up: its component (and those inside it) resumed from
@@ -9243,7 +9330,7 @@ function boot() {
   // keys it had (branch early-events).
   const held = QW.q || [];
   const redo = QW.redo;
-  if (DEV) { QW.keep = keepPage; QW.swap = hotSwap; keptPageBack(); }
+  if (DEV) { QW.keep = keepPage; QW.swap = hotSwap; QW.morph = hotMorph; keptPageBack(); }
   QW.booted = true;
   for (const r of held.splice(0)) {
     const i = outerIsland(r.el);

@@ -634,7 +634,7 @@ fn touch() {
   same one on every server. Without it, a random key is made at start: sessions end
   when the server stops. Under `--watch` the key is kept in `.quillo/.quillo-secret`
   beside the program instead (its owner's alone, and never served), so a restart keeps
-  you signed in *(since 0.8.4: a random key there too)*. The server warns when it starts if the secret is shorter than
+  you signed in *(since 0.8.5: a random key there too)*. The server warns when it starts if the secret is shorter than
   32 bytes, as it does for `QUILLO_SERVICE_SECRET` and `LIMER_ADMIN_SECRET`: a short one
   can be guessed offline from one signed cookie.
 - `set_cookie(name, value, { max_age, path, domain, http_only, secure, same_site })` and
@@ -1286,7 +1286,7 @@ component Board() {
   server sends on it, and `.send(value)` sends one to the server. On the server, while
   the page is rendered, it opens nothing. The component loads as soon as the page is idle,
   as one with `listen` does, so it hears what comes before anyone touches the page
-  *(since 0.8.4: only once someone reached for it, unless it was the page)*. `f` may
+  *(since 0.8.5: only once someone reached for it, unless it was the page)*. `f` may
   answer on the channel it is the callback of, since it runs after the `let` is set: the
   server greets each page as it joins (again, after a drop), and the page says which room
   it shows:

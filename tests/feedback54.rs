@@ -352,9 +352,11 @@ fn a_pages_print_follows_its_html_and_watch_reload_turns_it_off() {
     let d = dir("hot-print", &hot_program("a", "n="));
     std::fs::write(d.join("after.js"), AFTER).unwrap();
     let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+    // The print as the dev script holds it, `let v='N',h='...'` (a let since A.3: a morphed page
+    // takes the new one; the test changed for that).
     let print = |port: u16| {
         let p = support::send(port, "GET", "/", &[], "").body;
-        p.split("const h='").nth(1).unwrap().split('\'').next().unwrap().to_string()
+        p.split(",h='").nth(1).unwrap().split('\'').next().unwrap().to_string()
     };
     let first = print(s.port);
     assert_eq!(print(s.port), first, "the same page, the same print");
@@ -380,7 +382,7 @@ fn a_pages_print_follows_its_html_and_watch_reload_turns_it_off() {
     let after = support::send(s.port, "GET", "/", &[], "").body;
     let v = |p: &str| p.split(" data-v=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
     assert_ne!(v(&before), v(&after), "the version moved");
-    assert_eq!(print(s.port), before.split("const h='").nth(1).unwrap().split('\'').next().unwrap(), "the print did not");
+    assert_eq!(print(s.port), before.split(",h='").nth(1).unwrap().split('\'').next().unwrap(), "the print did not");
 }
 
 const TASKS: &str = "let tasks = [\"first\"]\nserver fn list() = tasks\nroute POST /add {\n    tasks = tasks + [\"more\"]\n    publish(\"var:tasks\")\n    \"ok\"\n}\nroute GET /other = \"OTHER\"\ncomponent List() {\n    state items = live(list)\n    <ul id=\"l\">{for t in items => <li>{t}</li>}</ul>\n}\nroute GET / = <html><body><div><List/></div></body></html>\n";
@@ -389,7 +391,7 @@ const TASKS: &str = "let tasks = [\"first\"]\nserver fn list() = tasks\nroute PO
 /// print of what that version renders now.
 fn asked(port: u16, was: &str) -> (String, Option<String>) {
     let a = support::send(port, "GET", "/", &[("x-quillo-hot", was)], "");
-    let print = a.body.split("const h='").nth(1).unwrap().split('\'').next().unwrap().to_string();
+    let print = a.body.split(",h='").nth(1).unwrap().split('\'').next().unwrap().to_string();
     (print, a.header("x-quillo-was").map(String::from))
 }
 
@@ -493,9 +495,9 @@ fn a_reload_keeps_what_the_page_held() {
         return;
     };
     let _turn = chrome_turn();
-    // A save that changes the page outside its islands (after them, so paths stay), as a reload
-    // needs (changed with A.2: a component's label is swapped in place now).
-    let outside = |p: String| p.replace("</body>", "<p>more</p></body>");
+    // A save that changes the program's own script, as a reload needs (changed with A.2 and A.3:
+    // a component's label is swapped in place, and the page's own HTML morphed).
+    let outside = |p: String| p.replace("<script src=\"/after.js\">", "<script src=\"/after.js?2\">");
     for (to, want_b, want_note) in [(outside(kept_program("0", "n=")), "n=3", "clicked"), (outside(kept_program("\"zero\"", "n=")), "n=zero", "clicked")] {
         let d = dir("kept", &kept_program("0", "n="));
         std::fs::write(d.join("after.js"), KEPT_AFTER).unwrap();
@@ -699,4 +701,64 @@ fn a_save_keeps_the_servers_data_and_says_so() {
     let line = reloaded(&d, &log, &DATA.replace("\"Shop\"", "\"My shop\""), 1);
     assert!(!line.contains("kept"), "{}", line);
     assert_eq!(support::send(port, "GET", "/n", &[], "").body, "0 My shop 0");
+}
+
+fn morph_program(title: &str, label: &str, more: &str) -> String {
+    format!("let stage = 0\nroute GET /stage/:n(int) {{\n    stage = n\n    \"ok\"\n}}\nroute GET /stage = stage\ncomponent Count(label: str) {{\n    state n = 0\n    <button id=\"b\" onclick={{() => {{ n += 1 }}}}>{{label}} {{n}}</button>\n}}\nroute GET / = <html><head><title>{}</title></head><body><h1 id=\"h\" class=\"{}\">{}</h1><div><Count label=\"{}\"/></div>{}</body></html>\n", title, title, title, label, more)
+}
+
+const MORPH_SCRIPT: &str = r##"(async () => {
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  const $ = (s) => document.querySelector(s);
+  $("#b").dispatchEvent(new Event("focusin", { bubbles: true }));
+  for (let i = 0; i < 300 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
+  const said = [];
+  document.addEventListener("quillo:hmr", (e) => { const d = JSON.parse(e.detail); said.push(d.what); });
+  for (let i = 0; i < 3; i++) { $("#b").click(); await tick(30); }
+  window.__kept = 1;
+  await fetch("/stage/1");
+  for (let i = 0; i < 400 && $("#h").textContent !== "Two"; i++) await tick(30);
+  const first = { h: $("#h").textContent, cls: $("#h").className, title: document.title, b: $("#b").textContent };
+  await fetch("/stage/2");
+  for (let i = 0; i < 400 && !$("#b").textContent.startsWith("clicks"); i++) await tick(30);
+  const second = { b: $("#b").textContent };
+  await fetch("/stage/3");
+  for (let i = 0; i < 400 && !$("#foot"); i++) await tick(30);
+  const QW = window[Symbol.for("quillo")];
+  document.body.dataset.result = JSON.stringify({ first, second, foot: ($("#foot") || {}).textContent, said, kept: window.__kept === 1, remade: QW.remade ?? 0, errors: window.__quilloErrors });
+})();"##;
+
+// FEEDBACK54.md, A.3: a save that changes the page's own HTML outside its components (a heading's
+// text and class, the title) no longer reloads it: the page morphs onto the new HTML, its
+// components kept as they are; a component whose props the page changed is made again with them,
+// its states kept; a node added at the end is added. The page says "morphed".
+#[test]
+fn the_pages_own_html_is_morphed_in_place() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let d = dir("morph", &morph_program("One", "n=", ""));
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+    let port = s.port;
+    let page = std::thread::spawn(move || in_chrome(&chrome, &format!("http://127.0.0.1:{}/", port), MORPH_SCRIPT));
+    let wait = |n: &str| {
+        let end = Instant::now() + Duration::from_secs(30);
+        while support::send(port, "GET", "/stage", &[], "").body != n {
+            assert!(Instant::now() < end, "stage {}", n);
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    };
+    wait("1");
+    std::fs::write(d.join("main.qwe"), morph_program("Two", "n=", "")).unwrap();
+    wait("2");
+    std::fs::write(d.join("main.qwe"), morph_program("Two", "clicks", "")).unwrap();
+    wait("3");
+    std::fs::write(d.join("main.qwe"), morph_program("Two", "clicks", "<p id=\"foot\">foot</p>")).unwrap();
+    let r = page.join().unwrap();
+    assert_eq!(
+        r,
+        serde_json::json!({ "first": { "h": "Two", "cls": "Two", "title": "Two", "b": "n= 3" }, "second": { "b": "clicks 3" }, "foot": "foot", "said": ["morphed", "morphed", "morphed"], "kept": true, "remade": 0, "errors": [] })
+    );
 }

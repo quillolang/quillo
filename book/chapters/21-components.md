@@ -719,7 +719,7 @@ component Dashboard() {
   or calls a `done` function it is given. There is no
   context: what is narrower than the page goes down as props. What the whole page shares
   is a [page state](#page-state), `state cart = []` at the top of the program, which
-  components placed separately in a page read and set alike *(since 0.8.4: none; they
+  components placed separately in a page read and set alike *(since 0.8.5: none; they
   shared through the server)*.
 - Props are passed live: a child shows its parent's new value without either running
   again. Each component keeps its own state; give components in a list a `key={...}`

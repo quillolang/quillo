@@ -310,7 +310,7 @@ demos show each of these running beside its code.
 ## What a save keeps
 
 Under [`--watch`](#options-of-quillo-run), a save is put into the open pages with as little lost
-as can be *(since 0.8.4: every save reloaded every page, and the server's data started again)*:
+as can be *(since 0.8.5: every save reloaded every page, and the server's data started again)*:
 
 - **Nothing the page uses changed** (a route it never calls, a server fn's body): the page stays
   as it is.
@@ -321,9 +321,14 @@ as can be *(since 0.8.4: every save reloaded every page, and the server's data s
   the same kind keeps the value. The components inside it keep theirs, by component and order
   (`<Row/><Row/>` with a third added before them shifts them, as when a page is taken up). Its
   effects, `@mount` and timers run again, as its code is new.
-- **The page's HTML outside its components changed, or the runtime did**: the page reloads, and
-  keeps what it can: each component's states by the same rule, a field a person typed into that
-  nothing follows, an open `<details>`, the scroll and the focus.
+- **The page's own HTML changed**, outside its components (a heading, a class, the title, a
+  node added at the end of an element): the page takes the new HTML in place, its components as
+  they are; one whose props the page changed is made again with them, keeping its states. The
+  page's stylesheets follow.
+- **What cannot be put in place** (another element where one was, a script of the program's that
+  differs, the runtime itself): the page reloads, and keeps what it can: each component's states
+  by the same rule, a field a person typed into that nothing follows, an open `<details>`, the
+  scroll and the focus.
 - **On the server**, each top-level `let` the program changes somewhere (its data) keeps its value
   while the new version starts it as the same kind of value; one whose kind changed, or that holds
   a function or a handle, starts again. A `let` the program never changes is code, and follows
