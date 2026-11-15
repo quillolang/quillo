@@ -323,6 +323,24 @@ fn live_page(port: u16, since: u64, topic: &str) -> Page {
     Page(s)
 }
 
+/// `live_page`, once the server has a place for it: with one place a client, the long poll
+/// `seq` made gives its place back just after its answer is written, and on a busy machine the
+/// next request can come first (it did on CI: 503).
+fn live_page_when_free(port: u16, since: u64, topic: &str) -> Page {
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        write!(s, "GET /_quillo/live?since={}&t={} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", since, topic).unwrap();
+        let h = head(&mut s);
+        if h.starts_with(b"HTTP/1.1 101") {
+            return Page(s);
+        }
+        assert!(h.starts_with(b"HTTP/1.1 503") && Instant::now() < end, "{}", String::from_utf8_lossy(&h));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn changed(m: &str) -> serde_json::Value {
     serde_json::from_str::<serde_json::Value>(m).unwrap()["changed"].clone()
 }
@@ -433,10 +451,18 @@ fn a_refused_live_upgrade_gives_its_place_back() {
     let d = dir("live-refused", LIVE);
     let s = support::serve_with(&d.join("main.qwe"), &["--live-per-client", "1"]);
     let at = seq(s.port);
-    let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
-    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    write!(c, "GET /_quillo/live?since={}&t=x HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: k\r\nSec-WebSocket-Version: 12\r\n\r\n", at).unwrap();
-    assert!(head(&mut c).starts_with(b"HTTP/1.1 426"));
+    // Once `seq`'s long poll has given its place back (see `live_page_when_free`).
+    let mut c = None;
+    assert!(until(10, || {
+        let mut t = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+        t.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(t, "GET /_quillo/live?since={}&t=x HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: k\r\nSec-WebSocket-Version: 12\r\n\r\n", at).unwrap();
+        let h = head(&mut t);
+        assert!(h.starts_with(b"HTTP/1.1 426") || h.starts_with(b"HTTP/1.1 503"), "{}", String::from_utf8_lossy(&h));
+        c = h.starts_with(b"HTTP/1.1 426").then_some(t);
+        c.is_some()
+    }), "the long poll's place was not given back");
+    let mut c = c.unwrap();
     let mut b = [0u8; 1];
     assert_eq!(c.read(&mut b).unwrap_or(0), 0);
     // Its place is given back once its task has ended, which may be just after the close.
@@ -549,7 +575,7 @@ fn a_live_page_gone_in_the_middle_of_a_frame_gives_its_place_back() {
     let d = dir("live-cut", LIVE);
     let s = support::serve_with(&d.join("main.qwe"), &["--live-per-client", "1"]);
     let at = seq(s.port);
-    let mut p = live_page(s.port, at, "cut");
+    let mut p = live_page_when_free(s.port, at, "cut");
     // A text frame's head for 100 bytes, its mask, and 3 of them; then it hangs up.
     p.0.write_all(&[0x81, 0x80 | 100, 1, 2, 3, 4, b'a', b'b', b'c']).unwrap();
     p.0.shutdown(std::net::Shutdown::Write).unwrap();
