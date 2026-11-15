@@ -142,6 +142,17 @@ fn no_page(name: &str, line: u32) -> Ctrl {
     Ctrl::Error(Box::new(QuilloError::new(format!("`{}` is the page's state, and this runs for no page: pass it as an argument", name), line)))
 }
 
+/// A name read that gives no value: unknown, or a page state where no page is made.
+#[cold]
+#[inline(never)]
+fn name_missing(name: &str, line: u32, page_state: bool) -> Ctrl {
+    if page_state {
+        no_page(name, line)
+    } else {
+        undefined(name, line)
+    }
+}
+
 fn undefined(name: &str, line: u32) -> Ctrl {
     Ctrl::Error(Box::new(QuilloError::new(format!("unknown name `{}`{}", name, crate::error::removed_note(name)), line)))
 }
@@ -3141,11 +3152,13 @@ impl Interp {
                 if self.reads.is_some() || !self.tracks.is_empty() {
                     self.note_global_read(env, n);
                 }
-                let v = lookup(env, *n).ok_or_else(|| undefined(n, *line))?;
-                if crate::value::is_page_state(&v) {
-                    return Err(no_page(n, *line));
+                // The miss out of line: in line, the page state's check made every `eval` frame
+                // 16 bytes larger, and a 3,000-deep walk ran out of stack on Linux (CI run
+                // 43733282629, feedback52_jit).
+                match lookup(env, *n) {
+                    Some(v) if !crate::value::is_page_state(&v) => Ok(v),
+                    found => Err(name_missing(n, *line, found.is_some())),
                 }
-                Ok(v)
             }
             // As in JavaScript: the operand that decided the result.
             Expr::Binary(BinOp::And, a, b, _) => {
