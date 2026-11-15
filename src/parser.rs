@@ -1512,7 +1512,7 @@ impl Parser {
         name_unmarked_styles(&mut body, ours);
         // Its `///` comment (FEEDBACK56.md, Q-854; branch feedback56).
         let doc = self.lx.doc_above(line);
-        Ok(FnDef { name, params, ret, err, effects, server: false, mcp: false, component: false, body, line, nesting, file: self.file.clone(), doc, hot: Default::default(), request_use: Default::default() })
+        Ok(FnDef { name, params, ret, err, effects, server: false, mcp: false, component: false, body, line, nesting, file: self.file.clone(), doc, hot: Default::default(), request_use: Default::default(), runs_by_itself: Default::default() })
     }
 
     /// `style <css>` at a file's top level: the CSS of the components the file declares, and no
@@ -1544,7 +1544,7 @@ impl Parser {
             args[1] = Expr::Lit(Lit::Nil);
         }
         let body = Expr::Block(vec![Stmt::Expr(Expr::Call(Box::new(Expr::Ident("__style".into(), line)), args, line))]);
-        Ok(Stmt::Fn(Arc::new(FnDef { name, params: Vec::new(), ret: None, err: None, effects: None, server: false, mcp: false, component: false, body, line, nesting: 1, file: self.file.clone(), doc: None, hot: Default::default(), request_use: Default::default() })))
+        Ok(Stmt::Fn(Arc::new(FnDef { name, params: Vec::new(), ret: None, err: None, effects: None, server: false, mcp: false, component: false, body, line, nesting: 1, file: self.file.clone(), doc: None, hot: Default::default(), request_use: Default::default(), runs_by_itself: Default::default() })))
     }
 
     /// `style <css>` in a component's or view's body: the call of `__style`,
@@ -1636,7 +1636,7 @@ impl Parser {
         let (mut body, nesting) = body?;
         name_unmarked_styles(&mut body, ours);
         let doc = self.lx.doc_above(line);
-        let def = FnDef { name, params, ret: None, err: None, effects: None, server: false, mcp, component: true, body, line, nesting, file: self.file.clone(), doc, hot: Default::default(), request_use: Default::default() };
+        let def = FnDef { name, params, ret: None, err: None, effects: None, server: false, mcp, component: true, body, line, nesting, file: self.file.clone(), doc, hot: Default::default(), request_use: Default::default(), runs_by_itself: Default::default() };
         key_not_a_param(&def)?;
         Ok(def)
     }
@@ -4115,7 +4115,7 @@ fn arrow(params: Vec<Param>, ret: Option<Ty>, (body, nesting): (Expr, u32), line
         file,
         doc: None,
         hot: Default::default(),
-        request_use: Default::default(),
+        request_use: Default::default(), runs_by_itself: Default::default(),
     }))
 }
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- A component's callback may answer on the channel it is the callback of: `let room =
+  channel.open(name, (m) => room.send(...))` passed `quillo check`, and the server then did not
+  start ("unknown name `room`", from the component's compile for the browser). A function in a
+  `let`'s initializer may use the name it is given, as on the server (FEEDBACK66.md, Q-950).
+- A component with `channel.open` loads as soon as the page is idle, as one with `listen` does,
+  and hears what the server sends before anyone touches the page; it waited for someone to reach
+  for it, unless it was the page itself (FEEDBACK66.md, Q-953).
+- `quillo check` no longer says a channel's handle is "a value from the page shown in markup"
+  when a handler sends on it, or when its callback calls `js(...)`, with a fix that did not
+  compile; what does show a page's value is still warned of (FEEDBACK66.md, Q-952).
+- `quillo dap` no longer verifies a breakpoint on a line only the browser runs (a component's
+  handler, a channel's or a timer's callback), which never stopped: it says so, and a coverage
+  tool on the debugger can leave such lines out (FEEDBACK66.md, Q-951).
+
 ## 0.8.4 (2026-11-15)
 
 - A page on a channel no longer takes three threads on the server, nor a page with live data one,

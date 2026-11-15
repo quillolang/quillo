@@ -238,6 +238,8 @@ pub struct FnDef {
     pub hot: std::sync::atomic::AtomicU32,
     /// What its code does with `request`, once asked (see `FnDef::request_use`).
     pub request_use: std::sync::atomic::AtomicU8,
+    /// Whether a component runs by itself, once asked (see `FnDef::runs_by_itself`).
+    pub runs_by_itself: std::sync::atomic::AtomicU8,
 }
 
 impl FnDef {
@@ -256,6 +258,22 @@ impl FnDef {
             self.request_use.store(known, Relaxed);
         }
         (known & NAMES != 0, known & VISITOR != 0)
+    }
+
+    /// Whether its body starts timers, live data or a channel, or runs JavaScript, without anyone
+    /// touching it (`island::runs_by_itself`). Worked out once, not on each render: the body was
+    /// walked on each, and `channel.open` made the walk longer (FEEDBACK66.md, Q-953; branch
+    /// feedback66).
+    pub fn runs_by_itself(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        const KNOWN: u8 = 1;
+        const YES: u8 = 2;
+        let mut known = self.runs_by_itself.load(Relaxed);
+        if known == 0 {
+            known = KNOWN | if crate::island::runs_by_itself(&self.body) { YES } else { 0 };
+            self.runs_by_itself.store(known, Relaxed);
+        }
+        known & YES != 0
     }
 }
 
@@ -387,7 +405,7 @@ impl RouteDef {
                 file: self.file.clone(),
                 doc: None,
                 hot: Default::default(),
-                request_use: Default::default(),
+                request_use: Default::default(), runs_by_itself: Default::default(),
             })
         });
         self

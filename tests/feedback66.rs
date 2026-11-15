@@ -807,3 +807,62 @@ route GET / = <html><body><C/></body></html>
 "#;
     assert_eq!(page_value_warnings(src, "shown"), vec!["both", "w", "ws"]);
 }
+
+// Q-953: a component whose only code is `channel.open` waited for someone to reach for it, and
+// heard nothing the server sent until then (in `<body>` itself it is the page, which loads at
+// once, as the report's probe had it). It now runs by itself, as one with `listen` does. A
+// channel opened only in a handler is opened when someone acts, and another `open` is not one.
+const NEWS: &str = r#"let n = 0
+fn tick() with net {
+    n += 1
+    let _ = channel.broadcast("news", { n })
+}
+every(100, tick)
+
+component News() {
+    state heard = 0
+    let ch = channel.open("news", (m) => { heard += 1 })
+    <p id="h">{heard}</p>
+}
+
+component Later() {
+    state heard = 0
+    <button id="b" onclick={() => {
+        let ch = channel.open("news", (m) => { heard += 1 })
+    }}>{heard}</button>
+}
+
+component Other() {
+    state k = 0
+    let door = { open: (x) => x + 1 }
+    <p id="o">{door.open(k)}</p>
+}
+
+route GET / = <html><body><div><News/></div></body></html>
+route GET /later = <html><body><div><Later/><Other/></div></body></html>
+"#;
+
+#[test]
+fn a_component_on_a_channel_starts_by_itself() {
+    let d = dir("news", NEWS);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let eager = |path: &str| {
+        let page = support::send(s.port, "GET", path, &[], "").body;
+        page.match_indices("<quillo-island").map(|(at, _)| page[at..at + page[at..].find('>').unwrap()].contains("data-e")).collect::<Vec<_>>()
+    };
+    assert_eq!(eager("/"), vec![true]);
+    assert_eq!(eager("/later"), vec![false, false]);
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping the browser half: no Chrome");
+        return;
+    };
+    let script = r#"(async () => {
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  let h = "0";
+  for (let i = 0; i < 300 && +h < 3; i++) { await tick(30); h = document.getElementById("h").textContent; }
+  document.body.dataset.result = JSON.stringify({ h: +h, errors: window.__quilloErrors });
+})();"#;
+    let r = in_chrome(&chrome, &format!("http://127.0.0.1:{}/", s.port), script);
+    assert!(r["h"].as_u64().unwrap() >= 3, "{}", r);
+    assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
+}

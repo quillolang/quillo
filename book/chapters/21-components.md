@@ -490,8 +490,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   code fail to load, they are done as the page alone does them. (The idea comes from
   Flickr, Google's JSAction, Angular's preboot and event replay, Qwik and React: see
   Acknowledgements in the [README](README.md#acknowledgements).) A
-  component that runs by itself (`every`, `live`, `listen`, `js`, `js_new`, `@mount` in
-  its code or markup, or in a component nested inside it) or that is the page (in
+  component that runs by itself (`every`, `live`, `listen`, `channel.open`, `js`, `js_new`,
+  `@mount` in its code or markup, or in a component nested inside it) or that is the page (in
   `<body>` itself, an app) loads as soon as the page is idle. `/_quillo/quillo.js` has
   every component, for pages that load it themselves. Text responses are gzipped for
   browsers that accept it.

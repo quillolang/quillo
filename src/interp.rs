@@ -2763,7 +2763,7 @@ impl Interp {
                     file: None,
                     doc: None,
                     hot: Default::default(),
-                    request_use: Default::default(),
+                    request_use: Default::default(), runs_by_itself: Default::default(),
                 });
                 define(env, &td.name, Value::Func(Arc::new(Closure { def, env: env.clone() })));
                 Ok(Value::Nil)
@@ -6110,7 +6110,7 @@ impl Interp {
         if self.marked.0 > marked.0 {
             extra.push_str(" data-qm");
         }
-        let eager = crate::island::runs_by_itself(&c.def.body) || self.marked.1 > marked.1;
+        let eager = c.def.runs_by_itself() || self.marked.1 > marked.1;
         let by_itself = eager || !live.is_empty();
         if self.island_wrap(&el.tag, props, state, live, eager, &extra, &body, self.in_svg, nested, out) {
             self.marked.0 += 1;
@@ -6298,7 +6298,7 @@ impl Interp {
         // As a component placed in the page says it (see `render_component_into`; FEEDBACK61.md, Q-892;
         // branch feedback61).
         let extra = if self.marked.0 > marked.0 { " data-qm" } else { "" };
-        let eager = crate::island::runs_by_itself(&d.c.def.body) || self.marked.1 > marked.1;
+        let eager = d.c.def.runs_by_itself() || self.marked.1 > marked.1;
         self.island_wrap(&d.tag, d.props.clone(), state, live, eager, extra, &body, d.svg, false, &mut out);
         Ok(out)
     }

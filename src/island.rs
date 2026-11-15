@@ -139,6 +139,13 @@ pub fn root_without_island_attrs(rest: &str, out: &mut String) {
 /// anyone touching it: timers, live data, the page's own JavaScript.
 const BY_ITSELF: &[&str] = &["every", "live", "listen", "js", "js_new"];
 
+/// `channel.open(...)`: what the server sends comes by itself, as `listen`'s does. A component
+/// with only that waited for a touch, and heard nothing until then (FEEDBACK66.md, Q-953;
+/// branch feedback66).
+fn opens_a_channel(f: &Expr) -> bool {
+    matches!(f, Expr::Field(o, n, _) if n == "open" && matches!(&**o, Expr::Ident(c, _) if c == "channel"))
+}
+
 /// Whether a component's body (not its event handlers, which only run when
 /// someone acts) starts timers or live data, runs JavaScript, or has an
 /// element with `@mount`.
@@ -149,7 +156,7 @@ pub fn runs_by_itself(e: &Expr) -> bool {
         // the component up already.
         Expr::Lambda(_) => false,
         Expr::Call(f, args, _) => {
-            matches!(&**f, Expr::Ident(n, _) if BY_ITSELF.contains(&n.as_str())) || runs_by_itself(f) || args.iter().any(runs_by_itself)
+            matches!(&**f, Expr::Ident(n, _) if BY_ITSELF.contains(&n.as_str())) || opens_a_channel(f) || runs_by_itself(f) || args.iter().any(runs_by_itself)
         }
         Expr::Template(parts) => parts.iter().any(|p| matches!(p, TPart::Expr(e) if runs_by_itself(e))),
         Expr::List(es) => es.iter().any(runs_by_itself),

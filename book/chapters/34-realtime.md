@@ -115,7 +115,10 @@ one shows in both, after its sender's name.
 - **In a component**, `channel.open(name, f)` opens the channel for as long as the code
   that called it stands: `f` gets each message the server sends on it, and `.send(value)`
   sends one to the server. When the component leaves the page, the page leaves the
-  channel. While the server renders the page, it opens nothing.
+  channel. While the server renders the page, it opens nothing. The component starts as
+  soon as the page is idle, so it hears what comes before anyone touches the page, and
+  `f` may answer on the channel it belongs to (`if m.t == "hello" { room.send(...) }`):
+  it runs after the `let` is set.
 - **On the server**, `channel.on(name, f)` gets each message from a page as `f(msg,
   peer)`, where `peer` is `{ id, session }`. `session()` inside `f` is that page's
   session too (as it was when the page connected). Messages are handled like UDP

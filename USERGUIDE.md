@@ -1744,8 +1744,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   code fail to load, they are done as the page alone does them. (The idea comes from
   Flickr, Google's JSAction, Angular's preboot and event replay, Qwik and React: see
   Acknowledgements in the [README](README.md#acknowledgements).) A
-  component that runs by itself (`every`, `live`, `listen`, `js`, `js_new`, `@mount` in
-  its code or markup, or in a component nested inside it) or that is the page (in
+  component that runs by itself (`every`, `live`, `listen`, `channel.open`, `js`, `js_new`,
+  `@mount` in its code or markup, or in a component nested inside it) or that is the page (in
   `<body>` itself, an app) loads as soon as the page is idle. `/_quillo/quillo.js` has
   every component, for pages that load it themselves. Text responses are gzipped for
   browsers that accept it.
@@ -4788,7 +4788,30 @@ component Board() {
 - In a component, `channel.open(name, f)` opens a channel for as long as the code that
   called it stands (the component leaving the page closes it): `f` gets each message the
   server sends on it, and `.send(value)` sends one to the server. On the server, while
-  the page is rendered, it opens nothing.
+  the page is rendered, it opens nothing. The component loads as soon as the page is idle,
+  as one with `listen` does, so it hears what comes before anyone touches the page
+  *(since 0.8.4: only once someone reached for it, unless it was the page)*. `f` may
+  answer on the channel it is the callback of, since it runs after the `let` is set: the
+  server greets each page as it joins (again, after a drop), and the page says which room
+  it shows:
+
+  ```quillo
+  channel.on("room", (msg, peer) => {
+      if msg.op == "open" { channel.send("room", peer, { t: "shown", room: msg.room }) }
+  }, { join: (peer) => {
+      channel.send("room", peer, { t: "hello" })
+      true
+  } })
+
+  component Room(id: str) {
+      state shown = ""
+      let room = channel.open("room", (m) => {
+          if m.t == "hello" { room.send({ op: "open", room: id }) }
+          if m.t == "shown" { shown = m.room }
+      })
+      <p>{shown}</p>
+  }
+  ```
 - On the server, `channel.on(name, f, { join, leave, tenants })` is written at the top of a
   program, once for a name. A name is letters, digits, `_`, `-`, `.` and `:`, at most
   64 characters. `f(msg, peer)` gets each message from a page; `peer` is `{ id,

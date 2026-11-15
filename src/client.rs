@@ -2260,7 +2260,7 @@ impl<'a> Compiler<'a> {
                             file: None,
                             doc: None,
                             hot: Default::default(),
-                            request_use: Default::default(),
+                            request_use: Default::default(), runs_by_itself: Default::default(),
                         };
                         let saved = std::mem::take(&mut self.ctxs);
                         let r = self.function(&def);
@@ -2611,7 +2611,7 @@ impl<'a> Compiler<'a> {
             file: None,
             doc: None,
             hot: Default::default(),
-            request_use: Default::default(),
+            request_use: Default::default(), runs_by_itself: Default::default(),
         };
         // Until made, references to it (from functions it holds) find it.
         self.globals.insert(name.to_string(), (js.to_string(), false));
