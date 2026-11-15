@@ -623,3 +623,80 @@ fn components_inside_a_swapped_one_keep_their_states() {
     let r = page.join().unwrap();
     assert_eq!(r, serde_json::json!({ "o": "open: true", "after": ["a 1", "b 2"], "clicked": "a 2", "said": ["swapped"], "remade": 0, "errors": [] }));
 }
+
+const DATA: &str = "let notes = []\nlet title = \"Shop\"\nlet count = 0\nlet helper = null\nroute POST /add {\n    notes = notes + [\"x\"]\n    count += 1\n    helper = (y) => y\n    \"ok\"\n}\nroute GET /n = `${len(notes)} ${title} ${count}`\n";
+
+/// `quillo run --watch` with its log in a file: the server, and where its log is.
+fn logged(d: &Path, port: u16) -> (Bare, PathBuf) {
+    let log = d.join("server.log");
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .arg(d.join("main.qwe"))
+        .args(["--port", &port.to_string(), "--watch"])
+        .env("QUILLO_SECRET", "test secret for the tests")
+        .current_dir(d)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let end = Instant::now() + Duration::from_secs(20);
+    while !support::listening(port) {
+        assert!(Instant::now() < end, "the server did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (Bare(child), log)
+}
+
+/// Saves `src` and waits for the reload's line, the `n`th: that line.
+fn reloaded(d: &Path, log: &Path, src: &str, n: usize) -> String {
+    std::fs::write(d.join("main.qwe"), src).unwrap();
+    let end = Instant::now() + Duration::from_secs(20);
+    loop {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        if let Some(l) = text.lines().filter(|l| l.starts_with("quillo: reloaded ")).nth(n - 1) {
+            return l.to_string();
+        }
+        assert!(Instant::now() < end, "no reload {}: {}", n, text);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+// Q-687, Part C: a save started the server's data again (top-level lets emptied, a :memory:
+// database too) and said nothing. Under --watch a let the program changes keeps its value across a
+// save while its kind is the same, and the reload's line says so; one whose kind changed, or that
+// holds a function, starts again, said too; a let the program never changes is code and follows
+// the edit; a :memory: database starts again, said.
+#[test]
+fn a_save_keeps_the_servers_data_and_says_so() {
+    let d = dir("data", DATA);
+    let port = support::free_port();
+    let (_s, log) = logged(&d, port);
+    support::send(port, "POST", "/add", &[], "");
+    support::send(port, "POST", "/add", &[], "");
+    assert_eq!(support::send(port, "GET", "/n", &[], "").body, "2 Shop 2");
+    let line = reloaded(&d, &log, &DATA.replace("\"Shop\"", "\"My shop\""), 1);
+    assert_eq!(support::send(port, "GET", "/n", &[], "").body, "2 My shop 2", "{}", line);
+    assert!(line.contains("; kept notes, count") && line.contains("started again: helper (it holds fn)"), "{}", line);
+    let line = reloaded(&d, &log, &DATA.replace("\"Shop\"", "\"My shop\"").replace("let count = 0", "let count = \"\""), 2);
+    assert!(line.contains("kept notes") && line.contains("count (its type changed: int to str)"), "{}", line);
+    assert_eq!(support::send(port, "GET", "/n", &[], "").body, "2 My shop ", "{}", line);
+    let line = reloaded(&d, &log, &format!("db.open(\":memory:\")\n{}", DATA), 3);
+    assert!(line.contains(":memory: database starts again empty"), "{}", line);
+    // Not under --reload (production): nothing carried, nothing said.
+    drop(_s);
+    let d = dir("data-reload", DATA);
+    let port = support::free_port();
+    let log = d.join("server.log");
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo")).arg("run").arg(d.join("main.qwe")).args(["--port", &port.to_string(), "--reload"]).env("QUILLO_SECRET", "test secret for the tests").current_dir(&d).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::fs::File::create(&log).unwrap()).spawn().unwrap();
+    let _s = Bare(child);
+    let end = Instant::now() + Duration::from_secs(20);
+    while !support::listening(port) {
+        assert!(Instant::now() < end);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    support::send(port, "POST", "/add", &[], "");
+    let line = reloaded(&d, &log, &DATA.replace("\"Shop\"", "\"My shop\""), 1);
+    assert!(!line.contains("kept"), "{}", line);
+    assert_eq!(support::send(port, "GET", "/n", &[], "").body, "0 My shop 0");
+}

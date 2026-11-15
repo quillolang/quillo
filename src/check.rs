@@ -9920,6 +9920,12 @@ pub fn walk_pattern(p: &Pattern, f: &mut dyn FnMut(&Expr)) {
     }
 }
 
+/// Calls `f` on every expression in `stmts` (FEEDBACK54.md, Part C: a reload looking for a
+/// `:memory:` database).
+pub(crate) fn each_expr_of(stmts: &[Stmt], f: &mut dyn FnMut(&Expr)) {
+    walk_stmts(stmts, f)
+}
+
 fn walk_stmts(stmts: &[Stmt], f: &mut dyn FnMut(&Expr)) {
     for s in stmts {
         match s {

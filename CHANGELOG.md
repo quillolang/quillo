@@ -11,6 +11,13 @@
 - Under `--watch`, a save that does not load is said over the open pages, which keep what they
   hold, until a save loads; it said nothing, and the pages showed the version before it as if
   the save had worked (FEEDBACK54.md, Q-686).
+- Under `--watch`, a component whose code changed is swapped into the open pages in place, no
+  reload: its states (and those of the components inside it) keep their values while their kind
+  is the same. A page that must reload (its HTML outside components changed) keeps its states,
+  the fields typed into, open `<details>`, the scroll and the focus. On the server, a top-level
+  `let` the program changes keeps its value across a save while its kind is the same, and the
+  reload's line says what was kept; a `:memory:` database starts again, said too (FEEDBACK54.md,
+  A.2, A.6, Part C, Q-687).
 - Under `--watch`, a change a page does not use (a route it never calls) no longer refreshes it:
   the page asks for itself again and stays when its HTML and code are as they were.
   `--watch=reload`, or `<html data-reload>` on a page, refreshes at every change, as before

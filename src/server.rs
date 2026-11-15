@@ -3044,6 +3044,9 @@ impl App {
         // Said once: the checker's lines above are the errors (FEEDBACK55.md, Q-852; branch
         // feedback55).
         let checked_out = !problems.is_empty();
+        // The version this one replaces, whose data a save under --watch carries (Part C).
+        let before = if self.watch { Some(self.current().1) } else { None };
+        let mut carried = String::new();
         self.shared.gil.acquire();
         // Services are loaded again with it (into a table of its own: see
         // `shared::Services`).
@@ -3060,6 +3063,11 @@ impl App {
         } else {
             Err(crate::error::QuilloError::new(problems, 0))
         };
+        if let (Ok(_), Some(before)) = (&res, &before) {
+            if let Loaded::Ready(old) = &**before {
+                carried = carry_data(old, &it);
+            }
+        }
         self.shared.gil.release();
         // What a failed load read or tried is watched until one loads (FEEDBACK55.md, Q-836;
         // branch feedback55).
@@ -3071,7 +3079,7 @@ impl App {
                 // "1 route", as when it starts (FEEDBACK55.md, Q-852; branch feedback55).
                 let n = it.routes.iter().filter(|r| r.method != crate::ast::GUARD_METHOD).count();
                 if say {
-                    eprintln!("quillo: reloaded {} ({} route{})", self.main_file.display(), n, if n == 1 { "" } else { "s" });
+                    eprintln!("quillo: reloaded {} ({} route{}){}", self.main_file.display(), n, if n == 1 { "" } else { "s" }, carried);
                 }
                 // A version that is the first to use services or `db.atomic`
                 // needs what delivers and recovers in the background.
@@ -3148,6 +3156,61 @@ impl App {
         }
         files
     }
+}
+
+/// Under --watch, what the version a save replaced held, carried into the new one (FEEDBACK54.md,
+/// Part C and Q-687, the user's rules of 2026-11-04 and 2026-11-15; branch hmr): each top-level
+/// `let` the program changes somewhere (its data: one it never changes is code, and follows the
+/// edit), when the new version still has it, its value is plain data (no function, handle or
+/// response in it), and the new one starts as the same kind of value (or as null). What was kept
+/// and what started again is said on the reload's line, and so is a `:memory:` database, which
+/// starts again empty (the user's choice). Mounted programs and services start again.
+fn carry_data(old: &Interp, new: &Interp) -> String {
+    fn plain(v: &Value) -> bool {
+        match v {
+            Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Str(_) | Value::Html(_) => true,
+            Value::List(xs) => xs.iter().all(plain),
+            Value::Map(m) => m.values().all(plain),
+            Value::Err(v, ..) => plain(v),
+            Value::Func(_) | Value::Builtin(..) | Value::Response(_) => false,
+        }
+    }
+    let mut assigned = std::collections::HashSet::new();
+    let mut lets = Vec::new();
+    let mut memory = false;
+    for stmts in new.program.iter() {
+        crate::check::global_assigned(stmts, &mut assigned);
+        for st in stmts.iter() {
+            if let crate::ast::Stmt::Let(p, ..) = st {
+                crate::check::pattern_names(p, &mut lets);
+            }
+        }
+        crate::check::each_expr_of(stmts, &mut |e| memory |= matches!(e, crate::ast::Expr::Lit(crate::ast::Lit::Str(s)) if &**s == ":memory:"));
+    }
+    let (mut kept, mut reset) = (Vec::new(), Vec::new());
+    lets.dedup();
+    for name in lets.iter().filter(|n| assigned.contains(n.as_str())) {
+        let (Some(was), Some(now)) = (crate::value::lookup(&old.globals, name.as_str()), crate::value::lookup(&new.globals, name.as_str())) else { continue };
+        if !plain(&was) {
+            reset.push(format!("{} (it holds {})", name, was.type_name()));
+        } else if !matches!(now, Value::Nil) && now.type_name() != was.type_name() {
+            reset.push(format!("{} (its type changed: {} to {})", name, was.type_name(), now.type_name()));
+        } else {
+            crate::value::assign(&new.globals, name.as_str(), was);
+            kept.push(name.clone());
+        }
+    }
+    let mut line = String::new();
+    if !kept.is_empty() {
+        line.push_str(&format!("; kept {}", kept.join(", ")));
+    }
+    if !reset.is_empty() {
+        line.push_str(&format!("; started again: {}", reset.join(", ")));
+    }
+    if memory {
+        line.push_str("; the :memory: database starts again empty (open a file to keep its rows across saves)");
+    }
+    line
 }
 
 /// Each file's time, and where it leads: a link pointed elsewhere is a change (FEEDBACK31.md,

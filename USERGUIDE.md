@@ -51,7 +51,7 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | `--port N`, `--host H` | where to listen (default `$PORT` or 8080, on 127.0.0.1). Give `--port` when 8080 is taken or a host names the port; `--port 0` takes any free one (`platform().server.port` says which). Give `--host 0.0.0.0` to be reached from other machines without a proxy in front; `--host localhost` is 127.0.0.1 |
 | `--listen unix:PATH` *(since 0.7)* | listen on a Unix socket instead of a TCP port, when a web server on the same machine passes requests on (on a shared server, so the neighbours cannot reach the port): made with mode 0600, removed when the server stops, and at most 100 bytes long (a short path relative to the folder `quillo` runs in). A `$PORT` that holds an absolute path (`/home/u/app.sock`, or `unix:/home/u/app.sock`) is taken the same way. Not with `--split`, `--instances`, `--register` or `--join` (see [Quillo on a shared server](#quillo-on-a-shared-server-cpanel)) |
 | `--socket-mode 660` *(since 0.7)* | with `--listen`: the socket's permissions, in octal, when the web server reaches it through the owner's group; the owner must keep read and write (`600`, the default) |
-| `--watch`, `-w` | while you work on the program: reload when it or a `use`d file changes (a symbolic link pointed elsewhere, to a file or a folder, counts, within a second), show errors on the page, and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's). Started, or reloaded, while a file is broken or missing, it watches every file that load read or tried and the folders of those not there, so fixing or making one loads the program; each error is said once. A save that does not load while one that did is served is said over the open pages, which keep what they hold, until a save loads. A page whose HTML and code a change left alone (an edit to a route it never calls) is not refreshed; `--watch=reload` refreshes every page at every change, and so does a page with `<html data-reload>`. With no `QUILLO_SECRET`, sessions are signed with a key kept in `.quillo/.quillo-secret`, so a restart does not sign you out. Not in production |
+| `--watch`, `-w` | while you work on the program: reload when it or a `use`d file changes (a symbolic link pointed elsewhere, to a file or a folder, counts, within a second), show errors on the page, and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's). Started, or reloaded, while a file is broken or missing, it watches every file that load read or tried and the folders of those not there, so fixing or making one loads the program; each error is said once. A save that does not load while one that did is served is said over the open pages, which keep what they hold, until a save loads. A page whose HTML and code a change left alone (an edit to a route it never calls) is not refreshed, and a component whose code changed is swapped into the open pages in place, keeping its states (see [What a save keeps](#what-a-save-keeps)); `--watch=reload` refreshes every page at every change, and so does a page with `<html data-reload>`. The server's own data, a top-level `let` the program changes, is kept across a save too. With no `QUILLO_SECRET`, sessions are signed with a key kept in `.quillo/.quillo-secret`, so a restart does not sign you out. Not in production |
 | `--reload` | in production, for a program whose files change while it runs (a deploy that copies new files, a plugin editor): reload when files change, with no errors shown on pages and no page refreshes; with `--instances`, each instance loads the change, the first checking it, so one that does not check reaches none; `--split` passes it to its services |
 | `--env-file F` | when the settings are not in the `.env` beside the program: a file kept outside the site's folder, or one file per place (`--env-file prod.env`); a path from the folder `quillo` runs in, which must exist |
 | `--policy FILE` *(since 0.7)* | before a deploy, or on a server you share: narrow what the program may do, after `/etc/quillo/policy.toml` and before the `quillo.policy` beside it; may be given more than once (see [The policy](#the-policy)) |
@@ -3546,6 +3546,35 @@ stopped).
 
 On [quillolang.org's Reactivity page](https://quillolang.org/docs/reactivity/), live
 demos show each of these running beside its code.
+
+
+### What a save keeps
+
+Under [`--watch`](#options-of-quillo-run), a save is put into the open pages with as little lost
+as can be *(since 0.8.4: every save reloaded every page, and the server's data started again)*:
+
+- **Nothing the page uses changed** (a route it never calls, a server fn's body): the page stays
+  as it is.
+- **A component's code changed**: it is swapped into the page in place, no reload. Each state
+  keeps its value while the new code starts it as the same kind of value (a number stays a
+  number, a list a list; a state that starts as `null` takes any); one whose kind changed starts
+  again from its new initializer, and the browser's console says so. A changed initializer of
+  the same kind keeps the value. The components inside it keep theirs, by component and order
+  (`<Row/><Row/>` with a third added before them shifts them, as when a page is taken up). Its
+  effects, `@mount` and timers run again, as its code is new.
+- **The page's HTML outside its components changed, or the runtime did**: the page reloads, and
+  keeps what it can: each component's states by the same rule, a field a person typed into that
+  nothing follows, an open `<details>`, the scroll and the focus.
+- **On the server**, each top-level `let` the program changes somewhere (its data) keeps its value
+  while the new version starts it as the same kind of value; one whose kind changed, or that holds
+  a function or a handle, starts again. A `let` the program never changes is code, and follows
+  the edit. A `:memory:` database starts again empty. The reload's line says what was kept:
+  `quillo: reloaded main.qwe (3 routes); kept notes, count; started again: cart (its type changed:
+  list to map)`.
+- A save that does not load is said over the page, which keeps showing the version before it.
+
+`--watch=reload` (or `<html data-reload>` on a page) reloads at every save, keeping nothing.
+`--reload`, for production, carries nothing either.
 
 ## Routes
 

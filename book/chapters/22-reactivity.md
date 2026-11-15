@@ -305,3 +305,32 @@ stopped).
 
 On [quillolang.org's Reactivity page](https://quillolang.org/docs/reactivity/), live
 demos show each of these running beside its code.
+
+
+## What a save keeps
+
+Under [`--watch`](#options-of-quillo-run), a save is put into the open pages with as little lost
+as can be *(since 0.8.4: every save reloaded every page, and the server's data started again)*:
+
+- **Nothing the page uses changed** (a route it never calls, a server fn's body): the page stays
+  as it is.
+- **A component's code changed**: it is swapped into the page in place, no reload. Each state
+  keeps its value while the new code starts it as the same kind of value (a number stays a
+  number, a list a list; a state that starts as `null` takes any); one whose kind changed starts
+  again from its new initializer, and the browser's console says so. A changed initializer of
+  the same kind keeps the value. The components inside it keep theirs, by component and order
+  (`<Row/><Row/>` with a third added before them shifts them, as when a page is taken up). Its
+  effects, `@mount` and timers run again, as its code is new.
+- **The page's HTML outside its components changed, or the runtime did**: the page reloads, and
+  keeps what it can: each component's states by the same rule, a field a person typed into that
+  nothing follows, an open `<details>`, the scroll and the focus.
+- **On the server**, each top-level `let` the program changes somewhere (its data) keeps its value
+  while the new version starts it as the same kind of value; one whose kind changed, or that holds
+  a function or a handle, starts again. A `let` the program never changes is code, and follows
+  the edit. A `:memory:` database starts again empty. The reload's line says what was kept:
+  `quillo: reloaded main.qwe (3 routes); kept notes, count; started again: cart (its type changed:
+  list to map)`.
+- A save that does not load is said over the page, which keeps showing the version before it.
+
+`--watch=reload` (or `<html data-reload>` on a page) reloads at every save, keeping nothing.
+`--reload`, for production, carries nothing either.
