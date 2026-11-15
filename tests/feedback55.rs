@@ -3130,7 +3130,9 @@ fn under_the_debugger_the_bundle_hides_as_the_server() {
     assert!(page.contains("<p id=\"a\">err(&quot;internal error&quot;)</p>"), "{}", page);
     let loader = support::send(port, "GET", "/_quillo/quillo.js", &[], "").body;
     let at = loader.split("const at = \"").nth(1).and_then(|r| r.split('"').next()).unwrap_or_else(|| panic!("{}", loader));
-    let runtime = support::send(port, "GET", &format!("{}quillo.js", at), &[], "").body;
+    // Under a hash of its own (FEEDBACK54.md, Q-688; branch hmr).
+    let file = loader.split('"').find(|f| f.ends_with("/quillo.js")).unwrap_or_else(|| panic!("{}", loader));
+    let runtime = support::send(port, "GET", &format!("{}{}", at, file), &[], "").body;
     assert!(runtime.contains("DEV = true;") && runtime.contains("let ERRORS_SHOWN = false;"), "{}", &runtime[..runtime.len().min(300)]);
     assert!(!runtime.contains("ERRORS_SHOWN = true"), "the bundle shows errors the server hides");
     drop(stdin);

@@ -29,20 +29,42 @@ fn program(dir: &Path, file: &str, src: &str) -> Interp {
     it
 }
 
-/// The loader a page runs: where its files are, and their names in order.
+/// The loader a page runs: where its files are, and their names in order. Each is under a
+/// hash of its own text (FEEDBACK54.md, Q-688; branch hmr), kept here for `dev`.
 fn listed(loader: &str) -> (String, Vec<String>) {
     let at = loader.split("const at = \"").nth(1).unwrap().split('"').next().unwrap().to_string();
     let list = loader.split("for (const f of [").nth(1).unwrap().split(']').next().unwrap();
-    (at, serde_json::from_str::<Vec<String>>(&format!("[{}]", list)).unwrap())
+    let named = serde_json::from_str::<Vec<String>>(&format!("[{}]", list)).unwrap();
+    let mut paths = Vec::new();
+    HASHES.with(|h| {
+        let mut h = h.borrow_mut();
+        h.clear();
+        for f in named {
+            let (hash, path) = f.split_once('/').unwrap();
+            h.insert(path.to_string(), hash.to_string());
+            paths.push(path.to_string());
+        }
+    });
+    (at, paths)
 }
 
-fn hash_of(at: &str) -> String {
-    at.trim_end_matches('/').rsplit('/').next().unwrap().to_string()
+thread_local! {
+    static HASHES: std::cell::RefCell<std::collections::HashMap<String, String>> = Default::default();
+}
+
+/// The hash of the last listed bundle's file `path`.
+fn hash_for(path: &str) -> String {
+    HASHES.with(|h| h.borrow().get(path).cloned()).unwrap_or_else(|| panic!("no {} listed", path))
+}
+
+/// The text of the last listed bundle's file `path`.
+fn dev(path: &str) -> String {
+    client::dev_file(&hash_for(path), path).unwrap_or_else(|| panic!("no {}", path)).to_string()
 }
 
 /// A file of the bundle, and its source map when it has one.
-fn file(hash: &str, name: &str) -> (String, Option<Value>) {
-    let text = client::dev_file(hash, name).unwrap_or_else(|| panic!("no {}", name));
+fn file(name: &str) -> (String, Option<Value>) {
+    let text = dev(name);
     let map = text.split("base64,").nth(1).map(|b64| {
         let bytes = b64decode(b64.trim());
         serde_json::from_slice(&bytes).unwrap()
@@ -101,15 +123,17 @@ fn each_function_has_a_file_mapped_to_its_lines() {
     let it = program(&d, "main.qwe", &src);
     let (at, files) = listed(&client::bundle(&it).unwrap());
     assert!(at.starts_with("/_quillo/src/"), "{}", at);
-    // The program's blocks and `DEV` are in the runtime's own function (FEEDBACK42.md, Q-481).
+    // `DEV` is in the runtime's own function (FEEDBACK42.md, Q-481); the program's blocks are
+    // each in the file that uses it (FEEDBACK54.md, Q-688).
     assert_eq!(files, ["quillo.js", "main.qwe/helper.js", "main.qwe/Counter.js", "boot.js"]);
-    let hash = hash_of(&at);
-    let (runtime, none) = file(&hash, "quillo.js");
+    let (runtime, none) = file("quillo.js");
     assert!(runtime.contains("function boot"), "the runtime as it is written");
+    assert!(!runtime.contains("W.block("), "no block of the program's in the runtime's file");
+    assert!(dev("main.qwe/Counter.js").contains("const $$b_"), "Counter declares its own block");
     assert!(none.is_none());
     assert!(runtime.starts_with("(function () { ") && runtime.contains("DEV = true;"), "in a function of its own");
     assert!(runtime.contains("Object.defineProperty(window, Symbol.for(\"quillo.dev\")"), "handed over by a symbol, not a name");
-    let (helper, map) = file(&hash, "main.qwe/helper.js");
+    let (helper, map) = file("main.qwe/helper.js");
     let map = map.expect("a source map");
     // In a function that takes the runtime's names, opened on the first line, so the map's
     // lines are the file's (Q-481).
@@ -123,12 +147,12 @@ fn each_function_has_a_file_mapped_to_its_lines() {
     let lines = mapped_lines(&map);
     assert!(lines.contains(&122) && lines.contains(&123), "{:?}", lines);
     // The text goes in the first map made from the file, and the others name it.
-    let (_, counter) = file(&hash, "main.qwe/Counter.js");
+    let (_, counter) = file("main.qwe/Counter.js");
     let counter = counter.expect("a source map");
     assert_eq!(counter["sourcesContent"][0], Value::Null);
     assert_eq!(counter["names"], serde_json::json!(["n"]));
     assert!(mapped_lines(&counter).contains(&128), "{:?}", mapped_lines(&counter));
-    assert_eq!(client::dev_file(&hash, "nothing.js"), None);
+    assert_eq!(client::dev_file(&hash_for("quillo.js"), "nothing.js"), None);
     assert_eq!(client::dev_file("nothing", "quillo.js"), None);
 }
 
@@ -138,9 +162,8 @@ fn constants_and_views_go_in_files_between_the_functions() {
     let d = temp_dir("client-dev-pieces").canonicalize().unwrap();
     let src = "let first = 5\nlet second = \"two\"\nfn uses() = first + 1\nlet third = 7\nview Tag(t) = <b>{t}</b>\nfn after() = third + 1\ncomponent C() = <p><Tag t={uses()}/>{second}{after()}{icon}</p>\nlet icon = <i></i>\n";
     let it = program(&d, "main.qwe", src);
-    let (at, files) = listed(&client::bundle(&it).unwrap());
-    let hash = hash_of(&at);
-    let joined: Vec<String> = files.iter().map(|f| client::dev_file(&hash, f).unwrap()).collect();
+    let (_, files) = listed(&client::bundle(&it).unwrap());
+    let joined: Vec<String> = files.iter().map(|f| dev(f)).collect();
     assert_eq!(files.first().unwrap(), "quillo.js");
     assert_eq!(files.last().unwrap(), "boot.js");
     // A value of the program's is written with its name.
@@ -163,11 +186,10 @@ fn a_value_that_names_a_source_map_stays_whole() {
     let d = temp_dir("client-dev-map-words").canonicalize().unwrap();
     let src = "let note = \"see //# sourceMappingURL=x.map\"\ncomponent C() = <p>{note}</p>\n";
     let it = program(&d, "main.qwe", src);
-    let (at, files) = listed(&client::bundle(&it).unwrap());
-    let hash = hash_of(&at);
+    let (_, files) = listed(&client::bundle(&it).unwrap());
     let close = "})(window[Symbol.for(\"quillo.dev\")]);\n";
     for f in &files[1..] {
-        let text = client::dev_file(&hash, f).unwrap();
+        let text = dev(f);
         assert!(text.starts_with("(function ($rt) { \"use strict\"; const { "), "{}: {}", f, text);
         // Closed once: before its map's line, else at its end.
         assert_eq!(text.matches(close).count(), 1, "{}: {}", f, text);
@@ -176,7 +198,7 @@ fn a_value_that_names_a_source_map_stays_whole() {
             None => assert!(text.ends_with(close), "{}: {}", f, text),
         }
     }
-    let joined: String = files.iter().map(|f| client::dev_file(&hash, f).unwrap()).collect();
+    let joined: String = files.iter().map(|f| dev(f)).collect();
     assert!(joined.contains("\"see //# sourceMappingURL=x.map\""), "{}", joined);
 }
 
@@ -187,9 +209,8 @@ fn a_view_with_no_file_of_its_own_gets_one() {
     let mut it = program(&d, "main.qwe", "view Tag(t) = <b>{t}</b>\ncomponent C() = <Tag t=\"x\"/>\n");
     // Loaded from text with no file of its own, it has no map either.
     it.load_source("view Other(t) = <i>{t}</i>\ncomponent D() = <Other t=\"y\"/>\n", "").unwrap_or_else(|e| panic!("{}", e));
-    let (at, files) = listed(&client::bundle(&it).unwrap());
-    let hash = hash_of(&at);
-    let texts: Vec<String> = files.iter().map(|f| client::dev_file(&hash, f).unwrap()).collect();
+    let (_, files) = listed(&client::bundle(&it).unwrap());
+    let texts: Vec<String> = files.iter().map(|f| dev(f)).collect();
     assert!(texts.iter().any(|t| t.contains("W.view(") && t.contains("Other")), "{:?}", files);
 }
 
@@ -202,7 +223,7 @@ fn a_mounted_programs_base_is_in_the_addresses() {
     let (at, files) = listed(&client::bundle(&it).unwrap());
     assert!(at.starts_with("/shop/_quillo/src/"), "{}", at);
     assert_eq!(files[0], "quillo.js");
-    let (text, _) = file(&hash_of(&at), &files[0]);
+    let (text, _) = file(&files[0]);
     assert!(text.contains("BASE = \"/shop\";"), "{}", text);
 }
 
@@ -214,24 +235,30 @@ fn a_file_outside_the_program_goes_by_its_name_and_paths_are_escaped() {
     std::fs::create_dir_all(&inside).unwrap();
     std::fs::write(d.join("shared lib.qwe"), "fn café() = 1\n").unwrap();
     let it = program(&inside, "main.qwe", "use \"../shared lib.qwe\"\ncomponent C() = <p>{café()}</p>\n");
-    let (at, files) = listed(&client::bundle(&it).unwrap());
+    let (_, files) = listed(&client::bundle(&it).unwrap());
     assert!(files.iter().any(|f| f == "shared%20lib.qwe/caf%C3%A9.js"), "{:?}", files);
-    let (_, map) = file(&hash_of(&at), "shared%20lib.qwe/caf%C3%A9.js");
+    let (_, map) = file("shared%20lib.qwe/caf%C3%A9.js");
     assert!(map.unwrap()["sources"][0].as_str().unwrap().ends_with("/shared%20lib.qwe"));
 }
 
+// Changed with Q-688 (FEEDBACK54.md; branch hmr): files are kept by their own hash, so the
+// runtime's, the same in every bundle, stays; what goes is a file no bundle of the last 256 has,
+// once more than 4,096 are kept.
 #[test]
 fn the_oldest_bundles_are_let_go() {
     let _one = alone();
     let d = temp_dir("client-dev-many").canonicalize().unwrap();
-    let hash_of_nth = |n: usize| {
-        let it = program(&d, "main.qwe", &format!("component C() = <p>{}</p>\n", n));
-        hash_of(&listed(&client::bundle(&it).unwrap()).0)
+    let nth = |n: usize| {
+        let src: String = (0..16).map(|k| format!("component C{}() = <p>{} {}</p>\n", k, n, k)).collect();
+        let it = program(&d, "main.qwe", &src);
+        listed(&client::bundle(&it).unwrap());
+        (hash_for("main.qwe/C0.js"), hash_for("quillo.js"))
     };
-    let first = hash_of_nth(0);
-    assert!(client::dev_file(&first, "quillo.js").is_some());
+    let (first, runtime) = nth(0);
+    assert!(client::dev_file(&first, "main.qwe/C0.js").is_some());
     for n in 1..=300 {
-        hash_of_nth(n);
+        assert_eq!(nth(n).1, runtime, "the runtime's file is the same in every bundle");
     }
-    assert!(client::dev_file(&first, "quillo.js").is_none(), "the bundle was kept");
+    assert!(client::dev_file(&first, "main.qwe/C0.js").is_none(), "the file was kept");
+    assert!(client::dev_file(&runtime, "quillo.js").is_some());
 }

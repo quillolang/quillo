@@ -583,12 +583,21 @@ mod dev {
     use super::*;
     use std::sync::Mutex;
 
-    /// The files of the bundles made, by their hash: path → script.
-    static FILES: Mutex<Option<HashMap<String, Arc<HashMap<String, String>>>>> = Mutex::new(None);
+    /// The files of the bundles made, each by the hash of its text: its path, its script, and
+    /// the bundle that last had it (by count).
+    #[derive(Default)]
+    struct Files {
+        files: HashMap<String, (String, Arc<String>, u64)>,
+        made: u64,
+    }
+
+    static FILES: Mutex<Option<Files>> = Mutex::new(None);
 
     /// A file of a development bundle (`/_quillo/src/<hash>/<path>`).
-    pub fn file(hash: &str, path: &str) -> Option<String> {
-        FILES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref()?.get(hash)?.get(path).cloned()
+    pub fn file(hash: &str, path: &str) -> Option<Arc<String>> {
+        let all = FILES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (p, text, _) = all.as_ref()?.files.get(hash)?;
+        (p == path).then(|| text.clone())
     }
 
     /// A file being made: its path and code (with line marks), and where
@@ -613,10 +622,9 @@ mod dev {
         if !it.base.is_empty() {
             let _ = writeln!(prelude, "BASE = {};", js_str(&it.base));
         }
-        for b in &c.blocks {
-            prelude.push_str(b);
-            prelude.push('\n');
-        }
+        // Each file declares the blocks it uses itself (below): in the runtime's file, every new
+        // block changed it (FEEDBACK54.md, Q-688; branch hmr).
+        let blocks: HashMap<&str, &str> = c.blocks.iter().filter_map(|b| Some((b.strip_prefix("const ")?.split(' ').next()?, b.as_str()))).collect();
         let base = std::fs::canonicalize(&*it.base_dir).unwrap_or_else(|_| it.base_dir.to_path_buf());
         // Each function the program wrote, in a file of its own (in the order
         // they were compiled, which is the order they need); what else the
@@ -700,9 +708,15 @@ mod dev {
         // base64-encoding that file hundreds of times over (FEEDBACK15.md,
         // Q-097; branch dev-maps-once).
         let mut embedded: HashSet<Arc<str>> = HashSet::new();
-        for p in pieces {
+        for mut p in pieces {
             if p.code.trim().is_empty() {
                 continue;
+            }
+            let mut own: Vec<&str> = names_in(&p.code).iter().filter_map(|n| blocks.get(n.as_str()).copied()).collect();
+            own.sort_unstable();
+            own.dedup();
+            if !own.is_empty() {
+                p.code = format!("{}\n{}", own.join("\n"), p.code);
             }
             let mapped = p.source.is_some();
             let text = match &p.source {
@@ -717,25 +731,33 @@ mod dev {
             order.push(p.path.clone());
             files.insert(p.path, text);
         }
-        let hash = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            for f in &order {
+        // Each file under a hash of its own text: one that did not change keeps its address, and
+        // the browser what it has of it (FEEDBACK54.md, Q-688; branch hmr).
+        let named: Vec<(String, String)> = order
+            .iter()
+            .map(|f| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
                 f.hash(&mut h);
                 files[f].hash(&mut h);
-            }
-            format!("{:016x}", h.finish())
-        };
+                (format!("{:016x}", h.finish()), f.clone())
+            })
+            .collect();
         {
             let mut all = FILES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let all = all.get_or_insert_with(HashMap::new);
-            // Bundles from long-gone versions of the program.
-            if all.len() > 256 {
-                all.clear();
+            let all = all.get_or_insert_with(Default::default);
+            all.made += 1;
+            let made = all.made;
+            for (hash, f) in &named {
+                let text = files.remove(f).unwrap_or_default();
+                all.files.entry(hash.clone()).or_insert_with(|| (f.clone(), Arc::new(text), made)).2 = made;
             }
-            all.insert(hash.clone(), Arc::new(files));
+            // Files no bundle of the last 256 made has.
+            if all.files.len() > 4096 {
+                all.files.retain(|_, (_, _, at)| *at + 256 > made);
+            }
         }
-        let list: Vec<String> = order.iter().map(|f| js_str(f)).collect();
+        let list: Vec<String> = named.iter().map(|(hash, f)| js_str(&format!("{}/{}", hash, f))).collect();
         format!(
             "// Quillo in development: the runtime, and each component, view and function in a file\n\
              // of its own, with a source map to the .qwe file it is in.\n\
@@ -748,7 +770,7 @@ mod dev {
              document.head.appendChild(s);\n\
              }}\n\
              }})();\n",
-            js_str(&format!("{}/_quillo/src/{}/", it.base, hash)),
+            js_str(&format!("{}/_quillo/src/", it.base)),
             list.join(", ")
         )
     }
@@ -772,9 +794,9 @@ mod dev {
     const HANDOVER: &str = "quillo.dev";
 
     /// What a development runtime hands the program's files: its own top-level names (those
-    /// on its `// dev` lines too, which declare one name each) and the program's blocks
-    /// (`const $b0 = W.block(...)`).
-    fn shared_names(c: &Compiler) -> Vec<String> {
+    /// on its `// dev` lines too, which declare one name each). The program's blocks are each
+    /// file's own (FEEDBACK54.md, Q-688; branch hmr).
+    fn shared_names(_c: &Compiler) -> Vec<String> {
         let decl = |line: &str| -> Option<String> {
             let rest = ["async function ", "function ", "class ", "const ", "let "].iter().find_map(|p| line.strip_prefix(p))?;
             let n: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
@@ -782,7 +804,6 @@ mod dev {
         };
         let mut names: Vec<String> = runtime_units().by_name.keys().filter(|n| !n.contains('.')).cloned().collect();
         names.extend(RUNTIME.lines().filter(|l| l.trim_end().ends_with("// dev")).filter_map(decl));
-        names.extend(c.blocks.iter().filter_map(|b| decl(b)));
         names.sort();
         names.dedup();
         names
@@ -1026,7 +1047,7 @@ mod dev {
 }
 
 /// A file of a development bundle (see `DEV`).
-pub fn dev_file(hash: &str, path: &str) -> Option<String> {
+pub fn dev_file(hash: &str, path: &str) -> Option<Arc<String>> {
     dev::file(hash, path)
 }
 
@@ -2325,6 +2346,35 @@ impl<'a> Compiler<'a> {
         })
     }
 
+    /// A new block's name, for its declaration's rest (` = W.block(...);`), which it is pushed
+    /// with. In development it is named by what it holds, not by how many came before: one
+    /// component's new block renamed every later component's, so each of their files changed
+    /// with it (FEEDBACK54.md, Q-688; branch hmr). The same text is the same block. In
+    /// production, the short name.
+    fn block_name(&mut self, prefix: &str, rest: &str) -> String {
+        if !self.dev {
+            let name = format!("{}{}", prefix, self.blocks.len());
+            self.blocks.push(format!("const {}{}", name, rest));
+            return name;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        rest.hash(&mut h);
+        // `$$`: a variable's name (`$b_1`, for a state `b`) never has a second `$`.
+        let mut name = format!("${}_{:012x}", prefix, h.finish() & 0xffff_ffff_ffff);
+        loop {
+            let decl = format!("const {}{}", name, rest);
+            match self.blocks.iter().find(|b| b.starts_with(&format!("const {} ", name))) {
+                Some(b) if *b == decl => return name,
+                Some(_) => name.push('x'),
+                None => {
+                    self.blocks.push(decl);
+                    return name;
+                }
+            }
+        }
+    }
+
     fn fresh(&mut self, name: &str) -> String {
         self.counter += 1;
         let clean: String = name.chars().map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' }).collect();
@@ -2524,7 +2574,12 @@ impl<'a> Compiler<'a> {
             self.file = def.file.clone();
         }
                     self.line = def.line.max(line);
+                    // Each definition numbers its names from 1, in a function of its own: a
+                    // variable added to one renumbered every later one's (FEEDBACK54.md, Q-688;
+                    // branch hmr).
+                    let saved_counter = std::mem::replace(&mut self.counter, 0);
                     let res = if def.component { self.component(&def) } else { self.function(&def) };
+                    self.counter = saved_counter;
                     self.ctxs = saved_ctxs;
                     self.what = saved_what;
                     self.line = saved_line;
@@ -2624,7 +2679,9 @@ impl<'a> Compiler<'a> {
         self.globals.insert(name.to_string(), (js.to_string(), false));
         let saved_ctxs = std::mem::take(&mut self.ctxs);
         let saved_what = std::mem::replace(&mut self.what, format!("`{}`", name));
+        let saved_counter = std::mem::replace(&mut self.counter, 0);
         let res = self.function(&def);
+        self.counter = saved_counter;
         self.ctxs = saved_ctxs;
         self.what = saved_what;
         let (code, is_async) = res?;
@@ -3626,11 +3683,7 @@ impl<'a> Compiler<'a> {
                 let made = format!(" = {};", float_js(*f));
                 match self.blocks.iter().find(|b| b.starts_with("const $fl") && b.ends_with(&made)) {
                     Some(b) => b["const ".len()..b.find(" = ").unwrap()].to_string(),
-                    None => {
-                        let name = format!("$fl{}", self.blocks.len());
-                        self.blocks.push(format!("const {}{}", name, made));
-                        name
-                    }
+                    None => self.block_name("$fl", &made),
                 }
             }
             Expr::Lit(l) => lit_js(l),
@@ -4781,8 +4834,7 @@ impl<'a> Compiler<'a> {
         let mask = self.row_mask;
         (self.cur_row, self.row_mask) = saved;
         let tpl = tpl?;
-        let name = format!("$b{}", self.blocks.len());
-        self.blocks.push(format!("const {} = W.block({});", name, tpl));
+        let name = self.block_name("$b", &format!(" = W.block({});", tpl));
         let t = match row {
             Some(row) if mask != 0 => format!("W.t({}, [{}], {}, {})", name, vals.join(", "), row, mask),
             _ => format!("W.t({}, [{}])", name, vals.join(", ")),

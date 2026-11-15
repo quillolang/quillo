@@ -190,10 +190,15 @@ fn only_a_development_page_carries_where_its_lines_came_from() {
     let d = folder("places", &[("main.qwe", PAGE)]);
     let (guard, port, _) = serving(&d, &["--watch"]);
     let loader = scripts(port);
-    let at = loader.iter().find(|(p, _)| p.contains("/_quillo/src/")).map(|(p, _)| p.clone()).expect("a development bundle");
-    let share = send(port, "GET", &format!("{}main.qwe/share.js", at), &[], "").body;
+    // Each file under a hash of its own (FEEDBACK54.md, Q-688; branch hmr).
+    let url = |name: &str| {
+        let (_, body) = loader.iter().find(|(p, _)| p.contains("/_quillo/src/")).expect("a development bundle");
+        let file = body.split('"').find(|f| f.ends_with(name) && !f.contains(' ')).unwrap_or_else(|| panic!("no {} in {}", name, body));
+        format!("/_quillo/src/{}", file.trim_start_matches('/'))
+    };
+    let share = send(port, "GET", &url("/main.qwe/share.js"), &[], "").body;
     assert!(share.contains("PLACES[\"main.qwe/share.js\"] = [\"main.qwe\", {"), "{}", share);
-    let runtime = send(port, "GET", &format!("{}quillo.js", at), &[], "").body;
+    let runtime = send(port, "GET", &url("/quillo.js"), &[], "").body;
     assert!(runtime.contains("const placed ="), "the runtime as it is written");
     drop(guard);
 

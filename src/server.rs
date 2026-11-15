@@ -1260,11 +1260,13 @@ impl Interp {
         // In development, the files a page's bundle loads (see `client::DEV`).
         if let Some((hash, file)) = rest.strip_prefix("src/").and_then(|r| r.split_once('/')) {
             let file = percent_decode(file, false);
+            // Its address names its text (FEEDBACK54.md, Q-688; branch hmr): kept, as a page's
+            // bundle is.
             return match crate::client::dev_file(hash, &file) {
                 Some(js) => HttpResponse {
                     status: 200,
-                    headers: vec![("content-type".into(), "text/javascript; charset=utf-8".into()), ("cache-control".into(), "no-cache".into())],
-                    body: js.into_bytes(),
+                    headers: vec![("content-type".into(), "text/javascript; charset=utf-8".into()), ("cache-control".into(), "public, max-age=31536000, immutable".into())],
+                    body: js.as_bytes().to_vec(),
                 },
                 None => plain(404, "not found\n"),
             };
