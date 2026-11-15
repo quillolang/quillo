@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- A page on a channel no longer takes three threads on the server, each with memory of its own:
+  its WebSocket is read and written on one thread that every such page shares. 1,000 pages cost
+  12 MB, where they cost 562 MB and kept 350 MB after they closed; nothing is kept now. A burst
+  to three pages costs half the CPU it did, one to 1,000 pages a hundredth, and an answer to a
+  page comes 5% sooner (FEEDBACK66.md, Q-954).
+
 ## 0.8.3 (2026-11-15)
 
 - A page with nothing to prefetch (no link, no `<script>`, no component) no longer carries

@@ -18,6 +18,26 @@ pub fn is_upgrade(req: &HttpRequest) -> bool {
     req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("upgrade") && v.eq_ignore_ascii_case("websocket"))
 }
 
+/// The answer to a request to become a WebSocket: the 101 that completes the handshake, or the
+/// refusal to write instead, after which the connection closes. A GET, asking for an upgrade, in
+/// version 13, as RFC 6455 §4.2.1 asks; told so with a 426 or a 400 otherwise (an HTTP/1.0
+/// request's `Upgrade` is dropped as it is read) (FEEDBACK36.md, Q-445; branch feedback36-39).
+/// Made apart from the connection, so that a channel's page, whose connection a task takes, is
+/// answered without its request kept (FEEDBACK66.md, Q-954; branch q954).
+pub fn handshake(req: &HttpRequest) -> Result<String, &'static str> {
+    let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim());
+    let upgrading = header("connection").is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")));
+    let key = match header("sec-websocket-key") {
+        Some(k) if req.method == "GET" && upgrading => k,
+        _ => return Err("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"),
+    };
+    if header("sec-websocket-version") != Some("13") {
+        return Err("HTTP/1.1 426 Upgrade Required\r\nsec-websocket-version: 13\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+    }
+    let accept = base64(&sha1(format!("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key).as_bytes()));
+    Ok(format!("HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {}\r\n\r\n", accept))
+}
+
 /// A WebSocket the server writes to. Each `send` reports whether the page
 /// is still there.
 /// The connection, how long one frame may take to write (none: as long as it takes), and its
@@ -53,30 +73,16 @@ impl Socket {
     /// Completes the handshake on the request's connection; `None` if the
     /// request is not a valid one.
     pub fn accept(req: &HttpRequest, mut stream: std::net::TcpStream) -> Option<Socket> {
-        // A GET, asking for an upgrade, in version 13, as RFC 6455 §4.2.1 asks; told so with a
-        // 426 or a 400 otherwise (an HTTP/1.0 request's `Upgrade` is dropped as it is read)
-        // (FEEDBACK36.md, Q-445; branch feedback36-39).
-        let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim());
-        let upgrading = header("connection").is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")));
-        let refusal = if req.method != "GET" || !upgrading || header("sec-websocket-key").is_none() {
-            Some("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-        } else if header("sec-websocket-version") != Some("13") {
-            Some("HTTP/1.1 426 Upgrade Required\r\nsec-websocket-version: 13\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-        } else {
-            None
-        };
-        if let Some(r) = refusal {
-            let _ = stream.write_all(r.as_bytes());
-            return None;
+        match handshake(req) {
+            Err(refusal) => {
+                let _ = stream.write_all(refusal.as_bytes());
+                None
+            }
+            Ok(answer) => {
+                stream.write_all(answer.as_bytes()).ok()?;
+                Some(Socket(stream, None, None))
+            }
         }
-        let key = header("sec-websocket-key")?.to_string();
-        let accept = base64(&sha1(format!("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key).as_bytes()));
-        let handshake = format!(
-            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {}\r\n\r\n",
-            accept
-        );
-        stream.write_all(handshake.as_bytes()).ok()?;
-        Some(Socket(stream, None, None))
     }
 
     /// Calls `heard`, on the watcher's thread, each time the page sends something or hangs up, so
@@ -454,7 +460,7 @@ impl Socket {
     /// and its payload written from where it is, nothing copied (see `wt::over_websocket`;
     /// FEEDBACK55.md, Q-806; branch feedback55). At most 64.
     pub fn send_all(&mut self, frames: &[(u8, &[u8])]) -> bool {
-        const MOST: usize = 64;
+        const MOST: usize = MOST_FRAMES;
         let frames = &frames[..frames.len().min(MOST)];
         let mut heads = [[0u8; 10]; MOST];
         let mut lens = [0usize; MOST];
@@ -642,6 +648,41 @@ mod watch {
     }
 }
 
+/// The most frames `send_all` and `send_all_async` write at once.
+pub const MOST_FRAMES: usize = 64;
+
+/// `Socket::send_all`, on a connection a task writes (a channel's page; FEEDBACK66.md, Q-954;
+/// branch q954): the frames in one write, each head made beside its payload, which is written from
+/// where it is. At most `N`, the room its state takes while it writes: 1 for a message alone,
+/// `MOST_FRAMES` for a batch. False if the page has gone. The caller bounds how long it may take.
+pub async fn send_all_async<const N: usize, W: tokio::io::AsyncWrite + Unpin>(w: &mut W, frames: &[(u8, &[u8])]) -> bool {
+    let frames = &frames[..frames.len().min(N)];
+    let mut heads = [[0u8; 10]; N];
+    let mut lens = [0usize; N];
+    for (i, (op, payload)) in frames.iter().enumerate() {
+        lens[i] = head_into(&mut heads[i], *op, payload.len());
+    }
+    let mut slices: [[std::io::IoSlice; 2]; N] = [[std::io::IoSlice::new(&[]); 2]; N];
+    for (i, (_, payload)) in frames.iter().enumerate() {
+        slices[i] = [std::io::IoSlice::new(&heads[i][..lens[i]]), std::io::IoSlice::new(payload)];
+    }
+    let mut rest = &mut slices.as_flattened_mut()[..2 * frames.len()];
+    loop {
+        while rest.first().is_some_and(|s| s.is_empty()) {
+            rest = &mut rest[1..];
+        }
+        if rest.is_empty() {
+            return true;
+        }
+        match tokio::io::AsyncWriteExt::write_vectored(w, rest).await {
+            Ok(0) => return false,
+            Ok(n) => std::io::IoSlice::advance_slices(&mut rest, n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+}
+
 /// A frame of the server's (not masked) put at the end of `f`: an opcode (0x1 text, 0x2 binary,
 /// 0x9 ping, 0xA pong) and its payload.
 pub fn frame_into(f: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
@@ -700,7 +741,9 @@ pub enum Message {
 
 /// Reads the page's messages: frames unmasked (a page's always are masked)
 /// and put back together when sent in parts, with control frames, which may
-/// come between the parts, given as they come.
+/// come between the parts, given as they come. Over a connection read as it
+/// blocks (`next`), or over one a task reads (`next_async`): the same reading
+/// for both, written once (FEEDBACK66.md, Q-954; branch q954).
 pub struct Reader<R> {
     r: R,
     max: usize,
@@ -708,79 +751,122 @@ pub struct Reader<R> {
     partial: Option<(u8, Vec<u8>)>,
 }
 
-impl<R: Read> Reader<R> {
+/// What a `Reader` reads from: as many bytes as the buffer holds, or an error.
+trait Source {
+    fn fill(&mut self, buf: &mut [u8]) -> impl std::future::Future<Output = std::io::Result<()>>;
+}
+
+/// A connection read as it blocks: each read done when it is asked for.
+struct Blocking<'a, R>(&'a mut R);
+
+impl<R: Read> Source for Blocking<'_, R> {
+    async fn fill(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        self.0.read_exact(buf)
+    }
+}
+
+/// A connection a task reads, waiting for what has not come.
+struct Waiting<'a, R>(&'a mut R);
+
+impl<R: tokio::io::AsyncRead + Unpin> Source for Waiting<'_, R> {
+    async fn fill(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        tokio::io::AsyncReadExt::read_exact(self.0, buf).await.map(|_| ())
+    }
+}
+
+impl<R> Reader<R> {
     pub fn new(r: R, max: usize) -> Reader<R> {
         Reader { r, max, partial: None }
     }
+}
 
+impl<R: Read> Reader<R> {
     /// The next message; an error when the connection ends, a frame is not
     /// one a page may send, or a message is larger than `max`.
     pub fn next(&mut self) -> std::io::Result<Message> {
-        let bad = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, why.to_string());
-        loop {
-            let mut head = [0u8; 2];
-            self.r.read_exact(&mut head)?;
-            let (fin, opcode, masked) = (head[0] & 0x80 != 0, head[0] & 0x0f, head[1] & 0x80 != 0);
-            if head[0] & 0x70 != 0 {
-                return Err(bad("reserved bits set"));
+        use std::future::Future;
+        let mut reading = std::pin::pin!(read_message(Blocking(&mut self.r), self.max, &mut self.partial));
+        // Each read blocks till it is done, so the reading is done when first asked.
+        match reading.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+            std::task::Poll::Ready(m) => m,
+            std::task::Poll::Pending => unreachable!("a blocking read is never left waiting"),
+        }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> Reader<R> {
+    /// `next`, on a connection a task reads.
+    pub async fn next_async(&mut self) -> std::io::Result<Message> {
+        read_message(Waiting(&mut self.r), self.max, &mut self.partial).await
+    }
+}
+
+/// The next message from `r` (see `Reader`).
+async fn read_message(mut r: impl Source, max: usize, partial: &mut Option<(u8, Vec<u8>)>) -> std::io::Result<Message> {
+    let bad = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, why.to_string());
+    loop {
+        let mut head = [0u8; 2];
+        r.fill(&mut head).await?;
+        let (fin, opcode, masked) = (head[0] & 0x80 != 0, head[0] & 0x0f, head[1] & 0x80 != 0);
+        if head[0] & 0x70 != 0 {
+            return Err(bad("reserved bits set"));
+        }
+        if !masked {
+            return Err(bad("a page's frames are masked"));
+        }
+        let len = match head[1] & 0x7f {
+            126 => {
+                let mut b = [0u8; 2];
+                r.fill(&mut b).await?;
+                u16::from_be_bytes(b) as u64
             }
-            if !masked {
-                return Err(bad("a page's frames are masked"));
+            127 => {
+                let mut b = [0u8; 8];
+                r.fill(&mut b).await?;
+                u64::from_be_bytes(b)
             }
-            let len = match head[1] & 0x7f {
-                126 => {
-                    let mut b = [0u8; 2];
-                    self.r.read_exact(&mut b)?;
-                    u16::from_be_bytes(b) as u64
+            n => n as u64,
+        };
+        // A control frame is short and whole (RFC 6455 5.5); a message's parts are counted
+        // without wrapping, where a length of u64::MAX after a first part wrapped to 0 and
+        // passed, and the allocation panicked the channel's thread (FEEDBACK49.md, Q-593;
+        // branch main).
+        if opcode & 0x8 != 0 && (len > 125 || !fin) {
+            return Err(bad("a control frame longer than 125 bytes, or in parts"));
+        }
+        let so_far = if opcode == 0x0 { partial.as_ref().map_or(0, |(_, d)| d.len()) as u64 } else { 0 };
+        if len.checked_add(so_far).map_or(true, |n| n > max as u64) {
+            return Err(bad("message too large"));
+        }
+        let mut mask = [0u8; 4];
+        r.fill(&mut mask).await?;
+        let mut data = vec![0u8; len as usize];
+        r.fill(&mut data).await?;
+        for (i, b) in data.iter_mut().enumerate() {
+            *b ^= mask[i % 4];
+        }
+        match opcode {
+            0x8 => return Ok(Message::Close),
+            0x9 => return Ok(Message::Ping(data)),
+            0xA => return Ok(Message::Pong),
+            0x0 => {
+                let Some((_, sofar)) = partial.as_mut() else { return Err(bad("a continuation of nothing")) };
+                sofar.extend_from_slice(&data);
+                if fin {
+                    let (kind, all) = partial.take().unwrap_or_default();
+                    return whole(kind, all);
                 }
-                127 => {
-                    let mut b = [0u8; 8];
-                    self.r.read_exact(&mut b)?;
-                    u64::from_be_bytes(b)
+            }
+            0x1 | 0x2 => {
+                if partial.is_some() {
+                    return Err(bad("a new message before the last one ended"));
                 }
-                n => n as u64,
-            };
-            // A control frame is short and whole (RFC 6455 5.5); a message's parts are counted
-            // without wrapping, where a length of u64::MAX after a first part wrapped to 0 and
-            // passed, and the allocation panicked the channel's thread (FEEDBACK49.md, Q-593;
-            // branch main).
-            if opcode & 0x8 != 0 && (len > 125 || !fin) {
-                return Err(bad("a control frame longer than 125 bytes, or in parts"));
-            }
-            let so_far = if opcode == 0x0 { self.partial.as_ref().map_or(0, |(_, d)| d.len()) as u64 } else { 0 };
-            if len.checked_add(so_far).map_or(true, |n| n > self.max as u64) {
-                return Err(bad("message too large"));
-            }
-            let mut mask = [0u8; 4];
-            self.r.read_exact(&mut mask)?;
-            let mut data = vec![0u8; len as usize];
-            self.r.read_exact(&mut data)?;
-            for (i, b) in data.iter_mut().enumerate() {
-                *b ^= mask[i % 4];
-            }
-            match opcode {
-                0x8 => return Ok(Message::Close),
-                0x9 => return Ok(Message::Ping(data)),
-                0xA => return Ok(Message::Pong),
-                0x0 => {
-                    let Some((_, sofar)) = self.partial.as_mut() else { return Err(bad("a continuation of nothing")) };
-                    sofar.extend_from_slice(&data);
-                    if fin {
-                        let (kind, all) = self.partial.take().unwrap_or_default();
-                        return whole(kind, all);
-                    }
+                if fin {
+                    return whole(opcode, data);
                 }
-                0x1 | 0x2 => {
-                    if self.partial.is_some() {
-                        return Err(bad("a new message before the last one ended"));
-                    }
-                    if fin {
-                        return whole(opcode, data);
-                    }
-                    self.partial = Some((opcode, data));
-                }
-                _ => return Err(bad("unknown opcode")),
+                *partial = Some((opcode, data));
             }
+            _ => return Err(bad("unknown opcode")),
         }
     }
 }

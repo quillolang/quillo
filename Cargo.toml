@@ -26,7 +26,7 @@ httparse = "1"
 libloading = "0.8"
 corosensei = "0.3"
 psm = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
 tokio-postgres = "0.7"
 indexmap = "2"
 stacker = "0.1"

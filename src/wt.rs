@@ -1427,138 +1427,159 @@ mod quic {
 
 // ---- a WebSocket, where WebTransport cannot be had ----------------------------------
 
-/// A page's connection over a WebSocket, on the waiting thread that owns
-/// it: what the page sends is read on a second thread.
-pub fn over_websocket(mut socket: crate::ws::Socket, ticket: Ticket) {
-    let (peer, mut rx) = connect(ticket, None);
-    socket.write_timeout(WRITE_WAIT);
-    let Ok(mut reader) = socket.reader(MAX_MESSAGE + 64) else {
-        disconnect(&peer);
-        return;
-    };
-    let reading = {
-        let peer = peer.clone();
-        std::thread::Builder::new().name("quillo-ch-ws".into()).stack_size(256 << 10).spawn(move || {
-            // However the reading ends, a panic too, the page is let go, where one left it
-            // counted and ignored (FEEDBACK49.md, Q-593; branch main).
-            struct Ends(Arc<Peer>);
-            impl Drop for Ends {
-                fn drop(&mut self) {
-                    self.0.put(Out::Close);
-                }
-            }
-            let _ends = Ends(peer.clone());
-            loop {
-                match reader.next() {
-                    Ok(crate::ws::Message::Text(t)) => from_page(&peer, &t),
-                    Ok(crate::ws::Message::Binary(b)) => frame_from_page(&peer, b),
-                    // RFC 6455 5.5.2 (FEEDBACK16.md, Q-132; branch feedback20-fixes).
-                    Ok(crate::ws::Message::Ping(data)) => {
-                        peer.put(Out::Pong(data));
-                    }
-                    Ok(crate::ws::Message::Close) | Err(_) => break,
-                    Ok(_) => {}
-                }
-            }
-        })
-    };
-    if reading.is_err() {
-        disconnect(&peer);
-        return;
+/// The runtime pages' WebSockets run on: a page is two tasks on it, where it was three threads,
+/// each with memory of its own, half a megabyte a page, most of it kept after the page closed
+/// (FEEDBACK66.md, Q-954; branch q954). Its own runtime, not the one shared connections and
+/// WebTransport use, whose one thread a burst to a thousand pages would hold from the database's
+/// answers. One thread: with four, each woke the others to look for work, and an answer to a page
+/// cost 16% more than with a thread a page, a burst to three pages twice what one thread costs; one
+/// writes a burst to a thousand pages as soon.
+/// Made when the first page connects; `None` when it cannot be made (no descriptor or thread was
+/// left for it), and made again for the next page, so that a server out of descriptors for a
+/// while hangs up on the pages meanwhile and takes those after.
+pub fn pages() -> Option<&'static tokio::runtime::Runtime> {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    static MAKING: Mutex<()> = Mutex::new(());
+    if let Some(rt) = RT.get() {
+        return Some(rt);
     }
-    // Something every 20 seconds, so a page that went away is noticed.
-    let ticker = peer.tx.clone();
-    let _ = std::thread::Builder::new().name("quillo-ch-ping".into()).stack_size(64 << 10).spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(20));
-        if ticker.blocking_send(Out::Ping).is_err() {
-            return;
-        }
-    });
-    // What waits for the page goes in one write, up to `BATCH` messages: a write each made the
-    // writer slower than one request broadcasting, and a page reading at full speed lost a third
-    // of a burst of 20,000 to a queue that filled (FEEDBACK55.md, Q-806; branch feedback55). The
-    // messages are written as they are (see `ws::Socket::send_all`), with no buffer made: one,
-    // grown on each page's thread, kept 5 to 20 MiB for 256 pages after a burst (found in review).
-    // In a burst (more than one message came at once, or this one soon after the last write) it
-    // waits a moment for more before it sleeps on the queue (`LINGER`): woken for each message, it
-    // cost the program sending a wake-up each, six times what the message did. Traffic that comes
-    // a message at a time is written as it comes, with no wait, which cost a third more of the
-    // server's time with 300 pages (found in review); and after a batch of many, what comes is
-    // taken at once, so that the queue, whose room is kept after, stays short.
+    let _making = lock(&MAKING);
+    if let Some(rt) = RT.get() {
+        return Some(rt);
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).thread_name("quillo-pages").enable_all().build().ok()?;
+    Some(RT.get_or_init(|| rt))
+}
+
+/// How often a page's WebSocket is pinged, so that a page that went away is noticed.
+const PING_EVERY: Duration = Duration::from_secs(20);
+
+/// A page's connection over a WebSocket, its handshake done, as a task on `pages`: what the page
+/// sends is read by a second task. What goes to the page is written in one write, up to `BATCH`
+/// messages, each written from where it is, nothing copied: a write each made the writer slower
+/// than one request broadcasting, and a page reading at full speed lost a third of a burst of
+/// 20,000 to a queue that filled (FEEDBACK55.md, Q-806; branch feedback55). It no longer waits a
+/// moment for more after a write in a burst, as a page's thread did: waking a thread cost the
+/// program sending a system call a message, and waking a task costs none, so the wait (a yield to
+/// the runtime, round and round) cost more than it saved, 4% more for a burst to three pages and
+/// 1.5% less without it than with threads (FEEDBACK66.md, Q-954; branch q954).
+pub async fn over_websocket(stream: tokio::net::TcpStream, ticket: Ticket) {
+    let (r, mut w) = stream.into_split();
+    let (peer, mut rx) = connect(ticket, None);
+    let reading = tokio::spawn(read_page(peer.clone(), r));
+    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_EVERY, PING_EVERY);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut clean = true;
-    let mut wrote = std::time::Instant::now().checked_sub(BURST).unwrap_or_else(std::time::Instant::now);
-    let mut batch: [Option<Out>; BATCH] = std::array::from_fn(|_| None);
-    'page: while let Some(first) = rx.blocking_recv() {
-        let mut next = Some(first);
-        let mut burst = wrote.elapsed() < BURST;
-        while next.is_some() {
-            let (mut n, mut close) = (0, false);
-            while let Some(o) = next.take() {
-                if matches!(o, Out::Close) {
+    'page: loop {
+        let first = tokio::select! {
+            biased;
+            o = rx.recv() => o,
+            _ = ping.tick() => Some(Out::Ping),
+        };
+        let Some(mut o) = first else { break };
+        loop {
+            if matches!(o, Out::Close) {
+                break 'page;
+            }
+            // A page that does not read is let go, not waited on for good (FEEDBACK49.md, Q-594).
+            let Ok(second) = rx.try_recv() else {
+                // A message alone, as most are, written with nothing made for it.
+                if !matches!(tokio::time::timeout(WRITE_WAIT, crate::ws::send_all_async::<1, _>(&mut w, &[frame(&o)])).await, Ok(true)) {
+                    clean = false;
+                    break 'page;
+                }
+                break;
+            };
+            // Made for each batch and let go after it, so that a quiet page holds none; the
+            // write's own state too (see `send_batch`).
+            let mut batch: Vec<Out> = Vec::with_capacity((rx.len() + 2).min(BATCH));
+            batch.push(o);
+            let (mut next, mut close) = (Some(second), false);
+            while let Some(x) = next.take() {
+                if matches!(x, Out::Close) {
                     close = true;
                     break;
                 }
-                batch[n] = Some(o);
-                n += 1;
-                if n < BATCH {
+                batch.push(x);
+                if batch.len() < BATCH {
                     next = rx.try_recv().ok();
                 }
             }
-            if n > 0 && !send_batch(&mut socket, &mut batch[..n]) {
+            if !matches!(tokio::time::timeout(WRITE_WAIT, Box::pin(send_batch(&mut w, batch))).await, Ok(true)) {
                 clean = false;
                 break 'page;
             }
-            wrote = std::time::Instant::now();
-            if close {
-                break 'page;
-            }
-            burst |= n > 1;
-            if next.is_none() {
-                // Yielding, not asleep, and on as soon as one comes: asleep it was woken by
-                // nothing, and an answer to a page asking one after another waited the whole
-                // sleep, 0.7 ms where it took 0.05 (found in review).
-                if burst && n < LINGER_UNDER {
-                    let until = std::time::Instant::now() + LINGER;
-                    while rx.is_empty() && std::time::Instant::now() < until {
-                        std::thread::sleep(LINGER_STEP);
-                    }
-                }
-                next = rx.try_recv().ok();
+            match next.or_else(|| rx.try_recv().ok()) {
+                _ if close => break 'page,
+                Some(x) => o = x,
+                None => break,
             }
         }
     }
     disconnect(&peer);
-    socket.end(clean);
-}
-
-/// Writes the messages in `batch` at once, and empties it: whether the page is still there.
-fn send_batch(socket: &mut crate::ws::Socket, batch: &mut [Option<Out>]) -> bool {
-    let frames: [(u8, &[u8]); BATCH] = std::array::from_fn(|i| match batch.get(i) {
-        Some(Some(Out::Text { json, .. })) => (0x1, json.as_bytes()),
-        Some(Some(Out::Media(f))) => (0x2, &f.wire[..]),
-        Some(Some(Out::Ping)) => (0x9, &[][..]),
-        Some(Some(Out::Pong(data))) => (0xA, &data[..]),
-        _ => (0, &[][..]),
-    });
-    let alive = socket.send_all(&frames[..batch.len()]);
-    for o in batch.iter_mut() {
-        *o = None;
+    reading.abort();
+    // A close frame when the last write went through (not in the middle of one that did not),
+    // then the connection shut, both ways once the reader has let its half go.
+    if clean {
+        let mut f = Vec::with_capacity(2);
+        crate::ws::frame_into(&mut f, 0x8, &[]);
+        let _ = tokio::time::timeout(Duration::from_secs(2), tokio::io::AsyncWriteExt::write_all(&mut w, &f)).await;
     }
-    alive
+    let _ = tokio::time::timeout(Duration::from_secs(2), tokio::io::AsyncWriteExt::shutdown(&mut w)).await;
 }
 
-/// How long a page's writer waits for more after a write in a burst, and how soon after its last
-/// write a message makes one (see `over_websocket`).
-const LINGER: Duration = Duration::from_micros(50);
-/// What it sleeps at a time meanwhile: yielding, a busy machine left it off the processor for
-/// milliseconds, and spinning would take one.
-const LINGER_STEP: Duration = Duration::from_micros(10);
-const BURST: Duration = Duration::from_millis(1);
-/// A batch of this many messages or more is followed by no wait (see `over_websocket`).
-const LINGER_UNDER: usize = 32;
+/// What a page sends on its WebSocket, read as it comes, till it closes, hangs up or sends what a
+/// page may not. However the reading ends, a panic too, the page is let go, where one left it
+/// counted and ignored (FEEDBACK49.md, Q-593; branch main).
+async fn read_page(peer: Arc<Peer>, r: tokio::net::tcp::OwnedReadHalf) {
+    struct Ends(Arc<Peer>);
+    impl Drop for Ends {
+        fn drop(&mut self) {
+            self.0.put(Out::Close);
+        }
+    }
+    let _ends = Ends(peer.clone());
+    let mut reader = crate::ws::Reader::new(tokio::io::BufReader::with_capacity(READ_AHEAD, r), MAX_MESSAGE + 64);
+    loop {
+        match reader.next_async().await {
+            Ok(crate::ws::Message::Text(t)) => from_page(&peer, &t),
+            Ok(crate::ws::Message::Binary(b)) => frame_from_page(&peer, b),
+            // RFC 6455 5.5.2 (FEEDBACK16.md, Q-132; branch feedback20-fixes).
+            Ok(crate::ws::Message::Ping(data)) => {
+                peer.put(Out::Pong(data));
+            }
+            Ok(crate::ws::Message::Close) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// What a page's reader takes from its connection at a time: a message of up to about this much
+/// in one read, where its head, its mask and its data were a read each, and one more each message
+/// found nothing come (an answer to a page cost 2% more than its thread's blocking reads did). A
+/// kilobyte a page, a megabyte for a thousand (FEEDBACK66.md, Q-954; branch q954).
+const READ_AHEAD: usize = 1024;
+
+/// Writes the messages in `batch` at once: whether the page is still there.
+async fn send_batch(w: &mut tokio::net::tcp::OwnedWriteHalf, batch: Vec<Out>) -> bool {
+    let frames: [(u8, &[u8]); BATCH] = std::array::from_fn(|i| batch.get(i).map_or((0, &[][..]), frame));
+    crate::ws::send_all_async::<BATCH, _>(w, &frames[..batch.len()]).await
+}
+
+/// A message's frame: its opcode and payload. A close is never written so (the writer ends on it,
+/// with a close of its own), and is an empty close here.
+fn frame(o: &Out) -> (u8, &[u8]) {
+    match o {
+        Out::Text { json, .. } => (0x1, json.as_bytes()),
+        Out::Media(f) => (0x2, &f.wire[..]),
+        Out::Ping => (0x9, &[][..]),
+        Out::Pong(data) => (0xA, &data[..]),
+        Out::Close => (0x8, &[][..]),
+    }
+}
 
 /// The most messages a page's WebSocket is written at once (see `over_websocket`).
-const BATCH: usize = 64;
+const BATCH: usize = crate::ws::MOST_FRAMES;
 
 /// A frame a page sends to a stream (`<quillo-media publish>`): taken only
 /// from a page that joined the stream's channel, `media:<name>` (FEEDBACK6.md,

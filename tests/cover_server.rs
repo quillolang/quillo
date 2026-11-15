@@ -449,21 +449,43 @@ fn a_server_out_of_descriptors_watches_files_by_looking() {
     assert!(until(|| srv.get("/").body.contains("three")), "{}", srv.log());
 }
 
-/// A page's upgrade that cannot get the second descriptor its reader needs: it is
-/// hung up on, and that is all.
+/// A page's upgrade when no descriptor is left. Changed with Q-954 (FEEDBACK66.md; branch
+/// q954), the reason: a page's reader once took a second descriptor of its own, and a page that
+/// could not get one was hung up on; a page is now two tasks on one runtime, sharing its one. What
+/// cannot be had with no descriptor left is that runtime, made when the first page connects: that
+/// page is hung up on, and that is all. Once there are descriptors again the next page makes it,
+/// and a page connecting after, when none is left again, is let in and kept.
 #[test]
 fn a_page_connecting_when_no_descriptor_is_left_is_hung_up_on() {
     let d = folder("ws-fds", &[("app.qwe", "route GET / = \"hi\"\n")]);
     let srv = run(&d, &["--no-wt"], Some(64));
-    let mut c = connect(srv.port);
-    c.write_all(b"POST /_quillo/wt-ticket HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n").unwrap();
-    let a = read_until(&mut c, b"}");
-    let t = ticket(&String::from_utf8_lossy(&a));
+    // A connection with a ticket, opened while there are descriptors.
+    let opened = || {
+        let mut c = connect(srv.port);
+        c.write_all(b"POST /_quillo/wt-ticket HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n").unwrap();
+        let a = read_until(&mut c, b"}");
+        (c, ticket(&String::from_utf8_lossy(&a)))
+    };
+    let (mut c, t) = opened();
+    let held = take_every_descriptor(&srv);
+    let head = upgrade(&mut c, &t);
+    assert!(head.is_empty(), "{}", String::from_utf8_lossy(&head));
+    let mut b = [0u8; 16];
+    assert_eq!(c.read(&mut b).unwrap(), 0, "the page was kept");
+    drop(held);
+    assert!(until(|| srv.get("/").body == "hi"), "{}", srv.log());
+    // With descriptors again: a page connects, and the runtime is made.
+    let (mut first, t) = opened();
+    let head = upgrade(&mut first, &t);
+    assert!(head.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&head));
+    // None left again: a page connecting needs none more, and stays.
+    let (mut c, t) = opened();
     let held = take_every_descriptor(&srv);
     let head = upgrade(&mut c, &t);
     assert!(head.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&head));
-    let mut b = [0u8; 16];
-    assert_eq!(c.read(&mut b).unwrap(), 0, "the page was kept");
+    c.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    let kept = c.read(&mut b).map_err(|e| e.kind());
+    assert!(matches!(kept, Err(std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)), "the page was let go: {:?}", kept);
     drop(held);
     assert!(until(|| srv.get("/").body == "hi"), "{}", srv.log());
 }

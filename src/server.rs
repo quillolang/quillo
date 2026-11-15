@@ -2128,15 +2128,23 @@ fn send_file(resp: HttpResponse, what: (std::path::PathBuf, u64, u64, Option<cra
     }))
 }
 
+/// A place among those for pages that wait (`Waiter`), or the 503 that tells the page to try later.
+fn waiting_place(ip: &str) -> Result<Waiter, Answer> {
+    Waiter::take(ip).ok_or_else(|| {
+        crate::metrics::LIVE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut resp = plain(503, "too many pages are waiting for changes; try again later\n");
+        resp.headers.push(("retry-after".into(), "5".into()));
+        Answer::Respond(resp)
+    })
+}
+
 /// Hands the connection to `f` on a thread of its own, holding one of the
 /// waiting places; answers 503 when they are all taken, or the client at
 /// `ip` holds its share of them.
 fn waiter(name: &'static str, ip: &str, f: impl FnOnce(std::net::TcpStream) + Send + 'static) -> Answer {
-    let Some(place) = Waiter::take(ip) else {
-        crate::metrics::LIVE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut resp = plain(503, "too many pages are waiting for changes; try again later\n");
-        resp.headers.push(("retry-after".into(), "5".into()));
-        return Answer::Respond(resp);
+    let place = match waiting_place(ip) {
+        Ok(p) => p,
+        Err(refused) => return refused,
     };
     Answer::Detach(Box::new(move |stream, before| {
         // If the thread cannot start, the place and the connection go with
@@ -2302,11 +2310,34 @@ fn serve_channels(req: HttpRequest) -> Answer {
     let Some(ticket) = crate::wt::ticket_of(req.url.split_once('?').map_or("", |(_, q)| q)) else {
         return Answer::Respond(plain(403, "no ticket, or an old one\n"));
     };
-    waiter("quillo-ch", &req.remote.clone(), move |stream| {
-        if let Some(socket) = crate::ws::Socket::accept(&req, stream) {
-            crate::wt::over_websocket(socket, ticket);
+    // A task on the pages' runtime, not a thread (FEEDBACK66.md, Q-954; branch q954): the
+    // handshake's answer is made here, so that the task holds none of the request.
+    let answer = crate::ws::handshake(&req);
+    let place = match waiting_place(&req.remote) {
+        Ok(p) => p,
+        Err(refused) => return refused,
+    };
+    Answer::Detach(Box::new(move |stream, mut before| {
+        // With no runtime (none could be made), or a connection the runtime cannot take, the page
+        // is hung up on, and connects again.
+        let Some(rt) = crate::wt::pages() else { return };
+        if stream.set_nonblocking(true).is_err() {
+            return;
         }
-    })
+        rt.spawn(async move {
+            let _place = place;
+            let Ok(mut stream) = tokio::net::TcpStream::from_std(stream) else { return };
+            // Earlier answers on this connection, then the handshake's, or its refusal.
+            let upgraded = answer.is_ok();
+            before.extend_from_slice(answer.as_ref().map_or_else(|r| r.as_bytes(), |a| a.as_bytes()));
+            let wrote = tokio::time::timeout(Duration::from_secs(30), tokio::io::AsyncWriteExt::write_all(&mut stream, &before)).await;
+            if !upgraded || !matches!(wrote, Ok(Ok(()))) {
+                return;
+            }
+            drop(before);
+            crate::wt::over_websocket(stream, ticket).await;
+        });
+    }))
 }
 
 /// The arguments a browser (or another service) calls a `server fn` with,
