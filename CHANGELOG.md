@@ -8,6 +8,10 @@
 - The guide's "A front end built elsewhere (React, Vite)": a built single-page app's `dist/`
   served beside the program, deep links answered `200` with its page, its hashed files kept a
   year, and its calls to the program on its own origin.
+- Under `--watch`, a component swapped in place at a save keeps what its elements held that no
+  state does: the focus and its selection, a box's scroll and the page's, what was typed in a
+  field nothing follows, a box ticked, an open `<details>` or `<dialog>`, an `<audio>` or
+  `<video>`'s time; they went with the swap (FEEDBACK54.md, A.4).
 
 ## 0.8.5 (2026-11-16)
 

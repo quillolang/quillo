@@ -3560,8 +3560,12 @@ as can be *(since 0.8.5: every save reloaded every page, and the server's data s
   number, a list a list; a state that starts as `null` takes any); one whose kind changed starts
   again from its new initializer, and the browser's console says so. A changed initializer of
   the same kind keeps the value. The components inside it keep theirs, by component and order
-  (`<Row/><Row/>` with a third added before them shifts them, as when a page is taken up). Its
-  effects, `@mount` and timers run again, as its code is new.
+  (`<Row/><Row/>` with a third added before them shifts them, as when a page is taken up). What
+  its elements held that no state does is put back where the same kind of element is in the same
+  place: the focus and its selection, the scroll of a box and of the page, what was typed in a
+  field nothing follows, a box ticked, an open `<details>` or `<dialog>`, an `<audio>` or
+  `<video>`'s time. Its effects, `@mount` and timers run
+  again, as its code is new.
 - **The page's own HTML changed**, outside its components (a heading, a class, the title, a
   node added at the end of an element): the page takes the new HTML in place, its components as
   they are; one whose props the page changed is made again with them, keeping its states. The

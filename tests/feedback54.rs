@@ -840,3 +840,91 @@ fn the_old_render_leaves_the_requests_page_states_alone() {
     let a = support::send(s.port, "GET", "/d/carol", &[("x-quillo-hot", &v1)], "");
     assert!(a.body.contains("<p id=\"d\">carol</p>"), "{}", a.body);
 }
+
+/// A second of silence, as a WAV file, for an <audio> to play: 8,000 samples of 8 bits.
+fn silence() -> String {
+    let mut w = Vec::new();
+    let n: u32 = 8000;
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36 + n).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&8000u32.to_le_bytes());
+    w.extend_from_slice(&8000u32.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&8u16.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&n.to_le_bytes());
+    w.extend(std::iter::repeat(128u8).take(n as usize));
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in w.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let v = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for k in 0..4 {
+            out.push(if k <= c.len() { A[(v >> (18 - 6 * k) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+fn dom_program(label: &str) -> String {
+    format!("let stage = 0\nroute GET /stage/:n(int) {{\n    stage = n\n    \"ok\"\n}}\nroute GET /stage = stage\ncomponent Form() {{\n    state n = 0\n    state bound = \"b\"\n    <div>\n        <button id=\"b\" onclick={{() => {{ n += 1 }}}}>{}{{n}}</button>\n        <input id=\"free\"/>\n        <input id=\"bound\" bind:value={{bound}}/>\n        <input id=\"tick\" type=\"checkbox\"/>\n        <details id=\"d\"><summary>more</summary>inside</details>\n        <div id=\"box\" style=\"height: 40px; overflow: auto\"><p style=\"height: 400px\">tall</p></div>\n        <audio id=\"au\" muted src=\"data:audio/wav;base64,{}\"></audio>\n        <dialog id=\"dlg\">a dialog</dialog>\n    </div>\n}}\nroute GET / = <html><body><div><Form/></div></body></html>\n", label, silence())
+}
+
+const DOM_SCRIPT: &str = r##"(async () => {
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  const $ = (s) => document.querySelector(s);
+  $("#b").dispatchEvent(new Event("focusin", { bubbles: true }));
+  for (let i = 0; i < 300 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
+  const said = [];
+  document.addEventListener("quillo:hmr", (e) => said.push(JSON.parse(e.detail).what));
+  $("#b").click(); $("#b").click(); await tick(30);
+  $("#bound").value = "typed"; $("#bound").dispatchEvent(new Event("input", { bubbles: true }));
+  $("#tick").checked = true;
+  $("#d").open = true;
+  $("#box").scrollTop = 120;
+  const au = $("#au");
+  for (let i = 0; i < 200 && au.readyState < 1; i++) await tick(20);
+  au.currentTime = 0.5;
+  $("#dlg").show();
+  const free = $("#free");
+  free.value = "hello world"; free.focus(); free.setSelectionRange(2, 7);
+  await fetch("/stage/1");
+  for (let i = 0; i < 400 && !$("#b").textContent.startsWith("count "); i++) await tick(30);
+  const f = $("#free"), au2 = $("#au");
+  for (let i = 0; i < 200 && au2.readyState < 1; i++) await tick(20);
+  document.body.dataset.result = JSON.stringify({ b: $("#b").textContent, free: f.value, focused: document.activeElement === f, sel: [f.selectionStart, f.selectionEnd], bound: $("#bound").value, tick: $("#tick").checked, open: $("#d").open, scroll: $("#box").scrollTop, dialog: $("#dlg").open, time: au2.currentTime, newAudio: au2 !== au, said, errors: window.__quilloErrors });
+})();"##;
+
+// FEEDBACK54.md, A.4: a component swapped in place is made again, and its DOM with it, so what the
+// page held that no state does went: what was typed in a field nothing follows, a checkbox ticked,
+// an open <details> and <dialog>, a box's scroll, an <audio>'s time, the focus and its selection.
+// They are put back after the
+// swap, where the place in the component still holds the same kind of element; a bound field
+// keeps its state's value.
+#[test]
+fn a_swap_keeps_what_the_dom_held() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let d = dir("swap-dom", &dom_program("n="));
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+    let port = s.port;
+    let page = std::thread::spawn(move || in_chrome(&chrome, &format!("http://127.0.0.1:{}/", port), DOM_SCRIPT));
+    let end = Instant::now() + Duration::from_secs(30);
+    while support::send(s.port, "GET", "/stage", &[], "").body != "1" {
+        assert!(Instant::now() < end && !page.is_finished(), "the page did not get ready");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    std::fs::write(d.join("main.qwe"), dom_program("count ")).unwrap();
+    let r = page.join().unwrap();
+    assert_eq!(
+        r,
+        serde_json::json!({ "b": "count 2", "free": "hello world", "focused": true, "sel": [2, 7], "bound": "typed", "tick": true, "open": true, "scroll": 120, "dialog": true, "time": 0.5, "newAudio": true, "said": ["swapped"], "errors": [] })
+    );
+}

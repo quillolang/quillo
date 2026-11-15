@@ -9085,10 +9085,64 @@ async function hotSwap(urls) {
   for (const el of outer) if (el.__qi && el.isConnected) remakeIsland(el, el.__qp || el.__qi.props);
 }
 
+// What the page holds in an island that no state does (FEEDBACK54.md, A.4): taken before it is
+// made again in a swap, put back after, each by its place in the island (the index at each level)
+// where that place still holds the same kind of element, and given up quietly where it does not.
+// The focus and its selection; each scrolled element's offset, and the window's; a field the
+// person changed that the new code does not set otherwise; an open <details> or <dialog>; a
+// <video> or <audio>'s time and whether it played.
+const pathIn = (root, n) => { const p = []; for (; n && n !== root && n.parentElement; n = n.parentElement) p.unshift([...n.parentElement.children].indexOf(n)); return n === root ? p : null; };
+const atPathIn = (root, p) => { let n = root; for (const i of p) n = n && n.children[i]; return n || null; };
+const kindOf = (n) => n.tagName + ":" + (n.type || "");
+function takeDom(el) {
+  const at = (n) => { const p = pathIn(el, n); return p && { p, k: kindOf(n) }; };
+  const took = { win: [scrollX, scrollY], scroll: [], fields: [], open: [], media: [], focus: null };
+  const a = document.activeElement;
+  if (a && el.contains(a) && a !== el) took.focus = Object.assign(at(a) || {}, { s: typeof a.selectionStart === "number" ? [a.selectionStart, a.selectionEnd, a.selectionDirection] : null });
+  for (const n of el.querySelectorAll("*")) {
+    if (n.scrollTop || n.scrollLeft) took.scroll.push(Object.assign(at(n), { t: n.scrollTop, l: n.scrollLeft }));
+    if ((n.localName === "input" || n.localName === "textarea" || n.localName === "select") && !asParsed(n) && n.type !== "password" && n.type !== "file") {
+      took.fields.push(Object.assign(at(n), { v: n.type === "checkbox" || n.type === "radio" ? n.checked : n.value }));
+    }
+    if ((n.localName === "details" || n.localName === "dialog") && n.open) took.open.push(Object.assign(at(n), { modal: n.localName === "dialog" && n.matches(":modal") }));
+    if ((n.localName === "video" || n.localName === "audio") && n.currentTime) took.media.push(Object.assign(at(n), { t: n.currentTime, playing: !n.paused }));
+  }
+  return took;
+}
+function putDom(el, took) {
+  const find = (x) => { const n = x && x.p && atPathIn(el, x.p); return n && kindOf(n) === x.k ? n : null; };
+  for (const x of took.fields) {
+    const n = find(x);
+    if (!n) continue;
+    // What the new code gives it (a state's value) wins over what was typed.
+    if (typeof x.v === "boolean") { if (n.checked === n.defaultChecked) n.checked = x.v; }
+    else if (n.value === n.defaultValue) n.value = x.v;
+  }
+  for (const x of took.open) {
+    const n = find(x);
+    if (!n || n.open) continue;
+    try { if (x.modal) n.showModal(); else n.open = true; } catch (_) {}
+  }
+  for (const x of took.media) {
+    const n = find(x);
+    if (!n) continue;
+    try { n.currentTime = x.t; if (x.playing) n.play().catch(() => {}); } catch (_) {}
+  }
+  for (const x of took.scroll) { const n = find(x); if (n) { n.scrollTop = x.t; n.scrollLeft = x.l; } }
+  const f = find(took.focus);
+  if (f && f.focus) {
+    f.focus({ preventScroll: true });
+    if (took.focus.s && f.setSelectionRange) try { f.setSelectionRange(...took.focus.s); } catch (_) {}
+  }
+  scrollTo(took.win[0], took.win[1]);
+}
+
 // The island `el`, taken up, made again with the code there is now and `props`, its states and
-// those of the components inside it kept (see `Inst.made`, `takeHydration`).
+// those of the components inside it kept (see `Inst.made`, `takeHydration`), and what its DOM held
+// that no state does (`takeDom`).
 function remakeIsland(el, props) {
   {
+    const dom = takeDom(el);
     const old = el.__qi;
     const def = C[el.dataset.c];
     if (!def) throw new Error(`quillo: unknown component <${el.dataset.c}>`);
@@ -9117,6 +9171,7 @@ function remakeIsland(el, props) {
     if (r !== el) { el.replaceWith(r); el = r; }
     el.__qi = inst;
     el.__qp = props;
+    putDom(el, dom);
   }
 }
 
