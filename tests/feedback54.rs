@@ -110,6 +110,13 @@ fn chrome() -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
+/// One Chrome test at a time, for all its length: a test waiting on its page's stage while another
+/// test's Chrome runs timed out.
+fn chrome_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// `url` in headless Chrome, with `script` run in the page: what it stored in `data-result`.
 fn in_chrome(chrome: &Path, url: &str, script: &str) -> serde_json::Value {
     static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -141,6 +148,7 @@ fn a_save_that_does_not_load_is_said_on_the_page_which_keeps_its_state() {
         eprintln!("skipping the browser half: no Chrome");
         return;
     };
+    let _turn = chrome_turn();
     let port = s.port;
     let page = std::thread::spawn(move || {
         let script = r#"(async () => {
@@ -274,7 +282,8 @@ fn a_restart_under_watch_keeps_the_session() {
 
 /// What a reloaded page says, from its own script: the first page leaves what it saw in
 /// `sessionStorage`, and the page that replaces it writes it out.
-const AFTER: &str = "if (sessionStorage.f54) document.body.dataset.result = JSON.stringify({ reloaded: true, first: JSON.parse(sessionStorage.f54), n: document.getElementById(\"b\").textContent, hmr: JSON.parse(sessionStorage.f54hmr || \"[]\") });\n";
+// Once the runtime is up: the reload kept the page's state (A.6), which it puts back then.
+const AFTER: &str = "if (sessionStorage.f54) (async () => { for (let i = 0; i < 300 && !(window[Symbol.for(\"quillo\")] || {}).booted; i++) await new Promise((r) => setTimeout(r, 30)); document.body.dataset.result = JSON.stringify({ reloaded: true, first: JSON.parse(sessionStorage.f54), n: document.getElementById(\"b\").textContent, hmr: JSON.parse(sessionStorage.f54hmr || \"[]\") }); })();\n";
 
 fn hot_program(other: &str, label: &str) -> String {
     format!("let stage = 0\nroute GET /stage/:n(int) {{\n    stage = n\n    \"ok\"\n}}\nroute GET /stage = stage\nroute GET /other = \"{}\"\nroute GET /after.js = file(\"after.js\")\ncomponent Count() {{\n    state n = 0\n    <button id=\"b\" onclick={{() => {{ n += 1 }}}}>{}{{n}}</button>\n}}\nroute GET / = <html><body><div><Count/></div><script src=\"/after.js\"></script></body></html>\n", other, label)
@@ -303,6 +312,7 @@ fn a_change_the_page_does_not_use_leaves_it_as_it_is() {
         eprintln!("skipping the browser half: no Chrome");
         return;
     };
+    let _turn = chrome_turn();
     let port = s.port;
     let page = std::thread::spawn(move || {
         let script = r#"(async () => {
@@ -326,10 +336,12 @@ fn a_change_the_page_does_not_use_leaves_it_as_it_is() {
     stage(s.port, 1, &page);
     std::fs::write(d.join("main.qwe"), hot_program("b", "n=")).unwrap();
     stage(s.port, 2, &page);
-    std::fs::write(d.join("main.qwe"), hot_program("b", "count ")).unwrap();
+    // The page's own HTML, outside its islands, reloads it (changed with A.2: a component's label
+    // is swapped in place now).
+    std::fs::write(d.join("main.qwe"), hot_program("b", "n=").replace("<script src=", "<p>more</p><script src=")).unwrap();
     let r = page.join().unwrap();
     assert_eq!(r["first"], serde_json::json!({ "kept": true, "n": "n=3", "errors": [] }), "{}", r);
-    assert_eq!((r["reloaded"].as_bool(), r["n"].as_str()), (Some(true), Some("count 0")), "{}", r);
+    assert_eq!((r["reloaded"].as_bool(), r["n"].as_str()), (Some(true), Some("n=3")), "{}", r);
     assert_eq!(r["hmr"], serde_json::json!([["kept", ""], ["reload", "html"]]), "{}", r);
 }
 
@@ -348,7 +360,11 @@ fn a_pages_print_follows_its_html_and_watch_reload_turns_it_off() {
     assert_eq!(print(s.port), first, "the same page, the same print");
     save(s.port, &d, &hot_program("b", "n="), "n=");
     assert_eq!(print(s.port), first, "a route the page does not call");
+    // A component's markup is its code's (compared by the bundle's ids, A.2); what is outside
+    // the islands is the page's (changed with A.2: the edit was a component's label).
     save(s.port, &d, &hot_program("b", "count "), "count ");
+    assert_eq!(print(s.port), first, "a component's markup is not the page's print");
+    save(s.port, &d, &hot_program("b", "count ").replace("<script src=", "<p>more</p><script src="), "<p>more</p>");
     assert_ne!(print(s.port), first, "the page's own HTML changed");
     drop(s);
     let s = support::serve_with(&d.join("main.qwe"), &["--watch=reload"]);
@@ -398,7 +414,8 @@ fn a_save_is_judged_on_the_data_as_it_is_now() {
     assert_eq!(was.as_deref(), Some(now.as_str()), "a save to a route the page does not call");
     let v2 = support::send(s.port, "GET", "/_quillo/events", &[], "").body;
     assert_ne!(v1, v2);
-    save(s.port, &d, &TASKS.replace("\"OTHER\"", "\"OTHER 2\"").replace("<li>{t}</li>", "<li>- {t}</li>"), "- first");
+    // Outside the islands (changed with A.2: the edit was inside the component's list).
+    save(s.port, &d, &TASKS.replace("\"OTHER\"", "\"OTHER 2\"").replace("</div></body>", "</div><p>after</p></body>"), "<p>after</p>");
     let (now, was) = asked(s.port, &v2);
     assert!(was.is_some() && was.as_deref() != Some(now.as_str()), "the page's markup changed");
     assert_eq!(asked(s.port, &v1).1, None, "two saves behind: no print of a version not kept");
@@ -416,6 +433,7 @@ fn a_page_whose_data_changed_is_kept_at_a_save_it_does_not_use() {
         eprintln!("skipping: no Chrome");
         return;
     };
+    let _turn = chrome_turn();
     let src = format!("{}let ready = false\nroute GET /stage-ready {{\n    ready = true\n    \"ok\"\n}}\nroute GET /is-ready = ready\n", TASKS);
     let d = dir("same-data-chrome", &src);
     let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
@@ -474,7 +492,11 @@ fn a_reload_keeps_what_the_page_held() {
         eprintln!("skipping: no Chrome");
         return;
     };
-    for (to, want_b, want_note) in [(kept_program("0", "count "), "count 3", "clicked"), (kept_program("\"zero\"", "n="), "n=zero", "clicked")] {
+    let _turn = chrome_turn();
+    // A save that changes the page outside its islands (after them, so paths stay), as a reload
+    // needs (changed with A.2: a component's label is swapped in place now).
+    let outside = |p: String| p.replace("</body>", "<p>more</p></body>");
+    for (to, want_b, want_note) in [(outside(kept_program("0", "n=")), "n=3", "clicked"), (outside(kept_program("\"zero\"", "n=")), "n=zero", "clicked")] {
         let d = dir("kept", &kept_program("0", "n="));
         std::fs::write(d.join("after.js"), KEPT_AFTER).unwrap();
         let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
@@ -499,4 +521,105 @@ fn a_reload_keeps_what_the_page_held() {
 
 fn chrome_or_skip() -> PathBuf {
     chrome().unwrap()
+}
+
+fn swap_program(n_init: &str, label: &str) -> String {
+    format!("let stage = 0\nroute GET /stage/:n(int) {{\n    stage = n\n    \"ok\"\n}}\nroute GET /stage = stage\ncomponent Count() {{\n    state n = {}\n    state note = \"\"\n    <div><button id=\"b\" onclick={{() => {{ n += 1; note = \"clicked\" }}}}>{}{{n}}</button><span id=\"note\">{{note}}</span></div>\n}}\nroute GET / = <html><body><div><Count/></div><p id=\"outside\">outside</p></body></html>\n", n_init, label)
+}
+
+const SWAP_SCRIPT: &str = r#"(async () => {
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  const b = () => document.getElementById("b");
+  b().dispatchEvent(new Event("focusin", { bubbles: true }));
+  for (let i = 0; i < 300 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
+  const said = [];
+  document.addEventListener("quillo:hmr", (e) => { const d = JSON.parse(e.detail); said.push(d.what); });
+  for (let i = 0; i < 3; i++) { b().click(); await tick(30); }
+  window.__kept = 1;
+  await fetch("/stage/1");
+  for (let i = 0; i < 400 && !b().textContent.startsWith("count "); i++) await tick(30);
+  const first = { b: b().textContent, note: document.getElementById("note").textContent };
+  b().click(); await tick(50);
+  const clicked = b().textContent;
+  await fetch("/stage/2");
+  for (let i = 0; i < 400 && !b().textContent.includes("zero"); i++) await tick(30);
+  const QW = window[Symbol.for("quillo")];
+  document.body.dataset.result = JSON.stringify({ first, clicked, second: b().textContent, said, kept: window.__kept === 1, remade: QW.remade ?? 0, errors: window.__quilloErrors });
+})();"#;
+
+// FEEDBACK54.md, A.2: a save that changes a component's code swaps it into the open page in
+// place: no reload (what the page's own script set stays), its states kept while their kind is
+// the same, its handlers the new code's; a state whose kind changed starts again.
+#[test]
+fn a_changed_component_is_swapped_in_place() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let d = dir("swap", &swap_program("0", "n="));
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+    let port = s.port;
+    let page = std::thread::spawn(move || in_chrome(&chrome, &format!("http://127.0.0.1:{}/", port), SWAP_SCRIPT));
+    let wait = |n: &str| {
+        let end = Instant::now() + Duration::from_secs(30);
+        while support::send(port, "GET", "/stage", &[], "").body != n {
+            assert!(Instant::now() < end, "stage {}", n);
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    };
+    wait("1");
+    std::fs::write(d.join("main.qwe"), swap_program("0", "count ")).unwrap();
+    wait("2");
+    std::fs::write(d.join("main.qwe"), swap_program("\"zero\"", "count ")).unwrap();
+    let r = page.join().unwrap();
+    assert_eq!(
+        r,
+        serde_json::json!({ "first": { "b": "count 3", "note": "clicked" }, "clicked": "count 4", "second": "count zero", "said": ["swapped", "swapped"], "kept": true, "remade": 0, "errors": [] })
+    );
+}
+
+fn nested_program(label: &str) -> String {
+    format!("let stage = 0\nroute GET /stage/:n(int) {{\n    stage = n\n    \"ok\"\n}}\nroute GET /stage = stage\ncomponent Inner(name: str) {{\n    state m = 0\n    <button class=\"in\" onclick={{() => {{ m += 1 }}}}>{{name}} {{m}}</button>\n}}\ncomponent Outer() {{\n    state open = false\n    <div><p id=\"o\">{}{{str(open)}}</p><button id=\"t\" onclick={{() => {{ open = !open }}}}>t</button><Inner name=\"a\"/><Inner name=\"b\"/></div>\n}}\nroute GET / = <html><body><div><Outer/></div></body></html>\n", label)
+}
+
+const NESTED_SCRIPT: &str = r##"(async () => {
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  const $ = (s) => document.querySelector(s);
+  $("#t").dispatchEvent(new Event("focusin", { bubbles: true }));
+  for (let i = 0; i < 300 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
+  const said = [];
+  document.addEventListener("quillo:hmr", (e) => said.push(JSON.parse(e.detail).what));
+  $("#t").click(); await tick(30);
+  const [a, b] = document.querySelectorAll(".in");
+  a.click(); await tick(30); b.click(); await tick(30); b.click(); await tick(30);
+  await fetch("/stage/1");
+  for (let i = 0; i < 400 && !$("#o").textContent.startsWith("open: "); i++) await tick(30);
+  const after = [...document.querySelectorAll(".in")].map((x) => x.textContent);
+  document.querySelectorAll(".in")[0].click(); await tick(50);
+  const QW = window[Symbol.for("quillo")];
+  document.body.dataset.result = JSON.stringify({ o: $("#o").textContent, after, clicked: document.querySelectorAll(".in")[0].textContent, said, remade: QW.remade ?? 0, errors: window.__quilloErrors });
+})();"##;
+
+// A.2's edge: the components inside a swapped one keep their states too, each its own, by
+// component and order, and their handlers still work.
+#[test]
+fn components_inside_a_swapped_one_keep_their_states() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let d = dir("swap-nested", &nested_program("open="));
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+    let port = s.port;
+    let page = std::thread::spawn(move || in_chrome(&chrome, &format!("http://127.0.0.1:{}/", port), NESTED_SCRIPT));
+    let end = Instant::now() + Duration::from_secs(30);
+    while support::send(s.port, "GET", "/stage", &[], "").body != "1" {
+        assert!(Instant::now() < end && !page.is_finished(), "the page did not get ready");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    std::fs::write(d.join("main.qwe"), nested_program("open: ")).unwrap();
+    let r = page.join().unwrap();
+    assert_eq!(r, serde_json::json!({ "o": "open: true", "after": ["a 1", "b 2"], "clicked": "a 2", "said": ["swapped"], "remade": 0, "errors": [] }));
 }

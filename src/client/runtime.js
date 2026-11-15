@@ -8483,6 +8483,19 @@ class Inst extends Scope {
   }
 
   made(name, init, page) {
+    // Swapped in place under --watch (FEEDBACK54.md, A.2): a state keeps its value while the new
+    // code's starts as the same kind of value (a null there, or one not known yet, takes any; the
+    // user's rule of 2026-11-04); else it starts again, and the console says so.
+    if (this.swapped && hasOwn(this.s0, name) && !page) {
+      let fresh;
+      try { fresh = init(); } catch (_) { fresh = null; }
+      const was = this.s0[name];
+      if (fresh !== null && !(fresh instanceof Promise) && keptKind(fresh) !== keptKind(was)) {
+        console.info(`quillo: <${this.def.$name}>'s state ${name} starts again: it was ${keptKind(was)}, the new code makes it ${keptKind(fresh)}`); // dev
+        return new Sig(fresh);
+      }
+      return new Sig(was);
+    }
     if (hasOwn(this.s0, name)) {
       // `{"$quillo_prop": "initial"}`: the prop's own value, written once (FEEDBACK30.md, Q-371;
       // branch feedback27-35-fixes). Read as the server's mark only, not from a map the program
@@ -8633,6 +8646,8 @@ function island(def, props, h, c, out) {
   }
   if (c.claim && isMarked(c.n)) { islandMarked(def, props, h, c, out); return; }
   let inst = new Inst(def, props, h && h.s, h && h.l);
+  // Made again in a swap (FEEDBACK54.md, A.2): its states as they were, while their kind holds.
+  if (h && h.swapped) inst.swapped = true;
   if (!c.claim && bareIn(c)) {
     const got = run(inst, null, false, c.svg, c.p) || [];
     bareRoot(got, inst, def.$name);
@@ -8653,6 +8668,7 @@ function island(def, props, h, c, out) {
     c.n = el.nextSibling;
   } else el = wrapper(def.$name);
   inst.el = el;
+  if (DEV) el.__qi = inst;
   if (!c.claim) {
     run(inst, el, false, c.svg);
     if (TOOLS) toolsMade(inst);
@@ -9049,6 +9065,56 @@ function keptPageBack() {
   if (f && f.focus) { f.focus(); if (k.focus.s && f.setSelectionRange) try { f.setSelectionRange(k.focus.s[0], k.focus.s[1]); } catch (_) {} }
 }
 
+// A save's changed files, swapped into the page in place (FEEDBACK54.md, A.2): each loaded as a
+// script (its `G["Name"] = ...` replaces the definition), then every island taken up made again
+// with the new code, its states kept by name (see `Inst.made`), and those inside it theirs, by
+// component and order. An island not taken up yet takes up the new code when it is reached for.
+// A component that is a row's or a cell's own root (no element of its own) starts again.
+function loadScript(url) {
+  return new Promise((ok, no) => {
+    const t = document.createElement("script");
+    t.src = url;
+    t.onload = () => { t.remove(); ok(); };
+    t.onerror = () => { t.remove(); no(new Error("quillo: could not load " + url)); };
+    document.head.appendChild(t);
+  });
+}
+async function hotSwap(urls) {
+  for (const u of urls) await loadScript(u);
+  const outer = [...document.querySelectorAll(ISLANDS)].filter((i) => !(i.parentElement && i.parentElement.closest(ISLANDS)));
+  for (let el of outer) {
+    const old = el.__qi;
+    if (!old || !el.isConnected) continue;
+    const def = C[el.dataset.c];
+    if (!def) throw new Error(`quillo: unknown component <${el.dataset.c}>`);
+    const states = (i) => { const o = {}; for (const [k, sig] of Object.entries(i.sigs || {})) o[k] = sig._v; return o; };
+    const s0 = states(old), props = el.__qp || old.props;
+    // Those inside it, in the page's order, by component: each made again takes the next of its
+    // name's, as a page being taken up does (see `takeHydration`).
+    const inner = {};
+    for (const i of el.querySelectorAll(ISLANDS)) {
+      if (i.__qi && !i.__qi.dead) (inner[i.dataset.c] = inner[i.dataset.c] || []).push({ s: states(i.__qi), l: i.__qi.liveInfo, swapped: true });
+    }
+    dispose(old);
+    removing++;
+    try {
+      if (ownRoot(el)) { const w = wrapper(el.dataset.c); el.replaceWith(w); el = w; } else el.replaceChildren();
+    } finally {
+      removing--;
+    }
+    const inst = new Inst(def, props, s0, old.liveInfo);
+    inst.swapped = true;
+    inst.el = el;
+    const svg = inSvg(el.parentNode || el);
+    hydrating = inner;
+    try { run(inst, el, false, svg); } finally { hydrating = null; }
+    const r = asOwnRoot(el, inst, svg);
+    if (r !== el) { el.replaceWith(r); el = r; }
+    el.__qi = inst;
+    el.__qp = props;
+  }
+}
+
 // An island taken up: its component (and those inside it) resumed from
 // the state the server wrote, on the HTML it wrote.
 function resume(el) {
@@ -9078,7 +9144,7 @@ function resume(el) {
   hydrating = queue();
   let inst = new Inst(def, props, state, liveInfo);
   inst.el = el;
-  if (DEV) el.__qi = inst;
+  if (DEV) { el.__qi = inst; el.__qp = props; }
   let ok = true;
   try {
     run(inst, el, true);
@@ -9113,7 +9179,7 @@ function resume(el) {
     run(inst, el, false, svg);
     const r = asOwnRoot(el, inst, svg);
     if (r !== el) { el.replaceWith(r); el = r; }
-    if (DEV) el.__qi = inst;
+    if (DEV) { el.__qi = inst; el.__qp = props; }
   }
   hydrating = null;
   if (TOOLS) toolsMade(inst);
@@ -9177,7 +9243,7 @@ function boot() {
   // keys it had (branch early-events).
   const held = QW.q || [];
   const redo = QW.redo;
-  if (DEV) { QW.keep = keepPage; keptPageBack(); }
+  if (DEV) { QW.keep = keepPage; QW.swap = hotSwap; keptPageBack(); }
   QW.booted = true;
   for (const r of held.splice(0)) {
     const i = outerIsland(r.el);

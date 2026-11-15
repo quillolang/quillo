@@ -3419,25 +3419,55 @@ fn watch(app: Arc<App>, others: Vec<Arc<App>>, mut files: Vec<PathBuf>, mut seen
 /// save replaced, the server renders that version too and gives its print (`x-quillo-was`),
 /// which the page compares instead of its own: data changed since then changes both alike.
 /// Live data's version too (`data-v="<seq>:<server>"`, which any change of data moves, a reload's
-/// too): the page's live states follow it themselves (found by Quillo DevTools' tests).
+/// too): the page's live states follow it themselves (found by Quillo DevTools' tests). And what an
+/// island holds, but its component and props: its code is compared on its own (the bundle's ids),
+/// and a component swapped in place makes it again (FEEDBACK54.md, A.2).
 fn page_print(body: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let mut rest = body;
     loop {
-        let bundle = rest.find("/_quillo/b/");
-        let live = rest.find(" data-v=\"");
-        match (bundle, live) {
-            (Some(i), l) if l.map_or(true, |l| i < l) => {
-                rest[..i].hash(&mut h);
-                rest = rest[i + "/_quillo/b/".len()..].trim_start_matches(|c: char| c.is_ascii_hexdigit());
-            }
-            (_, Some(l)) => {
-                rest[..l].hash(&mut h);
-                let after = &rest[l + " data-v=\"".len()..];
+        let next = [rest.find("/_quillo/b/"), rest.find(" data-v=\""), rest.find("<quillo-island")];
+        let Some((which, at)) = next.iter().enumerate().filter_map(|(k, i)| i.map(|i| (k, i))).min_by_key(|(_, i)| *i) else { break };
+        rest[..at].hash(&mut h);
+        rest = &rest[at..];
+        match which {
+            0 => rest = rest["/_quillo/b/".len()..].trim_start_matches(|c: char| c.is_ascii_hexdigit()),
+            1 => {
+                let after = &rest[" data-v=\"".len()..];
                 rest = after.find('"').map_or("", |e| &after[e + 1..]);
             }
-            _ => break,
+            _ => {
+                let tag_end = rest.find('>').map_or(rest.len(), |e| e + 1);
+                let tag = &rest[..tag_end];
+                for a in [" data-c=\"", " data-p=\""] {
+                    if let Some(i) = tag.find(a) {
+                        let v = &tag[i + a.len()..];
+                        v[..v.find('"').unwrap_or(v.len())].hash(&mut h);
+                    }
+                }
+                // To its own end, past the islands inside it.
+                let mut depth = 1usize;
+                let mut at = tag_end;
+                while depth > 0 {
+                    let (open, close) = (rest[at..].find("<quillo-island"), rest[at..].find("</quillo-island>"));
+                    match (open, close) {
+                        (Some(o), Some(c)) if o < c => {
+                            depth += 1;
+                            at += o + "<quillo-island".len();
+                        }
+                        (_, Some(c)) => {
+                            depth -= 1;
+                            at += c + "</quillo-island>".len();
+                        }
+                        _ => {
+                            at = rest.len();
+                            break;
+                        }
+                    }
+                }
+                rest = &rest[at..];
+            }
         }
     }
     rest.hash(&mut h);
@@ -3453,9 +3483,10 @@ fn dev_script(version: u64, print: &str) -> String {
     // a shadow root the page's styles do not reach; the page is not reloaded, so what it holds
     // stays (FEEDBACK54.md, Q-686; branch hmr). What the page decided at a new version is told
     // to tools as a `quillo:hmr` event on the document: { what: "kept" | "reload", why: "html" |
-    // "code" | "off" | "failed", version } (Quillo DevTools shows it). A page loaded after a
+    // "code" | "off" | "failed", version }, or { what: "swapped", why: the files } when the
+    // changed components were swapped in place (A.2) (Quillo DevTools shows it). A page loaded after a
     // reload that kept what it held starts its code at once, to put it back (A.6).
-    const SCRIPT: &str = r#"<script>/*quillo-dev*/(()=>{let v='@V@';const h='@H@',HOT=@HOT@;let c=0,e=0,box=null;const css=j=>{const p=JSON.parse(j);for(const l of document.querySelectorAll('link[rel=stylesheet]')){const u=new URL(l.href,location.href);if(u.origin===location.origin&&p.includes(u.pathname)){u.searchParams.set('quillo',Date.now());const n=l.cloneNode();n.href=u.pathname+u.search;n.onload=()=>l.remove();l.after(n)}}};const said=m=>{if(m===null){if(box){box.remove();box=null}return}if(!box){box=document.createElement('quillo-error');const r=box.attachShadow({mode:'open'});r.innerHTML='<style>:host{all:initial;position:fixed;left:0;right:0;bottom:0;z-index:2147483647;font:13px/1.45 ui-monospace,Menlo,monospace}div{position:relative;margin:8px;padding:12px 44px 12px 14px;background:#fff1f0;color:#5c0000;border:2px solid #c62828;border-radius:6px;max-height:45vh;overflow:auto;box-shadow:0 4px 18px #0005}pre{margin:8px 0 0;white-space:pre-wrap;font:inherit}button{position:absolute;top:8px;right:10px;border:0;background:none;font-size:20px;line-height:1;cursor:pointer;color:inherit}</style><div role="alert"><b>This save did not load: the page shows the version before it.</b><pre></pre><button aria-label="Close">×</button></div>';r.querySelector('button').onclick=()=>{box.remove();box=null};document.documentElement.appendChild(box)}box.shadowRoot.querySelector('pre').textContent=m};const plain=()=>{const w=window[Symbol.for('quillo')]||{};return !HOT||w.hot===false||document.documentElement.hasAttribute('data-reload')};const ids=t=>{const m=/\.ids = (\{.*?\});/.exec(t);return m?JSON.parse(m[1]):null};const tell=(what,why,ver)=>{try{document.dispatchEvent(new CustomEvent('quillo:hmr',{detail:JSON.stringify({what,why,version:ver})}))}catch(_){}};const again=(why,ver)=>{tell('reload',why,ver);if(why!=='off')try{const w=window[Symbol.for('quillo')];if(w&&w.keep)w.keep()}catch(_){}location.reload()};let busy=null;const hot=t=>busy||(busy=(async()=>{if(plain())return again('off',t);try{const r=await fetch(location.href,{cache:'no-store',credentials:'same-origin',headers:{'x-quillo-hot':v}});const p=await r.text();const was=r.headers.get('x-quillo-was');const m=/\/\*quillo-dev\*\/\(\(\)=>\{let v='(\d+)';const h='([0-9a-f]+)'/.exec(p)||[],v2=m[1],h2=m[2];if(!r.ok||!v2)return again('failed',t);if(was?was!==h2:h2!==h)return again('html',v2);const mine=(window[Symbol.for('quillo')]||{}).ids;if(mine){const b=(/\/_quillo\/b\/[0-9a-f]+\.js/.exec(p)||[])[0];const theirs=b?ids(await (await fetch(b,{cache:'no-store'})).text()):null;if(!theirs)return again('failed',v2);if(Object.keys(mine).some(k=>mine[k]!==theirs[k])||Object.keys(theirs).some(k=>!(k in mine)))return again('code',v2)}v=v2;said(null);tell('kept','',v2)}catch(x){again('failed',t)}})().finally(()=>{busy=null}));const seen=t=>{if(t.startsWith('css:')){const i=t.indexOf(':',4);c=+t.slice(4,i)||c;css(t.slice(i+1))}else if(t.startsWith('err:')){const i=t.indexOf(':',4);e=+t.slice(4,i)||e;said(JSON.parse(t.slice(i+1)))}else if(t!==v)return hot(t)};const u=()=>'/_quillo/events?v='+v+'&c='+c+'&e='+e,go=()=>{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u());s.onopen=()=>o=1;s.onmessage=e=>seen(e.data);s.onclose=()=>o?setTimeout(go,1000):fetch(u(),{cache:'no-store'}).then(r=>r.text()).then(async t=>{await seen(t);go()},()=>setTimeout(go,1000))};go();try{if(sessionStorage.getItem('quillo-keep:'+location.pathname+location.search)){const i=document.querySelector('quillo-island,[data-qi]');if(i)i.dispatchEvent(new Event('focusin',{bubbles:true}))}}catch(_){}})()</script>"#;
+    const SCRIPT: &str = r#"<script>/*quillo-dev*/(()=>{let v='@V@';const h='@H@',HOT=@HOT@;let c=0,e=0,box=null;const css=j=>{const p=JSON.parse(j);for(const l of document.querySelectorAll('link[rel=stylesheet]')){const u=new URL(l.href,location.href);if(u.origin===location.origin&&p.includes(u.pathname)){u.searchParams.set('quillo',Date.now());const n=l.cloneNode();n.href=u.pathname+u.search;n.onload=()=>l.remove();l.after(n)}}};const said=m=>{if(m===null){if(box){box.remove();box=null}return}if(!box){box=document.createElement('quillo-error');const r=box.attachShadow({mode:'open'});r.innerHTML='<style>:host{all:initial;position:fixed;left:0;right:0;bottom:0;z-index:2147483647;font:13px/1.45 ui-monospace,Menlo,monospace}div{position:relative;margin:8px;padding:12px 44px 12px 14px;background:#fff1f0;color:#5c0000;border:2px solid #c62828;border-radius:6px;max-height:45vh;overflow:auto;box-shadow:0 4px 18px #0005}pre{margin:8px 0 0;white-space:pre-wrap;font:inherit}button{position:absolute;top:8px;right:10px;border:0;background:none;font-size:20px;line-height:1;cursor:pointer;color:inherit}</style><div role="alert"><b>This save did not load: the page shows the version before it.</b><pre></pre><button aria-label="Close">×</button></div>';r.querySelector('button').onclick=()=>{box.remove();box=null};document.documentElement.appendChild(box)}box.shadowRoot.querySelector('pre').textContent=m};const plain=()=>{const w=window[Symbol.for('quillo')]||{};return !HOT||w.hot===false||document.documentElement.hasAttribute('data-reload')};const ids=t=>{const m=/\.ids = (\{.*?\});/.exec(t);return m?JSON.parse(m[1]):null};const tell=(what,why,ver)=>{try{document.dispatchEvent(new CustomEvent('quillo:hmr',{detail:JSON.stringify({what,why,version:ver})}))}catch(_){}};const again=(why,ver)=>{tell('reload',why,ver);if(why!=='off')try{const w=window[Symbol.for('quillo')];if(w&&w.keep)w.keep()}catch(_){}location.reload()};let busy=null;const hot=t=>busy||(busy=(async()=>{if(plain())return again('off',t);try{const r=await fetch(location.href,{cache:'no-store',credentials:'same-origin',headers:{'x-quillo-hot':v}});const p=await r.text();const was=r.headers.get('x-quillo-was');const m=/\/\*quillo-dev\*\/\(\(\)=>\{let v='(\d+)';const h='([0-9a-f]+)'/.exec(p)||[],v2=m[1],h2=m[2];if(!r.ok||!v2)return again('failed',t);if(was?was!==h2:h2!==h)return again('html',v2);const mine=(window[Symbol.for('quillo')]||{}).ids;if(mine){const b=(/\/_quillo\/b\/[0-9a-f]+\.js/.exec(p)||[])[0];const lt=b?await (await fetch(b,{cache:'no-store'})).text():'';const theirs=b?ids(lt):null;if(!theirs)return again('failed',v2);const changed=Object.keys(theirs).filter(k=>mine[k]!==theirs[k]);if(changed.length){const w=window[Symbol.for('quillo')]||{};if(!w.swap||changed.includes('quillo.js')||changed.includes('boot.js')||Object.keys(mine).some(k=>!(k in theirs)))return again('code',v2);const at=(/const at = "([^"]*)"/.exec(lt)||[])[1],list=JSON.parse('['+((/for \(const f of \[([^\]]*)\]/.exec(lt)||[])[1]||'')+']');const urls=changed.map(k=>list.find(f=>f.slice(f.indexOf('/')+1)===k)).filter(Boolean).map(f=>at+f);if(urls.length!==changed.length)return again('code',v2);try{await w.swap(urls);w.ids=theirs}catch(x){console.error(x);return again('code',v2)}v=v2;said(null);return tell('swapped',changed.join(', '),v2)}}v=v2;said(null);tell('kept','',v2)}catch(x){again('failed',t)}})().finally(()=>{busy=null}));const seen=t=>{if(t.startsWith('css:')){const i=t.indexOf(':',4);c=+t.slice(4,i)||c;css(t.slice(i+1))}else if(t.startsWith('err:')){const i=t.indexOf(':',4);e=+t.slice(4,i)||e;said(JSON.parse(t.slice(i+1)))}else if(t!==v)return hot(t)};const u=()=>'/_quillo/events?v='+v+'&c='+c+'&e='+e,go=()=>{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u());s.onopen=()=>o=1;s.onmessage=e=>seen(e.data);s.onclose=()=>o?setTimeout(go,1000):fetch(u(),{cache:'no-store'}).then(r=>r.text()).then(async t=>{await seen(t);go()},()=>setTimeout(go,1000))};go();try{if(sessionStorage.getItem('quillo-keep:'+location.pathname+location.search)){const i=document.querySelector('quillo-island,[data-qi]');if(i)i.dispatchEvent(new Event('focusin',{bubbles:true}))}}catch(_){}})()</script>"#;
     let hot = !PLAIN_RELOAD.load(std::sync::atomic::Ordering::Relaxed);
     SCRIPT.replace("@V@", &version.to_string()).replace("@H@", print).replace("@HOT@", if hot { "1" } else { "0" })
 }
