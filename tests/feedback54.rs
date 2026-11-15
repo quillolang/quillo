@@ -183,3 +183,91 @@ fn a_save_that_does_not_load_is_said_on_the_page_which_keeps_its_state() {
     assert!(said.parse::<u64>().is_ok() && said != version, "{}", said);
     assert!(support::send(s.port, "GET", "/", &[], "").body.contains("0!</button>"));
 }
+
+/// `quillo run` with no `QUILLO_SECRET`, on a port of its own: the server, and what it said
+/// until it listened.
+struct Bare(std::process::Child);
+
+impl Drop for Bare {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn bare(d: &Path, port: u16, opts: &[&str]) -> (Bare, String) {
+    use std::io::BufRead;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .arg(d.join("main.qwe"))
+        .args(["--port", &port.to_string()])
+        .args(opts)
+        .env_remove("QUILLO_SECRET")
+        .current_dir(d)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let err = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let mut said = String::new();
+    let end = Instant::now() + Duration::from_secs(20);
+    while !said.contains("listening on") {
+        assert!(Instant::now() < end, "the server did not start: {}", said);
+        if let Ok(l) = rx.recv_timeout(Duration::from_millis(50)) {
+            said.push_str(&l);
+            said.push('\n');
+        }
+    }
+    (Bare(child), said)
+}
+
+const VISITS: &str = "route GET / {\n    let n = (session().n ?? 0) + 1\n    set_session({ n })\n    str(n)\n}\n";
+
+/// GET / with `cookie`: the body, and the cookie the answer set (or the one given).
+fn visit(port: u16, cookie: &str) -> (String, String) {
+    let a = support::send(port, "GET", "/", &[("cookie", cookie)], "");
+    let set = a.headers.iter().find(|(k, _)| k == "set-cookie").map(|(_, v)| v.split(';').next().unwrap().to_string());
+    (a.body, set.unwrap_or_else(|| cookie.to_string()))
+}
+
+// Q-689: with no QUILLO_SECRET each start made a random key, so a restart under --watch (a new
+// binary, a changed .env) signed the developer out. Under --watch the key is now kept in
+// .quillo/.quillo-secret, its owner's alone, and said once; a session goes on across a restart.
+// Without --watch, a random key as before, and no file; with QUILLO_SECRET, that.
+#[test]
+fn a_restart_under_watch_keeps_the_session() {
+    let d = dir("restart-session", VISITS);
+    let port = support::free_port();
+    let (s, said) = bare(&d, port, &["--watch"]);
+    assert!(said.contains("sessions are signed with .quillo/.quillo-secret"), "{}", said);
+    let (one, cookie) = visit(port, "");
+    let (two, cookie) = visit(port, &cookie);
+    assert_eq!((one.as_str(), two.as_str()), ("1", "2"));
+    drop(s);
+    let key = d.join(".quillo/.quillo-secret");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    let (_s, _) = bare(&d, port, &["--watch"]);
+    assert_eq!(visit(port, &cookie).0, "3", "signed out by the restart");
+    drop(_s);
+
+    // Without --watch: no file made, none used.
+    let d2 = dir("restart-plain", VISITS);
+    let (s, said) = bare(&d2, port, &[]);
+    assert!(!said.contains(".quillo-secret"), "{}", said);
+    let (_, cookie) = visit(port, "");
+    drop(s);
+    assert!(!d2.join(".quillo/.quillo-secret").exists());
+    let (_s, _) = bare(&d2, port, &[]);
+    assert_eq!(visit(port, &cookie).0, "1");
+}

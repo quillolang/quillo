@@ -119,7 +119,12 @@ pub(crate) fn keep_secret(data: &Path) -> Result<(), String> {
         Ok(s) if s.trim().len() >= 32 => s.trim().to_string(),
         _ => {
             let s = crate::server::launch_token()?;
-            std::fs::write(&file, &s).map_err(|e| format!("{}: {}", file.display(), e))?;
+            // Its owner's alone: it signs every session (FEEDBACK54.md, Q-689; branch hmr).
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+            std::io::Write::write_all(&mut o.open(&file).map_err(|e| format!("{}: {}", file.display(), e))?, s.as_bytes()).map_err(|e| format!("{}: {}", file.display(), e))?;
             s
         }
     };

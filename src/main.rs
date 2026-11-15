@@ -1449,6 +1449,16 @@ fn before_the_program(file: &str, o: &RunOptions) -> Result<(), i32> {
         eprintln!("quillo: {}", e);
         return Err(2);
     }
+    // Under --watch, with no key given, sessions are signed with one kept beside the program, so
+    // a restart does not sign the developer out; without --watch a server never uses a file it was
+    // not told of (FEEDBACK54.md, Q-689; branch hmr).
+    if o.watch && std::env::var("QUILLO_SECRET").map_or(true, |s| s.is_empty()) {
+        let kept = Path::new(file).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).join(".quillo");
+        match quillo::embed::keep_secret(&kept) {
+            Ok(()) => eprintln!("quillo: sessions are signed with .quillo/.quillo-secret (development only; set QUILLO_SECRET in production)"),
+            Err(e) => eprintln!("quillo: cannot keep a session key in .quillo ({}); sessions use a random key and end when the server stops", e),
+        }
+    }
     // Known by identity, so a second hard link to one is not served (FEEDBACK55.md, Q-701; branch
     // feedback55).
     quillo::builtins::protect_settings(Path::new(file).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")), Some(&env_file.0));
