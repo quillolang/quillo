@@ -2012,6 +2012,9 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 // year: the file may be there tomorrow (FEEDBACK55.md, Q-715; branch feedback55).
                 r.headers.retain(|(k, _)| !["etag", "last-modified", "accept-ranges", "cache-control"].contains(&k.as_str()));
                 r.headers.push(("cache-control".into(), "no-cache".into()));
+                // Still a file, sent as it is: no script added to it for having no `ETag`
+                // (FEEDBACK69.md, Q-964; branch q964-miss-page).
+                r.headers.push((crate::server::AS_WRITTEN.into(), "1".into()));
                 return Ok(Value::Response(Arc::new(r)));
             }
         }

@@ -126,10 +126,9 @@ fn not_found_and_quillo_serve_answer_a_deep_link_with_a_404() {
     let d = build("not-found", "route GET /*path = files(\"dist\", path, { not_found: \"index.html\" })\n");
     let s = support::serve(&d.join("main.qwe"), &[]);
     let deep = send(s.port, "GET", "/products/42", &[], "");
-    assert_eq!(deep.status, 404, "the page, but as a miss");
-    // The page, but not as built: a miss's page loses its ETag, so the prefetching script is added
-    // (against the guide's "Pages sent as written", told to the user 2026-11-16; branch spa-docs).
-    assert!(deep.body.starts_with(&INDEX[..INDEX.len() - "</body></html>".len()]), "{}", deep.body);
+    // The page as built, but as a miss. It had the prefetching script added until FEEDBACK69.md,
+    // Q-964 (branch q964-miss-page).
+    assert_eq!((deep.status, deep.body.as_str()), (404, INDEX), "the page, but as a miss");
     assert_eq!(send(s.port, "GET", "/", &[], "").status, 200, "the index itself is found");
     drop(s);
 

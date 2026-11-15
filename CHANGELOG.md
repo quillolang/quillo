@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- The page `files()` sends for a miss (the folder's `404.html`, or its `not_found`) goes out as
+  written, as the guide had it: it was given the prefetching script, and `--watch`'s, for having
+  lost its `ETag` (FEEDBACK69.md, Q-964).
+- The guide's "A front end built elsewhere (React, Vite)": a built single-page app's `dist/`
+  served beside the program, deep links answered `200` with its page, its hashed files kept a
+  year, and its calls to the program on its own origin.
+
 ## 0.8.5 (2026-11-16)
 
 - **Page state**: `state cart = []` at the top of a program is the page's, shared by every

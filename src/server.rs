@@ -3626,7 +3626,19 @@ fn serve_events(app: Arc<App>, req: HttpRequest) -> Answer {
 /// `etag`): sent as it is, nothing added to it (FEEDBACK36.md, Q-447; branch feedback36-39).
 fn as_written(resp: &HttpResponse) -> bool {
     // A header named `null` is none (FEEDBACK55.md, Q-710; branch feedback55).
-    resp.status == 206 || resp.sent("etag").is_some() || resp.sent("content-range").is_some()
+    resp.status == 206 || resp.sent("etag").is_some() || resp.sent("content-range").is_some() || written_miss(resp)
+}
+
+/// Marks the page `files()` sends for a miss: a file, sent as its bytes are, which has lost its
+/// `ETag` (that of another URL's answer, Q-715) and so looked like a page a route made, and was
+/// given the prefetching script and `--watch`'s (FEEDBACK69.md, Q-964; branch q964-miss-page).
+/// Only ever on a 404, and `answer` takes it off: it is never sent.
+pub(crate) const AS_WRITTEN: &str = "x-quillo-as-written";
+
+/// Whether the answer is a miss's page, sent as written. Only a 404 looks, so a page a route made
+/// pays one comparison (FEEDBACK69.md, Q-964; branch q964-miss-page).
+fn written_miss(resp: &HttpResponse) -> bool {
+    resp.status == 404 && resp.header(AS_WRITTEN).is_some()
 }
 
 fn inject_dev_script(resp: &mut HttpResponse, version: u64) {
@@ -4014,6 +4026,11 @@ impl Worker {
         }
         if app.watch && streamed.is_none() {
             inject_dev_script(&mut resp, self.generation);
+        }
+        // Both scripts have been decided: the mark of a miss's page sent as written goes no
+        // further, whoever set it (FEEDBACK69.md, Q-964; branch q964-miss-page).
+        if resp.status == 404 {
+            resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(AS_WRITTEN));
         }
         // Chrome asks every site for this while DevTools is open; it is not
         // the program's business, so it is not logged.

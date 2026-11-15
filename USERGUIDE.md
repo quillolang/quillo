@@ -4675,7 +4675,7 @@ has logged in or out.
   link on a connection saving data.
 - A route that sets its own `cache-control` keeps it. Starting the program with
   [`--no-prefetch`](#options-of-quillo-run), `quillo run main.qwe --no-prefetch`, turns prefetching off.
-- **Pages sent as written:** a file `file()` or `files()` serves, and any answer with an
+- **Pages sent as written:** a file `file()` or `files()` serves (the page for a miss too), and any answer with an
   `etag` or a range, goes out as its bytes are, so its `ETag` and `Content-Range` name what
   is sent: no prefetching script is added to it, nor [`--watch`](#options-of-quillo-run)'s.
 
@@ -5197,7 +5197,9 @@ route GET /docs/*p = files("manual", p, { index: "home.htm", extensions: ["htm"]
   relative links work (`//docs` goes to `/docs/`, never to another host). A miss is the folder's `404.html`, sent with status 404, when it
   has one; else the plain 404. The page of a miss is `no-cache`, with `cache` or without
   (a file asked for before it was deployed is not missing in caches for a year), and is
-  sent whole whatever `Range` or conditional the request had. A route's URLs are the
+  sent whole whatever `Range` or conditional the request had, and as written: no script is
+  added to it *(until 0.8.5 it was given the prefetching script and `--watch`'s,
+  FEEDBACK69.md, Q-964)*. A route's URLs are the
   program's: `files()` serves what it is asked for, `/build/a.txt/` as `a.txt`, so a
   site whose URLs end in `/` keeps them.
 - Files whose names start with a dot (`.env`, `.git/`) are not served, but `.well-known/`
