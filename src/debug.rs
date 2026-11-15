@@ -700,10 +700,22 @@ fn push_cut(out: &mut String, s: &str, max: usize) {
 /// The lines of `src` where the program can stop, and where each top-level
 /// item starts: a breakpoint on a line with nothing to stop at moves to the
 /// next line that has, in the same item.
+#[cfg(test)]
 fn stops_in(src: &str) -> (Vec<u32>, Vec<u32>) {
-    let Ok(stmts) = Parser::new(src).parse_program() else { return (vec![], vec![]) };
+    let (lines, items, _) = stops_with_browser(src);
+    (lines, items)
+}
+
+/// `stops_in`, and the lines among them with only code the browser runs: in a component, its
+/// handlers and the callbacks of `channel.open`, `every`, `listen`, `run_after` and `receive`.
+/// A breakpoint there was verified and never stopped, and a coverage tool on the debugger counted
+/// those lines as never run (FEEDBACK66.md, Q-951; branch feedback66).
+fn stops_with_browser(src: &str) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let Ok(stmts) = Parser::new(src).parse_program() else { return (vec![], vec![], vec![]) };
     let mut lines = Vec::new();
     let mut items = Vec::new();
+    let mut browser = Vec::new();
+    let mut server = Vec::new();
     for s in &stmts {
         let start = match s {
             Stmt::Fn(d) => d.line,
@@ -716,11 +728,31 @@ fn stops_in(src: &str) -> (Vec<u32>, Vec<u32>) {
             items.push(start);
         }
         walk_stmt(s, &mut lines);
+        if let Stmt::Fn(d) = s {
+            if d.component {
+                let mut later = Vec::new();
+                crate::check::each_later(&d.body, &mut |l| {
+                    later.push(l as *const Expr);
+                    walk(l, &mut browser);
+                });
+                SKIP.with(|k| *k.borrow_mut() = later);
+                walk_stmt(s, &mut server);
+                SKIP.with(|k| k.borrow_mut().clear());
+            }
+        }
     }
     lines.sort_unstable();
     lines.dedup();
     items.sort_unstable();
-    (lines, items)
+    browser.retain(|l| !server.contains(l));
+    browser.sort_unstable();
+    browser.dedup();
+    (lines, items, browser)
+}
+
+thread_local! {
+    /// The functions `walk` leaves out: a component's code that runs in the browser.
+    static SKIP: std::cell::RefCell<Vec<*const Expr>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn walk_stmt(s: &Stmt, out: &mut Vec<u32>) {
@@ -792,6 +824,7 @@ fn walk(e: &Expr, out: &mut Vec<u32>) {
             walk(body, out);
         }
         Expr::Block(stmts) => stmts.iter().for_each(|s| walk_stmt(s, out)),
+        Expr::Lambda(_) if SKIP.with(|k| k.borrow().contains(&(e as *const Expr))) => {}
         Expr::Lambda(d) => walk_body(&d.body, out),
         Expr::Reply(s, b, _) => {
             walk(s, out);
@@ -1000,13 +1033,19 @@ pub fn serve(start: impl FnOnce(Launch) -> i32 + Send + 'static) -> i32 {
             "setBreakpoints" => {
                 let file = args["source"]["path"].as_str().unwrap_or("").to_string();
                 let file = std::fs::canonicalize(&file).map(|p| p.display().to_string()).unwrap_or(file);
-                let (lines, items) = std::fs::read_to_string(&file).map(|s| stops_in(&s)).unwrap_or_default();
+                let (lines, items, browser) = std::fs::read_to_string(&file).map(|s| stops_with_browser(&s)).unwrap_or_default();
                 let mut bps = Vec::new();
                 let mut shown = Vec::new();
                 for b in args["breakpoints"].as_array().into_iter().flatten() {
                     let want = b["line"].as_u64().unwrap_or(0) as u32;
                     let id = NEXT_BP.fetch_add(1, Relaxed);
                     match place(&lines, &items, want) {
+                        Some(line) if browser.contains(&line) => shown.push(json!({
+                            "id": id,
+                            "verified": false,
+                            "line": line,
+                            "message": "this runs in the browser, not on the server: it stops there with \"browser\": true in the launch configuration, or set it in the browser's developer tools"
+                        })),
                         Some(line) => {
                             let text = |k: &str| b[k].as_str().filter(|s| !s.trim().is_empty()).map(String::from);
                             bps.push(Bp { id, line, condition: text("condition"), hit: text("hitCondition"), log: text("logMessage"), hits: 0 });

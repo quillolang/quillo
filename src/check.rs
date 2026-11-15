@@ -9638,35 +9638,40 @@ fn unstyled_classes(order: &[Item], base: &Path, rules: &[(String, String, u32)]
 /// compile (FEEDBACK66.md, Q-952; branch feedback66). A function called at once (`map`'s) runs
 /// as `e` does.
 fn runs_later(e: &Expr) -> HashSet<*const Expr> {
-    fn all_of(e: &Expr, out: &mut HashSet<*const Expr>) {
-        walk_expr(e, &mut |x| {
-            out.insert(x as *const Expr);
-        });
-    }
     let mut out = HashSet::new();
+    each_later(e, &mut |l| {
+        walk_expr(l, &mut |x| {
+            out.insert(x as *const Expr);
+        })
+    });
+    out
+}
+
+/// The functions in `e` that run later (see `runs_later`), each once. In a component, that is
+/// in the browser only: the debugger does not stop there (FEEDBACK66.md, Q-951; branch feedback66).
+pub(crate) fn each_later(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     walk_expr(e, &mut |x| match x {
-        Expr::Call(f, args, _) => {
-            let later = match &**f {
+        Expr::Call(c, args, _) => {
+            let later = match &**c {
                 Expr::Ident(n, _) => ["every", "listen", "run_after", "receive"].contains(&n.as_str()),
                 Expr::Field(o, n, _) => n == "open" && matches!(&**o, Expr::Ident(c, _) if c == "channel"),
                 _ => false,
             };
             if later {
-                args.iter().filter(|a| matches!(a, Expr::Lambda(_))).for_each(|a| all_of(a, &mut out));
+                args.iter().filter(|a| matches!(a, Expr::Lambda(_))).for_each(&mut *f);
             }
         }
         Expr::Html(el, _) => walk_html_els(el, &mut |h| {
             for (name, v) in &h.attrs {
                 if let AttrVal::Expr(l @ Expr::Lambda(_)) = v {
                     if name.starts_with('@') || name.starts_with("on") {
-                        all_of(l, &mut out);
+                        f(l);
                     }
                 }
             }
         }),
         _ => {}
     });
-    out
 }
 
 fn walk_html_els(el: &HtmlEl, f: &mut dyn FnMut(&HtmlEl)) {

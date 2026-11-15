@@ -348,3 +348,67 @@ fn stop_on_entry_and_pause() {
     d.call("continue", json!({ "threadId": 1 }));
     assert!(page.join().unwrap().contains("HELLO 6!"));
 }
+
+// FEEDBACK66.md, Q-951: a breakpoint in a component's handler was verified, and never stopped:
+// that code runs in the browser. Lines with only such code (handlers, and the callbacks of
+// `channel.open`, `every`, `listen`, `run_after` and `receive`) are not verified, with a message
+// saying so; what the server runs as it makes the page still stops (branch feedback66).
+#[test]
+fn a_line_only_the_browser_runs_is_not_verified() {
+    let src = r#"channel.on("room", (msg, peer) => null)
+
+component Counter() {
+    state n = 0
+    let twice = (x) => x * 2
+    let room = channel.open("room", (m) => {
+        n += 1
+    })
+    let t = every(1000, () => {
+        n += 1
+    })
+    <div>
+        <p>{twice(n)}</p>
+        <button onclick={() => {
+            n += 1
+        }}>+</button>
+        <button @click={() => n = 0}>0</button>
+        <button onclick={() => n += 2}>{n + twice(1)}</button>
+        <p>{map([1], (i) => {
+            i + n
+        })}</p>
+    </div>
+}
+
+fn outside() {
+    return every(1000, () => {
+        print("tick")
+    })
+}
+
+route GET / = <html><body><Counter/></body></html>
+"#;
+    let dir = program("browser-lines", &[("main.qwe", src)]);
+    let port = free_port();
+    let lines = [4, 5, 6, 7, 10, 15, 17, 18, 20, 27];
+    let (mut d, set) = launch(&dir, port, &[("main.qwe", lines.iter().map(|&l| json!({ "line": l })).collect())], json!({}));
+    let verified: Vec<(u64, bool)> = set.iter().map(|b| (b["line"].as_u64().unwrap(), b["verified"].as_bool().unwrap())).collect();
+    // The state, a helper, the `let` a callback starts on, and a function `map` calls as the page
+    // is made: the server's. A channel's and a timer's callback, and handlers: the browser's, one
+    // written on a line of the markup too (17). Line 18's handler is all the server could stop at
+    // there: what the button shows is not a statement. Outside a component, `every`'s callback is
+    // the server's.
+    assert_eq!(
+        verified,
+        vec![(4, true), (5, true), (6, true), (7, false), (10, false), (15, false), (17, false), (18, false), (20, true), (27, true)]
+    );
+    for b in set.iter().filter(|b| b["verified"] == false) {
+        assert!(b["message"].as_str().unwrap().contains("runs in the browser"), "{}", b);
+    }
+    let page = get(port, "/");
+    let s = d.stopped();
+    assert_eq!(s["reason"], "breakpoint");
+    assert_eq!(d.stack()[0].1, 4);
+    d.call("setBreakpoints", json!({ "source": { "path": dir.join("main.qwe") }, "breakpoints": [] }));
+    d.call("continue", json!({ "threadId": 1 }));
+    assert!(page.join().unwrap().contains("<button>"), "the page was made");
+}
