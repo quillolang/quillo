@@ -1770,6 +1770,21 @@ fn sync_called(body: &Expr) -> HashSet<String> {
     out
 }
 
+/// Whether `let name = e` reads `name` only in the functions in `e`, which run after it is
+/// set: a callback using the handle its call gives (FEEDBACK66.md, Q-950; branch feedback66).
+/// Not when `e` reads it outside them too: that `name` is the one before (`let x = f(x, ...)`).
+fn named_in_own_fns(name: &str, e: &Expr) -> bool {
+    if matches!(e, Expr::Lambda(_)) {
+        return false;
+    }
+    let reads = |fns| {
+        let mut found = false;
+        each_expr_in(e, &mut |x| found |= matches!(x, Expr::Ident(i, _) if i.as_str() == name), fns);
+        found
+    };
+    reads(true) && !reads(false)
+}
+
 /// Calls `f` on `e` and every expression inside it.
 pub(crate) fn each_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     each_expr_in(e, f, true)
@@ -2905,6 +2920,18 @@ impl<'a> Compiler<'a> {
                 }
                 Stmt::Let(p, e, line) if !matches!(e, Expr::Lambda(_)) && !matches!(p, Pattern::Bind(n) if self.mutable.contains(n.as_str())) => {
                     self.line = *line;
+                    // A function in the initializer may use the name it is given, as on the server:
+                    // it runs after (`let room = channel.open(..., (m) => room.send(...))`). The
+                    // browser's compile said "unknown name" where `quillo check` passed, and the
+                    // server did not start (FEEDBACK66.md, Q-950; branch feedback66).
+                    let own = match p {
+                        Pattern::Bind(n) if named_in_own_fns(n, e) => {
+                            let m = self.fresh(n);
+                            self.declare_as(n, Local::Reactive(m.clone()));
+                            Some(m)
+                        }
+                        _ => None,
+                    };
                     let (v, r) = self.reactive_expr(e)?;
                     if !r {
                         pending = None;
@@ -2912,7 +2939,7 @@ impl<'a> Compiler<'a> {
                         continue;
                     }
                     if let Pattern::Bind(name) = p {
-                        let m = self.fresh(name);
+                        let m = own.unwrap_or_else(|| self.fresh(name));
                         let _ = writeln!(body, "const {} = W.memo(() => ({}));", m, v);
                         self.declare_as(name, Local::Reactive(m));
                     } else {
@@ -3028,11 +3055,20 @@ impl<'a> Compiler<'a> {
                         }
                     }
                     let func = if let (Pattern::Bind(_), Expr::Lambda(d)) = (p, e) { Some(self.lambda_is_async(d)?) } else { None };
+                    // Declared first when a function in it uses the name (FEEDBACK66.md, Q-950;
+                    // branch feedback66).
+                    let early = match p {
+                        Pattern::Bind(n) if named_in_own_fns(n, e) => Some(self.declare(n, None)),
+                        _ => None,
+                    };
                     let before = self.ctx().marks.len();
                     let v = self.expr(e)?;
                     let answer = self.answer_in(e, before);
                     if let Pattern::Bind(n) = p {
-                        let js = self.declare(n, func);
+                        let js = match early {
+                            Some(js) => js,
+                            None => self.declare(n, func),
+                        };
                         decls.push(js.clone());
                         let _ = writeln!(body, "{} = {};", js, v);
                     } else {

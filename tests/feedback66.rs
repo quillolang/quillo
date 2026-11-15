@@ -1,12 +1,13 @@
 // FEEDBACK66.md: qwertime's rooms. Q-954: a page on a channel cost the server half a megabyte,
 // three threads each with memory of its own, and most of it stayed after the page closed. A
-// page's WebSocket is now two tasks on one runtime (branch q954).
+// page's WebSocket is now two tasks on one runtime (branch q954). Q-950 to Q-953 (branch
+// feedback66) below those.
 
 mod support;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn dir(name: &str, src: &str) -> PathBuf {
@@ -599,4 +600,152 @@ fn a_watch_page_past_its_places_is_told_to_try_later() {
     }), "the first page's place was not given back");
     let (second, _) = open(&version);
     assert!(second.starts_with("HTTP/1.1 503") && second.contains("retry-after: 5"), "{}", second);
+}
+
+fn chrome() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("QUILLO_CHROME") {
+        return Some(PathBuf::from(p));
+    }
+    ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Chromium.app/Contents/MacOS/Chromium", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists())
+}
+
+/// `url` in headless Chrome, with `script` run in the page: what it stored in `data-result`.
+fn in_chrome(chrome: &Path, url: &str, script: &str) -> serde_json::Value {
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let d = support::temp_dir("f66-chrome");
+    std::fs::write(d.join("t.js"), script).unwrap();
+    let out = std::process::Command::new("node").arg(root.join("browser/run.js")).arg(chrome).arg(url).arg(d.join("profile")).arg("30000").arg(d.join("t.js")).output().expect("node");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{}: {}", e, String::from_utf8_lossy(&out.stdout)))
+}
+
+/// What `quillo check` says of a program, and whether it passed.
+fn check(d: &Path) -> (bool, String) {
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_quillo")).arg("check").arg(d.join("main.qwe")).output().unwrap();
+    (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr))
+}
+
+// Q-950: a callback answering on the channel it is the callback of, `let room =
+// channel.open(name, (m) => room.send(...))`, passed `quillo check`, and the server did not
+// start: the browser's compile said "unknown name `room`". A function in a `let`'s initializer
+// may now use the name, in a component's body (where the `let` is a memo) and in a handler; the
+// callback runs after the `let` is set, as on the server.
+const ANSWERS: &str = r#"let opened = 0
+let quiet = 0
+channel.on("room", (msg, peer) => {
+    if msg.op == "open" { opened += 1 }
+    if msg.op == "quiet" { quiet += 1 }
+    null
+}, { join: (peer) => {
+    channel.send("room", peer, { t: "hello" })
+    true
+} })
+
+component Room() {
+    state hellos = 0
+    state n = 0
+    let room = channel.open("room", (m) => {
+        if m.t == "hello" { room.send({ op: "open" }) }
+        hellos += 1
+    })
+    let other = channel.open("room", (m) => { other.send({ op: "quiet" }) })
+    let me = { name: "me", self: () => me.name }
+    <div>
+        <p id="h">{hellos}</p>
+        <p id="a">{me.self()}</p>
+        <button id="go" onclick={() => {
+            let it = { name: "handler", self: () => it.name }
+            n = len(it.self())
+        }}>go</button>
+        <p id="n">{n}</p>
+    </div>
+}
+
+route GET / = <html><body><Room/></body></html>
+route GET /said = [opened, quiet]
+"#;
+
+const ANSWERS_SCRIPT: &str = r#"(async () => {
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 300 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
+  const QW = window[Symbol.for("quillo")];
+  let said = null;
+  for (let i = 0; i < 300; i++) {
+    said = await (await fetch("/said")).json();
+    if (said[0] >= 1 && said[1] >= 1) break;
+    await tick(30);
+  }
+  document.getElementById("go").click();
+  await tick(100);
+  const text = (id) => document.getElementById(id).textContent;
+  document.body.dataset.result = JSON.stringify({ said, h: text("h"), a: text("a"), n: text("n"), remade: QW.remade ?? 0, errors: window.__quilloErrors });
+})();"#;
+
+#[test]
+fn a_channel_callback_answers_on_the_channel_it_opened() {
+    let d = dir("answers", ANSWERS);
+    let (ok, said) = check(&d);
+    assert!(ok, "{}", said);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let page = support::send(s.port, "GET", "/", &[], "").body;
+    assert!(page.contains(r#"<p id="a">me</p>"#) && page.contains(r#"<p id="n">0</p>"#), "{}", page);
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping the browser half: no Chrome");
+        return;
+    };
+    let r = in_chrome(&chrome, &format!("http://127.0.0.1:{}/", s.port), ANSWERS_SCRIPT);
+    // Each callback heard "hello" and answered on its own handle; the page resumed.
+    assert_eq!(r["said"], serde_json::json!([1, 1]), "{}", r);
+    assert_eq!((r["h"].as_str(), r["a"].as_str(), r["n"].as_str()), (Some("1"), Some("me"), Some("7")), "{}", r);
+    assert_eq!((r["remade"].as_u64(), &r["errors"]), (Some(0), &serde_json::json!([])), "{}", r);
+}
+
+// Q-950's edges: a name read outside the functions too keeps the meaning it had, the one before
+// it, and a name its function takes as a parameter is that parameter's. Both on the server's
+// page and in the browser's code, which the page's script must hold.
+#[test]
+fn a_name_its_initializer_reads_outside_a_function_is_the_one_before() {
+    let src = r#"component C() {
+    state n = 0
+    let k = 2
+    let k = [k + 1, (k) => k * 10]
+    let f = { g: (f) => f + 1 }
+    <div>
+        <p id="k">{k[0]} {k[1](4)} {f.g(1)}</p>
+        <button id="go" onclick={() => {
+            let j = 5
+            let j = [j + 1, (j) => j * 10]
+            n = j[0] + j[1](1)
+        }}>go</button>
+        <p id="n">{n}</p>
+    </div>
+}
+
+route GET / = <html><body><C/></body></html>
+"#;
+    let d = dir("before", src);
+    let (ok, said) = check(&d);
+    assert!(ok, "{}", said);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let page = support::send(s.port, "GET", "/", &[], "").body;
+    assert!(page.contains(r#"<p id="k">3 40 2</p>"#), "{}", page);
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping the browser half: no Chrome");
+        return;
+    };
+    let script = r#"(async () => {
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 300 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
+  const QW = window[Symbol.for("quillo")];
+  document.getElementById("go").click();
+  await tick(100);
+  document.body.dataset.result = JSON.stringify({ n: document.getElementById("n").textContent, remade: QW.remade ?? 0, errors: window.__quilloErrors });
+})();"#;
+    let r = in_chrome(&chrome, &format!("http://127.0.0.1:{}/", s.port), script);
+    assert_eq!((r["n"].as_str(), r["remade"].as_u64(), &r["errors"]), (Some("16"), Some(0), &serde_json::json!([])), "{}", r);
 }
