@@ -749,3 +749,61 @@ route GET / = <html><body><C/></body></html>
     let r = in_chrome(&chrome, &format!("http://127.0.0.1:{}/", s.port), script);
     assert_eq!((r["n"].as_str(), r["remade"].as_u64(), &r["errors"]), (Some("16"), Some(0), &serde_json::json!([])), "{}", r);
 }
+
+/// `quillo check`'s warnings that a page's value is shown, by line.
+fn page_value_warnings(src: &str, name: &str) -> Vec<String> {
+    let d = dir(name, src);
+    let (ok, said) = check(&d);
+    assert!(ok, "{}", said);
+    said.lines().filter(|l| l.contains("is a value from the page shown in markup")).map(|l| l.split(": warning: `").nth(1).unwrap_or(l).split('`').next().unwrap().to_string()).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
+}
+
+// Q-952: a `js(...)` in a channel's callback, with a handler in a conditional part of the markup
+// sending on the channel, made `quillo check` warn that `room` was a value from the page shown
+// in markup, and to write `state room = ...` (which did not compile, Q-950). The handler is not
+// markup, and the callback's `js` is not where the handle comes from.
+#[test]
+fn a_handle_used_in_a_handler_is_not_a_page_value_shown() {
+    let src = r#"channel.on("room", (msg, peer) => null)
+
+component Room() {
+    state n = 0
+    let room = channel.open("room", (m) => {
+        n += 1
+        js("console.log", n)
+    })
+    let w = js("Math.abs", -2)
+    let r = { ch: channel.open("room", (m) => { js("console.log", m) }), size: 3 }
+    let t = { size: 4, later: run_after(10, () => js("console.log", 1)) }
+    <div>
+        {n >= 0 && <button onclick={() => { room.send({ op: "x" }) }}>Send</button>}
+        {n >= 0 && <button @click={() => { n = w }}>Set</button>}
+        <p>{r.size} {t.size}</p>
+    </div>
+}
+
+route GET / = <html><body><Room/></body></html>
+"#;
+    assert_eq!(page_value_warnings(src, "handle"), Vec::<String>::new());
+}
+
+// Q-952's edges: what does show a page's value is still warned of, in a conditional part, through
+// a function called at once, and next to a handler that uses it too.
+#[test]
+fn a_page_value_shown_is_still_warned_of() {
+    let src = r#"component C() {
+    state n = 0
+    let w = js("Math.abs", -2)
+    let ws = map([1, 2], (i) => js("Math.abs", i))
+    let both = js("Math.abs", -3)
+    <div>
+        {n >= 0 && <p>{w}</p>}
+        <p>{len(ws)}</p>
+        {n >= 0 && <button onclick={() => { n = both }}>{both}</button>}
+    </div>
+}
+
+route GET / = <html><body><C/></body></html>
+"#;
+    assert_eq!(page_value_warnings(src, "shown"), vec!["both", "w", "ws"]);
+}

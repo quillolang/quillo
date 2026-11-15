@@ -4655,8 +4655,9 @@ impl Checker {
                 }
                 if let (Pattern::Bind(n), Some(c)) = (p, self.fns.last().and_then(|f| f.component.clone())) {
                     let mut from_page = false;
+                    let later = runs_later(e);
                     walk_expr(e, &mut |x| {
-                        from_page |= matches!(x, Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(n, _) if n == "js" || n == "js_new"));
+                        from_page |= matches!(x, Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(n, _) if n == "js" || n == "js_new")) && !later.contains(&(x as *const Expr));
                     });
                     if from_page && !matches!(e, Expr::Lambda(_)) {
                         self.page_lets.push((c, n.to_string()));
@@ -8452,9 +8453,12 @@ impl Checker {
                     }
                     if let Some(c) = self.in_component() {
                         let mut shown = Vec::new();
+                        let later = runs_later(x);
                         walk_expr(x, &mut |y| {
                             if let Expr::Ident(n, _) = y {
-                                shown.push(n.clone());
+                                if !later.contains(&(y as *const Expr)) {
+                                    shown.push(n.clone());
+                                }
                             }
                         });
                         for n in shown {
@@ -9627,6 +9631,44 @@ fn unstyled_classes(order: &[Item], base: &Path, rules: &[(String, String, u32)]
 
 /// Each element of `el`, itself first, as far as its children go (not
 /// those inside `{...}`).
+/// The expressions in `e` that run later, not while `e` is worked out: an element's handlers, and
+/// the callbacks of `channel.open`, `every`, `listen`, `run_after` and `receive`. A name a
+/// handler sends on is not shown, and a `js(...)` in a channel's callback is not where its handle
+/// comes from: both made `quillo check` say a page's value was shown, with a fix that did not
+/// compile (FEEDBACK66.md, Q-952; branch feedback66). A function called at once (`map`'s) runs
+/// as `e` does.
+fn runs_later(e: &Expr) -> HashSet<*const Expr> {
+    fn all_of(e: &Expr, out: &mut HashSet<*const Expr>) {
+        walk_expr(e, &mut |x| {
+            out.insert(x as *const Expr);
+        });
+    }
+    let mut out = HashSet::new();
+    walk_expr(e, &mut |x| match x {
+        Expr::Call(f, args, _) => {
+            let later = match &**f {
+                Expr::Ident(n, _) => ["every", "listen", "run_after", "receive"].contains(&n.as_str()),
+                Expr::Field(o, n, _) => n == "open" && matches!(&**o, Expr::Ident(c, _) if c == "channel"),
+                _ => false,
+            };
+            if later {
+                args.iter().filter(|a| matches!(a, Expr::Lambda(_))).for_each(|a| all_of(a, &mut out));
+            }
+        }
+        Expr::Html(el, _) => walk_html_els(el, &mut |h| {
+            for (name, v) in &h.attrs {
+                if let AttrVal::Expr(l @ Expr::Lambda(_)) = v {
+                    if name.starts_with('@') || name.starts_with("on") {
+                        all_of(l, &mut out);
+                    }
+                }
+            }
+        }),
+        _ => {}
+    });
+    out
+}
+
 fn walk_html_els(el: &HtmlEl, f: &mut dyn FnMut(&HtmlEl)) {
     f(el);
     for c in &el.children {
