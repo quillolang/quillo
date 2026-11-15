@@ -16,10 +16,12 @@ fn a_program_whose_folder_is_gone_still_gets_its_bundle() {
     let mut it = Interp::new(&gone);
     it.load_source(src, main.to_str().unwrap()).unwrap_or_else(|e| panic!("{}", e));
     let loader = client::bundle(&it).unwrap();
-    let at = loader.split("const at = \"").nth(1).unwrap().split('"').next().unwrap();
-    let hash = at.trim_end_matches('/').rsplit('/').next().unwrap();
+    // Each file is under a hash of its own (FEEDBACK54.md, Q-688; branch hmr: the test changed
+    // for it), `<hash>/<path>`.
     let list = loader.split("for (const f of [").nth(1).unwrap().split(']').next().unwrap();
-    let files: Vec<String> = serde_json::from_str(&format!("[{}]", list)).unwrap();
-    assert_eq!(files, ["quillo.js", "program.js", "boot.js"]);
+    let named: Vec<String> = serde_json::from_str(&format!("[{}]", list)).unwrap();
+    let files: Vec<(&str, &str)> = named.iter().map(|f| f.split_once('/').unwrap()).collect();
+    assert_eq!(files.iter().map(|f| f.1).collect::<Vec<_>>(), ["quillo.js", "program.js", "boot.js"]);
+    let (hash, _) = files[1];
     assert!(client::dev_file(hash, "program.js").is_some());
 }
