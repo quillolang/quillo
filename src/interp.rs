@@ -4236,7 +4236,16 @@ impl Interp {
             Value::Response(r) if matches!(r.body, Body::Stream { .. }) && crate::stream::bodyless(code as i64) => {
                 return fail(line, crate::stream::no_body(if matches!(r.body, Body::Stream { events: true, .. }) { "events" } else { "stream" }, code as i64));
             }
-            Value::Response(r) => Response { status: code, ..(*r).clone() },
+            Value::Response(r) => {
+                let mut r = Response { status: code, ..(*r).clone() };
+                // A miss's page given another status is the program's answer: the mark that keeps
+                // it as written holds on a 404 only, and was sent on a `reply 200` (FEEDBACK69.md,
+                // Q-964, found in review; branch q964-miss-page).
+                if code != 404 {
+                    r.headers.retain(|(k, _)| k != crate::server::AS_WRITTEN);
+                }
+                r
+            }
             b => Response { status: code, headers: Vec::new(), body: Body::Value(b) },
         };
         Err(Ctrl::Reply(Arc::new(resp)))
@@ -4422,6 +4431,12 @@ impl Interp {
                     // Q-710; branch feedback55).
                     let mut m = Map::with_capacity(r.headers.len());
                     for (k, v) in r.headers.iter() {
+                        // Quillo's mark is not the answer's header: copied into a `respond`, it
+                        // took a page's scripts away (FEEDBACK69.md, Q-964, found in review; branch
+                        // q964-miss-page).
+                        if k == crate::server::AS_WRITTEN {
+                            continue;
+                        }
                         let v = if v == crate::server::DROPPED { Value::Nil } else { Value::str(v) };
                         let cookie = k.eq_ignore_ascii_case("set-cookie");
                         match m.get_mut(k.as_str()) {

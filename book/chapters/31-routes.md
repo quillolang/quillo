@@ -1616,7 +1616,8 @@ route GET /docs/*p = files("manual", p, { index: "home.htm", extensions: ["htm"]
   (a file asked for before it was deployed is not missing in caches for a year), and is
   sent whole whatever `Range` or conditional the request had, and as written: no script is
   added to it *(until 0.8.5 it was given the prefetching script and `--watch`'s,
-  FEEDBACK69.md, Q-964)*. A route's URLs are the
+  FEEDBACK69.md, Q-964)*. Given another status (`reply 200 files(...)`), it is the program's
+  page, and gets what a route's page gets. A route's URLs are the
   program's: `files()` serves what it is asked for, `/build/a.txt/` as `a.txt`, so a
   site whose URLs end in `/` keeps them.
 - Files whose names start with a dot (`.env`, `.git/`) are not served, but `.well-known/`

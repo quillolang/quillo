@@ -582,7 +582,8 @@ fn children(v: &Value, start: Option<u64>, count: Option<u64>) -> Vec<(String, V
         Value::Response(r) => {
             let mut out = vec![("status".to_string(), Value::Int(r.status as i64))];
             // A header named `null` shows so (FEEDBACK55.md, Q-710; branch feedback55).
-            let headers = r.headers.iter().map(|(k, v)| Value::list(vec![Value::str(k), if v == crate::server::DROPPED { Value::Nil } else { Value::str(v) }])).collect();
+            // Not Quillo's mark of a miss's page (FEEDBACK69.md, Q-964; branch q964-miss-page).
+            let headers = r.headers.iter().filter(|(k, _)| k != crate::server::AS_WRITTEN).map(|(k, v)| Value::list(vec![Value::str(k), if v == crate::server::DROPPED { Value::Nil } else { Value::str(v) }])).collect();
             out.push(("headers".into(), Value::list(headers)));
             if let crate::value::Body::Value(b) = &r.body {
                 out.push(("body".into(), b.clone()));

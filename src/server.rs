@@ -3632,7 +3632,9 @@ fn as_written(resp: &HttpResponse) -> bool {
 /// Marks the page `files()` sends for a miss: a file, sent as its bytes are, which has lost its
 /// `ETag` (that of another URL's answer, Q-715) and so looked like a page a route made, and was
 /// given the prefetching script and `--watch`'s (FEEDBACK69.md, Q-964; branch q964-miss-page).
-/// Only ever on a 404, and `answer` takes it off: it is never sent.
+/// Only `files()` sets it (`respond`, `stream`, `events` and `site_headers` refuse it), a
+/// `reply` with another status drops it, a program reading the answer's headers does not see
+/// it, and `answer` takes it off the 404s it is on: it is never sent.
 pub(crate) const AS_WRITTEN: &str = "x-quillo-as-written";
 
 /// Whether the answer is a miss's page, sent as written. Only a 404 looks, so a page a route made
@@ -4028,7 +4030,7 @@ impl Worker {
             inject_dev_script(&mut resp, self.generation);
         }
         // Both scripts have been decided: the mark of a miss's page sent as written goes no
-        // further, whoever set it (FEEDBACK69.md, Q-964; branch q964-miss-page).
+        // further. Only a 404 carries it (FEEDBACK69.md, Q-964; branch q964-miss-page).
         if resp.status == 404 {
             resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(AS_WRITTEN));
         }

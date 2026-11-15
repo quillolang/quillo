@@ -2169,6 +2169,10 @@ fn site_headers(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         if matches!(name.as_str(), "content-length" | "transfer-encoding" | "connection" | "set-cookie" | "content-type") {
             return fail(line, format!("`site_headers`: `{}` is the answer's own; a route sets it", name));
         }
+        // FEEDBACK69.md, Q-964, found in review; branch q964-miss-page.
+        if name == crate::server::AS_WRITTEN {
+            return fail(line, format!("`site_headers`: `{}` is Quillo's own", name));
+        }
         let value = match v {
             Value::Nil => None,
             // A `location` that runs code or carries a page, as `respond`'s (FEEDBACK55.md, Q-719;
@@ -2456,6 +2460,11 @@ pub(crate) fn answer_headers(h: &Map, f: &str, line: u32) -> Result<Vec<(String,
     let mut out = Vec::with_capacity(h.len());
     for (k, v) in h.iter() {
         let k = k.to_ascii_lowercase();
+        // The mark of a miss's page sent as written is files()'s alone (FEEDBACK69.md, Q-964,
+        // found in review; branch q964-miss-page).
+        if k == crate::server::AS_WRITTEN {
+            return fail(line, format!("`{}` header `{}` is Quillo's own", f, k));
+        }
         match v {
             Value::Nil => out.push((k, crate::server::DROPPED.to_string())),
             Value::List(items) if k == "set-cookie" => {
