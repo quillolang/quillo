@@ -1686,6 +1686,82 @@ build "/app.css" = tailwind(css`@import "tailwindcss";`, classes())
   sets: only what is declared as a `build` moves off that path. `quillo build` does not
   make it ahead of time.
 
+### A front end built elsewhere (React, Vite)
+
+An app built by another tool (React, Vue or Svelte with Vite, say) is a folder: an
+`index.html`, its scripts and styles under names that change with their content, and the
+files of the app's `public/` folder at the top. The program serves it beside its own routes:
+
+```quillo
+route GET /api/hello = { ok: true }                                    // the program's routes first
+route GET /assets/*path = files("dist/assets", path, { cache: "1y" })   // Vite's hashed files
+route GET /favicon.ico = file("dist/favicon.ico")                       // each file of public/
+route GET /robots.txt = file("dist/robots.txt")
+route GET /*path = file("dist/index.html")                              // the app's own paths
+```
+
+- **A deep link** (`/products/42`, a reload, a link someone shared) gets `index.html` with
+  a `200`, and the app's router shows its page; a `HEAD` gets the same, a browser with a
+  current copy a `304`, and another method a `405`. The catch-all comes last, as routes are
+  tried in the order they are written (see [Routes](#routes)): a route after it is never
+  reached, and `quillo check` warns about one.
+- **Not `files("dist", path, { not_found: "index.html" })`, and not `quillo serve dist`:**
+  both send the page for a deep link, but as a miss, with a `404`, which search engines
+  leave out and a browser's tools show as an error.
+- **A missing script stays a `404`.** Under `/assets/` a name that is not there (a tab
+  still open on the build before a deploy, asking for its old chunk) gets a `404`, not
+  the app's page in place of JavaScript.
+- **Caching:** the hashed files go out with `cache-control: public, max-age=31536000,
+  immutable`, so a browser keeps them; `index.html` and the files at the top go out with
+  `no-cache` and an `ETag`, so a deploy is seen at the next load and an unchanged page
+  costs a `304`.
+- **The files at the top** (Vite copies the app's `public/` there: `favicon.ico`,
+  `robots.txt`, `manifest.webmanifest`, icons) each need a route before the catch-all, or
+  the catch-all answers them with `index.html`. Many of them are better in a folder of
+  their own: `public/static/` in the app, served with `route GET /static/*path =
+  files("dist/static", path)`.
+- **The app calls the program** through routes that answer JSON (`fetch("/api/hello")`),
+  or a `server fn` as a page calls one: `POST /_quillo/rpc/<name>` with `content-type:
+  application/json` and the arguments as a JSON array, answered `{"ok": value}` or
+  `{"err": payload}` (see [Server functions](#server-functions)). A call refused, for a
+  wrong type or from another site, gets a `4xx` with `{"error": text}`:
+
+  ```js
+  const res = await fetch("/_quillo/rpc/add_note", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(["buy milk"]),
+  })
+  const { ok, err, error } = await res.json()
+  ```
+
+  A `server fn` takes calls from the program's own pages only, so the app is served by
+  the program, on its host and port: from another host, another port or another
+  subdomain of the same site, the call gets a `403`.
+- **While the app is worked on**, Vite's dev server passes the program's paths on to it,
+  written with `changeOrigin: false`:
+
+  ```js
+  // vite.config.js
+  export default {
+    server: {
+      proxy: {
+        "/api": { target: "http://localhost:8080", changeOrigin: false },
+        "/_quillo": { target: "http://localhost:8080", changeOrigin: false },
+      },
+    },
+  }
+  ```
+
+  Vite's short form (`"/api": "http://localhost:8080"`) sends the program's host in
+  place of the browser's: a browser that says `Sec-Fetch-Site: same-origin` still gets
+  through, but a client that sends only `Origin` (an older browser, a test script) gets
+  a `403` from a `server fn`.
+- **Rendered in the browser:** Quillo serves the build as it is and does not run its
+  JavaScript on the server (`js()` is null there), so a React app's own server rendering
+  (`renderToString`) needs a JavaScript server of its own. The program's components are
+  rendered on the server (see [Components](#components)).
+
 ## Translations
 
 ```quillo

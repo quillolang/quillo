@@ -47,6 +47,7 @@ does not do it today; the way around it follows.
 | write middleware? | Yes, as a pipeline stage that `reply`s, or for many routes at once in a `routes` group (prefix, middleware, request pattern, nested; see [Route groups](#routes-route-groups)); there is no global hook, and no custom 500 page |
 | answer CORS preflights? | Not by itself: declare `route OPTIONS` and set the headers with `respond` (with no such route, `OPTIONS` gets 204 and `Allow`, no CORS headers) |
 | serve a folder of HTML and other files as they are? | Yes: `quillo serve site`, or `files("site", path)` in a route, with `index.html`, clean URLs and `404.html`. See [Static files](#static-files) |
+| serve a React or Vite app's build, deep links included? | Yes: `files("dist/assets", path, { cache: "1y" })` for its hashed files and a last `route GET /*path = file("dist/index.html")`; the app is rendered in the browser and calls the program on its own origin. See [A front end built elsewhere](#a-front-end-built-elsewhere-react-vite) |
 | open WebSockets of my own? | No: `live`, `events` with `listen`, and channels are the ways to push. See [Channels](#channels) |
 | receive or send binary data? | Only as files: `file()`, uploads, `image.*`. There is no bytes value; bodies are text |
 | stream a response? | Yes: `stream`, `events`. See [Streaming](#streaming) |
