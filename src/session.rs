@@ -420,7 +420,7 @@ fn cookie_line(it: &mut Interp, name: &str, value: &str, age: Option<u64>, opts:
 /// sticks, and nothing else would say so. Said once (FEEDBACK13.md, Q-089;
 /// branch feedback13-fixes).
 /// Whether the request came over HTTPS, as far as this server can tell: a proxy says so.
-fn came_over_https(it: &mut Interp) -> bool {
+pub(crate) fn came_over_https(it: &mut Interp) -> bool {
     header(it, "x-forwarded-proto").is_some_and(|p| p.eq_ignore_ascii_case("https"))
 }
 
@@ -658,17 +658,25 @@ fn set_session(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         _ => None,
     };
     let was = it.session.clone().or_else(|| arrived(it).map(|(d, _)| d));
-    if let (Some(a), Some(b)) = (was.as_ref().and_then(user_of), user_of(&data)) {
-        if !crate::value::equal(&a, &b) {
-            // Another person on this browser: the notifications turned on for the one before stop
-            // coming here, as at `end_session` (FEEDBACK67.md, B.3; branch pwa).
-            if it.site.notification {
-                if let Some(o) = current_owner(it) {
-                    if let Err(why) = crate::push::unbind_sessions(it, &[o]) {
-                        return fail(line, format!("`set_session`: the notifications of the person before could not be turned off on this device, so the session was not changed: {}", why));
-                    }
-                }
+    // Another person on this browser, or no one now, or someone where there was no one: the
+    // notifications turned on in the session before stop coming here, as at `end_session`. A cart
+    // set between Alice and Bob kept Alice's coming to Bob (FEEDBACK67.md, B.3, and its review;
+    // branch pwa).
+    let (before, after) = (was.as_ref().and_then(user_of), user_of(&data));
+    let same = match (&before, &after) {
+        (Some(a), Some(b)) => crate::value::equal(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    if it.site.notification && !same {
+        if let Some(o) = current_owner(it) {
+            if let Err(why) = crate::push::unbind_sessions(it, &[o]) {
+                return fail(line, format!("`set_session`: the notifications of the person before could not be turned off on this device, so the session was not changed: {}", why));
             }
+        }
+    }
+    if let (Some(a), Some(b)) = (before, after) {
+        if !crate::value::equal(&a, &b) {
             it.session_id = Some(None);
         }
     }

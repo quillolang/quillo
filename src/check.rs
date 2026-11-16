@@ -1027,7 +1027,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("notification.state", "", "str | null"),
     ("notification.stop", "", "str"),
     ("notification.send", "any, map", "map | error(str)"),
-    ("notification.user", "any", "str"),
+    ("notification.user", "any", "str | error(str)"),
     ("udp.listen", "int, fn, map | null=", "null"),
     ("udp.send", "str, int, any, map | null=", "null | error(str)"),
     ("udp.reply", "map, any", "null | error(str)"),
@@ -7678,6 +7678,9 @@ impl Checker {
         if m == "db" && !piped {
             self.sql_params(&full, args);
         }
+        if m == "db" && matches!(f, "transaction" | "atomic") {
+            self.sends_in_a_transaction(args);
+        }
         if m == "money" && !piped {
             self.money_literals(f, args);
         }
@@ -7767,12 +7770,6 @@ impl Checker {
         ));
     }
 
-    /// What the variable `name` holds, as far as SQL goes.
-    /// `http.get(...)` and the rest. In a component they are made by the
-    /// browser, from handlers: the server renders the component first, and
-    /// runs its `state` initializers. Elsewhere, a URL whose host comes from
-    /// a value may be a visitor's, who could then reach the server's own
-    /// network: a word, unless the call says `public_only` either way.
     /// `notification`'s sides (FEEDBACK67.md, B.3; branch pwa): `send` and `user` are the
     /// server's, never a component's; `ask`, `state` and `stop` the browser's, from a handler (and
     /// `state` to set a state), and refused where the code surely runs on the server, as `ask` and
@@ -7815,9 +7812,38 @@ impl Checker {
         }
     }
 
+    /// `notification.send` written in the function `db.transaction` or `db.atomic` runs: it fails
+    /// there, an error value, as waiting in one holds up every request (FEEDBACK67.md, B.3, review;
+    /// branch pwa).
+    fn sends_in_a_transaction(&mut self, args: &[Expr]) {
+        if !self.builtin_in_scope("notification") {
+            return;
+        }
+        let mut at = Vec::new();
+        for a in args {
+            if let Expr::Lambda(d) = a {
+                walk_fn(d, &mut |e| {
+                    if let Expr::Call(c, _, line) = e {
+                        if matches!(&**c, Expr::Field(o, f, _) if f == "send" && matches!(&**o, Expr::Ident(n, _) if *n == "notification")) {
+                            at.push(*line);
+                        }
+                    }
+                });
+            }
+        }
+        let line = self.line;
+        for l in at {
+            self.line = l;
+            self.warn(crate::push::IN_A_TRANSACTION);
+        }
+        self.line = line;
+    }
+
     /// A handler's `notification.ask()` after it has waited (a `server fn`, `http`, a service,
-    /// `parallel`, `receive`, `markdown`): browsers show the prompt only close to the click, and
-    /// WebKit only in it, so the ask is better first (FEEDBACK67.md, B.3; branch pwa).
+    /// `parallel`, `receive`, `markdown`, `notification.stop`): browsers show the prompt only close
+    /// to the click, and WebKit only in it, so the ask is better first (FEEDBACK67.md, B.3; branch
+    /// pwa). Followed as the code runs: a wait in one branch of an `if` or a `match` is not before
+    /// an ask in another (review); a function written in the handler is its own.
     fn ask_after_wait(&mut self, d: &FnDef) {
         // A variable that hides the module is said of already.
         if !self.builtin_in_scope("notification") {
@@ -7825,31 +7851,21 @@ impl Checker {
         }
         let server: HashSet<String> = self.bodies.iter().filter(|(_, b)| b.server && !b.component).map(|(n, _)| n.clone()).collect();
         let services: HashSet<String> = self.services.keys().cloned().collect();
-        let (mut waited, mut late): (Option<String>, Vec<(u32, String)>) = (None, Vec::new());
-        walk_fn(d, &mut |e| {
-            let Expr::Call(callee, _, line) = e else { return };
-            let (name, waits) = match &**callee {
-                Expr::Ident(n, _) => (n.to_string(), server.contains(&n.to_string()) || matches!(&**n, "parallel" | "receive" | "markdown")),
-                Expr::Field(o, f, _) => match &**o {
-                    Expr::Ident(m, _) => (format!("{}.{}", m, f), &**m == "http" || services.contains(&m.to_string()) || (&**m == "notification" && f == "stop")),
-                    _ => return,
-                },
-                _ => return,
-            };
-            if name == "notification.ask" {
-                if let Some(w) = &waited {
-                    late.push((*line, w.clone()));
-                }
-            } else if waits && waited.is_none() {
-                waited = Some(name);
-            }
-        });
+        let mut late: Vec<(u32, String)> = Vec::new();
+        let mut w = Waits { server: &server, services: &services, late: &mut late };
+        w.expr(&d.body, None);
         for (line, w) in late {
             self.line = line;
             self.warn(format!("`notification.ask` comes after `{}` waits in this handler: browsers show the permission prompt only close to the click, so ask first, then wait", w));
         }
     }
 
+    /// What the variable `name` holds, as far as SQL goes.
+    /// `http.get(...)` and the rest. In a component they are made by the
+    /// browser, from handlers: the server renders the component first, and
+    /// runs its `state` initializers. Elsewhere, a URL whose host comes from
+    /// a value may be a visitor's, who could then reach the server's own
+    /// network: a word, unless the call says `public_only` either way.
     fn http_rules(&mut self, f: &str, args: &[Expr], piped: bool) {
         // An option written in the call that is not one: an error before
         // the program runs, as it is when it runs (FEEDBACK5.md, Q-049;
@@ -10269,6 +10285,100 @@ pub fn walk_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
 /// A function's parameters' defaults, and its body: what it can run. A default is code as its
 /// body is: `server fn load(who = request.cookies.uid)` read the visitor where the body did not,
 /// and went to every viewer (FEEDBACK55.md, Q-880; branch feedback55).
+/// `Checker::ask_after_wait`'s walk, in the order the code runs: each expression given what waited
+/// before it (the call's name), and giving what has waited once it is done; `notification.ask`
+/// reached after a wait is noted (FEEDBACK67.md, B.3, review; branch pwa).
+struct Waits<'a> {
+    server: &'a HashSet<String>,
+    services: &'a HashSet<String>,
+    late: &'a mut Vec<(u32, String)>,
+}
+
+impl Waits<'_> {
+    fn all<'e>(&mut self, es: impl IntoIterator<Item = &'e Expr>, mut before: Option<String>) -> Option<String> {
+        for e in es {
+            before = self.expr(e, before);
+        }
+        before
+    }
+
+    fn stmts(&mut self, stmts: &[Stmt], mut before: Option<String>) -> Option<String> {
+        for s in stmts {
+            before = match s {
+                Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::Expr(e) | Stmt::State(_, e, _) | Stmt::Return(Some(e), _) => self.expr(e, before),
+                Stmt::SetField(o, _, _, e, _) => self.all([o, e], before),
+                _ => before,
+            };
+        }
+        before
+    }
+
+    fn expr(&mut self, e: &Expr, before: Option<String>) -> Option<String> {
+        match e {
+            Expr::Call(callee, args, line) => {
+                let named = match &**callee {
+                    Expr::Ident(n, _) => Some((n.to_string(), self.server.contains(&n.to_string()) || matches!(&**n, "parallel" | "receive" | "markdown"))),
+                    Expr::Field(o, f, _) => match &**o {
+                        Expr::Ident(m, _) => Some((format!("{}.{}", m, f), &**m == "http" || self.services.contains(&m.to_string()) || (&**m == "notification" && f == "stop"))),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let callee_done = if named.is_some() { before } else { self.expr(callee, before) };
+                let after = self.all(args, callee_done);
+                match named {
+                    Some((name, _)) if name == "notification.ask" => {
+                        if let Some(w) = &after {
+                            self.late.push((*line, w.clone()));
+                        }
+                        after
+                    }
+                    Some((name, true)) => after.or(Some(name)),
+                    _ => after,
+                }
+            }
+            Expr::If(c, a, b) => {
+                let c = self.expr(c, before);
+                let a = self.expr(a, c.clone());
+                let b = match b {
+                    Some(b) => self.expr(b, c.clone()),
+                    None => c,
+                };
+                a.or(b)
+            }
+            Expr::Match(s, arms, _) => {
+                let s = self.expr(s, before);
+                let mut out = s.clone();
+                for arm in arms {
+                    let g = arm.guard.as_ref().map_or(s.clone(), |g| self.expr(g, s.clone()));
+                    let r = self.expr(&arm.body, g);
+                    out = out.or(r);
+                }
+                out
+            }
+            Expr::Coalesce(a, b) => {
+                let a = self.expr(a, before);
+                let b = self.expr(b, a.clone());
+                a.or(b)
+            }
+            Expr::For(_, i, b, _) | Expr::While(i, b, _) => {
+                let i = self.expr(i, before);
+                let b = self.expr(b, i.clone());
+                i.or(b)
+            }
+            Expr::Block(stmts) => self.stmts(stmts, before),
+            // A function written here runs when it is called, which this does not follow.
+            Expr::Lambda(_) | Expr::Lit(_) | Expr::Ident(..) | Expr::Html(..) => before,
+            Expr::Template(parts) => self.all(parts.iter().filter_map(|p| if let TPart::Expr(x) = p { Some(x) } else { None }), before),
+            Expr::List(xs) => self.all(xs, before),
+            Expr::Map(es) => self.all(es.iter().map(|(_, x)| x), before),
+            Expr::Unary(_, x, _) | Expr::Try(x) | Expr::Field(x, _, _) => self.expr(x, before),
+            Expr::Binary(_, a, b, _) | Expr::Pipe(a, b, _) | Expr::Index(a, b, _) => self.all([&**a, &**b], before),
+            Expr::Reply(a, b, _) => self.all(std::iter::once(&**a).chain(b.as_deref()), before),
+        }
+    }
+}
+
 pub fn walk_fn(d: &FnDef, f: &mut dyn FnMut(&Expr)) {
     d.params.iter().filter_map(|p| p.default.as_ref()).for_each(|e| walk_expr(e, f));
     walk_expr(&d.body, f)

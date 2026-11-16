@@ -277,6 +277,11 @@ pub fn public_ip(ip: IpAddr) -> bool {
             if s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
                 return public_v4(Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8));
             }
+            // RFC 8215's local-use NAT64, 64:ff9b:1::/48: a network's own translator, to its own
+            // addresses (FEEDBACK67.md, B.3, review; branch pwa).
+            if s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1 {
+                return false;
+            }
             if s[0] == 0x2002 {
                 return public_v4(Ipv4Addr::new((s[1] >> 8) as u8, s[1] as u8, (s[2] >> 8) as u8, s[2] as u8));
             }
@@ -338,6 +343,9 @@ fn agent(o: Opts, stream: bool, url: &str) -> Result<ureq::Agent, String> {
         // `public_only`, and a `file:` one panicked (FEEDBACK51.md, Q-649 and Q-650; branch
         // feedback51-fixes).
         .redirects(0)
+        // As many kept to a host as `notification.send` sends to it at once, where ureq keeps one
+        // (FEEDBACK67.md, Q-960 and B.3's review; branch pwa).
+        .max_idle_connections_per_host(8)
         .user_agent(concat!("quillo/", env!("CARGO_PKG_VERSION")));
     let b = if stream { b.timeout_read(Duration::from_secs(300)) } else { b.timeout(Duration::from_secs(60)) };
     // Through a proxy, the proxy looks the name up: `public_only` checks it before the call.
@@ -1067,6 +1075,16 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // RFC 8215's local-use NAT64 prefix leads to the network's own addresses: not public, as the
+    // well-known 64:ff9b::/96 is public only where its IPv4 address is (FEEDBACK67.md, B.3,
+    // review; branch pwa).
+    #[test]
+    fn local_use_nat64_is_not_public() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(!public_ip(ip("64:ff9b:1::a00:1")) && !public_ip(ip("64:ff9b:1:ffff::808:808")));
+        assert!(public_ip(ip("64:ff9b::808:808")) && !public_ip(ip("64:ff9b::a00:1")) && public_ip(ip("64:ff9c::1")) && public_ip(ip("64:ff9b:2::1")));
+    }
 
     // As the client reads a URL (found in review of FEEDBACK51.md, Q-650).
     #[test]

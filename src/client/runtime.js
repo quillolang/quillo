@@ -1740,6 +1740,17 @@ async function pushSub() {
   const reg = await pushReg(false).catch(() => null);
   return reg && !(reg instanceof Err) ? reg.pushManager.getSubscription() : null;
 }
+// This page's look at the subscription the browser holds, as it starts (a Promise of "granted" or
+// "default"): whether the server sends to it for the person signed in now. One the browser kept for
+// someone else (their cookie ended, another person signed in) is unbound there, and the page asks
+// again; `state` says what it found (FEEDBACK67.md, B.3, review; branch pwa).
+let pushSeen = null;
+const pushCheck = () => pushSeen || (pushSeen = (async () => {
+  const sub = await pushSub();
+  if (!sub) return "default";
+  const r = await wireFetch(BASE + "/_quillo/push", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: sub.endpoint, check: true }) });
+  return r.ok && (await r.json()).state === "granted" ? "granted" : "default";
+})().catch(() => "default"));
 B.notification = {
   ask: meta(async (o) => {
     o = M(o, "notification.ask", 1);
@@ -1759,8 +1770,9 @@ B.notification = {
       if (sub && b64u(sub.options.applicationServerKey) !== key.key) sub = await inTime(sub.unsubscribe(), until).then(() => null);
       const made = !sub;
       if (made) sub = await inTime(reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: unb64u(key.key) }), until);
-      const body = JSON.stringify({ ...sub.toJSON(), user: isNil(o.user) ? null : o.user, origin: location.origin });
+      const body = JSON.stringify({ ...sub.toJSON(), user: isNil(o.user) ? null : o.user });
       const r = await inTime(wireFetch(BASE + "/_quillo/push", { method: "POST", headers: { "content-type": "application/json" }, body }), until);
+      pushSeen = Promise.resolve(r.ok ? "granted" : "default");
       if (r.ok) return "granted";
       const why = (await r.json().catch(() => ({}))).error || `the server answered ${r.status}`;
       // Not on where the server will not send to it: the next `state` says so.
@@ -1773,7 +1785,7 @@ B.notification = {
   state: meta(async () => {
     if (!pushHere()) return "unsupported";
     if (Notification.permission !== "granted") return Notification.permission;
-    return (await pushSub()) ? "granted" : "default";
+    return pushCheck();
   }, "notification.state", null),
   stop: meta(async () => {
     if (!pushHere()) return "unsupported";
@@ -1782,9 +1794,12 @@ B.notification = {
       await sub.unsubscribe().catch(() => false);
       await wireFetch(BASE + "/_quillo/push", { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: sub.endpoint }) }).catch(() => null);
     }
+    pushSeen = Promise.resolve("default");
     return Notification.permission === "denied" ? "denied" : "default";
   }, "notification.stop", null),
 };
+// The look, once the page has started (its BASE set), where the browser may hold a subscription.
+if (pushHere() && Notification.permission === "granted") setTimeout(pushCheck, 0);
 
 // `receive(url, f, { method, body, headers })` in a handler: sends the
 // request and calls f with what the answer streams, until it ends (or f

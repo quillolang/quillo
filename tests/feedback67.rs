@@ -3581,7 +3581,7 @@ fn q985_a_page_states_initializer_reads_the_session() {
 /// The push service and the browser's keys, played by Node: a sink on 127.0.0.1 that takes what
 /// Quillo posts, decrypts it by RFC 8291 with Node's own crypto (an implementation apart from
 /// Quillo's: the probe's, .git/wip/feedback67/probe-push-decrypt.mjs) and checks its VAPID header by
-/// RFC 8292. `/_made?n=K&kind=ok|404|410|500`: K subscriptions, their keys made as
+/// RFC 8292. `/_made?n=K&kind=ok|404|410|500|slow|redir|noisy`: K subscriptions, their keys made as
 /// `pushManager.subscribe` makes them, whose push service answers 201 or as `kind` says; `/_got`:
 /// what came, in order, with the connection it came on; `/_reset`.
 const SINK: &str = r#"const crypto = require("crypto"), http = require("http");
@@ -3643,6 +3643,11 @@ http.createServer((req, res) => {
     if (u.pathname === "/_got") return reply(200, got);
     if (u.pathname === "/_reset") { got = []; return reply(200, {}); }
     const kind = u.pathname.split("/")[2] || "";
+    // A push service that never answers, one that redirects, and one whose answer would write
+    // lines of its own in a log (the review's).
+    if (kind.startsWith("slow")) { got.push({ path: u.pathname, slow: true, sock: req.socket.remotePort }); return; }
+    if (kind.startsWith("redir")) { got.push({ path: u.pathname, redir: true }); res.writeHead(307, { location: "http://127.0.0.1:" + PORT + "/push/ok-redirected" }); return res.end(); }
+    if (kind.startsWith("noisy")) { got.push({ path: u.pathname }); res.writeHead(500); return res.end("line1\n\u001b[31mFAKE quillo: injected log line\u001b[0m"); }
     const status = kind.startsWith("404") ? 404 : kind.startsWith("410") ? 410 : kind.startsWith("500") ? 500 : 201;
     got.push({ ...open(u.pathname, req.headers, Buffer.concat(parts)), status, method: req.method, sock: req.socket.remotePort });
     res.writeHead(status);
@@ -3774,7 +3779,14 @@ route GET /out {
     end_session()
     redirect("/")
 }
-route GET /ticket/:who = notification.user(who)
+route GET /ticket/:who {
+    let t = notification.user(who)
+    return is_err(t) ? { error: t.error } : t
+}
+route GET /signin-ticket/:who {
+    set_session({ user: who })
+    return notification.user(who)
+}
 route POST /send/:who {
     let r = notification.send(who, request.json)
     is_err(r) ? { error: r.error } : r
@@ -3873,8 +3885,10 @@ fn notification_ended_subscriptions_are_dropped_and_counted() {
     assert_eq!(sink.got().len(), 5);
     sink.reset();
     assert_eq!(send_to(port, "ana", serde_json::json!({ "title": "two" })), serde_json::json!({ "sent": 2, "gone": 0 }));
-    let paths: Vec<String> = sink.got().iter().map(|g| g["path"].as_str().unwrap().split('-').next().unwrap().to_string()).collect();
-    assert_eq!(paths, ["/push/ok", "/push/ok", "/push/500"]);
+    // Sent at once (review): in any order.
+    let mut paths: Vec<String> = sink.got().iter().map(|g| g["path"].as_str().unwrap().split('-').next().unwrap().to_string()).collect();
+    paths.sort();
+    assert_eq!(paths, ["/push/500", "/push/ok", "/push/ok"]);
     assert!(log_with(&s, "the push service answered 500").contains("quillo: notification.send: 127.0.0.1: the push service answered 500"));
     assert_eq!(send_to(port, "bob", serde_json::json!({ "title": "none" })), serde_json::json!({ "sent": 0, "gone": 0 }));
     let (seven, _) = session_step(port, "/in-int/7", "");
@@ -3933,8 +3947,9 @@ fn notification_a_message_past_one_record_is_an_error_value() {
     assert_eq!((sink.got()[0]["ttl"].as_str(), sink.got()[0]["urgency"].as_str()), (Some("2419200"), Some("very-low")));
 }
 
-// Q-960: sends to one push service go over one kept connection: 50 in one request, one each, and
-// a send to 20 subscriptions at once, all on the connection the first opened.
+// Q-960: sends to one push service go over kept connections: 50 in one request, one each, all on
+// one; a send to 20 subscriptions at once over at most 8 (review: a person's devices are sent to
+// at once, 8 at a time), and the next send over the same ones.
 #[test]
 fn notification_sends_reuse_one_connection() {
     let sink = sink();
@@ -3955,14 +3970,136 @@ fn notification_sends_reuse_one_connection() {
     sink.reset();
     assert_eq!(send_to(port, "bob", serde_json::json!({ "title": "all" })), serde_json::json!({ "sent": 20, "gone": 0 }));
     let socks: std::collections::HashSet<u64> = sink.got().iter().map(|g| g["sock"].as_u64().unwrap()).collect();
-    assert_eq!(socks.len(), 1, "{:?}", socks);
+    assert!(!socks.is_empty() && socks.len() <= 8, "{:?}", socks);
+    sink.reset();
+    assert_eq!(send_to(port, "bob", serde_json::json!({ "title": "again" })), serde_json::json!({ "sent": 20, "gone": 0 }));
+    let again: std::collections::HashSet<u64> = sink.got().iter().map(|g| g["sock"].as_u64().unwrap()).collect();
+    assert!(again.is_subset(&socks), "{:?} then {:?}", socks, again);
+}
+
+// B.3 review, 3 and 5: a person has 20 devices here at most, a new one replacing the oldest; a
+// session changes 30 subscriptions a minute at most (the 31st is a 429). A send reaches the
+// devices at once: two push services that never answer take 10 s each, together, not one after
+// the other; a redirect is no delivery, and is not followed. What a push service answered is one
+// line in the log, its control characters escaped, and the log names its host, never the endpoint.
+#[test]
+fn notification_devices_are_capped_and_sent_to_at_once() {
+    let sink = sink();
+    let d = dir("n-cap", PUSHER);
+    let (s, port) = push_server(&d, &[], &[]);
+    let (hal, _) = session_step(port, "/in/hal", "");
+    let subs = sink.made(25, "ok");
+    for sub in &subs {
+        assert_eq!(bind(port, sub, serde_json::Value::Null, &hal).status, 200);
+    }
+    assert_eq!(send_to(port, "hal", serde_json::json!({ "title": "t" })), serde_json::json!({ "sent": 20, "gone": 0 }));
+    let mut reached: Vec<String> = sink.got().iter().map(|g| g["path"].as_str().unwrap().to_string()).collect();
+    let mut newest: Vec<String> = subs[5..].iter().map(|s| url_path(s["endpoint"].as_str().unwrap())).collect();
+    reached.sort();
+    newest.sort();
+    assert_eq!(reached, newest, "the 5 oldest replaced");
+    // 25 so far, then 5 more: the 31st in the minute is refused.
+    for sub in sink.made(5, "ok") {
+        assert_eq!(bind(port, &sub, serde_json::Value::Null, &hal).status, 200);
+    }
+    let a = bind(port, &sink.made(1, "ok")[0], serde_json::Value::Null, &hal);
+    assert_eq!(a.status, 429, "{}", a.body);
+    assert!(a.body.contains("more than 30 subscriptions changed in a minute by this session"), "{}", a.body);
+    // Another session is counted apart.
+    let (ivy, _) = session_step(port, "/in/ivy", "");
+    for kind in ["slow", "slow", "redir", "noisy"] {
+        assert_eq!(bind(port, &sink.made(1, kind)[0], serde_json::Value::Null, &ivy).status, 200);
+    }
+    let t0 = Instant::now();
+    assert_eq!(send_to(port, "ivy", serde_json::json!({ "title": "t" })), serde_json::json!({ "sent": 0, "gone": 0 }));
+    let took = t0.elapsed();
+    assert!(took >= Duration::from_secs(9) && took < Duration::from_secs(16), "{:?}", took);
+    assert!(!sink.got().iter().any(|g| g["path"] == "/push/ok-redirected"), "the redirect was followed");
+    let log = log_with(&s, "took more than 10 s");
+    let lines: Vec<&str> = log.lines().filter(|l| l.starts_with("quillo: notification.send:")).collect();
+    assert_eq!(lines.len(), 4, "{}", log);
+    assert!(lines.iter().filter(|l| l.contains("took more than 10 s")).count() == 2, "{:?}", lines);
+    assert!(lines.iter().any(|l| l.ends_with("127.0.0.1: the push service answered 307")), "{:?}", lines);
+    assert!(lines.iter().any(|l| l.ends_with("127.0.0.1: the push service answered 500: line1\\n\\u{1b}[31mFAKE quillo: injected log line\\u{1b}[0m")), "{:?}", lines);
+    assert!(!log.contains('\u{1b}') && !log.lines().any(|l| l.starts_with("FAKE")), "{}", log);
+    assert!(!log.contains("/push/"), "an endpoint in the log: {}", log);
+}
+
+/// The path of a URL.
+fn url_path(u: &str) -> String {
+    let rest = u.split_once("://").map_or(u, |(_, r)| r);
+    rest.find('/').map_or("/".to_string(), |i| rest[i..].to_string())
+}
+
+// B.3 review, 3: `notification.send` inside a transaction is an error value saying to send after
+// it (a SQLite transaction keeps the interpreter's lock, and every request would wait on the push
+// services), sending nothing; `quillo check` warns where it sees it, in `db.transaction` and
+// `db.atomic`, not after one.
+#[test]
+fn notification_send_in_a_transaction_is_refused() {
+    let src = "route GET /in/:who {\n    set_session({ user: who })\n    redirect(\"/\")\n}\nroute POST /send-tx/:who {\n    db.exec(\"create table if not exists t (x int)\")\n    let r = db.transaction(() => {\n        db.exec(\"insert into t values (1)\")\n        return notification.send(who, { title: \"in a transaction\" })\n    })\n    return is_err(r) ? { error: r.error } : r\n}\nroute POST /send-after/:who {\n    db.transaction(() => db.exec(\"insert into t values (2)\"))?\n    return notification.send(who, { title: \"after\" })\n}\nroute GET / = \"home\"\n";
+    let d = dir("n-tx", src);
+    std::fs::write(d.join(".env"), "QUILLO_DB=app.db\n").unwrap();
+    let (ok, lines) = check_lines("n-tx-check", src);
+    assert!(ok, "{:?}", lines);
+    assert_eq!(lines, [format!("main.qwe:9: warning: {}", IN_A_TRANSACTION)]);
+    let sink = sink();
+    let (_s, port) = push_server(&d, &[], &[]);
+    let (who, _) = session_step(port, "/in/tx", "");
+    assert_eq!(bind(port, &sink.made(1, "ok")[0], serde_json::Value::Null, &who).status, 200);
+    let a = support::send(port, "POST", "/send-tx/tx", &[], "");
+    assert!(a.body.contains("`notification.send` waits on push services, which inside a transaction"), "{} {}", a.status, a.body);
+    assert!(sink.got().is_empty());
+    let a = support::send(port, "POST", "/send-after/tx", &[], "");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&a.body).unwrap(), serde_json::json!({ "sent": 1, "gone": 0 }), "{}", a.body);
+}
+
+const IN_A_TRANSACTION: &str = "`notification.send` waits on push services, which inside a transaction holds up every other request (a SQLite transaction keeps the interpreter's lock), and sends even when the transaction is rolled back: call it after the transaction";
+
+// B.3 review, 6 and the database's errors: the origin a send's address and VAPID's `sub` are made
+// from is the request's (its Host, https where a proxy says the request came so), never the body's;
+// a database that cannot be had at /_quillo/push is "internal error" to the visitor (its words in
+// the log), in full under --watch.
+#[test]
+fn notification_the_origin_is_the_requests_and_errors_are_hidden() {
+    let sink = sink();
+    let d = dir("n-origin", PUSHER);
+    let (_s, port) = push_server(&d, &[], &[]);
+    let (ivan, _) = session_step(port, "/in/ivan", "");
+    let host = format!("127.0.0.1:{}", port);
+    let mut body = sink.made(1, "ok").remove(0);
+    body["user"] = serde_json::Value::Null;
+    body["origin"] = serde_json::json!("https://evil.example");
+    let a = support::send(port, "POST", "/_quillo/push", &[("host", &host), ("cookie", &ivan)], &body.to_string());
+    assert_eq!(a.status, 200, "{}", a.body);
+    let mut over = sink.made(1, "ok").remove(0);
+    over["user"] = serde_json::Value::Null;
+    let a = support::send(port, "POST", "/_quillo/push", &[("host", "shop.example:8443"), ("x-forwarded-proto", "https"), ("cookie", &ivan)], &over.to_string());
+    assert_eq!(a.status, 200, "{}", a.body);
+    send_to(port, "ivan", serde_json::json!({ "title": "t", "url": "/o/1" }));
+    let mut got: Vec<(String, String)> = sink.got().iter().map(|g| (g["message"]["notification"]["navigate"].as_str().unwrap().to_string(), g["vapid"]["sub"].as_str().unwrap().to_string())).collect();
+    got.sort();
+    assert_eq!(got, [(format!("http://127.0.0.1:{}/o/1", port), format!("http://127.0.0.1:{}", port)), ("https://shop.example:8443/o/1".to_string(), "https://shop.example:8443".to_string())]);
+    // The system database cannot be opened: a folder where its file would be.
+    for (opts, says) in [(&[][..], "\"internal error\""), (&["--watch"][..], "the system database")] {
+        let d = dir(&format!("n-dberror-{}", opts.len()), PUSHER);
+        std::fs::create_dir(d.join("quillo-system.db")).unwrap();
+        let (s, port) = push_server(&d, opts, &[]);
+        let (who, _) = session_step(port, "/in/una", "");
+        let a = bind(port, &sink.made(1, "ok")[0], serde_json::Value::Null, &who);
+        assert_eq!(a.status, 500, "{}", a.body);
+        assert!(a.body.contains(says), "{:?}: {}", opts, a.body);
+        assert!(log_with(&s, "/_quillo/push:").contains("quillo: /_quillo/push: the system database"), "{:?}", opts);
+    }
 }
 
 // B.3: `end_session()` unbinds the session's subscriptions, and so does a change of person in
 // `set_session` (Bob signing in where Ana was): the next person on the device gets nothing meant
-// for the one before. `user:` takes only what `notification.user(x)` made: made with no session,
-// it binds from any; made in one, only from that one, and ends with it. A plain value, a token
-// changed, or neither a token nor a signed-in visitor is refused, saying why. DELETE unbinds.
+// for the one before. `user:` takes only what `notification.user(x)` made in the session the post
+// comes from (review: one made at sign-in, in the request that set the session, is that session's;
+// none is made where there is no session; another session's, or none, is refused), and it ends
+// with that session. A plain value, a token changed, or neither a token nor a signed-in visitor is
+// refused, saying why. DELETE unbinds the visitor's own alone.
 #[test]
 fn notification_sessions_end_and_the_user_option() {
     let sink = sink();
@@ -3983,15 +4120,26 @@ fn notification_sessions_end_and_the_user_option() {
     let (bob, _) = session_step(port, "/in/bob", &ana);
     assert!(bob != ana);
     assert_eq!(send_to(port, "ana", one.clone())["sent"], 1, "her phone's stays");
-    // `user:` made with no session: bound from anywhere.
-    let guest = support::send(port, "GET", "/ticket/guest-1", &[], "").body;
-    assert_eq!(bind(port, &sink.made(1, "ok")[0], serde_json::json!(guest), "").status, 200);
-    assert_eq!(send_to(port, "guest-1", one.clone())["sent"], 1);
+    // No ticket where there is no session.
+    let a = support::send(port, "GET", "/ticket/guest-1", &[], "");
+    assert!(a.body.contains("notification.user: this request has no session to seal it for"), "{}", a.body);
+    // Made at sign-in, in the request that set the session: that session's alone.
+    let a = support::send(port, "GET", "/signin-ticket/erin", &[], "");
+    let erin = a.headers.iter().find(|(k, v)| k == "set-cookie" && v.contains("quillo_session=")).map(|(_, v)| v.split(';').next().unwrap().to_string()).unwrap();
+    let ticket = a.body.clone();
+    let (mallory, _) = session_step(port, "/in/mallory", "");
+    let sub = sink.made(1, "ok").remove(0);
+    for cookie in [mallory.as_str(), ""] {
+        let a = bind(port, &sub, serde_json::json!(ticket), cookie);
+        assert_eq!(a.status, 403, "{}", a.body);
+    }
+    assert_eq!(bind(port, &sub, serde_json::json!(ticket), &erin).status, 200);
+    assert_eq!(send_to(port, "erin", one.clone())["sent"], 1);
     // Made in a session (a cart, no user): only from it, and unbound when it ends.
     let (cart, _) = session_step(port, "/cart", "");
     let zoe = support::send(port, "GET", "/ticket/zoe", &[("cookie", &cart)], "").body;
     let sub = sink.made(1, "ok").remove(0);
-    let a = bind(port, &sub, serde_json::json!(zoe), "");
+    let a = bind(port, &sub, serde_json::json!(zoe), &mallory);
     assert_eq!(a.status, 403);
     assert!(a.body.contains("not one notification.user made here, for this session"), "{}", a.body);
     assert_eq!(bind(port, &sub, serde_json::json!(zoe), &bob).status, 403);
@@ -4000,40 +4148,121 @@ fn notification_sessions_end_and_the_user_option() {
     session_step(port, "/out", &cart);
     assert_eq!(send_to(port, "zoe", one.clone())["sent"], 0);
     // What is refused, and why.
+    let (cart2, _) = session_step(port, "/cart", "");
     let sub = sink.made(1, "ok").remove(0);
     for (user, cookie, says) in [
-        (serde_json::json!("zoe"), "", "not one notification.user made here"),
-        (serde_json::json!(format!("{}x", guest)), "", "not one notification.user made here"),
-        (serde_json::json!(7), "", "made on the server with notification.user(x), so that a page cannot name someone else"),
-        (serde_json::json!({ "user": "zoe" }), "", "made on the server with notification.user(x)"),
-        (serde_json::Value::Null, "", "no one to send to: the visitor is not signed in (session().user)"),
-        (serde_json::Value::Null, cart.as_str(), "no one to send to"),
+        (serde_json::json!("zoe"), cart2.as_str(), "not one notification.user made here"),
+        (serde_json::json!(format!("{}x", zoe)), cart2.as_str(), "not one notification.user made here"),
+        (serde_json::json!(7), cart2.as_str(), "made on the server with notification.user(x), so that a page cannot name someone else"),
+        (serde_json::json!({ "user": "zoe" }), cart2.as_str(), "made on the server with notification.user(x)"),
+        (serde_json::Value::Null, cart2.as_str(), "no one to send to: the visitor is not signed in (session().user)"),
+        (serde_json::Value::Null, "", "no one to send to"),
+        (serde_json::json!(zoe), "", "no one to send to"),
     ] {
         let a = bind(port, &sub, user.clone(), cookie);
         assert_eq!(a.status, 403, "{} {}", user, a.body);
         assert!(a.body.contains(says), "{}: {}", user, a.body);
     }
-    // DELETE, as `stop` sends it.
+    // DELETE, as `stop` sends it: the visitor's own alone.
     let (cy, _) = session_step(port, "/in/cy", "");
     let sub = sink.made(1, "ok").remove(0);
     assert_eq!(bind(port, &sub, serde_json::Value::Null, &cy).status, 200);
-    assert_eq!(send_to(port, "cy", one.clone())["sent"], 1);
     let host = format!("127.0.0.1:{}", port);
-    let a = support::send(port, "DELETE", "/_quillo/push", &[("host", &host)], &serde_json::json!({ "endpoint": sub["endpoint"] }).to_string());
+    let delete = |cookie: &str| {
+        let mut hs = vec![("host", host.as_str())];
+        if !cookie.is_empty() {
+            hs.push(("cookie", cookie));
+        }
+        support::send(port, "DELETE", "/_quillo/push", &hs, &serde_json::json!({ "endpoint": sub["endpoint"] }).to_string())
+    };
+    assert_eq!(delete("").status, 403);
+    assert_eq!(delete(&mallory).status, 200);
+    assert_eq!(send_to(port, "cy", one.clone())["sent"], 1, "a stranger's delete took nothing");
+    let a = delete(&cy);
     assert_eq!((a.status, a.body.as_str()), (200, r#"{"ok":true}"#));
     assert_eq!(send_to(port, "cy", one)["sent"], 0);
 }
 
+/// A page's look at its browser's subscription as it starts (`check`), with `cookie`: what the
+/// server says it is.
+fn check_sub(port: u16, sub: &serde_json::Value, cookie: &str) -> serde_json::Value {
+    let host = format!("127.0.0.1:{}", port);
+    let mut hs = vec![("host", host.as_str())];
+    if !cookie.is_empty() {
+        hs.push(("cookie", cookie));
+    }
+    let a = support::send(port, "POST", "/_quillo/push", &hs, &serde_json::json!({ "endpoint": sub["endpoint"], "check": true }).to_string());
+    assert_eq!(a.status, 200, "{}", a.body);
+    serde_json::from_str(&a.body).unwrap()
+}
+
+// B.3 review, 1: a device is one person's. (a) Any change of person in `set_session` unbinds the
+// session's subscriptions, to no one and from no one too: Alice's, then a cart set on her session,
+// then Bob signing in on that cookie, kept Alice's coming to Bob. The same person signing in again
+// keeps them. (b) A page's look as it starts: a subscription bound to someone else than the
+// session names now (Carol's, her cookie gone and Dave signed in fresh), or with no one signed in,
+// is unbound, and the page is told "default"; one of the visitor's, or made in this very session,
+// stays "granted"; one not bound at all is "default".
+#[test]
+fn notification_a_device_is_one_persons() {
+    let sink = sink();
+    let d = dir("n-one-person", PUSHER);
+    let (_s, port) = push_server(&d, &[], &[]);
+    let one = serde_json::json!({ "title": "t" });
+    // (a) Alice, a cart, Bob.
+    let (alice, _) = session_step(port, "/in/alice", "");
+    assert_eq!(bind(port, &sink.made(1, "ok")[0], serde_json::Value::Null, &alice).status, 200);
+    let (carted, _) = session_step(port, "/cart", &alice);
+    assert_eq!(send_to(port, "alice", one.clone())["sent"], 0, "a person to no one unbinds");
+    session_step(port, "/in/bob", &carted);
+    assert_eq!(send_to(port, "alice", one.clone())["sent"], 0);
+    // From no one to someone: a guest's ticket-bound device is not the person's who signs in.
+    let (guest, _) = session_step(port, "/cart", "");
+    let t = support::send(port, "GET", "/ticket/guest-9", &[("cookie", &guest)], "").body;
+    assert_eq!(bind(port, &sink.made(1, "ok")[0], serde_json::json!(t), &guest).status, 200);
+    assert_eq!(send_to(port, "guest-9", one.clone())["sent"], 1);
+    session_step(port, "/in/gus", &guest);
+    assert_eq!(send_to(port, "guest-9", one.clone())["sent"], 0, "no one to a person unbinds");
+    // The same person again: kept.
+    let (al, _) = session_step(port, "/in/al", "");
+    assert_eq!(bind(port, &sink.made(1, "ok")[0], serde_json::Value::Null, &al).status, 200);
+    let (al2, _) = session_step(port, "/in/al", &al);
+    assert_eq!(send_to(port, "al", one.clone())["sent"], 1);
+    // (b) Carol's device, her cookie gone, Dave signed in fresh on it.
+    let (carol, _) = session_step(port, "/in/carol", "");
+    let sub = sink.made(1, "ok").remove(0);
+    assert_eq!(bind(port, &sub, serde_json::Value::Null, &carol).status, 200);
+    assert_eq!(check_sub(port, &sub, &carol), serde_json::json!({ "state": "granted" }));
+    assert_eq!(send_to(port, "carol", one.clone())["sent"], 1, "her own look keeps it");
+    let (dave, _) = session_step(port, "/in/dave", "");
+    assert_eq!(check_sub(port, &sub, &dave), serde_json::json!({ "state": "default" }));
+    assert_eq!(send_to(port, "carol", one.clone())["sent"], 0, "Dave's page took Carol's away");
+    // No one signed in: unbound too; one not bound: "default".
+    let sub = sink.made(1, "ok").remove(0);
+    assert_eq!(bind(port, &sub, serde_json::Value::Null, &al2).status, 200);
+    assert_eq!(check_sub(port, &sub, ""), serde_json::json!({ "state": "default" }));
+    assert_eq!(send_to(port, "al", one.clone())["sent"], 1, "only the first of Al's");
+    assert_eq!(check_sub(port, &sink.made(1, "ok")[0], &al2), serde_json::json!({ "state": "default" }));
+    // Made in this very session with a ticket: the session's.
+    let (cart, _) = session_step(port, "/cart", "");
+    let t = support::send(port, "GET", "/ticket/kit", &[("cookie", &cart)], "").body;
+    let sub = sink.made(1, "ok").remove(0);
+    assert_eq!(bind(port, &sub, serde_json::json!(t), &cart).status, 200);
+    assert_eq!(check_sub(port, &sub, &cart), serde_json::json!({ "state": "granted" }));
+    assert_eq!(send_to(port, "kit", one)["sent"], 1);
+}
+
 // B.3: /_quillo/push takes only the program's own pages, as a server fn does: another site's post
 // or delete is refused (Sec-Fetch-Site, or an Origin of another host), and so is anything but JSON
-// of a few hundred bytes. It takes no endpoint a send should not reach: only https to the public
-// internet, or plain http to this machine with QUILLO_PUSH_LOCAL=1 (or --watch); no private
-// address, no other scheme, no user in it, nothing over 1,000 characters; and only a P-256 key and
-// a 16-byte secret. A page's origin comes with it.
+// of a few hundred bytes. It takes no endpoint a send should not reach: only https on port 443 to
+// the public internet, or plain http to this machine with QUILLO_PUSH_LOCAL=1 alone (review: not
+// --watch); no private address (local-use NAT64 too), no name of this machine with a final dot,
+// no other scheme or port, no user in it, nothing over 1,000 characters; and only a P-256 key and
+// a 16-byte secret. The page's origin is the request's, never what the body says (review).
 #[test]
 fn notification_what_the_push_endpoint_refuses() {
     let d = dir("n-refuse", PUSHER);
-    let (_s, port) = push_server(&d, &[], &[("QUILLO_PUSH_LOCAL", "0")]);
+    let (_s, port) = push_server(&d, &["--watch"], &[("QUILLO_PUSH_LOCAL", "0")]);
     let (ana, _) = session_step(port, "/in/ana", "");
     let (host, origin) = (format!("127.0.0.1:{}", port), format!("http://127.0.0.1:{}", port));
     let p256dh = "BF5JjJmHYcp-lHVMIDyVSu7Q4fzLCDsfNqASRtVyiv5i8aoIztqkMiDtok0G5oXrmrnwzD1uoXEWEeXDg1_Yzpg";
@@ -4051,17 +4280,23 @@ fn notification_what_the_push_endpoint_refuses() {
         (vec![("origin", origin.as_str())], format!("{{\"endpoint\":\"https://push.example.com/{}\"}}", "x".repeat(9000)), 413, "a few hundred bytes"),
         (vec![("origin", origin.as_str())], "{".to_string(), 400, "not JSON"),
         (vec![("origin", origin.as_str())], "{}".to_string(), 400, "no endpoint"),
-        (vec![], good.clone(), 400, "no origin"),
     ] {
         let a = post(&hs, &body);
         assert_eq!(a.status, status, "{:?} {}", hs, a.body);
         assert!(a.body.contains(says), "{:?}: {}", hs, a.body);
     }
-    // The page's origin in the body, where the browser sends no Origin, is taken.
+    // An origin in the body is not read: the request's Host is the page's.
     let mut with = sub("https://push.example.com/send/abc");
-    with["origin"] = serde_json::json!(origin);
+    with["origin"] = serde_json::json!("https://evil.example");
     assert_eq!(post(&[], &with.to_string()).status, 200);
     let long = format!("https://push.example.com/{}", "a".repeat(1000));
+    // Another session for the rest: a session changes 30 subscriptions a minute at most.
+    let (ana, _) = session_step(port, "/in/ana", "");
+    let post = |hs: &[(&str, &str)], body: &str| {
+        let mut all = vec![("host", host.as_str()), ("cookie", ana.as_str())];
+        all.extend_from_slice(hs);
+        support::send(port, "POST", "/_quillo/push", &all, body)
+    };
     for (endpoint, says) in [
         ("https://10.0.0.1/push", "not https to an address on the public internet"),
         ("https://169.254.169.254/latest", "not https to an address on the public internet"),
@@ -4069,8 +4304,13 @@ fn notification_what_the_push_endpoint_refuses() {
         ("https://localhost/push", "not https to an address on the public internet"),
         ("https://a.localhost/push", "not https to an address on the public internet"),
         ("http://push.example.com/push", "not https to an address on the public internet"),
-        ("http://127.0.0.1:9/push", "taken only under --watch or with QUILLO_PUSH_LOCAL=1"),
-        ("http://localhost:9/push", "taken only under --watch or with QUILLO_PUSH_LOCAL=1"),
+        ("http://127.0.0.1:9/push", "taken only with QUILLO_PUSH_LOCAL=1 (a test's push service)"),
+        ("http://localhost:9/push", "taken only with QUILLO_PUSH_LOCAL=1 (a test's push service)"),
+        ("https://localhost./push", "not https to an address on the public internet"),
+        ("https://[64:ff9b:1::a00:1]/push", "not https to an address on the public internet"),
+        ("https://[fd00::1]/push", "not https to an address on the public internet"),
+        ("https://push.example.com:22/push", "https on another port than 443"),
+        ("https://push.example.com:8443/push", "https on another port than 443"),
         ("ftp://push.example.com/push", "the endpoint is ftp:, not https"),
         ("https://me:pw@push.example.com/push", "holds a user"),
         ("https://push.example.com/push#x", "holds a user or a fragment"),
@@ -4082,6 +4322,14 @@ fn notification_what_the_push_endpoint_refuses() {
         assert_eq!(a.status, 400, "{} {}", endpoint, a.body);
         assert!(a.body.contains(says), "{}: {}", endpoint, a.body);
     }
+    let (ana, _) = session_step(port, "/in/ana", "");
+    let post = |hs: &[(&str, &str)], body: &str| {
+        let mut all = vec![("host", host.as_str()), ("cookie", ana.as_str())];
+        all.extend_from_slice(hs);
+        support::send(port, "POST", "/_quillo/push", &all, body)
+    };
+    // Port 443 written out is the same as none.
+    assert_eq!(post(&[("origin", origin.as_str())], &sub("https://push.example.com:443/send/x").to_string()).status, 200);
     for (keys, says) in [
         (serde_json::json!({ "auth": "swC8VcTjKc8fIaxz_rdm_Q" }), "no keys.p256dh"),
         (serde_json::json!({ "p256dh": "BF5J", "auth": "swC8VcTjKc8fIaxz_rdm_Q" }), "keys.p256dh is not 65 bytes"),
@@ -4149,6 +4397,38 @@ fn notification_a_program_without_it_pays_nothing() {
     let offline = fetch_body(port, "/_quillo/sw.js").2;
     assert!(offline.contains("addEventListener(\"fetch\"") && !offline.contains("\"push\"") && !offline.contains("notificationclick"), "{}", offline);
     assert_eq!(support::send(port, "GET", "/_quillo/push", &[], "").status, 404);
+}
+
+// B.3 review, 4: a program uses `notification` only where it calls the module: a variable of that
+// name (a loop's, a parameter, a `let`, a route's path parameter, a match arm's, a top-level one)
+// turns nothing on: no /_quillo/push, the worker that takes itself away, no warning at start, no
+// table. A call of the module where the name is bound only elsewhere (another block) does.
+#[test]
+fn notification_a_variable_of_its_name_turns_nothing_on() {
+    let hiding = [
+        ("loop", "let notifications = [{ title: \"Welcome\" }, { title: \"Ship\" }]\nroute GET / {\n    let out = []\n    for notification in notifications {\n        out = out + [notification.title]\n    }\n    return out\n}\n"),
+        ("param", "fn tell(notification) = notification.send(\"a\", { title: \"t\" })\nroute GET / = tell({ send: (a, b) => 1 })\n"),
+        ("let", "route GET / {\n    let notification = { stop: () => 1 }\n    return notification.stop()\n}\n"),
+        ("path", "route GET /n/:notification = notification.state()\n"),
+        ("arm", "route GET / = match { state: () => 1 } {\n    notification => notification.state()\n}\n"),
+        ("top", "let notification = { send: (a, b) => 1 }\nroute GET / = notification.send(\"a\", { title: \"t\" })\n"),
+    ];
+    const SAID: &str = "uses `notification` without QUILLO_SECRET";
+    for (name, src) in hiding {
+        let d = dir(&format!("n-hidden-{}", name), src);
+        let (s, port) = push_server(&d, &["--no-check"], &[("QUILLO_SECRET", "")]);
+        assert_eq!(support::send(port, "GET", "/_quillo/push", &[], "").status, 404, "{}", name);
+        let worker = fetch_body(port, "/_quillo/sw.js").2;
+        assert!(worker.contains("registration.unregister()") && !worker.contains("\"push\""), "{}: {}", name, worker);
+        support::send(port, "GET", "/", &[], "");
+        assert!(!log_with(&s, "listening").contains(SAID), "{}", name);
+        assert!(!d.join("quillo-system.db").exists(), "{}", name);
+    }
+    let used = "fn f() {\n    for notification in [1] {\n        print(notification)\n    }\n    return notification.send(\"a\", { title: \"t\" })\n}\nroute POST /send = f()\n";
+    let d = dir("n-hidden-elsewhere", used);
+    let (s, port) = push_server(&d, &["--no-check"], &[("QUILLO_SECRET", "")]);
+    assert_eq!(support::send(port, "GET", "/_quillo/push", &[], "").status, 200);
+    assert!(log_with(&s, SAID).contains(SAID));
 }
 
 /// `quillo check` of `src`: its error and warning lines.
@@ -4266,6 +4546,15 @@ route GET / = <html><body><C/></body></html>
             "main.qwe:4: error: `notification.ask`: unknown option `who` (the option is user)",
         ]
     );
+    // A wait in one branch is not before an ask in another (review); after an `if` that may have
+    // waited, it is.
+    let branches = "server fn save(n: int) -> int = n\ncomponent Alerts() {\n    state on = notification.state()\n    state ready = false\n    <div>\n        <button @click={() => {\n            if ready {\n                on = str(save(1))\n            } else {\n                on = notification.ask()\n            }\n        }}>one</button>\n        <button @click={() => {\n            if ready {\n                on = str(save(1))\n            }\n            on = notification.ask()\n        }}>two</button>\n        <button @click={() => {\n            let f = () => save(1)\n            on = notification.ask()\n            on = str(f())\n        }}>three</button>\n    </div>\n}\nroute GET / = <html><body><Alerts/></body></html>\n";
+    let (ok, lines) = check_lines("n-check-branches", branches);
+    assert!(ok, "{:?}", lines);
+    assert_eq!(lines, ["main.qwe:17: warning: `notification.ask` comes after `save` waits in this handler: browsers show the permission prompt only close to the click, so ask first, then wait"]);
+    // A send in what `db.atomic` runs is warned of too.
+    let (_, lines) = check_lines("n-check-atomic", "route POST /a = db.atomic([\"x\"], () => notification.send(\"a\", { title: \"t\" }))\n");
+    assert_eq!(lines, [format!("main.qwe:1: warning: {}", IN_A_TRANSACTION)]);
     // What a module does not have.
     let (ok, lines) = check_lines("n-check-none", "route GET / = notification.push(\"a\")\n");
     assert!(!ok && lines.iter().any(|l| l.contains("`notification` has no function `push`")), "{:?}", lines);
@@ -4523,11 +4812,16 @@ const PUSH_FLOW: &str = r#"(async () => {@KIT@
       reg = evs.flatMap((e) => e.params.registrations).find((r) => r.scopeURL === location.origin + "/" && !r.isDeleted);
       if (!reg) await tick(50);
     }
-    out.delivered = await cdp([["ServiceWorker.deliverPushMessage", { origin: location.origin + "/", registrationId: reg.registrationId, data: got[0].text }]]);
     const r = await navigator.serviceWorker.getRegistration("/");
     out.script = new URL(r.active.scriptURL).pathname;
+    // Delivered again where none shows in 3 s: run right after another Chrome went away, the
+    // system took the first ones away again (seen on macOS, Chrome 157; never alone). The tag
+    // makes a second one replace the first.
     let shown = [];
-    for (let i = 0; i < 600 && !shown.length; i++) { shown = await r.getNotifications(); if (!shown.length) await tick(25); }
+    for (let round = 0; round < 6 && !shown.length; round++) {
+      out.delivered = await cdp([["ServiceWorker.deliverPushMessage", { origin: location.origin + "/", registrationId: reg.registrationId, data: got[0].text }]]);
+      for (let i = 0; i < 120 && !shown.length; i++) { shown = await r.getNotifications(); if (!shown.length) await tick(25); }
+    }
     out.shown = shown.map((n) => ({ title: n.title, body: n.body, tag: n.tag, data: n.data }));
     out.stopped = await press("stop");
     out.after = await (await fetch("/send/ana", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title: "t" }) })).json();
@@ -4651,4 +4945,73 @@ fn notification_in_chrome_refusals_and_the_time_limit() {
     assert_eq!(r["late"].as_str(), Some("unsupported"), "{}", r);
     let ms = r["ms"].as_u64().unwrap();
     assert!((19_500..32_000).contains(&ms), "{}", ms);
+}
+
+/// `PushManager` played in every page and frame from its start (DevTools'
+/// `Page.addScriptToEvaluateOnNewDocument`), the subscription kept in localStorage as the browser
+/// keeps its own across page loads: `stub-next` holds the one Node made, which `subscribe` gives.
+const STUB_ON_EACH_PAGE: &str = r#"(() => {
+  const K = "stub-sub";
+  const load = () => { try { return JSON.parse(localStorage.getItem(K)); } catch (_) { return null; } };
+  const asSub = (s) => s && { endpoint: s.json.endpoint, options: { applicationServerKey: Uint8Array.from(s.key).buffer }, toJSON: () => s.json, unsubscribe: async () => { localStorage.removeItem(K); return true; } };
+  PushManager.prototype.getSubscription = async function () { return asSub(load()); };
+  PushManager.prototype.subscribe = async function (o) {
+    const s = { json: JSON.parse(localStorage.getItem("stub-next")), key: Array.from(new Uint8Array(o.applicationServerKey)) };
+    localStorage.setItem(K, JSON.stringify(s));
+    return asSub(s);
+  };
+})();"#;
+
+const DEVICE_SCRIPT: &str = r#"(async () => {@KIT@
+  const out = {};
+  try {
+    await grant();
+    await cdp([["Page.addScriptToEvaluateOnNewDocument", { source: @STUB@ }]]);
+    localStorage.setItem("stub-next", JSON.stringify(await made()));
+    // A page of the app, started in a frame: its state once the page has looked.
+    const open = async () => {
+      const f = document.createElement("iframe");
+      await new Promise((ok) => { f.onload = ok; f.src = "/"; document.body.appendChild(f); });
+      const at = () => f.contentDocument.getElementById("on");
+      for (let i = 0; i < 500 && !(at() && at().textContent); i++) await tick(20);
+      return f;
+    };
+    const shown = (f) => f.contentDocument.getElementById("on").textContent;
+    await signIn("carol");
+    const a = await open();
+    out.first = shown(a);
+    const was = a.contentDocument.getElementById("on").getAttribute("data-n");
+    a.contentDocument.getElementById("ask").click();
+    for (let i = 0; i < 500 && a.contentDocument.getElementById("on").getAttribute("data-n") === was; i++) await tick(20);
+    out.asked = shown(a);
+    out.again = shown(await open());
+    const sendCarol = async () => (await (await fetch("/send/carol", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title: "for carol" }) })).json()).sent;
+    out.sent = await sendCarol();
+    // Her cookie gone (it ended, or was cleared), and Dave signed in on the device.
+    await cdp([["Network.clearBrowserCookies", {}]]);
+    await signIn("dave");
+    out.dave = shown(await open());
+    out.after = await sendCarol();
+  } catch (e) { out.error = String(e && e.stack || e); }
+  document.body.dataset.result = JSON.stringify(out);
+})();"#;
+
+// B.3 review, 1 (b), in Chrome: a page that starts where the browser holds a subscription asks the
+// server whether it is still the signed-in person's. Carol's own pages say "granted" and her
+// notifications come; once her cookie is gone and Dave signs in on the device, his page's look
+// unbinds hers, says "default" so that the app asks him, and Carol's stop coming.
+#[test]
+fn notification_in_chrome_a_device_is_one_persons() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let sink = sink();
+    let d = dir("n-chrome-device", CHROME_PUSH);
+    std::fs::write(d.join("own-sw.js"), "self.addEventListener(\"install\", () => self.skipWaiting());\n").unwrap();
+    let (_s, port) = push_server(&d, &[], &[]);
+    let script = DEVICE_SCRIPT.replace("@KIT@", PUSH_KIT).replace("@SINK@", &sink.port.to_string()).replace("@STUB@", &serde_json::Value::String(STUB_ON_EACH_PAGE.to_string()).to_string());
+    let r = in_chrome_cdp(&chrome, &format!("http://127.0.0.1:{}/", port), &script, 120000);
+    assert_eq!(r, serde_json::json!({ "first": "default", "asked": "granted", "again": "granted", "sent": 1, "dave": "default", "after": 0 }), "{}", r);
 }
