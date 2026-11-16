@@ -727,7 +727,9 @@ const MORPH_SCRIPT: &str = r##"(async () => {
   for (let i = 0; i < 400 && !$("#b").textContent.startsWith("clicks"); i++) await tick(30);
   const second = { b: $("#b").textContent };
   await fetch("/stage/3");
-  for (let i = 0; i < 400 && !$("#foot"); i++) await tick(30);
+  // The page morphs, then looks at its bundle, then says "morphed": the third word can come after
+  // the node (found in the pwa speed check: 2 of 10 runs read the result between them).
+  for (let i = 0; i < 400 && (!$("#foot") || said.length < 3); i++) await tick(30);
   const QW = window[Symbol.for("quillo")];
   document.body.dataset.result = JSON.stringify({ first, second, foot: ($("#foot") || {}).textContent, said, kept: window.__kept === 1, remade: QW.remade ?? 0, errors: window.__quilloErrors });
 })();"##;
