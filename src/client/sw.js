@@ -1,14 +1,19 @@
 // Quillo's service worker, for a program with routes tagged `offline` (FEEDBACK67.md, B.2 and its
-// review; branch pwa). Served at <base>/_quillo/sw.js, its scope the program's base. Its text
+// reviews; branch pwa). Served at <base>/_quillo/sw.js, its scope the program's base. Its text
 // names the build, the program and its offline routes (V): a deploy installs a new worker, which
-// drops what the one before kept once it has kept the new pages; until then the old copies serve.
+// drops what the one before kept once it has kept the new pages (or tried five times); until then
+// the old copies serve. Pages are kept on install as prefetches, which Quillo answers without
+// changing anything, or refuses.
 // - <base>/_quillo/{b,r,s,t,i}/<hash> hold what their hash names: from the cache first, kept for
 //   good; only an answer the server marks immutable (one for a hash it no longer has is not).
 // - No other /_quillo/ address is touched: rpc, live, events, ready, src/, quillo.js, this file.
 // - A navigation goes to the network first. A 200 the server marks as an offline route's
-//   (`x-quillo-offline`) is kept, at most 100 pages, the oldest dropped first; when the network
-//   fails, or a proxy answers 502, 503 or 504, the kept copy is given, its <html> marked
-//   `data-kept` with when it was kept, else an offline page.
+//   (`x-quillo-offline`) is kept, at most 100 pages, the oldest dropped first; an answer without
+//   the mark drops the copy kept of that address. When the network fails, or a proxy answers 502,
+//   503 or 504, the kept copy is given, marked `data-kept` with when it was kept, else an offline
+//   page. The marks go in an <html> start tag put before all of the page but its doctype and
+//   comments, which the browser merges the page's own <html> into: nothing of the page is read or
+//   changed.
 // - A session's page (`x-quillo-offline: private`) is kept apart, by the session's name
 //   (`x-quillo-session`), at most 50 a session. Given back, it is hidden behind the gate, which
 //   shows it only to the session that browser holds now (the `quillo_tag` cookie) and otherwise
@@ -17,17 +22,18 @@
 // - Every other request goes to the network as if there were no worker.
 const BASE = @BASE@, V = @V@, PAGES = @PAGES@, OFFLINE = @OFFLINE@, GATE = @GATE@;
 const MINE = "quillo:" + BASE + ":", NAME = MINE + V, AWAY = NAME + ":", GONE = MINE + "gone";
-const READY = location.origin + BASE + "/_quillo/sw-ready", DROPPED = location.origin + BASE + "/_quillo/sw-dropped";
+const STATE = location.origin + BASE + "/_quillo/sw-state", DROPPED = location.origin + BASE + "/_quillo/sw-dropped";
 const NAMED = BASE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "/_quillo/[brsti]/[0-9a-f]+\\.(?:js|css|png)";
 const ONE = new RegExp("^" + NAMED + "$"), ALL = new RegExp(NAMED, "g");
 const lasting = (res) => res.ok && /immutable/.test(res.headers.get("cache-control") || "");
 const offline = () => new Response(OFFLINE, { status: 503, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
-// Whether this version's pages are all kept (null: not looked yet), and when that was last tried.
-let ready = null, tried = 0;
+// This version's pages kept on install: those done (kept, or answered so that they are not to
+// be), how many tries, when the last was, and whether it is done (null: not read yet).
+let st = null;
 
 self.addEventListener("install", (e) => {
   self.skipWaiting();
-  e.waitUntil(ahead().then((ok) => { ready = ok; tried = Date.now(); }));
+  e.waitUntil(ahead());
 });
 
 self.addEventListener("activate", (e) => e.waitUntil((async () => {
@@ -65,16 +71,28 @@ async function page(e) {
   } catch (_) {
     return (await kept(r.url)) || offline();
   }
-  // An app down behind a proxy; not a prefetch, which Quillo refuses with a 503.
-  if (res.status >= 502 && res.status <= 504 && !/prefetch/i.test(r.headers.get("sec-purpose") || "")) {
+  // A prefetch, which Quillo refuses with a 503 when it would change something: that says nothing
+  // of the page.
+  if (/prefetch/i.test(r.headers.get("sec-purpose") || "") || res.headers.get("x-quillo-prefetch") === "refused") return res;
+  // An app down behind a proxy.
+  if (res.status >= 502 && res.status <= 504) {
     const k = await kept(r.url);
     if (k) return k;
   }
   const who = res.headers.get("x-quillo-session"), mark = res.status === 200 && res.headers.get("x-quillo-offline");
-  // A copy only of a page to keep: a download or an event stream is not held twice.
-  if (who !== null || mark) e.waitUntil(seen(mark ? res.clone() : null, r.url, who, mark));
-  if (ready !== true) e.waitUntil(settle());
+  // A copy only of a page to keep: a download or an event stream is not held twice. Not kept now
+  // (a 404, a redirect, a page that holds a form key now): the copy goes, after the session's
+  // pages that go, whose caches it would open again.
+  const said = who !== null || mark ? seen(mark ? res.clone() : null, r.url, who, mark) : Promise.resolve();
+  e.waitUntil(mark ? said : said.then(() => forget(r.url)));
+  e.waitUntil(settle());
   return res;
+}
+
+// What was kept of an address, in this version's caches and the old ones'; a cache dropped
+// meanwhile is not made again.
+async function forget(url) {
+  for (const c of await mine()) if (await caches.has(c.k)) await (await caches.open(c.k)).delete(url);
 }
 
 async function named(e) {
@@ -155,11 +173,12 @@ async function keep(url, res, who) {
   h.delete("clear-site-data");
   h.set("x-quillo-kept", new Date().toISOString());
   const copy = new Response(await res.blob(), { status: 200, statusText: res.statusText, headers: h });
-  for (const c of await mine()) if (c.v === V) await (await caches.open(c.k)).delete(url);
-  const c = await caches.open(who === null ? NAME : AWAY + who);
+  // Written first, then taken from this version's other caches: never missing between.
+  const name = who === null ? NAME : AWAY + who, c = await caches.open(name);
   await c.put(url, copy);
+  for (const o of await mine()) if (o.v === V && o.k !== name) await (await caches.open(o.k)).delete(url);
   // The oldest pages first, past the bound; not the files they name.
-  const pages = (await c.keys()).filter((k) => k.url !== READY && !ONE.test(new URL(k.url).pathname));
+  const pages = (await c.keys()).filter((k) => k.url !== STATE && !ONE.test(new URL(k.url).pathname));
   for (const k of pages.slice(0, Math.max(0, pages.length - (who === null ? 100 : 50)))) await c.delete(k);
 }
 
@@ -169,62 +188,81 @@ async function kept(url) {
     if (c.who && g.has(c.who)) continue;
     const hit = await (await caches.open(c.k)).match(url, { ignoreVary: true });
     if (!hit) continue;
-    const mark = ' data-kept="' + (hit.headers.get("x-quillo-kept") || "") + '"' + (c.who ? ' data-kept-session="' + c.who + '" hidden' : "");
-    let html = await hit.text(), at;
-    const m = /<html(?=[\s/>])/i.exec(html);
-    if (m) {
-      at = m.index + 5;
-      html = html.slice(0, at) + mark + html.slice(at);
-    } else {
-      const d = /^\s*<!doctype[^>]*>/i.exec(html), i = d ? d[0].length : 0;
-      html = html.slice(0, i) + "<html" + mark + ">" + html.slice(i);
-      at = i + 5;
-    }
-    // A session's page: the gate first in its head, before anything of theirs is read.
-    if (c.who) {
-      const end = html.indexOf(">", at) + 1, head = /<head(?=[\s/>])[^>]*>/i.exec(html.slice(end));
-      const i = head ? end + head.index + head[0].length : end;
-      html = html.slice(0, i) + "<script>" + GATE + "</script>" + html.slice(i);
-    }
+    const html = await hit.text(), at = start(html);
+    // A session's page: hidden, the gate first, before anything of theirs is read.
+    const tag = "<html" + (c.who ? ' hidden data-kept-session="' + c.who + '"' : "") + ' data-kept="' + (hit.headers.get("x-quillo-kept") || "") + '">' + (c.who ? "<head><script>" + GATE + "</script>" : "");
     const h = new Headers(hit.headers);
     h.delete("content-length");
-    return new Response(html, { status: 200, headers: h });
+    return new Response(html.slice(0, at) + tag + html.slice(at), { status: 200, headers: h });
   }
   return null;
 }
 
+// Where a page's elements start: past a byte-order mark, white space, its doctype and comments
+// (`<!-- ... -->`, and `<!...>` or `<?...>`, which the browser reads as comments too). What comes
+// there is the browser's, as written: a conditional comment, `<html>` in a script's text.
+function start(html) {
+  let i = html.charCodeAt(0) === 0xfeff ? 1 : 0;
+  for (;;) {
+    while (i < html.length && /\s/.test(html[i])) i++;
+    if (html.startsWith("<!--", i)) {
+      const end = html.indexOf("-->", i + 4);
+      if (end < 0) return html.length;
+      i = end + 3;
+    } else if (html.startsWith("<!", i) || html.startsWith("<?", i)) {
+      const end = html.indexOf(">", i + 2);
+      if (end < 0) return html.length;
+      i = end + 1;
+    } else return i;
+  }
+}
+
+async function state() {
+  if (!st) {
+    const hit = await (await caches.open(NAME)).match(STATE);
+    st = hit ? await hit.json() : { done: [], tries: 0, at: 0, ready: false };
+  }
+  return st;
+}
+
 async function isReady() {
-  if (ready === null) ready = !!(await (await caches.open(NAME)).match(READY));
-  return ready;
+  return (await state()).ready;
 }
 
 async function dropOld() {
   for (const c of await mine()) if (c.v !== V) await caches.delete(c.k);
 }
 
-// This version's pages not all kept yet (a page failed as the worker installed): tried again on a
-// navigation that reached the network, at most every 10 s; the old copies go once they are.
+// This version's pages not all kept yet (a page did not come as the worker installed): tried again
+// on a navigation that reached the network, 10 s after the first try, then 30 s, 90 s and 270 s;
+// after five, the version is as kept as it gets, and the old copies go.
 async function settle() {
-  if ((await isReady()) || Date.now() - tried < 10000) return;
-  tried = Date.now();
-  if (await ahead()) {
-    ready = true;
-    await dropOld();
-  }
+  const s = await state();
+  if (s.ready || Date.now() - s.at < 10000 * 3 ** (s.tries - 1)) return;
+  if (await ahead()) await dropOld();
 }
 
 // Each offline route with no parameter, and the files its page names, so that a page never
-// opened opens offline with its components. Whether all were answered: a page that did not come
-// (no network, or a proxy's 502, 503 or 504) is tried again later; one answered otherwise is as
-// the server said.
+// opened opens offline with its components: asked for as a prefetch (`x-quillo-prefetch`), which
+// Quillo answers changing nothing, or refuses with a 503 that says so, as for a route that would
+// write, or set a cookie. A page that did not come (no network, a proxy's 502, 503 or 504) is
+// asked for again on the next try; one refused, redirected (here or off the site), or answered
+// otherwise is done with for this version.
 async function ahead() {
-  const c = await caches.open(NAME);
-  const got = await Promise.all(PAGES.map(async (p) => {
+  const s = await state(), c = await caches.open(NAME);
+  if (s.ready) return true;
+  s.tries++;
+  s.at = Date.now();
+  // One at a time: a prefetch waits for anyone else's request (Quillo answers it 503 meanwhile,
+  // which is tried again), the worker's own included.
+  const todo = PAGES.filter((p) => !s.done.includes(p)), got = [];
+  for (const p of todo) got.push(await (async () => {
     try {
-      const res = await fetch(p, { cache: "no-store" });
+      const res = await fetch(p, { cache: "no-store", redirect: "manual", headers: { "x-quillo-prefetch": "1" } });
+      if (res.type === "opaqueredirect" || res.headers.get("x-quillo-prefetch") === "refused") return true;
       if (res.status >= 502 && res.status <= 504) return false;
       const mark = res.headers.get("x-quillo-offline");
-      if (res.status !== 200 || res.redirected || !mark) return true;
+      if (res.status !== 200 || !mark) return true;
       const html = await res.clone().text();
       await seen(res, new URL(p, location.href).href, res.headers.get("x-quillo-session"), mark);
       await Promise.all([...new Set(html.match(ALL) || [])].map(async (f) => {
@@ -236,8 +274,9 @@ async function ahead() {
     } catch (_) {
       return false;
     }
-  }));
-  const ok = got.every(Boolean);
-  if (ok) await c.put(READY, new Response("1"));
-  return ok;
+  })());
+  todo.forEach((p, i) => { if (got[i]) s.done.push(p); });
+  s.ready = s.done.length >= PAGES.length || s.tries >= 5;
+  await c.put(STATE, new Response(JSON.stringify(s), { headers: { "content-type": "application/json" } }));
+  return s.ready;
 }

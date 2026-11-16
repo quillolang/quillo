@@ -1406,7 +1406,7 @@ const SW_KIT: &str = r#"
     const out = {};
     for (const n of await caches.keys()) {
       if (n.endsWith(":gone")) continue;
-      const k = (await (await caches.open(n)).keys()).map((r) => decodeURI(new URL(r.url).pathname).replace(/\/[0-9a-f]{16}\./, "/H.")).filter((p) => !p.endsWith("/_quillo/sw-ready")).sort();
+      const k = (await (await caches.open(n)).keys()).map((r) => decodeURI(new URL(r.url).pathname).replace(/\/[0-9a-f]{16}\./, "/H.")).filter((p) => !p.endsWith("/_quillo/sw-state")).sort();
       out[n.replace(/:[0-9a-f]{16}/, ":V").replace(/:V:.+$/, ":V:S")] = k;
     }
     return out;
@@ -1490,7 +1490,8 @@ const SHOP_SCRIPT: &str = r#"(async () => {@KIT@
 })();"#;
 
 // B.2: the worker registers from an offline route's page, at the program's scope, and controls
-// it. Online, a page comes from the network each time and a server fn is answered by the server;
+// it (`/menu`, which counts its loads, is not kept on install: the install asks as a prefetch, and
+// Quillo refuses a prefetch that would change something; second review). Online, a page comes from the network each time and a server fn is answered by the server;
 // what is kept is the offline routes with no parameter (kept on install, opened or not) and the
 // files their pages name, nothing of /_quillo/rpc, ready or another GET. With the server stopped:
 // the page opened shows its last copy, marked `data-kept`; one never opened opens too, its
@@ -1521,11 +1522,11 @@ fn b2_offline_pages_are_kept_and_shown_with_the_server_stopped() {
         r,
         serde_json::json!({
             "controlled": true, "worker": "/_quillo/sw.js", "scope": "/",
-            "menu": ["Menu 2", "Menu 3"], "call": "add 2", "ready": 200,
+            "menu": ["Menu 1", "Menu 2"], "call": "add 2", "ready": 200,
             "kept": { "quillo::V": files },
             "down": true,
             "offline": {
-                "/menu": { "h1": "Menu 3", "kept": "iso", "offline": false, "title": "" },
+                "/menu": { "h1": "Menu 2", "kept": "iso", "offline": false, "title": "" },
                 "/": { "h1": "Home", "kept": "iso", "offline": false, "title": "Home" },
                 "/never": { "h1": "Never", "kept": "iso", "offline": false, "title": "" },
                 "/item/5": offline_page, "/plain": offline_page, "/caf%C3%A9": offline_page,
@@ -1579,7 +1580,7 @@ const SIGNED_SCRIPT: &str = r#"(async () => {@KIT@
   await new Promise((ok) => { home.onload = ok; home.contentDocument.getElementById("f").submit(); });
   out.after_form = await until(async () => (await privates()) === 0 && (await kept()));
   out.again = await signIn("bob");
-  out.privates = await privates();
+  out.privates = (await until(async () => (await privates()) === 1)) ? 1 : 0;
   // A server fn: the runtime tells the worker.
   document.getElementById("out").click();
   out.after_fn = await until(async () => (await privates()) === 0 && (await kept()));
@@ -1650,9 +1651,9 @@ fn policy_hash(text: &str) -> String {
     format!("'sha256-{}'", out)
 }
 
-/// What registers the worker, at the base given.
+/// What registers the worker, at the base given, and tells it the session the browser holds.
 fn register_script(base: &str) -> String {
-    format!("<script>(n=>n&&n.register(\"{0}/_quillo/sw.js\",{{scope:\"{0}/\"}}))(navigator.serviceWorker)</script>", base)
+    format!("<script>(n=>{{if(!n)return;const u=\"{0}/_quillo/sw.js\";n.register(u,{{scope:\"{0}/\"}});const c=n.controller,m=/(?:^|;\\s*)quillo_tag=([^;]*)/.exec(document.cookie);c&&c.scriptURL===new URL(u,location).href&&c.postMessage({{quillo:\"session\",who:m?m[1]:\"-\"}})}})(navigator.serviceWorker)</script>", base)
 }
 
 /// Under the guide's content policy, with nothing of its own on the page but the register script;
@@ -2009,23 +2010,24 @@ fn b2_the_marks_and_the_register_script_go_where_they_belong() {
     let d = app_dir("sw-marked", &[("main.qwe", MARKED.as_bytes()), ("page.html", b"<!doctype html><html><body>file</body></html>")]);
     assert!(check(&d).0, "{:?}", check(&d));
     let (_s, port) = logged(&d, &[]);
-    assert_eq!(register_script("").len(), 90);
+    assert_eq!(register_script("").len(), 280);
+    // No session cookie at all: every page says no one (`-`), which any cache may give anyone.
     let m = |method: &str, path: &str| marks_of(port, method, path, None);
-    let one = || Some("1".to_string());
-    assert_eq!(m("GET", "/"), (200, one(), None, None, 1));
-    assert_eq!(m("HEAD", "/"), (200, one(), None, None, 0));
-    assert_eq!(m("GET", "/item/5"), (200, one(), None, None, 1));
-    assert_eq!(m("GET", "/caf%C3%A9"), (200, one(), None, None, 1));
-    assert_eq!(m("GET", "/docs/a"), (200, one(), None, None, 1));
-    // No session: the visitor's page is the one of no session's, `-`.
-    assert_eq!(m("GET", "/mine"), (200, Some("private".into()), Some("-".into()), None, 1));
+    let (one, none) = (|| Some("1".to_string()), || Some("-".to_string()));
+    assert_eq!(m("GET", "/"), (200, one(), none(), None, 1));
+    assert_eq!(m("HEAD", "/"), (200, one(), none(), None, 0));
+    assert_eq!(m("GET", "/item/5"), (200, one(), none(), None, 1));
+    assert_eq!(m("GET", "/caf%C3%A9"), (200, one(), none(), None, 1));
+    assert_eq!(m("GET", "/docs/a"), (200, one(), none(), None, 1));
+    // The visitor's page, no session: the one of no session's, `-`.
+    assert_eq!(m("GET", "/mine"), (200, Some("private".into()), none(), None, 1));
     for path in ["/nulled", "/theme", "/agent", "/order"] {
-        assert_eq!(m("GET", path), (200, None, None, None, 1), "{}", path);
+        assert_eq!(m("GET", path), (200, None, none(), None, 1), "{}", path);
     }
-    assert_eq!(m("POST", "/docs/b"), (200, None, None, None, 0));
-    assert_eq!(m("GET", "/plain"), (200, None, None, None, 0));
+    assert_eq!(m("POST", "/docs/b"), (200, None, none(), None, 0));
+    assert_eq!(m("GET", "/plain"), (200, None, none(), None, 0));
     assert_eq!(m("GET", "/data"), (200, None, None, None, 0));
-    assert_eq!(m("GET", "/missing"), (404, None, None, None, 0));
+    assert_eq!(m("GET", "/missing"), (404, None, none(), None, 0));
     assert_eq!(m("GET", "/nowhere"), (404, None, None, None, 0));
     let (_, h, body) = fetch(port, "GET", "/static", &[]);
     assert_eq!((header(&h, "x-quillo-offline"), String::from_utf8(body).unwrap()), (Some("1"), "<!doctype html><html><body>file</body></html>".to_string()));
@@ -2054,9 +2056,9 @@ fn b2_the_marks_and_the_register_script_go_where_they_belong() {
     assert_eq!(rpc("sign_out", &ana), (200, Some("-".into())));
 }
 
-// B.2 review: the session's name is a digest of its hidden id, so a cart or a message written into
-// the session keeps it, and two sign-ins of one browser as one person too; another person is
-// another name. `quillo_tag`, the cookie that names it, comes with the session cookie: readable
+// B.2 review: the session's name is a digest of its hidden id and (second review) of all it holds:
+// a cart written into it is another name; two sign-ins of one browser as one person keep it;
+// another person is another name. `quillo_tag`, the cookie that names it, comes with the session cookie: readable
 // by the page (no HttpOnly), its path the program's base, `SameSite=Lax`, `Secure` as the session
 // cookie is, living as long; taken away with it. A page of the session's that came without it (a
 // session from before the program's offline routes, a cookie lost) sets it again, once.
@@ -2070,12 +2072,13 @@ fn b2_the_session_is_named_by_its_hidden_id_and_its_cookie() {
         assert_eq!(line, format!("quillo_tag={}; Path={}; Max-Age=2592000; Secure; SameSite=Lax", tag, path));
         assert!(h.iter().any(|(k, v)| k == "set-cookie" && v.contains("quillo_session=") && v.contains("HttpOnly")));
         assert!(tag.len() == 16 && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'), "{}", tag);
-        // A cart in the session: the same name.
+        // A cart in the session: another name (second review: any change to the session is one,
+        // so that the person's kept pages go, and are kept again on the next visits).
         let (_, h, _) = fetch(port, "GET", "/cart", &[("cookie", &ana)]);
-        assert_eq!(header(&h, "x-quillo-session"), Some(tag.as_str()));
+        let cart_tag = header(&h, "x-quillo-session").unwrap().to_string();
+        assert_ne!(cart_tag, tag);
         let cart = h.iter().find(|(k, v)| k == "set-cookie" && v.contains("quillo_session=")).map(|(_, v)| v.split(';').next().unwrap().to_string()).unwrap();
-        assert_ne!(cart, ana, "the session cookie changed");
-        assert_eq!(marks_of(port, "GET", "/mine", Some(&format!("{}; quillo_tag={}", cart, tag))).2, Some(tag.clone()));
+        assert_eq!(marks_of(port, "GET", "/mine", Some(&format!("{}; quillo_tag={}", cart, cart_tag))).2, Some(cart_tag.clone()));
         // Signed in again a moment later in the same browser, as the same person: the same name.
         let (_, h, _) = fetch(port, "GET", "/in/ana", &[("cookie", &ana)]);
         assert_eq!(header(&h, "x-quillo-session"), Some(tag.as_str()));
@@ -2348,9 +2351,10 @@ const GATE_SCRIPT: &str = r#"(async () => {@KIT@
   out.dropped = (await dropped()).map((t) => t === ana ? "ana" : t);
   await stage(2);
   out.up = await up("pong");
-  // A late answer of a session dropped is not kept again (the server still takes ana's cookie).
+  // The server still takes ana's cookie, and sets her `quillo_tag` again (the page's register
+  // script then tells the worker she is back: which comes first is the browser's, so what it
+  // keeps here is not looked at; b2_review2_a_late_answer_of_a_dropped_session_is_not_kept).
   out.late = (await look("/mine")).h1;
-  out.not_again = await kept();
   // Another person's tag: the offline page.
   await look("/in/bob");
   const bob = tagNow();
@@ -2360,7 +2364,7 @@ const GATE_SCRIPT: &str = r#"(async () => {@KIT@
   document.cookie = "quillo_tag=someone" + secure;
   out.other = await lookUntil("/mine", (d) => d.documentElement.hasAttribute("data-quillo-offline"));
   out.after_other = await kept();
-  out.dropped2 = (await dropped()).map((t) => t === ana ? "ana" : t === bob ? "bob" : t);
+  out.dropped2 = (await dropped()).includes(bob);
   out.refused = refused;
   document.body.dataset.result = JSON.stringify(out);
 })();"#;
@@ -2406,9 +2410,9 @@ fn b2_a_sessions_kept_page_is_shown_only_to_that_session() {
             "bare": { "h1": "Bare ana", "kept": "iso", "offline": false, "title": "", "session": r["mine"]["session"], "hidden": false },
             "same": true,
             "ended": offline, "after_end": public, "dropped": ["ana"],
-            "up": true, "late": "Mine ana", "not_again": public,
+            "up": true, "late": "Mine ana",
             "bob": "Mine bob", "down2": true,
-            "other": offline, "after_other": public, "dropped2": ["ana", "bob"],
+            "other": offline, "after_other": public, "dropped2": true,
             "refused": [],
         }),
         "{}",
@@ -2430,7 +2434,7 @@ const FLAKY_SCRIPT: &str = r#"(async () => {@KIT@
   out.controlled = await controlled();
   const reg = await sw.getRegistration();
   // The caches by version: each one's pages, this worker's version last.
-  const versions = async () => { const out = []; for (const n of await caches.keys()) if (!n.endsWith(":gone")) out.push((await (await caches.open(n)).keys()).map((r) => new URL(r.url).pathname).filter((p) => !p.endsWith("sw-ready")).sort().join(" ")); return out.sort(); };
+  const versions = async () => { const out = []; for (const n of await caches.keys()) if (!n.endsWith(":gone")) out.push((await (await caches.open(n)).keys()).map((r) => new URL(r.url).pathname).filter((p) => !p.endsWith("sw-state")).sort().join(" ")); return out.sort(); };
   out.before = await versions();
   let changes = 0;
   sw.addEventListener("controllerchange", () => changes++);
@@ -2604,8 +2608,8 @@ fn b2_prefetch_works_under_the_worker() {
         return;
     };
     let _turn = chrome_turn();
-    // With the tag, `/menu` is also made once as the worker installs.
-    for (tag, controlled, menu) in [("offline ", true, "Menu 3"), ("", false, "Menu 2")] {
+    // `/menu` counts its loads (and sets a cookie): the worker's install, a prefetch, does not run it.
+    for (tag, controlled, menu) in [("offline ", true, "Menu 2"), ("", false, "Menu 2")] {
         for (link, want) in [("slow", serde_json::json!({ "h1": "Slow", "delivery": "navigational-prefetch", "kept": null, "controlled": controlled })), ("menu", serde_json::json!({ "h1": menu, "delivery": "", "kept": null, "controlled": controlled }))] {
             let d = dir("sw-prefetch", &prefetched(tag));
             let (s, port) = logged(&d, &[]);
@@ -2633,7 +2637,7 @@ const cache = (name) => ({
   async delete(r) { return store.get(name).delete(key(r)); },
   async keys() { return [...store.get(name).keys()].map((url) => ({ url })); },
 });
-const caches = { async open(n) { if (!store.has(n)) store.set(n, new Map()); return cache(n); }, async keys() { return [...store.keys()]; }, async delete(n) { return store.delete(n); } };
+const caches = { async open(n) { if (!store.has(n)) store.set(n, new Map()); return cache(n); }, async has(n) { return store.has(n); }, async keys() { return [...store.keys()]; }, async delete(n) { return store.delete(n); } };
 let clones = 0, next = null;
 const answer = (headers) => { const res = new Response("<html><body>x</body></html>", { status: 200, headers }); const c = res.clone.bind(res); res.clone = () => { clones++; return c(); }; return res; };
 const ctx = { location: new URL("http://h/_quillo/sw.js"), caches, Response, Headers, URL, console, setTimeout, Promise };
@@ -2736,4 +2740,599 @@ mount /blog = "blog.qwe"
         "{}",
         text
     );
+}
+
+// ---- B.2, second review ------------------------------------------------------------------------
+
+/// `script` in Node, with `makeBrowser` from tests/browser/sw-harness.mjs (the reviewer's emulation
+/// of a browser around the served worker: Cache Storage, a cookie jar, opaque redirects, the
+/// network switched off, the gate as sw-gate.js runs it) and `O`, the server's address: what it
+/// prints, as JSON.
+fn harness(port: u16, script: &str) -> serde_json::Value {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser/sw-harness.mjs");
+    let d = support::temp_dir(&format!("f67-harness-{}", script.len()));
+    let text = format!("import {{ makeBrowser }} from {:?};\nconst O = \"http://127.0.0.1:{}\";\n{}", root.display().to_string(), port, script);
+    std::fs::write(d.join("t.mjs"), text).unwrap();
+    let mut c = std::process::Command::new("node");
+    c.arg(d.join("t.mjs"));
+    let o = within(c, 60);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{}: {}", e, String::from_utf8_lossy(&o.stdout)))
+}
+
+/// The second review's program: sessions keyed every way, a person changed every way, `parallel`,
+/// a waiting part, pages that read a cookie, a header, the visitor's address, a route whose GET
+/// writes, a redirect, a page that stops being one, and marks the program writes itself.
+const SECOND: &str = r#"server fn sign_out() {
+    end_session()
+}
+server fn slow_who() = session().user ?? "nobody"
+server fn whoami() -> str = session().user ?? "nobody"
+route GET /in/:who {
+    set_session({ user: who })
+    redirect("/")
+}
+route GET /uid/:who {
+    set_session({ uid: who })
+    redirect("/")
+}
+route GET /name/:who {
+    set_session({ name: who })
+    redirect("/")
+}
+route GET /gh/:t {
+    set_session({ github_token: t })
+    redirect("/")
+}
+route GET /login-start {
+    set_session({ state: "s1", nonce: "n1" }, { max_age: "10m" })
+    redirect("/")
+}
+route GET /soft-out {
+    set_session({ user: null })
+    redirect("/")
+}
+route GET /anon-cart {
+    set_session({ cart: [1] })
+    redirect("/")
+}
+route GET /cart/:n {
+    set_session({ user: session().user, cart: [n] })
+    redirect("/")
+}
+route GET /par-in {
+    let [a, b] = parallel(() => set_session({ user: "zed" }), () => 1)
+    "ok"
+}
+route GET /out {
+    end_session()
+    redirect("https://example.com/")
+}
+component Slow() {
+    state w = defer(slow_who())
+    <p>Slow {w ?? "..."}</p>
+}
+component Lw() {
+    state w = live(whoami)
+    <p>Live {w}</p>
+}
+let hidden = false
+route GET /hide {
+    hidden = true
+    "ok"
+}
+route offline GET / = <html><body><h1>Home</h1></body></html>
+route offline GET /mine = <html><body><h1>Mine {session().user ?? session().uid ?? session().name ?? session().github_token ?? "nobody"}</h1></body></html>
+route offline GET /par {
+    let [u, x] = parallel(() => session().user ?? "nobody", () => 1)
+    <html><body><h1>Par {u}</h1></body></html>
+}
+route offline GET /parc {
+    let [u, x] = parallel(() => cookie("token") ?? "none", () => 1)
+    <html><body><h1>Parc {u}</h1></body></html>
+}
+route offline GET /def = <html><body><h1>Def</h1><Slow/></body></html>
+route offline GET /lw = <html><body><h1>Lw</h1><Lw/></body></html>
+route offline GET /theme = <html><body><h1>Theme {cookie("theme") ?? "light"}</h1></body></html>
+route offline GET /ip = <html><body><h1>Ip {request.ip}</h1></body></html>
+route offline GET /nulled = respond(200, <html><body><h1>Nulled {session().user ?? "x"}</h1></body></html>, { "cache-control": null })
+route offline GET /menu = hidden ? respond(404, <html><body><h1>Gone</h1></body></html>) : <html><body><h1>Menu</h1></body></html>
+route offline GET /read-all {
+    write_file("marked-read.txt", "all notifications marked read by a GET")
+    <html><body><h1>Read all</h1></body></html>
+}
+route offline GET /go = redirect("/")
+route offline GET /forged = respond(200, <html><body><h1>Forged {session().user ?? "nobody"}</h1></body></html>, { "x-quillo-offline": "1", "x-quillo-session": "abc" })
+route GET /plain = <html><body><h1>Plain</h1></body></html>
+route GET /plain-forged = respond(200, <html><body><h1>{session().user ?? "nobody"}</h1></body></html>, { "x-quillo-offline": "1" })
+route GET /ping = "pong"
+"#;
+
+/// A request's answer: its marks for the worker and the `quillo_tag` it sets (or "cleared").
+fn second_marks(port: u16, path: &str, cookie: &str, extra: &[(&str, &str)]) -> (Option<String>, Option<String>, Option<String>) {
+    let mut hs: Vec<(&str, &str)> = vec![];
+    if !cookie.is_empty() {
+        hs.push(("cookie", cookie));
+    }
+    hs.extend_from_slice(extra);
+    let (_, h, _) = fetch(port, "GET", path, &hs);
+    let tag = h.iter().find(|(k, v)| k == "set-cookie" && v.starts_with("quillo_tag=")).map(|(_, v)| {
+        let value = v.split(';').next().unwrap().trim_start_matches("quillo_tag=").to_string();
+        if value.is_empty() { "cleared".to_string() } else { value }
+    });
+    (header(&h, "x-quillo-offline").map(str::to_string), header(&h, "x-quillo-session").map(str::to_string), tag)
+}
+
+/// Follows a sign-in or a change of the session at `path` with `cookie`: the cookie after it, and
+/// the name the answer gives.
+fn session_step(port: u16, path: &str, cookie: &str) -> (String, String) {
+    let hs: Vec<(&str, &str)> = if cookie.is_empty() { vec![] } else { vec![("cookie", cookie)] };
+    let (_, h, _) = fetch(port, "GET", path, &hs);
+    let next = h.iter().find(|(k, v)| k == "set-cookie" && v.contains("quillo_session=")).map(|(_, v)| v.split(';').next().unwrap().to_string()).unwrap_or_else(|| cookie.to_string());
+    (next, header(&h, "x-quillo-session").unwrap_or("").to_string())
+}
+
+// Second review, 1: the session's name is a digest of its hidden id and all it holds, so that a
+// change of person, which keeps the hidden id where either side has no `user`, is another name in
+// each of the review's cases: a sign-in in two steps (as plugins/oidc.qwe does), `{ user: null }`,
+// an anonymous cart and then a sign-in, and sessions keyed `uid`, `name` or `github_token`. Any
+// write to the session is another name too (a cart: the person's kept pages are dropped, and kept
+// again on the next visits); the same session written again as it was keeps it.
+#[test]
+fn b2_review2_the_name_changes_with_anything_in_the_session() {
+    let d = dir("r2-names", SECOND);
+    let (_s, port) = logged(&d, &["--no-check"]);
+    let changed = |first: &str, then: &str| {
+        let (c, a) = session_step(port, first, "");
+        let (_, b) = session_step(port, then, &c);
+        assert!(a.len() == 16 && b.len() == 16 && a != b, "{} then {}: {} {}", first, then, a, b);
+    };
+    changed("/login-start", "/in/bob");
+    changed("/in/ana", "/soft-out");
+    changed("/soft-out", "/in/bob");
+    changed("/anon-cart", "/in/ana");
+    changed("/uid/alice", "/uid/bob");
+    changed("/name/alice", "/name/bob");
+    changed("/gh/t1", "/gh/t2");
+    changed("/in/ana", "/cart/1");
+    let (c, a) = session_step(port, "/in/ana", "");
+    assert_eq!(session_step(port, "/in/ana", &c).1, a, "the same session written again");
+    // As set, as read: the page names it as the sign-in did.
+    assert_eq!(second_marks(port, "/mine", &c, &[]).1, Some(a));
+}
+
+const PERSON_SCRIPT: &str = r#"
+const out = {};
+for (const [name, first, change] of [["soft sign-out", "/in/ana", ["/soft-out", "/in/bob"]], ["two steps", "/in/ana", ["/login-start", "/in/bob"]], ["uid", "/uid/alice", ["/uid/bob"]], ["anonymous cart", "/anon-cart", ["/in/bob"]]]) {
+  const b = await makeBrowser(O);
+  await b.install();
+  await b.go(first);
+  const kept = (await b.go("/mine")).h1;
+  for (const p of change) await b.go(p);
+  b.online = false;
+  out[name] = { kept, offline: await b.go("/mine") };
+}
+console.log(JSON.stringify(out));
+"#;
+
+// Second review, 1, as the worker sees it: a page kept for one person is never shown to the next,
+// whatever changed the person.
+#[test]
+fn b2_review2_a_kept_page_never_reaches_the_next_person() {
+    let d = dir("r2-person", SECOND);
+    let (_s, port) = logged(&d, &["--no-check"]);
+    let r = harness(port, PERSON_SCRIPT);
+    let gone = serde_json::json!({ "status": 503, "h1": "You are offline", "kept": false, "session": null, "offlinePage": true });
+    assert_eq!(
+        r,
+        serde_json::json!({
+            "soft sign-out": { "kept": "Mine ana", "offline": gone }, "two steps": { "kept": "Mine ana", "offline": gone },
+            "uid": { "kept": "Mine alice", "offline": gone }, "anonymous cart": { "kept": "Mine nobody", "offline": gone },
+        })
+    );
+}
+
+// Second review, 2: what a `parallel` function read of the session, and a session it set, come
+// back to the page: kept for that session, named as the cookie names it. A function that read a
+// cookie: not kept. A waiting part (`defer`) is made after the page's headers, or for a prefetch
+// after the request (where it sees no session at all): what it reads is not known, so the page is
+// not kept either way, and says no name, nor takes Ana's cookie away. A `live` value is made with
+// the page, which then is the session's.
+#[test]
+fn b2_review2_parallel_waiting_parts_and_live() {
+    let d = dir("r2-parallel", SECOND);
+    let (_s, port) = logged(&d, &["--no-check"]);
+    let (ana, tag) = session_step(port, "/in/ana", "");
+    let mine = format!("{}; quillo_tag={}", ana, tag);
+    let private = Some("private".to_string());
+    assert_eq!(second_marks(port, "/par", &mine, &[]), (private.clone(), Some(tag.clone()), None));
+    assert_eq!(second_marks(port, "/parc", &mine, &[]).0, None);
+    assert_eq!(second_marks(port, "/def", &mine, &[]).0, None);
+    assert_eq!(second_marks(port, "/def", &mine, &[("x-quillo-prefetch", "1")]), (None, None, None));
+    assert_eq!(second_marks(port, "/lw", &mine, &[]), (private, Some(tag.clone()), None));
+    // A session set in `parallel`: the answer names it as its cookie does.
+    let (_, h, _) = fetch(port, "GET", "/par-in", &[("cookie", &mine)]);
+    let set = h.iter().find(|(k, v)| k == "set-cookie" && v.starts_with("quillo_tag=")).map(|(_, v)| v.split(';').next().unwrap().trim_start_matches("quillo_tag=").to_string());
+    assert!(set.is_some() && header(&h, "x-quillo-session") == set.as_deref() && set.as_deref() != Some(tag.as_str()), "{:?}", h);
+}
+
+const OUT_SCRIPT: &str = r#"
+const b = await makeBrowser(O);
+await b.install();
+await b.go("/in/ana");
+await b.go("/mine");
+const before = Object.keys(await b.dump()).filter((k) => /:V:/.test(k) && !k.endsWith(":-"));
+// Signed out by a redirect off the site: the worker sees nothing of it.
+const out = await b.go("/out");
+const still = Object.keys(await b.dump()).filter((k) => /:V:/.test(k) && !k.endsWith(":-"));
+// The next page of the site, any page, says no one is signed in.
+await b.go("/plain");
+const after = Object.keys(await b.dump()).filter((k) => /:V:/.test(k) && !k.endsWith(":-"));
+console.log(JSON.stringify({ before: before.length, out: out.status, still: still.length, after: after.length }));
+"#;
+
+// Second review, 4: a page whose request came with no session cookie at all says no one is signed
+// in (`x-quillo-session: -`), which any cache may give anyone; the worker then drops every session's
+// kept pages. A sign-out the worker could not see (a redirect off the site) is caught at the next
+// page of the site. A page whose request had a session and that read none says nothing.
+#[test]
+fn b2_review2_a_page_of_no_one_drops_the_sessions_kept_pages() {
+    let d = dir("r2-out", SECOND);
+    let (_s, port) = logged(&d, &["--no-check"]);
+    assert_eq!(second_marks(port, "/plain", "", &[]), (None, Some("-".into()), None));
+    assert_eq!(second_marks(port, "/", "", &[]), (Some("1".into()), Some("-".into()), None));
+    let (ana, tag) = session_step(port, "/in/ana", "");
+    assert_eq!(second_marks(port, "/plain", &format!("{}; quillo_tag={}", ana, tag), &[]), (None, None, None));
+    assert_eq!(second_marks(port, "/", &ana, &[]), (Some("1".into()), None, None));
+    assert_eq!(harness(port, OUT_SCRIPT), serde_json::json!({ "before": 1, "out": "not handled", "still": 1, "after": 0 }));
+}
+
+const OTHER_READS_SCRIPT: &str = r#"
+const b = await makeBrowser(O);
+await b.install();
+await b.go("/in/ana");
+await b.go("/mine");
+const tag = b.jar.get("quillo_tag");
+for (const p of ["/theme", "/ip", "/nulled", "/parc", "/plain"]) await b.go(p);
+const same = b.jar.get("quillo_tag") === tag;
+b.online = false;
+console.log(JSON.stringify({ same, offline: await b.go("/mine"), gated: b.gated || 0 }));
+"#;
+
+// Second review, 5: `quillo_tag` is set or taken away from what is known of the session alone: a
+// page that read a cookie, a header, the visitor's address or nothing at all, or whose
+// `cache-control` was taken away, leaves Ana's cookie and her kept pages as they are. It is taken
+// away where the request has no valid session; set again where it has one that `session()` read.
+#[test]
+fn b2_review2_pages_that_read_other_things_leave_the_name_alone() {
+    let d = dir("r2-other", SECOND);
+    let (_s, port) = logged(&d, &["--no-check"]);
+    let (ana, tag) = session_step(port, "/in/ana", "");
+    let mine = format!("{}; quillo_tag={}", ana, tag);
+    for p in ["/theme", "/ip", "/nulled", "/parc", "/plain", "/"] {
+        assert_eq!(second_marks(port, p, &mine, &[]).2, None, "{}", p);
+    }
+    assert_eq!(second_marks(port, "/mine", &ana, &[]).2, Some(tag.clone()), "set again where `session()` read it");
+    assert_eq!(second_marks(port, "/plain", &format!("quillo_tag={}", tag), &[]).2, Some("cleared".into()), "no session cookie: taken away");
+    assert_eq!(second_marks(port, "/mine", &format!("quillo_session=forged; __Host-quillo_session=forged.x; quillo_tag={}", tag), &[]).2, Some("cleared".into()), "no valid session");
+    let gone = harness(port, OTHER_READS_SCRIPT);
+    assert_eq!(gone, serde_json::json!({ "same": true, "offline": { "status": 200, "h1": "Mine ana", "kept": true, "session": gone["offline"]["session"], "offlinePage": false }, "gated": 0 }));
+    // And a locale rule, which reads the request.
+    let d = dir("r2-locale", "translations({ en: { hi: \"Hi\" }, fr: { hi: \"Salut\" } })\nlocale_from((request) => request.query.lang ?? \"en\")\nroute GET /in/:who {\n    set_session({ user: who })\n    redirect(\"/\")\n}\nroute offline GET / = <html><body><h1>{t(\"hi\")}</h1></body></html>\nroute offline GET /mine = <html><body><h1>{session().user}</h1></body></html>\n");
+    let (_s2, port) = logged(&d, &[]);
+    let (ana, tag) = session_step(port, "/in/ana", "");
+    assert_eq!(second_marks(port, "/?lang=fr", &format!("{}; quillo_tag={}", ana, tag), &[]).2, None);
+    assert_eq!(harness(port, "const b = await makeBrowser(O); await b.install(); await b.go(\"/in/ana\"); await b.go(\"/mine\"); const t = b.jar.get(\"quillo_tag\"); await b.go(\"/?lang=fr\"); b.online = false; console.log(JSON.stringify({ same: b.jar.get(\"quillo_tag\") === t, offline: (await b.go(\"/mine\")).h1 }));"), serde_json::json!({ "same": true, "offline": "ana" }));
+}
+
+/// A version whose install keeps what it can: a GET that writes, redirects here and off the site,
+/// and a page that fails (503) for good.
+const PRECACHED: &str = "let down = true\nroute GET /fix {\n    down = false\n    \"ok\"\n}\nroute offline GET / = <html><body><h1>Two</h1></body></html>\nroute offline GET /read-all {\n    write_file(\"marked-read.txt\", \"read by a GET\")\n    <html><body><h1>Read all</h1></body></html>\n}\nroute offline GET /here = redirect(\"/\")\nroute offline GET /away = redirect(\"https://example.com/\")\nroute offline GET /flaky = down ? respond(503, \"not now\") : <html><body><h1>Flaky</h1></body></html>\nroute GET /ping = \"pong\"\n";
+
+const TRIES_SCRIPT: &str = r#"
+const b = await makeBrowser(O);
+// The caches by name (both versions' are "quillo::V" in `dump`).
+const names = () => [...b.store.keys()].filter((k) => !k.endsWith(":gone"));
+await b.install();
+const one = names();
+await fetch(O + "/stage-done");
+// The new version, installed: its pages tried, the old version's kept until they are.
+for (let i = 0; i < 200; i++) { const r = await fetch(O + "/ping"); if ((await r.text()) === "pong") break; await new Promise((r) => setTimeout(r, 50)); }
+const T0 = Date.now();
+b.time = T0;
+await b.update();
+const out = { v1: one.length, after_install: names().length, old_kept: names().includes(one[0]) };
+// Tried again on navigations: not before 10 s, then 30, 90 and 270 s after each; five in all.
+const at = [5, 11, 20, 42, 133, 404, 2000];
+out.versions = [];
+for (const s of at) {
+  b.time = T0 + s * 1000;
+  await b.go("/");
+  out.versions.push(names().length);
+}
+out.old_gone = !names().includes(one[0]);
+out.kept = [...b.store.get(names()[0]).keys()].map((u) => new URL(u).pathname).filter((p) => !p.startsWith("/_quillo/"));
+console.log(JSON.stringify(out));
+"#;
+
+// Second review, 6 and 7: the worker's install asks for its pages as a prefetch, which Quillo
+// answers changing nothing: a GET that would write is refused (its 503 says so), not run, also
+// under --no-prefetch; a redirect, here or off the site, and a refusal are done with for the
+// version, never asked again. A page that does not come (a 503 of a proxy's or the program's) is
+// asked again on navigations, 10 s, 30, 90 and 270 s after each try, five tries in all; after them
+// the version counts as kept, and the old version's caches go.
+#[test]
+fn b2_review2_the_precache_changes_nothing_and_gives_up_after_five_tries() {
+    for opts in [&[][..], &["--no-prefetch"][..]] {
+        let d = dir("r2-precache", "route offline GET / = <html><body><h1>One</h1></body></html>\nroute offline GET /old = <html><body><h1>Old</h1></body></html>\nlet stage = 0\nroute GET /stage-done {\n    stage = 1\n    \"ok\"\n}\nroute GET /stage = stage\nroute GET /ping = \"pong 1\"\n");
+        let (s, port) = logged(&d, opts);
+        let script = TRIES_SCRIPT.to_string();
+        let page = std::thread::spawn(move || harness(port, &script));
+        let end = Instant::now() + Duration::from_secs(30);
+        while support::send(port, "GET", "/stage", &[], "").body != "1" {
+            assert!(Instant::now() < end && !page.is_finished(), "the harness did not reach its stage");
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        drop(s);
+        std::fs::write(d.join("main.qwe"), PRECACHED).unwrap();
+        let s = logged_at(&d, port, opts);
+        let r = page.join().unwrap();
+        let log = std::fs::read_to_string(&s.1).unwrap_or_default();
+        assert_eq!(r, serde_json::json!({ "v1": 1, "after_install": 2, "old_kept": true, "versions": [2, 2, 2, 2, 2, 1, 1], "old_gone": true, "kept": ["/"] }), "{:?}: {}", opts, log);
+        assert!(!d.join("marked-read.txt").exists(), "{:?}: the GET wrote", opts);
+        let count = |p: &str| log.lines().filter(|l| l.starts_with(&format!("GET {} ", p))).count();
+        assert_eq!((count("/read-all"), count("/here"), count("/away"), count("/flaky")), (1, 1, 1, 5), "{:?}: {}", opts, log);
+        assert!(log.contains("GET /read-all -> 503"), "{}", log);
+    }
+}
+
+const FORGET_SCRIPT: &str = r#"
+const b = await makeBrowser(O);
+await b.install();
+await b.go("/in/ana");
+const forged = await b.go("/forged");
+await b.go("/menu");
+const before = (await b.dump())["quillo::V"].includes("/menu");
+await fetch(O + "/hide");
+const now = await b.go("/menu");
+const after = (await b.dump())["quillo::V"].includes("/menu");
+b.online = false;
+console.log(JSON.stringify({ forged: forged.h1, before, now: now.h1, after, offline: (await b.go("/menu")).offlinePage, forged_offline: (await b.go("/forged")).session !== null }));
+"#;
+
+// Second review, from the suspicions: the marks a program's own answer carries are taken off, so
+// that only Quillo says what its worker keeps (a page of Ana's marked `1` would have been kept for
+// everyone): an offline route's page is marked as what it read, and a page of no offline route
+// not at all. An address answered without the mark (a 404 now) loses the copy kept of it.
+#[test]
+fn b2_review2_the_programs_own_marks_are_not_taken_and_an_unmarked_answer_drops_the_copy() {
+    let d = dir("r2-forget", SECOND);
+    let (_s, port) = logged(&d, &["--no-check"]);
+    let (ana, tag) = session_step(port, "/in/ana", "");
+    let mine = format!("{}; quillo_tag={}", ana, tag);
+    assert_eq!(second_marks(port, "/forged", &mine, &[]), (Some("private".into()), Some(tag.clone()), None));
+    assert_eq!(second_marks(port, "/plain-forged", &mine, &[]), (None, Some(tag.clone()), None));
+    assert_eq!(second_marks(port, "/plain-forged", "", &[]), (None, Some("-".into()), None));
+    assert_eq!(harness(port, FORGET_SCRIPT), serde_json::json!({ "forged": "Forged ana", "before": true, "now": "Gone", "after": false, "offline": true, "forged_offline": true }));
+}
+
+/// A session's pages in every shape the review found: a conditional comment before the real
+/// `<html>`, a fragment, a page with no head, `<html>` in a script's string before the real one,
+/// and a comment before the doctype.
+const SHAPES: &str = r#"route GET /in/:who {
+    set_session({ user: who })
+    redirect("/")
+}
+route offline GET / = <html><body><h1>Home</h1></body></html>
+route offline GET /cond = respond(200, "<!doctype html><!--[if IE 9]><html class=\"ie9\"><![endif]--><!--[if gt IE 9]><!--><html lang=\"fr\" class=\"modern\"><!--<![endif]--><head><title>Cond</title></head><body><h1>Cond " + (session().user ?? "nobody") + "</h1></body></html>", { "content-type": "text/html; charset=utf-8" })
+route offline GET /frag = <div><h1>Frag {session().user ?? "nobody"}</h1></div>
+route offline GET /nohead = <html lang="de"><body><h1>Nohead {session().user ?? "nobody"}</h1></body></html>
+route offline GET /str = respond(200, "<!doctype html><script>window.s = \"<html data-x=1><head>\"</script><html lang=\"es\"><head><title>Str</title></head><body><h1>Str " + (session().user ?? "nobody") + "</h1></body></html>", { "content-type": "text/html; charset=utf-8" })
+route offline GET /note = respond(200, "<!-- a note --><!doctype html><html lang=\"it\"><body><h1>Note " + (session().user ?? "nobody") + "</h1></body></html>", { "content-type": "text/html; charset=utf-8" })
+route GET /ping = "pong"
+"#;
+
+const SHAPES_SCRIPT: &str = r#"(async () => {@KIT@
+  const out = {};
+  out.controlled = await controlled();
+  await look("/in/ana");
+  const paths = ["/cond", "/frag", "/nohead", "/str", "/note"];
+  for (const p of paths) await look(p);
+  await stage(1);
+  out.down = await down();
+  const parse = async (p, gated) => {
+    const f = await frame(p);
+    for (let i = 0; i < 200 && (f.contentDocument.readyState !== "complete" || (gated && f.contentDocument.documentElement.hasAttribute("hidden"))); i++) await tick(25);
+    const d = f.contentDocument, h = d.documentElement, first = d.head && d.head.firstElementChild;
+    return {
+      h1: (d.querySelector("h1") || {}).textContent || null, lang: h.getAttribute("lang"), cls: h.getAttribute("class"), x: h.getAttribute("data-x"),
+      kept: /^\d{4}-/.test(h.getAttribute("data-kept") || ""), session: h.hasAttribute("data-kept-session"), hidden: h.hasAttribute("hidden"),
+      gate_first: !!first && first.tagName === "SCRIPT" && first.textContent.includes("data-kept-session"), s: f.contentWindow.s === undefined ? null : f.contentWindow.s,
+      mode: d.compatMode, title: d.title,
+    };
+  };
+  for (const p of paths) out[p] = await parse(p, true);
+  out["/"] = await parse("/", false);
+  document.body.dataset.result = JSON.stringify(out);
+})();"#;
+
+// Second review, 3: the worker puts its marks in an `<html>` start tag of its own before all of
+// the page but its doctype and comments, and for a session's page a head with the gate, and
+// changes nothing later; the browser merges the page's own `<html>` attributes into it and leaves
+// out its second head. In Chrome, with the server stopped, each shape is parsed so: the gate first
+// in the head, run before the page, the page's own `lang` and `class` on the root (the conditional
+// comment's not), a script's string as written, the doctype's standards mode kept.
+#[test]
+fn b2_review2_the_marks_go_before_the_page_which_the_browser_merges() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let d = dir("r2-shapes", SHAPES);
+    let stages = support::serve(&dir("r2-stages1", STAGES).join("main.qwe"), &[]);
+    let (s, port) = logged(&d, &["--no-check"]);
+    let (c, url, sp) = (chrome.clone(), format!("http://127.0.0.1:{}/", port), stages.port);
+    let page = std::thread::spawn(move || in_chrome_staged(&c, &url, &SHAPES_SCRIPT.replace("@KIT@", SW_KIT), sp));
+    stage_reached(stages.port, 1, &page);
+    drop(s);
+    let r = page.join().unwrap();
+    let shown = |h1: &str, lang: Option<&str>, cls: Option<&str>, title: &str, mode: &str| {
+        serde_json::json!({ "h1": h1, "lang": lang, "cls": cls, "x": null, "kept": true, "session": true, "hidden": false, "gate_first": true, "s": null, "mode": mode, "title": title })
+    };
+    let mut str_page = shown("Str ana", Some("es"), None, "Str", "CSS1Compat");
+    str_page["s"] = serde_json::json!("<html data-x=1><head>");
+    assert_eq!(
+        r,
+        serde_json::json!({
+            "controlled": true, "down": true,
+            "/cond": shown("Cond ana", Some("fr"), Some("modern"), "Cond", "CSS1Compat"),
+            "/frag": shown("Frag ana", None, None, "", r["/frag"]["mode"].as_str().unwrap_or("")),
+            "/nohead": shown("Nohead ana", Some("de"), None, "", "CSS1Compat"),
+            "/str": str_page,
+            "/note": shown("Note ana", Some("it"), None, "", "CSS1Compat"),
+            "/": { "h1": "Home", "lang": null, "cls": null, "x": null, "kept": true, "session": false, "hidden": false, "gate_first": false, "s": null, "mode": "CSS1Compat", "title": "" },
+        })
+    );
+}
+
+/// A session's page and a page of no one's, neither with a component (no runtime on them), and a
+/// sign-out that leaves the site.
+fn told(stages: u16) -> String {
+    format!("route GET /in/:who {{\n    set_session({{ user: who }})\n    redirect(\"/\")\n}}\nroute GET /out {{\n    end_session()\n    redirect(\"http://127.0.0.1:{}/stage\")\n}}\nroute offline GET / = <html><body><h1>Home</h1></body></html>\nroute offline GET /mine = <html><body><h1>Mine {{session().user ?? \"nobody\"}}</h1></body></html>\nroute GET /ping = \"pong\"\n", stages)
+}
+
+const TOLD_SCRIPT: &str = r#"(async () => {@KIT@
+  const out = {};
+  out.controlled = await controlled();
+  await look("/in/ana");
+  out.mine = (await look("/mine")).h1;
+  out.signed = await kept();
+  // Signed out by a redirect off the site, which the worker does not see.
+  await frame("/out");
+  out.cookie = tagNow();
+  await stage(1);
+  out.down = await down();
+  out.still = await kept();
+  // Offline, a page of no one's, which has no runtime: its register script tells the worker.
+  out.home = (await look("/")).h1;
+  for (let i = 0; i < 100 && Object.keys(await kept()).length > 1; i++) await tick(25);
+  out.after = await kept();
+  document.body.dataset.result = JSON.stringify(out);
+})();"#;
+
+// Second review, 4: an offline route's page tells Quillo's worker which session the browser holds
+// (its register script, as the runtime does on pages with components): a sign-out the worker did
+// not see (a redirect off the site), the server then stopped, drops that session's kept pages at
+// the next page opened, one with no component, kept, from the cache.
+#[test]
+fn b2_review2_a_page_without_components_tells_the_worker_the_session() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let stages = support::serve(&dir("r2-stages2", STAGES).join("main.qwe"), &[]);
+    let d = dir("r2-told", &told(stages.port));
+    let (s, port) = logged(&d, &[]);
+    let (c, url, sp) = (chrome.clone(), format!("http://127.0.0.1:{}/", port), stages.port);
+    let page = std::thread::spawn(move || in_chrome_staged(&c, &url, &TOLD_SCRIPT.replace("@KIT@", SW_KIT), sp));
+    stage_reached(stages.port, 1, &page);
+    drop(s);
+    let public = serde_json::json!({ "quillo::V": ["/"] });
+    assert_eq!(
+        page.join().unwrap(),
+        serde_json::json!({ "controlled": true, "mine": "Mine ana", "signed": { "quillo::V": ["/"], "quillo::V:S": ["/mine"] }, "cookie": "-", "down": true, "still": { "quillo::V": ["/"], "quillo::V:S": ["/mine"] }, "home": "Home", "after": public })
+    );
+}
+
+/// A program of no offline route, whose own service worker writes down the messages it gets; a page
+/// with a component (the runtime on it).
+const OWN_WORKER: &str = r#"let OWN = "self.addEventListener('install', () => self.skipWaiting()); self.addEventListener('activate', (e) => e.waitUntil(clients.claim())); self.addEventListener('message', (e) => e.waitUntil(caches.open('got').then((c) => c.put('/m/' + Date.now() + Math.random(), new Response(JSON.stringify(e.data))))));"
+route GET /own.js = respond(200, OWN, { "content-type": "text/javascript" })
+component C() {
+    state n = 0
+    <button id="b" onclick={() => { n += 1 }}>{n}</button>
+}
+route GET / = <html><body><h1>Home</h1><script>navigator.serviceWorker.register("/own.js")</script></body></html>
+route GET /c = <html><body><C/></body></html>
+"#;
+
+const OWN_SCRIPT: &str = r#"(async () => {
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms)), sw = navigator.serviceWorker;
+  await sw.ready;
+  for (let i = 0; i < 300 && !sw.controller; i++) await tick(20);
+  const got = async () => { const c = await caches.open("got"); return Promise.all((await c.keys()).map(async (k) => (await c.match(k)).json())); };
+  // A page with the runtime, controlled by the program's own worker.
+  const f = document.createElement("iframe");
+  f.src = "/c";
+  document.body.appendChild(f);
+  await new Promise((r) => (f.onload = r));
+  for (let i = 0; i < 200 && !f.contentWindow[Symbol.for("quillo")]; i++) await tick(25);
+  await tick(500);
+  const before = await got();
+  sw.controller.postMessage({ probe: 1 });
+  for (let i = 0; i < 100 && (await got()).length === before.length; i++) await tick(25);
+  document.body.dataset.result = JSON.stringify({ controlled: !!f.contentWindow.navigator.serviceWorker.controller, before, after: await got() });
+})();"#;
+
+// Second review, from the suspicions: the runtime tells the session to Quillo's worker alone; a
+// worker of the program's own controlling the page gets nothing from it (a message the page sends
+// it does arrive).
+#[test]
+fn b2_review2_the_runtime_tells_quillos_worker_alone() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let d = dir("r2-own", OWN_WORKER);
+    let (_s, port) = logged(&d, &[]);
+    let r = in_chrome_staged(&chrome, &format!("http://127.0.0.1:{}/", port), OWN_SCRIPT, port);
+    assert_eq!(r, serde_json::json!({ "controlled": true, "before": [], "after": [{ "probe": 1 }] }));
+}
+
+const LATE_SCRIPT: &str = r#"
+const b = await makeBrowser(O);
+await b.install();
+await b.go("/in/ana");
+await b.go("/mine");
+const mine = async () => Object.keys(await b.dump()).filter((k) => /:V:/.test(k) && !k.endsWith(":-")).length;
+const before = await mine();
+// Signed out elsewhere, as a page tells it: ana's pages go.
+await b.message({ quillo: "session", who: "-" });
+const after = await mine();
+// An answer of her session that comes later (the server still takes her cookie): not kept again.
+const late = (await b.go("/mine")).h1;
+console.log(JSON.stringify({ before, after, late, not_again: await mine() }));
+"#;
+
+// Second review (the race of the first review's finding 4): an answer that carries the name of a
+// session the worker dropped is not kept again, nor taken for the session the browser holds.
+#[test]
+fn b2_review2_a_late_answer_of_a_dropped_session_is_not_kept() {
+    let d = dir("r2-late", SECOND);
+    let (_s, port) = logged(&d, &["--no-check"]);
+    assert_eq!(harness(port, LATE_SCRIPT), serde_json::json!({ "before": 1, "after": 0, "late": "Mine ana", "not_again": 0 }));
+}
+
+const REFUSED_SCRIPT: &str = r#"
+const b = await makeBrowser(O);
+await b.install();
+await b.go("/menu");
+const kept = () => b.dump().then((d) => d["quillo::V"].includes("/menu"));
+const before = await kept();
+// A prefetch of it (the browser's speculation rules), which Quillo refuses: it sets a cookie.
+const pre = await b.go("/menu", "GET", undefined, { "sec-purpose": "prefetch" });
+console.log(JSON.stringify({ before, prefetch: pre.status, after: await kept() }));
+"#;
+
+// Second review, from the answer to "an unmarked answer drops the copy": a prefetch through the
+// worker that Quillo refuses (its 503: the page would set a cookie) says nothing of the page, and
+// leaves its kept copy.
+#[test]
+fn b2_review2_a_refused_prefetch_leaves_the_kept_copy() {
+    let d = dir("r2-refused", "let n = 0\nroute offline GET / = <html><body><h1>Home</h1></body></html>\nroute offline GET /menu {\n    set_cookie(\"seen\", \"1\")\n    <html><body><h1>Menu</h1></body></html>\n}\n");
+    let (_s, port) = logged(&d, &[]);
+    assert_eq!(harness(port, REFUSED_SCRIPT), serde_json::json!({ "before": true, "prefetch": 503, "after": true }));
 }

@@ -5712,7 +5712,9 @@ async function rpcRaw(name, args, live, idem) {
 // (a redirect, another tab, the cookie's end) is caught so (FEEDBACK67.md, B.2, review; branch pwa).
 function swSession() {
   const c = typeof navigator !== "undefined" && navigator.serviceWorker && navigator.serviceWorker.controller;
-  if (!c) return;
+  // Quillo's worker alone: one of the program's own is told nothing (FEEDBACK67.md, B.2, second
+  // review; branch pwa).
+  if (!c || new URL(c.scriptURL).pathname !== BASE + "/_quillo/sw.js") return;
   const m = /(?:^|;\s*)quillo_tag=([^;]*)/.exec(document.cookie);
   c.postMessage({ quillo: "session", who: m ? m[1] : "-" });
 }

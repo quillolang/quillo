@@ -643,6 +643,11 @@ struct Back {
     session: Option<Value>,
     visitor_read: bool,
     visitor_other: bool,
+    /// What it read of the session, named for Quillo's service worker, and the hidden id of one it
+    /// set: a page whose `parallel` read the session went to the worker's shared cache as no one's
+    /// (FEEDBACK67.md, B.2, second review; branch pwa).
+    offline_seen: Option<(Option<String>, Option<u64>)>,
+    session_id: Option<Option<Arc<str>>>,
     locale_read: bool,
     read_request: bool,
     acted: bool,
@@ -2440,6 +2445,8 @@ impl Interp {
             session: self.session.take(),
             visitor_read: self.visitor_read,
             visitor_other: self.visitor_other,
+            offline_seen: self.offline_seen.take(),
+            session_id: self.session_id.clone(),
             locale_read: self.locale_read,
             read_request: self.read_request,
             acted: self.acted,
@@ -2455,6 +2462,9 @@ impl Interp {
         }
         self.visitor_read |= b.visitor_read;
         self.visitor_other |= b.visitor_other;
+        if self.offline_seen.is_none() {
+            self.offline_seen = b.offline_seen;
+        }
         self.locale_read |= b.locale_read;
         self.read_request |= b.read_request;
         self.acted |= b.acted;
@@ -2465,7 +2475,7 @@ impl Interp {
             self.wrote_req = b.wrote_req;
         }
         if !b.cookies.is_empty() || self.session.is_none() {
-            crate::session::take_back(self, b.cookies, b.session);
+            crate::session::take_back(self, b.cookies, b.session, b.session_id);
         }
     }
 

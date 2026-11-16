@@ -460,7 +460,10 @@ impl Interp {
         }
         // A page asked for ahead of a click: made without changing anything; and the old version's
         // render of a page under --watch, a print to compare (FEEDBACK54.md, found in review).
-        let prefetch = (is_prefetch(req) || self.read_only).then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        // Quillo's worker keeping a program's offline pages as it installs asks for them so, under
+        // --no-prefetch too: a GET that would write is refused, not run (FEEDBACK67.md, B.2, second
+        // review; branch pwa).
+        let prefetch = (is_prefetch(req) || self.read_only || (self.site.offline.is_some() && precache(req))).then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         self.prefetching = prefetch.clone();
         let changed = (req.method != "GET" && req.method != "HEAD").then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         self.changed = changed.clone();
@@ -534,7 +537,13 @@ impl Interp {
                 // Not a 2xx, which Chrome's speculation rules would keep and
                 // answer the click with (a 204 leaves the browser where it
                 // was): with a 503 it drops the prefetch and loads the page.
-                return HttpResponse { status: 503, headers: vec![("cache-control".into(), "no-store".into())], body: Vec::new() };
+                let mut headers = vec![("cache-control".into(), "no-store".into())];
+                // Said so to Quillo's worker, which keeps such a page on no try, where a proxy's 503
+                // is tried again (FEEDBACK67.md, B.2, second review; branch pwa).
+                if self.site.offline.is_some() {
+                    headers.push(("x-quillo-prefetch".into(), "refused".into()));
+                }
+                return HttpResponse { status: 503, headers, body: Vec::new() };
             }
             // Only this page's own fetch needs the HTTP cache: Chrome keeps a speculation
             // rule's answer itself, and would keep it there too. `Vary`, so that it does not
@@ -574,7 +583,8 @@ impl Interp {
         // (FEEDBACK67.md, B.2 and its review; branch pwa).
         let marked = if self.site.offline.is_some() {
             let offline = std::mem::take(&mut self.offline_page);
-            crate::pwa::mark(self, req, offline, session, &mut resp)
+            let parts = !self.deferred.is_empty() || !early_parts.is_empty();
+            crate::pwa::mark(self, req, offline, session, parts, &mut resp)
         } else {
             crate::pwa::Marked::default()
         };
@@ -3133,6 +3143,14 @@ fn used_script(base: &str) -> String {
 
 /// Whether a request is a prefetch: this page's (`PREFETCH_JS`) or the
 /// browser's own (speculation rules, `<link rel=prefetch>`).
+/// A page Quillo's worker keeps as it installs (`x-quillo-prefetch: 1` from its fetch, as
+/// `PREFETCH_JS`'s): a prefetch, whatever `--no-prefetch` says (FEEDBACK67.md, B.2, second review;
+/// branch pwa).
+#[cold]
+fn precache(req: &HttpRequest) -> bool {
+    req.method == "GET" && req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-quillo-prefetch") && v == "1")
+}
+
 pub fn is_prefetch(req: &HttpRequest) -> bool {
     req.method == "GET"
         && PREFETCH.load(std::sync::atomic::Ordering::Relaxed)
