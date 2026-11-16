@@ -314,27 +314,25 @@ for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; 
 
 ### Test coverage
 
-**Rust: 98.37% of lines** run under the tests (70,283 lines, 1,143 not run), **97.08% of
-regions** (169,170, 4,943 not run).
-**Browser runtime (`src/client/runtime.js`): 99.61% of lines** (6,492 lines, 25 not run).
-Both were measured together on 2026-11-16 on 0.8.5's code (c82feec) on macOS, from 3,745
+**Rust: 98.34% of lines** run under the tests (71,081 lines, 1,183 not run), **97.03% of
+regions** (170,978, 5,074 not run).
+**Browser runtime (`src/client/runtime.js`): 99.89% of lines** (6,530 lines, 7 not run).
+Both were measured together on 2026-11-17 on 0.8.6's code (13395d6) on macOS, from 3,787
 tests with Chrome, PostgreSQL and MariaDB included; none failed (two that failed under the
-load, feedback52_jit's big frame and its range loop, passed run alone). Of the 604 lines of Rust
-added since 0.8.4, 22 did not run in that run: tests written since run a page state's failing
-initializer, a page state called as a function and its field read through a fast path; the
-rest are fallbacks (a block name that collides, a page state's initializer the browser cannot
-run, a stream that cannot be written to). Of runtime.js's 25 lines, the 18 new ones are what a
-reload under `--watch` keeps, which runs just before the page goes and so is lost to the count
-(a test now asks the page that came back to keep), and the page's own HTML put in place for a
-component not taken up and a stylesheet changed (a test does both now); the other 7 are
-defensive guards. The Rust figures are the Lines and Regions columns of `cargo llvm-cov`'s total. A line counts as
+load passed run alone, and the test that closes a desktop window, which a locked screen
+stops, was run again once it was unlocked). Of the 665 lines of Rust added since 0.8.5, 19 did
+not run in that run: tests written since run a set of strings named inside another type, a
+migration's other pragmas and its drops written `if exists` or with a schema, `--metrics`
+under a content policy, the island rule on a page with no head, many different scripts on one
+thread, and a session read two helpers deep; the rest are fallbacks (a foreign key check that
+fails, a statement SQLite cannot prepare). runtime.js's 7 lines are defensive guards. The Rust figures are the Lines and Regions columns of `cargo llvm-cov`'s total. A line counts as
 run when any part of it ran, so `let x = f()?;` is run though `f` never failed; regions
 count each part, which is why they are lower (FEEDBACK49.md). The runtime's is V8's own
 coverage from headless Chrome and every Node a test starts, mapped back to runtime.js's
 lines. What Rust does not run is mostly operating system failures (a thread or a socket
 that cannot be made), other systems' branches (`src/platform.rs`, `src/desktop.rs`),
-`unreachable!` arms and timers; the files with the most are `src/check.rs` (83 lines),
-`src/ws.rs` (77), `src/httpd.rs` (63) and `src/server.rs` (59).
+`unreachable!` arms and timers; the files with the most are `src/check.rs` (87 lines),
+`src/ws.rs` (79), `src/server.rs` (66) and `src/httpd.rs` (64).
 
 Rust must stay at **97.90% of lines or above** (the aim is 99%), and runtime.js at
 **99.50% or above** on every change, and every line a change
