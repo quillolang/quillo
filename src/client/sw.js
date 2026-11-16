@@ -327,6 +327,21 @@ self.addEventListener("push", (e) => {
   e.waitUntil(Promise.all(jobs).catch(() => {}));
 });
 
+// On a navigation, at most once a minute, the worker asks the server whether the subscription this
+// browser holds is still the signed-in person's, as a page with components does as it starts: on
+// pages without them too, so that a device whose person's cookie ended, or that another person
+// signed in on, stops getting the one before's notifications. It asks a little after the
+// navigation, once the cookies its answer sets are the browser's (FEEDBACK67.md, B.3, second review;
+// branch pwa).
+let pushLooked = 0;
+self.addEventListener("fetch", (e) => {
+  if (e.request.mode !== "navigate" || Date.now() - pushLooked < 60000) return;
+  pushLooked = Date.now();
+  e.waitUntil(new Promise((ok) => setTimeout(ok, 2000)).then(() => self.registration.pushManager.getSubscription()).then((s) => s && fetch(BASE + "/_quillo/push", {
+    method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: s.endpoint, check: true }),
+  })).catch(() => {}));
+});
+
 self.addEventListener("notificationclick", (e) => {
   e.notification.close();
   const home = new URL(BASE + "/", location.origin);

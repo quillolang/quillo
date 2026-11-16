@@ -791,11 +791,12 @@ On the server:
   ```
 - **A sign-out unbinds**: `end_session()` unbinds every device subscribed in that session,
   and so does any change of person by `set_session`, to or from no `user` included, so the
-  next person on a shared device gets nothing meant for the one before. A page with
-  components that starts in a browser holding a subscription checks it with the server: one
-  bound to someone else than the session's person (after a cookie that simply ran out, say)
-  is unbound there and then, and `notification.state()` says `"default"`, so the next person
-  turns on their own.
+  next person on a shared device gets nothing meant for the one before. A browser holding a
+  subscription checks it with the server: a page with components as it starts, and Quillo's
+  worker on a page with none, at most once a minute. One bound to someone else than the
+  session's person (after a cookie that simply ran out, say) is unbound there and then, and
+  `notification.state()` says `"default"`, so the next person turns on their own. A ticket
+  stays its person's: after a change of person on its session it is refused.
 - **Limits**: a person has at most 20 devices in a program (and a tenant), the oldest
   replaced by a new one, and a session may turn devices on or off 30 times a minute (past
   that, a `429`). `stop` removes only this visitor's own.

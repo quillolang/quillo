@@ -1749,6 +1749,8 @@ const pushCheck = () => pushSeen || (pushSeen = (async () => {
   const sub = await pushSub();
   if (!sub) return "default";
   const r = await wireFetch(BASE + "/_quillo/push", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: sub.endpoint, check: true }) });
+  // Too many looks from this address in a minute: as the browser holds it, unseen.
+  if (r.status === 429) return "granted";
   return r.ok && (await r.json()).state === "granted" ? "granted" : "default";
 })().catch(() => "default"));
 B.notification = {

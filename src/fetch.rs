@@ -63,22 +63,20 @@ pub fn install(m: &mut Map) {
 }
 
 /// A call's options (see the top of this file).
-/// `notification.send` makes its calls with these too, on the agents kept here (FEEDBACK67.md, B.3
-/// and Q-960; branch pwa).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct Opts {
-    pub(crate) redirects: u32,
-    pub(crate) public_only: bool,
+struct Opts {
+    redirects: u32,
+    public_only: bool,
     /// Seconds to keep a GET's successful answer (0: not kept).
-    pub(crate) cache: u32,
+    cache: u32,
     /// Milliseconds the whole call may take (0: the agent's own limits).
-    pub(crate) timeout_ms: u32,
+    timeout_ms: u32,
     /// The certificates a call trusts and presents (`ca`, `cert`, `key`), by their number in
     /// `TLS` (0: the usual public CAs, and none presented).
-    pub(crate) tls: u32,
+    tls: u32,
 }
 
-pub(crate) const DEFAULT_OPTS: Opts = Opts { redirects: 5, public_only: false, cache: 0, timeout_ms: 0, tls: 0 };
+const DEFAULT_OPTS: Opts = Opts { redirects: 5, public_only: false, cache: 0, timeout_ms: 0, tls: 0 };
 
 /// The options there are; `http.stream`'s map also has its request's.
 const OPTION_NAMES: &[&str] = &["redirects", "public_only", "cache", "timeout", "ca", "cert", "key"];
@@ -150,7 +148,9 @@ pub(crate) fn client_tls(ca: Option<&str>, cert: Option<&str>, key: Option<&str>
 /// `NO_PROXY` names its host (a name, `.domain` or `domain` for it and below, an address, `*`);
 /// the machine itself never goes through one, as Go's default has it (FEEDBACK36.md, Q-442;
 /// branch feedback36-39).
-fn proxy_for(url: &str) -> Option<String> {
+/// `notification.send` goes through the same proxy, and judges the address the same way
+/// (FEEDBACK67.md, B.3, second review; branch pwa).
+pub(crate) fn proxy_for(url: &str) -> Option<String> {
     let var = |names: &[&str]| names.iter().find_map(|n| std::env::var(n).ok().filter(|v| !v.trim().is_empty()));
     let https = url.starts_with("https://");
     let proxy = if https { var(&["HTTPS_PROXY", "https_proxy"]) } else { var(&["HTTP_PROXY", "http_proxy"]) }.or_else(|| var(&["ALL_PROXY", "all_proxy"]))?;
@@ -177,7 +177,7 @@ fn proxy_for(url: &str) -> Option<String> {
 /// The host of `url` as the client reads it (WHATWG), an IPv6 address in `[...]`; empty if it
 /// does not parse. Split by hand, `http://169.254.169.254\x@example.com` was example.com here
 /// and the metadata address to the client (found in review of FEEDBACK51.md, Q-650).
-fn host_of(url: &str) -> String {
+pub(crate) fn host_of(url: &str) -> String {
     match url::Url::parse(url).ok().and_then(|u| u.host().map(|h| h.to_owned())) {
         Some(url::Host::Ipv6(a)) => format!("[{}]", a),
         Some(h) => h.to_string(),
@@ -315,7 +315,7 @@ fn public_v4(a: Ipv4Addr) -> bool {
 }
 
 /// Looks `netloc` up and keeps only public addresses; none is an error.
-fn resolve_public(netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
+pub(crate) fn resolve_public(netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
     let all: Vec<SocketAddr> = netloc.to_socket_addrs()?.collect();
     let public: Vec<SocketAddr> = all.into_iter().filter(|a| public_ip(a.ip())).collect();
     if public.is_empty() {
@@ -343,9 +343,6 @@ fn agent(o: Opts, stream: bool, url: &str) -> Result<ureq::Agent, String> {
         // `public_only`, and a `file:` one panicked (FEEDBACK51.md, Q-649 and Q-650; branch
         // feedback51-fixes).
         .redirects(0)
-        // As many kept to a host as `notification.send` sends to it at once, where ureq keeps one
-        // (FEEDBACK67.md, Q-960 and B.3's review; branch pwa).
-        .max_idle_connections_per_host(8)
         .user_agent(concat!("quillo/", env!("CARGO_PKG_VERSION")));
     let b = if stream { b.timeout_read(Duration::from_secs(300)) } else { b.timeout(Duration::from_secs(60)) };
     // Through a proxy, the proxy looks the name up: `public_only` checks it before the call.
@@ -378,7 +375,7 @@ struct Reply {
 }
 
 /// One call: its answer, the head read, the body not yet.
-pub(crate) fn call(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, String)], body: Option<&(String, Vec<u8>)>) -> Result<ureq::Response, String> {
+fn call(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, String)], body: Option<&(String, Vec<u8>)>) -> Result<ureq::Response, String> {
     if o.public_only && proxy_for(url).is_some() {
         // The host and port the client will ask the proxy for.
         let u = url::Url::parse(url).map_err(|e| format!("{}: {}", url, e))?;

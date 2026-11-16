@@ -62,7 +62,9 @@ async function main() {
       if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
       else if (msg.method && events.push({ method: msg.method, params: msg.params }) > 500) events.shift();
     };
-    const send = (method, params) => new Promise((ok) => { const n = ++id; pending.set(n, ok); ws.send(JSON.stringify({ id: n, method, params })); });
+    // With a session, to a target attached with `flatten` (a service worker's: FEEDBACK67.md, B.3,
+    // second review; branch pwa).
+    const send = (method, params, sessionId) => new Promise((ok) => { const n = ++id; pending.set(n, ok); ws.send(JSON.stringify(sessionId ? { id: n, method, params, sessionId } : { id: n, method, params })); });
     // Errors the runtime reports (quillo's `report`) are collected from the
     // first script on, for the tests' "errors" checks.
     await send("Page.enable");
@@ -126,9 +128,9 @@ async function main() {
         const asked = q.result && q.result.result && q.result.result.value;
         if (asked) {
           const answers = [];
-          for (const [method, params] of JSON.parse(asked)) {
+          for (const [method, params, sessionId] of JSON.parse(asked)) {
             if (method === "@events") { answers.push(events.filter((e) => e.method.startsWith((params && params.prefix) || ""))); continue; }
-            const r = await send(method, params);
+            const r = await send(method, params, sessionId);
             answers.push(r.result || { error: r.error });
           }
           // What they answered, for a page that asks for it with `data-cdp-out`: Chrome's own

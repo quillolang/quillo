@@ -103,7 +103,11 @@ fn user(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return Ok(Value::err(Value::str("notification.user: this request has no session to seal it for, and a ticket of no session could be used by anyone who saw it: set_session first (a cart, a sign-in), then make it")));
     };
     let place = crate::session::place(it);
-    let sealed = crate::session::seal(USER_PURPOSE, &serde_json::json!({ "u": who, "p": place, "o": owner, "e": now() + USER_AGE }).to_string());
+    // And who the session is now (null for no one): its hidden id stays from a person through a
+    // session of no one to another person (Q-887), and Bob, signed in where Alice had her ticket
+    // made, had it (second review).
+    let now_person = person(it);
+    let sealed = crate::session::seal(USER_PURPOSE, &serde_json::json!({ "u": who, "p": place, "o": owner, "w": now_person, "e": now() + USER_AGE }).to_string());
     Ok(Value::str(sealed))
 }
 
@@ -287,7 +291,7 @@ fn indexed(it: &mut Interp, on: Option<usize>, made: bool) {
     ONCE.store(true, std::sync::atomic::Ordering::Relaxed);
     for ix in INDEXES {
         if let Err(e) = sql(it, on, false, vec![Value::str(*ix)]) {
-            eprintln!("quillo: {}: an index could not be made ({}): sends and sign-outs read the whole table", TABLE, e);
+            eprintln!("quillo: {}: an index could not be made ({}): sends and sign-outs read the whole table", TABLE, for_the_log(&e));
         }
     }
 }
@@ -324,7 +328,10 @@ fn subscriptions(it: &mut Interp, who: &str, place: &str) -> Result<Vec<Sub>, St
 
 /// `end_session()`'s part, and a change of person in `set_session`: the subscriptions made in each
 /// of these sessions (by their owners, as `session::current_owner` names them) are unbound here,
-/// so that the next person on the device gets nothing meant for the one before.
+/// so that the next person on the device gets nothing meant for the one before. In a
+/// `db.transaction` on the program's database that rolls back, the rows come back with it, the
+/// cookie still ended: the worker's look at the next navigation, or a page's, unbinds them then, as
+/// the session they name is no one now (second review).
 pub(crate) fn unbind_sessions(it: &mut Interp, owners: &[String]) -> Result<(), String> {
     if owners.is_empty() {
         return Ok(());
@@ -355,17 +362,23 @@ fn refused(status: u16, msg: &str) -> HttpResponse {
 /// builtin's errors, in full under --watch; in full in the log (FEEDBACK67.md, B.3, review; branch
 /// pwa).
 fn failed_here(e: &str) -> HttpResponse {
-    eprintln!("quillo: /_quillo/push: {}", e);
-    refused(500, if crate::value::hiding() { "internal error" } else { e })
+    let said = for_the_log(e);
+    eprintln!("quillo: /_quillo/push: {}", said);
+    refused(500, if crate::value::hiding() { "internal error" } else { &said })
 }
 
-/// What a page does here in a minute, at most, by session: binds and unbinds. The program's own
-/// middleware runs before routes, never here (FEEDBACK67.md, B.3, review; branch pwa).
+/// What a page does here in a minute, at most, by session: binds and unbinds; and by the client's
+/// address, binds with no session. The program's own middleware runs before routes, never here
+/// (FEEDBACK67.md, B.3, review; branch pwa). A signed-in person's are held by the 20 devices
+/// they may have as well.
 const A_MINUTE: usize = 30;
+/// Looks at a subscription, by the client's address: one each page a person opens, and the
+/// worker's once a minute, many people behind one address too (second review).
+const CHECKS_A_MINUTE: usize = 60;
 
-/// Whether `owner`'s session has done what it may here in the last minute: each try counted, in a
-/// window that moves with it.
-fn too_often(owner: &str) -> bool {
+/// Whether `key` (a session's owner, or a client's address) has done what it may here in the last
+/// minute: each try counted, in a window that moves with it.
+fn too_often(key: &str, most: usize) -> bool {
     static SEEN: Mutex<Option<std::collections::HashMap<String, std::collections::VecDeque<std::time::Instant>>>> = Mutex::new(None);
     let now = std::time::Instant::now();
     let minute = std::time::Duration::from_secs(60);
@@ -374,11 +387,11 @@ fn too_often(owner: &str) -> bool {
     if seen.len() > 10_000 {
         seen.retain(|_, ts| ts.back().is_some_and(|t| now.duration_since(*t) < minute));
     }
-    let ts = seen.entry(owner.to_string()).or_default();
+    let ts = seen.entry(key.to_string()).or_default();
     while ts.front().is_some_and(|t| now.duration_since(*t) >= minute) {
         ts.pop_front();
     }
-    if ts.len() >= A_MINUTE {
+    if ts.len() >= most {
         return true;
     }
     ts.push_back(now);
@@ -429,19 +442,28 @@ fn answer_push(it: &mut Interp, req: &HttpRequest) -> HttpResponse {
     let Ok(j) = serde_json::from_slice::<serde_json::Value>(&req.body) else { return refused(400, "the body is not JSON") };
     let Some(endpoint) = j["endpoint"].as_str() else { return refused(400, "no endpoint") };
     let owner = crate::session::arrived_owner(it);
-    // A page's look at the subscription its browser holds, as it starts: many a minute, and it
-    // only ever takes a binding away.
+    // A page's look at the subscription its browser holds, as it starts (and the worker's, on
+    // navigations): it takes a binding away where the session has no one, so that one whose cookie
+    // ran out is unbound, and so it is held to so many a minute by the client's address, as one
+    // who knows an endpoint could ask (second review).
     if req.method == "POST" && j["check"] == true {
+        if too_often(&format!("looks from {}", req.remote), CHECKS_A_MINUTE) {
+            return refused(429, "more than 60 looks at a subscription in a minute from this address");
+        }
         return match check(it, endpoint, owner.as_deref()) {
             Ok(on) => answer(200, serde_json::json!({ "state": if on { "granted" } else { "default" } })),
             Err(e) => failed_here(&e),
         };
     }
-    // Binding and unbinding go by the session; with none there is nothing either can do.
+    // Binding and unbinding go by the session; with none there is nothing either can do, and the
+    // tries are counted by the client's address.
     let Some(owner) = owner else {
+        if too_often(&format!("binds from {}", req.remote), A_MINUTE) {
+            return refused(429, "more than 30 subscriptions changed in a minute from this address");
+        }
         return refused(403, "no one to send to: the visitor is not signed in (session().user), and ask was given no user: notification.user(x), made on the server, says who");
     };
-    if too_often(&owner) {
+    if too_often(&owner, A_MINUTE) {
         return refused(429, "more than 30 subscriptions changed in a minute by this session");
     }
     if req.method == "DELETE" {
@@ -470,11 +492,18 @@ fn check(it: &mut Interp, endpoint: &str, owner: Option<&str>) -> Result<bool, S
     let Value::List(l) = rows else { return Ok(false) };
     let Some(Value::Map(row)) = l.iter().find(|r| matches!(r, Value::Map(m) if text(m, "place") == place)) else { return Ok(false) };
     let who = person(it);
-    let mine = who.as_deref() == Some(text(row, "who").as_str()) || owner.is_some_and(|o| !o.is_empty() && text(row, "session") == o);
-    if !mine {
+    let theirs = who.as_deref() == Some(text(row, "who").as_str());
+    let here = owner.is_some_and(|o| !o.is_empty() && text(row, "session") == o);
+    if !theirs && !here {
         unbind(it, endpoint)?;
+        return Ok(false);
     }
-    Ok(mine)
+    // The person's, from a session before this one (a cookie that ended, a sign-in again): it is
+    // this session's now, so that its end, or a change of person in it, unbinds it (second review).
+    if let (true, false, Some(o)) = (theirs, here, owner) {
+        sql(it, on, false, vec![Value::str("update _quillo_push set session = ? where endpoint = ? and place = ?"), Value::str(o), Value::str(endpoint), Value::str(&place)])?;
+    }
+    Ok(true)
 }
 
 /// Unbinds the subscription at `endpoint`, in this place.
@@ -522,7 +551,7 @@ fn bind(it: &mut Interp, req: &HttpRequest, endpoint: &str, j: &serde_json::Valu
     let place = crate::session::place(it);
     let who = match &j["user"] {
         serde_json::Value::Null => person(it).ok_or_else(|| (403, "no one to send to: the visitor is not signed in (session().user), and ask was given no user: notification.user(x), made on the server, says who".to_string()))?,
-        serde_json::Value::String(t) => sealed_user(t, &place, owner).ok_or_else(|| (403, "the user given to notification.ask is not one notification.user made here, for this session, in the last 30 days: make it on the server with notification.user(x) and give it to the page".to_string()))?,
+        serde_json::Value::String(t) => sealed_user(t, &place, owner, person(it).as_deref()).ok_or_else(|| (403, "the user given to notification.ask is not one notification.user made here, for this session, in the last 30 days: make it on the server with notification.user(x) and give it to the page".to_string()))?,
         _ => return Err((403, "the user given to notification.ask is made on the server with notification.user(x), so that a page cannot name someone else".into())),
     };
     let on = table_on(it, true).map_err(|e| (500, e))?.ok_or((500, "no table".to_string()))?;
@@ -539,8 +568,10 @@ fn bind(it: &mut Interp, req: &HttpRequest, endpoint: &str, j: &serde_json::Valu
             Value::Int(now_ms()),
         ]
     };
-    // The endpoint is the key: the device is whoever subscribed it last. Twice, for a page that
-    // posted the same one at once.
+    // The endpoint is the key: the device is whoever subscribed it last, from a session with a
+    // person or a ticket (a bind never comes from no session). The endpoint is the device's
+    // secret, which only its browser and its push service hold. A bind of an endpoint already this
+    // person's rewrites its session too. Twice, for a page that posted the same one at once.
     let mut last = None;
     for _ in 0..2 {
         let gone = sql(it, on, false, vec![Value::str("delete from _quillo_push where endpoint = ?"), Value::str(endpoint)]);
@@ -593,10 +624,11 @@ fn now_ms() -> i64 {
 }
 
 /// Who `notification.user` sealed in `token`, if it was made here, in the session this request has
-/// (a ticket always names one), and is still good.
-fn sealed_user(token: &str, place: &str, owner: &str) -> Option<String> {
+/// (a ticket always names one), for the person that session names now (no one for a guest's), and
+/// is still good.
+fn sealed_user(token: &str, place: &str, owner: &str, person: Option<&str>) -> Option<String> {
     let j: serde_json::Value = serde_json::from_str(&crate::session::unseal(USER_PURPOSE, token)?).ok()?;
-    if j["p"].as_str()? != place || j["e"].as_u64()? <= now() || j["o"].as_str()? != owner {
+    if j["p"].as_str()? != place || j["e"].as_u64()? <= now() || j["o"].as_str()? != owner || j["w"].as_str() != person || !(j["w"].is_null() || j["w"].is_string()) {
         return None;
     }
     j["u"].as_str().map(str::to_string)
@@ -703,7 +735,9 @@ fn send(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     // Inside one, `unlocked` would wait holding the lock, and the push services for every request
     // (interp.rs, `unlocked`; FEEDBACK67.md, B.3, review; branch pwa).
-    if it.tx_depth > 0 || it.sqlite_tx > 0 || !it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty() {
+    // A service's code, called in the caller's SQLite transaction, runs on its own interpreter with
+    // none open of its own: the thread's hold says so (second review).
+    if it.tx_depth > 0 || it.sqlite_tx > 0 || crate::httpd::held() || !it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty() {
         return Ok(Value::err(Value::str(IN_A_TRANSACTION)));
     }
     let who = match args.first() {
@@ -753,7 +787,7 @@ fn send(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             }
         };
         if let Err(e) = r {
-            eprintln!("quillo: notification.send: {}", e);
+            eprintln!("quillo: notification.send: {}", for_the_log(&e));
         }
     }
     let mut out = Map::new();
@@ -793,20 +827,44 @@ fn host_of(endpoint: &str) -> String {
     url::Url::parse(endpoint).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_else(|| "the push service".into())
 }
 
-/// A push service's words for the log: control characters written as escapes (a line break or a
-/// terminal's colours could make a line of its own), at most 200 characters.
+/// A push service's words, or a database's, for the log: a URL there as its host alone, and a run
+/// of 24 or more of the characters an endpoint's path or key is made of as `…`, as either may be a
+/// subscription's secret (a database's duplicate key, a push service repeating the endpoint);
+/// control characters written as escapes (a line break or a terminal's colours could make a line
+/// of its own); at most 200 characters (FEEDBACK67.md, B.3, its reviews; branch pwa).
 fn for_the_log(text: &str) -> String {
-    let cut: String = text.trim().chars().take(200).collect();
-    let mut out = String::with_capacity(cut.len());
-    for c in cut.chars() {
-        if c.is_control() {
-            out.extend(c.escape_default());
-        } else {
-            out.push(c);
-        }
+    let mut plain = String::with_capacity(text.len());
+    let mut rest = text.trim();
+    while let Some(at) = rest.find("http://").into_iter().chain(rest.find("https://")).min() {
+        plain.push_str(&rest[..at]);
+        let end = rest[at..].find(|c: char| c.is_whitespace() || "\"'<>()[]{},;`".contains(c)).map_or(rest.len(), |e| at + e);
+        plain.push_str(&host_of(&rest[at..end]));
+        rest = &rest[end..];
     }
-    if text.trim().chars().count() > 200 {
-        out.push('…');
+    plain.push_str(rest);
+    let secretish = |c: char| c.is_ascii_alphanumeric() || "-_:=%+/.~".contains(c);
+    let mut out = String::with_capacity(plain.len());
+    let chars: Vec<char> = plain.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let run = chars[i..].iter().take_while(|c| secretish(**c)).count();
+        if run >= 24 {
+            out.push('…');
+            i += run;
+            continue;
+        }
+        let end = i + run.max(1);
+        for &c in &chars[i..end] {
+            if c.is_control() {
+                out.extend(c.escape_default());
+            } else {
+                out.push(c);
+            }
+        }
+        i = end;
+    }
+    if out.chars().count() > 200 {
+        out = out.chars().take(200).chain(std::iter::once('…')).collect();
     }
     out
 }
@@ -852,8 +910,14 @@ fn deliver(s: &Sub, payload: &str, ttl: u64, urgency: &str, left: std::time::Dur
         ("urgency".to_string(), urgency.to_string()),
         ("authorization".to_string(), vapid_header(&s.endpoint, &s.origin)),
     ];
-    let o = crate::fetch::Opts { public_only: https, timeout_ms: left.as_millis().clamp(1, 30_000) as u32, ..crate::fetch::DEFAULT_OPTS };
-    let resp = match crate::fetch::call(o, false, "POST", &s.endpoint, &headers, Some(&("application/octet-stream".to_string(), body))) {
+    // A kept connection the push service had closed fails as it is used: the message goes once
+    // more, on a new one. A push service takes a message sent twice as one, by its id
+    // (FEEDBACK67.md, B.3, second review; branch pwa).
+    let mut tried = post(https, &s.endpoint, &headers, &body, left, false);
+    if tried.as_ref().is_err_and(|e| dropped(e)) {
+        tried = post(https, &s.endpoint, &headers, &body, left, true);
+    }
+    let resp = match tried {
         Ok(r) => r,
         Err(e) => return failed(e),
     };
@@ -865,6 +929,66 @@ fn deliver(s: &Sub, payload: &str, ttl: u64, urgency: &str, left: std::time::Dur
         404 | 410 => Outcome::Gone,
         _ => failed(format!("the push service answered {}{}", status, if rest.trim().is_empty() { String::new() } else { format!(": {}", rest) })),
     }
+}
+
+/// Push's own agents: as many connections kept to a push service's host as a send goes to at once,
+/// public addresses alone for https (as `http.*`'s `public_only` resolves them), through the
+/// environment's proxy as `http.*` goes; `fresh`, one that keeps none, for a message sent again.
+/// Apart from `http.*`'s, which keep one a host: with more, ureq 2.12 failed a call on each kept
+/// socket a server had reset, GETs too (FEEDBACK67.md, B.3, second review; branch pwa).
+fn agent(public_only: bool, proxy: Option<String>, fresh: bool) -> Result<ureq::Agent, String> {
+    type Key = (bool, Option<String>, bool);
+    static AGENTS: OnceLock<Mutex<std::collections::HashMap<Key, ureq::Agent>>> = OnceLock::new();
+    let mut agents = AGENTS.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = (public_only, proxy.clone(), fresh);
+    if let Some(a) = agents.get(&key) {
+        return Ok(a.clone());
+    }
+    let kept = if fresh { 0 } else { WORKERS };
+    let b = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .redirects(0)
+        .max_idle_connections(kept * 16)
+        .max_idle_connections_per_host(kept)
+        .user_agent(concat!("quillo/", env!("CARGO_PKG_VERSION")));
+    let b = if public_only && proxy.is_none() { b.resolver(crate::fetch::resolve_public) } else { b };
+    let b = match &proxy {
+        Some(p) => b.proxy(ureq::Proxy::new(p).map_err(|e| format!("the proxy in the environment: {}", e))?),
+        None => b,
+    };
+    let a = b.build();
+    agents.insert(key, a.clone());
+    Ok(a)
+}
+
+/// One push message posted, within `timeout`: the answer, whatever its status.
+fn post(public_only: bool, endpoint: &str, headers: &[(String, String)], body: &[u8], timeout: std::time::Duration, fresh: bool) -> Result<ureq::Response, String> {
+    let proxy = crate::fetch::proxy_for(endpoint);
+    if public_only && proxy.is_some() {
+        // The proxy looks the name up: it is judged here first, as `http.*` judges it.
+        let u = url::Url::parse(endpoint).map_err(|e| e.to_string())?;
+        let host = crate::fetch::host_of(endpoint);
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let port = u.port_or_known_default().unwrap_or(443);
+        let at = if host.contains(':') { format!("[{}]:{}", host, port) } else { format!("{}:{}", host, port) };
+        crate::fetch::resolve_public(&at).map_err(|e| e.to_string())?;
+    }
+    let mut req = agent(public_only, proxy, fresh)?.post(endpoint).timeout(timeout).set("content-type", "application/octet-stream");
+    for (k, v) in headers {
+        req = req.set(k, v);
+    }
+    let sent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || req.send_bytes(body))).map_err(|_| "the HTTP client could not make the call".to_string())?;
+    match sent {
+        Ok(r) | Err(ureq::Error::Status(_, r)) => Ok(r),
+        Err(e) if e.to_string().contains("timed out") => Err(format!("took more than {} s (its timeout)", timeout.as_millis() as f64 / 1000.0)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// A failure of a connection the push service had closed: reset, cut, or ended before an answer.
+fn dropped(e: &str) -> bool {
+    let e = e.to_ascii_lowercase();
+    ["reset", "broken pipe", "closed", "end of file", "eof"].iter().any(|w| e.contains(w))
 }
 
 /// RFC 8291 (aes128gcm, RFC 8188): the message for one subscription, as the body to post. One
@@ -926,19 +1050,20 @@ fn vapid_header(endpoint: &str, sub: &str) -> String {
 
 // ---- at load ----------------------------------------------------------------------------------
 
-/// Whether the program calls the module: `notification.ask`, `.state`, `.stop`, `.send` or `.user`
-/// where `notification` is not a name of the program's own (a top-level one hides the module
-/// everywhere, as Q-069 has it; a parameter, a `let`, a loop's or a match arm's where they are
-/// bound). A loop over `notifications` naming each `notification` turned it all on: the endpoint,
-/// the worker, the warning and the table (FEEDBACK67.md, B.3, review; branch pwa). Read once, at
-/// load.
+/// Whether the program names the module: `notification` anywhere it is not a name of the
+/// program's own (a top-level one hides the module everywhere, as Q-069 has it; a parameter, a
+/// `let`, a loop's or a match arm's where they are bound). A call, a field, a pipe's
+/// (`"u" | notification.user`), an alias (`let tell = notification.send`, `let n = notification`),
+/// an index, a function that gives it back: each reaches the module (second review). A loop over
+/// `notifications` naming each `notification` turned it all on: the endpoint, the worker, the
+/// warning and the table (FEEDBACK67.md, B.3, review; branch pwa). Read once, at load.
 pub fn used_by(it: &Interp) -> bool {
     let module = matches!(crate::value::lookup(&it.globals, "notification"), Some(Value::Map(m)) if matches!(m.get("send"), Some(Value::Builtin(n, _)) if *n == "notification.send"));
     module && it.program.iter().any(|stmts| Calls::default().block(stmts))
 }
 
 /// The walk `used_by` makes, with the names bound around where it is: whether one of them is
-/// `notification`.
+/// `notification`, which then names the program's own.
 #[derive(Default)]
 struct Calls {
     scopes: Vec<bool>,
@@ -1030,15 +1155,9 @@ impl Calls {
 
     fn expr(&mut self, e: &Expr) -> bool {
         match e {
-            Expr::Call(callee, args, _) => {
-                if let Expr::Field(obj, f, _) = &**callee {
-                    if matches!(&**obj, Expr::Ident(n, _) if *n == NAME) && matches!(f.as_str(), "ask" | "state" | "stop" | "send" | "user") && !self.hidden() {
-                        return true;
-                    }
-                }
-                self.expr(callee) || args.iter().any(|a| self.expr(a))
-            }
-            Expr::Lit(_) | Expr::Ident(..) => false,
+            Expr::Ident(n, _) => *n == NAME && !self.hidden(),
+            Expr::Call(callee, args, _) => self.expr(callee) || args.iter().any(|a| self.expr(a)),
+            Expr::Lit(_) => false,
             Expr::Template(parts) => parts.iter().any(|p| matches!(p, TPart::Expr(x) if self.expr(x))),
             Expr::List(xs) => xs.iter().any(|x| self.expr(x)),
             Expr::Map(es) => es.iter().any(|(_, x)| self.expr(x)),
@@ -1092,6 +1211,19 @@ mod tests {
         assert!(r[..8].iter().all(|x| x.starts_with("sent")) && r[8..] == ["late 8", "late 9"], "{:?}", r);
         assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
         assert!(in_parallel(&Vec::<u64>::new(), 8, Instant::now(), |_, _| 1, |_| 0).is_empty());
+    }
+
+    // What a database or a push service says, as the log writes it: a URL as its host, a run that
+    // may be an endpoint's path or key cut out (a duplicate key's text, a body repeating the path;
+    // second review), its control characters escaped, at most 200 characters.
+    #[test]
+    fn what_may_hold_an_endpoint_is_cut_out_of_the_log() {
+        assert_eq!(
+            for_the_log("duplicate key value violates unique constraint \"_quillo_push_pkey\" DETAIL: Key (endpoint)=(https://fcm.googleapis.com/fcm/send/dQw4w9WgXcQ:APA91bHPRgkF3JUikC4ENAHEeMrd41Zxv3hVZjC9KtT8OvPVGJ) already exists."),
+            "duplicate key value violates unique constraint \"_quillo_push_pkey\" DETAIL: Key (endpoint)=(fcm.googleapis.com) already exists."
+        );
+        assert_eq!(for_the_log("no subscription at /push/ok-12abcdefghijklmnopqrstuvwxyz34"), "no subscription at …");
+        assert_eq!(for_the_log("UNIQUE constraint failed: _quillo_push.endpoint"), "UNIQUE constraint failed: _quillo_push.endpoint");
     }
 
     // What a push service says, as the log writes it: one line, its control characters escaped,
