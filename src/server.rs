@@ -1249,29 +1249,47 @@ impl Interp {
         // kind, RFC 9213, `Surrogate-Control`, nginx's `X-Accel-Expires`) go, leaving it the
         // decision (found in review). A `cache-control: null` stays none, as the user decided for
         // `null` (FEEDBACK55.md, Q-710).
+        // Nothing is made for an answer that needs no change, as each one a visitor gets comes here.
         if personal {
-            let mut changed: Vec<String> = Vec::new();
-            resp.headers.retain(|(k, v)| {
-                let cdn = {
-                    let k = k.to_ascii_lowercase();
-                    k.ends_with("cdn-cache-control") || k == "surrogate-control" || k == "x-accel-expires"
-                };
-                if cdn && v != DROPPED {
-                    changed.push(format!("`{}: {}` left out", k.to_ascii_lowercase(), v));
-                }
-                !cdn
-            });
+            let cdn = |k: &str| {
+                let b = k.as_bytes();
+                (b.len() >= 17 && b[b.len() - 17..].eq_ignore_ascii_case(b"cdn-cache-control")) || k.eq_ignore_ascii_case("surrogate-control") || k.eq_ignore_ascii_case("x-accel-expires")
+            };
+            // Whether to say what changed: asked only when something does.
+            let mut tell: Option<bool> = None;
+            let mut changed: Vec<(String, String, Option<String>)> = Vec::new();
+            if resp.headers.iter().any(|(k, _)| cdn(k)) {
+                let tell = *tell.get_or_insert_with(|| !said_here(path));
+                resp.headers.retain(|(k, v)| {
+                    if tell && cdn(k) && v != DROPPED {
+                        changed.push((k.to_ascii_lowercase(), v.clone(), None));
+                    }
+                    !cdn(k)
+                });
+            }
             for (k, v) in resp.headers.iter_mut() {
                 if !k.eq_ignore_ascii_case("cache-control") || v == "private" || v == DROPPED {
                     continue;
                 }
                 if let Some(own) = kept_by_visitor_alone(v) {
-                    changed.push(format!("`cache-control: {}` sent as `{}`", v, own));
-                    *v = own;
+                    if *tell.get_or_insert_with(|| !said_here(path)) {
+                        changed.push(("cache-control".into(), std::mem::replace(v, own.clone()), Some(own)));
+                    } else {
+                        *v = own;
+                    }
                 }
             }
             if !changed.is_empty() {
-                said_private(path, &changed.join(", "));
+                said_private(path, || {
+                    changed
+                        .iter()
+                        .map(|(k, v, own)| match own {
+                            Some(own) => format!("`{}: {}` sent as `{}`", k, v, own),
+                            None => format!("`{}: {}` left out", k, v),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                });
             }
         }
         // Not when the program said `vary: null` (FEEDBACK55.md, Q-710; branch feedback55).
@@ -2567,6 +2585,23 @@ pub(crate) fn rpc_failure(name: &str, e: &crate::error::QuilloError) -> String {
 /// already the visitor's (`private`, `no-store`) or that no cache keeps without asking (FEEDBACK59.md,
 /// Q-903; branch cache-and-migrate).
 pub(crate) fn kept_by_visitor_alone(v: &str) -> Option<String> {
+    // A route gives the same header each time: the last answer is kept, on each thread.
+    thread_local! {
+        static LAST: std::cell::RefCell<(String, Option<String>)> = const { std::cell::RefCell::new((String::new(), None)) };
+    }
+    if let Some(r) = LAST.with(|l| l.try_borrow().ok().filter(|l| l.0 == v).map(|l| l.1.clone())) {
+        return r;
+    }
+    let r = work_out_private(v);
+    LAST.with(|l| {
+        if let Ok(mut l) = l.try_borrow_mut() {
+            *l = (v.to_string(), r.clone());
+        }
+    });
+    r
+}
+
+fn work_out_private(v: &str) -> Option<String> {
     let parts = || v.split(',').map(str::trim).filter(|p| !p.is_empty());
     let is = |p: &str, n: &str| p.split('=').next().unwrap_or("").trim().eq_ignore_ascii_case(n);
     // `private` alone: one naming fields (`private="set-cookie"`) lets a shared cache keep the
@@ -2581,12 +2616,41 @@ pub(crate) fn kept_by_visitor_alone(v: &str) -> Option<String> {
     Some(if kept.is_empty() { "private".to_string() } else { format!("private, {}", kept.join(", ")) })
 }
 
-/// Said once for each path, the first 64, where an answer's `public` was made `private`.
-fn said_private(path: &str, what: &str) {
-    static SAID: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
-    let mut said = SAID.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if said.len() < 64 && said.insert(path.to_string()) {
-        eprintln!("quillo: {} read who the visitor is: {}, as a cache in front would give the answer to the next visitor (said once for each path)", path, what);
+/// The paths `said_private` has said, the first 64.
+static SAID_PRIVATE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+
+thread_local! {
+    /// The last path this thread found said, so that a route asked for again takes no lock.
+    static SAID_HERE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Whether there is nothing more to say for `path`: said already, or 64 said.
+fn said_here(path: &str) -> bool {
+    if SAID_HERE.with(|s| s.try_borrow().is_ok_and(|s| *s == path)) {
+        return true;
+    }
+    let said = SAID_PRIVATE.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let done = said.len() >= 64 || said.contains(path);
+    drop(said);
+    if done {
+        SAID_HERE.with(|s| {
+            if let Ok(mut s) = s.try_borrow_mut() {
+                s.clear();
+                s.push_str(path);
+            }
+        });
+    }
+    done
+}
+
+/// Said once for each path, the first 64, where an answer's `public` was made `private`; what
+/// changed is put in words only then.
+fn said_private(path: &str, what: impl FnOnce() -> String) {
+    let mut said = SAID_PRIVATE.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if said.len() < 64 && !said.contains(path) {
+        said.insert(path.to_string());
+        drop(said);
+        eprintln!("quillo: {} read who the visitor is: {}, as a cache in front would give the answer to the next visitor (said once for each path)", path, what());
     }
 }
 
