@@ -448,3 +448,20 @@ fn a_migration_that_arrives_during_a_reload_is_applied_after_it() {
         let _ = std::fs::remove_dir_all(&x);
     }
 }
+
+// Lines 0.8.6's coverage run did not reach: a pragma of another name is not taken for the foreign
+// keys one, and a drop written `if exists` or with its schema is still found and warned of.
+#[test]
+fn another_pragma_and_drops_written_with_if_exists_or_a_schema() {
+    for (i, drop) in ["drop table if exists authors;", "drop table main.authors;", "DROP TABLE IF EXISTS main.\"authors\";"].iter().enumerate() {
+        let d = dir(&format!("drops{}", i));
+        std::fs::write(d.join("migrations/001.sql"), AUTHORS).unwrap();
+        std::fs::write(d.join("migrations/002.sql"), format!("pragma defer_foreign_keys = on;\ncreate table authors_new (id integer primary key, name text);\ninsert into authors_new select id, name from authors;\n{}\nalter table authors_new rename to authors;\n", drop)).unwrap();
+        let (ok, out, err) = run(&d, "db.open(\"app.db\")\nprint(db.migrate())\nprint(len(db.query(\"select * from books\")))");
+        assert!(ok, "{}", err);
+        // Foreign keys stayed on (the pragma was another), so the cascade ran, as warned.
+        assert!(out.contains("0"), "{}: {}", drop, out);
+        assert!(err.contains("drops table authors, which books points at with on delete cascade"), "{}: {}", drop, err);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

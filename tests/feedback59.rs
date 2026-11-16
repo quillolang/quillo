@@ -524,3 +524,49 @@ fn many_parts_one_line_streams_in_development_and_odd_pages() {
     drop(_g);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// Lines 0.8.6's coverage run did not reach: with --metrics, a page with links and no component
+// carries the landing script, hashed into the policy; a page with a <body> and no head, and a
+// fragment, get the island rule where the browser starts the page; and past 16 different scripts
+// on a thread (a page state's values differ per page) each page's own hash is still the one named.
+#[test]
+fn metrics_pages_without_a_head_and_many_different_scripts() {
+    let src = "state n = 0\ncomponent Counter() {\n    state k = 0\n    <button id=\"c\" @click={() => k = k + 1}>{k} {n}</button>\n}\nsite_headers(\"/\", { \"content-security-policy\": \"default-src 'self'\" })\nroute GET /p ? { m: int = 0 } {\n    n = m\n    return <html><head><title>p</title></head><body><Counter/></body></html>\n}\nroute GET /bodyonly = <html><body><Counter/></body></html>\nroute GET /frag = <div><Counter/></div>\nroute GET /links = <html><head><title>l</title></head><body><a href=\"/p\">p</a></body></html>\nroute GET /plain = <html><head><title>x</title></head><body>hi</body></html>\n";
+    let d = dir("metrics", src);
+    let (_g, port, _log) = serve_logged(&d, &["--metrics", "--workers", "1"]);
+    // No link and no component: the landing script alone.
+    let (policy, body) = fetch(port, "/plain");
+    let hashes = script_hashes(&body);
+    assert_eq!(hashes.len(), 1, "{}", body);
+    assert!(policy.contains(&hashes[0]), "{}", policy);
+    let (policy, body) = fetch(port, "/links");
+    let hashes = script_hashes(&body);
+    assert_eq!(hashes.len(), 2, "{}", body);
+    for h in &hashes {
+        assert!(policy.contains(h), "{} not in {}", h, policy);
+    }
+    for path in ["/bodyonly", "/frag"] {
+        let (policy, body) = fetch(port, path);
+        let at = body.find("<style>quillo-island{display:contents}</style>").unwrap_or_else(|| panic!("{}: {}", path, body));
+        let island = body.find("<quillo-island").unwrap();
+        assert!(at < island, "{}: {}", path, body);
+        assert!(!body[..at].contains("<quillo-island") && (body.starts_with("<!doctype") || body.starts_with("<html") || at == 0), "{}: {}", path, body);
+        assert!(policy.contains("style-src"), "{}", policy);
+    }
+    for m in 0..40 {
+        let (policy, body) = fetch(port, &format!("/p?m={}", m));
+        for h in script_hashes(&body) {
+            assert!(policy.contains(&h), "m={}: {} not in {}", m, h, policy);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// The same: a session read two helpers deep still makes check warn of a public cache-control.
+#[test]
+fn check_follows_a_helper_that_calls_another() {
+    let d = dir("helpers", "fn inner() {\n    return session().user ?? \"nobody\"\n}\nfn me() {\n    return inner()\n}\nroute GET /two = respond(200, me(), { \"cache-control\": \"public, max-age=60\" })\n");
+    let out = check(&d);
+    assert!(out.contains("main.qwe:7:") && out.contains("its `cache-control` lets a shared cache keep the answer"), "{}", out);
+    let _ = std::fs::remove_dir_all(&d);
+}

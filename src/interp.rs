@@ -5330,7 +5330,9 @@ impl Interp {
                 Mode::Request => Mode::Lenient,
                 m => m,
             };
-            let article = |t: &str| if t.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
+            // A type of the program's starts with a capital: `an Outer`, not `a Outer`, and still `a User`,
+            // as a U says "you" (found by the tests of 0.8.6's coverage; branch pwa).
+            let article = |t: &str| if t.starts_with(['a', 'e', 'i', 'o', 'u', 'A', 'E', 'I', 'O']) { "an" } else { "a" };
             let wanted = match &f.pat {
                 Pattern::Type(t) => format!("{} {}", article(t), t),
                 Pattern::List(items, None) if items.len() == 1 => match &items[0] {

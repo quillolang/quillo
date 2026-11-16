@@ -117,3 +117,26 @@ fn a_set_written_out_says_it_binds_no_name() {
     assert!(check(&d).0, "{}", check(&d).1);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// Lines 0.8.6's coverage run did not reach: a set of strings named inside another named type
+// (`Outer = Inner | null`), and a type mixing a scalar with a string (`int | "auto"`), each
+// refusing a value outside it by the field's name and taking those inside.
+#[test]
+fn a_set_named_inside_another_type_and_a_scalar_beside_a_string() {
+    let d = dir("nested", "type Inner = \"a\" | \"b\"\ntype Outer = Inner | null\ntype Width = int | \"auto\"\nroute GET /o ? { x: Outer = null } = `o ${x}`\nroute GET /w ? { w: Width } = `w ${w}`\n");
+    assert!(check(&d).0, "{}", check(&d).1);
+    let s = support::serve_with(&d.join("main.qwe"), &["--watch"]);
+    let get = |p: &str| {
+        let a = support::send(s.port, "GET", p, &[], "");
+        (a.status, a.body)
+    };
+    assert_eq!(get("/o?x=a"), (200, "o a".into()));
+    assert_eq!(get("/o"), (200, "o null".into()));
+    let (st, body) = get("/o?x=c");
+    assert!(st == 400 && body.contains("`query.x` is text, not an Outer"), "{} {}", st, body);
+    assert_eq!(get("/w?w=12"), (200, "w 12".into()));
+    assert_eq!(get("/w?w=auto"), (200, "w auto".into()));
+    let (st, body) = get("/w?w=wide");
+    assert!(st == 400 && body.contains("`query.w` is text, not a Width"), "{} {}", st, body);
+    let _ = std::fs::remove_dir_all(&d);
+}
