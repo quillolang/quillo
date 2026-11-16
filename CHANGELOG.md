@@ -12,6 +12,8 @@
   state does: the focus and its selection, a box's scroll and the page's, what was typed in a
   field nothing follows, a box ticked, an open `<details>` or `<dialog>`, an `<audio>` or
   `<video>`'s time; they went with the swap (FEEDBACK54.md, A.4).
+- Under `--watch`, `r` and Enter typed where the server runs loads the program again with its data
+  started again, nothing carried, without a restart (FEEDBACK54.md, Part C).
 
 ## 0.8.5 (2026-11-16)
 

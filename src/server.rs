@@ -2939,6 +2939,9 @@ pub struct App {
     /// changed since the page was made is no change of the program's (FEEDBACK54.md, Q-685;
     /// branch hmr).
     replaced: Mutex<Option<(u64, Arc<Loaded>)>>,
+    /// The next reload carries nothing of the server's data: `r` and Enter in the terminal under
+    /// --watch (FEEDBACK54.md, Part C's open question; the user, 2026-11-16: "proceed").
+    fresh: std::sync::atomic::AtomicBool,
     /// The files the last load that failed read or tried, watched with the version served
     /// until one loads (FEEDBACK55.md, Q-836; branch feedback55).
     tried: Mutex<Vec<PathBuf>>,
@@ -2973,6 +2976,7 @@ impl App {
             css: Mutex::new((0, Vec::new())),
             failed: Mutex::new((0, None)),
             replaced: Mutex::new(None),
+            fresh: std::sync::atomic::AtomicBool::new(false),
             tried: Mutex::new(Vec::new()),
         }
     }
@@ -3064,10 +3068,14 @@ impl App {
         } else {
             Err(crate::error::QuilloError::new(problems, 0))
         };
-        if let (Ok(_), Some(before)) = (&res, &before) {
+        let fresh = self.fresh.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if let (Ok(_), Some(before), false) = (&res, &before, fresh) {
             if let Loaded::Ready(old) = &**before {
                 carried = carry_data(old, &it);
             }
+        }
+        if fresh {
+            carried = "; its data started again (r)".to_string();
         }
         self.shared.gil.release();
         // What a failed load read or tried is watched until one loads (FEEDBACK55.md, Q-836;
@@ -4346,7 +4354,25 @@ fn serve_from(
         }
     }
     if app.watch {
-        eprintln!("quillo: watching for changes");
+        // `r` and Enter, typed where the server runs: the program loaded again with its data
+        // started again, without a restart (which would sign no one out now either, Q-689). Only
+        // when its input is a terminal: a pipe, a test's null or the debugger's protocol is not
+        // read.
+        let typed = std::io::IsTerminal::is_terminal(&std::io::stdin()) && !crate::debug::on();
+        eprintln!("quillo: watching for changes{}", if typed { " (r and Enter starts the program's data again)" } else { "" });
+        if typed {
+            let app = app.clone();
+            let _ = std::thread::Builder::new().name("quillo-keys".into()).spawn(move || {
+                let mut line = String::new();
+                while std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).unwrap_or(0) > 0 {
+                    if line.trim() == "r" {
+                        app.fresh.store(true, std::sync::atomic::Ordering::Relaxed);
+                        app.reload();
+                    }
+                    line.clear();
+                }
+            });
+        }
         // The MCP door's token, on this machine alone (FEEDBACK56.md, C.3; branch feedback56).
         // Where this server answers, also when the first load failed (found in review).
         if let Some(a) = bound.filter(|a| a.ip() == std::net::Ipv4Addr::LOCALHOST && a.port() != 0) {

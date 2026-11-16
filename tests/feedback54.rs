@@ -928,3 +928,66 @@ fn a_swap_keeps_what_the_dom_held() {
         serde_json::json!({ "b": "count 2", "free": "hello world", "focused": true, "sel": [2, 7], "bound": "typed", "tick": true, "open": true, "scroll": 120, "dialog": true, "time": 0.5, "newAudio": true, "said": ["swapped"], "errors": [] })
     );
 }
+
+// FEEDBACK54.md, Part C's open question (the user, 2026-11-16: "proceed"): a save keeps the
+// server's data; `r` and Enter, typed where the server runs under --watch, loads the program again
+// with its data started again, and the reload's line says so. Only when the server's input is a
+// terminal (here a pseudo-terminal): the start line says it then, and not when its input is null.
+#[cfg(unix)]
+#[test]
+fn r_and_enter_starts_the_servers_data_again() {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    let d = dir("fresh", DATA);
+    let port = support::free_port();
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty fills the two descriptors, each owned once below.
+    assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) }, 0);
+    let log = d.join("server.log");
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .arg(d.join("main.qwe"))
+        .args(["--port", &port.to_string(), "--watch"])
+        .env("QUILLO_SECRET", "test secret for the tests")
+        .current_dir(&d)
+        .stdin(unsafe { std::process::Stdio::from_raw_fd(slave) })
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let _s = Bare(child);
+    let mut keys = unsafe { std::fs::File::from_raw_fd(master) };
+    let end = Instant::now() + Duration::from_secs(20);
+    while !support::listening(port) {
+        assert!(Instant::now() < end);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(std::fs::read_to_string(&log).unwrap().contains("watching for changes (r and Enter starts the program's data again)"));
+    support::send(port, "POST", "/add", &[], "");
+    support::send(port, "POST", "/add", &[], "");
+    assert_eq!(support::send(port, "GET", "/n", &[], "").body, "2 Shop 2");
+    // Another line is nothing.
+    keys.write_all(b"x\n").unwrap();
+    keys.write_all(b"r\n").unwrap();
+    let end = Instant::now() + Duration::from_secs(20);
+    let line = loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if let Some(l) = text.lines().find(|l| l.starts_with("quillo: reloaded ")) {
+            break l.to_string();
+        }
+        assert!(Instant::now() < end, "no reload: {}", text);
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(line.ends_with("; its data started again (r)"), "{}", line);
+    assert_eq!(support::send(port, "GET", "/n", &[], "").body, "0 Shop 0");
+    assert_eq!(std::fs::read_to_string(&log).unwrap().matches("quillo: reloaded ").count(), 1, "x reloaded too");
+    // A save after it carries again.
+    support::send(port, "POST", "/add", &[], "");
+    let line = reloaded(&d, &log, &DATA.replace("\"Shop\"", "\"My shop\""), 2);
+    assert!(line.contains("; kept notes, count"), "{}", line);
+    drop(_s);
+    // Input not a terminal: not said, not read.
+    let d2 = dir("fresh-null", DATA);
+    let (_s, log) = logged(&d2, port);
+    assert!(!std::fs::read_to_string(&log).unwrap().contains("r and Enter"));
+}

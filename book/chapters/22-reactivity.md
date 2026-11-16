@@ -338,7 +338,9 @@ as can be *(since 0.8.5: every save reloaded every page, and the server's data s
   a function or a handle, starts again. A `let` the program never changes is code, and follows
   the edit. A `:memory:` database starts again empty. The reload's line says what was kept:
   `quillo: reloaded main.qwe (3 routes); kept notes, count; started again: cart (its type changed:
-  list to map)`.
+  list to map)`. To start the data again without a restart, type `r` and Enter where the server
+  runs: the program loads again with nothing carried (`; its data started again (r)`). That is
+  read only when the server's input is a terminal, and the start line says so.
 - A save that does not load is said over the page, which keeps showing the version before it.
 
 `--watch=reload` (or `<html data-reload>` on a page) reloads at every save, keeping nothing.
