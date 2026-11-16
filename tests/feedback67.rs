@@ -3046,7 +3046,9 @@ await b.install();
 const one = names();
 await fetch(O + "/stage-done");
 // The new version, installed: its pages tried, the old version's kept until they are.
-for (let i = 0; i < 200; i++) { const r = await fetch(O + "/ping"); if ((await r.text()) === "pong") break; await new Promise((r) => setTimeout(r, 50)); }
+// The server is being started again: a refused connection is a try that did not come yet (under
+// load the restart took longer than the first fetch).
+for (let i = 0; i < 400; i++) { try { const r = await fetch(O + "/ping"); if ((await r.text()) === "pong") break; } catch (_) {} await new Promise((r) => setTimeout(r, 50)); }
 const T0 = Date.now();
 b.time = T0;
 await b.update();
