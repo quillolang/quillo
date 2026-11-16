@@ -39,6 +39,10 @@ url = "2"
 # Checking a service's JWT access tokens: RS256, ES256 and EdDSA (FEEDBACK38.md, Q-460), with
 # the ring rustls already builds.
 ring = "0.17"
+# The VAPID key of `notification.send`, a P-256 key derived from the session key: its public
+# key from the scalar, which ring cannot make; ring signs, agrees and encrypts (FEEDBACK67.md,
+# B.3 and Q-956; branch pwa).
+p256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
 fastrand = "2"
 memchr = "2"
 ctrlc = { version = "3", features = ["termination"] }

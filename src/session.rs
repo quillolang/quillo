@@ -75,6 +75,12 @@ fn key() -> &'static [u8; 32] {
     })
 }
 
+/// The session key itself, for what is derived from it alone: the VAPID key of
+/// `notification.send`, the same wherever sessions are (FEEDBACK67.md, Q-956; branch pwa).
+pub(crate) fn signing_key() -> &'static [u8; 32] {
+    key()
+}
+
 fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
@@ -654,6 +660,15 @@ fn set_session(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let was = it.session.clone().or_else(|| arrived(it).map(|(d, _)| d));
     if let (Some(a), Some(b)) = (was.as_ref().and_then(user_of), user_of(&data)) {
         if !crate::value::equal(&a, &b) {
+            // Another person on this browser: the notifications turned on for the one before stop
+            // coming here, as at `end_session` (FEEDBACK67.md, B.3; branch pwa).
+            if it.site.notification {
+                if let Some(o) = current_owner(it) {
+                    if let Err(why) = crate::push::unbind_sessions(it, &[o]) {
+                        return fail(line, format!("`set_session`: the notifications of the person before could not be turned off on this device, so the session was not changed: {}", why));
+                    }
+                }
+            }
             it.session_id = Some(None);
         }
     }
@@ -713,6 +728,15 @@ fn end_session(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
         // its logouts do not wait on that database.
         if it.mcp.is_some() {
             return fail(line, format!("`end_session`: the session's MCP tokens could not be ended, so it was not: {}", why));
+        }
+    }
+    // Its notifications stop coming to this device, as its tokens end (FEEDBACK67.md, B.3; branch
+    // pwa): a sign-out that could not unbind them fails, rather than leave the next person on the
+    // device someone else's.
+    if it.site.notification {
+        let owners: Vec<String> = sessions.iter().map(|(o, _)| o.clone()).collect();
+        if let Err(why) = crate::push::unbind_sessions(it, &owners) {
+            return fail(line, format!("`end_session`: this device's notifications could not be turned off, so the session was not ended: {}", why));
         }
     }
     send_cookie(it, "", Some(0), line)?;

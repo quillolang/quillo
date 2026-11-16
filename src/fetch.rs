@@ -63,20 +63,22 @@ pub fn install(m: &mut Map) {
 }
 
 /// A call's options (see the top of this file).
+/// `notification.send` makes its calls with these too, on the agents kept here (FEEDBACK67.md, B.3
+/// and Q-960; branch pwa).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct Opts {
-    redirects: u32,
-    public_only: bool,
+pub(crate) struct Opts {
+    pub(crate) redirects: u32,
+    pub(crate) public_only: bool,
     /// Seconds to keep a GET's successful answer (0: not kept).
-    cache: u32,
+    pub(crate) cache: u32,
     /// Milliseconds the whole call may take (0: the agent's own limits).
-    timeout_ms: u32,
+    pub(crate) timeout_ms: u32,
     /// The certificates a call trusts and presents (`ca`, `cert`, `key`), by their number in
     /// `TLS` (0: the usual public CAs, and none presented).
-    tls: u32,
+    pub(crate) tls: u32,
 }
 
-const DEFAULT_OPTS: Opts = Opts { redirects: 5, public_only: false, cache: 0, timeout_ms: 0, tls: 0 };
+pub(crate) const DEFAULT_OPTS: Opts = Opts { redirects: 5, public_only: false, cache: 0, timeout_ms: 0, tls: 0 };
 
 /// The options there are; `http.stream`'s map also has its request's.
 const OPTION_NAMES: &[&str] = &["redirects", "public_only", "cache", "timeout", "ca", "cert", "key"];
@@ -368,7 +370,7 @@ struct Reply {
 }
 
 /// One call: its answer, the head read, the body not yet.
-fn call(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, String)], body: Option<&(String, Vec<u8>)>) -> Result<ureq::Response, String> {
+pub(crate) fn call(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, String)], body: Option<&(String, Vec<u8>)>) -> Result<ureq::Response, String> {
     if o.public_only && proxy_for(url).is_some() {
         // The host and port the client will ask the proxy for.
         let u = url::Url::parse(url).map_err(|e| format!("{}: {}", url, e))?;

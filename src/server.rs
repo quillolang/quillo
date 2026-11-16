@@ -1575,6 +1575,11 @@ impl Interp {
                 return resp;
             }
         }
+        // A page's push subscription, for a program that uses `notification` (FEEDBACK67.md, B.3;
+        // branch pwa); bound to who the request's session says.
+        if rest == "push" && self.site.notification {
+            return crate::push::endpoint(self, req, path);
+        }
         if rest == "quillo.js" {
             // The browser keeps its copy and asks whether it is still current.
             let etag = format!("\"{:016x}\"", {

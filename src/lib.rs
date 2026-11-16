@@ -74,6 +74,7 @@ pub mod new;
 pub mod sites;
 pub mod platform;
 pub mod pwa;
+pub mod push;
 pub mod money;
 #[cfg(feature = "mysql")]
 pub mod my;

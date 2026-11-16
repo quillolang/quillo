@@ -3572,3 +3572,1081 @@ fn q985_a_page_states_initializer_reads_the_session() {
     assert!(String::from_utf8_lossy(&body).contains("<h1>nobody nobody /page</h1>"));
     assert_eq!(second_marks(port, "/kept", &format!("{}; quillo_tag={}", ana, tag), &[]), (Some("private".into()), Some(tag), None));
 }
+
+
+// ---- B.3: notifications (slice 4) ---------------------------------------------------------------
+
+/// The push service and the browser's keys, played by Node: a sink on 127.0.0.1 that takes what
+/// Quillo posts, decrypts it by RFC 8291 with Node's own crypto (an implementation apart from
+/// Quillo's: the probe's, .git/wip/feedback67/probe-push-decrypt.mjs) and checks its VAPID header by
+/// RFC 8292. `/_made?n=K&kind=ok|404|410|500`: K subscriptions, their keys made as
+/// `pushManager.subscribe` makes them, whose push service answers 201 or as `kind` says; `/_got`:
+/// what came, in order, with the connection it came on; `/_reset`.
+const SINK: &str = r#"const crypto = require("crypto"), http = require("http");
+const PORT = +process.argv[2];
+const subs = new Map();
+let got = [], n = 0;
+const b64u = (b) => Buffer.from(b).toString("base64url");
+function open(path, headers, body) {
+  const s = subs.get(path);
+  const out = { path, ttl: headers.ttl, urgency: headers.urgency, content_encoding: headers["content-encoding"], content_type: headers["content-type"], length: body.length };
+  try {
+    const salt = body.subarray(0, 16), rs = body.readUInt32BE(16), idlen = body[20], asPub = body.subarray(21, 21 + idlen), ct = body.subarray(21 + idlen);
+    const shared = s.ecdh.computeSecret(asPub);
+    const keyInfo = Buffer.concat([Buffer.from("WebPush: info\0"), s.ecdh.getPublicKey(), asPub]);
+    const ikm = Buffer.from(crypto.hkdfSync("sha256", shared, s.auth, keyInfo, 32));
+    const cek = Buffer.from(crypto.hkdfSync("sha256", ikm, salt, Buffer.from("Content-Encoding: aes128gcm\0"), 16));
+    const nonce = Buffer.from(crypto.hkdfSync("sha256", ikm, salt, Buffer.from("Content-Encoding: nonce\0"), 12));
+    const d = crypto.createDecipheriv("aes-128-gcm", cek, nonce);
+    d.setAuthTag(ct.subarray(ct.length - 16));
+    const plain = Buffer.concat([d.update(ct.subarray(0, ct.length - 16)), d.final()]);
+    let end = plain.length - 1;
+    while (end > 0 && plain[end] === 0) end--;
+    Object.assign(out, { record_size: rs, key_length: idlen, delimiter: plain[end], text: plain.subarray(0, end).toString("utf8") });
+    out.message = JSON.parse(out.text);
+  } catch (e) { out.error = String(e); }
+  try {
+    const a = headers.authorization || "";
+    const t = /t=([^,\s]+)/.exec(a)[1], k = /k=([^,\s]+)/.exec(a)[1];
+    const [h, c, sig] = t.split(".");
+    const kb = Buffer.from(k, "base64url");
+    const pub = crypto.createPublicKey({ key: { kty: "EC", crv: "P-256", x: b64u(kb.subarray(1, 33)), y: b64u(kb.subarray(33, 65)) }, format: "jwk" });
+    const claims = JSON.parse(Buffer.from(c, "base64url"));
+    out.vapid = { scheme: a.split(" ")[0], header: JSON.parse(Buffer.from(h, "base64url")), aud: claims.aud, sub: claims.sub, exp_in_h: (claims.exp - Date.now() / 1000) / 3600, k,
+      signature_ok: crypto.verify("sha256", Buffer.from(`${h}.${c}`), { key: pub, dsaEncoding: "ieee-p1363" }, Buffer.from(sig, "base64url")) };
+  } catch (e) { out.vapid_error = String(e); }
+  return out;
+}
+http.createServer((req, res) => {
+  const parts = [];
+  req.on("data", (d) => parts.push(d));
+  req.on("end", () => {
+    const u = new URL(req.url, "http://x");
+    const reply = (status, j) => {
+      const text = JSON.stringify(j);
+      res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(text), "access-control-allow-origin": "*" });
+      res.end(text);
+    };
+    if (u.pathname === "/_made") {
+      const k = +(u.searchParams.get("n") || 1), kind = u.searchParams.get("kind") || "ok", out = [];
+      for (let i = 0; i < k; i++) {
+        const ecdh = crypto.createECDH("prime256v1");
+        ecdh.generateKeys();
+        const auth = crypto.randomBytes(16), path = `/push/${kind}-${++n}`;
+        subs.set(path, { ecdh, auth });
+        out.push({ endpoint: `http://127.0.0.1:${PORT}${path}`, expirationTime: null, keys: { p256dh: b64u(ecdh.getPublicKey()), auth: b64u(auth) } });
+      }
+      return reply(200, out);
+    }
+    if (u.pathname === "/_got") return reply(200, got);
+    if (u.pathname === "/_reset") { got = []; return reply(200, {}); }
+    const kind = u.pathname.split("/")[2] || "";
+    const status = kind.startsWith("404") ? 404 : kind.startsWith("410") ? 410 : kind.startsWith("500") ? 500 : 201;
+    got.push({ ...open(u.pathname, req.headers, Buffer.concat(parts)), status, method: req.method, sock: req.socket.remotePort });
+    res.writeHead(status);
+    res.end();
+  });
+}).listen(PORT, "127.0.0.1", () => console.log("listening"));
+"#;
+
+/// The sink, running: killed with the test.
+struct Sink {
+    _node: support::Guard,
+    port: u16,
+}
+
+fn sink() -> Sink {
+    let d = support::temp_dir("f67-sink");
+    std::fs::write(d.join("sink.cjs"), SINK).unwrap();
+    let port = support::free_port();
+    let child = std::process::Command::new("node")
+        .arg(d.join("sink.cjs"))
+        .arg(port.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("node");
+    let node = support::Guard::new(child);
+    let end = Instant::now() + Duration::from_secs(20);
+    while !support::listening(port) {
+        assert!(Instant::now() < end, "the sink did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Sink { _node: node, port }
+}
+
+impl Sink {
+    fn get(&self, path: &str) -> serde_json::Value {
+        serde_json::from_str(&support::send(self.port, "GET", path, &[], "").body).unwrap()
+    }
+
+    /// `n` subscriptions whose push service answers as `kind` says.
+    fn made(&self, n: usize, kind: &str) -> Vec<serde_json::Value> {
+        self.get(&format!("/_made?n={}&kind={}", n, kind)).as_array().unwrap().clone()
+    }
+
+    fn got(&self) -> Vec<serde_json::Value> {
+        self.get("/_got").as_array().unwrap().clone()
+    }
+
+    fn reset(&self) {
+        self.get("/_reset");
+    }
+
+    fn origin(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+/// `quillo run` of `d` with `env` after QUILLO_SECRET and QUILLO_PUSH_LOCAL=1 (the sink is on this
+/// machine): the server, its log in server.log, and its port.
+fn push_server(d: &Path, opts: &[&str], env: &[(&str, &str)]) -> (Logged, u16) {
+    let port = support::free_port();
+    let log = d.join("server.log");
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .arg(d.join("main.qwe"))
+        .args(["--port", &port.to_string()])
+        .args(opts)
+        .env("QUILLO_SECRET", "test secret for the tests")
+        .env("QUILLO_PUSH_LOCAL", "1")
+        .envs(env.iter().copied())
+        .current_dir(d)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    support::stop_with_tests(&child);
+    let s = Logged(child, log);
+    let end = Instant::now() + Duration::from_secs(20);
+    while !support::listening(port) {
+        assert!(Instant::now() < end, "the server did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (s, port)
+}
+
+/// What a page posts to /_quillo/push, as the runtime makes it: the subscription, `user` (a token
+/// of `notification.user`, or null) and the page's origin, from the page's own site.
+fn bind(port: u16, sub: &serde_json::Value, user: serde_json::Value, cookie: &str) -> support::Answer {
+    let mut body = sub.clone();
+    body["user"] = user;
+    let (host, origin) = (format!("127.0.0.1:{}", port), format!("http://127.0.0.1:{}", port));
+    let mut hs = vec![("host", host.as_str()), ("origin", origin.as_str())];
+    if !cookie.is_empty() {
+        hs.push(("cookie", cookie));
+    }
+    support::send(port, "POST", "/_quillo/push", &hs, &body.to_string())
+}
+
+/// `POST /send/<who>` with the message: what `notification.send` gave, as JSON.
+fn send_to(port: u16, who: &str, msg: serde_json::Value) -> serde_json::Value {
+    let a = support::send(port, "POST", &format!("/send/{}", who), &[], &msg.to_string());
+    assert_eq!(a.status, 200, "{}", a.body);
+    serde_json::from_str(&a.body).unwrap_or_else(|_| panic!("{}", a.body))
+}
+
+/// The server's public key, as a page subscribes with it.
+fn push_key(port: u16) -> String {
+    let a = support::send(port, "GET", "/_quillo/push", &[], "");
+    assert_eq!((a.status, a.header("cache-control")), (200, Some("no-store")), "{}", a.body);
+    serde_json::from_str::<serde_json::Value>(&a.body).unwrap()["key"].as_str().unwrap().to_string()
+}
+
+/// A program that signs people in and sends to them.
+const PUSHER: &str = r#"route GET /in/:who {
+    set_session({ user: who })
+    redirect("/")
+}
+route GET /in-int/:n(int) {
+    set_session({ user: n })
+    redirect("/")
+}
+route GET /cart {
+    set_session({ cart: 3 })
+    redirect("/")
+}
+route GET /out {
+    end_session()
+    redirect("/")
+}
+route GET /ticket/:who = notification.user(who)
+route POST /send/:who {
+    let r = notification.send(who, request.json)
+    is_err(r) ? { error: r.error } : r
+}
+route POST /send-int/:n(int) = notification.send(n, request.json)
+route POST /many/:who/:n(int) {
+    let sent = 0
+    for i in 0..n {
+        sent += notification.send(who, { title: `n${i}` }).sent
+    }
+    { sent: sent }
+}
+route GET / = "home"
+"#;
+
+// B.3: what `notification.send` posts decrypts exactly, by Node's own RFC 8291 (unicode and emoji
+// included): one aes128gcm record of 4096, the key's 65 bytes, the delimiter 2, Declarative Web
+// Push's JSON with `navigate` from the subscription's origin; TTL and Urgency as given, else a day
+// and normal. Its VAPID header verifies by RFC 8292: ES256 by `k`, which is the key a page gets,
+// `aud` the push service's origin, `sub` the site's, 12 hours ahead. Under --base, `navigate`
+// carries the prefix.
+#[test]
+fn notification_a_message_decrypts_exactly_and_its_vapid_verifies() {
+    let sink = sink();
+    let d = dir("n-exact", PUSHER);
+    assert!(check(&d).0, "{:?}", check(&d));
+    let (_s, port) = push_server(&d, &[], &[]);
+    let (ana, _) = session_step(port, "/in/ana", "");
+    let subs = sink.made(1, "ok");
+    assert_eq!(bind(port, &subs[0], serde_json::Value::Null, &ana).status, 200);
+    let msg = serde_json::json!({ "title": "Grüße ✓", "body": "Order 1042 has shipped: 日本 🎉", "url": "/orders/1042", "tag": "o1042", "badge": 3, "silent": true, "ttl": "1h", "urgency": "high" });
+    assert_eq!(send_to(port, "ana", msg), serde_json::json!({ "sent": 1, "gone": 0 }));
+    let g = &sink.got()[0];
+    let want = format!(r#"{{"web_push":8030,"notification":{{"title":"Grüße ✓","body":"Order 1042 has shipped: 日本 🎉","navigate":"http://127.0.0.1:{}/orders/1042","tag":"o1042","silent":true,"app_badge":3}}}}"#, port);
+    assert_eq!(g["text"], want.as_str(), "{}", g);
+    assert_eq!((g["delimiter"].as_u64(), g["record_size"].as_u64(), g["key_length"].as_u64()), (Some(2), Some(4096), Some(65)));
+    assert_eq!((g["content_encoding"].as_str(), g["content_type"].as_str(), g["ttl"].as_str(), g["urgency"].as_str()), (Some("aes128gcm"), Some("application/octet-stream"), Some("3600"), Some("high")));
+    assert_eq!(g["length"].as_u64(), Some(86 + want.len() as u64 + 1 + 16));
+    let v = &g["vapid"];
+    assert_eq!((v["scheme"].as_str(), &v["header"], v["signature_ok"].as_bool()), (Some("vapid"), &serde_json::json!({ "typ": "JWT", "alg": "ES256" }), Some(true)), "{}", g);
+    assert_eq!((v["aud"].as_str().unwrap(), v["sub"].as_str().unwrap()), (sink.origin().as_str(), format!("http://127.0.0.1:{}", port).as_str()));
+    let h = v["exp_in_h"].as_f64().unwrap();
+    assert!(h > 11.9 && h <= 12.0, "{}", h);
+    assert_eq!(v["k"].as_str().unwrap(), push_key(port));
+    // The least: a title alone.
+    sink.reset();
+    assert_eq!(send_to(port, "ana", serde_json::json!({ "title": "t" })), serde_json::json!({ "sent": 1, "gone": 0 }));
+    let g = &sink.got()[0];
+    assert_eq!(g["message"], serde_json::json!({ "web_push": 8030, "notification": { "title": "t", "navigate": format!("http://127.0.0.1:{}/", port) } }));
+    assert_eq!((g["ttl"].as_str(), g["urgency"].as_str()), (Some("86400"), Some("normal")));
+    // Under --base, as a proxy hands requests on with the prefix taken off.
+    let d = dir("n-exact-base", PUSHER);
+    let (_s, port) = push_server(&d, &["--base", "/shop"], &[]);
+    let (ana, _) = session_step(port, "/in/ana", "");
+    assert_eq!(bind(port, &sink.made(1, "ok")[0], serde_json::Value::Null, &ana).status, 200);
+    sink.reset();
+    send_to(port, "ana", serde_json::json!({ "title": "t", "url": "/orders/7" }));
+    send_to(port, "ana", serde_json::json!({ "title": "t" }));
+    let navs: Vec<String> = sink.got().iter().map(|g| g["message"]["notification"]["navigate"].as_str().unwrap().to_string()).collect();
+    assert_eq!(navs, [format!("http://127.0.0.1:{}/shop/orders/7", port), format!("http://127.0.0.1:{}/shop/", port)]);
+}
+
+// Q-956: every instance signs with one key (`--instances 2`, 40 asks), the same after a restart
+// with the same QUILLO_SECRET, another with another: the key is derived from the session key.
+// It is a P-256 public key as a page subscribes with it: 65 bytes, uncompressed.
+#[test]
+fn notification_instances_and_restarts_sign_with_one_key() {
+    let d = dir("n-key", PUSHER);
+    let (s, port) = push_server(&d, &["--instances", "2"], &[]);
+    let keys: std::collections::HashSet<String> = (0..40).map(|_| push_key(port)).collect();
+    assert_eq!(keys.len(), 1, "{:?}", keys);
+    let key = keys.into_iter().next().unwrap();
+    assert_eq!(key.len(), 87);
+    assert!(key.starts_with('B'), "{}", key);
+    drop(s);
+    let (s, port) = push_server(&d, &[], &[]);
+    assert_eq!(push_key(port), key);
+    drop(s);
+    let (_s, port) = push_server(&d, &[], &[("QUILLO_SECRET", "another secret, another key, as sessions")]);
+    assert_ne!(push_key(port), key);
+}
+
+// B.3: what a push service says has ended (404, 410) is dropped and counted as `gone`; one that
+// failed otherwise (500) is kept, not counted, and said in the log; the next send reaches the rest.
+// Who is the user as JSON: the int 7 is not the text "7". No subscription: nothing sent, none gone.
+#[test]
+fn notification_ended_subscriptions_are_dropped_and_counted() {
+    let sink = sink();
+    let d = dir("n-gone", PUSHER);
+    let (s, port) = push_server(&d, &[], &[]);
+    let (ana, _) = session_step(port, "/in/ana", "");
+    for kind in ["ok", "ok", "404", "410", "500"] {
+        assert_eq!(bind(port, &sink.made(1, kind)[0], serde_json::Value::Null, &ana).status, 200);
+    }
+    assert_eq!(send_to(port, "ana", serde_json::json!({ "title": "one" })), serde_json::json!({ "sent": 2, "gone": 2 }));
+    assert_eq!(sink.got().len(), 5);
+    sink.reset();
+    assert_eq!(send_to(port, "ana", serde_json::json!({ "title": "two" })), serde_json::json!({ "sent": 2, "gone": 0 }));
+    let paths: Vec<String> = sink.got().iter().map(|g| g["path"].as_str().unwrap().split('-').next().unwrap().to_string()).collect();
+    assert_eq!(paths, ["/push/ok", "/push/ok", "/push/500"]);
+    assert!(log_with(&s, "the push service answered 500").contains("quillo: notification.send: 127.0.0.1: the push service answered 500"));
+    assert_eq!(send_to(port, "bob", serde_json::json!({ "title": "none" })), serde_json::json!({ "sent": 0, "gone": 0 }));
+    let (seven, _) = session_step(port, "/in-int/7", "");
+    assert_eq!(bind(port, &sink.made(1, "ok")[0], serde_json::Value::Null, &seven).status, 200);
+    assert_eq!(send_to(port, "7", serde_json::json!({ "title": "text 7" })), serde_json::json!({ "sent": 0, "gone": 0 }));
+    let a = support::send(port, "POST", "/send-int/7", &[], r#"{"title":"int 7"}"#);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&a.body).unwrap(), serde_json::json!({ "sent": 1, "gone": 0 }));
+}
+
+/// A message of exactly `size` bytes as sent from `origin` (a title, and a body of é's and x's).
+fn sized(origin: &str, size: usize) -> serde_json::Value {
+    let fixed = format!(r#"{{"web_push":8030,"notification":{{"title":"t","body":"","navigate":"{}/"}}}}"#, origin).len();
+    let n = size - fixed;
+    serde_json::json!({ "title": "t", "body": format!("{}{}", "é".repeat(n / 2), "x".repeat(n % 2)) })
+}
+
+// B.3: one push message holds 3,800 bytes as sent (one record of 4096): 3,799 and 3,800 go and
+// decrypt whole, 3,801 is an error value and sends nothing, with a subscription or none. A message
+// without a title, with an option that is none, a url that is not a path here, a bad badge, ttl
+// or urgency, is a mistake that stops the route, as `http`'s unknown options do.
+#[test]
+fn notification_a_message_past_one_record_is_an_error_value() {
+    let sink = sink();
+    let d = dir("n-size", PUSHER);
+    let (s, port) = push_server(&d, &[], &[]);
+    let origin = format!("http://127.0.0.1:{}", port);
+    let none = sized("", 3801);
+    assert_eq!(send_to(port, "ana", none)["error"].as_str(), Some("notification.send: the message is 3801 bytes as sent, more than the 3800 one push message holds: shorten its body"));
+    let (ana, _) = session_step(port, "/in/ana", "");
+    assert_eq!(bind(port, &sink.made(1, "ok")[0], serde_json::Value::Null, &ana).status, 200);
+    for size in [3799, 3800] {
+        assert_eq!(send_to(port, "ana", sized(&origin, size)), serde_json::json!({ "sent": 1, "gone": 0 }), "{}", size);
+    }
+    assert_eq!(send_to(port, "ana", sized(&origin, 3801))["error"].as_str(), Some("notification.send: the message is 3801 bytes as sent, more than the 3800 one push message holds: shorten its body"));
+    let got: Vec<usize> = sink.got().iter().map(|g| g["text"].as_str().unwrap().len()).collect();
+    assert_eq!(got, [3799, 3800]);
+    assert!(sink.got().iter().all(|g| g["length"].as_u64().unwrap() <= 4096 && g["delimiter"] == 2));
+    for (msg, says) in [
+        (r#"{"body":"no title"}"#, "`notification.send` needs a `title`"),
+        (r#"{"title":""}"#, "`notification.send` needs a `title`"),
+        (r#"{"title":"t","icon":"x.png"}"#, "unknown option `icon` (the options are title, body, url, tag, badge, silent, ttl, urgency)"),
+        (r#"{"title":"t","url":"https://elsewhere.example/x"}"#, "`url` is a path on this site"),
+        (r#"{"title":"t","url":"//elsewhere.example/x"}"#, "`url` is a path on this site"),
+        (r#"{"title":"t","badge":-1}"#, "`badge` is a whole number, 0 or more"),
+        (r#"{"title":"t","ttl":2419201}"#, "at most 4 weeks"),
+        (r#"{"title":"t","urgency":"now"}"#, "`urgency` is \"very-low\", \"low\", \"normal\" or \"high\""),
+        (r#"{"title":5}"#, "`notification.send`'s `title` is text, got int"),
+    ] {
+        let a = support::send(port, "POST", "/send/ana", &[], msg);
+        assert_eq!(a.status, 500, "{}", msg);
+        assert!(log_with(&s, says).contains(says), "{}: {}", msg, says);
+    }
+    // The longest TTL is taken.
+    sink.reset();
+    assert_eq!(send_to(port, "ana", serde_json::json!({ "title": "t", "ttl": 2419200, "urgency": "very-low" })), serde_json::json!({ "sent": 1, "gone": 0 }));
+    assert_eq!((sink.got()[0]["ttl"].as_str(), sink.got()[0]["urgency"].as_str()), (Some("2419200"), Some("very-low")));
+}
+
+// Q-960: sends to one push service go over one kept connection: 50 in one request, one each, and
+// a send to 20 subscriptions at once, all on the connection the first opened.
+#[test]
+fn notification_sends_reuse_one_connection() {
+    let sink = sink();
+    let d = dir("n-conn", PUSHER);
+    let (_s, port) = push_server(&d, &[], &[]);
+    let (ana, _) = session_step(port, "/in/ana", "");
+    assert_eq!(bind(port, &sink.made(1, "ok")[0], serde_json::Value::Null, &ana).status, 200);
+    let a = support::send(port, "POST", "/many/ana/50", &[], "");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&a.body).unwrap(), serde_json::json!({ "sent": 50 }), "{}", a.body);
+    let got = sink.got();
+    assert_eq!(got.len(), 50);
+    let socks: std::collections::HashSet<u64> = got.iter().map(|g| g["sock"].as_u64().unwrap()).collect();
+    assert_eq!(socks.len(), 1, "{:?}", socks);
+    let (bob, _) = session_step(port, "/in/bob", "");
+    for sub in sink.made(20, "ok") {
+        assert_eq!(bind(port, &sub, serde_json::Value::Null, &bob).status, 200);
+    }
+    sink.reset();
+    assert_eq!(send_to(port, "bob", serde_json::json!({ "title": "all" })), serde_json::json!({ "sent": 20, "gone": 0 }));
+    let socks: std::collections::HashSet<u64> = sink.got().iter().map(|g| g["sock"].as_u64().unwrap()).collect();
+    assert_eq!(socks.len(), 1, "{:?}", socks);
+}
+
+// B.3: `end_session()` unbinds the session's subscriptions, and so does a change of person in
+// `set_session` (Bob signing in where Ana was): the next person on the device gets nothing meant
+// for the one before. `user:` takes only what `notification.user(x)` made: made with no session,
+// it binds from any; made in one, only from that one, and ends with it. A plain value, a token
+// changed, or neither a token nor a signed-in visitor is refused, saying why. DELETE unbinds.
+#[test]
+fn notification_sessions_end_and_the_user_option() {
+    let sink = sink();
+    let d = dir("n-sessions", PUSHER);
+    let (_s, port) = push_server(&d, &[], &[]);
+    let one = serde_json::json!({ "title": "t" });
+    let (ana, _) = session_step(port, "/in/ana", "");
+    assert_eq!(bind(port, &sink.made(1, "ok")[0], serde_json::Value::Null, &ana).status, 200);
+    assert_eq!(send_to(port, "ana", one.clone())["sent"], 1);
+    session_step(port, "/out", &ana);
+    assert_eq!(send_to(port, "ana", one.clone())["sent"], 0);
+    // Ana again, then Bob on her browser without signing her out.
+    let (ana, _) = session_step(port, "/in/ana", "");
+    let (ana_phone, _) = session_step(port, "/in/ana", "");
+    assert_eq!(bind(port, &sink.made(1, "ok")[0], serde_json::Value::Null, &ana).status, 200);
+    assert_eq!(bind(port, &sink.made(1, "ok")[0], serde_json::Value::Null, &ana_phone).status, 200);
+    assert_eq!(send_to(port, "ana", one.clone())["sent"], 2);
+    let (bob, _) = session_step(port, "/in/bob", &ana);
+    assert!(bob != ana);
+    assert_eq!(send_to(port, "ana", one.clone())["sent"], 1, "her phone's stays");
+    // `user:` made with no session: bound from anywhere.
+    let guest = support::send(port, "GET", "/ticket/guest-1", &[], "").body;
+    assert_eq!(bind(port, &sink.made(1, "ok")[0], serde_json::json!(guest), "").status, 200);
+    assert_eq!(send_to(port, "guest-1", one.clone())["sent"], 1);
+    // Made in a session (a cart, no user): only from it, and unbound when it ends.
+    let (cart, _) = session_step(port, "/cart", "");
+    let zoe = support::send(port, "GET", "/ticket/zoe", &[("cookie", &cart)], "").body;
+    let sub = sink.made(1, "ok").remove(0);
+    let a = bind(port, &sub, serde_json::json!(zoe), "");
+    assert_eq!(a.status, 403);
+    assert!(a.body.contains("not one notification.user made here, for this session"), "{}", a.body);
+    assert_eq!(bind(port, &sub, serde_json::json!(zoe), &bob).status, 403);
+    assert_eq!(bind(port, &sub, serde_json::json!(zoe), &cart).status, 200);
+    assert_eq!(send_to(port, "zoe", one.clone())["sent"], 1);
+    session_step(port, "/out", &cart);
+    assert_eq!(send_to(port, "zoe", one.clone())["sent"], 0);
+    // What is refused, and why.
+    let sub = sink.made(1, "ok").remove(0);
+    for (user, cookie, says) in [
+        (serde_json::json!("zoe"), "", "not one notification.user made here"),
+        (serde_json::json!(format!("{}x", guest)), "", "not one notification.user made here"),
+        (serde_json::json!(7), "", "made on the server with notification.user(x), so that a page cannot name someone else"),
+        (serde_json::json!({ "user": "zoe" }), "", "made on the server with notification.user(x)"),
+        (serde_json::Value::Null, "", "no one to send to: the visitor is not signed in (session().user)"),
+        (serde_json::Value::Null, cart.as_str(), "no one to send to"),
+    ] {
+        let a = bind(port, &sub, user.clone(), cookie);
+        assert_eq!(a.status, 403, "{} {}", user, a.body);
+        assert!(a.body.contains(says), "{}: {}", user, a.body);
+    }
+    // DELETE, as `stop` sends it.
+    let (cy, _) = session_step(port, "/in/cy", "");
+    let sub = sink.made(1, "ok").remove(0);
+    assert_eq!(bind(port, &sub, serde_json::Value::Null, &cy).status, 200);
+    assert_eq!(send_to(port, "cy", one.clone())["sent"], 1);
+    let host = format!("127.0.0.1:{}", port);
+    let a = support::send(port, "DELETE", "/_quillo/push", &[("host", &host)], &serde_json::json!({ "endpoint": sub["endpoint"] }).to_string());
+    assert_eq!((a.status, a.body.as_str()), (200, r#"{"ok":true}"#));
+    assert_eq!(send_to(port, "cy", one)["sent"], 0);
+}
+
+// B.3: /_quillo/push takes only the program's own pages, as a server fn does: another site's post
+// or delete is refused (Sec-Fetch-Site, or an Origin of another host), and so is anything but JSON
+// of a few hundred bytes. It takes no endpoint a send should not reach: only https to the public
+// internet, or plain http to this machine with QUILLO_PUSH_LOCAL=1 (or --watch); no private
+// address, no other scheme, no user in it, nothing over 1,000 characters; and only a P-256 key and
+// a 16-byte secret. A page's origin comes with it.
+#[test]
+fn notification_what_the_push_endpoint_refuses() {
+    let d = dir("n-refuse", PUSHER);
+    let (_s, port) = push_server(&d, &[], &[("QUILLO_PUSH_LOCAL", "0")]);
+    let (ana, _) = session_step(port, "/in/ana", "");
+    let (host, origin) = (format!("127.0.0.1:{}", port), format!("http://127.0.0.1:{}", port));
+    let p256dh = "BF5JjJmHYcp-lHVMIDyVSu7Q4fzLCDsfNqASRtVyiv5i8aoIztqkMiDtok0G5oXrmrnwzD1uoXEWEeXDg1_Yzpg";
+    let sub = |endpoint: &str| serde_json::json!({ "endpoint": endpoint, "keys": { "p256dh": p256dh, "auth": "swC8VcTjKc8fIaxz_rdm_Q" } });
+    let post = |hs: &[(&str, &str)], body: &str| {
+        let mut all = vec![("host", host.as_str()), ("cookie", ana.as_str())];
+        all.extend_from_slice(hs);
+        support::send(port, "POST", "/_quillo/push", &all, body)
+    };
+    let good = sub("https://push.example.com/send/abc").to_string();
+    for (hs, body, status, says) in [
+        (vec![("origin", origin.as_str()), ("sec-fetch-site", "cross-site")], good.clone(), 403, "only the program's own pages"),
+        (vec![("origin", "http://evil.example")], good.clone(), 403, "only the program's own pages"),
+        (vec![("origin", origin.as_str()), ("content-type", "text/plain")], good.clone(), 415, "send JSON"),
+        (vec![("origin", origin.as_str())], format!("{{\"endpoint\":\"https://push.example.com/{}\"}}", "x".repeat(9000)), 413, "a few hundred bytes"),
+        (vec![("origin", origin.as_str())], "{".to_string(), 400, "not JSON"),
+        (vec![("origin", origin.as_str())], "{}".to_string(), 400, "no endpoint"),
+        (vec![], good.clone(), 400, "no origin"),
+    ] {
+        let a = post(&hs, &body);
+        assert_eq!(a.status, status, "{:?} {}", hs, a.body);
+        assert!(a.body.contains(says), "{:?}: {}", hs, a.body);
+    }
+    // The page's origin in the body, where the browser sends no Origin, is taken.
+    let mut with = sub("https://push.example.com/send/abc");
+    with["origin"] = serde_json::json!(origin);
+    assert_eq!(post(&[], &with.to_string()).status, 200);
+    let long = format!("https://push.example.com/{}", "a".repeat(1000));
+    for (endpoint, says) in [
+        ("https://10.0.0.1/push", "not https to an address on the public internet"),
+        ("https://169.254.169.254/latest", "not https to an address on the public internet"),
+        ("https://[::1]/push", "not https to an address on the public internet"),
+        ("https://localhost/push", "not https to an address on the public internet"),
+        ("https://a.localhost/push", "not https to an address on the public internet"),
+        ("http://push.example.com/push", "not https to an address on the public internet"),
+        ("http://127.0.0.1:9/push", "taken only under --watch or with QUILLO_PUSH_LOCAL=1"),
+        ("http://localhost:9/push", "taken only under --watch or with QUILLO_PUSH_LOCAL=1"),
+        ("ftp://push.example.com/push", "the endpoint is ftp:, not https"),
+        ("https://me:pw@push.example.com/push", "holds a user"),
+        ("https://push.example.com/push#x", "holds a user or a fragment"),
+        ("https://push.example.com/pü", "or not ASCII"),
+        (long.as_str(), "longer than 1000 characters"),
+        ("push.example.com", "not a URL"),
+    ] {
+        let a = post(&[("origin", origin.as_str())], &sub(endpoint).to_string());
+        assert_eq!(a.status, 400, "{} {}", endpoint, a.body);
+        assert!(a.body.contains(says), "{}: {}", endpoint, a.body);
+    }
+    for (keys, says) in [
+        (serde_json::json!({ "auth": "swC8VcTjKc8fIaxz_rdm_Q" }), "no keys.p256dh"),
+        (serde_json::json!({ "p256dh": "BF5J", "auth": "swC8VcTjKc8fIaxz_rdm_Q" }), "keys.p256dh is not 65 bytes"),
+        (serde_json::json!({ "p256dh": format!("B{}", "A".repeat(86)), "auth": "swC8VcTjKc8fIaxz_rdm_Q" }), "keys.p256dh is not a P-256 public key"),
+        (serde_json::json!({ "p256dh": p256dh, "auth": "swC8VcTjKc8fIaxz_rdm" }), "keys.auth is not 16 bytes"),
+        (serde_json::json!({ "p256dh": p256dh, "auth": "not base64url!" }), "keys.auth is not 16 bytes"),
+    ] {
+        let a = post(&[("origin", origin.as_str())], &serde_json::json!({ "endpoint": "https://push.example.com/x", "keys": keys }).to_string());
+        assert_eq!(a.status, 400, "{}", a.body);
+        assert!(a.body.contains(says), "{}: {}", says, a.body);
+    }
+    // Padded base64, as some libraries write it, is taken.
+    let padded = serde_json::json!({ "endpoint": "https://push.example.com/padded", "keys": { "p256dh": format!("{}=", p256dh), "auth": "swC8VcTjKc8fIaxz_rdm_Q==" } });
+    assert_eq!(post(&[("origin", origin.as_str())], &padded.to_string()).status, 200);
+    let a = support::send(port, "DELETE", "/_quillo/push", &[("host", &host), ("sec-fetch-site", "cross-site")], r#"{"endpoint":"https://push.example.com/padded"}"#);
+    assert_eq!(a.status, 403);
+    assert_eq!(support::send(port, "PUT", "/_quillo/push", &[("host", &host)], "{}").status, 405);
+}
+
+// B.3: a program that never names `notification` pays nothing: no /_quillo/push, the worker slice
+// 3 serves (the one that takes itself away), and no system database made by sign-ins and sign-outs.
+// One that does gets Quillo's worker for it: with no offline route (and under --watch, with or
+// without one) the one that shows notifications and keeps nothing (no `fetch` handler); with
+// offline routes, the offline worker with the notifications part; an offline program without
+// `notification` has no notifications part. Reading the key, a send with no subscription and a
+// sign-out make no table either.
+#[test]
+fn notification_a_program_without_it_pays_nothing() {
+    let plain = "route GET /in/:who {\n    set_session({ user: who })\n    redirect(\"/\")\n}\nroute GET /out {\n    end_session()\n    redirect(\"/\")\n}\nroute GET / = \"home\"\n";
+    let d = dir("n-none", plain);
+    let (_s, port) = push_server(&d, &[], &[]);
+    assert_eq!(support::send(port, "GET", "/_quillo/push", &[], "").status, 404);
+    assert_eq!(support::send(port, "POST", "/_quillo/push", &[], "{}").status, 404);
+    let (status, _, worker) = fetch_body(port, "/_quillo/sw.js");
+    assert!(status == 200 && worker.contains("registration.unregister()") && !worker.contains("\"push\""), "{}", worker);
+    let (ana, _) = session_step(port, "/in/ana", "");
+    session_step(port, "/out", &ana);
+    assert!(!d.join("quillo-system.db").exists());
+    // Uses it, no offline route: the worker that shows notifications.
+    let d = dir("n-worker", PUSHER);
+    let (_s, port) = push_server(&d, &[], &[]);
+    let (status, h, worker) = fetch_body(port, "/_quillo/sw.js");
+    assert_eq!((status, header(&h, "cache-control"), header(&h, "service-worker-allowed")), (200, Some("no-cache"), Some("/")));
+    assert!(worker.contains("addEventListener(\"push\"") && worker.contains("addEventListener(\"notificationclick\"") && !worker.contains("addEventListener(\"fetch\"") && !worker.contains("unregister"), "{}", worker);
+    assert!(!worker.lines().any(|l| l.trim_start().starts_with("//")), "comments are not served: {}", worker);
+    let etag = header(&h, "etag").unwrap().to_string();
+    assert_eq!(fetch(port, "GET", "/_quillo/sw.js", &[("if-none-match", &etag)]).0, 304);
+    push_key(port);
+    assert_eq!(send_to(port, "ana", serde_json::json!({ "title": "t" })), serde_json::json!({ "sent": 0, "gone": 0 }));
+    let (ana, _) = session_step(port, "/in/ana", "");
+    session_step(port, "/out", &ana);
+    assert!(!d.join("quillo-system.db").exists());
+    // Under --watch, the same worker, and the dev key's: no worker that takes itself away.
+    let d = dir("n-worker-watch", &format!("{}route offline GET /menu = <html><body>menu</body></html>\n", PUSHER));
+    let (_s, port) = push_server(&d, &["--watch"], &[("QUILLO_SECRET", "")]);
+    let watched = fetch_body(port, "/_quillo/sw.js").2;
+    assert!(watched.contains("addEventListener(\"push\"") && !watched.contains("addEventListener(\"fetch\"") && !watched.contains("unregister"), "{}", watched);
+    // With offline routes: both parts; an offline program without `notification`: no push part.
+    let d = dir("n-worker-offline", &format!("{}route offline GET /menu = <html><body>menu</body></html>\n", PUSHER));
+    let (_s, port) = push_server(&d, &[], &[]);
+    let both = fetch_body(port, "/_quillo/sw.js").2;
+    assert!(both.contains("addEventListener(\"fetch\"") && both.contains("addEventListener(\"push\"") && both.contains("addEventListener(\"notificationclick\""), "{}", both);
+    let d = dir("n-worker-offline-only", "route offline GET /menu = <html><body>menu</body></html>\n");
+    let (_s, port) = push_server(&d, &[], &[]);
+    let offline = fetch_body(port, "/_quillo/sw.js").2;
+    assert!(offline.contains("addEventListener(\"fetch\"") && !offline.contains("\"push\"") && !offline.contains("notificationclick"), "{}", offline);
+    assert_eq!(support::send(port, "GET", "/_quillo/push", &[], "").status, 404);
+}
+
+/// `quillo check` of `src`: its error and warning lines.
+fn check_lines(name: &str, src: &str) -> (bool, Vec<String>) {
+    let d = dir(name, src);
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"));
+    c.args(["check", "main.qwe"]).current_dir(&d);
+    let o = within(c, 30);
+    let text = String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr);
+    (o.status.success(), text.lines().filter(|l| l.contains(": error: ") || l.contains(": warning: ")).map(String::from).collect())
+}
+
+const BROWSER_ONLY: &str = "`notification.ask`, `notification.state` and `notification.stop` ask and read the browser: call them from an event handler of a component (`@click`); the server sends with `notification.send(user, { title, body, url })`";
+
+// B.3, `quillo check`: `send` and `user` are the server's, refused in a component (its body or a
+// handler); `ask`, `state` and `stop` the browser's, refused where the code surely runs on the
+// server (a route, a server fn, a tick, a job, the top level) and in a component's body (`state`
+// may set a state); an `ask` after a wait in its handler (a server fn, `http`, `stop`) is warned
+// of, not one before it or after `state`; a variable named `notification` hides the module and is
+// said. The forms that work pass: ask, state and stop in handlers, state setting a state, send in
+// a route, a server fn, a tick and a job, user in a route.
+#[test]
+fn notification_quillo_check_says_where_each_belongs() {
+    let good = r#"server fn save() -> int = 1
+server fn ship(who: str) -> map = notification.send(who, { title: "Shipped" })
+route POST /send/:who = notification.send(who, { title: "t", body: "b", url: "/x", tag: "t", badge: 1, silent: true, ttl: "1h", urgency: "high" })
+route GET /ticket/:who = notification.user(who)
+every(3600000, () => notification.send("x", { title: "tick" }))
+schedule("0 3 * * *", () => notification.send("x", { title: "job" }))
+component Alerts() {
+    state on = notification.state()
+    <div>
+        <button @click={() => { on = notification.ask() }}>ask</button>
+        <button @click={() => { on = notification.ask({ user: "t" })
+            on = str(save()) }}>ask, then save</button>
+        <button @click={() => { if notification.state() != "granted" { on = notification.ask() } }}>state, then ask</button>
+        <button @click={() => { on = notification.stop() }}>stop</button>
+        <button @mount={() => { on = notification.state() }}>mount</button>
+    </div>
+}
+route GET / = <html><body><Alerts/></body></html>
+"#;
+    let (ok, lines) = check_lines("n-check-good", good);
+    assert!(ok && lines.is_empty(), "{:?}", lines);
+    let bad = r#"server fn save() -> int = 1
+server fn s() {
+    notification.state()
+    notification.stop()
+}
+route GET /a {
+    notification.ask()
+    "x"
+}
+every(3600000, () => notification.ask())
+schedule("0 3 * * *", () => notification.stop())
+component C() {
+    state a = notification.stop()
+    let b = notification.state()
+    let c = notification.ask()
+    let t = notification.user("x")
+    <div>
+        <button @click={() => notification.send("x", { title: "t" })}>{a}{b}{c}{t}</button>
+        <button @click={() => { save()
+            a = notification.ask() }}>save, then ask</button>
+        <button @click={() => { let r = http.get("/x")
+            a = notification.ask() }}>get, then ask</button>
+        <button @click={() => { notification.stop()
+            a = notification.ask() }}>stop, then ask</button>
+    </div>
+}
+route GET / = <html><body><C/></body></html>
+"#;
+    let (ok, lines) = check_lines("n-check-bad", bad);
+    assert!(!ok);
+    let on = |line: u32, f: &str, place: &str| format!("main.qwe:{}: error: `notification.{}` {} runs on the server; {}", line, f, place, BROWSER_ONLY);
+    let body = |line: u32, f: &str, or: &str| format!("main.qwe:{}: error: `notification.{}` in <C> runs in the browser, and the server renders <C> first: call it from an event handler (@click){}", line, f, or);
+    let late = |line: u32, w: &str| format!("main.qwe:{}: warning: `notification.ask` comes after `{}` waits in this handler: browsers show the permission prompt only close to the click, so ask first, then wait", line, w);
+    let want = vec![
+        on(3, "state", "in a `server fn`"),
+        on(4, "stop", "in a `server fn`"),
+        on(7, "ask", "in a route"),
+        on(10, "ask", "in a tick"),
+        on(11, "stop", "in a job"),
+        body(13, "stop", ""),
+        body(14, "state", ", or set a state with it: state on = notification.state()"),
+        body(15, "ask", ""),
+        "main.qwe:16: error: `notification.user` is the server's, and <C> also runs in the browser: call it from a `server fn`".to_string(),
+        "main.qwe:18: error: `notification.send` is the server's, and <C> also runs in the browser: call it from a `server fn`".to_string(),
+        late(20, "save"),
+        late(22, "http.get"),
+        late(24, "notification.stop"),
+    ];
+    let mut got: Vec<String> = lines.into_iter().filter(|l| l.contains("notification")).collect();
+    got.sort_by_key(|l| l.split(':').nth(1).and_then(|n| n.parse::<u32>().ok()).unwrap_or(0));
+    assert_eq!(got, want);
+    // A variable that hides the module.
+    let (ok, lines) = check_lines("n-check-hidden", "let notification = { send: (a, b) => 1 }\nroute GET / = notification.send(\"a\", { title: \"t\" })\n");
+    assert!(!ok && lines.iter().any(|l| l.contains("`notification.send`: `notification` is the program's variable from main.qwe:1, which hides the module")), "{:?}", lines);
+    let (ok, lines) = check_lines("n-check-local", "fn f(who: str) {\n    let notification = { title: \"Shipped\" }\n    notification.send(who, notification)\n}\nroute GET / = f(\"a\")\n");
+    assert!(!ok && lines.iter().any(|l| l.contains("main.qwe:3: error: `notification.send`: `notification` here is map, a variable, which hides the module `notification`: rename the variable")), "{:?}", lines);
+    // A map of that name used as one is no mistake.
+    let (ok, lines) = check_lines("n-check-data", "fn f() {\n    let notification = { title: \"Shipped\" }\n    notification.title\n}\nroute GET / = f()\n");
+    assert!(ok, "{:?}", lines);
+    let (ok, lines) = check_lines("n-check-hidden2", "let notification = 3\nroute GET / = notification.send(\"a\", { title: \"t\" })\n");
+    assert!(!ok);
+    assert!(lines.iter().any(|l| l.contains("`notification` is the program's variable from main.qwe:1, which hides the module `notification` in every file: rename the variable")), "{:?}", lines);
+    // Options written in the call: those there are, and a message with its title.
+    let (ok, lines) = check_lines("n-check-options", "server fn ship(who: str) -> map = notification.send(who, { body: \"b\", icon: \"x.png\" })\ncomponent C() {\n    state on = \"\"\n    <button @click={() => { on = notification.ask({ who: 1 }) }}>{on}</button>\n}\nroute GET / = <html><body><C/></body></html>\n");
+    assert!(!ok);
+    assert_eq!(
+        lines,
+        [
+            "main.qwe:1: error: `notification.send`: unknown option `icon` (the options are title, body, url, tag, badge, silent, ttl, urgency)",
+            "main.qwe:1: error: `notification.send` needs a `title`: the line the device shows first",
+            "main.qwe:4: error: `notification.ask`: unknown option `who` (the option is user)",
+        ]
+    );
+    // What a module does not have.
+    let (ok, lines) = check_lines("n-check-none", "route GET / = notification.push(\"a\")\n");
+    assert!(!ok && lines.iter().any(|l| l.contains("`notification` has no function `push`")), "{:?}", lines);
+}
+
+// B.3, at run time without the check: `ask` and `stop` on the server fail saying where they go, as
+// does `state` outside a component's render; `state` in one gives null, which the browser reads
+// again. A component that sends, or seals a user, is refused as it is compiled for the browser,
+// and the program does not start.
+#[test]
+fn notification_on_the_wrong_side_it_fails_saying_why() {
+    let src = "route GET /ask = notification.ask()\nroute GET /stop = notification.stop()\nroute GET /state = notification.state()\ncomponent S() {\n    state on = notification.state()\n    <p id=\"on\">[{on ?? \"null\"}]</p>\n}\nroute GET /s = <html><body><S/></body></html>\n";
+    let d = dir("n-sides", src);
+    let (s, port) = push_server(&d, &["--no-check"], &[]);
+    for path in ["/ask", "/stop", "/state"] {
+        assert_eq!(support::send(port, "GET", path, &[], "").status, 500, "{}", path);
+    }
+    assert_eq!(log_with(&s, BROWSER_ONLY).matches(BROWSER_ONLY).count(), 3);
+    assert!(page(port, "/s").contains("<p id=\"on\">[null]</p>"));
+    for (f, call) in [("send", "notification.send(\"x\", { title: \"t\" })"), ("user", "notification.user(\"x\")")] {
+        let d = dir(&format!("n-sides-{}", f), &format!("component Bad() {{\n    let r = {}\n    <p>{{r}}</p>\n}}\nroute GET / = <html><body><Bad/></body></html>\n", call));
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"));
+        c.args(["run", "main.qwe", "--no-check", "--port", &support::free_port().to_string()]).current_dir(&d);
+        let o = within(c, 30);
+        let log = String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && log.contains(&format!("main.qwe:2: <Bad> (compiled for the browser): `notification.{}` is the server's: call it from a `server fn`", f)), "{}", log);
+    }
+}
+
+// B.3, Q-956: a program that uses `notification` with no QUILLO_SECRET is told at start that a
+// restart ends every subscription; not with one, not under --watch (the dev key in .quillo), not
+// a program without it, and once a process (`--instances 2`).
+#[test]
+fn notification_warns_at_start_without_a_secret() {
+    const SAID: &str = "quillo: this program uses `notification` without QUILLO_SECRET: its push key is made at start, so a restart ends every device's subscription; set QUILLO_SECRET, the same on every server";
+    let d = dir("n-warn", PUSHER);
+    let (s, _) = push_server(&d, &["--instances", "2"], &[("QUILLO_SECRET", "")]);
+    assert_eq!(log_with(&s, "listening").matches(SAID).count(), 1);
+    drop(s);
+    let (s, _) = push_server(&d, &[], &[]);
+    assert!(!log_with(&s, "listening").contains(SAID));
+    drop(s);
+    let (s, _) = push_server(&d, &["--watch"], &[("QUILLO_SECRET", "")]);
+    assert!(!log_with(&s, "listening").contains(SAID));
+    drop(s);
+    let d = dir("n-warn-none", "route GET / = \"home\"\n");
+    let (s, _) = push_server(&d, &[], &[("QUILLO_SECRET", "")]);
+    let log = log_with(&s, "listening");
+    assert!(log.contains("listening") && !log.contains("notification"), "{}", log);
+}
+
+/// Runs the worker a server serves (`@CODE@`) in Node's vm, with a browser's worker played: each
+/// case delivers a push (`push`: its data as text, or null for none) or clicks a notification
+/// (`click`: its `navigate`), with the windows open given (`windows`; `uncontrolled`: their
+/// `navigate` fails, as for a window the worker does not control), and gives what the worker did.
+const WORKER_CASES: &str = r#"
+const vm = require("vm");
+const code = require("fs").readFileSync(process.argv[2], "utf8");
+async function run(c) {
+  const handlers = {}, did = [];
+  const win = (url) => ({ url, focus: async () => { did.push("focus " + url); }, navigate: async (to) => { if (c.uncontrolled) throw new TypeError("not controlled"); did.push("navigate " + to); } });
+  const self = {
+    addEventListener: (n, f) => { handlers[n] = f; },
+    skipWaiting() {},
+    registration: { showNotification: async (t, o) => { did.push(["show", t, o]); } },
+    clients: { matchAll: async (o) => { did.push("all " + JSON.stringify(o)); return (c.windows || []).map(win); }, openWindow: async (u) => { did.push("open " + u); }, claim: async () => {} },
+  };
+  const navigator = c.badges ? { setAppBadge: async (n) => { did.push("badge " + n); }, clearAppBadge: async () => { did.push("badge cleared"); } } : {};
+  const ctx = { self, caches: { keys: async () => [], delete: async () => true }, location: { origin: "http://app.test" }, navigator, URL, Promise, Number, JSON, TypeError };
+  vm.createContext(ctx);
+  vm.runInContext(code, ctx);
+  const waits = [];
+  if ("push" in c) handlers.push({ data: c.push === null ? null : { json: () => JSON.parse(c.push) }, waitUntil: (p) => waits.push(p) });
+  if ("click" in c) handlers.notificationclick({ notification: { data: c.click === undefined ? undefined : { navigate: c.click }, close: () => did.push("close") }, waitUntil: (p) => waits.push(p) });
+  await Promise.all(waits);
+  return did;
+}
+(async () => {
+  const out = [];
+  for (const c of JSON.parse(process.argv[3])) out.push(await run(c));
+  console.log(JSON.stringify(out));
+})();
+"#;
+
+fn worker_did(code: &str, cases: serde_json::Value) -> serde_json::Value {
+    let d = support::temp_dir("f67-worker-did");
+    std::fs::write(d.join("sw.js"), code).unwrap();
+    std::fs::write(d.join("run.cjs"), WORKER_CASES).unwrap();
+    let mut c = std::process::Command::new("node");
+    c.arg(d.join("run.cjs")).arg(d.join("sw.js")).arg(cases.to_string());
+    let o = within(c, 30);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    serde_json::from_slice(&o.stdout).unwrap()
+}
+
+// B.3: Quillo's worker shows a push as its declarative message says: title, body, tag, `silent`,
+// and `app_badge` as the app's badge where the browser has one (0 takes it away); a push that is
+// no JSON, or empty, still shows (Chrome would show its own line otherwise). A click closes the
+// notification and focuses a window of the app at the message's address, moves one elsewhere
+// there, or opens one; never another site's address (the app's home instead), and a window the
+// worker cannot move is left for a new one. Under --base, a window outside it is not the app's.
+#[test]
+fn notification_the_worker_shows_a_push_and_opens_its_page() {
+    let d = dir("n-worker-vm", PUSHER);
+    let (_s, port) = push_server(&d, &[], &[]);
+    let worker = fetch_body(port, "/_quillo/sw.js").2;
+    let push = |n: serde_json::Value| serde_json::json!({ "web_push": 8030, "notification": n }).to_string();
+    let all = r#"all {"type":"window","includeUncontrolled":true}"#;
+    let r = worker_did(&worker, serde_json::json!([
+        { "push": push(serde_json::json!({ "title": "Shipped ✓", "body": "Order 7", "navigate": "http://app.test/orders/7", "tag": "o7", "silent": true, "app_badge": 3 })), "badges": true },
+        { "push": push(serde_json::json!({ "title": "t", "navigate": "http://app.test/", "app_badge": 0 })), "badges": true },
+        { "push": push(serde_json::json!({ "title": "t", "navigate": "http://app.test/", "app_badge": 2 })) },
+        { "push": "not json" },
+        { "push": null },
+        { "click": "http://app.test/orders/7", "windows": ["http://app.test/orders/7", "http://app.test/"] },
+        { "click": "http://app.test/orders/7", "windows": ["http://app.test/cart"] },
+        { "click": "http://app.test/orders/7", "windows": [] },
+        { "click": "https://evil.test/x", "windows": [] },
+        { "click": "http://app.test/orders/7", "windows": ["http://app.test/cart"], "uncontrolled": true },
+        { "click": null },
+    ]));
+    assert_eq!(
+        r,
+        serde_json::json!([
+            [["show", "Shipped ✓", { "body": "Order 7", "data": { "navigate": "http://app.test/orders/7" }, "tag": "o7", "silent": true }], "badge 3"],
+            [["show", "t", { "body": "", "data": { "navigate": "http://app.test/" } }], "badge cleared"],
+            [["show", "t", { "body": "", "data": { "navigate": "http://app.test/" } }]],
+            [["show", "", { "body": "", "data": { "navigate": "" } }]],
+            [["show", "", { "body": "", "data": { "navigate": "" } }]],
+            ["close", all, "focus http://app.test/orders/7"],
+            ["close", all, "focus http://app.test/cart", "navigate http://app.test/orders/7"],
+            ["close", all, "open http://app.test/orders/7"],
+            ["close", all, "open http://app.test/"],
+            ["close", all, "focus http://app.test/cart", "open http://app.test/orders/7"],
+            ["close", all, "open http://app.test/"],
+        ])
+    );
+    // Under --base: the app is under /shop.
+    let d = dir("n-worker-vm-base", PUSHER);
+    let (_s, port) = push_server(&d, &["--base", "/shop"], &[]);
+    let worker = fetch_body(port, "/_quillo/sw.js").2;
+    let r = worker_did(&worker, serde_json::json!([
+        { "click": "http://app.test/shop/orders/7", "windows": ["http://app.test/other"] },
+        { "click": "http://app.test/shop/orders/7", "windows": ["http://app.test/other", "http://app.test/shop"] },
+        { "click": null },
+    ]));
+    assert_eq!(
+        r,
+        serde_json::json!([
+            ["close", all, "open http://app.test/shop/orders/7"],
+            ["close", all, "focus http://app.test/shop", "navigate http://app.test/shop/orders/7"],
+            ["close", all, "open http://app.test/shop/"],
+        ])
+    );
+}
+
+/// The Chrome cases' program: sign-in, a send, a worker of the page's own, and buttons for each
+/// of `ask` (its error value shown), `ask` given an option it does not have, `stop` and `state`.
+const CHROME_PUSH: &str = r#"route POST /in/:who {
+    set_session({ user: who })
+    "ok"
+}
+route POST /send/:who = notification.send(who, request.json)
+route GET /own-sw.js = file("own-sw.js")
+component Alerts() {
+    state on = notification.state()
+    state n = 0
+    <div>
+        <p id="on" data-n={n}>{on}</p>
+        <button id="ask" @click={() => {
+            let r = notification.ask()
+            on = is_err(r) ? `error: ${r.error}` : r
+            n += 1
+        }}>ask</button>
+        <button id="bad" @click={() => {
+            let o = { who: 1 }
+            on = notification.ask(o)
+        }}>bad</button>
+        <button id="stop" @click={() => {
+            on = notification.stop()
+            n += 1
+        }}>stop</button>
+        <button id="state" @click={() => {
+            on = notification.state()
+            n += 1
+        }}>state</button>
+    </div>
+}
+route GET / = <html><body><Alerts/></body></html>
+"#;
+
+/// What the Chrome cases share: DevTools commands asked of run.js (QUILLO_PAGE_CDP), the button
+/// clicked and `#on` waited on, and `PushManager` played, headless Chrome having no push service of
+/// its own here: a subscription whose keys Node made (`give`), or one that never answers (`hang`).
+const PUSH_KIT: &str = r#"
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  const cdp = async (cmds) => {
+    document.body.setAttribute("data-cdp-out", "");
+    document.body.setAttribute("data-cdp", JSON.stringify(cmds));
+    for (let i = 0; i < 1000 && document.body.hasAttribute("data-cdp"); i++) await tick(20);
+    return JSON.parse(document.body.getAttribute("data-cdp-out"));
+  };
+  const on = () => document.getElementById("on").textContent;
+  const count = () => document.getElementById("on").getAttribute("data-n");
+  const press = async (id, n = 1500) => {
+    const was = count();
+    document.getElementById(id).click();
+    for (let i = 0; i < n && count() === was; i++) await tick(20);
+    return count() === was ? "no answer (was " + on() + ")" : on();
+  };
+  const b64 = (b) => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const sink = "http://127.0.0.1:@SINK@";
+  const made = async (kind = "ok") => (await (await fetch(sink + "/_made?n=1&kind=" + kind)).json())[0];
+  const played = { subscribed: [], unsubscribed: [] };
+  let mine = null;
+  const asSub = (s, key) => ({ endpoint: s.endpoint, options: { applicationServerKey: key }, toJSON: () => s, unsubscribe: async () => { played.unsubscribed.push(s.endpoint.split("/").pop()); mine = null; return true; } });
+  const give = (s) => {
+    PushManager.prototype.subscribe = async function (o) { played.subscribed.push({ userVisibleOnly: o.userVisibleOnly, key: b64(o.applicationServerKey) }); mine = asSub(s, o.applicationServerKey); return mine; };
+    PushManager.prototype.getSubscription = async function () { return mine; };
+  };
+  const hang = () => {
+    PushManager.prototype.subscribe = () => new Promise(() => {});
+    PushManager.prototype.getSubscription = async function () { return null; };
+  };
+  const grant = () => cdp([["Browser.grantPermissions", { origin: location.origin, permissions: ["notifications"] }]]);
+  const signIn = (who) => fetch("/in/" + who, { method: "POST" });
+"#;
+
+const PUSH_FLOW: &str = r#"(async () => {@KIT@
+  const out = {};
+  try {
+    for (let i = 0; i < 500 && on() === ""; i++) await tick(20);
+    out.first = on();
+    await grant();
+    out.permission = Notification.permission;
+    // A subscription the browser holds from another key (a QUILLO_SECRET changed): made again.
+    const old = await made(), fresh = await made();
+    mine = asSub(old, new Uint8Array(65).fill(4).buffer);
+    give(fresh);
+    out.before = await press("state");
+    await signIn("ana");
+    out.asked = await press("ask");
+    out.again = await press("ask");
+    out.state = await press("state");
+    out.played = played;
+    out.key = (await (await fetch("/_quillo/push")).json()).key;
+    out.sent = await (await fetch("/send/ana", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title: "Shipped ✓", body: "Grüße", url: "/orders/7", tag: "o7" }) })).json();
+    const got = await (await fetch(sink + "/_got")).json();
+    out.got = got.map((g) => ({ path: g.path.split("-")[0], message: g.message, signed: g.vapid.signature_ok, k: g.vapid.k === out.key }));
+    // The push delivered to Quillo's worker by DevTools, which shows it.
+    await cdp([["ServiceWorker.enable", {}]]);
+    let reg = null;
+    for (let i = 0; i < 100 && !reg; i++) {
+      const [evs] = await cdp([["@events", { prefix: "ServiceWorker.workerRegistrationUpdated" }]]);
+      reg = evs.flatMap((e) => e.params.registrations).find((r) => r.scopeURL === location.origin + "/" && !r.isDeleted);
+      if (!reg) await tick(50);
+    }
+    out.delivered = await cdp([["ServiceWorker.deliverPushMessage", { origin: location.origin + "/", registrationId: reg.registrationId, data: got[0].text }]]);
+    const r = await navigator.serviceWorker.getRegistration("/");
+    out.script = new URL(r.active.scriptURL).pathname;
+    let shown = [];
+    for (let i = 0; i < 600 && !shown.length; i++) { shown = await r.getNotifications(); if (!shown.length) await tick(25); }
+    out.shown = shown.map((n) => ({ title: n.title, body: n.body, tag: n.tag, data: n.data }));
+    out.stopped = await press("stop");
+    out.after = await (await fetch("/send/ana", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title: "t" }) })).json();
+    out.unsubscribed = played.unsubscribed;
+    document.getElementById("bad").click();
+    for (let i = 0; i < 200 && !window.__quilloErrors.length; i++) await tick(20);
+    out.errors = window.__quilloErrors;
+  } catch (e) { out.error = String(e && e.stack || e); }
+  document.body.dataset.result = JSON.stringify(out);
+})();"#;
+
+/// `script` in Chrome at `url` with DevTools commands for the page, within `ms`.
+fn in_chrome_cdp(chrome: &Path, url: &str, script: &str, ms: u64) -> serde_json::Value {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let t = support::temp_dir(&format!("f67-chrome-push-{}", script.len()));
+    std::fs::write(t.join("t.js"), script).unwrap();
+    let mut c = std::process::Command::new("node");
+    // Chrome's own notification centre, not the system's: on macOS a Chrome started while the one
+    // before was going away showed nothing through the system's, which a test cannot ask.
+    c.arg(root.join("browser/run.js")).arg(chrome).arg(url).arg(t.join("profile")).arg(ms.to_string()).arg(t.join("t.js")).env("QUILLO_PAGE_CDP", "1").env("QUILLO_CHROME_FLAGS", "--disable-features=NativeNotifications,SystemNotifications");
+    let out = within(c, ms / 1000 + 30);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{}: {}", e, String::from_utf8_lossy(&out.stdout)))
+}
+
+// B.3 in Chrome: the permission granted (DevTools), `state` says "default" until `ask`, which
+// registers Quillo's worker, makes again a subscription held from another key, subscribes with the
+// server's key (`userVisibleOnly`), posts it bound to the signed-in visitor, and says "granted";
+// asked again, it keeps the one it has. The server's send reaches Node's push service, decrypted
+// and signed; delivered to Quillo's worker (DevTools' deliverPushMessage), the push is shown with
+// its title, body, tag and address. `stop` unsubscribes and unbinds it; an option `ask` has not is
+// a mistake.
+#[test]
+fn notification_in_chrome_ask_send_show_stop() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let sink = sink();
+    let d = dir("n-chrome", CHROME_PUSH);
+    std::fs::write(d.join("own-sw.js"), "self.addEventListener(\"install\", () => self.skipWaiting());\n").unwrap();
+    assert!(check(&d).0, "{:?}", check(&d));
+    let (_s, port) = push_server(&d, &[], &[]);
+    let script = PUSH_FLOW.replace("@KIT@", PUSH_KIT).replace("@SINK@", &sink.port.to_string());
+    let r = in_chrome_cdp(&chrome, &format!("http://127.0.0.1:{}/", port), &script, 120000);
+    assert_eq!(r["error"], serde_json::Value::Null, "{}", r);
+    let key = push_key(port);
+    assert_eq!((r["first"].as_str(), r["permission"].as_str(), r["before"].as_str()), (Some("default"), Some("granted"), Some("default")), "{}", r);
+    assert_eq!((r["asked"].as_str(), r["again"].as_str(), r["state"].as_str(), r["key"].as_str()), (Some("granted"), Some("granted"), Some("granted"), Some(key.as_str())), "{}", r);
+    assert_eq!(r["played"]["subscribed"], serde_json::json!([{ "userVisibleOnly": true, "key": key }]), "{}", r);
+    assert_eq!(r["sent"], serde_json::json!({ "sent": 1, "gone": 0 }));
+    let nav = format!("http://127.0.0.1:{}/orders/7", port);
+    assert_eq!(r["got"], serde_json::json!([{ "path": "/push/ok", "message": { "web_push": 8030, "notification": { "title": "Shipped ✓", "body": "Grüße", "navigate": nav, "tag": "o7" } }, "signed": true, "k": true }]), "{}", r);
+    assert_eq!((r["delivered"].clone(), r["script"].as_str()), (serde_json::json!([{}]), Some("/_quillo/sw.js")));
+    assert_eq!(r["shown"], serde_json::json!([{ "title": "Shipped ✓", "body": "Grüße", "tag": "o7", "data": { "navigate": nav } }]), "{}", r);
+    assert_eq!((r["stopped"].as_str(), r["after"].clone()), (Some("default"), serde_json::json!({ "sent": 0, "gone": 0 })));
+    // The one from the other key, then the one `stop` ended.
+    assert_eq!(r["unsubscribed"].as_array().map(|a| a.len()), Some(2), "{}", r);
+    assert!(r["errors"].to_string().contains("`notification.ask`: unknown option `who` (the option is user)"), "{}", r);
+}
+
+const PUSH_EDGES: &str = r#"(async () => {@KIT@
+  const out = {};
+  try {
+    for (let i = 0; i < 500 && on() === ""; i++) await tick(20);
+    await grant();
+    // No one signed in: the server refuses, ask says why, and what it made is undone.
+    give(await made());
+    out.nobody = await press("ask");
+    out.nobody_state = await press("state");
+    out.unsubscribed = played.unsubscribed.length;
+    // No push here (a Safari tab on an iPhone): each says so.
+    const PM = window.PushManager;
+    delete window.PushManager;
+    out.unsupported = [await press("state"), await press("ask"), await press("stop")];
+    window.PushManager = PM;
+    // A worker of the page's own at Quillo's scope: not replaced.
+    for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+    const own = await navigator.serviceWorker.register("/own-sw.js", { scope: "/" });
+    for (let i = 0; i < 600 && !(own.active && own.active.scriptURL.endsWith("/own-sw.js")); i++) await tick(25);
+    await signIn("ana");
+    out.own = await press("ask");
+    out.own_state = await press("state");
+    out.own_stop = await press("stop");
+    await own.unregister();
+    // A subscribe that never answers: "unsupported" once ask's 20 s are up.
+    hang();
+    const t0 = Date.now();
+    out.late = await press("ask", 2000);
+    out.ms = Date.now() - t0;
+  } catch (e) { out.error = String(e && e.stack || e); }
+  document.body.dataset.result = JSON.stringify(out);
+})();"#;
+
+// B.3 in Chrome, the edges: with no one signed in the server refuses the subscription, `ask` gives
+// the server's reason as an error value and unsubscribes what it made, so `state` stays "default";
+// where the page has no push, `state`, `ask` and `stop` say "unsupported"; a worker of the page's
+// own at the scope is not replaced (an error value), `state` and `stop` then say "default"; and a
+// subscribe that never answers (as headless Chrome's did in the report) gives "unsupported" after
+// ask's 20 s, not a handler waiting for good.
+#[test]
+fn notification_in_chrome_refusals_and_the_time_limit() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let sink = sink();
+    let d = dir("n-chrome-edges", CHROME_PUSH);
+    std::fs::write(d.join("own-sw.js"), "self.addEventListener(\"install\", () => self.skipWaiting());\n").unwrap();
+    let (_s, port) = push_server(&d, &[], &[]);
+    let script = PUSH_EDGES.replace("@KIT@", PUSH_KIT).replace("@SINK@", &sink.port.to_string());
+    let r = in_chrome_cdp(&chrome, &format!("http://127.0.0.1:{}/", port), &script, 120000);
+    assert_eq!(r["error"], serde_json::Value::Null, "{}", r);
+    assert_eq!(r["nobody"].as_str(), Some("error: notification.ask: no one to send to: the visitor is not signed in (session().user), and ask was given no user: notification.user(x), made on the server, says who"), "{}", r);
+    assert_eq!((r["nobody_state"].as_str(), r["unsubscribed"].as_u64()), (Some("default"), Some(1)));
+    assert_eq!(r["unsupported"], serde_json::json!(["unsupported", "unsupported", "unsupported"]));
+    assert_eq!(r["own"].as_str(), Some(format!("error: notification: this page has a service worker of its own (http://127.0.0.1:{}/own-sw.js), which Quillo's would replace", port).as_str()), "{}", r);
+    assert_eq!((r["own_state"].as_str(), r["own_stop"].as_str()), (Some("default"), Some("default")));
+    assert_eq!(r["late"].as_str(), Some("unsupported"), "{}", r);
+    let ms = r["ms"].as_u64().unwrap();
+    assert!((19_500..32_000).contains(&ms), "{}", ms);
+}

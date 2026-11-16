@@ -237,6 +237,9 @@ const ACTS: &[&str] = &[
     "__service", "__service_later", "__site_call", "__site", "__built", "__callers", "schedule", "translations", "locale_from", "tenant_from", "allow_cross_site", "site_headers",
     "accept_calls", "style_with", "ready", "channel.on", "channel.send", "channel.broadcast", "channel.open", "receive", "media.rtp", "media.close", "media.on", "udp.listen",
     "udp.send", "udp.reply",
+    // The browser's, and a message sent; a sealed user is for this session and time
+    // (FEEDBACK67.md, B.3; branch pwa).
+    "notification.ask", "notification.state", "notification.stop", "notification.send", "notification.user",
 ];
 
 /// What the builtin `name` does (see `Kind`).

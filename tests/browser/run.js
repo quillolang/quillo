@@ -53,9 +53,14 @@ async function main() {
     await new Promise((ok, bad) => { ws.onopen = ok; ws.onerror = bad; });
     let id = 0;
     const pending = new Map();
+    // The events Chrome sent, the last 500, for a page that asks for them with QUILLO_PAGE_CDP
+    // (`["@events", { prefix }]`): a service worker's registration id, which
+    // `ServiceWorker.deliverPushMessage` takes (FEEDBACK67.md, B.3; branch pwa).
+    const events = [];
     ws.onmessage = (m) => {
       const msg = JSON.parse(m.data);
       if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
+      else if (msg.method && events.push({ method: msg.method, params: msg.params }) > 500) events.shift();
     };
     const send = (method, params) => new Promise((ok) => { const n = ++id; pending.set(n, ok); ws.send(JSON.stringify({ id: n, method, params })); });
     // Errors the runtime reports (quillo's `report`) are collected from the
@@ -122,6 +127,7 @@ async function main() {
         if (asked) {
           const answers = [];
           for (const [method, params] of JSON.parse(asked)) {
+            if (method === "@events") { answers.push(events.filter((e) => e.method.startsWith((params && params.prefix) || ""))); continue; }
             const r = await send(method, params);
             answers.push(r.result || { error: r.error });
           }

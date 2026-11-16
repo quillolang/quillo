@@ -1022,6 +1022,12 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("crypto.verify_password", "str, str | null", "bool"),
     ("crypto.equal", "str, str", "bool"),
     ("http.stream", "str, fn, map | null=", "map | error(str)"),
+    // A person's devices (FEEDBACK67.md, B.3; branch pwa): `state` is null while the server renders.
+    ("notification.ask", "map | null=", "str | error(str)"),
+    ("notification.state", "", "str | null"),
+    ("notification.stop", "", "str"),
+    ("notification.send", "any, map", "map | error(str)"),
+    ("notification.user", "any", "str"),
     ("udp.listen", "int, fn, map | null=", "null"),
     ("udp.send", "str, int, any, map | null=", "null | error(str)"),
     ("udp.reply", "map, any", "null | error(str)"),
@@ -1242,7 +1248,13 @@ pub fn call_shape(name: &str) -> String {
 /// Modules the browser has too (src/client/runtime.js).
 const BROWSER_MODULES: &[&str] = &["json", "math", "bit", "stats", "vec", "date", "money", "re"];
 
-pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "later", "math", "bit", "stats", "vec", "date", "money", "re"];
+pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "later", "math", "bit", "stats", "vec", "date", "money", "re", "notification"];
+
+/// `notification.send` and the rest, called on a variable of that name: always the module's, never
+/// a map of the program's own (FEEDBACK67.md, B.3; branch pwa).
+fn notification_named(m: &str, f: &str) -> bool {
+    m == "notification" && BUILTINS.iter().any(|(n, _, _)| n.strip_prefix("notification.") == Some(f))
+}
 
 /// What the modules hold that is not a function.
 const MODULE_VALUES: &[&str] = &["math.pi", "math.e", "math.tau", "math.inf", "math.nan"];
@@ -7192,8 +7204,10 @@ impl Checker {
                     // every file (FEEDBACK9.md, Q-069; branch feedback9-fixes).
                     let hidden = self.globals.get(m.as_str()).filter(|g| &*g.file != "<builtin>" && matches!(g.kind, Kind::Global)).map(|g| (g.file.clone(), g.line, g.t.bits));
                     // A map of the program's own (`let stats = { load: ... }`)
-                    // is what `stats.load()` means: its function is called.
-                    let own_map = matches!(hidden, Some((_, _, bits)) if bits & MAP != 0);
+                    // is what `stats.load()` means: its function is called. Not for one named
+                    // `notification`, a message's natural name, whose `send` and the rest are the
+                    // module's (FEEDBACK67.md, B.3; branch pwa).
+                    let own_map = matches!(hidden, Some((_, _, bits)) if bits & MAP != 0) && !notification_named(m, name);
                     if let Some((file, at, _)) = hidden.filter(|_| !own_map) {
                         let made = self.shown_at(&file, at);
                         let here = self.shown_at(&self.file.clone(), line);
@@ -7229,7 +7243,7 @@ impl Checker {
             // `let json = ...` in a function, then `json.stringify(...)`: the
             // variable, not the module, whose method this is not (Q-069).
             if let Expr::Ident(m, _) = &**obj {
-                if MODULES.contains(&m.as_str()) && recv.bits != 0 && recv.bits & MAP == 0 {
+                if MODULES.contains(&m.as_str()) && recv.bits != 0 && (recv.bits & MAP == 0 || notification_named(m, name)) {
                     self.error(format!(
                         "`{}.{}`: `{}` here is {}, a variable, which hides the module `{}`: rename the variable",
                         m, name, m, bits_text(recv.bits), m
@@ -7652,7 +7666,9 @@ impl Checker {
         }
         // A page opens channels; the rest of `channel` is the server's.
         // `http` calls go from the page too, once it has arrived.
-        if m == "http" && f != "stream" {
+        if m == "notification" {
+            self.notification_rules(f, args, piped);
+        } else if m == "http" && f != "stream" {
             self.http_rules(f, args, piped);
         } else if full == "http.stream" && self.in_component().is_some() {
             self.error("`http.stream` is the server's; in the browser, `receive(url, f, ...)` in a handler and `listen(url, f)` read a stream");
@@ -7757,6 +7773,83 @@ impl Checker {
     /// runs its `state` initializers. Elsewhere, a URL whose host comes from
     /// a value may be a visitor's, who could then reach the server's own
     /// network: a word, unless the call says `public_only` either way.
+    /// `notification`'s sides (FEEDBACK67.md, B.3; branch pwa): `send` and `user` are the
+    /// server's, never a component's; `ask`, `state` and `stop` the browser's, from a handler (and
+    /// `state` to set a state), and refused where the code surely runs on the server, as `ask` and
+    /// `notify` are (Q-959).
+    fn notification_rules(&mut self, f: &str, args: &[Expr], piped: bool) {
+        // Options written in the call that are none, and a message written out with no title:
+        // said before the program runs, as when it runs (as `http`'s options are).
+        let (at, known): (usize, &[&str]) = match f {
+            "ask" => (0, &["user"]),
+            "send" => (1, crate::push::OPTIONS),
+            _ => (usize::MAX, &[]),
+        };
+        if let (false, Some(Expr::Map(fields))) = (piped, args.get(at)) {
+            for (k, _) in fields.iter().filter(|(k, _)| !known.contains(&k.as_str())) {
+                let what = if f == "ask" { "the option is user".to_string() } else { format!("the options are {}", known.join(", ")) };
+                self.error(format!("`notification.{}`: unknown option `{}` ({})", f, k, what));
+            }
+            if f == "send" && !fields.iter().any(|(k, _)| k == "title") {
+                self.error("`notification.send` needs a `title`: the line the device shows first");
+            }
+        }
+        match f {
+            "send" | "user" => {
+                if let Some(c) = self.in_component() {
+                    self.error(format!("`notification.{}` is the server's, and <{}> also runs in the browser: call it from a `server fn`", f, c));
+                }
+            }
+            "ask" | "state" | "stop" => {
+                if let Some(place) = self.on_the_server() {
+                    self.error(format!("`notification.{}` {} runs on the server; {}", f, place, crate::push::BROWSER_ONLY));
+                } else if let Some(c) = self.in_component() {
+                    let (nested, init) = self.fns.last().map_or((false, false), |x| (x.nested, x.state_init));
+                    if (!nested && !init) || (init && f != "state") {
+                        let or = if f == "state" { ", or set a state with it: state on = notification.state()" } else { "" };
+                        self.error(format!("`notification.{}` in <{}> runs in the browser, and the server renders <{}> first: call it from an event handler (@click){}", f, c, c, or));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A handler's `notification.ask()` after it has waited (a `server fn`, `http`, a service,
+    /// `parallel`, `receive`, `markdown`): browsers show the prompt only close to the click, and
+    /// WebKit only in it, so the ask is better first (FEEDBACK67.md, B.3; branch pwa).
+    fn ask_after_wait(&mut self, d: &FnDef) {
+        // A variable that hides the module is said of already.
+        if !self.builtin_in_scope("notification") {
+            return;
+        }
+        let server: HashSet<String> = self.bodies.iter().filter(|(_, b)| b.server && !b.component).map(|(n, _)| n.clone()).collect();
+        let services: HashSet<String> = self.services.keys().cloned().collect();
+        let (mut waited, mut late): (Option<String>, Vec<(u32, String)>) = (None, Vec::new());
+        walk_fn(d, &mut |e| {
+            let Expr::Call(callee, _, line) = e else { return };
+            let (name, waits) = match &**callee {
+                Expr::Ident(n, _) => (n.to_string(), server.contains(&n.to_string()) || matches!(&**n, "parallel" | "receive" | "markdown")),
+                Expr::Field(o, f, _) => match &**o {
+                    Expr::Ident(m, _) => (format!("{}.{}", m, f), &**m == "http" || services.contains(&m.to_string()) || (&**m == "notification" && f == "stop")),
+                    _ => return,
+                },
+                _ => return,
+            };
+            if name == "notification.ask" {
+                if let Some(w) = &waited {
+                    late.push((*line, w.clone()));
+                }
+            } else if waits && waited.is_none() {
+                waited = Some(name);
+            }
+        });
+        for (line, w) in late {
+            self.line = line;
+            self.warn(format!("`notification.ask` comes after `{}` waits in this handler: browsers show the permission prompt only close to the click, so ask first, then wait", w));
+        }
+    }
+
     fn http_rules(&mut self, f: &str, args: &[Expr], piped: bool) {
         // An option written in the call that is not one: an error before
         // the program runs, as it is when it runs (FEEDBACK5.md, Q-049;
@@ -8678,6 +8771,9 @@ impl Checker {
                     self.browser_too += 1;
                     let t = self.expr(e);
                     self.browser_too -= 1;
+                    if let (true, Expr::Lambda(d)) = (name.starts_with('@'), e) {
+                        self.ask_after_wait(d);
+                    }
                     t
                 }
                 AttrVal::Expr(e) => self.expr(e),

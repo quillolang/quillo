@@ -349,6 +349,15 @@ fn attr(s: &str) -> String {
 /// phone shells. Nothing is set without the file and the tag.
 pub fn attach(it: &mut Interp, dir: &Path) {
     let name = installable(it, dir);
+    // Before the worker, which shows notifications for a program that sends them (FEEDBACK67.md,
+    // B.3; branch pwa).
+    let notification = crate::push::used_by(it);
+    if it.site.notification != notification {
+        Arc::make_mut(&mut it.site).notification = notification;
+    }
+    if notification {
+        crate::push::warn_without_secret();
+    }
     attach_offline(it, name.as_deref());
 }
 
@@ -866,6 +875,22 @@ pub struct Offline {
 /// page's content policy names it by one hash.
 static WORKER: &str = include_str!("client/sw.js");
 static WATCH_WORKER: &str = include_str!("client/sw-watch.js");
+/// The worker of a program that uses `notification` with no offline route, and under --watch: it
+/// keeps nothing, and shows notifications with sw.js's part for them (FEEDBACK67.md, B.3; branch
+/// pwa).
+static PUSH_WORKER: &str = include_str!("client/sw-push.js");
+
+/// sw.js up to its notifications (from its line `// @push`), and those: the whole for a program
+/// that uses `notification`, the first part alone for one that does not.
+fn worker_parts() -> (&'static str, &'static str) {
+    let at = WORKER.find("\n// @push").map_or(WORKER.len(), |i| i + 1);
+    (&WORKER[..at], &WORKER[at..])
+}
+
+/// Code as served: without its comments, which say what the guide says.
+fn uncommented(code: &str) -> String {
+    code.lines().filter(|l| !l.trim_start().starts_with("//")).flat_map(|l| [l, "\n"]).collect()
+}
 pub static GATE: &str = include_str!("client/sw-gate.js");
 
 /// The headers Quillo marks answers with for its worker: an offline route's page (`1`, or
@@ -926,9 +951,11 @@ fn attach_offline(it: &mut Interp, name: Option<&str>) {
     let mut files: Vec<String> = it.loaded.iter().map(|f| hash_of(std::fs::read(f).unwrap_or_default())).collect();
     files.sort();
     let shown: Vec<String> = offline.iter().map(|r| r.shown()).collect();
-    let version = hash_of((crate::version(), WORKER, GATE, &base, &shown, &files, &offline_page));
-    // Without its comments, which say what the guide says.
-    let code: String = WORKER.lines().filter(|l| !l.trim_start().starts_with("//")).flat_map(|l| [l, "\n"]).collect();
+    // With the part that shows notifications for a program that sends them (FEEDBACK67.md, B.3;
+    // branch pwa).
+    let source = if it.site.notification { WORKER } else { worker_parts().0 };
+    let version = hash_of((crate::version(), source, GATE, &base, &shown, &files, &offline_page));
+    let code = uncommented(source);
     let worker = code
         .replacen("@BASE@", &js(&base), 1)
         .replacen("@V@", &js(&version), 1)
@@ -987,6 +1014,13 @@ pub fn worker_answer(it: &Interp, req: &HttpRequest) -> Option<HttpResponse> {
     }
     let (body, etag) = match it.site.offline.as_ref() {
         Some(o) => (o.worker.clone(), o.etag.clone()),
+        // A program that sends notifications, with no offline route or under --watch: the worker
+        // that shows them and keeps nothing (FEEDBACK67.md, B.3; branch pwa).
+        None if it.site.notification => {
+            let body = (uncommented(PUSH_WORKER).replacen("@BASE@", &js(&it.base), 1) + &uncommented(worker_parts().1)).into_bytes();
+            let etag = format!("\"{}\"", hash_of(&body));
+            (body, etag)
+        }
         None => {
             let body = WATCH_WORKER.replacen("@BASE@", &js(&it.base), 1).into_bytes();
             let etag = format!("\"{}\"", hash_of(&body));

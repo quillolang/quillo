@@ -1704,6 +1704,88 @@ B.http = {
   request: meta((method, url, body, headers, opts) => httpCall("http.request", S(method, "http.request").toUpperCase(), url, body, headers, opts, 2), "http.request", null),
 };
 
+// `notification` in the browser (FEEDBACK67.md, B.3; branch pwa): `ask` turns it on for this device
+// from a click, `state` says whether it is on without asking, `stop` turns it off; the server's
+// `notification.send` sends. Each says "granted", "denied", "default" (not asked, or turned off) or
+// "unsupported": where the page has no push (a Safari tab on an iPhone, the phone apps, `quillo
+// app`), and from `ask` when the browser gives no answer in 20 s, as headless Chrome's subscribe
+// never does. `ask` registers Quillo's worker (/_quillo/sw.js), asks first, close to the click
+// (browsers allow the prompt only there), subscribes with the server's key, and posts the
+// subscription to /_quillo/push, which binds it to `session().user` or to `{ user }` made on the
+// server with `notification.user(x)`; what the server refuses is an error value saying why.
+const PUSH_WAIT = 20000, PUSH_LATE = new Error("late");
+const pushHere = () => !WIRE && typeof navigator !== "undefined" && !!navigator.serviceWorker && typeof PushManager === "function" && typeof Notification === "function" && /^https?:$/.test(location.protocol);
+const inTime = (p, until) => new Promise((ok, no) => {
+  const t = setTimeout(() => no(PUSH_LATE), Math.max(0, until - Date.now()));
+  Promise.resolve(p).then((v) => { clearTimeout(t); ok(v); }, (e) => { clearTimeout(t); no(e); });
+});
+const b64u = (b) => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64u = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+// Quillo's worker's registration for the program, made when `make`: an error value where the page
+// has a worker of its own at that scope (the one coming, if one is), which Quillo's would replace.
+async function pushReg(make) {
+  const url = new URL(BASE + "/_quillo/sw.js", location.href).href, scope = new URL(BASE + "/", location.href).href;
+  const reg = await navigator.serviceWorker.getRegistration(scope), w = reg && reg.scope === scope && (reg.installing || reg.waiting || reg.active);
+  if (w && w.scriptURL !== url) return new Err(`notification: this page has a service worker of its own (${w.scriptURL}), which Quillo's would replace`, true);
+  if (w) return reg;
+  return make ? navigator.serviceWorker.register(url, { scope }) : null;
+}
+// Its worker active, which subscribing needs.
+const pushActive = (reg) => new Promise((ok) => {
+  const w = reg.installing || reg.waiting;
+  if (reg.active || !w) return ok(reg);
+  w.addEventListener("statechange", () => w.state === "activated" && ok(reg));
+});
+async function pushSub() {
+  const reg = await pushReg(false).catch(() => null);
+  return reg && !(reg instanceof Err) ? reg.pushManager.getSubscription() : null;
+}
+B.notification = {
+  ask: meta(async (o) => {
+    o = M(o, "notification.ask", 1);
+    for (const k of mkeys(o)) if (k !== "user") fail(`\`notification.ask\`: unknown option \`${k}\` (the option is user)`);
+    if (!pushHere()) return "unsupported";
+    const until = Date.now() + PUSH_WAIT;
+    try {
+      const p = Notification.permission === "default" ? await inTime(Notification.requestPermission(), until) : Notification.permission;
+      if (p !== "granted") return p;
+      const reg = await inTime(pushReg(true), until);
+      if (reg instanceof Err) return reg;
+      // No key, or no such address (a mounted program's): no push here.
+      const [key] = await inTime(Promise.all([wireFetch(BASE + "/_quillo/push").then((r) => (r.ok ? r.json() : {})), pushActive(reg)]), until);
+      if (!key.key) return "unsupported";
+      let sub = await inTime(reg.pushManager.getSubscription(), until);
+      // One made with another key (QUILLO_SECRET changed) is made again.
+      if (sub && b64u(sub.options.applicationServerKey) !== key.key) sub = await inTime(sub.unsubscribe(), until).then(() => null);
+      const made = !sub;
+      if (made) sub = await inTime(reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: unb64u(key.key) }), until);
+      const body = JSON.stringify({ ...sub.toJSON(), user: isNil(o.user) ? null : o.user, origin: location.origin });
+      const r = await inTime(wireFetch(BASE + "/_quillo/push", { method: "POST", headers: { "content-type": "application/json" }, body }), until);
+      if (r.ok) return "granted";
+      const why = (await r.json().catch(() => ({}))).error || `the server answered ${r.status}`;
+      // Not on where the server will not send to it: the next `state` says so.
+      if (made) await sub.unsubscribe().catch(() => false);
+      return new Err(`notification.ask: ${why}`, true);
+    } catch (e) {
+      return e === PUSH_LATE ? "unsupported" : new Err(`notification.ask: ${e && e.message}`);
+    }
+  }, "notification.ask", null),
+  state: meta(async () => {
+    if (!pushHere()) return "unsupported";
+    if (Notification.permission !== "granted") return Notification.permission;
+    return (await pushSub()) ? "granted" : "default";
+  }, "notification.state", null),
+  stop: meta(async () => {
+    if (!pushHere()) return "unsupported";
+    const sub = await pushSub();
+    if (sub) {
+      await sub.unsubscribe().catch(() => false);
+      await wireFetch(BASE + "/_quillo/push", { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: sub.endpoint }) }).catch(() => null);
+    }
+    return Notification.permission === "denied" ? "denied" : "default";
+  }, "notification.stop", null),
+};
+
 // `receive(url, f, { method, body, headers })` in a handler: sends the
 // request and calls f with what the answer streams, until it ends (or f
 // gives false). An error value if it could not be had.

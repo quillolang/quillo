@@ -80,6 +80,8 @@ pub(crate) const CHANGES: &[&str] = &[
     "image.convert",
     "__service",
     "__service_later",
+    // A message to someone's devices (FEEDBACK67.md, B.3; branch pwa).
+    "notification.send",
 ];
 
 /// A run-time error, told the file it happened in (as the program was

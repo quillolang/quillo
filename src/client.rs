@@ -2604,7 +2604,7 @@ impl<'a> Compiler<'a> {
             }
             // The module, not a map of the program's own by its name.
             Value::Map(m)
-                if matches!(name, "json" | "math" | "bit" | "stats" | "vec" | "re" | "money" | "channel" | "http" | "date")
+                if matches!(name, "json" | "math" | "bit" | "stats" | "vec" | "re" | "money" | "channel" | "http" | "date" | "notification")
                     && m.values().any(|x| matches!(x, Value::Builtin(b, _) if b.strip_prefix(name).map_or(false, |r| r.starts_with('.')))) =>
             {
                 let r = (format!("B.{}", name), false);
@@ -3403,7 +3403,9 @@ impl<'a> Compiler<'a> {
                     // An initializer that reads the page runs again in the
                     // browser when the component is resumed (FEEDBACK18.md,
                     // Q-105; branch feedback18-fixes).
-                    let page = ["B.js(", "B.js_new(", "B.js_value("].iter().any(|f| init.contains(f));
+                    // `notification.state()` too, which the server cannot know (FEEDBACK67.md, B.3;
+                    // branch pwa).
+                    let page = ["B.js(", "B.js_new(", "B.js_value(", "B.notification.state("].iter().any(|f| init.contains(f));
                     let init = claimed(&init_ctx, init);
                     let (open, close) = if init_ctx.is_async { (RUN_OPEN, RUN_CLOSE) } else { ("", "") };
                     let _ = writeln!(
@@ -4339,6 +4341,9 @@ impl<'a> Compiler<'a> {
             if recv == "B.http" {
                 return self.http_call(name, argv);
             }
+            if recv == "B.notification" {
+                return self.notification_call(name, argv);
+            }
             // A module's function (`date.valid`, `re.replace`) gives no Promise and is never the
             // component's own: nothing waits (FEEDBACK28.md, Q-415 and Q-417; branch
             // feedback27-35-fixes).
@@ -4537,6 +4542,28 @@ impl<'a> Compiler<'a> {
             ));
         }
         let call = format!("B.http.{}({})", name, argv.join(", "));
+        Ok(self.await_if(true, call))
+    }
+
+    /// `notification.ask()`, `.state()` and `.stop()`, which wait on the browser: in handlers and
+    /// the functions they call, and `state` to set a state too; `send` and `user` are the
+    /// server's (FEEDBACK67.md, B.3; branch pwa).
+    fn notification_call(&mut self, name: &str, argv: Vec<String>) -> Result<String, QuilloError> {
+        if matches!(name, "send" | "user") {
+            return self.err(format!("`notification.{}` is the server's: call it from a `server fn`", name));
+        }
+        if !matches!(name, "ask" | "state" | "stop") {
+            return self.err(format!("`notification` has no function `{}`", name));
+        }
+        let c = self.ctx();
+        if c.component.is_some() || (c.state_init && name != "state") {
+            return self.err(format!(
+                "`notification.{}` in a component runs in the browser, and the server renders the component first: call it from an event handler (@click){}",
+                name,
+                if name == "state" { ", or set a state with it: state on = notification.state()" } else { "" }
+            ));
+        }
+        let call = format!("B.notification.{}({})", name, argv.join(", "));
         Ok(self.await_if(true, call))
     }
 

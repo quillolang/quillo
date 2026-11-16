@@ -57,6 +57,10 @@ pub struct Site {
     /// `offline`, worked out at load: none without one, which is all a request checks
     /// (FEEDBACK67.md, B.2; branch pwa).
     pub offline: Option<std::sync::Arc<crate::pwa::Offline>>,
+    /// The program names `notification`, worked out at load: `/_quillo/push`, Quillo's worker for
+    /// it, and its subscriptions unbound at the end of a session, none of which a program without
+    /// it gets (FEEDBACK67.md, B.3; branch pwa).
+    pub notification: bool,
 }
 
 impl Site {

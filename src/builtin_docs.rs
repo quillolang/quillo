@@ -205,6 +205,11 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("http.patch", "url, body, headers, options", "Sends a PATCH, its `body` as `http.post` does; the answer is as `http.get` gives it."),
     ("http.request", "method, url, body, headers, options", "Sends a request of any method, its `body` as `http.post` does."),
     ("http.stream", "url, f, options", "Reads an answer as it arrives: `f` gets each event, line or piece, and stops it by returning `false`."),
+    ("notification.ask", "options", "In a handler: asks to send this device notifications; \"granted\", \"denied\", \"default\" or \"unsupported\"."),
+    ("notification.state", "", "Whether this device gets notifications, without asking: \"granted\", \"denied\", \"default\" or \"unsupported\"."),
+    ("notification.stop", "", "In a handler: this device gets no more notifications; its state after."),
+    ("notification.send", "user, message", "Sends `{ title, body, url, ... }` to each of `user`'s devices, the page closed or not: `{ sent, gone }`."),
+    ("notification.user", "user", "On the server: `user`, sealed for `notification.ask({ user })` in this session, so a page cannot name another."),
     // Images
     ("image.info", "path", "`{ width, height, format, alpha }` from the file's header, or an error value."),
     ("image.convert", "src, dest, options", "Writes `dest` from `src`, as `{ crop, width, format, quality }` say; JPEG unless told, never enlarged."),

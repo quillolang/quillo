@@ -202,6 +202,10 @@ pub fn install(env: &Env) {
     let mut date = Map::new();
     crate::dates::install(&mut date);
     define(env, "date", Value::map(date));
+    // A person's devices told of something, over Web Push (FEEDBACK67.md, B.3; branch pwa).
+    let mut notification = Map::new();
+    crate::push::install(&mut notification);
+    define(env, "notification", Value::map(notification));
 }
 
 /// Every builtin name, as programs see it (`db.query`, `len`, ...).

@@ -309,3 +309,36 @@ async function ahead() {
   await c.put(STATE, new Response(JSON.stringify(s), { headers: { "content-type": "application/json" } }));
   return s.ready;
 }
+
+// @push: what a program that uses `notification` adds (FEEDBACK67.md, B.3; branch pwa), alone
+// after sw-push.js where the program has no offline route. A push is Quillo's declarative message
+// (`"web_push": 8030`), shown as it says: its title, body, tag, `silent`, and `app_badge` as the
+// app's badge (0 takes it away). A click on it focuses a window of the app and moves it to the
+// message's address, on this site only, or opens one there.
+self.addEventListener("push", (e) => {
+  let m = {};
+  try { m = (e.data && e.data.json()) || {}; } catch (_) {}
+  const n = (m && m.notification) || {}, text = (v) => (typeof v === "string" ? v : "");
+  const o = { body: text(n.body), data: { navigate: text(n.navigate) } };
+  if (typeof n.tag === "string") o.tag = n.tag;
+  if (n.silent === true) o.silent = true;
+  const jobs = [self.registration.showNotification(text(n.title), o)];
+  if (Number.isInteger(n.app_badge) && navigator.setAppBadge) jobs.push(n.app_badge > 0 ? navigator.setAppBadge(n.app_badge) : navigator.clearAppBadge());
+  e.waitUntil(Promise.all(jobs).catch(() => {}));
+});
+
+self.addEventListener("notificationclick", (e) => {
+  e.notification.close();
+  const home = new URL(BASE + "/", location.origin);
+  let to = home;
+  try { to = new URL((e.notification.data && e.notification.data.navigate) || home.href, home); } catch (_) {}
+  if (to.origin !== location.origin) to = home;
+  e.waitUntil((async () => {
+    const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    const app = all.filter((c) => new URL(c.url).pathname.startsWith(home.pathname) || new URL(c.url).pathname === BASE);
+    const w = app.find((c) => c.url === to.href) || app[0];
+    if (!w) return self.clients.openWindow(to.href);
+    await w.focus();
+    if (w.url !== to.href) await w.navigate(to.href).catch(() => self.clients.openWindow(to.href));
+  })());
+});
