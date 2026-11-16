@@ -3624,8 +3624,13 @@ fn ask(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if it.asking.is_some() || it.in_tool {
         return crate::mcp::ask_in_a_tool(it, args.len(), line);
     }
-    fail(line, "`ask` and `notify` speak to someone in the browser: call them from a component (an event handler)")
+    fail(line, IN_THE_BROWSER)
 }
+
+/// What `ask` and `notify` are for, said where they are called on the server, as they run and by
+/// `quillo check` where it knows the side: a page that is open, and what reaches the rest
+/// (FEEDBACK67.md, Q-959; branch pwa).
+pub const IN_THE_BROWSER: &str = "`ask` and `notify` speak to someone in the browser, on a page that is open: call them from a component (an event handler); to reach someone who is not on the page, `notification.send(user, { title, body, url })` sends to their devices, and `publish` updates the pages that are open";
 
 /// `run_script(source, vars)`: users' code, run in a sandbox (script.rs).
 fn run_script(it: &mut Interp, args: Vec<Value>, line: u32) -> R {

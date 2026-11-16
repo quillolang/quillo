@@ -1985,6 +1985,10 @@ struct FnCtx {
     nested: bool,
     /// A component's `state` initializer, which the server runs as it renders.
     state_init: bool,
+    /// Where this code surely runs on the server, as `quillo check` says it ("in a route", "in a
+    /// `server fn`", "in a tick", "in a job"): None where it may run in the browser too, in a
+    /// component or a function either side may call (FEEDBACK67.md, Q-959; branch pwa).
+    on_server: Option<&'static str>,
     /// What the function gives back other than at the end of its body:
     /// values of `return`, and the errors `?` passes on.
     exits: T,
@@ -2086,6 +2090,15 @@ struct Checker {
     state_types: HashMap<(Arc<str>, u32, String), (T, Vec<usize>)>,
     /// Checking the `live(...)` that sets a component's state.
     live_ok: bool,
+    /// > 0 while checking code that may run in the browser though no component holds it: a
+    /// handler written in markup, and what a component or view tag is given. Where it is not,
+    /// `FnCtx::on_server` says whether the code surely runs on the server (FEEDBACK67.md, Q-959;
+    /// branch pwa). A page state's initializer is the top level's: the server runs it for each
+    /// request, whatever the bundle does with it too.
+    browser_too: u32,
+    /// The function a top-level `every` or `schedule` is given, checked next: its body runs on
+    /// the server, as a tick or a job (FEEDBACK67.md, Q-959; branch pwa).
+    job_arg: Option<&'static str>,
     /// The services a program calls (`service billing = "billing.qwe"`): the
     /// server fns each offers, by name.
     services: HashMap<String, HashMap<String, Arc<Sig>>>,
@@ -2261,6 +2274,8 @@ impl Checker {
             scripts: HashMap::new(),
             state_types: HashMap::new(),
             live_ok: false,
+            browser_too: 0,
+            job_arg: None,
             services: HashMap::new(),
             services_elsewhere: HashSet::new(),
             service_files: HashMap::new(),
@@ -4276,6 +4291,20 @@ impl Checker {
         }
     }
 
+    /// Where the code being checked surely runs on the server, said as "in a route": a route's
+    /// own code, a `server fn`'s, what a top-level `every` or `schedule` is given, and the top
+    /// level itself, which runs as the program starts. None where it may run in the browser too
+    /// (FEEDBACK67.md, Q-959; branch pwa).
+    fn on_the_server(&self) -> Option<&'static str> {
+        if self.browser_too > 0 {
+            return None;
+        }
+        match self.fns.last() {
+            Some(f) => f.on_server,
+            None => self.sequential.then_some("at the top level"),
+        }
+    }
+
     /// A `server fn` that reads a page state through the program's functions (`return mine()`,
     /// `fn mine() { return cart }`): it ran on the page's render, where there is one, and failed
     /// at its next call or live refresh, where there is none (FEEDBACK68.md, found in review;
@@ -4384,6 +4413,7 @@ impl Checker {
             component: d.component.then(|| d.name.clone()),
             nested: false,
             state_init: false,
+            on_server: (d.server && !d.component).then_some("in a `server fn`"),
             exits: T::NEVER,
         });
         self.push();
@@ -4648,6 +4678,7 @@ impl Checker {
             component: None,
             nested: false,
             state_init: false,
+            on_server: Some("in a route"),
             exits: T::NEVER,
         });
         self.push();
@@ -5160,6 +5191,17 @@ impl Checker {
                 self.effect_error(&d.name, mask & !outer_allowed, outer_restrictor.as_ref());
             }
         }
+        // Where it runs: as the code around it does, but a handler or a prop written in markup,
+        // which may run in the browser; at the top level, only what `every` or `schedule` is
+        // given, as a `let` of one may be called from a component (FEEDBACK67.md, Q-959; branch
+        // pwa).
+        let job = if self.fns.is_empty() { self.job_arg.take() } else { None };
+        let on_server = match self.fns.last() {
+            _ if self.browser_too > 0 => None,
+            _ if d.server => Some("in a `server fn`"),
+            Some(f) => f.on_server,
+            None => job,
+        };
         self.fns.push(FnCtx {
             server: d.server || self.fns.last().is_some_and(|f| f.server),
             name: d.name.clone(),
@@ -5170,6 +5212,7 @@ impl Checker {
             component,
             nested: true,
             state_init: false,
+            on_server,
             exits: T::NEVER,
         });
         let saved_seq = self.sequential;
@@ -5222,6 +5265,7 @@ impl Checker {
             component: None,
             nested: false,
             state_init: false,
+            on_server: None,
             exits: T::NEVER,
         });
         self.push();
@@ -5846,7 +5890,22 @@ impl Checker {
                         self.warn("`file` serves the one file it is given, whatever its name: with a path from the request, `files(\"public\", path)` keeps `.env`, `.git` and the program's own files back");
                     }
                 }
-                self.call(callee, args, None)
+                // The function a top-level `every` or `schedule` is given runs on the server
+                // (FEEDBACK67.md, Q-959; branch pwa).
+                let job = match callee.as_ref() {
+                    _ if !self.fns.is_empty() || !self.sequential || !matches!(args.get(1), Some(Expr::Lambda(_))) => None,
+                    Expr::Ident(n, _) if n == "every" && self.builtin_in_scope(n) => Some("in a tick"),
+                    Expr::Ident(n, _) if n == "schedule" && self.builtin_in_scope(n) => Some("in a job"),
+                    _ => None,
+                };
+                if job.is_some() {
+                    self.job_arg = job;
+                }
+                let t = self.call(callee, args, None);
+                if job.is_some() {
+                    self.job_arg = None;
+                }
+                t
             }
             Expr::Field(obj, name, line) => {
                 let t = self.expr(obj);
@@ -8316,6 +8375,15 @@ impl Checker {
                 ));
             }
         }
+        // The server: `ask` and `notify` there fail every call, where the checker knows the side
+        // (FEEDBACK67.md, Q-959; branch pwa). One error a call: given too many, that is said; in a
+        // tool's own code, `ask` is said of the tool (ASK_IN_A_TOOL).
+        if sig.builtin && matches!(sig.name.as_str(), "ask" | "notify") && !too_many {
+            let tool = self.fns.first().and_then(|f| self.bodies.get(&f.name)).is_some_and(|d| d.mcp);
+            if let Some(place) = self.on_the_server().filter(|_| !(tool && sig.name == "ask")) {
+                self.error(format!("`{}` {} runs on the server; {}", sig.name, place, crate::builtins::IN_THE_BROWSER));
+            }
+        }
         if sig.builtin && sig.name == "live" {
             if let Some(Err(e)) = arg_exprs.first().filter(|o| matches!(o, Expr::Map(_))).map(crate::builtins::live_every) {
                 self.error(e);
@@ -8555,6 +8623,15 @@ impl Checker {
         for (name, v) in &el.attrs {
             let t = match v {
                 AttrVal::Bool => T::of(BOOL),
+                // A handler, and what a view or component is given (a function it may call in
+                // the browser), are not said to run on the server (FEEDBACK67.md, Q-959; branch
+                // pwa).
+                AttrVal::Expr(e) if is_view || name.starts_with('@') => {
+                    self.browser_too += 1;
+                    let t = self.expr(e);
+                    self.browser_too -= 1;
+                    t
+                }
                 AttrVal::Expr(e) => self.expr(e),
                 AttrVal::Spread(e) => {
                     let t = self.expr(e);
