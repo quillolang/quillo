@@ -157,6 +157,22 @@ A bad value stops the build with what is wrong. Without an `app.toml`, the app i
 (iOS, compiled by `actool`) and launcher icons at every density plus an adaptive icon
 (Android).
 
+The same file makes the program installable from a browser (the guide's "Installable
+apps"). The web's keys, `short_name`, `theme_color`, `background_color`, `display`,
+`start_url` and `description`, are not read by the phone builds and change nothing in
+them; `name` and `icon` are shared, so the app on a phone and the site installed from a
+browser have one name and one icon. `id` stays the phone's bundle id: the site's manifest
+never takes it. `quillo check main.qwe` reads `app.toml` too, and says its mistakes at
+their lines; what the phone builds take is at most a warning there.
+
+app-config.sh's `app_value` reads a key as Quillo reads it (src/pwa.rs), and a test
+compares the two over 22 files: a `#` inside quotes is no comment, TOML's escapes are read
+(`\"`, `\\`, `\n`, `\t`, `\uXXXX` and the rest), spaces and a CR at the end of a line are
+left out, and so is a byte-order mark; a key given twice is read at its first line, and a
+string never closed is what it holds. The `sed` it replaces gave `"Shop` for `"Shop #1"`,
+kept the quotes before trailing spaces or a CR (a file saved with CRLF), gave `'A` for
+`'A#B'` and kept the backslash of `"Tom\"s"` (FEEDBACK67.md, B.1).
+
 ## What goes into an app
 
 Both systems copy the program's folder with one filter, `app_copy_program` in

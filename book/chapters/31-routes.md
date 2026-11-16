@@ -1,10 +1,14 @@
 # Routes
 
 ```quillo
-route METHOD /path/:param/:typed(int)/*rest [? { query pattern }] [{ request pattern }] [with effects] = expr
-route METHOD /path [with effects] { ... block ... }
+route [offline] METHOD /path/:param/:typed(int)/*rest [? { query pattern }] [{ request pattern }] [with effects] = expr
+route [offline] METHOD /path [with effects] { ... block ... }
 ```
 
+- **`offline`**, after `route` and before the method, keeps a `GET` route's page on the
+  device for when there is no network (`route offline GET /menu = ...`); after `routes`, it
+  does so for each `GET` route of the group. It is a tag only there, and a name anywhere else
+  (see [Pages that work offline](#pages-that-work-offline)).
 - **Methods:** `GET POST PUT PATCH DELETE OPTIONS ANY`. `ANY` takes every method. A
   `HEAD` request is served by the `GET` route: the route runs (what it does, it does),
   and the body is dropped. A `route HEAD` is accepted but never matches. An `OPTIONS`
@@ -249,6 +253,10 @@ routes /reports | signed_in with db {               // what its routes may do, a
 }
 ```
 
+- **`offline`**, after `routes` and before the path (`routes offline /help { ... }`), keeps
+  the page of each `GET` route of the group, and of the groups inside it, for when there is
+  no network; its other routes are sent as ever. A group tagged so with no `GET` route is an
+  error (see [Pages that work offline](#pages-that-work-offline)).
 - **`with`**, after the middleware, is what every route in the group, and its middleware,
   may do. A route in it may narrow it (`route GET /status with time = ...`), a group
   inside it too, and asking for an effect it does not allow is an error (see
@@ -620,8 +628,11 @@ fn touch() {
   added is lost. Twenty adds to a cart kept in the session, sent at once, each
   `set_session({ ...s, cart: (s.cart ?? []) + [item] })`, kept one item. Keep what must
   not be lost (a cart, a draft) in a table, keyed by an id in the session.
-- `end_session()` removes the cookie from the browser, and ends the session's MCP tokens
-  (see [Tools for AI clients](#tools-for-ai-clients)), but a copy of the cookie someone kept stays
+- `end_session()` removes the cookie from the browser, ends the session's MCP tokens
+  (see [Tools for AI clients](#tools-for-ai-clients)), and stops the notifications turned
+  on in it (see [Notifications](#notifications)); with routes tagged `offline`, the pages
+  kept for it go from the device (see [Pages that work offline](#pages-that-work-offline)).
+  But a copy of the cookie someone kept stays
   valid until it expires. To end sessions on the server (log out everywhere, a stolen
   laptop), keep an id in the session and check it against the database.
 - The session cookie is `__Host-quillo_session` when it is `Secure` and for the whole
@@ -636,7 +647,9 @@ fn touch() {
   beside the program instead (its owner's alone, and never served), so a restart keeps
   you signed in *(since 0.8.5: a random key there too)*. The server warns when it starts if the secret is shorter than
   32 bytes, as it does for `QUILLO_SERVICE_SECRET` and `LIMER_ADMIN_SECRET`: a short one
-  can be guessed offline from one signed cookie.
+  can be guessed offline from one signed cookie. The push key of
+  [notifications](#notifications) is derived from it, so changing it ends every device's
+  subscription.
 - `set_cookie(name, value, { max_age, path, domain, http_only, secure, same_site })` and
   `delete_cookie(name, { path, domain, http_only, secure, same_site })` add `Set-Cookie`
   to the response, whatever the route returns. Cookies are `HttpOnly`, `SameSite=Lax`,
@@ -1100,7 +1113,7 @@ has logged in or out.
 
 - **Prefetching changes nothing.** A route asked for ahead of a click may read (the
   database, files, other servers) but not write: `db.exec` or SQL that writes, assigning
-  a global variable, cookies and sessions, files, `publish`, `http.post` and the like,
+  a global variable, cookies and sessions, files, `publish`, `notification.send`, `http.post` and the like,
   and calls to services stop it, and it is answered "not prefetched" (503, which the
   browser drops; the request log shows it as any 503, with no error line). The page is
   then made, as usual, when the link is followed. So a `GET` that does something (a
@@ -1756,7 +1769,10 @@ route GET /*path = file("dist/index.html")                              // the a
   `robots.txt`, `manifest.webmanifest`, icons) each need a route before the catch-all, or
   the catch-all answers them with `index.html`. Many of them are better in a folder of
   their own: `public/static/` in the app, served with `route GET /static/*path =
-  files("dist/static", path)`.
+  files("dist/static", path)`. With an `app.toml` beside the program, Quillo makes the
+  manifest and the icons, and answers `/manifest.webmanifest` and `/apple-touch-icon.png`
+  past the catch-all, whose `index.html` is no answer for them (see [Installable
+  apps](#installable-apps)).
 - **The app calls the program** through routes that answer JSON (`fetch("/api/hello")`),
   or a `server fn` as a page calls one: `POST /_quillo/rpc/<name>` with `content-type:
   application/json` and the arguments as a JSON array, answered `{"ok": value}` or

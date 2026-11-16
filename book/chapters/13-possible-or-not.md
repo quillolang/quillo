@@ -37,6 +37,9 @@ does not do it today; the way around it follows.
 | paste plain HTML into a page? | Mostly: comments, quotes of either kind, unquoted values and the doctype are taken; unclosed `<p>` and `<li>`, `<style>` and `<script>` braces need changing. See [From HTML](#from-html) |
 | translate the interface? | Yes, with plural rules, on both sides. See [Translations](#translations) |
 | run the app in a desktop window? | Yes, with a build that has the `app` feature (the release downloads do not). See [Desktop apps](#desktop-apps) |
+| have the site installed as an app (a PWA)? | Yes: an `app.toml` beside the program, and Quillo serves the manifest, the icons and the head tags. See [Installable apps](#installable-apps) |
+| have pages open with no network? | Yes: `route offline GET /x`, and Quillo writes the service worker. See [Pages that work offline](#pages-that-work-offline) |
+| write a service worker of my own? | Yes, served by a route, in place of Quillo's. See [A service worker of your own](#a-service-worker-of-your-own) |
 | compile components to WebAssembly? | Not yet: they compile to JavaScript |
 
 ## Serving
@@ -66,7 +69,7 @@ does not do it today; the way around it follows.
 |---|---|
 | have pages follow the database without writing a socket? | Yes: `live(load)`, over one WebSocket a page. See [Live data](#live-data) |
 | see changes made by other programs (`psql`, a cron script, a trigger)? | No: only writes made through Quillo, and `publish`. Have the other program call a route that publishes |
-| push to one user? | Yes: a topic of theirs (`watch` and `publish`), or `channel.send` to their page. See [Channels](#channels) |
+| push to one user? | Yes: a topic of theirs (`watch` and `publish`), or `channel.send` to their page. See [Channels](#channels). To their devices with the page closed: `notification.send`, over Web Push. See [Notifications](#notifications) |
 | use UDP, WebTransport datagrams, live video? | Yes: `udp.*`, channels, `media.*`. See [UDP](#udp), [Media](#media) |
 | connect pages to each other (WebRTC)? | No: everything goes through the server, which relays video as an SFU, with no TURN |
 | record a stream? | No: have the encoder write a copy |

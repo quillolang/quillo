@@ -591,7 +591,12 @@ route GET / = <html><body><Counter start={5}/></body></html>
   and styles: keyboard, focus and screen readers are taken care of (Escape, the
   backdrop and Cancel answer `false`; `tone: "danger"` starts on Cancel; a note goes
   after 4 seconds unless `seconds` says otherwise). On the server both are an error:
-  they speak to someone in the browser.
+  they speak to someone in the browser, on a page that is open. `quillo check` refuses them
+  where the code surely runs on the server (a route, a `server fn`, a tick, a job, the top
+  level, a page state's initializer), and says what reaches someone who is not on the page:
+  `notification.send` sends to their devices (see [Notifications](#notifications)), and
+  `publish` updates the pages that are open. A plain function, which may run on either
+  side, is not guessed: called on the server, it fails as it runs, saying the same.
 
   ```quillo
   component Remove(id: int) {
@@ -1333,7 +1338,8 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
   opens it takes over, no change missed or shown twice. Where no socket can be had, the
   plain requests carry the changes and a socket is tried again later each time, after 1
   to 3 s, doubling up to half a minute. A connection
-  that drops is opened again after a second or so, spread out, and after a restart pages
+  that drops is opened again after a second or so, spread out, and at once when the browser
+  says it is back online (its `online` event), without waiting out its backoff; after a restart pages
   ask for their data over a second, so that they do not all come at once; when the
   server cannot be reached, the page waits longer each time, up to half a minute, and
   never before a `Retry-After` it was given. A page that falls behind says so once in the

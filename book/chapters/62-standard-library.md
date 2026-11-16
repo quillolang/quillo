@@ -1621,8 +1621,10 @@ record: one server runs them). With a database per tenant, the system database n
 which tenants have calls (`_quillo_later_tenants`), as nothing else says where to look.
 
 The migrations applied (`_quillo_migrations`) are in the program's database. The calls a
-service answered (`_quillo_calls`) go with the jobs. `quillo-system.db` is made only when
-something must be kept in it (calls made later, `db.atomic`'s decisions);
+service answered (`_quillo_calls`) go with the jobs, and so do the devices that turned on
+[notifications](#notifications) (`_quillo_push`). `quillo-system.db` is made only when
+something must be kept in it (calls made later, `db.atomic`'s decisions, a device's
+subscription in a program with no database);
 `$QUILLO_SYSTEM_DB` may be a URL.
 
 ## Many tenants

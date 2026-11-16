@@ -24,3 +24,8 @@
   only macOS has run), and a `stream` route's answer sent in parts to an app's web view
 - `quillo build` making a program's `build` declarations ahead of time
 - an HTTP/2 client, for APNs and gRPC
+- notifications in the phone apps through Apple's and Google's push services (APNs and FCM:
+  they answer `"unsupported"`), and notifications by topic for people who are not signed in
+- `server fn` calls made offline kept and sent once the network is back
+- a service worker of the program's own run beside Quillo's, for a program with offline
+  routes

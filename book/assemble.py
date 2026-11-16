@@ -106,6 +106,19 @@ pf = replace_once(pf, "> **Try it here.** This site is a Quillo program, and its
 add("35-prefetching.md", "prefetching", pf, ("guide", "prefetching"))
 add("36-validation.md", "validation", replace_once(shift(site_guide("validation"), -1),
     "Everything on this page is one program", "Everything in this chapter is one program"), ("guide", "validation"))
+
+# The guide's sections on installable apps, offline pages and notifications, after "Phone apps"
+# at the end of its opening, which the Running quillo chapter stops short of
+intro = pages["introduction"]
+k = intro.index("### Installable apps")
+pwa = ["# Installable apps, offline pages and notifications", "",
+       "A Quillo program can be installed from the browser as an app, keep its pages on the device",
+       "for when there is no network, and tell people's devices something with the page closed.",
+       "Each comes from what the program says (a file, a word on a route, a call), with no",
+       "JavaScript, service worker or key of its own.", ""] + shift(intro[k:], -1)
+while pwa[-1] == "":
+    pwa.pop()
+add("37-installable-apps.md", "pwa", pwa, ("page", "introduction"))
 add("41-database.md", "database", replace_once(shift(site_guide("database"), -1),
     "This page goes through it", "This chapter goes through it"), ("guide", "database"))
 add("42-money.md", "money", replace_once(shift(site_guide("money"), -1),

@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased
+
+- **Installable apps**: a program with an `app.toml` beside it can be installed from the
+  browser, with nothing else written. Quillo serves `/manifest.webmanifest`, icons made from
+  `icon` (192, 512, a maskable 512 and Apple's 180 at `/apple-touch-icon.png`) and three tags in
+  each page's head (151 bytes); the file is the one the phone builds read, with `short_name`
+  (cut at a word), `theme_color`, `background_color`, `display`, `start_url` and `description`
+  added. The manifest's `id` is the scope, never the phone's bundle id. A route of the
+  program's at the very path wins, and one that takes any path wins only with a real answer
+  (a `2xx` that is not HTML, or a `3xx`), so a 404 page, a front end's `index.html` and a
+  guard's `401` keep the app installable. `quillo check` says the file's mistakes at their
+  lines (errors, and warnings for what the phone builds take), and `--watch` loads the
+  program again when it or its icon changes. A program without `app.toml` is served as before,
+  byte for byte (FEEDBACK67.md, B.1).
+- **Pages that work offline**: `route offline GET /x` and `routes offline /x { ... }` keep a
+  page on the device, with a service worker Quillo writes (`/_quillo/sw.js`): pages from the
+  network first, the copy marked `data-kept` (or an offline page named from `app.toml`) when
+  the network fails or a proxy answers `502` to `504`, routes without parameters kept as the
+  worker installs, a deploy's new worker keeping the old copies until it has its own. A page
+  that reads the visitor through `session()` alone is kept for that session only, behind a
+  gate that checks the `quillo_tag` cookie, and dropped when the session changes, ends or is
+  no longer taken; one that reads them another way, holds a form key, has waiting parts or
+  changed the session is not kept (`quillo check` says where a route reads them another
+  way). No worker under `--watch`, in the phone apps or in `quillo app`; a program without
+  offline routes pays nothing (FEEDBACK67.md, B.2; Q-958's rules for a worker of the
+  program's own are in the guide).
+- **Notifications**: `notification.ask()` in a handler turns on a device's notifications
+  (`"granted"`, `"denied"`, `"default"` or `"unsupported"`), `notification.state()` reads it
+  without asking, and `notification.stop()` turns it off; `notification.send(user, { title,
+  body, url, tag, badge, silent, ttl, urgency })` reaches that person's devices with the page
+  closed, over Web Push sent by Quillo itself (RFC 8291 and 8292), and gives `{ sent, gone }`.
+  Subscriptions are bound to `session().user`, or to a sealed `notification.user(x)`, kept in
+  `_quillo_push`, and unbound by `end_session()` and a change of person. The push key comes
+  from `QUILLO_SECRET`, the same on every instance (Q-956), and sends to one push service share
+  one connection (Q-960). The phone apps answer `"unsupported"` for now (FEEDBACK67.md, B.3).
+- `ask` and `notify` where the code surely runs on the server (a route, a `server fn`, a tick,
+  a job, the top level, a page state's initializer) are refused by `quillo check`, with what
+  reaches someone who is not on the page: `notification.send`, and `publish` for open pages.
+  They passed the check and failed every call with a 500 (FEEDBACK67.md, Q-959).
+- Under `--watch`, a page a service worker answers from its cache reloads once, then stops and
+  says why, in the page's error overlay and the console: it reloaded without end (305 times in
+  4 s under `--watch=reload`), or never showed the change (FEEDBACK67.md, Q-957).
+- A page state's initializer that reads `session()` reads the visitor's: it ran before the
+  request was there, found no session, and every `session()` after it in that request gave
+  `{}` (FEEDBACK68.md, Q-985).
+- A pattern's miss names a type of the program's with its article: `not an Outer`, still `a
+  User` (it said `a Outer`; FEEDBACK58.md, Q-874).
+- Editors (quillolang/editors, released on its own): `offline` after `route` and `routes` is
+  highlighted as a keyword in every editor's grammar, as `quillo lsp` already completes and
+  explains it.
+
 ## 0.8.6 (2026-11-16)
 
 - The page `files()` sends for a miss (the folder's `404.html`, or its `not_found`) goes out as

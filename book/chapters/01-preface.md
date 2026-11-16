@@ -51,8 +51,9 @@ server without `fetch` or `async` ([No fetch, no async/await](#async)).
 
 **Part III, Serving,** is about what runs on the server: [routes](#routes), [route
 groups](#route-groups), [headers, cookies and sessions](#headers-cookies-sessions), [real
-time](#realtime) over UDP, channels and media, [prefetching](#prefetching), and
-[validation](#validation) that runs in the browser and on the server alike.
+time](#realtime) over UDP, channels and media, [prefetching](#prefetching),
+[validation](#validation) that runs in the browser and on the server alike, and
+[installable apps, offline pages and notifications](#pwa).
 
 **Part IV, Data,** covers [databases](#database), from one SQLite file to shards and one
 transaction over several databases, and [money](#money): exact amounts, payments done

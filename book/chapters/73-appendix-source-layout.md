@@ -77,11 +77,15 @@ src/alloc.rs       the memory allocator: mimalloc on event loops and waiting thr
 src/stack.rs       room on the stack for deep recursion
 src/desktop.rs     quillo app: the program in a native window (the app feature)
 src/mobile.rs      a program inside a phone app: copied into the app, served to its web view
+src/pwa.rs         installable apps from app.toml (the manifest, icons, head tags), and the
+                   service worker for routes tagged offline
+src/push.rs        notification: subscriptions, and Web Push sent (RFC 8291, RFC 8292)
 src/platform.rs    platform(): where the program runs
 
 The browser and editors
 src/client.rs      compiles components to JavaScript
 src/client/runtime.js  the browser runtime: values, standard library, signals and markup
+src/client/sw.js   Quillo's service worker: pages kept for offline, notifications shown
 src/island.rs      when a page loads its components' code
 src/styles.rs      components' and views' own CSS, scoped
 src/lsp.rs         the language server
