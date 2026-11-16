@@ -411,3 +411,40 @@ fn old_orphans_are_counted_not_matched_by_row() {
         let _ = std::fs::remove_dir_all(&x);
     }
 }
+
+// Q-919, found by CI: a migration that arrives while a reload runs (the one before it being
+// applied) is applied after it, where the times read after the reload took it for seen. Made
+// sure here by a program that waits after migrating, the next file written in that wait; and a
+// database kept in the watched folder, which its own writes and reloads change, does not reload
+// the program again and again.
+#[test]
+fn a_migration_that_arrives_during_a_reload_is_applied_after_it() {
+    let d = dir("during");
+    std::fs::write(d.join("migrations/001_a.sql"), "create table a (id integer);").unwrap();
+    std::fs::write(d.join("main.qwe"), TABLES.replace("db.migrate()\n", "db.migrate()\nsleep(1500)\n")).unwrap();
+    let (_g, port, log) = serve_logged(&d, &["--watch"]);
+    let tables = || support::send(port, "GET", "/tables", &[], "").body;
+    assert_eq!(tables(), "a");
+    std::fs::write(d.join("migrations/002_b.sql"), "create table b (id integer);").unwrap();
+    // The reload has read the folder and waits: the next file comes now.
+    assert!(until(20, || std::fs::read_to_string(&log).unwrap_or_default().contains("applied migration 002_b.sql")), "{}", std::fs::read_to_string(&log).unwrap_or_default());
+    std::fs::write(d.join("migrations/003_c.sql"), "create table c (id integer);").unwrap();
+    assert!(until(30, || tables() == "a,b,c"), "{}: {}", tables(), std::fs::read_to_string(&log).unwrap_or_default());
+    let o = dir("db-inside");
+    std::fs::write(o.join("migrations/001_a.sql"), "create table a (id integer);").unwrap();
+    std::fs::write(o.join("main.qwe"), TABLES.replace("app.db", "migrations/app.db") + "route POST /w { db.exec(\"insert into a values (1)\"); \"ok\" }\n").unwrap();
+    {
+        let (_g, port, log) = serve_logged(&o, &["--watch"]);
+        for _ in 0..5 {
+            assert_eq!(support::send(port, "POST", "/w", &[("sec-fetch-site", "same-origin")], "").body, "ok");
+        }
+        std::fs::write(o.join("main.qwe"), TABLES.replace("app.db", "migrations/app.db") + "route POST /w { db.exec(\"insert into a values (2)\"); \"ok\" }\n").unwrap();
+        assert!(until(20, || std::fs::read_to_string(&log).unwrap_or_default().contains("reloaded")), "{}", std::fs::read_to_string(&log).unwrap_or_default());
+        std::thread::sleep(Duration::from_millis(3000));
+        let reloads = std::fs::read_to_string(&log).unwrap().matches("reloaded").count();
+        assert!(reloads <= 2, "{} reloads: {}", reloads, std::fs::read_to_string(&log).unwrap());
+    }
+    for x in [d, o] {
+        let _ = std::fs::remove_dir_all(&x);
+    }
+}

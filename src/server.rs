@@ -3681,13 +3681,19 @@ fn watch(app: Arc<App>, others: Vec<Arc<App>>, mut files: Vec<PathBuf>, mut seen
         if now != seen {
             // Editors often write in several steps; let them finish.
             std::thread::sleep(Duration::from_millis(30));
+            // The files as the reload is about to read them: what changes while it runs (a
+            // migration that arrives as the one before it is applied) is a change still, where
+            // times read after it took it for seen and it waited for another change
+            // (FEEDBACK62.md, Q-919, found by CI; branch cache-and-migrate).
+            let before: std::collections::HashMap<PathBuf, (Option<std::time::SystemTime>, Option<PathBuf>)> = files.iter().cloned().zip(mtimes(&files)).collect();
             if app.reload() {
                 for o in &others {
                     o.reload_saying(false);
                 }
             }
             files = app.watched_files();
-            seen = mtimes(&files);
+            let after = mtimes(&files);
+            seen = files.iter().zip(after).map(|(f, t)| before.get(f).cloned().unwrap_or(t)).collect();
             // A save that renamed a new file over the old one left the
             // old one watched: watch the files as they are now.
             events = open(&files, &served, &mut said);
