@@ -824,3 +824,58 @@ pub(crate) fn tag_again(it: &mut Interp, had: Option<&str>, session_cookie: bool
     cookie_line(it, TAG_COOKIE, want.as_deref().unwrap_or(""), Some(age), Some(&o), "set_session", 0).ok()
 }
 
+
+/// Whether the session cookie `req` came with opens (signed for here, not expired), read from the
+/// request as sent, the request's map gone: for a page that did not read the session, whose
+/// cookie may be one the server no longer takes (its key changed, its time ran out). None where it
+/// cannot be told (a program's tenant rule not worked out), and none without a cookie
+/// (FEEDBACK67.md, B.2, third review; branch pwa).
+pub(crate) fn cookie_opens(it: &mut Interp, req: &crate::server::HttpRequest) -> Option<bool> {
+    if it.site.tenant_rule.is_some() && it.tenant.is_none() {
+        return None;
+    }
+    let name = cookie_name(it);
+    let values: Vec<&str> = req
+        .headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+        .flat_map(|(_, v)| v.split(';'))
+        .filter_map(crate::server::cookie_pair)
+        .filter(|(k, _)| *k == name)
+        .map(|(_, v)| v)
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    let ctx = context(it);
+    // Each cookie opened is kept, by a digest of it and its place, until its own end: the key is the
+    // process's for its life, so one that opened opens until then. A browser sends the same cookie
+    // on each page; its signature checked on each was 24,000 instructions a page (measured).
+    thread_local! {
+        static OPENED: std::cell::RefCell<std::collections::VecDeque<(u64, u64)>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    }
+    let now = now();
+    let opens = |v: &str| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (&ctx, v).hash(&mut h);
+        let key = h.finish();
+        if OPENED.with(|o| o.borrow().iter().any(|(k, ends)| *k == key && *ends > now)) {
+            return true;
+        }
+        match open_until(&ctx, v) {
+            Some((_, _, _, ends)) => {
+                OPENED.with(|o| {
+                    let mut o = o.borrow_mut();
+                    if o.len() >= 256 {
+                        o.pop_front();
+                    }
+                    o.push_back((key, ends));
+                });
+                true
+            }
+            None => false,
+        }
+    };
+    Some(values.iter().filter(|v| opens(v)).count() == 1)
+}

@@ -30,6 +30,11 @@ export async function makeBrowser(origin) {
     async keys() { return [...store.keys()]; },
     async open(n) { if (!store.has(n)) store.set(n, new Map()); return cacheOf(store.get(n)); },
     async has(n) { return store.has(n); },
+    // In one cache by its name (`cacheName`), or in each; never makes one.
+    async match(r, opts = {}) {
+      for (const [n, m] of store) if (!opts.cacheName || opts.cacheName === n) { const hit = await cacheOf(m).match(r); if (hit) return hit; }
+      return undefined;
+    },
     async delete(n) { return store.delete(n); },
   };
   const cookieHeader = () => [...jar].map(([k, v]) => k + "=" + v).join("; ");

@@ -193,6 +193,13 @@ pub(crate) fn route_at(it: &Interp, path: &str) -> bool {
     })
 }
 
+/// Whether an answer is a page, `text/html` in any case (`Text/HTML` too): a media type's case is
+/// no part of it (RFC 9110 §8.3.1), and a page so marked had none of Quillo's scripts, and none of
+/// its offline marks' hashes in its policy (FEEDBACK67.md, B.2, third review; branch pwa).
+pub(crate) fn is_html(resp: &HttpResponse) -> bool {
+    resp.header("content-type").is_some_and(|c| c.trim_start().get(..9).is_some_and(|t| t.eq_ignore_ascii_case("text/html")))
+}
+
 /// The media type of a content-type header, without its parameters:
 /// "Application/JSON; charset=utf-8" is "application/json".
 pub(crate) fn essence(ctype: &str) -> String {
@@ -238,6 +245,13 @@ pub(crate) struct PendingRequest {
 }
 
 impl PendingRequest {
+    /// A request as no route has taken it yet: its path and query, no parameters (the page's
+    /// states, made before the routes; FEEDBACK68.md, Q-985; branch pwa).
+    pub(crate) fn of_url(url: &str) -> PendingRequest {
+        let (path, qs) = url.split_once('?').unwrap_or((url, ""));
+        PendingRequest { path: path.to_string(), query: Value::map(parse_urlencoded(qs)), params: Value::map(Map::new()) }
+    }
+
     pub(crate) fn make(&self, req: &HttpRequest) -> Value {
         let mut m = build_request(req, &self.path, &self.query);
         m.insert("params".into(), self.params.clone());
@@ -410,7 +424,11 @@ impl Interp {
                 r.headers.push(("cache-control".into(), "no-store".into()));
                 return r;
             }
-            return crate::service::pass_on(self, &url, &prefix, req);
+            let mut resp = crate::service::pass_on(self, &url, &prefix, req);
+            if self.site.offline.is_some() {
+                crate::pwa::unmarked(&mut resp);
+            }
+            return resp;
         }
         self.pending_stream = None;
         // One a request made and nothing took (a job that gave back a stream).
@@ -422,6 +440,11 @@ impl Interp {
                 inner.url = if rest.is_empty() || rest.starts_with('?') { format!("/{}", rest) } else { rest.to_string() };
                 sub.streams_direct = self.streams_direct;
                 let mut resp = sub.handle(&inner);
+                // Only the main program's worker marks are Quillo's (FEEDBACK67.md, B.2, third
+                // review; branch pwa).
+                if self.site.offline.is_some() {
+                    crate::pwa::unmarked(&mut resp);
+                }
                 self.pending_stream = sub.pending_stream.take();
                 // A mounted program's deferred parts are its own to render: whole
                 // here (branch defer).
@@ -451,7 +474,7 @@ impl Interp {
         self.offline_seen = None;
         self.locale_read = false;
         self.locale = None;
-        self.page_start(&req);
+
         if !req.body.is_empty() {
             let ctype = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map_or("", |(_, v)| v.as_str());
             if crate::upload::boundary(ctype).is_some() {
@@ -467,7 +490,15 @@ impl Interp {
         self.prefetching = prefetch.clone();
         let changed = (req.method != "GET" && req.method != "HEAD").then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         self.changed = changed.clone();
-        let mut resp = Answering::begin(self, req).0.handle_inner(req);
+        // The page's states, once the request is the one being answered: an initializer that read
+        // `session()` found none, and so did every `session()` of that request after it, the
+        // session kept as none (FEEDBACK68.md, Q-985, found in FEEDBACK67's third review; branch
+        // pwa).
+        let mut resp = {
+            let a = Answering::begin(self, req);
+            a.0.page_start(req);
+            a.0.handle_inner(req)
+        };
         // An app's, from its app.toml (src/pwa.rs): its manifest and Apple icon where a route that
         // takes any path answered 404, and its tags in a page's head. One check here, all a
         // program without one pays (FEEDBACK67.md, B.1 and its review; branch pwa).
@@ -486,7 +517,7 @@ impl Interp {
         let mut early_parts: Vec<usize> = Vec::new();
         if prefetch.is_some() && !self.deferred.is_empty() {
             let jobs = std::mem::take(&mut self.deferred);
-            if resp.header("content-type").is_some_and(|c| c.starts_with("text/html")) && resp.status == 200 {
+            if is_html(&resp) && resp.status == 200 {
                 early_parts = jobs.iter().map(|d| d.id).collect();
                 let page = crate::defer::split(std::mem::take(&mut resp.body), jobs);
                 resp.body = crate::defer::whole(self, page);
@@ -589,7 +620,7 @@ impl Interp {
             crate::pwa::Marked::default()
         };
         // Pages with components load the browser bundle.
-        let html = resp.header("content-type").map_or(false, |c| c.starts_with("text/html"));
+        let html = is_html(&resp);
         // Every page prefetches the links pointed at: a page a route made, not a file as it is on
         // disk, whose ETag and byte ranges are of the file (FEEDBACK36.md, Q-447; branch
         // feedback36-39).
@@ -1344,7 +1375,7 @@ impl Interp {
                 }
             }
         }
-        let html = resp.header("content-type").is_some_and(|c| c.starts_with("text/html"));
+        let html = is_html(resp);
         let framed_by_policy = resp.header("content-security-policy").is_some_and(|c| c.contains("frame-ancestors"))
             || want.iter().any(|(k, v)| k == "content-security-policy" && v.as_deref().is_some_and(|c| c.contains("frame-ancestors")));
         if html && !framed_by_policy && !want.iter().any(|(k, _)| k == "x-frame-options") {
@@ -4060,7 +4091,7 @@ fn written_miss(resp: &HttpResponse) -> bool {
 }
 
 fn inject_dev_script(resp: &mut HttpResponse, version: u64) {
-    let html = resp.header("content-type").map_or(false, |c| c.starts_with("text/html"));
+    let html = is_html(resp);
     if !html || as_written(resp) {
         return;
     }
@@ -4182,7 +4213,7 @@ fn replace_bytes(body: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     out
 }
 
-fn source_hash(text: &str) -> String {
+pub(crate) fn source_hash(text: &str) -> String {
     use sha2::Digest;
     // Most are the same on every page (the prefetch, the swap, the rule): the last few are kept,
     // on each thread.
@@ -4577,7 +4608,7 @@ impl Worker {
         };
         // A page asking whether the save changed it (`x-quillo-hot: <its version>`): what the
         // version it was made with renders now, by the same request, as a print beside this one.
-        if app.watch && resp.header("content-type").is_some_and(|c| c.starts_with("text/html")) {
+        if app.watch && is_html(&resp) {
             // A GET's only, run as a prefetch is, changing nothing: run for real, a route that writes
             // wrote twice at every save, once for each open page (found in review).
             let hot = (req.method == "GET").then(|| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-quillo-hot"))).flatten();

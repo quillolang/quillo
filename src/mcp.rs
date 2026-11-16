@@ -3033,6 +3033,9 @@ fn mcp_token(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctrl
     if at_the_door(it) {
         return fail(line, "`mcp_token` is not for a tool: a token is made where the user is signed in, on a page of the program's, and pasted into the AI client");
     }
+    // A credential shown once: its page is kept for offline by no one (FEEDBACK67.md, B.2, third
+    // review; branch pwa).
+    it.visitor_other = true;
     let session = crate::session::current(it);
     let user = match o.and_then(|m| m.get("user")) {
         Some(u) => u.clone(),

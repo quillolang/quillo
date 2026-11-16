@@ -4607,16 +4607,23 @@ const NOBODYS_FIELDS: &[&str] = &["path", "route_path", "host", "query", "query_
 /// cookies } = request` and `request.headers["x-api-key"]` were not, and such a page was kept
 /// for everyone by a cache in front (FEEDBACK55.md, Q-886; branch feedback55).
 pub(crate) fn request_use(walk: impl FnOnce(&mut dyn FnMut(&Expr))) -> (bool, bool) {
-    let (named, nobodys) = uses_of("request", walk);
+    // `__request`, the request as sent that a group's middleware is given, is read as `request`
+    // is: `{__request.cookies.secret}` was a page of no one's, for caches and for the offline
+    // worker alike (FEEDBACK67.md, B.2, third review; branch pwa).
+    let (named, nobodys) = uses_of_names(&["request", "__request"], walk);
     (named > 0, named > nobodys)
 }
 
 /// How often the code `walk` goes over names `name`, and how often as a field of nobody's.
 fn uses_of(name: &str, walk: impl FnOnce(&mut dyn FnMut(&Expr))) -> (u32, u32) {
+    uses_of_names(&[name], walk)
+}
+
+fn uses_of_names(names: &[&str], walk: impl FnOnce(&mut dyn FnMut(&Expr))) -> (u32, u32) {
     let (mut named, mut nobodys) = (0u32, 0u32);
     walk(&mut |x| match x {
-        Expr::Ident(n, _) if n == name => named += 1,
-        Expr::Field(o, f, _) if matches!(&**o, Expr::Ident(n, _) if n == name) && NOBODYS_FIELDS.contains(&f.as_str()) => nobodys += 1,
+        Expr::Ident(n, _) if names.contains(&n.as_str()) => named += 1,
+        Expr::Field(o, f, _) if matches!(&**o, Expr::Ident(n, _) if names.contains(&n.as_str())) && NOBODYS_FIELDS.contains(&f.as_str()) => nobodys += 1,
         _ => {}
     });
     (named, nobodys)

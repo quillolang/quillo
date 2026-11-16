@@ -498,8 +498,7 @@ pub fn answer(it: &mut Interp, path: &str, req: &HttpRequest) -> Option<HttpResp
 #[cold]
 #[inline(never)]
 pub fn after_route(it: &mut Interp, req: &HttpRequest, path: &str, resp: &mut HttpResponse) {
-    let html = |r: &HttpResponse| r.header("content-type").is_some_and(|c| c.trim_start().get(..9).is_some_and(|t| t.eq_ignore_ascii_case("text/html")));
-    let real = matches!(resp.status, 200..=299) && !html(resp) || matches!(resp.status, 300..=399);
+    let real = matches!(resp.status, 200..=299) && !crate::server::is_html(resp) || matches!(resp.status, 300..=399);
     if !real {
         if let Some(own) = answer(it, path, req) {
             *resp = own;
@@ -507,7 +506,7 @@ pub fn after_route(it: &mut Interp, req: &HttpRequest, path: &str, resp: &mut Ht
         }
     }
     // A page a route made, not a file as it is on disk (`as_written`).
-    if resp.header("content-type").is_some_and(|c| c.starts_with("text/html")) && !crate::server::as_written(resp) {
+    if crate::server::is_html(resp) && !crate::server::as_written(resp) {
         if let Some(w) = it.site.pwa.clone() {
             add_tags(&mut resp.body, &w);
         }
@@ -935,7 +934,8 @@ fn attach_offline(it: &mut Interp, name: Option<&str>) {
         .replacen("@V@", &js(&version), 1)
         .replacen("@PAGES@", &serde_json::to_string(&pages).unwrap_or_else(|_| "[]".into()), 1)
         .replacen("@OFFLINE@", &js(&offline_page), 1)
-        .replacen("@GATE@", &js(gate()), 1);
+        .replacen("@GATE@", &js(gate()), 1)
+        .replacen("@GATE_HASH@", &js(&crate::server::source_hash(gate())), 1);
     // 280 bytes with its tags, on each offline route's page: the worker's scope is the program's
     // base. It also tells Quillo's worker, where it controls the page, which session the browser
     // holds (`quillo_tag`, "-" for none), as the runtime does on pages with components: a sign-out
@@ -1032,8 +1032,13 @@ pub struct Marked {
 #[cold]
 #[inline(never)]
 pub fn mark(it: &mut Interp, req: &HttpRequest, offline_route: bool, session_changed: bool, parts: bool, resp: &mut HttpResponse) -> Marked {
-    resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(OFFLINE_HEADER) && !k.eq_ignore_ascii_case(SESSION_HEADER));
-    let html = resp.header("content-type").is_some_and(|c| c.trim_start().get(..9).is_some_and(|t| t.eq_ignore_ascii_case("text/html")));
+    unmarked(resp);
+    let html = crate::server::is_html(resp);
+    // `-` says no one, and drops the visitor's kept pages: only on a GET's answer, and a server
+    // fn's (never a navigation, and only the site's own pages can call one), which the runtime
+    // tells the worker of. Another site's form sent here carries no `Lax` cookie, and would have
+    // wiped them (FEEDBACK67.md, B.2, third review; branch pwa).
+    let get = matches!(req.method.as_str(), "GET" | "HEAD") || req.url.starts_with("/_quillo/rpc/");
     let (mut session_cookie, mut had) = (false, None);
     for (k, v) in req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("cookie")) {
         let _ = k;
@@ -1055,16 +1060,22 @@ pub fn mark(it: &mut Interp, req: &HttpRequest, offline_route: bool, session_cha
     // The session's name: never on an answer a shared cache may keep (the program took `private`
     // away), whose page is then not kept either.
     let tag = if session_changed || (html && it.offline_seen.is_some() && unshared(resp)) { crate::session::offline_tag(it) } else { None };
+    // A session cookie the page did not read, which no longer opens (expired, or the key changed):
+    // no one, as no cookie is; its kept pages and `quillo_tag` go. Only where it matters, and
+    // only then is the cookie checked (FEEDBACK67.md, B.2, third review; branch pwa).
+    // Only where the browser holds `quillo_tag`: without it the gate shows that session's copies to
+    // no one anyway.
+    let ended = html && get && session_cookie && had.is_some() && !session_changed && it.offline_seen.is_none() && crate::session::cookie_opens(it, req) == Some(false);
     let said = match &tag {
         Some(t) => Some(t.clone()),
-        None if html && !session_cookie && !session_changed => Some("-".into()),
+        None if html && (!session_cookie || ended) && !session_changed => Some("-".into()),
         None => None,
     };
-    if let Some(t) = said {
+    if let Some(t) = said.filter(|t| get || t != "-") {
         resp.headers.push((SESSION_HEADER.into(), t));
     }
     if html && !session_changed {
-        if let Some(line) = crate::session::tag_again(it, had.as_deref(), session_cookie) {
+        if let Some(line) = crate::session::tag_again(it, had.as_deref(), session_cookie && !ended) {
             // Never on an answer a shared cache may keep: it is the visitor's now.
             if !unshared(resp) {
                 resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("cache-control"));
@@ -1078,13 +1089,14 @@ pub fn mark(it: &mut Interp, req: &HttpRequest, offline_route: bool, session_cha
     }
     let register = Marked { register: true, private: false };
     // `idempotency::holds_form_key`, by memchr's search: compared window by window it was 9,000
-    // instructions on a 2 KB page.
-    if it.visitor_other || parts || memchr::memmem::find(&resp.body, crate::idempotency::FORM_FIELD.as_bytes()).is_some() {
+    // instructions on a 2 KB page. An answer that set or ended the session is not kept: it may
+    // show the person before it (a goodbye) under the name of the session after it (third review).
+    if it.visitor_other || parts || session_changed || memchr::memmem::find(&resp.body, crate::idempotency::FORM_FIELD.as_bytes()).is_some() {
         return register;
     }
-    // The session read or changed: the page is that session's. A locale rule alone reads nothing
-    // of anyone's that matters here.
-    if it.offline_seen.is_some() || session_changed {
+    // The session read: the page is that session's. A locale rule alone reads nothing of
+    // anyone's that matters here.
+    if it.offline_seen.is_some() {
         // A session that cannot be named (too full for an id), or an answer a shared cache may
         // keep: not kept.
         if tag.is_none() {
@@ -1095,4 +1107,10 @@ pub fn mark(it: &mut Interp, req: &HttpRequest, offline_route: bool, session_cha
     }
     resp.headers.push((OFFLINE_HEADER.into(), "1".into()));
     register
+}
+
+/// Takes away the marks an answer carries for Quillo's worker: the program's own, or a mounted
+/// program's, which only Quillo may set (FEEDBACK67.md, B.2, second and third reviews; branch pwa).
+pub fn unmarked(resp: &mut HttpResponse) {
+    resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(OFFLINE_HEADER) && !k.eq_ignore_ascii_case(SESSION_HEADER));
 }

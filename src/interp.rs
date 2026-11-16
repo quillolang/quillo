@@ -122,6 +122,9 @@ impl Interp {
         }
         crate::value::page_begin(Some(Vec::new()));
         let globals = self.globals.clone();
+        // What they read of the request (`session()`, `url()`) is the request's: its path and
+        // query, as a route's before its own parameters (FEEDBACK68.md, Q-985; branch pwa).
+        self.pending_request = Some(crate::server::PendingRequest::of_url(&req.url));
         for (name, e) in self.page_states.clone().iter() {
             let v = match self.eval(e, &globals) {
                 Ok(v) => v,
@@ -133,6 +136,8 @@ impl Interp {
             };
             crate::value::page_put(&globals, *name, v);
         }
+        self.pending_request = None;
+        self.current_request = None;
     }
 }
 

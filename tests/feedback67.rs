@@ -1405,9 +1405,11 @@ const SW_KIT: &str = r#"
   const kept = async () => {
     const out = {};
     for (const n of await caches.keys()) {
-      if (n.endsWith(":gone")) continue;
+      // Opened only if it is still there: opening one the worker just dropped makes it again,
+      // empty, and it was seen on every look after (found in the third review's runs).
+      if (n.endsWith(":gone") || !(await caches.has(n))) continue;
       const k = (await (await caches.open(n)).keys()).map((r) => decodeURI(new URL(r.url).pathname).replace(/\/[0-9a-f]{16}\./, "/H.")).filter((p) => !p.endsWith("/_quillo/sw-state")).sort();
-      out[n.replace(/:[0-9a-f]{16}/, ":V").replace(/:V:.+$/, ":V:S")] = k;
+      if (k.length) out[n.replace(/:[0-9a-f]{16}/, ":V").replace(/:V:.+$/, ":V:S")] = k;
     }
     return out;
   };
@@ -1581,9 +1583,14 @@ const SIGNED_SCRIPT: &str = r#"(async () => {@KIT@
   out.after_form = await until(async () => (await privates()) === 0 && (await kept()));
   out.again = await signIn("bob");
   out.privates = (await until(async () => (await privates()) === 1)) ? 1 : 0;
-  // A server fn: the runtime tells the worker.
-  document.getElementById("out").click();
-  out.after_fn = await until(async () => (await privates()) === 0 && (await kept()));
+  // A server fn: the runtime tells the worker. Its bundle loaded first, which a loaded machine
+  // took seconds for (the click waits for it, and a 5 s wait ran out in a full run).
+  const b = document.getElementById("out");
+  b.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+  for (let i = 0; i < 400 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(25);
+  b.click();
+  out.after_fn = null;
+  for (let i = 0; i < 400 && !out.after_fn; i++) { if ((await privates()) === 0) out.after_fn = await kept(); else await tick(25); }
   // A page that signs out in its own answer.
   await signIn("cy");
   await look("/bye");
@@ -2024,7 +2031,9 @@ fn b2_the_marks_and_the_register_script_go_where_they_belong() {
     for path in ["/nulled", "/theme", "/agent", "/order"] {
         assert_eq!(m("GET", path), (200, None, none(), None, 1), "{}", path);
     }
-    assert_eq!(m("POST", "/docs/b"), (200, None, none(), None, 0));
+    // Only a GET's answer says no one: another site's form, sent here, carries no Lax cookie
+    // (third review).
+    assert_eq!(m("POST", "/docs/b"), (200, None, None, None, 0));
     assert_eq!(m("GET", "/plain"), (200, None, none(), None, 0));
     assert_eq!(m("GET", "/data"), (200, None, None, None, 0));
     assert_eq!(m("GET", "/missing"), (404, None, none(), None, 0));
@@ -3129,6 +3138,10 @@ route offline GET /frag = <div><h1>Frag {session().user ?? "nobody"}</h1></div>
 route offline GET /nohead = <html lang="de"><body><h1>Nohead {session().user ?? "nobody"}</h1></body></html>
 route offline GET /str = respond(200, "<!doctype html><script>window.s = \"<html data-x=1><head>\"</script><html lang=\"es\"><head><title>Str</title></head><body><h1>Str " + (session().user ?? "nobody") + "</h1></body></html>", { "content-type": "text/html; charset=utf-8" })
 route offline GET /note = respond(200, "<!-- a note --><!doctype html><html lang=\"it\"><body><h1>Note " + (session().user ?? "nobody") + "</h1></body></html>", { "content-type": "text/html; charset=utf-8" })
+route offline GET /c1 = respond(200, "<!--><html lang=\"pt\"><body><h1>C1 " + (session().user ?? "nobody") + "</h1></body></html>", { "content-type": "text/html; charset=utf-8" })
+route offline GET /c2 = respond(200, "<!---><!doctype html><html lang=\"nl\"><body><h1>C2 " + (session().user ?? "nobody") + "</h1></body></html>", { "content-type": "text/html; charset=utf-8" })
+route offline GET /c3 = respond(200, "<!-- a --!><!doctype html><html lang=\"sv\"><body><h1>C3 " + (session().user ?? "nobody") + "</h1></body></html>", { "content-type": "text/html; charset=utf-8" })
+route offline GET /c4 = respond(200, "<!-- never closed <html><body><h1>C4 " + (session().user ?? "nobody") + "</h1>", { "content-type": "text/html; charset=utf-8" })
 route GET /ping = "pong"
 "#;
 
@@ -3136,7 +3149,7 @@ const SHAPES_SCRIPT: &str = r#"(async () => {@KIT@
   const out = {};
   out.controlled = await controlled();
   await look("/in/ana");
-  const paths = ["/cond", "/frag", "/nohead", "/str", "/note"];
+  const paths = ["/cond", "/frag", "/nohead", "/str", "/note", "/c1", "/c2", "/c3", "/c4"];
   for (const p of paths) await look(p);
   await stage(1);
   out.down = await down();
@@ -3191,6 +3204,12 @@ fn b2_review2_the_marks_go_before_the_page_which_the_browser_merges() {
             "/nohead": shown("Nohead ana", Some("de"), None, "", "CSS1Compat"),
             "/str": str_page,
             "/note": shown("Note ana", Some("it"), None, "", "CSS1Compat"),
+            // Third review, 4: `<!-->`, `<!--->` and `--!>` end comments, as the browser reads
+            // them; a comment never closed is all the page, the gate before it.
+            "/c1": shown("C1 ana", Some("pt"), None, "", "BackCompat"),
+            "/c2": shown("C2 ana", Some("nl"), None, "", "CSS1Compat"),
+            "/c3": shown("C3 ana", Some("sv"), None, "", "CSS1Compat"),
+            "/c4": { "h1": null, "lang": null, "cls": null, "x": null, "kept": true, "session": true, "hidden": false, "gate_first": true, "s": null, "mode": "BackCompat", "title": "" },
             "/": { "h1": "Home", "lang": null, "cls": null, "x": null, "kept": true, "session": false, "hidden": false, "gate_first": false, "s": null, "mode": "CSS1Compat", "title": "" },
         })
     );
@@ -3335,4 +3354,221 @@ fn b2_review2_a_refused_prefetch_leaves_the_kept_copy() {
     let d = dir("r2-refused", "let n = 0\nroute offline GET / = <html><body><h1>Home</h1></body></html>\nroute offline GET /menu {\n    set_cookie(\"seen\", \"1\")\n    <html><body><h1>Menu</h1></body></html>\n}\n");
     let (_s, port) = logged(&d, &[]);
     assert_eq!(harness(port, REFUSED_SCRIPT), serde_json::json!({ "before": true, "prefetch": 503, "after": true }));
+}
+
+// ---- B.2, third review -------------------------------------------------------------------------
+
+const THIRD: &str = r#"fn mcp ping() = "pong"
+route GET /in/:who {
+    set_session({ user: who })
+    redirect("/")
+}
+route GET /short/:who {
+    set_session({ user: who }, { max_age: 1 })
+    redirect("/")
+}
+route offline GET / = <html><body><h1>Home</h1></body></html>
+route offline GET /mine = <html><body><h1>{session().user ?? "nobody"}</h1></body></html>
+route offline GET /bye {
+    let u = session().user ?? "nobody"
+    end_session()
+    <html><body><h1>Bye {u}</h1></body></html>
+}
+route offline GET /bye2 {
+    let u = session().user ?? "nobody"
+    set_session({})
+    <html><body><h1>Bye {u}</h1></body></html>
+}
+route offline GET /hello {
+    set_session({ visits: 1 })
+    <html><body><h1>Hello</h1></body></html>
+}
+route offline GET /dunder = <html><body><h1>{request.path} {__request.cookies.secret ?? "none"}</h1></body></html>
+route offline GET /upper = respond(200, "<!doctype html><html><head><style>html{display:block}</style></head><body><h1>" + (session().user ?? "nobody") + "</h1></body></html>", { "content-type": "Text/HTML; charset=utf-8", "content-security-policy": "script-src 'self'; style-src 'unsafe-inline'" })
+route offline GET /sandboxed = respond(200, <html><body><h1>Sandboxed {session().user ?? "nobody"}</h1></body></html>, { "content-security-policy": "sandbox allow-same-origin" })
+route offline GET /token = <html><body><h1>Token {mcp_token()}</h1></body></html>
+mount /blog = "blog.qwe"
+route GET /ping = "pong"
+"#;
+
+/// A mounted program that writes the worker's marks itself.
+const MOUNTED: &str = "route GET /forged = respond(200, <html><body><h1>Blog</h1></body></html>, { \"x-quillo-offline\": \"1\", \"x-quillo-session\": \"abc\" })\n";
+
+fn third_dir(name: &str) -> PathBuf {
+    let d = dir(name, THIRD);
+    std::fs::write(d.join("blog.qwe"), MOUNTED).unwrap();
+    d
+}
+
+// Third review, 1: an answer that set or ended the session is never kept, private or public: one
+// that read Ana and then ended or emptied the session would have been kept under the new
+// session's name with Ana's name on it; one that only set it, too.
+#[test]
+fn b3_an_answer_that_changed_the_session_is_not_kept() {
+    let d = third_dir("r3-changed");
+    let (_s, port) = logged(&d, &["--no-check"]);
+    let (ana, tag) = session_step(port, "/in/ana", "");
+    let mine = format!("{}; quillo_tag={}", ana, tag);
+    for p in ["/bye", "/bye2", "/hello"] {
+        let (offline, said, _) = second_marks(port, p, &mine, &[]);
+        assert_eq!(offline, None, "{}", p);
+        assert!(said.is_some(), "{}: it still says the session it leaves", p);
+    }
+    let gone = harness(port, "const b = await makeBrowser(O); await b.install(); await b.go(\"/in/ana\"); const on = (await b.go(\"/bye\")).h1; b.online = false; console.log(JSON.stringify({ on, off: (await b.go(\"/bye\")).offlinePage }));");
+    assert_eq!(gone, serde_json::json!({ "on": "Bye ana", "off": true }));
+}
+
+// Third review, 2: `__request`, the request as sent, is read as `request` is: a page showing its
+// cookies is the visitor's, `private` with `Vary: Cookie` for caches in a program with no offline
+// route (Q-886's marking, which it got past), and not kept for offline in one with them.
+#[test]
+fn b3_dunder_request_is_the_visitors() {
+    let d = third_dir("r3-dunder");
+    let (_s, port) = logged(&d, &["--no-check"]);
+    assert_eq!(second_marks(port, "/dunder", "secret=s1", &[]).0, None);
+    let d = dir("r3-dunder-plain", "route GET /d = <html><body><h1>{__request.cookies.secret ?? \"none\"}</h1></body></html>\nroute GET /n = <html><body><h1>{request.path}</h1></body></html>\n");
+    let (_s2, port) = logged(&d, &[]);
+    let (_, h, body) = fetch(port, "GET", "/d", &[("cookie", "secret=s1")]);
+    assert!(String::from_utf8_lossy(&body).contains("s1"));
+    assert_eq!((header(&h, "cache-control"), header(&h, "vary")), (Some("private"), Some("Cookie")), "{:?}", h);
+    let (_, h, _) = fetch(port, "GET", "/n", &[("cookie", "secret=s1")]);
+    assert_eq!(header(&h, "cache-control"), None, "a page of nobody's stays so: {:?}", h);
+}
+
+// Third review, 3: a page whose content type is written `Text/HTML` is a page: it gets the
+// register script, and its policy names the gate, which its kept copy needs.
+#[test]
+fn b3_a_mixed_case_content_type_is_a_page() {
+    let d = third_dir("r3-upper");
+    let (_s, port) = logged(&d, &["--no-check"]);
+    let (ana, tag) = session_step(port, "/in/ana", "");
+    let (_, h, body) = fetch(port, "GET", "/upper", &[("cookie", &format!("{}; quillo_tag={}", ana, tag))]);
+    assert_eq!(header(&h, "x-quillo-offline"), Some("private"));
+    assert!(header(&h, "content-security-policy").unwrap_or("").contains(&policy_hash(quillo::pwa::gate())), "{:?}", h);
+    assert!(String::from_utf8_lossy(&body).contains(&register_script("")));
+}
+
+// Third review, 5 and the rest: a session cookie the page did not read, which no longer opens
+// (forged, or past its time): no one, as no cookie is (`-`), and `quillo_tag` goes; a valid one
+// says nothing. `-` is said on a GET's answer only (and a server fn's). A mounted program's own
+// marks are taken off. A page that made an MCP token (shown once) is not kept.
+#[test]
+fn b3_a_session_the_server_no_longer_takes_is_no_one() {
+    let d = third_dir("r3-ended");
+    let (_s, port) = logged(&d, &["--no-check"]);
+    let (ana, tag) = session_step(port, "/in/ana", "");
+    let mine = format!("{}; quillo_tag={}", ana, tag);
+    assert_eq!(second_marks(port, "/", &mine, &[]), (Some("1".into()), None, None));
+    let forged = format!("{}x; quillo_tag={}", ana, tag);
+    assert_eq!(second_marks(port, "/", &forged, &[]), (Some("1".into()), Some("-".into()), Some("cleared".into())));
+    let (short, short_tag) = session_step(port, "/short/bea", "");
+    std::thread::sleep(Duration::from_millis(2100));
+    assert_eq!(second_marks(port, "/", &format!("{}; quillo_tag={}", short, short_tag), &[]), (Some("1".into()), Some("-".into()), Some("cleared".into())));
+    // Not on a POST's answer.
+    let (_, h, _) = fetch(port, "POST", "/", &[("cookie", &forged)]);
+    assert_eq!(header(&h, "x-quillo-session"), None);
+    // A mounted program's own marks.
+    let (_, h, _) = fetch(port, "GET", "/blog/forged", &[("cookie", &mine)]);
+    assert_eq!((header(&h, "x-quillo-offline"), header(&h, "x-quillo-session")), (None, None), "{:?}", h);
+    // An MCP token on the page.
+    let (status, h, body) = fetch(port, "GET", "/token", &[("cookie", &mine)]);
+    assert!(status == 200 && String::from_utf8_lossy(&body).contains("Token "), "{}", String::from_utf8_lossy(&body));
+    assert_eq!(header(&h, "x-quillo-offline"), None);
+    // As the worker sees it: Ana's copies go at the first page after her cookie stopped opening.
+    let r = harness(port, "const b = await makeBrowser(O); await b.install(); await b.go(\"/in/ana\"); await b.go(\"/mine\"); const k = b.jar.keys().next().value; b.jar.set(k, b.jar.get(k) + \"x\"); await b.go(\"/\"); const left = Object.keys(await b.dump()).filter((n) => /:V:/.test(n) && !n.endsWith(\":-\")).length; b.online = false; console.log(JSON.stringify({ left, tag: b.jar.has(\"quillo_tag\"), offline: (await b.go(\"/mine\")).offlinePage }));");
+    assert_eq!(r, serde_json::json!({ "left": 0, "tag": false, "offline": true }));
+}
+
+// Third review, 3: a session's kept page whose policy would stop the gate (a `sandbox` without
+// `allow-scripts`) is not given back: the offline page instead. Without the gate its own sheet
+// could have shown it.
+#[test]
+fn b3_a_kept_page_whose_policy_stops_the_gate_is_not_given_back() {
+    let d = third_dir("r3-sandbox");
+    let (_s, port) = logged(&d, &["--no-check"]);
+    let r = harness(port, "const b = await makeBrowser(O); await b.install(); await b.go(\"/in/ana\"); await b.go(\"/sandboxed\"); await b.go(\"/mine\"); const kept = (await b.dump()); b.online = false; console.log(JSON.stringify({ kept: Object.entries(kept).filter(([n]) => /:V:/.test(n)).map(([, v]) => v.sort()), sandboxed: (await b.go(\"/sandboxed\")).offlinePage, mine: (await b.go(\"/mine\")).h1 }));");
+    assert_eq!(r, serde_json::json!({ "kept": [["/mine", "/sandboxed"]], "sandboxed": true, "mine": "ana" }));
+}
+
+/// The worker's own `start` and `gated`, taken from the served text, run in Node on pages and
+/// policies.
+const WORKER_PARTS: &str = r#"const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+const GATE_HASH = /GATE_HASH = ("[^"]*")/.exec(src)[1];
+const body = src.slice(src.indexOf("function start(html)"), src.indexOf("async function state()"));
+const [start, gated] = new Function("const GATE_HASH = " + GATE_HASH + ";\n" + body + "; return [start, gated];")();
+const long = "<!--" + "x".repeat(5000) + "-->";
+const pages = {
+  empty_comment: "<!--><html><body><h1>a</h1></body></html>",
+  dash_comment: "<!---><html><body><h1>a</h1></body></html>",
+  bang_end: "<!-- a --!><html><body><h1>a</h1></body></html>",
+  unclosed: "<!-- never closed <html><body><h1>a</h1>",
+  four_dashes: "<!----><html>",
+  bom_doctype: "\uFEFF<!doctype html><!-- x --> <html>",
+  pi: "<?xml version=\"1.0\"?><html>",
+  nbsp: "\u00a0<html>",
+  past_4kb: long + "<html>",
+  doctype_unclosed: "<!doctype html",
+};
+const at = {};
+for (const [k, p] of Object.entries(pages)) at[k] = start(p);
+const h = (p) => new Headers(p === null ? {} : { "content-security-policy": p });
+const policies = {
+  none: null, self: "script-src 'self'", hashed: "script-src 'self' " + JSON.parse(GATE_HASH), inline: "script-src 'unsafe-inline'",
+  inline_nonce: "script-src 'unsafe-inline' 'nonce-x'", default_only: "default-src 'self'", style_only: "style-src 'self'",
+  sandbox: "sandbox", sandbox_same_origin: "sandbox allow-same-origin", sandbox_scripts: "sandbox allow-scripts",
+  two: "script-src 'unsafe-inline', script-src 'self'",
+};
+const runs = {};
+for (const [k, p] of Object.entries(policies)) runs[k] = gated(h(p));
+console.log(JSON.stringify({ at, runs }));
+"#;
+
+// Third review, 4 and 3: where the worker puts its marks, by the HTML standard's comment states:
+// `<!-->` and `<!--->` end at once, `--!>` ends a comment, `<?...>` and an unclosed doctype as
+// bogus comments; a comment never closed, or no content in the first 4 KB, puts them at the very
+// start after a byte-order mark; a no-break space is content. And whether a kept policy lets
+// the gate run: no policy, inline scripts let in, its hash named, a sandbox with scripts; not
+// `'self'` alone, a nonce beside `'unsafe-inline'`, `default-src` without inline, a sandbox
+// without scripts, nor one policy of two that refuses.
+#[test]
+fn b3_where_the_marks_go_and_whether_the_gate_runs() {
+    let d = third_dir("r3-parts");
+    let (_s, port) = logged(&d, &["--no-check"]);
+    let (status, _, worker) = fetch_body(port, "/_quillo/sw.js");
+    assert!(status == 200 && worker.contains("GATE_HASH = "), "{} {}", status, worker.len());
+    std::fs::write(d.join("sw.js"), worker).unwrap();
+    std::fs::write(d.join("parts.js"), WORKER_PARTS).unwrap();
+    let mut c = std::process::Command::new("node");
+    c.arg(d.join("parts.js")).arg(d.join("sw.js"));
+    let o = within(c, 30);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let r: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(
+        r,
+        serde_json::json!({
+            "at": { "empty_comment": 5, "dash_comment": 6, "bang_end": 11, "unclosed": 0, "four_dashes": 7, "bom_doctype": 27, "pi": 21, "nbsp": 0, "past_4kb": 0, "doctype_unclosed": 0 },
+            "runs": { "none": true, "self": false, "hashed": true, "inline": true, "inline_nonce": false, "default_only": false, "style_only": true, "sandbox": false, "sandbox_same_origin": false, "sandbox_scripts": true, "two": false },
+        })
+    );
+}
+
+// FEEDBACK68.md, Q-985 (found in FEEDBACK67's third review): a page state's initializer that reads
+// the session ran before the request was there: it found none, and so did every `session()` of
+// that request after it, the session kept as none. Now it reads the request's (its path and
+// query too, through `url()`), and the page is the visitor's: private, and for offline kept for
+// that session.
+#[test]
+fn q985_a_page_states_initializer_reads_the_session() {
+    let src = "state who = session().user ?? \"nobody\"\nstate at = url().path\nroute GET /in/:who {\n    set_session({ user: who })\n    redirect(\"/\")\n}\nroute GET /page = <html><body><h1>{who} {session().user ?? \"nobody\"} {at}</h1></body></html>\nroute offline GET /kept = <html><body><h1>{who}</h1></body></html>\n";
+    let d = dir("q985", src);
+    assert!(check(&d).0, "{:?}", check(&d));
+    let (_s, port) = logged(&d, &[]);
+    let (ana, tag) = session_step(port, "/in/ana", "");
+    let (_, h, body) = fetch(port, "GET", "/page", &[("cookie", &ana)]);
+    assert!(String::from_utf8_lossy(&body).contains("<h1>ana ana /page</h1>"), "{}", String::from_utf8_lossy(&body));
+    assert_eq!(header(&h, "cache-control"), Some("private"));
+    let (_, _, body) = fetch(port, "GET", "/page", &[]);
+    assert!(String::from_utf8_lossy(&body).contains("<h1>nobody nobody /page</h1>"));
+    assert_eq!(second_marks(port, "/kept", &format!("{}; quillo_tag={}", ana, tag), &[]), (Some("private".into()), Some(tag), None));
 }

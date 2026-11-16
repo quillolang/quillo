@@ -20,7 +20,7 @@
 //   drops that session's pages and loads the page again. A session's pages are dropped when an
 //   answer, or the page's runtime, names another, and a session dropped is never kept again.
 // - Every other request goes to the network as if there were no worker.
-const BASE = @BASE@, V = @V@, PAGES = @PAGES@, OFFLINE = @OFFLINE@, GATE = @GATE@;
+const BASE = @BASE@, V = @V@, PAGES = @PAGES@, OFFLINE = @OFFLINE@, GATE = @GATE@, GATE_HASH = @GATE_HASH@;
 const MINE = "quillo:" + BASE + ":", NAME = MINE + V, AWAY = NAME + ":", GONE = MINE + "gone";
 const STATE = location.origin + BASE + "/_quillo/sw-state", DROPPED = location.origin + BASE + "/_quillo/sw-dropped";
 const NAMED = BASE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "/_quillo/[brsti]/[0-9a-f]+\\.(?:js|css|png)";
@@ -98,7 +98,8 @@ async function forget(url) {
 async function named(e) {
   for (const c of await mine()) {
     if (c.who) continue;
-    const hit = await (await caches.open(c.k)).match(e.request, { ignoreVary: true });
+    // By name, which makes no cache: one dropped meanwhile is not made again, empty.
+    const hit = await caches.match(e.request, { cacheName: c.k, ignoreVary: true });
     if (hit) return hit;
   }
   const res = await fetch(e.request);
@@ -176,7 +177,7 @@ async function keep(url, res, who) {
   // Written first, then taken from this version's other caches: never missing between.
   const name = who === null ? NAME : AWAY + who, c = await caches.open(name);
   await c.put(url, copy);
-  for (const o of await mine()) if (o.v === V && o.k !== name) await (await caches.open(o.k)).delete(url);
+  for (const o of await mine()) if (o.v === V && o.k !== name && (await caches.has(o.k))) await (await caches.open(o.k)).delete(url);
   // The oldest pages first, past the bound; not the files they name.
   const pages = (await c.keys()).filter((k) => k.url !== STATE && !ONE.test(new URL(k.url).pathname));
   for (const k of pages.slice(0, Math.max(0, pages.length - (who === null ? 100 : 50)))) await c.delete(k);
@@ -186,8 +187,10 @@ async function kept(url) {
   const g = await dropped();
   for (const c of await mine()) {
     if (c.who && g.has(c.who)) continue;
-    const hit = await (await caches.open(c.k)).match(url, { ignoreVary: true });
+    const hit = await caches.match(url, { cacheName: c.k, ignoreVary: true });
     if (!hit) continue;
+    // A session's page whose kept policy would stop the gate is not given back.
+    if (c.who && !gated(hit.headers)) continue;
     const html = await hit.text(), at = start(html);
     // A session's page: hidden, the gate first, before anything of theirs is read.
     const tag = "<html" + (c.who ? ' hidden data-kept-session="' + c.who + '"' : "") + ' data-kept="' + (hit.headers.get("x-quillo-kept") || "") + '">' + (c.who ? "<head><script>" + GATE + "</script>" : "");
@@ -198,23 +201,49 @@ async function kept(url) {
   return null;
 }
 
-// Where a page's elements start: past a byte-order mark, white space, its doctype and comments
-// (`<!-- ... -->`, and `<!...>` or `<?...>`, which the browser reads as comments too). What comes
-// there is the browser's, as written: a conditional comment, `<html>` in a script's text.
+// Where a page's elements start: past a byte-order mark, white space, its doctype and comments,
+// read as the browser's tokenizer reads them (the HTML standard's comment states: `<!-->` and
+// `<!--->` end at once, `--!>` ends one as `-->` does, `<!...>` and `<?...>` are comments to the
+// first `>`). What comes there is the browser's, as written: a conditional comment, `<html>` in a
+// script's text. Not found in the first 4 KB, or a comment never closed: the very start, after
+// the mark, where the gate still comes first (FEEDBACK67.md, B.2, third review; branch pwa).
 function start(html) {
-  let i = html.charCodeAt(0) === 0xfeff ? 1 : 0;
+  const first = html.charCodeAt(0) === 0xfeff ? 1 : 0;
+  let i = first;
   for (;;) {
-    while (i < html.length && /\s/.test(html[i])) i++;
+    while (i < html.length && "\t\n\f\r ".includes(html[i])) i++;
+    if (i > 4096) return first;
     if (html.startsWith("<!--", i)) {
-      const end = html.indexOf("-->", i + 4);
-      if (end < 0) return html.length;
-      i = end + 3;
+      if (html[i + 4] === ">") { i += 5; continue; }
+      if (html.startsWith("->", i + 4)) { i += 6; continue; }
+      const a = html.indexOf("-->", i + 4), b = html.indexOf("--!>", i + 4);
+      if (a < 0 && b < 0) return first;
+      i = a >= 0 && (b < 0 || a < b) ? a + 3 : b + 4;
     } else if (html.startsWith("<!", i) || html.startsWith("<?", i)) {
       const end = html.indexOf(">", i + 2);
-      if (end < 0) return html.length;
+      if (end < 0) return first;
       i = end + 1;
     } else return i;
   }
+}
+
+// Whether the gate can run under a kept page's policy: no `sandbox` that refuses scripts, and
+// where scripts are decided, inline ones let in or the gate's hash named. A page that cannot run
+// it would show without it (its own sheet may undo `hidden`), so it is not given back.
+function gated(h) {
+  const policy = h.get("content-security-policy");
+  if (!policy) return true;
+  return policy.split(",").every((p) => {
+    const ds = p.split(";").map((d) => d.trim().split(/\s+/)).filter((d) => d[0]);
+    const named = (n) => ds.find((d) => d[0].toLowerCase() === n);
+    const sandbox = named("sandbox");
+    if (sandbox && !sandbox.slice(1).some((t) => t.toLowerCase() === "allow-scripts")) return false;
+    const src = named("script-src-elem") || named("script-src") || named("default-src");
+    if (!src) return true;
+    const t = src.slice(1), low = t.map((x) => x.toLowerCase());
+    if (t.includes(GATE_HASH)) return true;
+    return low.includes("'unsafe-inline'") && !low.some((x) => /^'(nonce-|sha256-|sha384-|sha512-|strict-dynamic)/.test(x));
+  });
 }
 
 async function state() {
