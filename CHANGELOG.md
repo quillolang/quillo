@@ -32,9 +32,13 @@
   body, url, tag, badge, silent, ttl, urgency })` reaches that person's devices with the page
   closed, over Web Push sent by Quillo itself (RFC 8291 and 8292), and gives `{ sent, gone }`.
   Subscriptions are bound to `session().user`, or to a sealed `notification.user(x)`, kept in
-  `_quillo_push`, and unbound by `end_session()` and a change of person. The push key comes
-  from `QUILLO_SECRET`, the same on every instance (Q-956), and sends to one push service share
-  one connection (Q-960). The phone apps answer `"unsupported"` for now (FEEDBACK67.md, B.3).
+  `_quillo_push`, and unbound by `end_session()`, any change of person, and a page that finds
+  its device bound to someone else. At most 20 devices a person; sends go 8 at a time within
+  30 s, over kept connections (Q-960); push services are https on port 443. The push key comes
+  from `QUILLO_SECRET`, the same on every instance (Q-956). The phone apps answer
+  `"unsupported"` for now (FEEDBACK67.md, B.3).
+- `http.*`'s `public_only` no longer takes 64:ff9b:1::/48 (RFC 8215's local-use NAT64) as the
+  public internet (found in FEEDBACK67's review).
 - `ask` and `notify` where the code surely runs on the server (a route, a `server fn`, a tick,
   a job, the top level, a page state's initializer) are refused by `quillo check`, with what
   reaches someone who is not on the page: `notification.send`, and `publish` for open pages.

@@ -351,8 +351,9 @@ In the browser:
   people another way) is named by the server: `notification.ask({ user: ticket })`, where
   `ticket` is made in a route or a `server fn` with `notification.user(x)`. It is `x` sealed,
   good for 30 days, for this program and for the session it was made in, and it ends with
-  that session. A plain value is refused, as any page could then name someone else and be
-  sent their notifications:
+  that session: it works only from that session, and a request with no session makes none
+  (an error value; a sign-in route's own `set_session` counts). A plain value is refused, as
+  any page could then name someone else and be sent their notifications:
 
   ```quillo
   component Track(ticket: str) {
@@ -379,9 +380,12 @@ On the server:
   how many said the device's subscription had ended (a `404` or `410`), which is then
   dropped. Another failure keeps the subscription and is said in the log. It works in a
   route, a `server fn`, a job and a tick, and is refused in a component, which runs in the
-  browser too. It waits as `http.post` does, the server going on meanwhile, over one kept
-  connection to each push service. A `GET` that sends is refused as a prefetch (see
-  [Prefetching](#routes-prefetching)).
+  browser too. It waits as `http.post` does, the server going on meanwhile, and reaches a
+  person's devices at once: 8 at a time over kept connections, each given 10 s and all of them
+  30 s, past which the rest are said in the log as not sent. Inside `db.transaction` it is an
+  error value, as it would hold every other request while it waits: send after the
+  transaction (`quillo check` warns where it sees one inside). A `GET` that sends is refused
+  as a prefetch (see [Prefetching](#routes-prefetching)).
 - **The user** is what `session().user` held when the device subscribed (or the `x` of
   `notification.user(x)`), compared as JSON: the int `7` and the text `"7"` are two people,
   so send what the session holds.
@@ -423,8 +427,15 @@ On the server:
   }
   ```
 - **A sign-out unbinds**: `end_session()` unbinds every device subscribed in that session,
-  and so does `set_session` with another `user` (a second person signing in on the same
-  browser), so the next person on a shared device gets nothing meant for the one before.
+  and so does any change of person by `set_session`, to or from no `user` included, so the
+  next person on a shared device gets nothing meant for the one before. A page with
+  components that starts in a browser holding a subscription checks it with the server: one
+  bound to someone else than the session's person (after a cookie that simply ran out, say)
+  is unbound there and then, and `notification.state()` says `"default"`, so the next person
+  turns on their own.
+- **Limits**: a person has at most 20 devices in a program (and a tenant), the oldest
+  replaced by a new one, and a session may turn devices on or off 30 times a minute (past
+  that, a `429`). `stop` removes only this visitor's own.
   When they cannot be unbound (the database is down), the sign-out fails rather than leave
   them bound.
 - **The key**: the push key (VAPID, P-256) is derived from the session key, `QUILLO_SECRET`,
@@ -438,10 +449,12 @@ On the server:
   reached it. A program that never names `notification` has none of it: no table, no
   `/_quillo/push`, no worker for it. A variable named `notification` hides the module, and
   `quillo check` says so.
-- **Push services are https**, on the public internet: a subscription to anything else (a
-  private address, plain http, another scheme) is refused when the page sends it.
-  `QUILLO_PUSH_LOCAL=1` lets plain http to this machine through, for tests that play the push
-  service.
+- **Push services are https on port 443**, on the public internet: a subscription to anything
+  else (a private address, plain http, another port or scheme) is refused when the page sends
+  it, and an address is checked again as it resolves when a message is sent; a redirect is not
+  followed. `QUILLO_PUSH_LOCAL=1` lets plain http to this machine through, for tests that play
+  the push service; `--watch` does not. The site a notification opens is the one the page was
+  on (its `Host`), never what the page says.
 - **`/_quillo/push`** is where pages send subscriptions: `GET` gives the server's key, `POST`
   binds one, `DELETE` unbinds one. It takes JSON from the program's own pages only (another
   site's is a `403`), as a `server fn` does.
