@@ -31,6 +31,9 @@ pub(crate) const KEYWORDS: &[&str] = &[
     "true", "false", "null", "nil", "reply", "as", "component", "while",
 ];
 const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "ANY"];
+/// A `routes offline` group with no GET route in it: the tag keeps nothing (FEEDBACK67.md, B.2;
+/// branch pwa).
+const OFFLINE_NO_PAGE: &str = "this `routes offline` group has no GET route: `offline` keeps pages, which are GETs, and its other routes are sent again, never kept";
 /// What starts a line that takes names from a file: the file comes first, so an editor
 /// knows them while they are typed (FEEDBACK19.md, Q-156; branch feedback19-fixes).
 pub(crate) const IMPORT_WORDS: &[&str] = &["import", "client", "preload", "preconnect"];
@@ -139,7 +142,7 @@ pub(crate) fn starts_declaration(line: &[char]) -> bool {
     let name = |w: &str| w.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_');
     let upper = |w: &str| w.chars().next().is_some_and(char::is_uppercase);
     match first {
-        "route" => second.chars().all(|c| c.is_ascii_uppercase()),
+        "route" => second.chars().all(|c| c.is_ascii_uppercase()) || (second == "offline" && words.next().is_some_and(|m| m.chars().all(|c| c.is_ascii_uppercase()))),
         "view" | "component" | "type" => upper(second),
         "fn" => name(second) && line.contains('('),
         "server" => second == "fn",
@@ -1084,13 +1087,19 @@ impl Parser {
                             return Err(QuilloError::new(msg, line));
                         }
                     }
+                    // `routes offline /docs { ... }`: each GET route of the group kept for offline
+                    // (FEEDBACK67.md, B.2; branch pwa).
+                    let offline = self.peeked.is_none() && self.offline_group_tag();
                     if self.peeked.is_none() && self.group_ahead() {
                         if !top {
                             return Err(QuilloError::new("a `routes` group is written at the top level of a file, as `route` is", line));
                         }
-                        let routes = self.parse_group(line, &[], &[], &[], &None)?;
+                        let routes = self.parse_group(line, &[], &[], &[], &None, offline)?;
                         if routes.iter().all(|r| r.method == crate::ast::GUARD_METHOD) {
                             return Err(QuilloError::new("this `routes` group has no routes in it", line));
+                        }
+                        if offline && !routes.iter().any(|r| r.offline) {
+                            return Err(QuilloError::new(OFFLINE_NO_PAGE, line));
                         }
                         let mut routes = routes.into_iter();
                         let Some(first) = routes.next() else {
@@ -1203,8 +1212,10 @@ impl Parser {
                                     uses_request: false,
                                     reads_visitor: false,
                                     middleware_reads: Default::default(),
+                                    middleware_beyond: Default::default(),
                                     effects: None,
                                     limit: None,
+                                    offline: false,
                                 })));
                             }
                         }
@@ -1909,15 +1920,76 @@ impl Parser {
     }
 
     fn parse_route(&mut self, line: u32) -> PResult<RouteDef> {
+        // `route offline GET /menu = ...`: the tag, after the keyword as `fn mcp`'s is; `route` is
+        // a keyword, so the word after it is the tag or the method, and `offline` stays a name
+        // everywhere else (FEEDBACK67.md, B.2; branch pwa).
+        let offline = self.at_kw("offline")? && {
+            let (saved, at) = (self.save(), self.line()?);
+            self.next()?;
+            let tag = matches!(self.peek()?, Tok::Ident(_)) && self.line()? == at;
+            if !tag {
+                self.restore(saved);
+            }
+            tag
+        };
         let method = self.expect_ident("an HTTP method")?;
+        if method == "offline" {
+            return Err(QuilloError::new("`offline` comes before the method, and a page kept for offline is a GET: `route offline GET /menu = ...`", line));
+        }
         if !METHODS.contains(&method.as_str()) {
             return Err(QuilloError::new(
                 format!("unknown HTTP method `{}` (use one of {})", method, METHODS.join(", ")),
                 line,
             ));
         }
+        // What the browser keeps is a page, which it asks for with a GET: a POST, a PUT or a
+        // DELETE is sent again, never kept (FEEDBACK67.md, B.2; branch pwa).
+        if offline && method != "GET" {
+            return Err(QuilloError::new(format!("`offline` keeps a page for when there is no network, and a page is a GET: `route offline {} ...` cannot be kept (`route offline GET /...` for the page that shows it)", method), line));
+        }
+        if self.offline_ahead() {
+            return Err(QuilloError::new(format!("`offline` comes after `route`, before the method: `route offline {} /...`", method), line));
+        }
         let path = self.parse_path("after the method")?;
-        self.parse_route_rest(method, path, line)
+        let mut r = self.parse_route_rest(method, path, line)?;
+        r.offline = offline;
+        Ok(r)
+    }
+
+    /// Whether the word ahead, on this line, is `offline`: read by character, as a path is.
+    fn offline_ahead(&self) -> bool {
+        if self.peeked.is_some() {
+            return false;
+        }
+        let mut n = 0;
+        while matches!(self.lx.peek_char_at(n), Some(' ' | '\t')) {
+            n += 1;
+        }
+        "offline".chars().enumerate().all(|(i, c)| self.lx.peek_char_at(n + i) == Some(c)) && !self.lx.peek_char_at(n + 7).is_some_and(|c| c.is_alphanumeric() || c == '_')
+    }
+
+    /// After `routes`: `offline` with a space and a group's path after it, the tag of `routes
+    /// offline /docs { ... }`, taken; otherwise nothing is (FEEDBACK67.md, B.2; branch pwa).
+    fn offline_group_tag(&mut self) -> bool {
+        if self.peeked.is_some() {
+            return false;
+        }
+        // As the path after it would be read: past the spaces.
+        self.lx.skip_spaces();
+        if !self.offline_ahead() || !matches!(self.lx.peek_char_at(7), Some(' ' | '\t')) {
+            return false;
+        }
+        let mut n = 7;
+        while matches!(self.lx.peek_char_at(n), Some(' ' | '\t')) {
+            n += 1;
+        }
+        if self.lx.peek_char_at(n) != Some('/') {
+            return false;
+        }
+        for _ in 0..n {
+            self.lx.bump();
+        }
+        true
     }
 
     /// A route's or a group's path, read character by character:
@@ -2208,6 +2280,9 @@ impl Parser {
             self.parse_expr()?
         } else if self.at(&Tok::LBrace)? {
             self.parse_block()?
+        } else if self.at_kw("offline")? {
+            // FEEDBACK67.md wrote it so: `route GET /menu offline = ...` (B.2; branch pwa).
+            return self.err_at(format!("`offline` comes after `route`, before the method: `route offline {} {} ...`", method, shown_path(&path)));
         } else {
             return self.err_at("expected `=` or `{` to start the route body");
         };
@@ -2240,7 +2315,7 @@ impl Parser {
                 crate::check::walk_expr(&body, f)
             })
             .1;
-        Ok(RouteDef { method, path, query, body_pat, guards: Vec::new(), body, line, file: self.file.clone(), uses_request, reads_visitor, middleware_reads: Default::default(), effects, limit: None }.limited())
+        Ok(RouteDef { method, path, query, body_pat, guards: Vec::new(), body, line, file: self.file.clone(), uses_request, reads_visitor, middleware_reads: Default::default(), middleware_beyond: Default::default(), effects, limit: None, offline: false }.limited())
     }
 
     /// Whether what follows `routes` is a group's path: `/` and a path
@@ -2301,7 +2376,9 @@ impl Parser {
     /// body (`__answer(m(request))`: a `reply` in it, or a response it gives,
     /// answers instead), and the pattern matched with its own (branch
     /// route-groups).
-    fn parse_group(&mut self, line: u32, prefix: &[Seg], before: &[(Expr, u32)], guards: &[Pattern], outer: &Option<Vec<String>>) -> PResult<Vec<RouteDef>> {
+    /// `offline`: the group's tag, or a group's around it: each GET route in it is kept for offline
+    /// (FEEDBACK67.md, B.2; branch pwa).
+    fn parse_group(&mut self, line: u32, prefix: &[Seg], before: &[(Expr, u32)], guards: &[Pattern], outer: &Option<Vec<String>>, offline: bool) -> PResult<Vec<RouteDef>> {
         let mut path = prefix.to_vec();
         path.extend(self.parse_path("after `routes`")?);
         let mut before = before.to_vec();
@@ -2416,14 +2493,19 @@ impl Parser {
                             None => r.effects = Some(g.clone()),
                         }
                     }
+                    r.offline |= offline && r.method == "GET";
                     out.push(r.limited());
                 }
                 Tok::Ident(k) if k == "routes" => {
                     self.next()?;
-                    let inner = self.parse_group(at, &path, &before, &guards, &effects)?;
+                    let tag = self.offline_group_tag();
+                    let inner = self.parse_group(at, &path, &before, &guards, &effects, offline || tag)?;
                     // As at the top level (Q-546): a group inside another with nothing in it.
                     if inner.iter().all(|r| r.method == crate::ast::GUARD_METHOD) {
                         return Err(QuilloError::new("this `routes` group has no routes in it", at));
+                    }
+                    if tag && !inner.iter().any(|r| r.offline) {
+                        return Err(QuilloError::new(OFFLINE_NO_PAGE, at));
                     }
                     out.extend(inner);
                 }
@@ -2454,8 +2536,10 @@ impl Parser {
                     uses_request: true,
                     reads_visitor: guards.iter().any(pattern_reads_visitor),
                     middleware_reads: Default::default(),
+                    middleware_beyond: Default::default(),
                     effects: effects.clone(),
                     limit: None,
+                    offline: false,
                 }
                 .limited(),
             );
@@ -4545,6 +4629,16 @@ pub(crate) fn middleware_reads_visitor(d: &FnDef) -> bool {
     let Some(p) = d.params.first() else { return d.request_use().1 };
     let (named, nobodys) = uses_of(p.name.as_str(), |f| crate::check::walk_fn(d, f));
     d.request_use().1 || named > nobodys + given_back(&d.body, p.name.as_str())
+}
+
+/// `middleware_reads_visitor`, for what Quillo's service worker keeps: a first parameter named
+/// `request` is the request handed in, not the route's own one read anew, so only what is read of
+/// it counts; a guard that reads `session()` and hands the request back reads nothing more
+/// (FEEDBACK67.md, B.2, review; branch pwa).
+pub(crate) fn middleware_reads_beyond(d: &FnDef) -> bool {
+    let Some(p) = d.params.first() else { return d.request_use().1 };
+    let (named, nobodys) = uses_of(p.name.as_str(), |f| crate::check::walk_fn(d, f));
+    (p.name.as_str() != "request" && d.request_use().1) || named > nobodys + given_back(&d.body, p.name.as_str())
 }
 
 /// How often `e` gives `name` as its value, or returns it.

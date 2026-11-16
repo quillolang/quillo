@@ -355,12 +355,20 @@ pub struct RouteDef {
     pub reads_visitor: bool,
     /// Whether its groups' middleware can, once known (see `Interp::middleware_reads`).
     pub middleware_reads: std::sync::OnceLock<bool>,
+    /// Whether it reads more of the request it is handed than the session, once known, for what
+    /// Quillo's service worker keeps (see `Interp::middleware_beyond`; FEEDBACK67.md, B.2, review;
+    /// branch pwa).
+    pub middleware_beyond: std::sync::OnceLock<bool>,
     /// `route GET /report/:day with db { ... }`: what its body, and the middleware of its
     /// groups, may do; the group's `with` narrowed by its own (branch feedback40-43).
     pub effects: Option<Vec<String>>,
     /// The same as a function the runtime holds while the route runs, for its messages
     /// (`route GET /report/:day` is declared `with db`); made by `limited`.
     pub limit: Option<Arc<FnDef>>,
+    /// `route offline GET /menu`, or a GET route in `routes offline /docs { ... }`: its page is
+    /// kept by Quillo's service worker, for when there is no network (FEEDBACK67.md, B.2; branch
+    /// pwa).
+    pub offline: bool,
 }
 
 impl RouteDef {

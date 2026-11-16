@@ -559,7 +559,19 @@ fn session(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
     if let Some(s) = &it.session {
         return Ok(s.clone());
     }
-    let found = arrived(it).map_or_else(|| Value::map(Map::new()), |(d, _)| d);
+    let came = arrived(it);
+    // Its name, for a page of the visitor's that Quillo's service worker keeps (FEEDBACK67.md, B.2,
+    // review; branch pwa).
+    if it.site.offline.is_some() {
+        let tag = match &came {
+            None => Some("-".to_string()),
+            Some((_, Some(id))) => Some(tag_of(id)),
+            Some((_, None)) => None,
+        };
+        let ends = arrived_expiry(it);
+        it.offline_seen = Some((tag, ends));
+    }
+    let found = came.map_or_else(|| Value::map(Map::new()), |(d, _)| d);
     it.session = Some(found.clone());
     Ok(found)
 }
@@ -574,6 +586,9 @@ fn cookie(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         other => return fail(line, format!("`cookie` expects a cookie's name, got {}", other.map_or("nothing", |v| v.type_name()))),
     };
     it.visitor_read = true;
+    // Not the session: a page that reads it is kept for offline by no one (FEEDBACK67.md, B.2,
+    // review; branch pwa).
+    it.visitor_other = true;
     let Some(Value::Map(req)) = it.request_value() else { return Ok(Value::Nil) };
     Ok(match req.get("cookies") {
         Some(Value::Map(c)) => c.get(&*name).cloned().unwrap_or(Value::Nil),
@@ -643,6 +658,15 @@ fn set_session(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         );
     }
     send_cookie(it, &value, Some(age), line)?;
+    // Named for Quillo's service worker beside it, by its hidden id, which a cart or a message in
+    // it does not change; none for one too full for an id (FEEDBACK67.md, B.2, review; branch pwa).
+    if it.site.offline.is_some() {
+        let tag = match &it.session_id {
+            Some(Some(id)) => Some(tag_of(id)),
+            _ => None,
+        };
+        tag_cookie(it, tag.as_deref(), age);
+    }
     it.session = Some(data);
     it.session_ends = Some(given.map(|_| now() + age));
     Ok(Value::Nil)
@@ -677,8 +701,79 @@ fn end_session(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
         }
     }
     send_cookie(it, "", Some(0), line)?;
+    if it.site.offline.is_some() {
+        tag_cookie(it, None, 0);
+    }
     it.session = Some(Value::map(Map::new()));
     it.session_ends = Some(None);
     it.session_id = Some(None);
     Ok(Value::Nil)
+}
+
+/// The cookie that names the session for Quillo's service worker, in a program with routes
+/// tagged `offline`: `quillo_tag`, readable by the page's scripts, as the worker's gate on a
+/// visitor's kept page reads it before showing it. It proves nothing and opens nothing: it only
+/// names the session, by a digest of its hidden id (FEEDBACK67.md, B.2, review; branch pwa).
+pub const TAG_COOKIE: &str = "quillo_tag";
+
+/// A session's hidden id, named for the worker: signed with the session key for that purpose
+/// alone, so that the name tells nothing of the id, and servers that share `QUILLO_SECRET` say
+/// the same.
+fn tag_of(id: &str) -> String {
+    sign("quillo offline tag", id).chars().take(16).collect()
+}
+
+/// The session the browser holds once this answer is sent, named so: `-` for none; none for one
+/// with no hidden id (too full for one, or from before ids), whose pages are not kept, and for
+/// an answer that neither read the session (`session()`) nor set or ended it.
+pub(crate) fn offline_tag(it: &Interp) -> Option<String> {
+    match (&it.session_id, &it.session) {
+        (Some(Some(id)), _) => Some(tag_of(id)),
+        (Some(None), Some(Value::Map(m))) if m.is_empty() => Some("-".into()),
+        (Some(None), _) => None,
+        (None, _) => it.offline_seen.as_ref().and_then(|(t, _)| t.clone()),
+    }
+}
+
+/// Queues `quillo_tag` for `tag`, living `age` seconds as the session's cookie does, or takes it
+/// away (none): its path, `Secure` and `SameSite` as the session's.
+fn tag_cookie(it: &mut Interp, tag: Option<&str>, age: u64) {
+    let mut o = Map::new();
+    o.insert("http_only".into(), Value::Bool(false));
+    let age = if tag.is_some() { age } else { 0 };
+    if let Ok(l) = cookie_line(it, TAG_COOKIE, tag.unwrap_or(""), Some(age), Some(&o), "set_session", 0) {
+        queue(it, l);
+    }
+}
+
+/// For an answer of the visitor's whose session the browser's `quillo_tag` (`had`) does not name
+/// (a session from before the program's offline routes, or a cookie lost): the tag, set again for
+/// the rest of the session's life, or taken away when there is no session it can name. Queued
+/// cookies go out before this is asked: the line, for the answer's headers.
+pub(crate) fn tag_again(it: &mut Interp, had: Option<&str>, tag: Option<&str>) -> Option<String> {
+    let want = tag.filter(|t| *t != "-");
+    if had == want || (had.is_none() && want.is_none()) {
+        return None;
+    }
+    let mut o = Map::new();
+    o.insert("http_only".into(), Value::Bool(false));
+    let age = match want {
+        Some(_) => it.offline_seen.as_ref().and_then(|(_, e)| *e)?.saturating_sub(now()),
+        None => 0,
+    };
+    cookie_line(it, TAG_COOKIE, want.unwrap_or(""), Some(age), Some(&o), "set_session", 0).ok()
+}
+
+/// When the session the request came with ends, in seconds since 1970.
+fn arrived_expiry(it: &mut Interp) -> Option<u64> {
+    let ctx = context(it);
+    let ends: Vec<u64> = cookies(it)
+        .iter()
+        .filter_map(|v| {
+            open(&ctx, v)?;
+            let (payload, _) = v.split_once('.')?;
+            crate::value::json_value(&unb64url(payload)?).ok()?.get("e")?.as_u64()
+        })
+        .collect();
+    (ends.len() == 1).then(|| ends[0])
 }

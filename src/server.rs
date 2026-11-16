@@ -447,6 +447,8 @@ impl Interp {
         self.session_id = None;
         self.session_ends = None;
         self.visitor_read = false;
+        self.visitor_other = false;
+        self.offline_seen = None;
         self.locale_read = false;
         self.locale = None;
         self.page_start(&req);
@@ -564,6 +566,18 @@ impl Interp {
         if (wrote || session) && PREFETCH.load(std::sync::atomic::Ordering::Relaxed) && resp.header("clear-site-data").is_none() {
             resp.headers.push(("clear-site-data".into(), "\"prefetchCache\", \"prerenderCache\"".into()));
         }
+        // A program with routes tagged `offline` (src/pwa.rs, `Offline`): the marks its service
+        // worker reads, the session a page of the visitor's and each sign-in or sign-out leaves,
+        // and an offline route's page as one to keep, whose page then registers the worker.
+        // `Clear-Site-Data: "storage"` would have dropped the visitor's kept pages at a sign-out,
+        // and the worker with them. One check here, all a program without the tag pays
+        // (FEEDBACK67.md, B.2 and its review; branch pwa).
+        let marked = if self.site.offline.is_some() {
+            let offline = std::mem::take(&mut self.offline_page);
+            crate::pwa::mark(self, req, offline, session, &mut resp)
+        } else {
+            crate::pwa::Marked::default()
+        };
         // Pages with components load the browser bundle.
         let html = resp.header("content-type").map_or(false, |c| c.starts_with("text/html"));
         // Every page prefetches the links pointed at: a page a route made, not a file as it is on
@@ -582,6 +596,23 @@ impl Interp {
         // What the page has that these look for: links and scripts, a stream's player; one pass
         // for both (branch speed-fortunes).
         let tags = if html && req.method != "HEAD" { page_tags(&resp.body) } else { PageTags::default() };
+        // The script that registers Quillo's worker, on an offline route's page; let through the
+        // page's policy as Quillo's other scripts are. A page kept for a session is shown again
+        // behind the worker's gate, whose text is the same everywhere: the policy kept with the
+        // page lets it through, so that the worker changes no policy (FEEDBACK67.md, B.2 and its
+        // review; branch pwa).
+        if marked.register && html && req.method != "HEAD" {
+            if let Some(o) = self.site.offline.clone() {
+                let at = rfind_tag(&resp.body, b"</body>").unwrap_or(resp.body.len());
+                insert_at(&mut resp.body, at, o.register.as_bytes());
+                if refused.scripts {
+                    own.push(o.register_js.clone());
+                    if marked.private {
+                        own.push(crate::pwa::gate().to_string());
+                    }
+                }
+            }
+        }
         if html && req.method != "HEAD" && PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
             let has = rfind_tag;
             if let Some(at) = has(&resp.body, b"</body>") {
@@ -882,7 +913,11 @@ impl Interp {
             }
 
             self.current_request = r.uses_request.then_some(reqv);
-            self.visitor_read |= r.reads_visitor || self.middleware_reads(&r);
+            let reads = r.reads_visitor || self.middleware_reads(&r);
+            self.visitor_read |= reads;
+            // What Quillo's worker keeps: a read past the session (FEEDBACK67.md, B.2, review;
+            // branch pwa).
+            self.visitor_other |= r.reads_visitor || (reads && self.site.offline.is_some() && self.middleware_beyond(&r));
             let file = std::mem::replace(&mut self.cur_file, r.file.clone());
             // `route ... with db`: its body runs as a `with` function's, narrowed, never widened
             // (branch feedback40-43).
@@ -910,6 +945,9 @@ impl Interp {
             let resp = finish(crate::interp::in_file(ran, &r.file));
             self.current_request = None;
             self.pending_request = None;
+            // For Quillo's service worker, once the answer is made (see `handle`; FEEDBACK67.md,
+            // B.2; branch pwa).
+            self.offline_page = r.offline;
             // A `HEAD` is answered with the GET's headers, its length included; the body is left
             // out where the answer is written (FEEDBACK31.md, Q-393; branch feedback27-35-fixes).
             return resp;
@@ -1022,6 +1060,33 @@ impl Interp {
         })
     }
 
+    /// `middleware_reads`, as `parser::middleware_reads_beyond` reads the middleware: past the
+    /// session, for what Quillo's service worker keeps (FEEDBACK67.md, B.2, review; branch pwa).
+    #[cold]
+    fn middleware_beyond(&self, r: &crate::ast::RouteDef) -> bool {
+        use crate::ast::{Expr, Stmt};
+        let Expr::Block(stmts) = &r.body else { return false };
+        *r.middleware_beyond.get_or_init(|| {
+            stmts.iter().any(|s| {
+                let Stmt::Expr(Expr::Call(f, args, _)) = s else { return false };
+                if !matches!(&**f, Expr::Ident(n, _) if n == "__answer") {
+                    return false;
+                }
+                match args.first() {
+                    Some(Expr::Call(m, _, _)) => match &**m {
+                        Expr::Lambda(d) => crate::parser::middleware_reads_beyond(d),
+                        Expr::Ident(n, _) => match lookup(&self.globals, n) {
+                            Some(Value::Func(c)) => crate::parser::middleware_reads_beyond(&c.def),
+                            _ => true,
+                        },
+                        _ => true,
+                    },
+                    _ => true,
+                }
+            })
+        })
+    }
+
     /// The middleware of the innermost guarded group whose path the request is under, when no
     /// route answered it: its answer if it refuses, else none, and the server's answer stands.
     fn guard_first(
@@ -1090,7 +1155,9 @@ impl Interp {
                 define(&scope, &k, v);
             }
             self.current_request = Some(reqv);
-            self.visitor_read |= r.reads_visitor || self.middleware_reads(r);
+            let reads = r.reads_visitor || self.middleware_reads(r);
+            self.visitor_read |= reads;
+            self.visitor_other |= r.reads_visitor || (reads && self.site.offline.is_some() && self.middleware_beyond(r));
             let file = std::mem::replace(&mut self.cur_file, r.file.clone());
             self.route_limit = r.limit.clone();
             let answered = self.under_route(|it| it.eval(&r.body, &scope));
@@ -1459,6 +1526,13 @@ impl Interp {
                 ],
                 body: body.into_bytes(),
             };
+        }
+        // Quillo's service worker, for a program with routes tagged `offline`, and under --watch the
+        // one that takes itself away (FEEDBACK67.md, B.2; branch pwa).
+        if rest == "sw.js" {
+            if let Some(resp) = crate::pwa::worker_answer(self, req) {
+                return resp;
+            }
         }
         if rest == "quillo.js" {
             // The browser keeps its copy and asks whether it is still current.

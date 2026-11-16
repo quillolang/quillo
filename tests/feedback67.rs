@@ -1351,3 +1351,1389 @@ fn b1_review_an_icon_in_a_missing_folder_leaves_the_watcher_as_it_was() {
     let log = log_with(&s, "reloaded");
     assert!(!log.contains("every 50 ms"), "{}", log);
 }
+
+// ---- B.2: Quillo's service worker, for routes tagged `offline` (slice 3) ------------------------
+
+/// A server the page tells where it is (`fetch(STAGE + "/stage/<n>")`, no CORS needed), which
+/// stays up while the program's is stopped and started again.
+const STAGES: &str = "let stage = 0\nroute GET /stage/:n(int) {\n    stage = n\n    \"ok\"\n}\nroute GET /stage = stage\n";
+
+/// `in_chrome` with a deadline for pages that wait on the server's stages, and the stage
+/// server's address in the script (`@STAGE@`).
+fn in_chrome_staged(chrome: &Path, url: &str, script: &str, stages: u16) -> serde_json::Value {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let script = script.replace("@STAGE@", &format!("http://127.0.0.1:{}", stages));
+    let d = support::temp_dir(&format!("f67-sw-{}", script.len()));
+    std::fs::write(d.join("t.js"), &script).unwrap();
+    let mut c = std::process::Command::new("node");
+    c.arg(root.join("browser/run.js")).arg(chrome).arg(url).arg(d.join("profile")).arg("60000").arg(d.join("t.js"));
+    let out = within(c, 90);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{}: {}", e, String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Waits until the page says it reached `n` (or finished, which fails the test with its answer).
+fn stage_reached(stages: u16, n: u32, page: &std::thread::JoinHandle<serde_json::Value>) {
+    let end = Instant::now() + Duration::from_secs(60);
+    while support::send(stages, "GET", "/stage", &[], "").body != n.to_string() {
+        assert!(Instant::now() < end && !page.is_finished(), "the page did not reach stage {}", n);
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+/// What the scripts share: frames loaded through the worker, the caches' contents, and waits
+/// on the server (`down`, `up`).
+const SW_KIT: &str = r#"
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  const sw = navigator.serviceWorker;
+  const stage = (n) => fetch("@STAGE@/stage/" + n, { mode: "no-cors" });
+  const frame = (path) => new Promise((ok) => {
+    const f = document.createElement("iframe");
+    f.onload = () => ok(f);
+    f.src = path;
+    document.body.appendChild(f);
+  });
+  // A page as the worker gives it: its heading, `data-kept`, and whether it is the offline page.
+  const look = async (path) => {
+    const f = await frame(path), d = f.contentDocument, h = d.documentElement;
+    const kept = h.getAttribute("data-kept");
+    return { h1: (d.querySelector("h1") || {}).textContent || null, kept: kept === null ? null : /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(kept) ? "iso" : kept, offline: h.hasAttribute("data-quillo-offline"), title: d.title, frame: f };
+  };
+  const shown = (r) => { const o = Object.assign({}, r); delete o.frame; return o; };
+  // Each cache, its name's version as V and its session as S, with the paths it keeps (hashes as H);
+  // not the list of the sessions dropped, nor the mark that the version's pages are all kept.
+  const kept = async () => {
+    const out = {};
+    for (const n of await caches.keys()) {
+      if (n.endsWith(":gone")) continue;
+      const k = (await (await caches.open(n)).keys()).map((r) => decodeURI(new URL(r.url).pathname).replace(/\/[0-9a-f]{16}\./, "/H.")).filter((p) => !p.endsWith("/_quillo/sw-ready")).sort();
+      out[n.replace(/:[0-9a-f]{16}/, ":V").replace(/:V:.+$/, ":V:S")] = k;
+    }
+    return out;
+  };
+  // The sessions the worker dropped, by name.
+  const dropped = async (base = "") => { const r = await (await caches.open("quillo:" + base + ":gone")).match(base + "/_quillo/sw-dropped"); return r ? await r.json() : []; };
+  const tagNow = () => (/(?:^|;\s*)quillo_tag=([^;]*)/.exec(document.cookie) || [])[1] || "-";
+  const down = async () => { for (let i = 0; i < 600; i++) { try { await fetch("/ping", { cache: "no-store" }); } catch (_) { return true; } await tick(25); } return false; };
+  const up = async (want) => { for (let i = 0; i < 600; i++) { try { const r = await fetch("/ping", { cache: "no-store" }); if ((await r.text()) === want) return true; } catch (_) {} await tick(25); } return false; };
+  // `look`, once the page in the frame is as `ok` wants it (a gate that loads it again).
+  const lookUntil = async (path, ok) => {
+    const f = await frame(path);
+    for (let i = 0; i < 200; i++) { try { if (f.contentDocument.readyState === "complete" && ok(f.contentDocument)) break; } catch (_) {} await tick(25); }
+    const d = f.contentDocument, h = d.documentElement, k = h.getAttribute("data-kept");
+    return { h1: (d.querySelector("h1") || {}).textContent || null, kept: k === null ? null : /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(k) ? "iso" : k, offline: h.hasAttribute("data-quillo-offline"), title: d.title, session: h.getAttribute("data-kept-session"), hidden: h.hasAttribute("hidden") };
+  };
+  const controlled = async () => { await sw.ready; for (let i = 0; i < 300 && !sw.controller; i++) await tick(20); return !!sw.controller; };
+"#;
+
+/// The shop: offline routes with and without parameters, one counting its loads, one with a
+/// component, one that calls a server fn; a page that is not kept; app.toml's name, in unicode.
+const SHOP: &str = r#"let loads = 0
+server fn add(n: int) -> int = n + 1
+component Counter() {
+    state n = 0
+    <button id="inc" onclick={() => { n += 1 }}>clicked {n}</button>
+}
+component Adder() {
+    state got = ""
+    <button id="call" onclick={() => {
+        let r = add(1)
+        got = is_err(r) ? "unreachable" : str(r)
+    }}>add {got}</button>
+}
+route offline GET / = <html><head><title>Home</title></head><body><h1>Home</h1><Adder/></body></html>
+route offline GET /menu {
+    loads += 1
+    <html><body><h1>Menu {loads}</h1></body></html>
+}
+route offline GET /never = <html><body><h1>Never</h1><Counter/></body></html>
+route offline GET /item/:id = <html><body><h1>Item {id}</h1></body></html>
+route GET /plain = <html><body><h1>Plain</h1></body></html>
+route GET /ping = "pong"
+"#;
+
+const SHOP_SCRIPT: &str = r#"(async () => {@KIT@
+  const out = {};
+  out.controlled = await controlled();
+  const reg = await sw.getRegistration();
+  out.worker = new URL(sw.controller.scriptURL).pathname;
+  out.scope = new URL(reg.scope).pathname;
+  // Online: the network first, each load a new page.
+  out.menu = [(await look("/menu")).h1, (await look("/menu")).h1];
+  const call = async () => {
+    const b = document.getElementById("call"), was = b.textContent;
+    b.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    b.click();
+    for (let i = 0; i < 200 && b.textContent === was; i++) await tick(25);
+    return b.textContent;
+  };
+  out.call = await call();
+  out.ready = (await fetch("/_quillo/ready")).status;
+  out.kept = await kept();
+  await stage(1);
+  out.down = await down();
+  // The server is stopped.
+  out.offline = {};
+  for (const p of ["/menu", "/", "/never", "/item/5", "/plain", "/caf%C3%A9"]) out.offline[p] = shown(await look(p));
+  const never = (await look("/never")).frame.contentDocument;
+  const inc = never.getElementById("inc");
+  inc.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+  inc.click();
+  for (let i = 0; i < 200 && inc.textContent !== "clicked 1"; i++) await tick(25);
+  out.component = inc.textContent;
+  out.call_offline = await call();
+  const failed = async (p) => { try { await fetch(p); return false; } catch (_) { return true; } };
+  out.untouched = { ready: await failed("/_quillo/ready"), ping: await failed("/ping") };
+  out.kept_after = await kept();
+  out.errors = window.__quilloErrors;
+  document.body.dataset.result = JSON.stringify(out);
+})();"#;
+
+// B.2: the worker registers from an offline route's page, at the program's scope, and controls
+// it. Online, a page comes from the network each time and a server fn is answered by the server;
+// what is kept is the offline routes with no parameter (kept on install, opened or not) and the
+// files their pages name, nothing of /_quillo/rpc, ready or another GET. With the server stopped:
+// the page opened shows its last copy, marked `data-kept`; one never opened opens too, its
+// component working from the kept files; a page not kept, or with a parameter never opened, is
+// the offline page with app.toml's name (unicode, escaped); a server fn says it cannot be reached
+// and /_quillo/ready and other GETs fail as they would with no worker.
+#[test]
+fn b2_offline_pages_are_kept_and_shown_with_the_server_stopped() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let d = app_dir("sw-shop", &[("main.qwe", SHOP.as_bytes()), ("app.toml", "name = \"Corner <Shop> ✓\"\n".as_bytes())]);
+    assert!(check_app(&d, "main.qwe").0);
+    let stages = support::serve(&dir("sw-stages", STAGES).join("main.qwe"), &[]);
+    let (s, port) = logged(&d, &[]);
+    let (c, url, sp) = (chrome.clone(), format!("http://127.0.0.1:{}/", port), stages.port);
+    let page = std::thread::spawn(move || in_chrome_staged(&c, &url, &SHOP_SCRIPT.replace("@KIT@", SW_KIT), sp));
+    stage_reached(stages.port, 1, &page);
+    let log = std::fs::read_to_string(&s.1).unwrap_or_default();
+    drop(s);
+    let r = page.join().unwrap();
+    let name = "Corner <Shop> ✓";
+    let offline_page = serde_json::json!({ "h1": name, "kept": null, "offline": true, "title": name });
+    let files = serde_json::json!(["/", "/_quillo/b/H.js", "/_quillo/b/H.js", "/_quillo/r/H.js", "/menu", "/never"]);
+    assert_eq!(
+        r,
+        serde_json::json!({
+            "controlled": true, "worker": "/_quillo/sw.js", "scope": "/",
+            "menu": ["Menu 2", "Menu 3"], "call": "add 2", "ready": 200,
+            "kept": { "quillo::V": files },
+            "down": true,
+            "offline": {
+                "/menu": { "h1": "Menu 3", "kept": "iso", "offline": false, "title": "" },
+                "/": { "h1": "Home", "kept": "iso", "offline": false, "title": "Home" },
+                "/never": { "h1": "Never", "kept": "iso", "offline": false, "title": "" },
+                "/item/5": offline_page, "/plain": offline_page, "/caf%C3%A9": offline_page,
+            },
+            "component": "clicked 1", "call_offline": "add unreachable",
+            "untouched": { "ready": true, "ping": true },
+            "kept_after": { "quillo::V": files },
+            "errors": [],
+        }),
+        "{}",
+        log
+    );
+}
+
+/// A visitor's page kept for offline, and the two ways of signing out: a form the browser sends,
+/// answered with a redirect, and a server fn.
+const SIGNED: &str = r#"server fn sign_out() {
+    end_session()
+}
+component Out() {
+    <button id="out" onclick={() => { sign_out() }}>out</button>
+}
+route GET /in/:who {
+    set_session({ user: who })
+    redirect("/")
+}
+route POST /logout {
+    end_session()
+    redirect("/")
+}
+route GET /bye {
+    end_session()
+    <html><body><h1>Bye</h1></body></html>
+}
+route offline GET / = <html><body><h1>Home</h1><Out/><form id="f" method="post" action="/logout"><button>Sign out</button></form></body></html>
+route offline GET /mine = <html><body><h1>Mine {session().user ?? "nobody"}</h1></body></html>
+route GET /ping = "pong"
+"#;
+
+const SIGNED_SCRIPT: &str = r#"(async () => {@KIT@
+  const out = {};
+  out.controlled = await controlled();
+  const until = async (f) => { for (let i = 0; i < 200; i++) { const v = await f(); if (v) return v; await tick(25); } return null; };
+  const privates = async () => Object.keys(await kept()).filter((k) => k.endsWith(":S")).length;
+  const signIn = async (who) => { await look("/in/" + who); return (await look("/mine")).h1; };
+  out.at_install = await kept();
+  out.mine = await signIn("ana");
+  out.signed_in = await kept();
+  // A form the browser sends, answered by a redirect: the page after it says the session is none.
+  const home = (await look("/")).frame;
+  await new Promise((ok) => { home.onload = ok; home.contentDocument.getElementById("f").submit(); });
+  out.after_form = await until(async () => (await privates()) === 0 && (await kept()));
+  out.again = await signIn("bob");
+  out.privates = await privates();
+  // A server fn: the runtime tells the worker.
+  document.getElementById("out").click();
+  out.after_fn = await until(async () => (await privates()) === 0 && (await kept()));
+  // A page that signs out in its own answer.
+  await signIn("cy");
+  await look("/bye");
+  out.after_page = await until(async () => (await privates()) === 0 && (await kept()));
+  // Signed in again, the server stopped: the visitor's page is kept for them.
+  out.last = await signIn("dee");
+  await stage(1);
+  out.down = await down();
+  out.offline = shown(await look("/mine"));
+  out.errors = window.__quilloErrors;
+  document.body.dataset.result = JSON.stringify(out);
+})();"#;
+
+// B.2: a page that reads the visitor is kept apart, by the session it was made in, and dropped
+// when the session ends or changes: by a form the browser sends (its redirect's page says the
+// session left), by a server fn (the runtime tells the worker), by a page that ends it, and by
+// signing in as another. Public pages stay. With the server stopped, the page kept for the one
+// signed in is theirs.
+#[test]
+fn b2_a_visitors_page_is_dropped_when_the_session_ends_or_changes() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let d = dir("sw-signed", SIGNED);
+    assert!(check(&d).0, "{:?}", check(&d));
+    let stages = support::serve(&dir("sw-stages2", STAGES).join("main.qwe"), &[]);
+    let (s, port) = logged(&d, &[]);
+    let (c, url, sp) = (chrome.clone(), format!("http://127.0.0.1:{}/", port), stages.port);
+    let page = std::thread::spawn(move || in_chrome_staged(&c, &url, &SIGNED_SCRIPT.replace("@KIT@", SW_KIT), sp));
+    stage_reached(stages.port, 1, &page);
+    let log = std::fs::read_to_string(&s.1).unwrap_or_default();
+    drop(s);
+    let r = page.join().unwrap();
+    let public = serde_json::json!(["/", "/_quillo/b/H.js", "/_quillo/r/H.js"]);
+    let with = |user_page: bool| if user_page { serde_json::json!({ "quillo::V": public, "quillo::V:S": ["/mine"] }) } else { serde_json::json!({ "quillo::V": public }) };
+    assert_eq!(
+        r,
+        serde_json::json!({
+            "controlled": true,
+            "at_install": with(true), "mine": "Mine ana", "signed_in": with(true),
+            "after_form": with(false), "again": "Mine bob", "privates": 1, "after_fn": with(false), "after_page": with(false),
+            "last": "Mine dee", "down": true,
+            "offline": { "h1": "Mine dee", "kept": "iso", "offline": false, "title": "" },
+            "errors": [],
+        }),
+        "{}",
+        log
+    );
+}
+
+/// A policy's hash of `text`, as `'sha256-...'`.
+fn policy_hash(text: &str) -> String {
+    use sha2::Digest;
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let data = sha2::Sha256::digest(text.as_bytes());
+    let mut out = String::new();
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            out.push(if i <= c.len() { A[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    format!("'sha256-{}'", out)
+}
+
+/// What registers the worker, at the base given.
+fn register_script(base: &str) -> String {
+    format!("<script>(n=>n&&n.register(\"{0}/_quillo/sw.js\",{{scope:\"{0}/\"}}))(navigator.serviceWorker)</script>", base)
+}
+
+/// Under the guide's content policy, with nothing of its own on the page but the register script;
+/// its stages its own, as the policy lets the page reach no other server.
+const GUARDED: &str = "let stage = 0\nroute GET /stage/:n(int) {\n    stage = n\n    \"ok\"\n}\nroute GET /stage = stage\nsite_headers(\"/\", { \"content-security-policy\": \"default-src 'self'\" })\nroute offline GET / = <html><head><title>p</title></head><body><h1>Home</h1></body></html>\nroute offline GET /menu = <html><body><h1>Menu</h1></body></html>\nroute GET /ping = \"pong\"\n";
+
+const WATCHED_SCRIPT: &str = r#"(async () => {@KIT@
+  const out = {}, refused = [];
+  document.addEventListener("securitypolicyviolation", (e) => refused.push(e.violatedDirective));
+  out.controlled = await controlled();
+  out.kept = await kept();
+  const reg = await sw.getRegistration();
+  await stage(1);
+  out.up = await up("pong again");
+  // Under --watch: the worker there takes itself away, and what Quillo's kept.
+  await reg.update().catch((e) => { out.update = String(e); });
+  for (let i = 0; i < 200 && (await sw.getRegistrations()).length; i++) await tick(25);
+  out.registrations = (await sw.getRegistrations()).length;
+  out.caches = await caches.keys();
+  const home = (await look("/")).frame;
+  out.registers = [...home.contentDocument.scripts].some((s) => s.textContent.includes("/_quillo/sw.js"));
+  out.frame_controlled = !!home.contentWindow.navigator.serviceWorker.controller;
+  out.refused = refused;
+  document.body.dataset.result = JSON.stringify(out);
+})();"#;
+
+// B.2: the register script passes the page's policy, hashed as Quillo's other scripts are, and
+// the worker registers under `default-src 'self'`. Under --watch no page registers it, and
+// `/_quillo/sw.js` is a worker that takes itself away with what Quillo's kept: a browser that
+// registered the worker in a run without --watch has none after the next check, and no cache.
+#[test]
+fn b2_the_policy_lets_the_register_script_through_and_watch_takes_the_worker_away() {
+    let d = dir("sw-guarded", GUARDED);
+    let (s, port) = logged(&d, &[]);
+    let (status, h, body) = fetch(port, "GET", "/", &[]);
+    let body = String::from_utf8(body).unwrap();
+    assert_eq!(status, 200);
+    let js = register_script("");
+    assert!(body.contains(&format!("{}</body>", js)), "{}", body);
+    let inner = js.trim_start_matches("<script>").trim_end_matches("</script>");
+    assert_eq!(header(&h, "content-security-policy"), Some(format!("default-src 'self'; script-src 'self' {}", policy_hash(inner)).as_str()));
+    drop(s);
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    // Started again under --watch, and (the review) without --watch with its offline routes gone:
+    // either way the worker there takes itself away.
+    for (opts, src) in [(&["--watch"][..], GUARDED.to_string()), (&[][..], GUARDED.replace("route offline", "route"))] {
+        std::fs::write(d.join("main.qwe"), GUARDED).unwrap();
+        let s = logged_at(&d, port, &[]);
+        let (c, url) = (chrome.clone(), format!("http://127.0.0.1:{}/", port));
+        let page = std::thread::spawn(move || in_chrome_staged(&c, &url, &WATCHED_SCRIPT.replace("@KIT@", SW_KIT), port));
+        stage_reached(port, 1, &page);
+        drop(s);
+        std::fs::write(d.join("main.qwe"), src.replace("\"pong\"", "\"pong again\"")).unwrap();
+        let s = logged_at(&d, port, opts);
+        // No register script and no marks; the worker is the one that goes.
+        let (_, h, body) = fetch(port, "GET", "/", &[]);
+        let body = String::from_utf8(body).unwrap();
+        assert!(!body.contains("/_quillo/sw.js") && header(&h, "x-quillo-offline").is_none() && header(&h, "x-quillo-session").is_none(), "{:?} {}", h, body);
+        let (status, h, worker) = fetch(port, "GET", "/_quillo/sw.js", &[]);
+        assert_eq!((status, header(&h, "service-worker-allowed")), (200, Some("/")));
+        assert!(String::from_utf8_lossy(&worker).contains("self.registration.unregister()"));
+        let r = page.join().unwrap();
+        assert_eq!(
+            r,
+            serde_json::json!({
+                "controlled": true, "kept": { "quillo::V": ["/", "/menu"] }, "up": true,
+                "registrations": 0, "caches": [], "registers": false, "frame_controlled": false, "refused": [],
+            }),
+            "{:?}: {}",
+            opts,
+            std::fs::read_to_string(&s.1).unwrap_or_default()
+        );
+    }
+}
+
+/// A program in two versions: the second has another offline route and another heading.
+fn versioned(n: u32) -> String {
+    let extra = if n > 1 { "route offline GET /extra = <html><body><h1>Extra</h1></body></html>\n" } else { "" };
+    format!("route offline GET / = <html><body><h1>Version {0}</h1></body></html>\nroute offline GET /menu = <html><body><h1>Menu</h1></body></html>\n{1}route GET /ping = \"pong {0}\"\n", n, extra)
+}
+
+const VERSION_SCRIPT: &str = r#"(async () => {@KIT@
+  const out = {};
+  out.controlled = await controlled();
+  const reg = await sw.getRegistration(), first = reg.active;
+  let changes = 0;
+  sw.addEventListener("controllerchange", () => changes++);
+  const before = await caches.keys();
+  out.before = await kept();
+  await stage(1);
+  out.up = await up("pong 2");
+  await reg.update();
+  for (let i = 0; i < 400 && (await caches.keys()).includes(before[0]); i++) await tick(25);
+  for (let i = 0; i < 200 && !changes; i++) await tick(25);
+  out.after = await kept();
+  out.old_gone = !(await caches.keys()).includes(before[0]);
+  out.new_worker = reg.active !== first && sw.controller.scriptURL === first.scriptURL;
+  out.changes = changes;
+  out.home = (await look("/")).h1;
+  document.body.dataset.result = JSON.stringify(out);
+})();"#;
+
+// B.2: the program edited and started again on its port is a new worker (its version names the
+// program and its offline routes): it is installed at the next check, keeps the new routes, takes
+// over the page, and drops what the one before kept.
+#[test]
+fn b2_a_new_version_installs_a_new_worker_that_drops_the_old_caches() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let d = dir("sw-version", &versioned(1));
+    let stages = support::serve(&dir("sw-stages4", STAGES).join("main.qwe"), &[]);
+    let (s, port) = logged(&d, &[]);
+    let (_, h1, _) = fetch(port, "GET", "/_quillo/sw.js", &[]);
+    let (c, url, sp) = (chrome.clone(), format!("http://127.0.0.1:{}/", port), stages.port);
+    let page = std::thread::spawn(move || in_chrome_staged(&c, &url, &VERSION_SCRIPT.replace("@KIT@", SW_KIT), sp));
+    stage_reached(stages.port, 1, &page);
+    drop(s);
+    std::fs::write(d.join("main.qwe"), versioned(2)).unwrap();
+    let s = logged_at(&d, port, &[]);
+    let (_, h2, _) = fetch(port, "GET", "/_quillo/sw.js", &[]);
+    assert_ne!(header(&h1, "etag"), header(&h2, "etag"));
+    let r = page.join().unwrap();
+    assert_eq!(
+        r,
+        serde_json::json!({
+            "controlled": true, "before": { "quillo::V": ["/", "/menu"] }, "up": true,
+            "after": { "quillo::V": ["/", "/extra", "/menu"] }, "old_gone": true, "new_worker": true, "changes": 1, "home": "Version 2",
+        }),
+        "{}",
+        std::fs::read_to_string(&s.1).unwrap_or_default()
+    );
+}
+
+/// A proxy that serves the program under `base`, the prefix taken off as `--base` expects; with
+/// the program stopped it closes the connection, as a network gone does.
+const PROXY: &str = r#"const http = require("http");
+const [listen, upstream, base, mode] = [+process.argv[1], +process.argv[2], process.argv[3], process.argv[4]];
+http.createServer((req, res) => {
+  if (req.url !== base && !req.url.startsWith(base + "/")) { res.writeHead(404); return res.end("not here"); }
+  const p = http.request({ host: "127.0.0.1", port: upstream, path: req.url.slice(base.length) || "/", method: req.method, headers: req.headers }, (u) => { res.writeHead(u.statusCode, u.headers); u.pipe(res); });
+  p.on("error", () => { if (mode !== "502") return req.socket.destroy(); res.writeHead(502, { "content-type": "text/html" }); res.end("<html><body><p id=bad>bad gateway</p></body></html>"); });
+  req.pipe(p);
+}).listen(listen, "127.0.0.1", () => console.log("ready"));
+"#;
+
+const BASED: &str = r#"component Counter() {
+    state n = 0
+    <button id="inc" onclick={() => { n += 1 }}>clicked {n}</button>
+}
+route offline GET / = <html><body><h1>Home</h1></body></html>
+route offline GET /menu = <html><body><h1>Menu</h1><Counter/></body></html>
+route GET /ping = "pong"
+"#;
+
+const BASED_SCRIPT: &str = r#"(async () => {@KIT@
+  const out = {};
+  out.controlled = await controlled();
+  const reg = await sw.getRegistration();
+  out.worker = new URL(sw.controller.scriptURL).pathname;
+  out.scope = new URL(reg.scope).pathname;
+  out.kept = await kept();
+  await stage(1);
+  for (let i = 0; i < 600; i++) { try { await fetch("/shop/ping", { cache: "no-store" }); } catch (_) { out.down = true; break; } await tick(25); }
+  const menu = await look("/shop/menu");
+  const inc = menu.frame.contentDocument.getElementById("inc");
+  inc.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+  inc.click();
+  for (let i = 0; i < 200 && inc.textContent !== "clicked 1"; i++) await tick(25);
+  out.menu = shown(menu);
+  out.component = inc.textContent;
+  out.home = shown(await look("/shop/"));
+  out.gone = shown(await look("/shop/nothing"));
+  out.errors = window.__quilloErrors;
+  document.body.dataset.result = JSON.stringify(out);
+})();"#;
+
+// B.2 under --base: the worker is at the prefix's /_quillo/sw.js, its scope the prefix, allowed by
+// its header; its pages, its caches and the files it keeps carry the prefix; with the program
+// stopped, a page opened by a proxy that serves it at the prefix comes from the worker, with its
+// component working.
+#[test]
+fn b2_under_base_the_worker_and_its_pages_carry_the_prefix() {
+    let d = dir("sw-base", BASED);
+    let (s, port) = logged(&d, &["--base", "/shop"]);
+    let (status, h, worker) = fetch(port, "GET", "/_quillo/sw.js", &[]);
+    let worker = String::from_utf8(worker).unwrap();
+    assert_eq!((status, header(&h, "service-worker-allowed")), (200, Some("/shop/")));
+    assert!(worker.contains("const BASE = \"/shop\", V = \"") && worker.contains("PAGES = [\"/shop/\",\"/shop/menu\"]"), "{}", &worker[..worker.len().min(2000)]);
+    assert!(page(port, "/menu").contains(&register_script("/shop")));
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let stages = support::serve(&dir("sw-stages5", STAGES).join("main.qwe"), &[]);
+    let listen = support::free_port();
+    let proxy = std::process::Command::new("node").arg("-e").arg(PROXY).arg(listen.to_string()).arg(port.to_string()).arg("/shop").stdout(std::process::Stdio::null()).spawn().unwrap();
+    let _proxy = support::Guard::new(proxy);
+    let end = Instant::now() + Duration::from_secs(20);
+    while !support::listening(listen) {
+        assert!(Instant::now() < end, "the proxy did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (c, url, sp) = (chrome.clone(), format!("http://127.0.0.1:{}/shop/", listen), stages.port);
+    let page = std::thread::spawn(move || in_chrome_staged(&c, &url, &BASED_SCRIPT.replace("@KIT@", SW_KIT), sp));
+    stage_reached(stages.port, 1, &page);
+    let log = std::fs::read_to_string(&s.1).unwrap_or_default();
+    drop(s);
+    let r = page.join().unwrap();
+    assert_eq!(
+        r,
+        serde_json::json!({
+            "controlled": true, "worker": "/shop/_quillo/sw.js", "scope": "/shop/",
+            "kept": { "quillo:/shop:V": ["/shop/", "/shop/_quillo/b/H.js", "/shop/_quillo/r/H.js", "/shop/menu"] },
+            "down": true,
+            "menu": { "h1": "Menu", "kept": "iso", "offline": false, "title": "" }, "component": "clicked 1",
+            "home": { "h1": "Home", "kept": "iso", "offline": false, "title": "" },
+            "gone": { "h1": "You are offline", "kept": null, "offline": true, "title": "Offline" },
+            "errors": [],
+        }),
+        "{}",
+        log
+    );
+}
+
+const LIVE: &str = r#"let n = 0
+server fn count() -> int = n
+component Count() {
+    state v = live(count)
+    <p id="v">count {v}</p>
+}
+route GET / = <html><body><Count/></body></html>
+"#;
+
+/// The sockets the runtime makes after the page's first, counted as they are made and closed;
+/// with the server stopped, the live loop waits longer after each that does not open: after the
+/// second, 2 s or more.
+const ONLINE_SCRIPT: &str = r#"(async () => {
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  const W = WebSocket;
+  let made = 0, closed = 0;
+  window.WebSocket = function (u, p) { const s = p === undefined ? new W(u) : new W(u, p); made++; s.addEventListener("close", () => closed++); return s; };
+  window.WebSocket.prototype = W.prototype;
+  for (let i = 0; i < 200 && document.getElementById("v").textContent !== "count 0"; i++) await tick(25);
+  await fetch("@STAGE@/stage/1", { mode: "no-cors" });
+  for (let i = 0; i < 600 && closed < 2; i++) await tick(25);
+  const out = { tried: closed };
+  await tick(300);
+  out.waiting = made - closed;
+  const before = made;
+  dispatchEvent(new Event("online"));
+  await tick(300);
+  out.at_once = made - before;
+  document.body.dataset.result = JSON.stringify(out);
+})();"#;
+
+// B.2: back online, as the browser says, the live socket is opened again at once, where it waited
+// out its backoff (2 s or more after its second try that did not open, up to half a minute).
+#[test]
+fn b2_back_online_the_live_socket_is_opened_again_at_once() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let d = dir("sw-online", LIVE);
+    let stages = support::serve(&dir("sw-stages6", STAGES).join("main.qwe"), &[]);
+    let (s, port) = logged(&d, &[]);
+    let (c, url, sp) = (chrome.clone(), format!("http://127.0.0.1:{}/", port), stages.port);
+    let page = std::thread::spawn(move || in_chrome_staged(&c, &url, ONLINE_SCRIPT, sp));
+    stage_reached(stages.port, 1, &page);
+    drop(s);
+    assert_eq!(page.join().unwrap(), serde_json::json!({ "tried": 2, "waiting": 0, "at_once": 1 }));
+}
+
+/// Every kind of answer of a program with offline routes.
+const MARKED: &str = r#"server fn sign_out() {
+    end_session()
+}
+server fn same() -> int = 1
+server fn who() -> str = session().user ?? "nobody"
+route GET /in/:who {
+    set_session({ user: who })
+    redirect("/")
+}
+route GET /cart {
+    set_session({ user: session().user, cart: [1, 2, 3] })
+    "ok"
+}
+route offline GET / = <html><body><h1>Home</h1></body></html>
+route offline GET /item/:id = <html><body><h1>Item {id}</h1></body></html>
+route offline GET /café = <html><body><h1>Café</h1></body></html>
+route offline GET /mine = <html><body><h1>{session().user ?? "nobody"}</h1></body></html>
+route offline GET /nulled = respond(200, <html><body>{session().user ?? "x"}</body></html>, { "cache-control": null })
+route offline GET /theme = <html><body>{cookie("theme") ?? "light"}</body></html>
+route offline GET /agent = <html><body>{request.headers["user-agent"] ?? ""}</body></html>
+route offline GET /order = <html><body><form method="post" action="/buy"><input type="hidden" name="_idempotency_key" value="k1"></form></body></html>
+route offline GET /data = { a: 1 }
+route offline GET /missing = respond(404, <html><body>gone</body></html>)
+route offline GET /static = file("page.html")
+route GET /plain = <html><body><h1>Plain</h1></body></html>
+route GET /signed = <html><body>{session().user ?? "nobody"}</body></html>
+routes offline /docs {
+    route GET /a = <html><body>a</body></html>
+    route POST /b = <html><body>b</body></html>
+}
+fn signed(request) = session().user == null ? redirect("/") : request
+fn teamed(request) = request.headers["x-team"] == null ? redirect("/") : request
+routes offline /s | signed {
+    route GET /f = <html><body>{session().user}</body></html>
+}
+routes offline /t | teamed {
+    route GET /e = <html><body>e</body></html>
+}
+"#;
+
+/// An answer's status, its marks for the worker (`x-quillo-offline`, `x-quillo-session`), the
+/// `quillo_tag` cookie it sets, and how often it holds the register script.
+type Marks = (u16, Option<String>, Option<String>, Option<String>, usize);
+
+fn marks_of(port: u16, method: &str, path: &str, cookie: Option<&str>) -> Marks {
+    let hs: Vec<(&str, &str)> = cookie.map(|c| ("cookie", c)).into_iter().collect();
+    let (status, h, body) = fetch(port, method, path, &hs);
+    let tag = h.iter().find(|(k, v)| k == "set-cookie" && v.starts_with("quillo_tag=")).map(|(_, v)| v.clone());
+    (status, header(&h, "x-quillo-offline").map(str::to_string), header(&h, "x-quillo-session").map(str::to_string), tag, String::from_utf8_lossy(&body).matches(&register_script("")).count())
+}
+
+/// Signs in at `/in/<who>`: the session cookie as a request sends it, and the answer's tag.
+fn sign_in(port: u16, who: &str) -> (String, String, Vec<(String, String)>) {
+    let (status, h, _) = fetch(port, "GET", &format!("/in/{}", who), &[]);
+    assert_eq!(status, 303);
+    let cookie = h.iter().find(|(k, v)| k == "set-cookie" && v.contains("quillo_session=")).map(|(_, v)| v.split(';').next().unwrap().to_string()).unwrap();
+    (cookie, header(&h, "x-quillo-session").unwrap_or("").to_string(), h)
+}
+
+// B.2 and its review, as the server answers: an offline route's 200 page registers the worker, a
+// page with a parameter too, once each. What is kept is decided by what the request read, not by
+// `cache-control`: no one's (`1`); the visitor's through `session()` alone (`private`, by the
+// session's name); not at all when it read them otherwise (a cookie, a header), held a form key
+// (a kept form would send its order again), or could reach a shared cache (`cache-control: null`
+// leaves no name on it). Not a page that is not tagged, not JSON, not a 404, not a POST of an
+// offline group; a file as it is on disk is marked and has nothing added; a HEAD has the GET's
+// marks. The session's name goes only on a page of the visitor's and on an answer that sets or
+// ends the session (a redirect, a server fn's), never on a page anyone may be given.
+#[test]
+fn b2_the_marks_and_the_register_script_go_where_they_belong() {
+    let d = app_dir("sw-marked", &[("main.qwe", MARKED.as_bytes()), ("page.html", b"<!doctype html><html><body>file</body></html>")]);
+    assert!(check(&d).0, "{:?}", check(&d));
+    let (_s, port) = logged(&d, &[]);
+    assert_eq!(register_script("").len(), 90);
+    let m = |method: &str, path: &str| marks_of(port, method, path, None);
+    let one = || Some("1".to_string());
+    assert_eq!(m("GET", "/"), (200, one(), None, None, 1));
+    assert_eq!(m("HEAD", "/"), (200, one(), None, None, 0));
+    assert_eq!(m("GET", "/item/5"), (200, one(), None, None, 1));
+    assert_eq!(m("GET", "/caf%C3%A9"), (200, one(), None, None, 1));
+    assert_eq!(m("GET", "/docs/a"), (200, one(), None, None, 1));
+    // No session: the visitor's page is the one of no session's, `-`.
+    assert_eq!(m("GET", "/mine"), (200, Some("private".into()), Some("-".into()), None, 1));
+    for path in ["/nulled", "/theme", "/agent", "/order"] {
+        assert_eq!(m("GET", path), (200, None, None, None, 1), "{}", path);
+    }
+    assert_eq!(m("POST", "/docs/b"), (200, None, None, None, 0));
+    assert_eq!(m("GET", "/plain"), (200, None, None, None, 0));
+    assert_eq!(m("GET", "/data"), (200, None, None, None, 0));
+    assert_eq!(m("GET", "/missing"), (404, None, None, None, 0));
+    assert_eq!(m("GET", "/nowhere"), (404, None, None, None, 0));
+    let (_, h, body) = fetch(port, "GET", "/static", &[]);
+    assert_eq!((header(&h, "x-quillo-offline"), String::from_utf8(body).unwrap()), (Some("1"), "<!doctype html><html><body>file</body></html>".to_string()));
+    // Signed in: the session's pages carry its name; one anyone may be given does not.
+    let (ana, tag, _) = sign_in(port, "ana");
+    let with = |path: &str, c: &str| marks_of(port, "GET", path, Some(c));
+    let ana_tagged = format!("{}; quillo_tag={}", ana, tag);
+    assert_eq!(with("/mine", &ana_tagged), (200, Some("private".into()), Some(tag.clone()), None, 1));
+    assert_eq!(with("/signed", &ana_tagged), (200, None, Some(tag.clone()), None, 0));
+    for path in ["/", "/plain", "/theme", "/agent", "/nulled"] {
+        assert_eq!(with(path, &ana_tagged).2, None, "{}", path);
+    }
+    // Behind a guard that reads the session and hands the request back: kept for the session;
+    // behind one that reads a header: not kept.
+    assert_eq!(with("/s/f", &ana_tagged), (200, Some("private".into()), Some(tag.clone()), None, 1));
+    let (status, h, _) = fetch(port, "GET", "/t/e", &[("cookie", &ana_tagged), ("x-team", "a")]);
+    assert_eq!((status, header(&h, "x-quillo-offline")), (200, None));
+    // A server fn: one that sets or ends the session says the name it leaves; one that reads it, or
+    // nothing, says none.
+    let rpc = |name: &str, cookie: &str| {
+        let a = support::send(port, "POST", &format!("/_quillo/rpc/{}", name), &[("cookie", cookie), ("origin", "http://localhost")], "[]");
+        (a.status, a.header("x-quillo-session").map(str::to_string))
+    };
+    assert_eq!(rpc("same", &ana), (200, None));
+    assert_eq!(rpc("who", &ana), (200, None));
+    assert_eq!(rpc("sign_out", &ana), (200, Some("-".into())));
+}
+
+// B.2 review: the session's name is a digest of its hidden id, so a cart or a message written into
+// the session keeps it, and two sign-ins of one browser as one person too; another person is
+// another name. `quillo_tag`, the cookie that names it, comes with the session cookie: readable
+// by the page (no HttpOnly), its path the program's base, `SameSite=Lax`, `Secure` as the session
+// cookie is, living as long; taken away with it. A page of the session's that came without it (a
+// session from before the program's offline routes, a cookie lost) sets it again, once.
+#[test]
+fn b2_the_session_is_named_by_its_hidden_id_and_its_cookie() {
+    for (base, path) in [(&[][..], "/"), (&["--base", "/shop"][..], "/shop")] {
+        let d = app_dir("sw-tag", &[("main.qwe", MARKED.as_bytes()), ("page.html", b"x")]);
+        let (_s, port) = logged(&d, base);
+        let (ana, tag, h) = sign_in(port, "ana");
+        let line = h.iter().find(|(k, v)| k == "set-cookie" && v.starts_with("quillo_tag=")).map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(line, format!("quillo_tag={}; Path={}; Max-Age=2592000; Secure; SameSite=Lax", tag, path));
+        assert!(h.iter().any(|(k, v)| k == "set-cookie" && v.contains("quillo_session=") && v.contains("HttpOnly")));
+        assert!(tag.len() == 16 && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'), "{}", tag);
+        // A cart in the session: the same name.
+        let (_, h, _) = fetch(port, "GET", "/cart", &[("cookie", &ana)]);
+        assert_eq!(header(&h, "x-quillo-session"), Some(tag.as_str()));
+        let cart = h.iter().find(|(k, v)| k == "set-cookie" && v.contains("quillo_session=")).map(|(_, v)| v.split(';').next().unwrap().to_string()).unwrap();
+        assert_ne!(cart, ana, "the session cookie changed");
+        assert_eq!(marks_of(port, "GET", "/mine", Some(&format!("{}; quillo_tag={}", cart, tag))).2, Some(tag.clone()));
+        // Signed in again a moment later in the same browser, as the same person: the same name.
+        let (_, h, _) = fetch(port, "GET", "/in/ana", &[("cookie", &ana)]);
+        assert_eq!(header(&h, "x-quillo-session"), Some(tag.as_str()));
+        // Another person, and the same one again on another browser: other names.
+        let (_, bob, _) = sign_in(port, "bob");
+        let (_, ana2, _) = sign_in(port, "ana");
+        assert!(bob != tag && ana2 != tag && bob != ana2, "{} {} {}", tag, bob, ana2);
+        // The page of the session's without the cookie sets it again for the session's life; with
+        // it, or another's, as the server reads it.
+        let (_, _, _, again, _) = marks_of(port, "GET", "/mine", Some(&ana));
+        let again = again.unwrap();
+        let age: u64 = again.split("Max-Age=").nth(1).unwrap().split(';').next().unwrap().parse().unwrap();
+        assert!(again.starts_with(&format!("quillo_tag={}; Path={}; Max-Age=", tag, path)) && (2591990..=2592000).contains(&age) && !again.contains("HttpOnly"), "{}", again);
+        assert_eq!(marks_of(port, "GET", "/mine", Some(&format!("{}; quillo_tag={}", ana, tag))).3, None);
+        let wrong = marks_of(port, "GET", "/mine", Some(&format!("{}; quillo_tag=someone", ana))).3.unwrap();
+        assert!(wrong.starts_with(&format!("quillo_tag={};", tag)), "{}", wrong);
+        // No session, a stale cookie: taken away.
+        let gone = marks_of(port, "GET", "/mine", Some("quillo_tag=someone")).3.unwrap();
+        assert!(gone.starts_with(&format!("quillo_tag=; Path={}; Max-Age=0", path)), "{}", gone);
+        // Ended: both go.
+        let a = support::send(port, "POST", "/_quillo/rpc/sign_out", &[("cookie", &ana), ("origin", "http://localhost")], "[]");
+        let lines: Vec<&str> = a.headers.iter().filter(|(k, _)| k == "set-cookie").map(|(_, v)| v.as_str()).collect();
+        assert!(lines.iter().any(|l| l.starts_with(&format!("quillo_tag=; Path={}; Max-Age=0", path))), "{:?}", lines);
+    }
+    // A program without offline routes sets no such cookie.
+    let d = app_dir("sw-tag-none", &[("main.qwe", MARKED.replace("route offline", "route").replace("routes offline", "routes").as_bytes()), ("page.html", b"x")]);
+    let (_s, port) = logged(&d, &[]);
+    let (_, _, h) = sign_in(port, "ana");
+    assert!(!h.iter().any(|(k, v)| k == "set-cookie" && v.starts_with("quillo_tag=")), "{:?}", h);
+}
+
+/// `fetch` with a body.
+fn fetch_body(port: u16, path: &str) -> (u16, Vec<(String, String)>, String) {
+    let (s, h, b) = fetch(port, "GET", path, &[]);
+    (s, h, String::from_utf8_lossy(&b).into_owned())
+}
+
+// B.2: `/_quillo/sw.js` is JavaScript, revalidated each time, allowed the program's base as its
+// scope, with a validator (a 304 for it); a POST is not it. It names the offline routes with no
+// parameter, once each, in order, unicode as written, and the offline page with app.toml's name
+// made safe. Its version is one for the program: the same on every instance and after a restart,
+// another when a file the program uses changes.
+#[test]
+fn b2_the_worker_is_served_with_its_version_one_per_program() {
+    let d = app_dir("sw-served", &[("main.qwe", MARKED.as_bytes()), ("page.html", b"x"), ("app.toml", "name = \"A <b> & \\\"c\\\" ✓\"\n".as_bytes())]);
+    let (s, port) = logged(&d, &["--instances", "2"]);
+    let (status, h, worker) = fetch_body(port, "/_quillo/sw.js");
+    assert_eq!(status, 200);
+    assert_eq!(header(&h, "content-type"), Some("text/javascript; charset=utf-8"));
+    assert_eq!(header(&h, "cache-control"), Some("no-cache"));
+    assert_eq!(header(&h, "service-worker-allowed"), Some("/"));
+    let etag = header(&h, "etag").unwrap().to_string();
+    assert!(worker.contains(&format!("V = {}", etag)), "{}", etag);
+    assert!(worker.contains("PAGES = [\"/\",\"/café\",\"/mine\",\"/nulled\",\"/theme\",\"/agent\",\"/order\",\"/data\",\"/missing\",\"/static\",\"/docs/a\",\"/s/f\",\"/t/e\"]"), "{}", &worker[..2500.min(worker.len())]);
+    // The gate, as the server names it in a page's policy.
+    assert!(worker.contains(&format!("GATE = {}", serde_json::Value::String(quillo::pwa::gate().into()))));
+    assert!(worker.contains("<title>A &lt;b&gt; &amp; &quot;c&quot; ✓</title>") && worker.contains("<h1>A &lt;b&gt; &amp; &quot;c&quot; ✓</h1>"), "{}", worker);
+    let (status, _, body) = fetch(port, "GET", "/_quillo/sw.js", &[("if-none-match", &etag)]);
+    assert_eq!((status, body.len()), (304, 0));
+    assert_eq!(fetch(port, "POST", "/_quillo/sw.js", &[]).0, 404);
+    for _ in 0..8 {
+        assert_eq!(fetch_body(port, "/_quillo/sw.js").2, worker, "one worker on every instance");
+    }
+    drop(s);
+    let s = logged_at(&d, port, &[]);
+    assert_eq!(fetch_body(port, "/_quillo/sw.js").2, worker, "the same after a restart");
+    drop(s);
+    std::fs::write(d.join("main.qwe"), format!("use \"lib.qwe\"\n{}", MARKED)).unwrap();
+    std::fs::write(d.join("lib.qwe"), "fn one() = 1\n").unwrap();
+    let s = logged_at(&d, port, &[]);
+    let with_lib = fetch_body(port, "/_quillo/sw.js").2;
+    assert_ne!(with_lib, worker);
+    drop(s);
+    std::fs::write(d.join("lib.qwe"), "fn one() = 2\n").unwrap();
+    let _s = logged_at(&d, port, &[]);
+    assert_ne!(fetch_body(port, "/_quillo/sw.js").2, with_lib, "a file it uses changed");
+}
+
+// B.2 and its review: a program with no offline route is as it was, an app.toml or not: no marks
+// on any answer, no register script, no `quillo_tag`. Its `/_quillo/sw.js`, which a browser asks
+// for only if it registered Quillo's worker in an earlier run, is the worker that takes itself
+// away with what Quillo's kept (by the spec a 404 there would leave the old worker answering from
+// its cache); so under --watch, offline routes or not, where no page is marked either.
+#[test]
+fn b2_without_an_offline_route_nothing_changes() {
+    let src = MARKED.replace("route offline", "route").replace("routes offline", "routes");
+    for app in [false, true] {
+        let mut files: Vec<(&str, &[u8])> = vec![("main.qwe", src.as_bytes()), ("page.html", b"x")];
+        if app {
+            files.push(("app.toml", b"name = \"Shop\"\n"));
+        }
+        let d = app_dir(&format!("sw-none-{}", app), &files);
+        for opts in [&[][..], &["--watch"][..]] {
+            let (s, port) = logged(&d, opts);
+            let (status, h, worker) = fetch_body(port, "/_quillo/sw.js");
+            assert!(status == 200 && worker.contains("self.registration.unregister()") && worker.contains("const MINE = \"quillo:\" + \"\" + \":\""), "{:?}: {}", opts, worker);
+            assert_eq!(header(&h, "service-worker-allowed"), Some("/"));
+            let (ana, _, signed) = sign_in(port, "ana");
+            assert!(!signed.iter().any(|(k, v)| k.starts_with("x-quillo-offline") || k.starts_with("x-quillo-session") || v.starts_with("quillo_tag=")), "{:?}", signed);
+            for (method, path) in [("GET", "/"), ("HEAD", "/"), ("GET", "/mine"), ("GET", "/plain"), ("GET", "/nowhere"), ("POST", "/docs/b")] {
+                let (_, h, body) = fetch(port, method, path, &[("cookie", &ana)]);
+                assert!(!h.iter().any(|(k, v)| k.starts_with("x-quillo-offline") || k.starts_with("x-quillo-session") || v.starts_with("quillo_tag=")), "{:?} {} {}: {:?}", opts, method, path, h);
+                assert!(!String::from_utf8_lossy(&body).contains("/_quillo/sw.js"), "{} {}", method, path);
+            }
+            drop(s);
+        }
+    }
+}
+
+// B.2, the tag as written: after `route`, before the method (`route offline GET /x`, with patterns
+// and `with` after the path as ever), and after `routes`, before the group's path, where each GET
+// route of the group and of the groups inside it is kept, not its others. `offline` stays a name
+// everywhere else. Refused, each said for what it is: the tag on a route that is not a GET, a
+// group with no GET, and the tag where the report wrote it (`route GET /menu offline`) or after
+// the method.
+#[test]
+fn b2_the_tag_is_parsed_and_checked() {
+    let ok = [
+        "let offline = true\nfn f(offline: bool) = !offline\nroute GET /x = f(offline) ? \"y\" : \"n\"\n",
+        "route offline GET /x with db = db.query(\"select 1\")\n",
+        "route offline GET /x/:id(int) ? { page: int = 1 } = <p>{id} {page}</p>\n",
+        "routes offline /docs {\n    routes /inner {\n        route GET /a = \"a\"\n    }\n    route DELETE /b = \"b\"\n}\n",
+        "routes /docs {\n    routes offline /inner {\n        route GET /a = \"a\"\n    }\n    route offline GET /b = \"b\"\n}\n",
+        "let routes = 2\nlet offline = 1\nroute GET / = str(routes / offline)\n",
+    ];
+    for src in ok {
+        assert_eq!(check(&dir("tag-ok", src)), (true, vec![]), "{}", src);
+    }
+    let refused = [
+        ("route offline POST /x = \"x\"\n", "main.qwe:1: error: `offline` keeps a page for when there is no network, and a page is a GET: `route offline POST ...` cannot be kept (`route offline GET /...` for the page that shows it)"),
+        ("route offline ANY /x = \"x\"\n", "main.qwe:1: error: `offline` keeps a page for when there is no network, and a page is a GET: `route offline ANY ...` cannot be kept (`route offline GET /...` for the page that shows it)"),
+        ("route GET /menu offline = \"x\"\n", "main.qwe:1: error: `offline` comes after `route`, before the method: `route offline GET /menu ...`"),
+        ("route GET offline /menu = \"x\"\n", "main.qwe:1: error: `offline` comes after `route`, before the method: `route offline GET /...`"),
+        ("route offline /menu = \"x\"\n", "main.qwe:1: error: `offline` comes before the method, and a page kept for offline is a GET: `route offline GET /menu = ...`"),
+        ("routes offline /api {\n    route POST /a = \"a\"\n}\n", "main.qwe:1: error: this `routes offline` group has no GET route: `offline` keeps pages, which are GETs, and its other routes are sent again, never kept"),
+        ("routes /api {\n    routes offline /in {\n        route PUT /a = \"a\"\n    }\n    route GET /b = \"b\"\n}\n", "main.qwe:2: error: this `routes offline` group has no GET route: `offline` keeps pages, which are GETs, and its other routes are sent again, never kept"),
+        // Markup left open runs into the next declaration, a tagged route as a plain one.
+        ("route GET /a = <div>\n    <p>x</p>\n\nroute offline GET /b = \"b\"\n", "main.qwe:1: error: `<div>` is never closed: add `</div>` before `route` on line 4"),
+    ];
+    for (src, said) in refused {
+        assert_eq!(check(&dir("tag-refused", src)), (false, vec![said.to_string()]), "{}", src);
+    }
+    // Which routes are tagged, as the server reads them: each GET of an offline group, at any depth.
+    let d = dir("tag-which", "routes offline /docs {\n    routes /inner {\n        route GET /a = <html><body>a</body></html>\n    }\n    route DELETE /b = <html><body>b</body></html>\n}\nroutes /other {\n    route GET /c = <html><body>c</body></html>\n}\n");
+    let (_s, port) = logged(&d, &[]);
+    let tagged = |m: &str, p: &str| header(&fetch(port, m, p, &[]).1, "x-quillo-offline").is_some();
+    assert_eq!((tagged("GET", "/docs/inner/a"), tagged("DELETE", "/docs/b"), tagged("GET", "/other/c")), (true, false, false));
+}
+
+// B.2 in Quillo's highlighter (code on pages, the guide): the tag is a keyword after `route` and
+// `routes`, and the path after it is still a path (its `/*` no comment); a name `offline` is none.
+#[test]
+fn b2_the_highlighter_knows_the_tag() {
+    let v = quillo::eval_str("highlight(\"route offline GET /docs/*rest = 1\\nroutes offline /api {\\n}\\nlet offline = f(offline)\\nroute GET /x = offline\", \"quillo\")").unwrap();
+    assert_eq!(
+        v.display(),
+        "<span class=\"hl-k\">route</span> <span class=\"hl-k\">offline</span> <span class=\"hl-t\">GET</span> /docs/*rest = <span class=\"hl-n\">1</span>\n<span class=\"hl-k\">routes</span> <span class=\"hl-k\">offline</span> /api {\n}\n<span class=\"hl-k\">let</span> offline = <span class=\"hl-f\">f</span>(offline)\n<span class=\"hl-k\">route</span> <span class=\"hl-t\">GET</span> /x = offline"
+    );
+}
+
+// B.2 in the editor (`quillo lsp`): the tag is offered after `route ` and `routes `, first, and not
+// elsewhere; hovering it says what it does, and a name `offline` is no tag.
+#[test]
+fn b2_the_editor_offers_and_explains_the_tag() {
+    use serde_json::{json, Value};
+    use std::io::{BufRead, Read, Write};
+    let d = support::temp_dir("f67-lsp").canonicalize().unwrap();
+    let text = "route offline GET /menu = 1\nroutes offline /docs {\n}\nlet offline = 2\nroute \nroutes \nlet \nroute GET \n";
+    std::fs::write(d.join("main.qwe"), text).unwrap();
+    let uri = format!("file://{}", d.join("main.qwe").display());
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo")).arg("lsp").current_dir(&d).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let mut g = support::Guard::new(child);
+    let mut out = std::io::BufReader::new(g.0.stdout.take().unwrap());
+    let mut stdin = g.0.stdin.take().unwrap();
+    let mut next = 0;
+    let end = Instant::now() + Duration::from_secs(30);
+    let mut ask = |method: &str, params: Value, notify: bool| -> Value {
+        next += 1;
+        let msg = if notify { json!({ "jsonrpc": "2.0", "method": method, "params": params }) } else { json!({ "jsonrpc": "2.0", "id": next, "method": method, "params": params }) };
+        let body = msg.to_string();
+        write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
+        stdin.flush().unwrap();
+        if notify {
+            return Value::Null;
+        }
+        loop {
+            assert!(Instant::now() < end, "the language server did not answer");
+            let mut len = 0;
+            loop {
+                let mut line = String::new();
+                assert!(out.read_line(&mut line).unwrap() > 0, "the language server ended");
+                if line.trim_end().is_empty() {
+                    break;
+                }
+                if let Some(v) = line.trim_end().strip_prefix("Content-Length:") {
+                    len = v.trim().parse().unwrap();
+                }
+            }
+            let mut buf = vec![0; len];
+            out.read_exact(&mut buf).unwrap();
+            let m: Value = serde_json::from_slice(&buf).unwrap();
+            if m.get("id") == Some(&json!(next)) {
+                return m["result"].clone();
+            }
+        }
+    };
+    ask("initialize", json!({ "capabilities": {} }), false);
+    ask("initialized", json!({}), true);
+    ask("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": text } }), true);
+    let mut at = |method: &str, line: usize, character: usize| ask(method, json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } }), false);
+    let tag = at("textDocument/hover", 0, 8)["contents"]["value"].as_str().unwrap_or("").to_string();
+    assert!(tag.starts_with("`route offline GET /menu = ...`") && tag.contains("Only a GET can be kept."), "{}", tag);
+    assert_eq!(at("textDocument/hover", 1, 9)["contents"]["value"].as_str().unwrap_or(""), tag);
+    assert!(!at("textDocument/hover", 3, 6).to_string().contains("Only a GET can be kept"));
+    for (line, col, want) in [(4, 6, true), (5, 7, true), (6, 4, false), (7, 10, false)] {
+        let items = at("textDocument/completion", line, col);
+        let tag = items.as_array().unwrap().iter().position(|i| i["label"] == "offline" && i["kind"] == 14);
+        assert_eq!(tag.is_some(), want, "line {}: {}", line, items);
+        assert!(tag.map_or(true, |t| t == 0), "not first: {}", items);
+    }
+}
+
+// B.2: never in the phone shells (nor `quillo app`, which runs as "app" the same way): service
+// workers do not run there, and the program is on the device. No marks, no script, no worker.
+#[test]
+fn b2_never_in_the_phone_shells() {
+    quillo::platform::set_runtime("mobile");
+    let d = dir("sw-mobile", "route offline GET / = <html><body><h1>Home</h1></body></html>\n");
+    let mut it = quillo::Interp::new(&d);
+    it.load_file(&d.join("main.qwe")).unwrap();
+    quillo::pwa::attach(&mut it, &d);
+    let get = |it: &mut quillo::Interp, url: &str| it.handle(&quillo::server::HttpRequest { method: "GET".into(), url: url.into(), headers: vec![], body: vec![], remote: "127.0.0.1".into() });
+    let page = get(&mut it, "/");
+    assert_eq!(page.status, 200);
+    assert!(!page.headers.iter().any(|(k, _)| k.starts_with("x-quillo-offline") || k.starts_with("x-quillo-session")), "{:?}", page.headers);
+    assert!(!page.text().contains("/_quillo/sw.js"), "{}", page.text());
+    assert_eq!(get(&mut it, "/_quillo/sw.js").status, 404);
+}
+
+/// A session's pages under a policy that refuses inline scripts but the server's hashes: its
+/// stages on the stage server, which the policy lets the page reach.
+fn gated(stages: u16) -> String {
+    format!(
+        "site_headers(\"/\", {{ \"content-security-policy\": \"default-src 'self'; connect-src 'self' http://127.0.0.1:{}\" }})\nroute GET /in/:who {{\n    set_session({{ user: who }})\n    redirect(\"/\")\n}}\nroute offline GET / = <html><head><title>Home</title></head><body><h1>Home</h1></body></html>\nroute offline GET /mine = <html><head><title>Mine</title></head><body><h1>Mine {{session().user ?? \"nobody\"}}</h1></body></html>\nroute offline GET /bare = <html><body><h1>Bare {{session().user ?? \"nobody\"}}</h1></body></html>\nroute GET /ping = \"pong\"\n",
+        stages
+    )
+}
+
+const GATE_SCRIPT: &str = r#"(async () => {@KIT@
+  const out = {}, refused = [];
+  document.addEventListener("securitypolicyviolation", (e) => refused.push(e.violatedDirective));
+  const secure = "; Path=/; Secure; SameSite=Lax";
+  out.controlled = await controlled();
+  await look("/in/ana");
+  const ana = tagNow();
+  out.ana = (await look("/mine")).h1;
+  await look("/bare");
+  out.kept = await kept();
+  await stage(1);
+  out.down = await down();
+  // Offline, the browser holding the session the pages were kept for: shown, past the gate.
+  out.mine = await lookUntil("/mine", (d) => !d.documentElement.hasAttribute("hidden"));
+  out.bare = await lookUntil("/bare", (d) => !d.documentElement.hasAttribute("hidden"));
+  out.same = out.mine.session === ana && out.bare.session === ana;
+  // Signed out where the worker did not see it (the cookie ended): the offline page, and the
+  // session's pages dropped.
+  document.cookie = "quillo_tag=; Max-Age=0" + secure;
+  out.ended = await lookUntil("/mine", (d) => d.documentElement.hasAttribute("data-quillo-offline"));
+  out.after_end = await kept();
+  out.dropped = (await dropped()).map((t) => t === ana ? "ana" : t);
+  await stage(2);
+  out.up = await up("pong");
+  // A late answer of a session dropped is not kept again (the server still takes ana's cookie).
+  out.late = (await look("/mine")).h1;
+  out.not_again = await kept();
+  // Another person's tag: the offline page.
+  await look("/in/bob");
+  const bob = tagNow();
+  out.bob = (await look("/mine")).h1;
+  await stage(3);
+  out.down2 = await down();
+  document.cookie = "quillo_tag=someone" + secure;
+  out.other = await lookUntil("/mine", (d) => d.documentElement.hasAttribute("data-quillo-offline"));
+  out.after_other = await kept();
+  out.dropped2 = (await dropped()).map((t) => t === ana ? "ana" : t === bob ? "bob" : t);
+  out.refused = refused;
+  document.body.dataset.result = JSON.stringify(out);
+})();"#;
+
+// B.2 review, the gate: a page kept for a session is given back hidden, the gate first in its
+// head (passing the page's policy, which the server named it in), and shown only when the
+// browser's `quillo_tag` names that session. A session that ended without the worker seeing it
+// (the cookie gone) or another person's: the offline page instead, and that session's pages
+// dropped; an answer of a session dropped that comes later is not kept again.
+#[test]
+fn b2_a_sessions_kept_page_is_shown_only_to_that_session() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let stages = support::serve(&dir("sw-stages7", STAGES).join("main.qwe"), &[]);
+    let d = dir("sw-gated", &gated(stages.port));
+    let (s, port) = logged(&d, &[]);
+    // The policy of a session's page names the gate, which the page does not hold yet.
+    let (_, h, _) = fetch(port, "GET", "/mine", &[]);
+    assert!(header(&h, "content-security-policy").unwrap().contains(&policy_hash(quillo::pwa::gate())), "{:?}", h);
+    let (_, h, _) = fetch(port, "GET", "/", &[]);
+    assert!(!header(&h, "content-security-policy").unwrap().contains(&policy_hash(quillo::pwa::gate())), "{:?}", h);
+    let (c, url, sp) = (chrome.clone(), format!("http://127.0.0.1:{}/", port), stages.port);
+    let page = std::thread::spawn(move || in_chrome_staged(&c, &url, &GATE_SCRIPT.replace("@KIT@", SW_KIT), sp));
+    stage_reached(stages.port, 1, &page);
+    drop(s);
+    stage_reached(stages.port, 2, &page);
+    let s = logged_at(&d, port, &[]);
+    stage_reached(stages.port, 3, &page);
+    let log = std::fs::read_to_string(&s.1).unwrap_or_default();
+    drop(s);
+    let r = page.join().unwrap();
+    let offline = serde_json::json!({ "h1": "You are offline", "kept": null, "offline": true, "title": "Offline", "session": null, "hidden": false });
+    let public = serde_json::json!({ "quillo::V": ["/"] });
+    assert_eq!(
+        r,
+        serde_json::json!({
+            "controlled": true, "ana": "Mine ana",
+            "kept": { "quillo::V": ["/"], "quillo::V:S": ["/bare", "/mine"] }, "down": true,
+            "mine": { "h1": "Mine ana", "kept": "iso", "offline": false, "title": "Mine", "session": r["mine"]["session"], "hidden": false },
+            "bare": { "h1": "Bare ana", "kept": "iso", "offline": false, "title": "", "session": r["mine"]["session"], "hidden": false },
+            "same": true,
+            "ended": offline, "after_end": public, "dropped": ["ana"],
+            "up": true, "late": "Mine ana", "not_again": public,
+            "bob": "Mine bob", "down2": true,
+            "other": offline, "after_other": public, "dropped2": ["ana", "bob"],
+            "refused": [],
+        }),
+        "{}",
+        log
+    );
+}
+
+/// Two versions: the second drops `/old`, and has a page that fails (503) until `/fix`.
+fn flaky(n: u32) -> String {
+    if n == 1 {
+        "route offline GET / = <html><body><h1>One</h1></body></html>\nroute offline GET /old = <html><body><h1>Old</h1></body></html>\nroute offline GET /menu = <html><body><h1>Menu 1</h1></body></html>\nroute GET /ping = \"pong 1\"\n".into()
+    } else {
+        "let down = true\nroute GET /fix {\n    down = false\n    \"ok\"\n}\nroute offline GET / = <html><body><h1>Two</h1></body></html>\nroute offline GET /menu = <html><body><h1>Menu 2</h1></body></html>\nroute offline GET /flaky = down ? respond(503, \"not now\") : <html><body><h1>Flaky</h1></body></html>\nroute GET /ping = \"pong 2\"\n".into()
+    }
+}
+
+const FLAKY_SCRIPT: &str = r#"(async () => {@KIT@
+  const out = {};
+  out.controlled = await controlled();
+  const reg = await sw.getRegistration();
+  // The caches by version: each one's pages, this worker's version last.
+  const versions = async () => { const out = []; for (const n of await caches.keys()) if (!n.endsWith(":gone")) out.push((await (await caches.open(n)).keys()).map((r) => new URL(r.url).pathname).filter((p) => !p.endsWith("sw-ready")).sort().join(" ")); return out.sort(); };
+  out.before = await versions();
+  let changes = 0;
+  sw.addEventListener("controllerchange", () => changes++);
+  await stage(1);
+  out.up = await up("pong 2");
+  await reg.update();
+  for (let i = 0; i < 200 && !changes; i++) await tick(25);
+  out.both = await versions();
+  await stage(2);
+  out.down = await down();
+  // The new version could not keep /flaky: the old copies still serve.
+  out.old = shown(await look("/old"));
+  out.menu = (await look("/menu")).h1;
+  await stage(3);
+  out.up2 = await up("pong 2");
+  await fetch("/fix");
+  // Tried again on a navigation, 10 s after the last try at most: then the old version goes.
+  for (let i = 0; i < 30 && (await versions()).length > 1; i++) { await look("/"); await tick(1000); }
+  out.after = await versions();
+  document.body.dataset.result = JSON.stringify(out);
+})();"#;
+
+// B.2 review: a new version whose pages could not all be kept as it installed (one answered 503)
+// takes over but leaves the old version's copies, which still serve offline; it tries again on a
+// later navigation, and once all are kept the old version's caches go.
+#[test]
+fn b2_a_failed_update_keeps_the_old_pages_until_the_new_ones_are_kept() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let d = dir("sw-flaky", &flaky(1));
+    let stages = support::serve(&dir("sw-stages8", STAGES).join("main.qwe"), &[]);
+    let (s, port) = logged(&d, &[]);
+    let (c, url, sp) = (chrome.clone(), format!("http://127.0.0.1:{}/", port), stages.port);
+    let page = std::thread::spawn(move || in_chrome_staged(&c, &url, &FLAKY_SCRIPT.replace("@KIT@", SW_KIT), sp));
+    stage_reached(stages.port, 1, &page);
+    drop(s);
+    std::fs::write(d.join("main.qwe"), flaky(2)).unwrap();
+    let s = logged_at(&d, port, &[]);
+    stage_reached(stages.port, 2, &page);
+    drop(s);
+    stage_reached(stages.port, 3, &page);
+    let s = logged_at(&d, port, &[]);
+    let r = page.join().unwrap();
+    assert_eq!(
+        r,
+        serde_json::json!({
+            "controlled": true, "before": ["/ /menu /old"], "up": true,
+            "both": ["/ /menu", "/ /menu /old"], "down": true,
+            "old": { "h1": "Old", "kept": "iso", "offline": false, "title": "" }, "menu": "Menu 2",
+            "up2": true, "after": ["/ /flaky /menu"],
+        }),
+        "{}",
+        std::fs::read_to_string(&s.1).unwrap_or_default()
+    );
+}
+
+const BOUNDED: &str = "route GET /in/:who {\n    set_session({ user: who })\n    redirect(\"/\")\n}\nroute offline GET / = <html><body><h1>Home</h1></body></html>\nroute offline GET /item/:n = <html><body><h1>Item {n}</h1></body></html>\nroute offline GET /mine/:n = <html><body><h1>{session().user} {n}</h1></body></html>\n";
+
+const BOUNDED_SCRIPT: &str = r#"(async () => {@KIT@
+  const out = {};
+  out.controlled = await controlled();
+  await look("/in/ana");
+  const f = document.createElement("iframe");
+  document.body.appendChild(f);
+  const go = (p) => new Promise((ok) => { f.onload = ok; f.src = p; });
+  for (let n = 1; n <= 101; n++) await go("/item/" + n);
+  for (let n = 1; n <= 51; n++) await go("/mine/" + n);
+  await tick(500);
+  const k = await kept(), pub = k["quillo::V"], mine = k["quillo::V:S"];
+  out.public = [pub.length, pub.includes("/"), pub.includes("/item/1"), pub.includes("/item/2"), pub.includes("/item/101")];
+  out.session = [mine.length, mine.includes("/mine/1"), mine.includes("/mine/2"), mine.includes("/mine/51")];
+  document.body.dataset.result = JSON.stringify(out);
+})();"#;
+
+// B.2 review: what is kept is bounded, the oldest dropped first: 100 pages of no one's (here the
+// page kept on install and the first item go), and 50 of a session.
+#[test]
+fn b2_the_kept_pages_are_bounded_the_oldest_dropped_first() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let d = dir("sw-bounded", BOUNDED);
+    let (_s, port) = logged(&d, &[]);
+    let r = in_chrome_staged(&chrome, &format!("http://127.0.0.1:{}/", port), &BOUNDED_SCRIPT.replace("@KIT@", SW_KIT), port);
+    assert_eq!(r, serde_json::json!({ "controlled": true, "public": [100, false, false, true, true], "session": [50, false, true, true] }));
+}
+
+/// The proxy in front of a server on `port`, at `base`, in `mode` ("" closes the connection when
+/// the server is down, "502" answers so).
+fn proxy(port: u16, base: &str, mode: &str) -> (support::Guard, u16) {
+    let listen = support::free_port();
+    let child = std::process::Command::new("node").arg("-e").arg(PROXY).arg(listen.to_string()).arg(port.to_string()).arg(base).arg(mode).stdout(std::process::Stdio::null()).spawn().unwrap();
+    let g = support::Guard::new(child);
+    let end = Instant::now() + Duration::from_secs(20);
+    while !support::listening(listen) {
+        assert!(Instant::now() < end, "the proxy did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (g, listen)
+}
+
+const PROXIED_SCRIPT: &str = r#"(async () => {@KIT@
+  const out = {};
+  out.controlled = await controlled();
+  out.kept = await kept();
+  await stage(1);
+  for (let i = 0; i < 600; i++) { const r = await fetch("/ping", { cache: "no-store" }); if (r.status === 502) { out.down = true; break; } await tick(25); }
+  out.menu = shown(await look("/menu"));
+  const plain = (await look("/plain")).frame.contentDocument;
+  out.plain = (plain.getElementById("bad") || {}).textContent || null;
+  document.body.dataset.result = JSON.stringify(out);
+})();"#;
+
+// B.2 review: an app down behind a proxy that answers 502 (or 503, 504) for it: a navigation to a
+// kept page gets its copy; one to a page not kept gets the proxy's answer.
+#[test]
+fn b2_a_proxys_502_for_an_app_that_is_down_gives_the_kept_copy() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    let d = dir("sw-502", "route offline GET / = <html><body><h1>Home</h1></body></html>\nroute offline GET /menu = <html><body><h1>Menu</h1></body></html>\nroute GET /plain = <html><body><h1>Plain</h1></body></html>\nroute GET /ping = \"pong\"\n");
+    let stages = support::serve(&dir("sw-stages9", STAGES).join("main.qwe"), &[]);
+    let (s, port) = logged(&d, &[]);
+    let (_proxy, listen) = proxy(port, "", "502");
+    let (c, url, sp) = (chrome.clone(), format!("http://127.0.0.1:{}/", listen), stages.port);
+    let page = std::thread::spawn(move || in_chrome_staged(&c, &url, &PROXIED_SCRIPT.replace("@KIT@", SW_KIT), sp));
+    stage_reached(stages.port, 1, &page);
+    drop(s);
+    assert_eq!(
+        page.join().unwrap(),
+        serde_json::json!({ "controlled": true, "kept": { "quillo::V": ["/", "/menu"] }, "down": true, "menu": { "h1": "Menu", "kept": "iso", "offline": false, "title": "" }, "plain": "bad gateway" })
+    );
+}
+
+/// A link pointed at is prefetched (Chrome's speculation rules, as Quillo writes them), and the page
+/// it leads to says how it came.
+fn prefetched(tag: &str) -> String {
+    format!(
+        "let loads = 0\nlet REPORT = \"addEventListener('load', () => {{ const n = performance.getEntriesByType('navigation')[0]; document.body.setAttribute('data-result', JSON.stringify({{ h1: document.querySelector('h1').textContent, delivery: n.deliveryType, kept: document.documentElement.getAttribute('data-kept'), controlled: !!navigator.serviceWorker.controller }})) }})\"\nroute {0}GET / = <html><body><a id=\"slow\" href=\"/slow\">slow</a><a id=\"menu\" href=\"/menu\">menu</a></body></html>\nroute GET /slow {{\n    sleep(600)\n    <html><body><h1>Slow</h1><script>{{raw(REPORT)}}</script></body></html>\n}}\nroute {0}GET /menu {{\n    loads += 1\n    set_cookie(\"seen\", str(loads))\n    <html><body><h1>Menu {{loads}}</h1><script>{{raw(REPORT)}}</script></body></html>\n}}\n",
+        tag
+    )
+}
+
+/// Waits for the worker where there is one; keeps `/menu` once (opened in a frame); points at the
+/// link `@LINK@` and follows it.
+const POINT_SCRIPT: &str = r#"(async () => {
+  const sw = navigator.serviceWorker, tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  if ([...document.scripts].some((s) => s.textContent.includes("/_quillo/sw.js"))) { await sw.ready; for (let i = 0; i < 200 && !sw.controller; i++) await tick(20); }
+  const f = document.createElement("iframe"); f.src = "/menu"; document.body.appendChild(f); await new Promise((r) => (f.onload = r)); f.remove();
+  await tick(300);
+  const a = document.getElementById("@LINK@");
+  a.dispatchEvent(new PointerEvent("pointerover", { bubbles: true }));
+  await tick(1500);
+  a.click();
+})();"#;
+
+// B.2 review: speculation-rules prefetch works on the pages the worker controls as without one: the
+// page pointed at comes from the prefetch, made once. A prefetch Quillo refuses with a 503 (its page
+// sets a cookie) is not answered with the kept copy: followed, the link gives the page itself.
+#[test]
+fn b2_prefetch_works_under_the_worker() {
+    let Some(chrome) = chrome() else {
+        eprintln!("skipping: no Chrome");
+        return;
+    };
+    let _turn = chrome_turn();
+    // With the tag, `/menu` is also made once as the worker installs.
+    for (tag, controlled, menu) in [("offline ", true, "Menu 3"), ("", false, "Menu 2")] {
+        for (link, want) in [("slow", serde_json::json!({ "h1": "Slow", "delivery": "navigational-prefetch", "kept": null, "controlled": controlled })), ("menu", serde_json::json!({ "h1": menu, "delivery": "", "kept": null, "controlled": controlled }))] {
+            let d = dir("sw-prefetch", &prefetched(tag));
+            let (s, port) = logged(&d, &[]);
+            let r = in_chrome_staged(&chrome, &format!("http://127.0.0.1:{}/", port), &POINT_SCRIPT.replace("@LINK@", link), port);
+            let log = std::fs::read_to_string(&s.1).unwrap_or_default();
+            assert_eq!(r, want, "{:?} {}: {}", tag, link, log);
+            if link == "slow" {
+                assert_eq!(log.matches("GET /slow").count(), 1, "{}", log);
+            } else {
+                assert!(log.contains("GET /menu -> 503") && log.contains("prefetch"), "{}", log);
+            }
+        }
+    }
+}
+
+/// The served worker in Node, its Cache API and `fetch` made up: how often a navigation's answer
+/// is copied, for each kind of answer.
+const CLONES: &str = r#"const vm = require("vm");
+const src = require("fs").readFileSync(process.argv[2], "utf8");
+const listeners = {}, store = new Map();
+const key = (r) => (typeof r === "string" ? new URL(r, "http://h/").href : r.url);
+const cache = (name) => ({
+  async match(r) { const m = store.get(name), u = key(r); return m.has(u) ? m.get(u).clone() : undefined; },
+  async put(r, res) { store.get(name).set(key(r), res); },
+  async delete(r) { return store.get(name).delete(key(r)); },
+  async keys() { return [...store.get(name).keys()].map((url) => ({ url })); },
+});
+const caches = { async open(n) { if (!store.has(n)) store.set(n, new Map()); return cache(n); }, async keys() { return [...store.keys()]; }, async delete(n) { return store.delete(n); } };
+let clones = 0, next = null;
+const answer = (headers) => { const res = new Response("<html><body>x</body></html>", { status: 200, headers }); const c = res.clone.bind(res); res.clone = () => { clones++; return c(); }; return res; };
+const ctx = { location: new URL("http://h/_quillo/sw.js"), caches, Response, Headers, URL, console, setTimeout, Promise };
+// The pages kept on install are fetched by path: answered apart, and not counted.
+ctx.fetch = async (r) => (typeof r === "string" ? new Response("", { status: 404 }) : next());
+ctx.self = { addEventListener: (t, f) => (listeners[t] = f), skipWaiting() {}, registration: {}, clients: { claim: async () => {} } };
+vm.createContext(ctx);
+vm.runInContext(src, ctx);
+const navigate = async (path, headers) => {
+  next = () => answer(headers);
+  const waits = [];
+  let responded;
+  listeners.fetch({ request: { url: "http://h" + path, method: "GET", mode: "navigate", headers: new Headers() }, preloadResponse: Promise.resolve(undefined), respondWith: (p) => (responded = p), waitUntil: (p) => waits.push(p) });
+  await responded;
+  await Promise.all(waits);
+};
+(async () => {
+  const out = {};
+  for (const [name, path, headers] of [
+    ["page", "/plain", { "content-type": "text/html" }],
+    ["theirs", "/mine", { "content-type": "text/html", "x-quillo-session": "abc" }],
+    ["download", "/big.zip", { "content-type": "application/zip" }],
+    ["events", "/feed", { "content-type": "text/event-stream" }],
+    ["kept", "/menu", { "content-type": "text/html", "x-quillo-offline": "1" }],
+  ]) {
+    clones = 0;
+    await navigate(path, headers);
+    out[name] = clones;
+  }
+  console.log(JSON.stringify(out));
+})();
+"#;
+
+// B.2 review: a navigation's answer is copied only when it is a page to keep, as its headers say:
+// a page, a download or an event stream the worker does not keep is not held twice.
+#[test]
+fn b2_only_a_page_to_keep_is_copied() {
+    let d = dir("sw-clones", "route offline GET / = <html><body>x</body></html>\n");
+    let (_s, port) = logged(&d, &[]);
+    std::fs::write(d.join("sw.js"), fetch_body(port, "/_quillo/sw.js").2).unwrap();
+    std::fs::write(d.join("clones.js"), CLONES).unwrap();
+    let mut c = std::process::Command::new("node");
+    c.arg(d.join("clones.js")).arg(d.join("sw.js"));
+    let o = within(c, 30);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let r: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{}: {}", e, String::from_utf8_lossy(&o.stdout)));
+    assert_eq!(r, serde_json::json!({ "page": 0, "theirs": 0, "download": 0, "events": 0, "kept": 1 }));
+}
+
+// B.2 review: `quillo check` says where an offline route reads who the visitor is other than
+// through `session()` (a cookie there or in a function it calls, a header, its group's middleware
+// that reads the request, a server fn that does): its page is not kept. The session alone, a
+// middleware that only hands the request back, a route of no one's: nothing said. And an offline
+// route in a mounted program, whose pages the main program's worker does not keep.
+#[test]
+fn b2_check_says_what_will_not_be_kept() {
+    let src = r#"fn theme() = cookie("theme") ?? "light"
+server fn agent() -> str = request.headers["user-agent"] ?? ""
+fn reads(request) {
+    if request.headers["x-team"] == null {
+        return redirect("/")
+    }
+    request
+}
+fn signed(request) = session().user == null ? redirect("/") : request
+route offline GET /a = <html><body>{cookie("x") ?? ""}</body></html>
+route offline GET /b = <html><body>{request.headers["user-agent"] ?? ""}</body></html>
+route offline GET /c = <html><body>{theme()}</body></html>
+route offline GET /d = <html><body>{agent()}</body></html>
+routes offline /t | reads {
+    route GET /e = <html><body>e</body></html>
+}
+routes offline /s | signed {
+    route GET /f = <html><body>{session().user}</body></html>
+}
+route offline GET /g = <html><body>{session().user ?? "nobody"}</body></html>
+route offline GET /h ? { page: int = 1 } = <html><body>{page}</body></html>
+mount /blog = "blog.qwe"
+"#;
+    let d = dir("sw-check", src);
+    std::fs::write(d.join("blog.qwe"), "route GET / = \"blog\"\nroute offline GET /post = <html><body>post</body></html>\n").unwrap();
+    let o = within({
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"));
+        c.args(["check", "main.qwe"]).current_dir(&d);
+        c
+    }, 30);
+    let text = String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr);
+    let said: Vec<&str> = text.lines().filter(|l| l.contains(": warning: ")).collect();
+    let not_kept = |line: u32, route: &str| format!("main.qwe:{}: warning: `route offline {}` reads who the visitor is other than through `session()` (a cookie, a header, the request's own fields of theirs): its page is not kept for offline, and the offline page is shown in its place; read who they are with `session()`", line, route);
+    assert_eq!(
+        said,
+        vec![
+            not_kept(10, "GET /a").as_str(),
+            not_kept(11, "GET /b").as_str(),
+            not_kept(12, "GET /c").as_str(),
+            not_kept(13, "GET /d").as_str(),
+            not_kept(15, "GET /t/e").as_str(),
+            "./blog.qwe:2: warning: `route offline GET /post` is in a program mounted at `/blog`, whose pages Quillo's service worker does not keep: put the route in the main program",
+        ],
+        "{}",
+        text
+    );
+}

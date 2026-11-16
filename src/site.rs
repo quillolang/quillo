@@ -53,6 +53,10 @@ pub struct Site {
     /// the program's main file: none without one, which is all a request checks (FEEDBACK67.md,
     /// B.1; branch pwa).
     pub pwa: Option<std::sync::Arc<crate::pwa::Web>>,
+    /// Quillo's service worker and the script that registers it, for a program with routes tagged
+    /// `offline`, worked out at load: none without one, which is all a request checks
+    /// (FEEDBACK67.md, B.2; branch pwa).
+    pub offline: Option<std::sync::Arc<crate::pwa::Offline>>,
 }
 
 impl Site {

@@ -5706,6 +5706,18 @@ async function rpcRaw(name, args, live, idem) {
   return r;
 }
 
+// The session the browser holds, as `quillo_tag` names it ("-" for none), told to Quillo's service
+// worker where one controls the page, which drops the visitor's pages it kept in any other: on each
+// page load, and after a server fn's answer that set or ended it. A sign-out the worker did not see
+// (a redirect, another tab, the cookie's end) is caught so (FEEDBACK67.md, B.2, review; branch pwa).
+function swSession() {
+  const c = typeof navigator !== "undefined" && navigator.serviceWorker && navigator.serviceWorker.controller;
+  if (!c) return;
+  const m = /(?:^|;\s*)quillo_tag=([^;]*)/.exec(document.cookie);
+  c.postMessage({ quillo: "session", who: m ? m[1] : "-" });
+}
+swSession();
+
 async function rpcSend(name, args, live, idem) {
   let r;
   // It may change what was kept for a link (see `Ahead`).
@@ -5765,6 +5777,8 @@ async function rpcSend(name, args, live, idem) {
     // 0.25 s, 0.5 s, 1 s, give or take a quarter.
     await new Promise((ok) => setTimeout(ok, 250 * 2 ** (3 - tries) * (0.75 + Math.random() / 2)));
   }
+  // It set or ended the session (FEEDBACK67.md, B.2; branch pwa).
+  if (r.headers && r.headers.get("x-quillo-session") !== null) swSession();
   let body = null, text = "", cut = false;
   try { text = await r.text(); } catch (_) { cut = true; }
   try { body = readJSON(text); if (!body || !hasOwn(body, "patch")) body = untagDeep(body); } catch (_) {}
@@ -5838,7 +5852,11 @@ async function rpc(name, args, idem) {
 // server decides; asked with another server's number, it answers that all
 // the topics changed, and the page loads them again once.
 
-const Live = { seq: 0, server: "", subs: new Set(), ctrl: null, running: false, key: "", ws: null };
+const Live = { seq: 0, server: "", subs: new Set(), ctrl: null, running: false, key: "", ws: null, st: null };
+
+// Back online, as the browser says: the socket is opened again at once, where the loop waited out
+// its backoff, up to half a minute (FEEDBACK67.md, B.2; branch pwa).
+if (typeof addEventListener === "function") addEventListener("online", () => { if (Live.st && Live.st.back) Live.st.back(); });
 
 // Also takes data-v="<seq>:<server>" from a server-rendered island, split.
 function liveSeen(seq, server = "") {
@@ -5898,7 +5916,7 @@ function liveTell(key) {
 
 async function liveLoop() {
   // Tries in a row that came to nothing, and whether the page was told (see `liveFailed`).
-  const st = { fails: 0, said: false, back: null, revived: false };
+  const st = (Live.st = { fails: 0, said: false, back: null, revived: false });
   // The plain requests carrying the changes while there is no socket (`liveCarrier`), and the sockets
   // in a row that did not open meanwhile.
   let carrier = null, socks = 0;

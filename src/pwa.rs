@@ -343,16 +343,23 @@ fn attr(s: &str) -> String {
     s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;")
 }
 
-/// Reads `dir`'s app.toml, when there is one, into what `it` serves (see `Web`). Called once a
-/// program has loaded, by `quillo run` and by each reload, never for a mounted program, a service
-/// or the phone shells. Nothing is set without the file.
+/// Reads `dir`'s app.toml, when there is one, into what `it` serves (see `Web`), and works out
+/// its service worker when it has routes tagged `offline` (see `Offline`). Called once a program
+/// has loaded, by `quillo run` and by each reload, never for a mounted program, a service or the
+/// phone shells. Nothing is set without the file and the tag.
 pub fn attach(it: &mut Interp, dir: &Path) {
+    let name = installable(it, dir);
+    attach_offline(it, name.as_deref());
+}
+
+/// The app.toml part of `attach`: the app's name, when the file gives one.
+fn installable(it: &mut Interp, dir: &Path) -> Option<String> {
     let app = match AppToml::read(dir) {
-        None => return,
+        None => return None,
         Some(Ok(app)) => app,
         Some(Err(e)) => {
             say_once(format!("quillo: {}: {}", dir.join(FILE).display(), e));
-            return;
+            return None;
         }
     };
     let base = it.base.clone();
@@ -440,6 +447,7 @@ pub fn attach(it: &mut Interp, dir: &Path) {
     }
     let web = Web { head, manifest, manifest_etag, serve_manifest: !manifest_route, serve_apple: !apple_route, source, icon_file, background, set, icons };
     Arc::make_mut(&mut it.site).pwa = Some(Arc::new(web));
+    app.text("name").filter(|s| !s.is_empty()).map(str::to_string)
 }
 
 impl Web {
@@ -836,4 +844,230 @@ pub fn check(dir: &Path, shown: &str) -> Vec<crate::check::Diagnostic> {
         say(line, severity, message);
     }
     out
+}
+
+// ---- B.2: Quillo's service worker, for routes tagged `offline` ----------------------------------
+
+/// Quillo's service worker, for a program with routes tagged `offline` (FEEDBACK67.md, B.2;
+/// branch pwa): `<base>/_quillo/sw.js`, and the script that registers it on those routes' pages.
+/// Worked out at load, never under --watch, in the phone shells or in `quillo app`: none for a
+/// program without the tag, which is all a request checks (`Site::offline`).
+pub struct Offline {
+    /// `/_quillo/sw.js` as served, and its validator.
+    worker: Vec<u8>,
+    etag: String,
+    /// The `<script>` an offline route's page gets, and its text, for a page's content policy.
+    pub register: String,
+    pub register_js: String,
+}
+
+/// The worker (src/client/sw.js); the one that takes itself away (src/client/sw-watch.js), served
+/// under --watch and to a program with no offline route; and the gate the worker puts first in a
+/// visitor's kept page (src/client/sw-gate.js), whose text is the same everywhere, so that a
+/// page's content policy names it by one hash.
+static WORKER: &str = include_str!("client/sw.js");
+static WATCH_WORKER: &str = include_str!("client/sw-watch.js");
+pub static GATE: &str = include_str!("client/sw-gate.js");
+
+/// The headers Quillo marks answers with for its worker: an offline route's page (`1`, or
+/// `private` for a page of a session's), and the session the browser holds after an answer.
+pub const OFFLINE_HEADER: &str = "x-quillo-offline";
+pub const SESSION_HEADER: &str = "x-quillo-session";
+
+fn js(s: &str) -> String {
+    serde_json::Value::String(s.to_string()).to_string()
+}
+
+/// The gate's text, as it goes in a page and in a policy's hash: the file's, its end of line off.
+pub fn gate() -> &'static str {
+    GATE.trim_end()
+}
+
+/// Sets `it.site.offline` when the program has routes tagged `offline` and runs as a server, not
+/// under --watch (see `worker_answer` for what is served otherwise). `name`: app.toml's, for the
+/// offline page.
+fn attach_offline(it: &mut Interp, name: Option<&str>) {
+    let offline: Vec<&crate::ast::RouteDef> = it.routes.iter().filter(|r| r.offline).map(|r| &**r).collect();
+    if offline.is_empty() || crate::platform::runtime() != "server" || crate::platform::DEV.load(std::sync::atomic::Ordering::Relaxed) {
+        if it.site.offline.is_some() {
+            Arc::make_mut(&mut it.site).offline = None;
+        }
+        return;
+    }
+    let base = it.base.clone();
+    // Each offline route with no parameter in its path, kept on install, once each.
+    let mut pages: Vec<String> = Vec::new();
+    for r in &offline {
+        let mut path = String::new();
+        for seg in &r.path {
+            match seg {
+                crate::ast::Seg::Lit(l) => {
+                    path.push('/');
+                    path.push_str(l);
+                }
+                _ => {
+                    path.clear();
+                    break;
+                }
+            }
+        }
+        if path.is_empty() && !r.path.is_empty() {
+            continue;
+        }
+        let full = format!("{}{}", base, if path.is_empty() { "/" } else { &path });
+        if !pages.contains(&full) {
+            pages.push(full);
+        }
+    }
+    let offline_page = offline_page(name);
+    // The version: this build, the program (its files' contents, wherever they are, so that
+    // servers with one deploy in different folders agree), its base and its offline routes.
+    let mut files: Vec<String> = it.loaded.iter().map(|f| hash_of(std::fs::read(f).unwrap_or_default())).collect();
+    files.sort();
+    let shown: Vec<String> = offline.iter().map(|r| r.shown()).collect();
+    let version = hash_of((crate::version(), WORKER, GATE, &base, &shown, &files, &offline_page));
+    // Without its comments, which say what the guide says.
+    let code: String = WORKER.lines().filter(|l| !l.trim_start().starts_with("//")).flat_map(|l| [l, "\n"]).collect();
+    let worker = code
+        .replacen("@BASE@", &js(&base), 1)
+        .replacen("@V@", &js(&version), 1)
+        .replacen("@PAGES@", &serde_json::to_string(&pages).unwrap_or_else(|_| "[]".into()), 1)
+        .replacen("@OFFLINE@", &js(&offline_page), 1)
+        .replacen("@GATE@", &js(gate()), 1);
+    // About 100 bytes, on each offline route's page: the worker's scope is the program's base.
+    let register_js = format!("(n=>n&&n.register({},{{scope:{}}}))(navigator.serviceWorker)", js(&format!("{}/_quillo/sw.js", base)), js(&format!("{}/", base))).replace("</", "<\\/");
+    let register = format!("<script>{}</script>", register_js);
+    Arc::make_mut(&mut it.site).offline = Some(Arc::new(Offline { worker: worker.into_bytes(), etag: format!("\"{}\"", version), register, register_js }));
+}
+
+/// The page the worker gives for a page it has not kept, the network gone: the app's name when
+/// app.toml gives one, in plain English (the worker cannot know the language of a page it never
+/// saw).
+fn offline_page(name: Option<&str>) -> String {
+    let esc = |s: &str| crate::interp::escape(s);
+    let (title, h1) = match name {
+        Some(n) => (esc(n), esc(n)),
+        None => ("Offline".to_string(), "You are offline".to_string()),
+    };
+    format!(
+        concat!(
+            "<!doctype html><html lang=\"en\" data-quillo-offline><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+            "<title>{}</title><style>body{{margin:0;min-height:100vh;display:grid;place-items:center;font:16px/1.5 system-ui,sans-serif;text-align:center;color:#222;background:#fff}}",
+            "main{{padding:24px;max-width:28em}}h1{{font-size:1.4em;margin:0 0 .4em}}button{{font:inherit;padding:.4em 1.2em}}",
+            "@media (prefers-color-scheme:dark){{body{{color:#eee;background:#121212}}}}</style></head>",
+            "<body><main><h1>{}</h1><p>There is no connection, and this page was not kept on this device. It opens again once the connection is back.</p>",
+            "<button onclick=\"location.reload()\">Try again</button></main></body></html>"
+        ),
+        title, h1
+    )
+}
+
+/// `GET <base>/_quillo/sw.js`: Quillo's worker, revalidated each time (browsers check it on
+/// navigations). Without one (no offline route, or --watch), the worker that takes itself away
+/// and what Quillo's kept: a browser asks for this address only if it registered Quillo's worker
+/// in an earlier run, and a program that dropped its last offline route, as one under --watch,
+/// would have left it answering from its cache; by the spec a 404 here leaves it as it is
+/// (FEEDBACK67.md, B.2 and its review; branch pwa). None in the phone shells and `quillo app`.
+#[cold]
+#[inline(never)]
+pub fn worker_answer(it: &Interp, req: &HttpRequest) -> Option<HttpResponse> {
+    if !matches!(req.method.as_str(), "GET" | "HEAD") || crate::platform::runtime() != "server" {
+        return None;
+    }
+    let (body, etag) = match it.site.offline.as_ref() {
+        Some(o) => (o.worker.clone(), o.etag.clone()),
+        None => {
+            let body = WATCH_WORKER.replacen("@BASE@", &js(&it.base), 1).into_bytes();
+            let etag = format!("\"{}\"", hash_of(&body));
+            (body, etag)
+        }
+    };
+    let headers = vec![
+        ("content-type".into(), "text/javascript; charset=utf-8".into()),
+        ("cache-control".into(), "no-cache".into()),
+        ("service-worker-allowed".into(), format!("{}/", it.base)),
+        ("etag".into(), etag.clone()),
+    ];
+    let fresh = req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("if-none-match") && v.split(',').any(|t| t.trim() == etag));
+    Some(HttpResponse { status: if fresh { 304 } else { 200 }, headers, body: if fresh { Vec::new() } else { body } })
+}
+
+/// What the worker may do with an answer, once its headers are set (`mark`).
+#[derive(Default, Clone, Copy)]
+pub struct Marked {
+    /// An offline route's page: it gets the register script.
+    pub register: bool,
+    /// Kept for one session: the gate goes through the page's content policy.
+    pub private: bool,
+}
+
+/// What a program with offline routes marks its answers with, once their headers are set
+/// (FEEDBACK67.md, B.2 and its review; branch pwa):
+/// - An offline route's 200 page is kept (`x-quillo-offline`), by what the request read: `1`
+///   for one that read no one, `private` for one that read who the visitor is through the session
+///   alone (kept for that session, by its name), and not at all where it read them another way
+///   (a cookie, a header: `visitor_other`), nor where it holds a form key, which a kept copy
+///   would send again. Not by `cache-control`, which the program may have set or taken away.
+/// - The session's name (`x-quillo-session`) goes on a page of the visitor's and on an answer that
+///   sets or ends the session, a server fn's too, and on no answer a shared cache may keep; and
+///   `quillo_tag`, the cookie that names it, is set again on a page of theirs that came without it
+///   (a session from before the offline routes).
+/// Out of the request's own code: a program without the tag never calls it.
+#[cold]
+#[inline(never)]
+pub fn mark(it: &mut Interp, req: &HttpRequest, offline_route: bool, session_changed: bool, resp: &mut HttpResponse) -> Marked {
+    let html = resp.header("content-type").is_some_and(|c| c.trim_start().get(..9).is_some_and(|t| t.eq_ignore_ascii_case("text/html")));
+    let theirs = html && it.visitor_read;
+    let mut tag = None;
+    if theirs || session_changed {
+        tag = crate::session::offline_tag(it).filter(|_| {
+            // Never on an answer a shared cache may keep (the program took `private` away): the
+            // session's page is then not kept either.
+            session_changed
+                || resp.sent("cache-control").is_some_and(|c| {
+                    c.split(',').any(|d| {
+                        let d = d.trim().to_ascii_lowercase();
+                        d == "no-store" || d == "private" || d.starts_with("private=")
+                    })
+                })
+        });
+        if let Some(t) = &tag {
+            resp.headers.push((SESSION_HEADER.into(), t.clone()));
+        }
+        if theirs && !session_changed {
+            let had = req
+                .headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+                .flat_map(|(_, v)| v.split(';'))
+                .filter_map(crate::server::cookie_pair)
+                .find(|(k, _)| *k == crate::session::TAG_COOKIE)
+                .map(|(_, v)| v.to_string());
+            if let Some(line) = crate::session::tag_again(it, had.as_deref(), tag.as_deref()) {
+                resp.headers.push(("set-cookie".into(), line));
+            }
+        }
+    }
+    if !(offline_route && html && resp.status == 200) {
+        return Marked::default();
+    }
+    let register = Marked { register: true, private: false };
+    // `idempotency::holds_form_key`, by memchr's search: compared window by window it was 9,000
+    // instructions on a 2 KB page.
+    if it.visitor_other || memchr::memmem::find(&resp.body, crate::idempotency::FORM_FIELD.as_bytes()).is_some() {
+        return register;
+    }
+    // The session read or changed: the page is that session's. A locale rule alone reads nothing
+    // of anyone's that matters here.
+    if it.offline_seen.is_some() || session_changed {
+        // A session that cannot be named (too full for an id), or an answer a shared cache may
+        // keep: not kept.
+        if tag.is_none() {
+            return register;
+        }
+        resp.headers.push((OFFLINE_HEADER.into(), "private".into()));
+        return Marked { register: true, private: true };
+    }
+    resp.headers.push((OFFLINE_HEADER.into(), "1".into()));
+    register
 }

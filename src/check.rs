@@ -708,6 +708,33 @@ fn public_after_visitor(r: &RouteDef, fns: &HashMap<String, Arc<FnDef>>) -> Opti
     at.filter(|_| visitor || called.iter().any(|n| seen.insert(n.clone()) && fns.get(n).is_some_and(|d| visitor_in(fns, &d.body, &mut seen))))
 }
 
+/// Whether an offline route reads who the visitor is other than through `session()`: its patterns
+/// or its code name a field of the request that is theirs, it calls `cookie()`, there or in the
+/// functions it calls, its group's middleware reads the request, or a `server fn` it calls does.
+fn beyond_session(r: &RouteDef, fns: &HashMap<String, Arc<FnDef>>) -> bool {
+    r.reads_visitor || beyond_in(fns, &r.body, &mut HashSet::new())
+}
+
+fn beyond_in(fns: &HashMap<String, Arc<FnDef>>, body: &Expr, seen: &mut HashSet<String>) -> bool {
+    let mut found = false;
+    let mut called: Vec<String> = Vec::new();
+    walk_expr(body, &mut |x| match x {
+        Expr::Ident(n, _) if n == "cookie" => found = true,
+        // A group's middleware, given the request: it reads it unless it only hands it back.
+        Expr::Call(f, args, _) if matches!(&**f, Expr::Ident(n, _) if n == "__answer") => match args.first() {
+            Some(Expr::Call(m, _, _)) => match &**m {
+                Expr::Lambda(d) => found |= crate::parser::middleware_reads_beyond(d),
+                Expr::Ident(n, _) => found |= fns.get(n.as_str()).is_some_and(|d| crate::parser::middleware_reads_beyond(d)),
+                _ => {}
+            },
+            _ => {}
+        },
+        Expr::Ident(n, _) if fns.contains_key(n.as_str()) => called.push(n.to_string()),
+        _ => {}
+    });
+    found || called.into_iter().any(|n| seen.insert(n.clone()) && fns.get(&n).is_some_and(|d| (d.server && d.request_use().1) || beyond_in(fns, &d.body, seen)))
+}
+
 /// Whether code reads who the visitor is through the session or a cookie, there or in the
 /// functions it calls, as far as they go.
 fn visitor_in(fns: &HashMap<String, Arc<FnDef>>, body: &Expr, seen: &mut HashSet<String>) -> bool {
@@ -2563,6 +2590,17 @@ impl Checker {
                 } else {
                     let sub = check_file_opts(&full, HashMap::new(), self.options());
                     self.out.diagnostics.extend(sub.diagnostics);
+                    // Its pages are answered by it, apart from the program's service worker, which
+                    // marks and keeps the main program's alone (FEEDBACK67.md, B.2, review; branch pwa).
+                    if let Ok(text) = std::fs::read_to_string(&full) {
+                        for st in crate::parser::Parser::new(&text).parse_program().unwrap_or_default() {
+                            if let Stmt::Route(r) = &st {
+                                if r.offline {
+                                    self.diag_at(Arc::from(full.display().to_string().as_str()), r.line, Severity::Warning, format!("`route offline {}` is in a program mounted at `{}`, whose pages Quillo's service worker does not keep: put the route in the main program", r.shown(), prefix));
+                                }
+                            }
+                        }
+                    }
                     self.out.symbols.extend(sub.symbols.into_iter().filter(|s| s.kind == SymbolKind::Route).map(|mut s| {
                         s.name = s.name.replacen(' ', &format!(" {}", prefix), 1);
                         s
@@ -3906,6 +3944,12 @@ impl Checker {
         // answer for every cache: sent as `private`, said where it is written (FEEDBACK59.md, Q-903;
         // branch cache-and-migrate).
         for (file, r) in &routes {
+            // A page kept for offline reads who the visitor is through the session alone, which its
+            // kept copy is shown again for; one that reads them another way is not kept
+            // (FEEDBACK67.md, B.2, review; branch pwa).
+            if r.offline && beyond_session(r, &fns) {
+                self.diag_at(file.clone(), r.line, Severity::Warning, format!("`route offline {}` reads who the visitor is other than through `session()` (a cookie, a header, the request's own fields of theirs): its page is not kept for offline, and the offline page is shown in its place; read who they are with `session()`", r.shown()));
+            }
             if let Some(line) = public_after_visitor(r, &fns) {
                 self.diag_at(file.clone(), line, Severity::Warning, "this route reads who the visitor is (the session, a cookie, a header) and its `cache-control` lets a shared cache keep the answer: Quillo sends it as `private`, as a cache in front would give it to the next visitor, and the time stays for the visitor's own browser. Write `private` in it to say so".to_string());
             }

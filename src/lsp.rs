@@ -916,6 +916,9 @@ impl Server {
         if self.on_mcp_tag(params) {
             return json!({ "contents": { "kind": "markdown", "value": MCP_DOC } });
         }
+        if self.on_offline_tag(params) {
+            return json!({ "contents": { "kind": "markdown", "value": OFFLINE_DOC } });
+        }
         if let Some((_, r)) = self.reference_at(params) {
             let mut text = format!("```quillo\n{}\n```", private_detail(&r.name, &r.detail));
             if let (None, Some(d)) = (&r.def, builtin_doc(&r.name)) {
@@ -940,6 +943,16 @@ impl Server {
         let Some((w, a)) = word_at(src, 0, col) else { return false };
         let chars: Vec<char> = src.chars().collect();
         w == "mcp" && crate::highlight::mcp_tag(&chars, a, a + 3)
+    }
+
+    /// Whether the cursor is on the tag of `route offline GET /menu` or `routes offline /docs`, and
+    /// not on a name `offline` (FEEDBACK67.md, B.2; branch pwa).
+    fn on_offline_tag(&self, params: &J) -> bool {
+        let (uri, line, col) = Self::position(params);
+        let Some(src) = self.docs.get(&uri).and_then(|d| d.text.lines().nth(line)) else { return false };
+        let Some((w, a)) = word_at(src, 0, col) else { return false };
+        let chars: Vec<char> = src.chars().collect();
+        w == "offline" && crate::highlight::offline_tag(&chars, a, a + 7)
     }
 
     /// What the cursor is on in a `use` line: the file it names (no name),
@@ -1579,6 +1592,10 @@ impl Server {
         if lead.ends_with([' ', '\t']) && matches!(words[..], ["fn"] | ["server", "fn"] | ["service"]) && "mcp".starts_with(&head[lead.len()..]) {
             items.push(json!({ "label": "mcp", "kind": 14, "detail": "a tool, for AI clients (MCP)", "documentation": MCP_DOC, "sortText": "0" }));
         }
+        // `route `, `routes `: the tag of a page kept for offline (FEEDBACK67.md, B.2; branch pwa).
+        if lead.ends_with([' ', '\t']) && matches!(words[..], ["route"] | ["routes"]) && "offline".starts_with(&head[lead.len()..]) {
+            items.push(json!({ "label": "offline", "kind": 14, "detail": "a page kept for when there is no network", "documentation": OFFLINE_DOC, "sortText": "0" }));
+        }
         let file = uri_to_path(&uri).display().to_string();
         let mut seen = std::collections::HashSet::new();
         // What is in scope here (parameters, `let`s, state), nearest first and
@@ -2013,6 +2030,7 @@ fn comment_above(text: &str, line: u32) -> String {
 }
 
 /// The hover of a tool's tag (FEEDBACK56.md, Q-853; branch feedback56).
+const OFFLINE_DOC: &str = "`route offline GET /menu = ...`, `routes offline /docs { ... }`\n\nA page kept for when there is no network: Quillo's service worker goes to the server first, keeps the page it answers, and shows that copy, marked `data-kept` on its `<html>`, when the server cannot be reached. Routes with no parameter are kept as the worker installs, opened or not. A visitor's page (one that reads the session) is dropped when the session ends or changes. Only a GET can be kept.";
 const MCP_DOC: &str = "`fn mcp name(params) with db = ...`, `server fn mcp name(params) = ...`\n\nA tool, for AI clients that speak MCP: they are told its name, its `///` comment, its parameters' types and its `with`. To the program it is a function as any other; `server fn mcp` is also a page's to call.\n\n`service mcp /billing = \"billing.qwe\"` offers billing's tools here, as `billing.<name>`.";
 
 fn keyword_doc(w: &str) -> Option<String> {

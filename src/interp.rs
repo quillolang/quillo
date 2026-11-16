@@ -247,6 +247,18 @@ pub struct Interp {
     /// The answer read who the visitor is, from a cookie: one visitor's, for caches to keep
     /// apart (FEEDBACK31.md, Q-391; branch feedback27-35-fixes).
     pub visitor_read: bool,
+    /// The route that answered is tagged `offline` (`route offline GET /menu`): its page is marked
+    /// for Quillo's service worker to keep; taken by `handle` (FEEDBACK67.md, B.2; branch pwa).
+    pub(crate) offline_page: bool,
+    /// The answer read who the visitor is other than through the session (`cookie()`, the
+    /// request's headers or cookies, a program's own rule): an offline route's page is then not
+    /// kept for offline at all, where one that read only `session()` is kept for that session
+    /// alone (FEEDBACK67.md, B.2, review; branch pwa).
+    pub(crate) visitor_other: bool,
+    /// The session `session()` read, named for Quillo's service worker, and when it ends, taken
+    /// while the request is there to read it from: in a program with offline routes only
+    /// (`session::offline_tag`; FEEDBACK67.md, B.2, review; branch pwa).
+    pub(crate) offline_seen: Option<(Option<String>, Option<u64>)>,
     /// The answer was made in the visitor's language: it varies by what chose it
     /// (FEEDBACK55.md, Q-886; branch feedback55).
     pub locale_read: bool,
@@ -630,6 +642,7 @@ struct Back {
     cookies: Vec<String>,
     session: Option<Value>,
     visitor_read: bool,
+    visitor_other: bool,
     locale_read: bool,
     read_request: bool,
     acted: bool,
@@ -1844,6 +1857,9 @@ impl Interp {
             session_id: None,
             session_ends: None,
             visitor_read: false,
+            offline_page: false,
+            visitor_other: false,
+            offline_seen: None,
             locale_read: false,
             answering: false,
             locale: None,
@@ -1972,6 +1988,9 @@ impl Interp {
             session_id: None,
             session_ends: None,
             visitor_read: false,
+            offline_page: false,
+            visitor_other: false,
+            offline_seen: None,
             locale_read: false,
             answering: false,
             locale: None,
@@ -2420,6 +2439,7 @@ impl Interp {
             cookies: std::mem::take(&mut self.set_cookies),
             session: self.session.take(),
             visitor_read: self.visitor_read,
+            visitor_other: self.visitor_other,
             locale_read: self.locale_read,
             read_request: self.read_request,
             acted: self.acted,
@@ -2434,6 +2454,7 @@ impl Interp {
             self.asking = b.refused;
         }
         self.visitor_read |= b.visitor_read;
+        self.visitor_other |= b.visitor_other;
         self.locale_read |= b.locale_read;
         self.read_request |= b.read_request;
         self.acted |= b.acted;
@@ -2489,6 +2510,7 @@ impl Interp {
         // A run is kept by the tenant in force, whoever told it (see `run_scope`; FEEDBACK55.md,
         // Q-879; branch feedback55).
         self.visitor_read |= matches!(rule, crate::site::TenantRule::Function(_));
+        self.visitor_other |= matches!(rule, crate::site::TenantRule::Function(_));
         let Some(Value::Map(req)) = self.request_value() else { return None };
         let found = match rule {
             crate::site::TenantRule::Subdomain(domain) => {
@@ -4973,6 +4995,7 @@ impl Interp {
                 self.read_request = false;
             }
             self.visitor_read |= visitor;
+            self.visitor_other |= visitor;
         }
         let mut it = args.into_iter();
         for p in &def.params {

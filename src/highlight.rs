@@ -223,7 +223,16 @@ fn route_path(s: &[char], b: usize) -> Option<(usize, usize)> {
     };
     let (f, t) = word(skip(b));
     let mut at = skip(t);
-    match s[f..t].iter().collect::<String>().as_str() {
+    let first = s[f..t].iter().collect::<String>();
+    // Past the tag of `route offline GET /menu` and `routes offline /docs` (FEEDBACK67.md, B.2;
+    // branch pwa).
+    if first == "route" || first == "routes" {
+        let (f, t) = word(at);
+        if s[f..t].iter().copied().eq("offline".chars()) {
+            at = skip(t);
+        }
+    }
+    match first.as_str() {
         "route" => {
             let (f, t) = word(at);
             if f == t || !s[f..t].iter().all(|c| c.is_ascii_uppercase()) {
@@ -393,6 +402,35 @@ pub(crate) fn mcp_tag(s: &[char], i: usize, j: usize) -> bool {
         && match before.as_str() {
             "fn" | "view" | "component" => after.is_some_and(|c| c.is_alphabetic() || c == '_'),
             "service" => path || after.is_some_and(|c| c.is_alphabetic() || c == '_'),
+            _ => false,
+        }
+}
+
+/// Whether the `offline` from `i` to `j` is the tag of a route, as the parser reads it: right after
+/// `route` with a method after it, or after `routes` with a path after it, on its line; `offline`
+/// is a name everywhere else (FEEDBACK67.md, B.2; branch pwa).
+#[inline(never)]
+pub(crate) fn offline_tag(s: &[char], i: usize, j: usize) -> bool {
+    let space = |c: &char| matches!(c, ' ' | '\t');
+    let mut b = i;
+    while b > 0 && space(&s[b - 1]) {
+        b -= 1;
+    }
+    let end = b;
+    while b > 0 && ident_char(s[b - 1], false) {
+        b -= 1;
+    }
+    let before: String = s[b..end].iter().collect();
+    let line_start = b == 0 || s[..b].iter().rev().take_while(|c| **c != '\n').all(space);
+    let at = s[j..].iter().position(|c| !space(c)).map(|k| j + k);
+    let after = at.map(|k| s[k]);
+    end < i
+        && line_start
+        && j < s.len()
+        && space(&s[j])
+        && match before.as_str() {
+            "route" => after.is_some_and(|c| c.is_ascii_uppercase()),
+            "routes" => after == Some('/'),
             _ => false,
         }
 }
@@ -654,7 +692,7 @@ fn colour(code: &str, lang: &str, timed: bool) -> Option<String> {
                 } else {
                     None
                 }
-            } else if l.keywords.contains(&probe.as_str()) || (qwe && probe == "mcp" && mcp_tag(&s, i, j)) {
+            } else if l.keywords.contains(&probe.as_str()) || (qwe && probe == "mcp" && mcp_tag(&s, i, j)) || (qwe && probe == "offline" && offline_tag(&s, i, j)) {
                 Some("hl-k")
             } else if l.consts.contains(&probe.as_str()) {
                 Some("hl-n")
