@@ -158,9 +158,15 @@ server {
   names the proxy, and `request.ip` and each client's limits are the visitor's, from the
   `X-Forwarded-For` it adds. It is read from no other address, as a client can write it.
 - **Caching at the proxy or a CDN.** A page made from who the visitor is (it called
-  `session()` or `cookie()`, or set a cookie) is sent with `Cache-Control: private` and
-  `Vary: Cookie`, unless the route set its own `cache-control`, so a shared cache does
-  not give one visitor's page to another. Every HTML page gets
+  `session()` or `cookie()`, set a cookie, or read a header of the request or its `ip`) is
+  sent with `Cache-Control: private` and `Vary: Cookie`, so a shared cache does not give one
+  visitor's page to another. That holds whatever the route said *(since 0.8.6: its own
+  `cache-control` went as it was)*: `public`, `s-maxage` or a time, from `respond`, `file`'s
+  `cache` or a `site_headers` rule, is sent as `private`, the time kept for the visitor's
+  browser, and `CDN-Cache-Control`, `Surrogate-Control` and the like are left out, as a CDN
+  reads them first. Cloudflare ignores `Vary` and keeps a `.pdf` or a `.png` with no rule of
+  its own, so this is what keeps one visitor's file from the next. A `cache-control: null`
+  sends none at all. Every HTML page gets
   `X-Frame-Options: SAMEORIGIN`, unless the route sets one, or a
   `Content-Security-Policy` with `frame-ancestors`.
 - **Headers for the whole site.** `site_headers`, at the top of the program, sets
@@ -171,6 +177,10 @@ server {
 site_headers({ "content-security-policy": "default-src 'self'" })
 site_headers("/embed", { "x-frame-options": null })
 ```
+
+  A policy like this one needs nothing added for Quillo's own scripts *(since 0.8.6: it
+  stopped every component)*: they are named by their hashes in it, and the islands' style
+  is a hashed rule.
 
 - **What `site_headers` takes.** Names are checked and values are one line.
   `content-length`, `transfer-encoding`, `connection`, `set-cookie` and `content-type`

@@ -340,7 +340,10 @@ it `use`s changes, and puts the change into the pages you have open, keeping wha
 (see [What a save keeps](#what-a-save-keeps)). Started, or reloaded, while a
 file is broken or missing, it watches every file that load read or tried, and the
 folders of those not there, so fixing or making one loads the program; each error is
-said once.
+said once. It watches the folders `db.migrate` reads too *(since 0.8.6)*, and
+`platform().dev` is true then, so a route meant for development can refuse to run anywhere
+else. Started with `--host 0.0.0.0`, to try it from a phone, it says that anyone on the
+network can reach the program.
 
 ## Other files in a program
 

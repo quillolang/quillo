@@ -17,11 +17,13 @@ none, a table or a receipt, is sent as the route made it, without the script *(s
 - **Pointed at for 65 ms**, or at once when it is pressed, touched or reached with Tab.
   Each link is asked for once per page view.
 - **Chrome and Edge** are given the link as a speculation rule, and keep the page for the
-  navigation themselves.
+  navigation themselves. On a page whose content policy refuses inline scripts they fetch it
+  as other browsers do *(since 0.8.6)*, as a rule written for each link passes no policy that
+  names hashes.
 - **Other browsers** fetch it in the background with `x-quillo-prefetch: 1`. The server
   answers with `cache-control: private, max-age=30` and `Vary: Cookie`, so the click is
   answered from the browser's cache for the next 30 seconds, and not once someone has
-  logged in or out.
+  logged in or out. A signed-in visitor's page too *(since 0.8.6: it was made twice)*.
 - **Links a page's components follow** are fetched the same way, for the state of the
   components on the page they lead to, so those start with their data and no `null` first.
   It is kept for 30 seconds, until a `server fn` is called, and only for components not
@@ -89,7 +91,7 @@ go ahead of a visitor.
 - `data-no-prefetch` on an element turns it off for the links inside it:
   `<nav data-no-prefetch>…</nav>`.
 - A route that sets its own `cache-control` keeps it: a prefetch of it is answered as the
-  route says.
+  route says (made `private` if the page read who the visitor is).
 - A page whose live loader writes (marking messages read, say) is not prefetched either:
   it is made when the link is followed.
 - `quillo run main.qwe --no-prefetch`, an option given when starting the program (see

@@ -249,6 +249,18 @@ db.migrate()
 - MySQL commits a schema change at once, so a file that fails part way keeps what it did
   before the failure (a migration may hold one, which `db.transaction` refuses). Put one
   change in each file.
+- On SQLite, a table that cannot change in place is rebuilt as SQLite's page says: a new
+  table, the rows copied, the old one dropped, the new one renamed. When other tables point
+  at it, write `pragma foreign_keys = off` in that file *(since 0.8.6: the pragma did
+  nothing, and the drop deleted or blanked their rows)*. Quillo turns foreign keys off for
+  that file, checks them before it commits (a row the file leaves pointing at nothing rolls
+  it back), and turns them on again. Without the pragma, dropping a table others point at
+  with `on delete cascade` or `set null` is warned of.
+- A file with no statement yet, as an editor's new file is, waits until it has one
+  *(since 0.8.6)*.
+- Under `--watch`, the folders `db.migrate` reads are watched *(since 0.8.6)*: a migration
+  that arrives with a `git pull` is applied by the reload, and one that stopped the start is
+  tried again once fixed.
 
 ## Live data {#database-live-data}
 

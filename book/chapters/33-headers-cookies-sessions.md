@@ -179,6 +179,13 @@ decides where the page may load from:
 route GET /app = respond(200, <Page><Home/></Page>, { "content-security-policy": "default-src 'self'; img-src 'self' data:" })
 ```
 
+Quillo's own inline scripts pass such a policy *(since 0.8.6: they were refused, and no
+component ran)*: each is named by its hash in `script-src` (made from `default-src` when the
+policy has none), an island's `display:contents` is a hashed `<style>`, and links are
+prefetched with `fetch`. The program's own inline scripts are not added: give them a hash or
+a nonce of yours, or put them in a file. A policy in a `<meta http-equiv>` is not read: send
+it as a header.
+
 ## Cookies
 
 `set_cookie(name, value, options)` adds a `Set-Cookie` to the answer, whatever the route
@@ -187,7 +194,9 @@ null; `request.cookies` is all of them. A page that reads either, or the `cookie
 `authorization` header, is the visitor's: it goes out with `Cache-Control: private` and
 `Vary: Cookie`, as one made with `session()` does, so a cache in front keeps it for no
 one else *(since 0.7: one that read `request.cookies` or the headers was not)*. A route
-that sets `cache-control` itself keeps its own.
+that sets `cache-control` itself has it made `private`, its time kept for the browser
+*(since 0.8.6: it kept its own, `public` included)*, and `quillo check` says so where it
+is written.
 
 ```quillo
 route POST /theme { form: { theme: str } } {
