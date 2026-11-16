@@ -196,8 +196,29 @@ pub(crate) fn route_at(it: &Interp, path: &str) -> bool {
 /// Whether an answer is a page, `text/html` in any case (`Text/HTML` too): a media type's case is
 /// no part of it (RFC 9110 §8.3.1), and a page so marked had none of Quillo's scripts, and none of
 /// its offline marks' hashes in its policy (FEEDBACK67.md, B.2, third review; branch pwa).
+/// Every answer asks twice, so its first nine bytes are one comparison, each letter's case bit set
+/// (`| 0x20` makes an upper-case ASCII letter its lower case, and no other byte one of these
+/// letters; the `/` is compared as it is): `trim_start` and `eq_ignore_ascii_case` had cost a
+/// text answer 122 instructions more than 0.8.6's `starts_with`, where this costs 12 (speed check
+/// of branch pwa). Spaces or tabs before the type, which no answer of Quillo's has, take the long
+/// way; other white space is no part of a header's value (RFC 9110 §5.6.3).
 pub(crate) fn is_html(resp: &HttpResponse) -> bool {
-    resp.header("content-type").is_some_and(|c| c.trim_start().get(..9).is_some_and(|t| t.eq_ignore_ascii_case("text/html")))
+    const CASE: u64 = u64::from_le_bytes(*b"\x20\x20\x20\x20\x00\x20\x20\x20");
+    const TEXT_HTM: u64 = u64::from_le_bytes(*b"text/htm");
+    resp.header("content-type").is_some_and(|c| match c.as_bytes().get(..9) {
+        Some(t) => {
+            let first = u64::from_le_bytes([t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]]);
+            ((first | CASE) == TEXT_HTM && (t[8] | 0x20) == b'l') || (matches!(t[0], b' ' | b'\t') && html_after_spaces(c))
+        }
+        None => false,
+    })
+}
+
+/// `is_html` for a type written after spaces or tabs.
+#[cold]
+#[inline(never)]
+fn html_after_spaces(c: &str) -> bool {
+    c.trim_start_matches([' ', '\t']).get(..9).is_some_and(|t| t.eq_ignore_ascii_case("text/html"))
 }
 
 /// The media type of a content-type header, without its parameters:
@@ -5397,6 +5418,53 @@ fn island_loader(srcs: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `is_html` by one comparison is the long way's answer, as the third review of branch pwa
+    /// asked for it: every ASCII byte at each of the first ten places of three types, the cases
+    /// by name, and one byte of a two-byte letter at the ninth (speed check of branch pwa).
+    #[test]
+    fn is_html_by_one_comparison_is_the_long_ways() {
+        let long = |c: &str| c.trim_start_matches([' ', '\t']).get(..9).is_some_and(|t| t.eq_ignore_ascii_case("text/html"));
+        let page = |c: &str| is_html(&HttpResponse { status: 200, headers: vec![("Content-Type".into(), c.into())], body: Vec::new() });
+        for base in ["text/html; charset=utf-8", "text/html", "Text/HTML"] {
+            for at in 0..10 {
+                for b in 0u8..0x80 {
+                    let mut v = base.as_bytes().to_vec();
+                    if at < v.len() {
+                        v[at] = b;
+                    } else {
+                        v.push(b);
+                    }
+                    let c = String::from_utf8(v).unwrap();
+                    assert_eq!(page(&c), long(&c), "{:?}", c);
+                }
+            }
+        }
+        for (c, html) in [
+            ("text/html", true),
+            ("TEXT/HTML; charset=utf-8", true),
+            ("text/HTML", true),
+            ("tEXT/hTmL", true),
+            (" text/html", true),
+            ("\t Text/Html; charset=utf-8", true),
+            ("text/htmlx", true),
+            ("text/htm", false),
+            ("", false),
+            ("  ", false),
+            ("text/plain; charset=utf-8", false),
+            ("application/json", false),
+            ("text\x0fhtml", false),
+            ("text/htm\u{e9}", false),
+            ("text/html\u{e9}", true),
+            ("\u{a0}text/html", false),
+            ("text/xhtml", false),
+        ] {
+            assert_eq!(page(c), html, "{:?}", c);
+            assert_eq!(long(c), html, "{:?}", c);
+        }
+        // No content type: no page.
+        assert!(!is_html(&HttpResponse { status: 200, headers: Vec::new(), body: Vec::new() }));
+    }
 
     /// Header names and values by table, as by the list (2026-11-09): every byte, both ways.
     #[test]
