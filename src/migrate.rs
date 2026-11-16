@@ -42,9 +42,24 @@ fn digest(text: &str) -> String {
 
 const TABLE: &str = "create table if not exists _quillo_migrations (name text primary key, sha256 text not null, applied_at text not null)";
 
+/// The folders `db.migrate` has read in this process, for `--watch` to watch: the default
+/// database's, a tenant's, a shard's, and one a load that failed read (FEEDBACK62.md, Q-919,
+/// found in review). At most 64.
+static FOLDERS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn folders() -> Vec<std::path::PathBuf> {
+    FOLDERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
 /// Applies what `dir` has that the database has not; returns the names
 /// applied. Stops at the first file that fails, which is rolled back.
 pub fn run(db: &Backend, dir: &Path) -> Result<Vec<String>, String> {
+    {
+        let mut f = FOLDERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if f.len() < 64 && !f.iter().any(|d| d == dir) {
+            f.push(dir.to_path_buf());
+        }
+    }
     let todo = files(dir)?;
     match db {
         Backend::Sqlite(m) => {
@@ -52,40 +67,23 @@ pub fn run(db: &Backend, dir: &Path) -> Result<Vec<String>, String> {
             c.execute_batch(TABLE).map_err(|e| e.to_string())?;
             let mut applied = Vec::new();
             for (name, text) in &todo {
-                let hash = digest(text);
-                c.execute_batch("begin immediate").map_err(|e| e.to_string())?;
-                let had: Option<String> = c
-                    .query_row("select sha256 from _quillo_migrations where name = ?1", [name], |r| r.get(0))
-                    .ok();
-                if let Some(had) = had {
-                    let _ = c.execute_batch("commit");
-                    if had != hash {
-                        eprintln!("quillo: warning: migration {} changed after it was applied; it is not run again", name);
-                    }
-                    continue;
+                // SQLite takes `pragma foreign_keys` only outside a transaction, and each file
+                // runs in one: a file that turns them off to rebuild a table, as SQLite's own
+                // steps do, had them on, and dropping the old table ran its children's `on
+                // delete` actions, deleting or blanking their rows while `db.migrate` said it
+                // worked. Such a file has them off for its run, its foreign keys checked before
+                // it commits, and on again after (FEEDBACK62.md, Q-915; branch cache-and-migrate).
+                let says = sqlite_says(text);
+                let off = says.keys_off && c.query_row("pragma foreign_keys", [], |r| r.get::<_, i64>(0)).map_or(false, |v| v == 1);
+                if off {
+                    c.execute_batch("pragma foreign_keys = off").map_err(|e| e.to_string())?;
                 }
-                // A migration is where tables are made (FEEDBACK50.md, Q-628; found in review).
-                crate::db::warn_lossy_columns(text);
-                let done = c.execute_batch(text).and_then(|_| {
-                    c.execute(
-                        "insert into _quillo_migrations (name, sha256, applied_at) values (?1, ?2, datetime('now'))",
-                        [name, &hash],
-                    )
-                });
-                match done {
-                    // A deferred constraint fails at the commit, which leaves the file open
-                    // (FEEDBACK16.md, Q-143; branch feedback20-fixes).
-                    Ok(_) => {
-                        if let Err(e) = c.execute_batch("commit") {
-                            let _ = c.execute_batch("rollback");
-                            return Err(format!("migration {} failed: {}", name, e));
-                        }
-                        applied.push(name.clone());
-                    }
-                    Err(e) => {
-                        let _ = c.execute_batch("rollback");
-                        return Err(format!("migration {} failed: {}", name, e));
-                    }
+                let r = sqlite_one(&c, name, text, &says, off);
+                if off {
+                    let _ = c.execute_batch("pragma foreign_keys = on");
+                }
+                if r? {
+                    applied.push(name.clone());
                 }
             }
             Ok(applied)
@@ -108,6 +106,185 @@ pub fn run(db: &Backend, dir: &Path) -> Result<Vec<String>, String> {
             let r = my_run(&mut c, &todo);
             pool.give_back(c);
             r
+        }
+    }
+}
+
+/// One file on SQLite, in a transaction of its own: whether it was applied (false when it
+/// was already). `off` is that foreign keys were turned off for it.
+fn sqlite_one(c: &rusqlite::Connection, name: &str, text: &str, says: &SqliteSays, off: bool) -> Result<bool, String> {
+    let hash = digest(text);
+    c.execute_batch("begin immediate").map_err(|e| e.to_string())?;
+    let had: Option<String> = c.query_row("select sha256 from _quillo_migrations where name = ?1", [name], |r| r.get(0)).ok();
+    if let Some(had) = had {
+        let _ = c.execute_batch("commit");
+        if had != hash {
+            eprintln!("quillo: warning: migration {} changed after it was applied; it is not run again", name);
+        }
+        return Ok(false);
+    }
+    // A migration is where tables are made (FEEDBACK50.md, Q-628; found in review).
+    crate::db::warn_lossy_columns(text);
+    if !off {
+        warn_dropped_parents(c, name, &says.drops);
+    }
+    // Rows already pointing at nothing (made with foreign keys off, by the `sqlite3` shell say)
+    // are not this file's doing: only those it leaves are refused (found in review).
+    let before = if off { violations(c).map_err(|e| format!("migration {} failed: {}", name, e)) } else { Ok(Vec::new()) };
+    let before = match before {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = c.execute_batch("rollback");
+            return Err(e);
+        }
+    };
+    let done = c
+        .execute_batch(text)
+        .and_then(|_| c.execute("insert into _quillo_migrations (name, sha256, applied_at) values (?1, ?2, datetime('now'))", [name, &hash]))
+        .map_err(|e| e.to_string())
+        .and_then(|_| if off { foreign_key_check(c, name, &before) } else { Ok(()) });
+    match done {
+        // A deferred constraint fails at the commit, which leaves the file open
+        // (FEEDBACK16.md, Q-143; branch feedback20-fixes).
+        Ok(()) => {
+            if let Err(e) = c.execute_batch("commit") {
+                let _ = c.execute_batch("rollback");
+                return Err(format!("migration {} failed: {}", name, e));
+            }
+            Ok(true)
+        }
+        Err(e) => {
+            let _ = c.execute_batch("rollback");
+            Err(format!("migration {} failed: {}", name, e))
+        }
+    }
+}
+
+/// What a SQLite migration's statements say, read by the tokenizer, so that a comment or a
+/// string saying it is not taken (FEEDBACK62.md, Q-915; branch cache-and-migrate).
+#[derive(Default)]
+struct SqliteSays {
+    /// A `pragma foreign_keys = off` (or `0`, `false`, `no`, and the `(off)` form).
+    keys_off: bool,
+    /// The tables it drops, as named (without quotes).
+    drops: Vec<String>,
+}
+
+fn sqlite_says(text: &str) -> SqliteSays {
+    use crate::sql::Kind;
+    let (toks, _) = crate::sql::lex(crate::sql::Dialect::Sqlite, text);
+    let word = |i: usize| toks.get(i).filter(|t| t.kind == Kind::Word).map(|t| text[t.start..t.end].to_ascii_lowercase());
+    let unquoted = |i: usize| {
+        toks.get(i).filter(|t| matches!(t.kind, Kind::Word | Kind::Quoted | Kind::Str)).map(|t| {
+            let w = &text[t.start..t.end];
+            if t.kind == Kind::Word { w.to_string() } else { w[1..w.len().saturating_sub(1).max(1)].to_string() }
+        })
+    };
+    let mut says = SqliteSays::default();
+    // Each statement starts after a `;`, or at the text's start.
+    let mut starts = vec![0];
+    starts.extend(toks.iter().enumerate().filter(|(_, t)| t.kind == Kind::Semi).map(|(i, _)| i + 1));
+    for i in starts {
+        match word(i).as_deref() {
+            Some("pragma") => {
+                // `pragma [schema.]foreign_keys = off`, or `pragma foreign_keys(off)`.
+                let mut j = i + 1;
+                if toks.get(j + 1).is_some_and(|t| t.kind == Kind::Dot) {
+                    j += 2;
+                }
+                if !unquoted(j).is_some_and(|n| n.eq_ignore_ascii_case("foreign_keys")) {
+                    continue;
+                }
+                let v = match toks.get(j + 1).map(|t| (t.kind, &text[t.start..t.end])) {
+                    Some((Kind::Op, "=")) | Some((Kind::Open, _)) => toks.get(j + 2),
+                    _ => None,
+                };
+                if let Some(t) = v {
+                    let v = text[t.start..t.end].trim_matches(|c| c == '\'' || c == '"').to_ascii_lowercase();
+                    if matches!(v.as_str(), "off" | "0" | "false" | "no") {
+                        says.keys_off = true;
+                    }
+                }
+            }
+            Some("drop") if word(i + 1).as_deref() == Some("table") => {
+                let mut j = i + 2;
+                if word(j).as_deref() == Some("if") && word(j + 1).as_deref() == Some("exists") {
+                    j += 2;
+                }
+                if toks.get(j + 1).is_some_and(|t| t.kind == Kind::Dot) {
+                    j += 2;
+                }
+                if let Some(t) = unquoted(j) {
+                    says.drops.push(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    says
+}
+
+/// Dropping a table that others point at with an `on delete` action runs it for each row,
+/// foreign keys being on: said before the file runs, with what to write instead (FEEDBACK62.md,
+/// Q-915; branch cache-and-migrate).
+fn warn_dropped_parents(c: &rusqlite::Connection, name: &str, drops: &[String]) {
+    for table in drops {
+        let Ok(mut q) = c.prepare(
+            "select m.name, f.on_delete from sqlite_schema m, pragma_foreign_key_list(m.name) f \
+             where m.type = 'table' and f.\"table\" = ?1 collate nocase and m.name <> ?1 collate nocase \
+             and f.on_delete in ('CASCADE', 'SET NULL', 'SET DEFAULT')",
+        ) else {
+            continue;
+        };
+        let children: Vec<(String, String)> = q
+            .query_map([table], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default();
+        if let Some((child, action)) = children.first() {
+            let more = if children.len() > 1 { format!(" (and {} more)", children.len() - 1) } else { String::new() };
+            let does = if action == "CASCADE" { "deletes their rows" } else { "blanks their references" };
+            eprintln!(
+                "quillo: warning: migration {} drops table {}, which {} points at with on delete {}{}: with foreign keys on, the drop {}. To rebuild a table, write `pragma foreign_keys = off` in the file: Quillo turns them off for that file and checks them before it commits",
+                name, table, child, action.to_ascii_lowercase(), more, does
+            );
+        }
+    }
+}
+
+/// The rows whose foreign key finds no row: table, row, parent and which key.
+fn violations(c: &rusqlite::Connection) -> Result<Vec<(String, Option<i64>, String, i64)>, String> {
+    let mut q = c.prepare("pragma foreign_key_check").map_err(|e| e.to_string())?;
+    let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(|e| e.to_string())?;
+    Ok(rows.flatten().collect())
+}
+
+/// After a file run with foreign keys off: every row's foreign key still finds its row, but those
+/// that found none before it, or the file fails, naming the first that does not (FEEDBACK62.md,
+/// Q-915; branch cache-and-migrate).
+fn foreign_key_check(c: &rusqlite::Connection, name: &str, before: &[(String, Option<i64>, String, i64)]) -> Result<(), String> {
+    let all = violations(c)?;
+    let bad: Vec<_> = all.iter().filter(|v| !before.contains(v)).collect();
+    if !before.is_empty() {
+        let (t, row, p, _) = &before[0];
+        let more = if before.len() > 1 { format!(" (and {} more)", before.len() - 1) } else { String::new() };
+        eprintln!(
+            "quillo: warning: before migration {} ran, {}{} already pointed at no row of {}{}: left as they are, as the file did not make them",
+            name,
+            t,
+            row.map_or(String::new(), |id| format!(" row {}", id)),
+            p,
+            more
+        );
+    }
+    match bad.first() {
+        None => Ok(()),
+        Some((table, rowid, parent, _)) => {
+            let row = rowid.map_or(String::new(), |id| format!(" row {}", id));
+            let more = if bad.len() > 1 { format!(" (and {} more)", bad.len() - 1) } else { String::new() };
+            Err(format!(
+                "it turns foreign keys off, and leaves {}{} pointing at no row of {}{}: FOREIGN KEY constraint failed, so it was rolled back",
+                table, row, parent, more
+            ))
         }
     }
 }

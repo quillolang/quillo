@@ -182,6 +182,20 @@ fn overlay(mut m: serde_json::Map<String, serde_json::Value>, given: &serde_json
     m
 }
 
+/// The program runs under `--watch`: in development, where a tool of its own may run and its
+/// errors are shown in full. Set before the program loads, so its top level reads it too.
+pub static DEV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `platform().dev`: true under `--watch` alone, so that a route or a tool meant for
+/// development can refuse to run anywhere else, which nothing let a program tell
+/// (FEEDBACK62.md, Q-920; branch cache-and-migrate).
+fn with_dev(info: Value) -> Value {
+    let Value::Map(m) = info else { return info };
+    let mut m = (*m).clone();
+    m.insert("dev".into(), Value::Bool(DEV.load(std::sync::atomic::Ordering::Relaxed)));
+    Value::map(m)
+}
+
 /// Where the server listens: the host and port it was told, then the port it was given when it
 /// bound (`--port 0`). None in a script.
 static LISTENING: std::sync::Mutex<Option<(String, u16)>> = std::sync::Mutex::new(None);
@@ -196,7 +210,7 @@ pub fn set_listening(host: &str, port: u16) {
 /// to itself) need not be told its `--port` again (FEEDBACK34.md, Q-426; branch
 /// feedback27-35-fixes). `url` is one this machine can reach: `0.0.0.0` is `127.0.0.1` there.
 pub fn platform(it: &mut crate::interp::Interp, _: Vec<Value>, _: u32) -> Result<Value, Ctrl> {
-    let info = info();
+    let info = with_dev(info());
     let listening = LISTENING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     let Some((host, port)) = listening else { return Ok(info) };
     let Value::Map(m) = info else { return Ok(info) };

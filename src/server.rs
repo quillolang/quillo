@@ -459,9 +459,13 @@ impl Interp {
         crate::db::left_open(self, || format!("{} {}", req.method, path));
         // A prefetch's deferred parts: worked out now, as part of the prefetch, which
         // may change nothing (branch defer).
+        // Their ids, for their scripts' hashes in the page's policy (FEEDBACK59.md, Q-904, found
+        // in review: a prefetched page kept its waiting components waiting).
+        let mut early_parts: Vec<usize> = Vec::new();
         if prefetch.is_some() && !self.deferred.is_empty() {
             let jobs = std::mem::take(&mut self.deferred);
             if resp.header("content-type").is_some_and(|c| c.starts_with("text/html")) && resp.status == 200 {
+                early_parts = jobs.iter().map(|d| d.id).collect();
                 let page = crate::defer::split(std::mem::take(&mut resp.body), jobs);
                 resp.body = crate::defer::whole(self, page);
             }
@@ -543,6 +547,11 @@ impl Interp {
         // disk, whose ETag and byte ranges are of the file (FEEDBACK36.md, Q-447; branch
         // feedback36-39).
         let html = html && !as_written(&resp);
+        // What the answer's content policy refuses of what Quillo writes into the page itself:
+        // its scripts are then hashed into the policy, and an island's `display:contents` is a
+        // rule of a `<style>` (FEEDBACK59.md, Q-904; branch cache-and-migrate).
+        let refused = if html && req.method != "HEAD" { policy_refuses(&resp) } else { Refused::default() };
+        let mut own: Vec<String> = Vec::new();
         // Only a page with something to prefetch: a link, a script that may make one, or a
         // component. One with none carried 1,300 bytes that never ran (the Fortunes page,
         // 2,560 bytes against Bun's 1,226; branch page-size). With --metrics, such a page still
@@ -555,10 +564,23 @@ impl Interp {
             if let Some(at) = has(&resp.body, b"</body>") {
                 if self.rendered_island || tags.follow {
                     if !script_with(&resp.body, &PREFETCH_JS.as_bytes()[..40]) {
-                        insert_at(&mut resp.body, at, &prefetch_tags(&self.base));
+                        if refused.scripts {
+                            // Chrome's speculation rules, written for each link, pass no policy
+                            // that names hashes: the links are fetched instead, as other browsers
+                            // do (found in review).
+                            let t = format!("<script>{}</script>{}", prefetch_by_fetch(), used_script(&self.base));
+                            own.extend(script_texts(t.as_bytes()));
+                            insert_at(&mut resp.body, at, t.as_bytes());
+                        } else {
+                            insert_at(&mut resp.body, at, &prefetch_tags(&self.base));
+                        }
                     }
                 } else if crate::metrics::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-                    insert_at(&mut resp.body, at, used_script(&self.base).as_bytes());
+                    let t = used_script(&self.base);
+                    if refused.scripts {
+                        own.extend(script_texts(t.as_bytes()));
+                    }
+                    insert_at(&mut resp.body, at, t.as_bytes());
                 }
             }
         }
@@ -639,6 +661,9 @@ impl Interp {
                 }
             }
             let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
+            if refused.scripts {
+                own.extend(script_texts(tags.as_bytes()));
+            }
             insert_at(&mut resp.body, at, tags.as_bytes());
         }
         // The page's sheet: the styles of the components and views on it,
@@ -666,12 +691,28 @@ impl Interp {
                 insert_at(&mut resp.body, at, link.as_bytes());
             }
         }
+        // Quillo's own scripts and its islands' style, let through the page's policy, waiting
+        // components' parts included, which come after the head (FEEDBACK59.md, Q-904; branch
+        // cache-and-migrate).
+        let parts = html && req.method != "HEAD" && resp.status == 200 && !self.deferred.is_empty();
+        if refused.scripts && (parts || !early_parts.is_empty()) {
+            own.extend(script_texts(crate::defer::SWAP.as_bytes()));
+            for id in self.deferred.iter().map(|d| d.id).chain(early_parts.iter().copied()) {
+                own.extend(script_texts(crate::defer::part(id, "").as_bytes()));
+            }
+        }
+        // The rule only where an island is, or may come in a part.
+        let islands = refused.attr && (plain_islands(&mut resp.body) || parts);
+        if refused.scripts || islands {
+            allow_own(&mut resp, &own, &[], islands);
+        }
         // Waiting components (src/defer.rs; branch defer): the page now, each of them
         // after it in the same answer; whole when there is no server to stream it.
         if !self.deferred.is_empty() {
             let jobs = std::mem::take(&mut self.deferred);
             if html && req.method != "HEAD" && resp.status == 200 {
-                let page = crate::defer::split(std::mem::take(&mut resp.body), jobs);
+                let mut page = crate::defer::split(std::mem::take(&mut resp.body), jobs);
+                page.plain_islands = refused.attr;
                 if self.streams_direct {
                     resp.headers.push((crate::stream::MARK.into(), "1".into()));
                     resp.headers.push(("x-accel-buffering".into(), "no".into()));
@@ -1195,6 +1236,42 @@ impl Interp {
             }
             if let Some(v) = v {
                 resp.headers.push((k, v));
+            }
+        }
+        // An answer made from who the visitor is stays theirs, whatever its route, `file`'s
+        // `cache` or a `site_headers` rule said: `public` (or a time a shared cache takes,
+        // `s-maxage`, a `max-age` alone) let a cache in front give it to the next visitor, as
+        // Cloudflare ignores `Vary` and keeps a `.pdf` or a `.png` with no rule of its own. The
+        // time stays, for the visitor's own browser, as a page with a form key has its `public`
+        // turned to `no-store` (the user's choice of 2026-11-16; FEEDBACK59.md, Q-903; branch
+        // cache-and-migrate).
+        // The fields a CDN reads before `Cache-Control` (`CDN-Cache-Control` and its `Cloudflare-`
+        // kind, RFC 9213, `Surrogate-Control`, nginx's `X-Accel-Expires`) go, leaving it the
+        // decision (found in review). A `cache-control: null` stays none, as the user decided for
+        // `null` (FEEDBACK55.md, Q-710).
+        if personal {
+            let mut changed: Vec<String> = Vec::new();
+            resp.headers.retain(|(k, v)| {
+                let cdn = {
+                    let k = k.to_ascii_lowercase();
+                    k.ends_with("cdn-cache-control") || k == "surrogate-control" || k == "x-accel-expires"
+                };
+                if cdn && v != DROPPED {
+                    changed.push(format!("`{}: {}` left out", k.to_ascii_lowercase(), v));
+                }
+                !cdn
+            });
+            for (k, v) in resp.headers.iter_mut() {
+                if !k.eq_ignore_ascii_case("cache-control") || v == "private" || v == DROPPED {
+                    continue;
+                }
+                if let Some(own) = kept_by_visitor_alone(v) {
+                    changed.push(format!("`cache-control: {}` sent as `{}`", v, own));
+                    *v = own;
+                }
+            }
+            if !changed.is_empty() {
+                said_private(path, &changed.join(", "));
             }
         }
         // Not when the program said `vary: null` (FEEDBACK55.md, Q-710; branch feedback55).
@@ -2484,6 +2561,35 @@ pub(crate) fn rpc_failure(name: &str, e: &crate::error::QuilloError) -> String {
     }
 }
 
+/// A `Cache-Control` that a shared cache may keep, made one only the visitor's browser keeps:
+/// `private` first, without `public`, `s-maxage` and `proxy-revalidate`, which are for shared
+/// caches, and the rest as it was (`max-age`, `immutable`, `no-cache`). None for one that is
+/// already the visitor's (`private`, `no-store`) or that no cache keeps without asking (FEEDBACK59.md,
+/// Q-903; branch cache-and-migrate).
+pub(crate) fn kept_by_visitor_alone(v: &str) -> Option<String> {
+    let parts = || v.split(',').map(str::trim).filter(|p| !p.is_empty());
+    let is = |p: &str, n: &str| p.split('=').next().unwrap_or("").trim().eq_ignore_ascii_case(n);
+    // `private` alone: one naming fields (`private="set-cookie"`) lets a shared cache keep the
+    // rest (found in review).
+    if parts().any(|p| p.eq_ignore_ascii_case("private") || is(p, "no-store")) {
+        return None;
+    }
+    if !parts().any(|p| is(p, "public") || is(p, "s-maxage") || is(p, "max-age")) {
+        return None;
+    }
+    let kept: Vec<&str> = parts().filter(|p| !(is(p, "public") || is(p, "s-maxage") || is(p, "proxy-revalidate") || is(p, "private"))).collect();
+    Some(if kept.is_empty() { "private".to_string() } else { format!("private, {}", kept.join(", ")) })
+}
+
+/// Said once for each path, the first 64, where an answer's `public` was made `private`.
+fn said_private(path: &str, what: &str) {
+    static SAID: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    let mut said = SAID.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if said.len() < 64 && said.insert(path.to_string()) {
+        eprintln!("quillo: {} read who the visitor is: {}, as a cache in front would give the answer to the next visitor (said once for each path)", path, what);
+    }
+}
+
 /// Whether a page has a `<script>` element whose
 /// code starts with `code`: one put in already, as a mounted program's page
 /// has it, not text that quotes it, which is escaped.
@@ -2766,6 +2872,15 @@ pub const PREFETCH_JS: &str = concat!(
     "d.addEventListener(\"pointerover\",(e)=>{const a=link(e);clearTimeout(t);if(a)t=setTimeout(()=>go(a),65)},o);",
     "for(const v of[\"pointerdown\",\"touchstart\",\"focusin\"])d.addEventListener(v,(e)=>go(link(e)),o)})()"
 );
+
+/// `PREFETCH_JS` that fetches the links and writes no speculation rules: for a page whose policy
+/// refuses inline scripts, where Chrome refuses the rules written for each link even with
+/// `'inline-speculation-rules'`, as a hash beside it turns that off (FEEDBACK59.md, Q-904, found
+/// in review; branch cache-and-migrate).
+fn prefetch_by_fetch() -> &'static str {
+    static MADE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MADE.get_or_init(|| PREFETCH_JS.replace("const spec=HTMLScriptElement.supports&&HTMLScriptElement.supports(\"speculationrules\");", "const spec=false;"))
+}
 
 /// What the prefetch puts before a page's `</body>`, made once for a program's base and kept by
 /// each thread: it had been made, 1,300 bytes, for each page (2026-11-09, the server benchmark).
@@ -3155,6 +3270,26 @@ impl App {
         let mut files = vec![self.main_file.clone()];
         if let Loaded::Ready(it) = &*self.current().1 {
             files.extend(it.files());
+        }
+        // Under --watch, the folders `db.migrate` read and their files: a migration a `git pull`
+        // brings is applied by the reload, where the program ran on the old schema until a `.qwe`
+        // file changed; and one that stopped the first load is tried again once fixed. Not under
+        // --reload, where a deploy decides; nor a folder that is the program's own, where every
+        // database write would reload it (FEEDBACK62.md, Q-919; branch cache-and-migrate).
+        if self.watch {
+            let own = |d: &Path| d.canonicalize().ok();
+            let program = self.main_file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            for dir in crate::migrate::folders() {
+                if own(&dir).is_none() || own(&dir) == own(program) || files.contains(&dir) {
+                    continue;
+                }
+                let mut sql: Vec<PathBuf> = std::fs::read_dir(&dir)
+                    .map(|es| es.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "sql") && p.is_file()).collect())
+                    .unwrap_or_default();
+                sql.sort();
+                files.push(dir);
+                files.extend(sql);
+            }
         }
         // And what the last load that failed named: a used file fixed, or one it lacked made,
         // loads it (FEEDBACK55.md, Q-836; branch feedback55).
@@ -3663,6 +3798,174 @@ fn inject_dev_script(resp: &mut HttpResponse, version: u64) {
         None => format!("{}{}", body, script),
     }
     .into_bytes();
+    // Through the page's policy too, and the style of its box for a save that did not load
+    // (FEEDBACK59.md, Q-904; branch cache-and-migrate).
+    if resp.headers.iter().any(|(k, v)| is_policy(k) && v != DROPPED) {
+        let style = script.split_once("<style>").and_then(|(_, r)| r.split_once("</style>")).map(|(t, _)| t.to_string());
+        allow_own(resp, &script_texts(script.as_bytes()), &style.iter().map(String::as_str).collect::<Vec<_>>(), false);
+    }
+}
+
+/// What an answer's content policy refuses of what Quillo writes into a page itself: inline
+/// scripts, and a `style` attribute (a `<quillo-island>`'s `display:contents`). The guide's own
+/// `default-src 'self'` refused both: the page looked right and no component ran, with no word
+/// anywhere (FEEDBACK59.md, Q-904; branch cache-and-migrate).
+#[derive(Default, Clone, Copy)]
+pub(crate) struct Refused {
+    pub scripts: bool,
+    pub attr: bool,
+}
+
+/// The content policies an answer carries, the reporting ones too, which would report every one
+/// of Quillo's scripts.
+fn is_policy(name: &str) -> bool {
+    name.eq_ignore_ascii_case("content-security-policy") || name.eq_ignore_ascii_case("content-security-policy-report-only")
+}
+
+/// A policy's directives, in order: the name in lower case and its sources.
+fn directives(policy: &str) -> Vec<(String, Vec<&str>)> {
+    policy
+        .split(';')
+        .filter_map(|d| {
+            let mut words = d.split_ascii_whitespace();
+            let name = words.next()?.to_ascii_lowercase();
+            Some((name, words.collect()))
+        })
+        .collect()
+}
+
+/// The directive that decides for a kind of thing: the first of `names` the policy has.
+fn deciding<'a>(ds: &'a [(String, Vec<&'a str>)], names: &[&str]) -> Option<&'a [&'a str]> {
+    names.iter().find_map(|n| ds.iter().find(|(d, _)| d == n).map(|(_, v)| v.as_slice()))
+}
+
+/// Whether sources let an inline script or style run: `'unsafe-inline'`, which a nonce or a hash
+/// beside it turns off, and for scripts `'strict-dynamic'` too (for styles it means nothing:
+/// found in review, where a hash added beside it turned the program's own styles off).
+fn lets_inline(sources: &[&str], scripts: bool) -> bool {
+    let has = |p: &str| sources.iter().any(|s| s.to_ascii_lowercase().starts_with(p));
+    has("'unsafe-inline'") && !has("'nonce-") && !has("'sha256-") && !has("'sha384-") && !has("'sha512-") && !(scripts && has("'strict-dynamic'"))
+}
+
+const SCRIPTS: &[&str] = &["script-src-elem", "script-src", "default-src"];
+const STYLE_ELEMS: &[&str] = &["style-src-elem", "style-src", "default-src"];
+const STYLE_ATTRS: &[&str] = &["style-src-attr", "style-src", "default-src"];
+
+/// Each policy of the answer (a header may hold several, by commas) refuses or not.
+pub(crate) fn policy_refuses(resp: &HttpResponse) -> Refused {
+    let mut r = Refused::default();
+    for (_, v) in resp.headers.iter().filter(|(k, v)| is_policy(k) && v != DROPPED) {
+        for policy in v.split(',') {
+            let ds = directives(policy);
+            let refuses = |names: &[&str]| deciding(&ds, names).is_some_and(|s| !lets_inline(s, names == SCRIPTS));
+            r.scripts |= refuses(SCRIPTS);
+            r.attr |= refuses(STYLE_ATTRS);
+        }
+    }
+    r
+}
+
+/// The text of each `<script>` element in markup Quillo wrote.
+fn script_texts(tags: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(tags);
+    let mut out = Vec::new();
+    let mut rest = &*text;
+    while let Some(i) = rest.find("<script>") {
+        let after = &rest[i + 8..];
+        let Some(end) = after.find("</script>") else { break };
+        out.push(after[..end].to_string());
+        rest = &after[end + 9..];
+    }
+    out
+}
+
+/// The rule a `<quillo-island>` takes from a `<style>` when the policy refuses its attribute.
+const ISLAND_RULE: &str = "quillo-island{display:contents}";
+
+/// Islands without their `style` attribute, for a page whose policy refuses it: whether there
+/// was one.
+pub(crate) fn plain_islands(body: &mut Vec<u8>) -> bool {
+    const WITH: &[u8] = b"<quillo-island style=\"display:contents\"";
+    if !body.windows(WITH.len()).any(|w| w == WITH) {
+        return false;
+    }
+    *body = String::from_utf8_lossy(body).replace("<quillo-island style=\"display:contents\"", "<quillo-island").into_bytes();
+    true
+}
+
+fn source_hash(text: &str) -> String {
+    use sha2::Digest;
+    format!("'sha256-{}'", crate::ws::base64(&sha2::Sha256::digest(text.as_bytes())))
+}
+
+/// A policy with `hashes` added where `names` decides, unless that already lets inline code
+/// through (a hash would then turn its `'unsafe-inline'` off). A policy with only `default-src`
+/// gets the last of `names` made from it, which keeps everything else as it was.
+fn with_hashes(policy: &str, names: &[&str], hashes: &[String]) -> String {
+    let ds = directives(policy);
+    let Some(sources) = deciding(&ds, names) else { return policy.to_string() };
+    if lets_inline(sources, names == SCRIPTS) || hashes.is_empty() {
+        return policy.to_string();
+    }
+    let named = names.iter().position(|n| ds.iter().any(|(d, _)| d == n)).map(|i| names[i]).unwrap_or("default-src");
+    let mut sources: Vec<String> = sources.iter().filter(|s| !s.eq_ignore_ascii_case("'none'")).map(|s| s.to_string()).collect();
+    for h in hashes {
+        if !sources.contains(h) {
+            sources.push(h.clone());
+        }
+    }
+    let line = |name: &str| format!("{} {}", name, sources.join(" "));
+    if named == "default-src" {
+        let made = names[names.len() - 2];
+        let mut out = policy.trim_end().trim_end_matches(';').to_string();
+        out.push_str("; ");
+        out.push_str(&line(made));
+        return out;
+    }
+    policy
+        .split(';')
+        .map(|d| if d.split_ascii_whitespace().next().is_some_and(|n| n.eq_ignore_ascii_case(named)) { format!(" {}", line(named)) } else { d.to_string() })
+        .collect::<Vec<_>>()
+        .join(";")
+        .trim_start()
+        .to_string()
+}
+
+/// Quillo's own scripts through each policy of the answer, by their hashes, which a kept page
+/// keeps valid where a nonce would not; and, for a page whose policy refuses an island's
+/// attribute, its rule in a `<style>` at the head, hashed where the policy wants that too.
+pub(crate) fn allow_own(resp: &mut HttpResponse, scripts: &[String], styles: &[&str], island_style: bool) {
+    let mut script_hashes: Vec<String> = Vec::new();
+    for t in scripts {
+        let h = source_hash(t);
+        if !script_hashes.contains(&h) {
+            script_hashes.push(h);
+        }
+    }
+    let mut style_hashes: Vec<String> = styles.iter().map(|t| source_hash(t)).collect();
+    if island_style {
+        style_hashes.push(source_hash(ISLAND_RULE));
+    }
+    for (k, v) in resp.headers.iter_mut() {
+        if !is_policy(k) || *v == DROPPED {
+            continue;
+        }
+        *v = v
+            .split(',')
+            .map(|p| with_hashes(&with_hashes(p, SCRIPTS, &script_hashes), STYLE_ELEMS, &style_hashes))
+            .collect::<Vec<_>>()
+            .join(",");
+    }
+    if island_style {
+        let tag = format!("<style>{}</style>", ISLAND_RULE);
+        let find = |needle: &[u8]| find_ascii_ci(&resp.body, needle);
+        let at = match (find(b"</head>"), find(b"<body")) {
+            (Some(h), _) => h,
+            (None, Some(b)) => resp.body[b..].iter().position(|&c| c == b'>').map_or(0, |e| b + e + 1),
+            (None, None) => 0,
+        };
+        insert_at(&mut resp.body, at, tag.as_bytes());
+    }
 }
 
 fn error_page(msg: &str) -> HttpResponse {
@@ -4360,6 +4663,15 @@ fn serve_from(
         // read.
         let typed = std::io::IsTerminal::is_terminal(&std::io::stdin()) && !crate::debug::on();
         eprintln!("quillo: watching for changes{}", if typed { " (r and Enter starts the program's data again)" } else { "" });
+        // Opened to the network (`--host 0.0.0.0`, to try it from a phone): allowed, and said,
+        // as anyone there now reaches the routes, with errors shown in full (FEEDBACK62.md,
+        // Q-918; branch cache-and-migrate).
+        if let Some(a) = bound.filter(|a| !a.ip().is_loopback()) {
+            eprintln!(
+                "quillo: warning: --watch listens on {}, not this machine alone: anyone on its network can reach the program's routes and server fns, and sees its errors in full. Leave out --host to keep it to this machine",
+                a.ip()
+            );
+        }
         if typed {
             let app = app.clone();
             let _ = std::thread::Builder::new().name("quillo-keys".into()).spawn(move || {

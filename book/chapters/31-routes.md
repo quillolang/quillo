@@ -770,9 +770,35 @@ fn touch() {
   `x-request-id` and `x-content-type-options: nosniff`. Every HTML page carries
   `x-frame-options: SAMEORIGIN`, unless the route sets one or a
   `content-security-policy` with `frame-ancestors`. A page made from who the visitor is
-  (it called `session()` or `cookie()`, or set a cookie) carries `cache-control:
-  private` and `vary: cookie`, unless the route set its own `cache-control`, so a shared
-  cache never gives one visitor's page to another.
+  (it called `session()` or `cookie()`, set a cookie, or read a header of the request or its
+  `ip`) carries `cache-control: private` and `vary: cookie`, so a shared cache never gives
+  one visitor's page to another. That holds whatever time the route gave. A `cache-control`
+  that lets a shared cache keep the answer (`public`, `s-maxage`, a `max-age` without
+  `private`), whether from `respond`, from `file`'s `cache` or from a `site_headers` rule, is
+  sent as `private` with its time kept for the visitor's own browser, so a cache in front
+  that ignores `vary` (Cloudflare keeps a `.pdf` or a `.png` with no rule) cannot hand Ana's
+  file to the next visitor. A `cache-control: null` takes the header away, Quillo's `private`
+  included, as `null` does for any header: such a cache may fill that silence. The fields a
+  CDN reads before `Cache-Control`
+  (`CDN-Cache-Control`, `Cloudflare-CDN-Cache-Control`, `Surrogate-Control`, nginx's
+  `X-Accel-Expires`) are left out of such an answer. The log says so once for each path, and
+  `quillo check` warns where a route writes such a `cache-control` itself. A route that
+  reads no one keeps its `public`.
+- A `content-security-policy` needs nothing added for Quillo's own scripts. Where the
+  policy refuses inline scripts (the guide's own `default-src 'self'` below does), each one
+  Quillo wrote into the page is named by its hash in `script-src`, which is made from
+  `default-src` when the policy has none. That covers the components' loader, the links'
+  prefetch, the page's state, a waiting component's part and the development script. Where it
+  refuses a `style` attribute, the islands' `display:contents` moves into a `<style>` in the
+  head, hashed in `style-src`. A hash, not a nonce, so that a page kept by a cache stays
+  valid. A policy that already lets inline code run (`'unsafe-inline'` with no nonce or hash)
+  is left as it is, as a hash would turn that off. Under such a policy a page's links are
+  prefetched with `fetch`, as in Firefox and Safari: Chrome's speculation rules, written for
+  each link as the pointer comes, pass no policy that names a hash. The program's own inline
+  scripts are not added: give them your own nonce
+  or hash, or put them in a file the page loads. Only a policy in the answer's headers is
+  read: one in the page's own `<meta http-equiv>` is the program's to keep up to date, so
+  set it with `site_headers` instead.
 - `site_headers(map)` *(since 0.7)* at the top level adds headers to every answer that does not set
   them itself, and `site_headers("/admin", map)` to those under a path; a longer path's
   rule wins over a shorter one's. A `null` value takes away one Quillo sends. Names are

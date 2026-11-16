@@ -423,6 +423,10 @@ pub struct Interp {
     /// `locale_from` rule), is refused: it had been answered as outside any tool's call, `confirm`
     /// true, a yes nobody gave (FEEDBACK56.md, found in the coverage review; branch feedback56).
     pub(crate) in_tool: bool,
+    /// The request is a call's on stdio (`quillo mcp`): `request` for its code, and nothing that
+    /// a request from a browser would run, a `locale_from` rule (FEEDBACK63.md, Q-927; branch
+    /// cache-and-migrate).
+    pub(crate) stdio_request: bool,
     /// Run as a service (`--as-service`): its tools, which its app's door lists as its own and
     /// passes the calls of on to it, signed (FEEDBACK56.md, Part F; branch feedback56). None
     /// everywhere else, and for a service with none.
@@ -1907,6 +1911,7 @@ impl Interp {
             mcp: None,
             asking: None,
             in_tool: false,
+            stdio_request: false,
             offered_tools: None,
             ready_checks: Default::default(),
             style_with: None,
@@ -2034,6 +2039,7 @@ impl Interp {
             mcp: self.mcp.clone(),
             asking: None,
             in_tool: self.in_tool,
+            stdio_request: self.stdio_request,
             offered_tools: self.offered_tools.clone(),
             ready_checks: self.ready_checks.clone(),
             style_with: self.style_with.clone(),
@@ -5333,9 +5339,34 @@ impl Interp {
         "the request does not match its pattern".to_string()
     }
 
+    /// Whether `x` is of the program's type `t`, one that is not a record, as a form's or a
+    /// query's text is read when `lenient`; a record inside it is taken as fitting.
+    fn named_fits(&self, t: &str, x: &Value, lenient: bool, depth: usize) -> bool {
+        let Some(td) = self.types.get(t) else { return true };
+        if td.is_record() || depth > 8 {
+            return true;
+        }
+        (td.ty.optional && matches!(x, Value::Nil))
+            || td.ty.names.iter().any(|n| {
+                if n.starts_with('"') {
+                    let want: String = serde_json::from_str(n).unwrap_or_default();
+                    matches!(x, Value::Str(s) if **s == *want)
+                } else if self.types.contains_key(n) {
+                    self.named_fits(n, x, lenient, depth + 1)
+                } else {
+                    self.pattern_fits(&Pattern::Type(n.clone()), x, lenient)
+                }
+            })
+    }
+
     /// Whether `x` could match `p`, by its type and shape only: what `why_no_match` reads.
     fn pattern_fits(&self, p: &Pattern, x: &Value, lenient: bool) -> bool {
         match p {
+            // A type of the program's that is not a record (a set of strings, another name for a
+            // scalar): read as `make` reads it, so the field it misses is the one said
+            // (FEEDBACK58.md, Q-874; branch cache-and-migrate). A record is taken as fitting, as
+            // its defaults are code of the program's, not run here.
+            Pattern::Type(t) if self.types.get(t).is_some_and(|td| !td.is_record()) => self.named_fits(t, x, lenient, 0),
             Pattern::Type(t) if self.types.contains_key(t) => true,
             Pattern::Type(t) if t == "dec" => as_dec(x).is_some(),
             Pattern::Type(t) if t == "money" => crate::money::from_data(x).is_ok(),

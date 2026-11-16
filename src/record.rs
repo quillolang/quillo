@@ -227,7 +227,11 @@ fn make_name(it: &mut Interp, n: &str, ty: &Ty, v: &Value, lenient: bool, depth:
         // Money, held to `money.of`'s rules, with what is wrong (FEEDBACK50.md, Q-621; branch
         // feedback50-fixes).
         ("money", _) => Ok(crate::money::from_data(v).map_err(|what| Why { path: String::new(), what })),
-        (t, Value::Str(s)) if lenient && !type_name_matches(t, v) => match crate::interp::coerce(t, s) {
+        // Text converts to a scalar, not to one of a set of strings (`"oil_change" | "tire_rotation"`):
+        // that is text the form or the query gives as it is, which `fits` reads below. The set
+        // refused every value from a form or a query, and took it from JSON (FEEDBACK58.md,
+        // Q-874; branch cache-and-migrate).
+        (t, Value::Str(s)) if lenient && !type_name_matches(t, v) && !t.starts_with('"') => match crate::interp::coerce(t, s) {
             Some(x) => Ok(Ok(x)),
             None => Ok(Err(Why::default())),
         },

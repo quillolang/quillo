@@ -675,6 +675,52 @@ fn middleware_of(r: &RouteDef) -> Option<String> {
     }
 }
 
+/// Where a route that reads who the visitor is (the session, a cookie, a field of the request
+/// that is theirs) marks its answer for shared caches: a `cache-control` written out that a
+/// shared cache may keep. Not `file`'s `cache`, which says how long and not who keeps it, so
+/// that Quillo choosing `private` there is no surprise (FEEDBACK59.md, Q-903; branch
+/// cache-and-migrate).
+fn public_after_visitor(r: &RouteDef) -> Option<u32> {
+    let mut visitor = r.reads_visitor;
+    let mut at = None;
+    walk_expr(&r.body, &mut |x| match x {
+        Expr::Call(f, args, line) => {
+            if let Expr::Ident(n, _) = &**f {
+                match n.as_str() {
+                    "session" | "cookie" | "set_session" | "set_cookie" | "end_session" => visitor = true,
+                    // `respond(status, body, { "cache-control": ... })`, on its line.
+                    "respond" => {
+                        if let Some(Expr::Map(m)) = args.get(2) {
+                            if m.iter().any(|(k, v)| k.eq_ignore_ascii_case("cache-control") && matches!(v, Expr::Lit(Lit::Str(s)) if crate::server::kept_by_visitor_alone(s).is_some())) {
+                                at.get_or_insert(*line);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    });
+    at.filter(|_| visitor)
+}
+
+/// The fields a route's pattern checks against values written there (`service: "a" | "b"`, a
+/// webhook's `kind: "push"`), which bind no name: each name, and where it is
+/// (FEEDBACK58.md, Q-874; branch cache-and-migrate).
+fn literal_fields(p: &Pattern, place: &str, out: &mut Vec<(String, String)>) {
+    let Pattern::Record(fields) = p else { return };
+    for f in fields {
+        let at = if place.is_empty() { f.path.join(".") } else { format!("{}.{}", place, f.path.join(".")) };
+        match &f.pat {
+            Pattern::Record(_) => literal_fields(&f.pat, &at, out),
+            Pattern::Lit(_) => out.extend(f.path.last().map(|n| (n.clone(), at))),
+            Pattern::Alt(ps) if ps.iter().all(|q| matches!(q, Pattern::Lit(_))) => out.extend(f.path.last().map(|n| (n.clone(), at))),
+            _ => {}
+        }
+    }
+}
+
 /// Whether a server fn checks who calls it: it reads `request` or `session`, there or in a
 /// function of the program it calls (`me()`, `signed_in(request)`), as far as they go.
 fn guards_itself(fns: &HashMap<String, Arc<FnDef>>, body: &Expr, seen: &mut HashSet<String>) -> bool {
@@ -899,7 +945,9 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("db.error_kind", "any", "str | null"),
     ("db.sql_name", "str | list", "str"),
     ("idempotent", "map | fn, fn=", "any"),
-    ("db.migrate", "str=", "list | error(str)"),
+    // A failed migration stops what runs it, as it must at start (Q-602): no error value to
+    // handle, which `list | error(str)` promised (FEEDBACK62.md, Q-923; branch cache-and-migrate).
+    ("db.migrate", "str=", "list"),
     ("db.tenants", "", "list | error(str)"),
     ("db.tenant_exists", "str", "bool"),
     ("http.get", "str, map | null=, map | null=", "map | error(str)"),
@@ -1946,6 +1994,9 @@ struct Checker {
     plain_dollars: HashSet<(String, String, String)>,
     /// The functions being read in their own `let`.
     letting: Vec<String>,
+    /// The route's fields checked against values written in its pattern, which bind no name:
+    /// each name, and where it is (FEEDBACK58.md, Q-874; branch cache-and-migrate).
+    set_fields: Vec<(String, String)>,
     /// A component's `let`s whose value comes from the page (`js(...)`), by component: shown in
     /// markup, they make the browser remake the component (FEEDBACK35.md, Q-431; branch
     /// feedback27-35-fixes).
@@ -2202,6 +2253,7 @@ impl Checker {
             hint: None,
             strict_null: false,
             letting: Vec::new(),
+            set_fields: Vec::new(),
             plain_dollars: HashSet::new(),
             text_params: Vec::new(),
             text_params_depth: 0,
@@ -4104,7 +4156,13 @@ impl Checker {
                         } else if let Some(msg) = self.gone_name(name) {
                             self.error(msg);
                         } else {
-                            let hint = if !removed.is_empty() { removed } else { self.lookalike(name).unwrap_or_else(|| self.suggest(name)) };
+                            // A field the route's pattern checks against a set written out there
+                            // binds nothing, and says so (FEEDBACK58.md, Q-874; branch
+                            // cache-and-migrate).
+                            let set = self.set_fields.iter().find(|(n, _)| n == name).map(|(_, at)| {
+                                format!(": the route's pattern checks `{}` against the values written there, which binds no name. Give the set a name (`type Choice = \"a\" | \"b\"`) and write `{}: Choice` there to have `{}`, or read `request.{}`", at, name, name, at)
+                            });
+                            let hint = if let Some(set) = set { set } else if !removed.is_empty() { removed } else { self.lookalike(name).unwrap_or_else(|| self.suggest(name)) };
                             let msg = format!("unknown name `{}`{}", name, hint);
                             if self.fns.is_empty() || self.quiet > 0 {
                                 self.error(msg);
@@ -4544,6 +4602,12 @@ impl Checker {
     }
 
     fn route(&mut self, r: &Arc<RouteDef>) {
+        // A route that reads who the visitor is and marks its answer for every cache: sent as
+        // `private`, said where it is written (FEEDBACK59.md, Q-903; branch cache-and-migrate).
+        if let Some(line) = public_after_visitor(r) {
+            self.line = line;
+            self.warn("this route reads who the visitor is (the session, a cookie, a header) and its `cache-control` lets a shared cache keep the answer: Quillo sends it as `private`, as a cache in front would give it to the next visitor, and the time stays for the visitor's own browser. Write `private` in it to say so");
+        }
         self.line = r.line;
         // `? { page: itn }` binds `itn` and tests nothing; `{ json: Usr }` never matches
         // (FEEDBACK45.md, Q-504; branch feedback40-43).
@@ -4607,7 +4671,16 @@ impl Checker {
             Seg::Param(n, Some(t), _) if &**t == "str" => Some(n.clone()),
             _ => None,
         }).collect();
+        let mut set_fields = Vec::new();
+        if let Some(q) = &r.query {
+            literal_fields(q, "query", &mut set_fields);
+        }
+        if let Some(b) = &r.body_pat {
+            literal_fields(b, "", &mut set_fields);
+        }
+        self.set_fields = set_fields;
         self.expr(&r.body);
+        self.set_fields.clear();
         // A function in the answer, where it is written: JSON has none, and the answer is an
         // internal error (FEEDBACK55.md, Q-792; found in review: it went out as "<fn f>" before).
         let mut found = None;

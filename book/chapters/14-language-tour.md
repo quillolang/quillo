@@ -300,7 +300,15 @@ match v {
   `is_admin` to the profile it saves.
 - In a pattern, a record matches what `User(v)` would make, and binds that: in a route,
   `{ json: User }` takes the body as a User, and `{ form: Signup }` a form, its text
-  converted to the numbers and booleans the record asks for, as query values are.
+  converted to the numbers and booleans the record asks for, as query values are. A
+  field limited to a set of strings takes the form's or the query's text as it is: with
+  `type Service = "oil_change" | "tire_rotation"`, `? { service: Service }` and a
+  record's `service: Service` take `tire_rotation` from a `<select>`, and refuse
+  anything else with `` `form.service` is text, not a Service ``, the value sent left
+  out. A set written out in the pattern, `{ form: { service: "oil_change" | "tire_rotation" } }`,
+  checks the field and binds no name, as a literal in a pattern does. `quillo check`
+  says so where `service` is used: name the set as a type to have the name, or read
+  `request.form.service`.
 - `quillo check` holds code to the fields: `u.nmae` (did you mean `name`?), a field
   `User` does not have in `User({ ... })`, a missing field or one of the wrong type,
   and a default that is not of its field's type.

@@ -325,7 +325,8 @@ impl Interp {
             return Some(l.clone());
         }
         let i18n = self.site.i18n.clone()?;
-        let in_request = self.request_value().is_some();
+        // Not a call's on stdio, which has no browser to choose by (FEEDBACK63.md, Q-927).
+        let in_request = !self.stdio_request && self.request_value().is_some();
         let mut found = None;
         if in_request {
             if let Some(rule) = self.site.locale_rule.clone() {

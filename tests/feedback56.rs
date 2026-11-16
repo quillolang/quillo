@@ -8377,8 +8377,10 @@ fn f_calls(port: u16, doors: Vec<EDoor>, apart: bool) {
         let stdio = matches!(door, EDoor::Stdio(_));
         let who = f_structured(&door.result("billing.whoami", json!({}), true, None, None));
         if stdio {
-            // On stdio no one is signed in, and no client is said in a request.
-            assert_eq!(who, json!({ "user": null, "tenant": null, "mcp": null, "apart": false }));
+            // On stdio no one is signed in; the client is the one the call says, as a call on
+            // stdio has a `request` now (FEEDBACK63.md, Q-927; branch cache-and-migrate: it was
+            // null, the gap Q-927 closes).
+            assert_eq!(who, json!({ "user": null, "tenant": null, "mcp": { "client": "quillo-test", "version": "1.0.0" }, "apart": false }));
         } else {
             assert_eq!((who["user"].clone(), who["tenant"].clone(), who["apart"].clone()), (json!("bob"), Value::Null, json!(apart)), "{}", who);
             assert_eq!(who["mcp"]["client"], json!("quillo-test"), "{}", who);

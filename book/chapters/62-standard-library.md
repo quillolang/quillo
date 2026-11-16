@@ -102,7 +102,16 @@
   `{ host, port, url, base }`: the port it got when started with [`--port 0`](#options-of-quillo-run)
   (`quillo run main.qwe --port 0`), and a `url` reachable from this
   machine (`0.0.0.0` is written `127.0.0.1`), so a program that reads its own pages need not be
-  told its address again. It is null in a script and while the program loads.
+  told its address again. It is null in a script and while the program loads. `dev` is true
+  under [`--watch`](#options-of-quillo-run) alone, from the program's first line, so a route or
+  a tool meant for development can refuse to run anywhere else:
+
+  ```quillo
+  route GET /dev/tables {
+      if !platform().dev { reply 404 "" }
+      db.query("select name from sqlite_master")
+  }
+  ```
 
 A builtin given more arguments than it takes stops and says what it takes: `` `split`
 takes 2 arguments, got 3: split(s, sep) `` (and for `sort` given a comparator, to use
@@ -1198,7 +1207,8 @@ start together take turns (an advisory lock on Postgres, an immediate transactio
 SQLite), so each file still runs once. Only files ending `.sql` directly in the folder
 count (no subfolders); they sort by name as text, so `10_x.sql` comes before `2_x.sql`:
 pad the numbers. The name is the key: a renamed file runs again. A file holds no
-`begin` or `commit` of its own. The folder must exist: a missing one is an error that
+`begin` or `commit` of its own. In a route, a file that fails stops the request with a 500:
+`db.migrate` gives the names it applied, never an error value to handle. The folder must exist: a missing one is an error that
 says why it may be gone from a clone (`there is no such folder (git keeps no empty
 folder: put the first migration in it, or a .gitkeep, which is not read)`). The table is `_quillo_migrations
 (name, sha256, applied_at)`. Call it right after `db.open`:
@@ -1208,8 +1218,35 @@ db.open(env("DATABASE_URL"))
 db.migrate()
 ```
 
+A table that SQLite cannot change in place (a column's type, a `not null` added) is
+rebuilt as SQLite's own page says: a new table, the rows copied, the old one dropped, the
+new one renamed. When other tables point at it, write `pragma foreign_keys = off` in that
+file. SQLite takes the pragma only outside a transaction, so Quillo turns foreign keys off
+before the file's own, runs `pragma foreign_key_check` before its commit, and turns them on
+again after. A row the file leaves pointing at nothing rolls the whole file back, and the
+error names it (`leaves books row 3 pointing at no row of authors`). Rows that pointed at
+nothing before the file ran (written with foreign keys off, in the `sqlite3` shell say) are
+not the file's doing: they are left as they are, and a warning names them. Without the pragma, foreign keys are
+on, and dropping a table that others point at with `on delete cascade` or `set null` runs
+that action on each of their rows. A warning says so before the file runs:
+
+```sql
+-- 002_authors_name.sql
+pragma foreign_keys = off;
+create table authors_new (id integer primary key, name varchar(80) not null default '');
+insert into authors_new (id, name) select id, coalesce(name, '') from authors;
+drop table authors;
+alter table authors_new rename to authors;
+```
+
+Under [`--watch`](#options-of-quillo-run), the folders `db.migrate` reads (each database's)
+are watched as the program's files are. A migration that arrives (from a `git pull`) is
+applied by the reload that follows, which otherwise waited for a `.qwe` file to change, and a
+file that stopped the start is tried again once it is fixed. This does not happen under
+`--reload`, where a deploy decides, nor for a folder that is the program's own.
+
 **SQLite** runs inside the server process, with foreign keys on and WAL mode, and waits
-up to 5 s for a lock before a write is `"conflict"`. It is SQLite 3.46 with JSON, FTS5
+up to 5 s for a lock before a write is `"conflict"`. It is SQLite 3.54 with JSON, FTS5
 full-text search and R*Tree, and without math functions (`sin`, `acos`, `radians`):
 compute those in Quillo. Values: a column declared `bool` or `boolean` gives `true` and
 `false`, other 0s and 1s are ints; `decimal(...)` and friends give decimals (see

@@ -51,7 +51,7 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | `--port N`, `--host H` | where to listen (default `$PORT` or 8080, on 127.0.0.1). Give `--port` when 8080 is taken or a host names the port; `--port 0` takes any free one (`platform().server.port` says which). Give `--host 0.0.0.0` to be reached from other machines without a proxy in front; `--host localhost` is 127.0.0.1 |
 | `--listen unix:PATH` *(since 0.7)* | listen on a Unix socket instead of a TCP port, when a web server on the same machine passes requests on (on a shared server, so the neighbours cannot reach the port): made with mode 0600, removed when the server stops, and at most 100 bytes long (a short path relative to the folder `quillo` runs in). A `$PORT` that holds an absolute path (`/home/u/app.sock`, or `unix:/home/u/app.sock`) is taken the same way. Not with `--split`, `--instances`, `--register` or `--join` (see [Quillo on a shared server](#quillo-on-a-shared-server-cpanel)) |
 | `--socket-mode 660` *(since 0.7)* | with `--listen`: the socket's permissions, in octal, when the web server reaches it through the owner's group; the owner must keep read and write (`600`, the default) |
-| `--watch`, `-w` | while you work on the program: reload when it or a `use`d file changes (a symbolic link pointed elsewhere, to a file or a folder, counts, within a second), show errors on the page, and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's). Started, or reloaded, while a file is broken or missing, it watches every file that load read or tried and the folders of those not there, so fixing or making one loads the program; each error is said once. A save that does not load while one that did is served is said over the open pages, which keep what they hold, until a save loads. A page whose HTML and code a change left alone (an edit to a route it never calls) is not refreshed, a component whose code changed is swapped into the open pages in place, keeping its states, and a page's own HTML is put in place without a reload (see [What a save keeps](#what-a-save-keeps)); `--watch=reload` refreshes every page at every change, and so does a page with `<html data-reload>`. The server's own data, a top-level `let` the program changes, is kept across a save too. With no `QUILLO_SECRET`, sessions are signed with a key kept in `.quillo/.quillo-secret`, so a restart does not sign you out. Not in production |
+| `--watch`, `-w` | while you work on the program: reload when it or a `use`d file changes (a symbolic link pointed elsewhere, to a file or a folder, counts, within a second), show errors on the page, and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's). Started, or reloaded, while a file is broken or missing, it watches every file that load read or tried and the folders of those not there, so fixing or making one loads the program; each error is said once. A save that does not load while one that did is served is said over the open pages, which keep what they hold, until a save loads. A page whose HTML and code a change left alone (an edit to a route it never calls) is not refreshed, a component whose code changed is swapped into the open pages in place, keeping its states, and a page's own HTML is put in place without a reload (see [What a save keeps](#what-a-save-keeps)); `--watch=reload` refreshes every page at every change, and so does a page with `<html data-reload>`. The server's own data, a top-level `let` the program changes, is kept across a save too. With no `QUILLO_SECRET`, sessions are signed with a key kept in `.quillo/.quillo-secret`, so a restart does not sign you out. The folders `db.migrate` reads are watched too, so a migration that arrives is applied, and one that stopped the start is tried again once fixed. With `--host` on an address beyond this machine (`0.0.0.0`, to try the program from a phone) it says so at start, as anyone on the network can then reach the program and see its errors in full. Not in production |
 | `--reload` | in production, for a program whose files change while it runs (a deploy that copies new files, a plugin editor): reload when files change, with no errors shown on pages and no page refreshes; with `--instances`, each instance loads the change, the first checking it, so one that does not check reaches none; `--split` passes it to its services |
 | `--env-file F` | when the settings are not in the `.env` beside the program: a file kept outside the site's folder, or one file per place (`--env-file prod.env`); a path from the folder `quillo` runs in, which must exist |
 | `--policy FILE` *(since 0.7)* | before a deploy, or on a server you share: narrow what the program may do, after `/etc/quillo/policy.toml` and before the `quillo.policy` beside it; may be given more than once (see [The policy](#the-policy)) |
@@ -665,7 +665,15 @@ match v {
   `is_admin` to the profile it saves.
 - In a pattern, a record matches what `User(v)` would make, and binds that: in a route,
   `{ json: User }` takes the body as a User, and `{ form: Signup }` a form, its text
-  converted to the numbers and booleans the record asks for, as query values are.
+  converted to the numbers and booleans the record asks for, as query values are. A
+  field limited to a set of strings takes the form's or the query's text as it is: with
+  `type Service = "oil_change" | "tire_rotation"`, `? { service: Service }` and a
+  record's `service: Service` take `tire_rotation` from a `<select>`, and refuse
+  anything else with `` `form.service` is text, not a Service ``, the value sent left
+  out. A set written out in the pattern, `{ form: { service: "oil_change" | "tire_rotation" } }`,
+  checks the field and binds no name, as a literal in a pattern does. `quillo check`
+  says so where `service` is used: name the set as a type to have the name, or read
+  `request.form.service`.
 - `quillo check` holds code to the fields: `u.nmae` (did you mean `name`?), a field
   `User` does not have in `User({ ... })`, a missing field or one of the wrong type,
   and a default that is not of its field's type.
@@ -3035,7 +3043,10 @@ was made in, as they were then (a session is a signed cookie, kept nowhere else)
 what can change, a role, in the database on each call. Cookies a tool sets go back to a
 cookie caller and are dropped for a token's. `request.mcp` is `{ client, version }` from
 what the client says of itself, and null on any other request; it is read where `request` is,
-in a `server fn mcp` (a plain `fn mcp` has no `request`). Each user may make 60 tool
+in a `server fn mcp` (a plain `fn mcp` has no `request`). Under `quillo mcp` too: there
+`request` holds `mcp` and the method, with no headers, cookies, query or body, so that a
+stage written for HTTP (`request | auth.required | (_) => ...`) finds no header there and
+answers as it would to a call without one, and the client gets that answer. Each user may make 60 tool
 calls a minute, the cookie and their tokens together, per tenant (a caller with no `user`:
 per session or token) ([`--max-tool-calls`](#options-of-quillo-run), and a policy's
 `[limits] max_tool_calls` can lower it); one more is a `429` with `Retry-After`. Under
@@ -4359,9 +4370,35 @@ fn touch() {
   `x-request-id` and `x-content-type-options: nosniff`. Every HTML page carries
   `x-frame-options: SAMEORIGIN`, unless the route sets one or a
   `content-security-policy` with `frame-ancestors`. A page made from who the visitor is
-  (it called `session()` or `cookie()`, or set a cookie) carries `cache-control:
-  private` and `vary: cookie`, unless the route set its own `cache-control`, so a shared
-  cache never gives one visitor's page to another.
+  (it called `session()` or `cookie()`, set a cookie, or read a header of the request or its
+  `ip`) carries `cache-control: private` and `vary: cookie`, so a shared cache never gives
+  one visitor's page to another. That holds whatever time the route gave. A `cache-control`
+  that lets a shared cache keep the answer (`public`, `s-maxage`, a `max-age` without
+  `private`), whether from `respond`, from `file`'s `cache` or from a `site_headers` rule, is
+  sent as `private` with its time kept for the visitor's own browser, so a cache in front
+  that ignores `vary` (Cloudflare keeps a `.pdf` or a `.png` with no rule) cannot hand Ana's
+  file to the next visitor. A `cache-control: null` takes the header away, Quillo's `private`
+  included, as `null` does for any header: such a cache may fill that silence. The fields a
+  CDN reads before `Cache-Control`
+  (`CDN-Cache-Control`, `Cloudflare-CDN-Cache-Control`, `Surrogate-Control`, nginx's
+  `X-Accel-Expires`) are left out of such an answer. The log says so once for each path, and
+  `quillo check` warns where a route writes such a `cache-control` itself. A route that
+  reads no one keeps its `public`.
+- A `content-security-policy` needs nothing added for Quillo's own scripts. Where the
+  policy refuses inline scripts (the guide's own `default-src 'self'` below does), each one
+  Quillo wrote into the page is named by its hash in `script-src`, which is made from
+  `default-src` when the policy has none. That covers the components' loader, the links'
+  prefetch, the page's state, a waiting component's part and the development script. Where it
+  refuses a `style` attribute, the islands' `display:contents` moves into a `<style>` in the
+  head, hashed in `style-src`. A hash, not a nonce, so that a page kept by a cache stays
+  valid. A policy that already lets inline code run (`'unsafe-inline'` with no nonce or hash)
+  is left as it is, as a hash would turn that off. Under such a policy a page's links are
+  prefetched with `fetch`, as in Firefox and Safari: Chrome's speculation rules, written for
+  each link as the pointer comes, pass no policy that names a hash. The program's own inline
+  scripts are not added: give them your own nonce
+  or hash, or put them in a file the page loads. Only a policy in the answer's headers is
+  read: one in the page's own `<meta http-equiv>` is the program's to keep up to date, so
+  set it with `site_headers` instead.
 - `site_headers(map)` *(since 0.7)* at the top level adds headers to every answer that does not set
   them itself, and `site_headers("/admin", map)` to those under a path; a longer path's
   rule wins over a shorter one's. A `null` value takes away one Quillo sends. Names are
@@ -6323,7 +6360,16 @@ stays the simpler choice when the next move depends on the answer.
   `{ host, port, url, base }`: the port it got when started with [`--port 0`](#options-of-quillo-run)
   (`quillo run main.qwe --port 0`), and a `url` reachable from this
   machine (`0.0.0.0` is written `127.0.0.1`), so a program that reads its own pages need not be
-  told its address again. It is null in a script and while the program loads.
+  told its address again. It is null in a script and while the program loads. `dev` is true
+  under [`--watch`](#options-of-quillo-run) alone, from the program's first line, so a route or
+  a tool meant for development can refuse to run anywhere else:
+
+  ```quillo
+  route GET /dev/tables {
+      if !platform().dev { reply 404 "" }
+      db.query("select name from sqlite_master")
+  }
+  ```
 
 A builtin given more arguments than it takes stops and says what it takes: `` `split`
 takes 2 arguments, got 3: split(s, sep) `` (and for `sort` given a comparator, to use
@@ -7419,7 +7465,8 @@ start together take turns (an advisory lock on Postgres, an immediate transactio
 SQLite), so each file still runs once. Only files ending `.sql` directly in the folder
 count (no subfolders); they sort by name as text, so `10_x.sql` comes before `2_x.sql`:
 pad the numbers. The name is the key: a renamed file runs again. A file holds no
-`begin` or `commit` of its own. The folder must exist: a missing one is an error that
+`begin` or `commit` of its own. In a route, a file that fails stops the request with a 500:
+`db.migrate` gives the names it applied, never an error value to handle. The folder must exist: a missing one is an error that
 says why it may be gone from a clone (`there is no such folder (git keeps no empty
 folder: put the first migration in it, or a .gitkeep, which is not read)`). The table is `_quillo_migrations
 (name, sha256, applied_at)`. Call it right after `db.open`:
@@ -7429,8 +7476,35 @@ db.open(env("DATABASE_URL"))
 db.migrate()
 ```
 
+A table that SQLite cannot change in place (a column's type, a `not null` added) is
+rebuilt as SQLite's own page says: a new table, the rows copied, the old one dropped, the
+new one renamed. When other tables point at it, write `pragma foreign_keys = off` in that
+file. SQLite takes the pragma only outside a transaction, so Quillo turns foreign keys off
+before the file's own, runs `pragma foreign_key_check` before its commit, and turns them on
+again after. A row the file leaves pointing at nothing rolls the whole file back, and the
+error names it (`leaves books row 3 pointing at no row of authors`). Rows that pointed at
+nothing before the file ran (written with foreign keys off, in the `sqlite3` shell say) are
+not the file's doing: they are left as they are, and a warning names them. Without the pragma, foreign keys are
+on, and dropping a table that others point at with `on delete cascade` or `set null` runs
+that action on each of their rows. A warning says so before the file runs:
+
+```sql
+-- 002_authors_name.sql
+pragma foreign_keys = off;
+create table authors_new (id integer primary key, name varchar(80) not null default '');
+insert into authors_new (id, name) select id, coalesce(name, '') from authors;
+drop table authors;
+alter table authors_new rename to authors;
+```
+
+Under [`--watch`](#options-of-quillo-run), the folders `db.migrate` reads (each database's)
+are watched as the program's files are. A migration that arrives (from a `git pull`) is
+applied by the reload that follows, which otherwise waited for a `.qwe` file to change, and a
+file that stopped the start is tried again once it is fixed. This does not happen under
+`--reload`, where a deploy decides, nor for a folder that is the program's own.
+
 **SQLite** runs inside the server process, with foreign keys on and WAL mode, and waits
-up to 5 s for a lock before a write is `"conflict"`. It is SQLite 3.46 with JSON, FTS5
+up to 5 s for a lock before a write is `"conflict"`. It is SQLite 3.54 with JSON, FTS5
 full-text search and R*Tree, and without math functions (`sin`, `acos`, `radians`):
 compute those in Quillo. Values: a column declared `bool` or `boolean` gives `true` and
 `false`, other 0s and 1s are ints; `decimal(...)` and friends give decimals (see

@@ -14,6 +14,38 @@
   `<video>`'s time; they went with the swap (FEEDBACK54.md, A.4).
 - Under `--watch`, `r` and Enter typed where the server runs loads the program again with its data
   started again, nothing carried, without a restart (FEEDBACK54.md, Part C).
+- A SQLite migration that rebuilds a table others point at, with `pragma foreign_keys = off` as
+  SQLite's own steps write it, keeps their rows: the pragma did nothing inside the file's
+  transaction, so dropping the old table ran the children's `on delete` actions, deleting or
+  blanking their rows while `db.migrate` said it worked. Foreign keys are now off for that
+  file, checked before it commits (a row left pointing at nothing rolls it back), and on
+  again after. A file without the pragma that drops such a table gets a warning
+  (FEEDBACK62.md, Q-915).
+- An answer made from who the visitor is stays `private`, whatever its route said: `public`
+  (or `s-maxage`, a bare `max-age`) from `respond`, `file`'s `cache` or a `site_headers` rule is
+  sent as `private`, its time kept for the browser; the fields a CDN reads first (`CDN-Cache-Control`, `Surrogate-Control`, `X-Accel-Expires`) are
+  left out. A cache in front that ignores `Vary` gave one signed-in visitor's file to the next.
+  The log says so once for each path, and `quillo check` warns where a route writes it
+  (FEEDBACK59.md, Q-903, the user's choice).
+- A page under a `content-security-policy` that refuses inline code (the guide's own
+  `default-src 'self'`) runs its components. Quillo's own scripts are named by their hashes in
+  the policy, and the islands' `display:contents` is a hashed `<style>` rule; its links are
+  prefetched with `fetch`, as Chrome's speculation rules pass no policy that names a hash. The
+  page looked right while nothing on it worked, and nothing said why (FEEDBACK59.md, Q-904).
+- `platform().dev`: true under `--watch` alone (FEEDBACK62.md, Q-920). Under `--watch`, the
+  folders `db.migrate` reads are watched, so a migration that arrives is applied, and one that
+  stopped the first load is tried again once fixed (Q-919). Started
+  on an address beyond this machine, `--watch` says that anyone on the network can reach the
+  program (Q-918). `quillo check` takes `db.migrate` as giving a list, as a failure stops what
+  runs it (Q-923).
+- A field limited to a set of strings (`type Service = "oil_change" | "tire_rotation"`) takes its
+  values from a form and a query, as from JSON: it refused every one with `the request does not
+  match its pattern`. A miss names the field and the type. A set written out in the pattern
+  binds no name, and `quillo check` now says so where the name is used (FEEDBACK58.md, Q-874).
+- A `server fn mcp` that reads `request` (`request.mcp`, a stage `request | auth.required |
+  ...`) works under `quillo mcp`. It passed `quillo check` and worked over HTTP, and every call
+  over stdio failed with `internal error` (FEEDBACK63.md, Q-927).
+- The guide names SQLite 3.54, which Quillo has had since 0.8.1.
 
 ## 0.8.5 (2026-11-16)
 

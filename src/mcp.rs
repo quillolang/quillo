@@ -530,6 +530,20 @@ impl Door {
     /// response, which are never answered.
     pub fn answer(&self, it: &mut Interp, text: &[u8]) -> Option<J> {
         match message_of(text, "one message a line") {
+            // On stdio a call has a `request` too, as the guide's `request.mcp` and a `server fn`'s
+            // middleware (`request | auth.required | ...`) read one: who the client says it is, and
+            // no headers, cookies or query, so that a stage looking for a header finds none and
+            // answers as the program chose. Without it, every call to such a tool failed with
+            // `unknown name request`, where over HTTP it worked (FEEDBACK63.md, Q-927; branch
+            // cache-and-migrate).
+            Ok(msg) if !self.over_http && it.current_request.is_none() => {
+                it.current_request = Some(stdio_request(&msg));
+                it.stdio_request = true;
+                let a = self.answer_message(it, &msg);
+                it.stdio_request = false;
+                it.current_request = None;
+                a
+            }
             Ok(msg) => self.answer_message(it, &msg),
             Err(refused) => Some(refused),
         }
@@ -2374,6 +2388,27 @@ pub fn serve_stdio(door: &Door, it: &mut Interp, input: &mut dyn std::io::BufRea
 const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
 const CLIENT_KEY: &str = "io.modelcontextprotocol/clientInfo";
 
+/// `request.mcp`: who the client says it is, from a message's `_meta`. Self-reported
+/// (basic/index: for display and logs, not for security).
+fn client_said(msg: &Map<String, J>) -> Value {
+    let meta = msg.get("params").and_then(J::as_object).and_then(|p| p.get("_meta")).and_then(J::as_object);
+    let info = meta.and_then(|m| m.get(CLIENT_KEY)).and_then(J::as_object);
+    let said = |k: &str| info.and_then(|i| i.get(k)).and_then(J::as_str).map_or(Value::Nil, Value::str);
+    let mut client = crate::value::Map::new();
+    client.insert("client".into(), said("name"));
+    client.insert("version".into(), said("version"));
+    Value::map(client)
+}
+
+/// The `request` a call on stdio runs in: the map a request over HTTP gives, with no headers,
+/// cookies, query or body, and `mcp` (FEEDBACK63.md, Q-927; branch cache-and-migrate).
+fn stdio_request(msg: &Map<String, J>) -> Value {
+    let none = crate::server::HttpRequest { method: "POST".into(), url: "/_quillo/mcp".into(), headers: Vec::new(), body: Vec::new(), remote: String::new() };
+    let mut m = crate::server::build_request(&none, "/_quillo/mcp", &Value::map(crate::value::Map::new()));
+    m.insert("mcp".into(), client_said(msg));
+    Value::map(m)
+}
+
 /// MCP's code for headers that do not match the body, or are missing (streamable-http, Server
 /// Validation).
 pub const HEADER_MISMATCH: i64 = -32020;
@@ -2480,15 +2515,9 @@ fn answer_http(it: &mut Interp, door: &Door, req: &crate::server::HttpRequest) -
         }
     }
     // `request.mcp`: who the client says it is, so that a program can say what an assistant
-    // wrote. Self-reported (basic/index: for display and logs, not for security).
-    let meta = msg.get("params").and_then(J::as_object).and_then(|p| p.get("_meta")).and_then(J::as_object);
-    let info = meta.and_then(|m| m.get(CLIENT_KEY)).and_then(J::as_object);
-    let said = |k: &str| info.and_then(|i| i.get(k)).and_then(J::as_str).map_or(Value::Nil, Value::str);
-    let mut client = crate::value::Map::new();
-    client.insert("client".into(), said("name"));
-    client.insert("version".into(), said("version"));
+    // wrote.
     if let Some(Value::Map(m)) = &mut it.current_request {
-        Arc::make_mut(m).insert("mcp".into(), Value::map(client));
+        Arc::make_mut(m).insert("mcp".into(), client_said(&msg));
     }
     let answer = door.answer_as(it, &msg, &caller.key);
     if caller.token {

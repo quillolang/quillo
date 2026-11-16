@@ -1237,6 +1237,8 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
 fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     // Components in files of their own, for the browser's debugger.
     quillo::client::DEV.store(o.watch || quillo::debug::on(), std::sync::atomic::Ordering::Relaxed);
+    // `platform().dev` (FEEDBACK62.md, Q-920; branch cache-and-migrate).
+    quillo::platform::DEV.store(o.watch, std::sync::atomic::Ordering::Relaxed);
     let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     // Signed service calls name the service they are for (see `service::answer`).
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
