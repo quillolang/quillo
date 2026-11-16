@@ -323,7 +323,7 @@ as can be *(since 0.8.5: every save reloaded every page, and the server's data s
   its elements held that no state does is put back where the same kind of element is in the same
   place: the focus and its selection, the scroll of a box and of the page, what was typed in a
   field nothing follows, a box ticked, an open `<details>` or `<dialog>`, an `<audio>` or
-  `<video>`'s time. Its effects, `@mount` and timers run
+  `<video>`'s time *(since 0.8.6: they went with the swap)*. Its effects, `@mount` and timers run
   again, as its code is new.
 - **The page's own HTML changed**, outside its components (a heading, a class, the title, a
   node added at the end of an element): the page takes the new HTML in place, its components as
@@ -339,7 +339,7 @@ as can be *(since 0.8.5: every save reloaded every page, and the server's data s
   the edit. A `:memory:` database starts again empty. The reload's line says what was kept:
   `quillo: reloaded main.qwe (3 routes); kept notes, count; started again: cart (its type changed:
   list to map)`. To start the data again without a restart, type `r` and Enter where the server
-  runs: the program loads again with nothing carried (`; its data started again (r)`). That is
+  runs *(since 0.8.6)*: the program loads again with nothing carried (`; its data started again (r)`). That is
   read only when the server's input is a terminal, and the start line says so.
 - A save that does not load is said over the page, which keeps showing the version before it.
 

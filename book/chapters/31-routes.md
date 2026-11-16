@@ -772,7 +772,8 @@ fn touch() {
   `content-security-policy` with `frame-ancestors`. A page made from who the visitor is
   (it called `session()` or `cookie()`, set a cookie, or read a header of the request or its
   `ip`) carries `cache-control: private` and `vary: cookie`, so a shared cache never gives
-  one visitor's page to another. That holds whatever time the route gave. A `cache-control`
+  one visitor's page to another. That holds whatever time the route gave *(since 0.8.6: the
+  route's own `cache-control` went as it was, `public` included)*. A `cache-control`
   that does not say `private` or `no-store` (`public`, `s-maxage`, a `max-age` alone, or one
   with no time, which a shared cache may keep by `Expires` or its own reckoning), whether from
   `respond`, from `file`'s `cache` or from a `site_headers` rule, is sent as `private` with its
@@ -786,7 +787,8 @@ fn touch() {
   answer. The log says so once for each path, and
   `quillo check` warns where a route writes such a `cache-control` itself. A route that
   reads no one keeps its `public`.
-- A `content-security-policy` needs nothing added for Quillo's own scripts. Where the
+- A `content-security-policy` needs nothing added for Quillo's own scripts *(since 0.8.6: one
+  that refused inline code stopped every component, and nothing said why)*. Where the
   policy refuses inline scripts (the guide's own `default-src 'self'` below does), each one
   Quillo wrote into the page is named by its hash in `script-src`, which is made from
   `default-src` when the policy has none. That covers the components' loader, the links'

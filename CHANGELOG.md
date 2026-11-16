@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.6 (unreleased)
 
 - The page `files()` sends for a miss (the folder's `404.html`, or its `not_found`) goes out as
   written, as the guide had it: it was given the prefetching script, and `--watch`'s, for having

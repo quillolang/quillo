@@ -1781,7 +1781,8 @@ was made in, as they were then (a session is a signed cookie, kept nowhere else)
 what can change, a role, in the database on each call. Cookies a tool sets go back to a
 cookie caller and are dropped for a token's. `request.mcp` is `{ client, version }` from
 what the client says of itself, and null on any other request; it is read where `request` is,
-in a `server fn mcp` (a plain `fn mcp` has no `request`). Under `quillo mcp` too: there
+in a `server fn mcp` (a plain `fn mcp` has no `request`). Under `quillo mcp` too *(since 0.8.6:
+there was no `request` there, and such a tool failed every call)*: there
 `request` holds `mcp` and the method, with no headers, cookies, query or body, so that a
 stage written for HTTP (`request | auth.required | (_) => ...`) finds no header there and
 answers as it would to a call without one, and the client gets that answer. Each user may make 60 tool

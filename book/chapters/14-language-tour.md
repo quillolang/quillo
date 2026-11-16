@@ -301,7 +301,8 @@ match v {
 - In a pattern, a record matches what `User(v)` would make, and binds that: in a route,
   `{ json: User }` takes the body as a User, and `{ form: Signup }` a form, its text
   converted to the numbers and booleans the record asks for, as query values are. A
-  field limited to a set of strings takes the form's or the query's text as it is: with
+  field limited to a set of strings takes the form's or the query's text as it is *(since
+  0.8.6: it refused every value from a form or a query)*: with
   `type Service = "oil_change" | "tire_rotation"`, `? { service: Service }` and a
   record's `service: Service` take `tire_rotation` from a `<select>`, and refuse
   anything else with `` `form.service` is text, not a Service ``, the value sent left

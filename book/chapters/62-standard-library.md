@@ -102,7 +102,7 @@
   `{ host, port, url, base }`: the port it got when started with [`--port 0`](#options-of-quillo-run)
   (`quillo run main.qwe --port 0`), and a `url` reachable from this
   machine (`0.0.0.0` is written `127.0.0.1`), so a program that reads its own pages need not be
-  told its address again. It is null in a script and while the program loads. `dev` is true
+  told its address again. It is null in a script and while the program loads. `dev` *(since 0.8.6)* is true
   under [`--watch`](#options-of-quillo-run) alone, from the program's first line, so a route or
   a tool meant for development can refuse to run anywhere else:
 
@@ -1208,7 +1208,8 @@ SQLite), so each file still runs once. Only files ending `.sql` directly in the 
 count (no subfolders); they sort by name as text, so `10_x.sql` comes before `2_x.sql`:
 pad the numbers. The name is the key: a renamed file runs again. A file holds no
 `begin` or `commit` of its own. A file with no statement yet (a new one an editor made empty)
-waits, with a warning, until it has one. In a route, a file that fails stops the request with a 500:
+waits, with a warning, until it has one *(since 0.8.6: it was recorded empty, and the SQL
+written in it later never ran)*. In a route, a file that fails stops the request with a 500:
 `db.migrate` gives the names it applied, never an error value to handle. The folder must exist: a missing one is an error that
 says why it may be gone from a clone (`there is no such folder (git keeps no empty
 folder: put the first migration in it, or a .gitkeep, which is not read)`). The table is `_quillo_migrations
@@ -1222,7 +1223,8 @@ db.migrate()
 A table that SQLite cannot change in place (a column's type, a `not null` added) is
 rebuilt as SQLite's own page says: a new table, the rows copied, the old one dropped, the
 new one renamed. When other tables point at it, write `pragma foreign_keys = off` in that
-file. SQLite takes the pragma only outside a transaction, so Quillo turns foreign keys off
+file *(since 0.8.6: the pragma did nothing, and the drop deleted or blanked their rows)*.
+SQLite takes the pragma only outside a transaction, so Quillo turns foreign keys off
 before the file's own, runs `pragma foreign_key_check` before its commit, and turns them on
 again after. A row the file leaves pointing at nothing rolls the whole file back, and the
 error names it (`leaves books row 3 pointing at no row of authors`). Rows that pointed at
@@ -1241,7 +1243,7 @@ alter table authors_new rename to authors;
 ```
 
 Under [`--watch`](#options-of-quillo-run), the folders `db.migrate` reads (each database's)
-are watched as the program's files are. A migration that arrives (from a `git pull`) is
+are watched as the program's files are *(since 0.8.6)*. A migration that arrives (from a `git pull`) is
 applied by the reload that follows, which otherwise waited for a `.qwe` file to change, and a
 file that stopped the start is tried again once it is fixed. This does not happen under
 `--reload`, where a deploy decides, nor for a folder that is the program's own.
