@@ -49,6 +49,10 @@ pub struct Site {
     /// `site_headers(...)`: headers for every answer under a path ("/" for all), a null value
     /// taking one of Quillo's own away (FEEDBACK31.md, Q-391; branch feedback27-35-fixes).
     pub headers: Vec<(String, Vec<(String, Option<String>)>)>,
+    /// An installable app's manifest, icons and head tags, read at load from the app.toml beside
+    /// the program's main file: none without one, which is all a request checks (FEEDBACK67.md,
+    /// B.1; branch pwa).
+    pub pwa: Option<std::sync::Arc<crate::pwa::Web>>,
 }
 
 impl Site {

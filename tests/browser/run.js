@@ -120,7 +120,15 @@ async function main() {
         const q = await send("Runtime.evaluate", { expression: "document.body && document.body.getAttribute('data-cdp')", returnByValue: true });
         const asked = q.result && q.result.result && q.result.result.value;
         if (asked) {
-          for (const [method, params] of JSON.parse(asked)) await send(method, params);
+          const answers = [];
+          for (const [method, params] of JSON.parse(asked)) {
+            const r = await send(method, params);
+            answers.push(r.result || { error: r.error });
+          }
+          // What they answered, for a page that asks for it with `data-cdp-out`: Chrome's own
+          // manifest and installability checks (FEEDBACK67.md, B.1; branch pwa).
+          const out = JSON.stringify(JSON.stringify(answers));
+          await send("Runtime.evaluate", { expression: `document.body.hasAttribute('data-cdp-out') && document.body.setAttribute('data-cdp-out', ${out})` });
           await send("Runtime.evaluate", { expression: "document.body.removeAttribute('data-cdp')" });
           continue;
         }

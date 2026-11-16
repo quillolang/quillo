@@ -15,9 +15,79 @@
 # (the file, or empty when there is none and the defaults are used).
 
 app_value() {
-    # `key = "value"` or `key = value`, a comment after it left out.
-    sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$APP_CONFIG" | head -1 |
-        sed -e 's/[[:space:]]*#.*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+    # The key's first line, `key = "value"`, `key = 'value'` or `key = value`, read as Quillo reads
+    # it (src/pwa.rs), so that the app and the installable site show one name: a `#` in quotes is
+    # no comment, TOML's escapes are read (\" \\ \n \t \uXXXX...), spaces and a CR at the end are
+    # left out, and so is a byte-order mark; a string never closed is what it holds. The sed it
+    # replaces gave `"Shop` for "Shop #1" and kept the quotes before a CR (FEEDBACK67.md, B.1,
+    # review; branch pwa). Bytes, so that an escape gives its character's UTF-8 in any awk.
+    LC_ALL=C awk -v key="$1" '
+        function hex(h,   i, c, n) {
+            n = 0
+            for (i = 1; i <= length(h); i++) {
+                c = index("0123456789abcdef", tolower(substr(h, i, 1)))
+                if (c == 0) return -1
+                n = n * 16 + c - 1
+            }
+            return n
+        }
+        function utf8(n) {
+            if (n < 128) return sprintf("%c", n)
+            if (n < 2048) return sprintf("%c%c", 192 + int(n / 64), 128 + n % 64)
+            if (n < 65536) return sprintf("%c%c%c", 224 + int(n / 4096), 128 + int(n / 64) % 64, 128 + n % 64)
+            return sprintf("%c%c%c%c", 240 + int(n / 262144), 128 + int(n / 4096) % 64, 128 + int(n / 64) % 64, 128 + n % 64)
+        }
+        function value(v,   q, s, i, n, c, len, cp) {
+            q = substr(v, 1, 1)
+            if (q == "\"") {
+                s = ""
+                n = length(v)
+                for (i = 2; i <= n; i++) {
+                    c = substr(v, i, 1)
+                    if (c == "\"") return s
+                    if (c != "\\") { s = s c; continue }
+                    c = substr(v, ++i, 1)
+                    if (c == "n") s = s "\n"
+                    else if (c == "t") s = s "\t"
+                    else if (c == "r") s = s "\r"
+                    else if (c == "b") s = s "\b"
+                    else if (c == "f") s = s "\f"
+                    else if (c == "u" || c == "U") {
+                        len = c == "u" ? 4 : 8
+                        cp = length(substr(v, i + 1, len)) == len ? hex(substr(v, i + 1, len)) : -1
+                        if (cp >= 0 && cp <= 1114111 && (cp < 55296 || cp > 57343)) { s = s utf8(cp); i += len }
+                        else s = s c
+                    }
+                    else s = s c
+                }
+                return s
+            }
+            if (q == "\047") {
+                v = substr(v, 2)
+                i = index(v, "\047")
+                return i ? substr(v, 1, i - 1) : v
+            }
+            sub(/#.*/, "", v)
+            sub(/[ \t]+$/, "", v)
+            return v
+        }
+        NR == 1 && substr($0, 1, 3) == "\357\273\277" { $0 = substr($0, 4) }
+        {
+            line = $0
+            sub(/^[ \t]+/, "", line)
+            sub(/[ \t\r]+$/, "", line)
+            n = length(key)
+            if (substr(line, 1, n) == key) rest = substr(line, n + 1)
+            else if (substr(line, 1, n + 2) == "\"" key "\"" || substr(line, 1, n + 2) == "\047" key "\047") rest = substr(line, n + 3)
+            else next
+            sub(/^[ \t]+/, "", rest)
+            if (substr(rest, 1, 1) != "=") next
+            rest = substr(rest, 2)
+            sub(/^[ \t]+/, "", rest)
+            printf "%s", value(rest)
+            exit
+        }
+    ' "$APP_CONFIG"
 }
 
 APP_CONFIG=""

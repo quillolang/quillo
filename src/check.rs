@@ -1828,6 +1828,10 @@ fn check_source_with(src: &str, file: &str, base_dir: &Path, overrides: HashMap<
         if let Some((line, message)) = crate::mcp::instructions_warning(file, src, &a) {
             a.diagnostics.push(Diagnostic { file: file.to_string(), line, severity: Severity::Warning, message });
         }
+        // The app.toml beside the program, when there is one: its mistakes before it runs, at
+        // their lines (FEEDBACK67.md, B.1; branch pwa).
+        let shown = Path::new(file).parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| crate::pwa::FILE.to_string(), |p| p.join(crate::pwa::FILE).display().to_string());
+        a.diagnostics.extend(crate::pwa::check(base_dir, &shown));
     }
     RECORDS.with(|r| *r.borrow_mut() = outer_records);
     DEPTH.with(|d| d.set(d.get() - 1));

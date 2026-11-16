@@ -33,7 +33,9 @@ pub fn install(m: &mut Map) {
 const MOST_SIDE: u32 = 12_000;
 const MOST_BYTES: u64 = 512 << 20;
 
-fn limits() -> Limits {
+/// The bounds of decoding: the app's icons are decoded within them too (FEEDBACK67.md, B.1;
+/// branch pwa).
+pub(crate) fn limits() -> Limits {
     let mut l = Limits::default();
     l.max_image_width = Some(MOST_SIDE);
     l.max_image_height = Some(MOST_SIDE);

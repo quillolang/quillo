@@ -1267,6 +1267,10 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     }) {
         Ok(tools) => {
             tried.clear();
+            // An installable app, when an app.toml is beside it (FEEDBACK67.md, B.1; branch pwa).
+            if !o.as_service {
+                quillo::pwa::attach(&mut interp, base);
+            }
             // Its MCP door, when it has tools (FEEDBACK56.md, C.2; branch feedback56).
             quillo::mcp::open_door(&mut interp, path, tools);
             Loaded::Ready(interp)

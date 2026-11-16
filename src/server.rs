@@ -182,6 +182,17 @@ fn match_path(def: &[Seg], segs: &[String]) -> Option<Vec<(String, Value)>> {
     }
 }
 
+/// Whether the program has a `GET` (or `ANY`) route at the very path `path`, no parameter in it:
+/// Quillo's answer for an app then stays out of its way. One that takes any path (`/*rest`,
+/// `/:page`) is tried first, and Quillo answers where it gives a 404 (FEEDBACK67.md, B.1, review;
+/// branch pwa).
+pub(crate) fn route_at(it: &Interp, path: &str) -> bool {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    it.routes.iter().any(|r| {
+        (r.method == "GET" || r.method == "ANY") && r.path.len() == segs.len() && r.path.iter().zip(&segs).all(|(s, p)| matches!(s, Seg::Lit(l) if l == p))
+    })
+}
+
 /// The media type of a content-type header, without its parameters:
 /// "Application/JSON; charset=utf-8" is "application/json".
 pub(crate) fn essence(ctype: &str) -> String {
@@ -452,6 +463,12 @@ impl Interp {
         let changed = (req.method != "GET" && req.method != "HEAD").then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         self.changed = changed.clone();
         let mut resp = Answering::begin(self, req).0.handle_inner(req);
+        // An app's, from its app.toml (src/pwa.rs): its manifest and Apple icon where a route that
+        // takes any path answered 404, and its tags in a page's head. One check here, all a
+        // program without one pays (FEEDBACK67.md, B.1 and its review; branch pwa).
+        if self.site.pwa.is_some() {
+            crate::pwa::after_route(self, req, path, &mut resp);
+        }
         // Before anything that can wait: another request on the thread would find it
         // (FEEDBACK55.md, Q-883; branch feedback55).
         let made = crate::stream::take_made();
@@ -896,6 +913,15 @@ impl Interp {
             // A `HEAD` is answered with the GET's headers, its length included; the body is left
             // out where the answer is written (FEEDBACK31.md, Q-393; branch feedback27-35-fixes).
             return resp;
+        }
+        // An app's manifest and Apple's icon, from its app.toml: where no route of the program's
+        // takes the path (see `pwa::attach`), so here, after them, where a request a route answers
+        // never comes; and before a guarded group's middleware, as a browser asks for them without
+        // its cookies and they hold nothing of anyone's (FEEDBACK67.md, B.1; branch pwa).
+        if self.site.pwa.is_some() {
+            if let Some(resp) = crate::pwa::answer(self, path, req) {
+                return resp;
+            }
         }
         // Under a guarded group, its middleware first: a stranger learns nothing of what is
         // there, its paths, methods and parameters, from the server's own answers (FEEDBACK47.md,
@@ -1395,6 +1421,10 @@ impl Interp {
                 headers: vec![("content-type".into(), "text/javascript; charset=utf-8".into()), ("cache-control".into(), cache.into())],
                 body: js.as_bytes().to_vec(),
             };
+        }
+        // An app's icons, named by what they are made of (FEEDBACK67.md, B.1; branch pwa).
+        if let Some(hash) = rest.strip_prefix("i/").and_then(|r| r.strip_suffix(".png")) {
+            return crate::pwa::icon_answer(self, hash);
         }
         // In development, the files a page's bundle loads (see `client::DEV`).
         if let Some((hash, file)) = rest.strip_prefix("src/").and_then(|r| r.split_once('/')) {
@@ -3333,6 +3363,10 @@ impl App {
                 if self.watch {
                     *self.replaced.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(slot.clone());
                 }
+                // What its app.toml says, as it is now (FEEDBACK67.md, B.1; branch pwa).
+                if !self.is_service {
+                    crate::pwa::attach(&mut it, &self.base_dir);
+                }
                 crate::mcp::open_door(&mut it, &self.main_file, tools);
                 let loaded = Arc::new(Loaded::Ready(it));
                 warm_client(&loaded);
@@ -3382,8 +3416,20 @@ impl App {
 
     fn watched_files(&self) -> Vec<PathBuf> {
         let mut files = vec![self.main_file.clone()];
+        // The app.toml beside it, there or not (making one is a change), and the icon it names
+        // (FEEDBACK67.md, B.1; branch pwa).
+        let mut app = vec![self.base_dir.join(crate::pwa::FILE)];
         if let Loaded::Ready(it) = &*self.current().1 {
             files.extend(it.files());
+            // Not one in a folder that is not there, which the system cannot watch: it fell back to
+            // looking every 50 ms (found in review). `quillo check` says the icon is missing.
+            let icon = it.site.pwa.as_ref().and_then(|w| w.icon_file()).filter(|f| f.parent().is_none_or(|d| d.as_os_str().is_empty() || d.is_dir()));
+            app.extend(icon.map(Path::to_path_buf));
+        }
+        for f in app {
+            if !files.contains(&f) {
+                files.push(f);
+            }
         }
         // Under --watch, the folders `db.migrate` read and their files: a migration a `git pull`
         // brings is applied by the reload, where the program ran on the old schema until a `.qwe`
@@ -3820,13 +3866,16 @@ fn dev_script(version: u64, print: &str) -> String {
     // put in place (A.3) (Quillo DevTools shows it). A page loaded after a
     // reload that kept what it held starts its code at once, to put it back (A.6).
     // A page a service worker answers from its cache reloaded for ever (--watch=reload), or asked
-    // for itself each second and stayed old, saying nothing: a fetch of itself older than the
-    // version told now reloads (why: "cache"). The version a reload is for is kept for the next
-    // load, which reads it once (sessionStorage, `quillo-reload:` and the page's path and query);
-    // a page that comes back older than it, with a worker controlling it, reloads no more for that
-    // version and says why, over the page and in the console ({ what: "cached" }) (FEEDBACK67.md,
-    // Q-957; branch pwa).
-    const SCRIPT: &str = r#"<script>/*quillo-dev*/(()=>{let v='@V@',h='@H@';const HOT=@HOT@;let c=0,e=0,box=null;const K='quillo-reload:'+location.pathname+location.search;let stale=0;try{const s=+sessionStorage.getItem(K);sessionStorage.removeItem(K);if(s>+v&&navigator.serviceWorker.controller)stale=s}catch(_){}const css=j=>{const p=JSON.parse(j);for(const l of document.querySelectorAll('link[rel=stylesheet]')){const u=new URL(l.href,location.href);if(u.origin===location.origin&&p.includes(u.pathname)){u.searchParams.set('quillo',Date.now());const n=l.cloneNode();n.href=u.pathname+u.search;n.onload=()=>l.remove();l.after(n)}}};const said=m=>{if(m===null){if(box){box.remove();box=null}return}if(!box){box=document.createElement('quillo-error');const r=box.attachShadow({mode:'open'});r.innerHTML='<style>:host{all:initial;position:fixed;left:0;right:0;bottom:0;z-index:2147483647;font:13px/1.45 ui-monospace,Menlo,monospace}div{position:relative;margin:8px;padding:12px 44px 12px 14px;background:#fff1f0;color:#5c0000;border:2px solid #c62828;border-radius:6px;max-height:45vh;overflow:auto;box-shadow:0 4px 18px #0005}pre{margin:8px 0 0;white-space:pre-wrap;font:inherit}button{position:absolute;top:8px;right:10px;border:0;background:none;font-size:20px;line-height:1;cursor:pointer;color:inherit}</style><div role="alert"><b>This save did not load: the page shows the version before it.</b><pre></pre><button aria-label="Close">×</button></div>';r.querySelector('button').onclick=()=>{box.remove();box=null};document.documentElement.appendChild(box)}box.shadowRoot.querySelector('pre').textContent=m};const plain=()=>{const w=window[Symbol.for('quillo')]||{};return !HOT||w.hot===false||document.documentElement.hasAttribute('data-reload')};const ids=t=>{const m=/\.ids = (\{.*?\});/.exec(t);return m?JSON.parse(m[1]):null};const tell=(what,why,ver)=>{try{document.dispatchEvent(new CustomEvent('quillo:hmr',{detail:JSON.stringify({what,why,version:ver})}))}catch(_){}};const again=(why,ver)=>{if(stale&&+ver<=stale){v=ver;const m="This page came from a service worker's cache (`navigator.serviceWorker.controller`), so `--watch` cannot refresh it: unregister the worker (DevTools > Application > Service workers), or have it go to the server first for pages";console.warn(m);said(m);return tell('cached',why,ver)}tell('reload',why,ver);if(why!=='off')try{const w=window[Symbol.for('quillo')];if(w&&w.keep)w.keep()}catch(_){}try{sessionStorage.setItem(K,ver)}catch(_){}location.reload()};let busy=null;const hot=t=>busy||(busy=(async()=>{if(plain())return again('off',t);try{const r=await fetch(location.href,{cache:'no-store',credentials:'same-origin',headers:{'x-quillo-hot':v}});const p=await r.text();const was=r.headers.get('x-quillo-was');const m=/\/\*quillo-dev\*\/\(\(\)=>\{let v='(\d+)',h='([0-9a-f]+)'/.exec(p)||[],v2=m[1],h2=m[2];if(!r.ok||!v2)return again('failed',t);if(+v2<+t)return again('cache',t);let morphed=false;if(was?was!==h2:h2!==h){const w0=window[Symbol.for('quillo')]||{};let ok=false;try{ok=!!(w0.morph&&w0.morph(p))}catch(x){console.error(x)}if(!ok)return again('html',v2);morphed=true}h=h2;const mine=(window[Symbol.for('quillo')]||{}).ids;if(mine){const b=(/\/_quillo\/b\/[0-9a-f]+\.js/.exec(p)||[])[0];const lt=b?await (await fetch(b,{cache:'no-store'})).text():'';const theirs=b?ids(lt):null;if(!theirs)return again('failed',v2);const changed=Object.keys(theirs).filter(k=>mine[k]!==theirs[k]);if(changed.length){const w=window[Symbol.for('quillo')]||{};if(!w.swap||changed.includes('quillo.js')||changed.includes('boot.js')||Object.keys(mine).some(k=>!(k in theirs)))return again('code',v2);const at=(/const at = "([^"]*)"/.exec(lt)||[])[1],list=JSON.parse('['+((/for \(const f of \[([^\]]*)\]/.exec(lt)||[])[1]||'')+']');const urls=changed.map(k=>list.find(f=>f.slice(f.indexOf('/')+1)===k)).filter(Boolean).map(f=>at+f);if(urls.length!==changed.length)return again('code',v2);try{await w.swap(urls);w.ids=theirs}catch(x){console.error(x);return again('code',v2)}v=v2;said(null);return tell('swapped',changed.join(', ')+(morphed?'; the page morphed':''),v2)}}v=v2;said(null);tell(morphed?'morphed':'kept','',v2)}catch(x){again('failed',t)}})().finally(()=>{busy=null}));const seen=t=>{if(t.startsWith('css:')){const i=t.indexOf(':',4);c=+t.slice(4,i)||c;css(t.slice(i+1))}else if(t.startsWith('err:')){const i=t.indexOf(':',4);e=+t.slice(4,i)||e;said(JSON.parse(t.slice(i+1)))}else if(t!==v)return hot(t)};const u=()=>'/_quillo/events?v='+v+'&c='+c+'&e='+e,go=()=>{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u());s.onopen=()=>o=1;s.onmessage=e=>seen(e.data);s.onclose=()=>o?setTimeout(go,1000):fetch(u(),{cache:'no-store'}).then(r=>r.text()).then(async t=>{await seen(t);go()},()=>setTimeout(go,1000))};go();try{if(sessionStorage.getItem('quillo-keep:'+location.pathname+location.search)){const i=document.querySelector('quillo-island,[data-qi]');if(i)i.dispatchEvent(new Event('focusin',{bubbles:true}))}}catch(_){}})()</script>"#;
+    // for itself each second and stayed old, saying nothing: a fetch of itself that carries the
+    // version the page has, when the server told another, came from a cache, and reloads (why:
+    // "cache"). The version a reload is from (the page's own, as it loaded) and the one it is for
+    // are kept for the next load, which reads them once (sessionStorage, `quillo-reload:` and the
+    // page's path and query); a page that comes back with the version it reloaded from, a worker
+    // controlling it, reloads no more for that version and says why, over the page and in the
+    // console ({ what: "cached" }) (FEEDBACK67.md, Q-957; branch pwa). By equality, never by
+    // order: a restart counts from 1 again, below the version a worker kept, which reloaded for
+    // ever (found in review).
+    const SCRIPT: &str = r#"<script>/*quillo-dev*/(()=>{let v='@V@',h='@H@';const v0=v,HOT=@HOT@;let c=0,e=0,box=null;const K='quillo-reload:'+location.pathname+location.search;let stale='';try{const s=JSON.parse(sessionStorage.getItem(K)||'null');sessionStorage.removeItem(K);if(s&&s.from===v0&&navigator.serviceWorker.controller)stale=s.for}catch(_){}const css=j=>{const p=JSON.parse(j);for(const l of document.querySelectorAll('link[rel=stylesheet]')){const u=new URL(l.href,location.href);if(u.origin===location.origin&&p.includes(u.pathname)){u.searchParams.set('quillo',Date.now());const n=l.cloneNode();n.href=u.pathname+u.search;n.onload=()=>l.remove();l.after(n)}}};const said=m=>{if(m===null){if(box){box.remove();box=null}return}if(!box){box=document.createElement('quillo-error');const r=box.attachShadow({mode:'open'});r.innerHTML='<style>:host{all:initial;position:fixed;left:0;right:0;bottom:0;z-index:2147483647;font:13px/1.45 ui-monospace,Menlo,monospace}div{position:relative;margin:8px;padding:12px 44px 12px 14px;background:#fff1f0;color:#5c0000;border:2px solid #c62828;border-radius:6px;max-height:45vh;overflow:auto;box-shadow:0 4px 18px #0005}pre{margin:8px 0 0;white-space:pre-wrap;font:inherit}button{position:absolute;top:8px;right:10px;border:0;background:none;font-size:20px;line-height:1;cursor:pointer;color:inherit}</style><div role="alert"><b>This save did not load: the page shows the version before it.</b><pre></pre><button aria-label="Close">×</button></div>';r.querySelector('button').onclick=()=>{box.remove();box=null};document.documentElement.appendChild(box)}box.shadowRoot.querySelector('pre').textContent=m};const plain=()=>{const w=window[Symbol.for('quillo')]||{};return !HOT||w.hot===false||document.documentElement.hasAttribute('data-reload')};const ids=t=>{const m=/\.ids = (\{.*?\});/.exec(t);return m?JSON.parse(m[1]):null};const tell=(what,why,ver)=>{try{document.dispatchEvent(new CustomEvent('quillo:hmr',{detail:JSON.stringify({what,why,version:ver})}))}catch(_){}};const again=(why,ver)=>{ver=String(ver);if(stale&&ver===stale){v=ver;const m="This page came from a service worker's cache (`navigator.serviceWorker.controller`), so `--watch` cannot refresh it: unregister the worker (DevTools > Application > Service workers), or have it go to the server first for pages";console.warn(m);said(m);return tell('cached',why,ver)}tell('reload',why,ver);if(why!=='off')try{const w=window[Symbol.for('quillo')];if(w&&w.keep)w.keep()}catch(_){}try{sessionStorage.setItem(K,JSON.stringify({from:v0,for:ver}))}catch(_){}location.reload()};let busy=null;const hot=t=>busy||(busy=(async()=>{if(plain())return again('off',t);try{const r=await fetch(location.href,{cache:'no-store',credentials:'same-origin',headers:{'x-quillo-hot':v}});const p=await r.text();const was=r.headers.get('x-quillo-was');const m=/\/\*quillo-dev\*\/\(\(\)=>\{let v='(\d+)',h='([0-9a-f]+)'/.exec(p)||[],v2=m[1],h2=m[2];if(!r.ok||!v2)return again('failed',t);if(v2===v)return again('cache',t);let morphed=false;if(was?was!==h2:h2!==h){const w0=window[Symbol.for('quillo')]||{};let ok=false;try{ok=!!(w0.morph&&w0.morph(p))}catch(x){console.error(x)}if(!ok)return again('html',v2);morphed=true}h=h2;const mine=(window[Symbol.for('quillo')]||{}).ids;if(mine){const b=(/\/_quillo\/b\/[0-9a-f]+\.js/.exec(p)||[])[0];const lt=b?await (await fetch(b,{cache:'no-store'})).text():'';const theirs=b?ids(lt):null;if(!theirs)return again('failed',v2);const changed=Object.keys(theirs).filter(k=>mine[k]!==theirs[k]);if(changed.length){const w=window[Symbol.for('quillo')]||{};if(!w.swap||changed.includes('quillo.js')||changed.includes('boot.js')||Object.keys(mine).some(k=>!(k in theirs)))return again('code',v2);const at=(/const at = "([^"]*)"/.exec(lt)||[])[1],list=JSON.parse('['+((/for \(const f of \[([^\]]*)\]/.exec(lt)||[])[1]||'')+']');const urls=changed.map(k=>list.find(f=>f.slice(f.indexOf('/')+1)===k)).filter(Boolean).map(f=>at+f);if(urls.length!==changed.length)return again('code',v2);try{await w.swap(urls);w.ids=theirs}catch(x){console.error(x);return again('code',v2)}v=v2;said(null);return tell('swapped',changed.join(', ')+(morphed?'; the page morphed':''),v2)}}v=v2;said(null);tell(morphed?'morphed':'kept','',v2)}catch(x){again('failed',t)}})().finally(()=>{busy=null}));const seen=t=>{if(t.startsWith('css:')){const i=t.indexOf(':',4);c=+t.slice(4,i)||c;css(t.slice(i+1))}else if(t.startsWith('err:')){const i=t.indexOf(':',4);e=+t.slice(4,i)||e;said(JSON.parse(t.slice(i+1)))}else if(t!==v)return hot(t)};const u=()=>'/_quillo/events?v='+v+'&c='+c+'&e='+e,go=()=>{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u());s.onopen=()=>o=1;s.onmessage=e=>seen(e.data);s.onclose=()=>o?setTimeout(go,1000):fetch(u(),{cache:'no-store'}).then(r=>r.text()).then(async t=>{await seen(t);go()},()=>setTimeout(go,1000))};go();try{if(sessionStorage.getItem('quillo-keep:'+location.pathname+location.search)){const i=document.querySelector('quillo-island,[data-qi]');if(i)i.dispatchEvent(new Event('focusin',{bubbles:true}))}}catch(_){}})()</script>"#;
     let hot = !PLAIN_RELOAD.load(std::sync::atomic::Ordering::Relaxed);
     SCRIPT.replace("@V@", &version.to_string()).replace("@H@", print).replace("@HOT@", if hot { "1" } else { "0" })
 }
@@ -3899,7 +3948,7 @@ fn serve_events(app: Arc<App>, req: HttpRequest) -> Answer {
 /// In watch mode, HTML pages get a script that reloads them after a change.
 /// An answer whose bytes are named by a validator or a range (`file()`'s, or a route's own
 /// `etag`): sent as it is, nothing added to it (FEEDBACK36.md, Q-447; branch feedback36-39).
-fn as_written(resp: &HttpResponse) -> bool {
+pub(crate) fn as_written(resp: &HttpResponse) -> bool {
     // A header named `null` is none (FEEDBACK55.md, Q-710; branch feedback55).
     resp.status == 206 || resp.sent("etag").is_some() || resp.sent("content-range").is_some() || written_miss(resp)
 }
