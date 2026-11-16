@@ -101,6 +101,22 @@ route GET /silent {
     let u = session().user ?? "nobody"
     respond(200, u, { "cache-control": null })
 }
+route GET /quoted {
+    let u = session().user ?? "nobody"
+    respond(200, u, { "cache-control": "public, private=\"set-cookie, x-user\", max-age=600" })
+}
+route GET /no-time {
+    let u = session().user ?? "nobody"
+    respond(200, u, { "cache-control": "must-revalidate, stale-while-revalidate=600", "akamai-cache-control": "max-age=600", "edge-control": "cache-maxage=600" })
+}
+fn me() {
+    return session().user ?? "nobody"
+}
+route GET /helper = respond(200, me(), { "cache-control": "public, max-age=60" })
+route GET /n/:name {
+    let _u = session().user
+    respond(200, name, { "cache-control": "public, max-age=60" })
+}
 route GET /cdn-everyone = respond(200, "same", { "cache-control": "public, max-age=60", "cdn-cache-control": "max-age=600" })
 route GET /everyone = respond(200, "same for all", { "cache-control": "public, max-age=60" })
 route GET /file = file("report.pdf", { cache: "1y" })
@@ -140,7 +156,16 @@ fn an_answer_made_for_the_visitor_is_private_whatever_its_route_said() {
     // Already the visitor's, or kept by no one without asking: as written.
     assert_eq!(cc("/own", true).1, "private, max-age=5");
     assert_eq!(cc("/never", true).1, "no-store");
-    assert_eq!(cc("/asks", true).1, "no-cache");
+    // Any other `cache-control` takes `private` too: a shared cache may keep one that says no
+    // time, by `Expires` or its own reckoning (found in review).
+    assert_eq!(cc("/asks", true).1, "private, no-cache");
+    assert_eq!(cc("/quoted", true).1, "private, max-age=600");
+    let a = support::send(port, "GET", "/no-time", &[("cookie", c.as_str())], "");
+    assert_eq!(a.header("cache-control"), Some("private, must-revalidate, stale-while-revalidate=600"));
+    assert_eq!((a.header("akamai-cache-control"), a.header("edge-control")), (None, None));
+    assert_eq!(cc("/helper", true).1, "private, max-age=60");
+    // A path with a line break in it is said on one line.
+    assert_eq!(cc("/n/a%0Aquillo:%20forged", true).1, "private, max-age=60");
     // What reads nobody keeps its `public`: the same page for everyone.
     assert_eq!(cc("/everyone", true), (200, "public, max-age=60".into(), "".into()));
     assert_eq!(cc("/file", true).1, "public, max-age=31536000, immutable");
@@ -152,6 +177,7 @@ fn an_answer_made_for_the_visitor_is_private_whatever_its_route_said() {
     let said = std::fs::read_to_string(&log).unwrap();
     assert_eq!(said.matches("/kept read who the visitor is").count(), 1, "{}", said);
     assert!(said.contains("/kept read who the visitor is: `cache-control: public, max-age=60` sent as `private, max-age=60`"), "{}", said);
+    assert!(said.contains("quillo: /n/a\\nquillo: forged read who") && !said.lines().any(|l| l.starts_with("quillo: forged")), "{}", said);
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -163,11 +189,11 @@ fn check_warns_where_a_route_both_reads_the_visitor_and_says_public() {
     let d = dir("check", CACHED);
     let out = check(&d);
     let lines: Vec<&str> = out.lines().filter(|l| l.contains("its `cache-control` lets a shared cache keep the answer")).collect();
-    // /kept, /shared, /sets, /cdn and /some; not /own, /never, /asks, /silent, /files/kept.pdf,
-    // /everyone or /file.
-    assert_eq!(lines.len(), 5, "{}", out);
+    // /kept, /shared, /asks, /sets, /cdn, /some, /quoted, /no-time, /helper (its session read in
+    // `me`) and /n; not /own, /never, /silent, /files/kept.pdf, /everyone or /file.
+    assert_eq!(lines.len(), 10, "{}", out);
     // Each on its `respond`'s line.
-    assert!(lines[0].contains("main.qwe:9:") && lines[1].contains("main.qwe:13:") && lines[2].contains("main.qwe:34:"), "{}", out);
+    assert!(lines[0].contains("main.qwe:9:") && lines[1].contains("main.qwe:13:") && lines[3].contains("main.qwe:34:"), "{}", out);
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -297,7 +323,7 @@ fn streamed_parts_links_and_the_development_script_are_covered() {
     let d = dir("parts", &page("/p", "default-src 'self'", "<Counter/><Later/>"));
     let (_g, port, _log) = serve_logged(&d, &[]);
     let (policy, body) = fetch(port, "/p");
-    assert!(body.contains("got 42") && body.contains("swap(\""), "{}", body);
+    assert!(body.contains("got 42") && body.contains("swap(document.currentScript"), "{}", body);
     for h in script_hashes(&body) {
         assert!(policy.contains(&h), "{} not in {}: {}", h, policy, body);
     }
@@ -306,7 +332,7 @@ fn streamed_parts_links_and_the_development_script_are_covered() {
     // review).
     let a = support::send(port, "GET", "/p", &[("sec-purpose", "prefetch")], "");
     assert_eq!(a.status, 200, "{}", a.body);
-    assert!(a.body.contains("got 42") && a.body.contains("swap(\""), "{}", a.body);
+    assert!(a.body.contains("got 42") && a.body.contains("swap(document.currentScript") && !a.body.contains("swap(\"0\")"), "{}", a.body);
     let policy = a.header("content-security-policy").unwrap();
     for h in script_hashes(&a.body) {
         assert!(policy.contains(&h), "{} not in {}: {}", h, policy, a.body);
@@ -429,5 +455,72 @@ fn a_page_made_from_a_header_or_the_address_is_the_visitors() {
     }
     let a = support::send(port, "GET", "/path?x=1", &[], "");
     assert_eq!((a.status, a.header("cache-control")), (200, None), "{}", a.body);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// Q-904, found in the second review: many waiting components share one hashed line, so the policy
+// does not grow with them; a streamed page under --watch has its development script hashed; a page
+// with no head or body keeps its doctype first; a player is loaded by a hashed script, which a
+// policy with `'strict-dynamic'` takes; a visitor's page prefetched by fetch is kept for its click.
+#[test]
+fn many_parts_one_line_streams_in_development_and_odd_pages() {
+    let many = format!("{}route GET /m = <html><head></head><body>{}</body></html>\n", COUNTER, "<Later/>".repeat(12));
+    let d = dir("many", &format!("site_headers(\"/m\", {{ \"content-security-policy\": \"default-src 'self'\" }})\n{}", many));
+    let (_g, port, _log) = serve_logged(&d, &[]);
+    let (policy, body) = fetch(port, "/m");
+    assert_eq!(body.matches("got 42").count(), 12, "{}", body);
+    // A line for each part would be 12 hashes more, some 660 bytes.
+    assert!(policy.len() < 600, "{} bytes: {}", policy.len(), policy);
+    for h in script_hashes(&body) {
+        assert!(policy.contains(&h), "{} not in {}", h, policy);
+    }
+    // Prefetched, its parts worked out first: the same one line.
+    let a = support::send(port, "GET", "/m", &[("sec-purpose", "prefetch")], "");
+    let policy = a.header("content-security-policy").unwrap();
+    assert!(policy.len() < 600 && !a.body.contains("swap(\"3\")"), "{}", policy);
+    for h in script_hashes(&a.body) {
+        assert!(policy.contains(&h), "{} not in {}", h, policy);
+    }
+    drop(_g);
+    let _ = std::fs::remove_dir_all(&d);
+    // Streamed under --watch.
+    let d = dir("stream-dev", &page("/p", "default-src 'self'", "<Counter/><Later/>"));
+    let (_g, port, _log) = serve_logged(&d, &["--watch"]);
+    let (policy, body) = fetch(port, "/p");
+    assert!(body.contains("/*quillo-dev*/") && body.contains("got 42"), "{}", body);
+    for h in script_hashes(&body) {
+        assert!(policy.contains(&h), "{} not in {}", h, policy);
+    }
+    let style = body.split("<style>:host").nth(1).and_then(|r| r.split_once("</style>")).map(|(t, _)| format!(":host{}", t)).unwrap();
+    assert!(policy.contains(&format!("'sha256-{}'", b64(&sha2::Sha256::digest(style.as_bytes())))), "{}", policy);
+    drop(_g);
+    let _ = std::fs::remove_dir_all(&d);
+    // No head, no body: the rule after `<html>`, the doctype first.
+    let d = dir("nohead", &format!("{}site_headers(\"/x\", {{ \"content-security-policy\": \"default-src 'self'\" }})\nroute GET /x = <html><main><Counter/></main></html>\n", COUNTER));
+    let (_g, port, _log) = serve_logged(&d, &[]);
+    let (_, body) = fetch(port, "/x");
+    assert!(body.starts_with("<!doctype html>"), "{}", body);
+    assert!(body.contains("<style>quillo-island{display:contents}</style>"), "{}", body);
+    drop(_g);
+    let _ = std::fs::remove_dir_all(&d);
+    // A player, under `'strict-dynamic'`: loaded by a hashed script, no `<script src>` in the page.
+    let d = dir("media", "site_headers(\"/v\", { \"content-security-policy\": \"script-src 'strict-dynamic' 'unsafe-inline'\" })\nroute GET /v = <html><head></head><body><quillo-media stream=\"cam\" controls muted/></body></html>\n");
+    let (_g, port, _log) = serve_logged(&d, &[]);
+    let (policy, body) = fetch(port, "/v");
+    assert!(body.contains("/_quillo/media.js") && !body.contains("<script src=") && body.contains("s.async=false"), "{}", body);
+    for h in script_hashes(&body) {
+        assert!(policy.contains(&h), "{} not in {}", h, policy);
+    }
+    drop(_g);
+    let _ = std::fs::remove_dir_all(&d);
+    // A visitor's page prefetched by fetch: kept 30 s by that browser, as a page for everyone is.
+    let d = dir("prefetch-me", "route POST /login { set_session({ user: \"ana\" }); \"ok\" }\nroute GET /me = `hi ${session().user ?? \"nobody\"}`\n");
+    let (_g, port, _log) = serve_logged(&d, &[]);
+    let c = signed_in(port);
+    let a = support::send(port, "GET", "/me", &[("cookie", c.as_str()), ("x-quillo-prefetch", "1")], "");
+    assert_eq!((a.header("cache-control"), a.header("vary")), (Some("private, max-age=30"), Some("Cookie")), "{:?}", a.headers);
+    let a = support::send(port, "GET", "/me", &[("cookie", c.as_str())], "");
+    assert_eq!(a.header("cache-control"), Some("private"));
+    drop(_g);
     let _ = std::fs::remove_dir_all(&d);
 }

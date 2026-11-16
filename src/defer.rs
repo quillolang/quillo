@@ -42,6 +42,10 @@ pub(crate) struct Page {
     /// written without it, the page's `<style>` giving the rule (FEEDBACK59.md, Q-904; branch
     /// cache-and-migrate).
     pub plain_islands: bool,
+    /// It refuses inline scripts: each part swaps itself in by the one line `ONE_SWAP`, hashed
+    /// once in the policy, where a line naming each part made the policy grow with every part
+    /// (found in review).
+    pub one_swap: bool,
 }
 
 /// Swaps a waiting island for the one that came: defined once, before the first part, in the
@@ -58,26 +62,38 @@ pub fn part(id: usize, island: &str) -> String {
     format!("<template data-qt=\"{}\">{}</template><script>window[Symbol.for(\"quillo\")].swap(\"{}\")</script>", id, island, id)
 }
 
+/// The line that swaps in the part it follows, whichever it is: one text for every part.
+pub const ONE_SWAP: &str = "window[Symbol.for(\"quillo\")].swap(document.currentScript.previousElementSibling.getAttribute(\"data-qt\"))";
+
+/// `part`, swapped in by `ONE_SWAP`.
+pub fn part_one_swap(id: usize, island: &str) -> String {
+    format!("<template data-qt=\"{}\">{}</template><script>{}</script>", id, island, ONE_SWAP)
+}
+
 /// The page split at its last `</body>` (or its end), the swap script at the end of
 /// the first part.
 pub(crate) fn split(body: Vec<u8>, jobs: Vec<Deferred>) -> Page {
     let at = body.windows(7).rposition(|w| w.eq_ignore_ascii_case(b"</body>")).unwrap_or(body.len());
     let mut first = body[..at].to_vec();
     first.extend_from_slice(SWAP.as_bytes());
-    Page { first, tail: body[at..].to_vec(), jobs, plain_islands: false }
+    Page { first, tail: body[at..].to_vec(), jobs, plain_islands: false, one_swap: false }
 }
 
 /// Each waiting component rendered again: its part, or nothing when rendering it
 /// failed (the error is logged and the placeholder stays).
-pub(crate) fn resolve(it: &mut crate::interp::Interp, d: &Deferred, plain_islands: bool) -> String {
+pub(crate) fn resolve(it: &mut crate::interp::Interp, d: &Deferred, page: (bool, bool)) -> String {
+    let (plain_islands, one_swap) = page;
     // Under the route's `with`, as the rest of the page was (branch feedback40-43).
     match it.under_route(|it| it.render_deferred(d)) {
-        Ok(html) if plain_islands => {
-            let mut b = part(d.id, &html).into_bytes();
+        Ok(html) => {
+            let made = if one_swap { part_one_swap(d.id, &html) } else { part(d.id, &html) };
+            if !plain_islands {
+                return made;
+            }
+            let mut b = made.into_bytes();
             let _ = crate::server::plain_islands(&mut b);
             String::from_utf8(b).unwrap_or_default()
         }
-        Ok(html) => part(d.id, &html),
         Err(crate::interp::Ctrl::Error(e)) => {
             eprintln!("quillo: error while rendering the deferred part of <{}>: {}", d.tag, e);
             String::new()
@@ -90,7 +106,7 @@ pub(crate) fn resolve(it: &mut crate::interp::Interp, d: &Deferred, plain_island
 pub(crate) fn whole(it: &mut crate::interp::Interp, page: Page) -> Vec<u8> {
     let mut out = page.first;
     for d in &page.jobs {
-        out.extend_from_slice(resolve(it, d, page.plain_islands).as_bytes());
+        out.extend_from_slice(resolve(it, d, (page.plain_islands, page.one_swap)).as_bytes());
     }
     out.extend_from_slice(&page.tail);
     out

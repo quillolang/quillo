@@ -351,3 +351,63 @@ fn a_broken_first_migration_and_another_databases_folder_are_watched() {
         let _ = std::fs::remove_dir_all(&x);
     }
 }
+
+// Q-919, found in the second review: under --watch, an editor's new file, empty at first, waits
+// until it holds SQL, which then runs; and a folder made after the start is watched too.
+#[test]
+fn an_empty_new_file_waits_and_a_folder_made_later_is_watched() {
+    let d = dir("empty-file");
+    std::fs::write(d.join("migrations/001_a.sql"), "create table a (id integer);").unwrap();
+    std::fs::write(d.join("main.qwe"), TABLES).unwrap();
+    {
+        let (_g, port, log) = serve_logged(&d, &["--watch"]);
+        let tables = || support::send(port, "GET", "/tables", &[], "").body;
+        assert_eq!(tables(), "a");
+        std::fs::write(d.join("migrations/002_b.sql"), "").unwrap();
+        assert!(until(20, || std::fs::read_to_string(&log).unwrap_or_default().contains("002_b.sql has no statement yet")), "{}", std::fs::read_to_string(&log).unwrap_or_default());
+        std::fs::write(d.join("migrations/002_b.sql"), "-- only a comment\n").unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        std::fs::write(d.join("migrations/002_b.sql"), "create table b (id integer);").unwrap();
+        assert!(until(20, || tables() == "a,b"), "{}: {}", tables(), std::fs::read_to_string(&log).unwrap_or_default());
+        assert!(!std::fs::read_to_string(&log).unwrap().contains("changed after it was applied"));
+    }
+    // No folder at the start: the program does not load; making it, with a file, loads it.
+    let n = support::temp_dir("f62-no-folder");
+    std::fs::write(n.join("main.qwe"), TABLES).unwrap();
+    {
+        let (_g, port, log) = serve_logged(&n, &["--watch"]);
+        let tables = || support::send(port, "GET", "/tables", &[], "").body;
+        assert!(tables().contains("The program did not load"), "{}", tables());
+        std::fs::create_dir_all(n.join("migrations")).unwrap();
+        std::fs::write(n.join("migrations/001_a.sql"), "create table a (id integer);").unwrap();
+        assert!(until(20, || tables() == "a"), "{}: {}", tables(), std::fs::read_to_string(&log).unwrap_or_default());
+    }
+    for x in [d, n] {
+        let _ = std::fs::remove_dir_all(&x);
+    }
+}
+
+// Q-915, found in the second review: a rebuild of a table with no integer key numbers its rows
+// again, and an orphan there before is still the one there before; in a `without rowid` table, a
+// new one is still found.
+#[test]
+fn old_orphans_are_counted_not_matched_by_row() {
+    let d = dir("renumber");
+    std::fs::write(d.join("migrations/001.sql"), "create table people (id integer primary key, name text);\ncreate table pets (name text, owner integer references people(id));\ninsert into people values (1, 'a');\ninsert into pets values ('x', 1), ('y', 1), ('z', 1);\n").unwrap();
+    assert_eq!(load(&d, "db.open(\"app.db\")\ndb.migrate()").unwrap(), "[\"001.sql\"]");
+    load(&d, "db.open(\"app.db\")\ndb.exec(\"pragma foreign_keys = off\")\ndb.exec(\"delete from pets where name = 'y'\")\ndb.exec(\"update pets set owner = 9 where name = 'z'\")\ndb.exec(\"pragma foreign_keys = on\")").unwrap();
+    std::fs::write(d.join("migrations/002.sql"), "pragma foreign_keys = off;\ncreate table pets_new (name text not null default '', owner integer references people(id));\ninsert into pets_new select coalesce(name, ''), owner from pets;\ndrop table pets;\nalter table pets_new rename to pets;\n").unwrap();
+    let (ok, out, err) = run(&d, "db.open(\"app.db\")\nprint(db.migrate())");
+    assert!(ok && out.contains("002.sql"), "{}{}", out, err);
+    assert!(err.contains("already pointed at no row of people"), "{}", err);
+    let w = dir("without-rowid");
+    std::fs::write(w.join("migrations/001.sql"), "create table people (id integer primary key);\ncreate table tags (k text primary key, owner integer references people(id)) without rowid;\ninsert into people values (1), (2);\ninsert into tags values ('a', 1), ('b', 2);\n").unwrap();
+    assert_eq!(load(&w, "db.open(\"app.db\")\ndb.migrate()").unwrap(), "[\"001.sql\"]");
+    load(&w, "db.open(\"app.db\")\ndb.exec(\"pragma foreign_keys = off\")\ndb.exec(\"update tags set owner = 9 where k = 'a'\")\ndb.exec(\"pragma foreign_keys = on\")").unwrap();
+    std::fs::write(w.join("migrations/002.sql"), "pragma foreign_keys = off;\ndelete from people where id = 2;\n").unwrap();
+    let (ok, _, err) = run(&w, "db.open(\"app.db\")\nprint(db.migrate())");
+    assert!(!ok && err.contains("002.sql failed") && err.contains("pointing at no row of people"), "{}", err);
+    for x in [d, w] {
+        let _ = std::fs::remove_dir_all(&x);
+    }
+}

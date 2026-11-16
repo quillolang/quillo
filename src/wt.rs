@@ -163,7 +163,9 @@ pub fn key_channel(key: &str) -> &str {
 pub fn reach(it: &mut Interp) -> Option<Option<String>> {
     // `answering` as well: a stream's function or a deferred part runs after the route, with
     // the request no longer set (found in review).
-    let for_someone = it.tenant_named || FOR_PAGE.with(|f| f.get()) || it.answering || it.current_request.is_some() || it.pending_request.is_some();
+    // A call on stdio has a `request` of its own (FEEDBACK63.md, Q-927) and reaches what it
+    // reached without one (found in review).
+    let for_someone = it.tenant_named || FOR_PAGE.with(|f| f.get()) || it.answering || (it.current_request.is_some() && !it.stdio_request) || it.pending_request.is_some();
     for_someone.then(|| it.tenant().map(|t| t.to_string()))
 }
 

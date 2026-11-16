@@ -324,7 +324,7 @@ fn run_page(it: &mut Interp, page: crate::defer::Page, sink: &mut dyn Sink, chun
         return Ended::Gone;
     }
     for d in &page.jobs {
-        let part = crate::defer::resolve(it, d, page.plain_islands);
+        let part = crate::defer::resolve(it, d, (page.plain_islands, page.one_swap));
         if !piece(sink, part.as_bytes(), chunked) {
             return Ended::Gone;
         }

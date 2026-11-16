@@ -1207,7 +1207,8 @@ start together take turns (an advisory lock on Postgres, an immediate transactio
 SQLite), so each file still runs once. Only files ending `.sql` directly in the folder
 count (no subfolders); they sort by name as text, so `10_x.sql` comes before `2_x.sql`:
 pad the numbers. The name is the key: a renamed file runs again. A file holds no
-`begin` or `commit` of its own. In a route, a file that fails stops the request with a 500:
+`begin` or `commit` of its own. A file with no statement yet (a new one an editor made empty)
+waits, with a warning, until it has one. In a route, a file that fails stops the request with a 500:
 `db.migrate` gives the names it applied, never an error value to handle. The folder must exist: a missing one is an error that
 says why it may be gone from a clone (`there is no such folder (git keeps no empty
 folder: put the first migration in it, or a .gitkeep, which is not read)`). The table is `_quillo_migrations

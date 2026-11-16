@@ -773,22 +773,28 @@ fn touch() {
   (it called `session()` or `cookie()`, set a cookie, or read a header of the request or its
   `ip`) carries `cache-control: private` and `vary: cookie`, so a shared cache never gives
   one visitor's page to another. That holds whatever time the route gave. A `cache-control`
-  that lets a shared cache keep the answer (`public`, `s-maxage`, a `max-age` without
-  `private`), whether from `respond`, from `file`'s `cache` or from a `site_headers` rule, is
-  sent as `private` with its time kept for the visitor's own browser, so a cache in front
+  that does not say `private` or `no-store` (`public`, `s-maxage`, a `max-age` alone, or one
+  with no time, which a shared cache may keep by `Expires` or its own reckoning), whether from
+  `respond`, from `file`'s `cache` or from a `site_headers` rule, is sent as `private` with its
+  time kept for the visitor's own browser, so a cache in front
   that ignores `vary` (Cloudflare keeps a `.pdf` or a `.png` with no rule) cannot hand Ana's
   file to the next visitor. A `cache-control: null` takes the header away, Quillo's `private`
   included, as `null` does for any header: such a cache may fill that silence. The fields a
   CDN reads before `Cache-Control`
-  (`CDN-Cache-Control`, `Cloudflare-CDN-Cache-Control`, `Surrogate-Control`, nginx's
-  `X-Accel-Expires`) are left out of such an answer. The log says so once for each path, and
+  (any `...-Cache-Control`, such as `CDN-Cache-Control` and `Akamai-Cache-Control`, and
+  `Surrogate-Control`, `Edge-Control` and nginx's `X-Accel-Expires`) are left out of such an
+  answer. The log says so once for each path, and
   `quillo check` warns where a route writes such a `cache-control` itself. A route that
   reads no one keeps its `public`.
 - A `content-security-policy` needs nothing added for Quillo's own scripts. Where the
   policy refuses inline scripts (the guide's own `default-src 'self'` below does), each one
   Quillo wrote into the page is named by its hash in `script-src`, which is made from
   `default-src` when the policy has none. That covers the components' loader, the links'
-  prefetch, the page's state, a waiting component's part and the development script. Where it
+  prefetch, the page's state, the development script, and waiting components' parts, which
+  share one line, so the policy does not grow with them. The stream player is then loaded by
+  such a script, which a policy with `'strict-dynamic'` takes. Quillo's own files (the
+  bundles, the page's sheet) still need `'self'` in a policy that names sources: one that
+  allows nonces alone refuses them. Where it
   refuses a `style` attribute, the islands' `display:contents` moves into a `<style>` in the
   head, hashed in `style-src`. A hash, not a nonce, so that a page kept by a cache stays
   valid. A policy that already lets inline code run (`'unsafe-inline'` with no nonce or hash)

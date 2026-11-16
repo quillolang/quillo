@@ -522,9 +522,15 @@ impl Interp {
             // outlive the session it was made for (FEEDBACK22.md, Q-176; branch
             // feedback22-fixes).
             let own = req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-quillo-prefetch"));
-            if own && resp.status == 200 && resp.header("cache-control").is_none() && !crate::idempotency::holds_form_key(&resp.body) {
+            // A visitor's page, `private` by Quillo, too: else the link's page was made twice, as
+            // nothing could keep it (found in review).
+            let quillos = resp.header("cache-control").is_none() || resp.header("cache-control") == Some("private");
+            if own && resp.status == 200 && quillos && !crate::idempotency::holds_form_key(&resp.body) {
+                resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("cache-control"));
                 resp.headers.push(("cache-control".into(), "private, max-age=30".into()));
-                resp.headers.push(("vary".into(), "Cookie".into()));
+                if !resp.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("vary") && v.to_ascii_lowercase().contains("cookie")) {
+                    resp.headers.push(("vary".into(), "Cookie".into()));
+                }
             }
         }
         // A page with a key in a form is for this visitor, this once.
@@ -588,7 +594,15 @@ impl Interp {
         if html && req.method != "HEAD" {
             if tags.media && !script_tag_for(&resp.body, b"/_quillo/media.js") {
                 let at = rfind_tag(&resp.body, b"</body>").unwrap_or(resp.body.len());
-                insert_at(&mut resp.body, at, format!("<script src=\"{}/_quillo/media.js\" defer></script>", self.base).as_bytes());
+                if refused.scripts {
+                    // Made by a script of Quillo's, hashed: a policy with `'strict-dynamic'` takes
+                    // what it makes, and refuses a `<script src>` in the page (found in review).
+                    let load = format!("(d=>{{const s=d.createElement(\"script\");s.src=\"{}/_quillo/media.js\";s.async=false;d.head.appendChild(s)}})(document)", self.base);
+                    insert_at(&mut resp.body, at, format!("<script>{}</script>", load).as_bytes());
+                    own.push(load);
+                } else {
+                    insert_at(&mut resp.body, at, format!("<script src=\"{}/_quillo/media.js\" defer></script>", self.base).as_bytes());
+                }
             }
         }
         // The styles of what the page's bundle can show, or all of them for
@@ -697,8 +711,16 @@ impl Interp {
         let parts = html && req.method != "HEAD" && resp.status == 200 && !self.deferred.is_empty();
         if refused.scripts && (parts || !early_parts.is_empty()) {
             own.extend(script_texts(crate::defer::SWAP.as_bytes()));
-            for id in self.deferred.iter().map(|d| d.id).chain(early_parts.iter().copied()) {
-                own.extend(script_texts(crate::defer::part(id, "").as_bytes()));
+            own.push(crate::defer::ONE_SWAP.to_string());
+            // A prefetch's parts, in the page already: each swapped in by the one line.
+            if !early_parts.is_empty() {
+                let mut body = std::mem::take(&mut resp.body);
+                for id in &early_parts {
+                    let line = crate::defer::part(*id, "");
+                    let line = &line[line.find("<script>").unwrap_or(0)..];
+                    body = replace_bytes(&body, line.as_bytes(), format!("<script>{}</script>", crate::defer::ONE_SWAP).as_bytes());
+                }
+                resp.body = body;
             }
         }
         // The rule only where an island is, or may come in a part.
@@ -713,6 +735,7 @@ impl Interp {
             if html && req.method != "HEAD" && resp.status == 200 {
                 let mut page = crate::defer::split(std::mem::take(&mut resp.body), jobs);
                 page.plain_islands = refused.attr;
+                page.one_swap = refused.scripts;
                 if self.streams_direct {
                     resp.headers.push((crate::stream::MARK.into(), "1".into()));
                     resp.headers.push(("x-accel-buffering".into(), "no".into()));
@@ -1251,9 +1274,15 @@ impl Interp {
         // `null` (FEEDBACK55.md, Q-710).
         // Nothing is made for an answer that needs no change, as each one a visitor gets comes here.
         if personal {
+            // A targeted field (RFC 9213: `CDN-`, `Cloudflare-CDN-`, `Akamai-Cache-Control`), and the
+            // older ones: Fastly's and Varnish's `Surrogate-Control`, Akamai's `Edge-Control`, nginx's
+            // `X-Accel-Expires`.
             let cdn = |k: &str| {
                 let b = k.as_bytes();
-                (b.len() >= 17 && b[b.len() - 17..].eq_ignore_ascii_case(b"cdn-cache-control")) || k.eq_ignore_ascii_case("surrogate-control") || k.eq_ignore_ascii_case("x-accel-expires")
+                (b.len() > 14 && b[b.len() - 14..].eq_ignore_ascii_case(b"-cache-control"))
+                    || k.eq_ignore_ascii_case("surrogate-control")
+                    || k.eq_ignore_ascii_case("edge-control")
+                    || k.eq_ignore_ascii_case("x-accel-expires")
             };
             // Whether to say what changed: asked only when something does.
             let mut tell: Option<bool> = None;
@@ -2602,18 +2631,36 @@ pub(crate) fn kept_by_visitor_alone(v: &str) -> Option<String> {
 }
 
 fn work_out_private(v: &str) -> Option<String> {
-    let parts = || v.split(',').map(str::trim).filter(|p| !p.is_empty());
+    let parts = directives_of(v);
     let is = |p: &str, n: &str| p.split('=').next().unwrap_or("").trim().eq_ignore_ascii_case(n);
     // `private` alone: one naming fields (`private="set-cookie"`) lets a shared cache keep the
     // rest (found in review).
-    if parts().any(|p| p.eq_ignore_ascii_case("private") || is(p, "no-store")) {
+    if parts.iter().any(|p| p.eq_ignore_ascii_case("private") || is(p, "no-store")) {
         return None;
     }
-    if !parts().any(|p| is(p, "public") || is(p, "s-maxage") || is(p, "max-age")) {
-        return None;
-    }
-    let kept: Vec<&str> = parts().filter(|p| !(is(p, "public") || is(p, "s-maxage") || is(p, "proxy-revalidate") || is(p, "private"))).collect();
+    // Any other: a shared cache may keep what says no time too, by an `Expires` or by its own
+    // reckoning, and one that says `no-cache` (found in review).
+    let kept: Vec<&str> = parts.into_iter().filter(|p| !(is(p, "public") || is(p, "s-maxage") || is(p, "proxy-revalidate") || is(p, "private"))).collect();
     Some(if kept.is_empty() { "private".to_string() } else { format!("private, {}", kept.join(", ")) })
+}
+
+/// A `Cache-Control`'s directives, split at the commas outside quotes: `private="a, b"` is one.
+fn directives_of(v: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut quoted) = (0, false);
+    for (i, c) in v.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                out.push(v[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(v[start..].trim());
+    out.retain(|p| !p.is_empty());
+    out
 }
 
 /// The paths `said_private` has said, the first 64.
@@ -2650,7 +2697,10 @@ fn said_private(path: &str, what: impl FnOnce() -> String) {
     if said.len() < 64 && !said.contains(path) {
         said.insert(path.to_string());
         drop(said);
-        eprintln!("quillo: {} read who the visitor is: {}, as a cache in front would give the answer to the next visitor (said once for each path)", path, what());
+        // The path as a visitor wrote it, decoded: a line break in it would write a line of its
+        // own in the log (found in review).
+        let shown: String = path.chars().map(|c| if c.is_control() { c.escape_debug().to_string() } else { c.to_string() }).collect();
+        eprintln!("quillo: {} read who the visitor is: {}, as a cache in front would give the answer to the next visitor (said once for each path)", shown, what());
     }
 }
 
@@ -3344,7 +3394,12 @@ impl App {
             let own = |d: &Path| d.canonicalize().ok();
             let program = self.main_file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
             for dir in crate::migrate::folders() {
-                if own(&dir).is_none() || own(&dir) == own(program) || files.contains(&dir) {
+                // One not there yet is watched too, as making it is a change (found in review).
+                let same = match (own(&dir), own(program)) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => dir == program,
+                };
+                if same || files.contains(&dir) {
                     continue;
                 }
                 let mut sql: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -3953,13 +4008,45 @@ pub(crate) fn plain_islands(body: &mut Vec<u8>) -> bool {
     if !body.windows(WITH.len()).any(|w| w == WITH) {
         return false;
     }
-    *body = String::from_utf8_lossy(body).replace("<quillo-island style=\"display:contents\"", "<quillo-island").into_bytes();
+    *body = replace_bytes(body, WITH, b"<quillo-island");
     true
+}
+
+/// `body` with each `from` in it made `to`, as bytes: a page need not be UTF-8 (found in review).
+fn replace_bytes(body: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        if body[i..].starts_with(from) {
+            out.extend_from_slice(to);
+            i += from.len();
+        } else {
+            out.push(body[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn source_hash(text: &str) -> String {
     use sha2::Digest;
-    format!("'sha256-{}'", crate::ws::base64(&sha2::Sha256::digest(text.as_bytes())))
+    // Most are the same on every page (the prefetch, the swap, the rule): the last few are kept,
+    // on each thread.
+    thread_local! {
+        static KEPT: std::cell::RefCell<Vec<(String, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if let Some(h) = KEPT.with(|k| k.borrow().iter().find(|(t, _)| t == text).map(|(_, h)| h.clone())) {
+        return h;
+    }
+    let h = format!("'sha256-{}'", crate::ws::base64(&sha2::Sha256::digest(text.as_bytes())));
+    KEPT.with(|k| {
+        let mut k = k.borrow_mut();
+        if k.len() >= 16 {
+            k.remove(0);
+        }
+        k.push((text.to_string(), h.clone()));
+    });
+    h
 }
 
 /// A policy with `hashes` added where `names` decides, unless that already lets inline code
@@ -4023,10 +4110,14 @@ pub(crate) fn allow_own(resp: &mut HttpResponse, scripts: &[String], styles: &[&
     if island_style {
         let tag = format!("<style>{}</style>", ISLAND_RULE);
         let find = |needle: &[u8]| find_ascii_ci(&resp.body, needle);
-        let at = match (find(b"</head>"), find(b"<body")) {
-            (Some(h), _) => h,
-            (None, Some(b)) => resp.body[b..].iter().position(|&c| c == b'>').map_or(0, |e| b + e + 1),
-            (None, None) => 0,
+        let after = |at: usize| resp.body[at..].iter().position(|&c| c == b'>').map_or(0, |e| at + e + 1);
+        // Never before a `<!doctype>`, which would put the page in quirks mode (found in review).
+        let at = match (find(b"</head>"), find(b"<body"), find(b"<html"), find(b"<!doctype")) {
+            (Some(h), _, _, _) => h,
+            (None, Some(b), _, _) => after(b),
+            (None, None, Some(h), _) => after(h),
+            (None, None, None, Some(d)) => after(d),
+            (None, None, None, None) => 0,
         };
         insert_at(&mut resp.body, at, tag.as_bytes());
     }
@@ -4378,6 +4469,14 @@ impl Worker {
                         // change reloads it, as before (FEEDBACK54.md, Q-685; branch hmr).
                         let never = format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
                         let script = dev_script(self.generation, &never);
+                        // Through the page's policy, as the head is not gone yet (FEEDBACK59.md,
+                        // Q-904, found in review).
+                        if resp.headers.iter().any(|(k, v)| is_policy(k) && v != DROPPED) {
+                            let style = script.split_once("<style>").and_then(|(_, r)| r.split_once("</style>")).map(|(t, _)| t.to_string());
+                            let mut head = HttpResponse { status: resp.status, headers: std::mem::take(&mut resp.headers), body: Vec::new() };
+                            allow_own(&mut head, &script_texts(script.as_bytes()), &style.iter().map(String::as_str).collect::<Vec<_>>(), false);
+                            resp.headers = head.headers;
+                        }
                         page.tail.splice(0..0, script.into_bytes());
                     }
                     // Unless the program sent its own, or none (FEEDBACK55.md, Q-710; branch

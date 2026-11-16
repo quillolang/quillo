@@ -29,6 +29,13 @@ fn files(dir: &Path) -> Result<Vec<(String, String)>, String> {
         if path.extension().map_or(false, |x| x == "sql") && path.is_file() {
             let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
             let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+            // A file with no statement yet (an editor's new file, made empty before it is
+            // written) waits: applied empty, it was recorded, and the SQL then written in it
+            // never ran, under --watch at the first save (FEEDBACK62.md, Q-919, found in review).
+            if crate::sql::scan(crate::sql::Dialect::Sqlite, &text).stmts.is_empty() {
+                eprintln!("quillo: warning: migration {} has no statement yet: it is applied once it has one", name);
+                continue;
+            }
             out.push((name, text));
         }
     }
@@ -258,12 +265,22 @@ fn violations(c: &rusqlite::Connection) -> Result<Vec<(String, Option<i64>, Stri
     Ok(rows.flatten().collect())
 }
 
-/// After a file run with foreign keys off: every row's foreign key still finds its row, but those
-/// that found none before it, or the file fails, naming the first that does not (FEEDBACK62.md,
-/// Q-915; branch cache-and-migrate).
+/// After a file run with foreign keys off: every row's foreign key still finds its row, but as
+/// many as found none before it, or the file fails, naming a row of the first table and parent
+/// that has more (FEEDBACK62.md, Q-915; branch cache-and-migrate). Counted by table and parent,
+/// not by row, as a rebuilt table numbers its rows again, and one `without rowid` has none
+/// (found in review).
 fn foreign_key_check(c: &rusqlite::Connection, name: &str, before: &[(String, Option<i64>, String, i64)]) -> Result<(), String> {
     let all = violations(c)?;
-    let bad: Vec<_> = all.iter().filter(|v| !before.contains(v)).collect();
+    let count = |vs: &[(String, Option<i64>, String, i64)], t: &str, p: &str| vs.iter().filter(|v| v.0 == t && v.2 == p).count();
+    let mut grown: Vec<(&str, &str)> = Vec::new();
+    for v in &all {
+        let key = (v.0.as_str(), v.2.as_str());
+        if !grown.contains(&key) && count(&all, key.0, key.1) > count(before, key.0, key.1) {
+            grown.push(key);
+        }
+    }
+    let bad: Vec<_> = all.iter().filter(|v| grown.contains(&(v.0.as_str(), v.2.as_str()))).collect();
     if !before.is_empty() {
         let (t, row, p, _) = &before[0];
         let more = if before.len() > 1 { format!(" (and {} more)", before.len() - 1) } else { String::new() };
@@ -276,11 +293,13 @@ fn foreign_key_check(c: &rusqlite::Connection, name: &str, before: &[(String, Op
             more
         );
     }
-    match bad.first() {
+    // One that was not there before, when rows tell them apart; how many more there are now.
+    let new_rows: usize = grown.iter().map(|(t, p)| count(&all, t, p) - count(before, t, p)).sum();
+    match bad.iter().find(|v| !before.contains(v)).or(bad.first()) {
         None => Ok(()),
         Some((table, rowid, parent, _)) => {
             let row = rowid.map_or(String::new(), |id| format!(" row {}", id));
-            let more = if bad.len() > 1 { format!(" (and {} more)", bad.len() - 1) } else { String::new() };
+            let more = if new_rows > 1 { format!(" (and {} more)", new_rows - 1) } else { String::new() };
             Err(format!(
                 "it turns foreign keys off, and leaves {}{} pointing at no row of {}{}: FOREIGN KEY constraint failed, so it was rolled back",
                 table, row, parent, more

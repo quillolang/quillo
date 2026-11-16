@@ -23,7 +23,8 @@
   (FEEDBACK62.md, Q-915).
 - An answer made from who the visitor is stays `private`, whatever its route said: `public`
   (or `s-maxage`, a bare `max-age`) from `respond`, `file`'s `cache` or a `site_headers` rule is
-  sent as `private`, its time kept for the browser; the fields a CDN reads first (`CDN-Cache-Control`, `Surrogate-Control`, `X-Accel-Expires`) are
+  sent as `private`, its time kept for the browser, and so is any `cache-control` that says
+  neither `private` nor `no-store`; the fields a CDN reads first (`CDN-Cache-Control`, `Surrogate-Control`, `X-Accel-Expires`) are
   left out. A cache in front that ignores `Vary` gave one signed-in visitor's file to the next.
   The log says so once for each path, and `quillo check` warns where a route writes it
   (FEEDBACK59.md, Q-903, the user's choice).
@@ -34,7 +35,8 @@
   page looked right while nothing on it worked, and nothing said why (FEEDBACK59.md, Q-904).
 - `platform().dev`: true under `--watch` alone (FEEDBACK62.md, Q-920). Under `--watch`, the
   folders `db.migrate` reads are watched, so a migration that arrives is applied, and one that
-  stopped the first load is tried again once fixed (Q-919). Started
+  stopped the first load is tried again once fixed; a new file with no statement yet waits for
+  one, as an empty file applied was recorded and its SQL never ran (Q-919). Started
   on an address beyond this machine, `--watch` says that anyone on the network can reach the
   program (Q-918). `quillo check` takes `db.migrate` as giving a list, as a failure stops what
   runs it (Q-923).

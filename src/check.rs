@@ -680,14 +680,16 @@ fn middleware_of(r: &RouteDef) -> Option<String> {
 /// shared cache may keep. Not `file`'s `cache`, which says how long and not who keeps it, so
 /// that Quillo choosing `private` there is no surprise (FEEDBACK59.md, Q-903; branch
 /// cache-and-migrate).
-fn public_after_visitor(r: &RouteDef) -> Option<u32> {
+fn public_after_visitor(r: &RouteDef, fns: &HashMap<String, Arc<FnDef>>) -> Option<u32> {
     let mut visitor = r.reads_visitor;
     let mut at = None;
+    let mut called: Vec<String> = Vec::new();
     walk_expr(&r.body, &mut |x| match x {
         Expr::Call(f, args, line) => {
             if let Expr::Ident(n, _) = &**f {
                 match n.as_str() {
                     "session" | "cookie" | "set_session" | "set_cookie" | "end_session" => visitor = true,
+                    n if fns.contains_key(n) => called.push(n.to_string()),
                     // `respond(status, body, { "cache-control": ... })`, on its line.
                     "respond" => {
                         if let Some(Expr::Map(m)) = args.get(2) {
@@ -702,7 +704,25 @@ fn public_after_visitor(r: &RouteDef) -> Option<u32> {
         }
         _ => {}
     });
-    at.filter(|_| visitor)
+    let mut seen = HashSet::new();
+    at.filter(|_| visitor || called.iter().any(|n| seen.insert(n.clone()) && fns.get(n).is_some_and(|d| visitor_in(fns, &d.body, &mut seen))))
+}
+
+/// Whether code reads who the visitor is through the session or a cookie, there or in the
+/// functions it calls, as far as they go.
+fn visitor_in(fns: &HashMap<String, Arc<FnDef>>, body: &Expr, seen: &mut HashSet<String>) -> bool {
+    let mut found = false;
+    let mut called: Vec<String> = Vec::new();
+    walk_expr(body, &mut |x| {
+        if let Expr::Ident(n, _) = x {
+            if matches!(n.as_str(), "session" | "cookie" | "set_session" | "set_cookie" | "end_session") {
+                found = true;
+            } else if fns.contains_key(n.as_str()) {
+                called.push(n.to_string());
+            }
+        }
+    });
+    found || called.into_iter().any(|n| seen.insert(n.clone()) && fns.get(&n).is_some_and(|d| visitor_in(fns, &d.body, seen)))
 }
 
 /// The fields a route's pattern checks against values written there (`service: "a" | "b"`, a
@@ -3863,6 +3883,14 @@ impl Checker {
                 _ => None,
             })
             .collect();
+        // A route that reads who the visitor is, there or in a function it calls, and marks its
+        // answer for every cache: sent as `private`, said where it is written (FEEDBACK59.md, Q-903;
+        // branch cache-and-migrate).
+        for (file, r) in &routes {
+            if let Some(line) = public_after_visitor(r, &fns) {
+                self.diag_at(file.clone(), line, Severity::Warning, "this route reads who the visitor is (the session, a cookie, a header) and its `cache-control` lets a shared cache keep the answer: Quillo sends it as `private`, as a cache in front would give it to the next visitor, and the time stays for the visitor's own browser. Write `private` in it to say so".to_string());
+            }
+        }
         let mut told: HashSet<String> = HashSet::new();
         for (_, r) in &routes {
             let Some(guard) = middleware_of(r) else { continue };
@@ -4602,12 +4630,6 @@ impl Checker {
     }
 
     fn route(&mut self, r: &Arc<RouteDef>) {
-        // A route that reads who the visitor is and marks its answer for every cache: sent as
-        // `private`, said where it is written (FEEDBACK59.md, Q-903; branch cache-and-migrate).
-        if let Some(line) = public_after_visitor(r) {
-            self.line = line;
-            self.warn("this route reads who the visitor is (the session, a cookie, a header) and its `cache-control` lets a shared cache keep the answer: Quillo sends it as `private`, as a cache in front would give it to the next visitor, and the time stays for the visitor's own browser. Write `private` in it to say so");
-        }
         self.line = r.line;
         // `? { page: itn }` binds `itn` and tests nothing; `{ json: Usr }` never matches
         // (FEEDBACK45.md, Q-504; branch feedback40-43).
