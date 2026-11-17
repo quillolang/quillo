@@ -743,6 +743,19 @@ Found by the fix of Q-977 (branch security, 2026-11-17). Severity: low. Status: 
 | Requests | One |
 | Security | The CPU limit the operator set did not hold in the services under `--split` |
 
+### Q-990. `<sCript>` in another case is a script to the browser and any element to Quillo: `raw()` in it put visitor markup on the page
+
+Found in the review of Q-969's fix (branch security, 2026-11-18). Severity: medium. Status: FIXED on branch security. In 0.8.6 too. Code: src/parser.rs (`parse_html_el`); the renderer, `tags_fixed` and client.rs compared `script` and `style` case-sensitively.
+
+`<sCript>{raw(json.stringify(q))}</sCript>` wrote `</script><img ...>` as it was, even in plain HTML, as Quillo's protections for a script's text (`</` to `<\/`) and a component's refusal of dynamic scripts looked only for `script` written in lower case, while the browser takes a tag in any case.
+
+| Impact | |
+|---|---|
+| Functionality | `<sCript>` and `<sTyle>` (a tag that starts in lower case and is `script` or `style` in another) are refused where the program is read, by `quillo check` and at load; `<Script>` stays a view's name |
+| User | Visitor markup and script on the page, where `raw(json.stringify(...))` in a script is the guide's own safe form |
+| Requests | One |
+| Security | Cross-site scripting through a program that wrote the tag in another case |
+
 ## Checked and sound, and not covered, by group
 
 What each auditor tried that held, and what it did not get to, as it wrote them.

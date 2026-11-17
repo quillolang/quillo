@@ -552,6 +552,85 @@ pub struct ElFacts {
     /// `<svg>` (true) and `<foreignObject>` (false): what is in it is SVG's or HTML's, which the
     /// components in it are made for (FEEDBACK55.md, Q-763; branch feedback55).
     pub svg: Option<bool>,
+    /// What its tag is to the browser's parser where HTML, SVG and MathML meet, and whether it is
+    /// `<svg>` or `<math>`, where foreign content starts: the renderer follows where the parser is
+    /// only inside them, so that an `html` value in a script the parser reads as markup goes in a
+    /// CDATA section (see `crate::foreign`; FEEDBACK71.md, Q-969; branch security).
+    pub ns: crate::foreign::Kind,
+    pub ns_opens: bool,
+    /// It, or an element in it, may end foreign content where it stands (`<p>`, `<div>`): inside
+    /// `<svg>` its HTML, made once, is written as made, and what follows is where it leaves the
+    /// parser.
+    pub breaks: bool,
+    /// It is written from pieces of its own (`tags_fixed`, but not a `<pre>`, whose text may need
+    /// a newline first), and its tags go into its parent's pieces (`flat`: not an `<svg>`, a
+    /// `<foreignObject>` or a `<math>` either, which change what is in them). Worked out when it
+    /// is parsed, where its tag was read for it on each render (see `Interp::pieces_into`;
+    /// FEEDBACK71.md, Q-969; branch security).
+    pub pieces_root: bool,
+    pub flat: bool,
+    /// The tags its pieces hold of the elements in it change nothing of where the parser is
+    /// (`foreign::Kind::Other`): its pieces are written as they are inside `<svg>` too.
+    pub pieces_plain: bool,
+    /// What it writes depends on where the parser is: a `<script>` with a value in it, a view or a
+    /// component (whose body may have one), a value code makes (`{chart(x)}`); and whether its
+    /// children do, which a view's call is rendered before the view with.
+    pub sensitive: bool,
+    pub kids_sensitive: bool,
+    /// Nothing it writes depends on where the parser is, nor can hold a script: no view or
+    /// component, no `<script>` with a value, no value but literal markup (`{for p in ps =>
+    /// <circle cx={p.x}/>}`). An `<svg>` like it, in HTML, is written as HTML pages are, where
+    /// the parser is not followed (FEEDBACK71.md, Q-969, found in review; branch security).
+    pub ns_free: bool,
+    /// Its tag, and those of the elements in it, change nothing of where the parser is inside
+    /// `<svg>` or `<math>` (`foreign::Kind::Other`: no integration point, no tag that ends foreign
+    /// content), with no spread and no `<script>` with a value: there it is written as in HTML,
+    /// its values looked at (FEEDBACK71.md, Q-969, found in review; branch security).
+    pub ns_still: bool,
+    /// Where the view it calls puts its children, for that view called where it was
+    /// (`foreign::kept`): a view is walked once for each place it is called from.
+    pub kids_at: std::sync::atomic::AtomicU64,
+}
+
+/// Whether markup written in `e` (in a branch, a loop, a block, a lambda) may end foreign content
+/// (`ElFacts::breaks`).
+fn expr_breaks(e: &Expr) -> bool {
+    let mut hit = false;
+    crate::check::walk_expr(e, &mut |x| {
+        if let Expr::Html(el, _) = x {
+            hit |= el.facts.breaks;
+        }
+    });
+    hit
+}
+
+/// Whether `e`, a child of an element, writes only markup the program wrote: a literal, an element
+/// (`ElFacts::ns_free`), or a branch or a loop of them; no value, which may be html made apart.
+fn markup_only(e: &Expr) -> bool {
+    match e {
+        // A text (`{"Points"}`, `"${n} items"`), which the page escapes.
+        Expr::Lit(_) | Expr::Template(_) => true,
+        Expr::Html(el, _) => el.facts.ns_free,
+        Expr::If(_, a, b) => markup_only(a) && b.as_deref().is_none_or(markup_only),
+        Expr::For(_, _, body, _) => markup_only(body),
+        Expr::Match(_, arms, _) => arms.iter().all(|a| markup_only(&a.body)),
+        _ => false,
+    }
+}
+
+/// Whether what `e` writes in a page is the same wherever the parser is: its value, made by no
+/// code that may write markup (a variable's html was made already). See `ElFacts::sensitive`.
+fn writes_alike(e: &Expr) -> bool {
+    match e {
+        Expr::Lit(_) | Expr::Ident(..) => true,
+        Expr::Field(x, _, _) | Expr::Unary(_, x, _) => writes_alike(x),
+        Expr::Index(a, b, _) | Expr::Binary(_, a, b, _) | Expr::Coalesce(a, b) => writes_alike(a) && writes_alike(b),
+        Expr::Template(parts) => parts.iter().all(|p| match p {
+            TPart::Lit(_) => true,
+            TPart::Expr(x) => writes_alike(x),
+        }),
+        _ => false,
+    }
 }
 
 impl ElFacts {
@@ -588,6 +667,29 @@ impl ElFacts {
                 HtmlChild::El(e) => e.facts.fixed,
                 HtmlChild::Expr(e) => matches!(e, Expr::Lit(Lit::Str(_))),
             });
+        let ns = crate::foreign::kind_of(tag, attrs, component);
+        let ns_opens = matches!(ns, crate::foreign::Kind::Svg | crate::foreign::Kind::Math);
+        let svg = match tag {
+            "svg" => Some(true),
+            "foreignObject" => Some(false),
+            _ => None,
+        };
+        let pieces_root = tags_fixed && !matches!(tag, "pre" | "textarea" | "listing");
+        let flat = pieces_root && svg.is_none() && !ns_opens;
+        let els = || children.iter().filter_map(|c| if let HtmlChild::El(e) = c { Some(e) } else { None });
+        // Markup an expression in it writes counts too: `{c ? <p>x</p> : ""}` ends foreign
+        // content as `<p>x</p>` does (found in review).
+        let breaks = matches!(ns, crate::foreign::Kind::Breakout | crate::foreign::Kind::FontAsk)
+            || children.iter().any(|c| match c {
+                HtmlChild::El(e) => e.facts.breaks,
+                HtmlChild::Expr(x) => expr_breaks(x),
+            });
+        let pieces_plain = els().all(|e| !e.facts.flat || (e.facts.ns == crate::foreign::Kind::Other && e.facts.pieces_plain));
+        let kids_sensitive = children.iter().any(|c| match c {
+            HtmlChild::El(e) => e.facts.sensitive,
+            HtmlChild::Expr(x) => !writes_alike(x),
+        });
+        let dyn_script = tag.eq_ignore_ascii_case("script") && children.iter().any(|c| !matches!(c, HtmlChild::Expr(Expr::Lit(Lit::Str(_)))));
         ElFacts {
             component,
             void,
@@ -600,11 +702,27 @@ impl ElFacts {
             pieces: std::sync::OnceLock::new(),
             last_len: std::sync::atomic::AtomicUsize::new(0),
             select_value,
-            svg: match tag {
-                "svg" => Some(true),
-                "foreignObject" => Some(false),
-                _ => None,
-            },
+            svg,
+            ns,
+            ns_opens,
+            breaks,
+            pieces_root,
+            flat,
+            pieces_plain,
+            sensitive: component || dyn_script || kids_sensitive,
+            kids_sensitive,
+            ns_still: !component
+                && ns == crate::foreign::Kind::Other
+                && !attrs.iter().any(|(_, a)| matches!(a, AttrVal::Spread(_)))
+                && !dyn_script
+                && els().all(|e| e.facts.ns_still),
+            ns_free: !component
+                && !dyn_script
+                && children.iter().all(|c| match c {
+                    HtmlChild::El(e) => e.facts.ns_free,
+                    HtmlChild::Expr(x) => markup_only(x),
+                }),
+            kids_at: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -615,6 +733,7 @@ impl Clone for ElFacts {
             html_once: self.html_once.clone(),
             pieces: self.pieces.clone(),
             last_len: std::sync::atomic::AtomicUsize::new(self.last_len.load(std::sync::atomic::Ordering::Relaxed)),
+            kids_at: std::sync::atomic::AtomicU64::new(self.kids_at.load(std::sync::atomic::Ordering::Relaxed)),
             ..*self
         }
     }

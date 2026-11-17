@@ -3659,6 +3659,18 @@ impl Parser {
         // Where its `<` is (just read).
         let start = self.lx.pos.saturating_sub(1);
         let tag = self.read_html_name();
+        // `<sCript>` and `<sTyle>` are a script and a style sheet to the browser, which takes a
+        // tag in any case, while the renderer, the browser's compile and `quillo check` know them
+        // by `script` and `style`: `<sCript>{raw(x)}</sCript>` wrote a visitor's `</script><img>`
+        // as it was. Refused, as one way to write them is all a program needs (FEEDBACK71.md,
+        // Q-990; branch security). (`<Script>` is a view's name.)
+        if tag.starts_with(|c: char| c.is_ascii_lowercase()) && tag != "script" && tag != "style" && (tag.eq_ignore_ascii_case("script") || tag.eq_ignore_ascii_case("style")) {
+            return self.html_err(format!(
+                "write <{}> in lower case, <{}>: the browser takes it in any case, and Quillo writes what is in a script or a style sheet as such only for <script> and <style>",
+                tag,
+                tag.to_ascii_lowercase()
+            ));
+        }
         let mut id = None;
         let mut classes = Vec::new();
         loop {

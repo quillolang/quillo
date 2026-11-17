@@ -76,6 +76,13 @@
   request, Q-975); `find_all`, `replace` and `split` stop at `--max-compute`, and a pattern that rereads
   the text is an error value (300 KB had held a worker 11 s, Q-976). `--split` passes
   `--max-compute` on to its services (Q-1001).
+- **Scripts in SVG and MathML, and spreads**: `raw(...)` in a `<script>` the browser reads as
+  SVG or MathML goes in CDATA, following the parser's own namespace (a view's children where it
+  puts them, markup made apart and placed there later too), where visitor markup got out
+  (FEEDBACK71.md, Q-969); a spread `name` or `id` that `document` would take as its own property
+  is dropped on the elements that give it one (Q-979); `<sCript>` and `<sTyle>` in another case
+  are refused where the program is read, as the browser ran them as scripts that Quillo wrote as
+  any element (Q-990); the browser's `local_path` refuses C1 controls, as the server does (Q-968).
 - `http.*`'s `public_only` no longer takes 64:ff9b:1::/48 (RFC 8215's local-use NAT64) as the
   public internet (found in FEEDBACK67's review).
 - `ask` and `notify` where the code surely runs on the server (a route, a `server fn`, a tick,

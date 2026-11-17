@@ -2049,7 +2049,9 @@ B.lower = meta((s) => S(s, "lower").toLowerCase(), "lower", null);
 B.local_path = meta((s) => {
   if (typeof s !== "string") return null;
   s = s.replace(/[\t\n\r]/g, "").replace(/\\/g, "/").replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, "");
-  if (!s.startsWith("/") || s.startsWith("//") || /[\x00-\x1f\x7f]/.test(s) || /^\/%(2f|5c)/i.test(s)) return null;
+  // Control characters past ASCII too (C1, U+0080 to U+009F), as on the server, which refused
+  // them where this let them through (FEEDBACK71.md, Q-968; branch security).
+  if (!s.startsWith("/") || s.startsWith("//") || /[\x00-\x1f\x7f-\x9f]/.test(s) || /^\/%(2f|5c)/i.test(s)) return null;
   // Nor one that starts so once its `.` and `..` are taken out, as a browser takes them out:
   // `/.//evil.example` is `//evil.example` (as on the server, `local_target`; FEEDBACK71.md,
   // Q-968; branch feedback71).
@@ -7377,6 +7379,10 @@ function spreadListen(el, t, f) {
 // A key follows the rules of the same one written out: `onClick: f` is a handler, `@click`, as
 // the parser makes it (`onChange` on an <input> is `@input`), where it was dropped;
 // `className` is `class` and `htmlFor` is `for`, as React's (FEEDBACK48.md, Q-567; branch main).
+// The elements whose `name` the document takes as a property of its own, and of which its `id`
+// too: an `<object>`'s (3), an `<img>`'s that has a name (2). `<image>` is read as an `<img>`
+// (FEEDBACK71.md, Q-979; branch security).
+const DOCUMENT_TAKES = new Map([["img", 2], ["image", 2], ["form", 1], ["iframe", 1], ["embed", 1], ["object", 3]]);
 function spreadAttrs(maps, written, tag) {
   const o = {};
   const seen = new Set(written.map(attrKey));
@@ -7395,6 +7401,22 @@ function spreadAttrs(maps, written, tag) {
       seen.add(n);
       o[k] = v;
     }
+  }
+  // A `name` or `id` the document would take for one of its own properties: `<img
+  // name="createElement">` stops every component on the page. Asked of `document`'s prototypes, as
+  // the server's list is (`names_document`), not of `document`, which has the page's named
+  // elements too, a spread's own among them (FEEDBACK71.md, Q-979; branch security).
+  const takes = DOCUMENT_TAKES.get(tag.toLowerCase());
+  if (takes) {
+    const proto = Object.getPrototypeOf(document);
+    const own = (v) => typeof v === "string" && (v in proto || v === "location");
+    let named = written.some((w) => attrKey(w) === "name");
+    for (const k of Object.keys(o)) {
+      if (attrKey(k) !== "name") continue;
+      if (own(o[k])) delete o[k];
+      else if (typeof o[k] === "string" ? o[k] !== "" : !isNil(o[k]) && typeof o[k] !== "boolean") named = true;
+    }
+    if (takes === 3 || (takes === 2 && named)) for (const k of Object.keys(o)) if (attrKey(k) === "id" && own(o[k])) delete o[k];
   }
   return o;
 }
@@ -7525,7 +7547,9 @@ function leaving(e) {
     const method = ((by && by.getAttribute("formmethod")) || f.getAttribute("method") || "").toLowerCase();
     const target = (by && by.getAttribute("formtarget")) || f.getAttribute("target") || "";
     if (method === "dialog" || (target && target !== "_self")) return;
-    to = (by && by.getAttribute("formaction")) || f.action || location.href;
+    // The form's attribute, not `f.action`, which an `<input name="action">` in it stands for
+    // (FEEDBACK71.md, Q-979, found in review; branch security).
+    to = (by && by.getAttribute("formaction")) || f.getAttribute("action") || location.href;
   } else {
     if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     const a = e.target.closest && e.target.closest("a[href], area[href]");

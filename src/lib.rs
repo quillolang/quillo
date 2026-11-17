@@ -34,6 +34,7 @@ pub mod entities;
 pub mod debug;
 pub mod error;
 pub mod fetch;
+pub mod foreign;
 pub mod highlight;
 pub mod httpd;
 pub mod i18n;

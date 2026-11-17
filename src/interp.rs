@@ -3,6 +3,7 @@
 use crate::ast::*;
 use crate::decimal::Dec;
 use crate::error::QuilloError;
+use crate::foreign::Ns;
 use crate::parser::Parser;
 use crate::shared::Shared;
 use crate::value::*;
@@ -312,6 +313,11 @@ pub struct Interp {
     /// Rendering inside `<svg>` (and not in a `<foreignObject>` there): a component's root is its
     /// own island (see `island_wrap`; FEEDBACK55.md, Q-763; branch feedback55).
     in_svg: bool,
+    /// Where the browser's parser is as the page is written, HTML, SVG or MathML (see
+    /// `crate::foreign`): followed only inside `<svg>` and `<math>`, for a `<script>` whose text
+    /// the parser reads as markup there. Not `in_svg`, which is where a component stands
+    /// (FEEDBACK71.md, Q-969; branch security).
+    ns: crate::foreign::At,
     /// Components marked by comments so far (see `island_wrap`), and those of them that run by
     /// themselves: what an island around them says (FEEDBACK61.md, Q-892; branch feedback61).
     marked: (usize, usize),
@@ -1182,6 +1188,107 @@ fn spread_attr_allowed(name: &str) -> bool {
         && (!name.contains(':') || key == "xlink:href")
 }
 
+/// Whether a spread's `name` (or `id`) on an element whose names `document` takes as its own
+/// properties says one of `document`'s properties: `<img name="createElement">` made
+/// `document.createElement` that element, and the page's loader, and so every component on it,
+/// stopped for whoever was shown that data. Dropped, as DOMPurify's `SANITIZE_DOM` drops it. The
+/// document takes the `name` of an `<img>` (and `<image>`, which the parser reads as one),
+/// `<form>`, `<iframe>`, `<embed>` or `<object>`, the `id` of an `<object>`, and the `id` of an
+/// `<img>` that has a `name` too; what the program writes out is its own. The browser's runtime
+/// asks its own `document` (`spreadAttrs`; FEEDBACK71.md, Q-979; branch security).
+fn document_takes(tag: &str) -> Option<DocumentTakes> {
+    let is = |t: &str| tag.eq_ignore_ascii_case(t);
+    if is("img") || is("image") {
+        Some(DocumentTakes::IdWithName)
+    } else if is("object") {
+        Some(DocumentTakes::Id)
+    } else if is("form") || is("iframe") || is("embed") {
+        Some(DocumentTakes::Name)
+    } else {
+        None
+    }
+}
+
+/// What of an element's attributes `document` takes as its own names (see `document_takes`).
+#[derive(Clone, Copy, PartialEq)]
+enum DocumentTakes {
+    Name,
+    Id,
+    IdWithName,
+}
+
+/// Whether `v`, a text, is a property of `document` (`DOCUMENT_NAMES`).
+fn names_document(v: &Value) -> bool {
+    matches!(v, Value::Str(s) if DOCUMENT_NAMES.binary_search(&&**s).is_ok())
+}
+
+/// The names of `document`'s properties, its prototypes' and its own (`location`), as Chrome 157
+/// has them, sorted (see `document_takes`; FEEDBACK71.md, Q-979; branch security).
+const DOCUMENT_NAMES: &[&str] = &[
+    "ATTRIBUTE_NODE", "CDATA_SECTION_NODE", "COMMENT_NODE", "DOCUMENT_FRAGMENT_NODE",
+    "DOCUMENT_NODE", "DOCUMENT_POSITION_CONTAINED_BY", "DOCUMENT_POSITION_CONTAINS",
+    "DOCUMENT_POSITION_DISCONNECTED", "DOCUMENT_POSITION_FOLLOWING",
+    "DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC", "DOCUMENT_POSITION_PRECEDING",
+    "DOCUMENT_TYPE_NODE", "ELEMENT_NODE", "ENTITY_NODE", "ENTITY_REFERENCE_NODE", "NOTATION_NODE",
+    "PROCESSING_INSTRUCTION_NODE", "TEXT_NODE", "URL", "__defineGetter__", "__defineSetter__",
+    "__lookupGetter__", "__lookupSetter__", "__proto__", "activeElement", "activeViewTransition",
+    "addEventListener", "adoptNode", "adoptedStyleSheets", "alinkColor", "all", "anchors",
+    "append", "appendChild", "applets", "ariaNotify", "baseURI", "bgColor", "body",
+    "browsingTopics", "captureEvents", "caretPositionFromPoint", "caretRangeFromPoint",
+    "characterSet", "charset", "childElementCount", "childNodes", "children", "clear", "cloneNode",
+    "close", "compareDocumentPosition", "compatMode", "constructor", "contains", "contentType",
+    "cookie", "createAttribute", "createAttributeNS", "createCDATASection", "createComment",
+    "createDocumentFragment", "createElement", "createElementNS", "createEvent",
+    "createExpression", "createNSResolver", "createNodeIterator", "createProcessingInstruction",
+    "createRange", "createTextNode", "createTreeWalker", "currentScript", "customElementRegistry",
+    "defaultView", "designMode", "dir", "dispatchEvent", "doctype", "documentElement",
+    "documentURI", "domain", "elementFromPoint", "elementsFromPoint", "embeds", "evaluate",
+    "execCommand", "exitFullscreen", "exitPictureInPicture", "exitPointerLock", "featurePolicy",
+    "fgColor", "firstChild", "firstElementChild", "fonts", "forms", "fragmentDirective",
+    "fullscreen", "fullscreenElement", "fullscreenEnabled", "getAnimations", "getElementById",
+    "getElementsByClassName", "getElementsByName", "getElementsByTagName",
+    "getElementsByTagNameNS", "getRootNode", "getSelection", "hasChildNodes", "hasFocus",
+    "hasOwnProperty", "hasPrivateToken", "hasRedemptionRecord", "hasStorageAccess",
+    "hasUnpartitionedCookieAccess", "head", "hidden", "images", "implementation", "importNode",
+    "inputEncoding", "insertBefore", "isConnected", "isDefaultNamespace", "isEqualNode",
+    "isPrototypeOf", "isSameNode", "lastChild", "lastElementChild", "lastModified", "linkColor",
+    "links", "location", "lookupNamespaceURI", "lookupPrefix", "moveBefore", "nextSibling",
+    "nodeName", "nodeType", "nodeValue", "normalize", "onabort", "onanimationcancel",
+    "onanimationend", "onanimationiteration", "onanimationstart", "onauxclick", "onbeforecopy",
+    "onbeforecut", "onbeforeinput", "onbeforematch", "onbeforepaste", "onbeforetoggle",
+    "onbeforexrselect", "onblur", "oncancel", "oncanplay", "oncanplaythrough", "onchange",
+    "onclick", "onclose", "oncommand", "oncontentvisibilityautostatechange", "oncontextlost",
+    "oncontextmenu", "oncontextrestored", "oncopy", "oncuechange", "oncut", "ondblclick", "ondrag",
+    "ondragend", "ondragenter", "ondragleave", "ondragover", "ondragstart", "ondrop",
+    "ondurationchange", "onemptied", "onended", "onerror", "onfocus", "onformdata", "onfreeze",
+    "onfullscreenchange", "onfullscreenerror", "ongotpointercapture", "oninput", "oninvalid",
+    "onkeydown", "onkeypress", "onkeyup", "onload", "onloadeddata", "onloadedmetadata",
+    "onloadstart", "onlostpointercapture", "onmousedown", "onmouseenter", "onmouseleave",
+    "onmousemove", "onmouseout", "onmouseover", "onmouseup", "onmousewheel", "onpaste", "onpause",
+    "onplay", "onplaying", "onpointercancel", "onpointerdown", "onpointerenter", "onpointerleave",
+    "onpointerlockchange", "onpointerlockerror", "onpointermove", "onpointerout", "onpointerover",
+    "onpointerrawupdate", "onpointerup", "onprerenderingchange", "onprogress", "onratechange",
+    "onreadystatechange", "onreset", "onresize", "onresume", "onscroll", "onscrollend",
+    "onscrollsnapchange", "onscrollsnapchanging", "onsearch", "onsecuritypolicyviolation",
+    "onseeked", "onseeking", "onselect", "onselectionchange", "onselectstart", "onslotchange",
+    "onstalled", "onsubmit", "onsuspend", "ontimeupdate", "ontoggle", "ontransitioncancel",
+    "ontransitionend", "ontransitionrun", "ontransitionstart", "onvisibilitychange",
+    "onvolumechange", "onwaiting", "onwebkitanimationend", "onwebkitanimationiteration",
+    "onwebkitanimationstart", "onwebkitfullscreenchange", "onwebkitfullscreenerror",
+    "onwebkittransitionend", "onwheel", "open", "ownerDocument", "parentElement", "parentNode",
+    "pictureInPictureElement", "pictureInPictureEnabled", "plugins", "pointerLockElement",
+    "prepend", "prerendering", "previousSibling", "propertyIsEnumerable", "queryCommandEnabled",
+    "queryCommandIndeterm", "queryCommandState", "queryCommandSupported", "queryCommandValue",
+    "querySelector", "querySelectorAll", "readyState", "referrer", "releaseEvents", "removeChild",
+    "removeEventListener", "replaceChild", "replaceChildren", "requestStorageAccess",
+    "rootElement", "scripts", "scrollingElement", "startViewTransition", "styleSheets",
+    "textContent", "timeline", "title", "toLocaleString", "toString", "valueOf", "visibilityState",
+    "vlinkColor", "wasDiscarded", "webkitCancelFullScreen", "webkitCurrentFullScreenElement",
+    "webkitExitFullscreen", "webkitFullscreenElement", "webkitFullscreenEnabled", "webkitHidden",
+    "webkitIsFullScreen", "webkitVisibilityState", "when", "write", "writeln", "xmlEncoding",
+    "xmlStandalone", "xmlVersion",
+];
+
 /// Whether `key`, an attribute's name in lower case, is one the runtime or the page's loader
 /// reads to take an element up as a component (see `island_attr`), or Quillo's own
 /// `data-q-<style>` and `data-quillo-…`. Visitor JSON in a spread wrote them, and the element became a component of
@@ -1477,6 +1584,48 @@ fn class_words(v: &Value, out: &mut Held) {
     }
 }
 
+/// Whether `v`, written in a page, writes markup: html, or a list holding some (`render_value`);
+/// anything else is written escaped.
+fn holds_markup(v: &Value) -> bool {
+    match v {
+        Value::Html(_) => true,
+        Value::List(items) => items.iter().any(holds_markup),
+        _ => false,
+    }
+}
+
+/// How `render_tag_into` writes an element: as in HTML; inside foreign content for one that
+/// changes nothing of where the parser is (`ElFacts::ns_still`), its values looked at; following
+/// the parser there (FEEDBACK71.md, Q-969; branch security).
+const PLAIN: u8 = 0;
+const STILL: u8 = 1;
+const FOLLOW: u8 = 2;
+
+/// A child that may write a value itself, not in an element of its own (whose values are looked
+/// at there), or a view's or component's html (see `Interp::render_unseen`).
+fn unseen(c: &HtmlChild) -> bool {
+    match c {
+        HtmlChild::Expr(e) => writes_value(e),
+        HtmlChild::El(e) => e.facts.component,
+    }
+}
+
+/// Whether `e`, written where it is, may write a value outside any element it writes: `{x}`,
+/// `{f(x)}`, `{c ? s : ""}`, `{c ? <V s={s}/> : ""}`; not `{for p in ps => <g>{p.label}</g>}`,
+/// whose `<g>` looks at its own (see `unseen`).
+fn writes_value(e: &Expr) -> bool {
+    match e {
+        // A view's or component's html, which may be kept from where it was made (the view
+        // cache), is looked at as a value is (found in review).
+        Expr::Html(el, _) => el.facts.component,
+        Expr::Lit(_) | Expr::Template(_) => false,
+        Expr::If(_, a, b) => writes_value(a) || b.as_deref().is_some_and(writes_value),
+        Expr::For(_, _, body, _) => writes_value(body),
+        Expr::Match(_, arms, _) => arms.iter().any(|a| writes_value(&a.body)),
+        _ => true,
+    }
+}
+
 /// Whether the browser drops a newline right after the start tag of `tag`: <pre>, <textarea>
 /// and <listing>, whose text keeps its layout (FEEDBACK48.md, Q-572; branch main).
 fn drops_first_newline(tag: &str) -> bool {
@@ -1487,6 +1636,44 @@ fn drops_first_newline(tag: &str) -> bool {
 /// end it early (FEEDBACK35.md, Q-428; branch feedback27-35-fixes).
 pub fn script_text(s: &str) -> String {
     s.replace("</", "<\\/").replace("<!--", "<\\!--")
+}
+
+/// An `html` value (`raw(...)`) in a `<script>` the browser reads as SVG's or MathML's (see
+/// `foreign::At::script_is_foreign`), whose text its parser reads as markup: `<img onerror=...>`
+/// there was an element, which ran, and `&quot;` was `"`. In a CDATA section it is text, as in an
+/// HTML script, and the script gets the same code: written as `script_value` writes it, `</` as
+/// `<\/` and `<!--` as `<\!--`, a `]]>` in it split between two sections. Inside a section the
+/// program's own text opened (`open`), it goes in that one (FEEDBACK71.md, Q-969; branch security).
+fn foreign_script_html(h: &str, open: bool, out: &mut Held) {
+    if !open {
+        out.push_str("<![CDATA[");
+    }
+    let b = h.as_bytes();
+    let (mut from, mut i) = (0, 0);
+    while i < b.len() {
+        let (n, with) = match b[i] {
+            b'<' if b[i..].starts_with(b"</") => (2, "<\\/"),
+            b'<' if b[i..].starts_with(b"<!--") => (4, "<\\!--"),
+            b']' if b[i..].starts_with(b"]]>") => (3, "]]]]><![CDATA[>"),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        out.push_str(&h[from..i]);
+        out.push_str(with);
+        i += n;
+        from = i;
+    }
+    out.push_str(&h[from..]);
+    if !open {
+        out.push_str("]]>");
+    }
+}
+
+/// Whether a script's text so far leaves a CDATA section open (see `foreign_script_html`).
+fn in_cdata(text: &str) -> bool {
+    text.rfind("<![CDATA[").is_some_and(|at| !text[at..].contains("]]>"))
 }
 
 fn script_value(v: &Value, out: &mut Held) {
@@ -2147,6 +2334,7 @@ impl Interp {
             island_scopes: Vec::new(),
             island_scopes_at: Vec::new(),
             in_svg: false,
+            ns: Default::default(),
             marked: (0, 0),
             state_again: None,
             in_component: false,
@@ -2278,6 +2466,7 @@ impl Interp {
             island_scopes: Vec::new(),
             island_scopes_at: Vec::new(),
             in_svg: false,
+            ns: Default::default(),
             marked: (0, 0),
             state_again: None,
             in_component: false,
@@ -5323,8 +5512,15 @@ impl Interp {
         }
         // Views defined at the top level are cached (a nested one would
         // depend on the variables around it too).
+        // Kept as made in HTML: inside `<svg>` or `<math>` only one whose markup is the same
+        // there and leaves the parser where it was (FEEDBACK71.md, Q-969; branch security).
         if let (Some(cache), false, true) = (&self.view_cache, c.def.component, Arc::ptr_eq(&c.env, &self.globals)) {
-            return self.render_cached(cache.clone(), c, args, line, out);
+            // Its markup the program's own and nothing more, which no value can hold a script in:
+            // `view V(s) = <g>{s}</g>` was served in `<svg>` as made in HTML, a `<script>` in `s`
+            // as HTML's (found in review).
+            if self.ns.now == Ns::Html || matches!(&c.def.body, Expr::Html(el, _) if el.facts.ns_free && !el.facts.breaks) {
+                return self.render_cached(cache.clone(), c, args, line, out);
+            }
         }
         self.render_call_plain(c, args, line, out)
     }
@@ -5888,6 +6084,32 @@ impl Interp {
         if self.select_want.is_some() && (el.tag == "option" || el.tag == "optgroup") {
             return self.render_option_into(el, env, out);
         }
+        // Inside `<svg>` or `<math>`, or at one, where the parser is is followed (see
+        // `render_el_ns`): a page without them asks this, and nothing more; nor does one in HTML
+        // in which nothing depends on it (`ElFacts::ns_free`; FEEDBACK71.md, Q-969; branch
+        // security).
+        if self.ns.now != Ns::Html || (f.ns_opens && !f.ns_free) {
+            // Inside `<svg>`, one in which nothing depends on where the parser is, and nothing
+            // ends foreign content, writes the same and leaves the parser where it was: written
+            // as in HTML, where the parser is set aside (a chart's `<circle cx={x}/>`).
+            if f.ns_free && !f.breaks {
+                let here = std::mem::take(&mut self.ns);
+                let r = self.render_el_into(el, env, out);
+                self.ns = here;
+                return r;
+            }
+            // One whose tag, and those its pieces hold, change nothing of where the parser is
+            // there (`ElFacts::ns_still`): written as in HTML, where the parser stays, its values
+            // looked at (a chart's `<text x={x}>{label}</text>`).
+            if f.ns_still && matches!(self.ns.now, Ns::Svg | Ns::Math | Ns::Unsure) {
+                if f.pieces_root {
+                    self.make_pieces(el, env)?;
+                    return self.render_pieces::<STILL>(el, env, out);
+                }
+                return self.render_tag_into::<STILL>(el, env, out);
+            }
+            return self.render_el_ns(el, env, out);
+        }
         // An element whose HTML never changes is made once.
         if f.fixed {
             if let Some(h) = f.html_once.get() {
@@ -5895,42 +6117,149 @@ impl Interp {
                 return Ok(());
             }
             let start = out.len();
-            self.render_tag_into(el, env, out)?;
+            self.render_tag_into::<PLAIN>(el, env, out)?;
             let _ = f.html_once.set(Arc::from(&out[start..]));
             return Ok(());
         }
         // Tags that never change: their HTML is in pieces, made once. Not a <pre>, whose text,
         // known only as it is written, may need a newline before it (FEEDBACK48.md, Q-572;
-        // branch main).
-        if f.tags_fixed && !drops_first_newline(&el.tag) {
-            if f.pieces.get().is_none() {
-                let mut pieces = Vec::new();
-                let mut html = Held::new();
-                self.pieces_into(el, env, &mut pieces, &mut html)?;
-                let html = html.into_text().map_err(|o| o.at(el.line))?;
-                if !html.is_empty() {
-                    pieces.push(Piece::Html(html.into()));
-                }
-                let _ = f.pieces.set(pieces);
-            }
-            // In an `<svg>` (or out of it, in a `<foreignObject>`): see `in_svg`.
-            let outer = f.svg.map(|v| std::mem::replace(&mut self.in_svg, v));
-            let r = (|| {
-                for p in f.pieces.get().expect("set above") {
-                    match p {
-                        Piece::Html(h) => push_short(out, h),
-                        Piece::Expr(e) => self.render_expr_into(e, env, out)?,
-                        Piece::El(e) => self.render_el_into(e, env, out)?,
-                    }
-                }
-                Ok(())
-            })();
-            if let Some(v) = outer {
-                self.in_svg = v;
-            }
-            return r;
+        // branch main). Worked out when it was parsed (`ElFacts::pieces_root`), where its tag was
+        // read for it on each render (FEEDBACK71.md, Q-969; branch security).
+        if f.pieces_root {
+            self.make_pieces(el, env)?;
+            return self.render_pieces::<PLAIN>(el, env, out);
         }
-        self.render_tag_into(el, env, out)
+        self.render_tag_into::<PLAIN>(el, env, out)
+    }
+
+    /// A child the renderer writes as a value (`{raw(x)}`, `{children}`, a view's or a
+    /// component's html), inside foreign content: what the parser makes of it there, read from
+    /// what was written (`foreign::written`). A script in it that was made for HTML (`let s =
+    /// <script>{raw(x)}</script>`, then `<svg>{s}</svg>`; markup given to a view's attribute)
+    /// has its text put in CDATA sections there; and a `<p>` in it, which ends foreign content,
+    /// is followed (FEEDBACK71.md, Q-969, found in review; branch security).
+    fn render_unseen(&mut self, out: &mut Held, f: impl FnOnce(&mut Self, &mut Held) -> Result<(), Ctrl>) -> Result<(), Ctrl> {
+        let at = out.len();
+        let here = self.ns;
+        let r = f(self, out);
+        if here.now != Ns::Html {
+            let (after, fixed) = crate::foreign::written(here, out.get(at..).unwrap_or(""));
+            self.ns = after;
+            if let Some(t) = fixed {
+                out.truncate(at);
+                out.push_str(&t);
+            }
+        }
+        r
+    }
+
+    /// A child that may write a value, inside foreign content: a value that holds no markup (a
+    /// text, a number, a map, all written escaped) as it is, with nothing more; html, a list
+    /// holding some, and what a branch or a loop wrote, read again (`render_unseen`), as only
+    /// those can hold a `<script>` (FEEDBACK71.md, Q-969, found in review; branch security).
+    fn render_value_ns(&mut self, e: &Expr, env: &Env, out: &mut Held) -> Result<(), Ctrl> {
+        match e {
+            Expr::If(..) | Expr::For(..) | Expr::Match(..) | Expr::Block(_) | Expr::Binary(BinOp::And | BinOp::Or, ..) => {
+                self.render_unseen(out, |this, out| this.render_expr_into(e, env, out))
+            }
+            _ => {
+                let v = self.eval(e, env)?;
+                if holds_markup(&v) {
+                    self.render_unseen(out, |_, out| {
+                        render_value(&v, out);
+                        Ok(())
+                    })
+                } else {
+                    render_value(&v, out);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// `el`'s pieces, made on its first render (see `ElFacts::pieces`).
+    #[inline]
+    fn make_pieces(&mut self, el: &HtmlEl, env: &Env) -> Result<(), Ctrl> {
+        if el.facts.pieces.get().is_none() {
+            self.build_pieces(el, env)?;
+        }
+        Ok(())
+    }
+
+    #[cold]
+    fn build_pieces(&mut self, el: &HtmlEl, env: &Env) -> Result<(), Ctrl> {
+        let mut pieces = Vec::new();
+        let mut html = Held::new();
+        self.pieces_into(el, env, &mut pieces, &mut html)?;
+        let html = html.into_text().map_err(|o| o.at(el.line))?;
+        if !html.is_empty() {
+            pieces.push(Piece::Html(html.into()));
+        }
+        let _ = el.facts.pieces.set(pieces);
+        Ok(())
+    }
+
+    /// `el` written from its pieces (`M`: see `render_tag_into`).
+    #[inline]
+    fn render_pieces<const M: u8>(&mut self, el: &HtmlEl, env: &Env, out: &mut Held) -> Result<(), Ctrl> {
+        let f = &el.facts;
+        // In an `<svg>` (or out of it, in a `<foreignObject>`): see `in_svg`.
+        let outer = f.svg.map(|v| std::mem::replace(&mut self.in_svg, v));
+        let r = (|| {
+            for p in f.pieces.get().expect("set above") {
+                match p {
+                    Piece::Html(h) => push_short(out, h),
+                    Piece::Expr(e) if M != PLAIN && writes_value(e) => self.render_value_ns(e, env, out)?,
+                    Piece::Expr(e) => self.render_expr_into(e, env, out)?,
+                    Piece::El(e) if M != PLAIN && e.facts.component => self.render_unseen(out, |this, out| this.render_el_into(e, env, out))?,
+                    Piece::El(e) => self.render_el_into(e, env, out)?,
+                }
+            }
+            Ok(())
+        })();
+        if let Some(v) = outer {
+            self.in_svg = v;
+        }
+        r
+    }
+
+    /// An element inside `<svg>` or `<math>`, or one that opens them: written as in HTML, where
+    /// the browser's parser will be is followed as it goes (`crate::foreign`), for a `<script>`
+    /// it reads as SVG's or MathML's (FEEDBACK71.md, Q-969; branch security).
+    #[cold]
+    fn render_el_ns(&mut self, el: &HtmlEl, env: &Env, out: &mut Held) -> Result<(), Ctrl> {
+        let f = &el.facts;
+        // Its HTML, made once, is the same wherever it stands; but where one in it may end
+        // foreign content (`<p>`), which the parser is then out of, it is written as it goes.
+        if f.fixed && (!f.breaks || matches!(self.ns.now, Ns::Html | Ns::Unsure)) {
+            if let Some(h) = f.html_once.get() {
+                out.push_str(h);
+                return Ok(());
+            }
+            let start = out.len();
+            self.render_tag_into::<FOLLOW>(el, env, out)?;
+            let _ = f.html_once.set(Arc::from(&out[start..]));
+            return Ok(());
+        }
+        // Its pieces, where what their tags open changes nothing of where the parser is: what is
+        // in an HTML element, or in SVG's or MathML's elements that are none of `foreign::Kind`'s.
+        if f.pieces_root {
+            let outer = self.ns;
+            let inner = crate::foreign::enter(outer, f.ns);
+            let plain = match inner.now {
+                Ns::Html | Ns::Unsure => true,
+                Ns::Svg | Ns::Math => f.pieces_plain,
+                _ => false,
+            };
+            if plain {
+                self.make_pieces(el, env)?;
+                self.ns = inner;
+                let r = self.render_pieces::<FOLLOW>(el, env, out);
+                self.ns = crate::foreign::leave(outer, inner, self.ns);
+                return r;
+            }
+        }
+        self.render_tag_into::<FOLLOW>(el, env, out)
     }
 
     /// An option (or a group of them) of a `<select value={...}>`, made each time: ` selected` on
@@ -5945,7 +6274,13 @@ impl Interp {
         match el.facts.html_once.get() {
             Some(h) if option && el.facts.fixed => out.push_str(h),
             _ => {
-                self.render_tag_into(el, env, out)?;
+                // Where the parser is, inside `<svg>` (see `render_el_ns`; FEEDBACK71.md, Q-969;
+                // branch security).
+                if self.ns.now != Ns::Html {
+                    self.render_tag_into::<FOLLOW>(el, env, out)?;
+                } else {
+                    self.render_tag_into::<PLAIN>(el, env, out)?;
+                }
                 if option && el.facts.fixed {
                     let _ = el.facts.html_once.set(Arc::from(&out[start..]));
                 }
@@ -5983,8 +6318,9 @@ impl Interp {
         }
         for c in &el.children {
             match c {
-                // Not an `<svg>` or a `<foreignObject>`, which change what is in them (`in_svg`).
-                HtmlChild::El(e) if e.facts.tags_fixed && !drops_first_newline(&e.tag) && e.facts.svg.is_none() => self.pieces_into(e, env, pieces, html)?,
+                // Not an `<svg>` or a `<foreignObject>`, which change what is in them (`in_svg`),
+                // nor a `<math>` (`ElFacts::flat`; FEEDBACK71.md, Q-969; branch security).
+                HtmlChild::El(e) if e.facts.flat => self.pieces_into(e, env, pieces, html)?,
                 HtmlChild::Expr(e @ Expr::Lit(Lit::Str(_))) => self.render_expr_into(e, env, html)?,
                 _ => {
                     if !html.is_empty() {
@@ -6003,11 +6339,16 @@ impl Interp {
         Ok(())
     }
 
-    fn render_tag_into(&mut self, el: &HtmlEl, env: &Env, out: &mut Held) -> Result<(), Ctrl> {
+    /// `el`'s tags and contents, as `M` says: `PLAIN` in HTML; `FOLLOW`, inside `<svg>` or
+    /// `<math>` or at one, following where the browser's parser will be (see `render_el_ns`);
+    /// `STILL` there for an element that changes nothing of it (`ElFacts::ns_still`), its values
+    /// looked at as `FOLLOW` looks at them.
+    fn render_tag_into<const M: u8>(&mut self, el: &HtmlEl, env: &Env, out: &mut Held) -> Result<(), Ctrl> {
         let f = &el.facts;
         if f.html {
             out.push_str("<!doctype html>");
         }
+        let tag_start = out.len();
         out.push('<');
         out.push_str(&el.tag);
         // Most elements have no spread, no `class=` and are no <textarea>:
@@ -6019,32 +6360,57 @@ impl Interp {
         }
         let text_value = if f.plain_attrs { self.render_attrs_fast(el, env, out)?; None } else { self.render_attrs(el, env, out)? };
         out.push('>');
+        // Where its contents are to the parser, inside `<svg>` or `<math>` or at one: its
+        // attributes, written, say it for an `<annotation-xml>`'s `encoding` and a `<font>`'s
+        // `color`, `face` and `size` (FEEDBACK71.md, Q-969; branch security).
+        let ns = (M == FOLLOW).then(|| {
+            let outer = self.ns;
+            let kind = match f.ns {
+                crate::foreign::Kind::AnnotationAsk | crate::foreign::Kind::FontAsk => crate::foreign::kind_written(f.ns, &out[tag_start..]),
+                k => k,
+            };
+            let inner = crate::foreign::enter(outer, kind);
+            self.ns = inner;
+            (outer, inner)
+        });
         if f.void {
+            if let Some((outer, inner)) = ns {
+                self.ns = crate::foreign::leave(outer, inner, inner);
+            }
             return Ok(());
         }
-        if select {
+        let r = if select {
             // Its options, against its value (see `render_option_into`).
-            let want = self.select_pending.take().map(|v| SelectWant::of(&v)).transpose().map_err(|o| o.at(el.line))?;
-            let outer = std::mem::replace(&mut self.select_want, want);
-            let r = self.render_contents(el, env, text_value, out);
-            self.select_want = outer;
-            r?;
+            match self.select_pending.take().map(|v| SelectWant::of(&v)).transpose().map_err(|o| o.at(el.line)) {
+                Ok(want) => {
+                    let outer = std::mem::replace(&mut self.select_want, want);
+                    let r = self.render_contents::<M>(el, env, text_value, out);
+                    self.select_want = outer;
+                    r
+                }
+                Err(e) => Err(e),
+            }
         } else if let Some(v) = f.svg {
             let outer = std::mem::replace(&mut self.in_svg, v);
-            let r = self.render_contents(el, env, text_value, out);
+            let r = self.render_contents::<M>(el, env, text_value, out);
             self.in_svg = outer;
-            r?;
+            r
         } else {
-            self.render_contents(el, env, text_value, out)?;
+            self.render_contents::<M>(el, env, text_value, out)
+        };
+        // Back where it was, its error too.
+        if let Some((outer, inner)) = ns {
+            self.ns = crate::foreign::leave(outer, inner, self.ns);
         }
+        r?;
         out.push_str("</");
         out.push_str(&el.tag);
         out.push('>');
         Ok(())
     }
 
-    /// An element's contents.
-    fn render_contents(&mut self, el: &HtmlEl, env: &Env, text_value: Option<String>, out: &mut Held) -> Result<(), Ctrl> {
+    /// An element's contents (`M`: see `render_tag_into`).
+    fn render_contents<const M: u8>(&mut self, el: &HtmlEl, env: &Env, text_value: Option<String>, out: &mut Held) -> Result<(), Ctrl> {
         let f = &el.facts;
         match text_value {
             Some(t) => {
@@ -6060,6 +6426,10 @@ impl Interp {
             // HTML (`raw(...)`) as it is, but without `</` or `<!--`, so
             // neither can end the element early.
             None if el.tag == "script" => {
+                // One the parser reads as SVG's or MathML's, its text markup: HTML in it goes in a
+                // CDATA section (`foreign_script_html`; FEEDBACK71.md, Q-969; branch security).
+                let foreign = M == FOLLOW && self.ns.script_is_foreign();
+                let start = out.len();
                 for c in &el.children {
                     match c {
                         // Its own text is code, which the browser does not unescape: written as it
@@ -6072,7 +6442,13 @@ impl Interp {
                             // script (FEEDBACK53.md, Q-682; found in review).
                             let maybe = matches!(e, Expr::Binary(BinOp::And, ..) | Expr::If(_, _, None));
                             if !(maybe && matches!(v, Value::Nil | Value::Bool(false))) {
-                                script_value(&v, out);
+                                match &v {
+                                    Value::Html(h) if foreign => {
+                                        let open = in_cdata(&out[start..]);
+                                        foreign_script_html(h, open, out);
+                                    }
+                                    _ => script_value(&v, out),
+                                }
                             }
                         }
                         c => self.render_child(c, env, out)?,
@@ -6106,7 +6482,14 @@ impl Interp {
             None => {
                 let start = out.len();
                 for c in &el.children {
-                    self.render_child(c, env, out)?;
+                    if M != PLAIN && unseen(c) {
+                        match c {
+                            HtmlChild::Expr(e) => self.render_value_ns(e, env, out)?,
+                            c => self.render_unseen(out, |this, out| this.render_child(c, env, out))?,
+                        }
+                    } else {
+                        self.render_child(c, env, out)?;
+                    }
                 }
                 // A <pre>, <textarea> or <listing> whose text starts with a newline: the browser
                 // drops the first one after the start tag, so one more is written, and the text
@@ -6182,6 +6565,26 @@ impl Interp {
             // Once each: the first of `href` and `HREF` in a spread.
             if !(attr_key(&n) == "id" && el.id.is_some()) && written.insert(attr_key(&n)) {
                 entries.push((n, v));
+            }
+        }
+        // A spread's `name` or `id` that `document` would take for one of its own properties
+        // (see `document_takes`; FEEDBACK71.md, Q-979; branch security).
+        if let Some(takes) = document_takes(&el.tag) {
+            entries.retain(|(n, v)| !(attr_key(n) == "name" && names_document(v)));
+            let named = || {
+                explicit.iter().any(|(n, _)| attr_key(n) == "name")
+                    || entries.iter().any(|(n, v)| {
+                        attr_key(n) == "name"
+                            && match v {
+                                Value::Str(s) => !s.is_empty(),
+                                Value::Html(h) => !h.is_empty(),
+                                Value::Nil | Value::Bool(_) => false,
+                                _ => true,
+                            }
+                    })
+            };
+            if takes == DocumentTakes::Id || (takes == DocumentTakes::IdWithName && named()) {
+                entries.retain(|(n, v)| !(attr_key(n) == "id" && names_document(v)));
             }
         }
         entries.extend(explicit.iter().cloned());
@@ -6469,6 +6872,38 @@ impl Interp {
         }
     }
 
+    /// Where the view `c`, called by `el` here, puts the children it is given, as the parser will
+    /// read them (`foreign::children_at`): `None` where it writes them nowhere. The answer is kept
+    /// on `el` with the view's definition and where it was called, which it is the answer for:
+    /// the same element can call another view (`<Box>`, `Box` a parameter), and an answer kept
+    /// for `<div>` had a later `<svg>` view's script written for HTML (FEEDBACK71.md, Q-969, found
+    /// in review; branch security). HTML is one place to it: what a run in HTML had before does
+    /// not change where children go.
+    fn children_place(&self, el: &HtmlEl, c: &Closure) -> Option<crate::foreign::At> {
+        use crate::foreign::HTML_PLACE;
+        use std::sync::atomic::Ordering::Relaxed;
+        let def = Arc::as_ptr(&c.def) as usize;
+        // Called in HTML, answered HTML or nowhere, as kept: as here, at one look.
+        if self.ns.now == Ns::Html {
+            let word = el.facts.kids_at.load(Relaxed);
+            if word >> 8 == ((def as u64) << 8 | HTML_PLACE as u64) && matches!(word as u8, 1 | HTML_PLACE) && Arc::ptr_eq(&c.env, &self.globals) {
+                return None;
+            }
+        }
+        let at = if self.ns.now == Ns::Html { Default::default() } else { self.ns };
+        let keep = Arc::ptr_eq(&c.env, &self.globals);
+        if keep {
+            if let Some(answer) = crate::foreign::kept_answer(el.facts.kids_at.load(Relaxed), def, at) {
+                return answer;
+            }
+        }
+        let answer = crate::foreign::children_at(c, at);
+        if let (true, Some(word)) = (keep, crate::foreign::kept(def, at, answer)) {
+            el.facts.kids_at.store(word, Relaxed);
+        }
+        answer
+    }
+
     /// `<Card user={u}>"kids"</Card>` calls view `Card` with its parameters
     /// taken from attributes by name; a `children` parameter gets the body.
     fn render_component_into(&mut self, el: &HtmlEl, env: &Env, out: &mut Held) -> Result<(), Ctrl> {
@@ -6484,9 +6919,19 @@ impl Interp {
         // Held as the page is (FEEDBACK71.md, Q-977; branch security).
         let mut held = Held::new();
         if takes_children {
-            for ch in &el.children {
-                self.render_child(ch, env, &mut held)?;
+            // As where the view puts them, which they are rendered before: `view Icon(children) =
+            // <svg>{children}</svg>` has them in an `<svg>`, where a `<script>` among them is
+            // read as SVG's. Asked only where what they write depends on it (FEEDBACK71.md,
+            // Q-969; branch security).
+            let at = if el.facts.kids_sensitive { self.children_place(el, &c) } else { None };
+            // HTML where it is HTML already: as here.
+            let at = at.filter(|a| a.now != Ns::Html || self.ns.now != Ns::Html);
+            let outer = at.map(|a| std::mem::replace(&mut self.ns, a));
+            let r = el.children.iter().try_for_each(|ch| self.render_child(ch, env, &mut held));
+            if let Some(o) = outer {
+                self.ns = o;
             }
+            r?;
         }
         let mut kids = held.into_text().map_err(|o| o.at(line))?;
         // A view called without spreads takes its arguments straight from
@@ -6829,12 +7274,16 @@ impl Interp {
         let was = std::mem::replace(&mut self.in_component, true);
         // Where it stands, in an `<svg>` or not (see `in_svg`).
         let outer = std::mem::replace(&mut self.in_svg, d.svg);
+        // Its part is read in a `<template>`, as HTML, wherever it then goes (FEEDBACK71.md,
+        // Q-969; branch security).
+        let outer_ns = std::mem::take(&mut self.ns);
         let marked = self.marked;
         let r = crate::value::js_numbers(true, || self.render_call_into(&d.c, d.args.clone(), d.line, &mut body));
         self.in_component = was;
         let (state, mut live) = self.islands.pop().unwrap_or_default();
         let _ = self.states_now(&state);
         self.in_svg = outer;
+        self.ns = outer_ns;
         self.state_preset = None;
         r?;
         let body = body.into_text().map_err(|o| o.at(d.line))?;
