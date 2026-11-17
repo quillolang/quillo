@@ -139,10 +139,10 @@ Fix: in `location`, after `without_dots`, write a leading run of `/` as a single
 - The browser's `local_path` (src/client/runtime.js) says the same: it let `/.//evil.example` through, where the server now gives null.
 - One more form found while testing: `/.///evil.com` gave `///evil.com`, which browsers also take to evil.com. It is fixed by the same change.
 - Tests: `tests/feedback71.rs`, 3 tests:
-  - 17 redirect forms with and without `--base /app`, through `redirect`, a checked redirect and the guide's recipe;
-  - 24 `local_path` inputs, the 14 refused and 10 paths of the site's own, and on the server control characters past ASCII;
-  - the same 24 in Chrome, through a component, against the server's answers.
-  - On 0.8.6, every refused form gives `//evil.com` (or `///evil.com`), and `local_path` lets all 24 through.
+  - 18 redirect forms with and without `--base /app`, through `redirect`, a checked redirect and the guide's recipe;
+  - 29 `local_path` inputs, the 19 refused and 10 paths of the site's own, and on the server control characters past ASCII;
+  - the same 29 in Chrome, through a component, against the server's answers.
+  - On 0.8.6, every refused form gives `//evil.com` (or `///evil.com`), and `local_path` lets all 29 through.
 - A review agent checked 5.5 million path forms against WHATWG URL resolution, with and without `--base`: none left the site after the fix, and the same harness without it reproduces `//a`.
 - Speed. The first version's extra checks cost about 220 instructions per `local_path` call. So `local_target` now copies an address only when it has a tab, a line break or a `\`. It compares `/%2f` and `/%5c` ignoring case, with no lower-case copy. It walks the segments only when one starts with `.` or `%`. `dots` compares without a lower-case copy too.
 - Instructions retired for 2 million calls (`/usr/bin/time -l`, 3 runs each, steady to under 1%), against branch `pwa` 8e06a66 unchanged:
@@ -155,7 +155,11 @@ Fix: in `location`, after `without_dots`, write a leading run of `/` as a single
   | `redirect("/account/settings")` | 6.79 G | 6.76 G | −0.4% |
 
   Only a path with a real dot segment pays more, for the resolution that closes the hole.
-- Found while testing, not changed: the browser's `local_path` lets a control character past ASCII (U+0080 to U+009F) through, where the server's refuses it.
+- A second review, of the commit, compared the old and new `local_target`, `dots`, browser `local_path` and `location` on about 12 million inputs. It found no difference but the intended refusals, and no `Location` that starts with `//`. Its edge cases are in the tests.
+- One side effect: a path that taking the dots out left as `//` and a host IDNA cannot write (`/..//\u{85}`) made `redirect` return an error value. It now gives the site's own `/%C2%85`.
+- Found while testing, not changed:
+  - The browser's `local_path` lets a control character past ASCII (U+0080 to U+009F) through, where the server's refuses it.
+  - `/.%2F/evil.com`, `/..%2f/evil.com` and `/%2e%2F%2Fevil.com` are accepted, as they were. They are another host only to a server that decodes `%2F` before taking the dots out, the reason `/%2F/x` is refused. Browsers, and Quillo's own `redirect`, keep them on the site.
 
 ### Q-969. `raw(...)` inside an `<svg>` or `<math>` `<script>` puts visitor markup on the page (Q-646 is still open for html values)
 

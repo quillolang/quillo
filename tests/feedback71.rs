@@ -68,6 +68,9 @@ fn a_path_whose_dots_hide_a_second_slash_stays_on_the_site() {
             ("/.//evil.com/x?y=//z#//w", "/evil.com/x?y=//z#//w"),
             ("/.//", "/"),
             ("/.//é", "/%C3%A9"),
+            // `//` and a host IDNA cannot write once the dots were out: an error value before, a
+            // path of the site's own now (found in the second review).
+            ("/..//\u{85}", "/%C2%85"),
             // Not at the start, a `//` is the site's own path, as before.
             ("/a/.//b", "/a//b"),
             ("/a//b", "/a//b"),
@@ -91,7 +94,7 @@ fn a_path_whose_dots_hide_a_second_slash_stays_on_the_site() {
 fn local_path_is_null_for_a_path_that_dots_take_off_the_site() {
     let d = dir("local-path", &format!("for n in {} {{ print(json.stringify(local_path(n))) }}\n", PATHS));
     let want = [
-        "null", "null", "null", "null", "null", "null", "null", "null", "null", "null", "null", "null", "null", "null",
+        "null", "null", "null", "null", "null", "null", "null", "null", "null", "null", "null", "null", "null", "null", "null", "null", "null", "null", "null",
         // Paths of the site's own, as they were given.
         "\"/a/../b\"", "\"/./x\"", "\"/a/.//b\"", "\"/..\"", "\"/.\"", "\"/x?next=/.//evil\"", "\"/x#/.//evil\"", "\"/...//x\"", "\"/.a//x\"", "\"/./é\"",
     ];
@@ -103,10 +106,10 @@ fn local_path_is_null_for_a_path_that_dots_take_off_the_site() {
 }
 
 /// What `local_path` is given in the tests of both sides, as a Quillo list.
-const PATHS: &str = r#"["/.//evil.example", "/%2e//evil.example", "/%2E%2e//evil.example", "/a/..//evil.example", "/a/b/../..//evil.example", "/.%2e//evil.example", "/.///evil.example", "/./\\evil.example", "/.\t//evil.example", "/./%2F/evil", "/./%5C/evil", "/.\r//evil.example", "/%2E/%2F/x", "/.//", "/a/../b", "/./x", "/a/.//b", "/..", "/.", "/x?next=/.//evil", "/x#/.//evil", "/...//x", "/.a//x", "/./é"]"#;
+const PATHS: &str = r#"["/.//evil.example", "/%2e//evil.example", "/%2E%2e//evil.example", "/a/..//evil.example", "/a/b/../..//evil.example", "/.%2e//evil.example", "/.///evil.example", "/./\\evil.example", "/.\t//evil.example", "/./%2F/evil", "/./%5C/evil", "/.\r//evil.example", "/%2E/%2F/x", " /.//evil.example ", "/%2e.//evil.example", "/a/../%2F/x", "/./%2f/evil", "/.//evil.example?x=1", "/.//", "/a/../b", "/./x", "/a/.//b", "/..", "/.", "/x?next=/.//evil", "/x#/.//evil", "/...//x", "/.a//x", "/./é"]"#;
 
 /// What the server's `local_path` says for each of `PATHS`.
-const PATHS_SAID: &str = r#"[null,null,null,null,null,null,null,null,null,null,null,null,null,null,"/a/../b","/./x","/a/.//b","/..","/.","/x?next=/.//evil","/x#/.//evil","/...//x","/.a//x","/./é"]"#;
+const PATHS_SAID: &str = r#"[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,"/a/../b","/./x","/a/.//b","/..","/.","/x?next=/.//evil","/x#/.//evil","/...//x","/.a//x","/./é"]"#;
 
 // The browser's `local_path` says what the server's says: a component that runs it on a click.
 #[test]
