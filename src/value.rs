@@ -550,7 +550,8 @@ impl Value {
         fn go<const ASK: bool>(v: &Value, out: &mut Vec<u8>, max: usize, left: usize, depth: usize) -> Result<(), String> {
             let inner = |x: &Value, out: &mut Vec<u8>| -> Result<(), String> {
                 match x {
-                    Value::List(_) | Value::Map(_) | Value::Err(..) => go::<ASK>(x, out, max, left - 1, depth),
+                    // Past 256 levels on a new piece of stack when this one runs low (`deeper`).
+                    Value::List(_) | Value::Map(_) | Value::Err(..) => deeper(depth + 1 - left, || go::<ASK>(x, out, max, left - 1, depth)),
                     Value::Func(_) | Value::Builtin(..) => Err(FUNCTION_IN_JSON.into()),
                     scalar if ASK => {
                         scalar_held(scalar, out)?;
@@ -700,7 +701,7 @@ impl Value {
         match self {
             Value::Err(e, _, _) => {
                 lit!(if island { b"{\"$quillo_err\":" } else { b"{\"error\":" });
-                if !e.tree_json_into::<HELD, SCRIPT>(out, island, depth + 1) {
+                if !tree_next::<HELD, SCRIPT>(e, out, island, depth + 1) {
                     return false;
                 }
                 lit!(b"}");
@@ -730,7 +731,7 @@ impl Value {
                     if i > 0 {
                         lit!(b",");
                     }
-                    if !x.tree_json_into::<HELD, SCRIPT>(out, island, depth + 1) {
+                    if !tree_next::<HELD, SCRIPT>(x, out, island, depth + 1) {
                         return false;
                     }
                 }
@@ -743,7 +744,7 @@ impl Value {
                         return false;
                     }
                     lit!(b",");
-                    if !x.tree_json_into::<HELD, SCRIPT>(out, island, depth + 1) {
+                    if !tree_next::<HELD, SCRIPT>(x, out, island, depth + 1) {
                         return false;
                     }
                     lit!(b"]}");
@@ -758,7 +759,7 @@ impl Value {
                             return false;
                         }
                         lit!(b":");
-                        if !x.tree_json_into::<HELD, SCRIPT>(out, island, depth + 1) {
+                        if !tree_next::<HELD, SCRIPT>(x, out, island, depth + 1) {
                             return false;
                         }
                     }
@@ -2008,6 +2009,26 @@ fn dec_pair(a: &Value, b: &Value) -> Option<(crate::decimal::Dec, crate::decimal
 /// `json_str_into`, with room made for all of it first where `--max-memory` lets it be: false,
 /// and nothing written, where it does not. A text with nothing to escape is looked at once, as
 /// `json_str_into` looks at it; one with escapes is counted to its length first.
+/// `f` one level further down a value: past 256 levels, on a new piece of stack when this one
+/// has less than 256 KB left. A held level's frame is larger, and in a debug build a list 10,000
+/// deep overflowed the stack in `json.stringify` before its depth was said (CI run 44128157640;
+/// FEEDBACK71.md, Q-977; branch security). A shallow value pays one compare; a stack whose end is
+/// not known is left as it was.
+#[inline(always)]
+fn deeper<R>(level: usize, f: impl FnOnce() -> R) -> R {
+    if level >= 256 && crate::stack::remaining().is_some_and(|r| r < 256 << 10) {
+        crate::stack::maybe_grow(256 << 10, 4 << 20, f)
+    } else {
+        f()
+    }
+}
+
+/// `tree_json_into` one level down, through `deeper`: an island's props have no depth limit.
+#[inline(always)]
+fn tree_next<const HELD: bool, const SCRIPT: bool>(x: &Value, out: &mut Vec<u8>, island: bool, depth: usize) -> bool {
+    deeper(depth, || x.tree_json_into::<HELD, SCRIPT>(out, island, depth))
+}
+
 fn json_str_held(s: &str, out: &mut Vec<u8>) -> bool {
     if s.bytes().all(|b| b >= 0x20 && b != b'"' && b != b'\\') {
         if !bytes_room(out, s.len() + 2) {
