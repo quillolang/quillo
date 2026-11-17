@@ -29,7 +29,7 @@ One file holds the server and the browser: what it answers, the pages it renders
 components that run in the page, and the database they use. Quillo reads like
 JavaScript, checks your program before it runs, and serves it faster than Node and Bun.
 
-```quillo
+```javascript
 db.open("notes.db")
 db.exec("create table if not exists notes (id integer primary key, text text)")
 
