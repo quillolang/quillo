@@ -96,7 +96,7 @@ const VOID: &[&str] = &["area", "base", "br", "col", "embed", "hr", "img", "inpu
 /// dropped already): the server's, written before them, are the island's, and one the server did
 /// not write (`data-l`, `data-e`) was taken as the island's (FEEDBACK55.md, Q-700; branch
 /// feedback55).
-pub fn root_without_island_attrs(rest: &str, out: &mut String) {
+pub fn root_without_island_attrs<O: crate::value::Text>(rest: &str, out: &mut O) {
     let b = rest.as_bytes();
     let mut i = 0;
     while i < b.len() && b[i] != b'>' {

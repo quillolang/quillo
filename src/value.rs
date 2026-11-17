@@ -320,6 +320,41 @@ impl Value {
         }
     }
 
+    /// `display`, written through a `Held` text: a list's or a map's (or an error's) text, which
+    /// can be far longer than what it holds, stops at `--max-memory` as it is written, and is not
+    /// made past it (FEEDBACK71.md, Q-977, the review's bounded writer: counted before it was
+    /// written, a list of 1.4 million zeros was taken for 16.7 times its text and refused under
+    /// 64 MB, and floats such as 1e308, 309 bytes each, for 48; branch security). Anything else's
+    /// text is no longer than itself.
+    pub fn display_held(&self) -> Result<String, crate::httpd::OverMemory> {
+        match self {
+            Value::List(_) | Value::Map(_) | Value::Err(..) => {
+                let mut out = Held::new();
+                self.repr_at(&mut out, 0);
+                out.into_text()
+            }
+            _ => Ok(self.display()),
+        }
+    }
+
+    /// `display`, appended to `out`, with no text of its own made first: a template's part, a
+    /// `join`'s item.
+    pub fn display_into<O: Text>(&self, out: &mut O) {
+        match self {
+            Value::Str(s) | Value::Html(s) => out.push_str(s),
+            Value::Dec(d) => out.push_str(&d.to_string()),
+            _ => self.repr_at(out, 0),
+        }
+    }
+
+    /// `key_text`, held as `display_held` is: a list as a map's key is its text.
+    pub fn key_text_held(&self) -> Result<String, crate::httpd::OverMemory> {
+        match self {
+            Value::Dec(d) => Ok(d.normalized().to_string()),
+            _ => self.display_held(),
+        }
+    }
+
     /// The text of a map key made from this value (`set`, `get`,
     /// `group_by`): its display, with a decimal's zeros at the end left
     /// out, so 12.5 and 12.50 are one key.
@@ -345,8 +380,10 @@ impl Value {
         self.repr_at(out, 0)
     }
 
-    /// `repr_into`, `depth` levels down: past `DEEPEST`, `…` (FEEDBACK51.md, Q-661).
-    fn repr_at(&self, out: &mut String, depth: usize) {
+    /// `repr_into`, `depth` levels down: past `DEEPEST`, `…` (FEEDBACK51.md, Q-661). Into a
+    /// `Held` text too, which stops at `--max-memory`: a list stops being written once it has
+    /// (FEEDBACK71.md, Q-977; branch security).
+    fn repr_at<O: Text>(&self, out: &mut O, depth: usize) {
         if depth > DEEPEST && matches!(self, Value::List(_) | Value::Map(_) | Value::Err(..)) {
             return out.push('…');
         }
@@ -358,6 +395,9 @@ impl Value {
                         out.push_str(", ");
                     }
                     v.repr_at(out, depth + 1);
+                    if out.is_over() {
+                        return;
+                    }
                 }
                 out.push(']');
             }
@@ -370,6 +410,9 @@ impl Value {
                     }
                     key_into(k, out);
                     v.repr_at(out, depth + 1);
+                    if out.is_over() {
+                        return;
+                    }
                 }
                 out.push_str(" }");
             }
@@ -388,22 +431,41 @@ impl Value {
     }
 
     #[inline(never)]
-    fn scalar_repr(&self, out: &mut String) {
-        use std::fmt::Write;
-        let _ = match self {
-            Value::Nil => write!(out, "null"),
-            Value::Bool(b) => write!(out, "{}", b),
-            Value::Int(n) => write!(out, "{}", n),
-            Value::Float(f) => write!(out, "{}", fmt_float(*f)),
-            Value::Dec(d) => write!(out, "{}m", d),
-            Value::Str(s) => write!(out, "{}", serde_json::to_string(&**s).unwrap_or_default()),
-            Value::Func(c) => write!(out, "<fn {}>", c.def.name),
-            Value::Builtin(n, _) if n.starts_with("native:") => write!(out, "<rust fn {}>", crate::native::display_name(n)),
-            Value::Builtin(n, _) => write!(out, "<builtin {}>", n),
-            Value::Html(h) => write!(out, "{}", h),
-            Value::Response(r) => write!(out, "<response {}>", r.status),
-            Value::List(_) | Value::Map(_) | Value::Err(..) => Ok(self.repr_into(out)),
-        };
+    fn scalar_repr<O: Text>(&self, out: &mut O) {
+        match self {
+            Value::Nil => out.push_str("null"),
+            Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Value::Int(n) => int_into(*n, out),
+            Value::Float(f) => out.push_str(&fmt_float(*f)),
+            Value::Dec(d) => {
+                out.push_str(&d.to_string());
+                out.push('m');
+            }
+            // Quoted as JSON quotes it, written where it goes: a long text was copied first.
+            Value::Str(s) => quoted_into(s, out),
+            Value::Func(c) => {
+                out.push_str("<fn ");
+                out.push_str(&c.def.name);
+                out.push('>');
+            }
+            Value::Builtin(n, _) if n.starts_with("native:") => {
+                out.push_str("<rust fn ");
+                out.push_str(&crate::native::display_name(n));
+                out.push('>');
+            }
+            Value::Builtin(n, _) => {
+                out.push_str("<builtin ");
+                out.push_str(n);
+                out.push('>');
+            }
+            Value::Html(h) => out.push_str(h),
+            Value::Response(r) => {
+                out.push_str("<response ");
+                int_into(r.status as i64, out);
+                out.push('>');
+            }
+            Value::List(_) | Value::Map(_) | Value::Err(..) => self.repr_at(out, 0),
+        }
     }
 
     pub fn to_json(&self) -> serde_json::Value {
@@ -439,13 +501,67 @@ impl Value {
     /// main). Checked while written, the text itself counted, escapes and all, and no tree
     /// made first: a walk before it cost every JSON answer a third more (found in review).
     pub fn json_into_within(&self, out: &mut Vec<u8>, max: usize, depth: usize) -> Result<(), String> {
+        self.json_into_as::<false>(out, max, depth, &mut false)
+    }
+
+    /// `json_into_within`, held to `--max-memory` too as it is written: each growth of the text
+    /// is compared with the limit before it is made, and a text that would pass it is not made
+    /// (`bytes_room`). `json.stringify`, and the answer of a route (FEEDBACK71.md, Q-977; branch
+    /// security: an answer of 200 long texts made 180 MB of JSON under a 1 MB limit, found in
+    /// review). Err(None): refused at the limit, told so by the kind and not by any text.
+    pub fn json_into_held(&self, out: &mut Vec<u8>, max: usize, depth: usize) -> Result<(), Option<String>> {
+        let mut over = false;
+        self.json_into_as::<true>(out, max, depth, &mut over).map_err(|e| (!over).then_some(e))
+    }
+
+    fn json_into_as<const ASK: bool>(&self, out: &mut Vec<u8>, max: usize, depth: usize, over: &mut bool) -> Result<(), String> {
+        // Room for `n` more bytes, where the text is held: refused, the mark of the stop.
+        #[inline(always)]
+        fn room<const ASK: bool>(out: &mut Vec<u8>, n: usize) -> Result<(), String> {
+            if ASK && !bytes_room(out, n) {
+                return Err(OVER_IN_JSON.into());
+            }
+            Ok(())
+        }
+        // A scalar, held: room made for all it writes first, so its write grows nothing.
+        fn scalar_held(v: &Value, out: &mut Vec<u8>) -> Result<(), String> {
+            match v {
+                Value::Str(s) | Value::Html(s) => {
+                    if !json_str_held(s, out) {
+                        return Err(OVER_IN_JSON.into());
+                    }
+                }
+                Value::Dec(d) => {
+                    let t = d.to_string();
+                    if !json_str_held(&t, out) {
+                        return Err(OVER_IN_JSON.into());
+                    }
+                }
+                // A number, a bool, null or an answer's status: never longer than this.
+                other => {
+                    room::<true>(out, 64)?;
+                    other.json_into(out);
+                }
+            }
+            Ok(())
+        }
         // Scalars are written where they stand, and the size is looked at once a container
         // ends: what makes JSON grow past its limit is containers, shared or nested.
-        fn go(v: &Value, out: &mut Vec<u8>, max: usize, left: usize, depth: usize) -> Result<(), String> {
+        fn go<const ASK: bool>(v: &Value, out: &mut Vec<u8>, max: usize, left: usize, depth: usize) -> Result<(), String> {
             let inner = |x: &Value, out: &mut Vec<u8>| -> Result<(), String> {
                 match x {
-                    Value::List(_) | Value::Map(_) | Value::Err(..) => go(x, out, max, left - 1, depth),
+                    Value::List(_) | Value::Map(_) | Value::Err(..) => go::<ASK>(x, out, max, left - 1, depth),
                     Value::Func(_) | Value::Builtin(..) => Err(FUNCTION_IN_JSON.into()),
+                    scalar if ASK => {
+                        scalar_held(scalar, out)?;
+                        // Each item of a held list or map too: one list of long texts is one
+                        // container, and was written whole before it was looked at (found in
+                        // review).
+                        if out.len() > max {
+                            return Err(format!("its JSON would be more than {} MiB", max >> 20));
+                        }
+                        Ok(())
+                    }
                     scalar => {
                         scalar.json_into(out);
                         Ok(())
@@ -462,33 +578,48 @@ impl Value {
             match v {
                 Value::List(_) | Value::Map(_) | Value::Err(..) if left == 0 => return Err(format!("it is nested more than {} deep", depth)),
                 Value::List(l) => {
+                    room::<ASK>(out, 2)?;
                     out.push(b'[');
                     for (i, x) in l.iter().enumerate() {
                         if i > 0 {
+                            room::<ASK>(out, 1)?;
                             out.push(b',');
                         }
                         inner(x, out).map_err(|e| at(e, &|| format!("[{}]", i)))?;
                     }
+                    room::<ASK>(out, 1)?;
                     out.push(b']');
                 }
                 Value::Map(m) => {
+                    room::<ASK>(out, 2)?;
                     out.push(b'{');
                     for (i, (k, x)) in m.iter().enumerate() {
                         if i > 0 {
+                            room::<ASK>(out, 1)?;
                             out.push(b',');
                         }
-                        json_str_into(k, out);
+                        if ASK {
+                            if !json_str_held(k, out) || !bytes_room(out, 1) {
+                                return Err(OVER_IN_JSON.into());
+                            }
+                        } else {
+                            json_str_into(k, out);
+                        }
                         out.push(b':');
                         inner(x, out).map_err(|e| at(e, &|| if fmt_key(k).starts_with('"') { format!("[{}]", fmt_key(k)) } else { format!(".{}", k) }))?;
                     }
+                    room::<ASK>(out, 1)?;
                     out.push(b'}');
                 }
                 Value::Err(e, _, _) => {
+                    room::<ASK>(out, 10)?;
                     out.extend_from_slice(b"{\"error\":");
                     inner(e, out).map_err(|e| at(e, &|| ".error".into()))?;
+                    room::<ASK>(out, 1)?;
                     out.push(b'}');
                 }
                 Value::Func(_) | Value::Builtin(..) => return Err(FUNCTION_IN_JSON.into()),
+                scalar if ASK => scalar_held(scalar, out)?,
                 scalar => scalar.json_into(out),
             }
             if out.len() > max {
@@ -499,62 +630,281 @@ impl Value {
         // A function has no JSON: it was written as its text, `"<fn f>"`, where JavaScript leaves
         // it out and Python refuses it; said, and where it is (FEEDBACK55.md, Q-792; branch
         // feedback55).
-        go(self, out, max, depth + 1, depth).map_err(|e| match e.strip_prefix(FUNCTION_IN_JSON) {
+        let r = go::<ASK>(self, out, max, depth + 1, depth);
+        *over = ASK && matches!(&r, Err(e) if e == OVER_IN_JSON);
+        r.map_err(|e| match e.strip_prefix(FUNCTION_IN_JSON) {
             Some("") => "a function cannot be written as JSON".into(),
             Some(path) => format!("`{}` is a function, which cannot be written as JSON", path.trim_start_matches('.')),
             None => e,
         })
     }
 
-    /// The JSON text of `to_json`, written straight into `out`.
-    pub fn json_into(&self, out: &mut Vec<u8>) {
-        self.json_into_at(out, 0)
+    /// `island_json(v).to_string()`, written straight into `out` with no tree made first: an
+    /// island's props and state, a server fn's answer (FEEDBACK71.md, Q-977, found in review: the
+    /// tree of a list of 200 long texts took 228 MB before its text was held; branch security).
+    pub fn island_text(&self) -> String {
+        let mut out = Vec::new();
+        self.tree_json_into::<false, false>(&mut out, true, 0);
+        // SAFETY: only JSON text, which is UTF-8, was written.
+        unsafe { String::from_utf8_unchecked(out) }
     }
 
-    fn json_into_at(&self, out: &mut Vec<u8>, depth: usize) {
-        if depth > DEEPEST && matches!(self, Value::List(_) | Value::Map(_) | Value::Err(..)) {
-            return out.extend_from_slice(b"null");
+    /// `island_text`, held to `--max-memory` as it is written: `None` past it.
+    pub fn island_text_held(&self) -> Option<String> {
+        let mut out = Vec::new();
+        if !self.island_into_held(&mut out) {
+            return None;
+        }
+        // SAFETY: as above.
+        Some(unsafe { String::from_utf8_unchecked(out) })
+    }
+
+    /// `island_text_held`, written onto the end of `out`: false past the limit.
+    pub fn island_into_held(&self, out: &mut Vec<u8>) -> bool {
+        self.tree_json_into::<true, false>(out, true, 0)
+    }
+
+    /// `script_json(&v.to_json())`, the JSON a `<script>` carries, written onto the end of `out`
+    /// held to `--max-memory`: false, and the text left as far as it got, past it (FEEDBACK71.md,
+    /// Q-977, found in review: a list of 200 long texts made 1.2 GB first; branch security).
+    pub fn script_json_into(&self, out: &mut Vec<u8>) -> bool {
+        self.tree_json_into::<true, true>(out, false, 0)
+    }
+
+    /// The text serde_json writes of `to_json` (`island`: of `interp::island_json`), written
+    /// straight into `out`; where `HELD`, room made for each piece first (`bytes_room`), false
+    /// where it was refused. `SCRIPT`: with `<`, `&`, U+2028 and U+2029 in its texts escaped, as
+    /// `interp::script_json` has them. A float as serde writes it (not as `json_into` does), a
+    /// decimal as text, and past `DEEPEST` null, as `to_json`; an island's own marks
+    /// (`$quillo_err`, `$dec`, `$int`, `$`) and no depth limit, as `island_json`.
+    fn tree_json_into<const HELD: bool, const SCRIPT: bool>(&self, out: &mut Vec<u8>, island: bool, depth: usize) -> bool {
+        macro_rules! room {
+            ($n:expr) => {
+                if HELD && !bytes_room(out, $n) {
+                    return false;
+                }
+            };
+        }
+        macro_rules! lit {
+            ($b:expr) => {{
+                let b: &[u8] = $b;
+                room!(b.len());
+                out.extend_from_slice(b);
+            }};
+        }
+        let text = |s: &str, out: &mut Vec<u8>| json_str_as::<HELD, SCRIPT>(s, out);
+        if !island && depth > DEEPEST && matches!(self, Value::List(_) | Value::Map(_) | Value::Err(..)) {
+            lit!(b"null");
+            return true;
         }
         match self {
-            Value::Nil => out.extend_from_slice(b"null"),
-            Value::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
+            Value::Err(e, _, _) => {
+                lit!(if island { b"{\"$quillo_err\":" } else { b"{\"error\":" });
+                if !e.tree_json_into::<HELD, SCRIPT>(out, island, depth + 1) {
+                    return false;
+                }
+                lit!(b"}");
+            }
+            Value::Dec(d) if island => {
+                lit!(b"{\"$dec\":");
+                if !text(&d.to_string(), out) {
+                    return false;
+                }
+                lit!(b"}");
+            }
+            Value::Int(n) if island && n.unsigned_abs() > crate::interp::JS_SAFE => {
+                lit!(b"{\"$int\":\"");
+                let mut b = [0u8; 24];
+                let t = {
+                    use std::io::Write;
+                    let mut c = std::io::Cursor::new(&mut b[..]);
+                    let _ = write!(c, "{}", n);
+                    c.position() as usize
+                };
+                lit!(&b[..t]);
+                lit!(b"\"}");
+            }
+            Value::List(l) => {
+                lit!(b"[");
+                for (i, x) in l.iter().enumerate() {
+                    if i > 0 {
+                        lit!(b",");
+                    }
+                    if !x.tree_json_into::<HELD, SCRIPT>(out, island, depth + 1) {
+                        return false;
+                    }
+                }
+                lit!(b"]");
+            }
+            Value::Map(m) => match m.iter().next() {
+                Some((k, x)) if island && m.len() == 1 && k.starts_with('$') => {
+                    lit!(b"{\"$\":[");
+                    if !text(k, out) {
+                        return false;
+                    }
+                    lit!(b",");
+                    if !x.tree_json_into::<HELD, SCRIPT>(out, island, depth + 1) {
+                        return false;
+                    }
+                    lit!(b"]}");
+                }
+                _ => {
+                    lit!(b"{");
+                    for (i, (k, x)) in m.iter().enumerate() {
+                        if i > 0 {
+                            lit!(b",");
+                        }
+                        if !text(k, out) {
+                            return false;
+                        }
+                        lit!(b":");
+                        if !x.tree_json_into::<HELD, SCRIPT>(out, island, depth + 1) {
+                            return false;
+                        }
+                    }
+                    lit!(b"}");
+                }
+            },
+            Value::Nil => lit!(b"null"),
+            Value::Bool(b) => lit!(if *b { b"true" } else { b"false" }),
             Value::Int(n) => {
+                room!(24);
+                let _ = serde_json::to_writer(&mut *out, n);
+            }
+            Value::Float(f) => {
+                room!(32);
+                let _ = serde_json::to_writer(&mut *out, f);
+            }
+            Value::Dec(d) => return text(&d.to_string(), out),
+            Value::Str(s) | Value::Html(s) => return text(s, out),
+            Value::Response(r) => {
+                room!(24);
+                out.extend_from_slice(format!("{{\"status\":{}}}", r.status).as_bytes());
+            }
+            Value::Func(_) | Value::Builtin(..) => return text(&self.repr(), out),
+        }
+        true
+    }
+
+    /// The JSON text of `to_json`, written straight into `out`.
+    pub fn json_into(&self, out: &mut Vec<u8>) {
+        self.json_into_at::<false>(out, 0);
+    }
+
+    /// `json_into`, held to `--max-memory` as it is written, as `json_into_held` is: false, and
+    /// the text left as far as it got, where a growth would pass it (a stream's piece, an
+    /// attribute's JSON; FEEDBACK71.md, Q-977; branch security).
+    pub fn json_into_bounded(&self, out: &mut Vec<u8>) -> bool {
+        self.json_into_at::<true>(out, 0)
+    }
+
+    /// `json_into`, and where `HELD`, room made for each piece first (`bytes_room`): false where
+    /// it was refused, and nothing more written.
+    fn json_into_at<const HELD: bool>(&self, out: &mut Vec<u8>, depth: usize) -> bool {
+        macro_rules! room {
+            ($n:expr) => {
+                if HELD && !bytes_room(out, $n) {
+                    return false;
+                }
+            };
+        }
+        if depth > DEEPEST && matches!(self, Value::List(_) | Value::Map(_) | Value::Err(..)) {
+            room!(4);
+            out.extend_from_slice(b"null");
+            return true;
+        }
+        match self {
+            Value::Nil => {
+                room!(4);
+                out.extend_from_slice(b"null")
+            }
+            Value::Bool(b) => {
+                room!(5);
+                out.extend_from_slice(if *b { b"true" } else { b"false" })
+            }
+            Value::Int(n) => {
+                room!(24);
                 let _ = serde_json::to_writer(&mut *out, n);
             }
             // As JavaScript writes it (FEEDBACK55.md, Q-781; branch feedback55).
-            Value::Float(f) => json_float_into(*f, out),
-            Value::Dec(d) => json_str_into(&d.to_string(), out),
-            Value::Str(s) | Value::Html(s) => json_str_into(s, out),
+            Value::Float(f) => {
+                room!(64);
+                json_float_into(*f, out)
+            }
+            Value::Dec(d) => {
+                let t = d.to_string();
+                if HELD {
+                    return json_str_held(&t, out);
+                }
+                json_str_into(&t, out)
+            }
+            Value::Str(s) | Value::Html(s) => {
+                if HELD {
+                    return json_str_held(s, out);
+                }
+                json_str_into(s, out)
+            }
             Value::List(l) => {
+                room!(2);
                 out.push(b'[');
                 for (i, v) in l.iter().enumerate() {
                     if i > 0 {
+                        room!(1);
                         out.push(b',');
                     }
-                    v.json_into_at(out, depth + 1);
+                    if !v.json_into_at::<HELD>(out, depth + 1) {
+                        return false;
+                    }
                 }
+                room!(1);
                 out.push(b']');
             }
             Value::Map(m) => {
+                room!(2);
                 out.push(b'{');
                 for (i, (k, v)) in m.iter().enumerate() {
                     if i > 0 {
+                        room!(1);
                         out.push(b',');
                     }
-                    json_str_into(k, out);
+                    if HELD {
+                        if !json_str_held(k, out) {
+                            return false;
+                        }
+                        room!(1);
+                    } else {
+                        json_str_into(k, out);
+                    }
                     out.push(b':');
-                    v.json_into_at(out, depth + 1);
+                    if !v.json_into_at::<HELD>(out, depth + 1) {
+                        return false;
+                    }
                 }
+                room!(1);
                 out.push(b'}');
             }
             Value::Err(e, _, _) => {
+                room!(10);
                 out.extend_from_slice(b"{\"error\":");
-                e.json_into_at(out, depth + 1);
+                if !e.json_into_at::<HELD>(out, depth + 1) {
+                    return false;
+                }
+                room!(1);
                 out.push(b'}');
             }
-            Value::Response(r) => out.extend_from_slice(format!("{{\"status\":{}}}", r.status).as_bytes()),
-            Value::Func(_) | Value::Builtin(..) => json_str_into(&self.repr(), out),
+            Value::Response(r) => {
+                room!(24);
+                out.extend_from_slice(format!("{{\"status\":{}}}", r.status).as_bytes())
+            }
+            Value::Func(_) | Value::Builtin(..) => {
+                let t = self.repr();
+                if HELD {
+                    return json_str_held(&t, out);
+                }
+                json_str_into(&t, out)
+            }
         }
+        true
     }
 
     /// `json_into`, as a string.
@@ -591,16 +941,34 @@ impl Value {
     /// At most `JSON_NESTING` levels deep, as every reader of JSON takes (`json_value`), the
     /// database's and the browser's too (FEEDBACK55.md, Q-875's reviews; branch feedback55).
     pub fn parse_json(text: &str) -> serde_json::Result<Value> {
+        Value::parse_json_as(text).0
+    }
+
+    /// `parse_json`, where a value it would make past `--max-memory` is the request's stop: each
+    /// list and map is compared with the limit as it grows, and each text before it is made, so
+    /// none is made past it (FEEDBACK71.md, Q-977, the review's bounded readers: a body's JSON was
+    /// counted at 48 bytes a value, where a map's entry takes about 74; branch security).
+    pub fn parse_json_held(text: &str) -> Result<serde_json::Result<Value>, crate::httpd::OverMemory> {
+        match Value::parse_json_as(text) {
+            (_, true) => Err(crate::httpd::OverMemory),
+            (r, false) => Ok(r),
+        }
+    }
+
+    /// `parse_json`, and whether `--max-memory` stopped it.
+    fn parse_json_as(text: &str) -> (serde_json::Result<Value>, bool) {
         use serde::Deserialize;
         let budget = (text.len() / 8).max(JSON_VALUES);
         let outer = JSON_LEFT.with(|l| l.replace(budget));
         let outer_depth = JSON_DEPTH.with(|d| d.replace(0));
+        let outer_over = JSON_OVER.with(|o| o.replace(false));
         let mut de = serde_json::Deserializer::from_str(text);
         de.disable_recursion_limit();
         let r = Parsed::deserialize(&mut de).and_then(|p| de.end().map(|_| p.0));
         JSON_LEFT.with(|l| l.set(outer));
         let deep = JSON_DEPTH.with(|d| d.replace(outer_depth)) > JSON_NESTING;
-        r.map_err(|e| if deep { <serde_json::Error as serde::de::Error>::custom(json_too_deep()) } else { e })
+        let over = JSON_OVER.with(|o| o.replace(outer_over));
+        (r.map_err(|e| if deep { <serde_json::Error as serde::de::Error>::custom(json_too_deep()) } else { e }), over)
     }
 }
 
@@ -685,7 +1053,8 @@ impl<'de> serde::Deserialize<'de> for ParsedKey {
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.write_str("a key")
             }
-            fn visit_str<E>(self, s: &str) -> Result<ParsedKey, E> {
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<ParsedKey, E> {
+                crate::httpd::making(s.len()).map_err(|_| over_in_json())?;
                 Ok(ParsedKey(Key::new(s)))
             }
         }
@@ -703,6 +1072,16 @@ thread_local! {
     static JSON_LEFT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
     /// How deep the JSON being read is now; past `JSON_NESTING` once it was too deep.
     static JSON_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Whether `--max-memory` stopped the JSON being read (see `Value::parse_json_held`).
+    static JSON_OVER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The error that stops JSON being read at `--max-memory`, and the mark that it did.
+#[cold]
+#[inline(never)]
+fn over_in_json<E: serde::de::Error>() -> E {
+    JSON_OVER.with(|o| o.set(true));
+    E::custom(crate::httpd::over_memory())
 }
 
 /// A list or a map read from JSON, inside what is being read: an error past `JSON_NESTING`, and
@@ -761,7 +1140,10 @@ impl<'de> serde::de::Visitor<'de> for ParsedVisitor {
         Ok(Parsed(Value::Float(n)))
     }
 
-    fn visit_str<E>(self, s: &str) -> Result<Parsed, E> {
+    // Each text, list and map held to `--max-memory` as it is made (see `parse_json_held`): a
+    // compare where a list or a map grows, which a `push` makes anyway.
+    fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Parsed, E> {
+        crate::httpd::making(s.len()).map_err(|_| over_in_json())?;
         Ok(Parsed(Value::str(s)))
     }
 
@@ -770,7 +1152,7 @@ impl<'de> serde::de::Visitor<'de> for ParsedVisitor {
             let mut out = Vec::new();
             while let Some(Parsed(v)) = seq.next_element()? {
                 one_more()?;
-                out.push(v);
+                push_held(&mut out, v).map_err(|_| over_in_json())?;
             }
             Ok(Parsed(Value::list(out)))
         })
@@ -781,7 +1163,7 @@ impl<'de> serde::de::Visitor<'de> for ParsedVisitor {
             let mut out = Map::new();
             while let Some((ParsedKey(k), Parsed(v))) = map.next_entry()? {
                 one_more()?;
-                out.insert(k, v);
+                insert_held(&mut out, k, v).map_err(|_| over_in_json())?;
             }
             Ok(Parsed(Value::map(out)))
         })
@@ -1093,9 +1475,63 @@ pub fn js_number(f: f64) -> String {
 
 /// A map's key and its colon, as `repr` writes them.
 #[inline(never)]
-fn key_into(k: &str, out: &mut String) {
+fn key_into<O: Text>(k: &str, out: &mut O) {
     out.push_str(&fmt_key(k));
     out.push_str(": ");
+}
+
+/// An integer's digits, appended to `out`, with no `fmt` machinery.
+#[inline]
+pub fn int_into<O: Text>(n: i64, out: &mut O) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut m = n.unsigned_abs();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (m % 10) as u8;
+        m /= 10;
+        if m == 0 {
+            break;
+        }
+    }
+    if n < 0 {
+        out.push('-');
+    }
+    // SAFETY: ASCII digits.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+}
+
+/// A text quoted as `serde_json::to_string` quotes it, `"a\"b\n"`, written into `out` (see
+/// `scalar_repr`).
+fn quoted_into<O: Text>(s: &str, out: &mut O) {
+    let b = s.as_bytes();
+    out.push('"');
+    let mut done = 0;
+    for (i, &c) in b.iter().enumerate() {
+        let e: &str = match c {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            0x08 => "\\b",
+            0x0c => "\\f",
+            0..=0x1f => "",
+            _ => continue,
+        };
+        out.push_str(&s[done..i]);
+        if e.is_empty() {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let u = [b'\\', b'u', b'0', b'0', HEX[(c >> 4) as usize], HEX[(c & 15) as usize]];
+            // SAFETY: ASCII.
+            out.push_str(unsafe { std::str::from_utf8_unchecked(&u) });
+        } else {
+            out.push_str(e);
+        }
+        done = i + 1;
+    }
+    out.push_str(&s[done..]);
+    out.push('"');
 }
 
 fn fmt_key(k: &str) -> String {
@@ -1109,8 +1545,69 @@ fn fmt_key(k: &str) -> String {
     }
 }
 
+/// A JSON string of `s`, as serde_json writes it; `SCRIPT`: with `<`, `&`, U+2028 and U+2029
+/// escaped too, as `interp::script_json` has it; where `HELD`, room made for all of it first,
+/// false, and nothing written, where `--max-memory` refuses it (see `tree_json_into`).
+fn json_str_as<const HELD: bool, const SCRIPT: bool>(s: &str, out: &mut Vec<u8>) -> bool {
+    if !SCRIPT {
+        if HELD {
+            return json_str_held(s, out);
+        }
+        json_str_into(s, out);
+        return true;
+    }
+    let special = |c: char| matches!(c, '"' | '\\' | '<' | '&' | '\u{2028}' | '\u{2029}') || (c as u32) < 0x20;
+    if HELD {
+        let n = 2 + s.chars().map(|c| match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            '<' | '&' | '\u{2028}' | '\u{2029}' => 6,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        }).sum::<usize>();
+        if !bytes_room(out, n) {
+            return false;
+        }
+    }
+    out.push(b'"');
+    let mut done = 0;
+    for (i, c) in s.char_indices() {
+        if !special(c) {
+            continue;
+        }
+        out.extend_from_slice(&s.as_bytes()[done..i]);
+        let e: &[u8] = match c {
+            '"' => b"\\\"",
+            '\\' => b"\\\\",
+            '\n' => b"\\n",
+            '\r' => b"\\r",
+            '\t' => b"\\t",
+            '\u{8}' => b"\\b",
+            '\u{c}' => b"\\f",
+            '<' => b"\\u003c",
+            '&' => b"\\u0026",
+            '\u{2028}' => b"\\u2028",
+            '\u{2029}' => b"\\u2029",
+            _ => b"",
+        };
+        if e.is_empty() {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let b = c as u8;
+            out.extend_from_slice(&[b'\\', b'u', b'0', b'0', HEX[(b >> 4) as usize], HEX[(b & 15) as usize]]);
+        } else {
+            out.extend_from_slice(e);
+        }
+        done = i + c.len_utf8();
+    }
+    out.extend_from_slice(&s.as_bytes()[done..]);
+    out.push(b'"');
+    true
+}
+
 /// The mark `json_into_within` puts before where it met a function.
 const FUNCTION_IN_JSON: &str = "\u{1}fn";
+
+/// What a held JSON text says where `--max-memory` stopped it (`json_into_held`).
+const OVER_IN_JSON: &str = "\u{1}over";
 
 /// How deep a value is shown, written as JSON or compared, at most: past it, `…`, null, or not
 /// ordered. A list nested 50,000 deep, as code that nests from data makes it, overflowed the
@@ -1506,6 +2003,31 @@ fn dec_pair(a: &Value, b: &Value) -> Option<(crate::decimal::Dec, crate::decimal
         _ => None,
     };
     Some((one(a)?, one(b)?))
+}
+
+/// `json_str_into`, with room made for all of it first where `--max-memory` lets it be: false,
+/// and nothing written, where it does not. A text with nothing to escape is looked at once, as
+/// `json_str_into` looks at it; one with escapes is counted to its length first.
+fn json_str_held(s: &str, out: &mut Vec<u8>) -> bool {
+    if s.bytes().all(|b| b >= 0x20 && b != b'"' && b != b'\\') {
+        if !bytes_room(out, s.len() + 2) {
+            return false;
+        }
+        out.push(b'"');
+        out.extend_from_slice(s.as_bytes());
+        out.push(b'"');
+        return true;
+    }
+    let n = 2 + s.bytes().map(|b| match b {
+        b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
+        0..=0x1f => 6,
+        _ => 1,
+    }).sum::<usize>();
+    if !bytes_room(out, n) {
+        return false;
+    }
+    let _ = serde_json::to_writer(&mut *out, s);
+    true
 }
 
 /// A JSON string, escaped as `serde_json` escapes it.
@@ -2978,6 +3500,13 @@ pub fn with_slot<R>(env: &Env, name: Sym, f: impl FnOnce(&mut Value) -> R) -> Op
 /// (FEEDBACK29.md, Q-354; branch feedback29-fixes). `the_text_block_is_laid_out_as_assumed`
 /// holds `Arc`'s layout to what is assumed here.
 pub fn append_text(s: &mut Arc<str>, t: &str) -> bool {
+    append_text_as(s, t, true)
+}
+
+/// `append_text`, `--max-memory` asked or not: a compiled loop's code is made knowing whether the
+/// limit is set, and its texts ask only then (FEEDBACK71.md, Q-977; branch security).
+#[inline(always)]
+pub fn append_text_as(s: &mut Arc<str>, t: &str, ask: bool) -> bool {
     use std::alloc::{realloc, Layout};
     const HEADER: usize = 2 * std::mem::size_of::<usize>();
     const ALIGN: usize = std::mem::align_of::<usize>();
@@ -2990,8 +3519,22 @@ pub fn append_text(s: &mut Arc<str>, t: &str) -> bool {
     }
     let old = s.len();
     let new = old + t.len();
-    let Ok(layout) = Layout::from_size_align(round(HEADER + old), ALIGN) else { return false };
-    let Ok(_) = Layout::from_size_align(round(HEADER + new), ALIGN) else { return false };
+    // One compare, which a text under 64 KB passes, in the place of the two `Layout` checks: such
+    // a block's size is one a `Layout` takes (and the old one, shorter, too). A longer one has
+    // them, and the length it grows to is compared with `--max-memory` first: refused, it is not
+    // added to, and the caller's `+` makes the text, and is refused, saying so. The limit is
+    // looked at only then: asked of every append, the flag or the size cost one 5 to 10
+    // instructions, 0.4% to 1.6% of a loop of them (FEEDBACK71.md, Q-977; branch security).
+    if new >= crate::httpd::LARGE {
+        if Layout::from_size_align(round(HEADER + new), ALIGN).is_err() {
+            return false;
+        }
+        if ask && crate::httpd::making(new).is_err() {
+            return false;
+        }
+    }
+    // SAFETY: as said above, both sizes are a `Layout`'s; `ALIGN` is a power of two.
+    let layout = unsafe { Layout::from_size_align_unchecked(round(HEADER + old), ALIGN) };
     // SAFETY: nothing else holds the block (asked above), which starts `HEADER` before the
     // text and has `layout` (see the test); `realloc` gives a block of the size `Arc` works
     // out for the longer text, with the counts as they were, and the new bytes are text
@@ -3020,7 +3563,16 @@ pub fn append_text(s: &mut Arc<str>, t: &str) -> bool {
 /// builtin is to refuse or that is otherwise.
 pub fn update(slot: &mut Value, vals: &mut [Value]) -> bool {
     match (slot, &mut *vals) {
-        (Value::List(l), [_, x]) => Arc::make_mut(l).push(std::mem::replace(x, Value::Nil)),
+        (Value::List(l), [_, x]) => {
+            let l = Arc::make_mut(l);
+            // A list with no room left grows out of the way (`pushed_growing`), so the push here
+            // is the one `push` makes, its own check of the room known by then (FEEDBACK71.md,
+            // Q-977, found in review: asked here, a push cost one instruction more).
+            if l.len() == l.capacity() {
+                return pushed_growing(l, x);
+            }
+            l.push(std::mem::replace(x, Value::Nil))
+        }
         (Value::List(l), [_, Value::Int(i), x]) => {
             let n = l.len() as i64;
             let i = if *i < 0 { n + *i } else { *i };
@@ -3030,16 +3582,429 @@ pub fn update(slot: &mut Value, vals: &mut [Value]) -> bool {
             Arc::make_mut(l)[i as usize] = std::mem::replace(x, Value::Nil);
         }
         (Value::Map(m), [_, Value::Str(k), x]) => {
+            if !map_may_grow(m, k) {
+                return false;
+            }
             Arc::make_mut(m).insert(Key::new(k), std::mem::replace(x, Value::Nil));
         }
         // Any other key as `set` reads it, its text, but an error, which is no key and `set`
         // gives back (found in review of FEEDBACK55.md, string speed; branch feedback55).
-        (Value::Map(m), [_, k, x]) if !matches!(k, Value::Err(..)) => {
-            Arc::make_mut(m).insert(Key::from(k.key_text()), std::mem::replace(x, Value::Nil));
-        }
+        (Value::Map(m), [_, k, x]) if !matches!(k, Value::Err(..)) => return set_by_text(m, k, x),
         _ => return false,
     }
     true
+}
+
+/// `update`'s `set` of a map at a key that is no text: its text, held as `set` holds it (a list as
+/// a key; refused, the long way says so), out of the way of a list's `push` (FEEDBACK71.md, Q-977;
+/// branch security).
+#[inline(never)]
+fn set_by_text(m: &mut Arc<Map>, k: &Value, x: &mut Value) -> bool {
+    let Ok(k) = k.key_text_held() else { return false };
+    if !map_may_grow(m, &k) {
+        return false;
+    }
+    Arc::make_mut(m).insert(Key::from(k), std::mem::replace(x, Value::Nil));
+    true
+}
+
+/// Bytes a list's place for each item takes, and a map's for each entry (its key and value, the
+/// hash kept beside them and its place in the table).
+pub const ITEM_BYTES: usize = std::mem::size_of::<Value>();
+pub const ENTRY_BYTES: usize = std::mem::size_of::<(Key, Value)>() + 24;
+
+/// Whether a list with no room left, `cap` items, may grow: the room it grows to, twice it,
+/// compared with `--max-memory` once that is large; one it refuses goes the long way, to `push`,
+/// which says so (FEEDBACK71.md, Q-977; branch security).
+#[cold]
+#[inline(never)]
+pub fn list_grows(cap: usize) -> bool {
+    crate::httpd::making(cap.max(2).saturating_mul(2 * ITEM_BYTES)).is_ok()
+}
+
+/// `x` pushed onto `l` (taken from where it is), which has no room left, where `--max-memory`
+/// lets it grow: false, `l` and `x` as they were, where it does not.
+#[cold]
+#[inline(never)]
+pub fn pushed_growing(l: &mut Vec<Value>, x: &mut Value) -> bool {
+    if !list_grows(l.capacity()) {
+        return false;
+    }
+    l.push(std::mem::replace(x, Value::Nil));
+    true
+}
+
+/// Whether a map with no room left may take `k`: it has it, or the room it grows to is under
+/// `--max-memory` (see `map_may_grow`).
+#[cold]
+#[inline(never)]
+pub fn map_may_grow_to(m: &Map, k: &str) -> bool {
+    map_grows(m, k)
+}
+
+/// The same for a map given a key it may not have.
+#[inline(always)]
+pub fn map_may_grow(m: &Arc<Map>, k: &str) -> bool {
+    m.len() != m.capacity() || m.capacity() < crate::httpd::LARGE / (2 * ENTRY_BYTES) || map_grows(m, k)
+}
+
+#[cold]
+#[inline(never)]
+fn map_grows(m: &Map, k: &str) -> bool {
+    m.contains_key(k) || crate::httpd::making(m.capacity().saturating_mul(2 * ENTRY_BYTES)).is_ok()
+}
+
+/// Whether a list may hold `n` items, as `--max-memory` lets one value be: what a builtin that
+/// makes a list of a length it knows asks before it is made (FEEDBACK71.md, Q-977; branch
+/// security).
+#[inline(always)]
+pub fn list_of(n: usize) -> Result<(), crate::httpd::OverMemory> {
+    crate::httpd::making(n.saturating_mul(ITEM_BYTES))
+}
+
+/// Whether a map may hold `n` entries (see `list_of`).
+#[inline(always)]
+pub fn map_of(n: usize) -> Result<(), crate::httpd::OverMemory> {
+    crate::httpd::making(n.saturating_mul(ENTRY_BYTES))
+}
+
+/// `l.push(x)`, where `--max-memory` lets `l` grow to take it: what a builtin that makes a list
+/// item by item does, the limit asked only as it grows (`pushed_growing`).
+#[inline(always)]
+pub fn push_held(l: &mut Vec<Value>, x: Value) -> Result<(), crate::httpd::OverMemory> {
+    if l.len() == l.capacity() {
+        let mut x = x;
+        return if pushed_growing(l, &mut x) { Ok(()) } else { Err(crate::httpd::OverMemory) };
+    }
+    l.push(x);
+    Ok(())
+}
+
+/// `m.insert(k, x)`, where `--max-memory` lets `m` grow to take `k` (see `push_held`).
+#[inline(always)]
+pub fn insert_held(m: &mut Map, k: Key, x: Value) -> Result<(), crate::httpd::OverMemory> {
+    if m.len() == m.capacity() && m.capacity() >= crate::httpd::LARGE / (2 * ENTRY_BYTES) && !map_grows(m, &k) {
+        return Err(crate::httpd::OverMemory);
+    }
+    m.insert(k, x);
+    Ok(())
+}
+
+/// A text being made that `--max-memory` holds as it grows: each growth of its room is compared
+/// with the limit before it is made, and the last one is made no larger than the limit, so the
+/// text never takes more. A text that would pass it is not made: it stops (`is_over`), nothing
+/// more is written, and what made it gives the request's stop (`into_text`). Not set, a growth is
+/// a `String`'s and nothing else is asked; the limit is read only where the text grows
+/// (FEEDBACK71.md, Q-977, the third decision's review: every text a builtin or an answer makes is
+/// written through one, where its size was worked out before, too high for a list of zeros and
+/// too low for floats; branch security).
+pub struct Held {
+    s: String,
+    over: bool,
+}
+
+impl Default for Held {
+    fn default() -> Held {
+        Held::new()
+    }
+}
+
+impl Held {
+    #[inline]
+    pub const fn new() -> Held {
+        Held { s: String::new(), over: false }
+    }
+
+    /// With room for `n` to start with, no more than the limit lets it have.
+    pub fn with_capacity(n: usize) -> Held {
+        let n = if n >= crate::httpd::LARGE { n.min(crate::httpd::most_bytes()) } else { n };
+        Held { s: String::with_capacity(n), over: false }
+    }
+
+    /// Room for `n` more bytes, where the limit lets the text have it: false, and nothing more
+    /// made, where it does not.
+    #[inline(always)]
+    pub fn room(&mut self, n: usize) -> bool {
+        self.s.capacity() - self.s.len() >= n || self.grow(n)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, n: usize) -> bool {
+        if self.over {
+            return false;
+        }
+        let most = crate::httpd::most_bytes();
+        match self.s.len().checked_add(n) {
+            Some(need) if need <= most => {
+                // As a `String` grows, twice its room, but never past the limit.
+                let want = need.max(self.s.capacity().saturating_mul(2)).max(8).min(most);
+                self.s.reserve_exact(want - self.s.len());
+                true
+            }
+            _ => {
+                self.over = true;
+                false
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn push_str(&mut self, t: &str) {
+        if self.room(t.len()) {
+            self.s.push_str(t);
+        }
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, c: char) {
+        if self.room(c.len_utf8()) {
+            self.s.push(c);
+        }
+    }
+
+    pub fn insert_str(&mut self, at: usize, t: &str) {
+        if self.room(t.len()) {
+            self.s.insert_str(at, t);
+        }
+    }
+
+    pub fn insert(&mut self, at: usize, c: char) {
+        if self.room(c.len_utf8()) {
+            self.s.insert(at, c);
+        }
+    }
+
+    #[inline]
+    pub fn truncate(&mut self, n: usize) {
+        self.s.truncate(n);
+    }
+
+    /// Empty, with its room kept, and to be written again.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.s.clear();
+        self.over = false;
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.s.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.s.is_empty()
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        &self.s
+    }
+
+    /// Whether the text stopped at the limit.
+    #[inline]
+    pub fn is_over(&self) -> bool {
+        self.over
+    }
+
+    /// Stopped: a part of it was refused where it was made (a list's text in a page).
+    pub fn stop(&mut self) {
+        self.over = true;
+    }
+
+    /// The text made, or `OverMemory` where it stopped.
+    #[inline]
+    pub fn into_text(self) -> Result<String, crate::httpd::OverMemory> {
+        if self.over {
+            Err(crate::httpd::OverMemory)
+        } else {
+            Ok(self.s)
+        }
+    }
+}
+
+impl std::ops::Deref for Held {
+    type Target = str;
+    #[inline]
+    fn deref(&self) -> &str {
+        &self.s
+    }
+}
+
+impl std::fmt::Write for Held {
+    #[inline]
+    fn write_str(&mut self, t: &str) -> std::fmt::Result {
+        self.push_str(t);
+        if self.over {
+            Err(std::fmt::Error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// What a text is written into: a `String`, or a `Held` text that `--max-memory` stops. The
+/// writers shared by both (escaping, a number's digits, a value's text) are written once, for
+/// either (FEEDBACK71.md, Q-977; branch security).
+pub trait Text {
+    /// Room for `n` more bytes: false where the text may not have it, and nothing is then written.
+    fn room(&mut self, n: usize) -> bool;
+    /// The text, to write what `room` made room for into.
+    fn text(&mut self) -> &mut String;
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Whether the text stopped at the limit: never, for a `String`.
+    #[inline(always)]
+    fn is_over(&self) -> bool {
+        false
+    }
+    #[inline(always)]
+    fn push_str(&mut self, t: &str) {
+        if self.room(t.len()) {
+            self.text().push_str(t);
+        }
+    }
+    #[inline(always)]
+    fn push(&mut self, c: char) {
+        if self.room(c.len_utf8()) {
+            self.text().push(c);
+        }
+    }
+}
+
+impl Text for String {
+    #[inline(always)]
+    fn room(&mut self, n: usize) -> bool {
+        self.reserve(n);
+        true
+    }
+    #[inline(always)]
+    fn text(&mut self) -> &mut String {
+        self
+    }
+    #[inline(always)]
+    fn len(&self) -> usize {
+        String::len(self)
+    }
+    #[inline(always)]
+    fn push_str(&mut self, t: &str) {
+        String::push_str(self, t);
+    }
+    #[inline(always)]
+    fn push(&mut self, c: char) {
+        String::push(self, c);
+    }
+}
+
+impl Text for Held {
+    #[inline(always)]
+    fn room(&mut self, n: usize) -> bool {
+        Held::room(self, n)
+    }
+    #[inline(always)]
+    fn is_over(&self) -> bool {
+        self.over
+    }
+    #[inline(always)]
+    fn text(&mut self) -> &mut String {
+        &mut self.s
+    }
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.s.len()
+    }
+    #[inline(always)]
+    fn push_str(&mut self, t: &str) {
+        Held::push_str(self, t);
+    }
+    #[inline(always)]
+    fn push(&mut self, c: char) {
+        Held::push(self, c);
+    }
+}
+
+/// Room in JSON text being written for `n` more bytes, held as `Held` holds a text: false where
+/// `--max-memory` refuses it, and nothing more is then made.
+#[inline(always)]
+pub fn bytes_room(out: &mut Vec<u8>, n: usize) -> bool {
+    out.capacity() - out.len() >= n || bytes_grow(out, n)
+}
+
+#[cold]
+#[inline(never)]
+fn bytes_grow(out: &mut Vec<u8>, n: usize) -> bool {
+    let most = crate::httpd::most_bytes();
+    match out.len().checked_add(n) {
+        Some(need) if need <= most => {
+            let want = need.max(out.capacity().saturating_mul(2)).max(8).min(most);
+            out.reserve_exact(want - out.len());
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The JSON text of a serde value, written held to `--max-memory` as it grows: `None` past it (an
+/// island's props and state, a server fn's answer; FEEDBACK71.md, Q-977; branch security). The
+/// value itself is made first, as `island_json` makes it.
+pub fn serde_json_held(j: &serde_json::Value) -> Option<String> {
+    struct W<'a>(&'a mut Vec<u8>);
+    impl std::io::Write for W<'_> {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if !bytes_room(self.0, b.len()) {
+                return Err(std::io::Error::other("over"));
+            }
+            self.0.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = Vec::new();
+    serde_json::to_writer(W(&mut out), j).ok()?;
+    // SAFETY: serde_json writes UTF-8.
+    Some(unsafe { String::from_utf8_unchecked(out) })
+}
+
+/// Bytes, as text, with what is not UTF-8 written U+FFFD as `String::from_utf8_lossy` writes it,
+/// into a `Held` text: each bad byte takes three, so 30 MB of 0xFF made a 90 MB text past a 64 MB
+/// limit (FEEDBACK71.md, Q-977, found in review; branch security). The usual text, all of it
+/// UTF-8, is taken as it is, with nothing copied.
+pub fn lossy_held(b: Vec<u8>) -> Result<String, crate::httpd::OverMemory> {
+    match String::from_utf8(b) {
+        Ok(s) => Ok(s),
+        Err(e) => lossy_into_held(e.as_bytes()),
+    }
+}
+
+/// `lossy_held` of bytes held elsewhere (a request's body), copied as they are made text: one
+/// of them all UTF-8 compared with the limit first.
+pub fn lossy_held_of(b: &[u8]) -> Result<String, crate::httpd::OverMemory> {
+    match std::str::from_utf8(b) {
+        Ok(s) => {
+            crate::httpd::making(s.len())?;
+            Ok(s.to_owned())
+        }
+        Err(_) => lossy_into_held(b),
+    }
+}
+
+fn lossy_into_held(b: &[u8]) -> Result<String, crate::httpd::OverMemory> {
+    let mut out = Held::with_capacity(b.len());
+    for chunk in b.utf8_chunks() {
+        out.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() {
+            out.push_str("\u{FFFD}");
+        }
+        if out.is_over() {
+            break;
+        }
+    }
+    out.into_text()
 }
 
 /// `whole[key]` given `item` (a `push`) or changed at one place (`set`), where it is:
@@ -3054,7 +4019,14 @@ pub fn update_inside(whole: &mut Value, key: &Value, start: Option<Value>, mut v
     let last = vals.pop().unwrap_or(Value::Nil);
     let change = |x: &mut Value, last: Value, inner: Option<&Value>| -> bool {
         match (x, inner) {
-            (Value::List(l), None) => Arc::make_mut(l).push(last),
+            (Value::List(l), None) => {
+                let l = Arc::make_mut(l);
+                if l.len() == l.capacity() {
+                    let mut last = last;
+                    return pushed_growing(l, &mut last);
+                }
+                l.push(last)
+            }
             (Value::List(l), Some(Value::Int(i))) => {
                 let Some(i) = at(l, *i) else { return false };
                 Arc::make_mut(l)[i] = last;
@@ -3062,8 +4034,15 @@ pub fn update_inside(whole: &mut Value, key: &Value, start: Option<Value>, mut v
             // An error is no key: the long way gives it back (FEEDBACK55.md, Q-784; found in
             // review).
             (Value::Map(_), Some(Value::Err(..))) => return false,
+            // Held as `set` holds it: a new key where the map has no room left is compared with
+            // `--max-memory` first, and refused, the long way says so (FEEDBACK71.md, Q-977, found
+            // in review; branch security).
             (Value::Map(m), Some(k)) => {
-                Arc::make_mut(m).insert(k.key_text().into(), last);
+                let Ok(k) = k.key_text_held() else { return false };
+                if !map_may_grow(m, &k) {
+                    return false;
+                }
+                Arc::make_mut(m).insert(k.into(), last);
             }
             _ => return false,
         }
@@ -3081,13 +4060,17 @@ pub fn update_inside(whole: &mut Value, key: &Value, start: Option<Value>, mut v
             let k: &str = match k {
                 Value::Str(s) => s,
                 k => {
-                    text = k.key_text();
+                    let Ok(t) = k.key_text_held() else { return false };
+                    text = t;
                     &text
                 }
             };
             let m = Arc::make_mut(m);
             if let Some(x) = m.get_mut(k) {
                 return change(x, last, inner);
+            }
+            if m.len() == m.capacity() && !map_may_grow_to(m, k) {
+                return false;
             }
             let Some(mut x) = start else { return false };
             let done = change(&mut x, last, inner);
@@ -3305,5 +4288,74 @@ mod js_number_tests {
             "0".repeat(323)
         );
         assert_eq!(xs.iter().map(|x| super::js_number(*x)).collect::<Vec<_>>().join(" "), js);
+    }
+}
+
+#[cfg(test)]
+mod held_json_tests {
+    use super::*;
+
+    /// Values of every kind, nested, with every text a JSON string escapes and those a `<script>`
+    /// escapes too.
+    fn samples() -> Vec<Value> {
+        let text = Value::str("a\"b\\c\nd\re\tf\u{8}\u{c}\u{1}\u{1f}\u{7f}<&>é🎉\u{2028}\u{2029}</script><!--");
+        let mut m = Map::new();
+        m.insert("k".into(), text.clone());
+        m.insert("b c".into(), Value::list(vec![Value::Int(1), Value::Float(2.5)]));
+        m.insert("é<".into(), Value::Nil);
+        let mut one = Map::new();
+        one.insert("$x".into(), Value::Int(1));
+        let mut deep = Value::list(vec![]);
+        for _ in 0..(DEEPEST + 3) {
+            deep = Value::list(vec![deep]);
+        }
+        vec![
+            Value::Nil,
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Int(-7),
+            Value::Int(i64::MAX),
+            Value::Int(i64::MIN),
+            Value::Int(1 << 53),
+            Value::Float(1.0),
+            Value::Float(-0.0),
+            Value::Float(1e308),
+            Value::Float(1e21),
+            Value::Float(0.1 + 0.2),
+            Value::Float(f64::NAN),
+            Value::Float(f64::INFINITY),
+            Value::Dec(crate::decimal::Dec::parse("12.50").unwrap()),
+            text.clone(),
+            Value::html("<b>x</b>".to_string()),
+            Value::map(m.clone()),
+            Value::map(one),
+            Value::map(Map::new()),
+            Value::list(vec![]),
+            Value::err(Value::str("bad")),
+            Value::own_err(Value::list(vec![Value::map(m), text])),
+            deep,
+        ]
+    }
+
+    #[test]
+    fn island_and_script_json_are_written_as_serde_writes_their_trees() {
+        // The writers that write them straight into a held text (FEEDBACK71.md, Q-977; branch
+        // security) give byte for byte what the trees gave; on a stack of 256 MB, as a value
+        // nested past `DEEPEST` takes one.
+        std::thread::Builder::new().stack_size(256 << 20).spawn(written_as_trees).unwrap().join().unwrap();
+    }
+
+    fn written_as_trees() {
+        for v in samples() {
+            assert_eq!(v.island_text(), crate::interp::island_json(&v).to_string(), "{}", v.repr());
+            assert_eq!(v.island_text_held().as_deref(), Some(crate::interp::island_json(&v).to_string().as_str()));
+            let mut out = b"x".to_vec();
+            assert!(v.script_json_into(&mut out));
+            assert_eq!(String::from_utf8(out).unwrap(), format!("x{}", crate::interp::script_json(&v.to_json())), "{}", v.repr());
+        }
+        let all = Value::list(samples());
+        assert_eq!(all.island_text(), crate::interp::island_json(&all).to_string());
+        // Dropped here, on this stack.
+        drop(all);
     }
 }

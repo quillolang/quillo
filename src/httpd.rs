@@ -178,6 +178,12 @@ pub fn compute_limit_ms() -> u64 {
     MAX_COMPUTE.load(SeqCst)
 }
 
+/// The limit `--max-compute` set, in ms, if a policy did not set a smaller one: what a `--split`
+/// service is given (FEEDBACK71.md, Q-1001; branch security).
+pub fn compute_limit_of_option() -> Option<u64> {
+    (COMPUTE_FROM.get().is_none() && compute_limit_ms() != 0).then(compute_limit_ms)
+}
+
 /// Whether requests are limited. Compiled code has no steps to look between, so it is
 /// left out then.
 pub fn compute_limited() -> bool {
@@ -189,6 +195,110 @@ pub fn over_time() -> bool {
     let over = OWN_BUSY.with(|b| b.borrow().as_ref().is_some_and(|b| b.over.swap(false, SeqCst)));
     OVER_TIME.store(lock(&LOOPS_BUSY).iter().any(|b| b.over.load(SeqCst)), SeqCst);
     over
+}
+
+/// `--max-memory`: the most bytes one value a request makes may take; 0 for no limit. A failed
+/// allocation ends the whole process, every visitor's request with it, and nothing held memory as
+/// `--max-compute` holds time. Where a builtin is about to make a value (a text, a list, a map, a
+/// body read), the size it will have is compared with the limit before it is made, and a value
+/// that would pass it is not made: the request making it ends alone (FEEDBACK71.md, Q-977, the
+/// user's third decision, 2026-11-17: each value capped; branch security). Nothing is read from
+/// the system or the allocator: a size compare at each of those places, and nothing else.
+static MAX_MEMORY: AtomicU64 = AtomicU64::new(0);
+/// Whether `--max-memory` is set, for what is worked out only then (a list's text, a count).
+pub static MEMORY_LIMITED: AtomicBool = AtomicBool::new(false);
+/// No value smaller than this is compared: the least limit is this, so none could pass it, and
+/// what most of a program does pays one compare.
+pub const LARGE: usize = 64 << 10;
+/// The policy file the memory limit came from, when it was not `--max-memory`.
+static MEMORY_FROM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// `--max-memory`, in bytes.
+pub fn limit_memory(bytes: u64) {
+    MAX_MEMORY.store(bytes, SeqCst);
+    MEMORY_LIMITED.store(bytes != 0, SeqCst);
+}
+
+/// The limit now, in bytes; 0 for none.
+pub fn memory_limit() -> u64 {
+    MAX_MEMORY.load(SeqCst)
+}
+
+/// The limit `--max-memory` set, if a policy did not set a smaller one: what a `--split`
+/// service is given.
+pub fn memory_limit_of_option() -> Option<u64> {
+    (MEMORY_FROM.get().is_none() && memory_limit() != 0).then(memory_limit)
+}
+
+/// The limit is a policy's, said in the message of a request it ends.
+pub fn memory_limit_from(file: &std::path::Path) {
+    let _ = MEMORY_FROM.set(file.display().to_string());
+}
+
+/// How every message of a request ended at `--max-memory` begins, wherever its limit came from.
+/// Told by its kind (`QuilloError::memory_stop`), never by these words, which a program or another
+/// server can write too (found in review).
+pub const MEMORY_STOP: &str = "this request's value would be bigger than ";
+
+/// Why a request was ended at the memory limit: the option, or the policy file, that set it, and
+/// the limit.
+pub fn over_memory() -> String {
+    let most = memory_limit();
+    match MEMORY_FROM.get() {
+        Some(f) => format!("{}the policy {} allows (max_memory, {} bytes)", MEMORY_STOP, f, most),
+        None => format!("{}--max-memory allows ({} bytes)", MEMORY_STOP, most),
+    }
+}
+
+/// `over_memory()` as a page is told it: the policy's file is said in the log only.
+pub fn over_memory_said_to_pages() -> String {
+    match MEMORY_FROM.get() {
+        Some(_) => format!("{}the server's policy allows (max_memory, {} bytes)", MEMORY_STOP, memory_limit()),
+        None => over_memory(),
+    }
+}
+
+/// A value refused at `--max-memory`: the request's stop, made with `at`.
+#[derive(Debug, Clone, Copy)]
+pub struct OverMemory;
+
+impl OverMemory {
+    /// The stop, at `line`: an error no `??` takes, told by its kind.
+    pub fn at(self, line: u32) -> crate::interp::Ctrl {
+        crate::interp::Ctrl::Error(Box::new(crate::error::QuilloError::memory_stop(over_memory(), line)))
+    }
+}
+
+/// A value of `n` bytes is about to be made: refused (`OverMemory`) when it would be bigger than
+/// `--max-memory` allows, and then it is not made. One compare for a value under `LARGE`; the
+/// limit's load and a second compare for a larger one.
+#[inline(always)]
+pub fn making(n: usize) -> Result<(), OverMemory> {
+    if n >= LARGE {
+        let most = MAX_MEMORY.load(std::sync::atomic::Ordering::Relaxed);
+        if most != 0 && n as u64 > most {
+            return Err(OverMemory);
+        }
+    }
+    Ok(())
+}
+
+/// The most bytes a value may take: `usize::MAX` where nothing holds it. What a `Held` text
+/// compares as it grows, and only then.
+#[inline]
+pub fn most_bytes() -> usize {
+    match MAX_MEMORY.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => usize::MAX,
+        m => m.min(usize::MAX as u64) as usize,
+    }
+}
+
+/// The most a value may take: `u64::MAX` where nothing holds it.
+pub fn value_most() -> u64 {
+    match MAX_MEMORY.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => u64::MAX,
+        m => m,
+    }
 }
 
 /// Remembers what this request is, until `request_done`: `GET /path (rid 1a2b...)`. Made of

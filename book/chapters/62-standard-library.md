@@ -23,10 +23,17 @@
   groups in a loop (`(?:(a)|b)*` on `ab`, where the server keeps the group's last match and
   the browser clears `(a)` on each round: the two engines cannot be made the same, and
   `quillo check` warns of a capturing group inside a repeated one; capture the whole
-  repetition, `((?:a|b)*)`), and not at the same cost: the server's engine takes the same time on any text, and the
-  browser's backtracks, so `(a+)+$` can hang a tab with no way to stop it, which `quillo
+  repetition, `((?:a|b)*)`), and not at the same cost: one search on the server (`re.test`,
+  `re.find`) takes time in proportion to the text, whatever it is, and the browser's backtracks, so `(a+)+$` can hang a tab with no way to stop it, which `quillo
   check` warns of. Bound the counts (`{1,8}`), or run a visitor's own pattern in a `server
-  fn`. So a pattern takes only what both read alike: characters, `.`, `[...]`,
+  fn`. Finding every match (`find_all`, `replace`, `split`) searches again after each one, and
+  a pattern whose searches read on past their match (`[a-z]+X|[a-z]` on letters) reads the
+  text once per match: once its searches have read the text 64 times over and computed for
+  more than 0.25 s plus 4 µs a byte (the thread's own time), the call is an error value (`the
+  pattern scans the text too many times`), and `--max-compute` ends the request within 64
+  searches. A pattern compiles to at most 10 MB, as before (`(?:\w{1000}){109}` fits,
+  `(?:\w{1000}){110}` does not), and each thread keeps 32 MB of compiled patterns, the oldest
+  going first. So a pattern takes only what both read alike: characters, `.`, `[...]`,
   `\d \w \s \b` (ASCII digits and word characters, as in JavaScript) and their capitals,
   `^ $`, `(...)`, `(?:...)`, `(?<name>...)`, `|`, and `* + ? {n} {n,} {n,m}` (lazy with
   `?`). Lookaround, backreferences and `\p{...}` are errors, found by `quillo check`

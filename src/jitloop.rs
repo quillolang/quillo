@@ -25,7 +25,9 @@
 //! - A list it changes is taken out of its variable while it runs, so nothing else holds it
 //!   and it is changed where it is; one it only reads is held. Both are put back after.
 //! - It runs only where nothing else watches: not in a script with a budget, under the
-//!   debugger, with `--max-compute`, or while a view's reads are followed.
+//!   debugger, with `--max-compute`, or while a view's reads are followed. What it makes asks
+//!   `--max-memory` as the interpreter's does (`push1_asked`, `text_add`, `map_count`; FEEDBACK71.md,
+//!   Q-977; branch security).
 
 use crate::ast::*;
 use crate::interp::{binop, call_on, same_expr, Ctrl, Interp};
@@ -324,7 +326,7 @@ fn of_tag(tag: u64) -> T {
 enum Update<'a> {
     Set1 { i: &'a Expr, v: &'a Expr, line: u32 },
     Set2 { y: &'a Expr, x: &'a Expr, v: &'a Expr, line: u32, inner: u32 },
-    Push { v: &'a Expr },
+    Push { v: &'a Expr, line: u32 },
 }
 
 fn update<'a>(name: Sym, op: &AssignOp, e: &'a Expr) -> Option<Update<'a>> {
@@ -336,7 +338,7 @@ fn update<'a>(name: Sym, op: &AssignOp, e: &'a Expr) -> Option<Update<'a>> {
         return None;
     }
     match (f.as_str(), rest) {
-        ("push", [v]) => Some(Update::Push { v }),
+        ("push", [v]) => Some(Update::Push { v, line }),
         ("set", [y, inner]) => {
             if let Some((g, Expr::Index(o, y2, _), [x, v], inner_line)) = call_on(inner) {
                 if g.as_str() == "set" && matches!(&**o, Expr::Ident(n, _) if *n == name) && same_expr(y, y2) {
@@ -528,7 +530,7 @@ impl Walk {
                                 self.builtin("set");
                                 vec![y, x, v]
                             }
-                            Update::Push { v } => {
+                            Update::Push { v, .. } => {
                                 self.builtin("push");
                                 vec![v]
                             }
@@ -693,6 +695,25 @@ unsafe extern "C" fn push1(list: *mut Value, t: u64, bits: u64) {
     }
 }
 
+/// `push1` under `--max-memory`: a list with no room left grows, asked about first once that is
+/// large, as the interpreter asks; past it, the request's stop (FEEDBACK71.md, Q-977; branch
+/// security).
+unsafe extern "C" fn push1_asked(list: *mut Value, t: u64, bits: u64, line: u64, cx: *mut Cx) -> u64 {
+    // SAFETY: as `set1`.
+    if let Value::List(l) = unsafe { &mut *list } {
+        let l = Arc::make_mut(l);
+        let mut x = value_of(of_tag(t), bits);
+        if l.len() == l.capacity() {
+            if !value::pushed_growing(l, &mut x) {
+                return failed(cx, crate::httpd::OverMemory.at(line as u32));
+            }
+            return 0;
+        }
+        l.push(x);
+    }
+    0
+}
+
 /// `s[i]` of a text whose characters are not each a byte, `i` within it: the character's code
 /// (FEEDBACK55.md, string speed; branch feedback55).
 unsafe extern "C" fn text_char(text: *const Text, i: i64) -> i64 {
@@ -716,7 +737,11 @@ fn char_value(code: i64) -> Value {
 /// else a character (`code`). Added where it is when nothing else holds the text, as the
 /// interpreter adds; null, or the text added to itself, as `+` has it. Only its length and its
 /// one character are read after (FEEDBACK55.md, string speed; branch feedback55).
-unsafe extern "C" fn text_add(text: *mut Text, src: *const Text, ptr: *const u8, len: u64, code: i64, line: u64, cx: *mut Cx) -> u64 {
+///
+/// `ASK`: whether `--max-memory` is set, as the code was made: what it grows by is asked about
+/// then, once it is large (`append_text_as`), and the whole where it is made again, as the
+/// interpreter asks; else nothing is (FEEDBACK71.md, Q-977; branch security).
+unsafe extern "C" fn text_add<const ASK: bool>(text: *mut Text, src: *const Text, ptr: *const u8, len: u64, code: i64, line: u64, cx: *mut Cx) -> u64 {
     // SAFETY: `text` and `src` are the run's texts, and `ptr` a quoted text the code holds; nothing
     // else reads or writes them while this runs. `src` is read before `text` is written, as
     // they may be the same; what is added is held, so that a text added to itself is not
@@ -749,7 +774,12 @@ unsafe extern "C" fn text_add(text: *mut Text, src: *const Text, ptr: *const u8,
         }
     };
     if let Value::Str(s) = &mut t.value {
-        if !value::append_text(s, add) {
+        if !value::append_text_as(s, add, ASK) {
+            if ASK {
+                if let Err(stop) = crate::httpd::making(s.len() + add.len()) {
+                    return failed(cx, stop.at(line as u32));
+                }
+            }
             let mut both = String::with_capacity(s.len() + add.len());
             both.push_str(s);
             both.push_str(add);
@@ -806,6 +836,13 @@ unsafe extern "C" fn map_count(map: *mut Value, key: i64, op: u64, st: u64, sb: 
         Some(i) => m[i].clone(),
         None => value_of(of_tag(st), sb),
     };
+    // A new key in a map with no room left grows it: asked about first under `--max-memory`
+    // once that is large (FEEDBACK71.md, Q-977; branch security).
+    if at.is_none() && m.len() == m.capacity() {
+        if let Err(stop) = crate::httpd::making(m.capacity().saturating_mul(2 * value::ENTRY_BYTES)) {
+            return failed(cx, stop.at(line as u32));
+        }
+    }
     match binop(OPS[op as usize], old, value_of(of_tag(mt), mb), line as u32) {
         Ok(now) => {
             let m = Arc::make_mut(m);
@@ -1268,7 +1305,9 @@ impl Gen<'_> {
         };
         let a = self.text_addr(slot);
         let args = [a, src, p, n, code, self.b.ins().iconst(types::I64, line as i64), self.cx];
-        let r = self.helper(text_add as *const () as usize, &args, true)?;
+        // Asking `--max-memory` only where it is set (see `text_add`).
+        let f = if crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) { text_add::<true> as *const () } else { text_add::<false> as *const () };
+        let r = self.helper(f as usize, &args, true)?;
         self.leave_if(r, self.fail);
         self.written = true;
         Some(())
@@ -1747,12 +1786,22 @@ impl Gen<'_> {
                 let r = self.helper(set2 as *const () as usize, &args, true)?;
                 self.leave_if(r, self.fail);
             }
-            Update::Push { v } => {
+            Update::Push { v, line } => {
                 let (vv, tv) = self.value(v)?;
                 let addr = self.list_addr(slot);
                 let bits = self.to_bits(tv, vv);
                 let tg = self.b.ins().iconst(types::I64, tag(tv));
-                self.helper(push1 as *const () as usize, &[addr, tg, bits], false);
+                // Where `--max-memory` is set, the push that asks, and may fail; else the one
+                // that cannot, as before (it is set before any code is compiled): asking cost a
+                // push 14 instructions, 5% of a loop of them (FEEDBACK71.md, Q-977; branch
+                // security).
+                if crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) {
+                    let args = [addr, tg, bits, self.b.ins().iconst(types::I64, line as i64), self.cx];
+                    let r = self.helper(push1_asked as *const () as usize, &args, true)?;
+                    self.leave_if(r, self.fail);
+                } else {
+                    self.helper(push1 as *const () as usize, &[addr, tg, bits], false);
+                }
             }
         }
         self.written = true;

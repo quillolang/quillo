@@ -199,19 +199,23 @@ fn receive(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// other values as a line of JSON. Events: the value as JSON, as an event's
 /// data (named `event` if given); `send(null)` is a comment, which keeps a
 /// quiet connection open.
-fn encode(v: &Value, event: Option<&Value>, events: bool) -> Vec<u8> {
+/// A value's JSON written held to `--max-memory` as it grows (FEEDBACK71.md, Q-977; branch
+/// security): `None` where it would pass it.
+fn encode(v: &Value, event: Option<&Value>, events: bool) -> Option<Vec<u8>> {
     if !events {
-        return match v {
+        return Some(match v {
             Value::Str(s) => s.as_bytes().to_vec(),
             Value::Html(h) => h.as_bytes().to_vec(),
             Value::Nil => Vec::new(),
             other => {
                 let mut out = Vec::new();
-                other.json_into(&mut out);
+                if !other.json_into_bounded(&mut out) {
+                    return None;
+                }
                 out.push(b'\n');
                 out
             }
-        };
+        });
     }
     let mut out = Vec::new();
     // `send(v, { event, id, retry })`: the event's name, an id the browser sends back as
@@ -227,7 +231,7 @@ fn encode(v: &Value, event: Option<&Value>, events: bool) -> Vec<u8> {
     let one_line = |v: &Value| -> String { v.display().chars().filter(|c| !matches!(c, '\n' | '\r' | '\0')).collect() };
     if matches!(v, Value::Nil) && given(event).is_none() && given(id).is_none() && given(retry).is_none() {
         out.extend_from_slice(b":\n\n");
-        return out;
+        return Some(out);
     }
     if let Some(r) = given(retry) {
         out.extend_from_slice(format!("retry: {}\n", one_line(r)).as_bytes());
@@ -237,7 +241,7 @@ fn encode(v: &Value, event: Option<&Value>, events: bool) -> Vec<u8> {
     }
     if matches!(v, Value::Nil) && given(event).is_none() {
         out.push(b'\n');
-        return out;
+        return Some(out);
     }
     if let Some(e) = given(event) {
         // One line: a name with a line break in it would end the field.
@@ -248,9 +252,11 @@ fn encode(v: &Value, event: Option<&Value>, events: bool) -> Vec<u8> {
     }
     // JSON has no raw line breaks, so the data is one line.
     out.extend_from_slice(b"data: ");
-    v.json_into(&mut out);
+    if !v.json_into_bounded(&mut out) {
+        return None;
+    }
     out.extend_from_slice(b"\n\n");
-    out
+    Some(out)
 }
 
 /// `send(value, event = null)`, given to a stream's function; for events, `send(value, { event,
@@ -270,7 +276,12 @@ fn send(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if out.gone {
         return fail(line, GONE);
     }
-    let data = encode(args.first().unwrap_or(&Value::Nil), args.get(1), out.events);
+    // What it makes held to `--max-memory`: anything but a text written as JSON held as it grows
+    // (FEEDBACK71.md, Q-977, found in review; branch security).
+    let v = args.first().unwrap_or(&Value::Nil);
+    let Some(data) = encode(v, args.get(1), out.events) else {
+        return Err(crate::httpd::OverMemory.at(line));
+    };
     if data.is_empty() {
         return Ok(Value::Bool(true));
     }

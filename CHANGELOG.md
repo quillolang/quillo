@@ -69,6 +69,13 @@
   cookies along the way (Q-973). `cache` keeps answers apart by every option and a GET's body
   (one client certificate's answer went to calls with another), and `timeout` covers a call's
   redirects (Q-974).
+- **Large values and slow patterns**: `--max-memory 512MB` (and a policy's `max_memory`) ends a
+  request that would make one value bigger than that, alone, with a 500, its size compared
+  before the value is made; unset, nothing is checked (FEEDBACK71.md, Q-977). Each thread keeps
+  32 MB of compiled regexes at most, the oldest going first (a visitor's pattern held 11 MB a
+  request, Q-975); `find_all`, `replace` and `split` stop at `--max-compute`, and a pattern that rereads
+  the text is an error value (300 KB had held a worker 11 s, Q-976). `--split` passes
+  `--max-compute` on to its services (Q-1001).
 - `http.*`'s `public_only` no longer takes 64:ff9b:1::/48 (RFC 8215's local-use NAT64) as the
   public internet (found in FEEDBACK67's review).
 - `ask` and `notify` where the code surely runs on the server (a route, a `server fn`, a tick,

@@ -85,6 +85,7 @@ options for `run`:
   --no-build     load the .qwer libraries .quillo holds, as plugins.lock names them; never run cargo
   --instances N  run the program N times over, each on a core of its own
   --max-compute 2s  end a request that computes this long without letting go, as a 500
+  --max-memory 512MB  end a request that would make one value bigger than this, as a 500
   --drain 30s    on a stop, cut off what is still running after this long (default: wait for it all)
   --trust-proxy A,B believe X-Forwarded-For from these addresses or networks
   -- a b         what follows is the program's, for args()
@@ -230,7 +231,7 @@ fn main() {
 /// value, not the program.
 const VALUE_OPTIONS: &[&str] = &[
     "--host", "--port", "--listen", "--socket-mode", "--policy", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
-    "--max-body", "--max-compute", "--drain", "--max-tool-calls", "--allow-path", "--trust-proxy", "--live-per-client", "--max-connections", "--connections-per-client", "--allowed-hosts", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
+    "--max-body", "--max-compute", "--max-memory", "--drain", "--max-tool-calls", "--allow-path", "--trust-proxy", "--live-per-client", "--max-connections", "--connections-per-client", "--allowed-hosts", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
     "--scale", "--join", "--with", "--allow-join", "--join-as",
 ];
 
@@ -725,6 +726,7 @@ fn mcp(file: &str, flags: &[String]) -> i32 {
             }
         }
     }
+    policy_memory(&policy);
     if let Err(code) = before_the_program(file, &o) {
         return code;
     }
@@ -1076,6 +1078,16 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                     return Err(2);
                 }
             },
+            // A size, as `--max-body` takes one, that no one value a request makes may pass
+            // (FEEDBACK71.md, Q-977; branch security). Less than a large value is refused: it would
+            // refuse every one, whatever it said.
+            ("--max-memory", Some(v)) => match quillo::policy::size(v) {
+                Some(n) if n >= quillo::httpd::LARGE => quillo::httpd::limit_memory(n as u64),
+                _ => {
+                    eprintln!("quillo: --max-memory is a size of 64KB or more, such as 512MB or 1GB (or a number of bytes), got {:?}", v);
+                    return Err(2);
+                }
+            },
             // How long a stop waits for what is in progress; without it, for as long as that
             // takes (the user's graceful stop, 2026-11-09; branch feedback56).
             ("--drain", Some(v)) => match compute_limit(v) {
@@ -1390,6 +1402,20 @@ mod with {
     }
 }
 
+/// The policy's `max_memory`, where it is less than `--max-memory` or that is not given: it
+/// narrows, as the other limits do (FEEDBACK71.md, Q-977; branch security).
+fn policy_memory(p: &quillo::policy::Policy) {
+    if let Some(m) = p.max_memory {
+        let now = quillo::httpd::memory_limit();
+        if now == 0 || now > m as u64 {
+            quillo::httpd::limit_memory(m as u64);
+            if let Some(f) = &p.max_memory_from {
+                quillo::httpd::memory_limit_from(f);
+            }
+        }
+    }
+}
+
 /// A length of time for `--max-compute` and `--drain`, in ms.
 fn compute_limit(v: &str) -> Option<u64> {
     let (n, unit) = v.find(|c: char| !c.is_ascii_digit()).map_or((v, ""), |at| v.split_at(at));
@@ -1671,6 +1697,7 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
                 }
             }
         }
+        policy_memory(&p);
     }
     if let Err(code) = before_the_program(file, &o) {
         return code;

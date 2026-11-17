@@ -14,6 +14,10 @@ pub struct QuilloError {
     pub fix: Option<Box<Fix>>,
     /// The calls it has come out of so far (FEEDBACK21.md, Q-174; branch feedback20-fixes).
     calls: Option<Box<Calls>>,
+    /// The request's stop at `--max-memory`, told by this and never by its words, which a
+    /// program, a map's key or another server's header can hold too (FEEDBACK71.md, Q-977,
+    /// found in review; branch security).
+    pub memory_stop: bool,
 }
 
 /// The calls an error came out of, innermost first, kept as it passes up them
@@ -48,7 +52,12 @@ pub struct Fix {
 impl QuilloError {
     pub fn new(msg: impl Into<String>, line: u32) -> Self {
         // A private name as it was written (src/privacy.rs; branch public-private).
-        QuilloError { msg: crate::privacy::demangle(&msg.into()), line, file: None, fix: None, calls: None }
+        QuilloError { msg: crate::privacy::demangle(&msg.into()), line, file: None, fix: None, calls: None, memory_stop: false }
+    }
+
+    /// The stop of a request whose value would take the server's memory past `--max-memory`.
+    pub fn memory_stop(msg: impl Into<String>, line: u32) -> Self {
+        QuilloError { memory_stop: true, ..QuilloError::new(msg, line) }
     }
 
     pub fn with_fix(mut self, fix: Fix) -> Self {

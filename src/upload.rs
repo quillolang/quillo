@@ -178,10 +178,17 @@ fn base_name(name: &str) -> String {
 /// The form's fields and files. A field sent twice keeps the last value; a
 /// file field sent with several files is a list of them.
 pub fn parse(boundary: &str, body: &[u8]) -> (Map, Map) {
+    parse_as(boundary, body, false).unwrap_or_default()
+}
+
+/// `parse`, where `held`, each field's text made from its bytes held to `--max-memory`: U+FFFD
+/// takes three bytes for each byte that is not UTF-8 (FEEDBACK71.md, Q-977, found in review;
+/// branch security). At most `MAX_PARTS` fields and files.
+pub fn parse_as(boundary: &str, body: &[u8], held: bool) -> Result<(Map, Map), crate::httpd::OverMemory> {
     let mut form = Map::new();
     let mut files = Map::new();
     let delim = format!("--{}", boundary).into_bytes();
-    let Some(mut at) = find(body, &delim, 0) else { return (form, files) };
+    let Some(mut at) = find(body, &delim, 0) else { return Ok((form, files)) };
     let next_delim = format!("\r\n--{}", boundary).into_bytes();
     for _ in 0..MAX_PARTS {
         at += delim.len();
@@ -233,13 +240,14 @@ pub fn parse(boundary: &str, body: &[u8]) -> (Map, Map) {
                     }
                 }
                 None => {
-                    form.insert(name.as_str().into(), Value::str(String::from_utf8_lossy(&body[start..end])));
+                    let text = if held { crate::value::lossy_held_of(&body[start..end])? } else { String::from_utf8_lossy(&body[start..end]).into_owned() };
+                    form.insert(name.as_str().into(), Value::str(text));
                 }
             }
         }
         at = end + 2;
     }
-    (form, files)
+    Ok((form, files))
 }
 
 /// The bytes of upload record `file` in `body`.

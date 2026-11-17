@@ -269,21 +269,32 @@ impl Conn {
             let mut result = c.exec_iter(sql, params).await?;
             let cols = result.columns().unwrap_or_else(|| Vec::new().into());
             let mut out = Vec::new();
-            while let Some(row) = result.next().await? {
+            // Each text and the rows' list held to `--max-memory` as they are made: past it, the
+            // rest of the result is read and dropped, as the connection needs (FEEDBACK71.md,
+            // Q-977; branch security).
+            let mut over = false;
+            'rows: while let Some(row) = result.next().await? {
                 let mut m = Map::with_capacity(cols.len());
                 for (i, col) in cols.iter().enumerate() {
                     let v = row.as_ref(i).cloned().unwrap_or(My::NULL);
+                    if matches!(&v, My::Bytes(b) if crate::httpd::making(b.len()).is_err()) {
+                        over = true;
+                        break 'rows;
+                    }
                     m.insert(col.name_str().as_ref().into(), from_my(v, col));
                 }
-                out.push(Value::map(m));
+                if crate::value::push_held(&mut out, Value::map(m)).is_err() {
+                    over = true;
+                    break;
+                }
                 if limit.map_or(false, |l| out.len() >= l) {
                     break;
                 }
             }
             result.drop_result().await?;
-            Ok::<_, mysql_async::Error>(out)
+            Ok::<_, mysql_async::Error>(if over { Err(()) } else { Ok(out) })
         });
-        let rows = r.map_err(|e| self.failed(e))?;
+        let rows = r.map_err(|e| self.failed(e))?.map_err(|_| crate::db::ROWS_OVER.to_string())?;
         self.still_in_tx()?;
         Ok(rows)
     }

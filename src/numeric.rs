@@ -2232,6 +2232,9 @@ fn count(n: i64, f: &str, line: u32) -> Result<usize, Ctrl> {
     if n < 0 || n as usize > MOST {
         return fail(line, format!("`{}`: {} is not a count from 0 to {}", f, n, MOST));
     }
+    // A list of that many, compared with `--max-memory` before it is made (FEEDBACK71.md, Q-977;
+    // branch security).
+    crate::value::list_of(n as usize).map_err(|o| o.at(line))?;
     Ok(n as usize)
 }
 

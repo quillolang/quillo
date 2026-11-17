@@ -85,6 +85,86 @@ pub fn parse_urlencoded(s: &str) -> Map {
     m
 }
 
+/// `parse_urlencoded`, the map held to `--max-memory` as it grows: a body of 1.1 million fields
+/// made 211 MB under a 64 MB limit (FEEDBACK71.md, Q-977, found in review; branch security). A
+/// field's text is no longer than what it came as.
+fn parse_urlencoded_held(s: &str) -> Result<Map, crate::httpd::OverMemory> {
+    let mut m = Map::new();
+    for pair in s.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        crate::value::insert_held(&mut m, percent_decode(k, true).into(), Value::str(percent_decode(v, true)))?;
+    }
+    Ok(m)
+}
+
+/// What a request's body reads to: its text, its JSON, its form's fields and files. Held to
+/// `--max-memory` where `held`: the text made from it (U+FFFD three bytes for each byte that is
+/// not UTF-8), its JSON's lists, maps and texts, and a form's fields, each as it is made
+/// (FEEDBACK71.md, Q-977, the review's bounded readers; branch security).
+fn body_parts(req: &HttpRequest, ctype: &str, held: bool) -> Result<(Value, Value, Value, Value), crate::httpd::OverMemory> {
+    // Files: their bytes stay in the body (see `upload`), which is no text.
+    let multipart = crate::upload::boundary(ctype);
+    let body = if multipart.is_some() {
+        String::new()
+    } else if held {
+        crate::value::lossy_held_of(&req.body)?
+    } else {
+        String::from_utf8_lossy(&req.body).into_owned()
+    };
+    let trimmed = body.trim_start();
+    // A body is JSON when it says so, or says nothing and looks like it
+    // (curl, scripts). Not when it says it is something else: a page on
+    // another site can send `text/plain` without asking first, and must
+    // not reach routes that expect JSON.
+    let looks_json = trimmed.starts_with('{') || trimmed.starts_with('[');
+    let json = if is_json_type(ctype) || (ctype.trim().is_empty() && looks_json) {
+        // RFC 8259 lets a reader skip a byte-order mark (FEEDBACK31.md, Q-386; branch
+        // feedback27-35-fixes).
+        // Read straight into values, with a budget of them (FEEDBACK51.md, Q-660).
+        let text = body.strip_prefix('\u{FEFF}').unwrap_or(&body);
+        if held { Value::parse_json_held(text)? } else { Value::parse_json(text) }.unwrap_or(Value::Nil)
+    } else {
+        Value::Nil
+    };
+    let (form, files) = match &multipart {
+        Some(b) => crate::upload::parse_as(b, &req.body, held)?,
+        // The type in any case, with or without parameters (FEEDBACK55.md, Q-717; branch feedback55).
+        None if essence(ctype) == "application/x-www-form-urlencoded" => (if held { parse_urlencoded_held(&body)? } else { parse_urlencoded(&body) }, Map::new()),
+        None => (Map::new(), Map::new()),
+    };
+    Ok((Value::str(body), json, Value::map(form), Value::map(files)))
+}
+
+/// What a request's body read to, held, made once at the start of the request where
+/// `--max-memory` is set and the body is long enough to read past 64 KB (`read_body_held`): each
+/// `build_request` of it takes it from here, by the body's place and length.
+struct BodyRead {
+    at: usize,
+    len: usize,
+    parts: (Value, Value, Value, Value),
+}
+
+thread_local! {
+    static BODY_READ: std::cell::RefCell<Option<BodyRead>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The request's body read, held, as `build_request` reads it, and kept for it: `OverMemory`
+/// where a value it reads to would be bigger than `--max-memory` allows.
+fn read_body_held(req: &HttpRequest) -> Result<(), crate::httpd::OverMemory> {
+    let ctype = req.headers.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map_or("", |(_, v)| v.as_str());
+    let parts = body_parts(req, ctype, true)?;
+    BODY_READ.with(|b| *b.borrow_mut() = Some(BodyRead { at: req.body.as_ptr() as usize, len: req.body.len(), parts }));
+    Ok(())
+}
+
+/// What `read_body_held` kept of `req`'s body, if it read it.
+fn body_read(req: &HttpRequest) -> Option<(Value, Value, Value, Value)> {
+    if !crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    BODY_READ.with(|b| b.borrow().as_ref().filter(|r| r.at == req.body.as_ptr() as usize && r.len == req.body.len()).map(|r| r.parts.clone()))
+}
+
 /// `req` as `request`, its form as `all_values` makes it, for `{ form: { tag: [str] } }`.
 fn form_lists(pat: Option<&crate::ast::Pattern>, reqv: &Value, req: &HttpRequest) -> Option<Value> {
     let Some(crate::ast::Pattern::Record(fields)) = pat else { return None };
@@ -429,28 +509,10 @@ pub(crate) fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map
             }
         }
     }
-    // Files: their bytes stay in the body (see `upload`), which is no text.
-    let multipart = crate::upload::boundary(&ctype);
-    let body = if multipart.is_some() { String::new() } else { String::from_utf8_lossy(&req.body).into_owned() };
-    let trimmed = body.trim_start();
-    // A body is JSON when it says so, or says nothing and looks like it
-    // (curl, scripts). Not when it says it is something else: a page on
-    // another site can send `text/plain` without asking first, and must
-    // not reach routes that expect JSON.
-    let looks_json = trimmed.starts_with('{') || trimmed.starts_with('[');
-    let json = if is_json_type(&ctype) || (ctype.trim().is_empty() && looks_json) {
-        // RFC 8259 lets a reader skip a byte-order mark (FEEDBACK31.md, Q-386; branch
-        // feedback27-35-fixes).
-        // Read straight into values, with a budget of them (FEEDBACK51.md, Q-660).
-        Value::parse_json(body.strip_prefix('\u{FEFF}').unwrap_or(&body)).unwrap_or(Value::Nil)
-    } else {
-        Value::Nil
-    };
-    let (form, files) = match &multipart {
-        Some(b) => crate::upload::parse(b, &req.body),
-        // The type in any case, with or without parameters (FEEDBACK55.md, Q-717; branch feedback55).
-        None if essence(&ctype) == "application/x-www-form-urlencoded" => (parse_urlencoded(&body), Map::new()),
-        None => (Map::new(), Map::new()),
+    // Read at the request's start, held, where it could read past `--max-memory`; else here.
+    let (body, json, form, files) = match body_read(req) {
+        Some(parts) => parts,
+        None => body_parts(req, &ctype, false).unwrap_or((Value::str(""), Value::Nil, Value::map(Map::new()), Value::map(Map::new()))),
     };
 
     let mut headers = Map::with_capacity(req.headers.len());
@@ -470,10 +532,10 @@ pub(crate) fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map
     m.insert("params".into(), Value::map(Map::new()));
     m.insert("headers".into(), Value::map(headers));
     m.insert("cookies".into(), Value::map(cookies));
-    m.insert("body".into(), Value::str(body));
+    m.insert("body".into(), body);
     m.insert("json".into(), json);
-    m.insert("form".into(), Value::map(form));
-    m.insert("files".into(), Value::map(files));
+    m.insert("form".into(), form);
+    m.insert("files".into(), files);
     m.insert("ip".into(), Value::str(&req.remote));
     m
 }
@@ -1807,6 +1869,12 @@ impl Interp {
                     crate::httpd::error_line(&e.msg);
                     rpc_error(500, &crate::httpd::over_compute_said_to_pages())
                 }
+                // Past `--max-memory`, as past `--max-compute`, told by its kind (FEEDBACK71.md,
+                // Q-977; branch security).
+                Err(Ctrl::Error(e)) if e.memory_stop => {
+                    crate::httpd::error_line(&e.msg);
+                    rpc_error(500, &crate::httpd::over_memory_said_to_pages())
+                }
                 Err(Ctrl::Error(e)) => rpc_error(400, &e.msg),
                 Err(_) => rpc_error(500, "markdown failed"),
             };
@@ -1916,8 +1984,9 @@ impl Interp {
             return match res {
                 Ok(v) | Err(Ctrl::Return(v)) => match for_visitor(v) {
                     Value::Response(r) => render_response(&r),
-                    Value::Err(e, _, _) => json_response(200, serde_json::json!({ "err": crate::interp::island_json(&e) })),
-                    v => json_response(200, serde_json::json!({ "ok": crate::interp::island_json(&v) })),
+                    // Held as a route's answer is (FEEDBACK71.md, Q-977; branch security).
+                    Value::Err(e, _, _) => answer_held("err", &e),
+                    v => answer_held("ok", &v),
                 },
                 Err(Ctrl::Reply(r)) => render_response(&r),
                 Err(Ctrl::Error(e)) => {
@@ -1965,8 +2034,15 @@ impl Interp {
                 let answer = Arc::new(match res {
                     Ok(v) | Err(Ctrl::Return(v)) => match for_visitor(v) {
                         Value::Response(r) => return render_response(&r),
-                        Value::Err(e, _, _) => crate::livecache::Answer::new(crate::interp::island_json(&e), true),
-                        v => crate::livecache::Answer::new(crate::interp::island_json(&v), false),
+                        // Held to `--max-memory` where it is set (FEEDBACK71.md, Q-977; branch security).
+                        Value::Err(e, _, _) => match crate::livecache::Answer::of(&e, true) {
+                            Some(a) => a,
+                            None => return over_memory_answer(),
+                        },
+                        v => match crate::livecache::Answer::of(&v, false) {
+                            Some(a) => a,
+                            None => return over_memory_answer(),
+                        },
                     },
                     Err(Ctrl::Reply(r)) => return render_response(&r),
                     Err(Ctrl::Error(e)) => {
@@ -2802,6 +2878,30 @@ fn json_response(status: u16, j: serde_json::Value) -> HttpResponse {
     }
 }
 
+/// A 200 of JSON `j`, its text held to `--max-memory` as it is written: past it, a 500 that says
+/// so, as a route's answer is ended (FEEDBACK71.md, Q-977; branch security).
+/// A server fn's answer, `{"ok": v}` (or `err`), where the limit is set written straight into
+/// its body held to `--max-memory`, with no tree made first: past it, a 500 that says so, as a
+/// route's answer is ended (FEEDBACK71.md, Q-977, found in review: the tree of a list of 200
+/// long texts took 408 MB first; branch security).
+fn answer_held(key: &str, v: &Value) -> HttpResponse {
+    if !crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) {
+        return json_response(200, serde_json::json!({ key: crate::interp::island_json(v) }));
+    }
+    let mut body = format!("{{\"{}\":", key).into_bytes();
+    if v.island_into_held(&mut body) && crate::value::bytes_room(&mut body, 1) {
+        body.push(b'}');
+        return HttpResponse { status: 200, headers: vec![("content-type".into(), "application/json".into())], body };
+    }
+    over_memory_answer()
+}
+
+/// The answer to a server fn call past `--max-memory`, and its line in the log.
+fn over_memory_answer() -> HttpResponse {
+    crate::httpd::error_line(&crate::httpd::over_memory());
+    rpc_error(500, &crate::httpd::over_memory_said_to_pages())
+}
+
 fn rpc_error(status: u16, msg: &str) -> HttpResponse {
     json_response(status, serde_json::json!({ "error": msg }))
 }
@@ -3331,8 +3431,21 @@ pub(crate) fn render_response(r: &Response) -> HttpResponse {
             other => {
                 // An answer too large or too deep to write is the program's error, not the
                 // server's end, said as it is written (Q-606, Q-592).
+                // Held to `--max-memory` as it is written, as every text a request makes: the
+                // answer's body is a value too (FEEDBACK71.md, Q-977, found in review: 200 long
+                // texts made 180 MB of JSON under a 1 MB limit; branch security). Only where the
+                // limit is set: a compare for each piece cost a JSON answer 100 to 270
+                // instructions more.
                 let mut out = Vec::new();
-                if let Err(why) = hidden(other).as_ref().unwrap_or(other).json_into_within(&mut out, crate::builtins::JSON_MOST, crate::builtins::JSON_DEEPEST) {
+                let v = hidden(other);
+                let v = v.as_ref().unwrap_or(other);
+                let written = if crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) {
+                    v.json_into_held(&mut out, crate::builtins::JSON_MOST, crate::builtins::JSON_DEEPEST)
+                } else {
+                    v.json_into_within(&mut out, crate::builtins::JSON_MOST, crate::builtins::JSON_DEEPEST).map_err(Some)
+                };
+                if let Err(why) = written {
+                    let why = why.unwrap_or_else(crate::httpd::over_memory);
                     crate::httpd::error_line_with(&format!("the answer's value cannot be written as JSON: {}", why), &[]);
                     return HttpResponse { status: 500, headers: vec![("content-type".into(), "application/json".into())], body: br#"{"error":"internal error"}"#.to_vec() };
                 }
@@ -4644,7 +4757,19 @@ impl Worker {
         let rid = crate::service::request_id(req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-request-id")).map(|(_, v)| v.as_str()));
         crate::httpd::request_began(&req.method, &log_url(&req.url), &rid);
         let prefetch = is_prefetch(&req);
-        let mut resp = if app.watch && req.url == "/_quillo/dev" {
+        // Its body's text, and what reading it as JSON or a form makes, held to `--max-memory`
+        // as it is read, once, here: past it the request ends as a route's error does, a 500
+        // (FEEDBACK71.md, Q-977; branch security). `--max-body` holds the bytes as they come. The
+        // size first: a body under 1,260 bytes reads to less than 64 KB however it is read (a
+        // form's field takes 80 bytes for at least two of the body's), and pays a compare.
+        let body_over = if req.body.len() >= crate::httpd::LARGE / 52 && crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) {
+            read_body_held(&req).err()
+        } else {
+            None
+        };
+        let mut resp = if let Some(stop) = body_over {
+            finish(Err(stop.at(0)))
+        } else if app.watch && req.url == "/_quillo/dev" {
             plain(200, &self.generation.to_string())
         } else if prefetch && crate::httpd::others_waiting() {
             // A guess is work nobody has asked for yet, so it does not go before anyone. The
@@ -4713,6 +4838,9 @@ impl Worker {
                     let _ = v;
                 }
             }
+        }
+        if crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) {
+            BODY_READ.with(|b| b.borrow_mut().take());
         }
         crate::httpd::request_done();
         if prefetch && crate::metrics::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {

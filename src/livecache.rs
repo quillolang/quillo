@@ -146,6 +146,18 @@ impl Answer {
         let text: Arc<str> = value.to_string().into();
         Answer { h: hash(&text), value: Arc::new(value), text, err, gz: Mutex::new(None) }
     }
+
+    /// `Answer::new(island_json(v), err)`, its text held to `--max-memory` where the limit is
+    /// set: written first, with no tree made, and `None` past the limit; the tree, kept for
+    /// patches, made only then (FEEDBACK71.md, Q-977, found in review: a live answer of 200 MB
+    /// went out under an 8 MB limit; branch security).
+    pub fn of(v: &crate::value::Value, err: bool) -> Option<Self> {
+        if !crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) {
+            return Some(Answer::new(crate::interp::island_json(v), err));
+        }
+        let text: Arc<str> = v.island_text_held()?.into();
+        Some(Answer { h: hash(&text), value: Arc::new(crate::interp::island_json(v)), text, err, gz: Mutex::new(None) })
+    }
 }
 
 /// As text, not parsed: what the budget counts is then what is held, several

@@ -37,6 +37,29 @@ is not. Time spent waiting does not count. Compiled code has
 nowhere to stop, so under `--max-compute` functions are not compiled. `quillo check` warns on
 a `while` that cannot end.
 
+Started with [`--max-memory 512MB`](#options-of-quillo-run), no one value a request makes may be
+bigger than that, and a request that would make one ends there with a 500 (`this request's
+value would be bigger than --max-memory allows (N bytes)`) and a line in the log, while every
+other request goes on. No `??` takes it, and it is said at the line that made the value:
+
+- Every text a builtin or an answer writes stops as it would pass the limit: `+`, templates,
+  `str`, `join`, `replace`, `re.replace`, `upper`, `lower`, `normalize`, `escape`,
+  `url_encode`, `raw`, `markdown`, `json.stringify`, a route's JSON, a page and its components
+  (their attributes, `class` and `style` values, the text inside a `<script>` or a `<style>`, a
+  `<select>`'s value, the props and state their islands carry), a `server fn`'s answer, a live
+  part's too, a stream's piece. A deferred part that would pass it keeps its placeholder, as a
+  part that fails does, and its stop is said in the log.
+- Lists and maps are compared as they grow: `push`, `range`, `flatten`, spreads, `merge`,
+  `set`, `group_by`, `json.parse`, a query's rows, a form's fields.
+- Bytes read stop at the limit (`read_file`, `http`, a request's body), and their text (U+FFFD
+  for each byte that is not UTF-8) is held to it too.
+- Not held to it: the sum of many values each under it (bounded by time, with
+  `--max-compute`), copies no larger than what they copy (`slice`, `map`, `filter`, `sort`),
+  error messages, sessions and channels, and the PostgreSQL driver's own rows.
+
+Each instance and each `--split` service holds the same limit, and `--split` passes
+`--max-compute` on to its services too.
+
 How long a wait may last:
 
 - [`--workers N`](#options-of-quillo-run) (64 by default) requests can wait at once, each on a pool thread; more
@@ -659,7 +682,7 @@ hosts = ["api.stripe.com", "*.mapbox.com"]
 | `[http] hosts` | the hosts `http.*` and `site` calls may reach: `api.stripe.com`, `*.mapbox.com` (its subdomains, not itself), `*`. Each redirect is judged before it is followed |
 | `[http] private` | `false`: `http.*` and `site` calls reach nothing on this machine or its networks (loopback, private, link-local and the cloud's metadata at `169.254.169.254`, carrier-grade NAT, IPv6's unique-local), as the name resolves when it connects |
 | `[env] names` | the variables `env()` may read; any other reads as not set, so `env("HOME") ?? "none"` gives `"none"` |
-| `[limits] workers`, `max_compute`, `max_body` | the most [`--workers`](#options-of-quillo-run), [`--max-compute`](#options-of-quillo-run) and [`--max-body`](#options-of-quillo-run) may be: a smaller value given on the command line stays (`"10s"`, `"500ms"`, `"2m"`; `"10MB"`, `"512KB"` or bytes). Each takes what the option takes: 0 is refused (`p.toml:2: `max_body` is a size larger than 0`), as the option refuses it |
+| `[limits] workers`, `max_compute`, `max_body`, `max_memory` | the most [`--workers`](#options-of-quillo-run), [`--max-compute`](#options-of-quillo-run), [`--max-body`](#options-of-quillo-run) and [`--max-memory`](#options-of-quillo-run) may be (`max_memory`: no one value a request makes may be bigger; its stop says `the policy p.toml allows (max_memory, N bytes)`): a smaller value given on the command line stays (`"10s"`, `"500ms"`, `"2m"`; `"10MB"`, `"512KB"` or bytes). Each takes what the option takes: 0 is refused (`p.toml:2: `max_body` is a size larger than 0`), as the option refuses it |
 | `[limits] max_tool_calls` | the most tool calls a minute each user of the MCP door may make: it can lower `--max-tool-calls`, not raise it |
 
 Under the two files above, with `APP_NAME=Shop`:

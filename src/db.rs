@@ -1460,6 +1460,26 @@ fn prepare_error(e: rusqlite::Error) -> String {
 /// See `prepare_error`.
 pub(crate) const MORE_THAN_ONE: &str = "the SQL has more than one statement: a query, or db.exec given values, runs one (db.exec of the text alone, without values, runs them all)";
 
+/// What a driver's reading of rows says where `--max-memory` stopped it: `query_as` makes it the
+/// request's stop (FEEDBACK71.md, Q-977; branch security).
+pub(crate) const ROWS_OVER: &str = "\u{1}over";
+
+/// A cell's text, before it is made from what SQLite holds: compared with `--max-memory`, and a
+/// blob's with what U+FFFD takes for each byte that is not UTF-8 (FEEDBACK71.md, Q-977, found in
+/// review: `printf('%.*c', 5000000, 'x')` made a 5 MB text under a 1 MB limit; branch security).
+#[inline]
+fn cell_room(v: &ValueRef) -> Result<(), String> {
+    let n = match v {
+        ValueRef::Text(t) => t.len(),
+        ValueRef::Blob(b) if b.len() >= crate::httpd::LARGE / 3 => match std::str::from_utf8(b) {
+            Ok(_) => b.len(),
+            Err(_) => b.utf8_chunks().map(|c| c.valid().len() + if c.invalid().is_empty() { 0 } else { 3 }).sum(),
+        },
+        _ => return Ok(()),
+    };
+    crate::httpd::making(n).map_err(|_| ROWS_OVER.to_string())
+}
+
 pub(crate) fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
     // Compiled once and kept, as a statement made again and again is (a row read by its key per
     // request, an insert in a loop): faster than Python's sqlite3 there too (branch
@@ -1479,9 +1499,13 @@ pub(crate) fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option
         });
         let mut m = Map::with_capacity_and_hasher(cols.len(), Default::default());
         for (i, (c, kind)) in cols.iter().enumerate() {
-            m.insert(c.clone(), from_sql(row.get_ref(i).map_err(|e| e.to_string())?, *kind));
+            let cell = row.get_ref(i).map_err(|e| e.to_string())?;
+            cell_room(&cell)?;
+            m.insert(c.clone(), from_sql(cell, *kind));
         }
-        out.push(Value::map(m));
+        // The rows' list held as it grows: a recursive query of 300,000 rows made them all under a
+        // 1 MB limit (Q-977, found in review).
+        crate::value::push_held(&mut out, Value::map(m)).map_err(|_| ROWS_OVER.to_string())?;
         if limit.map_or(false, |l| out.len() >= l) {
             break;
         }
@@ -2983,6 +3007,11 @@ fn query_as(it: &mut Interp, args: Vec<Value>, line: u32, limit: Option<usize>, 
         no_commit_inside(it, &b, &scan, f, line)?;
     }
     let rows = select_in(it, on, b, &scan, sql, args[1..].to_vec(), limit);
+    // Stopped at `--max-memory` as its rows were read: the request's stop (FEEDBACK71.md, Q-977;
+    // branch security).
+    if matches!(&rows, Err(e) if e == ROWS_OVER) {
+        return Err(crate::httpd::OverMemory.at(line));
+    }
     if !own {
         committed_inside(&rows, &scan, f, line)?;
     }

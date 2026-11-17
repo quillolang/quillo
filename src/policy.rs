@@ -21,6 +21,7 @@
 //! max_compute = "10s"
 //! max_body = "10MB"
 //! max_tool_calls = 60            # a minute, for each caller of /_quillo/mcp
+//! max_memory = "512MB"           # no one value a request makes may be bigger
 //! ```
 //!
 //! The host's file comes first, then any `--policy FILE`, then `quillo.policy` beside the
@@ -67,6 +68,10 @@ pub struct Policy {
     /// The file each limit came from, for the messages that hold a program to it (FEEDBACK55.md,
     /// Q-849; branch feedback55).
     pub max_compute_from: Option<PathBuf>,
+    /// What no one value a request makes may be bigger than, as `--max-memory` says it, and the file it came
+    /// from (FEEDBACK71.md, Q-977; branch security).
+    pub max_memory: Option<usize>,
+    pub max_memory_from: Option<PathBuf>,
 }
 
 impl Default for Policy {
@@ -87,6 +92,8 @@ impl Default for Policy {
             max_body: None,
             max_tool_calls: None,
             max_compute_from: None,
+            max_memory: None,
+            max_memory_from: None,
         }
     }
 }
@@ -314,10 +321,22 @@ impl Policy {
                     }
                     self.max_body = Some(self.max_body.map_or(b, |m| m.min(b)));
                 }
+                // As `--max-memory` takes it, the least of the layers' (FEEDBACK71.md, Q-977; branch
+                // security).
+                ("limits", "max_memory", _) => {
+                    let b = bytes(&v).ok_or_else(|| at(line, "`max_memory` is a size such as \"512MB\"".into()))?;
+                    if b < crate::httpd::LARGE {
+                        return Err(at(line, "`max_memory` is a size of 64KB or more, as `--max-memory` takes, such as \"512MB\"".into()));
+                    }
+                    if self.max_memory.map_or(true, |m| b < m) {
+                        self.max_memory = Some(b);
+                        self.max_memory_from = Some(file.to_path_buf());
+                    }
+                }
                 ("limits", "max_tool_calls", V::Int(n)) if *n > 0 => self.max_tool_calls = Some(self.max_tool_calls.map_or(*n as usize, |m| m.min(*n as usize))),
                 ("limits", "max_tool_calls", V::Int(_)) => return Err(at(line, "`max_tool_calls` is a positive number, the calls a minute, as `--max-tool-calls` takes".into())),
                 (s, k, _) => {
-                    let known = ["plugins.build", "plugins.allow", "effects.allow", "http.private", "http.hosts", "env.names", "limits.workers", "limits.max_compute", "limits.max_body", "limits.max_tool_calls"];
+                    let known = ["plugins.build", "plugins.allow", "effects.allow", "http.private", "http.hosts", "env.names", "limits.workers", "limits.max_compute", "limits.max_body", "limits.max_tool_calls", "limits.max_memory"];
                     let name = format!("{}.{}", s, k);
                     return Err(at(line, if known.contains(&name.as_str()) { format!("`{}` has the wrong kind of value", name) } else { format!("`{}` is not something a policy says (it says {})", name, known.join(", ")) }));
                 }
@@ -412,6 +431,9 @@ impl Policy {
         }
         if let Some(n) = self.max_tool_calls {
             out.push(format!("max_tool_calls {} a minute", n));
+        }
+        if let Some(m) = self.max_memory {
+            out.push(format!("max_memory {} bytes", m));
         }
         format!("policy {}{}", self.files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(" + "), if out.is_empty() { String::new() } else { format!(" ({})", out.join("; ")) })
     }

@@ -968,11 +968,19 @@ thread_local! {
 /// Rows as maps of column name to value; a `money` value with `digits` decimals.
 fn values(rows: &[postgres::Row], limit: Option<usize>, digits: u32) -> Result<Vec<Value>, String> {
     MONEY.with(|m| m.set(digits));
-    let mut out = Vec::with_capacity(rows.len().min(limit.unwrap_or(usize::MAX)));
+    // The rows' list and each text compared with `--max-memory` as they are made from what the
+    // driver read (FEEDBACK71.md, Q-977; branch security). The driver's own rows are read whole
+    // first, and are not.
+    let n = rows.len().min(limit.unwrap_or(usize::MAX));
+    crate::value::list_of(n).map_err(|_| crate::db::ROWS_OVER.to_string())?;
+    let mut out = Vec::with_capacity(n);
     for row in rows.iter().take(limit.unwrap_or(usize::MAX)) {
         let mut m = Map::with_capacity(row.len());
         for (i, col) in row.columns().iter().enumerate() {
             let v: PgValue = row.try_get(i).map_err(|e| describe(&e))?;
+            if let Value::Str(t) = &v.0 {
+                crate::httpd::making(t.len()).map_err(|_| crate::db::ROWS_OVER.to_string())?;
+            }
             m.insert(col.name().into(), v.0);
         }
         out.push(Value::map(m));

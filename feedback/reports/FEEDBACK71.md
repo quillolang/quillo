@@ -702,6 +702,19 @@ Envoy quotes only `Subject`, `Cert` and `Chain`. A CA-issued URI SAN such as `sp
 | Requests | None |
 | Security | A certificate holder whose CA allows wildcard SANs names themselves as any caller |
 
+### Q-1001. `--max-compute` given to `quillo run --split` did not reach the services
+
+Found by the fix of Q-977 (branch security, 2026-11-17). Severity: low. Status: FIXED on branch security. Code: src/service.rs (the services' command line), src/httpd.rs (`compute_limit_of_option`).
+
+`--split` passed `--drain` on to the services it starts, and each reads the policy itself, but not `--max-compute`: a service's request that computed for long was not ended where the app's would be.
+
+| Impact | |
+|---|---|
+| Functionality | Each `--split` service gets `--max-compute`, as `--max-memory` |
+| User | A service's runaway request held its instance as before the option |
+| Requests | One |
+| Security | The CPU limit the operator set did not hold in the services under `--split` |
+
 ## Checked and sound, and not covered, by group
 
 What each auditor tried that held, and what it did not get to, as it wrote them.

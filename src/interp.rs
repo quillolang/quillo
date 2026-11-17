@@ -489,7 +489,7 @@ pub struct Interp {
     /// Components' and views' own CSS, and the pages' sheets made of it.
     pub styles: Arc<std::sync::Mutex<crate::styles::Styles>>,
     /// A buffer lent to the renderer for building attribute values.
-    spare: String,
+    spare: Held,
     /// What views rendered, shared by the workers (see `viewcache`).
     pub view_cache: Option<Arc<Mutex<crate::viewcache::ViewCache>>>,
     /// The renders being cached, innermost last: what each has read.
@@ -634,6 +634,37 @@ pub fn as_dec(v: &Value) -> Option<Dec> {
     }
 }
 
+/// A value of `n` bytes, a large one, about to be made: compared with `--max-memory`, out of the
+/// way of every small one, which pays one compare; past it, the request's stop (FEEDBACK71.md,
+/// Q-977; branch security).
+#[cold]
+#[inline(never)]
+pub(crate) fn large(n: usize, line: u32) -> Result<(), Ctrl> {
+    crate::httpd::making(n).map_err(|s| s.at(line))
+}
+
+/// The room a `Vec` or `String` of `cap` grows to when it must hold `need`: what it then makes.
+pub(crate) fn room_for(cap: usize, need: usize) -> usize {
+    need.max(cap.saturating_mul(2))
+}
+
+/// Whether a list may take `added` more items where it is: the room it grows to, where it must,
+/// compared with `--max-memory` first.
+#[cold]
+#[inline(never)]
+fn list_may_extend(l: &Arc<Vec<Value>>, added: usize) -> bool {
+    let need = l.len() + added;
+    need <= l.capacity() || crate::httpd::making(room_for(l.capacity(), need).saturating_mul(crate::value::ITEM_BYTES)).is_ok()
+}
+
+/// The line of a template's part, where it has one.
+fn part_line(x: &Expr) -> u32 {
+    match x {
+        Expr::Ident(_, l) | Expr::Call(_, _, l) | Expr::Binary(_, _, _, l) | Expr::Field(_, _, l) | Expr::Index(_, _, l) | Expr::Pipe(_, _, l) | Expr::Unary(_, _, l) => *l,
+        _ => 0,
+    }
+}
+
 /// Converts request text to the type a pattern asks for.
 /// Whether `??` may take a stop: not one that means the request must end, the compute limit's
 /// whether `--max-compute` or a policy set it (FEEDBACK55.md, Q-849; branch feedback55).
@@ -772,7 +803,7 @@ pub fn escape(s: &str) -> String {
 /// CR is `&#13;`, which the parser keeps, and a NUL U+FFFD, as the parser makes it in an attribute
 /// and the browser writes it (FEEDBACK55.md, Q-772; branch feedback55). In an attribute too, as
 /// Q-312 had it there (FEEDBACK25.md; branch feedback26-fixes).
-pub fn escape_into(s: &str, out: &mut String) {
+pub fn escape_into<O: Text>(s: &str, out: &mut O) {
     let b = s.as_bytes();
     let (mut done, mut i) = (0, 0);
     loop {
@@ -942,12 +973,26 @@ fn shows_script_url(v: &Value) -> bool {
     }
 }
 
-/// A `<style>` child's text: a list's items a line each; nothing for null and false.
-fn sheet_text(v: &Value) -> String {
+/// A `<style>` child's text: a list's items a line each; nothing for null and false. Held to
+/// `--max-memory` as it is written (FEEDBACK71.md, Q-977, found in review: a list of 200 long
+/// texts made 593 MB; branch security).
+fn sheet_text(v: &Value) -> Result<String, crate::httpd::OverMemory> {
     match v {
-        Value::Nil | Value::Bool(false) => String::new(),
-        Value::List(items) => items.iter().map(|x| x.display()).collect::<Vec<_>>().join("\n"),
-        other => other.display(),
+        Value::Nil | Value::Bool(false) => Ok(String::new()),
+        Value::List(items) => {
+            let mut out = Held::new();
+            for (i, x) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                x.display_into(&mut out);
+                if out.is_over() {
+                    break;
+                }
+            }
+            out.into_text()
+        }
+        other => other.display_held(),
     }
 }
 
@@ -1006,10 +1051,22 @@ pub fn script_scheme(url: &str) -> Option<&'static str> {
 /// `out.push_str(s)`, a short `s` copied in place by overlapping loads and stores rather than by a
 /// call to the C library's `memmove`: a page is made of many short pieces (a row's tags, a field's
 /// text, a number), and the calls had been 6% of the Fortunes page's time (branch speed-fortunes).
+///
+/// Into a `Held` text too, which makes the room first, where `--max-memory` lets it (FEEDBACK71.md,
+/// Q-977; branch security): a `String` reserves it, as before.
 #[inline(always)]
-pub(crate) fn push_short(out: &mut String, s: &str) {
-    // SAFETY: the bytes are a whole `str`, so `out` stays UTF-8.
-    push_short_bytes(unsafe { out.as_mut_vec() }, s.as_bytes());
+pub(crate) fn push_short<O: Text>(out: &mut O, s: &str) {
+    let n = s.len();
+    if n > 64 {
+        out.push_str(s);
+        return;
+    }
+    if !out.room(n) {
+        return;
+    }
+    // SAFETY: `room` made room for `n` more bytes, and the bytes are a whole `str`, so `out` stays
+    // UTF-8.
+    unsafe { copy_short(out.text().as_mut_vec(), s.as_bytes()) }
 }
 
 /// `out.extend_from_slice(s)`, as `push_short` copies: up to 64 bytes in place, more by `memmove`.
@@ -1021,8 +1078,20 @@ pub fn push_short_bytes(out: &mut Vec<u8>, s: &[u8]) {
         return;
     }
     out.reserve(n);
-    // SAFETY: `reserve` made room for `n` more bytes after `len`; each load reads inside `s` and
-    // each store writes inside that room: the loads and stores of a size overlap when `n` is under
+    // SAFETY: `reserve` made room for `n` more bytes.
+    unsafe { copy_short(out, s) }
+}
+
+/// `s`, 64 bytes at most, copied after the end of `out`, which has room for it.
+///
+/// # Safety
+/// `out` has room for `s.len()` more bytes.
+#[inline(always)]
+unsafe fn copy_short(out: &mut Vec<u8>, s: &[u8]) {
+    let n = s.len();
+    debug_assert!(n <= 64 && out.capacity() - out.len() >= n);
+    // SAFETY: there is room for `n` more bytes after `len`; each load reads inside `s` and each
+    // store writes inside that room: the loads and stores of a size overlap when `n` is under
     // twice their size, and together cover all `n` bytes.
     unsafe {
         let len = out.len();
@@ -1052,7 +1121,7 @@ pub fn push_short_bytes(out: &mut Vec<u8>, s: &[u8]) {
 }
 
 /// An integer's digits, appended to `out` (without `fmt`'s machinery).
-fn push_int(out: &mut String, n: i64) {
+fn push_int<O: Text>(out: &mut O, n: i64) {
     let mut buf = [0u8; 20];
     let mut i = buf.len();
     let mut m = n.unsigned_abs();
@@ -1071,12 +1140,16 @@ fn push_int(out: &mut String, n: i64) {
     push_short(out, unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
 }
 
-/// A value's text, escaped, appended to `out`.
-fn display_escaped(v: &Value, out: &mut String) {
+/// A value's text, escaped, appended to `out`: a list's or a map's text held, and none made past
+/// `--max-memory`, where the page stops (FEEDBACK71.md, Q-977; branch security).
+fn display_escaped(v: &Value, out: &mut Held) {
     match v {
         Value::Str(s) => escape_into(s, out),
         Value::Int(n) => push_int(out, *n),
-        other => escape_into(&other.display(), out),
+        other => match other.display_held() {
+            Ok(t) => escape_into(&t, out),
+            Err(_) => out.stop(),
+        },
     }
 }
 
@@ -1129,9 +1202,17 @@ pub(crate) fn island_attr(key: &str) -> bool {
 /// A list's or map's JSON as an attribute's value: a builtin's error in it says `internal error`
 /// where the server hides them, as `json.stringify` does (FEEDBACK55.md, Q-773; branch
 /// feedback55).
-fn attr_json(v: &Value) -> String {
+///
+/// Held to `--max-memory` as it is written, as the page is (FEEDBACK71.md, Q-977; branch
+/// security): `None` past it.
+fn attr_json(v: &Value) -> Option<String> {
     let hidden = if crate::value::hiding() { crate::server::hidden(v) } else { None };
-    hidden.as_ref().unwrap_or(v).json_text()
+    let mut out = Vec::new();
+    if !hidden.as_ref().unwrap_or(v).json_into_bounded(&mut out) {
+        return None;
+    }
+    // SAFETY: only JSON text, which is UTF-8, was written.
+    Some(unsafe { String::from_utf8_unchecked(out) })
 }
 
 /// Whether `lower`, an attribute's name in lower case, is React's handler form, `onclick`
@@ -1140,7 +1221,10 @@ fn is_react_handler(lower: &str) -> bool {
     lower.len() > 2 && lower.starts_with("on") && lower[2..].bytes().all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'_')
 }
 
-fn render_value(v: &Value, out: &mut String) {
+/// A value shown in a page, written into the page's `Held` text, which stops at `--max-memory`:
+/// a list of 200 long texts made a 180 MB page under a 1 MB limit (FEEDBACK71.md, Q-977, found
+/// in review; branch security).
+fn render_value(v: &Value, out: &mut Held) {
     match v {
         Value::Html(h) => out.push_str(h),
         // `true` shows nothing, as `false` and null do, as in React; a function too, where it
@@ -1149,11 +1233,17 @@ fn render_value(v: &Value, out: &mut String) {
         Value::List(items) => {
             for i in items.iter() {
                 render_value(i, out);
+                if out.is_over() {
+                    return;
+                }
             }
         }
         Value::Str(s) => escape_into(s, out),
         Value::Int(n) => push_int(out, *n),
-        other => escape_into(&crate::server::hidden(other).as_ref().unwrap_or(other).display(), out),
+        other => match crate::server::hidden(other).as_ref().unwrap_or(other).display_held() {
+            Ok(t) => escape_into(&t, out),
+            Err(_) => out.stop(),
+        },
     }
 }
 
@@ -1163,15 +1253,25 @@ fn render_value(v: &Value, out: &mut String) {
 /// `style={{ color: c, font_size: "2rem" }}`, React's way: a property for each key, `_` and
 /// camelCase written as `-` (FEEDBACK35.md, Q-429; branch feedback27-35-fixes), on every path
 /// that writes attributes (Q-531).
-fn style_value(name: &str, v: Value) -> Value {
+///
+/// Its text held to `--max-memory` as it is written, as the page is: past it, the page stops
+/// (`out`; FEEDBACK71.md, Q-977, found in review: a list of 200 long texts in a property made
+/// 697 MB; branch security).
+fn style_value(name: &str, v: Value, out: &mut Held) -> Value {
     match &v {
-        Value::Map(m) if name.eq_ignore_ascii_case("style") => Value::str(style_text(m)),
+        Value::Map(m) if name.eq_ignore_ascii_case("style") => match style_text(m) {
+            Ok(t) => Value::str(t),
+            Err(_) => {
+                out.stop();
+                Value::Nil
+            }
+        },
         _ => v,
     }
 }
 
-pub fn style_text(m: &Map) -> String {
-    let mut out = String::new();
+pub fn style_text(m: &Map) -> Result<String, crate::httpd::OverMemory> {
+    let mut out = Held::new();
     for (k, v) in m.iter() {
         if matches!(v, Value::Nil | Value::Bool(false)) {
             continue;
@@ -1228,15 +1328,18 @@ pub fn style_text(m: &Map) -> String {
                 !d.is_zero()
             }
             other => {
-                out.push_str(&crate::builtins::css_value(&other.display()));
+                out.push_str(&crate::builtins::css_value(&other.display_held()?));
                 false
             }
         };
         if nonzero && takes_px(&out[start..end]) {
             out.push_str("px");
         }
+        if out.is_over() {
+            break;
+        }
     }
-    out
+    out.into_text()
 }
 
 /// React's unitless CSS properties (`isUnitlessNumber`), as the attribute names them
@@ -1316,7 +1419,7 @@ pub fn bool_attr_text(name: &str, b: bool) -> Option<&'static str> {
 
 /// ` name="true"` for a bool attribute whose values are words (see `bool_attr_text`), else
 /// ` name` for true and nothing for false.
-fn write_bool_attr(name: &str, b: bool, out: &mut String) {
+fn write_bool_attr<O: Text>(name: &str, b: bool, out: &mut O) {
     match bool_attr_text(name, b) {
         Some(t) => {
             out.push(' ');
@@ -1337,8 +1440,11 @@ fn write_bool_attr(name: &str, b: bool, out: &mut String) {
 /// list's items (lists in it flattened, null, false and true skipped, a map in it as above),
 /// joined with spaces; text as it is. A map or list was written as its Quillo text
 /// (FEEDBACK48.md, Q-566; branch main).
-fn class_words(v: &Value, out: &mut String) {
-    let word = |w: &str, out: &mut String| {
+///
+/// Into a `Held` text, which stops at `--max-memory`: a list of 200 long texts made 1.08 GB of
+/// words first (FEEDBACK71.md, Q-977, found in review; branch security).
+fn class_words(v: &Value, out: &mut Held) {
+    let word = |w: &str, out: &mut Held| {
         if !w.is_empty() {
             if !out.is_empty() {
                 out.push(' ');
@@ -1352,6 +1458,9 @@ fn class_words(v: &Value, out: &mut String) {
         Value::List(items) => {
             for i in items.iter() {
                 class_words(i, out);
+                if out.is_over() {
+                    return;
+                }
             }
         }
         Value::Map(m) => {
@@ -1361,7 +1470,10 @@ fn class_words(v: &Value, out: &mut String) {
                 }
             }
         }
-        other => word(&other.display(), out),
+        other => match other.display_held() {
+            Ok(t) => word(&t, out),
+            Err(_) => out.stop(),
+        },
     }
 }
 
@@ -1377,14 +1489,43 @@ pub fn script_text(s: &str) -> String {
     s.replace("</", "<\\/").replace("<!--", "<\\!--")
 }
 
-fn script_value(v: &Value, out: &mut String) {
+fn script_value(v: &Value, out: &mut Held) {
     match v {
         // As JSON, where they were left out as children are, and `const a = {null};` was
         // `const a = ;` (FEEDBACK53.md, Q-682; branch main).
         Value::Nil => out.push_str("null"),
         Value::Bool(false) => out.push_str("false"),
-        Value::Html(h) => out.push_str(&h.replace("</", "<\\/").replace("<!--", "<\\!--")),
-        other => out.push_str(&script_json(&crate::server::hidden(other).as_ref().unwrap_or(other).to_json())),
+        // Written into the page as it is read, `</` as `<\/` and `<!--` as `<\!--`, held as the
+        // page is: each was a copy of it first (FEEDBACK71.md, Q-977; branch security).
+        Value::Html(h) => {
+            let mut rest: &str = h;
+            while let Some(at) = rest.find('<') {
+                out.push_str(&rest[..at]);
+                let after = &rest[at..];
+                if after.starts_with("</") {
+                    out.push_str("<\\/");
+                    rest = &after[2..];
+                } else if after.starts_with("<!--") {
+                    out.push_str("<\\!--");
+                    rest = &after[4..];
+                } else {
+                    out.push('<');
+                    rest = &after[1..];
+                }
+            }
+            out.push_str(rest);
+        }
+        // Its JSON as `script_json` has it, written straight into the page, held: no tree of
+        // serde's or its text made first (FEEDBACK71.md, Q-977, found in review: a list of 200
+        // long texts made 1.2 GB; branch security).
+        other => {
+            let v = crate::server::hidden(other);
+            let v = v.as_ref().unwrap_or(other);
+            // SAFETY: what is written is JSON, UTF-8, each piece whole: the page stays text.
+            if !v.script_json_into(unsafe { out.text().as_mut_vec() }) {
+                out.stop();
+            }
+        }
     }
 }
 
@@ -1419,8 +1560,29 @@ pub fn island_json(v: &Value) -> serde_json::Value {
     }
 }
 
+/// An island's state as `island_wrap` writes it, a state that holds its very prop written as
+/// the mark `{"$quillo_prop": name}`, straight into a held text, with no tree made first (see
+/// `Value::island_text_held`): `None` past `--max-memory`.
+fn state_text_held(m: &Map, marks: &[(String, String)]) -> Option<String> {
+    let mut out = String::from("{");
+    for (i, (k, x)) in m.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&serde_json::to_string(&**k).unwrap_or_default());
+        out.push(':');
+        match marks.iter().find(|(n, _)| n.as_str() == &**k) {
+            Some((_, name)) => out.push_str(&serde_json::json!({ "$quillo_prop": name }).to_string()),
+            None => out.push_str(&x.island_text_held()?),
+        }
+        crate::httpd::making(out.len()).ok()?;
+    }
+    out.push('}');
+    Some(out)
+}
+
 /// The largest int a JS number holds whole: 2^53 - 1.
-const JS_SAFE: u64 = (1 << 53) - 1;
+pub(crate) const JS_SAFE: u64 = (1 << 53) - 1;
 
 /// `island_json` read back: what the browser sent a server fn.
 pub fn from_island_json(j: &serde_json::Value) -> Value {
@@ -1714,6 +1876,84 @@ fn int_op(op: BinOp, x: i64, y: i64) -> Option<Value> {
     })
 }
 
+/// `text + other` (`first`) or `other + text` where the limit is set: the other's text written
+/// where it goes, through a `Held` text, which stops at `--max-memory`: an error's list too, where
+/// `"a" + err(list)` made 410 MB first (FEEDBACK71.md, Q-977, found in review; branch security).
+/// Out of `binop`'s way, which makes it as before where the limit is not set: in place, its frame
+/// took a register more for every call (found in review).
+#[cold]
+#[inline(never)]
+fn text_plus(text: &str, other: &Value, first: bool, line: u32) -> Result<Value, Ctrl> {
+    let mut s = Held::with_capacity(text.len() + 8);
+    if first {
+        s.push_str(text);
+        other.display_into(&mut s);
+    } else {
+        other.display_into(&mut s);
+        s.push_str(text);
+    }
+    Ok(Value::str(s.into_text().map_err(|o| o.at(line))?))
+}
+
+/// `+` of two texts, two pieces of markup or two lists, of a size that may pass `--max-memory`:
+/// compared with it first, and made as `binop` makes a smaller one (FEEDBACK71.md, Q-977; branch
+/// security).
+#[cold]
+#[inline(never)]
+fn large_plus(a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
+    use Value::*;
+    match (a, b) {
+        (Str(x), Str(y)) => {
+            large(x.len() + y.len(), line)?;
+            let mut s = String::with_capacity(x.len() + y.len());
+            s.push_str(&x);
+            s.push_str(&y);
+            Ok(Value::str(s))
+        }
+        (Html(x), Html(y)) => {
+            large(x.len() + y.len(), line)?;
+            Ok(Value::html(format!("{}{}", x, y)))
+        }
+        (List(x), List(y)) => {
+            large((x.len() + y.len()).saturating_mul(std::mem::size_of::<Value>()), line)?;
+            let mut v = match Arc::try_unwrap(x) {
+                std::result::Result::Ok(mut v) => {
+                    v.reserve_exact(y.len());
+                    v
+                }
+                std::result::Result::Err(x) => {
+                    let mut v = Vec::with_capacity(x.len() + y.len());
+                    v.extend(x.iter().cloned());
+                    v
+                }
+            };
+            v.extend(y.iter().cloned());
+            Ok(Value::list(v))
+        }
+        _ => unreachable!("`binop` sends only these"),
+    }
+}
+
+/// `x..y` of more than 2,048 ints, as `large_plus` is.
+#[cold]
+#[inline(never)]
+fn large_range(x: i64, y: i64, line: u32) -> Result<Value, Ctrl> {
+    large((y.saturating_sub(x).max(0) as usize).saturating_mul(std::mem::size_of::<Value>()), line)?;
+    Ok(Value::list((x..y).map(Value::Int).collect()))
+}
+
+/// `map + map` where the limit is set, held as it grows, as `merge` is (FEEDBACK71.md, Q-977;
+/// branch security).
+#[cold]
+#[inline(never)]
+fn map_plus(x: Arc<Map>, y: &Map, line: u32) -> Result<Value, Ctrl> {
+    let mut m = Arc::unwrap_or_clone(x);
+    for (k, v) in y.iter() {
+        crate::value::insert_held(&mut m, k.clone(), v.clone()).map_err(|o| o.at(line))?;
+    }
+    Ok(Value::map(m))
+}
+
 pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
     use Value::*;
     let overflow = || Ctrl::Error(Box::new(QuilloError::new("integer overflow", line)));
@@ -1723,18 +1963,31 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
             return r;
         }
     }
+    // A large value is compared with `--max-memory` before it is made, out of the way of every
+    // small one, which pays one compare and goes on as before (FEEDBACK71.md, Q-977; branch
+    // security): a text doubled 23 times took the whole server down at its heap's cap. The large
+    // ones are made elsewhere (`large_plus`), so that `binop`'s frame is what it was (found in
+    // review: a `?` on the check here took a slot of the stack, and an instruction a call).
     match op {
         BinOp::Add => match (a, b) {
             (Int(x), Int(y)) => x.checked_add(y).map(Int).ok_or_else(overflow),
+            (Str(x), Str(y)) if x.len() + y.len() >= crate::httpd::LARGE => large_plus(Str(x), Str(y), line),
             (Str(x), Str(y)) => {
                 let mut s = String::with_capacity(x.len() + y.len());
                 s.push_str(&x);
                 s.push_str(&y);
                 Ok(Value::str(s))
             }
+            // The other's text written where it goes, through a `Held` text, which stops at
+            // `--max-memory`: an error's list too, where `"a" + err(list)` made 410 MB first
+            // (FEEDBACK71.md, Q-977, found in review; branch security).
+            (Str(x), y) if crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) => text_plus(&x, &y, true, line),
+            (x, Str(y)) if crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) => text_plus(&y, &x, false, line),
             (Str(x), y) => Ok(Value::str(format!("{}{}", x, y.display()))),
             (x, Str(y)) => Ok(Value::str(format!("{}{}", x.display(), y))),
+            (Html(x), Html(y)) if x.len() + y.len() >= crate::httpd::LARGE => large_plus(Html(x), Html(y), line),
             (Html(x), Html(y)) => Ok(Value::html(format!("{}{}", x, y))),
+            (List(x), List(y)) if (x.len() + y.len()).saturating_mul(std::mem::size_of::<Value>()) >= crate::httpd::LARGE => large_plus(List(x), List(y), line),
             (List(x), List(y)) => {
                 // Made to size at once (not grown as it is filled).
                 let mut v = match Arc::try_unwrap(x) {
@@ -1751,6 +2004,7 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
                 v.extend(y.iter().cloned());
                 Ok(Value::list(v))
             }
+            (Map(x), Map(y)) if crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) => map_plus(x, &y, line),
             (Map(x), Map(y)) => {
                 let mut m = Arc::unwrap_or_clone(x);
                 for (k, v) in y.iter() {
@@ -1815,6 +2069,7 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
             }))
         }
         BinOp::Range => match (a, b) {
+            (Int(x), Int(y)) if y.saturating_sub(x) > (crate::httpd::LARGE / std::mem::size_of::<Value>()) as i64 && y.saturating_sub(x) <= 10_000_000 => large_range(x, y, line),
             (Int(x), Int(y)) if y.saturating_sub(x) <= 10_000_000 => Ok(Value::list((x..y).map(Int).collect())),
             (Int(_), Int(_)) => fail(line, "range is too large"),
             _ => fail(line, "`..` needs two ints"),
@@ -1955,7 +2210,7 @@ impl Interp {
             deferred: Vec::new(),
             island_defers: Vec::new(),
             state_preset: None,
-            spare: String::new(),
+            spare: Held::new(),
             view_cache: crate::viewcache::enabled().then(Default::default),
             tracks: Vec::new(),
             trace: Default::default(),
@@ -2086,7 +2341,7 @@ impl Interp {
             deferred: Vec::new(),
             island_defers: Vec::new(),
             state_preset: None,
-            spare: String::new(),
+            spare: Held::new(),
             view_cache: self.view_cache.clone(),
             tracks: Vec::new(),
             trace: Default::default(),
@@ -3248,7 +3503,8 @@ impl Interp {
                 // follows the `??` would act on a yes nobody gave (FEEDBACK56.md, Part E, found in
                 // review; branch feedback56).
                 let v = match self.eval(a, env) {
-                    Err(Ctrl::Error(e)) if guardable(&e.msg) && !self.asking.as_ref().is_some_and(|a| a.stopped()) => Value::Nil,
+                    // Nor `--max-memory`'s, told by its kind (FEEDBACK71.md, Q-977; branch security).
+                    Err(Ctrl::Error(e)) if guardable(&e.msg) && !e.memory_stop && !self.asking.as_ref().is_some_and(|a| a.stopped()) => Value::Nil,
                     other => other?,
                 };
                 if matches!(v, Value::Nil | Value::Err(..)) {
@@ -3568,8 +3824,10 @@ impl Interp {
 
     #[inline(never)]
     fn eval_template(&mut self, parts: &[TPart], env: &Env) -> Result<Value, Ctrl> {
-        let mut s = String::new();
+        let mut s = Held::new();
         self.template_into(parts, env, &mut s)?;
+        // Stopped, `template_into` said so: none is left.
+        let s = s.into_text().map_err(|o| o.at(0))?;
         self.script_made(Value::str(s), 0)
     }
 
@@ -3765,7 +4023,13 @@ impl Interp {
         }
         let mut more = Some(more);
         let done = crate::value::with_slot(env, name, |slot| match (slot, more.as_ref()) {
-            (Value::List(l), Some(Value::List(_))) => {
+            (Value::List(l), Some(Value::List(add))) => {
+                // What a list grown where it is takes, asked about first under `--max-memory`
+                // once it is large: one it refuses is left to `+`, which says so (FEEDBACK71.md,
+                // Q-977; branch security).
+                if (l.len() + add.len()) * crate::value::ITEM_BYTES >= crate::httpd::LARGE && !list_may_extend(l, add.len()) {
+                    return false;
+                }
                 let Some(Value::List(items)) = more.take() else { unreachable!("looked at above") };
                 let l = Arc::make_mut(l);
                 match Arc::try_unwrap(items) {
@@ -3785,6 +4049,9 @@ impl Interp {
 
     /// `t` added to the text a variable holds where it is, if nothing else holds it. What
     /// `s[i]` keeps of it stays right, so `while len(s) < n { s += "x" }` stays linear.
+    /// What it grows by is asked about first under `--max-memory`, once the text is large
+    /// (`append_text`): one it refuses is not added to, and `+` then makes the text, which it
+    /// refuses, saying so (FEEDBACK71.md, Q-977; branch security).
     fn text_added(&mut self, name: Sym, t: &str, env: &Env) -> bool {
         let mut kept = self.text.take();
         let mut index = None;
@@ -3988,7 +4255,7 @@ impl Interp {
                 return Ok(Some(kv));
             }
             v => {
-                owned = v.key_text();
+                owned = v.key_text_held().map_err(|o| o.at(line))?;
                 &owned
             }
         };
@@ -4003,9 +4270,10 @@ impl Interp {
             let m = Arc::make_mut(m);
             match at {
                 Some(i) => m[i] = now,
-                None => {
-                    m.insert(crate::value::Key::new(k), now);
-                }
+                // A new key where the map has no room left: the room it grows to compared with
+                // `--max-memory` first, as `set` compares it (FEEDBACK71.md, Q-977, found in
+                // review: `m = set(m, k, get(m, k, 0) + 1)` went past it; branch security).
+                None => crate::value::insert_held(m, crate::value::Key::new(k), now).map_err(|o| o.at(line))?,
             }
             Ok(true)
         });
@@ -5046,7 +5314,7 @@ impl Interp {
 
     /// Calls `c` and renders what it returns into `out`, writing its HTML
     /// as it goes (see `render_expr_into`).
-    fn render_call_into(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32, out: &mut String) -> Result<(), Ctrl> {
+    fn render_call_into(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32, out: &mut Held) -> Result<(), Ctrl> {
         // A declared result type is checked on the value.
         if c.def.ret.is_some() || c.def.err.is_some() {
             let v = self.call_closure(c, args, line)?;
@@ -5068,7 +5336,7 @@ impl Interp {
         c: &Closure,
         args: Vec<Option<Value>>,
         line: u32,
-        out: &mut String,
+        out: &mut Held,
     ) -> Result<(), Ctrl> {
         use crate::viewcache::Found;
         let locale = if self.site.i18n.is_some() { self.locale() } else { None };
@@ -5117,7 +5385,7 @@ impl Interp {
         }
     }
 
-    fn render_call_plain(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32, out: &mut String) -> Result<(), Ctrl> {
+    fn render_call_plain(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32, out: &mut Held) -> Result<(), Ctrl> {
         let def = c.def.clone();
         self.enter_call(&def, args.len(), line, |this| {
             let scope = this.bind_args(c, &def, args, line).or_else(|e| in_file(Err(e), &this.caller_file))?;
@@ -5149,7 +5417,7 @@ impl Interp {
     // write their HTML into one buffer as they go, instead of each becoming
     // a string that is copied into its parent's.
 
-    fn render_expr_into(&mut self, e: &Expr, env: &Env, out: &mut String) -> Result<(), Ctrl> {
+    fn render_expr_into(&mut self, e: &Expr, env: &Env, out: &mut Held) -> Result<(), Ctrl> {
         match e {
             Expr::Html(el, _) => self.render_el_into(el, env, out),
             Expr::If(c, a, b) => {
@@ -5262,7 +5530,7 @@ impl Interp {
         body: &Expr,
         env: &Env,
         line: u32,
-        out: &mut String,
+        out: &mut Held,
     ) -> Result<(), Ctrl> {
         let it = self.eval(iter, env)?;
         // One scope for the rows, emptied for each, unless a row kept it.
@@ -5275,16 +5543,23 @@ impl Interp {
             // `for p in items`: nothing to match.
             if let Pattern::Bind(n) = pat {
                 define(scope, n, item.clone());
-                return this.render_expr_into(body, scope, out);
+                this.render_expr_into(body, scope, out)?;
+            } else {
+                let mut binds = Vec::new();
+                if this.match_pat(pat, item, Mode::Strict, env, &mut binds)?.is_none() {
+                    return fail(line, format!("`for` pattern does not match {}", short(item)));
+                }
+                for (n, x) in binds {
+                    define(scope, &n, x);
+                }
+                this.render_expr_into(body, scope, out)?;
             }
-            let mut binds = Vec::new();
-            if this.match_pat(pat, item, Mode::Strict, env, &mut binds)?.is_none() {
-                return fail(line, format!("`for` pattern does not match {}", short(item)));
+            // The page stopped at `--max-memory`: the loop ends here (FEEDBACK71.md, Q-977; branch
+            // security).
+            if out.is_over() {
+                return Err(crate::httpd::OverMemory.at(line));
             }
-            for (n, x) in binds {
-                define(scope, &n, x);
-            }
-            this.render_expr_into(body, scope, out)
+            Ok(())
         };
         match &it {
             Value::List(l) => {
@@ -5595,13 +5870,17 @@ impl Interp {
     fn render_el(&mut self, el: &HtmlEl, env: &Env) -> Result<String, Ctrl> {
         // Room for what it made last time, at once.
         use std::sync::atomic::Ordering::Relaxed;
-        let mut out = String::with_capacity(el.facts.last_len.load(Relaxed));
+        // Written through a `Held` text: the page stops at `--max-memory`, as any text a request
+        // makes, and is not made past it (FEEDBACK71.md, Q-977, found in review: a list of 200
+        // long texts made a 1.26 GB page under a 1 MB limit; branch security).
+        let mut out = Held::with_capacity(el.facts.last_len.load(Relaxed));
         self.render_el_into(el, env, &mut out)?;
+        let out = out.into_text().map_err(|o| o.at(el.line))?;
         el.facts.last_len.store(out.len(), Relaxed);
         Ok(out)
     }
 
-    fn render_el_into(&mut self, el: &HtmlEl, env: &Env, out: &mut String) -> Result<(), Ctrl> {
+    fn render_el_into(&mut self, el: &HtmlEl, env: &Env, out: &mut Held) -> Result<(), Ctrl> {
         let f = &el.facts;
         if f.component {
             return self.render_component_into(el, env, out);
@@ -5626,8 +5905,9 @@ impl Interp {
         if f.tags_fixed && !drops_first_newline(&el.tag) {
             if f.pieces.get().is_none() {
                 let mut pieces = Vec::new();
-                let mut html = String::new();
+                let mut html = Held::new();
                 self.pieces_into(el, env, &mut pieces, &mut html)?;
+                let html = html.into_text().map_err(|o| o.at(el.line))?;
                 if !html.is_empty() {
                     pieces.push(Piece::Html(html.into()));
                 }
@@ -5658,7 +5938,7 @@ impl Interp {
     /// (`<select multiple>`), on each it names. An option's value is its `value`, else its text,
     /// spaces trimmed and run together, as the browser reads it; one marked `selected` already
     /// stays as written (FEEDBACK55.md, Q-758 and Q-761; branch feedback55).
-    fn render_option_into(&mut self, el: &HtmlEl, env: &Env, out: &mut String) -> Result<(), Ctrl> {
+    fn render_option_into(&mut self, el: &HtmlEl, env: &Env, out: &mut Held) -> Result<(), Ctrl> {
         let start = out.len();
         let option = el.tag == "option";
         // An option whose HTML never changes is made once, as elsewhere, and marked here.
@@ -5693,7 +5973,7 @@ impl Interp {
 
     /// `el` as pieces (see `ElFacts::pieces`): its tags and those of the
     /// elements in it like it as HTML, the rest as it is, to render each time.
-    fn pieces_into(&mut self, el: &HtmlEl, env: &Env, pieces: &mut Vec<Piece>, html: &mut String) -> Result<(), Ctrl> {
+    fn pieces_into(&mut self, el: &HtmlEl, env: &Env, pieces: &mut Vec<Piece>, html: &mut Held) -> Result<(), Ctrl> {
         html.push('<');
         html.push_str(&el.tag);
         self.render_attrs_fast(el, env, html)?;
@@ -5708,7 +5988,7 @@ impl Interp {
                 HtmlChild::Expr(e @ Expr::Lit(Lit::Str(_))) => self.render_expr_into(e, env, html)?,
                 _ => {
                     if !html.is_empty() {
-                        pieces.push(Piece::Html(std::mem::take(html).into()));
+                        pieces.push(Piece::Html(std::mem::take(html).into_text().map_err(|o| o.at(el.line))?.into()));
                     }
                     pieces.push(match c {
                         HtmlChild::El(e) => Piece::El(e.clone()),
@@ -5723,7 +6003,7 @@ impl Interp {
         Ok(())
     }
 
-    fn render_tag_into(&mut self, el: &HtmlEl, env: &Env, out: &mut String) -> Result<(), Ctrl> {
+    fn render_tag_into(&mut self, el: &HtmlEl, env: &Env, out: &mut Held) -> Result<(), Ctrl> {
         let f = &el.facts;
         if f.html {
             out.push_str("<!doctype html>");
@@ -5744,7 +6024,7 @@ impl Interp {
         }
         if select {
             // Its options, against its value (see `render_option_into`).
-            let want = self.select_pending.take().map(|v| SelectWant::of(&v));
+            let want = self.select_pending.take().map(|v| SelectWant::of(&v)).transpose().map_err(|o| o.at(el.line))?;
             let outer = std::mem::replace(&mut self.select_want, want);
             let r = self.render_contents(el, env, text_value, out);
             self.select_want = outer;
@@ -5764,7 +6044,7 @@ impl Interp {
     }
 
     /// An element's contents.
-    fn render_contents(&mut self, el: &HtmlEl, env: &Env, text_value: Option<String>, out: &mut String) -> Result<(), Ctrl> {
+    fn render_contents(&mut self, el: &HtmlEl, env: &Env, text_value: Option<String>, out: &mut Held) -> Result<(), Ctrl> {
         let f = &el.facts;
         match text_value {
             Some(t) => {
@@ -5808,7 +6088,18 @@ impl Interp {
                 for c in &el.children {
                     if let HtmlChild::Expr(e) = c {
                         let v = self.eval(e, env)?;
-                        out.push_str(&sheet_text(&v).replace('<', "\\3c "));
+                        // Each `<` written as it is reached, into the page, held.
+                        match sheet_text(&v) {
+                            Ok(t) => {
+                                let mut parts = t.split('<');
+                                out.push_str(parts.next().unwrap_or(""));
+                                for p in parts {
+                                    out.push_str("\\3c ");
+                                    out.push_str(p);
+                                }
+                            }
+                            Err(_) => out.stop(),
+                        }
                     }
                 }
             }
@@ -5830,14 +6121,26 @@ impl Interp {
 
     /// Attributes in general: spread maps, `class=` merged with `.classes`,
     /// a <textarea>'s value as its text (returned).
-    fn render_attrs(&mut self, el: &HtmlEl, env: &Env, out: &mut String) -> Result<Option<String>, Ctrl> {
+    fn render_attrs(&mut self, el: &HtmlEl, env: &Env, out: &mut Held) -> Result<Option<String>, Ctrl> {
+        // Each value's text held as the page is (FEEDBACK71.md, Q-977; branch security).
+        let held = |v: &Value, out: &mut Held| match v.display_held() {
+            Ok(t) => t,
+            Err(_) => {
+                out.stop();
+                String::new()
+            }
+        };
         if let Some(id) = &el.id {
             let v = self.eval(id, env)?;
-            out.push_str(&format!(" id=\"{}\"", escape(&v.display())));
+            let t = held(&v, out);
+            out.push_str(" id=\"");
+            escape_into(&t, out);
+            out.push('"');
         }
         let mut classes = Vec::new();
         for c in &el.classes {
-            classes.push(self.eval(c, env)?.display());
+            let v = self.eval(c, env)?;
+            classes.push(held(&v, out));
         }
         let mut rest = String::new();
         // Written-out attributes win over spread ones, except `class`,
@@ -5898,7 +6201,7 @@ impl Interp {
             }
             // Here too: an element with `class=`, a spread or a textarea (FEEDBACK46.md, Q-531;
             // branch feedback40-43).
-            let v = style_value(name, v);
+            let v = style_value(name, v, out);
             let v = match (&v, name) {
                 _ if url_attr(name) && shows_script_url(&v) => Value::str(BLOCKED_URL),
                 _ if anim_value_attr(&el.tag, name) && shows_script_url_in_list(&v) => Value::str(BLOCKED_URL),
@@ -5908,7 +6211,17 @@ impl Interp {
                 _ => v,
             };
             if name == "value" && el.tag == "textarea" {
-                text_value = Some(if matches!(v, Value::Nil) { String::new() } else { v.display() });
+                text_value = Some(if matches!(v, Value::Nil) {
+                    String::new()
+                } else {
+                    match v.display_held() {
+                        Ok(t) => t,
+                        Err(_) => {
+                            out.stop();
+                            String::new()
+                        }
+                    }
+                });
                 continue;
             }
             // Browsers ignore `value` on a select: its options show it (FEEDBACK55.md, Q-758;
@@ -5924,13 +6237,15 @@ impl Interp {
                     // A map's keys that are true and a list's words, as clsx gives them
                     // (FEEDBACK48.md, Q-566; branch main).
                     Value::List(_) | Value::Map(_) | Value::Bool(true) => {
-                        let mut words = String::new();
+                        let mut words = Held::new();
                         class_words(&v, &mut words);
-                        if !words.is_empty() {
-                            classes.push(words);
+                        match words.into_text() {
+                            Ok(w) if !w.is_empty() => classes.push(w),
+                            Ok(_) => {}
+                            Err(_) => out.stop(),
                         }
                     }
-                    other => classes.push(other.display()),
+                    other => classes.push(held(other, out)),
                 }
                 continue;
             }
@@ -5940,12 +6255,29 @@ impl Interp {
                 Value::Nil | Value::Func(_) | Value::Builtin(..) => {}
                 // A builtin's error in it says `internal error`, as `json.stringify` has it: its
                 // text went out in the attribute (FEEDBACK55.md, Q-773; branch feedback55).
-                Value::List(_) | Value::Map(_) => rest.push_str(&format!(" {}=\"{}\"", name, escape(&attr_json(&v)))),
-                other => rest.push_str(&format!(" {}=\"{}\"", name, escape(&other.display()))),
+                // Held as the page is: past `--max-memory`, the page stops (FEEDBACK71.md, Q-977;
+                // branch security).
+                Value::List(_) | Value::Map(_) => match attr_json(&v) {
+                    Some(j) => rest.push_str(&format!(" {}=\"{}\"", name, escape(&j))),
+                    None => out.stop(),
+                },
+                other => match other.display_held() {
+                    Ok(t) => rest.push_str(&format!(" {}=\"{}\"", name, escape(&t))),
+                    Err(_) => out.stop(),
+                },
             }
         }
+        // Written into the page, escaped, as it is read: the classes joined, escaped and quoted were
+        // three copies of them first (FEEDBACK71.md, Q-977; branch security).
         if !classes.is_empty() {
-            out.push_str(&format!(" class=\"{}\"", escape(&classes.join(" "))));
+            out.push_str(" class=\"");
+            for (i, c) in classes.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                escape_into(c, out);
+            }
+            out.push('"');
         }
         out.push_str(&rest);
         Ok(text_value)
@@ -5953,7 +6285,7 @@ impl Interp {
 
     /// Attributes of an element without spreads or `class=`, written into
     /// `out` as they are evaluated.
-    fn render_attrs_fast(&mut self, el: &HtmlEl, env: &Env, out: &mut String) -> Result<(), Ctrl> {
+    fn render_attrs_fast(&mut self, el: &HtmlEl, env: &Env, out: &mut Held) -> Result<(), Ctrl> {
         if let Some(id) = &el.id {
             let v = self.eval(id, env)?;
             out.push_str(" id=\"");
@@ -5988,9 +6320,10 @@ impl Interp {
             if el.facts.select_value && name == "value" {
                 self.select_pending = Some(match val {
                     AttrVal::Expr(Expr::Template(parts)) => {
-                        let mut t = String::new();
+                        // Held as a template's value is (FEEDBACK71.md, Q-977; branch security).
+                        let mut t = Held::new();
                         self.template_into(parts, env, &mut t)?;
-                        Value::str(&t)
+                        Value::str(t.into_text().map_err(|o| o.at(el.line))?)
                     }
                     AttrVal::Expr(e) => self.eval(e, env)?,
                     _ => Value::Bool(true),
@@ -6019,6 +6352,8 @@ impl Interp {
                 }
                 // In a URL attribute, the whole value is checked first.
                 AttrVal::Expr(Expr::Template(parts)) => {
+                    // A `Held` text kept for the next, held as a template's value is: 200 long texts
+                    // in one made 460 MB (FEEDBACK71.md, Q-977, found in review; branch security).
                     let mut url = std::mem::take(&mut self.spare);
                     url.clear();
                     let r = self.template_into(parts, env, &mut url);
@@ -6039,16 +6374,27 @@ impl Interp {
     }
 
     /// A template's text, appended to `out` (unescaped).
-    fn template_into(&mut self, parts: &[TPart], env: &Env, out: &mut String) -> Result<(), Ctrl> {
+    fn template_into<O: Text>(&mut self, parts: &[TPart], env: &Env, out: &mut O) -> Result<(), Ctrl> {
+        // Into a `Held` text, a template's value, which stops at `--max-memory` as it grows: a
+        // template can double a text as `+` can, and a list's text in it is written where it goes
+        // (FEEDBACK71.md, Q-977; branch security). The stop is said at the line of the part that
+        // made it, or of the part before a quoted one (found in review: line 0).
+        let mut at = 0;
         for p in parts {
             match p {
                 TPart::Lit(t) => out.push_str(t),
-                TPart::Expr(x) => match self.eval(x, env)? {
-                    Value::Str(t) => out.push_str(&t),
-                    Value::Int(n) => push_int(out, n),
-                    v if self.printing => out.push_str(&crate::value::told(|| v.display())),
-                    v => out.push_str(&v.display()),
-                },
+                TPart::Expr(x) => {
+                    at = part_line(x).max(at);
+                    match self.eval(x, env)? {
+                        Value::Str(t) => out.push_str(&t),
+                        Value::Int(n) => push_int(out, n),
+                        v if self.printing => out.push_str(&crate::value::told(|| v.display())),
+                        v => v.display_into(out),
+                    }
+                }
+            }
+            if out.is_over() {
+                return Err(crate::httpd::OverMemory.at(at));
             }
             if self.fuel != u64::MAX && out.len() > crate::script::SCRIPT_BYTES {
                 return fail(0, "the script made a value larger than 1 MB");
@@ -6058,7 +6404,7 @@ impl Interp {
     }
 
     /// ` name="url"` for a URL attribute of a `tag` (see `write_attr`).
-    fn write_url_attr(&self, tag: &str, name: &str, url: &str, out: &mut String) {
+    fn write_url_attr(&self, tag: &str, name: &str, url: &str, out: &mut Held) {
         out.push(' ');
         out.push_str(name);
         out.push_str("=\"");
@@ -6075,8 +6421,8 @@ impl Interp {
     /// ` name="value"`, or ` name` for true, nothing for false and null.
     /// URLs that would run script are blocked; site paths get the mount's
     /// prefix.
-    fn write_attr(&self, tag: &str, name: &str, v: Value, out: &mut String) {
-        let v = style_value(name, v);
+    fn write_attr(&self, tag: &str, name: &str, v: Value, out: &mut Held) {
+        let v = style_value(name, v, out);
         let v = match (&v, name) {
             _ if url_attr(name) && shows_script_url(&v) => Value::str(BLOCKED_URL),
             _ if anim_value_attr(tag, name) && shows_script_url_in_list(&v) => Value::str(BLOCKED_URL),
@@ -6097,7 +6443,10 @@ impl Interp {
                 out.push_str(name);
                 out.push_str("=\"");
                 // As in `render_attrs` (FEEDBACK55.md, Q-773; branch feedback55).
-                escape_into(&attr_json(&v), out);
+                match attr_json(&v) {
+                    Some(j) => escape_into(&j, out),
+                    None => out.stop(),
+                }
                 out.push('"');
             }
             // The HTML parser folds a CR, so `value={s}` would read otherwise here than
@@ -6113,7 +6462,7 @@ impl Interp {
         }
     }
 
-    fn render_child(&mut self, c: &HtmlChild, env: &Env, out: &mut String) -> Result<(), Ctrl> {
+    fn render_child(&mut self, c: &HtmlChild, env: &Env, out: &mut Held) -> Result<(), Ctrl> {
         match c {
             HtmlChild::El(el) => self.render_el_into(el, env, out),
             HtmlChild::Expr(e) => self.render_expr_into(e, env, out),
@@ -6122,7 +6471,7 @@ impl Interp {
 
     /// `<Card user={u}>"kids"</Card>` calls view `Card` with its parameters
     /// taken from attributes by name; a `children` parameter gets the body.
-    fn render_component_into(&mut self, el: &HtmlEl, env: &Env, out: &mut String) -> Result<(), Ctrl> {
+    fn render_component_into(&mut self, el: &HtmlEl, env: &Env, out: &mut Held) -> Result<(), Ctrl> {
         let line = el.line;
         let Some(f) = lookup(env, &el.tag) else {
             return fail(line, format!("unknown view <{}>", el.tag));
@@ -6132,12 +6481,14 @@ impl Interp {
         };
         // The body is only rendered for a view that takes it.
         let takes_children = c.def.params.iter().any(|p| p.name == "children");
-        let mut kids = String::new();
+        // Held as the page is (FEEDBACK71.md, Q-977; branch security).
+        let mut held = Held::new();
         if takes_children {
             for ch in &el.children {
-                self.render_child(ch, env, &mut kids)?;
+                self.render_child(ch, env, &mut held)?;
             }
         }
+        let mut kids = held.into_text().map_err(|o| o.at(line))?;
         // A view called without spreads takes its arguments straight from
         // the attributes, in parameter order.
         if !c.def.component && !el.attrs.iter().any(|(_, a)| matches!(a, AttrVal::Spread(_))) {
@@ -6217,18 +6568,19 @@ impl Interp {
         // What renders it once more (see `render_again`), but inside another's second render, and
         // the options of a select it is in, as they were before it.
         let twice = self.state_again.is_none().then(|| (args.clone(), self.select_want.clone()));
-        let mut body = String::new();
+        let mut held = Held::new();
         let was = std::mem::replace(&mut self.in_component, true);
         let marked = self.marked;
-        let r = crate::value::js_numbers(true, || self.render_call_into(&c, args, line, &mut body));
+        let r = crate::value::js_numbers(true, || self.render_call_into(&c, args, line, &mut held));
         self.in_component = was;
         let (mut state, mut live) = self.islands.pop().unwrap_or_default();
         let now = self.states_now(&state);
         let defers = if nested { Vec::new() } else { std::mem::take(&mut self.island_defers) };
         r?;
+        let mut body = held.into_text().map_err(|o| o.at(line))?;
         if let (Some(now), Some((args, options))) = (now, twice) {
             let after = std::mem::replace(&mut self.select_want, options);
-            match self.render_again(&c, args, line, now) {
+            match self.render_again(&c, args, line, now)? {
                 Some((b, s, l)) => {
                     body = b;
                     state = s;
@@ -6298,18 +6650,27 @@ impl Interp {
     /// (`count += n` from the child does, and keeps the first, as before); at most once each, and
     /// not inside another's second render, so that what is below is not rendered over and over
     /// (FEEDBACK55.md, Q-770; branch feedback55).
-    fn render_again(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32, now: Map) -> Option<(String, Map, Map)> {
+    fn render_again(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32, now: Map) -> Result<Option<(String, Map, Map)>, Ctrl> {
         self.islands.push((Map::new(), Map::new()));
         self.island_scopes_at.push(self.island_scopes.len());
         let outer = self.state_again.replace((self.islands.len(), now));
-        let mut body = String::new();
+        let mut body = Held::new();
         let was = std::mem::replace(&mut self.in_component, true);
         let r = crate::value::js_numbers(true, || self.render_call_into(c, args, line, &mut body));
         self.in_component = was;
         self.state_again = outer;
         let (state, live) = self.islands.pop().unwrap_or_default();
         let again = self.states_now(&state);
-        (r.is_ok() && again.is_none()).then_some((body, state, live))
+        // Stopped at `--max-memory`, by what it ran (a `push` loop the child's state made longer)
+        // or by what it wrote: the request's stop, at the line that made the value, as the first
+        // render's would be; the first was kept, stale, with a 200. Any other error keeps the
+        // first, as before (FEEDBACK71.md, Q-977, found in review; branch security).
+        let r = match r {
+            Err(Ctrl::Error(e)) if e.memory_stop => return Err(Ctrl::Error(e)),
+            r => r,
+        };
+        let body = body.into_text().map_err(|o| o.at(line))?;
+        Ok((r.is_ok() && again.is_none()).then_some((body, state, live)))
     }
 
     /// The states of the component just rendered (its island's `state`, as declared), those that
@@ -6352,7 +6713,7 @@ impl Interp {
     /// state (or, inside a table or a select, its own root element carrying them, or comments
     /// around it). Whether it was marked by comments.
     #[allow(clippy::too_many_arguments)]
-    fn island_wrap(&self, tag: &str, props: Map, mut state: Map, live: Map, eager: bool, extra: &str, body: &str, svg: bool, nested: bool, out: &mut String) -> bool {
+    fn island_wrap(&self, tag: &str, props: Map, mut state: Map, live: Map, eager: bool, extra: &str, body: &str, svg: bool, nested: bool, out: &mut Held) -> bool {
         // A state that still holds its very prop, as `state items = initial` does, is written as
         // a reference to it, not as a second copy of the list (FEEDBACK30.md, Q-371; branch
         // feedback27-35-fixes).
@@ -6372,34 +6733,58 @@ impl Interp {
                 *v = Value::Nil;
             }
         }
-        let mut state_json = island_json(&crate::server::for_visitor(Value::map(state)));
-        if let serde_json::Value::Object(o) = &mut state_json {
-            for (k, name) in marks {
-                o.insert(k, serde_json::json!({ "$quillo_prop": name }));
+        // Its props, state and live data as JSON, and the attributes that carry them, written held
+        // as the page is, with no tree of serde's made first: past `--max-memory` the page stops
+        // (FEEDBACK71.md, Q-977, found in review: the trees of a list of 200 long texts took 228
+        // MB before their text was held; branch security).
+        let state = crate::server::for_visitor(Value::map(state));
+        let state_text = match &state {
+            Value::Map(m) if !marks.is_empty() && !(m.len() == 1 && m.keys().all(|k| k.starts_with('$'))) => state_text_held(m, &marks),
+            Value::Map(_) if !marks.is_empty() => {
+                // A one-key map that starts with `$`, written `{"$": [k, v]}`, the marks beside it.
+                let mut j = island_json(&state);
+                if let serde_json::Value::Object(o) = &mut j {
+                    for (k, name) in marks {
+                        o.insert(k, serde_json::json!({ "$quillo_prop": name }));
+                    }
+                }
+                serde_json_held(&j)
             }
-        }
-        let live_attrs = if live.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " data-l=\"{}\" data-v=\"{}:{}\"",
-                escape(&Value::map(live).json_text()),
-                self.shared.live_seq(),
-                self.shared.id
-            )
+            other => other.island_text_held(),
+        };
+        let props_json = crate::server::for_visitor(Value::map(props)).island_text_held();
+        let live_json = (!live.is_empty()).then(|| {
+            let mut j = Vec::new();
+            Value::map(live).json_into_bounded(&mut j).then(|| unsafe { String::from_utf8_unchecked(j) })
+        });
+        let (Some(props_json), Some(state_text), None | Some(Some(_))) = (props_json, state_text, &live_json) else {
+            out.stop();
+            return false;
         };
         // A component that runs by itself (timers, live data, `@mount`, the
         // page's JavaScript) is started as soon as the page is idle; others
         // when someone reaches for them (see the loader in server.rs).
-        let data = format!(
-            " data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}{}{}",
-            escape(tag),
-            escape(&island_json(&crate::server::for_visitor(Value::map(props))).to_string()),
-            escape(&state_json.to_string()),
-            live_attrs,
-            if eager { " data-e" } else { "" },
-            extra
-        );
+        let mut data = Held::new();
+        data.push_str(" data-c=\"");
+        escape_into(tag, &mut data);
+        data.push_str("\" data-p=\"");
+        escape_into(&props_json, &mut data);
+        data.push_str("\" data-s=\"");
+        escape_into(&state_text, &mut data);
+        data.push('"');
+        if let Some(Some(l)) = &live_json {
+            data.push_str(" data-l=\"");
+            escape_into(l, &mut data);
+            data.push_str(&format!("\" data-v=\"{}:{}\"", self.shared.live_seq(), self.shared.id));
+        }
+        if eager {
+            data.push_str(" data-e");
+        }
+        data.push_str(extra);
+        let Ok(data) = data.into_text() else {
+            out.stop();
+            return false;
+        };
         // Inside a table or a select the browser's parser moves any other
         // element out, island and all: there the component's own root
         // element is its island. So it is inside an `<svg>` (`svg`), whatever
@@ -6440,7 +6825,7 @@ impl Interp {
         let page_reads = crate::value::page_reads();
         self.islands.push((Map::new(), Map::new()));
         self.island_scopes_at.push(self.island_scopes.len());
-        let mut body = String::new();
+        let mut body = Held::new();
         let was = std::mem::replace(&mut self.in_component, true);
         // Where it stands, in an `<svg>` or not (see `in_svg`).
         let outer = std::mem::replace(&mut self.in_svg, d.svg);
@@ -6452,6 +6837,7 @@ impl Interp {
         self.in_svg = outer;
         self.state_preset = None;
         r?;
+        let body = body.into_text().map_err(|o| o.at(d.line))?;
         // What it followed the first time, it follows still.
         for (k, v) in d.live.iter() {
             if !live.contains_key(k) {
@@ -6463,13 +6849,13 @@ impl Interp {
                 return fail(d.line, format!("state `{}` of <{}> is {}, which cannot be sent to the browser", k, d.tag, bad));
             }
         }
-        let mut out = String::new();
+        let mut out = Held::new();
         // As a component placed in the page says it (see `render_component_into`; FEEDBACK61.md, Q-892;
         // branch feedback61).
         let extra = if self.marked.0 > marked.0 { " data-qm" } else { "" };
         let eager = d.c.def.runs_by_itself() || self.marked.1 > marked.1 || crate::value::page_reads() != page_reads;
         self.island_wrap(&d.tag, d.props.clone(), state, live, eager, extra, &body, d.svg, false, &mut out);
-        Ok(out)
+        out.into_text().map_err(|o| o.at(d.line))
     }
 }
 
@@ -6506,12 +6892,27 @@ struct SelectWant {
 }
 
 impl SelectWant {
-    fn of(v: &Value) -> SelectWant {
-        let text = |v: &Value| if matches!(v, Value::Nil) { String::new() } else { escape(&v.display()) };
-        match v {
-            Value::List(xs) => SelectWant { values: xs.iter().map(text).collect(), many: true, done: false },
-            v => SelectWant { values: vec![text(v)], many: false, done: false },
-        }
+    /// Its values' texts, escaped, held to `--max-memory` all together, as one value: a list of
+    /// 200 long texts made 212 MB of them, with no stop (FEEDBACK71.md, Q-977, found in review;
+    /// branch security).
+    fn of(v: &Value) -> Result<SelectWant, crate::httpd::OverMemory> {
+        let mut total = 0usize;
+        let mut text = |v: &Value| -> Result<String, crate::httpd::OverMemory> {
+            if matches!(v, Value::Nil) {
+                return Ok(String::new());
+            }
+            let t = v.display_held()?;
+            let mut e = Held::with_capacity(t.len());
+            escape_into(&t, &mut e);
+            let e = e.into_text()?;
+            total = total.saturating_add(e.len());
+            crate::httpd::making(total)?;
+            Ok(e)
+        };
+        Ok(match v {
+            Value::List(xs) => SelectWant { values: xs.iter().map(&mut text).collect::<Result<_, _>>()?, many: true, done: false },
+            v => SelectWant { values: vec![text(v)?], many: false, done: false },
+        })
     }
 }
 

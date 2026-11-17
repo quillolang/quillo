@@ -136,21 +136,24 @@ fn forbidden(e: &Expr) -> Option<&'static str> {
     }
 }
 
-pub fn run_script(it: &mut Interp, src: &str, vars: Option<&Map>) -> Value {
+/// `--max-memory`'s stop is the request's, not the script's error: it ends the request through
+/// the script, as no `??` takes it (FEEDBACK71.md, Q-977, found in review: `run_script(...) ??
+/// "caught"` caught it; branch security).
+pub fn run_script(it: &mut Interp, src: &str, vars: Option<&Map>) -> Result<Value, Ctrl> {
     // Names are kept for good, and this source may be a visitor's: its own are its own
     // (src/sym.rs), and messages say them as it wrote them.
     let (parsed, names) = crate::sym::Sym::in_script(|| crate::parser::Parser::new(src).parse_program());
     let out = match parsed {
-        Ok(stmts) => run_parsed(it, &stmts, &names, vars),
+        Ok(stmts) => run_parsed(it, &stmts, &names, vars)?,
         Err(e) => bad(&format!("line {}: {}", e.line, e.msg)),
     };
     if names.is_empty() {
-        return out;
+        return Ok(out);
     }
-    match &out {
+    Ok(match &out {
         Value::Err(e, _, _) if matches!(&**e, Value::Str(_)) => bad(&said_as_written(&e.display(), &names)),
         _ => out,
-    }
+    })
 }
 
 /// `msg` with a script's own names as it wrote them: a message quotes a name in backticks,
@@ -176,7 +179,7 @@ fn said_as_written(msg: &str, names: &std::collections::HashMap<String, Sym>) ->
     out
 }
 
-fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap<String, Sym>, vars: Option<&Map>) -> Value {
+fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap<String, Sym>, vars: Option<&Map>) -> Result<Value, Ctrl> {
     // Its world: the safe builtins, then its variables. Quillo's own, not what the program's
     // globals have by those names: a program's `fn upper` was the script's `upper`, run with the
     // program's effects (FEEDBACK51.md, Q-648; branch feedback51-fixes).
@@ -208,6 +211,7 @@ fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap
     let saved_allowed = std::mem::replace(&mut it.allowed, 0);
     let saved_restrictor = it.restrictor.take();
     let saved_script = it.script.replace((root.clone(), saved_allowed));
+    let mut stopped = None;
     // Room on the stack for code nested as deeply as the parser allows.
     let out = crate::stack::for_nesting(crate::parser::MAX_NESTING, || {
         if let Some(why) = stmts.iter().find_map(forbidden_stmt) {
@@ -218,6 +222,10 @@ fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap
             match it.exec_stmt(s, &env) {
                 Ok(v) => last = v,
                 Err(Ctrl::Return(v)) => return v,
+                Err(Ctrl::Error(e)) if e.memory_stop => {
+                    stopped = Some(e);
+                    return Value::Nil;
+                }
                 Err(Ctrl::Error(e)) => return bad(&if e.line > 0 { format!("line {}: {}", e.line, e.msg) } else { e.msg.clone() }),
                 Err(Ctrl::Reply(_)) => return bad("a script cannot reply"),
             }
@@ -231,13 +239,16 @@ fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap
     it.allowed = saved_allowed;
     it.restrictor = saved_restrictor;
     it.script = saved_script;
+    if let Some(e) = stopped {
+        return Err(Ctrl::Error(e));
+    }
     // A function it made would run after it, with no budget of steps: `(n) => ...` doubling a
     // text made 16 MB, and a `while true` ran for good (FEEDBACK51.md, Q-670; branch
     // feedback51-fixes).
     if holds_function(&out) {
-        return bad("a script gives back no function (it would run without the script's limits): give back what it computes");
+        return Ok(bad("a script gives back no function (it would run without the script's limits): give back what it computes"));
     }
-    out
+    Ok(out)
 }
 
 thread_local! {

@@ -1,6 +1,6 @@
 //! The standard library: functions every program can call.
 
-use crate::interp::{escape, fail, Ctrl, Interp};
+use crate::interp::{fail, Ctrl, Interp};
 use crate::value::*;
 use indexmap::IndexMap;
 use std::path::{Component, Path};
@@ -398,15 +398,27 @@ pub(crate) fn print_line(line: &str) {
     STDOUT_GONE.fetch_or(gone, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn print(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    // The program's own log: what it hides from visitors, it sees.
-    let line = crate::value::told(|| args.iter().map(|v| v.display()).collect::<Vec<_>>().join(" "));
-    print_line(&line);
+fn print(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    // The program's own log: what it hides from visitors, it sees. Its line held as any text a
+    // request makes (FEEDBACK71.md, Q-977; branch security).
+    let text = crate::value::told(|| {
+        let mut out = Held::new();
+        for (i, v) in args.iter().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            v.display_into(&mut out);
+        }
+        out.into_text()
+    });
+    print_line(&text.map_err(|o| o.at(line))?);
     Ok(Value::Nil)
 }
 
-fn to_str(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    Ok(Value::str(arg(&args, 0).display()))
+fn to_str(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    // A list's or map's text written through a `Held` text, which stops at `--max-memory`
+    // (FEEDBACK71.md, Q-977; branch security).
+    Ok(Value::str(arg(&args, 0).display_held().map_err(|o| o.at(line))?))
 }
 
 fn to_int(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
@@ -475,11 +487,27 @@ fn type_of(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
 // ---- strings -----------------------------------------------------------
 
 fn upper(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    Ok(Value::str(s_arg(&args, 0, "upper", line)?.to_uppercase()))
+    let s = s_arg(&args, 0, "upper", line)?;
+    cased_length(&s, true, line)?;
+    Ok(Value::str(s.to_uppercase()))
 }
 
 fn lower(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    Ok(Value::str(s_arg(&args, 0, "lower", line)?.to_lowercase()))
+    let s = s_arg(&args, 0, "lower", line)?;
+    cased_length(&s, false, line)?;
+    Ok(Value::str(s.to_lowercase()))
+}
+
+/// The length of `s` in upper (or lower) case, compared with `--max-memory` before it is made:
+/// a letter can take three times its bytes (`ΐ` is three letters in upper case), and 1.2 MB of
+/// them made 3.6 MB under a 1 MB limit (FEEDBACK71.md, Q-977, found in review; branch security).
+/// Counted, exactly, only where the limit is set and the text could reach 64 KB.
+fn cased_length(s: &str, up: bool, line: u32) -> Result<(), Ctrl> {
+    if s.len() >= crate::httpd::LARGE / 3 && crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) {
+        let n: usize = if up { s.chars().map(|c| c.to_uppercase().map(char::len_utf8).sum::<usize>()).sum() } else { s.chars().map(|c| c.to_lowercase().map(char::len_utf8).sum::<usize>()).sum() };
+        made(n, line)?;
+    }
+    Ok(())
 }
 
 /// `normalize(s, "NFC")`: one Unicode form for text that looks the same, so `café` typed and
@@ -493,7 +521,25 @@ fn normalize(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Some(Value::Str(f)) => f.to_ascii_uppercase(),
         Some(other) => return fail(line, format!("`normalize` expects a form (\"NFC\", \"NFD\", \"NFKC\" or \"NFKD\") as argument 2, got {}", other.type_name())),
     };
+    // Written through a `Held` text where the limit is set: a character can take 18 of its kind
+    // (`ﷺ` in NFKD), and 900 KB of them made a 16 MB text (FEEDBACK71.md, Q-977, found in
+    // review; branch security).
+    fn held(cs: impl Iterator<Item = char>, line: u32) -> Result<String, Ctrl> {
+        let mut out = Held::new();
+        for c in cs {
+            out.push(c);
+            if out.is_over() {
+                break;
+            }
+        }
+        out.into_text().map_err(|o| o.at(line))
+    }
+    let limited = crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed);
     Ok(Value::str(match form.as_str() {
+        "NFC" if limited => held(s.nfc(), line)?,
+        "NFD" if limited => held(s.nfd(), line)?,
+        "NFKC" if limited => held(s.nfkc(), line)?,
+        "NFKD" if limited => held(s.nfkd(), line)?,
         "NFC" => s.nfc().collect::<String>(),
         "NFD" => s.nfd().collect(),
         "NFKC" => s.nfkc().collect(),
@@ -515,6 +561,13 @@ fn trim(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn split(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let s = s_arg(&args, 0, "split", line)?;
     let sep = if args.len() > 1 { s_arg(&args, 1, "split", line)? } else { Arc::from(" ") };
+    // The list of parts asked about first under `--max-memory`: a text of a million letters split
+    // by "" is a million items (FEEDBACK71.md, Q-977; branch security). Counted only when the
+    // list could be large, and the limit is set.
+    if s.len().saturating_add(1).saturating_mul(ITEM_BYTES) >= crate::httpd::LARGE && crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) {
+        let parts = if sep.is_empty() { s.chars().count() } else { s.matches(&*sep).count() + 1 };
+        made(parts.saturating_mul(ITEM_BYTES), line)?;
+    }
     let parts: Vec<Value> = if sep.is_empty() {
         s.chars().map(|c| Value::str(c.to_string())).collect()
     } else {
@@ -526,15 +579,68 @@ fn split(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn join(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let l = l_arg(&args, 0, "join", line)?;
     let sep = if args.len() > 1 { s_arg(&args, 1, "join", line)? } else { Arc::from("") };
-    Ok(Value::str(l.iter().map(|v| v.display()).collect::<Vec<_>>().join(&sep)))
+    // The text it makes is compared with `--max-memory` first, where a list that holds one long
+    // text many times joins to a far longer one (FEEDBACK71.md, Q-977; branch security). Texts
+    // only: their length summed as they are looked at, and one text made to it with nothing
+    // copied first (each was copied, then joined: 100 short texts took 2.8 times the
+    // instructions). Else each item's text, as before, a list's or a map's compared first, and
+    // then the whole.
+    let mut total = sep.len().saturating_mul(l.len().saturating_sub(1));
+    let texts = l.iter().all(|v| match v {
+        Value::Str(s) => {
+            total = total.saturating_add(s.len());
+            true
+        }
+        _ => false,
+    });
+    if texts {
+        if total >= crate::httpd::LARGE {
+            crate::interp::large(total, line)?;
+        }
+        let mut out = String::with_capacity(total);
+        for (i, v) in l.iter().enumerate() {
+            if i > 0 {
+                out.push_str(&sep);
+            }
+            if let Value::Str(s) = v {
+                out.push_str(s);
+            }
+        }
+        return Ok(Value::str(out));
+    }
+    // Else each item's text written where it goes, through a `Held` text, which stops at
+    // `--max-memory`: no item's text made first (FEEDBACK71.md, Q-977, found in review: 200 long
+    // texts and a number made 180 MB of parts before the whole was compared; branch security).
+    let mut out = Held::new();
+    for (i, v) in l.iter().enumerate() {
+        if i > 0 {
+            out.push_str(&sep);
+        }
+        v.display_into(&mut out);
+        if out.is_over() {
+            break;
+        }
+    }
+    Ok(Value::str(out.into_text().map_err(|o| o.at(line))?))
 }
+
+/// A large value of `n` bytes, asked about before it is made, under `--max-memory`
+/// (FEEDBACK71.md, Q-977; branch security).
+#[inline(always)]
+pub(crate) fn made(n: usize, line: u32) -> Result<(), Ctrl> {
+    crate::httpd::making(n).map_err(|s| s.at(line))
+}
+
+/// What a list's place for each item takes (see `value::ITEM_BYTES`).
+const ITEM_BYTES: usize = crate::value::ITEM_BYTES;
 
 fn contains(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let needle = arg(&args, 1);
     Ok(Value::Bool(match arg(&args, 0) {
-        Value::Str(s) => s.contains(&*needle.display()),
+        // A list's text held, as `str` holds it (FEEDBACK71.md, Q-977; branch security).
+        Value::Str(s) => s.contains(&*needle.display_held().map_err(|o| o.at(line))?),
         Value::List(l) => l.iter().any(|v| equal(v, &needle)),
-        Value::Map(m) => m.contains_key(&*needle.display()),
+        Value::Map(m) => m.contains_key(&*needle.display_held().map_err(|o| o.at(line))?),
         Value::Nil => false,
         other => return fail(line, format!("`contains` expects a str, list or map, got {}", other.type_name())),
     }))
@@ -552,6 +658,15 @@ fn replace(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let s = s_arg(&args, 0, "replace", line)?;
     let from = s_arg(&args, 1, "replace", line)?;
     let to = s_arg(&args, 2, "replace", line)?;
+    // The text it makes, compared with `--max-memory` first: each "a" given a long text
+    // (FEEDBACK71.md, Q-977; branch security). The most it could make is compared first, and only
+    // where that passes the limit are the matches counted: counted whatever the limit, a 108 KB
+    // `replace(s, "<", "&lt;")` took 80% longer (found in review).
+    let most = if to.len() <= from.len() { s.len() } else { s.len().saturating_add((s.len() / from.len().max(1) + 1).saturating_mul(to.len() - from.len())) };
+    if most >= crate::httpd::LARGE && most as u64 > crate::httpd::value_most() {
+        let times = if to.len() <= from.len() { 0 } else if from.is_empty() { s.chars().count() + 1 } else { s.matches(&*from).count() };
+        made(s.len().saturating_add(times.saturating_mul(to.len().saturating_sub(from.len()))), line)?;
+    }
     Ok(Value::str(s.replace(&*from, &to)))
 }
 
@@ -770,7 +885,19 @@ fn push(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let item = if args.len() > 1 { args.remove(1) } else { Value::Nil };
     let mut l = l_arg(&args, 0, "push", line)?;
     drop(args);
-    Arc::make_mut(&mut l).push(item);
+    // A list another holds is copied as it was (no bigger than the list it copies); one with no
+    // room left grows out of the way, the room it grows to compared with `--max-memory` first
+    // (`value::pushed_growing`), so a push with room is the one it was (FEEDBACK71.md, Q-977,
+    // found in review: asked before `make_mut`, a push cost an instruction more).
+    let v = Arc::make_mut(&mut l);
+    if v.len() == v.capacity() {
+        let mut item = item;
+        if !crate::value::pushed_growing(v, &mut item) {
+            return Err(crate::httpd::OverMemory.at(line));
+        }
+        return Ok(Value::List(l));
+    }
+    v.push(item);
     Ok(Value::List(l))
 }
 
@@ -795,6 +922,8 @@ fn range(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         if n > 10_000_000 {
             return fail(line, "range is too large");
         }
+        // Asked about first under `--max-memory` (FEEDBACK71.md, Q-977; branch security).
+        made((n as usize).saturating_mul(ITEM_BYTES), line)?;
         return Ok(Value::list((0..n as i64).map(|i| Value::Int(a + i * step)).collect()));
     }
     let (a, b) = if args.len() > 1 {
@@ -829,7 +958,7 @@ fn get(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if let k @ Value::Err(..) = arg(&args, 1) {
         return Ok(k);
     }
-    let k = arg(&args, 1).key_text();
+    let k = arg(&args, 1).key_text_held().map_err(|o| o.at(line))?;
     Ok(m.get(k.as_str()).cloned().unwrap_or_else(|| arg(&args, 2)))
 }
 
@@ -839,7 +968,7 @@ fn has(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if let k @ Value::Err(..) = arg(&args, 1) {
         return Ok(k);
     }
-    Ok(Value::Bool(m.contains_key(arg(&args, 1).key_text().as_str())))
+    Ok(Value::Bool(m.contains_key(arg(&args, 1).key_text_held().map_err(|o| o.at(line))?.as_str())))
 }
 
 fn set(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
@@ -871,11 +1000,19 @@ pub(crate) fn set_of(args: Vec<Value>, line: u32) -> R {
     if let k @ Value::Err(..) = arg(&args, 1) {
         return Ok(k);
     }
-    let (k, v) = (arg(&args, 1).key_text(), arg(&args, 2));
+    // A list as a key is its text, written held (FEEDBACK71.md, Q-977; branch security).
+    let (k, v) = (arg(&args, 1).key_text_held().map_err(|o| o.at(line))?, arg(&args, 2));
     // The arguments let go first: a map no one else holds is changed, not
     // copied (see `in_place` in src/interp.rs).
     drop(args);
-    Arc::make_mut(&mut m).insert(k.into(), v);
+    // A map with no room for a new key grows: the room it grows to compared with `--max-memory`
+    // first, out of the way (FEEDBACK71.md, Q-977; branch security). One another holds is copied
+    // as it was.
+    let mm = Arc::make_mut(&mut m);
+    if mm.len() == mm.capacity() && !crate::value::map_may_grow_to(mm, &k) {
+        return Err(crate::httpd::OverMemory.at(line));
+    }
+    mm.insert(k.into(), v);
     Ok(Value::Map(m))
 }
 
@@ -891,7 +1028,7 @@ fn remove(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
             if let k @ Value::Err(..) = arg(&args, 1) {
                 return Ok(k);
             }
-            let k = arg(&args, 1).key_text();
+            let k = arg(&args, 1).key_text_held().map_err(|o| o.at(line))?;
             drop(args);
             let mut m = Arc::unwrap_or_clone(m);
             m.shift_remove(k.as_str());
@@ -904,6 +1041,14 @@ fn merge(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (a, b) = (m_arg(&args, 0, "merge", line)?, m_arg(&args, 1, "merge", line)?);
     drop(args);
     let mut m = Arc::unwrap_or_clone(a);
+    // Held to `--max-memory` as it grows, where the limit is set: what a key of both takes is
+    // taken once (FEEDBACK71.md, Q-977, found in review; branch security).
+    if crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) {
+        for (k, v) in b.iter() {
+            crate::value::insert_held(&mut m, k.clone(), v.clone()).map_err(|o| o.at(line))?;
+        }
+        return Ok(Value::map(m));
+    }
     for (k, v) in b.iter() {
         m.insert(k.clone(), v.clone());
     }
@@ -915,8 +1060,15 @@ fn merge(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 // Q-036; branch feedback6-fixes). Null spreads nothing, in a map or a list.
 fn spread_map(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let mut out = Map::new();
+    // As `merge`, held as it grows where the limit is set (FEEDBACK71.md, Q-977; branch security).
+    let limited = crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed);
     for v in args {
         match v {
+            Value::Map(m) if limited => {
+                for (k, v) in m.iter() {
+                    crate::value::insert_held(&mut out, k.clone(), v.clone()).map_err(|o| o.at(line))?;
+                }
+            }
             Value::Map(m) => out.extend(m.iter().map(|(k, v)| (k.clone(), v.clone()))),
             Value::Nil => {}
             other => return fail(line, format!("`{{...x}}` spreads a map (or null) into a map, but x is {}", other.type_name())),
@@ -926,7 +1078,11 @@ fn spread_map(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 fn spread_list(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let mut out = Vec::new();
+    // Its length, known before it is made, compared with `--max-memory` (FEEDBACK71.md, Q-977,
+    // found in review: ten spreads of a list made it ten times over; branch security).
+    let n = args.iter().map(|v| if let Value::List(l) = v { l.len() } else { 0 }).fold(0usize, usize::saturating_add);
+    crate::value::list_of(n).map_err(|o| o.at(line))?;
+    let mut out = Vec::with_capacity(n);
     for v in args {
         match v {
             Value::List(l) => out.extend(l.iter().cloned()),
@@ -949,19 +1105,24 @@ fn is_err(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
 
 fn unwrap(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match arg(&args, 0) {
-        Value::Err(e, _, _) => fail(line, format!("unwrap of an error: {}", e.display())),
+        Value::Err(e, _, _) => fail(line, format!("unwrap of an error: {}", e.display_held().map_err(|o| o.at(line))?)),
         v => Ok(v),
     }
 }
 
 // ---- web ---------------------------------------------------------------
 
-fn raw(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    Ok(Value::html(arg(&args, 0).display()))
+// A list's text held as `str` holds it, and the escaped text written through a `Held` text: an
+// escape can take six bytes for one (FEEDBACK71.md, Q-977, found in review; branch security).
+fn raw(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    Ok(Value::html(arg(&args, 0).display_held().map_err(|o| o.at(line))?))
 }
 
-fn escape_fn(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    Ok(Value::str(escape(&arg(&args, 0).display())))
+fn escape_fn(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let t = arg(&args, 0).display_held().map_err(|o| o.at(line))?;
+    let mut out = Held::with_capacity(t.len());
+    crate::interp::escape_into(&t, &mut out);
+    Ok(Value::str(out.into_text().map_err(|o| o.at(line))?))
 }
 
 /// `url_encode(v)`: `v` as text for a URL, every byte but letters, digits
@@ -981,17 +1142,25 @@ fn first_error(v: &Value) -> Option<Value> {
     None
 }
 
-fn url_encode(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    fn enc(s: &str, out: &mut String) {
+fn url_encode(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    // Through a `Held` text, which stops at `--max-memory`: a byte can take three (FEEDBACK71.md,
+    // Q-977, found in review; branch security).
+    fn enc(s: &str, out: &mut Held) {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
         for b in s.bytes() {
             if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
                 out.push(b as char);
             } else {
-                out.push_str(&format!("%{:02X}", b));
+                let e = [b'%', HEX[(b >> 4) as usize], HEX[(b & 15) as usize]];
+                // SAFETY: ASCII.
+                out.push_str(unsafe { std::str::from_utf8_unchecked(&e) });
+            }
+            if out.is_over() {
+                return;
             }
         }
     }
-    let mut out = String::new();
+    let mut out = Held::new();
     // An error is given back, not its text in the URL, wherever it is: in a map's value, in a
     // list there, a map in a list (FEEDBACK55.md, Q-784; branch feedback55; nested ones found
     // later). The first, in order.
@@ -1006,12 +1175,12 @@ fn url_encode(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
                 }
                 enc(k, &mut out);
                 out.push('=');
-                enc(&v.display(), &mut out);
+                enc(&v.display_held().map_err(|o| o.at(line))?, &mut out);
             }
         }
-        v => enc(&v.display(), &mut out),
+        v => enc(&v.display_held().map_err(|o| o.at(line))?, &mut out),
     }
-    Ok(Value::str(out))
+    Ok(Value::str(out.into_text().map_err(|o| o.at(line))?))
 }
 
 fn env_var(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
@@ -2485,7 +2654,7 @@ pub(crate) fn answer_headers(h: &Map, f: &str, line: u32) -> Result<Vec<(String,
                 let only = if matches!(v, Value::List(_)) { ": only `set-cookie` takes a list, one header an item; join the values with \", \"" } else { "" };
                 return fail(line, format!("`{}` header `{}` is a str, got {}{}", f, k.escape_debug(), v.type_name(), only));
             }
-            v => out.push((k, v.display())),
+            v => out.push((k, v.display_held().map_err(|o| o.at(line))?)),
         }
     }
     // A `location` that runs code or carries a page is refused, as `redirect` refuses it: an app
@@ -2516,7 +2685,9 @@ pub(crate) fn content_type(t: &str, f: &str, line: u32) -> Result<String, Ctrl> 
 
 fn json_parse(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let s = s_arg(&args, 0, "json.parse", line)?;
-    Ok(match Value::parse_json(&s) {
+    // Each list, map and text it makes held to `--max-memory` as it is made (FEEDBACK71.md,
+    // Q-977; branch security).
+    Ok(match Value::parse_json_held(&s).map_err(|o| o.at(line))? {
         Ok(v) => v,
         Err(e) => Value::err(Value::str(format!("invalid JSON: {}", e))),
     })
@@ -2527,31 +2698,45 @@ fn json_parse(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 pub const JSON_MOST: usize = 256 << 20;
 pub const JSON_DEEPEST: usize = 10_000;
 
-fn json_stringify(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
+fn json_stringify(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // As `str` is (FEEDBACK26.md, Q-197; branch feedback26-fixes).
     let v = arg(&args, 0);
     let v = if crate::value::hiding() { crate::server::hidden(&v).unwrap_or(v) } else { v };
     // Written as it is held to its limits, with no tree of serde's made first (FEEDBACK49.md,
     // Q-606; found in review).
     let mut out = Vec::new();
-    if let Err(why) = v.json_into_within(&mut out, JSON_MOST, JSON_DEEPEST) {
-        return Ok(Value::err(Value::str(format!("json.stringify: {}", why))));
+    // Held, once it is large, to `--max-memory` too, as it is written: past it, the request's
+    // stop, told by its kind (a map's key in the error's text was taken for it: found in review)
+    // (FEEDBACK71.md, Q-977; branch security).
+    match v.json_into_held(&mut out, JSON_MOST, JSON_DEEPEST) {
+        Ok(()) => {}
+        Err(None) => return Err(crate::httpd::OverMemory.at(line)),
+        Err(Some(why)) => return Ok(Value::err(Value::str(format!("json.stringify: {}", why)))),
     }
     // SAFETY: only JSON text, which is UTF-8, was written.
     let text = unsafe { String::from_utf8_unchecked(out) };
-    Ok(Value::str(if arg(&args, 1).truthy() { indented(&text) } else { text }))
+    if arg(&args, 1).truthy() {
+        // Indented, it is longer, and its indent grows with its depth: written through a `Held`
+        // text, which stops at `--max-memory` as it grows (FEEDBACK71.md, Q-977, found in review:
+        // a list nested 9,000 deep made 458 MB before it was compared; branch security).
+        return Ok(Value::str(indented(&text).map_err(|o| o.at(line))?));
+    }
+    Ok(Value::str(text))
 }
 
 /// Compact JSON text indented by two spaces, as serde_json's pretty writer has it: `[]` and
 /// `{}` stay as they are, and a string's own brackets and commas are text.
-fn indented(json: &str) -> String {
+fn indented(json: &str) -> Result<String, crate::httpd::OverMemory> {
     let b = json.as_bytes();
-    let mut out = String::with_capacity(json.len() * 2);
+    let mut out = Held::with_capacity(json.len() * 2);
     let mut level = 0usize;
-    let newline = |out: &mut String, level: usize| {
+    let newline = |out: &mut Held, level: usize| {
         out.push('\n');
         for _ in 0..level {
             out.push_str("  ");
+            if out.is_over() {
+                return;
+            }
         }
     };
     let mut i = 0;
@@ -2598,9 +2783,12 @@ fn indented(json: &str) -> String {
                 out.push_str(&json[start..=i]);
             }
         }
+        if out.is_over() {
+            break;
+        }
         i += 1;
     }
-    out
+    out.into_text()
 }
 
 // ---- files -------------------------------------------------------------
@@ -2850,8 +3038,46 @@ fn read_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let Some(full) = local_path(it, &p) else {
         return Ok(Value::err(Value::str(format!("read_file: path must stay inside the program's folder: {}", p))));
     };
-    Ok(match std::fs::read(&full) {
-        Ok(b) => Value::str(String::from_utf8_lossy(&b)),
+    // Its bytes and its text, asked about first under `--max-memory`, by the size the open file
+    // gives, as `fs::read` reads one: what it does, and the same calls (FEEDBACK71.md, Q-977;
+    // branch security). Where the limit is set, read no further than it, whatever the size said:
+    // a FIFO, or a file that grows as it is read, says less than it gives (found in review); and
+    // its text made through a `Held` text, U+FFFD three bytes for each byte that is not UTF-8.
+    let most = crate::httpd::most_bytes();
+    let read = std::fs::File::open(&full).and_then(|mut f| {
+        let size = f.metadata().map(|m| m.len().min(usize::MAX as u64) as usize).unwrap_or(0);
+        if let Err(stop) = crate::httpd::making(size) {
+            return Ok(Err(stop));
+        }
+        let mut b = Vec::new();
+        b.try_reserve_exact(size).map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
+        if most == usize::MAX {
+            std::io::Read::read_to_end(&mut f, &mut b)?;
+            return Ok(Ok(b));
+        }
+        let mut chunk = vec![0u8; 64 << 10];
+        loop {
+            let n = match std::io::Read::read(&mut f, &mut chunk) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if !crate::value::bytes_room(&mut b, n) {
+                return Ok(Err(crate::httpd::OverMemory));
+            }
+            b.extend_from_slice(&chunk[..n]);
+        }
+        Ok(Ok(b))
+    });
+    let read = match read {
+        Ok(Err(stop)) => return Err(stop.at(line)),
+        Ok(Ok(b)) => Ok(b),
+        Err(e) => Err(e),
+    };
+    Ok(match read {
+        Ok(b) if most == usize::MAX => Value::str(String::from_utf8_lossy(&b)),
+        Ok(b) => Value::str(crate::value::lossy_held(b).map_err(|o| o.at(line))?),
         Err(e) => Value::err(Value::str(format!("read_file: {}: {}", p, e))),
     })
 }
@@ -2859,7 +3085,8 @@ fn read_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// `write_file(path, text)`: null, or an error value. Creates missing folders.
 fn write_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let p = s_arg(&args, 0, "write_file", line)?;
-    let text = arg(&args, 1).display();
+    // A list's text held as `str` holds it (FEEDBACK71.md, Q-977; branch security).
+    let text = arg(&args, 1).display_held().map_err(|o| o.at(line))?;
     let Some(full) = local_path(it, &p) else {
         return Ok(Value::err(Value::str(format!("write_file: path must stay inside the program's folder: {}", p))));
     };
@@ -3300,7 +3527,11 @@ fn unique(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// `flatten([[1], [2, 3], 4])` is `[1, 2, 3, 4]` (one level).
 fn flatten(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let l = l_arg(&args, 0, "flatten", line)?;
-    let mut out = Vec::new();
+    // Its length, known before it is made, compared with `--max-memory`: 300 lists of 30,000 made
+    // 9 million items (FEEDBACK71.md, Q-977, found in review; branch security).
+    let n = l.iter().map(|x| if let Value::List(inner) = x { inner.len() } else { 1 }).fold(0usize, usize::saturating_add);
+    crate::value::list_of(n).map_err(|o| o.at(line))?;
+    let mut out = Vec::with_capacity(n);
     for x in l.iter() {
         match x {
             Value::List(inner) => out.extend(inner.iter().cloned()),
@@ -3360,8 +3591,13 @@ fn group_by(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         // (FEEDBACK55.md, Q-784; branch feedback55).
         let k = match it.call1(&f, x.clone(), line)? {
             e @ Value::Err(..) => return Ok(e),
-            k => k.key_text(),
+            k => k.key_text_held().map_err(|o| o.at(line))?,
         };
+        // A new group where the map has no room left: the room it grows to compared with
+        // `--max-memory` first (FEEDBACK71.md, Q-977; branch security).
+        if groups.len() == groups.capacity() && groups.capacity() >= crate::httpd::LARGE / (2 * crate::value::ENTRY_BYTES) && !groups.contains_key(&k) {
+            crate::value::map_of(groups.capacity().saturating_mul(2)).map_err(|o| o.at(line))?;
+        }
         groups.entry(k).or_default().push(x.clone());
     }
     Ok(Value::map(groups.into_iter().map(|(k, v)| (k.into(), Value::list(v))).collect()))
@@ -3413,7 +3649,7 @@ fn index_of(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(match arg(&args, 0) {
         Value::List(l) => l.iter().position(|v| equal(v, &x)).map_or(Value::Nil, |i| Value::Int(i as i64)),
         Value::Str(s) => {
-            let needle = x.display();
+            let needle = x.display_held().map_err(|o| o.at(line))?;
             s.find(&*needle).map_or(Value::Nil, |b| Value::Int(s[..b].chars().count() as i64))
         }
         other => return fail(line, format!("`index_of` expects a list or str, got {}", other.type_name())),
@@ -3426,6 +3662,8 @@ fn repeat(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if n < 0 || (s.len() as i64).saturating_mul(n) > 100_000_000 {
         return fail(line, "`repeat` count is negative or too large");
     }
+    // Asked about first under `--max-memory` (FEEDBACK71.md, Q-977; branch security).
+    made(s.len() * n as usize, line)?;
     Ok(Value::str(s.repeat(n as usize)))
 }
 
@@ -3460,12 +3698,16 @@ fn markdown_page(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         inner.push(Value::map([("html".to_string(), h.clone())].into_iter().map(|(k, v)| (k.into(), v)).collect()));
     }
     let body = markdown(it, inner, line)?.display();
-    Ok(Value::Html(format!(
-        "<!DOCTYPE html><html{}><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title></head><body>{}</body></html>",
-        lang,
-        crate::interp::escape(&title),
-        body
-    ).into()))
+    // The page held as its body is (FEEDBACK71.md, Q-977; branch security).
+    let mut page = Held::with_capacity(body.len() + title.len() + 200);
+    page.push_str("<!DOCTYPE html><html");
+    page.push_str(&lang);
+    page.push_str("><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>");
+    crate::interp::escape_into(&title, &mut page);
+    page.push_str("</title></head><body>");
+    page.push_str(&body);
+    page.push_str("</body></html>");
+    Ok(Value::Html(page.into_text().map_err(|o| o.at(line))?.into()))
 }
 
 /// The text of the first level-1 heading with any, `# Title` or a setext one (`Title` over `===`),
@@ -3591,11 +3833,14 @@ pub(crate) fn markdown(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         out
     });
-    let mut out = String::with_capacity(s.len() * 3 / 2);
-    pulldown_cmark::html::push_html(&mut out, events);
+    // Written through a `Held` text, which stops at `--max-memory`: a link's long address used 200
+    // times made 160 MB (FEEDBACK71.md, Q-977, found in review; branch security).
+    let mut out = Held::with_capacity(s.len() * 3 / 2);
+    let _ = pulldown_cmark::html::write_html_fmt(&mut out, events);
     if over.get() {
         return fail(line, crate::httpd::over_compute());
     }
+    let mut out = out.into_text().map_err(|o| o.at(line))?;
     if inline {
         out = out.trim_end().to_string();
     }
@@ -3643,7 +3888,11 @@ fn run_script(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         None | Some(Value::Nil) => None,
         Some(_) => Some(m_arg(&args, 1, "run_script", line)?),
     };
-    Ok(crate::script::run_script(it, &src, vars.as_deref()))
+    // `--max-memory`'s stop said at this call, the script's lines being its own.
+    crate::script::run_script(it, &src, vars.as_deref()).map_err(|c| match c {
+        Ctrl::Error(e) if e.memory_stop => crate::httpd::OverMemory.at(line),
+        c => c,
+    })
 }
 
 // ---- live updates ------------------------------------------------------
@@ -3735,9 +3984,11 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             let did = it.acted;
             it.acted |= acted;
             let nobody_elses = personal || did;
-            let answer = r.as_ref().ok().filter(|v| !matches!(v, Value::Err(..) | Value::Response(_)) && crate::server::hidden(v).is_none()).map(|v| {
-                Arc::new(crate::value::js_numbers(false, || crate::livecache::Answer::new(crate::interp::island_json(v), false)))
-            });
+            // Held to `--max-memory` where it is set (FEEDBACK71.md, Q-977; branch security).
+            let answer = match r.as_ref().ok().filter(|v| !matches!(v, Value::Err(..) | Value::Response(_)) && crate::server::hidden(v).is_none()) {
+                Some(v) => Some(Arc::new(crate::value::js_numbers(false, || crate::livecache::Answer::of(v, false)).ok_or_else(|| crate::httpd::OverMemory.at(line))?)),
+                None => None,
+            };
             if let (Some(k), Some(a)) = (key, &answer) {
                 if !nobody_elses && it.set_cookies.len() == cookies && it.own_seqs.len() == own && it.shared.unchanged_since(&topics, seq) {
                     let mut cache = it.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3760,7 +4011,10 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // (FEEDBACK2.md, Q-028; branch feedback6-fixes).
     if let Ok(v) = &r {
         if !matches!(v, Value::Err(..)) {
-            let a = kept.unwrap_or_else(|| Arc::new(crate::value::js_numbers(false, || crate::livecache::Answer::new(crate::interp::island_json(v), false))));
+            let a = match kept {
+                Some(a) => a,
+                None => Arc::new(crate::value::js_numbers(false, || crate::livecache::Answer::of(v, false)).ok_or_else(|| crate::httpd::OverMemory.at(line))?),
+            };
             // A viewer's value is theirs (FEEDBACK55.md, Q-884; branch feedback55); with no
             // request to tell them by, it is not kept.
             if let Some(owner) = if personal { it.who() } else { Some(everyone) } {
@@ -3872,7 +4126,7 @@ fn watch(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn topics_arg(f: &str, args: &[Value], line: u32) -> Result<Vec<String>, Ctrl> {
     let mut out = Vec::with_capacity(args.len());
     for a in args {
-        let t = a.display();
+        let t = a.display_held().map_err(|o| o.at(line))?;
         if let Some(why) = crate::shared::topic_problem(f, &t) {
             return fail(line, why);
         }
@@ -4059,8 +4313,8 @@ pub fn css_value(s: &str) -> String {
 /// `\26 `: a `<style>` inside `<svg>` or `<math>` is markup, whose character references the
 /// browser decodes, and `&#125` (a `}` with no `;`) added a rule there (FEEDBACK55.md, Q-707;
 /// branch feedback55). The template's own text, CSS nesting's `&` say, stays as written.
-fn css_value_fn(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    Ok(Value::str(&css_value(&arg(&args, 0).display()).replace('&', "\\26 ")))
+fn css_value_fn(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    Ok(Value::str(&css_value(&arg(&args, 0).display_held().map_err(|o| o.at(line))?).replace('&', "\\26 ")))
 }
 
 /// `css` and `sql`: css`...` and sql`...` are the text as written; the tag

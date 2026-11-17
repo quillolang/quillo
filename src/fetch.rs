@@ -481,12 +481,35 @@ fn origin_of(url: &str) -> String {
     }
 }
 
+/// The longest answer read whole: `MAX_BODY`, or `--max-memory` where that is less, as the
+/// answer's text is a value (FEEDBACK71.md, Q-977; branch security). The limit is looked at once a
+/// call, before its round trip, as no size is known before.
+fn body_room() -> u64 {
+    crate::httpd::value_most().min(MAX_BODY)
+}
+
 /// What an answer longer than `MAX_BODY` is told.
 fn too_long(url: &str) -> String {
     format!("{}: the answer is longer than {} MiB, the most that is read whole: read it with http.stream", url, MAX_BODY >> 20)
 }
 
-fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Option<(String, Vec<u8>)>) -> Result<Reply, String> {
+/// Why `send` gave no answer: what went wrong, said, or `--max-memory`'s refusal of a body that
+/// long, told by its kind: a server's own words in an error (its `Content-Encoding`) were taken
+/// for the stop (FEEDBACK71.md, Q-977, found in review; branch security).
+enum Unsent {
+    Said(String),
+    OverMemory,
+}
+
+impl From<String> for Unsent {
+    fn from(s: String) -> Unsent {
+        Unsent::Said(s)
+    }
+}
+
+/// `most`: the longest answer read, `MAX_BODY` or less where `--max-memory` leaves less (see
+/// `body_room`); past a limit of its, `Unsent::OverMemory`.
+fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Option<(String, Vec<u8>)>, most: u64) -> Result<Reply, Unsent> {
     let mut passed = Vec::new();
     let (url, resp) = follow(o, false, method, url, headers, body, &mut passed)?;
     let (status, headers, last, reader) = head_of(o, &url, method, resp)?;
@@ -494,15 +517,23 @@ fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Op
     passed.extend(last);
     let cookies = passed;
     let mut bytes = Vec::new();
-    reader.take(MAX_BODY + 1).read_to_end(&mut bytes).map_err(|e| timed_out(o, &url, e.to_string()))?;
+    reader.take(most + 1).read_to_end(&mut bytes).map_err(|e| timed_out(o, &url, e.to_string()))?;
+    // Read no further than one value may be (FEEDBACK71.md, Q-977; branch security).
+    if bytes.len() as u64 > most && most < MAX_BODY {
+        return Err(Unsent::OverMemory);
+    }
     // A longer one is an error, where it was cut at the limit and said nothing: cut JSON was
     // `json: null` (FEEDBACK49.md, Q-599; branch main).
     if bytes.len() as u64 > MAX_BODY {
         // A site's call has no `http.stream` to read it with (FEEDBACK71.md, Q-973; branch
         // security).
-        return Err(if o.same_origin { format!("{}: the answer is longer than {} MiB, the most a site's call reads", url, MAX_BODY >> 20) } else { too_long(&url) });
+        return Err(Unsent::Said(if o.same_origin { format!("{}: the answer is longer than {} MiB, the most a site's call reads", url, MAX_BODY >> 20) } else { too_long(&url) }));
     }
-    Ok(Reply { status, headers, cookies, body: String::from_utf8_lossy(&bytes).into_owned() })
+    // Made text held too: what is not UTF-8 takes three bytes a byte as U+FFFD, and 1 MB of
+    // 0xFF read to a 3 MB text under a 1 MB limit (FEEDBACK71.md, Q-977, found in review; branch
+    // security).
+    let body = if most < MAX_BODY { crate::value::lossy_held(bytes).map_err(|_| Unsent::OverMemory)? } else { String::from_utf8_lossy(&bytes).into_owned() };
+    Ok(Reply { status, headers, cookies, body })
 }
 
 /// A `site`'s call (src/sites.rs), `POST url` with `body` as JSON, made as every call here is:
@@ -515,7 +546,10 @@ fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Op
 /// (FEEDBACK71.md, Q-973; branch security).
 pub(crate) fn site_post(url: &str, headers: &[(String, String)], body: Vec<u8>) -> Result<(u16, Vec<(String, String)>, Vec<String>, String), String> {
     let o = Opts { timeout_ms: 30_000, same_origin: true, ..DEFAULT_OPTS };
-    let r = send(o, "POST", url, headers, Some(("application/json".into(), body)))?;
+    let r = send(o, "POST", url, headers, Some(("application/json".into(), body)), MAX_BODY).map_err(|e| match e {
+        Unsent::Said(s) => s,
+        Unsent::OverMemory => crate::httpd::over_memory(),
+    })?;
     Ok((r.status, r.headers, r.cookies, r.body))
 }
 
@@ -813,10 +847,13 @@ fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Va
         Some(r) => r,
         None => {
             let (method, url) = (method.to_string(), url.to_string());
-            let res = it.unlocked(move || send(o, &method, &url, &hdrs, payload));
+            let most = body_room();
+            let res = it.unlocked(move || send(o, &method, &url, &hdrs, payload, most));
             let reply = match res {
                 Ok(r) => r,
-                Err(e) => return Ok(Value::err(Value::str(format!("http: {}", e)))),
+                // Past `--max-memory`: the request's stop, not an error value (FEEDBACK71.md, Q-977).
+                Err(Unsent::OverMemory) => return Err(crate::httpd::OverMemory.at(line)),
+                Err(Unsent::Said(e)) => return Ok(Value::err(Value::str(format!("http: {}", e)))),
             };
             if let Some(key) = key {
                 if (200..300).contains(&reply.status) {
@@ -827,8 +864,9 @@ fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Va
         }
     };
     // Read straight into values, with a budget of them: an answer of 8 MB of `0,` took 633 MB
-    // (FEEDBACK51.md, Q-660; branch feedback51-fixes).
-    let json = Value::parse_json(&reply.body).unwrap_or(Value::Nil);
+    // (FEEDBACK51.md, Q-660; branch feedback51-fixes). Each list, map and text held to
+    // `--max-memory` as it is made (FEEDBACK71.md, Q-977; branch security).
+    let json = Value::parse_json_held(&reply.body).map_err(|s| s.at(line))?.unwrap_or(Value::Nil);
     let mut m = Map::new();
     m.insert("status".into(), Value::Int(reply.status as i64));
     m.insert("ok".into(), Value::Bool((200..300).contains(&reply.status)));
@@ -1085,17 +1123,21 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     m.insert("headers".into(), Value::map(headers.iter().map(|(k, v)| (k.into(), Value::str(v))).collect()));
     m.insert("cookies".into(), Value::list(cookies.into_iter().map(Value::str).collect()));
     if !ok {
+        // No further than one value may be, and made text held to it (FEEDBACK71.md, Q-977;
+        // branch security).
+        let most = body_room();
         let read = it.unlocked(move || {
             let mut b = Vec::new();
-            reader.take(MAX_BODY + 1).read_to_end(&mut b).map(|_| b)
+            reader.take(most + 1).read_to_end(&mut b).map(|_| b)
         });
         // Its error said, not dropped, and one too long refused (Q-599).
         let bytes = match read {
+            Ok(b) if b.len() as u64 > most && most < MAX_BODY => return Err(crate::httpd::OverMemory.at(line)),
             Ok(b) if b.len() as u64 > MAX_BODY => return Ok(Value::err(Value::str(format!("http: {}", too_long(&url))))),
             Ok(b) => b,
             Err(e) => return Ok(Value::err(Value::str(format!("http: {}: {}", url, e)))),
         };
-        m.insert("body".into(), Value::str(String::from_utf8_lossy(&bytes)));
+        m.insert("body".into(), Value::str(crate::value::lossy_held(bytes).map_err(|o| o.at(line))?));
         return Ok(Value::map(m));
     }
     let ctype = headers.iter().find(|(k, _)| k == "content-type").map_or("", |(_, v)| v.as_str()).to_ascii_lowercase();

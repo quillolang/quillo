@@ -3003,6 +3003,16 @@ pub fn split(path: &Path, watch: bool, reload: bool, static_check: bool, checked
         if let Some(d) = crate::httpd::drain() {
             args.extend(["--drain".to_string(), format!("{}ms", d.as_millis())]);
         }
+        // And its requests' memory, the option's (a policy's is read by each from its file)
+        // (FEEDBACK71.md, Q-977; branch security).
+        if let Some(m) = crate::httpd::memory_limit_of_option() {
+            args.extend(["--max-memory".to_string(), m.to_string()]);
+        }
+        // And their time: a service's requests ran with no limit where the app's had one
+        // (FEEDBACK71.md, Q-1001; branch security).
+        if let Some(ms) = crate::httpd::compute_limit_of_option() {
+            args.extend(["--max-compute".to_string(), format!("{}ms", ms)]);
+        }
         // The app's policy is its services' too (the host's they read themselves).
         for f in crate::policy::get().files.iter().filter(|f| f.as_path() != Path::new(crate::policy::HOST_FILE)) {
             args.extend(["--policy".to_string(), f.display().to_string()]);
