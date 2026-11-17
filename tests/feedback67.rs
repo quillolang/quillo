@@ -3111,6 +3111,94 @@ fn b2_review2_the_precache_changes_nothing_and_gives_up_after_five_tries() {
     }
 }
 
+/// Pages a busy Quillo refuses to prefetch as the worker installs (`browser.busy`): twice, then
+/// served; refused for longer than the try waits; refused for every page, which share the 5 s; and
+/// a 503 with no mark, a proxy's, which waits for the next try as before.
+const BUSY_SCRIPT: &str = r#"
+const has = async (b, p) => ((await b.dump())["quillo::V"] || []).includes(p);
+const b = await makeBrowser(O);
+b.busy = { path: "/", times: 2 };
+await b.install();
+const twice = { asked: b.busy.asked, kept: await has(b, "/") };
+const c = await makeBrowser(O);
+c.busy = { path: "/menu", times: 99 };
+const t0 = Date.now();
+await c.install();
+const longer = { asked: c.busy.asked, kept: await has(c, "/menu"), other: await has(c, "/"), within: Date.now() - t0 < 6000 };
+const e = await makeBrowser(O);
+e.busy = { path: "", times: 99 };
+const t1 = Date.now();
+await e.install();
+const every = { asked: e.busy.asked, within: Date.now() - t1 < 7000 };
+const p = await makeBrowser(O);
+p.busy = { path: "/", times: 1, plain: true };
+await p.install();
+const plain = { asked: p.busy.asked, kept: await has(p, "/"), other: await has(p, "/menu") };
+console.log(JSON.stringify({ twice, longer, every, plain }));
+"#;
+
+// Found on CI (a debug build, where the page's own requests still ran as the worker installed):
+// a page Quillo is too busy to prefetch (Q-179's 503, marked `busy`) is asked again within the
+// install's try after 0.25, 0.5, 1 and 2 s, 5 s for the whole try; it had waited for a navigation
+// 10 s on, and under steady load was never kept. A 503 without the mark waits for the next try.
+#[test]
+fn b2_a_page_quillo_is_too_busy_to_prefetch_is_asked_again_as_the_worker_installs() {
+    let d = dir("sw-busy", "route offline GET / = <html><body><h1>Home</h1></body></html>\nroute offline GET /menu = <html><body><h1>Menu</h1></body></html>\n");
+    let (_s, port) = logged(&d, &[]);
+    let r = harness(port, BUSY_SCRIPT);
+    // "/menu" five times (four waits, 3.75 s), then "/" with the 1.25 s left: 0.25 and 0.5, and
+    // asked no more at 1 s (three in all).
+    assert_eq!(
+        r,
+        serde_json::json!({
+            "twice": { "asked": 3, "kept": true },
+            "longer": { "asked": 5, "kept": false, "other": true, "within": true },
+            "every": { "asked": 8, "within": true },
+            "plain": { "asked": 1, "kept": false, "other": true },
+        })
+    );
+}
+
+const BUSY_SLOW: &str = r#"
+fn work() {
+    let t = 0
+    for i in range(0, 300000) {
+        t = t + len(str(i))
+    }
+    return t
+}
+route offline GET / {
+    let n = work()
+    return <html><body><h1>made {n}</h1></body></html>
+}
+route GET /no = respond(503, "not now")
+"#;
+
+// Found on CI: Q-179's 503, for a prefetch while others wait, says so to Quillo's worker
+// (`x-quillo-prefetch: busy`); a route's own 503 does not, and a page made is not marked.
+#[test]
+fn b2_a_busy_servers_refusal_of_a_prefetch_is_marked_busy() {
+    let d = dir("busy-mark", BUSY_SLOW);
+    let (_s, port) = logged(&d, &[]);
+    let guesses: Vec<_> = (0..24)
+        .map(|_| std::thread::spawn(move || {
+            let a = support::send(port, "GET", "/", &[("x-quillo-prefetch", "1")], "");
+            (a.status, a.header("x-quillo-prefetch").map(str::to_string))
+        }))
+        .collect();
+    let answers: Vec<(u16, Option<String>)> = guesses.into_iter().map(|g| g.join().unwrap()).collect();
+    assert!(answers.iter().any(|(s, _)| *s == 503), "{:?}", answers);
+    for (status, mark) in &answers {
+        match status {
+            503 => assert_eq!(mark.as_deref(), Some("busy"), "{:?}", answers),
+            200 => assert_eq!(mark.as_deref(), None, "{:?}", answers),
+            _ => panic!("{:?}", answers),
+        }
+    }
+    let own = support::send(port, "GET", "/no", &[], "");
+    assert_eq!((own.status, own.header("x-quillo-prefetch")), (503, None));
+}
+
 const FORGET_SCRIPT: &str = r#"
 const b = await makeBrowser(O);
 await b.install();
