@@ -285,9 +285,18 @@ async function ahead() {
   // One at a time: a prefetch waits for anyone else's request (Quillo answers it 503 meanwhile,
   // which is tried again), the worker's own included.
   const todo = PAGES.filter((p) => !s.done.includes(p)), got = [];
+  // A page Quillo said it was too busy for (`x-quillo-prefetch: busy`, as anyone else's request
+  // waits) is asked again after 0.25 s, 0.5, 1 and 2, within 5 s for the whole try.
+  let budget = 5000;
   for (const p of todo) got.push(await (async () => {
     try {
-      const res = await fetch(p, { cache: "no-store", redirect: "manual", headers: { "x-quillo-prefetch": "1" } });
+      let res;
+      for (let wait = 250; ; wait *= 2) {
+        res = await fetch(p, { cache: "no-store", redirect: "manual", headers: { "x-quillo-prefetch": "1" } });
+        if (res.status !== 503 || res.headers.get("x-quillo-prefetch") !== "busy" || wait > 2000 || wait > budget) break;
+        budget -= wait;
+        await new Promise((ok) => setTimeout(ok, wait));
+      }
       if (res.type === "opaqueredirect" || res.headers.get("x-quillo-prefetch") === "refused") return true;
       if (res.status >= 502 && res.status <= 504) return false;
       const mark = res.headers.get("x-quillo-offline");

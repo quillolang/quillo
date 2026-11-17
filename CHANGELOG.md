@@ -18,7 +18,8 @@
   page on the device, with a service worker Quillo writes (`/_quillo/sw.js`): pages from the
   network first, the copy marked `data-kept` (or an offline page named from `app.toml`) when
   the network fails or a proxy answers `502` to `504`, routes without parameters kept as the
-  worker installs, a deploy's new worker keeping the old copies until it has its own. A page
+  worker installs (a page Quillo is too busy to prefetch asked again within 5 s), a deploy's
+  new worker keeping the old copies until it has its own. A page
   that reads the visitor through `session()` alone is kept for that session only, behind a
   gate that checks the `quillo_tag` cookie, and dropped when the session changes, ends or is
   no longer taken; one that reads them another way, holds a form key, has waiting parts or
