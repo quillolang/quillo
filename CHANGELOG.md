@@ -93,6 +93,12 @@
 - Editors (quillolang/editors, released on its own): `offline` after `route` and `routes` is
   highlighted as a keyword in every editor's grammar, as `quillo lsp` already completes and
   explains it.
+- **Security: redirects through dot segments.** `redirect` wrote a path of the site's own whose
+  `.` and `..` hid a second `/` (`/.//evil.example`, `/%2e//evil.example`,
+  `/a/..//evil.example`) as `Location: //evil.example`, which a browser takes to that host,
+  through the guide's own `redirect(local_path(next) ?? "/")`. It now writes one `/` first
+  (`/evil.example`, on the site), and `local_path` is null for such a path, on the server and in
+  the browser (FEEDBACK71.md, Q-968).
 
 ## 0.8.6 (2026-11-16)
 
