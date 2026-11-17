@@ -177,6 +177,19 @@ route POST /search {
 }
 "#;
 
+/// The log once it holds `want`, 10 s at most: a request's own line is written on the loop's next
+/// turn, after its answer, and CI's debug build read the log before it (run 44140118955).
+fn log_holding(path: &std::path::Path, want: &str) -> String {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let log = std::fs::read_to_string(path).unwrap_or_default();
+        if log.contains(want) || std::time::Instant::now() >= end {
+            return log;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn a_pattern_compiles_to_10_mib_at_most_and_says_so_past_it() {
     // The regex crate's own limit, as before the slice: `(?:\w{1000}){n}` is 96 KB a time, 109
@@ -513,7 +526,7 @@ fn max_memory_ends_the_request_whose_value_would_be_bigger_than_it_allows() {
         assert_eq!(get(port, path), (*status, body.to_string()), "{}", path);
     }
     // Each stop said in the log as `--max-compute`'s is: the request, where, and why.
-    let log = std::fs::read_to_string(d.join("mem.log")).unwrap();
+    let log = log_holding(&d.join("mem.log"), "GET /grow?k=23 -> 500");
     assert!(log.contains("quillo: error: GET /grow?k=23 (rid "), "{}", log);
     assert!(log.contains(&format!("mem.qwe:5: {}", STOP)), "{}", log);
     // A template's, at its part's line.
@@ -1279,7 +1292,7 @@ fn a_second_render_whose_code_passes_the_limit_ends_its_request() {
     let (status, body) = get(port, "/grows?n=100000");
     assert_eq!(status, 500, "{}", body);
     assert!(!body.contains(r#"<p id="g1">0</p>"#), "{}", body);
-    let log = std::fs::read_to_string(d.join("again.log")).unwrap();
+    let log = log_holding(&d.join("again.log"), "GET /grows?n=100000 -> 500");
     let stop = "again.qwe:4: this request's value would be bigger than --max-memory allows (1048576 bytes)";
     assert_eq!(log.matches(stop).count(), 1, "{}", log);
     assert!(log.contains("GET /grows?n=100000 -> 500"), "{}", log);
