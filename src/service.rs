@@ -1815,6 +1815,12 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     // feedback36-39).
     let mut caller: Option<Value> = None;
     let mut answer_key: Option<String> = None;
+    // Signed with the shared secret where `accept_calls` names callers another way: one of the
+    // system's services, not named, unless a token or a certificate on the call names it.
+    let mut unnamed = false;
+    // Why a name with a key of its own was refused under the secret: said first, before what a
+    // token or a certificate on the call got wrong (FEEDBACK71.md, Q-970; branch security).
+    let mut keyed: Option<String> = None;
     let mut why = if secret().is_some() {
         "not signed with this server's QUILLO_SERVICE_SECRET (or too old)".to_string()
     } else {
@@ -1840,7 +1846,23 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
             if let (Some(k), true) = (k, fresh) {
                 answer_key = Some(k);
                 // Version 2 did not sign the caller's name: it is not known then.
-                caller = Some(crate::svcauth::caller_value(if s.v >= 3 { said_caller } else { "" }, "quillo", Vec::new()));
+                let name = if s.v >= 3 { said_caller } else { "" };
+                // A caller `accept_calls` holds a key for proves it is that caller with its key, as a
+                // copy that joins does (`join_here`): the secret every service holds made any of
+                // them `shop`, for `for ["shop"]` and for what `_contracts` lists. The secret is
+                // then no proof of who calls, and a token or a certificate still may be
+                // (FEEDBACK71.md, Q-970; branch security).
+                if accept.as_ref().is_some_and(|a| a.keys.contains_key(name)) {
+                    keyed = Some(format!("this service takes calls from `{}` signed with its key, not the shared secret (auth: {{ key, as: \"{}\" }} where it declares this service)", name, name));
+                } else if accept.as_ref().is_some_and(|a| a.names_callers()) {
+                    // The name it says counts for nothing where callers are named by keys,
+                    // certificates or tokens: under the secret, a service became a SPIFFE id, a
+                    // CN or a token's `sub` for `for` (the user's decision, 2026-11-17;
+                    // FEEDBACK71.md, Q-970; branch security).
+                    unnamed = true;
+                } else {
+                    caller = Some(crate::svcauth::caller_value(name, "quillo", Vec::new()));
+                }
             }
         } else {
             why = "this service takes no calls signed with the shared secret (accept_calls { shared: false })".into();
@@ -1864,17 +1886,34 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
         // The certificate a proxy checked, from a proxy `--trust-proxy` names only.
         if let Some(h) = accept.as_ref().and_then(|a| a.client_cert.clone()) {
             let from_proxy = header(crate::httpd::PROXIED).is_some();
-            match header(&h) {
-                Some(v) if from_proxy => match crate::svcauth::cert_identity(v) {
-                    Some((name, extra)) => caller = Some(crate::svcauth::caller_value(&name, "mtls", extra)),
-                    None => why = format!("`{}` names no certificate's subject", h),
+            // Every line of it, joined as RFC 9110 §5.3 joins a header's lines, so that one a proxy
+            // adds after the client's is the last element, not left out for the client's
+            // (FEEDBACK71.md, Q-1000; branch security).
+            let lines: Vec<&str> = req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(&h)).map(|(_, v)| v.as_str()).collect();
+            let joined = (!lines.is_empty()).then(|| lines.join(","));
+            let chain = accept.as_ref().is_some_and(|a| a.client_cert_chain);
+            // Its form is the program's to say (`subject: true`), never the header's (Q-1000).
+            let subject = accept.as_ref().is_some_and(|a| a.client_cert_subject);
+            let read = |v: &str| match (subject, lines.len()) {
+                (true, 1) => crate::svcauth::subject_caller(v),
+                (true, n) => Err(format!("has {} lines: a subject is one", n)),
+                (false, _) => crate::svcauth::cert_caller(v, chain),
+            };
+            match joined.as_deref() {
+                // A SPIFFE id names the caller whole (FEEDBACK71.md, Q-971; branch security).
+                Some(v) if from_proxy => match read(v) {
+                    Ok((name, extra)) => caller = Some(crate::svcauth::caller_value(&name, "mtls", extra)),
+                    Err(e) => why = format!("`{}` {}", h, e),
                 },
                 Some(_) => why = format!("`{}` is believed only from a proxy --trust-proxy names", h),
                 None => {}
             }
         }
     }
-    let Some(mut caller) = caller else { return refused(401, &why) };
+    if caller.is_none() && unnamed {
+        caller = Some(crate::svcauth::caller_value("", "quillo", Vec::new()));
+    }
+    let Some(mut caller) = caller else { return refused(401, keyed.as_deref().unwrap_or(&why)) };
     if let Some(me) = SERVED_AS.get().filter(|me| *me != to) {
         return refused(401, &format!("this call is for service `{}`; this is `{}` (see --service-name)", to, me));
     }
@@ -2034,6 +2073,21 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, caller: V
     };
     if let Some(allowed) = it.fn_callers.get(f) {
         if !allowed.iter().any(|a| *a == who) {
+            // A SPIFFE caller is named by its whole id: a program written for its last part is
+            // told what to write instead (the user's decision, 2026-11-17; FEEDBACK71.md, Q-971;
+            // branch security).
+            let uri = match &caller {
+                Value::Map(m) => m.get("uri").map(|u| u.display()).filter(|u| *u == who),
+                _ => None,
+            };
+            if let Some(uri) = uri.filter(|u| u.rsplit('/').next().is_some_and(|last| allowed.iter().any(|a| a == last))) {
+                return refused(403, &format!("`{}` takes calls from {} only; this caller is `{}`: write that in `for`", f, allowed.join(", "), uri));
+            }
+            // The shared secret named no one (FEEDBACK71.md, Q-970; branch security).
+            let by_secret = matches!(&caller, Value::Map(m) if matches!(m.get("by"), Some(Value::Str(b)) if &**b == "quillo"));
+            if who.is_empty() && by_secret && it.accept.as_ref().is_some_and(|a| a.names_callers()) {
+                return refused(403, &format!("a call signed with the shared secret names no caller here, as `accept_calls` takes keys, certificates or tokens: `{}` is for {}", f, allowed.join(", ")));
+            }
             let who = if who.is_empty() { "a caller whose name is not known".to_string() } else { format!("`{}`", who) };
             return refused(403, &format!("`{}` takes calls from {} only; this is {}", f, allowed.join(", "), who));
         }

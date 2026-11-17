@@ -2338,9 +2338,18 @@ server fn refund(account: int, cents: int) for ["shop"] {
 ```
 
 - `keys`: a key for each caller, by name; a list takes any of its keys, while one is
-  changed.
+  changed. A caller named here proves itself with its key: a call signed with the shared
+  secret that says it is `shop` is refused (401 ``this service takes calls from `shop` signed
+  with its key, not the shared secret``, unless a token or certificate on it names it), as a
+  joining copy must use its key.
 - `shared: false`: calls signed with the shared secret are refused (`this service takes
-  no calls signed with the shared secret`). Without it they are taken as before.
+  no calls signed with the shared secret`). Without it they are taken, and where
+  `accept_calls` names callers another way (`keys`, `client_cert` or `jwt`), such a call is
+  one of the system's services and no more: `request.caller` is `{ name: "", by: "quillo" }`,
+  `for` refuses it (``a call signed with the shared secret names no caller here, as
+  `accept_calls` takes keys, certificates or tokens: `refund` is for shop``), and
+  `_contracts` lists only what has no `for`; a token or a certificate on the same call still
+  names it. With the shared secret alone, the name the caller signed is taken.
 - `jwt: { issuer, audience, jwks, secret }`: a bearer token, an OAuth 2.0 access token,
   checked against the identity provider's keys at `jwks` (a URL, kept for ten minutes,
   fetched again at most once a minute for a key it does not have: RS256, ES256, EdDSA)
@@ -2354,10 +2363,47 @@ server fn refund(account: int, cents: int) for ["shop"] {
   it would be good for ever`, `an unsigned token`).
 - `client_cert: { header }`: the identity in the header a proxy that ended mutual TLS
   sets, as Envoy's `x-forwarded-client-cert` (`Subject="CN=shop,O=Acme";URI=spiffe://...`):
-  the SPIFFE id's last part, else the subject's CN. Quillo ends no TLS itself, so the
-  header is believed only from an address the option [`--trust-proxy`](#options-of-quillo-run) names
+  the SPIFFE id whole, as Istio's policies name principals
+  (`for ["spiffe://cluster.local/ns/shop/sa/shop"]`), else the subject's CN
+  (`for ["shop"]`). Quillo ends no TLS itself, so the header is believed only from an
+  address the option [`--trust-proxy`](#options-of-quillo-run) names
   (`quillo run billing.qwe --as-service --trust-proxy 10.0.0.2`); from anyone else it is
-  a 401.
+  a 401. More precisely:
+  - Which form the header is in is the program's to say, never read from the header. By
+    default it is Envoy's `x-forwarded-client-cert`, one proxy's element, set in place of any
+    the client sent (Envoy's `forward_client_cert_details: SANITIZE_SET`, as a sidecar does):
+    a header with several elements, or several lines of it, is a 401. `client_cert: { header, chain: true }`
+    takes the last of several, for `APPEND_FORWARD`; use it only where the CA issues no URI
+    or DNS name with a comma in it (a SPIFFE id cannot have one), as Envoy writes those bare
+    and such a name would read as one more element, the last, written by the certificate's
+    holder.
+  - An element is read as Envoy writes it: elements by `,`, pairs by `;`, its keys only
+    (`By`, `Hash`, `Cert`, `Chain`, `Subject`, `URI`, `DNS`) in that order, `Subject`, `Cert`
+    and `Chain` in quotes with backslash escapes and the others bare, with no space around
+    `;`, `,` or `=` and no empty part or element. Anything else (an unclosed quote, a
+    backslash outside quotes, another key, a space) is a 401 that says what.
+  - `client_cert: { header, subject: true }` says the header is the certificate's subject
+    alone, one line, as RFC 2253 writes it (nginx: `proxy_set_header X-Client-DN
+    $ssl_client_s_dn;`); it does not go with `chain`, and is for a proxy that sets the header
+    in place of the client's, as `proxy_set_header` does, never one that adds to it.
+  - Only a `spiffe://` URI names the caller; another URI is shown in `request.caller.uri`, and
+    the CN names the caller, so where a CA binds who someone is in another kind of URI and
+    lets them choose the CN, use SPIFFE ids, or check `request.caller.uri` in `check`. A SPIFFE id is compared as written (not decoded, a slash at its
+    end kept) and must be
+    one by the SPIFFE spec (letters, digits, `.`, `-` and `_`; no empty, `.` or `..` part, no
+    query or fragment, 2,048 bytes at most): another, two URIs (an SVID has one), or another
+    URI with `,` `;` `=` `"` `\` or a space is a 401. Envoy writes a URI SAN that is a SPIFFE
+    id followed by `;DNS=...` as it writes that id and a DNS name, so a CA that issues URI SANs
+    without checking them as SPIFFE ids can give a holder the id at the start of one. A `for` written with the id's last part is refused with the id to
+    write (``this caller is `spiffe://cluster.local/ns/shop/sa/shop`: write that in
+    `for` ``).
+  - The CN is the subject's CN attribute, read as RFC 2253 and 4514 write a subject (what
+    Envoy and nginx's `$ssl_client_s_dn` send: `CN=shop,O=Acme\, Inc.`), its escapes decoded
+    (`CN=Acme\, Inc.` is `Acme, Inc.`). OpenSSL's slash form (`/O=Acme/CN=shop`, nginx's
+    `$ssl_client_s_dn_legacy`) is refused, as it cannot be read one way only. Two CNs, an
+    empty one, one with `:` in it, or a subject that does not parse names no caller (a 401,
+    saying why). Where a SPIFFE id names the caller,
+    the subject is shown in `request.caller.subject` and not read.
 - `check: (caller) => ...`, run with `request.caller` before the call's arguments are
   read: `false` refuses it with 403 (and an error value, with its text), a map takes the
   caller's place, and `reply` answers the call there.
@@ -2374,17 +2420,21 @@ What the function sees, where a service runs elsewhere (in one process a call is
 function's call: `request.caller` is null, and `for` is not checked):
 
 - `request.caller`: `{ name, by }`, `by` being `"quillo"` (the shared secret; `name` as
-  the caller signed it), `"key"`, `"jwt"` (with `scopes`, from `scope` or `scp`, and the
-  token's `claims`; `name` its `client_id`, `azp` or `sub`) or `"mtls"` (with `subject`,
-  and `uri` for a SPIFFE id). What `check` gave, when it gave a map.
+  the caller signed it, or `""` where `accept_calls` names callers another way), `"key"`,
+  `"jwt"` (with `scopes`, from `scope` or `scp`, and the token's `claims`; `name` its
+  `client_id`, `azp` or `sub`) or `"mtls"` (with `subject`, and `uri` for a SPIFFE id,
+  which is then its `name` too). What `check` gave, when it gave a map.
 - `request.user`: the claims of the visitor's token, when the caller forwarded its
   `authorization` and `accept_calls`'s `jwt` takes it; else null.
 - `request.forwarded`: the headers forwarded, by name.
 
 A call proven several ways is taken by the first that holds, in this order: a key of the
-caller's own, the shared secret, a token, a certificate. A caller with `QUILLO_SERVICE_SECRET`
-set signs every call with it, a bearer one too, so a service that is to check tokens says
-`shared: false`.
+caller's own; the shared secret, where nothing else names callers; a token; a certificate;
+last, the shared secret as a service without a name. A caller with `QUILLO_SERVICE_SECRET`
+set signs every call with it, a bearer one too, and the token still names it. Under
+`--split` the services sign with the shared secret: one whose `accept_calls` names callers
+by keys, certificates or tokens takes the others as unnamed, so a `for` there needs callers
+with keys of their own (`auth: { key, as }` where they declare it).
 
 Answers are signed back with the key the call was signed with, and a caller that signs
 with a key of its own takes no answer without it (``service billing: the answer from
@@ -2541,6 +2591,17 @@ empty.
   effect ``). Only what a `site` declaration made is a site *(since 0.7)*: a map with the
   same keys, from JSON or a script, is a map, so a visitor cannot point a call elsewhere.
   The name is ASCII letters, digits and `_`.
+- A call is made as `http`'s are: under a policy, `[http] hosts` must list the site and
+  `private = false` keeps it off this machine and its networks (`site shop: not called:
+  ...`). It goes through the proxy `HTTPS_PROXY` or `HTTP_PROXY` names: list internal sites
+  in `NO_PROXY` (`NO_PROXY=shop.internal,.corp.example`), or they are asked for through the
+  proxy. Redirects are followed on the site's own scheme, host and port only, up to 5 (a
+  `302` after the `POST` as a `GET`, a `307` with the same body); one elsewhere, or not
+  `http(s)`, is an error value naming where (``site shop: `notes` answered 302, sent on to
+  http://10.0.0.5/: ...``). A call has 10 s to connect and 30 s in all, its redirects
+  included; an answer over 64 MiB is an error value; requests say
+  `User-Agent: quillo/<version>`. The cookies of every answer from the site's own address,
+  those on the way too, are kept where cookies are kept (above).
 - `/_quillo/rpc/<fn>` is a stable wire for programs: a JSON array of arguments in,
   `{"ok": value}` or `{"err": error}` out. A program needs no `Origin` header; another
   site's `Origin` is refused.

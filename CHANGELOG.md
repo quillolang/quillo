@@ -50,6 +50,24 @@
   refused as another site's, and the log says so once (FEEDBACK70.md, Q-966). Quillo sends no
   `Strict-Transport-Security` itself, as it serves plain HTTP: the proxy does, or
   `site_headers` (the guide says how).
+- **Service callers**: a call signed with the shared secret cannot claim a name
+  `accept_calls { keys }` holds (401), and where `accept_calls` names callers by keys,
+  certificates or tokens it names no caller at all: `for` refuses it and `_contracts` lists
+  only what has no `for` (FEEDBACK71.md, Q-970). A caller proven by a SPIFFE id is named by
+  the whole id, as Istio names principals; a `for` written with its last part is refused with
+  the id to write (Q-971). The forwarded-certificate header is read as Envoy writes it, one
+  element unless `client_cert: { chain: true }`, its lines joined, held to Envoy's keys, order
+  and quoting with nothing trimmed, and only a SPIFFE id, checked against the spec, names a
+  caller by its URI; `client_cert: { subject: true }` reads a header that is a subject alone
+  (nginx's `$ssl_client_s_dn`), as the form is never guessed (Q-988, Q-1000). A subject's CN
+  is its CN attribute, read in RFC 2253's form with its escapes decoded; the slash form, two
+  CNs, a CN with `:` or a subject that does not parse name no caller (Q-989).
+- **Outgoing calls**: a method that is not an HTTP token is an error value before anything
+  connects (Q-972). `site` calls go as `http`'s do: the host's policy, the environment's
+  proxy, same-origin redirects only (a `file:` one was a 500), one 30 s deadline, the site's
+  cookies along the way (Q-973). `cache` keeps answers apart by every option and a GET's body
+  (one client certificate's answer went to calls with another), and `timeout` covers a call's
+  redirects (Q-974).
 - `http.*`'s `public_only` no longer takes 64:ff9b:1::/48 (RFC 8215's local-use NAT64) as the
   public internet (found in FEEDBACK67's review).
 - `ask` and `notify` where the code surely runs on the server (a route, a `server fn`, a tick,

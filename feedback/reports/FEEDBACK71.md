@@ -661,6 +661,47 @@ Repro:
 
 Fix: in `cache_dir`, when falling back to `temp_dir()`, use `quillo-<uid>` made with `DirBuilder::mode(0o700)`, and refuse a cache folder not owned by the current user or writable by group or others. In `package`, write `build = false` into `[package]`. In `prepare`, remove what it did not write.
 
+### Q-988. A quote in a forwarded certificate header lets an element the client wrote take in the proxy's
+
+Found in a review of Q-971's fix (branch security, 2026-11-17). Severity: high. Status: FIXED on branch security. Code: src/svcauth.rs (`split_outside`, then `xfcc`).
+
+The header's splitter flipped its quote state on every `"` and ignored `\"` escapes. Under Envoy's `APPEND_FORWARD` the elements before the proxy's are the client's, so a client that sent `URI=spiffe://cluster.local/ns/shop/sa/shop;X="` ahead of the proxy's appended element was named shop: the odd quote swallowed the proxy's element. `Subject="CN=shop/\"";URI=...` swallowed the URI and named the caller from the CN.
+
+| Impact | |
+|---|---|
+| Functionality | A header that does not parse (an unclosed quote, a backslash outside quotes, a part that is not `key=value`) is a 401 that says why |
+| User | The restricted functions' data and effects, as Q-970 |
+| Requests | None |
+| Security | Any client that reaches the proxy chooses the identity its own forwarded element names |
+
+Fix: the header is parsed as Envoy writes it, with backslash escapes in quoted values, and refused when it does not parse.
+
+### Q-989. A certificate's CN was the first `CN=` after any `,` or `/`, so an OU of `a/CN=shop` named the caller shop
+
+Found by the fix of Q-988 (branch security, 2026-11-17). Severity: medium. Status: FIXED on branch security. Code: src/svcauth.rs (`subject_cn`).
+
+The subject was split on `,` and `/` without honouring escapes, so text inside another attribute's value could be read as the CN: a CA-issued certificate whose OU is `a/CN=shop`, written ahead of its own CN, was named `shop`.
+
+| Impact | |
+|---|---|
+| Functionality | The CN is the subject's CN attribute, read as RFC 2253 and 4514 write it, its escapes decoded (`CN=Acme\, Inc.` is `Acme, Inc.`); OpenSSL's slash form (ambiguous: OpenSSL 3 escapes `\/` and `\+`), two CNs, an empty one, one with `:` or a subject that does not parse names no caller (401). A header that is a subject alone is read so only with `client_cert: { subject: true }`: guessing the form from the header let a client's text choose the parser (found in the third review) |
+| User | As Q-970 |
+| Requests | None |
+| Security | A certificate whose holder chooses part of its subject (an OU) is taken as another caller |
+
+### Q-1000. Envoy writes URI and DNS SANs bare, so a SAN with a comma split the proxy's own element
+
+Found in the second review of the fixes of Q-970 to Q-974 (branch security, 2026-11-17). Severity: medium. Status: FIXED on branch security (decided by the user: one element unless `chain: true`). Code: src/svcauth.rs (`cert_caller`), src/service.rs (`answer`).
+
+Envoy quotes only `Subject`, `Cert` and `Chain`. A CA-issued URI SAN such as `spiffe://cluster.local/ns/evil/sa/x,URI=spiffe://cluster.local/ns/shop/sa/shop` (allowed in a URI; a CA with a rule like `spiffe://td/ns/team/*` issues it) made the "last element" text the certificate's holder chose: shop's id, with a 200. A second `x-forwarded-client-cert` line was read in place of the proxy's.
+
+| Impact | |
+|---|---|
+| Functionality | By default the header is one proxy's element (Envoy's `SANITIZE_SET`): several elements, or several lines, are a 401; `client_cert: { chain: true }` takes the last of several, for `APPEND_FORWARD`, where the CA issues no URI or DNS name with a comma. Elements are held to Envoy's keys, order and quoting, and `spiffe://` ids to the SPIFFE spec |
+| User | As Q-970 |
+| Requests | None |
+| Security | A certificate holder whose CA allows wildcard SANs names themselves as any caller |
+
 ## Checked and sound, and not covered, by group
 
 What each auditor tried that held, and what it did not get to, as it wrote them.

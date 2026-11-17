@@ -130,26 +130,23 @@ pub fn call(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let keeps = keeps_cookies();
     let cookies = if keeps { jar(it, &name) } else { Vec::new() };
     let target = format!("{}/_quillo/rpc/{}", url, f);
+    // Made as `http`'s calls are, in src/fetch.rs: the host's `[http]` policy holds for a site
+    // too, a redirect is followed on the site's own origin only, and a `file:` one is an error
+    // value, not a crash of the route (FEEDBACK71.md, Q-973; branch security). The policy is
+    // asked here first, to say it refused, and again at each address `site_post` goes to.
     let answer = it.unlocked(move || {
-        let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(30)).build();
-        let mut req = agent.post(&target).set("content-type", "application/json").set("accept", "application/json");
+        crate::policy::get().http(&target).map_err(|e| (true, e))?;
+        let mut headers = vec![("accept".to_string(), "application/json".to_string())];
         if !cookies.is_empty() {
             let c: Vec<String> = cookies.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-            req = req.set("cookie", &c.join("; "));
+            headers.push(("cookie".into(), c.join("; ")));
         }
-        match req.send_string(&body) {
-            Ok(r) | Err(ureq::Error::Status(_, r)) => {
-                let status = r.status();
-                let set: Vec<String> = r.all("set-cookie").into_iter().map(str::to_string).collect();
-                let text = r.into_string().unwrap_or_default();
-                Ok((status, set, text))
-            }
-            Err(e) => Err(e.to_string()),
-        }
+        crate::fetch::site_post(&target, &headers, body.into_bytes()).map_err(|e| (false, e))
     });
-    let (status, set, text) = match answer {
+    let (status, headers, set, text) = match answer {
         Ok(a) => a,
-        Err(e) => return Ok(Value::err(Value::str(format!("site {}: no answer from {}: {}", name, url, e)))),
+        Err((true, e)) => return Ok(Value::err(Value::str(format!("site {}: not called: {}", name, e)))),
+        Err((false, e)) => return Ok(Value::err(Value::str(format!("site {}: no answer from {}: {}", name, url, e)))),
     };
     if !set.is_empty() {
         if keeps {
@@ -157,6 +154,14 @@ pub fn call(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         } else if !SAID_SERVER.swap(true, std::sync::atomic::Ordering::Relaxed) {
             eprintln!("quillo: site {}: the cookies it set are not kept on a server, where one visitor's session with it would be every visitor's", name);
         }
+    }
+    // A redirect elsewhere, which is not followed: where it went, not what is there. The cookies
+    // of that answer, and of those on the way, are the site's own and were kept above: every
+    // answer a site's call reads is from the site's origin (FEEDBACK71.md, Q-973; branch
+    // security).
+    if let Some((_, to)) = headers.iter().find(|(k, _)| k == "location").filter(|_| matches!(status, 301 | 302 | 303 | 307 | 308)) {
+        let to: String = to.chars().take(200).collect();
+        return Ok(Value::err(Value::str(format!("site {}: `{}` answered {}, sent on to {}: a site's call follows redirects on the site's own address only", name, f, status, to))));
     }
     // As deep as every reader takes (FEEDBACK55.md, Q-875's second review; branch feedback55).
     let j: serde_json::Value = crate::value::json_value(text.as_bytes()).unwrap_or(serde_json::Value::Null);

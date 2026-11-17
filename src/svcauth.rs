@@ -298,8 +298,24 @@ pub struct Accept {
     /// `client_cert: { header }`: the identity a proxy that ended mTLS gives in this header,
     /// believed only from an address `--trust-proxy` names.
     pub client_cert: Option<String>,
+    /// `client_cert: { chain: true }`: several elements taken, the last (Envoy's APPEND_FORWARD);
+    /// else one only (FEEDBACK71.md, Q-1000; branch security).
+    pub client_cert_chain: bool,
+    /// `client_cert: { subject: true }`: the header is the certificate's subject alone, one line,
+    /// as nginx's `$ssl_client_s_dn` gives it; else it is Envoy's (FEEDBACK71.md, Q-1000).
+    pub client_cert_subject: bool,
     /// `check: (caller) => ...`: anything else, in Quillo.
     pub check: Option<Value>,
+}
+
+impl Accept {
+    /// Whether it takes another way of proving which caller calls than the shared secret, which
+    /// every service of the system holds: a key, a certificate or a token. Then the secret proves
+    /// only that a call is one of the system's services, not which (the user's decision,
+    /// 2026-11-17; FEEDBACK71.md, Q-970; branch security).
+    pub fn names_callers(&self) -> bool {
+        !self.keys.is_empty() || self.client_cert.is_some() || self.jwt.is_some()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -364,10 +380,28 @@ pub fn accept_of(v: &Value) -> Result<Accept, String> {
     }
     match m.get("client_cert") {
         None | Some(Value::Nil) => {}
-        Some(Value::Map(c)) => match c.get("header") {
-            Some(Value::Str(h)) if !h.is_empty() => a.client_cert = Some(h.to_ascii_lowercase()),
-            _ => return Err("`accept_calls`: `client_cert` needs `header`, the one the proxy that ended mTLS sets (x-forwarded-client-cert)".into()),
-        },
+        Some(Value::Map(c)) => {
+            if let Some(k) = c.keys().find(|k| !["header", "chain", "subject"].contains(&&***k)) {
+                return Err(format!("`accept_calls`: `client_cert` has no `{}` (header, chain, subject)", k));
+            }
+            match c.get("header") {
+                Some(Value::Str(h)) if !h.is_empty() => a.client_cert = Some(h.to_ascii_lowercase()),
+                _ => return Err("`accept_calls`: `client_cert` needs `header`, the one the proxy that ended mTLS sets (x-forwarded-client-cert)".into()),
+            }
+            a.client_cert_chain = match c.get("chain") {
+                None | Some(Value::Nil) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(other) => return Err(format!("`accept_calls`: `client_cert`'s `chain` is true or false, not {}", crate::interp::short(other))),
+            };
+            a.client_cert_subject = match c.get("subject") {
+                None | Some(Value::Nil) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(other) => return Err(format!("`accept_calls`: `client_cert`'s `subject` is true or false, not {}", crate::interp::short(other))),
+            };
+            if a.client_cert_subject && a.client_cert_chain {
+                return Err("`accept_calls`: `client_cert` takes `chain` or `subject`, not both: `chain` is for Envoy's elements, and with `subject: true` the header is one subject".into());
+            }
+        }
         Some(other) => return Err(format!("`accept_calls`: `client_cert` is a map, like {{ header: \"x-forwarded-client-cert\" }}, not {}", crate::interp::short(other))),
     }
     match m.get("check") {
@@ -394,42 +428,331 @@ pub fn caller_value(name: &str, by: &str, extra: Vec<(&str, Value)>) -> Value {
 
 /// The identity in a proxy's client-certificate header: Envoy's `x-forwarded-client-cert`
 /// (`By=...;Hash=...;Subject="CN=shop,O=x";URI=spiffe://...`), or a subject alone. The name is
-/// the SPIFFE id's last part, or the CN.
+/// the SPIFFE id, whole, or the CN (see `cert_caller`), the last of several elements taken, as
+/// `client_cert: { chain: true }` takes it.
 pub fn cert_identity(header: &str) -> Option<(String, Vec<(&'static str, Value)>)> {
-    // Split where no quote is open: a subject has commas of its own.
-    fn split_outside(s: &str, sep: char) -> Vec<&str> {
-        let (mut out, mut from, mut quoted) = (Vec::new(), 0, false);
-        for (i, c) in s.char_indices() {
-            match c {
-                '"' => quoted = !quoted,
-                c if c == sep && !quoted => {
-                    out.push(&s[from..i]);
-                    from = i + 1;
-                }
-                _ => {}
-            }
-        }
-        out.push(&s[from..]);
-        out
+    cert_caller(header, true).ok()
+}
+
+/// The keys Envoy writes in an element, in the order it writes them: `By` for each URI of the
+/// proxy's own certificate, then the client certificate's `Hash`, `Cert`, `Chain`, `Subject`, and
+/// a `URI` and a `DNS` for each of its names.
+const ENVOY_KEYS: [&str; 7] = ["By", "Hash", "Cert", "Chain", "Subject", "URI", "DNS"];
+
+/// `cert_identity`, or why the header names no caller. `chain`: several elements are taken,
+/// the last being the client's (Envoy's `APPEND_FORWARD`); else the header is one proxy's
+/// element alone (`SANITIZE_SET`).
+///
+/// A SPIFFE id is the caller's name whole, `spiffe://cluster.local/ns/shop/sa/shop`, as Istio's
+/// policies name principals: its last part alone made any workload that could have a service
+/// account called `shop`, in any namespace or trust domain, `shop` (the user's decision,
+/// 2026-11-17; FEEDBACK71.md, Q-971; branch security). It is compared as written. A certificate
+/// with two URIs is no SPIFFE id (an X.509-SVID has exactly one), and neither is taken: refused.
+///
+/// Envoy writes a URI and a DNS name bare, unquoted, whatever is in it, so a name a CA issued
+/// with a `,` in it ended the proxy's element and began another, the last, which its holder
+/// wrote: `.../sa/x,URI=spiffe://.../sa/shop` named the caller shop. So by default a header is
+/// one element, a `spiffe://` URI is a SPIFFE id as its spec writes one (`spiffe_id`), another
+/// URI holds nothing that could end it, and an element holds only Envoy's keys, in Envoy's
+/// order, quoted where Envoy quotes them, so that a name written into it cannot add a pair the
+/// proxy did not write (the user's decision, 2026-11-17; FEEDBACK71.md, Q-1000; branch security).
+pub fn cert_caller(header: &str, chain: bool) -> Result<(String, Vec<(&'static str, Value)>), String> {
+    let mut elements = xfcc(header)?;
+    if elements.len() > 1 && !chain {
+        return Err(format!(
+            "has {} elements: one proxy's is expected, in place of any the client sent (Envoy's SANITIZE_SET); `client_cert: {{ chain: true }}` takes the last of several (APPEND_FORWARD)",
+            elements.len()
+        ));
     }
-    // The last element is the client's (each proxy adds one, comma between).
-    let elements = split_outside(header, ',');
-    let last = elements.iter().rev().find(|e| e.contains('=')).copied().unwrap_or(header).trim();
-    let field = |k: &str| {
-        split_outside(last, ';').into_iter().find_map(|p| {
-            let (a, b) = p.split_once('=')?;
-            a.trim().eq_ignore_ascii_case(k).then(|| b.trim().trim_matches('"').to_string())
-        })
+    for (_, pairs) in &elements {
+        envoy_element(pairs)?;
+    }
+    let Some((_, pairs)) = elements.pop() else { return Err("names no certificate's subject".into()) };
+    let values = |k: &str| pairs.iter().filter(|(a, _, _)| a.eq_ignore_ascii_case(k)).map(|(_, v, _)| v.clone()).collect::<Vec<String>>();
+    let subjects = values("Subject");
+    if subjects.len() > 1 {
+        return Err(format!("names {} subjects for the client's certificate, so who calls is not certain", subjects.len()));
+    }
+    let subject = subjects.into_iter().next().unwrap_or_default();
+    let uris: Vec<String> = values("URI").into_iter().filter(|u| !u.is_empty()).collect();
+    if uris.len() > 1 {
+        return Err(format!("names {} URIs for the client's certificate: a SPIFFE id is one (an X.509-SVID has exactly one), so who calls is not certain", uris.len()));
+    }
+    let uri = uris.into_iter().next();
+    // Only a SPIFFE id names the caller; another URI is shown, and the CN names it, read clearly.
+    // `URI=https://victim.example/;DNS=x` is what Envoy writes for a URI with `;DNS=x` in it, and
+    // for a URI and a DNS name: a name of the victim's, had any URI named the caller
+    // (FEEDBACK71.md, Q-1000; branch security).
+    let name = match &uri {
+        Some(u) if u.starts_with("spiffe://") => u.clone(),
+        _ => cn_of(&subject_attrs(&subject)?)?,
     };
-    let subject = field("Subject").unwrap_or_else(|| if last.contains(';') { String::new() } else { last.to_string() });
-    let uri = field("URI");
-    let cn = subject.split([',', '/']).find_map(|p| p.trim().strip_prefix("CN=").map(str::to_string));
-    let name = uri.as_deref().and_then(|u| u.rsplit('/').next()).map(str::to_string).filter(|n| !n.is_empty()).or(cn)?;
     let mut extra: Vec<(&'static str, Value)> = vec![("subject", Value::str(subject.as_str()))];
     if let Some(u) = uri {
         extra.push(("uri", Value::str(u.as_str())));
     }
-    Some((name, extra))
+    Ok((name, extra))
+}
+
+/// `client_cert: { header, subject: true }`: the header is the certificate's subject alone, in
+/// RFC 2253's form, as nginx's `proxy_set_header X-Client-DN $ssl_client_s_dn` sets it. Read
+/// whole: `CN=evil,OU=x,CN=shop` is two CNs. Which form a header is in is the program's to say,
+/// never the header's: guessed from its first key, a client's own `/CN=shop/O=` before Envoy's
+/// appended `,Hash=...` made the whole header a subject that named shop (FEEDBACK71.md, Q-1000;
+/// branch security).
+pub fn subject_caller(subject: &str) -> Result<(String, Vec<(&'static str, Value)>), String> {
+    let attrs = subject_attrs(subject)?;
+    if let Some((t, _, _)) = attrs.iter().find(|(t, _, _)| ENVOY_KEYS.iter().any(|k| k.eq_ignore_ascii_case(t))) {
+        return Err(format!("is a subject with `{}` in it, one of Envoy's keys: is it Envoy's header (no `subject: true`)?", t));
+    }
+    Ok((cn_of(&attrs)?, vec![("subject", Value::str(subject))]))
+}
+
+/// An element as Envoy writes one: its keys only, in its order, quoted where it quotes (`Cert`,
+/// `Chain`, `Subject`) and nowhere else, and each URI one that cannot have ended early (Q-1000).
+fn envoy_element(pairs: &[(String, String, bool)]) -> Result<(), String> {
+    let mut last = 0;
+    for (k, v, quoted) in pairs {
+        let Some(rank) = ENVOY_KEYS.iter().position(|e| e.eq_ignore_ascii_case(k)) else {
+            return Err(format!("has `{}`, a key Envoy does not write (By, Hash, Cert, Chain, Subject, URI, DNS)", k.chars().take(40).collect::<String>()));
+        };
+        if rank < last {
+            return Err("has its keys out of Envoy's order (By, Hash, Cert, Chain, Subject, URI, DNS): a pair the proxy did not write?".into());
+        }
+        last = rank;
+        if *quoted && matches!(rank, 0 | 1 | 5 | 6) {
+            return Err(format!("quotes `{}`, which Envoy writes bare", ENVOY_KEYS[rank]));
+        }
+        // Envoy quotes these always: a `Subject=CN=ops` after a comma in a name was no proxy's.
+        if !*quoted && matches!(rank, 2..=4) {
+            return Err(format!("writes `{}` bare, which Envoy quotes", ENVOY_KEYS[rank]));
+        }
+        if rank == 5 && !v.is_empty() {
+            let spiffe = v.get(..9).is_some_and(|s| s.eq_ignore_ascii_case("spiffe://"));
+            if spiffe {
+                spiffe_id(v)?;
+            } else if let Some(c) = v.chars().find(|c| matches!(c, ',' | ';' | '=' | '"' | '\\') || c.is_whitespace()) {
+                return Err(format!("gives a URI with `{}` in it: Envoy writes it bare, so where it ends is not certain", c.escape_debug()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A SPIFFE id as the SPIFFE ID spec writes one: `spiffe://` in lower case, a trust domain of
+/// `[a-z0-9.-_]`, path segments of `[a-zA-Z0-9.-_]`, none empty, `.` or `..`, no query, fragment,
+/// port or user, and 2,048 bytes at most (Q-1000).
+fn spiffe_id(u: &str) -> Result<(), String> {
+    let bad = |why: &str| Err(format!("gives `{}`, which is not a SPIFFE id: {}", u.chars().take(80).collect::<String>(), why));
+    let Some(rest) = u.strip_prefix("spiffe://") else { return bad("its scheme is `spiffe`, in lower case") };
+    if u.len() > 2048 {
+        return bad("it is longer than 2,048 bytes");
+    }
+    let (domain, path) = match rest.split_once('/') {
+        Some((d, p)) => (d, Some(p)),
+        None => (rest, None),
+    };
+    if domain.is_empty() || !domain.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_')) {
+        return bad("its trust domain is lower-case letters, digits, `.`, `-` and `_`");
+    }
+    for seg in path.map(|p| p.split('/').collect::<Vec<&str>>()).unwrap_or_default() {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return bad("a part of its path is empty, `.` or `..`");
+        }
+        if !seg.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')) {
+            return bad("its path is letters, digits, `.`, `-` and `_`, between slashes");
+        }
+    }
+    Ok(())
+}
+
+/// A certificate's subject's attributes, each its type, its value with its escapes decoded
+/// (`Acme\, Inc.` is `Acme, Inc.`) and whether it was in hex, read in the form it is written in:
+/// RFC 4514's (`CN=shop,O=Acme\, Inc.`, what Envoy sends, RFC 2253's spaces around `,` `+` `=`
+/// allowed). `cn_of` takes the CN attribute itself: one, not empty, and with no `:`.
+///
+/// The CN was the first piece after a `,` or a `/` that began `CN=`, wherever it was: an OU of
+/// `a/CN=shop`, written ahead of the CN, named the caller shop (FEEDBACK71.md, Q-989; branch
+/// security).
+fn subject_attrs(subject: &str) -> Result<Vec<(String, String, bool)>, String> {
+    // OpenSSL's slash form is not read: its printers escape `/` and `+` in a value or not, and
+    // join an RDN's attributes with `+`, so `/O=x\/CN=admin` and `/CN=shop+OU=x` have no one
+    // reading (FEEDBACK71.md, Q-989; branch security).
+    if subject.starts_with('/') {
+        return Err("gives the subject in OpenSSL's slash form (`/O=.../CN=...`), which has no one reading: send it as RFC 2253 writes it (`CN=...,O=...`; nginx's `$ssl_client_s_dn`, not `$ssl_client_s_dn_legacy`)".into());
+    }
+    rfc4514_subject(subject)
+}
+
+/// The one CN among a subject's attributes (`subject_attrs`).
+fn cn_of(attrs: &[(String, String, bool)]) -> Result<String, String> {
+    let cns: Vec<&(String, String, bool)> = attrs.iter().filter(|(t, _, _)| t.eq_ignore_ascii_case("CN") || t.eq_ignore_ascii_case("commonName") || t == "2.5.4.3").collect();
+    match cns.as_slice() {
+        [] => Err("names no certificate's subject".into()),
+        [(_, _, true)] => Err("gives the subject's CN in hex (`#...`), which is not read".into()),
+        [(_, v, _)] if v.is_empty() => Err("gives an empty CN".into()),
+        // `CN=spiffe://td/ns/prod/sa/admin` passed a `for` that names that id (Q-989).
+        [(_, v, _)] if v.contains(':') => Err("gives a CN with `:` in it, which could pass for a URI's name: it names no caller".into()),
+        [(_, v, _)] => Ok(v.clone()),
+        more => Err(format!("gives {} CNs in the certificate's subject, so who calls is not certain", more.len())),
+    }
+}
+
+/// An attribute's type, as RFC 4514 writes one: a name (`CN`, `emailAddress`) or an OID.
+fn attribute_type(t: &str) -> Result<String, String> {
+    let name = t.starts_with(|c: char| c.is_ascii_alphabetic()) && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    let oid = !t.is_empty() && t.chars().all(|c| c.is_ascii_digit() || c == '.');
+    if name || oid {
+        Ok(t.to_string())
+    } else {
+        Err(format!("gives a subject that does not parse: `{}` is no attribute's type", t.chars().take(40).collect::<String>()))
+    }
+}
+
+/// RFC 4514's form: each attribute's type, its value decoded, and whether it was in hex (`#...`).
+fn rfc4514_subject(s: &str) -> Result<Vec<(String, String, bool)>, String> {
+    let bad = |why: &str| Err(format!("gives a subject that does not parse: {}", why));
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    if s.trim().is_empty() {
+        return Ok(out);
+    }
+    let mut i = 0;
+    loop {
+        let from = i;
+        while i < b.len() && !matches!(b[i], b'=' | b',' | b'+' | b'\\') {
+            i += 1;
+        }
+        if i == b.len() || b[i] != b'=' {
+            return bad("an attribute is not type=value");
+        }
+        let ty = attribute_type(s[from..i].trim())?;
+        i += 1;
+        while i < b.len() && b[i] == b' ' {
+            i += 1;
+        }
+        let hex = b.get(i) == Some(&b'#');
+        // The value's bytes, and how many are kept: unescaped spaces at its end are not its.
+        let (mut v, mut keep) = (Vec::new(), 0);
+        while i < b.len() && !matches!(b[i], b',' | b'+') {
+            match b[i] {
+                b'\\' => {
+                    let hexval = |c: u8| (c as char).to_digit(16);
+                    match (b.get(i + 1).copied(), b.get(i + 2).copied()) {
+                        (Some(h), Some(l)) if hexval(h).is_some() && hexval(l).is_some() => {
+                            v.push((hexval(h).unwrap_or(0) * 16 + hexval(l).unwrap_or(0)) as u8);
+                            i += 3;
+                        }
+                        (Some(c), _) if b"\\\"+,;<> #=".contains(&c) => {
+                            v.push(c);
+                            i += 2;
+                        }
+                        _ => return bad("a backslash escapes nothing RFC 4514 escapes"),
+                    }
+                    keep = v.len();
+                }
+                c @ (b'"' | b';' | b'<' | b'>') => return bad(&format!("`{}` in a value, not escaped", c as char)),
+                c => {
+                    v.push(c);
+                    i += 1;
+                    if c != b' ' {
+                        keep = v.len();
+                    }
+                }
+            }
+        }
+        v.truncate(keep);
+        let Ok(v) = String::from_utf8(v) else { return bad("a value that is not UTF-8") };
+        out.push((ty, v, hex));
+        if i == b.len() {
+            return Ok(out);
+        }
+        i += 1;
+    }
+}
+
+/// Envoy's `x-forwarded-client-cert`, read as it is written: elements split by `,`, an element's
+/// pairs by `;`, outside a value's quotes; a pair is `key=value`, a value with `,`, `;` or `=` in
+/// it in quotes, where a backslash takes the next character as it is (`\"` and `\\`, and the
+/// subject's own RFC 2253 escapes, as `\,` in `O=Acme\, Inc.`). Each element's text and its pairs,
+/// a value as written between its quotes, and whether it was in quotes.
+///
+/// A quote was open or shut at each `"`, escaped or not, so an element of the client's (Envoy's
+/// `APPEND_FORWARD` keeps those it was sent, before its own) with a quote it never closed made
+/// the proxy's own element part of one of its values: `URI=spiffe://.../sa/shop;X="` before it
+/// named the caller shop (FEEDBACK71.md, Q-988; branch security). Now a quote not closed, a
+/// backslash outside one or a part that is not `key=value` refuses the header: the proxy's
+/// element is read only as it would be alone.
+fn xfcc(header: &str) -> Result<Vec<(&str, Vec<(String, String, bool)>)>, String> {
+    let mut elements = Vec::new();
+    let (mut quoted, mut escaped) = (false, false);
+    let (mut from, mut pair_from) = (0, 0);
+    let mut pairs: Vec<&str> = Vec::new();
+    for (i, c) in header.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if quoted => escaped = true,
+            '\\' => return Err("has a backslash outside a quoted value".into()),
+            '"' => quoted = !quoted,
+            ';' | ',' if !quoted => {
+                pairs.push(&header[pair_from..i]);
+                pair_from = i + 1;
+                if c == ',' {
+                    elements.push((&header[from..i], std::mem::take(&mut pairs)));
+                    from = i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    if quoted || escaped {
+        return Err("has a quote that is not closed, so where the proxy's own part begins is not certain".into());
+    }
+    pairs.push(&header[pair_from..]);
+    elements.push((&header[from..], pairs));
+    let mut out = Vec::new();
+    if header.is_empty() {
+        return Ok(out);
+    }
+    for (text, parts) in elements {
+        let mut kv = Vec::new();
+        // Nothing trimmed and nothing passed over: Envoy writes no space around `;`, `,` or `=`,
+        // and no empty part or element, so `URI=spiffe://.../admin;DNS=x`, `...admin;`,
+        // `...admin, ,` and a space after one were a URI cut short and read as whole
+        // (FEEDBACK71.md, Q-1000; branch security).
+        for p in parts {
+            if p.is_empty() {
+                return Err("has an empty part or element, which Envoy never writes".into());
+            }
+            let Some((k, v)) = p.split_once('=').filter(|(k, _)| !k.contains('"') && !k.is_empty()) else {
+                return Err("has a part that is not key=value".into());
+            };
+            if [k.chars().next(), k.chars().last(), v.chars().next(), v.chars().last()].into_iter().flatten().any(char::is_whitespace) {
+                return Err("has a space around a `;`, `,` or `=`, which Envoy never writes".into());
+            }
+            // Quotes around the whole value only, and none unescaped inside.
+            let (inner, quoted) = match v.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+                Some(inner) => (inner, true),
+                None if v.contains('"') => return Err("has a quote inside a value that is not quoted whole".into()),
+                None => (v, false),
+            };
+            let mut esc = false;
+            for c in inner.chars() {
+                match c {
+                    _ if esc => esc = false,
+                    '\\' => esc = true,
+                    '"' => return Err("has a quote inside a value that is not quoted whole".into()),
+                    _ => {}
+                }
+            }
+            kv.push((k.to_string(), inner.to_string(), quoted));
+        }
+        out.push((text, kv));
+    }
+    Ok(out)
 }
 
 // ---- JWT access tokens (RFC 9068), checked against a JWKS (RFC 7517) or a secret ---------------

@@ -1728,7 +1728,10 @@ Every HTTP status is a response; failing to connect is an error value, and so is
 that is not `http://` or `https://`. The functions: `http.get(url, headers, options)`,
 `http.delete(url, headers, options)`, `http.post(url, body, headers, options)`,
 `http.put` and `http.patch` as `post`, and `http.request(method, url, body, headers,
-options)`. The answer is `{ status, ok, headers, body, json, cookies }`: `ok` for a 2xx,
+options)`. A method is an HTTP token (letters, digits and ``!#$%&'*+-.^_`|~``), sent in
+upper case; another (a space, a line break, an empty one) is an error value before anything
+is sent, `http.stream`'s `method` too (`http: not an HTTP method: "GET\r\nX: y"`). The
+answer is `{ status, ok, headers, body, json, cookies }`: `ok` for a 2xx,
 header names in lower case, a header sent more than once joined with `, ` (two `Link`s are
 one `</x>; rel=a, </y>; rel=b`), `set-cookie`'s lines joined by a line break, as they
 cannot be by a comma, and also given one by one in `cookies`, a list; `body` as text
@@ -1769,14 +1772,16 @@ http.get(url, {}, { timeout: 5 })                   // an error value after 5 se
   too, before it is followed. A call refused is an error value: `http: example.com is not
   among the hosts quillo.policy allows: api.stripe.com, *.mapbox.com`.
 - `cache: seconds` (a GET's, up to a day) keeps a successful answer and gives it again to
-  the same call, the same URL, headers and options, from any request, until then. Calls
+  the same call, the same method, URL, headers, body and every option (`ca`, `cert`, `key`,
+  `timeout`, `redirects`, `public_only`, `cache`), from any request, until then: a call with
+  another client certificate, or none, is asked again. Calls
   to a site that limits how often it is asked, or that charges for each, then go out once
   for everyone: `cache: 60` on the rates above asks once a minute however many pages
   show them. Failures are not kept, nor answers over 16 MiB. At most 64 MiB of answers
   are, those that end soonest going first. On a method other than GET, and in
   `http.stream`, `cache` is an error.
 - `timeout: seconds` (more than 0, up to 300; `0.5` too) is how long the whole call may
-  take: then it gives an error value (`... took more than 5 s (its timeout)`). Unless given,
+  take, its redirects included: then it gives an error value (`... took more than 5 s (its timeout)`). Unless given,
   a call has 10 seconds to connect and 60 in all; `http.stream`, 300 seconds of silence
   between pieces. A page that waits on a slow service waits that long.
 

@@ -74,9 +74,12 @@ struct Opts {
     /// The certificates a call trusts and presents (`ca`, `cert`, `key`), by their number in
     /// `TLS` (0: the usual public CAs, and none presented).
     tls: u32,
+    /// A `site`'s call (src/sites.rs), no option of the program's: a redirect to another origin,
+    /// or to what is not http(s), is not followed but is the answer.
+    same_origin: bool,
 }
 
-const DEFAULT_OPTS: Opts = Opts { redirects: 5, public_only: false, cache: 0, timeout_ms: 0, tls: 0 };
+const DEFAULT_OPTS: Opts = Opts { redirects: 5, public_only: false, cache: 0, timeout_ms: 0, tls: 0, same_origin: false };
 
 /// The options there are; `http.stream`'s map also has its request's.
 const OPTION_NAMES: &[&str] = &["redirects", "public_only", "cache", "timeout", "ca", "cert", "key"];
@@ -242,7 +245,7 @@ fn opts_of(v: Option<&Value>, fname: &str, line: u32, base: &std::path::Path) ->
     if cert.is_some() != key.is_some() {
         return fail(line, format!("`{}`: `cert` and `key` go together: a certificate, and its key", fname));
     }
-    Ok(Opts { redirects, public_only, cache, timeout_ms, tls: tls_number(ca, cert, key) })
+    Ok(Opts { redirects, public_only, cache, timeout_ms, tls: tls_number(ca, cert, key), same_origin: false })
 }
 
 /// The server's own network is not where a component's calls go (see the
@@ -374,8 +377,9 @@ struct Reply {
     body: String,
 }
 
-/// One call: its answer, the head read, the body not yet.
-fn call(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, String)], body: Option<&(String, Vec<u8>)>) -> Result<ureq::Response, String> {
+/// One call: its answer, the head read, the body not yet. `left`: what is left of the whole
+/// call's `timeout`.
+fn call(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, String)], body: Option<&(String, Vec<u8>)>, left: Option<Duration>) -> Result<ureq::Response, String> {
     if o.public_only && proxy_for(url).is_some() {
         // The host and port the client will ask the proxy for.
         let u = url::Url::parse(url).map_err(|e| format!("{}: {}", url, e))?;
@@ -386,8 +390,8 @@ fn call(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, Stri
         resolve_public(&at).map_err(|e| timed_out(o, url, format!("{}: {}", url, e)))?;
     }
     let mut req = agent(o, stream, url)?.request(method, url);
-    if o.timeout_ms > 0 {
-        req = req.timeout(Duration::from_millis(o.timeout_ms as u64));
+    if let Some(left) = left {
+        req = req.timeout(left);
     }
     for (k, v) in headers {
         req = req.set(k, v);
@@ -414,16 +418,25 @@ fn call(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, Stri
 /// `301`, `302` or `303` after a write as a GET. To another origin (scheme, host and port), the
 /// program's headers stay behind but for those that say what it takes (`accept`, `user-agent`,
 /// ...): `x-api-key` went on to another port (FEEDBACK51.md, Q-649; branch feedback51-fixes).
-fn follow(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, String)], body: Option<(String, Vec<u8>)>) -> Result<(String, ureq::Response), String> {
+/// A site's call (`same_origin`) puts the `Set-Cookie`s of each answer it went past in `passed`.
+fn follow(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, String)], body: Option<(String, Vec<u8>)>, passed: &mut Vec<String>) -> Result<(String, ureq::Response), String> {
     let mut url = url.to_string();
     let mut headers = headers.to_vec();
     let mut hops = 0;
     let (mut method, mut body) = (method.to_string(), body);
+    // `timeout` is the whole call's, its redirects in it: each had all of it, so a site's 30 s
+    // were 180 over 5 redirects, where the client it had kept one (FEEDBACK71.md, Q-973; branch
+    // security).
+    let until = (o.timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(o.timeout_ms as u64));
     loop {
         // Each address, the first and each one it is sent on to (FEEDBACK41.md, Q-478; branch
         // feedback40-43).
         crate::policy::get().http(&url)?;
-        let resp = call(o, stream, &method, &url, &headers, body.as_ref())?;
+        let left = match until.map(|u| u.saturating_duration_since(Instant::now())) {
+            Some(d) if d.is_zero() => return Err(timed_out(o, &url, "timed out".into())),
+            left => left,
+        };
+        let resp = call(o, stream, &method, &url, &headers, body.as_ref(), left)?;
         let status = resp.status();
         let again = o.redirects > 0 && matches!(status, 301 | 302 | 303 | 307 | 308);
         // As browsers do: a 301, 302 or 303 after anything but a GET or a HEAD is a GET with no
@@ -434,7 +447,15 @@ fn follow(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, St
             headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type") && !k.eq_ignore_ascii_case("content-length"));
         }
         let next = if again { resp.header("location").and_then(|l| join_url(&url, l)) } else { None };
+        // A site's call goes on only within the site: its server sent Quillo anywhere, inside the
+        // network too, and the start of what was there came back in the error (FEEDBACK71.md,
+        // Q-973; branch security).
+        let next = next.filter(|n| !o.same_origin || origin_of(n) == origin_of(&url));
         let Some(next) = next else { return Ok((url, resp)) };
+        // A site's own cookies, set on the way: every answer here is from its origin (Q-973).
+        if o.same_origin {
+            passed.extend(resp.all("set-cookie").into_iter().map(str::to_string));
+        }
         hops += 1;
         if hops > o.redirects {
             return Err(format!("{}: more than {} redirects", url, o.redirects));
@@ -466,16 +487,36 @@ fn too_long(url: &str) -> String {
 }
 
 fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Option<(String, Vec<u8>)>) -> Result<Reply, String> {
-    let (url, resp) = follow(o, false, method, url, headers, body)?;
-    let (status, headers, cookies, reader) = head_of(o, &url, method, resp)?;
+    let mut passed = Vec::new();
+    let (url, resp) = follow(o, false, method, url, headers, body, &mut passed)?;
+    let (status, headers, last, reader) = head_of(o, &url, method, resp)?;
+    // Those set on the way first, so that the last answer's have the last word.
+    passed.extend(last);
+    let cookies = passed;
     let mut bytes = Vec::new();
     reader.take(MAX_BODY + 1).read_to_end(&mut bytes).map_err(|e| timed_out(o, &url, e.to_string()))?;
     // A longer one is an error, where it was cut at the limit and said nothing: cut JSON was
     // `json: null` (FEEDBACK49.md, Q-599; branch main).
     if bytes.len() as u64 > MAX_BODY {
-        return Err(too_long(&url));
+        // A site's call has no `http.stream` to read it with (FEEDBACK71.md, Q-973; branch
+        // security).
+        return Err(if o.same_origin { format!("{}: the answer is longer than {} MiB, the most a site's call reads", url, MAX_BODY >> 20) } else { too_long(&url) });
     }
     Ok(Reply { status, headers, cookies, body: String::from_utf8_lossy(&bytes).into_owned() })
+}
+
+/// A `site`'s call (src/sites.rs), `POST url` with `body` as JSON, made as every call here is:
+/// the host's policy judges each address, the client follows no redirect itself and a `file:`
+/// one is no crash, through the environment's proxy, saying `User-Agent: quillo/<version>`, and
+/// an answer over 64 MiB is an error. It has 10 s to connect and 30 in all, redirects too, and
+/// follows up to 5 redirects on the site's own origin; one elsewhere is the answer. Its status,
+/// headers, body, and the `Set-Cookie`s of each answer on the way and of the last, all from the
+/// site's origin. A site's call built a client of its own, which none of that held for
+/// (FEEDBACK71.md, Q-973; branch security).
+pub(crate) fn site_post(url: &str, headers: &[(String, String)], body: Vec<u8>) -> Result<(u16, Vec<(String, String)>, Vec<String>, String), String> {
+    let o = Opts { timeout_ms: 30_000, same_origin: true, ..DEFAULT_OPTS };
+    let r = send(o, "POST", url, headers, Some(("application/json".into(), body)))?;
+    Ok((r.status, r.headers, r.cookies, r.body))
 }
 
 /// An answer's status, headers, `Set-Cookie`s and body.
@@ -675,10 +716,24 @@ fn cache() -> std::sync::MutexGuard<'static, (HashMap<String, Cached>, usize)> {
     CACHE.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn cache_key(o: Opts, method: &str, url: &str, headers: &[(String, String)]) -> String {
-    let mut hs: Vec<String> = headers.iter().map(|(k, v)| format!("{}:{}", k.to_ascii_lowercase(), v)).collect();
+/// The same call: its method, URL, headers, body and every option, each part apart, hashed. The
+/// certificates left out, one client certificate's answer was given to calls with another, or
+/// none, which could not even connect; a GET's body left out, one query's answer was given to
+/// another; and parts joined by spaces and line breaks, a URL with a line break in it (which
+/// the client drops) was the same call as one with headers that held the rest (FEEDBACK71.md,
+/// Q-974; branch security). Each option is named, so that one added later cannot be left out.
+fn cache_key(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Option<&(String, Vec<u8>)>) -> String {
+    let Opts { redirects, public_only, cache, timeout_ms, tls, same_origin } = o;
+    let opts = format!("{} {} {} {} {} {}", redirects, public_only, cache, timeout_ms, tls, same_origin);
+    let mut hs: Vec<(String, &str)> = headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.as_str())).collect();
     hs.sort();
-    format!("{} {} {} {}\n{}", method, url, o.redirects, o.public_only, hs.join("\n"))
+    let (ctype, bytes) = body.map_or(("", &[][..]), |(t, b)| (t.as_str(), b.as_slice()));
+    let mut parts: Vec<&[u8]> = vec![method.as_bytes(), url.as_bytes(), opts.as_bytes(), if body.is_some() { b"body" } else { b"none" }, ctype.as_bytes(), bytes];
+    for (k, v) in &hs {
+        parts.push(k.as_bytes());
+        parts.push(v.as_bytes());
+    }
+    crate::idempotency::sha256_hex(&parts)
 }
 
 fn cached(key: &str) -> Option<Reply> {
@@ -753,7 +808,7 @@ fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Va
         Value::Html(h) => Some(("text/html; charset=utf-8".into(), h.as_bytes().to_vec())),
         other => Some(("application/json".into(), other.json_text().into_bytes())),
     };
-    let key = (o.cache > 0).then(|| cache_key(o, method, url, &hdrs));
+    let key = (o.cache > 0).then(|| cache_key(o, method, url, &hdrs, payload.as_ref()));
     let reply = match key.as_deref().and_then(cached) {
         Some(r) => r,
         None => {
@@ -814,17 +869,36 @@ fn patch(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 /// `http.request(method, url, body = null, headers = {}, options = {})`
 fn request(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    // Judged as written, and said so: upper case changes no character's kind.
     let method = match a(&args, 0) {
-        Value::Str(m) => m.to_ascii_uppercase(),
+        Value::Str(m) => match not_a_method(&m) {
+            Some(e) => return Ok(e),
+            None => m.to_ascii_uppercase(),
+        },
         other => return fail(line, format!("`http.request` expects a method string first, got {}", other.type_name())),
     };
     do_request(it, "http.request", &method, &a(&args, 1), &a(&args, 2), &a(&args, 3), args.get(4), line)
 }
 
+/// The error value for a method that is not an HTTP token (RFC 9110 §9.1 and §5.6.2: letters,
+/// digits and ``!#$%&'*+-.^_`|~``, at least one), before anything connects. The client writes
+/// the method into the request line as it is given, so one with a line break in it wrote
+/// headers, and a whole second request, of whoever chose it (FEEDBACK71.md, Q-972; branch
+/// security).
+fn not_a_method(m: &str) -> Option<Value> {
+    let token = !m.is_empty() && m.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+    if token {
+        return None;
+    }
+    let shown: String = m.chars().take(40).collect();
+    let more = if m.chars().count() > 40 { "..." } else { "" };
+    Some(Value::err(Value::str(format!("http: not an HTTP method: {:?}{} (a method is letters, digits and !#$%&'*+-.^_`|~)", shown, more))))
+}
+
 type Body = Box<dyn Read + Send + Sync>;
 
 fn open(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Option<(String, Vec<u8>)>) -> Result<Head, String> {
-    let (url, resp) = follow(o, true, method, url, headers, body)?;
+    let (url, resp) = follow(o, true, method, url, headers, body, &mut Vec::new())?;
     head_of(o, &url, method, resp)
 }
 
@@ -983,7 +1057,10 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     let body = opts.get("body").cloned().unwrap_or(Value::Nil);
     let method = match opts.get("method") {
-        Some(Value::Str(m)) => m.to_ascii_uppercase(),
+        Some(Value::Str(m)) => match not_a_method(m) {
+            Some(e) => return Ok(e),
+            None => m.to_ascii_uppercase(),
+        },
         _ if !matches!(body, Value::Nil) => "POST".into(),
         _ => "GET".into(),
     };
@@ -1081,6 +1158,76 @@ mod tests {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         assert!(!public_ip(ip("64:ff9b:1::a00:1")) && !public_ip(ip("64:ff9b:1:ffff::808:808")));
         assert!(public_ip(ip("64:ff9b::808:808")) && !public_ip(ip("64:ff9b::a00:1")) && public_ip(ip("64:ff9c::1")) && public_ip(ip("64:ff9b:2::1")));
+    }
+
+    // Every option is in a cached answer's key: another certificate, none, another CA, another
+    // timeout or another `cache` is another call (FEEDBACK71.md, Q-974; branch security).
+    #[test]
+    fn a_cached_answer_is_kept_apart_by_every_option() {
+        let tls = |ca: Option<&str>, cert: Option<&str>, key: Option<&str>| tls_number(ca.map(String::from), cert.map(String::from), key.map(String::from));
+        let alice = Opts { tls: tls(Some("ca.pem"), Some("alice.pem"), Some("alice.key")), ..DEFAULT_OPTS };
+        let bob = Opts { tls: tls(Some("ca.pem"), Some("bob.pem"), Some("bob.key")), ..DEFAULT_OPTS };
+        let ca_only = Opts { tls: tls(Some("ca.pem"), None, None), ..DEFAULT_OPTS };
+        let system = Opts { tls: tls(Some("system"), None, None), ..DEFAULT_OPTS };
+        let all = [
+            alice,
+            bob,
+            ca_only,
+            system,
+            DEFAULT_OPTS,
+            Opts { timeout_ms: 5000, ..DEFAULT_OPTS },
+            Opts { timeout_ms: 5001, ..DEFAULT_OPTS },
+            Opts { cache: 10, ..DEFAULT_OPTS },
+            Opts { cache: 60, ..DEFAULT_OPTS },
+            Opts { redirects: 0, ..DEFAULT_OPTS },
+            Opts { public_only: true, ..DEFAULT_OPTS },
+            Opts { same_origin: true, ..DEFAULT_OPTS },
+        ];
+        let url = "https://127.0.0.1:4863/balance";
+        let keys: std::collections::HashSet<String> = all.iter().map(|o| cache_key(*o, "GET", url, &[], None)).collect();
+        assert_eq!(keys.len(), all.len(), "each option apart");
+        // The same settings again are the same call: the same entry of `TLS`, and the same key.
+        let again = Opts { tls: tls(Some("ca.pem"), Some("alice.pem"), Some("alice.key")), ..DEFAULT_OPTS };
+        assert_eq!(again.tls, alice.tls);
+        assert_eq!(cache_key(again, "GET", url, &[], None), cache_key(alice, "GET", url, &[], None));
+        assert_eq!(tls(None, None, None), 0, "no TLS settings: the usual CAs");
+        // Headers in any order and any case of their names are the same call; their values not.
+        let h = |v: &[(&str, &str)]| v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+        assert_eq!(cache_key(alice, "GET", url, &h(&[("A", "1"), ("b", "2")]), None), cache_key(alice, "GET", url, &h(&[("b", "2"), ("a", "1")]), None));
+        assert_ne!(cache_key(alice, "GET", url, &h(&[("a", "1")]), None), cache_key(alice, "GET", url, &h(&[("a", "2")]), None));
+        // A GET's body, and its type, are the call too; none is not an empty one.
+        let body = |t: &str, b: &str| Some((t.to_string(), b.as_bytes().to_vec()));
+        let with = |b: &Option<(String, Vec<u8>)>| cache_key(alice, "GET", url, &[], b.as_ref());
+        let bodies = [None, body("text/plain; charset=utf-8", ""), body("text/plain; charset=utf-8", "query-for-alice"), body("text/plain; charset=utf-8", "query-for-bob"), body("application/json", "query-for-alice")];
+        let keys: std::collections::HashSet<String> = bodies.iter().map(with).collect();
+        assert_eq!(keys.len(), bodies.len());
+        assert_eq!(with(&body("application/json", "1")), with(&body("application/json", "1")));
+        // Parts kept apart: what one part ends with is never the next one's start.
+        let u1 = format!("{} 5 false 60 0 0 false\nk:v", url);
+        assert_ne!(cache_key(DEFAULT_OPTS, "GET", &u1, &h(&[("z", "1")]), None), cache_key(DEFAULT_OPTS, "GET", url, &h(&[("k", "v 5 false 60 0 0 false"), ("z", "1")]), None));
+        assert_ne!(cache_key(DEFAULT_OPTS, "GET", url, &h(&[("a:b", "c")]), None), cache_key(DEFAULT_OPTS, "GET", url, &h(&[("a", "b:c")]), None));
+        assert_ne!(cache_key(DEFAULT_OPTS, "GET", url, &h(&[("a", "1\nb:2")]), None), cache_key(DEFAULT_OPTS, "GET", url, &h(&[("a", "1"), ("b", "2")]), None));
+        assert_eq!(cache_key(DEFAULT_OPTS, "GET", url, &[], None).len(), 64, "a hash: the key's size does not grow with the call");
+    }
+
+    // A method is an HTTP token, or an error value before anything connects (FEEDBACK71.md,
+    // Q-972; branch security).
+    #[test]
+    fn a_method_is_an_http_token() {
+        let said = |v: Option<Value>| match v {
+            Some(Value::Err(e, ..)) => e.display(),
+            other => format!("not an error: {:?}", other.map(|v| v.repr())),
+        };
+        for m in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT", "PROPFIND", "M-SEARCH", "X", "9", "!#$%&'*+-.^_`|~", &"A".repeat(10_000)] {
+            assert!(not_a_method(m).is_none(), "{}", m);
+        }
+        for m in ["", " ", "GET ", " GET", "GE T", "GET\r\nX-Injected: yes", "GET\n", "GET\r", "G\tET", "GÉT", "ПОСТ", "GET\0", "(GET)", "GET/", "GET:", "\"GET\"", "{GET}", "G@T", "G,T", "G;T", "G=T", "G?T", "G[T]", "G\\T", "\u{7f}"] {
+            let e = said(not_a_method(m));
+            assert!(e.starts_with("http: not an HTTP method: "), "{:?}: {}", m, e);
+        }
+        // Shown escaped, and cut short.
+        let e = said(not_a_method("GET /admin HTTP/1.1\r\nHost: internal\r\nX-Injected: yes"));
+        assert!(e.contains(r#""GET /admin HTTP/1.1\r\nHost: internal\r\nX-I"..."#), "{}", e);
     }
 
     // As the client reads a URL (found in review of FEEDBACK51.md, Q-650).

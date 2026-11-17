@@ -153,7 +153,8 @@ fn each_caller_has_a_key_and_a_server_fn_names_its_callers() {
     // A certificate a proxy checked, from a proxy --trust-proxy names (Q-462).
     let xfcc = "By=spiffe://x/billing;Hash=ab;Subject=\"CN=shop,O=Acme\";URI=spiffe://cluster.local/ns/prod/sa/shop";
     let r = call(bp, "billing", "whoami", &[("x-forwarded-client-cert", xfcc)]);
-    assert!(r.body.contains(r#""name":"shop","by":"mtls","subject":"CN=shop,O=Acme","uri":"spiffe://cluster.local/ns/prod/sa/shop""#), "{}", r.body);
+    // Named by the whole SPIFFE id (FEEDBACK71.md, Q-971, decided by the user 2026-11-17).
+    assert!(r.body.contains(r#""name":"spiffe://cluster.local/ns/prod/sa/shop","by":"mtls","subject":"CN=shop,O=Acme","uri":"spiffe://cluster.local/ns/prod/sa/shop""#), "{}", r.body);
     let r = call(bp, "billing", "whoami", &[("x-forwarded-client-cert", "Subject=\"CN=ops\"")]);
     assert!(r.body.contains(r#""name":"ops","by":"mtls""#), "{}", r.body);
     assert!(call(bp, "billing", "whoami", &[("x-forwarded-client-cert", "Hash=ab")]).body.contains("names no certificate's subject"));
@@ -472,8 +473,11 @@ fn signatures_and_identities_unit_by_unit() {
     assert_ne!(sign3("k", 1, "a", "f", "", "c", "shop", "shop", "100", "", b"[]"), sign3("k", 1, "a", "f", "", "c", "shop", "shop", "200", "", b"[]"), "the deadline is signed");
     assert_ne!(sign_answer("k", "c", 200, b"x"), sign_answer("k", "c", 500, b"x"));
     assert_eq!(cert_identity("Subject=\"CN=a,O=b\"").unwrap().0, "a");
-    assert_eq!(cert_identity("CN=plain").unwrap().0, "plain");
-    assert_eq!(cert_identity("By=x;URI=spiffe://c/ns/p/sa/svc,By=y;URI=spiffe://c/ns/p/sa/last").unwrap().0, "last", "the client's is the last");
+    // A subject alone is read only where `client_cert: { subject: true }` says the header is one
+    // (FEEDBACK71.md, Q-1000): Envoy's header names no one with it.
+    assert_eq!(subject_caller("CN=plain").unwrap().0, "plain");
+    assert!(cert_identity("CN=plain").is_none());
+    assert_eq!(cert_identity("By=x;URI=spiffe://c/ns/p/sa/svc,By=y;URI=spiffe://c/ns/p/sa/last").unwrap().0, "spiffe://c/ns/p/sa/last", "the client's is the last (named whole: FEEDBACK71.md, Q-971)");
     assert!(cert_identity("Hash=1").is_none());
     let rules = JwtRules { secret: Some("s".into()), audience: Some("a".into()), ..Default::default() };
     let t = |c: &str| format!("{}.{}", c, "x");
