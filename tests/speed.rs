@@ -306,7 +306,9 @@ fn a_scripts_names_are_its_own() {
     use quillo::sym::Sym;
     let mut it = quillo::Interp::new(".");
     it.load_source("let program_has_this = 1\n", "main.qwe").unwrap();
-    let run = |it: &mut quillo::Interp, src: &str, vars: Option<&quillo::value::Map>| quillo::script::run_script(it, src, vars).repr();
+    // `run_script` gives a `Result` since the memory stop passes through a script, as Q-977's
+    // decision has it (FEEDBACK71.md, Q-977; branch security).
+    let run = |it: &mut quillo::Interp, src: &str, vars: Option<&quillo::value::Map>| quillo::script::run_script(it, src, vars).unwrap_or_else(|_| panic!("the script stopped")).repr();
     for i in 0..300 {
         let src = format!("let speed_fresh_{i} = {i}\nlet speed_other_{i} = speed_fresh_{i} * 2\nspeed_other_{i} + 1");
         assert_eq!(run(&mut it, &src, None), (i * 2 + 1).to_string());
@@ -326,7 +328,7 @@ fn a_scripts_names_are_its_own() {
     assert!(Sym::known("speed_given_unused").is_none() && Sym::known("speed_given_a").is_none());
     // A lambda it makes is not given back: it would run without the script's limits
     // (FEEDBACK51.md, Q-670).
-    let f = quillo::script::run_script(&mut it, "(speed_arg) => speed_arg + 1", None);
+    let f = quillo::script::run_script(&mut it, "(speed_arg) => speed_arg + 1", None).unwrap_or_else(|_| panic!("the script stopped"));
     assert!(f.repr().contains("a script gives back no function"), "{}", f.repr());
     // The same script twice gives the same, and a builtin is a builtin.
     assert_eq!(run(&mut it, "let speed_n = [3, 1, 2]\nsort(speed_n)", None), "[1, 2, 3]");

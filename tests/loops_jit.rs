@@ -157,7 +157,9 @@ fn compiled_loops() {
     it.load_source("let r = 0\n", "main.qwe").unwrap();
     let before = quillo::jitloop::compiled();
     let r = quillo::script::run_script(&mut it, "let t = 0\nfor i in 0..600 {\n    t += 1\n}\nt", None);
-    assert_eq!(r.repr(), "600");
+    // `run_script` gives a `Result` since the memory stop passes through a script, as Q-977's
+    // decision has it (FEEDBACK71.md, Q-977; branch security).
+    assert_eq!(r.unwrap_or_else(|_| panic!("the script stopped")).repr(), "600");
     assert_eq!(quillo::jitloop::compiled(), before);
 }
 
