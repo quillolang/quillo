@@ -1402,7 +1402,7 @@ const SW_KIT: &str = r#"
   const shown = (r) => { const o = Object.assign({}, r); delete o.frame; return o; };
   // Each cache, its name's version as V and its session as S, with the paths it keeps (hashes as H);
   // not the list of the sessions dropped, nor the mark that the version's pages are all kept.
-  const kept = async () => {
+  const snap = async () => {
     const out = {};
     for (const n of await caches.keys()) {
       // Opened only if it is still there: opening one the worker just dropped makes it again,
@@ -1412,6 +1412,20 @@ const SW_KIT: &str = r#"
       if (k.length) out[n.replace(/:[0-9a-f]{16}/, ":V").replace(/:V:.+$/, ":V:S")] = k;
     }
     return out;
+  };
+  // What the worker keeps of a page it answered is written after it gives the page (its
+  // `waitUntil`), which on CI's debug build came after the frame's load, and a look then read the
+  // cache without the page: read once it has held for 100 ms, 2 s at most (a shown bug in the
+  // tests, run 44022675220; branch pwa).
+  const kept = async () => {
+    let was = JSON.stringify(await snap());
+    for (let i = 0; i < 20; i++) {
+      await tick(100);
+      const now = JSON.stringify(await snap());
+      if (now === was) break;
+      was = now;
+    }
+    return JSON.parse(was);
   };
   // The sessions the worker dropped, by name.
   const dropped = async (base = "") => { const r = await (await caches.open("quillo:" + base + ":gone")).match(base + "/_quillo/sw-dropped"); return r ? await r.json() : []; };
