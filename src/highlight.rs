@@ -225,11 +225,13 @@ fn route_path(s: &[char], b: usize) -> Option<(usize, usize)> {
     let mut at = skip(t);
     let first = s[f..t].iter().collect::<String>();
     // Past the tag of `route offline GET /menu` and `routes offline /docs` (FEEDBACK67.md, B.2;
-    // branch pwa).
+    // branch pwa), and `writes`'s, the two in either order (FEEDBACK70.md, Q-965; branch security).
     if first == "route" || first == "routes" {
-        let (f, t) = word(at);
-        if s[f..t].iter().copied().eq("offline".chars()) {
-            at = skip(t);
+        for _ in 0..2 {
+            let (f, t) = word(at);
+            if s[f..t].iter().copied().eq("offline".chars()) || s[f..t].iter().copied().eq("writes".chars()) {
+                at = skip(t);
+            }
         }
     }
     match first.as_str() {
@@ -406,33 +408,70 @@ pub(crate) fn mcp_tag(s: &[char], i: usize, j: usize) -> bool {
         }
 }
 
-/// Whether the `offline` from `i` to `j` is the tag of a route, as the parser reads it: right after
-/// `route` with a method after it, or after `routes` with a path after it, on its line; `offline`
-/// is a name everywhere else (FEEDBACK67.md, B.2; branch pwa).
+/// Whether the `offline` or `writes` from `i` to `j` is a tag of a route, as the parser reads it:
+/// after `route` (and the other tag), with a method after it (or the other tag, then the method),
+/// or after `routes` the same way with a group's path, on its line, each once; the two are names
+/// everywhere else (FEEDBACK67.md, B.2; branch pwa; FEEDBACK70.md, Q-965; branch security). Read
+/// from the word: back over spaces and at most two words, then only spaces before them, as
+/// `offline_tag` was, and ahead over at most one: reading each from the line's start was quadratic
+/// on a line of them (second review).
 #[inline(never)]
-pub(crate) fn offline_tag(s: &[char], i: usize, j: usize) -> bool {
-    let space = |c: &char| matches!(c, ' ' | '\t');
-    let mut b = i;
-    while b > 0 && space(&s[b - 1]) {
-        b -= 1;
-    }
-    let end = b;
-    while b > 0 && ident_char(s[b - 1], false) {
-        b -= 1;
-    }
-    let before: String = s[b..end].iter().collect();
-    let line_start = b == 0 || s[..b].iter().rev().take_while(|c| **c != '\n').all(space);
-    let at = s[j..].iter().position(|c| !space(c)).map(|k| j + k);
-    let after = at.map(|k| s[k]);
-    end < i
-        && line_start
-        && j < s.len()
-        && space(&s[j])
-        && match before.as_str() {
-            "route" => after.is_some_and(|c| c.is_ascii_uppercase()),
-            "routes" => after == Some('/'),
-            _ => false,
+pub(crate) fn route_tag(s: &[char], i: usize, j: usize) -> bool {
+    let space = |c: char| matches!(c, ' ' | '\t');
+    let word = |f: usize, t: usize, w: &str| s[f..t].iter().copied().eq(w.chars());
+    let tag = |f: usize, t: usize| (word(f, t, "offline") || word(f, t, "writes")) && s[f..t] != s[i..j];
+    // The word before `at`, past at least one space: where it starts and ends.
+    let before = |at: usize| {
+        let mut e = at;
+        while e > 0 && space(s[e - 1]) {
+            e -= 1;
         }
+        let mut b = e;
+        while b > 0 && ident_char(s[b - 1], false) {
+            b -= 1;
+        }
+        (e < at && b < e).then_some((b, e))
+    };
+    let Some((mut b, mut e)) = before(i) else { return false };
+    let mut other = false;
+    if tag(b, e) {
+        other = true;
+        let Some(w) = before(b) else { return false };
+        (b, e) = w;
+    }
+    let group = if word(b, e, "route") {
+        false
+    } else if word(b, e, "routes") {
+        true
+    } else {
+        return false;
+    };
+    if !s[..b].iter().rev().take_while(|c| **c != '\n').all(|c| space(*c)) {
+        return false;
+    }
+    // Ahead: spaces, the other tag once, then the method or the group's path.
+    let skip = |mut k: usize| {
+        let from = k;
+        while k < s.len() && space(s[k]) {
+            k += 1;
+        }
+        (k > from).then_some(k)
+    };
+    let Some(mut k) = skip(j) else { return false };
+    let mut t = k;
+    while t < s.len() && ident_char(s[t], false) {
+        t += 1;
+    }
+    if !other && t > k && tag(k, t) {
+        let Some(n) = skip(t) else { return false };
+        k = n;
+    }
+    let next = s.get(k).copied();
+    if group {
+        next == Some('/')
+    } else {
+        next.is_some_and(|c| c.is_ascii_uppercase())
+    }
 }
 
 fn ident_start(c: char) -> bool {
@@ -692,7 +731,7 @@ fn colour(code: &str, lang: &str, timed: bool) -> Option<String> {
                 } else {
                     None
                 }
-            } else if l.keywords.contains(&probe.as_str()) || (qwe && probe == "mcp" && mcp_tag(&s, i, j)) || (qwe && probe == "offline" && offline_tag(&s, i, j)) {
+            } else if l.keywords.contains(&probe.as_str()) || (qwe && probe == "mcp" && mcp_tag(&s, i, j)) || (qwe && (probe == "offline" || probe == "writes") && route_tag(&s, i, j)) {
                 Some("hl-k")
             } else if l.consts.contains(&probe.as_str()) {
                 Some("hl-n")

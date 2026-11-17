@@ -369,6 +369,10 @@ pub struct RouteDef {
     /// kept by Quillo's service worker, for when there is no network (FEEDBACK67.md, B.2; branch
     /// pwa).
     pub offline: bool,
+    /// `route writes GET /confirm/:code`, or a GET route in `routes writes /p { ... }`: the GET
+    /// writes on purpose, so `quillo check` does not warn that a link from another site runs its
+    /// write with the visitor's session (FEEDBACK70.md, Q-965; branch security).
+    pub writes: bool,
 }
 
 impl RouteDef {

@@ -80,7 +80,7 @@ route GET /desk/articles {
     <Desk title="Articles" me={u} on="Articles" wide={true}><ArticlesBoard me={u}/></Desk>
 }
 
-route GET /desk/a/:id(int) {
+route writes GET /desk/a/:id(int) {
     let u = signed_in(`/desk/a/${id}`)
     let a = article_row(id) ?? reply 404 <NotAllowed me={u} what="There is no such article, or it was deleted."/>
     <Desk title={a.title} me={u} on="Articles" wide={true}><ArticleRoom article_id={id}/></Desk>

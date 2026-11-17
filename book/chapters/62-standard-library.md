@@ -245,8 +245,10 @@ Safety built in:
   `text/plain` one, which a page on another site could send.
 - A page on another site cannot post a form here: a `POST`, `PUT`, `PATCH` or `DELETE`
   with a form, multipart or plain-text body that the browser marks as cross-site
-  (`Sec-Fetch-Site`, or an `Origin` naming another host) gets a 403. JSON from another
-  site needs the browser to ask first, which nothing here answers, and programs that
+  (`Sec-Fetch-Site`, or an `Origin` naming another host) gets a 403. An `Origin` alone must
+  name the request's host and, where a `--trust-proxy` proxy says the scheme
+  (`X-Forwarded-Proto`), its scheme too: `http://` and `https://` of one host are two sites.
+  JSON from another site needs the browser to ask first, which nothing here answers, and programs that
   call the site (webhooks, scripts) send no `Origin`, so both work as before. For a
   path that must take such posts, such as a payment provider's return or a single
   sign-on callback, say so at the top of the program: `allow_cross_site("/sso")`.

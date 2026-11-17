@@ -34,6 +34,9 @@ const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPT
 /// A `routes offline` group with no GET route in it: the tag keeps nothing (FEEDBACK67.md, B.2;
 /// branch pwa).
 const OFFLINE_NO_PAGE: &str = "this `routes offline` group has no GET route: `offline` keeps pages, which are GETs, and its other routes are sent again, never kept";
+/// A `routes writes` group with no GET or ANY route in it: the tag says nothing (FEEDBACK70.md,
+/// Q-965; branch security).
+const WRITES_NO_PAGE: &str = "this `routes writes` group has no GET route (nor an ANY one, which takes GET): `writes` says that a GET's write is meant, and its other routes are expected to write";
 /// What starts a line that takes names from a file: the file comes first, so an editor
 /// knows them while they are typed (FEEDBACK19.md, Q-156; branch feedback19-fixes).
 pub(crate) const IMPORT_WORDS: &[&str] = &["import", "client", "preload", "preconnect"];
@@ -142,7 +145,17 @@ pub(crate) fn starts_declaration(line: &[char]) -> bool {
     let name = |w: &str| w.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_');
     let upper = |w: &str| w.chars().next().is_some_and(char::is_uppercase);
     match first {
-        "route" => second.chars().all(|c| c.is_ascii_uppercase()) || (second == "offline" && words.next().is_some_and(|m| m.chars().all(|c| c.is_ascii_uppercase()))),
+        // Past the tags of `route offline GET /menu` and `route writes GET /confirm`, in either
+        // order (FEEDBACK70.md, Q-965; branch security).
+        "route" => {
+            let mut method = Some(second);
+            for _ in 0..2 {
+                if matches!(method, Some("offline" | "writes")) {
+                    method = words.next();
+                }
+            }
+            method.is_some_and(|m| m.chars().all(|c| c.is_ascii_uppercase()))
+        }
         "view" | "component" | "type" => upper(second),
         "fn" => name(second) && line.contains('('),
         "server" => second == "fn",
@@ -1088,18 +1101,22 @@ impl Parser {
                         }
                     }
                     // `routes offline /docs { ... }`: each GET route of the group kept for offline
-                    // (FEEDBACK67.md, B.2; branch pwa).
-                    let offline = self.peeked.is_none() && self.offline_group_tag();
+                    // (FEEDBACK67.md, B.2; branch pwa). `routes writes /p { ... }`: each GET route
+                    // of it writes on purpose (FEEDBACK70.md, Q-965; branch security).
+                    let (offline, writes) = if self.peeked.is_none() { self.group_tags(line)? } else { (false, false) };
                     if self.peeked.is_none() && self.group_ahead() {
                         if !top {
                             return Err(QuilloError::new("a `routes` group is written at the top level of a file, as `route` is", line));
                         }
-                        let routes = self.parse_group(line, &[], &[], &[], &None, offline)?;
+                        let routes = self.parse_group(line, &[], &[], &[], &None, offline, writes)?;
                         if routes.iter().all(|r| r.method == crate::ast::GUARD_METHOD) {
                             return Err(QuilloError::new("this `routes` group has no routes in it", line));
                         }
                         if offline && !routes.iter().any(|r| r.offline) {
                             return Err(QuilloError::new(OFFLINE_NO_PAGE, line));
+                        }
+                        if writes && !routes.iter().any(|r| r.writes) {
+                            return Err(QuilloError::new(WRITES_NO_PAGE, line));
                         }
                         let mut routes = routes.into_iter();
                         let Some(first) = routes.next() else {
@@ -1216,6 +1233,7 @@ impl Parser {
                                     effects: None,
                                     limit: None,
                                     offline: false,
+                                    writes: false,
                                 })));
                             }
                         }
@@ -1922,19 +1940,36 @@ impl Parser {
     fn parse_route(&mut self, line: u32) -> PResult<RouteDef> {
         // `route offline GET /menu = ...`: the tag, after the keyword as `fn mcp`'s is; `route` is
         // a keyword, so the word after it is the tag or the method, and `offline` stays a name
-        // everywhere else (FEEDBACK67.md, B.2; branch pwa).
-        let offline = self.at_kw("offline")? && {
+        // everywhere else (FEEDBACK67.md, B.2; branch pwa). `route writes GET /confirm/:code`
+        // says that a GET's write is meant, read the same way; the two tags in either order, each
+        // once (FEEDBACK70.md, Q-965; branch security).
+        let (mut offline, mut writes) = (false, false);
+        loop {
+            let tag = if self.at_kw("offline")? {
+                "offline"
+            } else if self.at_kw("writes")? {
+                "writes"
+            } else {
+                break;
+            };
             let (saved, at) = (self.save(), self.line()?);
             self.next()?;
-            let tag = matches!(self.peek()?, Tok::Ident(_)) && self.line()? == at;
-            if !tag {
+            if !(matches!(self.peek()?, Tok::Ident(_)) && self.line()? == at) {
                 self.restore(saved);
+                break;
             }
-            tag
-        };
+            let given = if tag == "offline" { &mut offline } else { &mut writes };
+            if *given {
+                return Err(QuilloError::new(format!("`{}` is written twice: once is enough, `route {} GET /...`", tag, tag), line));
+            }
+            *given = true;
+        }
         let method = self.expect_ident("an HTTP method")?;
         if method == "offline" {
             return Err(QuilloError::new("`offline` comes before the method, and a page kept for offline is a GET: `route offline GET /menu = ...`", line));
+        }
+        if method == "writes" {
+            return Err(QuilloError::new("`writes` comes before the method, and says that a GET's write is meant: `route writes GET /confirm/:code = ...`", line));
         }
         if !METHODS.contains(&method.as_str()) {
             return Err(QuilloError::new(
@@ -1947,49 +1982,68 @@ impl Parser {
         if offline && method != "GET" {
             return Err(QuilloError::new(format!("`offline` keeps a page for when there is no network, and a page is a GET: `route offline {} ...` cannot be kept (`route offline GET /...` for the page that shows it)", method), line));
         }
-        if self.offline_ahead() {
-            return Err(QuilloError::new(format!("`offline` comes after `route`, before the method: `route offline {} /...`", method), line));
+        // A POST, a PUT, a PATCH or a DELETE is expected to write: only a GET needs saying so, and
+        // an ANY route, which takes GET (FEEDBACK70.md, Q-965; branch security).
+        if writes && method != "GET" && method != "ANY" {
+            return Err(QuilloError::new(format!("`writes` is for GET routes (and ANY, which takes GET): it says that a GET's write is meant, where a POST, a PUT, a PATCH or a DELETE is expected to write; drop it (`route {} /...`)", method), line));
+        }
+        for tag in ["offline", "writes"] {
+            if self.tag_ahead(0, tag) {
+                return Err(QuilloError::new(format!("`{}` comes after `route`, before the method: `route {} {} /...`", tag, tag, method), line));
+            }
         }
         let path = self.parse_path("after the method")?;
         let mut r = self.parse_route_rest(method, path, line)?;
         r.offline = offline;
+        r.writes = writes;
         Ok(r)
     }
 
-    /// Whether the word ahead, on this line, is `offline`: read by character, as a path is.
-    fn offline_ahead(&self) -> bool {
+    /// Whether the word ahead, on this line, `n` characters on and past the spaces there, is
+    /// `tag`: read by character, as a path is (FEEDBACK67.md, B.2; FEEDBACK70.md, Q-965).
+    fn tag_ahead(&self, mut n: usize, tag: &str) -> bool {
         if self.peeked.is_some() {
             return false;
         }
-        let mut n = 0;
         while matches!(self.lx.peek_char_at(n), Some(' ' | '\t')) {
             n += 1;
         }
-        "offline".chars().enumerate().all(|(i, c)| self.lx.peek_char_at(n + i) == Some(c)) && !self.lx.peek_char_at(n + 7).is_some_and(|c| c.is_alphanumeric() || c == '_')
+        tag.chars().enumerate().all(|(i, c)| self.lx.peek_char_at(n + i) == Some(c)) && !self.lx.peek_char_at(n + tag.len()).is_some_and(|c| c.is_alphanumeric() || c == '_')
     }
 
-    /// After `routes`: `offline` with a space and a group's path after it, the tag of `routes
-    /// offline /docs { ... }`, taken; otherwise nothing is (FEEDBACK67.md, B.2; branch pwa).
-    fn offline_group_tag(&mut self) -> bool {
+    /// After `routes`: the tags of `routes offline /docs { ... }` (FEEDBACK67.md, B.2; branch pwa)
+    /// and `routes writes /p { ... }` (FEEDBACK70.md, Q-965; branch security), in either order,
+    /// each with a space after it and a group's path after them, taken; otherwise nothing is.
+    fn group_tags(&mut self, line: u32) -> PResult<(bool, bool)> {
         if self.peeked.is_some() {
-            return false;
+            return Ok((false, false));
         }
         // As the path after it would be read: past the spaces.
         self.lx.skip_spaces();
-        if !self.offline_ahead() || !matches!(self.lx.peek_char_at(7), Some(' ' | '\t')) {
-            return false;
+        let (mut n, mut offline, mut writes) = (0, false, false);
+        loop {
+            let Some(tag) = ["offline", "writes"].into_iter().find(|t| self.tag_ahead(n, t)) else { break };
+            let mut m = n + tag.len();
+            if !matches!(self.lx.peek_char_at(m), Some(' ' | '\t')) {
+                break;
+            }
+            while matches!(self.lx.peek_char_at(m), Some(' ' | '\t')) {
+                m += 1;
+            }
+            let given = if tag == "offline" { &mut offline } else { &mut writes };
+            if *given {
+                return Err(QuilloError::new(format!("`{}` is written twice: once is enough, `routes {} /...`", tag, tag), line));
+            }
+            *given = true;
+            n = m;
         }
-        let mut n = 7;
-        while matches!(self.lx.peek_char_at(n), Some(' ' | '\t')) {
-            n += 1;
-        }
-        if self.lx.peek_char_at(n) != Some('/') {
-            return false;
+        if n == 0 || self.lx.peek_char_at(n) != Some('/') {
+            return Ok((false, false));
         }
         for _ in 0..n {
             self.lx.bump();
         }
-        true
+        Ok((offline, writes))
     }
 
     /// A route's or a group's path, read character by character:
@@ -2283,6 +2337,9 @@ impl Parser {
         } else if self.at_kw("offline")? {
             // FEEDBACK67.md wrote it so: `route GET /menu offline = ...` (B.2; branch pwa).
             return self.err_at(format!("`offline` comes after `route`, before the method: `route offline {} {} ...`", method, shown_path(&path)));
+        } else if self.at_kw("writes")? {
+            // As `offline` there (FEEDBACK70.md, Q-965; branch security).
+            return self.err_at(format!("`writes` comes after `route`, before the method: `route writes {} {} ...`", method, shown_path(&path)));
         } else {
             return self.err_at("expected `=` or `{` to start the route body");
         };
@@ -2315,7 +2372,7 @@ impl Parser {
                 crate::check::walk_expr(&body, f)
             })
             .1;
-        Ok(RouteDef { method, path, query, body_pat, guards: Vec::new(), body, line, file: self.file.clone(), uses_request, reads_visitor, middleware_reads: Default::default(), middleware_beyond: Default::default(), effects, limit: None, offline: false }.limited())
+        Ok(RouteDef { method, path, query, body_pat, guards: Vec::new(), body, line, file: self.file.clone(), uses_request, reads_visitor, middleware_reads: Default::default(), middleware_beyond: Default::default(), effects, limit: None, offline: false, writes: false }.limited())
     }
 
     /// Whether what follows `routes` is a group's path: `/` and a path
@@ -2377,8 +2434,10 @@ impl Parser {
     /// answers instead), and the pattern matched with its own (branch
     /// route-groups).
     /// `offline`: the group's tag, or a group's around it: each GET route in it is kept for offline
-    /// (FEEDBACK67.md, B.2; branch pwa).
-    fn parse_group(&mut self, line: u32, prefix: &[Seg], before: &[(Expr, u32)], guards: &[Pattern], outer: &Option<Vec<String>>, offline: bool) -> PResult<Vec<RouteDef>> {
+    /// (FEEDBACK67.md, B.2; branch pwa). `writes`, the same way: each GET route in it writes on
+    /// purpose (FEEDBACK70.md, Q-965; branch security).
+    #[allow(clippy::too_many_arguments)]
+    fn parse_group(&mut self, line: u32, prefix: &[Seg], before: &[(Expr, u32)], guards: &[Pattern], outer: &Option<Vec<String>>, offline: bool, writes: bool) -> PResult<Vec<RouteDef>> {
         let mut path = prefix.to_vec();
         path.extend(self.parse_path("after `routes`")?);
         let mut before = before.to_vec();
@@ -2494,18 +2553,22 @@ impl Parser {
                         }
                     }
                     r.offline |= offline && r.method == "GET";
+                    r.writes |= writes && (r.method == "GET" || r.method == "ANY");
                     out.push(r.limited());
                 }
                 Tok::Ident(k) if k == "routes" => {
                     self.next()?;
-                    let tag = self.offline_group_tag();
-                    let inner = self.parse_group(at, &path, &before, &guards, &effects, offline || tag)?;
+                    let (tag, writes_tag) = self.group_tags(at)?;
+                    let inner = self.parse_group(at, &path, &before, &guards, &effects, offline || tag, writes || writes_tag)?;
                     // As at the top level (Q-546): a group inside another with nothing in it.
                     if inner.iter().all(|r| r.method == crate::ast::GUARD_METHOD) {
                         return Err(QuilloError::new("this `routes` group has no routes in it", at));
                     }
                     if tag && !inner.iter().any(|r| r.offline) {
                         return Err(QuilloError::new(OFFLINE_NO_PAGE, at));
+                    }
+                    if writes_tag && !inner.iter().any(|r| r.writes) {
+                        return Err(QuilloError::new(WRITES_NO_PAGE, at));
                     }
                     out.extend(inner);
                 }
@@ -2540,6 +2603,7 @@ impl Parser {
                     effects: effects.clone(),
                     limit: None,
                     offline: false,
+                    writes: false,
                 }
                 .limited(),
             );
@@ -4597,7 +4661,7 @@ fn pattern_names_request(p: &Pattern) -> bool {
 /// The fields of `request` that say who nobody is: what the URL says, which a cache keeps pages
 /// by, and what was sent, which it does not keep. Every other one, a field added later too, is
 /// the visitor's (FEEDBACK55.md, Q-886; branch feedback55).
-const NOBODYS_FIELDS: &[&str] = &["path", "route_path", "host", "query", "query_string", "params", "method", "id", "body", "json", "form", "files"];
+pub(crate) const NOBODYS_FIELDS: &[&str] = &["path", "route_path", "host", "query", "query_string", "params", "method", "id", "body", "json", "form", "files"];
 
 /// Whether the code `walk` goes over names `request`, and whether it can read the visitor from
 /// it: a field of theirs (`headers`, `cookies`, `ip`), or the request itself going anywhere, to
@@ -4649,7 +4713,7 @@ pub(crate) fn middleware_reads_beyond(d: &FnDef) -> bool {
 }
 
 /// How often `e` gives `name` as its value, or returns it.
-fn given_back(e: &Expr, name: &str) -> u32 {
+pub(crate) fn given_back(e: &Expr, name: &str) -> u32 {
     match e {
         Expr::Ident(n, _) if n == name => 1,
         Expr::If(_, a, b) => given_back(a, name) + b.as_ref().map_or(0, |b| given_back(b, name)),

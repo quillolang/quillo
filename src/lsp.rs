@@ -741,12 +741,30 @@ impl Server {
             } else {
                 d.message.clone()
             };
-            let said = |range: J| json!({
-                "range": range,
-                "severity": match d.severity { Severity::Error => 1, Severity::Warning => 2, Severity::Hint => 4 },
-                "source": "quillo",
-                "message": message,
-            });
+            // A GET write said once for its routes: where each of them is (FEEDBACK70.md, Q-965,
+            // second review; branch security).
+            let related: Vec<J> = analysis
+                .related
+                .iter()
+                .filter(|(f, l, _)| *f == d.file && *l == d.line && (d.message.starts_with("this write (") || d.message.starts_with("these writes (")))
+                .flat_map(|(_, _, routes)| routes.iter())
+                .map(|(f, l, what)| {
+                    let text = if *f == file { text.clone() } else { std::fs::read_to_string(f).unwrap_or_default() };
+                    json!({ "location": { "uri": path_to_uri(f), "range": diag_range(&text, *l, "") }, "message": what })
+                })
+                .collect();
+            let said = |range: J| {
+                let mut j = json!({
+                    "range": range,
+                    "severity": match d.severity { Severity::Error => 1, Severity::Warning => 2, Severity::Hint => 4 },
+                    "source": "quillo",
+                    "message": message,
+                });
+                if !related.is_empty() {
+                    j["relatedInformation"] = J::Array(related.clone());
+                }
+                j
+            };
             let theirs = if d.file == file { None } else { real(&d.file) };
             if d.file == file || (theirs.is_some() && theirs == here) {
                 let range = diag_range(&text, d.line, &d.message);
@@ -916,8 +934,8 @@ impl Server {
         if self.on_mcp_tag(params) {
             return json!({ "contents": { "kind": "markdown", "value": MCP_DOC } });
         }
-        if self.on_offline_tag(params) {
-            return json!({ "contents": { "kind": "markdown", "value": OFFLINE_DOC } });
+        if let Some(tag) = self.on_route_tag(params) {
+            return json!({ "contents": { "kind": "markdown", "value": if tag == "writes" { WRITES_DOC } else { OFFLINE_DOC } } });
         }
         if let Some((_, r)) = self.reference_at(params) {
             let mut text = format!("```quillo\n{}\n```", private_detail(&r.name, &r.detail));
@@ -945,14 +963,16 @@ impl Server {
         w == "mcp" && crate::highlight::mcp_tag(&chars, a, a + 3)
     }
 
-    /// Whether the cursor is on the tag of `route offline GET /menu` or `routes offline /docs`, and
-    /// not on a name `offline` (FEEDBACK67.md, B.2; branch pwa).
-    fn on_offline_tag(&self, params: &J) -> bool {
+    /// The tag the cursor is on, of `route offline GET /menu` or `routes offline /docs` (FEEDBACK67.md,
+    /// B.2; branch pwa), or of `route writes GET /confirm/:code` (FEEDBACK70.md, Q-965; branch
+    /// security), and not a name `offline` or `writes`.
+    fn on_route_tag(&self, params: &J) -> Option<&'static str> {
         let (uri, line, col) = Self::position(params);
-        let Some(src) = self.docs.get(&uri).and_then(|d| d.text.lines().nth(line)) else { return false };
-        let Some((w, a)) = word_at(src, 0, col) else { return false };
+        let src = self.docs.get(&uri).and_then(|d| d.text.lines().nth(line))?;
+        let (w, a) = word_at(src, 0, col)?;
+        let tag = ["offline", "writes"].into_iter().find(|t| w == *t)?;
         let chars: Vec<char> = src.chars().collect();
-        w == "offline" && crate::highlight::offline_tag(&chars, a, a + 7)
+        crate::highlight::route_tag(&chars, a, a + tag.len()).then_some(tag)
     }
 
     /// What the cursor is on in a `use` line: the file it names (no name),
@@ -1592,9 +1612,14 @@ impl Server {
         if lead.ends_with([' ', '\t']) && matches!(words[..], ["fn"] | ["server", "fn"] | ["service"]) && "mcp".starts_with(&head[lead.len()..]) {
             items.push(json!({ "label": "mcp", "kind": 14, "detail": "a tool, for AI clients (MCP)", "documentation": MCP_DOC, "sortText": "0" }));
         }
-        // `route `, `routes `: the tag of a page kept for offline (FEEDBACK67.md, B.2; branch pwa).
-        if lead.ends_with([' ', '\t']) && matches!(words[..], ["route"] | ["routes"]) && "offline".starts_with(&head[lead.len()..]) {
+        // `route `, `routes `: the tag of a page kept for offline (FEEDBACK67.md, B.2; branch pwa),
+        // and of a GET whose write is meant, each after the other too (FEEDBACK70.md, Q-965;
+        // branch security).
+        if lead.ends_with([' ', '\t']) && matches!(words[..], ["route" | "routes"] | ["route" | "routes", "writes"]) && "offline".starts_with(&head[lead.len()..]) {
             items.push(json!({ "label": "offline", "kind": 14, "detail": "a page kept for when there is no network", "documentation": OFFLINE_DOC, "sortText": "0" }));
+        }
+        if lead.ends_with([' ', '\t']) && matches!(words[..], ["route" | "routes"] | ["route" | "routes", "offline"]) && "writes".starts_with(&head[lead.len()..]) {
+            items.push(json!({ "label": "writes", "kind": 14, "detail": "a GET whose write is meant", "documentation": WRITES_DOC, "sortText": "0" }));
         }
         let file = uri_to_path(&uri).display().to_string();
         let mut seen = std::collections::HashSet::new();
@@ -2032,6 +2057,8 @@ fn comment_above(text: &str, line: u32) -> String {
 /// The hover of a tool's tag (FEEDBACK56.md, Q-853; branch feedback56).
 const OFFLINE_DOC: &str = "`route offline GET /menu = ...`, `routes offline /docs { ... }`\n\nA page kept for when there is no network: Quillo's service worker goes to the server first, keeps the page it answers, and shows that copy, marked `data-kept` on its `<html>`, when the server cannot be reached. Routes with no parameter are kept as the worker installs, opened or not. A visitor's page (one that reads the session) is dropped when the session ends or changes. Only a GET can be kept.";
 const MCP_DOC: &str = "`fn mcp name(params) with db = ...`, `server fn mcp name(params) = ...`\n\nA tool, for AI clients that speak MCP: they are told its name, its `///` comment, its parameters' types and its `with`. To the program it is a function as any other; `server fn mcp` is also a page's to call.\n\n`service mcp /billing = \"billing.qwe\"` offers billing's tools here, as `billing.<name>`.";
+/// The hover of `writes` (FEEDBACK70.md, Q-965; branch security).
+const WRITES_DOC: &str = "`route writes GET /confirm/:code = ...`, `routes writes /p { ... }`\n\nA GET whose write is meant. A link on another site, in an email or in a chat runs a GET with the visitor's session, so `quillo check` warns of a GET route that writes and reads who the visitor is; `writes` says the write is meant there (a confirm-your-address link, a sign-in callback, a presence ping). Otherwise make it a `POST`, which Quillo refuses from other sites. Only a GET takes it, and an ANY route, which answers a GET.";
 
 fn keyword_doc(w: &str) -> Option<String> {
     let text = match w {

@@ -93,7 +93,7 @@ route POST /signup { form: Signup as f } {
 route POST /logout { sign_out(); redirect("/login") }
 
 // The language: a cookie for everyone, and the account's setting.
-route GET /lang/:code {
+route writes GET /lang/:code {
     let loc = code == "en" || code == "es" || code == "ar" ? code : "en"
     set_cookie("locale", loc, { max_age: "1y" })
     let u = me()

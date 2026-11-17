@@ -244,10 +244,61 @@ pub(crate) fn cross_site(req: &HttpRequest) -> bool {
     match (header("origin"), header("host")) {
         (None, _) => false,
         (Some(origin), host) => {
-            let origin_host = origin.split_once("://").map_or(origin, |(_, h)| h).trim_end_matches('/');
-            host.map_or(true, |h| !origin_host.eq_ignore_ascii_case(h))
+            let (scheme, origin_host) = origin.split_once("://").map_or((None, origin), |(s, h)| (Some(s), h));
+            if host.map_or(true, |h| !origin_host.trim_end_matches('/').eq_ignore_ascii_case(h)) {
+                return true;
+            }
+            // An origin is its scheme and its host: where the request's scheme is known, `http://`
+            // and `https://` of one host are two sites. Unknown, the hosts are compared alone
+            // (FEEDBACK70.md, Q-966; branch security).
+            match (scheme, known_scheme(req)) {
+                (Some(o), Some(r)) if !o.eq_ignore_ascii_case(r) => {
+                    scheme_differs(o, r);
+                    true
+                }
+                _ => false,
+            }
         }
     }
+}
+
+/// The scheme a request came over, where this server knows it: what a proxy `--trust-proxy` names
+/// says in `X-Forwarded-Proto`, `http` or `https`: its last header, and the last of a list in it,
+/// so that `http, https` and the two in two headers are one (RFC 9110, 5.3). Quillo serves no TLS
+/// of its own, and a request from anyone else says nothing that is believed. Without
+/// `--trust-proxy` nothing is looked for; the mark the server puts on a proxy's request is its own,
+/// put last, of its own spelling (FEEDBACK70.md, Q-966; branch security).
+fn known_scheme(req: &HttpRequest) -> Option<&'static str> {
+    if !crate::httpd::trusts_proxies() || !req.headers.iter().rev().any(|(k, _)| k == crate::httpd::PROXIED) {
+        return None;
+    }
+    let (_, v) = req.headers.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-proto"))?;
+    let last = v.rfind(',').map_or(v.as_str(), |i| &v[i + 1..]).trim();
+    match last.len() {
+        5 if last.eq_ignore_ascii_case("https") => Some("https"),
+        4 if last.eq_ignore_ascii_case("http") => Some("http"),
+        _ => None,
+    }
+}
+
+/// Said once: a write taken as another site's only for the scheme. Browsers send no
+/// `Sec-Fetch-Site` to an `http://` page, so a proxy that says `https` for its port-80 site has
+/// every browser's write from an `http://` page refused; one that says its own hop's `http` behind
+/// another TLS hop, older browsers' writes from `https://` pages (FEEDBACK70.md, Q-966, second
+/// review; branch security).
+#[cold]
+fn scheme_differs(origin: &str, proxy: &str) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let origin: String = origin.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')).take(16).collect();
+    let why = if proxy == "https" {
+        "Browsers send no Sec-Fetch-Site to an http:// page, so if this site is served over http:// too and the proxy says https there (a fixed X-Forwarded-Proto on its port-80 site), every browser's write from an http:// page is refused: have it say http there, or send http:// to https://"
+    } else {
+        "If browsers reach this site over https://, the proxy is saying its own hop's scheme (as one behind another TLS hop does: Cloudflare's Flexible mode, nginx's $scheme there), and older browsers' writes are all refused: have it pass on the scheme the browser used"
+    };
+    eprintln!("quillo: warning: a request was taken as another site's: its Origin is {}:// and the proxy (--trust-proxy) says it came over {}. {}. Said once", origin, proxy, why);
 }
 
 /// Whether a request's body is one another site's page can send without

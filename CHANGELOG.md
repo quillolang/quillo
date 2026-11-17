@@ -37,6 +37,19 @@
   30 s, over kept connections (Q-960); push services are https on port 443. The push key comes
   from `QUILLO_SECRET`, the same on every instance (Q-956). The phone apps answer
   `"unsupported"` for now (FEEDBACK67.md, B.3).
+- **A `GET` that writes**: `quillo check` warns of a `GET` (or `ANY`) route that surely writes (as the
+  prefetch guard reads writes: `db.exec` and SQL written to write, a global assigned, cookies
+  and sessions, files, `publish`, outbound writes, services, `notification.send`) and reads who
+  the visitor is (the request, `session()`, `cookie()`, there, in what it calls, a component it
+  shows or its middleware): a link on another site opens it with the visitor's session. `route writes GET /x`
+  and `routes writes /x { ... }` say the write is meant; three or more routes through one write
+  are said once, at it; `offline` with `writes` is warned of. The sample apps' meant writes are
+  tagged (FEEDBACK70.md, Q-965).
+- **`Origin`'s scheme**: a write with an `Origin` and no `Sec-Fetch-Site` whose scheme differs
+  from a `--trust-proxy` proxy's `X-Forwarded-Proto` (the last item of the last header) is
+  refused as another site's, and the log says so once (FEEDBACK70.md, Q-966). Quillo sends no
+  `Strict-Transport-Security` itself, as it serves plain HTTP: the proxy does, or
+  `site_headers` (the guide says how).
 - `http.*`'s `public_only` no longer takes 64:ff9b:1::/48 (RFC 8215's local-use NAT64) as the
   public internet (found in FEEDBACK67's review).
 - `ask` and `notify` where the code surely runs on the server (a route, a `server fn`, a tick,

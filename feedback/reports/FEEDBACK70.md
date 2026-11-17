@@ -165,6 +165,48 @@ Expected: when the request's scheme is known (TLS, or `x-forwarded-proto` from a
 
 Proposed fix: in `cross_site`, compare `Origin`'s scheme with the request's when the server knows the request's scheme. When it doesn't (no TLS, no trusted proxy header), compare the hosts as now. Under `--watch` on `localhost` both are `http`, so nothing changes there.
 
+### Q-986. `came_over_https` believes any client's `X-Forwarded-Proto`, where `cross_site` now believes only a `--trust-proxy` proxy's
+
+| Kind | Detected by | Attempts |
+|---|---|---|
+| silent (two readings of one header that disagree) | a review of Q-966's fix (branch security, 2026-11-17), reading src/session.rs:423 | 1 |
+
+`came_over_https` (src/session.rs) takes the last `X-Forwarded-Proto` from anyone. It decides two things:
+- the default `Secure` flag of `delete_cookie`'s clearing cookie;
+- the scheme of the origin kept with a push subscription (src/push.rs `origin_of`).
+
+Since Q-966, `cross_site` reads the same header only from a `--trust-proxy` proxy. A client that sends the header itself changes only its own answer and its own subscription: the origin's host is the client's `Host` anyway, so the header adds no reach.
+
+Expected: the two agree. The open part is what to do for a site behind a proxy it never named with `--trust-proxy`. Requiring it would make those sites' cookie deletions non-`Secure` and their push origins `http://`, with nothing said, and the guide tells people to send the header but never names `--trust-proxy` for it.
+
+| Impact | |
+|---|---|
+| **Functionality** | None today. Requiring `--trust-proxy` changes two defaults for sites behind an unnamed proxy |
+| **User** | None: a client only changes what it is itself sent |
+| **Requests** | None |
+| **Security** | Consistency only: no other visitor is reached |
+
+Proposed fix: require `--trust-proxy` (as `cross_site` does), and print one line at startup when requests carry `X-Forwarded-Proto` from a peer that isn't named: "behind a proxy? `--trust-proxy <its address>`".
+
+### Q-987. Under `quillo fcgi`, an `Origin`'s scheme is never compared (Q-966)
+
+| Kind | Detected by | Attempts |
+|---|---|---|
+| silent (a fix that does not reach one way of serving) | the fix of Q-966 (branch security, 2026-11-17), reading src/fcgi.rs | 1 |
+
+FastCGI requests reach the HTTP parser over a socket pair whose peer is the browser's `REMOTE_ADDR`, so they never carry the trusted-proxy mark, and the web server's `HTTPS` parameter is not read. Q-966's scheme comparison therefore never applies there, and the browser's own `HTTP_X_FORWARDED_PROTO` is passed through as it came.
+
+Expected: under `quillo fcgi` the web server is the proxy. Its `HTTPS` parameter (`on`, or absent) is the request's scheme, and a client's `X-Forwarded-Proto` is not believed.
+
+| Impact | |
+|---|---|
+| **Functionality** | None for current browsers, which send `Sec-Fetch-Site` |
+| **User** | None in a current browser |
+| **Requests** | None |
+| **Security** | Q-966's narrow case (an old browser, and an attacker on the visitor's network) stays open on shared hosting |
+
+Proposed fix: pass a "scheme known" flag from fcgi.rs through `Hand::give` into the parser, set from `HTTPS`, and drop a client's `X-Forwarded-Proto` there.
+
 ## Questions for the user
 
 1. Q-965: how does a `GET` route say it writes on purpose, so `check` does not warn (qwertime's `/live`, a confirm link)? Or does `check` warn only about some writes (SQL that deletes or updates rows the session owns)?

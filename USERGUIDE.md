@@ -4090,14 +4090,27 @@ as can be *(since 0.8.5: every save reloaded every page, and the server's data s
 ## Routes
 
 ```quillo
-route [offline] METHOD /path/:param/:typed(int)/*rest [? { query pattern }] [{ request pattern }] [with effects] = expr
-route [offline] METHOD /path [with effects] { ... block ... }
+route [offline] [writes] METHOD /path/:param/:typed(int)/*rest [? { query pattern }] [{ request pattern }] [with effects] = expr
+route [offline] [writes] METHOD /path [with effects] { ... block ... }
 ```
 
 - **`offline`**, after `route` and before the method, keeps a `GET` route's page on the
   device for when there is no network (`route offline GET /menu = ...`); after `routes`, it
   does so for each `GET` route of the group. It is a tag only there, and a name anywhere else
   (see [Pages that work offline](#pages-that-work-offline)).
+- **`writes`**, in the same place (either order with `offline`), says that a `GET` route's
+  write is meant: `route writes GET /confirm/:code = ...`; after `routes`, it does so for each
+  `GET` and `ANY` route of the group. A link on another site, in an email or in a chat opens a `GET` with
+  the visitor's session (browsers send `SameSite=Lax` cookies when a link is followed), so
+  `quillo check` warns of a `GET` (or `ANY`) route that surely writes (SQL as written in the program: SQL
+  built at run time is not guessed) and reads who the visitor is (`session()`, `cookie()`, the
+  request's headers or cookies, there, in a function it calls, a component it shows, or its
+  middleware). Make such a route a `POST` (a form or a button), which Quillo refuses from other
+  sites, or tag it where the write is meant, as for a confirm-your-address link, a sign-in
+  callback or a presence ping. Three or more
+  routes that warn through one write (a helper they all call, a group's middleware) are said
+  once, at the write. Only a `GET` or an `ANY` route takes the tag; `writes` is a name anywhere
+  else.
 - **Methods:** `GET POST PUT PATCH DELETE OPTIONS ANY`. `ANY` takes every method. A
   `HEAD` request is served by the `GET` route: the route runs (what it does, it does),
   and the body is dropped. A `route HEAD` is accepted but never matches. An `OPTIONS`
@@ -4871,7 +4884,10 @@ fn touch() {
 - Every answer carries `server: Quillo` (unless the route sets `server`), `date`,
   `x-request-id` and `x-content-type-options: nosniff`. Every HTML page carries
   `x-frame-options: SAMEORIGIN`, unless the route sets one or a
-  `content-security-policy` with `frame-ancestors`. A page made from who the visitor is
+  `content-security-policy` with `frame-ancestors`. None carries `Strict-Transport-Security`
+  from Quillo, which serves plain HTTP, whatever `X-Forwarded-Proto` says: the proxy in front
+  that serves HTTPS sends it, or the program does, with
+  `site_headers({ "strict-transport-security": "max-age=31536000" })`. A page made from who the visitor is
   (it called `session()` or `cookie()`, set a cookie, or read a header of the request or its
   `ip`) carries `cache-control: private` and `vary: cookie`, so a shared cache never gives
   one visitor's page to another. That holds whatever time the route gave *(since 0.8.6: the
@@ -5205,8 +5221,10 @@ has logged in or out.
   a global variable, cookies and sessions, files, `publish`, `notification.send`, `http.post` and the like,
   and calls to services stop it, and it is answered "not prefetched" (503, which the
   browser drops; the request log shows it as any 503, with no error line). The page is
-  then made, as usual, when the link is followed. So a `GET` that does something (a
-  logout link, a counter) is never done by pointing at it. A page prerendered runs none
+  then made, as usual, when the link is followed. So pointing at a `GET` that does something (a
+  logout link, a counter) never does it; following a link does, from another site too, with the
+  visitor's session: a write they would not want done for them belongs in a `POST` (see
+  `writes` under [Routes](#routes)). A page prerendered runs none
   of its components, `server fn`s or live updates until someone opens it.
 - **Links a page's components follow** are fetched for the state of the components on the
   page they lead to, so those start with their data and no `null` first (see
@@ -7016,8 +7034,10 @@ Safety built in:
   `text/plain` one, which a page on another site could send.
 - A page on another site cannot post a form here: a `POST`, `PUT`, `PATCH` or `DELETE`
   with a form, multipart or plain-text body that the browser marks as cross-site
-  (`Sec-Fetch-Site`, or an `Origin` naming another host) gets a 403. JSON from another
-  site needs the browser to ask first, which nothing here answers, and programs that
+  (`Sec-Fetch-Site`, or an `Origin` naming another host) gets a 403. An `Origin` alone must
+  name the request's host and, where a `--trust-proxy` proxy says the scheme
+  (`X-Forwarded-Proto`), its scheme too: `http://` and `https://` of one host are two sites.
+  JSON from another site needs the browser to ask first, which nothing here answers, and programs that
   call the site (webhooks, scripts) send no `Origin`, so both work as before. For a
   path that must take such posts, such as a payment provider's return or a single
   sign-on callback, say so at the top of the program: `allow_cross_site("/sso")`.

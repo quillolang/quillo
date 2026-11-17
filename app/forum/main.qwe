@@ -81,7 +81,7 @@ route GET /c/:slug ? { sort: str = "latest", page: int = 1 } {
 route GET /tag/:tag ? { sort: str = "latest", page: int = 1 } =
     <TagPage me={me()} tag={lower(tag)} side={side()} sort={sort_of(sort)} {page}/>
 
-route GET /t/:id(int) {
+route writes GET /t/:id(int) {
     let u = me()
     let thread = load_thread(id) ?? reply 404 <NotFoundPage me={u} what="This thread does not exist, or was deleted."/>
     count_view(id)
@@ -109,7 +109,7 @@ route GET /messages {
     <MessagesPage me={u}/>
 }
 
-route GET /messages/:name {
+route writes GET /messages/:name {
     let u = signed_in(`/messages/${name}`)
     let other = profile(name) ?? reply 404 <NotFoundPage me={u} what="Nobody here goes by that name."/>
     if other.id == u.id { reply 303 redirect("/messages") }
@@ -122,7 +122,7 @@ route GET /mod {
     <ModPage me={u} log={mod_log_recent()}/>
 }
 
-route GET /notifications {
+route writes GET /notifications {
     let u = signed_in("/notifications")
     let items = notifications_of(u.id)
     mark_read(u.id)
@@ -217,4 +217,4 @@ route GET /media/:name {
 
 // Threads as JSON, for scripts and feeds.
 route GET /api/threads ? { sort: str = "latest", page: int = 1 } = load_threads(null, null, sort_of(sort), page)
-route GET /api/t/:id(int) = { thread: load_thread(id) ?? reply 404 { error: "no such thread" }, posts: load_posts(id) }
+route writes GET /api/t/:id(int) = { thread: load_thread(id) ?? reply 404 { error: "no such thread" }, posts: load_posts(id) }

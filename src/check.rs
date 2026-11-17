@@ -1536,6 +1536,10 @@ pub struct Local {
 #[derive(Default, Debug)]
 pub struct Analysis {
     pub diagnostics: Vec<Diagnostic>,
+    /// Where else a warning is about, by its file and line: a GET write said once for the routes
+    /// that do it, each route's file, line and name, for an editor's `relatedInformation`
+    /// (FEEDBACK70.md, Q-965, second review; branch security).
+    pub related: Vec<(String, u32, Vec<(String, u32, String)>)>,
     pub symbols: Vec<Symbol>,
     pub references: Vec<Reference>,
     /// Where a file could not be parsed for syntax this Quillo does not
@@ -1615,6 +1619,10 @@ pub struct ToolFacts {
     /// It calls `confirm` or `about`: it asks the user itself (FEEDBACK56.md, Part E; branch
     /// feedback56).
     pub asks: bool,
+    /// A write its code surely does (`Checker::get_facts`), for a GET route of the program that
+    /// calls it as a service's: one that only reads is no write there (FEEDBACK70.md, Q-965;
+    /// branch security). None where it was not asked (a tool's).
+    pub sure_writes: Option<String>,
 }
 
 /// How `auth` written in a service's options proves who calls without signing: `bearer`, `oauth`,
@@ -1644,6 +1652,8 @@ struct ServiceFn {
     writes: bool,
     /// The checker sees all it may run.
     sure: bool,
+    /// Its code surely writes (`ToolFacts::sure_writes`; FEEDBACK70.md, Q-965).
+    sure_writes: bool,
 }
 
 /// What some code was found to do (`ToolFacts`' findings, without whose they are).
@@ -3113,6 +3123,11 @@ impl Checker {
             .flatten()
             .collect();
         self.idempotent_reaches_outside(&top_lets);
+        // A GET that writes, run from another site with the visitor's session (FEEDBACK70.md,
+        // Q-965; branch security).
+        self.get_writes_said(&order, &top_lets);
+        let mut server_fn_reach: Option<(HashMap<String, Arc<FnDef>>, HashMap<String, Arc<str>>, HashSet<String>)> = None;
+        let mut server_fn_seen = GetSeen::default();
         let mut late = Vec::new();
         for it in &order {
             if let Stmt::Fn(d) = &it.stmt {
@@ -3128,7 +3143,14 @@ impl Checker {
                 // Checked as a service: its server fns too, for the program calling them
                 // (FEEDBACK56.md, Q-853, B.3, found in review; branch feedback56).
                 if d.server && SERVER_FN_FACTS.with(|f| f.get()) {
-                    let facts = self.tool_facts(d, &it.file, &top_lets);
+                    let mut facts = self.tool_facts(d, &it.file, &top_lets);
+                    // What it surely writes, for a GET route that calls it (FEEDBACK70.md, Q-965;
+                    // branch security).
+                    let (fns, files, conns) = server_fn_reach.get_or_insert_with(|| get_program(&order));
+                    let cx = GetCx { fns, files, top_lets: &top_lets, conns };
+                    let params: Vec<String> = d.params.iter().map(|p| p.name.to_string()).collect();
+                    let own = self.get_own(&fn_code(d), &params, &cx);
+                    facts.sure_writes = self.get_facts(&own, &it.file, &cx, &mut server_fn_seen, false).writes.into_iter().next().map(|w| w.what);
                     self.out.server_fns.push(facts);
                 }
             }
@@ -3154,7 +3176,7 @@ impl Checker {
     /// review).
     fn tool_facts(&self, d: &Arc<FnDef>, file: &Arc<str>, top_lets: &HashSet<String>) -> ToolFacts {
         let r = self.reach_all(d, top_lets);
-        ToolFacts { def: d.clone(), file: file.to_string(), effects: r.effects, uncertain: r.uncertain, writes: r.writes, open: r.open, db: r.db, asks: r.asks }
+        ToolFacts { def: d.clone(), file: file.to_string(), effects: r.effects, uncertain: r.uncertain, writes: r.writes, open: r.open, db: r.db, asks: r.asks, sure_writes: None }
     }
 
     /// What `d`'s code does, with every function it names, each read once (`tool_facts`).
@@ -3440,7 +3462,7 @@ impl Checker {
                     .iter()
                     .map(|x| {
                         let sure = x.uncertain.is_none();
-                        (x.def.name.clone(), ServiceFn { inside: sure && x.open.is_none() && x.effects & net == 0, asks: x.asks, writes: x.writes.is_some(), sure })
+                        (x.def.name.clone(), ServiceFn { inside: sure && x.open.is_none() && x.effects & net == 0, asks: x.asks, writes: x.writes.is_some(), sure, sure_writes: x.sure_writes.is_some() })
                     })
                     .collect::<HashMap<_, _>>(),
             )
@@ -5463,6 +5485,260 @@ impl Checker {
                 ),
             );
         }
+    }
+
+    // ---- a GET that writes, with the visitor's session (FEEDBACK70.md, Q-965; branch security) --
+    //
+    // Quillo refuses a POST, a PUT, a PATCH or a DELETE that another site's page sends, but not a
+    // GET: a link on another site, in an email or in a chat sends the visitor to it with their
+    // `SameSite=Lax` cookies, and its write is done as them. Said of a GET route (and an ANY one,
+    // which answers a GET) whose code surely writes (what the prefetch guard refuses at run time)
+    // and surely reads who the visitor is, where the text makes both certain: SQL built as the
+    // program runs is not guessed at. `route writes GET /x` says the write is meant. Check time
+    // only: nothing of it runs at run time.
+
+    /// Each GET route that writes and reads who the visitor is, said; three or more whose one write
+    /// is the same (a helper's, a group's middleware's) said once, at it; and `offline` with
+    /// `writes`.
+    fn get_writes_said(&mut self, order: &[Item], top_lets: &HashSet<String>) {
+        let (fns, files, conns) = get_program(order);
+        let cx = GetCx { fns: &fns, files: &files, top_lets, conns: &conns };
+        let mut seen = GetSeen::default();
+        let mut said: Vec<(Arc<str>, u32, String)> = Vec::new();
+        let mut related: Vec<(Arc<str>, u32, Vec<(Arc<str>, u32, String)>)> = Vec::new();
+        // The routes whose writes are the same, by those writes (in file and line order).
+        let mut by_write: Vec<(Vec<GetWrite>, Vec<(Arc<str>, u32, String, String)>)> = Vec::new();
+        for it in order {
+            let Stmt::Route(r) = &it.stmt else { continue };
+            if r.method != "GET" && r.method != "ANY" {
+                continue;
+            }
+            // Its worker keeps an offline page ahead with a prefetch, which writes nothing.
+            if r.offline && r.writes {
+                said.push((it.file.clone(), r.line, format!(
+                    "`route offline writes {}`: Quillo's service worker keeps an offline page ahead with a prefetch, which writes nothing, so this one is refused then, and a copy kept from a visit is shown offline without the write; drop `offline`, or `writes` and the write (a `POST` the page sends)",
+                    r.shown()
+                )));
+            }
+            if r.writes {
+                continue;
+            }
+            let root = self.get_own(&[&r.body], &[], &cx);
+            let pattern_read = r.body_pat.iter().chain(r.guards.iter()).find_map(|p| match p {
+                Pattern::Record(fs) => fs.iter().filter_map(|f| f.path.first()).find(|f| matches!(f.as_str(), "headers" | "cookies")).cloned(),
+                _ => None,
+            });
+            // Most routes reach no write, or no read: said by what each function can reach, worked
+            // out once a check, before any walk of the route's own.
+            let can_write = !root.writes.is_empty() || root.calls.iter().any(|c| self.reaches(c, &cx, &mut seen).0);
+            let can_read = root.reads.is_some() || pattern_read.is_some() || root.calls.iter().any(|c| self.reaches(c, &cx, &mut seen).1);
+            if !(can_write && can_read) {
+                continue;
+            }
+            let mut facts = self.get_facts(&root, &it.file, &cx, &mut seen, true);
+            if facts.reads.is_none() {
+                facts.reads = pattern_read.map(|f| (format!("its request pattern takes the request's {}", f), None));
+            }
+            let Some(v) = facts.reads else { continue };
+            if facts.writes.is_empty() {
+                continue;
+            }
+            let read = match v {
+                (r, Some(f)) => format!("{}, in `{}`", r, f),
+                (r, None) => r,
+            };
+            let route = (it.file.clone(), r.line, r.shown(), read);
+            // Grouped only with routes whose writes are the same, all of them: a route that does
+            // another write is said by itself, with each.
+            let mut key = facts.writes.clone();
+            key.sort_by(|a, b| (&a.file, a.line, &a.what).cmp(&(&b.file, b.line, &b.what)));
+            match by_write.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, routes)) => routes.push(route),
+                None => by_write.push((key, vec![route])),
+            }
+        }
+        // The writes as a message lists them: three, and how many more.
+        let listed = |ws: &[GetWrite]| {
+            let mut out: Vec<String> = ws.iter().take(3).map(GetWrite::shown).collect();
+            if ws.len() > 3 {
+                out.push(format!("and {} more", ws.len() - 3));
+            }
+            out.join("; ")
+        };
+        for (ws, routes) in by_write {
+            if routes.len() < 3 {
+                for route in &routes {
+                    said.push(get_one(route, &listed(&ws)));
+                }
+                continue;
+            }
+            let w = &ws[0];
+            let at = |(f, l, shown, _): &(Arc<str>, u32, String, String)| if *f == w.file { format!("`{}` (line {})", shown, l) } else { format!("`{}` ({})", shown, self.shown_at(f, *l)) };
+            let mut list: Vec<String> = routes.iter().take(3).map(at).collect();
+            if routes.len() > 3 {
+                list.push(format!("{} more", routes.len() - 3));
+            }
+            let last = list.pop().unwrap_or_default();
+            let (these, are) = if ws.len() == 1 { ("this write", "is") } else { ("these writes", "are") };
+            said.push((w.file.clone(), w.line, format!(
+                "{} ({}) {} done by {} GET routes that read who the visitor is: {} and {}. A link on another site, in an email or in a chat runs them with the visitor's session (`SameSite=Lax` cookies go with a followed link). Make them `POST`s, or, if the write is meant (a presence ping, a page's count of views), tag them: `route writes GET ...`, `routes writes /...`",
+                these, listed(&ws), are, routes.len(), list.join(", "), last
+            )));
+            related.push((w.file.clone(), w.line, routes.iter().map(|(f, l, shown, _)| (f.clone(), *l, format!("`{}`", shown))).collect()));
+        }
+        said.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        for (file, line, msg) in said {
+            self.diag_at(file, line, Severity::Warning, msg);
+        }
+        // Where each route of a grouped warning is, for an editor (`Analysis::related`).
+        if self.quiet == 0 {
+            self.out.related.extend(related.into_iter().map(|(f, l, rs)| (f.to_string(), l, rs.into_iter().map(|(f, l, s)| (f.to_string(), l, s)).collect())));
+        }
+    }
+
+    /// One function's own code, read once a check (`GetSeen::own`).
+    fn own_of(&self, name: &str, cx: &GetCx, seen: &mut GetSeen) -> Option<Arc<GetOwn>> {
+        if let Some(o) = seen.own.get(name) {
+            return Some(o.clone());
+        }
+        let d = cx.fns.get(name)?;
+        let params: Vec<String> = d.params.iter().map(|p| p.name.to_string()).collect();
+        let o = Arc::new(self.get_own(&fn_code(d), &params, cx));
+        seen.own.insert(name.to_string(), o.clone());
+        Some(o)
+    }
+
+    /// Whether the program's function `name` can reach a write, and a read of who the visitor is,
+    /// through the functions it calls: worked out once a check for each strongly connected group of
+    /// functions (Tarjan's, with a stack of its own: a chain of calls however long takes no stack),
+    /// so the answer is the same in whatever order the routes and functions are written.
+    fn reaches(&self, name: &str, cx: &GetCx, seen: &mut GetSeen) -> (bool, bool) {
+        if let Some(r) = seen.reach.get(name) {
+            return *r;
+        }
+        if !cx.fns.contains_key(name) {
+            return (false, false);
+        }
+        let (mut index, mut low): (HashMap<String, usize>, HashMap<String, usize>) = (HashMap::new(), HashMap::new());
+        let (mut stack, mut on): (Vec<String>, HashSet<String>) = (Vec::new(), HashSet::new());
+        let mut work: Vec<(String, usize)> = Vec::new();
+        let mut next = 0;
+        let mut visit = |n: &str, index: &mut HashMap<String, usize>, low: &mut HashMap<String, usize>, stack: &mut Vec<String>, on: &mut HashSet<String>, work: &mut Vec<(String, usize)>| {
+            index.insert(n.to_string(), next);
+            low.insert(n.to_string(), next);
+            next += 1;
+            stack.push(n.to_string());
+            on.insert(n.to_string());
+            work.push((n.to_string(), 0));
+        };
+        visit(name, &mut index, &mut low, &mut stack, &mut on, &mut work);
+        while let Some((v, at)) = work.last().cloned() {
+            let calls = self.own_of(&v, cx, seen).map(|o| o.calls.clone()).unwrap_or_default();
+            if let Some(w) = calls.get(at) {
+                if let Some(top) = work.last_mut() {
+                    top.1 += 1;
+                }
+                if !cx.fns.contains_key(w.as_str()) || seen.reach.contains_key(w.as_str()) {
+                    continue;
+                }
+                if !index.contains_key(w.as_str()) {
+                    visit(w, &mut index, &mut low, &mut stack, &mut on, &mut work);
+                } else if on.contains(w.as_str()) {
+                    let lw = index[w.as_str()];
+                    let lv = low.get_mut(&v).expect("visited");
+                    *lv = (*lv).min(lw);
+                }
+                continue;
+            }
+            work.pop();
+            let lv = low[&v];
+            if let Some((u, _)) = work.last() {
+                let lu = low.get_mut(u).expect("visited");
+                *lu = (*lu).min(lv);
+            }
+            if lv != index[&v] {
+                continue;
+            }
+            // A group of functions that call each other: one answer for all of them.
+            let mut group = Vec::new();
+            while let Some(m) = stack.pop() {
+                on.remove(&m);
+                let last = m == v;
+                group.push(m);
+                if last {
+                    break;
+                }
+            }
+            let (mut w, mut r) = (false, false);
+            for m in &group {
+                if let Some(o) = self.own_of(m, cx, seen) {
+                    w |= !o.writes.is_empty();
+                    r |= o.reads.is_some();
+                    for c in &o.calls {
+                        if let Some((cw, cr)) = seen.reach.get(c.as_str()) {
+                            w |= *cw;
+                            r |= *cr;
+                        }
+                    }
+                }
+            }
+            for m in group {
+                seen.reach.insert(m, (w, r));
+            }
+        }
+        seen.reach.get(name).copied().unwrap_or((false, false))
+    }
+
+    /// What `root` (a route's or a function's own code) surely does with the program's functions it
+    /// calls: breadth first, each function visited once, so what is nearest is said whatever order
+    /// the routes and the functions are written in, and a chain of calls however long takes no
+    /// stack. `all`: every write reached, else the first.
+    fn get_facts(&self, root: &GetOwn, file: &Arc<str>, cx: &GetCx, seen: &mut GetSeen, all: bool) -> GetFacts {
+        let mut f = GetFacts { writes: Vec::new(), reads: root.reads.clone().map(|r| (r, None)) };
+        let add = |f: &mut GetFacts, w: GetWrite| {
+            if !f.writes.contains(&w) {
+                f.writes.push(w);
+            }
+        };
+        for (what, line) in &root.writes {
+            add(&mut f, GetWrite { what: what.clone(), at: None, file: file.clone(), line: *line });
+        }
+        // The names to visit, in the order reached: those from `next` on are still to visit.
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut names: Vec<String> = root.calls.clone();
+        let mut next = 0;
+        while (all || f.writes.is_empty()) || f.reads.is_none() {
+            let Some(n) = names.get(next).cloned() else { break };
+            next += 1;
+            if !visited.insert(n.clone()) {
+                continue;
+            }
+            // Past what reaches neither, once the walk has a read.
+            let (cw, cr) = self.reaches(&n, cx, seen);
+            if !cw && (!cr || f.reads.is_some()) {
+                continue;
+            }
+            let Some(o) = self.own_of(&n, cx, seen) else { continue };
+            if all || f.writes.is_empty() {
+                let at = cx.files.get(&n).cloned().unwrap_or_else(|| file.clone());
+                for (what, line) in &o.writes {
+                    add(&mut f, GetWrite { what: what.clone(), at: Some(n.clone()), file: at.clone(), line: *line });
+                }
+            }
+            if f.reads.is_none() {
+                f.reads = o.reads.clone().map(|r| (r, Some(n.clone())));
+            }
+            names.extend(o.calls.iter().cloned());
+        }
+        f
+    }
+
+    /// What `code` (with its function's `params`) surely does on the server by itself (`GetWalk`).
+    fn get_own(&self, code: &[&Expr], params: &[String], cx: &GetCx) -> GetOwn {
+        let names = ["request", "__request"];
+        let mut w = GetWalk::new(self, cx, &names, params);
+        w.exprs(code);
+        w.done()
     }
 
     /// `a.query(...)` on a connection from `db.connect` needs the db effect, as `db.query` does;
@@ -9804,6 +10080,606 @@ fn reads_written(sql: &str) -> bool {
         let scan = crate::sql::scan(*d, sql);
         scan.reads_only() && scan.first_words().is_some_and(|(w, _)| w.eq_ignore_ascii_case("select"))
     })
+}
+
+/// Whether SQL written in the program surely writes, as SQLite, PostgreSQL and MySQL each read it:
+/// not one that only reads (`sql::Scan::reads_only`, what the prefetch guard asks at run time), and
+/// it names a table it writes (`insert into`, `update`, `delete from`, `create`, `alter` or `drop
+/// table`, `truncate`) or a statement of it starts with a word that changes the database. A
+/// `select ... for update`, a `select nextval(...)` or a `pragma` is no sure write (FEEDBACK70.md,
+/// Q-965; branch security).
+fn writes_written(sql: &str) -> bool {
+    const CHANGING: &[&str] = &["insert", "update", "delete", "replace", "merge", "create", "alter", "drop", "truncate"];
+    crate::sql::Dialect::ALL.iter().all(|d| {
+        let scan = crate::sql::scan(*d, sql);
+        !scan.reads_only() && (!scan.tables.writes.is_empty() || scan.heads().any(|(a, _)| CHANGING.iter().any(|w| a.eq_ignore_ascii_case(w))))
+    })
+}
+
+/// SQL as a message shows it: on one line, cut after 60 characters.
+fn sql_shown(sql: &str) -> String {
+    let one: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    match one.char_indices().nth(60) {
+        Some((at, _)) => format!("{}...", &one[..at]),
+        None => one,
+    }
+}
+
+/// The builtins called by name that change something, as the prefetch guard refuses them
+/// (`interp::CHANGES`); `db.*`, `http.*`, `image.convert`, `notification.send` and a service's
+/// functions are read in `Checker::get_call`, and `db.atomic` is what its function does
+/// (FEEDBACK70.md, Q-965; branch security).
+const GET_WRITES: &[&str] = &["idempotent", "set_cookie", "delete_cookie", "set_session", "end_session", "mcp_token", "revoke_mcp_token", "write_file", "delete_file", "save_upload", "publish"];
+
+/// What one function's own code, or a route's, surely does, read once (`GetWalk`): its writes and
+/// the lines they are on, its first read of who the visitor is, and the program's functions it
+/// calls, hands on or shows (a component), in the order written (FEEDBACK70.md, Q-965; branch
+/// security).
+#[derive(Debug, Default)]
+struct GetOwn {
+    writes: Vec<(String, u32)>,
+    reads: Option<String>,
+    calls: Vec<String>,
+}
+
+/// What a route or a `server fn` surely does with the functions it calls (`Checker::get_facts`):
+/// each write it reaches, nearest first, with the function it is in (None: its own code), file
+/// and line; and its nearest read of who the visitor is, with the function it is in.
+#[derive(Debug, Default, Clone)]
+struct GetFacts {
+    writes: Vec<GetWrite>,
+    reads: Option<(String, Option<String>)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct GetWrite {
+    what: String,
+    at: Option<String>,
+    file: Arc<str>,
+    line: u32,
+}
+
+impl GetWrite {
+    /// As a message says it: `db.exec("...")`, in `seen`.
+    fn shown(&self) -> String {
+        match &self.at {
+            Some(f) => format!("{}, in `{}`", self.what, f),
+            None => self.what.clone(),
+        }
+    }
+}
+
+/// One route's warning: its write(s) and its read of who the visitor is.
+fn get_one(route: &(Arc<str>, u32, String, String), writes: &str) -> (Arc<str>, u32, String) {
+    let (file, line, shown, read) = route;
+    (file.clone(), *line, format!(
+        "`{}` writes ({}) and reads who the visitor is ({}): a link on another site, in an email or in a chat runs it with their session (`SameSite=Lax` cookies go with a followed link). Make it a `POST`, or, if the write is meant (a confirm-your-address link, a sign-in callback, a presence ping), tag it: `route writes GET ...`",
+        shown, writes, read
+    ))
+}
+
+/// What reading a function's code for `GetOwn` needs of the program: its functions, the files they
+/// are in, its top-level `let`s, and those of them that hold a connection (`db.connect`).
+struct GetCx<'a> {
+    fns: &'a HashMap<String, Arc<FnDef>>,
+    files: &'a HashMap<String, Arc<str>>,
+    top_lets: &'a HashSet<String>,
+    conns: &'a HashSet<String>,
+}
+
+/// Each function's own code as read, and whether it can reach a write and a read of who the visitor
+/// is, through the functions it calls (`Checker::reaches`): kept for the check, so a function many
+/// routes reach is read once.
+#[derive(Default)]
+struct GetSeen {
+    own: HashMap<String, Arc<GetOwn>>,
+    reach: HashMap<String, (bool, bool)>,
+}
+
+/// The program's functions by name, the files they are in, and the top-level `let`s that hold a
+/// connection, for `GetCx`.
+fn get_program(order: &[Item]) -> (HashMap<String, Arc<FnDef>>, HashMap<String, Arc<str>>, HashSet<String>) {
+    let (mut fns, mut files, mut conns) = (HashMap::new(), HashMap::new(), HashSet::new());
+    for it in order {
+        match &it.stmt {
+            Stmt::Fn(d) => {
+                fns.insert(d.name.clone(), d.clone());
+                files.insert(d.name.clone(), it.file.clone());
+            }
+            Stmt::Let(Pattern::Bind(n), e, _) if is_connect(e) => {
+                conns.insert(n.to_string());
+            }
+            _ => {}
+        }
+    }
+    (fns, files, conns)
+}
+
+/// A function's code as it runs: its parameters' defaults, then its body.
+fn fn_code(d: &FnDef) -> Vec<&Expr> {
+    d.params.iter().filter_map(|p| p.default.as_ref()).chain(std::iter::once(&d.body)).collect()
+}
+
+/// `o.name`, `o?.name` or `o["name"]`: the object, past a `?`, and the name.
+fn field_of(x: &Expr) -> Option<(&Expr, &str)> {
+    let (o, n) = match x {
+        Expr::Field(o, n, _) => (&**o, n.as_str()),
+        Expr::Index(o, k, _) => match &**k {
+            Expr::Lit(Lit::Str(n)) => (&**o, &**n),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let mut o = o;
+    while let Expr::Try(inner) = o {
+        o = inner;
+    }
+    Some((o, n))
+}
+
+/// A field of the request that says nothing of who the visitor is: nobody's
+/// (`parser::NOBODYS_FIELDS`, what a cache keeps pages by or what was sent), and `ip`, the address,
+/// which a link on another site gives nothing of the visitor's to write as.
+fn nobodys_field(f: &str) -> bool {
+    crate::parser::NOBODYS_FIELDS.contains(&f) || f == "ip"
+}
+
+/// What a name the code binds stands for where it is in scope (`GetWalk`).
+#[derive(Debug, Clone, Copy)]
+enum Bound {
+    Plain,
+    /// `let c = db.connect(...)`: its functions are `db`'s.
+    Conn,
+    /// `let f = () => ...`, a local `fn`: read where it is called or handed on.
+    Held(usize),
+}
+
+/// One walk of a function's or a route's code for `GetOwn`, in the order it runs, each name the code
+/// binds in scope only where it is bound: after its `let`, in its lambda, its loop, its arm. Left
+/// out, as code that runs elsewhere or later: a handler written in markup (`@click`), a lambda given
+/// as an attribute, and a lambda a `let` holds until the code calls it or hands it on. A
+/// component's props, and what a component the page shows runs to be made, run here. The request
+/// is read as `parser::request_use` reads it (Q-886): going anywhere but to a field of nobody's,
+/// `ip` and `headers.host` taken as nobody's too; its headers and cookies named where the text
+/// names them (FEEDBACK70.md, Q-965, second review; branch security).
+struct GetWalk<'a, 'c> {
+    ck: &'a Checker,
+    cx: &'a GetCx<'c>,
+    scope: Vec<(String, Bound)>,
+    /// The names that are the request where nothing binds them.
+    names: &'a [&'a str],
+    o: GetOwn,
+    /// What reading the request at each of its names is (None: nobody's).
+    said: HashMap<*const Expr, Option<String>>,
+    /// The reads of the request, in order.
+    uses: Vec<String>,
+    held: Vec<Arc<FnDef>>,
+    held_read: HashSet<usize>,
+}
+
+impl<'a, 'c> GetWalk<'a, 'c> {
+    fn new(ck: &'a Checker, cx: &'a GetCx<'c>, names: &'a [&'a str], params: &[String]) -> Self {
+        GetWalk { ck, cx, scope: params.iter().map(|p| (p.clone(), Bound::Plain)).collect(), names, o: GetOwn::default(), said: HashMap::new(), uses: Vec::new(), held: Vec::new(), held_read: HashSet::new() }
+    }
+
+    fn bound(&self, n: &str) -> Option<Bound> {
+        self.scope.iter().rev().find(|(m, _)| m == n).map(|(_, b)| *b)
+    }
+
+    /// Whether `e` is the request, by one of its names nothing here binds.
+    fn is_request(&self, e: &Expr) -> bool {
+        matches!(e, Expr::Ident(n, _) if self.names.contains(&n.as_str()) && self.bound(n.as_str()).is_none())
+    }
+
+    fn write(&mut self, what: String, line: u32) {
+        self.o.writes.push((what, line));
+    }
+
+    fn exprs(&mut self, code: &[&Expr]) {
+        for e in code {
+            self.expr(e);
+        }
+    }
+
+    fn expr(&mut self, e: &Expr) {
+        self.request_at(e);
+        match e {
+            Expr::Lit(_) => {}
+            Expr::Ident(n, _) => {
+                if self.is_request(e) {
+                    let what = match self.said.get(&(e as *const Expr)) {
+                        Some(None) => None,
+                        Some(Some(w)) => Some(w.clone()),
+                        None => Some("the request".to_string()),
+                    };
+                    self.uses.extend(what);
+                }
+                let _ = n;
+            }
+            Expr::Template(parts) => {
+                for p in parts {
+                    if let TPart::Expr(x) = p {
+                        self.expr(x);
+                    }
+                }
+            }
+            Expr::List(xs) => xs.iter().for_each(|x| self.expr(x)),
+            Expr::Map(es) => es.iter().for_each(|(_, x)| self.expr(x)),
+            Expr::Unary(_, x, _) | Expr::Try(x) | Expr::Field(x, _, _) => self.expr(x),
+            Expr::Binary(_, a, b, _) | Expr::Coalesce(a, b) | Expr::Index(a, b, _) => {
+                self.expr(a);
+                self.expr(b);
+            }
+            Expr::Pipe(lhs, rhs, line) => {
+                self.expr(lhs);
+                match &**rhs {
+                    Expr::Call(c, args, l) => {
+                        self.call(c, Some(lhs), args, *l);
+                        self.expr(c);
+                        args.iter().for_each(|a| self.expr(a));
+                    }
+                    other => {
+                        self.call(other, Some(lhs), &[], *line);
+                        self.expr(other);
+                    }
+                }
+            }
+            Expr::Call(c, args, line) => {
+                self.call(c, None, args, *line);
+                self.expr(c);
+                // What `every` and `schedule` are given runs later (in a component, in the browser:
+                // the page's clock), and a channel's or a port's handler when a message comes.
+                let later = match &**c {
+                    Expr::Ident(n, _) => matches!(n.as_str(), "every" | "schedule") && self.bound(n.as_str()).is_none(),
+                    Expr::Field(o, f, _) => matches!(&**o, Expr::Ident(m, _) if self.bound(m.as_str()).is_none() && matches!((m.as_str(), f.as_str()), ("channel", "on") | ("udp", "listen"))),
+                    _ => false,
+                };
+                args.iter().filter(|a| !(later && matches!(a, Expr::Lambda(_)))).for_each(|a| self.expr(a));
+            }
+            Expr::If(c, a, b) => {
+                self.expr(c);
+                self.expr(a);
+                if let Some(b) = b {
+                    self.expr(b);
+                }
+            }
+            Expr::Match(s, arms, _) => {
+                self.expr(s);
+                for a in arms {
+                    let mark = self.scope.len();
+                    self.pattern(&a.pat);
+                    self.bind_pattern(&a.pat, Bound::Plain);
+                    if let Some(g) = &a.guard {
+                        self.expr(g);
+                    }
+                    self.expr(&a.body);
+                    self.scope.truncate(mark);
+                }
+            }
+            Expr::For(p, i, b, _) => {
+                self.expr(i);
+                let mark = self.scope.len();
+                self.pattern(p);
+                self.bind_pattern(p, Bound::Plain);
+                self.expr(b);
+                self.scope.truncate(mark);
+            }
+            Expr::While(c, b, _) => {
+                self.expr(c);
+                self.expr(b);
+            }
+            Expr::Block(stmts) => self.block(stmts),
+            Expr::Lambda(d) => self.lambda(d),
+            Expr::Reply(s, b, _) => {
+                self.expr(s);
+                if let Some(b) = b {
+                    self.expr(b);
+                }
+            }
+            Expr::Html(el, _) => self.html(el),
+        }
+    }
+
+    /// The names a pattern binds, in scope from here.
+    fn bind_pattern(&mut self, p: &Pattern, b: Bound) {
+        let mut names = Vec::new();
+        pattern_names(p, &mut names);
+        self.scope.extend(names.into_iter().map(|n| (n, b)));
+    }
+
+    /// A pattern's defaults, which run where it matches.
+    fn pattern(&mut self, p: &Pattern) {
+        match p {
+            Pattern::Record(fields) => {
+                for f in fields {
+                    if let Some(d) = &f.default {
+                        self.expr(d);
+                    }
+                    self.pattern(&f.pat);
+                }
+            }
+            Pattern::List(ps, _) | Pattern::Alt(ps) => ps.iter().for_each(|p| self.pattern(p)),
+            Pattern::As(p, _) => self.pattern(p),
+            Pattern::Bind(_) | Pattern::Wild | Pattern::Lit(_) | Pattern::Type(_) => {}
+        }
+    }
+
+    fn block(&mut self, stmts: &[Stmt]) {
+        let mark = self.scope.len();
+        for s in stmts {
+            match s {
+                Stmt::Let(Pattern::Bind(n), Expr::Lambda(d), _) => {
+                    self.held.push(d.clone());
+                    self.scope.push((n.to_string(), Bound::Held(self.held.len() - 1)));
+                }
+                Stmt::Let(p, init, _) => {
+                    // `let { cookies } = request`: what it takes.
+                    if let Pattern::Record(fields) = p {
+                        if self.is_request(init) {
+                            let what = fields.iter().filter_map(|f| f.path.first()).find(|f| !nobodys_field(f)).map(|f| match f.as_str() {
+                                "headers" | "cookies" => format!("the request's {}", f),
+                                f => format!("`request.{}`", f),
+                            });
+                            self.said.entry(init as *const Expr).or_insert(what);
+                        }
+                    }
+                    self.expr(init);
+                    self.pattern(p);
+                    let b = if matches!(p, Pattern::Bind(_)) && is_connect(init) { Bound::Conn } else { Bound::Plain };
+                    self.bind_pattern(p, b);
+                }
+                Stmt::Assign(n, _, e, line) => {
+                    self.expr(e);
+                    if self.cx.top_lets.contains(n.as_str()) && self.bound(n.as_str()).is_none() {
+                        self.write(format!("assigns the program's variable `{}`", n), *line);
+                    }
+                }
+                Stmt::SetField(o, _, _, e, _) => {
+                    self.expr(o);
+                    self.expr(e);
+                }
+                Stmt::Expr(e) | Stmt::Return(Some(e), _) => self.expr(e),
+                Stmt::State(n, e, _) => {
+                    self.expr(e);
+                    self.scope.push((n.clone(), Bound::Plain));
+                }
+                Stmt::Fn(d) => {
+                    self.held.push(d.clone());
+                    self.scope.push((d.name.clone(), Bound::Held(self.held.len() - 1)));
+                }
+                _ => {}
+            }
+        }
+        self.scope.truncate(mark);
+    }
+
+    fn lambda(&mut self, d: &FnDef) {
+        let mark = self.scope.len();
+        self.scope.extend(d.params.iter().map(|p| (p.name.to_string(), Bound::Plain)));
+        let code = fn_code(d);
+        self.exprs(&code);
+        self.scope.truncate(mark);
+    }
+
+    /// A held lambda, called or handed on: read once, where it is.
+    fn read_held(&mut self, k: usize) {
+        if self.held_read.insert(k) {
+            let d = self.held[k].clone();
+            self.lambda(&d);
+        }
+    }
+
+    fn html(&mut self, el: &HtmlEl) {
+        if let Some(id) = &el.id {
+            self.expr(id);
+        }
+        el.classes.iter().for_each(|c| self.expr(c));
+        for (name, v) in &el.attrs {
+            if let AttrVal::Expr(v) | AttrVal::Spread(v) = v {
+                if !name.starts_with('@') && !matches!(v, Expr::Lambda(_)) {
+                    self.expr(v);
+                }
+            }
+        }
+        // A component the page shows: what the server runs to make it.
+        if el.tag.starts_with(char::is_uppercase) && self.bound(&el.tag).is_none() && self.cx.fns.contains_key(el.tag.as_str()) {
+            self.o.calls.push(el.tag.clone());
+        }
+        for c in &el.children {
+            match c {
+                HtmlChild::El(e) => self.html(e),
+                HtmlChild::Expr(x) => self.expr(x),
+            }
+        }
+    }
+
+    /// Before `e` is read: what reading the request there is, the outermost first
+    /// (`request.headers["user-agent"]`, the request handed to a function, to a group's middleware).
+    fn request_at(&mut self, e: &Expr) {
+        if let Some((o, name)) = field_of(e) {
+            if let Some((r, kind)) = field_of(o).filter(|(r, k)| self.is_request(r) && matches!(*k, "headers" | "cookies")) {
+                let what = (kind == "cookies" || !name.eq_ignore_ascii_case("host")).then(|| format!("the `{}` {}", name, if kind == "headers" { "header" } else { "cookie" }));
+                self.said.entry(r as *const Expr).or_insert(what);
+            } else if self.is_request(o) {
+                let what = match name {
+                    f if nobodys_field(f) => None,
+                    "headers" | "cookies" => Some(format!("the request's {}", name)),
+                    f => Some(format!("`request.{}`", f)),
+                };
+                self.said.entry(o as *const Expr).or_insert(what);
+            }
+        }
+        if let Expr::Call(c, args, _) = e {
+            let callee = match &**c {
+                Expr::Ident(n, _) => n.to_string(),
+                Expr::Field(_, n, _) => n.clone(),
+                _ => String::new(),
+            };
+            // The request handed to a group's middleware is the middleware's to read.
+            if callee == "__answer" {
+                if let Some(Expr::Call(_, given, _)) = args.first() {
+                    let mine: Vec<*const Expr> = given.iter().filter(|a| self.is_request(a)).map(|a| a as *const Expr).collect();
+                    for a in mine {
+                        self.said.insert(a, None);
+                    }
+                }
+            }
+            let handed: Vec<*const Expr> = args.iter().filter(|a| self.is_request(a)).map(|a| a as *const Expr).collect();
+            for a in handed {
+                let what = if callee.is_empty() { "the request".to_string() } else { format!("the request, given to `{}`", callee) };
+                self.said.entry(a).or_insert(Some(what));
+            }
+        }
+    }
+
+    /// A call: of a function of the program's (followed by `get_facts`), of a held lambda, of a
+    /// builtin that writes or reads who the visitor is, of a connection's or a service's function,
+    /// or a group's middleware; and the functions it is handed (`db.transaction(save)`).
+    fn call(&mut self, callee: &Expr, piped: Option<&Expr>, args: &[Expr], line: u32) {
+        for a in piped.into_iter().chain(args.iter()) {
+            if let Expr::Ident(n, _) = a {
+                match self.bound(n.as_str()) {
+                    Some(Bound::Held(k)) => self.read_held(k),
+                    Some(_) => {}
+                    None if self.cx.fns.contains_key(n.as_str()) => self.o.calls.push(n.to_string()),
+                    None => {}
+                }
+            }
+        }
+        let first = piped.or(args.first());
+        match callee {
+            Expr::Ident(n, _) => match self.bound(n.as_str()) {
+                Some(Bound::Held(k)) => self.read_held(k),
+                Some(_) => {}
+                None if self.cx.fns.contains_key(n.as_str()) => self.o.calls.push(n.to_string()),
+                None => match n.as_str() {
+                    "session" | "cookie" => {
+                        self.o.reads.get_or_insert_with(|| format!("`{}()`", n));
+                    }
+                    "__answer" => self.middleware(first),
+                    n if GET_WRITES.contains(&n) => self.write(format!("`{}`", n), line),
+                    _ => {}
+                },
+            },
+            Expr::Field(obj, name, _) => match &**obj {
+                Expr::Ident(m, _) => match self.bound(m.as_str()) {
+                    // A connection's functions are `db`'s (`db::connection`).
+                    Some(Bound::Conn) => self.db(name, first, &format!("{}.{}", m, name), line),
+                    Some(_) => self.method(name, line),
+                    None if self.cx.conns.contains(m.as_str()) => self.db(name, first, &format!("{}.{}", m, name), line),
+                    None if self.ck.module_named(m) => {
+                        let full = format!("{}.{}", m, name);
+                        match full.as_str() {
+                            f if f.starts_with("db.") => self.db(name, first, f, line),
+                            "http.post" | "http.put" | "http.patch" | "http.delete" | "image.convert" | "notification.send" => self.write(format!("`{}`", full), line),
+                            "http.request" => {
+                                if let Some(Expr::Lit(Lit::Str(method))) = first {
+                                    if !["GET", "HEAD", "OPTIONS"].iter().any(|g| method.eq_ignore_ascii_case(g)) {
+                                        self.write(format!("`http.request(\"{}\", ...)`", method), line);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    // A call of another program, unless its code is read and does not surely write.
+                    None if self.ck.services.contains_key(m.as_str()) && !self.cx.fns.contains_key(m.as_str()) => {
+                        if !self.ck.service_fn(m, name).is_some_and(|x| !x.sure_writes) {
+                            self.write(format!("`{}.{}`, a call of the service `{}`", m, name, m), line);
+                        }
+                    }
+                    None => self.method(name, line),
+                },
+                Expr::Field(inner, later, _) if later == "later" && matches!(&**inner, Expr::Ident(s, _) if self.ck.services.contains_key(s.as_str()) && self.bound(s.as_str()).is_none()) => {
+                    if let Expr::Ident(s, _) = &**inner {
+                        self.write(format!("`{}.later.{}`, a call of the service `{}` made later", s, name, s), line);
+                    }
+                }
+                _ => self.method(name, line),
+            },
+            _ => {}
+        }
+    }
+
+    /// `x.f(...)`, which is `f(x, ...)`.
+    fn method(&mut self, name: &str, line: u32) {
+        if self.cx.fns.contains_key(name) {
+            self.o.calls.push(name.to_string());
+        } else if GET_WRITES.contains(&name) {
+            self.write(format!("`{}`", name), line);
+        }
+    }
+
+    /// A group's middleware, handed the request: what it reads of it, written in place, a function
+    /// of the program's, or one such a function makes (`| require("admin")`). Its own `session()`
+    /// is found where its code is read.
+    fn middleware(&mut self, first: Option<&Expr>) {
+        let Some(Expr::Call(m, _, _)) = first else { return };
+        let mut made: Vec<Arc<FnDef>> = Vec::new();
+        match &**m {
+            Expr::Lambda(d) => made.push(d.clone()),
+            Expr::Ident(n, _) if self.bound(n.as_str()).is_none() => made.extend(self.cx.fns.get(n.as_str()).cloned()),
+            Expr::Call(f, _, _) => {
+                if let Some(d) = if let Expr::Ident(n, _) = &**f { self.cx.fns.get(n.as_str()) } else { None } {
+                    walk_expr(&d.body, &mut |y| {
+                        if let Expr::Lambda(l) = y {
+                            made.push(l.clone());
+                        }
+                    });
+                }
+            }
+            _ => {}
+        }
+        if self.o.reads.is_none() {
+            self.o.reads = made.iter().find_map(|d| self.middleware_read(d)).map(|r| format!("{}, in its group's middleware", r));
+        }
+    }
+
+    /// What a group's middleware reads of who the visitor is from the request it is handed, its
+    /// first parameter: its uses there, but that handing it back is how it lets the route go on, as
+    /// `parser::middleware_reads_visitor` reads it (Q-886). The first use that says what it reads.
+    fn middleware_read(&self, d: &FnDef) -> Option<String> {
+        let p = d.params.first()?.name.to_string();
+        let names = [p.as_str()];
+        let mut w = GetWalk::new(self.ck, self.cx, &names, &[]);
+        w.exprs(&fn_code(d));
+        if w.uses.len() as u32 <= crate::parser::given_back(&d.body, &p) {
+            return None;
+        }
+        w.uses.iter().find(|u| *u != "the request").or(w.uses.first()).cloned()
+    }
+
+    /// A call of `db`'s function `name` (`shown` as written): a statement written in the program
+    /// that only reads is no write; one built as it runs is `db.exec`'s, which writes; `db.query`
+    /// and `db.one` write only where their written SQL surely does. `sql\`...\`` is its text.
+    fn db(&mut self, name: &str, first: Option<&Expr>, shown: &str, line: u32) {
+        let sql = first.and_then(|e| match e {
+            Expr::Call(f, args, _) if args.len() == 1 && matches!(&**f, Expr::Ident(n, _) if n == "sql" && self.bound("sql").is_none() && !self.cx.fns.contains_key("sql")) => sql_written(&args[0]),
+            e => sql_written(e),
+        });
+        match name {
+            "exec" | "exec_many" => match sql {
+                Some(sql) if reads_written(&sql) => {}
+                Some(sql) => self.write(format!("`{}(\"{}\")`", shown, sql_shown(&sql)), line),
+                None => self.write(format!("`{}`", shown), line),
+            },
+            "query" | "one" => {
+                if let Some(sql) = sql.filter(|s| writes_written(s)) {
+                    self.write(format!("`{}(\"{}\")`, SQL that writes", shown, sql_shown(&sql)), line);
+                }
+            }
+            "migrate" => self.write(format!("`{}`", shown), line),
+            _ => {}
+        }
+    }
+
+    /// What the code was found to do: the request read where nothing else read who the visitor is.
+    fn done(mut self) -> GetOwn {
+        if self.o.reads.is_none() {
+            self.o.reads = self.uses.into_iter().next();
+        }
+        self.o
+    }
 }
 
 /// Names called in a body (not inside nested function definitions'
