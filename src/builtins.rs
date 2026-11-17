@@ -2326,7 +2326,7 @@ pub(crate) fn location(url: &str) -> Option<String> {
     if scheme.is_none() && url.starts_with('/') && !url.starts_with("//") {
         let end = url.find(['?', '#']).unwrap_or(url.len());
         if url[..end].split('/').any(|seg| dots(seg) > 0) {
-            url = format!("{}{}", without_dots(&url[..end]), &url[end..]).into();
+            url = format!("{}{}", one_slash_first(without_dots(&url[..end])), &url[end..]).into();
         }
     }
     if url.bytes().all(fine) {
@@ -2388,13 +2388,19 @@ pub(crate) fn location(url: &str) -> Option<String> {
 /// A path segment that is `.` (1) or `..` (2), in any of the forms browsers read so (`%2e`, `.%2E`),
 /// else 0 (FEEDBACK55.md, Q-719; branch feedback55).
 fn dots(seg: &str) -> u8 {
-    if seg.is_empty() || seg.len() > 6 {
+    // Compared as they are, with no lower-case copy, and a segment that starts with neither `.`
+    // nor `%` let go at once: `local_path` looks at each segment of a path with a `.` in it,
+    // `/docs/page.html` too (FEEDBACK71.md, Q-968; branch feedback71).
+    if seg.is_empty() || seg.len() > 6 || !matches!(seg.as_bytes()[0], b'.' | b'%') {
         return 0;
     }
-    match seg.to_ascii_lowercase().as_str() {
-        "." | "%2e" => 1,
-        ".." | ".%2e" | "%2e." | "%2e%2e" => 2,
-        _ => 0,
+    let is = |form: &str| seg.eq_ignore_ascii_case(form);
+    if is(".") || is("%2e") {
+        1
+    } else if is("..") || is(".%2e") || is("%2e.") || is("%2e%2e") {
+        2
+    } else {
+        0
     }
 }
 
@@ -2419,6 +2425,18 @@ fn without_dots(path: &str) -> String {
         }
     }
     format!("/{}", out.join("/"))
+}
+
+/// A path of the site's own with one `/` first, where taking its dot segments out left more:
+/// `/.//evil.com` is `//evil.com` without them, which a `Location` holds as another host, so the
+/// path that stays on the site is `/evil.com`. A path that had no dot segments is left as it was
+/// given (FEEDBACK71.md, Q-968; branch feedback71).
+fn one_slash_first(path: String) -> String {
+    if path.starts_with("//") {
+        format!("/{}", path.trim_start_matches('/'))
+    } else {
+        path
+    }
 }
 
 /// Whether a URL would run code or carry a page of its own when followed: `javascript:`,
@@ -2823,15 +2841,47 @@ pub(crate) fn real_as_made(p: &Path) -> std::path::PathBuf {
 /// (`//evil.example`, `/\evil.example`, `https:...`) is null, so `redirect(local_path(next) ??
 /// "/")` cannot send a visitor to another site (FEEDBACK31.md, Q-390; branch feedback27-35-fixes).
 pub fn local_target(s: &str) -> Option<String> {
-    let s: String = s.chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).map(|c| if c == '\\' { '/' } else { c }).collect();
+    // A copy without them is made only for an address that has a tab, a line break or a `\`; the
+    // checks below read the address as it is, with no lower-case copy, as one is read for each
+    // request a login's `next` comes in (FEEDBACK71.md, Q-968; branch feedback71).
+    let cleaned: String;
+    let s = if s.bytes().any(|b| matches!(b, b'\t' | b'\n' | b'\r' | b'\\')) {
+        cleaned = s.chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).map(|c| if c == '\\' { '/' } else { c }).collect();
+        cleaned.as_str()
+    } else {
+        s
+    };
     let s = s.trim_matches(|c: char| c <= ' ');
-    if !s.starts_with('/') || s.starts_with("//") || s.chars().any(|c| c.is_control()) {
+    if !s.starts_with('/') || s.starts_with("//") || s.bytes().any(|b| b < 0x20 || b == 0x7f) || (!s.is_ascii() && s.chars().any(|c| c.is_control())) {
         return None;
     }
     // A `:` before the path's first `/`, `?` or `#` would be a scheme; none can be here, as it
     // starts with `/`, but `/%2F/x` decodes to `//x` in some servers: refused too.
-    let lower = s.to_ascii_lowercase();
-    if lower.starts_with("/%2f") || lower.starts_with("/%5c") {
+    let refused = |p: &str| p.starts_with("//") || p.get(..4).is_some_and(|h| h.eq_ignore_ascii_case("/%2f") || h.eq_ignore_ascii_case("/%5c"));
+    if refused(s) {
+        return None;
+    }
+    // Nor one that starts so once its `.` and `..` are taken out, as a browser takes them out:
+    // `/.//evil.example`, `/%2e//evil.example` and `/a/..//evil.example` are `//evil.example`. A
+    // path with no segment that starts with `.` or `%` has none, and is not walked: one look at
+    // its bytes, up to the query or fragment, so `/docs/page.html` is not (FEEDBACK71.md, Q-968;
+    // branch feedback71).
+    let mut end = s.len();
+    let mut maybe = false;
+    let mut after_slash = false;
+    for (i, b) in s.bytes().enumerate() {
+        match b {
+            b'?' | b'#' => {
+                end = i;
+                break;
+            }
+            b'.' | b'%' if after_slash => maybe = true,
+            _ => {}
+        }
+        after_slash = b == b'/';
+    }
+    let path = &s[..end];
+    if maybe && path.split('/').any(|seg| dots(seg) > 0) && refused(&without_dots(path)) {
         return None;
     }
     Some(s.to_string())

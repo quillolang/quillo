@@ -326,7 +326,12 @@ routes /reports | signed_in with db {               // what its routes may do, a
   `next` came in the address, so anyone can write a link whose `next` is another site:
   `local_path(next)` *(since 0.7)* gives `next` when it is an address on this site as a browser reads it
   (tabs and line breaks dropped, `\` read as `/`), else null. `//evil.example`,
-  `/\evil.example`, `https://...` and `javascript:...` are null. It works on both sides.
+  `/\evil.example`, `https://...` and `javascript:...` are null, and so is a path that
+  starts so once its `.` and `..` are taken out, as a browser takes them out:
+  `/.//evil.example`, `/%2e//evil.example`, `/a/..//evil.example`. It works on both sides.
+  `redirect` writes a path of the site's own as the browser would go to it, its dot segments
+  out, and one `/` first where that left more: `redirect("/.//evil.example")` sends the
+  visitor to `/evil.example` on the site, not to `evil.example`.
 
   ```quillo
   route GET /login ? { next: str = "/" } =

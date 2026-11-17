@@ -2050,6 +2050,24 @@ B.local_path = meta((s) => {
   if (typeof s !== "string") return null;
   s = s.replace(/[\t\n\r]/g, "").replace(/\\/g, "/").replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, "");
   if (!s.startsWith("/") || s.startsWith("//") || /[\x00-\x1f\x7f]/.test(s) || /^\/%(2f|5c)/i.test(s)) return null;
+  // Nor one that starts so once its `.` and `..` are taken out, as a browser takes them out:
+  // `/.//evil.example` is `//evil.example` (as on the server, `local_target`; FEEDBACK71.md,
+  // Q-968; branch feedback71).
+  const end = s.search(/[?#]/), path = end < 0 ? s : s.slice(0, end);
+  const segs = /\/[.%]/.test(path) ? path.toLowerCase().slice(1).split("/") : [];
+  const dots = (g) => (g === "." || g === "%2e" ? 1 : g === ".." || g === ".%2e" || g === "%2e." || g === "%2e%2e" ? 2 : 0);
+  if (segs.some(dots)) {
+    const out = [];
+    segs.forEach((g, i) => {
+      const n = dots(g);
+      if (!n) out.push(g);
+      else {
+        if (n === 2) out.pop();
+        if (i === segs.length - 1) out.push("");
+      }
+    });
+    if (/^\/(\/|%2f|%5c)/.test("/" + out.join("/"))) return null;
+  }
   return s;
 }, "local_path", null);
 // One Unicode form, as on the server (FEEDBACK31.md, Q-394; branch feedback27-35-fixes).
