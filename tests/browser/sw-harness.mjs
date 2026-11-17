@@ -52,6 +52,15 @@ export async function makeBrowser(origin) {
     const manual = nav || init.redirect === "manual";
     const own = typeof r === "object" && r.headers ? Object.fromEntries(new Headers(r.headers)) : {};
     const headers = { cookie: cookieHeader(), ...own, ...(init.headers || {}) };
+    // The worker's own prefetch of a page answered as a busy Quillo answers it, the first
+    // `browser.busy.times` times (`browser.busy = { path, times }`); each is counted in `asked`.
+    if (browser.busy && url.endsWith(browser.busy.path) && headers["x-quillo-prefetch"] === "1") {
+      browser.busy.asked = (browser.busy.asked || 0) + 1;
+      if (browser.busy.times > 0) {
+        browser.busy.times--;
+        return new Response(null, { status: 503, headers: { "cache-control": "no-store", ...(browser.busy.plain ? {} : { "x-quillo-prefetch": "busy" }) } });
+      }
+    }
     // A request sent now whose answer comes later (`browser.hold`).
     const res = await fetch(url, { method, headers, body: r.body, redirect: "manual" });
     if (browser.hold && url.endsWith(browser.hold.path)) await browser.hold.gate;
@@ -77,7 +86,7 @@ export async function makeBrowser(origin) {
     registration: { navigationPreload: null, unregister() {} },
     clients: { claim: async () => {} },
   };
-  const start = () => vm.runInContext(src, vm.createContext({ self, caches, fetch: net, location: { origin, href: origin + "/_quillo/sw.js" }, Response, Headers, URL, Promise, console, Date: FakeDate, Set, RegExp }));
+  const start = () => vm.runInContext(src, vm.createContext({ self, caches, fetch: net, location: { origin, href: origin + "/_quillo/sw.js" }, Response, Headers, URL, Promise, console, Date: FakeDate, Set, RegExp, setTimeout }));
   start();
   const run = async (kind, e) => {
     const waits = [];

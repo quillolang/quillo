@@ -4649,8 +4649,11 @@ impl Worker {
         } else if prefetch && crate::httpd::others_waiting() {
             // A guess is work nobody has asked for yet, so it does not go before anyone. The
             // browser drops the 503, and a click is made as usual (FEEDBACK22.md, Q-179;
-            // branch feedback22-fixes).
-            HttpResponse { status: 503, headers: vec![("cache-control".into(), "no-store".into())], body: Vec::new() }
+            // branch feedback22-fixes). Marked `busy`, which Quillo's worker asks again in a
+            // moment as it installs: with nothing to tell it from a proxy's 503, a busy server's
+            // pages were kept only on a navigation 10 s on, and under steady load not at all
+            // (FEEDBACK67.md, B.2, found on CI; branch pwa).
+            HttpResponse { status: 503, headers: vec![("cache-control".into(), "no-store".into()), ("x-quillo-prefetch".into(), "busy".into())], body: Vec::new() }
         } else if too_many_parts(&req) {
             // As a body past the limit is, before the route runs: the parts past it were dropped
             // and the answer was a 200 (FEEDBACK55.md, Q-716; branch feedback55).

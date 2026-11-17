@@ -539,9 +539,11 @@ routes offline /help {
   components working. A page with a parameter is kept once it is opened. The worker asks for
   them one at a time as a prefetch, which Quillo answers changing nothing (see
   [Prefetching](#prefetching)): a route that would write, set a cookie or call a service is
-  refused, and kept only once someone opens it; a redirect is skipped. A page that did not
-  come (no network, a `502` to `504`) is asked for again on later navigations, 10 s, 30 s,
-  90 s and 270 s after each try, five tries in all.
+  refused, and kept only once someone opens it; a redirect is skipped. A page Quillo is too
+  busy to prefetch (others' requests are waiting, as a prefetch never goes before anyone) is
+  asked again within the try, after 0.25, 0.5, 1 and 2 s, 5 s for the whole try. A page that
+  did not come (no network, a `502` to `504`) is asked for again on later navigations, 10 s,
+  30 s, 90 s and 270 s after each try, five tries in all.
 - **The rest goes to the network** as if there were no worker: `server fn` calls, forms
   sent, `fetch`. A `server fn` called offline gives its error value (`` server fn `save`
   could not be reached: ... ``), and the handler says what it likes. Only Quillo's files named by
