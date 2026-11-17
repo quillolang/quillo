@@ -1907,11 +1907,17 @@ route GET / = <html><body><Count/></body></html>
 /// second, 2 s or more.
 const ONLINE_SCRIPT: &str = r#"(async () => {
   const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 200 && document.getElementById("v").textContent !== "count 0"; i++) await tick(25);
+  // The live loop is the bundle's, which comes when the island is reached for and took seconds on
+  // CI's debug build: the server was stopped before it came, and no socket was ever made (tried 0,
+  // at_once 0, in every CI run since this test was written). Reached for, and booted, before the
+  // sockets are counted, as a fast machine always had it (a shown bug in the test; branch pwa).
+  document.getElementById("v").dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+  for (let i = 0; i < 400 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(25);
   const W = WebSocket;
   let made = 0, closed = 0;
   window.WebSocket = function (u, p) { const s = p === undefined ? new W(u) : new W(u, p); made++; s.addEventListener("close", () => closed++); return s; };
   window.WebSocket.prototype = W.prototype;
-  for (let i = 0; i < 200 && document.getElementById("v").textContent !== "count 0"; i++) await tick(25);
   await fetch("@STAGE@/stage/1", { mode: "no-cors" });
   for (let i = 0; i < 600 && closed < 2; i++) await tick(25);
   const out = { tried: closed };
