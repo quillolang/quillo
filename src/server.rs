@@ -3262,12 +3262,41 @@ fn script_tag_for(body: &[u8], path: &[u8]) -> bool {
 
 /// Whether a value has an error in it that a visitor is not to read, at any depth.
 fn holds_hidden_error(v: &Value) -> bool {
+    holds_hidden_at(v, 0)
+}
+
+/// `holds_hidden_error` of `v`, `depth` levels down: past 256 levels on a new piece of stack when
+/// this one runs low, as the JSON writers go (`value::deeper`), where a list 20,000 deep given to
+/// `json.stringify` or `str` in a `parallel` call's function, on its stack of 512 KB, stopped the
+/// server; a scalar in a list or map is looked at where it is, with no call (coverage of 0.8.7,
+/// Q-1110; branch coverage-087).
+fn holds_hidden_at(v: &Value, depth: usize) -> bool {
     match v {
-        Value::Err(e, own, _) => !own || holds_hidden_error(e),
-        Value::List(l) => l.iter().any(holds_hidden_error),
-        Value::Map(m) => m.iter().any(|(_, x)| holds_hidden_error(x)),
+        Value::Err(e, own, _) => !own || hidden_below(e, depth),
+        Value::List(l) => {
+            for x in l.iter() {
+                if hidden_below(x, depth) {
+                    return true;
+                }
+            }
+            false
+        }
+        Value::Map(m) => {
+            for x in m.values() {
+                if hidden_below(x, depth) {
+                    return true;
+                }
+            }
+            false
+        }
         _ => false,
     }
+}
+
+/// `holds_hidden_at` of `x`, one level below `depth`, called only for what can hold an error.
+#[inline(always)]
+fn hidden_below(x: &Value, depth: usize) -> bool {
+    matches!(x, Value::Err(..) | Value::List(_) | Value::Map(_)) && crate::value::deeper(depth + 1, || holds_hidden_at(x, depth + 1))
 }
 
 /// What a hidden error said, for the log.
@@ -3280,14 +3309,21 @@ pub(crate) fn log_hidden(e: &Value, at: &Place) {
 }
 
 fn without_hidden_errors(v: &Value) -> Value {
+    without_hidden_at(v, 0)
+}
+
+/// `without_hidden_errors` of `v`, `depth` levels down, on a new piece of stack past 256 levels
+/// as `holds_hidden_at` goes (coverage of 0.8.7, Q-1110; branch coverage-087).
+fn without_hidden_at(v: &Value, depth: usize) -> Value {
+    let inner = |x: &Value| crate::value::deeper(depth + 1, || without_hidden_at(x, depth + 1));
     match v {
         Value::Err(e, false, at) => {
             log_hidden(e, at);
             Value::err(Value::str("internal error"))
         }
-        Value::Err(e, true, _) => Value::own_err(without_hidden_errors(e)),
-        Value::List(l) => Value::list(l.iter().map(without_hidden_errors).collect()),
-        Value::Map(m) => Value::map(m.iter().map(|(k, x)| (k.clone(), without_hidden_errors(x))).collect()),
+        Value::Err(e, true, _) => Value::own_err(inner(e)),
+        Value::List(l) => Value::list(l.iter().map(inner).collect()),
+        Value::Map(m) => Value::map(m.iter().map(|(k, x)| (k.clone(), inner(x))).collect()),
         other => other.clone(),
     }
 }

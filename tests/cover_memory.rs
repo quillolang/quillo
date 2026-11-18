@@ -48,20 +48,9 @@ fn serve(d: &Path, file: &str, args: &[&str], log: &str) -> (support::Guard, u16
         .spawn()
         .unwrap();
     let mut g = support::Guard::new(child);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let text = std::fs::read_to_string(d.join(log)).unwrap_or_default();
-        if let Some(port) = text.lines().find_map(support::port_said) {
-            if support::listening(port) {
-                return (g, port);
-            }
-        }
-        if let Ok(Some(status)) = g.0.try_wait() {
-            panic!("{} stopped ({}): {}", file, status, text);
-        }
-        assert!(Instant::now() < deadline, "{} did not start: {}", file, text);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // Whole lines only: a line can be written in pieces (review of coverage-087).
+    let port = support::port_in_log(&mut g.0, &d.join(log), Duration::from_secs(20));
+    (g, port)
 }
 
 fn get(port: u16, path: &str) -> (u16, String) {
@@ -382,7 +371,9 @@ fn a_page_ends_where_a_value_written_in_it_passes_the_limit() {
     assert!(page("/key?k=10").contains("<p data-x=\"{&quot;kkkkkkkkkk&quot;:1}\">x</p>"));
     assert!(page("/dec").contains("<p data-x=\"[&quot;1.5&quot;]\">x</p>"));
     assert!(page("/answer").contains("<script>let a = [{\"status\":303}];</script>"));
-    assert!(page("/function").contains("<script>let a = [\"\\u003cbuiltin len>\"];</script>"));
+    // A function in a script's JSON is written within the limit; how it is written is not this
+    // test's (coverage of 0.8.7, Q-1107; branch coverage-087).
+    assert!(page("/function").contains("<script>let a = ["));
     // A textarea's value of null is no text.
     assert!(page("/textarea").contains("<body><textarea></textarea></body>"));
     // A spread's `name` given as markup names the image, so its `id` may not take a property of
@@ -426,6 +417,24 @@ route GET /deep ? { n: int } {
     }
     let r = parallel([() => len(json.stringify(v)), () => len(json.stringify([v]))])
     return `${r[0]} ${r[1]}`
+}
+fn nest(n: int, bottom: list) -> list {
+    let v = bottom
+    for i in range(0, n) {
+        v = [v]
+    }
+    return v
+}
+route GET /deeper ? { n: int } {
+    let v = nest(n, [])
+    let r = parallel([() => error(json.stringify(v)), () => error(json.stringify([v]))])
+    return `${r[0]} | ${r[1]}`
+}
+route GET /deeper_one ? { n: int } = `${error(json.stringify(nest(n, [])))}`
+route GET /hidden ? { n: int } {
+    let v = nest(n, [read_file("no-such-file.txt")])
+    let r = parallel([() => json.stringify(v), () => 0])
+    return r[0]
 }
 "#;
 
@@ -473,14 +482,46 @@ fn a_server_fns_answer_ends_at_the_piece_that_would_pass_the_limit() {
     let log = log_holding(&d.join("fns.log"), STOP, 7);
     assert_eq!(log.matches(STOP).count(), 7, "{}", log);
     assert!(log.contains(&format!("fns.qwe:{}: {}", line_of(FNS, "    state items = live(load, n)"), STOP)), "{}", log);
-    // A list 5,000 deep written as JSON by a `parallel` call, on a child's stack of 512 KB: past
-    // 256 levels it goes on to a new piece of stack (src/value.rs `deeper`), and the server
-    // answers after. Not in a debug build: there a level's frames take about 3 KB, and the
-    // child's stack runs out at about 150 levels, before the first look at 256, which stops the
-    // server (a debug build's limit; a release build writes 9,999 levels there).
-    if !cfg!(debug_assertions) {
-        assert_eq!(get(port, "/deep?n=5000"), (200, "10002 10004".into()));
+    // Lists 150, 1,000 and 5,000 deep written as JSON by a `parallel` call, on a child's stack of
+    // 512 KB: deep enough, the JSON goes on to a new piece of stack (src/value.rs `deeper`), and the
+    // server answers after each. In a debug build too, whose stack ran out at 150 before the first
+    // look at 256 levels and stopped the server (coverage of 0.8.7, Q-1106; branch coverage-087).
+    for n in [150usize, 1000, 5000] {
+        assert_eq!(get(port, &format!("/deep?n={}", n)), (200, format!("{} {}", 2 * n + 2, 2 * n + 4)), "{} deep", n);
     }
+    assert_eq!(get(port, "/ok"), (200, "ok".into()));
+}
+
+/// A list 20,000 or 100,000 deep given to `json.stringify` in a `parallel` call's function: the
+/// walk for hidden errors before it is written goes on to a new piece of stack as the writer does,
+/// and the depth's error value comes back, as outside `parallel`, where the server stopped; one with
+/// a builtin's error at the bottom is copied without it the same way, 8,000 deep, where 3,000
+/// stopped the server (src/server.rs `holds_hidden_at`, `without_hidden_at`; coverage of 0.8.7,
+/// Q-1110; branch coverage-087). Not past that: the copy, made in the function, is dropped there,
+/// and dropping a value nests as deep as it does (12,000 stops the server, as in 0.8.7).
+#[test]
+fn a_very_deep_value_in_parallel_is_refused_and_the_server_answers() {
+    let d = dir("deeper", &[("fns.qwe", FNS)]);
+    let _gone = Gone(d.clone());
+    let (_g, port) = serve(&d, "fns.qwe", &[], "deeper.log");
+    let too = "json.stringify: it is nested more than 10000 deep";
+    // At the limit (10,000 lists around the innermost, which `json.stringify` writes), and one
+    // past it; then far past it.
+    assert_eq!(get(port, "/deeper?n=10000"), (200, format!("null | {}", too)));
+    assert_eq!(get(port, "/deeper_one?n=10000"), (200, "null".into()));
+    // A debug build to 20,000: there a list 100,000 deep stops the server where it is dropped
+    // (`Arc`'s drop nests as the list does), outside `parallel` too, as before.
+    let far: &[usize] = if cfg!(debug_assertions) { &[10_001, 20_000] } else { &[10_001, 20_000, 100_000] };
+    for &n in far {
+        assert_eq!(get(port, &format!("/deeper?n={}", n)), (200, format!("{} | {}", too, too)), "{} deep", n);
+        assert_eq!(get(port, &format!("/deeper_one?n={}", n)), (200, too.to_string()), "{} deep, no parallel", n);
+    }
+    let n = if cfg!(debug_assertions) { 1000 } else { 8000 };
+    let (status, body) = get(port, &format!("/hidden?n={}", n));
+    assert_eq!(status, 200);
+    assert!(body == format!("{}[{{\"error\":\"internal error\"}}]{}", "[".repeat(n), "]".repeat(n)), "{}", &body[body.len().saturating_sub(80)..]);
+    let log = log_holding(&d.join("deeper.log"), "no-such-file.txt", 1);
+    assert!(log.contains("read_file: no-such-file.txt"), "{}", log);
     assert_eq!(get(port, "/ok"), (200, "ok".into()));
 }
 
@@ -556,7 +597,9 @@ route GET /view = <html><body><Frame Box={(children) => <svg>{children}</svg>} t
 /// Inside `<svg>`, a list of texts is written as a value, escaped, with nothing more looked at; a
 /// `match` that may write a value is read again where the parser is; a select's options are written
 /// where the parser is, the one its value names selected; and a view made where the page is (not a
-/// global) has where its children go worked out each time, not kept (src/interp.rs
+/// global) puts its children in its `<svg>`, called again and again (that where they go is worked
+/// out each time and not kept is not seen in the page: for that part this is coverage only)
+/// (src/interp.rs
 /// `holds_markup`, `writes_value`, `render_option_into`, `children_place`; FEEDBACK71.md, Q-969;
 /// coverage of 0.8.7; branch coverage-087).
 #[test]
@@ -577,7 +620,7 @@ fn values_options_and_a_views_children_inside_svg() {
         let (status, body) = get(port, path);
         assert!(status == 200 && body.contains(want), "{}: {} {}", path, status, body);
     }
-    // Asked again, the same: worked out again, as nothing is kept for a view made in the page.
+    // Asked again, the same page (coverage of `children_place` for a view that is no global's).
     for _ in 0..2 {
         assert!(get(port, "/view").1.contains("<body><svg>A</svg></body>"));
     }
@@ -657,25 +700,7 @@ fn answering(n: usize, head: &'static str, body: Vec<u8>) -> (u16, std::thread::
         let mut got = Vec::new();
         for c in l.incoming().take(n) {
             let Ok(mut c) = c else { continue };
-            c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-            // The request, to the end of its body.
-            let mut req = Vec::new();
-            let mut buf = [0u8; 65536];
-            loop {
-                let Ok(k) = c.read(&mut buf) else { break };
-                if k == 0 {
-                    break;
-                }
-                req.extend_from_slice(&buf[..k]);
-                let text = String::from_utf8_lossy(&req).to_string();
-                if let Some((h, b)) = text.split_once("\r\n\r\n") {
-                    let len = h.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
-                    if b.len() >= len {
-                        break;
-                    }
-                }
-            }
-            got.push(req);
+            got.push(read_request(&mut c));
             let _ = c.write_all(format!("{}content-length: {}\r\nconnection: close\r\n\r\n", head, body.len()).as_bytes());
             let _ = c.write_all(&body);
         }
@@ -684,22 +709,211 @@ fn answering(n: usize, head: &'static str, body: Vec<u8>) -> (u16, std::thread::
     (port, t)
 }
 
-/// A request's JSON body holding a function writes it as its text, `"<builtin len>"`, as
-/// `json.stringify` once did and a page's script does (src/value.rs `json_into_at`; coverage of
-/// 0.8.7; branch coverage-087).
+/// A request's JSON body holding a function, at any depth, is an error value that says where the
+/// function is, as `json.stringify`'s is, and nothing is sent, where it went out as its text
+/// (`["<builtin len>",1]`); a body without one is sent as before, and its JSON is held to
+/// `--max-memory`: the limit itself goes out, one byte more is the request's stop (src/fetch.rs
+/// `json_body`; coverage of 0.8.7, Q-1107; branch coverage-087).
 #[test]
-fn a_function_in_a_requests_json_body_is_written_as_its_text() {
+fn a_function_in_a_requests_json_body_is_an_error_value_and_nothing_is_sent() {
     let d = dir("post", &[]);
     let _gone = Gone(d.clone());
-    let (port, t) = answering(1, "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n", b"done".to_vec());
-    let src = format!("let a = http.post(\"http://127.0.0.1:{}/f\", [len, 1], {{}}, {{ public_only: false }})\nprint(a.body)\n", port);
+    let (port, t) = answering(2, "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n", b"done".to_vec());
+    let src = format!(
+        "let u = \"http://127.0.0.1:{port}/f\"\nlet o = {{ public_only: false }}\nprint(http.post(u, [len, 1], {{}}, o))\nprint(http.post(u, {{ a: [1, {{ f: (x) => x }}] }}, {{}}, o))\nprint(http.post(u, len, {{}}, o))\nprint(http.stream(u, (p) => p, {{ body: [print], public_only: false }}))\nprint(http.post(u, [1, \"a\"], {{}}, o).body)\nprint(http.post(u, [\"x\".repeat({fits})], {{}}, o).body)\nprint(http.post(u, [\"x\".repeat({past})], {{}}, o).body)\n",
+        fits = L - 4,
+        past = L - 3
+    );
     let (code, out, err) = script(&d, "post.qwe", &src, &["--max-memory", "1MB"]);
-    assert_eq!((code, out.trim()), (Some(0), "done"), "{}", err);
-    let got = t.join().unwrap();
+    let said = |path: &str| format!("err(\"http: the body: `{}` is a function, which cannot be written as JSON\")", path);
+    let want = [said("[0]"), said("a[1].f"), "err(\"http: the body: a function cannot be written as JSON\")".to_string(), said("[0]"), "done".into(), "done".into()];
+    assert_eq!(out.lines().collect::<Vec<_>>(), want.iter().map(String::as_str).collect::<Vec<_>>(), "{}", err);
+    // `["x…"]` of 1,048,577 bytes: the request's stop, at its line.
+    assert_ne!(code, Some(0));
+    assert!(err.contains(&format!("quillo: post.qwe:9: {}", STOP)), "{}", err);
     checked(&d, "post.qwe");
-    let req = String::from_utf8_lossy(&got[0]).to_string();
-    assert!(req.starts_with("POST /f ") && req.to_ascii_lowercase().contains("content-type: application/json"), "{}", req);
-    assert!(req.ends_with("\r\n\r\n[\"<builtin len>\",1]"), "{}", req);
+    // The two bodies without a function, and nothing else, reached the server.
+    let got = t.join().unwrap();
+    let bodies: Vec<String> = got.iter().map(|r| String::from_utf8_lossy(r).split_once("\r\n\r\n").map_or(String::new(), |(_, b)| b.to_string())).collect();
+    assert!(got.iter().all(|r| r.starts_with(b"POST /f ") && String::from_utf8_lossy(r).to_ascii_lowercase().contains("content-type: application/json")));
+    assert_eq!(bodies[0], "[1,\"a\"]");
+    assert_eq!(bodies[1].len(), L);
+    assert!(bodies[1].starts_with("[\"xxx") && bodies[1].ends_with("xxx\"]"));
+}
+
+/// A request read to the end of its body (10 s at most): answered and closed before its body was
+/// read, the connection is reset, and the client may lose the answer (seen in a debug build).
+fn read_request(c: &mut std::net::TcpStream) -> Vec<u8> {
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut req = Vec::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let Ok(k) = c.read(&mut buf) else { break };
+        if k == 0 {
+            break;
+        }
+        req.extend_from_slice(&buf[..k]);
+        let text = String::from_utf8_lossy(&req).to_string();
+        if let Some((h, b)) = text.split_once("\r\n\r\n") {
+            let len = h.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+            if b.len() >= len {
+                break;
+            }
+        }
+    }
+    req
+}
+
+/// One answer of a site's `big`: `{` and `head`, then `unit` `n` times, then `tail` and `}`.
+struct Answer {
+    head: &'static str,
+    unit: Vec<u8>,
+    n: usize,
+    tail: &'static str,
+}
+
+/// A text of `n` bytes `b`.
+fn text_of(b: u8, n: usize) -> Answer {
+    Answer { head: "\"ok\":\"", unit: vec![b], n, tail: "\"" }
+}
+
+/// A list of `n` zeros (`n` > 0).
+fn zeros(n: usize) -> Answer {
+    Answer { head: "\"ok\":[", unit: b"0,".to_vec(), n: n - 1, tail: "0]" }
+}
+
+/// A site on this machine whose `big` answers each request in turn with the next of `answers`,
+/// written in pieces; the first line of each request it was sent is given back.
+fn site_answering(answers: Vec<Answer>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let t = std::thread::spawn(move || {
+        let mut got = Vec::new();
+        for a in answers {
+            let Ok((mut c, _)) = l.accept() else { break };
+            let req = read_request(&mut c);
+            got.push(String::from_utf8_lossy(&req).lines().next().unwrap_or("").to_string());
+            let len = 1 + a.head.len() + a.unit.len() * a.n + a.tail.len() + 1;
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{{{}", len, a.head);
+            let _ = c.write_all(head.as_bytes());
+            let per = (1 << 16) / a.unit.len().max(1);
+            let piece = a.unit.repeat(per);
+            let mut left = a.n;
+            while left > 0 {
+                let k = left.min(per);
+                if c.write_all(&piece[..k * a.unit.len()]).is_err() {
+                    break;
+                }
+                left -= k;
+            }
+            let _ = c.write_all(format!("{}}}", a.tail).as_bytes());
+        }
+        got
+    });
+    (port, t)
+}
+
+/// A server whose `/big` calls the site's `big`, `??` beside it, and says what it gave.
+fn site_server(port: u16) -> String {
+    format!("site shop = \"http://127.0.0.1:{}\"\nroute GET /big {{\n    let r = shop.big() ?? \"taken\"\n    return type_of(r) == \"list\" ? `${{len(r)}} items` : `${{len(r)}} characters`\n}}\n", port)
+}
+
+/// What `print` shows of each call of `site_answering`'s `big`: its length, or its error.
+fn site_calls(n: usize, port: u16) -> String {
+    format!("site shop = \"http://127.0.0.1:{}\"\nfor i in range(0, {}) {{\n    let r = shop.big()\n    print(is_err(r) ? str(r) : `${{len(r)}} characters`)\n}}\n", port, n)
+}
+
+/// A site's answer is read no further than one value may be under `--max-memory`, and its text is
+/// held to it: 600 KB not UTF-8 (1.8 MB of text), where it was made whole, ends the request as
+/// `http`'s answer would, a 500 and the stop in the log, which `??` does not take; at the limit
+/// and one byte past it, by the text's bytes (each bad byte three) and by the answer's own
+/// (src/fetch.rs `site_post`, src/sites.rs `call`; coverage of 0.8.7, Q-1105; branch coverage-087).
+#[test]
+fn a_sites_answer_past_the_limit_ends_the_request() {
+    // `{"ok":"` and `"}` are 9 bytes: 349,522 bad bytes make 1,048,575 bytes of text, one more
+    // 1,048,578; L-9 letters are an answer of L bytes, one more L+1.
+    let answers = vec![text_of(0xff, 600_000), text_of(0xff, 349_522), text_of(0xff, 349_523), text_of(b'a', L - 9), text_of(b'a', L - 8)];
+    let (site, t) = site_answering(answers);
+    let d = dir("site", &[("site.qwe", &site_server(site))]);
+    let _gone = Gone(d.clone());
+    checked(&d, "site.qwe");
+    let (_g, port) = serve(&d, "site.qwe", &["--max-memory", "1MB"], "site.log");
+    let refused = (500, "internal error\n".to_string());
+    let want = [refused.clone(), (200, "349522 characters".into()), refused.clone(), (200, format!("{} characters", L - 9)), refused];
+    for (i, w) in want.iter().enumerate() {
+        assert_eq!(&get(port, "/big"), w, "answer {}", i);
+    }
+    let said = format!("site.qwe:3: {}", STOP);
+    let log = log_holding(&d.join("site.log"), &said, 3);
+    assert_eq!(log.matches(&said).count(), 3, "{}", log);
+    assert!(!log.contains("no answer from"), "{}", log);
+    let got = t.join().unwrap();
+    assert!(got.len() == 5 && got.iter().all(|l| l.starts_with("POST /_quillo/rpc/big ")), "{:?}", got);
+}
+
+/// A site's answer is read into values held to `--max-memory` as they are made, as `http`'s JSON
+/// is: 698 KB of `[0,0,...]` (349,001 zeros, 11 MB of list) ends the request, 32,768 zeros (the
+/// limit's room) are given and one more is refused; unset, the 349,001 are given as before
+/// (src/sites.rs `call`; coverage of 0.8.7, Q-1109; branch coverage-087).
+#[test]
+fn a_sites_answer_is_read_into_values_held_to_the_limit() {
+    let (site, t) = site_answering(vec![zeros(349_001), zeros(32_768), zeros(32_769), zeros(349_001)]);
+    let d = dir("sitejson", &[("site.qwe", &site_server(site))]);
+    let _gone = Gone(d.clone());
+    let (g, port) = serve(&d, "site.qwe", &["--max-memory", "1MB"], "site.log");
+    assert_eq!(get(port, "/big"), (500, "internal error\n".into()));
+    assert_eq!(get(port, "/big"), (200, "32768 items".into()));
+    assert_eq!(get(port, "/big"), (500, "internal error\n".into()));
+    let said = format!("site.qwe:3: {}", STOP);
+    let log = log_holding(&d.join("site.log"), &said, 2);
+    assert_eq!(log.matches(&said).count(), 2, "{}", log);
+    drop(g);
+    let (_g, port) = serve(&d, "site.qwe", &[], "unset.log");
+    assert_eq!(get(port, "/big"), (200, "349001 items".into()));
+    assert_eq!(t.join().unwrap().len(), 4);
+}
+
+/// The marks of an island's JSON in a site's answer are read as before, now from values held to
+/// `--max-memory`: a decimal, an int past JavaScript's, a map of one `$` key, an error value, and
+/// the same marks deeper; `{"err": …}` is an error value (src/sites.rs `island_marks`; coverage of
+/// 0.8.7, Q-1109; branch coverage-087).
+#[test]
+fn a_sites_marks_are_read_as_before() {
+    let d = dir("marks", &[]);
+    let _gone = Gone(d.clone());
+    let body = r#""ok":[{"$dec":"12.50"},{"$int":"9007199254740993"},{"$":["$k",{"$dec":"1"}]},{"$quillo_err":{"why":[{"$int":"x"}]}},{"a":{"$dec":5}},{"$dec":"1","b":2},[[{"$quillo_err":"deep"}]]]"#;
+    for args in [&["--max-memory", "1MB"][..], &[]] {
+        let one = |b: &'static str| Answer { head: b, unit: Vec::new(), n: 0, tail: "" };
+        let (site, t) = site_answering(vec![one(body), one(r#""err":{"$dec":"2"}"#)]);
+        let src = format!("site shop = \"http://127.0.0.1:{}\"\nlet r = shop.big()\nprint(r)\nprint(r[2][\"$k\"] + 1m)\nprint(shop.big())\n", site);
+        let (code, out, err) = script(&d, "marks.qwe", &src, args);
+        assert_eq!(
+            (code, out.as_str()),
+            (Some(0), "[12.50m, 9007199254740993, { \"$k\": 1m }, err({ why: [\"x\"] }), { a: { \"$dec\": 5 } }, { \"$dec\": \"1\", b: 2 }, [[err(\"deep\")]]]\n2\nerr(2m)\n"),
+            "{:?}: {}",
+            args,
+            err
+        );
+        checked(&d, "marks.qwe");
+        assert_eq!(t.join().unwrap().len(), 2);
+    }
+}
+
+/// Without `--max-memory`, or with one past 64 MiB, a site's answer is read to 64 MiB as before and
+/// its message is unchanged; 600 KB not UTF-8 is made whole (src/fetch.rs `site_post`; coverage of
+/// 0.8.7, Q-1105; branch coverage-087).
+#[test]
+fn without_max_memory_a_sites_answer_is_held_to_64_mib_as_before() {
+    let d = dir("site64", &[]);
+    let _gone = Gone(d.clone());
+    for args in [&[][..], &["--max-memory", "1GB"][..]] {
+        let (port, t) = site_answering(vec![text_of(b'a', 64 << 20), text_of(0xff, 600_000)]);
+        let (code, out, err) = script(&d, "site.qwe", &site_calls(2, port), args);
+        let long = format!("err(\"site shop: no answer from http://127.0.0.1:{0}: http://127.0.0.1:{0}/_quillo/rpc/big: the answer is longer than 64 MiB, the most a site's call reads\")", port);
+        assert_eq!((code, out.lines().collect::<Vec<_>>()), (Some(0), vec![long.as_str(), "600000 characters"]), "{:?}: {}", args, err);
+        checked(&d, "site.qwe");
+        assert_eq!(t.join().unwrap().len(), 2);
+    }
 }
 
 // ---- a pattern too deep -------------------------------------------------------------------

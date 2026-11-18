@@ -2014,9 +2014,16 @@ fn dec_pair(a: &Value, b: &Value) -> Option<(crate::decimal::Dec, crate::decimal
 /// deep overflowed the stack in `json.stringify` before its depth was said (CI run 44128157640;
 /// FEEDBACK71.md, Q-977; branch security). A shallow value pays one compare; a stack whose end is
 /// not known is left as it was.
+/// The hidden errors' walks use it too (`server::holds_hidden_at`; coverage of 0.8.7, Q-1110;
+/// branch coverage-087).
 #[inline(always)]
-fn deeper<R>(level: usize, f: impl FnOnce() -> R) -> R {
-    if level >= 256 && crate::stack::remaining().is_some_and(|r| r < 256 << 10) {
+pub(crate) fn deeper<R>(level: usize, f: impl FnOnce() -> R) -> R {
+    // A debug build's level takes about 3 KB of stack: on a `parallel` call's child stack of
+    // 512 KB, a list 150 deep ran it out before the first look at 256, and the server stopped;
+    // there the stack is looked at from 32 levels down. A release build's is the constant 256, as
+    // before (coverage of 0.8.7, Q-1106; branch coverage-087).
+    const FROM: usize = if cfg!(debug_assertions) { 32 } else { 256 };
+    if level >= FROM && crate::stack::remaining().is_some_and(|r| r < 256 << 10) {
         crate::stack::maybe_grow(256 << 10, 4 << 20, f)
     } else {
         f()

@@ -116,6 +116,49 @@ fn keep(it: &Interp, name: &str, set: &[String]) {
     JARS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(HashMap::new).insert(name.to_string(), cookies);
 }
 
+/// A site's answer read as plain JSON (`Value::parse_json_held`) with an island's marks made into
+/// what they stand for, as `interp::from_island_json` reads them from serde's tree: `{"$dec": t}` a
+/// decimal, `{"$int": t}` an int, `{"$quillo_err": x}` an error value, `{"$": [k, x]}` the map of
+/// that one key. Changed where it is: nothing grows (coverage of 0.8.7, Q-1109; branch
+/// coverage-087).
+fn island_marks(v: Value) -> Value {
+    match v {
+        Value::List(mut l) => {
+            for x in Arc::make_mut(&mut l).iter_mut() {
+                *x = island_marks(std::mem::replace(x, Value::Nil));
+            }
+            Value::List(l)
+        }
+        Value::Map(mut m) => {
+            let mark = m.len() == 1 && m.get_index(0).is_some_and(|(k, x)| match (&**k, x) {
+                ("$dec" | "$int", Value::Str(_)) | ("$quillo_err", _) => true,
+                ("$", Value::List(a)) => a.len() == 2 && matches!(a[0], Value::Str(_)),
+                _ => false,
+            });
+            if mark {
+                let (k, x) = Arc::make_mut(&mut m).pop().expect("one entry");
+                return match (&*k, x) {
+                    ("$dec", Value::Str(s)) => crate::decimal::Dec::parse(&s).map_or(Value::Str(s), Value::Dec),
+                    ("$int", Value::Str(s)) => s.parse::<i64>().map_or(Value::Str(s), Value::Int),
+                    ("$", Value::List(a)) => {
+                        let mut a = Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone());
+                        let (x, k) = (a.pop().unwrap_or(Value::Nil), a.pop().unwrap_or(Value::Nil));
+                        let mut one = Map::new();
+                        one.insert(k.display().into(), island_marks(x));
+                        Value::map(one)
+                    }
+                    (_, x) => Value::err(island_marks(x)),
+                };
+            }
+            for x in Arc::make_mut(&mut m).values_mut() {
+                *x = island_marks(std::mem::replace(x, Value::Nil));
+            }
+            Value::Map(m)
+        }
+        other => other,
+    }
+}
+
 static SAID_SERVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `shop.notes(a, b)`, called as `__site_call(site, "notes", a, b)`.
@@ -135,7 +178,7 @@ pub fn call(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // value, not a crash of the route (FEEDBACK71.md, Q-973; branch security). The policy is
     // asked here first, to say it refused, and again at each address `site_post` goes to.
     let answer = it.unlocked(move || {
-        crate::policy::get().http(&target).map_err(|e| (true, e))?;
+        crate::policy::get().http(&target).map_err(|e| (true, Some(e)))?;
         let mut headers = vec![("accept".to_string(), "application/json".to_string())];
         if !cookies.is_empty() {
             let c: Vec<String> = cookies.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
@@ -145,8 +188,12 @@ pub fn call(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     });
     let (status, headers, set, text) = match answer {
         Ok(a) => a,
-        Err((true, e)) => return Ok(Value::err(Value::str(format!("site {}: not called: {}", name, e)))),
-        Err((false, e)) => return Ok(Value::err(Value::str(format!("site {}: no answer from {}: {}", name, url, e)))),
+        // An answer past `--max-memory`: the request's stop, which no `??` takes, as `http`'s is,
+        // where it was an error value saying the stop's words (coverage of 0.8.7, Q-1105; branch
+        // coverage-087).
+        Err((_, None)) => return Err(crate::httpd::OverMemory.at(line)),
+        Err((true, Some(e))) => return Ok(Value::err(Value::str(format!("site {}: not called: {}", name, e)))),
+        Err((false, Some(e))) => return Ok(Value::err(Value::str(format!("site {}: no answer from {}: {}", name, url, e)))),
     };
     if !set.is_empty() {
         if keeps {
@@ -164,13 +211,23 @@ pub fn call(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return Ok(Value::err(Value::str(format!("site {}: `{}` answered {}, sent on to {}: a site's call follows redirects on the site's own address only", name, f, status, to))));
     }
     // As deep as every reader takes (FEEDBACK55.md, Q-875's second review; branch feedback55).
-    let j: serde_json::Value = crate::value::json_value(text.as_bytes()).unwrap_or(serde_json::Value::Null);
-    if let Some(v) = j.get("ok") {
-        return Ok(crate::interp::from_island_json(v));
+    // Read straight into values, each list, map and text held to `--max-memory` as it is made, as
+    // `http`'s answers are, and past it the request's stop: a tree of serde's was made first, and
+    // an answer of 698 KB, `{"ok":[0,0,...]}`, a list of 349,001 values (11 MB) under a 1 MB
+    // limit (coverage of 0.8.7, Q-1109; branch coverage-087).
+    let mut j = match Value::parse_json_held(&text).map_err(|o| o.at(line))? {
+        Ok(Value::Map(m)) => Arc::try_unwrap(m).unwrap_or_else(|m| (*m).clone()),
+        _ => Map::new(),
+    };
+    if let Some(v) = j.shift_remove("ok") {
+        return Ok(island_marks(v));
     }
-    if let Some(e) = j.get("err") {
-        return Ok(Value::err(crate::interp::from_island_json(e)));
+    if let Some(e) = j.shift_remove("err") {
+        return Ok(Value::err(island_marks(e)));
     }
-    let why = j.get("error").and_then(|e| e.as_str()).map(str::to_string).unwrap_or_else(|| text.chars().take(200).collect());
+    let why = match j.get("error") {
+        Some(Value::Str(e)) => e.to_string(),
+        _ => text.chars().take(200).collect(),
+    };
     Ok(Value::err(Value::str(format!("site {}: `{}` answered {}: {}", name, f, status, why))))
 }

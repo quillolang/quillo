@@ -543,12 +543,18 @@ fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Op
 /// follows up to 5 redirects on the site's own origin; one elsewhere is the answer. Its status,
 /// headers, body, and the `Set-Cookie`s of each answer on the way and of the last, all from the
 /// site's origin. A site's call built a client of its own, which none of that held for
-/// (FEEDBACK71.md, Q-973; branch security).
-pub(crate) fn site_post(url: &str, headers: &[(String, String)], body: Vec<u8>) -> Result<(u16, Vec<(String, String)>, Vec<String>, String), String> {
+/// (FEEDBACK71.md, Q-973; branch security). Err(None): refused at `--max-memory`, told by its
+/// kind, which the caller makes the request's stop.
+pub(crate) fn site_post(url: &str, headers: &[(String, String)], body: Vec<u8>) -> Result<(u16, Vec<(String, String)>, Vec<String>, String), Option<String>> {
     let o = Opts { timeout_ms: 30_000, same_origin: true, ..DEFAULT_OPTS };
-    let r = send(o, "POST", url, headers, Some(("application/json".into(), body)), MAX_BODY).map_err(|e| match e {
-        Unsent::Said(s) => s,
-        Unsent::OverMemory => crate::httpd::over_memory(),
+    // Read no further than one value may be, and its text held to it, as `http`'s calls are
+    // (`body_room`): given `MAX_BODY`, an answer of 600 KB not UTF-8 was made a text of 1.8 MB
+    // under a 1 MB limit, and one of 64 MiB was read whole; and the stop told by its kind, not
+    // turned into an error value with its words, which `??` took (coverage of 0.8.7, Q-1105;
+    // branch coverage-087).
+    let r = send(o, "POST", url, headers, Some(("application/json".into(), body)), body_room()).map_err(|e| match e {
+        Unsent::Said(s) => Some(s),
+        Unsent::OverMemory => None,
     })?;
     Ok((r.status, r.headers, r.cookies, r.body))
 }
@@ -840,7 +846,10 @@ fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Va
         Value::Nil => None,
         Value::Str(s) => Some(("text/plain; charset=utf-8".into(), s.as_bytes().to_vec())),
         Value::Html(h) => Some(("text/html; charset=utf-8".into(), h.as_bytes().to_vec())),
-        other => Some(("application/json".into(), other.json_text().into_bytes())),
+        other => match json_body(other, line)? {
+            Ok(j) => Some(("application/json".into(), j)),
+            Err(e) => return Ok(e),
+        },
     };
     let key = (o.cache > 0).then(|| cache_key(o, method, url, &hdrs, payload.as_ref()));
     let reply = match key.as_deref().and_then(cached) {
@@ -880,6 +889,19 @@ fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Va
 
 fn a(args: &[Value], i: usize) -> Value {
     args.get(i).cloned().unwrap_or(Value::Nil)
+}
+
+/// A request's body as JSON, written as `json.stringify` writes it: a function in it, at any
+/// depth, is an error value that says where it is, and nothing is sent, where it went out as its
+/// text (`["<builtin len>",1]`); held to `--max-memory` as it is written, and past it the
+/// request's stop, as `json.stringify`'s is (coverage of 0.8.7, Q-1107; branch coverage-087).
+fn json_body(v: &Value, line: u32) -> Result<Result<Vec<u8>, Value>, Ctrl> {
+    let mut out = Vec::new();
+    match v.json_into_held(&mut out, crate::builtins::JSON_MOST, crate::builtins::JSON_DEEPEST) {
+        Ok(()) => Ok(Ok(out)),
+        Err(None) => Err(crate::httpd::OverMemory.at(line)),
+        Err(Some(why)) => Ok(Err(Value::err(Value::str(format!("http: the body: {}", why))))),
+    }
 }
 
 /// `http.get(url, headers = {}, options = {})`
@@ -1109,7 +1131,10 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let payload: Option<(String, Vec<u8>)> = match &body {
         Value::Nil => None,
         Value::Str(s) => Some(("text/plain; charset=utf-8".into(), s.as_bytes().to_vec())),
-        other => Some(("application/json".into(), other.json_text().into_bytes())),
+        other => match json_body(other, line)? {
+            Ok(j) => Some(("application/json".into(), j)),
+            Err(e) => return Ok(e),
+        },
     };
     let u = url.to_string();
     let (status, headers, cookies, mut reader) = match it.unlocked(move || open(o, &method, &u, &hdrs, payload)) {
