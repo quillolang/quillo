@@ -6142,34 +6142,62 @@ impl Interp {
     /// <script>{raw(x)}</script>`, then `<svg>{s}</svg>`; markup given to a view's attribute)
     /// has its text put in CDATA sections there; and a `<p>` in it, which ends foreign content,
     /// is followed (FEEDBACK71.md, Q-969, found in review; branch security).
-    fn render_unseen(&mut self, out: &mut Held, f: impl FnOnce(&mut Self, &mut Held) -> Result<(), Ctrl>) -> Result<(), Ctrl> {
+    fn render_unseen(&mut self, out: &mut Held, line: impl FnOnce() -> u32, f: impl FnOnce(&mut Self, &mut Held) -> Result<(), Ctrl>) -> Result<(), Ctrl> {
         let at = out.len();
         let here = self.ns;
         let r = f(self, out);
         if here.now != Ns::Html {
-            let (after, fixed) = crate::foreign::written(here, out.get(at..).unwrap_or(""));
+            let (after, fixed, ended) = crate::foreign::written(here, out.get(at..).unwrap_or(""));
             self.ns = after;
             if let Some(t) = fixed {
                 out.truncate(at);
                 out.push_str(&t);
             }
+            if let Some(e) = ended {
+                self.ending_written(line(), e);
+            }
         }
         r
+    }
+
+    /// Raw markup that stopped inside a comment, a tag, ... whose end `foreign::written` wrote:
+    /// said once for each line of the program that wrote it, with the program's file and line
+    /// (the value's, else its element's), in the log as other warnings are (coverage of 0.8.7,
+    /// Q-1116; the user, 2026-11-19: the endings written, a line the first time).
+    #[cold]
+    #[inline(never)]
+    fn ending_written(&self, line: u32, e: crate::foreign::Ending) {
+        static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let at = Place::new(self.cur_file.as_ref(), line).to_string();
+        {
+            let mut said = SAID.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if said.contains(&at) {
+                return;
+            }
+            said.push(at.clone());
+        }
+        let words = e.words();
+        crate::httpd::warning_line(&if at.is_empty() { words } else { format!("{}: {}", at, words) });
     }
 
     /// A child that may write a value, inside foreign content: a value that holds no markup (a
     /// text, a number, a map, all written escaped) as it is, with nothing more; html, a list
     /// holding some, and what a branch or a loop wrote, read again (`render_unseen`), as only
     /// those can hold a `<script>` (FEEDBACK71.md, Q-969, found in review; branch security).
-    fn render_value_ns(&mut self, e: &Expr, env: &Env, out: &mut Held) -> Result<(), Ctrl> {
+    fn render_value_ns(&mut self, e: &Expr, env: &Env, out: &mut Held, el_line: u32) -> Result<(), Ctrl> {
+        // The value's line for the log, else its element's (see `ending_written`).
+        let line = || match crate::debug::expr_line(e) {
+            0 => el_line,
+            l => l,
+        };
         match e {
             Expr::If(..) | Expr::For(..) | Expr::Match(..) | Expr::Block(_) | Expr::Binary(BinOp::And | BinOp::Or, ..) => {
-                self.render_unseen(out, |this, out| this.render_expr_into(e, env, out))
+                self.render_unseen(out, line, |this, out| this.render_expr_into(e, env, out))
             }
             _ => {
                 let v = self.eval(e, env)?;
                 if holds_markup(&v) {
-                    self.render_unseen(out, |_, out| {
+                    self.render_unseen(out, line, |_, out| {
                         render_value(&v, out);
                         Ok(())
                     })
@@ -6213,9 +6241,9 @@ impl Interp {
             for p in f.pieces.get().expect("set above") {
                 match p {
                     Piece::Html(h) => push_short(out, h),
-                    Piece::Expr(e) if M != PLAIN && writes_value(e) => self.render_value_ns(e, env, out)?,
+                    Piece::Expr(e) if M != PLAIN && writes_value(e) => self.render_value_ns(e, env, out, el.line)?,
                     Piece::Expr(e) => self.render_expr_into(e, env, out)?,
-                    Piece::El(e) if M != PLAIN && e.facts.component => self.render_unseen(out, |this, out| this.render_el_into(e, env, out))?,
+                    Piece::El(e) if M != PLAIN && e.facts.component => self.render_unseen(out, || e.line, |this, out| this.render_el_into(e, env, out))?,
                     Piece::El(e) => self.render_el_into(e, env, out)?,
                 }
             }
@@ -6488,8 +6516,15 @@ impl Interp {
                 for c in &el.children {
                     if M != PLAIN && unseen(c) {
                         match c {
-                            HtmlChild::Expr(e) => self.render_value_ns(e, env, out)?,
-                            c => self.render_unseen(out, |this, out| this.render_child(c, env, out))?,
+                            HtmlChild::Expr(e) => self.render_value_ns(e, env, out, el.line)?,
+                            c => self.render_unseen(
+                                out,
+                                || match c {
+                                    HtmlChild::El(x) => x.line,
+                                    HtmlChild::Expr(_) => el.line,
+                                },
+                                |this, out| this.render_child(c, env, out),
+                            )?,
                         }
                     } else {
                         self.render_child(c, env, out)?;

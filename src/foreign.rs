@@ -362,7 +362,7 @@ pub fn leave(outer: At, inner: At, cur: At) -> At {
 /// followed (an end tag that names no element open here, a table), every script after is written
 /// as it is safe in both, and the place after is not known (coverage of 0.8.7, Q-1116; branch
 /// coverage-087).
-pub fn written(at: At, html: &str) -> (At, Option<String>) {
+pub fn written(at: At, html: &str) -> (At, Option<String>, Option<Ending>) {
     let b = html.as_bytes();
     // The elements open, each with where it was opened, where its contents are, and where its
     // name is in `html`, which an end tag must name (coverage of 0.8.7, Q-1116; branch
@@ -385,6 +385,8 @@ pub fn written(at: At, html: &str) -> (At, Option<String>) {
     // A `<` that ends the html, written `&lt;`: the renderer's next text would make it a tag
     // (`raw("<")` then `hello`; coverage of 0.8.7, Q-1116; branch coverage-087).
     let mut last_lt = false;
+    // What it stopped inside, the first such, for the line the server says (`Ending`).
+    let mut ended: Option<Ending> = None;
     // The next `<`: most often right after the tag before.
     while let Some(n) = if b.get(i) == Some(&b'<') { Some(0) } else { memchr::memchr(b'<', b.get(i..).unwrap_or(&[])) } {
         i += n;
@@ -397,6 +399,11 @@ pub fn written(at: At, html: &str) -> (At, Option<String>) {
                 lost |= unknown;
                 if let Some(c) = close {
                     closer.push_str(c);
+                    ended.get_or_insert(match c {
+                        "-->" => Ending::Comment,
+                        "]]>" => Ending::Cdata,
+                        _ => Ending::Declaration,
+                    });
                 }
                 continue;
             }
@@ -404,8 +411,10 @@ pub fn written(at: At, html: &str) -> (At, Option<String>) {
                 if end {
                     // `</` at the very end: the browser takes what follows for a bogus comment.
                     closer.push('>');
+                    ended.get_or_insert(Ending::Tag);
                 } else {
                     last_lt = true;
+                    ended.get_or_insert(Ending::Lt);
                 }
             }
             i += 1;
@@ -424,6 +433,7 @@ pub fn written(at: At, html: &str) -> (At, Option<String>) {
                 ">"
             };
             closer.push_str(c);
+            ended.get_or_insert(if c == ">" { Ending::Tag } else { Ending::Quoted(c) });
             whole = format!("{}{}", &html[i..], c);
             whole.as_str()
         } else {
@@ -547,6 +557,7 @@ pub fn written(at: At, html: &str) -> (At, Option<String>) {
                 closer.push_str("</");
                 closer.push_str(name);
                 closer.push('>');
+                ended.get_or_insert(Ending::Text(text_name(name)));
                 continue;
             }
         } else if closed || (if html_el { html_no_push(name) } else { void_tag(name) }) {
@@ -572,14 +583,73 @@ pub fn written(at: At, html: &str) -> (At, Option<String>) {
         f.push_str(&html[copied..]);
     }
     if lost {
-        return (LOST, fixed);
+        return (LOST, fixed, ended);
     }
     // An element left open (raw html that is not whole): what follows is in it, which is not
     // followed.
     if !open.is_empty() {
         cur = unsure(cur);
     }
-    (cur, fixed)
+    (cur, fixed, ended)
+}
+
+/// What raw markup stopped inside, whose end `written` wrote so that the browser does not read on
+/// into the renderer's next markup: the server says so once for each line of the program that
+/// wrote it (`Interp::ending_written`; coverage of 0.8.7, Q-1116; the user, 2026-11-19: the
+/// endings written, a line in the log the first time).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ending {
+    /// `<!--` with no `-->`.
+    Comment,
+    /// `<!x`, `<!DOCTYPE`, `<?x` or `</ x` with no `>`.
+    Declaration,
+    /// `<![CDATA[` with no `]]>`.
+    Cdata,
+    /// A start or end tag with no `>`.
+    Tag,
+    /// A tag stopped inside a quoted attribute value: the quote and `>` that end it.
+    Quoted(&'static str),
+    /// A `<script>`'s (or a `<textarea>`'s, ...) text with no end tag.
+    Text(&'static str),
+    /// A `<` at the very end.
+    Lt,
+}
+
+impl Ending {
+    /// The line the server says, after the program's file and line.
+    pub fn words(self) -> String {
+        let (inside, end, whole) = match self {
+            Ending::Comment => ("a comment", "its end (-->)".to_string(), "the whole comment"),
+            Ending::Declaration => ("a <!...> or <?...>", "its end (>)".to_string(), "the whole declaration"),
+            Ending::Cdata => ("a CDATA section", "its end (]]>)".to_string(), "the whole section"),
+            Ending::Tag => ("a tag", "its end (>)".to_string(), "the whole tag"),
+            Ending::Quoted(c) => ("a quoted attribute value", format!("its end ({c})"), "the whole tag"),
+            Ending::Text(t) => {
+                return format!(
+                    "raw markup inside <svg> or <math> stops inside a <{t}>'s text; Quillo wrote its end tag (</{t}>) so the page stays safe. Pass the whole <{t}> in one raw()."
+                )
+            }
+            Ending::Lt => {
+                return "raw markup inside <svg> or <math> ends with a lone <; Quillo wrote it as &lt; so the page stays safe. Write &lt; for a < that starts no tag.".to_string()
+            }
+        };
+        format!("raw markup inside <svg> or <math> stops inside {inside}; Quillo wrote {end} so the page stays safe. Pass {whole} in one raw().")
+    }
+}
+
+/// A text element's name, kept: those `written` reads to their end tag.
+fn text_name(n: &str) -> &'static str {
+    match n {
+        "style" => "style",
+        "textarea" => "textarea",
+        "title" => "title",
+        "xmp" => "xmp",
+        "iframe" => "iframe",
+        "noembed" => "noembed",
+        "noframes" => "noframes",
+        "noscript" => "noscript",
+        _ => "script",
+    }
 }
 
 /// `name` in lower case in `buf`, where it fits (none that matters is longer), else `""`.

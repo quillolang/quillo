@@ -1028,3 +1028,74 @@ fn the_next_request_on_a_worker_starts_where_a_fresh_server_does() {
         }
     }
 }
+
+// ---- the line the server says once where it wrote an ending --------------------------------------
+
+/// The program's lines are counted: `/two`'s values are on lines 5 and 6, `/lt` is on line 8.
+const ENDINGS: &str = r##"route GET /comment = <html><body><svg>{raw("<!--")}<text>hidden</text>{raw("-->")}<script>{raw("<b>")}</script></svg></body></html>
+route GET /attr ? { u: str = "/x" } = <html><body><svg>{raw("<a href='")}{u}{raw("'>link</a>")}</svg></body></html>
+route GET /script ? { d: str = "1" } = <html><body><svg>{raw("<script>var d = ")}{d}{raw(";</script>")}</svg></body></html>
+route GET /two = <html><body><svg>
+    {raw("<!-- a")}
+    {raw("<!-- b")}
+</svg></body></html>
+route GET /lt = <html><body><svg><foreignObject>{raw("<")}hello</foreignObject></svg></body></html>
+route GET /complete = <html><body><svg>{raw("<g a='1'><!-- c --><text>t</text></g><style>a{}</style>")}</svg></body></html>
+route GET /cdata-fix = <html><body><svg>{raw("<script>a<b</script>")}</svg></body></html>
+route GET /lost = <html><body><svg><g>{raw("</svg><svg>")}</g></svg></body></html>
+route GET /plain = <html><body><p>{raw("<!--")}</p><script>{raw("<b>")}</script></body></html>
+"##;
+
+/// Where raw markup inside `<svg>` or `<math>` stops inside something and Quillo writes its end,
+/// the server says so in its log, once for each line of the program: the file and line of the
+/// value, what was left open (a comment, a quoted attribute value, a `<script>`'s text, a lone
+/// `<`), the end written and what to do. Asked twice, a line is said once; two values on two lines
+/// are two lines; complete markup, a script's text put in a CDATA section, a place lost, and a
+/// plain HTML page say nothing (src/foreign.rs `Ending`, src/interp.rs `ending_written`;
+/// FEEDBACK71.md Q-969, coverage of 0.8.7, Q-1116; the user, 2026-11-19: the endings written, a
+/// line the first time; branch coverage-087).
+#[test]
+fn an_ending_written_is_said_once_for_each_line_of_the_program() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    let d = support::temp_dir("cover-foreign-endings");
+    std::fs::write(d.join("main.qwe"), ENDINGS).unwrap();
+    let log = d.join("log.txt");
+    let out = std::fs::File::create(&log).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .args(["run", "main.qwe", "--port", "0"])
+        .current_dir(&d)
+        .env("QUILLO_SECRET", "a secret for the cover_foreign tests, long enough")
+        .stdin(Stdio::null())
+        .stdout(out.try_clone().unwrap())
+        .stderr(out)
+        .spawn()
+        .unwrap();
+    let mut g = support::Guard::new(child);
+    let port = support::port_in_log(&mut g.0, &log, Duration::from_secs(20));
+    for path in ["/comment", "/attr", "/script", "/two", "/lt", "/complete", "/cdata-fix", "/lost", "/plain"] {
+        for _ in 0..2 {
+            let a = support::send(port, "GET", path, &[], "");
+            assert_eq!(a.status, 200, "{}: {}", path, a.body);
+        }
+    }
+    drop(g);
+    let said = std::fs::read_to_string(&log).unwrap();
+    let warnings: Vec<&str> = said.lines().filter(|l| l.starts_with("quillo: warning:")).collect();
+    let lead = "raw markup inside <svg> or <math> stops inside";
+    let want = [
+        ("GET /comment", "main.qwe:1:", format!("{lead} a comment; Quillo wrote its end (-->) so the page stays safe. Pass the whole comment in one raw().")),
+        ("GET /attr", "main.qwe:2:", format!("{lead} a quoted attribute value; Quillo wrote its end ('>) so the page stays safe. Pass the whole tag in one raw().")),
+        ("GET /script", "main.qwe:3:", format!("{lead} a <script>'s text; Quillo wrote its end tag (</script>) so the page stays safe. Pass the whole <script> in one raw().")),
+        ("GET /two", "main.qwe:5:", format!("{lead} a comment; Quillo wrote its end (-->) so the page stays safe. Pass the whole comment in one raw().")),
+        ("GET /two", "main.qwe:6:", format!("{lead} a comment; Quillo wrote its end (-->) so the page stays safe. Pass the whole comment in one raw().")),
+        ("GET /lt", "main.qwe:8:", "raw markup inside <svg> or <math> ends with a lone <; Quillo wrote it as &lt; so the page stays safe. Write &lt; for a < that starts no tag.".to_string()),
+    ];
+    assert_eq!(warnings.len(), want.len(), "{}", said);
+    for ((request, at, words), line) in want.iter().zip(&warnings) {
+        // `quillo: warning: GET /comment (rid ...): main.qwe:1: raw markup ...`
+        assert!(line.starts_with(&format!("quillo: warning: {} (rid ", request)), "{}", line);
+        assert!(line.ends_with(&format!("): {} {}", at, words)), "{}", line);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
