@@ -152,6 +152,40 @@ routes /reports | signed_in with db, time {
 time` ``. A route outside any group takes `with` the same way: `route GET /day/:d with db
 = ...` (see [Effects](#effects)).
 
+## Tags for every route
+
+A word after `routes`, before the path, tags each route of the group as it tags one route
+after `route` *(since 0.8.7)*:
+
+```quillo
+routes offline /help {
+    route GET /returns = <html><body><h1>Returns</h1></body></html>
+    route GET /delivery = <html><body><h1>Delivery</h1></body></html>
+}
+
+// Links in the letters the site sends: the writes are meant.
+routes writes /email | signed_in {
+    route GET /confirm/:code {
+        db.exec("update users set confirmed = 1 where id = ? and code = ?", session().user, code)
+        redirect("/")
+    }
+    route GET /stop {
+        db.exec("update users set letters = 0 where id = ?", session().user)
+        "No more letters."
+    }
+}
+```
+
+- **`offline`** keeps the page of each `GET` route of the group, and of the groups inside
+  it, on the device for when there is no network (see [Installable apps, offline pages and
+  notifications](#possible-or-not)).
+- **`writes`** says the write of each `GET` and `ANY` route of the group is meant. Without
+  it, `quillo check` warns of both routes above, as each writes and reads who the visitor
+  is, and a link on another site would open it with their session (see [Requests from
+  other sites](#requests-from-other-sites)).
+- The two go in either order. Together they are warned of: Quillo's worker keeps an
+  offline page ahead with a prefetch, which writes nothing.
+
 ## Rules
 
 - A group holds only `route`s and `routes` groups, at the top level of a file. Its
@@ -161,7 +195,7 @@ time` ``. A route outside any group takes `with` the same way: `route GET /day/:
   json_only = ...` is a syntax error. For one route, nest a group of one, or write the
   check as a pipeline stage in its body.
 - `routes` is a keyword only at the start of a group. Elsewhere it is a name like any
-  other (`routes / 2` divides).
+  other (`routes / 2` divides), and so are `offline` and `writes`.
 - Routes from groups are routes: `quillo docs` lists them by their whole path
   (`/admin/users`), and `quillo check` checks them as it checks any route.
 

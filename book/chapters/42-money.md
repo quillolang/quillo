@@ -165,6 +165,10 @@ than the balance gives `422 {"error":"Not enough money","balance":{"amount":"87.
   that was wrong. `respond(422, ...)` is an answer like any other: "Not enough money" is
   kept, and the same request again gets it, even if money has come in since.
 - Each `?` turns a failed statement into an error value, which rolls everything back.
+- When the database that keeps the keys cannot be reached, the request is answered `503`
+  with `{"error": "could not record the Idempotency-Key"}` (or `could not read`). The
+  database's own message goes to the log, and to the answer only under `--watch` *(since
+  0.8.7: it reached the visitor)*.
 
 A `server fn` can use `idempotent` too, and the page then sends a key with each call by
 itself, and sends the call again when the connection fails. See

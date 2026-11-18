@@ -235,7 +235,11 @@ The options, and what a cookie is without them:
   `domain`) is an error: `` a `__Host-` cookie has no domain ``.
 - `delete_cookie(name, { path, domain })` must name the path and domain the cookie was
   set with, or the browser keeps it. It takes `http_only`, `secure` and `same_site` too,
-  and `max_age` only as 0.
+  and `max_age` only as 0. It is `Secure` when the request came over HTTPS (a proxy
+  `--trust-proxy` names says `X-Forwarded-Proto: https`, or under `quillo fcgi` the web
+  server's `HTTPS` is on), when the name needs it, or with `secure: true`, so a cookie set
+  with `secure: false` can be removed over plain HTTP *(since 0.8.7: anyone's
+  `X-Forwarded-Proto` decided it)*.
 - A cookie replaces another set in the same request only at the same name, path and
   domain, as browsers keep them: `delete_cookie("theme", { path: "/old" })` and then
   `set_cookie("theme", "dark")` send both.
@@ -251,7 +255,9 @@ The options, and what a cookie is without them:
   that comes over plain HTTP from anywhere but `localhost`, so a site reached as
   `http://10.0.0.5:8080` cannot keep anyone signed in; the server says so once when it
   happens. Serve the site over HTTPS (a proxy in front, sending
-  `x-forwarded-proto: https`).
+  `x-forwarded-proto: https`, and named with `--trust-proxy`: that header is believed from
+  its address alone *(since 0.8.7)*, and the first time one from another address would have
+  counted, the log says so once, with that address).
 
 A cookie the page's script reads, for a preference the browser applies before the page
 is rendered again:
@@ -376,7 +382,8 @@ component LoginForm() {
 the visitor comes back: `session()` reads the cookie and never sends it again. For a
 session that lasts while it is used, call `set_session` again on the requests that
 count as use. Once a day is enough, and keeps the cookie from being sent with every
-answer:
+answer. Renewing on a `GET` is a write `quillo check` warns of (see [Requests from other
+sites](#requests-from-other-sites)); here it is meant, and `writes` says so:
 
 ```quillo
 fn touch() {
@@ -387,7 +394,7 @@ fn touch() {
     }
 }
 
-route GET /dashboard { touch(); <Dashboard me={me_or_login("/dashboard")}/> }
+route writes GET /dashboard { touch(); <Dashboard me={me_or_login("/dashboard")}/> }
 ```
 
 **Signing out everywhere.** `end_session()` removes the cookie from one browser; a copy
@@ -434,6 +441,42 @@ expiry, the tenant and the program's mount point, so a session is no session pas
 time, for another tenant, or in another mounted program. A request with two session
 cookies that are both valid here has no session: one of them was planted.
 
+## Requests from other sites
+
+The browser sends the session cookie with every request to the site, from a page of
+another site too. Quillo tells them apart, so that a page elsewhere cannot act as the
+visitor:
+
+- **A form from another site is refused.** A `POST`, `PUT`, `PATCH` or `DELETE` with a
+  form, multipart or plain-text body that the browser marks as cross-site
+  (`Sec-Fetch-Site`, or an `Origin` naming another host) gets a 403 before any route runs.
+  JSON from another site needs the browser to ask first, which nothing here answers. A
+  path that must take such posts (a payment provider's return, a single sign-on callback)
+  is named at the top of the program: `allow_cross_site("/sso")`.
+- **The scheme counts too** *(since 0.8.7: the hosts alone were compared)*. Where a proxy
+  `--trust-proxy` names says the scheme (`X-Forwarded-Proto`), or under `quillo fcgi` the
+  web server does, an `Origin` alone must name it as well: `http://example.com` and
+  `https://example.com` are two sites. A write refused for the scheme alone is said once
+  in the log.
+- **A `GET` that writes is warned of** *(since 0.8.7)*. A link on another site, in an email
+  or in a chat opens a `GET` with the visitor's session (browsers send `SameSite=Lax`
+  cookies when a link is followed). So `quillo check` warns of a `GET` (or `ANY`) route
+  that surely writes (the database, a global, the session or a cookie, a file, `publish`,
+  `notification.send`, a service) and reads who the visitor is (`session()`, `cookie()`,
+  the request's headers), there or in a function, component or middleware it goes
+  through.
+
+The renewal of a session above, written without `writes`, is warned of so:
+
+```text
+main.qwe:9: warning: `GET /dashboard` writes (`set_session`, in `touch`) and reads who the visitor is (`session()`, in `touch`): a link on another site, in an email or in a chat runs it with their session (`SameSite=Lax` cookies go with a followed link). Make it a `POST`, or, if the write is meant (a confirm-your-address link, a sign-in callback, a presence ping), tag it: `route writes GET ...`
+```
+
+Make such a route a `POST`, from a form or a button. Where the write is meant, say so
+after `route`: `route writes GET /confirm/:code = ...`; after `routes`, `writes` tags each
+`GET` and `ANY` route of the group. Three or more routes warned of through one write (a
+helper they all call) are said once, at the write.
+
 ## Putting it together
 
 A small program with a sign-in, a theme cookie, a sliding session and an API behind a
@@ -462,7 +505,7 @@ fn touch() {
 view Page(theme: str, children) =
     <html><body class={`theme-${theme}`}>{children}</body></html>
 
-route GET / with db, time {
+route writes GET / with db, time {
     touch()
     <Page theme={cookie("theme") ?? "light"}>
         {me() != null ? <p>Hello, {me().name}. <a href="/account">Account</a></p> : <a href="/login">Sign in</a>}
@@ -506,6 +549,9 @@ from elsewhere cannot send a visitor to another site after signing in: starting 
 `redirect` sends a URL to another host as it is given (encoded where a URL must be). It
 refuses only a `javascript:`, `vbscript:` or `data:` URL, and keeps a path of the site's
 own on the site: `/\evil.example` is written `/%5Cevil.example`, and `..` is taken out.
+`/.//evil.example`, which `local` lets through, goes to `/evil.example` on the site
+*(since 0.8.7: it was written `//evil.example`, which a browser takes to that host)*; the
+builtin `local_path(next)` gives null for it.
 Signing out and the theme are
 forms too, posting to their routes: a link cannot log anyone out, since a `GET` would
 let any page do it. The `migrations/` folder holds the `users` table,

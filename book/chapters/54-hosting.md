@@ -11,7 +11,7 @@ page goes through each, with a checklist at the end.
 |---|---|
 | **The `quillo` binary** | One file of 20 to 25 MB, nothing else: SQLite and the time zone database are built in (the system's copy of the zones is read first, and the built-in one for a name it leaves out, so `US/Pacific` and `EST` work on Ubuntu 24.04, which moved them to its tzdata-legacy package), and TLS is rustls, not OpenSSL. The Linux release builds from 0.7.0 on are linked against glibc 2.17, so they start on CentOS 7, CloudLinux 7 and 8, AlmaLinux 8 and anything newer (0.6.0's need glibc 2.35). They are glibc builds, not static ones, since a plugin is a library the binary loads. Build it on (or for) the same system and CPU as the server: a Linux binary built on a newer distribution than the server's may not start there |
 | **The program's files** | `main.qwe` and the files it uses, `migrations/`, `public/` |
-| **Rust files, built** | A program with [`.qwer` files](#rust) builds them the first time it starts, which needs Rust. Run `quillo build main.qwe` beforehand on the same kind of machine, and deploy `.quillo/` with the program: `.quillo/native/` and `.quillo/plugins.lock`, each library's SHA-256. The server then needs no Rust. With `--no-build` it never builds: a library the lock does not name is refused rather than built again |
+| **Rust files, built** | A program with [`.qwer` files](#rust) builds them the first time it starts, which needs Rust. Run `quillo build main.qwe` beforehand on the same kind of machine, and deploy `.quillo/` with the program: `.quillo/native/` and `.quillo/plugins.lock`, each library's SHA-256. The server then needs no Rust. With `--no-build` it never builds: a library the lock does not name is refused rather than built again. Cargo runs what is in Quillo's build cache (`~/.cache/quillo/native`, or `QUILLO_NATIVE_CACHE`), so a server that builds keeps it to the account alone *(since 0.8.7)*: each of its folders is made 700, and a folder above it that other users can write in (a home with group write, say) is refused, with the `chmod go-w` to run |
 | **A long-running process** | Any VPS, cloud VM or container service. On shared hosting with `mod_fcgid` (cPanel), the web server starts it: see [Shared hosting](#shared-hosting). Hosting that runs only PHP cannot run it; see [static hosting](#static-hosting) |
 
 Quillo needs no Node, no package install and no build step on the server.
@@ -37,6 +37,7 @@ options](#running-quillo) lists every one, `--watch` and `--split` included.
 | `--log json` | a JSON line per request, for log collectors |
 | `--reload` | reload when the program's files change, without dropping requests (see [new versions](#new-versions)); with `--instances`, each instance loads the change, and `--split` passes it to its services |
 | `--max-body 50MB` | the largest request body (default 10 MiB): raise it for big uploads. Past its first 30 s a body must keep coming at 1 KiB/s *(since 0.7)*, and one that sends nothing for 30 s is answered `408`, with a line in the log. A gzipped body (`Content-Encoding: gzip`) is decoded, and the limit counts what it decodes to |
+| `--max-memory 512MB` | no one value a request makes (a text, a list, a body or file read, a fetched answer) may be bigger: a request that would make one ends with a 500 and a line in the log, while the others go on; at least `64KB`, and unset, nothing is checked *(since 0.8.7)* |
 | `--max-connections N` | connections open at once (default: what the file descriptors allow, less 4,608); past it one more is closed as it comes *(since 0.7)* |
 | `--connections-per-client N` | connections one client (an address, or an IPv6 /64) may hold open (default 512); this machine and `--trust-proxy`'s proxies are not held to it *(since 0.7)* |
 | `--base /shop` | when the program is served under a path rather than at the root: its links, redirects, scripts and cookies carry the prefix, and the proxy strips it from requests (Quillo routes the path it is given) |
@@ -146,6 +147,7 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
         proxy_read_timeout 1h;
@@ -157,6 +159,20 @@ server {
   visitor counts as one: only 256 pages then get live updates. `--trust-proxy 127.0.0.1`
   names the proxy, and `request.ip` and each client's limits are the visitor's, from the
   `X-Forwarded-For` it adds. It is read from no other address, as a client can write it.
+- **The scheme.** The same goes for `X-Forwarded-Proto` *(since 0.8.7: anyone's decided
+  `delete_cookie`'s `Secure` and a push subscription's origin)*: from a proxy
+  `--trust-proxy` names, it is the request's scheme, so a form's `Origin` is compared with
+  it (`http://` and `https://` of one host are two sites), a deleted cookie is `Secure`,
+  and a [notification](#possible-or-not) opens the https address. From another address it is
+  ignored, and the first time it would have counted the log says so once:
+
+  ```text
+  quillo: a request came with X-Forwarded-Proto from 127.0.0.1, which --trust-proxy does not name: if that address is your proxy, --trust-proxy 127.0.0.1; if not, a visitor sent it and it is ignored
+  ```
+
+  Quillo sends no `Strict-Transport-Security` itself, as it serves plain HTTP: the proxy
+  that serves HTTPS sends it, or the program does, with
+  `site_headers({ "strict-transport-security": "max-age=31536000" })`.
 - **Caching at the proxy or a CDN.** A page made from who the visitor is (it called
   `session()` or `cookie()`, set a cookie, or read a header of the request or its `ip`) is
   sent with `Cache-Control: private` and `Vary: Cookie`, so a shared cache does not give one
@@ -353,10 +369,14 @@ writes them to a folder that is uploaded as it is.
   `.quillo/plugins.lock` deployed with them (and `--no-build`)
 - `QUILLO_SECRET` set, the same on every server
 - `db.open(...) | unwrap`, and SQLite's folder on a disk that lasts, with backups
-- HTTPS from a proxy, which passes WebSockets and the `Host` header
+- HTTPS from a proxy, which passes WebSockets, the `Host` header and `X-Forwarded-Proto`,
+  named with `--trust-proxy`
 - `--host 127.0.0.1` behind a proxy on the same machine; not `--watch`
 - a service manager that restarts it, and waits 15 seconds when stopping it
 - `/_quillo/health` for the load balancer, `/_quillo/ready` for readiness;
   `/_quillo/metrics` and `/_quillo/describe` kept private, or off
-- `quillo run main.qwe --max-compute 2s`, so one request that computes for ever cannot hold an instance, and
-  limits of your own where you need them: Quillo has no rate limiting
+- `quillo run main.qwe --max-compute 2s --max-memory 512MB`, so one request that computes
+  for ever, or makes one huge value, cannot hold an instance (`find_all`, `replace` and
+  `split` stop at `--max-compute` too, inside a pattern that reads the text over and over
+  *(since 0.8.7)*), and limits of your own where you need them: Quillo has no rate
+  limiting

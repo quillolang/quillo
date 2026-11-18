@@ -40,8 +40,8 @@ These links are left alone:
 
 A route asked for ahead of a click may read (the database, files, other servers) but not
 write. Writing to the database, assigning a global variable, setting cookies or the
-session, writing files, `publish`, `http.post` and the like, and calls to services stop
-it, and the server answers "not prefetched" (`503`, `cache-control: no-store`), which the
+session, writing files, `publish`, `notification.send`, `http.post` and the like, and
+calls to services stop it, and the server answers "not prefetched" (`503`, `cache-control: no-store`), which the
 browser drops; a `204` would leave it where it was. The page is then made as usual when
 the link is followed.
 
@@ -58,7 +58,11 @@ route GET /logout {
 ```
 
 Pointing at a link to either does nothing: `/count` counts only when it is followed, and
-pointing at "Log out" logs no one out. A prefetch can be made by hand, as the browsers
+pointing at "Log out" logs no one out. Following a link does what the route does, a link on
+another site too, with the visitor's session: `quillo check` warns of a `GET` that writes
+and reads who the visitor is *(since 0.8.7)*, which belongs in a `POST` unless the write is
+meant (`route writes GET ...`; see [Requests from other
+sites](#requests-from-other-sites)). A prefetch can be made by hand, as the browsers
 other than Chrome and Edge make it:
 
 ```sh
@@ -84,7 +88,10 @@ to 30 seconds old on the click.
 
 A prefetch is work nobody has asked for yet. If anyone is waiting, it is answered "not
 prefetched" before it runs, and the page is made if the link is followed. So prefetches never
-go ahead of a visitor.
+go ahead of a visitor. That `503` carries `x-quillo-prefetch: busy` *(since 0.8.7)*, which
+a route's own `503` never does, so a client can tell a busy server from a page that cannot
+be made: Quillo's service worker, keeping [offline pages](#possible-or-not) as it installs, asks
+such a page again within 5 seconds.
 
 ## Turning it off
 

@@ -456,7 +456,10 @@ fn pay(from: int, n: int) -> int =
 
 Quillo keeps a few tables of its own in the program's database: scheduled jobs
 (`_quillo_jobs`, each run once, whichever server it is due on), the decisions of
-`db.atomic` (`_quillo_atomic`) and the migrations applied (`_quillo_migrations`).
+`db.atomic` (`_quillo_atomic`) and the migrations applied (`_quillo_migrations`). A program
+that names `notification` keeps the devices that turned notifications on in
+`_quillo_push`, with the jobs *(since 0.8.7)*: see [Installable apps, offline pages and
+notifications](#possible-or-not).
 
 With a database per tenant there is no one program database to keep them in, so the
 first two go to a system database: `db.system(target)` (one every server of the program

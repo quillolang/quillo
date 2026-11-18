@@ -85,9 +85,13 @@ options](#running-quillo) lists them all.
   SIGTERM, a SIGKILL, a crash): each holds a pipe from the app, which closes then, so no
   service is left serving with its port taken. A service started on its own, by hand or
   by systemd, serves on whatever its input is. `--describe`, `--no-build`,
-  `--reload` and the `--policy` files, given to the app (`quillo run app.qwe --split
+  `--reload`, `--max-compute` *(since 0.8.7: the services ran without it)*, `--max-memory`
+  and the `--policy` files, given to the app (`quillo run app.qwe --split
   --no-build --policy prod.toml`), are given to each of them too, and with `--port 0`
-  the services are told the port the app was given. It is the quickest
+  the services are told the port the app was given. Each service takes the request's
+  scheme from the app, signed with the shared secret, and believes no visitor's
+  `X-Forwarded-Proto` *(since 0.8.7)*: its cookie deletions are `Secure` and its writes
+  compared by scheme as the app's are. It is the quickest
   way to see an app as it would run split, on one machine.
 - **Checked once.** Before `--split` starts any service, the app checks the whole tree,
   its own files and every service's, and says each warning once. An error in a service
@@ -682,7 +686,16 @@ server fn whoami() -> map = { caller: request.caller, user: request.user, forwar
 ```
 
 - `keys` gives each caller's key by its name; a list takes any of them while one is
-  rotated.
+  rotated. A caller named here proves itself with its key: a call signed with the shared
+  secret that says it is `shop` is a 401 *(since 0.8.7: any service with the secret could
+  be that caller)*.
+- **The shared secret names no caller** where `accept_calls` names them another way
+  (`keys`, `client_cert` or `jwt`) *(since 0.8.7: such a call was the caller it signed
+  as)*. It is one of the system's services and no more: `request.caller` is `{ name: "",
+  by: "quillo" }`, `for` refuses it, and `_contracts` lists only what has no `for`. A token
+  or a certificate on the same call still names it. Under `--split` the services sign with
+  the shared secret, so a `for` there needs callers with keys of their own (`auth: { key,
+  as }` where they declare the service).
 - `jwt` takes bearer tokens: their signature against the provider's keys (`jwks`, a URL;
   RS256, ES256 and EdDSA) or a `secret` (HS256), with `exp` required and `iss` and `aud`
   checked. `audience` is required. A token a user signed in for, whose `sub` is the user
@@ -690,7 +703,21 @@ server fn whoami() -> map = { caller: request.caller, user: request.user, forwar
   called as the shop. A service calls with its own, from the client-credentials grant.
 - `client_cert` takes the identity of a certificate a proxy checked, as Envoy and
   Istio pass it on: Quillo does not end TLS itself. The header is believed only on a
-  request from an address `--trust-proxy` names.
+  request from an address `--trust-proxy` names. A SPIFFE id names the caller whole, as
+  Istio names principals: `for ["spiffe://cluster.local/ns/shop/sa/shop"]` *(since 0.8.7:
+  its last part, so a workload called `shop` in any namespace was `shop`)*. A `for` written
+  with the last part is refused, with the id to write. Without one, the subject's CN names
+  the caller, read as RFC 2253 writes a subject, its escapes decoded (`CN=Acme\, Inc.` is
+  `Acme, Inc.`); OpenSSL's slash form, two CNs or a CN with `:` name no caller *(since
+  0.8.7: the first `CN=` after any `,` or `/`)*.
+- The header is read as Envoy's `x-forwarded-client-cert`, one element set in place of the
+  client's (`forward_client_cert_details: SANITIZE_SET`): several elements, or several
+  lines of it, are a 401 *(since 0.8.7: an element the client wrote could name the
+  caller)*. `client_cert: { header, chain: true }` takes the last of several, for
+  `APPEND_FORWARD`; `client_cert: { header, subject: true }` reads a header that holds the
+  subject alone, as nginx's `proxy_set_header X-Client-DN $ssl_client_s_dn` sends it
+  *(both since 0.8.7)*. The form is the program's to say: it is never guessed from the
+  header.
 - `check` runs before the arguments are read. Only `true` or a map accepts, and a map
   becomes the caller; anything else refuses the call with 403, `false` and null among
   them *(since 0.7: null, an `if` with no `else`, let every other caller in)*. An error

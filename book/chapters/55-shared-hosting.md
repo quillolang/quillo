@@ -60,6 +60,12 @@ RewriteRule ^ app.fcgi [QSA,L]
   `quillo run` that believes a proxy's `X-Forwarded-For`). The server does the rest as it does
   for any visitor: routes, sessions, limits and the log. The log goes to Apache's error
   log.
+- **The scheme is the web server's** *(since 0.8.7)*: `HTTPS=on` (or `1`) is https,
+  another value http, else `REQUEST_SCHEME`. A visitor's own `X-Forwarded-Proto` is
+  dropped, so the check of a form's `Origin`, cookie deletions and a
+  [notification](#possible-or-not)'s address follow Apache. Behind another proxy that ends TLS,
+  set `HTTPS` from it (`SetEnvIf X-Forwarded-Proto https HTTPS=on`). A write refused for
+  the scheme alone is said once in the log, naming `HTTPS` or `REQUEST_SCHEME`.
 - **Jobs and the program's own calls** reach it through a socket only it can open, in a
   private folder under the system's temporary one.
 - **WebSockets do not pass through FastCGI.** Live data falls back to plain requests, each
@@ -116,7 +122,9 @@ configuration, not in `.htaccess`.
 - **`--trust-proxy 127.0.0.1`.** Every visitor through the socket is 127.0.0.1 to the
   program, so they share one address and one set of limits. The server says so at start
   until the option is given. With it, `request.ip` is the visitor's, from the
-  `X-Forwarded-For` header Apache adds.
+  `X-Forwarded-For` header Apache adds, and the scheme is the `X-Forwarded-Proto` it
+  sends *(since 0.8.7: anyone's was believed)*. Apache adds that one only when told, in
+  the HTTPS site: `RequestHeader set X-Forwarded-Proto "https"`.
 - A process manager may pass the socket's path in `$PORT`, as an absolute path
   (`/home/u/app/app.sock`, or `unix:/home/u/app/app.sock`).
 - Not with `--split`, `--instances`, `--register` or `--join`.
@@ -176,8 +184,9 @@ workers = 8
 ```
 
 A limit takes what its option takes: `workers = 0` is refused (`` p.toml:2: `workers` is
-a positive number, as `--workers` takes ``), and so is a `max_body` or `max_compute` of
-0. The start line lists the limits that hold the program: `quillo: policy
+a positive number, as `--workers` takes ``), and so is a `max_body`, `max_compute` or
+`max_memory` of 0. `max_memory = "64MB"` *(since 0.8.7)* holds each value a request makes,
+as `--max-memory` does (`the policy p.toml allows (max_memory, N bytes)`). The start line lists the limits that hold the program: `quillo: policy
 quillo.policy (workers 8)`. A request the policy's `max_compute` ends is a 500, as one
 `--max-compute` ends, wherever it is ended (a loop, a call, `highlight`, `markdown`),
 and the log names whichever is the tighter (`this request computed for longer than the
