@@ -31,9 +31,10 @@
   text once per match: once its searches have read the text 64 times over and computed for
   more than 0.25 s plus 4 µs a byte (the thread's own time), the call is an error value (`the
   pattern scans the text too many times`), and `--max-compute` ends the request within 64
-  searches. A pattern compiles to at most 10 MB, as before (`(?:\w{1000}){109}` fits,
+  searches *(since 0.8.7: 300 KB of text held a worker 11 s)*. A pattern compiles to at most 10 MB, as before (`(?:\w{1000}){109}` fits,
   `(?:\w{1000}){110}` does not), and each thread keeps 32 MB of compiled patterns, the oldest
-  going first. So a pattern takes only what both read alike: characters, `.`, `[...]`,
+  going first *(since 0.8.7: 256 patterns of any size, so a visitor's held 11 MB a request)*.
+  So a pattern takes only what both read alike: characters, `.`, `[...]`,
   `\d \w \s \b` (ASCII digits and word characters, as in JavaScript) and their capitals,
   `^ $`, `(...)`, `(?:...)`, `(?<name>...)`, `|`, and `* + ? {n} {n,} {n,m}` (lazy with
   `?`). Lookaround, backreferences and `\p{...}` are errors, found by `quillo check`
@@ -254,7 +255,8 @@ Safety built in:
   with a form, multipart or plain-text body that the browser marks as cross-site
   (`Sec-Fetch-Site`, or an `Origin` naming another host) gets a 403. An `Origin` alone must
   name the request's host and, where a `--trust-proxy` proxy says the scheme
-  (`X-Forwarded-Proto`), its scheme too: `http://` and `https://` of one host are two sites.
+  (`X-Forwarded-Proto`), its scheme too: `http://` and `https://` of one host are two sites
+  *(since 0.8.7: the hosts alone were compared)*.
   JSON from another site needs the browser to ask first, which nothing here answers, and programs that
   call the site (webhooks, scripts) send no `Origin`, so both work as before. For a
   path that must take such posts, such as a payment provider's return or a single
@@ -1737,7 +1739,8 @@ that is not `http://` or `https://`. The functions: `http.get(url, headers, opti
 `http.put` and `http.patch` as `post`, and `http.request(method, url, body, headers,
 options)`. A method is an HTTP token (letters, digits and ``!#$%&'*+-.^_`|~``), sent in
 upper case; another (a space, a line break, an empty one) is an error value before anything
-is sent, `http.stream`'s `method` too (`http: not an HTTP method: "GET\r\nX: y"`). The
+is sent, `http.stream`'s `method` too (`http: not an HTTP method: "GET\r\nX: y"`)
+*(since 0.8.7: a line break in it rewrote the request)*. The
 answer is `{ status, ok, headers, body, json, cookies }`: `ok` for a 2xx,
 header names in lower case, a header sent more than once joined with `, ` (two `Link`s are
 one `</x>; rel=a, </y>; rel=b`), `set-cookie`'s lines joined by a line break, as they
@@ -1769,7 +1772,7 @@ http.get(url, {}, { timeout: 5 })                   // an error value after 5 se
 - `public_only: true` connects only to the public internet: not this machine, a private
   network, or a cloud's metadata service (`169.254.169.254`), however the address is
   written, checked on the address the name gives as it connects (and again for each
-  redirect). Use it whenever someone else may choose the URL. `quillo check` warns about
+  redirect) *(since 0.8.7: RFC 8215's local-use NAT64, `64:ff9b:1::/48`, counted as public)*. Use it whenever someone else may choose the URL. `quillo check` warns about
   a call whose host comes from a value (a parameter, `request`, text put together before
   the host ends) unless its options say `public_only`, either way: `false` says the call
   is meant to reach inside.
@@ -1781,14 +1784,15 @@ http.get(url, {}, { timeout: 5 })                   // an error value after 5 se
 - `cache: seconds` (a GET's, up to a day) keeps a successful answer and gives it again to
   the same call, the same method, URL, headers, body and every option (`ca`, `cert`, `key`,
   `timeout`, `redirects`, `public_only`, `cache`), from any request, until then: a call with
-  another client certificate, or none, is asked again. Calls
+  another client certificate, or none, is asked again *(since 0.8.7: one certificate's answer
+  went to calls with another)*. Calls
   to a site that limits how often it is asked, or that charges for each, then go out once
   for everyone: `cache: 60` on the rates above asks once a minute however many pages
   show them. Failures are not kept, nor answers over 16 MiB. At most 64 MiB of answers
   are, those that end soonest going first. On a method other than GET, and in
   `http.stream`, `cache` is an error.
 - `timeout: seconds` (more than 0, up to 300; `0.5` too) is how long the whole call may
-  take, its redirects included: then it gives an error value (`... took more than 5 s (its timeout)`). Unless given,
+  take, its redirects included *(since 0.8.7: each hop had its own)*: then it gives an error value (`... took more than 5 s (its timeout)`). Unless given,
   a call has 10 seconds to connect and 60 in all; `http.stream`, 300 seconds of silence
   between pieces. A page that waits on a slow service waits that long.
 

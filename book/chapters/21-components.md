@@ -595,7 +595,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   where the code surely runs on the server (a route, a `server fn`, a tick, a job, the top
   level, a page state's initializer), and says what reaches someone who is not on the page:
   `notification.send` sends to their devices (see [Notifications](#notifications)), and
-  `publish` updates the pages that are open. A plain function, which may run on either
+  `publish` updates the pages that are open *(since 0.8.7: they passed the check, and every
+  call was a 500)*. A plain function, which may run on either
   side, is not guessed: called on the server, it fails as it runs, saying the same.
 
   ```quillo
@@ -1890,7 +1891,8 @@ emoji and Persian need, are let through. The same holds for each tool: such a ch
 its `///` is an error at its line and column, a zero width joiner or non-joiner there passes
 only between two characters a reader sees, and one in a string its schemas carry (a default,
 a string type's value) is an error at the tool's line, naming where; where the program has
-tools, its file's name, which AI clients are told, follows the same rule. A zero width joiner or non-joiner
+tools, its file's name, which AI clients are told, follows the same rule *(since 0.8.7: they reached
+the model)*. A zero width joiner or non-joiner
 between two letters still passes, as words in some scripts need one; it can carry about one
 hidden bit per letter, not readable text. The first line names the program, cut at 24
 characters. `quillo check` warns when the whole is over 2,000

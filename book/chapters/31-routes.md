@@ -11,7 +11,7 @@ route [offline] [writes] METHOD /path [with effects] { ... block ... }
   (see [Pages that work offline](#pages-that-work-offline)).
 - **`writes`**, in the same place (either order with `offline`), says that a `GET` route's
   write is meant: `route writes GET /confirm/:code = ...`; after `routes`, it does so for each
-  `GET` and `ANY` route of the group. A link on another site, in an email or in a chat opens a `GET` with
+  `GET` and `ANY` route of the group *(since 0.8.7)*. A link on another site, in an email or in a chat opens a `GET` with
   the visitor's session (browsers send `SameSite=Lax` cookies when a link is followed), so
   `quillo check` warns of a `GET` (or `ANY`) route that surely writes (SQL as written in the program: SQL
   built at run time is not guessed) and reads who the visitor is (`session()`, `cookie()`, the
@@ -341,10 +341,13 @@ routes /reports | signed_in with db {               // what its routes may do, a
   (tabs and line breaks dropped, `\` read as `/`), else null. `//evil.example`,
   `/\evil.example`, `https://...` and `javascript:...` are null, and so is a path that
   starts so once its `.` and `..` are taken out, as a browser takes them out:
-  `/.//evil.example`, `/%2e//evil.example`, `/a/..//evil.example`. It works on both sides.
+  `/.//evil.example`, `/%2e//evil.example`, `/a/..//evil.example`. It works on both sides
+  *(since 0.8.7: the browser's `local_path` let C1 controls through)*.
   `redirect` writes a path of the site's own as the browser would go to it, its dot segments
   out, and one `/` first where that left more: `redirect("/.//evil.example")` sends the
-  visitor to `/evil.example` on the site, not to `evil.example`.
+  visitor to `/evil.example` on the site, not to `evil.example` *(since 0.8.7: it wrote
+  `//evil.example`, which a browser takes to that host, and `local_path` let such paths
+  through)*.
 
   ```quillo
   route GET /login ? { next: str = "/" } =
@@ -999,7 +1002,7 @@ curl -i localhost:8080/_quillo/rpc/transfer -H "Idempotency-Key: k-77" --json '[
   Expired ones are deleted as requests come. When the database that keeps them cannot
   be reached, the request is answered 503 with `{"error": "could not record the
   Idempotency-Key"}` (or `could not read`); the database's message goes to the log, and to
-  the answer only under `--watch`.
+  the answer only under `--watch` *(since 0.8.7: it reached the visitor)*.
 - A key runs at most once, whoever asks, within the tenant and the mount point. Who may
   see its answer is compared at the strongest level both sides have: the `user` option
   (a str or an int, as `{ user: token.owner }`), then the session (a hidden id its cookie
@@ -2348,7 +2351,8 @@ server fn refund(account: int, cents: int) for ["shop"] {
   changed. A caller named here proves itself with its key: a call signed with the shared
   secret that says it is `shop` is refused (401 ``this service takes calls from `shop` signed
   with its key, not the shared secret``, unless a token or certificate on it names it), as a
-  joining copy must use its key.
+  joining copy must use its key *(since 0.8.7: any service with the secret could be that
+  caller)*.
 - `shared: false`: calls signed with the shared secret are refused (`this service takes
   no calls signed with the shared secret`). Without it they are taken, and where
   `accept_calls` names callers another way (`keys`, `client_cert` or `jwt`), such a call is
@@ -2356,7 +2360,7 @@ server fn refund(account: int, cents: int) for ["shop"] {
   `for` refuses it (``a call signed with the shared secret names no caller here, as
   `accept_calls` takes keys, certificates or tokens: `refund` is for shop``), and
   `_contracts` lists only what has no `for`; a token or a certificate on the same call still
-  names it. With the shared secret alone, the name the caller signed is taken.
+  names it *(since 0.8.7: such a call was the caller it signed as)*. With the shared secret alone, the name the caller signed is taken.
 - `jwt: { issuer, audience, jwks, secret }`: a bearer token, an OAuth 2.0 access token,
   checked against the identity provider's keys at `jwks` (a URL, kept for ten minutes,
   fetched again at most once a minute for a key it does not have: RS256, ES256, EdDSA)
@@ -2371,7 +2375,8 @@ server fn refund(account: int, cents: int) for ["shop"] {
 - `client_cert: { header }`: the identity in the header a proxy that ended mutual TLS
   sets, as Envoy's `x-forwarded-client-cert` (`Subject="CN=shop,O=Acme";URI=spiffe://...`):
   the SPIFFE id whole, as Istio's policies name principals
-  (`for ["spiffe://cluster.local/ns/shop/sa/shop"]`), else the subject's CN
+  (`for ["spiffe://cluster.local/ns/shop/sa/shop"]`) *(since 0.8.7: its last part, so a
+  workload called `shop` in any namespace was `shop`)*, else the subject's CN
   (`for ["shop"]`). Quillo ends no TLS itself, so the header is believed only from an
   address the option [`--trust-proxy`](#options-of-quillo-run) names
   (`quillo run billing.qwe --as-service --trust-proxy 10.0.0.2`); from anyone else it is
@@ -2379,7 +2384,8 @@ server fn refund(account: int, cents: int) for ["shop"] {
   - Which form the header is in is the program's to say, never read from the header. By
     default it is Envoy's `x-forwarded-client-cert`, one proxy's element, set in place of any
     the client sent (Envoy's `forward_client_cert_details: SANITIZE_SET`, as a sidecar does):
-    a header with several elements, or several lines of it, is a 401. `client_cert: { header, chain: true }`
+    a header with several elements, or several lines of it, is a 401 *(since 0.8.7: an element
+    the client wrote could name the caller)*. `client_cert: { header, chain: true }` *(since 0.8.7)*
     takes the last of several, for `APPEND_FORWARD`; use it only where the CA issues no URI
     or DNS name with a comma in it (a SPIFFE id cannot have one), as Envoy writes those bare
     and such a name would read as one more element, the last, written by the certificate's
@@ -2389,7 +2395,7 @@ server fn refund(account: int, cents: int) for ["shop"] {
     and `Chain` in quotes with backslash escapes and the others bare, with no space around
     `;`, `,` or `=` and no empty part or element. Anything else (an unclosed quote, a
     backslash outside quotes, another key, a space) is a 401 that says what.
-  - `client_cert: { header, subject: true }` says the header is the certificate's subject
+  - `client_cert: { header, subject: true }` *(since 0.8.7)* says the header is the certificate's subject
     alone, one line, as RFC 2253 writes it (nginx: `proxy_set_header X-Client-DN
     $ssl_client_s_dn;`); it does not go with `chain`, and is for a proxy that sets the header
     in place of the client's, as `proxy_set_header` does, never one that adds to it.
@@ -2406,7 +2412,8 @@ server fn refund(account: int, cents: int) for ["shop"] {
     `for` ``).
   - The CN is the subject's CN attribute, read as RFC 2253 and 4514 write a subject (what
     Envoy and nginx's `$ssl_client_s_dn` send: `CN=shop,O=Acme\, Inc.`), its escapes decoded
-    (`CN=Acme\, Inc.` is `Acme, Inc.`). OpenSSL's slash form (`/O=Acme/CN=shop`, nginx's
+    (`CN=Acme\, Inc.` is `Acme, Inc.`) *(since 0.8.7: the first `CN=` after any `,` or `/`, so
+    an OU of `a/CN=shop` named shop)*. OpenSSL's slash form (`/O=Acme/CN=shop`, nginx's
     `$ssl_client_s_dn_legacy`) is refused, as it cannot be read one way only. Two CNs, an
     empty one, one with `:` in it, or a subject that does not parse names no caller (a 401,
     saying why). Where a SPIFFE id names the caller,
@@ -2600,12 +2607,13 @@ empty.
   The name is ASCII letters, digits and `_`.
 - A call is made as `http`'s are: under a policy, `[http] hosts` must list the site and
   `private = false` keeps it off this machine and its networks (`site shop: not called:
-  ...`). It goes through the proxy `HTTPS_PROXY` or `HTTP_PROXY` names: list internal sites
+  ...`) *(since 0.8.7: the policy did not apply)*. It goes through the proxy `HTTPS_PROXY` or `HTTP_PROXY` names: list internal sites
   in `NO_PROXY` (`NO_PROXY=shop.internal,.corp.example`), or they are asked for through the
   proxy. Redirects are followed on the site's own scheme, host and port only, up to 5 (a
   `302` after the `POST` as a `GET`, a `307` with the same body); one elsewhere, or not
   `http(s)`, is an error value naming where (``site shop: `notes` answered 302, sent on to
-  http://10.0.0.5/: ...``). A call has 10 s to connect and 30 s in all, its redirects
+  http://10.0.0.5/: ...``) *(since 0.8.7: any redirect was followed, and a `file:` one was a
+  500)*. A call has 10 s to connect and 30 s in all, its redirects
   included; an answer over 64 MiB is an error value; requests say
   `User-Agent: quillo/<version>`. The cookies of every answer from the site's own address,
   those on the way too, are kept where cookies are kept (above).

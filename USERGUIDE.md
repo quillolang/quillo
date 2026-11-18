@@ -51,7 +51,7 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | `--port N`, `--host H` | where to listen (default `$PORT` or 8080, on 127.0.0.1). Give `--port` when 8080 is taken or a host names the port; `--port 0` takes any free one (`platform().server.port` says which). Give `--host 0.0.0.0` to be reached from other machines without a proxy in front; `--host localhost` is 127.0.0.1 |
 | `--listen unix:PATH` *(since 0.7)* | listen on a Unix socket instead of a TCP port, when a web server on the same machine passes requests on (on a shared server, so the neighbours cannot reach the port): made with mode 0600, removed when the server stops, and at most 100 bytes long (a short path relative to the folder `quillo` runs in). A `$PORT` that holds an absolute path (`/home/u/app.sock`, or `unix:/home/u/app.sock`) is taken the same way. Not with `--split`, `--instances`, `--register` or `--join` (see [Quillo on a shared server](#quillo-on-a-shared-server-cpanel)) |
 | `--socket-mode 660` *(since 0.7)* | with `--listen`: the socket's permissions, in octal, when the web server reaches it through the owner's group; the owner must keep read and write (`600`, the default) |
-| `--watch`, `-w` | while you work on the program: reload when it or a `use`d file changes (a symbolic link pointed elsewhere, to a file or a folder, counts, within a second), show errors on the page, and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's). Started, or reloaded, while a file is broken or missing, it watches every file that load read or tried and the folders of those not there, so fixing or making one loads the program; each error is said once. A save that does not load while one that did is served is said over the open pages, which keep what they hold, until a save loads. A page whose HTML and code a change left alone (an edit to a route it never calls) is not refreshed, a component whose code changed is swapped into the open pages in place, keeping its states, and a page's own HTML is put in place without a reload (see [What a save keeps](#what-a-save-keeps)); `--watch=reload` refreshes every page at every change, and so does a page with `<html data-reload>`. The server's own data, a top-level `let` the program changes, is kept across a save too. With no `QUILLO_SECRET`, sessions are signed with a key kept in `.quillo/.quillo-secret`, so a restart does not sign you out. The folders `db.migrate` reads are watched too, so a migration that arrives is applied, and one that stopped the start is tried again once fixed *(since 0.8.6)*. With `--host` on an address beyond this machine (`0.0.0.0`, to try the program from a phone) it says so at start, as anyone on the network can then reach the program and see its errors in full *(since 0.8.6)*. A page a service worker answers from its cache cannot be refreshed: it reloads once, then stops and says so, in the page's error overlay and in the console (this page came from a service worker's cache, so `--watch` cannot refresh it: unregister the worker, or have it go to the server first for pages); so under `--watch=reload`, and after a restart. `app.toml` and the icon it names are watched as the program's files are (see [Installable apps](#installable-apps)), and no page registers Quillo's service worker: `/_quillo/sw.js` is then one that takes itself away, with what Quillo's worker kept (see [Pages that work offline](#pages-that-work-offline)). Not in production |
+| `--watch`, `-w` | while you work on the program: reload when it or a `use`d file changes (a symbolic link pointed elsewhere, to a file or a folder, counts, within a second), show errors on the page, and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's). Started, or reloaded, while a file is broken or missing, it watches every file that load read or tried and the folders of those not there, so fixing or making one loads the program; each error is said once. A save that does not load while one that did is served is said over the open pages, which keep what they hold, until a save loads. A page whose HTML and code a change left alone (an edit to a route it never calls) is not refreshed, a component whose code changed is swapped into the open pages in place, keeping its states, and a page's own HTML is put in place without a reload (see [What a save keeps](#what-a-save-keeps)); `--watch=reload` refreshes every page at every change, and so does a page with `<html data-reload>`. The server's own data, a top-level `let` the program changes, is kept across a save too. With no `QUILLO_SECRET`, sessions are signed with a key kept in `.quillo/.quillo-secret`, so a restart does not sign you out. The folders `db.migrate` reads are watched too, so a migration that arrives is applied, and one that stopped the start is tried again once fixed *(since 0.8.6)*. With `--host` on an address beyond this machine (`0.0.0.0`, to try the program from a phone) it says so at start, as anyone on the network can then reach the program and see its errors in full *(since 0.8.6)*. A page a service worker answers from its cache cannot be refreshed: it reloads once, then stops and says so, in the page's error overlay and in the console (this page came from a service worker's cache, so `--watch` cannot refresh it: unregister the worker, or have it go to the server first for pages); so under `--watch=reload`, and after a restart *(since 0.8.7: it reloaded without end, or never showed the change)*. `app.toml` and the icon it names are watched as the program's files are (see [Installable apps](#installable-apps)), and no page registers Quillo's service worker: `/_quillo/sw.js` is then one that takes itself away, with what Quillo's worker kept (see [Pages that work offline](#pages-that-work-offline)). Not in production |
 | `--reload` | in production, for a program whose files change while it runs (a deploy that copies new files, a plugin editor): reload when files change, with no errors shown on pages and no page refreshes; with `--instances`, each instance loads the change, the first checking it, so one that does not check reaches none; `--split` passes it to its services |
 | `--env-file F` | when the settings are not in the `.env` beside the program: a file kept outside the site's folder, or one file per place (`--env-file prod.env`); a path from the folder `quillo` runs in, which must exist |
 | `--policy FILE` *(since 0.7)* | before a deploy, or on a server you share: narrow what the program may do, after `/etc/quillo/policy.toml` and before the `quillo.policy` beside it; may be given more than once (see [The policy](#the-policy)) |
@@ -59,7 +59,7 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | `--no-check` | when the program is known to check (a deploy that ran `quillo check` already) and starting must be quick: skip the static checks |
 | `--max-body N` | when visitors send larger files or bodies than 10MB: the largest request body to accept, a size such as `50MB` (`KB`, `MB` and `GB`, in any case, are 1024-based) or bytes; default 10MB; a larger body gets 413 (see [Uploads](#uploads)) |
 | `--max-compute 2s` *(since 0.7)* | when a request that computes for long must not hold up the others: end one that computes this long without letting go, as a 500 (see [Concurrency](#concurrency-and-reloading)) |
-| `--max-memory 512MB` | end a request that would make one value (a text, a list, a map, a body or file read, a fetched answer) bigger than this, as a 500; sizes as `--max-body`, at least `64KB`; unset, nothing is checked (see [Concurrency](#concurrency-and-reloading)) |
+| `--max-memory 512MB` *(since 0.8.7)* | end a request that would make one value (a text, a list, a map, a body or file read, a fetched answer) bigger than this, as a 500; sizes as `--max-body`, at least `64KB`; unset, nothing is checked (see [Concurrency](#concurrency-and-reloading)) |
 | `--drain 30s` | when a stop must not wait for ever: cut off what is still running this long after the stop is asked for (500ms, 30s, 2m). Without it, a stop waits for every request in progress, a large file being sent too, however long it takes (see [Stopping and health](#stopping-and-health)); for `run` and `mcp` |
 | `--max-tool-calls 60` | how many tool calls a minute each user of the MCP door may make (60 by default); one more is a `429` with `Retry-After` (see [Tools for AI clients](#tools-for-ai-clients)) |
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64). Give fewer where an account limits its threads (shared hosting), more for many slow calls at once |
@@ -373,7 +373,7 @@ answer, as after a post and a redirect. What the program sees is what a server s
 
 A program with an `app.toml` beside its main file can be installed from the browser, as an
 app with a window and an icon of its own (Chrome's and Edge's Install, Safari's Add to Dock
-and Add to Home Screen, Android's Add to home screen). Quillo writes what browsers ask for:
+and Add to Home Screen, Android's Add to home screen) *(since 0.8.7)*. Quillo writes what browsers ask for:
 the manifest, the icons at each size, and the tags in each page's head; the program writes
 no JavaScript, no service worker and no plugin. It is the file the phone builds read
 (`mobile/README.md`), so the app on a phone and the site installed from a browser have one
@@ -487,7 +487,7 @@ changes.
 ### Pages that work offline
 
 A route tagged `offline` keeps its page on the device, so that it opens with no network:
-on a train, in a basement, or with the server down. The tag comes after `route`, before
+on a train, in a basement, or with the server down *(since 0.8.7)*. The tag comes after `route`, before
 the method; after `routes`, it tags every `GET` route of the group and of the groups
 inside it:
 
@@ -621,7 +621,8 @@ scope, so such a program tags no route `offline`. Quillo's own addresses, under
 - **Pages from the network first**, the cache only when it fails. A worker that answers
   pages from its cache first shows the page as it was kept, with nothing to say so, and under
   `--watch` a page it answers cannot be refreshed: it reloads once, then stops and says so in
-  the page's error overlay and the console.
+  the page's error overlay and the console *(since 0.8.7: it reloaded without end, or never
+  showed the change)*.
 - **Keep only the pages that are everyone's.** The Cache API keeps what it is given,
   whatever its `Cache-Control` says, `private` and `no-store` included. Quillo sends
   `cache-control: private` on every page made from who the visitor is (see [What a route
@@ -665,7 +666,8 @@ self.addEventListener("fetch", (e) => {
 ### Notifications
 
 `notification` tells a person's devices something while the page is closed, or the browser
-too (an order shipped, a reply, a reminder), as the system's notification, over Web Push.
+too (an order shipped, a reply, a reminder), as the system's notification, over Web Push
+*(since 0.8.7)*.
 It is not `notify`, which shows a note on a page that is open (see
 [Components](#components)). The browser asks once, from a click, and the server sends when
 it likes:
@@ -1486,7 +1488,8 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   the visitor's choosing. On `<img>` (`<image>`), `<form>`, `<iframe>`, `<embed>` and
   `<object>`, a spread `name` that is one of `document`'s own properties is dropped, and such
   an `id` on `<object>` or on an `<img>` with a name: the browser would make
-  `document.createElement` that element and stop every component. What the program writes
+  `document.createElement` that element and stop every component *(since 0.8.7: they were
+  written)*. What the program writes
   out is kept. The marks of an island are the server's alone: `data-qi`,
   `data-qd` and `data-qt` written out, and a `<quillo-island>` tag, are errors when the
   program loads and in `quillo check` (`` `data-qi` in <div> is Quillo's own attribute ``).
@@ -1661,7 +1664,8 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   `<\!--`, which mean the same inside JavaScript strings and cannot end the element
   early, so `raw(json.stringify(x))` there is safe too. Inside `<svg>` or `<math>`, where the
   browser reads a script's text as markup, such HTML goes in a CDATA section, a `]]>` in it
-  split between two, so the script gets the same code; where HTML is read again (SVG's
+  split between two, so the script gets the same code *(since 0.8.7: its markup reached the
+  page)*; where HTML is read again (SVG's
   `<foreignObject>`, `<desc>`, `<title>`, MathML's `<mi>` to `<mtext>`, `<annotation-xml
   encoding="text/html">`, after a tag such as `<p>` that ends SVG) nothing is added. A view's
   children count as where it puts them; where Quillo cannot tell and the view can reach an
@@ -1670,7 +1674,8 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   then `<svg>{s}</svg>`, or given to a view's attribute) has its script text put in CDATA
   there too; a `<![CDATA[ ... ]]>` that a value in it holds is then taken by the browser as a
   section, so those characters are left out of the value (nothing else changes). Write `<script>` and `<style>` in lower case: `<sCript>` is refused, as the
-  browser takes it as a script. The script's own text goes in the
+  browser takes it as a script *(since 0.8.7: it was written as any element, and the browser
+  ran it)*. The script's own text goes in the
   same way: as written, quotes included, with only `</` and `<!--` escaped; code kept in
   a string goes in as code with `raw`, `<script>{raw("if (a < b) go('x')")}</script>`. A `{` in a script's text
   starts a Quillo value, so JavaScript with braces is a parse error that says what to
@@ -2354,7 +2359,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   where the code surely runs on the server (a route, a `server fn`, a tick, a job, the top
   level, a page state's initializer), and says what reaches someone who is not on the page:
   `notification.send` sends to their devices (see [Notifications](#notifications)), and
-  `publish` updates the pages that are open. A plain function, which may run on either
+  `publish` updates the pages that are open *(since 0.8.7: they passed the check, and every
+  call was a 500)*. A plain function, which may run on either
   side, is not guessed: called on the server, it fails as it runs, saying the same.
 
   ```quillo
@@ -3649,7 +3655,8 @@ emoji and Persian need, are let through. The same holds for each tool: such a ch
 its `///` is an error at its line and column, a zero width joiner or non-joiner there passes
 only between two characters a reader sees, and one in a string its schemas carry (a default,
 a string type's value) is an error at the tool's line, naming where; where the program has
-tools, its file's name, which AI clients are told, follows the same rule. A zero width joiner or non-joiner
+tools, its file's name, which AI clients are told, follows the same rule *(since 0.8.7: they reached
+the model)*. A zero width joiner or non-joiner
 between two letters still passes, as words in some scripts need one; it can carry about one
 hidden bit per letter, not readable text. The first line names the program, cut at 24
 characters. `quillo check` warns when the whole is over 2,000
@@ -4020,7 +4027,8 @@ route GET / {
 - **On the server**, each request for a page runs the initializers in the order written
   (one may read another), before its route; the route may set it, and the page is made
   with it. They run with the request there, so an initializer may read the visitor's
-  `session()` and `url()` (`state who = session().user ?? "guest"`); the page is then the
+  `session()` and `url()` (`state who = session().user ?? "guest"`) *(since 0.8.7: they ran
+  before the request, found no session, and each `session()` after them gave `{}`)*; the page is then the
   visitor's, `private` (see [What a route returns](#what-a-route-returns)). Views and
   components read it as any name. A view that read one is not cached, since it is that
   page's.
@@ -4124,7 +4132,7 @@ route [offline] [writes] METHOD /path [with effects] { ... block ... }
   (see [Pages that work offline](#pages-that-work-offline)).
 - **`writes`**, in the same place (either order with `offline`), says that a `GET` route's
   write is meant: `route writes GET /confirm/:code = ...`; after `routes`, it does so for each
-  `GET` and `ANY` route of the group. A link on another site, in an email or in a chat opens a `GET` with
+  `GET` and `ANY` route of the group *(since 0.8.7)*. A link on another site, in an email or in a chat opens a `GET` with
   the visitor's session (browsers send `SameSite=Lax` cookies when a link is followed), so
   `quillo check` warns of a `GET` (or `ANY`) route that surely writes (SQL as written in the program: SQL
   built at run time is not guessed) and reads who the visitor is (`session()`, `cookie()`, the
@@ -4454,10 +4462,13 @@ routes /reports | signed_in with db {               // what its routes may do, a
   (tabs and line breaks dropped, `\` read as `/`), else null. `//evil.example`,
   `/\evil.example`, `https://...` and `javascript:...` are null, and so is a path that
   starts so once its `.` and `..` are taken out, as a browser takes them out:
-  `/.//evil.example`, `/%2e//evil.example`, `/a/..//evil.example`. It works on both sides.
+  `/.//evil.example`, `/%2e//evil.example`, `/a/..//evil.example`. It works on both sides
+  *(since 0.8.7: the browser's `local_path` let C1 controls through)*.
   `redirect` writes a path of the site's own as the browser would go to it, its dot segments
   out, and one `/` first where that left more: `redirect("/.//evil.example")` sends the
-  visitor to `/evil.example` on the site, not to `evil.example`.
+  visitor to `/evil.example` on the site, not to `evil.example` *(since 0.8.7: it wrote
+  `//evil.example`, which a browser takes to that host, and `local_path` let such paths
+  through)*.
 
   ```quillo
   route GET /login ? { next: str = "/" } =
@@ -5112,7 +5123,7 @@ curl -i localhost:8080/_quillo/rpc/transfer -H "Idempotency-Key: k-77" --json '[
   Expired ones are deleted as requests come. When the database that keeps them cannot
   be reached, the request is answered 503 with `{"error": "could not record the
   Idempotency-Key"}` (or `could not read`); the database's message goes to the log, and to
-  the answer only under `--watch`.
+  the answer only under `--watch` *(since 0.8.7: it reached the visitor)*.
 - A key runs at most once, whoever asks, within the tenant and the mount point. Who may
   see its answer is compared at the strongest level both sides have: the `user` option
   (a str or an int, as `{ user: token.owner }`), then the session (a hidden id its cookie
@@ -6461,7 +6472,8 @@ server fn refund(account: int, cents: int) for ["shop"] {
   changed. A caller named here proves itself with its key: a call signed with the shared
   secret that says it is `shop` is refused (401 ``this service takes calls from `shop` signed
   with its key, not the shared secret``, unless a token or certificate on it names it), as a
-  joining copy must use its key.
+  joining copy must use its key *(since 0.8.7: any service with the secret could be that
+  caller)*.
 - `shared: false`: calls signed with the shared secret are refused (`this service takes
   no calls signed with the shared secret`). Without it they are taken, and where
   `accept_calls` names callers another way (`keys`, `client_cert` or `jwt`), such a call is
@@ -6469,7 +6481,7 @@ server fn refund(account: int, cents: int) for ["shop"] {
   `for` refuses it (``a call signed with the shared secret names no caller here, as
   `accept_calls` takes keys, certificates or tokens: `refund` is for shop``), and
   `_contracts` lists only what has no `for`; a token or a certificate on the same call still
-  names it. With the shared secret alone, the name the caller signed is taken.
+  names it *(since 0.8.7: such a call was the caller it signed as)*. With the shared secret alone, the name the caller signed is taken.
 - `jwt: { issuer, audience, jwks, secret }`: a bearer token, an OAuth 2.0 access token,
   checked against the identity provider's keys at `jwks` (a URL, kept for ten minutes,
   fetched again at most once a minute for a key it does not have: RS256, ES256, EdDSA)
@@ -6484,7 +6496,8 @@ server fn refund(account: int, cents: int) for ["shop"] {
 - `client_cert: { header }`: the identity in the header a proxy that ended mutual TLS
   sets, as Envoy's `x-forwarded-client-cert` (`Subject="CN=shop,O=Acme";URI=spiffe://...`):
   the SPIFFE id whole, as Istio's policies name principals
-  (`for ["spiffe://cluster.local/ns/shop/sa/shop"]`), else the subject's CN
+  (`for ["spiffe://cluster.local/ns/shop/sa/shop"]`) *(since 0.8.7: its last part, so a
+  workload called `shop` in any namespace was `shop`)*, else the subject's CN
   (`for ["shop"]`). Quillo ends no TLS itself, so the header is believed only from an
   address the option [`--trust-proxy`](#options-of-quillo-run) names
   (`quillo run billing.qwe --as-service --trust-proxy 10.0.0.2`); from anyone else it is
@@ -6492,7 +6505,8 @@ server fn refund(account: int, cents: int) for ["shop"] {
   - Which form the header is in is the program's to say, never read from the header. By
     default it is Envoy's `x-forwarded-client-cert`, one proxy's element, set in place of any
     the client sent (Envoy's `forward_client_cert_details: SANITIZE_SET`, as a sidecar does):
-    a header with several elements, or several lines of it, is a 401. `client_cert: { header, chain: true }`
+    a header with several elements, or several lines of it, is a 401 *(since 0.8.7: an element
+    the client wrote could name the caller)*. `client_cert: { header, chain: true }` *(since 0.8.7)*
     takes the last of several, for `APPEND_FORWARD`; use it only where the CA issues no URI
     or DNS name with a comma in it (a SPIFFE id cannot have one), as Envoy writes those bare
     and such a name would read as one more element, the last, written by the certificate's
@@ -6502,7 +6516,7 @@ server fn refund(account: int, cents: int) for ["shop"] {
     and `Chain` in quotes with backslash escapes and the others bare, with no space around
     `;`, `,` or `=` and no empty part or element. Anything else (an unclosed quote, a
     backslash outside quotes, another key, a space) is a 401 that says what.
-  - `client_cert: { header, subject: true }` says the header is the certificate's subject
+  - `client_cert: { header, subject: true }` *(since 0.8.7)* says the header is the certificate's subject
     alone, one line, as RFC 2253 writes it (nginx: `proxy_set_header X-Client-DN
     $ssl_client_s_dn;`); it does not go with `chain`, and is for a proxy that sets the header
     in place of the client's, as `proxy_set_header` does, never one that adds to it.
@@ -6519,7 +6533,8 @@ server fn refund(account: int, cents: int) for ["shop"] {
     `for` ``).
   - The CN is the subject's CN attribute, read as RFC 2253 and 4514 write a subject (what
     Envoy and nginx's `$ssl_client_s_dn` send: `CN=shop,O=Acme\, Inc.`), its escapes decoded
-    (`CN=Acme\, Inc.` is `Acme, Inc.`). OpenSSL's slash form (`/O=Acme/CN=shop`, nginx's
+    (`CN=Acme\, Inc.` is `Acme, Inc.`) *(since 0.8.7: the first `CN=` after any `,` or `/`, so
+    an OU of `a/CN=shop` named shop)*. OpenSSL's slash form (`/O=Acme/CN=shop`, nginx's
     `$ssl_client_s_dn_legacy`) is refused, as it cannot be read one way only. Two CNs, an
     empty one, one with `:` in it, or a subject that does not parse names no caller (a 401,
     saying why). Where a SPIFFE id names the caller,
@@ -6713,12 +6728,13 @@ empty.
   The name is ASCII letters, digits and `_`.
 - A call is made as `http`'s are: under a policy, `[http] hosts` must list the site and
   `private = false` keeps it off this machine and its networks (`site shop: not called:
-  ...`). It goes through the proxy `HTTPS_PROXY` or `HTTP_PROXY` names: list internal sites
+  ...`) *(since 0.8.7: the policy did not apply)*. It goes through the proxy `HTTPS_PROXY` or `HTTP_PROXY` names: list internal sites
   in `NO_PROXY` (`NO_PROXY=shop.internal,.corp.example`), or they are asked for through the
   proxy. Redirects are followed on the site's own scheme, host and port only, up to 5 (a
   `302` after the `POST` as a `GET`, a `307` with the same body); one elsewhere, or not
   `http(s)`, is an error value naming where (``site shop: `notes` answered 302, sent on to
-  http://10.0.0.5/: ...``). A call has 10 s to connect and 30 s in all, its redirects
+  http://10.0.0.5/: ...``) *(since 0.8.7: any redirect was followed, and a `file:` one was a
+  500)*. A call has 10 s to connect and 30 s in all, its redirects
   included; an answer over 64 MiB is an error value; requests say
   `User-Agent: quillo/<version>`. The cookies of every answer from the site's own address,
   those on the way too, are kept where cookies are kept (above).
@@ -6912,9 +6928,10 @@ stays the simpler choice when the next move depends on the answer.
   text once per match: once its searches have read the text 64 times over and computed for
   more than 0.25 s plus 4 µs a byte (the thread's own time), the call is an error value (`the
   pattern scans the text too many times`), and `--max-compute` ends the request within 64
-  searches. A pattern compiles to at most 10 MB, as before (`(?:\w{1000}){109}` fits,
+  searches *(since 0.8.7: 300 KB of text held a worker 11 s)*. A pattern compiles to at most 10 MB, as before (`(?:\w{1000}){109}` fits,
   `(?:\w{1000}){110}` does not), and each thread keeps 32 MB of compiled patterns, the oldest
-  going first. So a pattern takes only what both read alike: characters, `.`, `[...]`,
+  going first *(since 0.8.7: 256 patterns of any size, so a visitor's held 11 MB a request)*.
+  So a pattern takes only what both read alike: characters, `.`, `[...]`,
   `\d \w \s \b` (ASCII digits and word characters, as in JavaScript) and their capitals,
   `^ $`, `(...)`, `(?:...)`, `(?<name>...)`, `|`, and `* + ? {n} {n,} {n,m}` (lazy with
   `?`). Lookaround, backreferences and `\p{...}` are errors, found by `quillo check`
@@ -7135,7 +7152,8 @@ Safety built in:
   with a form, multipart or plain-text body that the browser marks as cross-site
   (`Sec-Fetch-Site`, or an `Origin` naming another host) gets a 403. An `Origin` alone must
   name the request's host and, where a `--trust-proxy` proxy says the scheme
-  (`X-Forwarded-Proto`), its scheme too: `http://` and `https://` of one host are two sites.
+  (`X-Forwarded-Proto`), its scheme too: `http://` and `https://` of one host are two sites
+  *(since 0.8.7: the hosts alone were compared)*.
   JSON from another site needs the browser to ask first, which nothing here answers, and programs that
   call the site (webhooks, scripts) send no `Origin`, so both work as before. For a
   path that must take such posts, such as a payment provider's return or a single
@@ -8618,7 +8636,8 @@ that is not `http://` or `https://`. The functions: `http.get(url, headers, opti
 `http.put` and `http.patch` as `post`, and `http.request(method, url, body, headers,
 options)`. A method is an HTTP token (letters, digits and ``!#$%&'*+-.^_`|~``), sent in
 upper case; another (a space, a line break, an empty one) is an error value before anything
-is sent, `http.stream`'s `method` too (`http: not an HTTP method: "GET\r\nX: y"`). The
+is sent, `http.stream`'s `method` too (`http: not an HTTP method: "GET\r\nX: y"`)
+*(since 0.8.7: a line break in it rewrote the request)*. The
 answer is `{ status, ok, headers, body, json, cookies }`: `ok` for a 2xx,
 header names in lower case, a header sent more than once joined with `, ` (two `Link`s are
 one `</x>; rel=a, </y>; rel=b`), `set-cookie`'s lines joined by a line break, as they
@@ -8650,7 +8669,7 @@ http.get(url, {}, { timeout: 5 })                   // an error value after 5 se
 - `public_only: true` connects only to the public internet: not this machine, a private
   network, or a cloud's metadata service (`169.254.169.254`), however the address is
   written, checked on the address the name gives as it connects (and again for each
-  redirect). Use it whenever someone else may choose the URL. `quillo check` warns about
+  redirect) *(since 0.8.7: RFC 8215's local-use NAT64, `64:ff9b:1::/48`, counted as public)*. Use it whenever someone else may choose the URL. `quillo check` warns about
   a call whose host comes from a value (a parameter, `request`, text put together before
   the host ends) unless its options say `public_only`, either way: `false` says the call
   is meant to reach inside.
@@ -8662,14 +8681,15 @@ http.get(url, {}, { timeout: 5 })                   // an error value after 5 se
 - `cache: seconds` (a GET's, up to a day) keeps a successful answer and gives it again to
   the same call, the same method, URL, headers, body and every option (`ca`, `cert`, `key`,
   `timeout`, `redirects`, `public_only`, `cache`), from any request, until then: a call with
-  another client certificate, or none, is asked again. Calls
+  another client certificate, or none, is asked again *(since 0.8.7: one certificate's answer
+  went to calls with another)*. Calls
   to a site that limits how often it is asked, or that charges for each, then go out once
   for everyone: `cache: 60` on the rates above asks once a minute however many pages
   show them. Failures are not kept, nor answers over 16 MiB. At most 64 MiB of answers
   are, those that end soonest going first. On a method other than GET, and in
   `http.stream`, `cache` is an error.
 - `timeout: seconds` (more than 0, up to 300; `0.5` too) is how long the whole call may
-  take, its redirects included: then it gives an error value (`... took more than 5 s (its timeout)`). Unless given,
+  take, its redirects included *(since 0.8.7: each hop had its own)*: then it gives an error value (`... took more than 5 s (its timeout)`). Unless given,
   a call has 10 seconds to connect and 60 in all; `http.stream`, 300 seconds of silence
   between pieces. A page that waits on a slow service waits that long.
 
@@ -8732,9 +8752,11 @@ A program source (`.qwe`, `.qwer`) is read only as a regular file of at most 16 
 program's sources come to at most 32 MiB together for `quillo check`, the language server and
 `quillo docs`; other files (`app.toml`, `quillo.policy`, `public/` style sheets and scripts)
 are read up to 64 MiB, so a cloned repository's link to `/dev/zero` or a FIFO is refused
-(`cannot read ...: it is not a regular file`) rather than read for ever. The program or
+(`cannot read ...: it is not a regular file`) rather than read for ever *(since 0.8.7: a link
+to `/dev/zero` ate memory)*. The program or
 `--policy` named on the command line may be a pipe or device under `/dev` or `/proc`
-(`quillo run <(...)`, `quillo run /dev/stdin`): it is read once. `.env` and `--env-file` are
+(`quillo run <(...)`, `quillo run /dev/stdin`): it is read once *(since 0.8.7:
+`quillo run <(...)` printed nothing)*. `.env` and `--env-file` are
 read as they come.
 
 Its warnings: an unused variable (name it `_x` to keep it); a function named like a
@@ -8874,7 +8896,7 @@ other request goes on. No `??` takes it, and it is said at the line that made th
   error messages, sessions and channels, and the PostgreSQL driver's own rows.
 
 Each instance and each `--split` service holds the same limit, and `--split` passes
-`--max-compute` on to its services too.
+`--max-compute` on to its services too *(since 0.8.7: they ran without it)*.
 
 How long a wait may last:
 
@@ -9498,7 +9520,7 @@ hosts = ["api.stripe.com", "*.mapbox.com"]
 | `[http] hosts` | the hosts `http.*` and `site` calls may reach: `api.stripe.com`, `*.mapbox.com` (its subdomains, not itself), `*`. Each redirect is judged before it is followed |
 | `[http] private` | `false`: `http.*` and `site` calls reach nothing on this machine or its networks (loopback, private, link-local and the cloud's metadata at `169.254.169.254`, carrier-grade NAT, IPv6's unique-local), as the name resolves when it connects |
 | `[env] names` | the variables `env()` may read; any other reads as not set, so `env("HOME") ?? "none"` gives `"none"` |
-| `[limits] workers`, `max_compute`, `max_body`, `max_memory` | the most [`--workers`](#options-of-quillo-run), [`--max-compute`](#options-of-quillo-run), [`--max-body`](#options-of-quillo-run) and [`--max-memory`](#options-of-quillo-run) may be (`max_memory`: no one value a request makes may be bigger; its stop says `the policy p.toml allows (max_memory, N bytes)`): a smaller value given on the command line stays (`"10s"`, `"500ms"`, `"2m"`; `"10MB"`, `"512KB"` or bytes). Each takes what the option takes: 0 is refused (`p.toml:2: `max_body` is a size larger than 0`), as the option refuses it |
+| `[limits] workers`, `max_compute`, `max_body`, `max_memory` | the most [`--workers`](#options-of-quillo-run), [`--max-compute`](#options-of-quillo-run), [`--max-body`](#options-of-quillo-run) and [`--max-memory`](#options-of-quillo-run) may be (`max_memory` *(since 0.8.7)*: no one value a request makes may be bigger; its stop says `the policy p.toml allows (max_memory, N bytes)`): a smaller value given on the command line stays (`"10s"`, `"500ms"`, `"2m"`; `"10MB"`, `"512KB"` or bytes). Each takes what the option takes: 0 is refused (`p.toml:2: `max_body` is a size larger than 0`), as the option refuses it |
 | `[limits] max_tool_calls` | the most tool calls a minute each user of the MCP door may make: it can lower `--max-tool-calls`, not raise it |
 
 Under the two files above, with `APP_NAME=Shop`:
@@ -9862,7 +9884,8 @@ How it runs:
 - `use` builds the file with cargo (`$CARGO`, or `cargo` found on the PATH from the program's
   folder), in a crate of its own in Quillo's cache: `QUILLO_NATIVE_CACHE`, else
   `$XDG_CACHE_HOME/quillo/native`, else `~/.cache/quillo/native`, else `quillo-<uid>/native` in
-  the temporary folder (`quillo-<username>` on Windows). Cargo runs whatever is in that cache,
+  the temporary folder (`quillo-<username>` on Windows) *(since 0.8.7: where HOME was not set, a
+  shared temporary folder another user could plant a `build.rs` in)*. Cargo runs whatever is in that cache,
   so: every folder above it, up to `/`, must be root's or yours and not writable by other users
   unless it is sticky (`/tmp`); one inside your home has its group and other write bits removed,
   and your home itself or a folder outside it is refused, with the `chmod go-w` to run. Each
@@ -9876,7 +9899,7 @@ How it runs:
   DrvFs) nothing is removed, and Quillo says once that the cache is not private there. A crate's
   manifest says `build = false`, and cargo runs in `/` (your profile folder on Windows), so the
   program's own `.cargo/config.toml` and `rust-toolchain.toml` do not apply to its plugins'
-  builds: settings for them go in `$CARGO_HOME/config.toml` or rustup's default. On Windows no
+  builds *(since 0.8.7: a `.cargo/config.toml` above the cache applied)*: settings for them go in `$CARGO_HOME/config.toml` or rustup's default. On Windows no
   ACL is checked, and a service running as SYSTEM gets `C:\Windows\Temp\quillo-MACHINE$`,
   whose owner nothing checks. The crates' builds
   are shared there, and nothing old is removed (it grows: clear it now and then). The
@@ -9962,7 +9985,8 @@ quillo install --list pdf          # what the catalog has, matching "pdf"
   `QUILLO_REGISTRY` for another), downloads each file, and writes it only when its
   SHA-256 and the `//! version:` line of its header match the catalog's. Each file is
   written to a new temporary file of its own beside it, then renamed into place; a plugin or
-  example file that is a symbolic link is neither read nor written. A plugin that fails
+  example file that is a symbolic link is neither read nor written *(since 0.8.7: it wrote
+  through any file a link named `<name>.qwer.part` pointed to)*. A plugin that fails
   leaves the others going, and the exit status is 1.
 - A file already there is left alone when it is the same, replaced when the catalog's
   version is newer, and kept when it is newer or the same version changed by hand:

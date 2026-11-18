@@ -118,7 +118,8 @@ How it runs:
 - `use` builds the file with cargo (`$CARGO`, or `cargo` found on the PATH from the program's
   folder), in a crate of its own in Quillo's cache: `QUILLO_NATIVE_CACHE`, else
   `$XDG_CACHE_HOME/quillo/native`, else `~/.cache/quillo/native`, else `quillo-<uid>/native` in
-  the temporary folder (`quillo-<username>` on Windows). Cargo runs whatever is in that cache,
+  the temporary folder (`quillo-<username>` on Windows) *(since 0.8.7: where HOME was not set, a
+  shared temporary folder another user could plant a `build.rs` in)*. Cargo runs whatever is in that cache,
   so: every folder above it, up to `/`, must be root's or yours and not writable by other users
   unless it is sticky (`/tmp`); one inside your home has its group and other write bits removed,
   and your home itself or a folder outside it is refused, with the `chmod go-w` to run. Each
@@ -132,7 +133,7 @@ How it runs:
   DrvFs) nothing is removed, and Quillo says once that the cache is not private there. A crate's
   manifest says `build = false`, and cargo runs in `/` (your profile folder on Windows), so the
   program's own `.cargo/config.toml` and `rust-toolchain.toml` do not apply to its plugins'
-  builds: settings for them go in `$CARGO_HOME/config.toml` or rustup's default. On Windows no
+  builds *(since 0.8.7: a `.cargo/config.toml` above the cache applied)*: settings for them go in `$CARGO_HOME/config.toml` or rustup's default. On Windows no
   ACL is checked, and a service running as SYSTEM gets `C:\Windows\Temp\quillo-MACHINE$`,
   whose owner nothing checks. The crates' builds
   are shared there, and nothing old is removed (it grows: clear it now and then). The
@@ -218,7 +219,8 @@ quillo install --list pdf          # what the catalog has, matching "pdf"
   `QUILLO_REGISTRY` for another), downloads each file, and writes it only when its
   SHA-256 and the `//! version:` line of its header match the catalog's. Each file is
   written to a new temporary file of its own beside it, then renamed into place; a plugin or
-  example file that is a symbolic link is neither read nor written. A plugin that fails
+  example file that is a symbolic link is neither read nor written *(since 0.8.7: it wrote
+  through any file a link named `<name>.qwer.part` pointed to)*. A plugin that fails
   leaves the others going, and the exit status is 1.
 - A file already there is left alone when it is the same, replaced when the catalog's
   version is newer, and kept when it is newer or the same version changed by hand:

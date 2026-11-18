@@ -30,9 +30,11 @@ A program source (`.qwe`, `.qwer`) is read only as a regular file of at most 16 
 program's sources come to at most 32 MiB together for `quillo check`, the language server and
 `quillo docs`; other files (`app.toml`, `quillo.policy`, `public/` style sheets and scripts)
 are read up to 64 MiB, so a cloned repository's link to `/dev/zero` or a FIFO is refused
-(`cannot read ...: it is not a regular file`) rather than read for ever. The program or
+(`cannot read ...: it is not a regular file`) rather than read for ever *(since 0.8.7: a link
+to `/dev/zero` ate memory)*. The program or
 `--policy` named on the command line may be a pipe or device under `/dev` or `/proc`
-(`quillo run <(...)`, `quillo run /dev/stdin`): it is read once. `.env` and `--env-file` are
+(`quillo run <(...)`, `quillo run /dev/stdin`): it is read once *(since 0.8.7:
+`quillo run <(...)` printed nothing)*. `.env` and `--env-file` are
 read as they come.
 
 Its warnings: an unused variable (name it `_x` to keep it); a function named like a

@@ -258,7 +258,8 @@ route GET / {
 - **On the server**, each request for a page runs the initializers in the order written
   (one may read another), before its route; the route may set it, and the page is made
   with it. They run with the request there, so an initializer may read the visitor's
-  `session()` and `url()` (`state who = session().user ?? "guest"`); the page is then the
+  `session()` and `url()` (`state who = session().user ?? "guest"`) *(since 0.8.7: they ran
+  before the request, found no session, and each `session()` after them gave `{}`)*; the page is then the
   visitor's, `private` (see [What a route returns](#what-a-route-returns)). Views and
   components read it as any name. A view that read one is not cached, since it is that
   page's.

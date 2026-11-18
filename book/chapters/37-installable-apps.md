@@ -9,7 +9,7 @@ JavaScript, service worker or key of its own.
 
 A program with an `app.toml` beside its main file can be installed from the browser, as an
 app with a window and an icon of its own (Chrome's and Edge's Install, Safari's Add to Dock
-and Add to Home Screen, Android's Add to home screen). Quillo writes what browsers ask for:
+and Add to Home Screen, Android's Add to home screen) *(since 0.8.7)*. Quillo writes what browsers ask for:
 the manifest, the icons at each size, and the tags in each page's head; the program writes
 no JavaScript, no service worker and no plugin. It is the file the phone builds read
 (`mobile/README.md`), so the app on a phone and the site installed from a browser have one
@@ -123,7 +123,7 @@ changes.
 ## Pages that work offline
 
 A route tagged `offline` keeps its page on the device, so that it opens with no network:
-on a train, in a basement, or with the server down. The tag comes after `route`, before
+on a train, in a basement, or with the server down *(since 0.8.7)*. The tag comes after `route`, before
 the method; after `routes`, it tags every `GET` route of the group and of the groups
 inside it:
 
@@ -257,7 +257,8 @@ scope, so such a program tags no route `offline`. Quillo's own addresses, under
 - **Pages from the network first**, the cache only when it fails. A worker that answers
   pages from its cache first shows the page as it was kept, with nothing to say so, and under
   `--watch` a page it answers cannot be refreshed: it reloads once, then stops and says so in
-  the page's error overlay and the console.
+  the page's error overlay and the console *(since 0.8.7: it reloaded without end, or never
+  showed the change)*.
 - **Keep only the pages that are everyone's.** The Cache API keeps what it is given,
   whatever its `Cache-Control` says, `private` and `no-store` included. Quillo sends
   `cache-control: private` on every page made from who the visitor is (see [What a route
@@ -301,7 +302,8 @@ self.addEventListener("fetch", (e) => {
 ## Notifications
 
 `notification` tells a person's devices something while the page is closed, or the browser
-too (an order shipped, a reply, a reminder), as the system's notification, over Web Push.
+too (an order shipped, a reply, a reminder), as the system's notification, over Web Push
+*(since 0.8.7)*.
 It is not `notify`, which shows a note on a page that is open (see
 [Components](#components)). The browser asks once, from a click, and the server sends when
 it likes:

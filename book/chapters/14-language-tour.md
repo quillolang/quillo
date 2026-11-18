@@ -640,7 +640,8 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   the visitor's choosing. On `<img>` (`<image>`), `<form>`, `<iframe>`, `<embed>` and
   `<object>`, a spread `name` that is one of `document`'s own properties is dropped, and such
   an `id` on `<object>` or on an `<img>` with a name: the browser would make
-  `document.createElement` that element and stop every component. What the program writes
+  `document.createElement` that element and stop every component *(since 0.8.7: they were
+  written)*. What the program writes
   out is kept. The marks of an island are the server's alone: `data-qi`,
   `data-qd` and `data-qt` written out, and a `<quillo-island>` tag, are errors when the
   program loads and in `quillo check` (`` `data-qi` in <div> is Quillo's own attribute ``).
@@ -815,7 +816,8 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   `<\!--`, which mean the same inside JavaScript strings and cannot end the element
   early, so `raw(json.stringify(x))` there is safe too. Inside `<svg>` or `<math>`, where the
   browser reads a script's text as markup, such HTML goes in a CDATA section, a `]]>` in it
-  split between two, so the script gets the same code; where HTML is read again (SVG's
+  split between two, so the script gets the same code *(since 0.8.7: its markup reached the
+  page)*; where HTML is read again (SVG's
   `<foreignObject>`, `<desc>`, `<title>`, MathML's `<mi>` to `<mtext>`, `<annotation-xml
   encoding="text/html">`, after a tag such as `<p>` that ends SVG) nothing is added. A view's
   children count as where it puts them; where Quillo cannot tell and the view can reach an
@@ -824,7 +826,8 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   then `<svg>{s}</svg>`, or given to a view's attribute) has its script text put in CDATA
   there too; a `<![CDATA[ ... ]]>` that a value in it holds is then taken by the browser as a
   section, so those characters are left out of the value (nothing else changes). Write `<script>` and `<style>` in lower case: `<sCript>` is refused, as the
-  browser takes it as a script. The script's own text goes in the
+  browser takes it as a script *(since 0.8.7: it was written as any element, and the browser
+  ran it)*. The script's own text goes in the
   same way: as written, quotes included, with only `</` and `<!--` escaped; code kept in
   a string goes in as code with `raw`, `<script>{raw("if (a < b) go('x')")}</script>`. A `{` in a script's text
   starts a Quillo value, so JavaScript with braces is a parse error that says what to
