@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.7 (2026-11-18)
 
 - **Installable apps**: a program with an `app.toml` beside it can be installed from the
   browser, with nothing else written. Quillo serves `/manifest.webmanifest`, icons made from
