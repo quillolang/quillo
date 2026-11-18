@@ -41,14 +41,6 @@ pub enum Kind {
     FontAsk,
 }
 
-/// The start tags that end foreign content (WHATWG HTML, 13.2.6.5), with `<font>` given `color`,
-/// `face` or `size`.
-const BREAKOUT: &[&str] = &[
-    "b", "big", "blockquote", "body", "br", "center", "code", "dd", "div", "dl", "dt", "em", "embed", "h1", "h2", "h3", "h4", "h5", "h6", "head", "hr", "i",
-    "img", "li", "listing", "menu", "meta", "nobr", "ol", "p", "pre", "ruby", "s", "small", "span", "strong", "strike", "sub", "sup", "table", "tt", "u",
-    "ul", "var",
-];
-
 const FONT_ATTRS: [&str; 3] = ["color", "face", "size"];
 
 /// What `tag` is to the parser (see `Kind`). A view's or a component's tag is none of these.
@@ -91,7 +83,13 @@ fn name_kind(t: &str) -> Kind {
         "foreignobject" | "desc" | "title" => Kind::SvgPoint,
         "mi" | "mo" | "mn" | "ms" | "mtext" => Kind::MathText,
         "mglyph" | "malignmark" => Kind::Glyph,
-        t if BREAKOUT.contains(&t) => Kind::Breakout,
+        // The start tags that end foreign content (WHATWG HTML, 13.2.6.5), with `<font>` given
+        // `color`, `face` or `size` (`kind_of`). A `match`, which looks at a name's length first,
+        // where a list was gone through name by name for each tag (coverage of 0.8.7; branch
+        // coverage-087).
+        "b" | "big" | "blockquote" | "body" | "br" | "center" | "code" | "dd" | "div" | "dl" | "dt" | "em" | "embed" | "h1" | "h2" | "h3" | "h4" | "h5"
+        | "h6" | "head" | "hr" | "i" | "img" | "li" | "listing" | "menu" | "meta" | "nobr" | "ol" | "p" | "pre" | "ruby" | "s" | "small" | "span"
+        | "strong" | "strike" | "sub" | "sup" | "table" | "tt" | "u" | "ul" | "var" => Kind::Breakout,
         _ => Kind::Other,
     }
 }
@@ -108,6 +106,9 @@ fn html_encoding(s: &str) -> bool {
 pub fn kind_written(kind: Kind, tag: &str) -> Kind {
     match kind {
         Kind::AnnotationAsk => match written_attr(tag, "encoding") {
+            // A character reference in it (`text&#47;html`) is decoded by the browser, which this
+            // does not do: not known (coverage of 0.8.7, Q-1117; branch coverage-087).
+            Some(v) if v.contains('&') => Kind::AnnotationAsk,
             Some(v) if html_encoding(v) => Kind::AnnotationHtml,
             _ => Kind::Annotation,
         },
@@ -118,35 +119,89 @@ pub fn kind_written(kind: Kind, tag: &str) -> Kind {
 }
 
 /// The value of the first attribute `name` (ASCII case aside, as the parser reads names) in a
-/// start tag the renderer wrote: `name="value"`, or `name` alone, which is `""`.
+/// start tag the renderer wrote, or one in markup it did not write (`raw(...)`): `name="value"`,
+/// `name='value'`, `name=value`, or `name` alone, which is `""`. Read as the browser reads it
+/// (`next_attr`): an unquoted value, or spaces around `=`, had it read the same place again and
+/// again, a request that never ended (`raw("<font size=1>")` inside `<svg>`; coverage of 0.8.7,
+/// Q-1111; branch coverage-087).
 fn written_attr<'t>(tag: &'t str, name: &str) -> Option<&'t str> {
-    let b = tag.as_bytes();
-    // Past `<` and the tag's name.
-    let mut i = b.iter().position(|c| c.is_ascii_whitespace())?;
-    while i < b.len() {
-        while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b'/') {
-            i += 1;
-        }
-        if i >= b.len() || b[i] == b'>' {
-            return None;
-        }
-        let start = i;
-        while i < b.len() && !b[i].is_ascii_whitespace() && !matches!(b[i], b'=' | b'>' | b'/') {
-            i += 1;
-        }
-        let here = &tag[start..i];
-        let mut value = "";
-        if b.get(i) == Some(&b'=') && b.get(i + 1) == Some(&b'"') {
-            let from = i + 2;
-            let to = tag[from..].find('"').map_or(tag.len(), |n| from + n);
-            value = &tag[from..to];
-            i = to + 1;
-        }
+    let mut i = name_end(tag);
+    while let Ok((here, value)) = next_attr(tag, &mut i) {
         if here.eq_ignore_ascii_case(name) {
             return Some(value);
         }
     }
     None
+}
+
+/// Where a start tag's name ends (`<font size=1>` at the space): past `<`, up to a space, `/` or
+/// `>`, as the browser's tokenizer reads a tag name.
+fn name_end(tag: &str) -> usize {
+    tag.bytes().position(|c| c.is_ascii_whitespace() || matches!(c, b'/' | b'>')).unwrap_or(tag.len())
+}
+
+/// The next attribute of a start tag from `i` (past its name, or the attribute before), read as
+/// the browser's tokenizer reads it (WHATWG HTML, 13.2.5.32 to 13.2.5.40; character references
+/// aside): its name and value, `i` moved past them; or, at the tag's end, whether it ended with
+/// the self-closing flag. Each step reads at least one byte (coverage of 0.8.7, Q-1111; branch
+/// coverage-087).
+fn next_attr<'t>(tag: &'t str, i: &mut usize) -> Result<(&'t str, &'t str), bool> {
+    let b = tag.as_bytes();
+    // Before a name: spaces, and a `/` that `>` does not follow.
+    loop {
+        match b.get(*i) {
+            None | Some(b'>') => return Err(false),
+            Some(b'/') => {
+                *i += 1;
+                if b.get(*i) == Some(&b'>') {
+                    return Err(true);
+                }
+            }
+            Some(c) if c.is_ascii_whitespace() => *i += 1,
+            Some(_) => break,
+        }
+    }
+    // The name, its first byte whatever it is (a first `=` is part of it).
+    let start = *i;
+    *i += 1;
+    while b.get(*i).is_some_and(|&c| !c.is_ascii_whitespace() && !matches!(c, b'/' | b'>' | b'=')) {
+        *i += 1;
+    }
+    let name = &tag[start..*i];
+    let mut j = *i;
+    while b.get(j).is_some_and(|c| c.is_ascii_whitespace()) {
+        j += 1;
+    }
+    if b.get(j) != Some(&b'=') {
+        return Ok((name, ""));
+    }
+    j += 1;
+    while b.get(j).is_some_and(|c| c.is_ascii_whitespace()) {
+        j += 1;
+    }
+    let value = match b.get(j) {
+        Some(&q @ (b'"' | b'\'')) => {
+            let from = j + 1;
+            let to = tag[from..].find(q as char).map_or(tag.len(), |n| from + n);
+            *i = (to + 1).min(tag.len());
+            &tag[from..to]
+        }
+        // `name=>`: no value, and `>` ends the tag.
+        None | Some(b'>') => {
+            *i = j;
+            ""
+        }
+        // Unquoted: up to a space or `>`, a `/` in it.
+        Some(_) => {
+            let from = j;
+            while b.get(j).is_some_and(|&c| !c.is_ascii_whitespace() && c != b'>') {
+                j += 1;
+            }
+            *i = j;
+            &tag[from..j]
+        }
+    };
+    Ok((name, value))
 }
 
 /// What the parser's current element is, which decides what the next start tag makes.
@@ -260,10 +315,21 @@ fn broken(at: At) -> At {
     At { now: Ns::Html, base: at.base, post: Some(post) }
 }
 
+/// Not known where, for the rest of the page: what `written` gives back where markup it read lost
+/// the parser's place (an end tag that names no element open there, a table). The browser's
+/// elements open are then not the renderer's, so leaving the renderer's own (`</svg>`) does not
+/// bring the place back (`<svg><g>{raw("</svg><svg><svg>")}</g></svg>` then a script, still in
+/// SVG to the browser): `leave` keeps it, and only it has `base` not known. The next request
+/// starts at HTML again (`Interp::page_start`; coverage of 0.8.7, Q-1116; branch coverage-087).
+pub const LOST: At = At { now: Ns::Unsure, base: Ns::Unsure, post: Some(Ns::Unsure) };
+
 /// Where the parser is after an element: `outer` where it was opened, `inner` its contents as
 /// `enter` gave them, `cur` where they ended.
 #[inline]
 pub fn leave(outer: At, inner: At, cur: At) -> At {
+    if cur.base == Ns::Unsure {
+        return LOST;
+    }
     if outer.now == Ns::Unsure {
         return outer;
     }
@@ -291,78 +357,222 @@ pub fn leave(outer: At, inner: At, cur: At) -> At {
 /// them split, so the parser takes it as the text it is in HTML; a section it opened and left
 /// open is closed. Only inside `<svg>` or `<math>` is this asked (`Interp::render_unseen`). The
 /// html is taken as whole, its elements closed as the renderer writes them (FEEDBACK71.md, Q-969,
-/// found in review; branch security).
+/// found in review; branch security). Where it stops inside a tag, a comment, a CDATA section or
+/// a script's text, that is ended in the html given back; and where the parser's place is not
+/// followed (an end tag that names no element open here, a table), every script after is written
+/// as it is safe in both, and the place after is not known (coverage of 0.8.7, Q-1116; branch
+/// coverage-087).
 pub fn written(at: At, html: &str) -> (At, Option<String>) {
     let b = html.as_bytes();
-    let mut open: Vec<(At, At)> = Vec::new();
+    // The elements open, each with where it was opened, where its contents are, and where its
+    // name is in `html`, which an end tag must name (coverage of 0.8.7, Q-1116; branch
+    // coverage-087).
+    let mut open: Vec<(At, At, u32, u32)> = Vec::new();
     let mut cur = at;
     let mut fixed: Option<String> = None;
     let mut copied = 0;
     let mut i = 0;
-    while let Some(n) = b[i..].iter().position(|&c| c == b'<') {
+    // Where the parser is is no longer followed (an end tag that names no element open here, a
+    // table, a `<select>`, ...): every script after is written as it is safe in both, and the
+    // rest of the page is not known (`LOST`). Sticky, as `leave` can bring a place not known back
+    // to one that is (coverage of 0.8.7, Q-1116; branch coverage-087).
+    let mut lost = at.base == Ns::Unsure;
+    // What the html needs at its end where it stops inside a tag, a comment, a CDATA section or
+    // the text of a `<script>`: there the browser would read on into the renderer's next markup
+    // (`raw("<input")` then `<foreignObject>`), which is no longer what the renderer takes it for
+    // (coverage of 0.8.7, Q-1116; branch coverage-087).
+    let mut closer = String::new();
+    // A `<` that ends the html, written `&lt;`: the renderer's next text would make it a tag
+    // (`raw("<")` then `hello`; coverage of 0.8.7, Q-1116; branch coverage-087).
+    let mut last_lt = false;
+    // The next `<`: most often right after the tag before.
+    while let Some(n) = if b.get(i) == Some(&b'<') { Some(0) } else { memchr::memchr(b'<', b.get(i..).unwrap_or(&[])) } {
         i += n;
-        if b[i..].starts_with(b"<!--") {
-            i = html[i + 4..].find("-->").map_or(b.len(), |e| i + 4 + e + 3);
-            continue;
-        }
+        // A start or end tag, the most of them, at one look; else what the tokenizer passes over.
         let end = b.get(i + 1) == Some(&b'/');
         let from = i + 1 + end as usize;
         if !b.get(from).is_some_and(|c| c.is_ascii_alphabetic()) {
+            if let Some((past, close, unknown)) = passed_over(html, i, cur.now, lost) {
+                i = past;
+                lost |= unknown;
+                if let Some(c) = close {
+                    closer.push_str(c);
+                }
+                continue;
+            }
+            if from >= b.len() {
+                if end {
+                    // `</` at the very end: the browser takes what follows for a bogus comment.
+                    closer.push('>');
+                } else {
+                    last_lt = true;
+                }
+            }
             i += 1;
             continue;
         }
         let name_end = from + b[from..].iter().take_while(|c| !c.is_ascii_whitespace() && !matches!(c, b'/' | b'>')).count();
-        let tag_end = tag_end(b, name_end);
-        let tag = &html[i..tag_end];
+        let (tag_end, how) = tag_end(b, name_end);
+        let flag = how & SELF_CLOSING != 0;
+        let whole;
+        let tag = if how & UNENDED != 0 {
+            let c = if how & IN_DOUBLE != 0 {
+                "\">"
+            } else if how & IN_SINGLE != 0 {
+                "'>"
+            } else {
+                ">"
+            };
+            closer.push_str(c);
+            whole = format!("{}{}", &html[i..], c);
+            whole.as_str()
+        } else {
+            &html[i..tag_end]
+        };
         i = tag_end;
         if end {
-            if let Some((outer, inner)) = open.pop() {
-                cur = leave(outer, inner, cur);
+            // An end tag ends the element open that it names, the last one. In an HTML element,
+            // one of no rule of its own is passed over where that element, or one below it before
+            // the one it names, is of HTML's special ones (`</foreignObject>` in a `<div>`), as the
+            // body's rules have it. Else, one that names another, or none open here, is followed
+            // by the browser up the elements open, or ends one outside this html
+            // (`raw("</foreignObject>")`), which is not followed (WHATWG HTML 13.2.6.4.7 "any other
+            // end tag", 13.2.6.5; coverage of 0.8.7, Q-1116; branch coverage-087).
+            if !lost {
+                // The last element open, named so (written in the same case, the most often).
+                let named = &b[from..name_end];
+                if let Some(&(outer, inner, at, len)) = open.last() {
+                    let top = &b[at as usize..(at + len) as usize];
+                    if top == named || top.eq_ignore_ascii_case(named) {
+                        open.pop();
+                        cur = leave(outer, inner, cur);
+                        continue;
+                    }
+                }
+                match end_tag(&open, b, named) {
+                    Some(0) => {}
+                    Some(n) => {
+                        for _ in 0..n {
+                            let (outer, inner, _, _) = open.pop().expect("an element open");
+                            cur = leave(outer, inner, cur);
+                        }
+                    }
+                    None => lost = true,
+                }
             }
             continue;
         }
         // Its name in lower case, on the stack: none that matters is longer.
         let mut low = [0u8; 16];
-        let len = name_end - from;
-        let name = if len <= low.len() {
-            low[..len].copy_from_slice(&b[from..name_end]);
-            low[..len].make_ascii_lowercase();
-            std::str::from_utf8(&low[..len]).unwrap_or("")
-        } else {
-            ""
-        };
+        let name = lower(&b[from..name_end], &mut low);
         let kind = match name {
             "annotation-xml" => kind_written(Kind::AnnotationAsk, tag),
             "font" => kind_written(Kind::FontAsk, tag),
             n => name_kind(n),
         };
         let inner = enter(cur, kind);
+        // An HTML element (by the body's rules, after a tag that ends foreign content too).
+        let html_el = inner.now == Ns::Html;
+        // Tags after which the body's rules are not what this follows: tables, `<select>`,
+        // `<template>`, `<frameset>`, `<plaintext>`, a `<form>` (which a page's own form makes the
+        // browser pass over) (coverage of 0.8.7, Q-1116; branch coverage-087).
+        if (html_el || inner.now == Ns::Unsure) && html_lost(name) {
+            lost = true;
+            continue;
+        }
+        // The self-closing flag (`<circle/>`) closes an SVG or MathML element, or one not known to
+        // be HTML's; an HTML element's is passed over, so `<div/>` is open as `<div>` is, and a
+        // `</foreignObject>` after it is no end of the integration point to the browser, which
+        // `div` keeps it from (WHATWG HTML, 13.2.6.4.7 and 13.2.6.5). Taken as closed, the script
+        // after that HTML was written for SVG (coverage of 0.8.7, Q-1100; branch coverage-087).
+        // The flag is read as the tokenizer reads it: in `<svg width=10/>` the `/` is the
+        // value's, and the `<svg>` stays open, where taking it closed had a script in it written
+        // as HTML's (coverage of 0.8.7, Q-1112; branch coverage-087).
+        let closed = inner.now != Ns::Html && flag;
         // A script's text, and in HTML the text of the elements whose contents are text, runs to
-        // its end tag.
-        let text = name == "script"
-            || (inner.now == Ns::Html && matches!(name, "style" | "textarea" | "title" | "xmp" | "iframe" | "noembed" | "noframes" | "noscript"));
+        // its end tag; an SVG or MathML `<script/>` has none. Where the parser is not followed,
+        // a script's text is taken as text and the others' as markup, as is safe in both.
+        let script = name == "script";
+        let text = (script && (lost || !(closed && inner.now.foreign())))
+            || (!lost && html_el && matches!(name, "style" | "textarea" | "title" | "xmp" | "iframe" | "noembed" | "noframes" | "noscript"));
         if text {
-            let close = find_end_tag(&html[i..], name).map_or(b.len(), |e| i + e);
-            if name == "script" && inner.script_is_foreign() {
+            // An SVG or MathML script's contents are markup to the browser: its end is past the
+            // CDATA sections, comments and tags in it (`<![CDATA[ "</script>" ]]>`), where an HTML
+            // one's is at the first `</script>`. Where markup in it runs past the end of the html
+            // (a `<![CDATA[` in a value of a script made for HTML), that browser would never end
+            // it: the first `</script>` ends it, what is open in it closed (`cdata_text`). Where it
+            // is not known whether the script is SVG's or HTML's and the two differ, the text runs
+            // to the later one, and each `</script` before it is written `<\/script` (the same in
+            // a JavaScript string), so that both end there (coverage of 0.8.7, Q-1116; branch
+            // coverage-087).
+            let foreign = script && (lost || inner.script_is_foreign());
+            let first = find_end_tag(&html[i..], name).map(|e| i + e);
+            let found = match foreign {
+                true => {
+                    let later = foreign_end(html, i);
+                    if later.is_some() && later != first && (lost || !inner.now.foreign()) {
+                        let to = later.unwrap_or(b.len());
+                        let f = fixed.get_or_insert_with(String::new);
+                        f.push_str(&html[copied..i]);
+                        let body = escape_end_tags(&html[i..to]);
+                        f.push_str(&cdata_text(&body).unwrap_or(body));
+                        copied = to;
+                        i = to;
+                        open.push((cur, inner, from as u32, (name_end - from) as u32));
+                        cur = inner;
+                        continue;
+                    }
+                    later.or(first)
+                }
+                false => first,
+            };
+            let close = found.unwrap_or(b.len());
+            if foreign {
                 if let Some(t) = cdata_text(&html[i..close]) {
                     let f = fixed.get_or_insert_with(String::new);
                     f.push_str(&html[copied..i]);
                     f.push_str(&t);
                     copied = close;
                 }
+            } else if script && script_escapes(&html[i..close]) {
+                // `<!--` then `<script>` in an HTML script: its `</script>` ends the inner one
+                // only, which is not followed (WHATWG HTML 13.2.5.20 to 13.2.5.31; coverage of
+                // 0.8.7, Q-1116; branch coverage-087).
+                lost = true;
             }
             i = close;
-        } else if tag.ends_with("/>") || crate::parser::VOID_TAGS.contains(&name) {
-            // No end tag follows (the renderer writes none for `<input>`, in SVG too, where the
-            // parser keeps it open; it holds what follows as SVG all the same).
+            if found.is_none() {
+                // Its end tag is written, else the browser takes the renderer's next markup for
+                // its text.
+                closer.push_str("</");
+                closer.push_str(name);
+                closer.push('>');
+                continue;
+            }
+        } else if closed || (if html_el { html_no_push(name) } else { void_tag(name) }) {
+            // No end tag follows: an element of HTML's the body makes none of or ends at once
+            // (`<param>`, `<td>`, `<image>`, whatever its slash; coverage of 0.8.7, Q-1100;
+            // branch coverage-087), or one written so in SVG (the renderer writes none for
+            // `<input>`, in SVG too, where the parser keeps it open; it holds what follows as SVG
+            // all the same).
             cur = leave(cur, inner, inner);
             continue;
         }
-        open.push((cur, inner));
+        open.push((cur, inner, from as u32, (name_end - from) as u32));
         cur = inner;
     }
-    if let Some(f) = &mut fixed {
+    if last_lt || !closer.is_empty() {
+        let f = fixed.get_or_insert_with(String::new);
+        f.push_str(&html[copied..b.len() - last_lt as usize]);
+        if last_lt {
+            f.push_str("&lt;");
+        }
+        f.push_str(&closer);
+    } else if let Some(f) = &mut fixed {
         f.push_str(&html[copied..]);
+    }
+    if lost {
+        return (LOST, fixed);
     }
     // An element left open (raw html that is not whole): what follows is in it, which is not
     // followed.
@@ -372,28 +582,332 @@ pub fn written(at: At, html: &str) -> (At, Option<String>) {
     (cur, fixed)
 }
 
-/// Where a start tag whose name ends at `from` ends, past its `>`, a quoted value's `>` not
-/// counted.
-fn tag_end(b: &[u8], from: usize) -> usize {
-    let mut quote = None;
-    for (k, &c) in b.iter().enumerate().skip(from) {
-        match (quote, c) {
-            (None, b'"' | b'\'') => quote = Some(c),
-            (Some(q), c) if c == q => quote = None,
-            (None, b'>') => return k + 1,
-            _ => {}
-        }
+/// `name` in lower case in `buf`, where it fits (none that matters is longer), else `""`.
+#[inline]
+fn lower<'b>(name: &[u8], buf: &'b mut [u8; 16]) -> &'b str {
+    if name.len() > buf.len() {
+        return "";
     }
-    b.len()
+    let buf = &mut buf[..name.len()];
+    buf.copy_from_slice(name);
+    buf.make_ascii_lowercase();
+    std::str::from_utf8(buf).unwrap_or("")
 }
 
-/// Where the first `</name` (`name` in lower case) is in `hay`, ASCII case aside.
+/// What an end tag (its name `name` as written in `b`, `low` in lower case) does to the elements
+/// open here, as the browser's tree builder does it: how many it closes, the last ones (`Some(0)`:
+/// it is passed over), or `None` where that is not followed. The last one named so is closed; in
+/// an HTML element, an end tag of no rule of its own goes down the elements open until one named
+/// so (closed with those above it) or one of the special ones (passed over), as the body's "any
+/// other end tag" does; one that may have been closed by a start tag (`<p>` in a `<p>`, an `<li>`
+/// in an `<li>`) is not followed, as the browser's elements open are then not these (coverage of
+/// 0.8.7, Q-1116; branch coverage-087).
+#[cold]
+#[inline(never)]
+fn end_tag(open: &[(At, At, u32, u32)], b: &[u8], name: &[u8]) -> Option<usize> {
+    let &(_, top_in, at, len) = open.last()?;
+    let (at, len) = (at as usize, len as usize);
+    if b[at..at + len].eq_ignore_ascii_case(name) {
+        return Some(1);
+    }
+    let mut buf = [0u8; 16];
+    if top_in.now != Ns::Html || html_end_rule(lower(name, &mut buf)) {
+        return None;
+    }
+    for (k, &(_, inner, at, len)) in open.iter().enumerate().rev() {
+        let (at, len) = (at as usize, len as usize);
+        let mut buf = [0u8; 16];
+        let n = lower(&b[at..at + len], &mut buf);
+        let html = inner.now == Ns::Html;
+        if html && implied_closes(n) {
+            return None;
+        }
+        if html && b[at..at + len].eq_ignore_ascii_case(name) {
+            return Some(open.len() - k);
+        }
+        let special = if html {
+            html_special(n)
+        } else {
+            matches!(inner.now, Ns::Point | Ns::MathText) || (n == "annotation-xml" && inner.now == Ns::Annotation)
+        };
+        if special {
+            return Some(0);
+        }
+        if inner.now == Ns::Unsure {
+            return None;
+        }
+    }
+    None
+}
+
+/// End tags with a rule of their own in a page's body (WHATWG HTML, 13.2.6.4.7).
+fn html_end_rule(n: &str) -> bool {
+    matches!(
+        n,
+        "a" | "address" | "applet" | "article" | "aside" | "b" | "big" | "blockquote" | "body" | "br" | "button" | "center" | "code" | "dd" | "details"
+            | "dialog" | "dir" | "div" | "dl" | "dt" | "em" | "fieldset" | "figcaption" | "figure" | "font" | "footer" | "form" | "h1" | "h2" | "h3"
+            | "h4" | "h5" | "h6" | "header" | "hgroup" | "html" | "i" | "li" | "listing" | "main" | "marquee" | "menu" | "nav" | "nobr" | "object"
+            | "ol" | "p" | "pre" | "s" | "search" | "section" | "small" | "strike" | "strong" | "summary" | "template" | "tt" | "u" | "ul"
+    )
+}
+
+/// HTML's special elements that an element can be left open in here (WHATWG HTML, 13.2.4.3).
+fn html_special(n: &str) -> bool {
+    matches!(
+        n,
+        "address" | "applet" | "article" | "aside" | "blockquote" | "button" | "center" | "dd" | "details" | "dir" | "div" | "dl" | "dt" | "fieldset"
+            | "figcaption" | "figure" | "footer" | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "header" | "hgroup" | "li" | "listing" | "main"
+            | "marquee" | "menu" | "nav" | "object" | "ol" | "p" | "pre" | "search" | "section" | "summary" | "ul"
+    )
+}
+
+/// HTML elements that a later start tag can close by itself (a `<p>` the next `<p>` or `<div>`
+/// ends, an `<li>` the next `<li>`, ...; WHATWG HTML 13.2.6.4.7).
+fn implied_closes(n: &str) -> bool {
+    matches!(
+        n,
+        "p" | "li" | "dd" | "dt" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "button" | "a" | "nobr" | "form" | "option" | "optgroup" | "rb" | "rp" | "rt"
+            | "rtc"
+    )
+}
+
+/// HTML's void elements (`crate::parser::VOID_TAGS`), whose end tag the renderer never writes.
+#[inline]
+fn void_tag(n: &str) -> bool {
+    matches!(n, "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta" | "source" | "track" | "wbr")
+}
+
+/// HTML's start tags that leave no element open in a page's body: void elements, those it treats
+/// as void (`<param>`, `<keygen>`, `<image>`, an `<img>`, `<basefont>`, `<bgsound>`), and those it
+/// passes over (`<frame>`, `<head>`, `<html>`, `<body>`), whatever their slash (WHATWG HTML,
+/// 13.2.6.4.7; coverage of 0.8.7, Q-1100; branch coverage-087).
+fn html_no_push(n: &str) -> bool {
+    matches!(
+        n,
+        "area" | "base" | "basefont" | "bgsound" | "body" | "br" | "col" | "embed" | "frame" | "head" | "hr" | "html" | "image" | "img" | "input"
+            | "keygen" | "link" | "meta" | "param" | "source" | "track" | "wbr"
+    )
+}
+
+/// HTML's start tags after which this does not follow the parser: a table and its parts (which,
+/// in a table's cell, end elements outside the integration point), `<select>`, `<template>`,
+/// `<frameset>`, `<plaintext>`, `<form>` (coverage of 0.8.7, Q-1116; branch coverage-087).
+fn html_lost(n: &str) -> bool {
+    matches!(
+        n,
+        "caption" | "colgroup" | "form" | "frameset" | "plaintext" | "select" | "table" | "tbody" | "td" | "template" | "tfoot" | "th" | "thead" | "tr"
+    )
+}
+
+/// Whether an HTML script's text has `<!--` and then `<script` and a space, `/` or `>`: the
+/// tokenizer's double-escaped state, where `</script>` does not end the script.
+fn script_escapes(t: &str) -> bool {
+    let Some(k) = t.find("<!--") else { return false };
+    let b = t[k..].as_bytes();
+    b.windows(8).any(|w| w[..7].eq_ignore_ascii_case(b"<script") && (w[7].is_ascii_whitespace() || matches!(w[7], b'/' | b'>')))
+}
+
+/// Where an SVG or MathML script whose contents start at `i` ends, at its `</script>`, its contents
+/// read as the markup they are there: CDATA sections, comments, bogus comments and other tags (an
+/// attribute's `</script>`) passed over; `None` where it does not end in `html` (coverage of
+/// 0.8.7, Q-1116; branch coverage-087).
+fn foreign_end(html: &str, mut i: usize) -> Option<usize> {
+    let b = html.as_bytes();
+    while let Some(n) = b[i..].iter().position(|&c| c == b'<') {
+        i += n;
+        if let Some((past, close, _)) = passed_over(html, i, Ns::Svg, false) {
+            if close.is_some() {
+                return None;
+            }
+            i = past;
+            continue;
+        }
+        let end = b.get(i + 1) == Some(&b'/');
+        let from = i + 1 + end as usize;
+        if !b.get(from).is_some_and(|c| c.is_ascii_alphabetic()) {
+            i += 1;
+            continue;
+        }
+        let name_end = from + b[from..].iter().take_while(|c| !c.is_ascii_whitespace() && !matches!(c, b'/' | b'>')).count();
+        if end && b[from..name_end].eq_ignore_ascii_case(b"script") {
+            return Some(i);
+        }
+        match tag_end(b, name_end) {
+            (_, how) if how & UNENDED != 0 => return None,
+            (past, _) => i = past,
+        }
+    }
+    None
+}
+
+/// `t` with each `</script` written `<\/script`, ASCII case aside.
+fn escape_end_tags(t: &str) -> String {
+    let mut out = String::with_capacity(t.len() + 8);
+    let mut rest = t;
+    while let Some(k) = rest.find("</") {
+        out.push_str(&rest[..k]);
+        let after = &rest[k + 2..];
+        if after.len() >= 6 && after.as_bytes()[..6].eq_ignore_ascii_case(b"script") {
+            out.push_str("<\\/");
+        } else {
+            out.push_str("</");
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// What the tokenizer passes over as no tag at `i` (a `<`), where the parser's current element is
+/// `now`: past its end, what the html needs at its end where it runs to the end, and whether the
+/// parser's place is no longer known after it; `None` for a tag, or a `<` that is text. A comment
+/// ends at the first `-->` or `--!>`, or at once for `<!-->` and `<!--->`; `<!x>`,
+/// `<!DOCTYPE ...>`, `<?x>` and `</ x>` (bogus comments) at the first `>`; `</>` is dropped.
+/// `<![CDATA[` is a CDATA section, to `]]>`, in foreign content (an SVG or MathML element that is
+/// no integration point), and a bogus comment in an HTML element; at an integration point (a
+/// `<foreignObject>`, an `<mi>`) browsers read the bogus comment where WHATWG HTML reads a
+/// section, so the bogus comment is read and, where the two differ by markup, the place is no
+/// longer known (coverage of 0.8.7, Q-1113; branch coverage-087). Read otherwise, markup the
+/// browser takes was passed over (`<!--><svg>` was a comment to the end) or markup it does not
+/// take was read (an end tag in `<!x </svg>>`), and a script then in SVG was written as HTML's
+/// (WHATWG HTML, 13.2.5.6 to 13.2.5.8, 13.2.5.41 to 13.2.5.52, 13.2.5.69; coverage of 0.8.7,
+/// Q-1113; branch coverage-087).
+#[cold]
+#[inline(never)]
+fn passed_over(html: &str, i: usize, now: Ns, lost: bool) -> Option<(usize, Option<&'static str>, bool)> {
+    let rest = &html.as_bytes()[i..];
+    match rest.get(1) {
+        Some(b'!' | b'?') => {}
+        Some(b'/') if rest.get(2).is_some_and(|c| !c.is_ascii_alphabetic()) => {}
+        _ => return None,
+    }
+    let to_gt = |from: usize| html[from..].find('>').map_or((html.len(), Some(">"), false), |k| (from + k + 1, None, false));
+    if rest.starts_with(b"<!--") {
+        return Some(comment_end(html, i + 4).map_or((html.len(), Some("-->"), false), |e| (e, None, false)));
+    }
+    if rest.starts_with(b"<![CDATA[") {
+        let section = html[i + 9..].find("]]>").map(|k| i + 9 + k + 3);
+        if now.foreign() && !lost {
+            return Some(section.map_or((html.len(), Some("]]>"), false), |e| (e, None, false)));
+        }
+        let (past, close, _) = to_gt(i + 9);
+        if now == Ns::Html {
+            return Some((past, close, false));
+        }
+        // Read either way: a `<` between the two ends is markup to one reading only, and a
+        // section that runs to the end is closed, which ends either.
+        let far = section.unwrap_or(html.len());
+        let differs = past < far && html[past..far].contains('<');
+        return Some((past, if section.is_none() { Some("]]>") } else { close }, differs));
+    }
+    match rest.get(1) {
+        Some(b'/') if rest.get(2) == Some(&b'>') => Some((i + 3, None, false)),
+        _ => Some(to_gt(i + 2)),
+    }
+}
+
+/// Where a comment whose text starts at `from` (past `<!--`) ends, past it: at once for `<!-->` and
+/// `<!--->`, else past the first `-->` or `--!>` (WHATWG HTML 13.2.5.43 to 13.2.5.52).
+fn comment_end(html: &str, from: usize) -> Option<usize> {
+    let after = &html[from..];
+    if after.starts_with('>') {
+        return Some(from + 1);
+    }
+    if after.starts_with("->") {
+        return Some(from + 2);
+    }
+    match (after.find("-->"), after.find("--!>")) {
+        (Some(a), Some(b)) if b < a => Some(from + b + 4),
+        (Some(a), _) => Some(from + a + 3),
+        (None, Some(b)) => Some(from + b + 4),
+        (None, None) => None,
+    }
+}
+
+/// Where a tag whose name ends at `from` ends, past its `>`, a quoted value's `>` not counted, as
+/// the browser's tokenizer reads it (13.2.5.32 to 13.2.5.40): a quote is one only where a value
+/// starts. Taken as one anywhere (`<g a=x'y><svg>'>`), the `<svg>` the browser opens was read as
+/// part of the tag, and a script in it as HTML's (coverage of 0.8.7, Q-1112; branch coverage-087).
+/// Where the html ends first, that it does (`UNENDED`) and in which quote (coverage of 0.8.7,
+/// Q-1116; branch coverage-087). And whether it carries the self-closing flag, read in the same
+/// pass: `<g/>`, `<g a="1"/>`, `<g a />`, not `<g a=1/>`, whose `/` is its value's, nor `<g / >`
+/// (coverage of 0.8.7, Q-1112; branch coverage-087).
+#[inline]
+fn tag_end(b: &[u8], from: usize) -> (usize, u8) {
+    let n = b.len();
+    let mut k = from;
+    // A `/` the tokenizer takes for the self-closing flag's was the byte before.
+    let mut slash = 0;
+    loop {
+        // Before a name: spaces, a `/`, or the end.
+        while k < n && b[k].is_ascii_whitespace() {
+            k += 1;
+            slash = 0;
+        }
+        if k >= n {
+            return (n, UNENDED | slash);
+        }
+        match b[k] {
+            b'>' => return (k + 1, slash),
+            b'/' => {
+                slash = SELF_CLOSING;
+                k += 1;
+                continue;
+            }
+            _ => slash = 0,
+        }
+        // A name, its first byte whatever it is.
+        k += 1;
+        while k < n && !matches!(b[k], b'/' | b'>' | b'=') && !b[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        // Its value, if a `=` follows.
+        let mut j = k;
+        while j < n && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= n || b[j] != b'=' {
+            continue;
+        }
+        j += 1;
+        while j < n && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= n {
+            return (n, UNENDED);
+        }
+        match b[j] {
+            q @ (b'"' | b'\'') => match b[j + 1..].iter().position(|&c| c == q) {
+                Some(m) => k = j + 2 + m,
+                None => return (n, UNENDED | if q == b'"' { IN_DOUBLE } else { IN_SINGLE }),
+            },
+            b'>' => return (j + 1, 0),
+            _ => {
+                k = j;
+                while k < n && b[k] != b'>' && !b[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+            }
+        }
+    }
+}
+
+/// What `tag_end` says of a tag besides where it ends: it carries the self-closing flag; the html
+/// ends before its `>`, in a value opened with `"` or `'`.
+const SELF_CLOSING: u8 = 1;
+const UNENDED: u8 = 2;
+const IN_DOUBLE: u8 = 4;
+const IN_SINGLE: u8 = 8;
+
+/// Where the first `</name` (`name` in lower case) that ends the element is in `hay`, ASCII case
+/// aside: followed by a space, `/` or `>`, as the tokenizer takes an end tag in a script's or a
+/// text's (`</scriptx>` ends nothing; coverage of 0.8.7, Q-1116; branch coverage-087).
 fn find_end_tag(hay: &str, name: &str) -> Option<usize> {
     let (h, n) = (hay.as_bytes(), name.as_bytes());
     let mut k = 0;
     while let Some(at) = h[k..].windows(2).position(|w| w == b"</") {
         let from = k + at + 2;
-        if h.get(from..from + n.len()).is_some_and(|x| x.eq_ignore_ascii_case(n)) {
+        if h.get(from..from + n.len()).is_some_and(|x| x.eq_ignore_ascii_case(n)) && h.get(from + n.len()).is_some_and(|&c| c.is_ascii_whitespace() || matches!(c, b'/' | b'>')) {
             return Some(k + at);
         }
         k = from;

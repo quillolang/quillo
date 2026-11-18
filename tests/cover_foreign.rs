@@ -149,17 +149,22 @@ fn raw_markup_in_svg_is_read_as_the_parser_reads_it() {
             // point, and the script after it is SVG's.
             ("/void", format!("<svg><foreignObject><input></foreignObject><script>{RAW_CODE}</script></svg>")),
             ("/self-closed", format!("<svg><foreignObject><svg/></foreignObject><script>{RAW_CODE}</script></svg>")),
-            // A `<div>` left open in a `<foreignObject>`, or its tag unended: not known; closed, HTML.
+            // A `<div>` left open in a `<foreignObject>`: not known; closed, HTML. Its tag unended
+            // is ended (`>`), else the browser reads the renderer's next markup into it (changed
+            // with Q-1116: it was left unended).
             ("/open", format!("<svg><foreignObject><div><script>{CODE}</script></foreignObject></svg>")),
             ("/closed", format!("<svg><foreignObject><div></div><script>{HTML}</script></foreignObject></svg>")),
-            ("/unended", format!("<svg><foreignObject><div<script>{CODE}</script></foreignObject></svg>")),
-            // A script that is never ended: its text to the end, in a section.
-            ("/no-end-tag", "<svg><script><![CDATA[a</b><b>x</b>&quot;]]]]><![CDATA[>]]></svg>".to_string()),
+            ("/unended", format!("<svg><foreignObject><div><script>{CODE}</script></foreignObject></svg>")),
+            // A script that is never ended: its text to the end, in a section, and its end tag
+            // written (changed with Q-1116: it was left open).
+            ("/no-end-tag", "<svg><script><![CDATA[a</b><b>x</b>&quot;]]]]><![CDATA[>]]></script></svg>".to_string()),
             // `<font>` alone is SVG's; given `color`, it ends SVG; unended, what follows is not known.
             ("/font-bare", format!("<svg><font>x</font><script>{CODE}</script></svg>")),
             ("/font-color", format!("<svg><font color=\"red\">x</font><script>{HTML}</script></svg>")),
-            ("/font-unended", format!("<svg><font x<script>{CODE}</script></svg>")),
-            ("/font-quote", format!("<svg><font face=\"x<script>{CODE}</script></svg>")),
+            // Unended, the tag is ended (its quote too; changed with Q-1116), and what is in it is
+            // not known.
+            ("/font-unended", format!("<svg><font x><script>{CODE}</script></svg>")),
+            ("/font-quote", format!("<svg><font face=\"x\"><script>{CODE}</script></svg>")),
             // A spread on a `<font>`: what it wrote says.
             ("/font-spread", format!("<svg><font>x</font><script>{CODE}</script></svg>")),
             ("/font-spread?a=%7B%22color%22%3A%22red%22%7D", format!("<svg><font color=\"red\">x</font><script>{HTML}</script></svg>")),
@@ -563,4 +568,463 @@ fn a_fixed_element_where_the_place_is_not_known_is_made_once() {
             ("/sum", format!("<svg><g>{Q}<i></g><text>a&lt;b&gt;x&lt;/b&gt;&amp;quot;]]&gt;</text><script>{CODE}</script></svg>")),
         ],
     );
+}
+
+// ---- Q-1100, Q-1111, Q-1112: start tags, read as the browser reads them ------------------------
+
+const SELF_CLOSED: &str = r##"route GET /div ? { q: str = "" } = <html><body><svg>{raw("<foreignObject><div/></foreignObject><script>" + q + "</script>")}</svg></body></html>
+route GET /div-upper ? { q: str = "" } = <html><body><svg>{raw("<foreignObject><DIV/></foreignObject><script>" + q + "</script>")}</svg></body></html>
+route GET /unknown ? { q: str = "" } = <html><body><svg>{raw("<foreignObject><x-y/></foreignObject><script>" + q + "</script>")}</svg></body></html>
+route GET /unicode ? { q: str = "" } = <html><body><svg>{raw("<foreignObject><x-é/></foreignObject><script>" + q + "</script>")}</svg></body></html>
+route GET /br ? { q: str = "" } = <html><body><svg>{raw("<foreignObject><br/></foreignObject><script>" + q + "</script>")}</svg></body></html>
+route GET /br-upper ? { q: str = "" } = <html><body><svg>{raw("<foreignObject><BR/></foreignObject><script>" + q + "</script>")}</svg></body></html>
+route GET /img ? { q: str = "" } = <html><body><svg>{raw("<foreignObject><img src=\"/x.png\"/></foreignObject><script>" + q + "</script>")}</svg></body></html>
+route GET /then-closed ? { q: str = "" } = <html><body><svg>{raw("<foreignObject><div/></foreignObject></div></foreignObject><script>" + q + "</script>")}</svg></body></html>
+route GET /left-in-point ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<div/>")}<script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /circle ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg><circle r=\"1\"/></svg><script>" + q + "</script>")}</foreignObject></svg></body></html>
+route GET /circle-spaced ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg><circle r=\"1\" /></svg><script>" + q + "</script>")}</foreignObject></svg></body></html>
+route GET /svg-closed ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg width=\"10\"/><script>" + q + "</script>")}</foreignObject></svg></body></html>
+route GET /svg-bare ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg hidden/><script>" + q + "</script>")}</foreignObject></svg></body></html>
+route GET /svg-unquoted ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg width=10/><script>" + q + "</script>")}</foreignObject></svg></body></html>
+route GET /svg-unicode ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg aria-label=✓/><script>" + q + "</script>")}</foreignObject></svg></body></html>
+route GET /svg-spaced-slash ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg / ><script>" + q + "</script>")}</foreignObject></svg></body></html>
+route GET /math-closed ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<math/><script>" + q + "</script>")}</foreignObject></svg></body></html>
+route GET /svg-script ? { q: str = "" } = <html><body><svg>{raw("<script/><foreignObject><script>" + q + "</script></foreignObject>")}</svg></body></html>
+route GET /html-script ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<script/>" + q + "</script>")}</foreignObject></svg></body></html>
+"##;
+
+/// Q-1100's repro: a `<div/>` in markup placed in a `<foreignObject>` is open, as the browser
+/// keeps it (an HTML element's self-closing flag is passed over), so the `</foreignObject>` after
+/// it ends nothing and the script after that is HTML's, written without a CDATA section; `<DIV/>`,
+/// an unknown `<x-y/>` and `<x-é/>` alike. Void elements (`<br/>`, `<BR/>`, `<img/>`) and SVG's
+/// and MathML's elements (`<circle/>`, `<svg width="10"/>`, `<svg hidden/>`, `<circle r="1" />`,
+/// `<math/>`, an SVG `<script/>`) are closed by it; a `/` that is an unquoted value's
+/// (`<svg width=10/>`, `<svg aria-label=✓/>`) or that a space parts from `>` (`<svg / >`) is no
+/// flag, and the `<svg>` stays open: its script is SVG's. A `</div>` then a real
+/// `</foreignObject>` leave the integration point (src/foreign.rs `written`, `self_closing`,
+/// `next_attr`; FEEDBACK71.md Q-969, coverage of 0.8.7, Q-1100, Q-1112; branch coverage-087).
+#[test]
+fn a_self_closed_html_element_stays_open_as_the_browser_keeps_it() {
+    let mut it = app(SELF_CLOSED);
+    pages(
+        &mut it,
+        &[
+            // HTML elements: open, and `</foreignObject>` ends nothing: the script is HTML's.
+            ("/div", format!("<svg><foreignObject><div/></foreignObject><script>{Q}</script></svg>")),
+            ("/div-upper", format!("<svg><foreignObject><DIV/></foreignObject><script>{Q}</script></svg>")),
+            ("/unknown", format!("<svg><foreignObject><x-y/></foreignObject><script>{Q}</script></svg>")),
+            ("/unicode", format!("<svg><foreignObject><x-é/></foreignObject><script>{Q}</script></svg>")),
+            // Void elements: no end tag, so `</foreignObject>` ends the integration point.
+            ("/br", format!("<svg><foreignObject><br/></foreignObject><script>{RAW_CODE}</script></svg>")),
+            ("/br-upper", format!("<svg><foreignObject><BR/></foreignObject><script>{RAW_CODE}</script></svg>")),
+            ("/img", format!("<svg><foreignObject><img src=\"/x.png\"/></foreignObject><script>{RAW_CODE}</script></svg>")),
+            // `</div>` closes the `<div>`, then `</foreignObject>` the integration point.
+            ("/then-closed", format!("<svg><foreignObject><div/></foreignObject></div></foreignObject><script>{RAW_CODE}</script></svg>")),
+            // Left open at the end of the markup, as `raw("<div>")` is: what follows is not known.
+            ("/left-in-point", format!("<svg><foreignObject><div/><script>{CODE}</script></foreignObject></svg>")),
+            // SVG's and MathML's elements: closed by the flag.
+            ("/circle", format!("<svg><foreignObject><svg><circle r=\"1\"/></svg><script>{Q}</script></foreignObject></svg>")),
+            ("/circle-spaced", format!("<svg><foreignObject><svg><circle r=\"1\" /></svg><script>{Q}</script></foreignObject></svg>")),
+            ("/svg-closed", format!("<svg><foreignObject><svg width=\"10\"/><script>{Q}</script></foreignObject></svg>")),
+            ("/svg-bare", format!("<svg><foreignObject><svg hidden/><script>{Q}</script></foreignObject></svg>")),
+            ("/math-closed", format!("<svg><foreignObject><math/><script>{Q}</script></foreignObject></svg>")),
+            // No flag: the `<svg>` is open, and the script in it is SVG's.
+            ("/svg-unquoted", format!("<svg><foreignObject><svg width=10/><script>{RAW_CODE}</script></foreignObject></svg>")),
+            ("/svg-unicode", format!("<svg><foreignObject><svg aria-label=✓/><script>{RAW_CODE}</script></foreignObject></svg>")),
+            ("/svg-spaced-slash", format!("<svg><foreignObject><svg / ><script>{RAW_CODE}</script></foreignObject></svg>")),
+            // An SVG `<script/>` holds no text: the `<foreignObject>` after it is read, and its
+            // script is HTML's. An HTML `<script/>`'s text runs to `</script>`, as before.
+            ("/svg-script", format!("<svg><script/><foreignObject><script>{Q}</script></foreignObject></svg>")),
+            ("/html-script", format!("<svg><foreignObject><script/>{Q}</script></foreignObject></svg>")),
+        ],
+    );
+}
+
+const ATTRS: &str = r##"route GET /size ? { q: str = "" } = <html><body><svg>{raw("<font size=1>x</font>")}<script>{raw(q)}</script></svg></body></html>
+route GET /second ? { q: str = "" } = <html><body><svg>{raw("<font a=x color=red>x</font>")}<script>{raw(q)}</script></svg></body></html>
+route GET /spaced ? { q: str = "" } = <html><body><svg>{raw("<font size = \"1\">x</font>")}<script>{raw(q)}</script></svg></body></html>
+route GET /single ? { q: str = "" } = <html><body><svg>{raw("<font a='x y' face='f'>x</font>")}<script>{raw(q)}</script></svg></body></html>
+route GET /bare ? { q: str = "" } = <html><body><svg>{raw("<font\tcolor>x</font>")}<script>{raw(q)}</script></svg></body></html>
+route GET /no-value ? { q: str = "" } = <html><body><svg>{raw("<font size=>x</font>")}<script>{raw(q)}</script></svg></body></html>
+route GET /swallowed ? { q: str = "" } = <html><body><svg>{raw("<font a= size>x</font>")}<script>{raw(q)}</script></svg></body></html>
+route GET /sizes ? { q: str = "" } = <html><body><svg>{raw("<font sizes=1 =size>x</font>")}<script>{raw(q)}</script></svg></body></html>
+route GET /ann ? { q: str = "" } = <html><body><math>{raw("<annotation-xml definitionURL=x encoding=text/html><script>" + q + "</script></annotation-xml>")}</math></body></html>
+route GET /ann-single ? { q: str = "" } = <html><body><math>{raw("<annotation-xml encoding='TEXT/HTML'><script>" + q + "</script></annotation-xml>")}</math></body></html>
+route GET /ann-slash ? { q: str = "" } = <html><body><math>{raw("<annotation-xml encoding=text/html/><script>" + q + "</script></annotation-xml>")}</math></body></html>
+route GET /ann-first ? { q: str = "" } = <html><body><math>{raw("<annotation-xml encoding=x encoding=text/html><script>" + q + "</script></annotation-xml>")}</math></body></html>
+route GET /quote-in-value ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<g a=x'y><svg>'><script>" + q + "</script></svg></g>")}</foreignObject></svg></body></html>
+route GET /quote-in-name ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<g a\"b><svg>\"><script>" + q + "</script></svg></g>")}</foreignObject></svg></body></html>
+route GET /quoted-gt ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<g title=\"a>b\"><svg><script>" + q + "</script></svg></g>")}</foreignObject></svg></body></html>
+route GET /end-tag-quote ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg></svg a='>'><script>" + q + "</script>")}</foreignObject></svg></body></html>
+"##;
+
+/// A start tag in markup the program made, read as the browser reads its attributes: unquoted
+/// values, spaces around `=` (`a= size` is `a` given `size`), single quotes, a tab, a name with
+/// no value or with `=` and none, a name that starts with `=`; the first of two with one name
+/// counts; a quote is one only where a value starts (`<g a=x'y>` ends at its `>`).
+/// `raw("<font size=1>")` inside `<svg>` was a request that never ended (`written_attr` read the
+/// same `=` again and again); now `size` is seen and the `<font>` ends SVG. Each request has a
+/// deadline (src/foreign.rs `written_attr`, `next_attr`, `kind_written`, `tag_end`;
+/// FEEDBACK71.md Q-969, coverage of 0.8.7, Q-1111, Q-1112; branch coverage-087).
+#[test]
+fn a_start_tag_made_by_the_program_is_read_as_the_browser_reads_it_and_never_hangs() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t = std::thread::spawn(move || {
+        let mut it = app(ATTRS);
+        let font = |raw: &str, script: &str| format!("<svg>{raw}x</font><script>{script}</script></svg>");
+        pages(
+            &mut it,
+            &[
+                // `color`, `face` or `size` given: the `<font>` ends SVG, and the script is HTML's.
+                ("/size", font("<font size=1>", HTML)),
+                ("/second", font("<font a=x color=red>", HTML)),
+                ("/spaced", font("<font size = \"1\">", HTML)),
+                ("/single", font("<font a='x y' face='f'>", HTML)),
+                ("/bare", font("<font\tcolor>", HTML)),
+                ("/no-value", font("<font size=>", HTML)),
+                // `sizes` and `=size` are other names, and after `a= ` the `size` is `a`'s value:
+                // SVG's `<font>`.
+                ("/sizes", font("<font sizes=1 =size>", CODE)),
+                ("/swallowed", font("<font a= size>", CODE)),
+                // An HTML `encoding`, however quoted, after another attribute: HTML's script.
+                ("/ann", format!("<math><annotation-xml definitionURL=x encoding=text/html><script>{Q}</script></annotation-xml></math>")),
+                ("/ann-single", format!("<math><annotation-xml encoding='TEXT/HTML'><script>{Q}</script></annotation-xml></math>")),
+                // `text/html/` is the value (no flag), and the first `encoding` counts: MathML's.
+                ("/ann-slash", format!("<math><annotation-xml encoding=text/html/><script>{RAW_CODE}</script></annotation-xml></math>")),
+                ("/ann-first", format!("<math><annotation-xml encoding=x encoding=text/html><script>{RAW_CODE}</script></annotation-xml></math>")),
+                // A quote in an unquoted value or in a name is no quote: the tag ends at its `>`,
+                // and the `<svg>` after it holds the script, SVG's. A quoted value's `>`, in a
+                // start tag or an end tag, ends nothing.
+                ("/quote-in-value", format!("<svg><foreignObject><g a=x'y><svg>'><script>{RAW_CODE}</script></svg></g></foreignObject></svg>")),
+                ("/quote-in-name", format!("<svg><foreignObject><g a\"b><svg>\"><script>{RAW_CODE}</script></svg></g></foreignObject></svg>")),
+                ("/quoted-gt", format!("<svg><foreignObject><g title=\"a>b\"><svg><script>{RAW_CODE}</script></svg></g></foreignObject></svg>")),
+                ("/end-tag-quote", format!("<svg><foreignObject><svg></svg a='>'><script>{Q}</script></foreignObject></svg>")),
+            ],
+        );
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+        Ok(()) => t.join().unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => std::panic::resume_unwind(t.join().unwrap_err()),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("a page was not answered within 120 s: a start tag was read again and again"),
+    }
+}
+
+// ---- Q-1113: comments, bogus comments and CDATA sections, passed over as the tokenizer does ----
+
+const PASSED_OVER: &str = r##"route GET /comment-empty ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<!--><svg>")}<script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /comment-dash ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<!---><svg>")}<script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /comment-bang ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<!-- x --!><svg>")}<script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /comment-dashes ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<!-- a -- <svg> b -->")}<script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /comment-closed ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<!-- <svg> --->")}<script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /comment-open ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<!-- x")}<script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /bogus ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg><!x </svg>><script>" + q + "</script></svg>")}</foreignObject></svg></body></html>
+route GET /doctype ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg><!DOCTYPE x </svg>><script>" + q + "</script></svg>")}</foreignObject></svg></body></html>
+route GET /question ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg><?x </svg>><script>" + q + "</script></svg>")}</foreignObject></svg></body></html>
+route GET /end-bogus ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg></ x </svg>><script>" + q + "</script></svg>")}</foreignObject></svg></body></html>
+route GET /end-empty ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg></></svg><script>" + q + "</script>")}</foreignObject></svg></body></html>
+route GET /bogus-open ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<!x")}<script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /cdata-svg ? { q: str = "" } = <html><body><svg>{raw("<![CDATA[><foreignObject>]]><script>" + q + "</script>")}</svg></body></html>
+route GET /cdata-point ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<![CDATA[><svg>]]><script>" + q + "</script>")}</foreignObject></svg></body></html>
+route GET /cdata-div ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<div><![CDATA[><svg>]]><script>" + q + "</script></svg></div>")}</foreignObject></svg></body></html>
+route GET /cdata-open ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<![CDATA[ x")}<script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /cdata-unsure ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg><p></p><![CDATA[><svg><script>" + q + "</script>]]>")}</foreignObject></svg></body></html>
+"##;
+
+/// Markup in a `<foreignObject>` that holds no tag to the browser is passed over as its tokenizer
+/// passes it over. A comment ends at once for `<!-->` and `<!--->`, and at the first `-->` or
+/// `--!>` (not at `-- b`): the `<svg>` after it is open, so the script after the markup is
+/// written as safe in both (Q-1113's repro, where the comment ran to the end and the script was
+/// HTML's). One left open is ended. `<!x ...>`, `<!DOCTYPE ...>`, `<?x ...>` and
+/// `</ x ...>` end at the first `>`, so an `</svg>` in them closes nothing and the script after
+/// is SVG's; `</>` is dropped. `<![CDATA[` is a section to `]]>` in SVG, a bogus comment to the
+/// first `>` in a `<div>`, and either right in a `<foreignObject>` or where the place is not
+/// known: the shorter way, what follows not known where the two differ by markup
+/// (src/foreign.rs `passed_over`, `written`; FEEDBACK71.md Q-969, coverage of 0.8.7, Q-1113,
+/// Q-1116; branch coverage-087).
+#[test]
+fn comments_and_cdata_sections_are_passed_over_as_the_browser_passes_them() {
+    let mut it = app(PASSED_OVER);
+    let fo = |inner: &str| format!("<svg><foreignObject>{inner}</foreignObject></svg>");
+    pages(
+        &mut it,
+        &[
+            // A comment that ends at once, or at `--!>`: the `<svg>` after it is open.
+            ("/comment-empty", fo(&format!("<!--><svg><script>{CODE}</script>"))),
+            ("/comment-dash", fo(&format!("<!---><svg><script>{CODE}</script>"))),
+            ("/comment-bang", fo(&format!("<!-- x --!><svg><script>{CODE}</script>"))),
+            // `--` alone, or before `->`, ends nothing: the `<svg>` is in the comment.
+            ("/comment-dashes", fo(&format!("<!-- a -- <svg> b --><script>{HTML}</script>"))),
+            ("/comment-closed", fo(&format!("<!-- <svg> ---><script>{HTML}</script>"))),
+            // Left open, it is ended (changed with Q-1116: what followed was not known).
+            ("/comment-open", fo(&format!("<!-- x--><script>{HTML}</script>"))),
+            // Bogus comments end at the first `>`: the `</svg>` in them closes nothing.
+            ("/bogus", fo(&format!("<svg><!x </svg>><script>{RAW_CODE}</script></svg>"))),
+            ("/doctype", fo(&format!("<svg><!DOCTYPE x </svg>><script>{RAW_CODE}</script></svg>"))),
+            ("/question", fo(&format!("<svg><?x </svg>><script>{RAW_CODE}</script></svg>"))),
+            ("/end-bogus", fo(&format!("<svg></ x </svg>><script>{RAW_CODE}</script></svg>"))),
+            ("/end-empty", fo(&format!("<svg></></svg><script>{Q}</script>"))),
+            ("/bogus-open", fo(&format!("<!x><script>{HTML}</script>"))),
+            // A CDATA section in SVG; a bogus comment in a `<div>`. Right in a `<foreignObject>`,
+            // browsers read the bogus comment (an `<svg>` after its `>`) where WHATWG HTML reads a
+            // section: with markup between the two ends, what follows is not known, and the
+            // script is written as safe in both (changed with Q-1113's review: the section was
+            // read, the script written as HTML's, and Chrome and parse5 read it as SVG's). Left
+            // open, it is ended with `]]>`, which ends either.
+            ("/cdata-svg", format!("<svg><![CDATA[><foreignObject>]]><script>{RAW_CODE}</script></svg>")),
+            ("/cdata-point", fo(&format!("<![CDATA[><svg>]]><script>{RAW_CODE}</script>"))),
+            ("/cdata-div", fo(&format!("<div><![CDATA[><svg>]]><script>{RAW_CODE}</script></svg></div>"))),
+            ("/cdata-open", fo(&format!("<![CDATA[ x]]><script>{HTML}</script>"))),
+            ("/cdata-unsure", fo(&format!("<svg><p></p><![CDATA[><svg><script>{RAW_CODE}</script>]]>"))),
+        ],
+    );
+}
+
+// ---- the review against parse5: CDATA at integration points, the body's void and ignored tags,
+// ---- encodings with character references, end tags, markup that stops inside a tag -----------
+
+const REVIEWED: &str = r##"route GET /cdata-mi ? { q: str = "" } = <html><body><math><mi>{raw("<![CDATA[><svg>]]><script>" + q + "</script>")}</mi></math></body></html>
+route GET /cdata-desc ? { q: str = "" } = <html><body><svg><desc>{raw("<![CDATA[><math>]]><script>" + q + "</script>")}</desc></svg></body></html>
+route GET /cdata-ann ? { q: str = "" } = <html><body><math><annotation-xml encoding="text/html">{raw("<![CDATA[><svg>]]><script>" + q + "</script>")}</annotation-xml></math></body></html>
+route GET /cdata-renderer ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<![CDATA[><svg>]]>")}<script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /cdata-text ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<![CDATA[>x]]>")}<script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /tag ? { q: str = "", t: str = "" } = <html><body><svg>{raw("<foreignObject>" + t + "</foreignObject><script>" + q + "</script>")}</svg></body></html>
+route GET /ann-ref ? { q: str = "" } = <html><body><math>{raw("<annotation-xml encoding='text&#47;html'><script>" + q + "</script></annotation-xml>")}</math></body></html>
+route GET /ann-ref-cdata ? { q: str = "" } = <html><body><math>{raw("<annotation-xml encoding='text&#47;html'><x><![CDATA[ > </x></annotation-xml><script>" + q + "</script> ]]>")}</math></body></html>
+route GET /ann-plain ? { q: str = "" } = <html><body><math>{raw("<annotation-xml encoding='text/html'><script>" + q + "</script></annotation-xml>")}</math></body></html>
+route GET /ann-renderer ? { q: str = "", e: str = "" } = <html><body><math><annotation-xml encoding={e}><script>{raw(q)}</script></annotation-xml></math></body></html>
+route GET /endtag-other ? { q: str = "" } = <html><body><svg>{raw("<foreignObject><svg></x><script>" + q + "</script>")}</svg></body></html>
+route GET /endtag-outer ? { q: str = "" } = <html><body><svg><foreignObject>{raw("</foreignObject>")}<script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /endtag-walk ? { q: str = "" } = <html><body><svg>{raw("<foreignObject><x-y></foreignObject><script>" + q + "</script>")}</svg></body></html>
+route GET /endtag-rule ? { q: str = "" } = <html><body><svg>{raw("<foreignObject><div><span></div><script>" + q + "</script></foreignObject>")}</svg></body></html>
+route GET /scriptx ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg><script></scriptx></script><script>" + q + "</script>")}</foreignObject></svg></body></html>
+route GET /escaped ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<script><!--<script></script><script>" + q + "</script>")}</foreignObject></svg></body></html>
+route GET /input-open ? { q: str = "" } = <html><body><svg>{raw("<input")}<foreignObject><script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /end-open ? { q: str = "" } = <html><body><svg>{raw("</")}<foreignObject><script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /end-x-open ? { q: str = "" } = <html><body><svg>{raw("</x")}<foreignObject><script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /quote-open ? { q: str = "" } = <html><body><svg>{raw("<g a=\"x")}<foreignObject><script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /single-open ? { q: str = "" } = <html><body><svg>{raw("<g a='x")}<foreignObject><script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /textarea-open ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<textarea>")}<script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /script-tag-open ? { q: str = "" } = <html><body><svg>{raw("<script")}<foreignObject><script>{raw(q)}</script></foreignObject></svg></body></html>
+"##;
+
+/// The inputs a review found against parse5 (a spec-exact parser standing in for the browser),
+/// each now written as the browser reads it, or as safe in both:
+/// - `<![CDATA[` at an integration point (`<mi>`, `<desc>`, an HTML `annotation-xml`, a
+///   `<foreignObject>` before the renderer's own script) is a bogus comment to browsers: the
+///   `<svg>` after its `>` holds the script, written in a section (Q-1113's review);
+/// - an HTML tag the body treats as void or passes over (`<param>`, `<keygen>`, `<image>`,
+///   `<basefont>`, `<bgsound>`, `<frame>`, `<head>`, `<html>`, `<body>`, `<col>`), with its slash
+///   or not, leaves nothing open, so `</foreignObject>` ends the integration point and the script
+///   after is SVG's; after a table's parts, `<select>`, `<template>` or `<frameset>` the parser is
+///   not followed; a `<span/>` is open, and `</foreignObject>` in it ends nothing (Q-1100);
+/// - an `encoding` with a character reference (`text&#47;html`, HTML's to the browser) is not
+///   known (Q-1117);
+/// - an end tag that names no element open here, or another than the last, and `</scriptx>`, do
+///   not end what they do not name; an HTML script with `<!--<script>` is not followed; markup
+///   that stops inside a tag, `</`, a quoted value or a `<textarea>` is ended, else the browser
+///   reads the renderer's next tag into it (Q-1116)
+/// (src/foreign.rs `written`, `end_tag`, `passed_over`, `tag_end`, `find_end_tag`,
+/// `kind_written`; FEEDBACK71.md Q-969, coverage of 0.8.7, Q-1100, Q-1113, Q-1116, Q-1117; branch
+/// coverage-087).
+#[test]
+fn the_inputs_a_review_found_against_parse5_are_read_as_the_browser_reads_them() {
+    let mut it = app(REVIEWED);
+    let fo = |inner: &str| format!("<svg><foreignObject>{inner}</foreignObject></svg>");
+    let mut cases: Vec<(String, String)> = vec![
+        ("/cdata-mi".into(), format!("<math><mi><![CDATA[><svg>]]><script>{RAW_CODE}</script></mi></math>")),
+        ("/cdata-desc".into(), format!("<svg><desc><![CDATA[><math>]]><script>{RAW_CODE}</script></desc></svg>")),
+        ("/cdata-ann".into(), format!("<math><annotation-xml encoding=\"text/html\"><![CDATA[><svg>]]><script>{RAW_CODE}</script></annotation-xml></math>")),
+        ("/cdata-renderer".into(), fo(&format!("<![CDATA[><svg>]]><script>{CODE}</script>"))),
+        // No markup between the two ends: either way the same, and the script is HTML's.
+        ("/cdata-text".into(), fo(&format!("<![CDATA[>x]]><script>{HTML}</script>"))),
+        ("/ann-ref".into(), format!("<math><annotation-xml encoding='text&#47;html'><script>{RAW_CODE}</script></annotation-xml></math>")),
+        ("/ann-ref-cdata".into(), format!("<math><annotation-xml encoding='text&#47;html'><x><![CDATA[ > </x></annotation-xml><script>{RAW_CODE}</script> ]]></math>")),
+        ("/ann-plain".into(), format!("<math><annotation-xml encoding='text/html'><script>{Q}</script></annotation-xml></math>")),
+        // Written by the renderer, `&` is `&amp;`: the browser reads `text&#47;html` as it is,
+        // no HTML encoding, and the section is right.
+        ("/ann-renderer?e=text%26%2347%3Bhtml".into(), format!("<math><annotation-xml encoding=\"text&amp;#47;html\"><script>{CODE}</script></annotation-xml></math>")),
+        ("/endtag-other".into(), format!("<svg><foreignObject><svg></x><script>{RAW_CODE}</script></svg>")),
+        ("/endtag-outer".into(), fo(&format!("</foreignObject><script>{CODE}</script>"))),
+        ("/endtag-walk".into(), format!("<svg><foreignObject><x-y></foreignObject><script>{Q}</script></svg>")),
+        ("/endtag-rule".into(), format!("<svg><foreignObject><div><span></div><script>{RAW_CODE}</script></foreignObject></svg>")),
+        ("/scriptx".into(), fo(&format!("<svg><script><![CDATA[</scriptx>]]></script><script>{RAW_CODE}</script>"))),
+        ("/escaped".into(), fo(&format!("<script><!--<script></script><script>{RAW_CODE}</script>"))),
+        ("/input-open".into(), format!("<svg><input><foreignObject><script>{HTML}</script></foreignObject></svg>")),
+        ("/end-open".into(), format!("<svg></><foreignObject><script>{HTML}</script></foreignObject></svg>")),
+        ("/end-x-open".into(), format!("<svg></x><foreignObject><script>{CODE}</script></foreignObject></svg>")),
+        ("/quote-open".into(), format!("<svg><g a=\"x\"><foreignObject><script>{CODE}</script></foreignObject></svg>")),
+        ("/single-open".into(), format!("<svg><g a='x'><foreignObject><script>{CODE}</script></foreignObject></svg>")),
+        ("/textarea-open".into(), fo(&format!("<textarea></textarea><script>{HTML}</script>"))),
+        ("/script-tag-open".into(), format!("<svg><script></script><foreignObject><script>{HTML}</script></foreignObject></svg>")),
+    ];
+    // Leaving nothing open, or after which the parser is not followed: the script after
+    // `</foreignObject>` is SVG's, in a section, with the slash or without.
+    for t in [
+        "param", "keygen", "image", "basefont", "bgsound", "frame", "head", "html", "body", "col", "td", "th", "tr", "tbody", "thead", "tfoot", "caption",
+        "colgroup", "table", "select", "template", "frameset",
+    ] {
+        for slash in ["", "/"] {
+            let tag = format!("<{t}{slash}>");
+            cases.push((format!("/tag?t={}", enc(&tag)), format!("<svg><foreignObject>{tag}</foreignObject><script>{RAW_CODE}</script></svg>")));
+        }
+    }
+    // Open, as the browser keeps them: `</foreignObject>` ends nothing, and the script is HTML's.
+    for tag in ["<span/>", "<div/>", "<x-y/>", "<b/>"] {
+        cases.push((format!("/tag?t={}", enc(tag)), format!("<svg><foreignObject>{tag}</foreignObject><script>{Q}</script></svg>")));
+    }
+    let cases: Vec<(&str, String)> = cases.iter().map(|(p, w)| (p.as_str(), w.clone())).collect();
+    pages(&mut it, &cases);
+}
+
+// ---- the second review: elements a start tag closes, a script's end in its own CDATA, a trailing
+// ---- `<`, and markup split over values -----------------------------------------------------------
+
+const IMPLIED: &str = r##"route GET /tag ? { q: str = "", t: str = "" } = <html><body><svg>{raw("<foreignObject>" + t + "</foreignObject><script>" + q + "</script>")}</svg></body></html>
+route GET /form-outer ? { q: str = "" } = <html><body><form><svg><foreignObject>{raw("<form></foreignObject><script>" + q + "</script>")}</foreignObject></svg></form></body></html>
+route GET /cdata-end ? { q: str = "" } = <html><body><svg>{raw("<svg><script><![CDATA[ var s = \"</script><img src=x onerror=1>\"; ]]></script></svg>")}</svg></body></html>
+route GET /cdata-end-fo ? { q: str = "" } = <html><body><svg>{raw("<foreignObject><svg><script><![CDATA[ x=\"</script><img src=x onerror=1>\" ]]></script></svg></foreignObject>")}</svg></body></html>
+route GET /comment-end ? { q: str = "" } = <html><body><svg>{raw("<script><!-- </script><img src=x onerror=1> --></script>")}</svg></body></html>
+route GET /attr-end ? { q: str = "" } = <html><body><svg>{raw("<script><g a='</script><img src=x onerror=1>'></g></script>")}</svg></body></html>
+route GET /cdata-end-unsure ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg><p></p><script><![CDATA[ \"</script><img src=x onerror=1>\" ]]></script>")}</foreignObject></svg></body></html>
+route GET /style-cdata ? { q: str = "" } = <html><body><svg>{raw("<style><![CDATA[ a{} </style><img src=x onerror=1> ]]></style>")}</svg></body></html>
+route GET /lt-text ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<")}hello<script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /lt-tag ? { q: str = "" } = <html><body><svg><foreignObject>{raw("x <")}<b>bold</b><script>{raw(q)}</script></foreignObject></svg></body></html>
+route GET /split-comment ? { q: str = "" } = <html><body><svg>{raw("<!--")}<text>hidden</text>{raw("-->")}<script>{raw(q)}</script></svg></body></html>
+route GET /split-attr ? { u: str = "/x" } = <html><body><svg>{raw("<a href='")}{u}{raw("'>link</a>")}</svg></body></html>
+route GET /split-script ? { d: str = "1" } = <html><body><svg>{raw("<script>var d = ")}{d}{raw(";</script>")}</svg></body></html>
+route GET /complete = <html><body><svg>{raw("<g a='1'><!-- c --><text>t</text></g><style>a{}</style><script><![CDATA[ x < 1 ]]></script>")}</svg></body></html>
+"##;
+
+/// The second review's inputs against parse5:
+/// - a start tag that closes an element by itself (a `<p>` in a `<p>` or before a `<div>`, an
+///   `<li>` in an `<li>`, `<dd>`/`<dt>`, `<h1>`/`<h2>`, `<button>`, `<a>`, `<nobr>`, `<option>`,
+///   `<rt>` after `<rb>`) leaves the browser's elements open other than these: an end tag that goes
+///   down past one of them is not followed, and the script after `</foreignObject>` is written in
+///   a section (the browser had ended the integration point); a `<form>` (which a page's own
+///   form makes the browser pass over) is not followed either; written closed, the same markup
+///   is followed as it is (Q-1116);
+/// - an SVG script's end is past the CDATA sections, comments and tags in it, so its own
+///   `"</script><img ...>"` stays text in it, the markup unchanged; where it is not known whether
+///   the script is SVG's or HTML's, its inner `</script` is written `<\/script` so that both end it
+///   at the same place (Q-1116);
+/// - a `<` that ends a value is written `&lt;`, so the renderer's next text does not make it a tag
+///   (Q-1116);
+/// - markup split over values is ended where each value stops (a comment, a quoted attribute, a
+///   script), so what the second value holds is text; complete markup is written as it is (Q-1116)
+/// (src/foreign.rs `written`, `end_tag`, `foreign_end`, `cdata_text`, `escape_end_tags`;
+/// FEEDBACK71.md Q-969, coverage of 0.8.7, Q-1116; branch coverage-087).
+#[test]
+fn the_second_reviews_inputs_are_read_as_the_browser_reads_them() {
+    let mut it = app(IMPLIED);
+    let mut cases: Vec<(String, String)> = Vec::new();
+    for t in [
+        "<p>one<p>two</p>",
+        "<p>one<div>two</div>",
+        "<li>a<li>b</li>",
+        "<dd>a<dt>b</dt>",
+        "<h1>a<h2>b</h2>",
+        "<button>a<button>b</button>",
+        "<a>a<a>b</a>",
+        "<nobr>a<nobr>b</nobr>",
+        "<option>a<option>b</option>",
+        "<ruby><rb>a<rt>b</rt></ruby>",
+        "<b><p>x</b></p>",
+        "<form><form></form>",
+        // Each closed by its own end tag: followed, and the script after is SVG's all the same.
+        "<p>one</p><p>two</p>",
+        "<li>a</li><li>b</li>",
+    ] {
+        cases.push((format!("/tag?t={}", enc(t)), format!("<svg><foreignObject>{t}</foreignObject><script>{RAW_CODE}</script></svg>")));
+    }
+    cases.extend([
+        ("/form-outer".to_string(), format!("<form><svg><foreignObject><form></foreignObject><script>{RAW_CODE}</script></foreignObject></svg></form>")),
+        ("/cdata-end".into(), "<svg><svg><script><![CDATA[ var s = \"</script><img src=x onerror=1>\"; ]]></script></svg></svg>".into()),
+        ("/cdata-end-fo".into(), "<svg><foreignObject><svg><script><![CDATA[ x=\"</script><img src=x onerror=1>\" ]]></script></svg></foreignObject></svg>".into()),
+        // A comment in it ends nothing, and is put in a section, as markup in an SVG script is.
+        ("/comment-end".into(), "<svg><script><![CDATA[<!-- </script><img src=x onerror=1> -->]]></script></svg>".into()),
+        ("/attr-end".into(), "<svg><script><![CDATA[<g a='</script><img src=x onerror=1>'></g>]]></script></svg>".into()),
+        ("/cdata-end-unsure".into(), "<svg><foreignObject><svg><p></p><script><![CDATA[ \"<\\/script><img src=x onerror=1>\" ]]></script></foreignObject></svg>".into()),
+        ("/style-cdata".into(), "<svg><style><![CDATA[ a{} </style><img src=x onerror=1> ]]></style></svg>".into()),
+        ("/lt-text".into(), format!("<svg><foreignObject>&lt;hello<script>{HTML}</script></foreignObject></svg>")),
+        ("/lt-tag".into(), format!("<svg><foreignObject>x &lt;<b>bold</b><script>{HTML}</script></foreignObject></svg>")),
+        // Split over values: each value's markup ended where it stops (new in round 4; a decision
+        // for the user), the second value's then text.
+        ("/split-comment".into(), format!("<svg><!----><text>hidden</text>--><script>{CODE}</script></svg>")),
+        ("/split-attr?u=%2Fx".into(), "<svg><a href=''>/x'>link</a></svg>".into()),
+        ("/split-script?d=1".into(), "<svg><script>var d = </script>1;</script></svg>".into()),
+        ("/complete".into(), "<svg><g a='1'><!-- c --><text>t</text></g><style>a{}</style><script><![CDATA[ x < 1 ]]></script></svg>".into()),
+    ]);
+    let cases: Vec<(&str, String)> = cases.iter().map(|(p, w)| (p.as_str(), w.clone())).collect();
+    pages(&mut it, &cases);
+}
+
+// ---- a place lost for the rest of the page, and the next request -------------------------------
+
+const PAGES: &str = r##"fn boom(z: int) = 10 / z
+view Bad(z: int) = <g>{boom(z)}</g>
+component Bar(h: int) {
+    state tall = false
+    <rect class="bar" width="10" height={tall ? h * 2 : h} @click={() => { tall = true }}/>
+}
+route GET /reopen ? { q: str = "" } = <html><body><svg><g>{raw("</svg><svg><svg>")}</g></svg><script>{raw(q)}</script></body></html>
+route GET /reopen-later ? { q: str = "" } = <html><body><svg><g>{raw("</svg><svg><svg>")}</g></svg><p>after</p><div><script>{raw(q)}</script></div></body></html>
+route GET /boom-child ? { z: int = 0 } = <html><body><svg><g>{boom(z)}</g></svg></body></html>
+route GET /boom-attr ? { z: int = 0 } = <html><body><svg><g x={boom(z)}></g></svg></body></html>
+route GET /boom-view ? { z: int = 0 } = <html><body><svg><Bad z={z}/></svg></body></html>
+route GET /boom-raw ? { z: int = 0 } = <html><body><svg>{raw(str(boom(z)))}</svg></body></html>
+route GET /boom-script ? { z: int = 0 } = <html><body><svg><script>{raw(str(boom(z)))}</script></svg></body></html>
+route GET /boom-point ? { z: int = 0 } = <html><body><svg><foreignObject>{raw("<div>")}{boom(z)}</foreignObject></svg></body></html>
+route GET /boom-mi ? { z: int = 0 } = <html><body><math><mi><svg><g>{boom(z)}</g></svg></mi></math></body></html>
+route GET /plain ? { q: str = "" } = <html><head><title>p</title></head><body><p>x</p><script>{raw(q)}</script><svg><g><text>t</text></g></svg><script>{raw(q)}</script></body></html>
+route GET /island ? { q: str = "" } = <html><body><svg><Bar h={4}/></svg><script>{raw(q)}</script></body></html>
+"##;
+
+/// A raw value that closes the renderer's `<svg>` and opens its own (`</svg><svg><svg>`) leaves
+/// the browser in SVG past the renderer's own `</svg>`: the place is lost for the rest of the page
+/// (`foreign::LOST`, which `leave` keeps), and a script after it, in the page's HTML, is written
+/// as safe in both (in 0.8.7 as HTML's, which the browser read as SVG's: the parse5 review's
+/// `reopen`) (src/foreign.rs `LOST`, `leave`, `written`; FEEDBACK71.md Q-969, coverage of 0.8.7,
+/// Q-1116; branch coverage-087).
+#[test]
+fn a_place_lost_in_a_page_stays_lost_to_its_end() {
+    let mut it = app(PAGES);
+    pages(
+        &mut it,
+        &[
+            ("/reopen", format!("<svg><g></svg><svg><svg></g></svg><script>{CODE}</script>")),
+            ("/reopen-later", format!("<svg><g></svg><svg><svg></g></svg><p>after</p><div><script>{CODE}</script></div>")),
+        ],
+    );
+}
+
+/// The parser's place starts at HTML for each request (`Interp::page_start`): after a page that
+/// lost it, or one that failed inside `<svg>`, `<math>` or a `<foreignObject>` (a child, an
+/// attribute, a view, a raw value, a script's value), the same worker's next page is written as a
+/// fresh server writes it, its scripts HTML's where HTML is read and a component in `<svg>` in its
+/// SVG place (src/interp.rs `page_start`; FEEDBACK71.md Q-969, coverage of 0.8.7, Q-1116; branch
+/// coverage-087).
+#[test]
+fn the_next_request_on_a_worker_starts_where_a_fresh_server_does() {
+    let fresh = |path: &str| page(&mut app(PAGES), path);
+    let (plain, island) = (fresh("/plain"), fresh("/island"));
+    assert_eq!(plain, format!("<p>x</p><script>{HTML}</script><svg><g><text>t</text></g></svg><script>{HTML}</script>"));
+    assert!(island.starts_with("<svg><rect data-qi data-c=\"Bar\""), "{}", island);
+    assert!(island.ends_with(&format!("</svg><script>{HTML}</script>")), "{}", island);
+    let mut it = app(PAGES);
+    let failing = |it: &mut Interp, path: &str| {
+        let r = it.handle(&HttpRequest { method: "GET".into(), url: path.into(), headers: vec![("Host".into(), "localhost".into())], body: Vec::new(), remote: "127.0.0.1".into() });
+        assert_eq!(r.status, 500, "{}: {}", path, r.text());
+    };
+    for before in ["/reopen", "/reopen-later", "/boom-child", "/boom-attr", "/boom-view", "/boom-raw", "/boom-script", "/boom-point", "/boom-mi"] {
+        for _ in 0..2 {
+            if before.starts_with("/boom") {
+                failing(&mut it, before);
+            } else {
+                page(&mut it, before);
+            }
+            assert_eq!(page(&mut it, "/plain"), plain, "/plain after {}", before);
+            assert_eq!(page(&mut it, "/island"), island, "/island after {}", before);
+        }
+    }
 }

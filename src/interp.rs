@@ -115,6 +115,10 @@ impl Interp {
     /// request to Quillo's own addresses (a `server fn`'s call, live data) is for no page and has
     /// none. A program with none pays one test (FEEDBACK68.md; branch global-state).
     pub(crate) fn page_start(&mut self, req: &crate::server::HttpRequest) {
+        // Where the browser's parser is starts at HTML for each request: a page whose markup lost
+        // it keeps it lost to its end (`foreign::LOST`), and the worker's next page is another
+        // document (coverage of 0.8.7, Q-1116; branch coverage-087).
+        self.ns = crate::foreign::At::default();
         if self.page_states.is_empty() {
             return;
         }
