@@ -44,15 +44,16 @@ other request goes on. No `??` takes it, and it is said at the line that made th
 
 - Every text a builtin or an answer writes stops as it would pass the limit: `+`, templates,
   `str`, `join`, `replace`, `re.replace`, `upper`, `lower`, `normalize`, `escape`,
-  `url_encode`, `raw`, `markdown`, `json.stringify`, a route's JSON, a page and its components
-  (their attributes, `class` and `style` values, the text inside a `<script>` or a `<style>`, a
-  `<select>`'s value, the props and state their islands carry), a `server fn`'s answer, a live
-  part's too, a stream's piece. A deferred part that would pass it keeps its placeholder, as a
-  part that fails does, and its stop is said in the log.
+  `url_encode`, `raw`, `markdown`, `json.stringify`, a route's JSON, an `http` request's JSON
+  body, a page and its components (their attributes, `class` and `style` values, the text
+  inside a `<script>` or a `<style>`, a `<select>`'s value, the props and state their islands
+  carry), a `server fn`'s answer, a live part's too, a stream's piece. A deferred part that
+  would pass it keeps its placeholder, as a part that fails does, and its stop is said in the
+  log.
 - Lists and maps are compared as they grow: `push`, `range`, `flatten`, spreads, `merge`,
-  `set`, `group_by`, `json.parse`, a query's rows, a form's fields.
-- Bytes read stop at the limit (`read_file`, `http`, a request's body), and their text (U+FFFD
-  for each byte that is not UTF-8) is held to it too.
+  `set`, `group_by`, `json.parse`, a site's answer, a query's rows, a form's fields.
+- Bytes read stop at the limit (`read_file`, `http`, a site's call, a request's body), and
+  their text (U+FFFD for each byte that is not UTF-8) is held to it too.
 - Not held to it: the sum of many values each under it (bounded by time, with
   `--max-compute`), copies no larger than what they copy (`slice`, `map`, `filter`, `sort`),
   error messages, sessions and channels, and the PostgreSQL driver's own rows.

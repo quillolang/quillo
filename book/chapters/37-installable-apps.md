@@ -210,6 +210,13 @@ too, for that visitor's session alone:
   read is not known), and a page whose `cache-control` the program took away
   (`cache-control: null`), which a shared cache could give anyone (see [What a route
   returns](#what-a-route-returns)).
+- **A group's middleware** is followed where it is a function of the program's, a lambda
+  written in place, or a lambda a top-level `let` holds. Middleware Quillo cannot follow
+  counts as a read of the visitor, so its group's pages are never kept, and `quillo check`
+  says so of each: a field of a map (`gates.team`), a builtin (`unwrap`), a call that makes
+  the function (`role("admin")`, see [Route groups](#routes-route-groups)), an index. Write it as a
+  function of the program's, or a lambda in place *(since 0.8.8: the check said nothing of
+  them)*.
 - **Kept per session**: the server names each session by a digest of its hidden id and of
   all it holds (16 characters, in `x-quillo-session`), and the browser holds that name in a
   cookie, `quillo_tag`, that the page can read (no `HttpOnly`), with the session cookie's
@@ -389,7 +396,12 @@ On the server:
   30 s, past which the rest are said in the log as not sent. Inside `db.transaction` it is an
   error value, as it would hold every other request while it waits: send after the
   transaction (`quillo check` warns where it sees one inside). A `GET` that sends is refused
-  as a prefetch (see [Prefetching](#routes-prefetching)).
+  as a prefetch (see [Prefetching](#routes-prefetching)). The subscriptions it reads are held to
+  [`--max-memory`](#concurrency-and-reloading) as a query's rows are: past it, the request
+  ends with a 500 that says the limit, as for any other value, and no `??` takes it. A
+  request to `/_quillo/push` that meets the limit is a 500 that says it too *(since 0.8.8:
+  the send gave an error value, which `??` took, and `/_quillo/push` answered "internal
+  error")*.
 - **The user** is what `session().user` held when the device subscribed (or the `x` of
   `notification.user(x)`), compared as JSON: the int `7` and the text `"7"` are two people,
   so send what the session holds.

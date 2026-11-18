@@ -825,7 +825,28 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   out. Markup made apart and placed in `<svg>` later (`let s = <script>{raw(x)}</script>`,
   then `<svg>{s}</svg>`, or given to a view's attribute) has its script text put in CDATA
   there too; a `<![CDATA[ ... ]]>` that a value in it holds is then taken by the browser as a
-  section, so those characters are left out of the value (nothing else changes). Write `<script>` and `<style>` in lower case: `<sCript>` is refused, as the
+  section, so those characters are left out of the value (nothing else changes). Markup
+  given as text (`raw(...)`) is read as the browser reads it, to tell whether a script after
+  it is in SVG or MathML or in HTML. Attributes may be unquoted or quoted either way
+  (`<font size=1>` ends SVG, as `<p>` does). A `/>` closes only a void element (`<br/>`) or
+  an SVG or MathML one (`<circle/>`): `<div/>` stays open as `<div>` does, and a
+  `</foreignObject>` after it ends nothing. In `<svg width=10/>` the `/` is the value's, so
+  the `<svg>` stays open. A comment ends at the first `-->` or `--!>`, and `<!-->` and
+  `<!--->` end at once. `<!x>`, `<!DOCTYPE x>`, `<?x>` and `</ x>` end at their first `>`.
+  `<![CDATA[ ... ]]>` is a section where the element around it is SVG's or MathML's (a
+  `<foreignObject>` too), and a comment to its first `>` inside an HTML element. An end tag
+  ends the element it names and those open inside it, as the browser's parser does. Where
+  Quillo cannot tell where the browser is (a `</div>` that names nothing open, one that walks
+  past a `<p>`, `<li>`, `<a>`, `<form>` or the like, a `<table>`, a `<select>`, a
+  `<template>`), every later script on that page, after the page's own `</svg>` too, is
+  written in the form safe in both readings. A script inside `<svg>` ends where the browser
+  ends it, after a CDATA section in it. Markup inside `<svg>` or `<math>` that stops partway
+  (`raw("<!-- x")`, `raw("<a href='x")`, a `<script>` with no `</script>`, a last `<`) has
+  its end written (`-->`, `'>`, `</script>`, `&lt;`), so the browser never reads on into the
+  page's next markup. A comment, tag or script split over two `raw` values is therefore
+  ended after the first, and the server log says so once for each line: give the whole of
+  it in one `raw` *(since 0.8.8: Quillo read such markup otherwise than the browser in
+  places, and a script the browser reads as SVG could be written for HTML)*. Write `<script>` and `<style>` in lower case: `<sCript>` is refused, as the
   browser takes it as a script *(since 0.8.7: it was written as any element, and the browser
   ran it)*. The script's own text goes in the
   same way: as written, quotes included, with only `</` and `<!--` escaped; code kept in

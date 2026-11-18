@@ -574,6 +574,13 @@ too, for that visitor's session alone:
   read is not known), and a page whose `cache-control` the program took away
   (`cache-control: null`), which a shared cache could give anyone (see [What a route
   returns](#what-a-route-returns)).
+- **A group's middleware** is followed where it is a function of the program's, a lambda
+  written in place, or a lambda a top-level `let` holds. Middleware Quillo cannot follow
+  counts as a read of the visitor, so its group's pages are never kept, and `quillo check`
+  says so of each: a field of a map (`gates.team`), a builtin (`unwrap`), a call that makes
+  the function (`role("admin")`, see [Route groups](#route-groups)), an index. Write it as a
+  function of the program's, or a lambda in place *(since 0.8.8: the check said nothing of
+  them)*.
 - **Kept per session**: the server names each session by a digest of its hidden id and of
   all it holds (16 characters, in `x-quillo-session`), and the browser holds that name in a
   cookie, `quillo_tag`, that the page can read (no `HttpOnly`), with the session cookie's
@@ -753,7 +760,12 @@ On the server:
   30 s, past which the rest are said in the log as not sent. Inside `db.transaction` it is an
   error value, as it would hold every other request while it waits: send after the
   transaction (`quillo check` warns where it sees one inside). A `GET` that sends is refused
-  as a prefetch (see [Prefetching](#prefetching)).
+  as a prefetch (see [Prefetching](#prefetching)). The subscriptions it reads are held to
+  [`--max-memory`](#concurrency-and-reloading) as a query's rows are: past it, the request
+  ends with a 500 that says the limit, as for any other value, and no `??` takes it. A
+  request to `/_quillo/push` that meets the limit is a 500 that says it too *(since 0.8.8:
+  the send gave an error value, which `??` took, and `/_quillo/push` answered "internal
+  error")*.
 - **The user** is what `session().user` held when the device subscribed (or the `x` of
   `notification.user(x)`), compared as JSON: the int `7` and the text `"7"` are two people,
   so send what the session holds.
@@ -1675,7 +1687,28 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   out. Markup made apart and placed in `<svg>` later (`let s = <script>{raw(x)}</script>`,
   then `<svg>{s}</svg>`, or given to a view's attribute) has its script text put in CDATA
   there too; a `<![CDATA[ ... ]]>` that a value in it holds is then taken by the browser as a
-  section, so those characters are left out of the value (nothing else changes). Write `<script>` and `<style>` in lower case: `<sCript>` is refused, as the
+  section, so those characters are left out of the value (nothing else changes). Markup
+  given as text (`raw(...)`) is read as the browser reads it, to tell whether a script after
+  it is in SVG or MathML or in HTML. Attributes may be unquoted or quoted either way
+  (`<font size=1>` ends SVG, as `<p>` does). A `/>` closes only a void element (`<br/>`) or
+  an SVG or MathML one (`<circle/>`): `<div/>` stays open as `<div>` does, and a
+  `</foreignObject>` after it ends nothing. In `<svg width=10/>` the `/` is the value's, so
+  the `<svg>` stays open. A comment ends at the first `-->` or `--!>`, and `<!-->` and
+  `<!--->` end at once. `<!x>`, `<!DOCTYPE x>`, `<?x>` and `</ x>` end at their first `>`.
+  `<![CDATA[ ... ]]>` is a section where the element around it is SVG's or MathML's (a
+  `<foreignObject>` too), and a comment to its first `>` inside an HTML element. An end tag
+  ends the element it names and those open inside it, as the browser's parser does. Where
+  Quillo cannot tell where the browser is (a `</div>` that names nothing open, one that walks
+  past a `<p>`, `<li>`, `<a>`, `<form>` or the like, a `<table>`, a `<select>`, a
+  `<template>`), every later script on that page, after the page's own `</svg>` too, is
+  written in the form safe in both readings. A script inside `<svg>` ends where the browser
+  ends it, after a CDATA section in it. Markup inside `<svg>` or `<math>` that stops partway
+  (`raw("<!-- x")`, `raw("<a href='x")`, a `<script>` with no `</script>`, a last `<`) has
+  its end written (`-->`, `'>`, `</script>`, `&lt;`), so the browser never reads on into the
+  page's next markup. A comment, tag or script split over two `raw` values is therefore
+  ended after the first, and the server log says so once for each line: give the whole of
+  it in one `raw` *(since 0.8.8: Quillo read such markup otherwise than the browser in
+  places, and a script the browser reads as SVG could be written for HTML)*. Write `<script>` and `<style>` in lower case: `<sCript>` is refused, as the
   browser takes it as a script *(since 0.8.7: it was written as any element, and the browser
   ran it)*. The script's own text goes in the
   same way: as written, quotes included, with only `</` and `<!--` escaped; code kept in
@@ -4139,10 +4172,12 @@ route [offline] [writes] METHOD /path [with effects] { ... block ... }
   `quillo check` warns of a `GET` (or `ANY`) route that surely writes (SQL as written in the program: SQL
   built at run time is not guessed) and reads who the visitor is (`session()`, `cookie()`, the
   request's headers or cookies, there, in a function it calls, a component it shows, or its
-  middleware). Make such a route a `POST` (a form or a button), which Quillo refuses from other
-  sites, or tag it where the write is meant, as for a confirm-your-address link, a sign-in
-  callback or a presence ping. Three or more
-  routes that warn through one write (a helper they all call, a group's middleware) are said
+  middleware). A request pattern reads them when any of its `|` alternatives takes the
+  headers or cookies, or one under `as`, so `route GET /seen { query: { who: str } } |
+  { cookies: { who: str } } { ... }` that writes is warned of *(since 0.8.8: it was not)*. Make such a route a `POST`
+  (a form or a button), which Quillo refuses from other sites, or tag it where the write is
+  meant, as for a confirm-your-address link, a sign-in callback or a presence ping. Three or
+  more routes that warn through one write (a helper they all call, a group's middleware) are said
   once, at the write. Only a `GET` or an `ANY` route takes the tag; `writes` is a name anywhere
   else.
 - **Methods:** `GET POST PUT PATCH DELETE OPTIONS ANY`. `ANY` takes every method. A
@@ -4392,7 +4427,10 @@ routes /reports | signed_in with db {               // what its routes may do, a
 - **`offline`**, after `routes` and before the path (`routes offline /help { ... }`), keeps
   the page of each `GET` route of the group, and of the groups inside it, for when there is
   no network; its other routes are sent as ever. A group tagged so with no `GET` route is an
-  error (see [Pages that work offline](#pages-that-work-offline)).
+  error (see [Pages that work offline](#pages-that-work-offline)). A space goes between a
+  tag, `offline` or `writes`, and the path: `routes offline/help { ... }` is an error that
+  says so (`` `offline` is a tag, and a space goes between it and the group's path: `routes
+  offline /help { ... }` ``) *(since 0.8.8: it said "`routes` is no keyword")*.
 - **`with`**, after the middleware, is what every route in the group, and its middleware,
   may do. A route in it may narrow it (`route GET /status with time = ...`), a group
   inside it too, and asking for an effect it does not allow is an error (see
@@ -4400,7 +4438,8 @@ routes /reports | signed_in with db {               // what its routes may do, a
 
 - **The path** goes before each route's own, parameters and types included
   (`:team(int)`), which the routes' bodies and patterns can use; a group's `/` alone
-  adds nothing.
+  adds nothing. It starts with `/`: `routes admin-tools { ... }` is an error that says so
+  (`` a group's path starts with `/`: `routes /admin-tools { ... }` ``) *(since 0.8.8)*.
 - **Middleware** (each after a `|`, as in a pipeline) is called with the request before
   the route's body, outer groups' first, in the order written. It lets the route go on by
   giving the request back (as `auth.required` does), or a copy of it (`merge(r, ...)`).
@@ -6745,7 +6784,13 @@ empty.
   http://10.0.0.5/: ...``) *(since 0.8.7: any redirect was followed, and a `file:` one was a
   500)*. A call has 10 s to connect and 30 s in all, its redirects
   included; an answer over 64 MiB is an error value; requests say
-  `User-Agent: quillo/<version>`. The cookies of every answer from the site's own address,
+  `User-Agent: quillo/<version>`. Under [`--max-memory`](#concurrency-and-reloading) the
+  answer is read no further than the limit and made into values held to it as they are
+  read: past it, the request ends with a 500, as `http`'s does, and no `??` takes it. An
+  answer with more values than JSON of its length may have (1,000,000, or one for each 8
+  bytes of an answer over 8 MB) is an error value that quotes its start (``site shop: `notes`
+  answered 200: {"ok":[0,0,...``) *(since 0.8.8: the answer was read to 64 MiB whatever
+  the limit)*. The cookies of every answer from the site's own address,
   those on the way too, are kept where cookies are kept (above).
 - `/_quillo/rpc/<fn>` is a stable wire for programs: a JSON array of arguments in,
   `{"ok": value}` or `{"err": error}` out. A program needs no `Origin` header; another
@@ -7070,7 +7115,7 @@ What each does at its edges, where the answer is not what another language would
 | `write_file(path, v)` | `v` as text, folders made, the file replaced; `null` or an error value |
 | `escape(s)` | `& < > " '` as entities |
 | `json.parse(s)` | an error value for bad JSON, for a number past a float (`1e400`) and for half of a character (a lone `\ud83d`), on both sides; an int past 64 bits becomes a float; a key given twice keeps the last value; keys in the order written, on both sides; at most 128 levels deep, on both sides, past which it is `invalid JSON: it nests more than 128 deep` (`request.json` and an `http` answer's `json` are `null`, a stream's line is its text, and a database's JSON cell is that error); every other reader of JSON (sessions, channels, a `server fn`'s arguments, a service's body) takes the same depth |
-| `json.stringify(v, pretty)` | indented by two spaces when `pretty` is true; a whole float as `2.0` (`-0.0` too), so it reads back as a float, and an exponent where JavaScript writes one (`1e+21`, `1e-7`), on both sides; markup as its HTML; a decimal as a string, NaN and infinities as `null`, an error value as `{"error": ...}`; a function is an error value naming where it is (`` json.stringify: `a.f` is a function, which cannot be written as JSON ``), where it was written as text; JSON past 256 MiB, or nested more than 10,000 deep, is an error value, counted before it is made, as lists that hold one part twice can double at each step *(since 0.7)*; a route's answer the same, a 500 with the reason in the log |
+| `json.stringify(v, pretty)` | indented by two spaces when `pretty` is true; a whole float as `2.0` (`-0.0` too), so it reads back as a float, and an exponent where JavaScript writes one (`1e+21`, `1e-7`), on both sides; markup as its HTML; a decimal as a string, NaN and infinities as `null`, an error value as `{"error": ...}`; a function is an error value naming where it is (`` json.stringify: `a.f` is a function, which cannot be written as JSON ``), where it was written as text; JSON past 256 MiB, or nested more than 10,000 deep, is an error value, counted before it is made, as lists that hold one part twice can double at each step *(since 0.7)*, in a `parallel` call's function too, on its smaller stack *(since 0.8.8: 20,000 deep there stopped the server)*; a route's answer the same, a 500 with the reason in the log |
 
 What is not in the standard library, and what to do instead:
 
@@ -8661,7 +8706,13 @@ it (`the answer is in a coding Quillo cannot read: content-encoding zstd`). Requ
 the headers give another; some APIs (OpenStreetMap's Nominatim) refuse that one, so
 name your program. `http.stream(url, f, opts)` reads an answer as it arrives (see [Streaming](#streaming)).
 Text is sent as `text/plain`, HTML as `text/html`, other values (numbers and decimals
-too) as JSON, unless the headers give a `content-type`.
+too) as JSON, unless the headers give a `content-type`. That JSON is written as
+`json.stringify` writes it: a function in the body, at any depth, is an error value that
+says where it is, and nothing is sent (``http: the body: `[0]` is a function, which cannot
+be written as JSON`` for `http.post(url, [len, 1])`); so is a body past 256 MiB or nested
+more than 10,000 deep. Under [`--max-memory`](#concurrency-and-reloading) the JSON is held
+to the limit as it is written. `http.stream`'s `body` is the same *(since 0.8.8: a
+function went out as its text)*.
 
 Options come after the headers (in `http.stream`, in its map):
 
@@ -8892,15 +8943,16 @@ other request goes on. No `??` takes it, and it is said at the line that made th
 
 - Every text a builtin or an answer writes stops as it would pass the limit: `+`, templates,
   `str`, `join`, `replace`, `re.replace`, `upper`, `lower`, `normalize`, `escape`,
-  `url_encode`, `raw`, `markdown`, `json.stringify`, a route's JSON, a page and its components
-  (their attributes, `class` and `style` values, the text inside a `<script>` or a `<style>`, a
-  `<select>`'s value, the props and state their islands carry), a `server fn`'s answer, a live
-  part's too, a stream's piece. A deferred part that would pass it keeps its placeholder, as a
-  part that fails does, and its stop is said in the log.
+  `url_encode`, `raw`, `markdown`, `json.stringify`, a route's JSON, an `http` request's JSON
+  body, a page and its components (their attributes, `class` and `style` values, the text
+  inside a `<script>` or a `<style>`, a `<select>`'s value, the props and state their islands
+  carry), a `server fn`'s answer, a live part's too, a stream's piece. A deferred part that
+  would pass it keeps its placeholder, as a part that fails does, and its stop is said in the
+  log.
 - Lists and maps are compared as they grow: `push`, `range`, `flatten`, spreads, `merge`,
-  `set`, `group_by`, `json.parse`, a query's rows, a form's fields.
-- Bytes read stop at the limit (`read_file`, `http`, a request's body), and their text (U+FFFD
-  for each byte that is not UTF-8) is held to it too.
+  `set`, `group_by`, `json.parse`, a site's answer, a query's rows, a form's fields.
+- Bytes read stop at the limit (`read_file`, `http`, a site's call, a request's body), and
+  their text (U+FFFD for each byte that is not UTF-8) is held to it too.
 - Not held to it: the sum of many values each under it (bounded by time, with
   `--max-compute`), copies no larger than what they copy (`slice`, `map`, `filter`, `sort`),
   error messages, sessions and channels, and the PostgreSQL driver's own rows.

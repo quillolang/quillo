@@ -1,5 +1,80 @@
 # Changelog
 
+## Unreleased
+
+Found by the tests written for 0.8.7's coverage (Q-1100 to Q-1117).
+
+### Security
+
+- **Scripts in SVG and MathML: markup made as text is read as the browser reads it.** To tell
+  whether a `<script>` is HTML's or SVG's, Quillo read `raw(...)` markup otherwise than the
+  browser, and a script the browser reads as SVG could get HTML's form, with no CDATA, so an
+  `html` value in it became elements: `<svg width=10/>` was taken as closed (the `/` is the
+  value's), and a quote inside an unquoted value or a name as the start of a quoted one
+  (Q-1112); a comment ended only at `-->`, where the browser also ends it at `--!>`, and at
+  once for `<!-->` and `<!--->`, so an `<svg>` opened after one was taken for comment
+  (Q-1113). `<!x>`, `<?x>` and `</ x>` end at their first `>`, and `<![CDATA[` is a section
+  in SVG and MathML and a comment in HTML. `/>` closes only void elements and SVG's and
+  MathML's, so `<div/>` in a `<foreignObject>` stays open and a script after it is written
+  for HTML, without the CDATA section that kept it from running (Q-1100) (coverage of 0.8.7).
+- **`raw("<font size=1>")` inside `<svg>` hung its request**: an unquoted attribute value, or
+  spaces around `=`, had the server read the same place again and again, and the request
+  held its thread for good. Attributes are read as the browser's tokenizer reads them, each
+  step moving on (coverage of 0.8.7, Q-1111).
+- **Scripts in SVG and MathML: where the browser is after an end tag, or after markup that
+  stops partway.** An end tag ended the element opened last, not the one it names; an
+  element a tag closes by itself (`<p>`, `<li>`, `<a>`, `<form>`, `<option>` and the like)
+  was taken as still open; a script inside `<svg>` was taken to end at a `</script>` inside
+  its own CDATA section; the page's own `</svg>` brought Quillo back to HTML where raw markup
+  had left it unable to tell; and markup that stopped partway (`raw("<input")`,
+  `raw("<!-- x")`, a last `<`) had the browser read on into the page's next markup. In each,
+  a script the browser reads as SVG could be written for HTML, and an `html` value in it
+  became elements. End tags end the element they name; where Quillo cannot tell, every later
+  script on the page is written in the form safe in both readings; an SVG script ends where
+  the browser ends it; markup inside `<svg>` or `<math>` that stops partway has its end
+  written (`>`, `-->`, `</script>`, `&lt;`). A program that splits one comment, tag or
+  script over two `raw` values now sees it ended after the first, and the server log says
+  so once for each line. `annotation-xml` with `encoding="text&#47;html"` is no longer taken
+  for MathML (coverage of 0.8.7, Q-1116, Q-1117). Each worker's page starts at HTML.
+- **Pages with SVG render faster**: reading markup inside `<svg>` takes 39-49% less time,
+  as tag names are matched at once where 0.8.7 compared them with a list of 44 on every
+  tag. A page of 5,000 `<rect>`s answers in 0.90 ms where it took 1.04 ms, nested SVG in
+  0.75 ms where it took 1.11; plain HTML pages are unchanged (coverage of 0.8.7).
+- **`--max-memory` holds a site's answer.** `shop.notes()` read the answer to 64 MiB
+  whatever the limit, and made its value whole: a 698 KB answer became 349,001 values (11 MB)
+  under `--max-memory 1MB`. The answer is read no further than the limit and made into values
+  held to it, and past it the request ends with a 500 that no `??` takes, as `http`'s does
+  (it was an error value). Without a limit, an answer with more values than JSON of its length
+  may have (1,000,000, or one for each 8 bytes of an answer over 8 MB) is an error value, where
+  `http` leaves its `json` `null` (coverage of 0.8.7, Q-1105, Q-1109).
+- **`json.stringify` of a very deep value stopped the server inside `parallel`.** A list
+  20,000 deep, given to it in a `parallel` call's function (a smaller stack), overflowed the
+  stack in the look for hidden errors before the JSON was written; that look goes on to a new
+  piece of stack as the writer does, and the depth's error value comes back, as outside
+  `parallel` (coverage of 0.8.7, Q-1110). In a debug build (`cargo run`, CI) 150 levels did,
+  before the writer's first look at the stack; release builds are unchanged there (Q-1106).
+
+### Fixed
+
+- **`notification.send` and `/_quillo/push` at `--max-memory`**: subscriptions read past the
+  limit end the request with a 500 that says it, as any other value does; a send gave an error
+  value with the limit's words, which `??` took, and the request answered 200, and
+  `/_quillo/push` answered "internal error" (coverage of 0.8.7, Q-1101).
+- **A function in an `http` body is an error value**, as in `json.stringify`, and nothing is
+  sent (``http: the body: `[0]` is a function, which cannot be written as JSON``): it went out
+  as its text (`["<builtin len>",1]`). The body's JSON is held to `--max-memory` and to
+  `json.stringify`'s limits, in `http.stream` too (coverage of 0.8.7, Q-1107).
+- **`quillo check` and offline groups' middleware**: middleware Quillo cannot follow (a field of
+  a map, a builtin, a call that makes the function, an index), whose pages the server never
+  keeps, is warned of, as is a lambda a top-level `let` holds that reads the request past the
+  session; the check said nothing of them (coverage of 0.8.7, Q-1102).
+- **`quillo check` and a `GET` that writes**: a request pattern's `|` alternatives, and one
+  under `as`, are looked through, so `{ query: q } | { cookies: c }` reads the visitor; it read
+  no one, and the warning did not come (coverage of 0.8.7, Q-1104).
+- **A group's slips said as such**: `routes offline/help { ... }` says a space goes between
+  the tag and the path, and `routes admin-tools { ... }` that the path starts with `/`; both
+  said "`routes` is no keyword: did you mean `route`?" (coverage of 0.8.7, Q-1103).
+
 ## 0.8.7 (2026-11-18)
 
 - **Installable apps**: a program with an `app.toml` beside it can be installed from the

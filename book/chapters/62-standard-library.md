@@ -164,7 +164,7 @@ What each does at its edges, where the answer is not what another language would
 | `write_file(path, v)` | `v` as text, folders made, the file replaced; `null` or an error value |
 | `escape(s)` | `& < > " '` as entities |
 | `json.parse(s)` | an error value for bad JSON, for a number past a float (`1e400`) and for half of a character (a lone `\ud83d`), on both sides; an int past 64 bits becomes a float; a key given twice keeps the last value; keys in the order written, on both sides; at most 128 levels deep, on both sides, past which it is `invalid JSON: it nests more than 128 deep` (`request.json` and an `http` answer's `json` are `null`, a stream's line is its text, and a database's JSON cell is that error); every other reader of JSON (sessions, channels, a `server fn`'s arguments, a service's body) takes the same depth |
-| `json.stringify(v, pretty)` | indented by two spaces when `pretty` is true; a whole float as `2.0` (`-0.0` too), so it reads back as a float, and an exponent where JavaScript writes one (`1e+21`, `1e-7`), on both sides; markup as its HTML; a decimal as a string, NaN and infinities as `null`, an error value as `{"error": ...}`; a function is an error value naming where it is (`` json.stringify: `a.f` is a function, which cannot be written as JSON ``), where it was written as text; JSON past 256 MiB, or nested more than 10,000 deep, is an error value, counted before it is made, as lists that hold one part twice can double at each step *(since 0.7)*; a route's answer the same, a 500 with the reason in the log |
+| `json.stringify(v, pretty)` | indented by two spaces when `pretty` is true; a whole float as `2.0` (`-0.0` too), so it reads back as a float, and an exponent where JavaScript writes one (`1e+21`, `1e-7`), on both sides; markup as its HTML; a decimal as a string, NaN and infinities as `null`, an error value as `{"error": ...}`; a function is an error value naming where it is (`` json.stringify: `a.f` is a function, which cannot be written as JSON ``), where it was written as text; JSON past 256 MiB, or nested more than 10,000 deep, is an error value, counted before it is made, as lists that hold one part twice can double at each step *(since 0.7)*, in a `parallel` call's function too, on its smaller stack *(since 0.8.8: 20,000 deep there stopped the server)*; a route's answer the same, a 500 with the reason in the log |
 
 What is not in the standard library, and what to do instead:
 
@@ -1755,7 +1755,13 @@ it (`the answer is in a coding Quillo cannot read: content-encoding zstd`). Requ
 the headers give another; some APIs (OpenStreetMap's Nominatim) refuse that one, so
 name your program. `http.stream(url, f, opts)` reads an answer as it arrives (see [Streaming](#streaming)).
 Text is sent as `text/plain`, HTML as `text/html`, other values (numbers and decimals
-too) as JSON, unless the headers give a `content-type`.
+too) as JSON, unless the headers give a `content-type`. That JSON is written as
+`json.stringify` writes it: a function in the body, at any depth, is an error value that
+says where it is, and nothing is sent (``http: the body: `[0]` is a function, which cannot
+be written as JSON`` for `http.post(url, [len, 1])`); so is a body past 256 MiB or nested
+more than 10,000 deep. Under [`--max-memory`](#concurrency-and-reloading) the JSON is held
+to the limit as it is written. `http.stream`'s `body` is the same *(since 0.8.8: a
+function went out as its text)*.
 
 Options come after the headers (in `http.stream`, in its map):
 

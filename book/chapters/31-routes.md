@@ -16,10 +16,12 @@ route [offline] [writes] METHOD /path [with effects] { ... block ... }
   `quillo check` warns of a `GET` (or `ANY`) route that surely writes (SQL as written in the program: SQL
   built at run time is not guessed) and reads who the visitor is (`session()`, `cookie()`, the
   request's headers or cookies, there, in a function it calls, a component it shows, or its
-  middleware). Make such a route a `POST` (a form or a button), which Quillo refuses from other
-  sites, or tag it where the write is meant, as for a confirm-your-address link, a sign-in
-  callback or a presence ping. Three or more
-  routes that warn through one write (a helper they all call, a group's middleware) are said
+  middleware). A request pattern reads them when any of its `|` alternatives takes the
+  headers or cookies, or one under `as`, so `route GET /seen { query: { who: str } } |
+  { cookies: { who: str } } { ... }` that writes is warned of *(since 0.8.8: it was not)*. Make such a route a `POST`
+  (a form or a button), which Quillo refuses from other sites, or tag it where the write is
+  meant, as for a confirm-your-address link, a sign-in callback or a presence ping. Three or
+  more routes that warn through one write (a helper they all call, a group's middleware) are said
   once, at the write. Only a `GET` or an `ANY` route takes the tag; `writes` is a name anywhere
   else.
 - **Methods:** `GET POST PUT PATCH DELETE OPTIONS ANY`. `ANY` takes every method. A
@@ -269,7 +271,10 @@ routes /reports | signed_in with db {               // what its routes may do, a
 - **`offline`**, after `routes` and before the path (`routes offline /help { ... }`), keeps
   the page of each `GET` route of the group, and of the groups inside it, for when there is
   no network; its other routes are sent as ever. A group tagged so with no `GET` route is an
-  error (see [Pages that work offline](#pages-that-work-offline)).
+  error (see [Pages that work offline](#pages-that-work-offline)). A space goes between a
+  tag, `offline` or `writes`, and the path: `routes offline/help { ... }` is an error that
+  says so (`` `offline` is a tag, and a space goes between it and the group's path: `routes
+  offline /help { ... }` ``) *(since 0.8.8: it said "`routes` is no keyword")*.
 - **`with`**, after the middleware, is what every route in the group, and its middleware,
   may do. A route in it may narrow it (`route GET /status with time = ...`), a group
   inside it too, and asking for an effect it does not allow is an error (see
@@ -277,7 +282,8 @@ routes /reports | signed_in with db {               // what its routes may do, a
 
 - **The path** goes before each route's own, parameters and types included
   (`:team(int)`), which the routes' bodies and patterns can use; a group's `/` alone
-  adds nothing.
+  adds nothing. It starts with `/`: `routes admin-tools { ... }` is an error that says so
+  (`` a group's path starts with `/`: `routes /admin-tools { ... }` ``) *(since 0.8.8)*.
 - **Middleware** (each after a `|`, as in a pipeline) is called with the request before
   the route's body, outer groups' first, in the order written. It lets the route go on by
   giving the request back (as `auth.required` does), or a copy of it (`merge(r, ...)`).
@@ -2622,7 +2628,13 @@ empty.
   http://10.0.0.5/: ...``) *(since 0.8.7: any redirect was followed, and a `file:` one was a
   500)*. A call has 10 s to connect and 30 s in all, its redirects
   included; an answer over 64 MiB is an error value; requests say
-  `User-Agent: quillo/<version>`. The cookies of every answer from the site's own address,
+  `User-Agent: quillo/<version>`. Under [`--max-memory`](#concurrency-and-reloading) the
+  answer is read no further than the limit and made into values held to it as they are
+  read: past it, the request ends with a 500, as `http`'s does, and no `??` takes it. An
+  answer with more values than JSON of its length may have (1,000,000, or one for each 8
+  bytes of an answer over 8 MB) is an error value that quotes its start (``site shop: `notes`
+  answered 200: {"ok":[0,0,...``) *(since 0.8.8: the answer was read to 64 MiB whatever
+  the limit)*. The cookies of every answer from the site's own address,
   those on the way too, are kept where cookies are kept (above).
 - `/_quillo/rpc/<fn>` is a stable wire for programs: a JSON array of arguments in,
   `{"ok": value}` or `{"err": error}` out. A program needs no `Origin` header; another
