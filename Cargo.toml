@@ -91,8 +91,9 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 muda = { version = "0.21", optional = true }
 
 [lints.rust]
-# `cfg(fuzzing)`: hooks for the fuzz targets (fuzz/), which cargo-fuzz sets.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+# `cfg(fuzzing)`: hooks for the fuzz targets (fuzz/), which cargo-fuzz sets. `cfg(coverage)`:
+# cargo llvm-cov's, under which a test may fail an install's write (src/install.rs).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(coverage)"] }
 
 [features]
 default = ["mysql", "jit", "realtime"]

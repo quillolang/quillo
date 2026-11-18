@@ -243,7 +243,7 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Ok(Claim::Answer(a)) => return give(a, true),
         Ok(Claim::Busy) => return no(409, RUNNING),
         Ok(Claim::Refused(status, msg)) => return no(status, &msg),
-        Err(e) => return no(503, &format!("could not record the Idempotency-Key: {}", e)),
+        Err(e) => return no(503, &db_failed(it, step, line, "could not record the Idempotency-Key", &e)),
     };
     cleanup(it, tenant.as_deref());
 
@@ -308,12 +308,26 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                     }
                     Ok(Claim::Busy) => no(409, RUNNING),
                     Ok(Claim::Refused(status, msg)) => no(status, &msg),
-                    Err(e) => no(503, &format!("could not read the Idempotency-Key: {}", e)),
+                    Err(e) => no(503, &db_failed(it, step, line, "could not read the Idempotency-Key", &e)),
                 };
             }
             r
         }
     }
+}
+
+/// What a visitor is told when the table of keys fails: `what` alone, as a builtin's error says
+/// only `internal error`, the database's words going to the log; all of it under `--watch`, and
+/// to a service calling (`step`), which is the program's own. The database's message was sent
+/// to anyone: a constraint, a table, a column, a PostgreSQL host (FEEDBACK71.md, Q-978; branch
+/// security).
+fn db_failed(it: &Interp, step: bool, line: u32, what: &str, why: &str) -> String {
+    let whole = format!("{}: {}", what, why);
+    if step || crate::server::SHOW_ERRORS.load(std::sync::atomic::Ordering::Relaxed) {
+        return whole;
+    }
+    crate::server::log_hidden(&Value::str(whole), &Place::new(it.cur_file.as_ref(), line));
+    what.to_string()
 }
 
 /// Who a row is when nothing was said of who asked.

@@ -1819,6 +1819,12 @@ pub fn check_file_with(path: &Path, overrides: HashMap<PathBuf, String>) -> Anal
 
 /// `check_file_with`, with options.
 pub fn check_file_opts(path: &Path, overrides: HashMap<PathBuf, String>, opts: Options) -> Analysis {
+    // A program's sources are read to `MOST_PROGRAM` together, the main file among them
+    // (FEEDBACK71.md, Q-982, found in review; branch security).
+    crate::error::with_source_budget(|| check_file_budgeted(path, overrides, opts))
+}
+
+fn check_file_budgeted(path: &Path, overrides: HashMap<PathBuf, String>, opts: Options) -> Analysis {
     let main = overrides.get(path).cloned().map_or_else(|| crate::error::read_source(path), Ok);
     match main {
         Ok(src) => {
@@ -1850,6 +1856,10 @@ pub fn check_source_opts(src: &str, file: &str, base_dir: &Path, opts: Options) 
 }
 
 fn check_source_with(src: &str, file: &str, base_dir: &Path, overrides: HashMap<PathBuf, String>, opts: Options) -> Analysis {
+    crate::error::with_source_budget(|| check_source_budgeted(src, file, base_dir, overrides, opts))
+}
+
+fn check_source_budgeted(src: &str, file: &str, base_dir: &Path, overrides: HashMap<PathBuf, String>, opts: Options) -> Analysis {
     if DEPTH.with(|d| d.get()) >= MAX_PROGRAMS {
         let mut a = Analysis::default();
         let message = format!("programs mount or call each other more than {} deep", MAX_PROGRAMS);
@@ -1873,6 +1883,13 @@ fn check_source_with(src: &str, file: &str, base_dir: &Path, overrides: HashMap<
     if outermost {
         if let Some((line, message)) = crate::mcp::unseen_in_block(src) {
             a.diagnostics.push(Diagnostic { file: file.to_string(), line, severity: Severity::Error, message });
+        }
+        // Its file's name, told to AI clients as its name where it has tools (FEEDBACK71.md,
+        // Q-980, found in review; branch security).
+        if !a.tools.is_empty() || !a.service_tools.is_empty() {
+            if let Some(message) = crate::mcp::unseen_in_name(file) {
+                a.diagnostics.push(Diagnostic { file: file.to_string(), line: 0, severity: Severity::Error, message });
+            }
         }
         if let Some((line, message)) = crate::mcp::instructions_warning(file, src, &a) {
             a.diagnostics.push(Diagnostic { file: file.to_string(), line, severity: Severity::Warning, message });
@@ -1935,6 +1952,14 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
             // The tools' types, for their schemas (FEEDBACK56.md, Q-858; branch feedback56).
             if !c.out.tools.is_empty() {
                 c.out.types = RECORDS.with(|r| r.borrow().clone());
+                // What AI clients are told of each tool holds no character a reader of the file
+                // does not see, as the `//!` block may not (FEEDBACK71.md, Q-980; branch
+                // security). A file's text is read again only for a tool that has one.
+                let overrides = &c.overrides;
+                let text_of = |f: &str| if f == file { Some(src.to_string()) } else { overrides.get(Path::new(f)).cloned().or_else(|| crate::error::read_source(f).ok()) };
+                for (f, line, msg) in crate::mcp::unseen_in_tools(&c.out, &text_of) {
+                    c.diag_at(Arc::from(f), line, Severity::Error, msg);
+                }
             }
         }
         Err(e) => {
@@ -2614,7 +2639,7 @@ impl Checker {
                     self.out.diagnostics.extend(sub.diagnostics);
                     // Its pages are answered by it, apart from the program's service worker, which
                     // marks and keeps the main program's alone (FEEDBACK67.md, B.2, review; branch pwa).
-                    if let Ok(text) = std::fs::read_to_string(&full) {
+                    if let Ok(text) = crate::error::read_text(&full) {
                         for st in crate::parser::Parser::new(&text).parse_program().unwrap_or_default() {
                             if let Stmt::Route(r) = &st {
                                 if r.offline {
@@ -10761,7 +10786,9 @@ fn class_rules(order: &[Item], base: &Path) -> Vec<(String, String, u32)> {
     css_files(&base.join("public"), &mut files, 0);
     files.sort();
     for p in files {
-        if let Ok(text) = std::fs::read_to_string(&p) {
+        // A regular file of a bounded size, as a program's own file is read: a style sheet that
+        // links to `/dev/zero` took the machine's memory (FEEDBACK71.md, Q-982; branch security).
+        if let Ok(text) = crate::error::read_text(&p) {
             sheets.push((Arc::from(p.display().to_string()), 1, text));
         }
     }
@@ -10896,7 +10923,7 @@ fn unstyled_classes(order: &[Item], base: &Path, rules: &[(String, String, u32)]
     files(&base.join("public"), &mut public, 0);
     for p in public {
         let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
-        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+        let Ok(text) = crate::error::read_text(&p) else { continue };
         match ext {
             "js" | "mjs" => scripts.push_str(&text),
             "css" => elsewhere.extend(crate::styles::set_elsewhere(&text)),
@@ -11050,7 +11077,7 @@ fn unused_classes(order: &[Item], base: &Path, unparsed: &[String]) -> Vec<(Arc<
     // What the app's services send it is theirs to say: their text counts.
     for it in order {
         if let Stmt::Service(_, _, path, _, _, _) = &it.stmt {
-            if let Ok(src) = std::fs::read_to_string(base.join(path)) {
+            if let Ok(src) = crate::error::read_text(base.join(path)) {
                 words(&src, &mut written);
             }
         }
@@ -11072,7 +11099,7 @@ fn unused_classes(order: &[Item], base: &Path, unparsed: &[String]) -> Vec<(Arc<
     public.sort();
     for p in public {
         let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
-        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+        let Ok(text) = crate::error::read_text(&p) else { continue };
         match ext {
             "css" => sheets.push((Arc::from(p.display().to_string()), 1, text)),
             "js" | "mjs" => words(&text, &mut written),

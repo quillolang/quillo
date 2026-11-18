@@ -1886,7 +1886,13 @@ reader of the file does not see (a control character, a bidirectional mark, embe
 override or isolate, a zero-width space, a line separator, a tag character) anywhere in the
 block is an error at its line and column, and the program does not start with it: what the
 model reads must be what the developer sees. The zero width joiner and non-joiner, which
-emoji and Persian need, are let through. The first line names the program, cut at 24
+emoji and Persian need, are let through. The same holds for each tool: such a character in
+its `///` is an error at its line and column, a zero width joiner or non-joiner there passes
+only between two characters a reader sees, and one in a string its schemas carry (a default,
+a string type's value) is an error at the tool's line, naming where; where the program has
+tools, its file's name, which AI clients are told, follows the same rule. A zero width joiner or non-joiner
+between two letters still passes, as words in some scripts need one; it can carry about one
+hidden bit per letter, not readable text. The first line names the program, cut at 24
 characters. `quillo check` warns when the whole is over 2,000
 characters on either door (the HTTP door counted under `--service-name` when `quillo run` is
 given one), saying by how much: clients cut long instructions short. `quillo docs --mcp

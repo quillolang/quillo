@@ -305,5 +305,15 @@ fn the_cache_is_where_the_system_says() {
     cache_in("cache-home", &[("HOME", &home)], &["XDG_CACHE_HOME"]);
     assert!(crates(&home.join(".cache")).is_dir());
     cache_in("cache-tmp", &[("TMPDIR", &tmp)], &["XDG_CACHE_HOME", "HOME"]);
-    assert!(crates(&tmp).is_dir());
+    // In the temporary folder, a folder of the user's own, `quillo-<uid>`: `quillo` there was
+    // anyone's to make first (FEEDBACK71.md, Q-983; branch security).
+    #[cfg(unix)]
+    let tmp = tmp.join(format!("quillo-{}", std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&base).unwrap()))).join("native").join("crates");
+    #[cfg(not(unix))]
+    let tmp = {
+        let user: String = std::env::var("USERNAME").unwrap_or_default().chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
+        tmp.join(if user.is_empty() { "quillo".to_string() } else { format!("quillo-{}", user) }).join("native").join("crates")
+    };
+    assert!(tmp.is_dir());
+    assert!(!crates(&base.join("tmp")).exists());
 }

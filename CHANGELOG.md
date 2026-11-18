@@ -83,6 +83,16 @@
   is dropped on the elements that give it one (Q-979); `<sCript>` and `<sTyle>` in another case
   are refused where the program is read, as the browser ran them as scripts that Quillo wrote as
   any element (Q-990); the browser's `local_path` refuses C1 controls, as the server does (Q-968).
+- **Local files and tools**: a failing key table in `idempotent` answers 503 without the
+  database's words, which go to the log (FEEDBACK71.md, Q-978); a hidden character in a tool's
+  `///` or schema strings, or in a tools program's file name, is an error, and joiners pass only
+  between visible characters (Q-980); `quillo install` writes each file through a temporary file
+  of its own and refuses links (Q-981); program sources are read as regular files of at most
+  16 MiB each and 32 MiB a program, command-line pipes under `/dev` read once (`quillo run <(...)`
+  now runs; Q-982); the plugin cache's folders above it are checked as OpenSSH checks a home, each
+  of its folders is made 700 and checked itself, links and other owners are refused, folders others
+  could write in are tightened and rebuilt (never under `QUILLO_NATIVE_CACHE`, which is refused
+  instead), and cargo is found first, then run in `/` (Q-983).
 - `http.*`'s `public_only` no longer takes 64:ff9b:1::/48 (RFC 8215's local-use NAT64) as the
   public internet (found in FEEDBACK67's review).
 - `ask` and `notify` where the code surely runs on the server (a route, a `server fn`, a tick,

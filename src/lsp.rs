@@ -101,6 +101,12 @@ fn read_message(input: &mut impl BufRead) -> io::Result<Option<Option<J>>> {
 /// folder and the folders above it, nearest first. `use` paths are from
 /// the main file's folder.
 pub fn program_entry(file: &Path) -> Option<PathBuf> {
+    // What it reads of the folders around comes to `MOST_PROGRAM` at most (FEEDBACK71.md, Q-982,
+    // found in review; branch security).
+    crate::error::with_source_budget(|| entry_of(file))
+}
+
+fn entry_of(file: &Path) -> Option<PathBuf> {
     let target = file.canonicalize().ok()?;
     let mut dir = target.parent()?.to_path_buf();
     for _ in 0..4 {
@@ -132,10 +138,25 @@ fn uses_transitively(main: &Path, base: &Path, target: &Path) -> bool {
         if !seen.insert(f.clone()) || seen.len() > 500 {
             continue;
         }
-        let Ok(src) = std::fs::read_to_string(&f) else { continue };
-        let lines: Vec<&str> = src.lines().collect();
-        for n in 0..lines.len() {
-            let Some(u) = use_text(&lines, n, 0).and_then(|(l, _)| use_line(&l)) else { continue };
+        // Read as a program's file is, a regular one of a bounded size: a `.qwe` beside the one
+        // opened that links to `/dev/zero` took the machine's memory (FEEDBACK71.md, Q-982;
+        // branch security).
+        let Ok(src) = crate::error::read_source(&f) else { continue };
+        // A line at a time, with the one before and after it that a `use` over two lines needs:
+        // a list of every line took 1.4 GB for 64 MiB of line breaks (FEEDBACK71.md, Q-982, found
+        // in review; branch security).
+        let mut rest = src.lines().peekable();
+        let mut before: Option<&str> = None;
+        while let Some(this) = rest.next() {
+            let after = rest.peek().copied();
+            let prev = before.replace(this);
+            if !this.contains("use") && !crate::parser::IMPORT_WORDS.iter().any(|w| this.contains(w)) {
+                continue;
+            }
+            let window = [prev.unwrap_or(""), this, after.unwrap_or("")];
+            let from = if prev.is_some() { 0 } else { 1 };
+            let to = if after.is_some() { 3 } else { 2 };
+            let Some(u) = use_text(&window[from..to], 1 - from, 0).and_then(|(l, _)| use_line(&l)) else { continue };
             // A `.qwer` file uses no other.
             let path = crate::modules::resolve_use(base, &f, &u.path, u.implied);
             if crate::native::is_rust(&path) {
@@ -749,7 +770,7 @@ impl Server {
                 .filter(|(f, l, _)| *f == d.file && *l == d.line && (d.message.starts_with("this write (") || d.message.starts_with("these writes (")))
                 .flat_map(|(_, _, routes)| routes.iter())
                 .map(|(f, l, what)| {
-                    let text = if *f == file { text.clone() } else { std::fs::read_to_string(f).unwrap_or_default() };
+                    let text = if *f == file { text.clone() } else { crate::error::read_text(f).unwrap_or_default() };
                     json!({ "location": { "uri": path_to_uri(f), "range": diag_range(&text, *l, "") }, "message": what })
                 })
                 .collect();
@@ -778,7 +799,7 @@ impl Server {
             if theirs.as_ref().is_some_and(|t| opened.contains_key(t)) {
                 continue;
             }
-            let other = std::fs::read_to_string(&d.file).unwrap_or_default();
+            let other = crate::error::read_text(&d.file).unwrap_or_default();
             let duri = path_to_uri(&d.file);
             if duri != uri && self.docs.contains_key(&duri) {
                 continue;
@@ -848,7 +869,7 @@ impl Server {
         let rust = self.rust.clone();
         std::thread::spawn(move || loop {
             let path = uri_to_path(&uri);
-            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let text = crate::error::read_text(&path).unwrap_or_default();
             let cargo: Vec<J> = match crate::native::check(&path) {
                 Ok(notes) => notes
                     .iter()
@@ -1315,7 +1336,7 @@ impl Server {
         let text = if uri_to_path(&uri).display().to_string() == file {
             self.docs.get(&uri).map(|d| d.text.clone()).unwrap_or_default()
         } else {
-            std::fs::read_to_string(&file).unwrap_or_default()
+            crate::error::read_text(&file).unwrap_or_default()
         };
         let l = line.saturating_sub(1) as usize;
         let src = text.lines().nth(l).unwrap_or("");
@@ -1352,7 +1373,7 @@ impl Server {
     fn text_of(&self, file: &str) -> String {
         match self.docs.iter().find(|(u, _)| uri_to_path(u).display().to_string() == file) {
             Some((_, d)) => d.text.clone(),
-            None => std::fs::read_to_string(file).unwrap_or_default(),
+            None => crate::error::read_text(file).unwrap_or_default(),
         }
     }
 

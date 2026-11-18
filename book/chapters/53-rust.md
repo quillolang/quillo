@@ -115,9 +115,26 @@ How it runs:
   statement runs, all in one cargo call over a workspace, so cargo builds them side by
   side (`quillo: building ./a.rs, ./b.qwer together`); a file that fails there is built
   again alone by its `use`, which says why.
-- `use` builds the file with `cargo` (`$CARGO`, or the one on the `PATH`), in a crate of
-  its own in Quillo's cache: `QUILLO_NATIVE_CACHE`, else `$XDG_CACHE_HOME/quillo/native`,
-  else `~/.cache/quillo/native`, else the system's temporary folder. The crates' builds
+- `use` builds the file with cargo (`$CARGO`, or `cargo` found on the PATH from the program's
+  folder), in a crate of its own in Quillo's cache: `QUILLO_NATIVE_CACHE`, else
+  `$XDG_CACHE_HOME/quillo/native`, else `~/.cache/quillo/native`, else `quillo-<uid>/native` in
+  the temporary folder (`quillo-<username>` on Windows). Cargo runs whatever is in that cache,
+  so: every folder above it, up to `/`, must be root's or yours and not writable by other users
+  unless it is sticky (`/tmp`); one inside your home has its group and other write bits removed,
+  and your home itself or a folder outside it is refused, with the `chmod go-w` to run. Each
+  cache folder (the cache's own, `native`, `crates` and each crate, `target`, `workspaces` and
+  each workspace) is made for you alone (700); a link or a folder another user owns is refused,
+  `~/.cache/quillo` as a link too (set `QUILLO_NATIVE_CACHE` to the real folder instead: that
+  one may itself be a link). Under HOME, XDG or the temporary folder, a folder of yours that
+  others could read or write is made 700, and if others could write in it, its crates, builds and
+  workspaces are removed and built again once; under `QUILLO_NATIVE_CACHE` nothing is changed,
+  and a folder others could write in is refused. On a filesystem without permissions (exFAT,
+  DrvFs) nothing is removed, and Quillo says once that the cache is not private there. A crate's
+  manifest says `build = false`, and cargo runs in `/` (your profile folder on Windows), so the
+  program's own `.cargo/config.toml` and `rust-toolchain.toml` do not apply to its plugins'
+  builds: settings for them go in `$CARGO_HOME/config.toml` or rustup's default. On Windows no
+  ACL is checked, and a service running as SYSTEM gets `C:\Windows\Temp\quillo-MACHINE$`,
+  whose owner nothing checks. The crates' builds
   are shared there, and nothing old is removed (it grows: clear it now and then). The
   library is kept in `.quillo/native/` next to the file, named by the file's whole name
   (so `x.rs` and `x.qwer` side by side keep one each), the glue's version, and a hash of
@@ -199,8 +216,10 @@ quillo install --list pdf          # what the catalog has, matching "pdf"
 
 - It reads the catalog (`https://quillolang.org/plugins/index.json`; [`--registry`](#other-commands) or
   `QUILLO_REGISTRY` for another), downloads each file, and writes it only when its
-  SHA-256 and the `//! version:` line of its header match the catalog's. A plugin
-  that fails leaves the others going, and the exit status is 1.
+  SHA-256 and the `//! version:` line of its header match the catalog's. Each file is
+  written to a new temporary file of its own beside it, then renamed into place; a plugin or
+  example file that is a symbolic link is neither read nor written. A plugin that fails
+  leaves the others going, and the exit status is 1.
 - A file already there is left alone when it is the same, replaced when the catalog's
   version is newer, and kept when it is newer or the same version changed by hand:
   [`--force`](#other-commands) replaces it. [`--dir DIR`](#other-commands) installs elsewhere. `name@1.2.0` asks for that

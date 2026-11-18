@@ -44,7 +44,9 @@ pub fn of_source(path: &Path) -> Result<J, QuilloError> {
     let mut seen = Vec::new();
     // Its `use`s from the folder of the file a link leads to (FEEDBACK55.md, Q-817; branch feedback55).
     let base = crate::modules::source_dir_or(path, path.parent().unwrap_or(Path::new(".")));
-    collect_file(path, &base, "", &mut parts, &mut seen, 0)?;
+    // Its sources read to `MOST_PROGRAM` together (FEEDBACK71.md, Q-982, found in review; branch
+    // security).
+    crate::error::with_source_budget(|| collect_file(path, &base, "", &mut parts, &mut seen, 0))?;
     let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     Ok(parts.document(&title))
 }

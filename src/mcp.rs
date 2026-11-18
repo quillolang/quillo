@@ -923,6 +923,124 @@ pub fn unseen_in_block(src: &str) -> Option<(u32, String)> {
     None
 }
 
+/// Each of the program's own tools whose description or schemas hold a character of `unseen`:
+/// its file, line and the message `quillo check` gives, an error, as for the `//!` block. A
+/// tool's `///` is its description, sent to the model word for word, and tag characters there
+/// carry text a model reads and a review shows as nothing; a string default or a string type's
+/// value in its schemas is read the same way. A character in the `///` is said at its line and
+/// column, found in the file's text (`text_of`, asked only then); one in a schema at the tool's
+/// line, with where it is (FEEDBACK71.md, Q-980; branch security). The tools of a service it
+/// offers are said by the service's own check.
+pub fn unseen_in_tools(a: &Analysis, text_of: &dyn Fn(&str) -> Option<String>) -> Vec<(String, u32, String)> {
+    let mut out = Vec::new();
+    let mut types: Option<HashMap<String, Types>> = None;
+    for f in &a.tools {
+        let d = &f.def;
+        if let Some(c) = d.doc.as_deref().and_then(|doc| doc.split('\n').find_map(hidden_at)).map(|(_, c)| c) {
+            let (line, column, c) = text_of(&f.file).and_then(|t| unseen_in_doc(&as_lexed(&t), d.line)).unwrap_or((d.line, 0, c));
+            let at = if column > 0 { format!("column {}: ", column) } else { String::new() };
+            out.push((f.file.clone(), line, format!("{}the `///` comment of tool `{}` is what AI clients are told of it, and this holds {}: take it out", at, d.name, hidden_what(c))));
+        }
+        let types = types.get_or_insert_with(|| HashMap::from([(String::new(), a.types.clone())]));
+        let t = tool(f, types);
+        let mut found = None;
+        unseen_in_json(&t.input_schema, "inputSchema", &mut found);
+        if let Some(o) = &t.output_schema {
+            unseen_in_json(o, "outputSchema", &mut found);
+        }
+        if let Some((at, c)) = found {
+            out.push((f.file.clone(), d.line, format!("the schema of tool `{}` is what AI clients are told of its arguments and result, and {} holds {}: take it out", d.name, at, hidden_what(c))));
+        }
+    }
+    out
+}
+
+/// The first character of `text` a reader does not see: one of `unseen`, or a zero width joiner
+/// or non-joiner that does not stand between two characters a reader sees (at either end, beside
+/// a space or another such character), where a run of them hid text as well as tag characters do
+/// (FEEDBACK71.md, Q-980, found in review; branch security). Its byte offset and the character.
+pub fn hidden_at(text: &str) -> Option<(usize, char)> {
+    let joiner = |c: char| matches!(c as u32, 0x200C | 0x200D);
+    let seen = |c: Option<char>| c.is_some_and(|c| !c.is_whitespace() && !unseen(c) && !joiner(c));
+    let mut before = None;
+    let mut rest = text.char_indices().peekable();
+    while let Some((at, c)) = rest.next() {
+        if unseen(c) || (joiner(c) && !(seen(before) && seen(rest.peek().map(|(_, n)| *n)))) {
+            return Some((at, c));
+        }
+        before = Some(c);
+    }
+    None
+}
+
+/// How a message names a character `hidden_at` found, and why it is one.
+fn hidden_what(c: char) -> String {
+    let why = if matches!(c as u32, 0x200C | 0x200D) { "not between two characters a reader sees" } else { "which a reader of the file does not see" };
+    format!("U+{:04X} ({}), {}", c as u32, unseen_name(c), why)
+}
+
+/// What `quillo check` says of a program file whose name holds a character a reader does not
+/// see: its name is the program's to AI clients (`serverInfo`, the first line of `instructions`),
+/// so it is held to the `//!` block's rule (FEEDBACK71.md, Q-980, found in review; branch
+/// security).
+pub fn unseen_in_name(file: &str) -> Option<String> {
+    let name = Path::new(file).file_stem()?.to_string_lossy().into_owned();
+    let (_, c) = hidden_at(&name)?;
+    Some(format!("the file's name is the program's name AI clients are told (`serverInfo`, `instructions`), and it holds {}: rename the file", hidden_what(c)))
+}
+
+/// The first character of `unseen` in the `///` lines right above line `line` of `src` (as the
+/// lexer reads it), a `//` line among them passed over as `Lexer::doc_above` does: its line, its
+/// column (from 1, in characters) and the character.
+fn unseen_in_doc(src: &str, line: u32) -> Option<(u32, usize, char)> {
+    let lines: Vec<&str> = src.split('\n').collect();
+    let mut first = None;
+    let mut n = line as usize;
+    while n > 1 {
+        n -= 1;
+        let text = lines.get(n - 1)?;
+        let body = text.trim_start_matches([' ', '\t']);
+        if !body.starts_with("//") {
+            break;
+        }
+        if !body.starts_with("///") || body.starts_with("////") {
+            continue;
+        }
+        let start = text.len() - body.len() + 3;
+        if let Some((at, c)) = hidden_at(&text[start..]) {
+            first = Some((n as u32, text[..start + at].chars().count() + 1, c));
+        }
+    }
+    first
+}
+
+/// The first character of `unseen` in a schema's keys and strings, and where: `inputSchema`'s
+/// `/properties/mode/default`.
+fn unseen_in_json(j: &J, at: &str, found: &mut Option<(String, char)>) {
+    if found.is_some() {
+        return;
+    }
+    let first = |s: &str| hidden_at(s).map(|(_, c)| c);
+    match j {
+        J::String(s) => *found = first(s).map(|c| (format!("`{}`", at), c)),
+        J::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                unseen_in_json(v, &format!("{}/{}", at, i), found);
+            }
+        }
+        J::Object(m) => {
+            for (k, v) in m {
+                if let Some(c) = first(k) {
+                    *found = Some((format!("a key in `{}`", at), c));
+                    return;
+                }
+                unseen_in_json(v, &format!("{}/{}", at, k), found);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The name the HTTP door serves the program in `path` under: `--service-name`'s, else its file's.
 pub fn served_name(path: &Path) -> String {
     crate::service::served_as().filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| stem(path))

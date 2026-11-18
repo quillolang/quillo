@@ -997,7 +997,9 @@ curl -i localhost:8080/_quillo/rpc/transfer -H "Idempotency-Key: k-77" --json '[
   cannot be kept. Answers are kept 24 hours, then the key is new again: `{ max_age:
   "7d" }` (seconds, or a duration as for cookies, up to 366 days) keeps them longer.
   Expired ones are deleted as requests come. When the database that keeps them cannot
-  be reached, the request is answered 503.
+  be reached, the request is answered 503 with `{"error": "could not record the
+  Idempotency-Key"}` (or `could not read`); the database's message goes to the log, and to
+  the answer only under `--watch`.
 - A key runs at most once, whoever asks, within the tenant and the mount point. Who may
   see its answer is compared at the strongest level both sides have: the `user` option
   (a str or an int, as `{ user: token.owner }`), then the session (a hidden id its cookie

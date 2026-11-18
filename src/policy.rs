@@ -129,12 +129,19 @@ pub fn load(main: &Path, extra: &[PathBuf]) -> Result<Policy, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("cannot read the policy {}: {}", host.display(), e)),
     }
+    // A `--policy` is the person's to name: `--policy <(cat p.toml)` is read (FEEDBACK71.md, Q-982,
+    // found in review; branch security).
+    for f in extra {
+        crate::error::name_file(f);
+    }
     files.extend(extra.iter().cloned());
     if program.is_file() {
         files.push(program);
     }
     for f in files {
-        let text = std::fs::read_to_string(&f).map_err(|e| format!("cannot read the policy {}: {}", f.display(), e))?;
+        // A regular file of a bounded size: `quillo check` reads a cloned repository's (FEEDBACK71.md,
+        // Q-982; branch security).
+        let text = crate::error::read_text(&f).map_err(|e| format!("cannot read the policy {}: {}", f.display(), e))?;
         p.add(&f, &text)?;
     }
     Ok(p)

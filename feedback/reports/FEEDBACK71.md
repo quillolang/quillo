@@ -756,6 +756,21 @@ Found in the review of Q-969's fix (branch security, 2026-11-18). Severity: medi
 | Requests | One |
 | Security | Cross-site scripting through a program that wrote the tag in another case |
 
+### Q-991. A large `public/*.css` makes `quillo check` and the language server take tens of seconds
+
+Found in the review of Q-982's fix (branch security, 2026-11-18). Severity: low. Status: OPEN (in 0.8.6 too). Code: check.rs's reading of a program's `public/` style sheets.
+
+A 1 MiB `public/*.css` makes `quillo check` take 29 s, and 2 MiB or more past 50 s; the language server is slowed the same way. A cloned repository can hold such a file, so opening it in an editor stalls.
+
+| Impact | |
+|---|---|
+| Functionality | None to the program; checking and editing it stall |
+| User | A developer's `check` and editor wait tens of seconds |
+| Requests | None (check and editor only) |
+| Security | A slowdown a cloned repository can cause; bounded by the 64 MiB read limit (Q-982) |
+
+Proposed fix: find the time (a quadratic scan of the sheet's rules is likely) and make it linear, or bound the part of a sheet `check` looks at.
+
 ## Checked and sound, and not covered, by group
 
 What each auditor tried that held, and what it did not get to, as it wrote them.

@@ -314,6 +314,9 @@ fn program_and_flags(args: &[String]) -> Result<(String, Vec<String>), String> {
         "css" | "js" | "mjs" | "json" | "txt" | "xml" | "csv" | "svg" => return Err(format!("{} is not a Quillo program (a .qwe file): serve it with `file(\"{}\")` in a route, or its folder with `quillo serve {}`", named, named, folder)),
         _ => {}
     }
+    // The file the person named may be a pipe or a device of theirs, under /dev or /proc: read,
+    // to the size a source may have (FEEDBACK71.md, Q-982; branch security).
+    quillo::error::name_file(Path::new(&named));
     Ok((named, flags))
 }
 

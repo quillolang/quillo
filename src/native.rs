@@ -983,30 +983,346 @@ fn manifest(crate_name: &str, deps: &str) -> String {
     format!("{}[profile.release]\npanic = \"unwind\"\n\n[workspace]\n", package(crate_name, deps, "lib.rs"))
 }
 
-/// A crate's package, library and dependencies; `lib`: where its code is.
+/// A crate's package, library and dependencies; `lib`: where its code is. `build = false`: cargo
+/// runs a `build.rs` it finds beside the manifest, and Quillo writes none (FEEDBACK71.md, Q-983;
+/// branch security).
 fn package(crate_name: &str, deps: &str, lib: &str) -> String {
     let mut deps = deps.to_string();
     if !deps.lines().any(|l| l.trim_start().starts_with("serde_json")) {
         deps.push_str("serde_json = \"1\"\n");
     }
     format!(
-        "[package]\nname = \"{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\ncrate-type = [\"cdylib\"]\npath = {:?}\n\n[dependencies]\n{}\n",
+        "[package]\nname = \"{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\nbuild = false\n\n[lib]\ncrate-type = [\"cdylib\"]\npath = {:?}\n\n[dependencies]\n{}\n",
         crate_name, lib, deps
     )
 }
 
 // ---- building ---------------------------------------------------------------------
 
-/// Quillo's cache: the crates it makes, and their shared build directory.
-fn cache_dir() -> PathBuf {
+/// Quillo's cache: the crates it makes, and their shared build directory. Cargo runs what it
+/// finds there, so no other user may write in any folder of it, nor rename a folder above it
+/// (FEEDBACK71.md, Q-983; branch security):
+///
+/// - Every folder above the cache, to `/`, is root's or the user's, and no other user may write
+///   in it unless it is sticky (`/tmp`), as OpenSSH asks of a home (`safe_above`): another account
+///   that could write in `~/.cache` could rename `~/.cache/quillo` and put a link there between the
+///   checks and the build. One inside HOME that the user owns has those write bits taken off;
+///   HOME itself, or a folder outside it, is refused. This comes before anything is changed.
+/// - Each folder Quillo names, from the cache's own (`quillo`, or `QUILLO_NATIVE_CACHE`'s) to a
+///   crate's, the build's and a workspace's, is made for its user alone (0700), and is asked of
+///   itself, not of where a link leads (`cache_folder`): a link is refused, as `crates/<name>`
+///   leading to another folder had its files deleted and the crate written there; so is a folder
+///   another user owns. `QUILLO_NATIVE_CACHE` itself may be a link the person made.
+/// - Under HOME, XDG_CACHE_HOME or the temporary folder, one the user owns that others could
+///   write in (a umask of 002; on macOS every account's group is `staff`) is made 0700 by Quillo,
+///   and what another user may have put in it is taken away: the crates, the build and the
+///   workspaces, built again once. Under `QUILLO_NATIVE_CACHE`, which may hold the person's own
+///   files, nothing is changed: such a folder is refused, with the `chmod` that makes it safe.
+/// - On a filesystem that keeps no permissions (exFAT, DrvFs), where a folder stays 0777 after
+///   it is made 0700, nothing is taken away, which every build would otherwise do; it is said
+///   once.
+/// - Where neither XDG_CACHE_HOME nor HOME is set (a system service, a cleaned CGI environment), it
+///   was `quillo/native` in the temporary folder, `/tmp` on Linux, which any local user could make
+///   first with a `build.rs` in it; it is now `quillo-<uid>` there, and one that cannot be made is
+///   refused at once, as a link there could lead somewhere by the time it is used.
+/// - On Windows the folder in the temporary folder is named for the user, `quillo-<username>`: a
+///   service running as SYSTEM or LocalService has `C:\Windows\Temp`, which other accounts share.
+///   Its permissions are ACLs, which nothing here asks: SYSTEM's name there is `MACHINE$`, and the
+///   folder's owner is not checked.
+fn cache_dir() -> Result<Cache, String> {
+    let absolute = |p: PathBuf| std::path::absolute(&p).unwrap_or(p);
     if let Ok(d) = std::env::var("QUILLO_NATIVE_CACHE") {
-        return PathBuf::from(d);
+        let d = absolute(PathBuf::from(d));
+        safe_above(&d)?;
+        cache_folder(&d, true, Kind::Named)?;
+        return Ok(Cache { native: d, kind: Kind::UnderNamed });
     }
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("quillo").join("native")
+    let base = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")));
+    let (root, kind) = match base {
+        Some(b) => (absolute(b.join("quillo")), Kind::Home),
+        None => (absolute(std::env::temp_dir().join(temp_name())), Kind::Shared),
+    };
+    safe_above(&root)?;
+    let opened = cache_folder(&root, true, kind)? == Made::Opened;
+    let native = root.join("native");
+    if cache_folder(&native, false, kind)? == Made::Opened || opened {
+        empty_builds(&native)?;
+    }
+    Ok(Cache { native, kind: Kind::Home })
+}
+
+/// The cache's `native` folder, and how the folders under it are taken (`Kind::Home`, or
+/// `Kind::UnderNamed` under `QUILLO_NATIVE_CACHE`).
+struct Cache {
+    native: PathBuf,
+    kind: Kind,
+}
+
+/// The cache's folder in the temporary folder: the user's own by name.
+fn temp_name() -> String {
+    #[cfg(unix)]
+    return format!("quillo-{}", unsafe { libc::geteuid() });
+    #[cfg(not(unix))]
+    {
+        let user: String = std::env::var("USERNAME").unwrap_or_default().chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
+        if user.is_empty() { "quillo".to_string() } else { format!("quillo-{}", user) }
+    }
+}
+
+/// The folder `parts` under the cache, each folder on the way taken as `cache_folder` takes it,
+/// and emptied when others could write in it. One that cannot be made is said, as before, by the
+/// last: `cannot make <it>: <why>`.
+fn cache_sub(cache: &Cache, parts: &[&str]) -> Result<PathBuf, String> {
+    let mut p = cache.native.clone();
+    let mut last = Made::Fine;
+    for part in parts {
+        p.push(part);
+        last = cache_folder(&p, false, cache.kind)?;
+        if last == Made::Opened {
+            empty_folder(&p)?;
+        }
+    }
+    match last {
+        Made::NotMade(why) => Err(format!("cannot make {}: {}", p.display(), why)),
+        _ => Ok(p),
+    }
+}
+
+/// Where a folder of the cache is: named by the person (`QUILLO_NATIVE_CACHE`, which may be a
+/// link of theirs) or under it, in their home, or in a temporary folder other users share.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Named,
+    UnderNamed,
+    Home,
+    Shared,
+}
+
+/// What `cache_folder` found.
+#[derive(PartialEq)]
+enum Made {
+    /// Made now, or there and the user's alone (or on a filesystem that keeps no permissions).
+    Fine,
+    /// There, and others could write in it: now the user's alone, and to be emptied.
+    Opened,
+    /// Not made, and why: said by what is made in it next (in a shared folder, refused at once).
+    NotMade(String),
+}
+
+/// Checks the folders above the cache folder `root`, to `/`, the way OpenSSH's StrictModes checks
+/// a home: each by the path given and by the real one a link leads to, root's or the user's, and
+/// writable by no one else unless sticky. One inside HOME (HOME itself not) that the user owns has
+/// the group's and others' write bits taken off; any other is refused (FEEDBACK71.md, Q-983, found
+/// in review; branch security).
+#[cfg(unix)]
+fn safe_above(root: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let me = unsafe { libc::geteuid() };
+    let home = std::env::var_os("HOME").and_then(|h| Path::new(&h).canonicalize().ok());
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut add = |from: Option<&Path>| {
+        for d in from.into_iter().flat_map(Path::ancestors) {
+            if !d.as_os_str().is_empty() && !dirs.iter().any(|x| x == d) {
+                dirs.push(d.to_path_buf());
+            }
+        }
+    };
+    let parent = root.parent();
+    // Each entry of the path as given, the cache's own among them, asked without following it: a
+    // link there is its owner's to point elsewhere after this check, so one another user owns
+    // (made first in a sticky `/tmp`, say) is refused, whatever it leads to now (FEEDBACK71.md,
+    // Q-983, found in review; branch security).
+    for entry in root.ancestors().filter(|e| !e.as_os_str().is_empty()) {
+        if let Ok(m) = std::fs::symlink_metadata(entry) {
+            if m.file_type().is_symlink() {
+                link_on_the_way(entry, m.uid(), me)?;
+            }
+        }
+    }
+    add(parent);
+    add(parent.and_then(|p| p.canonicalize().ok()).as_deref());
+    add(root.canonicalize().ok().as_deref().and_then(Path::parent));
+    for d in dirs {
+        // Not there yet: made by Quillo, for the user alone.
+        let Ok(meta) = std::fs::metadata(&d) else { continue };
+        if meta.uid() != 0 && meta.uid() != me {
+            return Err(format!("{}, above the plugin cache, belongs to another user (uid {}): nothing is built there; set QUILLO_NATIVE_CACHE to a folder of your own", d.display(), meta.uid()));
+        }
+        let mode = meta.mode() & 0o7777;
+        if mode & 0o022 == 0 || mode & 0o1000 != 0 {
+            continue;
+        }
+        let real = d.canonicalize().unwrap_or_else(|_| d.clone());
+        let inside_home = home.as_ref().is_some_and(|h| real != *h && real.starts_with(h));
+        if !(inside_home && meta.uid() == me) {
+            return Err(format!("{}, above the plugin cache, can be written by other users (mode {:o}), who could put a folder of theirs in the cache's place: nothing is built there; `chmod go-w {}` makes it safe", d.display(), mode & 0o777, d.display()));
+        }
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode & !0o022)).map_err(|e| format!("{}, above the plugin cache, can be written by other users (mode {:o}) and cannot be changed ({}): nothing is built there", d.display(), mode & 0o777, e))?;
+        if std::fs::metadata(&d).is_ok_and(|m| m.mode() & 0o022 != 0) {
+            no_permissions(&d);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn safe_above(_root: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// Whether a link at `entry` on the way to the cache, owned by `owner`, may be taken: only one
+/// root or the user (`me`) owns, as no one else can point it elsewhere then.
+#[cfg(any(unix, test))]
+fn link_on_the_way(entry: &Path, owner: u32, me: u32) -> Result<(), String> {
+    if owner == 0 || owner == me {
+        return Ok(());
+    }
+    let to = std::fs::read_link(entry).map(|t| format!(", `{}`", t.display())).unwrap_or_default();
+    Err(format!("{}, on the way to the plugin cache, is a link another user owns (uid {}), who could point it elsewhere: nothing is built there; name the folder it leads to{} instead, or set QUILLO_NATIVE_CACHE to a folder of your own", entry.display(), owner, to))
+}
+
+/// Says once that the cache is on a filesystem that keeps no permissions.
+fn no_permissions(dir: &Path) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("quillo: the cache is on a filesystem without permissions: {} stays writable by every user whatever is asked of it, so what is built there is no more private than that filesystem; set QUILLO_NATIVE_CACHE to a folder on another", dir.display());
+    }
+}
+
+/// Makes `dir` for its user alone (0700, the folders above it too with `parents`), or takes it
+/// when it is there: refused when it is a link (but a `Named` one), not a folder, or another
+/// user's. One that others could write in is made the user's alone (`Made::Opened`), but under
+/// `QUILLO_NATIVE_CACHE`, where it is refused. Asked of the folder itself, so a link is never
+/// followed into.
+#[cfg(unix)]
+fn cache_folder(dir: &Path, parents: bool, kind: Kind) -> Result<Made, String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let refuse = |why: String, then: &str| Err(format!("the plugin cache {} {}: nothing is built there{}", dir.display(), why, then));
+    if let Err(e) = std::fs::DirBuilder::new().recursive(parents).mode(0o700).create(dir) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return if kind == Kind::Shared { refuse(format!("cannot be made ({})", e), "") } else { Ok(Made::NotMade(e.to_string())) };
+        }
+    }
+    let meta = match if kind == Kind::Named { std::fs::metadata(dir) } else { std::fs::symlink_metadata(dir) } {
+        Ok(m) => m,
+        Err(e) if kind == Kind::Shared => return refuse(format!("cannot be read ({})", e), ""),
+        Err(e) => return Ok(Made::NotMade(e.to_string())),
+    };
+    if meta.file_type().is_symlink() {
+        // The cache's own folder in HOME, a link the person made: QUILLO_NATIVE_CACHE says where
+        // it is instead.
+        if kind == Kind::Home && parents {
+            let to = std::fs::read_link(dir).map(|t| format!(" ({})", t.display())).unwrap_or_default();
+            return refuse("is a link".into(), &format!("; set QUILLO_NATIVE_CACHE to the folder it leads to{} instead", to));
+        }
+        return refuse("is a link".into(), "; remove it, and a folder of your own is made");
+    }
+    if !meta.is_dir() {
+        return refuse("is not a folder".into(), "");
+    }
+    let me = unsafe { libc::geteuid() };
+    if meta.uid() != me {
+        return refuse(format!("belongs to another user (uid {}, this is {})", meta.uid(), me), "; set QUILLO_NATIVE_CACHE to a folder of your own");
+    }
+    let mode = meta.mode() & 0o777;
+    if matches!(kind, Kind::Named | Kind::UnderNamed) {
+        // The person's folder: what is in it is theirs, so nothing is changed or taken away.
+        return if mode & 0o022 != 0 {
+            refuse(format!("can be written by other users (mode {:o})", mode), &format!("; `chmod go-w {}` makes it yours alone", dir.display()))
+        } else {
+            Ok(Made::Fine)
+        };
+    }
+    if mode & 0o077 == 0 {
+        return Ok(Made::Fine);
+    }
+    // Its own, so the user may: no one else reads or enters it from now on.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| format!("the plugin cache {} can be written by other users (mode {:o}) and cannot be made yours alone ({}): nothing is built there", dir.display(), mode, e))?;
+    // A filesystem that keeps no permissions says the same after: nothing to take away, as
+    // nothing would ever stay away.
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.mode() & 0o077 != 0) {
+        no_permissions(dir);
+        return Ok(Made::Fine);
+    }
+    Ok(if mode & 0o022 != 0 { Made::Opened } else { Made::Fine })
+}
+
+#[cfg(not(unix))]
+fn cache_folder(dir: &Path, parents: bool, _kind: Kind) -> Result<Made, String> {
+    let made = if parents { std::fs::create_dir_all(dir) } else { std::fs::create_dir(dir) };
+    match made {
+        Err(e) if !dir.is_dir() => Ok(Made::NotMade(e.to_string())),
+        _ => Ok(Made::Fine),
+    }
+}
+
+/// Takes away the cache's crates, builds and workspaces under `native`, a folder others could
+/// write in: built again once. Nothing else there is touched.
+fn empty_builds(native: &Path) -> Result<(), String> {
+    for name in ["crates", "target", "check-target", "workspaces"] {
+        let p = native.join(name);
+        let gone = match std::fs::symlink_metadata(&p) {
+            Ok(m) if m.is_dir() => std::fs::remove_dir_all(&p),
+            Ok(_) => std::fs::remove_file(&p),
+            Err(_) => continue,
+        };
+        gone.map_err(|err| format!("cannot remove {}, which another user could have written: {}", p.display(), err))?;
+    }
+    Ok(())
+}
+
+/// Takes away all that is in `dir`, a link as a link: what another user may have put there.
+fn empty_folder(dir: &Path) -> Result<(), String> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Ok(()) };
+    for e in rd.flatten() {
+        let p = e.path();
+        let gone = if e.file_type().is_ok_and(|k| k.is_dir()) { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+        gone.map_err(|err| format!("cannot remove {}, which another user could have written: {}", p.display(), err))?;
+    }
+    Ok(())
+}
+
+/// The cargo to run, as a whole path, since cargo runs elsewhere (`cargo_dir`): `$CARGO`, or
+/// `cargo`, a bare name found on the PATH as it reads from this folder, a relative entry of it
+/// among them (FEEDBACK71.md, Q-983, found in review; branch security). One not found is left
+/// bare, for the start to say so.
+fn cargo_program() -> PathBuf {
+    let given = std::env::var_os("CARGO").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("cargo"));
+    if given.components().count() > 1 {
+        return std::path::absolute(&given).unwrap_or(given);
+    }
+    let names: Vec<PathBuf> = if cfg!(windows) && given.extension().is_none() { vec![given.with_extension("exe"), given.clone()] } else { vec![given.clone()] };
+    for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        let dir = if dir.as_os_str().is_empty() { PathBuf::from(".") } else { dir };
+        for n in &names {
+            let p = dir.join(n);
+            if runnable(&p) {
+                return std::path::absolute(&p).unwrap_or(p);
+            }
+        }
+    }
+    given
+}
+
+/// Whether `p` is a file this user may run.
+fn runnable(p: &Path) -> bool {
+    #[cfg(unix)]
+    return std::fs::metadata(p).is_ok_and(|m| m.is_file() && std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o111 != 0);
+    #[cfg(not(unix))]
+    return p.is_file();
+}
+
+/// Where cargo runs: a folder no other user may write in. Cargo reads `.cargo/config.toml`, and
+/// rustup `rust-toolchain.toml`, from the folder it runs in and every folder above it, and a
+/// program in `/tmp` had `/tmp/.cargo/config.toml`, anyone's, read for its build (FEEDBACK71.md,
+/// Q-983, found in review; branch security). So a program's own `.cargo/config.toml` and
+/// `rust-toolchain.toml` no longer reach its plugins' builds either. `/` is root's; on Windows,
+/// the user's profile.
+fn cargo_dir() -> PathBuf {
+    #[cfg(unix)]
+    return PathBuf::from("/");
+    #[cfg(not(unix))]
+    return std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
 }
 
 fn stem(qwer: &Path) -> String {
@@ -1055,11 +1371,24 @@ fn hex_hash(parts: &[&[u8]]) -> String {
 /// name and folder.
 fn prepare(abs: &Path, parsed: &Parsed) -> Result<(String, PathBuf), String> {
     let crate_name = format!("quillo_{}_{}", stem(abs), &hex_hash(&[abs.display().to_string().as_bytes()])[..8]);
-    let dir = cache_dir().join("crates").join(&crate_name);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot make {}: {}", dir.display(), e))?;
+    let dir = cache_sub(&cache_dir()?, &["crates", &crate_name])?;
+    // Only what is written here, and cargo's lock, stay in the crate's folder: a `build.rs`, a
+    // `src/`, a link, anything else found there was put there by someone else (FEEDBACK71.md,
+    // Q-983; branch security).
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let kind = e.file_type().ok();
+            let ours = matches!(e.file_name().to_str(), Some("Cargo.toml" | "lib.rs" | "Cargo.lock")) && kind.is_some_and(|k| k.is_file());
+            if !ours {
+                let p = e.path();
+                let gone = if kind.is_some_and(|k| k.is_dir()) { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+                gone.map_err(|err| format!("cannot remove {}, which Quillo did not write: {}", p.display(), err))?;
+            }
+        }
+    }
     let write = |f: &str, text: String| {
         // Unchanged files are left alone, so cargo has nothing to redo.
-        if std::fs::read_to_string(dir.join(f)).ok().as_deref() != Some(text.as_str()) {
+        if crate::error::read_text(dir.join(f)).ok().as_deref() != Some(text.as_str()) {
             std::fs::write(dir.join(f), text).map_err(|e| e.to_string())
         } else {
             Ok(())
@@ -1084,15 +1413,17 @@ pub struct Note {
 }
 
 pub fn check(qwer: &Path) -> Result<Vec<Note>, String> {
-    let src = std::fs::read_to_string(qwer).map_err(|e| format!("cannot read {}: {}", qwer.display(), e))?;
+    // Read as the program's files are, for the editor (FEEDBACK71.md, Q-982; branch security).
+    let src = crate::error::read_text(qwer).map_err(|e| format!("cannot read {}: {}", qwer.display(), e))?;
     let parsed = parse(&src);
     let abs = qwer.canonicalize().unwrap_or_else(|_| qwer.to_path_buf());
     let (_, dir) = prepare(&abs, &parsed)?;
-    let out = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+    let out = std::process::Command::new(cargo_program())
+        .current_dir(cargo_dir())
         .args(["check", "--message-format=json", "--manifest-path"])
         .arg(dir.join("Cargo.toml"))
         .arg("--target-dir")
-        .arg(cache_dir().join("check-target"))
+        .arg(cache_sub(&cache_dir()?, &["check-target"])?)
         .output()
         .map_err(|e| format!("cargo did not run ({}): install Rust (https://rustup.rs) for its errors here", e))?;
     let mut notes = Vec::new();
@@ -1246,7 +1577,7 @@ pub fn prebuild(files: &[PathBuf]) {
         if plugin_allowed(f).is_err() {
             continue;
         }
-        let Ok(src) = std::fs::read_to_string(f) else { continue };
+        let Ok(src) = crate::error::read_text(f) else { continue };
         let lib = lib_path(f, &src);
         if !lib.is_file() || (has_lock(&lib) && not_as_built(&lib).is_some()) {
             todo.push((f.clone(), src));
@@ -1266,11 +1597,13 @@ pub fn prebuild(files: &[PathBuf]) {
         }
     }
     let names: Vec<&str> = members.iter().map(|(_, n, ..)| n.as_str()).collect();
-    let ws = cache_dir().join("workspaces").join(hex_hash(&names.iter().map(|n| n.as_bytes()).collect::<Vec<_>>()));
+    let Ok(cache) = cache_dir() else { return };
+    let hash = hex_hash(&names.iter().map(|n| n.as_bytes()).collect::<Vec<_>>());
+    let Ok(ws) = cache_sub(&cache, &["workspaces", &hash]) else { return };
     for (_, name, dir, deps) in &members {
-        let m = ws.join("m").join(name);
+        let Ok(m) = cache_sub(&cache, &["workspaces", &hash, "m", name]) else { return };
         let text = package(name, deps, &dir.join("lib.rs").to_string_lossy());
-        if std::fs::create_dir_all(&m).is_err() || std::fs::write(m.join("Cargo.toml"), text).is_err() {
+        if std::fs::write(m.join("Cargo.toml"), text).is_err() {
             return;
         }
     }
@@ -1280,8 +1613,9 @@ pub fn prebuild(files: &[PathBuf]) {
         return;
     }
     eprintln!("quillo: building {} together", members.iter().map(|(f, ..)| f.display().to_string()).collect::<Vec<_>>().join(", "));
-    let target = cache_dir().join("target");
-    let ok = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+    let Ok(target) = cache_sub(&cache, &["target"]) else { return };
+    let ok = std::process::Command::new(cargo_program())
+        .current_dir(cargo_dir())
         .args(["build", "--release", "--message-format=short", "--manifest-path"])
         .arg(ws.join("Cargo.toml"))
         .arg("--target-dir")
@@ -1369,9 +1703,10 @@ pub fn build(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
         return Err(format!("{} is not built, and --no-build says not to build it here: build it with `quillo build` and bring .quillo along", qwer.display()));
     }
     let (crate_name, dir) = prepare(&abs, &parsed)?;
-    let target = cache_dir().join("target");
+    let target = cache_sub(&cache_dir()?, &["target"])?;
     eprintln!("quillo: building {}", qwer.display());
-    let out = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+    let out = std::process::Command::new(cargo_program())
+        .current_dir(cargo_dir())
         .args(["build", "--release", "--message-format=short", "--manifest-path"])
         .arg(dir.join("Cargo.toml"))
         .arg("--target-dir")
@@ -1463,7 +1798,8 @@ pub fn plugin_allowed(qwer: &Path) -> Result<(), String> {
     if p.plugins.is_empty() {
         return Ok(());
     }
-    let version = std::fs::read_to_string(qwer).ok().and_then(|t| crate::install::header_version(&t));
+    // `quillo check` asks this of a cloned repository's file (FEEDBACK71.md, Q-982; branch security).
+    let version = crate::error::read_text(qwer).ok().and_then(|t| crate::install::header_version(&t));
     p.plugin(&stem(qwer), version.as_deref())
 }
 
@@ -1800,6 +2136,27 @@ pub fn walk_program(main: &Path, visit: &mut dyn FnMut(&Path, &[crate::ast::Stmt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FEEDBACK71.md, Q-983 (branch security): a link on the way to the cache is taken only when
+    /// root or the user owns it, whatever it leads to; one another user owns is refused, naming
+    /// where it leads. A link of another user's cannot be made without root, so its owner is given
+    /// to the check here, as `safe_above` gives it from `symlink_metadata`.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_another_user_owns_on_the_way_to_the_cache_is_refused() {
+        let d = std::env::temp_dir().join(format!("quillo-native-link-owner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("real")).unwrap();
+        let link = d.join("link");
+        std::os::unix::fs::symlink(d.join("real"), &link).unwrap();
+        assert!(link_on_the_way(&link, 0, 501).is_ok());
+        assert!(link_on_the_way(&link, 501, 501).is_ok());
+        assert_eq!(
+            link_on_the_way(&link, 12345, 501).unwrap_err(),
+            format!("{}, on the way to the plugin cache, is a link another user owns (uid 12345), who could point it elsewhere: nothing is built there; name the folder it leads to, `{}` instead, or set QUILLO_NATIVE_CACHE to a folder of your own", link.display(), d.join("real").display())
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     const SRC: &str = r##"//! Pictures.
 //!

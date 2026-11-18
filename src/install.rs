@@ -187,14 +187,50 @@ fn absolute(registry: &str, u: &str) -> String {
     }
 }
 
-/// Written whole or not at all: to a temporary file beside it, then renamed.
+/// Written whole or not at all: to a temporary file beside it, then renamed into place, which
+/// replaces what is there at once. The temporary file was `<name>.qwer.part`, written with
+/// `fs::write`, which follows a link: a cloned repository that shipped `csv.qwer.part ->
+/// ~/.zshrc` had the developer's file written over, and `csv.qwer` became a link to it. It is
+/// now made new under a name of its own (`create_new`, which a link there refuses, dangling or
+/// not), removed on every failure, and a target that is itself a link is refused
+/// (FEEDBACK71.md, Q-981; branch security).
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let tmp = path.with_extension(format!("{}.part", path.extension().and_then(|e| e.to_str()).unwrap_or("")));
-    std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {}", tmp.display(), e))?;
+    use std::io::Write;
+    not_a_link(path)?;
+    let name = path.file_name().map_or_else(|| "plugin".into(), |n| n.to_string_lossy().into_owned());
+    let mut tries = 0;
+    let (tmp, mut out) = loop {
+        let tmp = path.with_file_name(format!("{}.{}-{:08x}.part", name, std::process::id(), fastrand::u32(..)));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(out) => break (tmp, out),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 16 => tries += 1,
+            Err(e) => return Err(format!("{}: {}", tmp.display(), e)),
+        }
+    };
+    // A test's way to fail the write part way, in a debug build or the coverage run's (cargo
+    // llvm-cov passes `--cfg coverage`, and scripts/coverage.sh builds for release) only: `ulimit
+    // -f` also stops the coverage run's own file being written.
+    let fail = cfg!(any(debug_assertions, coverage)) && std::env::var_os("QUILLO_TEST_FAIL_WRITE").is_some();
+    let written = if fail { out.write_all(&bytes[..bytes.len() / 2]).and(Err(std::io::Error::other("QUILLO_TEST_FAIL_WRITE"))) } else { out.write_all(bytes) };
+    drop(out);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{}: {}", tmp.display(), e));
+    }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("{}: {}", path.display(), e)
     })
+}
+
+/// A plugin's or an example's file that is a symbolic link is neither read nor written: in a
+/// cloned repository it may point anywhere, `/dev/zero` among them (FEEDBACK71.md, Q-981; branch
+/// security).
+fn not_a_link(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => Err(format!("{} is a symbolic link: nothing written; remove it to install here", path.display())),
+        _ => Ok(()),
+    }
 }
 
 /// The names nearest a misspelt one: those sharing its start, else containing it.
@@ -219,7 +255,10 @@ enum Done {
 
 fn install_one(agent: &ureq::Agent, registry: &str, e: &Entry, o: &Options, dir: &Path) -> Result<Done, String> {
     let path = dir.join(format!("{}.qwer", e.name));
-    let had = std::fs::read(&path).ok();
+    // Asked before it is read: a link to `/dev/zero` was read without end (FEEDBACK71.md, Q-981;
+    // branch security).
+    not_a_link(&path)?;
+    let had = crate::error::read_file(&path).ok();
     if let Some(old) = &had {
         if hex_sha256(old) == e.sha256 {
             return Ok(Done::UpToDate);

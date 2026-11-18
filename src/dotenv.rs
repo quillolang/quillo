@@ -77,7 +77,7 @@ fn read_file(path: &Path, required: bool, program: bool) -> Result<Option<String
         let why = if e.kind() == std::io::ErrorKind::NotFound { "which is not there".to_string() } else { format!("which cannot be read ({})", e) };
         return Err(format!("cannot read {}: it is a link to {}, {}{}", path.display(), to.display(), why, way_out(e.kind())));
     }
-    crate::error::read_source(path).map(Some).map_err(|e| format!("cannot read {}: {}{}", path.display(), e, way_out(e.kind())))
+    crate::error::read_source_whole(path).map(Some).map_err(|e| format!("cannot read {}: {}{}", path.display(), e, way_out(e.kind())))
 }
 
 /// A file that is always there and empty, for `--env-file`: no settings.

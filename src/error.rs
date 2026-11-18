@@ -290,22 +290,187 @@ pub fn noting_reads<T>(f: impl FnOnce() -> T) -> (T, Vec<std::path::PathBuf>) {
     (r, files)
 }
 
+/// The most of one file Quillo reads whole for a program: a file it uses, its policy, its
+/// app.toml, a style sheet or script of its own.
+pub const MOST_READ: u64 = 64 << 20;
+
+/// The most of one program source (`.qwe`, `.qwer`, the program named on the command line):
+/// parsing takes about seventy times the text, and the largest real one, quillo-ui.qwe, is 10 MB
+/// (FEEDBACK71.md, Q-982, found in review; branch security).
+pub const MOST_SOURCE: u64 = 16 << 20;
+
+/// The most of all the sources of one program that `quillo check`, the language server and
+/// `quillo docs` read for it together (`with_source_budget`).
+pub const MOST_PROGRAM: u64 = 32 << 20;
+
+/// A file a program supplies, read whole: a regular file of at most `MOST_READ` bytes
+/// (`MOST_SOURCE` for a `.qwe` or `.qwer`), asked of the file opened, not of its name. A link to
+/// `/dev/zero` in a cloned repository was read without end by `quillo check` and the language
+/// server, which took the machine's memory at about 4 GB a second; a FIFO held the read forever.
+/// Each is refused as what it is (FEEDBACK71.md, Q-982; branch security). Opened without waiting
+/// and without becoming the process's terminal, so a FIFO with no writer does not hold the open
+/// either; a regular file reads the same. What the person names on the command line under
+/// `/dev/` or `/proc/` may be anything (`name_file`), read to the same limit.
+pub fn read_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let source = path.extension().is_some_and(|e| e == "qwe" || e == "qwer");
+    read_bounded(path, if source { MOST_SOURCE } else { MOST_READ })
+}
+
+fn read_bounded(path: &std::path::Path, most: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let named = named_index(path);
+    if let Some(i) = named {
+        if let Some(b) = lock_named()[i].held.clone() {
+            return Ok(b);
+        }
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, if named.is_some() { libc::O_NOCTTY } else { libc::O_NONBLOCK | libc::O_NOCTTY });
+    let file = opts.open(path)?;
+    let meta = file.metadata()?;
+    // A folder is said as reading one said it before.
+    #[cfg(unix)]
+    if meta.is_dir() {
+        return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
+    }
+    if !meta.is_file() && named.is_none() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "it is not a regular file"));
+    }
+    let larger = || std::io::Error::new(std::io::ErrorKind::InvalidData, format!("it is larger than {} MiB", most >> 20));
+    if meta.is_file() && meta.len() > most {
+        return Err(larger());
+    }
+    let mut bytes = Vec::with_capacity(if meta.is_file() { meta.len() as usize } else { 0 });
+    file.take(most + 1).read_to_end(&mut bytes)?;
+    // It may have grown since it was asked.
+    if bytes.len() as u64 > most {
+        return Err(larger());
+    }
+    if let Some(i) = named.filter(|_| !meta.is_file()) {
+        lock_named()[i].held = Some(bytes.clone());
+    }
+    Ok(bytes)
+}
+
+/// A file the person named on the command line (the program, a `--policy`) where it is a pipe or
+/// a device of theirs: `quillo run <(...)`, `quillo run /dev/stdin`, `/proc/self/fd/3`. Only
+/// such a path, under `/dev/` or `/proc/`, may be no regular file: a committed `main.qwe` that
+/// links to a FIFO is refused, not waited on. What a pipe held is kept, as a pipe gives its text
+/// once and a program is read more than once (checked, then run), which read nothing the second
+/// time (FEEDBACK71.md, Q-982, found in review; branch security). Every file Quillo finds by
+/// itself (an import, a `use`d file, the language server's neighbours, `public/`, `app.toml`, the
+/// policy beside the program) stays held to a regular file.
+struct Named {
+    given: std::path::PathBuf,
+    real: Option<std::path::PathBuf>,
+    held: Option<Vec<u8>>,
+}
+
+static NAMED: std::sync::Mutex<Vec<Named>> = std::sync::Mutex::new(Vec::new());
+
+fn lock_named() -> std::sync::MutexGuard<'static, Vec<Named>> {
+    NAMED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Notes `path`, named on the command line, as the person's own (see `Named`): only a path under
+/// `/dev/` or `/proc/` is noted.
+pub fn name_file(path: &std::path::Path) {
+    let s = path.to_string_lossy();
+    if !(s.starts_with("/dev/") || s.starts_with("/proc/")) {
+        return;
+    }
+    let mut all = lock_named();
+    if !all.iter().any(|n| n.given == path) {
+        all.push(Named { given: path.to_path_buf(), real: path.canonicalize().ok(), held: None });
+    }
+}
+
+fn named_index(path: &std::path::Path) -> Option<usize> {
+    let all = lock_named();
+    if all.is_empty() {
+        return None;
+    }
+    all.iter().position(|n| n.given == path).or_else(|| {
+        // Another spelling of the same name is asked of the system, only then.
+        let real = path.canonicalize().ok()?;
+        all.iter().position(|n| n.real.as_ref() == Some(&real))
+    })
+}
+
+thread_local! {
+    /// What is left of `MOST_PROGRAM` for the sources being read, while `with_source_budget` runs.
+    static SOURCE_LEFT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// The sources counted so far, each once however often it is read.
+    static SOURCE_COUNTED: std::cell::RefCell<std::collections::HashSet<std::path::PathBuf>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// `f`, with every program source it reads (`read_source`) counted against `MOST_PROGRAM`: past
+/// it, a read is refused. Sixteen imports of 16 MiB each would otherwise each be parsed, at about
+/// seventy times their size (FEEDBACK71.md, Q-982, found in review; branch security). A call
+/// inside another shares its budget.
+pub fn with_source_budget<T>(f: impl FnOnce() -> T) -> T {
+    if SOURCE_LEFT.with(|l| l.get()).is_some() {
+        return f();
+    }
+    SOURCE_LEFT.with(|l| l.set(Some(MOST_PROGRAM)));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SOURCE_LEFT.with(|l| l.set(None));
+            SOURCE_COUNTED.with(|c| c.borrow_mut().clear());
+        }
+    }
+    let _reset = Reset;
+    f()
+}
+
+/// `read_file`, as text: `std::fs::read_to_string`'s answer for a file a program supplies
+/// (FEEDBACK71.md, Q-982; branch security).
+pub fn read_text(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    String::from_utf8(read_file(path.as_ref())?).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stream did not contain valid UTF-8"))
+}
+
 /// Sets the program read for `path` from now on.
 pub fn set_virtual(path: std::path::PathBuf, source: String) {
     let _ = VIRTUAL.set((path, source));
 }
 
 pub fn read_source(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
-    if let Some((p, s)) = VIRTUAL.get().filter(|(p, _)| p == path.as_ref()) {
+    source_text(path.as_ref(), true)
+}
+
+/// `read_source`, of a file the person running the program names rather than one a repository
+/// supplies, read whole as it comes: `.env` and `--env-file`, which may be `/dev/null` or a pipe a
+/// secrets manager writes (FEEDBACK71.md, Q-982; branch security). Only `quillo run` reads them.
+pub fn read_source_whole(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    source_text(path.as_ref(), false)
+}
+
+fn source_text(path: &std::path::Path, regular: bool) -> std::io::Result<String> {
+    if let Some((p, s)) = VIRTUAL.get().filter(|(p, _)| p == path) {
         let _ = p;
         return Ok(s.clone());
     }
     TRIED.with(|t| {
         if let Some(files) = t.borrow_mut().as_mut() {
-            files.push(path.as_ref().to_path_buf());
+            files.push(path.to_path_buf());
         }
     });
-    let bytes = std::fs::read(path)?;
+    let bytes = if regular { read_bounded(path, MOST_SOURCE)? } else { std::fs::read(path)? };
+    if regular {
+        if let Some(left) = SOURCE_LEFT.with(|l| l.get()) {
+            let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            if !SOURCE_COUNTED.with(|c| c.borrow().contains(&key)) {
+                if bytes.len() as u64 > left {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("the program's files come to more than {} MiB together", MOST_PROGRAM >> 20)));
+                }
+                SOURCE_LEFT.with(|l| l.set(Some(left - bytes.len() as u64)));
+                SOURCE_COUNTED.with(|c| c.borrow_mut().insert(key));
+            }
+        }
+    }
     String::from_utf8(bytes).map_err(|e| {
         let ok = &e.as_bytes()[..e.utf8_error().valid_up_to()];
         let line = ok.iter().filter(|&&b| b == b'\n').count() + 1;

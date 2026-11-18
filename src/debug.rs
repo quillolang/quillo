@@ -1034,7 +1034,8 @@ pub fn serve(start: impl FnOnce(Launch) -> i32 + Send + 'static) -> i32 {
             "setBreakpoints" => {
                 let file = args["source"]["path"].as_str().unwrap_or("").to_string();
                 let file = std::fs::canonicalize(&file).map(|p| p.display().to_string()).unwrap_or(file);
-                let (lines, items, browser) = std::fs::read_to_string(&file).map(|s| stops_with_browser(&s)).unwrap_or_default();
+                // Read as the program's files are (FEEDBACK71.md, Q-982; branch security).
+                let (lines, items, browser) = crate::error::read_text(&file).map(|s| stops_with_browser(&s)).unwrap_or_default();
                 let mut bps = Vec::new();
                 let mut shown = Vec::new();
                 for b in args["breakpoints"].as_array().into_iter().flatten() {

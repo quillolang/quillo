@@ -62,7 +62,9 @@ impl AppToml {
     /// The file in `dir`: none when there is none, the error when it cannot be read.
     pub fn read(dir: &Path) -> Option<Result<AppToml, String>> {
         let path = dir.join(FILE);
-        match std::fs::read(&path) {
+        // A regular file of a bounded size, as the program's own files are read (FEEDBACK71.md,
+        // Q-982; branch security).
+        match crate::error::read_file(&path) {
             Ok(bytes) => Some(match String::from_utf8(bytes) {
                 Ok(text) => Ok(AppToml::parse(&text)),
                 Err(_) => Err("not UTF-8 text".into()),
@@ -806,7 +808,7 @@ pub fn check(dir: &Path, shown: &str) -> Vec<crate::check::Diagnostic> {
     if let Some(e) = app.get("icon").filter(|e| !e.value.is_empty()) {
         let file = dir.join(&e.value);
         // Known by what it holds, as the run knows it, not by its name.
-        let read = if file.is_file() { Some(std::fs::read(&file)) } else { None };
+        let read = if file.is_file() { Some(crate::error::read_file(&file)) } else { None };
         match read {
             None => lines.push((e.line, Severity::Error, format!("icon \"{}\": no such file in the program's folder", e.value))),
             Some(Err(why)) => lines.push((e.line, Severity::Error, format!("icon \"{}\" cannot be read: {}", e.value, why))),

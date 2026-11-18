@@ -545,7 +545,8 @@ fn statements(path: &Path, base: &Path, seen: &mut HashSet<PathBuf>, out: &mut V
     if !seen.insert(key) {
         return Ok(());
     }
-    let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+    // Read as the program's own files are (FEEDBACK71.md, Q-982; branch security).
+    let src = crate::error::read_text(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
     // What the app needs of a service is its `server fn`s and the services it declares: a file
     // that does not parse is read for those alone, so an error in a body or a route of the
     // service's does not stop the app, which the service's own check reports (FEEDBACK40.md,

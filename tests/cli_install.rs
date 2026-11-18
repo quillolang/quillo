@@ -396,18 +396,23 @@ fn a_file_that_cannot_be_written_is_reported() {
     assert_eq!(o.status.code(), Some(1));
     assert!(err(&o).starts_with("quillo install: taken/sub: "), "{}", err(&o));
 
-    // Something in the way of the temporary file.
+    // What was the temporary file's name is in the way of nothing: the temporary file is made
+    // new under a name of its own, as a link there was written through (FEEDBACK71.md, Q-981;
+    // branch security). It is left as it is.
     std::fs::create_dir_all(d.join("a/hi.qwer.part")).unwrap();
     let o = from(&r, &d, &["--dir", "a", "hi"]);
-    assert_eq!(o.status.code(), Some(1));
-    assert!(err(&o).starts_with("quillo install: a/hi.qwer.part: "), "{}", err(&o));
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(std::fs::read(d.join("a/hi.qwer")).unwrap(), plugin("1.0.0"));
+    assert!(d.join("a/hi.qwer.part").is_dir());
 
     // Something in the way of the file itself: the temporary file is cleared up.
     std::fs::create_dir_all(d.join("b/hi.qwer/in-it")).unwrap();
     let o = from(&r, &d, &["--dir", "b", "hi"]);
     assert_eq!(o.status.code(), Some(1));
     assert!(err(&o).starts_with("quillo install: b/hi.qwer: "), "{}", err(&o));
-    assert!(!d.join("b/hi.qwer.part").exists());
+    // Its name is its own now (FEEDBACK71.md, Q-981; branch security): no `.part` is left.
+    let left: Vec<String> = std::fs::read_dir(d.join("b")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(left, ["hi.qwer"]);
 }
 
 #[test]

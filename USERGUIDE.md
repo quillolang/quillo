@@ -3645,7 +3645,13 @@ reader of the file does not see (a control character, a bidirectional mark, embe
 override or isolate, a zero-width space, a line separator, a tag character) anywhere in the
 block is an error at its line and column, and the program does not start with it: what the
 model reads must be what the developer sees. The zero width joiner and non-joiner, which
-emoji and Persian need, are let through. The first line names the program, cut at 24
+emoji and Persian need, are let through. The same holds for each tool: such a character in
+its `///` is an error at its line and column, a zero width joiner or non-joiner there passes
+only between two characters a reader sees, and one in a string its schemas carry (a default,
+a string type's value) is an error at the tool's line, naming where; where the program has
+tools, its file's name, which AI clients are told, follows the same rule. A zero width joiner or non-joiner
+between two letters still passes, as words in some scripts need one; it can carry about one
+hidden bit per letter, not readable text. The first line names the program, cut at 24
 characters. `quillo check` warns when the whole is over 2,000
 characters on either door (the HTTP door counted under `--service-name` when `quillo run` is
 given one), saying by how much: clients cut long instructions short. `quillo docs --mcp
@@ -5104,7 +5110,9 @@ curl -i localhost:8080/_quillo/rpc/transfer -H "Idempotency-Key: k-77" --json '[
   cannot be kept. Answers are kept 24 hours, then the key is new again: `{ max_age:
   "7d" }` (seconds, or a duration as for cookies, up to 366 days) keeps them longer.
   Expired ones are deleted as requests come. When the database that keeps them cannot
-  be reached, the request is answered 503.
+  be reached, the request is answered 503 with `{"error": "could not record the
+  Idempotency-Key"}` (or `could not read`); the database's message goes to the log, and to
+  the answer only under `--watch`.
 - A key runs at most once, whoever asks, within the tenant and the mount point. Who may
   see its answer is compared at the strongest level both sides have: the `user` option
   (a str or an int, as `{ user: token.owner }`), then the session (a hidden id its cookie
@@ -8720,6 +8728,15 @@ When a call to a function of your own named like a builtin (`notify`, `first`) h
 wrong arguments, the error says so: this `notify` is the program's own, from line 1,
 which hides the builtin `notify`.
 
+A program source (`.qwe`, `.qwer`) is read only as a regular file of at most 16 MiB, and one
+program's sources come to at most 32 MiB together for `quillo check`, the language server and
+`quillo docs`; other files (`app.toml`, `quillo.policy`, `public/` style sheets and scripts)
+are read up to 64 MiB, so a cloned repository's link to `/dev/zero` or a FIFO is refused
+(`cannot read ...: it is not a regular file`) rather than read for ever. The program or
+`--policy` named on the command line may be a pipe or device under `/dev` or `/proc`
+(`quillo run <(...)`, `quillo run /dev/stdin`): it is read once. `.env` and `--env-file` are
+read as they come.
+
 Its warnings: an unused variable (name it `_x` to keep it); a function named like a
 builtin, or a variable named like a module; a line starting `-x` that does nothing;
 `||`, `&&`, `!`, `if` or `? :` on a value known to be a string or a number; SQL put
@@ -9842,9 +9859,26 @@ How it runs:
   statement runs, all in one cargo call over a workspace, so cargo builds them side by
   side (`quillo: building ./a.rs, ./b.qwer together`); a file that fails there is built
   again alone by its `use`, which says why.
-- `use` builds the file with `cargo` (`$CARGO`, or the one on the `PATH`), in a crate of
-  its own in Quillo's cache: `QUILLO_NATIVE_CACHE`, else `$XDG_CACHE_HOME/quillo/native`,
-  else `~/.cache/quillo/native`, else the system's temporary folder. The crates' builds
+- `use` builds the file with cargo (`$CARGO`, or `cargo` found on the PATH from the program's
+  folder), in a crate of its own in Quillo's cache: `QUILLO_NATIVE_CACHE`, else
+  `$XDG_CACHE_HOME/quillo/native`, else `~/.cache/quillo/native`, else `quillo-<uid>/native` in
+  the temporary folder (`quillo-<username>` on Windows). Cargo runs whatever is in that cache,
+  so: every folder above it, up to `/`, must be root's or yours and not writable by other users
+  unless it is sticky (`/tmp`); one inside your home has its group and other write bits removed,
+  and your home itself or a folder outside it is refused, with the `chmod go-w` to run. Each
+  cache folder (the cache's own, `native`, `crates` and each crate, `target`, `workspaces` and
+  each workspace) is made for you alone (700); a link or a folder another user owns is refused,
+  `~/.cache/quillo` as a link too (set `QUILLO_NATIVE_CACHE` to the real folder instead: that
+  one may itself be a link). Under HOME, XDG or the temporary folder, a folder of yours that
+  others could read or write is made 700, and if others could write in it, its crates, builds and
+  workspaces are removed and built again once; under `QUILLO_NATIVE_CACHE` nothing is changed,
+  and a folder others could write in is refused. On a filesystem without permissions (exFAT,
+  DrvFs) nothing is removed, and Quillo says once that the cache is not private there. A crate's
+  manifest says `build = false`, and cargo runs in `/` (your profile folder on Windows), so the
+  program's own `.cargo/config.toml` and `rust-toolchain.toml` do not apply to its plugins'
+  builds: settings for them go in `$CARGO_HOME/config.toml` or rustup's default. On Windows no
+  ACL is checked, and a service running as SYSTEM gets `C:\Windows\Temp\quillo-MACHINE$`,
+  whose owner nothing checks. The crates' builds
   are shared there, and nothing old is removed (it grows: clear it now and then). The
   library is kept in `.quillo/native/` next to the file, named by the file's whole name
   (so `x.rs` and `x.qwer` side by side keep one each), the glue's version, and a hash of
@@ -9926,8 +9960,10 @@ quillo install --list pdf          # what the catalog has, matching "pdf"
 
 - It reads the catalog (`https://quillolang.org/plugins/index.json`; [`--registry`](#other-commands) or
   `QUILLO_REGISTRY` for another), downloads each file, and writes it only when its
-  SHA-256 and the `//! version:` line of its header match the catalog's. A plugin
-  that fails leaves the others going, and the exit status is 1.
+  SHA-256 and the `//! version:` line of its header match the catalog's. Each file is
+  written to a new temporary file of its own beside it, then renamed into place; a plugin or
+  example file that is a symbolic link is neither read nor written. A plugin that fails
+  leaves the others going, and the exit status is 1.
 - A file already there is left alone when it is the same, replaced when the catalog's
   version is newer, and kept when it is newer or the same version changed by hand:
   [`--force`](#other-commands) replaces it. [`--dir DIR`](#other-commands) installs elsewhere. `name@1.2.0` asks for that
