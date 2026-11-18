@@ -129,7 +129,10 @@ fn a_key_whose_table_lost_a_column_is_refused_as_unrecorded() {
     pay_then_spoil(s.port);
     let again = send(s.port, "POST", "/pay", &[("Idempotency-Key", "k1")], "");
     assert_eq!(again.status, 503, "{}", again.body);
-    assert!(again.body.contains("could not record the Idempotency-Key") && again.body.contains("body_b64"), "{}", again.body);
+    // The database's words (`body_b64`) go to the log, not to the visitor (FEEDBACK71.md, Q-978;
+    // branch security: the decided change; feedback71d checks the log line).
+    assert_eq!(again.body, r#"{"error":"could not record the Idempotency-Key"}"#);
+    assert!(!again.body.contains("body_b64"), "{}", again.body);
 }
 
 #[test]
@@ -187,7 +190,9 @@ route POST /pay = idempotent(() => pay())
     let s = serve(&f, &[]);
     let r = send(s.port, "POST", "/pay", &[("Idempotency-Key", "k1")], "");
     assert_eq!(r.status, 503, "{}", r.body);
-    assert!(r.body.contains("could not read the Idempotency-Key") && r.body.contains("path"), "{}", r.body);
+    // The database's words (`path`) go to the log, not to the visitor (FEEDBACK71.md, Q-978; branch
+    // security: the decided change).
+    assert_eq!(r.body, r#"{"error":"could not read the Idempotency-Key"}"#);
 }
 
 #[test]
