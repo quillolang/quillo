@@ -222,23 +222,20 @@ fn describe_is_answered_only_when_it_was_asked_for() {
     let dir = temp_dir("describe-serve");
     let file = dir.join("app.qwe");
     std::fs::write(&file, "route GET /x = 1\nserver fn f() = 1\n").unwrap();
-    let port = support::free_port();
+    // The system picks the port and the server says which: a port picked here could be taken by
+    // another process first (a shown bug in the test; branch security).
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(&file)
-        .args(["--port", &port.to_string(), "--describe"])
+        .args(["--port", "0", "--describe"])
         .env("QUILLO_SECRET", "test secret for the tests")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let _g = support::Guard::new(child);
-    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(std::time::Instant::now() < end, "server did not start");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    let mut _g = support::Guard::new(child);
+    let port = support::port_in_stderr(&mut _g.0, "app.qwe", std::time::Instant::now() + std::time::Duration::from_secs(20));
     let a = support::send(port, "GET", "/_quillo/describe", &[], "");
     assert_eq!(a.status, 200, "{}", a.body);
     let doc: Value = serde_json::from_str(&a.body).unwrap();

@@ -45,8 +45,12 @@ impl Drop for Running {
     }
 }
 
+/// The system picks the port and the server says which, but under --split (the services' lines
+/// come first): a port picked here could be taken by another process first (a shown bug in the
+/// test; branch security).
 fn run(d: &Path, args: &[&str]) -> Running {
-    let port = support::free_port();
+    let given = support::port_given(args);
+    let port = if given { support::free_port() } else { 0 };
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(d.join("main.qwe"))
@@ -56,16 +60,21 @@ fn run(d: &Path, args: &[&str]) -> Running {
         .current_dir(d)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(if given { Stdio::null() } else { Stdio::piped() })
         .spawn()
         .unwrap();
     support::stop_with_tests(&child);
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut r = Running(child, port);
+    if !given {
+        r.1 = support::port_in_stderr(&mut r.0, "main.qwe", deadline);
+        return r;
+    }
     while !support::listening(port) {
         assert!(Instant::now() < deadline, "did not start");
         std::thread::sleep(Duration::from_millis(30));
     }
-    Running(child, port)
+    r
 }
 
 fn described(port: u16) -> J {

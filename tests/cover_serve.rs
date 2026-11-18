@@ -110,11 +110,12 @@ impl Srv {
     }
 }
 
+/// The system picks the port and the log says which: a port picked here could be taken by another
+/// process first (a shown bug in the test; branch security).
 fn run(d: &Path) -> Srv {
-    let port = support::free_port();
     let log = d.join("stderr.log");
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["run", "app.qwe", "--port", &port.to_string()])
+        .args(["run", "app.qwe", "--port", "0"])
         .current_dir(d)
         .env("QUILLO_SECRET", "a test secret of more than thirty-two bytes")
         .stdin(Stdio::null())
@@ -123,12 +124,8 @@ fn run(d: &Path) -> Srv {
         .spawn()
         .expect("cannot start quillo");
     support::stop_with_tests(&child);
-    let s = Srv { child, port, log };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "the server did not start: {}", s.log());
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut s = Srv { child, port: 0, log };
+    s.port = support::port_in_log(&mut s.child, &s.log, Duration::from_secs(20));
     s
 }
 
@@ -163,10 +160,9 @@ fn a_served_file_that_cannot_be_opened_any_more_is_watched_by_looking() {
     let d = folder("watch-unreadable", "route GET /a.txt = file(\"a.txt\")\nroute GET /b.txt = file(\"b.txt\")\nroute GET / = \"one\"\n");
     std::fs::write(d.join("a.txt"), "a").unwrap();
     std::fs::write(d.join("b.txt"), "b").unwrap();
-    let port = support::free_port();
     let log = d.join("stderr.log");
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["run", "app.qwe", "--port", &port.to_string(), "--watch"])
+        .args(["run", "app.qwe", "--port", "0", "--watch"])
         .current_dir(&d)
         .env("QUILLO_SECRET", "a test secret of more than thirty-two bytes")
         .stdin(Stdio::null())
@@ -175,12 +171,9 @@ fn a_served_file_that_cannot_be_opened_any_more_is_watched_by_looking() {
         .spawn()
         .expect("cannot start quillo");
     support::stop_with_tests(&child);
-    let srv = Srv { child, port, log };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "the server did not start: {}", srv.log());
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut srv = Srv { child, port: 0, log };
+    let port = support::port_in_log(&mut srv.child, &srv.log, Duration::from_secs(20));
+    srv.port = port;
     assert_eq!(support::send(port, "GET", "/a.txt", &[], "").body, "a");
     std::fs::set_permissions(d.join("a.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
     assert_eq!(support::send(port, "GET", "/b.txt", &[], "").body, "b");

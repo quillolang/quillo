@@ -66,8 +66,9 @@ impl Srv {
 }
 
 /// `quillo run app.qwe` in `d`, with at most `descriptors` file descriptors when given.
+/// The system picks the port and the log says which: a port picked here could be taken by another
+/// process first (a shown bug in the test; branch security).
 fn run(d: &Path, args: &[&str], descriptors: Option<u32>) -> Srv {
-    let port = support::free_port();
     let bin = env!("CARGO_BIN_EXE_quillo");
     let mut c = match descriptors {
         Some(n) => {
@@ -78,7 +79,7 @@ fn run(d: &Path, args: &[&str], descriptors: Option<u32>) -> Srv {
         None => Command::new(bin),
     };
     let child = c
-        .args(["run", "app.qwe", "--port", &port.to_string()])
+        .args(["run", "app.qwe", "--port", "0"])
         .args(args)
         .current_dir(d)
         .env("QUILLO_SECRET", "a test secret of more than thirty-two bytes")
@@ -88,8 +89,8 @@ fn run(d: &Path, args: &[&str], descriptors: Option<u32>) -> Srv {
         .spawn()
         .expect("cannot start quillo");
     support::stop_with_tests(&child);
-    let s = Srv { child, port, dir: d.to_path_buf() };
-    assert!(until(|| support::listening(port)), "the server did not start: {}", s.log());
+    let mut s = Srv { child, port: 0, dir: d.to_path_buf() };
+    s.port = support::port_in_log(&mut s.child, &d.join("stderr.log"), Duration::from_secs(20));
     s
 }
 

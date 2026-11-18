@@ -615,7 +615,7 @@ fn a_local_named_like_a_global_is_its_own_on_both_sides() {
     let c = Command::new(env!("CARGO_BIN_EXE_quillo")).arg("check").arg(d.join("main.qwe")).output().unwrap();
     let said_check = String::from_utf8_lossy(&c.stdout).into_owned() + &String::from_utf8_lossy(&c.stderr);
     assert!(said_check.contains("server variable that changes"), "{}", said_check);
-    let o = Command::new(env!("CARGO_BIN_EXE_quillo")).arg("run").arg(d.join("main.qwe")).arg("--no-check").arg("--port").arg(support::free_port().to_string()).output().unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_quillo")).arg("run").arg(d.join("main.qwe")).arg("--no-check").arg("--port").arg("0").output().unwrap();
     assert_eq!(o.status.code(), Some(1));
     assert!(said(&o).contains("server variable that the program changes"), "{}", said(&o));
 }

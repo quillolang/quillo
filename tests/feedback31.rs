@@ -61,13 +61,16 @@ impl Logged {
     }
 }
 
+/// The system picks the port (`--port 0`) and the log says which: a port picked here could be
+/// taken by another process before the server bound it, and on CI a JSON body test got another
+/// server's answer (a shown bug in the test; branch security).
 fn serve(d: &Path, file: &str, args: &[&str]) -> Logged {
-    let port = support::free_port();
-    let log = d.join(format!("{}.log", port));
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let log = d.join(format!("{}.log", N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(d.join(file))
-        .args(["--port", &port.to_string(), "--no-check"])
+        .args(["--port", "0", "--no-check"])
         .args(args)
         .env("QUILLO_SECRET", "test secret for the tests, long enough to sign")
         .stdin(Stdio::null())
@@ -76,15 +79,8 @@ fn serve(d: &Path, file: &str, args: &[&str]) -> Logged {
         .spawn()
         .unwrap();
     support::stop_with_tests(&child);
-    let mut s = Logged { child, port, log };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        if let Ok(Some(st)) = s.child.try_wait() {
-            panic!("stopped: {}\n{}", st, s.log());
-        }
-        assert!(Instant::now() < deadline, "did not start:\n{}", s.log());
-        std::thread::sleep(Duration::from_millis(30));
-    }
+    let mut s = Logged { child, port: 0, log };
+    s.port = support::port_in_log(&mut s.child, &s.log, Duration::from_secs(20));
     s
 }
 
@@ -139,20 +135,18 @@ fn a_closed_pipe_ends_a_script_quietly_and_a_server_goes_on() {
     assert_eq!(std::os::unix::process::ExitStatusExt::into_raw(o.status) >> 8, 141, "{:?}", o.status);
     assert!(!String::from_utf8_lossy(&o.stderr).contains("panicked"), "{}", String::from_utf8_lossy(&o.stderr));
 
-    let port = support::free_port();
+    // The system picks the port, as `serve` has it (branch security).
     let mut srv = support::Guard::new(
         Command::new(env!("CARGO_BIN_EXE_quillo"))
             .arg("run")
             .arg(d.join("srv.qwe"))
-            .args(["--port", &port.to_string()])
+            .args(["--port", "0"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
     );
-    while !support::listening(port) {
-        std::thread::sleep(Duration::from_millis(30));
-    }
+    let port = support::port_in_stderr(&mut srv.0, "srv.qwe", Instant::now() + Duration::from_secs(20));
     drop(srv.0.stdout.take());
     let codes: Vec<u16> = (0..4).map(|_| send(port, "GET", "/", &[], "").status).collect();
     assert_eq!(codes, [200, 200, 200, 200]);
@@ -226,7 +220,7 @@ fn a_with_command_stops_with_a_quillo_stopped_while_it_loads_or_killed() {
         let mut q = Command::new(env!("CARGO_BIN_EXE_quillo"))
             .arg("run")
             .arg(d.join("main.qwe"))
-            .args(["--port", &support::free_port().to_string(), "--no-check", "--with", &cmd])
+            .args(["--port", "0", "--no-check", "--with", &cmd])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

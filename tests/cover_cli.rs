@@ -59,11 +59,12 @@ fn refused(o: &Output, what: &str) {
 }
 
 /// A server started in `d` with these arguments, once it listens; its log in `log.txt`.
+/// The system picks the port and the log says which (a port picked here could be taken by another
+/// process first; a shown bug in the test, branch security).
 fn started(d: &Path, cmd: &str, args: &[&str]) -> (Guard, u16) {
-    let port = support::free_port();
     let log = std::fs::File::create(d.join("log.txt")).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args([cmd, "main.qwe", "--port", &port.to_string()])
+        .args([cmd, "main.qwe", "--port", "0"])
         .args(args)
         .current_dir(d)
         .env("QUILLO_SECRET", "a secret for the cover tests, long enough")
@@ -72,12 +73,8 @@ fn started(d: &Path, cmd: &str, args: &[&str]) -> (Guard, u16) {
         .stderr(log)
         .spawn()
         .unwrap();
-    let g = Guard::new(child);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "did not start: {}", std::fs::read_to_string(d.join("log.txt")).unwrap_or_default());
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut g = Guard::new(child);
+    let port = support::port_in_log(&mut g.0, &d.join("log.txt"), Duration::from_secs(20));
     (g, port)
 }
 

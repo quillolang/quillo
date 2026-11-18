@@ -60,6 +60,13 @@ fn quillo_with(dir: &Path, args: &[&str], log: &str, secret: &str) -> Run {
     Run { child, log }
 }
 
+/// The port a run given `--port 0` says it listens on, once it does: the system picks it, as a
+/// port picked here could be taken by another process first (a shown bug in the test; branch
+/// security). Those under --split keep a port picked here: the services' lines come first.
+fn up_on_any(run: &mut Run) -> u16 {
+    support::port_in_log(&mut run.child, &run.log, Duration::from_secs(20))
+}
+
 fn up(run: &mut Run, port: u16) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while !listening(port) {
@@ -152,9 +159,8 @@ fn an_app_without_the_services_file_asks_the_running_service_for_its_functions()
     let app = temp_dir("f40-app");
     std::fs::write(svc.join("billing.qwe"), "server fn add(a: int, b: int, c: int = 0) -> int = a + b + c\nserver fn greet(name: str) = \"hello \" + name\n").unwrap();
     std::fs::write(app.join("main.qwe"), MAIN).unwrap();
-    let sport = free_port();
-    let mut billing = quillo(&svc, &["run", "billing.qwe", "--port", &sport.to_string(), "--as-service"], "billing.log");
-    up(&mut billing, sport);
+    let mut billing = quillo(&svc, &["run", "billing.qwe", "--port", "0", "--as-service"], "billing.log");
+    let sport = up_on_any(&mut billing);
     let url = format!("billing=http://127.0.0.1:{}", sport);
 
     // Its list is signed: unsigned, or for another, it is refused.
@@ -167,30 +173,28 @@ fn an_app_without_the_services_file_asks_the_running_service_for_its_functions()
     assert!(said.contains("warning: service billing: billing.qwe is not here, so its calls are not checked"), "{}", said);
 
     // Checked and run, the app asks billing what it offers, and calls it.
-    let port = free_port();
-    let mut main = quillo(&app, &["run", "main.qwe", "--port", &port.to_string(), "--service-url", &url], "main.log");
-    up(&mut main, port);
+    let mut main = quillo(&app, &["run", "main.qwe", "--port", "0", "--service-url", &url], "main.log");
+    let port = up_on_any(&mut main);
     assert_eq!(send(port, "GET", "/", &[], "").body, "3");
     assert_eq!(send(port, "GET", "/g", &[], "").body, "hello Ana");
     drop(main);
 
     // Its addresses in turn: one that is down is gone past, as for any call.
     let two = format!("billing=http://127.0.0.1:{},http://127.0.0.1:{}", free_port(), sport);
-    let port = free_port();
-    let mut main = quillo(&app, &["run", "main.qwe", "--port", &port.to_string(), "--service-url", &two], "two.log");
-    up(&mut main, port);
+    let mut main = quillo(&app, &["run", "main.qwe", "--port", "0", "--service-url", &two], "two.log");
+    let port = up_on_any(&mut main);
     assert_eq!(send(port, "GET", "/", &[], "").body, "3");
     drop(main);
 
     // Asked of a service that is not running: it says so, and why.
     let gone = format!("billing=http://127.0.0.1:{}", free_port());
-    let (code, said) = to_the_end(&app, &["run", "main.qwe", "--port", &free_port().to_string(), "--no-check", "--service-url", &gone], 30);
+    let (code, said) = to_the_end(&app, &["run", "main.qwe", "--port", "0", "--no-check", "--service-url", &gone], 30);
     assert_eq!(code, Some(1), "{}", said);
     assert!(said.contains("billing.qwe is not here, and service billing did not give its functions"), "{}", said);
 
     // With another secret, the service does not give them.
     let other = "not-the-secret-but-as-long-as-the-secret";
-    let (code, said) = to_the_end_with(&app, &["run", "main.qwe", "--port", &free_port().to_string(), "--no-check", "--service-url", &url], 30, other);
+    let (code, said) = to_the_end_with(&app, &["run", "main.qwe", "--port", "0", "--no-check", "--service-url", &url], 30, other);
     assert_eq!(code, Some(1), "{}", said);
     assert!(said.contains("did not give its functions"), "{}", said);
 }

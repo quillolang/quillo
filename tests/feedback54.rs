@@ -252,8 +252,11 @@ fn visit(port: u16, cookie: &str) -> (String, String) {
 #[test]
 fn a_restart_under_watch_keeps_the_session() {
     let d = dir("restart-session", VISITS);
-    let port = support::free_port();
-    let (s, said) = bare(&d, port, &["--watch"]);
+    // The first start on a port the system picks, read from its line (a port picked here could be
+    // taken by another process first; a shown bug in the test, branch security); the starts after
+    // it where it was, each waiting for its own server's line.
+    let (s, said) = bare(&d, 0, &["--watch"]);
+    let port = said.lines().find_map(support::port_said).expect("its port");
     assert!(said.contains("sessions are signed with .quillo/.quillo-secret"), "{}", said);
     let (one, cookie) = visit(port, "");
     let (two, cookie) = visit(port, &cookie);
@@ -630,13 +633,15 @@ fn components_inside_a_swapped_one_keep_their_states() {
 
 const DATA: &str = "let notes = []\nlet title = \"Shop\"\nlet count = 0\nlet helper = null\nroute POST /add {\n    notes = notes + [\"x\"]\n    count += 1\n    helper = (y) => y\n    \"ok\"\n}\nroute GET /n = `${len(notes)} ${title} ${count}`\n";
 
-/// `quillo run --watch` with its log in a file: the server, and where its log is.
-fn logged(d: &Path, port: u16) -> (Bare, PathBuf) {
+/// `quillo run --watch` with its log in a file: the server, where its log is, and its port. The
+/// system picks the port and the log says which: a port picked here could be taken by another
+/// process first (a shown bug in the test; branch security).
+fn logged(d: &Path) -> (Bare, PathBuf, u16) {
     let log = d.join("server.log");
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(d.join("main.qwe"))
-        .args(["--port", &port.to_string(), "--watch"])
+        .args(["--port", "0", "--watch"])
         .env("QUILLO_SECRET", "test secret for the tests")
         .current_dir(d)
         .stdin(std::process::Stdio::null())
@@ -644,12 +649,9 @@ fn logged(d: &Path, port: u16) -> (Bare, PathBuf) {
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
-    let end = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < end, "the server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    (Bare(child), log)
+    let mut s = Bare(child);
+    let port = support::port_in_log(&mut s.0, &log, Duration::from_secs(20));
+    (s, log, port)
 }
 
 /// Saves `src` and waits for the reload's line, the `n`th: that line.
@@ -674,8 +676,7 @@ fn reloaded(d: &Path, log: &Path, src: &str, n: usize) -> String {
 #[test]
 fn a_save_keeps_the_servers_data_and_says_so() {
     let d = dir("data", DATA);
-    let port = support::free_port();
-    let (_s, log) = logged(&d, port);
+    let (_s, log, port) = logged(&d);
     support::send(port, "POST", "/add", &[], "");
     support::send(port, "POST", "/add", &[], "");
     assert_eq!(support::send(port, "GET", "/n", &[], "").body, "2 Shop 2");
@@ -690,15 +691,10 @@ fn a_save_keeps_the_servers_data_and_says_so() {
     // Not under --reload (production): nothing carried, nothing said.
     drop(_s);
     let d = dir("data-reload", DATA);
-    let port = support::free_port();
     let log = d.join("server.log");
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo")).arg("run").arg(d.join("main.qwe")).args(["--port", &port.to_string(), "--reload"]).env("QUILLO_SECRET", "test secret for the tests").current_dir(&d).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::fs::File::create(&log).unwrap()).spawn().unwrap();
-    let _s = Bare(child);
-    let end = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < end);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo")).arg("run").arg(d.join("main.qwe")).args(["--port", "0", "--reload"]).env("QUILLO_SECRET", "test secret for the tests").current_dir(&d).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::fs::File::create(&log).unwrap()).spawn().unwrap();
+    let mut _s = Bare(child);
+    let port = support::port_in_log(&mut _s.0, &log, Duration::from_secs(20));
     support::send(port, "POST", "/add", &[], "");
     let line = reloaded(&d, &log, &DATA.replace("\"Shop\"", "\"My shop\""), 1);
     assert!(!line.contains("kept"), "{}", line);
@@ -780,7 +776,8 @@ fn the_session_key_file_is_made_safely() {
     let d = dir("key-safe", VISITS);
     std::fs::create_dir_all(d.join(".quillo")).unwrap();
     std::os::unix::fs::symlink(d.join("elsewhere.txt"), d.join(".quillo/.quillo-secret")).unwrap();
-    let port = support::free_port();
+    // No request is made: each start on a port the system picks (branch security).
+    let port = 0;
     let (s, said) = bare(&d, port, &["--watch"]);
     drop(s);
     assert!(said.contains("is a link") && !d.join("elsewhere.txt").exists(), "{}", said);
@@ -941,7 +938,6 @@ fn r_and_enter_starts_the_servers_data_again() {
     use std::io::Write;
     use std::os::fd::FromRawFd;
     let d = dir("fresh", DATA);
-    let port = support::free_port();
     let (mut master, mut slave) = (0, 0);
     // SAFETY: openpty fills the two descriptors, each owned once below.
     assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) }, 0);
@@ -949,7 +945,7 @@ fn r_and_enter_starts_the_servers_data_again() {
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(d.join("main.qwe"))
-        .args(["--port", &port.to_string(), "--watch"])
+        .args(["--port", "0", "--watch"])
         .env("QUILLO_SECRET", "test secret for the tests")
         .current_dir(&d)
         .stdin(unsafe { std::process::Stdio::from_raw_fd(slave) })
@@ -957,13 +953,9 @@ fn r_and_enter_starts_the_servers_data_again() {
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
-    let _s = Bare(child);
+    let mut _s = Bare(child);
     let mut keys = unsafe { std::fs::File::from_raw_fd(master) };
-    let end = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < end);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let port = support::port_in_log(&mut _s.0, &log, Duration::from_secs(20));
     assert!(std::fs::read_to_string(&log).unwrap().contains("watching for changes (r and Enter starts the program's data again)"));
     support::send(port, "POST", "/add", &[], "");
     support::send(port, "POST", "/add", &[], "");
@@ -990,6 +982,6 @@ fn r_and_enter_starts_the_servers_data_again() {
     drop(_s);
     // Input not a terminal: not said, not read.
     let d2 = dir("fresh-null", DATA);
-    let (_s, log) = logged(&d2, port);
+    let (_s, log, _) = logged(&d2);
     assert!(!std::fs::read_to_string(&log).unwrap().contains("r and Enter"));
 }

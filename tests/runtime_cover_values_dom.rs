@@ -56,23 +56,20 @@ fn dir() -> PathBuf {
 /// (driven by run.js over the DevTools protocol), runs `script` in it and
 /// returns what the script recorded in `data-result`.
 fn run_page(chrome: &Path, app: &str, script: &str, args: &[&str]) -> serde_json::Value {
-    let port = support::free_port();
-    let _server = support::Guard::new(
+    // The system picks the port and the server says which: a port picked here could be taken by
+    // another process first (a shown bug in the test; branch security).
+    let mut _server = support::Guard::new(
         Command::new(env!("CARGO_BIN_EXE_quillo"))
             .arg("run")
             .arg(dir().join(app))
-            .args(["--port", &port.to_string()])
+            .args(["--port", "0"])
             .args(args)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let port = support::port_in_stderr(&mut _server.0, app, Instant::now() + Duration::from_secs(10));
     let profile = std::env::temp_dir().join(format!("quillo-chrome-{}-{}", std::process::id(), port));
     let out = Command::new("node")
         .arg(dir().join("run.js"))

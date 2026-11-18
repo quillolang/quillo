@@ -364,7 +364,9 @@ fn a_plugins_function_stays_on_the_server() {
     let out = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(&app)
-        .args(["--port", &support::free_port().to_string()])
+        // `--port 0`: it never listens, and a port picked here could be taken first (branch
+        // security).
+        .args(["--port", "0"])
         .env("QUILLO_NATIVE_CACHE", std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("native-cache"))
         .stdin(std::process::Stdio::null())
         .output()

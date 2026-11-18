@@ -164,8 +164,10 @@ fn a_request_made_from_a_script_name_alone_has_no_query() {
 #[test]
 fn quillo_fcgi_on_a_port_answers_over_tcp_with_large_heads_and_bodies() {
     let d = folder("port");
-    let port = support::free_port();
-    let mut g = start(&d, &["--port", &port.to_string()], Stdio::null());
+    // The system picks the port and the log says which: a port picked here could be taken by
+    // another process first (a shown bug in the test; branch security).
+    let mut g = start(&d, &["--port", "0"], Stdio::null());
+    let port = support::port_in_log(&mut g.0, &d.join("fcgi.log"), Duration::from_secs(20));
     let connect = || {
         let s = std::net::TcpStream::connect(("127.0.0.1", port))?;
         s.set_read_timeout(Some(Duration::from_secs(20)))?;

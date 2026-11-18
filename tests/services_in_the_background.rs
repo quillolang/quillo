@@ -58,8 +58,12 @@ impl Run {
     }
 }
 
+/// The system picks the port and the log says which, but under --split (the services' lines come
+/// first): a port picked here could be taken by another process first (a shown bug in the test;
+/// branch security). A port given is checked to be this server's.
 fn run(file: &Path, extra: &[&str]) -> Run {
-    let port = support::free_port();
+    let given = support::port_given(extra);
+    let port = if given { support::free_port() } else { 0 };
     let log = file.with_extension("log");
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
@@ -75,14 +79,20 @@ fn run(file: &Path, extra: &[&str]) -> Run {
         .unwrap();
     support::stop_with_tests(&child);
     let mut r = Run { child, port, log };
-    let deadline = Instant::now() + Duration::from_secs(25);
-    while !support::listening(port) {
-        if let Ok(Some(status)) = r.child.try_wait() {
-            panic!("quillo stopped ({}):\n{}", status, r.log());
+    if given {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while !support::listening(port) {
+            if let Ok(Some(status)) = r.child.try_wait() {
+                panic!("quillo stopped ({}):\n{}", status, r.log());
+            }
+            assert!(Instant::now() < deadline, "the server did not start:\n{}", r.log());
+            std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(Instant::now() < deadline, "the server did not start:\n{}", r.log());
-        std::thread::sleep(Duration::from_millis(20));
+        assert!(support::listener_is(port, r.child.id()), "another process listens on {}", port);
+    } else {
+        r.port = support::port_in_log(&mut r.child, &r.log, Duration::from_secs(25));
     }
+    let port = r.port;
     // A server may drop a first connection as it starts.
     eventually(10, "the server did not answer", || (support::send(port, "GET", "/", &[], "").status != 0).then_some(()));
     r

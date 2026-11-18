@@ -41,28 +41,42 @@ fn run_page_with_path(chrome: &Path, app: &Path, port: u16, path: &str, script: 
     run_page_args(chrome, app, port, path, script, &[])
 }
 
-/// Like `run_page_with_path`, with options for the server.
-fn run_page_args(chrome: &Path, app: &Path, port: u16, path: &str, script: Option<&Path>, args: &[&str]) -> serde_json::Value {
-    // One Chrome at a time: several at once overload small CI machines.
-    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let server = support::Guard::new(
+/// `quillo run app` with `args`, once it listens, and its port: on `port` 0 the one the system
+/// picked, read from what it says; a port given, waited for and checked to be this server's.
+fn serving(app: &Path, port: u16, args: &[&str]) -> (support::Guard, u16) {
+    let mut server = support::Guard::new(
         Command::new(env!("CARGO_BIN_EXE_quillo"))
             .arg("run")
             .arg(app)
             .args(["--port", &port.to_string()])
             .args(args)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(if port == 0 { Stdio::piped() } else { Stdio::null() })
             .spawn()
             .unwrap(),
     );
     let deadline = Instant::now() + Duration::from_secs(10);
+    if port == 0 {
+        let port = support::port_in_stderr(&mut server.0, &app.display().to_string(), deadline);
+        return (server, port);
+    }
     while !support::listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
+    assert!(support::listener_is(port, server.0.id()), "another process listens on {}", port);
+    (server, port)
+}
+
+/// Like `run_page_with_path`, with options for the server. `port` 0 (as every test here gives
+/// it): the system picks the port and the server says which, where a port picked here could be
+/// taken by another process first (a shown bug in the tests; branch security).
+fn run_page_args(chrome: &Path, app: &Path, port: u16, path: &str, script: Option<&Path>, args: &[&str]) -> serde_json::Value {
+    // One Chrome at a time: several at once overload small CI machines.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let (server, port) = serving(app, port, args);
     let profile = std::env::temp_dir().join(format!("quillo-chrome-{}-{}", std::process::id(), port));
     let out = Command::new("node")
         .arg(dir.join("run.js"))
@@ -81,10 +95,6 @@ fn run_page_args(chrome: &Path, app: &Path, port: u16, path: &str, script: Optio
 }
 
 /// Node 22 or later (run.js uses its built-in WebSocket).
-/// A port nothing is listening on (tests run in parallel).
-fn free_port() -> u16 {
-    support::free_port()
-}
 
 fn node_available() -> bool {
     Command::new("node")
@@ -100,7 +110,7 @@ fn live_state_follows_changes_made_elsewhere() {
         eprintln!("skipping: needs Chrome and Node 22 or later");
         return;
     };
-    let result = run_page(&chrome, "live.qwe", free_port());
+    let result = run_page(&chrome, "live.qwe", 0);
     let want = serde_json::json!({
         "before": ["first"],
         "noteArrived": true,
@@ -120,7 +130,7 @@ fn components_hydrate_react_and_call_the_server() {
         eprintln!("skipping: needs Chrome and Node 22 or later");
         return;
     };
-    let result = run_page(&chrome, "app.qwe", free_port());
+    let result = run_page(&chrome, "app.qwe", 0);
     let want = serde_json::json!({
         "count": "7",
         "nestedStart": "1",
@@ -148,7 +158,7 @@ fn infinite_scroll_renders_only_a_window_of_rows() {
     let r = run_page_with(
         &chrome,
         &root.join("tests/programs/scroll.qwe"),
-        free_port(),
+        0,
         Some(&root.join("tests/browser/scroll.js")),
     );
     assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
@@ -171,7 +181,7 @@ fn components_compose() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("compose.qwe"), free_port(), Some(&dir.join("compose.js")));
+    let r = run_page_with(&chrome, &dir.join("compose.qwe"), 0, Some(&dir.join("compose.js")));
     let want = serde_json::json!({
         "counts": ["2", "4"],
         "total": "Last change: 2",
@@ -194,7 +204,7 @@ fn keyed_lists_move_only_what_changed() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("lists.qwe"), free_port(), Some(&dir.join("lists.js")));
+    let r = run_page_with(&chrome, &dir.join("lists.qwe"), 0, Some(&dir.join("lists.js")));
     let want = serde_json::json!({
         "swapped": ["item 5, item 2, item 3, item 4, item 1, item 6", [], true],
         "swapMoves": [2, 2],
@@ -221,7 +231,7 @@ fn svg_inside_html_draws() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("svg.qwe"), free_port(), Some(&dir.join("svg.js")));
+    let r = run_page_with(&chrome, &dir.join("svg.qwe"), 0, Some(&dir.join("svg.js")));
     let want = serde_json::json!({ "svg": true, "allSvg": true, "rects": 4, "circle": true, "html": true, "cls": "on", "drawn": true, "errors": [] });
     assert_eq!(r, want);
 }
@@ -236,7 +246,7 @@ fn table_rows_and_numbers_are_taken_up_as_written() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("tables.qwe"), free_port(), Some(&dir.join("tables.js")));
+    let r = run_page_with(&chrome, &dir.join("tables.qwe"), 0, Some(&dir.join("tables.js")));
     let want = serde_json::json!({
         "server": { "top": ["aoff", "boff"], "sheet": ["xoff", "yoff"], "options": ["one", "two"], "score": "8 days, 80400000000000000000000 0" },
         "after": { "top": ["aoff", "bon"], "sheet": ["xon", "yoff", "zon"], "score": "8 days, 80400000000000000000000 1" },
@@ -259,7 +269,7 @@ fn components_call_other_sites_from_the_page() {
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
     std::env::set_var("PUBLIC_QUILLO_TEST_TOKEN", "pk_test_123");
-    let r = run_page_with(&chrome, &dir.join("remote.qwe"), free_port(), Some(&dir.join("remote.js")));
+    let r = run_page_with(&chrome, &dir.join("remote.qwe"), 0, Some(&dir.join("remote.js")));
     let want = serde_json::json!({
         "got": [200, true, { "from": "elsewhere", "n": 2 }],
         "refused": true,
@@ -281,7 +291,7 @@ fn spread_attributes_from_data_stay_attributes() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("attrs.qwe"), free_port(), Some(&dir.join("attrs.js")));
+    let r = run_page_with(&chrome, &dir.join("attrs.qwe"), 0, Some(&dir.join("attrs.js")));
     let want = serde_json::json!({
         "form": ["/login", "post"],
         "formAttrs": ["action", "href", "id", "method", "title"],
@@ -305,7 +315,7 @@ fn a_binding_and_a_handler_on_one_input_both_run() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("binds.qwe"), free_port(), Some(&dir.join("binds.js")));
+    let r = run_page_with(&chrome, &dir.join("binds.qwe"), 0, Some(&dir.join("binds.js")));
     let want = serde_json::json!({ "text": "20000|asked about 20000|Ana|Ana|on|yes", "cleared": "", "errors": [] });
     assert_eq!(r, want);
 }
@@ -321,7 +331,7 @@ fn an_input_held_to_a_state_and_nothing_else_is_two_way() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("implied.qwe"), free_port(), Some(&dir.join("implied.js")));
+    let r = run_page_with(&chrome, &dir.join("implied.qwe"), 0, Some(&dir.join("implied.js")));
     let want = serde_json::json!({
         // qty, a number input: 3 typed is the number 3 (4 shown), not the text "3" ("31").
         "person": "Ana|on|whole|s|ABC|kept|2|open|closed|quiet|0.25|2|0.5|4",
@@ -348,11 +358,11 @@ fn islands_load_their_code_when_it_is_needed() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("lazy.qwe"), free_port(), Some(&dir.join("lazy.js")));
+    let r = run_page_with(&chrome, &dir.join("lazy.qwe"), 0, Some(&dir.join("lazy.js")));
     let want = serde_json::json!({ "idleLoads": false, "loadedOnFocus": true, "echo": "Ada", "clicked": "Go 1", "value": "Ada",
         "sameNodes": true, "remade": 0, "errors": [] });
     assert_eq!(r, want);
-    let r = run_page_with_path(&chrome, &dir.join("lazy.qwe"), free_port(), "/clock", Some(&dir.join("lazy.js")));
+    let r = run_page_with_path(&chrome, &dir.join("lazy.qwe"), 0, "/clock", Some(&dir.join("lazy.js")));
     assert_eq!(r, serde_json::json!({ "clockRuns": true, "errors": [] }));
 }
 
@@ -368,7 +378,7 @@ fn mouse_events_before_the_code_comes_are_done_again_as_made() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("early.qwe"), free_port(), Some(&dir.join("early.js")));
+    let r = run_page_with(&chrome, &dir.join("early.qwe"), 0, Some(&dir.join("early.js")));
     let want = serde_json::json!({
         "before": false,
         "kept": 9,
@@ -389,7 +399,7 @@ fn ask_waits_for_an_answer_and_notify_goes_by_itself() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("notices.qwe"), free_port(), Some(&dir.join("notices.js")));
+    let r = run_page_with(&chrome, &dir.join("notices.qwe"), 0, Some(&dir.join("notices.js")));
     let want = serde_json::json!({ "dialog": "alertdialog", "title": "Delete", "focus": "q-cancel", "waits": "3", "after": "2", "gone": true,
         "toast": "Deleted", "toastGone": true, "escaped": "2", "focusBack": "del", "errors": [] });
     assert_eq!(r, want);
@@ -404,7 +414,7 @@ fn highlight_is_the_same_on_both_sides() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("highlight.qwe"), free_port(), Some(&dir.join("highlight.js")));
+    let r = run_page_with(&chrome, &dir.join("highlight.qwe"), 0, Some(&dir.join("highlight.js")));
     let want = serde_json::json!({ "samples": 11, "same": true, "differ": [], "coloured": 10, "errors": [] });
     assert_eq!(r, want);
 }
@@ -418,7 +428,7 @@ fn components_call_the_pages_javascript() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("interop.qwe"), free_port(), Some(&dir.join("interop.js")));
+    let r = run_page_with(&chrome, &dir.join("interop.qwe"), 0, Some(&dir.join("interop.js")));
     let want = serde_json::json!({
         "mounted": ["gauge 1", 1],
         "called": ["gauge 2", "4"],
@@ -440,7 +450,7 @@ fn components_use_libraries_by_name() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("libs.qwe"), free_port(), Some(&dir.join("libs.js")));
+    let r = run_page_with(&chrome, &dir.join("libs.qwe"), 0, Some(&dir.join("libs.js")));
     // One script for both names, before the runtime and the bundle. Calling the
     // class without `.new` stops the handler, saying how to make one.
     let near = "err(\"js_new: gauge is not defined on this page (did you mean Gauge?)\")";
@@ -465,7 +475,7 @@ fn components_use_modules_by_name() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("modules.qwe"), free_port(), Some(&dir.join("modules.js")));
+    let r = run_page_with(&chrome, &dir.join("modules.qwe"), 0, Some(&dir.join("modules.js")));
     let want = serde_json::json!({
         "early": false,
         "made": "3 4 8 hello ann 2.0.0 5 hello bo 10 2.0.0 late",
@@ -490,7 +500,7 @@ fn the_ways_around_the_pages_checks_do_not_run_text() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("guard.qwe"), free_port(), Some(&dir.join("guard.js")));
+    let r = run_page_with(&chrome, &dir.join("guard.qwe"), 0, Some(&dir.join("guard.js")));
     let want = serde_json::json!({
         "reflect": "refused",
         "parse": "refused",
@@ -515,7 +525,7 @@ fn changes_touch_only_what_shows_them() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("fine.qwe"), free_port(), Some(&dir.join("fine.js")));
+    let r = run_page_with(&chrome, &dir.join("fine.qwe"), 0, Some(&dir.join("fine.js")));
     let want = serde_json::json!({
         "start": { "parent": 1, "child": 1 },
         "edit": ["characterData"],
@@ -541,7 +551,7 @@ fn navigate_without_a_single_page_app_loads_the_page() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("goto.qwe"), free_port(), Some(&dir.join("goto.js")));
+    let r = run_page_with(&chrome, &dir.join("goto.qwe"), 0, Some(&dir.join("goto.js")));
     let want = serde_json::json!({ "path": "/results", "query": { "q": "rust & go", "page": "2" }, "reloaded": true, "errors": [] });
     assert_eq!(r, want);
 }
@@ -555,7 +565,7 @@ fn a_component_sets_fields_of_the_pages_objects() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("fields.qwe"), free_port(), Some(&dir.join("fields.js")));
+    let r = run_page_with(&chrome, &dir.join("fields.qwe"), 0, Some(&dir.join("fields.js")));
     assert_eq!((&r["mounted"], &r["cleared"], &r["by_event"], &r["added"], &r["bad"]), (&"mounted".into(), &"".into(), &"".into(), &"51".into(), &"".into()), "{}", r);
     let errors = r["errors"].as_array().unwrap();
     assert!(errors.len() == 1 && errors[0].as_str().unwrap().contains("`innerHTML` is not set from Quillo code"), "{}", r);
@@ -572,7 +582,7 @@ fn a_refused_prefetch_does_not_stop_the_click() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("refused.qwe"), free_port(), Some(&dir.join("refused.js")));
+    let r = run_page_with(&chrome, &dir.join("refused.qwe"), 0, Some(&dir.join("refused.js")));
     assert_eq!(r, serde_json::json!({ "path": "/thread", "views": 1 }));
 }
 
@@ -587,7 +597,7 @@ fn spots_on_a_page_are_gone_to_as_the_browser_would() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("hash.qwe"), free_port(), Some(&dir.join("hash.js")));
+    let r = run_page_with(&chrome, &dir.join("hash.qwe"), 0, Some(&dir.join("hash.js")));
     let want = serde_json::json!({
         "link": { "at": true, "target": "target", "note": "/#target" },
         "back": { "hash": "", "note": "/#" },
@@ -608,7 +618,7 @@ fn markdown_in_a_component_is_the_servers() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("markdown.qwe"), free_port(), Some(&dir.join("markdown.js")));
+    let r = run_page_with(&chrome, &dir.join("markdown.qwe"), 0, Some(&dir.join("markdown.js")));
     assert_eq!(r["first"], "<p><strong>hi</strong> &lt;b&gt;x&lt;/b&gt;</p>\n", "{}", r);
     assert_eq!(r["same"], serde_json::json!([true, true, true, true]), "{}", r);
     let errors = r["errors"].as_array().unwrap();
@@ -625,7 +635,7 @@ fn and_in_markup_keeps_its_elements() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("and_markup.qwe"), free_port(), Some(&dir.join("and_markup.js")));
+    let r = run_page_with(&chrome, &dir.join("and_markup.qwe"), 0, Some(&dir.join("and_markup.js")));
     assert_eq!(
         r,
         serde_json::json!({ "same": true, "focused": true, "value": "Grace", "typed": "Grace", "ticked": true, "closed": true, "errors": [] })
@@ -643,7 +653,7 @@ fn styles_are_their_components_own() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("styles.qwe"), free_port(), Some(&dir.join("styles.js")));
+    let r = run_page_with(&chrome, &dir.join("styles.qwe"), 0, Some(&dir.join("styles.js")));
     assert_eq!(
         r,
         serde_json::json!({
@@ -665,7 +675,7 @@ fn a_textarea_follows_the_text_between_its_tags() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("textarea.qwe"), free_port(), Some(&dir.join("textarea.js")));
+    let r = run_page_with(&chrome, &dir.join("textarea.qwe"), 0, Some(&dir.join("textarea.js")));
     assert_eq!(
         r,
         serde_json::json!({
@@ -687,7 +697,7 @@ fn a_link_pointed_at_is_there_when_followed() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("prefetch.qwe"), free_port(), Some(&dir.join("prefetch.js")));
+    let r = run_page_with(&chrome, &dir.join("prefetch.qwe"), 0, Some(&dir.join("prefetch.js")));
     assert_eq!(r, serde_json::json!({ "fast": true, "kept": true, "errors": [] }));
 }
 
@@ -701,7 +711,7 @@ fn a_link_in_a_component_pointed_at_starts_with_its_state() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("ahead.qwe"), free_port(), Some(&dir.join("ahead.js")));
+    let r = run_page_with(&chrome, &dir.join("ahead.qwe"), 0, Some(&dir.join("ahead.js")));
     assert_eq!(r, serde_json::json!({
         "errors": [],
         "fetched": 1,
@@ -725,7 +735,7 @@ fn two_clicks_on_an_idempotent_call_are_one() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("once.qwe"), free_port(), Some(&dir.join("once.js")));
+    let r = run_page_with(&chrome, &dir.join("once.qwe"), 0, Some(&dir.join("once.js")));
     assert_eq!(r, serde_json::json!({
         "errors": [],
         "form": [1, "1"],
@@ -746,7 +756,7 @@ fn a_page_refused_live_data_waits_and_says_so() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("live_refused.qwe"), free_port(), Some(&dir.join("live_refused.js")));
+    let r = run_page_with(&chrome, &dir.join("live_refused.qwe"), 0, Some(&dir.join("live_refused.js")));
     assert_eq!(r, serde_json::json!({
         "errors": [],
         "told_once": 1,
@@ -765,7 +775,7 @@ fn a_loader_with_a_gap_refreshes_no_oftener() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("gap.qwe"), free_port(), Some(&dir.join("gap.js")));
+    let r = run_page_with(&chrome, &dir.join("gap.qwe"), 0, Some(&dir.join("gap.js")));
     assert_eq!(r, serde_json::json!({ "errors": [], "refreshes_few": true, "ended_with_the_last": "10" }));
 }
 
@@ -778,7 +788,7 @@ fn the_server_and_the_browser_agree() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("sides.qwe"), free_port(), Some(&dir.join("sides.js")));
+    let r = run_page_with(&chrome, &dir.join("sides.qwe"), 0, Some(&dir.join("sides.js")));
     assert_eq!(r["differ"], serde_json::json!([]), "{}", r);
     assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
     let v = &r["values"];
@@ -812,7 +822,7 @@ fn a_2xx_its_server_did_not_send_is_an_error_not_null() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("rpc_no_answer.qwe"), free_port(), Some(&dir.join("rpc_no_answer.js")));
+    let r = run_page_with(&chrome, &dir.join("rpc_no_answer.qwe"), 0, Some(&dir.join("rpc_no_answer.js")));
     assert_eq!(r["first"], "value: real", "{}", r);
     let no = "err: server fn `question` answered something that is not its answer";
     for (k, tail) in [
@@ -857,7 +867,7 @@ fn a_files_style_reaches_a_component_first_shown_in_the_browser() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("file_style_late.qwe"), free_port(), Some(&dir.join("file_style_late.js")));
+    let r = run_page_with(&chrome, &dir.join("file_style_late.qwe"), 0, Some(&dir.join("file_style_late.js")));
     assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
     assert_eq!(r["badge"], "rgb(1, 2, 3)", "no style of its own: {}", r);
     assert_eq!(r["own"], "rgb(4, 5, 6)", "the file's, beside its own: {}", r);
@@ -871,7 +881,7 @@ fn a_frame_or_player_with_a_listener_still_hears_its_load() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("src_heard.qwe"), free_port(), Some(&dir.join("src_heard.js")));
+    let r = run_page_with(&chrome, &dir.join("src_heard.qwe"), 0, Some(&dir.join("src_heard.js")));
     assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
     assert_eq!(r["after"], "1", "the listener written after src: {}", r);
     assert_eq!(r["before"], "1", "the listener written before src: {}", r);
@@ -884,7 +894,7 @@ fn a_src_the_page_already_says_is_not_asked_for_again() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("src_once.qwe"), free_port(), Some(&dir.join("src_once.js")));
+    let r = run_page_with(&chrome, &dir.join("src_once.qwe"), 0, Some(&dir.join("src_once.js")));
     assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
     for k in ["lit", "held", "state", "tpl0", "pic", "row", "film"] {
         assert_eq!(r["seen"][k], 1, "{} on load: {}", k, r);
@@ -903,7 +913,7 @@ fn the_seam_with_the_page_holds() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("seam.qwe"), free_port(), Some(&dir.join("seam.js")));
+    let r = run_page_with(&chrome, &dir.join("seam.qwe"), 0, Some(&dir.join("seam.js")));
     assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
     assert_eq!(r["same"], "false true true 1 false false true true", "{}", r);
     assert_eq!(r["prop"], "str a!", "{}", r);
@@ -939,7 +949,7 @@ fn a_prerendered_page_starts_when_it_is_shown() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("prerender.qwe"), free_port(), Some(&dir.join("prerender.js")));
+    let r = run_page_with(&chrome, &dir.join("prerender.qwe"), 0, Some(&dir.join("prerender.js")));
     assert_eq!(r, serde_json::json!({
         "held": { "text": "not yet", "calls": 0 },
         "shown": { "text": "ran", "calls": 1 },
@@ -956,7 +966,7 @@ fn components_translate_in_the_browser() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with_path(&chrome, &dir.join("i18n.qwe"), free_port(), "/?lang=ru", Some(&dir.join("i18n.js")));
+    let r = run_page_with_path(&chrome, &dir.join("i18n.qwe"), 0, "/?lang=ru", Some(&dir.join("i18n.js")));
     let want = serde_json::json!({
         "seen": ["1 товар", "2 товара", "3 товара", "4 товара", "5 товаров"],
         "button": "Добавить",
@@ -976,7 +986,7 @@ fn composition_survives_kept_rows() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("slots.qwe"), free_port(), Some(&dir.join("slots.js")));
+    let r = run_page_with(&chrome, &dir.join("slots.qwe"), 0, Some(&dir.join("slots.js")));
     let want = serde_json::json!({
         "layout": ["Groups", "<a href=\"/about\">About</a>"],
         "start": [
@@ -1010,7 +1020,7 @@ fn composition_example_works() {
     let r = run_page_with(
         &chrome,
         &root.join("tests/programs/compose.qwe"),
-        free_port(),
+        0,
         Some(&root.join("tests/browser/compose-example.js")),
     );
     let want = serde_json::json!({
@@ -1035,7 +1045,7 @@ fn json_layout_renders_and_follows_edits() {
     let r = run_page_with(
         &chrome,
         &root.join("tests/programs/layout.qwe"),
-        free_port(),
+        0,
         Some(&root.join("tests/browser/layout.js")),
     );
     let want = serde_json::json!({
@@ -1065,7 +1075,7 @@ fn single_page_app_navigates_without_reloading() {
     let r = run_page_with(
         &chrome,
         &root.join("tests/programs/spa.qwe"),
-        free_port(),
+        0,
         Some(&root.join("tests/browser/spa.js")),
     );
     let want = serde_json::json!({
@@ -1095,7 +1105,7 @@ fn mounted_single_page_app_stays_under_its_prefix() {
     let r = run_page_with_path(
         &chrome,
         &root.join("tests/programs/index.qwe"),
-        free_port(),
+        0,
         "/spa",
         Some(&root.join("tests/browser/mounted.js")),
     );
@@ -1118,7 +1128,7 @@ fn example_gallery_tabs_switch_without_reloading() {
         return;
     };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let r = run_page_with_path(&chrome, &root.join("tests/programs/index.qwe"), free_port(), "/", Some(&root.join("tests/browser/gallery.js")));
+    let r = run_page_with_path(&chrome, &root.join("tests/programs/index.qwe"), 0, "/", Some(&root.join("tests/browser/gallery.js")));
     let want = serde_json::json!({
         "start": ["/", "Todo", "/todo"],
         "shop": ["/?ex=spa", "Shop", "/spa"],
@@ -1140,7 +1150,7 @@ fn shop_stock_updates_live_and_the_cart_reserves_it() {
         return;
     };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let r = run_page_with(&chrome, &root.join("tests/programs/spa.qwe"), free_port(), Some(&root.join("tests/browser/spa-live.js")));
+    let r = run_page_with(&chrome, &root.join("tests/programs/spa.qwe"), 0, Some(&root.join("tests/browser/spa-live.js")));
     let want = serde_json::json!({
         "before": "10 in stock",
         "liveArrived": true,
@@ -1166,7 +1176,7 @@ fn game_of_life_runs_in_the_browser() {
         return;
     };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let r = run_page_with(&chrome, &root.join("tests/programs/life.qwe"), free_port(), Some(&root.join("tests/browser/life.js")));
+    let r = run_page_with(&chrome, &root.join("tests/programs/life.qwe"), 0, Some(&root.join("tests/browser/life.js")));
     let want = serde_json::json!({
         "start": ["0", "36"],
         "one": "39",
@@ -1192,7 +1202,7 @@ fn a_state_storm_leaves_nothing_behind() {
         return;
     };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut r = run_page_with(&chrome, &root.join("tests/programs/storm.qwe"), free_port(), Some(&root.join("tests/browser/storm.js")));
+    let mut r = run_page_with(&chrome, &root.join("tests/programs/storm.qwe"), 0, Some(&root.join("tests/browser/storm.js")));
     // Reported for information; varies from run to run.
     r.as_object_mut().unwrap().remove("heapGrowthKB");
     let want = serde_json::json!({
@@ -1214,7 +1224,7 @@ fn pages_read_streams_as_they_come() {
         eprintln!("skipping: needs Chrome and Node 22 or later");
         return;
     };
-    let result = run_page(&chrome, "streams.qwe", free_port());
+    let result = run_page(&chrome, "streams.qwe", 0);
     let want = serde_json::json!({
         "progressDone": true,
         "names": "progress,progress,progress",
@@ -1259,7 +1269,7 @@ fn channels_work(args: &[&str], via: &str) {
             }
         })
     };
-    let r = run_page_args(&chrome, &app, free_port(), "/", Some(&root.join("tests/browser/channels.js")), args);
+    let r = run_page_args(&chrome, &app, 0, "/", Some(&root.join("tests/browser/channels.js")), args);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     sender.join().unwrap();
     assert_eq!(r["via"], via, "{}", r);
@@ -1315,7 +1325,7 @@ fn media_plays(args: &[&str], via: &str) {
     // A keyframe every 10 s, from when the server listens; the page comes
     // 3 s after it.
     let mut ff = None;
-    let r = run_page_args_late(&chrome, &d.join("media.qwe"), free_port(), &root.join("tests/browser/media.js"), args, Duration::from_secs(3), || {
+    let r = run_page_args_late(&chrome, &d.join("media.qwe"), 0, &root.join("tests/browser/media.js"), args, Duration::from_secs(3), || {
         ff = ffmpeg_rtp(video, audio, 300);
         ff.is_some()
     });
@@ -1338,22 +1348,7 @@ fn media_plays(args: &[&str], via: &str) {
 /// the page loaded `late` after; `None` when `start` says it could not.
 fn run_page_args_late(chrome: &Path, app: &Path, port: u16, script: &Path, args: &[&str], late: Duration, start: impl FnOnce() -> bool) -> Option<serde_json::Value> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let server = support::Guard::new(
-        Command::new(env!("CARGO_BIN_EXE_quillo"))
-            .arg("run")
-            .arg(app)
-            .args(["--port", &port.to_string()])
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let (server, port) = serving(app, port, args);
     if !start() {
         return None;
     }
@@ -1393,7 +1388,7 @@ fn decimals_cross_to_the_page_and_back() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("decimals.qwe"), free_port(), Some(&dir.join("decimals.js")));
+    let r = run_page_with(&chrome, &dir.join("decimals.qwe"), 0, Some(&dir.join("decimals.js")));
     let want = serde_json::json!({
         "server": ["25.00", "9007199254740994", "dec int"],
         "added": "25.10",
@@ -1414,7 +1409,7 @@ fn two_files_with_one_component_name_work_side_by_side() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("modules/main.qwe"), free_port(), Some(&dir.join("modules/drive.js")));
+    let r = run_page_with(&chrome, &dir.join("modules/main.qwe"), 0, Some(&dir.join("modules/drive.js")));
     let want = serde_json::json!({
         "server": ["red 1", "blue 10"],
         "after": ["red 2", "blue 11"],
@@ -1434,7 +1429,7 @@ fn bits_and_filled_work_in_a_page_as_on_the_server() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("bits.qwe"), free_port(), Some(&dir.join("bits.js")));
+    let r = run_page_with(&chrome, &dir.join("bits.qwe"), 0, Some(&dir.join("bits.js")));
     let want = serde_json::json!({
         "server": ["48", "4611686018427387904", "1", "anonymous"],
         "flipped": "12",
@@ -1455,13 +1450,13 @@ fn an_error_in_a_page_names_its_place_in_development_only() {
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
     let (app, script) = (dir.join("placed.qwe"), dir.join("placed.js"));
-    let r = run_page_args(&chrome, &app, free_port(), "/", Some(&script), &["--watch"]);
+    let r = run_page_args(&chrome, &app, 0, "/", Some(&script), &["--watch"]);
     let said = r["said"][0].as_str().unwrap_or_else(|| panic!("{}", r));
     assert!(said.contains("placed.qwe:2: division by zero\n  in inner, called at "), "{}", said);
     assert!(said.contains("placed.qwe:3\n  in share, called at "), "{}", said);
     assert!(said.contains("placed.qwe:7"), "{}", said);
     assert!(said.ends_with("<the error>"), "{}", said);
-    let r = run_page_args(&chrome, &app, free_port(), "/", Some(&script), &[]);
+    let r = run_page_args(&chrome, &app, 0, "/", Some(&script), &[]);
     assert_eq!(r["said"], serde_json::json!(["quillo: division by zero"]));
 }
 
@@ -1476,12 +1471,12 @@ fn a_failed_server_fn_says_why_in_development_only() {
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
     let (app, script) = (dir.join("rpc_failed.qwe"), dir.join("rpc_failed.js"));
-    let r = run_page_args(&chrome, &app, free_port(), "/", Some(&script), &["--watch"]);
+    let r = run_page_args(&chrome, &app, 0, "/", Some(&script), &["--watch"]);
     let value = r["value"].as_str().unwrap_or_else(|| panic!("{}", r));
     assert!(value.starts_with("err(\"server fn `down` failed (500): ") && value.contains("rpc_failed.qwe:3: division by zero"), "{}", r);
     let said = r["said"].as_array().unwrap_or_else(|| panic!("{}", r));
     assert!(said.len() == 1 && said[0].as_str().is_some_and(|s| s.starts_with("quillo: server fn `down` failed: ") && s.contains("rpc_failed.qwe:3: division by zero")), "{}", r);
-    let r = run_page_args(&chrome, &app, free_port(), "/", Some(&script), &[]);
+    let r = run_page_args(&chrome, &app, 0, "/", Some(&script), &[]);
     let value = r["value"].as_str().unwrap_or_else(|| panic!("{}", r));
     assert!(!value.contains("division") && !value.contains("rpc_failed.qwe") && value.starts_with("err("), "{}", r);
     assert_eq!(r["said"], serde_json::json!([]), "{}", r);
@@ -1500,7 +1495,7 @@ fn a_developer_tool_hears_what_happens() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
     let (app, script) = (dir.join("devtools.qwe"), dir.join("devtools.js"));
     for dev in [true, false] {
-        let r = run_page_args(&chrome, &app, free_port(), "/", Some(&script), if dev { &["--watch"] } else { &[] });
+        let r = run_page_args(&chrome, &app, 0, "/", Some(&script), if dev { &["--watch"] } else { &[] });
         assert!(r["exception"].is_null(), "{}", r);
         let heard = r["heard"].as_array().unwrap();
         let of = |t: &str| heard.iter().filter(|m| m["type"] == t).collect::<Vec<_>>();
@@ -1545,7 +1540,7 @@ fn a_developer_tool_hears_what_happens() {
         assert!(answers.iter().any(|a| a["id"].is_null() && a["ok"] == true), "{}", r);
     }
     // A page that does not ask hears nothing, and is not answered.
-    let r = run_page_args(&chrome, &app, free_port(), "/plain", Some(&script), &[]);
+    let r = run_page_args(&chrome, &app, 0, "/plain", Some(&script), &[]);
     assert_eq!((r["heard"].clone(), r["answers"].clone()), (serde_json::json!([]), serde_json::json!([])), "{}", r);
 }
 
@@ -1561,8 +1556,8 @@ fn in_development_the_runtime_and_the_page_keep_their_own_names() {
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
     let (app, script) = (dir.join("scoped/main.qwe"), dir.join("scoped.js"));
-    let dev = run_page_args(&chrome, &app, free_port(), "/", Some(&script), &["--watch"]);
-    let prod = run_page_args(&chrome, &app, free_port(), "/", Some(&script), &[]);
+    let dev = run_page_args(&chrome, &app, 0, "/", Some(&script), &["--watch"]);
+    let prod = run_page_args(&chrome, &app, 0, "/", Some(&script), &[]);
     for r in [&dev, &prod] {
         assert_eq!(r["report"], "the page's own report", "{}", r);
         assert_eq!(r["second"], "tally 2", "{}", r);
@@ -1582,20 +1577,17 @@ fn in_development_components_come_in_files_of_their_own_mapped_to_their_lines() 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
     let app = dir.join("devmode/main.qwe");
     let source = dir.join("devmode/ui/counter.qwe").canonicalize().unwrap();
-    let port = free_port();
+    // The system picks the port and the server says which, as in `run_page_args` (branch
+    // security).
     let mut server = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(&app)
-        .args(["--port", &port.to_string(), "--watch"])
+        .args(["--port", "0", "--watch"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let port = support::port_in_stderr(&mut server, "devmode/main.qwe", Instant::now() + Duration::from_secs(10));
     let profile = std::env::temp_dir().join(format!("quillo-chrome-{}-{}", std::process::id(), port));
     // A breakpoint on `count += 1` (line 7), as an editor sets it, through the maps.
     let out = Command::new("node")
@@ -1633,7 +1625,7 @@ fn the_edges_of_feedback30_hold_in_the_browser() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with_path(&chrome, &dir.join("edges30.qwe"), free_port(), "/?lang=es", Some(&dir.join("edges30.js")));
+    let r = run_page_with_path(&chrome, &dir.join("edges30.qwe"), 0, "/?lang=es", Some(&dir.join("edges30.js")));
     assert_eq!(r["errors"].as_array().map(|e| e.iter().filter(|x| !x.as_str().unwrap_or("").contains("date.format")).count()), Some(0), "{}", r);
     assert_eq!(r["server"], r["browser"], "{}", r);
     assert_eq!(r["server"][0], "0 mensajes", "{}", r);

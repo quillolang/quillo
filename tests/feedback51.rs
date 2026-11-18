@@ -494,27 +494,24 @@ routes /ok | fine { route GET /x = "ok" }
 }
 
 /// `quillo run` with these arguments and this environment, once it listens.
+/// The system picks the port and the server says which: a port picked here could be taken by
+/// another process first (a shown bug in the test; branch security).
 fn run_with(d: &Path, file: &str, args: &[&str], env: &[(&str, &str)]) -> (support::Guard, u16) {
-    let port = support::free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(file)
-        .args(["--port", &port.to_string()])
+        .args(["--port", "0"])
         .args(args)
         .current_dir(d)
         .env_remove("QUILLO_SERVICE_SECRET")
         .envs(env.iter().copied())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let g = support::Guard::new(child);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(std::time::Instant::now() < deadline, "{} did not start", file);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    let mut g = support::Guard::new(child);
+    let port = support::port_in_stderr(&mut g.0, file, std::time::Instant::now() + std::time::Duration::from_secs(20));
     (g, port)
 }
 

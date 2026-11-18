@@ -518,14 +518,11 @@ fn the_command_line_says_what_a_file_is_and_serves_a_folder() {
     assert!(stderr(&quillo(&d, &["serve", "nowhere"])).contains("nowhere is not a folder"));
     assert!(stderr(&quillo(&d, &["serve", "a", "b"])).contains("`serve` takes one folder"));
     assert!(stdout(&quillo(&d, &["serve", "--help"])).contains("quillo serve <folder>"));
-    let port = support::free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_quillo")).args(["serve", "site", "--port", &port.to_string()]).current_dir(&d).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    let _g = support::Guard::new(child);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // The system picks the port and the server says which (a port picked here could be taken by
+    // another process first; a shown bug in the test, branch security).
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo")).args(["serve", "site", "--port", "0"]).current_dir(&d).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut _g = support::Guard::new(child);
+    let port = support::port_in_stderr(&mut _g.0, "site", Instant::now() + Duration::from_secs(20));
     assert_eq!(send(port, "GET", "/", &[], "").body, "<p>home</p>");
     assert_eq!(send(port, "GET", "/about", &[], "").body, "about");
 }

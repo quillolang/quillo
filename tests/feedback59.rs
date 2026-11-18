@@ -9,7 +9,7 @@ mod support;
 use sha2::Digest;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn dir(name: &str, src: &str) -> PathBuf {
     let d = support::temp_dir(&format!("f59-{}", name));
@@ -23,13 +23,14 @@ fn check(d: &Path) -> String {
 }
 
 /// A server whose lines go to a file: (guard, port, log).
+/// The system picks the port and the log says which: a port picked here could be taken by another
+/// process first (a shown bug in the test; branch security).
 fn serve_logged(d: &Path, args: &[&str]) -> (support::Guard, u16, PathBuf) {
-    let port = support::free_port();
     let log = d.join("server.log");
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(d.join("main.qwe"))
-        .args(["--port", &port.to_string()])
+        .args(["--port", "0"])
         .args(args)
         .env("QUILLO_SECRET", "a test secret for the tests, 32 bytes or more")
         .stdin(Stdio::null())
@@ -37,12 +38,8 @@ fn serve_logged(d: &Path, args: &[&str]) -> (support::Guard, u16, PathBuf) {
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
-    let g = support::Guard::new(child);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start: {}", std::fs::read_to_string(&log).unwrap_or_default());
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut g = support::Guard::new(child);
+    let port = support::port_in_log(&mut g.0, &log, Duration::from_secs(20));
     (g, port, log)
 }
 

@@ -28,11 +28,12 @@ fn stderr(o: &Output) -> String {
 }
 
 /// A server in `dir`, its log in a file there; stopped when dropped.
+/// The system picks the port and the log says which: a port picked here could be taken by another
+/// process first (a shown bug in the test; branch security).
 fn serving(dir: &Path, args: &[&str]) -> (support::Guard, u16, PathBuf) {
-    let port = support::free_port();
     let log = dir.join("log.txt");
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["run", "main.qwe", "--port", &port.to_string()])
+        .args(["run", "main.qwe", "--port", "0"])
         .args(args)
         .current_dir(dir)
         .env("HOME", dir)
@@ -41,12 +42,8 @@ fn serving(dir: &Path, args: &[&str]) -> (support::Guard, u16, PathBuf) {
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
-    let guard = support::Guard::new(child);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start: {}", std::fs::read_to_string(&log).unwrap_or_default());
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut guard = support::Guard::new(child);
+    let port = support::port_in_log(&mut guard.0, &log, Duration::from_secs(20));
     (guard, port, log)
 }
 

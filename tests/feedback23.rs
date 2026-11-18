@@ -284,6 +284,9 @@ fn as_service(file: &Path, port: u16) -> Child {
         assert!(Instant::now() < deadline, "the service did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
+    // Its port is given, as the front was told it or it is started again there: the listener is
+    // checked to be it, as another process could have taken the port (branch security).
+    assert!(support::listener_is(port, child.id()), "another process listens on {}", port);
     child
 }
 
@@ -330,19 +333,21 @@ fn a_step_that_stops_with_an_error_runs_again() {
 #[test]
 fn a_call_given_up_on_is_counted() {
     let d = dir("counted", &[("work.qwe", "server fn step(x: int) = x\n"), ("front.qwe", "db.open(\"front.db\")\nservice work = \"work.qwe\"\nfn shown(s) = s == null ? null : merge(s, { error: error(s.error) })\nlet wrong = json.parse(\"[\\\"not a number\\\"]\")\nroute GET /go = work.later.step(wrong[0])\nroute GET /status/:id = json.stringify(shown(later.status(id)))\n")]);
-    let port = support::free_port();
+    // The system picks the port and the server says which: a port picked here could be taken by
+    // another process first (a shown bug in the test; branch security).
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(d.join("front.qwe"))
-        .args(["--port", &port.to_string(), "--metrics"])
+        .args(["--port", "0", "--metrics"])
         .env("QUILLO_SECRET", "test secret for the tests")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     support::stop_with_tests(&child);
-    let _guard = support::Guard::new(child);
+    let mut _guard = support::Guard::new(child);
+    let port = support::port_in_stderr(&mut _guard.0, "front.qwe", Instant::now() + Duration::from_secs(20));
     eventually(20, "the server did not start", || support::listening(port) && send(port, "GET", "/status/x", &[], "").status == 200);
     let id = send(port, "GET", "/go", &[], "").body;
     eventually(15, "the call was not marked", || send(port, "GET", &format!("/status/{}", id), &[], "").body.contains("failed"));

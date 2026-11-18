@@ -56,24 +56,32 @@ fn dir() -> PathBuf {
 }
 
 /// `quillo run` on `app` at `port` with `args`, killed when dropped.
-fn serve(app: &Path, port: u16, args: &[&str]) -> support::Guard {
-    let server = support::Guard::new(
+/// On `port` 0 the system picks the port and the server says which: a port picked here could be
+/// taken by another process first (a shown bug in the test; branch security). A port given (a
+/// server started again where the one before was) is checked to be this server's.
+fn serve(app: &Path, port: u16, args: &[&str]) -> (support::Guard, u16) {
+    let mut server = support::Guard::new(
         Command::new(env!("CARGO_BIN_EXE_quillo"))
             .arg("run")
             .arg(app)
             .args(["--port", &port.to_string()])
             .args(args)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(if port == 0 { Stdio::piped() } else { Stdio::null() })
             .spawn()
             .unwrap(),
     );
     let deadline = Instant::now() + Duration::from_secs(10);
+    if port == 0 {
+        let port = support::port_in_stderr(&mut server.0, &app.display().to_string(), deadline);
+        return (server, port);
+    }
     while !support::listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
-    server
+    assert!(support::listener_is(port, server.0.id()), "another process listens on {}", port);
+    (server, port)
 }
 
 /// run.js loading `path` of the server at `port`, with `script`.
@@ -103,8 +111,7 @@ static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// returns what the script recorded in `data-result`.
 fn run_page(chrome: &Path, app: &str, path: &str, script: &str, args: &[&str]) -> serde_json::Value {
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let port = support::free_port();
-    let server = serve(&dir().join(app), port, args);
+    let (server, port) = serve(&dir().join(app), 0, args);
     let (mut cmd, profile) = run_js(chrome, port, path, &dir().join(script));
     let out = cmd.output().expect("node");
     drop(server);
@@ -369,8 +376,7 @@ fn a_channel_is_found_again_when_the_server_restarts() {
     let Some(chrome) = browser() else { return };
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let app = dir().join("cover-channels.qwe");
-    let port = support::free_port();
-    let first = serve(&app, port, &["--no-wt"]);
+    let (first, port) = serve(&app, 0, &["--no-wt"]);
     let (mut cmd, profile) = run_js(&chrome, port, "/", &dir().join("cover-channels-restart.js"));
     // What run.js prints, in files, so that the page is a Guard (stopped if this fails).
     let said = (profile.with_extension("out"), profile.with_extension("err"));
@@ -385,7 +391,7 @@ fn a_channel_is_found_again_when_the_server_restarts() {
     }
     drop(first);
     std::thread::sleep(Duration::from_millis(1500));
-    let second = serve(&app, port, &["--no-wt"]);
+    let (second, _) = serve(&app, port, &["--no-wt"]);
     let status = page.0.wait().expect("node");
     drop(second);
     let out = std::process::Output { status, stdout: std::fs::read(&said.0).unwrap(), stderr: std::fs::read(&said.1).unwrap() };

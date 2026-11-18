@@ -150,13 +150,18 @@ fn other_databases_run_their_files_as_before() {
 }
 
 /// A `quillo run` server whose lines go to a file: (child, port, log).
+/// The system picks the port and the log says which: a port picked here could be taken by another
+/// process first (a shown bug in the test; branch security). A port `args` name (for a first load
+/// that fails under --watch, which says no port) is kept, and checked to be this server's.
 fn serve_logged(d: &Path, args: &[&str]) -> (support::Guard, u16, PathBuf) {
-    let port = support::free_port();
     let log = d.join("server.log");
-    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .arg("run")
-        .arg(d.join("main.qwe"))
-        .args(["--port", &port.to_string()])
+    let named = support::port_named(args);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_quillo"));
+    c.arg("run").arg(d.join("main.qwe"));
+    if named.is_none() {
+        c.args(["--port", "0"]);
+    }
+    let child = c
         .args(args)
         .env("QUILLO_SECRET", "a test secret for the tests, 32 bytes or more")
         .stdin(Stdio::null())
@@ -164,12 +169,13 @@ fn serve_logged(d: &Path, args: &[&str]) -> (support::Guard, u16, PathBuf) {
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
-    let g = support::Guard::new(child);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start: {}", std::fs::read_to_string(&log).unwrap_or_default());
-        std::thread::sleep(Duration::from_millis(20));
+    let mut g = support::Guard::new(child);
+    if let Some(port) = named {
+        assert!(until(20, || support::listening(port)), "server did not start: {}", std::fs::read_to_string(&log).unwrap_or_default());
+        assert!(support::listener_is(port, g.0.id()), "another process listens on {}", port);
+        return (g, port, log);
     }
+    let port = support::port_in_log(&mut g.0, &log, Duration::from_secs(20));
     (g, port, log)
 }
 
@@ -330,7 +336,9 @@ fn a_broken_first_migration_and_another_databases_folder_are_watched() {
     std::fs::write(d.join("migrations/001_a.sql"), "create table a (id integer);\ninsert into nowhere values (1);").unwrap();
     std::fs::write(d.join("main.qwe"), TABLES).unwrap();
     {
-        let (_g, port, log) = serve_logged(&d, &["--watch"]);
+        // Its first load fails, and then it says no port: one is given (branch security).
+        let given = support::free_port().to_string();
+        let (_g, port, log) = serve_logged(&d, &["--watch", "--port", &given]);
         let tables = || support::send(port, "GET", "/tables", &[], "").body;
         assert!(tables().contains("The program did not load"), "{}", tables());
         std::fs::write(d.join("migrations/001_a.sql"), "create table a (id integer);").unwrap();
@@ -375,7 +383,9 @@ fn an_empty_new_file_waits_and_a_folder_made_later_is_watched() {
     let n = support::temp_dir("f62-no-folder");
     std::fs::write(n.join("main.qwe"), TABLES).unwrap();
     {
-        let (_g, port, log) = serve_logged(&n, &["--watch"]);
+        // Its first load fails, and then it says no port: one is given (branch security).
+        let given = support::free_port().to_string();
+        let (_g, port, log) = serve_logged(&n, &["--watch", "--port", &given]);
         let tables = || support::send(port, "GET", "/tables", &[], "").body;
         assert!(tables().contains("The program did not load"), "{}", tables());
         std::fs::create_dir_all(n.join("migrations")).unwrap();

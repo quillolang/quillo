@@ -56,8 +56,12 @@ fn app(name: &str, src: &str) -> (PathBuf, PathBuf) {
 }
 
 /// A `quillo run` server whose process the test can signal, its log in a file.
+/// The system picks the port and the log says which, but under --split (the services' lines come
+/// first): a port picked here could be taken by another process first (a shown bug in the test;
+/// branch security).
 fn run_logged(file: &Path, extra: &[&str], env: &[(&str, &str)], log: &Path) -> (Guard, u16) {
-    let port = free_port();
+    let given = support::port_given(extra);
+    let port = if given { free_port() } else { 0 };
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(file)
@@ -69,7 +73,11 @@ fn run_logged(file: &Path, extra: &[&str], env: &[(&str, &str)], log: &Path) -> 
         .stderr(std::fs::File::create(log).unwrap())
         .spawn()
         .expect("cannot start quillo");
-    let guard = Guard::new(child);
+    let mut guard = Guard::new(child);
+    if !given {
+        let port = support::port_in_log(&mut guard.0, log, Duration::from_secs(20));
+        return (guard, port);
+    }
     eventually(20, "the server did not start", || support::listening(port).then_some(()));
     (guard, port)
 }
@@ -339,6 +347,9 @@ fn a_call_made_later_whose_arguments_are_spoiled_is_made_without_them() {
         .unwrap();
     let _mailer = Guard::new(child);
     eventually(20, "the mailer did not start", || support::listening(port).then_some(()));
+    // Its port was given to the front before it started: the listener is checked to be it, as
+    // another process could have taken the port in between (branch security).
+    assert!(support::listener_is(port, _mailer.0.id()), "another process listens on {}", port);
     let sent = eventually(40, "the call made later was not made", || {
         let body = send(pm, "GET", "/sent", &[], "").body;
         (!body.is_empty()).then_some(body)

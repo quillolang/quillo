@@ -557,13 +557,14 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// A `quillo run` of `file` with what it says going to `log`.
+/// A `quillo run` of `file` with what it says going to `log`. The system picks the port and the
+/// log says which: a port picked here could be taken by another process first (a shown bug in the
+/// test; branch security).
 fn run_server(file: &Path, log: &Path, more: &[&str]) -> (support::Guard, u16) {
-    let port = support::free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(file)
-        .args(["--port", &port.to_string()])
+        .args(["--port", "0"])
         .args(more)
         .env("QUILLO_SECRET", "test secret for the tests")
         .stdin(Stdio::null())
@@ -571,7 +572,9 @@ fn run_server(file: &Path, log: &Path, more: &[&str]) -> (support::Guard, u16) {
         .stderr(std::fs::File::create(log).unwrap())
         .spawn()
         .unwrap();
-    (support::Guard::new(child), port)
+    let mut g = support::Guard::new(child);
+    let port = support::port_in_log(&mut g.0, log, Duration::from_secs(20));
+    (g, port)
 }
 
 #[cfg(unix)]

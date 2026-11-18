@@ -249,22 +249,19 @@ fn the_browser_writes_markup_as_the_server_does() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let port = support::free_port();
-    let _server = support::Guard::new(
+    // The system picks the port and the server says which: a port picked here could be taken by
+    // another process first (a shown bug in the test; branch security). So in `in_chrome`.
+    let mut _server = support::Guard::new(
         Command::new(env!("CARGO_BIN_EXE_quillo"))
             .arg("run")
             .arg(app())
-            .args(["--port", &port.to_string()])
+            .args(["--port", "0"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let port = support::port_in_stderr(&mut _server.0, "the page", Instant::now() + Duration::from_secs(20));
     let profile = std::env::temp_dir().join(format!("quillo-chrome-f48r-{}-{}", std::process::id(), port));
     let out = Command::new("node")
         .arg(dir.join("run.js"))
@@ -361,15 +358,10 @@ fn the_browser_writes_markup_as_the_server_does() {
 /// `page` of tests/browser in headless Chrome, its script `script`: what the script recorded.
 fn in_chrome(chrome: &Path, page: &str, script: &str) -> serde_json::Value {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let port = support::free_port();
-    let _server = support::Guard::new(
-        Command::new(env!("CARGO_BIN_EXE_quillo")).arg("run").arg(dir.join(page)).args(["--port", &port.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap(),
+    let mut _server = support::Guard::new(
+        Command::new(env!("CARGO_BIN_EXE_quillo")).arg("run").arg(dir.join(page)).args(["--port", "0"]).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let port = support::port_in_stderr(&mut _server.0, page, Instant::now() + Duration::from_secs(20));
     let profile = std::env::temp_dir().join(format!("quillo-chrome-f48v-{}-{}", std::process::id(), port));
     let out = Command::new("node").arg(dir.join("run.js")).arg(chrome).arg(format!("http://127.0.0.1:{}/", port)).arg(&profile).arg("60000").arg(dir.join(script)).output().unwrap();
     let _ = std::fs::remove_dir_all(&profile);

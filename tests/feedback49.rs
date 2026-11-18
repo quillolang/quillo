@@ -19,7 +19,9 @@ fn dir(name: &str, files: &[(&str, &[u8])]) -> PathBuf {
 /// `quillo run` on `file` until it stops by itself (or 20 s): its exit and what it said.
 fn start_alone(d: &PathBuf, file: &str) -> (Option<i32>, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["run", file, "--port", &support::free_port().to_string()])
+        // `--port 0`: a port picked here could be taken first, and the server stop for that
+        // (branch security).
+        .args(["run", file, "--port", "0"])
         .current_dir(d)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

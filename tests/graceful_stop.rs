@@ -36,9 +36,13 @@ impl Run {
 
     /// `group`: in a process group of its own, as a shell runs a command in a terminal, which a
     /// Ctrl-C there reaches whole.
+    /// The system picks the port and the log says which, but under --split (the services' lines
+    /// come first): a port picked here could be taken by another process first (a shown bug in
+    /// the test; branch security). A port given is checked to be this server's.
     fn start_as(d: &Path, file: &str, args: &[&str], group: bool) -> Run {
         use std::os::unix::process::CommandExt;
-        let port = support::free_port();
+        let given = support::port_given(args);
+        let port = if given { support::free_port() } else { 0 };
         let log = d.join(format!("{}.log", file));
         let mut c = Command::new(env!("CARGO_BIN_EXE_quillo"));
         c.arg("run").arg(d.join(file)).args(["--port", &port.to_string()]).args(args);
@@ -50,6 +54,10 @@ impl Run {
         let child = c.spawn().unwrap();
         support::stop_with_tests(&child);
         let mut r = Run { child, port, log };
+        if !given {
+            r.port = support::port_in_log(&mut r.child, &r.log, Duration::from_secs(30));
+            return r;
+        }
         let deadline = Instant::now() + Duration::from_secs(30);
         while !support::listening(port) {
             if let Ok(Some(st)) = r.child.try_wait() {
@@ -58,6 +66,7 @@ impl Run {
             assert!(Instant::now() < deadline, "did not start:\n{}", r.log());
             std::thread::sleep(Duration::from_millis(30));
         }
+        assert!(support::listener_is(port, r.child.id()), "another process listens on {}", port);
         r
     }
 

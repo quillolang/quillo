@@ -335,10 +335,11 @@ fn a_process_limit_too_low_for_the_threads_is_said_at_start() {
     use std::os::unix::process::CommandExt;
     let d = temp_dir("f41-nproc");
     std::fs::write(d.join("main.qwe"), "route GET / = \"hi\"\n").unwrap();
-    let port = support::free_port();
+    // The system picks the port and the log says which: a port picked here could be taken by
+    // another process first (a shown bug in the test; branch security).
     let log = std::fs::File::create(d.join("nproc.log")).unwrap();
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"));
-    cmd.args(["run", "main.qwe", "--port", &port.to_string(), "--workers", "64"]).current_dir(&d).stdout(log.try_clone().unwrap()).stderr(log);
+    cmd.args(["run", "main.qwe", "--port", "0", "--workers", "64"]).current_dir(&d).stdout(log.try_clone().unwrap()).stderr(log);
     // SAFETY: only setrlimit, which is async-signal-safe, between fork and exec. The limit is
     // checked when a process is made, so the exec itself is not refused.
     unsafe {
@@ -353,7 +354,11 @@ fn a_process_limit_too_low_for_the_threads_is_said_at_start() {
     let child = cmd.spawn().unwrap();
     let mut guard = support::Guard::new(child);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !support::listening(port) {
+    let mut port = 0;
+    while port == 0 || !support::listening(port) {
+        if port == 0 {
+            port = support::port_said_in(&d.join("nproc.log")).unwrap_or(0);
+        }
         // An account that already has 30 processes and threads (a CI runner's) cannot start
         // even the first: said so, with the limit, and not a panic (found by CI).
         if let Ok(Some(status)) = guard.0.try_wait() {
@@ -629,20 +634,16 @@ fn a_socket_server_does_not_join_and_says_what_its_visitors_look_like() {
 fn a_link_out_of_the_folder_is_said_once() {
     let (p, _) = linked("f41-said", FILES);
     let log = std::fs::File::create(p.join("said.log")).unwrap();
-    let port = support::free_port();
+    // The system picks the port, as above (branch security).
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["run", "main.qwe", "--port", &port.to_string()])
+        .args(["run", "main.qwe", "--port", "0"])
         .current_dir(&p)
         .stdout(log.try_clone().unwrap())
         .stderr(log)
         .spawn()
         .unwrap();
-    let _g = support::Guard::new(child);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(std::time::Instant::now() < deadline);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    let mut _g = support::Guard::new(child);
+    let port = support::port_in_log(&mut _g.0, &p.join("said.log"), std::time::Duration::from_secs(20));
     send(port, "GET", "/read?p=data/s.txt", &[], "");
     send(port, "GET", "/file?p=data/s.txt", &[], "");
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -677,6 +678,9 @@ fn a_redirect_is_held_to_the_policy_too() {
         assert!(std::time::Instant::now() < deadline, "{}", std::fs::read_to_string(d.join("r.log")).unwrap());
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    // The program names its own port, so it is given: the listener is checked to be it, as
+    // another process could have taken the port first (branch security).
+    assert!(support::listener_is(port, _g.0.id()), "another process listens on {}", port);
     assert_eq!(send(port, "GET", "/in", &[], "").body, "reached", "a redirect to an allowed host is followed");
     let out = send(port, "GET", "/out", &[], "").body;
     assert!(out.contains("localhost is not among the hosts") && out.contains("hosts.toml allows: 127.0.0.1"), "{}", out);

@@ -29,22 +29,19 @@ struct Running {
     port: u16,
 }
 
+/// The system picks the port and the server says which: a port picked here could be taken by
+/// another process first (a shown bug in the test; branch security).
 fn start(dir: &Path, secret: Option<&str>, args: &[&str]) -> Running {
-    let port = support::free_port();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_quillo"));
-    cmd.arg("run").arg(dir.join("main.qwe")).args(["--port", &port.to_string()]).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.arg("run").arg(dir.join("main.qwe")).args(["--port", "0"]).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
     cmd.env_remove("QUILLO_SECRET");
     if let Some(s) = secret {
         cmd.env("QUILLO_SECRET", s);
     }
     let child = cmd.spawn().unwrap();
     support::stop_with_tests(&child);
-    let guard = support::Guard::new(child);
-    let until = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < until, "the server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut guard = support::Guard::new(child);
+    let port = support::port_in_stderr(&mut guard.0, "main.qwe", Instant::now() + Duration::from_secs(20));
     Running { _guard: guard, port }
 }
 

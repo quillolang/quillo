@@ -700,18 +700,15 @@ fn another_tenants_value_gets_no_patch() {
 /// The hash `open` has on a server started with this secret, or none.
 fn hash_with(name: &str, secret: Option<&str>) -> String {
     let d = app(name, &[("main.qwe", "server fn open() = { n: 1 }\nroute GET / = \"ok\"\n")]);
-    let port = support::free_port();
+    // The system picks the port and the server says which: a port picked here could be taken by
+    // another process first (a shown bug in the test; branch security).
     let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"));
-    c.args(["run", "main.qwe", "--port", &port.to_string()]).current_dir(&d).env_remove("QUILLO_SECRET").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    c.args(["run", "main.qwe", "--port", "0"]).current_dir(&d).env_remove("QUILLO_SECRET").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
     if let Some(s) = secret {
         c.env("QUILLO_SECRET", s);
     }
-    let _server = support::Guard::new(c.spawn().unwrap());
-    let until = std::time::Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(std::time::Instant::now() < until, "server did not start");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let mut _server = support::Guard::new(c.spawn().unwrap());
+    let port = support::port_in_stderr(&mut _server.0, name, std::time::Instant::now() + Duration::from_secs(20));
     let a = send(port, "POST", "/_quillo/rpc/open", &[("x-quillo-live", "1"), ("sec-fetch-site", "same-origin")], "[]");
     hash_of(&a)
 }

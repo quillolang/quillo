@@ -3169,21 +3169,20 @@ fn run_script_with(d: &Path, file: &str, args: &[&str]) -> String {
 }
 
 /// `quillo serve folder` in `d`, until the guard is dropped, and its port.
+/// The system picks the port and the server says which: a port picked here could be taken by
+/// another process first (a shown bug in the test; branch security). So in this file's other
+/// servers, but those whose port is given (a service started again, `--split`, a first load that
+/// fails under --watch, which says no port).
 fn serve_folder(d: &Path, folder: &str) -> (support::Guard, u16) {
-    let port = support::free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["serve", folder, "--port", &port.to_string()])
+        .args(["serve", folder, "--port", "0"])
         .current_dir(d)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let g = support::Guard::new(child);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(std::time::Instant::now() < deadline, "quillo serve did not start");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    let mut g = support::Guard::new(child);
+    let port = support::port_in_stderr(&mut g.0, folder, std::time::Instant::now() + std::time::Duration::from_secs(20));
     (g, port)
 }
 
@@ -3865,20 +3864,15 @@ fn a_file_saved_anew_is_judged_as_it_is_now() {
     std::fs::write(d.join("public/localhost.pem"), cert.pem()).unwrap();
     std::fs::write(d.join("public/localhost-key.pem"), key.serialize_pem()).unwrap();
     std::fs::hard_link(d.join("public/localhost-key.pem"), d.join("public/key-copy.txt")).unwrap();
-    let port = support::free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["serve", "public", "--port", &port.to_string(), "--tls-cert", "public/localhost.pem", "--tls-key", "public/localhost-key.pem"])
+        .args(["serve", "public", "--port", "0", "--tls-cert", "public/localhost.pem", "--tls-key", "public/localhost-key.pem"])
         .current_dir(&d)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let _g = support::Guard::new(child);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(std::time::Instant::now() < deadline, "quillo serve did not start");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    let mut _g = support::Guard::new(child);
+    let port = support::port_in_stderr(&mut _g.0, "public", std::time::Instant::now() + std::time::Duration::from_secs(20));
     statuses(port, &[("/localhost-key.pem", 404), ("/key-copy.txt", 404)], "PRIVATE KEY");
     assert!(support::send(port, "GET", "/localhost.pem", &[], "").body.contains("BEGIN CERTIFICATE"));
 }
@@ -3953,12 +3947,11 @@ fn file_serves_a_database_named_on_purpose_in_ranges() {
 /// `quillo run main.qwe` in `d` with `opts`, its log kept, until the guard is dropped: the guard,
 /// its port and the log.
 fn serve_logged(d: &Path, opts: &[&str]) -> (support::Guard, u16, PathBuf) {
-    let port = support::free_port();
     let log = d.join("server.log");
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg("main.qwe")
-        .args(["--port", &port.to_string(), "--no-check"])
+        .args(["--port", "0", "--no-check"])
         .args(opts)
         .current_dir(d)
         .env("QUILLO_SECRET", "test secret for the tests")
@@ -3967,12 +3960,8 @@ fn serve_logged(d: &Path, opts: &[&str]) -> (support::Guard, u16, PathBuf) {
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
-    let g = support::Guard::new(child);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(std::time::Instant::now() < deadline, "did not start: {}", std::fs::read_to_string(&log).unwrap_or_default());
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    let mut g = support::Guard::new(child);
+    let port = support::port_in_log(&mut g.0, &log, std::time::Duration::from_secs(20));
     (g, port, log)
 }
 
@@ -5138,20 +5127,15 @@ fn a_key_given_as_a_link_is_kept_after_a_renewal() {
     std::fs::write(d.join("env2"), "SECRET=2\n").unwrap();
     link("archive/k1.pem", &d.join("site/live.pem"));
     link("../env1", &d.join("site/app.env"));
-    let port = support::free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["serve", "site", "--port", &port.to_string(), "--tls-cert", "site/cert.pem", "--tls-key", "site/live.pem", "--env-file", "site/app.env"])
+        .args(["serve", "site", "--port", "0", "--tls-cert", "site/cert.pem", "--tls-key", "site/live.pem", "--env-file", "site/app.env"])
         .current_dir(&d)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let _g = support::Guard::new(child);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(std::time::Instant::now() < deadline, "quillo serve did not start");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    let mut _g = support::Guard::new(child);
+    let port = support::port_in_stderr(&mut _g.0, "site", std::time::Instant::now() + std::time::Duration::from_secs(20));
     let kept = ["/live.pem", "/archive/k1.pem", "/app.env"];
     statuses(port, &kept.iter().map(|p| (*p, 404)).collect::<Vec<_>>(), "KEY");
     assert_eq!(support::send(port, "GET", "/index.html", &[], "").status, 200);
@@ -7327,13 +7311,19 @@ fn files_dir(name: &str, files: &[(&str, &[u8])]) -> PathBuf {
 
 /// `quillo run args...` in `d` on a port of its own, its log kept, until the guard is dropped:
 /// the guard, the port and the log.
+/// A port named in `args` (`--port N`) is kept, as is one picked here under --split; otherwise
+/// the system picks it and the log says which. A port given is checked to be this server's.
 fn run_logged(d: &Path, args: &[&str]) -> (support::Guard, u16, PathBuf) {
-    let port = support::free_port();
-    let log = d.join(format!("server-{}.log", port));
-    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .arg("run")
-        .args(args)
-        .args(["--port", &port.to_string()])
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let named = support::port_named(args);
+    let port = named.unwrap_or(if support::port_given(args) { support::free_port() } else { 0 });
+    let log = d.join(format!("server-{}.log", N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+    let mut c = Command::new(env!("CARGO_BIN_EXE_quillo"));
+    c.arg("run").args(args);
+    if named.is_none() {
+        c.args(["--port", &port.to_string()]);
+    }
+    let child = c
         .current_dir(d)
         .env("QUILLO_SECRET", "test secret for the tests")
         .stdin(std::process::Stdio::null())
@@ -7341,12 +7331,17 @@ fn run_logged(d: &Path, args: &[&str]) -> (support::Guard, u16, PathBuf) {
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
-    let g = support::Guard::new(child);
+    let mut g = support::Guard::new(child);
+    if port == 0 {
+        let port = support::port_in_log(&mut g.0, &log, std::time::Duration::from_secs(20));
+        return (g, port, log);
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while !support::listening(port) {
         assert!(std::time::Instant::now() < deadline, "did not start: {}", std::fs::read_to_string(&log).unwrap_or_default());
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    assert!(support::listener_is(port, g.0.id()), "another process listens on {}", port);
     (g, port, log)
 }
 
@@ -7509,7 +7504,9 @@ fn dotenv_a_nul_in_a_value_is_said_and_skipped() {
 #[test]
 fn watch_reloads_when_a_file_the_failed_load_named_is_fixed_or_made() {
     let d = files_dir("watch-broken", &[("main.qwe", b"import lib.qwe use ver\nroute GET / = str(ver())\n"), ("lib.qwe", b"fn ver() = 1 +\n")]);
-    let (_g, port, log) = run_logged(&d, &["main.qwe", "--watch"]);
+    // Its first load fails, and then it says no port: one is given (branch security).
+    let given = support::free_port().to_string();
+    let (_g, port, log) = run_logged(&d, &["main.qwe", "--watch", "--port", &given]);
     assert_eq!(support::send(port, "GET", "/", &[], "").status, 500);
     std::fs::write(d.join("lib.qwe"), "fn ver() = 2\n").unwrap();
     until_logged(&log, "the fixed lib.qwe loads", || body_of(port, "/") == "2");
@@ -7542,7 +7539,9 @@ fn watch_reloads_when_a_file_the_failed_load_named_is_fixed_or_made() {
 #[test]
 fn watch_started_on_a_missing_import_loads_once_it_is_made() {
     let d = files_dir("watch-missing", &[("main.qwe", b"import gone.qwe use g\nroute GET / = g()\n")]);
-    let (_g, port, log) = run_logged(&d, &["main.qwe", "--watch", "--no-check"]);
+    // Its first load fails, and then it says no port: one is given (branch security).
+    let given = support::free_port().to_string();
+    let (_g, port, log) = run_logged(&d, &["main.qwe", "--watch", "--no-check", "--port", &given]);
     assert_eq!(support::send(port, "GET", "/", &[], "").status, 500);
     std::fs::write(d.join("gone.qwe"), "fn g() = \"here\"\n").unwrap();
     until_logged(&log, "the file made loads", || body_of(port, "/") == "here");
@@ -7888,21 +7887,17 @@ fn lsp_reads_headers_in_any_case_and_answers_out_of_turn_as_the_protocol_asks() 
 #[test]
 fn quillo_serve_reads_its_options_as_run_does() {
     let d = files_dir("serve-options", &[("site/index.html", b"<p>home</p>")]);
-    let port = support::free_port();
+    // `--port=0`, the form this is about, and the port the system picked read from its line.
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["serve", &format!("--port={}", port), "--workers=4", "--log=json", "site"])
+        .args(["serve", "--port=0", "--workers=4", "--log=json", "site"])
         .current_dir(&d)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let _g = support::Guard::new(child);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(std::time::Instant::now() < deadline, "quillo serve --port= did not start");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    let mut _g = support::Guard::new(child);
+    let port = support::port_in_stderr(&mut _g.0, "quillo serve --port=", std::time::Instant::now() + std::time::Duration::from_secs(20));
     assert_eq!(body_of(port, "/"), "<p>home</p>");
     for (args, said) in [
         (&["serve", "site", "--with", "--watch"][..], "quillo: `--with` needs a value, and `--watch` is an option\n"),
@@ -8594,13 +8589,8 @@ fn a_service_duration_too_long_is_said_not_to_be_one() {
     let secret = "s12-a-secret-for-this-test-alone-0123456789";
     let opts = "{ retries: 0, failures: 1, timeout: \"18000000000000000000s\", cooldown: \"18000000000000000000s\" }";
     // Called where the service answers: the call is made.
-    let port = support::free_port();
-    let _work = support::Guard::new(Command::new(env!("CARGO_BIN_EXE_quillo")).args(["run", "work.qwe", "--as-service", "--port", &port.to_string()]).current_dir(&d).env("QUILLO_SERVICE_SECRET", secret).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(std::time::Instant::now() < deadline, "the service did not start");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    let mut _work = support::Guard::new(Command::new(env!("CARGO_BIN_EXE_quillo")).args(["run", "work.qwe", "--as-service", "--port", "0"]).current_dir(&d).env("QUILLO_SERVICE_SECRET", secret).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn().unwrap());
+    let port = support::port_in_stderr(&mut _work.0, "work.qwe", std::time::Instant::now() + std::time::Duration::from_secs(20));
     std::fs::write(d.join("main.qwe"), format!("service work = \"work.qwe\" {}\nprint(work.add(41))\n", opts)).unwrap();
     let out = script_with_env(&d, "main.qwe", &[("QUILLO_SERVICE_SECRET", secret), ("QUILLO_SERVICE_WORK", &format!("http://127.0.0.1:{}", port))]);
     assert_eq!(out, "41\n");

@@ -101,22 +101,18 @@ fn the_log_has_what_the_visitor_does_not() {
     use std::process::{Command, Stdio};
     let src = format!("{}{}", USERS, "route GET /value = db.query(\"select nope from users\")\n");
     let (d, f) = app("log", &src);
-    let port = support::free_port();
+    // The system picks the port and the log says which: a port picked here could be taken by
+    // another process first (a shown bug in the test; branch security). So below.
     let log = d.join("log.txt");
     let out = std::fs::File::create(&log).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["run", f.to_str().unwrap(), "--port", &port.to_string()])
+        .args(["run", f.to_str().unwrap(), "--port", "0"])
         .stdout(Stdio::null())
         .stderr(out)
         .spawn()
         .unwrap();
-    let g = support::Guard::new(child);
-    for _ in 0..200 {
-        if support::listening(port) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    let mut g = support::Guard::new(child);
+    let port = support::port_in_log(&mut g.0, &log, std::time::Duration::from_secs(20));
     assert_eq!(send(port, "GET", "/value", &[], "").body, r#"{"error":"internal error"}"#);
     drop(g);
     let text = std::fs::read_to_string(&log).unwrap();
@@ -130,20 +126,14 @@ fn its_author_sees_it_under_watch() {
     use std::process::{Command, Stdio};
     let src = format!("{}{}", USERS, "route GET /value = db.query(\"select nope from users\")\n");
     let (_d, f) = app("watch", &src);
-    let port = support::free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["run", f.to_str().unwrap(), "--port", &port.to_string(), "--watch"])
+        .args(["run", f.to_str().unwrap(), "--port", "0", "--watch"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let _g = support::Guard::new(child);
-    for _ in 0..200 {
-        if support::listening(port) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    let mut _g = support::Guard::new(child);
+    let port = support::port_in_stderr(&mut _g.0, "main.qwe", std::time::Instant::now() + std::time::Duration::from_secs(20));
     assert!(send(port, "GET", "/value", &[], "").body.contains("no such column: nope"));
 }
 
@@ -338,22 +328,16 @@ route GET /each = sum(range(0, 100000000) | map((n) => n + 1))
 /// A server of its own, with its log in a file.
 fn started(name: &str, args: &[&str]) -> (std::process::Child, u16, PathBuf) {
     let (d, f) = app(name, STUCK);
-    let port = support::free_port();
     let log = d.join("log.txt");
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["run", f.to_str().unwrap(), "--port", &port.to_string()])
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .args(["run", f.to_str().unwrap(), "--port", "0"])
         .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
     support::stop_with_tests(&child);
-    for _ in 0..400 {
-        if support::listening(port) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    let port = support::port_in_log(&mut child, &log, std::time::Duration::from_secs(20));
     (child, port, log)
 }
 
@@ -451,21 +435,15 @@ route GET /caught {
 #[test]
 fn what_a_builtin_says_is_not_for_the_visitor_and_is_in_the_log() {
     let (d, f) = app("builtins", BUILTIN_ERRORS);
-    let port = support::free_port();
     let log = d.join("log.txt");
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["run", f.to_str().unwrap(), "--port", &port.to_string()])
+        .args(["run", f.to_str().unwrap(), "--port", "0"])
         .stdout(std::process::Stdio::null())
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
-    let g = support::Guard::new(child);
-    for _ in 0..200 {
-        if support::listening(port) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    let mut g = support::Guard::new(child);
+    let port = support::port_in_log(&mut g.0, &log, std::time::Duration::from_secs(20));
     for path in ["/billing", "/keys", "/number", "/helper"] {
         let r = send(port, "GET", path, &[], "");
         assert_eq!((r.status, r.body.as_str()), (500, r#"{"error":"internal error"}"#), "{}", path);
@@ -485,21 +463,15 @@ fn what_a_builtin_says_is_not_for_the_visitor_and_is_in_the_log() {
 #[test]
 fn an_error_line_is_an_object_where_the_log_is_objects() {
     let (d, f) = app("json-log", "route GET /boom = 1 / 0\nroute GET /value = int(\"x\")\n");
-    let port = support::free_port();
     let log = d.join("log.txt");
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["run", f.to_str().unwrap(), "--port", &port.to_string(), "--log", "json", "--no-check"])
+        .args(["run", f.to_str().unwrap(), "--port", "0", "--log", "json", "--no-check"])
         .stdout(std::process::Stdio::null())
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
-    let g = support::Guard::new(child);
-    for _ in 0..200 {
-        if support::listening(port) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    let mut g = support::Guard::new(child);
+    let port = support::port_in_log(&mut g.0, &log, std::time::Duration::from_secs(20));
     let r = send(port, "GET", "/boom", &[("x-request-id", "abc123")], "");
     assert_eq!(r.status, 500);
     assert_eq!(send(port, "GET", "/value", &[], "").status, 500);

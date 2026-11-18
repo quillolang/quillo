@@ -96,25 +96,22 @@ fn what_changes_something_lets_the_kept_pages_go() {
 #[test]
 fn with_prefetching_off_nothing_is_kept_to_let_go() {
     let (_d, f) = app("off", PAGES);
-    let port = support::free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["run", f.to_str().unwrap(), "--port", &port.to_string(), "--no-prefetch"])
+        .args(["run", f.to_str().unwrap(), "--port", "0", "--no-prefetch"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let _g = support::Guard::new(child);
-    wait_for(port);
+    let mut g = support::Guard::new(child);
+    let port = port_of(&mut g);
     assert_eq!(send(port, "POST", "/write", &[], "").header("clear-site-data"), None);
 }
 
-fn wait_for(port: u16) {
-    for _ in 0..400 {
-        if support::listening(port) {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+/// The port the server in `g` says it listens on: the system picks it (`--port 0`), as a port
+/// picked here could be taken by another process before the server bound it (CI: `logged`'s
+/// connection refused; a shown bug in the test, branch security).
+fn port_of(g: &mut support::Guard) -> u16 {
+    support::port_in_stderr(&mut g.0, "main.qwe", std::time::Instant::now() + std::time::Duration::from_secs(20))
 }
 
 // ---- Q-179: who goes first -------------------------------------------------------------------
@@ -161,17 +158,16 @@ fn prefetches_do_not_go_before_a_visitor() {
 
 fn logged(name: &str, args: &[&str], go: impl Fn(u16)) -> String {
     let (d, f) = app(name, "route GET / = <html><body><a href=\"/x\">x</a></body></html>\n");
-    let port = support::free_port();
     let log = d.join("log.txt");
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["run", f.to_str().unwrap(), "--port", &port.to_string()])
+        .args(["run", f.to_str().unwrap(), "--port", "0"])
         .args(args)
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
-    let g = support::Guard::new(child);
-    wait_for(port);
+    let mut g = support::Guard::new(child);
+    let port = support::port_in_log(&mut g.0, &log, std::time::Duration::from_secs(20));
     go(port);
     std::thread::sleep(std::time::Duration::from_millis(200));
     drop(g);
@@ -201,15 +197,14 @@ fn a_prefetch_is_marked_in_the_log() {
 #[test]
 fn metrics_count_what_became_of_prefetches() {
     let (_d, f) = app("metrics", SLOW);
-    let port = support::free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["run", f.to_str().unwrap(), "--port", &port.to_string(), "--metrics"])
+        .args(["run", f.to_str().unwrap(), "--port", "0", "--metrics"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let _g = support::Guard::new(child);
-    wait_for(port);
+    let mut g = support::Guard::new(child);
+    let port = port_of(&mut g);
     assert_eq!(send(port, "GET", "/", &[RULES], "").status, 200);
     assert_eq!(send(port, "POST", "/_quillo/prefetch-used", &[], "").status, 204);
     let m = send(port, "GET", "/_quillo/metrics", &[], "").body;
@@ -226,15 +221,14 @@ fn a_page_says_it_came_from_a_prefetch_only_where_that_is_counted() {
     assert!(!send(s.port, "GET", "/", &[], "").body.contains("prefetch-used"));
     assert_ne!(send(s.port, "POST", "/_quillo/prefetch-used", &[], "").status, 204);
     let (_d, f) = app("beacon-on", page);
-    let port = support::free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["run", f.to_str().unwrap(), "--port", &port.to_string(), "--metrics"])
+        .args(["run", f.to_str().unwrap(), "--port", "0", "--metrics"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let _g = support::Guard::new(child);
-    wait_for(port);
+    let mut g = support::Guard::new(child);
+    let port = port_of(&mut g);
     assert!(send(port, "GET", "/", &[], "").body.contains("/_quillo/prefetch-used"));
 }
 
@@ -248,15 +242,14 @@ fn a_page_with_no_link_still_says_it_came_from_a_prefetch() {
     let plain = send(s.port, "GET", "/", &[], "").body;
     assert_eq!(plain, "<!doctype html><html><body><table><tr><td>1</td></tr></table></body></html>");
     let (_d, f) = app("beacon-no-link-on", page);
-    let port = support::free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["run", f.to_str().unwrap(), "--port", &port.to_string(), "--metrics"])
+        .args(["run", f.to_str().unwrap(), "--port", "0", "--metrics"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let _g = support::Guard::new(child);
-    wait_for(port);
+    let mut g = support::Guard::new(child);
+    let port = port_of(&mut g);
     let counted = send(port, "GET", "/", &[], "").body;
     assert!(counted.contains("/_quillo/prefetch-used") && !counted.contains("w.pf=1"), "{}", counted);
     assert!(counted.ends_with("</script></body></html>"), "{}", counted);

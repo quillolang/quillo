@@ -62,28 +62,19 @@ fn a_hidden_errors_text_never_reaches_a_visitor() {
 }
 
 /// The same with instances, which start another way.
-/// The server is up on `port`. A server that stopped, or never listened (its port taken
-/// meanwhile by another test's), fails the test: the wait had no end, and held a coverage run
-/// for 1 h 45 (2026-11-09; branch feedback56).
-fn listening(server: &mut support::Guard, port: u16) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !support::listening(port) {
-        if let Ok(Some(status)) = server.0.try_wait() {
-            panic!("the server stopped: {}", status);
-        }
-        assert!(std::time::Instant::now() < deadline, "the server did not listen on {}", port);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-}
+/// The system picks the port and the server says which (a port picked here was taken meanwhile by
+/// another test's server; a shown bug in the test, branch security). A server that stopped, or
+/// never listened, fails the test within 20 s: the wait had no end, and held a coverage run for
+/// 1 h 45 (2026-11-09; branch feedback56).
+const STARTS: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[test]
 fn it_holds_with_instances() {
     let d = dir("instances", &[("main.qwe", LEAKS)]);
-    let port = support::free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_quillo")).arg("run").arg(d.join("main.qwe")).args(["--port", &port.to_string(), "--instances", "2"]).env("QUILLO_SECRET", "a secret for this test, long enough to use").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo")).arg("run").arg(d.join("main.qwe")).args(["--port", "0", "--instances", "2"]).env("QUILLO_SECRET", "a secret for this test, long enough to use").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
     support::stop_with_tests(&child);
     let mut _server = support::Guard::new(child);
-    listening(&mut _server, port);
+    let port = support::port_in_stderr(&mut _server.0, "main.qwe", std::time::Instant::now() + STARTS);
     let a = send(port, "GET", "/text", &[], "");
     assert_eq!(a.body, "value: err(\"internal error\")");
 }
@@ -93,13 +84,12 @@ fn it_holds_with_instances() {
 #[test]
 fn the_log_and_print_keep_the_text() {
     let d = dir("log", &[("main.qwe", LEAKS)]);
-    let port = support::free_port();
     let log = std::fs::File::create(d.join("log.txt")).unwrap();
     let out = std::fs::File::create(d.join("out.txt")).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_quillo")).arg("run").arg(d.join("main.qwe")).args(["--port", &port.to_string()]).env("QUILLO_SECRET", "a secret for this test, long enough to use").stdin(Stdio::null()).stdout(out).stderr(log).spawn().unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo")).arg("run").arg(d.join("main.qwe")).args(["--port", "0"]).env("QUILLO_SECRET", "a secret for this test, long enough to use").stdin(Stdio::null()).stdout(out).stderr(log).spawn().unwrap();
     support::stop_with_tests(&child);
     let mut _server = support::Guard::new(child);
-    listening(&mut _server, port);
+    let port = support::port_in_log(&mut _server.0, &d.join("log.txt"), STARTS);
     send(port, "GET", "/text", &[("x-request-id", "abc123")], "");
     assert_eq!(send(port, "GET", "/printed", &[], "").body, "done");
     let logged = std::fs::read_to_string(d.join("log.txt")).unwrap();

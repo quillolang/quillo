@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// A port picked here, for a server whose whole stderr a test reads at its end; other servers
+/// here are given `--port 0` and say the port the system picked, as one picked here could be
+/// taken by another process first (a shown bug in the tests; branch security).
 fn port() -> u16 {
     support::free_port()
 }
@@ -36,23 +39,18 @@ fn start(file: &Path, extra: &[&str]) -> Server {
 }
 
 fn start_with_env(file: &Path, extra: &[&str], env: &[(&str, &str)]) -> Server {
-    let port = port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(file)
-        .args(["--port", &port.to_string()])
+        .args(["--port", "0"])
         .args(extra)
         .envs(env.iter().copied())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("cannot start quillo");
     support::stop_with_tests(&child);
-    let server = Server { child, port };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut server = Server { child, port: 0 };
+    server.port = support::port_in_stderr(&mut server.child, &file.display().to_string(), Instant::now() + Duration::from_secs(10));
     server
 }
 
@@ -509,23 +507,19 @@ fn the_log_can_be_json_lines() {
     let d = temp_dir("jsonlog");
     let f = d.join("app.qwe");
     std::fs::write(&f, "route GET /hello = \"hi\"\n").unwrap();
-    let port = port();
     // The log to a file, read once the server has stopped.
     let log_file = d.join("server.log");
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(&f)
-        .args(["--port", &port.to_string(), "--log", "json"])
+        .args(["--port", "0", "--log", "json"])
         .stderr(std::fs::File::create(&log_file).unwrap())
         .spawn()
         .unwrap();
     support::stop_with_tests(&child);
-    let server = Server { child, port };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut server = Server { child, port: 0 };
+    let port = support::port_in_log(&mut server.child, &log_file, Duration::from_secs(10));
+    server.port = port;
     assert_eq!(get(port, "/hello?x=1").1, "hi");
     std::thread::sleep(Duration::from_millis(300));
     drop(server);
@@ -544,22 +538,18 @@ fn a_refused_prefetch_is_not_logged_as_an_error() {
     let d = temp_dir("prefetchlog");
     let f = d.join("app.qwe");
     std::fs::write(&f, "let views = 0\nroute GET /thread {\n  views += 1\n  \"seen\"\n}\nroute GET /broken = unwrap(err(\"broken on purpose\"))\n").unwrap();
-    let port = port();
     let log_file = d.join("server.log");
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(&f)
-        .args(["--port", &port.to_string()])
+        .args(["--port", "0"])
         .stderr(std::fs::File::create(&log_file).unwrap())
         .spawn()
         .unwrap();
     support::stop_with_tests(&child);
-    let server = Server { child, port };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut server = Server { child, port: 0 };
+    let port = support::port_in_log(&mut server.child, &log_file, Duration::from_secs(10));
+    server.port = port;
     let prefetched = raw(port, "GET /thread HTTP/1.1\r\nSec-Purpose: prefetch");
     assert!(prefetched.starts_with("HTTP/1.1 503"), "{}", prefetched);
     assert_eq!(get(port, "/thread"), (200, "seen".to_string()));
@@ -780,6 +770,9 @@ fn the_log_never_shows_a_launch_token() {
             assert!(Instant::now() < deadline, "server did not start");
             std::thread::sleep(Duration::from_millis(20));
         }
+        // Its whole stderr is read at the end, so its port is picked here: the listener is
+        // checked to be it, as another process could have taken the port first (branch security).
+        assert!(support::listener_is(port, child.id()), "another process listens on {}", port);
         assert_eq!(get(port, &format!("/hello?a=1&_quillo_launch={}", token)).1, "hi");
         // A header line without a colon: refused before it is a request.
         let bad = raw(port, &format!("GET /hello?_quillo_launch={} HTTP/1.1\r\nno colon here", token));

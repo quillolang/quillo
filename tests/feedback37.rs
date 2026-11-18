@@ -50,6 +50,9 @@ fn a_server_whose_stderr_has_closed_still_stops_on_a_signal() {
         assert!(Instant::now() < deadline, "did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
+    // With its stderr closed it cannot say a port the system picked: the port is given, and the
+    // listener checked to be it, as another process could have taken it first (branch security).
+    assert!(support::listener_is(port, child.id()), "another process listens on {}", port);
     assert_eq!(send(port, "GET", "/", &[], "").body, "hi", "a request's log line goes nowhere, and the server goes on");
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -127,8 +130,8 @@ fn a_build_runs_once_the_port_is_open_and_a_request_waits_for_it() {
     assert_eq!(send(s.port, "GET", "/page.html", &[], "").header("content-type"), Some("text/html; charset=utf-8"));
     // A build that fails at the first start stops the program.
     let bad = dir("build-bad", &[("main.qwe", "fn fails() = err(\"no engine\")\nbuild \"/app.css\" = fails()\nroute GET / = 1\n")]);
-    let port = support::free_port();
-    let mut c = Command::new(env!("CARGO_BIN_EXE_quillo")).args(["run", "main.qwe", "--port", &port.to_string()]).current_dir(&bad).stderr(Stdio::piped()).spawn().unwrap();
+    // `--port 0`: it never listens, and a port picked here could be taken first (branch security).
+    let mut c = Command::new(env!("CARGO_BIN_EXE_quillo")).args(["run", "main.qwe", "--port", "0"]).current_dir(&bad).stderr(Stdio::piped()).spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
     let status = loop {
         if let Some(s) = c.try_wait().unwrap() {
@@ -167,7 +170,7 @@ fn style_with_takes_a_function() {
     assert!(css.contains("margin: .5rem;") && !css.contains("@apply"), "Q-455: {}", css);
     // A function that gives no CSS stops the load, as a command that fails does.
     let bad = dir("style-fn-bad", &[("main.qwe", "fn engine(css) = 3\nstyle_with(engine)\ncomponent C() {\n    style css`.c { x: 1 }`\n    <p.c/>\n}\nroute GET / = <C/>\n")]);
-    let (_, e) = out(&quillo(&bad, &["run", "main.qwe", "--port", &support::free_port().to_string()]));
+    let (_, e) = out(&quillo(&bad, &["run", "main.qwe", "--port", "0"]));
     assert!(e.contains("style_with `engine` failed") && e.contains("not CSS text"), "{}", e);
 }
 

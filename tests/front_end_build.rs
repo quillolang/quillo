@@ -132,17 +132,18 @@ fn not_found_and_quillo_serve_answer_a_deep_link_with_a_404() {
     assert_eq!(send(s.port, "GET", "/", &[], "").status, 200, "the index itself is found");
     drop(s);
 
-    let port = support::free_port();
+    // The system picks the port and the server says which: a port picked here could be taken by
+    // another process first (a shown bug in the test; branch security).
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["serve", "dist", "--port", &port.to_string()])
+        .args(["serve", "dist", "--port", "0"])
         .current_dir(&d)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let _g = support::Guard::new(child);
-    wait_for(port);
+    let mut _g = support::Guard::new(child);
+    let port = support::port_in_stderr(&mut _g.0, "quillo serve dist", Instant::now() + Duration::from_secs(20));
     assert_eq!(send(port, "GET", "/", &[], "").body, INDEX);
     assert_eq!(send(port, "GET", "/products/42", &[], "").status, 404, "quillo serve has no catch-all");
 }
@@ -185,10 +186,3 @@ fn the_app_calls_a_server_fn_from_the_programs_own_origin_only() {
     assert_eq!(call(&[("Content-Type", "application/x-www-form-urlencoded")], "text=a").status, 415);
 }
 
-fn wait_for(port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "quillo serve did not listen on {}", port);
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}

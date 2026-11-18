@@ -262,25 +262,23 @@ impl Drop for Server {
     }
 }
 
-fn start(file: &Path, port: u16, extra: &[&str]) -> Server {
+/// The system picks the port and the server says which: a port picked here could be taken by
+/// another process first (a shown bug in the test; branch security).
+fn start(file: &Path, extra: &[&str]) -> (Server, u16) {
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(file)
-        .args(["--port", &port.to_string()])
+        .args(["--port", "0"])
         .args(extra)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("cannot start quillo");
     support::stop_with_tests(&child);
-    let server = Server(child);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    server
+    let mut server = Server(child);
+    let port = support::port_in_stderr(&mut server.0, &file.display().to_string(), Instant::now() + Duration::from_secs(20));
+    (server, port)
 }
 
 #[test]
@@ -288,8 +286,7 @@ fn a_program_keeps_time_with_every_and_a_reload_changes_its_ticks() {
     let d = dir("program");
     let file = d.join("main.qwe");
     std::fs::write(&file, "let n = 0\nfn step() {\n n = n + 1\n}\nevery(20, step)\nroute GET /n = str(n)\n").unwrap();
-    let port = support::free_port();
-    let _s = start(&file, port, &["--watch"]);
+    let (_s, port) = start(&file, &["--watch"]);
     let n = |p: &str| support::send(port, "GET", p, &[], "").body.parse::<i64>().unwrap_or(-1);
     eventually(10, "the tick did not run", || (n("/n") >= 3).then_some(()));
     // A new version, without the tick: the count stays at the new version's.

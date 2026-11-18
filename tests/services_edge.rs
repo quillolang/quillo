@@ -744,8 +744,17 @@ fn spawn(exe: &Path, file: &Path, port: u16, extra: &[&str], env: &[(&str, &str)
     Run { child, port, log }
 }
 
+/// On `port` 0 the system picks the port and the log says which: a port picked here could be
+/// taken by another process first (a shown bug in the test; branch security). A port given (a
+/// copy that joins, a service an app was told of before it started, --split) is checked to be
+/// this server's.
 fn run(file: &Path, port: u16, extra: &[&str], env: &[(&str, &str)]) -> Run {
     let mut r = spawn(Path::new(env!("CARGO_BIN_EXE_quillo")), file, port, extra, env);
+    if port == 0 {
+        r.port = support::port_in_log(&mut r.child, &r.log, Duration::from_secs(25));
+        answers(r.port);
+        return r;
+    }
     let deadline = Instant::now() + Duration::from_secs(25);
     while !support::listening(port) {
         if let Ok(Some(status)) = r.child.try_wait() {
@@ -754,6 +763,7 @@ fn run(file: &Path, port: u16, extra: &[&str], env: &[(&str, &str)]) -> Run {
         assert!(Instant::now() < deadline, "server did not start:\n{}", r.log());
         std::thread::sleep(Duration::from_millis(20));
     }
+    assert!(support::listener_is(port, r.child.id()), "another process listens on {}", port);
     answers(port);
     r
 }
@@ -780,7 +790,7 @@ fn without_the_secret_a_service_elsewhere_is_not_called_or_answered() {
     let d = dir("no-secret");
     std::fs::write(d.join("work.qwe"), WORK).unwrap();
     std::fs::write(d.join("main.qwe"), "service work = \"work.qwe\"\nroute GET / = str(work.add(1).error)\n").unwrap();
-    let r = run(&d.join("main.qwe"), support::free_port(), &["--service-url", "work=http://127.0.0.1:1"], &[]);
+    let r = run(&d.join("main.qwe"), 0, &["--service-url", "work=http://127.0.0.1:1"], &[]);
     assert_eq!(r.get("/").1, "service work: runs at http://127.0.0.1:1, but QUILLO_SERVICE_SECRET is not set to sign the call");
     assert_eq!(support::send(r.port, "POST", "/_quillo/service/add", &[], "[1]").status, 403);
     assert_eq!(support::send(r.port, "POST", "/_quillo/join", &[], "{}").status, 403);
@@ -791,7 +801,7 @@ fn without_the_secret_a_service_elsewhere_is_not_called_or_answered() {
 fn a_call_for_another_service_is_refused_by_name() {
     let d = dir("other-name");
     std::fs::write(d.join("work.qwe"), WORK).unwrap();
-    let r = run(&d.join("work.qwe"), support::free_port(), &["--as-service"], &[("QUILLO_SERVICE_SECRET", SECRET)]);
+    let r = run(&d.join("work.qwe"), 0, &["--as-service"], &[("QUILLO_SERVICE_SECRET", SECRET)]);
     let h = signed(now_secs(), "billing", "add", "wrongname", "", "[1]");
     let headers: Vec<(&str, &str)> = h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let a = support::send(r.port, "POST", "/_quillo/service/add", &headers, "[1]");
@@ -809,8 +819,8 @@ fn a_copy_joins_says_it_is_there_and_leaves_when_it_stops() {
     std::fs::write(d.join("risk.qwe"), "server fn who() = env(\"WHO\", \"here\")\nroute GET /ok = \"ok\"\n").unwrap();
     std::fs::write(d.join("app.qwe"), "service risk = \"risk.qwe\" { retries: 1 }\nroute GET / = risk.who()\n").unwrap();
     let env = [("QUILLO_SERVICE_SECRET", SECRET)];
-    let app_port = support::free_port();
-    let mut app = run(&d.join("app.qwe"), app_port, &["--log", "text"], &env);
+    let mut app = run(&d.join("app.qwe"), 0, &["--log", "text"], &env);
+    let app_port = app.port;
     let url = format!("http://127.0.0.1:{}", app_port);
     let copy_port = support::free_port();
     let mut copy = run(&d.join("risk.qwe"), copy_port, &["--as-service", "--join", &url], &[("QUILLO_SERVICE_SECRET", SECRET), ("WHO", "the copy")]);
@@ -843,8 +853,8 @@ fn a_copy_that_cannot_join_says_why() {
     let d = dir("cannot-join");
     std::fs::write(d.join("risk.qwe"), "server fn who() = 1\nroute GET /ok = \"ok\"\n").unwrap();
     std::fs::write(d.join("app.qwe"), "service risk = \"risk.qwe\"\nroute GET / = \"up\"\n").unwrap();
-    let app_port = support::free_port();
-    let _app = run(&d.join("app.qwe"), app_port, &[], &[("QUILLO_SERVICE_SECRET", SECRET)]);
+    let _app = run(&d.join("app.qwe"), 0, &[], &[("QUILLO_SERVICE_SECRET", SECRET)]);
+    let app_port = _app.port;
     let url = format!("http://127.0.0.1:{}", app_port);
     // Not the app's secret: it says what the app said.
     let wrong = run(&d.join("risk.qwe"), support::free_port(), &["--as-service", "--join", &url], &[("QUILLO_SERVICE_SECRET", "another")]);
@@ -862,9 +872,9 @@ fn calls_in_a_log_of_json_can_be_followed() {
     let d = dir("json-log");
     std::fs::write(d.join("work.qwe"), WORK).unwrap();
     std::fs::write(d.join("main.qwe"), "service work = \"work.qwe\" { retries: 0 }\nroute GET / = str(work.add(1))\nroute GET /x = str(is_err(work.add(1)))\n").unwrap();
-    let pw = support::free_port();
-    let w = run(&d.join("work.qwe"), pw, &["--as-service"], &[("QUILLO_SERVICE_SECRET", SECRET)]);
-    let r = run(&d.join("main.qwe"), support::free_port(), &["--log", "json", "--service-url", &format!("work=http://127.0.0.1:{}", pw)], &[("QUILLO_SERVICE_SECRET", SECRET)]);
+    let w = run(&d.join("work.qwe"), 0, &["--as-service"], &[("QUILLO_SERVICE_SECRET", SECRET)]);
+    let pw = w.port;
+    let r = run(&d.join("main.qwe"), 0, &["--log", "json", "--service-url", &format!("work=http://127.0.0.1:{}", pw)], &[("QUILLO_SERVICE_SECRET", SECRET)]);
     assert_eq!(r.get("/").1, "2");
     drop(w);
     assert_eq!(r.get("/x").1, "true");
@@ -886,7 +896,7 @@ fn a_call_made_later_waits_in_memory_when_no_database_can_keep_it() {
     let url = format!("http://127.0.0.1:{}", pm);
     let nowhere = d.join("no-such-folder").join("system.db").display().to_string();
     let env = [("QUILLO_SERVICE_SECRET", SECRET), ("QUILLO_SERVICE_MAILER", url.as_str()), ("QUILLO_SYSTEM_DB", nowhere.as_str())];
-    let f = run(&d.join("front.qwe"), support::free_port(), &[], &env);
+    let f = run(&d.join("front.qwe"), 0, &[], &env);
     let (status, id) = f.get("/send/ana");
     assert!(status == 200 && id.len() == 24, "{} {}", status, id);
     f.get("/send/bad");
@@ -908,7 +918,7 @@ fn a_call_made_later_kept_in_a_database_is_tried_until_it_gets_through() {
     std::fs::write(d.join("front.qwe"), "db.open(\"front.db\")\nservice mailer = \"mailer.qwe\"\nroute GET /send/:to = mailer.later.send(to)\n").unwrap();
     let pm = support::free_port();
     let url = format!("http://127.0.0.1:{}", pm);
-    let f = run(&d.join("front.qwe"), support::free_port(), &[], &[("QUILLO_SERVICE_SECRET", SECRET), ("QUILLO_SERVICE_MAILER", url.as_str())]);
+    let f = run(&d.join("front.qwe"), 0, &[], &[("QUILLO_SERVICE_SECRET", SECRET), ("QUILLO_SERVICE_MAILER", url.as_str())]);
     let id = f.get("/send/ana").1;
     f.logged(&format!("(made later, {}) not made yet: ", id), 10);
     let m = run(&d.join("mailer.qwe"), pm, &[], &[("QUILLO_SERVICE_SECRET", SECRET)]);
@@ -923,15 +933,14 @@ fn two_servers_on_one_database_make_each_call_made_later_once() {
     // through what it saw due.
     std::fs::write(d.join("mailer.qwe"), "let sent = []\nserver fn send(to: str) {\n sent = sent + [to]\n sleep(700)\n}\nroute GET /sent = sent | join(\",\")\n").unwrap();
     std::fs::write(d.join("front.qwe"), "db.open(\"front.db\")\nservice mailer = \"mailer.qwe\" { timeout: \"20s\" }\nroute GET /send/:to = mailer.later.send(to)\n").unwrap();
-    let pm = support::free_port();
-    let url = format!("http://127.0.0.1:{}", pm);
-    let m = run(&d.join("mailer.qwe"), pm, &["--workers", "8"], &[("QUILLO_SERVICE_SECRET", SECRET)]);
+    let m = run(&d.join("mailer.qwe"), 0, &["--workers", "8"], &[("QUILLO_SERVICE_SECRET", SECRET)]);
+    let url = format!("http://127.0.0.1:{}", m.port);
     let env = [("QUILLO_SERVICE_SECRET", SECRET), ("QUILLO_SERVICE_MAILER", url.as_str())];
-    let a = run(&d.join("front.qwe"), support::free_port(), &[], &env);
+    let a = run(&d.join("front.qwe"), 0, &[], &env);
     for n in 0..6 {
         a.get(&format!("/send/n{}", n));
     }
-    let _b = run(&d.join("front.qwe"), support::free_port(), &[], &env);
+    let _b = run(&d.join("front.qwe"), 0, &[], &env);
     let sent = eventually(30, "the calls were not all made", || {
         let body = m.get("/sent").1;
         (body.split(',').count() >= 6).then_some(body)
@@ -948,7 +957,7 @@ fn copies_on_one_database_answer_a_call_as_the_first_did() {
     let d = dir("claims");
     std::fs::write(d.join("work.qwe"), "db.open(\"work.db\")\ndb.exec(\"create table if not exists runs (n integer)\")\nserver fn count() {\n db.exec(\"insert into runs values (1)\")\n db.query(\"select count(*) as n from runs\")[0].n\n}\nserver fn slow() {\n sleep(800)\n \"slept\"\n}\n").unwrap();
     let env = [("QUILLO_SERVICE_SECRET", SECRET)];
-    let (a, b) = (run(&d.join("work.qwe"), support::free_port(), &["--as-service"], &env), run(&d.join("work.qwe"), support::free_port(), &["--as-service"], &env));
+    let (a, b) = (run(&d.join("work.qwe"), 0, &["--as-service"], &env), run(&d.join("work.qwe"), 0, &["--as-service"], &env));
     let post = |port: u16, f: &str, h: &[(String, String)]| {
         let headers: Vec<(&str, &str)> = h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let r = support::send(port, "POST", &format!("/_quillo/service/{}", f), &headers, "[]");
@@ -1095,12 +1104,9 @@ fn a_split_service_stops_when_its_app_is_killed() {
         assert!(ports.iter().all(|p| !support::listening(*p)));
     }
     // Started alone, its stdin at its end from the start: it serves on.
-    let mut alone = spawn(Path::new(env!("CARGO_BIN_EXE_quillo")), &d.join("billing.qwe"), support::free_port(), &["--as-service"], &[]);
-    let deadline = Instant::now() + Duration::from_secs(25);
-    while !support::listening(alone.port) {
-        assert!(Instant::now() < deadline && alone.child.try_wait().unwrap().is_none(), "{}", alone.log());
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // On a port the system picks, read from its log (branch security).
+    let mut alone = spawn(Path::new(env!("CARGO_BIN_EXE_quillo")), &d.join("billing.qwe"), 0, &["--as-service"], &[]);
+    alone.port = support::port_in_log(&mut alone.child, &alone.log, Duration::from_secs(25));
     std::thread::sleep(Duration::from_millis(1200));
     assert!(alone.child.try_wait().unwrap().is_none() && support::listening(alone.port), "{}", alone.log());
 }

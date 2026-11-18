@@ -40,7 +40,10 @@ fn load(d: &Path) -> Interp {
     it
 }
 
-fn start(file: &Path, port: u16, args: &[&str]) -> Guard {
+/// On `port` 0 the system picks the port and the server says which: a port picked here could be
+/// taken by another process first (a shown bug in the test; branch security). A port given (one
+/// an app was told before the service started, a copy that joins) is checked to be this server's.
+fn start(file: &Path, port: u16, args: &[&str]) -> (Guard, u16) {
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(file)
@@ -50,16 +53,21 @@ fn start(file: &Path, port: u16, args: &[&str]) -> Guard {
         .env("QUILLO_HEALTH_TOKEN", TOKEN)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(if port == 0 { Stdio::piped() } else { Stdio::null() })
         .spawn()
         .unwrap();
-    let g = Guard::new(child);
+    let mut g = Guard::new(child);
     let deadline = Instant::now() + Duration::from_secs(20);
+    if port == 0 {
+        let port = support::port_in_stderr(&mut g.0, &file.display().to_string(), deadline);
+        return (g, port);
+    }
     while !listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
-    g
+    assert!(support::listener_is(port, g.0.id()), "another process listens on {}", port);
+    (g, port)
 }
 
 fn until(mut f: impl FnMut() -> bool) -> bool {
@@ -145,10 +153,10 @@ fn a_service_elsewhere_is_asked_at_each_of_its_addresses() {
         ("app.qwe", "service /billing = \"billing.qwe\"\nroute GET / = \"hi\"\n"),
         ("billing.qwe", "route GET /page = \"from billing\"\nserver fn f() = 1\n"),
     ]);
-    let (up, down, app) = (free_port(), free_port(), free_port());
-    let _billing = start(&d.join("billing.qwe"), up, &["--as-service"]);
+    let down = free_port();
+    let (_billing, up) = start(&d.join("billing.qwe"), 0, &["--as-service"]);
     let url = format!("billing=http://127.0.0.1:{},http://127.0.0.1:{}", up, down);
-    let _app = start(&d.join("app.qwe"), app, &["--service-url", &url]);
+    let (_app, app) = start(&d.join("app.qwe"), 0, &["--service-url", &url]);
     // Without the token, whether; with it, each address.
     let a = send(app, "GET", "/_quillo/ready", &[], "");
     assert_eq!((a.status, a.body.as_str()), (200, r#"{"ready":true}"#));
@@ -171,8 +179,8 @@ fn a_service_elsewhere_is_asked_at_each_of_its_addresses() {
 #[test]
 fn a_services_answer_is_kept_a_moment() {
     let d = folder("kept", &[("app.qwe", "service /billing = \"billing.qwe\"\nroute GET / = \"hi\"\n"), ("billing.qwe", "server fn f() = 1\n")]);
-    let (up, app) = (free_port(), free_port());
-    let _app = start(&d.join("app.qwe"), app, &["--service-url", &format!("billing=http://127.0.0.1:{}", up)]);
+    let up = free_port();
+    let (_app, app) = start(&d.join("app.qwe"), 0, &["--service-url", &format!("billing=http://127.0.0.1:{}", up)]);
     assert_eq!(send(app, "GET", "/_quillo/ready", &[], "").status, 503);
     let _billing = start(&d.join("billing.qwe"), up, &["--as-service"]);
     assert!(until(|| send(app, "GET", "/_quillo/ready", &[], "").status == 200));
@@ -181,8 +189,8 @@ fn a_services_answer_is_kept_a_moment() {
 #[test]
 fn no_address_answering_is_not_ready() {
     let d = folder("all-down", &[("app.qwe", "service /billing = \"billing.qwe\"\nroute GET / = \"hi\"\n"), ("billing.qwe", "server fn f() = 1\n")]);
-    let (down, app) = (free_port(), free_port());
-    let _app = start(&d.join("app.qwe"), app, &["--service-url", &format!("billing=http://127.0.0.1:{}", down)]);
+    let down = free_port();
+    let (_app, app) = start(&d.join("app.qwe"), 0, &["--service-url", &format!("billing=http://127.0.0.1:{}", down)]);
     assert_eq!(send(app, "GET", "/_quillo/ready", &[], "").status, 503);
     let a = send(app, "GET", "/billing/_quillo/ready", &[], "");
     assert_eq!(a.status, 503);
@@ -195,8 +203,8 @@ fn a_copy_that_joined_is_asked_with_the_service_here() {
         ("app.qwe", "service billing = \"billing.qwe\"\nroute GET / = \"hi\"\n"),
         ("billing.qwe", "server fn f() = 1\nroute GET /page = \"copy\"\n"),
     ]);
-    let (app, copy) = (free_port(), free_port());
-    let _app = start(&d.join("app.qwe"), app, &[]);
+    let copy = free_port();
+    let (_app, app) = start(&d.join("app.qwe"), 0, &[]);
     let at = format!("http://127.0.0.1:{}", app);
     let _copy = start(&d.join("billing.qwe"), copy, &["--as-service", "--join", &at]);
     let mut seen = String::new();

@@ -60,12 +60,17 @@ fn folder(name: &str, files: &[(&str, &str)]) -> PathBuf {
     d
 }
 
+/// The system picks the port and the log says which: a port picked here could be taken by another
+/// process first (a shown bug in the test; branch security). A port `args` name is kept, and
+/// checked to be this server's.
 fn run_in(d: &Path, main: &str, args: &[&str], env: &[(&str, &str)]) -> Srv {
-    let port = support::free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .arg("run")
-        .arg(d.join(main))
-        .args(["--port", &port.to_string()])
+    let named = support::port_named(args);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_quillo"));
+    c.arg("run").arg(d.join(main));
+    if named.is_none() {
+        c.args(["--port", "0"]);
+    }
+    let child = c
         .args(args)
         .envs(env.iter().copied())
         .env("QUILLO_SECRET", "a test secret of more than thirty-two bytes")
@@ -75,8 +80,13 @@ fn run_in(d: &Path, main: &str, args: &[&str], env: &[(&str, &str)]) -> Srv {
         .spawn()
         .expect("cannot start quillo");
     support::stop_with_tests(&child);
-    let s = Srv { child, port, dir: d.to_path_buf() };
-    assert!(until(|| support::listening(port)), "the server did not start: {}", s.log());
+    let mut s = Srv { child, port: named.unwrap_or(0), dir: d.to_path_buf() };
+    if let Some(port) = named {
+        assert!(until(|| support::listening(port)), "the server did not start: {}", s.log());
+        assert!(support::listener_is(port, s.child.id()), "another process listens on {}", port);
+        return s;
+    }
+    s.port = support::port_in_log(&mut s.child, &d.join("stderr.log"), Duration::from_secs(20));
     s
 }
 
@@ -422,7 +432,8 @@ fn development_pages_get_the_reload_script_wherever_they_can() {
 
 #[test]
 fn a_program_that_will_not_load_is_shown_until_it_does() {
-    let srv = run("watch-broken", "route GET / = \n", &["--watch"]);
+    // Its first load fails, and then it says no port: one is given (branch security).
+    let srv = run("watch-broken", "route GET / = \n", &["--watch", "--port", &support::free_port().to_string()]);
     let a = srv.get("/");
     assert_eq!(a.status, 500);
     assert!(a.body.contains("The program did not load"), "{}", a.body);

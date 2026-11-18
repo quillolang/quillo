@@ -323,33 +323,24 @@ impl Drop for Server {
     }
 }
 
-/// Ports outside the range the system gives clients, so that a client's
-/// connection cannot take a server's port before it listens.
-fn port() -> u16 {
-    support::free_port()
-}
-
 fn serve(name: &str, src: &str, extra: &[&str]) -> Server {
     let d = std::env::temp_dir().join(format!("quillo-security-{}-{}", std::process::id(), name));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(d.join("app.qwe"), src).unwrap();
-    let port = port();
+    // The system picks the port and the server says which: a port picked here could be taken by
+    // another process first (a shown bug in the test; branch security).
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(d.join("app.qwe"))
-        .args(["--port", &port.to_string()])
+        .args(["--port", "0"])
         .args(extra)
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("cannot start quillo");
     support::stop_with_tests(&child);
-    let server = Server { child, port };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut server = Server { child, port: 0 };
+    server.port = support::port_in_stderr(&mut server.child, name, Instant::now() + Duration::from_secs(20));
     server
 }
 

@@ -29,15 +29,13 @@ impl Drop for Server {
     }
 }
 
-fn free_port() -> u16 {
-    support::free_port()
-}
-
-fn start(file: &Path, port: u16, extra: &[&str], env: &[(&str, &str)]) -> Server {
+/// The system picks the port and the server says which: a port picked here could be taken by
+/// another process first (a shown bug in the test; branch security).
+fn start(file: &Path, extra: &[&str], env: &[(&str, &str)]) -> (Server, u16) {
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(file)
-        .args(["--port", &port.to_string()])
+        .args(["--port", "0"])
         .args(extra)
         .env("QUILLO_NATIVE_CACHE", cache())
         .envs(env.iter().copied())
@@ -46,22 +44,10 @@ fn start(file: &Path, port: u16, extra: &[&str], env: &[(&str, &str)]) -> Server
         .expect("cannot start quillo");
     support::stop_with_tests(&child);
     let mut server = Server(child);
-    // The first build of the cache's dependencies takes a while.
-    let deadline = Instant::now() + Duration::from_secs(300);
-    while !support::listening(port) {
-        if let Ok(Some(_)) = server.0.try_wait() {
-            let mut err = String::new();
-            let _ = server.0.stderr.take().map(|mut e| e.read_to_string(&mut err));
-            panic!("the server stopped:\n{}", err);
-        }
-        assert!(Instant::now() < deadline, "server did not start");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    // What it prints later is not read; it must not fill the pipe.
-    if let Some(mut e) = server.0.stderr.take() {
-        std::thread::spawn(move || std::io::copy(&mut e, &mut std::io::sink()));
-    }
-    server
+    // The first build of the cache's dependencies takes a while. Its stderr is read to the end,
+    // so the pipe never fills; what it said before it listened is in the panic when it stops.
+    let port = support::port_in_stderr(&mut server.0, &file.display().to_string(), Instant::now() + Duration::from_secs(300));
+    (server, port)
 }
 
 fn get(port: u16, path: &str) -> (u16, String) {
@@ -149,8 +135,7 @@ fn rust_functions_take_and_give_quillo_values() {
     let d = dir("values");
     std::fs::write(d.join("maths.qwer"), MATHS).unwrap();
     std::fs::write(d.join("main.qwe"), MAIN).unwrap();
-    let port = free_port();
-    let _s = start(&d.join("main.qwe"), port, &[], &[]);
+    let (_s, port) = start(&d.join("main.qwe"), &[], &[]);
     assert_eq!(get(port, "/primes/30").1, "[2,3,5,7,11,13,17,19,23,29]");
     assert_eq!(get(port, "/greet/Ana").1, "Hello, Ana!");
     let s: serde_json::Value = serde_json::from_str(&get(port, "/summary").1).unwrap();
@@ -175,8 +160,7 @@ fn a_slow_rust_call_holds_up_no_one() {
     let d = dir("slow");
     std::fs::write(d.join("maths.qwer"), MATHS).unwrap();
     std::fs::write(d.join("main.qwe"), MAIN).unwrap();
-    let port = free_port();
-    let _s = start(&d.join("main.qwe"), port, &[], &[]);
+    let (_s, port) = start(&d.join("main.qwe"), &[], &[]);
     let t = Instant::now();
     let slow = std::thread::spawn(move || get(port, "/slow").1);
     std::thread::sleep(Duration::from_millis(200));
@@ -201,8 +185,7 @@ fn a_qwer_file_has_crates() {
     )
     .unwrap();
     std::fs::write(d.join("main.qwe"), "use \"rand.qwer\"\nroute GET / = str(seeded(7, 0, 1000) == seeded(7, 0, 1000))\n").unwrap();
-    let port = free_port();
-    let _s = start(&d.join("main.qwe"), port, &[], &[]);
+    let (_s, port) = start(&d.join("main.qwe"), &[], &[]);
     assert_eq!(get(port, "/").1, "true");
 }
 
@@ -212,8 +195,7 @@ fn a_changed_file_is_built_again_and_a_broken_one_changes_nothing() {
     let lib = |greeting: &str| format!("pub fn greet(name: &str) -> String {{ format!(\"{}, {{}}!\", name) }}\n", greeting);
     std::fs::write(d.join("hello.qwer"), lib("Hello")).unwrap();
     std::fs::write(d.join("main.qwe"), "use \"hello.qwer\"\nroute GET /:name = greet(name)\n").unwrap();
-    let port = free_port();
-    let _s = start(&d.join("main.qwe"), port, &["--reload"], &[]);
+    let (_s, port) = start(&d.join("main.qwe"), &["--reload"], &[]);
     assert_eq!(get(port, "/Ana").1, "Hello, Ana!");
     std::fs::write(d.join("hello.qwer"), lib("Hi")).unwrap();
     eventually(120, "the changed file was not built again", || (get(port, "/Ana").1 == "Hi, Ana!").then_some(()));
@@ -233,8 +215,7 @@ fn a_program_built_beforehand_runs_without_cargo() {
     let out = Command::new(env!("CARGO_BIN_EXE_quillo")).args(["build"]).arg(d.join("main.qwe")).env("QUILLO_NATIVE_CACHE", cache()).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).contains("built "), "{}", String::from_utf8_lossy(&out.stdout));
-    let port = free_port();
-    let _s = start(&d.join("main.qwe"), port, &[], &[("CARGO", "/nonexistent/cargo")]);
+    let (_s, port) = start(&d.join("main.qwe"), &[], &[("CARGO", "/nonexistent/cargo")]);
     assert_eq!(get(port, "/greet/Bo").1, "Hello, Bo!");
 }
 
@@ -246,7 +227,8 @@ fn without_cargo_or_a_library_the_program_says_so() {
     let out = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(d.join("main.qwe"))
-        .args(["--port", &free_port().to_string()])
+        // `--port 0`: it never listens (branch security).
+        .args(["--port", "0"])
         .env("QUILLO_NATIVE_CACHE", cache())
         .env("CARGO", "/nonexistent/cargo")
         .output()

@@ -5362,6 +5362,9 @@ server fn mcp whoami() -> map with time = { user: session().user, tenant: tenant
             assert!(Instant::now() < deadline, "did not start: {}", said.lock().unwrap());
             std::thread::sleep(Duration::from_millis(20));
         }
+        // Named here, it is checked to be this server's: another process could have taken it
+        // first (branch security).
+        assert!(support::listener_is(p, g.0.id()), "another process listens on {}", p);
         std::thread::sleep(Duration::from_millis(300));
         assert!(!said.lock().unwrap().contains("MCP door"));
         std::fs::write(d.join("main.qwe"), "route GET / = \"hi\"\n/// Seven.\nfn mcp seven() -> int with time = 7\n").unwrap();
@@ -5416,7 +5419,8 @@ server fn mcp whoami() -> map with time = { user: session().user, tenant: tenant
         let d = review_dir("unopened", "", "");
         let bad = review_dir("unopened-system", "db.open(\"data/{tenant}.db\")", "");
         for (dir, env) in [(&d, ("QUILLO_DB", "postgres://nobody@127.0.0.1:9/none")), (&bad, ("QUILLO_SYSTEM_DB", "postgres://nobody@127.0.0.1:9/none"))] {
-            let (g, said) = logged_env(dir, &["--watch", "--port", &support::free_port().to_string()][..], &[env]);
+            // `--port 0`: its port is read from its line below (branch security).
+            let (g, said) = logged_env(dir, &["--watch", "--port", "0"][..], &[env]);
             let port: u16 = {
                 let deadline = Instant::now() + WAIT;
                 loop {
@@ -5484,11 +5488,14 @@ server fn mcp whoami() -> map with time = { user: session().user, tenant: tenant
         // QUILLO_SECRET from A to B: A's tokens are no good under B, and one revoked there stays
         // revoked when A comes back.
         let d = review_dir("rotated", "db.open(\"data.db\")", "");
+        // The system picks the port and the log says which (a port picked here could be taken by
+        // another process first; a shown bug in the test, branch security).
         let start = |key: &str| {
-            let port = support::free_port();
-            let (g, said) = logged_env(&d, &["--port", &port.to_string()][..], &[("QUILLO_SECRET", key)]);
+            let (g, said) = logged_env(&d, &["--port", "0"][..], &[("QUILLO_SECRET", key)]);
             let deadline = Instant::now() + WAIT;
-            while !support::listening(port) {
+            let mut port = 0;
+            while port == 0 || !support::listening(port) {
+                port = said.lock().unwrap().lines().find_map(support::port_said).unwrap_or(0);
                 assert!(Instant::now() < deadline, "did not start: {}", said.lock().unwrap());
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -8472,7 +8479,11 @@ struct Logged {
 
 impl Logged {
     fn start(file: &Path, opts: &[&str], env: &[(&str, &str)]) -> Logged {
-        let port = support::free_port();
+        // The system picks the port and the log says which, but under --split or --join, which
+        // need it given: a port picked here could be taken by another process first (a shown bug
+        // in the test; branch security). A port given is checked to be this server's.
+        let given = support::port_given(opts);
+        let mut port = if given { support::free_port() } else { 0 };
         let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
             .arg("run")
             .arg(file)
@@ -8497,12 +8508,21 @@ impl Logged {
         });
         let mut guard = support::Guard::new(child);
         let deadline = Instant::now() + WAIT;
-        while !support::listening(port) {
+        loop {
+            if port == 0 {
+                port = log.lock().unwrap().lines().find_map(support::port_said).unwrap_or(0);
+            }
+            if port != 0 && support::listening(port) {
+                break;
+            }
             if let Ok(Some(status)) = guard.0.try_wait() {
                 panic!("quillo run {} stopped ({}): {}", file.display(), status, log.lock().unwrap());
             }
             assert!(Instant::now() < deadline, "the server did not start: {}", log.lock().unwrap());
             std::thread::sleep(Duration::from_millis(20));
+        }
+        if given {
+            assert!(support::listener_is(port, guard.0.id()), "another process listens on {}", port);
         }
         Logged { _guard: guard, port, log }
     }

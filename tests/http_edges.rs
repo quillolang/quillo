@@ -85,28 +85,24 @@ fn start_from(name: &str, src: &str, set: impl Fn(&mut Command)) -> Srv {
     let f = d.join("app.qwe");
     std::fs::write(&f, src).unwrap();
     let log = d.join("stderr.log");
-    // A port found free can be taken before the server listens on it: ask for another.
-    for _ in 0..5 {
-        let port = support::free_port();
-        let mut c = Command::new(env!("CARGO_BIN_EXE_quillo"));
-        c.arg("run").arg(&f).args(["--port", &port.to_string()]);
-        set(&mut c);
-        let child = c
-            .env("QUILLO_SECRET", "a test secret of more than thirty-two bytes")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(std::fs::File::create(&log).unwrap())
-            .spawn()
-            .expect("cannot start quillo");
-        support::stop_with_tests(&child);
-        let s = Srv { child, port, log: log.clone() };
-        let taken = || s.log().contains("Address already in use");
-        assert!(until(|| support::listening(port) || taken()), "the server did not start: {}", s.log());
-        if !taken() {
-            return s;
-        }
-    }
-    panic!("no free port in 5 tries");
+    // A port found free can be taken before the server listens on it, and a test then talked to
+    // another process's listener: the system picks the port (`--port 0`) and the log says which,
+    // where five tries on a port picked here only met the port's being taken (a shown bug in the
+    // test; branch security).
+    let mut c = Command::new(env!("CARGO_BIN_EXE_quillo"));
+    c.arg("run").arg(&f).args(["--port", "0"]);
+    set(&mut c);
+    let child = c
+        .env("QUILLO_SECRET", "a test secret of more than thirty-two bytes")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .expect("cannot start quillo");
+    support::stop_with_tests(&child);
+    let mut s = Srv { child, port: 0, log };
+    s.port = support::port_in_log(&mut s.child, &s.log, Duration::from_secs(20));
+    s
 }
 
 fn connect(port: u16) -> TcpStream {

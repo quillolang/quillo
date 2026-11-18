@@ -60,6 +60,8 @@ fn dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser")
 }
 
+/// On `port` 0 the caller reads the port from its stderr; a port given is waited for here, and
+/// checked to be this server's (branch security).
 fn server(port: u16, args: &[&str], stderr: Stdio) -> support::Guard {
     let s = support::Guard::new(
         Command::new(env!("CARGO_BIN_EXE_quillo"))
@@ -72,11 +74,15 @@ fn server(port: u16, args: &[&str], stderr: Stdio) -> support::Guard {
             .spawn()
             .unwrap(),
     );
+    if port == 0 {
+        return s;
+    }
     let deadline = Instant::now() + Duration::from_secs(10);
     while !support::listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
+    assert!(support::listener_is(port, s.0.id()), "another process listens on {}", port);
     s
 }
 
@@ -111,8 +117,10 @@ static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// with `flags`, and gives what the script recorded.
 fn run(chrome: &Path, path: &str, script: &str, flags: &str, args: &[&str]) -> Value {
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let port = support::free_port();
-    let server = server(port, args, Stdio::null());
+    // The system picks the port and the server says which: a port picked here could be taken by
+    // another process first (a shown bug in the test; branch security).
+    let mut server = server(0, args, Stdio::piped());
+    let port = support::port_in_stderr(&mut server.0, "media-publish.qwe", Instant::now() + Duration::from_secs(10));
     let out = page(chrome, port, path, script, flags, 60000).wait_with_output().expect("node");
     drop(server);
     result(out, port)

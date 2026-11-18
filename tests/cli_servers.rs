@@ -41,9 +41,18 @@ struct Running {
 
 /// Starts `quillo run` on `file`, in its folder, and waits until it answers.
 fn run(dir: &Path, file: &str, extra: &[&str], env: &[(&str, &str)]) -> Running {
+    run_as(dir, file, extra, env, support::port_given(extra))
+}
+
+/// `run` on a port picked here: a program whose first load fails under --watch says no port.
+fn run_on_given_port(dir: &Path, file: &str, extra: &[&str], env: &[(&str, &str)]) -> Running {
+    run_as(dir, file, extra, env, true)
+}
+
+fn run_as(dir: &Path, file: &str, extra: &[&str], env: &[(&str, &str)], given: bool) -> Running {
     let mut tries = 0;
     loop {
-        match start(dir, file, extra, env) {
+        match start(dir, file, extra, env, given) {
             Ok(r) => return r,
             // Another test's server, in this process or not, got to the port first.
             Err(said) if said.contains("Address already in use") && tries < 5 => tries += 1,
@@ -52,9 +61,14 @@ fn run(dir: &Path, file: &str, extra: &[&str], env: &[(&str, &str)]) -> Running 
     }
 }
 
-fn start(dir: &Path, file: &str, extra: &[&str], env: &[(&str, &str)]) -> Result<Running, String> {
-    let port = free_port();
-    let log = dir.join(format!("{}-{}.log", file, port));
+fn start(dir: &Path, file: &str, extra: &[&str], env: &[(&str, &str)], given: bool) -> Result<Running, String> {
+    // The system picks the port (`--port 0`) and the log says which: a port picked here could be
+    // taken by another process before the server bound it, and the test then talked to that one
+    // (a shown bug in the test; branch security). A copy that joins or a member that registers
+    // tells the port it was given, so it is given one, and the listener checked to be it.
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let port = if given { free_port() } else { 0 };
+    let log = dir.join(format!("{}-{}.log", file, N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
     let out = File::create(&log).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .args(["run", file, "--port", &port.to_string()])
@@ -70,12 +84,18 @@ fn start(dir: &Path, file: &str, extra: &[&str], env: &[(&str, &str)]) -> Result
         .expect("cannot start quillo");
     let mut r = Running { server: Guard::new(child), port, log };
     let deadline = Instant::now() + Duration::from_secs(20);
-    while !answers(port) {
+    while r.port == 0 || !answers(r.port) {
+        if r.port == 0 {
+            r.port = support::port_said_in(&r.log).unwrap_or(0);
+        }
         if let Ok(Some(status)) = r.server.0.try_wait() {
             return Err(format!("{}\n{}", status, r.said()));
         }
         assert!(Instant::now() < deadline, "the server did not start\n{}", r.said());
         std::thread::sleep(Duration::from_millis(20));
+    }
+    if given && !support::listener_is(r.port, r.server.0.id()) {
+        return Err(format!("another process listens on {} (Address already in use)", r.port));
     }
     Ok(r)
 }
@@ -283,7 +303,7 @@ fn the_first_signal_answers_what_is_in_progress_and_stops() {
 fn watch_serves_a_broken_program_and_recovers_when_it_is_fixed() {
     // Stopped by the checker: the details are in the terminal.
     let dir = folder("watch-broken", &[("app.qwe", "route GET / = nope\n")]);
-    let s = run(&dir, "app.qwe", &["--watch"], &[]);
+    let s = run_on_given_port(&dir, "app.qwe", &["--watch"], &[]);
     s.wait_for("app.qwe:1: error: unknown name `nope`");
     let a = s.get("/");
     assert_eq!(a.status, 500, "{}", a.body);
@@ -295,7 +315,7 @@ fn watch_serves_a_broken_program_and_recovers_when_it_is_fixed() {
 #[test]
 fn watch_without_the_checker_shows_the_error_on_the_page() {
     let dir = folder("watch-run", &[("app.qwe", "fn zero() = 0\nprint(1 / zero())\nroute GET / = \"hi\"\n")]);
-    let s = run(&dir, "app.qwe", &["--watch", "--no-check"], &[]);
+    let s = run_on_given_port(&dir, "app.qwe", &["--watch", "--no-check"], &[]);
     s.wait_for("quillo: app.qwe:2: division by zero");
     let a = s.get("/");
     assert_eq!(a.status, 500, "{}", a.body);

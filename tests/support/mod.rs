@@ -317,10 +317,10 @@ fn serve_opts(file: &Path, env: &[(&str, &str)], opts: &[&str]) -> Server {
     // test's requests went to another test's server (FEEDBACK55.md, found running its slices;
     // branch feedback55). A test that names its own port or socket keeps it.
     // Under --split the services' own lines come first: those tests pick the port here as before.
-    let own = opts.iter().any(|o| *o == "--port" || o.starts_with("--port=") || *o == "--listen" || o.starts_with("--listen=") || *o == "--split");
+    let own = port_given(opts);
     let port = if own { free_port() } else { 0 };
     let log = std::env::var("QUILLO_TEST_LOG").is_ok();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(file)
         .args(["--port", &port.to_string(), "--workers", "8"])
@@ -345,40 +345,174 @@ fn serve_opts(file: &Path, env: &[(&str, &str)], opts: &[&str]) -> Server {
         }
         return s;
     }
-    // Read the server's lines to the end, so its pipe never fills: the port from its first
-    // "listening on", the rest shown under QUILLO_TEST_LOG.
+    // In its Server first, so that a panic below stops it.
+    let mut s = Server { child, port: 0 };
+    s.port = port_in_stderr(&mut s.child, &file.display().to_string(), deadline);
+    s
+}
+
+/// The port in a server's "listening on" line (`quillo: 2 routes listening on
+/// http://127.0.0.1:4100`, with ` (2 instances)` after it under --instances, `FastCGI at
+/// 127.0.0.1:4100` for `quillo fcgi`); none for a socket's path, or a line of a service's under
+/// --split (`[billing] quillo: ...`). A server whose first load fails under --watch says none.
+pub fn port_said(line: &str) -> Option<u16> {
+    let url = line.strip_prefix("quillo: ")?.split("listening on ").nth(1)?;
+    let url = url.strip_prefix("FastCGI at ").unwrap_or(url);
+    let hostport = url.split("://").nth(1).unwrap_or(url).split(|c: char| c == '/' || c.is_whitespace()).next().unwrap_or("");
+    hostport.rsplit(':').next().and_then(|p| p.parse::<u16>().ok())
+}
+
+/// The port `child`, a `quillo run --port 0` with its stderr piped, says it listens on, once it
+/// listens there. Its lines are read to the end on a thread of their own, so the pipe never
+/// fills, and shown under QUILLO_TEST_LOG. Panics, naming `what`, when the server stops first or
+/// `deadline` passes: hold `child` where a panic stops it (a `Guard`, say) before calling.
+pub fn port_in_stderr(child: &mut Child, what: &str, deadline: Instant) -> u16 {
+    port_from_stderr(child, what, deadline, std::env::var("QUILLO_TEST_LOG").is_ok())
+}
+
+/// `port_in_stderr` with every line the server says shown, as a stderr it inherited showed them.
+pub fn port_in_stderr_shown(child: &mut Child, what: &str, deadline: Instant) -> u16 {
+    port_from_stderr(child, what, deadline, true)
+}
+
+fn port_from_stderr(child: &mut Child, what: &str, deadline: Instant, log: bool) -> u16 {
     let (tx, rx) = std::sync::mpsc::channel();
-    let err = child.stderr.take().unwrap();
+    let err = child.stderr.take().expect("the server's stderr is piped");
+    // What it said before it listened, for a server that stops or does not start.
+    let said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let kept = said.clone();
     std::thread::spawn(move || {
         use std::io::BufRead;
+        let mut listening = false;
         for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
             if log {
                 eprintln!("{}", line);
             }
-            if let Some(url) = line.split("listening on ").nth(1) {
-                let hostport = url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("");
-                if let Some(p) = hostport.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
-                    let _ = tx.send(p);
-                }
+            if !listening {
+                let mut k = kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                k.push_str(&line);
+                k.push('\n');
+            }
+            if let Some(p) = port_said(&line) {
+                listening = true;
+                let _ = tx.send(p);
             }
         }
     });
-    let mut s = Server { child, port: 0 };
-    loop {
+    let said = || said.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let port = loop {
         if let Ok(p) = rx.recv_timeout(Duration::from_millis(20)) {
-            s.port = p;
-            break;
+            break p;
         }
-        if let Ok(Some(status)) = s.child.try_wait() {
-            panic!("quillo run {} stopped: {}", file.display(), status);
+        if let Ok(Some(status)) = child.try_wait() {
+            // Its last lines may still be on their way.
+            std::thread::sleep(Duration::from_millis(50));
+            panic!("quillo run {} stopped: {}\n{}", what, status, said());
         }
-        assert!(Instant::now() < deadline, "server did not start");
-    }
-    while !listening(s.port) {
+        assert!(Instant::now() < deadline, "server did not start\n{}", said());
+    };
+    while !listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(5));
     }
-    s
+    port
+}
+
+/// The port `child`, a `quillo run --port 0` whose stderr goes to the file `log`, says it listens
+/// on, once it listens there: the system picks it, as `serve_opts` has it, where a port picked
+/// here could be taken by another process before the server binds it (CI: feedback31's JSON body
+/// answered by another server, prefetching's refused connection, feedback67's sink). Only whole
+/// lines are read, as a line can be written in pieces. Panics with the log when `child` stops
+/// first or `within` passes: hold `child` where a panic stops it (a `Guard`, say) before calling.
+pub fn port_in_log(child: &mut Child, log: &Path, within: Duration) -> u16 {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Some(port) = port_said_in(log) {
+            while !listening(port) {
+                assert!(Instant::now() < deadline, "the server did not listen on {}:\n{}", port, std::fs::read_to_string(log).unwrap_or_default());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            return port;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("quillo stopped: {}\n{}", status, std::fs::read_to_string(log).unwrap_or_default());
+        }
+        assert!(Instant::now() < deadline, "the server did not start:\n{}", std::fs::read_to_string(log).unwrap_or_default());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The port of the first whole "listening on" line in the file `log`, if there is one yet: for a
+/// helper that waits in its own way (one that gives an error back when the server stops).
+pub fn port_said_in(log: &Path) -> Option<u16> {
+    let text = std::fs::read_to_string(log).ok()?;
+    text.split_inclusive('\n').filter(|l| l.ends_with('\n')).find_map(port_said)
+}
+
+/// The port `args` name (`--port N`, `--port=N`): a test gives one to a server that cannot say the
+/// port the system picked (its first load fails under --watch).
+pub fn port_named(args: &[&str]) -> Option<u16> {
+    args.iter().enumerate().find_map(|(i, a)| match a.strip_prefix("--port") {
+        Some("") => args.get(i + 1).and_then(|p| p.parse().ok()),
+        Some(r) => r.strip_prefix('=').and_then(|p| p.parse().ok()),
+        None => None,
+    })
+}
+
+/// Whether a `quillo run` with `args` must be given its port, not `--port 0`: it names its own
+/// (`--port`, `--listen`); a copy that joins (`--join`) or a member that registers (`--register`)
+/// tells others the port it was given, and 0 is refused; under `--split` the services' own lines
+/// come before the app's.
+pub fn port_given(args: &[&str]) -> bool {
+    args.iter().any(|o| {
+        ["--port", "--listen", "--split", "--join", "--register"].iter().any(|f| o == f || o.strip_prefix(f).map_or(false, |r| r.starts_with('=')))
+    })
+}
+
+/// The port `child`, a helper of a test's (a Node sink, a fake service) with its stdout piped,
+/// says it listens on as its first line, once it listens there: the helper listens on port 0 and
+/// prints the port it was given, where a port picked here could be taken by another process
+/// before the helper bound it (CI run 44152090200: feedback67's push sink did not start). The
+/// rest of its stdout is read to the end, so the pipe never fills. Panics, naming `what`, when the
+/// helper stops first or `within` passes: hold `child` where a panic stops it (a `Guard`) first.
+pub fn port_on_stdout(child: &mut Child, what: &str, within: Duration) -> u16 {
+    let deadline = Instant::now() + within;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let out = child.stdout.take().expect("the helper's stdout is piped");
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut lines = std::io::BufReader::new(out).lines().map_while(Result::ok);
+        if let Some(first) = lines.next() {
+            let _ = tx.send(first);
+        }
+        for _ in lines {}
+    });
+    let first = loop {
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(20)) {
+            break line;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("{} stopped: {}", what, status);
+        }
+        assert!(Instant::now() < deadline, "{} did not start", what);
+    };
+    let port: u16 = first.trim().parse().unwrap_or_else(|_| panic!("{} said {:?}, not its port", what, first));
+    while !listening(port) {
+        assert!(Instant::now() < deadline, "{} did not start", what);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    port
+}
+
+/// Whether `pid` is among the processes listening on TCP `port`, as `lsof` says; true when there
+/// is no `lsof` to ask. For a server that must take a port given before (started again where the
+/// one before was): another process could have taken it in between, and the test would talk to
+/// that one (branch security).
+pub fn listener_is(port: u16, pid: u32) -> bool {
+    match Command::new("lsof").args(["-nP", &format!("-iTCP:{}", port), "-sTCP:LISTEN", "-t"]).stdin(Stdio::null()).stderr(Stdio::null()).output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).split_whitespace().any(|p| p == pid.to_string()),
+        Err(_) => true,
+    }
 }
 
 /// An HTTP answer: status, headers (lower case) and body.

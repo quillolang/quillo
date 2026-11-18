@@ -13,7 +13,8 @@ fn program(d: &Path, cmd: &str) {
 
 fn quillo(d: &Path, path: Option<&str>) -> Output {
     let mut c = Command::new(env!("CARGO_BIN_EXE_quillo"));
-    c.args(["run", "app.qwe", "--port", &support::free_port().to_string()]).current_dir(d).stdin(Stdio::null());
+    // `--port 0`: it never listens, and a port picked here could be taken first (branch security).
+    c.args(["run", "app.qwe", "--port", "0"]).current_dir(d).stdin(Stdio::null());
     if let Some(p) = path {
         c.env("PATH", p);
     }

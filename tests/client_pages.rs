@@ -35,22 +35,19 @@ fn run_page(chrome: &Path, app: &str, path: &str, script: &str) -> Value {
     static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
-    let port = support::free_port();
-    let server = support::Guard::new(
+    // The system picks the port and the server says which: a port picked here could be taken by
+    // another process before the server bound it (a shown bug in the test; branch security).
+    let mut server = support::Guard::new(
         Command::new(env!("CARGO_BIN_EXE_quillo"))
             .arg("run")
             .arg(root.join("client_pages").join(app))
-            .args(["--port", &port.to_string()])
+            .args(["--port", "0"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let port = support::port_in_stderr(&mut server.0, app, Instant::now() + Duration::from_secs(10));
     let profile = std::env::temp_dir().join(format!("quillo-chrome-pages-{}-{}", std::process::id(), port));
     let out = Command::new("node")
         .arg(root.join("browser/run.js"))

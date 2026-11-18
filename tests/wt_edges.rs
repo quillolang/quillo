@@ -72,14 +72,15 @@ impl Run {
     }
 }
 
+/// The system picks the port and the log says which: a port picked here could be taken by another
+/// process first (a shown bug in the test; branch security).
 fn run(file: &Path, extra: &[&str], env: &[(&str, &str)]) -> Run {
     static N: AtomicUsize = AtomicUsize::new(0);
-    let port = support::free_port();
     let log = file.with_extension(format!("log{}", N.fetch_add(1, Ordering::SeqCst)));
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(file)
-        .args(["--port", &port.to_string()])
+        .args(["--port", "0"])
         .args(extra)
         .env("QUILLO_SECRET", "a test secret for the channels, long enough")
         .env_remove("QUILLO_SERVICE_SECRET")
@@ -90,16 +91,9 @@ fn run(file: &Path, extra: &[&str], env: &[(&str, &str)]) -> Run {
         .spawn()
         .expect("cannot start quillo");
     support::stop_with_tests(&child);
-    let mut r = Run { child, port, log };
-    let deadline = Instant::now() + Duration::from_secs(25);
-    while !support::listening(port) {
-        if let Ok(Some(status)) = r.child.try_wait() {
-            panic!("quillo stopped ({}):\n{}", status, r.log());
-        }
-        assert!(Instant::now() < deadline, "server did not start:\n{}", r.log());
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    answers(port);
+    let mut r = Run { child, port: 0, log };
+    r.port = support::port_in_log(&mut r.child, &r.log, Duration::from_secs(25));
+    answers(r.port);
     r
 }
 

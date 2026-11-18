@@ -139,13 +139,14 @@ impl Drop for Run {
     }
 }
 
+/// The system picks the port and the log says which: a port picked here could be taken by another
+/// process first (a shown bug in the test; branch security).
 fn run(d: &std::path::Path, flags: &[&str]) -> Run {
-    let port = support::free_port();
     let log = d.join("log.txt");
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(d.join("main.qwe"))
-        .args(["--port", &port.to_string(), "--metrics"])
+        .args(["--port", "0", "--metrics"])
         .args(flags)
         .env("QUILLO_SECRET", "a test secret for live data, long enough to use")
         .stdin(Stdio::null())
@@ -154,15 +155,8 @@ fn run(d: &std::path::Path, flags: &[&str]) -> Run {
         .spawn()
         .unwrap();
     support::stop_with_tests(&child);
-    let mut r = Run { child, port, log };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        if let Ok(Some(s)) = r.child.try_wait() {
-            panic!("quillo stopped ({}): {}", s, std::fs::read_to_string(&r.log).unwrap_or_default());
-        }
-        assert!(Instant::now() < deadline, "the server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut r = Run { child, port: 0, log };
+    r.port = support::port_in_log(&mut r.child, &r.log, Duration::from_secs(20));
     r
 }
 
@@ -530,16 +524,12 @@ fn live_data_can_be_seen_from_outside() {
 #[test]
 fn a_low_descriptor_limit_is_raised() {
     let d = live_app("descriptors");
-    let port = support::free_port();
-    let script = format!("ulimit -S -n 256; exec '{}' run '{}' --port {} --live-per-client 1000", env!("CARGO_BIN_EXE_quillo"), d.join("main.qwe").display(), port);
-    let child = Command::new("sh").args(["-c", &script]).env("QUILLO_SECRET", "a test secret for live data, long enough to use").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    // The system picks the port, as `run` has it (branch security).
+    let script = format!("ulimit -S -n 256; exec '{}' run '{}' --port 0 --live-per-client 1000", env!("CARGO_BIN_EXE_quillo"), d.join("main.qwe").display());
+    let child = Command::new("sh").args(["-c", &script]).env("QUILLO_SECRET", "a test secret for live data, long enough to use").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
     support::stop_with_tests(&child);
-    let _server = support::Guard::new(child);
-    let start = Instant::now();
-    while !support::listening(port) {
-        assert!(start.elapsed() < Duration::from_secs(20), "the server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut _server = support::Guard::new(child);
+    let port = support::port_in_stderr(&mut _server.0, "main.qwe", Instant::now() + Duration::from_secs(20));
     // Past the limit it started with, each a descriptor.
     let pages: Vec<Page> = (0..400).map(|i| open(port, 1, "db:nothing", None).unwrap_or_else(|| panic!("page {}", i))).collect();
     assert_eq!(pages.len(), 400);

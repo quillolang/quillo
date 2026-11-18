@@ -106,24 +106,22 @@ server fn price(n: int) = 12.50m * n
 route GET / = "the domain"
 "#,
     )]);
-    let port = support::free_port();
+    // The system picks the port and the server says which: a port picked here could be taken by
+    // another process first (a shown bug in the test; branch security).
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(d.join("main.qwe"))
-        .args(["--port", &port.to_string(), "--plain-http"])
+        .args(["--port", "0", "--plain-http"])
         .env("QUILLO_SECRET", "a test secret for the domain, long enough")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     support::stop_with_tests(&child);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(30));
-    }
-    (d, Running(child, port))
+    let mut r = Running(child, 0);
+    r.1 = support::port_in_stderr(&mut r.0, "main.qwe", Instant::now() + Duration::from_secs(20));
+    (d, r)
 }
 
 fn caller(name: &str, src: &str, keep: bool) -> Output {

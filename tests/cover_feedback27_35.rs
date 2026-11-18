@@ -27,23 +27,20 @@ fn said(o: &Output) -> String {
 }
 
 /// A server with options of its own, and its port.
+/// The system picks the port and the server says which: a port picked here could be taken by
+/// another process first (a shown bug in the test; branch security).
 fn serve_with(d: &Path, args: &[&str]) -> (support::Guard, u16) {
-    let port = support::free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(d.join("main.qwe"))
-        .args(["--port", &port.to_string()])
+        .args(["--port", "0"])
         .args(args)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let g = support::Guard::new(child);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "did not start");
-        std::thread::sleep(Duration::from_millis(30));
-    }
+    let mut g = support::Guard::new(child);
+    let port = support::port_in_stderr(&mut g.0, "main.qwe", Instant::now() + Duration::from_secs(20));
     (g, port)
 }
 
@@ -171,20 +168,17 @@ fn a_files_pattern_with_no_list_and_a_file_in_the_wrong_shape() {
 #[test]
 fn the_log_writes_a_carriage_return_and_keeps_a_tab() {
     let d = dir("log", &[("main.qwe", b"route GET /e/:m = err(m)\n")]);
-    let port = support::free_port();
     let log = d.join("log");
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(d.join("main.qwe"))
-        .args(["--port", &port.to_string()])
+        .args(["--port", "0"])
         .stderr(std::fs::File::create(&log).unwrap())
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
-    let _g = support::Guard::new(child);
-    while !support::listening(port) {
-        std::thread::sleep(Duration::from_millis(30));
-    }
+    let mut _g = support::Guard::new(child);
+    let port = support::port_in_log(&mut _g.0, &log, Duration::from_secs(20));
     send(port, "GET", "/e/a%0Db%09c", &[], "");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !std::fs::read_to_string(&log).unwrap().contains("a\\rb") && Instant::now() < deadline {

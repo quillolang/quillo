@@ -72,13 +72,14 @@ fn serve(d: &Path, wait: u64) -> Logged {
 }
 
 /// `serve` with options of `quillo run`'s.
+/// The system picks the port and the log says which: a port picked here could be taken by another
+/// process first (a shown bug in the test; branch security).
 fn serve_with(d: &Path, wait: u64, opts: &[&str]) -> Logged {
-    let port = support::free_port();
     let log = d.join("server.log");
     let child = quillo()
         .arg("run")
         .arg(d.join("main.qwe"))
-        .args(["--port", &port.to_string(), "--no-check"])
+        .args(["--port", "0", "--no-check"])
         .args(opts)
         .env("QUILLO_SECRET", "test secret for the tests")
         .stdin(Stdio::null())
@@ -87,15 +88,8 @@ fn serve_with(d: &Path, wait: u64, opts: &[&str]) -> Logged {
         .spawn()
         .unwrap();
     support::stop_with_tests(&child);
-    let mut s = Logged { child, port, log };
-    let deadline = Instant::now() + Duration::from_secs(wait);
-    while !support::listening(port) {
-        if let Ok(Some(st)) = s.child.try_wait() {
-            panic!("stopped: {}\n{}", st, s.log());
-        }
-        assert!(Instant::now() < deadline, "did not start:\n{}", s.log());
-        std::thread::sleep(Duration::from_millis(30));
-    }
+    let mut s = Logged { child, port: 0, log };
+    s.port = support::port_in_log(&mut s.child, &s.log, Duration::from_secs(wait));
     s
 }
 

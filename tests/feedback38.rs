@@ -25,12 +25,13 @@ fn dir(name: &str, files: &[(&str, &str)]) -> PathBuf {
 }
 
 /// `quillo run` with these arguments and this environment, once it listens.
+/// The system picks the port and the server says which: a port picked here could be taken by
+/// another process first (a shown bug in the test; branch security).
 fn run(d: &Path, file: &str, args: &[&str], env: &[(&str, &str)]) -> (support::Guard, u16) {
-    let port = support::free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(file)
-        .args(["--port", &port.to_string()])
+        .args(["--port", "0"])
         .args(args)
         .current_dir(d)
         .env_remove("QUILLO_SERVICE_SECRET")
@@ -41,15 +42,11 @@ fn run(d: &Path, file: &str, args: &[&str], env: &[(&str, &str)]) -> (support::G
         .env("JWT_KEY", JWT)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(if std::env::var("QUILLO_TEST_LOG").is_ok() { Stdio::inherit() } else { Stdio::null() })
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let g = support::Guard::new(child);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "{} did not start", file);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut g = support::Guard::new(child);
+    let port = support::port_in_stderr(&mut g.0, file, Instant::now() + Duration::from_secs(20));
     (g, port)
 }
 

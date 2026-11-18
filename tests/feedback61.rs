@@ -239,24 +239,21 @@ fn in_pages_given(name: &str, src: &str, paths: &[&str], body: &str, focus: bool
     // One Chrome at a time: several at once overload small machines.
     static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let port = support::free_port();
-    let _server = support::Guard::new(
+    // The system picks the port and the server says which: a port picked here could be taken by
+    // another process first (a shown bug in the test; branch security). So in `served`.
+    let mut _server = support::Guard::new(
         Command::new(quillo())
             .arg("run")
             .arg(app.0.join("main.qwe"))
-            .args(["--port", &port.to_string()])
+            .args(["--port", "0"])
             .args(args)
             .current_dir(&app.0)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let port = support::port_in_stderr(&mut _server.0, name, Instant::now() + Duration::from_secs(20));
     std::fs::write(app.0.join("t.js"), script(body)).unwrap();
     let run = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser/run.js");
     let mut got = Vec::new();
@@ -1638,24 +1635,19 @@ struct Served {
 fn served(name: &str, src: &str) -> Served {
     let app = App::new(name, src);
     checked(&app.0);
-    let port = support::free_port();
-    let server = support::Guard::new(
+    let mut server = support::Guard::new(
         Command::new(quillo())
             .arg("run")
             .arg(app.0.join("main.qwe"))
-            .args(["--port", &port.to_string(), "--metrics"])
+            .args(["--port", "0", "--metrics"])
             .current_dir(&app.0)
             .env("QUILLO_SECRET", "a test secret for live data, long enough to use")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let port = support::port_in_stderr(&mut server.0, name, Instant::now() + Duration::from_secs(20));
     Served { _server: server, _app: app, port }
 }
 

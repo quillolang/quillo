@@ -61,8 +61,11 @@ fn folder(name: &str, src: &str) -> PathBuf {
 
 /// `quillo run app.qwe` in `d` on a free port, with at most `descriptors` file descriptors when
 /// given; `wait` false for a server that listens elsewhere than its port.
+/// The system picks the port and the log says which: a port picked here could be taken by another
+/// process first (a shown bug in the test; branch security). One that listens elsewhere keeps the
+/// port it is given, never bound.
 fn run(d: &Path, args: &[&str], descriptors: Option<u32>, wait: bool) -> Srv {
-    let port = support::free_port();
+    let port = if wait && !support::port_given(args) { 0 } else { support::free_port() };
     let bin = env!("CARGO_BIN_EXE_quillo");
     let mut c = match descriptors {
         Some(n) => {
@@ -83,8 +86,10 @@ fn run(d: &Path, args: &[&str], descriptors: Option<u32>, wait: bool) -> Srv {
         .spawn()
         .expect("cannot start quillo");
     support::stop_with_tests(&child);
-    let s = Srv { child, port, dir: d.to_path_buf() };
-    if wait {
+    let mut s = Srv { child, port, dir: d.to_path_buf() };
+    if port == 0 {
+        s.port = support::port_in_log(&mut s.child, &d.join("stderr.log"), Duration::from_secs(20));
+    } else if wait {
         assert!(until(|| support::listening(port)), "the server did not start: {}", s.log());
     }
     s

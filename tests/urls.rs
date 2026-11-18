@@ -219,23 +219,21 @@ fn load(cases: &[(Case, &str)], args: &[&str], at: &str, wait_ms: u32) -> Page {
         ),
     )
     .unwrap();
-    let port = support::free_port();
-    let server = support::Guard::new(
+    // The system picks the port and the server says which, its lines shown as before: a port
+    // picked here could be taken by another process first (a shown bug in the test; branch
+    // security).
+    let mut server = support::Guard::new(
         Command::new(env!("CARGO_BIN_EXE_quillo"))
             .arg("run")
             .arg(dir.join("main.qwe"))
-            .args(["--port", &port.to_string()])
+            .args(["--port", "0"])
             .args(args)
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start:\n{}", program);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let port = support::port_in_stderr_shown(&mut server.0, &program, Instant::now() + Duration::from_secs(10));
     let front = if prefix.is_empty() { port } else { proxy(prefix, port) };
     let profile = dir.join("profile");
     let out = Command::new("node")

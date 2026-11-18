@@ -146,41 +146,23 @@ impl Drop for Server {
     }
 }
 
-fn free_port() -> u16 {
-    support::free_port()
-}
-
-/// Starts the program on a free port. Tests run side by side, so another
-/// one's server may take the port first: then this one's cannot listen,
-/// and is started again on another (connecting would only reach theirs).
+/// Starts the program on a port the system picks, which its log says. Tests run side by side, and
+/// another one's server could take a port picked here first: five tries on another port met that,
+/// where the system's own pick never collides (a shown bug in the test; branch security).
 fn start(d: &Path) -> (Server, u16) {
     let log = d.join("server.log");
-    for _ in 0..5 {
-        let port = free_port();
-        let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
-            .arg("run")
-            .arg(d.join("app.qwe"))
-            .args(["--port", &port.to_string()])
-            .stderr(std::fs::File::create(&log).unwrap())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        support::stop_with_tests(&child);
-        let mut server = Server(child, log.clone());
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if std::fs::read_to_string(&log).unwrap_or_default().contains("listening on") {
-                return (server, port);
-            }
-            if let Ok(Some(_)) = server.0.try_wait() {
-                break;
-            }
-            assert!(Instant::now() < deadline, "server did not start");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let _ = TcpStream::connect(("127.0.0.1", port));
-    }
-    panic!("no free port for the server: {}", std::fs::read_to_string(&log).unwrap_or_default())
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .arg(d.join("app.qwe"))
+        .args(["--port", "0"])
+        .stderr(std::fs::File::create(&log).unwrap())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    support::stop_with_tests(&child);
+    let mut server = Server(child, log.clone());
+    let port = support::port_in_log(&mut server.0, &log, Duration::from_secs(20));
+    (server, port)
 }
 
 fn ask(port: u16, path: &str) -> String {

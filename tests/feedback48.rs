@@ -310,22 +310,19 @@ fn reacts_event_names_fire_in_the_browser() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let port = support::free_port();
-    let _server = support::Guard::new(
+    // The system picks the port and the server says which: a port picked here could be taken by
+    // another process first (a shown bug in the test; branch security).
+    let mut _server = support::Guard::new(
         Command::new(env!("CARGO_BIN_EXE_quillo"))
             .arg("run")
             .arg(dir.join("f48-events.qwe"))
-            .args(["--port", &port.to_string()])
+            .args(["--port", "0"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let port = support::port_in_stderr(&mut _server.0, "f48-events.qwe", Instant::now() + Duration::from_secs(20));
     let profile = std::env::temp_dir().join(format!("quillo-chrome-f48-{}-{}", std::process::id(), port));
     let out = Command::new("node")
         .arg(dir.join("run.js"))
