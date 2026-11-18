@@ -735,6 +735,46 @@ fn beyond_in(fns: &HashMap<String, Arc<FnDef>>, body: &Expr, seen: &mut HashSet<
     found || called.into_iter().any(|n| seen.insert(n.clone()) && fns.get(&n).is_some_and(|d| (d.server && d.request_use().1) || beyond_in(fns, &d.body, seen)))
 }
 
+/// Why an offline route's page is never kept because of its groups' middleware, read as the
+/// server reads it (`Interp::middleware_beyond`): a lambda held by a top-level `let` that reads
+/// the request past the session, or middleware the server cannot follow at all, which it takes to
+/// read the visitor, so the page is never kept: a field of a map (`gates.team`), a builtin
+/// (`unwrap`), a call that makes the function (`make("admin")`). The check said nothing of those,
+/// where the server kept none of their pages. A `let` that holds anything but a lambda written
+/// there (or a name a pattern binds) may hold a function the server can read, and is not said
+/// (coverage of 0.8.7, Q-1102; branch coverage-087).
+fn unkept_by_middleware(r: &RouteDef, fns: &HashMap<String, Arc<FnDef>>, lets: &HashMap<String, Option<&Expr>>) -> Option<String> {
+    let Expr::Block(stmts) = &r.body else { return None };
+    stmts.iter().find_map(|s| {
+        let Stmt::Expr(Expr::Call(f, args, _)) = s else { return None };
+        if !matches!(&**f, Expr::Ident(n, _) if n == "__answer") {
+            return None;
+        }
+        let Some(Expr::Call(m, _, _)) = args.first() else { return None };
+        match &**m {
+            Expr::Lambda(_) => return None,
+            Expr::Ident(n, _) if fns.contains_key(n.as_str()) => return None,
+            Expr::Ident(n, _) => match lets.get(n.as_str()) {
+                Some(Some(Expr::Lambda(d))) => return crate::parser::middleware_reads_beyond(d).then(|| OFFLINE_READS.to_string()),
+                Some(_) => return None,
+                None => {}
+            },
+            _ => {}
+        }
+        let name = match &**m {
+            Expr::Call(c, _, _) => dotted(c).map(|c| format!("{}(...)", c)),
+            other => Some(written(other)).filter(|w| w != "..."),
+        };
+        Some(format!(
+            "its group's middleware{} is no function of the program's or lambda written in place, which Quillo follows, so it counts as such a read",
+            name.map_or(String::new(), |n| format!(", `{}`,", n))
+        ))
+    })
+}
+
+/// What an offline route reads, said when its page is not kept (`beyond_session`).
+const OFFLINE_READS: &str = "a cookie, a header, the request's own fields of theirs";
+
 /// Whether code reads who the visitor is through the session or a cookie, there or in the
 /// functions it calls, as far as they go.
 fn visitor_in(fns: &HashMap<String, Arc<FnDef>>, body: &Expr, seen: &mut HashSet<String>) -> bool {
@@ -3999,6 +4039,24 @@ impl Checker {
                 _ => None,
             })
             .collect();
+        // The names the program's top-level `let`s bind, with what `let name = ...` gives, for
+        // middleware named by one; only in a program with offline routes (coverage of 0.8.7,
+        // Q-1102; branch coverage-087).
+        let offline = routes.iter().any(|(_, r)| r.offline);
+        let lets: HashMap<String, Option<&Expr>> = order
+            .iter()
+            .filter(|_| offline)
+            .filter_map(|it| match &it.stmt {
+                Stmt::Let(Pattern::Bind(n), init, _) => Some(vec![(n.to_string(), Some(init))]),
+                Stmt::Let(p, _, _) => {
+                    let mut names = Vec::new();
+                    pattern_names(p, &mut names);
+                    Some(names.into_iter().map(|n| (n, None)).collect())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
         // A route that reads who the visitor is, there or in a function it calls, and marks its
         // answer for every cache: sent as `private`, said where it is written (FEEDBACK59.md, Q-903;
         // branch cache-and-migrate).
@@ -4006,8 +4064,17 @@ impl Checker {
             // A page kept for offline reads who the visitor is through the session alone, which its
             // kept copy is shown again for; one that reads them another way is not kept
             // (FEEDBACK67.md, B.2, review; branch pwa).
-            if r.offline && beyond_session(r, &fns) {
-                self.diag_at(file.clone(), r.line, Severity::Warning, format!("`route offline {}` reads who the visitor is other than through `session()` (a cookie, a header, the request's own fields of theirs): its page is not kept for offline, and the offline page is shown in its place; read who they are with `session()`", r.shown()));
+            // Its groups' middleware as the server reads it too (coverage of 0.8.7, Q-1102; branch
+            // coverage-087).
+            let why = if !r.offline {
+                None
+            } else if beyond_session(r, &fns) {
+                Some(OFFLINE_READS.to_string())
+            } else {
+                unkept_by_middleware(r, &fns, &lets)
+            };
+            if let Some(why) = why {
+                self.diag_at(file.clone(), r.line, Severity::Warning, format!("`route offline {}` reads who the visitor is other than through `session()` ({}): its page is not kept for offline, and the offline page is shown in its place; read who they are with `session()`", r.shown(), why));
             }
             if let Some(line) = public_after_visitor(r, &fns) {
                 self.diag_at(file.clone(), line, Severity::Warning, "this route reads who the visitor is (the session, a cookie, a header) and its `cache-control` lets a shared cache keep the answer: Quillo sends it as `private`, as a cache in front would give it to the next visitor, and the time stays for the visitor's own browser. Write `private` in it to say so".to_string());
@@ -5549,10 +5616,7 @@ impl Checker {
                 continue;
             }
             let root = self.get_own(&[&r.body], &[], &cx);
-            let pattern_read = r.body_pat.iter().chain(r.guards.iter()).find_map(|p| match p {
-                Pattern::Record(fs) => fs.iter().filter_map(|f| f.path.first()).find(|f| matches!(f.as_str(), "headers" | "cookies")).cloned(),
-                _ => None,
-            });
+            let pattern_read = r.body_pat.iter().chain(r.guards.iter()).find_map(pattern_takes);
             // Most routes reach no write, or no read: said by what each function can reach, worked
             // out once a check, before any walk of the route's own.
             let can_write = !root.writes.is_empty() || root.calls.iter().any(|c| self.reaches(c, &cx, &mut seen).0);
@@ -10171,6 +10235,19 @@ impl GetWrite {
             Some(f) => format!("{}, in `{}`", self.what, f),
             None => self.what.clone(),
         }
+    }
+}
+
+/// The request's headers or cookies a request pattern takes (`get_writes_said`): a record's field,
+/// or one an alternative's record takes, or one under `as`. A pattern of alternatives was not
+/// looked into, so `{ cookies: c } | { headers: h }` read no one (coverage of 0.8.7, Q-1104;
+/// branch coverage-087).
+fn pattern_takes(p: &Pattern) -> Option<String> {
+    match p {
+        Pattern::Record(fs) => fs.iter().filter_map(|f| f.path.first()).find(|f| matches!(f.as_str(), "headers" | "cookies")).cloned(),
+        Pattern::Alt(ps) => ps.iter().find_map(pattern_takes),
+        Pattern::As(p, _) => pattern_takes(p),
+        _ => None,
     }
 }
 

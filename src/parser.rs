@@ -2024,6 +2024,13 @@ impl Parser {
         loop {
             let Some(tag) = ["offline", "writes"].into_iter().find(|t| self.tag_ahead(n, t)) else { break };
             let mut m = n + tag.len();
+            // `routes offline/docs { ... }`: the tag and the path in one piece, which was said as
+            // "`routes` is no keyword" (coverage of 0.8.7, Q-1103; branch coverage-087).
+            if self.lx.peek_char_at(m) == Some('/') {
+                let tags: String = (0..m).filter_map(|i| self.lx.peek_char_at(i)).collect();
+                let path: String = (m..).map_while(|i| self.lx.peek_char_at(i)).take_while(|c| !c.is_whitespace() && !matches!(c, '{' | '|')).collect();
+                return Err(QuilloError::new(format!("`{}` is a tag, and a space goes between it and the group's path: `routes {} {} {{ ... }}`", tag, tags, path), line));
+            }
             if !matches!(self.lx.peek_char_at(m), Some(' ' | '\t')) {
                 break;
             }
@@ -2393,15 +2400,26 @@ impl Parser {
         if word.is_empty() {
             return None;
         }
+        // The rest of a path written without its `/`, `routes writes-x { ... }`, which was said as
+        // "`routes` is no keyword" (coverage of 0.8.7, Q-1103; branch coverage-087).
+        let mut path = word.clone();
+        let mut p = n;
+        while let Some(c) = self.lx.peek_char_at(p).filter(|c| is_path_char(*c)) {
+            path.push(c);
+            p += 1;
+        }
         while matches!(self.lx.peek_char_at(n), Some(' ' | '\t')) {
             n += 1;
+        }
+        while matches!(self.lx.peek_char_at(p), Some(' ' | '\t')) {
+            p += 1;
         }
         let next = self.lx.peek_char_at(n);
         if METHODS.contains(&word.as_str()) && next == Some('/') {
             return Some(format!("a group takes no method, each of its routes has one: `routes /... {{ route {} /... = ... }}`", word));
         }
-        if matches!(next, Some('{' | '|')) && !KEYWORDS.contains(&word.as_str()) {
-            return Some(format!("a group's path starts with `/`: `routes /{} {{ ... }}`", word));
+        if matches!(self.lx.peek_char_at(p), Some('{' | '|')) && !KEYWORDS.contains(&word.as_str()) {
+            return Some(format!("a group's path starts with `/`: `routes /{} {{ ... }}`", path));
         }
         None
     }
