@@ -103,19 +103,34 @@ fn run(d: &Path, opts: &[&str], env: &[(&str, &str)]) -> Run {
     r
 }
 
-/// A command run to its end within `secs`.
-fn within(mut c: Command, secs: u64) -> std::process::Output {
-    let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+/// What a command run to its end said: whether it succeeded, its stdout and its stderr.
+struct Ran {
+    ok: bool,
+    out: String,
+    err: String,
+}
+
+/// A command run to its end within `secs`, its output read as it comes (a full pipe would stop
+/// it), stopped with the tests and killed at the deadline.
+fn within(mut c: Command, secs: u64) -> Ran {
+    let mut child = support::Guard::new(c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+    let read = |mut r: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = r.read_to_end(&mut v);
+            String::from_utf8_lossy(&v).into_owned()
+        })
+    };
+    let (out, err) = (read(Box::new(child.0.stdout.take().unwrap())), read(Box::new(child.0.stderr.take().unwrap())));
     let end = Instant::now() + Duration::from_secs(secs);
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() > end {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("{:?} did not end within {} s", c, secs);
+    let ok = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status.success();
         }
+        assert!(Instant::now() < end, "{:?} did not end within {} s", c, secs);
         std::thread::sleep(Duration::from_millis(10));
-    }
-    child.wait_with_output().unwrap()
+    };
+    Ran { ok, out: out.join().unwrap(), err: err.join().unwrap() }
 }
 
 /// `quillo check main.qwe` in `d`: whether it passed, and its error and warning lines.
@@ -123,8 +138,8 @@ fn check_lines(d: &Path) -> (bool, Vec<String>) {
     let mut c = Command::new(env!("CARGO_BIN_EXE_quillo"));
     c.args(["check", "main.qwe"]).current_dir(d);
     let o = within(c, 30);
-    let text = String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr);
-    (o.status.success(), text.lines().filter(|l| l.contains(": error: ") || l.contains(": warning: ")).map(String::from).collect())
+    let text = o.out + &o.err;
+    (o.ok, text.lines().filter(|l| l.contains(": error: ") || l.contains(": warning: ")).map(String::from).collect())
 }
 
 /// The session cookie an answer sets (`name=value`), if it sets one.
@@ -151,8 +166,13 @@ fn with_cookie<'a>(cookie: &'a str, host: &'a str) -> Vec<(&'a str, &'a str)> {
 /// What a page posts to /_quillo/push for a subscription at `endpoint`, the visitor's session in
 /// `cookie`, from the page's own site.
 fn bind(port: u16, endpoint: &str, cookie: &str) -> support::Answer {
+    bind_keys(port, endpoint, P256DH, AUTH, cookie)
+}
+
+/// `bind`, with the subscription's keys given.
+fn bind_keys(port: u16, endpoint: &str, p256dh: &str, auth: &str, cookie: &str) -> support::Answer {
     let host = format!("127.0.0.1:{}", port);
-    let body = serde_json::json!({ "endpoint": endpoint, "keys": { "p256dh": P256DH, "auth": AUTH }, "user": null });
+    let body = serde_json::json!({ "endpoint": endpoint, "keys": { "p256dh": p256dh, "auth": auth }, "user": null });
     support::send(port, "POST", "/_quillo/push", &with_cookie(cookie, &host), &body.to_string())
 }
 
@@ -232,6 +252,51 @@ fn vapid_claims(auth: &str) -> serde_json::Value {
     serde_json::from_slice(&unb64url(t.split('.').nth(1).unwrap())).unwrap()
 }
 
+/// A browser's subscription, made here: its P-256 key, which reads one message sent to it.
+struct Browser {
+    key: ring::agreement::EphemeralPrivateKey,
+    p256dh: Vec<u8>,
+    auth: [u8; 16],
+}
+
+fn browser() -> Browser {
+    let rng = ring::rand::SystemRandom::new();
+    let key = ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::ECDH_P256, &rng).unwrap();
+    let p256dh = key.compute_public_key().unwrap().as_ref().to_vec();
+    let mut auth = [0u8; 16];
+    ring::rand::SecureRandom::fill(&rng, &mut auth).unwrap();
+    Browser { key, p256dh, auth }
+}
+
+struct Len(usize);
+
+impl ring::hkdf::KeyType for Len {
+    fn len(&self) -> usize {
+        self.0
+    }
+}
+
+fn hkdf(salt: &[u8], ikm: &[u8], info: &[u8], n: usize) -> Vec<u8> {
+    let mut out = vec![0u8; n];
+    ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, salt).extract(ikm).expand(&[info], Len(n)).unwrap().fill(&mut out).unwrap();
+    out
+}
+
+/// A message as the browser reads it (RFC 8291, aes128gcm of RFC 8188): the record size and the
+/// sender's key in the header, and the record opened with what the browser and the sender agree.
+fn decrypt(b: Browser, body: &[u8]) -> (u32, Vec<u8>, Vec<u8>) {
+    let (salt, size, id) = (&body[..16], u32::from_be_bytes(body[16..20].try_into().unwrap()), body[20] as usize);
+    let sender = body[21..21 + id].to_vec();
+    let shared = ring::agreement::agree_ephemeral(b.key, &ring::agreement::UnparsedPublicKey::new(&ring::agreement::ECDH_P256, &sender), |k| k.to_vec()).unwrap();
+    let ikm = hkdf(&b.auth, &shared, &[&b"WebPush: info\0"[..], &b.p256dh, &sender].concat(), 32);
+    let cek = hkdf(salt, &ikm, b"Content-Encoding: aes128gcm\0", 16);
+    let nonce = hkdf(salt, &ikm, b"Content-Encoding: nonce\0", 12);
+    let key = ring::aead::LessSafeKey::new(ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &cek).unwrap());
+    let mut record = body[21 + id..].to_vec();
+    let plain = key.open_in_place(ring::aead::Nonce::try_assume_unique_for_key(&nonce).unwrap(), ring::aead::Aad::empty(), &mut record).expect("the record opens").to_vec();
+    (size, sender, plain)
+}
+
 // ---- a push service and a proxy, played here ----------------------------------------------------
 
 /// What a push service was sent: the path, and the headers that matter.
@@ -240,7 +305,7 @@ struct Got {
     path: String,
     auth: String,
     encoding: String,
-    length: usize,
+    body: Vec<u8>,
 }
 
 /// A push service on this machine: 201 to each message, 404 or 410 where the path says so.
@@ -325,7 +390,7 @@ fn sink_on(addr: &str) -> Option<Sink> {
                     let path = first.split(' ').nth(1).unwrap_or("").to_string();
                     let h = |k: &str| headers.iter().find(|(n, _)| n == k).map_or(String::new(), |(_, v)| v.clone());
                     let status = if path.contains("/404-") { "404 Not Found" } else if path.contains("/410-") { "410 Gone" } else { "201 Created" };
-                    g.lock().unwrap().push(Got { path, auth: h("authorization"), encoding: h("content-encoding"), length: body.len() });
+                    g.lock().unwrap().push(Got { path, auth: h("authorization"), encoding: h("content-encoding"), body });
                     if s.write_all(format!("HTTP/1.1 {}\r\ncontent-length: 0\r\n\r\n", status).as_bytes()).is_err() {
                         return;
                     }
@@ -446,8 +511,6 @@ route GET / = "home"
 #[test]
 fn server_calls_given_wrongly_stop_the_request_saying_why() {
     let d = dir("wrong", WRONG);
-    let (ok, lines) = check_lines(&d);
-    assert!(ok && lines.is_empty(), "{:?}", lines);
     let s = run(&d, &[], &[]);
     let map = |got: &str| format!("`notification.send` takes the message as a map ({{ title, body, url }}), got {}", got);
     let silent = |got: &str| format!("`notification.send`'s `silent` is true or false, got {}", got);
@@ -510,8 +573,8 @@ fn the_browsers_compile_says_what_notification_has_and_where() {
         let mut c = Command::new(env!("CARGO_BIN_EXE_quillo"));
         c.args(["run", "main.qwe", "--no-check", "--port", "0"]).env("QUILLO_SECRET", "test secret for the tests").current_dir(&*d);
         let o = within(c, 30);
-        let log = String::from_utf8_lossy(&o.stderr);
-        assert!(!o.status.success(), "{} started: {}", name, log);
+        let log = o.err;
+        assert!(!o.ok, "{} started: {}", name, log);
         assert!(log.contains(&format!("main.qwe:{}: <C> (compiled for the browser): {}", line, compiled)), "{}: {}", name, log);
     }
     // `state` setting a state compiles, and the server renders null for it.
@@ -690,8 +753,9 @@ fn what_fails_for_one_device_is_said_in_the_log() {
 
 /// A push service on this machine's IPv6 loopback (`http://[::1]:port`) is taken as 127.0.0.1's
 /// is: refused without QUILLO_PUSH_LOCAL=1, bound and sent to with it, VAPID's `aud` its origin
-/// with the brackets (src/push.rs `loopback`, FEEDBACK67.md B.3; coverage of 0.8.7; branch
-/// coverage-087).
+/// with the brackets; what arrives opens with the browser's key, one record of 4096 holding the
+/// message and the delimiter 2 (src/push.rs `loopback`, FEEDBACK67.md B.3; coverage of 0.8.7;
+/// branch coverage-087).
 #[test]
 fn an_ipv6_loopback_push_service_is_this_machines() {
     let Some(sink) = sink_on("::1") else {
@@ -708,12 +772,17 @@ fn an_ipv6_loopback_push_service_is_this_machines() {
     drop(s);
     let s = run(&d, &[], &[]);
     let ana = sign_in(s.port, "ana");
-    assert_eq!(bind(s.port, &endpoint, &ana).status, 200);
+    let b = browser();
+    assert_eq!(bind_keys(s.port, &endpoint, &b64url(&b.p256dh), &b64url(&b.auth), &ana).status, 200);
     assert_eq!(send_to(s.port, "ana", serde_json::json!({ "title": "über IPv6" })), serde_json::json!({ "sent": 1, "gone": 0 }));
     let got = sink.got();
     assert_eq!(got.len(), 1, "{:?}", got);
     assert_eq!((got[0].path.as_str(), got[0].encoding.as_str()), ("/push/ok-v6", "aes128gcm"));
-    assert!(got[0].length > 86, "{:?}", got[0]);
+    let message = format!(r#"{{"web_push":8030,"notification":{{"title":"über IPv6","navigate":"http://127.0.0.1:{}/"}}}}"#, s.port);
+    assert_eq!(got[0].body.len(), 86 + message.len() + 1 + 16);
+    let (size, sender, plain) = decrypt(b, &got[0].body);
+    assert_eq!((size, sender.len(), sender[0]), (4096, 65, 4));
+    assert_eq!(plain, [message.as_bytes(), &[2]].concat(), "{}", String::from_utf8_lossy(&plain));
     let claims = vapid_claims(&got[0].auth);
     assert_eq!(claims["aud"], format!("http://[::1]:{}", sink.port));
     assert_eq!(claims["sub"], format!("http://127.0.0.1:{}", s.port));
@@ -763,8 +832,10 @@ fn look(port: u16, from: &str) -> String {
 /// counted. Past 10,000 addresses the table of tries is pruned of those that tried nothing in the
 /// last minute, and an address still within its minute stays refused. The window moves: once a
 /// minute has gone by, an address whose last try was within it has its older tries dropped and
-/// keeps the recent one (59 more), and one that tried nothing in it starts again (60) (src/push.rs
-/// `too_often`, FEEDBACK67.md B.3; coverage of 0.8.7; branch coverage-087).
+/// keeps the recent one (59 more), and one that tried nothing in it starts again (60). It costs
+/// about 61 s of wall time: the window is a minute of the clock, which no test can move (there is
+/// no test clock), so the test waits it out (src/push.rs `too_often`, FEEDBACK67.md B.3; coverage
+/// of 0.8.7; branch coverage-087).
 #[test]
 fn the_minutes_window_moves_and_the_table_of_tries_is_pruned() {
     let d = dir("window", PUSHER);
@@ -801,8 +872,10 @@ fn the_minutes_window_moves_and_the_table_of_tries_is_pruned() {
 // ---- VAPID headers, kept ------------------------------------------------------------------------
 
 /// A VAPID header is signed once for each push service and site, and kept: the same header for a
-/// second message. Past a thousand kept, they are dropped, and the next message is signed anew
-/// (src/push.rs `vapid_header`, FEEDBACK67.md B.3; coverage of 0.8.7; branch coverage-087).
+/// second message, and still with 911 kept. Past a thousand kept, they are dropped, and the next
+/// message is signed anew. The 1,001 others are 11 people's 91 devices, so that no one send nears
+/// the 30 s a send may take (src/push.rs `vapid_header`, FEEDBACK67.md B.3; coverage of 0.8.7;
+/// branch coverage-087).
 #[test]
 fn vapid_headers_kept_past_a_thousand_are_signed_anew() {
     let d = dir("vapid", PUSHER);
@@ -812,7 +885,7 @@ fn vapid_headers_kept_past_a_thousand_are_signed_anew() {
         c.execute_batch("begin").unwrap();
         row(&c, &sink.endpoint("/push/ok-first"), P256DH, "\"first\"", "http://first.example", 0);
         for i in 0..1001 {
-            row(&c, &sink.endpoint(&format!("/push/ok-b{}", i)), P256DH, "\"bulk\"", &format!("http://b{}.example", i), i + 1);
+            row(&c, &sink.endpoint(&format!("/push/ok-b{}", i)), P256DH, &format!("\"p{}\"", i / 91), &format!("http://b{}.example", i), i + 1);
         }
         c.execute_batch("commit").unwrap();
     }
@@ -824,7 +897,12 @@ fn vapid_headers_kept_past_a_thousand_are_signed_anew() {
     assert_eq!(vapid_claims(&signed)["sub"], "http://first.example");
     assert_eq!(send_to(s.port, "first", one.clone()), serde_json::json!({ "sent": 1, "gone": 0 }));
     assert_eq!(first(&sink), signed, "kept for the second message");
-    assert_eq!(send_to(s.port, "bulk", one.clone()), serde_json::json!({ "sent": 1001, "gone": 0 }));
+    for p in 0..10 {
+        assert_eq!(send_to(s.port, &format!("p{}", p), one.clone()), serde_json::json!({ "sent": 91, "gone": 0 }));
+    }
+    assert_eq!(send_to(s.port, "first", one.clone()), serde_json::json!({ "sent": 1, "gone": 0 }));
+    assert_eq!(first(&sink), signed, "kept with 911 kept");
+    assert_eq!(send_to(s.port, "p10", one.clone()), serde_json::json!({ "sent": 91, "gone": 0 }));
     let subs: std::collections::HashSet<String> = sink.got().iter().filter(|g| g.path.starts_with("/push/ok-b")).map(|g| vapid_claims(&g.auth)["sub"].as_str().unwrap().to_string()).collect();
     assert_eq!(subs.len(), 1001);
     assert_eq!(send_to(s.port, "first", one), serde_json::json!({ "sent": 1, "gone": 0 }));
@@ -898,9 +976,11 @@ fn a_session_too_full_for_an_id_is_never_named() {
 /// no longer opens makes it say "no one" (`-`) and takes `quillo_tag` away; where the cookie cannot
 /// be judged it says nothing and leaves the tag: a program with a tenant rule not worked out for
 /// the request, and a cookie of the other name than this server's (`quillo_session` where it uses
-/// `__Host-quillo_session`). Cookies that opened are kept by the last 256 of them: 300 sessions, each
-/// recognised, the first again after it fell out (src/session.rs `cookie_opens`, src/pwa.rs `mark`,
-/// FEEDBACK67.md B.2; coverage of 0.8.7; branch coverage-087).
+/// `__Host-quillo_session`). Cookies once opened are kept, the last 256 of them, so that a page
+/// need not check a signature again: a speed-up, whose answers are the same without it, so that
+/// part is coverage of it alone: 300 sessions, each recognised, the first again after it fell out
+/// (src/session.rs `cookie_opens`, src/pwa.rs `mark`, FEEDBACK67.md B.2; coverage of 0.8.7; branch
+/// coverage-087).
 #[test]
 fn a_cookie_that_cannot_be_judged_leaves_the_session_alone() {
     let d = dir("judged", OFFLINE);
@@ -984,9 +1064,10 @@ fn png(w: u32, h: u32, len: usize) -> Vec<u8> {
     bytes
 }
 
-/// What `quillo check` says of an app.toml's icon is known by its file, length and time, for the
-/// last 16 files: a file changed in place to the same length and time is told as it was, until 16
-/// other icons were checked after it, when it is read again (src/pwa.rs `icon_size`, FEEDBACK67.md
+/// What `quillo check` says of an app.toml's icon is known by its file, length and time, for 16
+/// files: a file changed in place to the same length and time is told as it was, until 16 other
+/// icons were checked after it, when it is read again. What is asserted holds for any 16 kept that
+/// let the least recent go, one at a time or all at once (src/pwa.rs `icon_size`, FEEDBACK67.md
 /// B.1; coverage of 0.8.7; branch coverage-087).
 #[test]
 fn an_icons_size_is_kept_for_sixteen_files() {
@@ -1015,31 +1096,90 @@ fn an_icons_size_is_kept_for_sixteen_files() {
     std::fs::write(&file, png(32, 32, 600)).unwrap();
     std::fs::File::options().write(true).open(&file).unwrap().set_modified(time).unwrap();
     assert_eq!(said(0), size(64), "kept by file, length and time");
-    for n in 1..16 {
+    for n in 1..=16 {
         assert_eq!(said(n), size(64));
     }
-    assert_eq!(said(0), size(64), "16 files kept");
-    assert_eq!(said(16), size(64));
     assert_eq!(said(0), size(32), "read again once 16 others were checked after it");
 }
 
 // ---- rows past --max-memory ---------------------------------------------------------------------
 
-/// A send whose rows hold a cell larger than --max-memory allows stops reading them, and gives the
-/// stop as its error value, sending nothing (src/push.rs `sql`, FEEDBACK71.md Q-977 with
-/// FEEDBACK67.md B.3; coverage of 0.8.7; branch coverage-087).
+/// A send whose rows hold a cell larger than --max-memory allows stops reading them, and the stop
+/// is the request's: a 500, said in the log at the send's line, which the program's `is_err` never
+/// sees; under 99,999 bytes too, one less than the cell. Under a limit the rows fit in, the same
+/// row is sent to; another person's rows are read and sent to under the small limit (src/push.rs
+/// `sql`, `send`, FEEDBACK71.md Q-977 with FEEDBACK67.md B.3; coverage of 0.8.7, Q-1101; branch
+/// coverage-087).
 #[test]
 fn rows_past_max_memory_are_not_read_by_a_send() {
     let d = dir("memory", PUSHER);
     let sink = sink();
     {
+        // The large cell is the auth secret: 75,000 bytes once decoded, which encrypting takes.
         let c = system_db(&d, TABLE);
-        row(&c, &sink.endpoint("/push/ok-big"), &"A".repeat(100_000), "\"big\"", "http://shop.example", 1);
+        c.execute(
+            "insert into _quillo_push (endpoint, p256dh, auth, who, session, origin, place, created, succeeded) values (?1, ?2, ?3, '\"big\"', 'id s', 'http://shop.example', ?4, 1, 0)",
+            rusqlite::params![sink.endpoint("/push/ok-big"), P256DH, "A".repeat(100_000), PLACE],
+        )
+        .unwrap();
         row(&c, &sink.endpoint("/push/ok-small"), P256DH, "\"small\"", "http://shop.example", 2);
     }
-    let s = run(&d, &["--max-memory", "64KB"], &[]);
     let one = serde_json::json!({ "title": "t" });
-    assert_eq!(send_to(s.port, "big", one.clone()), serde_json::json!({ "error": "notification.send: this request's value would be bigger than --max-memory allows (65536 bytes)" }));
-    assert!(sink.got().is_empty());
-    assert_eq!(send_to(s.port, "small", one), serde_json::json!({ "sent": 1, "gone": 0 }));
+    for (limit, bytes) in [("64KB", 65_536), ("99999", 99_999)] {
+        let s = run(&d, &["--max-memory", limit], &[]);
+        let a = support::send(s.port, "POST", "/send/big", &[], &one.to_string());
+        assert_eq!((a.status, a.body.as_str()), (500, "internal error\n"), "{}", limit);
+        let said = format!("main.qwe:10: this request's value would be bigger than --max-memory allows ({} bytes)", bytes);
+        assert!(s.log_with(&said).contains(&said), "{}: {}", limit, s.log_with(""));
+        assert!(sink.got().is_empty(), "{:?}", sink.got());
+        assert_eq!(send_to(s.port, "small", one.clone()), serde_json::json!({ "sent": 1, "gone": 0 }));
+        assert_eq!(sink.got().iter().map(|g| g.path.clone()).collect::<Vec<_>>(), ["/push/ok-small"]);
+        sink.reset();
+    }
+    let s = run(&d, &["--max-memory", "1MB"], &[]);
+    assert_eq!(send_to(s.port, "big", one), serde_json::json!({ "sent": 1, "gone": 0 }));
+    assert_eq!(sink.got().iter().map(|g| g.path.clone()).collect::<Vec<_>>(), ["/push/ok-big"]);
+    assert!(!s.log_with("").contains("--max-memory allows"));
+}
+
+/// At /_quillo/push, rows past --max-memory met as a bind counts the person's devices, or as a
+/// page's look reads its subscription, end the request as a server fn's call is ended: a 500 that
+/// says the limit, and the line in the log. A `stop` reads no rows, and is answered. Under a limit
+/// the rows fit in, the same bind and look are answered as ever (src/push.rs `sql`, `failed_here`,
+/// `bind`, `check`, FEEDBACK67.md B.3; coverage of 0.8.7, Q-1101; branch coverage-087).
+#[test]
+fn rows_past_max_memory_end_a_push_request() {
+    let d = dir("memory-push", PUSHER);
+    let sink = sink();
+    let looked = "https://push.example.com/send/big";
+    {
+        // Ana's device with a long endpoint, which a bind of hers reads; a device with a long
+        // session, which a look at it reads.
+        let c = system_db(&d, TABLE);
+        let insert = "insert into _quillo_push (endpoint, p256dh, auth, who, session, origin, place, created, succeeded) values (?1, ?2, ?3, ?4, ?5, 'http://shop.example', ?6, 1, 0)";
+        c.execute(insert, rusqlite::params![format!("https://push.example.com/{}", "e".repeat(100_000)), P256DH, AUTH, "\"ana\"", "id s", PLACE]).unwrap();
+        c.execute(insert, rusqlite::params![looked, P256DH, AUTH, "\"zed\"", "s".repeat(100_000), PLACE]).unwrap();
+    }
+    let look = |port: u16, cookie: &str| support::send(port, "POST", "/_quillo/push", &with_cookie(cookie, &format!("127.0.0.1:{}", port)), &serde_json::json!({ "endpoint": looked, "check": true }).to_string());
+    let s = run(&d, &["--max-memory", "64KB"], &[]);
+    let stopped = r#"{"error":"this request's value would be bigger than --max-memory allows (65536 bytes)"}"#;
+    let ana = sign_in(s.port, "ana");
+    let a = bind(s.port, &sink.endpoint("/push/ok-1"), &ana);
+    assert_eq!((a.status, a.body.as_str()), (500, stopped));
+    let a = look(s.port, &ana);
+    assert_eq!((a.status, a.body.as_str()), (500, stopped));
+    let log = s.log_with("--max-memory allows");
+    let lines: Vec<&str> = log.lines().filter(|l| l.contains("this request's value would be bigger than --max-memory allows (65536 bytes)")).collect();
+    assert_eq!(lines.len(), 2, "{}", log);
+    assert!(lines.iter().all(|l| l.starts_with("quillo: error: POST /_quillo/push")), "{:?}", lines);
+    let stop = support::send(s.port, "DELETE", "/_quillo/push", &with_cookie(&ana, &format!("127.0.0.1:{}", s.port)), &serde_json::json!({ "endpoint": looked }).to_string());
+    assert_eq!((stop.status, stop.body.as_str()), (200, r#"{"ok":true}"#));
+    drop(s);
+    let s = run(&d, &["--max-memory", "1MB"], &[]);
+    let ana = sign_in(s.port, "ana");
+    let a = bind(s.port, &sink.endpoint("/push/ok-2"), &ana);
+    assert_eq!((a.status, a.body.as_str()), (200, r#"{"ok":true}"#));
+    let a = look(s.port, &ana);
+    assert_eq!((a.status, a.body.as_str()), (200, r#"{"state":"default"}"#));
+    assert!(!s.log_with("").contains("--max-memory allows"));
 }

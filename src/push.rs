@@ -251,14 +251,42 @@ const INDEXES: &[&str] = &[
     "create index if not exists _quillo_push_session on _quillo_push (session)",
 ];
 
-/// A statement on Quillo's own tables there: its value, or the database's error.
-fn sql(it: &mut Interp, on: Option<usize>, query: bool, args: Vec<Value>) -> Result<Value, String> {
+/// What a statement on the table failed with: the database's words, or the request's stop at
+/// `--max-memory`, met as the rows were read. The stop is told by its kind, never by its words
+/// (httpd.rs, `MEMORY_STOP`), and goes out to the builtin or the answer that made the statement,
+/// where it stays the request's stop: made text, a send gave it to the program as an error value
+/// that `??` took, and the request answered 200 (coverage of 0.8.7, Q-1101; branch coverage-087).
+enum Fail {
+    Said(String),
+    MemoryStop,
+}
+
+impl std::fmt::Display for Fail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Fail::Said(e) => f.write_str(e),
+            Fail::MemoryStop => f.write_str(&crate::httpd::over_memory()),
+        }
+    }
+}
+
+impl From<String> for Fail {
+    fn from(e: String) -> Fail {
+        Fail::Said(e)
+    }
+}
+
+/// A statement on Quillo's own tables there: its value, or the database's error, or the request's
+/// stop (`Fail`). A `Ctrl` other than an error (a return, a reply) comes from a program's code,
+/// never from a statement.
+fn sql(it: &mut Interp, on: Option<usize>, query: bool, args: Vec<Value>) -> Result<Value, Fail> {
     let r = if query { crate::db::query_on(it, on, args) } else { crate::db::exec_on(it, on, args) };
     match r {
-        Ok(Value::Err(e, _, _)) => Err(e.display()),
+        Ok(Value::Err(e, _, _)) => Err(Fail::Said(e.display())),
         Ok(v) => Ok(v),
-        Err(Ctrl::Error(e)) => Err(e.msg.clone()),
-        Err(_) => Err("the statement was stopped".into()),
+        Err(Ctrl::Error(e)) if e.memory_stop => Err(Fail::MemoryStop),
+        Err(Ctrl::Error(e)) => Err(Fail::Said(e.msg.clone())),
+        Err(_) => Err(Fail::Said("the statement was stopped".into())),
     }
 }
 
@@ -293,7 +321,7 @@ fn indexed(it: &mut Interp, on: Option<usize>, made: bool) {
     ONCE.store(true, std::sync::atomic::Ordering::Relaxed);
     for ix in INDEXES {
         if let Err(e) = sql(it, on, false, vec![Value::str(*ix)]) {
-            eprintln!("quillo: {}: an index could not be made ({}): sends and sign-outs read the whole table", TABLE, for_the_log(&e));
+            eprintln!("quillo: {}: an index could not be made ({}): sends and sign-outs read the whole table", TABLE, for_the_log(&e.to_string()));
         }
     }
 }
@@ -313,7 +341,7 @@ fn text(m: &Map, k: &str) -> String {
 
 /// `who`'s subscriptions in `place`, compared exactly here, whatever a database's collation takes
 /// for the same.
-fn subscriptions(it: &mut Interp, who: &str, place: &str) -> Result<Vec<Sub>, String> {
+fn subscriptions(it: &mut Interp, who: &str, place: &str) -> Result<Vec<Sub>, Fail> {
     let Some(on) = table_on(it, false)? else { return Ok(Vec::new()) };
     let rows = sql(it, on, true, vec![Value::str("select endpoint, p256dh, auth, who, origin, place from _quillo_push where who = ? and place = ?"), Value::str(who), Value::str(place)])?;
     let Value::List(l) = rows else { return Ok(Vec::new()) };
@@ -340,8 +368,10 @@ pub(crate) fn unbind_sessions(it: &mut Interp, owners: &[String]) -> Result<(), 
     }
     let Some(on) = table_on(it, false)? else { return Ok(()) };
     let place = crate::session::place(it);
+    // A delete reads no rows, so meets no `--max-memory` stop: its words are all there is
+    // (coverage of 0.8.7, Q-1101; branch coverage-087).
     for o in owners.iter().filter(|o| !o.is_empty()) {
-        sql(it, on, false, vec![Value::str("delete from _quillo_push where session = ? and place = ?"), Value::str(o), Value::str(&place)])?;
+        sql(it, on, false, vec![Value::str("delete from _quillo_push where session = ? and place = ?"), Value::str(o), Value::str(&place)]).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -362,9 +392,14 @@ fn refused(status: u16, msg: &str) -> HttpResponse {
 
 /// A database's error, as the visitor gets it: "internal error" where the server hides a
 /// builtin's errors, in full under --watch; in full in the log (FEEDBACK67.md, B.3, review; branch
-/// pwa).
-fn failed_here(e: &str) -> HttpResponse {
-    let said = for_the_log(e);
+/// pwa). The request's stop at `--max-memory` is answered as a server fn's is (server.rs,
+/// `over_memory_answer`) (coverage of 0.8.7, Q-1101; branch coverage-087).
+fn failed_here(e: &Fail) -> HttpResponse {
+    if let Fail::MemoryStop = e {
+        crate::httpd::error_line(&crate::httpd::over_memory());
+        return refused(500, &crate::httpd::over_memory_said_to_pages());
+    }
+    let said = for_the_log(&e.to_string());
     eprintln!("quillo: /_quillo/push: {}", said);
     refused(500, if crate::value::hiding() { "internal error" } else { &said })
 }
@@ -478,7 +513,7 @@ fn answer_push(it: &mut Interp, req: &HttpRequest) -> HttpResponse {
     match bind(it, req, endpoint, &j, &owner) {
         Ok(()) => answer(200, serde_json::json!({ "ok": true })),
         Err((500, e)) => failed_here(&e),
-        Err((status, e)) => refused(status, &e),
+        Err((status, e)) => refused(status, &e.to_string()),
     }
 }
 
@@ -487,7 +522,7 @@ fn answer_push(it: &mut Interp, req: &HttpRequest) -> HttpResponse {
 /// anyone else, or with no one signed in now, is unbound here: the cookie before it ended, or
 /// another person signed in on the device, and it still brought the one before their
 /// notifications (FEEDBACK67.md, B.3, review; branch pwa).
-fn check(it: &mut Interp, endpoint: &str, owner: Option<&str>) -> Result<bool, String> {
+fn check(it: &mut Interp, endpoint: &str, owner: Option<&str>) -> Result<bool, Fail> {
     let Some(on) = table_on(it, false)? else { return Ok(false) };
     let place = crate::session::place(it);
     let rows = sql(it, on, true, vec![Value::str("select who, session, place from _quillo_push where endpoint = ?"), Value::str(endpoint)])?;
@@ -509,7 +544,7 @@ fn check(it: &mut Interp, endpoint: &str, owner: Option<&str>) -> Result<bool, S
 }
 
 /// Unbinds the subscription at `endpoint`, in this place.
-fn unbind(it: &mut Interp, endpoint: &str) -> Result<(), String> {
+fn unbind(it: &mut Interp, endpoint: &str) -> Result<(), Fail> {
     let Some(on) = table_on(it, false)? else { return Ok(()) };
     let place = crate::session::place(it);
     sql(it, on, false, vec![Value::str("delete from _quillo_push where endpoint = ? and place = ?"), Value::str(endpoint), Value::str(&place)]).map(|_| ())
@@ -518,7 +553,7 @@ fn unbind(it: &mut Interp, endpoint: &str) -> Result<(), String> {
 /// `stop`'s DELETE: the subscription unbound only where it is the visitor's, bound to the person
 /// the session names or made in this session; anyone else's endpoint is left as it is
 /// (FEEDBACK67.md, B.3, review; branch pwa).
-fn unbind_own(it: &mut Interp, endpoint: &str, owner: &str, who: Option<&str>) -> Result<(), String> {
+fn unbind_own(it: &mut Interp, endpoint: &str, owner: &str, who: Option<&str>) -> Result<(), Fail> {
     let Some(on) = table_on(it, false)? else { return Ok(()) };
     let place = crate::session::place(it);
     let args = vec![
@@ -537,10 +572,10 @@ const DEVICES: usize = 20;
 
 /// The subscription the page posted, bound and kept: checked first, so that a send never meets
 /// what it cannot use.
-fn bind(it: &mut Interp, req: &HttpRequest, endpoint: &str, j: &serde_json::Value, owner: &str) -> Result<(), (u16, String)> {
-    let bad = |e: String| (400, e);
+fn bind(it: &mut Interp, req: &HttpRequest, endpoint: &str, j: &serde_json::Value, owner: &str) -> Result<(), (u16, Fail)> {
+    let bad = |e: String| (400, Fail::Said(e));
     endpoint_ok(endpoint).map_err(bad)?;
-    let key = |k: &str, len: usize| -> Result<Vec<u8>, (u16, String)> {
+    let key = |k: &str, len: usize| -> Result<Vec<u8>, (u16, Fail)> {
         let s = j["keys"][k].as_str().ok_or_else(|| bad(format!("no keys.{}", k)))?;
         crate::crypto::unb64url(s.trim_end_matches('=')).filter(|b| b.len() == len).ok_or_else(|| bad(format!("keys.{} is not {} bytes of base64url", k, len)))
     };
@@ -552,11 +587,11 @@ fn bind(it: &mut Interp, req: &HttpRequest, endpoint: &str, j: &serde_json::Valu
     let origin = origin_of(it, req).ok_or_else(|| bad("the request names no host to send its pages from".into()))?;
     let place = crate::session::place(it);
     let who = match &j["user"] {
-        serde_json::Value::Null => person(it).ok_or_else(|| (403, "no one to send to: the visitor is not signed in (session().user), and ask was given no user: notification.user(x), made on the server, says who".to_string()))?,
-        serde_json::Value::String(t) => sealed_user(t, &place, owner, person(it).as_deref()).ok_or_else(|| (403, "the user given to notification.ask is not one notification.user made here, for this session, in the last 30 days: make it on the server with notification.user(x) and give it to the page".to_string()))?,
-        _ => return Err((403, "the user given to notification.ask is made on the server with notification.user(x), so that a page cannot name someone else".into())),
+        serde_json::Value::Null => person(it).ok_or_else(|| (403, Fail::Said("no one to send to: the visitor is not signed in (session().user), and ask was given no user: notification.user(x), made on the server, says who".to_string())))?,
+        serde_json::Value::String(t) => sealed_user(t, &place, owner, person(it).as_deref()).ok_or_else(|| (403, Fail::Said("the user given to notification.ask is not one notification.user made here, for this session, in the last 30 days: make it on the server with notification.user(x) and give it to the page".to_string())))?,
+        _ => return Err((403, Fail::Said("the user given to notification.ask is made on the server with notification.user(x), so that a page cannot name someone else".into()))),
     };
-    let on = table_on(it, true).map_err(|e| (500, e))?.ok_or((500, "no table".to_string()))?;
+    let on = table_on(it, true).map_err(|e| (500, Fail::Said(e)))?.ok_or((500, Fail::Said("no table".to_string())))?;
     let row = |endpoint: &str| {
         vec![
             Value::str("insert into _quillo_push (endpoint, p256dh, auth, who, session, origin, place, created, succeeded) values (?, ?, ?, ?, ?, ?, ?, ?, 0)"),
@@ -592,7 +627,7 @@ fn bind(it: &mut Interp, req: &HttpRequest, endpoint: &str, j: &serde_json::Valu
 }
 
 /// A person's devices here past `DEVICES`, the oldest first, unbound.
-fn keep_newest(it: &mut Interp, on: Option<usize>, who: &str, place: &str) -> Result<(), String> {
+fn keep_newest(it: &mut Interp, on: Option<usize>, who: &str, place: &str) -> Result<(), Fail> {
     let rows = sql(it, on, true, vec![Value::str("select endpoint, who, place, created from _quillo_push where who = ? and place = ?"), Value::str(who), Value::str(place)])?;
     let Value::List(l) = rows else { return Ok(()) };
     let mut mine: Vec<(i64, String)> = l
@@ -754,6 +789,8 @@ fn send(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let place = crate::session::place(it);
     let subs = match subscriptions(it, &who, &place) {
         Ok(s) => s,
+        // The request's stop, said at this call (coverage of 0.8.7, Q-1101; branch coverage-087).
+        Err(Fail::MemoryStop) => return Err(crate::httpd::OverMemory.at(line)),
         Err(e) => return Ok(Value::err(Value::str(format!("notification.send: {}", e)))),
     };
     let longest = subs.iter().map(|s| s.origin.as_str()).max_by_key(|o| o.len()).unwrap_or("").to_string();
@@ -789,7 +826,7 @@ fn send(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             }
         };
         if let Err(e) = r {
-            eprintln!("quillo: notification.send: {}", for_the_log(&e));
+            eprintln!("quillo: notification.send: {}", for_the_log(&e.to_string()));
         }
     }
     let mut out = Map::new();
@@ -871,7 +908,7 @@ fn for_the_log(text: &str) -> String {
     out
 }
 
-fn touch(it: &mut Interp, endpoint: &str, at: i64) -> Result<(), String> {
+fn touch(it: &mut Interp, endpoint: &str, at: i64) -> Result<(), Fail> {
     let Some(on) = table_on(it, false)? else { return Ok(()) };
     sql(it, on, false, vec![Value::str("update _quillo_push set succeeded = ? where endpoint = ?"), Value::Int(at), Value::str(endpoint)]).map(|_| ())
 }
