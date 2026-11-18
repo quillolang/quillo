@@ -5559,6 +5559,10 @@ impl Interp {
                 let seq = self.shared.live_seq();
                 self.tracks.push(Default::default());
                 let start = out.len();
+                // Where the browser's parser is, before: a render that leaves it elsewhere (raw
+                // markup in it that lost it) is not kept, as a hit writes the html and leaves the
+                // place as it was (coverage of 0.8.7, Q-1116; branch coverage-087).
+                let ns = self.ns;
                 let page_reads = crate::value::page_reads();
                 let r = self.render_call_plain(c, args.clone(), line, out);
                 let mut track = self.tracks.pop().unwrap_or_default();
@@ -5577,7 +5581,7 @@ impl Interp {
                 let mut cache = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if track.impure {
                     cache.forbid(&c.def);
-                } else {
+                } else if self.ns == ns {
                     cache.store(&c.def, args, &out[start..], track.deps, seq, if track.locale { locale } else { None });
                 }
                 Ok(())

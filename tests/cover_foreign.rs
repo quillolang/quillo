@@ -595,14 +595,15 @@ route GET /html-script ? { q: str = "" } = <html><body><svg><foreignObject>{raw(
 
 /// Q-1100's repro: a `<div/>` in markup placed in a `<foreignObject>` is open, as the browser
 /// keeps it (an HTML element's self-closing flag is passed over), so the `</foreignObject>` after
-/// it ends nothing and the script after that is HTML's, written without a CDATA section; `<DIV/>`,
-/// an unknown `<x-y/>` and `<x-é/>` alike. Void elements (`<br/>`, `<BR/>`, `<img/>`) and SVG's
+/// it ends nothing and the script after that is HTML's, written without a CDATA section; `<DIV/>`
+/// alike. An unknown `<x-y/>` or `<x-é/>`, no special element, lets `</foreignObject>` go down to
+/// the integration point, which Chrome passes over and parse5 closes: the safe form. Void elements (`<br/>`, `<BR/>`, `<img/>`) and SVG's
 /// and MathML's elements (`<circle/>`, `<svg width="10"/>`, `<svg hidden/>`, `<circle r="1" />`,
 /// `<math/>`, an SVG `<script/>`) are closed by it; a `/` that is an unquoted value's
 /// (`<svg width=10/>`, `<svg aria-label=✓/>`) or that a space parts from `>` (`<svg / >`) is no
 /// flag, and the `<svg>` stays open: its script is SVG's. A `</div>` then a real
-/// `</foreignObject>` leave the integration point (src/foreign.rs `written`, `self_closing`,
-/// `next_attr`; FEEDBACK71.md Q-969, coverage of 0.8.7, Q-1100, Q-1112; branch coverage-087).
+/// `</foreignObject>` leave the integration point (src/foreign.rs `written`, `tag_end`,
+/// `end_tag`; FEEDBACK71.md Q-969, coverage of 0.8.7, Q-1100, Q-1112, Q-1116; branch coverage-087).
 #[test]
 fn a_self_closed_html_element_stays_open_as_the_browser_keeps_it() {
     let mut it = app(SELF_CLOSED);
@@ -612,8 +613,11 @@ fn a_self_closed_html_element_stays_open_as_the_browser_keeps_it() {
             // HTML elements: open, and `</foreignObject>` ends nothing: the script is HTML's.
             ("/div", format!("<svg><foreignObject><div/></foreignObject><script>{Q}</script></svg>")),
             ("/div-upper", format!("<svg><foreignObject><DIV/></foreignObject><script>{Q}</script></svg>")),
-            ("/unknown", format!("<svg><foreignObject><x-y/></foreignObject><script>{Q}</script></svg>")),
-            ("/unicode", format!("<svg><foreignObject><x-é/></foreignObject><script>{Q}</script></svg>")),
+            // One of no special kind, `<x-y/>`: `</foreignObject>` goes down to the integration
+            // point, which Chrome passes over and parse5 closes, so the script after is written as
+            // safe in both (changed with round 7's review of Q-1116: it was HTML's).
+            ("/unknown", format!("<svg><foreignObject><x-y/></foreignObject><script>{RAW_CODE}</script></svg>")),
+            ("/unicode", format!("<svg><foreignObject><x-é/></foreignObject><script>{RAW_CODE}</script></svg>")),
             // Void elements: no end tag, so `</foreignObject>` ends the integration point.
             ("/br", format!("<svg><foreignObject><br/></foreignObject><script>{RAW_CODE}</script></svg>")),
             ("/br-upper", format!("<svg><foreignObject><BR/></foreignObject><script>{RAW_CODE}</script></svg>")),
@@ -846,7 +850,9 @@ fn the_inputs_a_review_found_against_parse5_are_read_as_the_browser_reads_them()
         ("/ann-renderer?e=text%26%2347%3Bhtml".into(), format!("<math><annotation-xml encoding=\"text&amp;#47;html\"><script>{CODE}</script></annotation-xml></math>")),
         ("/endtag-other".into(), format!("<svg><foreignObject><svg></x><script>{RAW_CODE}</script></svg>")),
         ("/endtag-outer".into(), fo(&format!("</foreignObject><script>{CODE}</script>"))),
-        ("/endtag-walk".into(), format!("<svg><foreignObject><x-y></foreignObject><script>{Q}</script></svg>")),
+        // Down to the integration point, which parse5 closes and Chrome passes over: safe in both
+        // (changed with round 7's review: it was HTML's).
+        ("/endtag-walk".into(), format!("<svg><foreignObject><x-y></foreignObject><script>{RAW_CODE}</script></svg>")),
         ("/endtag-rule".into(), format!("<svg><foreignObject><div><span></div><script>{RAW_CODE}</script></foreignObject></svg>")),
         ("/scriptx".into(), fo(&format!("<svg><script><![CDATA[</scriptx>]]></script><script>{RAW_CODE}</script>"))),
         ("/escaped".into(), fo(&format!("<script><!--<script></script><script>{RAW_CODE}</script>"))),
@@ -869,9 +875,12 @@ fn the_inputs_a_review_found_against_parse5_are_read_as_the_browser_reads_them()
             cases.push((format!("/tag?t={}", enc(&tag)), format!("<svg><foreignObject>{tag}</foreignObject><script>{RAW_CODE}</script></svg>")));
         }
     }
-    // Open, as the browser keeps them: `</foreignObject>` ends nothing, and the script is HTML's.
-    for tag in ["<span/>", "<div/>", "<x-y/>", "<b/>"] {
-        cases.push((format!("/tag?t={}", enc(tag)), format!("<svg><foreignObject>{tag}</foreignObject><script>{Q}</script></svg>")));
+    // Open, as the browser keeps them: in a special one (`<div/>`) `</foreignObject>` ends nothing
+    // and the script is HTML's; in others it goes down to the integration point, which Chrome
+    // passes over and parse5 closes: the safe form (changed with round 7's review: HTML's).
+    cases.push((format!("/tag?t={}", enc("<div/>")), format!("<svg><foreignObject><div/></foreignObject><script>{Q}</script></svg>")));
+    for tag in ["<span/>", "<x-y/>", "<b/>"] {
+        cases.push((format!("/tag?t={}", enc(tag)), format!("<svg><foreignObject>{tag}</foreignObject><script>{RAW_CODE}</script></svg>")));
     }
     let cases: Vec<(&str, String)> = cases.iter().map(|(p, w)| (p.as_str(), w.clone())).collect();
     pages(&mut it, &cases);
@@ -1098,4 +1107,73 @@ fn an_ending_written_is_said_once_for_each_line_of_the_program() {
         assert!(line.ends_with(&format!("): {} {}", at, words)), "{}", line);
     }
     let _ = std::fs::remove_dir_all(&d);
+}
+
+// ---- the third review: an <svg> left open, start tags that close elements, the view cache,
+// ---- end tags at an integration point, a script's CDATA never closed ------------------------------
+
+const THIRD: &str = r##"view Icon(x: str) = <svg>{raw(x)}</svg>
+route GET /open-svg ? { q: str = "" } = <html><body><svg>{raw("<svg>")}</svg><script>{raw(q)}</script></body></html>
+route GET /open-math ? { q: str = "" } = <html><body><math>{raw("<math>")}</math><script>{raw(q)}</script></body></html>
+route GET /open-g-svg ? { q: str = "" } = <html><body><svg>{raw("<g><svg>")}</svg><script>{raw(q)}</script></body></html>
+route GET /open-fo ? { q: str = "" } = <html><body><svg><foreignObject>{raw("<svg>")}</foreignObject></svg><script>{raw(q)}</script></body></html>
+route GET /open-svg-fo ? { q: str = "" } = <html><body><svg>{raw("<svg><foreignObject>")}</svg><script>{raw(q)}</script></body></html>
+route GET /open-g ? { q: str = "" } = <html><body><svg>{raw("<g>")}</svg><script>{raw(q)}</script></body></html>
+route GET /run ? { q: str = "", t: str = "" } = <html><body><svg>{raw("<g><foreignObject>" + t + "<svg><g><p></p></g><script>" + q + "</script>")}</svg></body></html>
+route GET /cached ? { q: str = "" } = <html><body><Icon x={"</svg><svg><svg>"}/><script>{raw(q)}</script></body></html>
+route GET /cached-fine ? { q: str = "" } = <html><body><Icon x={"<g></g>"}/><script>{raw(q)}</script></body></html>
+route GET /mi-span ? { q: str = "" } = <html><body><math>{raw("<mi><span></mi><script>" + q + "</script>")}</math></body></html>
+route GET /mo-span ? { q: str = "" } = <html><body><math>{raw("<mo><span/></mo><script>" + q + "</script>")}</math></body></html>
+route GET /mo-b ? { q: str = "" } = <html><body><math>{raw("<mo><b>x</mo><noembed><script>" + q + "</script>")}</math></body></html>
+route GET /mi-div ? { q: str = "" } = <html><body><math>{raw("<mi><div></mi><script>" + q + "</script>")}</math></body></html>
+route GET /open-cdata = <html><body><svg>{raw("<script><![CDATA[ var s = \"</script><img src=x onerror=1>\";</script>")}</svg></body></html>
+route GET /open-comment = <html><body><svg>{raw("<script><!-- var s = \"</script><img src=x onerror=1>\";</script>")}</svg></body></html>
+"##;
+
+/// The third review's inputs against parse5, each now safe in both readings:
+/// - an `<svg>` or `<math>` left open by raw markup takes the renderer's own `</svg>` or
+///   `</math>`, so the page goes on in SVG past the renderer's run: the place is lost to the
+///   page's end, and the script after is written in a section; a `<g>` left open is closed on the
+///   way by the renderer's `</svg>`, and the script after it is HTML's;
+/// - an HTML start tag that closes an element open by itself (`<li>` in an `<li>`, `<p>` in a
+///   `<p>`, `<dt>` after `<dd>`, `<h2>` after `<h1>`) loses the place, so an SVG run opened after
+///   it is not taken to go back to an element the browser closed; closed by their own end tags,
+///   the same elements are followed;
+/// - a view whose render lost the place is not kept in the view cache, so the next request,
+///   which would have been a hit, renders it and loses the place again; a view that keeps it is
+///   kept as before;
+/// - an end tag that goes down to an SVG or MathML integration point of its name (`</mi>` with a
+///   `<span>` open in the `<mi>`), passed over by Chrome and closed by parse5, loses the place; a
+///   special one (`<div>`) stops it before, as both read it;
+/// - an SVG script whose CDATA section or comment never closes ends at the next `</script>` after
+///   it, the inner one written `<\/script`, so its text stays text
+/// (src/foreign.rs `written`, `closes_open`, `end_tag`, `open_construct`; src/interp.rs
+/// `render_cached`; FEEDBACK71.md Q-969, coverage of 0.8.7, Q-1116; branch coverage-087).
+#[test]
+fn the_third_reviews_inputs_are_safe_in_both_readings() {
+    let mut it = app(THIRD);
+    let mut cases: Vec<(String, String)> = vec![
+        ("/open-svg".into(), format!("<svg><svg></svg><script>{CODE}</script>")),
+        ("/open-math".into(), format!("<math><math></math><script>{CODE}</script>")),
+        ("/open-g-svg".into(), format!("<svg><g><svg></svg><script>{CODE}</script>")),
+        ("/open-fo".into(), format!("<svg><foreignObject><svg></foreignObject></svg><script>{CODE}</script>")),
+        ("/open-svg-fo".into(), format!("<svg><svg><foreignObject></svg><script>{CODE}</script>")),
+        ("/open-g".into(), format!("<svg><g></svg><script>{HTML}</script>")),
+        ("/cached".into(), format!("<svg></svg><svg><svg></svg><script>{CODE}</script>")),
+        ("/cached-fine".into(), format!("<svg><g></g></svg><script>{HTML}</script>")),
+        ("/mi-span".into(), format!("<math><mi><span></mi><script>{RAW_CODE}</script></math>")),
+        ("/mo-span".into(), format!("<math><mo><span/></mo><script>{RAW_CODE}</script></math>")),
+        ("/mo-b".into(), format!("<math><mo><b>x</mo><noembed><script>{RAW_CODE}</script></math>")),
+        // `<div>` is special: `</mi>` stops at it, in both readings; the script is HTML's.
+        ("/mi-div".into(), format!("<math><mi><div></mi><script>{Q}</script></math>")),
+        ("/open-cdata".into(), "<svg><script><![CDATA[ var s = \"<\\/script><img src=x onerror=1>\";]]></script></svg>".into()),
+        ("/open-comment".into(), "<svg><script><![CDATA[<!-- var s = \"<\\/script><img src=x onerror=1>\";]]></script></svg>".into()),
+    ];
+    for t in ["<li>a<li>b</li>", "<p>a<p>b</p>", "<dd>a<dt>b</dt>", "<h1>a<h2>b</h2>", "<li>a</li><li>b</li>", "<p>a</p><p>b</p>"] {
+        // The run after: its `<p>` ends SVG where the browser takes it (in the `<foreignObject>`),
+        // and the `</g>` after closes the SVG `<g>` outside it: the script is SVG's, in a section.
+        cases.push((format!("/run?t={}", enc(t)), format!("<svg><g><foreignObject>{t}<svg><g><p></p></g><script>{RAW_CODE}</script></svg>")));
+    }
+    let cases: Vec<(&str, String)> = cases.iter().map(|(p, w)| (p.as_str(), w.clone())).collect();
+    pages(&mut it, &cases);
 }

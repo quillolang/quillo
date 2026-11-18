@@ -486,9 +486,19 @@ pub fn written(at: At, html: &str) -> (At, Option<String>, Option<Ending>) {
         // Tags after which the body's rules are not what this follows: tables, `<select>`,
         // `<template>`, `<frameset>`, `<plaintext>`, a `<form>` (which a page's own form makes the
         // browser pass over) (coverage of 0.8.7, Q-1116; branch coverage-087).
-        if (html_el || inner.now == Ns::Unsure) && html_lost(name) {
-            lost = true;
-            continue;
+        if html_el || inner.now == Ns::Unsure {
+            if html_lost(name) {
+                lost = true;
+                continue;
+            }
+            // An HTML start tag that closes an element open by itself (a `<p>` or a `<div>` in a
+            // `<p>`, an `<li>` in an `<li>`, ...): the browser's elements open are then not these,
+            // and a run of SVG opened after takes another place to go back to
+            // (`<li>a<li>b</li><svg>...<p>` ended SVG where the first `<li>` was taken to be open)
+            // (WHATWG HTML 13.2.6.4.7; coverage of 0.8.7, Q-1116; branch coverage-087).
+            if html_el && !lost && closes_open(&open, b, name) {
+                lost = true;
+            }
         }
         // The self-closing flag (`<circle/>`) closes an SVG or MathML element, or one not known to
         // be HTML's; an HTML element's is passed over, so `<div/>` is open as `<div>` is, and a
@@ -519,8 +529,8 @@ pub fn written(at: At, html: &str) -> (At, Option<String>, Option<Ending>) {
             let first = find_end_tag(&html[i..], name).map(|e| i + e);
             let found = match foreign {
                 true => {
-                    let later = foreign_end(html, i);
-                    if later.is_some() && later != first && (lost || !inner.now.foreign()) {
+                    let (later, never) = svg_script_end(html, i, name, first);
+                    if later.is_some() && later != first && (lost || !inner.now.foreign() || never) {
                         let to = later.unwrap_or(b.len());
                         let f = fixed.get_or_insert_with(String::new);
                         f.push_str(&html[copied..i]);
@@ -586,11 +596,25 @@ pub fn written(at: At, html: &str) -> (At, Option<String>, Option<Ending>) {
         return (LOST, fixed, ended);
     }
     // An element left open (raw html that is not whole): what follows is in it, which is not
-    // followed.
+    // followed. An `<svg>` or `<math>` left open takes the renderer's own `</svg>` or `</math>`,
+    // which then ends this one and not the renderer's, and the page goes on in SVG past the
+    // renderer's run: lost to the page's end. Others the renderer's end tags close on their way,
+    // or keep the browser in HTML where the renderer thinks it in SVG (coverage of 0.8.7, Q-1116;
+    // branch coverage-087).
     if !open.is_empty() {
+        if opens_run(&open, b) {
+            return (LOST, fixed, ended);
+        }
         cur = unsure(cur);
     }
     (cur, fixed, ended)
+}
+
+/// Whether an `<svg>` or a `<math>` that starts a run of SVG or MathML is among the elements open.
+#[cold]
+#[inline(never)]
+fn opens_run(open: &[(At, At, u32, u32)], b: &[u8]) -> bool {
+    open.iter().any(|&(_, inner, at, len)| matches!(inner.now, Ns::Svg | Ns::Math) && matches!(&b[at as usize..(at + len) as usize], [b's' | b'S', b'v' | b'V', b'g' | b'G'] | [b'm' | b'M', b'a' | b'A', b't' | b'T', b'h' | b'H']))
 }
 
 /// What raw markup stopped inside, whose end `written` wrote so that the browser does not read on
@@ -700,6 +724,13 @@ fn end_tag(open: &[(At, At, u32, u32)], b: &[u8], name: &[u8]) -> Option<usize> 
         } else {
             matches!(inner.now, Ns::Point | Ns::MathText) || (n == "annotation-xml" && inner.now == Ns::Annotation)
         };
+        // An SVG or MathML integration point of that name (`</mi>` in an `<mi>` with a `<span>`
+        // open in it): passed over by WHATWG HTML, Blink and Gecko, closed by parse5, which
+        // matches names across languages; not followed, so that either way is safe (coverage of
+        // 0.8.7, Q-1116; branch coverage-087).
+        if special && !html && b[at..at + len].eq_ignore_ascii_case(name) {
+            return None;
+        }
         if special {
             return Some(0);
         }
@@ -708,6 +739,51 @@ fn end_tag(open: &[(At, At, u32, u32)], b: &[u8], name: &[u8]) -> Option<usize> 
         }
     }
     None
+}
+
+/// Whether the HTML start tag `name` closes by itself an element open here, as the body's rules
+/// have it (WHATWG HTML 13.2.6.4.7): a `<p>` in button scope for the tags that close one, an
+/// `<li>` for an `<li>`, a `<dd>` or `<dt>` for either, a heading for a heading just open, a
+/// `<button>` for a button, `<a>` and `<nobr>` for their own, an `<option>` just open for an
+/// `<option>` or `<optgroup>`, ruby's parts for theirs. Looked for among the HTML elements open
+/// since the last SVG or MathML element (past an SVG run a tag that ends it pops first), one
+/// whose scope may hold it found is enough (coverage of 0.8.7, Q-1116; branch coverage-087).
+#[cold]
+#[inline(never)]
+fn closes_open(open: &[(At, At, u32, u32)], b: &[u8], name: &str) -> bool {
+    let closes_p = matches!(
+        name,
+        "address" | "article" | "aside" | "blockquote" | "center" | "details" | "dialog" | "dir" | "div" | "dl" | "fieldset" | "figcaption" | "figure"
+            | "footer" | "header" | "hgroup" | "main" | "menu" | "nav" | "ol" | "p" | "search" | "section" | "summary" | "ul" | "h1" | "h2" | "h3"
+            | "h4" | "h5" | "h6" | "pre" | "listing" | "hr" | "xmp" | "li" | "dd" | "dt"
+    );
+    let own = |n: &str| match name {
+        "li" => n == "li",
+        "dd" | "dt" => matches!(n, "dd" | "dt"),
+        "button" | "a" | "nobr" => n == name,
+        "rb" | "rtc" | "rp" | "rt" => matches!(n, "rb" | "rtc" | "rp" | "rt"),
+        _ => false,
+    };
+    let heading = |n: &str| matches!(n, "h1" | "h2" | "h3" | "h4" | "h5" | "h6");
+    if !closes_p && !matches!(name, "li" | "dd" | "dt" | "button" | "a" | "nobr" | "rb" | "rtc" | "rp" | "rt" | "option" | "optgroup") {
+        return false;
+    }
+    let mut top = true;
+    for &(_, inner, at, len) in open.iter().rev() {
+        match inner.now {
+            // Popped by the browser before a tag that ends SVG or MathML is taken.
+            Ns::Svg | Ns::Math | Ns::Annotation if top => continue,
+            Ns::Html => {}
+            _ => return false,
+        }
+        let mut buf = [0u8; 16];
+        let n = lower(&b[at as usize..(at + len) as usize], &mut buf);
+        if (closes_p && n == "p") || own(n) || (top && heading(name) && heading(n)) || (top && matches!(name, "option" | "optgroup") && n == "option") {
+            return true;
+        }
+        top = false;
+    }
+    false
 }
 
 /// End tags with a rule of their own in a page's body (WHATWG HTML, 13.2.6.4.7).
@@ -808,6 +884,50 @@ fn foreign_end(html: &str, mut i: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Where an SVG or MathML script whose contents start at `i` ends (`foreign_end`), and whether
+/// that reading never ends it. A CDATA section or a comment it opens and never closes: SVG never
+/// ends it, and the first `</script>`, inside that section, is no end of the script as its markup
+/// was written (`<![CDATA[ "</script><img ...>";</script>`). Where a later `</script>` follows,
+/// that one ends it, and those before are written `<\/script`; else the first (`first`) ends it,
+/// as a script made for HTML ends (coverage of 0.8.7, Q-1116; branch coverage-087).
+#[cold]
+#[inline(never)]
+fn svg_script_end(html: &str, i: usize, name: &str, first: Option<usize>) -> (Option<usize>, bool) {
+    let later = foreign_end(html, i);
+    if later.is_some() {
+        return (later, false);
+    }
+    let Some(f) = first else { return (None, true) };
+    let mut end = f;
+    while open_construct(&html[i..end]) {
+        match find_end_tag(&html[end + 2..], name) {
+            Some(k) => end = end + 2 + k,
+            None => break,
+        }
+    }
+    ((end != f).then_some(end), true)
+}
+
+/// Whether `t` ends inside a CDATA section or a comment it opens.
+#[cold]
+#[inline(never)]
+fn open_construct(t: &str) -> bool {
+    let mut rest = t;
+    loop {
+        match (rest.find("<![CDATA["), rest.find("<!--")) {
+            (Some(k), c) if c.is_none_or(|c| k < c) => match rest[k + 9..].find("]]>") {
+                Some(e) => rest = &rest[k + 9 + e + 3..],
+                None => return true,
+            },
+            (_, Some(c)) => match comment_end(rest, c + 4) {
+                Some(e) => rest = &rest[e..],
+                None => return true,
+            },
+            _ => return false,
+        }
+    }
 }
 
 /// `t` with each `</script` written `<\/script`, ASCII case aside.
